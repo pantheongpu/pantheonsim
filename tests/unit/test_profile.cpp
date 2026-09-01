@@ -11,12 +11,12 @@ using vgpu::Error;
 
 VTEST(registry_lists_all_gpus) {
   auto ids = vgpu::available_gpus();
-  VCHECK_EQ(ids.size(), size_t{9});
+  VCHECK_EQ(ids.size(), size_t{10});
   VCHECK_EQ(ids[0], "nvidia/a10");
   VCHECK_EQ(ids[4], "nvidia/b200");
   VCHECK_EQ(ids[5], "nvidia/rtx3060");
-  VCHECK_EQ(ids[6], "amd/mi300x");
-  VCHECK_EQ(ids[8], "amd/mi350x");
+  VCHECK_EQ(ids[6], "nvidia/a100-sxm4-40gb");
+  VCHECK_EQ(ids[9], "amd/mi350x");
 }
 
 VTEST(all_builtin_profiles_parse) {
@@ -31,7 +31,8 @@ VTEST(all_builtin_profiles_parse) {
     VCHECK(p.telemetry.pci_vendor_id != 0);
     // rtx3060 is characterized from a physical device; the rest are
     // placeholders from public documentation.
-    VCHECK_EQ(p.verified, p.id == "nvidia/rtx3060");
+    VCHECK_EQ(p.verified, p.id == "nvidia/rtx3060" || p.id == "nvidia/a10" ||
+                          p.id == "nvidia/a100-sxm4-40gb");
   }
 }
 
