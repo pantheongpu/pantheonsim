@@ -11,11 +11,12 @@ using vgpu::Error;
 
 VTEST(registry_lists_all_gpus) {
   auto ids = vgpu::available_gpus();
-  VCHECK_EQ(ids.size(), size_t{8});
+  VCHECK_EQ(ids.size(), size_t{9});
   VCHECK_EQ(ids[0], "nvidia/a10");
   VCHECK_EQ(ids[4], "nvidia/b200");
-  VCHECK_EQ(ids[5], "amd/mi300x");
-  VCHECK_EQ(ids[7], "amd/mi350x");
+  VCHECK_EQ(ids[5], "nvidia/rtx3060");
+  VCHECK_EQ(ids[6], "amd/mi300x");
+  VCHECK_EQ(ids[8], "amd/mi350x");
 }
 
 VTEST(all_builtin_profiles_parse) {
@@ -28,7 +29,9 @@ VTEST(all_builtin_profiles_parse) {
     VCHECK_EQ(p.limits.max_threads_per_block, 1024u);
     VCHECK(p.telemetry.power_limit_w > 0);   // monitoring tools need a scale
     VCHECK(p.telemetry.pci_vendor_id != 0);
-    VCHECK(!p.verified);  // nothing is hardware-characterized yet
+    // rtx3060 is characterized from a physical device; the rest are
+    // placeholders from public documentation.
+    VCHECK_EQ(p.verified, p.id == "nvidia/rtx3060");
   }
 }
 

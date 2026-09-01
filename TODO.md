@@ -1,6 +1,6 @@
 # TODO / status
 
-Updated: 2026-09-01 (rev 3). See ARCHITECTURE.md for the design behind these.
+Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
 
 ## Implemented (tested)
 
@@ -46,6 +46,37 @@ Updated: 2026-09-01 (rev 3). See ARCHITECTURE.md for the design behind these.
 - Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual
   devices (all_reduce and p2p_thrasher take their real peer-DMA paths).
 - Configurable virtual VRAM (VGPU_VRAM_MB); VGPU_TRACE coverage-growth logging.
+
+## Hardware characterization
+
+`tools/characterize.cu` + `tools/characterize-telemetry.sh` read a physical
+device and emit a profile with `verified: true`. `profiles/nvidia/rtx3060.yaml`
+was produced this way and is the only profile whose values come from hardware
+rather than documentation; `lspci` resolves its generated PCI id to the correct
+device name, and both conformance tests match the physical card exactly.
+
+Run them on any GPU to add support for it:
+
+```bash
+nvcc -std=c++14 tools/characterize.cu -o vgpu-characterize -lcuda
+{ ./vgpu-characterize 0 | sed '/^telemetry:/,$d'; tools/characterize-telemetry.sh 0; } \
+  > profiles/nvidia/<model>.yaml
+tests/conformance/run_conformance.sh    # then confirm the semantics match
+```
+
+The remaining profiles (A10/A100/H100/H200/B200, MI300X/MI325X/MI350X) are
+still documentation-derived placeholders. Characterizing them needs access to
+those parts.
+
+## Ecosystem tools that work today
+
+- **pynvml** and anything built on it (nvitop, gpustat, monitoring agents,
+  framework memory queries) — verified against a 4-GPU virtual rack.
+- **lspci**, via generated PCI configuration space.
+- **nvidia-smi / rocm-smi / rocm_agent_enumerator** — supplied by VirtualGPU
+  (see docs/telemetry.md for why the stock nvidia-smi binary cannot be used).
+
+Not yet: cuBLAS/cuDNN/NCCL (so no PyTorch), `nvidia-smi topo -m`, DCGM.
 
 ## Known out of scope (not CUDA)
 

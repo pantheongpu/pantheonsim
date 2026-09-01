@@ -20,6 +20,7 @@ set(VGPU_PROFILES
   nvidia/h100
   nvidia/h200
   nvidia/b200
+  nvidia/rtx3060
   amd/mi300x
   amd/mi325x
   amd/mi350x
