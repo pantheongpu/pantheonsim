@@ -1,0 +1,36 @@
+# VirtualGPU device profile: AMD Instinct AMD Instinct MI300X.
+# Values from public AMD documentation. verified: false means nothing here has
+# been confirmed by hardware characterization yet -- treat as placeholders.
+#
+# NOTE: AMD execution is NOT implemented. This profile exists for Level 1
+# (discovery) so rocm-smi / rocm_agent_enumerator / lspci report the device.
+# Launching a kernel on it fails with a clear "wavefront size 64 unsupported"
+# error rather than producing wrong answers.
+id: amd/mi300x
+vendor: amd
+model: "AMD Instinct MI300X"
+architecture: cdna3
+compute_capability: "9.4"
+warp_size: 64
+vram_bytes: 206158430208
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 1024]
+  max_grid_dim: [2147483647, 2147483647, 2147483647]
+  shared_mem_per_block_bytes: 65536
+  shared_mem_per_block_optin_bytes: 65536
+  registers_per_block: 65536
+  multiprocessors: 304
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+telemetry:
+  power_limit_w: 750
+  sm_clock_max_mhz: 2100
+  mem_clock_max_mhz: 5200
+  temperature_max_c: 100
+  pci_vendor_id: 4098          # 0x1002 AMD
+  pci_device_id: 29857        # 0x74a1 Aqua Vanjaram [Instinct MI300X]

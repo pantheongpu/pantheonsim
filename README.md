@@ -29,7 +29,7 @@ Working today, all CPU-only:
 
 | Area | State |
 | --- | --- |
-| Device profiles | A10, A100, H100, H200, B200 (data-driven YAML, values are placeholders pending hardware characterization) |
+| Device profiles | NVIDIA A10/A100/H100/H200/B200 and AMD MI300X/MI325X/MI350X (data-driven YAML; AMD is discovery-only). Values are placeholders pending hardware characterization |
 | `vgpu` CLI | `list-gpus`, `info --gpu <id> [--json]`, `demo vectoradd` |
 | Virtual VRAM | sparse/lazy backing — a virtual H200 claims 141 GB on a 16 GB host; OOB / use-after-free / double-free / misalignment diagnostics |
 | PTX | lexer/parser for a growing subset (see ARCHITECTURE.md); precise `unsupported` errors for the rest |
@@ -37,6 +37,8 @@ Working today, all CPU-only:
 | Driver API | `libvgpucuda.so` + clean-room `vgpu_cuda.h`: init/discovery/context/memory/module/`cuLaunchKernel`, `cuLibrary`/`cuKernel`, `cuGetProcAddress` |
 | Runtime API | `libvgpucudart` (drop-in `libcudart.so.13`): the CUDA **Runtime** API + nvcc host-registration ABI, so unmodified nvcc apps run unchanged |
 | Fatbin | extracts embedded PTX from nvcc fatbins (uncompressed + zstd) |
+| Discovery | live telemetry + NVML; drop-in `nvidia-smi`, `rocm-smi`, `rocm_agent_enumerator`, and `lspci` output — see [docs/telemetry.md](docs/telemetry.md) |
+| NVENC | `libnvidia-encode.so.1` with a deterministic content-derived encoder, so video-encode SDC tests run |
 | Proof | an nvcc-compiled CUDA program **and** the unmodified pantheon stress kernels run on the CPU; `memory_read` differential-matches a physical RTX 3060 (incl. fault injection + device printf) |
 
 Known limitations (deliberate, documented):

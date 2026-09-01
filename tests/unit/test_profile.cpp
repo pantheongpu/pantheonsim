@@ -9,21 +9,25 @@ using vgpu::DeviceProfile;
 using vgpu::Err;
 using vgpu::Error;
 
-VTEST(registry_lists_all_nvidia_gpus) {
+VTEST(registry_lists_all_gpus) {
   auto ids = vgpu::available_gpus();
-  VCHECK_EQ(ids.size(), size_t{5});
+  VCHECK_EQ(ids.size(), size_t{8});
   VCHECK_EQ(ids[0], "nvidia/a10");
   VCHECK_EQ(ids[4], "nvidia/b200");
+  VCHECK_EQ(ids[5], "amd/mi300x");
+  VCHECK_EQ(ids[7], "amd/mi350x");
 }
 
 VTEST(all_builtin_profiles_parse) {
   for (const auto& id : vgpu::available_gpus()) {
     DeviceProfile p = vgpu::load_gpu(id);
     VCHECK_EQ(p.id, id);
-    VCHECK_EQ(p.vendor, "nvidia");
-    VCHECK_EQ(p.warp_size, 32u);
+    VCHECK(p.vendor == "nvidia" || p.vendor == "amd");
+    VCHECK(p.warp_size == 32u || p.warp_size == 64u);
     VCHECK(p.vram_bytes > 0);
     VCHECK_EQ(p.limits.max_threads_per_block, 1024u);
+    VCHECK(p.telemetry.power_limit_w > 0);   // monitoring tools need a scale
+    VCHECK(p.telemetry.pci_vendor_id != 0);
     VCHECK(!p.verified);  // nothing is hardware-characterized yet
   }
 }

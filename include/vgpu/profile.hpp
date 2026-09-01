@@ -27,6 +27,22 @@ struct Limits {
   uint32_t multiprocessors = 0;
 };
 
+// Presentation values for monitoring tools (nvidia-smi, rocm-smi, `vgpu smi`).
+//
+// These are deliberately NOT part of the functional model and are never
+// consulted by the execution engine: VirtualGPU does not predict performance.
+// They exist so telemetry has a plausible, per-model scale to render against,
+// and every value derived from them is labelled synthetic. See
+// ARCHITECTURE.md and docs/telemetry.md.
+struct TelemetryClass {
+  uint32_t power_limit_w = 0;
+  uint32_t sm_clock_max_mhz = 0;
+  uint32_t mem_clock_max_mhz = 0;
+  uint32_t temperature_max_c = 0;
+  uint32_t pci_vendor_id = 0;
+  uint32_t pci_device_id = 0;
+};
+
 struct DeviceProfile {
   std::string id;            // registry id, e.g. "nvidia/h100"
   std::string vendor;        // "nvidia" | "amd"
@@ -38,6 +54,7 @@ struct DeviceProfile {
   uint64_t vram_bytes = 0;
   bool verified = false;  // true once hardware characterization confirms values
   Limits limits;
+  TelemetryClass telemetry;
   std::map<std::string, bool> features;
 
   // Parses a profile document. `origin` names the source in error messages.

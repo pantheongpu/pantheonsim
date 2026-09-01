@@ -88,6 +88,18 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
   p.limits.registers_per_block = static_cast<uint32_t>(get_int(lim, "registers_per_block", origin));
   p.limits.multiprocessors = static_cast<uint32_t>(get_int(lim, "multiprocessors", origin));
 
+  // Optional: presentation-only values for monitoring tools.
+  if (auto it = doc.map.find("telemetry"); it != doc.map.end()) {
+    if (it->second.kind != Value::Kind::Map) fail(origin, "'telemetry' must be a map");
+    const Value& t = it->second;
+    p.telemetry.power_limit_w = static_cast<uint32_t>(get_int(t, "power_limit_w", origin));
+    p.telemetry.sm_clock_max_mhz = static_cast<uint32_t>(get_int(t, "sm_clock_max_mhz", origin));
+    p.telemetry.mem_clock_max_mhz = static_cast<uint32_t>(get_int(t, "mem_clock_max_mhz", origin));
+    p.telemetry.temperature_max_c = static_cast<uint32_t>(get_int(t, "temperature_max_c", origin));
+    p.telemetry.pci_vendor_id = static_cast<uint32_t>(get_int(t, "pci_vendor_id", origin));
+    p.telemetry.pci_device_id = static_cast<uint32_t>(get_int(t, "pci_device_id", origin));
+  }
+
   if (auto it = doc.map.find("features"); it != doc.map.end()) {
     if (it->second.kind != Value::Kind::Map) fail(origin, "'features' must be a map");
     for (auto& [k, v] : it->second.map) {

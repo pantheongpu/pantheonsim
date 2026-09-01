@@ -22,3 +22,14 @@ features:
   bf16: true
   fp64: true
   tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+# Public spec-sheet figures; PCI ids from the public NVIDIA device list.
+telemetry:
+  power_limit_w: 400
+  sm_clock_max_mhz: 1410
+  mem_clock_max_mhz: 1593
+  temperature_max_c: 85
+  pci_vendor_id: 4318          # 0x10DE NVIDIA
+  pci_device_id: 8370        # 0x20b2 GA100 [A100 SXM4 80GB]

@@ -30,6 +30,7 @@ uint64_t MemoryManager::alloc(uint64_t size) {
   next_va_ += padded;
   used_ += size;
   live_.emplace(base, Allocation{size, {}});
+  notify_usage();
   return base;
 }
 
@@ -39,6 +40,7 @@ void MemoryManager::free(uint64_t ptr) {
     used_ -= it->second.size;
     freed_.emplace(ptr, FreedRecord{it->second.size});
     live_.erase(it);
+    notify_usage();
     return;
   }
   if (freed_.count(ptr))

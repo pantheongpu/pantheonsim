@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Drop-in nvidia-smi for VirtualGPU.
+#
+# On a machine with no NVIDIA driver there is no nvidia-smi at all, so this
+# provides the command. It renders the same telemetry the NVML shim serves.
+# (The *stock* nvidia-smi binary cannot be used against VirtualGPU: it gates
+# startup on nvmlInternalGetExportTable, an undocumented internal vtable.
+# Tools that use the documented NVML API -- pynvml, DCGM, framework memory
+# queries -- work against build/shim/libnvidia-ml.so.1 normally.)
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+vgpu="$here/vgpu"
+[[ -x "$vgpu" ]] || vgpu="$here/../vgpu"
+case "${1:-}" in
+  --version)
+    echo "NVIDIA-SMI version  : VirtualGPU 0.1.0"
+    echo "NVML version        : 13.580.00.00 (VirtualGPU)"
+    echo "DRIVER version      : ${VGPU_DRIVER_VERSION:-580.00.00} (virtual)"
+    exit 0 ;;
+  --query-gpu*|--format*|-q)
+    exec "$vgpu" smi --csv ;;
+  -L|--list-gpus)
+    exec "$vgpu" smi --csv ;;
+esac
+exec "$vgpu" smi "$@"

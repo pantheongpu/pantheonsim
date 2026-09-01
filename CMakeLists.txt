@@ -20,6 +20,9 @@ set(VGPU_PROFILES
   nvidia/h100
   nvidia/h200
   nvidia/b200
+  amd/mi300x
+  amd/mi325x
+  amd/mi350x
 )
 set(_gen_dir "${CMAKE_BINARY_DIR}/generated")
 set(_gen "${_gen_dir}/vgpu/embedded_profiles.hpp")
@@ -41,6 +44,7 @@ add_library(vgpu STATIC
   src/core/profile.cpp
   src/core/registry.cpp
   src/core/memory.cpp
+  src/core/telemetry.cpp
   src/ptx/ast.cpp
   src/ptx/lexer.cpp
   src/ptx/parser.cpp
@@ -104,6 +108,23 @@ if(CUDA_ABI_INCLUDE)
     COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so.13.0" "${CMAKE_BINARY_DIR}/shim/libcudart.so"
     COMMENT "Creating runtime shim symlinks (build/shim/libcudart.so.13)")
   # ---------------------------------------------------------------------------
+  # libvgpunvml: NVML, presented as libnvidia-ml.so.1. nvidia-smi dlopens that
+  # soname and resolves entries by name, so the real nvidia-smi binary reports
+  # VirtualGPU's devices when the shim directory is on LD_LIBRARY_PATH.
+  # ---------------------------------------------------------------------------
+  add_library(vgpunvml SHARED src/cuda/nvml_api.cpp)
+  target_link_libraries(vgpunvml PRIVATE vgpu)
+  target_include_directories(vgpunvml PRIVATE ${CUDA_ABI_INCLUDE})
+  set_target_properties(vgpunvml PROPERTIES OUTPUT_NAME nvidia-ml SOVERSION 1)
+  add_custom_command(TARGET vgpunvml POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvidia-ml.so.1"
+            "${CMAKE_BINARY_DIR}/shim/libnvidia-ml.so.1"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvidia-ml.so.1"
+            "${CMAKE_BINARY_DIR}/shim/libnvidia-ml.so"
+    COMMENT "Creating NVML shim symlinks (build/shim/libnvidia-ml.so.1)")
+
+  # ---------------------------------------------------------------------------
   # libvgpunvenc: VirtualGPU's NVENC implementation, presented as
   # libnvidia-encode.so.1. Applications dlopen that bare soname, which searches
   # LD_LIBRARY_PATH first, so the shim directory wins over the real driver
@@ -131,9 +152,19 @@ else()
 endif()
 
 # CLI
-add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp)
+add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
+# Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /
+# rocm_agent_enumerator do not exist at all, so VirtualGPU supplies them; they
+# render the same telemetry the NVML shim serves.
+add_custom_command(TARGET vgpu_cli POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/bin"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../vgpu" "${CMAKE_BINARY_DIR}/bin/vgpu"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/tools/nvidia-smi" "${CMAKE_BINARY_DIR}/bin/nvidia-smi"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/tools/rocm-smi" "${CMAKE_BINARY_DIR}/bin/rocm-smi"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/tools/rocm_agent_enumerator" "${CMAKE_BINARY_DIR}/bin/rocm_agent_enumerator"
+  COMMENT "Installing drop-in monitoring tools into build/bin")
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -156,6 +187,7 @@ target_compile_definitions(test_exec PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR
 vgpu_unit_test(test_runtime)
 vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
+vgpu_unit_test(test_telemetry)
 
 # The C harness: an "external application" built with a plain C compiler
 # against the documented ABI only (vgpu_cuda.h + libvgpucuda.so).

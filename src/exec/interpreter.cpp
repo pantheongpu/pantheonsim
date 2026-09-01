@@ -21,6 +21,7 @@
 //    Everything is deterministic by construction.
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -128,9 +129,12 @@ uint64_t mask_to_bits(uint64_t v, uint32_t bits) {
 class Interpreter {
  public:
   Interpreter(const EntryFn& fn, const LaunchConfig& cfg, const ParamBuffer& params, MemoryManager& mem,
-              const DeviceProfile& profile, const SymbolTable* symbols, LaunchStats& stats)
+              const DeviceProfile& profile, const SymbolTable* symbols, LaunchStats& stats,
+              const ProgressFn& progress)
       : fn_(fn), cfg_(cfg), params_(params), mem_(mem), profile_(profile), symbols_(symbols),
-        stats_(stats) {}
+        stats_(stats), progress_(progress) {
+    if (progress_) last_progress_ = std::chrono::steady_clock::now();
+  }
 
   void run_grid() {
     auto sched = make_scheduler(cfg_.scheduler);
@@ -209,6 +213,7 @@ class Interpreter {
         throw Error::make(Err::PtxParse, "control fell off the end of kernel '", fn_.name,
                           "' (missing ret)");
       const Instr& ins = fn_.body[w.pc];
+      if (progress_ && (stats_.instructions & 0xFFFFF) == 0) report_progress();
       if (++stats_.instructions > cfg_.max_steps)
         throw Error::make(Err::ExecLimit, "kernel '", fn_.name, "' exceeded the launch step budget (",
                           cfg_.max_steps, " instructions) — possible infinite loop");
@@ -1512,6 +1517,15 @@ class Interpreter {
     }
   }
 
+  // Publishes elapsed busy time mid-launch so telemetry stays live during a
+  // long kernel instead of freezing until the launch returns.
+  void report_progress() {
+    auto now = std::chrono::steady_clock::now();
+    double dt = std::chrono::duration<double>(now - last_progress_).count();
+    last_progress_ = now;
+    progress_(dt);
+  }
+
   const EntryFn& fn_;
   const LaunchConfig& cfg_;
   const ParamBuffer& params_;
@@ -1519,6 +1533,8 @@ class Interpreter {
   const DeviceProfile& profile_;
   const SymbolTable* symbols_;
   LaunchStats& stats_;
+  ProgressFn progress_;
+  std::chrono::steady_clock::time_point last_progress_;
 };
 
 ParamBuffer build_params(const EntryFn& fn, const std::vector<std::vector<uint8_t>>& args) {
@@ -1572,11 +1588,12 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
 
 LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
                    const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
-                   const DeviceProfile& profile, const SymbolTable* symbols) {
+                   const DeviceProfile& profile, const SymbolTable* symbols,
+                   const ProgressFn& progress) {
   validate(fn, cfg, profile);
   ParamBuffer pb = build_params(fn, args);
   LaunchStats stats;
-  Interpreter interp(fn, cfg, pb, mem, profile, symbols, stats);
+  Interpreter interp(fn, cfg, pb, mem, profile, symbols, stats, progress);
   interp.run_grid();
   return stats;
 }

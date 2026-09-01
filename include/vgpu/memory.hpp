@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <vector>
@@ -43,6 +44,10 @@ class MemoryManager {
   uint64_t load_scalar(uint64_t addr, uint32_t size) const;
   void store_scalar(uint64_t addr, uint32_t size, uint64_t value);
 
+  // Notified with the new total whenever allocated bytes change. Used to feed
+  // live memory telemetry; optional and unset by default.
+  void set_usage_observer(std::function<void(uint64_t)> obs) { usage_observer_ = std::move(obs); }
+
   // Locates the live allocation containing `addr`. Returns false if none.
   bool find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const;
 
@@ -67,6 +72,11 @@ class MemoryManager {
   uint64_t capacity_;
   uint64_t used_ = 0;
   uint64_t next_va_ = kDeviceVaBase;
+  void notify_usage() const {
+    if (usage_observer_) usage_observer_(used_);
+  }
+
+  std::function<void(uint64_t)> usage_observer_;
   std::map<uint64_t, Allocation> live_;        // base -> allocation
   std::map<uint64_t, FreedRecord> freed_;      // base -> record (for UAF/double-free reporting)
 };

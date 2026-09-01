@@ -19,17 +19,37 @@
 #include "vgpu/memory.hpp"
 #include "vgpu/profile.hpp"
 #include "vgpu/ptx/ast.hpp"
+#include "vgpu/telemetry.hpp"
 
 namespace vgpu::runtime {
 
 class Device {
  public:
-  explicit Device(DeviceProfile profile, int ordinal)
-      : profile_(std::move(profile)), ordinal_(ordinal), mem_(profile_.vram_bytes) {}
+  Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemetry)
+      : profile_(std::move(profile)), ordinal_(ordinal), mem_(profile_.vram_bytes),
+        telemetry_(telemetry) {
+    if (telemetry_) {
+      int ord = ordinal_;
+      telemetry::Publisher* pub = telemetry_;
+      mem_.set_usage_observer(
+          [pub, ord](uint64_t used) { pub->note_memory(static_cast<uint32_t>(ord), used); });
+    }
+  }
 
   const DeviceProfile& profile() const { return profile_; }
   int ordinal() const { return ordinal_; }
   MemoryManager& memory() { return mem_; }
+
+  // Reports device-busy time to telemetry without running a kernel. Used by
+  // `vgpu serve` to present a rack under a chosen synthetic load.
+  void note_busy(double seconds) {
+    if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(ordinal_), seconds);
+  }
+
+  // Reports host<->device traffic to telemetry (bytes and the time it took).
+  void note_transfer(uint64_t bytes, double seconds) {
+    if (telemetry_) telemetry_->note_transfer(static_cast<uint32_t>(ordinal_), bytes, seconds);
+  }
 
   // Loads a PTX module; returns a module handle valid for this device.
   // PTX errors are augmented with the device's profile id.
@@ -50,6 +70,7 @@ class Device {
   DeviceProfile profile_;
   int ordinal_;
   MemoryManager mem_;
+  telemetry::Publisher* telemetry_ = nullptr;
   uint64_t next_module_id_ = 1;
   struct LoadedModule {
     uint64_t id = 0;
@@ -70,6 +91,9 @@ class Runtime {
   Device& device(int ordinal);
 
  private:
+  void publish_identity(const DeviceProfile& profile, int ordinal);
+
+  telemetry::Publisher telemetry_;
   std::vector<std::unique_ptr<Device>> devices_;
 };
 

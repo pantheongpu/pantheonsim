@@ -20,6 +20,7 @@
 #include <driver_types.h>
 #include <vector_types.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -501,6 +502,7 @@ VGPU_EXPORT cudaError_t cudaFree(void* ptr) {
 
 VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cudaMemcpyKind kind) {
   return guard("cudaMemcpy", [&](State& s) {
+    auto _t0 = std::chrono::steady_clock::now();
     vgpu::MemoryManager& mm = current(s).memory();
     bool dd = is_device_ptr(dst), sd = is_device_ptr(src);
     if (kind == cudaMemcpyDefault) kind = dd && sd ? cudaMemcpyDeviceToDevice
@@ -526,6 +528,8 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
       default:
         return cudaErrorInvalidValue;
     }
+    current(s).note_transfer(
+        count, std::chrono::duration<double>(std::chrono::steady_clock::now() - _t0).count());
     return cudaSuccess;
   });
 }

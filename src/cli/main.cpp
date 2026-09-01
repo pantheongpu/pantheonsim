@@ -25,6 +25,10 @@ int usage(FILE* to) {
                "  vgpu info --gpu <vendor/model>       Show a device profile (add --json for JSON)\n"
                "  vgpu demo vectoradd [--gpu <id>] [-n <elems>]\n"
                "                                       Run the built-in vectorAdd kernel end-to-end\n"
+               "  vgpu smi [--csv|--rocm|--agents|--lspci|--lspci-dump|--explain]\n"
+               "                                       Live view of running virtual GPUs\n"
+               "  vgpu serve --gpu <id> [--count N] [--load 0..1] [--alloc-mb N]\n"
+               "                                       Present a virtual rack for monitoring tools\n"
                "  vgpu --version | --help\n",
                kVersion);
   return to == stdout ? 0 : 2;
@@ -114,6 +118,9 @@ int cmd_info(const std::string& gpu, bool json) {
 
 // Implemented in demo.cpp (stubbed until the execution engine lands).
 int demo_vectoradd(const std::string& gpu, long long n);
+// Implemented in smi.cpp / serve.cpp.
+int cmd_smi(const std::vector<std::string>& args);
+int cmd_serve(const std::vector<std::string>& args);
 
 int main(int argc, char** argv) {
   std::vector<std::string> args(argv + 1, argv + argc);
@@ -127,6 +134,8 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (cmd == "list-gpus") return cmd_list_gpus();
+    if (cmd == "smi") return cmd_smi({args.begin() + 1, args.end()});
+    if (cmd == "serve") return cmd_serve({args.begin() + 1, args.end()});
     if (cmd == "info") {
       std::string gpu;
       bool json = false;

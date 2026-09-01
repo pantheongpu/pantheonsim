@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <vector>
 
+#include <functional>
 #include <map>
 
 #include "vgpu/exec/scheduler.hpp"
@@ -23,6 +24,10 @@ struct LaunchConfig {
   uint64_t max_steps = 1ull << 30;
 };
 
+// Invoked periodically during a launch so long-running kernels can still
+// publish live telemetry. Receives seconds elapsed since the previous call.
+using ProgressFn = std::function<void(double seconds)>;
+
 struct LaunchStats {
   uint64_t blocks = 0;
   uint64_t warps = 0;
@@ -38,6 +43,7 @@ using SymbolTable = std::map<std::string, uint64_t>;
 // Deterministic: same inputs -> same result, always.
 LaunchStats launch(const ptx::EntryFn& fn, const LaunchConfig& cfg,
                    const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
-                   const DeviceProfile& profile, const SymbolTable* symbols = nullptr);
+                   const DeviceProfile& profile, const SymbolTable* symbols = nullptr,
+                   const ProgressFn& progress = nullptr);
 
 }  // namespace vgpu::exec
