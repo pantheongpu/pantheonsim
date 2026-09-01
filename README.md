@@ -34,18 +34,21 @@ Working today, all CPU-only:
 | Virtual VRAM | sparse/lazy backing — a virtual H200 claims 141 GB on a 16 GB host; OOB / use-after-free / double-free / misalignment diagnostics |
 | PTX | lexer/parser for a growing subset (see ARCHITECTURE.md); precise `unsupported` errors for the rest |
 | Execution | SIMT warp interpreter: 32-lane warps, divergence masks, `bar.sync` across warps, deterministic scheduling |
-| Driver API | `libvgpucuda.so` + clean-room `vgpu_cuda.h`: init/discovery/context/memory/module/`cuLaunchKernel` subset |
-| Proof | an externally compiled C11 program runs vectorAdd through the driver ABI and verifies exact results — no NVIDIA hardware or software involved |
+| Driver API | `libvgpucuda.so` + clean-room `vgpu_cuda.h`: init/discovery/context/memory/module/`cuLaunchKernel`, `cuLibrary`/`cuKernel`, `cuGetProcAddress` |
+| Runtime API | `libvgpucudart` (drop-in `libcudart.so.13`): the CUDA **Runtime** API + nvcc host-registration ABI, so unmodified nvcc apps run unchanged |
+| Fatbin | extracts embedded PTX from nvcc fatbins (uncompressed + zstd) |
+| Proof | an nvcc-compiled CUDA program **and** the unmodified pantheon stress kernels run on the CPU; `memory_read` differential-matches a physical RTX 3060 (incl. fault injection + device printf) |
 
 Known limitations (deliberate, documented):
 
-- Kernels must be **PTX text** (embedded or loaded via `cuModuleLoadData`).
-  cubin/fatbin/SASS images are rejected with `CUDA_ERROR_NOT_SUPPORTED`.
-- The CUDA *Runtime* API (`cudaMalloc`, `<<<>>>` launches) is not shimmed yet —
-  driver API only. So "unmodified CUDA app" today means "app written against
-  the driver API subset"; the runtime-API shim is the next compatibility step.
-- No shared memory, atomics, warp shuffles, streams, or events yet. Every gap
-  fails loudly with a precise error, never silently.
+- Kernels must carry **PTX** (embedded, or a fatbin containing PTX; zstd
+  fatbins are decompressed). SASS-only fatbins are rejected with a precise error.
+- Unmodified apps must link **shared** cudart (`nvcc -cudart shared`) so the
+  loader can substitute VirtualGPU's `libcudart.so.13`. The source is untouched;
+  hosting a *statically* linked cudart needs NVIDIA's undocumented driver export
+  tables and is future work.
+- No shared memory, warp shuffles, tensor cores, or f16/bf16 math yet. Every
+  gap fails loudly (instruction, PTX line, kernel, profile), never silently.
 - AMD (MI300X/MI325X/MI350X) is designed for but not started.
 
 ## Build & test
@@ -65,6 +68,18 @@ Then:
 ./build/vgpu info --gpu nvidia/h200
 ./build/vgpu demo vectoradd --gpu nvidia/h100 -n 1000000
 ```
+
+### Running an unmodified CUDA application
+
+```bash
+# Build the app from unmodified source against shared cudart, then run it on a
+# virtual GPU — no physical GPU involved.
+nvcc -cudart shared my_app.cu -o my_app
+scripts/vgpu-run.sh --gpu nvidia/h200 ./my_app
+```
+
+The pantheon stress/diagnostics kernels run this way unchanged — see
+[docs/pantheon-workloads.md](docs/pantheon-workloads.md).
 
 ### Running a driver-API program against the virtual GPU
 
@@ -104,8 +119,8 @@ which real GPUs cannot give you cheaply.
 
 ## Roadmap (abridged — see TODO.md)
 
-1. Runtime-API shim + fatbin PTX extraction → truly unmodified CUDA apps
-2. Shared memory, atomics, more PTX; streams/events
+1. Shared memory, warp shuffles, more PTX → broader kernel coverage
+2. Static-cudart hosting (driver export tables) → no `-cudart shared` rebuild
 3. `vgpu run` / `vgpu test --matrix` across profiles
 4. Hardware characterization + differential fuzzing against physical GPUs
    (oracle machines) → verified profiles, conformance database, compat scores

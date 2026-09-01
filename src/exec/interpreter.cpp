@@ -10,12 +10,19 @@
 //    implicitly at ret. Barriers inside divergent control flow are rejected
 //    with a clear error rather than deadlocking (IPDOM reconvergence is a
 //    planned upgrade — see TODO.md).
+//  - Address spaces: device globals live in the MemoryManager VA range;
+//    per-thread .local frames live in a reserved window (kLocalVaBase) that
+//    generic loads/stores route to the executing lane's private buffer —
+//    which is exactly PTX .local semantics. cvta is identity everywhere.
+//  - Atomics are read-modify-write in fixed lane order — trivially atomic
+//    and deterministic in this sequential engine.
 //  - Warps in a block run under a pluggable Scheduler; a warp yields only at
 //    barriers or retirement. Blocks run sequentially in a fixed order.
 //    Everything is deterministic by construction.
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <unordered_map>
 
@@ -28,6 +35,11 @@ namespace {
 using namespace vgpu::ptx;
 
 constexpr uint32_t kWarpSize = 32;
+// Per-thread .local window: distinct from both host pointers and device
+// globals. Addresses here are lane-relative (each lane sees its own frame).
+constexpr uint64_t kLocalVaBase = 0x6fff'0000'0000ull;
+constexpr uint64_t kLocalVaSize = 1ull << 30;
+
 using Mask = uint32_t;  // bit i == lane i active
 using Lanes = std::array<uint64_t, kWarpSize>;
 
@@ -51,6 +63,8 @@ struct Warp {
   std::vector<std::pair<size_t, Mask>> divergence;  // parked (pc, mask)
   std::unordered_map<std::string, Lanes> regs;
   std::unordered_map<std::string, Mask> preds;
+  std::unordered_map<std::string, Lanes> slots;  // call-argument slots
+  std::vector<std::vector<uint8_t>> local;       // per-lane .local frames (lazy)
   std::array<uint32_t, kWarpSize> tid_x{}, tid_y{}, tid_z{};
 };
 
@@ -59,11 +73,16 @@ uint64_t f32bits(float f) { return std::bit_cast<uint32_t>(f); }
 double f64(uint64_t bits) { return std::bit_cast<double>(bits); }
 uint64_t f64bits(double d) { return std::bit_cast<uint64_t>(d); }
 
+uint64_t mask_to_bits(uint64_t v, uint32_t bits) {
+  return bits >= 64 ? v : (v & ((1ull << bits) - 1));
+}
+
 class Interpreter {
  public:
   Interpreter(const EntryFn& fn, const LaunchConfig& cfg, const ParamBuffer& params, MemoryManager& mem,
-              const DeviceProfile& profile, LaunchStats& stats)
-      : fn_(fn), cfg_(cfg), params_(params), mem_(mem), profile_(profile), stats_(stats) {}
+              const DeviceProfile& profile, const SymbolTable* symbols, LaunchStats& stats)
+      : fn_(fn), cfg_(cfg), params_(params), mem_(mem), profile_(profile), symbols_(symbols),
+        stats_(stats) {}
 
   void run_grid() {
     auto sched = make_scheduler(cfg_.scheduler);
@@ -80,16 +99,20 @@ class Interpreter {
   }
 
  private:
-  [[noreturn]] void fault(size_t line, const std::string& msg) {
-    throw Error::make(Err::Internal, msg, "\n  in kernel '", fn_.name, "' at line ", line);
-  }
-
   // Re-throws a lower-level error with kernel/instruction context attached.
   [[noreturn]] void rethrow_with_context(const Error& e, const Instr& ins, int lane) {
     throw Error::make(e.code(), e.message(), "\n  in kernel '", fn_.name, "', PTX line ", ins.line,
                       lane >= 0 ? "\n  lane " + std::to_string(lane) : "",
                       "\n  instruction: ", ins.text.empty() ? "?" : ins.text,
                       "\n  GPU profile: ", profile_.id);
+  }
+
+  [[noreturn]] void ctx_fail(const Instr& ins, int lane, Err code, const std::string& msg) {
+    try {
+      throw Error::make(code, msg);
+    } catch (const Error& e) {
+      rethrow_with_context(e, ins, lane);
+    }
   }
 
   void run_block(const BlockCtx& ctx, Scheduler& sched) {
@@ -115,8 +138,6 @@ class Interpreter {
       for (size_t i = 0; i < warps.size(); ++i)
         if (warps[i].state == Warp::State::Ready) runnable.push_back(i);
       if (runnable.empty()) {
-        // Barrier release: every warp is either retired or waiting, which is
-        // exactly the functional bar.sync condition.
         bool any_waiting = false;
         for (auto& w : warps)
           if (w.state == Warp::State::AtBarrier) {
@@ -143,19 +164,25 @@ class Interpreter {
     }
   }
 
-  // ---- register access ----
+  // ---- symbols / registers / operands ----
+
+  uint64_t resolve_symbol(const Instr& ins, const std::string& name) {
+    if (auto it = fn_.locals.find(name); it != fn_.locals.end())
+      return kLocalVaBase + it->second.offset;
+    if (symbols_) {
+      if (auto it = symbols_->find(name); it != symbols_->end()) return it->second;
+    }
+    ctx_fail(ins, -1, Err::NotFound,
+             "unknown symbol '" + name + "' (not a .local depot or module .global variable)");
+  }
 
   Lanes read_operand(Warp& w, const BlockCtx& ctx, const Instr& ins, const Operand& op) {
     Lanes out{};
     if (const auto* r = std::get_if<RegOperand>(&op)) {
       auto it = w.regs.find(r->name);
-      if (it == w.regs.end()) {
-        try {
-          throw Error::make(Err::UninitializedRegister, "register ", r->name, " read before any write");
-        } catch (const Error& e) {
-          rethrow_with_context(e, ins, -1);
-        }
-      }
+      if (it == w.regs.end())
+        ctx_fail(ins, -1, Err::UninitializedRegister,
+                 "register " + r->name + " read before any write");
       return it->second;
     }
     if (const auto* imm = std::get_if<ImmInt>(&op)) {
@@ -164,6 +191,10 @@ class Interpreter {
     }
     if (const auto* immf = std::get_if<ImmFloatBits>(&op)) {
       out.fill(immf->bits);
+      return out;
+    }
+    if (const auto* sym = std::get_if<SymbolOperand>(&op)) {
+      out.fill(resolve_symbol(ins, sym->name));
       return out;
     }
     const auto& s = std::get<SregOperand>(op);
@@ -193,19 +224,64 @@ class Interpreter {
   void write_reg(Warp& w, const std::string& name, Mask m, const Lanes& vals, uint32_t bits) {
     Lanes& dst = w.regs[name];  // zero-initialized on first touch
     for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-      if (m & (1u << lane)) dst[lane] = bits == 64 ? vals[lane] : (vals[lane] & 0xFFFFFFFFull);
+      if (m & (1u << lane)) dst[lane] = mask_to_bits(vals[lane], bits);
   }
 
   Mask read_pred(Warp& w, const Instr& ins, const std::string& name) {
     auto it = w.preds.find(name);
-    if (it == w.preds.end()) {
-      try {
-        throw Error::make(Err::UninitializedRegister, "predicate ", name, " read before any write");
-      } catch (const Error& e) {
-        rethrow_with_context(e, ins, -1);
-      }
-    }
+    if (it == w.preds.end())
+      ctx_fail(ins, -1, Err::UninitializedRegister, "predicate " + name + " read before any write");
     return it->second;
+  }
+
+  // ---- routed memory access (device global VA range vs .local window) ----
+
+  bool is_local(uint64_t addr) const {
+    return addr >= kLocalVaBase && addr < kLocalVaBase + kLocalVaSize;
+  }
+
+  std::vector<uint8_t>& lane_local(Warp& w, uint32_t lane) {
+    if (w.local.empty()) w.local.resize(kWarpSize);
+    auto& buf = w.local[lane];
+    if (buf.size() < fn_.local_frame_size) buf.resize(fn_.local_frame_size, 0);
+    return buf;
+  }
+
+  void check_local(const Instr& ins, int lane, uint64_t addr, uint32_t size) {
+    uint64_t off = addr - kLocalVaBase;
+    if (off + size > fn_.local_frame_size)
+      ctx_fail(ins, lane, Err::OutOfBounds,
+               "local memory access at frame offset " + std::to_string(off) + " (+" +
+                   std::to_string(size) + " bytes) exceeds the " +
+                   std::to_string(fn_.local_frame_size) + "-byte .local frame");
+  }
+
+  uint64_t load_routed(Warp& w, const Instr& ins, uint32_t lane, uint64_t addr, uint32_t size) {
+    if (is_local(addr)) {
+      check_local(ins, static_cast<int>(lane), addr, size);
+      uint64_t v = 0;
+      std::memcpy(&v, lane_local(w, lane).data() + (addr - kLocalVaBase), size);
+      return v;
+    }
+    try {
+      return mem_.load_scalar(addr, size);
+    } catch (const Error& e) {
+      rethrow_with_context(e, ins, static_cast<int>(lane));
+    }
+  }
+
+  void store_routed(Warp& w, const Instr& ins, uint32_t lane, uint64_t addr, uint32_t size,
+                    uint64_t value) {
+    if (is_local(addr)) {
+      check_local(ins, static_cast<int>(lane), addr, size);
+      std::memcpy(lane_local(w, lane).data() + (addr - kLocalVaBase), &value, size);
+      return;
+    }
+    try {
+      mem_.store_scalar(addr, size, value);
+    } catch (const Error& e) {
+      rethrow_with_context(e, ins, static_cast<int>(lane));
+    }
   }
 
   // ---- the dispatcher ----
@@ -227,27 +303,25 @@ class Interpreter {
       return;
     }
     if (std::holds_alternative<OpBar>(ins.op)) {
-      if (ins.has_pred)
-        try {
-          throw Error::make(Err::UnsupportedPtx, "predicated bar.sync is not supported");
-        } catch (const Error& e) {
-          rethrow_with_context(e, ins, -1);
-        }
+      if (ins.has_pred) ctx_fail(ins, -1, Err::UnsupportedPtx, "predicated bar.sync is not supported");
       if (!w.divergence.empty())
-        try {
-          throw Error::make(Err::UnsupportedPtx,
-                            "bar.sync inside divergent control flow is not supported yet "
-                            "(the warp still has parked execution paths)");
-        } catch (const Error& e) {
-          rethrow_with_context(e, ins, -1);
-        }
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "bar.sync inside divergent control flow is not supported yet "
+                 "(the warp still has parked execution paths)");
       ++w.pc;
       w.state = Warp::State::AtBarrier;
       return;
     }
 
-    // All remaining ops are straight-line: execute under mask m, advance pc.
-    if (m != 0) exec_straightline(w, ctx, ins, m);
+    if (m != 0) {
+      try {
+        dispatch(w, ctx, ins, m);
+      } catch (const Error& e) {
+        if (std::string(e.what()).find("in kernel") == std::string::npos)
+          rethrow_with_context(e, ins, -1);
+        throw;
+      }
+    }
     ++w.pc;
   }
 
@@ -280,29 +354,67 @@ class Interpreter {
     if (w.active == 0) w.state = Warp::State::Done;
   }
 
-  void exec_straightline(Warp& w, const BlockCtx& ctx, const Instr& ins, Mask m) {
-    try {
-      dispatch(w, ctx, ins, m);
-    } catch (const Error& e) {
-      // Memory faults etc. thrown mid-instruction get kernel context here.
-      if (std::string(e.what()).find("in kernel") == std::string::npos)
-        rethrow_with_context(e, ins, -1);
-      throw;
-    }
-  }
-
   void dispatch(Warp& w, const BlockCtx& ctx, const Instr& ins, Mask m) {
     if (const auto* op = std::get_if<OpMov>(&ins.op)) {
-      if (op->ty.kind == Type::Kind::Pred)
-        throw Error::make(Err::UnsupportedPtx, "mov.pred is not supported yet");
       Lanes v = read_operand(w, ctx, ins, op->src);
       write_reg(w, op->dst, m, v, op->ty.bits);
       return;
     }
-    if (const auto* op = std::get_if<OpCvtaToGlobal>(&ins.op)) {
-      // Flat virtual address space: generic<->global conversion is identity.
+    if (const auto* op = std::get_if<OpCvta>(&ins.op)) {
       Lanes v = read_operand(w, ctx, ins, op->src);
       write_reg(w, op->dst, m, v, 64);
+      return;
+    }
+    if (const auto* op = std::get_if<OpCvt>(&ins.op)) {
+      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes r{};
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) r[lane] = convert(op, v[lane]);
+      write_reg(w, op->dst, m, r, op->dst_ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpNot>(&ins.op)) {
+      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes r{};
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) r[lane] = ~v[lane];
+      write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpNeg>(&ins.op)) {
+      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes r{};
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          if (op->ty.kind == Type::Kind::F)
+            r[lane] = op->ty.bits == 32 ? f32bits(-f32(v[lane])) : f64bits(-f64(v[lane]));
+          else
+            r[lane] = static_cast<uint64_t>(-static_cast<int64_t>(v[lane]));
+        }
+      write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpPrmt>(&ins.op)) {
+      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b),
+            c = read_operand(w, ctx, ins, op->c);
+      Lanes r{};
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          uint8_t bytes[8];
+          uint32_t lo = static_cast<uint32_t>(a[lane]), hi = static_cast<uint32_t>(b[lane]);
+          for (int i = 0; i < 4; ++i) bytes[i] = (lo >> (8 * i)) & 0xFF;
+          for (int i = 0; i < 4; ++i) bytes[4 + i] = (hi >> (8 * i)) & 0xFF;
+          uint32_t sel = static_cast<uint32_t>(c[lane]);
+          uint32_t out = 0;
+          for (int i = 0; i < 4; ++i) {
+            uint32_t nib = (sel >> (4 * i)) & 0xF;
+            uint8_t byte = bytes[nib & 0x7];
+            if (nib & 0x8) byte = (byte & 0x80) ? 0xFF : 0x00;  // sign-replicate mode
+            out |= static_cast<uint32_t>(byte) << (8 * i);
+          }
+          r[lane] = out;
+        }
+      write_reg(w, op->dst, m, r, 32);
       return;
     }
     if (const auto* op = std::get_if<OpLd>(&ins.op)) {
@@ -311,6 +423,10 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpSt>(&ins.op)) {
       exec_st(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpAtom>(&ins.op)) {
+      exec_atom(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpIntBin>(&ins.op)) {
@@ -326,7 +442,7 @@ class Interpreter {
             c = read_operand(w, ctx, ins, op->c);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = a[lane] * b[lane] + c[lane];  // wrapping; .lo truncates on write
+        if (m & (1u << lane)) r[lane] = a[lane] * b[lane] + c[lane];
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -342,6 +458,23 @@ class Interpreter {
             r[lane] = uint64_t{static_cast<uint32_t>(a[lane])} * uint64_t{static_cast<uint32_t>(b[lane])};
         }
       write_reg(w, op->dst, m, r, 64);
+      return;
+    }
+    if (const auto* op = std::get_if<OpShf>(&ins.op)) {
+      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b),
+            c = read_operand(w, ctx, ins, op->c);
+      Lanes r{};
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          uint64_t hi = static_cast<uint32_t>(b[lane]);
+          uint64_t lo = static_cast<uint32_t>(a[lane]);
+          uint32_t n = op->wrap ? (static_cast<uint32_t>(c[lane]) & 31u)
+                                : std::min<uint32_t>(static_cast<uint32_t>(c[lane]), 32u);
+          uint64_t funnel = (hi << 32) | lo;
+          r[lane] = op->left ? static_cast<uint32_t>((funnel << n) >> 32)
+                             : static_cast<uint32_t>(funnel >> n);
+        }
+      write_reg(w, op->dst, m, r, 32);
       return;
     }
     if (const auto* op = std::get_if<OpFloatBin>(&ins.op)) {
@@ -385,7 +518,93 @@ class Interpreter {
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
+    if (const auto* op = std::get_if<OpPredBin>(&ins.op)) {
+      Mask a = read_pred(w, ins, op->a);
+      Mask b = read_pred(w, ins, op->b);
+      Mask r = op->op == PredBinOp::And ? (a & b) : op->op == PredBinOp::Or ? (a | b) : (a ^ b);
+      Mask& p = w.preds[op->dst];
+      p = (p & ~m) | (r & m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpNotPred>(&ins.op)) {
+      Mask s = read_pred(w, ins, op->src);
+      Mask& p = w.preds[op->dst];
+      p = (p & ~m) | (~s & m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpDeclSlot>(&ins.op)) {
+      w.slots[op->name].fill(0);
+      return;
+    }
+    if (const auto* op = std::get_if<OpStSlot>(&ins.op)) {
+      if (op->offset != 0)
+        ctx_fail(ins, -1, Err::UnsupportedPtx, "st.param at a non-zero slot offset");
+      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes& slot = w.slots[op->slot];
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) slot[lane] = mask_to_bits(v[lane], op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpLdSlot>(&ins.op)) {
+      auto it = w.slots.find(op->slot);
+      if (it == w.slots.end())
+        ctx_fail(ins, -1, Err::UninitializedRegister, "call slot '" + op->slot + "' read before write");
+      if (op->offset != 0)
+        ctx_fail(ins, -1, Err::UnsupportedPtx, "ld.param at a non-zero slot offset");
+      write_reg(w, op->dst, m, it->second, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpCall>(&ins.op)) {
+      exec_vprintf(w, ins, *op, m);
+      return;
+    }
     throw Error::make(Err::Internal, "interpreter has no handler for a parsed instruction");
+  }
+
+  // Applies an integer rounding mode to a real value.
+  static double round_int(double x, Round rnd) {
+    switch (rnd) {
+      case Round::Rzi: return std::trunc(x);
+      case Round::Rm: return std::floor(x);
+      case Round::Rp: return std::ceil(x);
+      case Round::Rni: [[fallthrough]];
+      default: return std::nearbyint(x);  // round-to-nearest-even
+    }
+  }
+
+  uint64_t convert(const OpCvt* op, uint64_t in) {
+    const Type& s = op->src_ty;
+    const Type& d = op->dst_ty;
+    // Read the source as a real number (float src) or integer (int src).
+    if (s.is_float()) {
+      double x = s.bits == 32 ? static_cast<double>(f32(in)) : f64(in);
+      if (d.is_float()) return d.bits == 32 ? f32bits(static_cast<float>(x)) : f64bits(x);
+      // float -> int: round then clamp to the destination range.
+      double rounded = round_int(x, op->round == Round::None ? Round::Rzi : op->round);
+      if (d.is_signed()) {
+        long double lo = -std::pow(2.0L, d.bits - 1), hi = std::pow(2.0L, d.bits - 1) - 1;
+        if (std::isnan(rounded)) return 0;
+        if (rounded < lo) rounded = static_cast<double>(lo);
+        if (rounded > hi) rounded = static_cast<double>(hi);
+        return mask_to_bits(static_cast<uint64_t>(static_cast<int64_t>(rounded)), d.bits);
+      }
+      long double hi = std::pow(2.0L, d.bits) - 1;
+      if (std::isnan(rounded) || rounded < 0) return 0;
+      if (rounded > hi) rounded = static_cast<double>(hi);
+      return mask_to_bits(static_cast<uint64_t>(rounded), d.bits);
+    }
+    // Integer source: sign/zero-extend to 64 bits first.
+    uint64_t sv = mask_to_bits(in, s.bits);
+    if (s.is_signed() && s.bits < 64) {
+      uint64_t sign_bit = 1ull << (s.bits - 1);
+      if (sv & sign_bit) sv |= ~((sign_bit << 1) - 1);
+    }
+    if (d.is_float()) {
+      double x = s.is_signed() ? static_cast<double>(static_cast<int64_t>(sv))
+                               : static_cast<double>(sv);
+      return d.bits == 32 ? f32bits(static_cast<float>(x)) : f64bits(x);
+    }
+    return mask_to_bits(sv, d.bits);  // int -> int: truncate/extend
   }
 
   uint64_t int_bin(IntBinOp op, Type ty, uint64_t a, uint64_t b, const Instr& ins) {
@@ -403,16 +622,11 @@ class Interpreter {
       case IntBinOp::Max: return sig ? static_cast<uint64_t>(std::max(s(a), s(b))) : std::max(u(a), u(b));
       case IntBinOp::Div:
       case IntBinOp::Rem: {
-        if (u(b) == 0) {
+        if (u(b) == 0)
           // Real GPUs produce an undefined value here; VirtualGPU traps instead,
           // because a div-by-zero in a kernel is almost always a bug (documented
           // deliberate divergence — see ARCHITECTURE.md).
-          try {
-            throw Error::make(Err::InvalidValue, "integer division by zero");
-          } catch (const Error& e) {
-            rethrow_with_context(e, ins, -1);
-          }
-        }
+          ctx_fail(ins, -1, Err::InvalidValue, "integer division by zero");
         if (op == IntBinOp::Div)
           return sig ? static_cast<uint64_t>(s(a) / s(b)) : u(a) / u(b);
         return sig ? static_cast<uint64_t>(s(a) % s(b)) : u(a) % u(b);
@@ -484,55 +698,223 @@ class Interpreter {
 
   // ---- memory ops ----
 
+  Lanes addr_base(Warp& w, const BlockCtx& ctx, const Instr& ins, const Addr& a) {
+    return read_operand(w, ctx, ins, Operand{RegOperand{a.base}});
+  }
+
   void exec_ld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLd& op, Mask m) {
     uint32_t size = op.ty.bytes();
-    Lanes r{};
+    size_t n = op.dsts.size();
     if (op.space == Space::Param) {
       auto it = params_.layout.find(op.addr.base);
-      if (it == params_.layout.end() || !op.addr.base_is_param)
-        throw Error::make(Err::PtxParse, "ld.param from non-parameter '", op.addr.base, "'");
+      if (it == params_.layout.end())
+        ctx_fail(ins, -1, Err::PtxParse, "ld.param from non-parameter '" + op.addr.base + "'");
       auto [off, psize] = it->second;
-      int64_t at = int64_t{off} + op.addr.offset;
-      if (at < 0 || static_cast<uint64_t>(at) + size > off + psize)
-        throw Error::make(Err::OutOfBounds, "ld.param reads past parameter '", op.addr.base, "'");
-      uint64_t v = 0;
-      std::memcpy(&v, params_.bytes.data() + at, size);
-      r.fill(v);
-    } else {
-      Lanes base = addr_base(w, ctx, ins, op.addr);
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
-          uint64_t addr = base[lane] + static_cast<uint64_t>(op.addr.offset);
-          try {
-            r[lane] = mem_.load_scalar(addr, size);
-          } catch (const Error& e) {
-            rethrow_with_context(e, ins, static_cast<int>(lane));
-          }
-        }
+      for (size_t e = 0; e < n; ++e) {
+        int64_t at = int64_t{off} + op.addr.offset + static_cast<int64_t>(e * size);
+        if (at < 0 || static_cast<uint64_t>(at) + size > uint64_t{off} + psize)
+          ctx_fail(ins, -1, Err::OutOfBounds,
+                   "ld.param reads past parameter '" + op.addr.base + "'");
+        uint64_t v = 0;
+        std::memcpy(&v, params_.bytes.data() + at, size);
+        Lanes r{};
+        r.fill(v);
+        write_reg(w, op.dsts[e], m, r, op.ty.bits);
+      }
+      return;
     }
-    write_reg(w, op.dst, m, r, op.ty.bits == 64 ? 64 : 32);
+    Lanes base = addr_base(w, ctx, ins, op.addr);
+    uint32_t va = size * static_cast<uint32_t>(n);  // vector accesses need vector alignment
+    std::vector<Lanes> results(n);
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+      if (m & (1u << lane)) {
+        uint64_t addr = base[lane] + static_cast<uint64_t>(op.addr.offset);
+        if (addr % va != 0)
+          ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
+                   "vector load requires " + std::to_string(va) + "-byte alignment");
+        for (size_t e = 0; e < n; ++e)
+          results[e][lane] = load_routed(w, ins, lane, addr + e * size, size);
+      }
+    for (size_t e = 0; e < n; ++e) write_reg(w, op.dsts[e], m, results[e], op.ty.bits);
   }
 
   void exec_st(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSt& op, Mask m) {
     uint32_t size = op.ty.bytes();
-    Lanes vals = read_operand(w, ctx, ins, op.src);
+    size_t n = op.srcs.size();
+    std::vector<Lanes> vals;
+    vals.reserve(n);
+    for (const auto& src : op.srcs) vals.push_back(read_operand(w, ctx, ins, src));
     Lanes base = addr_base(w, ctx, ins, op.addr);
+    uint32_t va = size * static_cast<uint32_t>(n);
     for (uint32_t lane = 0; lane < kWarpSize; ++lane)
       if (m & (1u << lane)) {
         uint64_t addr = base[lane] + static_cast<uint64_t>(op.addr.offset);
-        uint64_t v = size == 8 ? vals[lane] : (vals[lane] & ((1ull << (size * 8)) - 1));
-        try {
-          mem_.store_scalar(addr, size, v);
-        } catch (const Error& e) {
-          rethrow_with_context(e, ins, static_cast<int>(lane));
-        }
+        if (addr % va != 0)
+          ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
+                   "vector store requires " + std::to_string(va) + "-byte alignment");
+        for (size_t e = 0; e < n; ++e)
+          store_routed(w, ins, lane, addr + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
       }
   }
 
-  Lanes addr_base(Warp& w, const BlockCtx& ctx, const Instr& ins, const Addr& a) {
-    if (a.base_is_param)
-      throw Error::make(Err::UnsupportedPtx, "parameter-based addressing outside ld.param");
-    return read_operand(w, ctx, ins, Operand{RegOperand{a.base}});
+  void exec_atom(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    uint32_t size = op.ty.bytes();
+    if (size != 4 && size != 8)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, "atomics are only implemented for 32/64-bit types");
+    Lanes base = addr_base(w, ctx, ins, op.addr);
+    Lanes bv = read_operand(w, ctx, ins, op.b);
+    Lanes cv{};
+    if (op.op == AtomOp::Cas) cv = read_operand(w, ctx, ins, op.c);
+    Lanes r{};
+    // Fixed lane order: trivially atomic and deterministic in this engine.
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+      if (m & (1u << lane)) {
+        uint64_t addr = base[lane] + static_cast<uint64_t>(op.addr.offset);
+        uint64_t old = load_routed(w, ins, lane, addr, size);
+        uint64_t b = mask_to_bits(bv[lane], op.ty.bits);
+        uint64_t nv = old;
+        switch (op.op) {
+          case AtomOp::Add: nv = old + b; break;
+          case AtomOp::And: nv = old & b; break;
+          case AtomOp::Or: nv = old | b; break;
+          case AtomOp::Xor: nv = old ^ b; break;
+          case AtomOp::Exch: nv = b; break;
+          case AtomOp::Min:
+            nv = op.ty.is_signed()
+                     ? (size == 8 ? static_cast<uint64_t>(std::min(static_cast<int64_t>(old),
+                                                                   static_cast<int64_t>(b)))
+                                  : static_cast<uint64_t>(static_cast<uint32_t>(
+                                        std::min(static_cast<int32_t>(old), static_cast<int32_t>(b)))))
+                     : std::min(old, b);
+            break;
+          case AtomOp::Max:
+            nv = op.ty.is_signed()
+                     ? (size == 8 ? static_cast<uint64_t>(std::max(static_cast<int64_t>(old),
+                                                                   static_cast<int64_t>(b)))
+                                  : static_cast<uint64_t>(static_cast<uint32_t>(
+                                        std::max(static_cast<int32_t>(old), static_cast<int32_t>(b)))))
+                     : std::max(old, b);
+            break;
+          case AtomOp::Cas: nv = (old == mask_to_bits(cv[lane], op.ty.bits)) ? b : old; break;
+        }
+        store_routed(w, ins, lane, addr, size, mask_to_bits(nv, op.ty.bits));
+        r[lane] = old;
+      }
+    write_reg(w, op.dst, m, r, op.ty.bits);
+  }
+
+  // ---- device printf (the vprintf builtin) ----
+
+  std::string read_cstring(Warp& w, const Instr& ins, uint32_t lane, uint64_t addr) {
+    std::string out;
+    for (size_t i = 0; i < 8192; ++i) {
+      uint64_t b = load_routed(w, ins, lane, addr + i, 1);
+      if (b == 0) return out;
+      out += static_cast<char>(b);
+    }
+    ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+             "printf format string exceeds 8 KiB (missing NUL terminator?)");
+  }
+
+  void exec_vprintf(Warp& w, const Instr& ins, const OpCall& op, Mask m) {
+    if (op.param_slots.size() != 2)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, "vprintf expects exactly 2 arguments (format, valist)");
+    auto fmt_it = w.slots.find(op.param_slots[0]);
+    auto va_it = w.slots.find(op.param_slots[1]);
+    if (fmt_it == w.slots.end() || va_it == w.slots.end())
+      ctx_fail(ins, -1, Err::UninitializedRegister, "vprintf argument slot read before write");
+
+    Lanes counts{};
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      if (!(m & (1u << lane))) continue;
+      std::string fmt = read_cstring(w, ins, lane, fmt_it->second[lane]);
+      uint64_t valist = va_it->second[lane];
+      uint64_t cursor = 0;
+      std::string out;
+      char buf[256];
+
+      auto fetch = [&](uint32_t size) -> uint64_t {
+        cursor = (cursor + size - 1) / size * size;  // natural alignment in the valist
+        if (valist == 0)
+          ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                   "printf format consumes arguments but no argument buffer was passed");
+        uint64_t v = load_routed(w, ins, lane, valist + cursor, size);
+        cursor += size;
+        return v;
+      };
+
+      for (size_t i = 0; i < fmt.size(); ++i) {
+        if (fmt[i] != '%') {
+          out += fmt[i];
+          continue;
+        }
+        size_t start = i++;
+        if (i < fmt.size() && fmt[i] == '%') {
+          out += '%';
+          continue;
+        }
+        while (i < fmt.size() && std::string("-+ #0123456789.").find(fmt[i]) != std::string::npos) ++i;
+        int longs = 0;
+        while (i < fmt.size() && (fmt[i] == 'l' || fmt[i] == 'h' || fmt[i] == 'z')) {
+          if (fmt[i] == 'l') ++longs;
+          if (fmt[i] == 'z') longs = 2;
+          ++i;
+        }
+        if (i >= fmt.size())
+          ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                   "printf format ends inside a % specifier");
+        char conv = fmt[i];
+        // Spec with normalized length: 64-bit integers always use "ll".
+        std::string flags = fmt.substr(start + 1, (i - (longs ? longs : 0)) - start - 1);
+        // Strip any length chars that slipped into flags capture.
+        while (!flags.empty() && (flags.back() == 'l' || flags.back() == 'h' || flags.back() == 'z'))
+          flags.pop_back();
+        bool is64 = longs >= 1 || conv == 'p';  // %l.. and pointers are 8 bytes on this ABI
+        switch (conv) {
+          case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': case 'c': {
+            uint64_t v = fetch(is64 ? 8 : 4);
+            std::string spec = "%" + flags + (is64 ? "ll" : "") + conv;
+            if (is64)
+              std::snprintf(buf, sizeof buf, spec.c_str(), static_cast<unsigned long long>(v));
+            else if (conv == 'd' || conv == 'i' || conv == 'c')
+              std::snprintf(buf, sizeof buf, spec.c_str(), static_cast<int>(v));
+            else
+              std::snprintf(buf, sizeof buf, spec.c_str(), static_cast<unsigned>(v));
+            out += buf;
+            break;
+          }
+          case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+            uint64_t v = fetch(8);
+            std::string spec = "%" + flags + conv;
+            std::snprintf(buf, sizeof buf, spec.c_str(), f64(v));
+            out += buf;
+            break;
+          }
+          case 'p': {
+            uint64_t v = fetch(8);
+            std::snprintf(buf, sizeof buf, "0x%llx", static_cast<unsigned long long>(v));
+            out += buf;
+            break;
+          }
+          case 's': {
+            uint64_t v = fetch(8);
+            out += read_cstring(w, ins, lane, v);
+            break;
+          }
+          default:
+            ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                     std::string("printf conversion '%") + conv + "' is not implemented");
+        }
+      }
+      std::fwrite(out.data(), 1, out.size(), stdout);
+      counts[lane] = out.size();
+    }
+    std::fflush(stdout);
+    if (!op.retval_slot.empty()) {
+      Lanes& slot = w.slots[op.retval_slot];
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) slot[lane] = counts[lane];
+    }
   }
 
   const EntryFn& fn_;
@@ -540,6 +922,7 @@ class Interpreter {
   const ParamBuffer& params_;
   MemoryManager& mem_;
   const DeviceProfile& profile_;
+  const SymbolTable* symbols_;
   LaunchStats& stats_;
 };
 
@@ -549,11 +932,12 @@ ParamBuffer build_params(const EntryFn& fn, const std::vector<std::vector<uint8_
                       " parameters, launch supplied ", args.size());
   ParamBuffer pb;
   for (size_t i = 0; i < args.size(); ++i) {
-    uint32_t size = fn.params[i].ty.bytes();
+    uint32_t size = fn.params[i].size;
     if (args[i].size() != size)
       throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "' parameter '", fn.params[i].name,
                         "' is ", size, " bytes, launch supplied ", args[i].size(), " bytes");
-    uint32_t off = static_cast<uint32_t>((pb.bytes.size() + size - 1) / size * size);  // natural alignment
+    uint32_t align = fn.params[i].align ? fn.params[i].align : (size < 8 ? size : 8);
+    uint32_t off = static_cast<uint32_t>((pb.bytes.size() + align - 1) / align * align);
     pb.bytes.resize(off + size);
     std::memcpy(pb.bytes.data() + off, args[i].data(), size);
     pb.layout[fn.params[i].name] = {off, size};
@@ -590,11 +974,11 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
 
 LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
                    const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
-                   const DeviceProfile& profile) {
+                   const DeviceProfile& profile, const SymbolTable* symbols) {
   validate(fn, cfg, profile);
   ParamBuffer pb = build_params(fn, args);
   LaunchStats stats;
-  Interpreter interp(fn, cfg, pb, mem, profile, stats);
+  Interpreter interp(fn, cfg, pb, mem, profile, symbols, stats);
   interp.run_grid();
   return stats;
 }

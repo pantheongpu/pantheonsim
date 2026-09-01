@@ -1,0 +1,616 @@
+// libvgpucudart — VirtualGPU's implementation of the CUDA Runtime API.
+//
+// This is what unmodified nvcc-compiled applications link against. It replaces
+// NVIDIA's libcudart: the same documented C ABI, backed by the VirtualGPU CPU
+// engine instead of a GPU. It implements two documented interfaces:
+//
+//   1. The public CUDA Runtime API (cudaMalloc, cudaMemcpy, cudaLaunchKernel,
+//      cudaGetDeviceProperties, ...), from docs.nvidia.com.
+//   2. The nvcc host boilerplate ABI (__cudaRegisterFatBinary,
+//      __cudaRegisterFunction, __cudaPushCallConfiguration, ...) that the
+//      "<<<grid, block>>>" launch syntax lowers to, documented in the toolkit's
+//      crt/host_runtime.h. These let a chevron launch route to cudaLaunchKernel.
+//
+// Building this file requires the CUDA toolkit's ABI headers (driver_types.h,
+// vector_types.h) for the exact cudaDeviceProp / enum layout — they are used at
+// build time only and not redistributed. The rest of VirtualGPU stays
+// dependency-free; this shim is an optional target (see CMakeLists.txt).
+//
+// Everything is synchronous and deterministic, matching the engine.
+#include <driver_types.h>
+#include <vector_types.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "fatbin.hpp"
+static_assert(sizeof(cudaDeviceProp) == 1008, "cudaDeviceProp ABI size drift");
+#include "vgpu/error.hpp"
+#include "vgpu/registry.hpp"
+#include "vgpu/runtime/runtime.hpp"
+
+namespace {
+
+constexpr int kRuntimeVersion = 13000;  // CUDA 13.0
+constexpr int kDriverVersion = 13000;
+
+bool quiet() {
+  const char* q = std::getenv("VGPU_QUIET");
+  return q && q[0] == '1';
+}
+bool trace() {
+  const char* t = std::getenv("VGPU_TRACE");
+  return t && t[0] == '1';
+}
+
+// A fatbin registered by the host boilerplate. PTX is parsed into a runtime
+// module lazily on first use for the active device.
+struct RegisteredModule {
+  std::string ptx;
+  std::unordered_map<int, uint64_t> module_per_device;  // device -> runtime module id
+};
+
+struct KernelInfo {
+  RegisteredModule* mod = nullptr;
+  std::string entry_name;
+};
+
+struct State {
+  std::recursive_mutex mu;
+  std::unique_ptr<vgpu::runtime::Runtime> rt;
+  int current_device = 0;
+  std::vector<std::unique_ptr<RegisteredModule>> modules;
+  std::unordered_map<const void*, KernelInfo> kernels;  // host stub ptr -> kernel
+  std::map<void*, size_t> host_allocs;
+  bool initialized = false;
+};
+
+State& st() {
+  static State s;
+  return s;
+}
+
+void ensure_init(State& s) {
+  if (s.initialized) return;
+  const char* gpu = std::getenv("VGPU_GPU");
+  std::string id = gpu && gpu[0] ? gpu : "nvidia/h100";
+  int count = 1;
+  if (const char* c = std::getenv("VGPU_DEVICE_COUNT"); c && c[0]) count = std::atoi(c);
+  vgpu::DeviceProfile profile = vgpu::load_gpu(id);
+  // Optional: shrink advertised VRAM so VRAM-proportional stress tests run at
+  // laptop scale (their size is a % of device memory). Functional behavior is
+  // unchanged; only the working-set size the app chooses shrinks.
+  if (const char* mb = std::getenv("VGPU_VRAM_MB"); mb && mb[0])
+    profile.vram_bytes = static_cast<uint64_t>(std::strtoull(mb, nullptr, 10)) * 1024ull * 1024ull;
+  s.rt = std::make_unique<vgpu::runtime::Runtime>(profile, count);
+  s.initialized = true;
+  if (!quiet())
+    std::fprintf(stderr, "[vgpu] virtual GPU platform initialized: %d x %s (%s)\n", count,
+                 profile.id.c_str(), profile.model.c_str());
+}
+
+// Sticky last error, per the runtime API contract.
+thread_local cudaError_t g_last_error = cudaSuccess;
+
+cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
+  using vgpu::Err;
+  cudaError_t code;
+  switch (e.code()) {
+    case Err::OutOfMemory: code = cudaErrorMemoryAllocation; break;
+    case Err::UnknownGpu: code = cudaErrorInvalidDevice; break;
+    case Err::PtxParse: code = cudaErrorInvalidPtx; break;
+    case Err::UnsupportedPtx:
+    case Err::Unsupported: code = cudaErrorNotSupported; break;
+    case Err::NotFound: code = cudaErrorInvalidDeviceFunction; break;
+    case Err::ExecLimit: code = cudaErrorLaunchTimeout; break;
+    case Err::InvalidPointer:
+    case Err::UseAfterFree:
+    case Err::OutOfBounds:
+    case Err::MisalignedAccess:
+    case Err::UninitializedRegister: code = cudaErrorIllegalAddress; break;
+    default: code = cudaErrorInvalidValue; break;
+  }
+  (void)s;
+  if (!quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", api, e.what());
+  g_last_error = code;
+  return code;
+}
+
+vgpu::runtime::Device& current(State& s) { return s.rt->device(s.current_device); }
+
+// Loads (once) the runtime module for a registered fatbin on the current device.
+uint64_t module_on_current(State& s, RegisteredModule& m) {
+  int dev = s.current_device;
+  auto it = m.module_per_device.find(dev);
+  if (it != m.module_per_device.end()) return it->second;
+  uint64_t mid = s.rt->device(dev).load_module(m.ptx);
+  m.module_per_device[dev] = mid;
+  return mid;
+}
+
+template <class F>
+cudaError_t guard(const char* api, F&& body) {
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  try {
+    ensure_init(s);
+    cudaError_t rc = body(s);
+    if (rc != cudaSuccess) g_last_error = rc;
+    return rc;
+  } catch (const vgpu::Error& e) {
+    return set_error(s, e, api);
+  } catch (const std::exception& e) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", api, e.what());
+    g_last_error = cudaErrorUnknown;
+    return cudaErrorUnknown;
+  }
+}
+
+bool is_device_ptr(const void* p) {
+  return reinterpret_cast<uint64_t>(p) >= vgpu::kDeviceVaBase;
+}
+
+// Pending chevron launch configuration, pushed by __cudaPushCallConfiguration
+// and consumed by __cudaPopCallConfiguration inside the generated launch stub.
+struct PendingConfig {
+  dim3 grid, block;
+  size_t shared = 0;
+  void* stream = nullptr;
+  bool valid = false;
+};
+thread_local PendingConfig g_pending_config;
+
+}  // namespace
+
+#define VGPU_EXPORT extern "C" __attribute__((visibility("default")))
+
+/* ===================================================================== */
+/* nvcc host boilerplate ABI (chevron launches lower onto these)         */
+/* ===================================================================== */
+
+VGPU_EXPORT void** __cudaRegisterFatBinary(void* fatCubin) {
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  try {
+    ensure_init(s);
+    auto rm = std::make_unique<RegisteredModule>();
+    // fatCubin is a __fatBinC_Wrapper_t*; extract the best PTX image.
+    auto ptxs = vgpu::cuda::extract_ptx(fatCubin);
+    if (ptxs.empty()) {
+      if (!quiet())
+        std::fprintf(stderr,
+                     "[vgpu] __cudaRegisterFatBinary: no PTX in fatbin (SASS-only build); rebuild "
+                     "with an -arch that embeds PTX\n");
+      // Return a handle anyway; the failure surfaces at launch with context.
+    } else {
+      size_t best = 0;
+      for (size_t i = 1; i < ptxs.size(); ++i)
+        if (ptxs[i].arch > ptxs[best].arch) best = i;
+      rm->ptx = std::move(ptxs[best].text);
+    }
+    RegisteredModule* raw = rm.get();
+    s.modules.push_back(std::move(rm));
+    if (trace()) std::fprintf(stderr, "[vgpu][trace] __cudaRegisterFatBinary -> %p\n", (void*)raw);
+    return reinterpret_cast<void**>(raw);
+  } catch (const std::exception& e) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] __cudaRegisterFatBinary: %s\n", e.what());
+    return nullptr;
+  }
+}
+
+VGPU_EXPORT void __cudaRegisterFatBinaryEnd(void**) {}
+VGPU_EXPORT void __cudaUnregisterFatBinary(void**) {}
+VGPU_EXPORT char __cudaInitModule(void**) { return 1; }
+
+VGPU_EXPORT void __cudaRegisterFunction(void** fatCubinHandle, const char* hostFun, char* deviceFun,
+                                        const char* deviceName, int thread_limit, void* tid,
+                                        void* bid, void* bDim, void* gDim, int* wSize) {
+  (void)deviceFun;
+  (void)thread_limit;
+  (void)tid;
+  (void)bid;
+  (void)bDim;
+  (void)gDim;
+  (void)wSize;
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  auto* mod = reinterpret_cast<RegisteredModule*>(fatCubinHandle);
+  s.kernels[reinterpret_cast<const void*>(hostFun)] = {mod, deviceName};
+  if (trace())
+    std::fprintf(stderr, "[vgpu][trace] __cudaRegisterFunction: stub %p -> '%s'\n", (void*)hostFun,
+                 deviceName);
+}
+
+VGPU_EXPORT void __cudaRegisterVar(void** /*handle*/, char* /*hostVar*/, char* /*deviceAddress*/,
+                                   const char* /*deviceName*/, int /*ext*/, size_t /*size*/,
+                                   int /*constant*/, int /*global*/) {
+  // __device__/__constant__ variables: the workloads in scope do not read them
+  // from the host, so recording is deferred. (No silent misbehavior: a kernel
+  // that references an unregistered global still gets a clear symbol error.)
+}
+
+VGPU_EXPORT unsigned __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim, size_t sharedMem,
+                                                 void* stream) {
+  g_pending_config = {gridDim, blockDim, sharedMem, stream, true};
+  return 0;  // 0 == configuration accepted; the stub then runs the kernel body
+}
+
+VGPU_EXPORT cudaError_t __cudaPopCallConfiguration(dim3* gridDim, dim3* blockDim, size_t* sharedMem,
+                                                   void* stream) {
+  if (!g_pending_config.valid) return cudaErrorInvalidConfiguration;
+  if (gridDim) *gridDim = g_pending_config.grid;
+  if (blockDim) *blockDim = g_pending_config.block;
+  if (sharedMem) *sharedMem = g_pending_config.shared;
+  if (stream) *reinterpret_cast<void**>(stream) = g_pending_config.stream;
+  g_pending_config.valid = false;
+  return cudaSuccess;
+}
+
+/* ===================================================================== */
+/* Launch                                                                */
+/* ===================================================================== */
+
+// CUDA 12.4+ chevron lowering: the stub calls __cudaGetKernel(&handle, hostFun)
+// once, then __cudaLaunchKernel(handle, ...). We use the host stub pointer
+// itself as the opaque kernel handle, so both map back to the registered entry.
+typedef void* vgpu_cudaKernel_t;
+
+VGPU_EXPORT cudaError_t __cudaGetKernel(vgpu_cudaKernel_t* kernel, const void* hostFun) {
+  if (!kernel) return cudaErrorInvalidValue;
+  *kernel = const_cast<void*>(hostFun);
+  return cudaSuccess;
+}
+
+extern "C" cudaError_t cudaLaunchKernel(const void*, dim3, dim3, void**, size_t, cudaStream_t);
+
+VGPU_EXPORT cudaError_t __cudaLaunchKernel(vgpu_cudaKernel_t kernel, dim3 gridDim, dim3 blockDim,
+                                          void** args, size_t sharedMem, cudaStream_t stream) {
+  return cudaLaunchKernel(kernel, gridDim, blockDim, args, sharedMem, stream);
+}
+VGPU_EXPORT cudaError_t __cudaLaunchKernel_ptsz(vgpu_cudaKernel_t kernel, dim3 gridDim, dim3 blockDim,
+                                               void** args, size_t sharedMem, cudaStream_t stream) {
+  return cudaLaunchKernel(kernel, gridDim, blockDim, args, sharedMem, stream);
+}
+
+VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args,
+                                         size_t sharedMem, cudaStream_t stream) {
+  (void)stream;
+  return guard("cudaLaunchKernel", [&](State& s) -> cudaError_t {
+    auto it = s.kernels.find(func);
+    if (it == s.kernels.end()) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] cudaLaunchKernel: unregistered kernel stub %p\n", func);
+      return cudaErrorInvalidDeviceFunction;
+    }
+    KernelInfo& ki = it->second;
+    if (!ki.mod || ki.mod->ptx.empty())
+      throw vgpu::Error::make(vgpu::Err::Unsupported,
+                              "kernel '" + ki.entry_name +
+                                  "' has no PTX (SASS-only fatbin); rebuild with embedded PTX");
+    uint64_t mid = module_on_current(s, *ki.mod);
+    vgpu::runtime::Device& dev = current(s);
+    const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
+
+    std::vector<std::vector<uint8_t>> kargs(fn->params.size());
+    for (size_t i = 0; i < fn->params.size(); ++i) {
+      uint32_t size = fn->params[i].size;
+      kargs[i].resize(size);
+      std::memcpy(kargs[i].data(), args[i], size);
+    }
+    vgpu::exec::LaunchConfig cfg;
+    cfg.grid = {gridDim.x, gridDim.y, gridDim.z};
+    cfg.block = {blockDim.x, blockDim.y, blockDim.z};
+    cfg.shared_bytes = static_cast<uint32_t>(sharedMem);
+    dev.launch(*fn, cfg, kargs, dev.symbols(mid));
+    return cudaSuccess;
+  });
+}
+
+/* ===================================================================== */
+/* Device management                                                     */
+/* ===================================================================== */
+
+VGPU_EXPORT cudaError_t cudaGetDeviceCount(int* count) {
+  return guard("cudaGetDeviceCount", [&](State& s) {
+    if (!count) return cudaErrorInvalidValue;
+    *count = s.rt->device_count();
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaSetDevice(int device) {
+  return guard("cudaSetDevice", [&](State& s) {
+    if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
+    s.current_device = device;
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaGetDevice(int* device) {
+  return guard("cudaGetDevice", [&](State& s) {
+    if (!device) return cudaErrorInvalidValue;
+    *device = s.current_device;
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaSetDeviceFlags(unsigned int) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaGetDeviceFlags(unsigned int* flags) {
+  if (flags) *flags = 0;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaDeviceSynchronize(void) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaDeviceReset(void) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaThreadSynchronize(void) { return cudaSuccess; }
+
+VGPU_EXPORT cudaError_t cudaGetDeviceProperties(cudaDeviceProp* prop, int device) {
+  return guard("cudaGetDeviceProperties", [&](State& s) {
+    if (!prop) return cudaErrorInvalidValue;
+    if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
+    const vgpu::DeviceProfile& p = s.rt->device(device).profile();
+    std::memset(prop, 0, sizeof *prop);
+    std::snprintf(prop->name, sizeof prop->name, "%s", p.model.c_str());
+    prop->totalGlobalMem = p.vram_bytes;
+    prop->warpSize = static_cast<int>(p.warp_size);
+    prop->major = p.cc_major;
+    prop->minor = p.cc_minor;
+    prop->multiProcessorCount = static_cast<int>(p.limits.multiprocessors);
+    prop->maxThreadsPerBlock = static_cast<int>(p.limits.max_threads_per_block);
+    prop->maxThreadsPerMultiProcessor = (p.cc_major == 8 && p.cc_minor >= 6) ? 1536 : 2048;
+    prop->sharedMemPerBlock = p.limits.shared_mem_per_block;
+    prop->sharedMemPerBlockOptin = p.limits.shared_mem_per_block_optin;
+    prop->sharedMemPerMultiprocessor = p.limits.shared_mem_per_block_optin;
+    prop->regsPerBlock = static_cast<int>(p.limits.registers_per_block);
+    prop->regsPerMultiprocessor = static_cast<int>(p.limits.registers_per_block);
+    prop->maxThreadsDim[0] = static_cast<int>(p.limits.max_block_dim[0]);
+    prop->maxThreadsDim[1] = static_cast<int>(p.limits.max_block_dim[1]);
+    prop->maxThreadsDim[2] = static_cast<int>(p.limits.max_block_dim[2]);
+    prop->maxGridSize[0] = static_cast<int>(p.limits.max_grid_dim[0]);
+    prop->maxGridSize[1] = static_cast<int>(p.limits.max_grid_dim[1]);
+    prop->maxGridSize[2] = static_cast<int>(p.limits.max_grid_dim[2]);
+    prop->totalConstMem = 65536;
+    // Performance-related fields (clocks, bus width) are placeholders — VirtualGPU
+    // models no performance. CUDA 13 dropped clockRate/memoryClockRate/computeMode
+    // from cudaDeviceProp entirely.
+    prop->memoryBusWidth = 256;  // placeholder
+    prop->l2CacheSize = 8 * 1024 * 1024;
+    prop->concurrentKernels = 1;
+    prop->unifiedAddressing = 1;
+    prop->canMapHostMemory = 1;
+    prop->pciBusID = device + 1;
+    prop->pciDeviceID = 0;
+    prop->integrated = 0;
+    prop->ECCEnabled = 0;
+    prop->maxThreadsPerBlock = static_cast<int>(p.limits.max_threads_per_block);
+    // Deterministic fake UUID (matches the driver shim scheme).
+    unsigned char b[16] = {'V', 'G', 'P', 'U'};
+    uint32_t h = 2166136261u;
+    for (char c : p.id) h = (h ^ static_cast<unsigned char>(c)) * 16777619u;
+    std::memcpy(b + 4, &h, 4);
+    b[8] = static_cast<unsigned char>(device);
+    std::memcpy(&prop->uuid, b, 16);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, int attr, int device) {
+  return guard("cudaDeviceGetAttribute", [&](State& s) {
+    if (!value) return cudaErrorInvalidValue;
+    if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
+    const vgpu::DeviceProfile& p = s.rt->device(device).profile();
+    switch (attr) {
+      case 1: *value = static_cast<int>(p.limits.max_threads_per_block); break;  // MaxThreadsPerBlock
+      case 8: *value = static_cast<int>(p.limits.shared_mem_per_block); break;   // MaxSharedPerBlock
+      case 10: *value = static_cast<int>(p.warp_size); break;                    // WarpSize
+      case 16: *value = static_cast<int>(p.limits.multiprocessors); break;       // MultiProcessorCount
+      case 39: *value = (p.cc_major == 8 && p.cc_minor >= 6) ? 1536 : 2048; break;  // MaxThreads/SM
+      case 75: *value = p.cc_major; break;                                       // ComputeCapabilityMajor
+      case 76: *value = p.cc_minor; break;                                       // ComputeCapabilityMinor
+      default:
+        if (trace()) std::fprintf(stderr, "[vgpu][trace] cudaDeviceGetAttribute(%d) -> 0\n", attr);
+        *value = 0;
+    }
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaDeviceCanAccessPeer(int* can, int, int) {
+  if (can) *can = 0;
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaDeviceEnablePeerAccess(int, unsigned int) { return cudaSuccess; }
+
+VGPU_EXPORT cudaError_t cudaMemGetInfo(size_t* free_b, size_t* total_b) {
+  return guard("cudaMemGetInfo", [&](State& s) {
+    if (!free_b || !total_b) return cudaErrorInvalidValue;
+    vgpu::MemoryManager& mm = current(s).memory();
+    *total_b = static_cast<size_t>(mm.capacity());
+    *free_b = static_cast<size_t>(mm.capacity() - mm.used());
+    return cudaSuccess;
+  });
+}
+
+/* ===================================================================== */
+/* Memory                                                                */
+/* ===================================================================== */
+
+VGPU_EXPORT cudaError_t cudaMalloc(void** ptr, size_t size) {
+  return guard("cudaMalloc", [&](State& s) {
+    if (!ptr) return cudaErrorInvalidValue;
+    *ptr = reinterpret_cast<void*>(current(s).memory().alloc(size));
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaFree(void* ptr) {
+  return guard("cudaFree", [&](State& s) {
+    if (!ptr) return cudaSuccess;  // cudaFree(NULL) is a documented no-op
+    current(s).memory().free(reinterpret_cast<uint64_t>(ptr));
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cudaMemcpyKind kind) {
+  return guard("cudaMemcpy", [&](State& s) {
+    vgpu::MemoryManager& mm = current(s).memory();
+    bool dd = is_device_ptr(dst), sd = is_device_ptr(src);
+    if (kind == cudaMemcpyDefault) kind = dd && sd ? cudaMemcpyDeviceToDevice
+                                          : dd      ? cudaMemcpyHostToDevice
+                                          : sd      ? cudaMemcpyDeviceToHost
+                                                    : cudaMemcpyHostToHost;
+    switch (kind) {
+      case cudaMemcpyHostToDevice:
+        mm.write(reinterpret_cast<uint64_t>(dst), src, count);
+        break;
+      case cudaMemcpyDeviceToHost:
+        mm.read(reinterpret_cast<uint64_t>(src), dst, count);
+        break;
+      case cudaMemcpyDeviceToDevice: {
+        std::vector<uint8_t> tmp(count);
+        mm.read(reinterpret_cast<uint64_t>(src), tmp.data(), count);
+        mm.write(reinterpret_cast<uint64_t>(dst), tmp.data(), count);
+        break;
+      }
+      case cudaMemcpyHostToHost:
+        std::memcpy(dst, src, count);
+        break;
+      default:
+        return cudaErrorInvalidValue;
+    }
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t count,
+                                        cudaMemcpyKind kind, cudaStream_t) {
+  return cudaMemcpy(dst, src, count, kind);
+}
+
+VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
+  return guard("cudaMemset", [&](State& s) {
+    std::vector<uint8_t> buf(count, static_cast<uint8_t>(value));
+    current(s).memory().write(reinterpret_cast<uint64_t>(dst), buf.data(), count);
+    return cudaSuccess;
+  });
+}
+VGPU_EXPORT cudaError_t cudaMemsetAsync(void* dst, int value, size_t count, cudaStream_t) {
+  return cudaMemset(dst, value, count);
+}
+
+VGPU_EXPORT cudaError_t cudaMallocHost(void** ptr, size_t size) {
+  return guard("cudaMallocHost", [&](State&) {
+    if (!ptr) return cudaErrorInvalidValue;
+    void* p = std::aligned_alloc(4096, (size + 4095) / 4096 * 4096);
+    if (!p) return cudaErrorMemoryAllocation;
+    st().host_allocs[p] = size;
+    *ptr = p;
+    return cudaSuccess;
+  });
+}
+VGPU_EXPORT cudaError_t cudaHostAlloc(void** ptr, size_t size, unsigned int) {
+  return cudaMallocHost(ptr, size);
+}
+VGPU_EXPORT cudaError_t cudaFreeHost(void* ptr) {
+  return guard("cudaFreeHost", [&](State& s) {
+    if (!ptr) return cudaSuccess;
+    s.host_allocs.erase(ptr);
+    std::free(ptr);
+    return cudaSuccess;
+  });
+}
+VGPU_EXPORT cudaError_t cudaMemcpyPeerAsync(void* dst, int, const void* src, int, size_t count,
+                                            cudaStream_t) {
+  return cudaMemcpy(dst, src, count, cudaMemcpyDeviceToDevice);
+}
+
+/* ===================================================================== */
+/* Streams and events (synchronous / wall-clock)                         */
+/* ===================================================================== */
+
+VGPU_EXPORT cudaError_t cudaStreamCreate(cudaStream_t* s) {
+  if (s) *s = reinterpret_cast<cudaStream_t>(0x1);
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned int) {
+  return cudaStreamCreate(s);
+}
+VGPU_EXPORT cudaError_t cudaStreamDestroy(cudaStream_t) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaStreamSynchronize(cudaStream_t) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaStreamQuery(cudaStream_t) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned int) {
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaEventCreate(cudaEvent_t* e) {
+  if (e) *e = reinterpret_cast<cudaEvent_t>(std::malloc(sizeof(long long)));
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned int) {
+  return cudaEventCreate(e);
+}
+VGPU_EXPORT cudaError_t cudaEventRecord(cudaEvent_t, cudaStream_t) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaEventSynchronize(cudaEvent_t) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaEventQuery(cudaEvent_t) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t, cudaEvent_t) {
+  if (ms) *ms = 0.0f;  // VirtualGPU does not model timing
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaEventDestroy(cudaEvent_t e) {
+  std::free(e);
+  return cudaSuccess;
+}
+
+/* ===================================================================== */
+/* Errors and versions                                                   */
+/* ===================================================================== */
+
+VGPU_EXPORT cudaError_t cudaGetLastError(void) {
+  cudaError_t e = g_last_error;
+  g_last_error = cudaSuccess;
+  return e;
+}
+VGPU_EXPORT cudaError_t cudaPeekAtLastError(void) { return g_last_error; }
+
+VGPU_EXPORT const char* cudaGetErrorString(cudaError_t error) {
+  switch (error) {
+    case cudaSuccess: return "no error";
+    case cudaErrorMemoryAllocation: return "out of memory";
+    case cudaErrorInvalidValue: return "invalid argument";
+    case cudaErrorInvalidDevice: return "invalid device ordinal";
+    case cudaErrorInvalidDeviceFunction: return "invalid device function";
+    case cudaErrorInvalidPtx: return "a PTX JIT compilation failed";
+    case cudaErrorIllegalAddress: return "an illegal memory access was encountered";
+    case cudaErrorLaunchTimeout: return "the launch timed out and was terminated";
+    case cudaErrorNotSupported: return "operation not supported";
+    default: return "unknown error";
+  }
+}
+VGPU_EXPORT const char* cudaGetErrorName(cudaError_t error) {
+  switch (error) {
+    case cudaSuccess: return "cudaSuccess";
+    case cudaErrorMemoryAllocation: return "cudaErrorMemoryAllocation";
+    case cudaErrorInvalidValue: return "cudaErrorInvalidValue";
+    case cudaErrorInvalidDevice: return "cudaErrorInvalidDevice";
+    case cudaErrorInvalidDeviceFunction: return "cudaErrorInvalidDeviceFunction";
+    case cudaErrorInvalidPtx: return "cudaErrorInvalidPtx";
+    case cudaErrorIllegalAddress: return "cudaErrorIllegalAddress";
+    case cudaErrorNotSupported: return "cudaErrorNotSupported";
+    default: return "cudaErrorUnknown";
+  }
+}
+
+VGPU_EXPORT cudaError_t cudaDriverGetVersion(int* v) {
+  if (v) *v = kDriverVersion;
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaRuntimeGetVersion(int* v) {
+  if (v) *v = kRuntimeVersion;
+  return cudaSuccess;
+}

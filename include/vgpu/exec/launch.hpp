@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <vector>
 
+#include <map>
+
 #include "vgpu/exec/scheduler.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/profile.hpp"
@@ -27,11 +29,15 @@ struct LaunchStats {
   uint64_t instructions = 0;
 };
 
+// Module global-variable addresses (name -> device VA), materialized by the
+// runtime at module load. Kernels referencing globals need this at launch.
+using SymbolTable = std::map<std::string, uint64_t>;
+
 // Runs `fn` across the whole grid on the CPU. `args` are the raw kernel
 // parameter values, one byte-vector per .param (sizes must match).
 // Deterministic: same inputs -> same result, always.
 LaunchStats launch(const ptx::EntryFn& fn, const LaunchConfig& cfg,
                    const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
-                   const DeviceProfile& profile);
+                   const DeviceProfile& profile, const SymbolTable* symbols = nullptr);
 
 }  // namespace vgpu::exec

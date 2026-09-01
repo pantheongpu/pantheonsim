@@ -44,6 +44,18 @@ std::vector<Token> lex(const std::string& src) {
       i += 2;
       continue;
     }
+    if (c == '"') {
+      // String literal (e.g. .pragma "nounroll"). Kept as one token, quotes and all.
+      size_t start = i++;
+      while (i < n && src[i] != '"') {
+        if (src[i] == '\n') ++line;
+        ++i;
+      }
+      if (i >= n) throw Error::make(Err::PtxParse, "line ", line, ": unterminated string literal");
+      ++i;
+      out.push_back({Token::Kind::Word, src.substr(start, i - start), line});
+      continue;
+    }
     if (word_char(c)) {
       size_t start = i;
       while (i < n && word_char(src[i])) ++i;

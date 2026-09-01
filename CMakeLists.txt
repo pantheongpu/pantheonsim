@@ -51,8 +51,57 @@ add_library(vgpu STATIC
 target_include_directories(vgpu PUBLIC include "${_gen_dir}")
 
 # libvgpucuda: the CUDA Driver API shim external programs link against.
-add_library(vgpucuda SHARED src/cuda/driver_api.cpp)
-target_link_libraries(vgpucuda PRIVATE vgpu)
+add_library(vgpucuda SHARED src/cuda/driver_api.cpp src/cuda/fatbin.cpp)
+target_link_libraries(vgpucuda PRIVATE vgpu ${CMAKE_DL_LIBS})
+# The shim directory: prepend to LD_LIBRARY_PATH and unmodified CUDA binaries
+# (static cudart included) dlopen VirtualGPU as the driver.
+add_custom_command(TARGET vgpucuda POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libvgpucuda.so" "${CMAKE_BINARY_DIR}/shim/libcuda.so.1"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libvgpucuda.so" "${CMAKE_BINARY_DIR}/shim/libcuda.so"
+  COMMENT "Creating driver shim symlinks (build/shim/libcuda.so.1)")
+
+# ---------------------------------------------------------------------------
+# libvgpucudart: the CUDA *runtime* API shim. Lets unmodified nvcc-compiled
+# applications (built against shared cudart) run on VirtualGPU. Requires the
+# CUDA toolkit's ABI headers at build time (driver_types.h) for exact struct
+# layout; built only when they are found, so the core stays dependency-free.
+# ---------------------------------------------------------------------------
+# Derive the ABI include from the nvcc that will compile the workloads, so the
+# shim's cudaDeviceProp layout matches the application's exactly. A mismatched
+# system copy (e.g. an older /usr/include/driver_types.h) would corrupt caller
+# structs, so nvcc's own toolkit include is the only trustworthy source.
+find_program(VGPU_NVCC nvcc)
+if(VGPU_NVCC)
+  get_filename_component(_nvcc_bin "${VGPU_NVCC}" DIRECTORY)
+  get_filename_component(_cuda_root "${_nvcc_bin}" DIRECTORY)
+  find_path(CUDA_ABI_INCLUDE driver_types.h
+    PATHS "${_cuda_root}/include" "${_cuda_root}/targets/x86_64-linux/include"
+    NO_DEFAULT_PATH)
+endif()
+if(NOT CUDA_ABI_INCLUDE)
+  find_path(CUDA_ABI_INCLUDE driver_types.h
+    PATHS /usr/local/cuda/include /opt/cuda/include ENV CUDA_HOME ENV CUDA_PATH
+    PATH_SUFFIXES include NO_DEFAULT_PATH)
+endif()
+if(CUDA_ABI_INCLUDE)
+  message(STATUS "CUDA ABI headers at ${CUDA_ABI_INCLUDE}: building libvgpucudart")
+  add_library(vgpucudart SHARED src/cuda/runtime_api.cpp src/cuda/fatbin.cpp)
+  target_link_libraries(vgpucudart PRIVATE vgpu ${CMAKE_DL_LIBS})
+  target_include_directories(vgpucudart PRIVATE ${CUDA_ABI_INCLUDE} src/cuda)
+  # Present as libcudart.so.13 so unmodified binaries find us via LD_LIBRARY_PATH.
+  set_target_properties(vgpucudart PROPERTIES OUTPUT_NAME cudart)
+  target_link_options(vgpucudart PRIVATE
+    "-Wl,--version-script=${CMAKE_SOURCE_DIR}/src/cuda/cudart.map"
+    "-Wl,-soname,libcudart.so.13")
+  add_custom_command(TARGET vgpucudart POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so" "${CMAKE_BINARY_DIR}/shim/libcudart.so.13"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so" "${CMAKE_BINARY_DIR}/shim/libcudart.so.12"
+    COMMENT "Creating runtime shim symlinks (build/shim/libcudart.so.13)")
+else()
+  message(STATUS "CUDA ABI headers not found: skipping libvgpucudart (core unaffected)")
+endif()
 
 # CLI
 add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp)
@@ -78,6 +127,8 @@ target_compile_definitions(test_ptx PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR}
 vgpu_unit_test(test_exec)
 target_compile_definitions(test_exec PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR}/tests/kernels")
 vgpu_unit_test(test_runtime)
+vgpu_unit_test(test_exec2)
+vgpu_unit_test(test_exec3)
 
 # The C harness: an "external application" built with a plain C compiler
 # against the documented ABI only (vgpu_cuda.h + libvgpucuda.so).
@@ -86,3 +137,10 @@ target_link_libraries(vector_add_driver PRIVATE vgpucuda)
 target_include_directories(vector_add_driver PRIVATE include)
 add_test(NAME c_harness_vector_add COMMAND vector_add_driver)
 set_tests_properties(c_harness_vector_add PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100")
+
+# End-to-end: an nvcc-compiled CUDA app run through libvgpucudart. Depends on
+# the runtime shim; only meaningful when it was built (CUDA headers present).
+if(TARGET vgpucudart)
+  add_test(NAME e2e_vector_add COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_e2e.sh)
+  set_tests_properties(e2e_vector_add PROPERTIES DEPENDS vgpucudart)
+endif()

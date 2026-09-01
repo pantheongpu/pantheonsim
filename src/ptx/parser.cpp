@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <optional>
+#include <set>
 #include <unordered_map>
 
 #include "lexer.hpp"
@@ -25,15 +26,24 @@ const std::unordered_map<std::string, Sreg>& sreg_table() {
   return t;
 }
 
+// ld/st/atom modifiers that are functionally inert for this engine
+// (cache hints, memory orders, scopes).
+bool inert_mem_modifier(const std::string& p) {
+  static const std::set<std::string> inert = {"volatile", "nc", "ca", "cg", "cs", "lu",  "cv",
+                                              "wb",       "wt", "relaxed", "acquire", "release",
+                                              "acq_rel",  "cta", "gpu", "sys"};
+  return inert.count(p) > 0;
+}
+
 std::vector<std::string> split_dots(const std::string& s) {
   std::vector<std::string> parts;
   std::string cur;
-  for (size_t i = 0; i < s.size(); ++i) {
-    if (s[i] == '.') {
+  for (char c : s) {
+    if (c == '.') {
       if (!cur.empty()) parts.push_back(cur);
       cur.clear();
     } else {
-      cur += s[i];
+      cur += c;
     }
   }
   if (!cur.empty()) parts.push_back(cur);
@@ -75,7 +85,7 @@ class Parser {
       if (t.text == ".target") {
         next();
         m.target = expect_word("target");
-        while (peek_punct(",")) {  // e.g. ".target sm_90, debug"
+        while (peek_punct(",")) {
           next();
           m.target += "," + expect_word("target option");
         }
@@ -91,16 +101,36 @@ class Parser {
       }
       if (t.text == ".visible" || t.text == ".weak") {
         next();
-        continue;  // linkage qualifier before .entry
+        continue;  // linkage qualifier
+      }
+      if (t.text == ".pragma") {
+        next();
+        while (!at_end() && !peek_punct(";")) next();
+        if (!at_end()) next();
+        continue;
+      }
+      if (t.text == ".extern") {
+        // ".extern .func (...) name (...);" — declaration of an external
+        // function (vprintf). Recorded implicitly; skip to the ';'.
+        while (!at_end() && !peek_punct(";")) next();
+        if (!at_end()) next();
+        continue;
       }
       if (t.text == ".entry") {
         next();
-        m.entries.push_back(parse_entry(t.line));
+        m.entries.push_back(parse_entry());
         continue;
       }
+      if (t.text == ".global" || t.text == ".const") {
+        next();
+        m.globals.push_back(parse_global(t.line));
+        continue;
+      }
+      if (t.text == ".func")
+        fail_unsupported(t.line, ".func", "", "device functions are not supported (only .entry kernels)");
       fail_unsupported(t.line, t.text, "",
                        "directive not in the implemented PTX subset (supported: .version .target "
-                       ".address_size .visible .entry)");
+                       ".address_size .visible .extern .global .const .entry)");
     }
     return m;
   }
@@ -145,26 +175,110 @@ class Parser {
     fail(t.line, "expected a type in " + ctx + ", got '" + t.text + "'");
   }
 
-  EntryFn parse_entry(size_t line) {
+  int64_t parse_int_literal(const std::string& w, size_t line) {
+    try {
+      if (w.size() > 2 && w[0] == '0' && (w[1] == 'x' || w[1] == 'X'))
+        return static_cast<int64_t>(std::stoull(w.substr(2), nullptr, 16));
+      return std::stoll(w);
+    } catch (const std::exception&) {
+      fail(line, "bad integer literal '" + w + "'");
+    }
+  }
+
+  // Reads "N" or "-N".
+  int64_t expect_int(const std::string& what) {
+    bool neg = false;
+    if (peek_punct("-")) {
+      next();
+      neg = true;
+    }
+    std::string w = expect_word(what);
+    int64_t v = parse_int_literal(w, peek().line);
+    return neg ? -v : v;
+  }
+
+  // ---- module-scope .global/.const variables ----
+
+  GlobalVar parse_global(size_t line) {
+    GlobalVar g;
+    // Optional modifiers before the type.
+    while (peek().kind == Token::Kind::Word && peek().text[0] == '.') {
+      if (peek().text == ".align") {
+        next();
+        g.align = static_cast<uint32_t>(expect_int("alignment"));
+        continue;
+      }
+      break;
+    }
+    Type ty = expect_type(".global declaration");
+    g.name = expect_word("global variable name");
+    uint64_t elems = 1;
+    if (peek_punct("[")) {
+      next();
+      elems = static_cast<uint64_t>(expect_int("array size"));
+      expect_punct("]");
+    }
+    g.size = elems * ty.bytes();
+    if (g.size == 0) fail(line, "zero-sized global '" + g.name + "'");
+    if (peek_punct("=")) {
+      next();
+      if (peek_punct("{")) {
+        next();
+        g.init.reserve(g.size);
+        while (!peek_punct("}")) {
+          int64_t v = expect_int("initializer element");
+          // Little-endian element append.
+          for (uint32_t b = 0; b < ty.bytes(); ++b)
+            g.init.push_back(static_cast<uint8_t>((static_cast<uint64_t>(v) >> (8 * b)) & 0xFF));
+          if (peek_punct(",")) next();
+        }
+        next();  // '}'
+      } else {
+        int64_t v = expect_int("initializer");
+        for (uint32_t b = 0; b < ty.bytes(); ++b)
+          g.init.push_back(static_cast<uint8_t>((static_cast<uint64_t>(v) >> (8 * b)) & 0xFF));
+      }
+      if (g.init.size() > g.size)
+        fail(line, "initializer for '" + g.name + "' longer than its declared size");
+      g.init.resize(g.size, 0);
+    }
+    expect_punct(";");
+    return g;
+  }
+
+  // ---- entry functions ----
+
+  EntryFn parse_entry() {
     EntryFn fn;
     fn.name = expect_word("kernel name");
     current_kernel_ = fn.name;
+    call_slots_.clear();
     if (peek_punct("(")) {
       next();
       while (!peek_punct(")")) {
         std::string kw = expect_word("'.param'");
         if (kw != ".param") fail(peek().line, "expected .param, got '" + kw + "'");
+        ParamDecl p;
+        // Optional ".align N" then type, then optional pointer annotations.
+        if (peek().kind == Token::Kind::Word && peek().text == ".align") {
+          next();
+          p.align = static_cast<uint32_t>(expect_int("alignment"));
+        }
         Type ty = expect_type("parameter declaration");
-        // Skip optional pointer annotations: .ptr .global .align N
         while (peek().kind == Token::Kind::Word && peek().text[0] == '.') {
           std::string ann = next().text;
-          if (ann == ".align") (void)expect_word("alignment");
-          // .ptr / .global / .const etc.: functional no-ops for us
+          if (ann == ".align") p.align = static_cast<uint32_t>(expect_int("alignment"));
+          // .ptr / .global / .const: functional no-ops for us
         }
-        ParamDecl p;
         p.name = expect_word("parameter name");
         p.ty = ty;
-        if (peek_punct("[")) fail_unsupported(peek().line, ".param array", fn.name, "array parameters");
+        p.size = ty.bytes();
+        if (peek_punct("[")) {  // aggregate: .param .align 8 .b8 name[24]
+          next();
+          p.size = static_cast<uint32_t>(expect_int("parameter array size"));
+          expect_punct("]");
+        }
+        if (p.align == 0) p.align = p.size < 8 ? p.size : 8;
         fn.params.push_back(std::move(p));
         if (peek_punct(",")) next();
       }
@@ -173,31 +287,67 @@ class Parser {
     expect_punct("{");
     parse_body(fn);
     current_kernel_.clear();
-    (void)line;
     return fn;
   }
 
   void parse_body(EntryFn& fn) {
     std::unordered_map<std::string, size_t> labels;
-    std::vector<std::pair<size_t, std::string>> bra_fixups;  // instr idx -> label
+    std::vector<std::pair<size_t, std::string>> bra_fixups;
+    int depth = 0;  // nested { } scopes (call sequences)
 
     while (true) {
       const Token& t = peek();
       if (t.kind == Token::Kind::End) fail(t.line, "unexpected end of file inside kernel body");
+      if (peek_punct("{")) {
+        next();
+        ++depth;
+        continue;
+      }
       if (peek_punct("}")) {
         next();
-        break;
+        if (depth == 0) break;
+        --depth;
+        continue;
       }
       if (t.kind == Token::Kind::Word && t.text == ".reg") {
         next();
         parse_reg_decl(fn);
         continue;
       }
+      if (t.kind == Token::Kind::Word && t.text == ".local") {
+        next();
+        parse_local_decl(fn, t.line);
+        continue;
+      }
+      if (t.kind == Token::Kind::Word && t.text == ".pragma") {
+        // Performance hints ("nounroll" etc.): functionally inert, skip.
+        while (!at_end() && !peek_punct(";")) next();
+        if (!at_end()) next();
+        continue;
+      }
+      if (t.kind == Token::Kind::Word && t.text == ".param") {
+        // Call-argument slot declaration inside a call sequence.
+        next();
+        Instr ins;
+        ins.line = t.line;
+        OpDeclSlot d;
+        Type ty = expect_type(".param slot declaration");
+        d.name = expect_word("slot name");
+        d.size = ty.bytes();
+        if (peek_punct("["))
+          fail_unsupported(t.line, ".param array call slot", fn.name,
+                           "aggregate call arguments are not supported yet");
+        expect_punct(";");
+        call_slots_.insert(d.name);
+        ins.op = d;
+        ins.text = ".param " + d.name;
+        fn.body.push_back(std::move(ins));
+        continue;
+      }
       if (t.kind == Token::Kind::Word && t.text[0] == '.') {
         fail_unsupported(t.line, t.text, fn.name,
-                         t.text == ".shared" || t.text == ".local"
-                             ? "shared/local memory declarations are not implemented yet"
-                             : "directive not in the implemented subset");
+                         t.text == ".shared" ? "shared memory declarations are not implemented yet"
+                                             : "directive not in the implemented subset");
       }
       // Label?
       if (t.kind == Token::Kind::Word && peek_punct(":", 1)) {
@@ -240,19 +390,32 @@ class Parser {
     expect_punct(";");
   }
 
-  // ---- operands ----
-
-  int64_t parse_int_literal(const std::string& w, size_t line) {
-    try {
-      if (w.size() > 2 && w[0] == '0' && (w[1] == 'x' || w[1] == 'X'))
-        return static_cast<int64_t>(std::stoull(w.substr(2), nullptr, 16));
-      return std::stoll(w);
-    } catch (const std::exception&) {
-      fail(line, "bad integer literal '" + w + "'");
+  void parse_local_decl(EntryFn& fn, size_t line) {
+    LocalDecl d;
+    while (peek().kind == Token::Kind::Word && peek().text == ".align") {
+      next();
+      d.align = static_cast<uint32_t>(expect_int("alignment"));
     }
+    Type ty = expect_type(".local declaration");
+    d.name = expect_word("local variable name");
+    uint64_t elems = 1;
+    if (peek_punct("[")) {
+      next();
+      elems = static_cast<uint64_t>(expect_int("array size"));
+      expect_punct("]");
+    }
+    d.size = static_cast<uint32_t>(elems * ty.bytes());
+    if (d.align == 0) d.align = 8;
+    uint32_t off = (fn.local_frame_size + d.align - 1) / d.align * d.align;
+    d.offset = off;
+    fn.local_frame_size = off + d.size;
+    if (!fn.locals.emplace(d.name, d).second) fail(line, "duplicate .local '" + d.name + "'");
+    expect_punct(";");
   }
 
-  Operand parse_operand(const EntryFn& fn) {
+  // ---- operands ----
+
+  Operand parse_operand() {
     const Token& t = next();
     if (t.kind == Token::Kind::Punct && t.text == "-") {
       std::string w = expect_word("number after '-'");
@@ -266,15 +429,14 @@ class Parser {
       return RegOperand{w};
     }
     if (isdigit(static_cast<unsigned char>(w[0]))) {
-      // Float literals: 0fXXXXXXXX (f32 bits), 0dXXXXXXXXXXXXXXXX (f64 bits).
       if (w.size() == 10 && w[0] == '0' && (w[1] == 'f' || w[1] == 'F'))
         return ImmFloatBits{std::stoull(w.substr(2), nullptr, 16), 32};
       if (w.size() == 18 && w[0] == '0' && (w[1] == 'd' || w[1] == 'D'))
         return ImmFloatBits{std::stoull(w.substr(2), nullptr, 16), 64};
       return ImmInt{parse_int_literal(w, t.line)};
     }
-    (void)fn;
-    fail(t.line, "cannot parse operand '" + w + "'");
+    // Bare identifier: a module global / local depot symbol.
+    return SymbolOperand{w};
   }
 
   std::string expect_reg_operand(const std::string& ctx) {
@@ -283,31 +445,55 @@ class Parser {
     return w;
   }
 
+  // Register vector: {%r1, %r2, %r3, %r4}
+  std::vector<std::string> parse_reg_vector(size_t n) {
+    std::vector<std::string> regs;
+    expect_punct("{");
+    while (!peek_punct("}")) {
+      regs.push_back(expect_reg_operand("vector element"));
+      if (peek_punct(",")) next();
+    }
+    next();
+    if (regs.size() != n)
+      fail(peek().line, "vector operand has " + std::to_string(regs.size()) + " elements, expected " +
+                            std::to_string(n));
+    return regs;
+  }
+
+  std::vector<Operand> parse_operand_vector(size_t n) {
+    std::vector<Operand> ops;
+    expect_punct("{");
+    while (!peek_punct("}")) {
+      ops.push_back(parse_operand());
+      if (peek_punct(",")) next();
+    }
+    next();
+    if (ops.size() != n)
+      fail(peek().line, "vector operand has " + std::to_string(ops.size()) + " elements, expected " +
+                            std::to_string(n));
+    return ops;
+  }
+
   Addr parse_addr(const EntryFn& fn) {
     expect_punct("[");
     Addr a;
     std::string base = expect_word("address base");
     if (base[0] == '%') {
       a.base = base;
-      a.base_is_param = false;
+      a.base_kind = Addr::Base::Reg;
+    } else if (call_slots_.count(base)) {
+      a.base = base;
+      a.base_kind = Addr::Base::CallSlot;
     } else {
-      // Parameter name (ld.param [pname]) — validate it exists.
       bool found = false;
       for (const auto& p : fn.params) found = found || p.name == base;
-      if (!found) fail(peek().line, "unknown parameter '" + base + "' in address operand");
+      if (!found) fail(peek().line, "unknown parameter or slot '" + base + "' in address operand");
       a.base = base;
-      a.base_is_param = true;
+      a.base_kind = Addr::Base::EntryParam;
     }
     if (peek_punct("+")) {
       next();
-      bool neg = false;
-      if (peek_punct("-")) {
-        next();
-        neg = true;
-      }
-      std::string off = expect_word("address offset");
-      a.offset = parse_int_literal(off, peek().line);
-      if (neg) a.offset = -a.offset;
+      a.offset = expect_int("address offset");
     }
     expect_punct("]");
     return a;
@@ -341,7 +527,7 @@ class Parser {
     const std::string& op0 = parts[0];
     if (op0 == "ld" || op0 == "st") {
       Space space = Space::Generic;
-      bool vec = false;
+      size_t vec = 1;
       Type ty{};
       bool have_ty = false;
       for (size_t i = 1; i < parts.size(); ++i) {
@@ -350,61 +536,212 @@ class Parser {
         else if (p == "global") space = Space::Global;
         else if (p == "shared") space = Space::Shared;
         else if (p == "local") space = Space::Local;
-        else if (p == "volatile" || p == "nc" || p == "relaxed" || p == "acquire" || p == "release" ||
-                 p == "gpu" || p == "cta" || p == "sys")
-          ;  // memory-order/scope/cache hints: functionally inert for our engine today
-        else if (p == "v2" || p == "v4") vec = true;
+        else if (inert_mem_modifier(p)) ;
+        else if (p == "v2") vec = 2;
+        else if (p == "v4") vec = 4;
         else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
         } else return unsupported("unrecognized ld/st modifier '." + p + "'");
       }
-      if (vec) return unsupported("vector ld/st (v2/v4) not implemented yet");
       if (!have_ty) fail(ins.line, "ld/st missing type: " + opcode);
-      if (space == Space::Shared || space == Space::Local)
-        return unsupported("shared/local memory not implemented yet");
+      if (space == Space::Shared) return unsupported("shared memory not implemented yet");
       if (op0 == "ld") {
-        OpLd op;
-        op.space = space;
-        op.ty = ty;
-        op.dst = expect_reg_operand("ld destination");
+        Addr addr;
+        std::vector<std::string> dsts;
+        if (vec == 1) {
+          dsts.push_back(expect_reg_operand("ld destination"));
+        } else {
+          dsts = parse_reg_vector(vec);
+        }
         expect_punct(",");
-        op.addr = parse_addr(fn);
-        ins.op = op;
+        addr = parse_addr(fn);
+        if (space == Space::Param) {
+          if (addr.base_kind == Addr::Base::Reg)
+            return unsupported("ld.param through a register address");
+          if (addr.base_kind == Addr::Base::CallSlot) {
+            if (vec != 1) return unsupported("vector ld.param from call slot");
+            OpLdSlot op{addr.base, addr.offset, ty, dsts[0]};
+            ins.op = op;
+          } else {
+            ins.op = OpLd{space, ty, std::move(dsts), addr};
+          }
+        } else {
+          if (addr.base_kind != Addr::Base::Reg)
+            return unsupported("non-param load from a parameter/slot name");
+          ins.op = OpLd{space, ty, std::move(dsts), addr};
+        }
       } else {
-        if (space == Space::Param) return unsupported("st.param is only used in device functions");
-        OpSt op;
-        op.space = space;
-        op.ty = ty;
-        op.addr = parse_addr(fn);
+        Addr addr = parse_addr(fn);
         expect_punct(",");
-        op.src = parse_operand(fn);
-        ins.op = op;
+        std::vector<Operand> srcs;
+        if (vec == 1)
+          srcs.push_back(parse_operand());
+        else
+          srcs = parse_operand_vector(vec);
+        if (space == Space::Param) {
+          if (addr.base_kind != Addr::Base::CallSlot)
+            return unsupported("st.param outside a call sequence");
+          if (vec != 1) return unsupported("vector st.param");
+          ins.op = OpStSlot{addr.base, addr.offset, ty, srcs[0]};
+        } else {
+          if (addr.base_kind != Addr::Base::Reg)
+            return unsupported("store to a parameter/slot name");
+          ins.op = OpSt{space, ty, addr, std::move(srcs)};
+        }
       }
     } else if (op0 == "mov") {
       if (parts.size() != 2) return unsupported("mov form");
       auto ty = parse_type_token(parts[1]);
       if (!ty) fail(ins.line, "mov missing type");
+      if (ty->kind == Type::Kind::Pred) return unsupported("mov.pred");
       OpMov op;
       op.ty = *ty;
       op.dst = expect_reg_operand("mov destination");
       expect_punct(",");
-      op.src = parse_operand(fn);
+      op.src = parse_operand();
       ins.op = op;
     } else if (op0 == "cvta") {
-      // cvta.to.global.u64 (generic->global) and cvta.global.u64 (global->generic):
-      // both are identity in VirtualGPU's flat address space.
+      // cvta[.to].{global,local,shared,const}.u64 — all address spaces alias
+      // in VirtualGPU's flat VA scheme, so every cvta is an identity move.
       size_t i = 1;
       if (i < parts.size() && parts[i] == "to") ++i;
-      if (i >= parts.size() || parts[i] != "global") return unsupported("only cvta[.to].global supported");
-      ++i;
+      if (i < parts.size() && (parts[i] == "global" || parts[i] == "local" || parts[i] == "const")) ++i;
+      else if (i < parts.size() && parts[i] == "shared") return unsupported("cvta.shared");
       auto ty = (i < parts.size()) ? parse_type_token(parts[i]) : std::nullopt;
       if (!ty) fail(ins.line, "cvta missing type");
-      OpCvtaToGlobal op;
+      OpCvta op;
       op.ty = *ty;
       op.dst = expect_reg_operand("cvta destination");
       expect_punct(",");
-      op.src = parse_operand(fn);
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "cvt") {
+      // cvt[.round][.sat][.ftz].<dstty>.<srcty>
+      std::vector<Type> tys;
+      Round round = Round::None;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "rn") round = Round::Rn;
+        else if (p == "rz") round = Round::Rz;
+        else if (p == "rm") round = Round::Rm;
+        else if (p == "rp") round = Round::Rp;
+        else if (p == "rni") round = Round::Rni;
+        else if (p == "rzi") round = Round::Rzi;
+        else if (p == "rmi") round = Round::Rm;
+        else if (p == "rpi") round = Round::Rp;
+        else if (p == "sat" || p == "ftz") ;  // saturation/flush handled conservatively below
+        else if (auto t2 = parse_type_token(p)) tys.push_back(*t2);
+        else return unsupported("unrecognized cvt modifier '." + p + "'");
+      }
+      if (tys.size() != 2) fail(ins.line, "cvt needs .<dsttype>.<srctype>");
+      if ((tys[0].is_float() && tys[0].bits == 16) || (tys[1].is_float() && tys[1].bits == 16))
+        return unsupported("half-precision (f16) cvt not implemented yet");
+      OpCvt op;
+      op.dst_ty = tys[0];
+      op.src_ty = tys[1];
+      op.round = round;
+      op.dst = expect_reg_operand("cvt destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "not") {
+      if (parts.size() != 2) return unsupported("not form");
+      auto ty = parse_type_token(parts[1]);
+      if (!ty) fail(ins.line, "not missing type");
+      if (ty->kind == Type::Kind::Pred) {
+        OpNotPred op;
+        op.dst = expect_reg_operand("not.pred destination");
+        expect_punct(",");
+        op.src = expect_reg_operand("not.pred source");
+        ins.op = op;
+      } else {
+        OpNot op;
+        op.ty = *ty;
+        op.dst = expect_reg_operand("not destination");
+        expect_punct(",");
+        op.src = parse_operand();
+        ins.op = op;
+      }
+    } else if (op0 == "neg") {
+      if (parts.size() != 2) return unsupported("neg form");
+      auto ty = parse_type_token(parts[1]);
+      if (!ty) fail(ins.line, "neg missing type");
+      OpNeg op;
+      op.ty = *ty;
+      op.dst = expect_reg_operand("neg destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "prmt") {
+      // prmt.b32[.mode] d, a, b, c — only the default (generic) mode.
+      if (parts.size() < 2 || parts[1] != "b32") return unsupported("prmt form (only prmt.b32)");
+      if (parts.size() > 2) return unsupported("prmt with an explicit mode ('." + parts[2] + "')");
+      OpPrmt op;
+      op.dst = expect_reg_operand("prmt destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      expect_punct(",");
+      op.c = parse_operand();
+      ins.op = op;
+    } else if (op0 == "shf") {
+      // shf.{l,r}.{wrap,clamp}.b32 d, a, b, c — funnel shift of b:a.
+      if (parts.size() != 4 || (parts[1] != "l" && parts[1] != "r") ||
+          (parts[2] != "wrap" && parts[2] != "clamp") || parts[3] != "b32")
+        return unsupported("shf form (only shf.{l,r}.{wrap,clamp}.b32)");
+      OpShf op;
+      op.left = parts[1] == "l";
+      op.wrap = parts[2] == "wrap";
+      op.dst = expect_reg_operand("shf destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      expect_punct(",");
+      op.c = parse_operand();
+      ins.op = op;
+    } else if (op0 == "atom") {
+      // atom[.space][.sem][.scope].<op>.<type> d, [a], b [, c]
+      Space space = Space::Generic;
+      std::optional<AtomOp> aop;
+      Type ty{};
+      bool have_ty = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "global") space = Space::Global;
+        else if (p == "shared") return unsupported("atomics on shared memory (no shared memory yet)");
+        else if (inert_mem_modifier(p)) ;
+        else if (p == "add") aop = AtomOp::Add;
+        else if (p == "min") aop = AtomOp::Min;
+        else if (p == "max") aop = AtomOp::Max;
+        else if (p == "and") aop = AtomOp::And;
+        else if (p == "or") aop = AtomOp::Or;
+        else if (p == "xor") aop = AtomOp::Xor;
+        else if (p == "exch") aop = AtomOp::Exch;
+        else if (p == "cas") aop = AtomOp::Cas;
+        else if (auto t2 = parse_type_token(p)) {
+          ty = *t2;
+          have_ty = true;
+        } else return unsupported("atom operation '." + p + "'");
+      }
+      if (!aop || !have_ty) return unsupported("atom form");
+      if (ty.is_float()) return unsupported("float atomics not implemented yet");
+      OpAtom op;
+      op.op = *aop;
+      op.ty = ty;
+      (void)space;
+      op.dst = expect_reg_operand("atom destination");
+      expect_punct(",");
+      op.addr = parse_addr(fn);
+      if (op.addr.base_kind != Addr::Base::Reg) return unsupported("atom on a parameter name");
+      expect_punct(",");
+      op.b = parse_operand();
+      if (*aop == AtomOp::Cas) {
+        expect_punct(",");
+        op.c = parse_operand();
+      }
       ins.op = op;
     } else if (op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "min" || op0 == "max" ||
                op0 == "div" || op0 == "rem" || op0 == "and" || op0 == "or" || op0 == "xor" ||
@@ -417,7 +754,7 @@ class Parser {
         if (p == "wide") wide = true;
         else if (p == "lo") lo = true;
         else if (p == "hi") hi = true;
-        else if (p == "rn" || p == "ftz") ;  // round-to-nearest is our only float mode
+        else if (p == "rn" || p == "ftz") ;
         else if (p == "rz" || p == "rm" || p == "rp")
           return unsupported("non-default float rounding mode '." + p + "'");
         else if (p == "sat" || p == "approx" || p == "full")
@@ -429,7 +766,22 @@ class Parser {
       }
       if (!have_ty) fail(ins.line, opcode + " missing type");
       if (hi) return unsupported("mul.hi not implemented yet");
-      if (ty.is_float()) {
+      if (ty.kind == Type::Kind::Pred) {
+        // and.pred / or.pred / xor.pred
+        std::optional<PredBinOp> pop;
+        if (op0 == "and") pop = PredBinOp::And;
+        else if (op0 == "or") pop = PredBinOp::Or;
+        else if (op0 == "xor") pop = PredBinOp::Xor;
+        if (!pop) return unsupported("'" + op0 + "' on predicates");
+        OpPredBin op;
+        op.op = *pop;
+        op.dst = expect_reg_operand("predicate destination");
+        expect_punct(",");
+        op.a = expect_reg_operand("predicate operand");
+        expect_punct(",");
+        op.b = expect_reg_operand("predicate operand");
+        ins.op = op;
+      } else if (ty.is_float()) {
         if (ty.bits != 32 && ty.bits != 64) return unsupported("only f32/f64 float math implemented");
         static const std::unordered_map<std::string, FloatBinOp> fops = {
             {"add", FloatBinOp::Add}, {"sub", FloatBinOp::Sub}, {"mul", FloatBinOp::Mul},
@@ -441,9 +793,9 @@ class Parser {
         op.ty = ty;
         op.dst = expect_reg_operand("destination");
         expect_punct(",");
-        op.a = parse_operand(fn);
+        op.a = parse_operand();
         expect_punct(",");
-        op.b = parse_operand(fn);
+        op.b = parse_operand();
         ins.op = op;
       } else if (wide) {
         if (op0 != "mul" || ty.bits != 32) return unsupported("only mul.wide.{s32,u32} implemented");
@@ -451,9 +803,9 @@ class Parser {
         op.is_signed = ty.is_signed();
         op.dst = expect_reg_operand("destination");
         expect_punct(",");
-        op.a = parse_operand(fn);
+        op.a = parse_operand();
         expect_punct(",");
-        op.b = parse_operand(fn);
+        op.b = parse_operand();
         ins.op = op;
       } else {
         static const std::unordered_map<std::string, IntBinOp> iops = {
@@ -469,9 +821,9 @@ class Parser {
         op.ty = ty;
         op.dst = expect_reg_operand("destination");
         expect_punct(",");
-        op.a = parse_operand(fn);
+        op.a = parse_operand();
         expect_punct(",");
-        op.b = parse_operand(fn);
+        op.b = parse_operand();
         ins.op = op;
       }
     } else if (op0 == "mad" || op0 == "fma") {
@@ -489,11 +841,11 @@ class Parser {
       if (!have_ty) fail(ins.line, opcode + " missing type");
       std::string dst = expect_reg_operand("destination");
       expect_punct(",");
-      Operand a = parse_operand(fn);
+      Operand a = parse_operand();
       expect_punct(",");
-      Operand b = parse_operand(fn);
+      Operand b = parse_operand();
       expect_punct(",");
-      Operand c = parse_operand(fn);
+      Operand c = parse_operand();
       if (ty.is_float()) {
         if (ty.bits != 32 && ty.bits != 64) return unsupported("only f32/f64 fma implemented");
         ins.op = OpFma{ty, dst, a, b, c};
@@ -515,9 +867,9 @@ class Parser {
       op.ty = *ty;
       op.dst = expect_reg_operand("predicate destination");
       expect_punct(",");
-      op.a = parse_operand(fn);
+      op.a = parse_operand();
       expect_punct(",");
-      op.b = parse_operand(fn);
+      op.b = parse_operand();
       ins.op = op;
     } else if (op0 == "selp") {
       if (parts.size() != 2) return unsupported("selp form");
@@ -527,17 +879,36 @@ class Parser {
       op.ty = *ty;
       op.dst = expect_reg_operand("destination");
       expect_punct(",");
-      op.a = parse_operand(fn);
+      op.a = parse_operand();
       expect_punct(",");
-      op.b = parse_operand(fn);
+      op.b = parse_operand();
       expect_punct(",");
       op.pred = expect_reg_operand("selp predicate");
       ins.op = op;
     } else if (op0 == "bra") {
-      // ".uni" (uniform hint) is accepted and ignored.
       std::string label = expect_word("branch target");
       bra_fixups.emplace_back(fn.body.size(), label);
       ins.op = OpBra{0, label};
+    } else if (op0 == "call") {
+      // call.uni (retval0), vprintf, (param0, param1);
+      OpCall op;
+      if (peek_punct("(")) {
+        next();
+        op.retval_slot = expect_word("return value slot");
+        expect_punct(")");
+        expect_punct(",");
+      }
+      op.callee = expect_word("call target");
+      expect_punct(",");
+      expect_punct("(");
+      while (!peek_punct(")")) {
+        op.param_slots.push_back(expect_word("call argument slot"));
+        if (peek_punct(",")) next();
+      }
+      next();
+      if (op.callee != "vprintf")
+        return unsupported("call to '" + op.callee + "' (only the vprintf builtin is callable)");
+      ins.op = op;
     } else if (op0 == "bar" || op0 == "barrier") {
       bool sync_seen = false;
       for (size_t i = 1; i < parts.size(); ++i) {
@@ -546,13 +917,12 @@ class Parser {
         else return unsupported("only bar.sync is implemented");
       }
       if (!sync_seen) return unsupported("only bar.sync is implemented");
-      Operand which = parse_operand(fn);
+      Operand which = parse_operand();
       if (auto* imm = std::get_if<ImmInt>(&which); !imm || imm->value != 0)
         return unsupported("only barrier 0 (bar.sync 0) is implemented");
       if (peek_punct(",")) return unsupported("partial barriers (bar.sync 0, N) not implemented");
       ins.op = OpBar{};
     } else if (op0 == "ret" || op0 == "exit") {
-      // ".uni" hint ignored.
       ins.op = OpRet{};
     } else {
       return unsupported("instruction not in the implemented PTX subset");
@@ -563,9 +933,8 @@ class Parser {
     return ins;
   }
 
-  // Rebuilds source-ish text from tokens for error messages. Joins the tokens
-  // consumed so far plus (for mid-statement failures) the un-consumed remainder,
-  // stopping at the statement's own ';'.
+  // Rebuilds source-ish text from tokens for error messages, stopping at the
+  // statement's own ';'.
   std::string reconstruct_from(size_t start_tok) {
     std::string out;
     for (size_t i = start_tok; i < toks_.size(); ++i) {
@@ -580,16 +949,16 @@ class Parser {
   std::vector<Token> toks_;
   size_t pos_ = 0;
   std::string current_kernel_;
+  std::set<std::string> call_slots_;
 };
 
 }  // namespace
 
 Module parse(const std::string& src) {
   Parser p(src);
-  Module m = p.parse_module();
-  if (m.entries.empty())
-    throw Error::make(Err::PtxParse, "no .entry kernels found in PTX module");
-  return m;
+  // Note: a module with zero kernels is legal (e.g. a translation unit with
+  // only host code still registers an empty PTX image).
+  return p.parse_module();
 }
 
 }  // namespace vgpu::ptx

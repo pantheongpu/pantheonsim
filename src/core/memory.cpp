@@ -141,6 +141,16 @@ void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
   }
 }
 
+bool MemoryManager::find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const {
+  auto up = live_.upper_bound(addr);
+  if (up == live_.begin()) return false;
+  auto prev = std::prev(up);
+  if (addr >= prev->first + prev->second.size) return false;
+  if (base) *base = prev->first;
+  if (size) *size = prev->second.size;
+  return true;
+}
+
 uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
   if (size != 1 && size != 2 && size != 4 && size != 8)
     throw Error::make(Err::Internal, "load_scalar: bad size ", size);

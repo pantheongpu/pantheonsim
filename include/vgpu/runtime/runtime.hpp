@@ -39,17 +39,25 @@ class Device {
   // Looks up a kernel. The returned pointer lives as long as the module.
   const ptx::EntryFn* get_function(uint64_t module_id, const std::string& name) const;
 
+  // The module's global-variable addresses (valid while the module is loaded).
+  const exec::SymbolTable* symbols(uint64_t module_id) const;
+
   void launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
-              const std::vector<std::vector<uint8_t>>& args);
+              const std::vector<std::vector<uint8_t>>& args,
+              const exec::SymbolTable* syms = nullptr);
 
  private:
   DeviceProfile profile_;
   int ordinal_;
   MemoryManager mem_;
   uint64_t next_module_id_ = 1;
-  // module id -> parsed module (shared_ptr so EntryFn pointers stay valid
-  // while a caller holds the module).
-  std::vector<std::pair<uint64_t, std::shared_ptr<ptx::Module>>> modules_;
+  struct LoadedModule {
+    uint64_t id = 0;
+    std::shared_ptr<ptx::Module> mod;
+    exec::SymbolTable symbols;          // .global variables -> device VAs
+    std::vector<uint64_t> global_vas;   // to free on unload
+  };
+  std::vector<LoadedModule> modules_;
 };
 
 class Runtime {

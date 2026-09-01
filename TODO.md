@@ -1,6 +1,6 @@
 # TODO / status
 
-Updated: 2026-09-01. See ARCHITECTURE.md for the design behind these.
+Updated: 2026-09-01 (rev 2). See ARCHITECTURE.md for the design behind these.
 
 ## Implemented (tested)
 
@@ -22,8 +22,19 @@ Updated: 2026-09-01. See ARCHITECTURE.md for the design behind these.
   retain/release, mem alloc/free/HtoD/DtoH/DtoD/getinfo, moduleLoadData(Ex)/
   unload/getFunction, cuLaunchKernel(kernelParams), error name/string;
   VGPU_GPU / VGPU_DEVICE_COUNT / VGPU_QUIET
-- M7 (stand-in): external C11 harness binary against the ABI alone — passes
-  discovery/memory/launch/error-path checks on all five profiles
+- M7 (real): unmodified nvcc-compiled CUDA apps run on VirtualGPU via
+  libvgpucudart (CUDA Runtime API + nvcc host-registration ABI +
+  cuLibrary/cuKernel + fatbin PTX extraction incl. zstd). Verified with the
+  external C11 driver-API harness AND an nvcc-compiled vectorAdd e2e test.
+- Pantheon workloads: the pantheongpu stress/diagnostics kernels run
+  unmodified (idle, memory_read/write, galpat, march_test, memory_hammer,
+  atomic/int/compute virus). memory_read differential-matches a physical RTX
+  3060 including fault-injection + device printf. See docs/pantheon-workloads.md.
+- PTX additions: cvt (int<->float, rounding modes), neg, prmt.b32, not,
+  shf funnel shifts, atomics (add/min/max/and/or/xor/exch/cas), vector
+  ld/st.v2/v4, predicate logic (and/or/xor/not.pred), .local memory frames,
+  module .global variables, aggregate by-value params, device printf (vprintf).
+- Configurable virtual VRAM (VGPU_VRAM_MB); VGPU_TRACE coverage-growth logging.
 
 ## Partially implemented
 
@@ -36,9 +47,9 @@ Updated: 2026-09-01. See ARCHITECTURE.md for the design behind these.
 
 ## Not implemented (fails loudly, never silently)
 
-- PTX: shared/local memory, atomics, shuffles/vote/ballot, cvt, mul.hi,
-  vector ld/st (v2/v4), f16/bf16, sat/approx/rounding variants, textures,
-  cp.async, tensor-core ops (wmma/mma), grid sync
+- PTX: shared memory (__shared__), warp shuffles/vote/ballot, mul.hi, f16/bf16
+  math, half-precision cvt, textures/surfaces, cp.async, tensor-core ops
+  (wmma/mma/wgmma), grid sync, inline-asm-only instructions
 - Runtime: streams (M8), events (M8), async copies, unified/managed memory,
   virtual memory mgmt API (cuMemAddressReserve…), host-pinned memory
 - Frontends: CUDA runtime API (cudart), NVML, cubin/SASS loading,
@@ -54,9 +65,10 @@ Updated: 2026-09-01. See ARCHITECTURE.md for the design behind these.
    is synchronous; add handles + cross-stream sync semantics)
 2. **Shared memory + atomics + shuffles** in PTX/interpreter — unlocks real
    reduction/scan kernels and the first interesting divergence bugs
-3. **cudart shim**: `__cudaRegisterFatBinary`-family interception + fatbin
-   parsing to pull embedded PTX out of unmodified nvcc binaries; then
-   `vgpu run --gpu … ./app` wrapper (true M7)
+3. **Static cudart hosting**: satisfy NVIDIA's undocumented driver export
+   tables (cuGetExportTable dark API) so binaries built with the *default*
+   (static) cudart also run without a `-cudart shared` rebuild. Partial
+   groundwork exists in the driver shim; deferred as brittle/version-specific.
 4. **Scheduler: random mode** (seeded) + first differential scheduling tests
 5. **Characterization harness v0**: same micro-tests on a physical GPU
    (bench/ rents them) vs virtual profiles; start flipping `verified` bits

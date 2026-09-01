@@ -43,6 +43,9 @@ class MemoryManager {
   uint64_t load_scalar(uint64_t addr, uint32_t size) const;
   void store_scalar(uint64_t addr, uint32_t size, uint64_t value);
 
+  // Locates the live allocation containing `addr`. Returns false if none.
+  bool find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const;
+
   uint64_t used() const { return used_; }
   uint64_t capacity() const { return capacity_; }
   size_t live_allocations() const { return live_.size(); }

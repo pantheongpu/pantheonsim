@@ -133,7 +133,34 @@ Unsupported ≠ broken: anything outside the implemented subset (PTX
 instruction, API, attribute) fails loudly, naming exactly what was missing.
 Silent wrong answers are the one unforgivable bug class in an emulator.
 
-### D6. Clean-room ABI discipline
+### D6. Two shims: documented runtime API over undocumented dark API
+
+To host unmodified nvcc binaries we provide `libvgpucudart` — a drop-in
+`libcudart.so.13` implementing the **documented** CUDA Runtime API plus the
+documented nvcc host-registration ABI (`__cudaRegisterFatBinary`,
+`__cudaRegisterFunction`, `__cudaPushCallConfiguration`, `__cudaGetKernel`,
+`cudaLaunchKernel`). A chevron launch lowers onto these; our runtime pulls the
+embedded PTX out of the fatbin and runs it on the SIMT engine. This is the
+supported path and requires the app to link *shared* cudart.
+
+The alternative — letting NVIDIA's *static* cudart run and satisfying it from
+our `libcuda` — means implementing `cuGetExportTable`, a set of **undocumented,
+version-specific, integrity-checked** vtables ("the dark API"). We implemented
+enough to watch cudart bootstrap, but chose the documented runtime API as the
+primary interface: it is stable, legible, and clean-room. Static-cudart hosting
+stays behind an env flag as future work. The rule this encodes: prefer a
+documented interface we can maintain over an undocumented one we must chase.
+
+Two ABI subtleties that bit us and are now guarded:
+- `cudaDeviceProp` is version-specific. The shim's copy MUST match the toolkit
+  that compiled the app, or field writes land at the wrong offsets and smash
+  the caller's stack. The build derives the ABI header from the `nvcc` on PATH
+  (not a stale system copy) and `static_assert`s the struct size.
+- CUDA 12.4+/13 lowers chevrons through `__cudaGetKernel` + `__cudaLaunchKernel`
+  (a `cudaKernel_t` handle), not only the classic `cudaLaunchKernel(func, …)`.
+  Both entry points are provided.
+
+### D7. Clean-room ABI discipline
 
 `vgpu_cuda.h` is written from NVIDIA's public driver-API documentation;
 numeric values (error codes, attribute ids) follow the documented ABI so real
