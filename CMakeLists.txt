@@ -103,6 +103,29 @@ if(CUDA_ABI_INCLUDE)
     COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so.13.0" "${CMAKE_BINARY_DIR}/shim/libcudart.so.12"
     COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so.13.0" "${CMAKE_BINARY_DIR}/shim/libcudart.so"
     COMMENT "Creating runtime shim symlinks (build/shim/libcudart.so.13)")
+  # ---------------------------------------------------------------------------
+  # libvgpunvenc: VirtualGPU's NVENC implementation, presented as
+  # libnvidia-encode.so.1. Applications dlopen that bare soname, which searches
+  # LD_LIBRARY_PATH first, so the shim directory wins over the real driver
+  # library. Needs the Video Codec SDK header (vendored by the workload tree).
+  # ---------------------------------------------------------------------------
+  find_path(NVENC_INCLUDE nvEncodeAPI.h
+    PATHS "${CMAKE_SOURCE_DIR}/../pantheongpu/kernels/common/nvenc"
+          ENV NVENC_HEADER_DIR)
+  if(NVENC_INCLUDE)
+    message(STATUS "NVENC header at ${NVENC_INCLUDE}: building libvgpunvenc")
+    add_library(vgpunvenc SHARED src/cuda/nvenc_api.cpp)
+    target_link_libraries(vgpunvenc PRIVATE vgpu vgpucudart)
+    target_include_directories(vgpunvenc PRIVATE ${NVENC_INCLUDE})
+    set_target_properties(vgpunvenc PROPERTIES OUTPUT_NAME nvidia-encode SOVERSION 1)
+    add_custom_command(TARGET vgpunvenc POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvidia-encode.so.1"
+              "${CMAKE_BINARY_DIR}/shim/libnvidia-encode.so.1"
+      COMMENT "Creating NVENC shim symlink (build/shim/libnvidia-encode.so.1)")
+  else()
+    message(STATUS "nvEncodeAPI.h not found: skipping libvgpunvenc")
+  endif()
 else()
   message(STATUS "CUDA ABI headers not found: skipping libvgpucudart (core unaffected)")
 endif()
