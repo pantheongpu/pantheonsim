@@ -1,6 +1,6 @@
 # TODO / status
 
-Updated: 2026-09-01 (rev 2). See ARCHITECTURE.md for the design behind these.
+Updated: 2026-09-01 (rev 3). See ARCHITECTURE.md for the design behind these.
 
 ## Implemented (tested)
 
@@ -30,11 +30,28 @@ Updated: 2026-09-01 (rev 2). See ARCHITECTURE.md for the design behind these.
   unmodified (idle, memory_read/write, galpat, march_test, memory_hammer,
   atomic/int/compute virus). memory_read differential-matches a physical RTX
   3060 including fault-injection + device printf. See docs/pantheon-workloads.md.
-- PTX additions: cvt (int<->float, rounding modes), neg, prmt.b32, not,
+- PTX additions: cvt (int<->float, rounding modes), neg, abs, prmt.b32, not,
   shf funnel shifts, atomics (add/min/max/and/or/xor/exch/cas), vector
   ld/st.v2/v4, predicate logic (and/or/xor/not.pred), .local memory frames,
-  module .global variables, aggregate by-value params, device printf (vprintf).
+  module .global variables, aggregate by-value params, device printf (vprintf),
+  transcendentals (ex2/lg2/sin/cos/sqrt/rsqrt/rcp/tanh), bfe/bfi/brev/popc/clz,
+  mad.wide, mov pack/unpack, NaN-aware setp forms, inline-asm register locals.
+- Shared memory: static + dynamic (extern) .shared, per-block zeroed frames,
+  ld/st/atom.shared, correct space-relative addressing (cvta to/from generic).
+- Warp shuffles (shfl.sync up/down/bfly/idx, + predicate output) and
+  vote/ballot.
+- Tensor cores: wmma.mma m16n16k16 f32.f32 (row/col layouts), wmma.store.d.
+- f16 (software IEEE binary16) and packed f16x2 arithmetic.
+- CUDA Graphs: real stream capture -> record -> replay.
 - Configurable virtual VRAM (VGPU_VRAM_MB); VGPU_TRACE coverage-growth logging.
+
+## Known out of scope (not CUDA)
+
+- `rt_virus` needs **OptiX** (NVIDIA's ray-tracing library, loaded from
+  libnvoptix.so.1) and `media_enc_virus` needs **NVENC**
+  (libnvidia-encode.so.1). Both are separate NVIDIA subsystems, not CUDA;
+  emulating them is a distinct project. They fail with the vendor library's
+  own error rather than a VirtualGPU error.
 
 ## Partially implemented
 
@@ -58,6 +75,19 @@ Updated: 2026-09-01 (rev 2). See ARCHITECTURE.md for the design behind these.
   --matrix`, trace record/replay, schedulers random/adversarial, race
   detection, OOM injection, characterization/differential-fuzz harness,
   conformance DB + compat scores
+
+## Performance
+
+The interpreter retires roughly 2x10^8 instructions/s (measured:
+`vgpu demo vectoradd -n 2000000` in ~210 ms). A GPU retires ~10^13 ops/s, so
+saturation-style stress tests must be run at reduced intensity via their own
+CLI knobs (`--kernel_loops`, `--grid_size`); see
+scripts/run-pantheon-workloads.sh. Closing even part of that gap needs the
+IR/JIT path in ARCHITECTURE.md D1. The cheapest next win is interning
+register names to dense indices at parse time: the interpreter currently
+does a string-hash lookup per operand, which profiling points to as the
+dominant cost (returning operands by reference instead of by value was
+already tried and gained only ~5%, so the copies were already elided).
 
 ## Next milestones (order)
 

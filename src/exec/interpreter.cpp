@@ -230,8 +230,11 @@ class Interpreter {
              "unknown symbol '" + name + "' (not a .local depot or module .global variable)");
   }
 
-  Lanes read_operand(Warp& w, const BlockCtx& ctx, const Instr& ins, const Operand& op) {
-    Lanes out{};
+  // Returns a reference to the operand's lane vector. Register operands alias
+  // the warp's register file directly; everything else is materialized into
+  // `scratch`. Returning a reference keeps a 256-byte copy off the hot path.
+  const Lanes& read_operand(Warp& w, const BlockCtx& ctx, const Instr& ins, const Operand& op,
+                            Lanes& scratch) {
     if (const auto* r = std::get_if<RegOperand>(&op)) {
       auto it = w.regs.find(r->name);
       if (it == w.regs.end())
@@ -240,20 +243,20 @@ class Interpreter {
       return it->second;
     }
     if (const auto* imm = std::get_if<ImmInt>(&op)) {
-      out.fill(static_cast<uint64_t>(imm->value));
-      return out;
+      scratch.fill(static_cast<uint64_t>(imm->value));
+      return scratch;
     }
     if (const auto* immf = std::get_if<ImmFloatBits>(&op)) {
-      out.fill(immf->bits);
-      return out;
+      scratch.fill(immf->bits);
+      return scratch;
     }
     if (const auto* sym = std::get_if<SymbolOperand>(&op)) {
-      out.fill(resolve_symbol(ins, sym->name));
-      return out;
+      scratch.fill(resolve_symbol(ins, sym->name));
+      return scratch;
     }
-    const auto& s = std::get<SregOperand>(op);
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) out[lane] = sreg_value(s.reg, w, ctx, lane);
-    return out;
+    const auto& sr = std::get<SregOperand>(op);
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) scratch[lane] = sreg_value(sr.reg, w, ctx, lane);
+    return scratch;
   }
 
   uint32_t sreg_value(Sreg s, const Warp& w, const BlockCtx& ctx, uint32_t lane) {
@@ -446,7 +449,8 @@ class Interpreter {
 
   void dispatch(Warp& w, const BlockCtx& ctx, const Instr& ins, Mask m) {
     if (const auto* op = std::get_if<OpMov>(&ins.op)) {
-      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       write_reg(w, op->dst, m, v, op->ty.bits);
       return;
     }
@@ -455,7 +459,10 @@ class Interpreter {
       uint32_t piece = op->ty.bits / n;
       std::vector<Lanes> vals;
       vals.reserve(n);
-      for (const auto& src : op->srcs) vals.push_back(read_operand(w, ctx, ins, src));
+      for (const auto& src : op->srcs) {
+        Lanes tmp;
+        vals.push_back(read_operand(w, ctx, ins, src, tmp));
+      }
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -470,7 +477,8 @@ class Interpreter {
     if (const auto* op = std::get_if<OpMovUnpack>(&ins.op)) {
       uint32_t n = static_cast<uint32_t>(op->dsts.size());
       uint32_t piece = op->ty.bits / n;
-      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       for (uint32_t i = 0; i < n; ++i) {
         Lanes r{};
         for (uint32_t lane = 0; lane < kWarpSize; ++lane)
@@ -480,7 +488,8 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpCvta>(&ins.op)) {
-      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       uint64_t base = space_base(op->space);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
@@ -490,7 +499,8 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpCvt>(&ins.op)) {
-      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = convert(op, v[lane]);
@@ -498,7 +508,8 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpNot>(&ins.op)) {
-      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = ~v[lane];
@@ -506,7 +517,8 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpNeg>(&ins.op)) {
-      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -519,8 +531,12 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpPrmt>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b),
-            c = read_operand(w, ctx, ins, op->c);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -542,7 +558,8 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpAbs>(&ins.op)) {
-      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -559,7 +576,8 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpMath>(&ins.op)) {
-      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -581,8 +599,12 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpBfe>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b),
-            c = read_operand(w, ctx, ins, op->c);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = bfe(op->ty, a[lane], b[lane], c[lane]);
@@ -590,8 +612,14 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpBfi>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b),
-            c = read_operand(w, ctx, ins, op->c), d = read_operand(w, ctx, ins, op->d);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
+      Lanes _s_d;
+      const Lanes& d = read_operand(w, ctx, ins, op->d, _s_d);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = bfi(op->ty, a[lane], b[lane], c[lane], d[lane]);
@@ -599,7 +627,8 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpBrev>(&ins.op)) {
-      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -612,7 +641,8 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpPopcClz>(&ins.op)) {
-      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -664,7 +694,10 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpIntBin>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = int_bin(op->op, op->ty, a[lane], b[lane], ins);
@@ -672,8 +705,12 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpMadLo>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b),
-            c = read_operand(w, ctx, ins, op->c);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = a[lane] * b[lane] + c[lane];
@@ -681,8 +718,12 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpMadWide>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b),
-            c = read_operand(w, ctx, ins, op->c);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -698,7 +739,10 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpMulWide>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -712,8 +756,12 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpShf>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b),
-            c = read_operand(w, ctx, ins, op->c);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -729,7 +777,10 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpFloatBin>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = float_bin(op->op, op->ty, a[lane], b[lane]);
@@ -737,8 +788,12 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpFma>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b),
-            c = read_operand(w, ctx, ins, op->c);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -751,7 +806,10 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpF16x2Bin>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -770,8 +828,12 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpF16x2Fma>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b),
-            c = read_operand(w, ctx, ins, op->c);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -788,7 +850,8 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpF16x2Neg>(&ins.op)) {
-      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = v[lane] ^ 0x80008000ull;  // flip both sign bits
@@ -804,7 +867,10 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpSetp>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Mask& p = w.preds[op->dst];
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
@@ -814,7 +880,10 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpSelp>(&ins.op)) {
-      Lanes a = read_operand(w, ctx, ins, op->a), b = read_operand(w, ctx, ins, op->b);
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Mask p = read_pred(w, ins, op->pred);
       Lanes r{};
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
@@ -843,7 +912,8 @@ class Interpreter {
     if (const auto* op = std::get_if<OpStSlot>(&ins.op)) {
       if (op->offset != 0)
         ctx_fail(ins, -1, Err::UnsupportedPtx, "st.param at a non-zero slot offset");
-      Lanes v = read_operand(w, ctx, ins, op->src);
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes& slot = w.slots[op->slot];
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) slot[lane] = mask_to_bits(v[lane], op->ty.bits);
@@ -895,8 +965,12 @@ class Interpreter {
   // into the warp's lane vector — the operation the warp-vectorized register
   // file makes trivial (see ARCHITECTURE.md D1).
   void exec_shfl(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpShfl& op, Mask m) {
-    Lanes a = read_operand(w, ctx, ins, op.a), b = read_operand(w, ctx, ins, op.b),
-          c = read_operand(w, ctx, ins, op.c);
+    Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op.a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op.b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op.c, _s_c);
     Lanes r{};
     Mask pred_out = 0;
     for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
@@ -953,8 +1027,10 @@ class Interpreter {
     // Gather A and B (16x16 f16 each) and C (16x16 f32) from the warp.
     double A[kMmaDim][kMmaDim] = {}, B[kMmaDim][kMmaDim] = {}, C[kMmaDim][kMmaDim] = {};
     for (int reg = 0; reg < 8; ++reg) {
-      Lanes av = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}});
-      Lanes bv = read_operand(w, ctx, ins, Operand{RegOperand{op.b[reg]}});
+      Lanes _s_av;
+      const Lanes& av = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s_av);
+      Lanes _s_bv;
+      const Lanes& bv = read_operand(w, ctx, ins, Operand{RegOperand{op.b[reg]}}, _s_bv);
       for (uint32_t lane = 0; lane < kMmaDim; ++lane) {
         for (int h = 0; h < 2; ++h) {
           uint32_t col = static_cast<uint32_t>(reg * 2 + h);
@@ -967,7 +1043,8 @@ class Interpreter {
       }
     }
     for (int reg = 0; reg < 8; ++reg) {
-      Lanes cv = read_operand(w, ctx, ins, Operand{RegOperand{op.c[reg]}});
+      Lanes _s_cv;
+      const Lanes& cv = read_operand(w, ctx, ins, Operand{RegOperand{op.c[reg]}}, _s_cv);
       for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
         uint32_t linear = lane * 8 + static_cast<uint32_t>(reg);
         C[linear / kMmaDim][linear % kMmaDim] = f32(cv[lane]);
@@ -995,8 +1072,9 @@ class Interpreter {
 
   void exec_wmma_store(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaStore& op,
                        Mask m) {
-    Lanes base = addr_base(w, ctx, ins, op.addr);
-    Lanes stride = read_operand(w, ctx, ins, op.stride);
+    const Lanes& base = addr_base(w, ctx, ins, op.addr);
+    Lanes _s_stride;
+      const Lanes& stride = read_operand(w, ctx, ins, op.stride, _s_stride);
     uint64_t sbase = space_base(op.space);
     // The whole warp cooperates; lane 0's address and stride describe the tile.
     uint32_t lead = 0;
@@ -1005,7 +1083,8 @@ class Interpreter {
     uint64_t addr0 = sbase + base[lead] + static_cast<uint64_t>(op.addr.offset);
     uint64_t ld = stride[lead];
     for (int reg = 0; reg < 8; ++reg) {
-      Lanes v = read_operand(w, ctx, ins, op.src[reg]);
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op.src[reg], _s_v);
       for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
         if (!(m & (1u << lane))) continue;
         uint32_t linear = lane * 8 + static_cast<uint32_t>(reg);
@@ -1197,8 +1276,16 @@ class Interpreter {
 
   // ---- memory ops ----
 
-  Lanes addr_base(Warp& w, const BlockCtx& ctx, const Instr& ins, const Addr& a) {
-    return read_operand(w, ctx, ins, Operand{RegOperand{a.base}});
+  // Address bases are always register names (the parser guarantees it for
+  // Base::Reg), so look the register up directly and alias the register file
+  // rather than routing through read_operand's scratch path.
+  const Lanes& addr_base(Warp& w, const BlockCtx& ctx, const Instr& ins, const Addr& a) {
+    (void)ctx;
+    auto it = w.regs.find(a.base);
+    if (it == w.regs.end())
+      ctx_fail(ins, -1, Err::UninitializedRegister,
+               "address register " + a.base + " read before any write");
+    return it->second;
   }
 
   void exec_ld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLd& op, Mask m) {
@@ -1222,7 +1309,7 @@ class Interpreter {
       }
       return;
     }
-    Lanes base = addr_base(w, ctx, ins, op.addr);
+    const Lanes& base = addr_base(w, ctx, ins, op.addr);
     uint64_t sbase = space_base(op.space);
     uint32_t va = size * static_cast<uint32_t>(n);  // vector accesses need vector alignment
     std::vector<Lanes> results(n);
@@ -1243,8 +1330,11 @@ class Interpreter {
     size_t n = op.srcs.size();
     std::vector<Lanes> vals;
     vals.reserve(n);
-    for (const auto& src : op.srcs) vals.push_back(read_operand(w, ctx, ins, src));
-    Lanes base = addr_base(w, ctx, ins, op.addr);
+    for (const auto& src : op.srcs) {
+      Lanes tmp;
+      vals.push_back(read_operand(w, ctx, ins, src, tmp));
+    }
+    const Lanes& base = addr_base(w, ctx, ins, op.addr);
     uint64_t sbase = space_base(op.space);
     uint32_t va = size * static_cast<uint32_t>(n);
     for (uint32_t lane = 0; lane < kWarpSize; ++lane)
@@ -1262,11 +1352,13 @@ class Interpreter {
     uint32_t size = op.ty.bytes();
     if (size != 4 && size != 8)
       ctx_fail(ins, -1, Err::UnsupportedPtx, "atomics are only implemented for 32/64-bit types");
-    Lanes base = addr_base(w, ctx, ins, op.addr);
+    const Lanes& base = addr_base(w, ctx, ins, op.addr);
     uint64_t sbase = space_base(op.space);
-    Lanes bv = read_operand(w, ctx, ins, op.b);
+    Lanes _s_bv;
+      const Lanes& bv = read_operand(w, ctx, ins, op.b, _s_bv);
     Lanes cv{};
-    if (op.op == AtomOp::Cas) cv = read_operand(w, ctx, ins, op.c);
+    Lanes _s_cv;
+    if (op.op == AtomOp::Cas) cv = read_operand(w, ctx, ins, op.c, _s_cv);
     Lanes r{};
     // Fixed lane order: trivially atomic and deterministic in this engine.
     for (uint32_t lane = 0; lane < kWarpSize; ++lane)
