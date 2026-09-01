@@ -50,23 +50,35 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
 ## Hardware characterization
 
 `tools/characterize.cu` + `tools/characterize-telemetry.sh` read a physical
-device and emit a profile with `verified: true`. `profiles/nvidia/rtx3060.yaml`
-was produced this way and is the only profile whose values come from hardware
-rather than documentation; `lspci` resolves its generated PCI id to the correct
-device name, and both conformance tests match the physical card exactly.
+device and emit a profile with `verified: true`.
+`tools/characterize-cloud.sh <instance-type> <region>` does the whole thing on
+a rented GPU -- launch, characterize, capture conformance references, and
+terminate (termination is registered before launch and then confirmed, because
+an instance left running bills by the hour).
+`tools/compare-profile.py` diffs a measured profile against the one in the
+tree, so corrections are visible rather than silently applied.
 
-Run them on any GPU to add support for it:
+Verified against real hardware, four devices across three architectures:
 
-```bash
-nvcc -std=c++14 tools/characterize.cu -o vgpu-characterize -lcuda
-{ ./vgpu-characterize 0 | sed '/^telemetry:/,$d'; tools/characterize-telemetry.sh 0; } \
-  > profiles/nvidia/<model>.yaml
-tests/conformance/run_conformance.sh    # then confirm the semantics match
-```
+| profile | device | how |
+| --- | --- | --- |
+| `nvidia/rtx3060` | RTX 3060 (sm_86) | local |
+| `nvidia/a10` | A10 (sm_86) | Lambda `gpu_1x_a10` |
+| `nvidia/a100-sxm4-40gb` | A100 SXM4 40GB (sm_80) | Lambda `gpu_1x_a100_sxm4` |
+| `nvidia/h100` | H100 SXM5 80GB (sm_90) | Lambda `gpu_1x_h100_sxm5` |
 
-The remaining profiles (A10/A100/H100/H200/B200, MI300X/MI325X/MI350X) are
-still documentation-derived placeholders. Characterizing them needs access to
-those parts.
+All four match the physical device on **512 conformance values each** -- the
+same binary run on hardware and on VirtualGPU, diffed.
+
+What characterization corrected in the documentation-derived placeholders:
+- A10 `vram_bytes` 25769803776 -> 23696375808 (datasheet "24 GB"; the device
+  reports 22.07 GiB) and `temperature_max_c` 85 -> 98.
+- H100 `vram_bytes` 85899345920 -> 85028896768.
+Clocks, power caps, SM counts, shared-memory limits and PCI ids were already
+right. Capacity values being wrong is exactly what this process is for.
+
+Still documentation-derived: A100 80GB, H200, B200, and all three AMD
+profiles. B200 had no Lambda capacity; AMD parts are not offered there.
 
 ## Register and occupancy modeling
 

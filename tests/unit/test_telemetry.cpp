@@ -39,7 +39,7 @@ VTEST(publishes_device_identity) {
   VCHECK_EQ(std::string(snap.devices[0].name), "NVIDIA H100 80GB HBM3");
   VCHECK_EQ(std::string(snap.devices[0].vendor), "nvidia");
   VCHECK_EQ(std::string(snap.devices[0].architecture), "hopper");
-  VCHECK_EQ(snap.devices[0].vram_total_bytes, 85899345920ull);
+  VCHECK_EQ(snap.devices[0].vram_total_bytes, 85028896768ull);  // measured on hardware
   // Each virtual device gets its own PCI slot and a distinct UUID.
   VCHECK_EQ(std::string(snap.devices[0].bus_id), "00000000:01:00.0");
   VCHECK_EQ(std::string(snap.devices[2].bus_id), "00000000:03:00.0");

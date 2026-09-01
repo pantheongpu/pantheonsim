@@ -25,11 +25,17 @@ static std::string slug(const char* name) {
         size_t p = in.find(skip);
         if (p != std::string::npos) in.erase(p, std::strlen(skip));
     }
-    bool prev_space = false;
+    // Separators become hyphens rather than vanishing: dropping them turned
+    // "H100 80GB HBM3" into "h10080gbhbm3".
+    bool pending_sep = false;
     for (char c : in) {
-        if (std::isalnum((unsigned char)c)) { s += (char)std::tolower(c); prev_space = false; }
-        else if (c == '-' || c == '_') { s += '-'; prev_space = false; }
-        else if (!prev_space && !s.empty()) { prev_space = true; }
+        if (std::isalnum((unsigned char)c)) {
+            if (pending_sep && !s.empty()) s += '-';
+            pending_sep = false;
+            s += (char)std::tolower(c);
+        } else {
+            pending_sep = true;
+        }
     }
     return s;
 }

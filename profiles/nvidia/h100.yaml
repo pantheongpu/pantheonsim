@@ -1,14 +1,15 @@
 # VirtualGPU device profile: NVIDIA H100 (SXM 80GB variant).
-# Public documentation values (sm_90); verified: false = placeholders pending
-# hardware characterization.
+# Measured on a physical H100 SXM5 80GB (Lambda gpu_1x_h100_sxm5) with
+# tools/characterize.cu. The thermal slowdown limit is not reported by
+# nvidia-smi on this part, so temperature_max_c remains the documented value.
 id: nvidia/h100
 vendor: nvidia
 model: "NVIDIA H100 80GB HBM3"
 architecture: hopper
 compute_capability: "9.0"
 warp_size: 32
-vram_bytes: 85899345920          # 80 GiB HBM3
-verified: false
+vram_bytes: 85028896768
+verified: true
 limits:
   max_threads_per_block: 1024
   max_block_dim: [1024, 1024, 64]
@@ -37,4 +38,4 @@ telemetry:
   mem_clock_max_mhz: 2619
   temperature_max_c: 87
   pci_vendor_id: 4318          # 0x10DE NVIDIA
-  pci_device_id: 9008        # 0x2330 GH100 [H100 SXM5 80GB]
+  pci_device_id: 9008

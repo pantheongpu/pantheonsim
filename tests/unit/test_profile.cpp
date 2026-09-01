@@ -32,7 +32,7 @@ VTEST(all_builtin_profiles_parse) {
     // rtx3060 is characterized from a physical device; the rest are
     // placeholders from public documentation.
     VCHECK_EQ(p.verified, p.id == "nvidia/rtx3060" || p.id == "nvidia/a10" ||
-                          p.id == "nvidia/a100-sxm4-40gb");
+                          p.id == "nvidia/a100-sxm4-40gb" || p.id == "nvidia/h100");
   }
 }
 
@@ -41,7 +41,7 @@ VTEST(h100_profile_values) {
   VCHECK_EQ(p.architecture, "hopper");
   VCHECK_EQ(p.cc_major, 9);
   VCHECK_EQ(p.cc_minor, 0);
-  VCHECK_EQ(p.vram_bytes, 85899345920ull);
+  VCHECK_EQ(p.vram_bytes, 85028896768ull);  // measured on hardware
   VCHECK_EQ(p.limits.multiprocessors, 132u);
   VCHECK(p.features.at("bf16"));
 }
