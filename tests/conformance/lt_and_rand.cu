@@ -72,7 +72,11 @@ int main() {
         lt_matmul("lt matmul relu+bias", CUBLASLT_EPILOGUE_RELU_BIAS, db);
         cudaFree(db);
     }
-    // cuRAND: properties, not exact values.
+    // cuRAND: distribution properties, not exact values -- the two generators
+    // are different algorithms, so their streams never coincide. Print only as
+    // many digits as N justifies: with N=1e5 the standard error of the mean is
+    // ~9e-4 for the uniform and ~1e-2 for the normal, so a third decimal here
+    // would be sampling noise, not a semantics difference.
     {
         const size_t N = 100000;
         float* d = nullptr; cudaMalloc(&d, N*sizeof(float));
@@ -82,7 +86,7 @@ int main() {
         auto u = down(d, N);
         double mean=0, lo=1e9, hi=-1e9; for (float x:u){mean+=x; lo=std::fmin(lo,x); hi=std::fmax(hi,x);} mean/=N;
         double var=0; for (float x:u) var += (x-mean)*(x-mean); var/=N;
-        printf("curand uniform         mean=%.3f var=%.4f min>0=%d max<=1=%d\n",
+        printf("curand uniform         mean=%.2f var=%.2f min>0=%d max<=1=%d\n",
                mean, var, lo>0.0, hi<=1.0);
 
         curandSetPseudoRandomGeneratorSeed(g, 99ULL);
@@ -90,7 +94,7 @@ int main() {
         auto nn = down(d, N);
         double m2=0; for (float x:nn) m2+=x; m2/=N;
         double v2=0; for (float x:nn) v2 += (x-m2)*(x-m2); v2/=N;
-        printf("curand normal          mean=%.2f stddev=%.2f\n", m2, std::sqrt(v2));
+        printf("curand normal          mean=%.1f stddev=%.1f\n", m2, std::sqrt(v2));
 
         // Same seed must reproduce the same stream.
         curandSetPseudoRandomGeneratorSeed(g, 4242ULL);

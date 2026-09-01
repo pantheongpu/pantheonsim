@@ -1,0 +1,3 @@
+libcudnn.so.9 {
+  global: *;
+};

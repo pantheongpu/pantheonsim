@@ -190,6 +190,36 @@ if(CUDA_ABI_INCLUDE)
   endforeach()
 
   # ---------------------------------------------------------------------------
+  # libvgpucudnn: cuDNN, presented as libcudnn.so.9. Built against the real
+  # vendored headers (third_party/cudnn_include) -- hand-writing a vendor
+  # struct layout has silently produced garbage twice, so we never do it.
+  # Real cuDNN exports versioned symbols tagged "libcudnn.so.9"; the version
+  # script gives ours the same tag so the loader binds without the
+  # "no version information available" warning.
+  # ---------------------------------------------------------------------------
+  find_path(CUDNN_INCLUDE cudnn.h
+    PATHS "${CMAKE_SOURCE_DIR}/third_party/cudnn_include" ENV CUDNN_HEADER_DIR
+    NO_DEFAULT_PATH)
+  if(CUDNN_INCLUDE)
+    message(STATUS "cuDNN headers at ${CUDNN_INCLUDE}: building libvgpucudnn")
+    add_library(vgpucudnn SHARED src/cuda/cudnn_api.cpp)
+    target_link_libraries(vgpucudnn PRIVATE vgpu vgpucudart)
+    target_include_directories(vgpucudnn PRIVATE ${CUDNN_INCLUDE} ${CUDA_ABI_INCLUDE})
+    set_target_properties(vgpucudnn PROPERTIES OUTPUT_NAME cudnn SOVERSION 9 VERSION 9.0)
+    target_link_options(vgpucudnn PRIVATE
+      "-Wl,--version-script=${CMAKE_SOURCE_DIR}/src/cuda/cudnn.map")
+    add_custom_command(TARGET vgpucudnn POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudnn.so.9.0"
+              "${CMAKE_BINARY_DIR}/shim/libcudnn.so.9"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudnn.so.9.0"
+              "${CMAKE_BINARY_DIR}/shim/libcudnn.so"
+      COMMENT "Creating cuDNN shim symlinks (build/shim/libcudnn.so.9)")
+  else()
+    message(STATUS "cuDNN headers not found: skipping libvgpucudnn")
+  endif()
+
+  # ---------------------------------------------------------------------------
   # libvgpunvenc: VirtualGPU's NVENC implementation, presented as
   # libnvidia-encode.so.1. Applications dlopen that bare soname, which searches
   # LD_LIBRARY_PATH first, so the shim directory wins over the real driver
