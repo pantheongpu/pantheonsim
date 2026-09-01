@@ -110,7 +110,13 @@ direction for something that refuses launches.
 - **nvidia-smi / rocm-smi / rocm_agent_enumerator** — supplied by VirtualGPU
   (see docs/telemetry.md for why the stock nvidia-smi binary cannot be used).
 
-Not yet: cuBLAS/cuDNN/NCCL (so no PyTorch), `nvidia-smi topo -m`, DCGM.
+**cuBLAS** is implemented (`libcublas.so.13`) and verified against real cuBLAS:
+every GEMM path is bit-identical, level-1/2 routines agree to ~1e-7. The math
+runs on the host rather than through the interpreter, because cuBLAS is a
+library rather than user code — see docs/cublas.md.
+
+Not yet: cuDNN, cuRAND, cuSPARSE, cuSOLVER, NCCL (so still no PyTorch),
+`nvidia-smi topo -m`, DCGM.
 
 ## Known out of scope (not CUDA)
 

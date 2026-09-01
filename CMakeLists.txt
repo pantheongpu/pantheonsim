@@ -138,6 +138,25 @@ if(CUDA_ABI_INCLUDE)
     COMMENT "Creating NVML shim symlinks (build/shim/libnvidia-ml.so.1)")
 
   # ---------------------------------------------------------------------------
+  # libvgpucublas: cuBLAS, presented as libcublas.so.13. cuBLAS is a library,
+  # not user code, so its arithmetic runs on the host at native speed rather
+  # than through the SIMT interpreter -- see docs/cublas.md.
+  # ---------------------------------------------------------------------------
+  add_library(vgpucublas SHARED src/cuda/cublas_api.cpp)
+  target_link_libraries(vgpucublas PRIVATE vgpu vgpucudart)
+  target_include_directories(vgpucublas PRIVATE ${CUDA_ABI_INCLUDE})
+  set_target_properties(vgpucublas PROPERTIES OUTPUT_NAME cublas SOVERSION 13 VERSION 13.0)
+  target_link_options(vgpucublas PRIVATE
+    "-Wl,--version-script=${CMAKE_SOURCE_DIR}/src/cuda/cublas.map")
+  add_custom_command(TARGET vgpucublas POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcublas.so.13.0"
+            "${CMAKE_BINARY_DIR}/shim/libcublas.so.13"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcublas.so.13.0"
+            "${CMAKE_BINARY_DIR}/shim/libcublas.so"
+    COMMENT "Creating cuBLAS shim symlinks (build/shim/libcublas.so.13)")
+
+  # ---------------------------------------------------------------------------
   # libvgpunvenc: VirtualGPU's NVENC implementation, presented as
   # libnvidia-encode.so.1. Applications dlopen that bare soname, which searches
   # LD_LIBRARY_PATH first, so the shim directory wins over the real driver
