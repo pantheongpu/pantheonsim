@@ -111,16 +111,36 @@ Not yet: cuBLAS/cuDNN/NCCL (so no PyTorch), `nvidia-smi topo -m`, DCGM.
 
 ## Performance
 
-The interpreter retires roughly 2x10^8 instructions/s (measured:
-`vgpu demo vectoradd -n 2000000` in ~210 ms). A GPU retires ~10^13 ops/s, so
-saturation-style stress tests must be run at reduced intensity via their own
-CLI knobs (`--kernel_loops`, `--grid_size`); see
-scripts/run-pantheon-workloads.sh. Closing even part of that gap needs the
-IR/JIT path in ARCHITECTURE.md D1. The cheapest next win is interning
-register names to dense indices at parse time: the interpreter currently
-does a string-hash lookup per operand, which profiling points to as the
-dominant cost (returning operands by reference instead of by value was
-already tried and gained only ~5%, so the copies were already elided).
+Measure with `tools/bench.sh` (vectorAdd) and a register-heavy kernel.
+Profile with gprof; guessing has been wrong every time so far.
+
+Done (1.5x on memory-bound, 2.0x on ALU-bound):
+- Register names are interned to dense ids at parse time; the interpreter
+  indexes a flat register file instead of hashing a name per operand.
+- Per-instruction scratch is no longer zero-initialized. `Lanes r{}` was a
+  256-byte memset on *every* instruction -- about 6 GB of pointless memset in
+  the ALU benchmark, and the single largest win found.
+- Hot ALU paths choose the operation and width once per warp instead of
+  per lane, and iterate only active lanes (`for_active`).
+- Link-time optimization for Release builds.
+
+Measured now: vectorAdd 2M elements ~145 ms; ~1.05G lane-ops of dense FMA
+~0.85 s. Profiling says the remaining time is in the per-lane loops
+themselves, which is where it should be for an interpreter.
+
+Next, in order of expected payoff:
+1. **Narrower lane storage.** `Lanes` is 32 x uint64 = 256 bytes, so 32-bit
+   work moves twice the data it needs. A width-tagged register file (32-bit
+   lanes with a 64-bit overlay) should cut memory traffic roughly in half.
+2. **PTX -> internal IR -> LLVM JIT** (ARCHITECTURE.md D1). This is the real
+   answer and the reason the runtime boundary was drawn where it is; an
+   interpreter will not close the remaining gap to hardware.
+3. Block-level parallelism across host threads, behind the scheduler
+   abstraction so determinism is preserved.
+
+A GPU still retires ~10^13 ops/s, so saturation-style stress tests are run at
+reduced intensity via their own CLI knobs; see
+scripts/run-pantheon-workloads.sh.
 
 ## Next milestones (order)
 

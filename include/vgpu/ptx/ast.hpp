@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <map>
+#include <ostream>
 #include <string>
 #include <variant>
 #include <vector>
@@ -35,7 +36,23 @@ enum class Sreg : uint8_t {
   LaneId,
 };
 
-struct RegOperand { std::string name; };            // %r1, %rd4, %f2, %p1 ...
+// A virtual register reference. `id` is a dense per-kernel index assigned at
+// parse time so the interpreter can index a flat register file instead of
+// hashing a name on every operand read -- the difference between ~25M and
+// ~100M+ warp-instructions per second. `name` is kept for diagnostics.
+inline constexpr uint32_t kNoReg = 0xFFFFFFFFu;
+struct Reg {
+  std::string name;
+  uint32_t id = kNoReg;
+};
+
+// Compare and print a Reg by name, so diagnostics and tests read naturally.
+inline bool operator==(const Reg& r, const std::string& s) { return r.name == s; }
+inline bool operator==(const Reg& r, const char* s) { return r.name == s; }
+inline bool operator==(const Reg& a, const Reg& b) { return a.id == b.id; }
+inline std::ostream& operator<<(std::ostream& os, const Reg& r) { return os << r.name; }
+
+struct RegOperand { Reg reg; };                     // %r1, %rd4, %f2, %p1 ...
 struct ImmInt { int64_t value; };                   // 42, -1, 0x10
 struct ImmFloatBits { uint64_t bits; uint32_t width; };  // 0f3F800000 / 0d...
 struct SregOperand { Sreg reg; };
@@ -52,6 +69,7 @@ struct Addr {
   enum class Base { Reg, EntryParam, CallSlot, Symbol };
   Base base_kind = Base::Reg;
   std::string base;
+  uint32_t base_id = kNoReg;  // interned when base_kind == Reg
   int64_t offset = 0;
 };
 
@@ -66,61 +84,61 @@ enum class AtomOp { Add, Min, Max, And, Or, Xor, Exch, Cas };
 enum class PredBinOp { And, Or, Xor };
 
 // Vector loads/stores (v2/v4) carry 2 or 4 registers; scalar ops carry 1.
-struct OpLd { Space space; Type ty; std::vector<std::string> dsts; Addr addr; };
+struct OpLd { Space space; Type ty; std::vector<Reg> dsts; Addr addr; };
 struct OpSt { Space space; Type ty; Addr addr; std::vector<Operand> srcs; };
-struct OpMov { Type ty; std::string dst; Operand src; };
+struct OpMov { Type ty; Reg dst; Operand src; };
 // Vector forms of mov used by inline asm to pack/unpack sub-word registers:
 //   mov.b32 %r, {%rs1, %rs2};      pack two 16-bit halves into 32 bits
 //   mov.b32 {%rs1, %rs2}, %r;      unpack
-struct OpMovPack { Type ty; std::string dst; std::vector<Operand> srcs; };
-struct OpMovUnpack { Type ty; std::vector<std::string> dsts; Operand src; };
+struct OpMovPack { Type ty; Reg dst; std::vector<Operand> srcs; };
+struct OpMovUnpack { Type ty; std::vector<Reg> dsts; Operand src; };
 // Address-space conversion. PTX addresses in .shared/.local are offsets within
 // that space's window; cvta converts them to/from generic addresses.
 //   cvta.<space>.u64    d, a   -> generic  (d = window_base + a)
 //   cvta.to.<space>.uNN d, a   -> space    (d = a - window_base)
 // .global/.const already alias the generic space, so those are identity.
-struct OpCvta { Type ty; Space space; bool to_space; std::string dst; Operand src; };
+struct OpCvta { Type ty; Space space; bool to_space; Reg dst; Operand src; };
 enum class Round { None, Rn, Rz, Rm, Rp, Rni, Rzi };
-struct OpCvt { Type dst_ty; Type src_ty; Round round = Round::None; std::string dst; Operand src; };
-struct OpNot { Type ty; std::string dst; Operand src; };   // bitwise not
-struct OpNeg { Type ty; std::string dst; Operand src; };   // arithmetic negate (int/float)
-struct OpAbs { Type ty; std::string dst; Operand src; };
+struct OpCvt { Type dst_ty; Type src_ty; Round round = Round::None; Reg dst; Operand src; };
+struct OpNot { Type ty; Reg dst; Operand src; };   // bitwise not
+struct OpNeg { Type ty; Reg dst; Operand src; };   // arithmetic negate (int/float)
+struct OpAbs { Type ty; Reg dst; Operand src; };
 
 // Single-operand math: the SFU-approximated transcendentals plus sqrt/rcp.
 // VirtualGPU computes them at full host precision; results are within the
 // documented approximation tolerance but not bit-identical to a real SFU
 // (a documented divergence — see ARCHITECTURE.md).
 enum class MathOp { Ex2, Lg2, Sin, Cos, Sqrt, Rsqrt, Rcp, Tanh };
-struct OpMath { MathOp op; Type ty; std::string dst; Operand src; };
+struct OpMath { MathOp op; Type ty; Reg dst; Operand src; };
 
 // Bitfield extract/insert.
-struct OpBfe { Type ty; std::string dst; Operand a, b, c; };        // b=start, c=len
-struct OpBfi { Type ty; std::string dst; Operand a, b, c, d; };     // insert a into b
-struct OpBrev { Type ty; std::string dst; Operand src; };           // bit reverse
-struct OpPopcClz { bool popc; Type ty; std::string dst; Operand src; };
+struct OpBfe { Type ty; Reg dst; Operand a, b, c; };        // b=start, c=len
+struct OpBfi { Type ty; Reg dst; Operand a, b, c, d; };     // insert a into b
+struct OpBrev { Type ty; Reg dst; Operand src; };           // bit reverse
+struct OpPopcClz { bool popc; Type ty; Reg dst; Operand src; };
 
 // Warp shuffle. `pred_dst` is the optional "d|p" second destination.
 enum class ShflMode { Up, Down, Bfly, Idx };
-struct OpShfl { ShflMode mode; std::string dst; std::string pred_dst; Operand a, b, c, member_mask; };
+struct OpShfl { ShflMode mode; Reg dst; Reg pred_dst; Operand a, b, c, member_mask; };
 // Warp vote/ballot across the active mask.
 enum class VoteMode { All, Any, Uni, Ballot };
-struct OpVote { VoteMode mode; bool ballot; std::string dst; std::string src; bool negate_src; };
-struct OpPrmt { std::string dst; Operand a, b, c; };       // byte permute (default mode)
-struct OpIntBin { IntBinOp op; Type ty; std::string dst; Operand a, b; };
-struct OpMadLo { Type ty; std::string dst; Operand a, b, c; };
-struct OpMulWide { bool is_signed; std::string dst; Operand a, b; };  // 32x32 -> 64
-struct OpMadWide { bool is_signed; std::string dst; Operand a, b, c; };  // 32x32+64 -> 64
+struct OpVote { VoteMode mode; bool ballot; Reg dst; Reg src; bool negate_src; };
+struct OpPrmt { Reg dst; Operand a, b, c; };       // byte permute (default mode)
+struct OpIntBin { IntBinOp op; Type ty; Reg dst; Operand a, b; };
+struct OpMadLo { Type ty; Reg dst; Operand a, b, c; };
+struct OpMulWide { bool is_signed; Reg dst; Operand a, b; };  // 32x32 -> 64
+struct OpMadWide { bool is_signed; Reg dst; Operand a, b, c; };  // 32x32+64 -> 64
 // High half of a same-width multiply. Compilers emit these to turn integer
 // division by a constant into a multiply, so they show up in ordinary code.
-struct OpMulHi { Type ty; std::string dst; Operand a, b; };
-struct OpMadHi { Type ty; std::string dst; Operand a, b, c; };
-struct OpShf { bool left; bool wrap; std::string dst; Operand a, b, c; };  // funnel shift b:a
-struct OpFloatBin { FloatBinOp op; Type ty; std::string dst; Operand a, b; };
-struct OpFma { Type ty; std::string dst; Operand a, b, c; };
+struct OpMulHi { Type ty; Reg dst; Operand a, b; };
+struct OpMadHi { Type ty; Reg dst; Operand a, b, c; };
+struct OpShf { bool left; bool wrap; Reg dst; Operand a, b, c; };  // funnel shift b:a
+struct OpFloatBin { FloatBinOp op; Type ty; Reg dst; Operand a, b; };
+struct OpFma { Type ty; Reg dst; Operand a, b, c; };
 // Packed half2 SIMD: one 32-bit register holds two f16 lanes.
-struct OpF16x2Bin { FloatBinOp op; std::string dst; Operand a, b; };
-struct OpF16x2Fma { std::string dst; Operand a, b, c; };
-struct OpF16x2Neg { std::string dst; Operand src; };
+struct OpF16x2Bin { FloatBinOp op; Reg dst; Operand a, b; };
+struct OpF16x2Fma { Reg dst; Operand a, b, c; };
+struct OpF16x2Neg { Reg dst; Operand src; };
 
 // Tensor-core MMA (m16n16k16, f16 inputs, f32 accumulate). A warp-collective
 // operation: the 32 lanes jointly hold the matrices.
@@ -134,7 +152,7 @@ struct OpF16x2Neg { std::string dst; Operand src; };
 enum class MatLayout { Row, Col };
 struct OpWmmaMma {
   MatLayout alayout, blayout;
-  std::vector<std::string> d, a, b, c;
+  std::vector<Reg> d, a, b, c;
 };
 struct OpWmmaStore {
   MatLayout layout;
@@ -143,18 +161,18 @@ struct OpWmmaStore {
   std::vector<Operand> src;
   Operand stride;
 };
-struct OpSetp { CmpOp cmp; Type ty; std::string dst; Operand a, b; };
-struct OpSelp { Type ty; std::string dst; Operand a, b; std::string pred; };
-struct OpPredBin { PredBinOp op; std::string dst; std::string a, b; };
-struct OpNotPred { std::string dst; std::string src; };
-struct OpAtom { AtomOp op; Space space; Type ty; std::string dst; Addr addr; Operand b; Operand c; };
+struct OpSetp { CmpOp cmp; Type ty; Reg dst; Operand a, b; };
+struct OpSelp { Type ty; Reg dst; Operand a, b; Reg pred; };
+struct OpPredBin { PredBinOp op; Reg dst; Reg a, b; };
+struct OpNotPred { Reg dst; Reg src; };
+struct OpAtom { AtomOp op; Space space; Type ty; Reg dst; Addr addr; Operand b; Operand c; };
 struct OpBra { size_t target; std::string label; };  // target = instruction index
 struct OpBar {};                                     // bar.sync 0
 struct OpRet {};
 // Call-sequence machinery (currently only the vprintf builtin is callable).
 struct OpDeclSlot { std::string name; uint32_t size; };            // ".param .b64 param0;" in body
 struct OpStSlot { std::string slot; int64_t offset; Type ty; Operand src; };
-struct OpLdSlot { std::string slot; int64_t offset; Type ty; std::string dst; };
+struct OpLdSlot { std::string slot; int64_t offset; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
@@ -166,7 +184,7 @@ struct Instr {
   size_t line = 0;                 // source line, for diagnostics
   bool has_pred = false;           // @%p / @!%p guard
   bool pred_negated = false;
-  std::string pred;
+  Reg pred;
   Op op;
   std::string text;                // original source text, for diagnostics
 };
@@ -201,6 +219,9 @@ struct EntryFn {
   std::vector<ParamDecl> params;
   std::vector<Instr> body;
   std::map<std::string, Type> reg_decls;      // declared virtual registers
+  // Dense register numbering used by the interpreter's flat register file.
+  std::map<std::string, uint32_t> reg_ids;
+  uint32_t num_regs = 0;
   std::map<std::string, LocalDecl> locals;    // .local depots
   uint32_t local_frame_size = 0;              // total per-thread local bytes
   std::map<std::string, SharedDecl> shared;   // .shared variables (per block)

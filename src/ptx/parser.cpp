@@ -263,6 +263,7 @@ class Parser {
 
   EntryFn parse_entry() {
     EntryFn fn;
+    cur_fn_ = &fn;
     fn.name = expect_word("kernel name");
     current_kernel_ = fn.name;
     call_slots_.clear();
@@ -304,6 +305,7 @@ class Parser {
     for (auto& [name, d] : fn.shared)
       if (d.dynamic) d.offset = fn.static_shared_size;
     current_kernel_.clear();
+    cur_fn_ = nullptr;
     return fn;
   }
 
@@ -401,10 +403,12 @@ class Parser {
         for (int i = 0; i < n; ++i) {
           fn.reg_decls[name + std::to_string(i)] = ty;
           declared_regs_.insert(name + std::to_string(i));
+          intern(name + std::to_string(i));
         }
       } else {
         fn.reg_decls[name] = ty;
         declared_regs_.insert(name);
+        intern(name);
       }
       if (peek_punct(",")) {
         next();
@@ -499,7 +503,7 @@ class Parser {
     if (w[0] == '%') {
       auto it = sreg_table().find(w);
       if (it != sreg_table().end()) return SregOperand{it->second};
-      return RegOperand{w};
+      return RegOperand{intern(w)};
     }
     if (isdigit(static_cast<unsigned char>(w[0]))) {
       if (w.size() == 10 && w[0] == '0' && (w[1] == 'f' || w[1] == 'F'))
@@ -510,23 +514,32 @@ class Parser {
     }
     // A bare identifier is an inline-asm register local if it was declared as
     // one; otherwise it names a module global or local depot.
-    if (declared_regs_.count(w)) return RegOperand{w};
+    if (declared_regs_.count(w)) return RegOperand{intern(w)};
     return SymbolOperand{w};
+  }
+
+  // Interns a register name into the current kernel's dense numbering. The
+  // interpreter indexes a flat register file with these ids instead of hashing
+  // names at run time.
+  Reg intern(const std::string& name) {
+    auto [it, fresh] = cur_fn_->reg_ids.emplace(name, cur_fn_->num_regs);
+    if (fresh) ++cur_fn_->num_regs;
+    return Reg{name, it->second};
   }
 
   // Register operand. Inline asm may declare locals without the '%' sigil
   // (".reg .f16 low;"), so a bare identifier that was declared as a register
   // is accepted too.
-  std::string expect_reg_operand(const std::string& ctx) {
+  Reg expect_reg_operand(const std::string& ctx) {
     std::string w = expect_word(ctx);
     if (w[0] != '%' && !declared_regs_.count(w))
       fail(peek().line, ctx + " must be a register, got '" + w + "'");
-    return w;
+    return intern(w);
   }
 
   // Register vector: {%r1, %r2, %r3, %r4}
-  std::vector<std::string> parse_reg_vector(size_t n) {
-    std::vector<std::string> regs;
+  std::vector<Reg> parse_reg_vector(size_t n) {
+    std::vector<Reg> regs;
     expect_punct("{");
     while (!peek_punct("}")) {
       regs.push_back(expect_reg_operand("vector element"));
@@ -539,8 +552,8 @@ class Parser {
     return regs;
   }
 
-  std::vector<std::string> parse_reg_vector_any() {
-    std::vector<std::string> regs;
+  std::vector<Reg> parse_reg_vector_any() {
+    std::vector<Reg> regs;
     expect_punct("{");
     while (!peek_punct("}")) {
       regs.push_back(expect_reg_operand("fragment register"));
@@ -568,9 +581,10 @@ class Parser {
     expect_punct("[");
     Addr a;
     std::string base = expect_word("address base");
-    if (base[0] == '%') {
+    if (base[0] == '%' || declared_regs_.count(base)) {
       a.base = base;
       a.base_kind = Addr::Base::Reg;
+      a.base_id = intern(base).id;
     } else if (call_slots_.count(base)) {
       a.base = base;
       a.base_kind = Addr::Base::CallSlot;
@@ -643,7 +657,7 @@ class Parser {
       if (!have_ty) fail(ins.line, "ld/st missing type: " + opcode);
       if (op0 == "ld") {
         Addr addr;
-        std::vector<std::string> dsts;
+        std::vector<Reg> dsts;
         if (vec == 1) {
           dsts.push_back(expect_reg_operand("ld destination"));
         } else {
@@ -704,7 +718,7 @@ class Parser {
         if (op.dsts.size() != 2 && op.dsts.size() != 4) return unsupported("mov unpack arity");
         ins.op = op;
       } else {
-        std::string dst = expect_reg_operand("mov destination");
+        Reg dst = expect_reg_operand("mov destination");
         expect_punct(",");
         if (peek_punct("{")) {  // mov.bN d, {s0, s1, ...}  — pack
           OpMovPack op;
@@ -804,7 +818,7 @@ class Parser {
         if (parts[i] != "f16x2" && parts[i] != "rn" && parts[i] != "ftz" && parts[i] != "sat" &&
             parts[i] != "rz" && parts[i] != "rm" && parts[i] != "rp")
           return unsupported("f16x2 modifier '." + parts[i] + "'");
-      std::string dst = expect_reg_operand("destination");
+      Reg dst = expect_reg_operand("destination");
       expect_punct(",");
       Operand a = parse_operand();
       if (op0 == "neg") {
@@ -865,7 +879,7 @@ class Parser {
         op.addr = parse_addr(fn);
         expect_punct(",");
         {
-          std::vector<std::string> regs = parse_reg_vector_any();
+          std::vector<Reg> regs = parse_reg_vector_any();
           for (auto& r : regs) op.src.push_back(Operand{RegOperand{r}});
         }
         if (op.src.size() != 8) return unsupported("wmma.store fragment arity");
@@ -918,7 +932,7 @@ class Parser {
     } else if (op0 == "bfe" || op0 == "bfi") {
       auto ty = parse_type_token(parts.back());
       if (!ty || parts.size() != 2) return unsupported(op0 + " form");
-      std::string dst = expect_reg_operand("destination");
+      Reg dst = expect_reg_operand("destination");
       expect_punct(",");
       Operand a = parse_operand();
       expect_punct(",");
@@ -1209,7 +1223,7 @@ class Parser {
         } else return unsupported("unrecognized modifier '." + p + "'");
       }
       if (!have_ty) fail(ins.line, opcode + " missing type");
-      std::string dst = expect_reg_operand("destination");
+      Reg dst = expect_reg_operand("destination");
       expect_punct(",");
       Operand a = parse_operand();
       expect_punct(",");
@@ -1336,6 +1350,7 @@ class Parser {
   std::string current_kernel_;
   std::set<std::string> call_slots_;
   std::set<std::string> declared_regs_;  // every .reg name in the current kernel
+  EntryFn* cur_fn_ = nullptr;           // receives interned register ids
 };
 
 }  // namespace

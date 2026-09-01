@@ -10,6 +10,16 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 add_compile_options(-Wall -Wextra)
 
+# The interpreter is the hot path and benefits measurably from cross-TU
+# inlining. Enabled only for Release builds, and only if the toolchain
+# supports it, so debug builds and odd toolchains are unaffected.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT VGPU_HAVE_LTO OUTPUT _lto_msg)
+if(VGPU_HAVE_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release")
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+  message(STATUS "Link-time optimization enabled for Release")
+endif()
+
 # ---------------------------------------------------------------------------
 # Embed device profiles (profiles/*.yaml) into a generated header so binaries
 # are self-contained. Re-runs automatically when a profile file changes.
