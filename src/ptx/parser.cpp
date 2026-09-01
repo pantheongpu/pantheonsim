@@ -563,20 +563,15 @@ class Parser {
     return ins;
   }
 
-  // Rebuilds source-ish text from tokens for error messages.
+  // Rebuilds source-ish text from tokens for error messages. Joins the tokens
+  // consumed so far plus (for mid-statement failures) the un-consumed remainder,
+  // stopping at the statement's own ';'.
   std::string reconstruct_from(size_t start_tok) {
     std::string out;
-    for (size_t i = start_tok; i < pos_ && i < toks_.size(); ++i) {
-      if (toks_[i].kind == Token::Kind::End) break;
+    for (size_t i = start_tok; i < toks_.size(); ++i) {
+      if (toks_[i].kind == Token::Kind::End || toks_[i].text == ";") break;
       if (!out.empty() && toks_[i].kind == Token::Kind::Word && out.back() != '@' && out.back() != '[')
         out += ' ';
-      out += toks_[i].text;
-    }
-    // Also include un-consumed tokens up to the ';' so unsupported-instruction
-    // errors show the full statement.
-    for (size_t i = pos_; i < toks_.size(); ++i) {
-      if (toks_[i].kind == Token::Kind::End || toks_[i].text == ";") break;
-      out += ' ';
       out += toks_[i].text;
     }
     return out;

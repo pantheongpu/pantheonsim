@@ -46,8 +46,13 @@ add_library(vgpu STATIC
   src/ptx/parser.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
+  src/runtime/runtime.cpp
 )
 target_include_directories(vgpu PUBLIC include "${_gen_dir}")
+
+# libvgpucuda: the CUDA Driver API shim external programs link against.
+add_library(vgpucuda SHARED src/cuda/driver_api.cpp)
+target_link_libraries(vgpucuda PRIVATE vgpu)
 
 # CLI
 add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp)
@@ -72,3 +77,12 @@ vgpu_unit_test(test_ptx)
 target_compile_definitions(test_ptx PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR}/tests/kernels")
 vgpu_unit_test(test_exec)
 target_compile_definitions(test_exec PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR}/tests/kernels")
+vgpu_unit_test(test_runtime)
+
+# The C harness: an "external application" built with a plain C compiler
+# against the documented ABI only (vgpu_cuda.h + libvgpucuda.so).
+add_executable(vector_add_driver tests/c_harness/vector_add_driver.c)
+target_link_libraries(vector_add_driver PRIVATE vgpucuda)
+target_include_directories(vector_add_driver PRIVATE include)
+add_test(NAME c_harness_vector_add COMMAND vector_add_driver)
+set_tests_properties(c_harness_vector_add PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100")
