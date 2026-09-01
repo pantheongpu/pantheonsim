@@ -40,6 +40,7 @@ add_library(vgpu STATIC
   src/core/yamlish.cpp
   src/core/profile.cpp
   src/core/registry.cpp
+  src/core/memory.cpp
 )
 target_include_directories(vgpu PUBLIC include "${_gen_dir}")
 
@@ -61,3 +62,4 @@ endfunction()
 
 vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_profile)
+vgpu_unit_test(test_memory)
