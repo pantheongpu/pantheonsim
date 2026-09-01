@@ -1,0 +1,25 @@
+# VirtualGPU device profile: NVIDIA A10.
+# Values are taken from public NVIDIA documentation (datasheet + CUDA
+# programming guide, sm_86). verified: false means no value in this file has
+# been confirmed by hardware characterization yet — treat as placeholders.
+id: nvidia/a10
+vendor: nvidia
+model: "NVIDIA A10"
+architecture: ampere
+compute_capability: "8.6"
+warp_size: 32
+vram_bytes: 25769803776          # 24 GiB GDDR6
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 101376   # 99 KiB (sm_86)
+  registers_per_block: 65536
+  multiprocessors: 72
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true

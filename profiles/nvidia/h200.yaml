@@ -1,0 +1,24 @@
+# VirtualGPU device profile: NVIDIA H200 (SXM).
+# Public documentation values (sm_90, Hopper refresh with 141 GB HBM3e);
+# verified: false = placeholders pending hardware characterization.
+id: nvidia/h200
+vendor: nvidia
+model: "NVIDIA H200"
+architecture: hopper
+compute_capability: "9.0"
+warp_size: 32
+vram_bytes: 151397597184         # 141 GiB HBM3e (marketing "141 GB"; placeholder)
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 232448   # 227 KiB (sm_90)
+  registers_per_block: 65536
+  multiprocessors: 132
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true

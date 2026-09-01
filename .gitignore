@@ -1,8 +1,6 @@
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.venv/
-venv/
-*.egg-info/
 build/
-dist/
+__pycache__/
+*.o
+*.so
+compile_commands.json
+.cache/

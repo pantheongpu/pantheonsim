@@ -1,0 +1,24 @@
+# VirtualGPU device profile: NVIDIA A100 (SXM4 80GB variant).
+# Public documentation values (sm_80); verified: false = placeholders pending
+# hardware characterization.
+id: nvidia/a100
+vendor: nvidia
+model: "NVIDIA A100-SXM4-80GB"
+architecture: ampere
+compute_capability: "8.0"
+warp_size: 32
+vram_bytes: 85899345920          # 80 GiB HBM2e
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 166912   # 163 KiB (sm_80)
+  registers_per_block: 65536
+  multiprocessors: 108
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true

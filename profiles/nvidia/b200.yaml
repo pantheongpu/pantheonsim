@@ -1,0 +1,25 @@
+# VirtualGPU device profile: NVIDIA B200 (Blackwell).
+# Public documentation values (sm_100). Blackwell public data is thinner than
+# Hopper's; several values here are best-effort placeholders and MUST be
+# revisited by hardware characterization. verified: false.
+id: nvidia/b200
+vendor: nvidia
+model: "NVIDIA B200"
+architecture: blackwell
+compute_capability: "10.0"
+warp_size: 32
+vram_bytes: 206158430208         # 192 GiB HBM3e (spec sheet; SMI-visible size TBD)
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 232448   # 227 KiB (sm_100)
+  registers_per_block: 65536
+  multiprocessors: 148
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
