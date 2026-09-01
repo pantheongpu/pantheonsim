@@ -1,86 +1,106 @@
 # Running the pantheon workloads on VirtualGPU
 
-The [pantheongpu](https://github.com/pantheongpu) GPU stress/diagnostics kernels
-run **unmodified** on VirtualGPU — the same source that runs on a physical GPU.
+The [pantheongpu](https://github.com/pantheongpu) GPU stress/diagnostics suite
+runs **unmodified** on VirtualGPU — the same sources that run on a physical GPU.
+
+```bash
+./scripts/build.sh
+./scripts/run-pantheon-workloads.sh          # builds and runs the whole suite
+```
 
 ## How it works
 
 pantheon kernels use the CUDA **Runtime** API (`cudaMalloc`, `cudaMemcpy`,
-`kernel<<<grid, block>>>()`, `cudaDeviceSynchronize`). VirtualGPU ships
-`libvgpucudart` — a drop-in `libcudart.so.13` implementing that API plus the
-nvcc host-registration ABI (`__cudaRegisterFatBinary`, `__cudaRegisterFunction`,
-`__cudaPushCallConfiguration`, `__cudaGetKernel`, `cudaLaunchKernel`). At load
-time the shim is placed ahead of NVIDIA's runtime, so the chevron launch lowers
-onto our runtime, which extracts the embedded PTX from the fatbin and executes
-it on the CPU SIMT engine.
+`kernel<<<grid, block>>>()`). VirtualGPU ships `libvgpucudart` — a drop-in
+`libcudart.so.13` implementing that API plus the nvcc host-registration ABI
+(`__cudaRegisterFatBinary`, `__cudaRegisterFunction`,
+`__cudaPushCallConfiguration`, `__cudaGetKernel`, `cudaLaunchKernel`). The
+chevron launch lowers onto our runtime, which pulls the embedded PTX out of the
+fatbin and executes it on the CPU SIMT engine. `libvgpucuda` provides the
+driver API (`libcuda.so.1`) for workloads that link `-lcuda`.
 
-### One requirement: shared cudart
+Only two things differ from a physical-GPU run, and neither touches the source:
 
-The app must link the **shared** CUDA runtime so the loader can substitute our
-library:
+**1. Link the shared CUDA runtime** (`nvcc -cudart shared`) so the loader can
+substitute our library. Hosting a *statically* linked cudart would require
+NVIDIA's undocumented driver export tables; see ARCHITECTURE.md D6.
 
-```bash
-nvcc -cudart shared ...            # instead of the default static cudart
-```
+**2. Set a CPU-appropriate intensity** using the workloads' own CLI knobs.
+These are saturation tests: a GPU retires ~10¹³ ops/s, a CPU interpreter
+~2×10⁸. Lowering `--kernel_loops`/`--grid_size` and the VRAM percentage runs
+the same code over a smaller working set — it does not change what executes.
+The runner defaults to `--kernel_loops 2 --grid_size 4`, 2% of a 64 MB virtual
+device, and a 5 s duration, which makes every workload finish in about its
+requested duration.
 
-The source is untouched — only the runtime link mode differs. (Hosting a
-*statically* linked cudart would require NVIDIA's undocumented driver export
-tables; that path is future work. See ARCHITECTURE.md.)
-
-## Recipe
-
-```bash
-# 1. Build VirtualGPU (libvgpucudart is built when the CUDA toolkit is present)
-./scripts/build.sh
-
-# 2. Compile an unmodified pantheon workload against shared cudart
-nvcc -O3 -std=c++14 -Ikernels/common -x cu --gpu-architecture=sm_86 \
-     -cudart shared kernels/memory_read/memory_read.cpp -o memory_read
-
-# 3. Run it on a virtual GPU — no physical GPU involved
-scripts/vgpu-run.sh --gpu nvidia/a10 --vram-mb 64 ./memory_read 0 1 50 --verify
-```
-
-Environment (also honored directly):
+## Environment
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `VGPU_GPU` | virtual GPU profile | `nvidia/h100` |
-| `VGPU_VRAM_MB` | cap advertised VRAM so `%`-of-VRAM stress tests run at laptop scale | profile VRAM |
+| `VGPU_VRAM_MB` | cap advertised VRAM so %-of-VRAM tests run at laptop scale | profile VRAM |
 | `VGPU_DEVICE_COUNT` | number of identical virtual devices | 1 |
-| `VGPU_TRACE=1` | log every runtime/driver entry point (how to grow coverage) | off |
+| `VGPU_TRACE=1` | log every runtime/driver entry point and unmodeled attribute | off |
 | `VGPU_QUIET=1` | silence diagnostics | off |
 
-`--vram-mb` matters because several workloads size their allocation as a
-percentage of device memory; on a real 24 GB card that is gigabytes of
-interpreted threads. Functional behavior is identical; only the working set
-shrinks.
+The runner additionally accepts `VGPU_WL_GPU`, `VGPU_WL_VRAM_MB`,
+`VGPU_WL_DURATION`, `VGPU_WL_LOOPS`, `VGPU_WL_GRID`, `VGPU_WL_MEMPCT`,
+`VGPU_WL_TIMEOUT`.
 
-## Status (verified against a physical RTX 3060 oracle)
+## Status
 
-Runs to completion with correct results:
+**44 of 46 workloads run to completion**, each executing for its full requested
+duration. This includes the memory diagnostics (`memory_read`/`write`,
+`galpat`, `march_test`, `memory_hammer`, `memory_retention`, `tlb_avalanche`),
+the compute/ALU stressors (`compute_virus`, `int_virus`, `fp64_virus`,
+`sfu_stress`, `atomic_virus`), the tensor-core kernels (`mma_virus`,
+`tensor_virus`, `transformer_virus`, `omni_virus`), the AI-serving workloads
+(`llm_prefill`, `llm_decode`, `moe_router`, `fused_attention`,
+`quantized_gemm`, `rag_embedding`, `kv_cache_churn`, `speculative_decode`),
+and `graph_replay` (real CUDA Graph capture/replay).
 
-| Workload | Result |
-| --- | --- |
-| `idle` | runs |
-| `memory_read` | **PASS**; fault injection detected at index 1337 (matches 3060) |
-| `memory_write` | **PASS** |
-| `galpat` | **PASS** (0 gallop errors) |
-| `march_test` | **PASS** (0 march errors) |
-| `memory_hammer` | runs |
-| `atomic_virus` | runs |
-| `int_virus` | runs |
-| `compute_virus` | runs (fp32 ALU hammer) |
+The two exceptions are **not CUDA**:
 
-The differential check is the point: on `memory_read --inject_error`, both the
-physical 3060 and the virtual A10 report `Verification: FAIL (1 errors)` — and
-VirtualGPU reproduces the device-side `printf` diagnostic byte-for-byte
-(`Index: 1337 | XOR: 0x0badbeef`).
+| Workload | Needs | Why it is out of scope |
+| --- | --- | --- |
+| `rt_virus` | OptiX (`libnvoptix.so.1`) | NVIDIA's ray-tracing library — a separate product with its own pipeline/BVH runtime |
+| `media_enc_virus` | NVENC (`libnvidia-encode.so.1`) | NVIDIA's hardware video encoder — fixed-function silicon, not CUDA |
 
-## Coverage notes
+On a CPU-only machine both take their own documented "driver not installed"
+path and exit cleanly. On a host that *also* has real NVIDIA driver libraries
+(e.g. WSL), they load the real library and then try to reach real hardware
+through the virtual device, so the runner skips them.
+
+## Differential validation against real hardware
+
+`memory_read` was validated against a physical RTX 3060 (the intended
+characterization oracle):
+
+| Run | Physical 3060 | Virtual A10 |
+| --- | --- | --- |
+| clean | `Verification: PASS (0 errors)` | `Verification: PASS (0 errors)` |
+| `--inject_error` | `Verification: FAIL (1 errors)` | `Verification: FAIL (1 errors)` |
+
+VirtualGPU also reproduces the device-side `printf` diagnostic byte-for-byte:
+
+```
+[SDC FAULT][Memory_READ] Retention/Read Error! Index: 1337 | Exp: 0xe76e5272 | Act: 0xecc3ec9d | XOR: 0x0badbeef
+```
+
+## Growing coverage
 
 Every unsupported PTX instruction fails loudly, naming the instruction, PTX
-line, kernel, and profile — never a silent wrong answer. Growing coverage is
-mechanical: run under `VGPU_TRACE=1`, read the `unsupported PTX` message, add
-the instruction with a unit test. Kernels using shared memory, warp shuffles,
-tensor-core MMA, or SASS-only fatbins are not yet runnable and say so.
+line, kernel, and GPU profile — never a silent wrong answer:
+
+```
+[vgpu] cudaLaunchKernel: VirtualGPU error [unsupported-ptx]: unsupported PTX:
+  neg.f32 %f34, %f51
+at line 67 in kernel '_Z20voltage_droop_kerneliPfi'
+  GPU profile: nvidia/a10
+```
+
+So extending coverage is mechanical: run under `VGPU_TRACE=1`, read the error,
+implement the instruction, add a unit test. That loop is exactly how the
+subset grew from vectorAdd to the full suite — shared memory, warp shuffles,
+tensor cores, f16/f16x2, transcendentals, and bitfield ops were each added
+because a specific workload demanded them.

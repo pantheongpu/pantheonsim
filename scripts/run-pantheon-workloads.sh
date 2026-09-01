@@ -21,12 +21,21 @@ bin="$out/bin"; logs="$out/logs"
 mkdir -p "$bin" "$logs"
 
 : "${VGPU_WL_GPU:=nvidia/a10}"       # sm_86 profile matches the sm_86 build
-: "${VGPU_WL_VRAM_MB:=512}"          # advertised VRAM (sizes %-of-VRAM tests)
+: "${VGPU_WL_VRAM_MB:=64}"           # advertised VRAM (sizes %-of-VRAM tests)
 : "${VGPU_WL_DURATION:=5}"           # seconds each workload should run
-: "${VGPU_WL_TIMEOUT:=180}"          # hard cap per workload
-: "${VGPU_WL_LOOPS:=4}"              # --kernel_loops
-: "${VGPU_WL_GRID:=8}"               # --grid_size
-: "${VGPU_WL_MEMPCT:=5}"             # percent of virtual VRAM to allocate
+: "${VGPU_WL_TIMEOUT:=90}"           # hard cap per workload
+: "${VGPU_WL_LOOPS:=2}"              # --kernel_loops
+: "${VGPU_WL_GRID:=4}"               # --grid_size
+: "${VGPU_WL_MEMPCT:=2}"             # percent of virtual VRAM to allocate
+
+# Workloads that need NVIDIA subsystems VirtualGPU does not emulate. These are
+# separate products, not CUDA: OptiX is the ray-tracing library (libnvoptix)
+# and NVENC is the hardware video encoder (libnvidia-encode). On a CPU-only
+# machine both workloads take their own documented "driver not installed"
+# path and exit cleanly; on a host that also has real NVIDIA driver libraries
+# installed (e.g. WSL) they load the real library and then try to reach real
+# hardware through the virtual device, so we skip them here.
+OUT_OF_SCOPE=" rt_virus media_enc_virus "
 
 if ! command -v nvcc >/dev/null 2>&1; then
   echo "SKIP: nvcc not found (needed to compile the workloads)"; exit 0
@@ -50,6 +59,9 @@ printf '%-26s %-8s %s\n' "--------------------------" "------" "------"
 for w in $names; do
   if [[ ! -x "$bin/$w" ]]; then
     printf '%-26s %-8s %s\n' "$w" SKIP "does not build in this environment"; ((skip++)); continue
+  fi
+  if [[ "$OUT_OF_SCOPE" == *" $w "* ]]; then
+    printf '%-26s %-8s %s\n' "$w" SKIP "needs OptiX/NVENC (not CUDA; out of scope)"; ((skip++)); continue
   fi
   start=$SECONDS
   VGPU_QUIET=1 VGPU_GPU="$VGPU_WL_GPU" VGPU_VRAM_MB="$VGPU_WL_VRAM_MB" \

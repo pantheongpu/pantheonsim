@@ -33,7 +33,7 @@ Working today, all CPU-only:
 | `vgpu` CLI | `list-gpus`, `info --gpu <id> [--json]`, `demo vectoradd` |
 | Virtual VRAM | sparse/lazy backing — a virtual H200 claims 141 GB on a 16 GB host; OOB / use-after-free / double-free / misalignment diagnostics |
 | PTX | lexer/parser for a growing subset (see ARCHITECTURE.md); precise `unsupported` errors for the rest |
-| Execution | SIMT warp interpreter: 32-lane warps, divergence masks, `bar.sync` across warps, deterministic scheduling |
+| Execution | SIMT warp interpreter: 32-lane warps, divergence masks, shared memory, `bar.sync`, warp shuffles/vote, atomics, tensor-core `wmma`, f16/f16x2, deterministic scheduling |
 | Driver API | `libvgpucuda.so` + clean-room `vgpu_cuda.h`: init/discovery/context/memory/module/`cuLaunchKernel`, `cuLibrary`/`cuKernel`, `cuGetProcAddress` |
 | Runtime API | `libvgpucudart` (drop-in `libcudart.so.13`): the CUDA **Runtime** API + nvcc host-registration ABI, so unmodified nvcc apps run unchanged |
 | Fatbin | extracts embedded PTX from nvcc fatbins (uncompressed + zstd) |
@@ -47,8 +47,12 @@ Known limitations (deliberate, documented):
   loader can substitute VirtualGPU's `libcudart.so.13`. The source is untouched;
   hosting a *statically* linked cudart needs NVIDIA's undocumented driver export
   tables and is future work.
-- No shared memory, warp shuffles, tensor cores, or f16/bf16 math yet. Every
-  gap fails loudly (instruction, PTX line, kernel, profile), never silently.
+- `wmma` fragment layout is VirtualGPU's own (PTX leaves it unspecified) —
+  see ARCHITECTURE.md D8. bf16, `cp.async`, `mma.sync`, and textures are not
+  implemented. Every gap fails loudly (instruction, PTX line, kernel,
+  profile), never silently.
+- OptiX (ray tracing) and NVENC (video encode) are separate NVIDIA
+  subsystems, not CUDA, and are out of scope.
 - AMD (MI300X/MI325X/MI350X) is designed for but not started.
 
 ## Build & test
@@ -78,8 +82,14 @@ nvcc -cudart shared my_app.cu -o my_app
 scripts/vgpu-run.sh --gpu nvidia/h200 ./my_app
 ```
 
-The pantheon stress/diagnostics kernels run this way unchanged — see
-[docs/pantheon-workloads.md](docs/pantheon-workloads.md).
+All 44 CUDA workloads in the pantheon stress/diagnostics suite run this way
+unchanged:
+
+```bash
+scripts/run-pantheon-workloads.sh        # builds and runs the whole suite
+```
+
+See [docs/pantheon-workloads.md](docs/pantheon-workloads.md).
 
 ### Running a driver-API program against the virtual GPU
 

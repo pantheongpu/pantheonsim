@@ -160,7 +160,37 @@ Two ABI subtleties that bit us and are now guarded:
   (a `cudaKernel_t` handle), not only the classic `cudaLaunchKernel(func, …)`.
   Both entry points are provided.
 
-### D7. Clean-room ABI discipline
+### D7. Address spaces are windows, not aliases
+
+PTX `.shared` and `.local` addresses are **offsets within their space**, not
+generic addresses: `mov.u32 %r, sharedvar` yields a 32-bit offset, and `cvta`
+converts to/from the generic space. VirtualGPU models this with two reserved
+VA windows (`kSharedVaBase`, `kLocalVaBase`); space-tagged accesses add the
+window base, `cvta.<space>` adds it, `cvta.to.<space>` subtracts it, and
+generic accesses route by address range. `.global`/`.const` already alias the
+flat device VA range, so those conversions are identity.
+
+Getting this wrong is silent: an early version treated every space as an alias,
+so a 32-bit `st.shared [%r]` truncated a 64-bit pointer and wrote through
+address 0. Shared memory is per-block and **zero-initialized** (hardware leaves
+it undefined) — another deliberate determinism divergence.
+
+### D8. Tensor-core fragments: a chosen, documented layout
+
+PTX explicitly leaves the mapping of matrix elements to `wmma` fragment
+registers **unspecified**. VirtualGPU therefore defines its own self-consistent
+layout (m16n16k16: A/B halves indexed by lane and register, C/D f32 as a flat
+row-major 256-element spread over 32 lanes x 8 registers) and computes
+`D = A x B + C` from it.
+
+Consequence, stated plainly: kernels that treat fragments as opaque
+(`wmma.load` -> `wmma.mma` -> `wmma.store`) or that fill them uniformly get
+hardware-matching results. A kernel that depends on NVIDIA's exact undocumented
+element distribution — which is legal to observe but not to rely on — may
+differ. That is the correct trade for a functional simulator, and the
+characterization suite is where any real divergence would be caught.
+
+### D9. Clean-room ABI discipline
 
 `vgpu_cuda.h` is written from NVIDIA's public driver-API documentation;
 numeric values (error codes, attribute ids) follow the documented ABI so real
