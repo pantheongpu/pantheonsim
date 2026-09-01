@@ -157,6 +157,39 @@ if(CUDA_ABI_INCLUDE)
     COMMENT "Creating cuBLAS shim symlinks (build/shim/libcublas.so.13)")
 
   # ---------------------------------------------------------------------------
+  # Additional vendor libraries. Same boundary as cuBLAS: library math runs on
+  # the host, application kernels are simulated. Each is presented under the
+  # real soname so unmodified programs link against it.
+  # ---------------------------------------------------------------------------
+  # Each CUDA library carries its own major version, and the soname is what the
+  # loader matches on: building curand as .so.13 meant programs silently loaded
+  # NVIDIA's real libcurand.so.10 instead. Keep this table in step with
+  # `objdump -p libX.so | grep SONAME` from the toolkit.
+  set(_vgpu_libs
+    "curand:10:curand_api"
+    "cublasLt:13:cublaslt_api"
+  )
+  foreach(_entry IN LISTS _vgpu_libs)
+    string(REPLACE ":" ";" _parts "${_entry}")
+    list(GET _parts 0 _lib)
+    list(GET _parts 1 _ver)
+    list(GET _parts 2 _src)
+    string(TOLOWER "${_lib}" _lower)
+    add_library(vgpu${_lower} SHARED src/cuda/${_src}.cpp)
+    target_link_libraries(vgpu${_lower} PRIVATE vgpu vgpucudart)
+    target_include_directories(vgpu${_lower} PRIVATE ${CUDA_ABI_INCLUDE})
+    set_target_properties(vgpu${_lower} PROPERTIES
+      OUTPUT_NAME ${_lib} SOVERSION ${_ver} VERSION ${_ver}.0)
+    add_custom_command(TARGET vgpu${_lower} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink "../lib${_lib}.so.${_ver}.0"
+              "${CMAKE_BINARY_DIR}/shim/lib${_lib}.so.${_ver}"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink "../lib${_lib}.so.${_ver}.0"
+              "${CMAKE_BINARY_DIR}/shim/lib${_lib}.so"
+      COMMENT "Creating ${_lib} shim symlinks (soname lib${_lib}.so.${_ver})")
+  endforeach()
+
+  # ---------------------------------------------------------------------------
   # libvgpunvenc: VirtualGPU's NVENC implementation, presented as
   # libnvidia-encode.so.1. Applications dlopen that bare soname, which searches
   # LD_LIBRARY_PATH first, so the shim directory wins over the real driver
