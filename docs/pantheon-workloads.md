@@ -50,14 +50,22 @@ The runner additionally accepts `VGPU_WL_GPU`, `VGPU_WL_VRAM_MB`,
 ## Status
 
 **44 of 46 workloads run to completion**, each executing for its full requested
-duration. This includes the memory diagnostics (`memory_read`/`write`,
+duration (the runner provisions 2 virtual devices so the multi-GPU workloads
+take their real peer-DMA paths). This includes the memory diagnostics (`memory_read`/`write`,
 `galpat`, `march_test`, `memory_hammer`, `memory_retention`, `tlb_avalanche`),
 the compute/ALU stressors (`compute_virus`, `int_virus`, `fp64_virus`,
 `sfu_stress`, `atomic_virus`), the tensor-core kernels (`mma_virus`,
 `tensor_virus`, `transformer_virus`, `omni_virus`), the AI-serving workloads
 (`llm_prefill`, `llm_decode`, `moe_router`, `fused_attention`,
 `quantized_gemm`, `rag_embedding`, `kv_cache_churn`, `speculative_decode`),
-and `graph_replay` (real CUDA Graph capture/replay).
+`graph_replay` (real CUDA Graph capture/replay), and the multi-GPU workloads
+`all_reduce` and `p2p_thrasher` (peer copies between two virtual devices).
+
+A few workloads allocate fixed-size buffers rather than a percentage of VRAM
+(`pcie_bandwidth` and `p2p_thrasher` each want two 256 MiB buffers), so the
+runner gives those a larger virtual device. Configurable virtual VRAM and
+device count are product features, not workarounds: `VGPU_VRAM_MB` and
+`VGPU_DEVICE_COUNT` let one laptop present whatever rack the test expects.
 
 The two exceptions are **not CUDA**:
 

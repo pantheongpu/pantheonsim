@@ -43,6 +43,8 @@ Updated: 2026-09-01 (rev 3). See ARCHITECTURE.md for the design behind these.
 - Tensor cores: wmma.mma m16n16k16 f32.f32 (row/col layouts), wmma.store.d.
 - f16 (software IEEE binary16) and packed f16x2 arithmetic.
 - CUDA Graphs: real stream capture -> record -> replay.
+- Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual
+  devices (all_reduce and p2p_thrasher take their real peer-DMA paths).
 - Configurable virtual VRAM (VGPU_VRAM_MB); VGPU_TRACE coverage-growth logging.
 
 ## Known out of scope (not CUDA)
@@ -91,14 +93,16 @@ already tried and gained only ~5%, so the copies were already elided).
 
 ## Next milestones (order)
 
-1. **M8** streams/events (default-stream semantics already hold: everything
-   is synchronous; add handles + cross-stream sync semantics)
-2. **Shared memory + atomics + shuffles** in PTX/interpreter — unlocks real
-   reduction/scan kernels and the first interesting divergence bugs
-3. **Static cudart hosting**: satisfy NVIDIA's undocumented driver export
+1. **Interpreter speed**: intern register names to dense indices at parse
+   time (see Performance above) — the single biggest win available without
+   the JIT.
+2. **Scheduler: random mode** (seeded) + first differential scheduling tests,
+   then the adversarial mode that makes VirtualGPU a race detector.
+3. **Characterization harness v0**: run the same micro-tests on a physical
+   GPU (bench/ rents them) and on virtual profiles, diff, and start flipping
+   `verified` bits in the profiles.
+4. **Static cudart hosting**: satisfy NVIDIA's undocumented driver export
    tables (cuGetExportTable dark API) so binaries built with the *default*
    (static) cudart also run without a `-cudart shared` rebuild. Partial
    groundwork exists in the driver shim; deferred as brittle/version-specific.
-4. **Scheduler: random mode** (seeded) + first differential scheduling tests
-5. **Characterization harness v0**: same micro-tests on a physical GPU
-   (bench/ rents them) vs virtual profiles; start flipping `verified` bits
+5. **More PTX as workloads demand it**: bf16, cp.async, mma.sync, textures.
