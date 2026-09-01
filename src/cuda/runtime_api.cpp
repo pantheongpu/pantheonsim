@@ -431,11 +431,43 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, int attr, int device)
   });
 }
 
-VGPU_EXPORT cudaError_t cudaDeviceCanAccessPeer(int* can, int, int) {
-  if (can) *can = 0;
-  return cudaSuccess;
+VGPU_EXPORT cudaError_t cudaDeviceCanAccessPeer(int* can, int device, int peerDevice) {
+  return guard("cudaDeviceCanAccessPeer", [&](State& s) {
+    if (!can) return cudaErrorInvalidValue;
+    if (device < 0 || device >= s.rt->device_count() || peerDevice < 0 ||
+        peerDevice >= s.rt->device_count())
+      return cudaErrorInvalidDevice;
+    // Distinct virtual devices can always reach each other; a device is not
+    // its own peer (matching the runtime API contract).
+    *can = (device != peerDevice) ? 1 : 0;
+    return cudaSuccess;
+  });
 }
-VGPU_EXPORT cudaError_t cudaDeviceEnablePeerAccess(int, unsigned int) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaDeviceEnablePeerAccess(int peerDevice, unsigned int) {
+  return guard("cudaDeviceEnablePeerAccess", [&](State& s) {
+    if (peerDevice < 0 || peerDevice >= s.rt->device_count()) return cudaErrorInvalidDevice;
+    if (peerDevice == s.current_device) return cudaErrorInvalidDevice;
+    return cudaSuccess;  // peer mappings are implicit in this engine
+  });
+}
+VGPU_EXPORT cudaError_t cudaDeviceDisablePeerAccess(int) { return cudaSuccess; }
+
+// Copies between two virtual devices' memories. Device pointers are only
+// meaningful on their own device, so each side is resolved against its own
+// MemoryManager.
+VGPU_EXPORT cudaError_t cudaMemcpyPeer(void* dst, int dstDevice, const void* src, int srcDevice,
+                                       size_t count) {
+  return guard("cudaMemcpyPeer", [&](State& s) {
+    if (dstDevice < 0 || dstDevice >= s.rt->device_count() || srcDevice < 0 ||
+        srcDevice >= s.rt->device_count())
+      return cudaErrorInvalidDevice;
+    if (count == 0) return cudaSuccess;
+    std::vector<uint8_t> tmp(count);
+    s.rt->device(srcDevice).memory().read(reinterpret_cast<uint64_t>(src), tmp.data(), count);
+    s.rt->device(dstDevice).memory().write(reinterpret_cast<uint64_t>(dst), tmp.data(), count);
+    return cudaSuccess;
+  });
+}
 
 VGPU_EXPORT cudaError_t cudaMemGetInfo(size_t* free_b, size_t* total_b) {
   return guard("cudaMemGetInfo", [&](State& s) {
@@ -535,9 +567,9 @@ VGPU_EXPORT cudaError_t cudaFreeHost(void* ptr) {
     return cudaSuccess;
   });
 }
-VGPU_EXPORT cudaError_t cudaMemcpyPeerAsync(void* dst, int, const void* src, int, size_t count,
-                                            cudaStream_t) {
-  return cudaMemcpy(dst, src, count, cudaMemcpyDeviceToDevice);
+VGPU_EXPORT cudaError_t cudaMemcpyPeerAsync(void* dst, int dstDevice, const void* src,
+                                            int srcDevice, size_t count, cudaStream_t) {
+  return cudaMemcpyPeer(dst, dstDevice, src, srcDevice, count);
 }
 
 /* ===================================================================== */

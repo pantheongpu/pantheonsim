@@ -74,18 +74,26 @@ through the virtual device, so the runner skips them.
 ## Differential validation against real hardware
 
 `memory_read` was validated against a physical RTX 3060 (the intended
-characterization oracle):
+characterization oracle). Build the reference with the Makefile's default
+(static) cudart and the virtual run with `-cudart shared` — the source is
+identical, only the runtime link differs:
 
 | Run | Physical 3060 | Virtual A10 |
 | --- | --- | --- |
 | clean | `Verification: PASS (0 errors)` | `Verification: PASS (0 errors)` |
 | `--inject_error` | `Verification: FAIL (1 errors)` | `Verification: FAIL (1 errors)` |
 
-VirtualGPU also reproduces the device-side `printf` diagnostic byte-for-byte:
+VirtualGPU also reproduces the device-side `printf` diagnostic byte-for-byte —
+identical expected/actual/XOR values, from an independent CPU execution:
 
 ```
 [SDC FAULT][Memory_READ] Retention/Read Error! Index: 1337 | Exp: 0xe76e5272 | Act: 0xecc3ec9d | XOR: 0x0badbeef
 ```
+
+One host caveat, unrelated to VirtualGPU: on this WSL machine a `-cudart
+shared` binary segfaults when run against the *real* driver (no VirtualGPU
+libraries involved). Use the default static-cudart build for the physical
+reference run, as above.
 
 ## Growing coverage
 

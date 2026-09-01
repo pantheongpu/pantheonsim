@@ -51,4 +51,27 @@ VTEST(devices_have_independent_memory) {
   VCHECK(err.code() == Err::InvalidPointer);
 }
 
+VTEST(peer_copy_between_virtual_devices) {
+  // Device pointers are per-device; a peer copy moves bytes between two
+  // devices' memories (the path cudaMemcpyPeer takes).
+  runtime::Runtime rt(load_gpu("nvidia/a10"), 2);
+  uint64_t p0 = rt.device(0).memory().alloc(256);
+  uint64_t p1 = rt.device(1).memory().alloc(256);
+  std::vector<uint32_t> src(64);
+  for (uint32_t i = 0; i < src.size(); ++i) src[i] = i * 3 + 1;
+  rt.device(0).memory().write(p0, src.data(), src.size() * 4);
+
+  std::vector<uint8_t> staging(256);
+  rt.device(0).memory().read(p0, staging.data(), staging.size());
+  rt.device(1).memory().write(p1, staging.data(), staging.size());
+
+  std::vector<uint32_t> got(64);
+  rt.device(1).memory().read(p1, got.data(), got.size() * 4);
+  VCHECK(src == got);
+  // The source device's pointer is still invalid on the destination device.
+  uint32_t scratch = 0;
+  auto err = VCAPTURE(Error, rt.device(1).memory().read(p0 + 4096, &scratch, 4));
+  VCHECK(err.code() == Err::InvalidPointer);
+}
+
 VTEST_MAIN

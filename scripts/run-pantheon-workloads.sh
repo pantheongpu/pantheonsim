@@ -27,6 +27,17 @@ mkdir -p "$bin" "$logs"
 : "${VGPU_WL_LOOPS:=2}"              # --kernel_loops
 : "${VGPU_WL_GRID:=4}"               # --grid_size
 : "${VGPU_WL_MEMPCT:=2}"             # percent of virtual VRAM to allocate
+: "${VGPU_WL_DEVICES:=2}"            # virtual device count (multi-GPU workloads need >= 2)
+
+# A few workloads allocate fixed-size buffers rather than a percentage of VRAM,
+# so they need a larger virtual device than the default.
+vram_for() {
+  case "$1" in
+    pcie_bandwidth|p2p_thrasher) echo 1024 ;;  # fixed 256 MiB buffers per device
+    all_reduce)                  echo 1024 ;;  # sizes its ring buffers from VRAM
+    *)                           echo "$VGPU_WL_VRAM_MB" ;;
+  esac
+}
 
 # Workloads that need NVIDIA subsystems VirtualGPU does not emulate. These are
 # separate products, not CUDA: OptiX is the ray-tracing library (libnvoptix)
@@ -64,7 +75,8 @@ for w in $names; do
     printf '%-26s %-8s %s\n' "$w" SKIP "needs OptiX/NVENC (not CUDA; out of scope)"; ((skip++)); continue
   fi
   start=$SECONDS
-  VGPU_QUIET=1 VGPU_GPU="$VGPU_WL_GPU" VGPU_VRAM_MB="$VGPU_WL_VRAM_MB" \
+  VGPU_QUIET=1 VGPU_GPU="$VGPU_WL_GPU" VGPU_VRAM_MB="$(vram_for "$w")" \
+    VGPU_DEVICE_COUNT="$VGPU_WL_DEVICES" \
     LD_LIBRARY_PATH="$shim" timeout "$VGPU_WL_TIMEOUT" \
     "$bin/$w" 0 "$VGPU_WL_DURATION" "$VGPU_WL_MEMPCT" \
     --kernel_loops "$VGPU_WL_LOOPS" --warmup_iters 1 --grid_size "$VGPU_WL_GRID" \
