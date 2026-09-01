@@ -12,37 +12,37 @@ using yamlish::Value;
   throw Error::make(Err::ProfileParse, origin, ": ", msg);
 }
 
-const Value& require(const Value& map, const std::string& key, const std::string& origin) {
+const Value& require(const Value& map, const char* key, const std::string& origin) {
   auto it = map.map.find(key);
-  if (it == map.map.end()) fail(origin, "missing required key: " + key);
+  if (it == map.map.end()) fail(origin, std::string("missing required key: ") + key);
   return it->second;
 }
 
-std::string get_str(const Value& map, const std::string& key, const std::string& origin) {
+std::string get_str(const Value& map, const char* key, const std::string& origin) {
   const Value& v = require(map, key, origin);
-  if (v.kind != Value::Kind::Str) fail(origin, "key '" + key + "' must be a string");
+  if (v.kind != Value::Kind::Str) fail(origin, "key '" + std::string(key) + "' must be a string");
   return v.str;
 }
 
-int64_t get_int(const Value& map, const std::string& key, const std::string& origin) {
+int64_t get_int(const Value& map, const char* key, const std::string& origin) {
   const Value& v = require(map, key, origin);
-  if (v.kind != Value::Kind::Int) fail(origin, "key '" + key + "' must be an integer");
+  if (v.kind != Value::Kind::Int) fail(origin, "key '" + std::string(key) + "' must be an integer");
   return v.i;
 }
 
-bool get_bool(const Value& map, const std::string& key, const std::string& origin) {
+bool get_bool(const Value& map, const char* key, const std::string& origin) {
   const Value& v = require(map, key, origin);
-  if (v.kind != Value::Kind::Bool) fail(origin, "key '" + key + "' must be true/false");
+  if (v.kind != Value::Kind::Bool) fail(origin, "key '" + std::string(key) + "' must be true/false");
   return v.b;
 }
 
-std::array<uint32_t, 3> get_dim3(const Value& map, const std::string& key, const std::string& origin) {
+std::array<uint32_t, 3> get_dim3(const Value& map, const char* key, const std::string& origin) {
   const Value& v = require(map, key, origin);
-  if (v.kind != Value::Kind::List || v.list.size() != 3) fail(origin, "key '" + key + "' must be [x, y, z]");
+  if (v.kind != Value::Kind::List || v.list.size() != 3) fail(origin, "key '" + std::string(key) + "' must be [x, y, z]");
   std::array<uint32_t, 3> out{};
   for (int i = 0; i < 3; ++i) {
     if (v.list[i].kind != Value::Kind::Int || v.list[i].i < 0)
-      fail(origin, "key '" + key + "' must contain non-negative integers");
+      fail(origin, "key '" + std::string(key) + "' must contain non-negative integers");
     out[i] = static_cast<uint32_t>(v.list[i].i);
   }
   return out;
