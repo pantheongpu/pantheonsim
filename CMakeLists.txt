@@ -190,6 +190,31 @@ if(CUDA_ABI_INCLUDE)
   endforeach()
 
   # ---------------------------------------------------------------------------
+  # libvgpunccl: NCCL, presented as libnccl.so.2. There is no NVLink to move
+  # bytes over, so the transport is a directory of memory-mapped files -- which
+  # is what lets one-rank-per-process launchers (torchrun) work unmodified.
+  # ---------------------------------------------------------------------------
+  find_path(NCCL_INCLUDE nccl.h
+    PATHS "${CMAKE_SOURCE_DIR}/third_party/nccl_include" ENV NCCL_HEADER_DIR
+    NO_DEFAULT_PATH)
+  if(NCCL_INCLUDE)
+    message(STATUS "NCCL headers at ${NCCL_INCLUDE}: building libvgpunccl")
+    add_library(vgpunccl SHARED src/cuda/nccl_api.cpp)
+    target_link_libraries(vgpunccl PRIVATE vgpu vgpucudart)
+    target_include_directories(vgpunccl PRIVATE ${NCCL_INCLUDE} ${CUDA_ABI_INCLUDE})
+    set_target_properties(vgpunccl PROPERTIES OUTPUT_NAME nccl SOVERSION 2 VERSION 2.0)
+    add_custom_command(TARGET vgpunccl POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnccl.so.2.0"
+              "${CMAKE_BINARY_DIR}/shim/libnccl.so.2"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnccl.so.2.0"
+              "${CMAKE_BINARY_DIR}/shim/libnccl.so"
+      COMMENT "Creating NCCL shim symlinks (build/shim/libnccl.so.2)")
+  else()
+    message(STATUS "NCCL headers not found: skipping libvgpunccl")
+  endif()
+
+  # ---------------------------------------------------------------------------
   # libvgpucudnn: cuDNN, presented as libcudnn.so.9. Built against the real
   # vendored headers (third_party/cudnn_include) -- hand-writing a vendor
   # struct layout has silently produced garbage twice, so we never do it.
@@ -302,4 +327,12 @@ set_tests_properties(c_harness_vector_add PROPERTIES ENVIRONMENT "VGPU_GPU=nvidi
 if(TARGET vgpucudart)
   add_test(NAME e2e_vector_add COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_e2e.sh)
   set_tests_properties(e2e_vector_add PROPERTIES DEPENDS vgpucudart)
+endif()
+
+# One rank per process over the file-backed NCCL transport. This is the shape
+# real launchers use, and the only test where the ranks share no address space.
+if(TARGET vgpunccl)
+  add_test(NAME e2e_nccl_multiproc
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_nccl_multiproc.sh 4)
+  set_tests_properties(e2e_nccl_multiproc PROPERTIES DEPENDS vgpunccl TIMEOUT 300)
 endif()
