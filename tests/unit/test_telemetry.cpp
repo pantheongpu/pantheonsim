@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <memory>
 #include <thread>
 
 #include "vgpu/error.hpp"
@@ -18,12 +19,13 @@ namespace {
 struct TempSegment {
   std::string path;
   explicit TempSegment(const char* tag) {
-    path = std::string("/tmp/vgpu-telemetry-test-") + tag + "-" + std::to_string(getpid());
+    path = std::string("/tmp/vgpu-telemetry-test-") + tag + "-" + std::to_string(getpid()) + ".d";
     setenv("VGPU_TELEMETRY_PATH", path.c_str(), 1);
   }
   ~TempSegment() {
     unsetenv("VGPU_TELEMETRY_PATH");
-    ::remove(path.c_str());
+    // The publisher removes its own file; drop the directory.
+    ::rmdir(path.c_str());
   }
 };
 }  // namespace
@@ -121,7 +123,32 @@ VTEST(amd_profiles_are_discoverable) {
 
 VTEST(no_publisher_means_no_snapshot) {
   telemetry::Shared snap{};
-  VCHECK(!telemetry::read_snapshot(&snap, "/tmp/vgpu-telemetry-does-not-exist"));
+  VCHECK(!telemetry::read_snapshot(&snap, "/tmp/vgpu-telemetry-does-not-exist.d"));
+}
+
+VTEST(publishers_merge_like_processes_sharing_a_gpu) {
+  // A session and a workload are separate processes on the same virtual
+  // machine: memory adds up and both appear in the per-device process list,
+  // and neither one exiting erases the other.
+  TempSegment seg("merge");
+  auto session = std::make_unique<runtime::Runtime>(load_gpu("nvidia/h100"), 2);
+  uint64_t a = session->device(0).memory().alloc(32ull * 1024 * 1024);
+  {
+    runtime::Runtime workload(load_gpu("nvidia/h100"), 2);
+    uint64_t b = workload.device(0).memory().alloc(8ull * 1024 * 1024);
+    telemetry::Shared snap{};
+    VCHECK(telemetry::read_snapshot(&snap, seg.path));
+    VCHECK_EQ(snap.device_count, 2u);
+    // Both processes' allocations are visible on device 0.
+    VCHECK_EQ(snap.devices[0].vram_used_bytes, 40ull * 1024 * 1024);
+    workload.device(0).memory().free(b);
+  }
+  // The workload is gone; the session's own memory is still reported.
+  telemetry::Shared after{};
+  VCHECK(telemetry::read_snapshot(&after, seg.path));
+  VCHECK_EQ(after.device_count, 2u);
+  VCHECK_EQ(after.devices[0].vram_used_bytes, 32ull * 1024 * 1024);
+  session->device(0).memory().free(a);
 }
 
 VTEST(amd_execution_fails_loudly) {

@@ -75,6 +75,17 @@ Then:
 ./build/vgpu demo vectoradd --gpu nvidia/h100 -n 1000000
 ```
 
+### Simulating a whole machine
+
+```bash
+build/bin/vgpu shell        # pick a GPU, CUDA/driver and OS, then get a shell
+```
+
+Inside it, `nvidia-smi`, `rocm-smi`, `rocm_agent_enumerator`, `lspci`, `dmesg`,
+`uname` and `/proc/driver/nvidia/version` all reflect the machine you asked
+for, and CUDA programs run on the CPU engine. See
+[docs/machine-simulator.md](docs/machine-simulator.md).
+
 ### Running an unmodified CUDA application
 
 ```bash

@@ -1,5 +1,6 @@
 #include "vgpu/telemetry.hpp"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -9,7 +10,9 @@
 #include <cerrno>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <vector>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -35,15 +38,23 @@ constexpr double kWindowSeconds = 0.5;  // telemetry integration window
 std::string default_path() {
   if (const char* p = std::getenv("VGPU_TELEMETRY_PATH"); p && p[0]) return p;
   if (const char* r = std::getenv("XDG_RUNTIME_DIR"); r && r[0])
-    return std::string(r) + "/vgpu-telemetry";
-  return "/tmp/vgpu-telemetry-" + std::to_string(getuid());
+    return std::string(r) + "/vgpu-telemetry.d";
+  return "/tmp/vgpu-telemetry-" + std::to_string(getuid()) + ".d";
 }
 
 Publisher::Publisher() {
   if (disabled()) return;
   size_ = sizeof(Shared);
-  std::string path = default_path();
-  fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0600);
+  std::string dir = default_path();
+  ::mkdir(dir.c_str(), 0700);
+  // One segment per publisher instance -- keyed by pid *and* a process-local
+  // sequence, because a single process can hold more than one Runtime (the
+  // driver-API and runtime-API shims each create their own).
+  static std::atomic<unsigned> seq{0};
+  std::string path = dir + "/pub-" + std::to_string(getpid()) + "-" +
+                     std::to_string(seq.fetch_add(1));
+  path_ = path;
+  fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
   if (fd_ < 0) return;
   if (::ftruncate(fd_, static_cast<off_t>(size_)) != 0) {
     ::close(fd_);
@@ -74,11 +85,12 @@ Publisher::Publisher() {
 
 Publisher::~Publisher() {
   if (shared_) {
-    // Zero the device count so a stale file does not advertise dead devices.
     shared_->device_count = 0;
     ::munmap(shared_, size_);
   }
   if (fd_ >= 0) ::close(fd_);
+  // Remove this process's segment so it cannot linger as phantom hardware.
+  if (!path_.empty()) ::unlink(path_.c_str());
 }
 
 void Publisher::begin_update() {
@@ -203,8 +215,11 @@ void Publisher::refresh(uint32_t ordinal) {
   a.mem_busy_seconds = 0;
 }
 
-bool read_snapshot(Shared* out, const std::string& path) {
-  if (!out) return false;
+namespace {
+
+// Reads one publisher's segment. Seqlock-style: retry while a writer is
+// mid-update, so a snapshot is never half-applied.
+bool read_one(const std::string& path, Shared* out) {
   int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) return false;
   struct stat st {};
@@ -216,7 +231,6 @@ bool read_snapshot(Shared* out, const std::string& path) {
   ::close(fd);
   if (p == MAP_FAILED) return false;
   const Shared* s = static_cast<const Shared*>(p);
-  // Seqlock-style read: retry while a writer is mid-update.
   for (int attempt = 0; attempt < 64; ++attempt) {
     uint64_t before = __atomic_load_n(&s->update_seq, __ATOMIC_ACQUIRE);
     if (before & 1) continue;
@@ -226,11 +240,77 @@ bool read_snapshot(Shared* out, const std::string& path) {
   }
   ::munmap(p, sizeof(Shared));
   if (out->magic != kMagic || out->version != kVersion) return false;
-  // A publisher that died leaves the file behind; treat a dead writer as "no
-  // devices" rather than reporting phantom hardware.
-  if (out->writer_pid != 0 && ::kill(static_cast<pid_t>(out->writer_pid), 0) != 0 && errno == ESRCH)
+  // A publisher that died leaves its file behind; clean it up rather than
+  // reporting phantom hardware.
+  if (out->writer_pid != 0 && ::kill(static_cast<pid_t>(out->writer_pid), 0) != 0 &&
+      errno == ESRCH) {
+    ::unlink(path.c_str());
     return false;
+  }
   return out->device_count > 0;
+}
+
+}  // namespace
+
+bool read_snapshot(Shared* out, const std::string& dir) {
+  if (!out) return false;
+  DIR* d = ::opendir(dir.c_str());
+  if (!d) return false;
+  std::vector<Shared> pubs;
+  while (struct dirent* e = ::readdir(d)) {
+    if (std::strncmp(e->d_name, "pub-", 4) != 0) continue;
+    Shared s{};
+    if (read_one(dir + "/" + e->d_name, &s)) pubs.push_back(s);
+  }
+  ::closedir(d);
+  if (pubs.empty()) return false;
+
+  // Several processes share one virtual machine, exactly as they share a
+  // physical GPU. Identity comes from the publisher holding the most devices
+  // (the session, when there is one); memory and counters add up; each
+  // contributing process shows up in the per-device process list.
+  size_t base = 0;
+  for (size_t i = 1; i < pubs.size(); ++i)
+    if (pubs[i].device_count > pubs[base].device_count) base = i;
+  *out = pubs[base];
+
+  for (uint32_t dev = 0; dev < out->device_count; ++dev) {
+    DeviceSample& agg = out->devices[dev];
+    agg.vram_used_bytes = 0;
+    agg.kernels_launched = 0;
+    agg.bytes_moved = 0;
+    agg.proc_count = 0;
+    uint32_t util = 0, mem_util = 0;
+    for (const Shared& p : pubs) {
+      if (dev >= p.device_count) continue;
+      const DeviceSample& s = p.devices[dev];
+      agg.vram_used_bytes += s.vram_used_bytes;
+      agg.kernels_launched += s.kernels_launched;
+      agg.bytes_moved += s.bytes_moved;
+      util = std::max(util, s.utilization_gpu);
+      mem_util = std::max(mem_util, s.utilization_mem);
+      // Report the busiest publisher's derived readings for this device.
+      if (s.utilization_gpu >= util) {
+        agg.temperature_c = s.temperature_c;
+        agg.power_mw = s.power_mw;
+        agg.sm_clock_mhz = s.sm_clock_mhz;
+        agg.mem_clock_mhz = s.mem_clock_mhz;
+        agg.voltage_mv = s.voltage_mv;
+        agg.fan_percent = s.fan_percent;
+        agg.perf_state = s.perf_state;
+      }
+      if (s.vram_used_bytes > 0 && agg.proc_count < kMaxProcs) {
+        ProcSample& ps = agg.procs[agg.proc_count++];
+        ps.pid = p.writer_pid;
+        ps.used_bytes = s.vram_used_bytes;
+        std::snprintf(ps.name, sizeof ps.name, "pid %u", p.writer_pid);
+      }
+    }
+    agg.utilization_gpu = util;
+    agg.utilization_mem = mem_util;
+    if (agg.vram_used_bytes > agg.vram_total_bytes) agg.vram_used_bytes = agg.vram_total_bytes;
+  }
+  return true;
 }
 
 }  // namespace vgpu::telemetry

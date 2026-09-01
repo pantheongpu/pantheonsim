@@ -29,6 +29,9 @@ int usage(FILE* to) {
                "                                       Live view of running virtual GPUs\n"
                "  vgpu serve --gpu <id> [--count N] [--load 0..1] [--alloc-mb N]\n"
                "                                       Present a virtual rack for monitoring tools\n"
+               "  vgpu shell                           Interactive machine simulator: pick a GPU,\n"
+               "                                       CUDA/driver and OS, then get a shell where\n"
+               "                                       nvidia-smi/rocm-smi/lspci/dmesg all work\n"
                "  vgpu --version | --help\n",
                kVersion);
   return to == stdout ? 0 : 2;
@@ -121,6 +124,7 @@ int demo_vectoradd(const std::string& gpu, long long n);
 // Implemented in smi.cpp / serve.cpp.
 int cmd_smi(const std::vector<std::string>& args);
 int cmd_serve(const std::vector<std::string>& args);
+int cmd_shell(const std::vector<std::string>& args);
 
 int main(int argc, char** argv) {
   std::vector<std::string> args(argv + 1, argv + argc);
@@ -136,6 +140,7 @@ int main(int argc, char** argv) {
     if (cmd == "list-gpus") return cmd_list_gpus();
     if (cmd == "smi") return cmd_smi({args.begin() + 1, args.end()});
     if (cmd == "serve") return cmd_serve({args.begin() + 1, args.end()});
+    if (cmd == "shell") return cmd_shell({args.begin() + 1, args.end()});
     if (cmd == "info") {
       std::string gpu;
       bool json = false;

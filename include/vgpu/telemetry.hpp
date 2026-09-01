@@ -85,8 +85,13 @@ struct Shared {
   DeviceSample devices[kMaxDevices];
 };
 
-// Path of the shared segment. Honors VGPU_TELEMETRY_PATH, else
-// $XDG_RUNTIME_DIR/vgpu-telemetry, else /tmp/vgpu-telemetry-<uid>.
+// Directory holding one segment per publishing process. Honors
+// VGPU_TELEMETRY_PATH, else $XDG_RUNTIME_DIR/vgpu-telemetry.d, else
+// /tmp/vgpu-telemetry-<uid>.d
+//
+// One file per process matters: a session (`vgpu shell`) and the workloads run
+// inside it are separate processes sharing the same virtual machine, and a
+// workload exiting must not erase the machine.
 std::string default_path();
 
 // Maps the segment read-write and publishes device identity. Called by the
@@ -132,11 +137,15 @@ class Publisher {
   Shared* shared_ = nullptr;
   int fd_ = -1;
   size_t size_ = 0;
+  std::string path_;
   Accum accum_[kMaxDevices];
 };
 
-// Reads a snapshot of the segment. Returns false when no VirtualGPU process
-// has published telemetry (or the file is stale/!magic).
-bool read_snapshot(Shared* out, const std::string& path = default_path());
+// Merges every live publisher in `dir` into one view of the machine, the way
+// several processes share one physical GPU: device identity comes from the
+// publisher that owns the most devices, memory and counters are summed, and
+// each contributing process appears in the per-device process list. Returns
+// false when no live VirtualGPU process has published anything.
+bool read_snapshot(Shared* out, const std::string& dir = default_path());
 
 }  // namespace vgpu::telemetry

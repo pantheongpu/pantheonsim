@@ -152,7 +152,7 @@ else()
 endif()
 
 # CLI
-add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp)
+add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
 # Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /
