@@ -402,12 +402,13 @@ VGPU_EXPORT cudaError_t cudaGetDeviceProperties(cudaDeviceProp* prop, int device
     prop->minor = p.cc_minor;
     prop->multiProcessorCount = static_cast<int>(p.limits.multiprocessors);
     prop->maxThreadsPerBlock = static_cast<int>(p.limits.max_threads_per_block);
-    prop->maxThreadsPerMultiProcessor = (p.cc_major == 8 && p.cc_minor >= 6) ? 1536 : 2048;
+    prop->maxThreadsPerMultiProcessor = static_cast<int>(p.limits.max_threads_per_sm);
+    prop->regsPerMultiprocessor = static_cast<int>(p.limits.registers_per_sm);
+    prop->maxBlocksPerMultiProcessor = static_cast<int>(p.limits.max_blocks_per_sm);
     prop->sharedMemPerBlock = p.limits.shared_mem_per_block;
     prop->sharedMemPerBlockOptin = p.limits.shared_mem_per_block_optin;
     prop->sharedMemPerMultiprocessor = p.limits.shared_mem_per_block_optin;
     prop->regsPerBlock = static_cast<int>(p.limits.registers_per_block);
-    prop->regsPerMultiprocessor = static_cast<int>(p.limits.registers_per_block);
     prop->maxThreadsDim[0] = static_cast<int>(p.limits.max_block_dim[0]);
     prop->maxThreadsDim[1] = static_cast<int>(p.limits.max_block_dim[1]);
     prop->maxThreadsDim[2] = static_cast<int>(p.limits.max_block_dim[2]);
@@ -449,7 +450,8 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, int attr, int device)
       case 8: *value = static_cast<int>(p.limits.shared_mem_per_block); break;   // MaxSharedPerBlock
       case 10: *value = static_cast<int>(p.warp_size); break;                    // WarpSize
       case 16: *value = static_cast<int>(p.limits.multiprocessors); break;       // MultiProcessorCount
-      case 39: *value = (p.cc_major == 8 && p.cc_minor >= 6) ? 1536 : 2048; break;  // MaxThreads/SM
+      case 39: *value = static_cast<int>(p.limits.max_threads_per_sm); break;  // MaxThreads/SM
+      case 82: *value = static_cast<int>(p.limits.registers_per_sm); break;    // MaxRegistersPerSM
       case 75: *value = p.cc_major; break;                                       // ComputeCapabilityMajor
       case 76: *value = p.cc_minor; break;                                       // ComputeCapabilityMinor
       default:
@@ -458,6 +460,65 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, int attr, int device)
     }
     return cudaSuccess;
   });
+}
+
+// cudaFuncGetAttributes: report the kernel's actual register footprint and
+// local frame, which is what occupancy tools and tuning scripts read.
+//
+// Uses the toolkit's own cudaFuncAttributes: the layout is version-specific,
+// and writing a hand-rolled copy produced garbage (numRegs in the tens of
+// thousands) until this was switched to the real type.
+static_assert(sizeof(cudaFuncAttributes) > 0, "cudaFuncAttributes must come from the toolkit");
+
+VGPU_EXPORT cudaError_t cudaFuncGetAttributes(cudaFuncAttributes* attr, const void* func) {
+  return guard("cudaFuncGetAttributes", [&](State& s) -> cudaError_t {
+    cudaFuncAttributes* a = attr;
+    if (!a) return cudaErrorInvalidValue;
+    auto it = s.kernels.find(func);
+    if (it == s.kernels.end()) return cudaErrorInvalidDeviceFunction;
+    KernelInfo& ki = it->second;
+    if (!ki.mod || ki.mod->ptx.empty()) return cudaErrorInvalidDeviceFunction;
+    uint64_t mid = module_on_current(s, *ki.mod);
+    vgpu::runtime::Device& dev = current(s);
+    const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
+    const vgpu::DeviceProfile& p = dev.profile();
+    auto res = vgpu::exec::kernel_resources(*fn, p, p.limits.max_threads_per_block, 0);
+    std::memset(a, 0, sizeof *a);
+    a->numRegs = static_cast<int>(res.usage.regs_per_thread);
+    a->localSizeBytes = res.usage.local_bytes;
+    a->sharedSizeBytes = fn->static_shared_size;
+    a->maxThreadsPerBlock = static_cast<int>(p.limits.max_threads_per_block);
+    a->ptxVersion = 83;
+    a->binaryVersion = p.cc_major * 10 + p.cc_minor;
+    a->maxDynamicSharedSizeBytes = static_cast<int>(p.limits.shared_mem_per_block_optin);
+    return cudaSuccess;
+  });
+}
+
+// Real occupancy, from the same analysis the launch path uses.
+VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBlocks,
+                                                                      const void* func,
+                                                                      int blockSize,
+                                                                      size_t dynamicSMemSize) {
+  return guard("cudaOccupancyMaxActiveBlocksPerMultiprocessor", [&](State& s) -> cudaError_t {
+    if (!numBlocks || blockSize <= 0) return cudaErrorInvalidValue;
+    auto it = s.kernels.find(func);
+    if (it == s.kernels.end()) return cudaErrorInvalidDeviceFunction;
+    KernelInfo& ki = it->second;
+    if (!ki.mod || ki.mod->ptx.empty()) return cudaErrorInvalidDeviceFunction;
+    uint64_t mid = module_on_current(s, *ki.mod);
+    vgpu::runtime::Device& dev = current(s);
+    const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
+    auto res = vgpu::exec::kernel_resources(*fn, dev.profile(),
+                                            static_cast<uint32_t>(blockSize),
+                                            static_cast<uint32_t>(dynamicSMemSize));
+    *numBlocks = static_cast<int>(res.occupancy.blocks_per_sm);
+    return cudaSuccess;
+  });
+}
+VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+    int* n, const void* f, int bs, size_t dyn, unsigned int) {
+  return cudaOccupancyMaxActiveBlocksPerMultiprocessor(n, f, bs, dyn);
 }
 
 VGPU_EXPORT cudaError_t cudaDeviceCanAccessPeer(int* can, int device, int peerDevice) {

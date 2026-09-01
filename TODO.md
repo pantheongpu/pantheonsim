@@ -68,6 +68,28 @@ The remaining profiles (A10/A100/H100/H200/B200, MI300X/MI325X/MI350X) are
 still documentation-derived placeholders. Characterizing them needs access to
 those parts.
 
+## Register and occupancy modeling
+
+PTX declares *virtual* registers, so counting declarations says nothing about
+what a thread occupies. `src/ptx/regalloc.cpp` runs liveness over the
+instruction stream (extending ranges across loop back edges) and a linear scan
+for the peak, counts a 64-bit value as a register pair as the hardware does,
+keeps predicates in their own file, and rounds to the allocation granularity.
+
+That count is functional, not decorative:
+- a block needing more registers than the device allows fails with
+  "too many resources requested for launch", as on hardware;
+- `__launch_bounds__` (`.maxntid` / `.reqntid`) is parsed and enforced;
+- `cudaFuncGetAttributes` reports real `numRegs` and `localSizeBytes`, and
+  `cudaOccupancyMaxActiveBlocksPerMultiprocessor` does the standard occupancy
+  calculation instead of returning a placeholder.
+
+Checked against a physical RTX 3060: a simple kernel reports **8 registers and
+6 blocks/SM on both**. A register-heavy kernel reports 48 where hardware says
+24 -- the estimate is conservative, because ptxas rematerializes and schedules
+in ways this analysis does not model. Erring toward "needs more" is the safe
+direction for something that refuses launches.
+
 ## Ecosystem tools that work today
 
 - **pynvml** and anything built on it (nvitop, gpustat, monitoring agents,
@@ -128,14 +150,31 @@ Measured now: vectorAdd 2M elements ~145 ms; ~1.05G lane-ops of dense FMA
 ~0.85 s. Profiling says the remaining time is in the per-lane loops
 themselves, which is where it should be for an interpreter.
 
+Narrower lane storage was implemented and measured: registers are now split
+into a 32-bit and a 64-bit file by declared width, with native 32-bit paths
+for the hot integer, float and fma cases. Measured A/B against the previous
+single 64-bit file:
+
+| benchmark | wide | narrow |
+| --- | --- | --- |
+| vectorAdd 2M (memory-bound) | ~147 ms | ~148 ms |
+| dense f32 FMA | ~0.86 s | ~0.83 s |
+| 120 live registers | ~0.90 s | ~0.88 s |
+
+So about 3% on register-heavy kernels and nothing on memory-bound ones --
+far less than hoped. The reason is that the register file was already small
+enough to sit in L1 (30 registers x 256 B is under 8 KB), so halving it does
+not remove a bottleneck that was not there. It is kept because it is correct,
+it halves per-warp register memory (which will matter as resident warp counts
+grow), and a 32-bit register file with 64-bit values in pairs is what the
+hardware actually does.
+
 Next, in order of expected payoff:
-1. **Narrower lane storage.** `Lanes` is 32 x uint64 = 256 bytes, so 32-bit
-   work moves twice the data it needs. A width-tagged register file (32-bit
-   lanes with a 64-bit overlay) should cut memory traffic roughly in half.
-2. **PTX -> internal IR -> LLVM JIT** (ARCHITECTURE.md D1). This is the real
-   answer and the reason the runtime boundary was drawn where it is; an
-   interpreter will not close the remaining gap to hardware.
-3. Block-level parallelism across host threads, behind the scheduler
+1. **PTX -> internal IR -> LLVM JIT** (ARCHITECTURE.md D1). Profiling now puts
+   the time in per-lane interpretation itself, which is exactly what a JIT
+   removes. This is the real answer; further interpreter micro-optimization
+   has hit diminishing returns.
+2. Block-level parallelism across host threads, behind the scheduler
    abstraction so determinism is preserved.
 
 A GPU still retires ~10^13 ops/s, so saturation-style stress tests are run at

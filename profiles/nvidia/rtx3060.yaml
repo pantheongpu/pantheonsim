@@ -17,6 +17,11 @@ limits:
   shared_mem_per_block_optin_bytes: 101376
   registers_per_block: 65536
   multiprocessors: 28
+  registers_per_sm: 65536
+  max_threads_per_sm: 1536
+  max_blocks_per_sm: 16
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 102400
 features:
   fp16: true
   bf16: true

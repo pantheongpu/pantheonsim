@@ -26,6 +26,8 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <unordered_map>
 
 #include "vgpu/error.hpp"
@@ -46,7 +48,12 @@ constexpr uint64_t kSharedVaBase = 0x6ffe'0000'0000ull;
 constexpr uint64_t kSharedVaSize = 1ull << 30;
 
 using Mask = uint32_t;  // bit i == lane i active
+// Operands are passed around as 64-bit lanes so every handler sees one type.
 using Lanes = std::array<uint64_t, kWarpSize>;
+// Storage, however, is split by declared width: a 32-bit register costs
+// 128 bytes per warp instead of 256. Most registers in real kernels are
+// 32-bit, so this halves register-file traffic for the common case.
+using Lanes32 = std::array<uint32_t, kWarpSize>;
 
 struct ParamBuffer {
   std::vector<uint8_t> bytes;
@@ -79,11 +86,17 @@ struct Warp {
   // work, since every lane has merged back into one path by then.
   std::vector<Path> paths;
   Mask exited = 0;
-  // Flat register file indexed by the parser's dense register ids. `written`
-  // tracks first assignment so a read-before-write is still diagnosed.
-  std::vector<Lanes> regs;
+  // Register files indexed by the parser's dense ids: narrow registers live
+  // in regs32, 64-bit ones in regs64. `written*` tracks first assignment so a
+  // read-before-write is still diagnosed.
+  std::vector<Lanes32> regs32;
+  std::vector<Lanes> regs64;
   std::vector<Mask> preds;
-  std::vector<uint8_t> written;  // vector<bool> would bit-pack; this is hot
+  std::vector<uint8_t> written32, written64;
+  // Widening a 32-bit register into the 64-bit operand form needs somewhere to
+  // land; reused per read to avoid touching the allocator.
+  mutable std::array<Lanes, 4> widen_scratch;
+  mutable uint32_t widen_next = 0;
   std::unordered_map<std::string, Lanes> slots;  // call-argument slots
   std::vector<std::vector<uint8_t>> local;       // per-lane .local frames (lazy)
   std::array<uint32_t, kWarpSize> tid_x{}, tid_y{}, tid_z{};
@@ -209,9 +222,11 @@ class Interpreter {
     std::vector<Warp> warps(nwarps);
     for (size_t w = 0; w < nwarps; ++w) {
       Warp& warp = warps[w];
-      warp.regs.assign(fn_.num_regs, Lanes{});
-      warp.preds.assign(fn_.num_regs, 0);
-      warp.written.assign(fn_.num_regs, 0);
+      warp.regs32.assign(fn_.num_regs32, Lanes32{});
+      warp.regs64.assign(fn_.num_regs64, Lanes{});
+      warp.preds.assign(fn_.num_regs32 + fn_.num_regs64, 0);
+      warp.written32.assign(fn_.num_regs32, 0);
+      warp.written64.assign(fn_.num_regs64, 0);
       Mask live = 0;
       for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
         uint64_t lin = uint64_t{static_cast<uint32_t>(w)} * kWarpSize + lane;
@@ -302,10 +317,16 @@ class Interpreter {
   const Lanes& read_operand(Warp& w, const BlockCtx& ctx, const Instr& ins, const Operand& op,
                             Lanes& scratch) {
     if (const auto* r = std::get_if<RegOperand>(&op)) {
-      if (r->reg.id >= w.regs.size() || !w.written[r->reg.id])
+      if (r->reg.wide) {
+        if (r->reg.id >= w.regs64.size() || !w.written64[r->reg.id])
+          ctx_fail(ins, -1, Err::UninitializedRegister,
+                   "register " + r->reg.name + " read before any write");
+        return w.regs64[r->reg.id];
+      }
+      if (r->reg.id >= w.regs32.size() || !w.written32[r->reg.id])
         ctx_fail(ins, -1, Err::UninitializedRegister,
                  "register " + r->reg.name + " read before any write");
-      return w.regs[r->reg.id];
+      return widen(w, w.regs32[r->reg.id]);
     }
     if (const auto* imm = std::get_if<ImmInt>(&op)) {
       scratch.fill(static_cast<uint64_t>(imm->value));
@@ -343,29 +364,87 @@ class Interpreter {
     return 0;
   }
 
-  void write_reg(Warp& w, const Reg& reg, Mask m, const Lanes& vals, uint32_t bits) {
-    Lanes& dst = w.regs[reg.id];
-    if (bits >= 64)
-      for_active(m, [&](uint32_t l) { dst[l] = vals[l]; });
-    else {
-      const uint64_t keep = (1ull << bits) - 1;
-      for_active(m, [&](uint32_t l) { dst[l] = vals[l] & keep; });
+  // Widens a 32-bit register into the 64-bit operand form. A small rotating
+  // set of buffers keeps several operands of one instruction alive at once.
+  const Lanes& widen(Warp& w, const Lanes32& src) {
+    Lanes& out = w.widen_scratch[w.widen_next];
+    w.widen_next = (w.widen_next + 1) % w.widen_scratch.size();
+    for (uint32_t l = 0; l < kWarpSize; ++l) out[l] = src[l];
+    return out;
+  }
+
+  // True when an operand can be read as 32-bit lanes with no widening: a
+  // narrow register, or an immediate (which is materialized either way).
+  static bool narrow_operand(const Operand& o) {
+    if (const auto* r = std::get_if<RegOperand>(&o)) return !r->reg.wide;
+    return std::holds_alternative<ImmInt>(o) || std::holds_alternative<ImmFloatBits>(o);
+  }
+
+  // Reads an operand as 32-bit lanes. Only valid when narrow_operand() holds.
+  const Lanes32& read_narrow(Warp& w, const Instr& ins, const Operand& o, Lanes32& scratch) {
+    if (const auto* r = std::get_if<RegOperand>(&o)) {
+      if (r->reg.id >= w.regs32.size() || !w.written32[r->reg.id])
+        ctx_fail(ins, -1, Err::UninitializedRegister,
+                 "register " + r->reg.name + " read before any write");
+      return w.regs32[r->reg.id];
     }
-    w.written[reg.id] = 1;
+    uint32_t v = std::holds_alternative<ImmInt>(o)
+                     ? static_cast<uint32_t>(std::get<ImmInt>(o).value)
+                     : static_cast<uint32_t>(std::get<ImmFloatBits>(o).bits);
+    scratch.fill(v);
+    return scratch;
+  }
+
+  // Writes 32-bit lanes straight into the narrow file -- no widening, and half
+  // the memory traffic of the 64-bit path.
+  void write_narrow(Warp& w, const Reg& reg, Mask m, const Lanes32& vals) {
+    Lanes32& dst = w.regs32[reg.id];
+    for_active(m, [&](uint32_t l) { dst[l] = vals[l]; });
+    w.written32[reg.id] = 1;
+  }
+
+  void write_reg(Warp& w, const Reg& reg, Mask m, const Lanes& vals, uint32_t bits) {
+    if (reg.wide) {
+      Lanes& dst = w.regs64[reg.id];
+      if (bits >= 64)
+        for_active(m, [&](uint32_t l) { dst[l] = vals[l]; });
+      else {
+        const uint64_t keep = (1ull << bits) - 1;
+        for_active(m, [&](uint32_t l) { dst[l] = vals[l] & keep; });
+      }
+      w.written64[reg.id] = 1;
+      return;
+    }
+    Lanes32& dst = w.regs32[reg.id];
+    if (bits >= 32)
+      for_active(m, [&](uint32_t l) { dst[l] = static_cast<uint32_t>(vals[l]); });
+    else {
+      const uint32_t keep = (1u << bits) - 1;
+      for_active(m, [&](uint32_t l) { dst[l] = static_cast<uint32_t>(vals[l]) & keep; });
+    }
+    w.written32[reg.id] = 1;
+  }
+
+  // Predicates are declared .pred, so they live in the narrow numbering; the
+  // slot index is offset past the 64-bit file to keep one predicate vector.
+  uint32_t pred_index(const Reg& reg) const {
+    return reg.wide ? fn_.num_regs32 + reg.id : reg.id;
   }
 
   Mask read_pred(Warp& w, const Instr& ins, const Reg& reg) {
-    if (reg.id >= w.preds.size() || !w.written[reg.id])
+    uint32_t idx = pred_index(reg);
+    bool ok = reg.wide ? (reg.id < w.written64.size() && w.written64[reg.id])
+                       : (reg.id < w.written32.size() && w.written32[reg.id]);
+    if (idx >= w.preds.size() || !ok)
       ctx_fail(ins, -1, Err::UninitializedRegister,
                "predicate " + reg.name + " read before any write");
-    return w.preds[reg.id];
+    return w.preds[idx];
   }
 
-  // Predicate destinations share the register numbering, so writing one marks
-  // it initialized just like a value register.
   Mask& pred_slot(Warp& w, const Reg& reg) {
-    w.written[reg.id] = 1;
-    return w.preds[reg.id];
+    if (reg.wide) w.written64[reg.id] = 1;
+    else w.written32[reg.id] = 1;
+    return w.preds[pred_index(reg)];
   }
 
   // ---- routed memory access (device global VA range vs .local window) ----
@@ -1429,10 +1508,18 @@ class Interpreter {
       scratch.fill(resolve_symbol(ins, a.base));
       return scratch;
     }
-    if (a.base_id >= w.regs.size() || !w.written[a.base_id])
+    // Address registers are .b64 in 64-bit PTX, but shared/local addressing
+    // legitimately uses 32-bit registers, so honor whichever file it is in.
+    if (a.base_wide) {
+      if (a.base_id >= w.regs64.size() || !w.written64[a.base_id])
+        ctx_fail(ins, -1, Err::UninitializedRegister,
+                 "address register " + a.base + " read before any write");
+      return w.regs64[a.base_id];
+    }
+    if (a.base_id >= w.regs32.size() || !w.written32[a.base_id])
       ctx_fail(ins, -1, Err::UninitializedRegister,
                "address register " + a.base + " read before any write");
-    return w.regs[a.base_id];
+    return widen(w, w.regs32[a.base_id]);
   }
 
   void exec_ld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLd& op, Mask m) {
@@ -1701,6 +1788,36 @@ ParamBuffer build_params(const EntryFn& fn, const std::vector<std::vector<uint8_
   return pb;
 }
 
+}  // namespace
+
+KernelResources kernel_resources(const EntryFn& fn, const DeviceProfile& profile,
+                                 uint32_t block_threads, uint32_t dynamic_shared) {
+  // The register analysis depends only on the kernel, so memoize it on the
+  // kernel itself. Occupancy also depends on the launch shape and is cheap.
+  ptx::RegisterUsage usage;
+  if (fn.regs_analyzed) {
+    usage.regs_per_thread = fn.cached_regs_per_thread;
+    usage.pred_regs = fn.cached_pred_regs;
+    usage.peak_live = fn.cached_peak_live;
+    usage.local_bytes = fn.local_frame_size;
+  } else {
+    usage = ptx::analyze_registers(fn);
+    fn.cached_regs_per_thread = usage.regs_per_thread;
+    fn.cached_pred_regs = usage.pred_regs;
+    fn.cached_peak_live = usage.peak_live;
+    fn.regs_analyzed = true;
+  }
+  KernelResources r;
+  r.usage = usage;
+  r.occupancy = ptx::compute_occupancy(
+      usage.regs_per_thread, block_threads, fn.static_shared_size, dynamic_shared,
+      profile.limits.registers_per_sm, profile.limits.max_threads_per_sm,
+      profile.limits.max_blocks_per_sm, profile.limits.shared_mem_per_sm, profile.warp_size);
+  return r;
+}
+
+namespace {
+
 void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p) {
   if (p.warp_size != kWarpSize)
     throw Error::make(Err::Unsupported, "profile ", p.id, " has warp size ", p.warp_size,
@@ -1721,6 +1838,42 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
     throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': ", threads,
                       " threads per block exceeds profile limit ", p.limits.max_threads_per_block, " (",
                       p.id, ")");
+  // Launch bounds declared by the kernel (__launch_bounds__). Hardware
+  // refuses a block larger than the kernel was compiled for.
+  for (int i = 0; i < 3; ++i) {
+    if (fn.req_ntid[i] && cfg.block[i] != fn.req_ntid[i])
+      throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "' requires exactly ",
+                        fn.req_ntid[0], "x", fn.req_ntid[1], "x", fn.req_ntid[2],
+                        " threads per block (.reqntid), launch asked for ", cfg.block[0], "x",
+                        cfg.block[1], "x", cfg.block[2]);
+    if (fn.max_ntid[i] && cfg.block[i] > fn.max_ntid[i])
+      throw Error::make(Err::LaunchConfig, "kernel '", fn.name,
+                        "' was compiled for at most ", fn.max_ntid[0], "x", fn.max_ntid[1], "x",
+                        fn.max_ntid[2], " threads per block (__launch_bounds__), launch asked for ",
+                        cfg.block[0], "x", cfg.block[1], "x", cfg.block[2]);
+  }
+
+  // Register budget. A block whose threads collectively need more registers
+  // than the device provides cannot be launched -- the same
+  // "too many resources requested for launch" a real driver reports.
+  KernelResources res = kernel_resources(fn, p, static_cast<uint32_t>(threads),
+                                         cfg.shared_bytes);
+  if (res.usage.regs_per_thread > p.limits.max_registers_per_thread)
+    throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "' needs ",
+                      res.usage.regs_per_thread, " registers per thread; profile ", p.id,
+                      " allows at most ", p.limits.max_registers_per_thread);
+  uint64_t block_regs = uint64_t{res.usage.regs_per_thread} * threads;
+  if (block_regs > p.limits.registers_per_block)
+    throw Error::make(Err::LaunchConfig, "too many resources requested for launch: kernel '",
+                      fn.name, "' uses ", res.usage.regs_per_thread, " registers per thread and ",
+                      threads, " threads per block (", block_regs,
+                      " registers), but profile ", p.id, " allows ", p.limits.registers_per_block,
+                      " per block. Use a smaller block or fewer registers.");
+  if (res.occupancy.blocks_per_sm == 0)
+    throw Error::make(Err::LaunchConfig, "kernel '", fn.name,
+                      "' cannot place a single block on a multiprocessor of ", p.id,
+                      " (limited by ", res.occupancy.limited_by, ")");
+
   uint64_t total_shared = uint64_t{fn.static_shared_size} + cfg.shared_bytes;
   uint32_t shared_limit = std::max(p.limits.shared_mem_per_block, p.limits.shared_mem_per_block_optin);
   if (total_shared > shared_limit)

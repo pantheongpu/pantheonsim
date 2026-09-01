@@ -779,10 +779,14 @@ namespace {
 int func_attribute(const vgpu::ptx::EntryFn* fn, const vgpu::DeviceProfile& p, int attrib) {
   switch (attrib) {
     case 0: return static_cast<int>(p.limits.max_threads_per_block);  // MAX_THREADS_PER_BLOCK
-    case 1: return 0;                                                 // SHARED_SIZE_BYTES
+    case 1: return static_cast<int>(fn ? fn->static_shared_size : 0); // SHARED_SIZE_BYTES
     case 2: return 0;                                                 // CONST_SIZE_BYTES
     case 3: return static_cast<int>(fn ? fn->local_frame_size : 0);   // LOCAL_SIZE_BYTES
-    case 4: return 32;                                                // NUM_REGS (placeholder)
+    case 4:                                                           // NUM_REGS
+      return fn ? static_cast<int>(
+                      vgpu::exec::kernel_resources(*fn, p, p.limits.max_threads_per_block, 0)
+                          .usage.regs_per_thread)
+                : 0;
     case 5: return 90;                                                // PTX_VERSION
     case 6: return p.cc_major * 10 + p.cc_minor;                      // BINARY_VERSION
     case 8: return static_cast<int>(p.limits.shared_mem_per_block_optin);

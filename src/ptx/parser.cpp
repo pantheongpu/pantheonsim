@@ -299,6 +299,33 @@ class Parser {
       }
       expect_punct(")");
     }
+    // Performance directives that follow the signature. .maxntid/.reqntid are
+    // functional (they bound the launch shape); .minnctapersm is a scheduling
+    // hint we record but do not act on.
+    while (peek().kind == Token::Kind::Word && peek().text[0] == '.') {
+      std::string d = peek().text;
+      if (d == ".maxntid" || d == ".reqntid") {
+        next();
+        std::array<uint32_t, 3> dims{1, 1, 1};
+        for (int i = 0; i < 3; ++i) {
+          dims[i] = static_cast<uint32_t>(expect_int("launch bound"));
+          if (i < 2 && peek_punct(",")) next();
+          else if (i < 2) break;
+        }
+        if (d == ".maxntid") fn.max_ntid = dims;
+        else fn.req_ntid = dims;
+      } else if (d == ".minnctapersm" || d == ".maxnreg" || d == ".maxnctapersm") {
+        next();
+        uint32_t v = static_cast<uint32_t>(expect_int("directive value"));
+        if (d == ".minnctapersm") fn.min_ctas_per_sm = v;
+      } else if (d == ".noreturn" || d == ".pragma") {
+        next();
+        while (!at_end() && !peek_punct(";") && !peek_punct("{")) next();
+        if (peek_punct(";")) next();
+      } else {
+        break;
+      }
+    }
     expect_punct("{");
     parse_body(fn);
     // Dynamic shared memory lives above every static allocation.
@@ -401,13 +428,16 @@ class Parser {
         expect_punct(">");
         int n = std::atoi(count.c_str());
         for (int i = 0; i < n; ++i) {
-          fn.reg_decls[name + std::to_string(i)] = ty;
-          declared_regs_.insert(name + std::to_string(i));
-          intern(name + std::to_string(i));
+          const std::string nm = name + std::to_string(i);
+          fn.reg_decls[nm] = ty;
+          declared_regs_.insert(nm);
+          fn.reg_wide[nm] = ty.bits > 32 && ty.kind != Type::Kind::Pred;
+          intern(nm);
         }
       } else {
         fn.reg_decls[name] = ty;
         declared_regs_.insert(name);
+        fn.reg_wide[name] = ty.bits > 32 && ty.kind != Type::Kind::Pred;
         intern(name);
       }
       if (peek_punct(",")) {
@@ -521,10 +551,19 @@ class Parser {
   // Interns a register name into the current kernel's dense numbering. The
   // interpreter indexes a flat register file with these ids instead of hashing
   // names at run time.
+  // Interns a register into the file its declared width selects. Ids are
+  // dense within each file, so both can be plain vectors.
   Reg intern(const std::string& name) {
-    auto [it, fresh] = cur_fn_->reg_ids.emplace(name, cur_fn_->num_regs);
-    if (fresh) ++cur_fn_->num_regs;
-    return Reg{name, it->second};
+    auto wit = cur_fn_->reg_wide.find(name);
+    bool wide = wit != cur_fn_->reg_wide.end() && wit->second;
+    auto it = cur_fn_->reg_ids.find(name);
+    if (it == cur_fn_->reg_ids.end()) {
+      uint32_t id = wide ? cur_fn_->num_regs64++ : cur_fn_->num_regs32++;
+      it = cur_fn_->reg_ids.emplace(name, id).first;
+      cur_fn_->reg_wide.emplace(name, wide);
+      ++cur_fn_->num_regs;
+    }
+    return Reg{name, it->second, wide};
   }
 
   // Register operand. Inline asm may declare locals without the '%' sigil
@@ -584,7 +623,9 @@ class Parser {
     if (base[0] == '%' || declared_regs_.count(base)) {
       a.base = base;
       a.base_kind = Addr::Base::Reg;
-      a.base_id = intern(base).id;
+      Reg r = intern(base);
+      a.base_id = r.id;
+      a.base_wide = r.wide;
     } else if (call_slots_.count(base)) {
       a.base = base;
       a.base_kind = Addr::Base::CallSlot;

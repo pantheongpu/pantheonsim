@@ -6,6 +6,7 @@
 // kernel (never silently misbehaving).
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <ostream>
@@ -44,6 +45,11 @@ inline constexpr uint32_t kNoReg = 0xFFFFFFFFu;
 struct Reg {
   std::string name;
   uint32_t id = kNoReg;
+  // True for registers declared wider than 32 bits. The interpreter keeps two
+  // register files -- 32-bit and 64-bit lanes -- so the common narrow case
+  // moves half as much memory per instruction. `id` indexes whichever file
+  // this flag selects.
+  bool wide = false;
 };
 
 // Compare and print a Reg by name, so diagnostics and tests read naturally.
@@ -70,6 +76,7 @@ struct Addr {
   Base base_kind = Base::Reg;
   std::string base;
   uint32_t base_id = kNoReg;  // interned when base_kind == Reg
+  bool base_wide = false;     // which register file base_id indexes
   int64_t offset = 0;
 };
 
@@ -221,9 +228,25 @@ struct EntryFn {
   std::map<std::string, Type> reg_decls;      // declared virtual registers
   // Dense register numbering used by the interpreter's flat register file.
   std::map<std::string, uint32_t> reg_ids;
-  uint32_t num_regs = 0;
+  std::map<std::string, bool> reg_wide;   // name -> lives in the 64-bit file
+  uint32_t num_regs = 0;                  // ids are dense within each file
+  uint32_t num_regs32 = 0;
+  uint32_t num_regs64 = 0;
   std::map<std::string, LocalDecl> locals;    // .local depots
   uint32_t local_frame_size = 0;              // total per-thread local bytes
+  // Launch bounds from __launch_bounds__. `.maxntid` caps the block size the
+  // kernel was compiled for and `.reqntid` fixes it exactly; exceeding either
+  // is a launch failure on hardware, so both are enforced.
+  std::array<uint32_t, 3> max_ntid{0, 0, 0};
+  std::array<uint32_t, 3> req_ntid{0, 0, 0};
+  uint32_t min_ctas_per_sm = 0;
+  // Memoized register analysis. Held here rather than in a pointer-keyed
+  // side table: a freed module's address can be reused by the next one, and
+  // such a cache then hands back another kernel's register count.
+  mutable bool regs_analyzed = false;
+  mutable uint32_t cached_regs_per_thread = 0;
+  mutable uint32_t cached_pred_regs = 0;
+  mutable uint32_t cached_peak_live = 0;
   std::map<std::string, SharedDecl> shared;   // .shared variables (per block)
   uint32_t static_shared_size = 0;            // statically declared shared bytes
   bool uses_dynamic_shared = false;

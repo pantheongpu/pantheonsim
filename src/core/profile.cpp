@@ -87,6 +87,18 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
       static_cast<uint32_t>(get_int(lim, "shared_mem_per_block_optin_bytes", origin));
   p.limits.registers_per_block = static_cast<uint32_t>(get_int(lim, "registers_per_block", origin));
   p.limits.multiprocessors = static_cast<uint32_t>(get_int(lim, "multiprocessors", origin));
+  // Optional residency ceilings; older profiles without them fall back to
+  // values derived from the fields that are present.
+  auto opt = [&](const char* key, uint32_t fallback) -> uint32_t {
+    auto it = lim.map.find(key);
+    if (it == lim.map.end() || it->second.kind != Value::Kind::Int) return fallback;
+    return static_cast<uint32_t>(it->second.i);
+  };
+  p.limits.registers_per_sm = opt("registers_per_sm", p.limits.registers_per_block);
+  p.limits.max_threads_per_sm = opt("max_threads_per_sm", 2048);
+  p.limits.max_blocks_per_sm = opt("max_blocks_per_sm", 16);
+  p.limits.max_registers_per_thread = opt("max_registers_per_thread", 255);
+  p.limits.shared_mem_per_sm = opt("shared_mem_per_sm", p.limits.shared_mem_per_block_optin);
 
   // Optional: presentation-only values for monitoring tools.
   if (auto it = doc.map.find("telemetry"); it != doc.map.end()) {

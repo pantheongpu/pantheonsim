@@ -25,6 +25,14 @@ struct Limits {
   uint32_t shared_mem_per_block_optin = 0;  // opt-in dynamic maximum
   uint32_t registers_per_block = 0;
   uint32_t multiprocessors = 0;
+  // Residency ceilings. These are functional, not performance: they decide
+  // whether a launch fits on the device at all ("too many resources requested
+  // for launch") and how many warps can be resident.
+  uint32_t registers_per_sm = 0;
+  uint32_t max_threads_per_sm = 0;
+  uint32_t max_blocks_per_sm = 0;
+  uint32_t max_registers_per_thread = 255;
+  uint32_t shared_mem_per_sm = 0;
 };
 
 // Presentation values for monitoring tools (nvidia-smi, rocm-smi, `vgpu smi`).

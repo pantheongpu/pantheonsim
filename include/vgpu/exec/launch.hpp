@@ -12,6 +12,7 @@
 #include "vgpu/memory.hpp"
 #include "vgpu/profile.hpp"
 #include "vgpu/ptx/ast.hpp"
+#include "vgpu/ptx/regalloc.hpp"
 
 namespace vgpu::exec {
 
@@ -27,6 +28,18 @@ struct LaunchConfig {
 // Invoked periodically during a launch so long-running kernels can still
 // publish live telemetry. Receives seconds elapsed since the previous call.
 using ProgressFn = std::function<void(double seconds)>;
+
+// Register footprint and residency for a kernel on a device, as the launch
+// path computes it. Exposed so tools can report what hardware would.
+struct KernelResources {
+  ptx::RegisterUsage usage;
+  ptx::Occupancy occupancy;
+};
+
+// Computes a kernel's register footprint and its occupancy at `block_threads`
+// on `profile`. Cached per kernel; deterministic.
+KernelResources kernel_resources(const ptx::EntryFn& fn, const DeviceProfile& profile,
+                                 uint32_t block_threads, uint32_t dynamic_shared = 0);
 
 struct LaunchStats {
   uint64_t blocks = 0;
