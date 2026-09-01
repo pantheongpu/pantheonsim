@@ -41,6 +41,9 @@ add_library(vgpu STATIC
   src/core/profile.cpp
   src/core/registry.cpp
   src/core/memory.cpp
+  src/ptx/ast.cpp
+  src/ptx/lexer.cpp
+  src/ptx/parser.cpp
 )
 target_include_directories(vgpu PUBLIC include "${_gen_dir}")
 
@@ -63,3 +66,5 @@ endfunction()
 vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_profile)
 vgpu_unit_test(test_memory)
+vgpu_unit_test(test_ptx)
+target_compile_definitions(test_ptx PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR}/tests/kernels")

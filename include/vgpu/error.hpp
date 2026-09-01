@@ -36,12 +36,15 @@ const char* err_name(Err e);
 
 class Error : public std::exception {
  public:
-  Error(Err code, std::string message) : code_(code) {
-    msg_ = std::string("VirtualGPU error [") + err_name(code) + "]: " + std::move(message);
+  Error(Err code, std::string message) : code_(code), raw_(std::move(message)) {
+    msg_ = std::string("VirtualGPU error [") + err_name(code) + "]: " + raw_;
   }
 
   Err code() const { return code_; }
   const char* what() const noexcept override { return msg_.c_str(); }
+  // The message without the "VirtualGPU error [...]" prefix, for rewrapping
+  // with extra context at a higher layer.
+  const std::string& message() const { return raw_; }
 
   // Error::make(Err::OutOfBounds, "access at 0x", std::hex, addr, " past end of allocation")
   template <class... Args>
@@ -53,6 +56,7 @@ class Error : public std::exception {
 
  private:
   Err code_;
+  std::string raw_;
   std::string msg_;
 };
 
