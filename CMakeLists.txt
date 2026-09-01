@@ -53,12 +53,15 @@ target_include_directories(vgpu PUBLIC include "${_gen_dir}")
 # libvgpucuda: the CUDA Driver API shim external programs link against.
 add_library(vgpucuda SHARED src/cuda/driver_api.cpp src/cuda/fatbin.cpp)
 target_link_libraries(vgpucuda PRIVATE vgpu ${CMAKE_DL_LIBS})
+# Present the real driver's identity: apps linked with -lcuda record SONAME
+# "libcuda.so.1" and resolve to this library through LD_LIBRARY_PATH at run time.
+set_target_properties(vgpucuda PROPERTIES OUTPUT_NAME cuda SOVERSION 1 VERSION 1.1)
 # The shim directory: prepend to LD_LIBRARY_PATH and unmodified CUDA binaries
 # (static cudart included) dlopen VirtualGPU as the driver.
 add_custom_command(TARGET vgpucuda POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
-  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libvgpucuda.so" "${CMAKE_BINARY_DIR}/shim/libcuda.so.1"
-  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libvgpucuda.so" "${CMAKE_BINARY_DIR}/shim/libcuda.so"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcuda.so.1.1" "${CMAKE_BINARY_DIR}/shim/libcuda.so.1"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcuda.so.1.1" "${CMAKE_BINARY_DIR}/shim/libcuda.so"
   COMMENT "Creating driver shim symlinks (build/shim/libcuda.so.1)")
 
 # ---------------------------------------------------------------------------
@@ -90,14 +93,15 @@ if(CUDA_ABI_INCLUDE)
   target_link_libraries(vgpucudart PRIVATE vgpu ${CMAKE_DL_LIBS})
   target_include_directories(vgpucudart PRIVATE ${CUDA_ABI_INCLUDE} src/cuda)
   # Present as libcudart.so.13 so unmodified binaries find us via LD_LIBRARY_PATH.
-  set_target_properties(vgpucudart PROPERTIES OUTPUT_NAME cudart)
+  # Same identity trick as libcuda: become libcudart.so.13 with that SONAME.
+  set_target_properties(vgpucudart PROPERTIES OUTPUT_NAME cudart SOVERSION 13 VERSION 13.0)
   target_link_options(vgpucudart PRIVATE
-    "-Wl,--version-script=${CMAKE_SOURCE_DIR}/src/cuda/cudart.map"
-    "-Wl,-soname,libcudart.so.13")
+    "-Wl,--version-script=${CMAKE_SOURCE_DIR}/src/cuda/cudart.map")
   add_custom_command(TARGET vgpucudart POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
-    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so" "${CMAKE_BINARY_DIR}/shim/libcudart.so.13"
-    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so" "${CMAKE_BINARY_DIR}/shim/libcudart.so.12"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so.13.0" "${CMAKE_BINARY_DIR}/shim/libcudart.so.13"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so.13.0" "${CMAKE_BINARY_DIR}/shim/libcudart.so.12"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so.13.0" "${CMAKE_BINARY_DIR}/shim/libcudart.so"
     COMMENT "Creating runtime shim symlinks (build/shim/libcudart.so.13)")
 else()
   message(STATUS "CUDA ABI headers not found: skipping libvgpucudart (core unaffected)")

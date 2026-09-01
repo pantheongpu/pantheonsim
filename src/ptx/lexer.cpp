@@ -62,7 +62,8 @@ std::vector<Token> lex(const std::string& src) {
       out.push_back({Token::Kind::Word, src.substr(start, i - start), line});
       continue;
     }
-    static const std::string puncts = ",;:()[]{}@+<>!-=*";
+    // '|' appears in shuffle/vote destinations ("d|p"); '%' only inside words.
+    static const std::string puncts = ",;:()[]{}@+<>!-=*|";
     if (puncts.find(c) != std::string::npos) {
       out.push_back({Token::Kind::Punct, std::string(1, c), line});
       ++i;

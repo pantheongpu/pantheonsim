@@ -79,17 +79,32 @@ VTEST(negative_offsets_and_immediates) {
 }
 
 VTEST(unsupported_instruction_names_kernel_and_line) {
-  auto err = VCAPTURE(Error, parse(wrap_kernel("atom.shared.cas.b32 %r1, [%rd1], %r2, %r3;\nret;")));
+  auto err = VCAPTURE(
+      Error, parse(wrap_kernel("wmma.load.a.sync.aligned.m8n8k4.row.f16 {%f1}, [%rd1];\nret;")));
   VCHECK(err.code() == Err::UnsupportedPtx);
-  VCHECK_CONTAINS(err.what(), "atom.shared.cas.b32");
+  VCHECK_CONTAINS(err.what(), "wmma.load");
   VCHECK_CONTAINS(err.what(), "kernel 'k'");
   VCHECK_CONTAINS(err.what(), "line 6");
 }
 
-VTEST(shared_memory_clearly_unsupported) {
-  auto err = VCAPTURE(Error, parse(wrap_kernel(".shared .align 4 .b8 buf[512];\nret;")));
-  VCHECK(err.code() == Err::UnsupportedPtx);
-  VCHECK_CONTAINS(err.what(), "shared");
+VTEST(shared_memory_declarations_parse) {
+  Module m = parse(wrap_kernel(".shared .align 4 .b8 buf[512];\n"
+                               "st.shared.u32 [%rd1], %r1;\nret;"));
+  const EntryFn& fn = m.entries[0];
+  VCHECK_EQ(fn.shared.size(), size_t{1});
+  VCHECK_EQ(fn.shared.at("buf").size, 512u);
+  VCHECK_EQ(fn.static_shared_size, 512u);
+  VCHECK(std::get<OpSt>(fn.body[0].op).space == Space::Shared);
+}
+
+VTEST(dynamic_shared_memory_sits_above_static) {
+  Module m = parse(".version 8.3\n.target sm_90\n.address_size 64\n"
+                   ".extern .shared .align 8 .b8 dyn[];\n"
+                   ".visible .entry k()\n{\n.shared .align 4 .b8 st[256];\nret;\n}\n");
+  const EntryFn& fn = m.entries[0];
+  VCHECK_EQ(fn.static_shared_size, 256u);
+  VCHECK(fn.uses_dynamic_shared);
+  VCHECK_EQ(fn.shared.at("dyn").offset, 256u);
 }
 
 VTEST(undefined_label_is_parse_error) {

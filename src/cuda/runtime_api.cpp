@@ -278,9 +278,14 @@ VGPU_EXPORT cudaError_t __cudaLaunchKernel_ptsz(vgpu_cudaKernel_t kernel, dim3 g
   return cudaLaunchKernel(kernel, gridDim, blockDim, args, sharedMem, stream);
 }
 
+// Defined with the CUDA Graph machinery below: records this launch instead of
+// running it when its stream is capturing.
+bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, void** args,
+                                     size_t sharedMem, cudaStream_t stream,
+                                     const std::vector<uint32_t>& param_sizes);
+
 VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args,
                                          size_t sharedMem, cudaStream_t stream) {
-  (void)stream;
   return guard("cudaLaunchKernel", [&](State& s) -> cudaError_t {
     auto it = s.kernels.find(func);
     if (it == s.kernels.end()) {
@@ -297,11 +302,16 @@ VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 bl
     vgpu::runtime::Device& dev = current(s);
     const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
 
+    std::vector<uint32_t> param_sizes(fn->params.size());
+    for (size_t i = 0; i < fn->params.size(); ++i) param_sizes[i] = fn->params[i].size;
+    // Under stream capture the launch is recorded for later replay, not run.
+    if (vgpu_record_launch_if_capturing(func, gridDim, blockDim, args, sharedMem, stream, param_sizes))
+      return cudaSuccess;
+
     std::vector<std::vector<uint8_t>> kargs(fn->params.size());
     for (size_t i = 0; i < fn->params.size(); ++i) {
-      uint32_t size = fn->params[i].size;
-      kargs[i].resize(size);
-      std::memcpy(kargs[i].data(), args[i], size);
+      kargs[i].resize(param_sizes[i]);
+      std::memcpy(kargs[i].data(), args[i], param_sizes[i]);
     }
     vgpu::exec::LaunchConfig cfg;
     cfg.grid = {gridDim.x, gridDim.y, gridDim.z};
@@ -547,6 +557,7 @@ VGPU_EXPORT cudaError_t cudaStreamQuery(cudaStream_t) { return cudaSuccess; }
 VGPU_EXPORT cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned int) {
   return cudaSuccess;
 }
+// cudaStreamIsCapturing is defined with the CUDA Graph machinery below.
 
 VGPU_EXPORT cudaError_t cudaEventCreate(cudaEvent_t* e) {
   if (e) *e = reinterpret_cast<cudaEvent_t>(std::malloc(sizeof(long long)));
@@ -612,5 +623,131 @@ VGPU_EXPORT cudaError_t cudaDriverGetVersion(int* v) {
 }
 VGPU_EXPORT cudaError_t cudaRuntimeGetVersion(int* v) {
   if (v) *v = kRuntimeVersion;
+  return cudaSuccess;
+}
+
+/* ===================================================================== */
+/* CUDA Graphs: real stream capture and replay                           */
+/*                                                                       */
+/* Capture must genuinely record instead of executing — workloads verify */
+/* a replayed graph's output against a directly-launched reference, so a */
+/* no-op stub would silently produce wrong results.                      */
+/* ===================================================================== */
+
+namespace {
+
+struct RecordedLaunch {
+  const void* func = nullptr;
+  dim3 grid, block;
+  size_t shared = 0;
+  std::vector<std::vector<uint8_t>> arg_bytes;  // deep copy of parameter values
+  std::vector<void*> arg_ptrs;                  // rebuilt to point at arg_bytes
+};
+
+struct GraphRec {
+  std::vector<RecordedLaunch> launches;
+};
+
+std::mutex g_graph_mu;
+std::unordered_map<void*, std::unique_ptr<GraphRec>> g_graphs;      // graph handles
+std::unordered_map<void*, std::unique_ptr<GraphRec>> g_graph_execs; // instantiated graphs
+// Streams currently capturing. VirtualGPU's streams are all the same
+// synchronous engine, so capture state is keyed by the stream handle value.
+std::unordered_map<void*, std::unique_ptr<GraphRec>> g_capturing;
+
+// Returns the capture buffer for `stream`, or nullptr when not capturing.
+GraphRec* capture_target(cudaStream_t stream) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto it = g_capturing.find(reinterpret_cast<void*>(stream));
+  return it == g_capturing.end() ? nullptr : it->second.get();
+}
+
+}  // namespace
+
+// Records a launch during capture. Returns true if it was recorded (and must
+// therefore NOT execute now).
+bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, void** args,
+                                     size_t sharedMem, cudaStream_t stream,
+                                     const std::vector<uint32_t>& param_sizes) {
+  GraphRec* g = capture_target(stream);
+  if (!g) return false;
+  RecordedLaunch rl;
+  rl.func = func;
+  rl.grid = grid;
+  rl.block = block;
+  rl.shared = sharedMem;
+  rl.arg_bytes.resize(param_sizes.size());
+  for (size_t i = 0; i < param_sizes.size(); ++i) {
+    rl.arg_bytes[i].resize(param_sizes[i]);
+    std::memcpy(rl.arg_bytes[i].data(), args[i], param_sizes[i]);
+  }
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  g->launches.push_back(std::move(rl));
+  return true;
+}
+
+VGPU_EXPORT cudaError_t cudaStreamBeginCapture(cudaStream_t stream, int mode) {
+  (void)mode;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  g_capturing[reinterpret_cast<void*>(stream)] = std::make_unique<GraphRec>();
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaStreamEndCapture(cudaStream_t stream, void** pGraph) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto it = g_capturing.find(reinterpret_cast<void*>(stream));
+  if (it == g_capturing.end()) return cudaErrorStreamCaptureImplicit;
+  auto graph = std::move(it->second);
+  g_capturing.erase(it);
+  void* handle = graph.get();
+  g_graphs[handle] = std::move(graph);
+  if (pGraph) *pGraph = handle;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphInstantiate(void** pExec, void* graph, void*, char*, size_t) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto it = g_graphs.find(graph);
+  if (it == g_graphs.end()) return cudaErrorInvalidValue;
+  auto exec = std::make_unique<GraphRec>(*it->second);  // snapshot at instantiate time
+  void* handle = exec.get();
+  g_graph_execs[handle] = std::move(exec);
+  if (pExec) *pExec = handle;
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaGraphInstantiateWithFlags(void** pExec, void* graph,
+                                                      unsigned long long) {
+  return cudaGraphInstantiate(pExec, graph, nullptr, nullptr, 0);
+}
+
+VGPU_EXPORT cudaError_t cudaGraphLaunch(void* exec, cudaStream_t stream) {
+  std::vector<RecordedLaunch> replay;
+  {
+    std::lock_guard<std::mutex> lock(g_graph_mu);
+    auto it = g_graph_execs.find(exec);
+    if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
+    replay = it->second->launches;  // copy so we can run without holding the lock
+  }
+  for (auto& rl : replay) {
+    std::vector<void*> ptrs(rl.arg_bytes.size());
+    for (size_t i = 0; i < rl.arg_bytes.size(); ++i) ptrs[i] = rl.arg_bytes[i].data();
+    cudaError_t rc = cudaLaunchKernel(rl.func, rl.grid, rl.block, ptrs.data(), rl.shared, stream);
+    if (rc != cudaSuccess) return rc;
+  }
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphDestroy(void* graph) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  g_graphs.erase(graph);
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaGraphExecDestroy(void* exec) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  g_graph_execs.erase(exec);
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaStreamIsCapturing(cudaStream_t stream, int* status) {
+  if (status) *status = capture_target(stream) ? 1 : 0;
   return cudaSuccess;
 }

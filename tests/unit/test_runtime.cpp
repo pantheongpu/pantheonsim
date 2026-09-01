@@ -35,7 +35,7 @@ VTEST(unsupported_ptx_error_names_profile) {
   runtime::Runtime rt(load_gpu("nvidia/b200"));
   auto err = VCAPTURE(Error, rt.device(0).load_module(
                                  ".version 8.3\n.target sm_100\n.address_size 64\n"
-                                 ".visible .entry k() { wmma.mma.sync.aligned.m16n16k16.row.col.f32.f32 %r1, %r2, %r3, %r4; ret; }\n"));
+                                 ".visible .entry k() { cp.async.ca.shared.global [%r1], [%rd1], 16; ret; }\n"));
   VCHECK(err.code() == Err::UnsupportedPtx);
   VCHECK_CONTAINS(err.what(), "GPU profile: nvidia/b200");
 }

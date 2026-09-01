@@ -110,10 +110,23 @@ class Parser {
         continue;
       }
       if (t.text == ".extern") {
-        // ".extern .func (...) name (...);" — declaration of an external
-        // function (vprintf). Recorded implicitly; skip to the ';'.
+        // ".extern .shared ..." declares dynamic shared memory; ".extern .func"
+        // declares an external function (vprintf), which we skip.
+        if (peek(1).kind == Token::Kind::Word && peek(1).text == ".shared") {
+          next();  // .extern
+          next();  // .shared
+          SharedDecl d = parse_shared_decl(t.line, /*allow_unsized=*/true);
+          d.dynamic = d.size == 0;
+          m.module_shared.push_back(std::move(d));
+          continue;
+        }
         while (!at_end() && !peek_punct(";")) next();
         if (!at_end()) next();
+        continue;
+      }
+      if (t.text == ".shared") {
+        next();
+        m.module_shared.push_back(parse_shared_decl(t.line, /*allow_unsized=*/true));
         continue;
       }
       if (t.text == ".entry") {
@@ -253,6 +266,7 @@ class Parser {
     fn.name = expect_word("kernel name");
     current_kernel_ = fn.name;
     call_slots_.clear();
+    declared_regs_.clear();
     if (peek_punct("(")) {
       next();
       while (!peek_punct(")")) {
@@ -286,6 +300,9 @@ class Parser {
     }
     expect_punct("{");
     parse_body(fn);
+    // Dynamic shared memory lives above every static allocation.
+    for (auto& [name, d] : fn.shared)
+      if (d.dynamic) d.offset = fn.static_shared_size;
     current_kernel_.clear();
     return fn;
   }
@@ -344,10 +361,14 @@ class Parser {
         fn.body.push_back(std::move(ins));
         continue;
       }
+      if (t.kind == Token::Kind::Word && t.text == ".shared") {
+        next();
+        SharedDecl d = parse_shared_decl(t.line, /*allow_unsized=*/true);
+        place_shared(fn, std::move(d), t.line);
+        continue;
+      }
       if (t.kind == Token::Kind::Word && t.text[0] == '.') {
-        fail_unsupported(t.line, t.text, fn.name,
-                         t.text == ".shared" ? "shared memory declarations are not implemented yet"
-                                             : "directive not in the implemented subset");
+        fail_unsupported(t.line, t.text, fn.name, "directive not in the implemented subset");
       }
       // Label?
       if (t.kind == Token::Kind::Word && peek_punct(":", 1)) {
@@ -377,9 +398,13 @@ class Parser {
         std::string count = expect_word("register count");
         expect_punct(">");
         int n = std::atoi(count.c_str());
-        for (int i = 0; i < n; ++i) fn.reg_decls[name + std::to_string(i)] = ty;
+        for (int i = 0; i < n; ++i) {
+          fn.reg_decls[name + std::to_string(i)] = ty;
+          declared_regs_.insert(name + std::to_string(i));
+        }
       } else {
         fn.reg_decls[name] = ty;
+        declared_regs_.insert(name);
       }
       if (peek_punct(",")) {
         next();
@@ -388,6 +413,54 @@ class Parser {
       break;
     }
     expect_punct(";");
+  }
+
+  // ".shared .align N .b8 name[size];" — size may be omitted for the dynamic
+  // (extern) form, whose extent comes from the launch's sharedMemBytes.
+  SharedDecl parse_shared_decl(size_t line, bool allow_unsized) {
+    SharedDecl d;
+    while (peek().kind == Token::Kind::Word && peek().text == ".align") {
+      next();
+      d.align = static_cast<uint32_t>(expect_int("alignment"));
+    }
+    Type ty = expect_type(".shared declaration");
+    d.name = expect_word("shared variable name");
+    uint64_t elems = 0;
+    bool sized = false;
+    if (peek_punct("[")) {
+      next();
+      if (!peek_punct("]")) {
+        elems = static_cast<uint64_t>(expect_int("array size"));
+        sized = true;
+      }
+      expect_punct("]");
+    } else {
+      elems = 1;
+      sized = true;
+    }
+    d.size = static_cast<uint32_t>(elems * ty.bytes());
+    if (!sized) {
+      if (!allow_unsized) fail(line, "unsized .shared array '" + d.name + "'");
+      d.dynamic = true;
+      d.size = 0;
+    }
+    if (d.align == 0) d.align = 8;
+    expect_punct(";");
+    return d;
+  }
+
+  void place_shared(EntryFn& fn, SharedDecl d, size_t line) {
+    if (d.dynamic) {
+      // Dynamic shared memory starts after all static allocations; the exact
+      // offset is fixed up once the whole body has been parsed.
+      fn.uses_dynamic_shared = true;
+      d.offset = 0;
+    } else {
+      uint32_t off = (fn.static_shared_size + d.align - 1) / d.align * d.align;
+      d.offset = off;
+      fn.static_shared_size = off + d.size;
+    }
+    if (!fn.shared.emplace(d.name, d).second) fail(line, "duplicate .shared '" + d.name + "'");
   }
 
   void parse_local_decl(EntryFn& fn, size_t line) {
@@ -435,13 +508,19 @@ class Parser {
         return ImmFloatBits{std::stoull(w.substr(2), nullptr, 16), 64};
       return ImmInt{parse_int_literal(w, t.line)};
     }
-    // Bare identifier: a module global / local depot symbol.
+    // A bare identifier is an inline-asm register local if it was declared as
+    // one; otherwise it names a module global or local depot.
+    if (declared_regs_.count(w)) return RegOperand{w};
     return SymbolOperand{w};
   }
 
+  // Register operand. Inline asm may declare locals without the '%' sigil
+  // (".reg .f16 low;"), so a bare identifier that was declared as a register
+  // is accepted too.
   std::string expect_reg_operand(const std::string& ctx) {
     std::string w = expect_word(ctx);
-    if (w[0] != '%') fail(peek().line, ctx + " must be a register, got '" + w + "'");
+    if (w[0] != '%' && !declared_regs_.count(w))
+      fail(peek().line, ctx + " must be a register, got '" + w + "'");
     return w;
   }
 
@@ -457,6 +536,17 @@ class Parser {
     if (regs.size() != n)
       fail(peek().line, "vector operand has " + std::to_string(regs.size()) + " elements, expected " +
                             std::to_string(n));
+    return regs;
+  }
+
+  std::vector<std::string> parse_reg_vector_any() {
+    std::vector<std::string> regs;
+    expect_punct("{");
+    while (!peek_punct("}")) {
+      regs.push_back(expect_reg_operand("fragment register"));
+      if (peek_punct(",")) next();
+    }
+    next();
     return regs;
   }
 
@@ -545,7 +635,6 @@ class Parser {
         } else return unsupported("unrecognized ld/st modifier '." + p + "'");
       }
       if (!have_ty) fail(ins.line, "ld/st missing type: " + opcode);
-      if (space == Space::Shared) return unsupported("shared memory not implemented yet");
       if (op0 == "ld") {
         Addr addr;
         std::vector<std::string> dsts;
@@ -595,23 +684,64 @@ class Parser {
       auto ty = parse_type_token(parts[1]);
       if (!ty) fail(ins.line, "mov missing type");
       if (ty->kind == Type::Kind::Pred) return unsupported("mov.pred");
-      OpMov op;
-      op.ty = *ty;
-      op.dst = expect_reg_operand("mov destination");
-      expect_punct(",");
-      op.src = parse_operand();
-      ins.op = op;
+      if (peek_punct("{")) {  // mov.bN {d0, d1, ...}, src  — unpack
+        OpMovUnpack op;
+        op.ty = *ty;
+        next();
+        while (!peek_punct("}")) {
+          op.dsts.push_back(expect_reg_operand("mov destination element"));
+          if (peek_punct(",")) next();
+        }
+        next();
+        expect_punct(",");
+        op.src = parse_operand();
+        if (op.dsts.size() != 2 && op.dsts.size() != 4) return unsupported("mov unpack arity");
+        ins.op = op;
+      } else {
+        std::string dst = expect_reg_operand("mov destination");
+        expect_punct(",");
+        if (peek_punct("{")) {  // mov.bN d, {s0, s1, ...}  — pack
+          OpMovPack op;
+          op.ty = *ty;
+          op.dst = dst;
+          next();
+          while (!peek_punct("}")) {
+            op.srcs.push_back(parse_operand());
+            if (peek_punct(",")) next();
+          }
+          next();
+          if (op.srcs.size() != 2 && op.srcs.size() != 4) return unsupported("mov pack arity");
+          ins.op = op;
+        } else {
+          OpMov op;
+          op.ty = *ty;
+          op.dst = dst;
+          op.src = parse_operand();
+          ins.op = op;
+        }
+      }
     } else if (op0 == "cvta") {
-      // cvta[.to].{global,local,shared,const}.u64 — all address spaces alias
-      // in VirtualGPU's flat VA scheme, so every cvta is an identity move.
+      // cvta[.to].<space>.<type>
       size_t i = 1;
-      if (i < parts.size() && parts[i] == "to") ++i;
-      if (i < parts.size() && (parts[i] == "global" || parts[i] == "local" || parts[i] == "const")) ++i;
-      else if (i < parts.size() && parts[i] == "shared") return unsupported("cvta.shared");
+      bool to_space = false;
+      if (i < parts.size() && parts[i] == "to") {
+        to_space = true;
+        ++i;
+      }
+      Space space = Space::Generic;
+      if (i < parts.size()) {
+        if (parts[i] == "global") { space = Space::Global; ++i; }
+        else if (parts[i] == "local") { space = Space::Local; ++i; }
+        else if (parts[i] == "shared") { space = Space::Shared; ++i; }
+        else if (parts[i] == "const") { space = Space::Global; ++i; }
+        else if (parts[i] == "param") { space = Space::Param; ++i; }
+      }
       auto ty = (i < parts.size()) ? parse_type_token(parts[i]) : std::nullopt;
       if (!ty) fail(ins.line, "cvta missing type");
       OpCvta op;
       op.ty = *ty;
+      op.space = space;
+      op.to_space = to_space;
       op.dst = expect_reg_operand("cvta destination");
       expect_punct(",");
       op.src = parse_operand();
@@ -635,8 +765,6 @@ class Parser {
         else return unsupported("unrecognized cvt modifier '." + p + "'");
       }
       if (tys.size() != 2) fail(ins.line, "cvt needs .<dsttype>.<srctype>");
-      if ((tys[0].is_float() && tys[0].bits == 16) || (tys[1].is_float() && tys[1].bits == 16))
-        return unsupported("half-precision (f16) cvt not implemented yet");
       OpCvt op;
       op.dst_ty = tys[0];
       op.src_ty = tys[1];
@@ -663,6 +791,222 @@ class Parser {
         op.src = parse_operand();
         ins.op = op;
       }
+    } else if ((op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "fma" || op0 == "neg") &&
+               opcode.find("f16x2") != std::string::npos) {
+      // Packed half2 arithmetic.
+      for (size_t i = 1; i < parts.size(); ++i)
+        if (parts[i] != "f16x2" && parts[i] != "rn" && parts[i] != "ftz" && parts[i] != "sat" &&
+            parts[i] != "rz" && parts[i] != "rm" && parts[i] != "rp")
+          return unsupported("f16x2 modifier '." + parts[i] + "'");
+      std::string dst = expect_reg_operand("destination");
+      expect_punct(",");
+      Operand a = parse_operand();
+      if (op0 == "neg") {
+        ins.op = OpF16x2Neg{dst, a};
+      } else {
+        expect_punct(",");
+        Operand b = parse_operand();
+        if (op0 == "fma") {
+          expect_punct(",");
+          Operand c = parse_operand();
+          ins.op = OpF16x2Fma{dst, a, b, c};
+        } else {
+          FloatBinOp fop = op0 == "add"   ? FloatBinOp::Add
+                           : op0 == "sub" ? FloatBinOp::Sub
+                                          : FloatBinOp::Mul;
+          ins.op = OpF16x2Bin{fop, dst, a, b};
+        }
+      }
+    } else if (op0 == "wmma") {
+      // wmma.mma.sync.aligned.<alayout>.<blayout>.m16n16k16.f32.f32 {d}, {a}, {b}, {c};
+      // wmma.store.d.sync.aligned.<layout>.m16n16k16[.space].f32 [addr], {d}, stride;
+      if (parts.size() < 2) return unsupported("wmma form");
+      const std::string& kind = parts[1];
+      std::vector<MatLayout> layouts;
+      Space space = Space::Generic;
+      bool shape_ok = false;
+      for (size_t i = 2; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "sync" || p == "aligned" || p == "d" || p == "f32") ;
+        else if (p == "row") layouts.push_back(MatLayout::Row);
+        else if (p == "col") layouts.push_back(MatLayout::Col);
+        else if (p == "m16n16k16") shape_ok = true;
+        else if (p == "global") space = Space::Global;
+        else if (p == "shared") space = Space::Shared;
+        else if (p == "f16") ;
+        else return unsupported("wmma modifier '." + p + "' (only m16n16k16 f32 is implemented)");
+      }
+      if (!shape_ok) return unsupported("only the m16n16k16 wmma shape is implemented");
+      if (kind == "mma") {
+        if (layouts.size() != 2) return unsupported("wmma.mma needs both A and B layouts");
+        OpWmmaMma op;
+        op.alayout = layouts[0];
+        op.blayout = layouts[1];
+        op.d = parse_reg_vector_any();
+        expect_punct(",");
+        op.a = parse_reg_vector_any();
+        expect_punct(",");
+        op.b = parse_reg_vector_any();
+        expect_punct(",");
+        op.c = parse_reg_vector_any();
+        if (op.d.size() != 8 || op.a.size() != 8 || op.b.size() != 8 || op.c.size() != 8)
+          return unsupported("wmma.mma fragment arity (expected 8 registers each)");
+        ins.op = op;
+      } else if (kind == "store") {
+        OpWmmaStore op;
+        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
+        op.space = space;
+        op.addr = parse_addr(fn);
+        expect_punct(",");
+        {
+          std::vector<std::string> regs = parse_reg_vector_any();
+          for (auto& r : regs) op.src.push_back(Operand{RegOperand{r}});
+        }
+        if (op.src.size() != 8) return unsupported("wmma.store fragment arity");
+        expect_punct(",");
+        op.stride = parse_operand();
+        ins.op = op;
+      } else {
+        return unsupported("wmma." + kind + " is not implemented (only .mma and .store.d)");
+      }
+    } else if (op0 == "abs") {
+      if (parts.size() < 2) return unsupported("abs form");
+      auto ty = parse_type_token(parts.back());
+      if (!ty) fail(ins.line, "abs missing type");
+      OpAbs op;
+      op.ty = *ty;
+      op.dst = expect_reg_operand("abs destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "ex2" || op0 == "lg2" || op0 == "sin" || op0 == "cos" || op0 == "sqrt" ||
+               op0 == "rsqrt" || op0 == "rcp" || op0 == "tanh") {
+      static const std::unordered_map<std::string, MathOp> mops = {
+          {"ex2", MathOp::Ex2},     {"lg2", MathOp::Lg2},   {"sin", MathOp::Sin},
+          {"cos", MathOp::Cos},     {"sqrt", MathOp::Sqrt}, {"rsqrt", MathOp::Rsqrt},
+          {"rcp", MathOp::Rcp},     {"tanh", MathOp::Tanh}};
+      Type ty{};
+      bool have_ty = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        // approx/rn/rz/ftz/full select precision on hardware; VirtualGPU always
+        // computes at host precision (documented divergence).
+        if (p == "approx" || p == "rn" || p == "rz" || p == "rm" || p == "rp" || p == "ftz" ||
+            p == "full")
+          ;
+        else if (auto t2 = parse_type_token(p)) {
+          ty = *t2;
+          have_ty = true;
+        } else return unsupported("unrecognized modifier '." + p + "'");
+      }
+      if (!have_ty) fail(ins.line, opcode + " missing type");
+      if (!ty.is_float() || (ty.bits != 32 && ty.bits != 64))
+        return unsupported("only f32/f64 " + op0 + " is implemented");
+      OpMath op;
+      op.op = mops.at(op0);
+      op.ty = ty;
+      op.dst = expect_reg_operand("destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "bfe" || op0 == "bfi") {
+      auto ty = parse_type_token(parts.back());
+      if (!ty || parts.size() != 2) return unsupported(op0 + " form");
+      std::string dst = expect_reg_operand("destination");
+      expect_punct(",");
+      Operand a = parse_operand();
+      expect_punct(",");
+      Operand b = parse_operand();
+      expect_punct(",");
+      Operand c = parse_operand();
+      if (op0 == "bfe") {
+        ins.op = OpBfe{*ty, dst, a, b, c};
+      } else {
+        expect_punct(",");
+        Operand d = parse_operand();
+        ins.op = OpBfi{*ty, dst, a, b, c, d};
+      }
+    } else if (op0 == "brev") {
+      auto ty = parse_type_token(parts.back());
+      if (!ty || parts.size() != 2) return unsupported("brev form");
+      OpBrev op;
+      op.ty = *ty;
+      op.dst = expect_reg_operand("destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "popc" || op0 == "clz") {
+      auto ty = parse_type_token(parts.back());
+      if (!ty || parts.size() != 2) return unsupported(op0 + " form");
+      OpPopcClz op;
+      op.popc = (op0 == "popc");
+      op.ty = *ty;
+      op.dst = expect_reg_operand("destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "shfl") {
+      // shfl.sync.<mode>.b32 d[|p], a, b, c, membermask;
+      ShflMode mode;
+      bool have_mode = false, sync = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "sync") sync = true;
+        else if (p == "up") { mode = ShflMode::Up; have_mode = true; }
+        else if (p == "down") { mode = ShflMode::Down; have_mode = true; }
+        else if (p == "bfly") { mode = ShflMode::Bfly; have_mode = true; }
+        else if (p == "idx") { mode = ShflMode::Idx; have_mode = true; }
+        else if (p == "b32") ;
+        else return unsupported("shfl modifier '." + p + "'");
+      }
+      if (!have_mode) return unsupported("shfl needs a mode (.up/.down/.bfly/.idx)");
+      if (!sync) return unsupported("the deprecated non-.sync shfl is not implemented");
+      OpShfl op;
+      op.mode = mode;
+      op.dst = expect_reg_operand("shfl destination");
+      if (peek_punct("|")) {  // optional predicate destination
+        next();
+        op.pred_dst = expect_reg_operand("shfl predicate destination");
+      }
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      expect_punct(",");
+      op.c = parse_operand();
+      expect_punct(",");
+      op.member_mask = parse_operand();
+      ins.op = op;
+    } else if (op0 == "vote") {
+      // vote.sync.{all,any,uni}.pred d, p, membermask;  vote.sync.ballot.b32 d, p, mask;
+      VoteMode mode = VoteMode::All;
+      bool ballot = false, have_mode = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "sync") ;
+        else if (p == "all") { mode = VoteMode::All; have_mode = true; }
+        else if (p == "any") { mode = VoteMode::Any; have_mode = true; }
+        else if (p == "uni") { mode = VoteMode::Uni; have_mode = true; }
+        else if (p == "ballot") { mode = VoteMode::Ballot; ballot = true; have_mode = true; }
+        else if (p == "pred" || p == "b32") ;
+        else return unsupported("vote modifier '." + p + "'");
+      }
+      if (!have_mode) return unsupported("vote needs a mode");
+      OpVote op;
+      op.mode = mode;
+      op.ballot = ballot;
+      op.dst = expect_reg_operand("vote destination");
+      expect_punct(",");
+      if (peek_punct("!")) {
+        next();
+        op.negate_src = true;
+      }
+      op.src = expect_reg_operand("vote predicate source");
+      if (peek_punct(",")) {
+        next();
+        (void)parse_operand();  // membermask
+      }
+      ins.op = op;
     } else if (op0 == "neg") {
       if (parts.size() != 2) return unsupported("neg form");
       auto ty = parse_type_token(parts[1]);
@@ -711,7 +1055,7 @@ class Parser {
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "global") space = Space::Global;
-        else if (p == "shared") return unsupported("atomics on shared memory (no shared memory yet)");
+        else if (p == "shared") space = Space::Shared;
         else if (inert_mem_modifier(p)) ;
         else if (p == "add") aop = AtomOp::Add;
         else if (p == "min") aop = AtomOp::Min;
@@ -731,7 +1075,7 @@ class Parser {
       OpAtom op;
       op.op = *aop;
       op.ty = ty;
-      (void)space;
+      op.space = space;
       op.dst = expect_reg_operand("atom destination");
       expect_punct(",");
       op.addr = parse_addr(fn);
@@ -782,7 +1126,8 @@ class Parser {
         op.b = expect_reg_operand("predicate operand");
         ins.op = op;
       } else if (ty.is_float()) {
-        if (ty.bits != 32 && ty.bits != 64) return unsupported("only f32/f64 float math implemented");
+        if (ty.bits != 16 && ty.bits != 32 && ty.bits != 64)
+          return unsupported("only f16/f32/f64 float math implemented");
         static const std::unordered_map<std::string, FloatBinOp> fops = {
             {"add", FloatBinOp::Add}, {"sub", FloatBinOp::Sub}, {"mul", FloatBinOp::Mul},
             {"min", FloatBinOp::Min}, {"max", FloatBinOp::Max}, {"div", FloatBinOp::Div}};
@@ -828,11 +1173,15 @@ class Parser {
       }
     } else if (op0 == "mad" || op0 == "fma") {
       Type ty{};
-      bool have_ty = false, lo = false;
+      bool have_ty = false, lo = false, wide = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "lo") lo = true;
-        else if (p == "rn" || p == "ftz") ;
+        else if (p == "wide") wide = true;
+        else if (p == "hi") return unsupported("mad.hi not implemented yet");
+        // Rounding modes: VirtualGPU always computes at host precision
+        // (round-to-nearest) — a documented divergence, see ARCHITECTURE.md.
+        else if (p == "rn" || p == "rz" || p == "rm" || p == "rp" || p == "ftz" || p == "sat") ;
         else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
@@ -849,15 +1198,28 @@ class Parser {
       if (ty.is_float()) {
         if (ty.bits != 32 && ty.bits != 64) return unsupported("only f32/f64 fma implemented");
         ins.op = OpFma{ty, dst, a, b, c};
+      } else if (wide) {
+        if (ty.bits != 32) return unsupported("only mad.wide.{s32,u32} implemented");
+        ins.op = OpMadWide{ty.is_signed(), dst, a, b, c};
       } else {
-        if (!lo) return unsupported("integer mad requires .lo");
+        if (!lo) return unsupported("integer mad requires .lo or .wide");
         ins.op = OpMadLo{ty, dst, a, b, c};
       }
     } else if (op0 == "setp") {
+      // setp.<cmp>[.ftz].<type> — drop the flush-to-zero qualifier.
+      if (parts.size() == 4 && parts[2] == "ftz") parts.erase(parts.begin() + 2);
       if (parts.size() != 3) return unsupported("setp form (only setp.<cmp>.<type> is implemented)");
       static const std::unordered_map<std::string, CmpOp> cmps = {
-          {"eq", CmpOp::Eq}, {"ne", CmpOp::Ne}, {"lt", CmpOp::Lt},
-          {"le", CmpOp::Le}, {"gt", CmpOp::Gt}, {"ge", CmpOp::Ge}};
+          {"eq", CmpOp::Eq},   {"ne", CmpOp::Ne},   {"lt", CmpOp::Lt},
+          {"le", CmpOp::Le},   {"gt", CmpOp::Gt},   {"ge", CmpOp::Ge},
+          // Unsigned integer forms share the ordered comparators; the operand
+          // type already selects signed vs unsigned interpretation.
+          {"lo", CmpOp::Lt},   {"ls", CmpOp::Le},   {"hi", CmpOp::Gt},
+          {"hs", CmpOp::Ge},
+          // Float unordered (NaN-true) forms and the NaN tests.
+          {"equ", CmpOp::Equ}, {"neu", CmpOp::Neu}, {"ltu", CmpOp::Ltu},
+          {"leu", CmpOp::Leu}, {"gtu", CmpOp::Gtu}, {"geu", CmpOp::Geu},
+          {"num", CmpOp::Num}, {"nan", CmpOp::Nan}};
       auto it = cmps.find(parts[1]);
       if (it == cmps.end()) return unsupported("comparison '." + parts[1] + "'");
       auto ty = parse_type_token(parts[2]);
@@ -950,6 +1312,7 @@ class Parser {
   size_t pos_ = 0;
   std::string current_kernel_;
   std::set<std::string> call_slots_;
+  std::set<std::string> declared_regs_;  // every .reg name in the current kernel
 };
 
 }  // namespace
@@ -958,7 +1321,27 @@ Module parse(const std::string& src) {
   Parser p(src);
   // Note: a module with zero kernels is legal (e.g. a translation unit with
   // only host code still registers an empty PTX image).
-  return p.parse_module();
+  Module m = p.parse_module();
+  // Module-scope .shared variables are per-block storage available to every
+  // kernel, so give each entry its own slot in that kernel's shared frame.
+  for (auto& fn : m.entries) {
+    for (const auto& md : m.module_shared) {
+      if (fn.shared.count(md.name)) continue;
+      SharedDecl d = md;
+      if (d.dynamic) {
+        fn.uses_dynamic_shared = true;
+        d.offset = fn.static_shared_size;
+      } else {
+        uint32_t off = (fn.static_shared_size + d.align - 1) / d.align * d.align;
+        d.offset = off;
+        fn.static_shared_size = off + d.size;
+      }
+      fn.shared.emplace(d.name, d);
+    }
+    for (auto& [name, d] : fn.shared)
+      if (d.dynamic) d.offset = fn.static_shared_size;
+  }
+  return m;
 }
 
 }  // namespace vgpu::ptx
