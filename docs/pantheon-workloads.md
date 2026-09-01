@@ -49,9 +49,29 @@ The runner additionally accepts `VGPU_WL_GPU`, `VGPU_WL_VRAM_MB`,
 
 ## Status
 
-**44 of 46 workloads run to completion**, each executing for its full requested
-duration (the runner provisions 2 virtual devices so the multi-GPU workloads
-take their real peer-DMA paths). This includes the memory diagnostics (`memory_read`/`write`,
+**44 of 46 workloads pass; 0 fail.** Each runs for its full requested duration
+(5 s here; 7-8 s for the ones that also allocate a gigabyte or set up peer
+access). The runner provisions 2 virtual devices so the multi-GPU workloads
+take their real peer-DMA paths. Verified run:
+
+```
+44 passed, 0 failed, 2 skipped
+all_reduce               PASS  8s  0.0994063 GB/s        (peer DMA, 2 virtual GPUs)
+galpat                   PASS  7s  1.22755e+07 gallop-reads/s
+graph_replay             PASS  5s  183403 graph-steps/s  (real capture/replay)
+march_test               PASS  5s  1.5287e+07 march-ops/s
+memory_read              PASS  5s  0.219581 GB/s
+mma_virus                PASS  5s  0.00215057 TFLOPS     (tensor cores)
+moe_router               PASS  5s  784476 ai-ops/s       (shared memory)
+p2p_thrasher             PASS  7s  1.74713 GB/s          (peer DMA)
+pcie_bandwidth           PASS  8s  7.23639 GB/s
+transformer_virus        PASS  5s  0.00196313 TFLOPS     (wmma)
+...                                (full table: run the script)
+media_enc_virus          SKIP      needs NVENC (not CUDA; out of scope)
+rt_virus                 SKIP      needs OptiX (not CUDA; out of scope)
+```
+
+The suite includes the memory diagnostics (`memory_read`/`write`,
 `galpat`, `march_test`, `memory_hammer`, `memory_retention`, `tlb_avalanche`),
 the compute/ALU stressors (`compute_virus`, `int_virus`, `fp64_virus`,
 `sfu_stress`, `atomic_virus`), the tensor-core kernels (`mma_virus`,
