@@ -44,6 +44,8 @@ add_library(vgpu STATIC
   src/ptx/ast.cpp
   src/ptx/lexer.cpp
   src/ptx/parser.cpp
+  src/exec/scheduler.cpp
+  src/exec/interpreter.cpp
 )
 target_include_directories(vgpu PUBLIC include "${_gen_dir}")
 
@@ -68,3 +70,5 @@ vgpu_unit_test(test_profile)
 vgpu_unit_test(test_memory)
 vgpu_unit_test(test_ptx)
 target_compile_definitions(test_ptx PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR}/tests/kernels")
+vgpu_unit_test(test_exec)
+target_compile_definitions(test_exec PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR}/tests/kernels")

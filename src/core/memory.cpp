@@ -72,6 +72,13 @@ const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t 
       if (base_out) *base_out = base;
       return a;
     }
+    // The VA range up to the alignment-padded end belongs to this allocation:
+    // an access there is an overrun, which deserves a better diagnosis than
+    // "unknown pointer".
+    uint64_t padded = (a.size + kAllocAlign - 1) / kAllocAlign * kAllocAlign;
+    if (addr < base + padded)
+      throw Error::make(Err::OutOfBounds, op, " at ", Hex{addr}, " is ", addr - (base + a.size),
+                        " bytes past the end of the ", a.size, "-byte allocation at ", Hex{base});
   }
   // Freed allocation?
   auto fup = freed_.upper_bound(addr);
