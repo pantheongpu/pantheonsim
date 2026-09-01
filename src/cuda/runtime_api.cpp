@@ -303,6 +303,23 @@ VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 bl
     vgpu::runtime::Device& dev = current(s);
     const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
 
+    // A kernel with parameters needs an argument array, and every slot in it
+    // must be a real pointer: dereferencing what the caller passed is the one
+    // place a bad argument turns into a crash instead of an error code.
+    if (!fn->params.empty() && !args) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] cudaLaunchKernel: kernel '%s' takes %zu parameters but the "
+                             "argument array is NULL\n", ki.entry_name.c_str(), fn->params.size());
+      return cudaErrorInvalidValue;
+    }
+    for (size_t i = 0; i < fn->params.size(); ++i) {
+      if (!args[i]) {
+        if (!quiet())
+          std::fprintf(stderr, "[vgpu] cudaLaunchKernel: kernel '%s' argument %zu is NULL\n",
+                       ki.entry_name.c_str(), i);
+        return cudaErrorInvalidValue;
+      }
+    }
     std::vector<uint32_t> param_sizes(fn->params.size());
     for (size_t i = 0; i < fn->params.size(); ++i) param_sizes[i] = fn->params[i].size;
     // Under stream capture the launch is recorded for later replay, not run.
@@ -357,9 +374,20 @@ VGPU_EXPORT cudaError_t cudaGetDeviceFlags(unsigned int* flags) {
   return cudaSuccess;
 }
 
-VGPU_EXPORT cudaError_t cudaDeviceSynchronize(void) { return cudaSuccess; }
-VGPU_EXPORT cudaError_t cudaDeviceReset(void) { return cudaSuccess; }
-VGPU_EXPORT cudaError_t cudaThreadSynchronize(void) { return cudaSuccess; }
+// Work is synchronous here, so there is nothing to wait for -- but a failed
+// launch must still be observable through synchronization, which is how most
+// programs check for errors. Returning the sticky error (and clearing it, as
+// CUDA does) keeps a failed kernel from looking like success.
+VGPU_EXPORT cudaError_t cudaDeviceSynchronize(void) {
+  cudaError_t e = g_last_error;
+  g_last_error = cudaSuccess;
+  return e;
+}
+VGPU_EXPORT cudaError_t cudaDeviceReset(void) {
+  g_last_error = cudaSuccess;
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaThreadSynchronize(void) { return cudaDeviceSynchronize(); }
 
 VGPU_EXPORT cudaError_t cudaGetDeviceProperties(cudaDeviceProp* prop, int device) {
   return guard("cudaGetDeviceProperties", [&](State& s) {
@@ -588,7 +616,7 @@ VGPU_EXPORT cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned int)
   return cudaStreamCreate(s);
 }
 VGPU_EXPORT cudaError_t cudaStreamDestroy(cudaStream_t) { return cudaSuccess; }
-VGPU_EXPORT cudaError_t cudaStreamSynchronize(cudaStream_t) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaStreamSynchronize(cudaStream_t) { return cudaDeviceSynchronize(); }
 VGPU_EXPORT cudaError_t cudaStreamQuery(cudaStream_t) { return cudaSuccess; }
 VGPU_EXPORT cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned int) {
   return cudaSuccess;

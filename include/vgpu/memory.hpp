@@ -7,8 +7,14 @@
 //    H200 can advertise 141 GB of VRAM on a 16 GB laptop; only touched pages
 //    cost host RAM. Untouched device memory reads as zero (documented
 //    VirtualGPU behavior; real GPUs leave it undefined).
-//  - Virtual addresses are handed out monotonically and never reused, so
-//    use-after-free is detectable for the lifetime of the process.
+//  - Virtual addresses are handed out monotonically and never reused, so a
+//    freed pointer can never alias a later allocation.
+//  - Freed allocations are remembered in a bounded quarantine (the most recent
+//    kQuarantineEntries frees) so use-after-free and double-free stay
+//    detectable without growing without limit: workloads that cycle millions
+//    of allocations would otherwise leak one record per free. Beyond the
+//    quarantine a stale pointer is reported as an invalid pointer rather than
+//    a use-after-free -- still an error, with a hint that it may be stale.
 //  - Every access is bounds-checked and produces a rich diagnostic on failure
 //    (these diagnostics are a product feature for CI, not just debug aids).
 #pragma once
@@ -24,6 +30,9 @@ namespace vgpu {
 inline constexpr uint64_t kDeviceVaBase = 0x7fff'0000'0000ull;
 inline constexpr uint64_t kAllocAlign = 256;  // matches CUDA's documented minimum alignment
 inline constexpr uint64_t kChunkSize = 64 * 1024;
+// How many freed allocations stay individually diagnosable. Bounded so that
+// long-running alloc/free loops do not grow memory forever.
+inline constexpr size_t kQuarantineEntries = 4096;
 
 class MemoryManager {
  public:
@@ -63,6 +72,7 @@ class MemoryManager {
   };
   struct FreedRecord {
     uint64_t size = 0;
+    uint64_t seq = 0;  // eviction order
   };
 
   // Maps addr to (allocation base, allocation); throws with diagnostics.
@@ -78,7 +88,13 @@ class MemoryManager {
 
   std::function<void(uint64_t)> usage_observer_;
   std::map<uint64_t, Allocation> live_;        // base -> allocation
-  std::map<uint64_t, FreedRecord> freed_;      // base -> record (for UAF/double-free reporting)
+  // base -> record, bounded to kQuarantineEntries (oldest evicted first).
+  std::map<uint64_t, FreedRecord> freed_;
+  std::map<uint64_t, uint64_t> freed_order_;  // seq -> base, for eviction
+  uint64_t freed_seq_ = 0;
+  // Highest VA ever handed out, so a pointer inside the retired range can be
+  // called out as stale even after it leaves the quarantine.
+  uint64_t high_water_va_ = kDeviceVaBase;
 };
 
 }  // namespace vgpu

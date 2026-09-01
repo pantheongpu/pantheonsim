@@ -28,6 +28,7 @@ uint64_t MemoryManager::alloc(uint64_t size) {
   uint64_t base = next_va_;
   uint64_t padded = (size + kAllocAlign - 1) / kAllocAlign * kAllocAlign;
   next_va_ += padded;
+  high_water_va_ = next_va_;
   used_ += size;
   live_.emplace(base, Allocation{size, {}});
   notify_usage();
@@ -38,7 +39,17 @@ void MemoryManager::free(uint64_t ptr) {
   auto it = live_.find(ptr);
   if (it != live_.end()) {
     used_ -= it->second.size;
-    freed_.emplace(ptr, FreedRecord{it->second.size});
+    // Quarantine the freed range so use-after-free stays diagnosable, evicting
+    // the oldest entry once the bound is reached.
+    freed_[ptr] = FreedRecord{it->second.size, freed_seq_};
+    freed_order_[freed_seq_++] = ptr;
+    while (freed_order_.size() > kQuarantineEntries) {
+      auto oldest = freed_order_.begin();
+      auto stale = freed_.find(oldest->second);
+      // Only drop it if this record is the one that entry refers to.
+      if (stale != freed_.end() && stale->second.seq == oldest->first) freed_.erase(stale);
+      freed_order_.erase(oldest);
+    }
     live_.erase(it);
     notify_usage();
     return;
@@ -55,6 +66,11 @@ void MemoryManager::free(uint64_t ptr) {
                         ": allocation starts at ", Hex{prev->first}, " (", prev->second.size,
                         " bytes); pass the base pointer");
   }
+  if (ptr >= kDeviceVaBase && ptr < high_water_va_)
+    throw Error::make(Err::InvalidPointer, "free of device pointer ", Hex{ptr},
+                      " that is not a live allocation; it is inside the retired address range, so "
+                      "it was most likely freed earlier (beyond the ", kQuarantineEntries,
+                      "-entry double-free quarantine)");
   throw Error::make(Err::InvalidPointer, "free of unknown device pointer ", Hex{ptr},
                     " (never returned by an allocation)");
 }
@@ -90,6 +106,11 @@ const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t 
       throw Error::make(Err::UseAfterFree, op, " at ", Hex{addr}, " touches freed allocation ",
                         Hex{prev->first}, " (", prev->second.size, " bytes); device memory was freed");
   }
+  if (addr >= kDeviceVaBase && addr < high_water_va_)
+    throw Error::make(Err::UseAfterFree, op, " at ", Hex{addr},
+                      " is inside the retired address range: the allocation it belonged to was "
+                      "freed (older than the ", kQuarantineEntries,
+                      "-entry quarantine, so its size is no longer recorded)");
   throw Error::make(Err::InvalidPointer, op, " at ", Hex{addr},
                     ": address is not inside any device allocation",
                     addr < kDeviceVaBase ? " (looks like a host pointer, not a device pointer)" : "");

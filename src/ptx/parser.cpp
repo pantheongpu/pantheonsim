@@ -575,11 +575,17 @@ class Parser {
       a.base = base;
       a.base_kind = Addr::Base::CallSlot;
     } else {
-      bool found = false;
-      for (const auto& p : fn.params) found = found || p.name == base;
-      if (!found) fail(peek().line, "unknown parameter or slot '" + base + "' in address operand");
-      a.base = base;
-      a.base_kind = Addr::Base::EntryParam;
+      bool is_param = false;
+      for (const auto& p : fn.params) is_param = is_param || p.name == base;
+      if (is_param) {
+        a.base = base;
+        a.base_kind = Addr::Base::EntryParam;
+      } else {
+        // A variable addressed by name (.shared/.local/.global). Resolution
+        // happens at launch, when the module's symbol table is available.
+        a.base = base;
+        a.base_kind = Addr::Base::Symbol;
+      }
     }
     if (peek_punct("+")) {
       next();
@@ -656,8 +662,8 @@ class Parser {
             ins.op = OpLd{space, ty, std::move(dsts), addr};
           }
         } else {
-          if (addr.base_kind != Addr::Base::Reg)
-            return unsupported("non-param load from a parameter/slot name");
+          if (addr.base_kind == Addr::Base::CallSlot || addr.base_kind == Addr::Base::EntryParam)
+            return unsupported("non-param load through a parameter/slot name");
           ins.op = OpLd{space, ty, std::move(dsts), addr};
         }
       } else {
@@ -674,8 +680,8 @@ class Parser {
           if (vec != 1) return unsupported("vector st.param");
           ins.op = OpStSlot{addr.base, addr.offset, ty, srcs[0]};
         } else {
-          if (addr.base_kind != Addr::Base::Reg)
-            return unsupported("store to a parameter/slot name");
+          if (addr.base_kind == Addr::Base::CallSlot || addr.base_kind == Addr::Base::EntryParam)
+            return unsupported("store through a parameter/slot name");
           ins.op = OpSt{space, ty, addr, std::move(srcs)};
         }
       }
@@ -1079,7 +1085,8 @@ class Parser {
       op.dst = expect_reg_operand("atom destination");
       expect_punct(",");
       op.addr = parse_addr(fn);
-      if (op.addr.base_kind != Addr::Base::Reg) return unsupported("atom on a parameter name");
+      if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
+        return unsupported("atom through a parameter/slot name");
       expect_punct(",");
       op.b = parse_operand();
       if (*aop == AtomOp::Cas) {
@@ -1109,7 +1116,21 @@ class Parser {
         } else return unsupported("unrecognized modifier '." + p + "'");
       }
       if (!have_ty) fail(ins.line, opcode + " missing type");
-      if (hi) return unsupported("mul.hi not implemented yet");
+      if (hi) {
+        if (op0 != "mul") return unsupported("'." + op0 + ".hi' is not implemented");
+        if (ty.is_float()) return unsupported("mul.hi on floats");
+        OpMulHi op;
+        op.ty = ty;
+        op.dst = expect_reg_operand("destination");
+        expect_punct(",");
+        op.a = parse_operand();
+        expect_punct(",");
+        op.b = parse_operand();
+        ins.op = op;
+        expect_punct(";");
+        ins.text = reconstruct_from(start_tok);
+        return ins;
+      }
       if (ty.kind == Type::Kind::Pred) {
         // and.pred / or.pred / xor.pred
         std::optional<PredBinOp> pop;
@@ -1173,12 +1194,12 @@ class Parser {
       }
     } else if (op0 == "mad" || op0 == "fma") {
       Type ty{};
-      bool have_ty = false, lo = false, wide = false;
+      bool have_ty = false, lo = false, wide = false, hi = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "lo") lo = true;
         else if (p == "wide") wide = true;
-        else if (p == "hi") return unsupported("mad.hi not implemented yet");
+        else if (p == "hi") hi = true;
         // Rounding modes: VirtualGPU always computes at host precision
         // (round-to-nearest) — a documented divergence, see ARCHITECTURE.md.
         else if (p == "rn" || p == "rz" || p == "rm" || p == "rp" || p == "ftz" || p == "sat") ;
@@ -1201,6 +1222,8 @@ class Parser {
       } else if (wide) {
         if (ty.bits != 32) return unsupported("only mad.wide.{s32,u32} implemented");
         ins.op = OpMadWide{ty.is_signed(), dst, a, b, c};
+      } else if (hi) {
+        ins.op = OpMadHi{ty, dst, a, b, c};
       } else {
         if (!lo) return unsupported("integer mad requires .lo or .wide");
         ins.op = OpMadLo{ty, dst, a, b, c};

@@ -520,6 +520,10 @@ int cmd_shell(const std::vector<std::string>& args) {
   ::waitpid(pid, &status, 0);
   stop = true;
   if (pump.joinable()) pump.join();
+  // Remove the session directory; otherwise every run leaves its generated
+  // tools and system files behind in /tmp.
+  if (s.dir.rfind("/tmp/vgpu-session-", 0) == 0)
+    std::system(("rm -rf '" + s.dir + "' 2>/dev/null").c_str());
   std::printf("\n  Session ended. Simulated %d x %s.\n", c.count, profile.model.c_str());
   return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }

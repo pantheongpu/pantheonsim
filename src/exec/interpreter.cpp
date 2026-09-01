@@ -62,13 +62,23 @@ struct BlockCtx {
   std::vector<uint8_t>* shared = nullptr;
 };
 
+// One diverged execution path: a set of lanes sharing a program counter.
+struct Path {
+  size_t pc = 0;
+  Mask mask = 0;
+};
+
 struct Warp {
   enum class State { Ready, AtBarrier, Done };
   State state = State::Ready;
-  size_t pc = 0;
-  Mask active = 0;
+  // Live paths. Reconvergence is by *lowest program counter*: the path with
+  // the smallest pc always runs next, and paths that arrive at the same pc are
+  // merged. For the structured control flow compilers emit, that reconverges
+  // an if/else at its join point and lets a loop's lanes iterate until they
+  // reach the exit -- which is what makes bar.sync after a divergent region
+  // work, since every lane has merged back into one path by then.
+  std::vector<Path> paths;
   Mask exited = 0;
-  std::vector<std::pair<size_t, Mask>> divergence;  // parked (pc, mask)
   std::unordered_map<std::string, Lanes> regs;
   std::unordered_map<std::string, Mask> preds;
   std::unordered_map<std::string, Lanes> slots;  // call-argument slots
@@ -177,14 +187,17 @@ class Interpreter {
     std::vector<Warp> warps(nwarps);
     for (size_t w = 0; w < nwarps; ++w) {
       Warp& warp = warps[w];
+      Mask live = 0;
       for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
         uint64_t lin = uint64_t{static_cast<uint32_t>(w)} * kWarpSize + lane;
         if (lin >= total) break;
-        warp.active |= (1u << lane);
+        live |= (1u << lane);
         warp.tid_x[lane] = static_cast<uint32_t>(lin % ctx.ntid[0]);
         warp.tid_y[lane] = static_cast<uint32_t>((lin / ctx.ntid[0]) % ctx.ntid[1]);
         warp.tid_z[lane] = static_cast<uint32_t>(lin / (uint64_t{ctx.ntid[0]} * ctx.ntid[1]));
       }
+      if (live) warp.paths.push_back({0, live});
+      else warp.state = Warp::State::Done;
     }
     stats_.warps += nwarps;
 
@@ -207,17 +220,39 @@ class Interpreter {
     }
   }
 
+  // Merges paths sitting at the same pc and returns the index of the one with
+  // the lowest pc, which is the path that runs next.
+  size_t select_path(Warp& w) {
+    for (size_t i = 0; i < w.paths.size(); ++i) {
+      for (size_t j = w.paths.size(); j-- > i + 1;) {
+        if (w.paths[j].pc == w.paths[i].pc) {
+          w.paths[i].mask |= w.paths[j].mask;
+          w.paths.erase(w.paths.begin() + static_cast<long>(j));
+        }
+      }
+    }
+    size_t best = 0;
+    for (size_t i = 1; i < w.paths.size(); ++i)
+      if (w.paths[i].pc < w.paths[best].pc) best = i;
+    return best;
+  }
+
   void run_warp_until_yield(Warp& w, const BlockCtx& ctx) {
     while (w.state == Warp::State::Ready) {
-      if (w.pc >= fn_.body.size())
+      if (w.paths.empty()) {
+        w.state = Warp::State::Done;
+        return;
+      }
+      size_t idx = select_path(w);
+      if (w.paths[idx].pc >= fn_.body.size())
         throw Error::make(Err::PtxParse, "control fell off the end of kernel '", fn_.name,
                           "' (missing ret)");
-      const Instr& ins = fn_.body[w.pc];
+      const Instr& ins = fn_.body[w.paths[idx].pc];
       if (progress_ && (stats_.instructions & 0xFFFFF) == 0) report_progress();
       if (++stats_.instructions > cfg_.max_steps)
         throw Error::make(Err::ExecLimit, "kernel '", fn_.name, "' exceeded the launch step budget (",
                           cfg_.max_steps, " instructions) — possible infinite loop");
-      step(w, ctx, ins);
+      step(w, ctx, idx, ins);
     }
   }
 
@@ -384,8 +419,9 @@ class Interpreter {
 
   // ---- the dispatcher ----
 
-  void step(Warp& w, const BlockCtx& ctx, const Instr& ins) {
-    Mask m = w.active;
+  void step(Warp& w, const BlockCtx& ctx, size_t idx, const Instr& ins) {
+    Mask active = w.paths[idx].mask;
+    Mask m = active;
     if (ins.has_pred) {
       Mask p = read_pred(w, ins, ins.pred);
       if (ins.pred_negated) p = ~p;
@@ -393,20 +429,29 @@ class Interpreter {
     }
 
     if (const auto* op = std::get_if<OpBra>(&ins.op)) {
-      exec_bra(w, *op, m);
+      exec_bra(w, idx, *op, m);
       return;
     }
     if (std::holds_alternative<OpRet>(ins.op)) {
-      exec_ret(w, m);
+      exec_ret(w, idx, m);
       return;
     }
     if (std::holds_alternative<OpBar>(ins.op)) {
       if (ins.has_pred) ctx_fail(ins, -1, Err::UnsupportedPtx, "predicated bar.sync is not supported");
-      if (!w.divergence.empty())
+      // Every live lane must arrive before the warp yields. Lanes still on
+      // other paths have a higher pc and will merge here first; if any path
+      // can never reach this barrier the kernel is malformed, and the step
+      // budget catches it rather than deadlocking silently.
+      if (w.paths.size() > 1) {
+        // Let the other paths run until they merge at this barrier.
+        w.paths[idx].pc = w.paths[idx].pc;  // stay put; a lower-pc path runs next
+        size_t other = select_other_runnable(w, idx);
+        if (other != idx) return;
         ctx_fail(ins, -1, Err::UnsupportedPtx,
-                 "bar.sync inside divergent control flow is not supported yet "
-                 "(the warp still has parked execution paths)");
-      ++w.pc;
+                 "bar.sync cannot be reached by every lane of the warp: some lanes are on a path "
+                 "that never arrives at this barrier");
+      }
+      ++w.paths[idx].pc;
       w.state = Warp::State::AtBarrier;
       return;
     }
@@ -420,36 +465,47 @@ class Interpreter {
         throw;
       }
     }
-    ++w.pc;
+    ++w.paths[idx].pc;
   }
 
-  void exec_bra(Warp& w, const OpBra& op, Mask m) {
+  // Is there another path that can still run (a strictly lower pc)? Used to
+  // decide whether a barrier is merely waiting for stragglers.
+  size_t select_other_runnable(Warp& w, size_t idx) {
+    for (size_t i = 0; i < w.paths.size(); ++i)
+      if (i != idx && w.paths[i].pc < w.paths[idx].pc) return i;
+    return idx;
+  }
+
+  void exec_bra(Warp& w, size_t idx, const OpBra& op, Mask m) {
     Mask taken = m;
-    Mask fallthrough = w.active & ~taken;
+    Mask fallthrough = w.paths[idx].mask & ~taken;
     if (taken == 0) {
-      ++w.pc;
+      ++w.paths[idx].pc;
       return;
     }
     if (fallthrough == 0) {
-      w.pc = op.target;
+      w.paths[idx].pc = op.target;
       return;
     }
-    w.divergence.emplace_back(w.pc + 1, fallthrough);
-    w.active = taken;
-    w.pc = op.target;
+    // Diverge: both halves become live paths, and whichever has the lower pc
+    // runs first. They merge again as soon as they reach the same pc.
+    size_t fall_pc = w.paths[idx].pc + 1;
+    w.paths[idx].pc = op.target;
+    w.paths[idx].mask = taken;
+    w.paths.push_back({fall_pc, fallthrough});
   }
 
-  void exec_ret(Warp& w, Mask m) {
+  void exec_ret(Warp& w, size_t idx, Mask m) {
     w.exited |= m;
-    w.active &= ~m;
-    ++w.pc;  // predicated ret: surviving lanes continue at the next instruction
-    while (w.active == 0 && !w.divergence.empty()) {
-      auto [pc, mask] = w.divergence.back();
-      w.divergence.pop_back();
-      w.pc = pc;
-      w.active = mask & ~w.exited;
+    Mask survivors = w.paths[idx].mask & ~m;
+    if (survivors == 0) {
+      w.paths.erase(w.paths.begin() + static_cast<long>(idx));
+    } else {
+      // A predicated ret retires some lanes; the rest carry on.
+      w.paths[idx].mask = survivors;
+      ++w.paths[idx].pc;
     }
-    if (w.active == 0) w.state = Warp::State::Done;
+    if (w.paths.empty()) w.state = Warp::State::Done;
   }
 
   void dispatch(Warp& w, const BlockCtx& ctx, const Instr& ins, Mask m) {
@@ -722,6 +778,25 @@ class Interpreter {
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
+    if (const auto* op = std::get_if<OpMulHi>(&ins.op)) {
+      Lanes _s_a; const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b; const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes r{};
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) r[lane] = mul_hi(op->ty, a[lane], b[lane]);
+      write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpMadHi>(&ins.op)) {
+      Lanes _s_a; const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b; const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c; const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
+      Lanes r{};
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) r[lane] = mul_hi(op->ty, a[lane], b[lane]) + c[lane];
+      write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
     if (const auto* op = std::get_if<OpMadWide>(&ins.op)) {
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
@@ -940,6 +1015,34 @@ class Interpreter {
     throw Error::make(Err::Internal, "interpreter has no handler for a parsed instruction");
   }
 
+  // High half of a same-width product. 64-bit needs a 128-bit intermediate.
+  static uint64_t mul_hi(Type ty, uint64_t a, uint64_t b) {
+    if (ty.bits == 64) {
+      if (ty.is_signed()) {
+        __int128 prod = static_cast<__int128>(static_cast<int64_t>(a)) *
+                        static_cast<__int128>(static_cast<int64_t>(b));
+        return static_cast<uint64_t>(static_cast<unsigned __int128>(prod) >> 64);
+      }
+      unsigned __int128 prod = static_cast<unsigned __int128>(a) * static_cast<unsigned __int128>(b);
+      return static_cast<uint64_t>(prod >> 64);
+    }
+    uint32_t bits = ty.bits;
+    if (ty.is_signed()) {
+      int64_t x = static_cast<int64_t>(sign_extend(a, bits));
+      int64_t y = static_cast<int64_t>(sign_extend(b, bits));
+      return mask_to_bits(static_cast<uint64_t>((x * y) >> bits), bits);
+    }
+    uint64_t prod = mask_to_bits(a, bits) * mask_to_bits(b, bits);
+    return mask_to_bits(prod >> bits, bits);
+  }
+
+  static uint64_t sign_extend(uint64_t v, uint32_t bits) {
+    if (bits >= 64) return v;
+    uint64_t sign = 1ull << (bits - 1);
+    v = mask_to_bits(v, bits);
+    return (v & sign) ? (v | ~((sign << 1) - 1)) : v;
+  }
+
   static uint64_t bfe(Type ty, uint64_t a, uint64_t bpos, uint64_t clen) {
     uint32_t pos = static_cast<uint32_t>(bpos) & 0xFF;
     uint32_t len = static_cast<uint32_t>(clen) & 0xFF;
@@ -1077,7 +1180,8 @@ class Interpreter {
 
   void exec_wmma_store(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaStore& op,
                        Mask m) {
-    const Lanes& base = addr_base(w, ctx, ins, op.addr);
+    Lanes _s_base;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     Lanes _s_stride;
       const Lanes& stride = read_operand(w, ctx, ins, op.stride, _s_stride);
     uint64_t sbase = space_base(op.space);
@@ -1281,11 +1385,16 @@ class Interpreter {
 
   // ---- memory ops ----
 
-  // Address bases are always register names (the parser guarantees it for
-  // Base::Reg), so look the register up directly and alias the register file
-  // rather than routing through read_operand's scratch path.
-  const Lanes& addr_base(Warp& w, const BlockCtx& ctx, const Instr& ins, const Addr& a) {
+  // Resolves an address operand's base. Registers alias the register file
+  // directly; a named variable resolves through the symbol table into
+  // `scratch`.
+  const Lanes& addr_base(Warp& w, const BlockCtx& ctx, const Instr& ins, const Addr& a,
+                         Lanes& scratch) {
     (void)ctx;
+    if (a.base_kind == Addr::Base::Symbol) {
+      scratch.fill(resolve_symbol(ins, a.base));
+      return scratch;
+    }
     auto it = w.regs.find(a.base);
     if (it == w.regs.end())
       ctx_fail(ins, -1, Err::UninitializedRegister,
@@ -1314,7 +1423,8 @@ class Interpreter {
       }
       return;
     }
-    const Lanes& base = addr_base(w, ctx, ins, op.addr);
+    Lanes _s_base;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     uint64_t sbase = space_base(op.space);
     uint32_t va = size * static_cast<uint32_t>(n);  // vector accesses need vector alignment
     std::vector<Lanes> results(n);
@@ -1339,7 +1449,8 @@ class Interpreter {
       Lanes tmp;
       vals.push_back(read_operand(w, ctx, ins, src, tmp));
     }
-    const Lanes& base = addr_base(w, ctx, ins, op.addr);
+    Lanes _s_base;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     uint64_t sbase = space_base(op.space);
     uint32_t va = size * static_cast<uint32_t>(n);
     for (uint32_t lane = 0; lane < kWarpSize; ++lane)
@@ -1357,7 +1468,8 @@ class Interpreter {
     uint32_t size = op.ty.bytes();
     if (size != 4 && size != 8)
       ctx_fail(ins, -1, Err::UnsupportedPtx, "atomics are only implemented for 32/64-bit types");
-    const Lanes& base = addr_base(w, ctx, ins, op.addr);
+    Lanes _s_base;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     uint64_t sbase = space_base(op.space);
     Lanes _s_bv;
       const Lanes& bv = read_operand(w, ctx, ins, op.b, _s_bv);

@@ -188,6 +188,10 @@ vgpu_unit_test(test_runtime)
 vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
 vgpu_unit_test(test_telemetry)
+vgpu_unit_test(test_robustness)
+target_include_directories(test_robustness PRIVATE src/cuda)
+target_sources(test_robustness PRIVATE src/cuda/fatbin.cpp)
+target_link_libraries(test_robustness PRIVATE ${CMAKE_DL_LIBS})
 
 # The C harness: an "external application" built with a plain C compiler
 # against the documented ABI only (vgpu_cuda.h + libvgpucuda.so).

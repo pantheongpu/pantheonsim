@@ -98,31 +98,59 @@ std::vector<FatbinPtx> extract_ptx(const void* data) {
   if (magic != kFatbinMagic)
     throw Error::make(Err::InvalidValue, "not a fatbin image (bad magic; expected 0xBA55ED50)");
 
-  std::vector<FatbinPtx> out;
   ContainerHeader ch{};
   std::memcpy(&ch, p, sizeof ch);
-  const uint8_t* e = p + ch.header_size;
-  const uint8_t* end = e + ch.size;
-  while (e + sizeof(EntryHeader) <= end) {
+  if (ch.header_size < sizeof(ContainerHeader))
+    throw Error::make(Err::InvalidValue, "fatbin container header_size is ", ch.header_size,
+                      ", smaller than the header itself");
+  if (ch.size > kMaxFatbinBytes)
+    throw Error::make(Err::InvalidValue, "fatbin declares ", ch.size,
+                      " bytes, above the ", kMaxFatbinBytes, "-byte limit; image looks corrupt");
+
+  std::vector<FatbinPtx> out;
+  const uint8_t* const body = p + ch.header_size;
+  const uint8_t* const end = body + ch.size;
+  const uint8_t* e = body;
+  // Every iteration must advance strictly, so a zero-length entry cannot spin.
+  while (e < end) {
+    if (static_cast<uint64_t>(end - e) < sizeof(EntryHeader)) break;  // trailing padding
     EntryHeader eh{};
     std::memcpy(&eh, e, sizeof eh);
+    if (eh.header_size < sizeof(EntryHeader))
+      throw Error::make(Err::InvalidValue, "fatbin entry header_size is ", eh.header_size,
+                        ", smaller than the entry header");
+    if (static_cast<uint64_t>(end - e) < eh.header_size)
+      throw Error::make(Err::InvalidValue, "fatbin entry header runs past the end of the image");
     const uint8_t* payload = e + eh.header_size;
+    if (eh.padded_payload_size > static_cast<uint64_t>(end - payload))
+      throw Error::make(Err::InvalidValue, "fatbin entry payload (", eh.padded_payload_size,
+                        " bytes) runs past the end of the image");
+
     if (eh.kind == 1 /* PTX */) {
+      uint64_t size = eh.payload_size ? eh.payload_size : eh.padded_payload_size;
+      if (size > eh.padded_payload_size)
+        throw Error::make(Err::InvalidValue, "fatbin PTX payload_size (", size,
+                          ") exceeds its padded size (", eh.padded_payload_size, ")");
       FatbinPtx px;
       px.arch = eh.arch;
-      size_t size = eh.payload_size ? eh.payload_size : eh.padded_payload_size;
       if (eh.flags & kFlagZstd) {
-        px.text = decompress_zstd(payload, size);
+        px.text = decompress_zstd(payload, static_cast<size_t>(size));
       } else if (eh.flags & kFlagLz4) {
         throw Error::make(Err::Unsupported,
                           "LZ4-compressed fatbin PTX is not supported yet (zstd and uncompressed are)");
       } else {
-        px.text.assign(reinterpret_cast<const char*>(payload), size);
+        px.text.assign(reinterpret_cast<const char*>(payload), static_cast<size_t>(size));
       }
       while (!px.text.empty() && px.text.back() == '\0') px.text.pop_back();
       out.push_back(std::move(px));
     }
-    e = payload + eh.padded_payload_size;
+
+    const uint8_t* next = payload + eh.padded_payload_size;
+    if (next <= e)
+      throw Error::make(Err::InvalidValue,
+                        "fatbin entry does not advance (header_size and payload both zero); "
+                        "image is malformed");
+    e = next;
   }
   return out;
 }

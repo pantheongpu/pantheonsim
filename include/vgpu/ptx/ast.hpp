@@ -45,11 +45,13 @@ struct SymbolOperand { std::string name; };
 
 using Operand = std::variant<RegOperand, ImmInt, ImmFloatBits, SregOperand, SymbolOperand>;
 
-// A memory operand: [base + offset].
+// A memory operand: [base + offset]. The base may be a register, a kernel
+// parameter, a call-argument slot, or a variable named directly -- PTX allows
+// `st.shared.u32 [myvar+8], %r` without first materializing an address.
 struct Addr {
-  enum class Base { Reg, EntryParam, CallSlot };
+  enum class Base { Reg, EntryParam, CallSlot, Symbol };
   Base base_kind = Base::Reg;
-  std::string base;  // register / parameter / call-slot name
+  std::string base;
   int64_t offset = 0;
 };
 
@@ -108,6 +110,10 @@ struct OpIntBin { IntBinOp op; Type ty; std::string dst; Operand a, b; };
 struct OpMadLo { Type ty; std::string dst; Operand a, b, c; };
 struct OpMulWide { bool is_signed; std::string dst; Operand a, b; };  // 32x32 -> 64
 struct OpMadWide { bool is_signed; std::string dst; Operand a, b, c; };  // 32x32+64 -> 64
+// High half of a same-width multiply. Compilers emit these to turn integer
+// division by a constant into a multiply, so they show up in ordinary code.
+struct OpMulHi { Type ty; std::string dst; Operand a, b; };
+struct OpMadHi { Type ty; std::string dst; Operand a, b, c; };
 struct OpShf { bool left; bool wrap; std::string dst; Operand a, b, c; };  // funnel shift b:a
 struct OpFloatBin { FloatBinOp op; Type ty; std::string dst; Operand a, b; };
 struct OpFma { Type ty; std::string dst; Operand a, b, c; };
@@ -152,7 +158,7 @@ struct OpLdSlot { std::string slot; int64_t offset; Type ty; std::string dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall>;
 
