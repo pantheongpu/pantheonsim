@@ -44,7 +44,87 @@ std::vector<uint8_t> fatbin(uint64_t container_size, uint32_t entry_hdr, uint64_
   std::memcpy(b.data() + 32, &payload_size, 4);
   return b;
 }
+// Builds a complete PTX entry, optionally LZ4-compressed, with the extended
+// header that carries the uncompressed size.
+std::vector<uint8_t> ptx_fatbin(const std::vector<uint8_t>& payload, uint64_t flags,
+                                uint64_t uncompressed, uint32_t entry_hdr = 80) {
+  const uint64_t padded = (payload.size() + 7) / 8 * 8;
+  std::vector<uint8_t> b(64 + entry_hdr + padded + 64, 0);
+  uint32_t magic = 0xBA55ED50;
+  uint16_t ver = 1, hsz = 16;
+  uint64_t csize = entry_hdr + padded;
+  std::memcpy(b.data(), &magic, 4);
+  std::memcpy(b.data() + 4, &ver, 2);
+  std::memcpy(b.data() + 6, &hsz, 2);
+  std::memcpy(b.data() + 8, &csize, 8);
+  uint16_t kind = 1, ever = 257;
+  uint32_t psize = static_cast<uint32_t>(payload.size());
+  std::memcpy(b.data() + 16, &kind, 2);
+  std::memcpy(b.data() + 18, &ever, 2);
+  std::memcpy(b.data() + 20, &entry_hdr, 4);
+  std::memcpy(b.data() + 24, &padded, 8);
+  std::memcpy(b.data() + 32, &psize, 4);
+  std::memcpy(b.data() + 56, &flags, 8);
+  if (entry_hdr >= 64) std::memcpy(b.data() + 16 + 56, &uncompressed, 8);
+  std::memcpy(b.data() + 16 + entry_hdr, payload.data(), payload.size());
+  return b;
+}
+
+// A minimal LZ4 block: one all-literals sequence, then a token whose match
+// repeats what was just emitted. Enough to exercise both halves of the format.
+std::vector<uint8_t> lz4_block(const std::string& literals, int match_len, int offset) {
+  std::vector<uint8_t> out;
+  const size_t ll = literals.size();
+  out.push_back(static_cast<uint8_t>((ll < 15 ? ll : 15) << 4) |
+                static_cast<uint8_t>(match_len - 4 < 15 ? match_len - 4 : 15));
+  if (ll >= 15) {
+    size_t rest = ll - 15;
+    while (rest >= 255) { out.push_back(255); rest -= 255; }
+    out.push_back(static_cast<uint8_t>(rest));
+  }
+  out.insert(out.end(), literals.begin(), literals.end());
+  out.push_back(static_cast<uint8_t>(offset & 0xFF));
+  out.push_back(static_cast<uint8_t>(offset >> 8));
+  if (match_len - 4 >= 15) {
+    int rest = match_len - 4 - 15;
+    while (rest >= 255) { out.push_back(255); rest -= 255; }
+    out.push_back(static_cast<uint8_t>(rest));
+  }
+  return out;
+}
 }  // namespace
+
+// Every CUDA 12 toolkit LZ4-compresses the PTX it embeds; CUDA 13 moved to
+// zstd. A host with the older toolkit is the common case, so this path is not
+// optional -- it is how a binary built anywhere but this machine gets read.
+VTEST(lz4_compressed_fatbin_ptx_is_decompressed) {
+  const std::string literals = ".version 8.7\n.target sm_90\n";
+  const int match = 8, offset = 12;
+  auto block = lz4_block(literals, match, offset);
+  std::string expect = literals;
+  for (int i = 0; i < match; ++i) expect.push_back(expect[expect.size() - offset]);
+  auto image = ptx_fatbin(block, 0x2011, expect.size());
+  auto ptx = vgpu::cuda::extract_ptx(image.data());
+  VCHECK_EQ(ptx.size(), size_t{1});
+  VCHECK_EQ(ptx[0].text, expect);
+}
+
+VTEST(lz4_fatbin_with_a_lying_size_is_rejected) {
+  auto block = lz4_block("abcdefgh", 6, 4);
+  // Claims far more output than the block can produce.
+  auto image = ptx_fatbin(block, 0x2011, 4096);
+  auto err = VCAPTURE(Error, vgpu::cuda::extract_ptx(image.data()));
+  VCHECK(err.code() == Err::InvalidValue);
+  // A match reaching before the start of the output must not read out of bounds.
+  auto bad = lz4_block("ab", 6, 900);
+  auto image2 = ptx_fatbin(bad, 0x2011, 64);
+  auto err2 = VCAPTURE(Error, vgpu::cuda::extract_ptx(image2.data()));
+  VCHECK(err2.code() == Err::InvalidValue);
+  // An LZ4 entry whose header is too short to carry the uncompressed size.
+  auto image3 = ptx_fatbin(block, 0x2011, 0, 48);
+  auto err3 = VCAPTURE(Error, vgpu::cuda::extract_ptx(image3.data()));
+  VCHECK(err3.code() == Err::InvalidValue);
+}
 
 VTEST(malformed_fatbin_fails_cleanly) {
   // These used to hang or read far out of bounds. The loader APIs hand us a

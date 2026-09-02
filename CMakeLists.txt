@@ -93,7 +93,10 @@ add_custom_command(TARGET vgpucuda POST_BUILD
 # structs, so nvcc's own toolkit include is the only trustworthy source.
 find_program(VGPU_NVCC nvcc)
 if(VGPU_NVCC)
-  get_filename_component(_nvcc_bin "${VGPU_NVCC}" DIRECTORY)
+  # Resolve symlinks first: distributions put an nvcc symlink in /usr/bin, and
+  # deriving the toolkit root from that gives /usr, where no CUDA library lives.
+  get_filename_component(_nvcc_real "${VGPU_NVCC}" REALPATH)
+  get_filename_component(_nvcc_bin "${_nvcc_real}" DIRECTORY)
   get_filename_component(_cuda_root "${_nvcc_bin}" DIRECTORY)
   find_path(CUDA_ABI_INCLUDE driver_types.h
     PATHS "${_cuda_root}/include" "${_cuda_root}/targets/x86_64-linux/include"
@@ -113,7 +116,11 @@ endif()
 # installed, and fall back to the documented value if the library is absent.
 function(vgpu_toolkit_soversion _name _default _out)
   set(_found "")
-  foreach(_dir "${_cuda_root}/lib64" "${_cuda_root}/targets/x86_64-linux/lib" "${_cuda_root}/lib")
+  # The include directory that was actually accepted is the most reliable
+  # anchor: its sibling lib directories belong to the same toolkit.
+  get_filename_component(_inc_root "${CUDA_ABI_INCLUDE}" DIRECTORY)
+  foreach(_dir "${_cuda_root}/lib64" "${_cuda_root}/targets/x86_64-linux/lib" "${_cuda_root}/lib"
+               "${_inc_root}/lib64" "${_inc_root}/lib")
     file(GLOB _cands "${_dir}/lib${_name}.so.[0-9]*")
     foreach(_c IN LISTS _cands)
       if("${_c}" MATCHES "\\.so\\.([0-9]+)$")

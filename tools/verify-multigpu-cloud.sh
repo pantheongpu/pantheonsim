@@ -106,6 +106,12 @@ $SSH 'set -x
   ctest --test-dir build --output-on-failure 2>&1 | tail -5
   echo "===== CONFORMANCE (differential, against this machines GPUs) ====="
   tests/conformance/run_conformance.sh
+  # A remote failure is expensive to diagnose over another rental, so dump what
+  # each side actually printed when something did not match.
+  for f in "${TMPDIR:-/tmp}"/vgpu-conformance/*.virt.txt; do
+    [ -e "$f" ] || continue
+    echo "--- $(basename "$f")"; head -4 "$f"
+  done
   echo "===== NCCL ACROSS 8 PROCESSES (virtual rack) ====="
   tests/e2e/run_nccl_multiproc.sh 8
   echo "===== NCCL SINGLE-PROCESS GROUP, 8 VIRTUAL RANKS ====="

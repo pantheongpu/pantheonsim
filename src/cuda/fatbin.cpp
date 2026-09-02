@@ -62,6 +62,67 @@ const Zstd* zstd() {
   return (z.decompress && z.content_size && z.is_error) ? &z : nullptr;
 }
 
+// The LZ4 block format, which is what nvcc used before it moved to zstd -- so
+// every CUDA 12 toolkit produces it and any host with one needs this path.
+// Implemented here rather than dlopened: it is forty lines, the format is
+// frozen, and a fatbin is untrusted input that deserves bounds checks written
+// on purpose rather than inherited.
+//
+// A block is a sequence of: a token byte (high nibble = literal length, low
+// nibble = match length - 4), optional length-extension bytes (255 means
+// "keep reading"), the literals themselves, then a little-endian 16-bit
+// backward offset into the output produced so far. Matches may overlap the
+// current output position, so the copy has to be byte at a time.
+std::string decompress_lz4(const uint8_t* src, size_t src_size, size_t expected) {
+  std::string out;
+  out.reserve(expected);
+  size_t ip = 0;
+  auto need = [&](size_t n) {
+    if (src_size - ip < n)
+      throw Error::make(Err::InvalidValue, "fatbin LZ4 block ends mid-sequence");
+  };
+  auto read_length = [&](size_t base) {
+    size_t len = base;
+    if (base == 15) {
+      for (;;) {
+        need(1);
+        const uint8_t b = src[ip++];
+        len += b;
+        if (b != 255) break;
+        if (len > expected)
+          throw Error::make(Err::InvalidValue, "fatbin LZ4 length runs past the declared size");
+      }
+    }
+    return len;
+  };
+
+  while (ip < src_size) {
+    const uint8_t token = src[ip++];
+    const size_t literals = read_length(token >> 4);
+    need(literals);
+    if (out.size() + literals > expected)
+      throw Error::make(Err::InvalidValue, "fatbin LZ4 literals exceed the declared size");
+    out.append(reinterpret_cast<const char*>(src + ip), literals);
+    ip += literals;
+    if (ip >= src_size) break;   // the last sequence is literals only
+
+    need(2);
+    const size_t offset = static_cast<size_t>(src[ip]) | (static_cast<size_t>(src[ip + 1]) << 8);
+    ip += 2;
+    if (offset == 0 || offset > out.size())
+      throw Error::make(Err::InvalidValue, "fatbin LZ4 match offset points outside the output");
+    const size_t match = read_length(token & 0xF) + 4;   // minimum match is 4 bytes
+    if (out.size() + match > expected)
+      throw Error::make(Err::InvalidValue, "fatbin LZ4 match exceeds the declared size");
+    const size_t start = out.size() - offset;
+    for (size_t i = 0; i < match; ++i) out.push_back(out[start + i]);
+  }
+  if (out.size() != expected)
+    throw Error::make(Err::InvalidValue, "fatbin LZ4 produced ", out.size(), " bytes, header said ",
+                      expected);
+  return out;
+}
+
 std::string decompress_zstd(const uint8_t* src, size_t src_size) {
   const Zstd* z = zstd();
   if (!z)
@@ -136,8 +197,19 @@ std::vector<FatbinPtx> extract_ptx(const void* data) {
       if (eh.flags & kFlagZstd) {
         px.text = decompress_zstd(payload, static_cast<size_t>(size));
       } else if (eh.flags & kFlagLz4) {
-        throw Error::make(Err::Unsupported,
-                          "LZ4-compressed fatbin PTX is not supported yet (zstd and uncompressed are)");
+        // A compressed entry carries the uncompressed size in an extended
+        // header; without it there is nothing to size the output against.
+        if (eh.header_size < 64)
+          throw Error::make(Err::InvalidValue,
+                            "fatbin entry is LZ4-compressed but its header is too short to carry "
+                            "the uncompressed size");
+        uint64_t uncompressed = 0;
+        std::memcpy(&uncompressed, e + 56, sizeof uncompressed);
+        if (uncompressed == 0 || uncompressed > kMaxFatbinBytes)
+          throw Error::make(Err::InvalidValue, "fatbin LZ4 entry declares an uncompressed size of ",
+                            uncompressed, ", which is not usable");
+        px.text = decompress_lz4(payload, static_cast<size_t>(size),
+                                 static_cast<size_t>(uncompressed));
       } else {
         px.text.assign(reinterpret_cast<const char*>(payload), static_cast<size_t>(size));
       }
