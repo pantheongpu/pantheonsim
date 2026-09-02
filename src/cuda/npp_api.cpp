@@ -33,6 +33,16 @@
 
 #include <cuda_runtime.h>
 
+// The signal API's length parameter widened from int to size_t in NPP 13. A
+// definition that disagrees with the header is a compile error rather than a
+// silent mismatch -- the good outcome, but only if the type comes from the
+// header rather than being assumed.
+#if defined(NPP_VER_MAJOR) && NPP_VER_MAJOR >= 13
+using NppSignalLen = size_t;
+#else
+using NppSignalLen = int;
+#endif
+
 namespace {
 
 // Pitched images: row r begins `step` bytes into the image, and only the first
@@ -68,12 +78,15 @@ template <class T> void put_scalar(void* dev, T value) {
 inline double scale_by(double v, int scale_factor) {
   return scale_factor == 0 ? v : v * std::pow(2.0, -scale_factor);
 }
+// Round to nearest with ties to even, which is what NPP does -- measured, not
+// assumed: half-away-from-zero disagreed with hardware on exactly the values
+// that land on .5, and only on those.
 inline Npp8u sat8u(double v) {
-  const double r = std::round(v);
+  const double r = std::nearbyint(v);
   return static_cast<Npp8u>(r < 0 ? 0 : (r > 255 ? 255 : r));
 }
 inline Npp16u sat16u(double v) {
-  const double r = std::round(v);
+  const double r = std::nearbyint(v);
   return static_cast<Npp16u>(r < 0 ? 0 : (r > 65535 ? 65535 : r));
 }
 
@@ -138,7 +151,7 @@ VGPU_EXPORT void nppiFree(void* p) { cudaFree(p); }
 /* ---- signal memory ---- */
 
 #define VGPU_NPPS_MALLOC(SUFFIX, TYPE)                        \
-  VGPU_EXPORT TYPE* nppsMalloc_##SUFFIX(size_t n) {           \
+  VGPU_EXPORT TYPE* nppsMalloc_##SUFFIX(NppSignalLen n) {           \
     void* p = nullptr;                                        \
     if (cudaMalloc(&p, n * sizeof(TYPE)) != cudaSuccess) return nullptr; \
     return static_cast<TYPE*>(p);                             \
@@ -268,12 +281,25 @@ VGPU_NPP_BIN8U(Add, a + b)
 VGPU_NPP_BIN8U(Sub, b - a)      // documented as pSrc2 - pSrc1
 VGPU_NPP_BIN8U(Mul, a * b)
 VGPU_NPP_BIN8U(Div, b == 0 ? 0.0 : a / b)   // NPP divides pSrc2 by pSrc1... see below
-VGPU_NPP_BIN8U(AbsDiff, std::fabs(a - b))
 VGPU_NPP_BIN32F(Add, a + b)
 VGPU_NPP_BIN32F(Sub, b - a)
 VGPU_NPP_BIN32F(Mul, a * b)
 VGPU_NPP_BIN32F(Div, b == 0 ? 0.0 : a / b)
 VGPU_NPP_BIN32F(AbsDiff, std::fabs(a - b))
+
+// AbsDiff has no scale factor: the difference of two 8-bit values already fits.
+#define VGPU_NPP_ABSDIFF(SUFFIX, CH)                                                            \
+  VGPU_EXPORT NppStatus nppiAbsDiff_##SUFFIX(const Npp8u* s1, int ss1, const Npp8u* s2, int ss2,\
+                                             Npp8u* d, int ds, NppiSize roi) {                  \
+    return binop_8u(s1, ss1, s2, ss2, d, ds, roi, CH, 0,                                        \
+                    [](double a, double b) { return std::fabs(a - b); });                       \
+  }                                                                                             \
+  VGPU_NPP_CTX(NppStatus, nppiAbsDiff_##SUFFIX,                                                 \
+               (const Npp8u* s1, int ss1, const Npp8u* s2, int ss2, Npp8u* d, int ds,           \
+                NppiSize roi, NppStreamContext),                                                \
+               (s1, ss1, s2, ss2, d, ds, roi))
+VGPU_NPP_ABSDIFF(8u_C1R, 1)
+VGPU_NPP_ABSDIFF(8u_C3R, 3)
 
 // Bitwise operators have no scale factor and no saturation.
 #define VGPU_NPP_LOGIC(NAME, EXPR)                                                              \
@@ -660,7 +686,9 @@ VGPU_EXPORT NppStatus nppiFilterBox_8u_C1R(const Npp8u* s, Npp32s ss, Npp8u* d, 
       for (int my = 0; my < mask.height; ++my)
         for (int mx = 0; mx < mask.width; ++mx)
           acc += src[static_cast<size_t>(y + my) * w + (x + mx)];
-      dst[static_cast<size_t>(y) * roi.width + x] = sat8u(acc / n);
+      // FilterBox truncates rather than rounds: a window whose mean is exactly
+      // 3.5 comes back as 3 on hardware.
+      dst[static_cast<size_t>(y) * roi.width + x] = sat8u(std::floor(acc / n));
     }
   store_roi<Npp8u>(d, ds, roi.width, roi.height, dst);
   return NPP_SUCCESS;
@@ -692,7 +720,16 @@ VGPU_EXPORT NppStatus nppiFilter_32f_C1R(const Npp32f* s, Npp32s ss, Npp32f* d, 
   for (int y = 0; y < roi.height; ++y)
     for (int x = 0; x < roi.width; ++x) {
       double acc = 0;
-      // NPP applies the kernel as a convolution: the mask is reversed.
+      // The documented behaviour: a convolution, so the mask is reversed.
+      //
+      // This is the one entry point here whose hardware behaviour could not be
+      // reproduced. Probing NVIDIA's implementation with delta kernels shows a
+      // mapping that aliases mask positions -- k[1] and k[2] read the same
+      // source pixel, as do k[4], k[5], k[7] and k[8] -- which matches neither
+      // a convolution nor a correlation and which the documentation does not
+      // describe. Rather than encode a guess, this follows the documented
+      // definition, and the conformance suite deliberately does not claim a
+      // match for it. See docs/libraries.md.
       for (int my = 0; my < ksize.height; ++my)
         for (int mx = 0; mx < ksize.width; ++mx)
           acc += static_cast<double>(src[static_cast<size_t>(y + my) * w + (x + mx)]) *
@@ -757,3 +794,227 @@ VGPU_EXPORT NppStatus nppiMirror_8u_C1R(const Npp8u* s, int ss, Npp8u* d, int ds
 VGPU_NPP_CTX(NppStatus, nppiMirror_8u_C1R,
              (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize r, NppiAxis f, NppStreamContext),
              (s, ss, d, ds, r, f))
+
+// Resize maps destination pixels back into the source rectangle. NPP's factors
+// are the ratio of the two rectangles, and the sample point for a destination
+// pixel is its centre mapped back through that ratio.
+namespace {
+
+template <int CH>
+NppStatus resize_8u(const Npp8u* s, int ss, NppiSize src_size, NppiRect src_roi, Npp8u* d, int ds,
+                    NppiSize dst_size, NppiRect dst_roi, int interpolation) {
+  if (!s || !d) return NPP_NULL_POINTER_ERROR;
+  if (src_roi.width <= 0 || src_roi.height <= 0 || dst_roi.width <= 0 || dst_roi.height <= 0)
+    return NPP_SIZE_ERROR;
+  if (interpolation != NPPI_INTER_NN && interpolation != NPPI_INTER_LINEAR)
+    return NPP_INTERPOLATION_ERROR;
+  auto src = fetch_roi<Npp8u>(s, ss, src_size.width * CH, src_size.height);
+  auto dst = fetch_roi<Npp8u>(d, ds, dst_size.width * CH, dst_size.height);
+  const double fx = static_cast<double>(src_roi.width) / dst_roi.width;
+  const double fy = static_cast<double>(src_roi.height) / dst_roi.height;
+  auto at = [&](int y, int x, int c) -> double {
+    x = std::min(std::max(x, src_roi.x), src_roi.x + src_roi.width - 1);
+    y = std::min(std::max(y, src_roi.y), src_roi.y + src_roi.height - 1);
+    return src[(static_cast<size_t>(y) * src_size.width + x) * CH + c];
+  };
+  // Pixel centres: destination pixel x samples the source at
+  // (x + 0.5) * factor - 0.5, the usual convention and the one NPP's
+  // nearest-neighbour output agrees with.
+  //
+  // NPP's *bilinear* output does not follow it. Fitting the hardware result
+  // pixel by pixel shows the horizontal axis interpolating at pixel centres
+  // while the vertical axis samples rows exactly, with no blending at all --
+  // 2y for a factor of two, not 2y + 0.5. That is not a convention this can
+  // reproduce from the outside without guessing, so LINEAR here is the
+  // standard bilinear filter and the conformance suite does not claim it
+  // matches. See docs/libraries.md.
+  for (int y = 0; y < dst_roi.height; ++y)
+    for (int x = 0; x < dst_roi.width; ++x) {
+      const double sx = (x + 0.5) * fx + src_roi.x - 0.5;
+      const double sy = (y + 0.5) * fy + src_roi.y - 0.5;
+      for (int c = 0; c < CH; ++c) {
+        double v;
+        if (interpolation == NPPI_INTER_NN) {
+          v = at(static_cast<int>(std::nearbyint(sy)), static_cast<int>(std::nearbyint(sx)), c);
+        } else {
+          // Interpolate in single precision: NPP does, and at a truncating
+          // final step the difference between float and double shows up as an
+          // occasional pixel one count out.
+          const int x0 = static_cast<int>(std::floor(sx)), y0 = static_cast<int>(std::floor(sy));
+          const float ax = static_cast<float>(sx - x0), ay = static_cast<float>(sy - y0);
+          v = static_cast<float>(at(y0, x0, c)) * (1 - ax) * (1 - ay) +
+              static_cast<float>(at(y0, x0 + 1, c)) * ax * (1 - ay) +
+              static_cast<float>(at(y0 + 1, x0, c)) * (1 - ax) * ay +
+              static_cast<float>(at(y0 + 1, x0 + 1, c)) * ax * ay;
+        }
+        // Truncation again, matching the box filter and hardware.
+        dst[(static_cast<size_t>(y + dst_roi.y) * dst_size.width + (x + dst_roi.x)) * CH + c] =
+            sat8u(std::floor(v));
+      }
+    }
+  store_roi<Npp8u>(d, ds, dst_size.width * CH, dst_size.height, dst);
+  return NPP_SUCCESS;
+}
+
+}  // namespace
+
+VGPU_EXPORT NppStatus nppiResize_8u_C1R(const Npp8u* s, int ss, NppiSize ssz, NppiRect sroi,
+                                        Npp8u* d, int ds, NppiSize dsz, NppiRect droi, int interp) {
+  return resize_8u<1>(s, ss, ssz, sroi, d, ds, dsz, droi, interp);
+}
+VGPU_EXPORT NppStatus nppiResize_8u_C3R(const Npp8u* s, int ss, NppiSize ssz, NppiRect sroi,
+                                        Npp8u* d, int ds, NppiSize dsz, NppiRect droi, int interp) {
+  return resize_8u<3>(s, ss, ssz, sroi, d, ds, dsz, droi, interp);
+}
+VGPU_NPP_CTX(NppStatus, nppiResize_8u_C1R,
+             (const Npp8u* s, int ss, NppiSize ssz, NppiRect sroi, Npp8u* d, int ds, NppiSize dsz,
+              NppiRect droi, int i, NppStreamContext),
+             (s, ss, ssz, sroi, d, ds, dsz, droi, i))
+VGPU_NPP_CTX(NppStatus, nppiResize_8u_C3R,
+             (const Npp8u* s, int ss, NppiSize ssz, NppiRect sroi, Npp8u* d, int ds, NppiSize dsz,
+              NppiRect droi, int i, NppStreamContext),
+             (s, ss, ssz, sroi, d, ds, dsz, droi, i))
+
+/* ---- signal processing (npps) ---- */
+
+namespace {
+template <class T> std::vector<T> fetch_signal(const T* s, size_t n) {
+  std::vector<T> h(n);
+  if (n) cudaMemcpy(h.data(), s, n * sizeof(T), cudaMemcpyDeviceToHost);
+  return h;
+}
+template <class T> void store_signal(T* d, const std::vector<T>& h) {
+  if (!h.empty()) cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
+}
+}  // namespace
+
+#define VGPU_NPPS_BIN(NAME, EXPR)                                                        \
+  VGPU_EXPORT NppStatus npps##NAME##_32f(const Npp32f* s1, const Npp32f* s2, Npp32f* d,  \
+                                         NppSignalLen n) {                               \
+    if (!s1 || !s2 || !d) return NPP_NULL_POINTER_ERROR;                                 \
+    auto a = fetch_signal(s1, n);                                                        \
+    auto b = fetch_signal(s2, n);                                                        \
+    std::vector<Npp32f> o(n);                                                            \
+    for (size_t i = 0; i < n; ++i) {                                                     \
+      const double x = a[i], y = b[i];                                                   \
+      o[i] = static_cast<Npp32f>(EXPR);                                                  \
+    }                                                                                    \
+    store_signal(d, o);                                                                  \
+    return NPP_SUCCESS;                                                                  \
+  }                                                                                      \
+  VGPU_NPP_CTX(NppStatus, npps##NAME##_32f,                                              \
+               (const Npp32f* s1, const Npp32f* s2, Npp32f* d, NppSignalLen n, NppStreamContext), \
+               (s1, s2, d, n))
+// npps follows the same convention as nppi: Sub is pSrc2 - pSrc1.
+VGPU_NPPS_BIN(Add, x + y)
+VGPU_NPPS_BIN(Sub, y - x)
+VGPU_NPPS_BIN(Mul, x * y)
+VGPU_NPPS_BIN(Div, x == 0.0 ? 0.0 : y / x)
+
+#define VGPU_NPPS_CONST(NAME, EXPR)                                                      \
+  VGPU_EXPORT NppStatus npps##NAME##_32f(const Npp32f* s, Npp32f v, Npp32f* d, NppSignalLen n) {\
+    if (!s || !d) return NPP_NULL_POINTER_ERROR;                                         \
+    auto a = fetch_signal(s, n);                                                         \
+    std::vector<Npp32f> o(n);                                                            \
+    for (size_t i = 0; i < n; ++i) {                                                     \
+      const double x = a[i], k = v;                                                      \
+      o[i] = static_cast<Npp32f>(EXPR);                                                  \
+    }                                                                                    \
+    store_signal(d, o);                                                                  \
+    return NPP_SUCCESS;                                                                  \
+  }                                                                                      \
+  VGPU_NPP_CTX(NppStatus, npps##NAME##_32f,                                              \
+               (const Npp32f* s, Npp32f v, Npp32f* d, NppSignalLen n, NppStreamContext),       \
+               (s, v, d, n))
+VGPU_NPPS_CONST(AddC, x + k)
+VGPU_NPPS_CONST(SubC, x - k)
+VGPU_NPPS_CONST(MulC, x * k)
+VGPU_NPPS_CONST(DivC, k == 0.0 ? 0.0 : x / k)
+
+#define VGPU_NPPS_UNARY(NAME, EXPR)                                                      \
+  VGPU_EXPORT NppStatus npps##NAME##_32f(const Npp32f* s, Npp32f* d, NppSignalLen n) {         \
+    if (!s || !d) return NPP_NULL_POINTER_ERROR;                                         \
+    auto a = fetch_signal(s, n);                                                         \
+    std::vector<Npp32f> o(n);                                                            \
+    for (size_t i = 0; i < n; ++i) {                                                     \
+      const double x = a[i];                                                             \
+      o[i] = static_cast<Npp32f>(EXPR);                                                  \
+    }                                                                                    \
+    store_signal(d, o);                                                                  \
+    return NPP_SUCCESS;                                                                  \
+  }                                                                                      \
+  VGPU_NPP_CTX(NppStatus, npps##NAME##_32f,                                              \
+               (const Npp32f* s, Npp32f* d, NppSignalLen n, NppStreamContext), (s, d, n))
+VGPU_NPPS_UNARY(Abs, std::fabs(x))
+VGPU_NPPS_UNARY(Sqr, x * x)
+VGPU_NPPS_UNARY(Sqrt, std::sqrt(x))
+VGPU_NPPS_UNARY(Ln, std::log(x))
+VGPU_NPPS_UNARY(Exp, std::exp(x))
+
+VGPU_EXPORT NppStatus nppsSet_32f(Npp32f value, Npp32f* d, NppSignalLen n) {
+  if (!d) return NPP_NULL_POINTER_ERROR;
+  std::vector<Npp32f> o(n, value);
+  store_signal(d, o);
+  return NPP_SUCCESS;
+}
+VGPU_EXPORT NppStatus nppsZero_32f(Npp32f* d, NppSignalLen n) { return nppsSet_32f(0.0f, d, n); }
+VGPU_EXPORT NppStatus nppsCopy_32f(const Npp32f* s, Npp32f* d, NppSignalLen n) {
+  if (!s || !d) return NPP_NULL_POINTER_ERROR;
+  store_signal(d, fetch_signal(s, n));
+  return NPP_SUCCESS;
+}
+VGPU_NPP_CTX(NppStatus, nppsSet_32f, (Npp32f v, Npp32f* d, NppSignalLen n, NppStreamContext), (v, d, n))
+VGPU_NPP_CTX(NppStatus, nppsZero_32f, (Npp32f* d, NppSignalLen n, NppStreamContext), (d, n))
+VGPU_NPP_CTX(NppStatus, nppsCopy_32f, (const Npp32f* s, Npp32f* d, NppSignalLen n, NppStreamContext),
+             (s, d, n))
+
+#define VGPU_NPPS_BUFSIZE(NAME)                                                          \
+  VGPU_EXPORT NppStatus npps##NAME##GetBufferSize_32f(NppSignalLen n, size_t* bytes) {         \
+    if (!bytes) return NPP_NULL_POINTER_ERROR;                                           \
+    *bytes = 4096;                                                                       \
+    return NPP_SUCCESS;                                                                  \
+  }                                                                                      \
+  VGPU_NPP_CTX(NppStatus, npps##NAME##GetBufferSize_32f, (NppSignalLen n, size_t* b, NppStreamContext), \
+               (n, b))
+VGPU_NPPS_BUFSIZE(Sum)
+VGPU_NPPS_BUFSIZE(Mean)
+VGPU_NPPS_BUFSIZE(Max)
+VGPU_NPPS_BUFSIZE(Min)
+VGPU_NPPS_BUFSIZE(StdDev)
+
+VGPU_EXPORT NppStatus nppsSum_32f(const Npp32f* s, NppSignalLen n, Npp32f* sum, Npp8u*) {
+  if (!s || !sum) return NPP_NULL_POINTER_ERROR;
+  auto h = fetch_signal(s, n);
+  double acc = 0;
+  for (Npp32f v : h) acc += v;
+  put_scalar<Npp32f>(sum, static_cast<Npp32f>(acc));
+  return NPP_SUCCESS;
+}
+VGPU_EXPORT NppStatus nppsMean_32f(const Npp32f* s, NppSignalLen n, Npp32f* mean, Npp8u*) {
+  if (!s || !mean) return NPP_NULL_POINTER_ERROR;
+  auto h = fetch_signal(s, n);
+  double acc = 0;
+  for (Npp32f v : h) acc += v;
+  put_scalar<Npp32f>(mean, static_cast<Npp32f>(n ? acc / n : 0.0));
+  return NPP_SUCCESS;
+}
+VGPU_EXPORT NppStatus nppsMax_32f(const Npp32f* s, NppSignalLen n, Npp32f* mx, Npp8u*) {
+  if (!s || !mx) return NPP_NULL_POINTER_ERROR;
+  auto h = fetch_signal(s, n);
+  Npp32f best = h.empty() ? 0.0f : h[0];
+  for (Npp32f v : h) best = std::max(best, v);
+  put_scalar<Npp32f>(mx, best);
+  return NPP_SUCCESS;
+}
+VGPU_EXPORT NppStatus nppsMin_32f(const Npp32f* s, NppSignalLen n, Npp32f* mn, Npp8u*) {
+  if (!s || !mn) return NPP_NULL_POINTER_ERROR;
+  auto h = fetch_signal(s, n);
+  Npp32f best = h.empty() ? 0.0f : h[0];
+  for (Npp32f v : h) best = std::min(best, v);
+  put_scalar<Npp32f>(mn, best);
+  return NPP_SUCCESS;
+}
+VGPU_NPP_CTX(NppStatus, nppsSum_32f, (const Npp32f* s, NppSignalLen n, Npp32f* o, Npp8u* b, NppStreamContext), (s, n, o, b))
+VGPU_NPP_CTX(NppStatus, nppsMean_32f, (const Npp32f* s, NppSignalLen n, Npp32f* o, Npp8u* b, NppStreamContext), (s, n, o, b))
+VGPU_NPP_CTX(NppStatus, nppsMax_32f, (const Npp32f* s, NppSignalLen n, Npp32f* o, Npp8u* b, NppStreamContext), (s, n, o, b))
+VGPU_NPP_CTX(NppStatus, nppsMin_32f, (const Npp32f* s, NppSignalLen n, Npp32f* o, Npp8u* b, NppStreamContext), (s, n, o, b))

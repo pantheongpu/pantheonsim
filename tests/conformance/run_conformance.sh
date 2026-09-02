@@ -37,6 +37,12 @@ for src in "$root"/tests/conformance/*.cu; do
   grep -q "cusparse" "$src" && libs="$libs -lcusparse"
   grep -q "cusolver" "$src" && libs="$libs -lcusolver"
   grep -q "nvrtc" "$src" && libs="$libs -lnvrtc -lcuda"
+  # NPP is eleven libraries; a test that touches any of it links them all.
+  grep -q "npp" "$src" && libs="$libs -lnppc -lnppial -lnppicc -lnppidei -lnppif -lnppig -lnppim -lnppist -lnppisu -lnppitc -lnpps"
+  if grep -q "nvjpeg" "$src"; then
+    libs="$libs -lnvjpeg"
+    inc="$inc -DVGPU_DATA_DIR=\"$root/tests/conformance/data\""
+  fi
   if [[ "$name" == "multi_gpu" ]]; then
     # Both sides must see the same number of devices for the outputs to be
     # comparable; the virtual rack is sized to match the physical machine.
@@ -95,15 +101,20 @@ for src in "$root"/tests/conformance/*.cu; do
   fi
   # The real side links against whichever reference library it found; the
   # virtual side links against the shim, which carries the same sonames.
-  nvcc -std=c++14 -arch="$VGPU_CONF_ARCH" -Wno-deprecated-gpu-targets \
+  nvcc -std=c++17 -arch="$VGPU_CONF_ARCH" -Wno-deprecated-gpu-targets \
        -Xcompiler -Wno-deprecated-declarations $inc "$src" \
-       -o "$out/$name.real" ${reallib:+-L$reallib} $libs 2>/dev/null
-  nvcc -std=c++14 -arch="$VGPU_CONF_ARCH" -Wno-deprecated-gpu-targets \
+       -o "$out/$name.real" ${reallib:+-L$reallib} $libs 2>"$out/$name.real.build.log"
+  nvcc -std=c++17 -arch="$VGPU_CONF_ARCH" -Wno-deprecated-gpu-targets \
        -Xcompiler -Wno-deprecated-declarations -cudart shared $inc "$src" \
-       -o "$out/$name.virt" -L"$shim" $libs 2>/dev/null
+       -o "$out/$name.virt" -L"$shim" $libs 2>"$out/$name.virt.build.log"
   env VGPU_QUIET=1 VGPU_GPU="$VGPU_CONF_GPU" VGPU_VRAM_MB=256 LD_LIBRARY_PATH="$shim" \
     "${env_virt[@]}" timeout 300 "$out/$name.virt" > "$out/$name.virt.txt" 2>&1
   vrc=$?
+  if [[ ! -x "$out/$name.virt" ]]; then
+    echo "FAIL  $name: did not compile"
+    head -5 "$out/$name.virt.build.log" | sed 's/^/        /'
+    fail=1; continue
+  fi
   if [[ $vrc -ne 0 ]] || grep -q "LAUNCHFAIL\|ALLOCFAIL" "$out/$name.virt.txt"; then
     echo "FAIL  $name: VirtualGPU did not complete"
     grep -m3 -E "error \[|LAUNCHFAIL" "$out/$name.virt.txt" | sed 's/^/        /'

@@ -27,9 +27,16 @@ static int g_bad = 0;
 static float contrib(int rank, int i) { return 1.0f + rank + 0.25f * (i % 7); }
 
 static void check(const char* tag, const std::vector<float>& got, const std::vector<float>& want) {
+  // Relative, not absolute: a product across eight ranks reaches five figures,
+  // where single precision cannot resolve 1e-5 at all. The reference is summed
+  // in double here and in float on the device, so the comparison has to scale
+  // with the magnitude or it fails on arithmetic that is perfectly correct.
   double err = 0;
   size_t n = got.size() < want.size() ? got.size() : want.size();
-  for (size_t i = 0; i < n; ++i) err = std::fmax(err, std::fabs(got[i] - want[i]));
+  for (size_t i = 0; i < n; ++i) {
+    const double scale = std::fmax(1.0, std::fabs(want[i]));
+    err = std::fmax(err, std::fabs(got[i] - want[i]) / scale);
+  }
   const bool ok = got.size() == want.size() && err <= 1e-5;
   if (!ok) ++g_bad;
   double sum = 0; for (float v : got) sum += v;

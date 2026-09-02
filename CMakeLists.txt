@@ -220,6 +220,7 @@ if(CUDA_ABI_INCLUDE)
     "cusparse:12:cusparse_api"
     "cusolver:12:cusolver_api"
     "nvrtc:13:nvrtc_api"
+    "nvjpeg:13:nvjpeg_api"
   )
   foreach(_entry IN LISTS _vgpu_libs)
     string(REPLACE ":" ";" _parts "${_entry}")
@@ -242,6 +243,31 @@ if(CUDA_ABI_INCLUDE)
       COMMAND ${CMAKE_COMMAND} -E create_symlink "../lib${_lib}.so.${_ver}.0"
               "${CMAKE_BINARY_DIR}/shim/lib${_lib}.so"
       COMMENT "Creating ${_lib} shim symlinks (soname lib${_lib}.so.${_ver})")
+  endforeach()
+
+  # ---------------------------------------------------------------------------
+  # NPP. NVIDIA splits it across eleven shared objects that share one API
+  # surface, so one source is built into each under its own soname. The symbols
+  # are identical in every copy and ELF resolves a name to a single definition
+  # process-wide, so the duplication costs disk and nothing else.
+  # ---------------------------------------------------------------------------
+  set(_vgpu_npp_libs nppc nppial nppicc nppidei nppif nppig nppim nppist nppisu nppitc npps)
+  foreach(_npp IN LISTS _vgpu_npp_libs)
+    vgpu_toolkit_soversion(${_npp} 13 _nppver)
+    vgpu_version_script(${_npp} ${_nppver} _nppmap)
+    add_library(vgpu${_npp} SHARED src/cuda/npp_api.cpp)
+    target_link_libraries(vgpu${_npp} PRIVATE vgpu vgpucudart)
+    target_include_directories(vgpu${_npp} PRIVATE ${CUDA_ABI_INCLUDE})
+    set_target_properties(vgpu${_npp} PROPERTIES
+      OUTPUT_NAME ${_npp} SOVERSION ${_nppver} VERSION ${_nppver}.0)
+    target_link_options(vgpu${_npp} PRIVATE "-Wl,--version-script=${_nppmap}")
+    add_custom_command(TARGET vgpu${_npp} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink "../lib${_npp}.so.${_nppver}.0"
+              "${CMAKE_BINARY_DIR}/shim/lib${_npp}.so.${_nppver}"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink "../lib${_npp}.so.${_nppver}.0"
+              "${CMAKE_BINARY_DIR}/shim/lib${_npp}.so"
+      COMMENT "Creating ${_npp} shim symlinks (soname lib${_npp}.so.${_nppver})")
   endforeach()
 
   # ---------------------------------------------------------------------------

@@ -9,6 +9,24 @@ nvcc -cudart shared app.cu -o app -lcublas -lcudnn -lcufft
 LD_LIBRARY_PATH=build/shim ./app
 ```
 
+Binaries built by any CUDA 12 or 13 toolkit work: the PTX nvcc embeds is LZ4
+compressed by CUDA 12 and zstd compressed by CUDA 13, and both are read here.
+
+## nvJPEG: a codec, not a wrapper
+
+There is no JPEG library in this repository to delegate to, so nvJPEG's half of
+the work is a baseline codec written against ITU-T T.81: marker parsing,
+Huffman decoding, dequantisation, an inverse DCT, chroma upsampling and colour
+conversion on the way in; the forward transform, quality-scaled quantisation
+and the Annex K Huffman tables on the way out.
+
+Header facts are exact and compared exactly -- component count, chroma
+subsampling, per-component dimensions for 4:4:4, 4:2:0 and grayscale files. The
+pixels are not bit-identical and cannot be: the standard does not specify the
+inverse DCT, so two correct decoders differ by about a count per pixel. The
+conformance test compares statistics at a precision that rounding cannot move,
+which is the honest meaning of "the same image".
+
 | library | soname | what it covers |
 | --- | --- | --- |
 | CUDA driver | `libcuda.so.1` | contexts, modules, memory, launches |
@@ -23,6 +41,8 @@ LD_LIBRARY_PATH=build/shim ./app
 | cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR, symmetric eigen, SVD |
 | NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
+| NPP | `libnppc.so.13` and ten siblings | image and signal primitives |
+| nvJPEG | `libnvjpeg.so.13` | baseline JPEG decode and encode |
 | NVENC | `libnvidia-encode.so.1` | video encode |
 
 ## Why the math runs on the host
@@ -58,6 +78,13 @@ output. Anything that differs is a bug in this implementation.
 | `cusolver_factorizations` | Cholesky, LU (pivots included), QR and every solve bit-identical; one f32 eigenvalue differs by ~1e‑6 relative |
 | `nccl_collectives` | all 24 bit-identical at two ranks on two physical GPUs |
 | `nvrtc_jit` | identical: compile a kernel at run time, load the PTX, launch it, same numbers |
+| `npp_ops` | all 48 bit-identical, across arithmetic, logic, conversion, colour, statistics, morphology and resizing |
+| `nvjpeg_codec` | all 24 identical: header parsing exactly, pixels to within the IDCT's own tolerance |
+| `multi_gpu` | all 13 identical to two physical GPUs |
+
+The library majors in that table are the ones this machine has; the build
+reads each soname off the installed toolkit, so on a CUDA 12 host the same
+shims come out as `libcublas.so.12`, `libcufft.so.11` and so on.
 
 Some of those numbers came out of the hardware rather than the documentation.
 cuDNN rejects `CUDNN_ACTIVATION_IDENTITY` from `cudnnActivationForward`, and
@@ -108,6 +135,25 @@ reason. `cublasGemmStridedBatchedEx` and `cublasHgemm` go through the same
 path, and all of it is bit-identical to hardware on operands that the narrow
 formats represent exactly.
 
+## Two NPP entry points that do not match, and why they say so
+
+Everything in the NPP subset is bit-identical to hardware except two, and both
+are excluded from the conformance comparison rather than quietly claimed:
+
+- **`nppiFilter_32f_C1R`** (general convolution). Probing NVIDIA's
+  implementation with delta kernels gives a mask-to-source mapping that aliases
+  positions -- kernel elements 1 and 2 read the same source pixel, as do 4, 5, 7
+  and 8 -- which is neither a convolution nor a correlation and is not what the
+  documentation describes. VirtualGPU implements the documented convolution.
+- **`nppiResize` with `NPPI_INTER_LINEAR`**. Fitting the hardware output pixel
+  by pixel shows the horizontal axis interpolating at pixel centres while the
+  vertical axis samples rows exactly, with no blending at all. Nearest-neighbour
+  matches and is compared; bilinear here is the standard filter.
+
+Both are usable and both are documented as approximations. Getting an answer
+that is *close* to NVIDIA's is not the same as getting NVIDIA's, and this file
+is where the difference is written down.
+
 ## NVRTC: the compiler is the compiler
 
 NVRTC turns a string of CUDA C++ into PTX at run time. That is a C++ compiler,
@@ -149,7 +195,14 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
 - **NVRTC**: CUBIN, LTO-IR and OptiX-IR output (SASS and vendor bitcode, neither
   of which VirtualGPU can execute — ask for PTX), precompiled headers, time
   traces.
-- No NPP or nvJPEG.
+- **NPP**: a chosen subset -- allocation, per-pixel arithmetic and logic, data
+  exchange, colour conversion, thresholding, statistics, box filtering, 3x3
+  morphology, mirroring, resizing, and the signal-processing equivalents. The
+  rest of NPP's several thousand entry points are absent rather than
+  approximated, so a program that needs more fails at link time with a name.
+- **nvJPEG**: baseline sequential DCT only. Progressive JPEG, 12-bit samples,
+  arithmetic coding and lossless mode are rejected by name; so are the batched
+  and device-side decode APIs and the transcoding entry points.
 
 Add them the way the PTX subset grew: hit one, implement it, prove it against
 hardware.

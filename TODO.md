@@ -121,7 +121,7 @@ past that it stops being caution and starts being a false negative.
   (see docs/telemetry.md for why the stock nvidia-smi binary cannot be used).
 
 **Vendor libraries.** cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE,
-cuSOLVER, NCCL and NVRTC are implemented under their real sonames, each verified
+cuSOLVER, NCCL, NVRTC, NPP and nvJPEG are implemented under their real sonames, each verified
 against NVIDIA's own library on a physical GPU: cuDNN, cuFFT and cuSPARSE are
 bit-identical on every value the conformance suite reports, cuSOLVER on
 everything but one f32 eigenvalue, and NCCL on all 24 values at two ranks
@@ -133,7 +133,7 @@ NVRTC works by invoking the toolkit's own nvcc, which runs on the host and
 needs no GPU -- so runtime-compiled kernels (CuPy, Numba, Triton, inductor)
 reach the interpreter through the driver API like any other PTX.
 
-Not yet: NPP, nvJPEG, `nvidia-smi topo -m`, DCGM. PyTorch also ships thousands of its own kernels,
+Not yet: `nvidia-smi topo -m`, DCGM. PyTorch also ships thousands of its own kernels,
 which would run on the interpreter, so `import torch` finding a usable GPU is
 still a separate question from library coverage.
 
