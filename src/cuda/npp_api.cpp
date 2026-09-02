@@ -33,15 +33,13 @@
 
 #include <cuda_runtime.h>
 
-// The signal *operations* took an int length before NPP 13 and a size_t after;
-// the allocators took size_t all along. A definition that disagrees with the
-// header is a compile error rather than a silent mismatch -- the good outcome,
-// but only if the type comes from the header rather than being assumed.
-#if defined(NPP_VER_MAJOR) && NPP_VER_MAJOR >= 13
+// The signal API's length parameter is size_t in every toolkit this has been
+// built against -- NPP 12.8 and 13.0 both. An earlier attempt guarded it on the
+// major version and made NPP 12.8 fail to compile, which is the useful failure
+// mode: a definition that disagrees with the header is a compile error, not a
+// silent mismatch. The alias stays so the day it does change there is one place
+// to change it.
 using NppSignalLen = size_t;
-#else
-using NppSignalLen = int;
-#endif
 
 namespace {
 
