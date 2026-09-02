@@ -176,10 +176,16 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPciInfo_v3(nvmlDevice_t device, nvmlPciInf
   const auto* d = sample(device);
   if (!d || !pci) return NVML_ERROR_INVALID_ARGUMENT;
   std::memset(pci, 0, sizeof *pci);
-  std::snprintf(pci->busId, sizeof pci->busId, "%s", d->bus_id);
-  std::snprintf(pci->busIdLegacy, sizeof pci->busIdLegacy, "%s", d->bus_id);
   unsigned int domain = 0, bus = 0, dev_id = 0;
   std::sscanf(d->bus_id, "%x:%x:%x", &domain, &bus, &dev_id);
+  // The two fields are different formats, not one string copied twice: busId
+  // carries an eight-digit domain in a 32-byte buffer, busIdLegacy a four-digit
+  // one in a 16-byte buffer. Copying the full id into the legacy field
+  // truncated it, which is what NVML_DEVICE_PCI_BUS_ID_LEGACY_FMT exists to
+  // prevent.
+  std::snprintf(pci->busId, sizeof pci->busId, NVML_DEVICE_PCI_BUS_ID_FMT, domain, bus, dev_id);
+  std::snprintf(pci->busIdLegacy, sizeof pci->busIdLegacy, NVML_DEVICE_PCI_BUS_ID_LEGACY_FMT,
+                domain, bus, dev_id);
   pci->domain = domain;
   pci->bus = bus;
   pci->device = dev_id;

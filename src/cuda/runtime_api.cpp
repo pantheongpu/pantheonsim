@@ -17,6 +17,12 @@
 // dependency-free; this shim is an optional target (see CMakeLists.txt).
 //
 // Everything is synchronous and deterministic, matching the engine.
+// The vendor header is included so every entry point below is checked against
+// NVIDIA's own declaration at compile time. Without it the shim's signatures
+// were only as right as they looked, and several were not: cudaGraphInstantiate
+// still had its CUDA 11 arity, and half the graph and capture calls took int
+// where the API takes an enum or an opaque handle.
+#include <cuda_runtime_api.h>
 #include <driver_types.h>
 #include <vector_types.h>
 
@@ -479,16 +485,18 @@ VGPU_EXPORT cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp* prop, int dev
   return cudaGetDeviceProperties(prop, device);
 }
 
-VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, int attr, int device) {
+VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, int device) {
   return guard("cudaDeviceGetAttribute", [&](State& s) {
     if (!value) return cudaErrorInvalidValue;
     if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
     const vgpu::DeviceProfile& p = s.rt->device(device).profile();
+    // Named rather than numbered: these used to be the ordinals of
+    // cudaDeviceAttr, which is a table that only has to be renumbered once.
     switch (attr) {
-      case 1: *value = static_cast<int>(p.limits.max_threads_per_block); break;  // MaxThreadsPerBlock
-      case 8: *value = static_cast<int>(p.limits.shared_mem_per_block); break;   // MaxSharedPerBlock
-      case 10: *value = static_cast<int>(p.warp_size); break;                    // WarpSize
-      case 16: *value = static_cast<int>(p.limits.multiprocessors); break;       // MultiProcessorCount
+      case cudaDevAttrMaxThreadsPerBlock: *value = static_cast<int>(p.limits.max_threads_per_block); break;
+      case cudaDevAttrMaxSharedMemoryPerBlock: *value = static_cast<int>(p.limits.shared_mem_per_block); break;
+      case cudaDevAttrWarpSize: *value = static_cast<int>(p.warp_size); break;
+      case cudaDevAttrMultiProcessorCount: *value = static_cast<int>(p.limits.multiprocessors); break;
       case 39: *value = static_cast<int>(p.limits.max_threads_per_sm); break;  // MaxThreads/SM
       case 82: *value = static_cast<int>(p.limits.registers_per_sm); break;    // MaxRegistersPerSM
       case 75: *value = p.cc_major; break;                                       // ComputeCapabilityMajor
@@ -911,14 +919,14 @@ bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, vo
   return true;
 }
 
-VGPU_EXPORT cudaError_t cudaStreamBeginCapture(cudaStream_t stream, int mode) {
+VGPU_EXPORT cudaError_t cudaStreamBeginCapture(cudaStream_t stream, cudaStreamCaptureMode mode) {
   (void)mode;
   std::lock_guard<std::mutex> lock(g_graph_mu);
   g_capturing[reinterpret_cast<void*>(stream)] = std::make_unique<GraphRec>();
   return cudaSuccess;
 }
 
-VGPU_EXPORT cudaError_t cudaStreamEndCapture(cudaStream_t stream, void** pGraph) {
+VGPU_EXPORT cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* pGraph) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto it = g_capturing.find(reinterpret_cast<void*>(stream));
   if (it == g_capturing.end()) return cudaErrorStreamCaptureImplicit;
@@ -926,30 +934,31 @@ VGPU_EXPORT cudaError_t cudaStreamEndCapture(cudaStream_t stream, void** pGraph)
   g_capturing.erase(it);
   void* handle = graph.get();
   g_graphs[handle] = std::move(graph);
-  if (pGraph) *pGraph = handle;
+  if (pGraph) *pGraph = static_cast<cudaGraph_t>(handle);
   return cudaSuccess;
 }
 
-VGPU_EXPORT cudaError_t cudaGraphInstantiate(void** pExec, void* graph, void*, char*, size_t) {
+VGPU_EXPORT cudaError_t cudaGraphInstantiate(cudaGraphExec_t* pExec, cudaGraph_t graph,
+                                             unsigned long long) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
-  auto it = g_graphs.find(graph);
+  auto it = g_graphs.find(static_cast<void*>(graph));
   if (it == g_graphs.end()) return cudaErrorInvalidValue;
   auto exec = std::make_unique<GraphRec>(*it->second);  // snapshot at instantiate time
   void* handle = exec.get();
   g_graph_execs[handle] = std::move(exec);
-  if (pExec) *pExec = handle;
+  if (pExec) *pExec = static_cast<cudaGraphExec_t>(handle);
   return cudaSuccess;
 }
-VGPU_EXPORT cudaError_t cudaGraphInstantiateWithFlags(void** pExec, void* graph,
-                                                      unsigned long long) {
-  return cudaGraphInstantiate(pExec, graph, nullptr, nullptr, 0);
+VGPU_EXPORT cudaError_t cudaGraphInstantiateWithFlags(cudaGraphExec_t* pExec, cudaGraph_t graph,
+                                                      unsigned long long flags) {
+  return cudaGraphInstantiate(pExec, graph, flags);
 }
 
-VGPU_EXPORT cudaError_t cudaGraphLaunch(void* exec, cudaStream_t stream) {
+VGPU_EXPORT cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t stream) {
   std::vector<RecordedLaunch> replay;
   {
     std::lock_guard<std::mutex> lock(g_graph_mu);
-    auto it = g_graph_execs.find(exec);
+    auto it = g_graph_execs.find(static_cast<void*>(exec));
     if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
     replay = it->second->launches;  // copy so we can run without holding the lock
   }
@@ -962,17 +971,20 @@ VGPU_EXPORT cudaError_t cudaGraphLaunch(void* exec, cudaStream_t stream) {
   return cudaSuccess;
 }
 
-VGPU_EXPORT cudaError_t cudaGraphDestroy(void* graph) {
+VGPU_EXPORT cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
-  g_graphs.erase(graph);
+  g_graphs.erase(static_cast<void*>(graph));
   return cudaSuccess;
 }
-VGPU_EXPORT cudaError_t cudaGraphExecDestroy(void* exec) {
+VGPU_EXPORT cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
-  g_graph_execs.erase(exec);
+  g_graph_execs.erase(static_cast<void*>(exec));
   return cudaSuccess;
 }
-VGPU_EXPORT cudaError_t cudaStreamIsCapturing(cudaStream_t stream, int* status) {
-  if (status) *status = capture_target(stream) ? 1 : 0;
+VGPU_EXPORT cudaError_t cudaStreamIsCapturing(cudaStream_t stream,
+                                              cudaStreamCaptureStatus* status) {
+  if (status)
+    *status = capture_target(stream) ? cudaStreamCaptureStatusActive
+                                     : cudaStreamCaptureStatusNone;
   return cudaSuccess;
 }

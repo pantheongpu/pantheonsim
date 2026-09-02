@@ -131,6 +131,10 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescDestroy(cublasLtMatmulDesc_t d) {
   delete reinterpret_cast<MatmulDesc*>(d);
   return CUBLAS_STATUS_SUCCESS;
 }
+// The caller declares how many bytes its buffer holds, and these entry points
+// used to ignore that and copy a fixed width either way -- reading past a
+// caller's buffer on set, writing past it on get. The size is part of the
+// contract, so it is checked.
 VGPU_EXPORT cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t d,
                                                           cublasLtMatmulDescAttributes_t attr,
                                                           const void* buf, size_t bytes) {
@@ -138,30 +142,48 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t d
   auto* m = reinterpret_cast<MatmulDesc*>(d);
   switch (attr) {
     case CUBLASLT_MATMUL_DESC_TRANSA:
+      if (bytes < sizeof(int32_t)) return CUBLAS_STATUS_INVALID_VALUE;
       std::memcpy(&m->transa, buf, sizeof(int32_t));
       return CUBLAS_STATUS_SUCCESS;
     case CUBLASLT_MATMUL_DESC_TRANSB:
+      if (bytes < sizeof(int32_t)) return CUBLAS_STATUS_INVALID_VALUE;
       std::memcpy(&m->transb, buf, sizeof(int32_t));
       return CUBLAS_STATUS_SUCCESS;
     case CUBLASLT_MATMUL_DESC_EPILOGUE:
+      if (bytes < sizeof(int32_t)) return CUBLAS_STATUS_INVALID_VALUE;
       std::memcpy(&m->epilogue, buf, sizeof(int32_t));
       return CUBLAS_STATUS_SUCCESS;
     case CUBLASLT_MATMUL_DESC_BIAS_POINTER:
+      if (bytes < sizeof(void*)) return CUBLAS_STATUS_INVALID_VALUE;
       std::memcpy(&m->bias, buf, sizeof(void*));
       return CUBLAS_STATUS_SUCCESS;
     default:
-      (void)bytes;
       return CUBLAS_STATUS_SUCCESS;  // attributes we do not model are inert
   }
 }
 VGPU_EXPORT cublasStatus_t cublasLtMatmulDescGetAttribute(cublasLtMatmulDesc_t d,
                                                           cublasLtMatmulDescAttributes_t attr,
-                                                          void* buf, size_t, size_t* written) {
+                                                          void* buf, size_t bytes,
+                                                          size_t* written) {
   if (!known(d) || !buf) return CUBLAS_STATUS_INVALID_VALUE;
   auto* m = reinterpret_cast<MatmulDesc*>(d);
-  int32_t v = attr == CUBLASLT_MATMUL_DESC_TRANSA   ? m->transa
-              : attr == CUBLASLT_MATMUL_DESC_TRANSB ? m->transb
-                                                    : m->epilogue;
+  // The bias attribute is a pointer, not an int32. Returning the epilogue for
+  // everything that was not a transpose selector meant asking for the bias
+  // pointer got four bytes of an unrelated enum.
+  if (attr == CUBLASLT_MATMUL_DESC_BIAS_POINTER) {
+    if (bytes < sizeof(void*)) return CUBLAS_STATUS_INVALID_VALUE;
+    std::memcpy(buf, &m->bias, sizeof(void*));
+    if (written) *written = sizeof(void*);
+    return CUBLAS_STATUS_SUCCESS;
+  }
+  int32_t v = 0;
+  switch (attr) {
+    case CUBLASLT_MATMUL_DESC_TRANSA: v = m->transa; break;
+    case CUBLASLT_MATMUL_DESC_TRANSB: v = m->transb; break;
+    case CUBLASLT_MATMUL_DESC_EPILOGUE: v = m->epilogue; break;
+    default: return CUBLAS_STATUS_NOT_SUPPORTED;   // rather than a plausible wrong value
+  }
+  if (bytes < sizeof v) return CUBLAS_STATUS_INVALID_VALUE;
   std::memcpy(buf, &v, sizeof v);
   if (written) *written = sizeof v;
   return CUBLAS_STATUS_SUCCESS;

@@ -200,6 +200,30 @@ int main() {
     }
   }
 
+  if (nranks > 1) {  // Two messages to the same peer inside one group.
+    // They are matched in order, so the second must not overwrite the first --
+    // which is exactly what a single buffer per peer would do.
+    const size_t half = N / 2;
+    for (int i = 0; i < nranks; ++i) load(i, N);
+    NK(ncclGroupStart());
+    for (int i = 0; i < nranks; ++i) {
+      const int next = (i + 1) % nranks, prev = (i + nranks - 1) % nranks;
+      NK(ncclSend(r[i].send, half, ncclFloat, next, comms[i], r[i].stream));
+      NK(ncclSend(r[i].send + half, N - half, ncclFloat, next, comms[i], r[i].stream));
+      NK(ncclRecv(r[i].recv, half, ncclFloat, prev, comms[i], r[i].stream));
+      NK(ncclRecv(r[i].recv + half, N - half, ncclFloat, prev, comms[i], r[i].stream));
+      (void)prev;
+    }
+    NK(ncclGroupEnd());
+    for (int i = 0; i < nranks; ++i) {
+      const int prev = (i + nranks - 1) % nranks;
+      std::vector<float> want(N);
+      for (size_t k = 0; k < N; ++k) want[k] = contrib(prev, (int)k);
+      char tag[64]; snprintf(tag, sizeof(tag), "pipelined send/recv r%d", i);
+      check(tag, grab(i, N), want);
+    }
+  }
+
   {  // Integer and reduced-precision payloads go down the same path.
     std::vector<int*> si(nranks), ri(nranks);
     for (int i = 0; i < nranks; ++i) {

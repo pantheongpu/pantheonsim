@@ -439,6 +439,21 @@ VGPU_EXPORT CUresult cuCtxCreate_v2(CUcontext* pctx, unsigned int flags, CUdevic
 VGPU_EXPORT CUresult cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice dev) {
   return cuCtxCreate_v2(pctx, flags, dev);
 }
+// CUDA 13's header maps cuCtxCreate to cuCtxCreate_v4, which takes a parameter
+// block for green contexts and execution affinity. Without this symbol a
+// program built against that toolkit fails to load at all -- the plain name it
+// never calls is no help. The parameter block is not supported, and says so
+// rather than being ignored.
+VGPU_EXPORT CUresult cuCtxCreate_v3(CUcontext* pctx, void* exec_affinity_params, int num_params,
+                                    unsigned int flags, CUdevice dev) {
+  if (exec_affinity_params && num_params > 0) return CUDA_ERROR_NOT_SUPPORTED;
+  return cuCtxCreate_v2(pctx, flags, dev);
+}
+VGPU_EXPORT CUresult cuCtxCreate_v4(CUcontext* pctx, void* ctx_create_params, unsigned int flags,
+                                    CUdevice dev) {
+  if (ctx_create_params) return CUDA_ERROR_NOT_SUPPORTED;
+  return cuCtxCreate_v2(pctx, flags, dev);
+}
 
 VGPU_EXPORT CUresult cuCtxDestroy_v2(CUcontext ctx) {
   return api("cuCtxDestroy", true, false, [&](ShimState& s) {
@@ -1030,6 +1045,11 @@ VGPU_EXPORT CUresult cuEventElapsedTime(float* ms, void* start, void* end) {
     *ms = static_cast<float>(ns / 1e6);
     return CUDA_SUCCESS;
   });
+}
+// Same story as cuCtxCreate: CUDA 13 renames this one too, and a program built
+// there resolves the versioned name, not the plain one.
+VGPU_EXPORT CUresult cuEventElapsedTime_v2(float* ms, void* start, void* end) {
+  return cuEventElapsedTime(ms, start, end);
 }
 
 /* ---- context odds and ends static cudart asks about ---- */

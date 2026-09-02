@@ -147,16 +147,17 @@ struct Rendezvous {
   std::string base;      // path prefix shared by every rank
   Mapping meta_map;
   Meta* meta = nullptr;
-  std::mutex mu;         // guards the per-rank writer maps below
+  std::mutex mu;         // guards the per-rank writer map below
   std::unordered_map<int, Mapping*> writers;   // rank -> my own data file
-  std::unordered_map<std::string, Mapping*> p2p_writers;
   ~Rendezvous() {
     for (auto& [k, v] : writers) delete v;
-    for (auto& [k, v] : p2p_writers) delete v;
   }
   std::string rank_path(int r) const { return base + ".r" + std::to_string(r); }
-  std::string p2p_path(int s, int d) const {
-    return base + ".p" + std::to_string(s) + "-" + std::to_string(d);
+  // One file per message rather than one per pair: a group may post several
+  // sends to the same peer before any of them is received, and a single slot
+  // would have the second overwrite the first.
+  std::string p2p_path(int s, int d, uint64_t seq) const {
+    return base + ".p" + std::to_string(s) + "-" + std::to_string(d) + "." + std::to_string(seq);
   }
 };
 
@@ -437,14 +438,6 @@ Mapping* writer_for(Rendezvous* rz, int rank, size_t want) {
   return it->second->open_write(rz->rank_path(rank), want) ? it->second : nullptr;
 }
 
-Mapping* p2p_writer_for(Rendezvous* rz, int src, int dst, size_t want) {
-  const std::string key = std::to_string(src) + "-" + std::to_string(dst);
-  std::lock_guard<std::mutex> l(rz->mu);
-  auto it = rz->p2p_writers.find(key);
-  if (it == rz->p2p_writers.end()) it = rz->p2p_writers.emplace(key, new Mapping()).first;
-  return it->second->open_write(rz->p2p_path(src, dst), want) ? it->second : nullptr;
-}
-
 // How many bytes this rank publishes for the given op.
 size_t deposit_bytes(const Op& op) {
   const size_t es = type_size(op.dt);
@@ -462,17 +455,23 @@ ncclResult_t deposit(Op& op) {
   if (op.kind == Kind::Recv) return ncclSuccess;  // receivers publish nothing
 
   if (op.kind == Kind::Send) {
-    Mapping* m = p2p_writer_for(c->rz, c->rank, op.peer, bytes ? bytes : 1);
-    if (!m) return ncclSystemError;
+    // The message number this send is: the file it writes is named for it, so
+    // a second send to the same peer cannot overwrite an unread first.
+    const uint64_t seq =
+        c->rz->meta->posted[c->rank][op.peer].load(std::memory_order_acquire) + 1;
+    Mapping m;
+    if (!m.open_write(c->rz->p2p_path(c->rank, op.peer, seq), bytes ? bytes : 1))
+      return ncclSystemError;
     {
       DeviceGuard g(c->cuda_dev);
       cudaStreamSynchronize(op.stream);
-      if (bytes && cudaMemcpy(m->addr, op.send, bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
+      if (bytes && cudaMemcpy(m.addr, op.send, bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
         return ncclUnhandledCudaError;
     }
-    msync(m->addr, m->len, MS_ASYNC);
+    msync(m.addr, m.len, MS_SYNC);
+    m.reset();   // close before publishing, so a reader never sees a short file
     c->rz->meta->bytes[c->rank][op.peer].store(bytes, std::memory_order_release);
-    c->rz->meta->posted[c->rank][op.peer].fetch_add(1, std::memory_order_release);
+    c->rz->meta->posted[c->rank][op.peer].store(seq, std::memory_order_release);
     return ncclSuccess;
   }
 
@@ -516,19 +515,25 @@ ncclResult_t collect(Op& op) {
                   "a matching ncclSend", c->rank))
       return ncclTimeout;
     const size_t bytes = op.count * es;
-    const size_t sent = meta->bytes[op.peer][c->rank].load(std::memory_order_acquire);
-    if (sent != bytes) {
-      std::fprintf(stderr, "[vgpu] nccl: rank %d expected %zu bytes from rank %d, sender posted %zu\n",
-                   c->rank, bytes, op.peer, sent);
+    Mapping m;
+    // The file's own length is the message length, so a size disagreement is
+    // caught here rather than trusted from a shared counter that a later send
+    // may already have moved on.
+    const std::string path = c->rz->p2p_path(op.peer, c->rank, want_msgs);
+    if (!m.open_read(path, bytes)) {
+      std::fprintf(stderr,
+                   "[vgpu] nccl: rank %d expected %zu bytes as message %llu from rank %d, and the "
+                   "sender did not write that much\n",
+                   c->rank, bytes, (unsigned long long)want_msgs, op.peer);
       return ncclInvalidUsage;
     }
-    Mapping m;
-    if (!m.open_read(c->rz->p2p_path(op.peer, c->rank), bytes)) return ncclSystemError;
     {
       DeviceGuard g(c->cuda_dev);
       if (cudaMemcpy(op.recv, m.addr, bytes, cudaMemcpyHostToDevice) != cudaSuccess)
         return ncclUnhandledCudaError;
     }
+    m.reset();
+    unlink(path.c_str());   // the message has been consumed; do not accumulate files
     meta->taken[op.peer][c->rank].store(want_msgs, std::memory_order_release);
     return ncclSuccess;
   }

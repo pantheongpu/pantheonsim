@@ -108,7 +108,10 @@ struct BitReader {
     --count;
     return (buf >> count) & 1;
   }
+  // A Huffman table in a corrupt file can decode to a symbol asking for far
+  // more bits than an int holds. JPEG never needs more than 16.
   int bits(int n) {
+    if (n <= 0 || n > 16) { hit_marker = true; return 0; }
     int v = 0;
     for (int i = 0; i < n; ++i) v = (v << 1) | bit();
     return v;
@@ -129,7 +132,18 @@ int huff_decode(BitReader& br, const HuffTable& t) {
 
 // The sign convention of JPEG's variable-length integers: values whose top bit
 // is clear are negative.
-int extend(int v, int n) { return (n && v < (1 << (n - 1))) ? v - (1 << n) + 1 : v; }
+int extend(int v, int n) {
+  if (n <= 0 || n > 16) return 0;   // the caller has already rejected the symbol
+  return v < (1 << (n - 1)) ? v - (1 << n) + 1 : v;
+}
+
+// A DCT coefficient fits comfortably in 16 bits for any real image; clamping
+// keeps a corrupt file from overflowing the dequantisation multiply, which is
+// signed and therefore undefined rather than merely wrong.
+int clamp_coefficient(int v) {
+  constexpr int kLimit = 1 << 20;
+  return v < -kLimit ? -kLimit : (v > kLimit ? kLimit : v);
+}
 
 // Straightforward separable inverse DCT. Slower than the fast integer variants
 // and, unlike them, exact to double precision -- which is the right trade for a
@@ -218,9 +232,16 @@ nvjpegStatus_t parse_and_decode(const uint8_t* data, size_t len, Frame* f, bool 
           f->comps[c].tq = seg[8 + c * 3];
           if (f->comps[c].h < 1 || f->comps[c].h > 4 || f->comps[c].v < 1 || f->comps[c].v > 4)
             return NVJPEG_STATUS_BAD_JPEG;
+          // Selectors index fixed four-entry tables; the file chooses the value.
+          if (f->comps[c].tq > 3) return NVJPEG_STATUS_BAD_JPEG;
           f->hmax = std::max(f->hmax, f->comps[c].h);
           f->vmax = std::max(f->vmax, f->comps[c].v);
         }
+        // A header can declare 65535x65535 with four components, which is
+        // 17 GB of planes. Refuse it here rather than in the allocator.
+        if (f->width <= 0 || f->height <= 0 ||
+            static_cast<int64_t>(f->width) * f->height > 268435456LL)
+          return NVJPEG_STATUS_BAD_JPEG;
         f->mcu_w = f->hmax * 8;
         f->mcu_h = f->vmax * 8;
         f->mcus_x = (f->width + f->mcu_w - 1) / f->mcu_w;
@@ -292,6 +313,7 @@ nvjpegStatus_t parse_and_decode(const uint8_t* data, size_t len, Frame* f, bool 
           if (!found) return NVJPEG_STATUS_BAD_JPEG;
           found->td = seg[2 + s * 2] >> 4;
           found->ta = seg[2 + s * 2] & 0xF;
+          if (found->td > 3 || found->ta > 3) return NVJPEG_STATUS_BAD_JPEG;
           scan.push_back(found);
         }
         BitReader br{data + i + seglen, data + len};
@@ -318,8 +340,12 @@ nvjpegStatus_t parse_and_decode(const uint8_t* data, size_t len, Frame* f, bool 
                   const HuffTable& act = f->ac[c->ta];
                   if (!dct.present || !act.present) return NVJPEG_STATUS_BAD_JPEG;
                   const int t = huff_decode(br, dct);
+                  if (t > 16) return NVJPEG_STATUS_BAD_JPEG;
                   const int diff = t ? extend(br.bits(t), t) : 0;
-                  c->dc_pred += diff;
+                  // Coefficients are bounded in a well-formed file; in a
+                  // corrupt one the predictor would otherwise run away and
+                  // overflow the multiply below.
+                  c->dc_pred = clamp_coefficient(c->dc_pred + diff);
                   block[0] = c->dc_pred * f->quant[c->tq][0];
                   for (int k = 1; k < 64;) {
                     const int rs = huff_decode(br, act);
@@ -331,7 +357,8 @@ nvjpegStatus_t parse_and_decode(const uint8_t* data, size_t len, Frame* f, bool 
                     }
                     k += r;
                     if (k > 63) break;
-                    block[kZigZag[k]] = extend(br.bits(sbits), sbits) * f->quant[c->tq][k];
+                    block[kZigZag[k]] =
+                        clamp_coefficient(extend(br.bits(sbits), sbits)) * f->quant[c->tq][k];
                     ++k;
                   }
                   const int px = (mx * c->h + bx) * 8, py = (my * c->v + by) * 8;
