@@ -54,6 +54,7 @@ const OsChoice kOsChoices[] = {
 
 struct Config {
   std::string gpu = "nvidia/h100";
+  std::string command;   // -c: run this instead of an interactive shell
   int count = 1;
   long long vram_mb = 0;  // 0 = use the profile's own capacity
   std::string cuda = "12.4";
@@ -372,6 +373,7 @@ int cmd_shell(const std::vector<std::string>& args) {
     else if (a == "--hostname") c.hostname = next();
     else if (a == "--load") c.load = std::atof(next().c_str());
     else if (a == "--no-isolate") c.isolate = false;
+    else if (a == "-c" || a == "--command") c.command = next();
     else if (a == "--no-prompt" || a == "-y") prompt = false;
     else if (a == "--os") {
       std::string want = next();
@@ -439,6 +441,12 @@ int cmd_shell(const std::vector<std::string>& args) {
                                      // while the generated files say otherwise.
                                      "--os", std::string(c.os.id) + ":" + c.os.version_id,
                                      "--vram-mb", std::to_string(profile.vram_bytes / (1024 * 1024))};
+    // -c has to survive the re-exec, or an isolated scripted session silently
+    // becomes an interactive one and exits on the first EOF.
+    if (!c.command.empty()) {
+      argv.push_back("-c");
+      argv.push_back(c.command);
+    }
     std::vector<char*> cargv;
     for (auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
     cargv.push_back(nullptr);
@@ -475,6 +483,18 @@ int cmd_shell(const std::vector<std::string>& args) {
     // tools and install scripts check -- appear for the simulated driver.
     ok = bind(s.root + "/proc/driver", "/proc/driver") || ok;
     ok = bind(s.root + "/sys/class/drm", "/sys/class/drm") || ok;
+    // Bind the session's nvcc over the toolkit's own. PATH order is not enough
+    // on its own: build systems routinely put the CUDA bin directory in front
+    // of whatever the caller set -- pantheon.py does exactly that -- and would
+    // then get the unwrapped compiler and a statically linked runtime, which
+    // cannot talk to a simulated driver. Inside this namespace the wrapper wins
+    // wherever nvcc is invoked from.
+    for (const char* dir : {"/usr/local/cuda/bin", "/usr/local/cuda-13.0/bin",
+                            "/usr/local/cuda-12.0/bin", "/opt/cuda/bin", "/usr/bin"}) {
+      const std::string target = std::string(dir) + "/nvcc";
+      struct stat st{};
+      if (::stat(target.c_str(), &st) == 0) ok = bind(s.bin + "/nvcc", target) || ok;
+    }
     isolated = ok;
   }
 
@@ -508,6 +528,7 @@ int cmd_shell(const std::vector<std::string>& args) {
   const char* old_ld = std::getenv("LD_LIBRARY_PATH");
   setenv("LD_LIBRARY_PATH", (shim + (old_ld ? std::string(":") + old_ld : "")).c_str(), 1);
 
+  if (c.command.empty()) {
   std::printf("\n");
   std::printf("  Simulated machine ready\n");
   std::printf("    GPUs     : %d x %s (%s each)\n", c.count, profile.model.c_str(),
@@ -522,6 +543,7 @@ int cmd_shell(const std::vector<std::string>& args) {
   std::printf("\n  Try: nvidia-smi | rocm-smi | rocm_agent_enumerator | lspci | dmesg | uname -a\n");
   std::printf("       vgpu smi --explain   (what is measured vs modelled)\n");
   std::printf("  Type 'exit' to end the session.\n\n");
+  }
   std::fflush(stdout);
 
   const char* shell = std::getenv("SHELL");
@@ -542,6 +564,14 @@ int cmd_shell(const std::vector<std::string>& args) {
 
   pid_t pid = ::fork();
   if (pid == 0) {
+    if (!c.command.empty()) {
+      // Non-interactive: run one command in the same simulated machine and
+      // exit with its status, so a build or a test suite can be driven from a
+      // script rather than typed at the prompt.
+      ::execl(shell, shell, "--rcfile", rcfile.c_str(), "-c", c.command.c_str(), nullptr);
+      ::execl("/bin/sh", "sh", "-c", c.command.c_str(), nullptr);
+      _exit(127);
+    }
     ::execl(shell, shell, "--rcfile", rcfile.c_str(), "-i", nullptr);
     ::execl("/bin/sh", "sh", "-i", nullptr);
     _exit(127);
@@ -554,6 +584,7 @@ int cmd_shell(const std::vector<std::string>& args) {
   // tools and system files behind in /tmp.
   if (s.dir.rfind("/tmp/vgpu-session-", 0) == 0)
     std::system(("rm -rf '" + s.dir + "' 2>/dev/null").c_str());
-  std::printf("\n  Session ended. Simulated %d x %s.\n", c.count, profile.model.c_str());
+  if (c.command.empty())
+    std::printf("\n  Session ended. Simulated %d x %s.\n", c.count, profile.model.c_str());
   return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }

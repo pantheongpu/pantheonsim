@@ -1331,6 +1331,25 @@ const void* dark_table_for(const unsigned char* uuid) {
 
 VGPU_EXPORT CUresult cuGetExportTable(const void** table, const void* uuid) {
   if (!table || !uuid) return CUDA_ERROR_INVALID_VALUE;
+  // Only a statically linked CUDA runtime asks for these: the shared runtime
+  // never touches them, because VirtualGPU's libcudart answers instead. A
+  // static runtime is NVIDIA's own, living inside the binary and reaching the
+  // driver through this undocumented table -- it gets a little further and
+  // then refuses with cudaErrorSoftwareValidityNotEstablished, which reaches
+  // the program as "integrity checks failed" on its first CUDA call and
+  // explains nothing. Say what is happening once, while there is still time
+  // for it to be useful.
+  static std::once_flag warned;
+  std::call_once(warned, [] {
+    if (std::getenv("VGPU_QUIET") && std::getenv("VGPU_QUIET")[0] == '1') return;
+    std::fprintf(stderr,
+                 "[vgpu] this program links the CUDA runtime statically, which cannot run on a "
+                 "simulated driver.\n"
+                 "       Rebuild with 'nvcc -cudart shared', or build inside 'vgpu shell', which "
+                 "supplies an nvcc that adds it.\n"
+                 "       Without that the next CUDA call fails with error 103, \"integrity checks "
+                 "failed\".\n");
+  });
   const unsigned char* u = static_cast<const unsigned char*>(uuid);
   const void* t = dark_table_for(u);
   if (trace()) {

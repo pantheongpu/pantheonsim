@@ -252,6 +252,56 @@ bool read_one(const std::string& path, Shared* out) {
 
 }  // namespace
 
+void describe_device(const DeviceProfile& p, int ordinal, DeviceSample* d) {
+  if (!d) return;
+  std::snprintf(d->name, sizeof d->name, "%s", p.model.c_str());
+  std::snprintf(d->architecture, sizeof d->architecture, "%s", p.architecture.c_str());
+  std::snprintf(d->vendor, sizeof d->vendor, "%s", p.vendor.c_str());
+  // Deterministic synthetic UUID/bus id, stable for a given profile+ordinal.
+  uint32_t h = 2166136261u;
+  for (char c : p.id) h = (h ^ static_cast<unsigned char>(c)) * 16777619u;
+  std::snprintf(d->uuid, sizeof d->uuid, "GPU-%08x-%04x-%04x-%04x-%08x%04x", h, (h >> 16) & 0xFFFF,
+                0x4000 | (h & 0x0FFF), 0x8000 | ((h >> 4) & 0x3FFF), h * 2654435761u,
+                static_cast<unsigned>(ordinal));
+  // Each virtual device gets its own PCI slot on a synthetic bus.
+  std::snprintf(d->bus_id, sizeof d->bus_id, "00000000:%02X:00.0", ordinal + 1);
+  d->pci_device_id = (p.telemetry.pci_device_id << 16) | p.telemetry.pci_vendor_id;
+  d->pci_subsystem_id = d->pci_device_id;
+  d->cc_major = p.cc_major;
+  d->cc_minor = p.cc_minor;
+  d->multiprocessors = p.limits.multiprocessors;
+  d->vram_total_bytes = p.vram_bytes;
+  d->vram_used_bytes = 0;
+  d->power_limit_mw = p.telemetry.power_limit_w * 1000;
+  d->temperature_max_c = p.telemetry.temperature_max_c;
+  d->sm_clock_max_mhz = p.telemetry.sm_clock_max_mhz;
+  d->mem_clock_max_mhz = p.telemetry.mem_clock_max_mhz;
+}
+
+Shared idle_snapshot(const DeviceProfile& p, int device_count) {
+  Shared s{};
+  s.magic = kMagic;
+  s.version = kVersion;
+  s.device_count = static_cast<uint32_t>(
+      device_count < 1 ? 1 : (device_count > kMaxDevices ? kMaxDevices : device_count));
+  for (uint32_t i = 0; i < s.device_count; ++i) {
+    describe_device(p, static_cast<int>(i), &s.devices[i]);
+    DeviceSample& d = s.devices[i];
+    // An idle device: cool, near its floor clock, drawing its idle power.
+    d.utilization_gpu = 0;
+    d.utilization_mem = 0;
+    d.temperature_c = 32;
+    d.power_mw = d.power_limit_mw / 12;
+    d.voltage_mv = 700;
+    d.sm_clock_mhz = d.sm_clock_max_mhz / 5;
+    d.mem_clock_mhz = d.mem_clock_max_mhz / 5;
+    d.fan_percent = 0;
+    d.perf_state = 8;   // P8 is the idle state a real device reports
+    d.proc_count = 0;
+  }
+  return s;
+}
+
 bool read_snapshot(Shared* out, const std::string& dir) {
   if (!out) return false;
   DIR* d = ::opendir(dir.c_str());

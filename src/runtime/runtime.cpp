@@ -124,30 +124,10 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
 void Runtime::publish_identity(const DeviceProfile& p, int ordinal) {
   telemetry::DeviceSample* d = telemetry_.device(static_cast<uint32_t>(ordinal));
   if (!d) return;
-  std::snprintf(d->name, sizeof d->name, "%s", p.model.c_str());
-  std::snprintf(d->architecture, sizeof d->architecture, "%s", p.architecture.c_str());
-  std::snprintf(d->vendor, sizeof d->vendor, "%s", p.vendor.c_str());
-  // Deterministic synthetic UUID/bus id, stable for a given profile+ordinal.
-  uint32_t h = 2166136261u;
-  for (char c : p.id) h = (h ^ static_cast<unsigned char>(c)) * 16777619u;
-  std::snprintf(d->uuid, sizeof d->uuid, "GPU-%08x-%04x-%04x-%04x-%08x%04x", h, (h >> 16) & 0xFFFF,
-                0x4000 | (h & 0x0FFF), 0x8000 | ((h >> 4) & 0x3FFF), h * 2654435761u,
-                static_cast<unsigned>(ordinal));
-  // Each virtual device gets its own PCI slot on a synthetic bus.
-  std::snprintf(d->bus_id, sizeof d->bus_id, "00000000:%02X:00.0", ordinal + 1);
-  d->pci_device_id = (p.telemetry.pci_device_id << 16) | p.telemetry.pci_vendor_id;
-  d->pci_subsystem_id = d->pci_device_id;
-  d->cc_major = p.cc_major;
-  d->cc_minor = p.cc_minor;
-  d->multiprocessors = p.limits.multiprocessors;
-  d->vram_total_bytes = p.vram_bytes;
-  d->vram_used_bytes = 0;
-  d->power_limit_mw = p.telemetry.power_limit_w * 1000;
-  d->temperature_max_c = p.telemetry.temperature_max_c;
-  d->sm_clock_max_mhz = p.telemetry.sm_clock_max_mhz;
-  d->mem_clock_max_mhz = p.telemetry.mem_clock_max_mhz;
+  telemetry::describe_device(p, ordinal, d);
   telemetry_.refresh(static_cast<uint32_t>(ordinal));
 }
+
 
 Runtime::Runtime(const DeviceProfile& profile, int device_count) {
   if (device_count < 1) throw Error::make(Err::InvalidValue, "device_count must be >= 1");

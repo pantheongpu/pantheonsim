@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "vgpu/registry.hpp"
 #include "vgpu/telemetry.hpp"
 
 namespace {
@@ -363,18 +364,21 @@ int cmd_smi(const std::vector<std::string>& args) {
   }
   vgpu::telemetry::Shared snap{};
   if (!vgpu::telemetry::read_snapshot(&snap)) {
-    if (agents) {
-      // With nothing running there are no agents beyond the host CPU one.
-      std::printf("gfx000\n");
-      return 0;
+    // Nothing is publishing, which on a real machine is the ordinary case:
+    // nvidia-smi answers about an idle GPU rather than failing. Monitoring
+    // tools poll before and after a workload and treat a non-zero exit as "no
+    // GPU", so describe the configured rack as idle instead.
+    const char* gpu = std::getenv("VGPU_GPU");
+    int count = 1;
+    if (const char* c = std::getenv("VGPU_DEVICE_COUNT"); c && c[0]) count = std::atoi(c);
+    try {
+      snap = vgpu::telemetry::idle_snapshot(vgpu::load_gpu(gpu && *gpu ? gpu : "nvidia/h100"),
+                                            count);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "vgpu smi: no running VirtualGPU and no usable profile (%s)\n",
+                   e.what());
+      return 1;
     }
-    std::fprintf(stderr,
-                 "vgpu smi: no running VirtualGPU found.\n"
-                 "  Telemetry is published by a live process; start a workload first, e.g.\n"
-                 "    LD_LIBRARY_PATH=build/shim ./my_cuda_app\n"
-                 "  (looked in %s; override with VGPU_TELEMETRY_PATH)\n",
-                 vgpu::telemetry::default_path().c_str());
-    return 1;
   }
   if (query_fields == "__list__") {
     for (uint32_t i = 0; i < snap.device_count; ++i)

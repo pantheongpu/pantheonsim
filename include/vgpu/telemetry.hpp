@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <string>
 
+#include "vgpu/profile.hpp"
+
 namespace vgpu::telemetry {
 
 inline constexpr uint32_t kMagic = 0x56475054;  // "VGPT"
@@ -147,5 +149,15 @@ class Publisher {
 // each contributing process appears in the per-device process list. Returns
 // false when no live VirtualGPU process has published anything.
 bool read_snapshot(Shared* out, const std::string& dir = default_path());
+
+// Fills in a device's identity and static limits from its profile. Used both
+// by a live publisher and by the monitoring tools when nothing is running:
+// a real nvidia-smi answers on an idle machine, so this one does too.
+void describe_device(const DeviceProfile& p, int ordinal, DeviceSample* out);
+
+// A snapshot of an idle rack built straight from a profile, for when no
+// process is publishing. Everything dynamic reads as idle, which is what an
+// idle device reports.
+Shared idle_snapshot(const DeviceProfile& p, int device_count);
 
 }  // namespace vgpu::telemetry
