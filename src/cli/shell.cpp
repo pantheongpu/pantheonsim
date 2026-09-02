@@ -15,6 +15,8 @@
 //     /proc/driver/nvidia, /sys/class/drm and /etc/os-release over the real
 //     ones, so even programs that read those absolute paths see the simulated
 //     machine.
+#include <algorithm>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -270,6 +272,31 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
     write_file(card + "/device/device", id);
   }
 
+  // Resolves a program to an absolute path using PATH as it stands now, which
+  // is before the session binds its own tools over the real ones.
+  auto find_program = [](const char* name) -> std::string {
+    const char* path = std::getenv("PATH");
+    if (!path) return "";
+    const std::string p(path);
+    size_t at = 0;
+    while (at <= p.size()) {
+      const size_t colon = p.find(':', at);
+      const std::string dir =
+          p.substr(at, colon == std::string::npos ? std::string::npos : colon - at);
+      if (!dir.empty()) {
+        const std::string cand = dir + "/" + name;
+        if (::access(cand.c_str(), X_OK) == 0) {
+          char resolved[4096];
+          if (::realpath(cand.c_str(), resolved)) return resolved;
+          return cand;
+        }
+      }
+      if (colon == std::string::npos) break;
+      at = colon + 1;
+    }
+    return "";
+  };
+
   // --- session tools, first on PATH ---
   auto tool = [&](const std::string& name, const std::string& body) {
     write_file(s.bin + "/" + name, "#!/usr/bin/env bash\n" + body, true);
@@ -285,33 +312,6 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
        "             echo \"CUDA Version        : " + c.cuda + "\"; exit 0 ;;\n"
        "  -L|--list-gpus) exec \"" + vgpu + "\" smi --list ;;\n"
        "esac\nexec \"" + vgpu + "\" smi \"$@\"\n");
-  // nvcc links the CUDA runtime statically by default, and a static cudart
-  // reaches libcuda through an undocumented internal table rather than the
-  // documented driver API: against VirtualGPU it probes several hundred entry
-  // points and then refuses with "integrity checks failed" on the program's
-  // first CUDA call. Linking the runtime shared changes nothing about the
-  // program and lets VirtualGPU's libcudart answer, so every build system that
-  // calls nvcc works unmodified. VGPU_NVCC_PASSTHROUGH=1 restores the original.
-  tool("nvcc",
-       "self=\"$(readlink -f \"$0\")\"\n"
-       "real=\"\"\n"
-       "IFS=':' read -ra parts <<< \"${PATH:-}\"\n"
-       "for dir in \"${parts[@]}\"; do\n"
-       "  [[ -n \"$dir\" && -x \"$dir/nvcc\" ]] || continue\n"
-       "  cand=\"$(readlink -f \"$dir/nvcc\")\"\n"
-       "  [[ \"$cand\" == \"$self\" ]] && continue\n"
-       "  real=\"$cand\"; break\n"
-       "done\n"
-       "[[ -n \"$real\" ]] || { echo \"vgpu nvcc: no real nvcc on PATH\" >&2; exit 127; }\n"
-       "[[ \"${VGPU_NVCC_PASSTHROUGH:-0}\" == 1 ]] && exec \"$real\" \"$@\"\n"
-       "inject=1\n"
-       "for a in \"$@\"; do\n"
-       "  case \"$a\" in\n"
-       "    --version|-V|--help|-h|-cudart|-cudart=*|--cudart|--cudart=*) inject=0 ;;\n"
-       "  esac\n"
-       "done\n"
-       "[[ $inject -eq 1 ]] && exec \"$real\" -cudart shared \"$@\"\n"
-       "exec \"$real\" \"$@\"\n");
   tool("rocm-smi", "exec \"" + vgpu + "\" smi --rocm \"$@\"\n");
   tool("rocm_agent_enumerator", "exec \"" + vgpu + "\" smi --agents\n");
   tool("dmesg",
@@ -334,18 +334,63 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
        "# names from the host pci.ids like any other device.\n"
        "\"" + vgpu + "\" smi --lspci-dump > \"" + s.pci_dump + "\" 2>/dev/null\n"
        "exec /usr/bin/lspci -F \"" + s.pci_dump + "\" \"$@\"\n");
+  // The session compiler: the real one with -cudart shared added.
+  //
+  // nvcc links the CUDA runtime statically by default, and a static cudart is
+  // NVIDIA's own runtime inside the binary, reaching libcuda through an
+  // undocumented internal table rather than the documented driver API. Against
+  // a simulated driver it probes several hundred entry points and then refuses
+  // with "integrity checks failed" on the program's first CUDA call. Linking
+  // the runtime shared changes nothing about the program and lets VirtualGPU's
+  // libcudart answer, so build systems work unmodified.
+  //
+  // The real compiler's path is resolved here, before the session binds this
+  // script over it: a PATH search at run time would find only this script and
+  // exec itself forever.
+  const std::string real_nvcc = find_program("nvcc");
   tool("nvcc",
-       "# The simulated toolkit version. A real nvcc, if installed, still\n"
-       "# compiles: pass --real to reach it.\n"
+       "# The session compiler. VGPU_NVCC_PASSTHROUGH=1 removes the -cudart flag.\n"
        "if [ \"${1:-}\" = \"--version\" ]; then\n"
        "  echo 'nvcc: NVIDIA (R) Cuda compiler driver'\n"
        "  echo 'Cuda compilation tools, release " + c.cuda + " (VirtualGPU session)'\n"
        "  exit 0\nfi\n"
-       "if command -v /usr/local/cuda/bin/nvcc >/dev/null 2>&1; then\n"
-       "  exec /usr/local/cuda/bin/nvcc \"$@\"\nfi\n"
-       "echo 'nvcc: no CUDA toolkit installed in this session' >&2; exit 127\n");
+       "REAL='" + real_nvcc + "'\n"
+       "[ -x \"$REAL\" ] || { echo 'nvcc: no CUDA toolkit in this session' >&2; exit 127; }\n"
+       "[ \"${VGPU_NVCC_PASSTHROUGH:-0}\" = 1 ] && exec \"$REAL\" \"$@\"\n"
+       "for a in \"$@\"; do\n"
+       "  case \"$a\" in\n"
+       "    -cudart|-cudart=*|--cudart|--cudart=*|--help|-h) exec \"$REAL\" \"$@\" ;;\n"
+       "  esac\n"
+       "done\n"
+       "exec \"$REAL\" -cudart shared \"$@\"\n");
   tool("vgpu", "exec \"" + vgpu + "\" \"$@\"\n");
   return s;
+}
+
+// The CUDA bin directories a build system is likely to put in front of PATH,
+// in the order the common tools list them.
+std::vector<std::string> cuda_bin_directories() {
+  std::vector<std::string> out;
+  auto add = [&](const std::string& d) {
+    struct stat st{};
+    if (::stat(d.c_str(), &st) == 0 && S_ISDIR(st.st_mode) &&
+        std::find(out.begin(), out.end(), d) == out.end())
+      out.push_back(d);
+  };
+  for (const char* var : {"CUDA_HOME", "CUDA_PATH"})
+    if (const char* r = std::getenv(var); r && *r) add(std::string(r) + "/bin");
+  add("/usr/local/cuda/bin");
+  // Versioned toolkits, newest first, which is the order these tools use.
+  if (DIR* d = ::opendir("/usr/local")) {
+    std::vector<std::string> versioned;
+    while (struct dirent* e = ::readdir(d))
+      if (std::strncmp(e->d_name, "cuda-", 5) == 0)
+        versioned.push_back(std::string("/usr/local/") + e->d_name + "/bin");
+    ::closedir(d);
+    std::sort(versioned.rbegin(), versioned.rend());
+    for (const auto& v : versioned) add(v);
+  }
+  return out;
 }
 
 std::string human_vram(uint64_t bytes) {
@@ -483,18 +528,6 @@ int cmd_shell(const std::vector<std::string>& args) {
     // tools and install scripts check -- appear for the simulated driver.
     ok = bind(s.root + "/proc/driver", "/proc/driver") || ok;
     ok = bind(s.root + "/sys/class/drm", "/sys/class/drm") || ok;
-    // Bind the session's nvcc over the toolkit's own. PATH order is not enough
-    // on its own: build systems routinely put the CUDA bin directory in front
-    // of whatever the caller set -- pantheon.py does exactly that -- and would
-    // then get the unwrapped compiler and a statically linked runtime, which
-    // cannot talk to a simulated driver. Inside this namespace the wrapper wins
-    // wherever nvcc is invoked from.
-    for (const char* dir : {"/usr/local/cuda/bin", "/usr/local/cuda-13.0/bin",
-                            "/usr/local/cuda-12.0/bin", "/opt/cuda/bin", "/usr/bin"}) {
-      const std::string target = std::string(dir) + "/nvcc";
-      struct stat st{};
-      if (::stat(target.c_str(), &st) == 0) ok = bind(s.bin + "/nvcc", target) || ok;
-    }
     isolated = ok;
   }
 
@@ -522,7 +555,15 @@ int cmd_shell(const std::vector<std::string>& args) {
     });
   }
 
-  std::string path = s.bin + ":" + (std::getenv("PATH") ? std::getenv("PATH") : "/usr/bin:/bin");
+  // The session's tools go first, and every CUDA bin directory a build system
+  // might reach for goes right behind them. Tools routinely prepend the
+  // toolkit's directory to whatever PATH they were given -- pantheon.py does
+  // exactly that -- but only when it is not already there, so listing them all
+  // here is what keeps the session's nvcc in front of the real one.
+  std::string path = s.bin;
+  for (const std::string& dir : cuda_bin_directories())
+    if (path.find(dir) == std::string::npos) path += ":" + dir;
+  path += ":" + std::string(std::getenv("PATH") ? std::getenv("PATH") : "/usr/bin:/bin");
   setenv("PATH", path.c_str(), 1);
   std::string shim = shim_dir();
   const char* old_ld = std::getenv("LD_LIBRARY_PATH");
