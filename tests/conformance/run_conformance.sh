@@ -18,17 +18,49 @@ mkdir -p "$out"
 command -v nvcc >/dev/null || { echo "SKIP: nvcc not found"; exit 0; }
 [[ -e "$shim/libcudart.so.13" ]] || { echo "SKIP: build VirtualGPU first"; exit 0; }
 have_gpu=0
-if [[ -z "${VGPU_ONLY:-}" ]] && nvidia-smi -L >/dev/null 2>&1; then have_gpu=1; fi
+ngpu=0
+if [[ -z "${VGPU_ONLY:-}" ]] && nvidia-smi -L >/dev/null 2>&1; then
+  have_gpu=1
+  ngpu="$(nvidia-smi -L | wc -l)"
+fi
 
 fail=0
 for src in "$root"/tests/conformance/*.cu; do
   name="$(basename "$src" .cu)"
   # Link whatever vendor libraries the test uses; the shim supplies the
   # VirtualGPU implementations of the same sonames at run time.
-  libs=""; inc=""; reallib=""
+  libs=""; inc=""; reallib=""; env_real=(); env_virt=()
   grep -q "cublas_v2\|cublas\.h" "$src" && libs="$libs -lcublas"
   grep -q "cublasLt" "$src" && libs="$libs -lcublasLt"
   grep -q "curand" "$src" && libs="$libs -lcurand"
+  grep -q "cufft" "$src" && libs="$libs -lcufft"
+  if grep -q "nccl" "$src"; then
+    # NCCL, like cuDNN, ships outside the toolkit. Its headers are vendored.
+    inc="$inc -I$root/third_party/nccl_include"
+    libs="$libs -lnccl"
+    # NCCL wants one device per rank, so the rank count the two sides can be
+    # compared at is however many physical GPUs this machine has.
+    ranks=$(( ngpu > 1 ? 2 : 1 ))
+    env_real=(VGPU_NCCL_RANKS=$ranks)
+    env_virt=(VGPU_NCCL_RANKS=$ranks VGPU_DEVICE_COUNT=$ranks
+              VGPU_NCCL_DIR="$out/rendezvous-$name" VGPU_NCCL_TIMEOUT=120)
+    if [[ -e "${VGPU_NCCL_LIB:-/nonexistent}/libnccl.so.2" ]]; then
+      reallib="$VGPU_NCCL_LIB"
+    else
+      reallib="$(dirname "$(find /usr /opt "${TMPDIR:-/tmp}" -name libnccl.so.2 \
+                             -not -path "$out/*" -not -path "$shim/*" 2>/dev/null | head -1)")"
+      [[ -e "$reallib/libnccl.so.2" ]] || reallib=""
+    fi
+    if [[ -n "$reallib" ]]; then
+      rm -rf "$out/nccl-real"; mkdir -p "$out/nccl-real"
+      cp -a "$reallib"/libnccl.so.2 "$out/nccl-real/"
+      ln -sf libnccl.so.2 "$out/nccl-real/libnccl.so"
+      reallib="$out/nccl-real"
+    elif [[ $have_gpu -eq 1 ]]; then
+      echo "skip  $name: no reference libnccl.so.2 (set VGPU_NCCL_LIB)"
+      continue
+    fi
+  fi
   if grep -q "cudnn" "$src"; then
     # cuDNN is not part of the CUDA toolkit: its headers are vendored here and
     # the reference library comes from wherever the wheel or package put it.
@@ -61,8 +93,8 @@ for src in "$root"/tests/conformance/*.cu; do
   nvcc -std=c++14 -arch="$VGPU_CONF_ARCH" -Wno-deprecated-gpu-targets \
        -Xcompiler -Wno-deprecated-declarations -cudart shared $inc "$src" \
        -o "$out/$name.virt" -L"$shim" $libs 2>/dev/null
-  VGPU_QUIET=1 VGPU_GPU="$VGPU_CONF_GPU" VGPU_VRAM_MB=256 LD_LIBRARY_PATH="$shim" \
-    timeout 300 "$out/$name.virt" > "$out/$name.virt.txt" 2>&1
+  env VGPU_QUIET=1 VGPU_GPU="$VGPU_CONF_GPU" VGPU_VRAM_MB=256 LD_LIBRARY_PATH="$shim" \
+    "${env_virt[@]}" timeout 300 "$out/$name.virt" > "$out/$name.virt.txt" 2>&1
   vrc=$?
   if [[ $vrc -ne 0 ]] || grep -q "LAUNCHFAIL\|ALLOCFAIL" "$out/$name.virt.txt"; then
     echo "FAIL  $name: VirtualGPU did not complete"
@@ -73,7 +105,8 @@ for src in "$root"/tests/conformance/*.cu; do
     echo "ok    $name (virtual only; no physical GPU to compare against)"
     continue
   fi
-  LD_LIBRARY_PATH="${reallib:-}" timeout 300 "$out/$name.real" > "$out/$name.real.txt" 2>&1
+  env LD_LIBRARY_PATH="${reallib:-}" "${env_real[@]}" \
+    timeout 300 "$out/$name.real" > "$out/$name.real.txt" 2>&1
   if diff -q "$out/$name.real.txt" "$out/$name.virt.txt" >/dev/null; then
     echo "MATCH $name ($(wc -l < "$out/$name.real.txt") values identical to hardware)"
   elif python3 "$root/tests/conformance/compare_numeric.py" \

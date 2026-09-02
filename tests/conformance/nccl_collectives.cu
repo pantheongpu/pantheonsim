@@ -8,7 +8,9 @@
 // and against VirtualGPU's still gives a byte-for-byte differential check of
 // the API plumbing.
 //
-//   VGPU_NCCL_RANKS=4   number of ranks (default: all visible devices, max 8)
+//   VGPU_NCCL_RANKS=4   number of ranks (default 1, so the differential run
+//                       compares like with like on machines with any number of
+//                       GPUs; tests/e2e/run_nccl_group.sh raises it)
 #include <nccl.h>
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -44,7 +46,7 @@ struct Rank {
 int main() {
   int ndev = 0;
   cudaGetDeviceCount(&ndev);
-  int nranks = ndev > 8 ? 8 : ndev;
+  int nranks = 1;
   if (const char* e = std::getenv("VGPU_NCCL_RANKS")) nranks = std::atoi(e);
   if (nranks < 1) nranks = 1;
   if (nranks > ndev) { printf("SKIP: %d ranks requested, %d devices visible\n", nranks, ndev); return 0; }

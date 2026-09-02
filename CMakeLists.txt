@@ -168,6 +168,7 @@ if(CUDA_ABI_INCLUDE)
   set(_vgpu_libs
     "curand:10:curand_api"
     "cublasLt:13:cublaslt_api"
+    "cufft:12:cufft_api"
   )
   foreach(_entry IN LISTS _vgpu_libs)
     string(REPLACE ":" ";" _parts "${_entry}")
@@ -335,4 +336,6 @@ if(TARGET vgpunccl)
   add_test(NAME e2e_nccl_multiproc
            COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_nccl_multiproc.sh 4)
   set_tests_properties(e2e_nccl_multiproc PROPERTIES DEPENDS vgpunccl TIMEOUT 300)
+  add_test(NAME e2e_nccl_group COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_nccl_group.sh 4)
+  set_tests_properties(e2e_nccl_group PROPERTIES DEPENDS vgpunccl TIMEOUT 300)
 endif()
