@@ -157,6 +157,15 @@ int current_device(ShimState& s) {
 
 vgpu::runtime::Device& current(ShimState& s) { return s.rt->device(current_device(s)); }
 
+// Device VA windows are disjoint, so a device pointer names its own device.
+// Resolving against the current context instead would make a copy between two
+// devices read the wrong memory at the same numeric address.
+vgpu::MemoryManager& owner_memory(ShimState& s, CUdeviceptr p) {
+  for (int d = 0; d < s.rt->device_count(); ++d)
+    if (s.rt->device(d).memory().owns(p)) return s.rt->device(d).memory();
+  return current(s).memory();
+}
+
 void check_device(ShimState& s, CUdevice dev) {
   if (dev < 0 || dev >= s.rt->device_count())
     throw vgpu::Error::make(vgpu::Err::UnknownGpu, "invalid device ordinal ", dev, " (have ",
@@ -520,7 +529,7 @@ VGPU_EXPORT CUresult cuMemAlloc(CUdeviceptr* dptr, size_t bytesize) {
 
 VGPU_EXPORT CUresult cuMemFree_v2(CUdeviceptr dptr) {
   return api("cuMemFree", true, false, [&](ShimState& s) {
-    current(s).memory().free(dptr);
+    owner_memory(s, dptr).free(dptr);
     return CUDA_SUCCESS;
   });
 }
@@ -529,7 +538,7 @@ VGPU_EXPORT CUresult cuMemFree(CUdeviceptr dptr) { return cuMemFree_v2(dptr); }
 VGPU_EXPORT CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount) {
   return api("cuMemcpyHtoD", true, false, [&](ShimState& s) {
     if (!srcHost && ByteCount) return CUDA_ERROR_INVALID_VALUE;
-    current(s).memory().write(dstDevice, srcHost, ByteCount);
+    owner_memory(s, dstDevice).write(dstDevice, srcHost, ByteCount);
     return CUDA_SUCCESS;
   });
 }
@@ -540,7 +549,7 @@ VGPU_EXPORT CUresult cuMemcpyHtoD(CUdeviceptr d, const void* h, size_t n) {
 VGPU_EXPORT CUresult cuMemcpyDtoH_v2(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount) {
   return api("cuMemcpyDtoH", true, false, [&](ShimState& s) {
     if (!dstHost && ByteCount) return CUDA_ERROR_INVALID_VALUE;
-    current(s).memory().read(srcDevice, dstHost, ByteCount);
+    owner_memory(s, srcDevice).read(srcDevice, dstHost, ByteCount);
     return CUDA_SUCCESS;
   });
 }
@@ -551,8 +560,8 @@ VGPU_EXPORT CUresult cuMemcpyDtoH(void* h, CUdeviceptr d, size_t n) {
 VGPU_EXPORT CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount) {
   return api("cuMemcpyDtoD", true, false, [&](ShimState& s) {
     std::vector<uint8_t> tmp(ByteCount);
-    current(s).memory().read(srcDevice, tmp.data(), ByteCount);
-    current(s).memory().write(dstDevice, tmp.data(), ByteCount);
+    owner_memory(s, srcDevice).read(srcDevice, tmp.data(), ByteCount);
+    owner_memory(s, dstDevice).write(dstDevice, tmp.data(), ByteCount);
     return CUDA_SUCCESS;
   });
 }
@@ -881,7 +890,7 @@ template <typename T>
 CUresult memset_impl(const char* name, CUdeviceptr dptr, T value, size_t n) {
   return api(name, true, false, [&](ShimState& s) {
     std::vector<T> buf(n, value);
-    current(s).memory().write(dptr, buf.data(), n * sizeof(T));
+    owner_memory(s, dptr).write(dptr, buf.data(), n * sizeof(T));
     return CUDA_SUCCESS;
   });
 }
@@ -909,7 +918,7 @@ VGPU_EXPORT CUresult cuMemsetD32Async(CUdeviceptr d, unsigned int v, size_t n, C
 VGPU_EXPORT CUresult cuMemGetAddressRange_v2(CUdeviceptr* base, size_t* size, CUdeviceptr dptr) {
   return api("cuMemGetAddressRange", true, false, [&](ShimState& s) {
     uint64_t b = 0, sz = 0;
-    if (!current(s).memory().find_allocation(dptr, &b, &sz)) return CUDA_ERROR_INVALID_VALUE;
+    if (!owner_memory(s, dptr).find_allocation(dptr, &b, &sz)) return CUDA_ERROR_INVALID_VALUE;
     if (base) *base = b;
     if (size) *size = sz;
     return CUDA_SUCCESS;

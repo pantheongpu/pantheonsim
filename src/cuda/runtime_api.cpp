@@ -125,6 +125,17 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
 
 vgpu::runtime::Device& current(State& s) { return s.rt->device(s.current_device); }
 
+// The memory of whichever device owns this pointer. Device VA windows are
+// disjoint, so the address alone identifies the owner; falling back to the
+// current device keeps the error message about an unmapped address rather than
+// about the wrong device.
+vgpu::MemoryManager& owner_memory(State& s, const void* p) {
+  const uint64_t addr = reinterpret_cast<uint64_t>(p);
+  for (int d = 0; d < s.rt->device_count(); ++d)
+    if (s.rt->device(d).memory().owns(addr)) return s.rt->device(d).memory();
+  return current(s).memory();
+}
+
 // Loads (once) the runtime module for a registered fatbin on the current device.
 uint64_t module_on_current(State& s, RegisteredModule& m) {
   int dev = s.current_device;
@@ -584,7 +595,7 @@ VGPU_EXPORT cudaError_t cudaMalloc(void** ptr, size_t size) {
 VGPU_EXPORT cudaError_t cudaFree(void* ptr) {
   return guard("cudaFree", [&](State& s) {
     if (!ptr) return cudaSuccess;  // cudaFree(NULL) is a documented no-op
-    current(s).memory().free(reinterpret_cast<uint64_t>(ptr));
+    owner_memory(s, ptr).free(reinterpret_cast<uint64_t>(ptr));
     return cudaSuccess;
   });
 }
@@ -592,23 +603,29 @@ VGPU_EXPORT cudaError_t cudaFree(void* ptr) {
 VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cudaMemcpyKind kind) {
   return guard("cudaMemcpy", [&](State& s) {
     auto _t0 = std::chrono::steady_clock::now();
-    vgpu::MemoryManager& mm = current(s).memory();
     bool dd = is_device_ptr(dst), sd = is_device_ptr(src);
+    // Under unified addressing a device pointer names its own device, so each
+    // side is resolved against the device that owns it rather than against
+    // whichever device happens to be current. Without this a
+    // cudaMemcpyDeviceToDevice between two devices reads the current device's
+    // memory at the same numeric address -- silently, and with the wrong bytes.
+    vgpu::MemoryManager& dmm = dd ? owner_memory(s, dst) : current(s).memory();
+    vgpu::MemoryManager& smm = sd ? owner_memory(s, src) : current(s).memory();
     if (kind == cudaMemcpyDefault) kind = dd && sd ? cudaMemcpyDeviceToDevice
                                           : dd      ? cudaMemcpyHostToDevice
                                           : sd      ? cudaMemcpyDeviceToHost
                                                     : cudaMemcpyHostToHost;
     switch (kind) {
       case cudaMemcpyHostToDevice:
-        mm.write(reinterpret_cast<uint64_t>(dst), src, count);
+        dmm.write(reinterpret_cast<uint64_t>(dst), src, count);
         break;
       case cudaMemcpyDeviceToHost:
-        mm.read(reinterpret_cast<uint64_t>(src), dst, count);
+        smm.read(reinterpret_cast<uint64_t>(src), dst, count);
         break;
       case cudaMemcpyDeviceToDevice: {
         std::vector<uint8_t> tmp(count);
-        mm.read(reinterpret_cast<uint64_t>(src), tmp.data(), count);
-        mm.write(reinterpret_cast<uint64_t>(dst), tmp.data(), count);
+        smm.read(reinterpret_cast<uint64_t>(src), tmp.data(), count);
+        dmm.write(reinterpret_cast<uint64_t>(dst), tmp.data(), count);
         break;
       }
       case cudaMemcpyHostToHost:
@@ -631,7 +648,7 @@ VGPU_EXPORT cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t count
 VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
   return guard("cudaMemset", [&](State& s) {
     std::vector<uint8_t> buf(count, static_cast<uint8_t>(value));
-    current(s).memory().write(reinterpret_cast<uint64_t>(dst), buf.data(), count);
+    owner_memory(s, dst).write(reinterpret_cast<uint64_t>(dst), buf.data(), count);
     return cudaSuccess;
   });
 }

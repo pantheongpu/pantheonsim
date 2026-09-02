@@ -26,7 +26,7 @@ namespace vgpu::runtime {
 class Device {
  public:
   Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemetry)
-      : profile_(std::move(profile)), ordinal_(ordinal), mem_(profile_.vram_bytes),
+      : profile_(std::move(profile)), ordinal_(ordinal), mem_(profile_.vram_bytes, static_cast<uint32_t>(ordinal)),
         telemetry_(telemetry) {
     if (telemetry_) {
       int ord = ordinal_;

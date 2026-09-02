@@ -37,6 +37,11 @@ for src in "$root"/tests/conformance/*.cu; do
   grep -q "cusparse" "$src" && libs="$libs -lcusparse"
   grep -q "cusolver" "$src" && libs="$libs -lcusolver"
   grep -q "nvrtc" "$src" && libs="$libs -lnvrtc -lcuda"
+  if [[ "$name" == "multi_gpu" ]]; then
+    # Both sides must see the same number of devices for the outputs to be
+    # comparable; the virtual rack is sized to match the physical machine.
+    env_virt=(VGPU_DEVICE_COUNT=$(( ngpu > 1 ? ngpu : 1 )))
+  fi
   if grep -q "nccl" "$src"; then
     # NCCL, like cuDNN, ships outside the toolkit. Its headers are vendored.
     inc="$inc -I$root/third_party/nccl_include"

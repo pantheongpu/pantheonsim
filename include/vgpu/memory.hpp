@@ -28,6 +28,12 @@
 namespace vgpu {
 
 inline constexpr uint64_t kDeviceVaBase = 0x7fff'0000'0000ull;
+// Each device owns a disjoint 1 TiB window above that base. CUDA guarantees
+// unified virtual addressing -- a device pointer is unique process-wide and
+// identifies the device that owns it -- and without separate windows two
+// devices hand out the same numeric address for different memory, so a
+// cross-device copy silently reads the wrong buffer instead of failing.
+inline constexpr uint64_t kDeviceVaStride = 0x100'0000'0000ull;  // 1 TiB
 inline constexpr uint64_t kAllocAlign = 256;  // matches CUDA's documented minimum alignment
 inline constexpr uint64_t kChunkSize = 64 * 1024;
 // How many freed allocations stay individually diagnosable. Bounded so that
@@ -36,7 +42,16 @@ inline constexpr size_t kQuarantineEntries = 4096;
 
 class MemoryManager {
  public:
-  explicit MemoryManager(uint64_t capacity_bytes) : capacity_(capacity_bytes) {}
+  explicit MemoryManager(uint64_t capacity_bytes, uint32_t device_ordinal = 0)
+      : capacity_(capacity_bytes),
+        va_base_(kDeviceVaBase + static_cast<uint64_t>(device_ordinal) * kDeviceVaStride),
+        next_va_(va_base_),
+        high_water_va_(va_base_) {}
+
+  // The device's window in the process-wide address space, and whether an
+  // address falls inside it.
+  uint64_t va_base() const { return va_base_; }
+  bool owns(uint64_t addr) const { return addr >= va_base_ && addr < va_base_ + kDeviceVaStride; }
 
   // Allocates `size` bytes of virtual device memory. size == 0 is invalid.
   uint64_t alloc(uint64_t size);
@@ -80,8 +95,9 @@ class MemoryManager {
   Allocation& resolve_mut(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out);
 
   uint64_t capacity_;
+  uint64_t va_base_;
   uint64_t used_ = 0;
-  uint64_t next_va_ = kDeviceVaBase;
+  uint64_t next_va_;
   void notify_usage() const {
     if (usage_observer_) usage_observer_(used_);
   }
@@ -94,7 +110,7 @@ class MemoryManager {
   uint64_t freed_seq_ = 0;
   // Highest VA ever handed out, so a pointer inside the retired range can be
   // called out as stale even after it leaves the quarantine.
-  uint64_t high_water_va_ = kDeviceVaBase;
+  uint64_t high_water_va_;
 };
 
 }  // namespace vgpu

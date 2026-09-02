@@ -66,7 +66,7 @@ void MemoryManager::free(uint64_t ptr) {
                         ": allocation starts at ", Hex{prev->first}, " (", prev->second.size,
                         " bytes); pass the base pointer");
   }
-  if (ptr >= kDeviceVaBase && ptr < high_water_va_)
+  if (ptr >= va_base_ && ptr < high_water_va_)
     throw Error::make(Err::InvalidPointer, "free of device pointer ", Hex{ptr},
                       " that is not a live allocation; it is inside the retired address range, so "
                       "it was most likely freed earlier (beyond the ", kQuarantineEntries,
@@ -106,14 +106,16 @@ const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t 
       throw Error::make(Err::UseAfterFree, op, " at ", Hex{addr}, " touches freed allocation ",
                         Hex{prev->first}, " (", prev->second.size, " bytes); device memory was freed");
   }
-  if (addr >= kDeviceVaBase && addr < high_water_va_)
+  if (addr >= va_base_ && addr < high_water_va_)
     throw Error::make(Err::UseAfterFree, op, " at ", Hex{addr},
                       " is inside the retired address range: the allocation it belonged to was "
                       "freed (older than the ", kQuarantineEntries,
                       "-entry quarantine, so its size is no longer recorded)");
   throw Error::make(Err::InvalidPointer, op, " at ", Hex{addr},
                     ": address is not inside any device allocation",
-                    addr < kDeviceVaBase ? " (looks like a host pointer, not a device pointer)" : "");
+                    addr < kDeviceVaBase   ? " (looks like a host pointer, not a device pointer)"
+                    : !owns(addr)      ? " (belongs to a different device)"
+                                       : "");
 }
 
 MemoryManager::Allocation& MemoryManager::resolve_mut(uint64_t addr, uint64_t len, const char* op,
