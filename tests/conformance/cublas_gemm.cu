@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <vector>
 #include <cublas_v2.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #define CK(x) do { cublasStatus_t s_=(x); if(s_){printf("BLASFAIL %d @%d\n",(int)s_,__LINE__);return 1;} } while(0)
@@ -121,6 +123,154 @@ int main() {
         float dot=0; CK(cublasSdot(h,m,dy,1,dy,1,&dot)); printf("%-26s %.5f\n","sdot",dot);
         float nrm=0; CK(cublasSnrm2(h,m,dy,1,&nrm)); printf("%-26s %.5f\n","snrm2",nrm);
         cudaFree(dA);cudaFree(dx);cudaFree(dy);
+    }
+    // 8. Mixed precision. Values are chosen to be exactly representable in the
+    // narrow formats, and k is small, so the accumulation is exact on both
+    // sides -- a disagreement here is a semantics bug, not rounding.
+    {
+        const int m=16,n=12,k=8;
+        auto small = [](size_t cnt, unsigned seed) {
+            std::vector<float> v(cnt); unsigned s=seed;
+            for (size_t i=0;i<cnt;++i){ s=s*1664525u+1013904223u; v[i]=(float)((int)(s>>20)%17-8)*0.25f; }
+            return v;
+        };
+        auto A=small((size_t)m*k,21), B=small((size_t)k*n,22), C=small((size_t)m*n,23);
+
+        auto run_half = [&](const char* tag, cudaDataType ctype, cublasComputeType_t comp) {
+            std::vector<__half> ha(A.size()), hb(B.size()), hc(C.size());
+            for (size_t i=0;i<A.size();++i) ha[i]=__float2half(A[i]);
+            for (size_t i=0;i<B.size();++i) hb[i]=__float2half(B[i]);
+            for (size_t i=0;i<C.size();++i) hc[i]=__float2half(C[i]);
+            void *dA,*dB,*dC;
+            cudaMalloc(&dA,ha.size()*2); cudaMalloc(&dB,hb.size()*2);
+            cudaMalloc(&dC,hc.size()* (ctype==CUDA_R_32F?4:2));
+            cudaMemcpy(dA,ha.data(),ha.size()*2,cudaMemcpyHostToDevice);
+            cudaMemcpy(dB,hb.data(),hb.size()*2,cudaMemcpyHostToDevice);
+            if (ctype==CUDA_R_32F) cudaMemcpy(dC,C.data(),C.size()*4,cudaMemcpyHostToDevice);
+            else cudaMemcpy(dC,hc.data(),hc.size()*2,cudaMemcpyHostToDevice);
+            float al=1.0f, be=0.5f;
+            cublasStatus_t st = cublasGemmEx(h,CUBLAS_OP_N,CUBLAS_OP_N,m,n,k,&al,dA,CUDA_R_16F,m,
+                                             dB,CUDA_R_16F,k,&be,dC,ctype,m,comp,
+                                             CUBLAS_GEMM_DEFAULT);
+            if (st) { printf("%-26s status=%d\n",tag,(int)st); }
+            else {
+                std::vector<float> out(C.size());
+                if (ctype==CUDA_R_32F) cudaMemcpy(out.data(),dC,out.size()*4,cudaMemcpyDeviceToHost);
+                else { std::vector<__half> t(C.size());
+                       cudaMemcpy(t.data(),dC,t.size()*2,cudaMemcpyDeviceToHost);
+                       for (size_t i=0;i<t.size();++i) out[i]=__half2float(t[i]); }
+                emit(tag,out);
+            }
+            cudaFree(dA);cudaFree(dB);cudaFree(dC);
+        };
+        run_half("gemmEx f16 in f16 out", CUDA_R_16F, CUBLAS_COMPUTE_32F);
+        run_half("gemmEx f16 in f32 out", CUDA_R_32F, CUBLAS_COMPUTE_32F);
+
+        {   // bfloat16 in and out
+            std::vector<__nv_bfloat16> ba(A.size()), bb(B.size()), bc(C.size());
+            for (size_t i=0;i<A.size();++i) ba[i]=__float2bfloat16(A[i]);
+            for (size_t i=0;i<B.size();++i) bb[i]=__float2bfloat16(B[i]);
+            for (size_t i=0;i<C.size();++i) bc[i]=__float2bfloat16(C[i]);
+            void *dA,*dB,*dC;
+            cudaMalloc(&dA,ba.size()*2); cudaMalloc(&dB,bb.size()*2); cudaMalloc(&dC,bc.size()*2);
+            cudaMemcpy(dA,ba.data(),ba.size()*2,cudaMemcpyHostToDevice);
+            cudaMemcpy(dB,bb.data(),bb.size()*2,cudaMemcpyHostToDevice);
+            cudaMemcpy(dC,bc.data(),bc.size()*2,cudaMemcpyHostToDevice);
+            float al=1.0f, be=0.5f;
+            cublasStatus_t st = cublasGemmEx(h,CUBLAS_OP_N,CUBLAS_OP_N,m,n,k,&al,dA,CUDA_R_16BF,m,
+                                             dB,CUDA_R_16BF,k,&be,dC,CUDA_R_16BF,m,
+                                             CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
+            if (st) printf("%-26s status=%d\n","gemmEx bf16",(int)st);
+            else {
+                std::vector<__nv_bfloat16> t(C.size());
+                cudaMemcpy(t.data(),dC,t.size()*2,cudaMemcpyDeviceToHost);
+                std::vector<float> out(t.size());
+                for (size_t i=0;i<t.size();++i) out[i]=__bfloat162float(t[i]);
+                emit("gemmEx bf16",out);
+            }
+            cudaFree(dA);cudaFree(dB);cudaFree(dC);
+        }
+
+        {   // int8 operands, int32 accumulator and output
+            std::vector<int8_t> ia(A.size()), ib(B.size());
+            std::vector<int32_t> ic(C.size());
+            for (size_t i=0;i<A.size();++i) ia[i]=(int8_t)(A[i]*4.0f);
+            for (size_t i=0;i<B.size();++i) ib[i]=(int8_t)(B[i]*4.0f);
+            for (size_t i=0;i<C.size();++i) ic[i]=(int32_t)(C[i]*4.0f);
+            void *dA,*dB,*dC;
+            cudaMalloc(&dA,ia.size()); cudaMalloc(&dB,ib.size()); cudaMalloc(&dC,ic.size()*4);
+            cudaMemcpy(dA,ia.data(),ia.size(),cudaMemcpyHostToDevice);
+            cudaMemcpy(dB,ib.data(),ib.size(),cudaMemcpyHostToDevice);
+            cudaMemcpy(dC,ic.data(),ic.size()*4,cudaMemcpyHostToDevice);
+            int32_t al=1, be=2;
+            // int8 GEMM wants column counts that are multiples of 4 on hardware;
+            // m, n and k here already satisfy that.
+            cublasStatus_t st = cublasGemmEx(h,CUBLAS_OP_N,CUBLAS_OP_N,m,n,k,&al,dA,CUDA_R_8I,m,
+                                             dB,CUDA_R_8I,k,&be,dC,CUDA_R_32I,m,
+                                             CUBLAS_COMPUTE_32I,CUBLAS_GEMM_DEFAULT);
+            if (st) printf("%-26s status=%d\n","gemmEx int8",(int)st);
+            else {
+                std::vector<int32_t> out(ic.size());
+                cudaMemcpy(out.data(),dC,out.size()*4,cudaMemcpyDeviceToHost);
+                long long s2=0, a2=0;
+                for (int32_t x:out){ s2+=x; a2+= x<0?-x:x; }
+                printf("%-26s n=%-6zu sum=%lld abssum=%lld first=%d last=%d\n",
+                       "gemmEx int8",out.size(),s2,a2,out.front(),out.back());
+            }
+            cudaFree(dA);cudaFree(dB);cudaFree(dC);
+        }
+
+        {   // Strided-batched mixed precision, the shape attention uses.
+            const int batch=3;
+            auto Ab=small((size_t)m*k*batch,31), Bb=small((size_t)k*n*batch,32),
+                 Cb=small((size_t)m*n*batch,33);
+            std::vector<__half> ha(Ab.size()), hb(Bb.size()), hc(Cb.size());
+            for (size_t i=0;i<Ab.size();++i) ha[i]=__float2half(Ab[i]);
+            for (size_t i=0;i<Bb.size();++i) hb[i]=__float2half(Bb[i]);
+            for (size_t i=0;i<Cb.size();++i) hc[i]=__float2half(Cb[i]);
+            void *dA,*dB,*dC;
+            cudaMalloc(&dA,ha.size()*2); cudaMalloc(&dB,hb.size()*2); cudaMalloc(&dC,hc.size()*2);
+            cudaMemcpy(dA,ha.data(),ha.size()*2,cudaMemcpyHostToDevice);
+            cudaMemcpy(dB,hb.data(),hb.size()*2,cudaMemcpyHostToDevice);
+            cudaMemcpy(dC,hc.data(),hc.size()*2,cudaMemcpyHostToDevice);
+            float al=1.0f, be=0.0f;
+            cublasStatus_t st = cublasGemmStridedBatchedEx(
+                h,CUBLAS_OP_N,CUBLAS_OP_N,m,n,k,&al,dA,CUDA_R_16F,m,(long long)m*k,
+                dB,CUDA_R_16F,k,(long long)k*n,&be,dC,CUDA_R_16F,m,(long long)m*n,batch,
+                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
+            if (st) printf("%-26s status=%d\n","gemmStridedBatchedEx",(int)st);
+            else {
+                std::vector<__half> t(hc.size());
+                cudaMemcpy(t.data(),dC,t.size()*2,cudaMemcpyDeviceToHost);
+                std::vector<float> out(t.size());
+                for (size_t i=0;i<t.size();++i) out[i]=__half2float(t[i]);
+                emit("gemmStridedBatchedEx",out);
+            }
+            cudaFree(dA);cudaFree(dB);cudaFree(dC);
+        }
+
+        {   // cublasHgemm: half in, half out, half alpha/beta.
+            std::vector<__half> ha(A.size()), hb(B.size()), hc(C.size());
+            for (size_t i=0;i<A.size();++i) ha[i]=__float2half(A[i]);
+            for (size_t i=0;i<B.size();++i) hb[i]=__float2half(B[i]);
+            for (size_t i=0;i<C.size();++i) hc[i]=__float2half(C[i]);
+            __half *dA,*dB,*dC;
+            cudaMalloc(&dA,ha.size()*2); cudaMalloc(&dB,hb.size()*2); cudaMalloc(&dC,hc.size()*2);
+            cudaMemcpy(dA,ha.data(),ha.size()*2,cudaMemcpyHostToDevice);
+            cudaMemcpy(dB,hb.data(),hb.size()*2,cudaMemcpyHostToDevice);
+            cudaMemcpy(dC,hc.data(),hc.size()*2,cudaMemcpyHostToDevice);
+            __half al=__float2half(1.0f), be=__float2half(0.5f);
+            cublasStatus_t st = cublasHgemm(h,CUBLAS_OP_N,CUBLAS_OP_N,m,n,k,&al,dA,m,dB,k,&be,dC,m);
+            if (st) printf("%-26s status=%d\n","hgemm",(int)st);
+            else {
+                std::vector<__half> t(hc.size());
+                cudaMemcpy(t.data(),dC,t.size()*2,cudaMemcpyDeviceToHost);
+                std::vector<float> out(t.size());
+                for (size_t i=0;i<t.size();++i) out[i]=__half2float(t[i]);
+                emit("hgemm",out);
+            }
+            cudaFree(dA);cudaFree(dB);cudaFree(dC);
+        }
     }
     CK(cublasDestroy(h));
     return 0;

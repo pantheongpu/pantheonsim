@@ -1,10 +1,13 @@
 // Register pressure and occupancy.
 //
 // The counts are an estimate: PTX declares virtual registers and ptxas
-// allocates physical ones, so this does its own liveness + linear scan. It
-// matched hardware exactly on a simple kernel and over-estimated a
-// register-heavy one during development -- erring toward "needs more", which
-// is the safe direction for a tool that refuses launches.
+// allocates physical ones, so this solves liveness over the control-flow graph
+// and takes the peak. It matches hardware exactly on a simple kernel and
+// over-estimates a register-heavy one -- erring toward "needs more", which is
+// the safe direction for a tool that refuses launches. Erring too far is not
+// safe, though: an over-estimate that crosses the hardware limit refuses a
+// launch that would have worked, which is what a cruder approximation here
+// used to do.
 #include "vgpu/ptx/regalloc.hpp"
 
 #include <string>
@@ -106,6 +109,35 @@ DONE:
     ret;
   )");
   VCHECK(u.peak_live >= 3);  // accumulator, counter and bound all live in the loop
+}
+
+// The counterpart to the test above, and the one that was missing: a value
+// whose whole life is inside one iteration must not be charged for the loop.
+// Treating "overlaps the loop" as "live across the loop" reported 328
+// registers for a grid-stride kernel that ptxas compiles into 14, and refused
+// launches hardware accepts.
+VTEST(values_dead_within_an_iteration_do_not_inflate_the_loop) {
+  auto u = usage_of(R"(
+    .reg .pred %p<2>;
+    .reg .b32 %r<40>;
+    mov.u32 %r1, 0;
+    mov.u32 %r2, 100;
+LOOP:
+    setp.ge.u32 %p1, %r1, %r2;
+    @%p1 bra DONE;
+    add.s32 %r10, %r1, 1;
+    add.s32 %r11, %r10, 1;
+    add.s32 %r12, %r11, 1;
+    add.s32 %r13, %r12, 1;
+    add.s32 %r14, %r13, 1;
+    add.s32 %r15, %r14, 1;
+    add.s32 %r1, %r15, 1;
+    bra LOOP;
+DONE:
+    ret;
+  )");
+  // %r1 and %r2 live across the loop, plus at most one temporary at a time.
+  VCHECK(u.peak_live <= 4);
 }
 
 VTEST(occupancy_matches_the_standard_calculation) {

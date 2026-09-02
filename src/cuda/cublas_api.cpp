@@ -19,6 +19,8 @@
 // respected. Results are computed in the requested precision so they can be
 // compared against real cuBLAS -- which is how these were validated.
 #include <cublas_v2.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cmath>
 #include <cstdio>
@@ -114,6 +116,101 @@ void gemm_host(cublasOperation_t transa, cublasOperation_t transb, int m, int n,
 
 // Elements a column-major matrix occupies given its leading dimension.
 size_t extent(int ld, int cols) { return static_cast<size_t>(ld) * cols; }
+
+/* ---- mixed precision ----
+   GemmEx lets every operand carry its own type. Rather than instantiate the
+   product of all of them, narrow operands are widened to float on the way in
+   and narrowed again on the way out; the conversions come from the toolkit's
+   own host-callable intrinsics rather than hand-written bit twiddling.
+   Accumulation is in float, which is what a tensor core does under
+   CUBLAS_COMPUTE_32F. */
+
+bool load_as_float(const void* dev, size_t n, cudaDataType t, std::vector<float>* out) {
+  out->assign(n, 0.0f);
+  if (!n) return true;
+  switch (t) {
+    case CUDA_R_32F:
+      return cudaMemcpy(out->data(), dev, n * sizeof(float), kD2H) == cudaSuccess;
+    case CUDA_R_16F: {
+      auto raw = fetch<__half>(dev, n);
+      for (size_t i = 0; i < n; ++i) (*out)[i] = __half2float(raw[i]);
+      return true;
+    }
+    case CUDA_R_16BF: {
+      auto raw = fetch<__nv_bfloat16>(dev, n);
+      for (size_t i = 0; i < n; ++i) (*out)[i] = __bfloat162float(raw[i]);
+      return true;
+    }
+    default: return false;
+  }
+}
+
+bool store_from_float(void* dev, const std::vector<float>& host, cudaDataType t) {
+  if (host.empty()) return true;
+  switch (t) {
+    case CUDA_R_32F:
+      return cudaMemcpy(dev, host.data(), host.size() * sizeof(float), kH2D) == cudaSuccess;
+    case CUDA_R_16F: {
+      std::vector<__half> raw(host.size());
+      for (size_t i = 0; i < host.size(); ++i) raw[i] = __float2half(host[i]);
+      store(dev, raw);
+      return true;
+    }
+    case CUDA_R_16BF: {
+      std::vector<__nv_bfloat16> raw(host.size());
+      for (size_t i = 0; i < host.size(); ++i) raw[i] = __float2bfloat16(host[i]);
+      store(dev, raw);
+      return true;
+    }
+    default: return false;
+  }
+}
+
+size_t type_bytes(cudaDataType t) {
+  switch (t) {
+    case CUDA_R_8I: return 1;
+    case CUDA_R_16F: case CUDA_R_16BF: return 2;
+    case CUDA_R_32F: case CUDA_R_32I: return 4;
+    case CUDA_R_64F: return 8;
+    default: return 0;
+  }
+}
+
+bool is_narrow_float(cudaDataType t) {
+  return t == CUDA_R_32F || t == CUDA_R_16F || t == CUDA_R_16BF;
+}
+
+// C = alpha * op(A) * op(B) + beta * C over already-widened host operands.
+void gemm_float(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+                float alpha, const std::vector<float>& A, int lda, const std::vector<float>& B,
+                int ldb, float beta, std::vector<float>& C, int ldc) {
+  const bool ta = transa != CUBLAS_OP_N, tb = transb != CUBLAS_OP_N;
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) {
+      float acc = 0.0f;
+      for (int p = 0; p < k; ++p)
+        acc += A[ta ? idx(p, i, lda) : idx(i, p, lda)] * B[tb ? idx(j, p, ldb) : idx(p, j, ldb)];
+      float& c = C[idx(i, j, ldc)];
+      c = beta == 0.0f ? alpha * acc : alpha * acc + beta * c;
+    }
+}
+
+// The int8 path: operands are int8, the product accumulates in int32, and C is
+// int32. Nothing is widened to float, because rounding would change the answer.
+void gemm_int8(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+               int32_t alpha, const std::vector<int8_t>& A, int lda, const std::vector<int8_t>& B,
+               int ldb, int32_t beta, std::vector<int32_t>& C, int ldc) {
+  const bool ta = transa != CUBLAS_OP_N, tb = transb != CUBLAS_OP_N;
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) {
+      int32_t acc = 0;
+      for (int p = 0; p < k; ++p)
+        acc += static_cast<int32_t>(A[ta ? idx(p, i, lda) : idx(i, p, lda)]) *
+               static_cast<int32_t>(B[tb ? idx(j, p, ldb) : idx(p, j, ldb)]);
+      int32_t& c = C[idx(i, j, ldc)];
+      c = beta == 0 ? alpha * acc : alpha * acc + beta * c;
+    }
+}
 
 template <class T, class Acc>
 cublasStatus_t do_gemm(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
@@ -347,9 +444,93 @@ VGPU_EXPORT cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta,
   if (Atype == CUDA_R_64F && Btype == CUDA_R_64F && Ctype == CUDA_R_64F)
     return do_gemm<double, double>(h, ta, tb, m, n, k, static_cast<const double*>(alpha), A, lda, B,
                                    ldb, static_cast<const double*>(beta), C, ldc);
+  // Mixed precision: half or bfloat16 operands accumulated in float, which is
+  // what a tensor core does under CUBLAS_COMPUTE_32F. C may be narrower than
+  // the accumulator, so it is rounded once on the way out.
+  if (is_narrow_float(Atype) && is_narrow_float(Btype) && is_narrow_float(Ctype) &&
+      computeType != CUBLAS_COMPUTE_32I && computeType != CUBLAS_COMPUTE_64F) {
+    if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (m < 0 || n < 0 || k < 0 || lda < 1 || ldb < 1 || ldc < m)
+      return CUBLAS_STATUS_INVALID_VALUE;
+    if (!alpha || !beta || !C) return CUBLAS_STATUS_INVALID_VALUE;
+    if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
+    // alpha and beta are float here whatever the operand types, except under
+    // CUBLAS_COMPUTE_16F where the API says they are half.
+    float a, b;
+    if (computeType == CUBLAS_COMPUTE_16F || computeType == CUBLAS_COMPUTE_16F_PEDANTIC) {
+      auto widen = [&](const void* p) {
+        __half v;
+        if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE)
+          v = fetch<__half>(p, 1)[0];
+        else
+          v = *static_cast<const __half*>(p);
+        return __half2float(v);
+      };
+      a = widen(alpha);
+      b = widen(beta);
+    } else {
+      a = scalar(h, static_cast<const float*>(alpha));
+      b = scalar(h, static_cast<const float*>(beta));
+    }
+    std::vector<float> hA, hB, hC;
+    if (!load_as_float(A, extent(lda, ta == CUBLAS_OP_N ? k : m), Atype, &hA) ||
+        !load_as_float(B, extent(ldb, tb == CUBLAS_OP_N ? n : k), Btype, &hB) ||
+        !load_as_float(C, extent(ldc, n), Ctype, &hC))
+      return CUBLAS_STATUS_NOT_SUPPORTED;
+    gemm_float(ta, tb, m, n, k, a, hA, lda, hB, ldb, b, hC, ldc);
+    return store_from_float(C, hC, Ctype) ? CUBLAS_STATUS_SUCCESS
+                                          : CUBLAS_STATUS_NOT_SUPPORTED;
+  }
+
+  // The quantized path: int8 operands, int32 accumulator and output.
+  if (Atype == CUDA_R_8I && Btype == CUDA_R_8I && Ctype == CUDA_R_32I) {
+    if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (m < 0 || n < 0 || k < 0 || lda < 1 || ldb < 1 || ldc < m)
+      return CUBLAS_STATUS_INVALID_VALUE;
+    if (!alpha || !beta || !C) return CUBLAS_STATUS_INVALID_VALUE;
+    if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
+    const int32_t a = scalar(h, static_cast<const int32_t*>(alpha));
+    const int32_t b = scalar(h, static_cast<const int32_t*>(beta));
+    auto hA = fetch<int8_t>(A, extent(lda, ta == CUBLAS_OP_N ? k : m));
+    auto hB = fetch<int8_t>(B, extent(ldb, tb == CUBLAS_OP_N ? n : k));
+    auto hC = fetch<int32_t>(C, extent(ldc, n));
+    gemm_int8(ta, tb, m, n, k, a, hA, lda, hB, ldb, b, hC, ldc);
+    store(C, hC);
+    return CUBLAS_STATUS_SUCCESS;
+  }
+
   if (trace())
     std::fprintf(stderr,
                  "[vgpu] cublasGemmEx: unsupported type combination (A=%d B=%d C=%d compute=%d)\n",
                  (int)Atype, (int)Btype, (int)Ctype, (int)computeType);
   return CUBLAS_STATUS_NOT_SUPPORTED;
+}
+
+VGPU_EXPORT cublasStatus_t cublasGemmStridedBatchedEx(
+    cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+    const void* alpha, const void* A, cudaDataType Atype, int lda, long long strideA,
+    const void* B, cudaDataType Btype, int ldb, long long strideB, const void* beta, void* C,
+    cudaDataType Ctype, int ldc, long long strideC, int batchCount,
+    cublasComputeType_t computeType, cublasGemmAlgo_t algo) {
+  const size_t ea = type_bytes(Atype), eb = type_bytes(Btype), ec = type_bytes(Ctype);
+  if (!ea || !eb || !ec) return CUBLAS_STATUS_NOT_SUPPORTED;
+  for (int i = 0; i < batchCount; ++i) {
+    const cublasStatus_t s = cublasGemmEx(
+        h, ta, tb, m, n, k, alpha, static_cast<const char*>(A) + (size_t)i * strideA * ea, Atype,
+        lda, static_cast<const char*>(B) + (size_t)i * strideB * eb, Btype, ldb, beta,
+        static_cast<char*>(C) + (size_t)i * strideC * ec, Ctype, ldc, computeType, algo);
+    if (s != CUBLAS_STATUS_SUCCESS) return s;
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+// cublasHgemm accumulates in half on hardware only when the math mode asks for
+// it; the default path uses a float accumulator, which is what this does.
+VGPU_EXPORT cublasStatus_t cublasHgemm(cublasHandle_t h, cublasOperation_t ta,
+                                       cublasOperation_t tb, int m, int n, int k,
+                                       const __half* alpha, const __half* A, int lda,
+                                       const __half* B, int ldb, const __half* beta, __half* C,
+                                       int ldc) {
+  return cublasGemmEx(h, ta, tb, m, n, k, alpha, A, CUDA_R_16F, lda, B, CUDA_R_16F, ldb, beta, C,
+                      CUDA_R_16F, ldc, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT);
 }

@@ -137,4 +137,46 @@ VTEST(only_64bit_address_size_supported) {
   VCHECK(err.code() == Err::UnsupportedPtx);
 }
 
+// nvcc emits a prototype ahead of the definition whenever something refers to
+// a kernel before it appears -- taking its address, for instance, which is
+// exactly what NVRTC's name expressions compile to.
+VTEST(entry_prototype_is_a_declaration_not_a_definition) {
+  Module m = parse(
+      ".version 8.3\n.target sm_90\n.address_size 64\n"
+      ".visible .entry k(\n.param .u64 k_param_0\n)\n;\n"
+      ".visible .entry k(\n.param .u64 k_param_0\n)\n{\nret;\n}\n");
+  VCHECK_EQ(m.entries.size(), size_t{1});
+  VCHECK_EQ(m.entries[0].name, std::string("k"));
+  VCHECK_EQ(m.entries[0].body.size(), size_t{1});
+}
+
+// The lexer gives numbers and identifiers the same token kind, so a scalar
+// initialiser is one character away from being mistaken for a symbol -- which
+// silently zeroed every initialised global the first time this was written.
+VTEST(global_scalar_initialiser_is_not_a_symbol) {
+  Module m = parse(
+      ".version 8.3\n.target sm_90\n.address_size 64\n"
+      ".global .align 4 .u32 answer = 42;\n"
+      ".global .align 4 .f32 one = 0f3F800000;\n"
+      ".visible .entry k()\n{\nret;\n}\n");
+  VCHECK_EQ(m.globals.size(), size_t{2});
+  VCHECK(m.globals[0].init_symbol.empty());
+  VCHECK_EQ(m.globals[0].init.size(), size_t{4});
+  VCHECK_EQ(int(m.globals[0].init[0]), 42);
+  VCHECK(m.globals[1].init_symbol.empty());
+  VCHECK_EQ(m.globals[1].init.size(), size_t{4});
+}
+
+VTEST(global_initialised_with_a_symbol) {
+  Module m = parse(
+      ".version 8.3\n.target sm_90\n.address_size 64\n"
+      ".global .align 4 .u32 target[4];\n"
+      ".global .align 8 .u64 pointer = target;\n"
+      ".visible .entry k()\n{\nret;\n}\n");
+  VCHECK_EQ(m.globals.size(), size_t{2});
+  VCHECK_EQ(m.globals[1].name, std::string("pointer"));
+  VCHECK_EQ(m.globals[1].init_symbol, std::string("target"));
+  VCHECK(m.globals[1].init.empty());  // the address is only known at load time
+}
+
 VTEST_MAIN

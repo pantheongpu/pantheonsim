@@ -83,36 +83,72 @@ RegisterUsage analyze_registers(const EntryFn& fn) {
   if (fn.num_regs == 0 || fn.body.empty()) return out;
 
   const size_t n = fn.body.size();
-  constexpr size_t kNone = static_cast<size_t>(-1);
-  std::vector<size_t> first(fn.num_regs, kNone), last(fn.num_regs, 0);
 
+  // Per-instruction definitions and uses, deduplicated.
+  std::vector<std::vector<uint32_t>> defs(n), uses(n);
   for (size_t i = 0; i < n; ++i) {
-    std::vector<uint32_t> defs, uses;
-    collect(fn.body[i], defs, uses);
-    for (uint32_t id : defs) {
-      if (id >= fn.num_regs) continue;
-      if (first[id] == kNone) first[id] = i;
-      last[id] = std::max(last[id], i);
-    }
-    for (uint32_t id : uses) {
-      if (id >= fn.num_regs) continue;
-      if (first[id] == kNone) first[id] = i;  // used before any def we saw
-      last[id] = std::max(last[id], i);
-    }
+    std::vector<uint32_t> d, u;
+    collect(fn.body[i], d, u);
+    auto keep = [&](std::vector<uint32_t>& src, std::vector<uint32_t>& dst) {
+      std::sort(src.begin(), src.end());
+      src.erase(std::unique(src.begin(), src.end()), src.end());
+      for (uint32_t id : src)
+        if (id < fn.num_regs) dst.push_back(id);
+    };
+    keep(d, defs[i]);
+    keep(u, uses[i]);
   }
 
-  // A value live anywhere inside a loop stays live for the whole loop, since
-  // the back edge can return to the top with it still needed.
-  for (size_t i = 0; i < n; ++i) {
-    const auto* br = std::get_if<OpBra>(&fn.body[i].op);
-    if (!br || br->target > i) continue;  // forward branch: not a loop edge
-    size_t lo = br->target, hi = i;
-    for (uint32_t id = 0; id < fn.num_regs; ++id) {
-      if (first[id] == kNone) continue;
-      if (first[id] <= hi && last[id] >= lo) {  // overlaps the loop body
-        first[id] = std::min(first[id], lo);
-        last[id] = std::max(last[id], hi);
+  // Successors. An unpredicated branch goes only to its target; a predicated
+  // one may also fall through; ret ends the path.
+  auto successors = [&](size_t i, size_t* buf) -> int {
+    const Instr& ins = fn.body[i];
+    if (std::holds_alternative<OpRet>(ins.op)) return 0;
+    if (const auto* br = std::get_if<OpBra>(&ins.op)) {
+      int cnt = 0;
+      if (br->target < n) buf[cnt++] = br->target;
+      if (ins.has_pred && i + 1 < n) buf[cnt++] = i + 1;
+      return cnt;
+    }
+    if (i + 1 < n) { buf[0] = i + 1; return 1; }
+    return 0;
+  };
+
+  // Backward dataflow liveness. The earlier version approximated a live range
+  // as first-definition to last-use and then extended everything that touched
+  // a loop across the whole loop body -- which made every value in a
+  // grid-stride loop look simultaneously live and reported 328 registers for a
+  // kernel ptxas compiles into 14. A real fixed-point solve costs a few passes
+  // and gets the answer right:
+  //     live_out[i] = union of live_in over successors
+  //     live_in[i]  = uses[i] + (live_out[i] - defs[i])
+  const size_t words = (fn.num_regs + 63) / 64;
+  std::vector<uint64_t> live_in(n * words, 0), live_out(n * words, 0), scratch(words, 0);
+  auto bit_set = [](uint64_t* w, uint32_t id) { w[id >> 6] |= 1ull << (id & 63); };
+  auto bit_clear = [](uint64_t* w, uint32_t id) { w[id >> 6] &= ~(1ull << (id & 63)); };
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (size_t ii = n; ii-- > 0;) {
+      std::fill(scratch.begin(), scratch.end(), 0ull);
+      size_t succ[2];
+      const int ns = successors(ii, succ);
+      for (int k = 0; k < ns; ++k) {
+        const uint64_t* in = &live_in[succ[k] * words];
+        for (size_t w = 0; w < words; ++w) scratch[w] |= in[w];
       }
+      uint64_t* out_i = &live_out[ii * words];
+      for (size_t w = 0; w < words; ++w)
+        if (out_i[w] != scratch[w]) { out_i[w] = scratch[w]; changed = true; }
+
+      // live_in = uses + (live_out - defs)
+      for (size_t w = 0; w < words; ++w) scratch[w] = out_i[w];
+      for (uint32_t id : defs[ii]) bit_clear(scratch.data(), id);
+      for (uint32_t id : uses[ii]) bit_set(scratch.data(), id);
+      uint64_t* in_i = &live_in[ii * words];
+      for (size_t w = 0; w < words; ++w)
+        if (in_i[w] != scratch[w]) { in_i[w] = scratch[w]; changed = true; }
     }
   }
 
@@ -127,31 +163,33 @@ RegisterUsage analyze_registers(const EntryFn& fn) {
     width[id] = slots_for(it->second);
   }
 
-  // Linear scan for the peak of simultaneously live values.
-  std::vector<int32_t> delta(n + 1, 0), pred_delta(n + 1, 0);
-  for (uint32_t id = 0; id < fn.num_regs; ++id) {
-    if (first[id] == kNone) continue;
-    if (is_pred[id]) {
-      pred_delta[first[id]] += 1;
-      pred_delta[last[id] + 1] -= 1;
-    } else {
-      delta[first[id]] += static_cast<int32_t>(width[id]);
-      delta[last[id] + 1] -= static_cast<int32_t>(width[id]);
+  // Peak pressure: at each instruction, what is live on the way out plus
+  // whatever this instruction defines -- a dead definition still needs a
+  // register while it is being written.
+  uint32_t peak = 0, ppeak = 0;
+  for (size_t i = 0; i < n; ++i) {
+    std::fill(scratch.begin(), scratch.end(), 0ull);
+    const uint64_t* out_i = &live_out[i * words];
+    for (size_t w = 0; w < words; ++w) scratch[w] = out_i[w];
+    for (uint32_t id : defs[i]) bit_set(scratch.data(), id);
+    uint32_t live = 0, plive = 0;
+    for (size_t w = 0; w < words; ++w) {
+      uint64_t bits = scratch[w];
+      while (bits) {
+        const uint32_t id = static_cast<uint32_t>(w * 64 + __builtin_ctzll(bits));
+        bits &= bits - 1;
+        if (is_pred[id]) ++plive;
+        else live += width[id];
+      }
     }
-  }
-  int32_t live = 0, peak = 0, plive = 0, ppeak = 0;
-  for (size_t i = 0; i <= n; ++i) {
-    live += delta[i];
-    plive += pred_delta[i];
     peak = std::max(peak, live);
     ppeak = std::max(ppeak, plive);
   }
 
-  out.peak_live = static_cast<uint32_t>(peak);
-  out.pred_regs = static_cast<uint32_t>(ppeak);
+  out.peak_live = peak;
+  out.pred_regs = ppeak;
   // Round up to the hardware's allocation granularity.
-  out.regs_per_thread =
-      ((static_cast<uint32_t>(peak) + kAllocGranularity - 1) / kAllocGranularity) * kAllocGranularity;
+  out.regs_per_thread = ((peak + kAllocGranularity - 1) / kAllocGranularity) * kAllocGranularity;
   if (out.regs_per_thread == 0) out.regs_per_thread = kAllocGranularity;
   return out;
 }

@@ -131,7 +131,10 @@ class Parser {
       }
       if (t.text == ".entry") {
         next();
-        m.entries.push_back(parse_entry());
+        EntryFn fn;
+        // A prototype (".entry name(params);") declares a kernel defined later
+        // or elsewhere; only a definition carries a body worth keeping.
+        if (parse_entry(&fn)) m.entries.push_back(std::move(fn));
         continue;
       }
       if (t.text == ".global" || t.text == ".const") {
@@ -212,6 +215,12 @@ class Parser {
 
   // ---- module-scope .global/.const variables ----
 
+  // PTX identifiers start with a letter, '_' or '$'; numeric literals (including
+  // "0f3F800000" floats) start with a digit or a sign.
+  static bool is_identifier_start(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$';
+  }
+
   GlobalVar parse_global(size_t line) {
     GlobalVar g;
     // Optional modifiers before the type.
@@ -246,6 +255,12 @@ class Parser {
           if (peek_punct(",")) next();
         }
         next();  // '}'
+      } else if (peek().kind == Token::Kind::Word && is_identifier_start(peek().text[0])) {
+        // "= some_symbol": the initialiser is another symbol's address, which
+        // only exists once the module is loaded. The lexer gives numbers and
+        // identifiers the same token kind, so the first character is what
+        // separates them -- "= 5" is a value, not a symbol named "5".
+        g.init_symbol = next().text;
       } else {
         int64_t v = expect_int("initializer");
         for (uint32_t b = 0; b < ty.bytes(); ++b)
@@ -253,7 +268,9 @@ class Parser {
       }
       if (g.init.size() > g.size)
         fail(line, "initializer for '" + g.name + "' longer than its declared size");
-      g.init.resize(g.size, 0);
+      // A symbol initialiser leaves no bytes here: the address is written by
+      // the loader once every global has one.
+      if (g.init_symbol.empty()) g.init.resize(g.size, 0);
     }
     expect_punct(";");
     return g;
@@ -261,8 +278,10 @@ class Parser {
 
   // ---- entry functions ----
 
-  EntryFn parse_entry() {
-    EntryFn fn;
+  // Returns false when this was a declaration rather than a definition, in
+  // which case *out is not meaningful.
+  bool parse_entry(EntryFn* out) {
+    EntryFn& fn = *out;
     cur_fn_ = &fn;
     fn.name = expect_word("kernel name");
     current_kernel_ = fn.name;
@@ -326,6 +345,12 @@ class Parser {
         break;
       }
     }
+    if (peek_punct(";")) {  // prototype, no body
+      next();
+      current_kernel_.clear();
+      cur_fn_ = nullptr;
+      return false;
+    }
     expect_punct("{");
     parse_body(fn);
     // Dynamic shared memory lives above every static allocation.
@@ -333,7 +358,7 @@ class Parser {
       if (d.dynamic) d.offset = fn.static_shared_size;
     current_kernel_.clear();
     cur_fn_ = nullptr;
-    return fn;
+    return true;
   }
 
   void parse_body(EntryFn& fn) {

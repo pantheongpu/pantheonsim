@@ -37,7 +37,7 @@ Working today, all CPU-only:
 | Driver API | `libvgpucuda.so` + clean-room `vgpu_cuda.h`: init/discovery/context/memory/module/`cuLaunchKernel`, `cuLibrary`/`cuKernel`, `cuGetProcAddress` |
 | Runtime API | `libvgpucudart` (drop-in `libcudart.so.13`): the CUDA **Runtime** API + nvcc host-registration ABI, so unmodified nvcc apps run unchanged |
 | Fatbin | extracts embedded PTX from nvcc fatbins (uncompressed + zstd) |
-| Vendor libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER and NCCL under their real sonames, each differential-tested against NVIDIA's own library on a physical GPU — see [docs/libraries.md](docs/libraries.md) |
+| Vendor libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL and NVRTC under their real sonames, each differential-tested against NVIDIA's own library on a physical GPU — see [docs/libraries.md](docs/libraries.md) |
 | Discovery | live telemetry + NVML; drop-in `nvidia-smi`, `rocm-smi`, `rocm_agent_enumerator`, and `lspci` output — see [docs/telemetry.md](docs/telemetry.md) |
 | NVENC | `libnvidia-encode.so.1` with a deterministic content-derived encoder, so video-encode SDC tests run |
 | Proof | an nvcc-compiled CUDA program **and** the unmodified pantheon stress kernels run on the CPU; `memory_read` differential-matches a physical RTX 3060 (incl. fault injection + device printf) |

@@ -83,10 +83,10 @@ profiles. B200 had no Lambda capacity; AMD parts are not offered there.
 ## Register and occupancy modeling
 
 PTX declares *virtual* registers, so counting declarations says nothing about
-what a thread occupies. `src/ptx/regalloc.cpp` runs liveness over the
-instruction stream (extending ranges across loop back edges) and a linear scan
-for the peak, counts a 64-bit value as a register pair as the hardware does,
-keeps predicates in their own file, and rounds to the allocation granularity.
+what a thread occupies. `src/ptx/regalloc.cpp` solves liveness over the
+control-flow graph to a fixed point and takes the peak, counts a 64-bit value
+as a register pair as the hardware does, keeps predicates in their own file,
+and rounds to the allocation granularity.
 
 That count is functional, not decorative:
 - a block needing more registers than the device allows fails with
@@ -97,10 +97,20 @@ That count is functional, not decorative:
   calculation instead of returning a placeholder.
 
 Checked against a physical RTX 3060: a simple kernel reports **8 registers and
-6 blocks/SM on both**. A register-heavy kernel reports 48 where hardware says
-24 -- the estimate is conservative, because ptxas rematerializes and schedules
-in ways this analysis does not model. Erring toward "needs more" is the safe
-direction for something that refuses launches.
+6 blocks/SM on both**. Measured against `ptxas -v` across the pantheon kernels,
+this analysis lands a little *under* the real allocation -- 8 vs 14, 16 vs 20,
+24 vs 26, 16 vs 24 -- because ptxas keeps values live longer than the data flow
+requires in order to hide latency. So treat it as a lower bound on what a
+thread needs: the launch refusal only fires when a kernel is genuinely
+impossible, and the occupancy figure is optimistic by the same margin.
+
+It used to err the other way, and far harder. Approximating a live range as
+first-definition-to-last-use and then extending everything that touched a loop
+across the whole loop body made every value in a grid-stride kernel look
+simultaneously live: 328 registers for a kernel ptxas compiles into 14, and 10
+of the 46 pantheon workloads refused to launch. The lesson is that a
+conservative estimate is only safe while it stays under the hardware limit --
+past that it stops being caution and starts being a false negative.
 
 ## Ecosystem tools that work today
 
@@ -111,7 +121,7 @@ direction for something that refuses launches.
   (see docs/telemetry.md for why the stock nvidia-smi binary cannot be used).
 
 **Vendor libraries.** cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE,
-cuSOLVER and NCCL are implemented under their real sonames, each verified
+cuSOLVER, NCCL and NVRTC are implemented under their real sonames, each verified
 against NVIDIA's own library on a physical GPU: cuDNN, cuFFT and cuSPARSE are
 bit-identical on every value the conformance suite reports, cuSOLVER on
 everything but one f32 eigenvalue, and NCCL on all 24 values at two ranks
@@ -119,8 +129,11 @@ across two physical GPUs. The math runs on the host rather than through the
 interpreter, because a vendor library is not user code — see docs/libraries.md
 for the boundary, the per-library scope, and what each one deliberately refuses.
 
-Not yet: NPP, nvJPEG, NVRTC (a CUDA C++ compiler is a different project),
-`nvidia-smi topo -m`, DCGM. PyTorch also ships thousands of its own kernels,
+NVRTC works by invoking the toolkit's own nvcc, which runs on the host and
+needs no GPU -- so runtime-compiled kernels (CuPy, Numba, Triton, inductor)
+reach the interpreter through the driver API like any other PTX.
+
+Not yet: NPP, nvJPEG, `nvidia-smi topo -m`, DCGM. PyTorch also ships thousands of its own kernels,
 which would run on the interpreter, so `import torch` finding a usable GPU is
 still a separate question from library coverage.
 

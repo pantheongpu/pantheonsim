@@ -171,6 +171,7 @@ if(CUDA_ABI_INCLUDE)
     "cufft:12:cufft_api"
     "cusparse:12:cusparse_api"
     "cusolver:12:cusolver_api"
+    "nvrtc:13:nvrtc_api"
   )
   foreach(_entry IN LISTS _vgpu_libs)
     string(REPLACE ":" ";" _parts "${_entry}")

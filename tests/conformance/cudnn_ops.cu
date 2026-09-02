@@ -83,6 +83,9 @@ static void run() {
   conv_case(h, "conv 3x3 stride2", 1, 2, 9, 9, 3, 3, 3, 0, 2, 1, 1, CUDNN_CROSS_CORRELATION);
   conv_case(h, "conv 3x3 dilate2", 1, 2, 9, 9, 3, 3, 3, 2, 1, 2, 1, CUDNN_CROSS_CORRELATION);
   conv_case(h, "conv flipped kernel", 1, 2, 7, 7, 3, 3, 3, 1, 1, 1, 1, CUDNN_CONVOLUTION);
+  // Flipping and dilation interact: the flip is applied to the filter index,
+  // then dilation to the flipped one, so the two together need their own case.
+  conv_case(h, "conv flipped dilate2", 1, 2, 9, 9, 3, 3, 3, 2, 1, 2, 1, CUDNN_CONVOLUTION);
   conv_case(h, "conv grouped g=2", 1, 4, 7, 7, 4, 3, 3, 1, 1, 1, 2, CUDNN_CROSS_CORRELATION);
   conv_case(h, "conv 1x1", 2, 5, 6, 6, 7, 1, 1, 0, 1, 1, 1, CUDNN_CROSS_CORRELATION);
 

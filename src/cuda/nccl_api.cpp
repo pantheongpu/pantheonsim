@@ -37,6 +37,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 namespace {
@@ -69,6 +72,14 @@ struct Meta {
   std::atomic<uint64_t> taken[kMaxRanks][kMaxRanks];   // ... and received
   std::atomic<uint64_t> bytes[kMaxRanks][kMaxRanks];   // size of the message in flight
 };
+
+// The rendezvous lives in a file two processes map at different addresses, so
+// every atomic in it has to be address-free -- a lock-backed atomic would
+// synchronise the wrong thing entirely.
+static_assert(std::atomic<uint64_t>::is_always_lock_free,
+              "NCCL rendezvous needs lock-free 64-bit atomics in shared memory");
+static_assert(std::atomic<uint32_t>::is_always_lock_free,
+              "NCCL rendezvous needs lock-free 32-bit atomics in shared memory");
 
 std::string rendezvous_dir() {
   if (const char* d = std::getenv("VGPU_NCCL_DIR")) return d;
@@ -255,104 +266,46 @@ size_t type_size(ncclDataType_t t) {
   }
 }
 
-/* ---- reduced-precision conversions -------------------------------------
-   Done by hand rather than through cuda_fp16.h so the shim builds with a plain
-   host compiler. These are the IEEE binary16 and the truncated-fp32 bfloat16
-   formats, plus the two OCP FP8 formats, all round-to-nearest-even. */
+/* ---- reduced-precision conversions ----
+   Through the vendor headers' own host-callable conversions rather than hand
+   written bit twiddling. Four formats' worth of rounding rules is exactly the
+   kind of thing that has silently produced wrong numbers in this repository
+   before, and the correct version already ships with the toolkit. */
 
-float half_to_float(uint16_t h) {
-  const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
-  const uint32_t exp = (h >> 10) & 0x1f;
-  uint32_t man = h & 0x3ff;
-  uint32_t bits;
-  if (exp == 0) {
-    if (man == 0) { bits = sign; }
-    else {  // subnormal: renormalize
-      int e = -1;
-      do { man <<= 1; ++e; } while (!(man & 0x400));
-      bits = sign | ((uint32_t)(127 - 15 - e) << 23) | ((man & 0x3ff) << 13);
-    }
-  } else if (exp == 31) {
-    bits = sign | 0x7f800000u | (man << 13);
-  } else {
-    bits = sign | ((exp - 15 + 127) << 23) | (man << 13);
-  }
-  float f; std::memcpy(&f, &bits, 4); return f;
+float half_to_float(uint16_t bits) {
+  __half v;
+  std::memcpy(&v, &bits, sizeof v);
+  return __half2float(v);
 }
-
 uint16_t float_to_half(float f) {
-  uint32_t x; std::memcpy(&x, &f, 4);
-  const uint16_t sign = (uint16_t)((x >> 16) & 0x8000);
-  const int32_t exp = (int32_t)((x >> 23) & 0xff) - 127 + 15;
-  const uint32_t man = x & 0x7fffff;
-  if (((x >> 23) & 0xff) == 0xff) return (uint16_t)(sign | 0x7c00 | (man ? 0x200 : 0));
-  if (exp >= 31) return (uint16_t)(sign | 0x7c00);        // overflow -> inf
-  if (exp <= 0) {
-    if (exp < -10) return sign;                            // underflow -> zero
-    const uint32_t m = man | 0x800000;
-    const int shift = 14 - exp;
-    uint32_t v = m >> shift;
-    if ((m >> (shift - 1)) & 1) {  // round to nearest, ties away is close enough
-      const uint32_t rest = m & ((1u << (shift - 1)) - 1);
-      if (rest || (v & 1)) ++v;
-    }
-    return (uint16_t)(sign | v);
-  }
-  uint16_t v = (uint16_t)(sign | (exp << 10) | (man >> 13));
-  if ((man & 0x1000) && ((man & 0xfff) || (v & 1))) ++v;   // round-to-nearest-even
-  return v;
+  const __half v = __float2half(f);
+  uint16_t bits;
+  std::memcpy(&bits, &v, sizeof bits);
+  return bits;
 }
-
-float bf16_to_float(uint16_t b) {
-  const uint32_t bits = (uint32_t)b << 16;
-  float f; std::memcpy(&f, &bits, 4); return f;
+float bf16_to_float(uint16_t bits) {
+  __nv_bfloat16 v;
+  std::memcpy(&v, &bits, sizeof v);
+  return __bfloat162float(v);
 }
-
 uint16_t float_to_bf16(float f) {
-  uint32_t x; std::memcpy(&x, &f, 4);
-  if (((x >> 23) & 0xff) == 0xff) return (uint16_t)(x >> 16);   // inf/nan pass through
-  const uint32_t rounded = x + 0x7fff + ((x >> 16) & 1);        // round-to-nearest-even
-  return (uint16_t)(rounded >> 16);
+  const __nv_bfloat16 v = __float2bfloat16(f);
+  uint16_t bits;
+  std::memcpy(&bits, &v, sizeof bits);
+  return bits;
 }
-
-// OCP FP8: e4m3 has bias 7 and no infinities; e5m2 has bias 15 and IEEE-shaped
-// specials. Both go through binary16, which represents every finite fp8 exactly.
-float fp8_to_float(uint8_t v, bool e4m3) {
-  const uint32_t sign = (uint32_t)(v & 0x80) << 8;
-  if (e4m3) {
-    const uint32_t exp = (v >> 3) & 0xf, man = v & 0x7;
-    if (exp == 0xf && man == 0x7) return half_to_float((uint16_t)(sign | 0x7e00));  // NaN
-    if (exp == 0) return half_to_float((uint16_t)(sign | (man << 7)));  // subnormal (bias matches)
-    return half_to_float((uint16_t)(sign | ((exp + 15 - 7) << 10) | (man << 7)));
-  }
-  return half_to_float((uint16_t)(sign | ((uint32_t)(v & 0x7f) << 8)));
+float e4m3_to_f(uint8_t bits) {
+  __nv_fp8_e4m3 v;
+  v.__x = bits;
+  return static_cast<float>(v);
 }
-
-uint8_t float_to_fp8(float f, bool e4m3) {
-  if (e4m3) {
-    const uint16_t h = float_to_half(f);
-    const uint8_t sign = (uint8_t)((h >> 8) & 0x80);
-    const int32_t exp = (int32_t)((h >> 10) & 0x1f) - 15 + 7;
-    const uint32_t man = h & 0x3ff;
-    if (((h >> 10) & 0x1f) == 0x1f) return (uint8_t)(sign | 0x7f);   // inf/nan -> NaN
-    if (exp >= 0xf && (exp > 0xf || (man >> 7) == 0x7)) return (uint8_t)(sign | 0x7e);  // max
-    if (exp <= 0) {
-      if (exp < -2) return sign;
-      const uint32_t m = man | 0x400;
-      const int shift = 8 - exp;
-      uint8_t out = (uint8_t)(m >> shift);
-      if ((m >> (shift - 1)) & 1) ++out;
-      return (uint8_t)(sign | out);
-    }
-    uint8_t out = (uint8_t)(sign | (exp << 3) | (man >> 7));
-    if ((man & 0x40) && ((man & 0x3f) || (out & 1))) ++out;
-    return out;
-  }
-  const uint16_t h = float_to_half(f);
-  uint8_t out = (uint8_t)(h >> 8);
-  if ((h & 0x80) && ((h & 0x7f) || (out & 1))) ++out;
-  return out;
+uint8_t f_to_e4m3(float f) { return static_cast<uint8_t>(__nv_fp8_e4m3(f).__x); }
+float e5m2_to_f(uint8_t bits) {
+  __nv_fp8_e5m2 v;
+  v.__x = bits;
+  return static_cast<float>(v);
 }
+uint8_t f_to_e5m2(float f) { return static_cast<uint8_t>(__nv_fp8_e5m2(f).__x); }
 
 /* ---- reductions ---- */
 
@@ -386,11 +339,6 @@ void reduce_narrow(void* acc, const void* in, size_t n, ncclRedOp_t op) {
     a[i] = FromF(r);
   }
 }
-
-float e4m3_to_f(uint8_t v) { return fp8_to_float(v, true); }
-uint8_t f_to_e4m3(float f) { return float_to_fp8(f, true); }
-float e5m2_to_f(uint8_t v) { return fp8_to_float(v, false); }
-uint8_t f_to_e5m2(float f) { return float_to_fp8(f, false); }
 
 bool reduce(void* acc, const void* in, size_t n, ncclDataType_t dt, ncclRedOp_t op) {
   switch (dt) {

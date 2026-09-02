@@ -36,6 +36,7 @@ for src in "$root"/tests/conformance/*.cu; do
   grep -q "cufft" "$src" && libs="$libs -lcufft"
   grep -q "cusparse" "$src" && libs="$libs -lcusparse"
   grep -q "cusolver" "$src" && libs="$libs -lcusolver"
+  grep -q "nvrtc" "$src" && libs="$libs -lnvrtc -lcuda"
   if grep -q "nccl" "$src"; then
     # NCCL, like cuDNN, ships outside the toolkit. Its headers are vendored.
     inc="$inc -I$root/third_party/nccl_include"

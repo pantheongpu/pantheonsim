@@ -259,6 +259,10 @@ struct GlobalVar {
   uint32_t align = 1;
   uint64_t size = 0;
   std::vector<uint8_t> init;  // empty or size bytes
+  // A pointer-valued global can be initialised with another symbol's address
+  // ("= my_array;"). The address is not known until the module is loaded, so
+  // the name is carried here and resolved then.
+  std::string init_symbol;
 };
 
 struct Module {
