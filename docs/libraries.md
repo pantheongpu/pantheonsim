@@ -97,6 +97,24 @@ round on the way out, so single-precision results are if anything slightly more
 accurate than hardware's. A real GPU does not reproduce its own results
 bit-for-bit across architectures either.
 
+## More than one GPU
+
+A virtual rack is `VGPU_DEVICE_COUNT` devices built from one profile. Each owns
+a disjoint window of the process address space, because CUDA guarantees unified
+virtual addressing: a device pointer is unique process-wide and identifies the
+device that owns it. Copies, memsets, frees and address-range lookups all
+resolve a device pointer against its owner rather than against whichever device
+happens to be current, so a cross-device `cudaMemcpyDeviceToDevice` moves the
+bytes it should. Without separate windows two devices hand out the same numeric
+address for different memory and that copy silently reads the wrong buffer --
+which is what it used to do.
+
+`tests/conformance/multi_gpu.cu` compares the semantics against a real
+multi-GPU machine: enumeration, per-device allocation and kernels,
+`cudaSetDevice` stickiness, allocation isolation, peer copies synchronous and
+asynchronous, device-to-device through the generic entry point, and an event on
+the destination device.
+
 ## NCCL: a file-backed transport
 
 There is no NVLink here, so NCCL moves bytes through a directory of
