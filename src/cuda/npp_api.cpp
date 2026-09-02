@@ -33,10 +33,10 @@
 
 #include <cuda_runtime.h>
 
-// The signal API's length parameter widened from int to size_t in NPP 13. A
-// definition that disagrees with the header is a compile error rather than a
-// silent mismatch -- the good outcome, but only if the type comes from the
-// header rather than being assumed.
+// The signal *operations* took an int length before NPP 13 and a size_t after;
+// the allocators took size_t all along. A definition that disagrees with the
+// header is a compile error rather than a silent mismatch -- the good outcome,
+// but only if the type comes from the header rather than being assumed.
 #if defined(NPP_VER_MAJOR) && NPP_VER_MAJOR >= 13
 using NppSignalLen = size_t;
 #else
@@ -151,7 +151,7 @@ VGPU_EXPORT void nppiFree(void* p) { cudaFree(p); }
 /* ---- signal memory ---- */
 
 #define VGPU_NPPS_MALLOC(SUFFIX, TYPE)                        \
-  VGPU_EXPORT TYPE* nppsMalloc_##SUFFIX(NppSignalLen n) {           \
+  VGPU_EXPORT TYPE* nppsMalloc_##SUFFIX(size_t n) {           \
     void* p = nullptr;                                        \
     if (cudaMalloc(&p, n * sizeof(TYPE)) != cudaSuccess) return nullptr; \
     return static_cast<TYPE*>(p);                             \

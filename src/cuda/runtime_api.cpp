@@ -673,6 +673,46 @@ VGPU_EXPORT cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t count
   return cudaMemcpy(dst, src, count, kind);
 }
 
+// Pitched allocations. Image code -- NPP included -- allocates rows padded to
+// an alignment and then copies rectangles rather than runs, so these are not
+// optional for anything that handles pictures.
+VGPU_EXPORT cudaError_t cudaMallocPitch(void** ptr, size_t* pitch, size_t width, size_t height) {
+  return guard("cudaMallocPitch", [&](State& s) {
+    if (!ptr || !pitch) return cudaErrorInvalidValue;
+    if (width == 0 || height == 0) {
+      *ptr = nullptr;
+      *pitch = 0;
+      return cudaSuccess;
+    }
+    // 512 bytes is the alignment CUDA documents for pitched allocations and the
+    // one NPP's own allocators assume.
+    *pitch = (width + 511) / 512 * 512;
+    *ptr = reinterpret_cast<void*>(current(s).memory().alloc(*pitch * height));
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemcpy2D(void* dst, size_t dpitch, const void* src, size_t spitch,
+                                     size_t width, size_t height, cudaMemcpyKind kind) {
+  if (width == 0 || height == 0) return cudaSuccess;
+  if (!dst || !src) return cudaErrorInvalidValue;
+  // A rectangle is a run of rows; each row goes through the same path as a
+  // linear copy, so the owning-device resolution applies to it too.
+  for (size_t y = 0; y < height; ++y) {
+    const cudaError_t e =
+        cudaMemcpy(static_cast<char*>(dst) + y * dpitch,
+                   static_cast<const char*>(src) + y * spitch, width, kind);
+    if (e != cudaSuccess) return e;
+  }
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t spitch,
+                                          size_t width, size_t height, cudaMemcpyKind kind,
+                                          cudaStream_t) {
+  return cudaMemcpy2D(dst, dpitch, src, spitch, width, height, kind);
+}
+
+
 VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
   return guard("cudaMemset", [&](State& s) {
     std::vector<uint8_t> buf(count, static_cast<uint8_t>(value));
@@ -683,6 +723,21 @@ VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
 VGPU_EXPORT cudaError_t cudaMemsetAsync(void* dst, int value, size_t count, cudaStream_t) {
   return cudaMemset(dst, value, count);
 }
+VGPU_EXPORT cudaError_t cudaMemset2D(void* dst, size_t pitch, int value, size_t width,
+                                     size_t height) {
+  if (width == 0 || height == 0) return cudaSuccess;
+  if (!dst) return cudaErrorInvalidValue;
+  for (size_t y = 0; y < height; ++y) {
+    const cudaError_t e = cudaMemset(static_cast<char*>(dst) + y * pitch, value, width);
+    if (e != cudaSuccess) return e;
+  }
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaMemset2DAsync(void* dst, size_t pitch, int value, size_t width,
+                                          size_t height, cudaStream_t) {
+  return cudaMemset2D(dst, pitch, value, width, height);
+}
+
 
 VGPU_EXPORT cudaError_t cudaMallocHost(void** ptr, size_t size) {
   return guard("cudaMallocHost", [&](State&) {
