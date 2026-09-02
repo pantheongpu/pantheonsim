@@ -125,9 +125,7 @@ VGPU_EXPORT int cublasScnrm2_v2() { vgpu_report_unimplemented("cublasScnrm2_v2")
 VGPU_EXPORT int cublasScopy_v2() { vgpu_report_unimplemented("cublasScopy_v2"); return 15; }
 VGPU_EXPORT int cublasSetMatrixAsync() { vgpu_report_unimplemented("cublasSetMatrixAsync"); return 15; }
 VGPU_EXPORT int cublasSetVectorAsync() { vgpu_report_unimplemented("cublasSetVectorAsync"); return 15; }
-VGPU_EXPORT int cublasSetWorkspace_v2() { vgpu_report_unimplemented("cublasSetWorkspace_v2"); return 15; }
 VGPU_EXPORT int cublasSgelsBatched() { vgpu_report_unimplemented("cublasSgelsBatched"); return 15; }
-VGPU_EXPORT int cublasSgemmBatched() { vgpu_report_unimplemented("cublasSgemmBatched"); return 15; }
 VGPU_EXPORT int cublasSgemmEx() { vgpu_report_unimplemented("cublasSgemmEx"); return 15; }
 VGPU_EXPORT int cublasSgeqrfBatched() { vgpu_report_unimplemented("cublasSgeqrfBatched"); return 15; }
 VGPU_EXPORT int cublasSger_v2() { vgpu_report_unimplemented("cublasSger_v2"); return 15; }

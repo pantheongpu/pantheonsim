@@ -52,6 +52,7 @@ std::vector<std::string> split_dots(const std::string& s) {
 
 std::optional<Type> parse_type_token(const std::string& part) {
   if (part == "pred") return Type{Type::Kind::Pred, 1};
+  if (part == "bf16") return Type{Type::Kind::BF, 16};
   if (part.size() < 2) return std::nullopt;
   Type::Kind kind;
   switch (part[0]) {

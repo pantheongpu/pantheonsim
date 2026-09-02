@@ -344,6 +344,39 @@ VGPU_EXPORT cublasStatus_t cublasSgemmStridedBatched(
   return CUBLAS_STATUS_SUCCESS;
 }
 
+// The pointer-array form: each batch entry is an independent matrix rather
+// than a fixed stride apart. The pointers live in device memory, so the array
+// itself has to be read back before it can be walked.
+VGPU_EXPORT cublasStatus_t cublasSgemmBatched(cublasHandle_t h, cublasOperation_t ta,
+                                              cublasOperation_t tb, int m, int n, int k,
+                                              const float* alpha, const float* const Aarray[],
+                                              int lda, const float* const Barray[], int ldb,
+                                              const float* beta, float* const Carray[], int ldc,
+                                              int batchCount) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (batchCount < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (batchCount == 0) return CUBLAS_STATUS_SUCCESS;
+  if (!Aarray || !Barray || !Carray) return CUBLAS_STATUS_INVALID_VALUE;
+  // The three arrays are themselves in device memory; pull the pointers back
+  // before dereferencing them.
+  const auto a = fetch<const float*>(Aarray, static_cast<size_t>(batchCount));
+  const auto b = fetch<const float*>(Barray, static_cast<size_t>(batchCount));
+  const auto c = fetch<float*>(Carray, static_cast<size_t>(batchCount));
+  for (int i = 0; i < batchCount; ++i) {
+    cublasStatus_t st =
+        cublasSgemm_v2(h, ta, tb, m, n, k, alpha, a[i], lda, b[i], ldb, beta, c[i], ldc);
+    if (st != CUBLAS_STATUS_SUCCESS) return st;
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+// A workspace is a scratch buffer the library would use for its own tiling.
+// Nothing here needs one, so accepting it is honest: the caller's buffer simply
+// goes unused, and refusing would stop a program that is doing nothing wrong.
+VGPU_EXPORT cublasStatus_t cublasSetWorkspace_v2(cublasHandle_t h, void*, size_t) {
+  return valid(h) ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_NOT_INITIALIZED;
+}
+
 /* ---- level 2 and level 1 ---- */
 
 VGPU_EXPORT cublasStatus_t cublasSgemv_v2(cublasHandle_t h, cublasOperation_t trans, int m, int n,

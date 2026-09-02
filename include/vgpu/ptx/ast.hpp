@@ -18,12 +18,17 @@ namespace vgpu::ptx {
 
 // Scalar type of an operand/instruction, e.g. ".s32" -> {Kind::S, 32}.
 struct Type {
-  enum class Kind { B, U, S, F, Pred };
+  // BF is bfloat16: the same exponent range as f32 with a 7-bit mantissa,
+  // so it is a distinct kind rather than an f16 with different bits.
+  enum class Kind { B, U, S, F, BF, Pred };
   Kind kind = Kind::B;
   uint32_t bits = 32;
 
   uint32_t bytes() const { return bits / 8; }
   bool is_float() const { return kind == Kind::F; }
+  bool is_bfloat() const { return kind == Kind::BF; }
+  // Any real-valued type, for code paths that treat them alike.
+  bool is_real() const { return kind == Kind::F || kind == Kind::BF; }
   bool is_signed() const { return kind == Kind::S; }
   std::string str() const;
 };

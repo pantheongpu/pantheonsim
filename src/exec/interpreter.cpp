@@ -1431,15 +1431,34 @@ class Interpreter {
     }
   }
 
+  // bfloat16 is the top 16 bits of an f32: same exponent, mantissa truncated to
+  // 7 bits. Converting in rounds to nearest even on the discarded half, which is
+  // what cvt.rn asks for; converting out is exact.
+  static double bf16_to_double(uint64_t in) {
+    const uint32_t bits = static_cast<uint32_t>(in & 0xffffu) << 16;
+    return static_cast<double>(std::bit_cast<float>(bits));
+  }
+  static uint64_t double_to_bf16(double x) {
+    const float f = static_cast<float>(x);
+    const uint32_t bits = std::bit_cast<uint32_t>(f);
+    if (std::isnan(f)) return (bits >> 16) | 0x0040u;  // keep it quiet
+    // Round to nearest, ties to even, on the 16 bits being dropped.
+    const uint32_t lsb = (bits >> 16) & 1u;
+    const uint32_t rounded = bits + 0x7fffu + lsb;
+    return rounded >> 16;
+  }
+
   uint64_t convert(const OpCvt* op, uint64_t in) {
     const Type& s = op->src_ty;
     const Type& d = op->dst_ty;
     // Read the source as a real number (float src) or integer (int src).
-    if (s.is_float()) {
-      double x = s.bits == 16 ? f16_to_double(in)
+    if (s.is_real()) {
+      double x = s.is_bfloat()  ? bf16_to_double(in)
+                 : s.bits == 16 ? f16_to_double(in)
                  : s.bits == 32 ? static_cast<double>(f32(in))
                                 : f64(in);
-      if (d.is_float()) {
+      if (d.is_real()) {
+        if (d.is_bfloat()) return double_to_bf16(x);
         if (d.bits == 16) return double_to_f16(x);
         return d.bits == 32 ? f32bits(static_cast<float>(x)) : f64bits(x);
       }
@@ -1463,9 +1482,10 @@ class Interpreter {
       uint64_t sign_bit = 1ull << (s.bits - 1);
       if (sv & sign_bit) sv |= ~((sign_bit << 1) - 1);
     }
-    if (d.is_float()) {
+    if (d.is_real()) {
       double x = s.is_signed() ? static_cast<double>(static_cast<int64_t>(sv))
                                : static_cast<double>(sv);
+      if (d.is_bfloat()) return double_to_bf16(x);
       if (d.bits == 16) return double_to_f16(x);
       return d.bits == 32 ? f32bits(static_cast<float>(x)) : f64bits(x);
     }
