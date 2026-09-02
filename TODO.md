@@ -134,10 +134,13 @@ NVRTC works by invoking the toolkit's own nvcc, which runs on the host and
 needs no GPU -- so runtime-compiled kernels (CuPy, Numba, Triton, inductor)
 reach the interpreter through the driver API like any other PTX.
 
-Multi-GPU is verified against real hardware in two places: the local two-GPU
-box for the differential suite, and a rented two-H100 SXM5 instance for the
-same suite plus eight-rank NCCL over eight processes. That instance runs CUDA
-12.8, so it also covers the older toolkit's LZ4 fatbins and soname majors.
+Multi-GPU is verified against real hardware in four places: the local two-GPU
+box, and rented 2x H100 SXM5, 4x H100 SXM5 and 8x A100 80GB instances. All
+thirteen conformance suites match on every one of them, with NCCL compared
+against NVIDIA's libnccl at two, four and eight ranks respectively. The 2x
+instance runs CUDA 12.8, so it also covers the older toolkit's LZ4 fatbins,
+its cudaGetDeviceProperties_v2 spelling and its soname majors; the 8x is
+sm_80, a second architecture.
 
 Not yet: `nvidia-smi topo -m`, DCGM. PyTorch also ships thousands of its own kernels,
 which would run on the interpreter, so `import torch` finding a usable GPU is

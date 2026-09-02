@@ -99,7 +99,8 @@ laptop's. It has been run on two shapes so far, and all thirteen suites match on
 | machine | what it adds |
 | --- | --- |
 | 2x H100 SXM5, CUDA 12.8 | NVLink, and everything the older toolkit does differently -- LZ4 fatbins, the `cudaGetDeviceProperties_v2` spelling, different soname majors |
-| 8x A100 80GB SXM4, sm_80 | a second architecture, eight-rank NCCL against NVIDIA's libnccl, and eight ranks across eight processes |
+| 4x H100 SXM5 | four-rank NCCL against NVIDIA's libnccl, and four ranks across four processes |
+| 8x A100 80GB SXM4, sm_80 | a second architecture, eight-rank NCCL, and eight ranks across eight processes |
 
 Reduced precision is compared with a tolerance, not bit-for-bit, wherever the
 two implementations legitimately differ: these libraries compute in double and
