@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -1938,6 +1939,29 @@ unsigned worker_count(uint64_t blocks) {
   return want ? want : 1;
 }
 
+// The step budget is a guard against a kernel that loops forever. A kernel that
+// is legitimately long -- a soak or bake kernel that runs for minutes on
+// hardware -- trips it too, and the interpreter is slow enough that this is not
+// rare. VGPU_MAX_STEPS raises it without a rebuild; 0 turns the guard off, for
+// when you know the kernel terminates and only need it to finish.
+uint64_t effective_max_steps(uint64_t configured) {
+  const char* e = std::getenv("VGPU_MAX_STEPS");
+  if (!e || !*e) return configured;
+  // strtoull accepts a leading sign and wraps a negative around, so "-5" would
+  // parse as an enormous budget and quietly remove the very guard this is
+  // protecting. Reject a sign before parsing.
+  const char* p = e;
+  while (*p == ' ' || *p == '\t') ++p;
+  if (*p == '-' || *p == '+') return configured;
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(e, &end, 10);
+  // Anything that is not a whole number leaves the guard as configured rather
+  // than silently disabling it.
+  if (errno != 0 || end == e || *end != '\0') return configured;
+  return v == 0 ? std::numeric_limits<uint64_t>::max() : static_cast<uint64_t>(v);
+}
+
 }  // namespace
 
 LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
@@ -1945,13 +1969,15 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
                    const DeviceProfile& profile, const SymbolTable* symbols,
                    const ProgressFn& progress) {
   validate(fn, cfg, profile);
+  LaunchConfig eff = cfg;
+  eff.max_steps = effective_max_steps(cfg.max_steps);
   ParamBuffer pb = build_params(fn, args);
   const uint64_t blocks = uint64_t{cfg.grid[0]} * cfg.grid[1] * cfg.grid[2];
   const unsigned nthreads = worker_count(blocks);
 
   if (nthreads <= 1) {
     LaunchStats stats;
-    Interpreter interp(fn, cfg, pb, mem, profile, symbols, stats, progress);
+    Interpreter interp(fn, eff, pb, mem, profile, symbols, stats, progress);
     interp.run_grid();
     return stats;
   }
@@ -1970,7 +1996,7 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
     const uint64_t end = blocks * (t + 1) / nthreads;
     workers.emplace_back([&, t, begin, end] {
       try {
-        Interpreter interp(fn, cfg, pb, mem, profile, symbols, per_thread[t],
+        Interpreter interp(fn, eff, pb, mem, profile, symbols, per_thread[t],
                            t == 0 ? progress : ProgressFn{});
         interp.set_concurrent(true);
         interp.run_block_range(begin, end);
