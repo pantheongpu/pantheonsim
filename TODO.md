@@ -77,8 +77,9 @@ What characterization corrected in the documentation-derived placeholders:
 Clocks, power caps, SM counts, shared-memory limits and PCI ids were already
 right. Capacity values being wrong is exactly what this process is for.
 
-Still documentation-derived: A100 80GB, H200, B200, and all three AMD
-profiles. B200 had no Lambda capacity; AMD parts are not offered there.
+Still documentation-derived: H200, B200, and all three AMD profiles. B200 had
+no Lambda capacity; AMD parts are not offered there. The A100 80GB was read
+from a physical device on an 8x instance.
 
 ## Register and occupancy modeling
 

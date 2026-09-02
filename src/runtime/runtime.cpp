@@ -8,9 +8,35 @@
 
 namespace vgpu::runtime {
 
+namespace {
+
+// ".target sm_86" -> 86. Returns 0 for anything that is not a plain sm_NN,
+// which is treated as "no opinion" rather than as an error.
+int target_arch(const std::string& target) {
+  const size_t at = target.find("sm_");
+  if (at == std::string::npos) return 0;
+  int v = 0;
+  for (size_t i = at + 3; i < target.size() && target[i] >= '0' && target[i] <= '9'; ++i)
+    v = v * 10 + (target[i] - '0');
+  return v;
+}
+
+}  // namespace
+
 uint64_t Device::load_module(const std::string& ptx_src) {
   try {
     auto mod = std::make_shared<ptx::Module>(ptx::parse(ptx_src));
+    // PTX is forward compatible but not backward: a module built for a newer
+    // architecture than the device is rejected by the real driver with
+    // CUDA_ERROR_INVALID_PTX, and a simulator that loaded it anyway would let
+    // a program pass here and fail on the hardware it is standing in for.
+    const int want = target_arch(mod->target);
+    const int have = profile_.cc_major * 10 + profile_.cc_minor;
+    if (want && have && want > have)
+      throw Error::make(Err::PtxParse, "module targets ", mod->target,
+                        " but this device is compute capability ", profile_.cc_major, ".",
+                        profile_.cc_minor,
+                        "; PTX runs on newer architectures, not older ones");
     LoadedModule lm;
     lm.id = next_module_id_++;
     // Materialize module .global variables into device memory.

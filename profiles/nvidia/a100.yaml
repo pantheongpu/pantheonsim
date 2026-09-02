@@ -1,14 +1,15 @@
 # VirtualGPU device profile: NVIDIA A100 (SXM4 80GB variant).
-# Public documentation values (sm_80); verified: false = placeholders pending
-# hardware characterization.
+# Read from a physical A100-SXM4-80GB on a Lambda 8x instance by
+# tools/characterize.cu. The residency ceilings are the sm_80 constants, which
+# the 40 GB part reported identically.
 id: nvidia/a100
 vendor: nvidia
 model: "NVIDIA A100-SXM4-80GB"
 architecture: ampere
 compute_capability: "8.0"
 warp_size: 32
-vram_bytes: 85899345920          # 80 GiB HBM2e
-verified: false
+vram_bytes: 85095874560          # what the device reports, not the 80 GiB label
+verified: true
 limits:
   max_threads_per_block: 1024
   max_block_dim: [1024, 1024, 64]

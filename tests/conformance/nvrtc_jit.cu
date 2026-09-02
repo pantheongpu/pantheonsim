@@ -48,10 +48,24 @@ int main() {
   printf("supported archs include sm_86: %s, ascending: %s\n", has86 ? "yes" : "no",
          ascending ? "yes" : "no");
 
+  // Compile for the device that will run it. A fixed architecture works until
+  // the machine is older than it: PTX runs forward, not backward, and the
+  // driver rejects a newer target with CUDA_ERROR_INVALID_PTX.
+  DR(cuInit(0));
+  int cc_major = 0, cc_minor = 0;
+  CUdevice probe;
+  DR(cuDeviceGet(&probe, 0));
+  DR(cuDeviceGetAttribute(&cc_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, probe));
+  DR(cuDeviceGetAttribute(&cc_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, probe));
+  char arch_opt[64];
+  snprintf(arch_opt, sizeof(arch_opt), "--gpu-architecture=compute_%d%d", cc_major, cc_minor);
+  char target_needle[32];
+  snprintf(target_needle, sizeof(target_needle), ".target sm_%d%d", cc_major, cc_minor);
+
   nvrtcProgram prog;
   NR(nvrtcCreateProgram(&prog, kSource, "jit.cu", 0, nullptr, nullptr));
   NR(nvrtcAddNameExpression(prog, "fill_ramp<float>"));
-  const char* opts[] = {"--gpu-architecture=compute_86", "-std=c++14"};
+  const char* opts[] = {arch_opt, "-std=c++14"};
   const nvrtcResult crc = nvrtcCompileProgram(prog, 2, opts);
   size_t logsz = 0;
   NR(nvrtcGetProgramLogSize(prog, &logsz));
@@ -73,11 +87,10 @@ int main() {
   NR(nvrtcGetPTXSize(prog, &ptxsz));
   std::string ptx(ptxsz, '\0');
   NR(nvrtcGetPTX(prog, &ptx[0]));
-  printf("ptx has target sm_86: %s, has scale_add entry: %s\n",
-         ptx.find(".target sm_86") != std::string::npos ? "yes" : "no",
+  printf("ptx targets this device: %s, has scale_add entry: %s\n",
+         ptx.find(target_needle) != std::string::npos ? "yes" : "no",
          ptx.find(".entry scale_add") != std::string::npos ? "yes" : "no");
 
-  DR(cuInit(0));
   CUdevice dev;
   DR(cuDeviceGet(&dev, 0));
   CUcontext ctx;

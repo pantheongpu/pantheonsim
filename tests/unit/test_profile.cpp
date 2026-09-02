@@ -29,10 +29,11 @@ VTEST(all_builtin_profiles_parse) {
     VCHECK_EQ(p.limits.max_threads_per_block, 1024u);
     VCHECK(p.telemetry.power_limit_w > 0);   // monitoring tools need a scale
     VCHECK(p.telemetry.pci_vendor_id != 0);
-    // rtx3060 is characterized from a physical device; the rest are
-    // placeholders from public documentation.
+    // These were read from physical devices; the rest are still placeholders
+    // from public documentation, and the flag has to say which is which.
     VCHECK_EQ(p.verified, p.id == "nvidia/rtx3060" || p.id == "nvidia/a10" ||
-                          p.id == "nvidia/a100-sxm4-40gb" || p.id == "nvidia/h100");
+                          p.id == "nvidia/a100-sxm4-40gb" || p.id == "nvidia/a100" ||
+                          p.id == "nvidia/h100");
   }
 }
 

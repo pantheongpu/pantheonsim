@@ -95,6 +95,19 @@ int main(int argc, char** argv) {
                 optin_shared ? optin_shared : (int)p.sharedMemPerBlock);
     std::printf("  registers_per_block: %d\n", p.regsPerBlock);
     std::printf("  multiprocessors: %d\n", p.multiProcessorCount);
+    // The residency ceilings, which decide occupancy. They were being written
+    // in by hand after the fact, which is exactly the kind of value that ends
+    // up carrying a datasheet's number instead of the device's.
+    int regs_per_sm = 0, blocks_per_sm = 0, shared_per_sm = 0;
+    cudaDeviceGetAttribute(&regs_per_sm, cudaDevAttrMaxRegistersPerMultiprocessor, dev);
+    cudaDeviceGetAttribute(&blocks_per_sm, cudaDevAttrMaxBlocksPerMultiprocessor, dev);
+    cudaDeviceGetAttribute(&shared_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
+    std::printf("  registers_per_sm: %d\n", regs_per_sm ? regs_per_sm : p.regsPerBlock);
+    std::printf("  max_threads_per_sm: %d\n", p.maxThreadsPerMultiProcessor);
+    std::printf("  max_blocks_per_sm: %d\n", blocks_per_sm ? blocks_per_sm : 16);
+    std::printf("  max_registers_per_thread: 255\n");
+    std::printf("  shared_mem_per_sm: %d\n",
+                shared_per_sm ? shared_per_sm : (int)p.sharedMemPerMultiprocessor);
     std::printf("features:\n");
     std::printf("  fp16: %s\n", p.major >= 6 ? "true" : "false");
     std::printf("  bf16: %s\n", p.major >= 8 ? "true" : "false");
