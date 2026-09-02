@@ -110,13 +110,19 @@ direction for something that refuses launches.
 - **nvidia-smi / rocm-smi / rocm_agent_enumerator** — supplied by VirtualGPU
   (see docs/telemetry.md for why the stock nvidia-smi binary cannot be used).
 
-**cuBLAS** is implemented (`libcublas.so.13`) and verified against real cuBLAS:
-every GEMM path is bit-identical, level-1/2 routines agree to ~1e-7. The math
-runs on the host rather than through the interpreter, because cuBLAS is a
-library rather than user code — see docs/cublas.md.
+**Vendor libraries.** cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE,
+cuSOLVER and NCCL are implemented under their real sonames, each verified
+against NVIDIA's own library on a physical GPU: cuDNN, cuFFT and cuSPARSE are
+bit-identical on every value the conformance suite reports, cuSOLVER on
+everything but one f32 eigenvalue, and NCCL on all 24 values at two ranks
+across two physical GPUs. The math runs on the host rather than through the
+interpreter, because a vendor library is not user code — see docs/libraries.md
+for the boundary, the per-library scope, and what each one deliberately refuses.
 
-Not yet: cuDNN, cuRAND, cuSPARSE, cuSOLVER, NCCL (so still no PyTorch),
-`nvidia-smi topo -m`, DCGM.
+Not yet: NPP, nvJPEG, NVRTC (a CUDA C++ compiler is a different project),
+`nvidia-smi topo -m`, DCGM. PyTorch also ships thousands of its own kernels,
+which would run on the interpreter, so `import torch` finding a usable GPU is
+still a separate question from library coverage.
 
 ## Known out of scope (not CUDA)
 
@@ -128,8 +134,9 @@ Not yet: cuDNN, cuRAND, cuSPARSE, cuSOLVER, NCCL (so still no PyTorch),
 
 ## Partially implemented
 
-- Divergence: reconverges at ret only; bar.sync inside divergence = clear
-  error. Upgrade: IPDOM reconvergence points.
+- Divergence: min-PC reconvergence -- paths at the same pc merge and the lowest
+  pc runs next, so bar.sync after a divergent region works. Not full IPDOM:
+  irreducible control flow is not handled.
 - cuCtxSetCurrent(NULL) pops rather than clearing a per-thread binding; the
   current-context stack is process-global, not thread-local.
 - M7 proper: needs the CUDA *runtime* API shim + fatbin PTX extraction to run
@@ -137,13 +144,12 @@ Not yet: cuDNN, cuRAND, cuSPARSE, cuSOLVER, NCCL (so still no PyTorch),
 
 ## Not implemented (fails loudly, never silently)
 
-- PTX: shared memory (__shared__), warp shuffles/vote/ballot, mul.hi, f16/bf16
-  math, half-precision cvt, textures/surfaces, cp.async, tensor-core ops
-  (wmma/mma/wgmma), grid sync, inline-asm-only instructions
-- Runtime: streams (M8), events (M8), async copies, unified/managed memory,
-  virtual memory mgmt API (cuMemAddressReserve…), host-pinned memory
-- Frontends: CUDA runtime API (cudart), NVML, cubin/SASS loading,
-  cuGetProcAddress dispatch, AMD everything (HIP, ROCm-SMI, CDNA ISA)
+- PTX: textures/surfaces, cp.async, wgmma, grid sync, inline-asm-only
+  instructions
+- Runtime: async copies, unified/managed memory, virtual memory mgmt API
+  (cuMemAddressReserve…), host-pinned memory
+- Frontends: cubin/SASS loading, cuGetProcAddress dispatch, AMD everything
+  (HIP, ROCm-SMI, CDNA ISA)
 - Tooling: `vgpu run` (LD_LIBRARY_PATH/LD_PRELOAD wrapper), `vgpu test
   --matrix`, trace record/replay, schedulers random/adversarial, race
   detection, OOM injection, characterization/differential-fuzz harness,

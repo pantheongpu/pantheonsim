@@ -27,7 +27,9 @@ width 64 is a parameter, not a rewrite — enforced today by an explicit
 - **L2 Runtime behavior** — contexts, memory, copies, errors; streams/events
   next. (Core working)
 - **L3 Compute** — PTX kernels execute functionally on CPU. (Working subset)
-- **L4 Ecosystem** — cuBLAS/cuDNN/NCCL/PyTorch. (Not attempted; design only)
+- **L4 Ecosystem** — cuBLAS/cuBLASLt/cuDNN/cuFFT/cuRAND/cuSPARSE/cuSOLVER/NCCL
+  are implemented and verified against hardware (docs/libraries.md);
+  PyTorch itself is not.
 
 ## Repository map
 

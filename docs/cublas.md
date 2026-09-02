@@ -60,13 +60,10 @@ cuBLASLt, complex types, triangular solves, and the remaining level-1/2/3
 routines. Add them the same way the PTX subset grew: hit one, implement it,
 prove it against hardware.
 
-## What this does and does not unlock
+## The rest of the stack
 
-A framework needs more than cuBLAS. PyTorch also links cuDNN, cuRAND,
-cuSPARSE, cuSOLVER and NCCL, none of which exist here, and it ships thousands
-of its own kernels that would run on the interpreter. So `import torch` does
-not yet find a GPU.
-
-What does work today is the question CI most often needs answered — *will this
-fit and will it launch* — since device memory, discovery, and launch limits all
-behave like the real device. See docs/telemetry.md and TODO.md.
+cuBLAS was the first of these; cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE,
+cuSOLVER and NCCL followed, all drawing the same library-vs-kernel boundary and
+all proved the same way. **docs/libraries.md** covers the set — what each one
+implements, what it deliberately does not, and how each was verified against a
+physical GPU.
