@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 
 #include <cstring>
+#include <limits>
 
 #include "vgpu/error.hpp"
 
@@ -143,23 +144,54 @@ std::string decompress_zstd(const uint8_t* src, size_t src_size) {
 }  // namespace
 
 std::vector<FatbinPtx> extract_ptx(const void* data) {
+  return extract_ptx(data, std::numeric_limits<size_t>::max());
+}
+
+std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
   if (!data) throw Error::make(Err::InvalidValue, "NULL fatbin image");
   const uint8_t* p = static_cast<const uint8_t*>(data);
 
+  // When the caller knows the buffer size, `avail` is the number of bytes
+  // still inside it; when it does not, it is "unknown" and only the format's
+  // internal consistency and kMaxFatbinBytes constrain the walk. Every read
+  // below is checked against this rather than against a bound computed from a
+  // field in the image, which is what let a declared size larger than the
+  // buffer walk off the end.
+  const bool bounded = bytes != std::numeric_limits<size_t>::max();
+  auto room = [&](const uint8_t* q, uint64_t n) {
+    if (!bounded) return true;
+    const uint8_t* base = static_cast<const uint8_t*>(data);
+    if (q < base) return false;
+    const uint64_t used = static_cast<uint64_t>(q - base);
+    return used <= bytes && n <= bytes - used;
+  };
+  auto need = [&](const uint8_t* q, uint64_t n, const char* what) {
+    if (!room(q, n))
+      throw Error::make(Err::InvalidValue, "fatbin image is truncated: ", what, " needs ", n,
+                        " bytes but the buffer is only ", bytes, " long");
+  };
+
+  need(p, 4, "the magic number");
   uint32_t magic = 0;
   std::memcpy(&magic, p, 4);
   if (magic == kWrapperMagic) {
+    need(p, 16, "the fatbin wrapper");
     // __fatBinC_Wrapper_t { int magic; int version; const ull* data; void* filename_or_fatbins; }
     const uint8_t* inner = nullptr;
     std::memcpy(&inner, p + 8, 8);
     if (!inner) throw Error::make(Err::InvalidValue, "fatbin wrapper has NULL data pointer");
     p = inner;
+    // The wrapper points at a separate allocation whose size we were not told,
+    // so the caller's bound no longer applies past this point.
+    bytes = std::numeric_limits<size_t>::max();
+    data = inner;
     std::memcpy(&magic, p, 4);
   }
   if (magic != kFatbinMagic)
     throw Error::make(Err::InvalidValue, "not a fatbin image (bad magic; expected 0xBA55ED50)");
 
   ContainerHeader ch{};
+  need(p, sizeof ch, "the container header");
   std::memcpy(&ch, p, sizeof ch);
   if (ch.header_size < sizeof(ContainerHeader))
     throw Error::make(Err::InvalidValue, "fatbin container header_size is ", ch.header_size,
@@ -169,13 +201,19 @@ std::vector<FatbinPtx> extract_ptx(const void* data) {
                       " bytes, above the ", kMaxFatbinBytes, "-byte limit; image looks corrupt");
 
   std::vector<FatbinPtx> out;
+  need(p, ch.header_size, "the container header it declares");
   const uint8_t* const body = p + ch.header_size;
+  // The declared body size is a number from the image. Where the real length is
+  // known, a declaration larger than the buffer is a truncated image, not a
+  // licence to read that far.
+  need(body, ch.size, "the container body it declares");
   const uint8_t* const end = body + ch.size;
   const uint8_t* e = body;
   // Every iteration must advance strictly, so a zero-length entry cannot spin.
   while (e < end) {
     if (static_cast<uint64_t>(end - e) < sizeof(EntryHeader)) break;  // trailing padding
     EntryHeader eh{};
+    need(e, sizeof eh, "an entry header");
     std::memcpy(&eh, e, sizeof eh);
     if (eh.header_size < sizeof(EntryHeader))
       throw Error::make(Err::InvalidValue, "fatbin entry header_size is ", eh.header_size,
@@ -204,6 +242,7 @@ std::vector<FatbinPtx> extract_ptx(const void* data) {
                             "fatbin entry is LZ4-compressed but its header is too short to carry "
                             "the uncompressed size");
         uint64_t uncompressed = 0;
+        need(e + 56, sizeof uncompressed, "an LZ4 entry's uncompressed size");
         std::memcpy(&uncompressed, e + 56, sizeof uncompressed);
         if (uncompressed == 0 || uncompressed > kMaxFatbinBytes)
           throw Error::make(Err::InvalidValue, "fatbin LZ4 entry declares an uncompressed size of ",

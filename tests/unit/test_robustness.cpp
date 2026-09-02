@@ -9,6 +9,7 @@
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
+#include <cstdio>
 #include "vtest.hpp"
 
 using namespace vgpu;
@@ -292,3 +293,47 @@ VTEST(variable_named_directly_as_an_address) {
 }
 
 VTEST_MAIN
+
+// A fatbin's sizes are numbers read out of the image, so they can describe a
+// body far larger than the buffer holding it. Bounds derived from those numbers
+// are then meaningless, and the entry walk reads past the allocation. Fuzzing
+// the parser with exactly-sized buffers hit this on 174 of 4000 inputs. The
+// two-argument form takes the real length so a truncated image is rejected.
+VTEST(truncated_fatbin_is_rejected_when_the_size_is_known) {
+  const std::string literals = ".version 8.7\n.target sm_90\n";
+  auto image = ptx_fatbin(lz4_block(literals, 8, 12), 0x2011, literals.size() + 8);
+
+  // Whole image: still parses.
+  auto ok = vgpu::cuda::extract_ptx(image.data(), image.size());
+  VCHECK_EQ(ok.size(), size_t{1});
+
+  // Cut short at every interesting boundary: each must throw rather than read
+  // past the end. The container claims a body the truncated buffer cannot hold.
+  for (size_t cut : {size_t{4}, size_t{8}, size_t{16}, image.size() / 2}) {
+    if (cut >= image.size()) continue;
+    std::vector<uint8_t> shortened(image.begin(), image.begin() + cut);
+    auto err = VCAPTURE(Error, vgpu::cuda::extract_ptx(shortened.data(), shortened.size()));
+    VCHECK(err.code() == Err::InvalidValue);
+  }
+
+  // Dropping the final byte is not a truncation the parser should reject: it
+  // lies past the body the container declares, so it is trailing padding. The
+  // boundary is the declared body, not the end of the buffer.
+  std::vector<uint8_t> minus_padding(image.begin(), image.end() - 1);
+  auto still = vgpu::cuda::extract_ptx(minus_padding.data(), minus_padding.size());
+  VCHECK_EQ(still.size(), size_t{1});
+}
+
+VTEST(fatbin_declaring_more_than_the_buffer_is_rejected) {
+  // A well-formed header whose declared body size exceeds the real buffer: the
+  // case that produced the heap-buffer-overflow, since `end` was computed from
+  // the declaration rather than the allocation.
+  const std::string literals = ".version 8.7\n.target sm_90\n";
+  auto image = ptx_fatbin(lz4_block(literals, 8, 12), 0x2011, literals.size() + 8);
+  // Overstate the container body size by a large amount.
+  uint64_t huge = 1ull << 20;
+  std::memcpy(image.data() + 8, &huge, sizeof huge);
+  auto err = VCAPTURE(Error, vgpu::cuda::extract_ptx(image.data(), image.size()));
+  VCHECK(err.code() == Err::InvalidValue);
+  VCHECK_CONTAINS(err.what(), "truncated");
+}
