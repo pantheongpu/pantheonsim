@@ -53,8 +53,10 @@ for src in "$root"/tests/conformance/*.cu; do
     inc="$inc -I$root/third_party/nccl_include"
     libs="$libs -lnccl"
     # NCCL wants one device per rank, so the rank count the two sides can be
-    # compared at is however many physical GPUs this machine has.
-    ranks=$(( ngpu > 1 ? 2 : 1 ))
+    # compared at is however many physical GPUs this machine has. Eight is the
+    # largest shape worth comparing; past that the collectives are the same
+    # code with a longer loop.
+    ranks=$(( ngpu > 8 ? 8 : (ngpu > 1 ? ngpu : 1) ))
     env_real=(VGPU_NCCL_RANKS=$ranks)
     env_virt=(VGPU_NCCL_RANKS=$ranks VGPU_DEVICE_COUNT=$ranks
               VGPU_NCCL_DIR="$out/rendezvous-$name" VGPU_NCCL_TIMEOUT=120)

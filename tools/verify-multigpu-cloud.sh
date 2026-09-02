@@ -112,10 +112,20 @@ $SSH 'set -x
     [ -e "$f" ] || continue
     echo "--- $(basename "$f")"; head -4 "$f"
   done
-  echo "===== NCCL ACROSS 8 PROCESSES (virtual rack) ====="
-  tests/e2e/run_nccl_multiproc.sh 8
-  echo "===== NCCL SINGLE-PROCESS GROUP, 8 VIRTUAL RANKS ====="
-  tests/e2e/run_nccl_group.sh 8
+  NGPU=$(nvidia-smi -L | wc -l)
+  echo "===== NCCL ACROSS $NGPU PROCESSES (one per physical GPU) ====="
+  tests/e2e/run_nccl_multiproc.sh "$NGPU"
+  echo "===== NCCL SINGLE-PROCESS GROUP, $NGPU VIRTUAL RANKS ====="
+  tests/e2e/run_nccl_group.sh "$NGPU"
+  # The instance is already paid for, so read the device while we are here:
+  # several profiles in this repository are still documentation-derived.
+  echo "===== DEVICE CHARACTERIZATION ====="
+  nvcc -std=c++14 -Wno-deprecated-gpu-targets tools/characterize.cu -o /tmp/characterize -lcuda \
+    && { /tmp/characterize 0 | sed "/^telemetry:/,\$d"; bash tools/characterize-telemetry.sh 0; } \
+       > /tmp/profile.yaml
+  head -40 /tmp/profile.yaml
 ' 2>&1 | tee "$outdir/run.log"
 
+scp -q $SSHOPT ubuntu@"$IP":/tmp/profile.yaml "$outdir/${type_name}.yaml" 2>/dev/null \
+  && echo "[cloud] profile -> $outdir/${type_name}.yaml"
 echo "[cloud] log -> $outdir/run.log"
