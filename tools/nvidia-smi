@@ -16,9 +16,11 @@ case "${1:-}" in
     echo "NVML version        : 13.580.00.00 (VirtualGPU)"
     echo "DRIVER version      : ${VGPU_DRIVER_VERSION:-580.00.00} (virtual)"
     exit 0 ;;
-  --query-gpu*|--format*|-q)
-    exec "$vgpu" smi --csv ;;
   -L|--list-gpus)
-    exec "$vgpu" smi --csv ;;
+    exec "$vgpu" smi --list ;;
 esac
+# --query-gpu, --format and -q are passed through rather than collapsed into a
+# fixed CSV: callers ask for particular fields in a particular shape and parse
+# what comes back, so answering a different question is worse than not
+# answering at all.
 exec "$vgpu" smi "$@"

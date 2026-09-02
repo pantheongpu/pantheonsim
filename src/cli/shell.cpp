@@ -273,14 +273,44 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   auto tool = [&](const std::string& name, const std::string& body) {
     write_file(s.bin + "/" + name, "#!/usr/bin/env bash\n" + body, true);
   };
+  // --query-gpu, --format and -q go through untouched: callers ask for
+  // particular fields in a particular shape and then parse what comes back,
+  // so collapsing them all into one fixed CSV answers a different question.
   tool("nvidia-smi",
        "# VirtualGPU session tool.\n"
        "case \"${1:-}\" in\n"
        "  --version) echo \"NVIDIA-SMI version  : VirtualGPU (simulated)\";\n"
        "             echo \"DRIVER version      : " + c.driver + "\";\n"
        "             echo \"CUDA Version        : " + c.cuda + "\"; exit 0 ;;\n"
-       "  --query-gpu*|--format*|-L|--list-gpus) exec \"" + vgpu + "\" smi --csv ;;\n"
+       "  -L|--list-gpus) exec \"" + vgpu + "\" smi --list ;;\n"
        "esac\nexec \"" + vgpu + "\" smi \"$@\"\n");
+  // nvcc links the CUDA runtime statically by default, and a static cudart
+  // reaches libcuda through an undocumented internal table rather than the
+  // documented driver API: against VirtualGPU it probes several hundred entry
+  // points and then refuses with "integrity checks failed" on the program's
+  // first CUDA call. Linking the runtime shared changes nothing about the
+  // program and lets VirtualGPU's libcudart answer, so every build system that
+  // calls nvcc works unmodified. VGPU_NVCC_PASSTHROUGH=1 restores the original.
+  tool("nvcc",
+       "self=\"$(readlink -f \"$0\")\"\n"
+       "real=\"\"\n"
+       "IFS=':' read -ra parts <<< \"${PATH:-}\"\n"
+       "for dir in \"${parts[@]}\"; do\n"
+       "  [[ -n \"$dir\" && -x \"$dir/nvcc\" ]] || continue\n"
+       "  cand=\"$(readlink -f \"$dir/nvcc\")\"\n"
+       "  [[ \"$cand\" == \"$self\" ]] && continue\n"
+       "  real=\"$cand\"; break\n"
+       "done\n"
+       "[[ -n \"$real\" ]] || { echo \"vgpu nvcc: no real nvcc on PATH\" >&2; exit 127; }\n"
+       "[[ \"${VGPU_NVCC_PASSTHROUGH:-0}\" == 1 ]] && exec \"$real\" \"$@\"\n"
+       "inject=1\n"
+       "for a in \"$@\"; do\n"
+       "  case \"$a\" in\n"
+       "    --version|-V|--help|-h|-cudart|-cudart=*|--cudart|--cudart=*) inject=0 ;;\n"
+       "  esac\n"
+       "done\n"
+       "[[ $inject -eq 1 ]] && exec \"$real\" -cudart shared \"$@\"\n"
+       "exec \"$real\" \"$@\"\n");
   tool("rocm-smi", "exec \"" + vgpu + "\" smi --rocm \"$@\"\n");
   tool("rocm_agent_enumerator", "exec \"" + vgpu + "\" smi --agents\n");
   tool("dmesg",

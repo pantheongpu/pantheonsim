@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Drop-in nvcc for VirtualGPU: the real compiler with "-cudart shared" added.
+#
+# nvcc links the CUDA runtime statically by default. A statically linked cudart
+# is NVIDIA's own runtime living inside the binary, and it talks to libcuda
+# through an undocumented internal table rather than the documented driver API;
+# against VirtualGPU it gets far enough to probe several hundred entry points
+# and then refuses with cudaErrorSoftwareValidityNotEstablished -- "integrity
+# checks failed" -- on the first call the program makes.
+#
+# Linking the runtime shared changes nothing about the program and lets
+# VirtualGPU's libcudart.so answer instead. Every build system that calls nvcc
+# then works unmodified, which is the point of this directory.
+#
+# Set VGPU_NVCC_PASSTHROUGH=1 to get the unmodified compiler back.
+set -uo pipefail
+self="$(readlink -f "$0")"
+
+# Find the next nvcc on PATH that is not this script.
+real=""
+IFS=':' read -ra parts <<< "${PATH:-}"
+for dir in "${parts[@]}"; do
+  [[ -n "$dir" && -x "$dir/nvcc" ]] || continue
+  cand="$(readlink -f "$dir/nvcc")"
+  [[ "$cand" == "$self" ]] && continue
+  real="$cand"
+  break
+done
+if [[ -z "$real" ]]; then
+  for cand in /usr/local/cuda/bin/nvcc /opt/cuda/bin/nvcc; do
+    [[ -x "$cand" ]] && { real="$cand"; break; }
+  done
+fi
+[[ -n "$real" ]] || { echo "vgpu nvcc: no real nvcc found on PATH" >&2; exit 127; }
+
+if [[ "${VGPU_NVCC_PASSTHROUGH:-0}" == "1" ]]; then
+  exec "$real" "$@"
+fi
+
+# Leave informational invocations and an explicit -cudart choice alone.
+inject=1
+for a in "$@"; do
+  case "$a" in
+    --version|-V|--help|-h|--list-gpu-arch|--list-gpu-code) inject=0 ;;
+    -cudart|-cudart=*|--cudart|--cudart=*) inject=0 ;;
+  esac
+done
+
+if [[ $inject -eq 1 ]]; then
+  exec "$real" -cudart shared "$@"
+fi
+exec "$real" "$@"
