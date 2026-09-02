@@ -10,7 +10,22 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cmath>
+#include <type_traits>
 #include <vector>
+
+// NPP's scratch-size out-parameter is int* on CUDA 12.0 and size_t* by 12.8.
+// Naming either one directly makes this test fail to compile on the other
+// toolkit, so take the type from the header's own declaration.
+template <typename F>
+struct npp_bufsize;
+template <typename R, typename A, typename B, typename C>
+struct npp_bufsize<R (*)(A, B, C)> {
+  using type = B;
+};
+template <typename F>
+using npp_bufsize_t = std::remove_pointer_t<typename npp_bufsize<F>::type>;
+using ImgBufSize = npp_bufsize_t<decltype(&nppiSumGetBufferHostSize_8u_C1R_Ctx)>;
+using SigBufSize = npp_bufsize_t<decltype(&nppsSumGetBufferSize_32f_Ctx)>;
 
 #define NP(x) do { NppStatus s_ = (x); if (s_ != NPP_SUCCESS) { \
   printf("%-30s status=%d\n", #x, (int)s_); return; } } while (0)
@@ -180,7 +195,7 @@ static void run() {
   emit("compare <", down_img(dD, sd, W, H));
 
   {   // Statistics land in device memory, as NPP defines them.
-    size_t bytes = 0;
+    ImgBufSize bytes = 0;
     NP(nppiSumGetBufferHostSize_8u_C1R_Ctx(roi, &bytes, ctx));
     Npp8u* buf = nullptr;
     cudaMalloc(&buf, bytes ? bytes : 1);
@@ -267,7 +282,7 @@ static void run() {
     { std::vector<Npp32f> h(n); cudaMemcpy(h.data(), dz, n * 4, cudaMemcpyDeviceToHost); emit("npps mulC", h); }
     NP(nppsSqrt_32f_Ctx(dx, dz, n, ctx));
     { std::vector<Npp32f> h(n); cudaMemcpy(h.data(), dz, n * 4, cudaMemcpyDeviceToHost); emit("npps sqrt", h); }
-    size_t bs = 0;
+    SigBufSize bs = 0;
     NP(nppsSumGetBufferSize_32f_Ctx(n, &bs, ctx));
     Npp8u* buf = nullptr;
     cudaMalloc(&buf, bs ? bs : 1);

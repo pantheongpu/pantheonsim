@@ -904,8 +904,8 @@ namespace {
 template <typename T>
 CUresult memset_impl(const char* name, CUdeviceptr dptr, T value, size_t n) {
   return api(name, true, false, [&](ShimState& s) {
-    std::vector<T> buf(n, value);
-    owner_memory(s, dptr).write(dptr, buf.data(), n * sizeof(T));
+    owner_memory(s, dptr).fill(dptr, reinterpret_cast<const uint8_t*>(&value), sizeof(T),
+                               n * sizeof(T));
     return CUDA_SUCCESS;
   });
 }

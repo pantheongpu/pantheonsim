@@ -1,7 +1,9 @@
 // Unit tests for the virtual device memory manager.
 #include "vgpu/memory.hpp"
 
+#include <cstdio>
 #include <cstring>
+#include <unistd.h>
 #include <vector>
 
 #include "vgpu/error.hpp"
@@ -139,3 +141,100 @@ VTEST(write_spanning_chunks) {
 }
 
 VTEST_MAIN
+
+// --- fill(): memset without a host staging buffer -------------------------
+// A memset used to build a host copy the size of the range and then write it
+// in, so setting N bytes of device memory cost N bytes of chunks plus N bytes
+// of staging, live at the same time. These pin the behaviour that replaced it.
+
+namespace {
+// Resident set size in bytes, from the second field of /proc/self/statm.
+uint64_t resident_bytes() {
+  std::FILE* f = std::fopen("/proc/self/statm", "r");
+  if (!f) return 0;
+  unsigned long total = 0, resident = 0;
+  const int got = std::fscanf(f, "%lu %lu", &total, &resident);
+  std::fclose(f);
+  if (got != 2) return 0;
+  return static_cast<uint64_t>(resident) * static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
+}
+}  // namespace
+
+VTEST(fill_byte_pattern_spans_chunks) {
+  MemoryManager mm(1 << 20);
+  const uint64_t n = vgpu::kChunkSize * 3 + 77;  // deliberately not chunk-aligned
+  uint64_t p = mm.alloc(n);
+  const uint8_t v = 0xAB;
+  mm.fill(p, &v, 1, n);
+  std::vector<uint8_t> out(n, 0);
+  mm.read(p, out.data(), n);
+  for (uint64_t i = 0; i < n; ++i) VCHECK_EQ(out[i], 0xAB);
+  mm.free(p);
+}
+
+VTEST(fill_repeats_four_byte_pattern_in_phase) {
+  // cuMemsetD32 repeats a 4-byte value; the phase must survive the chunk
+  // boundary the fill crosses, not restart at each chunk.
+  MemoryManager mm(1 << 20);
+  const uint64_t n = vgpu::kChunkSize + 4 * 5;
+  uint64_t p = mm.alloc(n);
+  const uint32_t word = 0x11223344u;
+  mm.fill(p, reinterpret_cast<const uint8_t*>(&word), 4, n);
+  std::vector<uint8_t> out(n, 0);
+  mm.read(p, out.data(), n);
+  const uint8_t* w = reinterpret_cast<const uint8_t*>(&word);
+  for (uint64_t i = 0; i < n; ++i) VCHECK_EQ(out[i], w[i % 4]);
+  mm.free(p);
+}
+
+VTEST(fill_partial_range_leaves_neighbours_alone) {
+  MemoryManager mm(1 << 20);
+  const uint64_t n = vgpu::kChunkSize * 2;
+  uint64_t p = mm.alloc(n);
+  std::vector<uint8_t> seed(n, 0x5A);
+  mm.write(p, seed.data(), n);
+  const uint8_t v = 0xFF;
+  mm.fill(p + 100, &v, 1, 50);
+  std::vector<uint8_t> out(n, 0);
+  mm.read(p, out.data(), n);
+  for (uint64_t i = 0; i < n; ++i)
+    VCHECK_EQ(out[i], (i >= 100 && i < 150) ? 0xFF : 0x5A);
+  mm.free(p);
+}
+
+VTEST(zero_fill_does_not_materialize_chunks) {
+  // Zeroing memory nothing has touched is already true of that memory, so it
+  // must not cost host RAM. This is what keeps a workload that allocates most
+  // of a large device and zeroes it from pulling the whole device into RSS.
+  MemoryManager mm(1ull << 40);
+  const uint64_t n = 256ull * 1024 * 1024;
+  uint64_t p = mm.alloc(n);
+  const uint64_t before = resident_bytes();
+  const uint8_t zero = 0;
+  mm.fill(p, &zero, 1, n);
+  const uint64_t after = resident_bytes();
+  // Allow slack for unrelated allocator noise, but nothing near the 256 MiB
+  // that materializing every chunk would cost.
+  VCHECK(after < before + (32ull * 1024 * 1024));
+  // It still reads back as zero.
+  std::vector<uint8_t> out(4096, 0xEE);
+  mm.read(p + n - 4096, out.data(), out.size());
+  for (uint8_t b : out) VCHECK_EQ(b, 0);
+  mm.free(p);
+}
+
+VTEST(nonzero_fill_costs_about_one_copy) {
+  // The staging buffer made a fill of N bytes cost about 2N. Hold it to
+  // roughly one copy.
+  MemoryManager mm(1ull << 40);
+  const uint64_t n = 256ull * 1024 * 1024;
+  uint64_t p = mm.alloc(n);
+  const uint64_t before = resident_bytes();
+  const uint8_t v = 0xC3;
+  mm.fill(p, &v, 1, n);
+  const uint64_t after = resident_bytes();
+  const uint64_t grew = after > before ? after - before : 0;
+  VCHECK(grew >= n / 2);            // it really did materialize the range
+  VCHECK(grew < n + (n / 2));       // but nowhere near twice it
+  mm.free(p);
+}

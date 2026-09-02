@@ -428,10 +428,30 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v3(nvmlDevice_t de
   *infoCount = have;
   return NVML_SUCCESS;
 }
+// _v2 takes nvmlProcessInfo_v2_t, which is a distinct struct from the
+// nvmlProcessInfo_t the _v3 entry point uses -- it has no confidential-compute
+// memory field. On toolkits where the two happen to be layout-compatible,
+// declaring this with nvmlProcessInfo_t builds; on CUDA 12.0 the headers
+// disagree and it does not. Fill the v2 struct on its own terms.
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v2(nvmlDevice_t device,
                                                                  unsigned int* infoCount,
-                                                                 nvmlProcessInfo_t* infos) {
-  return nvmlDeviceGetComputeRunningProcesses_v3(device, infoCount, infos);
+                                                                 nvmlProcessInfo_v2_t* infos) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !infoCount) return NVML_ERROR_INVALID_ARGUMENT;
+  unsigned int have = d->proc_count;
+  if (!infos || *infoCount < have) {
+    *infoCount = have;
+    return have ? NVML_ERROR_INSUFFICIENT_SIZE : NVML_SUCCESS;
+  }
+  for (unsigned int i = 0; i < have; ++i) {
+    std::memset(&infos[i], 0, sizeof infos[i]);
+    infos[i].pid = d->procs[i].pid;
+    infos[i].usedGpuMemory = d->procs[i].used_bytes;
+  }
+  *infoCount = have;
+  return NVML_SUCCESS;
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses_v3(nvmlDevice_t, unsigned int* n,
                                                                   nvmlProcessInfo_t*) {
