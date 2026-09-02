@@ -12,6 +12,8 @@
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
+#include <cstdlib>
+#include <string>
 #include "vtest.hpp"
 
 using namespace vgpu;
@@ -309,3 +311,83 @@ VTEST(wrong_arg_count_is_diagnosed) {
 }
 
 VTEST_MAIN
+
+// --- VGPU_MAX_STEPS -------------------------------------------------------
+// The step budget catches infinite loops, but a kernel that is legitimately
+// long trips it too. These pin the override that raises or removes it.
+
+namespace {
+// A kernel that runs a bounded number of iterations: long enough to exceed a
+// deliberately tiny budget, short enough to finish when the budget allows it.
+const char* kCountdownPtx = R"(
+.version 8.3
+.target sm_90
+.address_size 64
+.visible .entry countdown()
+{
+    .reg .s32 %r<3>;
+    mov.s32 %r1, 500;
+LOOP:
+    sub.s32 %r1, %r1, 1;
+    setp.gt.s32 %p1, %r1, 0;
+    @%p1 bra LOOP;
+    ret;
+}
+)";
+
+struct EnvGuard {
+  const char* name;
+  std::string saved;
+  bool had = false;
+  explicit EnvGuard(const char* n) : name(n) {
+    if (const char* v = std::getenv(n)) { saved = v; had = true; }
+  }
+  void set(const char* v) { ::setenv(name, v, 1); }
+  ~EnvGuard() { had ? (void)::setenv(name, saved.c_str(), 1) : (void)::unsetenv(name); }
+};
+}  // namespace
+
+VTEST(max_steps_env_raises_the_budget) {
+  ptx::Module m = ptx::parse(kCountdownPtx);
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/h100");
+  LaunchConfig cfg;
+  cfg.max_steps = 100;  // far too small for 500 iterations
+
+  EnvGuard g("VGPU_MAX_STEPS");
+  ::unsetenv("VGPU_MAX_STEPS");
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, mem, prof));
+  VCHECK(err.code() == Err::ExecLimit);
+
+  g.set("100000");  // now it fits
+  exec::launch(m.entries[0], cfg, {}, mem, prof);
+}
+
+VTEST(max_steps_env_zero_disables_the_budget) {
+  ptx::Module m = ptx::parse(kCountdownPtx);
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/h100");
+  LaunchConfig cfg;
+  cfg.max_steps = 1;
+
+  EnvGuard g("VGPU_MAX_STEPS");
+  g.set("0");
+  exec::launch(m.entries[0], cfg, {}, mem, prof);  // no guard at all
+}
+
+VTEST(max_steps_env_ignores_junk) {
+  // A value that is not a whole number must leave the guard alone rather than
+  // silently removing the protection against a runaway kernel.
+  ptx::Module m = ptx::parse(kCountdownPtx);
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/h100");
+  LaunchConfig cfg;
+  cfg.max_steps = 100;
+
+  EnvGuard g("VGPU_MAX_STEPS");
+  for (const char* junk : {"abc", "12x", "", "-5"}) {
+    g.set(junk);
+    auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, mem, prof));
+    VCHECK(err.code() == Err::ExecLimit);
+  }
+}
