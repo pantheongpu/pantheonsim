@@ -1,0 +1,3 @@
+libnvjpeg.so.13 {
+  global: *;
+};

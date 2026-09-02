@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Drop-in rocm-smi for VirtualGPU. ROCm is not installed on a CPU-only machine,
+# so this provides the command, rendering the same live telemetry.
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+vgpu="$here/vgpu"; [[ -x "$vgpu" ]] || vgpu="$here/../vgpu"
+case "${1:-}" in
+  --showallinfo|-a) exec "$vgpu" smi ;;
+  --csv)            exec "$vgpu" smi --csv ;;
+  --version)        echo "ROCm SMI version: VirtualGPU 0.1.0"; exit 0 ;;
+esac
+exec "$vgpu" smi --rocm

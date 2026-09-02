@@ -1,0 +1,3 @@
+libnppist.so.13 {
+  global: *;
+};

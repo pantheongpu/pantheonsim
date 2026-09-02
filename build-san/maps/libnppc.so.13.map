@@ -1,0 +1,3 @@
+libnppc.so.13 {
+  global: *;
+};

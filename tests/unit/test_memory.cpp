@@ -148,6 +148,23 @@ VTEST_MAIN
 // of staging, live at the same time. These pin the behaviour that replaced it.
 
 namespace {
+// Sanitizers keep shadow memory alongside every allocation, so resident size
+// no longer tracks what the allocator was asked for. The two RSS assertions
+// below measure host memory directly and are meaningless there -- and a test
+// that fails under a sanitizer build is a reason people stop running them.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+constexpr bool kMeasuresHostMemory = false;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
+    __has_feature(memory_sanitizer)
+constexpr bool kMeasuresHostMemory = false;
+#else
+constexpr bool kMeasuresHostMemory = true;
+#endif
+#else
+constexpr bool kMeasuresHostMemory = true;
+#endif
+
 // Resident set size in bytes, from the second field of /proc/self/statm.
 uint64_t resident_bytes() {
   std::FILE* f = std::fopen("/proc/self/statm", "r");
@@ -213,6 +230,7 @@ VTEST(zero_fill_does_not_materialize_chunks) {
   const uint8_t zero = 0;
   mm.fill(p, &zero, 1, n);
   const uint64_t after = resident_bytes();
+  if (!kMeasuresHostMemory) { mm.free(p); return; }
   // Allow slack for unrelated allocator noise, but nothing near the 256 MiB
   // that materializing every chunk would cost.
   VCHECK(after < before + (32ull * 1024 * 1024));
@@ -233,8 +251,51 @@ VTEST(nonzero_fill_costs_about_one_copy) {
   const uint8_t v = 0xC3;
   mm.fill(p, &v, 1, n);
   const uint64_t after = resident_bytes();
+  if (!kMeasuresHostMemory) { mm.free(p); return; }
   const uint64_t grew = after > before ? after - before : 0;
   VCHECK(grew >= n / 2);            // it really did materialize the range
   VCHECK(grew < n + (n / 2));       // but nowhere near twice it
+  mm.free(p);
+}
+
+// --- bounds arithmetic and host-pointer validation -----------------------
+
+VTEST(length_near_uint64_max_does_not_wrap_the_bounds_check) {
+  // The check was `addr + len > base + size`, which wraps for a length near
+  // UINT64_MAX: the sum lands below the end and the access is admitted. Every
+  // device access resolves through here, so it failing open is the worst case
+  // for a simulator whose job is to catch out-of-bounds accesses.
+  MemoryManager mm(1 << 20);
+  uint64_t p = mm.alloc(1024);
+  const uint8_t v = 0;
+  auto e1 = VCAPTURE(Error, mm.fill(p, &v, 1, ~uint64_t{0}));
+  VCHECK(e1.code() == Err::OutOfBounds);
+  std::vector<uint8_t> src(16, 1);
+  auto e2 = VCAPTURE(Error, mm.write(p, src.data(), ~uint64_t{0}));
+  VCHECK(e2.code() == Err::OutOfBounds);
+  std::vector<uint8_t> dst(16);
+  auto e3 = VCAPTURE(Error, mm.read(p, dst.data(), ~uint64_t{0}));
+  VCHECK(e3.code() == Err::OutOfBounds);
+  // A length that is merely one past the end is still caught.
+  auto e4 = VCAPTURE(Error, mm.write(p, src.data(), 1025));
+  VCHECK(e4.code() == Err::OutOfBounds);
+  // And the exact size still succeeds.
+  std::vector<uint8_t> full(1024, 7);
+  mm.write(p, full.data(), 1024);
+  mm.free(p);
+}
+
+VTEST(null_host_pointer_is_an_error_not_a_crash) {
+  // cudaMemcpy hands these through verbatim. CUDA reports a null host pointer
+  // as an invalid argument; dereferencing it kills the process instead.
+  MemoryManager mm(1 << 20);
+  uint64_t p = mm.alloc(64);
+  auto e1 = VCAPTURE(Error, mm.write(p, nullptr, 16));
+  VCHECK(e1.code() == Err::InvalidValue);
+  auto e2 = VCAPTURE(Error, mm.read(p, nullptr, 16));
+  VCHECK(e2.code() == Err::InvalidValue);
+  // Zero length stays a no-op, as memcpy semantics allow.
+  mm.write(p, nullptr, 0);
+  mm.read(p, nullptr, 0);
   mm.free(p);
 }

@@ -1,0 +1,3 @@
+libnppig.so.13 {
+  global: *;
+};

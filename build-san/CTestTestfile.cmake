@@ -1,0 +1,36 @@
+# CMake generated Testfile for 
+# Source directory: /home/saqib/tools/pantheon/pantheonsim
+# Build directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+# 
+# This file includes the relevant testing commands required for 
+# testing this directory and lists subdirectories to be tested as well.
+add_test([=[test_yamlish]=] "/home/saqib/tools/pantheon/pantheonsim/build-san/test_yamlish")
+set_tests_properties([=[test_yamlish]=] PROPERTIES  _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;387;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;390;vgpu_unit_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[test_profile]=] "/home/saqib/tools/pantheon/pantheonsim/build-san/test_profile")
+set_tests_properties([=[test_profile]=] PROPERTIES  _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;387;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;391;vgpu_unit_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[test_memory]=] "/home/saqib/tools/pantheon/pantheonsim/build-san/test_memory")
+set_tests_properties([=[test_memory]=] PROPERTIES  _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;387;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;392;vgpu_unit_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[test_ptx]=] "/home/saqib/tools/pantheon/pantheonsim/build-san/test_ptx")
+set_tests_properties([=[test_ptx]=] PROPERTIES  _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;387;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;393;vgpu_unit_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[test_exec]=] "/home/saqib/tools/pantheon/pantheonsim/build-san/test_exec")
+set_tests_properties([=[test_exec]=] PROPERTIES  _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;387;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;395;vgpu_unit_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[test_runtime]=] "/home/saqib/tools/pantheon/pantheonsim/build-san/test_runtime")
+set_tests_properties([=[test_runtime]=] PROPERTIES  _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;387;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;397;vgpu_unit_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[test_exec2]=] "/home/saqib/tools/pantheon/pantheonsim/build-san/test_exec2")
+set_tests_properties([=[test_exec2]=] PROPERTIES  _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;387;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;398;vgpu_unit_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[test_exec3]=] "/home/saqib/tools/pantheon/pantheonsim/build-san/test_exec3")
+set_tests_properties([=[test_exec3]=] PROPERTIES  _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;387;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;399;vgpu_unit_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[test_telemetry]=] "/home/saqib/tools/pantheon/pantheonsim/build-san/test_telemetry")
+set_tests_properties([=[test_telemetry]=] PROPERTIES  _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;387;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;400;vgpu_unit_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[test_regalloc]=] "/home/saqib/tools/pantheon/pantheonsim/build-san/test_regalloc")
+set_tests_properties([=[test_regalloc]=] PROPERTIES  _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;387;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;401;vgpu_unit_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[test_robustness]=] "/home/saqib/tools/pantheon/pantheonsim/build-san/test_robustness")
+set_tests_properties([=[test_robustness]=] PROPERTIES  _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;387;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;402;vgpu_unit_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[c_harness_vector_add]=] "/home/saqib/tools/pantheon/pantheonsim/build-san/vector_add_driver")
+set_tests_properties([=[c_harness_vector_add]=] PROPERTIES  ENVIRONMENT "VGPU_GPU=nvidia/h100" _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;412;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[e2e_vector_add]=] "/home/saqib/tools/pantheon/pantheonsim/tests/e2e/run_e2e.sh")
+set_tests_properties([=[e2e_vector_add]=] PROPERTIES  DEPENDS "vgpucudart" _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;418;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[e2e_nccl_multiproc]=] "/home/saqib/tools/pantheon/pantheonsim/tests/e2e/run_nccl_multiproc.sh" "4")
+set_tests_properties([=[e2e_nccl_multiproc]=] PROPERTIES  DEPENDS "vgpunccl" TIMEOUT "300" _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;425;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")
+add_test([=[e2e_nccl_group]=] "/home/saqib/tools/pantheon/pantheonsim/tests/e2e/run_nccl_group.sh" "4")
+set_tests_properties([=[e2e_nccl_group]=] PROPERTIES  DEPENDS "vgpunccl" TIMEOUT "300" _BACKTRACE_TRIPLES "/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;428;add_test;/home/saqib/tools/pantheon/pantheonsim/CMakeLists.txt;0;")

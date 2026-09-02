@@ -1,0 +1,3 @@
+libnppisu.so.13 {
+  global: *;
+};

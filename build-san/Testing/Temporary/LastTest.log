@@ -1,0 +1,426 @@
+Start testing: Sep 02 16:06 CDT
+----------------------------------------------------------
+1/15 Testing: test_yamlish
+1/15 Test: test_yamlish
+Command: "/home/saqib/tools/pantheon/pantheonsim/build-san/test_yamlish"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"test_yamlish" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+[ PASS ] scalars_and_types
+[ PASS ] comments_and_blank_lines
+[ PASS ] nested_map_one_level
+[ PASS ] list_of_ints
+[ PASS ] error_reports_line_number
+[ PASS ] error_duplicate_key
+[ PASS ] error_deep_nesting_rejected
+[ PASS ] error_tab_indent_rejected
+8/8 tests passed
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_yamlish" end time: Sep 02 16:06 CDT
+"test_yamlish" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/15 Testing: test_profile
+2/15 Test: test_profile
+Command: "/home/saqib/tools/pantheon/pantheonsim/build-san/test_profile"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"test_profile" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+[ PASS ] registry_lists_all_gpus
+[ PASS ] all_builtin_profiles_parse
+[ PASS ] h100_profile_values
+[ PASS ] gpu_id_is_case_insensitive
+[ PASS ] unknown_gpu_lists_available
+[ PASS ] profile_missing_key_is_an_error
+6/6 tests passed
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_profile" end time: Sep 02 16:06 CDT
+"test_profile" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/15 Testing: test_memory
+3/15 Test: test_memory
+Command: "/home/saqib/tools/pantheon/pantheonsim/build-san/test_memory"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"test_memory" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+[ PASS ] alloc_write_read_roundtrip
+[ PASS ] untouched_memory_reads_zero
+[ PASS ] huge_virtual_alloc_is_cheap
+[ PASS ] oom_reports_usage
+[ PASS ] zero_byte_alloc_rejected
+[ PASS ] oob_write_detected_with_context
+[ PASS ] invalid_pointer_detected
+[ PASS ] host_pointer_hint
+[ PASS ] double_free_detected
+[ PASS ] interior_free_detected
+[ PASS ] use_after_free_detected
+[ PASS ] freed_vas_never_reused
+[ PASS ] misaligned_scalar_access_detected
+[ PASS ] write_spanning_chunks
+[ PASS ] fill_byte_pattern_spans_chunks
+[ PASS ] fill_repeats_four_byte_pattern_in_phase
+[ PASS ] fill_partial_range_leaves_neighbours_alone
+[ PASS ] zero_fill_does_not_materialize_chunks
+[ PASS ] nonzero_fill_costs_about_one_copy
+[ PASS ] length_near_uint64_max_does_not_wrap_the_bounds_check
+[ PASS ] null_host_pointer_is_an_error_not_a_crash
+21/21 tests passed
+<end of output>
+Test time =   0.44 sec
+----------------------------------------------------------
+Test Passed.
+"test_memory" end time: Sep 02 16:06 CDT
+"test_memory" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/15 Testing: test_ptx
+4/15 Test: test_ptx
+Command: "/home/saqib/tools/pantheon/pantheonsim/build-san/test_ptx"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"test_ptx" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+[ PASS ] parses_reference_vector_add
+[ PASS ] special_registers_decoded
+[ PASS ] float_hex_immediates
+[ PASS ] negative_offsets_and_immediates
+[ PASS ] unsupported_instruction_names_kernel_and_line
+[ PASS ] shared_memory_declarations_parse
+[ PASS ] dynamic_shared_memory_sits_above_static
+[ PASS ] undefined_label_is_parse_error
+[ PASS ] bad_syntax_reports_line
+[ PASS ] predicate_negation
+[ PASS ] comments_are_skipped
+[ PASS ] only_64bit_address_size_supported
+[ PASS ] entry_prototype_is_a_declaration_not_a_definition
+[ PASS ] global_scalar_initialiser_is_not_a_symbol
+[ PASS ] global_initialised_with_a_symbol
+15/15 tests passed
+<end of output>
+Test time =   0.03 sec
+----------------------------------------------------------
+Test Passed.
+"test_ptx" end time: Sep 02 16:06 CDT
+"test_ptx" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/15 Testing: test_exec
+5/15 Test: test_exec
+Command: "/home/saqib/tools/pantheon/pantheonsim/build-san/test_exec"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"test_exec" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+[ PASS ] vector_add_end_to_end
+[ PASS ] vector_add_is_deterministic
+[ PASS ] vector_add_odd_block_sizes
+[ PASS ] divergent_branches_take_both_paths
+[ PASS ] barrier_synchronizes_warps
+[ PASS ] multi_dimensional_grid
+[ PASS ] kernel_oob_fault_names_kernel_lane_and_profile
+[ PASS ] uninitialized_register_read_is_diagnosed
+[ PASS ] infinite_loop_hits_step_budget
+[ PASS ] launch_limits_enforced
+[ PASS ] wrong_arg_count_is_diagnosed
+11/11 tests passed
+<end of output>
+Test time =   0.12 sec
+----------------------------------------------------------
+Test Passed.
+"test_exec" end time: Sep 02 16:06 CDT
+"test_exec" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/15 Testing: test_runtime
+6/15 Test: test_runtime
+Command: "/home/saqib/tools/pantheon/pantheonsim/build-san/test_runtime"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"test_runtime" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+[ PASS ] multi_device_enumeration
+[ PASS ] module_lifecycle_and_lookup
+[ PASS ] unsupported_ptx_error_names_profile
+[ PASS ] devices_have_independent_memory
+[ PASS ] peer_copy_between_virtual_devices
+5/5 tests passed
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"test_runtime" end time: Sep 02 16:06 CDT
+"test_runtime" time elapsed: 00:00:00
+----------------------------------------------------------
+
+7/15 Testing: test_exec2
+7/15 Test: test_exec2
+Command: "/home/saqib/tools/pantheon/pantheonsim/build-san/test_exec2"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"test_exec2" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+[ PASS ] cvt_sign_and_zero_extension
+[ PASS ] atomic_add_returns_unique_old_values
+[ PASS ] vector_v4_load_store_and_alignment
+[ PASS ] funnel_shift_wrap
+[ PASS ] predicate_logic_ops
+[ PASS ] aggregate_byte_array_param
+[ PASS ] module_global_string_and_symbols
+--- expected device printf output: ---
+val=0 hex=0
+val=1 hex=1
+--------------------------------------
+[ PASS ] local_memory_and_device_printf
+8/8 tests passed
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"test_exec2" end time: Sep 02 16:06 CDT
+"test_exec2" time elapsed: 00:00:00
+----------------------------------------------------------
+
+8/15 Testing: test_exec3
+8/15 Test: test_exec3
+Command: "/home/saqib/tools/pantheon/pantheonsim/build-san/test_exec3"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"test_exec3" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+[ PASS ] neg_float_and_int
+[ PASS ] prmt_default_byte_select
+[ PASS ] cvt_int_to_float_and_back
+[ PASS ] cvt_float_to_int_clamps
+[ PASS ] shared_memory_reduction_across_warps
+[ PASS ] shared_memory_is_zeroed_and_per_block
+[ PASS ] shared_overflow_is_diagnosed
+[ PASS ] warp_shuffle_butterfly_reduction
+[ PASS ] shuffle_idx_broadcast_and_predicate
+[ PASS ] bitfield_and_transcendental_ops
+[ PASS ] nan_aware_setp_variants
+[ PASS ] f16_conversion_roundtrip
+[ PASS ] f16x2_packed_arithmetic
+[ PASS ] wmma_m16n16k16_matmul
+[ PASS ] wmma_accumulator_is_added
+[ PASS ] atomics_are_atomic_across_blocks
+16/16 tests passed
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"test_exec3" end time: Sep 02 16:06 CDT
+"test_exec3" time elapsed: 00:00:00
+----------------------------------------------------------
+
+9/15 Testing: test_telemetry
+9/15 Test: test_telemetry
+Command: "/home/saqib/tools/pantheon/pantheonsim/build-san/test_telemetry"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"test_telemetry" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+[ PASS ] publishes_device_identity
+[ PASS ] memory_usage_is_real_and_live
+[ PASS ] idle_device_reports_idle_not_zero
+[ PASS ] load_raises_utilization_power_and_temperature
+[ PASS ] amd_profiles_are_discoverable
+[ PASS ] no_publisher_means_no_snapshot
+[ PASS ] publishers_merge_like_processes_sharing_a_gpu
+[ PASS ] amd_execution_fails_loudly
+8/8 tests passed
+<end of output>
+Test time =   2.04 sec
+----------------------------------------------------------
+Test Passed.
+"test_telemetry" end time: Sep 02 16:06 CDT
+"test_telemetry" time elapsed: 00:00:02
+----------------------------------------------------------
+
+10/15 Testing: test_regalloc
+10/15 Test: test_regalloc
+Command: "/home/saqib/tools/pantheon/pantheonsim/build-san/test_regalloc"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"test_regalloc" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+[ PASS ] overlapping_lifetimes_share_registers
+[ PASS ] sixty_four_bit_values_cost_a_register_pair
+[ PASS ] predicates_are_counted_separately
+[ PASS ] loop_carried_values_stay_live_across_the_back_edge
+[ PASS ] values_dead_within_an_iteration_do_not_inflate_the_loop
+[ PASS ] occupancy_matches_the_standard_calculation
+[ PASS ] launch_bounds_are_enforced
+[ PASS ] register_budget_refuses_an_impossible_launch
+[ PASS ] simple_kernel_matches_hardware_register_count
+9/9 tests passed
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"test_regalloc" end time: Sep 02 16:06 CDT
+"test_regalloc" time elapsed: 00:00:00
+----------------------------------------------------------
+
+11/15 Testing: test_robustness
+11/15 Test: test_robustness
+Command: "/home/saqib/tools/pantheon/pantheonsim/build-san/test_robustness"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"test_robustness" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+[ PASS ] lz4_compressed_fatbin_ptx_is_decompressed
+[ PASS ] lz4_fatbin_with_a_lying_size_is_rejected
+[ PASS ] malformed_fatbin_fails_cleanly
+[ PASS ] freed_allocation_tracking_is_bounded
+[ PASS ] barrier_after_divergent_region
+[ PASS ] mul_hi_matches_hardware
+[ PASS ] variable_named_directly_as_an_address
+[ PASS ] truncated_fatbin_is_rejected_when_the_size_is_known
+[ PASS ] fatbin_declaring_more_than_the_buffer_is_rejected
+9/9 tests passed
+<end of output>
+Test time =   0.32 sec
+----------------------------------------------------------
+Test Passed.
+"test_robustness" end time: Sep 02 16:06 CDT
+"test_robustness" time elapsed: 00:00:00
+----------------------------------------------------------
+
+12/15 Testing: c_harness_vector_add
+12/15 Test: c_harness_vector_add
+Command: "/home/saqib/tools/pantheon/pantheonsim/build-san/vector_add_driver"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"c_harness_vector_add" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+[vgpu] cuDeviceGetCount: cuInit has not been called
+[vgpu] virtual GPU platform initialized: 1 x nvidia/h100 (NVIDIA H100 80GB HBM3)
+[vgpu] cuDeviceGet: VirtualGPU error [unknown-gpu]: invalid device ordinal 42 (have 1)
+[vgpu] cuModuleGetFunction: VirtualGPU error [not-found]: no kernel named 'noSuchKernel' in module. Kernels present:
+  vecAdd
+[vgpu] cuLaunchKernel: VirtualGPU error [out-of-bounds]: device memory read at 0x7fff00003140 is 0 bytes past the end of the 64-byte allocation at 0x7fff00003100
+  in kernel 'vecAdd', PTX line 30
+  lane 16
+  instruction: ld.global.f32 %f1,[%rd8]
+  GPU profile: nvidia/h100
+[vgpu] cuLaunchKernel: VirtualGPU error [launch-config]: kernel 'vecAdd': block dim 0 is 2048, profile nvidia/h100 allows at most 1024
+[vgpu] cuModuleLoadData: VirtualGPU error [unsupported]: cuModuleLoadData received a bare cubin/ELF image; VirtualGPU loads PTX (embedded PTX text or a fatbin containing PTX)
+[vgpu] cuMemFree: VirtualGPU error [double-free]: double free of device pointer 0x7fff00000000 (allocation of 4000 bytes was already freed)
+driver 13000 | device 0: NVIDIA H100 80GB HBM3 | sm_90 | warp 32 | 132 SMs | 79.2 GiB
+PASS
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"c_harness_vector_add" end time: Sep 02 16:06 CDT
+"c_harness_vector_add" time elapsed: 00:00:00
+----------------------------------------------------------
+
+13/15 Testing: e2e_vector_add
+13/15 Test: e2e_vector_add
+Command: "/home/saqib/tools/pantheon/pantheonsim/tests/e2e/run_e2e.sh"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"e2e_vector_add" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+vectorAdd via libvgpucudart: PASS
+<end of output>
+Test time =   0.44 sec
+----------------------------------------------------------
+Test Passed.
+"e2e_vector_add" end time: Sep 02 16:06 CDT
+"e2e_vector_add" time elapsed: 00:00:00
+----------------------------------------------------------
+
+14/15 Testing: e2e_nccl_multiproc
+14/15 Test: e2e_nccl_multiproc
+Command: "/home/saqib/tools/pantheon/pantheonsim/tests/e2e/run_nccl_multiproc.sh" "4"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"e2e_nccl_multiproc" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+rank 0 of 4: ok
+rank 2 of 4: ok
+rank 1 of 4: ok
+rank 3 of 4: ok
+4 ranks, 4 processes: allreduce + allgather + send/recv all correct
+<end of output>
+Test time =   1.09 sec
+----------------------------------------------------------
+Test Passed.
+"e2e_nccl_multiproc" end time: Sep 02 16:06 CDT
+"e2e_nccl_multiproc" time elapsed: 00:00:01
+----------------------------------------------------------
+
+15/15 Testing: e2e_nccl_group
+15/15 Test: e2e_nccl_group
+Command: "/home/saqib/tools/pantheon/pantheonsim/tests/e2e/run_nccl_group.sh" "4"
+Directory: /home/saqib/tools/pantheon/pantheonsim/build-san
+"e2e_nccl_group" start time: Sep 02 16:06 CDT
+Output:
+----------------------------------------------------------
+nccl ranks=4
+allreduce sum r0           n=1024 sum=13307.0000 ok
+allreduce sum r1           n=1024 sum=13307.0000 ok
+allreduce sum r2           n=1024 sum=13307.0000 ok
+allreduce sum r3           n=1024 sum=13307.0000 ok
+allreduce prod r0          n=1024 sum=103336.7461 ok
+allreduce prod r1          n=1024 sum=103336.7461 ok
+allreduce prod r2          n=1024 sum=103336.7461 ok
+allreduce prod r3          n=1024 sum=103336.7461 ok
+allreduce max r0           n=1024 sum=4862.7500 ok
+allreduce max r1           n=1024 sum=4862.7500 ok
+allreduce max r2           n=1024 sum=4862.7500 ok
+allreduce max r3           n=1024 sum=4862.7500 ok
+allreduce min r0           n=1024 sum=1790.7500 ok
+allreduce min r1           n=1024 sum=1790.7500 ok
+allreduce min r2           n=1024 sum=1790.7500 ok
+allreduce min r3           n=1024 sum=1790.7500 ok
+allreduce avg r0           n=1024 sum=3326.7500 ok
+allreduce avg r1           n=1024 sum=3326.7500 ok
+allreduce avg r2           n=1024 sum=3326.7500 ok
+allreduce avg r3           n=1024 sum=3326.7500 ok
+broadcast r0               n=1024 sum=4862.7500 ok
+broadcast r1               n=1024 sum=4862.7500 ok
+broadcast r2               n=1024 sum=4862.7500 ok
+broadcast r3               n=1024 sum=4862.7500 ok
+reduce root                n=1024 sum=13307.0000 ok
+reduce non-root untouched  n=1024 sum=0.0000 ok
+allgather r0               n=4096 sum=13307.0000 ok
+allgather r1               n=4096 sum=13307.0000 ok
+allgather r2               n=4096 sum=13307.0000 ok
+allgather r3               n=4096 sum=13307.0000 ok
+reducescatter r0           n=1024 sum=13307.0000 ok
+reducescatter r1           n=1024 sum=13311.0000 ok
+reducescatter r2           n=1024 sum=13315.0000 ok
+reducescatter r3           n=1024 sum=13312.0000 ok
+sendrecv ring r0           n=1024 sum=4862.7500 ok
+sendrecv ring r1           n=1024 sum=1790.7500 ok
+sendrecv ring r2           n=1024 sum=2814.7500 ok
+sendrecv ring r3           n=1024 sum=3838.7500 ok
+pipelined send/recv r0     n=1024 sum=4862.7500 ok
+pipelined send/recv r1     n=1024 sum=1790.7500 ok
+pipelined send/recv r2     n=1024 sum=2814.7500 ok
+pipelined send/recv r3     n=1024 sum=3838.7500 ok
+allreduce int32            sum=51150 ok
+comm major=2 count=4 rank=0 dev=0
+RESULT: all collectives match their analytic value
+<end of output>
+Test time =   1.16 sec
+----------------------------------------------------------
+Test Passed.
+"e2e_nccl_group" end time: Sep 02 16:06 CDT
+"e2e_nccl_group" time elapsed: 00:00:01
+----------------------------------------------------------
+
+End testing: Sep 02 16:06 CDT

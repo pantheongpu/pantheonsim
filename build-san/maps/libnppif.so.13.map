@@ -1,0 +1,3 @@
+libnppif.so.13 {
+  global: *;
+};

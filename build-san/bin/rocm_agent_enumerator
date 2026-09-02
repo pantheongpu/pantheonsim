@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Drop-in rocm_agent_enumerator for VirtualGPU: prints the ISA target of every
+# virtual AMD agent (plus the host CPU agent, gfx000), as ROCm's does.
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+vgpu="$here/vgpu"; [[ -x "$vgpu" ]] || vgpu="$here/../vgpu"
+exec "$vgpu" smi --agents

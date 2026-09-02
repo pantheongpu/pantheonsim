@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -fsanitize=address,undefined -fno-omit-frame-pointer -g -g -shared -Wl,--dependency-file=CMakeFiles/vgpunccl.dir/link.d -Wl,-soname,libnccl.so.2 -o libnccl.so.2.0 CMakeFiles/vgpunccl.dir/src/cuda/nccl_api.cpp.o  -Wl,-rpath,/home/saqib/tools/pantheon/pantheonsim/build-san libvgpu.a libcudart.so.13.0

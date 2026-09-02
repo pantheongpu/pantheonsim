@@ -1,0 +1,16 @@
+test_yamlish 3 0.00272542
+test_profile 3 0.00437074
+test_memory 3 0.14781
+test_ptx 3 0.0116027
+test_exec 3 0.0408756
+test_runtime 3 0.0142881
+test_exec2 3 0.0195866
+test_exec3 3 0.0424696
+test_telemetry 3 0.68098
+test_regalloc 3 0.0276778
+test_robustness 3 0.105795
+c_harness_vector_add 3 0.0205385
+e2e_vector_add 3 0.145413
+e2e_nccl_multiproc 3 0.364634
+e2e_nccl_group 3 0.387865
+---

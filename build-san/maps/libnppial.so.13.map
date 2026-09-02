@@ -1,0 +1,3 @@
+libnppial.so.13 {
+  global: *;
+};

@@ -87,7 +87,12 @@ const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t 
     uint64_t base = prev->first;
     const Allocation& a = prev->second;
     if (addr < base + a.size) {
-      if (addr + len > base + a.size)
+      // Compare against the bytes remaining rather than addr + len: a length
+      // near UINT64_MAX makes that sum wrap, and the check then passes for an
+      // access that runs off the end. `addr` is inside the allocation here, so
+      // `remaining` cannot underflow.
+      const uint64_t remaining = a.size - (addr - base);
+      if (len > remaining)
         throw Error::make(Err::OutOfBounds, op, " of ", len, " bytes at ", Hex{addr},
                           " runs past the end of the ", a.size, "-byte allocation at ", Hex{base},
                           " (last valid byte: ", Hex{base + a.size - 1}, ")");
@@ -173,6 +178,12 @@ void MemoryManager::fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_
 
 void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   if (len == 0) return;
+  // The host pointer comes straight from the application. CUDA reports a null
+  // one as an invalid argument; dereferencing it instead turns a recoverable
+  // application bug into a dead process.
+  if (!src)
+    throw Error::make(Err::InvalidValue, "device memory write of ", len,
+                      " bytes from a NULL host pointer");
   uint64_t base = 0;
   Allocation& a = resolve_mut(dst, len, "device memory write", &base);
   const uint8_t* s = static_cast<const uint8_t*>(src);
@@ -192,6 +203,9 @@ void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
 
 void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
   if (len == 0) return;
+  if (!dst)
+    throw Error::make(Err::InvalidValue, "device memory read of ", len,
+                      " bytes into a NULL host pointer");
   uint64_t base = 0;
   const Allocation& a = resolve(src, len, "device memory read", &base);
   uint8_t* d = static_cast<uint8_t*>(dst);

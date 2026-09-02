@@ -1,0 +1,3 @@
+libnvrtc.so.13 {
+  global: *;
+};

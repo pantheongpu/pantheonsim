@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -fsanitize=address,undefined -fno-omit-frame-pointer -g -g -shared -Wl,--dependency-file=CMakeFiles/vgpunvml.dir/link.d -Wl,-soname,libnvidia-ml.so.1 -o libnvidia-ml.so.1 CMakeFiles/vgpunvml.dir/src/cuda/nvml_api.cpp.o  libvgpu.a
