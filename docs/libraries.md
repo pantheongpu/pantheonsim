@@ -94,9 +94,12 @@ by differential testing and are matched deliberately.
 The same suite runs on a rented multi-GPU machine through
 `tools/verify-multigpu-cloud.sh`, which builds VirtualGPU there and compares
 against that machine's own libraries -- so the results above are not one
-laptop's. On a two-H100 SXM5 box running CUDA 12.8, everything above matched,
-which also exercises the older toolkit's LZ4 fatbins, its
-`cudaGetDeviceProperties_v2` spelling, and its different soname majors.
+laptop's. It has been run on two shapes so far, and all thirteen suites match on both:
+
+| machine | what it adds |
+| --- | --- |
+| 2x H100 SXM5, CUDA 12.8 | NVLink, and everything the older toolkit does differently -- LZ4 fatbins, the `cudaGetDeviceProperties_v2` spelling, different soname majors |
+| 8x A100 80GB SXM4, sm_80 | a second architecture, eight-rank NCCL against NVIDIA's libnccl, and eight ranks across eight processes |
 
 Reduced precision is compared with a tolerance, not bit-for-bit, wherever the
 two implementations legitimately differ: these libraries compute in double and

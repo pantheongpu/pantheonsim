@@ -96,7 +96,7 @@ $SSH 'set -x
   export VGPU_CONF_ARCH="sm_$(echo $CC_DOT | tr -d .)"
   case "$CC_DOT" in
     9.0) export VGPU_CONF_GPU=nvidia/h100 ;;
-    8.0) export VGPU_CONF_GPU=nvidia/a100-sxm4-40gb ;;
+    8.0) export VGPU_CONF_GPU=nvidia/a100 ;;
     8.6) export VGPU_CONF_GPU=nvidia/a10 ;;
     10.0) export VGPU_CONF_GPU=nvidia/b200 ;;
     *)   export VGPU_CONF_GPU=nvidia/h100 ;;
