@@ -1157,7 +1157,20 @@ class Parser {
         } else return unsupported("atom operation '." + p + "'");
       }
       if (!aop || !have_ty) return unsupported("atom form");
-      if (ty.is_float()) return unsupported("float atomics not implemented yet");
+      // Float atomics are what a reduction, a gradient accumulation, or an
+      // embedding backward pass is built out of, so they are not optional for
+      // ML work. CUDA exposes add/exch/min/max on float and double; the
+      // bitwise ops and CAS are integer-only there too, and a program that
+      // wants CAS on a float does it through .b32.
+      if (ty.is_float()) {
+        if (*aop != AtomOp::Add && *aop != AtomOp::Exch && *aop != AtomOp::Min &&
+            *aop != AtomOp::Max)
+          return unsupported("atom." + std::string(*aop == AtomOp::Cas ? "cas" : "bitwise") +
+                             " on a float type (CUDA has no such instruction; use .b32)");
+        if (ty.bits != 32 && ty.bits != 64)
+          return unsupported("float atomics are implemented for f32 and f64; f16/bf16 atomics "
+                             "are not yet");
+      }
       OpAtom op;
       op.op = *aop;
       op.ty = ty;

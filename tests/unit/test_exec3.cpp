@@ -7,6 +7,7 @@
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
+#include <cmath>
 #include "vtest.hpp"
 
 using namespace vgpu;
@@ -567,3 +568,82 @@ VTEST(atomics_are_atomic_across_blocks) {
 }
 
 VTEST_MAIN
+
+// Float atomics are what reductions, gradient accumulation, and embedding
+// backward passes are built out of, so a simulator without them cannot run ML
+// code. atom.add.f32 must add the values, not their bit patterns.
+VTEST(float_atomic_add_accumulates_across_blocks) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry acc(.param .u64 p)
+{
+  .reg .f32 %f<4>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.f32 %f1, 0f3F000000;          // 0.5
+  atom.global.add.f32 %f2, [%rd2], %f1;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t acc = mem.alloc(4);
+  float zero = 0.0f;
+  mem.write(acc, &zero, 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {128, 1, 1};
+  cfg.block = {32, 1, 1};
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &acc, 8);
+  exec::launch(m.entries[0], cfg, {arg}, mem, prof);
+  float total = 0.0f;
+  mem.read(acc, &total, 4);
+  VCHECK_EQ(total, 128.0f * 32.0f * 0.5f);
+}
+
+VTEST(float_atomic_min_max_follow_fmin_ordering) {
+  // CUDA's float min/max take the non-NaN operand, which is fmin/fmax
+  // ordering rather than a plain comparison.
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry mm(.param .u64 p, .param .f32 v)
+{
+  .reg .f32 %f<4>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  ld.param.f32 %f1, [v];
+  cvta.to.global.u64 %rd2, %rd1;
+  atom.global.min.f32 %f2, [%rd2], %f1;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t cell = mem.alloc(4);
+  float start = 5.0f;
+  mem.write(cell, &start, 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {1, 1, 1};
+  std::vector<uint8_t> pa(8), va(4);
+  std::memcpy(pa.data(), &cell, 8);
+  float smaller = 2.0f;
+  std::memcpy(va.data(), &smaller, 4);
+  exec::launch(m.entries[0], cfg, {pa, va}, mem, prof);
+  float got = 0.0f;
+  mem.read(cell, &got, 4);
+  VCHECK_EQ(got, 2.0f);
+  // A NaN operand leaves the stored value, per fmin.
+  float nan_v = std::nanf("");
+  std::memcpy(va.data(), &nan_v, 4);
+  exec::launch(m.entries[0], cfg, {pa, va}, mem, prof);
+  mem.read(cell, &got, 4);
+  VCHECK_EQ(got, 2.0f);
+}

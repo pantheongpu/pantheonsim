@@ -1,7 +1,10 @@
-build/
-__pycache__/
 *.o
 *.so
-compile_commands.json
 .cache/
+__pycache__/
+build-cu12/
 build-fix/
+build-san/
+build-tsan/
+build/
+compile_commands.json

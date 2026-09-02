@@ -1624,6 +1624,44 @@ class Interpreter {
         uint64_t old = load_routed(w, ctx, ins, lane, addr, size);
         uint64_t b = mask_to_bits(bv[lane], op.ty.bits);
         uint64_t nv = old;
+        if (op.ty.is_float()) {
+          // Reinterpret and operate in the float domain: adding the bit
+          // patterns of two floats produces a number unrelated to their sum.
+          // Min/max follow CUDA and use the fmin/fmax ordering rather than <,
+          // so a NaN operand yields the other value.
+          if (size == 4) {
+            const float x = std::bit_cast<float>(static_cast<uint32_t>(old));
+            const float y = std::bit_cast<float>(static_cast<uint32_t>(b));
+            float res = x;
+            switch (op.op) {
+              case AtomOp::Add: res = x + y; break;
+              case AtomOp::Exch: res = y; break;
+              case AtomOp::Min: res = std::fmin(x, y); break;
+              case AtomOp::Max: res = std::fmax(x, y); break;
+              default:
+                ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                         "this atomic operation has no float form");
+            }
+            nv = std::bit_cast<uint32_t>(res);
+          } else {
+            const double x = std::bit_cast<double>(old);
+            const double y = std::bit_cast<double>(b);
+            double res = x;
+            switch (op.op) {
+              case AtomOp::Add: res = x + y; break;
+              case AtomOp::Exch: res = y; break;
+              case AtomOp::Min: res = std::fmin(x, y); break;
+              case AtomOp::Max: res = std::fmax(x, y); break;
+              default:
+                ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                         "this atomic operation has no float form");
+            }
+            nv = std::bit_cast<uint64_t>(res);
+          }
+          store_routed(w, ctx, ins, lane, addr, size, mask_to_bits(nv, op.ty.bits));
+          r[lane] = old;
+          continue;
+        }
         switch (op.op) {
           case AtomOp::Add: nv = old + b; break;
           case AtomOp::And: nv = old & b; break;
