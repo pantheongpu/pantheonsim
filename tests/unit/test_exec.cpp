@@ -309,3 +309,31 @@ VTEST(wrong_arg_count_is_diagnosed) {
 }
 
 VTEST_MAIN
+
+VTEST(launch_bounds_limit_the_total_not_each_dimension) {
+  // __launch_bounds__(128) emits ".maxntid 128, 1, 1". A 32x4x1 block is 128
+  // threads and hardware accepts it; checking dimension by dimension rejected
+  // any block with a y extent, which is most real kernels.
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry bounded()
+.maxntid 128, 1, 1
+{
+    ret;
+}
+)";
+  ptx::Module m = ptx::parse(kPtx);
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {32, 4, 1};  // 128 threads, within the bound
+  exec::launch(m.entries[0], cfg, {}, mem, prof);
+  // Over the total is still refused.
+  cfg.block = {32, 8, 1};  // 256
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, mem, prof));
+  VCHECK(err.code() == Err::LaunchConfig);
+  VCHECK_CONTAINS(err.what(), "128");
+}

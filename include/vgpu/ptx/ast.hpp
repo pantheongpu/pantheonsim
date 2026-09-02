@@ -131,16 +131,27 @@ struct OpShfl { ShflMode mode; Reg dst; Reg pred_dst; Operand a, b, c, member_ma
 enum class VoteMode { All, Any, Uni, Ballot };
 struct OpVote { VoteMode mode; bool ballot; Reg dst; Reg src; bool negate_src; };
 struct OpPrmt { Reg dst; Operand a, b, c; };       // byte permute (default mode)
+// copysign.f32/f64 d, a, b -- magnitude of b with the sign of a.
+struct OpCopysign { Type ty; Reg dst; Operand a, b; };
+// dp4a.{u32,s32}.{u32,s32} d, a, b, c -- four byte-wise products of a and b
+// accumulated into c. Quantized inference leans on this heavily.
+struct OpDp4a { bool a_signed; bool b_signed; Reg dst; Operand a, b, c; };
+// bmsk.{clamp,wrap}.b32 d, a, b -- a contiguous mask of b bits starting at a.
+struct OpBmsk { bool wrap; Reg dst; Operand a, b; };
 struct OpIntBin { IntBinOp op; Type ty; Reg dst; Operand a, b; };
 struct OpMadLo { Type ty; Reg dst; Operand a, b, c; };
-struct OpMulWide { bool is_signed; Reg dst; Operand a, b; };  // 32x32 -> 64
+struct OpMulWide { uint32_t src_bits = 32; bool is_signed; Reg dst; Operand a, b; };  // 32x32 -> 64
 struct OpMadWide { bool is_signed; Reg dst; Operand a, b, c; };  // 32x32+64 -> 64
 // High half of a same-width multiply. Compilers emit these to turn integer
 // division by a constant into a multiply, so they show up in ordinary code.
 struct OpMulHi { Type ty; Reg dst; Operand a, b; };
 struct OpMadHi { Type ty; Reg dst; Operand a, b, c; };
 struct OpShf { bool left; bool wrap; Reg dst; Operand a, b, c; };  // funnel shift b:a
-struct OpFloatBin { FloatBinOp op; Type ty; Reg dst; Operand a, b; };
+// PTX names an explicit rounding mode on float arithmetic. Unlike .approx,
+// which only relaxes accuracy, these change the result -- quantization kernels
+// depend on .rz truncating -- so they are carried through and applied.
+enum class FRound { Nearest, Zero, MinusInf, PlusInf };
+struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op; Type ty; Reg dst; Operand a, b; };
 struct OpFma { Type ty; Reg dst; Operand a, b, c; };
 // Packed half2 SIMD: one 32-bit register holds two f16 lanes.
 struct OpF16x2Bin { FloatBinOp op; Reg dst; Operand a, b; };
@@ -175,6 +186,10 @@ struct OpNotPred { Reg dst; Reg src; };
 struct OpAtom { AtomOp op; Space space; Type ty; Reg dst; Addr addr; Operand b; Operand c; };
 struct OpBra { size_t target; std::string label; };  // target = instruction index
 struct OpBar {};                                     // bar.sync 0
+// trap aborts the launch. CUDA reports it as an unspecified launch failure,
+// and a kernel that reaches it has detected something it cannot continue past,
+// so it must not be silently skipped.
+struct OpTrap {};
 struct OpRet {};
 // Call-sequence machinery (currently only the vprintf builtin is callable).
 struct OpDeclSlot { std::string name; uint32_t size; };            // ".param .b64 param0;" in body
@@ -183,7 +198,7 @@ struct OpLdSlot { std::string slot; int64_t offset; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall>;
 

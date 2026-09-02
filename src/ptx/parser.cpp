@@ -1021,6 +1021,50 @@ class Parser {
       expect_punct(",");
       op.src = parse_operand();
       ins.op = op;
+    } else if (op0 == "copysign") {
+      auto ty = parse_type_token(parts.back());
+      if (!ty || !ty->is_float()) return unsupported("copysign form (float types only)");
+      OpCopysign op;
+      op.ty = *ty;
+      op.dst = expect_reg_operand("copysign destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      ins.op = op;
+    } else if (op0 == "dp4a") {
+      // dp4a.atype.btype d, a, b, c
+      if (parts.size() != 3) return unsupported("dp4a form");
+      const bool as = parts[1] == "s32", au = parts[1] == "u32";
+      const bool bs = parts[2] == "s32", bu = parts[2] == "u32";
+      if ((!as && !au) || (!bs && !bu)) return unsupported("dp4a operand types");
+      OpDp4a op;
+      op.a_signed = as;
+      op.b_signed = bs;
+      op.dst = expect_reg_operand("dp4a destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      expect_punct(",");
+      op.c = parse_operand();
+      ins.op = op;
+    } else if (op0 == "bmsk") {
+      if (parts.size() < 2) return unsupported("bmsk form");
+      bool wrap = false;
+      for (size_t i = 1; i + 1 < parts.size(); ++i) {
+        if (parts[i] == "wrap") wrap = true;
+        else if (parts[i] != "clamp") return unsupported("bmsk mode '." + parts[i] + "'");
+      }
+      if (parts.back() != "b32") return unsupported("bmsk type (only .b32)");
+      OpBmsk op;
+      op.wrap = wrap;
+      op.dst = expect_reg_operand("bmsk destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      ins.op = op;
     } else if (op0 == "popc" || op0 == "clz") {
       auto ty = parse_type_token(parts.back());
       if (!ty || parts.size() != 2) return unsupported(op0 + " form");
@@ -1094,8 +1138,16 @@ class Parser {
       }
       ins.op = op;
     } else if (op0 == "neg") {
-      if (parts.size() != 2) return unsupported("neg form");
-      auto ty = parse_type_token(parts[1]);
+      // neg carries the same accuracy modifiers as the other float ops --
+      // neg.ftz.f32 is ordinary in generated code. .ftz flushes denormals to
+      // zero, which negation cannot turn into a wrong sign, so the exact result
+      // stays within what the modifier promises. Take the type from the last
+      // component rather than requiring it to be the only one, as abs does.
+      if (parts.size() < 2) return unsupported("neg form");
+      for (size_t i = 1; i + 1 < parts.size(); ++i)
+        if (parts[i] != "ftz")
+          return unsupported("neg modifier '." + parts[i] + "'");
+      auto ty = parse_type_token(parts.back());
       if (!ty) fail(ins.line, "neg missing type");
       OpNeg op;
       op.ty = *ty;
@@ -1191,6 +1243,7 @@ class Parser {
                op0 == "div" || op0 == "rem" || op0 == "and" || op0 == "or" || op0 == "xor" ||
                op0 == "shl" || op0 == "shr") {
       bool wide = false, lo = false, hi = false;
+      FRound frnd = FRound::Nearest;
       Type ty{};
       bool have_ty = false;
       for (size_t i = 1; i < parts.size(); ++i) {
@@ -1199,10 +1252,20 @@ class Parser {
         else if (p == "lo") lo = true;
         else if (p == "hi") hi = true;
         else if (p == "rn" || p == "ftz") ;
-        else if (p == "rz" || p == "rm" || p == "rp")
-          return unsupported("non-default float rounding mode '." + p + "'");
-        else if (p == "sat" || p == "approx" || p == "full")
-          return unsupported("modifier '." + p + "' not implemented");
+        else if (p == "rz") frnd = FRound::Zero;
+        else if (p == "rm") frnd = FRound::MinusInf;
+        else if (p == "rp") frnd = FRound::PlusInf;
+        // .approx and .full ask for a faster, less accurate result -- div.approx
+        // is what __fdividef compiles to, and ML kernels use it constantly.
+        // Both have a documented error bound, and the exact IEEE result falls
+        // inside it, so computing exactly satisfies the contract. This is the
+        // same policy the SFU transcendentals already follow: correct to better
+        // than hardware, never bit-identical to it.
+        else if (p == "approx" || p == "full") ;
+        // .sat clamps the result into [0,1]. That is a semantic change, not an
+        // accuracy one, so ignoring it would silently produce wrong numbers.
+        else if (p == "sat")
+          return unsupported("modifier '.sat' not implemented");
         else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
@@ -1248,6 +1311,7 @@ class Parser {
         auto it = fops.find(op0);
         if (it == fops.end()) return unsupported("float op '" + op0 + "'");
         OpFloatBin op;
+        op.round = frnd;
         op.op = it->second;
         op.ty = ty;
         op.dst = expect_reg_operand("destination");
@@ -1257,8 +1321,13 @@ class Parser {
         op.b = parse_operand();
         ins.op = op;
       } else if (wide) {
-        if (op0 != "mul" || ty.bits != 32) return unsupported("only mul.wide.{s32,u32} implemented");
+        // .wide doubles the operand width: 16-bit sources give a 32-bit result,
+        // 32-bit give 64. Quantized kernels use the 16-bit form for byte-pair
+        // arithmetic, so restricting this to 32-bit blocked them.
+        if (op0 != "mul" || (ty.bits != 32 && ty.bits != 16))
+          return unsupported("only mul.wide.{s16,u16,s32,u32} implemented");
         OpMulWide op;
+        op.src_bits = ty.bits;
         op.is_signed = ty.is_signed();
         op.dst = expect_reg_operand("destination");
         expect_punct(",");
@@ -1387,6 +1456,18 @@ class Parser {
       if (op.callee != "vprintf")
         return unsupported("call to '" + op.callee + "' (only the vprintf builtin is callable)");
       ins.op = op;
+    } else if (op0 == "trap") {
+      ins.op = OpTrap{};
+    } else if (op0 == "membar" || op0 == "fence") {
+      // Blocks execute their instructions in order and device atomics are
+      // serialized by a lock, so every prior write is already visible to
+      // whoever could observe it. There is no reordering here to fence against.
+      ins.op = OpBar{};
+    } else if (op0 == "nanosleep") {
+      // A backoff hint. Consuming it as a no-op is correct; the operand is a
+      // duration nothing here can meaningfully honour.
+      (void)parse_operand();
+      ins.op = OpBar{};  // nothing to do; treated as a barrier-free no-op
     } else if (op0 == "bar" || op0 == "barrier") {
       bool sync_seen = false;
       for (size_t i = 1; i < parts.size(); ++i) {

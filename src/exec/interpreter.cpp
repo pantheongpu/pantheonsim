@@ -23,6 +23,7 @@
 #include <bit>
 #include <chrono>
 #include <thread>
+#include <cfenv>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -680,8 +681,21 @@ class Interpreter {
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r;  // written for every active lane below
+      // An explicit rounding mode changes the result, so it has to be applied
+      // rather than assumed to be round-to-nearest: quantization kernels use
+      // .rz specifically because truncation is what they want. Set the host
+      // mode around the arithmetic and put it back, so nothing else observes
+      // the change.
+      const int prev_round = std::fegetround();
+      switch (op->round) {
+        case FRound::Zero: std::fesetround(FE_TOWARDZERO); break;
+        case FRound::MinusInf: std::fesetround(FE_DOWNWARD); break;
+        case FRound::PlusInf: std::fesetround(FE_UPWARD); break;
+        case FRound::Nearest: break;
+      }
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = float_bin(op->op, op->ty, a[lane], b[lane]);
+      if (op->round != FRound::Nearest) std::fesetround(prev_round);
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -721,13 +735,20 @@ class Interpreter {
       Lanes r;  // written for every active lane below
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
-          if (op->is_signed)
+          if (op->src_bits == 16) {
+            if (op->is_signed)
+              r[lane] = static_cast<uint64_t>(static_cast<uint32_t>(
+                  int32_t{static_cast<int16_t>(a[lane])} * int32_t{static_cast<int16_t>(b[lane])}));
+            else
+              r[lane] = uint32_t{static_cast<uint16_t>(a[lane])} *
+                        uint32_t{static_cast<uint16_t>(b[lane])};
+          } else if (op->is_signed)
             r[lane] = static_cast<uint64_t>(int64_t{static_cast<int32_t>(a[lane])} *
                                             int64_t{static_cast<int32_t>(b[lane])});
           else
             r[lane] = uint64_t{static_cast<uint32_t>(a[lane])} * uint64_t{static_cast<uint32_t>(b[lane])};
         }
-      write_reg(w, op->dst, m, r, 64);
+      write_reg(w, op->dst, m, r, op->src_bits * 2);  // .wide doubles the width
       return;
     }
     if (const auto* op = std::get_if<OpSelp>(&ins.op)) {
@@ -850,6 +871,76 @@ class Interpreter {
             r[lane] = static_cast<uint64_t>(-static_cast<int64_t>(v[lane]));
         }
       write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpCopysign>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          // Magnitude of b, sign of a -- and it must be bit-exact for zeros and
+          // NaNs, so move the sign bit rather than going through comparisons.
+          if (op->ty.bits == 64) {
+            const uint64_t sign = a[lane] & (1ull << 63);
+            r[lane] = sign | (b[lane] & ~(1ull << 63));
+          } else {
+            const uint32_t av = static_cast<uint32_t>(a[lane]);
+            const uint32_t bv = static_cast<uint32_t>(b[lane]);
+            r[lane] = (av & 0x80000000u) | (bv & 0x7fffffffu);
+          }
+        }
+      write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpDp4a>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          const uint32_t av = static_cast<uint32_t>(a[lane]);
+          const uint32_t bv = static_cast<uint32_t>(b[lane]);
+          // Each operand contributes four bytes, sign- or zero-extended
+          // according to its own type; the four products accumulate into c.
+          int64_t acc = op->a_signed || op->b_signed
+                            ? static_cast<int64_t>(static_cast<int32_t>(c[lane]))
+                            : static_cast<int64_t>(static_cast<uint32_t>(c[lane]));
+          for (int byte = 0; byte < 4; ++byte) {
+            const uint8_t ab = static_cast<uint8_t>(av >> (byte * 8));
+            const uint8_t bb = static_cast<uint8_t>(bv >> (byte * 8));
+            const int64_t ax = op->a_signed ? static_cast<int8_t>(ab) : static_cast<int64_t>(ab);
+            const int64_t bx = op->b_signed ? static_cast<int8_t>(bb) : static_cast<int64_t>(bb);
+            acc += ax * bx;
+          }
+          r[lane] = static_cast<uint32_t>(static_cast<int32_t>(acc));
+        }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpBmsk>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          const uint32_t base = static_cast<uint32_t>(a[lane]) & 31u;
+          uint32_t width = static_cast<uint32_t>(b[lane]) & 0xffu;
+          // .clamp caps the width at the register size; .wrap takes it modulo.
+          if (op->wrap) width &= 31u;
+          else if (width > 32u) width = 32u;
+          uint32_t mask = width >= 32u ? 0xffffffffu : ((1u << width) - 1u);
+          r[lane] = static_cast<uint32_t>(mask << base);
+        }
+      write_reg(w, op->dst, m, r, 32);
       return;
     }
     if (const auto* op = std::get_if<OpPrmt>(&ins.op)) {
@@ -1919,12 +2010,18 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
                         fn.req_ntid[0], "x", fn.req_ntid[1], "x", fn.req_ntid[2],
                         " threads per block (.reqntid), launch asked for ", cfg.block[0], "x",
                         cfg.block[1], "x", cfg.block[2]);
-    if (fn.max_ntid[i] && cfg.block[i] > fn.max_ntid[i])
-      throw Error::make(Err::LaunchConfig, "kernel '", fn.name,
-                        "' was compiled for at most ", fn.max_ntid[0], "x", fn.max_ntid[1], "x",
-                        fn.max_ntid[2], " threads per block (__launch_bounds__), launch asked for ",
-                        cfg.block[0], "x", cfg.block[1], "x", cfg.block[2]);
   }
+  // .maxntid bounds the *product* of the block dimensions, not each one
+  // separately: __launch_bounds__(128) emits ".maxntid 128, 1, 1", and a launch
+  // of 32x4x1 is 128 threads, which hardware accepts. Comparing dimension by
+  // dimension rejected shapes that are within the bound -- every block whose y
+  // extent was greater than 1, which is most of them.
+  const uint64_t max_ntid_total = uint64_t{fn.max_ntid[0]} * fn.max_ntid[1] * fn.max_ntid[2];
+  const uint64_t block_total = uint64_t{cfg.block[0]} * cfg.block[1] * cfg.block[2];
+  if (max_ntid_total && block_total > max_ntid_total)
+    throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "' was compiled for at most ",
+                      max_ntid_total, " threads per block (__launch_bounds__), launch asked for ",
+                      cfg.block[0], "x", cfg.block[1], "x", cfg.block[2], " = ", block_total);
 
   // Register budget. A block whose threads collectively need more registers
   // than the device provides cannot be launched -- the same
