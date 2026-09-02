@@ -21,6 +21,9 @@
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+// cublas_v2.h pulls in the runtime API transitively under CUDA 13 but not
+// under CUDA 12, and this file copies operands with cudaMemcpy.
+#include <cuda_runtime_api.h>
 
 #include <cmath>
 #include <cstdio>
