@@ -91,6 +91,13 @@ cuDNN rejects `CUDNN_ACTIVATION_IDENTITY` from `cudnnActivationForward`, and
 cuRAND does *not* rewind its stream when the seed is set again. Both were found
 by differential testing and are matched deliberately.
 
+The same suite runs on a rented multi-GPU machine through
+`tools/verify-multigpu-cloud.sh`, which builds VirtualGPU there and compares
+against that machine's own libraries -- so the results above are not one
+laptop's. On a two-H100 SXM5 box running CUDA 12.8, everything above matched,
+which also exercises the older toolkit's LZ4 fatbins, its
+`cudaGetDeviceProperties_v2` spelling, and its different soname majors.
+
 Reduced precision is compared with a tolerance, not bit-for-bit, wherever the
 two implementations legitimately differ: these libraries compute in double and
 round on the way out, so single-precision results are if anything slightly more
