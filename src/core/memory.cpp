@@ -127,6 +127,50 @@ MemoryManager::Allocation& MemoryManager::resolve_mut(uint64_t addr, uint64_t le
   return const_cast<Allocation&>(resolve(addr, len, op, base_out));
 }
 
+uint8_t* MemoryManager::materialize(Allocation& a, uint64_t chunk_idx) {
+  // First touch materializes the chunk. Two threads can race here; the loser
+  // frees its copy and uses the winner's, so the pointer a reader sees is
+  // always the one that stays. make_unique value-initializes, so the chunk
+  // arrives zeroed -- untouched device memory reads as zero.
+  auto fresh = std::make_unique<uint8_t[]>(kChunkSize);
+  uint8_t* expected = nullptr;
+  if (a.chunks[chunk_idx].compare_exchange_strong(expected, fresh.get(),
+                                                  std::memory_order_acq_rel))
+    return fresh.release();
+  return expected;
+}
+
+void MemoryManager::fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_len, uint64_t len) {
+  if (len == 0) return;
+  uint64_t base = 0;
+  Allocation& a = resolve_mut(dst, len, "device memory fill", &base);
+  bool all_zero = true;
+  for (uint32_t i = 0; i < pattern_len; ++i)
+    if (pattern[i] != 0) all_zero = false;
+  uint64_t off = dst - base;
+  uint64_t done = 0;  // bytes filled so far; fixes the pattern's phase
+  while (len > 0) {
+    uint64_t chunk_idx = off / kChunkSize;
+    uint64_t chunk_off = off % kChunkSize;
+    uint64_t n = std::min(len, kChunkSize - chunk_off);
+    uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
+    // Zeroing a chunk that was never touched is a no-op that would otherwise
+    // cost 64 KiB of host RAM to express.
+    if (chunk || !all_zero) {
+      if (!chunk) chunk = materialize(a, chunk_idx);
+      if (pattern_len == 1) {
+        std::memset(chunk + chunk_off, pattern[0], static_cast<size_t>(n));
+      } else {
+        uint8_t* p = chunk + chunk_off;
+        for (uint64_t i = 0; i < n; ++i) p[i] = pattern[(done + i) % pattern_len];
+      }
+    }
+    off += n;
+    done += n;
+    len -= n;
+  }
+}
+
 void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   if (len == 0) return;
   uint64_t base = 0;
@@ -138,19 +182,7 @@ void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
     uint64_t chunk_off = off % kChunkSize;
     uint64_t n = std::min(len, kChunkSize - chunk_off);
     uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
-    if (!chunk) {
-      // First touch materializes the chunk. Two threads can race here; the
-      // loser frees its copy and uses the winner's, so the pointer a reader
-      // sees is always the one that stays.
-      auto fresh = std::make_unique<uint8_t[]>(kChunkSize);
-      std::memset(fresh.get(), 0, kChunkSize);
-      uint8_t* expected = nullptr;
-      if (a.chunks[chunk_idx].compare_exchange_strong(expected, fresh.get(),
-                                                      std::memory_order_acq_rel))
-        chunk = fresh.release();
-      else
-        chunk = expected;
-    }
+    if (!chunk) chunk = materialize(a, chunk_idx);
     std::memcpy(chunk + chunk_off, s, n);
     s += n;
     off += n;

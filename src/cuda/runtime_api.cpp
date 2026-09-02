@@ -723,8 +723,8 @@ VGPU_EXPORT cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* 
 
 VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
   return guard("cudaMemset", [&](State& s) {
-    std::vector<uint8_t> buf(count, static_cast<uint8_t>(value));
-    owner_memory(s, dst).write(reinterpret_cast<uint64_t>(dst), buf.data(), count);
+    const uint8_t byte = static_cast<uint8_t>(value);
+    owner_memory(s, dst).fill(reinterpret_cast<uint64_t>(dst), &byte, 1, count);
     return cudaSuccess;
   });
 }

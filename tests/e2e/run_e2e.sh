@@ -9,7 +9,14 @@ out="${TMPDIR:-/tmp}/vgpu_e2e_vecadd_$$"
 if ! command -v nvcc >/dev/null 2>&1; then
   echo "SKIP: nvcc not found (e2e needs the CUDA toolkit to compile the app)"; exit 0
 fi
-if [[ ! -e "$shim/libcudart.so.13" ]]; then
+# The shim's soname major follows the installed toolkit (.so.12 under CUDA 12,
+# .so.13 under CUDA 13), so match on whatever was built. Naming one major here
+# made this skip -- and so report success without compiling anything -- on
+# every host with the other one.
+shopt -s nullglob
+cudart_libs=("$shim"/libcudart.so.[0-9]*)
+shopt -u nullglob
+if (( ${#cudart_libs[@]} == 0 )); then
   echo "SKIP: libvgpucudart not built (CUDA ABI headers absent at build time)"; exit 0
 fi
 nvcc -std=c++14 -cudart shared --gpu-architecture=sm_86 -Wno-deprecated-gpu-targets "$src" -o "$out"

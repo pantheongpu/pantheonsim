@@ -64,6 +64,13 @@ class MemoryManager {
   void write(uint64_t dst, const void* src, uint64_t len);
   void read(uint64_t src, void* dst, uint64_t len) const;
 
+  // Fills a range by repeating a 1/2/4-byte pattern, without building a host
+  // copy of the range first. Staging a buffer the size of the fill is what
+  // made a memset of N bytes cost 2N of host RAM: the staging buffer is live
+  // at the same time as the chunks it is being copied into. A zero pattern
+  // skips untouched chunks entirely, since those already read as zero.
+  void fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_len, uint64_t len);
+
   // Scalar access for the interpreter. size must be 1/2/4/8 and the address
   // naturally aligned. Values are zero-extended into the returned u64.
   uint64_t load_scalar(uint64_t addr, uint32_t size) const;
@@ -128,6 +135,10 @@ class MemoryManager {
     uint64_t size = 0;
     uint64_t seq = 0;  // eviction order
   };
+
+  // Creates chunk `chunk_idx` if absent and returns the chunk that won the
+  // race; safe to call from several block threads at once.
+  static uint8_t* materialize(Allocation& a, uint64_t chunk_idx);
 
   // Maps addr to (allocation base, allocation); throws with diagnostics.
   const Allocation& resolve(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out) const;

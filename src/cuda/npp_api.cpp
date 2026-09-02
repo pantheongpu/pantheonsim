@@ -29,17 +29,40 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 #include <cuda_runtime.h>
 
-// The signal API's length parameter is size_t in every toolkit this has been
-// built against -- NPP 12.8 and 13.0 both. An earlier attempt guarded it on the
-// major version and made NPP 12.8 fail to compile, which is the useful failure
-// mode: a definition that disagrees with the header is a compile error, not a
-// silent mismatch. The alias stays so the day it does change there is one place
-// to change it.
-using NppSignalLen = size_t;
+// The signal API's length parameter is `int` in NPP 12.0 and `size_t` by 12.8.
+// Guarding on the version means guessing the release it changed in, and a
+// definition that disagrees with the header is a hard compile error. So take
+// the type from the header's own declaration of nppsMalloc_8u instead: whatever
+// this toolkit says the length is, that is what the definitions below use.
+template <typename F>
+struct npp_len_of;
+template <typename R, typename A>
+struct npp_len_of<R (*)(A)> {
+  using type = A;
+};
+using NppSignalLen = typename npp_len_of<decltype(&nppsMalloc_8u)>::type;
+
+// The GetBufferHostSize/GetBufferSize families have the same split: the
+// out-parameter is int* on NPP 12.0 and size_t* by 12.8. Read it off the
+// header rather than guessing the release. Anchor on the _Ctx forms -- CUDA 13
+// declares only those, so the plain names are not a portable place to look.
+template <typename F>
+struct npp_ctx_bufsize_of;
+template <typename R, typename A, typename B, typename C>
+struct npp_ctx_bufsize_of<R (*)(A, B, C)> {
+  using type = B;
+};
+using NppBufferSize = std::remove_pointer_t<
+    typename npp_ctx_bufsize_of<decltype(&nppiSumGetBufferHostSize_8u_C1R_Ctx)>::type>;
+// The signal-domain sizes split independently of the image-domain ones, so
+// derive them separately rather than assuming the two agree.
+using NppSignalBufferSize = std::remove_pointer_t<
+    typename npp_ctx_bufsize_of<decltype(&nppsSumGetBufferSize_32f_Ctx)>::type>;
 
 namespace {
 
@@ -148,11 +171,16 @@ VGPU_EXPORT void nppiFree(void* p) { cudaFree(p); }
 
 /* ---- signal memory ---- */
 
-#define VGPU_NPPS_MALLOC(SUFFIX, TYPE)                        \
-  VGPU_EXPORT TYPE* nppsMalloc_##SUFFIX(size_t n) {           \
-    void* p = nullptr;                                        \
-    if (cudaMalloc(&p, n * sizeof(TYPE)) != cudaSuccess) return nullptr; \
-    return static_cast<TYPE*>(p);                             \
+#define VGPU_NPPS_MALLOC(SUFFIX, TYPE)                                      \
+  VGPU_EXPORT TYPE* nppsMalloc_##SUFFIX(NppSignalLen n) {                   \
+    if constexpr (std::is_signed_v<NppSignalLen>)                           \
+      if (n < 0) return nullptr;                                            \
+    void* p = nullptr;                                                      \
+    /* widen before multiplying: on the toolkits where the length is int,   \
+       a large count times sizeof(TYPE) overflows the int otherwise */      \
+    const size_t bytes = static_cast<size_t>(n) * sizeof(TYPE);             \
+    if (cudaMalloc(&p, bytes) != cudaSuccess) return nullptr;               \
+    return static_cast<TYPE*>(p);                                           \
   }
 VGPU_NPPS_MALLOC(8u, Npp8u)
 VGPU_NPPS_MALLOC(8s, Npp8s)
@@ -567,24 +595,24 @@ VGPU_NPP_CTX(NppStatus, nppiCompare_8u_C1R,
    buffer it sizes for the caller. Nothing here needs scratch, but the size has
    to be non-zero or a caller's cudaMalloc of it fails. */
 
-VGPU_EXPORT NppStatus nppiSumGetBufferHostSize_8u_C1R(NppiSize roi, size_t* bytes) {
+VGPU_EXPORT NppStatus nppiSumGetBufferHostSize_8u_C1R(NppiSize roi, NppBufferSize* bytes) {
   if (!bytes) return NPP_NULL_POINTER_ERROR;
   *bytes = 4096;
   return NPP_SUCCESS;
 }
-VGPU_EXPORT NppStatus nppiMeanGetBufferHostSize_8u_C1R(NppiSize roi, size_t* bytes) {
+VGPU_EXPORT NppStatus nppiMeanGetBufferHostSize_8u_C1R(NppiSize roi, NppBufferSize* bytes) {
   return nppiSumGetBufferHostSize_8u_C1R(roi, bytes);
 }
-VGPU_EXPORT NppStatus nppiMinMaxGetBufferHostSize_8u_C1R(NppiSize roi, size_t* bytes) {
+VGPU_EXPORT NppStatus nppiMinMaxGetBufferHostSize_8u_C1R(NppiSize roi, NppBufferSize* bytes) {
   return nppiSumGetBufferHostSize_8u_C1R(roi, bytes);
 }
-VGPU_EXPORT NppStatus nppiMeanStdDevGetBufferHostSize_8u_C1R(NppiSize roi, size_t* bytes) {
+VGPU_EXPORT NppStatus nppiMeanStdDevGetBufferHostSize_8u_C1R(NppiSize roi, NppBufferSize* bytes) {
   return nppiSumGetBufferHostSize_8u_C1R(roi, bytes);
 }
-VGPU_NPP_CTX(NppStatus, nppiSumGetBufferHostSize_8u_C1R, (NppiSize r, size_t* b, NppStreamContext), (r, b))
-VGPU_NPP_CTX(NppStatus, nppiMeanGetBufferHostSize_8u_C1R, (NppiSize r, size_t* b, NppStreamContext), (r, b))
-VGPU_NPP_CTX(NppStatus, nppiMinMaxGetBufferHostSize_8u_C1R, (NppiSize r, size_t* b, NppStreamContext), (r, b))
-VGPU_NPP_CTX(NppStatus, nppiMeanStdDevGetBufferHostSize_8u_C1R, (NppiSize r, size_t* b, NppStreamContext), (r, b))
+VGPU_NPP_CTX(NppStatus, nppiSumGetBufferHostSize_8u_C1R, (NppiSize r, NppBufferSize* b, NppStreamContext), (r, b))
+VGPU_NPP_CTX(NppStatus, nppiMeanGetBufferHostSize_8u_C1R, (NppiSize r, NppBufferSize* b, NppStreamContext), (r, b))
+VGPU_NPP_CTX(NppStatus, nppiMinMaxGetBufferHostSize_8u_C1R, (NppiSize r, NppBufferSize* b, NppStreamContext), (r, b))
+VGPU_NPP_CTX(NppStatus, nppiMeanStdDevGetBufferHostSize_8u_C1R, (NppiSize r, NppBufferSize* b, NppStreamContext), (r, b))
 
 VGPU_EXPORT NppStatus nppiSum_8u_C1R(const Npp8u* s, int ss, NppiSize roi, Npp8u*, Npp64f* sum) {
   if (!s || !sum) return NPP_NULL_POINTER_ERROR;
@@ -967,12 +995,13 @@ VGPU_NPP_CTX(NppStatus, nppsCopy_32f, (const Npp32f* s, Npp32f* d, NppSignalLen 
              (s, d, n))
 
 #define VGPU_NPPS_BUFSIZE(NAME)                                                          \
-  VGPU_EXPORT NppStatus npps##NAME##GetBufferSize_32f(NppSignalLen n, size_t* bytes) {         \
+  VGPU_EXPORT NppStatus npps##NAME##GetBufferSize_32f(NppSignalLen n,             \
+                                                      NppSignalBufferSize* bytes) {         \
     if (!bytes) return NPP_NULL_POINTER_ERROR;                                           \
     *bytes = 4096;                                                                       \
     return NPP_SUCCESS;                                                                  \
   }                                                                                      \
-  VGPU_NPP_CTX(NppStatus, npps##NAME##GetBufferSize_32f, (NppSignalLen n, size_t* b, NppStreamContext), \
+  VGPU_NPP_CTX(NppStatus, npps##NAME##GetBufferSize_32f, (NppSignalLen n, NppSignalBufferSize* b, NppStreamContext), \
                (n, b))
 VGPU_NPPS_BUFSIZE(Sum)
 VGPU_NPPS_BUFSIZE(Mean)

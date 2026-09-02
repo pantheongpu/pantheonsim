@@ -119,8 +119,16 @@ function(vgpu_toolkit_soversion _name _default _out)
   # The include directory that was actually accepted is the most reliable
   # anchor: its sibling lib directories belong to the same toolkit.
   get_filename_component(_inc_root "${CUDA_ABI_INCLUDE}" DIRECTORY)
+  # Distro-packaged toolkits (Ubuntu's cuda-* debs) put the headers in
+  # /usr/include and the libraries in the multiarch dir, which none of the
+  # toolkit-shaped paths above cover: the search fell through to the default
+  # and built a .so.13 shim on a CUDA 12 host, where it is never loaded
+  # because the program asks the loader for libcudart.so.12.
   foreach(_dir "${_cuda_root}/lib64" "${_cuda_root}/targets/x86_64-linux/lib" "${_cuda_root}/lib"
-               "${_inc_root}/lib64" "${_inc_root}/lib")
+               "${_cuda_root}/lib/${CMAKE_LIBRARY_ARCHITECTURE}"
+               "${_inc_root}/lib64" "${_inc_root}/lib"
+               "${_inc_root}/lib/${CMAKE_LIBRARY_ARCHITECTURE}"
+               "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}" "/lib/${CMAKE_LIBRARY_ARCHITECTURE}")
     file(GLOB _cands "${_dir}/lib${_name}.so.[0-9]*")
     foreach(_c IN LISTS _cands)
       if("${_c}" MATCHES "\\.so\\.([0-9]+)$")

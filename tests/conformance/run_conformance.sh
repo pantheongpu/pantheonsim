@@ -16,7 +16,11 @@ mkdir -p "$out"
 : "${VGPU_CONF_ARCH:=sm_86}"
 
 command -v nvcc >/dev/null || { echo "SKIP: nvcc not found"; exit 0; }
-[[ -e "$shim/libcudart.so.13" ]] || { echo "SKIP: build VirtualGPU first"; exit 0; }
+# Match whichever soname major this toolkit built (see run_e2e.sh).
+shopt -s nullglob
+_cudart_libs=("$shim"/libcudart.so.[0-9]*)
+shopt -u nullglob
+(( ${#_cudart_libs[@]} > 0 )) || { echo "SKIP: build VirtualGPU first"; exit 0; }
 have_gpu=0
 ngpu=0
 if [[ -z "${VGPU_ONLY:-}" ]] && nvidia-smi -L >/dev/null 2>&1; then
