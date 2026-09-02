@@ -19,6 +19,7 @@
 //    (these diagnostics are a product feature for CI, not just debug aids).
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -80,10 +81,48 @@ class MemoryManager {
   size_t live_allocations() const { return live_.size(); }
 
  private:
+  // Chunks are a flat array of owning pointers rather than a map: a lookup is
+  // then an index instead of a red-black tree walk, which is the difference
+  // between one instruction and a cache-missing traversal on every scalar
+  // access. Making them atomic also lets blocks run on several threads without
+  // a lock on the fast path -- a chunk is created once and never moves, so a
+  // reader either sees null (reads as zero) or the final pointer.
   struct Allocation {
     uint64_t size = 0;
-    // chunk index -> chunk bytes; absent chunks read as zero.
-    std::map<uint64_t, std::unique_ptr<uint8_t[]>> chunks;
+    size_t chunk_count = 0;
+    std::unique_ptr<std::atomic<uint8_t*>[]> chunks;
+
+    Allocation() = default;
+    // The move has to clear the source's count as well as its pointer: a
+    // defaulted move leaves chunk_count behind, and the moved-from destructor
+    // then walks a null array.
+    Allocation(Allocation&& o) noexcept
+        : size(o.size), chunk_count(o.chunk_count), chunks(std::move(o.chunks)) {
+      o.size = 0;
+      o.chunk_count = 0;
+    }
+    Allocation& operator=(Allocation&& o) noexcept {
+      if (this != &o) {
+        release();
+        size = o.size;
+        chunk_count = o.chunk_count;
+        chunks = std::move(o.chunks);
+        o.size = 0;
+        o.chunk_count = 0;
+      }
+      return *this;
+    }
+    Allocation(const Allocation&) = delete;
+    Allocation& operator=(const Allocation&) = delete;
+    ~Allocation() { release(); }
+
+   private:
+    void release() {
+      if (!chunks) return;
+      for (size_t i = 0; i < chunk_count; ++i) delete[] chunks[i].load(std::memory_order_relaxed);
+    }
+
+   public:
   };
   struct FreedRecord {
     uint64_t size = 0;

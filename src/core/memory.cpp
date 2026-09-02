@@ -30,7 +30,11 @@ uint64_t MemoryManager::alloc(uint64_t size) {
   next_va_ += padded;
   high_water_va_ = next_va_;
   used_ += size;
-  live_.emplace(base, Allocation{size, {}});
+  Allocation a;
+  a.size = size;
+  a.chunk_count = static_cast<size_t>((size + kChunkSize - 1) / kChunkSize);
+  a.chunks = std::make_unique<std::atomic<uint8_t*>[]>(a.chunk_count);
+  live_.emplace(base, std::move(a));
   notify_usage();
   return base;
 }
@@ -133,12 +137,21 @@ void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
     uint64_t chunk_idx = off / kChunkSize;
     uint64_t chunk_off = off % kChunkSize;
     uint64_t n = std::min(len, kChunkSize - chunk_off);
-    auto& chunk = a.chunks[chunk_idx];
+    uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
     if (!chunk) {
-      chunk = std::make_unique<uint8_t[]>(kChunkSize);
-      std::memset(chunk.get(), 0, kChunkSize);
+      // First touch materializes the chunk. Two threads can race here; the
+      // loser frees its copy and uses the winner's, so the pointer a reader
+      // sees is always the one that stays.
+      auto fresh = std::make_unique<uint8_t[]>(kChunkSize);
+      std::memset(fresh.get(), 0, kChunkSize);
+      uint8_t* expected = nullptr;
+      if (a.chunks[chunk_idx].compare_exchange_strong(expected, fresh.get(),
+                                                      std::memory_order_acq_rel))
+        chunk = fresh.release();
+      else
+        chunk = expected;
     }
-    std::memcpy(chunk.get() + chunk_off, s, n);
+    std::memcpy(chunk + chunk_off, s, n);
     s += n;
     off += n;
     len -= n;
@@ -155,11 +168,11 @@ void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
     uint64_t chunk_idx = off / kChunkSize;
     uint64_t chunk_off = off % kChunkSize;
     uint64_t n = std::min(len, kChunkSize - chunk_off);
-    auto it = a.chunks.find(chunk_idx);
-    if (it == a.chunks.end())
+    const uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
+    if (!chunk)
       std::memset(d, 0, n);  // untouched device memory reads as zero (documented)
     else
-      std::memcpy(d, it->second.get() + chunk_off, n);
+      std::memcpy(d, chunk + chunk_off, n);
     d += n;
     off += n;
     len -= n;

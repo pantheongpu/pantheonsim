@@ -53,7 +53,15 @@ using SymbolTable = std::map<std::string, uint64_t>;
 
 // Runs `fn` across the whole grid on the CPU. `args` are the raw kernel
 // parameter values, one byte-vector per .param (sizes must match).
-// Deterministic: same inputs -> same result, always.
+//
+// The grid is split across host threads -- CUDA blocks are independent, which
+// is the programming model's central promise -- so a race-free kernel gives the
+// same result every time, exactly as it does on hardware. A kernel that races
+// no longer has one blessed answer, which is also true on hardware; set
+// VGPU_THREADS=1 to get back a single strictly ordered block sequence, which
+// makes even a racy kernel reproducible.
+//
+// Warp scheduling inside a block stays deterministic regardless.
 LaunchStats launch(const ptx::EntryFn& fn, const LaunchConfig& cfg,
                    const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
                    const DeviceProfile& profile, const SymbolTable* symbols = nullptr,

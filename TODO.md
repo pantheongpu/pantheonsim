@@ -179,6 +179,24 @@ still a separate question from library coverage.
 
 ## Performance
 
+Two changes moved the needle most recently, both found by profiling rather than
+by guessing:
+
+- **The grid runs on every core.** Blocks are independent by definition, so
+  each host thread takes a slice of them. `VGPU_THREADS` sets the count and
+  defaults to the machine's; 1 restores the old strictly serial block order,
+  which is what a kernel with a data race needs to stay reproducible. Device
+  atomics take a stripe lock when the launch is threaded, because a fixed lane
+  order is only atomic within one thread -- without it a 256-block atomicAdd
+  test lost a third of its increments.
+- **Chunk lookup is an array index, not a tree walk.** Sparse VRAM chunks were
+  a std::map per allocation, so every scalar load and store walked a red-black
+  tree. They are now a flat array of atomic pointers: O(1), no allocation on
+  the read path, and lock-free for the threaded case.
+
+Measured on an 8-core box: vectorAdd 2M elements 169 ms -> 50 ms, and the
+pantheon memory_write workload at --duration 1 went from 49 s to 7.5 s.
+
 Measure with `tools/bench.sh` (vectorAdd) and a register-heavy kernel.
 Profile with gprof; guessing has been wrong every time so far.
 

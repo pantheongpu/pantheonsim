@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -181,18 +182,28 @@ class Interpreter {
     if (progress_) last_progress_ = std::chrono::steady_clock::now();
   }
 
+  void set_concurrent(bool v) { concurrent_ = v; }
+
   void run_grid() {
+    const uint64_t total = uint64_t{cfg_.grid[0]} * cfg_.grid[1] * cfg_.grid[2];
+    run_block_range(0, total);
+  }
+
+  // Runs the blocks with linear indices [first, last). CUDA blocks are
+  // independent -- that is the programming model's central promise -- so a
+  // range can run on its own thread with nothing shared but device memory.
+  void run_block_range(uint64_t first, uint64_t last) {
     auto sched = make_scheduler(cfg_.scheduler);
-    for (uint32_t bz = 0; bz < cfg_.grid[2]; ++bz)
-      for (uint32_t by = 0; by < cfg_.grid[1]; ++by)
-        for (uint32_t bx = 0; bx < cfg_.grid[0]; ++bx) {
-          BlockCtx ctx;
-          ctx.ctaid = {bx, by, bz};
-          ctx.ntid = cfg_.block;
-          ctx.nctaid = cfg_.grid;
-          run_block(ctx, *sched);
-          ++stats_.blocks;
-        }
+    const uint64_t gx = cfg_.grid[0], gy = cfg_.grid[1];
+    for (uint64_t i = first; i < last; ++i) {
+      BlockCtx ctx;
+      ctx.ctaid = {static_cast<uint32_t>(i % gx), static_cast<uint32_t>((i / gx) % gy),
+                   static_cast<uint32_t>(i / (gx * gy))};
+      ctx.ntid = cfg_.block;
+      ctx.nctaid = cfg_.grid;
+      run_block(ctx, *sched);
+      ++stats_.blocks;
+    }
   }
 
  private:
@@ -1597,10 +1608,19 @@ class Interpreter {
     Lanes _s_cv;
     if (op.op == AtomOp::Cas) cv = read_operand(w, ctx, ins, op.c, _s_cv);
     Lanes r;  // written for every active lane below
-    // Fixed lane order: trivially atomic and deterministic in this engine.
+    // A fixed lane order makes this atomic within a warp, and within a block,
+    // because a block runs on one thread. Across blocks it does not: when the
+    // grid is spread over several threads, two blocks can read-modify-write the
+    // same global address at once and lose an update. The stripe lock closes
+    // that, and is skipped entirely when the launch is single-threaded, where
+    // the fixed order was already enough.
+    const bool lock_needed = concurrent_ && op.space != Space::Shared && op.space != Space::Local;
     for (uint32_t lane = 0; lane < kWarpSize; ++lane)
       if (m & (1u << lane)) {
         uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+        std::unique_lock<std::mutex> guard;
+        if (lock_needed)
+          guard = std::unique_lock<std::mutex>(atomic_lock_for(addr));
         uint64_t old = load_routed(w, ctx, ins, lane, addr, size);
         uint64_t b = mask_to_bits(bv[lane], op.ty.bits);
         uint64_t nv = old;
@@ -1738,10 +1758,16 @@ class Interpreter {
                      std::string("printf conversion '%") + conv + "' is not implemented");
         }
       }
-      std::fwrite(out.data(), 1, out.size(), stdout);
+      // One lock for the whole line: blocks run on several threads, and
+      // interleaving two device printfs mid-line makes both unreadable.
+      {
+        static std::mutex printf_mu;
+        std::lock_guard<std::mutex> guard(printf_mu);
+        std::fwrite(out.data(), 1, out.size(), stdout);
+        std::fflush(stdout);
+      }
       counts[lane] = out.size();
     }
-    std::fflush(stdout);
     if (!op.retval_slot.empty()) {
       Lanes& slot = w.slots[op.retval_slot];
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
@@ -1758,6 +1784,14 @@ class Interpreter {
     progress_(dt);
   }
 
+  // Striped locks for device-side atomics when the grid is running on more
+  // than one thread. Sized well above the core count so unrelated addresses
+  // rarely collide.
+  static std::mutex& atomic_lock_for(uint64_t addr) {
+    static std::array<std::mutex, 251> locks;
+    return locks[(addr >> 2) % locks.size()];
+  }
+
   const EntryFn& fn_;
   const LaunchConfig& cfg_;
   const ParamBuffer& params_;
@@ -1766,6 +1800,7 @@ class Interpreter {
   const SymbolTable* symbols_;
   LaunchStats& stats_;
   ProgressFn progress_;
+  bool concurrent_ = false;   // set when the grid is split across threads
   std::chrono::steady_clock::time_point last_progress_;
 };
 
@@ -1884,16 +1919,77 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
 
 }  // namespace
 
+namespace {
+
+// How many host threads to spread the grid over. One thread reproduces the old
+// strictly serial block order exactly, which is what a kernel with a data race
+// needs to stay reproducible; more threads is faster and is what CUDA's own
+// model already allows, since blocks may run in any order and concurrently.
+unsigned worker_count(uint64_t blocks) {
+  unsigned want = 0;
+  if (const char* t = std::getenv("VGPU_THREADS")) {
+    const int v = std::atoi(t);
+    want = v > 0 ? static_cast<unsigned>(v) : 1;
+  } else {
+    want = std::thread::hardware_concurrency();
+    if (want == 0) want = 1;
+  }
+  if (want > blocks) want = static_cast<unsigned>(blocks);
+  return want ? want : 1;
+}
+
+}  // namespace
+
 LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
                    const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
                    const DeviceProfile& profile, const SymbolTable* symbols,
                    const ProgressFn& progress) {
   validate(fn, cfg, profile);
   ParamBuffer pb = build_params(fn, args);
-  LaunchStats stats;
-  Interpreter interp(fn, cfg, pb, mem, profile, symbols, stats, progress);
-  interp.run_grid();
-  return stats;
+  const uint64_t blocks = uint64_t{cfg.grid[0]} * cfg.grid[1] * cfg.grid[2];
+  const unsigned nthreads = worker_count(blocks);
+
+  if (nthreads <= 1) {
+    LaunchStats stats;
+    Interpreter interp(fn, cfg, pb, mem, profile, symbols, stats, progress);
+    interp.run_grid();
+    return stats;
+  }
+
+  // Each worker gets its own interpreter and its own statistics; the only thing
+  // they share is device memory, whose chunk table is lock-free for exactly
+  // this. Progress reporting stays on one worker so the callback is never
+  // re-entered.
+  std::vector<LaunchStats> per_thread(nthreads);
+  std::vector<std::thread> workers;
+  std::mutex err_mu;
+  std::exception_ptr first_error;
+  workers.reserve(nthreads);
+  for (unsigned t = 0; t < nthreads; ++t) {
+    const uint64_t begin = blocks * t / nthreads;
+    const uint64_t end = blocks * (t + 1) / nthreads;
+    workers.emplace_back([&, t, begin, end] {
+      try {
+        Interpreter interp(fn, cfg, pb, mem, profile, symbols, per_thread[t],
+                           t == 0 ? progress : ProgressFn{});
+        interp.set_concurrent(true);
+        interp.run_block_range(begin, end);
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(err_mu);
+        if (!first_error) first_error = std::current_exception();
+      }
+    });
+  }
+  for (auto& w : workers) w.join();
+  if (first_error) std::rethrow_exception(first_error);
+
+  LaunchStats total;
+  for (const auto& s : per_thread) {
+    total.blocks += s.blocks;
+    total.warps += s.warps;
+    total.instructions += s.instructions;
+  }
+  return total;
 }
 
 }  // namespace vgpu::exec

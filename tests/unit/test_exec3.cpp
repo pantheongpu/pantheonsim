@@ -531,4 +531,39 @@ VTEST(wmma_accumulator_is_added) {
     VCHECK_EQ(as_f32(e.mem.load_scalar(out + l * 4, 4)), 106.0f);
 }
 
+// Blocks run on several host threads by default, so an atomic that is only
+// atomic within a block silently loses updates. This is the test that says so:
+// 256 blocks of 64 threads each add one to the same counter.
+VTEST(atomics_are_atomic_across_blocks) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry bump(.param .u64 p)
+{
+  .reg .b32 %r<4>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  atom.global.add.u32 %r1, [%rd2], 1;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t counter = mem.alloc(4);
+  uint32_t zero = 0;
+  mem.write(counter, &zero, 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {256, 1, 1};
+  cfg.block = {64, 1, 1};
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &counter, 8);
+  exec::launch(m.entries[0], cfg, {arg}, mem, prof);
+  uint32_t total = 0;
+  mem.read(counter, &total, 4);
+  VCHECK_EQ(total, 256u * 64u);
+}
+
 VTEST_MAIN
