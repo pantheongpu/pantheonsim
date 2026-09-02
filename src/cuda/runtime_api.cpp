@@ -417,6 +417,14 @@ VGPU_EXPORT cudaError_t cudaDeviceReset(void) {
 }
 VGPU_EXPORT cudaError_t cudaThreadSynchronize(void) { return cudaDeviceSynchronize(); }
 
+// CUDA 12 renamed this entry point when cudaDeviceProp changed shape, so a
+// binary built against that toolkit calls cudaGetDeviceProperties_v2 while one
+// built against CUDA 13 calls the plain name. The header's rename would also
+// rewrite the definition below, leaving whichever name the build host happens
+// to use -- so it is undone and both names are exported deliberately.
+#ifdef cudaGetDeviceProperties
+#undef cudaGetDeviceProperties
+#endif
 VGPU_EXPORT cudaError_t cudaGetDeviceProperties(cudaDeviceProp* prop, int device) {
   return guard("cudaGetDeviceProperties", [&](State& s) {
     if (!prop) return cudaErrorInvalidValue;
@@ -466,6 +474,9 @@ VGPU_EXPORT cudaError_t cudaGetDeviceProperties(cudaDeviceProp* prop, int device
     std::memcpy(&prop->uuid, b, 16);
     return cudaSuccess;
   });
+}
+VGPU_EXPORT cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp* prop, int device) {
+  return cudaGetDeviceProperties(prop, device);
 }
 
 VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, int attr, int device) {
