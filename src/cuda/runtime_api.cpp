@@ -31,7 +31,24 @@
 #include <vector>
 
 #include "fatbin.hpp"
-static_assert(sizeof(cudaDeviceProp) == 1008, "cudaDeviceProp ABI size drift");
+// cudaDeviceProp is filled in by this shim and read by the application, so
+// both sides must agree on its layout. The original failure was a stale
+// /usr/include copy of the header winning over the toolkit's, which silently
+// smashed the caller's stack -- so the guard checks that the header in use is
+// the one that belongs to the CUDA runtime version it claims to be. Sizes are
+// recorded per toolkit; an unrecognised version compiles (a newer toolkit is
+// not automatically wrong) but says so, rather than refusing to build.
+#if CUDART_VERSION >= 13000 && CUDART_VERSION < 14000
+static_assert(sizeof(cudaDeviceProp) == 1008,
+              "cudaDeviceProp is not the size CUDA 13 defines: the header in use is probably not "
+              "the toolkit's");
+#elif CUDART_VERSION >= 12000 && CUDART_VERSION < 13000
+static_assert(sizeof(cudaDeviceProp) == 1032,
+              "cudaDeviceProp is not the size CUDA 12 defines: the header in use is probably not "
+              "the toolkit's");
+#else
+#warning "unrecognised CUDA runtime version: cudaDeviceProp layout is unchecked"
+#endif
 #include "vgpu/error.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"

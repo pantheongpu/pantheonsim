@@ -104,22 +104,62 @@ if(NOT CUDA_ABI_INCLUDE)
     PATHS /usr/local/cuda/include /opt/cuda/include ENV CUDA_HOME ENV CUDA_PATH
     PATH_SUFFIXES include NO_DEFAULT_PATH)
 endif()
+# The soname is what the loader matches on, and each CUDA library carries its
+# own major version that moves between toolkits (cuBLAS is .so.12 under CUDA 12
+# and .so.13 under CUDA 13). Building under the wrong one means programs
+# silently load NVIDIA's real library instead of this one -- which is exactly
+# what happened when cuRAND was built as .so.13. So rather than hard-code a
+# table that goes stale, read the major off the toolkit that is actually
+# installed, and fall back to the documented value if the library is absent.
+function(vgpu_toolkit_soversion _name _default _out)
+  set(_found "")
+  foreach(_dir "${_cuda_root}/lib64" "${_cuda_root}/targets/x86_64-linux/lib" "${_cuda_root}/lib")
+    file(GLOB _cands "${_dir}/lib${_name}.so.[0-9]*")
+    foreach(_c IN LISTS _cands)
+      if("${_c}" MATCHES "\\.so\\.([0-9]+)$")
+        set(_found "${CMAKE_MATCH_1}")
+        break()
+      endif()
+    endforeach()
+    if(_found)
+      break()
+    endif()
+  endforeach()
+  if(NOT _found)
+    set(_found "${_default}")
+  endif()
+  set(${_out} "${_found}" PARENT_SCOPE)
+endfunction()
+
+# A version script naming the soname's own version node, which is how NVIDIA
+# tags these symbols. Getting it wrong makes the loader warn about missing
+# version information on every call.
+function(vgpu_version_script _libname _soversion _out)
+  set(_path "${CMAKE_BINARY_DIR}/maps/lib${_libname}.so.${_soversion}.map")
+  file(WRITE "${_path}" "lib${_libname}.so.${_soversion} {\n  global: *;\n};\n")
+  set(${_out} "${_path}" PARENT_SCOPE)
+endfunction()
+
 if(CUDA_ABI_INCLUDE)
   message(STATUS "CUDA ABI headers at ${CUDA_ABI_INCLUDE}: building libvgpucudart")
+  vgpu_toolkit_soversion(cudart 13 SO_CUDART)
+  message(STATUS "toolkit runtime soname: libcudart.so.${SO_CUDART}")
   add_library(vgpucudart SHARED src/cuda/runtime_api.cpp src/cuda/fatbin.cpp)
   target_link_libraries(vgpucudart PRIVATE vgpu ${CMAKE_DL_LIBS})
   target_include_directories(vgpucudart PRIVATE ${CUDA_ABI_INCLUDE} src/cuda)
-  # Present as libcudart.so.13 so unmodified binaries find us via LD_LIBRARY_PATH.
-  # Same identity trick as libcuda: become libcudart.so.13 with that SONAME.
-  set_target_properties(vgpucudart PROPERTIES OUTPUT_NAME cudart SOVERSION 13 VERSION 13.0)
-  target_link_options(vgpucudart PRIVATE
-    "-Wl,--version-script=${CMAKE_SOURCE_DIR}/src/cuda/cudart.map")
+  # Present as the toolkit's own libcudart soname so unmodified binaries find
+  # us via LD_LIBRARY_PATH. Same identity trick as libcuda.
+  vgpu_version_script(cudart ${SO_CUDART} _cudart_map)
+  set_target_properties(vgpucudart PROPERTIES
+    OUTPUT_NAME cudart SOVERSION ${SO_CUDART} VERSION ${SO_CUDART}.0)
+  target_link_options(vgpucudart PRIVATE "-Wl,--version-script=${_cudart_map}")
   add_custom_command(TARGET vgpucudart POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
-    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so.13.0" "${CMAKE_BINARY_DIR}/shim/libcudart.so.13"
-    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so.13.0" "${CMAKE_BINARY_DIR}/shim/libcudart.so.12"
-    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so.13.0" "${CMAKE_BINARY_DIR}/shim/libcudart.so"
-    COMMENT "Creating runtime shim symlinks (build/shim/libcudart.so.13)")
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so.${SO_CUDART}.0"
+            "${CMAKE_BINARY_DIR}/shim/libcudart.so.${SO_CUDART}"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudart.so.${SO_CUDART}.0"
+            "${CMAKE_BINARY_DIR}/shim/libcudart.so"
+    COMMENT "Creating runtime shim symlinks (build/shim/libcudart.so.${SO_CUDART})")
   # ---------------------------------------------------------------------------
   # libvgpunvml: NVML, presented as libnvidia-ml.so.1. nvidia-smi dlopens that
   # soname and resolves entries by name, so the real nvidia-smi binary reports
@@ -142,29 +182,30 @@ if(CUDA_ABI_INCLUDE)
   # not user code, so its arithmetic runs on the host at native speed rather
   # than through the SIMT interpreter -- see docs/cublas.md.
   # ---------------------------------------------------------------------------
+  vgpu_toolkit_soversion(cublas 13 SO_CUBLAS)
+  vgpu_version_script(cublas ${SO_CUBLAS} _cublas_map)
   add_library(vgpucublas SHARED src/cuda/cublas_api.cpp)
   target_link_libraries(vgpucublas PRIVATE vgpu vgpucudart)
   target_include_directories(vgpucublas PRIVATE ${CUDA_ABI_INCLUDE})
-  set_target_properties(vgpucublas PROPERTIES OUTPUT_NAME cublas SOVERSION 13 VERSION 13.0)
-  target_link_options(vgpucublas PRIVATE
-    "-Wl,--version-script=${CMAKE_SOURCE_DIR}/src/cuda/cublas.map")
+  set_target_properties(vgpucublas PROPERTIES
+    OUTPUT_NAME cublas SOVERSION ${SO_CUBLAS} VERSION ${SO_CUBLAS}.0)
+  target_link_options(vgpucublas PRIVATE "-Wl,--version-script=${_cublas_map}")
   add_custom_command(TARGET vgpucublas POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
-    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcublas.so.13.0"
-            "${CMAKE_BINARY_DIR}/shim/libcublas.so.13"
-    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcublas.so.13.0"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcublas.so.${SO_CUBLAS}.0"
+            "${CMAKE_BINARY_DIR}/shim/libcublas.so.${SO_CUBLAS}"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcublas.so.${SO_CUBLAS}.0"
             "${CMAKE_BINARY_DIR}/shim/libcublas.so"
-    COMMENT "Creating cuBLAS shim symlinks (build/shim/libcublas.so.13)")
+    COMMENT "Creating cuBLAS shim symlinks (build/shim/libcublas.so.${SO_CUBLAS})")
 
   # ---------------------------------------------------------------------------
   # Additional vendor libraries. Same boundary as cuBLAS: library math runs on
   # the host, application kernels are simulated. Each is presented under the
   # real soname so unmodified programs link against it.
   # ---------------------------------------------------------------------------
-  # Each CUDA library carries its own major version, and the soname is what the
-  # loader matches on: building curand as .so.13 meant programs silently loaded
-  # NVIDIA's real libcurand.so.10 instead. Keep this table in step with
-  # `objdump -p libX.so | grep SONAME` from the toolkit.
+  # The second field is only the fallback: the real major is read off the
+  # installed toolkit, because it moves between CUDA releases (cuFFT is .so.11
+  # under CUDA 12 and .so.12 under CUDA 13).
   set(_vgpu_libs
     "curand:10:curand_api"
     "cublasLt:13:cublaslt_api"
@@ -176,14 +217,17 @@ if(CUDA_ABI_INCLUDE)
   foreach(_entry IN LISTS _vgpu_libs)
     string(REPLACE ":" ";" _parts "${_entry}")
     list(GET _parts 0 _lib)
-    list(GET _parts 1 _ver)
+    list(GET _parts 1 _fallback)
     list(GET _parts 2 _src)
+    vgpu_toolkit_soversion(${_lib} ${_fallback} _ver)
+    vgpu_version_script(${_lib} ${_ver} _map)
     string(TOLOWER "${_lib}" _lower)
     add_library(vgpu${_lower} SHARED src/cuda/${_src}.cpp)
     target_link_libraries(vgpu${_lower} PRIVATE vgpu vgpucudart)
     target_include_directories(vgpu${_lower} PRIVATE ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpu${_lower} PROPERTIES
       OUTPUT_NAME ${_lib} SOVERSION ${_ver} VERSION ${_ver}.0)
+    target_link_options(vgpu${_lower} PRIVATE "-Wl,--version-script=${_map}")
     add_custom_command(TARGET vgpu${_lower} POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
       COMMAND ${CMAKE_COMMAND} -E create_symlink "../lib${_lib}.so.${_ver}.0"
