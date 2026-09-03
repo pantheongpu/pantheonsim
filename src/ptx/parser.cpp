@@ -733,9 +733,12 @@ class Parser {
         expect_punct(",");
         addr = parse_addr(fn);
         if (space == Space::Param) {
-          if (addr.base_kind == Addr::Base::Reg)
-            return unsupported("ld.param through a register address");
-          if (addr.base_kind == Addr::Base::CallSlot) {
+          // A register base is a parameter's address, taken with
+          // "mov.b64 %rd, kernel_param_N". Parameters have addresses of their
+          // own, so this loads back out of the parameter buffer.
+          if (addr.base_kind == Addr::Base::Reg) {
+            ins.op = OpLd{space, ty, std::move(dsts), addr};
+          } else if (addr.base_kind == Addr::Base::CallSlot) {
             if (vec != 1) return unsupported("vector ld.param from call slot");
             OpLdSlot op{addr.base, addr.offset, ty, dsts[0]};
             ins.op = op;
@@ -852,8 +855,8 @@ class Parser {
         else if (p == "rp") round = Round::Rp;
         else if (p == "rni") round = Round::Rni;
         else if (p == "rzi") round = Round::Rzi;
-        else if (p == "rmi") round = Round::Rm;
-        else if (p == "rpi") round = Round::Rp;
+        else if (p == "rmi") round = Round::Rmi;
+        else if (p == "rpi") round = Round::Rpi;
         else if (p == "sat" || p == "ftz") ;  // saturation/flush handled conservatively below
         else if (auto t2 = parse_type_token(p)) tys.push_back(*t2);
         else return unsupported("unrecognized cvt modifier '." + p + "'");
@@ -1477,13 +1480,24 @@ class Parser {
       (void)parse_operand();
       ins.op = OpBar{};  // nothing to do; treated as a barrier-free no-op
     } else if (op0 == "bar" || op0 == "barrier") {
-      bool sync_seen = false;
+      bool sync_seen = false, warp_scope = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         if (parts[i] == "sync") sync_seen = true;
         else if (parts[i] == "cta") ;
-        else return unsupported("only bar.sync is implemented");
+        else if (parts[i] == "warp") warp_scope = true;
+        else return unsupported("only bar.sync and bar.warp.sync are implemented");
       }
       if (!sync_seen) return unsupported("only bar.sync is implemented");
+      if (warp_scope) {
+        // __syncwarp. A warp executes its lanes in lockstep here and diverged
+        // paths reconverge at the earliest common pc, so the lanes named by the
+        // mask are already synchronised by the time this is reached. The
+        // operand is the member mask, which nothing needs to consume.
+        (void)parse_operand();
+        ins.op = OpBar{};
+        expect_punct(";");
+        return ins;
+      }
       Operand which = parse_operand();
       if (auto* imm = std::get_if<ImmInt>(&which); !imm || imm->value != 0)
         return unsupported("only barrier 0 (bar.sync 0) is implemented");

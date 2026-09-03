@@ -47,6 +47,12 @@ constexpr uint32_t kWarpSize = 32;
 constexpr uint64_t kLocalVaBase = 0x6fff'0000'0000ull;
 constexpr uint64_t kLocalVaSize = 1ull << 30;
 // Per-block .shared window, likewise distinct from host and device-global VAs.
+// Kernel parameters get an address window of their own so a kernel can take a
+// parameter's address and load through it -- CUB's segmented sort does exactly
+// that. Nothing else may be addressed here, so a stray pointer into this range
+// is still diagnosable.
+constexpr uint64_t kParamVaBase = 0x6ffd'0000'0000ull;
+constexpr uint64_t kParamVaSize = 1ull << 20;
 constexpr uint64_t kSharedVaBase = 0x6ffe'0000'0000ull;
 constexpr uint64_t kSharedVaSize = 1ull << 30;
 
@@ -323,8 +329,15 @@ class Interpreter {
     if (symbols_) {
       if (auto it = symbols_->find(name); it != symbols_->end()) return it->second;
     }
+    // A kernel may take a parameter's address rather than loading it by name:
+    // CUB's segmented sort does "mov.b64 %rd, kernel_param_10" and then loads
+    // through the register. Parameters live in their own window so those loads
+    // resolve back to the parameter buffer.
+    if (auto it = params_.layout.find(name); it != params_.layout.end())
+      return kParamVaBase + it->second.first;
     ctx_fail(ins, -1, Err::NotFound,
-             "unknown symbol '" + name + "' (not a .local depot or module .global variable)");
+             "unknown symbol '" + name + "' (not a .local depot, module .global variable, or "
+             "kernel parameter)");
   }
 
   // Returns a reference to the operand's lane vector. Register operands alias
@@ -502,6 +515,7 @@ class Interpreter {
     switch (sp) {
       case Space::Shared: return kSharedVaBase;
       case Space::Local: return kLocalVaBase;
+      case Space::Param: return kParamVaBase;
       default: return 0;
     }
   }
@@ -1491,7 +1505,9 @@ class Interpreter {
   static double round_int(double x, Round rnd) {
     switch (rnd) {
       case Round::Rzi: return std::trunc(x);
+      case Round::Rmi: [[fallthrough]];
       case Round::Rm: return std::floor(x);
+      case Round::Rpi: [[fallthrough]];
       case Round::Rp: return std::ceil(x);
       case Round::Rni: [[fallthrough]];
       default: return std::nearbyint(x);  // round-to-nearest-even
@@ -1525,6 +1541,19 @@ class Interpreter {
                  : s.bits == 32 ? static_cast<double>(f32(in))
                                 : f64(in);
       if (d.is_real()) {
+        // An "i" rounding mode rounds to an integral value and keeps the float
+        // type: cvt.rpi.f32.f32 is ceilf. Skipping it here made ceilf, floorf
+        // and truncf return their argument, and roundf return x + 0.5.
+        switch (op->round) {
+          case Round::Rni:
+          case Round::Rzi:
+          case Round::Rmi:
+          case Round::Rpi:
+            x = round_int(x, op->round);
+            break;
+          default:
+            break;
+        }
         if (d.is_bfloat()) return double_to_bf16(x);
         if (d.bits == 16) return double_to_f16(x);
         return d.bits == 32 ? f32bits(static_cast<float>(x)) : f64bits(x);
@@ -1730,6 +1759,28 @@ class Interpreter {
   void exec_ld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLd& op, Mask m) {
     uint32_t size = op.ty.bytes();
     size_t n = op.dsts.size();
+    if (op.space == Space::Param && op.addr.base_kind == Addr::Base::Reg) {
+      // Address form: the register holds a parameter-window address.
+      Lanes _s_base;
+      const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
+      std::vector<Lanes> results(n);
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          const uint64_t addr =
+              base[lane] + static_cast<uint64_t>(op.addr.offset);
+          for (size_t e = 0; e < n; ++e) {
+            const uint64_t at = addr + e * size;
+            if (at < kParamVaBase || at + size > kParamVaBase + params_.bytes.size())
+              ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                       "ld.param through a register reads outside the parameter buffer");
+            uint64_t v = 0;
+            std::memcpy(&v, params_.bytes.data() + (at - kParamVaBase), size);
+            results[e][lane] = v;
+          }
+        }
+      for (size_t e = 0; e < n; ++e) write_reg(w, op.dsts[e], m, results[e], op.ty.bits);
+      return;
+    }
     if (op.space == Space::Param) {
       auto it = params_.layout.find(op.addr.base);
       if (it == params_.layout.end())

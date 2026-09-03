@@ -7,6 +7,7 @@
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
+#include <array>
 #include <cmath>
 #include "vtest.hpp"
 
@@ -865,5 +866,69 @@ VTEST(narrow_integer_ops_use_their_own_width) {
   VCHECK_EQ(shr_u, 0x0FFFu);
   VCHECK_EQ(static_cast<int32_t>(shr_s), -1);
   VCHECK_EQ(is_neg, 1u);
+  mem.free(out);
+}
+
+// The "i" rounding modes round to an integral value while keeping the float
+// type: cvt.rpi.f32.f32 is ceilf. Treating them as the bare .rm/.rp float
+// rounding modes made ceilf, floorf and truncf return their argument, and
+// roundf return x + 0.5 -- the rounding step was simply absent.
+VTEST(integral_cvt_rounding_modes_round) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry rnd(.param .u64 p, .param .f32 v)
+{
+  .reg .f32 %f<8>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  ld.param.f32 %f1, [v];
+  cvta.to.global.u64 %rd2, %rd1;
+  cvt.rpi.f32.f32 %f2, %f1;      // ceil
+  st.global.f32 [%rd2], %f2;
+  cvt.rmi.f32.f32 %f3, %f1;      // floor
+  st.global.f32 [%rd2+4], %f3;
+  cvt.rzi.f32.f32 %f4, %f1;      // trunc
+  st.global.f32 [%rd2+8], %f4;
+  cvt.rni.f32.f32 %f5, %f1;      // nearest, ties to even
+  st.global.f32 [%rd2+12], %f5;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(16);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {1, 1, 1};
+  auto run = [&](float v) {
+    std::vector<uint8_t> pa(8), va(4);
+    std::memcpy(pa.data(), &out, 8);
+    std::memcpy(va.data(), &v, 4);
+    exec::launch(m.entries[0], cfg, {pa, va}, mem, prof);
+    float got[4] = {0, 0, 0, 0};
+    mem.read(out, got, 16);
+    return std::array<float, 4>{got[0], got[1], got[2], got[3]};
+  };
+
+  auto a = run(100.75f);
+  VCHECK_EQ(a[0], 101.0f);   // ceil
+  VCHECK_EQ(a[1], 100.0f);   // floor
+  VCHECK_EQ(a[2], 100.0f);   // trunc
+  VCHECK_EQ(a[3], 101.0f);   // nearest
+
+  auto b = run(-100.75f);
+  VCHECK_EQ(b[0], -100.0f);
+  VCHECK_EQ(b[1], -101.0f);
+  VCHECK_EQ(b[2], -100.0f);
+  VCHECK_EQ(b[3], -101.0f);
+
+  // Ties go to even, not away from zero.
+  auto c = run(2.5f);
+  VCHECK_EQ(c[3], 2.0f);
+  auto d = run(3.5f);
+  VCHECK_EQ(d[3], 4.0f);
   mem.free(out);
 }

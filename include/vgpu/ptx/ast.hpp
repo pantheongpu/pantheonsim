@@ -110,7 +110,12 @@ struct OpMovUnpack { Type ty; std::vector<Reg> dsts; Operand src; };
 //   cvta.to.<space>.uNN d, a   -> space    (d = a - window_base)
 // .global/.const already alias the generic space, so those are identity.
 struct OpCvta { Type ty; Space space; bool to_space; Reg dst; Operand src; };
-enum class Round { None, Rn, Rz, Rm, Rp, Rni, Rzi };
+// The bare modes (.rn/.rz/.rm/.rp) pick how a value is rounded into a narrower
+// float. The "i" modes (.rni/.rzi/.rmi/.rpi) instead round to an integral
+// value while keeping the float type -- they are what ceilf, floorf, truncf and
+// roundf compile to, so conflating them with the bare modes leaves those
+// intrinsics returning their input.
+enum class Round { None, Rn, Rz, Rm, Rp, Rni, Rzi, Rmi, Rpi };
 struct OpCvt { Type dst_ty; Type src_ty; Round round = Round::None; Reg dst; Operand src; };
 struct OpNot { Type ty; Reg dst; Operand src; };   // bitwise not
 struct OpNeg { Type ty; Reg dst; Operand src; };   // arithmetic negate (int/float)
