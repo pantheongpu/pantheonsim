@@ -43,18 +43,29 @@ bool is_cache_hint(const std::string& part) {
   return part.rfind("L1::", 0) == 0 || part.rfind("L2::", 0) == 0;
 }
 
+// ".shared::cta" is the explicit spelling of the ".shared" every kernel here
+// already means. ".shared::cluster" is a different space -- memory in another
+// block of a thread-block cluster -- so that one is left intact to be rejected
+// by name rather than quietly treated as ordinary shared memory.
+std::string normalize_scope(std::string part) {
+  const std::string cta = "::cta";
+  if (part.size() > cta.size() && part.compare(part.size() - cta.size(), cta.size(), cta) == 0)
+    part.resize(part.size() - cta.size());
+  return part;
+}
+
 std::vector<std::string> split_dots(const std::string& s) {
   std::vector<std::string> parts;
   std::string cur;
   for (char c : s) {
     if (c == '.') {
-      if (!cur.empty() && !is_cache_hint(cur)) parts.push_back(cur);
+      if (!cur.empty() && !is_cache_hint(cur)) parts.push_back(normalize_scope(cur));
       cur.clear();
     } else {
       cur += c;
     }
   }
-  if (!cur.empty() && !is_cache_hint(cur)) parts.push_back(cur);
+  if (!cur.empty() && !is_cache_hint(cur)) parts.push_back(normalize_scope(cur));
   return parts;
 }
 
@@ -1599,6 +1610,75 @@ class Parser {
       // duration nothing here can meaningfully honour.
       (void)parse_operand();
       ins.op = OpBar{};  // nothing to do; treated as a barrier-free no-op
+    } else if (op0 == "movmatrix") {
+      bool trans = false, b16 = false, shape = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "sync" || p == "aligned") ;
+        else if (p == "trans") trans = true;
+        else if (p == "m8n8") shape = true;
+        else if (p == "b16") b16 = true;
+        else return unsupported("movmatrix modifier '." + p + "'");
+      }
+      // Without .trans it would be a plain move, and the only shape and element
+      // width the ISA defines for it are m8n8.b16.
+      if (!trans) return unsupported("movmatrix without .trans");
+      if (!shape || !b16) return unsupported("only movmatrix.m8n8.b16 exists");
+      OpMovMatrix op;
+      op.dst = expect_reg_operand("movmatrix destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "cp" && parts.size() > 1 && parts[1] == "async") {
+      // The group operations first: they carry no addresses.
+      if (parts.size() > 2 && parts[2] == "commit_group") {
+        ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::Commit, 0};
+      } else if (parts.size() > 2 && parts[2] == "wait_all") {
+        ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::WaitAll, 0};
+      } else if (parts.size() > 2 && parts[2] == "wait_group") {
+        Operand n = parse_operand();
+        auto* imm = std::get_if<ImmInt>(&n);
+        if (!imm || imm->value < 0)
+          return unsupported("cp.async.wait_group needs a non-negative immediate");
+        ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::WaitGroup,
+                                static_cast<uint32_t>(imm->value)};
+      } else {
+        // cp.async.<ca|cg>.shared.global [dst], [src], cp-size{, src-size};
+        bool cg = false, ca = false, shared_seen = false, global_seen = false;
+        for (size_t i = 2; i < parts.size(); ++i) {
+          const std::string& p = parts[i];
+          if (p == "cg") cg = true;
+          else if (p == "ca") ca = true;
+          else if (p == "shared") shared_seen = true;
+          else if (p == "global") global_seen = true;
+          else if (p == "mbarrier") return unsupported("cp.async.mbarrier");
+          else return unsupported("cp.async modifier '." + p + "'");
+        }
+        if (!shared_seen || !global_seen)
+          return unsupported("cp.async must name .shared and .global");
+        if (!cg && !ca) return unsupported("cp.async needs .ca or .cg");
+        OpCpAsync op;
+        op.dst = parse_addr(fn);
+        expect_punct(",");
+        op.src = parse_addr(fn);
+        expect_punct(",");
+        {
+          Operand n = parse_operand();
+          auto* imm = std::get_if<ImmInt>(&n);
+          if (!imm || (imm->value != 4 && imm->value != 8 && imm->value != 16))
+            return unsupported("cp.async copy size must be 4, 8 or 16 bytes");
+          op.bytes = static_cast<uint32_t>(imm->value);
+        }
+        // .cg exists only for 16-byte copies; .ca covers 4, 8 and 16. Saying so
+        // beats copying the right bytes under a modifier that cannot mean this.
+        if (cg && op.bytes != 16) return unsupported("cp.async.cg is 16 bytes only");
+        if (peek_punct(",")) {
+          next();
+          op.have_src_size = true;
+          op.src_size = parse_operand();
+        }
+        ins.op = op;
+      }
     } else if ((op0 == "bar" || op0 == "barrier") && parts.size() > 1 && parts[1] == "red") {
       // bar.red.<op>.<type> d, 0, [!]p
       std::optional<BarRedOp> rop;

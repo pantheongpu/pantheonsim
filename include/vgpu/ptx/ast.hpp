@@ -152,6 +152,13 @@ struct OpCvtF16x2 { Reg dst; Operand a, b; bool bf16 = false; };
 // Loads N 8x8 matrices of 16-bit elements from shared memory. Row r of matrix i
 // is at the address supplied by lane i*8+r, and each lane comes away with two
 // consecutive elements of one row -- the layout an mma fragment expects.
+// movmatrix.sync.aligned.m8n8.trans.b16 d, a
+// Transposes an 8x8 matrix of 16-bit elements that the warp already holds in
+// registers -- the same fragment layout ldmatrix produces, so this is the
+// register-only counterpart to ldmatrix's .trans: it costs no shared memory
+// round trip. Flash attention uses it to feed K^T to the second mma.
+struct OpMovMatrix { Reg dst; Operand src; };
+
 struct OpLdMatrix { uint32_t count = 1; bool trans = false; std::vector<Reg> dsts; Addr addr; };
 
 // mma.sync.aligned.m16n8kK.row.col.<dtype>.<atype>.<btype>.<ctype>
@@ -241,13 +248,40 @@ struct OpRet {};
 // Call-sequence machinery (currently only the vprintf builtin is callable).
 struct OpDeclSlot { std::string name; uint32_t size; };            // ".param .b64 param0;" in body
 struct OpStSlot { std::string slot; int64_t offset; Type ty; Operand src; };
+// cp.async.{ca,cg}.shared.global [dst], [src], cp-size{, src-size};
+//
+// A copy from global to shared that the *thread* does not wait on: it is
+// issued, batched into a group with cp.async.commit_group, and awaited later
+// with cp.async.wait_group N (at most N groups still outstanding) or
+// cp.async.wait_all. This is what lets a tiled kernel fetch the next tile
+// while computing on the current one, and it is the backbone of every modern
+// attention and GEMM kernel.
+//
+// `src_size` is optional and may be smaller than the copy: the bytes past it
+// are zero-filled rather than read, which is how kernels handle a tile that
+// runs off the end of a tensor without a branch.
+struct OpCpAsync {
+  uint32_t bytes = 16;                 // 4, 8 or 16
+  Addr dst;                            // shared
+  Addr src;                            // global
+  bool have_src_size = false;
+  Operand src_size;                    // bytes actually read; the rest is zeroed
+};
+
+// The group operations. These carry no data: what they do is order the copies
+// above against the reads that consume them.
+struct OpCpAsyncGroup {
+  enum class Kind { Commit, WaitGroup, WaitAll } kind = Kind::Commit;
+  uint32_t keep = 0;                   // wait_group N: leave at most N outstanding
+};
+
 struct OpLdSlot { std::string slot; int64_t offset; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
-                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall>;
+                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix>;
 
 struct Instr {
   size_t line = 0;                 // source line, for diagnostics

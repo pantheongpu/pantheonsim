@@ -32,8 +32,13 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
       [&](const auto& op) {
         using T = std::decay_t<decltype(op)>;
         if constexpr (requires { op.dst; }) {
-          if constexpr (std::is_same_v<std::decay_t<decltype(op.dst)>, Reg>)
+          if constexpr (std::is_same_v<std::decay_t<decltype(op.dst)>, Reg>) {
             if (op.dst.id != kNoReg) defs.push_back(op.dst.id);
+          } else if constexpr (std::is_same_v<std::decay_t<decltype(op.dst)>, Addr>) {
+            // An address-typed destination defines memory, not a register; the
+            // register it names is read to form the address.
+            use_addr(op.dst);
+          }
         }
         if constexpr (requires { op.dsts; })
           for (const auto& d : op.dsts) defs.push_back(d.id);
@@ -42,9 +47,12 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
             uses.push_back(op.src.id);
           else if constexpr (std::is_same_v<std::decay_t<decltype(op.src)>, Operand>)
             use_operand(op.src);
+          else if constexpr (std::is_same_v<std::decay_t<decltype(op.src)>, Addr>)
+            use_addr(op.src);
           else
             for (const auto& s : op.src) use_operand(s);
         }
+        if constexpr (requires { op.src_size; }) use_operand(op.src_size);
         if constexpr (requires { op.srcs; })
           for (const auto& s : op.srcs) use_operand(s);
         if constexpr (requires { op.a; }) {

@@ -34,6 +34,10 @@ struct RegisterUsage {
   uint32_t local_bytes = 0;
   // Peak before rounding to the allocation granularity, for diagnostics.
   uint32_t peak_live = 0;
+  // Registers past the architectural maximum, which the real compiler spills to
+  // local memory rather than failing over. Non-zero means regs_per_thread has
+  // been clamped and local_bytes includes the spill.
+  uint32_t spilled_regs = 0;
 };
 
 // Computes the register footprint of a kernel. Deterministic.
