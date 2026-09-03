@@ -1559,13 +1559,29 @@ class Interpreter {
     return mask_to_bits(sv, d.bits);  // int -> int: truncate/extend
   }
 
+  // Registers are 32 or 64 bits wide, but an operand type can be narrower. The
+  // bits above the operand's width belong to whatever was in the register
+  // before and must take no part: shr.u16 of a register holding 0xFFFFFFFF has
+  // to shift 0xFFFF, and shr.s16 has to take its sign from bit 15, not bit 31.
+  // Treating every non-64-bit type as 32-bit got both wrong, which is why the
+  // i-quant kernels -- almost entirely 16-bit bit manipulation -- produced
+  // wrong values while the 32-bit paths around them were fine.
+  static uint64_t narrow_u(uint64_t v, uint32_t bits) {
+    return bits >= 64 ? v : (v & ((1ull << bits) - 1));
+  }
+  static int64_t narrow_s(uint64_t v, uint32_t bits) {
+    if (bits >= 64) return static_cast<int64_t>(v);
+    const uint64_t mask = (1ull << bits) - 1;
+    uint64_t m = v & mask;
+    const uint64_t sign = 1ull << (bits - 1);
+    if (m & sign) m |= ~mask;
+    return static_cast<int64_t>(m);
+  }
+
   uint64_t int_bin(IntBinOp op, Type ty, uint64_t a, uint64_t b, const Instr& ins) {
-    bool sixty_four = ty.bits == 64;
     bool sig = ty.is_signed();
-    auto s = [&](uint64_t v) -> int64_t {
-      return sixty_four ? static_cast<int64_t>(v) : int64_t{static_cast<int32_t>(v)};
-    };
-    auto u = [&](uint64_t v) -> uint64_t { return sixty_four ? v : (v & 0xFFFFFFFFull); };
+    auto s = [&](uint64_t v) -> int64_t { return narrow_s(v, ty.bits); };
+    auto u = [&](uint64_t v) -> uint64_t { return narrow_u(v, ty.bits); };
     switch (op) {
       case IntBinOp::Add: return a + b;
       case IntBinOp::Sub: return a - b;
@@ -1679,10 +1695,10 @@ class Interpreter {
       if (ty.bits == 16) return compare_float(cmp, f16_to_double(a), f16_to_double(b));
       return ty.bits == 32 ? compare_float(cmp, f32(a), f32(b)) : compare_float(cmp, f64(a), f64(b));
     }
-    if (ty.is_signed())
-      return ty.bits == 64 ? do_cmp(static_cast<int64_t>(a), static_cast<int64_t>(b))
-                           : do_cmp(static_cast<int32_t>(a), static_cast<int32_t>(b));
-    return ty.bits == 64 ? do_cmp(a, b) : do_cmp(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+    // Same narrowing as the arithmetic: setp.gt.s16 compares 16-bit values, so
+    // the bits above them must not decide the result.
+    if (ty.is_signed()) return do_cmp(narrow_s(a, ty.bits), narrow_s(b, ty.bits));
+    return do_cmp(narrow_u(a, ty.bits), narrow_u(b, ty.bits));
   }
 
   // ---- memory ops ----

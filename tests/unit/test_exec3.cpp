@@ -814,3 +814,56 @@ VTEST(signed_narrow_loads_sign_extend) {
   mem.free(src);
   mem.free(dst);
 }
+
+// Registers are 32 or 64 bits wide, but an operand type can be narrower. Bits
+// above the operand's width belong to whatever the register held before and
+// must take no part: shr.u16 of 0xFFFFFFFF shifts 0xFFFF, and shr.s16 takes its
+// sign from bit 15. Treating every non-64-bit type as 32-bit got both wrong.
+VTEST(narrow_integer_ops_use_their_own_width) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry nw(.param .u64 p)
+{
+  .reg .b16 %rs<8>;
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<4>;
+  .reg .pred %p<4>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, -1;              // register holds 0xFFFFFFFF
+  cvt.u16.u32 %rs1, %r1;        // as a 16-bit value that is 0xFFFF
+  shr.u16 %rs2, %rs1, 4;        // must be 0x0FFF, not 0xFFFF
+  cvt.u32.u16 %r2, %rs2;
+  st.global.u32 [%rd2], %r2;
+  shr.s16 %rs3, %rs1, 4;        // sign from bit 15: -1 >> 4 = -1
+  cvt.s32.s16 %r3, %rs3;
+  st.global.u32 [%rd2+4], %r3;
+  mov.u32 %r4, 32768;           // 0x8000: negative as s16, positive as s32
+  cvt.u16.u32 %rs4, %r4;
+  setp.lt.s16 %p1, %rs4, 0;
+  selp.b32 %r5, 1, 0, %p1;
+  st.global.u32 [%rd2+8], %r5;  // must be 1
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(16);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {1, 1, 1};
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &out, 8);
+  exec::launch(m.entries[0], cfg, {arg}, mem, prof);
+  uint32_t shr_u = 0, shr_s = 0, is_neg = 0;
+  mem.read(out, &shr_u, 4);
+  mem.read(out + 4, &shr_s, 4);
+  mem.read(out + 8, &is_neg, 4);
+  VCHECK_EQ(shr_u, 0x0FFFu);
+  VCHECK_EQ(static_cast<int32_t>(shr_s), -1);
+  VCHECK_EQ(is_neg, 1u);
+  mem.free(out);
+}
