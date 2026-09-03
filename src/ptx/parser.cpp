@@ -35,18 +35,26 @@ bool inert_mem_modifier(const std::string& p) {
   return inert.count(p) > 0;
 }
 
+// Cache hints (.L2::128B, .L1::no_allocate, .L2::cache_hint) tell the hardware
+// how far to prefetch and what to keep resident. They change how fast a load
+// is, never what it returns, so an interpreter drops them -- and must not
+// mistake one for a modifier it does not know.
+bool is_cache_hint(const std::string& part) {
+  return part.rfind("L1::", 0) == 0 || part.rfind("L2::", 0) == 0;
+}
+
 std::vector<std::string> split_dots(const std::string& s) {
   std::vector<std::string> parts;
   std::string cur;
   for (char c : s) {
     if (c == '.') {
-      if (!cur.empty()) parts.push_back(cur);
+      if (!cur.empty() && !is_cache_hint(cur)) parts.push_back(cur);
       cur.clear();
     } else {
       cur += c;
     }
   }
-  if (!cur.empty()) parts.push_back(cur);
+  if (!cur.empty() && !is_cache_hint(cur)) parts.push_back(cur);
   return parts;
 }
 

@@ -179,4 +179,31 @@ VTEST(global_initialised_with_a_symbol) {
   VCHECK(m.globals[1].init.empty());  // the address is only known at load time
 }
 
+// Cache hints tell the hardware how far to prefetch; they never change what a
+// load returns. The lexer has to keep the doubled colon inside the opcode --
+// splitting on it tore "ld.global.nc.L2::128B.u32" in half and made every
+// flash-attention kernel unparseable rather than merely unsupported.
+VTEST(cache_hints_are_accepted_and_ignored) {
+  Module m = parse(
+      ".version 8.3\n.target sm_90\n.address_size 64\n"
+      ".visible .entry k(.param .u64 p)\n{\n"
+      ".reg .b64 %rd<3>;\n.reg .b32 %r<3>;\n"
+      "ld.param.u64 %rd1, [p];\n"
+      "cvta.to.global.u64 %rd2, %rd1;\n"
+      "ld.global.nc.L2::128B.u32 %r1, [%rd2];\n"
+      "ld.global.L1::no_allocate.u32 %r2, [%rd2];\n"
+      "st.global.L2::256B.u32 [%rd2], %r1;\n"
+      "ret;\n}\n");
+  VCHECK_EQ(m.entries.size(), size_t{1});
+  // The hinted loads parse to exactly the instructions the unhinted ones would.
+  const auto& body = m.entries[0].body;
+  size_t loads = 0, stores = 0;
+  for (const auto& i : body) {
+    if (std::holds_alternative<OpLd>(i.op)) ++loads;
+    if (std::holds_alternative<OpSt>(i.op)) ++stores;
+  }
+  VCHECK_EQ(loads, size_t{3});   // ld.param plus the two hinted global loads
+  VCHECK_EQ(stores, size_t{1});
+}
+
 VTEST_MAIN

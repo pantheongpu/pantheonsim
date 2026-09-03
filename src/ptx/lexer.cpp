@@ -58,7 +58,21 @@ std::vector<Token> lex(const std::string& src) {
     }
     if (word_char(c)) {
       size_t start = i;
-      while (i < n && word_char(src[i])) ++i;
+      while (i < n) {
+        if (word_char(src[i])) {
+          ++i;
+          continue;
+        }
+        // A *doubled* colon belongs to a cache-hint qualifier (.L2::128B,
+        // .L1::no_allocate) and is part of the opcode; a single one ends a
+        // label. Splitting on the pair would tear an opcode in half, which is
+        // how ggml's flash-attention kernels failed to parse at all.
+        if (src[i] == ':' && i + 2 < n && src[i + 1] == ':' && word_char(src[i + 2])) {
+          i += 2;
+          continue;
+        }
+        break;
+      }
       out.push_back({Token::Kind::Word, src.substr(start, i - start), line});
       continue;
     }
