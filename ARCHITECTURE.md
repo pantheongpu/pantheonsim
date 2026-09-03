@@ -106,8 +106,25 @@ scheduler abstraction per block.
   base/size, kernel, PTX line, lane, and profile — they are a product
   feature, not debug leftovers.
 - Documented deliberate divergences from real hardware, all in the direction
-  of catching bugs: deterministic zero-fill, trapping integer division by
-  zero, trapping misaligned access.
+  of catching bugs: deterministic zero-fill, trapping misaligned access.
+
+  Integer division by zero used to be one of them and no longer is. The
+  reasoning was that a div-by-zero in a kernel is almost always a bug; real
+  code falsified it. ggml's flash-attention passes zero for a stride the
+  configuration does not use, takes a remainder from it, and discards the
+  answer -- so trapping made those kernels unrunnable over arithmetic that was
+  never going to matter. It now follows the hardware, deterministically: an
+  all-ones quotient and a remainder of the dividend. `VGPU_TRAP_DIV_BY_ZERO=1`
+  restores the trap for a debugging run.
+
+  The general lesson is the one the register analysis taught earlier: a
+  divergence that catches bugs is only worth having while it does not also
+  reject correct programs. Compilers emit arithmetic whose result is dead, and
+  a simulator that judges every instruction as if its result mattered will
+  refuse code that hardware runs. Reading an undefined register is the same
+  story -- it now reads as zero, and the diagnosis moved to the point where
+  such a value would become a result: an address, a branch condition, or a
+  store.
 
 Host is assumed little-endian 64-bit (static_assert-able; scalar loads use
 memcpy semantics).

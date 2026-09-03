@@ -390,15 +390,31 @@ class Interpreter {
   const Lanes& read_operand(Warp& w, const BlockCtx& ctx, const Instr& ins, const Operand& op,
                             Lanes& scratch) {
     if (const auto* r = std::get_if<RegOperand>(&op)) {
+      // Reading a register that has not been written yet is undefined in PTX,
+      // and compilers emit it on purpose. ggml's flash-attention kernels
+      // unroll "pick the value belonging to my lane" into a chain of selp, each
+      // step overwriting the accumulator only for the lane whose index matches;
+      // the chain is seeded with a register nothing has written, and every
+      // lane's copy of that seed is dead by the time the chain ends. NVIDIA's
+      // own compute-sanitizer checks uninitialized *memory* and not registers,
+      // for this reason.
+      //
+      // So an undefined register reads as zero here -- deterministically, which
+      // is more than hardware promises -- and the diagnostic is kept where it
+      // still means something: addr_base, read_pred and exec_st below refuse a
+      // register nothing has written, because an address, a branch condition or
+      // a stored value made of nothing is a bug in any program.
       if (r->reg.wide) {
-        if (r->reg.id >= w.regs64.size() || !w.written64[r->reg.id])
-          ctx_fail(ins, -1, Err::UninitializedRegister,
-                   "register " + r->reg.name + " read before any write");
+        if (r->reg.id >= w.regs64.size() || !w.written64[r->reg.id]) {
+          scratch.fill(0);
+          return scratch;
+        }
         return w.regs64[r->reg.id];
       }
-      if (r->reg.id >= w.regs32.size() || !w.written32[r->reg.id])
-        ctx_fail(ins, -1, Err::UninitializedRegister,
-                 "register " + r->reg.name + " read before any write");
+      if (r->reg.id >= w.regs32.size() || !w.written32[r->reg.id]) {
+        scratch.fill(0);
+        return scratch;
+      }
       return widen(w, w.regs32[r->reg.id]);
     }
     if (const auto* imm = std::get_if<ImmInt>(&op)) {
@@ -456,9 +472,12 @@ class Interpreter {
   // Reads an operand as 32-bit lanes. Only valid when narrow_operand() holds.
   const Lanes32& read_narrow(Warp& w, const Instr& ins, const Operand& o, Lanes32& scratch) {
     if (const auto* r = std::get_if<RegOperand>(&o)) {
-      if (r->reg.id >= w.regs32.size() || !w.written32[r->reg.id])
-        ctx_fail(ins, -1, Err::UninitializedRegister,
-                 "register " + r->reg.name + " read before any write");
+      // Undefined reads as zero, for the reason given on read_operand.
+      if (r->reg.id >= w.regs32.size() || !w.written32[r->reg.id]) {
+        (void)ins;
+        scratch.fill(0);
+        return scratch;
+      }
       return w.regs32[r->reg.id];
     }
     uint32_t v = std::holds_alternative<ImmInt>(o)
@@ -912,11 +931,11 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpSelp>(&ins.op)) {
+      Mask p = read_pred(w, ins, op->pred);
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
-      Mask p = read_pred(w, ins, op->pred);
       Lanes r;  // written for every active lane below
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = (p & (1u << lane)) ? a[lane] : b[lane];
@@ -1967,6 +1986,16 @@ class Interpreter {
     return static_cast<int64_t>(m);
   }
 
+  // Integer division by zero is undefined in PTX and does not trap on hardware.
+  // VGPU_TRAP_DIV_BY_ZERO=1 turns it back into an error for a debugging run.
+  static bool trap_div_by_zero() {
+    static const bool on = [] {
+      const char* v = std::getenv("VGPU_TRAP_DIV_BY_ZERO");
+      return v && v[0] == '1';
+    }();
+    return on;
+  }
+
   uint64_t int_bin(IntBinOp op, Type ty, uint64_t a, uint64_t b, const Instr& ins) {
     bool sig = ty.is_signed();
     auto s = [&](uint64_t v) -> int64_t { return narrow_s(v, ty.bits); };
@@ -1979,11 +2008,23 @@ class Interpreter {
       case IntBinOp::Max: return sig ? static_cast<uint64_t>(std::max(s(a), s(b))) : std::max(u(a), u(b));
       case IntBinOp::Div:
       case IntBinOp::Rem: {
-        if (u(b) == 0)
-          // Real GPUs produce an undefined value here; VirtualGPU traps instead,
-          // because a div-by-zero in a kernel is almost always a bug (documented
-          // deliberate divergence — see ARCHITECTURE.md).
-          ctx_fail(ins, -1, Err::InvalidValue, "integer division by zero");
+        if (u(b) == 0) {
+          // PTX leaves this undefined and real GPUs do not trap. VirtualGPU
+          // used to, on the reasoning that a div-by-zero is almost always a
+          // bug -- but real code falsifies that: ggml's flash-attention passes
+          // zero for a stride its configuration does not use, computes a
+          // remainder from it, and discards the answer. Trapping made those
+          // kernels unrunnable over arithmetic that was never going to matter.
+          //
+          // So the default now follows the hardware, deterministically: a
+          // quotient of all-ones and a remainder of the dividend, which is what
+          // the usual expansion of these instructions leaves behind. The trap
+          // is still available for a debugging run, since it does find real
+          // bugs -- it just cannot be the default.
+          if (trap_div_by_zero())
+            ctx_fail(ins, -1, Err::InvalidValue, "integer division by zero");
+          return op == IntBinOp::Div ? narrow_u(~uint64_t{0}, ty.bits) : u(a);
+        }
         if (op == IntBinOp::Div)
           return sig ? static_cast<uint64_t>(s(a) / s(b)) : u(a) / u(b);
         return sig ? static_cast<uint64_t>(s(a) % s(b)) : u(a) % u(b);
@@ -2298,6 +2339,17 @@ class Interpreter {
     std::vector<Lanes> vals;
     vals.reserve(n);
     for (const auto& src : op.srcs) {
+      // A value that nothing has ever written, on its way to memory, is a bug
+      // in any program -- unlike the dead reads compilers emit into arithmetic,
+      // which read as zero (see read_operand). This is where an undefined
+      // register stops being the compiler's business and becomes a result.
+      if (const auto* r = std::get_if<RegOperand>(&src)) {
+        const bool init = r->reg.wide ? (r->reg.id < w.regs64.size() && w.written64[r->reg.id])
+                                      : (r->reg.id < w.regs32.size() && w.written32[r->reg.id]);
+        if (!init)
+          ctx_fail(ins, -1, Err::UninitializedRegister,
+                   "store writes register " + r->reg.name + ", which nothing has written");
+      }
       Lanes tmp;
       vals.push_back(read_operand(w, ctx, ins, src, tmp));
     }

@@ -246,7 +246,34 @@ VTEST(kernel_oob_fault_names_kernel_lane_and_profile) {
   VCHECK_CONTAINS(err.what(), "nvidia/h100");
 }
 
-VTEST(uninitialized_register_read_is_diagnosed) {
+VTEST(uninitialized_register_reaching_memory_is_diagnosed) {
+  // A value nothing has written, on its way to memory, is a bug in any program.
+  const char* ptx = R"(
+.version 8.3
+.target sm_90
+.address_size 64
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<3>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+)";
+  ptx::Module m = ptx::parse(ptx);
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/h100");
+  uint64_t out = mem.alloc(4);
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &out, 8);
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], LaunchConfig{}, {arg}, mem, prof));
+  VCHECK(err.code() == Err::UninitializedRegister);
+  VCHECK_CONTAINS(err.what(), "%r2");
+}
+
+VTEST(uninitialized_address_register_is_diagnosed) {
   const char* ptx = R"(
 .version 8.3
 .target sm_90
@@ -254,17 +281,50 @@ VTEST(uninitialized_register_read_is_diagnosed) {
 .visible .entry k()
 {
     .reg .b32 %r<3>;
-    add.s32 %r1, %r2, 1;
+    .reg .b64 %rd<3>;
+    ld.global.u32 %r1, [%rd2];
     ret;
 }
 )";
   ptx::Module m = ptx::parse(ptx);
   MemoryManager mem(1 << 20);
   DeviceProfile prof = load_gpu("nvidia/h100");
-  LaunchConfig cfg;
-  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, mem, prof));
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], LaunchConfig{}, {}, mem, prof));
   VCHECK(err.code() == Err::UninitializedRegister);
-  VCHECK_CONTAINS(err.what(), "%r2");
+  VCHECK_CONTAINS(err.what(), "%rd2");
+}
+
+VTEST(uninitialized_register_in_arithmetic_reads_as_zero) {
+  // Not every undefined read is a bug: compilers emit them deliberately, and
+  // faulting here made ggml's flash-attention kernels -- which seed an unrolled
+  // chain of selp with a register nothing has written, then overwrite every
+  // lane's copy of it -- impossible to run. NVIDIA's own compute-sanitizer
+  // checks uninitialized memory rather than registers for the same reason. So
+  // arithmetic reads zero, deterministically, and the diagnosis moves to the
+  // point where such a value would become a result.
+  const char* ptx = R"(
+.version 8.3
+.target sm_90
+.address_size 64
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    add.s32 %r1, %r2, 7;
+    st.global.u32 [%rd2], %r1;
+    ret;
+}
+)";
+  ptx::Module m = ptx::parse(ptx);
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/h100");
+  uint64_t out = mem.alloc(4);
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &out, 8);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg}, mem, prof);
+  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{7});  // 0 + 7, not a fault
 }
 
 VTEST(infinite_loop_hits_step_budget) {

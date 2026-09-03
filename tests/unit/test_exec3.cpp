@@ -1210,4 +1210,36 @@ VTEST(movmatrix_transposes_the_warps_8x8_tile) {
   }
 }
 
+VTEST(integer_division_by_zero_follows_the_hardware) {
+  // PTX leaves this undefined and real GPUs do not trap. VirtualGPU used to,
+  // on the reasoning that a div-by-zero is almost always a bug -- but ggml's
+  // flash-attention passes zero for a stride its configuration does not use,
+  // takes a remainder from it, and throws the answer away. Trapping made those
+  // kernels unrunnable over arithmetic that never mattered.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 7;
+    mov.u32 %r2, 0;
+    div.s32 %r3, %r1, %r2;
+    st.global.u32 [%rd2], %r3;
+    rem.s32 %r4, %r1, %r2;
+    st.global.u32 [%rd2+4], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(8);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  // Deterministic, which is more than hardware promises: all-ones for the
+  // quotient, the dividend for the remainder.
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0xFFFFFFFF});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{7});
+}
+
 VTEST_MAIN
