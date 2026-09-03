@@ -29,9 +29,15 @@ GPU="${VGPU_WORKLOAD_GPU:-nvidia/a10}"
 VRAM_MB="${VGPU_WORKLOAD_VRAM_MB:-1024}"
 DURATION="${VGPU_WORKLOAD_SECONDS:-2}"
 MEM_PCT="${VGPU_WORKLOAD_MEM_PCT:-2}"
+# These are soak kernels: they are built to keep a GPU busy for a duration, so
+# their launches are legitimately long and the default step budget -- which
+# exists to catch a kernel looping forever -- cuts them off. int_virus trips it.
+# Raise it rather than pick easier workloads, since being long-running is the
+# property that makes them worth testing. Still finite, so a real runaway stops.
+export VGPU_MAX_STEPS="${VGPU_MAX_STEPS:-17179869184}"
 
 echo "pantheon: $pantheon"
-echo "workloads: ${WORKLOADS[*]}  (gpu=$GPU vram=${VRAM_MB}MB ${DURATION}s ${MEM_PCT}%)"
+echo "workloads: ${WORKLOADS[*]}  (gpu=$GPU vram=${VRAM_MB}MB ${DURATION}s ${MEM_PCT}% max_steps=$VGPU_MAX_STEPS)"
 
 # Build and run inside the shell: it supplies an nvcc that links the shared CUDA
 # runtime, without which the binaries link a static one that cannot run against
