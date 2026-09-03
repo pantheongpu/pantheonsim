@@ -171,6 +171,17 @@ void MemoryManager::fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_
   }
 }
 
+uint64_t MemoryManager::resident_bytes() const {
+  uint64_t chunks = 0;
+  for (const auto& [base, a] : live_) {
+    (void)base;
+    if (!a.chunks) continue;
+    for (size_t i = 0; i < a.chunk_count; ++i)
+      if (a.chunks[i].load(std::memory_order_relaxed)) ++chunks;
+  }
+  return chunks * kChunkSize;
+}
+
 void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   if (len == 0) return;
   uint64_t base = 0;

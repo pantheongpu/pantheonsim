@@ -63,7 +63,19 @@ exit \$rc
 INNER
 )
 
-"$build/vgpu" shell --gpu "$GPU" --vram-mb "$VRAM_MB" -y -c "$inner"
+# vgpu shell isolates itself with an unprivileged user namespace. Hardened
+# kernels forbid that (Ubuntu 24.04 sets
+# kernel.apparmor_restrict_unprivileged_userns=1, and CI runners and most
+# containers restrict it too), so fall back to running without isolation. The
+# shim still takes precedence through LD_LIBRARY_PATH; what is lost is the
+# hiding of a real GPU, which matters only on a host that has one.
+isolate=()
+if ! unshare --user --map-root-user true >/dev/null 2>&1; then
+  echo "note: unprivileged user namespaces unavailable; running with --no-isolate"
+  isolate=(--no-isolate)
+fi
+
+"$build/vgpu" shell --gpu "$GPU" --vram-mb "$VRAM_MB" "${isolate[@]}" -y -c "$inner"
 status=$?
 [[ $status -eq 0 ]] && echo "pantheon workloads: all passed"
 exit $status

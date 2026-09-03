@@ -83,6 +83,13 @@ class MemoryManager {
   // Locates the live allocation containing `addr`. Returns false if none.
   bool find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const;
 
+  // Host memory actually backing this device's allocations: chunks that have
+  // been materialized, times the chunk size. This is the quantity the sparse
+  // backing exists to keep small, and unlike the process's resident size it is
+  // exact and unaffected by the allocator, the page cache, or a sanitizer's
+  // shadow memory -- which makes it something a test can assert on.
+  uint64_t resident_bytes() const;
+
   uint64_t used() const { return used_; }
   uint64_t capacity() const { return capacity_; }
   size_t live_allocations() const { return live_.size(); }
