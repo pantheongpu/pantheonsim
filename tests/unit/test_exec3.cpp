@@ -688,3 +688,68 @@ VTEST(mov_pred_from_immediate_and_register) {
   mem.read(out, &got, 4);
   VCHECK_EQ(got, 7u);
 }
+
+// dp4a is the four-way byte dot product quantized inference is built on, so a
+// wrong answer here corrupts every quantized matmul while still producing
+// plausible-looking output. Concrete values, checked by hand.
+VTEST(dp4a_signed_and_unsigned) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry dp(.param .u64 p, .param .u32 av, .param .u32 bv, .param .u32 cv)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  ld.param.u32 %r1, [av];
+  ld.param.u32 %r2, [bv];
+  ld.param.u32 %r3, [cv];
+  cvta.to.global.u64 %rd2, %rd1;
+  dp4a.u32.u32 %r4, %r1, %r2, %r3;
+  st.global.u32 [%rd2], %r4;
+  dp4a.s32.s32 %r5, %r1, %r2, %r3;
+  st.global.u32 [%rd2+4], %r5;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(8);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {1, 1, 1};
+  auto run = [&](uint32_t a, uint32_t b, uint32_t c) {
+    std::vector<uint8_t> pa(8), aa(4), ba(4), ca(4);
+    std::memcpy(pa.data(), &out, 8);
+    std::memcpy(aa.data(), &a, 4);
+    std::memcpy(ba.data(), &b, 4);
+    std::memcpy(ca.data(), &c, 4);
+    exec::launch(m.entries[0], cfg, {pa, aa, ba, ca}, mem, prof);
+    uint32_t got[2] = {0, 0};
+    mem.read(out, got, 8);
+    return std::pair<uint32_t, int32_t>{got[0], static_cast<int32_t>(got[1])};
+  };
+
+  // bytes of a = 4,3,2,1 ; bytes of b = 1,1,1,1 -> 4+3+2+1 = 10
+  auto r1 = run(0x01020304u, 0x01010101u, 0);
+  VCHECK_EQ(r1.first, 10u);
+  VCHECK_EQ(r1.second, 10);
+
+  // a = all 0xFF. Unsigned that is 255 each: 255*4 = 1020.
+  // Signed it is -1 each: -1*4 = -4.
+  auto r2 = run(0xFFFFFFFFu, 0x01010101u, 0);
+  VCHECK_EQ(r2.first, 1020u);
+  VCHECK_EQ(r2.second, -4);
+
+  // The accumulator is added in.
+  auto r3 = run(0x01020304u, 0x01010101u, 7);
+  VCHECK_EQ(r3.first, 17u);
+  VCHECK_EQ(r3.second, 17);
+
+  // Larger products: bytes 2,2,2,2 against 3,3,3,3 -> 4 * 6 = 24
+  auto r4 = run(0x02020202u, 0x03030303u, 0);
+  VCHECK_EQ(r4.first, 24u);
+  mem.free(out);
+}

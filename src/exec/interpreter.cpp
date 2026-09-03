@@ -987,13 +987,24 @@ class Interpreter {
       Lanes r;
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
-          const uint32_t base = static_cast<uint32_t>(a[lane]) & 31u;
-          uint32_t width = static_cast<uint32_t>(b[lane]) & 0xffu;
-          // .clamp caps the width at the register size; .wrap takes it modulo.
-          if (op->wrap) width &= 31u;
-          else if (width > 32u) width = 32u;
-          uint32_t mask = width >= 32u ? 0xffffffffu : ((1u << width) - 1u);
-          r[lane] = static_cast<uint32_t>(mask << base);
+          uint32_t base = static_cast<uint32_t>(a[lane]);
+          uint32_t width = static_cast<uint32_t>(b[lane]);
+          // .wrap takes both operands modulo 32; .clamp caps them at 32. These
+          // are different: wrapping the start position for .clamp turns a
+          // position of 40 into 8 and produces a mask in the wrong place,
+          // rather than the empty mask the clamp is supposed to give.
+          if (op->wrap) {
+            base &= 31u;
+            width &= 31u;
+          } else {
+            if (base > 32u) base = 32u;
+            if (width > 32u) width = 32u;
+          }
+          // Build and shift in 64 bits: a width or shift of 32 is undefined on
+          // a 32-bit type.
+          const uint64_t bits = width >= 32u ? 0xffffffffull : ((1ull << width) - 1ull);
+          const uint64_t shifted = base >= 32u ? 0ull : (bits << base);
+          r[lane] = static_cast<uint32_t>(shifted & 0xffffffffull);
         }
       write_reg(w, op->dst, m, r, 32);
       return;

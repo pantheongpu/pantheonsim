@@ -945,6 +945,36 @@ VGPU_EXPORT cudaError_t cudaGraphGetNodes(cudaGraph_t, cudaGraphNode_t*, size_t*
   if (numNodes) *numNodes = 0;
   return cudaSuccess;
 }
+// Graphs execute inline, so an instantiated graph holds no captured topology
+// to compare against. Report that the update did not apply rather than
+// claiming success: a caller told the update succeeded will skip
+// re-instantiating and then replay work that was never updated.
+VGPU_EXPORT cudaError_t cudaGraphExecUpdate(cudaGraphExec_t, cudaGraph_t,
+                                            cudaGraphExecUpdateResultInfo* info) {
+  if (info) {
+    std::memset(info, 0, sizeof *info);
+    info->result = cudaGraphExecUpdateErrorTopologyChanged;
+  }
+  return cudaErrorGraphExecUpdateFailure;
+}
+
+// Cooperative launch guarantees every block is resident so grid-wide
+// synchronisation is safe. Blocks here are scheduled across host threads in
+// ranges, which does not provide that, and a kernel calling grid.sync() under
+// an ordinary launch would hang or silently produce wrong results.
+VGPU_EXPORT cudaError_t cudaLaunchCooperativeKernel(const void*, dim3, dim3, void**, size_t,
+                                                    cudaStream_t) {
+  return cudaErrorNotSupported;
+}
+
+// Managed memory is one allocation the CPU and GPU both address. Device memory
+// here lives in a separate virtual window that host code cannot dereference, so
+// handing back a device pointer would fault the moment the host touched it.
+VGPU_EXPORT cudaError_t cudaMallocManaged(void** ptr, size_t size, unsigned int) {
+  if (!ptr) return cudaErrorInvalidValue;
+  return cudaErrorNotSupported;
+}
+
 VGPU_EXPORT cudaError_t cudaGraphDebugDotPrint(cudaGraph_t, const char* path, unsigned int) {
   if (!path) return cudaErrorInvalidValue;
   std::FILE* f = std::fopen(path, "w");
