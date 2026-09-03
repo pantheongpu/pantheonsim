@@ -753,3 +753,64 @@ VTEST(dp4a_signed_and_unsigned) {
   VCHECK_EQ(r4.first, 24u);
   mem.free(out);
 }
+
+// A signed narrow load sign-extends into the destination register. Masking to
+// the type width instead turns -1 into 255, and the cvt that follows reads the
+// positive number: that is how a quantized weight of -1 became +255 and
+// corrupted every dequantized tensor while still looking like a plain copy.
+VTEST(signed_narrow_loads_sign_extend) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry ldsext(.param .u64 src, .param .u64 dst)
+{
+  .reg .b16 %rs<4>;
+  .reg .b32 %r<6>;
+  .reg .f32 %f<4>;
+  .reg .b64 %rd<6>;
+  ld.param.u64 %rd1, [src];
+  ld.param.u64 %rd2, [dst];
+  cvta.to.global.u64 %rd3, %rd1;
+  cvta.to.global.u64 %rd4, %rd2;
+  ld.global.s8 %rs1, [%rd3];        // signed byte
+  cvt.rn.f32.s16 %f1, %rs1;         // must see the negative value
+  st.global.f32 [%rd4], %f1;
+  ld.global.s16 %rs2, [%rd3+2];     // signed halfword
+  cvt.s32.s16 %r1, %rs2;
+  st.global.u32 [%rd4+4], %r1;
+  ld.global.u8 %rs3, [%rd3];        // unsigned stays zero-extended
+  cvt.u32.u16 %r2, %rs3;
+  st.global.u32 [%rd4+8], %r2;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t src = mem.alloc(16), dst = mem.alloc(16);
+  // byte 0 = -1 (0xFF); halfword at +2 = -1000
+  uint8_t in[8] = {0xFF, 0x00, 0x00, 0x00, 0, 0, 0, 0};
+  int16_t neg = -1000;
+  std::memcpy(in + 2, &neg, 2);
+  mem.write(src, in, 8);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {1, 1, 1};
+  std::vector<uint8_t> a0(8), a1(8);
+  std::memcpy(a0.data(), &src, 8);
+  std::memcpy(a1.data(), &dst, 8);
+  exec::launch(m.entries[0], cfg, {a0, a1}, mem, prof);
+
+  float as_float = 0.0f;
+  int32_t as_int = 0;
+  uint32_t unsigned_byte = 0;
+  mem.read(dst, &as_float, 4);
+  mem.read(dst + 4, &as_int, 4);
+  mem.read(dst + 8, &unsigned_byte, 4);
+  VCHECK_EQ(as_float, -1.0f);       // not 255.0
+  VCHECK_EQ(as_int, -1000);
+  VCHECK_EQ(unsigned_byte, 255u);   // ld.u8 must NOT sign-extend
+  mem.free(src);
+  mem.free(dst);
+}

@@ -329,6 +329,13 @@ VGPU_EXPORT cudaError_t __cudaLaunchKernel_ptsz(vgpu_cudaKernel_t kernel, dim3 g
 
 // Defined with the CUDA Graph machinery below: records this launch instead of
 // running it when its stream is capturing.
+// Called by the operations that cannot be recorded. Marks any in-flight
+// capture as unusable rather than letting it silently omit the work.
+void vgpu_invalidate_capture(const char* what);
+bool vgpu_record_memcpy_if_capturing(void* dst, const void* src, size_t bytes,
+                                     cudaMemcpyKind kind, cudaStream_t stream);
+bool vgpu_record_memset_if_capturing(void* dst, int value, size_t bytes, cudaStream_t stream);
+
 bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, void** args,
                                      size_t sharedMem, cudaStream_t stream,
                                      const std::vector<uint32_t>& param_sizes);
@@ -691,7 +698,8 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
 }
 
 VGPU_EXPORT cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t count,
-                                        cudaMemcpyKind kind, cudaStream_t) {
+                                        cudaMemcpyKind kind, cudaStream_t stream) {
+  if (vgpu_record_memcpy_if_capturing(dst, src, count, kind, stream)) return cudaSuccess;
   return cudaMemcpy(dst, src, count, kind);
 }
 
@@ -742,7 +750,8 @@ VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
     return cudaSuccess;
   });
 }
-VGPU_EXPORT cudaError_t cudaMemsetAsync(void* dst, int value, size_t count, cudaStream_t) {
+VGPU_EXPORT cudaError_t cudaMemsetAsync(void* dst, int value, size_t count, cudaStream_t stream) {
+  if (vgpu_record_memset_if_capturing(dst, value, count, stream)) return cudaSuccess;
   return cudaMemset(dst, value, count);
 }
 VGPU_EXPORT cudaError_t cudaMemset2D(void* dst, size_t pitch, int value, size_t width,
@@ -1111,16 +1120,35 @@ VGPU_EXPORT cudaError_t cudaRuntimeGetVersion(int* v) {
 
 namespace {
 
+// One operation inside a captured region. A graph is not only kernels: a
+// framework captures copies and fills alongside them, and replaying with those
+// missing produces confidently wrong results rather than an error.
 struct RecordedLaunch {
+  enum class Kind { Kernel, Memcpy, Memset } kind = Kind::Kernel;
+  // Kernel
   const void* func = nullptr;
   dim3 grid, block;
   size_t shared = 0;
   std::vector<std::vector<uint8_t>> arg_bytes;  // deep copy of parameter values
   std::vector<void*> arg_ptrs;                  // rebuilt to point at arg_bytes
+  // Memcpy / Memset. Pointers are recorded, not the data behind them: a graph
+  // reads whatever the buffers hold at replay time, which is what makes
+  // replaying a captured step with new inputs meaningful.
+  void* dst = nullptr;
+  const void* src = nullptr;
+  size_t bytes = 0;
+  cudaMemcpyKind copy_kind = cudaMemcpyDefault;
+  int fill_value = 0;
 };
 
 struct GraphRec {
   std::vector<RecordedLaunch> launches;
+  // Set when something happened during capture that this implementation cannot
+  // record. Only kernel launches are captured; a copy or a fill inside the
+  // region runs immediately and would be missing from every replay, so the
+  // capture is no longer a faithful record of the work and must not be used.
+  bool invalidated = false;
+  const char* invalidated_by = nullptr;
 };
 
 std::mutex g_graph_mu;
@@ -1138,6 +1166,46 @@ GraphRec* capture_target(cudaStream_t stream) {
 }
 
 }  // namespace
+
+// Records a copy or a fill during capture. Returns true when it was recorded,
+// in which case the caller must not perform it now -- it belongs to the graph.
+bool vgpu_record_memcpy_if_capturing(void* dst, const void* src, size_t bytes,
+                                     cudaMemcpyKind kind, cudaStream_t stream) {
+  GraphRec* g = capture_target(stream);
+  if (!g) return false;
+  RecordedLaunch r;
+  r.kind = RecordedLaunch::Kind::Memcpy;
+  r.dst = dst;
+  r.src = src;
+  r.bytes = bytes;
+  r.copy_kind = kind;
+  g->launches.push_back(std::move(r));
+  return true;
+}
+
+bool vgpu_record_memset_if_capturing(void* dst, int value, size_t bytes, cudaStream_t stream) {
+  GraphRec* g = capture_target(stream);
+  if (!g) return false;
+  RecordedLaunch r;
+  r.kind = RecordedLaunch::Kind::Memset;
+  r.dst = dst;
+  r.fill_value = value;
+  r.bytes = bytes;
+  g->launches.push_back(std::move(r));
+  return true;
+}
+
+// Marks any in-flight capture as unusable. Called by the operations that this
+// implementation cannot record, so a capture that would silently omit work
+// fails at cudaStreamEndCapture instead of replaying an incomplete graph.
+void vgpu_invalidate_capture(const char* what) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  for (auto& entry : g_capturing)
+    if (entry.second && !entry.second->invalidated) {
+      entry.second->invalidated = true;
+      entry.second->invalidated_by = what;
+    }
+}
 
 // Records a launch during capture. Returns true if it was recorded (and must
 // therefore NOT execute now).
@@ -1163,6 +1231,10 @@ bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, vo
 
 VGPU_EXPORT cudaError_t cudaStreamBeginCapture(cudaStream_t stream, cudaStreamCaptureMode mode) {
   (void)mode;
+  // Kernel launches, copies and fills are all recorded, so a captured region
+  // replays the work it actually contained. Anything still unrecordable marks
+  // the capture invalid and cudaStreamEndCapture reports it, rather than
+  // handing back a graph that silently omits work.
   std::lock_guard<std::mutex> lock(g_graph_mu);
   g_capturing[reinterpret_cast<void*>(stream)] = std::make_unique<GraphRec>();
   return cudaSuccess;
@@ -1174,6 +1246,19 @@ VGPU_EXPORT cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* p
   if (it == g_capturing.end()) return cudaErrorStreamCaptureImplicit;
   auto graph = std::move(it->second);
   g_capturing.erase(it);
+  if (graph->invalidated) {
+    // CUDA reports a capture that saw an unsupported operation this way, and
+    // callers fall back to running the work directly. Handing back a graph that
+    // silently omits the copies would give wrong answers on every replay.
+    if (!quiet())
+      std::fprintf(stderr,
+                   "[vgpu] stream capture invalidated: %s inside a captured region is not "
+                   "recorded (only kernel launches are).\n"
+                   "       Run the work directly instead of replaying a graph.\n",
+                   graph->invalidated_by ? graph->invalidated_by : "an operation");
+    if (pGraph) *pGraph = nullptr;
+    return cudaErrorStreamCaptureInvalidated;
+  }
   void* handle = graph.get();
   g_graphs[handle] = std::move(graph);
   if (pGraph) *pGraph = static_cast<cudaGraph_t>(handle);
@@ -1205,9 +1290,16 @@ VGPU_EXPORT cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t strea
     replay = it->second->launches;  // copy so we can run without holding the lock
   }
   for (auto& rl : replay) {
-    std::vector<void*> ptrs(rl.arg_bytes.size());
-    for (size_t i = 0; i < rl.arg_bytes.size(); ++i) ptrs[i] = rl.arg_bytes[i].data();
-    cudaError_t rc = cudaLaunchKernel(rl.func, rl.grid, rl.block, ptrs.data(), rl.shared, stream);
+    cudaError_t rc = cudaSuccess;
+    if (rl.kind == RecordedLaunch::Kind::Memcpy) {
+      rc = cudaMemcpy(rl.dst, rl.src, rl.bytes, rl.copy_kind);
+    } else if (rl.kind == RecordedLaunch::Kind::Memset) {
+      rc = cudaMemset(rl.dst, rl.fill_value, rl.bytes);
+    } else {
+      std::vector<void*> ptrs(rl.arg_bytes.size());
+      for (size_t i = 0; i < rl.arg_bytes.size(); ++i) ptrs[i] = rl.arg_bytes[i].data();
+      rc = cudaLaunchKernel(rl.func, rl.grid, rl.block, ptrs.data(), rl.shared, stream);
+    }
     if (rc != cudaSuccess) return rc;
   }
   return cudaSuccess;
