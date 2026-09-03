@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <string>
+#include <cstddef>
 #include <vector>
 
 namespace vgpu::cuda {
@@ -34,6 +35,18 @@ inline constexpr uint64_t kMaxFatbinBytes = 512ull * 1024 * 1024;
 // sizes come from the file, and a malformed one must fail cleanly rather than
 // read out of bounds or spin. Throws vgpu::Error with a precise reason on
 // malformed or unsupported input.
+// `bytes` is the real size of the buffer at `data`. Pass it whenever it is
+// known: it is the only thing that can catch a truncated image, because every
+// other bound in the format is a number read out of the image itself. A
+// container whose declared size is larger than the buffer is then rejected
+// instead of walked off the end.
+std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes);
+
+// Unbounded form, for the CUDA entry points that have no length to give:
+// __cudaRegisterFatBinary and cuModuleLoadFatBinary both take a bare pointer.
+// Offsets are still checked for internal consistency and against
+// kMaxFatbinBytes, but a truncated image cannot be detected here -- prefer the
+// two-argument form anywhere a size exists.
 std::vector<FatbinPtx> extract_ptx(const void* data);
 
 }  // namespace vgpu::cuda
