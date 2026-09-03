@@ -69,6 +69,15 @@ struct ParamBuffer {
   std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> layout;  // name -> (offset, size)
 };
 
+// State for bar.red, which needs every warp in the block to arrive before it
+// can produce a value. Held behind a pointer for the same reason shared memory
+// is: the context is passed by const reference.
+struct BarrierReduction {
+  uint64_t acc = 0;
+  uint32_t arrived = 0;   // warps that have contributed and not yet collected
+  bool complete = false;  // set when the barrier released; cleared when drained
+};
+
 struct BlockCtx {
   std::array<uint32_t, 3> ctaid{};
   std::array<uint32_t, 3> ntid{};
@@ -76,6 +85,7 @@ struct BlockCtx {
   // Per-block shared memory. Zero-initialized at block start: real hardware
   // leaves it undefined, VirtualGPU makes it deterministic (documented).
   std::vector<uint8_t>* shared = nullptr;
+  BarrierReduction* bar_red = nullptr;
 };
 
 // One diverged execution path: a set of lanes sharing a program counter.
@@ -87,6 +97,10 @@ struct Path {
 struct Warp {
   enum class State { Ready, AtBarrier, Done };
   State state = State::Ready;
+  // Set between contributing to a bar.red and collecting its result. The
+  // instruction re-executes when the barrier releases, and this is how it knows
+  // to collect rather than contribute a second time.
+  bool bar_red_waiting = false;
   // Live paths. Reconvergence is by *lowest program counter*: the path with
   // the smallest pc always runs next, and paths that arrive at the same pc are
   // merged. For the structured control flow compilers emit, that reconverges
@@ -236,6 +250,8 @@ class Interpreter {
     // launch's dynamic bytes).
     std::vector<uint8_t> shared(fn_.static_shared_size + cfg_.shared_bytes, 0);
     ctx.shared = &shared;
+    BarrierReduction bar_red;
+    ctx.bar_red = &bar_red;
     uint64_t total = uint64_t{ctx.ntid[0]} * ctx.ntid[1] * ctx.ntid[2];
     size_t nwarps = static_cast<size_t>((total + kWarpSize - 1) / kWarpSize);
     std::vector<Warp> warps(nwarps);
@@ -272,6 +288,8 @@ class Interpreter {
             w.state = Warp::State::Ready;
             any_waiting = true;
           }
+        // Every warp has now arrived, so a bar.red in flight has its answer.
+        if (any_waiting) bar_red.complete = true;
         if (!any_waiting) return;  // all Done
         continue;
       }
@@ -611,6 +629,56 @@ class Interpreter {
     }
     if (std::holds_alternative<OpRet>(ins.op)) {
       exec_ret(w, idx, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpBarRed>(&ins.op)) {
+      if (ins.has_pred)
+        ctx_fail(ins, -1, Err::UnsupportedPtx, "predicated bar.red is not supported");
+      if (!ctx.bar_red)
+        ctx_fail(ins, -1, Err::UnsupportedPtx, "bar.red outside a block context");
+      BarrierReduction& red = *ctx.bar_red;
+      if (!w.bar_red_waiting) {
+        // Contribute and wait. The result is not known until every warp in the
+        // block has arrived, so the pc stays put and this re-executes on
+        // release rather than advancing now.
+        if (red.arrived == 0) {
+          red.acc = op->op == BarRedOp::And ? ~uint64_t{0} : 0;
+          red.complete = false;
+        }
+        Mask p = read_pred(w, ins, op->src);
+        if (op->negate_src) p = ~p;
+        const Mask voters = p & m;
+        switch (op->op) {
+          case BarRedOp::And:
+            // True only if every participating lane of every warp voted true.
+            red.acc &= (voters == m) ? 1u : 0u;
+            break;
+          case BarRedOp::Or:
+            red.acc |= (voters != 0) ? 1u : 0u;
+            break;
+          case BarRedOp::Popc:
+            red.acc += static_cast<uint64_t>(popcount_mask(voters));
+            break;
+        }
+        ++red.arrived;
+        ++stats_.barriers;
+        w.bar_red_waiting = true;
+        w.state = Warp::State::AtBarrier;
+        return;
+      }
+      // Released: collect the block-wide result.
+      w.bar_red_waiting = false;
+      if (red.arrived) --red.arrived;
+      if (op->op == BarRedOp::Popc) {
+        Lanes r;
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+          if (m & (1u << lane)) r[lane] = red.acc;
+        write_reg(w, op->dst, m, r, 32);
+      } else {
+        Mask& dp = pred_slot(w, op->dst);
+        dp = (red.acc & 1u) ? (dp | m) : (dp & ~m);
+      }
+      ++w.paths[idx].pc;
       return;
     }
     if (std::holds_alternative<OpBar>(ins.op)) {

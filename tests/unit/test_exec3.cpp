@@ -980,3 +980,69 @@ VTEST(redux_sync_reduces_across_the_warp) {
   VCHECK_EQ(mn, 0u);
   mem.free(out);
 }
+
+// bar.red is a barrier that also produces a value: a predicate reduced across
+// every thread in the block. It cannot complete until every warp has arrived,
+// so it contributes, waits, and collects on release.
+VTEST(bar_red_reduces_across_the_block) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry br(.param .u64 p, .param .u32 thresh)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<6>;
+  .reg .pred %p<6>;
+  ld.param.u64 %rd1, [p];
+  ld.param.u32 %r7, [thresh];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  setp.lt.u32 %p1, %r1, %r7;      // true for the first `thresh` threads
+  bar.red.or.pred %p2, 0, %p1;    // any thread in the block?
+  bar.red.and.pred %p3, 0, %p1;   // all threads in the block?
+  selp.b32 %r2, 1, 0, %p2;
+  selp.b32 %r3, 1, 0, %p3;
+  setp.eq.u32 %p4, %r1, 0;
+  @%p4 st.global.u32 [%rd2], %r2;
+  @%p4 st.global.u32 [%rd2+4], %r3;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(16);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {128, 1, 1};  // four warps, so the reduction spans warps
+  auto run = [&](uint32_t thresh) {
+    std::vector<uint8_t> pa(8), ta(4);
+    std::memcpy(pa.data(), &out, 8);
+    std::memcpy(ta.data(), &thresh, 4);
+    exec::launch(m.entries[0], cfg, {pa, ta}, mem, prof);
+    uint32_t any = 0, all = 0;
+    mem.read(out, &any, 4);
+    mem.read(out + 4, &all, 4);
+    return std::pair<uint32_t, uint32_t>{any, all};
+  };
+
+  // Nobody: neither any nor all.
+  auto none = run(0);
+  VCHECK_EQ(none.first, 0u);
+  VCHECK_EQ(none.second, 0u);
+  // One thread, and it is in the first warp: any but not all. This is the case
+  // that only works if warps beyond the first also contribute.
+  auto one = run(1);
+  VCHECK_EQ(one.first, 1u);
+  VCHECK_EQ(one.second, 0u);
+  // A whole warp's worth, still not the whole block.
+  auto warp = run(32);
+  VCHECK_EQ(warp.first, 1u);
+  VCHECK_EQ(warp.second, 0u);
+  // Everyone: both.
+  auto every = run(128);
+  VCHECK_EQ(every.first, 1u);
+  VCHECK_EQ(every.second, 1u);
+  mem.free(out);
+}

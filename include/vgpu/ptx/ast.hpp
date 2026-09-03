@@ -231,6 +231,12 @@ struct OpBar {};                                     // bar.sync 0
 // and a kernel that reaches it has detected something it cannot continue past,
 // so it must not be silently skipped.
 struct OpTrap {};
+// bar.red.{and,or}.pred d, 0, p  /  bar.red.popc.u32 d, 0, p
+// A barrier that also reduces a predicate across every thread in the block and
+// gives all of them the result. Unlike bar.sync it produces a value, so it
+// cannot complete until every warp has arrived.
+enum class BarRedOp { And, Or, Popc };
+struct OpBarRed { BarRedOp op; Reg dst; Reg src; bool negate_src = false; };
 struct OpRet {};
 // Call-sequence machinery (currently only the vprintf builtin is callable).
 struct OpDeclSlot { std::string name; uint32_t size; };            // ".param .b64 param0;" in body
@@ -239,7 +245,7 @@ struct OpLdSlot { std::string slot; int64_t offset; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall>;
 

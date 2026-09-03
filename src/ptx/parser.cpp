@@ -1591,6 +1591,36 @@ class Parser {
       // duration nothing here can meaningfully honour.
       (void)parse_operand();
       ins.op = OpBar{};  // nothing to do; treated as a barrier-free no-op
+    } else if ((op0 == "bar" || op0 == "barrier") && parts.size() > 1 && parts[1] == "red") {
+      // bar.red.<op>.<type> d, 0, [!]p
+      std::optional<BarRedOp> rop;
+      bool pred_ty = false, u32_ty = false;
+      for (size_t i = 2; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "and") rop = BarRedOp::And;
+        else if (p == "or") rop = BarRedOp::Or;
+        else if (p == "popc") rop = BarRedOp::Popc;
+        else if (p == "pred") pred_ty = true;
+        else if (p == "u32") u32_ty = true;
+        else if (p == "cta") ;
+        else return unsupported("bar.red modifier '." + p + "'");
+      }
+      if (!rop) return unsupported("bar.red needs .and, .or or .popc");
+      if (*rop == BarRedOp::Popc ? !u32_ty : !pred_ty)
+        return unsupported("bar.red type does not match its operation");
+      OpBarRed op;
+      op.op = *rop;
+      op.dst = expect_reg_operand("bar.red destination");
+      expect_punct(",");
+      {
+        Operand which = parse_operand();
+        if (auto* imm = std::get_if<ImmInt>(&which); !imm || imm->value != 0)
+          return unsupported("only barrier 0 is implemented");
+      }
+      expect_punct(",");
+      if (peek_punct("!")) { next(); op.negate_src = true; }
+      op.src = expect_reg_operand("bar.red source predicate");
+      ins.op = op;
     } else if (op0 == "bar" || op0 == "barrier") {
       bool sync_seen = false, warp_scope = false;
       for (size_t i = 1; i < parts.size(); ++i) {
