@@ -118,6 +118,16 @@ VGPU_EXPORT cudnnStatus_t cudnnGetStream(cudnnHandle_t h, cudaStream_t* s) {
   if (s) *s = reinterpret_cast<Handle*>(h)->stream;
   return CUDNN_STATUS_SUCCESS;
 }
+VGPU_EXPORT cudnnStatus_t cudnnGetProperty(libraryPropertyType type, int* value) {
+  if (!value) return CUDNN_STATUS_BAD_PARAM;
+  switch (type) {
+    case MAJOR_VERSION: *value = 9; break;
+    case MINOR_VERSION: *value = 1; break;
+    case PATCH_LEVEL: *value = 0; break;
+    default: return CUDNN_STATUS_BAD_PARAM;
+  }
+  return CUDNN_STATUS_SUCCESS;
+}
 VGPU_EXPORT size_t cudnnGetVersion(void) { return CUDNN_VERSION; }
 VGPU_EXPORT size_t cudnnGetCudartVersion(void) { return 13000; }
 VGPU_EXPORT const char* cudnnGetErrorString(cudnnStatus_t s) {

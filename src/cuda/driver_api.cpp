@@ -622,6 +622,80 @@ VGPU_EXPORT CUresult cuModuleLoadData(CUmodule* module, const void* image) {
   });
 }
 
+// A fatbin handed straight to the driver takes the same path as one passed to
+// cuModuleLoadData: pull the PTX out and load it.
+VGPU_EXPORT CUresult cuModuleLoadFatBinary(CUmodule* module, const void* fatCubin) {
+  return cuModuleLoadData(module, fatCubin);
+}
+
+// Releasing the primary context. Nothing is cached per context here, so this
+// succeeds without tearing down the device.
+VGPU_EXPORT CUresult cuDevicePrimaryCtxReset(CUdevice) { return CUDA_SUCCESS; }
+
+// Runtime JIT linking: refuse rather than return an empty module a caller would
+// then launch kernels from and get nothing.
+VGPU_EXPORT CUresult cuLinkAddFile_v2(void*, int, const char*, unsigned int, void*, void*) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuLinkDestroy(void*) { return CUDA_ERROR_NOT_SUPPORTED; }
+
+/* ---- virtual memory management ----
+ * The VMM API reserves address space and maps physical handles into it, which
+ * is how PyTorch's expandable_segments allocator works. The sparse chunk model
+ * here has no separable physical handles to map, so these refuse: a framework
+ * that asked for a mapping and got silent success would write into memory that
+ * was never backed.
+ */
+VGPU_EXPORT CUresult cuMemAddressReserve(CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuMemAddressFree(CUdeviceptr, size_t) { return CUDA_ERROR_NOT_SUPPORTED; }
+VGPU_EXPORT CUresult cuMemCreate(void*, size_t, const void*, unsigned long long) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuMemRelease(unsigned long long) { return CUDA_ERROR_NOT_SUPPORTED; }
+VGPU_EXPORT CUresult cuMemMap(CUdeviceptr, size_t, size_t, unsigned long long, unsigned long long) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuMemUnmap(CUdeviceptr, size_t) { return CUDA_ERROR_NOT_SUPPORTED; }
+VGPU_EXPORT CUresult cuMemSetAccess(CUdeviceptr, size_t, const void*, size_t) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuMemGetAllocationGranularity(size_t* granularity, const void*, int) {
+  // Answering this one is harmless and lets a caller size a request before
+  // discovering the mapping calls are unavailable.
+  if (!granularity) return CUDA_ERROR_INVALID_VALUE;
+  *granularity = 64u * 1024u;  // the chunk size the sparse backing uses
+  return CUDA_SUCCESS;
+}
+VGPU_EXPORT CUresult cuMemExportToShareableHandle(void*, unsigned long long, int, unsigned long long) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuMemImportFromShareableHandle(unsigned long long*, void*, int) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+// Multicast objects span several devices' memory; there is no such fabric here.
+VGPU_EXPORT CUresult cuMulticastCreate(unsigned long long*, const void*) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuMulticastAddDevice(unsigned long long, CUdevice) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuMulticastBindMem(unsigned long long, size_t, unsigned long long, size_t,
+                                        size_t, unsigned long long) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+// Stream memory ops. Work is synchronous, so the write happens now.
+VGPU_EXPORT CUresult cuStreamWriteValue32(CUstream, CUdeviceptr addr, unsigned int value,
+                                          unsigned int) {
+  return api("cuStreamWriteValue32", true, false, [&](ShimState& s) {
+    owner_memory(s, addr).write(addr, &value, sizeof value);
+    return CUDA_SUCCESS;
+  });
+}
+
 VGPU_EXPORT CUresult cuModuleLoadDataEx(CUmodule* module, const void* image, unsigned int numOptions,
                                         void* options, void** optionValues) {
   (void)numOptions;
@@ -910,6 +984,37 @@ CUresult memset_impl(const char* name, CUdeviceptr dptr, T value, size_t n) {
   });
 }
 }  // namespace
+
+/* ---- entry points frameworks link against ----
+ * Each of these reports a failure rather than pretending. A cooperative launch
+ * whose kernel calls grid.sync() would deadlock or silently produce wrong
+ * results if run as an ordinary launch, and a JIT-linked module that quietly
+ * did nothing would surface much later as a wrong answer.
+ */
+VGPU_EXPORT CUresult cuLaunchCooperativeKernel(CUfunction, unsigned int, unsigned int, unsigned int,
+                                               unsigned int, unsigned int, unsigned int,
+                                               unsigned int, CUstream, void**) {
+  // Cooperative launch guarantees every block is resident so grid-wide
+  // synchronisation is safe. The interpreter schedules blocks across host
+  // threads in ranges, which does not provide that guarantee.
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+// The JIT-link types are not in the header subset this file compiles against;
+// these take opaque parameters because they only need to exist and refuse.
+VGPU_EXPORT CUresult cuLinkCreate_v2(unsigned int, void*, void*, void*) {
+  return CUDA_ERROR_NOT_SUPPORTED;  // runtime JIT linking of cubins
+}
+VGPU_EXPORT CUresult cuLinkAddData_v2(void*, int, void*, size_t, const char*, unsigned int, void*,
+                                      void*) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuLinkComplete(void*, void**, size_t*) { return CUDA_ERROR_NOT_SUPPORTED; }
+VGPU_EXPORT CUresult cuTensorMapEncodeTiled(void*, unsigned int, unsigned int, void*,
+                                            const unsigned long long*, const unsigned long long*,
+                                            const unsigned int*, const unsigned int*, unsigned int,
+                                            unsigned int, unsigned int, unsigned int) {
+  return CUDA_ERROR_NOT_SUPPORTED;  // Hopper TMA descriptors
+}
 
 VGPU_EXPORT CUresult cuMemsetD8_v2(CUdeviceptr d, unsigned char v, size_t n) {
   return memset_impl("cuMemsetD8", d, v, n);

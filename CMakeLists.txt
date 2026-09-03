@@ -199,7 +199,7 @@ if(CUDA_ABI_INCLUDE)
   # ---------------------------------------------------------------------------
   vgpu_toolkit_soversion(cublas 13 SO_CUBLAS)
   vgpu_version_script(cublas ${SO_CUBLAS} _cublas_map)
-  add_library(vgpucublas SHARED src/cuda/cublas_api.cpp)
+  add_library(vgpucublas SHARED src/cuda/cublas_api.cpp src/cuda/generated/cublas_stubs.cpp)
   target_link_libraries(vgpucublas PRIVATE vgpu vgpucudart)
   target_include_directories(vgpucublas PRIVATE ${CUDA_ABI_INCLUDE})
   set_target_properties(vgpucublas PROPERTIES
@@ -238,7 +238,14 @@ if(CUDA_ABI_INCLUDE)
     vgpu_toolkit_soversion(${_lib} ${_fallback} _ver)
     vgpu_version_script(${_lib} ${_ver} _map)
     string(TOLOWER "${_lib}" _lower)
-    add_library(vgpu${_lower} SHARED src/cuda/${_src}.cpp)
+    # Some of these libraries also carry generated stubs for the entry points
+    # they export but VirtualGPU does not implement: a framework resolves every
+    # symbol at load time, so one missing name blocks the import outright.
+    set(_extra_src "")
+    if(EXISTS "${CMAKE_SOURCE_DIR}/src/cuda/generated/${_lower}_stubs.cpp")
+      set(_extra_src "src/cuda/generated/${_lower}_stubs.cpp")
+    endif()
+    add_library(vgpu${_lower} SHARED src/cuda/${_src}.cpp ${_extra_src})
     target_link_libraries(vgpu${_lower} PRIVATE vgpu vgpucudart)
     target_include_directories(vgpu${_lower} PRIVATE ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpu${_lower} PROPERTIES
@@ -288,7 +295,7 @@ if(CUDA_ABI_INCLUDE)
     NO_DEFAULT_PATH)
   if(NCCL_INCLUDE)
     message(STATUS "NCCL headers at ${NCCL_INCLUDE}: building libvgpunccl")
-    add_library(vgpunccl SHARED src/cuda/nccl_api.cpp)
+    add_library(vgpunccl SHARED src/cuda/nccl_api.cpp src/cuda/generated/nccl_stubs.cpp)
     target_link_libraries(vgpunccl PRIVATE vgpu vgpucudart)
     target_include_directories(vgpunccl PRIVATE ${NCCL_INCLUDE} ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpunccl PROPERTIES OUTPUT_NAME nccl SOVERSION 2 VERSION 2.0)
@@ -316,7 +323,7 @@ if(CUDA_ABI_INCLUDE)
     NO_DEFAULT_PATH)
   if(CUDNN_INCLUDE)
     message(STATUS "cuDNN headers at ${CUDNN_INCLUDE}: building libvgpucudnn")
-    add_library(vgpucudnn SHARED src/cuda/cudnn_api.cpp)
+    add_library(vgpucudnn SHARED src/cuda/cudnn_api.cpp src/cuda/generated/cudnn_stubs.cpp)
     target_link_libraries(vgpucudnn PRIVATE vgpu vgpucudart)
     target_include_directories(vgpucudnn PRIVATE ${CUDNN_INCLUDE} ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpucudnn PROPERTIES OUTPUT_NAME cudnn SOVERSION 9 VERSION 9.0)
@@ -426,5 +433,16 @@ if(TARGET vgpunccl)
            COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_nccl_multiproc.sh 4)
   set_tests_properties(e2e_nccl_multiproc PROPERTIES DEPENDS vgpunccl TIMEOUT 300)
   add_test(NAME e2e_nccl_group COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_nccl_group.sh 4)
+
+# Real pantheon workloads, built by their own Makefile and run end to end. The
+# unit tests cover instructions one at a time; this covers an unmodified GPU
+# diagnostic actually working, which is where every serious bug here showed up
+# first. Skips cleanly when no pantheon checkout is present, so a contributor
+# without one still gets a green run.
+add_test(NAME pantheon_workloads
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/workloads/run_pantheon_workloads.sh)
+set_tests_properties(pantheon_workloads PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 1800)
   set_tests_properties(e2e_nccl_group PROPERTIES DEPENDS vgpunccl TIMEOUT 300)
 endif()

@@ -18,12 +18,17 @@ namespace vgpu::ptx {
 
 // Scalar type of an operand/instruction, e.g. ".s32" -> {Kind::S, 32}.
 struct Type {
-  enum class Kind { B, U, S, F, Pred };
+  // BF is bfloat16: the same exponent range as f32 with a 7-bit mantissa,
+  // so it is a distinct kind rather than an f16 with different bits.
+  enum class Kind { B, U, S, F, BF, Pred };
   Kind kind = Kind::B;
   uint32_t bits = 32;
 
   uint32_t bytes() const { return bits / 8; }
   bool is_float() const { return kind == Kind::F; }
+  bool is_bfloat() const { return kind == Kind::BF; }
+  // Any real-valued type, for code paths that treat them alike.
+  bool is_real() const { return kind == Kind::F || kind == Kind::BF; }
   bool is_signed() const { return kind == Kind::S; }
   std::string str() const;
 };
@@ -105,7 +110,12 @@ struct OpMovUnpack { Type ty; std::vector<Reg> dsts; Operand src; };
 //   cvta.to.<space>.uNN d, a   -> space    (d = a - window_base)
 // .global/.const already alias the generic space, so those are identity.
 struct OpCvta { Type ty; Space space; bool to_space; Reg dst; Operand src; };
-enum class Round { None, Rn, Rz, Rm, Rp, Rni, Rzi };
+// The bare modes (.rn/.rz/.rm/.rp) pick how a value is rounded into a narrower
+// float. The "i" modes (.rni/.rzi/.rmi/.rpi) instead round to an integral
+// value while keeping the float type -- they are what ceilf, floorf, truncf and
+// roundf compile to, so conflating them with the bare modes leaves those
+// intrinsics returning their input.
+enum class Round { None, Rn, Rz, Rm, Rp, Rni, Rzi, Rmi, Rpi };
 struct OpCvt { Type dst_ty; Type src_ty; Round round = Round::None; Reg dst; Operand src; };
 struct OpNot { Type ty; Reg dst; Operand src; };   // bitwise not
 struct OpNeg { Type ty; Reg dst; Operand src; };   // arithmetic negate (int/float)
@@ -130,17 +140,59 @@ struct OpShfl { ShflMode mode; Reg dst; Reg pred_dst; Operand a, b, c, member_ma
 // Warp vote/ballot across the active mask.
 enum class VoteMode { All, Any, Uni, Ballot };
 struct OpVote { VoteMode mode; bool ballot; Reg dst; Reg src; bool negate_src; };
+// redux.sync.<op>.<type> d, a, membermask -- reduce a across the participating
+// lanes of the warp and give every one of them the result.
+enum class ReduxOp { Add, Min, Max, And, Or, Xor };
+struct OpRedux { ReduxOp op; Type ty; Reg dst; Operand src; };
+// cvt.rn.f16x2.f32 d, a, b -- convert two f32 and pack them into one register,
+// a in the high half and b in the low half.
+struct OpCvtF16x2 { Reg dst; Operand a, b; bool bf16 = false; };
+
+// ldmatrix.sync.aligned.m8n8.xN[.trans].b16 {d...}, [addr]
+// Loads N 8x8 matrices of 16-bit elements from shared memory. Row r of matrix i
+// is at the address supplied by lane i*8+r, and each lane comes away with two
+// consecutive elements of one row -- the layout an mma fragment expects.
+struct OpLdMatrix { uint32_t count = 1; bool trans = false; std::vector<Reg> dsts; Addr addr; };
+
+// mma.sync.aligned.m16n8kK.row.col.<dtype>.<atype>.<btype>.<ctype>
+// The warp-wide tensor-core multiply-accumulate. Distinct from wmma, which is
+// the older whole-fragment API: this one names the exact shape and the
+// registers each lane holds.
+enum class MmaElem { F16, BF16, TF32, S8, U8 };
+struct OpMma {
+  uint32_t k = 16;          // m and n are fixed at 16 and 8 for every shape here
+  MmaElem ab_type = MmaElem::F16;
+  bool ab_signed = true;    // for the integer types
+  bool acc_f16 = false;     // accumulate in f16x2 registers rather than f32
+  bool acc_int = false;     // s32 accumulate
+  std::vector<Reg> d, a, b, c;
+};
+// mov.pred d, {0|1|%p} -- set a predicate from an immediate or copy another.
+// Predicates live in their own register file, so this cannot go through the
+// ordinary mov path that writes a 32/64-bit value.
+struct OpMovPred { Reg dst; Operand src; };
 struct OpPrmt { Reg dst; Operand a, b, c; };       // byte permute (default mode)
+// copysign.f32/f64 d, a, b -- magnitude of b with the sign of a.
+struct OpCopysign { Type ty; Reg dst; Operand a, b; };
+// dp4a.{u32,s32}.{u32,s32} d, a, b, c -- four byte-wise products of a and b
+// accumulated into c. Quantized inference leans on this heavily.
+struct OpDp4a { bool a_signed; bool b_signed; Reg dst; Operand a, b, c; };
+// bmsk.{clamp,wrap}.b32 d, a, b -- a contiguous mask of b bits starting at a.
+struct OpBmsk { bool wrap; Reg dst; Operand a, b; };
 struct OpIntBin { IntBinOp op; Type ty; Reg dst; Operand a, b; };
 struct OpMadLo { Type ty; Reg dst; Operand a, b, c; };
-struct OpMulWide { bool is_signed; Reg dst; Operand a, b; };  // 32x32 -> 64
+struct OpMulWide { uint32_t src_bits = 32; bool is_signed; Reg dst; Operand a, b; };  // 32x32 -> 64
 struct OpMadWide { bool is_signed; Reg dst; Operand a, b, c; };  // 32x32+64 -> 64
 // High half of a same-width multiply. Compilers emit these to turn integer
 // division by a constant into a multiply, so they show up in ordinary code.
 struct OpMulHi { Type ty; Reg dst; Operand a, b; };
 struct OpMadHi { Type ty; Reg dst; Operand a, b, c; };
 struct OpShf { bool left; bool wrap; Reg dst; Operand a, b, c; };  // funnel shift b:a
-struct OpFloatBin { FloatBinOp op; Type ty; Reg dst; Operand a, b; };
+// PTX names an explicit rounding mode on float arithmetic. Unlike .approx,
+// which only relaxes accuracy, these change the result -- quantization kernels
+// depend on .rz truncating -- so they are carried through and applied.
+enum class FRound { Nearest, Zero, MinusInf, PlusInf };
+struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op; Type ty; Reg dst; Operand a, b; };
 struct OpFma { Type ty; Reg dst; Operand a, b, c; };
 // Packed half2 SIMD: one 32-bit register holds two f16 lanes.
 struct OpF16x2Bin { FloatBinOp op; Reg dst; Operand a, b; };
@@ -175,6 +227,16 @@ struct OpNotPred { Reg dst; Reg src; };
 struct OpAtom { AtomOp op; Space space; Type ty; Reg dst; Addr addr; Operand b; Operand c; };
 struct OpBra { size_t target; std::string label; };  // target = instruction index
 struct OpBar {};                                     // bar.sync 0
+// trap aborts the launch. CUDA reports it as an unspecified launch failure,
+// and a kernel that reaches it has detected something it cannot continue past,
+// so it must not be silently skipped.
+struct OpTrap {};
+// bar.red.{and,or}.pred d, 0, p  /  bar.red.popc.u32 d, 0, p
+// A barrier that also reduces a predicate across every thread in the block and
+// gives all of them the result. Unlike bar.sync it produces a value, so it
+// cannot complete until every warp has arrived.
+enum class BarRedOp { And, Or, Popc };
+struct OpBarRed { BarRedOp op; Reg dst; Reg src; bool negate_src = false; };
 struct OpRet {};
 // Call-sequence machinery (currently only the vprintf builtin is callable).
 struct OpDeclSlot { std::string name; uint32_t size; };            // ".param .b64 param0;" in body
@@ -183,7 +245,7 @@ struct OpLdSlot { std::string slot; int64_t offset; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall>;
 

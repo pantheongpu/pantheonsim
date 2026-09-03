@@ -4,5 +4,7 @@ __pycache__/
 *.so
 compile_commands.json
 .cache/
+build-cu12/
 build-fix/
 build-san/
+build-tsan/

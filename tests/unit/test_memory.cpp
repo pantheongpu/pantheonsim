@@ -147,18 +147,6 @@ VTEST_MAIN
 // in, so setting N bytes of device memory cost N bytes of chunks plus N bytes
 // of staging, live at the same time. These pin the behaviour that replaced it.
 
-namespace {
-// Resident set size in bytes, from the second field of /proc/self/statm.
-uint64_t resident_bytes() {
-  std::FILE* f = std::fopen("/proc/self/statm", "r");
-  if (!f) return 0;
-  unsigned long total = 0, resident = 0;
-  const int got = std::fscanf(f, "%lu %lu", &total, &resident);
-  std::fclose(f);
-  if (got != 2) return 0;
-  return static_cast<uint64_t>(resident) * static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
-}
-}  // namespace
 
 VTEST(fill_byte_pattern_spans_chunks) {
   MemoryManager mm(1 << 20);
@@ -205,17 +193,14 @@ VTEST(fill_partial_range_leaves_neighbours_alone) {
 VTEST(zero_fill_does_not_materialize_chunks) {
   // Zeroing memory nothing has touched is already true of that memory, so it
   // must not cost host RAM. This is what keeps a workload that allocates most
-  // of a large device and zeroes it from pulling the whole device into RSS.
+  // of a large device and zeroes it from pulling the whole device into memory.
   MemoryManager mm(1ull << 40);
   const uint64_t n = 256ull * 1024 * 1024;
   uint64_t p = mm.alloc(n);
-  const uint64_t before = resident_bytes();
+  VCHECK_EQ(mm.resident_bytes(), 0ull);
   const uint8_t zero = 0;
   mm.fill(p, &zero, 1, n);
-  const uint64_t after = resident_bytes();
-  // Allow slack for unrelated allocator noise, but nothing near the 256 MiB
-  // that materializing every chunk would cost.
-  VCHECK(after < before + (32ull * 1024 * 1024));
+  VCHECK_EQ(mm.resident_bytes(), 0ull);  // not one chunk
   // It still reads back as zero.
   std::vector<uint8_t> out(4096, 0xEE);
   mm.read(p + n - 4096, out.data(), out.size());
@@ -224,17 +209,19 @@ VTEST(zero_fill_does_not_materialize_chunks) {
 }
 
 VTEST(nonzero_fill_costs_about_one_copy) {
-  // The staging buffer made a fill of N bytes cost about 2N. Hold it to
-  // roughly one copy.
+  // The staging buffer made a fill of N bytes cost about 2N of host memory.
+  // Backing is exactly one chunk per touched chunk now, so this is an equality
+  // rather than a range: the earlier version compared the process's resident
+  // size, which a sanitizer's shadow memory and the allocator both perturb.
   MemoryManager mm(1ull << 40);
   const uint64_t n = 256ull * 1024 * 1024;
   uint64_t p = mm.alloc(n);
-  const uint64_t before = resident_bytes();
   const uint8_t v = 0xC3;
   mm.fill(p, &v, 1, n);
-  const uint64_t after = resident_bytes();
-  const uint64_t grew = after > before ? after - before : 0;
-  VCHECK(grew >= n / 2);            // it really did materialize the range
-  VCHECK(grew < n + (n / 2));       // but nowhere near twice it
+  VCHECK_EQ(mm.resident_bytes(), n);  // one copy, not two
+  // A second fill over the same range materializes nothing further.
+  mm.fill(p, &v, 1, n);
+  VCHECK_EQ(mm.resident_bytes(), n);
   mm.free(p);
+  VCHECK_EQ(mm.resident_bytes(), 0ull);
 }

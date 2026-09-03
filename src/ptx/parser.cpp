@@ -52,6 +52,7 @@ std::vector<std::string> split_dots(const std::string& s) {
 
 std::optional<Type> parse_type_token(const std::string& part) {
   if (part == "pred") return Type{Type::Kind::Pred, 1};
+  if (part == "bf16") return Type{Type::Kind::BF, 16};
   if (part.size() < 2) return std::nullopt;
   Type::Kind kind;
   switch (part[0]) {
@@ -732,9 +733,12 @@ class Parser {
         expect_punct(",");
         addr = parse_addr(fn);
         if (space == Space::Param) {
-          if (addr.base_kind == Addr::Base::Reg)
-            return unsupported("ld.param through a register address");
-          if (addr.base_kind == Addr::Base::CallSlot) {
+          // A register base is a parameter's address, taken with
+          // "mov.b64 %rd, kernel_param_N". Parameters have addresses of their
+          // own, so this loads back out of the parameter buffer.
+          if (addr.base_kind == Addr::Base::Reg) {
+            ins.op = OpLd{space, ty, std::move(dsts), addr};
+          } else if (addr.base_kind == Addr::Base::CallSlot) {
             if (vec != 1) return unsupported("vector ld.param from call slot");
             OpLdSlot op{addr.base, addr.offset, ty, dsts[0]};
             ins.op = op;
@@ -769,8 +773,15 @@ class Parser {
       if (parts.size() != 2) return unsupported("mov form");
       auto ty = parse_type_token(parts[1]);
       if (!ty) fail(ins.line, "mov missing type");
-      if (ty->kind == Type::Kind::Pred) return unsupported("mov.pred");
-      if (peek_punct("{")) {  // mov.bN {d0, d1, ...}, src  — unpack
+      if (ty->kind == Type::Kind::Pred) {
+        // Predicates live in their own register file, so this cannot go through
+        // the value path below.
+        OpMovPred op;
+        op.dst = expect_reg_operand("mov.pred destination");
+        expect_punct(",");
+        op.src = parse_operand();
+        ins.op = op;
+      } else if (peek_punct("{")) {  // mov.bN {d0, d1, ...}, src  — unpack
         OpMovUnpack op;
         op.ty = *ty;
         next();
@@ -835,6 +846,7 @@ class Parser {
     } else if (op0 == "cvt") {
       // cvt[.round][.sat][.ftz].<dstty>.<srcty>
       std::vector<Type> tys;
+      std::string packed;  // "f16x2"/"bf16x2": two f32 sources packed into one register
       Round round = Round::None;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
@@ -844,11 +856,27 @@ class Parser {
         else if (p == "rp") round = Round::Rp;
         else if (p == "rni") round = Round::Rni;
         else if (p == "rzi") round = Round::Rzi;
-        else if (p == "rmi") round = Round::Rm;
-        else if (p == "rpi") round = Round::Rp;
+        else if (p == "rmi") round = Round::Rmi;
+        else if (p == "rpi") round = Round::Rpi;
         else if (p == "sat" || p == "ftz") ;  // saturation/flush handled conservatively below
+        else if (p == "f16x2" || p == "bf16x2") packed = p;
         else if (auto t2 = parse_type_token(p)) tys.push_back(*t2);
         else return unsupported("unrecognized cvt modifier '." + p + "'");
+      }
+      if (!packed.empty()) {
+        // cvt.rn.f16x2.f32 d, a, b -- two f32 converted and packed, a high, b low.
+        if (tys.size() != 1 || tys[0].bits != 32 || !tys[0].is_float())
+          return unsupported("cvt to " + packed + " from a source other than f32");
+        OpCvtF16x2 op;
+        op.bf16 = packed[0] == 'b';
+        op.dst = expect_reg_operand("cvt destination");
+        expect_punct(",");
+        op.a = parse_operand();
+        expect_punct(",");
+        op.b = parse_operand();
+        ins.op = op;
+        expect_punct(";");
+        return ins;
       }
       if (tys.size() != 2) fail(ins.line, "cvt needs .<dsttype>.<srctype>");
       OpCvt op;
@@ -1021,6 +1049,145 @@ class Parser {
       expect_punct(",");
       op.src = parse_operand();
       ins.op = op;
+    } else if (op0 == "ldmatrix") {
+      uint32_t count = 0;
+      bool trans = false, shape_ok = false, b16 = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "sync" || p == "aligned") ;
+        else if (p == "m8n8") shape_ok = true;
+        else if (p == "x1") count = 1;
+        else if (p == "x2") count = 2;
+        else if (p == "x4") count = 4;
+        else if (p == "trans") trans = true;
+        else if (p == "b16") b16 = true;
+        else if (p == "shared" || p == "cta") ;
+        else return unsupported("ldmatrix modifier '." + p + "'");
+      }
+      if (!shape_ok || !count || !b16)
+        return unsupported("only ldmatrix.m8n8.x{1,2,4}.b16 is implemented");
+      OpLdMatrix op;
+      op.count = count;
+      op.trans = trans;
+      op.dsts = parse_reg_vector_any();
+      if (op.dsts.size() != count) return unsupported("ldmatrix destination arity");
+      expect_punct(",");
+      op.addr = parse_addr(fn);
+      ins.op = op;
+    } else if (op0 == "mma") {
+      // mma.sync.aligned.m16n8kK.row.col.<d>.<a>.<b>.<c>
+      uint32_t k = 0;
+      std::vector<std::string> types;
+      bool row_col = false, saw_row = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "sync" || p == "aligned") ;
+        else if (p == "row") saw_row = true;
+        else if (p == "col") { if (saw_row) row_col = true; }
+        else if (p == "m16n8k8") k = 8;
+        else if (p == "m16n8k16") k = 16;
+        else if (p == "m16n8k32") k = 32;
+        else if (p == "f32" || p == "f16" || p == "bf16" || p == "tf32" || p == "s32" ||
+                 p == "s8" || p == "u8")
+          types.push_back(p);
+        else return unsupported("mma modifier '." + p + "' (shape or type not implemented)");
+      }
+      if (!k) return unsupported("only the m16n8k{8,16,32} mma shapes are implemented");
+      if (!row_col) return unsupported("only mma .row.col is implemented");
+      if (types.size() != 4) return unsupported("mma needs .<dtype>.<atype>.<btype>.<ctype>");
+      OpMma op;
+      op.k = k;
+      const std::string& at = types[1];
+      if (at == "f16") op.ab_type = MmaElem::F16;
+      else if (at == "bf16") op.ab_type = MmaElem::BF16;
+      else if (at == "tf32") op.ab_type = MmaElem::TF32;
+      else if (at == "s8") { op.ab_type = MmaElem::S8; op.ab_signed = true; }
+      else if (at == "u8") { op.ab_type = MmaElem::U8; op.ab_signed = false; }
+      else return unsupported("mma operand type '." + at + "'");
+      if (types[1] != types[2]) return unsupported("mma with mixed A and B types");
+      op.acc_f16 = types[0] == "f16";
+      op.acc_int = types[0] == "s32";
+      op.d = parse_reg_vector_any();
+      expect_punct(",");
+      op.a = parse_reg_vector_any();
+      expect_punct(",");
+      op.b = parse_reg_vector_any();
+      expect_punct(",");
+      op.c = parse_reg_vector_any();
+      if (op.d.size() != op.c.size()) return unsupported("mma D and C arity differ");
+      ins.op = op;
+    } else if (op0 == "redux") {
+      // redux.sync.<op>.<type> d, a, membermask
+      std::optional<ReduxOp> rop;
+      Type ty{};
+      bool have_ty = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "sync") ;
+        else if (p == "add") rop = ReduxOp::Add;
+        else if (p == "min") rop = ReduxOp::Min;
+        else if (p == "max") rop = ReduxOp::Max;
+        else if (p == "and") rop = ReduxOp::And;
+        else if (p == "or") rop = ReduxOp::Or;
+        else if (p == "xor") rop = ReduxOp::Xor;
+        else if (auto t2 = parse_type_token(p)) { ty = *t2; have_ty = true; }
+        else return unsupported("redux modifier '." + p + "'");
+      }
+      if (!rop || !have_ty) return unsupported("redux form");
+      if (ty.is_float()) return unsupported("redux on float types");
+      OpRedux op;
+      op.op = *rop;
+      op.ty = ty;
+      op.dst = expect_reg_operand("redux destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      expect_punct(",");
+      (void)parse_operand();  // membermask; the active mask already carries it
+      ins.op = op;
+    } else if (op0 == "copysign") {
+      auto ty = parse_type_token(parts.back());
+      if (!ty || !ty->is_float()) return unsupported("copysign form (float types only)");
+      OpCopysign op;
+      op.ty = *ty;
+      op.dst = expect_reg_operand("copysign destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      ins.op = op;
+    } else if (op0 == "dp4a") {
+      // dp4a.atype.btype d, a, b, c
+      if (parts.size() != 3) return unsupported("dp4a form");
+      const bool as = parts[1] == "s32", au = parts[1] == "u32";
+      const bool bs = parts[2] == "s32", bu = parts[2] == "u32";
+      if ((!as && !au) || (!bs && !bu)) return unsupported("dp4a operand types");
+      OpDp4a op;
+      op.a_signed = as;
+      op.b_signed = bs;
+      op.dst = expect_reg_operand("dp4a destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      expect_punct(",");
+      op.c = parse_operand();
+      ins.op = op;
+    } else if (op0 == "bmsk") {
+      if (parts.size() < 2) return unsupported("bmsk form");
+      bool wrap = false;
+      for (size_t i = 1; i + 1 < parts.size(); ++i) {
+        if (parts[i] == "wrap") wrap = true;
+        else if (parts[i] != "clamp") return unsupported("bmsk mode '." + parts[i] + "'");
+      }
+      if (parts.back() != "b32") return unsupported("bmsk type (only .b32)");
+      OpBmsk op;
+      op.wrap = wrap;
+      op.dst = expect_reg_operand("bmsk destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      ins.op = op;
     } else if (op0 == "popc" || op0 == "clz") {
       auto ty = parse_type_token(parts.back());
       if (!ty || parts.size() != 2) return unsupported(op0 + " form");
@@ -1094,8 +1261,16 @@ class Parser {
       }
       ins.op = op;
     } else if (op0 == "neg") {
-      if (parts.size() != 2) return unsupported("neg form");
-      auto ty = parse_type_token(parts[1]);
+      // neg carries the same accuracy modifiers as the other float ops --
+      // neg.ftz.f32 is ordinary in generated code. .ftz flushes denormals to
+      // zero, which negation cannot turn into a wrong sign, so the exact result
+      // stays within what the modifier promises. Take the type from the last
+      // component rather than requiring it to be the only one, as abs does.
+      if (parts.size() < 2) return unsupported("neg form");
+      for (size_t i = 1; i + 1 < parts.size(); ++i)
+        if (parts[i] != "ftz")
+          return unsupported("neg modifier '." + parts[i] + "'");
+      auto ty = parse_type_token(parts.back());
       if (!ty) fail(ins.line, "neg missing type");
       OpNeg op;
       op.ty = *ty;
@@ -1157,7 +1332,20 @@ class Parser {
         } else return unsupported("atom operation '." + p + "'");
       }
       if (!aop || !have_ty) return unsupported("atom form");
-      if (ty.is_float()) return unsupported("float atomics not implemented yet");
+      // Float atomics are what a reduction, a gradient accumulation, or an
+      // embedding backward pass is built out of, so they are not optional for
+      // ML work. CUDA exposes add/exch/min/max on float and double; the
+      // bitwise ops and CAS are integer-only there too, and a program that
+      // wants CAS on a float does it through .b32.
+      if (ty.is_float()) {
+        if (*aop != AtomOp::Add && *aop != AtomOp::Exch && *aop != AtomOp::Min &&
+            *aop != AtomOp::Max)
+          return unsupported("atom." + std::string(*aop == AtomOp::Cas ? "cas" : "bitwise") +
+                             " on a float type (CUDA has no such instruction; use .b32)");
+        if (ty.bits != 32 && ty.bits != 64)
+          return unsupported("float atomics are implemented for f32 and f64; f16/bf16 atomics "
+                             "are not yet");
+      }
       OpAtom op;
       op.op = *aop;
       op.ty = ty;
@@ -1178,6 +1366,7 @@ class Parser {
                op0 == "div" || op0 == "rem" || op0 == "and" || op0 == "or" || op0 == "xor" ||
                op0 == "shl" || op0 == "shr") {
       bool wide = false, lo = false, hi = false;
+      FRound frnd = FRound::Nearest;
       Type ty{};
       bool have_ty = false;
       for (size_t i = 1; i < parts.size(); ++i) {
@@ -1186,10 +1375,20 @@ class Parser {
         else if (p == "lo") lo = true;
         else if (p == "hi") hi = true;
         else if (p == "rn" || p == "ftz") ;
-        else if (p == "rz" || p == "rm" || p == "rp")
-          return unsupported("non-default float rounding mode '." + p + "'");
-        else if (p == "sat" || p == "approx" || p == "full")
-          return unsupported("modifier '." + p + "' not implemented");
+        else if (p == "rz") frnd = FRound::Zero;
+        else if (p == "rm") frnd = FRound::MinusInf;
+        else if (p == "rp") frnd = FRound::PlusInf;
+        // .approx and .full ask for a faster, less accurate result -- div.approx
+        // is what __fdividef compiles to, and ML kernels use it constantly.
+        // Both have a documented error bound, and the exact IEEE result falls
+        // inside it, so computing exactly satisfies the contract. This is the
+        // same policy the SFU transcendentals already follow: correct to better
+        // than hardware, never bit-identical to it.
+        else if (p == "approx" || p == "full") ;
+        // .sat clamps the result into [0,1]. That is a semantic change, not an
+        // accuracy one, so ignoring it would silently produce wrong numbers.
+        else if (p == "sat")
+          return unsupported("modifier '.sat' not implemented");
         else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
@@ -1235,6 +1434,7 @@ class Parser {
         auto it = fops.find(op0);
         if (it == fops.end()) return unsupported("float op '" + op0 + "'");
         OpFloatBin op;
+        op.round = frnd;
         op.op = it->second;
         op.ty = ty;
         op.dst = expect_reg_operand("destination");
@@ -1244,8 +1444,13 @@ class Parser {
         op.b = parse_operand();
         ins.op = op;
       } else if (wide) {
-        if (op0 != "mul" || ty.bits != 32) return unsupported("only mul.wide.{s32,u32} implemented");
+        // .wide doubles the operand width: 16-bit sources give a 32-bit result,
+        // 32-bit give 64. Quantized kernels use the 16-bit form for byte-pair
+        // arithmetic, so restricting this to 32-bit blocked them.
+        if (op0 != "mul" || (ty.bits != 32 && ty.bits != 16))
+          return unsupported("only mul.wide.{s16,u16,s32,u32} implemented");
         OpMulWide op;
+        op.src_bits = ty.bits;
         op.is_signed = ty.is_signed();
         op.dst = expect_reg_operand("destination");
         expect_punct(",");
@@ -1374,14 +1579,67 @@ class Parser {
       if (op.callee != "vprintf")
         return unsupported("call to '" + op.callee + "' (only the vprintf builtin is callable)");
       ins.op = op;
+    } else if (op0 == "trap") {
+      ins.op = OpTrap{};
+    } else if (op0 == "membar" || op0 == "fence") {
+      // Blocks execute their instructions in order and device atomics are
+      // serialized by a lock, so every prior write is already visible to
+      // whoever could observe it. There is no reordering here to fence against.
+      ins.op = OpBar{};
+    } else if (op0 == "nanosleep") {
+      // A backoff hint. Consuming it as a no-op is correct; the operand is a
+      // duration nothing here can meaningfully honour.
+      (void)parse_operand();
+      ins.op = OpBar{};  // nothing to do; treated as a barrier-free no-op
+    } else if ((op0 == "bar" || op0 == "barrier") && parts.size() > 1 && parts[1] == "red") {
+      // bar.red.<op>.<type> d, 0, [!]p
+      std::optional<BarRedOp> rop;
+      bool pred_ty = false, u32_ty = false;
+      for (size_t i = 2; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "and") rop = BarRedOp::And;
+        else if (p == "or") rop = BarRedOp::Or;
+        else if (p == "popc") rop = BarRedOp::Popc;
+        else if (p == "pred") pred_ty = true;
+        else if (p == "u32") u32_ty = true;
+        else if (p == "cta") ;
+        else return unsupported("bar.red modifier '." + p + "'");
+      }
+      if (!rop) return unsupported("bar.red needs .and, .or or .popc");
+      if (*rop == BarRedOp::Popc ? !u32_ty : !pred_ty)
+        return unsupported("bar.red type does not match its operation");
+      OpBarRed op;
+      op.op = *rop;
+      op.dst = expect_reg_operand("bar.red destination");
+      expect_punct(",");
+      {
+        Operand which = parse_operand();
+        if (auto* imm = std::get_if<ImmInt>(&which); !imm || imm->value != 0)
+          return unsupported("only barrier 0 is implemented");
+      }
+      expect_punct(",");
+      if (peek_punct("!")) { next(); op.negate_src = true; }
+      op.src = expect_reg_operand("bar.red source predicate");
+      ins.op = op;
     } else if (op0 == "bar" || op0 == "barrier") {
-      bool sync_seen = false;
+      bool sync_seen = false, warp_scope = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         if (parts[i] == "sync") sync_seen = true;
         else if (parts[i] == "cta") ;
-        else return unsupported("only bar.sync is implemented");
+        else if (parts[i] == "warp") warp_scope = true;
+        else return unsupported("only bar.sync and bar.warp.sync are implemented");
       }
       if (!sync_seen) return unsupported("only bar.sync is implemented");
+      if (warp_scope) {
+        // __syncwarp. A warp executes its lanes in lockstep here and diverged
+        // paths reconverge at the earliest common pc, so the lanes named by the
+        // mask are already synchronised by the time this is reached. The
+        // operand is the member mask, which nothing needs to consume.
+        (void)parse_operand();
+        ins.op = OpBar{};
+        expect_punct(";");
+        return ins;
+      }
       Operand which = parse_operand();
       if (auto* imm = std::get_if<ImmInt>(&which); !imm || imm->value != 0)
         return unsupported("only barrier 0 (bar.sync 0) is implemented");

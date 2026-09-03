@@ -23,6 +23,7 @@
 #include <bit>
 #include <chrono>
 #include <thread>
+#include <cfenv>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -46,6 +47,12 @@ constexpr uint32_t kWarpSize = 32;
 constexpr uint64_t kLocalVaBase = 0x6fff'0000'0000ull;
 constexpr uint64_t kLocalVaSize = 1ull << 30;
 // Per-block .shared window, likewise distinct from host and device-global VAs.
+// Kernel parameters get an address window of their own so a kernel can take a
+// parameter's address and load through it -- CUB's segmented sort does exactly
+// that. Nothing else may be addressed here, so a stray pointer into this range
+// is still diagnosable.
+constexpr uint64_t kParamVaBase = 0x6ffd'0000'0000ull;
+constexpr uint64_t kParamVaSize = 1ull << 20;
 constexpr uint64_t kSharedVaBase = 0x6ffe'0000'0000ull;
 constexpr uint64_t kSharedVaSize = 1ull << 30;
 
@@ -62,6 +69,15 @@ struct ParamBuffer {
   std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> layout;  // name -> (offset, size)
 };
 
+// State for bar.red, which needs every warp in the block to arrive before it
+// can produce a value. Held behind a pointer for the same reason shared memory
+// is: the context is passed by const reference.
+struct BarrierReduction {
+  uint64_t acc = 0;
+  uint32_t arrived = 0;   // warps that have contributed and not yet collected
+  bool complete = false;  // set when the barrier released; cleared when drained
+};
+
 struct BlockCtx {
   std::array<uint32_t, 3> ctaid{};
   std::array<uint32_t, 3> ntid{};
@@ -69,6 +85,7 @@ struct BlockCtx {
   // Per-block shared memory. Zero-initialized at block start: real hardware
   // leaves it undefined, VirtualGPU makes it deterministic (documented).
   std::vector<uint8_t>* shared = nullptr;
+  BarrierReduction* bar_red = nullptr;
 };
 
 // One diverged execution path: a set of lanes sharing a program counter.
@@ -80,6 +97,10 @@ struct Path {
 struct Warp {
   enum class State { Ready, AtBarrier, Done };
   State state = State::Ready;
+  // Set between contributing to a bar.red and collecting its result. The
+  // instruction re-executes when the barrier releases, and this is how it knows
+  // to collect rather than contribute a second time.
+  bool bar_red_waiting = false;
   // Live paths. Reconvergence is by *lowest program counter*: the path with
   // the smallest pc always runs next, and paths that arrive at the same pc are
   // merged. For the structured control flow compilers emit, that reconverges
@@ -229,6 +250,8 @@ class Interpreter {
     // launch's dynamic bytes).
     std::vector<uint8_t> shared(fn_.static_shared_size + cfg_.shared_bytes, 0);
     ctx.shared = &shared;
+    BarrierReduction bar_red;
+    ctx.bar_red = &bar_red;
     uint64_t total = uint64_t{ctx.ntid[0]} * ctx.ntid[1] * ctx.ntid[2];
     size_t nwarps = static_cast<size_t>((total + kWarpSize - 1) / kWarpSize);
     std::vector<Warp> warps(nwarps);
@@ -265,6 +288,8 @@ class Interpreter {
             w.state = Warp::State::Ready;
             any_waiting = true;
           }
+        // Every warp has now arrived, so a bar.red in flight has its answer.
+        if (any_waiting) bar_red.complete = true;
         if (!any_waiting) return;  // all Done
         continue;
       }
@@ -302,6 +327,9 @@ class Interpreter {
                           "' (missing ret)");
       const Instr& ins = fn_.body[w.paths[idx].pc];
       if (progress_ && (stats_.instructions & 0xFFFFF) == 0) report_progress();
+      // Warp-level issue count, plus the per-lane total: their ratio is the
+      // average lane utilisation, which is divergence measured directly.
+      stats_.thread_instructions += static_cast<uint64_t>(popcount_mask(w.paths[idx].mask));
       if (++stats_.instructions > cfg_.max_steps)
         throw Error::make(Err::ExecLimit, "kernel '", fn_.name, "' exceeded the launch step budget (",
                           cfg_.max_steps, " instructions) — possible infinite loop");
@@ -319,8 +347,15 @@ class Interpreter {
     if (symbols_) {
       if (auto it = symbols_->find(name); it != symbols_->end()) return it->second;
     }
+    // A kernel may take a parameter's address rather than loading it by name:
+    // CUB's segmented sort does "mov.b64 %rd, kernel_param_10" and then loads
+    // through the register. Parameters live in their own window so those loads
+    // resolve back to the parameter buffer.
+    if (auto it = params_.layout.find(name); it != params_.layout.end())
+      return kParamVaBase + it->second.first;
     ctx_fail(ins, -1, Err::NotFound,
-             "unknown symbol '" + name + "' (not a .local depot or module .global variable)");
+             "unknown symbol '" + name + "' (not a .local depot, module .global variable, or "
+             "kernel parameter)");
   }
 
   // Returns a reference to the operand's lane vector. Register operands alias
@@ -453,6 +488,37 @@ class Interpreter {
     return w.preds[idx];
   }
 
+  static uint32_t popcount_mask(Mask m) {
+    return static_cast<uint32_t>(__builtin_popcount(static_cast<unsigned>(m)));
+  }
+
+  // Memory traffic, counted per active lane. Space matters: a shared access and
+  // a global one cost very different things on hardware, and lumping them would
+  // make the numbers useless for the comparison people actually want.
+  void count_memory(Space space, uint32_t bytes, uint32_t lanes, bool is_store) {
+    const uint64_t n = lanes;
+    const uint64_t b = n * bytes;
+    switch (space) {
+      case Space::Shared:
+        if (is_store) { stats_.shared_stores += n; stats_.shared_bytes_written += b; }
+        else { stats_.shared_loads += n; stats_.shared_bytes_read += b; }
+        break;
+      case Space::Local:
+        if (is_store) stats_.local_stores += n; else stats_.local_loads += n;
+        break;
+      case Space::Param:
+        // Kernel parameters are read from the constant bank, not from device
+        // memory. Counting them as global traffic inflated every kernel's load
+        // count by one per thread and would make the byte totals wrong.
+        break;
+      case Space::Global:
+      case Space::Generic:
+        if (is_store) { stats_.global_stores += n; stats_.global_bytes_written += b; }
+        else { stats_.global_loads += n; stats_.global_bytes_read += b; }
+        break;
+    }
+  }
+
   Mask& pred_slot(Warp& w, const Reg& reg) {
     if (reg.wide) w.written64[reg.id] = 1;
     else w.written32[reg.id] = 1;
@@ -467,6 +533,7 @@ class Interpreter {
     switch (sp) {
       case Space::Shared: return kSharedVaBase;
       case Space::Local: return kLocalVaBase;
+      case Space::Param: return kParamVaBase;
       default: return 0;
     }
   }
@@ -564,8 +631,59 @@ class Interpreter {
       exec_ret(w, idx, m);
       return;
     }
+    if (const auto* op = std::get_if<OpBarRed>(&ins.op)) {
+      if (ins.has_pred)
+        ctx_fail(ins, -1, Err::UnsupportedPtx, "predicated bar.red is not supported");
+      if (!ctx.bar_red)
+        ctx_fail(ins, -1, Err::UnsupportedPtx, "bar.red outside a block context");
+      BarrierReduction& red = *ctx.bar_red;
+      if (!w.bar_red_waiting) {
+        // Contribute and wait. The result is not known until every warp in the
+        // block has arrived, so the pc stays put and this re-executes on
+        // release rather than advancing now.
+        if (red.arrived == 0) {
+          red.acc = op->op == BarRedOp::And ? ~uint64_t{0} : 0;
+          red.complete = false;
+        }
+        Mask p = read_pred(w, ins, op->src);
+        if (op->negate_src) p = ~p;
+        const Mask voters = p & m;
+        switch (op->op) {
+          case BarRedOp::And:
+            // True only if every participating lane of every warp voted true.
+            red.acc &= (voters == m) ? 1u : 0u;
+            break;
+          case BarRedOp::Or:
+            red.acc |= (voters != 0) ? 1u : 0u;
+            break;
+          case BarRedOp::Popc:
+            red.acc += static_cast<uint64_t>(popcount_mask(voters));
+            break;
+        }
+        ++red.arrived;
+        ++stats_.barriers;
+        w.bar_red_waiting = true;
+        w.state = Warp::State::AtBarrier;
+        return;
+      }
+      // Released: collect the block-wide result.
+      w.bar_red_waiting = false;
+      if (red.arrived) --red.arrived;
+      if (op->op == BarRedOp::Popc) {
+        Lanes r;
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+          if (m & (1u << lane)) r[lane] = red.acc;
+        write_reg(w, op->dst, m, r, 32);
+      } else {
+        Mask& dp = pred_slot(w, op->dst);
+        dp = (red.acc & 1u) ? (dp | m) : (dp & ~m);
+      }
+      ++w.paths[idx].pc;
+      return;
+    }
     if (std::holds_alternative<OpBar>(ins.op)) {
       if (ins.has_pred) ctx_fail(ins, -1, Err::UnsupportedPtx, "predicated bar.sync is not supported");
+      ++stats_.barriers;
       // Every live lane must arrive before the warp yields. Lanes still on
       // other paths have a higher pc and will merge here first; if any path
       // can never reach this barrier the kernel is malformed, and the step
@@ -616,7 +734,10 @@ class Interpreter {
       return;
     }
     // Diverge: both halves become live paths, and whichever has the lower pc
-    // runs first. They merge again as soon as they reach the same pc.
+    // runs first. They merge again as soon as they reach the same pc. Only this
+    // case is divergence -- a branch every lane agrees on took one of the two
+    // early returns above and costs nothing.
+    ++stats_.divergent_branches;
     size_t fall_pc = w.paths[idx].pc + 1;
     w.paths[idx].pc = op.target;
     w.paths[idx].mask = taken;
@@ -655,10 +776,12 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpLd>(&ins.op)) {
+      count_memory(op->space, op->ty.bytes(), popcount_mask(m), /*is_store=*/false);
       exec_ld(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpSt>(&ins.op)) {
+      count_memory(op->space, op->ty.bytes(), popcount_mask(m), /*is_store=*/true);
       exec_st(w, ctx, ins, *op, m);
       return;
     }
@@ -681,8 +804,21 @@ class Interpreter {
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r;  // written for every active lane below
+      // An explicit rounding mode changes the result, so it has to be applied
+      // rather than assumed to be round-to-nearest: quantization kernels use
+      // .rz specifically because truncation is what they want. Set the host
+      // mode around the arithmetic and put it back, so nothing else observes
+      // the change.
+      const int prev_round = std::fegetround();
+      switch (op->round) {
+        case FRound::Zero: std::fesetround(FE_TOWARDZERO); break;
+        case FRound::MinusInf: std::fesetround(FE_DOWNWARD); break;
+        case FRound::PlusInf: std::fesetround(FE_UPWARD); break;
+        case FRound::Nearest: break;
+      }
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = float_bin(op->op, op->ty, a[lane], b[lane]);
+      if (op->round != FRound::Nearest) std::fesetround(prev_round);
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -722,13 +858,20 @@ class Interpreter {
       Lanes r;  // written for every active lane below
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) {
-          if (op->is_signed)
+          if (op->src_bits == 16) {
+            if (op->is_signed)
+              r[lane] = static_cast<uint64_t>(static_cast<uint32_t>(
+                  int32_t{static_cast<int16_t>(a[lane])} * int32_t{static_cast<int16_t>(b[lane])}));
+            else
+              r[lane] = uint32_t{static_cast<uint16_t>(a[lane])} *
+                        uint32_t{static_cast<uint16_t>(b[lane])};
+          } else if (op->is_signed)
             r[lane] = static_cast<uint64_t>(int64_t{static_cast<int32_t>(a[lane])} *
                                             int64_t{static_cast<int32_t>(b[lane])});
           else
             r[lane] = uint64_t{static_cast<uint32_t>(a[lane])} * uint64_t{static_cast<uint32_t>(b[lane])};
         }
-      write_reg(w, op->dst, m, r, 64);
+      write_reg(w, op->dst, m, r, op->src_bits * 2);  // .wide doubles the width
       return;
     }
     if (const auto* op = std::get_if<OpSelp>(&ins.op)) {
@@ -851,6 +994,165 @@ class Interpreter {
             r[lane] = static_cast<uint64_t>(-static_cast<int64_t>(v[lane]));
         }
       write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpMovPred>(&ins.op)) {
+      Mask& p = pred_slot(w, op->dst);
+      if (const auto* imm = std::get_if<ImmInt>(&op->src)) {
+        // A constant applies to every active lane; inactive lanes keep theirs.
+        if (imm->value != 0) p |= m;
+        else p &= ~m;
+      } else if (const auto* r = std::get_if<RegOperand>(&op->src)) {
+        const Mask src = w.preds[pred_index(r->reg)];
+        p = (p & ~m) | (src & m);
+      } else {
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "mov.pred source must be an immediate or a predicate register");
+      }
+      return;
+    }
+    if (const auto* op = std::get_if<OpLdMatrix>(&ins.op)) {
+      exec_ldmatrix(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpMma>(&ins.op)) {
+      exec_mma(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpRedux>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->src, _s_a);
+      // Every participating lane contributes and every one receives the result.
+      // The active mask is the membership: a lane not executing this
+      // instruction is not in the warp's reduction.
+      bool first = true;
+      uint64_t acc = 0;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+        if (!(m & (1u << lane))) continue;
+        const uint64_t v = a[lane];
+        if (first) { acc = v; first = false; continue; }
+        switch (op->op) {
+          case ReduxOp::Add: acc = acc + v; break;
+          case ReduxOp::And: acc = acc & v; break;
+          case ReduxOp::Or: acc = acc | v; break;
+          case ReduxOp::Xor: acc = acc ^ v; break;
+          case ReduxOp::Min:
+            acc = op->ty.is_signed()
+                      ? static_cast<uint64_t>(std::min(narrow_s(acc, op->ty.bits),
+                                                       narrow_s(v, op->ty.bits)))
+                      : std::min(narrow_u(acc, op->ty.bits), narrow_u(v, op->ty.bits));
+            break;
+          case ReduxOp::Max:
+            acc = op->ty.is_signed()
+                      ? static_cast<uint64_t>(std::max(narrow_s(acc, op->ty.bits),
+                                                       narrow_s(v, op->ty.bits)))
+                      : std::max(narrow_u(acc, op->ty.bits), narrow_u(v, op->ty.bits));
+            break;
+        }
+      }
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) r[lane] = acc;
+      write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpCvtF16x2>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          // The first source goes in the high half, the second in the low.
+          const double x = static_cast<double>(f32(a[lane]));
+          const double y = static_cast<double>(f32(b[lane]));
+          const uint64_t hi = op->bf16 ? double_to_bf16(x) : double_to_f16(x);
+          const uint64_t lo = op->bf16 ? double_to_bf16(y) : double_to_f16(y);
+          r[lane] = ((hi & 0xffffull) << 16) | (lo & 0xffffull);
+        }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpCopysign>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          // Magnitude of b, sign of a -- and it must be bit-exact for zeros and
+          // NaNs, so move the sign bit rather than going through comparisons.
+          if (op->ty.bits == 64) {
+            const uint64_t sign = a[lane] & (1ull << 63);
+            r[lane] = sign | (b[lane] & ~(1ull << 63));
+          } else {
+            const uint32_t av = static_cast<uint32_t>(a[lane]);
+            const uint32_t bv = static_cast<uint32_t>(b[lane]);
+            r[lane] = (av & 0x80000000u) | (bv & 0x7fffffffu);
+          }
+        }
+      write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpDp4a>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          const uint32_t av = static_cast<uint32_t>(a[lane]);
+          const uint32_t bv = static_cast<uint32_t>(b[lane]);
+          // Each operand contributes four bytes, sign- or zero-extended
+          // according to its own type; the four products accumulate into c.
+          int64_t acc = op->a_signed || op->b_signed
+                            ? static_cast<int64_t>(static_cast<int32_t>(c[lane]))
+                            : static_cast<int64_t>(static_cast<uint32_t>(c[lane]));
+          for (int byte = 0; byte < 4; ++byte) {
+            const uint8_t ab = static_cast<uint8_t>(av >> (byte * 8));
+            const uint8_t bb = static_cast<uint8_t>(bv >> (byte * 8));
+            const int64_t ax = op->a_signed ? static_cast<int8_t>(ab) : static_cast<int64_t>(ab);
+            const int64_t bx = op->b_signed ? static_cast<int8_t>(bb) : static_cast<int64_t>(bb);
+            acc += ax * bx;
+          }
+          r[lane] = static_cast<uint32_t>(static_cast<int32_t>(acc));
+        }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpBmsk>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          uint32_t base = static_cast<uint32_t>(a[lane]);
+          uint32_t width = static_cast<uint32_t>(b[lane]);
+          // .wrap takes both operands modulo 32; .clamp caps them at 32. These
+          // are different: wrapping the start position for .clamp turns a
+          // position of 40 into 8 and produces a mask in the wrong place,
+          // rather than the empty mask the clamp is supposed to give.
+          if (op->wrap) {
+            base &= 31u;
+            width &= 31u;
+          } else {
+            if (base > 32u) base = 32u;
+            if (width > 32u) width = 32u;
+          }
+          // Build and shift in 64 bits: a width or shift of 32 is undefined on
+          // a 32-bit type.
+          const uint64_t bits = width >= 32u ? 0xffffffffull : ((1ull << width) - 1ull);
+          const uint64_t shifted = base >= 32u ? 0ull : (bits << base);
+          r[lane] = static_cast<uint32_t>(shifted & 0xffffffffull);
+        }
+      write_reg(w, op->dst, m, r, 32);
       return;
     }
     if (const auto* op = std::get_if<OpPrmt>(&ins.op)) {
@@ -1256,6 +1558,163 @@ class Interpreter {
   // A ".col" layout transposes the matrix on the way in/out.
   static constexpr uint32_t kMmaDim = 16;
 
+  // ldmatrix: row r of matrix i comes from the address supplied by lane i*8+r,
+  // and every lane leaves with two consecutive 16-bit elements of one row. The
+  // distribution is the layout an mma A/B fragment expects, which is the whole
+  // point of the instruction.
+  void exec_ldmatrix(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLdMatrix& op, Mask m) {
+    Lanes _s_base;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
+    // The register already holds an address in the shared window -- it comes
+    // from cvta, which has done the space conversion. Adding the window base
+    // again lands at twice it, which is what the bounds check reported.
+    for (uint32_t mat = 0; mat < op.count; ++mat) {
+      // Pull the 8x8 matrix in, a row at a time.
+      uint16_t tile[8][8] = {};
+      for (uint32_t r = 0; r < 8; ++r) {
+        const uint32_t src_lane = mat * 8 + r;
+        if (!(m & (1u << src_lane)))
+          ctx_fail(ins, static_cast<int>(src_lane), Err::UnsupportedPtx,
+                   "ldmatrix needs every lane that supplies a row address to be active");
+        const uint64_t addr = base[src_lane] + static_cast<uint64_t>(op.addr.offset);
+        for (uint32_t c = 0; c < 8; ++c)
+          tile[r][c] = static_cast<uint16_t>(
+              load_routed(w, ctx, ins, src_lane, addr + c * 2, 2));
+      }
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          const uint32_t row = lane / 4, colpair = lane % 4;
+          uint16_t lo, hi;
+          if (op.trans) {
+            lo = tile[colpair * 2][row];
+            hi = tile[colpair * 2 + 1][row];
+          } else {
+            lo = tile[row][colpair * 2];
+            hi = tile[row][colpair * 2 + 1];
+          }
+          r[lane] = (static_cast<uint64_t>(hi) << 16) | lo;
+        }
+      write_reg(w, op.dsts[mat], m, r, 32);
+    }
+  }
+
+  // Decodes one element of an mma A/B fragment from a lane's register.
+  double mma_elem(MmaElem t, bool is_signed, uint64_t reg, uint32_t slot) {
+    switch (t) {
+      case MmaElem::F16: return f16_to_double((reg >> (16 * slot)) & 0xFFFF);
+      case MmaElem::BF16: return bf16_to_double((reg >> (16 * slot)) & 0xFFFF);
+      case MmaElem::TF32:
+        // tf32 occupies a full 32-bit register; its reduced mantissa is a
+        // hardware precision detail, and computing exactly stays inside it.
+        return static_cast<double>(f32(reg));
+      case MmaElem::S8:
+      case MmaElem::U8: {
+        const uint8_t byte = static_cast<uint8_t>(reg >> (8 * slot));
+        return is_signed ? static_cast<double>(static_cast<int8_t>(byte))
+                         : static_cast<double>(byte);
+      }
+    }
+    return 0.0;
+  }
+
+  void exec_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMma& op, Mask m) {
+    constexpr uint32_t kM = 16, kN = 8;
+    const uint32_t K = op.k;
+    const bool sixteen_bit = op.ab_type == MmaElem::F16 || op.ab_type == MmaElem::BF16;
+    const bool eight_bit = op.ab_type == MmaElem::S8 || op.ab_type == MmaElem::U8;
+    // Elements each lane holds per register: 2 for 16-bit, 4 for 8-bit, 1 for
+    // tf32. The register counts follow from the shape.
+    const uint32_t per_reg = sixteen_bit ? 2u : (eight_bit ? 4u : 1u);
+    const uint32_t a_regs = (kM * K) / (kWarpSize * per_reg);
+    const uint32_t b_regs = (K * kN) / (kWarpSize * per_reg);
+    if (op.a.size() != a_regs || op.b.size() != b_regs)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, "mma fragment arity does not match the shape");
+
+    std::vector<double> A(kM * K, 0.0), B(K * kN, 0.0), C(kM * kN, 0.0);
+    // A: lane (groupID, tid) holds rows {groupID, groupID+8} at the column
+    // block the register index selects.
+    for (uint32_t reg = 0; reg < a_regs; ++reg) {
+      Lanes _s;
+      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s);
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+        const uint32_t group = lane / 4, tid = lane % 4;
+        const uint32_t row = group + (reg % 2) * 8;
+        const uint32_t col0 = tid * per_reg + (reg / 2) * (per_reg * 4);
+        for (uint32_t e = 0; e < per_reg; ++e)
+          A[row * K + col0 + e] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
+      }
+    }
+    // B is K x N: the lane's group selects the column, the register and tid
+    // select the rows.
+    for (uint32_t reg = 0; reg < b_regs; ++reg) {
+      Lanes _s;
+      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.b[reg]}}, _s);
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+        const uint32_t group = lane / 4, tid = lane % 4;
+        const uint32_t col = group;
+        const uint32_t row0 = tid * per_reg + reg * (per_reg * 4);
+        for (uint32_t e = 0; e < per_reg; ++e)
+          B[(row0 + e) * kN + col] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
+      }
+    }
+    // C/D: four values per lane, two rows by two columns.
+    auto cd_index = [](uint32_t lane, uint32_t slot) {
+      const uint32_t group = lane / 4, tid = lane % 4;
+      const uint32_t row = group + (slot / 2) * 8;
+      const uint32_t col = tid * 2 + (slot % 2);
+      return row * kN + col;
+    };
+    for (uint32_t reg = 0; reg < op.c.size(); ++reg) {
+      Lanes _s;
+      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.c[reg]}}, _s);
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+        if (op.acc_f16) {
+          // Two halves per register.
+          C[cd_index(lane, reg * 2)] = f16_to_double(v[lane] & 0xFFFF);
+          C[cd_index(lane, reg * 2 + 1)] = f16_to_double((v[lane] >> 16) & 0xFFFF);
+        } else if (op.acc_int) {
+          C[cd_index(lane, reg)] = static_cast<double>(static_cast<int32_t>(v[lane]));
+        } else {
+          C[cd_index(lane, reg)] = static_cast<double>(f32(v[lane]));
+        }
+      }
+    }
+    // D = A x B + C. Float shapes accumulate in f32 and integer shapes in s32,
+    // matching the accumulate type the instruction names.
+    std::vector<double> D(kM * kN, 0.0);
+    for (uint32_t i = 0; i < kM; ++i)
+      for (uint32_t j = 0; j < kN; ++j) {
+        if (op.acc_int) {
+          int64_t acc = static_cast<int64_t>(C[i * kN + j]);
+          for (uint32_t k = 0; k < K; ++k)
+            acc += static_cast<int64_t>(A[i * K + k]) * static_cast<int64_t>(B[k * kN + j]);
+          D[i * kN + j] = static_cast<double>(static_cast<int32_t>(acc));
+        } else {
+          float acc = static_cast<float>(C[i * kN + j]);
+          for (uint32_t k = 0; k < K; ++k)
+            acc += static_cast<float>(A[i * K + k]) * static_cast<float>(B[k * kN + j]);
+          D[i * kN + j] = static_cast<double>(acc);
+        }
+      }
+    for (uint32_t reg = 0; reg < op.d.size(); ++reg) {
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          if (op.acc_f16) {
+            const uint64_t lo = double_to_f16(D[cd_index(lane, reg * 2)]);
+            const uint64_t hi = double_to_f16(D[cd_index(lane, reg * 2 + 1)]);
+            r[lane] = ((hi & 0xFFFF) << 16) | (lo & 0xFFFF);
+          } else if (op.acc_int) {
+            r[lane] = static_cast<uint32_t>(static_cast<int32_t>(D[cd_index(lane, reg)]));
+          } else {
+            r[lane] = f32bits(static_cast<float>(D[cd_index(lane, reg)]));
+          }
+        }
+      write_reg(w, op.d[reg], m, r, 32);
+    }
+  }
+
   void exec_wmma_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaMma& op, Mask m) {
     // Gather A and B (16x16 f16 each) and C (16x16 f32) from the warp.
     double A[kMmaDim][kMmaDim] = {}, B[kMmaDim][kMmaDim] = {}, C[kMmaDim][kMmaDim] = {};
@@ -1334,22 +1793,56 @@ class Interpreter {
   static double round_int(double x, Round rnd) {
     switch (rnd) {
       case Round::Rzi: return std::trunc(x);
+      case Round::Rmi: [[fallthrough]];
       case Round::Rm: return std::floor(x);
+      case Round::Rpi: [[fallthrough]];
       case Round::Rp: return std::ceil(x);
       case Round::Rni: [[fallthrough]];
       default: return std::nearbyint(x);  // round-to-nearest-even
     }
   }
 
+  // bfloat16 is the top 16 bits of an f32: same exponent, mantissa truncated to
+  // 7 bits. Converting in rounds to nearest even on the discarded half, which is
+  // what cvt.rn asks for; converting out is exact.
+  static double bf16_to_double(uint64_t in) {
+    const uint32_t bits = static_cast<uint32_t>(in & 0xffffu) << 16;
+    return static_cast<double>(std::bit_cast<float>(bits));
+  }
+  static uint64_t double_to_bf16(double x) {
+    const float f = static_cast<float>(x);
+    const uint32_t bits = std::bit_cast<uint32_t>(f);
+    if (std::isnan(f)) return (bits >> 16) | 0x0040u;  // keep it quiet
+    // Round to nearest, ties to even, on the 16 bits being dropped.
+    const uint32_t lsb = (bits >> 16) & 1u;
+    const uint32_t rounded = bits + 0x7fffu + lsb;
+    return rounded >> 16;
+  }
+
   uint64_t convert(const OpCvt* op, uint64_t in) {
     const Type& s = op->src_ty;
     const Type& d = op->dst_ty;
     // Read the source as a real number (float src) or integer (int src).
-    if (s.is_float()) {
-      double x = s.bits == 16 ? f16_to_double(in)
+    if (s.is_real()) {
+      double x = s.is_bfloat()  ? bf16_to_double(in)
+                 : s.bits == 16 ? f16_to_double(in)
                  : s.bits == 32 ? static_cast<double>(f32(in))
                                 : f64(in);
-      if (d.is_float()) {
+      if (d.is_real()) {
+        // An "i" rounding mode rounds to an integral value and keeps the float
+        // type: cvt.rpi.f32.f32 is ceilf. Skipping it here made ceilf, floorf
+        // and truncf return their argument, and roundf return x + 0.5.
+        switch (op->round) {
+          case Round::Rni:
+          case Round::Rzi:
+          case Round::Rmi:
+          case Round::Rpi:
+            x = round_int(x, op->round);
+            break;
+          default:
+            break;
+        }
+        if (d.is_bfloat()) return double_to_bf16(x);
         if (d.bits == 16) return double_to_f16(x);
         return d.bits == 32 ? f32bits(static_cast<float>(x)) : f64bits(x);
       }
@@ -1373,22 +1866,39 @@ class Interpreter {
       uint64_t sign_bit = 1ull << (s.bits - 1);
       if (sv & sign_bit) sv |= ~((sign_bit << 1) - 1);
     }
-    if (d.is_float()) {
+    if (d.is_real()) {
       double x = s.is_signed() ? static_cast<double>(static_cast<int64_t>(sv))
                                : static_cast<double>(sv);
+      if (d.is_bfloat()) return double_to_bf16(x);
       if (d.bits == 16) return double_to_f16(x);
       return d.bits == 32 ? f32bits(static_cast<float>(x)) : f64bits(x);
     }
     return mask_to_bits(sv, d.bits);  // int -> int: truncate/extend
   }
 
+  // Registers are 32 or 64 bits wide, but an operand type can be narrower. The
+  // bits above the operand's width belong to whatever was in the register
+  // before and must take no part: shr.u16 of a register holding 0xFFFFFFFF has
+  // to shift 0xFFFF, and shr.s16 has to take its sign from bit 15, not bit 31.
+  // Treating every non-64-bit type as 32-bit got both wrong, which is why the
+  // i-quant kernels -- almost entirely 16-bit bit manipulation -- produced
+  // wrong values while the 32-bit paths around them were fine.
+  static uint64_t narrow_u(uint64_t v, uint32_t bits) {
+    return bits >= 64 ? v : (v & ((1ull << bits) - 1));
+  }
+  static int64_t narrow_s(uint64_t v, uint32_t bits) {
+    if (bits >= 64) return static_cast<int64_t>(v);
+    const uint64_t mask = (1ull << bits) - 1;
+    uint64_t m = v & mask;
+    const uint64_t sign = 1ull << (bits - 1);
+    if (m & sign) m |= ~mask;
+    return static_cast<int64_t>(m);
+  }
+
   uint64_t int_bin(IntBinOp op, Type ty, uint64_t a, uint64_t b, const Instr& ins) {
-    bool sixty_four = ty.bits == 64;
     bool sig = ty.is_signed();
-    auto s = [&](uint64_t v) -> int64_t {
-      return sixty_four ? static_cast<int64_t>(v) : int64_t{static_cast<int32_t>(v)};
-    };
-    auto u = [&](uint64_t v) -> uint64_t { return sixty_four ? v : (v & 0xFFFFFFFFull); };
+    auto s = [&](uint64_t v) -> int64_t { return narrow_s(v, ty.bits); };
+    auto u = [&](uint64_t v) -> uint64_t { return narrow_u(v, ty.bits); };
     switch (op) {
       case IntBinOp::Add: return a + b;
       case IntBinOp::Sub: return a - b;
@@ -1502,10 +2012,10 @@ class Interpreter {
       if (ty.bits == 16) return compare_float(cmp, f16_to_double(a), f16_to_double(b));
       return ty.bits == 32 ? compare_float(cmp, f32(a), f32(b)) : compare_float(cmp, f64(a), f64(b));
     }
-    if (ty.is_signed())
-      return ty.bits == 64 ? do_cmp(static_cast<int64_t>(a), static_cast<int64_t>(b))
-                           : do_cmp(static_cast<int32_t>(a), static_cast<int32_t>(b));
-    return ty.bits == 64 ? do_cmp(a, b) : do_cmp(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+    // Same narrowing as the arithmetic: setp.gt.s16 compares 16-bit values, so
+    // the bits above them must not decide the result.
+    if (ty.is_signed()) return do_cmp(narrow_s(a, ty.bits), narrow_s(b, ty.bits));
+    return do_cmp(narrow_u(a, ty.bits), narrow_u(b, ty.bits));
   }
 
   // ---- memory ops ----
@@ -1537,6 +2047,28 @@ class Interpreter {
   void exec_ld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLd& op, Mask m) {
     uint32_t size = op.ty.bytes();
     size_t n = op.dsts.size();
+    if (op.space == Space::Param && op.addr.base_kind == Addr::Base::Reg) {
+      // Address form: the register holds a parameter-window address.
+      Lanes _s_base;
+      const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
+      std::vector<Lanes> results(n);
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          const uint64_t addr =
+              base[lane] + static_cast<uint64_t>(op.addr.offset);
+          for (size_t e = 0; e < n; ++e) {
+            const uint64_t at = addr + e * size;
+            if (at < kParamVaBase || at + size > kParamVaBase + params_.bytes.size())
+              ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                       "ld.param through a register reads outside the parameter buffer");
+            uint64_t v = 0;
+            std::memcpy(&v, params_.bytes.data() + (at - kParamVaBase), size);
+            results[e][lane] = v;
+          }
+        }
+      for (size_t e = 0; e < n; ++e) write_reg(w, op.dsts[e], m, results[e], op.ty.bits);
+      return;
+    }
     if (op.space == Space::Param) {
       auto it = params_.layout.find(op.addr.base);
       if (it == params_.layout.end())
@@ -1569,7 +2101,28 @@ class Interpreter {
         for (size_t e = 0; e < n; ++e)
           results[e][lane] = load_routed(w, ctx, ins, lane, addr + e * size, size);
       }
-    for (size_t e = 0; e < n; ++e) write_reg(w, op.dsts[e], m, results[e], op.ty.bits);
+    // A signed narrow load sign-extends into the destination register: PTX says
+    // ld.s8 delivers the byte's value, not its bit pattern. Masking to the type
+    // width instead turns -1 into 255, and the cvt that follows reads the
+    // positive number -- which is how a quantized weight of -1 became +255 and
+    // corrupted every dequantized tensor while still looking like a plain copy.
+    for (size_t e = 0; e < n; ++e) {
+      const uint32_t dst_bits = op.dsts[e].wide ? 64u : 32u;
+      if (op.ty.is_signed() && op.ty.bits < dst_bits) {
+        Lanes ext = results[e];
+        const uint64_t sign_bit = 1ull << (op.ty.bits - 1);
+        const uint64_t value_mask = (sign_bit << 1) - 1;
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+          if (m & (1u << lane)) {
+            uint64_t v = ext[lane] & value_mask;
+            if (v & sign_bit) v |= ~value_mask;
+            ext[lane] = v;
+          }
+        write_reg(w, op.dsts[e], m, ext, dst_bits);
+      } else {
+        write_reg(w, op.dsts[e], m, results[e], op.ty.bits);
+      }
+    }
   }
 
   void exec_st(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSt& op, Mask m) {
@@ -1622,9 +2175,48 @@ class Interpreter {
         std::unique_lock<std::mutex> guard;
         if (lock_needed)
           guard = std::unique_lock<std::mutex>(atomic_lock_for(addr));
+        ++stats_.atomics;
         uint64_t old = load_routed(w, ctx, ins, lane, addr, size);
         uint64_t b = mask_to_bits(bv[lane], op.ty.bits);
         uint64_t nv = old;
+        if (op.ty.is_float()) {
+          // Reinterpret and operate in the float domain: adding the bit
+          // patterns of two floats produces a number unrelated to their sum.
+          // Min/max follow CUDA and use the fmin/fmax ordering rather than <,
+          // so a NaN operand yields the other value.
+          if (size == 4) {
+            const float x = std::bit_cast<float>(static_cast<uint32_t>(old));
+            const float y = std::bit_cast<float>(static_cast<uint32_t>(b));
+            float res = x;
+            switch (op.op) {
+              case AtomOp::Add: res = x + y; break;
+              case AtomOp::Exch: res = y; break;
+              case AtomOp::Min: res = std::fmin(x, y); break;
+              case AtomOp::Max: res = std::fmax(x, y); break;
+              default:
+                ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                         "this atomic operation has no float form");
+            }
+            nv = std::bit_cast<uint32_t>(res);
+          } else {
+            const double x = std::bit_cast<double>(old);
+            const double y = std::bit_cast<double>(b);
+            double res = x;
+            switch (op.op) {
+              case AtomOp::Add: res = x + y; break;
+              case AtomOp::Exch: res = y; break;
+              case AtomOp::Min: res = std::fmin(x, y); break;
+              case AtomOp::Max: res = std::fmax(x, y); break;
+              default:
+                ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                         "this atomic operation has no float form");
+            }
+            nv = std::bit_cast<uint64_t>(res);
+          }
+          store_routed(w, ctx, ins, lane, addr, size, mask_to_bits(nv, op.ty.bits));
+          r[lane] = old;
+          continue;
+        }
         switch (op.op) {
           case AtomOp::Add: nv = old + b; break;
           case AtomOp::And: nv = old & b; break;
@@ -1882,12 +2474,18 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
                         fn.req_ntid[0], "x", fn.req_ntid[1], "x", fn.req_ntid[2],
                         " threads per block (.reqntid), launch asked for ", cfg.block[0], "x",
                         cfg.block[1], "x", cfg.block[2]);
-    if (fn.max_ntid[i] && cfg.block[i] > fn.max_ntid[i])
-      throw Error::make(Err::LaunchConfig, "kernel '", fn.name,
-                        "' was compiled for at most ", fn.max_ntid[0], "x", fn.max_ntid[1], "x",
-                        fn.max_ntid[2], " threads per block (__launch_bounds__), launch asked for ",
-                        cfg.block[0], "x", cfg.block[1], "x", cfg.block[2]);
   }
+  // .maxntid bounds the *product* of the block dimensions, not each one
+  // separately: __launch_bounds__(128) emits ".maxntid 128, 1, 1", and a launch
+  // of 32x4x1 is 128 threads, which hardware accepts. Comparing dimension by
+  // dimension rejected shapes that are within the bound -- every block whose y
+  // extent was greater than 1, which is most of them.
+  const uint64_t max_ntid_total = uint64_t{fn.max_ntid[0]} * fn.max_ntid[1] * fn.max_ntid[2];
+  const uint64_t block_total = uint64_t{cfg.block[0]} * cfg.block[1] * cfg.block[2];
+  if (max_ntid_total && block_total > max_ntid_total)
+    throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "' was compiled for at most ",
+                      max_ntid_total, " threads per block (__launch_bounds__), launch asked for ",
+                      cfg.block[0], "x", cfg.block[1], "x", cfg.block[2], " = ", block_total);
 
   // Register budget. A block whose threads collectively need more registers
   // than the device provides cannot be launched -- the same
@@ -2014,6 +2612,20 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
     total.blocks += s.blocks;
     total.warps += s.warps;
     total.instructions += s.instructions;
+    total.thread_instructions += s.thread_instructions;
+    total.divergent_branches += s.divergent_branches;
+    total.global_loads += s.global_loads;
+    total.global_stores += s.global_stores;
+    total.shared_loads += s.shared_loads;
+    total.shared_stores += s.shared_stores;
+    total.local_loads += s.local_loads;
+    total.local_stores += s.local_stores;
+    total.global_bytes_read += s.global_bytes_read;
+    total.global_bytes_written += s.global_bytes_written;
+    total.shared_bytes_read += s.shared_bytes_read;
+    total.shared_bytes_written += s.shared_bytes_written;
+    total.atomics += s.atomics;
+    total.barriers += s.barriers;
   }
   return total;
 }

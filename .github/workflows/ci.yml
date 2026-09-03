@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A push that lands while an earlier run is still going supersedes it; there is
+# no value in finishing a build of code nobody will look at again.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # nvcc 12.0 rejects this image's default GCC 13 headers (it fails inside
+  # <bits/floatn.h> on _Float128), so point it at GCC 12. Only the .cu
+  # compilations need this; the shims themselves are ordinary C++.
+  NVCC_PREPEND_FLAGS: -ccbin g++-12
+
+jobs:
+  build-and-test:
+    name: build + unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit
+          nvcc --version | tail -2
+          cmake --version | head -1
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Report which CUDA ABI was detected
+        # The shim's soname major follows the installed toolkit, and getting it
+        # wrong means programs silently load NVIDIA's real library instead of
+        # this one. Print it so a broken detection is visible in the log.
+        run: ls build/shim/
+
+      - name: Unit and end-to-end tests
+        run: ctest --test-dir build --output-on-failure -E pantheon_workloads
+
+  workloads:
+    name: pantheon workloads
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pantheonsim
+
+      # The workloads are the real coverage: unmodified GPU diagnostics, built
+      # by their own Makefile, running end to end against the simulator.
+      - uses: actions/checkout@v4
+        with:
+          repository: pantheongpu/pantheon
+          path: pantheon
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit
+
+      - name: Build VirtualGPU
+        working-directory: pantheonsim
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: Run pantheon workloads
+        working-directory: pantheonsim
+        env:
+          VGPU_PANTHEON_DIR: ${{ github.workspace }}/pantheon
+          VGPU_BUILD_DIR: ${{ github.workspace }}/pantheonsim/build
+        run: ./tests/workloads/run_pantheon_workloads.sh
+
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit
+
+      - name: Build instrumented
+        run: |
+          cmake -S . -B build-san -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build-san -j"$(nproc)"
+
+      - name: Run under sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build-san --output-on-failure -E pantheon_workloads
+
+  threads:
+    name: ThreadSanitizer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit
+
+      - name: Build instrumented
+        run: |
+          cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+          cmake --build build-tsan -j"$(nproc)"
+
+      - name: Run under TSan
+        # TSan cannot map its shadow memory under this kernel's ASLR entropy, so
+        # the run needs randomization off. Without this every test aborts with
+        # "unexpected memory mapping" before it starts.
+        run: setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -E pantheon_workloads

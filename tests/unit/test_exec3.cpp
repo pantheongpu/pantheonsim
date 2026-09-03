@@ -7,6 +7,8 @@
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
+#include <array>
+#include <cmath>
 #include "vtest.hpp"
 
 using namespace vgpu;
@@ -567,3 +569,480 @@ VTEST(atomics_are_atomic_across_blocks) {
 }
 
 VTEST_MAIN
+
+// Float atomics are what reductions, gradient accumulation, and embedding
+// backward passes are built out of, so a simulator without them cannot run ML
+// code. atom.add.f32 must add the values, not their bit patterns.
+VTEST(float_atomic_add_accumulates_across_blocks) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry acc(.param .u64 p)
+{
+  .reg .f32 %f<4>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.f32 %f1, 0f3F000000;          // 0.5
+  atom.global.add.f32 %f2, [%rd2], %f1;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t acc = mem.alloc(4);
+  float zero = 0.0f;
+  mem.write(acc, &zero, 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {128, 1, 1};
+  cfg.block = {32, 1, 1};
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &acc, 8);
+  exec::launch(m.entries[0], cfg, {arg}, mem, prof);
+  float total = 0.0f;
+  mem.read(acc, &total, 4);
+  VCHECK_EQ(total, 128.0f * 32.0f * 0.5f);
+}
+
+VTEST(float_atomic_min_max_follow_fmin_ordering) {
+  // CUDA's float min/max take the non-NaN operand, which is fmin/fmax
+  // ordering rather than a plain comparison.
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry mm(.param .u64 p, .param .f32 v)
+{
+  .reg .f32 %f<4>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  ld.param.f32 %f1, [v];
+  cvta.to.global.u64 %rd2, %rd1;
+  atom.global.min.f32 %f2, [%rd2], %f1;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t cell = mem.alloc(4);
+  float start = 5.0f;
+  mem.write(cell, &start, 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {1, 1, 1};
+  std::vector<uint8_t> pa(8), va(4);
+  std::memcpy(pa.data(), &cell, 8);
+  float smaller = 2.0f;
+  std::memcpy(va.data(), &smaller, 4);
+  exec::launch(m.entries[0], cfg, {pa, va}, mem, prof);
+  float got = 0.0f;
+  mem.read(cell, &got, 4);
+  VCHECK_EQ(got, 2.0f);
+  // A NaN operand leaves the stored value, per fmin.
+  float nan_v = std::nanf("");
+  std::memcpy(va.data(), &nan_v, 4);
+  exec::launch(m.entries[0], cfg, {pa, va}, mem, prof);
+  mem.read(cell, &got, 4);
+  VCHECK_EQ(got, 2.0f);
+}
+
+// mov.pred sets a predicate from a constant or copies another. Predicates are a
+// separate register file, so this cannot go through the value mov path.
+VTEST(mov_pred_from_immediate_and_register) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry mp(.param .u64 p)
+{
+  .reg .b32 %r<4>;
+  .reg .b64 %rd<4>;
+  .reg .pred %p<4>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.pred %p1, 1;
+  mov.pred %p2, %p1;          // copy
+  mov.pred %p3, 0;
+  mov.u32 %r1, 0;
+  @%p2 mov.u32 %r1, 7;        // taken:      r1 = 7
+  @%p3 mov.u32 %r1, 99;       // not taken:  stays 7
+  st.global.u32 [%rd2], %r1;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(4);
+  uint32_t zero = 0;
+  mem.write(out, &zero, 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {1, 1, 1};
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &out, 8);
+  exec::launch(m.entries[0], cfg, {arg}, mem, prof);
+  uint32_t got = 0;
+  mem.read(out, &got, 4);
+  VCHECK_EQ(got, 7u);
+}
+
+// dp4a is the four-way byte dot product quantized inference is built on, so a
+// wrong answer here corrupts every quantized matmul while still producing
+// plausible-looking output. Concrete values, checked by hand.
+VTEST(dp4a_signed_and_unsigned) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry dp(.param .u64 p, .param .u32 av, .param .u32 bv, .param .u32 cv)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  ld.param.u32 %r1, [av];
+  ld.param.u32 %r2, [bv];
+  ld.param.u32 %r3, [cv];
+  cvta.to.global.u64 %rd2, %rd1;
+  dp4a.u32.u32 %r4, %r1, %r2, %r3;
+  st.global.u32 [%rd2], %r4;
+  dp4a.s32.s32 %r5, %r1, %r2, %r3;
+  st.global.u32 [%rd2+4], %r5;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(8);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {1, 1, 1};
+  auto run = [&](uint32_t a, uint32_t b, uint32_t c) {
+    std::vector<uint8_t> pa(8), aa(4), ba(4), ca(4);
+    std::memcpy(pa.data(), &out, 8);
+    std::memcpy(aa.data(), &a, 4);
+    std::memcpy(ba.data(), &b, 4);
+    std::memcpy(ca.data(), &c, 4);
+    exec::launch(m.entries[0], cfg, {pa, aa, ba, ca}, mem, prof);
+    uint32_t got[2] = {0, 0};
+    mem.read(out, got, 8);
+    return std::pair<uint32_t, int32_t>{got[0], static_cast<int32_t>(got[1])};
+  };
+
+  // bytes of a = 4,3,2,1 ; bytes of b = 1,1,1,1 -> 4+3+2+1 = 10
+  auto r1 = run(0x01020304u, 0x01010101u, 0);
+  VCHECK_EQ(r1.first, 10u);
+  VCHECK_EQ(r1.second, 10);
+
+  // a = all 0xFF. Unsigned that is 255 each: 255*4 = 1020.
+  // Signed it is -1 each: -1*4 = -4.
+  auto r2 = run(0xFFFFFFFFu, 0x01010101u, 0);
+  VCHECK_EQ(r2.first, 1020u);
+  VCHECK_EQ(r2.second, -4);
+
+  // The accumulator is added in.
+  auto r3 = run(0x01020304u, 0x01010101u, 7);
+  VCHECK_EQ(r3.first, 17u);
+  VCHECK_EQ(r3.second, 17);
+
+  // Larger products: bytes 2,2,2,2 against 3,3,3,3 -> 4 * 6 = 24
+  auto r4 = run(0x02020202u, 0x03030303u, 0);
+  VCHECK_EQ(r4.first, 24u);
+  mem.free(out);
+}
+
+// A signed narrow load sign-extends into the destination register. Masking to
+// the type width instead turns -1 into 255, and the cvt that follows reads the
+// positive number: that is how a quantized weight of -1 became +255 and
+// corrupted every dequantized tensor while still looking like a plain copy.
+VTEST(signed_narrow_loads_sign_extend) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry ldsext(.param .u64 src, .param .u64 dst)
+{
+  .reg .b16 %rs<4>;
+  .reg .b32 %r<6>;
+  .reg .f32 %f<4>;
+  .reg .b64 %rd<6>;
+  ld.param.u64 %rd1, [src];
+  ld.param.u64 %rd2, [dst];
+  cvta.to.global.u64 %rd3, %rd1;
+  cvta.to.global.u64 %rd4, %rd2;
+  ld.global.s8 %rs1, [%rd3];        // signed byte
+  cvt.rn.f32.s16 %f1, %rs1;         // must see the negative value
+  st.global.f32 [%rd4], %f1;
+  ld.global.s16 %rs2, [%rd3+2];     // signed halfword
+  cvt.s32.s16 %r1, %rs2;
+  st.global.u32 [%rd4+4], %r1;
+  ld.global.u8 %rs3, [%rd3];        // unsigned stays zero-extended
+  cvt.u32.u16 %r2, %rs3;
+  st.global.u32 [%rd4+8], %r2;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t src = mem.alloc(16), dst = mem.alloc(16);
+  // byte 0 = -1 (0xFF); halfword at +2 = -1000
+  uint8_t in[8] = {0xFF, 0x00, 0x00, 0x00, 0, 0, 0, 0};
+  int16_t neg = -1000;
+  std::memcpy(in + 2, &neg, 2);
+  mem.write(src, in, 8);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {1, 1, 1};
+  std::vector<uint8_t> a0(8), a1(8);
+  std::memcpy(a0.data(), &src, 8);
+  std::memcpy(a1.data(), &dst, 8);
+  exec::launch(m.entries[0], cfg, {a0, a1}, mem, prof);
+
+  float as_float = 0.0f;
+  int32_t as_int = 0;
+  uint32_t unsigned_byte = 0;
+  mem.read(dst, &as_float, 4);
+  mem.read(dst + 4, &as_int, 4);
+  mem.read(dst + 8, &unsigned_byte, 4);
+  VCHECK_EQ(as_float, -1.0f);       // not 255.0
+  VCHECK_EQ(as_int, -1000);
+  VCHECK_EQ(unsigned_byte, 255u);   // ld.u8 must NOT sign-extend
+  mem.free(src);
+  mem.free(dst);
+}
+
+// Registers are 32 or 64 bits wide, but an operand type can be narrower. Bits
+// above the operand's width belong to whatever the register held before and
+// must take no part: shr.u16 of 0xFFFFFFFF shifts 0xFFFF, and shr.s16 takes its
+// sign from bit 15. Treating every non-64-bit type as 32-bit got both wrong.
+VTEST(narrow_integer_ops_use_their_own_width) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry nw(.param .u64 p)
+{
+  .reg .b16 %rs<8>;
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<4>;
+  .reg .pred %p<4>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, -1;              // register holds 0xFFFFFFFF
+  cvt.u16.u32 %rs1, %r1;        // as a 16-bit value that is 0xFFFF
+  shr.u16 %rs2, %rs1, 4;        // must be 0x0FFF, not 0xFFFF
+  cvt.u32.u16 %r2, %rs2;
+  st.global.u32 [%rd2], %r2;
+  shr.s16 %rs3, %rs1, 4;        // sign from bit 15: -1 >> 4 = -1
+  cvt.s32.s16 %r3, %rs3;
+  st.global.u32 [%rd2+4], %r3;
+  mov.u32 %r4, 32768;           // 0x8000: negative as s16, positive as s32
+  cvt.u16.u32 %rs4, %r4;
+  setp.lt.s16 %p1, %rs4, 0;
+  selp.b32 %r5, 1, 0, %p1;
+  st.global.u32 [%rd2+8], %r5;  // must be 1
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(16);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {1, 1, 1};
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &out, 8);
+  exec::launch(m.entries[0], cfg, {arg}, mem, prof);
+  uint32_t shr_u = 0, shr_s = 0, is_neg = 0;
+  mem.read(out, &shr_u, 4);
+  mem.read(out + 4, &shr_s, 4);
+  mem.read(out + 8, &is_neg, 4);
+  VCHECK_EQ(shr_u, 0x0FFFu);
+  VCHECK_EQ(static_cast<int32_t>(shr_s), -1);
+  VCHECK_EQ(is_neg, 1u);
+  mem.free(out);
+}
+
+// The "i" rounding modes round to an integral value while keeping the float
+// type: cvt.rpi.f32.f32 is ceilf. Treating them as the bare .rm/.rp float
+// rounding modes made ceilf, floorf and truncf return their argument, and
+// roundf return x + 0.5 -- the rounding step was simply absent.
+VTEST(integral_cvt_rounding_modes_round) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry rnd(.param .u64 p, .param .f32 v)
+{
+  .reg .f32 %f<8>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  ld.param.f32 %f1, [v];
+  cvta.to.global.u64 %rd2, %rd1;
+  cvt.rpi.f32.f32 %f2, %f1;      // ceil
+  st.global.f32 [%rd2], %f2;
+  cvt.rmi.f32.f32 %f3, %f1;      // floor
+  st.global.f32 [%rd2+4], %f3;
+  cvt.rzi.f32.f32 %f4, %f1;      // trunc
+  st.global.f32 [%rd2+8], %f4;
+  cvt.rni.f32.f32 %f5, %f1;      // nearest, ties to even
+  st.global.f32 [%rd2+12], %f5;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(16);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {1, 1, 1};
+  auto run = [&](float v) {
+    std::vector<uint8_t> pa(8), va(4);
+    std::memcpy(pa.data(), &out, 8);
+    std::memcpy(va.data(), &v, 4);
+    exec::launch(m.entries[0], cfg, {pa, va}, mem, prof);
+    float got[4] = {0, 0, 0, 0};
+    mem.read(out, got, 16);
+    return std::array<float, 4>{got[0], got[1], got[2], got[3]};
+  };
+
+  auto a = run(100.75f);
+  VCHECK_EQ(a[0], 101.0f);   // ceil
+  VCHECK_EQ(a[1], 100.0f);   // floor
+  VCHECK_EQ(a[2], 100.0f);   // trunc
+  VCHECK_EQ(a[3], 101.0f);   // nearest
+
+  auto b = run(-100.75f);
+  VCHECK_EQ(b[0], -100.0f);
+  VCHECK_EQ(b[1], -101.0f);
+  VCHECK_EQ(b[2], -100.0f);
+  VCHECK_EQ(b[3], -101.0f);
+
+  // Ties go to even, not away from zero.
+  auto c = run(2.5f);
+  VCHECK_EQ(c[3], 2.0f);
+  auto d = run(3.5f);
+  VCHECK_EQ(d[3], 4.0f);
+  mem.free(out);
+}
+
+// redux.sync reduces a value across the participating lanes of a warp and
+// gives every one of them the result.
+VTEST(redux_sync_reduces_across_the_warp) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry rdx(.param .u64 p)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<6>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  redux.sync.add.u32 %r2, %r1, -1;
+  redux.sync.max.u32 %r3, %r1, -1;
+  redux.sync.min.u32 %r4, %r1, -1;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.s64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r2;
+  setp.eq.u32 %p1, %r1, 0;
+  @%p1 st.global.u32 [%rd2+128], %r3;
+  @%p1 st.global.u32 [%rd2+132], %r4;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(256);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {32, 1, 1};
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &out, 8);
+  exec::launch(m.entries[0], cfg, {arg}, mem, prof);
+  // 0 + 1 + ... + 31 = 496, and every lane must see it.
+  std::vector<uint32_t> sums(32, 0);
+  mem.read(out, sums.data(), 32 * 4);
+  for (uint32_t v : sums) VCHECK_EQ(v, 496u);
+  uint32_t mx = 0, mn = 0;
+  mem.read(out + 128, &mx, 4);
+  mem.read(out + 132, &mn, 4);
+  VCHECK_EQ(mx, 31u);
+  VCHECK_EQ(mn, 0u);
+  mem.free(out);
+}
+
+// bar.red is a barrier that also produces a value: a predicate reduced across
+// every thread in the block. It cannot complete until every warp has arrived,
+// so it contributes, waits, and collects on release.
+VTEST(bar_red_reduces_across_the_block) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry br(.param .u64 p, .param .u32 thresh)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<6>;
+  .reg .pred %p<6>;
+  ld.param.u64 %rd1, [p];
+  ld.param.u32 %r7, [thresh];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  setp.lt.u32 %p1, %r1, %r7;      // true for the first `thresh` threads
+  bar.red.or.pred %p2, 0, %p1;    // any thread in the block?
+  bar.red.and.pred %p3, 0, %p1;   // all threads in the block?
+  selp.b32 %r2, 1, 0, %p2;
+  selp.b32 %r3, 1, 0, %p3;
+  setp.eq.u32 %p4, %r1, 0;
+  @%p4 st.global.u32 [%rd2], %r2;
+  @%p4 st.global.u32 [%rd2+4], %r3;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(16);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {128, 1, 1};  // four warps, so the reduction spans warps
+  auto run = [&](uint32_t thresh) {
+    std::vector<uint8_t> pa(8), ta(4);
+    std::memcpy(pa.data(), &out, 8);
+    std::memcpy(ta.data(), &thresh, 4);
+    exec::launch(m.entries[0], cfg, {pa, ta}, mem, prof);
+    uint32_t any = 0, all = 0;
+    mem.read(out, &any, 4);
+    mem.read(out + 4, &all, 4);
+    return std::pair<uint32_t, uint32_t>{any, all};
+  };
+
+  // Nobody: neither any nor all.
+  auto none = run(0);
+  VCHECK_EQ(none.first, 0u);
+  VCHECK_EQ(none.second, 0u);
+  // One thread, and it is in the first warp: any but not all. This is the case
+  // that only works if warps beyond the first also contribute.
+  auto one = run(1);
+  VCHECK_EQ(one.first, 1u);
+  VCHECK_EQ(one.second, 0u);
+  // A whole warp's worth, still not the whole block.
+  auto warp = run(32);
+  VCHECK_EQ(warp.first, 1u);
+  VCHECK_EQ(warp.second, 0u);
+  // Everyone: both.
+  auto every = run(128);
+  VCHECK_EQ(every.first, 1u);
+  VCHECK_EQ(every.second, 1u);
+  mem.free(out);
+}
