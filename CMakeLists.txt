@@ -433,5 +433,16 @@ if(TARGET vgpunccl)
            COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_nccl_multiproc.sh 4)
   set_tests_properties(e2e_nccl_multiproc PROPERTIES DEPENDS vgpunccl TIMEOUT 300)
   add_test(NAME e2e_nccl_group COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_nccl_group.sh 4)
+
+# Real pantheon workloads, built by their own Makefile and run end to end. The
+# unit tests cover instructions one at a time; this covers an unmodified GPU
+# diagnostic actually working, which is where every serious bug here showed up
+# first. Skips cleanly when no pantheon checkout is present, so a contributor
+# without one still gets a green run.
+add_test(NAME pantheon_workloads
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/workloads/run_pantheon_workloads.sh)
+set_tests_properties(pantheon_workloads PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 1800)
   set_tests_properties(e2e_nccl_group PROPERTIES DEPENDS vgpunccl TIMEOUT 300)
 endif()
