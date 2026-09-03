@@ -846,6 +846,7 @@ class Parser {
     } else if (op0 == "cvt") {
       // cvt[.round][.sat][.ftz].<dstty>.<srcty>
       std::vector<Type> tys;
+      std::string packed;  // "f16x2"/"bf16x2": two f32 sources packed into one register
       Round round = Round::None;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
@@ -858,8 +859,24 @@ class Parser {
         else if (p == "rmi") round = Round::Rmi;
         else if (p == "rpi") round = Round::Rpi;
         else if (p == "sat" || p == "ftz") ;  // saturation/flush handled conservatively below
+        else if (p == "f16x2" || p == "bf16x2") packed = p;
         else if (auto t2 = parse_type_token(p)) tys.push_back(*t2);
         else return unsupported("unrecognized cvt modifier '." + p + "'");
+      }
+      if (!packed.empty()) {
+        // cvt.rn.f16x2.f32 d, a, b -- two f32 converted and packed, a high, b low.
+        if (tys.size() != 1 || tys[0].bits != 32 || !tys[0].is_float())
+          return unsupported("cvt to " + packed + " from a source other than f32");
+        OpCvtF16x2 op;
+        op.bf16 = packed[0] == 'b';
+        op.dst = expect_reg_operand("cvt destination");
+        expect_punct(",");
+        op.a = parse_operand();
+        expect_punct(",");
+        op.b = parse_operand();
+        ins.op = op;
+        expect_punct(";");
+        return ins;
       }
       if (tys.size() != 2) fail(ins.line, "cvt needs .<dsttype>.<srctype>");
       OpCvt op;
@@ -1031,6 +1048,34 @@ class Parser {
       op.dst = expect_reg_operand("destination");
       expect_punct(",");
       op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "redux") {
+      // redux.sync.<op>.<type> d, a, membermask
+      std::optional<ReduxOp> rop;
+      Type ty{};
+      bool have_ty = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "sync") ;
+        else if (p == "add") rop = ReduxOp::Add;
+        else if (p == "min") rop = ReduxOp::Min;
+        else if (p == "max") rop = ReduxOp::Max;
+        else if (p == "and") rop = ReduxOp::And;
+        else if (p == "or") rop = ReduxOp::Or;
+        else if (p == "xor") rop = ReduxOp::Xor;
+        else if (auto t2 = parse_type_token(p)) { ty = *t2; have_ty = true; }
+        else return unsupported("redux modifier '." + p + "'");
+      }
+      if (!rop || !have_ty) return unsupported("redux form");
+      if (ty.is_float()) return unsupported("redux on float types");
+      OpRedux op;
+      op.op = *rop;
+      op.ty = ty;
+      op.dst = expect_reg_operand("redux destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      expect_punct(",");
+      (void)parse_operand();  // membermask; the active mask already carries it
       ins.op = op;
     } else if (op0 == "copysign") {
       auto ty = parse_type_token(parts.back());

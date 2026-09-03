@@ -644,7 +644,13 @@ VGPU_EXPORT cudaError_t cudaMemGetInfo(size_t* free_b, size_t* total_b) {
 VGPU_EXPORT cudaError_t cudaMalloc(void** ptr, size_t size) {
   return guard("cudaMalloc", [&](State& s) {
     if (!ptr) return cudaErrorInvalidValue;
-    *ptr = reinterpret_cast<void*>(current(s).memory().alloc(size));
+    // A zero-byte allocation succeeds on hardware and yields a distinct pointer
+    // that can be freed. ggml asks for one and treats a failure as fatal, so
+    // rejecting it stopped whole operations that were doing nothing wrong.
+    // Back it with a single byte: that gives an address no other allocation
+    // shares, which is what makes the pointer usable as an identity and
+    // free-able.
+    *ptr = reinterpret_cast<void*>(current(s).memory().alloc(size ? size : 1));
     return cudaSuccess;
   });
 }

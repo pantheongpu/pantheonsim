@@ -932,3 +932,51 @@ VTEST(integral_cvt_rounding_modes_round) {
   VCHECK_EQ(d[3], 4.0f);
   mem.free(out);
 }
+
+// redux.sync reduces a value across the participating lanes of a warp and
+// gives every one of them the result.
+VTEST(redux_sync_reduces_across_the_warp) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry rdx(.param .u64 p)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<6>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  redux.sync.add.u32 %r2, %r1, -1;
+  redux.sync.max.u32 %r3, %r1, -1;
+  redux.sync.min.u32 %r4, %r1, -1;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.s64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r2;
+  setp.eq.u32 %p1, %r1, 0;
+  @%p1 st.global.u32 [%rd2+128], %r3;
+  @%p1 st.global.u32 [%rd2+132], %r4;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(256);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {32, 1, 1};
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &out, 8);
+  exec::launch(m.entries[0], cfg, {arg}, mem, prof);
+  // 0 + 1 + ... + 31 = 496, and every lane must see it.
+  std::vector<uint32_t> sums(32, 0);
+  mem.read(out, sums.data(), 32 * 4);
+  for (uint32_t v : sums) VCHECK_EQ(v, 496u);
+  uint32_t mx = 0, mn = 0;
+  mem.read(out + 128, &mx, 4);
+  mem.read(out + 132, &mn, 4);
+  VCHECK_EQ(mx, 31u);
+  VCHECK_EQ(mn, 0u);
+  mem.free(out);
+}

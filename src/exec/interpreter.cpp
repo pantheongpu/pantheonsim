@@ -943,6 +943,61 @@ class Interpreter {
       }
       return;
     }
+    if (const auto* op = std::get_if<OpRedux>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->src, _s_a);
+      // Every participating lane contributes and every one receives the result.
+      // The active mask is the membership: a lane not executing this
+      // instruction is not in the warp's reduction.
+      bool first = true;
+      uint64_t acc = 0;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+        if (!(m & (1u << lane))) continue;
+        const uint64_t v = a[lane];
+        if (first) { acc = v; first = false; continue; }
+        switch (op->op) {
+          case ReduxOp::Add: acc = acc + v; break;
+          case ReduxOp::And: acc = acc & v; break;
+          case ReduxOp::Or: acc = acc | v; break;
+          case ReduxOp::Xor: acc = acc ^ v; break;
+          case ReduxOp::Min:
+            acc = op->ty.is_signed()
+                      ? static_cast<uint64_t>(std::min(narrow_s(acc, op->ty.bits),
+                                                       narrow_s(v, op->ty.bits)))
+                      : std::min(narrow_u(acc, op->ty.bits), narrow_u(v, op->ty.bits));
+            break;
+          case ReduxOp::Max:
+            acc = op->ty.is_signed()
+                      ? static_cast<uint64_t>(std::max(narrow_s(acc, op->ty.bits),
+                                                       narrow_s(v, op->ty.bits)))
+                      : std::max(narrow_u(acc, op->ty.bits), narrow_u(v, op->ty.bits));
+            break;
+        }
+      }
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) r[lane] = acc;
+      write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpCvtF16x2>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          // The first source goes in the high half, the second in the low.
+          const double x = static_cast<double>(f32(a[lane]));
+          const double y = static_cast<double>(f32(b[lane]));
+          const uint64_t hi = op->bf16 ? double_to_bf16(x) : double_to_f16(x);
+          const uint64_t lo = op->bf16 ? double_to_bf16(y) : double_to_f16(y);
+          r[lane] = ((hi & 0xffffull) << 16) | (lo & 0xffffull);
+        }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
     if (const auto* op = std::get_if<OpCopysign>(&ins.op)) {
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
