@@ -5,7 +5,7 @@
 # worth its own test at a rank count the differential run cannot reach.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-shim="$root/build/shim"
+shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 ranks="${1:-4}"
 out="${TMPDIR:-/tmp}/vgpu-nccl-group.$$"
 

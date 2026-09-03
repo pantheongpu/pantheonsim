@@ -29,12 +29,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <vector>
 
 #include "vgpu/error.hpp"
 #include "vgpu/memory.hpp"
+#include "vgpu/runtime/capture.hpp"
 
 // Operands are read from and written to the same virtual device memory the
 // kernels see, through the runtime shim's own copy path (declared by the CUDA
@@ -88,6 +91,73 @@ T scalar(cublasHandle_t h, const T* p) {
   Handle* hh = reinterpret_cast<Handle*>(h);
   if (hh && hh->pointer_mode == CUBLAS_POINTER_MODE_DEVICE) return fetch<T>(p, 1)[0];
   return *p;
+}
+
+// ---- CUDA graph capture ----
+//
+// On hardware a cuBLAS call inside a captured region is recorded, not run: it
+// executes when the graph is launched, over whatever the graph's kernels have
+// by then produced. Computing on the host at call time would instead read
+// operands that do not exist yet -- llama.cpp fills its batched-GEMM pointer
+// arrays with a kernel immediately before the GEMM, so an eager read gets
+// uninitialized pool memory and dereferences it as device pointers.
+//
+// Deferring the whole call as a closure gets both halves right: nothing is read
+// during capture, and the work is there on every replay.
+
+// alpha and beta are consumed when the call is made, not when it runs, so a
+// host-mode scalar has to be copied -- the caller's variable is typically a
+// local that is long gone by the time a graph replays. A device-mode scalar is
+// left alone, since that memory is still there and is meant to be read late.
+struct HeldScalar {
+  std::shared_ptr<std::vector<uint8_t>> owned;
+  const void* dev = nullptr;
+  const void* get() const { return owned ? static_cast<const void*>(owned->data()) : dev; }
+};
+
+inline HeldScalar hold(cublasHandle_t h, const void* p, size_t bytes) {
+  HeldScalar s;
+  Handle* hh = reinterpret_cast<Handle*>(h);
+  if (!p || bytes == 0 || (hh && hh->pointer_mode == CUBLAS_POINTER_MODE_DEVICE)) {
+    s.dev = p;
+    return s;
+  }
+  const auto* b = static_cast<const uint8_t*>(p);
+  s.owned = std::make_shared<std::vector<uint8_t>>(b, b + bytes);
+  return s;
+}
+
+// GemmEx types alpha and beta by the compute type rather than by the operand
+// types, so a snapshot has to know how many bytes to keep.
+inline size_t compute_scalar_bytes(cublasComputeType_t ct) {
+  switch (ct) {
+    case CUBLAS_COMPUTE_16F:
+    case CUBLAS_COMPUTE_16F_PEDANTIC: return sizeof(__half);
+    case CUBLAS_COMPUTE_64F:
+    case CUBLAS_COMPUTE_64F_PEDANTIC: return sizeof(double);
+    default: return sizeof(float);  // the 32F and 32I families are both 4 bytes
+  }
+}
+
+// Hands the call to the graph when the handle's stream is capturing. Returns
+// true if it was recorded, in which case the caller must return success now
+// without touching device memory.
+template <class Fn>
+bool deferred_to_graph(cublasHandle_t h, Fn&& fn) {
+  Handle* hh = reinterpret_cast<Handle*>(h);
+  if (!hh) return false;
+  return vgpu_record_host_op_if_capturing(hh->stream, std::function<void()>(std::forward<Fn>(fn)));
+}
+
+// A reduction that writes its answer through a host pointer cannot be recorded:
+// the graph runs later, and by then that pointer means nothing. Real cuBLAS
+// rejects this too, so saying so is the honest answer rather than a guess.
+inline bool host_result_under_capture(cublasHandle_t h) {
+  Handle* hh = reinterpret_cast<Handle*>(h);
+  if (!hh || hh->pointer_mode != CUBLAS_POINTER_MODE_HOST) return false;
+  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(hh->stream, &st) != cudaSuccess) return false;
+  return st == cudaStreamCaptureStatusActive;
 }
 
 // Column-major element access with a leading dimension.
@@ -321,6 +391,12 @@ VGPU_EXPORT cublasStatus_t cublasSgemm_v2(cublasHandle_t h, cublasOperation_t ta
                                           const float* alpha, const float* A, int lda,
                                           const float* B, int ldb, const float* beta, float* C,
                                           int ldc) {
+  if (deferred_to_graph(h, [=, a = hold(h, alpha, sizeof(float)),
+                            b = hold(h, beta, sizeof(float))] {
+        cublasSgemm_v2(h, ta, tb, m, n, k, static_cast<const float*>(a.get()), A, lda, B, ldb,
+                       static_cast<const float*>(b.get()), C, ldc);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
   return do_gemm<float, float>(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 
@@ -329,6 +405,12 @@ VGPU_EXPORT cublasStatus_t cublasDgemm_v2(cublasHandle_t h, cublasOperation_t ta
                                           const double* alpha, const double* A, int lda,
                                           const double* B, int ldb, const double* beta, double* C,
                                           int ldc) {
+  if (deferred_to_graph(h, [=, a = hold(h, alpha, sizeof(double)),
+                            b = hold(h, beta, sizeof(double))] {
+        cublasDgemm_v2(h, ta, tb, m, n, k, static_cast<const double*>(a.get()), A, lda, B, ldb,
+                       static_cast<const double*>(b.get()), C, ldc);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
   return do_gemm<double, double>(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 
@@ -357,6 +439,13 @@ VGPU_EXPORT cublasStatus_t cublasSgemmBatched(cublasHandle_t h, cublasOperation_
   if (batchCount < 0) return CUBLAS_STATUS_INVALID_VALUE;
   if (batchCount == 0) return CUBLAS_STATUS_SUCCESS;
   if (!Aarray || !Barray || !Carray) return CUBLAS_STATUS_INVALID_VALUE;
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(float)),
+                            be = hold(h, beta, sizeof(float))] {
+        cublasSgemmBatched(h, ta, tb, m, n, k, static_cast<const float*>(al.get()), Aarray, lda,
+                           Barray, ldb, static_cast<const float*>(be.get()), Carray, ldc,
+                           batchCount);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
   // The three arrays are themselves in device memory; pull the pointers back
   // before dereferencing them.
   const auto a = fetch<const float*>(Aarray, static_cast<size_t>(batchCount));
@@ -385,6 +474,12 @@ VGPU_EXPORT cublasStatus_t cublasSgemv_v2(cublasHandle_t h, cublasOperation_t tr
                                           int incy) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (m < 0 || n < 0 || lda < 1 || incx == 0 || incy == 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(float)),
+                            be = hold(h, beta, sizeof(float))] {
+        cublasSgemv_v2(h, trans, m, n, static_cast<const float*>(al.get()), A, lda, x, incx,
+                       static_cast<const float*>(be.get()), y, incy);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
   float a = scalar(h, alpha), b = scalar(h, beta);
   const int xlen = trans == CUBLAS_OP_N ? n : m;
   const int ylen = trans == CUBLAS_OP_N ? m : n;
@@ -407,6 +502,10 @@ VGPU_EXPORT cublasStatus_t cublasSaxpy_v2(cublasHandle_t h, int n, const float* 
                                           const float* x, int incx, float* y, int incy) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (n <= 0) return CUBLAS_STATUS_SUCCESS;
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(float))] {
+        cublasSaxpy_v2(h, n, static_cast<const float*>(al.get()), x, incx, y, incy);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
   float a = scalar(h, alpha);
   auto hx = fetch<float>(x, static_cast<size_t>(std::abs(incx)) * (n - 1) + 1);
   auto hy = fetch<float>(y, static_cast<size_t>(std::abs(incy)) * (n - 1) + 1);
@@ -419,6 +518,10 @@ VGPU_EXPORT cublasStatus_t cublasSscal_v2(cublasHandle_t h, int n, const float* 
                                           int incx) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (n <= 0) return CUBLAS_STATUS_SUCCESS;
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(float))] {
+        cublasSscal_v2(h, n, static_cast<const float*>(al.get()), x, incx);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
   float a = scalar(h, alpha);
   auto hx = fetch<float>(x, static_cast<size_t>(std::abs(incx)) * (n - 1) + 1);
   for (int i = 0; i < n; ++i) hx[i * incx] *= a;
@@ -430,6 +533,9 @@ VGPU_EXPORT cublasStatus_t cublasSdot_v2(cublasHandle_t h, int n, const float* x
                                          const float* y, int incy, float* result) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!result) return CUBLAS_STATUS_INVALID_VALUE;
+  if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (deferred_to_graph(h, [=] { cublasSdot_v2(h, n, x, incx, y, incy, result); }))
+    return CUBLAS_STATUS_SUCCESS;
   double acc = 0.0;
   if (n > 0) {
     auto hx = fetch<float>(x, static_cast<size_t>(std::abs(incx)) * (n - 1) + 1);
@@ -448,6 +554,9 @@ VGPU_EXPORT cublasStatus_t cublasSnrm2_v2(cublasHandle_t h, int n, const float* 
                                           float* result) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!result) return CUBLAS_STATUS_INVALID_VALUE;
+  if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (deferred_to_graph(h, [=] { cublasSnrm2_v2(h, n, x, incx, result); }))
+    return CUBLAS_STATUS_SUCCESS;
   double acc = 0.0;
   if (n > 0) {
     auto hx = fetch<float>(x, static_cast<size_t>(std::abs(incx)) * (n - 1) + 1);
@@ -471,7 +580,13 @@ VGPU_EXPORT cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta,
                                         const void* alpha, const void* A, cudaDataType Atype,
                                         int lda, const void* B, cudaDataType Btype, int ldb,
                                         const void* beta, void* C, cudaDataType Ctype, int ldc,
-                                        cublasComputeType_t computeType, cublasGemmAlgo_t) {
+                                        cublasComputeType_t computeType, cublasGemmAlgo_t algo) {
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, compute_scalar_bytes(computeType)),
+                            be = hold(h, beta, compute_scalar_bytes(computeType))] {
+        cublasGemmEx(h, ta, tb, m, n, k, al.get(), A, Atype, lda, B, Btype, ldb, be.get(), C,
+                     Ctype, ldc, computeType, algo);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
   // Only the all-fp32 and all-fp64 forms are implemented; mixed precision
   // needs the f16/bf16 conversion paths and is not silently approximated.
   if (Atype == CUDA_R_32F && Btype == CUDA_R_32F && Ctype == CUDA_R_32F)
@@ -572,6 +687,12 @@ VGPU_EXPORT cublasStatus_t cublasGemmBatchedEx(
   if (batchCount < 0) return CUBLAS_STATUS_INVALID_VALUE;
   if (batchCount == 0) return CUBLAS_STATUS_SUCCESS;
   if (!Aarray || !Barray || !Carray) return CUBLAS_STATUS_INVALID_VALUE;
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, compute_scalar_bytes(computeType)),
+                            be = hold(h, beta, compute_scalar_bytes(computeType))] {
+        cublasGemmBatchedEx(h, ta, tb, m, n, k, al.get(), Aarray, Atype, lda, Barray, Btype, ldb,
+                            be.get(), Carray, Ctype, ldc, batchCount, computeType, algo);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
   const auto a = fetch<const void*>(Aarray, static_cast<size_t>(batchCount));
   const auto b = fetch<const void*>(Barray, static_cast<size_t>(batchCount));
   const auto c = fetch<void*>(Carray, static_cast<size_t>(batchCount));

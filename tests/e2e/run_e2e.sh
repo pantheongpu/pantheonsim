@@ -3,7 +3,8 @@
 # run it against VirtualGPU's libcudart. Skips cleanly if nvcc is unavailable.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-shim="$root/build/shim"
+. "$root/tests/shim_guard.sh"
+shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 src="$root/tests/e2e/vector_add.cu"
 out="${TMPDIR:-/tmp}/vgpu_e2e_vecadd_$$"
 if ! command -v nvcc >/dev/null 2>&1; then
@@ -20,6 +21,7 @@ if (( ${#cudart_libs[@]} == 0 )); then
   echo "SKIP: libvgpucudart not built (CUDA ABI headers absent at build time)"; exit 0
 fi
 nvcc -std=c++14 -cudart shared --gpu-architecture=sm_86 -Wno-deprecated-gpu-targets "$src" -o "$out"
+if ! require_shim_libs "$shim" "$out"; then rm -f "$out"; exit 0; fi
 result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/h100 LD_LIBRARY_PATH="$shim" "$out")"
 rm -f "$out"
 echo "vectorAdd via libvgpucudart: $result"

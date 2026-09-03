@@ -6,7 +6,7 @@
 #   tests/e2e/run_nccl_multiproc.sh [nranks]     (default 4)
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-shim="$root/build/shim"
+shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 nranks="${1:-4}"
 out="${TMPDIR:-/tmp}/vgpu-nccl-mp.$$"
 

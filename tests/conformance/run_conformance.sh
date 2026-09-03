@@ -9,7 +9,7 @@
 # virtual side uses -cudart shared so the shim can be substituted.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-shim="$root/build/shim"
+shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 out="${TMPDIR:-/tmp}/vgpu-conformance"
 mkdir -p "$out"
 : "${VGPU_CONF_GPU:=nvidia/a10}"   # sm_86 profile matches the sm_86 build

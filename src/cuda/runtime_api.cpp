@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <dlfcn.h>
 #include <map>
 #include <mutex>
@@ -339,6 +340,7 @@ bool vgpu_record_memset_if_capturing(void* dst, int value, size_t bytes, cudaStr
 bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, void** args,
                                      size_t sharedMem, cudaStream_t stream,
                                      const std::vector<uint32_t>& param_sizes);
+bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()> op);
 
 VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args,
                                          size_t sharedMem, cudaStream_t stream) {
@@ -985,7 +987,7 @@ VGPU_EXPORT cudaError_t cudaLaunchCooperativeKernel(const void*, dim3, dim3, voi
 // Managed memory is one allocation the CPU and GPU both address. Device memory
 // here lives in a separate virtual window that host code cannot dereference, so
 // handing back a device pointer would fault the moment the host touched it.
-VGPU_EXPORT cudaError_t cudaMallocManaged(void** ptr, size_t size, unsigned int) {
+VGPU_EXPORT cudaError_t cudaMallocManaged(void** ptr, size_t, unsigned int) {
   if (!ptr) return cudaErrorInvalidValue;
   return cudaErrorNotSupported;
 }
@@ -1130,7 +1132,7 @@ namespace {
 // framework captures copies and fills alongside them, and replaying with those
 // missing produces confidently wrong results rather than an error.
 struct RecordedLaunch {
-  enum class Kind { Kernel, Memcpy, Memset } kind = Kind::Kernel;
+  enum class Kind { Kernel, Memcpy, Memset, Host } kind = Kind::Kernel;
   // Kernel
   const void* func = nullptr;
   dim3 grid, block;
@@ -1145,14 +1147,19 @@ struct RecordedLaunch {
   size_t bytes = 0;
   cudaMemcpyKind copy_kind = cudaMemcpyDefault;
   int fill_value = 0;
+  // Host: a vendor-library call that computes on the CPU. It is replayed by
+  // re-running the closure, which re-reads device memory then -- so it sees
+  // what the graph's kernels produced, exactly as the real library would.
+  std::function<void()> host_op;
 };
 
 struct GraphRec {
   std::vector<RecordedLaunch> launches;
   // Set when something happened during capture that this implementation cannot
-  // record. Only kernel launches are captured; a copy or a fill inside the
-  // region runs immediately and would be missing from every replay, so the
-  // capture is no longer a faithful record of the work and must not be used.
+  // record. Kernel launches, copies, fills and host-computed library calls are
+  // all captured; anything else would run immediately and be missing from every
+  // replay, so the capture is no longer a faithful record of the work and must
+  // not be used.
   bool invalidated = false;
   const char* invalidated_by = nullptr;
 };
@@ -1197,6 +1204,19 @@ bool vgpu_record_memset_if_capturing(void* dst, int value, size_t bytes, cudaStr
   r.dst = dst;
   r.fill_value = value;
   r.bytes = bytes;
+  g->launches.push_back(std::move(r));
+  return true;
+}
+
+// Records a host-computed library call during capture. Returns true when it was
+// recorded, in which case the caller must not do the work now.
+bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()> op) {
+  GraphRec* g = capture_target(stream);
+  if (!g) return false;
+  RecordedLaunch r;
+  r.kind = RecordedLaunch::Kind::Host;
+  r.host_op = std::move(op);
+  std::lock_guard<std::mutex> lock(g_graph_mu);
   g->launches.push_back(std::move(r));
   return true;
 }
@@ -1301,6 +1321,8 @@ VGPU_EXPORT cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t strea
       rc = cudaMemcpy(rl.dst, rl.src, rl.bytes, rl.copy_kind);
     } else if (rl.kind == RecordedLaunch::Kind::Memset) {
       rc = cudaMemset(rl.dst, rl.fill_value, rl.bytes);
+    } else if (rl.kind == RecordedLaunch::Kind::Host) {
+      rl.host_op();
     } else {
       std::vector<void*> ptrs(rl.arg_bytes.size());
       for (size_t i = 0; i < rl.arg_bytes.size(); ++i) ptrs[i] = rl.arg_bytes[i].data();
