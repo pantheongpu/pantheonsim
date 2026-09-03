@@ -1049,6 +1049,73 @@ class Parser {
       expect_punct(",");
       op.src = parse_operand();
       ins.op = op;
+    } else if (op0 == "ldmatrix") {
+      uint32_t count = 0;
+      bool trans = false, shape_ok = false, b16 = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "sync" || p == "aligned") ;
+        else if (p == "m8n8") shape_ok = true;
+        else if (p == "x1") count = 1;
+        else if (p == "x2") count = 2;
+        else if (p == "x4") count = 4;
+        else if (p == "trans") trans = true;
+        else if (p == "b16") b16 = true;
+        else if (p == "shared" || p == "cta") ;
+        else return unsupported("ldmatrix modifier '." + p + "'");
+      }
+      if (!shape_ok || !count || !b16)
+        return unsupported("only ldmatrix.m8n8.x{1,2,4}.b16 is implemented");
+      OpLdMatrix op;
+      op.count = count;
+      op.trans = trans;
+      op.dsts = parse_reg_vector_any();
+      if (op.dsts.size() != count) return unsupported("ldmatrix destination arity");
+      expect_punct(",");
+      op.addr = parse_addr(fn);
+      ins.op = op;
+    } else if (op0 == "mma") {
+      // mma.sync.aligned.m16n8kK.row.col.<d>.<a>.<b>.<c>
+      uint32_t k = 0;
+      std::vector<std::string> types;
+      bool row_col = false, saw_row = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "sync" || p == "aligned") ;
+        else if (p == "row") saw_row = true;
+        else if (p == "col") { if (saw_row) row_col = true; }
+        else if (p == "m16n8k8") k = 8;
+        else if (p == "m16n8k16") k = 16;
+        else if (p == "m16n8k32") k = 32;
+        else if (p == "f32" || p == "f16" || p == "bf16" || p == "tf32" || p == "s32" ||
+                 p == "s8" || p == "u8")
+          types.push_back(p);
+        else return unsupported("mma modifier '." + p + "' (shape or type not implemented)");
+      }
+      if (!k) return unsupported("only the m16n8k{8,16,32} mma shapes are implemented");
+      if (!row_col) return unsupported("only mma .row.col is implemented");
+      if (types.size() != 4) return unsupported("mma needs .<dtype>.<atype>.<btype>.<ctype>");
+      OpMma op;
+      op.k = k;
+      const std::string& at = types[1];
+      if (at == "f16") op.ab_type = MmaElem::F16;
+      else if (at == "bf16") op.ab_type = MmaElem::BF16;
+      else if (at == "tf32") op.ab_type = MmaElem::TF32;
+      else if (at == "s8") { op.ab_type = MmaElem::S8; op.ab_signed = true; }
+      else if (at == "u8") { op.ab_type = MmaElem::U8; op.ab_signed = false; }
+      else return unsupported("mma operand type '." + at + "'");
+      if (types[1] != types[2]) return unsupported("mma with mixed A and B types");
+      op.acc_f16 = types[0] == "f16";
+      op.acc_int = types[0] == "s32";
+      op.d = parse_reg_vector_any();
+      expect_punct(",");
+      op.a = parse_reg_vector_any();
+      expect_punct(",");
+      op.b = parse_reg_vector_any();
+      expect_punct(",");
+      op.c = parse_reg_vector_any();
+      if (op.d.size() != op.c.size()) return unsupported("mma D and C arity differ");
+      ins.op = op;
     } else if (op0 == "redux") {
       // redux.sync.<op>.<type> d, a, membermask
       std::optional<ReduxOp> rop;

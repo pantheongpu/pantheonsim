@@ -184,4 +184,3 @@ VGPU_EXPORT int cublasZtrmv_v2() { vgpu_report_unimplemented("cublasZtrmv_v2"); 
 VGPU_EXPORT int cublasZtrsmBatched() { vgpu_report_unimplemented("cublasZtrsmBatched"); return 15; }
 VGPU_EXPORT int cublasZtrsm_v2() { vgpu_report_unimplemented("cublasZtrsm_v2"); return 15; }
 VGPU_EXPORT int cublasZtrsv_v2() { vgpu_report_unimplemented("cublasZtrsv_v2"); return 15; }
-VGPU_EXPORT int cublasGemmBatchedEx() { vgpu_report_unimplemented("cublasGemmBatchedEx"); return 15; }

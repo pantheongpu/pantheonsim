@@ -147,6 +147,26 @@ struct OpRedux { ReduxOp op; Type ty; Reg dst; Operand src; };
 // cvt.rn.f16x2.f32 d, a, b -- convert two f32 and pack them into one register,
 // a in the high half and b in the low half.
 struct OpCvtF16x2 { Reg dst; Operand a, b; bool bf16 = false; };
+
+// ldmatrix.sync.aligned.m8n8.xN[.trans].b16 {d...}, [addr]
+// Loads N 8x8 matrices of 16-bit elements from shared memory. Row r of matrix i
+// is at the address supplied by lane i*8+r, and each lane comes away with two
+// consecutive elements of one row -- the layout an mma fragment expects.
+struct OpLdMatrix { uint32_t count = 1; bool trans = false; std::vector<Reg> dsts; Addr addr; };
+
+// mma.sync.aligned.m16n8kK.row.col.<dtype>.<atype>.<btype>.<ctype>
+// The warp-wide tensor-core multiply-accumulate. Distinct from wmma, which is
+// the older whole-fragment API: this one names the exact shape and the
+// registers each lane holds.
+enum class MmaElem { F16, BF16, TF32, S8, U8 };
+struct OpMma {
+  uint32_t k = 16;          // m and n are fixed at 16 and 8 for every shape here
+  MmaElem ab_type = MmaElem::F16;
+  bool ab_signed = true;    // for the integer types
+  bool acc_f16 = false;     // accumulate in f16x2 registers rather than f32
+  bool acc_int = false;     // s32 accumulate
+  std::vector<Reg> d, a, b, c;
+};
 // mov.pred d, {0|1|%p} -- set a predicate from an immediate or copy another.
 // Predicates live in their own register file, so this cannot go through the
 // ordinary mov path that writes a 32/64-bit value.
@@ -219,7 +239,7 @@ struct OpLdSlot { std::string slot; int64_t offset; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpMovPred, OpRedux, OpCvtF16x2, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall>;
 

@@ -943,6 +943,14 @@ class Interpreter {
       }
       return;
     }
+    if (const auto* op = std::get_if<OpLdMatrix>(&ins.op)) {
+      exec_ldmatrix(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpMma>(&ins.op)) {
+      exec_mma(w, ctx, ins, *op, m);
+      return;
+    }
     if (const auto* op = std::get_if<OpRedux>(&ins.op)) {
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->src, _s_a);
@@ -1481,6 +1489,163 @@ class Interpreter {
   //              holds linear element L * 8 + r (row-major 16x16).
   // A ".col" layout transposes the matrix on the way in/out.
   static constexpr uint32_t kMmaDim = 16;
+
+  // ldmatrix: row r of matrix i comes from the address supplied by lane i*8+r,
+  // and every lane leaves with two consecutive 16-bit elements of one row. The
+  // distribution is the layout an mma A/B fragment expects, which is the whole
+  // point of the instruction.
+  void exec_ldmatrix(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLdMatrix& op, Mask m) {
+    Lanes _s_base;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
+    // The register already holds an address in the shared window -- it comes
+    // from cvta, which has done the space conversion. Adding the window base
+    // again lands at twice it, which is what the bounds check reported.
+    for (uint32_t mat = 0; mat < op.count; ++mat) {
+      // Pull the 8x8 matrix in, a row at a time.
+      uint16_t tile[8][8] = {};
+      for (uint32_t r = 0; r < 8; ++r) {
+        const uint32_t src_lane = mat * 8 + r;
+        if (!(m & (1u << src_lane)))
+          ctx_fail(ins, static_cast<int>(src_lane), Err::UnsupportedPtx,
+                   "ldmatrix needs every lane that supplies a row address to be active");
+        const uint64_t addr = base[src_lane] + static_cast<uint64_t>(op.addr.offset);
+        for (uint32_t c = 0; c < 8; ++c)
+          tile[r][c] = static_cast<uint16_t>(
+              load_routed(w, ctx, ins, src_lane, addr + c * 2, 2));
+      }
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          const uint32_t row = lane / 4, colpair = lane % 4;
+          uint16_t lo, hi;
+          if (op.trans) {
+            lo = tile[colpair * 2][row];
+            hi = tile[colpair * 2 + 1][row];
+          } else {
+            lo = tile[row][colpair * 2];
+            hi = tile[row][colpair * 2 + 1];
+          }
+          r[lane] = (static_cast<uint64_t>(hi) << 16) | lo;
+        }
+      write_reg(w, op.dsts[mat], m, r, 32);
+    }
+  }
+
+  // Decodes one element of an mma A/B fragment from a lane's register.
+  double mma_elem(MmaElem t, bool is_signed, uint64_t reg, uint32_t slot) {
+    switch (t) {
+      case MmaElem::F16: return f16_to_double((reg >> (16 * slot)) & 0xFFFF);
+      case MmaElem::BF16: return bf16_to_double((reg >> (16 * slot)) & 0xFFFF);
+      case MmaElem::TF32:
+        // tf32 occupies a full 32-bit register; its reduced mantissa is a
+        // hardware precision detail, and computing exactly stays inside it.
+        return static_cast<double>(f32(reg));
+      case MmaElem::S8:
+      case MmaElem::U8: {
+        const uint8_t byte = static_cast<uint8_t>(reg >> (8 * slot));
+        return is_signed ? static_cast<double>(static_cast<int8_t>(byte))
+                         : static_cast<double>(byte);
+      }
+    }
+    return 0.0;
+  }
+
+  void exec_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMma& op, Mask m) {
+    constexpr uint32_t kM = 16, kN = 8;
+    const uint32_t K = op.k;
+    const bool sixteen_bit = op.ab_type == MmaElem::F16 || op.ab_type == MmaElem::BF16;
+    const bool eight_bit = op.ab_type == MmaElem::S8 || op.ab_type == MmaElem::U8;
+    // Elements each lane holds per register: 2 for 16-bit, 4 for 8-bit, 1 for
+    // tf32. The register counts follow from the shape.
+    const uint32_t per_reg = sixteen_bit ? 2u : (eight_bit ? 4u : 1u);
+    const uint32_t a_regs = (kM * K) / (kWarpSize * per_reg);
+    const uint32_t b_regs = (K * kN) / (kWarpSize * per_reg);
+    if (op.a.size() != a_regs || op.b.size() != b_regs)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, "mma fragment arity does not match the shape");
+
+    std::vector<double> A(kM * K, 0.0), B(K * kN, 0.0), C(kM * kN, 0.0);
+    // A: lane (groupID, tid) holds rows {groupID, groupID+8} at the column
+    // block the register index selects.
+    for (uint32_t reg = 0; reg < a_regs; ++reg) {
+      Lanes _s;
+      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s);
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+        const uint32_t group = lane / 4, tid = lane % 4;
+        const uint32_t row = group + (reg % 2) * 8;
+        const uint32_t col0 = tid * per_reg + (reg / 2) * (per_reg * 4);
+        for (uint32_t e = 0; e < per_reg; ++e)
+          A[row * K + col0 + e] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
+      }
+    }
+    // B is K x N: the lane's group selects the column, the register and tid
+    // select the rows.
+    for (uint32_t reg = 0; reg < b_regs; ++reg) {
+      Lanes _s;
+      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.b[reg]}}, _s);
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+        const uint32_t group = lane / 4, tid = lane % 4;
+        const uint32_t col = group;
+        const uint32_t row0 = tid * per_reg + reg * (per_reg * 4);
+        for (uint32_t e = 0; e < per_reg; ++e)
+          B[(row0 + e) * kN + col] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
+      }
+    }
+    // C/D: four values per lane, two rows by two columns.
+    auto cd_index = [](uint32_t lane, uint32_t slot) {
+      const uint32_t group = lane / 4, tid = lane % 4;
+      const uint32_t row = group + (slot / 2) * 8;
+      const uint32_t col = tid * 2 + (slot % 2);
+      return row * kN + col;
+    };
+    for (uint32_t reg = 0; reg < op.c.size(); ++reg) {
+      Lanes _s;
+      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.c[reg]}}, _s);
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+        if (op.acc_f16) {
+          // Two halves per register.
+          C[cd_index(lane, reg * 2)] = f16_to_double(v[lane] & 0xFFFF);
+          C[cd_index(lane, reg * 2 + 1)] = f16_to_double((v[lane] >> 16) & 0xFFFF);
+        } else if (op.acc_int) {
+          C[cd_index(lane, reg)] = static_cast<double>(static_cast<int32_t>(v[lane]));
+        } else {
+          C[cd_index(lane, reg)] = static_cast<double>(f32(v[lane]));
+        }
+      }
+    }
+    // D = A x B + C. Float shapes accumulate in f32 and integer shapes in s32,
+    // matching the accumulate type the instruction names.
+    std::vector<double> D(kM * kN, 0.0);
+    for (uint32_t i = 0; i < kM; ++i)
+      for (uint32_t j = 0; j < kN; ++j) {
+        if (op.acc_int) {
+          int64_t acc = static_cast<int64_t>(C[i * kN + j]);
+          for (uint32_t k = 0; k < K; ++k)
+            acc += static_cast<int64_t>(A[i * K + k]) * static_cast<int64_t>(B[k * kN + j]);
+          D[i * kN + j] = static_cast<double>(static_cast<int32_t>(acc));
+        } else {
+          float acc = static_cast<float>(C[i * kN + j]);
+          for (uint32_t k = 0; k < K; ++k)
+            acc += static_cast<float>(A[i * K + k]) * static_cast<float>(B[k * kN + j]);
+          D[i * kN + j] = static_cast<double>(acc);
+        }
+      }
+    for (uint32_t reg = 0; reg < op.d.size(); ++reg) {
+      Lanes r;
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) {
+          if (op.acc_f16) {
+            const uint64_t lo = double_to_f16(D[cd_index(lane, reg * 2)]);
+            const uint64_t hi = double_to_f16(D[cd_index(lane, reg * 2 + 1)]);
+            r[lane] = ((hi & 0xFFFF) << 16) | (lo & 0xFFFF);
+          } else if (op.acc_int) {
+            r[lane] = static_cast<uint32_t>(static_cast<int32_t>(D[cd_index(lane, reg)]));
+          } else {
+            r[lane] = f32bits(static_cast<float>(D[cd_index(lane, reg)]));
+          }
+        }
+      write_reg(w, op.d[reg], m, r, 32);
+    }
+  }
 
   void exec_wmma_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaMma& op, Mask m) {
     // Gather A and B (16x16 f16 each) and C (16x16 f32) from the warp.

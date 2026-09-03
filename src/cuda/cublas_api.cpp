@@ -560,6 +560,29 @@ VGPU_EXPORT cublasStatus_t cublasGemmStridedBatchedEx(
   return CUBLAS_STATUS_SUCCESS;
 }
 
+// The pointer-array form of GemmEx: each batch entry is an independent matrix
+// rather than a fixed stride apart, and the three arrays live in device memory.
+VGPU_EXPORT cublasStatus_t cublasGemmBatchedEx(
+    cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+    const void* alpha, const void* const Aarray[], cudaDataType Atype, int lda,
+    const void* const Barray[], cudaDataType Btype, int ldb, const void* beta, void* const Carray[],
+    cudaDataType Ctype, int ldc, int batchCount, cublasComputeType_t computeType,
+    cublasGemmAlgo_t algo) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (batchCount < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (batchCount == 0) return CUBLAS_STATUS_SUCCESS;
+  if (!Aarray || !Barray || !Carray) return CUBLAS_STATUS_INVALID_VALUE;
+  const auto a = fetch<const void*>(Aarray, static_cast<size_t>(batchCount));
+  const auto b = fetch<const void*>(Barray, static_cast<size_t>(batchCount));
+  const auto c = fetch<void*>(Carray, static_cast<size_t>(batchCount));
+  for (int i = 0; i < batchCount; ++i) {
+    const cublasStatus_t st = cublasGemmEx(h, ta, tb, m, n, k, alpha, a[i], Atype, lda, b[i], Btype,
+                                           ldb, beta, c[i], Ctype, ldc, computeType, algo);
+    if (st != CUBLAS_STATUS_SUCCESS) return st;
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
+
 // cublasHgemm accumulates in half on hardware only when the math mode asks for
 // it; the default path uses a float accumulator, which is what this does.
 VGPU_EXPORT cublasStatus_t cublasHgemm(cublasHandle_t h, cublasOperation_t ta,
