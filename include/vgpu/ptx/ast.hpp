@@ -135,6 +135,10 @@ struct OpShfl { ShflMode mode; Reg dst; Reg pred_dst; Operand a, b, c, member_ma
 // Warp vote/ballot across the active mask.
 enum class VoteMode { All, Any, Uni, Ballot };
 struct OpVote { VoteMode mode; bool ballot; Reg dst; Reg src; bool negate_src; };
+// mov.pred d, {0|1|%p} -- set a predicate from an immediate or copy another.
+// Predicates live in their own register file, so this cannot go through the
+// ordinary mov path that writes a 32/64-bit value.
+struct OpMovPred { Reg dst; Operand src; };
 struct OpPrmt { Reg dst; Operand a, b, c; };       // byte permute (default mode)
 // copysign.f32/f64 d, a, b -- magnitude of b with the sign of a.
 struct OpCopysign { Type ty; Reg dst; Operand a, b; };
@@ -203,7 +207,7 @@ struct OpLdSlot { std::string slot; int64_t offset; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpMovPred, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall>;
 

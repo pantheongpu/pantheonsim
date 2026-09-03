@@ -41,10 +41,38 @@ struct KernelResources {
 KernelResources kernel_resources(const ptx::EntryFn& fn, const DeviceProfile& profile,
                                  uint32_t block_threads, uint32_t dynamic_shared = 0);
 
+// Counters for a launch. Everything here is counted exactly as it happens
+// rather than sampled, which is the one thing a simulator can offer that
+// hardware counters cannot: the numbers are complete and identical run to run.
+//
+// What is deliberately absent is as important as what is here. There is no
+// timing or memory-hierarchy model, so cache hit rates, DRAM throughput, warp
+// stall reasons and achieved occupancy are not derivable -- reporting them
+// would mean inventing them.
 struct LaunchStats {
   uint64_t blocks = 0;
   uint64_t warps = 0;
+  // Warp-level instruction issues, the same quantity a profiler calls
+  // inst_executed: one per instruction executed by a warp regardless of how
+  // many lanes were active.
   uint64_t instructions = 0;
+  // Summed over active lanes -- thread_inst_executed. The ratio against
+  // `instructions` is the average number of lanes doing useful work, so it
+  // measures divergence directly.
+  uint64_t thread_instructions = 0;
+  // Branches where the active mask actually split. A branch all lanes agree on
+  // is not divergence and is not counted.
+  uint64_t divergent_branches = 0;
+  // Memory operations by space, counted per active lane.
+  uint64_t global_loads = 0, global_stores = 0;
+  uint64_t shared_loads = 0, shared_stores = 0;
+  uint64_t local_loads = 0, local_stores = 0;
+  uint64_t global_bytes_read = 0, global_bytes_written = 0;
+  uint64_t shared_bytes_read = 0, shared_bytes_written = 0;
+  // Atomic read-modify-writes, per active lane.
+  uint64_t atomics = 0;
+  // bar.sync executions, per warp.
+  uint64_t barriers = 0;
 };
 
 // Module global-variable addresses (name -> device VA), materialized by the

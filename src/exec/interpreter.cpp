@@ -302,6 +302,9 @@ class Interpreter {
                           "' (missing ret)");
       const Instr& ins = fn_.body[w.paths[idx].pc];
       if (progress_ && (stats_.instructions & 0xFFFFF) == 0) report_progress();
+      // Warp-level issue count, plus the per-lane total: their ratio is the
+      // average lane utilisation, which is divergence measured directly.
+      stats_.thread_instructions += static_cast<uint64_t>(popcount_mask(w.paths[idx].mask));
       if (++stats_.instructions > cfg_.max_steps)
         throw Error::make(Err::ExecLimit, "kernel '", fn_.name, "' exceeded the launch step budget (",
                           cfg_.max_steps, " instructions) — possible infinite loop");
@@ -453,6 +456,37 @@ class Interpreter {
     return w.preds[idx];
   }
 
+  static uint32_t popcount_mask(Mask m) {
+    return static_cast<uint32_t>(__builtin_popcount(static_cast<unsigned>(m)));
+  }
+
+  // Memory traffic, counted per active lane. Space matters: a shared access and
+  // a global one cost very different things on hardware, and lumping them would
+  // make the numbers useless for the comparison people actually want.
+  void count_memory(Space space, uint32_t bytes, uint32_t lanes, bool is_store) {
+    const uint64_t n = lanes;
+    const uint64_t b = n * bytes;
+    switch (space) {
+      case Space::Shared:
+        if (is_store) { stats_.shared_stores += n; stats_.shared_bytes_written += b; }
+        else { stats_.shared_loads += n; stats_.shared_bytes_read += b; }
+        break;
+      case Space::Local:
+        if (is_store) stats_.local_stores += n; else stats_.local_loads += n;
+        break;
+      case Space::Param:
+        // Kernel parameters are read from the constant bank, not from device
+        // memory. Counting them as global traffic inflated every kernel's load
+        // count by one per thread and would make the byte totals wrong.
+        break;
+      case Space::Global:
+      case Space::Generic:
+        if (is_store) { stats_.global_stores += n; stats_.global_bytes_written += b; }
+        else { stats_.global_loads += n; stats_.global_bytes_read += b; }
+        break;
+    }
+  }
+
   Mask& pred_slot(Warp& w, const Reg& reg) {
     if (reg.wide) w.written64[reg.id] = 1;
     else w.written32[reg.id] = 1;
@@ -566,6 +600,7 @@ class Interpreter {
     }
     if (std::holds_alternative<OpBar>(ins.op)) {
       if (ins.has_pred) ctx_fail(ins, -1, Err::UnsupportedPtx, "predicated bar.sync is not supported");
+      ++stats_.barriers;
       // Every live lane must arrive before the warp yields. Lanes still on
       // other paths have a higher pc and will merge here first; if any path
       // can never reach this barrier the kernel is malformed, and the step
@@ -616,7 +651,10 @@ class Interpreter {
       return;
     }
     // Diverge: both halves become live paths, and whichever has the lower pc
-    // runs first. They merge again as soon as they reach the same pc.
+    // runs first. They merge again as soon as they reach the same pc. Only this
+    // case is divergence -- a branch every lane agrees on took one of the two
+    // early returns above and costs nothing.
+    ++stats_.divergent_branches;
     size_t fall_pc = w.paths[idx].pc + 1;
     w.paths[idx].pc = op.target;
     w.paths[idx].mask = taken;
@@ -655,10 +693,12 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpLd>(&ins.op)) {
+      count_memory(op->space, op->ty.bytes(), popcount_mask(m), /*is_store=*/false);
       exec_ld(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpSt>(&ins.op)) {
+      count_memory(op->space, op->ty.bytes(), popcount_mask(m), /*is_store=*/true);
       exec_st(w, ctx, ins, *op, m);
       return;
     }
@@ -871,6 +911,21 @@ class Interpreter {
             r[lane] = static_cast<uint64_t>(-static_cast<int64_t>(v[lane]));
         }
       write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpMovPred>(&ins.op)) {
+      Mask& p = pred_slot(w, op->dst);
+      if (const auto* imm = std::get_if<ImmInt>(&op->src)) {
+        // A constant applies to every active lane; inactive lanes keep theirs.
+        if (imm->value != 0) p |= m;
+        else p &= ~m;
+      } else if (const auto* r = std::get_if<RegOperand>(&op->src)) {
+        const Mask src = w.preds[pred_index(r->reg)];
+        p = (p & ~m) | (src & m);
+      } else {
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "mov.pred source must be an immediate or a predicate register");
+      }
       return;
     }
     if (const auto* op = std::get_if<OpCopysign>(&ins.op)) {
@@ -1732,6 +1787,7 @@ class Interpreter {
         std::unique_lock<std::mutex> guard;
         if (lock_needed)
           guard = std::unique_lock<std::mutex>(atomic_lock_for(addr));
+        ++stats_.atomics;
         uint64_t old = load_routed(w, ctx, ins, lane, addr, size);
         uint64_t b = mask_to_bits(bv[lane], op.ty.bits);
         uint64_t nv = old;
@@ -2143,6 +2199,20 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
     total.blocks += s.blocks;
     total.warps += s.warps;
     total.instructions += s.instructions;
+    total.thread_instructions += s.thread_instructions;
+    total.divergent_branches += s.divergent_branches;
+    total.global_loads += s.global_loads;
+    total.global_stores += s.global_stores;
+    total.shared_loads += s.shared_loads;
+    total.shared_stores += s.shared_stores;
+    total.local_loads += s.local_loads;
+    total.local_stores += s.local_stores;
+    total.global_bytes_read += s.global_bytes_read;
+    total.global_bytes_written += s.global_bytes_written;
+    total.shared_bytes_read += s.shared_bytes_read;
+    total.shared_bytes_written += s.shared_bytes_written;
+    total.atomics += s.atomics;
+    total.barriers += s.barriers;
   }
   return total;
 }

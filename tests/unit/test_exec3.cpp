@@ -647,3 +647,44 @@ VTEST(float_atomic_min_max_follow_fmin_ordering) {
   mem.read(cell, &got, 4);
   VCHECK_EQ(got, 2.0f);
 }
+
+// mov.pred sets a predicate from a constant or copies another. Predicates are a
+// separate register file, so this cannot go through the value mov path.
+VTEST(mov_pred_from_immediate_and_register) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry mp(.param .u64 p)
+{
+  .reg .b32 %r<4>;
+  .reg .b64 %rd<4>;
+  .reg .pred %p<4>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.pred %p1, 1;
+  mov.pred %p2, %p1;          // copy
+  mov.pred %p3, 0;
+  mov.u32 %r1, 0;
+  @%p2 mov.u32 %r1, 7;        // taken:      r1 = 7
+  @%p3 mov.u32 %r1, 99;       // not taken:  stays 7
+  st.global.u32 [%rd2], %r1;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(4);
+  uint32_t zero = 0;
+  mem.write(out, &zero, 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {1, 1, 1};
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &out, 8);
+  exec::launch(m.entries[0], cfg, {arg}, mem, prof);
+  uint32_t got = 0;
+  mem.read(out, &got, 4);
+  VCHECK_EQ(got, 7u);
+}

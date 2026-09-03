@@ -770,8 +770,15 @@ class Parser {
       if (parts.size() != 2) return unsupported("mov form");
       auto ty = parse_type_token(parts[1]);
       if (!ty) fail(ins.line, "mov missing type");
-      if (ty->kind == Type::Kind::Pred) return unsupported("mov.pred");
-      if (peek_punct("{")) {  // mov.bN {d0, d1, ...}, src  — unpack
+      if (ty->kind == Type::Kind::Pred) {
+        // Predicates live in their own register file, so this cannot go through
+        // the value path below.
+        OpMovPred op;
+        op.dst = expect_reg_operand("mov.pred destination");
+        expect_punct(",");
+        op.src = parse_operand();
+        ins.op = op;
+      } else if (peek_punct("{")) {  // mov.bN {d0, d1, ...}, src  — unpack
         OpMovUnpack op;
         op.ty = *ty;
         next();

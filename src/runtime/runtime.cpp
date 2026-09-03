@@ -2,6 +2,8 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstdio>
 
 #include "vgpu/error.hpp"
 #include "vgpu/ptx/parser.hpp"
@@ -102,10 +104,53 @@ const exec::SymbolTable* Device::symbols(uint64_t module_id) const {
   throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
 }
 
+namespace {
+
+// VGPU_COUNTERS=1 prints the per-launch counters. These are exact counts of
+// what executed, not samples: a simulator can report every instruction and
+// every memory access, which is the one thing hardware counters cannot do.
+// Nothing here is timing-derived, because there is no timing model to derive
+// it from.
+bool counters_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VGPU_COUNTERS");
+    return e && e[0] && e[0] != '0';
+  }();
+  return on;
+}
+
+void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
+                     const exec::LaunchStats& st) {
+  if (!counters_enabled()) return;
+  const double lanes = st.instructions ? static_cast<double>(st.thread_instructions) /
+                                             static_cast<double>(st.instructions)
+                                       : 0.0;
+  std::fprintf(stderr,
+               "[vgpu][counters] %s  grid=%ux%ux%u block=%ux%ux%u\n"
+               "    blocks=%llu warps=%llu\n"
+               "    inst_executed=%llu  thread_inst_executed=%llu  lanes_active_avg=%.2f/32\n"
+               "    divergent_branches=%llu  barriers=%llu  atomics=%llu\n"
+               "    global  ld=%llu st=%llu  read=%llu B write=%llu B\n"
+               "    shared  ld=%llu st=%llu  read=%llu B write=%llu B\n"
+               "    local   ld=%llu st=%llu\n",
+               kernel.c_str(), cfg.grid[0], cfg.grid[1], cfg.grid[2], cfg.block[0], cfg.block[1],
+               cfg.block[2], (unsigned long long)st.blocks, (unsigned long long)st.warps,
+               (unsigned long long)st.instructions, (unsigned long long)st.thread_instructions,
+               lanes, (unsigned long long)st.divergent_branches, (unsigned long long)st.barriers,
+               (unsigned long long)st.atomics, (unsigned long long)st.global_loads,
+               (unsigned long long)st.global_stores, (unsigned long long)st.global_bytes_read,
+               (unsigned long long)st.global_bytes_written, (unsigned long long)st.shared_loads,
+               (unsigned long long)st.shared_stores, (unsigned long long)st.shared_bytes_read,
+               (unsigned long long)st.shared_bytes_written, (unsigned long long)st.local_loads,
+               (unsigned long long)st.local_stores);
+}
+
+}  // namespace
+
 void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
                     const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms) {
   if (!telemetry_) {
-    exec::launch(fn, cfg, args, mem_, profile_, syms);
+    report_counters(fn.name, cfg, exec::launch(fn, cfg, args, mem_, profile_, syms));
     return;
   }
   // Utilization is the real fraction of wall time spent executing kernels. The
@@ -114,8 +159,9 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
   uint32_t ord = static_cast<uint32_t>(ordinal_);
   telemetry::Publisher* pub = telemetry_;
   auto start = std::chrono::steady_clock::now();
-  exec::launch(fn, cfg, args, mem_, profile_, syms,
+  const exec::LaunchStats st = exec::launch(fn, cfg, args, mem_, profile_, syms,
                [pub, ord](double dt) { pub->note_kernel(ord, dt); });
+  report_counters(fn.name, cfg, st);
   double busy = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   pub->note_kernel(ord, 0.0);
   (void)busy;

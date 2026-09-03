@@ -337,3 +337,97 @@ VTEST(launch_bounds_limit_the_total_not_each_dimension) {
   VCHECK(err.code() == Err::LaunchConfig);
   VCHECK_CONTAINS(err.what(), "128");
 }
+
+// Launch counters. These are exact counts of what executed, so a test can
+// predict them precisely -- which is the point: hardware counters sample and
+// multiplex, these do not.
+VTEST(launch_counters_are_exact) {
+  // 2 blocks x 32 threads, each thread doing one global load and one store.
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry cnt(.param .u64 p)
+{
+  .reg .b32 %r<4>;
+  .reg .b64 %rd<6>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %ctaid.x;
+  mov.u32 %r2, %ntid.x;
+  mov.u32 %r3, %tid.x;
+  mad.lo.s32 %r1, %r1, %r2, %r3;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.s64 %rd4, %rd2, %rd3;
+  ld.global.u32 %r2, [%rd4];
+  st.global.u32 [%rd4], %r2;
+  ret;
+}
+)";
+  ptx::Module m = ptx::parse(kPtx);
+  MemoryManager mem(1 << 20);
+  uint64_t buf = mem.alloc(64 * 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {2, 1, 1};
+  cfg.block = {32, 1, 1};
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &buf, 8);
+  auto st = exec::launch(m.entries[0], cfg, {arg}, mem, prof);
+
+  VCHECK_EQ(st.blocks, 2ull);
+  VCHECK_EQ(st.warps, 2ull);          // 32 threads is exactly one warp per block
+  // One load and one store per thread: 64 threads.
+  VCHECK_EQ(st.global_loads, 64ull);
+  VCHECK_EQ(st.global_stores, 64ull);
+  VCHECK_EQ(st.global_bytes_read, 64ull * 4);
+  VCHECK_EQ(st.global_bytes_written, 64ull * 4);
+  VCHECK_EQ(st.shared_loads, 0ull);
+  VCHECK_EQ(st.atomics, 0ull);
+  VCHECK_EQ(st.barriers, 0ull);
+  // No branch in this kernel, so nothing diverges.
+  VCHECK_EQ(st.divergent_branches, 0ull);
+  // Every lane is active throughout, so the per-lane total is exactly 32x the
+  // warp-level count.
+  VCHECK_EQ(st.thread_instructions, st.instructions * 32);
+  mem.free(buf);
+}
+
+VTEST(divergence_is_counted_only_when_lanes_disagree) {
+  // Half the warp takes the branch, so it diverges exactly once per warp.
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry dv(.param .u64 p)
+{
+  .reg .b32 %r<4>;
+  .reg .b64 %rd<4>;
+  .reg .pred %p<2>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  setp.lt.u32 %p1, %r1, 16;
+  @%p1 bra SKIP;
+  st.global.u32 [%rd2], %r1;
+SKIP:
+  ret;
+}
+)";
+  ptx::Module m = ptx::parse(kPtx);
+  MemoryManager mem(1 << 20);
+  uint64_t buf = mem.alloc(4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {32, 1, 1};
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &buf, 8);
+  auto st = exec::launch(m.entries[0], cfg, {arg}, mem, prof);
+  VCHECK_EQ(st.divergent_branches, 1ull);
+  // Only the 16 lanes that fell through reach the store.
+  VCHECK_EQ(st.global_stores, 16ull);
+  // And with lanes idle on the diverged paths, utilisation is below full.
+  VCHECK(st.thread_instructions < st.instructions * 32);
+  mem.free(buf);
+}
