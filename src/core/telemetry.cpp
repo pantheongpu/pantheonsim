@@ -191,7 +191,11 @@ void Publisher::refresh(uint32_t ordinal) {
   double target_w = idle_w + (d->power_limit_mw / 1000.0 - idle_w) * util;
   a.power_w += (target_w - a.power_w) * (1.0 - std::pow(1.0 - 0.45, windows));  // fast electrical
 
-  double target_c = 32.0 + (static_cast<double>(d->temperature_max_c) - 42.0) * util;
+  // A device that reports no thermal threshold still needs a plausible synthetic
+  // curve; 85 C is the common slowdown point and the whole reading is labelled
+  // synthetic anyway. Without this the curve ran below room temperature.
+  const double t_max = d->temperature_max_c ? static_cast<double>(d->temperature_max_c) : 85.0;
+  double target_c = 32.0 + (t_max - 42.0) * util;
   a.temp_c += (target_c - a.temp_c) * (1.0 - std::pow(1.0 - 0.08, windows));  // slow thermal mass
 
   d->utilization_gpu = static_cast<uint32_t>(std::lround(util * 100.0));

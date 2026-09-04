@@ -24,6 +24,18 @@ std::string get_str(const Value& map, const char* key, const std::string& origin
   return v.str;
 }
 
+// Telemetry values are presentation-only, and a driver that does not report one
+// is a fact about the device rather than a broken profile: a real GH200 reports
+// no thermal threshold, and requiring the key made every profile characterized
+// from one unloadable. Absent means zero, which callers render as "unknown".
+int64_t opt_int(const Value& map, const char* key, const std::string& origin, int64_t dflt) {
+  auto it = map.map.find(key);
+  if (it == map.map.end()) return dflt;
+  if (it->second.kind != Value::Kind::Int)
+    fail(origin, "key '" + std::string(key) + "' must be an integer");
+  return it->second.i;
+}
+
 int64_t get_int(const Value& map, const char* key, const std::string& origin) {
   const Value& v = require(map, key, origin);
   if (v.kind != Value::Kind::Int) fail(origin, "key '" + std::string(key) + "' must be an integer");
@@ -104,12 +116,12 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
   if (auto it = doc.map.find("telemetry"); it != doc.map.end()) {
     if (it->second.kind != Value::Kind::Map) fail(origin, "'telemetry' must be a map");
     const Value& t = it->second;
-    p.telemetry.power_limit_w = static_cast<uint32_t>(get_int(t, "power_limit_w", origin));
-    p.telemetry.sm_clock_max_mhz = static_cast<uint32_t>(get_int(t, "sm_clock_max_mhz", origin));
-    p.telemetry.mem_clock_max_mhz = static_cast<uint32_t>(get_int(t, "mem_clock_max_mhz", origin));
-    p.telemetry.temperature_max_c = static_cast<uint32_t>(get_int(t, "temperature_max_c", origin));
-    p.telemetry.pci_vendor_id = static_cast<uint32_t>(get_int(t, "pci_vendor_id", origin));
-    p.telemetry.pci_device_id = static_cast<uint32_t>(get_int(t, "pci_device_id", origin));
+    p.telemetry.power_limit_w = static_cast<uint32_t>(opt_int(t, "power_limit_w", origin, 0));
+    p.telemetry.sm_clock_max_mhz = static_cast<uint32_t>(opt_int(t, "sm_clock_max_mhz", origin, 0));
+    p.telemetry.mem_clock_max_mhz = static_cast<uint32_t>(opt_int(t, "mem_clock_max_mhz", origin, 0));
+    p.telemetry.temperature_max_c = static_cast<uint32_t>(opt_int(t, "temperature_max_c", origin, 0));
+    p.telemetry.pci_vendor_id = static_cast<uint32_t>(opt_int(t, "pci_vendor_id", origin, 0));
+    p.telemetry.pci_device_id = static_cast<uint32_t>(opt_int(t, "pci_device_id", origin, 0));
   }
 
   if (auto it = doc.map.find("features"); it != doc.map.end()) {

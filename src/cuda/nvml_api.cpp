@@ -278,6 +278,10 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTemperatureThreshold(nvmlDevice_t device,
   refresh();
   const auto* d = sample(device);
   if (!d || !temp) return NVML_ERROR_INVALID_ARGUMENT;
+  // A profile characterized from a device whose driver reports no threshold
+  // carries zero here. Saying "not supported" is what that driver said, and is
+  // better than inventing a number a monitoring tool would then act on.
+  if (d->temperature_max_c == 0) return NVML_ERROR_NOT_SUPPORTED;
   switch (which) {
     case NVML_TEMPERATURE_THRESHOLD_SHUTDOWN: *temp = d->temperature_max_c + 5; break;
     case NVML_TEMPERATURE_THRESHOLD_SLOWDOWN: *temp = d->temperature_max_c; break;
