@@ -224,9 +224,25 @@ int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
     case 41: return 1;                               // UNIFIED_ADDRESSING (64-bit Linux is UVA)
     case 82: return static_cast<int>(p.limits.shared_mem_per_block_optin);
     case 90: return 1;                               // COMPUTE_PREEMPTION_SUPPORTED
+    // Capabilities this does not implement. Zero is the true answer for each,
+    // and saying so explicitly keeps them out of the "unmodeled" report below.
+    case 102: return 0;                              // VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
+    case 115: return 0;                              // GPU_DIRECT_RDMA_SUPPORTED
+    case 118: return 0;                              // HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED
+    case 121: return 0;                              // MAX_PERSISTING_L2_CACHE_SIZE
+    case 124: return 0;                              // MEMPOOL_SUPPORTED_HANDLE_TYPES
+    case 128: return 0;                              // DEFERRED_MAPPING_CUDA_ARRAY_SUPPORTED
     default:
-      if (trace())
-        std::fprintf(stderr, "[vgpu][trace] cuDeviceGetAttribute(%d) -> 0 (unmodeled)\n", attrib);
+      // Answering zero for a quantity nobody modelled is how a scan came to
+      // launch no blocks, on the runtime side of this same question. The
+      // driver API is reached by more varied software, and an error here is
+      // more likely to be fatal than useful -- so this still answers zero, but
+      // says so where it can be seen rather than only under VGPU_TRACE.
+      if (!quiet())
+        std::fprintf(stderr,
+                     "[vgpu] cuDeviceGetAttribute: attribute %d is not modelled; answering 0. If "
+                     "that is wrong for your program, add it to driver_api.cpp\n",
+                     attrib);
       return 0;
   }
 }
