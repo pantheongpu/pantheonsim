@@ -246,8 +246,11 @@ VTEST(kernel_oob_fault_names_kernel_lane_and_profile) {
   VCHECK_CONTAINS(err.what(), "nvidia/h100");
 }
 
-VTEST(uninitialized_register_reaching_memory_is_diagnosed) {
-  // A value nothing has written, on its way to memory, is a bug in any program.
+VTEST(uninitialized_register_reaching_memory_is_diagnosed_in_strict_mode) {
+  // A value nothing has written, on its way to memory, looks like a bug -- but
+  // CUB's radix sort stores exactly that into the unused part of a shared tile
+  // and never reads it back, so this cannot be the default. VGPU_STRICT=1 is
+  // for looking for a bug rather than running a workload.
   const char* ptx = R"(
 .version 8.3
 .target sm_90
@@ -268,7 +271,9 @@ VTEST(uninitialized_register_reaching_memory_is_diagnosed) {
   uint64_t out = mem.alloc(4);
   std::vector<uint8_t> arg(8);
   std::memcpy(arg.data(), &out, 8);
+  setenv("VGPU_STRICT", "1", 1);
   auto err = VCAPTURE(Error, exec::launch(m.entries[0], LaunchConfig{}, {arg}, mem, prof));
+  unsetenv("VGPU_STRICT");
   VCHECK(err.code() == Err::UninitializedRegister);
   VCHECK_CONTAINS(err.what(), "%r2");
 }

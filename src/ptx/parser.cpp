@@ -22,6 +22,13 @@ const std::unordered_map<std::string, Sreg>& sreg_table() {
       {"%ctaid.x", Sreg::CtaidX},   {"%ctaid.y", Sreg::CtaidY},   {"%ctaid.z", Sreg::CtaidZ},
       {"%nctaid.x", Sreg::NctaidX}, {"%nctaid.y", Sreg::NctaidY}, {"%nctaid.z", Sreg::NctaidZ},
       {"%laneid", Sreg::LaneId},
+      {"%lanemask_eq", Sreg::LaneMaskEq},
+      {"%lanemask_lt", Sreg::LaneMaskLt},
+      {"%lanemask_le", Sreg::LaneMaskLe},
+      {"%lanemask_gt", Sreg::LaneMaskGt},
+      {"%lanemask_ge", Sreg::LaneMaskGe},
+      {"%warpid", Sreg::WarpId},
+      {"%nwarpid", Sreg::NWarpId},
   };
   return t;
 }
@@ -578,6 +585,15 @@ class Parser {
     if (w[0] == '%') {
       auto it = sreg_table().find(w);
       if (it != sreg_table().end()) return SregOperand{it->second};
+      // A %-name that was never declared is a special register this engine does
+      // not implement, not a register that happens to be unwritten. Letting it
+      // through as an ordinary register made %lanemask_le read as zero, which
+      // turned CUB's radix sort into a store four bytes below its shared array
+      // -- a silent wrong answer where an unimplemented instruction would have
+      // said so plainly.
+      if (!declared_regs_.count(w))
+        fail_unsupported(t.line, w, cur_fn_ ? cur_fn_->name : std::string(),
+                         "special register '" + w + "'");
       return RegOperand{intern(w)};
     }
     if (isdigit(static_cast<unsigned char>(w[0]))) {
@@ -1598,18 +1614,24 @@ class Parser {
       if (op.callee != "vprintf")
         return unsupported("call to '" + op.callee + "' (only the vprintf builtin is callable)");
       ins.op = op;
+    } else if (op0 == "activemask") {
+      OpActiveMask op;
+      op.dst = expect_reg_operand("activemask destination");
+      ins.op = op;
     } else if (op0 == "trap") {
       ins.op = OpTrap{};
     } else if (op0 == "membar" || op0 == "fence") {
       // Blocks execute their instructions in order and device atomics are
       // serialized by a lock, so every prior write is already visible to
-      // whoever could observe it. There is no reordering here to fence against.
-      ins.op = OpBar{};
+      // whoever could observe it. There is no reordering here to fence against
+      // -- but a fence is not a barrier, and this used to be OpBar, which made
+      // it wait for every warp in the block.
+      ins.op = OpNop{};
     } else if (op0 == "nanosleep") {
       // A backoff hint. Consuming it as a no-op is correct; the operand is a
       // duration nothing here can meaningfully honour.
       (void)parse_operand();
-      ins.op = OpBar{};  // nothing to do; treated as a barrier-free no-op
+      ins.op = OpNop{};
     } else if (op0 == "movmatrix") {
       bool trans = false, b16 = false, shape = false;
       for (size_t i = 1; i < parts.size(); ++i) {

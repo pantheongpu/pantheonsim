@@ -544,10 +544,24 @@ VGPU_EXPORT cudaError_t cudaFuncGetAttributes(cudaFuncAttributes* attr, const vo
   return guard("cudaFuncGetAttributes", [&](State& s) -> cudaError_t {
     cudaFuncAttributes* a = attr;
     if (!a) return cudaErrorInvalidValue;
+    // Returning the error silently made this very hard to place: CUB asks about
+    // its own kernels before it launches any, so the failure surfaced as
+    // "invalid device function" from a sort, with nothing said about which
+    // kernel could not be described.
     auto it = s.kernels.find(func);
-    if (it == s.kernels.end()) return cudaErrorInvalidDeviceFunction;
+    if (it == s.kernels.end()) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] cudaFuncGetAttributes: unregistered kernel stub %p\n", func);
+      return cudaErrorInvalidDeviceFunction;
+    }
     KernelInfo& ki = it->second;
-    if (!ki.mod || ki.mod->ptx.empty()) return cudaErrorInvalidDeviceFunction;
+    if (!ki.mod || ki.mod->ptx.empty()) {
+      if (!quiet())
+        std::fprintf(stderr,
+                     "[vgpu] cudaFuncGetAttributes: kernel '%s' has no PTX in its fatbin\n",
+                     ki.entry_name.c_str());
+      return cudaErrorInvalidDeviceFunction;
+    }
     uint64_t mid = module_on_current(s, *ki.mod);
     vgpu::runtime::Device& dev = current(s);
     const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
@@ -558,7 +572,13 @@ VGPU_EXPORT cudaError_t cudaFuncGetAttributes(cudaFuncAttributes* attr, const vo
     a->localSizeBytes = res.usage.local_bytes;
     a->sharedSizeBytes = fn->static_shared_size;
     a->maxThreadsPerBlock = static_cast<int>(p.limits.max_threads_per_block);
-    a->ptxVersion = 83;
+    // ptxVersion is the *virtual architecture* the function was compiled for,
+    // not the PTX ISA version -- CUB multiplies it by ten and dispatches on the
+    // result, so reporting 83 for "PTX ISA 8.3" produced 830, an architecture
+    // no kernel was ever built for, and every CUB algorithm refused to run with
+    // cudaErrorInvalidDeviceFunction. It comes from the module's own .target.
+    const int arch = dev.module_arch(mid);
+    a->ptxVersion = arch ? arch : p.cc_major * 10 + p.cc_minor;
     a->binaryVersion = p.cc_major * 10 + p.cc_minor;
     a->maxDynamicSharedSizeBytes = static_cast<int>(p.limits.shared_mem_per_block_optin);
     return cudaSuccess;
@@ -573,9 +593,23 @@ VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBl
   return guard("cudaOccupancyMaxActiveBlocksPerMultiprocessor", [&](State& s) -> cudaError_t {
     if (!numBlocks || blockSize <= 0) return cudaErrorInvalidValue;
     auto it = s.kernels.find(func);
-    if (it == s.kernels.end()) return cudaErrorInvalidDeviceFunction;
+    if (it == s.kernels.end()) {
+      if (!quiet())
+        std::fprintf(stderr,
+                     "[vgpu] cudaOccupancyMaxActiveBlocksPerMultiprocessor: unregistered kernel "
+                     "stub %p\n",
+                     func);
+      return cudaErrorInvalidDeviceFunction;
+    }
     KernelInfo& ki = it->second;
-    if (!ki.mod || ki.mod->ptx.empty()) return cudaErrorInvalidDeviceFunction;
+    if (!ki.mod || ki.mod->ptx.empty()) {
+      if (!quiet())
+        std::fprintf(stderr,
+                     "[vgpu] cudaOccupancyMaxActiveBlocksPerMultiprocessor: kernel '%s' has no "
+                     "PTX in its fatbin\n",
+                     ki.entry_name.c_str());
+      return cudaErrorInvalidDeviceFunction;
+    }
     uint64_t mid = module_on_current(s, *ki.mod);
     vgpu::runtime::Device& dev = current(s);
     const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);

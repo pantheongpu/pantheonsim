@@ -151,6 +151,16 @@ struct Warp {
   std::unique_ptr<AsyncCopies> cp;  // created on the first cp.async
 };
 
+// Strict mode, sampled once per launch: consulting it is a relaxed atomic load
+// rather than a getenv on a hot path, and a process that changes the variable
+// between launches gets what it asked for.
+std::atomic<bool> g_strict{false};
+
+void refresh_strict_mode() {
+  const char* v = std::getenv("VGPU_STRICT");
+  g_strict.store(v && v[0] == '1', std::memory_order_relaxed);
+}
+
 // IEEE 754 binary16 <-> double, implemented in software so the engine needs no
 // host f16 support. Round-to-nearest-even, with subnormals and inf/NaN.
 double f16_to_double(uint64_t bits) {
@@ -449,6 +459,22 @@ class Interpreter {
       case Sreg::NctaidY: return ctx.nctaid[1];
       case Sreg::NctaidZ: return ctx.nctaid[2];
       case Sreg::LaneId: return lane;
+      case Sreg::LaneMaskEq: return 1u << lane;
+      case Sreg::LaneMaskLt: return lane == 0 ? 0u : (~0u >> (kWarpSize - lane));
+      case Sreg::LaneMaskLe: return static_cast<uint32_t>((uint64_t{2} << lane) - 1);
+      case Sreg::LaneMaskGt: return lane == kWarpSize - 1
+                                        ? 0u
+                                        : ~static_cast<uint32_t>((uint64_t{2} << lane) - 1);
+      case Sreg::LaneMaskGe: return ~0u << lane;
+      // Warps are numbered within the block, which is how a kernel uses this:
+      // to index a per-warp slot in shared memory.
+      case Sreg::WarpId: {
+        const uint32_t linear = w.tid_x[lane] + w.tid_y[lane] * ctx.ntid[0] +
+                                w.tid_z[lane] * ctx.ntid[0] * ctx.ntid[1];
+        return linear / kWarpSize;
+      }
+      case Sreg::NWarpId:
+        return (ctx.ntid[0] * ctx.ntid[1] * ctx.ntid[2] + kWarpSize - 1) / kWarpSize;
     }
     return 0;
   }
@@ -821,6 +847,14 @@ class Interpreter {
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = int_bin(op->op, op->ty, a[lane], b[lane], ins);
       write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (std::holds_alternative<OpNop>(ins.op)) return;
+    if (const auto* op = std::get_if<OpActiveMask>(&ins.op)) {
+      Lanes r;  // every active lane sees the same membership
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) r[lane] = m;
+      write_reg(w, op->dst, m, r, 32);
       return;
     }
     if (const auto* op = std::get_if<OpCpAsync>(&ins.op)) {
@@ -1986,15 +2020,12 @@ class Interpreter {
     return static_cast<int64_t>(m);
   }
 
-  // Integer division by zero is undefined in PTX and does not trap on hardware.
-  // VGPU_TRAP_DIV_BY_ZERO=1 turns it back into an error for a debugging run.
-  static bool trap_div_by_zero() {
-    static const bool on = [] {
-      const char* v = std::getenv("VGPU_TRAP_DIV_BY_ZERO");
-      return v && v[0] == '1';
-    }();
-    return on;
-  }
+  // Strict mode: the checks that hunt for bugs hardware would hide, but which
+  // real compiler output trips over. Integer division by zero and a store of a
+  // register nothing has written are both undefined-but-harmless in code ptxas
+  // and CUB emit every day, so neither can be on by default -- and both are
+  // worth having when you are looking for a bug rather than running a workload.
+  static bool strict() { return g_strict.load(std::memory_order_relaxed); }
 
   uint64_t int_bin(IntBinOp op, Type ty, uint64_t a, uint64_t b, const Instr& ins) {
     bool sig = ty.is_signed();
@@ -2021,7 +2052,7 @@ class Interpreter {
           // the usual expansion of these instructions leaves behind. The trap
           // is still available for a debugging run, since it does find real
           // bugs -- it just cannot be the default.
-          if (trap_div_by_zero())
+          if (strict())
             ctx_fail(ins, -1, Err::InvalidValue, "integer division by zero");
           return op == IntBinOp::Div ? narrow_u(~uint64_t{0}, ty.bits) : u(a);
         }
@@ -2339,11 +2370,11 @@ class Interpreter {
     std::vector<Lanes> vals;
     vals.reserve(n);
     for (const auto& src : op.srcs) {
-      // A value that nothing has ever written, on its way to memory, is a bug
-      // in any program -- unlike the dead reads compilers emit into arithmetic,
-      // which read as zero (see read_operand). This is where an undefined
-      // register stops being the compiler's business and becomes a result.
-      if (const auto* r = std::get_if<RegOperand>(&src)) {
+      // A value nothing has written, on its way to memory, looks like a bug --
+      // but CUB's radix sort stores exactly that into the unused part of a
+      // shared tile, and never reads it back. So this is a strict-mode check
+      // rather than a default one; see strict().
+      if (const auto* r = strict() ? std::get_if<RegOperand>(&src) : nullptr) {
         const bool init = r->reg.wide ? (r->reg.id < w.regs64.size() && w.written64[r->reg.id])
                                       : (r->reg.id < w.regs32.size() && w.written32[r->reg.id]);
         if (!init)
@@ -2799,6 +2830,7 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
                    const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
                    const DeviceProfile& profile, const SymbolTable* symbols,
                    const ProgressFn& progress) {
+  refresh_strict_mode();
   validate(fn, cfg, profile);
   LaunchConfig eff = cfg;
   eff.max_steps = effective_max_steps(cfg.max_steps);

@@ -1242,4 +1242,124 @@ VTEST(integer_division_by_zero_follows_the_hardware) {
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{7});
 }
 
+VTEST(lane_masks_have_the_values_warp_algorithms_depend_on) {
+  // popc(%lanemask_le & mask) is how CUB ranks a lane among its peers. Getting
+  // these wrong is not an off-by-one in a number, it is an address.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 20;
+    add.s64 %rd4, %rd2, %rd3;
+    mov.u32 %r2, %lanemask_eq;
+    st.global.u32 [%rd4], %r2;
+    mov.u32 %r3, %lanemask_lt;
+    st.global.u32 [%rd4+4], %r3;
+    mov.u32 %r4, %lanemask_le;
+    st.global.u32 [%rd4+8], %r4;
+    mov.u32 %r5, %lanemask_gt;
+    st.global.u32 [%rd4+12], %r5;
+    mov.u32 %r6, %lanemask_ge;
+    st.global.u32 [%rd4+16], %r6;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 20);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t l = 0; l < 32; ++l) {
+    const uint64_t base = out + l * 20;
+    const uint32_t eq = 1u << l;
+    const uint32_t lt = l == 0 ? 0u : (~0u >> (32 - l));
+    const uint32_t le = lt | eq;
+    const uint32_t ge = ~0u << l;
+    const uint32_t gt = ge & ~eq;
+    VCHECK_EQ(e.mem.load_scalar(base, 4), uint64_t{eq});
+    VCHECK_EQ(e.mem.load_scalar(base + 4, 4), uint64_t{lt});
+    VCHECK_EQ(e.mem.load_scalar(base + 8, 4), uint64_t{le});
+    VCHECK_EQ(e.mem.load_scalar(base + 12, 4), uint64_t{gt});
+    VCHECK_EQ(e.mem.load_scalar(base + 16, 4), uint64_t{ge});
+  }
+}
+
+VTEST(ballot_returns_the_lanes_that_voted_not_their_complement) {
+  // vote.ballot's negate_src flag had no default initializer, so a ballot with
+  // no '!' read whatever was on the stack: usually true, which returned the
+  // complement of the mask. Almost nothing noticed, because most uses feed
+  // popc or compare against zero and both survive a complement. CUB's radix
+  // sort does not -- it ranks a lane with popc(%lanemask_le & ballot), and a
+  // complemented ballot ranked every lane zero and stored below its array.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %laneid;
+    mul.wide.u32 %rd3, %r1, 12;
+    add.s64 %rd4, %rd2, %rd3;
+    setp.lt.u32 %p1, %r1, 16;
+    vote.sync.ballot.b32 %r2, %p1, -1;
+    st.global.u32 [%rd4], %r2;
+    setp.eq.s32 %p2, %r1, 0;
+    vote.sync.ballot.b32 %r3, %p2, -1;
+    st.global.u32 [%rd4+4], %r3;
+    vote.sync.ballot.b32 %r4, !%p2, -1;
+    st.global.u32 [%rd4+8], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 12);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t l = 0; l < 32; ++l) {
+    VCHECK_EQ(e.mem.load_scalar(out + l * 12, 4), uint64_t{0x0000FFFF});
+    VCHECK_EQ(e.mem.load_scalar(out + l * 12 + 4, 4), uint64_t{0x00000001});
+    VCHECK_EQ(e.mem.load_scalar(out + l * 12 + 8, 4), uint64_t{0xFFFFFFFE});
+  }
+}
+
+VTEST(activemask_is_the_lanes_still_running) {
+  // Half the warp returns early; the rest must see only themselves.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %laneid;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    setp.lt.u32 %p1, %r1, 16;
+    @%p1 bra DONE;
+    activemask.b32 %r2;
+    st.global.u32 [%rd4], %r2;
+DONE:
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t l = 16; l < 32; ++l)
+    VCHECK_EQ(e.mem.load_scalar(out + l * 4, 4), uint64_t{0xFFFF0000});
+}
+
 VTEST_MAIN

@@ -59,6 +59,12 @@ class Device {
   // Looks up a kernel. The returned pointer lives as long as the module.
   const ptx::EntryFn* get_function(uint64_t module_id, const std::string& name) const;
 
+  // The virtual architecture the module was compiled for, from its ".target"
+  // directive: 86 for ".target sm_86". Zero when the module does not say.
+  // Reported through cudaFuncGetAttributes::ptxVersion, which CUB reads to pick
+  // a kernel policy, so it has to be an architecture and not an ISA version.
+  int module_arch(uint64_t module_id) const;
+
   // The module's global-variable addresses (valid while the module is loaded).
   const exec::SymbolTable* symbols(uint64_t module_id) const;
 
