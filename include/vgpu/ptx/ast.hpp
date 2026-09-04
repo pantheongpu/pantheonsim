@@ -40,6 +40,20 @@ enum class Sreg : uint8_t {
   CtaidX, CtaidY, CtaidZ,
   NctaidX, NctaidY, NctaidZ,
   LaneId,
+  // The lane-mask family: a 32-bit mask of the lanes whose id compares the
+  // given way with this lane's. Warp-aggregated algorithms are built on these
+  // -- CUB's radix sort ranks a lane among its peers with
+  // popc(%lanemask_le & match_mask), and a wrong value there is an address, not
+  // a number.
+  LaneMaskEq, LaneMaskLt, LaneMaskLe, LaneMaskGt, LaneMaskGe,
+  // One warp per 32 lanes of the block, in this engine's scheduling.
+  WarpId, NWarpId,
+  // %envreg<32>: driver-set registers. PTX says they read as zero unless a
+  // driver has set them, and nothing here sets them -- so zero is the value,
+  // not a stand-in for one. ggml's soft_max reads a pair of them, splices them
+  // into a 64-bit value and branches on whether it is zero, which is precisely
+  // the "not set" path.
+  EnvReg,
 };
 
 // A virtual register reference. `id` is a dense per-kernel index assigned at
@@ -64,9 +78,9 @@ inline bool operator==(const Reg& a, const Reg& b) { return a.id == b.id; }
 inline std::ostream& operator<<(std::ostream& os, const Reg& r) { return os << r.name; }
 
 struct RegOperand { Reg reg; };                     // %r1, %rd4, %f2, %p1 ...
-struct ImmInt { int64_t value; };                   // 42, -1, 0x10
-struct ImmFloatBits { uint64_t bits; uint32_t width; };  // 0f3F800000 / 0d...
-struct SregOperand { Sreg reg; };
+struct ImmInt { int64_t value = 0; };                   // 42, -1, 0x10
+struct ImmFloatBits { uint64_t bits = 0; uint32_t width = 0; };  // 0f3F800000 / 0d...
+struct SregOperand { Sreg reg = Sreg::TidX; };
 // A bare identifier naming a module .global variable or a function-local
 // depot ("mov.u64 %rd, $str;" / "mov.u64 %SPL, __local_depot0;").
 struct SymbolOperand { std::string name; };
@@ -96,8 +110,8 @@ enum class AtomOp { Add, Min, Max, And, Or, Xor, Exch, Cas };
 enum class PredBinOp { And, Or, Xor };
 
 // Vector loads/stores (v2/v4) carry 2 or 4 registers; scalar ops carry 1.
-struct OpLd { Space space; Type ty; std::vector<Reg> dsts; Addr addr; };
-struct OpSt { Space space; Type ty; Addr addr; std::vector<Operand> srcs; };
+struct OpLd { Space space = Space::Generic; Type ty; std::vector<Reg> dsts; Addr addr; };
+struct OpSt { Space space = Space::Generic; Type ty; Addr addr; std::vector<Operand> srcs; };
 struct OpMov { Type ty; Reg dst; Operand src; };
 // Vector forms of mov used by inline asm to pack/unpack sub-word registers:
 //   mov.b32 %r, {%rs1, %rs2};      pack two 16-bit halves into 32 bits
@@ -109,7 +123,7 @@ struct OpMovUnpack { Type ty; std::vector<Reg> dsts; Operand src; };
 //   cvta.<space>.u64    d, a   -> generic  (d = window_base + a)
 //   cvta.to.<space>.uNN d, a   -> space    (d = a - window_base)
 // .global/.const already alias the generic space, so those are identity.
-struct OpCvta { Type ty; Space space; bool to_space; Reg dst; Operand src; };
+struct OpCvta { Type ty; Space space = Space::Generic; bool to_space = false; Reg dst; Operand src; };
 // The bare modes (.rn/.rz/.rm/.rp) pick how a value is rounded into a narrower
 // float. The "i" modes (.rni/.rzi/.rmi/.rpi) instead round to an integral
 // value while keeping the float type -- they are what ceilf, floorf, truncf and
@@ -132,18 +146,18 @@ struct OpMath { MathOp op; Type ty; Reg dst; Operand src; };
 struct OpBfe { Type ty; Reg dst; Operand a, b, c; };        // b=start, c=len
 struct OpBfi { Type ty; Reg dst; Operand a, b, c, d; };     // insert a into b
 struct OpBrev { Type ty; Reg dst; Operand src; };           // bit reverse
-struct OpPopcClz { bool popc; Type ty; Reg dst; Operand src; };
+struct OpPopcClz { bool popc = false; Type ty; Reg dst; Operand src; };
 
 // Warp shuffle. `pred_dst` is the optional "d|p" second destination.
 enum class ShflMode { Up, Down, Bfly, Idx };
 struct OpShfl { ShflMode mode; Reg dst; Reg pred_dst; Operand a, b, c, member_mask; };
 // Warp vote/ballot across the active mask.
 enum class VoteMode { All, Any, Uni, Ballot };
-struct OpVote { VoteMode mode; bool ballot; Reg dst; Reg src; bool negate_src; };
+struct OpVote { VoteMode mode = VoteMode::All; bool ballot = false; Reg dst; Reg src; bool negate_src = false; };
 // redux.sync.<op>.<type> d, a, membermask -- reduce a across the participating
 // lanes of the warp and give every one of them the result.
 enum class ReduxOp { Add, Min, Max, And, Or, Xor };
-struct OpRedux { ReduxOp op; Type ty; Reg dst; Operand src; };
+struct OpRedux { ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand src; };
 // cvt.rn.f16x2.f32 d, a, b -- convert two f32 and pack them into one register,
 // a in the high half and b in the low half.
 struct OpCvtF16x2 { Reg dst; Operand a, b; bool bf16 = false; };
@@ -152,6 +166,13 @@ struct OpCvtF16x2 { Reg dst; Operand a, b; bool bf16 = false; };
 // Loads N 8x8 matrices of 16-bit elements from shared memory. Row r of matrix i
 // is at the address supplied by lane i*8+r, and each lane comes away with two
 // consecutive elements of one row -- the layout an mma fragment expects.
+// movmatrix.sync.aligned.m8n8.trans.b16 d, a
+// Transposes an 8x8 matrix of 16-bit elements that the warp already holds in
+// registers -- the same fragment layout ldmatrix produces, so this is the
+// register-only counterpart to ldmatrix's .trans: it costs no shared memory
+// round trip. Flash attention uses it to feed K^T to the second mma.
+struct OpMovMatrix { Reg dst; Operand src; };
+
 struct OpLdMatrix { uint32_t count = 1; bool trans = false; std::vector<Reg> dsts; Addr addr; };
 
 // mma.sync.aligned.m16n8kK.row.col.<dtype>.<atype>.<btype>.<ctype>
@@ -176,26 +197,26 @@ struct OpPrmt { Reg dst; Operand a, b, c; };       // byte permute (default mode
 struct OpCopysign { Type ty; Reg dst; Operand a, b; };
 // dp4a.{u32,s32}.{u32,s32} d, a, b, c -- four byte-wise products of a and b
 // accumulated into c. Quantized inference leans on this heavily.
-struct OpDp4a { bool a_signed; bool b_signed; Reg dst; Operand a, b, c; };
+struct OpDp4a { bool a_signed = false; bool b_signed = false; Reg dst; Operand a, b, c; };
 // bmsk.{clamp,wrap}.b32 d, a, b -- a contiguous mask of b bits starting at a.
-struct OpBmsk { bool wrap; Reg dst; Operand a, b; };
-struct OpIntBin { IntBinOp op; Type ty; Reg dst; Operand a, b; };
+struct OpBmsk { bool wrap = false; Reg dst; Operand a, b; };
+struct OpIntBin { IntBinOp op = IntBinOp::Add; Type ty; Reg dst; Operand a, b; };
 struct OpMadLo { Type ty; Reg dst; Operand a, b, c; };
-struct OpMulWide { uint32_t src_bits = 32; bool is_signed; Reg dst; Operand a, b; };  // 32x32 -> 64
-struct OpMadWide { bool is_signed; Reg dst; Operand a, b, c; };  // 32x32+64 -> 64
+struct OpMulWide { uint32_t src_bits = 32; bool is_signed = false; Reg dst; Operand a, b; };  // 32x32 -> 64
+struct OpMadWide { bool is_signed = false; Reg dst; Operand a, b, c; };  // 32x32+64 -> 64
 // High half of a same-width multiply. Compilers emit these to turn integer
 // division by a constant into a multiply, so they show up in ordinary code.
 struct OpMulHi { Type ty; Reg dst; Operand a, b; };
 struct OpMadHi { Type ty; Reg dst; Operand a, b, c; };
-struct OpShf { bool left; bool wrap; Reg dst; Operand a, b, c; };  // funnel shift b:a
+struct OpShf { bool left = false; bool wrap = false; Reg dst; Operand a, b, c; };  // funnel shift b:a
 // PTX names an explicit rounding mode on float arithmetic. Unlike .approx,
 // which only relaxes accuracy, these change the result -- quantization kernels
 // depend on .rz truncating -- so they are carried through and applied.
 enum class FRound { Nearest, Zero, MinusInf, PlusInf };
-struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op; Type ty; Reg dst; Operand a, b; };
+struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; Type ty; Reg dst; Operand a, b; };
 struct OpFma { Type ty; Reg dst; Operand a, b, c; };
 // Packed half2 SIMD: one 32-bit register holds two f16 lanes.
-struct OpF16x2Bin { FloatBinOp op; Reg dst; Operand a, b; };
+struct OpF16x2Bin { FloatBinOp op = FloatBinOp::Add; Reg dst; Operand a, b; };
 struct OpF16x2Fma { Reg dst; Operand a, b, c; };
 struct OpF16x2Neg { Reg dst; Operand src; };
 
@@ -215,18 +236,26 @@ struct OpWmmaMma {
 };
 struct OpWmmaStore {
   MatLayout layout;
-  Space space;
+  Space space = Space::Generic;
   Addr addr;
   std::vector<Operand> src;
   Operand stride;
 };
-struct OpSetp { CmpOp cmp; Type ty; Reg dst; Operand a, b; };
+struct OpSetp { CmpOp cmp = CmpOp::Eq; Type ty; Reg dst; Operand a, b; };
 struct OpSelp { Type ty; Reg dst; Operand a, b; Reg pred; };
-struct OpPredBin { PredBinOp op; Reg dst; Reg a, b; };
+struct OpPredBin { PredBinOp op = PredBinOp::And; Reg dst; Reg a, b; };
 struct OpNotPred { Reg dst; Reg src; };
-struct OpAtom { AtomOp op; Space space; Type ty; Reg dst; Addr addr; Operand b; Operand c; };
-struct OpBra { size_t target; std::string label; };  // target = instruction index
+struct OpAtom { AtomOp op = AtomOp::Add; Space space = Space::Generic; Type ty; Reg dst; Addr addr; Operand b; Operand c; };
+struct OpBra { size_t target = 0; std::string label; };  // target = instruction index
 struct OpBar {};                                     // bar.sync 0
+// An instruction with nothing to do here: a memory fence, or a backoff hint.
+// Distinct from OpBar because a fence is *not* a barrier -- mapping membar onto
+// bar.sync made every fence wait for the whole block, which a kernel that
+// fences on one warp's path would have hung on.
+struct OpNop {};
+// activemask.b32 d -- the mask of lanes of this warp currently executing. Warp
+// algorithms use it as the membership for a following .sync operation.
+struct OpActiveMask { Reg dst; };
 // trap aborts the launch. CUDA reports it as an unspecified launch failure,
 // and a kernel that reaches it has detected something it cannot continue past,
 // so it must not be silently skipped.
@@ -236,18 +265,45 @@ struct OpTrap {};
 // gives all of them the result. Unlike bar.sync it produces a value, so it
 // cannot complete until every warp has arrived.
 enum class BarRedOp { And, Or, Popc };
-struct OpBarRed { BarRedOp op; Reg dst; Reg src; bool negate_src = false; };
+struct OpBarRed { BarRedOp op = BarRedOp::And; Reg dst; Reg src; bool negate_src = false; };
 struct OpRet {};
 // Call-sequence machinery (currently only the vprintf builtin is callable).
-struct OpDeclSlot { std::string name; uint32_t size; };            // ".param .b64 param0;" in body
-struct OpStSlot { std::string slot; int64_t offset; Type ty; Operand src; };
-struct OpLdSlot { std::string slot; int64_t offset; Type ty; Reg dst; };
+struct OpDeclSlot { std::string name; uint32_t size = 0; };            // ".param .b64 param0;" in body
+struct OpStSlot { std::string slot; int64_t offset = 0; Type ty; Operand src; };
+// cp.async.{ca,cg}.shared.global [dst], [src], cp-size{, src-size};
+//
+// A copy from global to shared that the *thread* does not wait on: it is
+// issued, batched into a group with cp.async.commit_group, and awaited later
+// with cp.async.wait_group N (at most N groups still outstanding) or
+// cp.async.wait_all. This is what lets a tiled kernel fetch the next tile
+// while computing on the current one, and it is the backbone of every modern
+// attention and GEMM kernel.
+//
+// `src_size` is optional and may be smaller than the copy: the bytes past it
+// are zero-filled rather than read, which is how kernels handle a tile that
+// runs off the end of a tensor without a branch.
+struct OpCpAsync {
+  uint32_t bytes = 16;                 // 4, 8 or 16
+  Addr dst;                            // shared
+  Addr src;                            // global
+  bool have_src_size = false;
+  Operand src_size;                    // bytes actually read; the rest is zeroed
+};
+
+// The group operations. These carry no data: what they do is order the copies
+// above against the reads that consume them.
+struct OpCpAsyncGroup {
+  enum class Kind { Commit, WaitGroup, WaitAll } kind = Kind::Commit;
+  uint32_t keep = 0;                   // wait_group N: leave at most N outstanding
+};
+
+struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
-                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall>;
+                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpActiveMask>;
 
 struct Instr {
   size_t line = 0;                 // source line, for diagnostics

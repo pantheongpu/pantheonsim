@@ -32,6 +32,8 @@ set(VGPU_PROFILES
   nvidia/b200
   nvidia/rtx3060
   nvidia/a100-sxm4-40gb
+  nvidia/gh200-480gb
+  nvidia/h100-pcie
   amd/mi300x
   amd/mi325x
   amd/mi350x
@@ -423,7 +425,8 @@ set_tests_properties(c_harness_vector_add PROPERTIES ENVIRONMENT "VGPU_GPU=nvidi
 # the runtime shim; only meaningful when it was built (CUDA headers present).
 if(TARGET vgpucudart)
   add_test(NAME e2e_vector_add COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_e2e.sh)
-  set_tests_properties(e2e_vector_add PROPERTIES DEPENDS vgpucudart)
+  set_tests_properties(e2e_vector_add PROPERTIES DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
 endif()
 
 # One rank per process over the file-backed NCCL transport. This is the shape
@@ -431,8 +434,35 @@ endif()
 if(TARGET vgpunccl)
   add_test(NAME e2e_nccl_multiproc
            COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_nccl_multiproc.sh 4)
-  set_tests_properties(e2e_nccl_multiproc PROPERTIES DEPENDS vgpunccl TIMEOUT 300)
+  set_tests_properties(e2e_nccl_multiproc PROPERTIES DEPENDS vgpunccl TIMEOUT 300
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
   add_test(NAME e2e_nccl_group COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_nccl_group.sh 4)
+  set_tests_properties(e2e_nccl_group PROPERTIES DEPENDS vgpunccl TIMEOUT 300
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+endif()
+
+# A cuBLAS call captured into a CUDA graph. The library computes on the host,
+# which is invisible to a program until it captures a graph: the call has to be
+# recorded and run at launch, over what the graph's own kernels produced, not
+# computed eagerly over operands that do not exist yet.
+if(TARGET vgpucublas)
+  add_test(NAME e2e_graph_cublas
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_graph_cublas.sh)
+  set_tests_properties(e2e_graph_cublas PROPERTIES
+    DEPENDS vgpucublas
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # A leading dimension pads between columns, not after the last one. Operands
+  # allocated to exactly their extent make an over-read fault instead of
+  # quietly picking up whatever followed them.
+  add_test(NAME e2e_cublas_tight
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_cublas_tight.sh)
+  set_tests_properties(e2e_cublas_tight PROPERTIES
+    DEPENDS vgpucublas
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+endif()
 
 # Real pantheon workloads, built by their own Makefile and run end to end. The
 # unit tests cover instructions one at a time; this covers an unmodified GPU
@@ -444,5 +474,3 @@ add_test(NAME pantheon_workloads
 set_tests_properties(pantheon_workloads PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 1800)
-  set_tests_properties(e2e_nccl_group PROPERTIES DEPENDS vgpunccl TIMEOUT 300)
-endif()

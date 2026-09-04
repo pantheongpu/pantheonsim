@@ -126,6 +126,18 @@ Environment knobs:
 | `VGPU_GPU` | virtual GPU profile id | `nvidia/h100` |
 | `VGPU_DEVICE_COUNT` | number of identical virtual devices | `1` |
 | `VGPU_QUIET` | `1` silences stderr diagnostics | unset |
+| `VGPU_TRACE` | `1` logs every runtime/driver entry point | unset |
+| `VGPU_MAX_STEPS` | raises the runaway-kernel step budget; `0` removes it | built-in |
+| `VGPU_THREADS` | host threads used to run blocks | auto |
+| `VGPU_VRAM_MB` | virtual VRAM size, overriding the profile | profile |
+| `VGPU_STRICT` | `1` turns on the checks that catch bugs hardware hides but that real compiler output trips over: integer division by zero, and storing a register nothing has written | unset |
+
+`VGPU_STRICT` is off by default for a reason worth knowing. Both of those
+checks find real bugs, and both fire on code that is perfectly correct: ptxas
+emits arithmetic whose result is dead, ggml divides by a stride its
+configuration does not use, and CUB stores an undefined register into the
+unused part of a shared tile. A check that also rejects working programs
+cannot be the default, so it is a mode you turn on when you are hunting.
 
 Errors return documented `CUresult` codes **and** print a rich diagnostic:
 

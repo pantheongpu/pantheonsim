@@ -10,6 +10,16 @@ import re
 import sys
 
 
+# Fields whose value is a property of the *configuration* of a device rather
+# than of its model, so a difference between two physically identical cards is
+# expected rather than a correction to make.
+#
+# vram_bytes is the one that bites: an A10 with ECC enabled reports about
+# 1.5 GiB less than the same A10 with it off, and two H100s on different driver
+# versions differed by 10 MiB of reserved memory. Both readings are right.
+CONFIG_DEPENDENT = {"vram_bytes"}
+
+
 def load(path):
     """Parse the restricted-YAML profile subset into a flat key -> value map."""
     out, section = {}, None
@@ -40,12 +50,17 @@ def main():
         # id/model naturally differ when the repo profile is a different SKU.
         diffs.append((k, e, m))
     name = sys.argv[2].split('/')[-1]
-    if not diffs:
+    config = [d for d in diffs if d[0] in CONFIG_DEPENDENT]
+    real = [d for d in diffs if d[0] not in CONFIG_DEPENDENT]
+    if not real:
         print(f'{name}: matches hardware on every shared field')
-        return 0
-    print(f'{name}: {len(diffs)} field(s) differ (repo -> hardware)')
-    for k, e, m in diffs:
-        print(f'  {k:<44} {e:>18}  ->  {m}')
+    else:
+        print(f'{name}: {len(real)} field(s) differ (repo -> hardware)')
+        for k, e, m in real:
+            print(f'  {k:<44} {e:>18}  ->  {m}')
+    for k, e, m in config:
+        # Not a correction to make: see CONFIG_DEPENDENT above.
+        print(f'  [configuration] {k:<30} {e:>18}  vs  {m}')
     return 0
 
 

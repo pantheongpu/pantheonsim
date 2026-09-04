@@ -23,6 +23,8 @@
 #include <bit>
 #include <chrono>
 #include <thread>
+#include <deque>
+#include <memory>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
@@ -94,6 +96,29 @@ struct Path {
   Mask mask = 0;
 };
 
+// One cp.async copy that has been issued but not yet awaited.
+//
+// The source is read when the instruction issues and the destination is
+// written when the thread waits. Both are points the hardware is allowed to
+// pick, and splitting them this way is what makes the instruction mean
+// anything: a kernel that reads the destination before its wait sees the old
+// contents, exactly as it would on a device, instead of data that a
+// synchronous copy would have put there early and hidden the bug.
+struct PendingCopy {
+  uint64_t dst = 0;                  // shared-window address
+  uint32_t bytes = 0;                // 4, 8 or 16
+  std::array<uint8_t, 16> data{};    // read at issue; zero past src-size
+};
+
+// Per-lane copy state, allocated only for warps that actually use cp.async --
+// which is almost none of them, and this is 32 lanes of container otherwise.
+struct AsyncCopies {
+  // Issued but not yet committed to a group.
+  std::array<std::vector<PendingCopy>, kWarpSize> open;
+  // Committed groups, oldest first. wait_group N drains until N remain.
+  std::array<std::deque<std::vector<PendingCopy>>, kWarpSize> groups;
+};
+
 struct Warp {
   enum class State { Ready, AtBarrier, Done };
   State state = State::Ready;
@@ -123,7 +148,18 @@ struct Warp {
   std::unordered_map<std::string, Lanes> slots;  // call-argument slots
   std::vector<std::vector<uint8_t>> local;       // per-lane .local frames (lazy)
   std::array<uint32_t, kWarpSize> tid_x{}, tid_y{}, tid_z{};
+  std::unique_ptr<AsyncCopies> cp;  // created on the first cp.async
 };
+
+// Strict mode, sampled once per launch: consulting it is a relaxed atomic load
+// rather than a getenv on a hot path, and a process that changes the variable
+// between launches gets what it asked for.
+std::atomic<bool> g_strict{false};
+
+void refresh_strict_mode() {
+  const char* v = std::getenv("VGPU_STRICT");
+  g_strict.store(v && v[0] == '1', std::memory_order_relaxed);
+}
 
 // IEEE 754 binary16 <-> double, implemented in software so the engine needs no
 // host f16 support. Round-to-nearest-even, with subnormals and inf/NaN.
@@ -364,15 +400,31 @@ class Interpreter {
   const Lanes& read_operand(Warp& w, const BlockCtx& ctx, const Instr& ins, const Operand& op,
                             Lanes& scratch) {
     if (const auto* r = std::get_if<RegOperand>(&op)) {
+      // Reading a register that has not been written yet is undefined in PTX,
+      // and compilers emit it on purpose. ggml's flash-attention kernels
+      // unroll "pick the value belonging to my lane" into a chain of selp, each
+      // step overwriting the accumulator only for the lane whose index matches;
+      // the chain is seeded with a register nothing has written, and every
+      // lane's copy of that seed is dead by the time the chain ends. NVIDIA's
+      // own compute-sanitizer checks uninitialized *memory* and not registers,
+      // for this reason.
+      //
+      // So an undefined register reads as zero here -- deterministically, which
+      // is more than hardware promises -- and the diagnostic is kept where it
+      // still means something: addr_base, read_pred and exec_st below refuse a
+      // register nothing has written, because an address, a branch condition or
+      // a stored value made of nothing is a bug in any program.
       if (r->reg.wide) {
-        if (r->reg.id >= w.regs64.size() || !w.written64[r->reg.id])
-          ctx_fail(ins, -1, Err::UninitializedRegister,
-                   "register " + r->reg.name + " read before any write");
+        if (r->reg.id >= w.regs64.size() || !w.written64[r->reg.id]) {
+          scratch.fill(0);
+          return scratch;
+        }
         return w.regs64[r->reg.id];
       }
-      if (r->reg.id >= w.regs32.size() || !w.written32[r->reg.id])
-        ctx_fail(ins, -1, Err::UninitializedRegister,
-                 "register " + r->reg.name + " read before any write");
+      if (r->reg.id >= w.regs32.size() || !w.written32[r->reg.id]) {
+        scratch.fill(0);
+        return scratch;
+      }
       return widen(w, w.regs32[r->reg.id]);
     }
     if (const auto* imm = std::get_if<ImmInt>(&op)) {
@@ -407,6 +459,23 @@ class Interpreter {
       case Sreg::NctaidY: return ctx.nctaid[1];
       case Sreg::NctaidZ: return ctx.nctaid[2];
       case Sreg::LaneId: return lane;
+      case Sreg::LaneMaskEq: return 1u << lane;
+      case Sreg::LaneMaskLt: return lane == 0 ? 0u : (~0u >> (kWarpSize - lane));
+      case Sreg::LaneMaskLe: return static_cast<uint32_t>((uint64_t{2} << lane) - 1);
+      case Sreg::LaneMaskGt: return lane == kWarpSize - 1
+                                        ? 0u
+                                        : ~static_cast<uint32_t>((uint64_t{2} << lane) - 1);
+      case Sreg::LaneMaskGe: return ~0u << lane;
+      // Warps are numbered within the block, which is how a kernel uses this:
+      // to index a per-warp slot in shared memory.
+      case Sreg::WarpId: {
+        const uint32_t linear = w.tid_x[lane] + w.tid_y[lane] * ctx.ntid[0] +
+                                w.tid_z[lane] * ctx.ntid[0] * ctx.ntid[1];
+        return linear / kWarpSize;
+      }
+      case Sreg::EnvReg: return 0;
+      case Sreg::NWarpId:
+        return (ctx.ntid[0] * ctx.ntid[1] * ctx.ntid[2] + kWarpSize - 1) / kWarpSize;
     }
     return 0;
   }
@@ -430,9 +499,12 @@ class Interpreter {
   // Reads an operand as 32-bit lanes. Only valid when narrow_operand() holds.
   const Lanes32& read_narrow(Warp& w, const Instr& ins, const Operand& o, Lanes32& scratch) {
     if (const auto* r = std::get_if<RegOperand>(&o)) {
-      if (r->reg.id >= w.regs32.size() || !w.written32[r->reg.id])
-        ctx_fail(ins, -1, Err::UninitializedRegister,
-                 "register " + r->reg.name + " read before any write");
+      // Undefined reads as zero, for the reason given on read_operand.
+      if (r->reg.id >= w.regs32.size() || !w.written32[r->reg.id]) {
+        (void)ins;
+        scratch.fill(0);
+        return scratch;
+      }
       return w.regs32[r->reg.id];
     }
     uint32_t v = std::holds_alternative<ImmInt>(o)
@@ -628,7 +700,7 @@ class Interpreter {
       return;
     }
     if (std::holds_alternative<OpRet>(ins.op)) {
-      exec_ret(w, idx, m);
+      exec_ret(w, ctx, ins, idx, m);
       return;
     }
     if (const auto* op = std::get_if<OpBarRed>(&ins.op)) {
@@ -744,7 +816,7 @@ class Interpreter {
     w.paths.push_back({fall_pc, fallthrough});
   }
 
-  void exec_ret(Warp& w, size_t idx, Mask m) {
+  void exec_ret(Warp& w, const BlockCtx& ctx, const Instr& ins, size_t idx, Mask m) {
     w.exited |= m;
     Mask survivors = w.paths[idx].mask & ~m;
     if (survivors == 0) {
@@ -754,7 +826,10 @@ class Interpreter {
       w.paths[idx].mask = survivors;
       ++w.paths[idx].pc;
     }
-    if (w.paths.empty()) w.state = Warp::State::Done;
+    if (w.paths.empty()) {
+      w.state = Warp::State::Done;
+      drain_async_copies(w, ctx, ins);
+    }
   }
 
   void dispatch(Warp& w, const BlockCtx& ctx, const Instr& ins, Mask m) {
@@ -773,6 +848,22 @@ class Interpreter {
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = int_bin(op->op, op->ty, a[lane], b[lane], ins);
       write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (std::holds_alternative<OpNop>(ins.op)) return;
+    if (const auto* op = std::get_if<OpActiveMask>(&ins.op)) {
+      Lanes r;  // every active lane sees the same membership
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane)) r[lane] = m;
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpCpAsync>(&ins.op)) {
+      exec_cp_async(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpCpAsyncGroup>(&ins.op)) {
+      exec_cp_async_group(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpLd>(&ins.op)) {
@@ -875,11 +966,11 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpSelp>(&ins.op)) {
+      Mask p = read_pred(w, ins, op->pred);
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
-      Mask p = read_pred(w, ins, op->pred);
       Lanes r;  // written for every active lane below
       for (uint32_t lane = 0; lane < kWarpSize; ++lane)
         if (m & (1u << lane)) r[lane] = (p & (1u << lane)) ? a[lane] : b[lane];
@@ -1013,6 +1104,10 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpLdMatrix>(&ins.op)) {
       exec_ldmatrix(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpMovMatrix>(&ins.op)) {
+      exec_movmatrix(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpMma>(&ins.op)) {
@@ -1599,6 +1694,37 @@ class Interpreter {
     }
   }
 
+  // The warp holds an 8x8 matrix of 16-bit elements in the same layout ldmatrix
+  // produces: lane L holds row L/4, columns 2*(L%4) and 2*(L%4)+1, packed into
+  // one 32-bit register. Transposing it is a matter of re-gathering, since
+  // every element already lives somewhere in the warp.
+  void exec_movmatrix(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMovMatrix& op,
+                      Mask m) {
+    Lanes _s_a;
+    const Lanes& a = read_operand(w, ctx, ins, op.src, _s_a);
+    uint16_t tile[8][8] = {};
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      // .aligned means the whole warp executes this together; a partial warp
+      // would be reading registers no lane wrote.
+      if (!(m & (1u << lane)))
+        ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                 "movmatrix is warp-aligned: every lane must be active, because the "
+                 "matrix is spread across all 32 of them");
+      const uint32_t row = lane / 4, colpair = lane % 4;
+      tile[row][colpair * 2] = static_cast<uint16_t>(a[lane] & 0xFFFFu);
+      tile[row][colpair * 2 + 1] = static_cast<uint16_t>((a[lane] >> 16) & 0xFFFFu);
+    }
+    Lanes r{};
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      const uint32_t row = lane / 4, colpair = lane % 4;
+      // d[row][c] = a[c][row]
+      const uint16_t lo = tile[colpair * 2][row];
+      const uint16_t hi = tile[colpair * 2 + 1][row];
+      r[lane] = (static_cast<uint64_t>(hi) << 16) | lo;
+    }
+    write_reg(w, op.dst, m, r, 32);
+  }
+
   // Decodes one element of an mma A/B fragment from a lane's register.
   double mma_elem(MmaElem t, bool is_signed, uint64_t reg, uint32_t slot) {
     switch (t) {
@@ -1895,6 +2021,13 @@ class Interpreter {
     return static_cast<int64_t>(m);
   }
 
+  // Strict mode: the checks that hunt for bugs hardware would hide, but which
+  // real compiler output trips over. Integer division by zero and a store of a
+  // register nothing has written are both undefined-but-harmless in code ptxas
+  // and CUB emit every day, so neither can be on by default -- and both are
+  // worth having when you are looking for a bug rather than running a workload.
+  static bool strict() { return g_strict.load(std::memory_order_relaxed); }
+
   uint64_t int_bin(IntBinOp op, Type ty, uint64_t a, uint64_t b, const Instr& ins) {
     bool sig = ty.is_signed();
     auto s = [&](uint64_t v) -> int64_t { return narrow_s(v, ty.bits); };
@@ -1907,11 +2040,23 @@ class Interpreter {
       case IntBinOp::Max: return sig ? static_cast<uint64_t>(std::max(s(a), s(b))) : std::max(u(a), u(b));
       case IntBinOp::Div:
       case IntBinOp::Rem: {
-        if (u(b) == 0)
-          // Real GPUs produce an undefined value here; VirtualGPU traps instead,
-          // because a div-by-zero in a kernel is almost always a bug (documented
-          // deliberate divergence — see ARCHITECTURE.md).
-          ctx_fail(ins, -1, Err::InvalidValue, "integer division by zero");
+        if (u(b) == 0) {
+          // PTX leaves this undefined and real GPUs do not trap. VirtualGPU
+          // used to, on the reasoning that a div-by-zero is almost always a
+          // bug -- but real code falsifies that: ggml's flash-attention passes
+          // zero for a stride its configuration does not use, computes a
+          // remainder from it, and discards the answer. Trapping made those
+          // kernels unrunnable over arithmetic that was never going to matter.
+          //
+          // So the default now follows the hardware, deterministically: a
+          // quotient of all-ones and a remainder of the dividend, which is what
+          // the usual expansion of these instructions leaves behind. The trap
+          // is still available for a debugging run, since it does find real
+          // bugs -- it just cannot be the default.
+          if (strict())
+            ctx_fail(ins, -1, Err::InvalidValue, "integer division by zero");
+          return op == IntBinOp::Div ? narrow_u(~uint64_t{0}, ty.bits) : u(a);
+        }
         if (op == IntBinOp::Div)
           return sig ? static_cast<uint64_t>(s(a) / s(b)) : u(a) / u(b);
         return sig ? static_cast<uint64_t>(s(a) % s(b)) : u(a) % u(b);
@@ -2044,6 +2189,101 @@ class Interpreter {
     return widen(w, w.regs32[a.base_id]);
   }
 
+  // ---- cp.async ----
+
+  // Issue: read the source now, hold the bytes, and leave the destination
+  // untouched until the thread waits for the group this copy lands in.
+  void exec_cp_async(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCpAsync& op, Mask m) {
+    if (!w.cp) w.cp = std::make_unique<AsyncCopies>();
+    Lanes _s_dst, _s_src;
+    const Lanes& dstb = addr_base(w, ctx, ins, op.dst, _s_dst);
+    const Lanes& srcb = addr_base(w, ctx, ins, op.src, _s_src);
+    Lanes _s_size;
+    const Lanes* size_lanes = nullptr;
+    if (op.have_src_size) size_lanes = &read_operand(w, ctx, ins, op.src_size, _s_size);
+
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      if (!(m & (1u << lane))) continue;
+      PendingCopy pc;
+      pc.bytes = op.bytes;
+      // The destination is a shared-space address; the source a global one.
+      pc.dst = kSharedVaBase + dstb[lane] + static_cast<uint64_t>(op.dst.offset);
+      const uint64_t src = srcb[lane] + static_cast<uint64_t>(op.src.offset);
+      // Bytes past src-size are zero-filled rather than read, which is how a
+      // tile that runs off the end of a tensor is handled without a branch.
+      uint64_t readable = op.bytes;
+      if (size_lanes) readable = std::min<uint64_t>((*size_lanes)[lane], op.bytes);
+      // Fault now if the destination could not take the write: the instruction
+      // that named the address is far more useful to report than the wait that
+      // happens to drain it.
+      check_shared(ctx, ins, static_cast<int>(lane), pc.dst, op.bytes);
+      for (uint64_t off = 0; off < readable;) {
+        const uint32_t chunk = static_cast<uint32_t>(std::min<uint64_t>(8, readable - off));
+        const uint64_t v = load_routed(w, ctx, ins, lane, src + off, chunk);
+        std::memcpy(pc.data.data() + off, &v, chunk);
+        off += chunk;
+      }
+      w.cp->open[lane].push_back(pc);
+    }
+    count_memory(Space::Global, op.bytes, popcount_mask(m), /*is_store=*/false);
+  }
+
+  // Land one group's copies in shared memory.
+  void complete_group(Warp& w, const BlockCtx& ctx, const Instr& ins, uint32_t lane,
+                      const std::vector<PendingCopy>& group) {
+    (void)w;
+    for (const PendingCopy& pc : group) {
+      check_shared(ctx, ins, static_cast<int>(lane), pc.dst, pc.bytes);
+      std::memcpy(ctx.shared->data() + (pc.dst - kSharedVaBase), pc.data.data(), pc.bytes);
+      // The shared write lands here, not where the copy was issued, so this is
+      // where it is counted.
+      count_memory(Space::Shared, pc.bytes, 1, /*is_store=*/true);
+    }
+  }
+
+  void exec_cp_async_group(Warp& w, const BlockCtx& ctx, const Instr& ins,
+                           const OpCpAsyncGroup& op, Mask m) {
+    if (!w.cp) {
+      // Waiting with nothing outstanding is legal and common -- a loop's first
+      // iteration waits before it has issued anything.
+      return;
+    }
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      if (!(m & (1u << lane))) continue;
+      auto& open = w.cp->open[lane];
+      auto& groups = w.cp->groups[lane];
+      // wait_all is defined as commit_group followed by wait_group 0, so both
+      // it and commit close whatever is open first.
+      if (op.kind != OpCpAsyncGroup::Kind::WaitGroup) {
+        if (!open.empty()) {
+          groups.push_back(std::move(open));
+          open.clear();
+        }
+      }
+      if (op.kind == OpCpAsyncGroup::Kind::Commit) continue;
+      const size_t keep = op.kind == OpCpAsyncGroup::Kind::WaitAll ? 0 : op.keep;
+      while (groups.size() > keep) {
+        complete_group(w, ctx, ins, lane, groups.front());
+        groups.pop_front();
+      }
+    }
+  }
+
+  // A thread that ends with copies still in flight still performs them: the
+  // hardware does not cancel an issued copy because the thread finished, and
+  // another warp in the block may yet read what it wrote.
+  void drain_async_copies(Warp& w, const BlockCtx& ctx, const Instr& ins) {
+    if (!w.cp) return;
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      for (auto& g : w.cp->groups[lane]) complete_group(w, ctx, ins, lane, g);
+      w.cp->groups[lane].clear();
+      if (!w.cp->open[lane].empty()) {
+        complete_group(w, ctx, ins, lane, w.cp->open[lane]);
+        w.cp->open[lane].clear();
+      }
+    }
+  }
+
   void exec_ld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLd& op, Mask m) {
     uint32_t size = op.ty.bytes();
     size_t n = op.dsts.size();
@@ -2131,6 +2371,17 @@ class Interpreter {
     std::vector<Lanes> vals;
     vals.reserve(n);
     for (const auto& src : op.srcs) {
+      // A value nothing has written, on its way to memory, looks like a bug --
+      // but CUB's radix sort stores exactly that into the unused part of a
+      // shared tile, and never reads it back. So this is a strict-mode check
+      // rather than a default one; see strict().
+      if (const auto* r = strict() ? std::get_if<RegOperand>(&src) : nullptr) {
+        const bool init = r->reg.wide ? (r->reg.id < w.regs64.size() && w.written64[r->reg.id])
+                                      : (r->reg.id < w.regs32.size() && w.written32[r->reg.id]);
+        if (!init)
+          ctx_fail(ins, -1, Err::UninitializedRegister,
+                   "store writes register " + r->reg.name + ", which nothing has written");
+      }
       Lanes tmp;
       vals.push_back(read_operand(w, ctx, ins, src, tmp));
     }
@@ -2435,6 +2686,24 @@ KernelResources kernel_resources(const EntryFn& fn, const DeviceProfile& profile
     fn.cached_peak_live = usage.peak_live;
     fn.regs_analyzed = true;
   }
+  // A thread cannot occupy more architectural registers than the ISA has. When
+  // the data flow needs more, ptxas does not give up -- it spills the excess to
+  // local memory and the kernel runs, slower. Treating the analysis figure as a
+  // hard requirement instead turned a register-hungry but perfectly legal
+  // kernel into a launch that could never happen: ggml's flash-attention
+  // kernels want 272 by this measure, and refusing them meant the whole
+  // attention path was unreachable.
+  //
+  // The interpreter has no architectural register file to run out of, so this
+  // only corrects what is *reported* -- the occupancy figure and the launch
+  // decision, which are exactly the things the number exists to inform.
+  const uint32_t arch_max = profile.limits.max_registers_per_thread;
+  if (arch_max && usage.regs_per_thread > arch_max) {
+    const uint32_t spilled = usage.regs_per_thread - arch_max;
+    usage.spilled_regs = spilled;
+    usage.regs_per_thread = arch_max;
+    usage.local_bytes += spilled * 4u;  // a spilled 32-bit register
+  }
   KernelResources r;
   r.usage = usage;
   r.occupancy = ptx::compute_occupancy(
@@ -2453,7 +2722,9 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
   uint64_t threads = 1;
   for (int i = 0; i < 3; ++i) {
     if (cfg.block[i] == 0 || cfg.grid[i] == 0)
-      throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': grid/block dimensions must be >= 1");
+      throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': grid/block dimensions must be "
+                        ">= 1, got grid ", cfg.grid[0], "x", cfg.grid[1], "x", cfg.grid[2],
+                        " block ", cfg.block[0], "x", cfg.block[1], "x", cfg.block[2]);
     if (cfg.block[i] > p.limits.max_block_dim[i])
       throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': block dim ", i, " is ", cfg.block[i],
                         ", profile ", p.id, " allows at most ", p.limits.max_block_dim[i]);
@@ -2492,10 +2763,6 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
   // "too many resources requested for launch" a real driver reports.
   KernelResources res = kernel_resources(fn, p, static_cast<uint32_t>(threads),
                                          cfg.shared_bytes);
-  if (res.usage.regs_per_thread > p.limits.max_registers_per_thread)
-    throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "' needs ",
-                      res.usage.regs_per_thread, " registers per thread; profile ", p.id,
-                      " allows at most ", p.limits.max_registers_per_thread);
   uint64_t block_regs = uint64_t{res.usage.regs_per_thread} * threads;
   if (block_regs > p.limits.registers_per_block)
     throw Error::make(Err::LaunchConfig, "too many resources requested for launch: kernel '",
@@ -2566,6 +2833,7 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
                    const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
                    const DeviceProfile& profile, const SymbolTable* symbols,
                    const ProgressFn& progress) {
+  refresh_strict_mode();
   validate(fn, cfg, profile);
   LaunchConfig eff = cfg;
   eff.max_steps = effective_max_steps(cfg.max_steps);

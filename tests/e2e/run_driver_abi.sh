@@ -4,7 +4,7 @@
 # not drifted apart.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-shim="$root/build/shim"
+shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 out="${TMPDIR:-/tmp}/vgpu-driver-abi.$$"
 command -v nvcc >/dev/null || { echo "SKIP: nvcc not found"; exit 0; }
 [[ -e "$shim/libcuda.so.1" ]] || { echo "SKIP: libvgpucuda not built"; exit 0; }

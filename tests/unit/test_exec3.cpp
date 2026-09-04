@@ -568,7 +568,6 @@ VTEST(atomics_are_atomic_across_blocks) {
   VCHECK_EQ(total, 256u * 64u);
 }
 
-VTEST_MAIN
 
 // Float atomics are what reductions, gradient accumulation, and embedding
 // backward passes are built out of, so a simulator without them cannot run ML
@@ -1046,3 +1045,321 @@ VTEST(bar_red_reduces_across_the_block) {
   VCHECK_EQ(every.second, 1u);
   mem.free(out);
 }
+
+// ---- cp.async ----
+//
+// The instruction's whole meaning is that the copy is *not* finished when it
+// issues. A test that only checked the data arrives would pass just as well
+// against a plain synchronous copy and prove nothing, so these pin the timing.
+
+VTEST(cp_async_lands_only_after_the_wait) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 src, .param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .shared .align 16 .b8 tile[16];
+    ld.param.u64 %rd1, [src];
+    cvta.to.global.u64 %rd2, %rd1;
+    ld.param.u64 %rd3, [out];
+    cvta.to.global.u64 %rd4, %rd3;
+    mov.u32 %r1, tile;
+    mov.u32 %r6, 0xAAAAAAAA;
+    st.shared.u32 [%r1], %r6;                 // poison the destination
+    cp.async.cg.shared.global [%r1], [%rd2], 16;
+    cp.async.commit_group;
+    ld.shared.u32 %r2, [%r1];                 // before the wait: still poison
+    st.global.u32 [%rd4], %r2;
+    cp.async.wait_group 0;
+    ld.shared.u32 %r3, [%r1];                 // after the wait: the copy
+    st.global.u32 [%rd4+4], %r3;
+    ld.shared.u32 %r4, [%r1+12];
+    st.global.u32 [%rd4+8], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t src = e.mem.alloc(16), out = e.mem.alloc(16);
+  for (int i = 0; i < 4; ++i) e.mem.store_scalar(src + 4 * i, 4, 0x11111111ull * (i + 1));
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(src), arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0xAAAAAAAA});      // not yet copied
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0x11111111});  // after the wait
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{0x44444444});  // all 16 bytes
+}
+
+VTEST(cp_async_wait_group_keeps_later_groups_pending) {
+  // Two groups, waiting with one still allowed outstanding: the first must have
+  // landed and the second must not. This is the double-buffering pattern every
+  // tiled kernel is built on.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 src, .param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .shared .align 16 .b8 tile[32];
+    ld.param.u64 %rd1, [src];
+    cvta.to.global.u64 %rd2, %rd1;
+    ld.param.u64 %rd3, [out];
+    cvta.to.global.u64 %rd4, %rd3;
+    mov.u32 %r1, tile;
+    mov.u32 %r6, 0xAAAAAAAA;
+    mov.u32 %r7, 0xBBBBBBBB;
+    st.shared.u32 [%r1], %r6;
+    st.shared.u32 [%r1+16], %r7;
+    cp.async.ca.shared.global [%r1], [%rd2], 4;
+    cp.async.commit_group;
+    cp.async.ca.shared.global [%r1+16], [%rd2+4], 4;
+    cp.async.commit_group;
+    cp.async.wait_group 1;
+    ld.shared.u32 %r2, [%r1];
+    st.global.u32 [%rd4], %r2;
+    ld.shared.u32 %r3, [%r1+16];
+    st.global.u32 [%rd4+4], %r3;
+    cp.async.wait_all;
+    ld.shared.u32 %r4, [%r1+16];
+    st.global.u32 [%rd4+8], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t src = e.mem.alloc(16), out = e.mem.alloc(16);
+  e.mem.store_scalar(src, 4, 0x11111111u);
+  e.mem.store_scalar(src + 4, 4, 0x22222222u);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(src), arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0x11111111});      // group 0 landed
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0xBBBBBBBB});  // group 1 pending
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{0x22222222});  // wait_all drains it
+}
+
+VTEST(cp_async_zero_fills_past_the_source_size) {
+  // The src-size operand is how a kernel reads a tile that runs off the end of
+  // a tensor without branching: the bytes past it read as zero, not as
+  // whatever happened to follow it in memory.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 src, .param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .shared .align 16 .b8 tile[16];
+    ld.param.u64 %rd1, [src];
+    cvta.to.global.u64 %rd2, %rd1;
+    ld.param.u64 %rd3, [out];
+    cvta.to.global.u64 %rd4, %rd3;
+    mov.u32 %r1, tile;
+    mov.u32 %r5, 4;
+    cp.async.cg.shared.global [%r1], [%rd2], 16, %r5;
+    cp.async.wait_all;
+    ld.shared.u32 %r2, [%r1];
+    st.global.u32 [%rd4], %r2;
+    ld.shared.u32 %r3, [%r1+4];
+    st.global.u32 [%rd4+4], %r3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t src = e.mem.alloc(16), out = e.mem.alloc(16);
+  for (int i = 0; i < 4; ++i) e.mem.store_scalar(src + 4 * i, 4, 0x11111111ull * (i + 1));
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(src), arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0x11111111});  // within src-size
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0});       // past it: zero-filled
+}
+
+VTEST(movmatrix_transposes_the_warps_8x8_tile) {
+  // Element (r,c) = r*8+c, so the transpose is unmistakable: after it, the
+  // lane holding row r must hold what column r held.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 2;          // row = lane / 4
+    and.b32 %r3, %r1, 3;          // colpair = lane % 4
+    shl.b32 %r4, %r2, 3;          // row * 8
+    shl.b32 %r5, %r3, 1;          // colpair * 2
+    add.s32 %r6, %r4, %r5;        // low half  = row*8 + colpair*2
+    add.s32 %r7, %r6, 1;          // high half = that + 1
+    shl.b32 %r7, %r7, 16;
+    or.b32 %r6, %r6, %r7;
+    movmatrix.sync.aligned.m8n8.trans.b16 %r5, %r6;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd3, %rd2, %rd3;
+    st.global.u32 [%rd3], %r5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t lane = 0; lane < 32; ++lane) {
+    const uint32_t row = lane / 4, colpair = lane % 4;
+    const uint64_t got = e.mem.load_scalar(out + lane * 4, 4);
+    // d[row][c] = a[c][row] = c*8 + row, for c = colpair*2 and colpair*2+1.
+    const uint32_t lo = (colpair * 2) * 8 + row;
+    const uint32_t hi = (colpair * 2 + 1) * 8 + row;
+    VCHECK_EQ(got & 0xFFFFu, uint64_t{lo});
+    VCHECK_EQ((got >> 16) & 0xFFFFu, uint64_t{hi});
+  }
+}
+
+VTEST(integer_division_by_zero_follows_the_hardware) {
+  // PTX leaves this undefined and real GPUs do not trap. VirtualGPU used to,
+  // on the reasoning that a div-by-zero is almost always a bug -- but ggml's
+  // flash-attention passes zero for a stride its configuration does not use,
+  // takes a remainder from it, and throws the answer away. Trapping made those
+  // kernels unrunnable over arithmetic that never mattered.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 7;
+    mov.u32 %r2, 0;
+    div.s32 %r3, %r1, %r2;
+    st.global.u32 [%rd2], %r3;
+    rem.s32 %r4, %r1, %r2;
+    st.global.u32 [%rd2+4], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(8);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  // Deterministic, which is more than hardware promises: all-ones for the
+  // quotient, the dividend for the remainder.
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0xFFFFFFFF});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{7});
+}
+
+VTEST(lane_masks_have_the_values_warp_algorithms_depend_on) {
+  // popc(%lanemask_le & mask) is how CUB ranks a lane among its peers. Getting
+  // these wrong is not an off-by-one in a number, it is an address.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 20;
+    add.s64 %rd4, %rd2, %rd3;
+    mov.u32 %r2, %lanemask_eq;
+    st.global.u32 [%rd4], %r2;
+    mov.u32 %r3, %lanemask_lt;
+    st.global.u32 [%rd4+4], %r3;
+    mov.u32 %r4, %lanemask_le;
+    st.global.u32 [%rd4+8], %r4;
+    mov.u32 %r5, %lanemask_gt;
+    st.global.u32 [%rd4+12], %r5;
+    mov.u32 %r6, %lanemask_ge;
+    st.global.u32 [%rd4+16], %r6;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 20);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t l = 0; l < 32; ++l) {
+    const uint64_t base = out + l * 20;
+    const uint32_t eq = 1u << l;
+    const uint32_t lt = l == 0 ? 0u : (~0u >> (32 - l));
+    const uint32_t le = lt | eq;
+    const uint32_t ge = ~0u << l;
+    const uint32_t gt = ge & ~eq;
+    VCHECK_EQ(e.mem.load_scalar(base, 4), uint64_t{eq});
+    VCHECK_EQ(e.mem.load_scalar(base + 4, 4), uint64_t{lt});
+    VCHECK_EQ(e.mem.load_scalar(base + 8, 4), uint64_t{le});
+    VCHECK_EQ(e.mem.load_scalar(base + 12, 4), uint64_t{gt});
+    VCHECK_EQ(e.mem.load_scalar(base + 16, 4), uint64_t{ge});
+  }
+}
+
+VTEST(ballot_returns_the_lanes_that_voted_not_their_complement) {
+  // vote.ballot's negate_src flag had no default initializer, so a ballot with
+  // no '!' read whatever was on the stack: usually true, which returned the
+  // complement of the mask. Almost nothing noticed, because most uses feed
+  // popc or compare against zero and both survive a complement. CUB's radix
+  // sort does not -- it ranks a lane with popc(%lanemask_le & ballot), and a
+  // complemented ballot ranked every lane zero and stored below its array.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %laneid;
+    mul.wide.u32 %rd3, %r1, 12;
+    add.s64 %rd4, %rd2, %rd3;
+    setp.lt.u32 %p1, %r1, 16;
+    vote.sync.ballot.b32 %r2, %p1, -1;
+    st.global.u32 [%rd4], %r2;
+    setp.eq.s32 %p2, %r1, 0;
+    vote.sync.ballot.b32 %r3, %p2, -1;
+    st.global.u32 [%rd4+4], %r3;
+    vote.sync.ballot.b32 %r4, !%p2, -1;
+    st.global.u32 [%rd4+8], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 12);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t l = 0; l < 32; ++l) {
+    VCHECK_EQ(e.mem.load_scalar(out + l * 12, 4), uint64_t{0x0000FFFF});
+    VCHECK_EQ(e.mem.load_scalar(out + l * 12 + 4, 4), uint64_t{0x00000001});
+    VCHECK_EQ(e.mem.load_scalar(out + l * 12 + 8, 4), uint64_t{0xFFFFFFFE});
+  }
+}
+
+VTEST(activemask_is_the_lanes_still_running) {
+  // Half the warp returns early; the rest must see only themselves.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %laneid;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    setp.lt.u32 %p1, %r1, 16;
+    @%p1 bra DONE;
+    activemask.b32 %r2;
+    st.global.u32 [%rd4], %r2;
+DONE:
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t l = 16; l < 32; ++l)
+    VCHECK_EQ(e.mem.load_scalar(out + l * 4, 4), uint64_t{0xFFFF0000});
+}
+
+VTEST_MAIN

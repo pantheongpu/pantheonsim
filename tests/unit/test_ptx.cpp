@@ -21,9 +21,13 @@ std::string read_file(const std::string& path) {
   return os.str();
 }
 
+// PTX requires every register to be declared, and an undeclared %name is a
+// special register rather than a register -- so these fixtures declare the
+// usual files up front instead of relying on names springing into existence.
 std::string wrap_kernel(const std::string& body, const std::string& params = "") {
-  return ".version 8.3\n.target sm_90\n.address_size 64\n.visible .entry k(" + params + ")\n{\n" + body +
-         "\n}\n";
+  return ".version 8.3\n.target sm_90\n.address_size 64\n.visible .entry k(" + params + ")\n{\n" +
+         ".reg .b32 %r<16>;\n.reg .b64 %rd<16>;\n.reg .f32 %f<16>;\n.reg .f64 %fd<16>;\n"
+         ".reg .b16 %rs<16>;\n.reg .pred %p<16>;\n" + body + "\n}\n";
 }
 
 }  // namespace
@@ -79,12 +83,43 @@ VTEST(negative_offsets_and_immediates) {
 }
 
 VTEST(unsupported_instruction_names_kernel_and_line) {
-  auto err = VCAPTURE(
-      Error, parse(wrap_kernel("wmma.load.a.sync.aligned.m8n8k4.row.f16 {%f1}, [%rd1];\nret;")));
+  // Spelled out rather than wrapped, so the line the diagnostic reports is
+  // visible here and does not move when the fixture's prelude changes.
+  auto err = VCAPTURE(Error, parse(".version 8.3\n"                                    // 1
+                                   ".target sm_90\n"                                   // 2
+                                   ".address_size 64\n"                                // 3
+                                   ".visible .entry k()\n"                             // 4
+                                   "{\n"                                               // 5
+                                   ".reg .f32 %f<4>;\n"                                // 6
+                                   ".reg .b64 %rd<4>;\n"                               // 7
+                                   "wmma.load.a.sync.aligned.m8n8k4.row.f16 {%f1}, [%rd1];\n"  // 8
+                                   "ret;\n}\n"));
   VCHECK(err.code() == Err::UnsupportedPtx);
   VCHECK_CONTAINS(err.what(), "wmma.load");
   VCHECK_CONTAINS(err.what(), "kernel 'k'");
-  VCHECK_CONTAINS(err.what(), "line 6");
+  VCHECK_CONTAINS(err.what(), "line 8");
+}
+
+VTEST(an_unknown_special_register_is_not_silently_a_register) {
+  // %lanemask_le used to fall through to an ordinary register, which nothing
+  // had written -- so it read as zero and CUB's radix sort ranked every lane at
+  // zero and stored four bytes below its shared array. An unimplemented special
+  // register has to say so.
+  auto err = VCAPTURE(Error, parse(wrap_kernel("mov.u32 %r1, %total_smem_size;\nret;")));
+  VCHECK(err.code() == Err::UnsupportedPtx);
+  VCHECK_CONTAINS(err.what(), "%total_smem_size");
+}
+
+VTEST(lane_masks_are_the_masks_they_name) {
+  Module m = parse(wrap_kernel("mov.u32 %r1, %lanemask_le;\n"
+                               "mov.u32 %r2, %lanemask_lt;\n"
+                               "mov.u32 %r3, %lanemask_gt;\n"
+                               "mov.u32 %r4, %lanemask_ge;\n"
+                               "mov.u32 %r5, %lanemask_eq;\nret;"));
+  const auto& body = m.entries[0].body;
+  VCHECK_EQ(body.size(), size_t{6});
+  VCHECK(std::get<SregOperand>(std::get<OpMov>(body[0].op).src).reg == Sreg::LaneMaskLe);
+  VCHECK(std::get<SregOperand>(std::get<OpMov>(body[4].op).src).reg == Sreg::LaneMaskEq);
 }
 
 VTEST(shared_memory_declarations_parse) {
@@ -177,6 +212,33 @@ VTEST(global_initialised_with_a_symbol) {
   VCHECK_EQ(m.globals[1].name, std::string("pointer"));
   VCHECK_EQ(m.globals[1].init_symbol, std::string("target"));
   VCHECK(m.globals[1].init.empty());  // the address is only known at load time
+}
+
+// Cache hints tell the hardware how far to prefetch; they never change what a
+// load returns. The lexer has to keep the doubled colon inside the opcode --
+// splitting on it tore "ld.global.nc.L2::128B.u32" in half and made every
+// flash-attention kernel unparseable rather than merely unsupported.
+VTEST(cache_hints_are_accepted_and_ignored) {
+  Module m = parse(
+      ".version 8.3\n.target sm_90\n.address_size 64\n"
+      ".visible .entry k(.param .u64 p)\n{\n"
+      ".reg .b64 %rd<3>;\n.reg .b32 %r<3>;\n"
+      "ld.param.u64 %rd1, [p];\n"
+      "cvta.to.global.u64 %rd2, %rd1;\n"
+      "ld.global.nc.L2::128B.u32 %r1, [%rd2];\n"
+      "ld.global.L1::no_allocate.u32 %r2, [%rd2];\n"
+      "st.global.L2::256B.u32 [%rd2], %r1;\n"
+      "ret;\n}\n");
+  VCHECK_EQ(m.entries.size(), size_t{1});
+  // The hinted loads parse to exactly the instructions the unhinted ones would.
+  const auto& body = m.entries[0].body;
+  size_t loads = 0, stores = 0;
+  for (const auto& i : body) {
+    if (std::holds_alternative<OpLd>(i.op)) ++loads;
+    if (std::holds_alternative<OpSt>(i.op)) ++stores;
+  }
+  VCHECK_EQ(loads, size_t{3});   // ld.param plus the two hinted global loads
+  VCHECK_EQ(stores, size_t{1});
 }
 
 VTEST_MAIN

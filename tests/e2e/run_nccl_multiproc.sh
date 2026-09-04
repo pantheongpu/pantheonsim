@@ -6,7 +6,8 @@
 #   tests/e2e/run_nccl_multiproc.sh [nranks]     (default 4)
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-shim="$root/build/shim"
+. "$root/tests/shim_guard.sh"
+shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 nranks="${1:-4}"
 out="${TMPDIR:-/tmp}/vgpu-nccl-mp.$$"
 
@@ -16,6 +17,7 @@ command -v nvcc >/dev/null || { echo "SKIP: nvcc not found"; exit 0; }
 mkdir -p "$out"
 trap 'rm -rf "$out"' EXIT
 nvcc -std=c++14 -arch=sm_86 -Wno-deprecated-gpu-targets -cudart shared \
+     $(shim_sanitizer_nvcc_flags "$shim") \
      -I"$root/third_party/nccl_include" "$root/tests/e2e/nccl_multiproc.cu" \
      -L"$shim" -lnccl -o "$out/mp" || { echo "FAIL: compile"; exit 1; }
 

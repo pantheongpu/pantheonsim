@@ -180,9 +180,12 @@ VTEST(launch_bounds_are_enforced) {
   VCHECK_CONTAINS(err.what(), "__launch_bounds__");
 }
 
-VTEST(register_budget_refuses_an_impossible_launch) {
-  // A block asking for more registers than the device has must fail the way
-  // hardware does, not run and produce numbers.
+VTEST(more_registers_than_the_isa_has_spills_instead_of_failing) {
+  // A thread cannot occupy more architectural registers than the ISA has, but
+  // that is not a reason to refuse the launch: ptxas spills the excess to local
+  // memory and the kernel runs, slower. Treating the analysis figure as a hard
+  // requirement made register-hungry but perfectly legal kernels unlaunchable
+  // -- which is how the whole flash-attention path became unreachable.
   // Define many 64-bit values and only consume them at the end, so every one
   // is genuinely live at the same time (a chain of dead defs would not be).
   std::string body = ".reg .b64 %rd<600>;\n";
@@ -192,16 +195,45 @@ VTEST(register_budget_refuses_an_impossible_launch) {
     body += "add.s64 %rd1, %rd1, %rd" + std::to_string(i) + ";\n";
   body += "ret;\n";
   auto m = ptx::parse(std::string(kHeader) + ".visible .entry k()\n{\n" + body + "}\n");
-  auto u = ptx::analyze_registers(m.entries[0]);
-  VCHECK(u.regs_per_thread > 255);  // way past any real per-thread ceiling
+  auto raw = ptx::analyze_registers(m.entries[0]);
+  VCHECK(raw.regs_per_thread > 255);  // the data flow really does want more
 
   MemoryManager mem(1 << 20);
   DeviceProfile prof = load_gpu("nvidia/rtx3060");
   LaunchConfig cfg;
   cfg.block = {256, 1, 1};
+  // 255 x 256 threads = 65280 registers, inside the 65536 this part has, so
+  // hardware runs this and so must we.
+  exec::launch(m.entries[0], cfg, {}, mem, prof);
+
+  // What is *reported* is the clamped figure, with the difference charged to
+  // local memory as spill.
+  auto res = exec::kernel_resources(m.entries[0], prof, 256, 0);
+  VCHECK_EQ(res.usage.regs_per_thread, 255u);
+  VCHECK(res.usage.spilled_regs > 0);
+  VCHECK(res.usage.local_bytes >= res.usage.spilled_regs * 4);
+}
+
+VTEST(register_budget_refuses_an_impossible_launch) {
+  // The refusal that is real: a block whose threads collectively need more
+  // registers than the file holds. Spilling cannot rescue this one, because
+  // the limit is per block rather than per thread, and hardware reports
+  // "too many resources requested for launch".
+  std::string body = ".reg .b64 %rd<600>;\n";
+  for (int i = 1; i < 300; ++i)
+    body += "mov.u64 %rd" + std::to_string(i) + ", " + std::to_string(i) + ";\n";
+  for (int i = 2; i < 300; ++i)
+    body += "add.s64 %rd1, %rd1, %rd" + std::to_string(i) + ";\n";
+  body += "ret;\n";
+  auto m = ptx::parse(std::string(kHeader) + ".visible .entry k()\n{\n" + body + "}\n");
+
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/rtx3060");
+  LaunchConfig cfg;
+  cfg.block = {1024, 1, 1};  // 255 x 1024 = 261120, far past the 65536 available
   auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, mem, prof));
   VCHECK(err.code() == Err::LaunchConfig);
-  VCHECK_CONTAINS(err.what(), "registers per thread");
+  VCHECK_CONTAINS(err.what(), "too many resources requested for launch");
 }
 
 VTEST(simple_kernel_matches_hardware_register_count) {

@@ -84,6 +84,20 @@ void Device::unload_module(uint64_t module_id) {
   throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
 }
 
+int Device::module_arch(uint64_t module_id) const {
+  for (const auto& lm : modules_) {
+    if (lm.id != module_id) continue;
+    // ".target sm_86" -- and it may carry more, as in ".target sm_86, debug".
+    const std::string& t = lm.mod->target;
+    const size_t at = t.find("sm_");
+    if (at == std::string::npos) return 0;
+    int v = 0;
+    for (size_t i = at + 3; i < t.size() && t[i] >= '0' && t[i] <= '9'; ++i) v = v * 10 + (t[i] - '0');
+    return v;
+  }
+  return 0;
+}
+
 const ptx::EntryFn* Device::get_function(uint64_t module_id, const std::string& name) const {
   for (const auto& lm : modules_) {
     if (lm.id != module_id) continue;

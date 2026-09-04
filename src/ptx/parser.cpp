@@ -22,6 +22,13 @@ const std::unordered_map<std::string, Sreg>& sreg_table() {
       {"%ctaid.x", Sreg::CtaidX},   {"%ctaid.y", Sreg::CtaidY},   {"%ctaid.z", Sreg::CtaidZ},
       {"%nctaid.x", Sreg::NctaidX}, {"%nctaid.y", Sreg::NctaidY}, {"%nctaid.z", Sreg::NctaidZ},
       {"%laneid", Sreg::LaneId},
+      {"%lanemask_eq", Sreg::LaneMaskEq},
+      {"%lanemask_lt", Sreg::LaneMaskLt},
+      {"%lanemask_le", Sreg::LaneMaskLe},
+      {"%lanemask_gt", Sreg::LaneMaskGt},
+      {"%lanemask_ge", Sreg::LaneMaskGe},
+      {"%warpid", Sreg::WarpId},
+      {"%nwarpid", Sreg::NWarpId},
   };
   return t;
 }
@@ -35,18 +42,37 @@ bool inert_mem_modifier(const std::string& p) {
   return inert.count(p) > 0;
 }
 
+// Cache hints (.L2::128B, .L1::no_allocate, .L2::cache_hint) tell the hardware
+// how far to prefetch and what to keep resident. They change how fast a load
+// is, never what it returns, so an interpreter drops them -- and must not
+// mistake one for a modifier it does not know.
+bool is_cache_hint(const std::string& part) {
+  return part.rfind("L1::", 0) == 0 || part.rfind("L2::", 0) == 0;
+}
+
+// ".shared::cta" is the explicit spelling of the ".shared" every kernel here
+// already means. ".shared::cluster" is a different space -- memory in another
+// block of a thread-block cluster -- so that one is left intact to be rejected
+// by name rather than quietly treated as ordinary shared memory.
+std::string normalize_scope(std::string part) {
+  const std::string cta = "::cta";
+  if (part.size() > cta.size() && part.compare(part.size() - cta.size(), cta.size(), cta) == 0)
+    part.resize(part.size() - cta.size());
+  return part;
+}
+
 std::vector<std::string> split_dots(const std::string& s) {
   std::vector<std::string> parts;
   std::string cur;
   for (char c : s) {
     if (c == '.') {
-      if (!cur.empty()) parts.push_back(cur);
+      if (!cur.empty() && !is_cache_hint(cur)) parts.push_back(normalize_scope(cur));
       cur.clear();
     } else {
       cur += c;
     }
   }
-  if (!cur.empty()) parts.push_back(cur);
+  if (!cur.empty() && !is_cache_hint(cur)) parts.push_back(normalize_scope(cur));
   return parts;
 }
 
@@ -559,6 +585,18 @@ class Parser {
     if (w[0] == '%') {
       auto it = sreg_table().find(w);
       if (it != sreg_table().end()) return SregOperand{it->second};
+      // %envreg0 .. %envreg31 all read as zero; they are only distinguished by
+      // number for a driver that sets them, and this one does not.
+      if (w.rfind("%envreg", 0) == 0) return SregOperand{Sreg::EnvReg};
+      // A %-name that was never declared is a special register this engine does
+      // not implement, not a register that happens to be unwritten. Letting it
+      // through as an ordinary register made %lanemask_le read as zero, which
+      // turned CUB's radix sort into a store four bytes below its shared array
+      // -- a silent wrong answer where an unimplemented instruction would have
+      // said so plainly.
+      if (!declared_regs_.count(w))
+        fail_unsupported(t.line, w, cur_fn_ ? cur_fn_->name : std::string(),
+                         "special register '" + w + "'");
       return RegOperand{intern(w)};
     }
     if (isdigit(static_cast<unsigned char>(w[0]))) {
@@ -1579,18 +1617,93 @@ class Parser {
       if (op.callee != "vprintf")
         return unsupported("call to '" + op.callee + "' (only the vprintf builtin is callable)");
       ins.op = op;
+    } else if (op0 == "activemask") {
+      OpActiveMask op;
+      op.dst = expect_reg_operand("activemask destination");
+      ins.op = op;
     } else if (op0 == "trap") {
       ins.op = OpTrap{};
     } else if (op0 == "membar" || op0 == "fence") {
       // Blocks execute their instructions in order and device atomics are
       // serialized by a lock, so every prior write is already visible to
-      // whoever could observe it. There is no reordering here to fence against.
-      ins.op = OpBar{};
+      // whoever could observe it. There is no reordering here to fence against
+      // -- but a fence is not a barrier, and this used to be OpBar, which made
+      // it wait for every warp in the block.
+      ins.op = OpNop{};
     } else if (op0 == "nanosleep") {
       // A backoff hint. Consuming it as a no-op is correct; the operand is a
       // duration nothing here can meaningfully honour.
       (void)parse_operand();
-      ins.op = OpBar{};  // nothing to do; treated as a barrier-free no-op
+      ins.op = OpNop{};
+    } else if (op0 == "movmatrix") {
+      bool trans = false, b16 = false, shape = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "sync" || p == "aligned") ;
+        else if (p == "trans") trans = true;
+        else if (p == "m8n8") shape = true;
+        else if (p == "b16") b16 = true;
+        else return unsupported("movmatrix modifier '." + p + "'");
+      }
+      // Without .trans it would be a plain move, and the only shape and element
+      // width the ISA defines for it are m8n8.b16.
+      if (!trans) return unsupported("movmatrix without .trans");
+      if (!shape || !b16) return unsupported("only movmatrix.m8n8.b16 exists");
+      OpMovMatrix op;
+      op.dst = expect_reg_operand("movmatrix destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "cp" && parts.size() > 1 && parts[1] == "async") {
+      // The group operations first: they carry no addresses.
+      if (parts.size() > 2 && parts[2] == "commit_group") {
+        ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::Commit, 0};
+      } else if (parts.size() > 2 && parts[2] == "wait_all") {
+        ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::WaitAll, 0};
+      } else if (parts.size() > 2 && parts[2] == "wait_group") {
+        Operand n = parse_operand();
+        auto* imm = std::get_if<ImmInt>(&n);
+        if (!imm || imm->value < 0)
+          return unsupported("cp.async.wait_group needs a non-negative immediate");
+        ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::WaitGroup,
+                                static_cast<uint32_t>(imm->value)};
+      } else {
+        // cp.async.<ca|cg>.shared.global [dst], [src], cp-size{, src-size};
+        bool cg = false, ca = false, shared_seen = false, global_seen = false;
+        for (size_t i = 2; i < parts.size(); ++i) {
+          const std::string& p = parts[i];
+          if (p == "cg") cg = true;
+          else if (p == "ca") ca = true;
+          else if (p == "shared") shared_seen = true;
+          else if (p == "global") global_seen = true;
+          else if (p == "mbarrier") return unsupported("cp.async.mbarrier");
+          else return unsupported("cp.async modifier '." + p + "'");
+        }
+        if (!shared_seen || !global_seen)
+          return unsupported("cp.async must name .shared and .global");
+        if (!cg && !ca) return unsupported("cp.async needs .ca or .cg");
+        OpCpAsync op;
+        op.dst = parse_addr(fn);
+        expect_punct(",");
+        op.src = parse_addr(fn);
+        expect_punct(",");
+        {
+          Operand n = parse_operand();
+          auto* imm = std::get_if<ImmInt>(&n);
+          if (!imm || (imm->value != 4 && imm->value != 8 && imm->value != 16))
+            return unsupported("cp.async copy size must be 4, 8 or 16 bytes");
+          op.bytes = static_cast<uint32_t>(imm->value);
+        }
+        // .cg exists only for 16-byte copies; .ca covers 4, 8 and 16. Saying so
+        // beats copying the right bytes under a modifier that cannot mean this.
+        if (cg && op.bytes != 16) return unsupported("cp.async.cg is 16 bytes only");
+        if (peek_punct(",")) {
+          next();
+          op.have_src_size = true;
+          op.src_size = parse_operand();
+        }
+        ins.op = op;
+      }
     } else if ((op0 == "bar" || op0 == "barrier") && parts.size() > 1 && parts[1] == "red") {
       // bar.red.<op>.<type> d, 0, [!]p
       std::optional<BarRedOp> rop;

@@ -1,4 +1,5 @@
 // Unit tests for device profiles and the built-in registry.
+#include <algorithm>
 #include "vgpu/profile.hpp"
 
 #include "vgpu/error.hpp"
@@ -10,13 +11,17 @@ using vgpu::Err;
 using vgpu::Error;
 
 VTEST(registry_lists_all_gpus) {
+  // By membership rather than position: adding a profile used to shift every
+  // index after it and fail this test for the wrong reason.
   auto ids = vgpu::available_gpus();
-  VCHECK_EQ(ids.size(), size_t{10});
-  VCHECK_EQ(ids[0], "nvidia/a10");
-  VCHECK_EQ(ids[4], "nvidia/b200");
-  VCHECK_EQ(ids[5], "nvidia/rtx3060");
-  VCHECK_EQ(ids[6], "nvidia/a100-sxm4-40gb");
-  VCHECK_EQ(ids[9], "amd/mi350x");
+  const std::vector<std::string> expected = {
+      "nvidia/a10",   "nvidia/a100", "nvidia/h100",   "nvidia/h200",
+      "nvidia/b200",  "nvidia/rtx3060", "nvidia/a100-sxm4-40gb",
+      "nvidia/gh200-480gb", "nvidia/h100-pcie",
+      "amd/mi300x", "amd/mi325x", "amd/mi350x"};
+  VCHECK_EQ(ids.size(), expected.size());
+  for (const auto& want : expected)
+    VCHECK(std::find(ids.begin(), ids.end(), want) != ids.end());
 }
 
 VTEST(all_builtin_profiles_parse) {
@@ -33,7 +38,8 @@ VTEST(all_builtin_profiles_parse) {
     // from public documentation, and the flag has to say which is which.
     VCHECK_EQ(p.verified, p.id == "nvidia/rtx3060" || p.id == "nvidia/a10" ||
                           p.id == "nvidia/a100-sxm4-40gb" || p.id == "nvidia/a100" ||
-                          p.id == "nvidia/h100");
+                          p.id == "nvidia/h100" || p.id == "nvidia/gh200-480gb" ||
+                          p.id == "nvidia/h100-pcie");
   }
 }
 
@@ -64,6 +70,56 @@ VTEST(profile_missing_key_is_an_error) {
   VCHECK(err.code() == Err::ProfileParse);
   VCHECK_CONTAINS(err.what(), "test-origin");
   VCHECK_CONTAINS(err.what(), "missing required key");
+}
+
+VTEST(a_driver_that_reports_no_thermal_threshold_still_loads) {
+  // Telemetry is presentation-only and a device that does not report a value is
+  // a fact about the device, not a broken profile. A real GH200's driver
+  // reports no thermal threshold, so tools/characterize-telemetry.sh comments
+  // the key out -- and requiring it made every profile characterized from one
+  // fail to load at all, which surfaced as the device having no memory.
+  const char* yaml = R"(
+id: nvidia/testcard
+vendor: nvidia
+model: "Test Card"
+architecture: hopper
+compute_capability: "9.0"
+warp_size: 32
+vram_bytes: 101468602368
+verified: true
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 232448
+  registers_per_block: 65536
+  multiprocessors: 132
+  registers_per_sm: 65536
+  max_threads_per_sm: 2048
+  max_blocks_per_sm: 32
+telemetry:
+  power_limit_w: 900
+  sm_clock_max_mhz: 1980
+)";
+  DeviceProfile p = DeviceProfile::from_yaml(yaml, "test");
+  VCHECK_EQ(p.telemetry.power_limit_w, 900u);
+  VCHECK_EQ(p.telemetry.sm_clock_max_mhz, 1980u);
+  // Absent means unknown, which is zero, which callers render as unavailable.
+  VCHECK_EQ(p.telemetry.temperature_max_c, 0u);
+  VCHECK_EQ(p.telemetry.mem_clock_max_mhz, 0u);
+  VCHECK_EQ(p.limits.multiprocessors, 132u);
+}
+
+VTEST(the_gh200_profile_loads_and_says_what_hardware_said) {
+  // Characterized from a physical GH200 on Lambda; verified: true means the
+  // values came off the device rather than a datasheet.
+  DeviceProfile p = vgpu::load_gpu("nvidia/gh200-480gb");
+  VCHECK(p.verified);
+  VCHECK_EQ(p.cc_major, 9);
+  VCHECK_EQ(p.cc_minor, 0);
+  VCHECK_EQ(p.limits.multiprocessors, 132u);
+  VCHECK_EQ(p.warp_size, 32u);
 }
 
 VTEST_MAIN

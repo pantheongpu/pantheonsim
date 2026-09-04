@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <dlfcn.h>
 #include <map>
 #include <mutex>
@@ -339,6 +340,7 @@ bool vgpu_record_memset_if_capturing(void* dst, int value, size_t bytes, cudaStr
 bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, void** args,
                                      size_t sharedMem, cudaStream_t stream,
                                      const std::vector<uint32_t>& param_sizes);
+bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()> op);
 
 VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args,
                                          size_t sharedMem, cudaStream_t stream) {
@@ -350,6 +352,10 @@ VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 bl
       return cudaErrorInvalidDeviceFunction;
     }
     KernelInfo& ki = it->second;
+    if (trace())
+      std::fprintf(stderr, "[vgpu][trace] launch %s grid %ux%ux%u block %ux%ux%u shared %zu\n",
+                   ki.entry_name.c_str(), gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y,
+                   blockDim.z, sharedMem);
     if (!ki.mod || ki.mod->ptx.empty())
       throw vgpu::Error::make(vgpu::Err::Unsupported,
                               "kernel '" + ki.entry_name +
@@ -515,16 +521,53 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, 
     // cudaDeviceAttr, which is a table that only has to be renumbered once.
     switch (attr) {
       case cudaDevAttrMaxThreadsPerBlock: *value = static_cast<int>(p.limits.max_threads_per_block); break;
+      case cudaDevAttrMaxBlockDimX: *value = static_cast<int>(p.limits.max_block_dim[0]); break;
+      case cudaDevAttrMaxBlockDimY: *value = static_cast<int>(p.limits.max_block_dim[1]); break;
+      case cudaDevAttrMaxBlockDimZ: *value = static_cast<int>(p.limits.max_block_dim[2]); break;
+      // CUB clamps its tile count to the maximum grid extent. Reporting zero
+      // for it -- which the silent default below used to do -- asked the device
+      // to run no blocks at all, and every scan failed to launch.
+      case cudaDevAttrMaxGridDimX: *value = static_cast<int>(p.limits.max_grid_dim[0]); break;
+      case cudaDevAttrMaxGridDimY: *value = static_cast<int>(p.limits.max_grid_dim[1]); break;
+      case cudaDevAttrMaxGridDimZ: *value = static_cast<int>(p.limits.max_grid_dim[2]); break;
       case cudaDevAttrMaxSharedMemoryPerBlock: *value = static_cast<int>(p.limits.shared_mem_per_block); break;
+      case cudaDevAttrMaxSharedMemoryPerBlockOptin: *value = static_cast<int>(p.limits.shared_mem_per_block_optin); break;
+      case cudaDevAttrMaxSharedMemoryPerMultiprocessor: *value = static_cast<int>(p.limits.shared_mem_per_sm); break;
+      case cudaDevAttrMaxRegistersPerBlock: *value = static_cast<int>(p.limits.registers_per_block); break;
+      case cudaDevAttrMaxRegistersPerMultiprocessor: *value = static_cast<int>(p.limits.registers_per_sm); break;
+      case cudaDevAttrMaxThreadsPerMultiProcessor: *value = static_cast<int>(p.limits.max_threads_per_sm); break;
+      case cudaDevAttrMaxBlocksPerMultiprocessor: *value = static_cast<int>(p.limits.max_blocks_per_sm); break;
       case cudaDevAttrWarpSize: *value = static_cast<int>(p.warp_size); break;
       case cudaDevAttrMultiProcessorCount: *value = static_cast<int>(p.limits.multiprocessors); break;
-      case 39: *value = static_cast<int>(p.limits.max_threads_per_sm); break;  // MaxThreads/SM
-      case 82: *value = static_cast<int>(p.limits.registers_per_sm); break;    // MaxRegistersPerSM
-      case 75: *value = p.cc_major; break;                                       // ComputeCapabilityMajor
-      case 76: *value = p.cc_minor; break;                                       // ComputeCapabilityMinor
+      case cudaDevAttrComputeCapabilityMajor: *value = p.cc_major; break;
+      case cudaDevAttrComputeCapabilityMinor: *value = p.cc_minor; break;
+      case cudaDevAttrTotalConstantMemory: *value = 64 * 1024; break;
+      case cudaDevAttrClockRate: *value = static_cast<int>(p.telemetry.sm_clock_max_mhz) * 1000; break;
+      case cudaDevAttrMemoryClockRate: *value = static_cast<int>(p.telemetry.mem_clock_max_mhz) * 1000; break;
+      case cudaDevAttrPciBusId: *value = 0; break;
+      case cudaDevAttrPciDeviceId: *value = device; break;
+      case cudaDevAttrPciDomainId: *value = 0; break;
+      // Capabilities, where zero is the answer rather than the absence of one.
+      case cudaDevAttrUnifiedAddressing: *value = 1; break;
+      case cudaDevAttrConcurrentKernels: *value = 1; break;
+      case cudaDevAttrAsyncEngineCount: *value = 1; break;
+      case cudaDevAttrIntegrated: *value = 0; break;
+      case cudaDevAttrEccEnabled: *value = 0; break;
+      case cudaDevAttrCanMapHostMemory: *value = 0; break;
+      case cudaDevAttrManagedMemory: *value = 0; break;       // cudaMallocManaged is refused
+      case cudaDevAttrCooperativeLaunch: *value = 0; break;   // no grid-wide sync
+      case cudaDevAttrComputeMode: *value = 0; break;         // cudaComputeModeDefault
       default:
-        if (trace()) std::fprintf(stderr, "[vgpu][trace] cudaDeviceGetAttribute(%d) -> 0\n", attr);
-        *value = 0;
+        // A silent zero here is how a scan came to launch no blocks. An
+        // attribute this does not model is reported, so the caller either
+        // handles it or fails where the cause is visible -- rather than being
+        // told the device has none of whatever it asked about.
+        if (!quiet())
+          std::fprintf(stderr,
+                       "[vgpu] cudaDeviceGetAttribute: attribute %d is not modelled by this "
+                       "profile; add it to runtime_api.cpp rather than assuming zero\n",
+                       static_cast<int>(attr));
+        return cudaErrorInvalidValue;
     }
     return cudaSuccess;
   });
@@ -542,10 +585,24 @@ VGPU_EXPORT cudaError_t cudaFuncGetAttributes(cudaFuncAttributes* attr, const vo
   return guard("cudaFuncGetAttributes", [&](State& s) -> cudaError_t {
     cudaFuncAttributes* a = attr;
     if (!a) return cudaErrorInvalidValue;
+    // Returning the error silently made this very hard to place: CUB asks about
+    // its own kernels before it launches any, so the failure surfaced as
+    // "invalid device function" from a sort, with nothing said about which
+    // kernel could not be described.
     auto it = s.kernels.find(func);
-    if (it == s.kernels.end()) return cudaErrorInvalidDeviceFunction;
+    if (it == s.kernels.end()) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] cudaFuncGetAttributes: unregistered kernel stub %p\n", func);
+      return cudaErrorInvalidDeviceFunction;
+    }
     KernelInfo& ki = it->second;
-    if (!ki.mod || ki.mod->ptx.empty()) return cudaErrorInvalidDeviceFunction;
+    if (!ki.mod || ki.mod->ptx.empty()) {
+      if (!quiet())
+        std::fprintf(stderr,
+                     "[vgpu] cudaFuncGetAttributes: kernel '%s' has no PTX in its fatbin\n",
+                     ki.entry_name.c_str());
+      return cudaErrorInvalidDeviceFunction;
+    }
     uint64_t mid = module_on_current(s, *ki.mod);
     vgpu::runtime::Device& dev = current(s);
     const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
@@ -556,7 +613,13 @@ VGPU_EXPORT cudaError_t cudaFuncGetAttributes(cudaFuncAttributes* attr, const vo
     a->localSizeBytes = res.usage.local_bytes;
     a->sharedSizeBytes = fn->static_shared_size;
     a->maxThreadsPerBlock = static_cast<int>(p.limits.max_threads_per_block);
-    a->ptxVersion = 83;
+    // ptxVersion is the *virtual architecture* the function was compiled for,
+    // not the PTX ISA version -- CUB multiplies it by ten and dispatches on the
+    // result, so reporting 83 for "PTX ISA 8.3" produced 830, an architecture
+    // no kernel was ever built for, and every CUB algorithm refused to run with
+    // cudaErrorInvalidDeviceFunction. It comes from the module's own .target.
+    const int arch = dev.module_arch(mid);
+    a->ptxVersion = arch ? arch : p.cc_major * 10 + p.cc_minor;
     a->binaryVersion = p.cc_major * 10 + p.cc_minor;
     a->maxDynamicSharedSizeBytes = static_cast<int>(p.limits.shared_mem_per_block_optin);
     return cudaSuccess;
@@ -571,9 +634,23 @@ VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBl
   return guard("cudaOccupancyMaxActiveBlocksPerMultiprocessor", [&](State& s) -> cudaError_t {
     if (!numBlocks || blockSize <= 0) return cudaErrorInvalidValue;
     auto it = s.kernels.find(func);
-    if (it == s.kernels.end()) return cudaErrorInvalidDeviceFunction;
+    if (it == s.kernels.end()) {
+      if (!quiet())
+        std::fprintf(stderr,
+                     "[vgpu] cudaOccupancyMaxActiveBlocksPerMultiprocessor: unregistered kernel "
+                     "stub %p\n",
+                     func);
+      return cudaErrorInvalidDeviceFunction;
+    }
     KernelInfo& ki = it->second;
-    if (!ki.mod || ki.mod->ptx.empty()) return cudaErrorInvalidDeviceFunction;
+    if (!ki.mod || ki.mod->ptx.empty()) {
+      if (!quiet())
+        std::fprintf(stderr,
+                     "[vgpu] cudaOccupancyMaxActiveBlocksPerMultiprocessor: kernel '%s' has no "
+                     "PTX in its fatbin\n",
+                     ki.entry_name.c_str());
+      return cudaErrorInvalidDeviceFunction;
+    }
     uint64_t mid = module_on_current(s, *ki.mod);
     vgpu::runtime::Device& dev = current(s);
     const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
@@ -985,7 +1062,7 @@ VGPU_EXPORT cudaError_t cudaLaunchCooperativeKernel(const void*, dim3, dim3, voi
 // Managed memory is one allocation the CPU and GPU both address. Device memory
 // here lives in a separate virtual window that host code cannot dereference, so
 // handing back a device pointer would fault the moment the host touched it.
-VGPU_EXPORT cudaError_t cudaMallocManaged(void** ptr, size_t size, unsigned int) {
+VGPU_EXPORT cudaError_t cudaMallocManaged(void** ptr, size_t, unsigned int) {
   if (!ptr) return cudaErrorInvalidValue;
   return cudaErrorNotSupported;
 }
@@ -1130,7 +1207,7 @@ namespace {
 // framework captures copies and fills alongside them, and replaying with those
 // missing produces confidently wrong results rather than an error.
 struct RecordedLaunch {
-  enum class Kind { Kernel, Memcpy, Memset } kind = Kind::Kernel;
+  enum class Kind { Kernel, Memcpy, Memset, Host } kind = Kind::Kernel;
   // Kernel
   const void* func = nullptr;
   dim3 grid, block;
@@ -1145,14 +1222,19 @@ struct RecordedLaunch {
   size_t bytes = 0;
   cudaMemcpyKind copy_kind = cudaMemcpyDefault;
   int fill_value = 0;
+  // Host: a vendor-library call that computes on the CPU. It is replayed by
+  // re-running the closure, which re-reads device memory then -- so it sees
+  // what the graph's kernels produced, exactly as the real library would.
+  std::function<void()> host_op;
 };
 
 struct GraphRec {
   std::vector<RecordedLaunch> launches;
   // Set when something happened during capture that this implementation cannot
-  // record. Only kernel launches are captured; a copy or a fill inside the
-  // region runs immediately and would be missing from every replay, so the
-  // capture is no longer a faithful record of the work and must not be used.
+  // record. Kernel launches, copies, fills and host-computed library calls are
+  // all captured; anything else would run immediately and be missing from every
+  // replay, so the capture is no longer a faithful record of the work and must
+  // not be used.
   bool invalidated = false;
   const char* invalidated_by = nullptr;
 };
@@ -1197,6 +1279,19 @@ bool vgpu_record_memset_if_capturing(void* dst, int value, size_t bytes, cudaStr
   r.dst = dst;
   r.fill_value = value;
   r.bytes = bytes;
+  g->launches.push_back(std::move(r));
+  return true;
+}
+
+// Records a host-computed library call during capture. Returns true when it was
+// recorded, in which case the caller must not do the work now.
+bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()> op) {
+  GraphRec* g = capture_target(stream);
+  if (!g) return false;
+  RecordedLaunch r;
+  r.kind = RecordedLaunch::Kind::Host;
+  r.host_op = std::move(op);
+  std::lock_guard<std::mutex> lock(g_graph_mu);
   g->launches.push_back(std::move(r));
   return true;
 }
@@ -1301,6 +1396,8 @@ VGPU_EXPORT cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t strea
       rc = cudaMemcpy(rl.dst, rl.src, rl.bytes, rl.copy_kind);
     } else if (rl.kind == RecordedLaunch::Kind::Memset) {
       rc = cudaMemset(rl.dst, rl.fill_value, rl.bytes);
+    } else if (rl.kind == RecordedLaunch::Kind::Host) {
+      rl.host_op();
     } else {
       std::vector<void*> ptrs(rl.arg_bytes.size());
       for (size_t i = 0; i < rl.arg_bytes.size(); ++i) ptrs[i] = rl.arg_bytes[i].data();
