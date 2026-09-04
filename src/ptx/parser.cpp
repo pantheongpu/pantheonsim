@@ -585,6 +585,9 @@ class Parser {
     if (w[0] == '%') {
       auto it = sreg_table().find(w);
       if (it != sreg_table().end()) return SregOperand{it->second};
+      // %envreg0 .. %envreg31 all read as zero; they are only distinguished by
+      // number for a driver that sets them, and this one does not.
+      if (w.rfind("%envreg", 0) == 0) return SregOperand{Sreg::EnvReg};
       // A %-name that was never declared is a special register this engine does
       // not implement, not a register that happens to be unwritten. Letting it
       // through as an ordinary register made %lanemask_le read as zero, which

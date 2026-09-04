@@ -473,6 +473,7 @@ class Interpreter {
                                 w.tid_z[lane] * ctx.ntid[0] * ctx.ntid[1];
         return linear / kWarpSize;
       }
+      case Sreg::EnvReg: return 0;
       case Sreg::NWarpId:
         return (ctx.ntid[0] * ctx.ntid[1] * ctx.ntid[2] + kWarpSize - 1) / kWarpSize;
     }
@@ -2721,7 +2722,9 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
   uint64_t threads = 1;
   for (int i = 0; i < 3; ++i) {
     if (cfg.block[i] == 0 || cfg.grid[i] == 0)
-      throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': grid/block dimensions must be >= 1");
+      throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': grid/block dimensions must be "
+                        ">= 1, got grid ", cfg.grid[0], "x", cfg.grid[1], "x", cfg.grid[2],
+                        " block ", cfg.block[0], "x", cfg.block[1], "x", cfg.block[2]);
     if (cfg.block[i] > p.limits.max_block_dim[i])
       throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': block dim ", i, " is ", cfg.block[i],
                         ", profile ", p.id, " allows at most ", p.limits.max_block_dim[i]);

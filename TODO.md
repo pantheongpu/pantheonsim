@@ -40,7 +40,16 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   ld/st/atom.shared, correct space-relative addressing (cvta to/from generic).
 - Warp shuffles (shfl.sync up/down/bfly/idx, + predicate output) and
   vote/ballot.
-- Tensor cores: wmma.mma m16n16k16 f32.f32 (row/col layouts), wmma.store.d.
+- Tensor cores: wmma.mma m16n16k16 f32.f32 (row/col layouts), wmma.store.d;
+  ldmatrix.m8n8.x{1,2,4}[.trans], mma.sync.m16n8k{8,16,32} over f16/bf16/tf32/
+  s8, and movmatrix.m8n8.trans (the register-only transpose).
+- Asynchronous copy: cp.async.{ca,cg} with commit_group / wait_group / wait_all
+  and the src-size zero-fill form. The copy is deferred until the wait rather
+  than performed on the spot, so a kernel that reads its destination early sees
+  what the hardware would, not what a synchronous copy would have hidden.
+- Warp membership: %lanemask_{eq,lt,le,gt,ge}, %warpid, activemask, bar.red,
+  redux.sync. An undeclared %name is now reported as a special register this
+  engine does not have rather than treated as a register nothing has written.
 - f16 (software IEEE binary16) and packed f16x2 arithmetic.
 - CUDA Graphs: real stream capture -> record -> replay.
 - Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual
@@ -166,8 +175,7 @@ still a separate question from library coverage.
 
 ## Not implemented (fails loudly, never silently)
 
-- PTX: textures/surfaces, cp.async, wgmma, grid sync, inline-asm-only
-  instructions
+- PTX: textures/surfaces, wgmma, grid sync, inline-asm-only instructions
 - Runtime: async copies, unified/managed memory, virtual memory mgmt API
   (cuMemAddressReserve…), host-pinned memory
 - Frontends: cubin/SASS loading, cuGetProcAddress dispatch, AMD everything
@@ -259,4 +267,7 @@ scripts/run-pantheon-workloads.sh.
    tables (cuGetExportTable dark API) so binaries built with the *default*
    (static) cudart also run without a `-cudart shared` rebuild. Partial
    groundwork exists in the driver shim; deferred as brittle/version-specific.
-5. **More PTX as workloads demand it**: bf16, cp.async, mma.sync, textures.
+5. **More PTX as workloads demand it**: bf16, cp.async, mma.sync and the
+   lane-mask family are done -- driven by llama.cpp's flash attention and by
+   CUB's radix sort, which is the way to pick the next one too. Textures,
+   wgmma and grid sync are what is left of the list.

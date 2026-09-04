@@ -48,6 +48,12 @@ enum class Sreg : uint8_t {
   LaneMaskEq, LaneMaskLt, LaneMaskLe, LaneMaskGt, LaneMaskGe,
   // One warp per 32 lanes of the block, in this engine's scheduling.
   WarpId, NWarpId,
+  // %envreg<32>: driver-set registers. PTX says they read as zero unless a
+  // driver has set them, and nothing here sets them -- so zero is the value,
+  // not a stand-in for one. ggml's soft_max reads a pair of them, splices them
+  // into a 64-bit value and branches on whether it is zero, which is precisely
+  // the "not set" path.
+  EnvReg,
 };
 
 // A virtual register reference. `id` is a dense per-kernel index assigned at

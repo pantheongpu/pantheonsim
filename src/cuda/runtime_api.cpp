@@ -517,16 +517,53 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, 
     // cudaDeviceAttr, which is a table that only has to be renumbered once.
     switch (attr) {
       case cudaDevAttrMaxThreadsPerBlock: *value = static_cast<int>(p.limits.max_threads_per_block); break;
+      case cudaDevAttrMaxBlockDimX: *value = static_cast<int>(p.limits.max_block_dim[0]); break;
+      case cudaDevAttrMaxBlockDimY: *value = static_cast<int>(p.limits.max_block_dim[1]); break;
+      case cudaDevAttrMaxBlockDimZ: *value = static_cast<int>(p.limits.max_block_dim[2]); break;
+      // CUB clamps its tile count to the maximum grid extent. Reporting zero
+      // for it -- which the silent default below used to do -- asked the device
+      // to run no blocks at all, and every scan failed to launch.
+      case cudaDevAttrMaxGridDimX: *value = static_cast<int>(p.limits.max_grid_dim[0]); break;
+      case cudaDevAttrMaxGridDimY: *value = static_cast<int>(p.limits.max_grid_dim[1]); break;
+      case cudaDevAttrMaxGridDimZ: *value = static_cast<int>(p.limits.max_grid_dim[2]); break;
       case cudaDevAttrMaxSharedMemoryPerBlock: *value = static_cast<int>(p.limits.shared_mem_per_block); break;
+      case cudaDevAttrMaxSharedMemoryPerBlockOptin: *value = static_cast<int>(p.limits.shared_mem_per_block_optin); break;
+      case cudaDevAttrMaxSharedMemoryPerMultiprocessor: *value = static_cast<int>(p.limits.shared_mem_per_sm); break;
+      case cudaDevAttrMaxRegistersPerBlock: *value = static_cast<int>(p.limits.registers_per_block); break;
+      case cudaDevAttrMaxRegistersPerMultiprocessor: *value = static_cast<int>(p.limits.registers_per_sm); break;
+      case cudaDevAttrMaxThreadsPerMultiProcessor: *value = static_cast<int>(p.limits.max_threads_per_sm); break;
+      case cudaDevAttrMaxBlocksPerMultiprocessor: *value = static_cast<int>(p.limits.max_blocks_per_sm); break;
       case cudaDevAttrWarpSize: *value = static_cast<int>(p.warp_size); break;
       case cudaDevAttrMultiProcessorCount: *value = static_cast<int>(p.limits.multiprocessors); break;
-      case 39: *value = static_cast<int>(p.limits.max_threads_per_sm); break;  // MaxThreads/SM
-      case 82: *value = static_cast<int>(p.limits.registers_per_sm); break;    // MaxRegistersPerSM
-      case 75: *value = p.cc_major; break;                                       // ComputeCapabilityMajor
-      case 76: *value = p.cc_minor; break;                                       // ComputeCapabilityMinor
+      case cudaDevAttrComputeCapabilityMajor: *value = p.cc_major; break;
+      case cudaDevAttrComputeCapabilityMinor: *value = p.cc_minor; break;
+      case cudaDevAttrTotalConstantMemory: *value = 64 * 1024; break;
+      case cudaDevAttrClockRate: *value = static_cast<int>(p.telemetry.sm_clock_max_mhz) * 1000; break;
+      case cudaDevAttrMemoryClockRate: *value = static_cast<int>(p.telemetry.mem_clock_max_mhz) * 1000; break;
+      case cudaDevAttrPciBusId: *value = 0; break;
+      case cudaDevAttrPciDeviceId: *value = device; break;
+      case cudaDevAttrPciDomainId: *value = 0; break;
+      // Capabilities, where zero is the answer rather than the absence of one.
+      case cudaDevAttrUnifiedAddressing: *value = 1; break;
+      case cudaDevAttrConcurrentKernels: *value = 1; break;
+      case cudaDevAttrAsyncEngineCount: *value = 1; break;
+      case cudaDevAttrIntegrated: *value = 0; break;
+      case cudaDevAttrEccEnabled: *value = 0; break;
+      case cudaDevAttrCanMapHostMemory: *value = 0; break;
+      case cudaDevAttrManagedMemory: *value = 0; break;       // cudaMallocManaged is refused
+      case cudaDevAttrCooperativeLaunch: *value = 0; break;   // no grid-wide sync
+      case cudaDevAttrComputeMode: *value = 0; break;         // cudaComputeModeDefault
       default:
-        if (trace()) std::fprintf(stderr, "[vgpu][trace] cudaDeviceGetAttribute(%d) -> 0\n", attr);
-        *value = 0;
+        // A silent zero here is how a scan came to launch no blocks. An
+        // attribute this does not model is reported, so the caller either
+        // handles it or fails where the cause is visible -- rather than being
+        // told the device has none of whatever it asked about.
+        if (!quiet())
+          std::fprintf(stderr,
+                       "[vgpu] cudaDeviceGetAttribute: attribute %d is not modelled by this "
+                       "profile; add it to runtime_api.cpp rather than assuming zero\n",
+                       static_cast<int>(attr));
+        return cudaErrorInvalidValue;
     }
     return cudaSuccess;
   });
