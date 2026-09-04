@@ -67,7 +67,7 @@ an instance left running bills by the hour).
 `tools/compare-profile.py` diffs a measured profile against the one in the
 tree, so corrections are visible rather than silently applied.
 
-Verified against real hardware, seven devices across five architectures:
+Verified against real hardware, eight devices across five architectures:
 
 | profile | device | how |
 | --- | --- | --- |
@@ -78,8 +78,9 @@ Verified against real hardware, seven devices across five architectures:
 | `nvidia/gh200-480gb` | GH200 480GB (sm_90, Grace) | Lambda `gpu_1x_gh200` |
 | `nvidia/h100-pcie` | H100 80GB PCIe (sm_90) | Lambda `gpu_1x_h100_pcie` |
 | `nvidia/t4` | Tesla T4 (sm_75, Turing) | EC2 `g4dn.xlarge` |
+| `nvidia/a10g` | A10G (sm_86) | EC2 `g5.xlarge` |
 
-All seven match the physical device on **512 conformance values each** -- the
+All eight match the physical device on **512 conformance values each** -- the
 same binary run on hardware and on VirtualGPU, diffed.
 
 **`vram_bytes` is a property of a configuration, not of a model.** Two A10s
@@ -89,6 +90,12 @@ driver-reserved memory. Both readings in each pair are correct, so
 `tools/compare-profile.py` reports this field separately rather than as a
 correction to apply. Matching a specific device exactly is what `VGPU_VRAM_MB`
 is for.
+
+The A10G is worth a profile of its own rather than aliasing the A10: same
+architecture and compute capability, but 80 SMs against 72 and a 300 W cap
+against 150. SM count times blocks-per-SM is what decides how a library splits
+work, so treating them as one part would report the wrong occupancy ceiling
+for every kernel.
 
 What characterization corrected in the documentation-derived placeholders:
 - A10 `vram_bytes` 25769803776 -> 23696375808 (datasheet "24 GB"; the device

@@ -17,7 +17,7 @@ VTEST(registry_lists_all_gpus) {
   const std::vector<std::string> expected = {
       "nvidia/a10",   "nvidia/a100", "nvidia/h100",   "nvidia/h200",
       "nvidia/b200",  "nvidia/rtx3060", "nvidia/a100-sxm4-40gb",
-      "nvidia/gh200-480gb", "nvidia/h100-pcie", "nvidia/t4",
+      "nvidia/gh200-480gb", "nvidia/h100-pcie", "nvidia/t4", "nvidia/a10g",
       "amd/mi300x", "amd/mi325x", "amd/mi350x"};
   VCHECK_EQ(ids.size(), expected.size());
   for (const auto& want : expected)
@@ -39,7 +39,8 @@ VTEST(all_builtin_profiles_parse) {
     VCHECK_EQ(p.verified, p.id == "nvidia/rtx3060" || p.id == "nvidia/a10" ||
                           p.id == "nvidia/a100-sxm4-40gb" || p.id == "nvidia/a100" ||
                           p.id == "nvidia/h100" || p.id == "nvidia/gh200-480gb" ||
-                          p.id == "nvidia/h100-pcie" || p.id == "nvidia/t4");
+                          p.id == "nvidia/h100-pcie" || p.id == "nvidia/t4" ||
+                          p.id == "nvidia/a10g");
   }
 }
 
