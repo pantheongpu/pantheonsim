@@ -149,6 +149,11 @@ struct Rendezvous {
   Meta* meta = nullptr;
   std::mutex mu;         // guards the per-rank writer map below
   std::unordered_map<int, Mapping*> writers;   // rank -> my own data file
+  // Communicators in this process still attached. The rendezvous is shared by
+  // every rank running here, so it outlives any one of them -- but not all of
+  // them, which is what this counts. It used to live until the process exited,
+  // and LeakSanitizer was right to call that a leak.
+  int refs = 0;
   ~Rendezvous() {
     for (auto& [k, v] : writers) delete v;
   }
@@ -188,7 +193,10 @@ Rendezvous* attach(const ncclUniqueId& id, int nranks, std::string* err) {
   const std::string meta_path = base + ".meta";
 
   std::lock_guard<std::mutex> lock(g_mu);
-  if (auto it = g_rendezvous.find(base); it != g_rendezvous.end()) return it->second;
+  if (auto it = g_rendezvous.find(base); it != g_rendezvous.end()) {
+    ++it->second->refs;
+    return it->second;
+  }
 
   struct stat st{};
   if (stat(meta_path.c_str(), &st) != 0) {
@@ -229,6 +237,7 @@ Rendezvous* attach(const ncclUniqueId& id, int nranks, std::string* err) {
     delete rz;
     return nullptr;
   }
+  rz->refs = 1;
   g_rendezvous[base] = rz;
   return rz;
 }
@@ -734,7 +743,16 @@ VGPU_EXPORT ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int*
 }
 
 VGPU_EXPORT ncclResult_t ncclCommDestroy(ncclComm_t comm) {
-  delete reinterpret_cast<Comm*>(comm);
+  auto* c = reinterpret_cast<Comm*>(comm);
+  if (!c) return ncclSuccess;
+  if (c->rz) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (--c->rz->refs <= 0) {
+      g_rendezvous.erase(c->rz->base);
+      delete c->rz;  // takes its per-rank mappings with it
+    }
+  }
+  delete c;
   return ncclSuccess;
 }
 VGPU_EXPORT ncclResult_t ncclCommFinalize(ncclComm_t) { return ncclSuccess; }

@@ -142,6 +142,18 @@ int main() {
     return 1;
   }
 
+  // Released explicitly: this runs under LeakSanitizer in CI, and a handle left
+  // open here would be reported as a leak in the shim rather than in the test.
+  CK(cudaGraphExecDestroy(ge));
+  CK(cudaGraphDestroy(g));
+  CK(cudaFree(ps));
+  CK(cudaFree(pd));
+  CK(cudaFree(A));
+  CK(cudaFree(B));
+  CK(cudaFree(C));
+  CK(cudaStreamDestroy(st));
+  CB(cublasDestroy(h));
+
   std::printf("PASS\n");
   return 0;
 }

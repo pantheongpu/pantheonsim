@@ -19,7 +19,8 @@ if (( ${#cublas_libs[@]} == 0 )); then
 fi
 # compute_86 only: the kernel must reach the interpreter as PTX, not as SASS.
 nvcc -std=c++14 -cudart shared -arch=compute_86 -code=compute_86 \
-     -Wno-deprecated-gpu-targets "$src" -o "$out" -lcublas
+     -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") \
+     "$src" -o "$out" -lcublas
 if ! require_shim_libs "$shim" "$out"; then rm -f "$out"; exit 0; fi
 result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/a10 LD_LIBRARY_PATH="$shim" "$out")"
 rm -f "$out"

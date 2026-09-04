@@ -20,7 +20,8 @@ shopt -u nullglob
 if (( ${#cudart_libs[@]} == 0 )); then
   echo "SKIP: libvgpucudart not built (CUDA ABI headers absent at build time)"; exit 0
 fi
-nvcc -std=c++14 -cudart shared --gpu-architecture=sm_86 -Wno-deprecated-gpu-targets "$src" -o "$out"
+nvcc -std=c++14 -cudart shared --gpu-architecture=sm_86 -Wno-deprecated-gpu-targets \
+     $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out"
 if ! require_shim_libs "$shim" "$out"; then rm -f "$out"; exit 0; fi
 result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/h100 LD_LIBRARY_PATH="$shim" "$out")"
 rm -f "$out"

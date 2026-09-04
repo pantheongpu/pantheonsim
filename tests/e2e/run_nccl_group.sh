@@ -5,6 +5,7 @@
 # worth its own test at a rank count the differential run cannot reach.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/shim_guard.sh"
 shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 ranks="${1:-4}"
 out="${TMPDIR:-/tmp}/vgpu-nccl-group.$$"
@@ -15,6 +16,7 @@ command -v nvcc >/dev/null || { echo "SKIP: nvcc not found"; exit 0; }
 mkdir -p "$out"
 trap 'rm -rf "$out"' EXIT
 nvcc -std=c++14 -arch=sm_86 -Wno-deprecated-gpu-targets -cudart shared \
+     $(shim_sanitizer_nvcc_flags "$shim") \
      -I"$root/third_party/nccl_include" "$root/tests/conformance/nccl_collectives.cu" \
      -L"$shim" -lnccl -o "$out/group" || { echo "FAIL: compile"; exit 1; }
 
