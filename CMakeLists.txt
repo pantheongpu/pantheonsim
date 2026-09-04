@@ -34,6 +34,7 @@ set(VGPU_PROFILES
   nvidia/a100-sxm4-40gb
   nvidia/gh200-480gb
   nvidia/h100-pcie
+  nvidia/t4
   amd/mi300x
   amd/mi325x
   amd/mi350x
