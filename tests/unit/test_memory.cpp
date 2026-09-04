@@ -140,7 +140,6 @@ VTEST(write_spanning_chunks) {
   VCHECK(in == out);
 }
 
-VTEST_MAIN
 
 // --- fill(): memset without a host staging buffer -------------------------
 // A memset used to build a host copy the size of the range and then write it
@@ -225,3 +224,27 @@ VTEST(nonzero_fill_costs_about_one_copy) {
   mm.free(p);
   VCHECK_EQ(mm.resident_bytes(), 0ull);
 }
+
+VTEST(a_length_that_wraps_the_end_address_is_still_out_of_bounds) {
+  // Computed as end = addr + len, a length near UINT64_MAX wraps to a small
+  // number and compares *below* the allocation's end -- so the check passed
+  // exactly the access it exists to stop. It is a remaining-length compare now.
+  MemoryManager mem(1 << 20);
+  uint64_t p = mem.alloc(64);
+  std::vector<uint8_t> buf(64);
+  auto err = VCAPTURE(Error, mem.read(p + 32, buf.data(), ~uint64_t{0} - 16));
+  VCHECK(err.code() == Err::OutOfBounds);
+}
+
+VTEST(null_host_pointers_are_diagnosed_not_dereferenced) {
+  MemoryManager mem(1 << 20);
+  uint64_t p = mem.alloc(64);
+  auto w = VCAPTURE(Error, mem.write(p, nullptr, 8));
+  VCHECK(w.code() == Err::InvalidPointer);
+  VCHECK_CONTAINS(w.what(), "NULL host pointer");
+  auto r = VCAPTURE(Error, mem.read(p, nullptr, 8));
+  VCHECK(r.code() == Err::InvalidPointer);
+  VCHECK_CONTAINS(r.what(), "NULL host pointer");
+}
+
+VTEST_MAIN
