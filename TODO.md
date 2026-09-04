@@ -67,7 +67,7 @@ an instance left running bills by the hour).
 `tools/compare-profile.py` diffs a measured profile against the one in the
 tree, so corrections are visible rather than silently applied.
 
-Verified against real hardware, four devices across three architectures:
+Verified against real hardware, five devices across four architectures:
 
 | profile | device | how |
 | --- | --- | --- |
@@ -75,9 +75,18 @@ Verified against real hardware, four devices across three architectures:
 | `nvidia/a10` | A10 (sm_86) | Lambda `gpu_1x_a10` |
 | `nvidia/a100-sxm4-40gb` | A100 SXM4 40GB (sm_80) | Lambda `gpu_1x_a100_sxm4` |
 | `nvidia/h100` | H100 SXM5 80GB (sm_90) | Lambda `gpu_1x_h100_sxm5` |
+| `nvidia/gh200-480gb` | GH200 480GB (sm_90, Grace) | Lambda `gpu_1x_gh200` |
 
-All four match the physical device on **512 conformance values each** -- the
+All five match the physical device on **512 conformance values each** -- the
 same binary run on hardware and on VirtualGPU, diffed.
+
+**`vram_bytes` is a property of a configuration, not of a model.** Two A10s
+characterized months apart differ by 1.5 GiB, which is the ECC reservation:
+one had ECC on and the other off. Two H100 SXM5s differ by 10 MiB of
+driver-reserved memory. Both readings in each pair are correct, so
+`tools/compare-profile.py` reports this field separately rather than as a
+correction to apply. Matching a specific device exactly is what `VGPU_VRAM_MB`
+is for.
 
 What characterization corrected in the documentation-derived placeholders:
 - A10 `vram_bytes` 25769803776 -> 23696375808 (datasheet "24 GB"; the device
