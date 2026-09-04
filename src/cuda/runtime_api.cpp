@@ -352,6 +352,10 @@ VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 bl
       return cudaErrorInvalidDeviceFunction;
     }
     KernelInfo& ki = it->second;
+    if (trace())
+      std::fprintf(stderr, "[vgpu][trace] launch %s grid %ux%ux%u block %ux%ux%u shared %zu\n",
+                   ki.entry_name.c_str(), gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y,
+                   blockDim.z, sharedMem);
     if (!ki.mod || ki.mod->ptx.empty())
       throw vgpu::Error::make(vgpu::Err::Unsupported,
                               "kernel '" + ki.entry_name +
