@@ -67,7 +67,7 @@ an instance left running bills by the hour).
 `tools/compare-profile.py` diffs a measured profile against the one in the
 tree, so corrections are visible rather than silently applied.
 
-Verified against real hardware, five devices across four architectures:
+Verified against real hardware, six devices across four architectures:
 
 | profile | device | how |
 | --- | --- | --- |
@@ -76,8 +76,9 @@ Verified against real hardware, five devices across four architectures:
 | `nvidia/a100-sxm4-40gb` | A100 SXM4 40GB (sm_80) | Lambda `gpu_1x_a100_sxm4` |
 | `nvidia/h100` | H100 SXM5 80GB (sm_90) | Lambda `gpu_1x_h100_sxm5` |
 | `nvidia/gh200-480gb` | GH200 480GB (sm_90, Grace) | Lambda `gpu_1x_gh200` |
+| `nvidia/h100-pcie` | H100 80GB PCIe (sm_90) | Lambda `gpu_1x_h100_pcie` |
 
-All five match the physical device on **512 conformance values each** -- the
+All six match the physical device on **512 conformance values each** -- the
 same binary run on hardware and on VirtualGPU, diffed.
 
 **`vram_bytes` is a property of a configuration, not of a model.** Two A10s
