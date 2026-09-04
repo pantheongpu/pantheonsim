@@ -21,6 +21,15 @@ key_file="${VGPU_AWS_KEY_FILE:-$HOME/.ssh/id_rsa}"
 sg_name="${VGPU_AWS_SG:-pantheon-bench-sg}"
 mkdir -p "$outdir"
 
+# Check the inputs before renting anything. These are resolved relative to the
+# script, so a copy run from outside the tree resolves them to nonsense -- and
+# the first version of this discovered that only after launching an instance,
+# uploading nothing, and failing on the far side.
+for f in tools/characterize.cu tools/characterize-telemetry.sh \
+         tests/conformance/ptx_semantics.cu tests/conformance/control_flow.cu; do
+  [[ -r "$here/$f" ]] || { echo "missing $here/$f (run this from the repository, not a copy)"; exit 1; }
+done
+
 command -v aws >/dev/null || { echo "no aws CLI"; exit 1; }
 aws sts get-caller-identity >/dev/null 2>&1 || { echo "not authenticated: run 'aws login'"; exit 1; }
 [[ -r "$key_file" ]] || { echo "no ssh key at $key_file"; exit 1; }
