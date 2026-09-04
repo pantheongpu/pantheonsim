@@ -165,6 +165,53 @@ Not yet: `nvidia-smi topo -m`, DCGM. PyTorch also ships thousands of its own ker
 which would run on the interpreter, so `import torch` finding a usable GPU is
 still a separate question from library coverage.
 
+## A race the simulator found in llama.cpp
+
+`FLASH_ATTN_EXT` runs about 2950 cases against the CPU backend. Fourteen fail,
+all at `hsk=192, hsv=128` with a batch above one -- the asymmetric head-size
+shape MLA models use -- by margins around 0.1 against a 5e-4 tolerance.
+
+The cause is upstream, in ggml's `flash_attn_ext_f16` mma kernel:
+
+- `flash_attn_ext_f16_process_tile` writes `tile_Q` (shared) at the top, and
+  its first `__syncthreads()` comes *after* those writes.
+- The matching sync at the *end* of the function is conditional:
+  `if (np > 1) __syncthreads();`.
+- The caller loop calls `process_tile` repeatedly with no barrier between
+  calls.
+
+So when `np == 1` and one block processes more than one tile, the next tile's
+writes to `tile_Q` are not separated from the previous tile's reads by any
+barrier. That is a write-after-read race on shared memory.
+
+A block processes more than one tile only when stream-k splits work unevenly,
+which is why the failures are so narrow. The evidence:
+
+| configuration | blocks | tiles | result |
+| --- | --- | --- | --- |
+| stream-k disabled | -- | -- | 36/36 pass |
+| grid 64, 128, 256 (even multiples of 32 tiles) | 1 tile per block | 32 | pass |
+| grid 144 (not a multiple) | blocks span tile boundaries | 32 | 14 fail |
+| grid 144, `__syncthreads()` made unconditional | -- | -- | 36/36 pass |
+
+A barrier cannot change arithmetic, only ordering, so a result that changes
+when one is added had an observable ordering. Real hardware tolerates it
+because warps in a block advance together and the window is small; the
+round-robin scheduler here does not, which is the whole point of running on
+this rather than on a device.
+
+Ruled out along the way, each with a test rather than an argument: the
+attention math itself, `fastdiv`/`fastmodulo`, 64-bit division, widening
+multiplies, integer conversions, unsigned compares, `vote.ballot`, the mma
+fragment layout (checked element for element against a physical A10), buffer
+sizing, and the write/read pairing between the two kernels -- a block wrote
+`-0.387939 / 3.341256 / 5.117198` and the fixup read back exactly those.
+
+Not fixed here, because it is not this project's bug to fix. What *is* this
+project's to do is diagnose it rather than quietly return different numbers,
+which is the shared-memory race detection in the scheduler work below. This is
+the case to build it against.
+
 ## Known out of scope (not CUDA)
 
 - `rt_virus` needs **OptiX** (NVIDIA's ray-tracing library, loaded from
