@@ -450,6 +450,16 @@ if(TARGET vgpucublas)
     DEPENDS vgpucublas
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
+
+  # A leading dimension pads between columns, not after the last one. Operands
+  # allocated to exactly their extent make an over-read fault instead of
+  # quietly picking up whatever followed them.
+  add_test(NAME e2e_cublas_tight
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_cublas_tight.sh)
+  set_tests_properties(e2e_cublas_tight PROPERTIES
+    DEPENDS vgpucublas
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
 endif()
 
 # Real pantheon workloads, built by their own Makefile and run end to end. The

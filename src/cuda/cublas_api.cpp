@@ -187,8 +187,17 @@ void gemm_host(cublasOperation_t transa, cublasOperation_t transb, int m, int n,
   }
 }
 
-// Elements a column-major matrix occupies given its leading dimension.
-size_t extent(int ld, int cols) { return static_cast<size_t>(ld) * cols; }
+// Elements a column-major matrix occupies, given its leading dimension.
+//
+// The last column holds `rows` elements, not `ld` of them: the padding a
+// leading dimension implies exists *between* columns, and there is none after
+// the last. Reading ld*cols therefore ran past the end of any matrix allocated
+// to exactly the size it needs -- which ggml does, and which the bounds check
+// caught as a read of 1544 bytes past a 1792-byte allocation.
+size_t extent(int ld, int cols, int rows) {
+  if (cols <= 0 || rows <= 0) return 0;
+  return static_cast<size_t>(ld) * (cols - 1) + rows;
+}
 
 /* ---- mixed precision ----
    GemmEx lets every operand carry its own type. Rather than instantiate the
@@ -296,9 +305,9 @@ cublasStatus_t do_gemm(cublasHandle_t handle, cublasOperation_t transa, cublasOp
   Acc alpha = scalar(handle, alpha_p), beta = scalar(handle, beta_p);
   if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
 
-  auto hA = fetch<T>(A, extent(lda, transa == CUBLAS_OP_N ? k : m));
-  auto hB = fetch<T>(B, extent(ldb, transb == CUBLAS_OP_N ? n : k));
-  auto hC = fetch<T>(C, extent(ldc, n));
+  auto hA = fetch<T>(A, transa == CUBLAS_OP_N ? extent(lda, k, m) : extent(lda, m, k));
+  auto hB = fetch<T>(B, transb == CUBLAS_OP_N ? extent(ldb, n, k) : extent(ldb, k, n));
+  auto hC = fetch<T>(C, extent(ldc, n, m));
   gemm_host<T, Acc>(transa, transb, m, n, k, alpha, hA, lda, hB, ldb, beta, hC, ldc);
   store(C, hC);
   return CUBLAS_STATUS_SUCCESS;
@@ -484,7 +493,7 @@ VGPU_EXPORT cublasStatus_t cublasSgemv_v2(cublasHandle_t h, cublasOperation_t tr
   const int xlen = trans == CUBLAS_OP_N ? n : m;
   const int ylen = trans == CUBLAS_OP_N ? m : n;
   if (!m || !n) return CUBLAS_STATUS_SUCCESS;
-  auto hA = fetch<float>(A, extent(lda, n));
+  auto hA = fetch<float>(A, extent(lda, n, m));
   auto hx = fetch<float>(x, static_cast<size_t>(std::abs(incx)) * (xlen - 1) + 1);
   auto hy = fetch<float>(y, static_cast<size_t>(std::abs(incy)) * (ylen - 1) + 1);
   for (int i = 0; i < ylen; ++i) {
@@ -624,9 +633,9 @@ VGPU_EXPORT cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta,
       b = scalar(h, static_cast<const float*>(beta));
     }
     std::vector<float> hA, hB, hC;
-    if (!load_as_float(A, extent(lda, ta == CUBLAS_OP_N ? k : m), Atype, &hA) ||
-        !load_as_float(B, extent(ldb, tb == CUBLAS_OP_N ? n : k), Btype, &hB) ||
-        !load_as_float(C, extent(ldc, n), Ctype, &hC))
+    if (!load_as_float(A, ta == CUBLAS_OP_N ? extent(lda, k, m) : extent(lda, m, k), Atype, &hA) ||
+        !load_as_float(B, tb == CUBLAS_OP_N ? extent(ldb, n, k) : extent(ldb, k, n), Btype, &hB) ||
+        !load_as_float(C, extent(ldc, n, m), Ctype, &hC))
       return CUBLAS_STATUS_NOT_SUPPORTED;
     gemm_float(ta, tb, m, n, k, a, hA, lda, hB, ldb, b, hC, ldc);
     return store_from_float(C, hC, Ctype) ? CUBLAS_STATUS_SUCCESS
@@ -642,9 +651,9 @@ VGPU_EXPORT cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta,
     if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
     const int32_t a = scalar(h, static_cast<const int32_t*>(alpha));
     const int32_t b = scalar(h, static_cast<const int32_t*>(beta));
-    auto hA = fetch<int8_t>(A, extent(lda, ta == CUBLAS_OP_N ? k : m));
-    auto hB = fetch<int8_t>(B, extent(ldb, tb == CUBLAS_OP_N ? n : k));
-    auto hC = fetch<int32_t>(C, extent(ldc, n));
+    auto hA = fetch<int8_t>(A, ta == CUBLAS_OP_N ? extent(lda, k, m) : extent(lda, m, k));
+    auto hB = fetch<int8_t>(B, tb == CUBLAS_OP_N ? extent(ldb, n, k) : extent(ldb, k, n));
+    auto hC = fetch<int32_t>(C, extent(ldc, n, m));
     gemm_int8(ta, tb, m, n, k, a, hA, lda, hB, ldb, b, hC, ldc);
     store(C, hC);
     return CUBLAS_STATUS_SUCCESS;
