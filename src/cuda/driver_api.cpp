@@ -226,7 +226,19 @@ int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
     case 90: return 1;                               // COMPUTE_PREEMPTION_SUPPORTED
     // Capabilities this does not implement. Zero is the true answer for each,
     // and saying so explicitly keeps them out of the "unmodeled" report below.
+    // A real quantity, and answering zero for it is the same mistake that had
+    // CUB launching no blocks: it is a divisor in occupancy arithmetic.
+    case 134: return static_cast<int>(p.limits.max_blocks_per_sm);   // MAX_BLOCKS_PER_MULTIPROCESSOR
     case 102: return 0;                              // VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
+    case 135: return 0;                              // GENERIC_COMPRESSION_SUPPORTED
+    case 136: return 0;                              // MAX_PERSISTING_L2_CACHE_SIZE
+    case 137: return 0;                              // MAX_ACCESS_POLICY_WINDOW_SIZE
+    case 138: return 0;                              // GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED
+    case 139: return 0;                              // RESERVED_SHARED_MEMORY_PER_BLOCK
+    case 140: return 0;                              // SPARSE_CUDA_ARRAY_SUPPORTED
+    case 141: return 0;                              // READ_ONLY_HOST_REGISTER_SUPPORTED
+    case 142: return 0;                              // TIMELINE_SEMAPHORE_INTEROP_SUPPORTED
+    case 143: return 0;                              // MEMORY_POOLS_SUPPORTED (no cuMemPool* here)
     case 115: return 0;                              // GPU_DIRECT_RDMA_SUPPORTED
     case 118: return 0;                              // HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED
     case 121: return 0;                              // MAX_PERSISTING_L2_CACHE_SIZE

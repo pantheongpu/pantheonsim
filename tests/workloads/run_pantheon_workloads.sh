@@ -22,6 +22,24 @@ done
 command -v nvcc >/dev/null || { echo "SKIP: nvcc not found (the workloads are compiled from source)"; exit 0; }
 [[ -x "$build/vgpu" ]] || { echo "SKIP: $build/vgpu not built"; exit 0; }
 
+# The shim's soname major follows the toolkit it was built against, and nvcc
+# stamps these binaries with the major *it* ships. A CUDA 12 build directory
+# next to a CUDA 13 nvcc is an unbuildable pairing rather than a defect: the
+# workloads would link the real libcudart, reach the real driver, and fail with
+# "integrity checks failed" -- which reads as a simulator bug and is not one.
+shopt -s nullglob
+_cudart=("$build"/shim/libcudart.so.[0-9]*)
+shopt -u nullglob
+if (( ${#_cudart[@]} )); then
+  _shim_major="${_cudart[0]##*.}"
+  _nvcc_major="$(nvcc --version | sed -n 's/.*release \([0-9]*\).*/\1/p' | head -1)"
+  if [[ -n "$_nvcc_major" && "$_shim_major" != "$_nvcc_major" ]]; then
+    echo "SKIP: shim is CUDA $_shim_major but nvcc is CUDA $_nvcc_major;" \
+         "the workloads would link the real runtime"
+    exit 0
+  fi
+fi
+
 # Small, fast, and between them they exercise the paths that have broken before:
 # integer and float arithmetic, global traffic, shared memory and atomics.
 WORKLOADS=("${VGPU_WORKLOADS:-compute_virus int_virus cache_latency}")
