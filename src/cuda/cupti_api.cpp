@@ -310,6 +310,176 @@ VGPU_EXPORT CUptiResult cuptiEnableAllDomains(uint32_t, CUpti_SubscriberHandle) 
   return CUPTI_SUCCESS;
 }
 
+/* ---- identifiers and attributes ----
+   Small, real, and needed before a tool will get as far as asking for
+   anything interesting. */
+
+VGPU_EXPORT CUptiResult cuptiDeviceSupported(CUdevice, int* support) {
+  if (!support) return CUPTI_ERROR_INVALID_PARAMETER;
+  *support = 1;   // activity tracing works; events and metrics say so themselves
+  return CUPTI_SUCCESS;
+}
+
+VGPU_EXPORT CUptiResult cuptiGetContextId(CUcontext context, uint32_t* id) {
+  if (!id) return CUPTI_ERROR_INVALID_PARAMETER;
+  *id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(context));
+  return CUPTI_SUCCESS;
+}
+VGPU_EXPORT CUptiResult cuptiGetDeviceId(CUcontext, uint32_t* id) {
+  if (!id) return CUPTI_ERROR_INVALID_PARAMETER;
+  *id = 0;
+  return CUPTI_SUCCESS;
+}
+VGPU_EXPORT CUptiResult cuptiGetStreamId(CUcontext, CUstream stream, uint32_t* id) {
+  if (!id) return CUPTI_ERROR_INVALID_PARAMETER;
+  *id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(stream));
+  return CUPTI_SUCCESS;
+}
+VGPU_EXPORT CUptiResult cuptiGetStreamIdEx(CUcontext c, CUstream stream, uint8_t, uint32_t* id) {
+  return cuptiGetStreamId(c, stream, id);
+}
+VGPU_EXPORT CUptiResult cuptiGetCallbackName(CUpti_CallbackDomain, uint32_t, const char** name) {
+  if (!name) return CUPTI_ERROR_INVALID_PARAMETER;
+  // No callbacks are dispatched, so no callback has a name to report.
+  return CUPTI_ERROR_INVALID_PARAMETER;
+}
+VGPU_EXPORT CUptiResult cuptiActivitySetAttribute(CUpti_ActivityAttribute, size_t*, void*) {
+  // Buffer sizes and watermarks: this hands whole buffers to the consumer's own
+  // allocator on flush, so there is nothing to tune.
+  return CUPTI_SUCCESS;
+}
+VGPU_EXPORT CUptiResult cuptiActivityEnableLatencyTimestamps(uint8_t) { return CUPTI_SUCCESS; }
+VGPU_EXPORT CUptiResult cuptiEnableNonOverlappingMode(void) { return CUPTI_SUCCESS; }
+VGPU_EXPORT CUptiResult cuptiDisableNonOverlappingMode(void) { return CUPTI_SUCCESS; }
+
+/* ---- events and metrics ----
+   Hardware performance counters, which this does not have. The exact counters
+   this engine keeps -- instruction mix, sectors and coalescing, bank
+   conflicts, tensor issues -- are a different set from a device's, and
+   answering to NVIDIA's metric names would claim an equivalence that does not
+   hold. So the device reports no event domains and no metrics, which is the
+   truth, and a tool that asks is told plainly rather than handed a number.
+
+   Reporting zero rather than failing outright matters: a profiler that cannot
+   enumerate counters still goes on to trace activity, which does work. */
+
+VGPU_EXPORT CUptiResult cuptiDeviceGetNumEventDomains(CUdevice, uint32_t* n) {
+  if (!n) return CUPTI_ERROR_INVALID_PARAMETER;
+  *n = 0;
+  return CUPTI_SUCCESS;
+}
+VGPU_EXPORT CUptiResult cuptiDeviceEnumEventDomains(CUdevice, size_t* size, CUpti_EventDomainID*) {
+  if (size) *size = 0;
+  return CUPTI_SUCCESS;
+}
+VGPU_EXPORT CUptiResult cuptiDeviceGetNumMetrics(CUdevice, uint32_t* n) {
+  if (!n) return CUPTI_ERROR_INVALID_PARAMETER;
+  *n = 0;
+  return CUPTI_SUCCESS;
+}
+VGPU_EXPORT CUptiResult cuptiDeviceEnumMetrics(CUdevice, size_t* size, CUpti_MetricID*) {
+  if (size) *size = 0;
+  return CUPTI_SUCCESS;
+}
+VGPU_EXPORT CUptiResult cuptiDeviceGetAttribute(CUdevice, CUpti_DeviceAttribute, size_t*, void*) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiDeviceGetEventDomainAttribute(CUdevice, CUpti_EventDomainID,
+                                                           CUpti_EventDomainAttribute, size_t*,
+                                                           void*) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiEventDomainEnumEvents(CUpti_EventDomainID, size_t* size,
+                                                   CUpti_EventID*) {
+  if (size) *size = 0;
+  return CUPTI_SUCCESS;
+}
+VGPU_EXPORT CUptiResult cuptiEventDomainGetNumEvents(CUpti_EventDomainID, uint32_t* n) {
+  if (!n) return CUPTI_ERROR_INVALID_PARAMETER;
+  *n = 0;
+  return CUPTI_SUCCESS;
+}
+VGPU_EXPORT CUptiResult cuptiEventGetAttribute(CUpti_EventID, CUpti_EventAttribute, size_t*, void*) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiEventGetIdFromName(CUdevice, const char*, CUpti_EventID*) {
+  return CUPTI_ERROR_INVALID_EVENT_NAME;
+}
+VGPU_EXPORT CUptiResult cuptiEventGroupGetAttribute(CUpti_EventGroup, CUpti_EventGroupAttribute,
+                                                    size_t*, void*) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiEventGroupSetAttribute(CUpti_EventGroup, CUpti_EventGroupAttribute,
+                                                    size_t, void*) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiEventGroupReadAllEvents(CUpti_EventGroup, CUpti_ReadEventFlags,
+                                                     size_t*, uint64_t*, size_t*, CUpti_EventID*,
+                                                     size_t*) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiEventGroupSetsCreate(CUcontext, size_t, CUpti_EventID*,
+                                                  CUpti_EventGroupSets**) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiEventGroupSetsDestroy(CUpti_EventGroupSets*) { return CUPTI_SUCCESS; }
+VGPU_EXPORT CUptiResult cuptiEventGroupSetEnable(CUpti_EventGroupSet*) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiEventGroupSetDisable(CUpti_EventGroupSet*) { return CUPTI_SUCCESS; }
+VGPU_EXPORT CUptiResult cuptiSetEventCollectionMode(CUcontext, CUpti_EventCollectionMode) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiMetricGetIdFromName(CUdevice, const char*, CUpti_MetricID*) {
+  return CUPTI_ERROR_INVALID_METRIC_NAME;
+}
+VGPU_EXPORT CUptiResult cuptiMetricGetAttribute(CUpti_MetricID, CUpti_MetricAttribute, size_t*,
+                                                void*) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiMetricGetNumEvents(CUpti_MetricID, uint32_t* n) {
+  if (!n) return CUPTI_ERROR_INVALID_PARAMETER;
+  *n = 0;
+  return CUPTI_SUCCESS;
+}
+VGPU_EXPORT CUptiResult cuptiMetricEnumEvents(CUpti_MetricID, size_t* size, CUpti_EventID*) {
+  if (size) *size = 0;
+  return CUPTI_SUCCESS;
+}
+VGPU_EXPORT CUptiResult cuptiMetricCreateEventGroupSets(CUcontext, size_t, CUpti_MetricID*,
+                                                        CUpti_EventGroupSets**) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiMetricGetRequiredEventGroupSets(CUcontext, CUpti_MetricID,
+                                                             CUpti_EventGroupSets**) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiMetricGetValue(CUdevice, CUpti_MetricID, size_t, CUpti_EventID*,
+                                            size_t, uint64_t*, uint64_t, CUpti_MetricValue*) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+
+/* ---- replay, sampling and the other subsystems this has no device for ---- */
+
+VGPU_EXPORT CUptiResult cuptiEnableKernelReplayMode(CUcontext) { return CUPTI_ERROR_NOT_SUPPORTED; }
+VGPU_EXPORT CUptiResult cuptiDisableKernelReplayMode(CUcontext) { return CUPTI_SUCCESS; }
+VGPU_EXPORT CUptiResult cuptiKernelReplaySubscribeUpdate(CUpti_KernelReplayUpdateFunc, void*) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiActivityConfigurePCSampling(CUcontext, CUpti_ActivityPCSamplingConfig*) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiActivityConfigureUnifiedMemoryCounter(
+    CUpti_ActivityUnifiedMemoryCounterConfig*, uint32_t) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiGetAutoBoostState(CUcontext, CUpti_ActivityAutoBoostState*) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiNvtxInitialize(void*) { return CUPTI_SUCCESS; }
+VGPU_EXPORT CUptiResult cuptiNvtxInitialize2(void*) { return CUPTI_SUCCESS; }
+VGPU_EXPORT CUptiResult cuptiOpenACCInitialize(void*) { return CUPTI_ERROR_NOT_SUPPORTED; }
+
 VGPU_EXPORT CUptiResult cuptiActivityPushExternalCorrelationId(CUpti_ExternalCorrelationKind,
                                                               uint64_t) {
   return CUPTI_SUCCESS;

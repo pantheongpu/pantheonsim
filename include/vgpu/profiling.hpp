@@ -53,4 +53,19 @@ uint32_t next_correlation();
 
 }  // namespace vgpu::profiling
 
+namespace vgpu {
+
+// Opens the library named by CUDA_INJECTION64_PATH and calls its documented
+// InitializeInjection entry point, once.
+//
+// A profiler does not ask the driver to profile; it asks the loader. nvprof,
+// Nsight and anything else built on NVIDIA's injection library set this
+// variable and rely on CUDA initialization to open the library and let the
+// tool install its hooks. Without it the tool loads, the program runs
+// correctly, and the tool reports "no profile data collected" -- which reads
+// as a broken profiler rather than a driver that never invited it in.
+void load_injection_library();
+
+}  // namespace vgpu
+
 #endif  // VGPU_PROFILING_HPP

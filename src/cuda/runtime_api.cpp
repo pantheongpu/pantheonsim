@@ -130,6 +130,9 @@ void ensure_init(State& s) {
   s.rt = std::make_unique<vgpu::runtime::Runtime>(profile, count);
   s.initialized = true;
   init_driver_shim_if_loaded();
+  // A program that only uses the runtime API never reaches cuInit, and a
+  // profiler attached to it would otherwise never be invited in.
+  vgpu::load_injection_library();
   if (!quiet())
     std::fprintf(stderr, "[vgpu] virtual GPU platform initialized: %d x %s (%s)\n", count,
                  profile.id.c_str(), profile.model.c_str());

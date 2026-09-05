@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -25,6 +26,7 @@
 
 #include "fatbin.hpp"
 #include "vgpu/error.hpp"
+#include "vgpu/profiling.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
 
@@ -310,6 +312,7 @@ VGPU_EXPORT CUresult cuInit(unsigned int flags) {
     if (!quiet())
       std::fprintf(stderr, "[vgpu] virtual GPU platform initialized: %d x %s (%s)\n", count,
                    profile.id.c_str(), profile.model.c_str());
+    vgpu::load_injection_library();
     return CUDA_SUCCESS;
   });
 }

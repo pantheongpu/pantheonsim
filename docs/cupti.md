@@ -21,6 +21,37 @@ is a measurement of a GPU.
 This is the same line the telemetry surface draws: report what is known, and
 refuse to invent the rest. See `ARCHITECTURE.md`.
 
+## Loading the profiler
+
+A profiler does not ask the driver to profile. It sets `CUDA_INJECTION64_PATH`
+and relies on CUDA initialization to open that library and call its
+`InitializeInjection` entry point, which is where the tool installs its hooks.
+
+Until that was implemented, nvprof loaded, ran the program correctly, and
+reported "No profile data collected" -- which reads as a broken profiler rather
+than a driver that never invited it in. It is loaded once, at initialization,
+from both the driver and runtime entry points: a program that only uses the
+runtime API never reaches `cuInit`, and a profiler attached to one would
+otherwise never start.
+
+## nvprof
+
+Works, on a matching toolkit major:
+
+```
+ GPU activities:   92.15%  521.27us  1  vecAdd(float const *, float const *, float*, int)
+                    7.09%  40.108us  2  [CUDA memcpy HtoD]
+                    0.75%  4.2680us  1  [CUDA memcpy DtoH]
+```
+
+Two constraints are nvprof's own rather than this engine's. It refuses compute
+capability 8.0 and above, so profiling uses a Turing profile; and it links a
+CUPTI of its own toolkit's major, so a CUDA 12 nvprof needs the CUDA 12 shim.
+`tests/e2e/run_nvprof.sh` checks both and skips when they cannot be met.
+
+"No API activities were profiled" is expected and correct: that line refers to
+the Callback API, which is deliberately not dispatched -- see below.
+
 ## What is implemented
 
 The Activity API, which is what produces a timeline:

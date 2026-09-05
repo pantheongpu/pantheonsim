@@ -514,6 +514,13 @@ if(TARGET vgpucupti)
     DEPENDS vgpucupti
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
+
+  # And the same thing through a tool nobody here wrote.
+  add_test(NAME e2e_nvprof COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_nvprof.sh)
+  set_tests_properties(e2e_nvprof PROPERTIES
+    DEPENDS vgpucupti
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
 endif()
 
 # Real pantheon workloads, built by their own Makefile and run end to end. The
