@@ -52,6 +52,27 @@ CUPTI of its own toolkit's major, so a CUDA 12 nvprof needs the CUDA 12 shim.
 "No API activities were profiled" is expected and correct: that line refers to
 the Callback API, which is deliberately not dispatched -- see below.
 
+## Nsight Systems
+
+Does not collect CUDA data, and cannot yet.
+
+`nsys` runs the program correctly, and its injection library loads and
+initializes through the same path nvprof uses -- but it does not use this
+library at all. It ships its own CUPTI and loads it by absolute path from its
+own install directory, and that copy reaches the driver through
+`cuGetExportTable`, NVIDIA's undocumented internal interface. Its own error
+strings say so: "Failed to get cuGetExportTable".
+
+So an `nsys` report from a program running here contains OS runtime traces --
+`pthread_create`, file I/O -- and no CUDA trace data. The blocker is not
+anything in the public API; it is a set of version-specific tables of function
+pointers with no specification, which `TODO.md` has long listed as deferred for
+being brittle. Nothing about the CUPTI here changes that, and implementing the
+Activity API cannot route around it.
+
+The practical answer today is nvprof, which collects through the public API
+this does implement.
+
 ## What is implemented
 
 The Activity API, which is what produces a timeline:

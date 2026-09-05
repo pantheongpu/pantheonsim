@@ -332,6 +332,11 @@ scripts/run-pantheon-workloads.sh.
    tables (cuGetExportTable dark API) so binaries built with the *default*
    (static) cudart also run without a `-cudart shared` rebuild. Partial
    groundwork exists in the driver shim; deferred as brittle/version-specific.
+   Now has a second consumer: Nsight Systems collects through its own bundled
+   CUPTI, loaded by absolute path from its install directory, and that copy
+   reaches the driver the same way -- so `nsys` produces a report with OS
+   runtime traces and no CUDA data. nvprof works, because its path goes through
+   the public CUPTI this does implement. See docs/cupti.md.
 5. **More PTX as workloads demand it**: bf16, cp.async, mma.sync and the
    lane-mask family are done -- driven by llama.cpp's flash attention and by
    CUB's radix sort, which is the way to pick the next one too. Textures,

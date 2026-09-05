@@ -1478,13 +1478,19 @@ VGPU_EXPORT CUresult cuGetExportTable(const void** table, const void* uuid) {
   static std::once_flag warned;
   std::call_once(warned, [] {
     if (std::getenv("VGPU_QUIET") && std::getenv("VGPU_QUIET")[0] == '1') return;
+    // Two very different callers reach here, and telling someone to rebuild
+    // their program when it was a profiler asking sends them somewhere useless.
     std::fprintf(stderr,
-                 "[vgpu] this program links the CUDA runtime statically, which cannot run on a "
-                 "simulated driver.\n"
-                 "       Rebuild with 'nvcc -cudart shared', or build inside 'vgpu shell', which "
-                 "supplies an nvcc that adds it.\n"
-                 "       Without that the next CUDA call fails with error 103, \"integrity checks "
-                 "failed\".\n");
+                 "[vgpu] something asked for a driver export table, which is NVIDIA's "
+                 "undocumented internal interface.\n"
+                 "       If this is your program: it links the CUDA runtime statically, which "
+                 "cannot run on a simulated driver. Rebuild with\n"
+                 "       'nvcc -cudart shared', or build inside 'vgpu shell', which supplies an "
+                 "nvcc that adds it. Without that the next\n"
+                 "       CUDA call fails with error 103, \"integrity checks failed\".\n"
+                 "       If this is a profiler: Nsight Systems collects through its own bundled "
+                 "CUPTI, which needs these tables.\n"
+                 "       nvprof works instead -- see docs/cupti.md.\n");
   });
   const unsigned char* u = static_cast<const unsigned char*>(uuid);
   const void* t = dark_table_for(u);
