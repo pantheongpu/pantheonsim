@@ -137,9 +137,15 @@ int main() {
   // And the converse: a capability VirtualGPU does not implement must answer
   // no. A block count leaking into a NUMA query is what the wrong numbering
   // looked like from the outside.
+  //
+  // HOST_NUMA_ID is guarded because the enum is newer than some toolkits this
+  // builds against -- CUDA 12.0 has no such name. Checked against 13.0, where
+  // it exists, rather than guessing at the release that introduced it.
+#if CUDA_VERSION >= 13000
   int numa_id = 0;
   CK(cuDeviceGetAttribute(&numa_id, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, dev));
   printf("HOST_NUMA_ID is not a block count: %s\n", numa_id <= 0 ? "yes" : "no");
+#endif
   int managed = -1;
   CK(cuDeviceGetAttribute(&managed, CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY, dev));
   printf("MANAGED_MEMORY answers no: %s\n", managed == 0 ? "yes" : "no");

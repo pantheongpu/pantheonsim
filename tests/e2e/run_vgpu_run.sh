@@ -7,6 +7,7 @@
 # section, so both are testable without a GPU.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/shim_guard.sh"
 build="${VGPU_BUILD_DIR:-$root/build}"
 vgpu="$build/vgpu"
 work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu_run_test.XXXXXX")"
@@ -55,19 +56,28 @@ fi
 if command -v gcc >/dev/null 2>&1; then
   echo 'void stub(void){}' > "$work/stub.c"
   echo 'int main(void){return 0;}' > "$work/prog.c"
-  gcc -shared -fPIC -Wl,-soname,libcudart.so.12 "$work/stub.c" -o "$work/libcudart.so.12"
+  # Major 99 will never be a real CUDA release, so this stays a mismatch whatever
+  # toolkit the shim was built against -- and the message has to name the major
+  # the shim actually carries, which differs between build directories.
+  shopt -s nullglob
+  shim_carts=("$build/shim"/libcudart.so.[0-9]*)
+  shopt -u nullglob
+  have_cart="$(basename "${shim_carts[0]}")"
+  gcc -shared -fPIC -Wl,-soname,libcudart.so.99 "$work/stub.c" -o "$work/libcudart.so.99"
   # --no-as-needed keeps the dependency even though nothing in it is called.
-  gcc "$work/prog.c" -Wl,--no-as-needed -L"$work" -l:libcudart.so.12 -o "$work/needs12"
+  gcc "$work/prog.c" -Wl,--no-as-needed -L"$work" -l:libcudart.so.99 -o "$work/needs99"
   check "a soname the shim lacks is named, with what it has instead" \
-        "this build of the simulator has libcudart.so.13" -- \
-    "$vgpu" run --gpu nvidia/a10 "$work/needs12"
+        "this build of the simulator has $have_cart" -- \
+    "$vgpu" run --gpu nvidia/a10 "$work/needs99"
 else
   echo "SKIP: gcc not found (soname mismatch check)"
 fi
 
 # --- things that need nvcc ---
 
-if command -v nvcc >/dev/null 2>&1; then
+nvcc_bin="$(pick_nvcc_for_shim "$build/shim")"
+nvcc_host_compiler_fix
+if [[ -n "$nvcc_bin" ]]; then
   cat > "$work/k.cu" <<'CU'
 #include <cstdio>
 __global__ void addk(float* x, int n) {
@@ -86,14 +96,27 @@ int main() {
   return h[7] == 8.f ? 0 : 1;
 }
 CU
-  nvcc_flags=(-std=c++17 -arch=sm_86 -Wno-deprecated-gpu-targets)
-  nvcc "${nvcc_flags[@]}" -cudart shared "$work/k.cu" -o "$work/shared" 2>/dev/null
-  nvcc "${nvcc_flags[@]}" "$work/k.cu" -o "$work/static" 2>/dev/null
+  # The programs must carry whatever sanitizer the shim was built with, or they
+  # abort loading it with "ASan runtime does not come first".
+  read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$build/shim")"
+  nvcc_flags=(-std=c++17 -arch=sm_86 -Wno-deprecated-gpu-targets "${san_flags[@]}")
+  "$nvcc_bin" "${nvcc_flags[@]}" -cudart shared "$work/k.cu" -o "$work/shared" 2>/dev/null
+  "$nvcc_bin" "${nvcc_flags[@]}" "$work/k.cu" -o "$work/static" 2>/dev/null
+  # The RPATH has to name a directory that really holds the real libcudart, or
+  # there is nothing for the check to catch -- and where that is depends on the
+  # toolkit layout (a distribution package puts it in the multiarch directory,
+  # NVIDIA's installer under targets/). Ask the loader's cache rather than
+  # guessing from nvcc's location.
+  real_cart="$(ldconfig -p | awk -v n="$have_cart" '$1 == n {print $NF; exit}')"
+  real_dir=""
+  [[ -n "$real_cart" && -e "$real_cart" ]] && real_dir="$(dirname "$real_cart")"
   # DT_RPATH, not DT_RUNPATH: --disable-new-dtags is what makes the difference,
   # and the difference is the whole point of the check.
-  nvcc "${nvcc_flags[@]}" -cudart shared \
-       -Xlinker --disable-new-dtags -Xlinker -rpath="$(dirname "$(command -v nvcc)")/../lib64" \
-       "$work/k.cu" -o "$work/rpath" 2>/dev/null
+  if [[ -n "$real_dir" ]]; then
+    "$nvcc_bin" "${nvcc_flags[@]}" -cudart shared \
+         -Xlinker --disable-new-dtags -Xlinker -rpath="$real_dir" \
+         "$work/k.cu" -o "$work/rpath" 2>/dev/null
+  fi
 
   check "a shared-cudart program runs and computes" "h[7]=8.0" -- \
     "$vgpu" run --quiet --gpu nvidia/a10 "$work/shared"
@@ -106,7 +129,7 @@ CU
     fails=$((fails + 1))
   fi
 
-  if [[ -e "$work/rpath" ]] && readelf -d "$work/rpath" 2>/dev/null | grep -q RPATH; then
+  if [[ -e "$work/rpath" ]] && readelf -d "$work/rpath" 2>/dev/null | grep -q "(RPATH)"; then
     out="$("$vgpu" run --quiet --gpu nvidia/a10 "$work/rpath" 2>&1)"
     if [[ "$out" == *"DT_RPATH"* ]]; then
       echo "PASS a DT_RPATH that shadows the shim is caught"
@@ -115,13 +138,23 @@ CU
       fails=$((fails + 1))
     fi
     # And --preload gets past it, which is the advice the warning gives.
-    check "--preload runs it anyway" "h[7]=8.0" -- \
-      "$vgpu" run --quiet --gpu nvidia/a10 --preload "$work/rpath"
+    #
+    # Not under a sanitizer: LD_PRELOAD entries load before the program's own
+    # DT_NEEDED, so preloading an instrumented shim puts it ahead of the
+    # program's libasan and the ordering check fires. That is a real limitation
+    # of --preload against an instrumented build, not a defect in the warning
+    # above, and the warning is what this test is for.
+    if [[ -z "$(shim_sanitizer "$build/shim")" ]]; then
+      check "--preload runs it anyway" "h[7]=8.0" -- \
+        "$vgpu" run --quiet --gpu nvidia/a10 --preload "$work/rpath"
+    else
+      echo "SKIP: --preload against a sanitizer-instrumented shim (load order)"
+    fi
   else
-    echo "SKIP: could not build a DT_RPATH binary"
+    echo "SKIP: no DT_RPATH binary (no real libcudart directory to point at)"
   fi
 else
-  echo "SKIP: nvcc not found (compiled-program checks)"
+  echo "SKIP: no nvcc matching this shim's toolkit (compiled-program checks)"
 fi
 
 if (( fails )); then

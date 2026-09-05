@@ -23,6 +23,27 @@ shopt -u nullglob
 # library path offers. A CUDA 12 nvprof against a CUDA 13 shim finds no
 # libcupti.so.12, falls back to the real one, and reports collecting nothing --
 # an unbuildable pairing rather than a defect, so it skips like the rest.
+# nvprof cannot be run against a sanitizer-instrumented shim, and the reason is
+# nvprof rather than anything here: it loads libcuda into its *own* process to
+# look for devices, so with the shim on the library path an uninstrumented
+# NVIDIA binary ends up loading an instrumented library and aborts with "ASan
+# runtime does not come first in initial library list". It does this even
+# profiling /bin/true, so building the app with the shim's sanitizer -- which is
+# what every other e2e test here does, and the obvious thing to try -- does not
+# help. nvprof is not ours to rebuild.
+#
+# Nothing is lost by skipping: what the sanitizer builds check is this project's
+# own memory safety, and e2e_cupti_activity exercises the same injection and
+# activity-record path under the sanitizers with a program we do control. What
+# is unique to this test -- that a profiler nobody here wrote collects real data
+# -- is covered by the ordinary build.
+san="$(shim_sanitizer "$shim")"
+if [[ -n "$san" ]]; then
+  echo "SKIP: shim is built with $san, and nvprof loads libcuda into its own"
+  echo "      uninstrumented process (see the comment in this script)"
+  exit 0
+fi
+
 shim_major="${cupti_libs[0]##*.}"
 nvprof_major="$(nvprof --version 2>&1 | sed -n 's/.*Release version \([0-9]*\)\..*/\1/p' | head -1)"
 if [[ -n "$nvprof_major" && "$shim_major" != "$nvprof_major" ]]; then
@@ -45,12 +66,7 @@ for cand in "${VGPU_NVCC:-}" "$(command -v nvcc 2>/dev/null)" /usr/bin/nvcc /usr
 done
 [[ -n "$pick_nvcc" ]] || { echo "SKIP: no nvcc for CUDA $shim_major"; exit 0; }
 
-# nvcc 12 rejects this distribution's default GCC 13 headers, failing inside
-# <bits/floatn.h> on _Float128. The CI workflow sets the same flag for the same
-# reason; setting it here too means a developer's shell does not have to.
-if [[ -z "${NVCC_PREPEND_FLAGS:-}" ]] && command -v g++-12 >/dev/null 2>&1; then
-  export NVCC_PREPEND_FLAGS="-ccbin g++-12"
-fi
+nvcc_host_compiler_fix
 
 "$pick_nvcc" -std=c++14 -cudart shared -arch=compute_75 -code=compute_75 \
      -Wno-deprecated-gpu-targets "$root/tests/e2e/vector_add.cu" -o "$out"
