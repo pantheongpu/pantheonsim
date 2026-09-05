@@ -150,6 +150,7 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
       st.global_requests
           ? static_cast<double>(st.global_bytes_read + st.global_bytes_written) / 32.0
           : 0.0;
+  const auto cls = [&st](exec::InstClass c) { return st.inst_by_class[static_cast<size_t>(c)]; };
   const double coalescing_pct =
       st.global_sectors ? 100.0 * ideal_sectors / static_cast<double>(st.global_sectors) : 0.0;
   std::fprintf(stderr,
@@ -161,7 +162,9 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
                "    shared  ld=%llu st=%llu  read=%llu B write=%llu B\n"
                "    local   ld=%llu st=%llu\n"
                "    sectors global=%llu over %llu requests (%.2f per request, %.0f%% of ideal)\n"
-               "    shared  bank_conflicts=%llu over %llu requests\n",
+               "    shared  bank_conflicts=%llu over %llu requests\n"
+               "    mix     fp16=%llu fp32=%llu fp64=%llu int=%llu cvt=%llu\n"
+               "            ctrl=%llu mem=%llu tensor=%llu misc=%llu  (tensor issues=%llu)\n",
                kernel.c_str(), cfg.grid[0], cfg.grid[1], cfg.grid[2], cfg.block[0], cfg.block[1],
                cfg.block[2], (unsigned long long)st.blocks, (unsigned long long)st.warps,
                (unsigned long long)st.instructions, (unsigned long long)st.thread_instructions,
@@ -175,7 +178,17 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
                (unsigned long long)st.global_sectors, (unsigned long long)st.global_requests,
                sectors_per_request, coalescing_pct,
                (unsigned long long)st.shared_bank_conflicts,
-               (unsigned long long)st.shared_requests);
+               (unsigned long long)st.shared_requests,
+               (unsigned long long)cls(exec::InstClass::Fp16),
+               (unsigned long long)cls(exec::InstClass::Fp32),
+               (unsigned long long)cls(exec::InstClass::Fp64),
+               (unsigned long long)cls(exec::InstClass::Integer),
+               (unsigned long long)cls(exec::InstClass::BitConvert),
+               (unsigned long long)cls(exec::InstClass::Control),
+               (unsigned long long)cls(exec::InstClass::Memory),
+               (unsigned long long)cls(exec::InstClass::Tensor),
+               (unsigned long long)cls(exec::InstClass::Misc),
+               (unsigned long long)st.tensor_instructions);
 }
 
 }  // namespace

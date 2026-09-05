@@ -49,6 +49,21 @@ KernelResources kernel_resources(const ptx::EntryFn& fn, const DeviceProfile& pr
 // timing or memory-hierarchy model, so cache hit rates, DRAM throughput, warp
 // stall reasons and achieved occupancy are not derivable -- reporting them
 // would mean inventing them.
+// What a thread-instruction was, in the categories a profiler reports. The
+// classes partition every instruction, so they sum to thread_instructions --
+// which is a property worth testing, because a classifier that silently drops
+// a case looks exactly like one that works.
+enum class InstClass : uint8_t {
+  Fp16, Fp32, Fp64,   // arithmetic, by operand width
+  Integer,            // integer arithmetic and bit manipulation
+  BitConvert,         // cvt, cvta, and the pack/unpack moves
+  Control,            // branches, returns, barriers, trap
+  Memory,             // loads, stores, atomics, async copies
+  Tensor,             // mma, wmma, movmatrix -- the tensor-core pipe
+  Misc,               // mov, setp, selp, shuffles, votes
+  Count
+};
+
 struct LaunchStats {
   uint64_t blocks = 0;
   uint64_t warps = 0;
@@ -95,6 +110,13 @@ struct LaunchStats {
   // nothing. This counts the extra passes that serialization forces -- zero
   // for a conflict-free access, 31 for a 32-way conflict.
   uint64_t shared_bank_conflicts = 0;
+
+  // Instruction mix, per active lane, so these sum to thread_instructions.
+  uint64_t inst_by_class[static_cast<size_t>(InstClass::Count)] = {};
+  // Tensor-core issues counted per warp rather than per lane: an mma is one
+  // instruction the whole warp executes together, and a per-lane figure would
+  // say 32 for something that happened once.
+  uint64_t tensor_instructions = 0;
 
   // Adding a counter used to mean remembering to add it to the merge that
   // folds each host thread's totals together, and forgetting left the new one

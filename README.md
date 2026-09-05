@@ -152,6 +152,16 @@ own:
 A device derives both by sampling, so its answer moves between runs. These do
 not move.
 
+The instruction mix is reported alongside them, in the categories a profiler
+uses: fp16/fp32/fp64 by operand width, integer, conversion, control, memory,
+tensor and everything else. The classes partition the instructions, so they sum
+to the thread-instruction total -- which is checked by a test, because a
+classifier that silently drops a case looks exactly like one that works.
+Tensor-core work is reported twice: per lane with the rest of the mix, and per
+warp as `tensor issues`, since an mma is one instruction the whole warp
+executes together and a per-lane figure would say thirty-two for something that
+happened once.
+
 There is no timing model and no cache model here, so there are no cycles, no
 stall reasons and no hit rates. Those are the numbers a profiler is mostly
 made of, and inventing them would be worse than not having them.

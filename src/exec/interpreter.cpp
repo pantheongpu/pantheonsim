@@ -365,12 +365,86 @@ class Interpreter {
       if (progress_ && (stats_.instructions & 0xFFFFF) == 0) report_progress();
       // Warp-level issue count, plus the per-lane total: their ratio is the
       // average lane utilisation, which is divergence measured directly.
-      stats_.thread_instructions += static_cast<uint64_t>(popcount_mask(w.paths[idx].mask));
+      const uint64_t lanes = static_cast<uint64_t>(popcount_mask(w.paths[idx].mask));
+      stats_.thread_instructions += lanes;
+      // Counted against the same mask as thread_instructions, so the classes
+      // partition it exactly. Predication narrows the mask inside step(); it is
+      // deliberately not subtracted here, for the same reason.
+      const InstClass cls = class_of_pc(w.paths[idx].pc);
+      stats_.inst_by_class[static_cast<size_t>(cls)] += lanes;
+      if (cls == InstClass::Tensor) ++stats_.tensor_instructions;
       if (++stats_.instructions > cfg_.max_steps)
         throw Error::make(Err::ExecLimit, "kernel '", fn_.name, "' exceeded the launch step budget (",
                           cfg_.max_steps, " instructions) — possible infinite loop");
       step(w, ctx, idx, ins);
     }
+  }
+
+  InstClass class_of_pc(size_t pc) const {
+    if (class_by_pc_.empty()) {
+      class_by_pc_.resize(fn_.body.size());
+      for (size_t i = 0; i < fn_.body.size(); ++i)
+        class_by_pc_[i] = static_cast<uint8_t>(classify(fn_.body[i]));
+    }
+    return static_cast<InstClass>(class_by_pc_[pc]);
+  }
+
+  // Which category an instruction falls in. Worked out once per kernel rather
+  // than per execution: a kernel is parsed once and its instructions run
+  // millions of times, and a chain of variant tests on that path would cost
+  // more than the counting is worth.
+  static InstClass classify(const Instr& ins) {
+    auto by_width = [](const Type& t) {
+      if (t.bits == 16) return InstClass::Fp16;
+      if (t.bits == 64) return InstClass::Fp64;
+      return InstClass::Fp32;
+    };
+    // Arithmetic that carries a type: float by width, otherwise integer.
+    if (const auto* o = std::get_if<OpFloatBin>(&ins.op)) return by_width(o->ty);
+    if (const auto* o = std::get_if<OpFma>(&ins.op)) return by_width(o->ty);
+    if (const auto* o = std::get_if<OpMath>(&ins.op)) return by_width(o->ty);
+    if (const auto* o = std::get_if<OpCopysign>(&ins.op)) return by_width(o->ty);
+    if (std::holds_alternative<OpF16x2Bin>(ins.op) ||
+        std::holds_alternative<OpF16x2Fma>(ins.op) ||
+        std::holds_alternative<OpF16x2Neg>(ins.op))
+      return InstClass::Fp16;
+    for (const Type* t : {std::get_if<OpNeg>(&ins.op) ? &std::get_if<OpNeg>(&ins.op)->ty : nullptr,
+                          std::get_if<OpAbs>(&ins.op) ? &std::get_if<OpAbs>(&ins.op)->ty : nullptr})
+      if (t) return t->is_real() ? by_width(*t) : InstClass::Integer;
+
+    if (std::holds_alternative<OpIntBin>(ins.op) || std::holds_alternative<OpMadLo>(ins.op) ||
+        std::holds_alternative<OpMulWide>(ins.op) || std::holds_alternative<OpMadWide>(ins.op) ||
+        std::holds_alternative<OpMulHi>(ins.op) || std::holds_alternative<OpMadHi>(ins.op) ||
+        std::holds_alternative<OpShf>(ins.op) || std::holds_alternative<OpBfe>(ins.op) ||
+        std::holds_alternative<OpBfi>(ins.op) || std::holds_alternative<OpBrev>(ins.op) ||
+        std::holds_alternative<OpPopcClz>(ins.op) || std::holds_alternative<OpPrmt>(ins.op) ||
+        std::holds_alternative<OpDp4a>(ins.op) || std::holds_alternative<OpBmsk>(ins.op) ||
+        std::holds_alternative<OpNot>(ins.op))
+      return InstClass::Integer;
+
+    if (std::holds_alternative<OpCvt>(ins.op) || std::holds_alternative<OpCvtF16x2>(ins.op) ||
+        std::holds_alternative<OpCvta>(ins.op) || std::holds_alternative<OpMovPack>(ins.op) ||
+        std::holds_alternative<OpMovUnpack>(ins.op))
+      return InstClass::BitConvert;
+
+    if (std::holds_alternative<OpBra>(ins.op) || std::holds_alternative<OpRet>(ins.op) ||
+        std::holds_alternative<OpBar>(ins.op) || std::holds_alternative<OpBarRed>(ins.op) ||
+        std::holds_alternative<OpTrap>(ins.op) || std::holds_alternative<OpCall>(ins.op))
+      return InstClass::Control;
+
+    if (std::holds_alternative<OpLd>(ins.op) || std::holds_alternative<OpSt>(ins.op) ||
+        std::holds_alternative<OpAtom>(ins.op) || std::holds_alternative<OpCpAsync>(ins.op) ||
+        std::holds_alternative<OpCpAsyncGroup>(ins.op) ||
+        std::holds_alternative<OpLdMatrix>(ins.op) ||
+        std::holds_alternative<OpWmmaStore>(ins.op) ||
+        std::holds_alternative<OpLdSlot>(ins.op) || std::holds_alternative<OpStSlot>(ins.op))
+      return InstClass::Memory;
+
+    if (std::holds_alternative<OpMma>(ins.op) || std::holds_alternative<OpWmmaMma>(ins.op) ||
+        std::holds_alternative<OpMovMatrix>(ins.op))
+      return InstClass::Tensor;
+
+    return InstClass::Misc;
   }
 
   // ---- symbols / registers / operands ----
@@ -2725,6 +2799,9 @@ class Interpreter {
   const SymbolTable* symbols_;
   LaunchStats& stats_;
   ProgressFn progress_;
+  // One entry per instruction, filled on first use. Classifying costs a chain
+  // of variant tests, and the instruction stream is the hottest path there is.
+  mutable std::vector<uint8_t> class_by_pc_;
   bool concurrent_ = false;   // set when the grid is split across threads
   std::chrono::steady_clock::time_point last_progress_;
 };
