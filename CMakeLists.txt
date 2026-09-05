@@ -523,6 +523,17 @@ if(TARGET vgpucupti)
     TIMEOUT 600)
 endif()
 
+# The shim compiled against NVIDIA's own cuda.h. This is the only test that can
+# see a signature or an enum value that has drifted from the toolkit -- the shim
+# is written against a clean-room header, so nothing else in the build compares
+# the two. It existed unregistered for a while, which is how ten device
+# attributes came to be filed under the wrong numbers.
+add_test(NAME e2e_driver_abi COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_driver_abi.sh)
+set_tests_properties(e2e_driver_abi PROPERTIES
+  DEPENDS vgpucuda
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
 # The `vgpu run` wrapper, and the two pre-flight checks that are the reason it
 # exists: a CUDA soname the shim does not carry, and a DT_RPATH that outranks
 # LD_LIBRARY_PATH. Both are silent failures without it.

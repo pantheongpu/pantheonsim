@@ -108,6 +108,42 @@ int main() {
   for (int i = 0; i < n; ++i) if (host[i] != 42) ++wrong;
   printf("kernel result wrong: %d\n", wrong);
 
+  // Device attributes, checked through the vendor header's own enum names.
+  //
+  // This is the check that was missing: the shim's attribute table is written
+  // with bare integers, and ten of them were filed under the wrong number --
+  // including MAX_BLOCKS_PER_MULTIPROCESSOR, added after a CUB scan launched no
+  // blocks, which went to 134 (HOST_NUMA_ID) and left the real 106 answering
+  // zero. Compiling against cuda.h is what makes a wrong number visible.
+  struct { CUdevice_attribute attr; const char* name; int min; } kPositive[] = {
+      {CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR, "MAX_BLOCKS_PER_MULTIPROCESSOR", 1},
+      {CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, "MAX_THREADS_PER_MULTIPROCESSOR", 1},
+      {CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, "MAX_SHARED_MEMORY_PER_SM", 1},
+      {CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR, "MAX_REGISTERS_PER_SM", 1},
+      {CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, "SHARED_MEMORY_PER_BLOCK_OPTIN", 1},
+      {CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE1D_WIDTH, "MAXIMUM_TEXTURE1D_WIDTH", 1},
+      {CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE2D_HEIGHT, "MAXIMUM_TEXTURE2D_HEIGHT", 1},
+      {CU_DEVICE_ATTRIBUTE_MAXIMUM_SURFACE3D_DEPTH, "MAXIMUM_SURFACE3D_DEPTH", 1},
+      {CU_DEVICE_ATTRIBUTE_TEXTURE_PITCH_ALIGNMENT, "TEXTURE_PITCH_ALIGNMENT", 1},
+  };
+  int attr_bad = 0;
+  for (auto& a : kPositive) {
+    int v = 0;
+    CK(cuDeviceGetAttribute(&v, a.attr, dev));
+    if (v < a.min) { printf("  %s answered %d\n", a.name, v); ++attr_bad; }
+  }
+  printf("attributes that must be positive are: %s\n", attr_bad ? "NOT all positive" : "all positive");
+
+  // And the converse: a capability VirtualGPU does not implement must answer
+  // no. A block count leaking into a NUMA query is what the wrong numbering
+  // looked like from the outside.
+  int numa_id = 0;
+  CK(cuDeviceGetAttribute(&numa_id, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, dev));
+  printf("HOST_NUMA_ID is not a block count: %s\n", numa_id <= 0 ? "yes" : "no");
+  int managed = -1;
+  CK(cuDeviceGetAttribute(&managed, CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY, dev));
+  printf("MANAGED_MEMORY answers no: %s\n", managed == 0 ? "yes" : "no");
+
   // Runtime JIT linking. Numba resolves and calls this family for every kernel
   // it compiles, so a missing or mis-typed entry point stops it before its
   // first launch. Two inputs, so the merge is exercised rather than a

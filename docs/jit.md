@@ -77,11 +77,18 @@ undocumented export tables (`cuGetExportTable`) during startup and fails at
 `cudaGetDeviceCount` with `cudaErrorSoftwareValidityNotEstablished` — before it
 has compiled a single kernel.
 
+Building CuPy from source does not change this: its build links
+`cudart_static` either way, so a source-built CuPy has no `libcudart` in its
+`DT_NEEDED` and fails in exactly the same place. (Checked, because it is the
+obvious thing to try.)
+
 Unblocking CuPy means implementing enough of the dark API to satisfy a static
-cudart, which is the same work Nsight Systems needs and is tracked as its own
-item in TODO.md. It is deliberately not done: those tables are undocumented,
-version-specific and integrity-checked, and the documented runtime API is the
-interface this project commits to.
+cudart, which is the same work Nsight Systems needs. That has now been
+investigated in detail and stopped for a specific reason rather than a general
+one -- see [dark-api.md](dark-api.md). The short version: the runtime's validity
+self-test never asks the driver to compute anything, so passing it is not a
+matter of being functionally correct, and the values it does want have no
+specification a clean-room project can read.
 
 ## Running the tests
 

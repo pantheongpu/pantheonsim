@@ -361,8 +361,19 @@ scripts/run-pantheon-workloads.sh.
    `verified` bits in the profiles.
 4. **Static cudart hosting**: satisfy NVIDIA's undocumented driver export
    tables (cuGetExportTable dark API) so binaries built with the *default*
-   (static) cudart also run without a `-cudart shared` rebuild. Partial
-   groundwork exists in the driver shim; deferred as brittle/version-specific.
+   (static) cudart also run without a `-cudart shared` rebuild. **Investigated
+   and stopped, with a reason** -- see docs/dark-api.md for the full bootstrap
+   map. The static runtime asks for seven tables (three of them mandatory:
+   without them the process aborts before `main`), queries the device through
+   the ordinary documented API, and then fails its own validity self-test with
+   `cudaErrorSoftwareValidityNotEstablished`. Three hypotheses were tested and
+   eliminated: a missing table, unfilled out-parameters, and an incomplete
+   device model. The decisive observation is that the runtime never performs a
+   *functional* test -- no allocation, no launch, no result compared -- so the
+   validity decision comes from the table interactions alone. Getting past it
+   means producing exact values for slots with no specification, obtainable
+   only from NVIDIA's internal headers or by disassembling their runtime.
+   Neither is available to a clean-room project, so this stays where it is.
    Now has two more consumers. Nsight Systems collects through its own bundled
    CUPTI, loaded by absolute path from its install directory, and that copy
    reaches the driver the same way -- so `nsys` produces a report with OS

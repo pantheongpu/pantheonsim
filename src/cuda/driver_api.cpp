@@ -95,10 +95,17 @@ bool quiet() {
 
 // VGPU_TRACE=1: log every driver entry point resolution and unknown-attribute
 // query — the tool for growing the shim against new applications.
-bool trace() {
+// VGPU_TRACE=2: also log every driver call and its result. Louder, and the only
+// way to see what a caller does between the calls it tells you about -- a
+// statically linked runtime runs a self-test before it will report a device,
+// and this is how you find out what the self-test asks for.
+int trace_level() {
   const char* t = std::getenv("VGPU_TRACE");
-  return t && t[0] == '1';
+  if (!t || !t[0]) return 0;
+  return t[0] - '0';
 }
+bool trace() { return trace_level() >= 1; }
+bool trace_calls() { return trace_level() >= 2; }
 
 void report(const char* api, const std::string& msg) {
   if (!quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", api, msg.c_str());
@@ -141,10 +148,14 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
     return CUDA_ERROR_NOT_INITIALIZED;
   }
   try {
-    return body(s);
+    CUresult r = body(s);
+    if (trace_calls()) std::fprintf(stderr, "[vgpu][call] %s -> %d\n", name, static_cast<int>(r));
+    return r;
   } catch (const vgpu::Error& e) {
     report(name, e.what());
-    return map_error(e, kernel_context);
+    const CUresult r = map_error(e, kernel_context);
+    if (trace_calls()) std::fprintf(stderr, "[vgpu][call] %s -> %d (threw)\n", name, static_cast<int>(r));
+    return r;
   } catch (const std::exception& e) {
     report(name, std::string("unexpected: ") + e.what());
     return CUDA_ERROR_UNKNOWN;
@@ -200,10 +211,20 @@ std::string best_ptx(const void* image) {
   return std::move(ptxs[best].text);
 }
 
-// Attribute values beyond the profile-backed set. These are functional
-// placeholders (VirtualGPU does not model performance); unknown ids resolve
-// to 0, which also cleanly disables optional cudart features (memory pools,
-// virtual memory management, managed memory, ...).
+// Attribute values beyond the profile-backed set.
+//
+// The numbers are CUdevice_attribute, and they are the whole difficulty: an
+// answer filed under the wrong one is worse than no answer, because it is
+// returned confidently. This table previously had ten entries numbered wrong,
+// including MAX_BLOCKS_PER_MULTIPROCESSOR -- added after a CUB scan launched no
+// blocks -- filed under 134, which is HOST_NUMA_ID. The scan bug was still
+// there, and 134 was answering a NUMA query with a block count. Every id below
+// is checked against the toolkit's cuda.h.
+//
+// Texture and surface limits are the documented per-compute-capability values
+// from the CUDA C Programming Guide's technical-specification table. Nothing
+// here models performance; the clock and bandwidth entries are placeholders and
+// say so.
 int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
   switch (attrib) {
     case 11: return 2147483647;                      // MAX_PITCH
@@ -213,46 +234,141 @@ int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
     case 18: return 0;                               // INTEGRATED
     case 19: return 1;                               // CAN_MAP_HOST_MEMORY
     case 20: return 0;                               // COMPUTE_MODE (default)
+
+    // ---- texture limits (documented, per compute capability) ----
+    case 21: return 131072;                          // MAXIMUM_TEXTURE1D_WIDTH
+    case 22: return 131072;                          // MAXIMUM_TEXTURE2D_WIDTH
+    case 23: return 65536;                           // MAXIMUM_TEXTURE2D_HEIGHT
+    case 24: return 16384;                           // MAXIMUM_TEXTURE3D_WIDTH
+    case 25: return 16384;                           // MAXIMUM_TEXTURE3D_HEIGHT
+    case 26: return 16384;                           // MAXIMUM_TEXTURE3D_DEPTH
+    case 27: return 32768;                           // MAXIMUM_TEXTURE2D_LAYERED_WIDTH
+    case 28: return 32768;                           // MAXIMUM_TEXTURE2D_LAYERED_HEIGHT
+    case 29: return 2048;                            // MAXIMUM_TEXTURE2D_LAYERED_LAYERS
+
     case 30: return 512;                             // SURFACE_ALIGNMENT
     case 31: return 1;                               // CONCURRENT_KERNELS
     case 32: return 0;                               // ECC_ENABLED
     case 33: return 1;                               // PCI_BUS_ID
     case 34: return 0;                               // PCI_DEVICE_ID
+    case 35: return 0;                               // TCC_DRIVER (Linux is always 0)
     case 36: return 1000000;                         // MEMORY_CLOCK_RATE (placeholder)
     case 37: return 256;                             // GLOBAL_MEMORY_BUS_WIDTH (placeholder)
     case 38: return 8 * 1024 * 1024;                 // L2_CACHE_SIZE (placeholder)
     case 39:                                         // MAX_THREADS_PER_MULTIPROCESSOR
-      // sm_86/sm_89 run 1536 resident threads/SM; other supported gens 2048.
-      return (p.cc_major == 8 && p.cc_minor >= 6) ? 1536 : 2048;
+      return static_cast<int>(p.limits.max_threads_per_sm);
     case 40: return 2;                               // ASYNC_ENGINE_COUNT
     case 41: return 1;                               // UNIFIED_ADDRESSING (64-bit Linux is UVA)
-    case 82: return static_cast<int>(p.limits.shared_mem_per_block_optin);
+    case 42: return 32768;                           // MAXIMUM_TEXTURE1D_LAYERED_WIDTH
+    case 43: return 2048;                            // MAXIMUM_TEXTURE1D_LAYERED_LAYERS
+    case 45: return 32768;                           // MAXIMUM_TEXTURE2D_GATHER_WIDTH
+    case 46: return 32768;                           // MAXIMUM_TEXTURE2D_GATHER_HEIGHT
+    case 47: return 16384;                           // MAXIMUM_TEXTURE3D_WIDTH_ALTERNATE
+    case 48: return 16384;                           // MAXIMUM_TEXTURE3D_HEIGHT_ALTERNATE
+    case 49: return 16384;                           // MAXIMUM_TEXTURE3D_DEPTH_ALTERNATE
+    case 50: return 0;                               // PCI_DOMAIN_ID
+    case 51: return 32;                              // TEXTURE_PITCH_ALIGNMENT
+    case 52: return 32768;                           // MAXIMUM_TEXTURECUBEMAP_WIDTH
+    case 53: return 32768;                           // MAXIMUM_TEXTURECUBEMAP_LAYERED_WIDTH
+    case 54: return 2046;                            // MAXIMUM_TEXTURECUBEMAP_LAYERED_LAYERS
+
+    // ---- surface limits ----
+    case 55: return 32768;                           // MAXIMUM_SURFACE1D_WIDTH
+    case 56: return 131072;                          // MAXIMUM_SURFACE2D_WIDTH
+    case 57: return 65536;                           // MAXIMUM_SURFACE2D_HEIGHT
+    case 58: return 16384;                           // MAXIMUM_SURFACE3D_WIDTH
+    case 59: return 16384;                           // MAXIMUM_SURFACE3D_HEIGHT
+    case 60: return 16384;                           // MAXIMUM_SURFACE3D_DEPTH
+    case 61: return 32768;                           // MAXIMUM_SURFACE1D_LAYERED_WIDTH
+    case 62: return 2048;                            // MAXIMUM_SURFACE1D_LAYERED_LAYERS
+    case 63: return 32768;                           // MAXIMUM_SURFACE2D_LAYERED_WIDTH
+    case 64: return 32768;                           // MAXIMUM_SURFACE2D_LAYERED_HEIGHT
+    case 65: return 2048;                            // MAXIMUM_SURFACE2D_LAYERED_LAYERS
+    case 66: return 32768;                           // MAXIMUM_SURFACECUBEMAP_WIDTH
+    case 67: return 32768;                           // MAXIMUM_SURFACECUBEMAP_LAYERED_WIDTH
+    case 68: return 2046;                            // MAXIMUM_SURFACECUBEMAP_LAYERED_LAYERS
+
+    case 70: return 131072;                          // MAXIMUM_TEXTURE2D_LINEAR_WIDTH
+    case 71: return 65000;                           // MAXIMUM_TEXTURE2D_LINEAR_HEIGHT
+    case 72: return 2097120;                         // MAXIMUM_TEXTURE2D_LINEAR_PITCH
+    case 73: return 32768;                           // MAXIMUM_TEXTURE2D_MIPMAPPED_WIDTH
+    case 74: return 32768;                           // MAXIMUM_TEXTURE2D_MIPMAPPED_HEIGHT
+    case 77: return 32768;                           // MAXIMUM_TEXTURE1D_MIPMAPPED_WIDTH
+
+    case 78: return 1;                               // STREAM_PRIORITIES_SUPPORTED
+    case 79: return 1;                               // GLOBAL_L1_CACHE_SUPPORTED
+    case 80: return 1;                               // LOCAL_L1_CACHE_SUPPORTED
+    case 81: return static_cast<int>(p.limits.shared_mem_per_sm);
+                                                     // MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
+    case 82: return static_cast<int>(p.limits.registers_per_sm);
+                                                     // MAX_REGISTERS_PER_MULTIPROCESSOR
+    case 84: return 0;                               // MULTI_GPU_BOARD
+    case 85: return 0;                               // MULTI_GPU_BOARD_GROUP_ID
     case 90: return 1;                               // COMPUTE_PREEMPTION_SUPPORTED
     // MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: the ceiling a kernel can raise its
     // dynamic shared memory to, above the 48 KiB default. Triton reads it to
     // decide how large a tile it may stage, so answering zero caps every kernel
     // at the smallest tile it knows.
     case 97: return static_cast<int>(p.limits.shared_mem_per_block_optin);
-    // Capabilities this does not implement. Zero is the true answer for each,
-    // and saying so explicitly keeps them out of the "unmodeled" report below.
-    // A real quantity, and answering zero for it is the same mistake that had
-    // CUB launching no blocks: it is a divisor in occupancy arithmetic.
-    case 134: return static_cast<int>(p.limits.max_blocks_per_sm);   // MAX_BLOCKS_PER_MULTIPROCESSOR
-    case 102: return 0;                              // VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
-    case 135: return 0;                              // GENERIC_COMPRESSION_SUPPORTED
-    case 136: return 0;                              // MAX_PERSISTING_L2_CACHE_SIZE
-    case 137: return 0;                              // MAX_ACCESS_POLICY_WINDOW_SIZE
-    case 138: return 0;                              // GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED
-    case 139: return 0;                              // RESERVED_SHARED_MEMORY_PER_BLOCK
-    case 140: return 0;                              // SPARSE_CUDA_ARRAY_SUPPORTED
-    case 141: return 0;                              // READ_ONLY_HOST_REGISTER_SUPPORTED
-    case 142: return 0;                              // TIMELINE_SEMAPHORE_INTEROP_SUPPORTED
-    case 143: return 0;                              // MEMORY_POOLS_SUPPORTED (no cuMemPool* here)
-    case 115: return 0;                              // GPU_DIRECT_RDMA_SUPPORTED
-    case 118: return 0;                              // HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED
-    case 121: return 0;                              // MAX_PERSISTING_L2_CACHE_SIZE
-    case 124: return 0;                              // MEMPOOL_SUPPORTED_HANDLE_TYPES
-    case 128: return 0;                              // DEFERRED_MAPPING_CUDA_ARRAY_SUPPORTED
+    case 98: return 0;                               // CAN_FLUSH_REMOTE_WRITES
+    case 99: return 1;                               // HOST_REGISTER_SUPPORTED
+    // A real quantity, and answering zero for it is what had a CUB scan launch
+    // no blocks: it is a divisor in occupancy arithmetic. 106, not 134.
+    case 106: return static_cast<int>(p.limits.max_blocks_per_sm);
+    case 107: return 0;                              // GENERIC_COMPRESSION_SUPPORTED
+    case 110: return 0;                              // GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED
+    case 111: return 0;                              // RESERVED_SHARED_MEMORY_PER_BLOCK
+
+    // ---- capabilities this deliberately does not implement ----
+    // Zero is the true answer for each, and saying so explicitly keeps them out
+    // of the "not modelled" report below: a caller that asks whether managed
+    // memory works needs a truthful no, not a warning.
+    case 83: return 0;                               // MANAGED_MEMORY
+    case 86: return 0;                               // HOST_NATIVE_ATOMIC_SUPPORTED
+    case 88: return 0;                               // PAGEABLE_MEMORY_ACCESS
+    case 89: return 0;                               // CONCURRENT_MANAGED_ACCESS
+    case 91: return 0;                               // CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM
+    case 95: return 0;                               // COOPERATIVE_LAUNCH (no grid sync yet)
+    case 96: return 0;                               // COOPERATIVE_MULTI_DEVICE_LAUNCH
+    case 100: return 0;                              // PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES
+    case 101: return 0;                              // DIRECT_MANAGED_MEM_ACCESS_FROM_HOST
+    case 102: return 0;                              // VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED
+    case 103: return 0;                              // HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED
+    case 104: return 0;                              // HANDLE_TYPE_WIN32_HANDLE_SUPPORTED
+    case 105: return 0;                              // HANDLE_TYPE_WIN32_KMT_HANDLE_SUPPORTED
+    case 108: return 0;                              // MAX_PERSISTING_L2_CACHE_SIZE
+    case 109: return 0;                              // MAX_ACCESS_POLICY_WINDOW_SIZE
+    case 112: return 0;                              // SPARSE_CUDA_ARRAY_SUPPORTED
+    case 113: return 0;                              // READ_ONLY_HOST_REGISTER_SUPPORTED
+    case 114: return 0;                              // TIMELINE_SEMAPHORE_INTEROP_SUPPORTED
+    case 115: return 0;                              // MEMORY_POOLS_SUPPORTED (no cuMemPool*)
+    case 116: return 0;                              // GPU_DIRECT_RDMA_SUPPORTED
+    case 117: return 0;                              // GPU_DIRECT_RDMA_FLUSH_WRITES_OPTIONS
+    case 118: return 0;                              // GPU_DIRECT_RDMA_WRITES_ORDERING
+    case 119: return 0;                              // MEMPOOL_SUPPORTED_HANDLE_TYPES
+    case 120: return 0;                              // CLUSTER_LAUNCH (no thread-block clusters)
+    case 121: return 0;                              // DEFERRED_MAPPING_CUDA_ARRAY_SUPPORTED
+    case 124: return 0;                              // DMA_BUF_SUPPORTED
+    case 125: return 0;                              // IPC_EVENT_SUPPORTED (see cuIpc* above)
+    case 128: return 0;                              // TENSOR_MAP_ACCESS_SUPPORTED
+    case 129: return 0;                              // UNIFIED_FUNCTION_POINTERS
+    case 130: return 0;                              // NUMA_CONFIG (not NUMA-attached)
+    case 131: return 0;                              // NUMA_ID
+    case 133: return 0;                              // MPS_ENABLED
+    case 134: return -1;                             // HOST_NUMA_ID (-1: no NUMA affinity)
+    case 135: return 0;                              // D3D12_CIG_SUPPORTED (Windows only)
+    case 136: return 0;                              // MEM_DECOMPRESS_ALGORITHM_MASK
+    case 137: return 0;                              // MEM_DECOMPRESS_MAXIMUM_LENGTH
+    case 138: return 0;                              // VULKAN_CIG_SUPPORTED
+    // GPU_PCI_DEVICE_ID: the 16-bit PCI device and vendor ids packed into one
+    // word. The profile carries the pair that `vgpu smi --lspci` renders, so
+    // this is the same identity the rest of the stack presents.
+    case 139:
+      return static_cast<int>((p.telemetry.pci_device_id << 16) | p.telemetry.pci_vendor_id);
+    case 140: return 0;                              // GPU_PCI_SUBSYSTEM_ID
+    case 141: return 0;                              // HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
+    case 142: return 0;                              // HOST_NUMA_MEMORY_POOLS_SUPPORTED
+    case 143: return 0;                              // HOST_NUMA_MULTINODE_IPC_SUPPORTED
     default:
       // Answering zero for a quantity nobody modelled is how a scan came to
       // launch no blocks, on the runtime side of this same question. The
@@ -1508,11 +1624,35 @@ constexpr unsigned char kUuidCtxStorage[16] = {0xc6, 0x93, 0x33, 0x6e, 0x11, 0x2
 // unless every table it asks for exists, so unknown UUIDs are served generic
 // logging-stub tables, assigned on demand and grown empirically (VGPU_TRACE).
 
+// An experiment knob, not a feature: VGPU_DARK_FILL=1 makes every stub zero the
+// eight bytes at each argument that looks like a writable pointer before
+// returning. The dark API has no specification, so the only question that can
+// be asked of it is "does the caller care?" -- and a caller that reads an
+// out-parameter we never wrote is the most likely way an unspecified slot
+// changes behaviour. Off by default: writing through a pointer whose meaning is
+// unknown is a guess, and a wrong guess corrupts the caller's memory.
+bool dark_fill() {
+  const char* e = std::getenv("VGPU_DARK_FILL");
+  return e && e[0] == '1';
+}
+
+// Plausibly a pointer into the caller's own mapping. Deliberately conservative:
+// only addresses in the range a userspace heap or stack occupies.
+bool looks_writable(uintptr_t v) {
+  return v > 0x10000 && v < (uintptr_t{1} << 47) && (v & 7) == 0;
+}
+
 template <int Table, int Index>
-uintptr_t dark_stub(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
+uintptr_t dark_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
+                    uintptr_t a5) {
   if (trace())
-    std::fprintf(stderr, "[vgpu][trace] dark-api table %d slot %d called (stubbed -> 0)\n", Table,
-                 Index);
+    std::fprintf(stderr,
+                 "[vgpu][trace] dark-api table %d slot %d(%#lx, %#lx, %#lx, %#lx, %#lx, %#lx)"
+                 " (stubbed -> 0)\n",
+                 Table, Index, a0, a1, a2, a3, a4, a5);
+  if (dark_fill())
+    for (uintptr_t a : {a0, a1, a2, a3, a4, a5})
+      if (looks_writable(a)) *reinterpret_cast<uint64_t*>(a) = 0;
   return 0;
 }
 
@@ -1581,7 +1721,31 @@ void* g_generic_tables[kMaxGenericTables][16];
 unsigned char g_generic_uuids[kMaxGenericTables][16];
 int g_generic_count = 0;
 
+// VGPU_DARK_DENY: refuse specific export tables, by UUID hex prefix, or "all".
+// The dark API has no specification to implement against, so the only way to
+// learn which table a caller actually depends on is to withhold one and see
+// what changes. This is that experiment, kept because the question recurs
+// whenever a new toolkit version bootstraps differently.
+bool dark_denied(const unsigned char* uuid) {
+  const char* deny = std::getenv("VGPU_DARK_DENY");
+  if (!deny || !deny[0]) return false;
+  char hex[33];
+  for (int i = 0; i < 16; ++i) std::snprintf(hex + 2 * i, 3, "%02x", uuid[i]);
+  std::string list(deny);
+  if (list == "all") return true;
+  size_t start = 0;
+  while (start <= list.size()) {
+    size_t comma = list.find(',', start);
+    std::string item = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+    if (!item.empty() && std::strncmp(hex, item.c_str(), item.size()) == 0) return true;
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  return false;
+}
+
 const void* dark_table_for(const unsigned char* uuid) {
+  if (dark_denied(uuid)) return nullptr;
   static bool init = false;
   if (!init) {
     init = true;
