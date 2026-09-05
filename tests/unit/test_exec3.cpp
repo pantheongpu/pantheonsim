@@ -1693,6 +1693,103 @@ VTEST(the_racy_kernel_runs_without_complaint_when_detection_is_off) {
   exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
 }
 
+// Two warps storing the *same* value to the same shared word.
+//
+// This is llama.cpp's mul_mat_q, reduced: with `need_check` on, the tile loader
+// clamps out-of-range rows with `i = min(i, i_max)`, so several warps recompute
+// the same source pointer and write the same bytes to the same word. It is a
+// race by the strict definition and cannot affect the result -- no reader and
+// no other writer can tell which store won, because the bytes are identical
+// either way.
+//
+// Reporting it would make the detector useless on the code it exists to check,
+// so by default it is silent. VGPU_RACE=2 still reports it, because the strict
+// definition has its uses.
+static const char* kSameValueRaceKernel = R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    .shared .align 4 .b8 tile[256];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r2, tile;
+    // Every thread in both warps stores 7 to word 0, with no bar.sync anywhere.
+    mov.u32 %r3, 7;
+    st.shared.u32 [%r2], %r3;
+    ld.shared.u32 %r4, [%r2];
+    st.global.u32 [%rd2], %r4;
+    ret;
+}
+)";
+
+VTEST(two_warps_writing_the_same_value_is_not_reported) {
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kSameValueRaceKernel);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};  // two warps
+  setenv("VGPU_RACE", "1", 1);
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  unsetenv("VGPU_RACE");
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{7});
+}
+
+VTEST(the_same_value_write_is_still_a_race_under_strict_mode) {
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kSameValueRaceKernel);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  setenv("VGPU_RACE", "2", 1);
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof));
+  unsetenv("VGPU_RACE");
+  VCHECK(err.code() == Err::DataRace);
+}
+
+// The converse, and the reason the value check is not simply "ignore the second
+// write": a store that leaves the bytes alone is still recorded as a write, so
+// a later store of a *different* value is caught against it.
+VTEST(a_differing_write_after_a_redundant_one_is_still_reported) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    .shared .align 4 .b8 tile[256];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, tile;
+    // Word 0 already holds 7 when warp 0 stores 7 into it -- a store that
+    // changes nothing. Warp 1 then stores 9, which does change it.
+    mov.u32 %r3, 7;
+    st.shared.u32 [%r2], %r3;
+    bar.sync 0;
+    setp.gt.u32 %p1, %r1, 31;
+    @%p1 bra SECOND;
+    st.shared.u32 [%r2], %r3;
+    bra DONE;
+SECOND:
+    mov.u32 %r5, 9;
+    st.shared.u32 [%r2], %r5;
+DONE:
+    st.global.u32 [%rd2], %r3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  setenv("VGPU_RACE", "1", 1);
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof));
+  unsetenv("VGPU_RACE");
+  VCHECK(err.code() == Err::DataRace);
+}
+
 VTEST(one_warp_reusing_its_own_shared_words_is_not_a_race) {
   // A warp racing with itself is impossible: its own accesses are ordered by
   // the program. A detector that keyed on the word alone would say otherwise.
