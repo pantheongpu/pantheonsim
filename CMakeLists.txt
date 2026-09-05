@@ -61,6 +61,7 @@ add_library(vgpu STATIC
   src/core/registry.cpp
   src/core/memory.cpp
   src/core/telemetry.cpp
+  src/core/profiling.cpp
   src/ptx/ast.cpp
   src/ptx/lexer.cpp
   src/ptx/parser.cpp
@@ -195,6 +196,34 @@ if(CUDA_ABI_INCLUDE)
     COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvidia-ml.so.1"
             "${CMAKE_BINARY_DIR}/shim/libnvidia-ml.so"
     COMMENT "Creating NVML shim symlinks (build/shim/libnvidia-ml.so.1)")
+
+  # ---------------------------------------------------------------------------
+  # libvgpucupti: CUPTI, which is how every profiler reads a CUDA program --
+  # Nsight, nvprof, PyTorch's profiler, DCGM. Without it the counters and the
+  # timeline this engine already has are reachable only through VGPU_COUNTERS,
+  # which no existing tool knows how to read. See docs/cupti.md for what the
+  # timestamps do and do not mean.
+  # ---------------------------------------------------------------------------
+  vgpu_toolkit_soversion(cupti 13 SO_CUPTI)
+  vgpu_version_script(cupti ${SO_CUPTI} _cupti_map)
+  add_library(vgpucupti SHARED src/cuda/cupti_api.cpp)
+  # Against the runtime shim rather than the static core, deliberately. The
+  # profiling switch and its event queue are process-global state: linking the
+  # static library here would give this library its own copy, so CUPTI would
+  # turn recording on in one and the runtime would keep reading the other, and
+  # a profiler would attach successfully and receive nothing.
+  target_link_libraries(vgpucupti PRIVATE vgpucudart)
+  target_include_directories(vgpucupti PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpucupti PROPERTIES
+    OUTPUT_NAME cupti SOVERSION ${SO_CUPTI} VERSION ${SO_CUPTI}.0)
+  target_link_options(vgpucupti PRIVATE "-Wl,--version-script=${_cupti_map}")
+  add_custom_command(TARGET vgpucupti POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcupti.so.${SO_CUPTI}.0"
+            "${CMAKE_BINARY_DIR}/shim/libcupti.so.${SO_CUPTI}"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcupti.so.${SO_CUPTI}.0"
+            "${CMAKE_BINARY_DIR}/shim/libcupti.so"
+    COMMENT "Creating CUPTI shim symlinks (build/shim/libcupti.so.${SO_CUPTI})")
 
   # ---------------------------------------------------------------------------
   # libvgpucublas: cuBLAS, presented as libcublas.so.13. cuBLAS is a library,
@@ -472,6 +501,17 @@ if(TARGET vgpucublas)
            COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_mma_layout.sh)
   set_tests_properties(e2e_mma_layout PROPERTIES
     DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+endif()
+
+# A program profiling itself through CUPTI, which is how every profiler reads a
+# CUDA program. Checks the records describe the work that was actually issued.
+if(TARGET vgpucupti)
+  add_test(NAME e2e_cupti_activity
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_cupti_activity.sh)
+  set_tests_properties(e2e_cupti_activity PROPERTIES
+    DEPENDS vgpucupti
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 endif()

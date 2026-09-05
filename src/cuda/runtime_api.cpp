@@ -58,6 +58,7 @@ static_assert(sizeof(cudaDeviceProp) == 1032,
 #warning "unrecognised CUDA runtime version: cudaDeviceProp layout is unchecked"
 #endif
 #include "vgpu/error.hpp"
+#include "vgpu/profiling.hpp"
 #include "vgpu/telemetry.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
@@ -352,6 +353,10 @@ VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 bl
       return cudaErrorInvalidDeviceFunction;
     }
     KernelInfo& ki = it->second;
+    // A profiler wants the launch even when nothing else does; recording is a
+    // relaxed load away when nobody is listening.
+    const bool profiling = vgpu::profiling::enabled();
+    const uint64_t t0 = profiling ? vgpu::profiling::now_ns() : 0;
     if (trace())
       std::fprintf(stderr, "[vgpu][trace] launch %s grid %ux%ux%u block %ux%ux%u shared %zu\n",
                    ki.entry_name.c_str(), gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y,
@@ -397,6 +402,20 @@ VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 bl
     cfg.block = {blockDim.x, blockDim.y, blockDim.z};
     cfg.shared_bytes = static_cast<uint32_t>(sharedMem);
     dev.launch(*fn, cfg, kargs, dev.symbols(mid));
+    if (profiling) {
+      vgpu::profiling::Event ev;
+      ev.kind = vgpu::profiling::EventKind::Kernel;
+      ev.start_ns = t0;
+      ev.end_ns = vgpu::profiling::now_ns();
+      ev.device = static_cast<uint32_t>(s.current_device);
+      ev.correlation = vgpu::profiling::next_correlation();
+      ev.stream = reinterpret_cast<uint64_t>(stream);
+      ev.name = ki.entry_name;
+      ev.grid[0] = gridDim.x; ev.grid[1] = gridDim.y; ev.grid[2] = gridDim.z;
+      ev.block[0] = blockDim.x; ev.block[1] = blockDim.y; ev.block[2] = blockDim.z;
+      ev.shared_bytes = static_cast<uint32_t>(sharedMem);
+      vgpu::profiling::record(std::move(ev));
+    }
     return cudaSuccess;
   });
 }
@@ -774,8 +793,23 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
       default:
         return cudaErrorInvalidValue;
     }
-    current(s).note_transfer(
-        count, std::chrono::duration<double>(std::chrono::steady_clock::now() - _t0).count());
+    const auto _t1 = std::chrono::steady_clock::now();
+    current(s).note_transfer(count, std::chrono::duration<double>(_t1 - _t0).count());
+    if (vgpu::profiling::enabled()) {
+      vgpu::profiling::Event ev;
+      ev.kind = vgpu::profiling::EventKind::Memcpy;
+      // The transfer's own clock, so a copy and the kernel beside it line up on
+      // one timeline rather than two.
+      ev.end_ns = vgpu::profiling::now_ns();
+      ev.start_ns = ev.end_ns - static_cast<uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        _t1 - _t0).count());
+      ev.device = static_cast<uint32_t>(s.current_device);
+      ev.correlation = vgpu::profiling::next_correlation();
+      ev.bytes = count;
+      ev.copy_kind = static_cast<uint32_t>(kind);
+      vgpu::profiling::record(std::move(ev));
+    }
     return cudaSuccess;
   });
 }
