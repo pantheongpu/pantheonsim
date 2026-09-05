@@ -401,7 +401,7 @@ else()
 endif()
 
 # CLI
-add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp)
+add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
 # Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /
@@ -522,6 +522,15 @@ if(TARGET vgpucupti)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
 endif()
+
+# The `vgpu run` wrapper, and the two pre-flight checks that are the reason it
+# exists: a CUDA soname the shim does not carry, and a DT_RPATH that outranks
+# LD_LIBRARY_PATH. Both are silent failures without it.
+add_test(NAME e2e_vgpu_run COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_vgpu_run.sh)
+set_tests_properties(e2e_vgpu_run PROPERTIES
+  DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
 
 # Numba and Triton compiling Python straight to kernels that run here. Neither
 # framework uses cudart, so neither is reached by any other test: Numba goes

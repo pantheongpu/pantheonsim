@@ -276,10 +276,10 @@ identical until someone checks.
   (cuMemAddressReserve…), host-pinned memory
 - Frontends: cubin/SASS loading, cuGetProcAddress dispatch, AMD everything
   (HIP, ROCm-SMI, CDNA ISA)
-- Tooling: `vgpu run` (LD_LIBRARY_PATH/LD_PRELOAD wrapper), `vgpu test
-  --matrix`, trace record/replay, schedulers random/adversarial, race
-  detection, OOM injection, characterization/differential-fuzz harness,
-  conformance DB + compat scores
+- Tooling: `vgpu test --matrix`, trace record/replay, schedulers
+  random/adversarial, OOM injection, characterization/differential-fuzz
+  harness, conformance DB + compat scores. (`vgpu run` and shared-memory race
+  detection are done.)
 
 ## Performance
 

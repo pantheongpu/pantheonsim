@@ -97,8 +97,18 @@ for, and CUDA programs run on the CPU engine. See
 # Build the app from unmodified source against shared cudart, then run it on a
 # virtual GPU — no physical GPU involved.
 nvcc -cudart shared my_app.cu -o my_app
-scripts/vgpu-run.sh --gpu nvidia/h200 ./my_app
+build/vgpu run --gpu nvidia/h200 ./my_app
 ```
+
+`vgpu run` puts the simulator's CUDA libraries in front of the real ones and
+execs the program in place, so its exit code and signals are its own. Before it
+does, it reads the binary's dynamic section and reports the two things that
+otherwise fail silently: a CUDA soname this build of the shim does not carry
+(a CUDA 12 program against a CUDA 13 shim), and a `DT_RPATH` naming a directory
+that holds the real libraries — the one search path the loader consults *before*
+`LD_LIBRARY_PATH`, which `--preload` gets past. `vgpu run --help` lists the
+device, execution and diagnostic options (`--race`, `--strict`, `--counters`,
+`--print-env`).
 
 All 44 CUDA workloads in the pantheon stress/diagnostics suite run this way
 unchanged:
@@ -207,7 +217,7 @@ which real GPUs cannot give you cheaply.
 
 1. Shared memory, warp shuffles, more PTX → broader kernel coverage
 2. Static-cudart hosting (driver export tables) → no `-cudart shared` rebuild
-3. `vgpu run` / `vgpu test --matrix` across profiles
+3. `vgpu test --matrix` across profiles (`vgpu run` is done)
 4. Hardware characterization + differential fuzzing against physical GPUs
    (oracle machines) → verified profiles, conformance database, compat scores
 5. Random/adversarial warp scheduling → race detection
