@@ -523,6 +523,17 @@ if(TARGET vgpucupti)
     TIMEOUT 600)
 endif()
 
+# Numba and Triton compiling Python straight to kernels that run here. Neither
+# framework uses cudart, so neither is reached by any other test: Numba goes
+# through the driver's JIT link API and Triton through PTX handed over before
+# ptxas sees it. Skips when the frameworks are not installed; set VGPU_PY to an
+# interpreter that has them.
+add_test(NAME e2e_jit_frameworks
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_jit_frameworks.sh)
+set_tests_properties(e2e_jit_frameworks PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 1800)
+
 # Real pantheon workloads, built by their own Makefile and run end to end. The
 # unit tests cover instructions one at a time; this covers an unmodified GPU
 # diagnostic actually working, which is where every serious bug here showed up

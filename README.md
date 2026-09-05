@@ -39,6 +39,7 @@ Working today, all CPU-only:
 | Fatbin | extracts embedded PTX from nvcc fatbins (uncompressed, zstd and LZ4 — so binaries from CUDA 12 and 13 both work) |
 | Multi-GPU | a virtual rack of N devices with disjoint address windows; peer copies and per-device isolation match a real two-GPU machine |
 | Vendor libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP and nvJPEG under their real sonames, each differential-tested against NVIDIA's own library on a physical GPU — see [docs/libraries.md](docs/libraries.md) |
+| Python JIT | Numba runs unmodified (its PTX is assembled through the driver's JIT link API); Triton runs with a one-line hook that stops its pipeline at PTX — see [docs/jit.md](docs/jit.md) |
 | Discovery | live telemetry + NVML; drop-in `nvidia-smi`, `rocm-smi`, `rocm_agent_enumerator`, and `lspci` output — see [docs/telemetry.md](docs/telemetry.md) |
 | NVENC | `libnvidia-encode.so.1` with a deterministic content-derived encoder, so video-encode SDC tests run |
 | Proof | an nvcc-compiled CUDA program **and** the unmodified pantheon stress kernels run on the CPU; `memory_read` differential-matches a physical RTX 3060 (incl. fault injection + device printf) |
@@ -50,10 +51,12 @@ Known limitations (deliberate, documented):
 - Unmodified apps must link **shared** cudart (`nvcc -cudart shared`) so the
   loader can substitute VirtualGPU's `libcudart.so.13`. The source is untouched;
   hosting a *statically* linked cudart needs NVIDIA's undocumented driver export
-  tables and is future work.
+  tables and is future work. This is what stops CuPy, which links cudart
+  statically — see [docs/jit.md](docs/jit.md).
 - `wmma` fragment layout is VirtualGPU's own (PTX leaves it unspecified) —
-  see ARCHITECTURE.md D8. bf16, `cp.async`, `mma.sync`, and textures are not
-  implemented. Every gap fails loudly (instruction, PTX line, kernel,
+  see ARCHITECTURE.md D8. bf16, `cp.async`, `mma.sync`, `ldmatrix` and the
+  extended-precision carry family are implemented; textures, surfaces, `wgmma`
+  and grid sync are not. Every gap fails loudly (instruction, PTX line, kernel,
   profile), never silently.
 - OptiX (ray tracing) and NVENC (video encode) are separate NVIDIA
   subsystems, not CUDA, and are out of scope.

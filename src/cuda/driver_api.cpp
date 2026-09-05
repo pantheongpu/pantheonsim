@@ -15,6 +15,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <fstream>
+#include <sstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -226,6 +228,11 @@ int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
     case 41: return 1;                               // UNIFIED_ADDRESSING (64-bit Linux is UVA)
     case 82: return static_cast<int>(p.limits.shared_mem_per_block_optin);
     case 90: return 1;                               // COMPUTE_PREEMPTION_SUPPORTED
+    // MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: the ceiling a kernel can raise its
+    // dynamic shared memory to, above the 48 KiB default. Triton reads it to
+    // decide how large a tile it may stage, so answering zero caps every kernel
+    // at the smallest tile it knows.
+    case 97: return static_cast<int>(p.limits.shared_mem_per_block_optin);
     // Capabilities this does not implement. Zero is the true answer for each,
     // and saying so explicitly keeps them out of the "unmodeled" report below.
     // A real quantity, and answering zero for it is the same mistake that had
@@ -663,12 +670,125 @@ VGPU_EXPORT CUresult cuModuleLoadFatBinary(CUmodule* module, const void* fatCubi
 // succeeds without tearing down the device.
 VGPU_EXPORT CUresult cuDevicePrimaryCtxReset(CUdevice) { return CUDA_SUCCESS; }
 
-// Runtime JIT linking: refuse rather than return an empty module a caller would
-// then launch kernels from and get nothing.
-VGPU_EXPORT CUresult cuLinkAddFile_v2(void*, int, const char*, unsigned int, void*, void*) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+/* ---- runtime JIT linking ----
+ *
+ * On hardware the link step turns PTX and relocatable cubins into a single
+ * cubin that cuModuleLoadData then loads. Here the module loader consumes PTX
+ * directly, so the "cubin" this produces is PTX text: inputs are collected,
+ * merged, and handed back as the completed image. That keeps the contract the
+ * caller depends on -- complete() yields something loadable -- without pretending
+ * to emit machine code.
+ *
+ * Numba is the reason this exists: it resolves and calls the link API for every
+ * kernel it compiles, so refusing here stopped it before it ever reached a
+ * launch.
+ */
+struct LinkState {
+  std::vector<std::string> inputs;  // PTX modules, in the order they were added
+  std::string image;                // merged result, kept alive until destroy
+};
+
+std::mutex& link_mutex() {
+  static std::mutex m;
+  return m;
 }
-VGPU_EXPORT CUresult cuLinkDestroy(void*) { return CUDA_ERROR_NOT_SUPPORTED; }
+std::unordered_map<void*, std::unique_ptr<LinkState>>& link_states() {
+  static std::unordered_map<void*, std::unique_ptr<LinkState>> m;
+  return m;
+}
+
+// Looks a link handle up, throwing rather than dereferencing something that was
+// never handed out (or was already destroyed).
+LinkState& link_state(void* h) {
+  std::lock_guard<std::mutex> g(link_mutex());
+  auto it = link_states().find(h);
+  if (it == link_states().end())
+    throw vgpu::Error::make(vgpu::Err::InvalidValue,
+                            "cuLink call on a handle that is not an open link state");
+  return *it->second;
+}
+
+// Merges PTX modules textually. Only the first module keeps its .version /
+// .target / .address_size directives; repeating them is a parse error, and the
+// module-level directives of a second input carry no information the first
+// does not already have.
+std::string merge_ptx(const std::vector<std::string>& inputs) {
+  std::string out;
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    if (i == 0) {
+      out = inputs[0];
+      if (!out.empty() && out.back() != '\n') out.push_back('\n');
+      continue;
+    }
+    std::istringstream in(inputs[i]);
+    std::string line;
+    while (std::getline(in, line)) {
+      std::string trimmed = line;
+      size_t b = trimmed.find_first_not_of(" \t");
+      if (b != std::string::npos) trimmed = trimmed.substr(b);
+      if (trimmed.rfind(".version", 0) == 0 || trimmed.rfind(".target", 0) == 0 ||
+          trimmed.rfind(".address_size", 0) == 0)
+        continue;
+      out += line;
+      out.push_back('\n');
+    }
+  }
+  return out;
+}
+
+// Accepts one input into a link state. PTX is taken as-is, a fatbin has its PTX
+// pulled out, and a bare cubin is refused with the same message the module
+// loader gives -- there is no SASS decoder behind this.
+void link_add(LinkState& st, int type, const void* data, size_t size, const char* name) {
+  const char* what = name && *name ? name : "<anonymous>";
+  if (!data || size == 0)
+    throw vgpu::Error::make(vgpu::Err::InvalidValue, "cuLinkAddData: empty input '", what, "'");
+  uint32_t magic = 0;
+  if (size >= 4) std::memcpy(&magic, data, 4);
+  if (magic == 0x466243B1u || magic == 0xBA55ED50u) {
+    st.inputs.push_back(best_ptx(data));
+    return;
+  }
+  const char* text = static_cast<const char*>(data);
+  if (text[0] == 0x7f)
+    throw vgpu::Error::make(vgpu::Err::Unsupported, "cuLinkAddData: input '", what,
+                            "' is a cubin/ELF image; VirtualGPU links PTX (CU_JIT_INPUT_PTX or a "
+                            "fatbin containing PTX)");
+  if (type != 1 /* CU_JIT_INPUT_PTX */ && type != 0 && type != 2)
+    throw vgpu::Error::make(vgpu::Err::Unsupported, "cuLinkAddData: input type ", type,
+                            " is not supported; VirtualGPU links PTX");
+  // PTX may or may not carry a terminating NUL inside the reported size.
+  size_t len = size;
+  while (len > 0 && text[len - 1] == '\0') --len;
+  st.inputs.emplace_back(text, len);
+}
+
+VGPU_EXPORT CUresult cuLinkAddFile_v2(void* state, int type, const char* path, unsigned int,
+                                      void*, void*) {
+  return api("cuLinkAddFile_v2", true, false, [&](ShimState&) {
+    if (!state || !path) return CUDA_ERROR_INVALID_VALUE;
+    LinkState& st = link_state(state);
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+      throw vgpu::Error::make(vgpu::Err::InvalidValue, "cuLinkAddFile: cannot open '", path, "'");
+    std::string blob((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    link_add(st, type, blob.data(), blob.size(), path);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuLinkAddFile(void* state, int type, const char* path, unsigned int n,
+                                   void* keys, void* vals) {
+  return cuLinkAddFile_v2(state, type, path, n, keys, vals);
+}
+
+VGPU_EXPORT CUresult cuLinkDestroy(void* state) {
+  return api("cuLinkDestroy", true, false, [&](ShimState&) {
+    if (!state) return CUDA_ERROR_INVALID_VALUE;
+    std::lock_guard<std::mutex> g(link_mutex());
+    if (link_states().erase(state) == 0) return CUDA_ERROR_INVALID_VALUE;
+    return CUDA_SUCCESS;
+  });
+}
 
 /* ---- virtual memory management ----
  * The VMM API reserves address space and maps physical handles into it, which
@@ -1032,14 +1152,54 @@ VGPU_EXPORT CUresult cuLaunchCooperativeKernel(CUfunction, unsigned int, unsigne
 }
 // The JIT-link types are not in the header subset this file compiles against;
 // these take opaque parameters because they only need to exist and refuse.
-VGPU_EXPORT CUresult cuLinkCreate_v2(unsigned int, void*, void*, void*) {
-  return CUDA_ERROR_NOT_SUPPORTED;  // runtime JIT linking of cubins
+VGPU_EXPORT CUresult cuLinkCreate_v2(unsigned int, void*, void*, void** stateOut) {
+  return api("cuLinkCreate_v2", true, false, [&](ShimState&) {
+    if (!stateOut) return CUDA_ERROR_INVALID_VALUE;
+    // JIT options (register caps, optimisation level, log buffers) describe a
+    // code generator this has no equivalent of, so they are accepted and left
+    // unused rather than refused.
+    auto st = std::make_unique<LinkState>();
+    void* h = st.get();
+    {
+      std::lock_guard<std::mutex> g(link_mutex());
+      link_states()[h] = std::move(st);
+    }
+    *stateOut = h;
+    return CUDA_SUCCESS;
+  });
 }
-VGPU_EXPORT CUresult cuLinkAddData_v2(void*, int, void*, size_t, const char*, unsigned int, void*,
-                                      void*) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+VGPU_EXPORT CUresult cuLinkCreate(unsigned int n, void* keys, void* vals, void** stateOut) {
+  return cuLinkCreate_v2(n, keys, vals, stateOut);
 }
-VGPU_EXPORT CUresult cuLinkComplete(void*, void**, size_t*) { return CUDA_ERROR_NOT_SUPPORTED; }
+
+VGPU_EXPORT CUresult cuLinkAddData_v2(void* state, int type, void* data, size_t size,
+                                      const char* name, unsigned int, void*, void*) {
+  return api("cuLinkAddData_v2", true, false, [&](ShimState&) {
+    if (!state) return CUDA_ERROR_INVALID_VALUE;
+    link_add(link_state(state), type, data, size, name);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuLinkAddData(void* state, int type, void* data, size_t size, const char* name,
+                                   unsigned int n, void* keys, void* vals) {
+  return cuLinkAddData_v2(state, type, data, size, name, n, keys, vals);
+}
+
+VGPU_EXPORT CUresult cuLinkComplete(void* state, void** imageOut, size_t* sizeOut) {
+  return api("cuLinkComplete", true, false, [&](ShimState&) {
+    if (!state || !imageOut) return CUDA_ERROR_INVALID_VALUE;
+    LinkState& st = link_state(state);
+    if (st.inputs.empty())
+      throw vgpu::Error::make(vgpu::Err::InvalidValue, "cuLinkComplete: no inputs were added");
+    st.image = merge_ptx(st.inputs);
+    st.image.push_back('\0');  // the loader reads the image as a C string
+    *imageOut = st.image.data();
+    // The reported size excludes the terminator, matching how a cubin size is
+    // reported: the caller only ever passes it back to cuModuleLoadDataEx.
+    if (sizeOut) *sizeOut = st.image.size() - 1;
+    return CUDA_SUCCESS;
+  });
+}
 VGPU_EXPORT CUresult cuTensorMapEncodeTiled(void*, unsigned int, unsigned int, void*,
                                             const unsigned long long*, const unsigned long long*,
                                             const unsigned int*, const unsigned int*, unsigned int,
@@ -1464,6 +1624,33 @@ const void* dark_table_for(const unsigned char* uuid) {
 }
 
 }  // namespace
+
+/* ---- interprocess memory ----
+   Device memory here is a per-process virtual address space with per-process
+   backing, so a handle from one process names nothing in another. Saying so is
+   the honest answer, and the runtime API's cudaIpc* family says the same.
+
+   They have to exist even so: a caller that looks the symbols up at startup --
+   Numba resolves cuIpcOpenMemHandle before it will report a device at all --
+   fails on the lookup rather than on the call, which reads as "no CUDA here"
+   instead of "no interprocess sharing here". */
+
+VGPU_EXPORT CUresult cuIpcGetMemHandle(CUipcMemHandle*, CUdeviceptr) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuIpcOpenMemHandle(CUdeviceptr*, CUipcMemHandle, unsigned int) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuIpcOpenMemHandle_v2(CUdeviceptr*, CUipcMemHandle, unsigned int) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuIpcCloseMemHandle(CUdeviceptr) { return CUDA_ERROR_NOT_SUPPORTED; }
+VGPU_EXPORT CUresult cuIpcGetEventHandle(CUipcEventHandle*, CUevent) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuIpcOpenEventHandle(CUevent*, CUipcEventHandle) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
 
 VGPU_EXPORT CUresult cuGetExportTable(const void** table, const void* uuid) {
   if (!table || !uuid) return CUDA_ERROR_INVALID_VALUE;

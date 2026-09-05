@@ -173,6 +173,9 @@ struct Warp {
   std::unordered_map<std::string, Lanes> slots;  // call-argument slots
   std::vector<std::vector<uint8_t>> local;       // per-lane .local frames (lazy)
   std::array<uint32_t, kWarpSize> tid_x{}, tid_y{}, tid_z{};
+  // PTX's condition-code carry bit, one per lane. Written by ".cc" arithmetic
+  // and read by addc/subc/madc; nothing else in the ISA touches it.
+  Mask carry = 0;
   std::unique_ptr<AsyncCopies> cp;  // created on the first cp.async
 };
 
@@ -1072,8 +1075,12 @@ class Interpreter {
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = int_bin(op->op, op->ty, a[lane], b[lane], ins);
+      if (op->carry_in || op->carry_out) {
+        exec_carry_add_sub(w, *op, a, b, m, r);
+      } else {
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+          if (m & (1u << lane)) r[lane] = int_bin(op->op, op->ty, a[lane], b[lane], ins);
+      }
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1148,8 +1155,15 @@ class Interpreter {
       Lanes _s_c;
       const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = a[lane] * b[lane] + c[lane];
+      if (op->carry_in || op->carry_out) {
+        Lanes prod;
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+          if (m & (1u << lane)) prod[lane] = a[lane] * b[lane];
+        exec_carry_mad(w, op->ty.bits, op->carry_in, op->carry_out, prod, c, m, r);
+      } else {
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+          if (m & (1u << lane)) r[lane] = a[lane] * b[lane] + c[lane];
+      }
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1633,8 +1647,15 @@ class Interpreter {
       Lanes _s_b; const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes _s_c; const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = mul_hi(op->ty, a[lane], b[lane]) + c[lane];
+      if (op->carry_in || op->carry_out) {
+        Lanes prod;
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+          if (m & (1u << lane)) prod[lane] = mul_hi(op->ty, a[lane], b[lane]);
+        exec_carry_mad(w, op->ty.bits, op->carry_in, op->carry_out, prod, c, m, r);
+      } else {
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+          if (m & (1u << lane)) r[lane] = mul_hi(op->ty, a[lane], b[lane]) + c[lane];
+      }
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1887,9 +1908,12 @@ class Interpreter {
   void exec_ldmatrix(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLdMatrix& op, Mask m) {
     Lanes _s_base;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
-    // The register already holds an address in the shared window -- it comes
-    // from cvta, which has done the space conversion. Adding the window base
-    // again lands at twice it, which is what the bounds check reported.
+    // Without ".shared" the register already holds an address in the shared
+    // window -- it comes from cvta, which has done the space conversion, and
+    // adding the window base again lands at twice it. With ".shared" the
+    // instruction names the space itself and the register is a bare offset, so
+    // the base has to be applied here instead.
+    const uint64_t window = op.shared_space ? space_base(Space::Shared) : 0;
     for (uint32_t mat = 0; mat < op.count; ++mat) {
       // Pull the 8x8 matrix in, a row at a time.
       uint16_t tile[8][8] = {};
@@ -1898,7 +1922,7 @@ class Interpreter {
         if (!(m & (1u << src_lane)))
           ctx_fail(ins, static_cast<int>(src_lane), Err::UnsupportedPtx,
                    "ldmatrix needs every lane that supplies a row address to be active");
-        const uint64_t addr = base[src_lane] + static_cast<uint64_t>(op.addr.offset);
+        const uint64_t addr = window + base[src_lane] + static_cast<uint64_t>(op.addr.offset);
         for (uint32_t c = 0; c < 8; ++c)
           tile[r][c] = static_cast<uint16_t>(
               load_routed(w, ctx, ins, src_lane, addr + c * 2, 2));
@@ -1925,6 +1949,57 @@ class Interpreter {
   // produces: lane L holds row L/4, columns 2*(L%4) and 2*(L%4)+1, packed into
   // one 32-bit register. Transposing it is a matter of re-gathering, since
   // every element already lives somewhere in the warp.
+  // The addend half of mad.{lo,hi}.cc / madc: the multiply has already been
+  // reduced to one value per lane, and only its addition with c touches the
+  // carry bit. The product's own overflow is discarded -- ".lo" and ".hi" have
+  // each already chosen which half of it survives.
+  void exec_carry_mad(Warp& w, uint32_t bits, bool carry_in, bool carry_out, const Lanes& prod,
+                      const Lanes& c, Mask m, Lanes& r) {
+    Mask out = w.carry;
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      if (!(m & (1u << lane))) continue;
+      const uint64_t p = mask_to_bits(prod[lane], bits);
+      const uint64_t addend = mask_to_bits(c[lane], bits);
+      const uint64_t cin = carry_in ? ((w.carry >> lane) & 1u) : 0u;
+      const uint64_t sum = mask_to_bits(p + addend + cin, bits);
+      r[lane] = sum;
+      if (carry_out) {
+        const bool cout = (sum < p) || (cin && sum == p);
+        out = (out & ~(Mask{1} << lane)) | (Mask{cout} << lane);
+      }
+    }
+    if (carry_out) w.carry = out;
+  }
+
+  // add/sub with the condition-code carry bit. PTX defines subtraction's carry
+  // as the carry-out of (a + ~b + 1), so a borrow clears the bit rather than
+  // setting it -- which is what makes "sub.cc" then "subc" chain correctly into
+  // a wider subtract.
+  void exec_carry_add_sub(Warp& w, const OpIntBin& op, const Lanes& a, const Lanes& b, Mask m,
+                          Lanes& r) {
+    const uint32_t bits = op.ty.bits;
+    const bool sub = (op.op == IntBinOp::Sub);
+    Mask out = w.carry;
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      if (!(m & (1u << lane))) continue;
+      const uint64_t x = mask_to_bits(a[lane], bits);
+      // For a subtract the carry-in defaults to 1 (the +1 of two's complement);
+      // subc supplies the previous carry-out in its place.
+      const uint64_t cin =
+          op.carry_in ? ((w.carry >> lane) & 1u) : (sub ? 1u : 0u);
+      const uint64_t y = sub ? mask_to_bits(~b[lane], bits) : mask_to_bits(b[lane], bits);
+      const uint64_t sum = mask_to_bits(x + y + cin, bits);
+      r[lane] = sum;
+      if (op.carry_out) {
+        // Unsigned overflow: the sum wrapped below either addend, or landed
+        // exactly on one because the carry-in pushed it around.
+        const bool cout = (sum < x) || (cin && sum == x);
+        out = (out & ~(Mask{1} << lane)) | (Mask{cout} << lane);
+      }
+    }
+    if (op.carry_out) w.carry = out;
+  }
+
   void exec_movmatrix(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMovMatrix& op,
                       Mask m) {
     Lanes _s_a;

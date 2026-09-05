@@ -1726,4 +1726,186 @@ VTEST(one_warp_reusing_its_own_shared_words_is_not_a_race) {
   VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{12});
 }
 
+// ---- extended-precision arithmetic (the condition-code carry bit) ----
+//
+// These are what a compiler emits when it synthesises arithmetic wider than the
+// native register: Numba builds every 64-bit array index this way, so a wrong
+// carry shows up as a wrong address rather than a wrong number.
+
+VTEST(add_cc_then_addc_carries_between_halves) {
+  // 0xFFFFFFFF + 1 overflows the low half and must set the carry, which addc
+  // then folds into the high half: {lo=0xFFFFFFFF, hi=0} + 1 == {0, 1}.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 4294967295;
+    mov.u32 %r2, 0;
+    add.cc.u32 %r3, %r1, 1;
+    addc.u32 %r4, %r2, 0;
+    st.global.u32 [%rd2], %r3;
+    st.global.u32 [%rd2+4], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{1});
+}
+
+VTEST(add_cc_leaves_the_carry_clear_when_nothing_overflows) {
+  // The complement of the test above: addc must not invent a carry. Getting
+  // this backwards is invisible in the overflow case and wrong everywhere else.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 5;
+    add.cc.u32 %r3, %r1, 6;
+    addc.u32 %r4, 100, 0;
+    st.global.u32 [%rd2], %r3;
+    st.global.u32 [%rd2+4], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{11});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{100});
+}
+
+VTEST(sub_cc_then_subc_borrows_between_halves) {
+  // {lo=0, hi=1} - 1 == {0xFFFFFFFF, 0}. PTX defines the subtract's carry as
+  // the carry-out of (a + ~b + 1), so a borrow *clears* the bit and subc
+  // subtracts the extra one. Treating a borrow as a set bit gives hi=1 here.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 0;
+    mov.u32 %r2, 1;
+    sub.cc.u32 %r3, %r1, 1;
+    subc.u32 %r4, %r2, 0;
+    st.global.u32 [%rd2], %r3;
+    st.global.u32 [%rd2+4], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0xFFFFFFFFull});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0});
+}
+
+VTEST(mad_lo_cc_and_madc_hi_build_a_64_bit_product) {
+  // The full 64x64 pattern ptxas emits: 0xFFFFFFFF * 3 == 0x2FFFFFFFD, so the
+  // low half wraps and the high half must receive the carry on top of the
+  // product's own high half.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 4294967295;
+    mov.u32 %r2, 3;
+    mad.lo.cc.u32 %r3, %r1, %r2, 0;
+    madc.hi.u32 %r4, %r1, %r2, 0;
+    st.global.u32 [%rd2], %r3;
+    st.global.u32 [%rd2+4], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  // 0xFFFFFFFF * 3 = 0x2_FFFFFFFD
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0xFFFFFFFDull});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{2});
+}
+
+VTEST(the_carry_bit_is_per_lane_not_per_warp) {
+  // Lane 0 overflows and lane 1 does not. A carry bit shared across the warp
+  // would give both lanes the same high half; each lane owns its own.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    // lane 0 adds 0xFFFFFFFF + 1 (overflows), lane 1 adds 1 + 1 (does not)
+    setp.eq.u32 %p1, %r1, 0;
+    selp.b32 %r2, 4294967295, 1, %p1;
+    add.cc.u32 %r3, %r2, 1;
+    addc.u32 %r4, 0, 0;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {2, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{1});      // lane 0 carried
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0});  // lane 1 did not
+}
+
+VTEST(decimal_literals_above_int64_max_keep_their_bit_pattern) {
+  // ptxas prints the float sign-bit mask as decimal 9223372036854775808, which
+  // overflows a signed parse. Rejecting it made every kernel that negates a
+  // double unloadable.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u64 %rd3, 9223372036854775808;
+    st.global.u64 [%rd2], %rd3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 8), uint64_t{0x8000000000000000ull});
+}
+
 VTEST_MAIN

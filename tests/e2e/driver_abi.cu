@@ -41,6 +41,25 @@ DONE:
 }
 )";
 
+static const char* kPtxSecond = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry set_seven(.param .u64 p)
+{
+  .reg .b32 %r<4>;
+  .reg .b64 %rd<5>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  mul.wide.s32 %rd3, %r1, 4;
+  add.s64 %rd4, %rd2, %rd3;
+  mov.u32 %r2, 7;
+  st.global.u32 [%rd4], %r2;
+  ret;
+}
+)";
+
 int main() {
   CK(cuInit(0));
   int count = 0;
@@ -88,6 +107,41 @@ int main() {
   int wrong = 0;
   for (int i = 0; i < n; ++i) if (host[i] != 42) ++wrong;
   printf("kernel result wrong: %d\n", wrong);
+
+  // Runtime JIT linking. Numba resolves and calls this family for every kernel
+  // it compiles, so a missing or mis-typed entry point stops it before its
+  // first launch. Two inputs, so the merge is exercised rather than a
+  // single-module pass-through.
+  CUlinkState link;
+  CK(cuLinkCreate(0, nullptr, nullptr, &link));
+  CK(cuLinkAddData(link, CU_JIT_INPUT_PTX, (void*)kPtx, strlen(kPtx) + 1, "add_one", 0, nullptr,
+                   nullptr));
+  CK(cuLinkAddData(link, CU_JIT_INPUT_PTX, (void*)kPtxSecond, strlen(kPtxSecond) + 1, "set_seven",
+                   0, nullptr, nullptr));
+  void* image = nullptr;
+  size_t image_size = 0;
+  CK(cuLinkComplete(link, &image, &image_size));
+  printf("link produced an image: %s\n", (image && image_size > 0) ? "yes" : "no");
+
+  CUmodule linked;
+  CK(cuModuleLoadDataEx(&linked, image, 0, nullptr, nullptr));
+  CUfunction seven, plus;
+  CK(cuModuleGetFunction(&seven, linked, "set_seven"));
+  CK(cuModuleGetFunction(&plus, linked, "add_one"));
+  printf("both linked kernels resolve: yes\n");
+
+  // Run one from each input, in order, so the result proves both bodies
+  // survived the merge rather than only their names.
+  void* seven_args[] = {&buf};
+  CK(cuLaunchKernel(seven, 1, 1, 1, n, 1, 1, 0, nullptr, seven_args, nullptr));
+  CK(cuLaunchKernel(plus, 1, 1, 1, n, 1, 1, 0, nullptr, args, nullptr));
+  CK(cuCtxSynchronize());
+  CK(cuMemcpyDtoH(host.data(), buf, n * sizeof(int)));
+  int linked_wrong = 0;
+  for (int i = 0; i < n; ++i) if (host[i] != 8) ++linked_wrong;
+  printf("linked kernel result wrong: %d\n", linked_wrong);
+  CK(cuModuleUnload(linked));
+  CK(cuLinkDestroy(link));
 
   // Events, including the elapsed-time call CUDA 13 renames.
   CUevent a, b;

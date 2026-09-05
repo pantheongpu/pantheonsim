@@ -158,8 +158,29 @@ interpreter, because a vendor library is not user code — see docs/libraries.md
 for the boundary, the per-library scope, and what each one deliberately refuses.
 
 NVRTC works by invoking the toolkit's own nvcc, which runs on the host and
-needs no GPU -- so runtime-compiled kernels (CuPy, Numba, Triton, inductor)
-reach the interpreter through the driver API like any other PTX.
+needs no GPU, so kernels compiled through NVRTC reach the interpreter through
+the driver API like any other PTX. The JIT frameworks are a separate question,
+because none of them uses NVRTC:
+
+- **Numba works.** It talks to `libcuda` directly and never loads a cudart. It
+  compiles Python to PTX itself and assembles it through `cuLinkCreate` /
+  `cuLinkAddData` / `cuLinkComplete`, which VirtualGPU implements by merging
+  the PTX inputs and returning the merged text as the completed image -- the
+  module loader consumes PTX, so there is no cubin to emit. Verified on shared
+  memory with block reductions, atomics, 2D grids, math intrinsics, a tiled
+  matmul, `shfl_up_sync` scans and streams.
+- **Triton works, with a one-line hook.** It compiles all the way to PTX and
+  then shells out to `ptxas` for a cubin, which is the one artifact in its
+  pipeline VirtualGPU cannot load. `tools/vgpu_triton.py` ends the pipeline at
+  PTX using `knobs.runtime.add_stages_inspection_hook`, Triton's own extension
+  point. Verified on a fused softmax, a `tl.dot` matmul (real `mma.sync` and
+  `ldmatrix`) and an atomic reduction.
+- **CuPy does not work.** It statically links the CUDA runtime rather than
+  loading `libcudart.so`, so `LD_LIBRARY_PATH` never reaches it; its embedded
+  runtime asks the driver for an export table and fails at
+  `getDeviceCount()` with `cudaErrorSoftwareValidityNotEstablished` long
+  before any kernel is compiled. Unblocking it needs the `cuGetExportTable`
+  work below, not anything in the interpreter.
 
 Multi-GPU is verified against real hardware in four places: the local two-GPU
 box, and rented 2x H100 SXM5, 4x H100 SXM5 and 8x A100 80GB instances. All
@@ -342,12 +363,16 @@ scripts/run-pantheon-workloads.sh.
    tables (cuGetExportTable dark API) so binaries built with the *default*
    (static) cudart also run without a `-cudart shared` rebuild. Partial
    groundwork exists in the driver shim; deferred as brittle/version-specific.
-   Now has a second consumer: Nsight Systems collects through its own bundled
+   Now has two more consumers. Nsight Systems collects through its own bundled
    CUPTI, loaded by absolute path from its install directory, and that copy
    reaches the driver the same way -- so `nsys` produces a report with OS
    runtime traces and no CUDA data. nvprof works, because its path goes through
-   the public CUPTI this does implement. See docs/cupti.md.
-5. **More PTX as workloads demand it**: bf16, cp.async, mma.sync and the
-   lane-mask family are done -- driven by llama.cpp's flash attention and by
-   CUB's radix sort, which is the way to pick the next one too. Textures,
-   wgmma and grid sync are what is left of the list.
+   the public CUPTI this does implement. See docs/cupti.md. CuPy is the other:
+   it links the runtime statically and dies in the same place, at
+   `getDeviceCount()`, before it compiles anything.
+5. **More PTX as workloads demand it**: bf16, cp.async, mma.sync, the
+   lane-mask family and the extended-precision carry family (`add.cc`/`addc`,
+   `sub.cc`/`subc`, `mad.lo.cc`/`madc.hi`) are done -- driven by llama.cpp's
+   flash attention, CUB's radix sort and Numba's 64-bit index arithmetic, which
+   is the way to pick the next one too. Textures, wgmma and grid sync are what
+   is left of the list.

@@ -202,6 +202,84 @@ VTEST(global_scalar_initialiser_is_not_a_symbol) {
   VCHECK_EQ(m.globals[1].init.size(), size_t{4});
 }
 
+// ".common" is a tentative definition: zero-initialised, and merged with any
+// other definition of the same symbol at link time. Once a module is loaded
+// there is nothing left to merge with, so it declares exactly what ".global"
+// does -- but refusing the directive stopped every Numba module at load, since
+// Numba emits one per kernel.
+VTEST(common_linkage_declares_an_ordinary_global) {
+  Module m = parse(
+      ".version 8.3\n.target sm_90\n.address_size 64\n"
+      ".common .global .align 8 .u64 numba_env;\n"
+      ".visible .entry k()\n{\nret;\n}\n");
+  VCHECK_EQ(m.globals.size(), size_t{1});
+  VCHECK_EQ(m.globals[0].name, std::string("numba_env"));
+  VCHECK_EQ(m.globals[0].size, uint64_t{8});
+  VCHECK(m.globals[0].init.empty());  // tentative: zero, with no explicit bytes
+}
+
+// Debug line tables. Anything compiled with source locations carries ".file"
+// at module scope and a ".loc" per statement; Triton emits both. They describe
+// where the code came from, not what it does.
+VTEST(debug_line_directives_are_skipped) {
+  Module m = parse(
+      ".version 8.3\n.target sm_86\n.address_size 64\n"
+      ".file 1 \"/tmp/kernel.py\"\n"
+      ".visible .entry k(.param .u64 out)\n{\n"
+      ".reg .b64 %rd<4>;\n"
+      ".loc 1 23 17\n"
+      "ld.param.u64 %rd1, [out];\n"
+      ".loc 1 24 5\n"
+      "ret;\n}\n");
+  VCHECK_EQ(m.entries.size(), size_t{1});
+  // Two real instructions survive; the markers between them do not.
+  VCHECK_EQ(m.entries[0].body.size(), size_t{2});
+}
+
+// A one-element braced list is legal PTX for a scalar load or store, and it is
+// the form Triton's inline-asm memory ops take. The braces say nothing the
+// vector count does not already say.
+VTEST(braced_single_element_ld_and_st_parse_as_scalars) {
+  Module m = parse(
+      ".version 8.3\n.target sm_86\n.address_size 64\n"
+      ".visible .entry k(.param .u64 out)\n{\n"
+      ".reg .b32 %r<4>;\n.reg .b64 %rd<4>;\n"
+      "ld.param.u64 %rd1, [out];\n"
+      "ld.global.b32 { %r1 }, [ %rd1 + 0 ];\n"
+      "st.global.b32 [ %rd1 + 4 ], { %r1 };\n"
+      "ret;\n}\n");
+  const auto& body = m.entries[0].body;
+  const OpLd* ld = nullptr;
+  const OpSt* st = nullptr;
+  for (const auto& ins : body) {
+    if (const auto* l = std::get_if<OpLd>(&ins.op); l && l->space == Space::Global) ld = l;
+    if (const auto* t = std::get_if<OpSt>(&ins.op)) st = t;
+  }
+  VCHECK(ld != nullptr);
+  VCHECK_EQ(ld->dsts.size(), size_t{1});
+  VCHECK(st != nullptr);
+  VCHECK_EQ(st->srcs.size(), size_t{1});
+}
+
+// ldmatrix comes in two forms that differ in what the address register holds.
+// Reading a bare shared offset as a generic address lands at 0.
+VTEST(ldmatrix_records_whether_the_shared_space_was_named) {
+  Module m = parse(
+      ".version 8.3\n.target sm_86\n.address_size 64\n"
+      ".visible .entry k()\n{\n"
+      ".reg .b32 %r<8>;\n"
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r1, %r2, %r3, %r4}, [%r5];\n"
+      "ldmatrix.sync.aligned.m8n8.x4.b16 {%r1, %r2, %r3, %r4}, [%r5];\n"
+      "ret;\n}\n");
+  const auto& body = m.entries[0].body;
+  std::vector<const OpLdMatrix*> lms;
+  for (const auto& ins : body)
+    if (const auto* l = std::get_if<OpLdMatrix>(&ins.op)) lms.push_back(l);
+  VCHECK_EQ(lms.size(), size_t{2});
+  VCHECK(lms[0]->shared_space);
+  VCHECK(!lms[1]->shared_space);
+}
+
 VTEST(global_initialised_with_a_symbol) {
   Module m = parse(
       ".version 8.3\n.target sm_90\n.address_size 64\n"

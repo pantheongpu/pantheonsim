@@ -126,14 +126,42 @@ class Parser {
           fail_unsupported(t.line, ".address_size " + sz, "", "only 64-bit PTX is supported");
         continue;
       }
-      if (t.text == ".visible" || t.text == ".weak") {
+      // Linkage qualifiers. ".common" is a tentative definition -- zero
+      // initialized, and merged with any other definition of the same symbol at
+      // link time. Once a module is loaded there is nothing left to merge with,
+      // so it declares exactly what ".global" does. Numba emits one per kernel.
+      if (t.text == ".visible" || t.text == ".weak" || t.text == ".common") {
         next();
-        continue;  // linkage qualifier
+        continue;
       }
       if (t.text == ".pragma") {
         next();
         while (!at_end() && !peek_punct(";")) next();
         if (!at_end()) next();
+        continue;
+      }
+      // ".file" names a source file for the ".loc" markers inside kernels. It
+      // runs to the end of its line rather than to a semicolon.
+      if (t.text == ".file" || t.text == ".loc") {
+        size_t line = t.line;
+        next();
+        while (!at_end() && peek().line == line) next();
+        continue;
+      }
+      // DWARF sections: a nested brace block of raw bytes. Skipped wholesale --
+      // nothing here consumes debug info, and the contents are not PTX.
+      if (t.text == ".section") {
+        next();
+        while (!at_end() && !peek_punct("{")) next();
+        if (peek_punct("{")) {
+          next();
+          int depth = 1;
+          while (!at_end() && depth > 0) {
+            if (peek_punct("{")) ++depth;
+            else if (peek_punct("}")) --depth;
+            next();
+          }
+        }
         continue;
       }
       if (t.text == ".extern") {
@@ -173,7 +201,8 @@ class Parser {
         fail_unsupported(t.line, ".func", "", "device functions are not supported (only .entry kernels)");
       fail_unsupported(t.line, t.text, "",
                        "directive not in the implemented PTX subset (supported: .version .target "
-                       ".address_size .visible .extern .global .const .entry)");
+                       ".address_size .visible .weak .common .extern .global .const .entry .file .loc "
+                       ".section)");
     }
     return m;
   }
@@ -222,7 +251,15 @@ class Parser {
     try {
       if (w.size() > 2 && w[0] == '0' && (w[1] == 'x' || w[1] == 'X'))
         return static_cast<int64_t>(std::stoull(w.substr(2), nullptr, 16));
-      return std::stoll(w);
+      // Decimal immediates above INT64_MAX are legal PTX for .u64/.b64 operands
+      // -- 9223372036854775808 is the sign-bit mask a float negation uses, and
+      // ptxas prints it in decimal. Fall back to an unsigned parse and keep the
+      // bit pattern; the instruction's type decides how it is read.
+      try {
+        return std::stoll(w);
+      } catch (const std::out_of_range&) {
+        return static_cast<int64_t>(std::stoull(w));
+      }
     } catch (const std::exception&) {
       fail(line, "bad integer literal '" + w + "'");
     }
@@ -446,6 +483,16 @@ class Parser {
         next();
         SharedDecl d = parse_shared_decl(t.line, /*allow_unsized=*/true);
         place_shared(fn, std::move(d), t.line);
+        continue;
+      }
+      // Debug information. ".loc" marks a source line and ".pragma" carries
+      // hints for the code generator; neither changes what the kernel computes,
+      // and both appear in anything compiled with line tables -- Triton emits a
+      // ".loc" per statement.
+      if (t.kind == Token::Kind::Word && (t.text == ".loc" || t.text == ".pragma")) {
+        next();
+        while (!at_end() && !peek_punct(";") && peek().line == t.line) next();
+        if (peek_punct(";")) next();
         continue;
       }
       if (t.kind == Token::Kind::Word && t.text[0] == '.') {
@@ -763,7 +810,10 @@ class Parser {
       if (op0 == "ld") {
         Addr addr;
         std::vector<Reg> dsts;
-        if (vec == 1) {
+        // A one-element braced list is legal PTX for a scalar load, and it is
+        // what Triton's inline-asm loads look like: "ld.global.b32 { %r1 },
+        // [ %rd1 ];". The braces carry no meaning the vector count does not.
+        if (vec == 1 && !peek_punct("{")) {
           dsts.push_back(expect_reg_operand("ld destination"));
         } else {
           dsts = parse_reg_vector(vec);
@@ -792,7 +842,7 @@ class Parser {
         Addr addr = parse_addr(fn);
         expect_punct(",");
         std::vector<Operand> srcs;
-        if (vec == 1)
+        if (vec == 1 && !peek_punct("{"))
           srcs.push_back(parse_operand());
         else
           srcs = parse_operand_vector(vec);
@@ -1089,7 +1139,7 @@ class Parser {
       ins.op = op;
     } else if (op0 == "ldmatrix") {
       uint32_t count = 0;
-      bool trans = false, shape_ok = false, b16 = false;
+      bool trans = false, shape_ok = false, b16 = false, shared_space = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "sync" || p == "aligned") ;
@@ -1099,7 +1149,8 @@ class Parser {
         else if (p == "x4") count = 4;
         else if (p == "trans") trans = true;
         else if (p == "b16") b16 = true;
-        else if (p == "shared" || p == "cta") ;
+        else if (p == "shared") shared_space = true;
+        else if (p == "cta") ;  // scope qualifier on .shared::cta
         else return unsupported("ldmatrix modifier '." + p + "'");
       }
       if (!shape_ok || !count || !b16)
@@ -1107,6 +1158,7 @@ class Parser {
       OpLdMatrix op;
       op.count = count;
       op.trans = trans;
+      op.shared_space = shared_space;
       op.dsts = parse_reg_vector_any();
       if (op.dsts.size() != count) return unsupported("ldmatrix destination arity");
       expect_punct(",");
@@ -1402,7 +1454,11 @@ class Parser {
       ins.op = op;
     } else if (op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "min" || op0 == "max" ||
                op0 == "div" || op0 == "rem" || op0 == "and" || op0 == "or" || op0 == "xor" ||
-               op0 == "shl" || op0 == "shr") {
+               op0 == "shl" || op0 == "shr" || op0 == "addc" || op0 == "subc") {
+      // "addc"/"subc" are "add"/"sub" that also read the carry bit.
+      const bool carry_in = (op0 == "addc" || op0 == "subc");
+      const std::string base_op = carry_in ? op0.substr(0, 3) : op0;
+      bool carry_out = false;
       bool wide = false, lo = false, hi = false;
       FRound frnd = FRound::Nearest;
       Type ty{};
@@ -1412,6 +1468,7 @@ class Parser {
         if (p == "wide") wide = true;
         else if (p == "lo") lo = true;
         else if (p == "hi") hi = true;
+        else if (p == "cc") carry_out = true;
         else if (p == "rn" || p == "ftz") ;
         else if (p == "rz") frnd = FRound::Zero;
         else if (p == "rm") frnd = FRound::MinusInf;
@@ -1434,7 +1491,7 @@ class Parser {
       }
       if (!have_ty) fail(ins.line, opcode + " missing type");
       if (hi) {
-        if (op0 != "mul") return unsupported("'." + op0 + ".hi' is not implemented");
+        if (base_op != "mul") return unsupported("'." + base_op + ".hi' is not implemented");
         if (ty.is_float()) return unsupported("mul.hi on floats");
         OpMulHi op;
         op.ty = ty;
@@ -1451,10 +1508,10 @@ class Parser {
       if (ty.kind == Type::Kind::Pred) {
         // and.pred / or.pred / xor.pred
         std::optional<PredBinOp> pop;
-        if (op0 == "and") pop = PredBinOp::And;
-        else if (op0 == "or") pop = PredBinOp::Or;
-        else if (op0 == "xor") pop = PredBinOp::Xor;
-        if (!pop) return unsupported("'" + op0 + "' on predicates");
+        if (base_op == "and") pop = PredBinOp::And;
+        else if (base_op == "or") pop = PredBinOp::Or;
+        else if (base_op == "xor") pop = PredBinOp::Xor;
+        if (!pop) return unsupported("'" + base_op + "' on predicates");
         OpPredBin op;
         op.op = *pop;
         op.dst = expect_reg_operand("predicate destination");
@@ -1469,8 +1526,8 @@ class Parser {
         static const std::unordered_map<std::string, FloatBinOp> fops = {
             {"add", FloatBinOp::Add}, {"sub", FloatBinOp::Sub}, {"mul", FloatBinOp::Mul},
             {"min", FloatBinOp::Min}, {"max", FloatBinOp::Max}, {"div", FloatBinOp::Div}};
-        auto it = fops.find(op0);
-        if (it == fops.end()) return unsupported("float op '" + op0 + "'");
+        auto it = fops.find(base_op);
+        if (it == fops.end()) return unsupported("float op '" + base_op + "'");
         OpFloatBin op;
         op.round = frnd;
         op.op = it->second;
@@ -1485,7 +1542,7 @@ class Parser {
         // .wide doubles the operand width: 16-bit sources give a 32-bit result,
         // 32-bit give 64. Quantized kernels use the 16-bit form for byte-pair
         // arithmetic, so restricting this to 32-bit blocked them.
-        if (op0 != "mul" || (ty.bits != 32 && ty.bits != 16))
+        if (base_op != "mul" || (ty.bits != 32 && ty.bits != 16))
           return unsupported("only mul.wide.{s16,u16,s32,u32} implemented");
         OpMulWide op;
         op.src_bits = ty.bits;
@@ -1502,12 +1559,16 @@ class Parser {
             {"min", IntBinOp::Min}, {"max", IntBinOp::Max}, {"div", IntBinOp::Div},
             {"rem", IntBinOp::Rem}, {"and", IntBinOp::And}, {"or", IntBinOp::Or},
             {"xor", IntBinOp::Xor}, {"shl", IntBinOp::Shl}, {"shr", IntBinOp::Shr}};
-        auto it = iops.find(op0);
-        if (it == iops.end()) return unsupported("integer op '" + op0 + "'");
-        if (op0 == "mul" && !lo) return unsupported("plain mul on integers requires .lo/.wide/.hi");
+        auto it = iops.find(base_op);
+        if (it == iops.end()) return unsupported("integer op '" + base_op + "'");
+        if (base_op == "mul" && !lo) return unsupported("plain mul on integers requires .lo/.wide/.hi");
+        if ((carry_in || carry_out) && base_op != "add" && base_op != "sub")
+          return unsupported("the carry bit is only defined for add/sub/mad");
         OpIntBin op;
         op.op = it->second;
         op.ty = ty;
+        op.carry_in = carry_in;
+        op.carry_out = carry_out;
         op.dst = expect_reg_operand("destination");
         expect_punct(",");
         op.a = parse_operand();
@@ -1515,7 +1576,9 @@ class Parser {
         op.b = parse_operand();
         ins.op = op;
       }
-    } else if (op0 == "mad" || op0 == "fma") {
+    } else if (op0 == "mad" || op0 == "fma" || op0 == "madc") {
+      bool carry_in = (op0 == "madc");
+      bool carry_out = false;
       Type ty{};
       bool have_ty = false, lo = false, wide = false, hi = false;
       for (size_t i = 1; i < parts.size(); ++i) {
@@ -1523,6 +1586,7 @@ class Parser {
         if (p == "lo") lo = true;
         else if (p == "wide") wide = true;
         else if (p == "hi") hi = true;
+        else if (p == "cc") carry_out = true;
         // Rounding modes: VirtualGPU always computes at host precision
         // (round-to-nearest) — a documented divergence, see ARCHITECTURE.md.
         else if (p == "rn" || p == "rz" || p == "rm" || p == "rp" || p == "ftz" || p == "sat") ;
@@ -1539,17 +1603,20 @@ class Parser {
       Operand b = parse_operand();
       expect_punct(",");
       Operand c = parse_operand();
+      if ((carry_in || carry_out) && !lo && !hi)
+        return unsupported("the carry bit is only defined for mad.lo and mad.hi");
       if (ty.is_float()) {
+        if (carry_in || carry_out) return unsupported("the carry bit is integer-only");
         if (ty.bits != 32 && ty.bits != 64) return unsupported("only f32/f64 fma implemented");
         ins.op = OpFma{ty, dst, a, b, c};
       } else if (wide) {
         if (ty.bits != 32) return unsupported("only mad.wide.{s32,u32} implemented");
         ins.op = OpMadWide{ty.is_signed(), dst, a, b, c};
       } else if (hi) {
-        ins.op = OpMadHi{ty, dst, a, b, c};
+        ins.op = OpMadHi{ty, dst, a, b, c, carry_in, carry_out};
       } else {
         if (!lo) return unsupported("integer mad requires .lo or .wide");
-        ins.op = OpMadLo{ty, dst, a, b, c};
+        ins.op = OpMadLo{ty, dst, a, b, c, carry_in, carry_out};
       }
     } else if (op0 == "setp") {
       // setp.<cmp>[.ftz].<type> — drop the flush-to-zero qualifier.
