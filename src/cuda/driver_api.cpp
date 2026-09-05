@@ -224,9 +224,37 @@ int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
     case 41: return 1;                               // UNIFIED_ADDRESSING (64-bit Linux is UVA)
     case 82: return static_cast<int>(p.limits.shared_mem_per_block_optin);
     case 90: return 1;                               // COMPUTE_PREEMPTION_SUPPORTED
+    // Capabilities this does not implement. Zero is the true answer for each,
+    // and saying so explicitly keeps them out of the "unmodeled" report below.
+    // A real quantity, and answering zero for it is the same mistake that had
+    // CUB launching no blocks: it is a divisor in occupancy arithmetic.
+    case 134: return static_cast<int>(p.limits.max_blocks_per_sm);   // MAX_BLOCKS_PER_MULTIPROCESSOR
+    case 102: return 0;                              // VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
+    case 135: return 0;                              // GENERIC_COMPRESSION_SUPPORTED
+    case 136: return 0;                              // MAX_PERSISTING_L2_CACHE_SIZE
+    case 137: return 0;                              // MAX_ACCESS_POLICY_WINDOW_SIZE
+    case 138: return 0;                              // GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED
+    case 139: return 0;                              // RESERVED_SHARED_MEMORY_PER_BLOCK
+    case 140: return 0;                              // SPARSE_CUDA_ARRAY_SUPPORTED
+    case 141: return 0;                              // READ_ONLY_HOST_REGISTER_SUPPORTED
+    case 142: return 0;                              // TIMELINE_SEMAPHORE_INTEROP_SUPPORTED
+    case 143: return 0;                              // MEMORY_POOLS_SUPPORTED (no cuMemPool* here)
+    case 115: return 0;                              // GPU_DIRECT_RDMA_SUPPORTED
+    case 118: return 0;                              // HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED
+    case 121: return 0;                              // MAX_PERSISTING_L2_CACHE_SIZE
+    case 124: return 0;                              // MEMPOOL_SUPPORTED_HANDLE_TYPES
+    case 128: return 0;                              // DEFERRED_MAPPING_CUDA_ARRAY_SUPPORTED
     default:
-      if (trace())
-        std::fprintf(stderr, "[vgpu][trace] cuDeviceGetAttribute(%d) -> 0 (unmodeled)\n", attrib);
+      // Answering zero for a quantity nobody modelled is how a scan came to
+      // launch no blocks, on the runtime side of this same question. The
+      // driver API is reached by more varied software, and an error here is
+      // more likely to be fatal than useful -- so this still answers zero, but
+      // says so where it can be seen rather than only under VGPU_TRACE.
+      if (!quiet())
+        std::fprintf(stderr,
+                     "[vgpu] cuDeviceGetAttribute: attribute %d is not modelled; answering 0. If "
+                     "that is wrong for your program, add it to driver_api.cpp\n",
+                     attrib);
       return 0;
   }
 }

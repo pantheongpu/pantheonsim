@@ -365,12 +365,86 @@ class Interpreter {
       if (progress_ && (stats_.instructions & 0xFFFFF) == 0) report_progress();
       // Warp-level issue count, plus the per-lane total: their ratio is the
       // average lane utilisation, which is divergence measured directly.
-      stats_.thread_instructions += static_cast<uint64_t>(popcount_mask(w.paths[idx].mask));
+      const uint64_t lanes = static_cast<uint64_t>(popcount_mask(w.paths[idx].mask));
+      stats_.thread_instructions += lanes;
+      // Counted against the same mask as thread_instructions, so the classes
+      // partition it exactly. Predication narrows the mask inside step(); it is
+      // deliberately not subtracted here, for the same reason.
+      const InstClass cls = class_of_pc(w.paths[idx].pc);
+      stats_.inst_by_class[static_cast<size_t>(cls)] += lanes;
+      if (cls == InstClass::Tensor) ++stats_.tensor_instructions;
       if (++stats_.instructions > cfg_.max_steps)
         throw Error::make(Err::ExecLimit, "kernel '", fn_.name, "' exceeded the launch step budget (",
                           cfg_.max_steps, " instructions) — possible infinite loop");
       step(w, ctx, idx, ins);
     }
+  }
+
+  InstClass class_of_pc(size_t pc) const {
+    if (class_by_pc_.empty()) {
+      class_by_pc_.resize(fn_.body.size());
+      for (size_t i = 0; i < fn_.body.size(); ++i)
+        class_by_pc_[i] = static_cast<uint8_t>(classify(fn_.body[i]));
+    }
+    return static_cast<InstClass>(class_by_pc_[pc]);
+  }
+
+  // Which category an instruction falls in. Worked out once per kernel rather
+  // than per execution: a kernel is parsed once and its instructions run
+  // millions of times, and a chain of variant tests on that path would cost
+  // more than the counting is worth.
+  static InstClass classify(const Instr& ins) {
+    auto by_width = [](const Type& t) {
+      if (t.bits == 16) return InstClass::Fp16;
+      if (t.bits == 64) return InstClass::Fp64;
+      return InstClass::Fp32;
+    };
+    // Arithmetic that carries a type: float by width, otherwise integer.
+    if (const auto* o = std::get_if<OpFloatBin>(&ins.op)) return by_width(o->ty);
+    if (const auto* o = std::get_if<OpFma>(&ins.op)) return by_width(o->ty);
+    if (const auto* o = std::get_if<OpMath>(&ins.op)) return by_width(o->ty);
+    if (const auto* o = std::get_if<OpCopysign>(&ins.op)) return by_width(o->ty);
+    if (std::holds_alternative<OpF16x2Bin>(ins.op) ||
+        std::holds_alternative<OpF16x2Fma>(ins.op) ||
+        std::holds_alternative<OpF16x2Neg>(ins.op))
+      return InstClass::Fp16;
+    for (const Type* t : {std::get_if<OpNeg>(&ins.op) ? &std::get_if<OpNeg>(&ins.op)->ty : nullptr,
+                          std::get_if<OpAbs>(&ins.op) ? &std::get_if<OpAbs>(&ins.op)->ty : nullptr})
+      if (t) return t->is_real() ? by_width(*t) : InstClass::Integer;
+
+    if (std::holds_alternative<OpIntBin>(ins.op) || std::holds_alternative<OpMadLo>(ins.op) ||
+        std::holds_alternative<OpMulWide>(ins.op) || std::holds_alternative<OpMadWide>(ins.op) ||
+        std::holds_alternative<OpMulHi>(ins.op) || std::holds_alternative<OpMadHi>(ins.op) ||
+        std::holds_alternative<OpShf>(ins.op) || std::holds_alternative<OpBfe>(ins.op) ||
+        std::holds_alternative<OpBfi>(ins.op) || std::holds_alternative<OpBrev>(ins.op) ||
+        std::holds_alternative<OpPopcClz>(ins.op) || std::holds_alternative<OpPrmt>(ins.op) ||
+        std::holds_alternative<OpDp4a>(ins.op) || std::holds_alternative<OpBmsk>(ins.op) ||
+        std::holds_alternative<OpNot>(ins.op))
+      return InstClass::Integer;
+
+    if (std::holds_alternative<OpCvt>(ins.op) || std::holds_alternative<OpCvtF16x2>(ins.op) ||
+        std::holds_alternative<OpCvta>(ins.op) || std::holds_alternative<OpMovPack>(ins.op) ||
+        std::holds_alternative<OpMovUnpack>(ins.op))
+      return InstClass::BitConvert;
+
+    if (std::holds_alternative<OpBra>(ins.op) || std::holds_alternative<OpRet>(ins.op) ||
+        std::holds_alternative<OpBar>(ins.op) || std::holds_alternative<OpBarRed>(ins.op) ||
+        std::holds_alternative<OpTrap>(ins.op) || std::holds_alternative<OpCall>(ins.op))
+      return InstClass::Control;
+
+    if (std::holds_alternative<OpLd>(ins.op) || std::holds_alternative<OpSt>(ins.op) ||
+        std::holds_alternative<OpAtom>(ins.op) || std::holds_alternative<OpCpAsync>(ins.op) ||
+        std::holds_alternative<OpCpAsyncGroup>(ins.op) ||
+        std::holds_alternative<OpLdMatrix>(ins.op) ||
+        std::holds_alternative<OpWmmaStore>(ins.op) ||
+        std::holds_alternative<OpLdSlot>(ins.op) || std::holds_alternative<OpStSlot>(ins.op))
+      return InstClass::Memory;
+
+    if (std::holds_alternative<OpMma>(ins.op) || std::holds_alternative<OpWmmaMma>(ins.op) ||
+        std::holds_alternative<OpMovMatrix>(ins.op))
+      return InstClass::Tensor;
+
+    return InstClass::Misc;
   }
 
   // ---- symbols / registers / operands ----
@@ -567,6 +641,72 @@ class Interpreter {
   // Memory traffic, counted per active lane. Space matters: a shared access and
   // a global one cost very different things on hardware, and lumping them would
   // make the numbers useless for the comparison people actually want.
+  // Sectors and bank conflicts, counted from the addresses the lanes actually
+  // used. A device derives both by sampling; here they are exact, because every
+  // lane's address is in hand at the moment of the access.
+  //
+  // `addrs` holds one address per lane, valid where `m` is set. `bytes` is the
+  // per-lane access width, `count` the number of consecutive elements a vector
+  // access touches from that address.
+  void count_addresses(Space space, const Lanes& addrs, Mask m, uint32_t bytes, size_t count) {
+    if (m == 0) return;
+    const uint64_t span = static_cast<uint64_t>(bytes) * count;
+
+    if (space == Space::Shared) {
+      // 32 banks of 4 bytes. Lanes reaching different words in one bank
+      // serialize; lanes reaching the same word are broadcast and free. An
+      // access wider than a word touches consecutive words, which the hardware
+      // takes in separate passes -- counting each word is what makes a
+      // conflict-free 8-byte access come out as conflict-free.
+      uint32_t worst = 1;
+      for (uint32_t bank = 0; bank < 32; ++bank) {
+        std::array<uint64_t, kWarpSize * 4> words{};
+        uint32_t distinct = 0;
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+          if (!(m & (1u << lane))) continue;
+          for (uint64_t off = 0; off < span; off += 4) {
+            const uint64_t word = (addrs[lane] + off) / 4;
+            if (word % 32 != bank) continue;
+            bool seen = false;
+            for (uint32_t i = 0; i < distinct; ++i)
+              if (words[i] == word) { seen = true; break; }
+            if (!seen && distinct < words.size()) words[distinct++] = word;
+          }
+        }
+        if (distinct > worst) worst = distinct;
+      }
+      stats_.shared_bank_conflicts += worst - 1;
+      ++stats_.shared_requests;
+      return;
+    }
+
+    if (space == Space::Param) return;  // the constant bank, not device memory
+
+    // Everything else moves in 32-byte sectors. Count the distinct ones the
+    // warp touched: four for a coalesced 32-lane 4-byte load, up to 32 when
+    // every lane lands in its own sector.
+    std::array<uint64_t, kWarpSize * 8> sectors{};
+    uint32_t distinct = 0;
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      if (!(m & (1u << lane))) continue;
+      const uint64_t first = addrs[lane] / 32;
+      const uint64_t last = (addrs[lane] + (span ? span - 1 : 0)) / 32;
+      for (uint64_t sec = first; sec <= last; ++sec) {
+        bool seen = false;
+        for (uint32_t i = 0; i < distinct; ++i)
+          if (sectors[i] == sec) { seen = true; break; }
+        if (!seen && distinct < sectors.size()) sectors[distinct++] = sec;
+      }
+    }
+    if (space == Space::Local) {
+      stats_.local_sectors += distinct;
+      ++stats_.local_requests;
+    } else {
+      stats_.global_sectors += distinct;
+      ++stats_.global_requests;
+    }
+  }
+
   void count_memory(Space space, uint32_t bytes, uint32_t lanes, bool is_store) {
     const uint64_t n = lanes;
     const uint64_t b = n * bytes;
@@ -2331,6 +2471,14 @@ class Interpreter {
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     uint64_t sbase = space_base(op.space);
     uint32_t va = size * static_cast<uint32_t>(n);  // vector accesses need vector alignment
+    {
+      // Sectors and bank conflicts need the addresses, which only exist here.
+      Lanes at{};
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane))
+          at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+      count_addresses(op.space, at, m, size, n);
+    }
     std::vector<Lanes> results(n);
     for (uint32_t lane = 0; lane < kWarpSize; ++lane)
       if (m & (1u << lane)) {
@@ -2389,6 +2537,13 @@ class Interpreter {
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     uint64_t sbase = space_base(op.space);
     uint32_t va = size * static_cast<uint32_t>(n);
+    {
+      Lanes at{};
+      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+        if (m & (1u << lane))
+          at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+      count_addresses(op.space, at, m, size, n);
+    }
     for (uint32_t lane = 0; lane < kWarpSize; ++lane)
       if (m & (1u << lane)) {
         uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
@@ -2644,6 +2799,9 @@ class Interpreter {
   const SymbolTable* symbols_;
   LaunchStats& stats_;
   ProgressFn progress_;
+  // One entry per instruction, filled on first use. Classifying costs a chain
+  // of variant tests, and the instruction stream is the hottest path there is.
+  mutable std::vector<uint8_t> class_by_pc_;
   bool concurrent_ = false;   // set when the grid is split across threads
   std::chrono::steady_clock::time_point last_progress_;
 };
@@ -2876,25 +3034,7 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
   if (first_error) std::rethrow_exception(first_error);
 
   LaunchStats total;
-  for (const auto& s : per_thread) {
-    total.blocks += s.blocks;
-    total.warps += s.warps;
-    total.instructions += s.instructions;
-    total.thread_instructions += s.thread_instructions;
-    total.divergent_branches += s.divergent_branches;
-    total.global_loads += s.global_loads;
-    total.global_stores += s.global_stores;
-    total.shared_loads += s.shared_loads;
-    total.shared_stores += s.shared_stores;
-    total.local_loads += s.local_loads;
-    total.local_stores += s.local_stores;
-    total.global_bytes_read += s.global_bytes_read;
-    total.global_bytes_written += s.global_bytes_written;
-    total.shared_bytes_read += s.shared_bytes_read;
-    total.shared_bytes_written += s.shared_bytes_written;
-    total.atomics += s.atomics;
-    total.barriers += s.barriers;
-  }
+  for (const auto& s : per_thread) total.add(s);
   return total;
 }
 

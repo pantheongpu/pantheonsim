@@ -139,6 +139,20 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
   const double lanes = st.instructions ? static_cast<double>(st.thread_instructions) /
                                              static_cast<double>(st.instructions)
                                        : 0.0;
+  // Sectors per request against the fewest a request of this shape could have
+  // needed. 100% means every byte fetched was asked for; 25% means three
+  // quarters of the traffic was the memory system rounding up to 32 bytes.
+  const double sectors_per_request =
+      st.global_requests ? static_cast<double>(st.global_sectors) /
+                               static_cast<double>(st.global_requests)
+                         : 0.0;
+  const double ideal_sectors =
+      st.global_requests
+          ? static_cast<double>(st.global_bytes_read + st.global_bytes_written) / 32.0
+          : 0.0;
+  const auto cls = [&st](exec::InstClass c) { return st.inst_by_class[static_cast<size_t>(c)]; };
+  const double coalescing_pct =
+      st.global_sectors ? 100.0 * ideal_sectors / static_cast<double>(st.global_sectors) : 0.0;
   std::fprintf(stderr,
                "[vgpu][counters] %s  grid=%ux%ux%u block=%ux%ux%u\n"
                "    blocks=%llu warps=%llu\n"
@@ -146,7 +160,11 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
                "    divergent_branches=%llu  barriers=%llu  atomics=%llu\n"
                "    global  ld=%llu st=%llu  read=%llu B write=%llu B\n"
                "    shared  ld=%llu st=%llu  read=%llu B write=%llu B\n"
-               "    local   ld=%llu st=%llu\n",
+               "    local   ld=%llu st=%llu\n"
+               "    sectors global=%llu over %llu requests (%.2f per request, %.0f%% of ideal)\n"
+               "    shared  bank_conflicts=%llu over %llu requests\n"
+               "    mix     fp16=%llu fp32=%llu fp64=%llu int=%llu cvt=%llu\n"
+               "            ctrl=%llu mem=%llu tensor=%llu misc=%llu  (tensor issues=%llu)\n",
                kernel.c_str(), cfg.grid[0], cfg.grid[1], cfg.grid[2], cfg.block[0], cfg.block[1],
                cfg.block[2], (unsigned long long)st.blocks, (unsigned long long)st.warps,
                (unsigned long long)st.instructions, (unsigned long long)st.thread_instructions,
@@ -156,7 +174,21 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
                (unsigned long long)st.global_bytes_written, (unsigned long long)st.shared_loads,
                (unsigned long long)st.shared_stores, (unsigned long long)st.shared_bytes_read,
                (unsigned long long)st.shared_bytes_written, (unsigned long long)st.local_loads,
-               (unsigned long long)st.local_stores);
+               (unsigned long long)st.local_stores,
+               (unsigned long long)st.global_sectors, (unsigned long long)st.global_requests,
+               sectors_per_request, coalescing_pct,
+               (unsigned long long)st.shared_bank_conflicts,
+               (unsigned long long)st.shared_requests,
+               (unsigned long long)cls(exec::InstClass::Fp16),
+               (unsigned long long)cls(exec::InstClass::Fp32),
+               (unsigned long long)cls(exec::InstClass::Fp64),
+               (unsigned long long)cls(exec::InstClass::Integer),
+               (unsigned long long)cls(exec::InstClass::BitConvert),
+               (unsigned long long)cls(exec::InstClass::Control),
+               (unsigned long long)cls(exec::InstClass::Memory),
+               (unsigned long long)cls(exec::InstClass::Tensor),
+               (unsigned long long)cls(exec::InstClass::Misc),
+               (unsigned long long)st.tensor_instructions);
 }
 
 }  // namespace

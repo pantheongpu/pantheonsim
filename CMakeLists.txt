@@ -34,6 +34,8 @@ set(VGPU_PROFILES
   nvidia/a100-sxm4-40gb
   nvidia/gh200-480gb
   nvidia/h100-pcie
+  nvidia/t4
+  nvidia/a10g
   amd/mi300x
   amd/mi325x
   amd/mi350x
@@ -460,6 +462,16 @@ if(TARGET vgpucublas)
            COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_cublas_tight.sh)
   set_tests_properties(e2e_cublas_tight PROPERTIES
     DEPENDS vgpucublas
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # Where each lane's mma.sync fragment element sits. A permuted mapping
+  # cancels out wherever a fragment is written back the way it was read, so
+  # this pins it against the ISA rather than against a matmul's answer.
+  add_test(NAME e2e_mma_layout
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_mma_layout.sh)
+  set_tests_properties(e2e_mma_layout PROPERTIES
+    DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 endif()

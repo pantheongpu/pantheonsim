@@ -131,6 +131,40 @@ Environment knobs:
 | `VGPU_THREADS` | host threads used to run blocks | auto |
 | `VGPU_VRAM_MB` | virtual VRAM size, overriding the profile | profile |
 | `VGPU_STRICT` | `1` turns on the checks that catch bugs hardware hides but that real compiler output trips over: integer division by zero, and storing a register nothing has written | unset |
+| `VGPU_COUNTERS` | `1` prints exact per-launch performance counters | unset |
+
+`VGPU_COUNTERS` reports what a profiler reports, except that every number is
+counted rather than sampled. Instructions and thread-instructions (their ratio
+is the average number of lanes doing useful work), divergent branches, memory
+by space, atomics and barriers -- and two that are worth the simulator on their
+own:
+
+- **Sectors and coalescing.** Memory moves in 32-byte sectors. Every lane's
+  address is in hand at the moment of the access, so the sectors a warp touches
+  are counted exactly: four for a fully coalesced 32-lane load of 4-byte
+  values, up to thirty-two when every lane lands in its own sector. The
+  percentage is how much of the traffic was asked for rather than rounded up to.
+- **Shared-memory bank conflicts.** Thirty-two banks of four bytes; lanes
+  reaching different words in one bank serialize, lanes reaching the same word
+  are broadcast and free. The count is the extra passes serialization forces --
+  zero for a conflict-free access, thirty-one for a 32-way conflict.
+
+A device derives both by sampling, so its answer moves between runs. These do
+not move.
+
+The instruction mix is reported alongside them, in the categories a profiler
+uses: fp16/fp32/fp64 by operand width, integer, conversion, control, memory,
+tensor and everything else. The classes partition the instructions, so they sum
+to the thread-instruction total -- which is checked by a test, because a
+classifier that silently drops a case looks exactly like one that works.
+Tensor-core work is reported twice: per lane with the rest of the mix, and per
+warp as `tensor issues`, since an mma is one instruction the whole warp
+executes together and a per-lane figure would say thirty-two for something that
+happened once.
+
+There is no timing model and no cache model here, so there are no cycles, no
+stall reasons and no hit rates. Those are the numbers a profiler is mostly
+made of, and inventing them would be worse than not having them.
 
 `VGPU_STRICT` is off by default for a reason worth knowing. Both of those
 checks find real bugs, and both fire on code that is perfectly correct: ptxas
