@@ -73,7 +73,46 @@ struct LaunchStats {
   uint64_t atomics = 0;
   // bar.sync executions, per warp.
   uint64_t barriers = 0;
+
+  // ---- counted from the addresses themselves ----
+  //
+  // These are the two numbers a profiler gives you that actually change how a
+  // kernel is written, and both are *derived* on hardware: a device counts
+  // them by sampling, so the answer moves between runs. Here every lane's
+  // address is in hand at the moment of the access, so they are exact and
+  // reproducible.
+
+  // 32-byte sectors touched, which is the granularity memory is moved in. A
+  // fully coalesced 32-lane load of 4-byte values touches 4 sectors; the same
+  // load with a stride touches up to 32. The ratio against the request count
+  // is the coalescing efficiency, and `*_requests` is that denominator: one
+  // per warp-level instruction rather than per lane.
+  uint64_t global_sectors = 0, local_sectors = 0;
+  uint64_t global_requests = 0, shared_requests = 0, local_requests = 0;
+
+  // Shared memory is 32 banks of 4 bytes. Lanes hitting different words in one
+  // bank serialize; lanes hitting the *same* word are broadcast and cost
+  // nothing. This counts the extra passes that serialization forces -- zero
+  // for a conflict-free access, 31 for a 32-way conflict.
+  uint64_t shared_bank_conflicts = 0;
+
+  // Adding a counter used to mean remembering to add it to the merge that
+  // folds each host thread's totals together, and forgetting left the new one
+  // reading zero however carefully it was collected. Every field is a uint64_t
+  // count, so the merge walks them rather than naming them, and a field added
+  // above is summed without anyone having to remember.
+  // Every member is a uint64_t count, which is what makes walking them safe.
+  // A member of any other type must not be folded in by reinterpretation --
+  // give it its own handling instead of letting this reach it.
+  void add(const LaunchStats& other) {
+    auto* dst = reinterpret_cast<uint64_t*>(this);
+    const auto* src = reinterpret_cast<const uint64_t*>(&other);
+    for (size_t i = 0; i < sizeof(LaunchStats) / sizeof(uint64_t); ++i) dst[i] += src[i];
+  }
 };
+
+static_assert(sizeof(LaunchStats) % sizeof(uint64_t) == 0,
+              "LaunchStats must be a block of uint64_t counters; see add()");
 
 // Module global-variable addresses (name -> device VA), materialized by the
 // runtime at module load. Kernels referencing globals need this at launch.

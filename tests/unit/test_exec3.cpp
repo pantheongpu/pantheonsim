@@ -1362,4 +1362,155 @@ DONE:
     VCHECK_EQ(e.mem.load_scalar(out + l * 4, 4), uint64_t{0xFFFF0000});
 }
 
+// ---- counters derived from the addresses themselves ----
+//
+// Every expected number below is worked out by hand from the access pattern,
+// not read back from the engine. A counter checked against itself measures
+// nothing.
+
+VTEST(coalesced_and_strided_loads_touch_the_sectors_they_should) {
+  // 32 lanes x 4 bytes, consecutive: 128 bytes, which is exactly 4 sectors.
+  // The same 32 lanes at a 32-byte stride touch a sector each: 32.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 p, .param .u32 stride)
+{
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [p];
+    cvta.to.global.u64 %rd2, %rd1;
+    ld.param.u32 %r2, [stride];
+    mov.u32 %r1, %tid.x;
+    mul.lo.s32 %r3, %r1, %r2;
+    mul.wide.u32 %rd3, %r3, 1;
+    add.s64 %rd4, %rd2, %rd3;
+    ld.global.u32 %r4, [%rd4];
+    st.global.u32 [%rd4], %r4;
+    ret;
+}
+)";
+  auto m = ptx::parse(ptx);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+
+  for (uint32_t stride : {4u, 32u}) {
+    Env e;
+    uint64_t buf = e.mem.alloc(32 * 64);
+    std::vector<uint8_t> sarg(4);
+    std::memcpy(sarg.data(), &stride, 4);
+    auto st = exec::launch(m.entries[0], cfg, {arg_u64(buf), sarg}, e.mem, e.prof);
+    // One load and one store, so two requests from one warp.
+    VCHECK_EQ(st.global_requests, 2ull);
+    const uint64_t want = stride == 4 ? 4ull : 32ull;   // per request
+    VCHECK_EQ(st.global_sectors, want * 2);
+  }
+}
+
+VTEST(shared_bank_conflicts_are_counted_the_way_hardware_serializes) {
+  // Shared memory is 32 banks of 4 bytes, so bank = (address/4) % 32.
+  //   stride 1 word : lane i -> bank i          -> no conflict
+  //   stride 32 words: every lane -> bank 0, all different words -> 32-way,
+  //                    which costs 31 extra passes
+  //   every lane the same address -> broadcast, no conflict
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u32 stride)
+{
+    .reg .b32 %r<8>;
+    .shared .align 4 .b8 tile[16384];
+    ld.param.u32 %r2, [stride];
+    mov.u32 %r1, %tid.x;
+    mul.lo.s32 %r3, %r1, %r2;
+    shl.b32 %r4, %r3, 2;
+    mov.u32 %r5, tile;
+    add.s32 %r6, %r5, %r4;
+    ld.shared.u32 %r7, [%r6];
+    ret;
+}
+)";
+  auto m = ptx::parse(ptx);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  struct Case { uint32_t stride; uint64_t conflicts; };
+  for (const Case& c : {Case{1, 0}, Case{32, 31}, Case{0, 0}}) {
+    Env e;
+    std::vector<uint8_t> sarg(4);
+    std::memcpy(sarg.data(), &c.stride, 4);
+    auto st = exec::launch(m.entries[0], cfg, {sarg}, e.mem, e.prof);
+    VCHECK_EQ(st.shared_requests, 1ull);
+    VCHECK_EQ(st.shared_bank_conflicts, c.conflicts);
+  }
+}
+
+VTEST(a_vector_load_is_one_request_over_the_sectors_it_spans) {
+  // 32 lanes x 16 bytes consecutive = 512 bytes = 16 sectors, in one
+  // instruction. Counting per lane instead would say 32 requests and miss that
+  // this is the efficient shape.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 p)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [p];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 16;
+    add.s64 %rd4, %rd2, %rd3;
+    ld.global.v4.u32 {%r2,%r3,%r4,%r5}, [%rd4];
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t buf = e.mem.alloc(32 * 16);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  auto st = exec::launch(m.entries[0], cfg, {arg_u64(buf)}, e.mem, e.prof);
+  VCHECK_EQ(st.global_requests, 1ull);
+  VCHECK_EQ(st.global_sectors, 16ull);
+}
+
+VTEST(counters_survive_the_merge_across_host_threads) {
+  // A launch of one block returns its statistics directly; more than one block
+  // splits across host threads and folds the totals together at the end. The
+  // fold used to name each field by hand, so a counter added without touching
+  // it read zero -- every single-block test passed while a real kernel
+  // reported nothing. This runs enough blocks to take the threaded path.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 p)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    .shared .align 4 .b8 tile[256];
+    ld.param.u64 %rd1, [p];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    shl.b32 %r3, %r2, 5;
+    add.s32 %r4, %r3, %r1;
+    mul.wide.u32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    ld.global.u32 %r5, [%rd4];
+    mov.u32 %r6, tile;
+    shl.b32 %r7, %r1, 2;
+    add.s32 %r8, %r6, %r7;
+    st.shared.u32 [%r8], %r5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint32_t nblocks = 64;
+  uint64_t buf = e.mem.alloc(nblocks * 32 * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  cfg.grid = {nblocks, 1, 1};
+  auto st = exec::launch(m.entries[0], cfg, {arg_u64(buf)}, e.mem, e.prof);
+  VCHECK_EQ(st.blocks, uint64_t{nblocks});
+  // One coalesced global load per block: 32 lanes x 4 bytes = 4 sectors each.
+  VCHECK_EQ(st.global_requests, uint64_t{nblocks});
+  VCHECK_EQ(st.global_sectors, uint64_t{nblocks} * 4);
+  // One conflict-free shared store per block.
+  VCHECK_EQ(st.shared_requests, uint64_t{nblocks});
+  VCHECK_EQ(st.shared_bank_conflicts, 0ull);
+}
+
 VTEST_MAIN
