@@ -132,6 +132,7 @@ Environment knobs:
 | `VGPU_VRAM_MB` | virtual VRAM size, overriding the profile | profile |
 | `VGPU_STRICT` | `1` turns on the checks that catch bugs hardware hides but that real compiler output trips over: integer division by zero, and storing a register nothing has written | unset |
 | `VGPU_COUNTERS` | `1` prints exact per-launch performance counters | unset |
+| `VGPU_RACE` | `1` reports unordered shared-memory access between warps | unset |
 
 `VGPU_COUNTERS` reports what a profiler reports, except that every number is
 counted rather than sampled. Instructions and thread-instructions (their ratio
@@ -165,6 +166,17 @@ happened once.
 There is no timing model and no cache model here, so there are no cycles, no
 stall reasons and no hit rates. Those are the numbers a profiler is mostly
 made of, and inventing them would be worse than not having them.
+
+`VGPU_RACE` checks the rule a CUDA block promises: two warps may touch the same
+shared word without a `bar.sync` between them only if both are reading.
+Anything else is a race, and which warp wins is not something the program
+decided. Hardware usually hides this -- warps advance together and the window
+is small -- which is exactly why it is worth checking somewhere that does not.
+
+It is off by default because it costs a shadow word per shared word, and on
+because you are looking for something. It found the flash-attention race in
+llama.cpp in one run, naming the kernel, the PTX line and both warps; that same
+bug took a day to corner by bisection.
 
 `VGPU_STRICT` is off by default for a reason worth knowing. Both of those
 checks find real bugs, and both fire on code that is perfectly correct: ptxas

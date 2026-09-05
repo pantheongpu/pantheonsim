@@ -1603,4 +1603,127 @@ VTEST(tensor_instructions_are_counted_once_per_warp) {
             2ull * 32);                                                      // per lane
 }
 
+// ---- shared-memory race detection ----
+
+static const char* kRaceKernel = R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<3>;
+    .shared .align 4 .b8 tile[256];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, tile;
+    // Warp 0 writes word 0; warp 1 reads it. NO bar.sync between them, so
+    // which one goes first is not something this program decided.
+    setp.gt.u32 %p1, %r1, 31;
+    @%p1 bra READER;
+    mov.u32 %r3, 7;
+    st.shared.u32 [%r2], %r3;
+    bra DONE;
+READER:
+    ld.shared.u32 %r4, [%r2];
+    st.global.u32 [%rd2], %r4;
+DONE:
+    ret;
+}
+)";
+
+VTEST(a_shared_race_between_warps_is_reported) {
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kRaceKernel);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};   // two warps, so they can race with each other
+  setenv("VGPU_RACE", "1", 1);
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof));
+  unsetenv("VGPU_RACE");
+  VCHECK(err.code() == Err::DataRace);
+  VCHECK_CONTAINS(err.what(), "shared memory");
+  VCHECK_CONTAINS(err.what(), "bar.sync");
+}
+
+VTEST(the_same_kernel_is_silent_when_a_barrier_orders_it) {
+  // The identical accesses, with a bar.sync between the write and the read.
+  // If the detector fired here it would be useless: every real kernel does
+  // this, and a checker that cannot tell ordered from unordered is noise.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<3>;
+    .shared .align 4 .b8 tile[256];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, tile;
+    setp.gt.u32 %p1, %r1, 31;
+    @%p1 bra AFTER;
+    mov.u32 %r3, 7;
+    st.shared.u32 [%r2], %r3;
+AFTER:
+    bar.sync 0;
+    ld.shared.u32 %r4, [%r2];
+    st.global.u32 [%rd2], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  setenv("VGPU_RACE", "1", 1);
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  unsetenv("VGPU_RACE");
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{7});
+}
+
+VTEST(the_racy_kernel_runs_without_complaint_when_detection_is_off) {
+  // Detection is opt-in, and its cost is a shadow word per shared word. A
+  // kernel nobody is checking must not pay for it or be stopped by it.
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kRaceKernel);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+}
+
+VTEST(one_warp_reusing_its_own_shared_words_is_not_a_race) {
+  // A warp racing with itself is impossible: its own accesses are ordered by
+  // the program. A detector that keyed on the word alone would say otherwise.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    .shared .align 4 .b8 tile[256];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r2, tile;
+    mov.u32 %r3, 11;
+    st.shared.u32 [%r2], %r3;
+    ld.shared.u32 %r4, [%r2];
+    add.s32 %r5, %r4, 1;
+    st.shared.u32 [%r2], %r5;
+    ld.shared.u32 %r6, [%r2];
+    st.global.u32 [%rd2], %r6;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};   // one warp
+  setenv("VGPU_RACE", "1", 1);
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  unsetenv("VGPU_RACE");
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{12});
+}
+
 VTEST_MAIN

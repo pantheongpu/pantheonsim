@@ -216,9 +216,19 @@ sizing, and the write/read pairing between the two kernels -- a block wrote
 `-0.387939 / 3.341256 / 5.117198` and the fixup read back exactly those.
 
 Not fixed here, because it is not this project's bug to fix. What *is* this
-project's to do is diagnose it rather than quietly return different numbers,
-which is the shared-memory race detection in the scheduler work below. This is
-the case to build it against.
+project's to do is diagnose it rather than quietly return different numbers.
+
+That detector now exists: `VGPU_RACE=1` finds this bug in a single run, naming
+the kernel, the PTX line and the two warps involved. It is quiet on SOFT_MAX,
+RMS_NORM, CUMSUM and all three pantheon workloads.
+
+It also reports one candidate in `MUL_MAT` -- a write-write on the same shared
+word from two warps of `mul_mat_q`, with no barrier between them in program
+order. That one is **unverified**. MUL_MAT is correct on all 1253 cases, which
+points to two warps writing the same value redundantly: a race by the strict
+definition, harmless in effect. It is recorded rather than claimed, because
+"the detector found a second bug" and "the detector has a false positive" look
+identical until someone checks.
 
 ## Known out of scope (not CUDA)
 
