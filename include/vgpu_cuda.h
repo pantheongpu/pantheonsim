@@ -43,10 +43,17 @@ typedef enum cudaError_enum {
 
 typedef int CUdevice;
 typedef unsigned long long CUdeviceptr;
+
+/* Interprocess handles. Opaque 64-byte blobs in the real ABI; the size is what
+   matters, since callers pass them by value. */
+#define VGPU_CU_IPC_HANDLE_SIZE 64
+typedef struct CUipcEventHandle_st { char reserved[VGPU_CU_IPC_HANDLE_SIZE]; } CUipcEventHandle;
+typedef struct CUipcMemHandle_st { char reserved[VGPU_CU_IPC_HANDLE_SIZE]; } CUipcMemHandle;
 typedef struct CUctx_st* CUcontext;
 typedef struct CUmod_st* CUmodule;
 typedef struct CUfunc_st* CUfunction;
 typedef struct CUstream_st* CUstream;
+typedef struct CUevent_st* CUevent;
 
 typedef enum CUdevice_attribute_enum {
   CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 1,

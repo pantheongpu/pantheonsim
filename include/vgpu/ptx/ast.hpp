@@ -173,7 +173,17 @@ struct OpCvtF16x2 { Reg dst; Operand a, b; bool bf16 = false; };
 // round trip. Flash attention uses it to feed K^T to the second mma.
 struct OpMovMatrix { Reg dst; Operand src; };
 
-struct OpLdMatrix { uint32_t count = 1; bool trans = false; std::vector<Reg> dsts; Addr addr; };
+// ldmatrix.sync.aligned.m8n8.xN[.trans][.shared].b16
+// When ".shared" is named, the address register holds an offset in the shared
+// window; without it the register holds a generic address that cvta has already
+// converted. Both forms occur: llama.cpp cvta's first, Triton does not.
+struct OpLdMatrix {
+  uint32_t count = 1;
+  bool trans = false;
+  bool shared_space = false;
+  std::vector<Reg> dsts;
+  Addr addr;
+};
 
 // mma.sync.aligned.m16n8kK.row.col.<dtype>.<atype>.<btype>.<ctype>
 // The warp-wide tensor-core multiply-accumulate. Distinct from wmma, which is
@@ -200,14 +210,31 @@ struct OpCopysign { Type ty; Reg dst; Operand a, b; };
 struct OpDp4a { bool a_signed = false; bool b_signed = false; Reg dst; Operand a, b, c; };
 // bmsk.{clamp,wrap}.b32 d, a, b -- a contiguous mask of b bits starting at a.
 struct OpBmsk { bool wrap = false; Reg dst; Operand a, b; };
-struct OpIntBin { IntBinOp op = IntBinOp::Add; Type ty; Reg dst; Operand a, b; };
-struct OpMadLo { Type ty; Reg dst; Operand a, b, c; };
+// Extended-precision arithmetic. PTX has a single per-thread condition-code
+// carry bit: ".cc" writes it, and the "addc"/"subc"/"madc" opcodes read it.
+// Compilers chain these to synthesise wider-than-native adds -- Numba builds
+// 64-bit index arithmetic out of them.
+struct OpIntBin {
+  IntBinOp op = IntBinOp::Add;
+  Type ty;
+  Reg dst;
+  Operand a, b;
+  bool carry_in = false;   // addc/subc: add the carry bit into the result
+  bool carry_out = false;  // .cc: leave the carry-out in the condition code
+};
+struct OpMadLo {
+  Type ty;
+  Reg dst;
+  Operand a, b, c;
+  bool carry_in = false;
+  bool carry_out = false;
+};
 struct OpMulWide { uint32_t src_bits = 32; bool is_signed = false; Reg dst; Operand a, b; };  // 32x32 -> 64
 struct OpMadWide { bool is_signed = false; Reg dst; Operand a, b, c; };  // 32x32+64 -> 64
 // High half of a same-width multiply. Compilers emit these to turn integer
 // division by a constant into a multiply, so they show up in ordinary code.
 struct OpMulHi { Type ty; Reg dst; Operand a, b; };
-struct OpMadHi { Type ty; Reg dst; Operand a, b, c; };
+struct OpMadHi { Type ty; Reg dst; Operand a, b, c; bool carry_in = false; bool carry_out = false; };
 struct OpShf { bool left = false; bool wrap = false; Reg dst; Operand a, b, c; };  // funnel shift b:a
 // PTX names an explicit rounding mode on float arithmetic. Unlike .approx,
 // which only relaxes accuracy, these change the result -- quantization kernels

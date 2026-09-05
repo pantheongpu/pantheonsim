@@ -170,6 +170,23 @@ primary interface: it is stable, legible, and clean-room. Static-cudart hosting
 stays behind an env flag as future work. The rule this encodes: prefer a
 documented interface we can maintain over an undocumented one we must chase.
 
+The same rule decides where each JIT framework meets us. All three compile to
+PTX, and PTX is what the interpreter consumes, so the question is only whether
+a framework will hand it over:
+
+- **Numba** assembles its PTX through `cuLinkCreate`/`cuLinkAddData`/
+  `cuLinkComplete`. We implement that family by merging the PTX inputs and
+  returning the merged text as the completed image: on hardware the link step
+  produces a cubin, and here the "cubin" is PTX, because that is what
+  `cuModuleLoadData` loads. Nothing is faked -- `cuLinkComplete` really does
+  yield something the loader accepts.
+- **Triton** goes one step further and runs `ptxas` itself, so what arrives is
+  a cubin. We decline it rather than pretend, and `tools/vgpu_triton.py` ends
+  Triton's pipeline at PTX through its own documented stage hook. A SASS
+  decoder would be the alternative, and SASS is undocumented.
+- **CuPy** links the runtime statically, so it never reaches either path; it
+  needs the dark API above.
+
 Two ABI subtleties that bit us and are now guarded:
 - `cudaDeviceProp` is version-specific. The shim's copy MUST match the toolkit
   that compiled the app, or field writes land at the wrong offsets and smash

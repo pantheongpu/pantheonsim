@@ -158,8 +158,29 @@ interpreter, because a vendor library is not user code — see docs/libraries.md
 for the boundary, the per-library scope, and what each one deliberately refuses.
 
 NVRTC works by invoking the toolkit's own nvcc, which runs on the host and
-needs no GPU -- so runtime-compiled kernels (CuPy, Numba, Triton, inductor)
-reach the interpreter through the driver API like any other PTX.
+needs no GPU, so kernels compiled through NVRTC reach the interpreter through
+the driver API like any other PTX. The JIT frameworks are a separate question,
+because none of them uses NVRTC:
+
+- **Numba works.** It talks to `libcuda` directly and never loads a cudart. It
+  compiles Python to PTX itself and assembles it through `cuLinkCreate` /
+  `cuLinkAddData` / `cuLinkComplete`, which VirtualGPU implements by merging
+  the PTX inputs and returning the merged text as the completed image -- the
+  module loader consumes PTX, so there is no cubin to emit. Verified on shared
+  memory with block reductions, atomics, 2D grids, math intrinsics, a tiled
+  matmul, `shfl_up_sync` scans and streams.
+- **Triton works, with a one-line hook.** It compiles all the way to PTX and
+  then shells out to `ptxas` for a cubin, which is the one artifact in its
+  pipeline VirtualGPU cannot load. `tools/vgpu_triton.py` ends the pipeline at
+  PTX using `knobs.runtime.add_stages_inspection_hook`, Triton's own extension
+  point. Verified on a fused softmax, a `tl.dot` matmul (real `mma.sync` and
+  `ldmatrix`) and an atomic reduction.
+- **CuPy does not work.** It statically links the CUDA runtime rather than
+  loading `libcudart.so`, so `LD_LIBRARY_PATH` never reaches it; its embedded
+  runtime asks the driver for an export table and fails at
+  `getDeviceCount()` with `cudaErrorSoftwareValidityNotEstablished` long
+  before any kernel is compiled. Unblocking it needs the `cuGetExportTable`
+  work below, not anything in the interpreter.
 
 Multi-GPU is verified against real hardware in four places: the local two-GPU
 box, and rented 2x H100 SXM5, 4x H100 SXM5 and 8x A100 80GB instances. All
@@ -216,9 +237,19 @@ sizing, and the write/read pairing between the two kernels -- a block wrote
 `-0.387939 / 3.341256 / 5.117198` and the fixup read back exactly those.
 
 Not fixed here, because it is not this project's bug to fix. What *is* this
-project's to do is diagnose it rather than quietly return different numbers,
-which is the shared-memory race detection in the scheduler work below. This is
-the case to build it against.
+project's to do is diagnose it rather than quietly return different numbers.
+
+That detector now exists: `VGPU_RACE=1` finds this bug in a single run, naming
+the kernel, the PTX line and the two warps involved. It is quiet on SOFT_MAX,
+RMS_NORM, CUMSUM and all three pantheon workloads.
+
+It also reports one candidate in `MUL_MAT` -- a write-write on the same shared
+word from two warps of `mul_mat_q`, with no barrier between them in program
+order. That one is **unverified**. MUL_MAT is correct on all 1253 cases, which
+points to two warps writing the same value redundantly: a race by the strict
+definition, harmless in effect. It is recorded rather than claimed, because
+"the detector found a second bug" and "the detector has a false positive" look
+identical until someone checks.
 
 ## Known out of scope (not CUDA)
 
@@ -245,10 +276,10 @@ the case to build it against.
   (cuMemAddressReserve…), host-pinned memory
 - Frontends: cubin/SASS loading, cuGetProcAddress dispatch, AMD everything
   (HIP, ROCm-SMI, CDNA ISA)
-- Tooling: `vgpu run` (LD_LIBRARY_PATH/LD_PRELOAD wrapper), `vgpu test
-  --matrix`, trace record/replay, schedulers random/adversarial, race
-  detection, OOM injection, characterization/differential-fuzz harness,
-  conformance DB + compat scores
+- Tooling: `vgpu test --matrix`, trace record/replay, schedulers
+  random/adversarial, OOM injection, characterization/differential-fuzz
+  harness, conformance DB + compat scores. (`vgpu run` and shared-memory race
+  detection are done.)
 
 ## Performance
 
@@ -330,9 +361,29 @@ scripts/run-pantheon-workloads.sh.
    `verified` bits in the profiles.
 4. **Static cudart hosting**: satisfy NVIDIA's undocumented driver export
    tables (cuGetExportTable dark API) so binaries built with the *default*
-   (static) cudart also run without a `-cudart shared` rebuild. Partial
-   groundwork exists in the driver shim; deferred as brittle/version-specific.
-5. **More PTX as workloads demand it**: bf16, cp.async, mma.sync and the
-   lane-mask family are done -- driven by llama.cpp's flash attention and by
-   CUB's radix sort, which is the way to pick the next one too. Textures,
-   wgmma and grid sync are what is left of the list.
+   (static) cudart also run without a `-cudart shared` rebuild. **Investigated
+   and stopped, with a reason** -- see docs/dark-api.md for the full bootstrap
+   map. The static runtime asks for seven tables (three of them mandatory:
+   without them the process aborts before `main`), queries the device through
+   the ordinary documented API, and then fails its own validity self-test with
+   `cudaErrorSoftwareValidityNotEstablished`. Three hypotheses were tested and
+   eliminated: a missing table, unfilled out-parameters, and an incomplete
+   device model. The decisive observation is that the runtime never performs a
+   *functional* test -- no allocation, no launch, no result compared -- so the
+   validity decision comes from the table interactions alone. Getting past it
+   means producing exact values for slots with no specification, obtainable
+   only from NVIDIA's internal headers or by disassembling their runtime.
+   Neither is available to a clean-room project, so this stays where it is.
+   Now has two more consumers. Nsight Systems collects through its own bundled
+   CUPTI, loaded by absolute path from its install directory, and that copy
+   reaches the driver the same way -- so `nsys` produces a report with OS
+   runtime traces and no CUDA data. nvprof works, because its path goes through
+   the public CUPTI this does implement. See docs/cupti.md. CuPy is the other:
+   it links the runtime statically and dies in the same place, at
+   `getDeviceCount()`, before it compiles anything.
+5. **More PTX as workloads demand it**: bf16, cp.async, mma.sync, the
+   lane-mask family and the extended-precision carry family (`add.cc`/`addc`,
+   `sub.cc`/`subc`, `mad.lo.cc`/`madc.hi`) are done -- driven by llama.cpp's
+   flash attention, CUB's radix sort and Numba's 64-bit index arithmetic, which
+   is the way to pick the next one too. Textures, wgmma and grid sync are what
+   is left of the list.

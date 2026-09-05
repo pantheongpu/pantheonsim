@@ -1603,4 +1603,309 @@ VTEST(tensor_instructions_are_counted_once_per_warp) {
             2ull * 32);                                                      // per lane
 }
 
+// ---- shared-memory race detection ----
+
+static const char* kRaceKernel = R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<3>;
+    .shared .align 4 .b8 tile[256];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, tile;
+    // Warp 0 writes word 0; warp 1 reads it. NO bar.sync between them, so
+    // which one goes first is not something this program decided.
+    setp.gt.u32 %p1, %r1, 31;
+    @%p1 bra READER;
+    mov.u32 %r3, 7;
+    st.shared.u32 [%r2], %r3;
+    bra DONE;
+READER:
+    ld.shared.u32 %r4, [%r2];
+    st.global.u32 [%rd2], %r4;
+DONE:
+    ret;
+}
+)";
+
+VTEST(a_shared_race_between_warps_is_reported) {
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kRaceKernel);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};   // two warps, so they can race with each other
+  setenv("VGPU_RACE", "1", 1);
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof));
+  unsetenv("VGPU_RACE");
+  VCHECK(err.code() == Err::DataRace);
+  VCHECK_CONTAINS(err.what(), "shared memory");
+  VCHECK_CONTAINS(err.what(), "bar.sync");
+}
+
+VTEST(the_same_kernel_is_silent_when_a_barrier_orders_it) {
+  // The identical accesses, with a bar.sync between the write and the read.
+  // If the detector fired here it would be useless: every real kernel does
+  // this, and a checker that cannot tell ordered from unordered is noise.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<3>;
+    .shared .align 4 .b8 tile[256];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, tile;
+    setp.gt.u32 %p1, %r1, 31;
+    @%p1 bra AFTER;
+    mov.u32 %r3, 7;
+    st.shared.u32 [%r2], %r3;
+AFTER:
+    bar.sync 0;
+    ld.shared.u32 %r4, [%r2];
+    st.global.u32 [%rd2], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  setenv("VGPU_RACE", "1", 1);
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  unsetenv("VGPU_RACE");
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{7});
+}
+
+VTEST(the_racy_kernel_runs_without_complaint_when_detection_is_off) {
+  // Detection is opt-in, and its cost is a shadow word per shared word. A
+  // kernel nobody is checking must not pay for it or be stopped by it.
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kRaceKernel);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+}
+
+VTEST(one_warp_reusing_its_own_shared_words_is_not_a_race) {
+  // A warp racing with itself is impossible: its own accesses are ordered by
+  // the program. A detector that keyed on the word alone would say otherwise.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    .shared .align 4 .b8 tile[256];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r2, tile;
+    mov.u32 %r3, 11;
+    st.shared.u32 [%r2], %r3;
+    ld.shared.u32 %r4, [%r2];
+    add.s32 %r5, %r4, 1;
+    st.shared.u32 [%r2], %r5;
+    ld.shared.u32 %r6, [%r2];
+    st.global.u32 [%rd2], %r6;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};   // one warp
+  setenv("VGPU_RACE", "1", 1);
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  unsetenv("VGPU_RACE");
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{12});
+}
+
+// ---- extended-precision arithmetic (the condition-code carry bit) ----
+//
+// These are what a compiler emits when it synthesises arithmetic wider than the
+// native register: Numba builds every 64-bit array index this way, so a wrong
+// carry shows up as a wrong address rather than a wrong number.
+
+VTEST(add_cc_then_addc_carries_between_halves) {
+  // 0xFFFFFFFF + 1 overflows the low half and must set the carry, which addc
+  // then folds into the high half: {lo=0xFFFFFFFF, hi=0} + 1 == {0, 1}.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 4294967295;
+    mov.u32 %r2, 0;
+    add.cc.u32 %r3, %r1, 1;
+    addc.u32 %r4, %r2, 0;
+    st.global.u32 [%rd2], %r3;
+    st.global.u32 [%rd2+4], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{1});
+}
+
+VTEST(add_cc_leaves_the_carry_clear_when_nothing_overflows) {
+  // The complement of the test above: addc must not invent a carry. Getting
+  // this backwards is invisible in the overflow case and wrong everywhere else.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 5;
+    add.cc.u32 %r3, %r1, 6;
+    addc.u32 %r4, 100, 0;
+    st.global.u32 [%rd2], %r3;
+    st.global.u32 [%rd2+4], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{11});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{100});
+}
+
+VTEST(sub_cc_then_subc_borrows_between_halves) {
+  // {lo=0, hi=1} - 1 == {0xFFFFFFFF, 0}. PTX defines the subtract's carry as
+  // the carry-out of (a + ~b + 1), so a borrow *clears* the bit and subc
+  // subtracts the extra one. Treating a borrow as a set bit gives hi=1 here.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 0;
+    mov.u32 %r2, 1;
+    sub.cc.u32 %r3, %r1, 1;
+    subc.u32 %r4, %r2, 0;
+    st.global.u32 [%rd2], %r3;
+    st.global.u32 [%rd2+4], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0xFFFFFFFFull});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0});
+}
+
+VTEST(mad_lo_cc_and_madc_hi_build_a_64_bit_product) {
+  // The full 64x64 pattern ptxas emits: 0xFFFFFFFF * 3 == 0x2FFFFFFFD, so the
+  // low half wraps and the high half must receive the carry on top of the
+  // product's own high half.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 4294967295;
+    mov.u32 %r2, 3;
+    mad.lo.cc.u32 %r3, %r1, %r2, 0;
+    madc.hi.u32 %r4, %r1, %r2, 0;
+    st.global.u32 [%rd2], %r3;
+    st.global.u32 [%rd2+4], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  // 0xFFFFFFFF * 3 = 0x2_FFFFFFFD
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0xFFFFFFFDull});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{2});
+}
+
+VTEST(the_carry_bit_is_per_lane_not_per_warp) {
+  // Lane 0 overflows and lane 1 does not. A carry bit shared across the warp
+  // would give both lanes the same high half; each lane owns its own.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    // lane 0 adds 0xFFFFFFFF + 1 (overflows), lane 1 adds 1 + 1 (does not)
+    setp.eq.u32 %p1, %r1, 0;
+    selp.b32 %r2, 4294967295, 1, %p1;
+    add.cc.u32 %r3, %r2, 1;
+    addc.u32 %r4, 0, 0;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {2, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{1});      // lane 0 carried
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0});  // lane 1 did not
+}
+
+VTEST(decimal_literals_above_int64_max_keep_their_bit_pattern) {
+  // ptxas prints the float sign-bit mask as decimal 9223372036854775808, which
+  // overflows a signed parse. Rejecting it made every kernel that negates a
+  // double unloadable.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u64 %rd3, 9223372036854775808;
+    st.global.u64 [%rd2], %rd3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 8), uint64_t{0x8000000000000000ull});
+}
+
 VTEST_MAIN

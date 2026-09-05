@@ -70,3 +70,37 @@ shim_sanitizer_nvcc_flags() {
     *) printf '%s' "" ;;
   esac
 }
+
+# pick_nvcc_for_shim <shim_dir>
+# Echoes the path of an nvcc whose toolkit major matches this shim's, or nothing.
+#
+# A machine can have more than one toolkit, and the first nvcc on PATH is often
+# not the one this build directory was configured against. Compiling with the
+# wrong one produces a binary that asks for a soname the shim does not carry,
+# which is a real diagnostic in `vgpu run` and pure noise in a test.
+pick_nvcc_for_shim() {
+  local shim="$1" cand major
+  shopt -s nullglob
+  local libs=("$shim"/libcudart.so.[0-9]*)
+  shopt -u nullglob
+  (( ${#libs[@]} )) || return 0
+  local want="${libs[0]##*.}"
+  for cand in "${VGPU_NVCC:-}" "$(command -v nvcc 2>/dev/null)" /usr/bin/nvcc \
+              /usr/local/cuda/bin/nvcc; do
+    [[ -n "$cand" && -x "$cand" ]] || continue
+    major="$("$cand" --version 2>/dev/null | sed -n 's/.*release \([0-9]*\)[,.].*/\1/p' | head -1)"
+    [[ "$major" == "$want" ]] && { printf '%s' "$cand"; return 0; }
+  done
+  return 0
+}
+
+# nvcc_host_compiler_fix
+# CUDA 12's nvcc rejects GCC 13's <bits/floatn.h> on _Float128 and fails inside
+# <math.h> before it sees any of our code. Pointing it at g++-12 is the standard
+# workaround, and the CI workflow sets the same thing for the same reason;
+# doing it here too means a developer's shell does not have to.
+nvcc_host_compiler_fix() {
+  if [[ -z "${NVCC_PREPEND_FLAGS:-}" ]] && command -v g++-12 >/dev/null 2>&1; then
+    export NVCC_PREPEND_FLAGS="-ccbin g++-12"
+  fi
+}

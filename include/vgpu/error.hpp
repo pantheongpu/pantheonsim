@@ -25,6 +25,7 @@ enum class Err {
   PtxParse,               // syntactically invalid PTX
   UnsupportedPtx,         // valid-looking PTX we do not implement yet
   UninitializedRegister,  // kernel read a register before writing it
+  DataRace,               // two warps reached the same shared word unordered
   LaunchConfig,           // grid/block/shared config violates profile limits
   ExecLimit,              // step budget exceeded (likely infinite loop)
   NotFound,               // module/function lookup failure

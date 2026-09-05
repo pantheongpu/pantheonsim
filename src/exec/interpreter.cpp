@@ -80,6 +80,30 @@ struct BarrierReduction {
   bool complete = false;  // set when the barrier released; cleared when drained
 };
 
+// Shadow state for shared memory, one entry per 4-byte word, used only when
+// race detection is on.
+//
+// The rule a CUDA block promises is simple: two warps may touch the same shared
+// word without a barrier between them only if both are reading. Anything else
+// is a race, and the answer depends on an order the program never specified.
+// Hardware usually hides that -- warps advance together and the window is
+// small -- which is exactly why it is worth checking here.
+//
+// An epoch is the count of barriers the block has completed, so "no barrier
+// between them" is "same epoch". Warps per block cap at 32 (1024 threads), so
+// the set of warps that read a word in an epoch fits in a uint32_t exactly.
+struct WordShadow {
+  uint32_t readers = 0;             // bitmask of warps that read it this epoch
+  uint32_t read_epoch = 0xFFFFFFFF;
+  uint32_t write_epoch = 0xFFFFFFFF;
+  uint16_t writer = 0xFFFF;         // warp that wrote it, 0xFFFF for none
+};
+
+struct SharedShadow {
+  std::vector<WordShadow> words;
+  uint32_t epoch = 0;
+};
+
 struct BlockCtx {
   std::array<uint32_t, 3> ctaid{};
   std::array<uint32_t, 3> ntid{};
@@ -88,6 +112,7 @@ struct BlockCtx {
   // leaves it undefined, VirtualGPU makes it deterministic (documented).
   std::vector<uint8_t>* shared = nullptr;
   BarrierReduction* bar_red = nullptr;
+  SharedShadow* shadow = nullptr;   // non-null only when race detection is on
 };
 
 // One diverged execution path: a set of lanes sharing a program counter.
@@ -148,6 +173,9 @@ struct Warp {
   std::unordered_map<std::string, Lanes> slots;  // call-argument slots
   std::vector<std::vector<uint8_t>> local;       // per-lane .local frames (lazy)
   std::array<uint32_t, kWarpSize> tid_x{}, tid_y{}, tid_z{};
+  // PTX's condition-code carry bit, one per lane. Written by ".cc" arithmetic
+  // and read by addc/subc/madc; nothing else in the ISA touches it.
+  Mask carry = 0;
   std::unique_ptr<AsyncCopies> cp;  // created on the first cp.async
 };
 
@@ -155,10 +183,17 @@ struct Warp {
 // rather than a getenv on a hot path, and a process that changes the variable
 // between launches gets what it asked for.
 std::atomic<bool> g_strict{false};
+std::atomic<bool> g_race{false};
 
-void refresh_strict_mode() {
-  const char* v = std::getenv("VGPU_STRICT");
-  g_strict.store(v && v[0] == '1', std::memory_order_relaxed);
+// Sampled together, once per launch. Caching either in a function-local static
+// makes it depend on which kernel in a process ran first -- which is how the
+// race detector's own test came to pass a racy kernel: an earlier launch had
+// already frozen the flag to false.
+void refresh_modes() {
+  const char* strict = std::getenv("VGPU_STRICT");
+  g_strict.store(strict && strict[0] == '1', std::memory_order_relaxed);
+  const char* race = std::getenv("VGPU_RACE");
+  g_race.store(race && race[0] == '1', std::memory_order_relaxed);
 }
 
 // IEEE 754 binary16 <-> double, implemented in software so the engine needs no
@@ -288,6 +323,11 @@ class Interpreter {
     ctx.shared = &shared;
     BarrierReduction bar_red;
     ctx.bar_red = &bar_red;
+    SharedShadow shadow;
+    if (detect_races() && !shared.empty()) {
+      shadow.words.assign(shared.size() / 4 + 1, WordShadow{});
+      ctx.shadow = &shadow;
+    }
     uint64_t total = uint64_t{ctx.ntid[0]} * ctx.ntid[1] * ctx.ntid[2];
     size_t nwarps = static_cast<size_t>((total + kWarpSize - 1) / kWarpSize);
     std::vector<Warp> warps(nwarps);
@@ -326,10 +366,15 @@ class Interpreter {
           }
         // Every warp has now arrived, so a bar.red in flight has its answer.
         if (any_waiting) bar_red.complete = true;
+        // ...and the barrier they arrived at orders everything before it
+        // against everything after, which is what ends the epoch.
+        if (any_waiting && ctx.shadow) ++ctx.shadow->epoch;
         if (!any_waiting) return;  // all Done
         continue;
       }
-      run_warp_until_yield(warps[sched.pick(runnable)], ctx);
+      const size_t picked = sched.pick(runnable);
+      cur_warp_ = static_cast<uint32_t>(picked);
+      run_warp_until_yield(warps[picked], ctx);
     }
   }
 
@@ -758,6 +803,49 @@ class Interpreter {
     return addr >= kSharedVaBase && addr < kSharedVaBase + kSharedVaSize;
   }
 
+  // Race detection, off unless VGPU_RACE=1.
+  static bool detect_races() { return g_race.load(std::memory_order_relaxed); }
+
+  [[noreturn]] void report_race(const Instr& ins, const char* what, uint64_t word,
+                                uint32_t other_warp) {
+    ctx_fail(ins, -1, Err::DataRace,
+             std::string(what) + " on shared memory at byte offset " +
+                 std::to_string(word * 4) + ": warp " + std::to_string(cur_warp_) +
+                 " and warp " + std::to_string(other_warp) +
+                 " both reach it with no bar.sync between them, so which one wins is not "
+                 "something the program decided. Hardware usually hides this because warps "
+                 "advance together; it is a real race either way");
+  }
+
+  void note_shared_access(const BlockCtx& ctx, const Instr& ins, uint64_t addr, uint32_t bytes,
+                          bool is_write) {
+    if (!ctx.shadow) return;
+    SharedShadow& sh = *ctx.shadow;
+    const uint64_t first = (addr - kSharedVaBase) / 4;
+    const uint64_t last = (addr - kSharedVaBase + (bytes ? bytes - 1 : 0)) / 4;
+    for (uint64_t w = first; w <= last && w < sh.words.size(); ++w) {
+      WordShadow& s = sh.words[w];
+      if (is_write) {
+        if (s.write_epoch == sh.epoch && s.writer != 0xFFFF && s.writer != cur_warp_)
+          report_race(ins, "write-write race", w, s.writer);
+        if (s.read_epoch == sh.epoch) {
+          const uint32_t others = s.readers & ~(1u << cur_warp_);
+          if (others) report_race(ins, "read-write race", w, __builtin_ctz(others));
+        }
+        s.writer = static_cast<uint16_t>(cur_warp_);
+        s.write_epoch = sh.epoch;
+      } else {
+        if (s.write_epoch == sh.epoch && s.writer != 0xFFFF && s.writer != cur_warp_)
+          report_race(ins, "write-read race", w, s.writer);
+        if (s.read_epoch != sh.epoch) {
+          s.readers = 0;
+          s.read_epoch = sh.epoch;
+        }
+        s.readers |= (1u << cur_warp_);
+      }
+    }
+  }
+
   void check_shared(const BlockCtx& ctx, const Instr& ins, int lane, uint64_t addr, uint32_t size) {
     uint64_t off = addr - kSharedVaBase;
     size_t have = ctx.shared ? ctx.shared->size() : 0;
@@ -788,6 +876,7 @@ class Interpreter {
                        uint32_t size) {
     if (is_shared(addr)) {
       check_shared(ctx, ins, static_cast<int>(lane), addr, size);
+      note_shared_access(ctx, ins, addr, size, /*is_write=*/false);
       uint64_t v = 0;
       std::memcpy(&v, ctx.shared->data() + (addr - kSharedVaBase), size);
       return v;
@@ -809,6 +898,7 @@ class Interpreter {
                     uint32_t size, uint64_t value) {
     if (is_shared(addr)) {
       check_shared(ctx, ins, static_cast<int>(lane), addr, size);
+      note_shared_access(ctx, ins, addr, size, /*is_write=*/true);
       std::memcpy(ctx.shared->data() + (addr - kSharedVaBase), &value, size);
       return;
     }
@@ -985,8 +1075,12 @@ class Interpreter {
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = int_bin(op->op, op->ty, a[lane], b[lane], ins);
+      if (op->carry_in || op->carry_out) {
+        exec_carry_add_sub(w, *op, a, b, m, r);
+      } else {
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+          if (m & (1u << lane)) r[lane] = int_bin(op->op, op->ty, a[lane], b[lane], ins);
+      }
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1061,8 +1155,15 @@ class Interpreter {
       Lanes _s_c;
       const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = a[lane] * b[lane] + c[lane];
+      if (op->carry_in || op->carry_out) {
+        Lanes prod;
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+          if (m & (1u << lane)) prod[lane] = a[lane] * b[lane];
+        exec_carry_mad(w, op->ty.bits, op->carry_in, op->carry_out, prod, c, m, r);
+      } else {
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+          if (m & (1u << lane)) r[lane] = a[lane] * b[lane] + c[lane];
+      }
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1546,8 +1647,15 @@ class Interpreter {
       Lanes _s_b; const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes _s_c; const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = mul_hi(op->ty, a[lane], b[lane]) + c[lane];
+      if (op->carry_in || op->carry_out) {
+        Lanes prod;
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+          if (m & (1u << lane)) prod[lane] = mul_hi(op->ty, a[lane], b[lane]);
+        exec_carry_mad(w, op->ty.bits, op->carry_in, op->carry_out, prod, c, m, r);
+      } else {
+        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+          if (m & (1u << lane)) r[lane] = mul_hi(op->ty, a[lane], b[lane]) + c[lane];
+      }
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1800,9 +1908,12 @@ class Interpreter {
   void exec_ldmatrix(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLdMatrix& op, Mask m) {
     Lanes _s_base;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
-    // The register already holds an address in the shared window -- it comes
-    // from cvta, which has done the space conversion. Adding the window base
-    // again lands at twice it, which is what the bounds check reported.
+    // Without ".shared" the register already holds an address in the shared
+    // window -- it comes from cvta, which has done the space conversion, and
+    // adding the window base again lands at twice it. With ".shared" the
+    // instruction names the space itself and the register is a bare offset, so
+    // the base has to be applied here instead.
+    const uint64_t window = op.shared_space ? space_base(Space::Shared) : 0;
     for (uint32_t mat = 0; mat < op.count; ++mat) {
       // Pull the 8x8 matrix in, a row at a time.
       uint16_t tile[8][8] = {};
@@ -1811,7 +1922,7 @@ class Interpreter {
         if (!(m & (1u << src_lane)))
           ctx_fail(ins, static_cast<int>(src_lane), Err::UnsupportedPtx,
                    "ldmatrix needs every lane that supplies a row address to be active");
-        const uint64_t addr = base[src_lane] + static_cast<uint64_t>(op.addr.offset);
+        const uint64_t addr = window + base[src_lane] + static_cast<uint64_t>(op.addr.offset);
         for (uint32_t c = 0; c < 8; ++c)
           tile[r][c] = static_cast<uint16_t>(
               load_routed(w, ctx, ins, src_lane, addr + c * 2, 2));
@@ -1838,6 +1949,57 @@ class Interpreter {
   // produces: lane L holds row L/4, columns 2*(L%4) and 2*(L%4)+1, packed into
   // one 32-bit register. Transposing it is a matter of re-gathering, since
   // every element already lives somewhere in the warp.
+  // The addend half of mad.{lo,hi}.cc / madc: the multiply has already been
+  // reduced to one value per lane, and only its addition with c touches the
+  // carry bit. The product's own overflow is discarded -- ".lo" and ".hi" have
+  // each already chosen which half of it survives.
+  void exec_carry_mad(Warp& w, uint32_t bits, bool carry_in, bool carry_out, const Lanes& prod,
+                      const Lanes& c, Mask m, Lanes& r) {
+    Mask out = w.carry;
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      if (!(m & (1u << lane))) continue;
+      const uint64_t p = mask_to_bits(prod[lane], bits);
+      const uint64_t addend = mask_to_bits(c[lane], bits);
+      const uint64_t cin = carry_in ? ((w.carry >> lane) & 1u) : 0u;
+      const uint64_t sum = mask_to_bits(p + addend + cin, bits);
+      r[lane] = sum;
+      if (carry_out) {
+        const bool cout = (sum < p) || (cin && sum == p);
+        out = (out & ~(Mask{1} << lane)) | (Mask{cout} << lane);
+      }
+    }
+    if (carry_out) w.carry = out;
+  }
+
+  // add/sub with the condition-code carry bit. PTX defines subtraction's carry
+  // as the carry-out of (a + ~b + 1), so a borrow clears the bit rather than
+  // setting it -- which is what makes "sub.cc" then "subc" chain correctly into
+  // a wider subtract.
+  void exec_carry_add_sub(Warp& w, const OpIntBin& op, const Lanes& a, const Lanes& b, Mask m,
+                          Lanes& r) {
+    const uint32_t bits = op.ty.bits;
+    const bool sub = (op.op == IntBinOp::Sub);
+    Mask out = w.carry;
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      if (!(m & (1u << lane))) continue;
+      const uint64_t x = mask_to_bits(a[lane], bits);
+      // For a subtract the carry-in defaults to 1 (the +1 of two's complement);
+      // subc supplies the previous carry-out in its place.
+      const uint64_t cin =
+          op.carry_in ? ((w.carry >> lane) & 1u) : (sub ? 1u : 0u);
+      const uint64_t y = sub ? mask_to_bits(~b[lane], bits) : mask_to_bits(b[lane], bits);
+      const uint64_t sum = mask_to_bits(x + y + cin, bits);
+      r[lane] = sum;
+      if (op.carry_out) {
+        // Unsigned overflow: the sum wrapped below either addend, or landed
+        // exactly on one because the carry-in pushed it around.
+        const bool cout = (sum < x) || (cin && sum == x);
+        out = (out & ~(Mask{1} << lane)) | (Mask{cout} << lane);
+      }
+    }
+    if (op.carry_out) w.carry = out;
+  }
+
   void exec_movmatrix(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMovMatrix& op,
                       Mask m) {
     Lanes _s_a;
@@ -2802,6 +2964,7 @@ class Interpreter {
   // One entry per instruction, filled on first use. Classifying costs a chain
   // of variant tests, and the instruction stream is the hottest path there is.
   mutable std::vector<uint8_t> class_by_pc_;
+  uint32_t cur_warp_ = 0;     // which warp of the block is running, for race reports
   bool concurrent_ = false;   // set when the grid is split across threads
   std::chrono::steady_clock::time_point last_progress_;
 };
@@ -2991,7 +3154,7 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
                    const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
                    const DeviceProfile& profile, const SymbolTable* symbols,
                    const ProgressFn& progress) {
-  refresh_strict_mode();
+  refresh_modes();
   validate(fn, cfg, profile);
   LaunchConfig eff = cfg;
   eff.max_steps = effective_max_steps(cfg.max_steps);

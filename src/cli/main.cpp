@@ -29,6 +29,9 @@ int usage(FILE* to) {
                "                                       Live view of running virtual GPUs\n"
                "  vgpu serve --gpu <id> [--count N] [--load 0..1] [--alloc-mb N]\n"
                "                                       Present a virtual rack for monitoring tools\n"
+               "  vgpu run [opts] <program> [args...]  Run a program against VirtualGPU, with the\n"
+               "                                       simulator's CUDA libraries in front of the\n"
+               "                                       real ones (vgpu run --help for options)\n"
                "  vgpu shell                           Interactive machine simulator: pick a GPU,\n"
                "                                       CUDA/driver and OS, then get a shell where\n"
                "                                       nvidia-smi/rocm-smi/lspci/dmesg all work\n"
@@ -125,6 +128,8 @@ int demo_vectoradd(const std::string& gpu, long long n);
 int cmd_smi(const std::vector<std::string>& args);
 int cmd_serve(const std::vector<std::string>& args);
 int cmd_shell(const std::vector<std::string>& args);
+// Implemented in run.cpp.
+int cmd_run(const std::vector<std::string>& args);
 
 int main(int argc, char** argv) {
   std::vector<std::string> args(argv + 1, argv + argc);
@@ -141,6 +146,7 @@ int main(int argc, char** argv) {
     if (cmd == "smi") return cmd_smi({args.begin() + 1, args.end()});
     if (cmd == "serve") return cmd_serve({args.begin() + 1, args.end()});
     if (cmd == "shell") return cmd_shell({args.begin() + 1, args.end()});
+    if (cmd == "run") return cmd_run({args.begin() + 1, args.end()});
     if (cmd == "info") {
       std::string gpu;
       bool json = false;

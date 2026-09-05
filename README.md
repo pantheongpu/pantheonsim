@@ -39,6 +39,7 @@ Working today, all CPU-only:
 | Fatbin | extracts embedded PTX from nvcc fatbins (uncompressed, zstd and LZ4 — so binaries from CUDA 12 and 13 both work) |
 | Multi-GPU | a virtual rack of N devices with disjoint address windows; peer copies and per-device isolation match a real two-GPU machine |
 | Vendor libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP and nvJPEG under their real sonames, each differential-tested against NVIDIA's own library on a physical GPU — see [docs/libraries.md](docs/libraries.md) |
+| Python JIT | Numba runs unmodified (its PTX is assembled through the driver's JIT link API); Triton runs with a one-line hook that stops its pipeline at PTX — see [docs/jit.md](docs/jit.md) |
 | Discovery | live telemetry + NVML; drop-in `nvidia-smi`, `rocm-smi`, `rocm_agent_enumerator`, and `lspci` output — see [docs/telemetry.md](docs/telemetry.md) |
 | NVENC | `libnvidia-encode.so.1` with a deterministic content-derived encoder, so video-encode SDC tests run |
 | Proof | an nvcc-compiled CUDA program **and** the unmodified pantheon stress kernels run on the CPU; `memory_read` differential-matches a physical RTX 3060 (incl. fault injection + device printf) |
@@ -50,10 +51,12 @@ Known limitations (deliberate, documented):
 - Unmodified apps must link **shared** cudart (`nvcc -cudart shared`) so the
   loader can substitute VirtualGPU's `libcudart.so.13`. The source is untouched;
   hosting a *statically* linked cudart needs NVIDIA's undocumented driver export
-  tables and is future work.
+  tables and is future work. This is what stops CuPy, which links cudart
+  statically — see [docs/jit.md](docs/jit.md).
 - `wmma` fragment layout is VirtualGPU's own (PTX leaves it unspecified) —
-  see ARCHITECTURE.md D8. bf16, `cp.async`, `mma.sync`, and textures are not
-  implemented. Every gap fails loudly (instruction, PTX line, kernel,
+  see ARCHITECTURE.md D8. bf16, `cp.async`, `mma.sync`, `ldmatrix` and the
+  extended-precision carry family are implemented; textures, surfaces, `wgmma`
+  and grid sync are not. Every gap fails loudly (instruction, PTX line, kernel,
   profile), never silently.
 - OptiX (ray tracing) and NVENC (video encode) are separate NVIDIA
   subsystems, not CUDA, and are out of scope.
@@ -94,8 +97,18 @@ for, and CUDA programs run on the CPU engine. See
 # Build the app from unmodified source against shared cudart, then run it on a
 # virtual GPU — no physical GPU involved.
 nvcc -cudart shared my_app.cu -o my_app
-scripts/vgpu-run.sh --gpu nvidia/h200 ./my_app
+build/vgpu run --gpu nvidia/h200 ./my_app
 ```
+
+`vgpu run` puts the simulator's CUDA libraries in front of the real ones and
+execs the program in place, so its exit code and signals are its own. Before it
+does, it reads the binary's dynamic section and reports the two things that
+otherwise fail silently: a CUDA soname this build of the shim does not carry
+(a CUDA 12 program against a CUDA 13 shim), and a `DT_RPATH` naming a directory
+that holds the real libraries — the one search path the loader consults *before*
+`LD_LIBRARY_PATH`, which `--preload` gets past. `vgpu run --help` lists the
+device, execution and diagnostic options (`--race`, `--strict`, `--counters`,
+`--print-env`).
 
 All 44 CUDA workloads in the pantheon stress/diagnostics suite run this way
 unchanged:
@@ -132,6 +145,7 @@ Environment knobs:
 | `VGPU_VRAM_MB` | virtual VRAM size, overriding the profile | profile |
 | `VGPU_STRICT` | `1` turns on the checks that catch bugs hardware hides but that real compiler output trips over: integer division by zero, and storing a register nothing has written | unset |
 | `VGPU_COUNTERS` | `1` prints exact per-launch performance counters | unset |
+| `VGPU_RACE` | `1` reports unordered shared-memory access between warps | unset |
 
 `VGPU_COUNTERS` reports what a profiler reports, except that every number is
 counted rather than sampled. Instructions and thread-instructions (their ratio
@@ -166,6 +180,17 @@ There is no timing model and no cache model here, so there are no cycles, no
 stall reasons and no hit rates. Those are the numbers a profiler is mostly
 made of, and inventing them would be worse than not having them.
 
+`VGPU_RACE` checks the rule a CUDA block promises: two warps may touch the same
+shared word without a `bar.sync` between them only if both are reading.
+Anything else is a race, and which warp wins is not something the program
+decided. Hardware usually hides this -- warps advance together and the window
+is small -- which is exactly why it is worth checking somewhere that does not.
+
+It is off by default because it costs a shadow word per shared word, and on
+because you are looking for something. It found the flash-attention race in
+llama.cpp in one run, naming the kernel, the PTX line and both warps; that same
+bug took a day to corner by bisection.
+
 `VGPU_STRICT` is off by default for a reason worth knowing. Both of those
 checks find real bugs, and both fire on code that is perfectly correct: ptxas
 emits arithmetic whose result is dead, ggml divides by a stride its
@@ -192,7 +217,7 @@ which real GPUs cannot give you cheaply.
 
 1. Shared memory, warp shuffles, more PTX → broader kernel coverage
 2. Static-cudart hosting (driver export tables) → no `-cudart shared` rebuild
-3. `vgpu run` / `vgpu test --matrix` across profiles
+3. `vgpu test --matrix` across profiles (`vgpu run` is done)
 4. Hardware characterization + differential fuzzing against physical GPUs
    (oracle machines) → verified profiles, conformance database, compat scores
 5. Random/adversarial warp scheduling → race detection
