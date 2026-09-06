@@ -1631,6 +1631,98 @@ DONE:
 }
 )";
 
+// ---- cooperative launch: a grid-wide barrier ----
+//
+// cg::this_grid().sync() is not an instruction. It compiles to an atomic
+// increment of a counter in global memory followed by a spin on that counter,
+// so it only terminates if the blocks that have not arrived yet can still run.
+// This is that pattern written directly: each block adds one to a counter, then
+// spins until the counter reaches the block count, then reads a word another
+// block wrote.
+static const char* kGridBarrierKernel = R"(
+.visible .entry k(.param .u64 counter, .param .u64 out)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [counter];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %nctaid.x;
+    // Each block writes its own id + 1 into out[blockIdx].
+    mul.wide.u32 %rd5, %r1, 4;
+    add.s64 %rd6, %rd4, %rd5;
+    add.s32 %r3, %r1, 1;
+    st.global.u32 [%rd6], %r3;
+    // Arrive.
+    // One thread per block, so the arrival is one increment per block with no
+    // intra-block divergence to reason about -- this is a test of the grid
+    // barrier, not of how a block gathers its own threads first.
+    mov.u32 %r4, 1;
+    atom.add.release.gpu.global.u32 %r5, [%rd3], %r4;
+    // Spin until every block has arrived.
+SPIN:
+    ld.acquire.gpu.global.u32 %r6, [%rd3];
+    setp.lt.u32 %p1, %r6, %r2;
+    @%p1 bra SPIN;
+    // Now read the word the *next* block wrote. Only correct if the barrier
+    // held: without it this block may arrive before that one has written.
+    add.s32 %r7, %r1, 1;
+    rem.u32 %r8, %r7, %r2;
+    mul.wide.u32 %rd7, %r8, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.global.u32 %r9, [%rd8];
+    // Stash it at out[nctaid + blockIdx] so the check can see both halves.
+    add.s32 %r10, %r1, %r2;
+    mul.wide.u32 %rd9, %r10, 4;
+    add.s64 %rd10, %rd4, %rd9;
+    st.global.u32 [%rd10], %r9;
+    ret;
+}
+)";
+
+VTEST(a_cooperative_launch_lets_blocks_wait_for_each_other) {
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kGridBarrierKernel);
+  uint64_t counter = e.mem.alloc(4);
+  uint64_t out = e.mem.alloc(64);
+  e.mem.store_scalar(counter, 4, 0);
+  LaunchConfig cfg;
+  cfg.grid = {4, 1, 1};
+  cfg.block = {1, 1, 1};
+  cfg.cooperative = true;
+  exec::launch(m.entries[0], cfg, {arg_u64(counter), arg_u64(out)}, e.mem, e.prof);
+  // Every block arrived.
+  VCHECK_EQ(e.mem.load_scalar(counter, 4), uint64_t{4});
+  // ...and each read the next block's value, which only the barrier makes safe.
+  for (uint32_t b = 0; b < 4; ++b) {
+    VCHECK_EQ(e.mem.load_scalar(out + b * 4, 4), uint64_t{b + 1});
+    VCHECK_EQ(e.mem.load_scalar(out + (4 + b) * 4, 4), uint64_t{(b + 1) % 4 + 1});
+  }
+}
+
+// The same kernel without the cooperative flag must NOT quietly work: blocks
+// run one at a time, so the first to spin waits for a block that has not
+// started. That is a hang, and the step budget is what turns a hang into a
+// diagnosable error rather than a wedged process.
+VTEST(the_same_kernel_without_a_cooperative_launch_does_not_hang_forever) {
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kGridBarrierKernel);
+  uint64_t counter = e.mem.alloc(4);
+  uint64_t out = e.mem.alloc(64);
+  e.mem.store_scalar(counter, 4, 0);
+  LaunchConfig cfg;
+  cfg.grid = {4, 1, 1};
+  cfg.block = {1, 1, 1};
+  cfg.cooperative = false;
+  cfg.max_steps = 100000;  // small, so the spin is caught quickly
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(counter), arg_u64(out)},
+                                          e.mem, e.prof));
+  VCHECK(err.code() == Err::ExecLimit);
+}
+
 VTEST(a_shared_race_between_warps_is_reported) {
   Env e;
   auto m = ptx::parse(std::string(kHeader) + kRaceKernel);

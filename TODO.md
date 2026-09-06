@@ -413,5 +413,22 @@ scripts/run-pantheon-workloads.sh.
    lane-mask family and the extended-precision carry family (`add.cc`/`addc`,
    `sub.cc`/`subc`, `mad.lo.cc`/`madc.hi`) are done -- driven by llama.cpp's
    flash attention, CUB's radix sort and Numba's 64-bit index arithmetic, which
-   is the way to pick the next one too. Textures, wgmma and grid sync are what
-   is left of the list.
+   is the way to pick the next one too.
+
+   **Grid sync is done**, and it turned out not to be a PTX gap at all.
+   `cg::this_grid().sync()` compiles to no special instruction: it is an atomic
+   increment of a counter in device memory and a spin on that counter, using
+   ops the interpreter already had. What it needs is a *scheduler* that holds
+   every block resident and interleaves them -- running blocks one at a time,
+   which the programming model permits and this did, deadlocks the first block
+   to arrive. Blocks are now suspendable, a cooperative launch round-robins
+   them with a bounded turn so a spinning warp yields, and the barrier's
+   workspace address is served through `%envreg1`/`%envreg2` the way the driver
+   supplies it. `cudaLaunchCooperativeKernel` and `cuLaunchCooperativeKernel`
+   refuse a grid too large to be resident, because such a kernel does not run
+   slowly, it hangs. See docs/cooperative.md.
+
+   Textures/surfaces and wgmma are what is left. Neither is used by llama.cpp
+   or by any pantheon workload today, so neither is workload-driven yet:
+   `tex.1d`/`tex.2d`/`suld`/`sust` plus the texture-object runtime API is the
+   larger and more generally useful of the two.

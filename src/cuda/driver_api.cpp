@@ -128,6 +128,11 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
       // Inside a kernel these are the moral equivalent of a device-side fault.
       return kernel_context ? CUDA_ERROR_ILLEGAL_ADDRESS : CUDA_ERROR_INVALID_VALUE;
     case Err::UninitializedRegister: return CUDA_ERROR_ILLEGAL_ADDRESS;
+    // Both of these reached the switch's fallthrough before, and so were
+    // reported as CUDA_ERROR_UNKNOWN -- the least informative code available,
+    // for the two conditions this project most wants to be legible.
+    case Err::Trap: return CUDA_ERROR_ILLEGAL_INSTRUCTION;
+    case Err::DataRace: return CUDA_ERROR_LAUNCH_FAILED;
     case Err::DoubleFree:
     case Err::InvalidFree:
     case Err::InvalidValue:
@@ -328,7 +333,11 @@ int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
     case 88: return 0;                               // PAGEABLE_MEMORY_ACCESS
     case 89: return 0;                               // CONCURRENT_MANAGED_ACCESS
     case 91: return 0;                               // CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM
-    case 95: return 0;                               // COOPERATIVE_LAUNCH (no grid sync yet)
+    // COOPERATIVE_LAUNCH: cudaLaunchCooperativeKernel works, because the
+    // scheduler can hold every block resident and interleave them. The
+    // multi-device form (96) needs grids on separate devices waiting on each
+    // other, which it cannot.
+    case 95: return 1;
     case 96: return 0;                               // COOPERATIVE_MULTI_DEVICE_LAUNCH
     case 100: return 0;                              // PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES
     case 101: return 0;                              // DIRECT_MANAGED_MEM_ACCESS_FROM_HOST
@@ -1002,11 +1011,13 @@ VGPU_EXPORT CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const
   });
 }
 
-VGPU_EXPORT CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
-                                    unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY,
-                                    unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream,
-                                    void** kernelParams, void** extra) {
-  return api("cuLaunchKernel", true, true, [&](ShimState& s) {
+namespace {
+CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int gridDimX,
+                              unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX,
+                              unsigned int blockDimY, unsigned int blockDimZ,
+                              unsigned int sharedMemBytes, CUstream hStream, void** kernelParams,
+                              void** extra, bool cooperative) {
+  return api(api_name, true, true, [&](ShimState& s) {
     uintptr_t fh = reinterpret_cast<uintptr_t>(f);
     if ((fh & 7) == kTagKernel) fh = kernel_to_function(s, fh);  // CUkernel is launchable directly
     check_handle(fh, kTagFunc, "function");
@@ -1035,9 +1046,34 @@ VGPU_EXPORT CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigne
     cfg.grid = {gridDimX, gridDimY, gridDimZ};
     cfg.block = {blockDimX, blockDimY, blockDimZ};
     cfg.shared_bytes = sharedMemBytes;
+    cfg.cooperative = cooperative;
+    if (cooperative) {
+      // Every block of a cooperative launch waits for every other, so a grid
+      // that cannot all be resident does not run slowly -- it hangs. Hardware
+      // refuses it, and so does this.
+      const vgpu::DeviceProfile& p = s.rt->device(rec.device).profile();
+      const uint64_t resident = uint64_t{p.limits.max_blocks_per_sm} * p.limits.multiprocessors;
+      const uint64_t want = uint64_t{gridDimX} * gridDimY * gridDimZ;
+      if (resident && want > resident)
+        throw vgpu::Error::make(vgpu::Err::LaunchConfig, "cooperative launch of ", want,
+                                " blocks exceeds what ", p.id, " can hold resident (",
+                                p.limits.max_blocks_per_sm, " blocks/SM x ",
+                                p.limits.multiprocessors, " SMs = ", resident, ")");
+    }
     s.rt->device(rec.device).launch(*rec.fn, cfg, args, rec.syms);
     return CUDA_SUCCESS;
   });
+}
+}  // namespace
+
+VGPU_EXPORT CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
+                                    unsigned int gridDimZ, unsigned int blockDimX,
+                                    unsigned int blockDimY, unsigned int blockDimZ,
+                                    unsigned int sharedMemBytes, CUstream hStream,
+                                    void** kernelParams, void** extra) {
+  return launch_kernel_common("cuLaunchKernel", f, gridDimX, gridDimY, gridDimZ, blockDimX,
+                              blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra,
+                              /*cooperative=*/false);
 }
 
 /* ======================================================================== */
@@ -1258,13 +1294,14 @@ CUresult memset_impl(const char* name, CUdeviceptr dptr, T value, size_t n) {
  * results if run as an ordinary launch, and a JIT-linked module that quietly
  * did nothing would surface much later as a wrong answer.
  */
-VGPU_EXPORT CUresult cuLaunchCooperativeKernel(CUfunction, unsigned int, unsigned int, unsigned int,
-                                               unsigned int, unsigned int, unsigned int,
-                                               unsigned int, CUstream, void**) {
-  // Cooperative launch guarantees every block is resident so grid-wide
-  // synchronisation is safe. The interpreter schedules blocks across host
-  // threads in ranges, which does not provide that guarantee.
-  return CUDA_ERROR_NOT_SUPPORTED;
+VGPU_EXPORT CUresult cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX,
+                                               unsigned int gridDimY, unsigned int gridDimZ,
+                                               unsigned int blockDimX, unsigned int blockDimY,
+                                               unsigned int blockDimZ, unsigned int sharedMemBytes,
+                                               CUstream hStream, void** kernelParams) {
+  return launch_kernel_common("cuLaunchCooperativeKernel", f, gridDimX, gridDimY, gridDimZ,
+                              blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream,
+                              kernelParams, nullptr, /*cooperative=*/true);
 }
 // The JIT-link types are not in the header subset this file compiles against;
 // these take opaque parameters because they only need to exist and refuse.

@@ -634,7 +634,12 @@ class Parser {
       if (it != sreg_table().end()) return SregOperand{it->second};
       // %envreg0 .. %envreg31 all read as zero; they are only distinguished by
       // number for a driver that sets them, and this one does not.
-      if (w.rfind("%envreg", 0) == 0) return SregOperand{Sreg::EnvReg};
+      // %envreg0..31 is a bank the driver fills in before the launch. Which
+      // one is asked for matters: a cooperative launch puts the address of its
+      // grid-barrier workspace in %envreg1 and %envreg2.
+      if (w.rfind("%envreg", 0) == 0)
+        return SregOperand{Sreg::EnvReg,
+                           static_cast<uint32_t>(std::atoi(w.c_str() + 7))};
       // A %-name that was never declared is a special register this engine does
       // not implement, not a register that happens to be unwritten. Letting it
       // through as an ordinary register made %lanemask_le read as zero, which
