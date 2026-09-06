@@ -472,12 +472,22 @@ VGPU_EXPORT cudaError_t cudaLaunchCooperativeKernel(const void* func, dim3 gridD
                             stream, /*cooperative=*/true);
 }
 
-// The multi-device form needs peer grids waiting on each other across devices.
-// Refused rather than run as if it were single-device, which would deadlock or
-// silently compute the wrong thing.
-VGPU_EXPORT cudaError_t cudaLaunchCooperativeKernelMultiDevice(void*, unsigned int, unsigned int) {
+// The multi-device form needs peer grids on separate devices waiting on each
+// other. Refused rather than run as if it were single-device, which would
+// deadlock or silently compute the wrong thing.
+//
+// Deprecated in CUDA 12 and removed in 13, so it is only defined when the
+// toolkit still declares it -- and its first parameter is cudaLaunchParams*,
+// not void*. A mismatch here is a hard error rather than a subtle one, because
+// the vendor header is included: C linkage makes two declarations of the same
+// name with different types a conflict, which is exactly the check that caught
+// this.
+#if CUDART_VERSION < 13000
+VGPU_EXPORT cudaError_t cudaLaunchCooperativeKernelMultiDevice(struct cudaLaunchParams*,
+                                                               unsigned int, unsigned int) {
   return cudaErrorNotSupported;
 }
+#endif
 
 /* ===================================================================== */
 /* Device management                                                     */

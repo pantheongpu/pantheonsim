@@ -1703,10 +1703,17 @@ VTEST(a_cooperative_launch_lets_blocks_wait_for_each_other) {
   }
 }
 
-// The same kernel without the cooperative flag must NOT quietly work: blocks
+// The same kernel without the cooperative flag must not quietly work: blocks
 // run one at a time, so the first to spin waits for a block that has not
-// started. That is a hang, and the step budget is what turns a hang into a
+// started. That is a hang, and the step budget is what turns it into a
 // diagnosable error rather than a wedged process.
+//
+// VGPU_THREADS=1 is the point of the test, not a workaround for it. An ordinary
+// launch is free to run blocks on parallel workers, and when it does, a grid
+// barrier can be satisfied by luck -- which is precisely why grid.sync()
+// outside a cooperative launch is undefined rather than merely slow. Pinning to
+// one worker asks the question the test means to ask: with blocks run in
+// sequence, does the spin get diagnosed?
 VTEST(the_same_kernel_without_a_cooperative_launch_does_not_hang_forever) {
   Env e;
   auto m = ptx::parse(std::string(kHeader) + kGridBarrierKernel);
@@ -1718,8 +1725,10 @@ VTEST(the_same_kernel_without_a_cooperative_launch_does_not_hang_forever) {
   cfg.block = {1, 1, 1};
   cfg.cooperative = false;
   cfg.max_steps = 100000;  // small, so the spin is caught quickly
+  setenv("VGPU_THREADS", "1", 1);
   auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(counter), arg_u64(out)},
                                           e.mem, e.prof));
+  unsetenv("VGPU_THREADS");
   VCHECK(err.code() == Err::ExecLimit);
 }
 
