@@ -80,7 +80,9 @@ inline std::ostream& operator<<(std::ostream& os, const Reg& r) { return os << r
 struct RegOperand { Reg reg; };                     // %r1, %rd4, %f2, %p1 ...
 struct ImmInt { int64_t value = 0; };                   // 42, -1, 0x10
 struct ImmFloatBits { uint64_t bits = 0; uint32_t width = 0; };  // 0f3F800000 / 0d...
-struct SregOperand { Sreg reg = Sreg::TidX; };
+// `index` is meaningful only for %envregN, where the number selects one of a
+// bank of driver-supplied words rather than naming a distinct quantity.
+struct SregOperand { Sreg reg = Sreg::TidX; uint32_t index = 0; };
 // A bare identifier naming a module .global variable or a function-local
 // depot ("mov.u64 %rd, $str;" / "mov.u64 %SPL, __local_depot0;").
 struct SymbolOperand { std::string name; };

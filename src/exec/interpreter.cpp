@@ -284,7 +284,48 @@ class Interpreter {
 
   void run_grid() {
     const uint64_t total = uint64_t{cfg_.grid[0]} * cfg_.grid[1] * cfg_.grid[2];
-    run_block_range(0, total);
+    if (cfg_.cooperative) run_grid_cooperative(total);
+    else run_block_range(0, total);
+  }
+
+  // A cooperative launch: every block resident at once, interleaved.
+  //
+  // `cg::this_grid().sync()` is not an instruction. It compiles to an atomic
+  // increment of a counter in global memory and then a spin on that counter --
+  // so it only terminates if the blocks that have not arrived yet are still
+  // able to run. Running blocks one at a time, which is what the ordinary
+  // scheduler does and what the programming model permits, deadlocks on the
+  // first block to arrive.
+  //
+  // So every block is set up before any of them runs, and each gets a bounded
+  // turn in round-robin order. Deterministic, and the same order every time:
+  // the point of this simulator is that a run is reproducible, which rules out
+  // handing the blocks to OS threads and letting them race.
+  void run_grid_cooperative(uint64_t total) {
+    auto sched = make_scheduler(cfg_.scheduler);
+    const uint64_t gx = cfg_.grid[0], gy = cfg_.grid[1];
+    std::vector<BlockState> blocks(static_cast<size_t>(total));
+    for (uint64_t i = 0; i < total; ++i) {
+      BlockState& b = blocks[static_cast<size_t>(i)];
+      b.ctx.ctaid = {static_cast<uint32_t>(i % gx), static_cast<uint32_t>((i / gx) % gy),
+                     static_cast<uint32_t>(i / (gx * gy))};
+      b.ctx.ntid = cfg_.block;
+      b.ctx.nctaid = cfg_.grid;
+      setup_block(b);
+    }
+    // One warp-turn per block per round. Long enough that a block making real
+    // progress is not paying scheduler overhead per instruction, short enough
+    // that a spinning warp hands the grid back promptly.
+    constexpr uint64_t kSlice = 256;
+    size_t live = blocks.size();
+    while (live) {
+      live = 0;
+      for (BlockState& b : blocks) {
+        if (b.done) continue;
+        if (step_block(b, *sched, kSlice)) ++live;
+        else ++stats_.blocks;
+      }
+    }
   }
 
   // Runs the blocks with linear indices [first, last). CUDA blocks are
@@ -321,23 +362,36 @@ class Interpreter {
     }
   }
 
-  void run_block(BlockCtx& ctx, Scheduler& sched) {
+  // Everything a block owns while it is resident. An ordinary launch keeps one
+  // of these on the stack and runs it to completion; a cooperative launch keeps
+  // one per block and interleaves them, which is the whole difference between
+  // the two scheduling modes.
+  struct BlockState {
+    BlockCtx ctx;
+    std::vector<uint8_t> shared;
+    BarrierReduction bar_red;
+    SharedShadow shadow;
+    std::vector<Warp> warps;
+    bool done = false;
+  };
+
+  void setup_block(BlockState& b) {
     // Fresh, zeroed shared memory per block (static declarations + the
     // launch's dynamic bytes).
-    std::vector<uint8_t> shared(fn_.static_shared_size + cfg_.shared_bytes, 0);
-    ctx.shared = &shared;
-    BarrierReduction bar_red;
-    ctx.bar_red = &bar_red;
-    SharedShadow shadow;
-    if (detect_races() && !shared.empty()) {
-      shadow.words.assign(shared.size() / 4 + 1, WordShadow{});
-      ctx.shadow = &shadow;
+    b.shared.assign(fn_.static_shared_size + cfg_.shared_bytes, 0);
+    b.ctx.shared = &b.shared;
+    b.ctx.bar_red = &b.bar_red;
+    if (detect_races() && !b.shared.empty()) {
+      b.shadow.words.assign(b.shared.size() / 4 + 1, WordShadow{});
+      b.ctx.shadow = &b.shadow;
     }
-    uint64_t total = uint64_t{ctx.ntid[0]} * ctx.ntid[1] * ctx.ntid[2];
-    size_t nwarps = static_cast<size_t>((total + kWarpSize - 1) / kWarpSize);
-    std::vector<Warp> warps(nwarps);
+    const uint64_t total = uint64_t{b.ctx.ntid[0]} * b.ctx.ntid[1] * b.ctx.ntid[2];
+    const size_t nwarps = static_cast<size_t>((total + kWarpSize - 1) / kWarpSize);
+    // resize, not assign: a Warp owns a unique_ptr and so is move-only.
+    b.warps.clear();
+    b.warps.resize(nwarps);
     for (size_t w = 0; w < nwarps; ++w) {
-      Warp& warp = warps[w];
+      Warp& warp = b.warps[w];
       warp.regs32.assign(fn_.num_regs32, Lanes32{});
       warp.regs64.assign(fn_.num_regs64, Lanes{});
       warp.preds.assign(fn_.num_regs32 + fn_.num_regs64, 0);
@@ -348,38 +402,58 @@ class Interpreter {
         uint64_t lin = uint64_t{static_cast<uint32_t>(w)} * kWarpSize + lane;
         if (lin >= total) break;
         live |= (1u << lane);
-        warp.tid_x[lane] = static_cast<uint32_t>(lin % ctx.ntid[0]);
-        warp.tid_y[lane] = static_cast<uint32_t>((lin / ctx.ntid[0]) % ctx.ntid[1]);
-        warp.tid_z[lane] = static_cast<uint32_t>(lin / (uint64_t{ctx.ntid[0]} * ctx.ntid[1]));
+        warp.tid_x[lane] = static_cast<uint32_t>(lin % b.ctx.ntid[0]);
+        warp.tid_y[lane] = static_cast<uint32_t>((lin / b.ctx.ntid[0]) % b.ctx.ntid[1]);
+        warp.tid_z[lane] = static_cast<uint32_t>(lin / (uint64_t{b.ctx.ntid[0]} * b.ctx.ntid[1]));
       }
       if (live) warp.paths.push_back({0, live});
       else warp.state = Warp::State::Done;
     }
     stats_.warps += nwarps;
+  }
 
+  // Gives the block one turn: picks a runnable warp and runs it, or releases a
+  // barrier when every warp has arrived. Returns false once the block is
+  // finished.
+  //
+  // `slice` bounds how many instructions the chosen warp may execute before
+  // returning here. An ordinary launch leaves it unbounded, because nothing
+  // else is waiting. A cooperative launch must bound it: a grid barrier is a
+  // spin on a global flag another block has to set, and a warp spinning without
+  // a bound would never give that block a turn.
+  bool step_block(BlockState& b, Scheduler& sched, uint64_t slice) {
     std::vector<size_t> runnable;
-    while (true) {
-      runnable.clear();
-      for (size_t i = 0; i < warps.size(); ++i)
-        if (warps[i].state == Warp::State::Ready) runnable.push_back(i);
-      if (runnable.empty()) {
-        bool any_waiting = false;
-        for (auto& w : warps)
-          if (w.state == Warp::State::AtBarrier) {
-            w.state = Warp::State::Ready;
-            any_waiting = true;
-          }
-        // Every warp has now arrived, so a bar.red in flight has its answer.
-        if (any_waiting) bar_red.complete = true;
-        // ...and the barrier they arrived at orders everything before it
-        // against everything after, which is what ends the epoch.
-        if (any_waiting && ctx.shadow) ++ctx.shadow->epoch;
-        if (!any_waiting) return;  // all Done
-        continue;
+    for (size_t i = 0; i < b.warps.size(); ++i)
+      if (b.warps[i].state == Warp::State::Ready) runnable.push_back(i);
+    if (runnable.empty()) {
+      bool any_waiting = false;
+      for (auto& w : b.warps)
+        if (w.state == Warp::State::AtBarrier) {
+          w.state = Warp::State::Ready;
+          any_waiting = true;
+        }
+      // Every warp has now arrived, so a bar.red in flight has its answer.
+      if (any_waiting) b.bar_red.complete = true;
+      // ...and the barrier they arrived at orders everything before it
+      // against everything after, which is what ends the epoch.
+      if (any_waiting && b.ctx.shadow) ++b.ctx.shadow->epoch;
+      if (!any_waiting) {
+        b.done = true;
+        return false;  // all Done
       }
-      const size_t picked = sched.pick(runnable);
-      cur_warp_ = static_cast<uint32_t>(picked);
-      run_warp_until_yield(warps[picked], ctx);
+      return true;
+    }
+    const size_t picked = sched.pick(runnable);
+    cur_warp_ = static_cast<uint32_t>(picked);
+    run_warp_until_yield(b.warps[picked], b.ctx, slice);
+    return true;
+  }
+
+  void run_block(BlockCtx& ctx, Scheduler& sched) {
+    BlockState b;
+    b.ctx = ctx;
+    setup_block(b);
+    while (step_block(b, sched, /*slice=*/0)) {
     }
   }
 
@@ -401,8 +475,12 @@ class Interpreter {
     return best;
   }
 
-  void run_warp_until_yield(Warp& w, const BlockCtx& ctx) {
+  // Runs one warp until it yields: a barrier, a return, or -- when `slice` is
+  // non-zero -- that many instructions. Zero means no bound.
+  void run_warp_until_yield(Warp& w, const BlockCtx& ctx, uint64_t slice = 0) {
+    uint64_t issued = 0;
     while (w.state == Warp::State::Ready) {
+      if (slice && issued++ >= slice) return;
       if (w.paths.empty()) {
         w.state = Warp::State::Done;
         return;
@@ -564,11 +642,12 @@ class Interpreter {
       return scratch;
     }
     const auto& sr = std::get<SregOperand>(op);
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) scratch[lane] = sreg_value(sr.reg, w, ctx, lane);
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+      scratch[lane] = sreg_value(sr.reg, sr.index, w, ctx, lane);
     return scratch;
   }
 
-  uint32_t sreg_value(Sreg s, const Warp& w, const BlockCtx& ctx, uint32_t lane) {
+  uint32_t sreg_value(Sreg s, uint32_t index, const Warp& w, const BlockCtx& ctx, uint32_t lane) {
     switch (s) {
       case Sreg::TidX: return w.tid_x[lane];
       case Sreg::TidY: return w.tid_y[lane];
@@ -597,7 +676,20 @@ class Interpreter {
                                 w.tid_z[lane] * ctx.ntid[0] * ctx.ntid[1];
         return linear / kWarpSize;
       }
-      case Sreg::EnvReg: return 0;
+      // The driver's parameter bank. Only two entries mean anything here: a
+      // cooperative launch passes the address of its grid-barrier workspace as
+      // %envreg1 (low half) and %envreg2 (high half). cooperative_groups reads
+      // exactly those, and traps if the pair is zero -- which is how it detects
+      // a grid.sync() outside a cooperative launch, and why every other entry
+      // must stay zero rather than being given a plausible-looking value.
+      // %envreg1 is the *high* half and %envreg2 the low one. That is not a
+      // guess: the generated code reassembles them with
+      // "bfi.b64 %rd1, %rd7, %rd6, 32, 32", which inserts %envreg1 into bits
+      // 63:32 of %envreg2.
+      case Sreg::EnvReg:
+        if (index == 1) return static_cast<uint32_t>(cfg_.coop_workspace >> 32);
+        if (index == 2) return static_cast<uint32_t>(cfg_.coop_workspace);
+        return 0;
       case Sreg::NWarpId:
         return (ctx.ntid[0] * ctx.ntid[1] * ctx.ntid[2] + kWarpSize - 1) / kWarpSize;
     }
@@ -1815,7 +1907,25 @@ class Interpreter {
       exec_vprintf(w, ctx, ins, *op, m);
       return;
     }
-    throw Error::make(Err::Internal, "interpreter has no handler for a parsed instruction");
+    if (std::holds_alternative<OpTrap>(ins.op)) {
+      // "trap" ends the kernel with an unrecoverable device-side error. On
+      // hardware the launch fails and the context is left unusable; here it is
+      // an error with the line that did it, which is more use and no less true.
+      //
+      // Compilers put it on paths that are supposed to be unreachable --
+      // cooperative_groups emits one where the grid is not cooperative, and
+      // assert() lowers to it -- so reaching one is a fact about the program
+      // worth reporting rather than a gap in this interpreter.
+      ctx_fail(ins, -1, Err::Trap,
+               "the kernel executed 'trap', which ends it with a device-side error. This is what "
+               "a failed device assert(), an unreachable path, or a cooperative-groups call "
+               "outside a cooperative launch compiles to");
+    }
+    // The parser accepted it and nothing here runs it -- a gap between the two
+    // halves, not a bad program. Naming the instruction is the difference
+    // between a five-minute fix and a bisection.
+    ctx_fail(ins, -1, Err::Internal,
+             "the parser accepts this instruction but the interpreter has no handler for it");
   }
 
   // High half of a same-width product. 64-bit needs a 128-bit intermediate.
@@ -3191,9 +3301,31 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
   validate(fn, cfg, profile);
   LaunchConfig eff = cfg;
   eff.max_steps = effective_max_steps(cfg.max_steps);
+
+  // A cooperative launch needs the grid-barrier workspace the driver would
+  // reserve on hardware: cg::this_grid().sync() finds it through %envreg1 and
+  // %envreg2, and the barrier counter it spins on lives a few bytes in. It must
+  // start zeroed, because the counter's sign is what the barrier reads.
+  //
+  // Freed on the way out however that happens -- a kernel that faults must not
+  // leak a buffer the caller never asked for.
+  struct CoopWorkspace {
+    MemoryManager& mem;
+    uint64_t addr = 0;
+    ~CoopWorkspace() { if (addr) mem.free(addr); }
+  } coop{mem};
+  if (eff.cooperative) {
+    constexpr uint64_t kCoopWorkspaceBytes = 64;
+    coop.addr = mem.alloc(kCoopWorkspaceBytes);
+    for (uint64_t i = 0; i < kCoopWorkspaceBytes; i += 8) mem.store_scalar(coop.addr + i, 8, 0);
+    eff.coop_workspace = coop.addr;
+  }
   ParamBuffer pb = build_params(fn, args);
   const uint64_t blocks = uint64_t{cfg.grid[0]} * cfg.grid[1] * cfg.grid[2];
-  const unsigned nthreads = worker_count(blocks);
+  // A cooperative launch runs on one worker whatever VGPU_THREADS says. Its
+  // blocks wait on each other, so they cannot be split into independent ranges
+  // -- that is precisely the promise a cooperative launch does not make.
+  const unsigned nthreads = eff.cooperative ? 1 : worker_count(blocks);
 
   if (nthreads <= 1) {
     LaunchStats stats;

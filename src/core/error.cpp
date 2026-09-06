@@ -18,6 +18,7 @@ const char* err_name(Err e) {
     case Err::UnsupportedPtx: return "unsupported-ptx";
     case Err::UninitializedRegister: return "uninitialized-register";
     case Err::DataRace: return "data-race";
+    case Err::Trap: return "trap";
     case Err::LaunchConfig: return "launch-config";
     case Err::ExecLimit: return "exec-limit";
     case Err::NotFound: return "not-found";

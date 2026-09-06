@@ -157,6 +157,13 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
     case Err::OutOfBounds:
     case Err::MisalignedAccess:
     case Err::UninitializedRegister: code = cudaErrorIllegalAddress; break;
+    // "trap" is what a failed device assert and an unreachable path compile to,
+    // and hardware surfaces it as an illegal instruction.
+    case Err::Trap: code = cudaErrorIllegalInstruction; break;
+    // A data race is this simulator's own finding rather than a CUDA condition.
+    // "unspecified launch failure" is the closest real code, and it is at least
+    // true that the launch did not produce a result anyone should use.
+    case Err::DataRace: code = cudaErrorLaunchFailure; break;
     default: code = cudaErrorInvalidValue; break;
   }
   (void)s;
@@ -346,9 +353,13 @@ bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, vo
                                      const std::vector<uint32_t>& param_sizes);
 bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()> op);
 
-VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args,
-                                         size_t sharedMem, cudaStream_t stream) {
-  return guard("cudaLaunchKernel", [&](State& s) -> cudaError_t {
+// The body of both launch entry points. `cooperative` is the only difference,
+// and it changes one thing: whether the blocks are resident together and may
+// wait on each other. See the scheduler note in interpreter.cpp.
+static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gridDim,
+                                      dim3 blockDim, void** args, size_t sharedMem,
+                                      cudaStream_t stream, bool cooperative) {
+  return guard(api, [&](State& s) -> cudaError_t {
     auto it = s.kernels.find(func);
     if (it == s.kernels.end()) {
       if (!quiet())
@@ -404,6 +415,28 @@ VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 bl
     cfg.grid = {gridDim.x, gridDim.y, gridDim.z};
     cfg.block = {blockDim.x, blockDim.y, blockDim.z};
     cfg.shared_bytes = static_cast<uint32_t>(sharedMem);
+    cfg.cooperative = cooperative;
+    if (cooperative) {
+      // A cooperative launch promises every block is resident, so the grid has
+      // to fit. Hardware refuses a grid that does not, and so does this: a
+      // kernel whose blocks wait on blocks that were never started does not
+      // produce a wrong answer, it hangs, and the error is far more useful.
+      const vgpu::DeviceProfile& p = dev.profile();
+      const uint64_t resident =
+          uint64_t{p.limits.max_blocks_per_sm} * p.limits.multiprocessors;
+      const uint64_t want = uint64_t{gridDim.x} * gridDim.y * gridDim.z;
+      if (resident && want > resident) {
+        if (!quiet())
+          std::fprintf(stderr,
+                       "[vgpu] %s: grid of %llu blocks exceeds what %s can hold resident "
+                       "(%u blocks/SM x %u SMs = %llu). A cooperative launch requires every "
+                       "block to be resident, so this cannot run here or on the real part.\n",
+                       api, static_cast<unsigned long long>(want), p.id.c_str(),
+                       p.limits.max_blocks_per_sm, p.limits.multiprocessors,
+                       static_cast<unsigned long long>(resident));
+        return cudaErrorCooperativeLaunchTooLarge;
+      }
+    }
     dev.launch(*fn, cfg, kargs, dev.symbols(mid));
     if (profiling) {
       vgpu::profiling::Event ev;
@@ -422,6 +455,39 @@ VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 bl
     return cudaSuccess;
   });
 }
+
+VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args,
+                                         size_t sharedMem, cudaStream_t stream) {
+  return launch_kernel_impl("cudaLaunchKernel", func, gridDim, blockDim, args, sharedMem, stream,
+                            /*cooperative=*/false);
+}
+
+// cg::this_grid().sync() is only defined for a kernel launched this way, and
+// nothing in the PTX distinguishes the two -- the grid barrier is an atomic and
+// a spin on ordinary global memory. So the promise has to come from the launch.
+VGPU_EXPORT cudaError_t cudaLaunchCooperativeKernel(const void* func, dim3 gridDim, dim3 blockDim,
+                                                    void** args, size_t sharedMem,
+                                                    cudaStream_t stream) {
+  return launch_kernel_impl("cudaLaunchCooperativeKernel", func, gridDim, blockDim, args, sharedMem,
+                            stream, /*cooperative=*/true);
+}
+
+// The multi-device form needs peer grids on separate devices waiting on each
+// other. Refused rather than run as if it were single-device, which would
+// deadlock or silently compute the wrong thing.
+//
+// Deprecated in CUDA 12 and removed in 13, so it is only defined when the
+// toolkit still declares it -- and its first parameter is cudaLaunchParams*,
+// not void*. A mismatch here is a hard error rather than a subtle one, because
+// the vendor header is included: C linkage makes two declarations of the same
+// name with different types a conflict, which is exactly the check that caught
+// this.
+#if CUDART_VERSION < 13000
+VGPU_EXPORT cudaError_t cudaLaunchCooperativeKernelMultiDevice(struct cudaLaunchParams*,
+                                                               unsigned int, unsigned int) {
+  return cudaErrorNotSupported;
+}
+#endif
 
 /* ===================================================================== */
 /* Device management                                                     */
@@ -577,7 +643,9 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, 
       case cudaDevAttrEccEnabled: *value = 0; break;
       case cudaDevAttrCanMapHostMemory: *value = 0; break;
       case cudaDevAttrManagedMemory: *value = 0; break;       // cudaMallocManaged is refused
-      case cudaDevAttrCooperativeLaunch: *value = 0; break;   // no grid-wide sync
+      // Grid-wide sync works under cudaLaunchCooperativeKernel; the
+      // multi-device form does not.
+      case cudaDevAttrCooperativeLaunch: *value = 1; break;
       case cudaDevAttrComputeMode: *value = 0; break;         // cudaComputeModeDefault
       default:
         // A silent zero here is how a scan came to launch no blocks. An
@@ -1087,15 +1155,6 @@ VGPU_EXPORT cudaError_t cudaGraphExecUpdate(cudaGraphExec_t, cudaGraph_t,
   return cudaErrorGraphExecUpdateFailure;
 }
 
-// Cooperative launch guarantees every block is resident so grid-wide
-// synchronisation is safe. Blocks here are scheduled across host threads in
-// ranges, which does not provide that, and a kernel calling grid.sync() under
-// an ordinary launch would hang or silently produce wrong results.
-VGPU_EXPORT cudaError_t cudaLaunchCooperativeKernel(const void*, dim3, dim3, void**, size_t,
-                                                    cudaStream_t) {
-  return cudaErrorNotSupported;
-}
-
 // Managed memory is one allocation the CPU and GPU both address. Device memory
 // here lives in a separate virtual window that host code cannot dereference, so
 // handing back a device pointer would fault the moment the host touched it.
@@ -1193,6 +1252,11 @@ VGPU_EXPORT cudaError_t cudaGetLastError(void) {
 }
 VGPU_EXPORT cudaError_t cudaPeekAtLastError(void) { return g_last_error; }
 
+// Both of these must name every code this shim can return. They did not: the
+// tables listed eight of the seventeen, so a program that printed
+// cudaGetErrorName() of a real, correctly-returned error was told
+// "cudaErrorUnknown" -- confidently wrong, and indistinguishable from the
+// simulator having no idea what happened.
 VGPU_EXPORT const char* cudaGetErrorString(cudaError_t error) {
   switch (error) {
     case cudaSuccess: return "no error";
@@ -1204,6 +1268,17 @@ VGPU_EXPORT const char* cudaGetErrorString(cudaError_t error) {
     case cudaErrorIllegalAddress: return "an illegal memory access was encountered";
     case cudaErrorLaunchTimeout: return "the launch timed out and was terminated";
     case cudaErrorNotSupported: return "operation not supported";
+    case cudaErrorInvalidConfiguration: return "invalid configuration argument";
+    case cudaErrorIllegalInstruction: return "an illegal instruction was encountered";
+    case cudaErrorLaunchFailure: return "unspecified launch failure";
+    case cudaErrorCooperativeLaunchTooLarge:
+      return "too many blocks in cooperative launch";
+    case cudaErrorStreamCaptureImplicit:
+      return "operation would make the legacy stream depend on a capturing stream";
+    case cudaErrorStreamCaptureInvalidated:
+      return "operation failed due to a previous error during capture";
+    case cudaErrorGraphExecUpdateFailure: return "the graph update was not performed";
+    case cudaErrorOperatingSystem: return "OS call failed or operation not supported on this OS";
     default: return "unknown error";
   }
 }
@@ -1217,6 +1292,15 @@ VGPU_EXPORT const char* cudaGetErrorName(cudaError_t error) {
     case cudaErrorInvalidPtx: return "cudaErrorInvalidPtx";
     case cudaErrorIllegalAddress: return "cudaErrorIllegalAddress";
     case cudaErrorNotSupported: return "cudaErrorNotSupported";
+    case cudaErrorLaunchTimeout: return "cudaErrorLaunchTimeout";
+    case cudaErrorInvalidConfiguration: return "cudaErrorInvalidConfiguration";
+    case cudaErrorIllegalInstruction: return "cudaErrorIllegalInstruction";
+    case cudaErrorLaunchFailure: return "cudaErrorLaunchFailure";
+    case cudaErrorCooperativeLaunchTooLarge: return "cudaErrorCooperativeLaunchTooLarge";
+    case cudaErrorStreamCaptureImplicit: return "cudaErrorStreamCaptureImplicit";
+    case cudaErrorStreamCaptureInvalidated: return "cudaErrorStreamCaptureInvalidated";
+    case cudaErrorGraphExecUpdateFailure: return "cudaErrorGraphExecUpdateFailure";
+    case cudaErrorOperatingSystem: return "cudaErrorOperatingSystem";
     default: return "cudaErrorUnknown";
   }
 }

@@ -523,6 +523,16 @@ if(TARGET vgpucupti)
     TIMEOUT 600)
 endif()
 
+# A grid-wide barrier through cooperative_groups, unmodified. Checks the
+# barrier holds, that a grid too large to be resident is refused rather than
+# hung, and that the same kernel launched ordinarily fails loudly.
+add_test(NAME e2e_cooperative_grid
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_cooperative_grid.sh)
+set_tests_properties(e2e_cooperative_grid PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
 # The shim compiled against NVIDIA's own cuda.h. This is the only test that can
 # see a signature or an enum value that has drifted from the toolkit -- the shim
 # is written against a clean-room header, so nothing else in the build compares

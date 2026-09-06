@@ -23,6 +23,16 @@ struct LaunchConfig {
   SchedulerKind scheduler = SchedulerKind::Deterministic;
   // Safety net against infinite loops; counts executed instructions per launch.
   uint64_t max_steps = 1ull << 30;
+  // A cooperative launch: every block is resident at once and may wait on the
+  // others. Ordinary launches make the opposite promise -- blocks are
+  // independent and may run in any order, one at a time -- and running them
+  // that way is both faster and a stricter check of that promise, so this
+  // changes the scheduler rather than being the default.
+  bool cooperative = false;
+  // Device address of the grid-barrier workspace a cooperative launch needs.
+  // cg::this_grid().sync() reads it out of %envreg1/%envreg2 and traps when it
+  // is null, so this is what makes the barrier reachable rather than a crash.
+  uint64_t coop_workspace = 0;
 };
 
 // Invoked periodically during a launch so long-running kernels can still
