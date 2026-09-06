@@ -145,7 +145,7 @@ Environment knobs:
 | `VGPU_VRAM_MB` | virtual VRAM size, overriding the profile | profile |
 | `VGPU_STRICT` | `1` turns on the checks that catch bugs hardware hides but that real compiler output trips over: integer division by zero, and storing a register nothing has written | unset |
 | `VGPU_COUNTERS` | `1` prints exact per-launch performance counters | unset |
-| `VGPU_RACE` | `1` reports unordered shared-memory access between warps | unset |
+| `VGPU_RACE` | `1` reports unordered shared-memory access between warps; `2` also reports stores that change nothing | unset |
 
 `VGPU_COUNTERS` reports what a profiler reports, except that every number is
 counted rather than sampled. Instructions and thread-instructions (their ratio
@@ -185,6 +185,15 @@ shared word without a `bar.sync` between them only if both are reading.
 Anything else is a race, and which warp wins is not something the program
 decided. Hardware usually hides this -- warps advance together and the window
 is small -- which is exactly why it is worth checking somewhere that does not.
+
+One exception, and it is not a softening of the rule: a store that leaves the
+bytes exactly as it found them cannot be observed by anyone, because no reader
+and no other writer can tell whether it happened before or after. Real kernels
+do this deliberately -- llama.cpp's `mul_mat_q` clamps out-of-range tile rows
+with `i = min(i, i_max)`, so several warps recompute the same pointer and store
+the same value to the same word. The write is still recorded, so a later store
+of a *different* value is caught against it; only the report is suppressed.
+`VGPU_RACE=2` reports these too.
 
 It is off by default because it costs a shadow word per shared word, and on
 because you are looking for something. It found the flash-attention race in

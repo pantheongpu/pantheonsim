@@ -243,13 +243,41 @@ That detector now exists: `VGPU_RACE=1` finds this bug in a single run, naming
 the kernel, the PTX line and the two warps involved. It is quiet on SOFT_MAX,
 RMS_NORM, CUMSUM and all three pantheon workloads.
 
-It also reports one candidate in `MUL_MAT` -- a write-write on the same shared
-word from two warps of `mul_mat_q`, with no barrier between them in program
-order. That one is **unverified**. MUL_MAT is correct on all 1253 cases, which
-points to two warps writing the same value redundantly: a race by the strict
-definition, harmless in effect. It is recorded rather than claimed, because
-"the detector found a second bug" and "the detector has a false positive" look
-identical until someone checks.
+It also reported one candidate in `MUL_MAT`. **Checked, and it is neither a
+second bug nor a false positive**: it is a real race whose outcome cannot
+differ, and the detector was right to see it and wrong to stop on it.
+
+The kernel is `mul_mat_q<GGML_TYPE_Q4_0, 16, need_check=true>`, and the write is
+in `ggml_cuda_mmq_load_tiles_q4_0`. With `need_check` on, the tile loader clamps
+out-of-range rows:
+
+    if (fallback) { i = min(i, i_max); }
+    const block_q4_0 * bxi = (const block_q4_0 *) x + kbx0 + i*stride + kbx;
+    x_qs[i*(MMQ_TILE_NE_K + 1) + txi] = qs0;
+
+Rows past `i_max` all collapse onto `i_max`, so several warps recompute the same
+source pointer, read the same block, and store the same bytes to the same shared
+word. Two warps, no barrier between them, one address -- and the value is the
+same whichever wins.
+
+So the detector now compares the bytes. A store that leaves shared memory
+exactly as it found it cannot be observed by anyone -- no reader and no other
+writer can tell whether it happened before or after -- and does not turn a
+conflicting access into a race. The write is still *recorded*, so a later store
+of a different value is caught against it; only the report is suppressed.
+`VGPU_RACE=2` reports these too, for the strict definition.
+
+Three results, each with its control:
+
+| Run | Before | After |
+| --- | --- | --- |
+| `MUL_MAT`, `VGPU_RACE=1` | aborts at case 49 | 1253/1253, silent |
+| `MUL_MAT`, `VGPU_RACE=2` | aborts at case 49 | aborts at case 49, same word |
+| `FLASH_ATTN_EXT`, `VGPU_RACE=1` | reports the real race | reports the real race |
+
+The last row is the one that matters: the llama.cpp flash-attention race is a
+write-read on values that genuinely differ, and it still fires. The change
+narrows what counts as observable, not what the detector looks at.
 
 ## Known out of scope (not CUDA)
 

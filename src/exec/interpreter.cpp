@@ -184,6 +184,10 @@ struct Warp {
 // between launches gets what it asked for.
 std::atomic<bool> g_strict{false};
 std::atomic<bool> g_race{false};
+// VGPU_RACE=2: also report writes that leave the bytes unchanged. Off by
+// default -- see the comment on `unobservable_write` for why those are not
+// races -- but the strict definition has its uses, so it stays reachable.
+std::atomic<bool> g_race_strict{false};
 
 // Sampled together, once per launch. Caching either in a function-local static
 // makes it depend on which kernel in a process ran first -- which is how the
@@ -193,7 +197,8 @@ void refresh_modes() {
   const char* strict = std::getenv("VGPU_STRICT");
   g_strict.store(strict && strict[0] == '1', std::memory_order_relaxed);
   const char* race = std::getenv("VGPU_RACE");
-  g_race.store(race && race[0] == '1', std::memory_order_relaxed);
+  g_race.store(race && (race[0] == '1' || race[0] == '2'), std::memory_order_relaxed);
+  g_race_strict.store(race && race[0] == '2', std::memory_order_relaxed);
 }
 
 // IEEE 754 binary16 <-> double, implemented in software so the engine needs no
@@ -805,6 +810,7 @@ class Interpreter {
 
   // Race detection, off unless VGPU_RACE=1.
   static bool detect_races() { return g_race.load(std::memory_order_relaxed); }
+  static bool races_strict() { return g_race_strict.load(std::memory_order_relaxed); }
 
   [[noreturn]] void report_race(const Instr& ins, const char* what, uint64_t word,
                                 uint32_t other_warp) {
@@ -817,18 +823,45 @@ class Interpreter {
                  "advance together; it is a real race either way");
   }
 
+  // True when the store leaves shared memory exactly as it found it.
+  //
+  // Such a store cannot be observed by anyone: no reader and no other writer
+  // can tell whether it happened before or after, because the bytes are the
+  // same either way. So it does not turn a conflicting access into a race.
+  //
+  // This is not a heuristic -- it is checked against the bytes actually there,
+  // and the conflicting writer is what put them there. Real kernels do this on
+  // purpose: llama.cpp's mul_mat_q clamps out-of-range tile rows with
+  // `i = min(i, i_max)`, so several warps recompute the same source pointer and
+  // write the same value to the same word. Reporting that as a bug makes the
+  // detector useless on the code it exists to check.
+  //
+  // The write is still *recorded* as a write, so a later store of a different
+  // value is still caught against it. Only the report is suppressed.
+  bool unobservable_write(const BlockCtx& ctx, uint64_t addr, uint32_t bytes,
+                          uint64_t value) const {
+    if (races_strict()) return false;
+    if (bytes == 0 || bytes > 8) return false;
+    uint64_t existing = 0;
+    std::memcpy(&existing, ctx.shared->data() + (addr - kSharedVaBase), bytes);
+    uint64_t incoming = 0;
+    std::memcpy(&incoming, &value, bytes);
+    return existing == incoming;
+  }
+
   void note_shared_access(const BlockCtx& ctx, const Instr& ins, uint64_t addr, uint32_t bytes,
-                          bool is_write) {
+                          bool is_write, uint64_t value = 0) {
     if (!ctx.shadow) return;
     SharedShadow& sh = *ctx.shadow;
+    const bool silent = is_write && unobservable_write(ctx, addr, bytes, value);
     const uint64_t first = (addr - kSharedVaBase) / 4;
     const uint64_t last = (addr - kSharedVaBase + (bytes ? bytes - 1 : 0)) / 4;
     for (uint64_t w = first; w <= last && w < sh.words.size(); ++w) {
       WordShadow& s = sh.words[w];
       if (is_write) {
-        if (s.write_epoch == sh.epoch && s.writer != 0xFFFF && s.writer != cur_warp_)
+        if (!silent && s.write_epoch == sh.epoch && s.writer != 0xFFFF && s.writer != cur_warp_)
           report_race(ins, "write-write race", w, s.writer);
-        if (s.read_epoch == sh.epoch) {
+        if (!silent && s.read_epoch == sh.epoch) {
           const uint32_t others = s.readers & ~(1u << cur_warp_);
           if (others) report_race(ins, "read-write race", w, __builtin_ctz(others));
         }
@@ -898,7 +931,7 @@ class Interpreter {
                     uint32_t size, uint64_t value) {
     if (is_shared(addr)) {
       check_shared(ctx, ins, static_cast<int>(lane), addr, size);
-      note_shared_access(ctx, ins, addr, size, /*is_write=*/true);
+      note_shared_access(ctx, ins, addr, size, /*is_write=*/true, value);
       std::memcpy(ctx.shared->data() + (addr - kSharedVaBase), &value, size);
       return;
     }
