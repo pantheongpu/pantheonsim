@@ -29,6 +29,17 @@ const std::unordered_map<std::string, Sreg>& sreg_table() {
       {"%lanemask_ge", Sreg::LaneMaskGe},
       {"%warpid", Sreg::WarpId},
       {"%nwarpid", Sreg::NWarpId},
+      {"%clock", Sreg::Clock},
+      {"%clock_hi", Sreg::ClockHi},
+      {"%clock64", Sreg::Clock64},
+      {"%globaltimer", Sreg::GlobalTimer},
+      {"%globaltimer_lo", Sreg::GlobalTimerLo},
+      {"%globaltimer_hi", Sreg::GlobalTimerHi},
+      {"%smid", Sreg::SmId},
+      {"%nsmid", Sreg::NSmId},
+      {"%dynamic_smem_size", Sreg::DynamicSmemSize},
+      {"%total_smem_size", Sreg::TotalSmemSize},
+      {"%gridid", Sreg::GridId},
   };
   return t;
 }

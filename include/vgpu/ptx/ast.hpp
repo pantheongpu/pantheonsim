@@ -48,12 +48,27 @@ enum class Sreg : uint8_t {
   LaneMaskEq, LaneMaskLt, LaneMaskLe, LaneMaskGt, LaneMaskGe,
   // One warp per 32 lanes of the block, in this engine's scheduling.
   WarpId, NWarpId,
-  // %envreg<32>: driver-set registers. PTX says they read as zero unless a
-  // driver has set them, and nothing here sets them -- so zero is the value,
-  // not a stand-in for one. ggml's soft_max reads a pair of them, splices them
-  // into a 64-bit value and branches on whether it is zero, which is precisely
-  // the "not set" path.
+  // %envreg<32>: driver-set registers, read as zero unless a driver has set
+  // them. A cooperative launch sets %envreg1 and %envreg2 to the halves of its
+  // grid-barrier workspace address; everything else stays zero, and
+  // cooperative_groups relies on that -- a null pair is how it detects a
+  // grid.sync() outside a cooperative launch. ggml's soft_max reads a pair and
+  // branches on whether it is zero, which is the same "not set" test.
   EnvReg,
+  // Cycle and nanosecond counters. VirtualGPU has no timing model, so these
+  // are not times -- see the note at sreg_value(). They exist because kernels
+  // read them for *ordering* (spin with a deadline, exponential backoff), and
+  // refusing the register fails the whole kernel over something it only uses
+  // to decide when to stop waiting.
+  Clock, ClockHi, Clock64, GlobalTimer, GlobalTimerLo, GlobalTimerHi,
+  // Which multiprocessor this block landed on, and how many the device has.
+  SmId, NSmId,
+  // Shared memory available to the block: the launch's dynamic bytes, and that
+  // plus the module's static declarations.
+  DynamicSmemSize, TotalSmemSize,
+  // A serial number for the launch, distinct from every other launch in the
+  // process.
+  GridId,
 };
 
 // A virtual register reference. `id` is a dense per-kernel index assigned at

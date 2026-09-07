@@ -65,8 +65,15 @@ static_assert(sizeof(cudaDeviceProp) == 1032,
 
 namespace {
 
-constexpr int kRuntimeVersion = 13000;  // CUDA 13.0
-constexpr int kDriverVersion = 13000;
+// The version this shim reports, taken from the toolkit it was built against
+// rather than written down. The soname is already derived that way -- a build
+// with a CUDA 12 nvcc produces libcudart.so.12 -- and a hardcoded number meant
+// that build would call itself .so.12 and then report 13000, which is the kind
+// of disagreement a caller has no way to make sense of.
+constexpr int kRuntimeVersion = CUDART_VERSION;
+// The driver is at least as new as the runtime it serves; reporting the same
+// number is what a matched pair looks like.
+constexpr int kDriverVersion = CUDART_VERSION;
 
 bool quiet() {
   const char* q = std::getenv("VGPU_QUIET");

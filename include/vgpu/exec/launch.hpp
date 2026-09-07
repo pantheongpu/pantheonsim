@@ -99,8 +99,16 @@ struct LaunchStats {
   uint64_t local_loads = 0, local_stores = 0;
   uint64_t global_bytes_read = 0, global_bytes_written = 0;
   uint64_t shared_bytes_read = 0, shared_bytes_written = 0;
-  // Atomic read-modify-writes, per active lane.
+  // Local memory is the one space that had operation counts and sectors but no
+  // byte totals, so a spill-heavy kernel could not be compared against a
+  // global-memory-heavy one in the same units. The asymmetry was an oversight,
+  // not a decision.
+  uint64_t local_bytes_read = 0, local_bytes_written = 0;
+  // Atomic read-modify-writes, per active lane, and the bytes they moved. An
+  // atomic is a read and a write, so its traffic is counted once here rather
+  // than twice in the load and store totals.
   uint64_t atomics = 0;
+  uint64_t atomic_bytes = 0;
   // bar.sync executions, per warp.
   uint64_t barriers = 0;
 

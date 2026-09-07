@@ -150,8 +150,8 @@ Environment knobs:
 `VGPU_COUNTERS` reports what a profiler reports, except that every number is
 counted rather than sampled. Instructions and thread-instructions (their ratio
 is the average number of lanes doing useful work), divergent branches, memory
-by space, atomics and barriers -- and two that are worth the simulator on their
-own:
+by space in operations *and* bytes, atomics with the bytes they moved, and
+barriers -- and two that are worth the simulator on their own:
 
 - **Sectors and coalescing.** Memory moves in 32-byte sectors. Every lane's
   address is in hand at the moment of the access, so the sectors a warp touches
@@ -175,6 +175,9 @@ Tensor-core work is reported twice: per lane with the rest of the mix, and per
 warp as `tensor issues`, since an mma is one instruction the whole warp
 executes together and a per-lane figure would say thirty-two for something that
 happened once.
+
+An atomic is a read and a write, so its traffic is counted once as
+`atomic_bytes` rather than twice in the load and store totals.
 
 There is no timing model and no cache model here, so there are no cycles, no
 stall reasons and no hit rates. Those are the numbers a profiler is mostly

@@ -157,10 +157,10 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
                "[vgpu][counters] %s  grid=%ux%ux%u block=%ux%ux%u\n"
                "    blocks=%llu warps=%llu\n"
                "    inst_executed=%llu  thread_inst_executed=%llu  lanes_active_avg=%.2f/32\n"
-               "    divergent_branches=%llu  barriers=%llu  atomics=%llu\n"
+               "    divergent_branches=%llu  barriers=%llu  atomics=%llu (%llu B)\n"
                "    global  ld=%llu st=%llu  read=%llu B write=%llu B\n"
                "    shared  ld=%llu st=%llu  read=%llu B write=%llu B\n"
-               "    local   ld=%llu st=%llu\n"
+               "    local   ld=%llu st=%llu  read=%llu B write=%llu B\n"
                "    sectors global=%llu over %llu requests (%.2f per request, %.0f%% of ideal)\n"
                "    shared  bank_conflicts=%llu over %llu requests\n"
                "    mix     fp16=%llu fp32=%llu fp64=%llu int=%llu cvt=%llu\n"
@@ -169,12 +169,15 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
                cfg.block[2], (unsigned long long)st.blocks, (unsigned long long)st.warps,
                (unsigned long long)st.instructions, (unsigned long long)st.thread_instructions,
                lanes, (unsigned long long)st.divergent_branches, (unsigned long long)st.barriers,
-               (unsigned long long)st.atomics, (unsigned long long)st.global_loads,
+               (unsigned long long)st.atomics, (unsigned long long)st.atomic_bytes,
+               (unsigned long long)st.global_loads,
                (unsigned long long)st.global_stores, (unsigned long long)st.global_bytes_read,
                (unsigned long long)st.global_bytes_written, (unsigned long long)st.shared_loads,
                (unsigned long long)st.shared_stores, (unsigned long long)st.shared_bytes_read,
                (unsigned long long)st.shared_bytes_written, (unsigned long long)st.local_loads,
                (unsigned long long)st.local_stores,
+               (unsigned long long)st.local_bytes_read,
+               (unsigned long long)st.local_bytes_written,
                (unsigned long long)st.global_sectors, (unsigned long long)st.global_requests,
                sectors_per_request, coalescing_pct,
                (unsigned long long)st.shared_bank_conflicts,
