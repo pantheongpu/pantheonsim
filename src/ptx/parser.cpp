@@ -718,6 +718,19 @@ class Parser {
     return regs;
   }
 
+  // A braced list of any length. Texture coordinates come this way: the count
+  // is fixed by the geometry, not by the syntax.
+  std::vector<Operand> parse_operand_vector_any() {
+    std::vector<Operand> ops;
+    expect_punct("{");
+    while (!peek_punct("}")) {
+      ops.push_back(parse_operand());
+      if (peek_punct(",")) next();
+    }
+    next();
+    return ops;
+  }
+
   std::vector<Operand> parse_operand_vector(size_t n) {
     std::vector<Operand> ops;
     expect_punct("{");
@@ -1695,6 +1708,102 @@ class Parser {
       ins.op = op;
     } else if (op0 == "trap") {
       ins.op = OpTrap{};
+    } else if (op0 == "tex") {
+      // tex.<geom>[.level|.grad].v4.<dtype>.<ctype> {d,d,d,d}, [obj, {c,...}]
+      uint32_t dims = 0;
+      Type dtype{}, ctype{};
+      bool have_d = false;
+      std::vector<std::string> types;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "1d") dims = 1;
+        else if (p == "2d") dims = 2;
+        else if (p == "3d") dims = 3;
+        else if (p == "v4") ;
+        else if (p == "a1d" || p == "a2d" || p == "cube" || p == "acube")
+          return unsupported("layered and cubemap textures are not implemented");
+        else if (p == "level" || p == "grad")
+          return unsupported("mipmapped texture fetch ('." + p + "') is not implemented");
+        else if (auto t2 = parse_type_token(p)) types.push_back(p);
+        else return unsupported("tex modifier '." + p + "'");
+      }
+      if (!dims) return unsupported("tex geometry (only .1d/.2d/.3d are implemented)");
+      if (types.size() != 2) return unsupported("tex needs a destination and a coordinate type");
+      dtype = *parse_type_token(types[0]);
+      ctype = *parse_type_token(types[1]);
+      have_d = true;
+      (void)have_d;
+      OpTex op;
+      op.dims = dims;
+      op.dtype = dtype;
+      op.ctype = ctype;
+      op.dsts = parse_reg_vector_any();
+      if (op.dsts.size() != 4) return unsupported("tex destination arity (ptxas emits .v4)");
+      expect_punct(",");
+      expect_punct("[");
+      op.obj = parse_operand();
+      expect_punct(",");
+      op.coords = parse_operand_vector_any();
+      if (op.coords.size() < dims)
+        return unsupported("tex coordinate count does not match its geometry");
+      expect_punct("]");
+      ins.op = std::move(op);
+    } else if (op0 == "suld" || op0 == "sust") {
+      // suld.b.<geom>.<type>.<clamp> {d,...}, [obj, {x,y}]
+      // sust.b.<geom>.<type>.<clamp> [obj, {x,y}], {s,...}
+      uint32_t dims = 0, bytes = 0;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "b") ;              // byte-addressed, the only form ptxas emits
+        else if (p == "p") return unsupported("suld/sust '.p' (formatted) is not implemented");
+        else if (p == "1d") dims = 1;
+        else if (p == "2d") dims = 2;
+        else if (p == "3d") dims = 3;
+        else if (p == "a1d" || p == "a2d")
+          return unsupported("layered surfaces are not implemented");
+        // Out-of-range policy. ".trap" is what a surface access compiles to by
+        // default and is the only one implemented: ".clamp" and ".zero" change
+        // the result rather than the diagnostics, so accepting them silently
+        // would answer a different question.
+        else if (p == "trap") ;
+        else if (p == "clamp" || p == "zero")
+          return unsupported("suld/sust '." + p + "' out-of-range policy is not implemented");
+        else if (p == "v2" || p == "v4") ;
+        else if (p == "b8") bytes = 1;
+        else if (p == "b16") bytes = 2;
+        else if (p == "b32") bytes = 4;
+        else if (p == "b64") bytes = 8;
+        else return unsupported(op0 + " modifier '." + p + "'");
+      }
+      if (!dims) return unsupported(op0 + " geometry (only .1d/.2d/.3d are implemented)");
+      if (!bytes) return unsupported(op0 + " component width");
+      if (op0 == "suld") {
+        OpSuld op;
+        op.dims = dims;
+        op.bytes = bytes;
+        op.dsts = parse_reg_vector_any();
+        expect_punct(",");
+        expect_punct("[");
+        op.obj = parse_operand();
+        expect_punct(",");
+        op.coords = parse_operand_vector_any();
+        expect_punct("]");
+        if (op.coords.size() < dims) return unsupported("suld coordinate count");
+        ins.op = std::move(op);
+      } else {
+        OpSust op;
+        op.dims = dims;
+        op.bytes = bytes;
+        expect_punct("[");
+        op.obj = parse_operand();
+        expect_punct(",");
+        op.coords = parse_operand_vector_any();
+        expect_punct("]");
+        expect_punct(",");
+        op.srcs = parse_operand_vector_any();
+        if (op.coords.size() < dims) return unsupported("sust coordinate count");
+        ins.op = std::move(op);
+      }
     } else if (op0 == "membar" || op0 == "fence") {
       // Blocks execute their instructions in order and device atomics are
       // serialized by a lock, so every prior write is already visible to

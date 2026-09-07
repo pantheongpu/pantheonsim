@@ -289,6 +289,39 @@ struct OpActiveMask { Reg dst; };
 // and a kernel that reaches it has detected something it cannot continue past,
 // so it must not be silently skipped.
 struct OpTrap {};
+
+// Texture and surface access. The object is a 64-bit handle the host created,
+// passed in as an ordinary kernel parameter; everything else about the fetch
+// comes from the table it names (see exec/texture.hpp).
+//
+//   tex.<geom>.v4.<dtype>.<ctype>  {d0,d1,d2,d3}, [obj, {c0,...}]
+//   suld.b.<geom>.<type>.<clamp>   {d0,...},      [obj, {x,y}]
+//   sust.b.<geom>.<type>.<clamp>   [obj, {x,y}],  {s0,...}
+//
+// tex always writes four components even when the caller wants one -- the
+// widest form is what ptxas emits regardless.
+struct OpTex {
+  uint32_t dims = 1;             // 1, 2 or 3
+  Type dtype;                    // destination component type (f32, s32, u32)
+  Type ctype;                    // coordinate type: f32 for sampled, s32 for fetch
+  std::vector<Reg> dsts;         // always four
+  Operand obj;                   // the texture object handle
+  std::vector<Operand> coords;
+};
+struct OpSuld {
+  uint32_t dims = 1;
+  uint32_t bytes = 4;            // per component, from .b8/.b16/.b32/.b64
+  std::vector<Reg> dsts;
+  Operand obj;
+  std::vector<Operand> coords;   // x is a *byte* offset, y and z are texel rows
+};
+struct OpSust {
+  uint32_t dims = 1;
+  uint32_t bytes = 4;
+  Operand obj;
+  std::vector<Operand> coords;
+  std::vector<Operand> srcs;
+};
 // bar.red.{and,or}.pred d, 0, p  /  bar.red.popc.u32 d, 0, p
 // A barrier that also reduces a predicate across every thread in the block and
 // gives all of them the result. Unlike bar.sync it produces a value, so it
@@ -330,7 +363,7 @@ struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpActiveMask>;
 
