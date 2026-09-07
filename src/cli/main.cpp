@@ -114,8 +114,10 @@ int cmd_info(const std::string& gpu, bool json) {
     std::printf("\n");
     if (!p.verified)
       std::printf(
-          "  NOTE: profile values are placeholders from public documentation;\n"
-          "        not yet confirmed by hardware characterization (verified: false)\n");
+          "  NOTE: not confirmed by hardware characterization (verified: false).\n"
+          "        Where the values came from differs per profile -- some are read from\n"
+          "        public documentation, some inherited from a verified profile of the\n"
+          "        same die -- so the profile's own header says which.\n");
   }
   return 0;
 }

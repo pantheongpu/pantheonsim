@@ -29,7 +29,7 @@ Working today, all CPU-only:
 
 | Area | State |
 | --- | --- |
-| Device profiles | NVIDIA A10/A100/H100/H200/B200 and AMD MI300X/MI325X/MI350X (data-driven YAML; AMD is discovery-only). Values are placeholders pending hardware characterization |
+| Device profiles | Ten NVIDIA profiles verified against physical cards across six architectures — Turing, Ampere sm_80/sm_86, Ada, Hopper, Grace-Hopper — each matching its device on 512 conformance values. `h200` and `b200` are not yet characterized, and AMD MI300X/MI325X/MI350X are discovery-only placeholders; each profile's header says where its values came from |
 | `vgpu` CLI | `list-gpus`, `info --gpu <id> [--json]`, `demo vectoradd` |
 | Virtual VRAM | sparse/lazy backing — a virtual H200 claims 141 GB on a 16 GB host; OOB / use-after-free / double-free / misalignment diagnostics |
 | PTX | lexer/parser for a growing subset (see ARCHITECTURE.md); precise `unsupported` errors for the rest |

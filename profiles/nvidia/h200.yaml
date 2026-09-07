@@ -1,6 +1,23 @@
 # VirtualGPU device profile: NVIDIA H200 (SXM).
-# Public documentation values (sm_90, Hopper refresh with 141 GB HBM3e);
-# verified: false = placeholders pending hardware characterization.
+#
+# Provenance, because "placeholder" understated this one. The H200 is the same
+# GH100 die as the H100 SXM5 at the same compute capability, so every field the
+# execution model consults -- the whole limits block, the features, the SM
+# count -- is inherited from profiles/nvidia/h100.yaml, which *was* read from a
+# physical card and matches it on 512 conformance values. Diff the two files
+# and the functional part is identical.
+#
+# Three fields were read from no device: vram_bytes, mem_clock_max_mhz and
+# pci_device_id. Only the first is functional; the other two are telemetry,
+# which is presentation and never consulted by the interpreter.
+#
+# verified stays false, and vram_bytes is exactly why. It is the one field that
+# differs between two *physically identical* cards -- an A10 with ECC on reads
+# 1.5 GiB below the same A10 with it off, and two H100 SXM5s differed by 10 MiB
+# of driver reservation. So the single functional value not inherited here is
+# also the single least inferable one, and inheriting the rest correctly does
+# not make it measured. `verified` means read from hardware; it does not mean
+# believed to be right.
 id: nvidia/h200
 vendor: nvidia
 model: "NVIDIA H200"

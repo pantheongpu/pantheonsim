@@ -112,6 +112,20 @@ capacity when it was first tried, and the G-instance vCPU quota is still zero
 in every region except us-east-1. It launched on the third availability zone
 the script tried, which is the reason that loop exists.
 
+**H200 is a special case worth naming.** It is the same GH100 die as the H100
+SXM5 at the same compute capability, so every field the execution model
+consults -- the whole limits block, the features, the SM count -- is inherited
+from the *verified* `nvidia/h100`, not from a datasheet. Diff the two profiles
+and the functional part is identical; only `vram_bytes`, `mem_clock_max_mhz`
+and `pci_device_id` differ, and of those only the first is functional.
+
+It stays `verified: false` anyway, and `vram_bytes` is the reason. That is the
+one field that differs between two *physically identical* cards, so the single
+functional value not inherited is also the single least inferable one.
+Inheriting the rest correctly does not make it measured. Lambda offers no H200,
+so closing this means EC2 `p5en.48xlarge` -- eight of them, which is why it is
+still open.
+
 **`vram_bytes` is a property of a configuration, not of a model.** Two A10s
 characterized months apart differ by 1.5 GiB, which is the ECC reservation:
 one had ECC on and the other off. Two H100 SXM5s differ by 10 MiB of
