@@ -50,6 +50,28 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
 - Warp membership: %lanemask_{eq,lt,le,gt,ge}, %warpid, activemask, bar.red,
   redux.sync. An undeclared %name is now reported as a special register this
   engine does not have rather than treated as a register nothing has written.
+- The rest of the special-register set a kernel is likely to read: %smid and
+  %nsmid (blocks are placed round robin over the profile's SM count -- a real
+  placement, and what a persistent kernel needs to partition work), %gridid,
+  %dynamic_smem_size, %total_smem_size, and the clock family
+  (%clock, %clock_hi, %clock64, %globaltimer{,_lo,_hi}).
+
+  **The clock family is a counter, not a time.** There is no timing model here,
+  and inventing a number that looked like nanoseconds would be the same mistake
+  as reporting a cache hit rate. What exists is a deterministic count of
+  instructions issued by the block, which is monotonic -- and that is the only
+  property most kernels use these for: spin-with-a-deadline and exponential
+  backoff need the value to *advance*, not to be accurate. So a kernel that
+  waits on %clock64 terminates, and a kernel that measures with it gets a
+  reproducible number that is not a duration. Refusing the register instead
+  failed the whole kernel over something it read only to decide when to stop
+  waiting.
+
+  Still refused, each by name: the thread-block cluster registers (%clusterid,
+  %cluster_ctaid, %cluster_ctarank, %is_explicit_cluster), which need a cluster
+  concept the scheduler does not have; %pm0-%pm7, which are hardware
+  performance-monitor counters with no defined value unless a profiler set
+  them; and %current_graph_exec.
 - f16 (software IEEE binary16) and packed f16x2 arithmetic.
 - CUDA Graphs: real stream capture -> record -> replay.
 - Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual

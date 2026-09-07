@@ -105,9 +105,14 @@ VTEST(an_unknown_special_register_is_not_silently_a_register) {
   // had written -- so it read as zero and CUB's radix sort ranked every lane at
   // zero and stored four bytes below its shared array. An unimplemented special
   // register has to say so.
-  auto err = VCAPTURE(Error, parse(wrap_kernel("mov.u32 %r1, %total_smem_size;\nret;")));
+  //
+  // The example has to be one that is genuinely still unimplemented: this test
+  // named %total_smem_size until that was implemented, and then failed --
+  // which is the test working, not breaking. %clusterid needs a thread-block
+  // cluster concept the scheduler does not have.
+  auto err = VCAPTURE(Error, parse(wrap_kernel("mov.u32 %r1, %clusterid.x;\nret;")));
   VCHECK(err.code() == Err::UnsupportedPtx);
-  VCHECK_CONTAINS(err.what(), "%total_smem_size");
+  VCHECK_CONTAINS(err.what(), "%clusterid");
 }
 
 VTEST(lane_masks_are_the_masks_they_name) {

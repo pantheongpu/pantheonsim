@@ -1642,6 +1642,189 @@ DONE:
 }
 )";
 
+// ---- special registers added for kernels that read them ----
+
+VTEST(clock64_advances_and_never_goes_backwards) {
+  // The property kernels actually depend on. A spin-with-a-deadline loop needs
+  // the value to move; it does not need it to be a duration, and here it is
+  // not one -- see the note at sreg_value().
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u64 %rd3, %clock64;
+    // Some work between the two reads.
+    mov.u32 %r1, 0;
+    add.s32 %r1, %r1, 1;
+    add.s32 %r1, %r1, 1;
+    add.s32 %r1, %r1, 1;
+    mov.u64 %rd4, %clock64;
+    sub.s64 %rd5, %rd4, %rd3;
+    st.global.u64 [%rd2], %rd5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  const uint64_t elapsed = e.mem.load_scalar(out, 8);
+  VCHECK(elapsed > 0);                 // it advanced
+  VCHECK(elapsed < (1ull << 32));      // and did not wrap or go negative
+}
+
+VTEST(smid_is_within_the_devices_multiprocessor_count) {
+  // A persistent kernel partitions work by %smid, so the values have to be
+  // distinct and in range. Round robin over the profile's SM count gives both.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %smid;
+    mov.u32 %r3, %nsmid;
+    mul.wide.u32 %rd3, %r1, 8;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r2;
+    st.global.u32 [%rd4+4], %r3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(128);
+  LaunchConfig cfg;
+  cfg.grid = {8, 1, 1};
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  const uint64_t sms = e.prof.limits.multiprocessors;
+  VCHECK(sms > 0);
+  for (uint32_t b = 0; b < 8; ++b) {
+    VCHECK_EQ(e.mem.load_scalar(out + b * 8, 4), uint64_t{b % sms});
+    VCHECK_EQ(e.mem.load_scalar(out + b * 8 + 4, 4), sms);
+  }
+}
+
+VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
+  // %dynamic_smem_size is the launch's dynamic bytes; %total_smem_size adds the
+  // module's static declarations. Both are known exactly, so there is no reason
+  // for a kernel to be refused over them.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .shared .align 4 .b8 tile[256];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %dynamic_smem_size;
+    mov.u32 %r2, %total_smem_size;
+    st.global.u32 [%rd2], %r1;
+    st.global.u32 [%rd2+4], %r2;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  cfg.shared_bytes = 512;
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{512});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{512 + 256});
+}
+
+VTEST(gridid_differs_between_launches) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u64 %rd3, %gridid;
+    st.global.u64 [%rd2], %rd3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t a = e.mem.alloc(8), b = e.mem.alloc(8);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(a)}, e.mem, e.prof);
+  exec::launch(m.entries[0], cfg, {arg_u64(b)}, e.mem, e.prof);
+  const uint64_t first = e.mem.load_scalar(a, 8), second = e.mem.load_scalar(b, 8);
+  VCHECK(first != 0);
+  VCHECK(second == first + 1);
+}
+
+VTEST(local_traffic_is_counted_in_bytes_as_well_as_operations) {
+  // Global and shared had byte totals and local did not, so a spill-heavy
+  // kernel could not be compared against a global-memory-heavy one in the same
+  // units.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .local .align 4 .b8 depot[64];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u64 %rd3, depot;
+    mov.u32 %r1, 42;
+    st.local.u32 [%rd3], %r1;
+    ld.local.u32 %r2, [%rd3];
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  LaunchConfig cfg;
+  cfg.block = {4, 1, 1};
+  auto st = exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{42});
+  VCHECK_EQ(st.local_stores, uint64_t{4});
+  VCHECK_EQ(st.local_loads, uint64_t{4});
+  VCHECK_EQ(st.local_bytes_written, uint64_t{16});  // 4 lanes x 4 bytes
+  VCHECK_EQ(st.local_bytes_read, uint64_t{16});
+}
+
+VTEST(atomics_report_the_bytes_they_moved) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 1;
+    atom.global.add.u32 %r2, [%rd2], %r1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  e.mem.store_scalar(out, 4, 0);
+  LaunchConfig cfg;
+  cfg.block = {8, 1, 1};
+  auto st = exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{8});
+  VCHECK_EQ(st.atomics, uint64_t{8});
+  VCHECK_EQ(st.atomic_bytes, uint64_t{32});  // 8 lanes x 4 bytes
+}
+
 // ---- texture and surface objects ----
 //
 // The handle a kernel receives is only a number; what it means comes from the

@@ -34,6 +34,12 @@
 
 namespace {
 
+// Reported by cuDriverGetVersion. Fixed rather than derived from a toolkit,
+// because this shim deliberately has no toolkit dependency -- it builds against
+// the clean-room vgpu_cuda.h and exists on machines with no CUDA installed at
+// all. libvgpucudart takes its version from the toolkit it was built against,
+// so the two can differ; a driver at least as new as the runtime it serves is
+// the normal configuration on real machines too, not a disagreement.
 constexpr int kDriverVersion = 13000;  // reported as CUDA 13.0
 
 // Handle tagging: low 3 bits encode the handle type so passing e.g. a module

@@ -113,6 +113,10 @@ struct BlockCtx {
   std::vector<uint8_t>* shared = nullptr;
   BarrierReduction* bar_red = nullptr;
   SharedShadow* shadow = nullptr;   // non-null only when race detection is on
+  // Backs %clock/%clock64/%globaltimer. Advanced once per warp instruction,
+  // per block -- see the note at sreg_value() for why this is a counter and
+  // not a time.
+  uint64_t* clock = nullptr;
 };
 
 // One diverged execution path: a set of lanes sharing a program counter.
@@ -281,6 +285,7 @@ class Interpreter {
   }
 
   void set_concurrent(bool v) { concurrent_ = v; }
+  void set_grid_id(uint64_t v) { grid_id_ = v; }
 
   void run_grid() {
     const uint64_t total = uint64_t{cfg_.grid[0]} * cfg_.grid[1] * cfg_.grid[2];
@@ -372,6 +377,7 @@ class Interpreter {
     BarrierReduction bar_red;
     SharedShadow shadow;
     std::vector<Warp> warps;
+    uint64_t clock = 0;
     bool done = false;
   };
 
@@ -381,6 +387,7 @@ class Interpreter {
     b.shared.assign(fn_.static_shared_size + cfg_.shared_bytes, 0);
     b.ctx.shared = &b.shared;
     b.ctx.bar_red = &b.bar_red;
+    b.ctx.clock = &b.clock;
     if (detect_races() && !b.shared.empty()) {
       b.shadow.words.assign(b.shared.size() / 4 + 1, WordShadow{});
       b.ctx.shadow = &b.shadow;
@@ -501,6 +508,7 @@ class Interpreter {
       const InstClass cls = class_of_pc(w.paths[idx].pc);
       stats_.inst_by_class[static_cast<size_t>(cls)] += lanes;
       if (cls == InstClass::Tensor) ++stats_.tensor_instructions;
+      if (ctx.clock) ++*ctx.clock;
       if (++stats_.instructions > cfg_.max_steps)
         throw Error::make(Err::ExecLimit, "kernel '", fn_.name, "' exceeded the launch step budget (",
                           cfg_.max_steps, " instructions) — possible infinite loop");
@@ -647,7 +655,24 @@ class Interpreter {
     return scratch;
   }
 
-  uint32_t sreg_value(Sreg s, uint32_t index, const Warp& w, const BlockCtx& ctx, uint32_t lane) {
+  // Special registers.
+  //
+  // The clock family needs a word of explanation, because the honest answer is
+  // "these are not times". VirtualGPU has no timing model: it does not know how
+  // long anything takes, and inventing a number that looked like nanoseconds
+  // would be the same mistake as reporting a cache hit rate. What it does have
+  // is a deterministic count of instructions issued, and that count is
+  // monotonic -- which is the only property most kernels actually use these
+  // for. Spin-with-a-deadline and exponential backoff need the value to
+  // *advance*, not to be accurate.
+  //
+  // So a kernel that waits on %clock64 terminates, and a kernel that measures
+  // with it gets a reproducible number that is not a duration. That is a
+  // documented divergence, in the same family as the SFU transcendentals being
+  // more accurate here than on hardware. The alternative was refusing the
+  // register, which failed the entire kernel over something it read only to
+  // decide when to stop waiting.
+  uint64_t sreg_value(Sreg s, uint32_t index, const Warp& w, const BlockCtx& ctx, uint32_t lane) {
     switch (s) {
       case Sreg::TidX: return w.tid_x[lane];
       case Sreg::TidY: return w.tid_y[lane];
@@ -692,6 +717,37 @@ class Interpreter {
         return 0;
       case Sreg::NWarpId:
         return (ctx.ntid[0] * ctx.ntid[1] * ctx.ntid[2] + kWarpSize - 1) / kWarpSize;
+
+      // ---- the clock family: a counter, not a time (see above) ----
+      case Sreg::Clock: return static_cast<uint32_t>(ctx.clock ? *ctx.clock : 0);
+      case Sreg::ClockHi: return static_cast<uint32_t>((ctx.clock ? *ctx.clock : 0) >> 32);
+      case Sreg::Clock64: return ctx.clock ? *ctx.clock : 0;
+      // %globaltimer is nanoseconds on hardware. Scaled from the same counter
+      // so the two stay consistent with each other: a kernel that compares them
+      // sees one clock, not two that disagree.
+      case Sreg::GlobalTimer: return ctx.clock ? *ctx.clock : 0;
+      case Sreg::GlobalTimerLo: return static_cast<uint32_t>(ctx.clock ? *ctx.clock : 0);
+      case Sreg::GlobalTimerHi: return static_cast<uint32_t>((ctx.clock ? *ctx.clock : 0) >> 32);
+
+      // Which multiprocessor the block landed on. Blocks are assigned round
+      // robin over the profile's SM count, which is a real assignment rather
+      // than a made-up number: the block does run somewhere, and round robin is
+      // the most even placement. Persistent kernels use this to partition work,
+      // and they need distinct values far more than they need the exact one
+      // hardware would have chosen.
+      case Sreg::SmId: {
+        const uint32_t sms = profile_.limits.multiprocessors;
+        if (!sms) return 0;
+        const uint64_t linear = uint64_t{ctx.ctaid[0]} +
+                                uint64_t{ctx.ctaid[1]} * ctx.nctaid[0] +
+                                uint64_t{ctx.ctaid[2]} * ctx.nctaid[0] * ctx.nctaid[1];
+        return static_cast<uint32_t>(linear % sms);
+      }
+      case Sreg::NSmId: return profile_.limits.multiprocessors;
+
+      case Sreg::DynamicSmemSize: return cfg_.shared_bytes;
+      case Sreg::TotalSmemSize: return fn_.static_shared_size + cfg_.shared_bytes;
+      case Sreg::GridId: return grid_id_;
     }
     return 0;
   }
@@ -858,7 +914,8 @@ class Interpreter {
         else { stats_.shared_loads += n; stats_.shared_bytes_read += b; }
         break;
       case Space::Local:
-        if (is_store) stats_.local_stores += n; else stats_.local_loads += n;
+        if (is_store) { stats_.local_stores += n; stats_.local_bytes_written += b; }
+        else { stats_.local_loads += n; stats_.local_bytes_read += b; }
         break;
       case Space::Param:
         // Kernel parameters are read from the constant bank, not from device
@@ -3137,6 +3194,7 @@ class Interpreter {
         if (lock_needed)
           guard = std::unique_lock<std::mutex>(atomic_lock_for(addr));
         ++stats_.atomics;
+        stats_.atomic_bytes += size;
         uint64_t old = load_routed(w, ctx, ins, lane, addr, size);
         uint64_t b = mask_to_bits(bv[lane], op.ty.bits);
         uint64_t nv = old;
@@ -3358,6 +3416,10 @@ class Interpreter {
   // of variant tests, and the instruction stream is the hottest path there is.
   mutable std::vector<uint8_t> class_by_pc_;
   uint32_t cur_warp_ = 0;     // which warp of the block is running, for race reports
+  // %gridid: a serial number distinguishing this launch from every other one in
+  // the process. Assigned once per launch rather than per interpreter, so the
+  // workers of one launch agree.
+  uint64_t grid_id_ = 0;
   bool concurrent_ = false;   // set when the grid is split across threads
   std::chrono::steady_clock::time_point last_progress_;
 };
@@ -3549,6 +3611,10 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
                    const ProgressFn& progress) {
   refresh_modes();
   validate(fn, cfg, profile);
+  // One %gridid per launch. Starts at 1 so an unset value reads as "no launch"
+  // rather than as the first one.
+  static std::atomic<uint64_t> g_next_grid_id{1};
+  const uint64_t grid_id = g_next_grid_id.fetch_add(1, std::memory_order_relaxed);
   LaunchConfig eff = cfg;
   eff.max_steps = effective_max_steps(cfg.max_steps);
 
@@ -3580,6 +3646,7 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
   if (nthreads <= 1) {
     LaunchStats stats;
     Interpreter interp(fn, eff, pb, mem, profile, symbols, stats, progress);
+    interp.set_grid_id(grid_id);
     interp.run_grid();
     return stats;
   }
@@ -3601,6 +3668,7 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
         Interpreter interp(fn, eff, pb, mem, profile, symbols, per_thread[t],
                            t == 0 ? progress : ProgressFn{});
         interp.set_concurrent(true);
+        interp.set_grid_id(grid_id);
         interp.run_block_range(begin, end);
       } catch (...) {
         std::lock_guard<std::mutex> lock(err_mu);
