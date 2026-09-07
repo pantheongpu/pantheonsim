@@ -89,7 +89,7 @@ an instance left running bills by the hour).
 `tools/compare-profile.py` diffs a measured profile against the one in the
 tree, so corrections are visible rather than silently applied.
 
-Verified against real hardware, eight devices across five architectures:
+Verified against real hardware, nine devices across six architectures:
 
 | profile | device | how |
 | --- | --- | --- |
@@ -101,9 +101,16 @@ Verified against real hardware, eight devices across five architectures:
 | `nvidia/h100-pcie` | H100 80GB PCIe (sm_90) | Lambda `gpu_1x_h100_pcie` |
 | `nvidia/t4` | Tesla T4 (sm_75, Turing) | EC2 `g4dn.xlarge` |
 | `nvidia/a10g` | A10G (sm_86) | EC2 `g5.xlarge` |
+| `nvidia/l4` | L4 (sm_89, Ada Lovelace) | EC2 `g6.xlarge` |
 
-All eight match the physical device on **512 conformance values each** -- the
+All nine match the physical device on **512 conformance values each** -- the
 same binary run on hardware and on VirtualGPU, diffed.
+
+Ada was the last architecture gap in the supported range. It stayed open for a
+while because capacity and quota were both against it: us-east-1 had no L4
+capacity when it was first tried, and the G-instance vCPU quota is still zero
+in every region except us-east-1. It launched on the third availability zone
+the script tried, which is the reason that loop exists.
 
 **`vram_bytes` is a property of a configuration, not of a model.** Two A10s
 characterized months apart differ by 1.5 GiB, which is the ECC reservation:
