@@ -193,8 +193,13 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
 
 }  // namespace
 
-void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
+void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
                     const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms) {
+  // Texture objects belong to the device, so the launch does not have to be
+  // told about them by every caller. A caller that set them explicitly keeps
+  // its own table.
+  exec::LaunchConfig cfg = in_cfg;
+  if (!cfg.textures && !textures_.empty()) cfg.textures = &textures_;
   if (!telemetry_) {
     report_counters(fn.name, cfg, exec::launch(fn, cfg, args, mem_, profile_, syms));
     return;

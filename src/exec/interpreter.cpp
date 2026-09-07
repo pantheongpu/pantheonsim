@@ -1907,6 +1907,18 @@ class Interpreter {
       exec_vprintf(w, ctx, ins, *op, m);
       return;
     }
+    if (const auto* op = std::get_if<OpTex>(&ins.op)) {
+      exec_tex(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpSuld>(&ins.op)) {
+      exec_suld(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpSust>(&ins.op)) {
+      exec_sust(w, ctx, ins, *op, m);
+      return;
+    }
     if (std::holds_alternative<OpTrap>(ins.op)) {
       // "trap" ends the kernel with an unrecoverable device-side error. On
       // hardware the launch fails and the context is left unusable; here it is
@@ -2112,6 +2124,244 @@ class Interpreter {
       }
     }
     if (carry_out) w.carry = out;
+  }
+
+  // ---- texture and surface objects ----
+  //
+  // A texture fetch is an addressed read with a format conversion on the end.
+  // There is no texture cache modelled here and no interpolation: what is
+  // implemented is the part that changes results rather than timing.
+
+  const TextureDesc& texture_for(const Instr& ins, uint64_t handle, TexKind want) {
+    if (!cfg_.textures || cfg_.textures->empty())
+      ctx_fail(ins, -1, Err::InvalidValue,
+               "this launch has no texture or surface objects, but the kernel used one. The "
+               "handle a kernel receives is created by cudaCreateTextureObject or "
+               "cudaCreateSurfaceObject on the host");
+    auto it = cfg_.textures->find(handle);
+    if (it == cfg_.textures->end())
+      ctx_fail(ins, -1, Err::InvalidValue,
+               "texture/surface handle " + std::to_string(handle) +
+                   " was never created, or was already destroyed");
+    if (it->second.object != want)
+      ctx_fail(ins, -1, Err::InvalidValue,
+               std::string("this is a ") +
+                   (it->second.object == TexKind::Surface ? "surface" : "texture") +
+                   " object, but the instruction is a " +
+                   (want == TexKind::Surface ? "surface" : "texture") +
+                   " access. The two have the same shape of handle and are not "
+                   "interchangeable");
+    return it->second;
+  }
+
+  // Applies the addressing mode. Returns false when the texel is outside and
+  // the mode says to produce the border colour rather than clamp to an edge.
+  static bool wrap_coord(TexAddress mode, int64_t v, uint32_t size, uint32_t* out) {
+    if (size == 0) { *out = 0; return true; }
+    const int64_t n = static_cast<int64_t>(size);
+    switch (mode) {
+      case TexAddress::Clamp:
+        if (v < 0) v = 0;
+        if (v >= n) v = n - 1;
+        break;
+      case TexAddress::Wrap:
+        v %= n;
+        if (v < 0) v += n;
+        break;
+      case TexAddress::Mirror: {
+        const int64_t period = 2 * n;
+        int64_t t = v % period;
+        if (t < 0) t += period;
+        v = (t < n) ? t : (period - 1 - t);
+        break;
+      }
+      case TexAddress::Border:
+        if (v < 0 || v >= n) return false;
+        break;
+    }
+    *out = static_cast<uint32_t>(v);
+    return true;
+  }
+
+  // Reads one channel's raw bits out of a texel.
+  uint64_t texel_channel_bits(const TextureDesc& d, uint64_t texel_addr, uint32_t ch,
+                              const Instr& ins, uint32_t lane) {
+    uint32_t offset = 0;
+    for (uint32_t i = 0; i < ch; ++i) offset += d.channel_bits[i] / 8;
+    const uint32_t bytes = d.channel_bits[ch] / 8;
+    if (bytes == 0) return 0;
+    try {
+      return mem_.load_scalar(texel_addr + offset, bytes);
+    } catch (const Error& e) {
+      rethrow_with_context(e, ins, static_cast<int>(lane));
+    }
+  }
+
+  // Converts one channel to the 32 bits the destination register wants.
+  uint32_t convert_channel(const TextureDesc& d, uint32_t ch, uint64_t raw, Type dtype) {
+    const uint32_t bits = d.channel_bits[ch];
+    if (bits == 0) {
+      // A channel the format does not have. Hardware returns 0 for x/y/z and 1
+      // for w; matching that matters because a kernel reading .w of a
+      // single-channel texture expects 1, not 0.
+      if (ch == 3) return dtype.is_float() ? static_cast<uint32_t>(f32bits(1.0f)) : 1u;
+      return 0;
+    }
+    if (d.kind == ChannelKind::Float) {
+      if (bits == 32) return static_cast<uint32_t>(raw);
+      if (bits == 16) return static_cast<uint32_t>(f32bits(static_cast<float>(f16_to_double(raw))));
+      return 0;
+    }
+    // Integer channels. Sign-extend first, because everything downstream --
+    // both the integer result and the normalized float -- depends on it.
+    int64_t sv = static_cast<int64_t>(raw);
+    if (d.kind == ChannelKind::Signed && bits < 64) {
+      const uint64_t sign = 1ull << (bits - 1);
+      if (raw & sign) sv = static_cast<int64_t>(raw | ~((1ull << bits) - 1));
+    }
+    if (d.read_as_normalized_float) {
+      // cudaReadModeNormalizedFloat: unsigned maps onto [0,1], signed onto
+      // [-1,1], both by the widest magnitude the channel can hold.
+      const double scale = static_cast<double>((1ull << (bits - (d.kind == ChannelKind::Signed ? 1 : 0))) - 1);
+      double f = static_cast<double>(sv) / scale;
+      if (d.kind == ChannelKind::Signed && f < -1.0) f = -1.0;
+      return static_cast<uint32_t>(f32bits(static_cast<float>(f)));
+    }
+    if (dtype.is_float()) return static_cast<uint32_t>(f32bits(static_cast<float>(sv)));
+    return static_cast<uint32_t>(sv);
+  }
+
+  void exec_tex(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTex& op, Mask m) {
+    Lanes _s_obj;
+    const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
+    std::array<Lanes, 3> coord;
+    std::array<Lanes, 3> coord_scratch;
+    for (uint32_t i = 0; i < op.dims; ++i)
+      coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
+
+    std::array<Lanes, 4> out;
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      if (!(m & (1u << lane))) continue;
+      const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Texture);
+      if (d.filter != TexFilter::Point)
+        ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+                 "cudaFilterModeLinear is not implemented. Interpolation between texels is a "
+                 "documented weighted average, but hardware computes the weights in a fixed-point "
+                 "format with 8 fractional bits, so a float implementation would differ from the "
+                 "device in the low bits -- which is exactly what differential testing here is "
+                 "meant to catch. Point sampling is exact");
+
+      const uint32_t size[3] = {d.width, d.height, d.depth};
+      bool inside = true;
+      uint32_t idx[3] = {0, 0, 0};
+      for (uint32_t i = 0; i < op.dims; ++i) {
+        int64_t c;
+        if (op.ctype.is_float()) {
+          float f = f32(coord[i][lane]);
+          if (d.normalized_coords) f *= static_cast<float>(size[i]);
+          // Point sampling takes the texel the coordinate falls in. CUDA's
+          // sampled coordinates are texel-centred, so x+0.5 addresses texel x.
+          c = static_cast<int64_t>(std::floor(f));
+        } else {
+          c = static_cast<int64_t>(static_cast<int32_t>(coord[i][lane]));
+        }
+        if (!wrap_coord(d.address[i], c, size[i], &idx[i])) { inside = false; break; }
+      }
+
+      if (!inside) {
+        // Border addressing outside the extent: all components zero, which is
+        // the default border colour.
+        for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = 0;
+        continue;
+      }
+      const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
+      const uint64_t plane = row * (d.height ? d.height : 1);
+      const uint64_t addr = d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes;
+      for (uint32_t ch = 0; ch < 4; ++ch)
+        out[ch][lane] = convert_channel(d, ch, texel_channel_bits(d, addr, ch, ins, lane), op.dtype);
+    }
+    count_memory(Space::Global, 4 * 4, popcount_mask(m), /*is_store=*/false);
+    for (uint32_t ch = 0; ch < 4 && ch < op.dsts.size(); ++ch)
+      write_reg(w, op.dsts[ch], m, out[ch], 32);
+  }
+
+  // suld/sust address a surface in *bytes* along x and in whole rows along y
+  // and z, which is why they take no format: they move raw bytes.
+  uint64_t surface_address(const Instr& ins, uint32_t lane, const TextureDesc& d,
+                           const std::array<Lanes, 3>& coord, uint32_t dims, uint32_t bytes) {
+    const int64_t x = static_cast<int32_t>(coord[0][lane]);
+    const int64_t y = dims > 1 ? static_cast<int32_t>(coord[1][lane]) : 0;
+    const int64_t z = dims > 2 ? static_cast<int32_t>(coord[2][lane]) : 0;
+    const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
+    const uint64_t plane = row * (d.height ? d.height : 1);
+    // ".trap" is the out-of-range policy ptxas emits, and it means what it
+    // says: the access faults rather than being clamped or dropped.
+    const int64_t row_bytes = static_cast<int64_t>(uint64_t{d.width} * d.texel_bytes);
+    if (x < 0 || x + static_cast<int64_t>(bytes) > row_bytes ||
+        (d.height && (y < 0 || y >= static_cast<int64_t>(d.height))) ||
+        (d.depth && (z < 0 || z >= static_cast<int64_t>(d.depth))))
+      ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+               "surface access at byte x=" + std::to_string(x) + ", y=" + std::to_string(y) +
+                   " is outside the " + std::to_string(d.width) + "x" + std::to_string(d.height) +
+                   " surface (" + std::to_string(row_bytes) +
+                   " bytes per row). The instruction's '.trap' policy is what makes this a fault "
+                   "rather than a clamp");
+    return d.base + z * plane + y * row + static_cast<uint64_t>(x);
+  }
+
+  void exec_suld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSuld& op, Mask m) {
+    Lanes _s_obj;
+    const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
+    std::array<Lanes, 3> coord;
+    std::array<Lanes, 3> coord_scratch;
+    for (uint32_t i = 0; i < op.dims; ++i)
+      coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
+    std::vector<Lanes> out(op.dsts.size());
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      if (!(m & (1u << lane))) continue;
+      const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Surface);
+      const uint64_t base = surface_address(ins, lane, d, coord, op.dims,
+                                            op.bytes * static_cast<uint32_t>(op.dsts.size()));
+      for (size_t c = 0; c < op.dsts.size(); ++c) {
+        try {
+          out[c][lane] = mem_.load_scalar(base + c * op.bytes, op.bytes);
+        } catch (const Error& e) {
+          rethrow_with_context(e, ins, static_cast<int>(lane));
+        }
+      }
+    }
+    count_memory(Space::Global, op.bytes * static_cast<uint32_t>(op.dsts.size()), popcount_mask(m),
+                 /*is_store=*/false);
+    for (size_t c = 0; c < op.dsts.size(); ++c)
+      write_reg(w, op.dsts[c], m, out[c], op.bytes * 8 > 32 ? 64 : 32);
+  }
+
+  void exec_sust(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSust& op, Mask m) {
+    Lanes _s_obj;
+    const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
+    std::array<Lanes, 3> coord;
+    std::array<Lanes, 3> coord_scratch;
+    for (uint32_t i = 0; i < op.dims; ++i)
+      coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
+    std::vector<Lanes> src(op.srcs.size());
+    std::vector<Lanes> src_scratch(op.srcs.size());
+    for (size_t c = 0; c < op.srcs.size(); ++c)
+      src[c] = read_operand(w, ctx, ins, op.srcs[c], src_scratch[c]);
+    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      if (!(m & (1u << lane))) continue;
+      const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Surface);
+      const uint64_t base = surface_address(ins, lane, d, coord, op.dims,
+                                            op.bytes * static_cast<uint32_t>(op.srcs.size()));
+      for (size_t c = 0; c < op.srcs.size(); ++c) {
+        try {
+          mem_.store_scalar(base + c * op.bytes, op.bytes, src[c][lane]);
+        } catch (const Error& e) {
+          rethrow_with_context(e, ins, static_cast<int>(lane));
+        }
+      }
+    }
+    count_memory(Space::Global, op.bytes * static_cast<uint32_t>(op.srcs.size()), popcount_mask(m),
+                 /*is_store=*/true);
   }
 
   // add/sub with the condition-code carry bit. PTX defines subtraction's carry

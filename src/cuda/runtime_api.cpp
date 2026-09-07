@@ -1155,6 +1155,304 @@ VGPU_EXPORT cudaError_t cudaGraphExecUpdate(cudaGraphExec_t, cudaGraph_t,
   return cudaErrorGraphExecUpdateFailure;
 }
 
+/* ===================================================================== */
+/* Texture and surface objects                                           */
+/*                                                                       */
+/* A texture object is a handle over memory plus a description of how to */
+/* read it. The kernel receives only the handle, so everything else has  */
+/* to be recorded here for the launch to consult -- see                  */
+/* include/vgpu/exec/texture.hpp.                                        */
+/*                                                                       */
+/* No texture cache is modelled: a fetch reads the same bytes an         */
+/* ordinary load would, because VirtualGPU has no memory hierarchy to    */
+/* model it against. Addressing and format conversion are implemented,   */
+/* because those change results rather than timing.                      */
+/* ===================================================================== */
+
+namespace {
+
+// A cudaArray here is device memory with its shape recorded alongside. Hardware
+// stores arrays in an opaque, swizzled layout that only the texture units can
+// address; nothing here depends on that layout, so a dense row-major buffer
+// serves, and cudaMemcpy2DToArray is an ordinary strided copy.
+struct ArrayRec {
+  uint64_t base = 0;
+  uint64_t bytes = 0;
+  uint32_t width = 0, height = 0, depth = 0;
+  cudaChannelFormatDesc fmt{};
+  uint32_t texel_bytes = 0;
+  int device = 0;
+};
+std::unordered_map<uint64_t, ArrayRec> g_arrays;
+uint64_t g_next_array = 1;
+
+uint32_t texel_bytes_of(const cudaChannelFormatDesc& f) {
+  return static_cast<uint32_t>((f.x + f.y + f.z + f.w + 7) / 8);
+}
+uint32_t channels_of(const cudaChannelFormatDesc& f) {
+  return (f.x ? 1u : 0u) + (f.y ? 1u : 0u) + (f.z ? 1u : 0u) + (f.w ? 1u : 0u);
+}
+
+bool channel_kind_of(const cudaChannelFormatDesc& f, vgpu::exec::ChannelKind* out) {
+  switch (f.f) {
+    case cudaChannelFormatKindSigned: *out = vgpu::exec::ChannelKind::Signed; return true;
+    case cudaChannelFormatKindUnsigned: *out = vgpu::exec::ChannelKind::Unsigned; return true;
+    case cudaChannelFormatKindFloat: *out = vgpu::exec::ChannelKind::Float; return true;
+    default: return false;  // NV12, block-compressed and the rest
+  }
+}
+
+bool address_mode_of(cudaTextureAddressMode m, vgpu::exec::TexAddress* out) {
+  switch (m) {
+    case cudaAddressModeWrap: *out = vgpu::exec::TexAddress::Wrap; return true;
+    case cudaAddressModeClamp: *out = vgpu::exec::TexAddress::Clamp; return true;
+    case cudaAddressModeMirror: *out = vgpu::exec::TexAddress::Mirror; return true;
+    case cudaAddressModeBorder: *out = vgpu::exec::TexAddress::Border; return true;
+  }
+  return false;
+}
+
+// Handles are ordinary integers on hardware too, and a kernel can only tell
+// them apart by what the table says. Starting well above zero means a
+// forgotten initialisation looks like the invalid handle it is.
+uint64_t g_next_texobj = 0x1000;
+
+// Fills in the parts of the descriptor that come from the resource, whichever
+// kind it is. Returns an error code on the forms not implemented.
+cudaError_t fill_from_resource(const cudaResourceDesc* res, vgpu::exec::TextureDesc* d) {
+  switch (res->resType) {
+    case cudaResourceTypeLinear: {
+      d->base = reinterpret_cast<uint64_t>(res->res.linear.devPtr);
+      d->texel_bytes = texel_bytes_of(res->res.linear.desc);
+      if (d->texel_bytes == 0) return cudaErrorInvalidValue;
+      d->width = static_cast<uint32_t>(res->res.linear.sizeInBytes / d->texel_bytes);
+      d->height = 0;
+      d->depth = 0;
+      d->pitch_bytes = 0;
+      d->channels = channels_of(res->res.linear.desc);
+      d->channel_bits[0] = static_cast<uint32_t>(res->res.linear.desc.x);
+      d->channel_bits[1] = static_cast<uint32_t>(res->res.linear.desc.y);
+      d->channel_bits[2] = static_cast<uint32_t>(res->res.linear.desc.z);
+      d->channel_bits[3] = static_cast<uint32_t>(res->res.linear.desc.w);
+      if (!channel_kind_of(res->res.linear.desc, &d->kind)) return cudaErrorNotSupported;
+      return cudaSuccess;
+    }
+    case cudaResourceTypePitch2D: {
+      d->base = reinterpret_cast<uint64_t>(res->res.pitch2D.devPtr);
+      d->texel_bytes = texel_bytes_of(res->res.pitch2D.desc);
+      if (d->texel_bytes == 0) return cudaErrorInvalidValue;
+      d->width = static_cast<uint32_t>(res->res.pitch2D.width);
+      d->height = static_cast<uint32_t>(res->res.pitch2D.height);
+      d->depth = 0;
+      d->pitch_bytes = static_cast<uint32_t>(res->res.pitch2D.pitchInBytes);
+      d->channels = channels_of(res->res.pitch2D.desc);
+      d->channel_bits[0] = static_cast<uint32_t>(res->res.pitch2D.desc.x);
+      d->channel_bits[1] = static_cast<uint32_t>(res->res.pitch2D.desc.y);
+      d->channel_bits[2] = static_cast<uint32_t>(res->res.pitch2D.desc.z);
+      d->channel_bits[3] = static_cast<uint32_t>(res->res.pitch2D.desc.w);
+      if (!channel_kind_of(res->res.pitch2D.desc, &d->kind)) return cudaErrorNotSupported;
+      return cudaSuccess;
+    }
+    case cudaResourceTypeArray: {
+      auto it = g_arrays.find(reinterpret_cast<uint64_t>(res->res.array.array));
+      if (it == g_arrays.end()) return cudaErrorInvalidValue;
+      const ArrayRec& a = it->second;
+      d->base = a.base;
+      d->width = a.width;
+      d->height = a.height;
+      d->depth = a.depth;
+      d->pitch_bytes = a.width * a.texel_bytes;
+      d->texel_bytes = a.texel_bytes;
+      d->channels = channels_of(a.fmt);
+      d->channel_bits[0] = static_cast<uint32_t>(a.fmt.x);
+      d->channel_bits[1] = static_cast<uint32_t>(a.fmt.y);
+      d->channel_bits[2] = static_cast<uint32_t>(a.fmt.z);
+      d->channel_bits[3] = static_cast<uint32_t>(a.fmt.w);
+      d->from_array = true;
+      if (!channel_kind_of(a.fmt, &d->kind)) return cudaErrorNotSupported;
+      return cudaSuccess;
+    }
+    default:
+      // Mipmapped arrays need a level-of-detail selection this does not have.
+      return cudaErrorNotSupported;
+  }
+}
+
+}  // namespace
+
+// The templated cudaCreateChannelDesc<T>() in the toolkit header is an inline
+// that calls this, so it has to exist even though it computes nothing that
+// needs a device.
+VGPU_EXPORT cudaChannelFormatDesc cudaCreateChannelDesc(int x, int y, int z, int w,
+                                                        cudaChannelFormatKind f) {
+  cudaChannelFormatDesc d;
+  d.x = x;
+  d.y = y;
+  d.z = z;
+  d.w = w;
+  d.f = f;
+  return d;
+}
+
+VGPU_EXPORT cudaError_t cudaMallocArray(cudaArray_t* array, const cudaChannelFormatDesc* desc,
+                                        size_t width, size_t height, unsigned int flags) {
+  return guard("cudaMallocArray", [&](State& s) -> cudaError_t {
+    if (!array || !desc) return cudaErrorInvalidValue;
+    (void)flags;  // cudaArraySurfaceLoadStore changes nothing about the storage here
+    ArrayRec rec;
+    rec.fmt = *desc;
+    rec.texel_bytes = texel_bytes_of(*desc);
+    if (rec.texel_bytes == 0 || width == 0) return cudaErrorInvalidValue;
+    rec.width = static_cast<uint32_t>(width);
+    rec.height = static_cast<uint32_t>(height);
+    rec.depth = 0;
+    rec.bytes = uint64_t{rec.width} * (rec.height ? rec.height : 1) * rec.texel_bytes;
+    rec.device = s.current_device;
+    rec.base = current(s).memory().alloc(rec.bytes);
+    const uint64_t handle = g_next_array++;
+    g_arrays[handle] = rec;
+    *array = reinterpret_cast<cudaArray_t>(handle);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaFreeArray(cudaArray_t array) {
+  return guard("cudaFreeArray", [&](State& s) -> cudaError_t {
+    auto it = g_arrays.find(reinterpret_cast<uint64_t>(array));
+    if (it == g_arrays.end()) return cudaErrorInvalidValue;
+    s.rt->device(it->second.device).memory().free(it->second.base);
+    g_arrays.erase(it);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaGetChannelDesc(cudaChannelFormatDesc* desc, cudaArray_const_t array) {
+  return guard("cudaGetChannelDesc", [&](State&) -> cudaError_t {
+    auto it = g_arrays.find(reinterpret_cast<uint64_t>(array));
+    if (!desc || it == g_arrays.end()) return cudaErrorInvalidValue;
+    *desc = it->second.fmt;
+    return cudaSuccess;
+  });
+}
+
+// Copies into and out of an array. The array is dense row-major here, so these
+// are strided copies; on hardware they also convert between the linear source
+// and the array's swizzled layout, which is exactly the detail nothing outside
+// the texture unit is allowed to depend on.
+VGPU_EXPORT cudaError_t cudaMemcpy2DToArray(cudaArray_t dst, size_t wOffset, size_t hOffset,
+                                            const void* src, size_t spitch, size_t width,
+                                            size_t height, cudaMemcpyKind kind) {
+  return guard("cudaMemcpy2DToArray", [&](State& s) -> cudaError_t {
+    auto it = g_arrays.find(reinterpret_cast<uint64_t>(dst));
+    if (it == g_arrays.end() || !src) return cudaErrorInvalidValue;
+    const ArrayRec& a = it->second;
+    const uint64_t dpitch = uint64_t{a.width} * a.texel_bytes;
+    if (wOffset + width > dpitch || hOffset + height > (a.height ? a.height : 1))
+      return cudaErrorInvalidValue;
+    vgpu::MemoryManager& mem = s.rt->device(a.device).memory();
+    for (size_t row = 0; row < height; ++row) {
+      const uint64_t d = a.base + (hOffset + row) * dpitch + wOffset;
+      const uint8_t* srow = static_cast<const uint8_t*>(src) + row * spitch;
+      if (kind == cudaMemcpyDeviceToDevice) {
+        // Device to device: stage the row rather than assuming the two live in
+        // one address space, which they need not.
+        std::vector<uint8_t> stage(width);
+        mem.read(reinterpret_cast<uint64_t>(srow), stage.data(), width);
+        mem.write(d, stage.data(), width);
+      } else {
+        mem.write(d, srow, width);
+      }
+    }
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemcpy2DFromArray(void* dst, size_t dpitch, cudaArray_const_t src,
+                                              size_t wOffset, size_t hOffset, size_t width,
+                                              size_t height, cudaMemcpyKind kind) {
+  return guard("cudaMemcpy2DFromArray", [&](State& s) -> cudaError_t {
+    auto it = g_arrays.find(reinterpret_cast<uint64_t>(src));
+    if (it == g_arrays.end() || !dst) return cudaErrorInvalidValue;
+    const ArrayRec& a = it->second;
+    const uint64_t spitch = uint64_t{a.width} * a.texel_bytes;
+    if (wOffset + width > spitch || hOffset + height > (a.height ? a.height : 1))
+      return cudaErrorInvalidValue;
+    vgpu::MemoryManager& mem = s.rt->device(a.device).memory();
+    for (size_t row = 0; row < height; ++row) {
+      const uint64_t srow = a.base + (hOffset + row) * spitch + wOffset;
+      uint8_t* drow = static_cast<uint8_t*>(dst) + row * dpitch;
+      if (kind == cudaMemcpyDeviceToDevice) {
+        std::vector<uint8_t> stage(width);
+        mem.read(srow, stage.data(), width);
+        mem.write(reinterpret_cast<uint64_t>(drow), stage.data(), width);
+      } else {
+        mem.read(srow, drow, width);
+      }
+    }
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
+                                                const cudaResourceDesc* res,
+                                                const cudaTextureDesc* tex,
+                                                const cudaResourceViewDesc* view) {
+  return guard("cudaCreateTextureObject", [&](State& s) -> cudaError_t {
+    if (!out || !res) return cudaErrorInvalidValue;
+    if (view) return cudaErrorNotSupported;  // resource views reinterpret the format
+    vgpu::exec::TextureDesc d;
+    d.object = vgpu::exec::TexKind::Texture;
+    if (cudaError_t e = fill_from_resource(res, &d); e != cudaSuccess) return e;
+    if (tex) {
+      for (int i = 0; i < 3; ++i)
+        if (!address_mode_of(tex->addressMode[i], &d.address[i])) return cudaErrorInvalidValue;
+      // Linear filtering is refused rather than approximated -- see the note at
+      // the fetch. sRGB and anisotropy change the result too.
+      if (tex->filterMode == cudaFilterModeLinear) d.filter = vgpu::exec::TexFilter::Linear;
+      if (tex->sRGB) return cudaErrorNotSupported;
+      if (tex->maxAnisotropy > 1) return cudaErrorNotSupported;
+      d.normalized_coords = tex->normalizedCoords != 0;
+      d.read_as_normalized_float = tex->readMode == cudaReadModeNormalizedFloat;
+    }
+    const uint64_t handle = g_next_texobj++;
+    current(s).textures()[handle] = d;
+    *out = static_cast<cudaTextureObject_t>(handle);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaDestroyTextureObject(cudaTextureObject_t obj) {
+  return guard("cudaDestroyTextureObject", [&](State& s) -> cudaError_t {
+    return current(s).textures().erase(static_cast<uint64_t>(obj)) ? cudaSuccess
+                                                                   : cudaErrorInvalidValue;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaCreateSurfaceObject(cudaSurfaceObject_t* out,
+                                                const cudaResourceDesc* res) {
+  return guard("cudaCreateSurfaceObject", [&](State& s) -> cudaError_t {
+    if (!out || !res) return cudaErrorInvalidValue;
+    vgpu::exec::TextureDesc d;
+    d.object = vgpu::exec::TexKind::Surface;
+    if (cudaError_t e = fill_from_resource(res, &d); e != cudaSuccess) return e;
+    const uint64_t handle = g_next_texobj++;
+    current(s).textures()[handle] = d;
+    *out = static_cast<cudaSurfaceObject_t>(handle);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaDestroySurfaceObject(cudaSurfaceObject_t obj) {
+  return guard("cudaDestroySurfaceObject", [&](State& s) -> cudaError_t {
+    return current(s).textures().erase(static_cast<uint64_t>(obj)) ? cudaSuccess
+                                                                   : cudaErrorInvalidValue;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaGetTextureObjectResourceDesc(cudaResourceDesc*, cudaTextureObject_t) {
+  return cudaErrorNotSupported;
+}
+
 // Managed memory is one allocation the CPU and GPU both address. Device memory
 // here lives in a separate virtual window that host code cannot dereference, so
 // handing back a device pointer would fault the moment the host touched it.

@@ -9,6 +9,7 @@
 #include <map>
 
 #include "vgpu/exec/scheduler.hpp"
+#include "vgpu/exec/texture.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/profile.hpp"
 #include "vgpu/ptx/ast.hpp"
@@ -33,6 +34,10 @@ struct LaunchConfig {
   // cg::this_grid().sync() reads it out of %envreg1/%envreg2 and traps when it
   // is null, so this is what makes the barrier reachable rather than a crash.
   uint64_t coop_workspace = 0;
+  // Texture and surface objects visible to this launch. The handle a kernel
+  // receives is only a number; this is what it means. Null when the kernel uses
+  // no textures, which is the overwhelming majority.
+  const TextureTable* textures = nullptr;
 };
 
 // Invoked periodically during a launch so long-running kernels can still

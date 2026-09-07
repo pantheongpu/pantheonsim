@@ -72,12 +72,19 @@ class Device {
               const std::vector<std::vector<uint8_t>>& args,
               const exec::SymbolTable* syms = nullptr);
 
+  // Texture and surface objects live for as long as the device, not the
+  // module: the host creates them, kernels receive them as parameters, and
+  // nothing ties them to the code that reads them.
+  exec::TextureTable& textures() { return textures_; }
+  const exec::TextureTable& textures() const { return textures_; }
+
  private:
   DeviceProfile profile_;
   int ordinal_;
   MemoryManager mem_;
   telemetry::Publisher* telemetry_ = nullptr;
   uint64_t next_module_id_ = 1;
+  exec::TextureTable textures_;
   struct LoadedModule {
     uint64_t id = 0;
     std::shared_ptr<ptx::Module> mod;

@@ -4,6 +4,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
+#include "vgpu/exec/texture.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
@@ -13,6 +14,11 @@
 
 using namespace vgpu;
 using vgpu::exec::LaunchConfig;
+using vgpu::exec::TextureTable;
+using vgpu::exec::TextureDesc;
+using vgpu::exec::ChannelKind;
+using vgpu::exec::TexAddress;
+using vgpu::exec::TexKind;
 
 namespace {
 const char* kHeader = ".version 8.3\n.target sm_86\n.address_size 64\n";
@@ -30,6 +36,11 @@ float as_f32(uint64_t v) {
   uint32_t u = static_cast<uint32_t>(v);
   std::memcpy(&f, &u, 4);
   return f;
+}
+uint64_t f32_bits(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  return u;
 }
 }  // namespace
 
@@ -1630,6 +1641,281 @@ DONE:
     ret;
 }
 )";
+
+// ---- texture and surface objects ----
+//
+// The handle a kernel receives is only a number; what it means comes from the
+// launch's texture table. These pin the addressing and the format conversion,
+// which are the parts of a fetch that change results.
+
+VTEST(tex_1d_reads_a_texel_by_integer_index) {
+  // tex1Dfetch over linear memory: no filtering, no normalisation, just an
+  // indexed read. This is the form ML code uses, because it is a cached load.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.u32 %r1, %tid.x;
+    tex.1d.v4.f32.s32 {%f1, %f2, %f3, %f4}, [%rd1, {%r1}];
+    mul.wide.u32 %rd4, %r1, 4;
+    add.s64 %rd5, %rd3, %rd4;
+    st.global.f32 [%rd5], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t data = e.mem.alloc(64);
+  uint64_t out = e.mem.alloc(64);
+  for (uint32_t i = 0; i < 8; ++i) e.mem.store_scalar(data + i * 4, 4, f32_bits(i * 1.5f));
+
+  TextureTable tex;
+  TextureDesc d;
+  d.base = data;
+  d.width = 8;
+  d.channels = 1;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.kind = ChannelKind::Float;
+  tex[0x1234] = d;
+
+  LaunchConfig cfg;
+  cfg.block = {8, 1, 1};
+  cfg.textures = &tex;
+  exec::launch(m.entries[0], cfg, {arg_u64(0x1234), arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t i = 0; i < 8; ++i)
+    VCHECK_EQ(as_f32(e.mem.load_scalar(out + i * 4, 4)), i * 1.5f);
+}
+
+VTEST(an_unknown_texture_handle_is_named_rather_than_read) {
+  // The failure mode this prevents: a handle that was never created is a
+  // number like any other, and reading through it would produce plausible
+  // garbage from wherever it pointed.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [t];
+    mov.u32 %r1, %tid.x;
+    tex.1d.v4.f32.s32 {%f1, %f2, %f3, %f4}, [%rd1, {%r1}];
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  TextureTable tex;
+  TextureDesc d;
+  d.base = out;
+  d.width = 4;
+  tex[0x1] = d;
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  cfg.textures = &tex;
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(0xBEEF), arg_u64(out)},
+                                          e.mem, e.prof));
+  VCHECK(err.code() == Err::InvalidValue);
+}
+
+VTEST(tex_clamps_out_of_range_coordinates_to_the_edge) {
+  // cudaAddressModeClamp: the default, and the one that hides bugs if it is
+  // wrong, because an off-by-one only shows at the boundary.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.u32 %r1, %tid.x;
+    // index = tid - 2, so lanes 0 and 1 fall off the low edge and 6, 7 off
+    // the high one.
+    sub.s32 %r2, %r1, 2;
+    tex.1d.v4.f32.s32 {%f1, %f2, %f3, %f4}, [%rd1, {%r2}];
+    mul.wide.u32 %rd4, %r1, 4;
+    add.s64 %rd5, %rd3, %rd4;
+    st.global.f32 [%rd5], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t data = e.mem.alloc(64);
+  uint64_t out = e.mem.alloc(64);
+  for (uint32_t i = 0; i < 4; ++i) e.mem.store_scalar(data + i * 4, 4, f32_bits(10.0f + i));
+  TextureTable tex;
+  TextureDesc d;
+  d.base = data;
+  d.width = 4;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.kind = ChannelKind::Float;
+  d.address[0] = TexAddress::Clamp;
+  tex[7] = d;
+  LaunchConfig cfg;
+  cfg.block = {8, 1, 1};
+  cfg.textures = &tex;
+  exec::launch(m.entries[0], cfg, {arg_u64(7), arg_u64(out)}, e.mem, e.prof);
+  const float want[8] = {10, 10, 10, 11, 12, 13, 13, 13};
+  for (uint32_t i = 0; i < 8; ++i) VCHECK_EQ(as_f32(e.mem.load_scalar(out + i * 4, 4)), want[i]);
+}
+
+VTEST(a_missing_channel_reads_as_zero_and_alpha_as_one) {
+  // Hardware returns 0 for absent x/y/z and 1 for absent w. A kernel reading
+  // .w of a one-channel texture expects 1, and getting 0 is the kind of wrong
+  // that looks like a black image rather than an error.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.u32 %r1, 0;
+    tex.1d.v4.f32.s32 {%f1, %f2, %f3, %f4}, [%rd1, {%r1}];
+    st.global.f32 [%rd3], %f1;
+    st.global.f32 [%rd3+4], %f2;
+    st.global.f32 [%rd3+8], %f3;
+    st.global.f32 [%rd3+12], %f4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t data = e.mem.alloc(16);
+  uint64_t out = e.mem.alloc(32);
+  e.mem.store_scalar(data, 4, f32_bits(2.5f));
+  TextureTable tex;
+  TextureDesc d;
+  d.base = data;
+  d.width = 1;
+  d.channels = 1;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.kind = ChannelKind::Float;
+  tex[3] = d;
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  cfg.textures = &tex;
+  exec::launch(m.entries[0], cfg, {arg_u64(3), arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), 2.5f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 4, 4)), 0.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 8, 4)), 0.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 12, 4)), 1.0f);
+}
+
+VTEST(a_surface_write_then_read_round_trips) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 s)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [s];
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r2, %r1, 2;
+    mov.u32 %r3, 0;
+    suld.b.2d.b32.trap {%r4}, [%rd1, {%r2, %r3}];
+    add.s32 %r5, %r4, 100;
+    sust.b.2d.b32.trap [%rd1, {%r2, %r3}], {%r5};
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t data = e.mem.alloc(64);
+  for (uint32_t i = 0; i < 4; ++i) e.mem.store_scalar(data + i * 4, 4, i);
+  TextureTable tex;
+  TextureDesc d;
+  d.base = data;
+  d.width = 4;
+  d.height = 1;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.object = TexKind::Surface;
+  tex[9] = d;
+  LaunchConfig cfg;
+  cfg.block = {4, 1, 1};
+  cfg.textures = &tex;
+  exec::launch(m.entries[0], cfg, {arg_u64(9)}, e.mem, e.prof);
+  for (uint32_t i = 0; i < 4; ++i) VCHECK_EQ(e.mem.load_scalar(data + i * 4, 4), uint64_t{i + 100});
+}
+
+VTEST(a_surface_access_past_the_edge_faults_rather_than_wrapping) {
+  // suld/sust carry a ".trap" out-of-range policy, and it means what it says.
+  // Clamping instead would turn an indexing bug into a plausible picture.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 s)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [s];
+    mov.u32 %r2, 64;
+    mov.u32 %r3, 0;
+    suld.b.2d.b32.trap {%r4}, [%rd1, {%r2, %r3}];
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t data = e.mem.alloc(64);
+  TextureTable tex;
+  TextureDesc d;
+  d.base = data;
+  d.width = 4;
+  d.height = 1;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.object = TexKind::Surface;
+  tex[9] = d;
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  cfg.textures = &tex;
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(9)}, e.mem, e.prof));
+  VCHECK(err.code() == Err::OutOfBounds);
+}
+
+VTEST(a_texture_handle_used_as_a_surface_is_refused) {
+  // The two have the same shape of handle and are not interchangeable.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 s)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [s];
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 0;
+    suld.b.2d.b32.trap {%r4}, [%rd1, {%r2, %r3}];
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t data = e.mem.alloc(64);
+  TextureTable tex;
+  TextureDesc d;
+  d.base = data;
+  d.width = 4;
+  d.height = 1;
+  d.texel_bytes = 4;
+  d.object = TexKind::Texture;  // a texture, used by a surface instruction
+  tex[9] = d;
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  cfg.textures = &tex;
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(9)}, e.mem, e.prof));
+  VCHECK(err.code() == Err::InvalidValue);
+}
 
 // ---- cooperative launch: a grid-wide barrier ----
 //

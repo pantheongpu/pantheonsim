@@ -523,6 +523,14 @@ if(TARGET vgpucupti)
     TIMEOUT 600)
 endif()
 
+# Texture and surface objects: tex1Dfetch over linear memory, tex2D over a
+# cudaArray, a surface read-modify-write, and the linear-filter refusal.
+add_test(NAME e2e_textures COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_textures.sh)
+set_tests_properties(e2e_textures PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
 # A grid-wide barrier through cooperative_groups, unmodified. Checks the
 # barrier holds, that a grid too large to be resident is refused rather than
 # hung, and that the same kernel launched ordinarily fails loudly.

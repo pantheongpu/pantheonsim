@@ -428,7 +428,23 @@ scripts/run-pantheon-workloads.sh.
    refuse a grid too large to be resident, because such a kernel does not run
    slowly, it hangs. See docs/cooperative.md.
 
-   Textures/surfaces and wgmma are what is left. Neither is used by llama.cpp
-   or by any pantheon workload today, so neither is workload-driven yet:
-   `tex.1d`/`tex.2d`/`suld`/`sust` plus the texture-object runtime API is the
-   larger and more generally useful of the two.
+   **Textures and surfaces are done for the point-sampled case**, which is what
+   the overwhelming majority of CUDA code uses: `tex.1d`/`tex.2d`/`tex.3d`,
+   `suld`, `sust`, plus `cudaCreateTextureObject`, `cudaCreateSurfaceObject`,
+   `cudaMallocArray` and the array copies. Backing memory can be linear
+   (`tex1Dfetch`, which is how ML code uses textures -- as a cached load),
+   pitched 2D, or a `cudaArray`. All four addressing modes, the integer and
+   float channel kinds, `cudaReadModeNormalizedFloat`, and the
+   absent-channel rule (0 for x/y/z, 1 for w) are implemented.
+
+   Deliberately refused rather than approximated: `cudaFilterModeLinear`.
+   Interpolation between texels is a documented weighted average, but hardware
+   computes the weights in a fixed-point format with 8 fractional bits, so a
+   float implementation would differ from the device in the low bits -- which
+   is precisely what the differential testing here exists to catch. Also
+   refused: mipmaps, layered and cubemap textures, sRGB, anisotropy, and the
+   `.clamp`/`.zero` surface out-of-range policies. See docs/textures.md.
+
+   `wgmma` is what is left, and it is not workload-driven yet: nothing in
+   llama.cpp or the pantheon suite uses it, and it needs TMA and mbarrier
+   alongside it to be worth having.
