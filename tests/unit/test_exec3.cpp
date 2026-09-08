@@ -1939,6 +1939,62 @@ VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{512 + 256});
 }
 
+VTEST(bf16_arithmetic_is_bf16_not_f16) {
+  // bf16 is not an f16 with a different bias: it has f32's exponent range and
+  // a 7-bit mantissa. The distinction is visible at 300.0, which bf16 rounds
+  // to 300 exactly but which is well inside f16's range too -- so the value
+  // that separates them is one f16 cannot hold at all. 70000 overflows f16 to
+  // infinity and is an ordinary bf16.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.f32 %f1, 0f477A3000;      // 64099 -- finite in bf16, infinite in f16
+    cvt.rn.bf16.f32 %r1, %f1;
+    mov.f32 %f2, 0f40000000;      // 2.0
+    cvt.rn.bf16.f32 %r2, %f2;
+    mul.rn.bf16 %r3, %r1, %r2;    // ~128k, still finite in bf16
+    cvt.f32.bf16 %f3, %r3;
+    st.global.f32 [%rd2], %f3;
+    // packed bf16x2: two independent halves
+    mov.f32 %f4, 0f3F800000;      // 1.0
+    cvt.rn.bf16.f32 %r4, %f4;
+    shl.b32 %r5, %r2, 16;
+    or.b32 %r6, %r4, %r5;         // {lo=1.0, hi=2.0}
+    add.rn.bf16x2 %r7, %r6, %r6;  // {2.0, 4.0}
+    and.b32 %r8, %r7, 65535;
+    cvt.f32.bf16 %f5, %r8;
+    shr.u32 %r9, %r7, 16;
+    cvt.f32.bf16 %f6, %r9;
+    st.global.f32 [%rd2+4], %f5;
+    st.global.f32 [%rd2+8], %f6;
+    // max propagates the non-NaN operand, which fmin/fmax do and < does not
+    max.bf16 %r10, %r4, %r2;
+    cvt.f32.bf16 %f7, %r10;
+    st.global.f32 [%rd2+12], %f7;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  // 64099 rounds to bf16 as 64256; doubled that is 128512, and it must be
+  // finite -- an f16 decode would have made it infinity long before here.
+  const float doubled = as_f32(e.mem.load_scalar(out, 4));
+  VCHECK(std::isfinite(doubled));
+  VCHECK(doubled > 100000.0f && doubled < 160000.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 4, 4)), 2.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 8, 4)), 4.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 12, 4)), 2.0f);
+}
+
 VTEST(bfind_elect_and_isspacep) {
   std::string ptx = std::string(kHeader) + R"(
 .visible .entry k(.param .u64 out)

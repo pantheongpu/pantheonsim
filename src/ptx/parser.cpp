@@ -1063,30 +1063,42 @@ class Parser {
         op.src = parse_operand();
         ins.op = op;
       }
-    } else if ((op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "fma" || op0 == "neg") &&
-               opcode.find("f16x2") != std::string::npos) {
-      // Packed half2 arithmetic.
-      for (size_t i = 1; i < parts.size(); ++i)
-        if (parts[i] != "f16x2" && parts[i] != "rn" && parts[i] != "ftz" && parts[i] != "sat" &&
-            parts[i] != "rz" && parts[i] != "rm" && parts[i] != "rp")
-          return unsupported("f16x2 modifier '." + parts[i] + "'");
+    } else if ((op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "fma" || op0 == "neg" ||
+                op0 == "min" || op0 == "max") &&
+               (opcode.find("f16") != std::string::npos ||
+                opcode.find("bf16") != std::string::npos)) {
+      // Half-precision arithmetic in all four shapes: f16, f16x2, bf16, bf16x2.
+      bool is_bf = false, is_packed = false, saw_ty = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p2 = parts[i];
+        if (p2 == "f16") { saw_ty = true; }
+        else if (p2 == "f16x2") { saw_ty = true; is_packed = true; }
+        else if (p2 == "bf16") { saw_ty = true; is_bf = true; }
+        else if (p2 == "bf16x2") { saw_ty = true; is_bf = true; is_packed = true; }
+        else if (p2 == "rn" || p2 == "ftz" || p2 == "sat" || p2 == "rz" || p2 == "rm" ||
+                 p2 == "rp" || p2 == "NaN" || p2 == "xorsign" || p2 == "abs") ;
+        else return unsupported("half-precision modifier '." + p2 + "'");
+      }
+      if (!saw_ty) return unsupported("half-precision form without a type");
       Reg dst = expect_reg_operand("destination");
       expect_punct(",");
       Operand a = parse_operand();
       if (op0 == "neg") {
-        ins.op = OpF16x2Neg{dst, a};
+        ins.op = OpF16x2Neg{is_bf, is_packed, dst, a};
       } else {
         expect_punct(",");
         Operand b = parse_operand();
         if (op0 == "fma") {
           expect_punct(",");
           Operand c = parse_operand();
-          ins.op = OpF16x2Fma{dst, a, b, c};
+          ins.op = OpF16x2Fma{is_bf, is_packed, dst, a, b, c};
         } else {
           FloatBinOp fop = op0 == "add"   ? FloatBinOp::Add
                            : op0 == "sub" ? FloatBinOp::Sub
+                           : op0 == "min" ? FloatBinOp::Min
+                           : op0 == "max" ? FloatBinOp::Max
                                           : FloatBinOp::Mul;
-          ins.op = OpF16x2Bin{fop, dst, a, b};
+          ins.op = OpF16x2Bin{fop, is_bf, is_packed, dst, a, b};
         }
       }
     } else if (op0 == "wmma") {

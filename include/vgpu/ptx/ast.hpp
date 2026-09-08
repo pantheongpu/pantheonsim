@@ -352,9 +352,14 @@ enum class FRound { Nearest, Zero, MinusInf, PlusInf };
 struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; Type ty; Reg dst; Operand a, b; };
 struct OpFma { Type ty; Reg dst; Operand a, b, c; };
 // Packed half2 SIMD: one 32-bit register holds two f16 lanes.
-struct OpF16x2Bin { FloatBinOp op = FloatBinOp::Add; Reg dst; Operand a, b; };
-struct OpF16x2Fma { Reg dst; Operand a, b, c; };
-struct OpF16x2Neg { Reg dst; Operand src; };
+// Half-precision arithmetic. One node covers four shapes, because they differ
+// only in how many 16-bit values a 32-bit register holds and how those bits
+// decode: f16 and bf16 scalars occupy the low half, f16x2 and bf16x2 pack two.
+// bf16 is not an f16 with a different bias -- it has f32's exponent range and
+// a 7-bit mantissa -- so the flag selects a different decode, not a scale.
+struct OpF16x2Bin { FloatBinOp op = FloatBinOp::Add; bool bf16 = false; bool packed = true; Reg dst; Operand a, b; };
+struct OpF16x2Fma { bool bf16 = false; bool packed = true; Reg dst; Operand a, b, c; };
+struct OpF16x2Neg { bool bf16 = false; bool packed = true; Reg dst; Operand src; };
 
 // Tensor-core MMA (m16n16k16, f16 inputs, f32 accumulate). A warp-collective
 // operation: the 32 lanes jointly hold the matrices.

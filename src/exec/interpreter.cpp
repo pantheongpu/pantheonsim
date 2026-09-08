@@ -2337,13 +2337,24 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
           uint64_t out = 0;
-          for (int h = 0; h < 2; ++h) {
-            double x = f16_to_double((a[lane] >> (16 * h)) & 0xFFFF);
-            double y = f16_to_double((b[lane] >> (16 * h)) & 0xFFFF);
-            double v = op->op == FloatBinOp::Add   ? x + y
-                       : op->op == FloatBinOp::Sub ? x - y
-                                                   : x * y;
-            out |= double_to_f16(v) << (16 * h);
+          const int halves = op->packed ? 2 : 1;
+          for (int h = 0; h < halves; ++h) {
+            const uint64_t ax = (a[lane] >> (16 * h)) & 0xFFFF;
+            const uint64_t bx = (b[lane] >> (16 * h)) & 0xFFFF;
+            double x = op->bf16 ? bf16_to_double(ax) : f16_to_double(ax);
+            double y = op->bf16 ? bf16_to_double(bx) : f16_to_double(bx);
+            double v;
+            switch (op->op) {
+              case FloatBinOp::Add: v = x + y; break;
+              case FloatBinOp::Sub: v = x - y; break;
+              case FloatBinOp::Mul: v = x * y; break;
+              // PTX min/max return the non-NaN operand when exactly one is
+              // NaN, which is std::fmin/fmax's rule and not what < gives.
+              case FloatBinOp::Min: v = std::fmin(x, y); break;
+              case FloatBinOp::Max: v = std::fmax(x, y); break;
+              default: v = x * y; break;
+            }
+            out |= (op->bf16 ? double_to_bf16(v) : double_to_f16(v)) << (16 * h);
           }
           r[lane] = out;
         }
@@ -2361,11 +2372,16 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
           uint64_t out = 0;
-          for (int h = 0; h < 2; ++h) {
-            double x = f16_to_double((a[lane] >> (16 * h)) & 0xFFFF);
-            double y = f16_to_double((b[lane] >> (16 * h)) & 0xFFFF);
-            double z = f16_to_double((c[lane] >> (16 * h)) & 0xFFFF);
-            out |= double_to_f16(std::fma(x, y, z)) << (16 * h);
+          const int halves = op->packed ? 2 : 1;
+          for (int h = 0; h < halves; ++h) {
+            const uint64_t ax = (a[lane] >> (16 * h)) & 0xFFFF;
+            const uint64_t bx = (b[lane] >> (16 * h)) & 0xFFFF;
+            const uint64_t cx = (c[lane] >> (16 * h)) & 0xFFFF;
+            double x = op->bf16 ? bf16_to_double(ax) : f16_to_double(ax);
+            double y = op->bf16 ? bf16_to_double(bx) : f16_to_double(bx);
+            double z = op->bf16 ? bf16_to_double(cx) : f16_to_double(cx);
+            const double v = std::fma(x, y, z);
+            out |= (op->bf16 ? double_to_bf16(v) : double_to_f16(v)) << (16 * h);
           }
           r[lane] = out;
         }
@@ -2377,7 +2393,13 @@ class Interpreter {
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
       for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane)) r[lane] = v[lane] ^ 0x80008000ull;  // flip both sign bits
+        if (m & (Mask{1} << lane)) {
+          // The sign bit is the top bit of each 16-bit half for both f16 and
+          // bf16, so this is one mask either way; only how many halves take
+          // part differs.
+          const uint64_t flip = op->packed ? 0x80008000ull : 0x00008000ull;
+          r[lane] = v[lane] ^ flip;
+        }
       write_reg(w, op->dst, m, r, 32);
       return;
     }
