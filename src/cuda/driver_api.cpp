@@ -1256,6 +1256,37 @@ VGPU_EXPORT CUresult cuLaunchKernelEx(const void* config, CUfunction f, void** k
   };
   const auto* c = static_cast<const LaunchCfgABI*>(config);
   if (!c) return CUDA_ERROR_INVALID_VALUE;
+  // Attributes are refused rather than dropped.
+  //
+  // This shim forwarded the config and ignored `attrs` entirely, which was
+  // harmless while nothing it could carry was implemented. Thread-block
+  // clusters changed that: a launch carrying
+  // CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION would have run with no cluster, and
+  // every block would have read %cluster_ctarank as 0 and %cluster_nctarank
+  // as 1. It would have succeeded and been wrong, silently, which is the one
+  // outcome this engine is built to not produce.
+  //
+  // Walking the array is not an option here. Unlike the runtime shim, this
+  // file deliberately depends on no vendor header -- see vgpu_cuda.h -- and
+  // the entry stride is not a constant that can be hard-coded:
+  // sizeof(CUlaunchAttribute) is 72 with CUDA 13 against the 40 an older
+  // toolkit's union gives, so a fixed guess reads the wrong bytes on some
+  // toolkit and reports a cluster shape nobody asked for.
+  //
+  // So: no attributes is the supported case, and anything else says so. The
+  // runtime entry point (cudaLaunchKernelEx) does read attributes, because
+  // that shim is compiled against the vendor headers, and it is the path CUDA
+  // C++ actually takes.
+  if (c->num_attrs != 0 && c->attrs != nullptr) {
+    if (!quiet())
+      std::fprintf(stderr,
+                   "[vgpu] cuLaunchKernelEx: %u launch attribute(s) given; this entry point "
+                   "cannot read them (the attribute struct size differs between CUDA "
+                   "toolkits) and will not ignore them silently. Use cudaLaunchKernelEx, "
+                   "which does read them.\n",
+                   c->num_attrs);
+    return CUDA_ERROR_NOT_SUPPORTED;
+  }
   return cuLaunchKernel(f, c->gx, c->gy, c->gz, c->bx, c->by, c->bz, c->shared_bytes, c->stream,
                         kernelParams, extra);
 }

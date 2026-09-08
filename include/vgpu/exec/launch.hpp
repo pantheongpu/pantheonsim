@@ -22,6 +22,10 @@ struct LaunchConfig {
   std::array<uint32_t, 3> grid{1, 1, 1};
   std::array<uint32_t, 3> block{1, 1, 1};
   uint32_t shared_bytes = 0;
+  // Thread-block cluster shape in CTAs (cudaLaunchAttributeClusterDimension,
+  // or __cluster_dims__ compiled into the kernel). All zeros means no explicit
+  // cluster, which PTX defines as behaving like 1x1x1.
+  std::array<uint32_t, 3> cluster{0, 0, 0};
   SchedulerKind scheduler = SchedulerKind::Deterministic;
   // Seed for the random and adversarial schedulers; ignored by the
   // deterministic one. The same seed replays the same execution.

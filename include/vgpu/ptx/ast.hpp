@@ -69,6 +69,25 @@ enum class Sreg : uint8_t {
   // A serial number for the launch, distinct from every other launch in the
   // process.
   GridId,
+  // Thread-block clusters (sm_90 and later). A cluster is a group of CTAs
+  // co-scheduled close enough to address each other's shared memory. This
+  // engine models the *scheduling level* -- which cluster a block is in, where
+  // it sits inside that cluster, and how many there are -- and not the
+  // distributed shared memory, which is a memory-model change and stays
+  // refused (`.shared::cluster`, mapa, cluster barriers).
+  //
+  // These are defined for every launch, not only explicit-cluster ones. PTX
+  // says a grid launched without a cluster dimension behaves as though the
+  // cluster were 1x1x1, so %cluster_ctarank is 0 and %clusterid equals
+  // %ctaid. That is what hardware reports, so it is what these report; a
+  // kernel that reads them outside a cluster launch gets the same answer here
+  // as on an H100 rather than a refusal.
+  ClusterIdX, ClusterIdY, ClusterIdZ,
+  NClusterIdX, NClusterIdY, NClusterIdZ,
+  ClusterCtaIdX, ClusterCtaIdY, ClusterCtaIdZ,
+  ClusterNCtaIdX, ClusterNCtaIdY, ClusterNCtaIdZ,
+  ClusterCtaRank, ClusterNCtaRank,
+  IsExplicitCluster,
 };
 
 // A virtual register reference. `id` is a dense per-kernel index assigned at
@@ -446,6 +465,11 @@ struct EntryFn {
   std::array<uint32_t, 3> max_ntid{0, 0, 0};
   std::array<uint32_t, 3> req_ntid{0, 0, 0};
   uint32_t min_ctas_per_sm = 0;
+  // .reqnctapercluster: the cluster shape in CTAs the kernel was compiled for
+  // (__cluster_dims__). Zero means the kernel names no cluster shape.
+  // .explicitcluster says the kernel must be launched with one.
+  std::array<uint32_t, 3> req_cluster{0, 0, 0};
+  bool explicit_cluster = false;
   // Memoized register analysis. Held here rather than in a pointer-keyed
   // side table: a freed module's address can be reused by the next one, and
   // such a cache then hands back another kernel's register count.

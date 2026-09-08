@@ -40,6 +40,21 @@ const std::unordered_map<std::string, Sreg>& sreg_table() {
       {"%dynamic_smem_size", Sreg::DynamicSmemSize},
       {"%total_smem_size", Sreg::TotalSmemSize},
       {"%gridid", Sreg::GridId},
+      {"%clusterid.x", Sreg::ClusterIdX},
+      {"%clusterid.y", Sreg::ClusterIdY},
+      {"%clusterid.z", Sreg::ClusterIdZ},
+      {"%nclusterid.x", Sreg::NClusterIdX},
+      {"%nclusterid.y", Sreg::NClusterIdY},
+      {"%nclusterid.z", Sreg::NClusterIdZ},
+      {"%cluster_ctaid.x", Sreg::ClusterCtaIdX},
+      {"%cluster_ctaid.y", Sreg::ClusterCtaIdY},
+      {"%cluster_ctaid.z", Sreg::ClusterCtaIdZ},
+      {"%cluster_nctaid.x", Sreg::ClusterNCtaIdX},
+      {"%cluster_nctaid.y", Sreg::ClusterNCtaIdY},
+      {"%cluster_nctaid.z", Sreg::ClusterNCtaIdZ},
+      {"%cluster_ctarank", Sreg::ClusterCtaRank},
+      {"%cluster_nctarank", Sreg::ClusterNCtaRank},
+      {"%is_explicit_cluster", Sreg::IsExplicitCluster},
   };
   return t;
 }
@@ -408,6 +423,26 @@ class Parser {
         }
         if (d == ".maxntid") fn.max_ntid = dims;
         else fn.req_ntid = dims;
+      } else if (d == ".reqnctapercluster") {
+        // __cluster_dims__(x,y,z). Fewer than three values means the trailing
+        // dimensions are 1, the same shorthand .maxntid uses.
+        next();
+        std::array<uint32_t, 3> dims{1, 1, 1};
+        for (int i = 0; i < 3; ++i) {
+          dims[i] = static_cast<uint32_t>(expect_int("cluster dimension"));
+          if (i < 2 && peek_punct(",")) next();
+          else if (i < 2) break;
+        }
+        fn.req_cluster = dims;
+      } else if (d == ".explicitcluster") {
+        next();
+        fn.explicit_cluster = true;
+      } else if (d == ".maxclusterrank") {
+        // A ceiling on cluster size for occupancy, not a shape. Recorded
+        // nowhere because nothing here schedules by it, but it must be
+        // consumed or the token stream desynchronizes.
+        next();
+        expect_int("directive value");
       } else if (d == ".minnctapersm" || d == ".maxnreg" || d == ".maxnctapersm") {
         next();
         uint32_t v = static_cast<uint32_t>(expect_int("directive value"));

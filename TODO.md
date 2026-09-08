@@ -368,8 +368,15 @@ textures, grid sync and host-pinned memory long after all three worked. A
 roadmap that overstates what is missing misleads as much as one that overstates
 what is done.
 
-- PTX: `wgmma` and the thread-block cluster registers, inline-asm-only
-  instructions. (Textures, surfaces and grid sync are done.)
+- PTX: `wgmma` and the cluster *memory* model, inline-asm-only instructions.
+  (Textures, surfaces and grid sync are done. The thread-block cluster
+  scheduling level is done: `%clusterid`, `%nclusterid`, `%cluster_ctaid`,
+  `%cluster_nctaid`, `%cluster_ctarank`, `%cluster_nctarank` and
+  `%is_explicit_cluster` all report, driven by a cluster shape that comes from
+  `.reqnctapercluster` or from `cudaLaunchAttributeClusterDimension`. What is
+  still missing is the part that makes a cluster more than a numbering:
+  distributed shared memory -- `.shared::cluster`, `mapa`, cluster barriers --
+  which is a memory-model change, and stays refused rather than approximated.)
 - Runtime: async copies, the virtual memory management API
   (cuMemAddressReserve…). (Managed memory and host-pinned memory are done.)
 - Frontends: cubin/SASS loading, and AMD execution -- HIP runtime and the CDNA

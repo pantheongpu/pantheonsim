@@ -1939,6 +1939,174 @@ VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{512 + 256});
 }
 
+VTEST(cluster_registers_tile_the_grid) {
+  // A 2x2 cluster over a 4x2 grid is two clusters side by side. Every block
+  // writes where it thinks it is, and the check is against the tiling worked
+  // out by hand rather than against the same arithmetic the engine used.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ctaid.y;
+    mov.u32 %r3, %nctaid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;        // linear block id
+    mul.lo.s32 %r5, %r4, 16;              // 4 words per block
+    cvt.u64.u32 %rd3, %r5;
+    add.s64 %rd4, %rd2, %rd3;
+    mov.u32 %r6, %clusterid.x;
+    mov.u32 %r7, %cluster_ctaid.x;
+    mov.u32 %r8, %cluster_ctarank;
+    mov.u32 %r9, %cluster_nctarank;
+    st.global.u32 [%rd4], %r6;
+    st.global.u32 [%rd4+4], %r7;
+    st.global.u32 [%rd4+8], %r8;
+    st.global.u32 [%rd4+12], %r9;
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");   // clusters are sm_90 and later
+  auto m = ptx::parse(ptx);
+  const uint32_t kBlocks = 8;
+  uint64_t out = e.mem.alloc(kBlocks * 16);
+  LaunchConfig cfg;
+  cfg.grid = {4, 2, 1};
+  cfg.block = {1, 1, 1};
+  cfg.cluster = {2, 2, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t by = 0; by < 2; ++by) {
+    for (uint32_t bx = 0; bx < 4; ++bx) {
+      const uint32_t b = by * 4 + bx;
+      const uint64_t base = out + b * 16;
+      VCHECK_EQ(e.mem.load_scalar(base, 4), uint64_t{bx / 2});          // %clusterid.x
+      VCHECK_EQ(e.mem.load_scalar(base + 4, 4), uint64_t{bx % 2});      // %cluster_ctaid.x
+      // rank is x-fastest within the 2x2 cluster
+      VCHECK_EQ(e.mem.load_scalar(base + 8, 4), uint64_t{(bx % 2) + (by % 2) * 2});
+      VCHECK_EQ(e.mem.load_scalar(base + 12, 4), uint64_t{4});          // %cluster_nctarank
+    }
+  }
+}
+
+VTEST(without_a_cluster_every_block_is_its_own) {
+  // PTX defines a launch with no cluster dimension as behaving like a 1x1x1
+  // cluster, so these registers answer on any launch rather than being a
+  // cluster-only feature. %clusterid then equals %ctaid, the rank is 0, and
+  // %is_explicit_cluster is false -- which is what an H100 reports, and the
+  // reason a kernel reading them need not be refused.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %ctaid.x;
+    mul.lo.s32 %r2, %r1, 16;
+    cvt.u64.u32 %rd3, %r2;
+    add.s64 %rd4, %rd2, %rd3;
+    mov.u32 %r3, %clusterid.x;
+    mov.u32 %r4, %cluster_ctarank;
+    mov.u32 %r5, %cluster_nctarank;
+    mov.u32 %r6, %is_explicit_cluster;
+    st.global.u32 [%rd4], %r3;
+    st.global.u32 [%rd4+4], %r4;
+    st.global.u32 [%rd4+8], %r5;
+    st.global.u32 [%rd4+12], %r6;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(3 * 16);
+  LaunchConfig cfg;
+  cfg.grid = {3, 1, 1};
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t b = 0; b < 3; ++b) {
+    const uint64_t base = out + b * 16;
+    VCHECK_EQ(e.mem.load_scalar(base, 4), uint64_t{b});    // %clusterid.x == %ctaid.x
+    VCHECK_EQ(e.mem.load_scalar(base + 4, 4), uint64_t{0});
+    VCHECK_EQ(e.mem.load_scalar(base + 8, 4), uint64_t{1});
+    VCHECK_EQ(e.mem.load_scalar(base + 12, 4), uint64_t{0});
+  }
+}
+
+VTEST(a_cluster_that_does_not_tile_the_grid_is_refused) {
+  // Hardware rejects a grid that is not a whole number of clusters, because
+  // the leftover blocks belong to no cluster. Inventing a partial one would
+  // give %cluster_nctarank a value no block in it agrees with.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k() { ret; }
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  LaunchConfig cfg;
+  cfg.grid = {5, 1, 1};      // 5 is not a multiple of 2
+  cfg.block = {1, 1, 1};
+  cfg.cluster = {2, 1, 1};
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, e.mem, e.prof));
+  VCHECK(err.code() == Err::LaunchConfig);
+  VCHECK_CONTAINS(err.what(), "not a multiple of the cluster");
+}
+
+VTEST(clusters_need_hopper) {
+  // Reporting a scheduling level a part does not have is the failure mode this
+  // engine exists to avoid, so an A10 refuses rather than pretending.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k() { ret; }
+)";
+  Env e;   // nvidia/a10, sm_86
+  auto m = ptx::parse(ptx);
+  LaunchConfig cfg;
+  cfg.grid = {4, 1, 1};
+  cfg.block = {1, 1, 1};
+  cfg.cluster = {2, 1, 1};
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, e.mem, e.prof));
+  VCHECK(err.code() == Err::LaunchConfig);
+  VCHECK_CONTAINS(err.what(), "compute capability 9.0");
+}
+
+VTEST(cluster_dims_compiled_into_the_kernel_apply_without_a_launch_attribute) {
+  // __cluster_dims__(2,1,1) becomes .reqnctapercluster in the PTX. It is a
+  // property of the kernel, so a plain launch still runs 2-block clusters --
+  // and %is_explicit_cluster is true, because one was.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out) .reqnctapercluster 2, 1, 1
+{
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %ctaid.x;
+    mul.lo.s32 %r2, %r1, 8;
+    cvt.u64.u32 %rd3, %r2;
+    add.s64 %rd4, %rd2, %rd3;
+    mov.u32 %r3, %cluster_ctarank;
+    mov.u32 %r4, %is_explicit_cluster;
+    st.global.u32 [%rd4], %r3;
+    st.global.u32 [%rd4+4], %r4;
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4 * 8);
+  LaunchConfig cfg;
+  cfg.grid = {4, 1, 1};
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t b = 0; b < 4; ++b) {
+    VCHECK_EQ(e.mem.load_scalar(out + b * 8, 4), uint64_t{b % 2});
+    VCHECK_EQ(e.mem.load_scalar(out + b * 8 + 4, 4), uint64_t{1});
+  }
+}
+
 VTEST(gridid_differs_between_launches) {
   std::string ptx = std::string(kHeader) + R"(
 .visible .entry k(.param .u64 out)

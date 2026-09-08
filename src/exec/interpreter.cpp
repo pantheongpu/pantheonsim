@@ -118,6 +118,12 @@ struct BlockCtx {
   std::array<uint32_t, 3> ctaid{};
   std::array<uint32_t, 3> ntid{};
   std::array<uint32_t, 3> nctaid{};
+  // The cluster shape in CTAs, always at least 1x1x1: a launch with no
+  // explicit cluster is a launch whose clusters hold one block each, which is
+  // exactly what PTX says those registers report. Keeping the default at 1
+  // rather than 0 means the cluster registers need no special case.
+  std::array<uint32_t, 3> cluster{1, 1, 1};
+  bool explicit_cluster = false;
   // Per-block shared memory. Zero-initialized at block start: real hardware
   // leaves it undefined, VirtualGPU makes it deterministic (documented).
   std::vector<uint8_t>* shared = nullptr;
@@ -301,6 +307,19 @@ class Interpreter {
     if (progress_) last_progress_ = std::chrono::steady_clock::now();
   }
 
+  // The cluster shape this launch runs with, never zero in any dimension. A
+  // launch that names no cluster is a launch of 1x1x1 clusters -- one block
+  // each -- which is what PTX says the cluster registers report there.
+  std::array<uint32_t, 3> cluster_shape() const {
+    std::array<uint32_t, 3> c = cfg_.cluster;
+    for (int i = 0; i < 3; ++i)
+      if (c[i] == 0) c[i] = 1;
+    return c;
+  }
+  bool has_explicit_cluster() const {
+    return cfg_.cluster[0] > 1 || cfg_.cluster[1] > 1 || cfg_.cluster[2] > 1;
+  }
+
   void set_concurrent(bool v) { concurrent_ = v; }
   void set_grid_id(uint64_t v) { grid_id_ = v; }
 
@@ -333,6 +352,8 @@ class Interpreter {
                      static_cast<uint32_t>(i / (gx * gy))};
       b.ctx.ntid = cfg_.block;
       b.ctx.nctaid = cfg_.grid;
+      b.ctx.cluster = cluster_shape();
+      b.ctx.explicit_cluster = has_explicit_cluster();
       setup_block(b);
     }
     // One warp-turn per block per round. Long enough that a block making real
@@ -362,6 +383,8 @@ class Interpreter {
                    static_cast<uint32_t>(i / (gx * gy))};
       ctx.ntid = cfg_.block;
       ctx.nctaid = cfg_.grid;
+      ctx.cluster = cluster_shape();
+      ctx.explicit_cluster = has_explicit_cluster();
       run_block(ctx, *sched);
       ++stats_.blocks;
     }
@@ -742,6 +765,50 @@ class Interpreter {
       case Sreg::NctaidX: return ctx.nctaid[0];
       case Sreg::NctaidY: return ctx.nctaid[1];
       case Sreg::NctaidZ: return ctx.nctaid[2];
+      // ---- thread-block clusters ----
+      //
+      // A cluster tiles the grid: block (bx,by,bz) sits in cluster
+      // (bx/cx, by/cy, bz/cz) at position (bx%cx, by%cy, bz%cz) inside it.
+      // With the default 1x1x1 cluster every block is its own cluster, which
+      // makes %clusterid equal %ctaid and %cluster_ctaid zero -- exactly what
+      // hardware reports for a launch with no cluster dimension.
+      //
+      // What is modelled here is the scheduling level and nothing more. A
+      // cluster on real hardware also means the blocks are co-resident and can
+      // read each other's shared memory; `.shared::cluster`, mapa and the
+      // cluster barriers stay refused, because pretending distributed shared
+      // memory works would let a kernel read a neighbour's data that was never
+      // written.
+      case Sreg::ClusterIdX: return ctx.ctaid[0] / ctx.cluster[0];
+      case Sreg::ClusterIdY: return ctx.ctaid[1] / ctx.cluster[1];
+      case Sreg::ClusterIdZ: return ctx.ctaid[2] / ctx.cluster[2];
+      // Clusters per grid, rounded up: a grid that is not a whole number of
+      // clusters still contains the partial one. validate() requires the grid
+      // to divide evenly, as hardware does, so this rounding is belt and
+      // braces rather than a second policy.
+      case Sreg::NClusterIdX:
+        return (ctx.nctaid[0] + ctx.cluster[0] - 1) / ctx.cluster[0];
+      case Sreg::NClusterIdY:
+        return (ctx.nctaid[1] + ctx.cluster[1] - 1) / ctx.cluster[1];
+      case Sreg::NClusterIdZ:
+        return (ctx.nctaid[2] + ctx.cluster[2] - 1) / ctx.cluster[2];
+      case Sreg::ClusterCtaIdX: return ctx.ctaid[0] % ctx.cluster[0];
+      case Sreg::ClusterCtaIdY: return ctx.ctaid[1] % ctx.cluster[1];
+      case Sreg::ClusterCtaIdZ: return ctx.ctaid[2] % ctx.cluster[2];
+      case Sreg::ClusterNCtaIdX: return ctx.cluster[0];
+      case Sreg::ClusterNCtaIdY: return ctx.cluster[1];
+      case Sreg::ClusterNCtaIdZ: return ctx.cluster[2];
+      // The block's linear rank inside its cluster, x fastest. This is the one
+      // a real kernel uses most: it indexes the per-block slot in a
+      // cluster-wide array.
+      case Sreg::ClusterCtaRank:
+        return uint64_t{ctx.ctaid[0] % ctx.cluster[0]} +
+               uint64_t{ctx.ctaid[1] % ctx.cluster[1]} * ctx.cluster[0] +
+               uint64_t{ctx.ctaid[2] % ctx.cluster[2]} * ctx.cluster[0] * ctx.cluster[1];
+      case Sreg::ClusterNCtaRank:
+        return uint64_t{ctx.cluster[0]} * ctx.cluster[1] * ctx.cluster[2];
+      case Sreg::IsExplicitCluster: return ctx.explicit_cluster ? 1u : 0u;
+
       case Sreg::LaneId: return lane;
       case Sreg::LaneMaskEq: return Mask{1} << lane;
       case Sreg::LaneMaskLt: return lane == 0 ? 0u : (~0u >> (W_ - lane));
@@ -3565,6 +3632,50 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
   if (p.warp_size != 32u && p.warp_size != kMaxWarpSize)
     throw Error::make(Err::Unsupported, "profile ", p.id, " has warp size ", p.warp_size,
                       "; only 32 and 64 are implemented");
+  // ---- thread-block clusters ----
+  const bool wants_cluster =
+      cfg.cluster[0] > 1 || cfg.cluster[1] > 1 || cfg.cluster[2] > 1;
+  if (wants_cluster) {
+    // Clusters arrived with Hopper. Running one on an older profile would
+    // report a scheduling level that part does not have, which is the kind of
+    // wrong answer this whole engine exists to avoid.
+    if (p.cc_major < 9)
+      throw Error::make(Err::LaunchConfig, "kernel '", fn.name,
+                        "': thread-block clusters require compute capability 9.0 or later; ",
+                        p.id, " is ", p.cc_major, ".", p.cc_minor);
+    // A launch that contradicts the kernel's own __cluster_dims__ fails on
+    // hardware rather than being silently overridden, so it fails here.
+    if (fn.req_cluster != std::array<uint32_t, 3>{0, 0, 0} && cfg.cluster != fn.req_cluster)
+      throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': launched with cluster ",
+                        cfg.cluster[0], "x", cfg.cluster[1], "x", cfg.cluster[2],
+                        " but compiled with __cluster_dims__ ", fn.req_cluster[0], "x",
+                        fn.req_cluster[1], "x", fn.req_cluster[2]);
+    uint64_t ctas = 1;
+    for (int i = 0; i < 3; ++i) {
+      const uint32_t c = cfg.cluster[i] ? cfg.cluster[i] : 1;
+      // The grid is tiled by clusters, so a grid that is not a whole number of
+      // them has blocks belonging to no cluster. Hardware rejects this; so
+      // does this, rather than inventing a partial cluster.
+      if (cfg.grid[i] % c != 0)
+        throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': grid dimension ", i,
+                          " is ", cfg.grid[i], ", which is not a multiple of the cluster "
+                          "dimension ", c);
+      ctas *= c;
+    }
+    // 8 is the portable maximum CUDA guarantees. Larger clusters exist on some
+    // parts through an opt-in, and this engine does not model the opt-in, so
+    // the portable limit is the one enforced -- a kernel that needs more is
+    // told which number it exceeded.
+    if (ctas > 8)
+      throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': cluster of ", ctas,
+                        " blocks exceeds the portable maximum of 8");
+  } else if (fn.explicit_cluster) {
+    // .explicitcluster means the kernel refuses to run without one.
+    throw Error::make(Err::LaunchConfig, "kernel '", fn.name,
+                      "': compiled with .explicitcluster and must be launched with a "
+                      "cluster dimension");
+  }
+
   uint64_t threads = 1;
   for (int i = 0; i < 3; ++i) {
     if (cfg.block[i] == 0 || cfg.grid[i] == 0)
@@ -3680,13 +3791,23 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
                    const DeviceProfile& profile, const SymbolTable* symbols,
                    const ProgressFn& progress) {
   refresh_modes();
-  validate(fn, cfg, profile);
+  LaunchConfig with_cluster = cfg;
+  // __cluster_dims__ compiles to .reqnctapercluster and is a property of the
+  // kernel, so it applies whether or not the launch asked for a cluster. An
+  // explicit cudaLaunchAttributeClusterDimension still wins: validate() then
+  // checks the two agree, because on hardware a launch that contradicts
+  // .reqnctapercluster fails rather than being quietly overridden.
+  if (with_cluster.cluster == std::array<uint32_t, 3>{0, 0, 0} &&
+      fn.req_cluster != std::array<uint32_t, 3>{0, 0, 0})
+    with_cluster.cluster = fn.req_cluster;
+  const LaunchConfig& cfg_ref = with_cluster;
+  validate(fn, cfg_ref, profile);
   // One %gridid per launch. Starts at 1 so an unset value reads as "no launch"
   // rather than as the first one.
   static std::atomic<uint64_t> g_next_grid_id{1};
   const uint64_t grid_id = g_next_grid_id.fetch_add(1, std::memory_order_relaxed);
-  LaunchConfig eff = cfg;
-  eff.max_steps = effective_max_steps(cfg.max_steps);
+  LaunchConfig eff = cfg_ref;
+  eff.max_steps = effective_max_steps(cfg_ref.max_steps);
   // VGPU_SCHEDULER overrides whatever the caller asked for, so a racy program
   // can be re-run under a different order without touching its source. A
   // caller that set the mode explicitly still loses to the environment, which

@@ -106,13 +106,15 @@ VTEST(an_unknown_special_register_is_not_silently_a_register) {
   // zero and stored four bytes below its shared array. An unimplemented special
   // register has to say so.
   //
-  // The example has to be one that is genuinely still unimplemented: this test
-  // named %total_smem_size until that was implemented, and then failed --
-  // which is the test working, not breaking. %clusterid needs a thread-block
-  // cluster concept the scheduler does not have.
-  auto err = VCAPTURE(Error, parse(wrap_kernel("mov.u32 %r1, %clusterid.x;\nret;")));
+  // The example has to be one that is genuinely still unimplemented, and this
+  // test keeps outliving its examples: it named %total_smem_size until that
+  // was implemented, then %clusterid until the cluster registers were. Each
+  // time it failed, which is the test working rather than breaking.
+  // %current_graph_exec is the current one -- it identifies the graph
+  // executable a kernel is running inside, and nothing here tracks that.
+  auto err = VCAPTURE(Error, parse(wrap_kernel("mov.u64 %rd1, %current_graph_exec;\nret;")));
   VCHECK(err.code() == Err::UnsupportedPtx);
-  VCHECK_CONTAINS(err.what(), "%clusterid");
+  VCHECK_CONTAINS(err.what(), "%current_graph_exec");
 }
 
 VTEST(lane_masks_are_the_masks_they_name) {

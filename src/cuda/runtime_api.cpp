@@ -369,7 +369,8 @@ bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()>
 // wait on each other. See the scheduler note in interpreter.cpp.
 static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gridDim,
                                       dim3 blockDim, void** args, size_t sharedMem,
-                                      cudaStream_t stream, bool cooperative) {
+                                      cudaStream_t stream, bool cooperative,
+                                      std::array<uint32_t, 3> cluster = {0, 0, 0}) {
   return guard(api, [&](State& s) -> cudaError_t {
     auto it = s.kernels.find(func);
     if (it == s.kernels.end()) {
@@ -434,6 +435,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     cfg.block = {blockDim.x, blockDim.y, blockDim.z};
     cfg.shared_bytes = static_cast<uint32_t>(sharedMem);
     cfg.cooperative = cooperative;
+    cfg.cluster = cluster;
     if (cooperative) {
       // A cooperative launch promises every block is resident, so the grid has
       // to fit. Hardware refuses a grid that does not, and so does this: a
@@ -1560,8 +1562,32 @@ VGPU_EXPORT cudaError_t cudaGraphDebugDotPrint(cudaGraph_t, const char* path, un
 VGPU_EXPORT cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* cfg, const void* func,
                                             void** args) {
   if (!cfg) return cudaErrorInvalidValue;
-  return cudaLaunchKernel(func, cfg->gridDim, cfg->blockDim, args, cfg->dynamicSmemBytes,
-                          cfg->stream);
+  // The attribute list is the whole point of the Ex form, and this used to
+  // drop it. That was invisible until thread-block clusters existed: a kernel
+  // launched with cudaLaunchAttributeClusterDimension ran with no cluster at
+  // all, and every block read %cluster_ctarank as 0 and %cluster_nctarank as
+  // 1. The launch succeeded and the answer was wrong, which is the failure
+  // this engine is built to not have.
+  //
+  // The vendor struct is used rather than a hand-rolled one because its size
+  // is not stable: sizeof(cudaLaunchAttribute) is 72 with this toolkit, and a
+  // guess at the stride would walk the array wrong on any other version.
+  unsigned cluster[3] = {0, 0, 0};
+  for (unsigned i = 0; i < cfg->numAttrs; ++i) {
+    const cudaLaunchAttribute& a = cfg->attrs[i];
+    if (a.id == cudaLaunchAttributeClusterDimension) {
+      cluster[0] = a.val.clusterDim.x;
+      cluster[1] = a.val.clusterDim.y;
+      cluster[2] = a.val.clusterDim.z;
+    }
+    // Every other attribute is inert here for a reason that is already true
+    // elsewhere in this shim: priority and memory-sync domains need a stream
+    // scheduler, access policy windows need a cache model, and programmatic
+    // events need asynchrony. None of them changes what a kernel computes.
+  }
+  return launch_kernel_impl("cudaLaunchKernelEx", func, cfg->gridDim, cfg->blockDim, args,
+                            cfg->dynamicSmemBytes, cfg->stream, /*cooperative=*/false,
+                            {cluster[0], cluster[1], cluster[2]});
 }
 
 // Profiler control is a no-op: there is no external profiler attached, and a
