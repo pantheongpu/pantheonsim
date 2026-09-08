@@ -90,6 +90,19 @@ int cmd_counters() {
       {"DRAM read/write throughput", "requires a memory-hierarchy and timing model"},
       {"issue slot utilisation", "same"},
       {"instruction replay", "a hardware recovery mechanism, not a program property"},
+      // Worth naming explicitly, because the local_* counters look like they
+      // already answer it and they do not. Register spilling is done by ptxas,
+      // *below* the language this engine executes: by the time a kernel reaches
+      // us it is still PTX, with virtual registers and no allocation decided,
+      // so no spill load or store has been emitted for us to count. The .local
+      // traffic that is counted is the depot -- stack frames and arrays nvcc
+      // could not keep in virtual registers -- which is a different quantity
+      // that happens to live in the same address space. Labelling it "spill"
+      // would produce a number that is exact, reproducible, and about something
+      // else. What can honestly be said about spilling is said elsewhere:
+      // `spilled_regs` reports how many registers exceed the profile's
+      // architectural maximum, which is a property of the kernel, not traffic.
+      {"register spill/fill traffic", "ptxas allocates registers; we execute PTX, where no spill exists yet"},
   };
   std::printf("Counters VirtualGPU reports. Every one is counted exactly from what the\n"
               "program executed, not sampled -- so they are reproducible run to run, and\n"
