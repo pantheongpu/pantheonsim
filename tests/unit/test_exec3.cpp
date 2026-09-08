@@ -1939,6 +1939,125 @@ VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{512 + 256});
 }
 
+VTEST(bfind_elect_and_isspacep) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<4>;
+    .shared .align 4 .b8 tile[64];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 1024;            // bit 10
+    bfind.u32 %r2, %r1;
+    bfind.shiftamt.u32 %r3, %r1;  // 31 - 10
+    mov.u32 %r4, 0;
+    bfind.u32 %r5, %r4;           // no set bit -> 0xFFFFFFFF
+    mov.u32 %r6, 4294967291;      // -5 as s32; ~(-5) = 4, top differing bit is 2
+    bfind.s32 %r7, %r6;
+    st.global.u32 [%rd2], %r2;
+    st.global.u32 [%rd2+4], %r3;
+    st.global.u32 [%rd2+8], %r5;
+    st.global.u32 [%rd2+12], %r7;
+    // one leader for the whole warp
+    elect.sync %r8|%p0, -1;
+    selp.b32 %r9, 1, 0, %p0;
+    st.global.u32 [%rd2+16], %r8;
+    // generic pointers: a shared address is shared, a global one is global
+    mov.u64 %rd3, tile;
+    cvta.shared.u64 %rd4, %rd3;
+    isspacep.shared %p1, %rd4;
+    selp.b32 %r10, 1, 0, %p1;
+    isspacep.global %p2, %rd4;
+    selp.b32 %r11, 1, 0, %p2;
+    isspacep.global %p3, %rd1;
+    selp.b32 %r12, 1, 0, %p3;
+    st.global.u32 [%rd2+20], %r10;
+    st.global.u32 [%rd2+24], %r11;
+    st.global.u32 [%rd2+28], %r12;
+    griddepcontrol.wait;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{10});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{21});          // 31 - 10
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{0xFFFFFFFFu}); // no bit set
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), uint64_t{2});          // bfind.s32 of -5
+  VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{0});          // lane 0 elected
+  VCHECK_EQ(e.mem.load_scalar(out + 20, 4), uint64_t{1});          // shared is shared
+  VCHECK_EQ(e.mem.load_scalar(out + 24, 4), uint64_t{0});          // and is not global
+  VCHECK_EQ(e.mem.load_scalar(out + 28, 4), uint64_t{1});          // the buffer is global
+}
+
+VTEST(cp_async_mbarrier_arrive_lands_the_copy_before_the_arrival) {
+  // The ordering an Ampere pipeline depends on. Warp 0 issues a cp.async into
+  // shared memory and signals the barrier with cp.async.mbarrier.arrive; every
+  // thread waits and then reads. If the arrival were signalled before the copy
+  // landed, the consumers would read the zero that cp.async deliberately
+  // leaves visible until its wait -- so this reads 7 or it reads 0.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 src, .param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<12>;
+    .reg .pred %p<4>;
+    .shared .align 8 .b8 bar[8];
+    .shared .align 16 .b8 stage[16];
+    ld.param.u64 %rd1, [src];
+    cvta.to.global.u64 %rd2, %rd1;
+    ld.param.u64 %rd3, [out];
+    cvta.to.global.u64 %rd4, %rd3;
+    mov.u32 %r1, %tid.x;
+    mov.u64 %rd5, bar;
+    mov.u64 %rd6, stage;
+    setp.ne.u32 %p0, %r1, 0;
+    @%p0 bra INITDONE;
+    mov.u32 %r2, 64;
+    mbarrier.init.shared.b64 [%rd5], %r2;
+    mov.u32 %r3, 0;
+    st.shared.u32 [%rd6], %r3;
+INITDONE:
+    bar.sync 0;
+    @%p0 bra ARRIVE;
+    cp.async.ca.shared.global [%rd6], [%rd2], 4;
+    cp.async.mbarrier.arrive.shared.b64 [%rd5];
+    bra WAIT;
+ARRIVE:
+    mbarrier.arrive.shared.b64 %rd7, [%rd5];
+WAIT:
+    mbarrier.arrive.shared.b64 %rd8, [%rd5];
+SPIN:
+    mbarrier.test_wait.shared.b64 %p1, [%rd5], %rd8;
+    @!%p1 bra SPIN;
+    ld.shared.u32 %r5, [%rd6];
+    mul.wide.u32 %rd9, %r1, 4;
+    add.s64 %rd10, %rd4, %rd9;
+    st.global.u32 [%rd10], %r5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint32_t kThreads = 64;
+  uint64_t src = e.mem.alloc(16);
+  e.mem.store_scalar(src, 4, 7);
+  uint64_t out = e.mem.alloc(kThreads * 4);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {kThreads, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(src), arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t t = 0; t < kThreads; ++t)
+    VCHECK_EQ(e.mem.load_scalar(out + t * 4, 4), uint64_t{7});
+}
+
 VTEST(mbarrier_orders_a_producer_against_a_consumer) {
   // The test that matters for a split barrier: warp 0 writes a value, all
   // threads arrive, and every thread spins on the barrier before reading. If

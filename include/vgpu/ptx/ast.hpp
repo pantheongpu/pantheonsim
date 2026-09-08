@@ -183,6 +183,18 @@ struct OpBfe { Type ty; Reg dst; Operand a, b, c; };        // b=start, c=len
 struct OpBfi { Type ty; Reg dst; Operand a, b, c, d; };     // insert a into b
 struct OpBrev { Type ty; Reg dst; Operand src; };           // bit reverse
 struct OpPopcClz { bool popc = false; Type ty; Reg dst; Operand src; };
+// bfind.{u32,s32,u64,s64}[.shiftamt] d, a -- the index of the most significant
+// set bit, or 0xFFFFFFFF when there is none. The signed form searches for the
+// most significant bit that differs from the sign, which is what makes it an
+// integer log2 for negative numbers too. .shiftamt reports the distance from
+// the top instead of the index, which is what a normalizing shift wants.
+struct OpBfind { bool shiftamt = false; Type ty; Reg dst; Operand src; };
+// elect.sync d|p, membermask -- names one lane of the member set as leader.
+// Hopper's warp-specialized kernels use it to pick the thread that issues a
+// TMA copy or drives an mbarrier.
+struct OpElect { Reg dst; Reg pred_dst; Operand membermask; };
+// isspacep.<space> p, a -- does this generic address point into that window?
+struct OpIsSpacep { Space space = Space::Global; Reg dst; Operand src; };
 
 // Warp shuffle. `pred_dst` is the optional "d|p" second destination.
 enum class ShflMode { Up, Down, Bfly, Idx };
@@ -454,15 +466,21 @@ struct OpCpAsync {
 // The group operations. These carry no data: what they do is order the copies
 // above against the reads that consume them.
 struct OpCpAsyncGroup {
-  enum class Kind { Commit, WaitGroup, WaitAll } kind = Kind::Commit;
+  // MbarrierArrive is cp.async.mbarrier.arrive: instead of joining a numbered
+  // group, the outstanding copies are made to complete and then an arrival is
+  // signalled on an mbarrier. It is how an Ampere-style pipeline hands a
+  // filled buffer to its consumer.
+  enum class Kind { Commit, WaitGroup, WaitAll, MbarrierArrive } kind = Kind::Commit;
   uint32_t keep = 0;                   // wait_group N: leave at most N outstanding
+  Addr bar;                            // MbarrierArrive: the barrier to signal
+  bool noinc = false;                  // .noinc: do not add an arrival of our own
 };
 
 struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpActiveMask>;
 

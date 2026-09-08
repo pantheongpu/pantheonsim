@@ -1829,6 +1829,86 @@ class Interpreter {
       write_reg(w, op->dst, m, r, 32);
       return;
     }
+    if (const auto* op = std::get_if<OpBfind>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->src, _s_a);
+      Lanes r;
+      const uint32_t bits = op->ty.bits;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
+          uint64_t v = mask_to_bits(a[lane], bits);
+          // The signed form looks for the most significant bit that differs
+          // from the sign, which is what makes it an integer log2 of the
+          // magnitude for negatives too. Inverting a negative value first is
+          // how PTX defines it.
+          if (op->ty.is_signed()) {
+            const bool neg = (v >> (bits - 1)) & 1u;
+            if (neg) v = mask_to_bits(~v, bits);
+          }
+          uint32_t idx = 0xFFFFFFFFu;
+          if (v != 0) {
+            uint32_t i = bits;
+            while (i-- > 0)
+              if ((v >> i) & 1ull) { idx = i; break; }
+            // .shiftamt reports the distance from the top rather than the
+            // index, which is what a normalizing shift wants.
+            if (op->shiftamt) idx = bits - 1 - idx;
+          }
+          r[lane] = idx;
+        }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpElect>(&ins.op)) {
+      require_warp32(ins, "elect.sync");
+      Lanes _s_mm;
+      const Lanes& mm = read_operand(w, ctx, ins, op->membermask, _s_mm);
+      // One leader for the whole warp, not one per lane: every participating
+      // lane must be told the *same* winner or the kernel has several leaders
+      // and the copy it was electing someone to issue happens more than once.
+      uint32_t leader = W_;
+      const Mask members = static_cast<Mask>(mm[first_set(m)]) & m;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (members & (Mask{1} << lane)) { leader = lane; break; }
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = leader < W_ ? leader : 0;
+      if (op->dst.id != kNoReg) write_reg(w, op->dst, m, r, 32);
+      if (op->pred_dst.id != kNoReg) {
+        Mask& p = pred_slot(w, op->pred_dst);
+        const Mask won = (leader < W_) ? (Mask{1} << leader) : Mask{0};
+        p = (p & ~m) | (won & m);
+      }
+      return;
+    }
+    if (const auto* op = std::get_if<OpIsSpacep>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->src, _s_a);
+      Mask& p = pred_slot(w, op->dst);
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        const uint64_t v = a[lane];
+        bool in_space = false;
+        switch (op->space) {
+          case Space::Shared:
+            in_space = v >= kSharedVaBase && v < kSharedVaBase + kSharedVaSize;
+            break;
+          case Space::Local:
+            in_space = v >= kLocalVaBase && v < kLocalVaBase + kLocalVaSize;
+            break;
+          default:
+            // Global is everything that is a device address and not one of the
+            // engine's private windows. Answering "not shared and not local"
+            // would also claim a null pointer is global.
+            in_space = v >= kDeviceVaBase && !(v >= kSharedVaBase && v < kSharedVaBase + kSharedVaSize) &&
+                       !(v >= kLocalVaBase && v < kLocalVaBase + kLocalVaSize) &&
+                       !(v >= kParamVaBase && v < kParamVaBase + kParamVaSize);
+            break;
+        }
+        p = in_space ? (p | (Mask{1} << lane)) : (p & ~(Mask{1} << lane));
+      }
+      return;
+    }
     if (const auto* op = std::get_if<OpMbarrier>(&ins.op)) {
       exec_mbarrier(w, ctx, ins, *op, m);
       return;
@@ -3382,6 +3462,50 @@ class Interpreter {
 
   void exec_cp_async_group(Warp& w, const BlockCtx& ctx, const Instr& ins,
                            const OpCpAsyncGroup& op, Mask m) {
+    if (op.kind == OpCpAsyncGroup::Kind::MbarrierArrive) {
+      // The copies this thread issued complete, and then it arrives on the
+      // barrier. Completing first is the whole ordering guarantee: a consumer
+      // released by this arrival must see the filled buffer, so making the
+      // copies land after the arrival would hand it the old contents -- the
+      // exact bug deferring cp.async exists to expose.
+      if (w.cp) {
+        for (uint32_t lane = 0; lane < W_; ++lane) {
+          if (!(m & (Mask{1} << lane))) continue;
+          auto& open = w.cp->open[lane];
+          auto& groups = w.cp->groups[lane];
+          if (!open.empty()) {
+            groups.push_back(std::move(open));
+            open.clear();
+          }
+          while (!groups.empty()) {
+            complete_group(w, ctx, ins, lane, groups.front());
+            groups.pop_front();
+          }
+        }
+      }
+      if (!ctx.mbar)
+        ctx_fail(ins, -1, Err::UnsupportedPtx, "cp.async.mbarrier.arrive outside a block context");
+      Lanes _s_base;
+      const Lanes& base = addr_base(w, ctx, ins, op.bar, _s_base);
+      const uint32_t lead = first_set(m);
+      const uint64_t addr =
+          space_base(Space::Shared) + base[lead] + static_cast<uint64_t>(op.bar.offset);
+      auto it = ctx.mbar->bars.find(addr);
+      if (it == ctx.mbar->bars.end() || !it->second.valid)
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "cp.async.mbarrier.arrive on an mbarrier that has not been initialized");
+      // .noinc completes the copies without contributing an arrival of its
+      // own, which is how a thread that already arrived orders its copies.
+      if (!op.noinc) {
+        Mbarrier& b = it->second;
+        b.arrived += popcount_mask(m);
+        if (b.arrived >= b.expected) {
+          b.arrived -= b.expected;
+          b.phase ^= 1u;
+        }
+      }
+      return;
+    }
     if (!w.cp) {
       // Waiting with nothing outstanding is legal and common -- a loop's first
       // iteration waits before it has issued anything.
@@ -3560,6 +3684,10 @@ class Interpreter {
   // preempts a spinning warp after its slice, the other warps run and arrive,
   // and the spinner then sees the phase flip. A spin that can never be
   // satisfied is caught by the step budget rather than hanging.
+  static uint32_t first_set(Mask m) {
+    return m ? static_cast<uint32_t>(__builtin_ctzll(m)) : 0u;
+  }
+
   void exec_mbarrier(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMbarrier& op,
                      Mask m) {
     if (!ctx.mbar)

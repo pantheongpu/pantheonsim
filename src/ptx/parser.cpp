@@ -1451,6 +1451,55 @@ class Parser {
       expect_punct(",");
       op.c = parse_operand();
       ins.op = op;
+    } else if (op0 == "bfind") {
+      OpBfind op;
+      size_t ti = 1;
+      if (parts.size() > 1 && parts[1] == "shiftamt") { op.shiftamt = true; ti = 2; }
+      if (ti >= parts.size()) return unsupported("bfind form (expected bfind[.shiftamt].type)");
+      auto bty = parse_type_token(parts[ti]);
+      if (!bty || (bty->bits != 32 && bty->bits != 64))
+        return unsupported("bfind type '." + parts[ti] + "' (only 32- and 64-bit)");
+      op.ty = *bty;
+      op.dst = expect_reg_operand("bfind destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "elect") {
+      if (parts.size() != 2 || parts[1] != "sync")
+        return unsupported("elect form (expected elect.sync)");
+      OpElect op;
+      // The syntax is "d|p" or just "|p": the leader's lane id, the predicate,
+      // or both. A bare "|" means only the predicate is wanted.
+      if (!peek_punct("|")) op.dst = expect_reg_operand("elect destination");
+      if (peek_punct("|")) {
+        next();
+        op.pred_dst = expect_reg_operand("elect predicate destination");
+      }
+      expect_punct(",");
+      op.membermask = parse_operand();
+      ins.op = op;
+    } else if (op0 == "isspacep") {
+      if (parts.size() != 2) return unsupported("isspacep form (expected isspacep.space)");
+      OpIsSpacep op;
+      if (parts[1] == "global") op.space = Space::Global;
+      else if (parts[1] == "shared") op.space = Space::Shared;
+      else if (parts[1] == "local") op.space = Space::Local;
+      else if (parts[1] == "const") op.space = Space::Global;
+      else return unsupported("isspacep space '." + parts[1] + "'");
+      op.dst = expect_reg_operand("isspacep destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "griddepcontrol" || op0 == "setmaxnreg") {
+      // Both are scheduling directives with no effect on what a kernel
+      // computes. griddepcontrol orders a grid against its predecessor, and
+      // launches here are synchronous, so the predecessor has already finished
+      // by the time this executes -- .wait has nothing to wait for and
+      // .launch_dependents nothing to release. setmaxnreg reshapes a
+      // warpgroup's register budget, and there is no architectural register
+      // file to reshape.
+      while (!at_end() && !peek_punct(";")) next();
+      ins.op = OpNop{};
     } else if (op0 == "mbarrier") {
       // mbarrier.<op>[.parity][.space][.sem][.scope].b64 ...
       OpMbarrier op;
@@ -2119,6 +2168,16 @@ class Parser {
         ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::Commit, 0};
       } else if (parts.size() > 2 && parts[2] == "wait_all") {
         ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::WaitAll, 0};
+      } else if (parts.size() > 3 && parts[2] == "mbarrier" && parts[3] == "arrive") {
+        // cp.async.mbarrier.arrive[.noinc].shared.b64 [bar]
+        OpCpAsyncGroup g;
+        g.kind = OpCpAsyncGroup::Kind::MbarrierArrive;
+        for (size_t i = 4; i < parts.size(); ++i)
+          if (parts[i] == "noinc") g.noinc = true;
+        g.bar = parse_addr(fn);
+        if (g.bar.base_kind == Addr::Base::CallSlot || g.bar.base_kind == Addr::Base::EntryParam)
+          return unsupported("cp.async.mbarrier.arrive through a parameter/slot name");
+        ins.op = g;
       } else if (parts.size() > 2 && parts[2] == "wait_group") {
         Operand n = parse_operand();
         auto* imm = std::get_if<ImmInt>(&n);
@@ -2135,7 +2194,6 @@ class Parser {
           else if (p == "ca") ca = true;
           else if (p == "shared") shared_seen = true;
           else if (p == "global") global_seen = true;
-          else if (p == "mbarrier") return unsupported("cp.async.mbarrier");
           else return unsupported("cp.async modifier '." + p + "'");
         }
         if (!shared_seen || !global_seen)
