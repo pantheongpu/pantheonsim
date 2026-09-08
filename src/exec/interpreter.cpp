@@ -1478,7 +1478,7 @@ class Interpreter {
         case FRound::Nearest: break;
       }
       for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane)) r[lane] = float_bin(op->op, op->ty, a[lane], b[lane]);
+        if (m & (Mask{1} << lane)) r[lane] = float_bin(op->op, op->ty, a[lane], b[lane], op->nan_propagate);
       if (op->round != FRound::Nearest) std::fesetround(prev_round);
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
@@ -2186,23 +2186,44 @@ class Interpreter {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
+      auto apply = [&](double x) {
+        switch (op->op) {
+          case MathOp::Ex2: return std::exp2(x);
+          case MathOp::Lg2: return std::log2(x);
+          case MathOp::Sin: return std::sin(x);
+          case MathOp::Cos: return std::cos(x);
+          case MathOp::Sqrt: return std::sqrt(x);
+          case MathOp::Rsqrt: return 1.0 / std::sqrt(x);
+          case MathOp::Rcp: return 1.0 / x;
+          case MathOp::Tanh: return std::tanh(x);
+        }
+        return 0.0;
+      };
+      const bool is_bf = op->ty.is_bfloat();
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
-          double x = op->ty.bits == 32 ? static_cast<double>(f32(v[lane])) : f64(v[lane]);
-          double y = 0;
-          switch (op->op) {
-            case MathOp::Ex2: y = std::exp2(x); break;
-            case MathOp::Lg2: y = std::log2(x); break;
-            case MathOp::Sin: y = std::sin(x); break;
-            case MathOp::Cos: y = std::cos(x); break;
-            case MathOp::Sqrt: y = std::sqrt(x); break;
-            case MathOp::Rsqrt: y = 1.0 / std::sqrt(x); break;
-            case MathOp::Rcp: y = 1.0 / x; break;
-            case MathOp::Tanh: y = std::tanh(x); break;
+          if (op->ty.bits == 16) {
+            // The half forms compute at host precision like every other
+            // transcendental here and round once at the end. Rounding to 16
+            // bits *before* the function -- the shape a naive reuse of the f32
+            // path would take -- loses more than the hardware's own
+            // approximation does.
+            uint64_t out = 0;
+            const int halves = op->packed ? 2 : 1;
+            for (int h = 0; h < halves; ++h) {
+              const uint64_t bits = (v[lane] >> (16 * h)) & 0xFFFF;
+              const double y = apply(is_bf ? bf16_to_double(bits) : f16_to_double(bits));
+              out |= (is_bf ? double_to_bf16(y) : double_to_f16(y)) << (16 * h);
+            }
+            r[lane] = out;
+            continue;
           }
+          const double x = op->ty.bits == 32 ? static_cast<double>(f32(v[lane])) : f64(v[lane]);
+          const double y = apply(x);
           r[lane] = op->ty.bits == 32 ? f32bits(static_cast<float>(y)) : f64bits(y);
         }
-      write_reg(w, op->dst, m, r, op->ty.bits);
+      // A half result still occupies a 32-bit register, packed or not.
+      write_reg(w, op->dst, m, r, op->ty.bits == 16 ? 32u : op->ty.bits);
       return;
     }
     if (const auto* op = std::get_if<OpBfe>(&ins.op)) {
@@ -3322,7 +3343,27 @@ class Interpreter {
     return 0;
   }
 
-  uint64_t float_bin(FloatBinOp op, Type ty, uint64_t a, uint64_t b) {
+  // nan_propagate is min.NaN/max.NaN: NaN in, NaN out. Plain min/max return
+  // the *other* operand when one is NaN, which is fmin/fmax's rule, and the
+  // two disagree on exactly the inputs a numerically fragile kernel is
+  // watching for -- a clamp written as max.NaN(x, lo) to keep NaNs visible
+  // would quietly launder them away under fmax.
+  uint64_t float_bin(FloatBinOp op, Type ty, uint64_t a, uint64_t b,
+                     bool nan_propagate = false) {
+    if (nan_propagate && (op == FloatBinOp::Min || op == FloatBinOp::Max)) {
+      const double x = ty.bits == 64 ? f64(a) : static_cast<double>(f32(a));
+      const double y = ty.bits == 64 ? f64(b) : static_cast<double>(f32(b));
+      if (std::isnan(x) || std::isnan(y)) {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        if (ty.bits == 64) return f64bits(nan);
+        if (ty.bits == 32) return f32bits(static_cast<float>(nan));
+        return double_to_f16(nan);
+      }
+    }
+    return float_bin_impl(op, ty, a, b);
+  }
+
+  uint64_t float_bin_impl(FloatBinOp op, Type ty, uint64_t a, uint64_t b) {
     if (ty.bits == 16) {
       double x = f16_to_double(a), y = f16_to_double(b), r = 0;
       switch (op) {
@@ -3836,9 +3877,15 @@ class Interpreter {
   }
 
   void exec_atom(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    // The access width is not the element width for the half forms: an
+    // f16x2 atomic reads and writes a whole 32-bit word, and a scalar f16 one
+    // touches 2 bytes. Taking the width from the element type alone is what
+    // made a packed atomic look like an unsupported 2-byte access.
     uint32_t size = op.ty.bytes();
-    if (size != 4 && size != 8)
-      ctx_fail(ins, -1, Err::UnsupportedPtx, "atomics are only implemented for 32/64-bit types");
+    if (op.ty.bits == 16) size = op.packed_half ? 4u : 2u;
+    if (size != 2 && size != 4 && size != 8)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "atomics are implemented for 16-, 32- and 64-bit types");
     Lanes _s_base;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     uint64_t sbase = space_base(op.space);
@@ -3864,9 +3911,36 @@ class Interpreter {
         ++stats_.atomics;
         stats_.atomic_bytes += size;
         uint64_t old = load_routed(w, ctx, ins, lane, addr, size);
-        uint64_t b = mask_to_bits(bv[lane], op.ty.bits);
+        // Masked to the *access* width, not the element width: for an f16x2
+        // atomic those differ, and masking to 16 bits threw away the high
+        // half of every operand before it was ever added.
+        uint64_t b = mask_to_bits(bv[lane], size * 8u);
         uint64_t nv = old;
-        if (op.ty.is_float()) {
+        if (op.ty.is_real() && op.ty.bits == 16) {
+          // f16/bf16 atomics. The packed forms update two independent halves
+          // in one operation, which is the point of them: a gradient
+          // accumulation touches both channels of a half2 with one atomic
+          // rather than racing on two.
+          const bool is_bf = op.ty.is_bfloat();
+          const int halves = op.packed_half ? 2 : 1;
+          uint64_t out = op.packed_half ? 0 : (old & ~0xFFFFull);
+          for (int h = 0; h < halves; ++h) {
+            const uint64_t ox = (old >> (16 * h)) & 0xFFFF;
+            const uint64_t bx = (b >> (16 * h)) & 0xFFFF;
+            const double x = is_bf ? bf16_to_double(ox) : f16_to_double(ox);
+            const double y = is_bf ? bf16_to_double(bx) : f16_to_double(bx);
+            out |= (is_bf ? double_to_bf16(x + y) : double_to_f16(x + y)) << (16 * h);
+          }
+          nv = out;
+          // Store and continue, exactly as the f32/f64 branch does. Falling
+          // through instead reaches the integer switch below, which overwrote
+          // nv with old + b -- so a packed half atomic added the two operands'
+          // *bit patterns* and stored that. It looked like an accumulation
+          // because the number grew.
+          store_routed(w, ctx, ins, lane, addr, size, mask_to_bits(nv, size * 8u));
+          r[lane] = old;
+          continue;
+        } else if (op.ty.is_float()) {
           // Reinterpret and operate in the float domain: adding the bit
           // patterns of two floats produces a number unrelated to their sum.
           // Min/max follow CUDA and use the fmin/fmax ordering rather than <,
@@ -3900,7 +3974,7 @@ class Interpreter {
             }
             nv = std::bit_cast<uint64_t>(res);
           }
-          store_routed(w, ctx, ins, lane, addr, size, mask_to_bits(nv, op.ty.bits));
+          store_routed(w, ctx, ins, lane, addr, size, mask_to_bits(nv, size * 8u));
           r[lane] = old;
           continue;
         }
@@ -3928,13 +4002,15 @@ class Interpreter {
             break;
           case AtomOp::Cas: nv = (old == mask_to_bits(cv[lane], op.ty.bits)) ? b : old; break;
         }
-        store_routed(w, ctx, ins, lane, addr, size, mask_to_bits(nv, op.ty.bits));
+        store_routed(w, ctx, ins, lane, addr, size, mask_to_bits(nv, size * 8u));
         r[lane] = old;
       }
     // `red` performed the read-modify-write and has nowhere to put the old
     // value. The memory side above already happened, which is the whole
     // instruction; only the write-back is skipped.
-    if (!op.discards_result) write_reg(w, op.dst, m, r, op.ty.bits);
+    // The width here is the access width too: an f16x2 atomic returns the
+    // whole 32-bit word it replaced, not one half of it.
+    if (!op.discards_result) write_reg(w, op.dst, m, r, size * 8u);
   }
 
   // ---- device printf (the vprintf builtin) ----

@@ -64,7 +64,14 @@ const std::unordered_map<std::string, Sreg>& sreg_table() {
 bool inert_mem_modifier(const std::string& p) {
   static const std::set<std::string> inert = {"volatile", "nc", "ca", "cg", "cs", "lu",  "cv",
                                               "wb",       "wt", "relaxed", "acquire", "release",
-                                              "acq_rel",  "cta", "gpu", "sys"};
+                                              "acq_rel",  "cta", "gpu", "sys",
+                                              // .noftz keeps subnormal halves rather than
+                                              // flushing them, and this engine never flushes,
+                                              // so it asks for the behaviour already in place.
+                                              "noftz",
+                                              // Cluster scope on an ordinary access is a
+                                              // visibility promise, not a different address.
+                                              "cluster"};
   return inert.count(p) > 0;
 }
 
@@ -1171,6 +1178,7 @@ class Parser {
           {"rcp", MathOp::Rcp},     {"tanh", MathOp::Tanh}};
       Type ty{};
       bool have_ty = false;
+      bool packed_half = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         // approx/rn/rz/ftz/full select precision on hardware; VirtualGPU always
@@ -1178,17 +1186,20 @@ class Parser {
         if (p == "approx" || p == "rn" || p == "rz" || p == "rm" || p == "rp" || p == "ftz" ||
             p == "full")
           ;
+        else if (p == "f16x2") { ty = Type{Type::Kind::F, 16}; have_ty = true; packed_half = true; }
+        else if (p == "bf16x2") { ty = Type{Type::Kind::BF, 16}; have_ty = true; packed_half = true; }
         else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
         } else return unsupported("unrecognized modifier '." + p + "'");
       }
       if (!have_ty) fail(ins.line, opcode + " missing type");
-      if (!ty.is_float() || (ty.bits != 32 && ty.bits != 64))
-        return unsupported("only f32/f64 " + op0 + " is implemented");
+      if (!ty.is_real() || (ty.bits != 16 && ty.bits != 32 && ty.bits != 64))
+        return unsupported(op0 + " on '" + parts.back() + "'");
       OpMath op;
       op.op = mops.at(op0);
       op.ty = ty;
+      op.packed = packed_half;
       op.dst = expect_reg_operand("destination");
       expect_punct(",");
       op.src = parse_operand();
@@ -1753,6 +1764,7 @@ class Parser {
       std::optional<AtomOp> aop;
       Type ty{};
       bool have_ty = false;
+      bool packed_half = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "global") space = Space::Global;
@@ -1766,6 +1778,8 @@ class Parser {
         else if (p == "xor") aop = AtomOp::Xor;
         else if (p == "exch") aop = AtomOp::Exch;
         else if (p == "cas") aop = AtomOp::Cas;
+        else if (p == "f16x2") { ty = Type{Type::Kind::F, 16}; have_ty = true; packed_half = true; }
+        else if (p == "bf16x2") { ty = Type{Type::Kind::BF, 16}; have_ty = true; packed_half = true; }
         else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
@@ -1782,9 +1796,10 @@ class Parser {
             *aop != AtomOp::Max)
           return unsupported("atom." + std::string(*aop == AtomOp::Cas ? "cas" : "bitwise") +
                              " on a float type (CUDA has no such instruction; use .b32)");
-        if (ty.bits != 32 && ty.bits != 64)
-          return unsupported("float atomics are implemented for f32 and f64; f16/bf16 atomics "
-                             "are not yet");
+        if (ty.bits == 16 && *aop != AtomOp::Add)
+          return unsupported("only atom.add is defined for f16/bf16");
+        if (ty.bits != 16 && ty.bits != 32 && ty.bits != 64)
+          return unsupported("float atomics are implemented for f16, bf16, f32 and f64");
       }
       if (discards && *aop == AtomOp::Cas)
         return unsupported("red.cas (a compare-and-swap whose result is discarded "
@@ -1794,6 +1809,7 @@ class Parser {
       op.ty = ty;
       op.space = space;
       op.discards_result = discards;
+      op.packed_half = packed_half;
       if (!discards) {
         op.dst = expect_reg_operand("atom destination");
         expect_punct(",");
@@ -1815,6 +1831,7 @@ class Parser {
       const bool carry_in = (op0 == "addc" || op0 == "subc");
       const std::string base_op = carry_in ? op0.substr(0, 3) : op0;
       bool carry_out = false;
+      bool nan_propagate = false;
       bool wide = false, lo = false, hi = false;
       FRound frnd = FRound::Nearest;
       Type ty{};
@@ -1836,6 +1853,14 @@ class Parser {
         // same policy the SFU transcendentals already follow: correct to better
         // than hardware, never bit-identical to it.
         else if (p == "approx" || p == "full") ;
+        // min.NaN/max.NaN propagate a NaN operand instead of returning the
+        // other one. That is exactly what fmin/fmax do NOT do, so it cannot be
+        // dropped -- it is handled at execution, and recorded here.
+        else if (p == "NaN") nan_propagate = true;
+        // .xorsign.abs takes the magnitude and xors the signs; a semantic
+        // change rather than an accuracy one.
+        else if (p == "xorsign" || p == "abs")
+          return unsupported("modifier '." + p + "' on " + op0 + " is not implemented");
         // .sat clamps the result into [0,1]. That is a semantic change, not an
         // accuracy one, so ignoring it would silently produce wrong numbers.
         else if (p == "sat")
@@ -1888,6 +1913,7 @@ class Parser {
         OpFloatBin op;
         op.round = frnd;
         op.op = it->second;
+        op.nan_propagate = nan_propagate;
         op.ty = ty;
         op.dst = expect_reg_operand("destination");
         expect_punct(",");

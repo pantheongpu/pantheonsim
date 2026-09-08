@@ -176,7 +176,9 @@ struct OpAbs { Type ty; Reg dst; Operand src; };
 // documented approximation tolerance but not bit-identical to a real SFU
 // (a documented divergence — see ARCHITECTURE.md).
 enum class MathOp { Ex2, Lg2, Sin, Cos, Sqrt, Rsqrt, Rcp, Tanh };
-struct OpMath { MathOp op; Type ty; Reg dst; Operand src; };
+// packed is the .f16x2/.bf16x2 form: two independent 16-bit results in one
+// 32-bit register. The type carries which of f16/bf16 the halves are.
+struct OpMath { MathOp op; Type ty; bool packed = false; Reg dst; Operand src; };
 
 // Bitfield extract/insert.
 struct OpBfe { Type ty; Reg dst; Operand a, b, c; };        // b=start, c=len
@@ -349,7 +351,11 @@ struct OpShf { bool left = false; bool wrap = false; Reg dst; Operand a, b, c; }
 // which only relaxes accuracy, these change the result -- quantization kernels
 // depend on .rz truncating -- so they are carried through and applied.
 enum class FRound { Nearest, Zero, MinusInf, PlusInf };
-struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; Type ty; Reg dst; Operand a, b; };
+// nan_propagate is min.NaN/max.NaN, which returns NaN when either operand is
+// NaN. Plain min/max return the non-NaN operand, which is fmin/fmax's rule --
+// the two disagree on exactly the inputs a numerically fragile kernel cares
+// about, so the modifier cannot be dropped.
+struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; bool nan_propagate = false; Type ty; Reg dst; Operand a, b; };
 struct OpFma { Type ty; Reg dst; Operand a, b, c; };
 // Packed half2 SIMD: one 32-bit register holds two f16 lanes.
 // Half-precision arithmetic. One node covers four shapes, because they differ
@@ -390,7 +396,7 @@ struct OpNotPred { Reg dst; Reg src; };
 // old value. nvcc emits it whenever the result of an atomicAdd() is unused,
 // which in a reduction or a histogram is every call, so a kernel full of
 // atomics can easily contain no `atom` at all.
-struct OpAtom { AtomOp op = AtomOp::Add; Space space = Space::Generic; Type ty; Reg dst; Addr addr; Operand b; Operand c; bool discards_result = false; };
+struct OpAtom { AtomOp op = AtomOp::Add; Space space = Space::Generic; Type ty; Reg dst; Addr addr; Operand b; Operand c; bool discards_result = false; bool packed_half = false; };
 struct OpBra { size_t target = 0; std::string label; };  // target = instruction index
 struct OpBar {};                                     // bar.sync 0
 // An instruction with nothing to do here: a memory fence, or a backoff hint.

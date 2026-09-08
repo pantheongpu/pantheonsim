@@ -1939,6 +1939,77 @@ VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{512 + 256});
 }
 
+VTEST(nan_propagating_min_and_half_atomics) {
+  // min.NaN/max.NaN return NaN when either operand is NaN; plain min/max
+  // return the other operand, which is fmin/fmax's rule. A clamp written as
+  // max.NaN to keep NaNs visible would quietly launder them away if the
+  // modifier were dropped, so the two forms are checked against each other.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.f32 %f1, 0f7FC00000;      // NaN
+    mov.f32 %f2, 0f40400000;      // 3.0
+    min.f32 %f3, %f1, %f2;        // plain: returns 3.0
+    min.NaN.f32 %f4, %f1, %f2;    // .NaN: returns NaN
+    st.global.f32 [%rd2], %f3;
+    st.global.f32 [%rd2+4], %f4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), 3.0f);
+  VCHECK(std::isnan(as_f32(e.mem.load_scalar(out + 4, 4))));
+}
+
+VTEST(packed_half_atomics_update_both_channels) {
+  // atom.add.f16x2 is one atomic over two independent halves, which is the
+  // point of it: a gradient accumulation touches both channels of a half2
+  // without racing on two separate atomics. 64 threads each add {1.0, 2.0}.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.f32 %f1, 0f3F800000;      // 1.0
+    mov.f32 %f2, 0f40000000;      // 2.0
+    cvt.rn.f16x2.f32 %r1, %f2, %f1;   // hi = 2.0, lo = 1.0
+    red.global.add.noftz.f16x2 [%rd2], %r1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(8);
+  e.mem.store_scalar(out, 4, 0);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {64, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  const uint32_t packed = static_cast<uint32_t>(e.mem.load_scalar(out, 4));
+  // f16 has an 11-bit mantissa, so 64 and 128 are both exact.
+  auto half_to_float = [](uint16_t h) {
+    const uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1F, man = h & 0x3FF;
+    if (exp == 0) return std::ldexp(static_cast<float>(man), -24) * (sign ? -1 : 1);
+    const float v = std::ldexp(static_cast<float>(man | 0x400), static_cast<int>(exp) - 25);
+    return sign ? -v : v;
+  };
+  VCHECK_EQ(half_to_float(static_cast<uint16_t>(packed & 0xFFFF)), 64.0f);
+  VCHECK_EQ(half_to_float(static_cast<uint16_t>(packed >> 16)), 128.0f);
+}
+
 VTEST(bf16_arithmetic_is_bf16_not_f16) {
   // bf16 is not an f16 with a different bias: it has f32's exponent range and
   // a 7-bit mantissa. The distinction is visible at 300.0, which bf16 rounds
