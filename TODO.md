@@ -373,10 +373,12 @@ what is done.
 - Runtime: async copies, the virtual memory management API
   (cuMemAddressReserve…). (Managed memory and host-pinned memory are done.)
 - Frontends: cubin/SASS loading, and AMD execution -- HIP runtime and the CDNA
-  ISA. AMD *discovery* now exists: `tools/rocminfo-to-profile.py` reads a real
-  MI325X and `profiles/amd/mi325x.yaml` is verified against one. What is
-  missing is running anything, and the blocker is concrete rather than vague:
-  a wavefront is 64 lanes and this interpreter's warp is 32.
+  ISA. AMD *discovery* exists: `tools/rocminfo-to-profile.py` reads a real
+  MI325X and `profiles/amd/mi325x.yaml` is verified against one. The warp width
+  is no longer the blocker: the interpreter is warp-width parametric, masks are
+  64-bit, and a 64-lane profile launches and executes. What is missing now is
+  the front-end -- HIP compiles to a GCN code object, not to PTX, so there is
+  nothing yet to feed a 64-lane wavefront.
 - Tooling: trace record/replay, conformance DB + compat scores. (`vgpu run`,
   `vgpu test --matrix`, shared-memory race detection, the random and
   adversarial schedulers, and fault injection are done.)

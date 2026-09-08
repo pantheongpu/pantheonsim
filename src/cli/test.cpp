@@ -151,10 +151,13 @@ int cmd_test(const std::vector<std::string>& args) {
   if (gpus.empty()) {
     for (const auto& id : vgpu::available_gpus()) {
       const vgpu::DeviceProfile p = vgpu::load_gpu(id);
-      // AMD profiles describe 64-lane wavefronts, which the interpreter does
-      // not execute yet, so running one would report a failure about this
-      // engine rather than about the program. Verified-only by default for the
-      // same reason a placeholder is not evidence.
+      // AMD profiles are excluded even though the interpreter executes 64-lane
+      // wavefronts now. The reason changed: it is no longer that the engine
+      // cannot run them, it is that the programs in this matrix are CUDA. What
+      // a CUDA binary does on a 64-lane wavefront is not what an MI300X does
+      // with it, so including the column would compare against a machine that
+      // does not exist. Verified-only by default for the same reason a
+      // placeholder is not evidence.
       if (p.vendor != "nvidia") continue;
       if (!all && !p.verified) continue;
       gpus.push_back(id);

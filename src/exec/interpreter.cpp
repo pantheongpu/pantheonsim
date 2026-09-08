@@ -44,7 +44,14 @@ namespace {
 
 using namespace vgpu::ptx;
 
-constexpr uint32_t kWarpSize = 32;
+// The widest warp any profile describes: 32 lanes on NVIDIA, 64 on a CDNA
+// wavefront. This is a *ceiling* for sizing per-lane storage, not the width
+// anything executes at -- that comes from the device profile at construction
+// and lives in Interpreter::W_. Sizing to the maximum costs an NVIDIA warp
+// twice the register-file footprint it needs and keeps every per-lane array a
+// plain fixed-size member, which is the trade the alternative (a vector per
+// register, indexed at every access) loses badly.
+constexpr uint32_t kMaxWarpSize = 64;
 // Per-thread .local window: distinct from both host pointers and device
 // globals. Addresses here are lane-relative (each lane sees its own frame).
 constexpr uint64_t kLocalVaBase = 0x6fff'0000'0000ull;
@@ -59,13 +66,15 @@ constexpr uint64_t kParamVaSize = 1ull << 20;
 constexpr uint64_t kSharedVaBase = 0x6ffe'0000'0000ull;
 constexpr uint64_t kSharedVaSize = 1ull << 30;
 
-using Mask = uint32_t;  // bit i == lane i active
+// Bit i == lane i active. 64 bits because a CDNA wavefront has 64 lanes; an
+// NVIDIA warp uses the low 32 and leaves the rest clear.
+using Mask = uint64_t;
 // Operands are passed around as 64-bit lanes so every handler sees one type.
-using Lanes = std::array<uint64_t, kWarpSize>;
+using Lanes = std::array<uint64_t, kMaxWarpSize>;
 // Storage, however, is split by declared width: a 32-bit register costs
 // 128 bytes per warp instead of 256. Most registers in real kernels are
 // 32-bit, so this halves register-file traffic for the common case.
-using Lanes32 = std::array<uint32_t, kWarpSize>;
+using Lanes32 = std::array<uint32_t, kMaxWarpSize>;
 
 struct ParamBuffer {
   std::vector<uint8_t> bytes;
@@ -144,9 +153,9 @@ struct PendingCopy {
 // which is almost none of them, and this is 32 lanes of container otherwise.
 struct AsyncCopies {
   // Issued but not yet committed to a group.
-  std::array<std::vector<PendingCopy>, kWarpSize> open;
+  std::array<std::vector<PendingCopy>, kMaxWarpSize> open;
   // Committed groups, oldest first. wait_group N drains until N remain.
-  std::array<std::deque<std::vector<PendingCopy>>, kWarpSize> groups;
+  std::array<std::deque<std::vector<PendingCopy>>, kMaxWarpSize> groups;
 };
 
 struct Warp {
@@ -177,7 +186,7 @@ struct Warp {
   mutable uint32_t widen_next = 0;
   std::unordered_map<std::string, Lanes> slots;  // call-argument slots
   std::vector<std::vector<uint8_t>> local;       // per-lane .local frames (lazy)
-  std::array<uint32_t, kWarpSize> tid_x{}, tid_y{}, tid_z{};
+  std::array<uint32_t, kMaxWarpSize> tid_x{}, tid_y{}, tid_z{};
   // PTX's condition-code carry bit, one per lane. Written by ".cc" arithmetic
   // and read by addc/subc/madc; nothing else in the ISA touches it.
   Mask carry = 0;
@@ -253,19 +262,24 @@ uint64_t f32bits(float f) { return std::bit_cast<uint32_t>(f); }
 double f64(uint64_t bits) { return std::bit_cast<double>(bits); }
 uint64_t f64bits(double d) { return std::bit_cast<uint64_t>(d); }
 
-inline constexpr Mask kAllLanes = 0xFFFFFFFFu;
+// Every lane of a warp `width` lanes wide. Written as a shift of 2 rather than
+// 1 so that width == 64 does not shift a 64-bit value by 64, which is
+// undefined and on x86 produces 1 rather than 0.
+inline constexpr Mask all_lanes(uint32_t width) {
+  return static_cast<Mask>((Mask{2} << (width - 1)) - 1);
+}
 
 // Applies `f` to each active lane. The full-warp case is a straight loop the
 // compiler can vectorize; a partial mask walks only the set bits instead of
-// testing all 32. Both matter: this runs once per instruction per warp.
+// testing every lane. Both matter: this runs once per instruction per warp.
 template <class F>
-inline void for_active(Mask m, F&& f) {
-  if (m == kAllLanes) {
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) f(lane);
+inline void for_active(Mask m, uint32_t width, F&& f) {
+  if (m == all_lanes(width)) {
+    for (uint32_t lane = 0; lane < width; ++lane) f(lane);
   } else {
     Mask rest = m;
     while (rest) {
-      uint32_t lane = static_cast<uint32_t>(__builtin_ctz(rest));
+      uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(rest));
       rest &= rest - 1;
       f(lane);
     }
@@ -282,7 +296,8 @@ class Interpreter {
               const DeviceProfile& profile, const SymbolTable* symbols, LaunchStats& stats,
               const ProgressFn& progress)
       : fn_(fn), cfg_(cfg), params_(params), mem_(mem), profile_(profile), symbols_(symbols),
-        stats_(stats), progress_(progress) {
+        stats_(stats), progress_(progress), W_(profile.warp_size),
+        all_(all_lanes(profile.warp_size)) {
     if (progress_) last_progress_ = std::chrono::steady_clock::now();
   }
 
@@ -395,7 +410,7 @@ class Interpreter {
       b.ctx.shadow = &b.shadow;
     }
     const uint64_t total = uint64_t{b.ctx.ntid[0]} * b.ctx.ntid[1] * b.ctx.ntid[2];
-    const size_t nwarps = static_cast<size_t>((total + kWarpSize - 1) / kWarpSize);
+    const size_t nwarps = static_cast<size_t>((total + W_ - 1) / W_);
     // resize, not assign: a Warp owns a unique_ptr and so is move-only.
     b.warps.clear();
     b.warps.resize(nwarps);
@@ -407,10 +422,10 @@ class Interpreter {
       warp.written32.assign(fn_.num_regs32, 0);
       warp.written64.assign(fn_.num_regs64, 0);
       Mask live = 0;
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-        uint64_t lin = uint64_t{static_cast<uint32_t>(w)} * kWarpSize + lane;
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        uint64_t lin = uint64_t{static_cast<uint32_t>(w)} * W_ + lane;
         if (lin >= total) break;
-        live |= (1u << lane);
+        live |= (Mask{1} << lane);
         warp.tid_x[lane] = static_cast<uint32_t>(lin % b.ctx.ntid[0]);
         warp.tid_y[lane] = static_cast<uint32_t>((lin / b.ctx.ntid[0]) % b.ctx.ntid[1]);
         warp.tid_z[lane] = static_cast<uint32_t>(lin / (uint64_t{b.ctx.ntid[0]} * b.ctx.ntid[1]));
@@ -666,9 +681,34 @@ class Interpreter {
       return scratch;
     }
     const auto& sr = std::get<SregOperand>(op);
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane)
+    if (is_lanemask_sreg(sr.reg)) require_warp32(ins, "%lanemask_*");
+    for (uint32_t lane = 0; lane < W_; ++lane)
       scratch[lane] = sreg_value(sr.reg, sr.index, w, ctx, lane);
     return scratch;
+  }
+
+  // PTX defines its warp-level primitives over a 32-lane warp, and defines
+  // their masks as .b32: activemask, vote.ballot, shfl.sync's member mask and
+  // the %lanemask_* registers all produce or consume 32 bits. There is no PTX
+  // meaning for any of them at 64 lanes. Widening them would be inventing
+  // semantics the ISA does not define, and truncating them to 32 would drop
+  // the upper half of a wavefront silently -- the worse of the two, because
+  // the kernel would run and be wrong. So they are refused by name, and the
+  // message says which primitive and what the profile's width is.
+  //
+  // A CDNA wavefront has its own 64-bit equivalents. They belong to the AMD
+  // front-end, which reads a different ISA; they are not these instructions
+  // with a wider mask.
+  void require_warp32(const Instr& ins, const char* what) {
+    if (W_ != 32u)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               std::string(what) + " is defined by PTX over a 32-lane warp; this profile's warp"
+               " is " + std::to_string(W_) + " lanes wide");
+  }
+
+  static bool is_lanemask_sreg(Sreg s) {
+    return s == Sreg::LaneMaskEq || s == Sreg::LaneMaskLt || s == Sreg::LaneMaskLe ||
+           s == Sreg::LaneMaskGt || s == Sreg::LaneMaskGe;
   }
 
   // Special registers.
@@ -703,10 +743,10 @@ class Interpreter {
       case Sreg::NctaidY: return ctx.nctaid[1];
       case Sreg::NctaidZ: return ctx.nctaid[2];
       case Sreg::LaneId: return lane;
-      case Sreg::LaneMaskEq: return 1u << lane;
-      case Sreg::LaneMaskLt: return lane == 0 ? 0u : (~0u >> (kWarpSize - lane));
+      case Sreg::LaneMaskEq: return Mask{1} << lane;
+      case Sreg::LaneMaskLt: return lane == 0 ? 0u : (~0u >> (W_ - lane));
       case Sreg::LaneMaskLe: return static_cast<uint32_t>((uint64_t{2} << lane) - 1);
-      case Sreg::LaneMaskGt: return lane == kWarpSize - 1
+      case Sreg::LaneMaskGt: return lane == W_ - 1
                                         ? 0u
                                         : ~static_cast<uint32_t>((uint64_t{2} << lane) - 1);
       case Sreg::LaneMaskGe: return ~0u << lane;
@@ -715,7 +755,7 @@ class Interpreter {
       case Sreg::WarpId: {
         const uint32_t linear = w.tid_x[lane] + w.tid_y[lane] * ctx.ntid[0] +
                                 w.tid_z[lane] * ctx.ntid[0] * ctx.ntid[1];
-        return linear / kWarpSize;
+        return linear / W_;
       }
       // The driver's parameter bank. Only two entries mean anything here: a
       // cooperative launch passes the address of its grid-barrier workspace as
@@ -732,7 +772,7 @@ class Interpreter {
         if (index == 2) return static_cast<uint32_t>(cfg_.coop_workspace);
         return 0;
       case Sreg::NWarpId:
-        return (ctx.ntid[0] * ctx.ntid[1] * ctx.ntid[2] + kWarpSize - 1) / kWarpSize;
+        return (ctx.ntid[0] * ctx.ntid[1] * ctx.ntid[2] + W_ - 1) / W_;
 
       // ---- the clock family: a counter, not a time (see above) ----
       case Sreg::Clock: return static_cast<uint32_t>(ctx.clock ? *ctx.clock : 0);
@@ -773,7 +813,7 @@ class Interpreter {
   const Lanes& widen(Warp& w, const Lanes32& src) {
     Lanes& out = w.widen_scratch[w.widen_next];
     w.widen_next = (w.widen_next + 1) % w.widen_scratch.size();
-    for (uint32_t l = 0; l < kWarpSize; ++l) out[l] = src[l];
+    for (uint32_t l = 0; l < W_; ++l) out[l] = src[l];
     return out;
   }
 
@@ -806,7 +846,7 @@ class Interpreter {
   // the memory traffic of the 64-bit path.
   void write_narrow(Warp& w, const Reg& reg, Mask m, const Lanes32& vals) {
     Lanes32& dst = w.regs32[reg.id];
-    for_active(m, [&](uint32_t l) { dst[l] = vals[l]; });
+    for_active(m, W_, [&](uint32_t l) { dst[l] = vals[l]; });
     w.written32[reg.id] = 1;
   }
 
@@ -814,20 +854,20 @@ class Interpreter {
     if (reg.wide) {
       Lanes& dst = w.regs64[reg.id];
       if (bits >= 64)
-        for_active(m, [&](uint32_t l) { dst[l] = vals[l]; });
+        for_active(m, W_, [&](uint32_t l) { dst[l] = vals[l]; });
       else {
         const uint64_t keep = (1ull << bits) - 1;
-        for_active(m, [&](uint32_t l) { dst[l] = vals[l] & keep; });
+        for_active(m, W_, [&](uint32_t l) { dst[l] = vals[l] & keep; });
       }
       w.written64[reg.id] = 1;
       return;
     }
     Lanes32& dst = w.regs32[reg.id];
     if (bits >= 32)
-      for_active(m, [&](uint32_t l) { dst[l] = static_cast<uint32_t>(vals[l]); });
+      for_active(m, W_, [&](uint32_t l) { dst[l] = static_cast<uint32_t>(vals[l]); });
     else {
       const uint32_t keep = (1u << bits) - 1;
-      for_active(m, [&](uint32_t l) { dst[l] = static_cast<uint32_t>(vals[l]) & keep; });
+      for_active(m, W_, [&](uint32_t l) { dst[l] = static_cast<uint32_t>(vals[l]) & keep; });
     }
     w.written32[reg.id] = 1;
   }
@@ -849,7 +889,7 @@ class Interpreter {
   }
 
   static uint32_t popcount_mask(Mask m) {
-    return static_cast<uint32_t>(__builtin_popcount(static_cast<unsigned>(m)));
+    return static_cast<uint32_t>(__builtin_popcountll(m));
   }
 
   // Memory traffic, counted per active lane. Space matters: a shared access and
@@ -874,10 +914,10 @@ class Interpreter {
       // conflict-free 8-byte access come out as conflict-free.
       uint32_t worst = 1;
       for (uint32_t bank = 0; bank < 32; ++bank) {
-        std::array<uint64_t, kWarpSize * 4> words{};
+        std::array<uint64_t, kMaxWarpSize * 4> words{};
         uint32_t distinct = 0;
-        for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-          if (!(m & (1u << lane))) continue;
+        for (uint32_t lane = 0; lane < W_; ++lane) {
+          if (!(m & (Mask{1} << lane))) continue;
           for (uint64_t off = 0; off < span; off += 4) {
             const uint64_t word = (addrs[lane] + off) / 4;
             if (word % 32 != bank) continue;
@@ -899,10 +939,10 @@ class Interpreter {
     // Everything else moves in 32-byte sectors. Count the distinct ones the
     // warp touched: four for a coalesced 32-lane 4-byte load, up to 32 when
     // every lane lands in its own sector.
-    std::array<uint64_t, kWarpSize * 8> sectors{};
+    std::array<uint64_t, kMaxWarpSize * 8> sectors{};
     uint32_t distinct = 0;
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-      if (!(m & (1u << lane))) continue;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
       const uint64_t first = addrs[lane] / 32;
       const uint64_t last = (addrs[lane] + (span ? span - 1 : 0)) / 32;
       for (uint64_t sec = first; sec <= last; ++sec) {
@@ -1028,7 +1068,7 @@ class Interpreter {
           report_race(ins, "write-write race", w, s.writer);
         if (!silent && s.read_epoch == sh.epoch) {
           const uint32_t others = s.readers & ~(1u << cur_warp_);
-          if (others) report_race(ins, "read-write race", w, __builtin_ctz(others));
+          if (others) report_race(ins, "read-write race", w, __builtin_ctzll(others));
         }
         s.writer = static_cast<uint16_t>(cur_warp_);
         s.write_epoch = sh.epoch;
@@ -1055,7 +1095,7 @@ class Interpreter {
   }
 
   std::vector<uint8_t>& lane_local(Warp& w, uint32_t lane) {
-    if (w.local.empty()) w.local.resize(kWarpSize);
+    if (w.local.empty()) w.local.resize(W_);
     auto& buf = w.local[lane];
     if (buf.size() < fn_.local_frame_size) buf.resize(fn_.local_frame_size, 0);
     return buf;
@@ -1171,8 +1211,8 @@ class Interpreter {
       if (red.arrived) --red.arrived;
       if (op->op == BarRedOp::Popc) {
         Lanes r;
-        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-          if (m & (1u << lane)) r[lane] = red.acc;
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) r[lane] = red.acc;
         write_reg(w, op->dst, m, r, 32);
       } else {
         Mask& dp = pred_slot(w, op->dst);
@@ -1276,17 +1316,18 @@ class Interpreter {
       if (op->carry_in || op->carry_out) {
         exec_carry_add_sub(w, *op, a, b, m, r);
       } else {
-        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-          if (m & (1u << lane)) r[lane] = int_bin(op->op, op->ty, a[lane], b[lane], ins);
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) r[lane] = int_bin(op->op, op->ty, a[lane], b[lane], ins);
       }
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
     if (std::holds_alternative<OpNop>(ins.op)) return;
     if (const auto* op = std::get_if<OpActiveMask>(&ins.op)) {
+      require_warp32(ins, "activemask");
       Lanes r;  // every active lane sees the same membership
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = m;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = m;
       write_reg(w, op->dst, m, r, 32);
       return;
     }
@@ -1314,10 +1355,10 @@ class Interpreter {
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Mask& p = pred_slot(w, op->dst);
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           bool t = compare(op->cmp, op->ty, a[lane], b[lane]);
-          p = t ? (p | (1u << lane)) : (p & ~(1u << lane));
+          p = t ? (p | (Mask{1} << lane)) : (p & ~(Mask{1} << lane));
         }
       return;
     }
@@ -1339,8 +1380,8 @@ class Interpreter {
         case FRound::PlusInf: std::fesetround(FE_UPWARD); break;
         case FRound::Nearest: break;
       }
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = float_bin(op->op, op->ty, a[lane], b[lane]);
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = float_bin(op->op, op->ty, a[lane], b[lane]);
       if (op->round != FRound::Nearest) std::fesetround(prev_round);
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
@@ -1355,12 +1396,12 @@ class Interpreter {
       Lanes r;  // written for every active lane below
       if (op->carry_in || op->carry_out) {
         Lanes prod;
-        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-          if (m & (1u << lane)) prod[lane] = a[lane] * b[lane];
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) prod[lane] = a[lane] * b[lane];
         exec_carry_mad(w, op->ty.bits, op->carry_in, op->carry_out, prod, c, m, r);
       } else {
-        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-          if (m & (1u << lane)) r[lane] = a[lane] * b[lane] + c[lane];
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) r[lane] = a[lane] * b[lane] + c[lane];
       }
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
@@ -1374,9 +1415,9 @@ class Interpreter {
       const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r;  // written for every active lane below
       if (op->ty.bits == 32)
-        for_active(m, [&](uint32_t l) { r[l] = f32bits(std::fma(f32(a[l]), f32(b[l]), f32(c[l]))); });
+        for_active(m, W_, [&](uint32_t l) { r[l] = f32bits(std::fma(f32(a[l]), f32(b[l]), f32(c[l]))); });
       else
-        for_active(m, [&](uint32_t l) { r[l] = f64bits(std::fma(f64(a[l]), f64(b[l]), f64(c[l]))); });
+        for_active(m, W_, [&](uint32_t l) { r[l] = f64bits(std::fma(f64(a[l]), f64(b[l]), f64(c[l]))); });
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1386,8 +1427,8 @@ class Interpreter {
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           if (op->src_bits == 16) {
             if (op->is_signed)
               r[lane] = static_cast<uint64_t>(static_cast<uint32_t>(
@@ -1411,8 +1452,8 @@ class Interpreter {
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = (p & (1u << lane)) ? a[lane] : b[lane];
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = (p & (Mask{1} << lane)) ? a[lane] : b[lane];
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1421,8 +1462,8 @@ class Interpreter {
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       uint64_t base = space_base(op->space);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane))
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane))
           r[lane] = op->to_space ? v[lane] - base : v[lane] + base;
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
@@ -1435,8 +1476,8 @@ class Interpreter {
       Lanes _s_c;
       const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           uint64_t prod;
           if (op->is_signed)
             prod = static_cast<uint64_t>(int64_t{static_cast<int32_t>(a[lane])} *
@@ -1452,8 +1493,8 @@ class Interpreter {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = convert(op, v[lane]);
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = convert(op, v[lane]);
       write_reg(w, op->dst, m, r, op->dst_ty.bits);
       return;
     }
@@ -1465,8 +1506,8 @@ class Interpreter {
       Lanes _s_a; const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
       Lanes _s_b; const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = mul_hi(op->ty, a[lane], b[lane]);
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = mul_hi(op->ty, a[lane], b[lane]);
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1480,8 +1521,8 @@ class Interpreter {
         vals.push_back(read_operand(w, ctx, ins, src, tmp));
       }
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           uint64_t out = 0;
           for (uint32_t i = 0; i < n; ++i)
             out |= mask_to_bits(vals[i][lane], piece) << (piece * i);
@@ -1497,8 +1538,8 @@ class Interpreter {
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       for (uint32_t i = 0; i < n; ++i) {
         Lanes r;  // written for every active lane below
-        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-          if (m & (1u << lane)) r[lane] = mask_to_bits(v[lane] >> (piece * i), piece);
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) r[lane] = mask_to_bits(v[lane] >> (piece * i), piece);
         write_reg(w, op->dsts[i], m, r, piece);
       }
       return;
@@ -1507,8 +1548,8 @@ class Interpreter {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = ~v[lane];
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = ~v[lane];
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1516,8 +1557,8 @@ class Interpreter {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           if (op->ty.kind == Type::Kind::F)
             r[lane] = op->ty.bits == 32 ? f32bits(-f32(v[lane])) : f64bits(-f64(v[lane]));
           else
@@ -1550,10 +1591,12 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpMma>(&ins.op)) {
+      require_warp32(ins, "mma.sync");
       exec_mma(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpRedux>(&ins.op)) {
+      require_warp32(ins, "redux.sync");
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->src, _s_a);
       // Every participating lane contributes and every one receives the result.
@@ -1561,8 +1604,8 @@ class Interpreter {
       // instruction is not in the warp's reduction.
       bool first = true;
       uint64_t acc = 0;
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-        if (!(m & (1u << lane))) continue;
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
         const uint64_t v = a[lane];
         if (first) { acc = v; first = false; continue; }
         switch (op->op) {
@@ -1585,8 +1628,8 @@ class Interpreter {
         }
       }
       Lanes r;
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = acc;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = acc;
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1596,8 +1639,8 @@ class Interpreter {
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r;
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           // The first source goes in the high half, the second in the low.
           const double x = static_cast<double>(f32(a[lane]));
           const double y = static_cast<double>(f32(b[lane]));
@@ -1614,8 +1657,8 @@ class Interpreter {
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r;
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           // Magnitude of b, sign of a -- and it must be bit-exact for zeros and
           // NaNs, so move the sign bit rather than going through comparisons.
           if (op->ty.bits == 64) {
@@ -1638,8 +1681,8 @@ class Interpreter {
       Lanes _s_c;
       const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r;
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           const uint32_t av = static_cast<uint32_t>(a[lane]);
           const uint32_t bv = static_cast<uint32_t>(b[lane]);
           // Each operand contributes four bytes, sign- or zero-extended
@@ -1665,8 +1708,8 @@ class Interpreter {
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r;
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           uint32_t base = static_cast<uint32_t>(a[lane]);
           uint32_t width = static_cast<uint32_t>(b[lane]);
           // .wrap takes both operands modulo 32; .clamp caps them at 32. These
@@ -1697,8 +1740,8 @@ class Interpreter {
       Lanes _s_c;
       const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           uint8_t bytes[8];
           uint32_t lo = static_cast<uint32_t>(a[lane]), hi = static_cast<uint32_t>(b[lane]);
           for (int i = 0; i < 4; ++i) bytes[i] = (lo >> (8 * i)) & 0xFF;
@@ -1720,8 +1763,8 @@ class Interpreter {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           if (op->ty.is_float())
             r[lane] = op->ty.bits == 32 ? f32bits(std::fabs(f32(v[lane])))
                                         : f64bits(std::fabs(f64(v[lane])));
@@ -1738,8 +1781,8 @@ class Interpreter {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           double x = op->ty.bits == 32 ? static_cast<double>(f32(v[lane])) : f64(v[lane]);
           double y = 0;
           switch (op->op) {
@@ -1765,8 +1808,8 @@ class Interpreter {
       Lanes _s_c;
       const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = bfe(op->ty, a[lane], b[lane], c[lane]);
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = bfe(op->ty, a[lane], b[lane], c[lane]);
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1780,8 +1823,8 @@ class Interpreter {
       Lanes _s_d;
       const Lanes& d = read_operand(w, ctx, ins, op->d, _s_d);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = bfi(op->ty, a[lane], b[lane], c[lane], d[lane]);
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = bfi(op->ty, a[lane], b[lane], c[lane], d[lane]);
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1789,8 +1832,8 @@ class Interpreter {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           uint64_t x = mask_to_bits(v[lane], op->ty.bits), out = 0;
           for (uint32_t i = 0; i < op->ty.bits; ++i)
             if (x & (1ull << i)) out |= 1ull << (op->ty.bits - 1 - i);
@@ -1803,8 +1846,8 @@ class Interpreter {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           uint64_t x = mask_to_bits(v[lane], op->ty.bits);
           if (op->popc) {
             r[lane] = static_cast<uint64_t>(__builtin_popcountll(x));
@@ -1818,17 +1861,19 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpShfl>(&ins.op)) {
+      require_warp32(ins, "shfl.sync");
       exec_shfl(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpVote>(&ins.op)) {
+      require_warp32(ins, "vote/ballot");
       Mask p = read_pred(w, ins, op->src);
       if (op->negate_src) p = ~p;
       Mask voters = p & m;
       if (op->ballot) {
         Lanes r;  // written for every active lane below
-        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-          if (m & (1u << lane)) r[lane] = voters;
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) r[lane] = voters;
         write_reg(w, op->dst, m, r, 32);
       } else {
         bool all = (voters == m), any = (voters != 0);
@@ -1847,12 +1892,12 @@ class Interpreter {
       Lanes r;  // written for every active lane below
       if (op->carry_in || op->carry_out) {
         Lanes prod;
-        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-          if (m & (1u << lane)) prod[lane] = mul_hi(op->ty, a[lane], b[lane]);
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) prod[lane] = mul_hi(op->ty, a[lane], b[lane]);
         exec_carry_mad(w, op->ty.bits, op->carry_in, op->carry_out, prod, c, m, r);
       } else {
-        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-          if (m & (1u << lane)) r[lane] = mul_hi(op->ty, a[lane], b[lane]) + c[lane];
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) r[lane] = mul_hi(op->ty, a[lane], b[lane]) + c[lane];
       }
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
@@ -1865,8 +1910,8 @@ class Interpreter {
       Lanes _s_c;
       const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           uint64_t hi = static_cast<uint32_t>(b[lane]);
           uint64_t lo = static_cast<uint32_t>(a[lane]);
           uint32_t n = op->wrap ? (static_cast<uint32_t>(c[lane]) & 31u)
@@ -1884,8 +1929,8 @@ class Interpreter {
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           uint64_t out = 0;
           for (int h = 0; h < 2; ++h) {
             double x = f16_to_double((a[lane] >> (16 * h)) & 0xFFFF);
@@ -1908,8 +1953,8 @@ class Interpreter {
       Lanes _s_c;
       const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           uint64_t out = 0;
           for (int h = 0; h < 2; ++h) {
             double x = f16_to_double((a[lane] >> (16 * h)) & 0xFFFF);
@@ -1926,12 +1971,13 @@ class Interpreter {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) r[lane] = v[lane] ^ 0x80008000ull;  // flip both sign bits
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = v[lane] ^ 0x80008000ull;  // flip both sign bits
       write_reg(w, op->dst, m, r, 32);
       return;
     }
     if (const auto* op = std::get_if<OpWmmaMma>(&ins.op)) {
+      require_warp32(ins, "wmma.mma");
       exec_wmma_mma(w, ctx, ins, *op, m);
       return;
     }
@@ -1963,8 +2009,8 @@ class Interpreter {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes& slot = w.slots[op->slot];
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) slot[lane] = mask_to_bits(v[lane], op->ty.bits);
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) slot[lane] = mask_to_bits(v[lane], op->ty.bits);
       return;
     }
     if (const auto* op = std::get_if<OpLdSlot>(&ins.op)) {
@@ -2079,8 +2125,8 @@ class Interpreter {
       const Lanes& c = read_operand(w, ctx, ins, op.c, _s_c);
     Lanes r;  // written for every active lane below
     Mask pred_out = 0;
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-      if (!(m & (1u << lane))) continue;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
       uint32_t bval = static_cast<uint32_t>(b[lane]) & 0x1F;
       uint32_t cval = static_cast<uint32_t>(c[lane]) & 0x1F;
       uint32_t segmask = (static_cast<uint32_t>(c[lane]) >> 8) & 0x1F;
@@ -2108,7 +2154,7 @@ class Interpreter {
       }
       if (!pred) j = lane;  // out-of-range source: the lane reads its own value
       r[lane] = a[j & 0x1F];
-      if (pred) pred_out |= (1u << lane);
+      if (pred) pred_out |= (Mask{1} << lane);
     }
     write_reg(w, op.dst, m, r, 32);
     if (op.pred_dst.id != kNoReg) {
@@ -2147,7 +2193,7 @@ class Interpreter {
       uint16_t tile[8][8] = {};
       for (uint32_t r = 0; r < 8; ++r) {
         const uint32_t src_lane = mat * 8 + r;
-        if (!(m & (1u << src_lane)))
+        if (!(m & (Mask{1} << src_lane)))
           ctx_fail(ins, static_cast<int>(src_lane), Err::UnsupportedPtx,
                    "ldmatrix needs every lane that supplies a row address to be active");
         const uint64_t addr = window + base[src_lane] + static_cast<uint64_t>(op.addr.offset);
@@ -2156,8 +2202,8 @@ class Interpreter {
               load_routed(w, ctx, ins, src_lane, addr + c * 2, 2));
       }
       Lanes r;
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           const uint32_t row = lane / 4, colpair = lane % 4;
           uint16_t lo, hi;
           if (op.trans) {
@@ -2184,8 +2230,8 @@ class Interpreter {
   void exec_carry_mad(Warp& w, uint32_t bits, bool carry_in, bool carry_out, const Lanes& prod,
                       const Lanes& c, Mask m, Lanes& r) {
     Mask out = w.carry;
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-      if (!(m & (1u << lane))) continue;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
       const uint64_t p = mask_to_bits(prod[lane], bits);
       const uint64_t addend = mask_to_bits(c[lane], bits);
       const uint64_t cin = carry_in ? ((w.carry >> lane) & 1u) : 0u;
@@ -2313,8 +2359,8 @@ class Interpreter {
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
 
     std::array<Lanes, 4> out;
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-      if (!(m & (1u << lane))) continue;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Texture);
       if (d.filter != TexFilter::Point)
         ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
@@ -2390,8 +2436,8 @@ class Interpreter {
     for (uint32_t i = 0; i < op.dims; ++i)
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
     std::vector<Lanes> out(op.dsts.size());
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-      if (!(m & (1u << lane))) continue;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Surface);
       const uint64_t base = surface_address(ins, lane, d, coord, op.dims,
                                             op.bytes * static_cast<uint32_t>(op.dsts.size()));
@@ -2420,8 +2466,8 @@ class Interpreter {
     std::vector<Lanes> src_scratch(op.srcs.size());
     for (size_t c = 0; c < op.srcs.size(); ++c)
       src[c] = read_operand(w, ctx, ins, op.srcs[c], src_scratch[c]);
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-      if (!(m & (1u << lane))) continue;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Surface);
       const uint64_t base = surface_address(ins, lane, d, coord, op.dims,
                                             op.bytes * static_cast<uint32_t>(op.srcs.size()));
@@ -2446,8 +2492,8 @@ class Interpreter {
     const uint32_t bits = op.ty.bits;
     const bool sub = (op.op == IntBinOp::Sub);
     Mask out = w.carry;
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-      if (!(m & (1u << lane))) continue;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
       const uint64_t x = mask_to_bits(a[lane], bits);
       // For a subtract the carry-in defaults to 1 (the +1 of two's complement);
       // subc supplies the previous carry-out in its place.
@@ -2471,10 +2517,10 @@ class Interpreter {
     Lanes _s_a;
     const Lanes& a = read_operand(w, ctx, ins, op.src, _s_a);
     uint16_t tile[8][8] = {};
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+    for (uint32_t lane = 0; lane < W_; ++lane) {
       // .aligned means the whole warp executes this together; a partial warp
       // would be reading registers no lane wrote.
-      if (!(m & (1u << lane)))
+      if (!(m & (Mask{1} << lane)))
         ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
                  "movmatrix is warp-aligned: every lane must be active, because the "
                  "matrix is spread across all 32 of them");
@@ -2483,7 +2529,7 @@ class Interpreter {
       tile[row][colpair * 2 + 1] = static_cast<uint16_t>((a[lane] >> 16) & 0xFFFFu);
     }
     Lanes r{};
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+    for (uint32_t lane = 0; lane < W_; ++lane) {
       const uint32_t row = lane / 4, colpair = lane % 4;
       // d[row][c] = a[c][row]
       const uint16_t lo = tile[colpair * 2][row];
@@ -2520,8 +2566,8 @@ class Interpreter {
     // Elements each lane holds per register: 2 for 16-bit, 4 for 8-bit, 1 for
     // tf32. The register counts follow from the shape.
     const uint32_t per_reg = sixteen_bit ? 2u : (eight_bit ? 4u : 1u);
-    const uint32_t a_regs = (kM * K) / (kWarpSize * per_reg);
-    const uint32_t b_regs = (K * kN) / (kWarpSize * per_reg);
+    const uint32_t a_regs = (kM * K) / (W_ * per_reg);
+    const uint32_t b_regs = (K * kN) / (W_ * per_reg);
     if (op.a.size() != a_regs || op.b.size() != b_regs)
       ctx_fail(ins, -1, Err::UnsupportedPtx, "mma fragment arity does not match the shape");
 
@@ -2531,7 +2577,7 @@ class Interpreter {
     for (uint32_t reg = 0; reg < a_regs; ++reg) {
       Lanes _s;
       const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s);
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      for (uint32_t lane = 0; lane < W_; ++lane) {
         const uint32_t group = lane / 4, tid = lane % 4;
         const uint32_t row = group + (reg % 2) * 8;
         const uint32_t col0 = tid * per_reg + (reg / 2) * (per_reg * 4);
@@ -2544,7 +2590,7 @@ class Interpreter {
     for (uint32_t reg = 0; reg < b_regs; ++reg) {
       Lanes _s;
       const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.b[reg]}}, _s);
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      for (uint32_t lane = 0; lane < W_; ++lane) {
         const uint32_t group = lane / 4, tid = lane % 4;
         const uint32_t col = group;
         const uint32_t row0 = tid * per_reg + reg * (per_reg * 4);
@@ -2562,7 +2608,7 @@ class Interpreter {
     for (uint32_t reg = 0; reg < op.c.size(); ++reg) {
       Lanes _s;
       const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.c[reg]}}, _s);
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      for (uint32_t lane = 0; lane < W_; ++lane) {
         if (op.acc_f16) {
           // Two halves per register.
           C[cd_index(lane, reg * 2)] = f16_to_double(v[lane] & 0xFFFF);
@@ -2593,8 +2639,8 @@ class Interpreter {
       }
     for (uint32_t reg = 0; reg < op.d.size(); ++reg) {
       Lanes r;
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           if (op.acc_f16) {
             const uint64_t lo = double_to_f16(D[cd_index(lane, reg * 2)]);
             const uint64_t hi = double_to_f16(D[cd_index(lane, reg * 2 + 1)]);
@@ -2631,7 +2677,7 @@ class Interpreter {
     for (int reg = 0; reg < 8; ++reg) {
       Lanes _s_cv;
       const Lanes& cv = read_operand(w, ctx, ins, Operand{RegOperand{op.c[reg]}}, _s_cv);
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      for (uint32_t lane = 0; lane < W_; ++lane) {
         uint32_t linear = lane * 8 + static_cast<uint32_t>(reg);
         C[linear / kMmaDim][linear % kMmaDim] = f32(cv[lane]);
       }
@@ -2648,7 +2694,7 @@ class Interpreter {
     // Scatter D back into the destination fragment.
     for (int reg = 0; reg < 8; ++reg) {
       Lanes r;  // written for every active lane below
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+      for (uint32_t lane = 0; lane < W_; ++lane) {
         uint32_t linear = lane * 8 + static_cast<uint32_t>(reg);
         r[lane] = f32bits(D[linear / kMmaDim][linear % kMmaDim]);
       }
@@ -2665,15 +2711,15 @@ class Interpreter {
     uint64_t sbase = space_base(op.space);
     // The whole warp cooperates; lane 0's address and stride describe the tile.
     uint32_t lead = 0;
-    while (lead < kWarpSize && !(m & (1u << lead))) ++lead;
-    if (lead == kWarpSize) return;
+    while (lead < W_ && !(m & (Mask{1} << lead))) ++lead;
+    if (lead == W_) return;
     uint64_t addr0 = sbase + base[lead] + static_cast<uint64_t>(op.addr.offset);
     uint64_t ld = stride[lead];
     for (int reg = 0; reg < 8; ++reg) {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op.src[reg], _s_v);
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-        if (!(m & (1u << lane))) continue;
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
         uint32_t linear = lane * 8 + static_cast<uint32_t>(reg);
         uint32_t i = linear / kMmaDim, j = linear % kMmaDim;
         uint64_t elem = op.layout == MatLayout::Row ? (uint64_t{i} * ld + j)
@@ -2970,8 +3016,8 @@ class Interpreter {
     const Lanes* size_lanes = nullptr;
     if (op.have_src_size) size_lanes = &read_operand(w, ctx, ins, op.src_size, _s_size);
 
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-      if (!(m & (1u << lane))) continue;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
       PendingCopy pc;
       pc.bytes = op.bytes;
       // The destination is a shared-space address; the source a global one.
@@ -3016,8 +3062,8 @@ class Interpreter {
       // iteration waits before it has issued anything.
       return;
     }
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-      if (!(m & (1u << lane))) continue;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
       auto& open = w.cp->open[lane];
       auto& groups = w.cp->groups[lane];
       // wait_all is defined as commit_group followed by wait_group 0, so both
@@ -3042,7 +3088,7 @@ class Interpreter {
   // another warp in the block may yet read what it wrote.
   void drain_async_copies(Warp& w, const BlockCtx& ctx, const Instr& ins) {
     if (!w.cp) return;
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
+    for (uint32_t lane = 0; lane < W_; ++lane) {
       for (auto& g : w.cp->groups[lane]) complete_group(w, ctx, ins, lane, g);
       w.cp->groups[lane].clear();
       if (!w.cp->open[lane].empty()) {
@@ -3060,8 +3106,8 @@ class Interpreter {
       Lanes _s_base;
       const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
       std::vector<Lanes> results(n);
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) {
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
           const uint64_t addr =
               base[lane] + static_cast<uint64_t>(op.addr.offset);
           for (size_t e = 0; e < n; ++e) {
@@ -3102,14 +3148,14 @@ class Interpreter {
     {
       // Sectors and bank conflicts need the addresses, which only exist here.
       Lanes at{};
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane))
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane))
           at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
       count_addresses(op.space, at, m, size, n);
     }
     std::vector<Lanes> results(n);
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-      if (m & (1u << lane)) {
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) {
         uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
         if (addr % va != 0)
           ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
@@ -3128,8 +3174,8 @@ class Interpreter {
         Lanes ext = results[e];
         const uint64_t sign_bit = 1ull << (op.ty.bits - 1);
         const uint64_t value_mask = (sign_bit << 1) - 1;
-        for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-          if (m & (1u << lane)) {
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) {
             uint64_t v = ext[lane] & value_mask;
             if (v & sign_bit) v |= ~value_mask;
             ext[lane] = v;
@@ -3167,13 +3213,13 @@ class Interpreter {
     uint32_t va = size * static_cast<uint32_t>(n);
     {
       Lanes at{};
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane))
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane))
           at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
       count_addresses(op.space, at, m, size, n);
     }
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-      if (m & (1u << lane)) {
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) {
         uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
         if (addr % va != 0)
           ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
@@ -3203,8 +3249,8 @@ class Interpreter {
     // that, and is skipped entirely when the launch is single-threaded, where
     // the fixed order was already enough.
     const bool lock_needed = concurrent_ && op.space != Space::Shared && op.space != Space::Local;
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-      if (m & (1u << lane)) {
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) {
         uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
         std::unique_lock<std::mutex> guard;
         if (lock_needed)
@@ -3305,8 +3351,8 @@ class Interpreter {
       ctx_fail(ins, -1, Err::UninitializedRegister, "vprintf argument slot read before write");
 
     Lanes counts{};
-    for (uint32_t lane = 0; lane < kWarpSize; ++lane) {
-      if (!(m & (1u << lane))) continue;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
       std::string fmt = read_cstring(w, ctx, ins, lane, fmt_it->second[lane]);
       uint64_t valist = va_it->second[lane];
       uint64_t cursor = 0;
@@ -3398,8 +3444,8 @@ class Interpreter {
     }
     if (!op.retval_slot.empty()) {
       Lanes& slot = w.slots[op.retval_slot];
-      for (uint32_t lane = 0; lane < kWarpSize; ++lane)
-        if (m & (1u << lane)) slot[lane] = counts[lane];
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) slot[lane] = counts[lane];
     }
   }
 
@@ -3425,6 +3471,11 @@ class Interpreter {
   const ParamBuffer& params_;
   MemoryManager& mem_;
   const DeviceProfile& profile_;
+  // Lanes per warp, from the device profile: 32 on NVIDIA, 64 on a CDNA
+  // wavefront. Every per-lane loop is bounded by this rather than by the array
+  // size, so an NVIDIA warp does not walk 32 lanes that are not there.
+  const uint32_t W_ = 32;
+  const Mask all_ = all_lanes(32);
   const SymbolTable* symbols_;
   LaunchStats& stats_;
   ProgressFn progress_;
@@ -3508,9 +3559,12 @@ KernelResources kernel_resources(const EntryFn& fn, const DeviceProfile& profile
 namespace {
 
 void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p) {
-  if (p.warp_size != kWarpSize)
+  // 32 for an NVIDIA warp, 64 for a CDNA wavefront. Anything else is not a
+  // width this engine has storage for, and rounding it would silently execute
+  // a different machine than the profile describes.
+  if (p.warp_size != 32u && p.warp_size != kMaxWarpSize)
     throw Error::make(Err::Unsupported, "profile ", p.id, " has warp size ", p.warp_size,
-                      "; only 32 is implemented");
+                      "; only 32 and 64 are implemented");
   uint64_t threads = 1;
   for (int i = 0; i < 3; ++i) {
     if (cfg.block[i] == 0 || cfg.grid[i] == 0)

@@ -554,7 +554,19 @@ VGPU_EXPORT CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CU
     if (!pi) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
     const vgpu::DeviceProfile& p = s.rt->device(dev).profile();
-    switch (attrib) {
+    // Read the attribute as the integer the ABI actually passes, not as the
+    // enum. A caller built against a newer CUDA header legitimately passes
+    // values this shim's headers do not enumerate -- CUDA 13 sends 134, and
+    // the `default:` arm below exists precisely to answer them. But *loading*
+    // an enum object holding a value outside its enumerators is undefined:
+    // UBSan reports it, and a compiler is entitled to assume the value is in
+    // range and delete the default arm, which would turn forward compatibility
+    // into a wrong answer with no diagnostic. memcpy reads the bytes without
+    // making that claim about them.
+    static_assert(sizeof(attrib) == sizeof(int), "CUdevice_attribute is not int-sized");
+    int attr_id;
+    std::memcpy(&attr_id, &attrib, sizeof attr_id);
+    switch (attr_id) {
       case CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: *pi = (int)p.limits.max_threads_per_block; break;
       case CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X: *pi = (int)p.limits.max_block_dim[0]; break;
       case CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y: *pi = (int)p.limits.max_block_dim[1]; break;
@@ -574,7 +586,7 @@ VGPU_EXPORT CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CU
       case CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: *pi = p.cc_major; break;
       case CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: *pi = p.cc_minor; break;
       default:
-        *pi = extra_attribute(p, static_cast<int>(attrib));
+        *pi = extra_attribute(p, attr_id);
         break;
     }
     return CUDA_SUCCESS;
