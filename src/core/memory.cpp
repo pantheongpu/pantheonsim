@@ -188,6 +188,13 @@ uint64_t MemoryManager::resident_bytes() const {
 
 void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   if (len == 0) return;
+  if (host_maps_) {
+    std::lock_guard<std::mutex> lock(host_maps_->mu);
+    if (const HostMap* m = find_host_map_locked(dst, len)) {
+      std::memcpy(m->host + (dst - m->base), src, len);
+      return;
+    }
+  }
   // A null host buffer would be dereferenced by the memcpy below and take the
   // process down with a signal, losing the diagnosis. Saying which argument was
   // null is the whole point of running on a simulator.
@@ -212,8 +219,47 @@ void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   }
 }
 
+const MemoryManager::HostMap* MemoryManager::find_host_map_locked(uint64_t addr,
+                                                                   uint64_t len) const {
+  if (!host_maps_) return nullptr;
+  for (const HostMap& m : host_maps_->maps)
+    if (addr >= m.base && addr + len <= m.base + m.len) return &m;
+  return nullptr;
+}
+
+void MemoryManager::map_host(uint64_t addr, void* host, uint64_t len) {
+  if (!host_maps_) host_maps_ = std::make_unique<HostMaps>();
+  std::lock_guard<std::mutex> lock(host_maps_->mu);
+  host_maps_->maps.push_back(HostMap{addr, len, static_cast<uint8_t*>(host)});
+}
+
+void MemoryManager::unmap_host(uint64_t addr) {
+  if (!host_maps_) return;
+  std::lock_guard<std::mutex> lock(host_maps_->mu);
+  auto& v = host_maps_->maps;
+  for (size_t i = 0; i < v.size(); ++i)
+    if (v[i].base == addr) {
+      v.erase(v.begin() + static_cast<long>(i));
+      break;
+    }
+}
+
+bool MemoryManager::is_host_mapped(uint64_t addr) const {
+  if (!host_maps_) return false;
+  std::lock_guard<std::mutex> lock(host_maps_->mu);
+  return find_host_map_locked(addr, 1) != nullptr;
+}
+
 void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
   if (len == 0) return;
+  // Managed memory is the caller's own buffer; there is no chunk table to walk.
+  if (host_maps_) {
+    std::lock_guard<std::mutex> lock(host_maps_->mu);
+    if (const HostMap* m = find_host_map_locked(src, len)) {
+      std::memcpy(dst, m->host + (src - m->base), len);
+      return;
+    }
+  }
   if (!dst)
     throw Error::make(Err::InvalidPointer,
                       "device memory read into a NULL host pointer (", len, " bytes from ",

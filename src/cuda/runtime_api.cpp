@@ -58,6 +58,7 @@ static_assert(sizeof(cudaDeviceProp) == 1032,
 #warning "unrecognised CUDA runtime version: cudaDeviceProp layout is unchecked"
 #endif
 #include "vgpu/error.hpp"
+#include "vgpu/faults.hpp"
 #include "vgpu/profiling.hpp"
 #include "vgpu/telemetry.hpp"
 #include "vgpu/registry.hpp"
@@ -103,6 +104,9 @@ struct State {
   std::vector<std::unique_ptr<RegisteredModule>> modules;
   std::unordered_map<const void*, KernelInfo> kernels;  // host stub ptr -> kernel
   std::map<void*, size_t> host_allocs;
+  // Managed allocations, kept apart from host_allocs because freeing one has
+  // to unmap it from the device side as well.
+  std::map<void*, size_t> managed_allocs;
   bool initialized = false;
 };
 
@@ -413,6 +417,13 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     if (vgpu_record_launch_if_capturing(func, gridDim, blockDim, args, sharedMem, stream, param_sizes))
       return cudaSuccess;
 
+    if (vgpu::faults::should_fail(vgpu::faults::Op::Launch)) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] %s: failing this launch, as VGPU_FAIL_LAUNCH asked. This is "
+                             "injected, not a real failure\n", api);
+      return cudaErrorLaunchFailure;
+    }
+
     std::vector<std::vector<uint8_t>> kargs(fn->params.size());
     for (size_t i = 0; i < fn->params.size(); ++i) {
       kargs[i].resize(param_sizes[i]);
@@ -649,7 +660,7 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, 
       case cudaDevAttrIntegrated: *value = 0; break;
       case cudaDevAttrEccEnabled: *value = 0; break;
       case cudaDevAttrCanMapHostMemory: *value = 0; break;
-      case cudaDevAttrManagedMemory: *value = 0; break;       // cudaMallocManaged is refused
+      case cudaDevAttrManagedMemory: *value = 1; break;
       // Grid-wide sync works under cudaLaunchCooperativeKernel; the
       // multi-device form does not.
       case cudaDevAttrCooperativeLaunch: *value = 1; break;
@@ -818,6 +829,15 @@ VGPU_EXPORT cudaError_t cudaMemGetInfo(size_t* free_b, size_t* total_b) {
 VGPU_EXPORT cudaError_t cudaMalloc(void** ptr, size_t size) {
   return guard("cudaMalloc", [&](State& s) {
     if (!ptr) return cudaErrorInvalidValue;
+    // Injected failure, if this occurrence was selected. Returns the documented
+    // out-of-memory the API is allowed to return at any time, which is the
+    // error most callers claim to handle and few ever execute.
+    if (vgpu::faults::should_fail(vgpu::faults::Op::Alloc)) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] cudaMalloc: failing this allocation, as VGPU_FAIL_ALLOC "
+                             "asked. This is injected, not a real exhaustion\n");
+      return cudaErrorMemoryAllocation;
+    }
     // A zero-byte allocation succeeds on hardware and yields a distinct pointer
     // that can be freed. ggml asks for one and treats a failure as fatal, so
     // rejecting it stopped whole operations that were doing nothing wrong.
@@ -832,6 +852,17 @@ VGPU_EXPORT cudaError_t cudaMalloc(void** ptr, size_t size) {
 VGPU_EXPORT cudaError_t cudaFree(void* ptr) {
   return guard("cudaFree", [&](State& s) {
     if (!ptr) return cudaSuccess;  // cudaFree(NULL) is a documented no-op
+    // Managed memory frees the same way as device memory from the caller's
+    // side, but it is host memory underneath, so it has to leave the device's
+    // map before it is released -- otherwise a later kernel could address a
+    // pointer this process has given back to the allocator.
+    auto mit = s.managed_allocs.find(ptr);
+    if (mit != s.managed_allocs.end()) {
+      current(s).memory().unmap_host(reinterpret_cast<uint64_t>(ptr));
+      s.managed_allocs.erase(mit);
+      std::free(ptr);
+      return cudaSuccess;
+    }
     owner_memory(s, ptr).free(reinterpret_cast<uint64_t>(ptr));
     return cudaSuccess;
   });
@@ -839,6 +870,12 @@ VGPU_EXPORT cudaError_t cudaFree(void* ptr) {
 
 VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cudaMemcpyKind kind) {
   return guard("cudaMemcpy", [&](State& s) {
+    if (vgpu::faults::should_fail(vgpu::faults::Op::Memcpy)) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] cudaMemcpy: failing this copy, as VGPU_FAIL_MEMCPY asked. "
+                             "This is injected, not a real failure\n");
+      return cudaErrorInvalidValue;
+    }
     auto _t0 = std::chrono::steady_clock::now();
     bool dd = is_device_ptr(dst), sd = is_device_ptr(src);
     // Under unified addressing a device pointer names its own device, so each
@@ -1463,10 +1500,50 @@ VGPU_EXPORT cudaError_t cudaGetTextureObjectResourceDesc(cudaResourceDesc*, cuda
 // Managed memory is one allocation the CPU and GPU both address. Device memory
 // here lives in a separate virtual window that host code cannot dereference, so
 // handing back a device pointer would fault the moment the host touched it.
-VGPU_EXPORT cudaError_t cudaMallocManaged(void** ptr, size_t, unsigned int) {
-  if (!ptr) return cudaErrorInvalidValue;
-  return cudaErrorNotSupported;
+VGPU_EXPORT cudaError_t cudaMallocManaged(void** ptr, size_t size, unsigned int) {
+  return guard("cudaMallocManaged", [&](State& s) -> cudaError_t {
+    if (!ptr) return cudaErrorInvalidValue;
+    if (vgpu::faults::should_fail(vgpu::faults::Op::Alloc)) return cudaErrorMemoryAllocation;
+    const size_t n = size ? size : 1;
+    void* p = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
+    if (!p) return cudaErrorMemoryAllocation;
+    // Real host memory, addressable by kernels at its own address. This is the
+    // one place being a simulator makes something *easier*: on hardware
+    // managed memory needs page migration between two physical memories, and
+    // here there is only one.
+    current(s).memory().map_host(reinterpret_cast<uint64_t>(p), p, n);
+    st().managed_allocs[p] = n;
+    *ptr = p;
+    return cudaSuccess;
+  });
 }
+
+// Prefetching and advice describe where pages should live. There is one memory
+// here, so both are honest no-ops rather than refusals: a caller that
+// prefetches is asking for a performance hint, and not getting one is not a
+// behavioural difference it can observe.
+//
+// CUDA 13 changed both to take a cudaMemLocation where 12 took an int device,
+// so each needs the signature of the toolkit in use. The vendor header is
+// included, and C linkage makes a mismatch a hard error rather than a subtle
+// one -- which is how the last one of these was caught.
+#if CUDART_VERSION >= 13000
+VGPU_EXPORT cudaError_t cudaMemPrefetchAsync(const void*, size_t, struct cudaMemLocation,
+                                             unsigned int, cudaStream_t) {
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaMemAdvise(const void*, size_t, cudaMemoryAdvise,
+                                      struct cudaMemLocation) {
+  return cudaSuccess;
+}
+#else
+VGPU_EXPORT cudaError_t cudaMemPrefetchAsync(const void*, size_t, int, cudaStream_t) {
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaMemAdvise(const void*, size_t, cudaMemoryAdvise, int) {
+  return cudaSuccess;
+}
+#endif
 
 VGPU_EXPORT cudaError_t cudaGraphDebugDotPrint(cudaGraph_t, const char* path, unsigned int) {
   if (!path) return cudaErrorInvalidValue;

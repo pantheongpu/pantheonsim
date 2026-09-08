@@ -10,7 +10,9 @@ id: amd/mi300x
 vendor: amd
 model: "AMD Instinct MI300X"
 architecture: cdna3
-compute_capability: "9.4"
+# AMD parts have no compute capability; the gfx target is what identifies them.
+# Placeholder, like the rest of this file: not read from a device.
+gcn_arch: "gfx942"
 warp_size: 64
 vram_bytes: 206158430208
 verified: false

@@ -22,6 +22,9 @@ struct LaunchConfig {
   std::array<uint32_t, 3> block{1, 1, 1};
   uint32_t shared_bytes = 0;
   SchedulerKind scheduler = SchedulerKind::Deterministic;
+  // Seed for the random and adversarial schedulers; ignored by the
+  // deterministic one. The same seed replays the same execution.
+  uint64_t scheduler_seed = 0;
   // Safety net against infinite loops; counts executed instructions per launch.
   uint64_t max_steps = 1ull << 30;
   // A cooperative launch: every block is resident at once and may wait on the

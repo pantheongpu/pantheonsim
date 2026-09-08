@@ -5,6 +5,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
 #include "vgpu/exec/texture.hpp"
+#include "vgpu/exec/scheduler.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
@@ -1641,6 +1642,138 @@ DONE:
     ret;
 }
 )";
+
+// ---- scheduler modes ----
+//
+// A kernel with a read-modify-write race between two warps through *global*
+// memory. The shared-memory detector cannot see this one -- it is not shared
+// memory -- so the only thing that exposes it is an execution order in which
+// the two warps interleave.
+//
+// Under the deterministic scheduler they never do: a warp runs from one
+// barrier to the next without interruption, so warp 0 completes its whole
+// read-modify-write before warp 1 starts, and the answer comes out "right"
+// every time. That is the failure mode these modes exist for.
+static const char* kGlobalRaceKernel = R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    // Every thread does a non-atomic increment of the same word, 8 times.
+    // With any interleaving at all, updates are lost.
+    mov.u32 %r5, 0;
+LOOP:
+    ld.global.u32 %r1, [%rd2];
+    add.s32 %r2, %r1, 1;
+    st.global.u32 [%rd2], %r2;
+    add.s32 %r5, %r5, 1;
+    setp.lt.u32 %p1, %r5, 8;
+    @%p1 bra LOOP;
+    ret;
+}
+)";
+
+static uint64_t run_global_race(Env& e, const ptx::Module& m, vgpu::exec::SchedulerKind kind,
+                                uint64_t seed) {
+  uint64_t out = e.mem.alloc(16);
+  e.mem.store_scalar(out, 4, 0);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};  // two warps
+  cfg.scheduler = kind;
+  cfg.scheduler_seed = seed;
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  return e.mem.load_scalar(out, 4);
+}
+
+VTEST(the_same_seed_replays_the_same_execution) {
+  // The property the whole mode rests on: a race you cannot re-run is a race
+  // you cannot fix.
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kGlobalRaceKernel);
+  const uint64_t a = run_global_race(e, m, vgpu::exec::SchedulerKind::Random, 12345);
+  const uint64_t b = run_global_race(e, m, vgpu::exec::SchedulerKind::Random, 12345);
+  VCHECK_EQ(a, b);
+  const uint64_t c = run_global_race(e, m, vgpu::exec::SchedulerKind::Adversarial, 999);
+  const uint64_t d = run_global_race(e, m, vgpu::exec::SchedulerKind::Adversarial, 999);
+  VCHECK_EQ(c, d);
+}
+
+VTEST(an_adversarial_order_loses_updates_the_deterministic_one_does_not) {
+  // 64 threads x 8 increments = 512 if every update landed. The deterministic
+  // order runs each warp to completion, so within a warp the lanes are
+  // lockstep and the two warps do not interleave: it reports one fixed answer.
+  // The adversarial order preempts every instruction, so updates are lost --
+  // which is what the hardware would also do, and what the fixed order hides.
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kGlobalRaceKernel);
+  const uint64_t det = run_global_race(e, m, vgpu::exec::SchedulerKind::Deterministic, 0);
+  const uint64_t adv = run_global_race(e, m, vgpu::exec::SchedulerKind::Adversarial, 7);
+  VCHECK(adv < det);
+}
+
+VTEST(different_seeds_explore_different_orders) {
+  // If every seed produced the same answer the mode would be a search in name
+  // only. At least one pair out of several must differ.
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kGlobalRaceKernel);
+  std::vector<uint64_t> seen;
+  for (uint64_t seed = 1; seed <= 12; ++seed)
+    seen.push_back(run_global_race(e, m, vgpu::exec::SchedulerKind::Random, seed));
+  bool any_differ = false;
+  for (size_t i = 1; i < seen.size(); ++i)
+    if (seen[i] != seen[0]) any_differ = true;
+  VCHECK(any_differ);
+}
+
+VTEST(a_race_free_kernel_gives_the_same_answer_under_every_order) {
+  // The other half, and the one that keeps the modes honest: reordering must
+  // not change a correct program. A scheduler that broke race-free kernels
+  // would make every report suspect.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    mul.lo.s32 %r2, %r1, 3;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+)";
+  auto check = [&](vgpu::exec::SchedulerKind kind, uint64_t seed) {
+    Env e;
+    auto m = ptx::parse(ptx);
+    uint64_t out = e.mem.alloc(512);
+    LaunchConfig cfg;
+    cfg.block = {64, 1, 1};
+    cfg.scheduler = kind;
+    cfg.scheduler_seed = seed;
+    exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+    for (uint32_t i = 0; i < 64; ++i)
+      VCHECK_EQ(e.mem.load_scalar(out + i * 4, 4), uint64_t{i * 3});
+  };
+  check(vgpu::exec::SchedulerKind::Deterministic, 0);
+  check(vgpu::exec::SchedulerKind::Random, 4242);
+  check(vgpu::exec::SchedulerKind::Adversarial, 4242);
+}
+
+VTEST(an_unknown_scheduler_name_is_refused_rather_than_defaulted) {
+  // Running the default under a name nobody recognises would mean a result
+  // that cannot be attributed to an execution order, which is the one thing
+  // these modes exist to provide.
+  setenv("VGPU_SCHEDULER", "aggressive", 1);
+  vgpu::exec::SchedulerKind k = vgpu::exec::SchedulerKind::Deterministic;
+  uint64_t seed = 0;
+  auto err = VCAPTURE(Error, vgpu::exec::scheduler_from_env(&k, &seed));
+  unsetenv("VGPU_SCHEDULER");
+  VCHECK(err.code() == Err::InvalidValue);
+}
 
 // ---- special registers added for kernels that read them ----
 

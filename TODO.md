@@ -89,7 +89,8 @@ an instance left running bills by the hour).
 `tools/compare-profile.py` diffs a measured profile against the one in the
 tree, so corrections are visible rather than silently applied.
 
-Verified against real hardware, nine devices across six architectures:
+Verified against real hardware, ten devices across seven architectures --
+including the first AMD part:
 
 | profile | device | how |
 | --- | --- | --- |
@@ -102,11 +103,30 @@ Verified against real hardware, nine devices across six architectures:
 | `nvidia/t4` | Tesla T4 (sm_75, Turing) | EC2 `g4dn.xlarge` |
 | `nvidia/a10g` | A10G (sm_86) | EC2 `g5.xlarge` |
 | `nvidia/l4` | L4 (sm_89, Ada Lovelace) | EC2 `g6.xlarge` |
+| `amd/mi325x` | MI325X (gfx942, CDNA3) | DigitalOcean `gpu-mi325x1-256gb` |
 
 All nine match the physical device on **512 conformance values each** -- the
 same binary run on hardware and on VirtualGPU, diffed.
 
-Ada was the last architecture gap in the supported range. It stayed open for a
+**The AMD one is discovery, not execution.** `amd/mi325x` describes a real
+MI325X -- 304 CUs, 64-lane wavefronts, 64 KiB LDS, gfx942 -- and nothing can
+run on it yet, because the interpreter's warp is 32 lanes wide. The profile is
+deliberately ahead of the engine rather than rounded to fit it.
+
+It also cost three droplets to get, and two of those were avoidable. The first
+two attempts compiled a HIP program on the rented machine and failed
+identically: DigitalOcean's AMD image ships `hipcc` but not the HIP development
+headers, so `hip/hip_runtime.h` exists nowhere under `/opt/rocm`. The third run
+dumped `rocminfo`, which was installed all along and reports everything the
+schema needs, and every subsequent iteration was free.
+`tools/rocminfo-to-profile.py` parses it at home for that reason.
+
+MI300X was the intended target and is not launchable: a create was attempted in
+all sixteen available DigitalOcean regions and every one answered "Size is not
+available in this region". MI325X is the same gfx942 CDNA3 target, so only
+`vram_bytes` differs between them.
+
+Ada was the last architecture gap in the NVIDIA range. It stayed open for a
 while because capacity and quota were both against it: us-east-1 had no L4
 capacity when it was first tried, and the G-instance vCPU quota is still zero
 in every region except us-east-1. It launched on the third availability zone
@@ -342,15 +362,23 @@ narrows what counts as observable, not what the detector looks at.
 
 ## Not implemented (fails loudly, never silently)
 
-- PTX: textures/surfaces, wgmma, grid sync, inline-asm-only instructions
-- Runtime: async copies, unified/managed memory, virtual memory mgmt API
-  (cuMemAddressReserve…), host-pinned memory
-- Frontends: cubin/SASS loading, cuGetProcAddress dispatch, AMD everything
-  (HIP, ROCm-SMI, CDNA ISA)
-- Tooling: `vgpu test --matrix`, trace record/replay, schedulers
-  random/adversarial, OOM injection, characterization/differential-fuzz
-  harness, conformance DB + compat scores. (`vgpu run` and shared-memory race
-  detection are done.)
+This list was stale for a while, which is its own kind of wrong: it still named
+textures, grid sync and host-pinned memory long after all three worked. A
+roadmap that overstates what is missing misleads as much as one that overstates
+what is done.
+
+- PTX: `wgmma` and the thread-block cluster registers, inline-asm-only
+  instructions. (Textures, surfaces and grid sync are done.)
+- Runtime: async copies, the virtual memory management API
+  (cuMemAddressReserve…). (Managed memory and host-pinned memory are done.)
+- Frontends: cubin/SASS loading, and AMD execution -- HIP runtime and the CDNA
+  ISA. AMD *discovery* now exists: `tools/rocminfo-to-profile.py` reads a real
+  MI325X and `profiles/amd/mi325x.yaml` is verified against one. What is
+  missing is running anything, and the blocker is concrete rather than vague:
+  a wavefront is 64 lanes and this interpreter's warp is 32.
+- Tooling: trace record/replay, conformance DB + compat scores. (`vgpu run`,
+  `vgpu test --matrix`, shared-memory race detection, the random and
+  adversarial schedulers, and fault injection are done.)
 
 ## Performance
 
@@ -425,8 +453,28 @@ scripts/run-pantheon-workloads.sh.
 1. **Interpreter speed**: intern register names to dense indices at parse
    time (see Performance above) — the single biggest win available without
    the JIT.
-2. **Scheduler: random mode** (seeded) + first differential scheduling tests,
-   then the adversarial mode that makes VirtualGPU a race detector.
+2. **Scheduler: random and adversarial modes** -- done. `VGPU_SCHEDULER` picks
+   between `deterministic`, `random` and `adversarial`, and
+   `VGPU_SCHEDULER_SEED` makes the last two replayable: the same seed replays
+   the same execution exactly, which is the property that makes a race
+   fixable rather than merely observed.
+
+   The half that mattered was not which warp runs next but *for how long*.
+   Under the deterministic scheduler a warp runs from one barrier to the next
+   without interruption, so two warps in the same epoch never interleave at
+   all. The shared-memory detector still finds their conflict, because it
+   reasons about epochs rather than orderings -- but a race through *global*
+   memory produces no detector report, and with no interleaving it produces no
+   wrong answer either. It simply does not appear. The new modes preempt
+   mid-warp, and a test pins the difference: a non-atomic increment from two
+   warps loses updates under the adversarial order and does not under the
+   deterministic one.
+
+   Still to do: an adversarial mode guided by what the warps are about to
+   touch. The scheduler is not told about memory, so today it maximises
+   switching and lets that do the work rather than aiming at a specific pair of
+   conflicting accesses. Aiming would mean feeding the race detector's shadow
+   state back into scheduling.
 3. **Characterization harness v0**: run the same micro-tests on a physical
    GPU (bench/ rents them) and on virtual profiles, diff, and start flipping
    `verified` bits in the profiles.

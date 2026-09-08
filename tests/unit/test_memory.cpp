@@ -247,4 +247,61 @@ VTEST(null_host_pointers_are_diagnosed_not_dereferenced) {
   VCHECK_CONTAINS(r.what(), "NULL host pointer");
 }
 
+// ---- managed memory ----
+//
+// One buffer the host dereferences directly and a kernel also addresses. Every
+// other device pointer here is a virtual address with no host meaning, which
+// is why cudaMallocManaged used to refuse; a managed buffer is real host
+// memory put on the device's map.
+
+VTEST(a_mapped_host_buffer_is_readable_and_writable_from_the_device_side) {
+  MemoryManager mem(1 << 20);
+  std::vector<uint32_t> host(64, 0);
+  const uint64_t addr = reinterpret_cast<uint64_t>(host.data());
+  mem.map_host(addr, host.data(), host.size() * sizeof(uint32_t));
+
+  // The device side writes; the host sees it without a copy.
+  mem.store_scalar(addr + 4 * 4, 4, 0xABCDu);
+  VCHECK_EQ(host[4], 0xABCDu);
+  // The host writes; the device side sees it without a copy.
+  host[9] = 0x1234u;
+  VCHECK_EQ(mem.load_scalar(addr + 9 * 4, 4), uint64_t{0x1234u});
+
+  mem.unmap_host(addr);
+}
+
+VTEST(a_mapped_buffer_is_owned_by_the_device_even_outside_its_window) {
+  // owns() is what decides whether a pointer is treated as device memory, and
+  // a managed buffer lives at its real host address -- outside every device
+  // VA window -- while still being device-addressable.
+  MemoryManager mem(1 << 20);
+  std::vector<uint32_t> host(16, 0);
+  const uint64_t addr = reinterpret_cast<uint64_t>(host.data());
+  VCHECK(!mem.owns(addr));
+  mem.map_host(addr, host.data(), host.size() * sizeof(uint32_t));
+  VCHECK(mem.owns(addr));
+  VCHECK(mem.is_host_mapped(addr));
+  mem.unmap_host(addr);
+  // And once unmapped it is not device memory again, so a kernel cannot reach
+  // a pointer the process has given back to the allocator.
+  VCHECK(!mem.owns(addr));
+  VCHECK(!mem.is_host_mapped(addr));
+}
+
+VTEST(ordinary_device_memory_is_unaffected_by_a_mapping_existing) {
+  // The mapped-range check sits on the read and write path, so it has to be
+  // invisible to everything that is not managed.
+  MemoryManager mem(1 << 20);
+  std::vector<uint32_t> host(16, 7);
+  const uint64_t mapped = reinterpret_cast<uint64_t>(host.data());
+  mem.map_host(mapped, host.data(), host.size() * sizeof(uint32_t));
+
+  const uint64_t dev = mem.alloc(256);
+  mem.store_scalar(dev, 4, 0x5555u);
+  VCHECK_EQ(mem.load_scalar(dev, 4), uint64_t{0x5555u});
+  VCHECK_EQ(host[0], 7u);  // untouched by the device-memory write
+  mem.free(dev);
+  mem.unmap_host(mapped);
+}
+
 VTEST_MAIN

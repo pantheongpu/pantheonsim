@@ -32,6 +32,8 @@ int usage(FILE* to) {
                "  vgpu run [opts] <program> [args...]  Run a program against VirtualGPU, with the\n"
                "                                       simulator's CUDA libraries in front of the\n"
                "                                       real ones (vgpu run --help for options)\n"
+               "  vgpu test --matrix <program> [args]  Run a program on every device profile and\n"
+               "                                       compare the results (vgpu test --help)\n"
                "  vgpu shell                           Interactive machine simulator: pick a GPU,\n"
                "                                       CUDA/driver and OS, then get a shell where\n"
                "                                       nvidia-smi/rocm-smi/lspci/dmesg all work\n"
@@ -62,7 +64,10 @@ int cmd_info(const std::string& gpu, bool json) {
     std::printf("  \"vendor\": \"%s\",\n", json_escape(p.vendor).c_str());
     std::printf("  \"model\": \"%s\",\n", json_escape(p.model).c_str());
     std::printf("  \"architecture\": \"%s\",\n", json_escape(p.architecture).c_str());
-    std::printf("  \"compute_capability\": \"%d.%d\",\n", p.cc_major, p.cc_minor);
+    if (p.vendor == "amd")
+      std::printf("  \"gcn_arch\": \"%s\",\n", json_escape(p.gcn_arch).c_str());
+    else
+      std::printf("  \"compute_capability\": \"%d.%d\",\n", p.cc_major, p.cc_minor);
     std::printf("  \"warp_size\": %u,\n", p.warp_size);
     std::printf("  \"vram_bytes\": %llu,\n", static_cast<unsigned long long>(p.vram_bytes));
     std::printf("  \"verified\": %s,\n", p.verified ? "true" : "false");
@@ -90,7 +95,12 @@ int cmd_info(const std::string& gpu, bool json) {
     std::printf("  vendor:              %s\n", p.vendor.c_str());
     std::printf("  model:               %s\n", p.model.c_str());
     std::printf("  architecture:        %s\n", p.architecture.c_str());
-    std::printf("  compute capability:  %d.%d\n", p.cc_major, p.cc_minor);
+    // AMD parts have no compute capability; their gfx target is the equivalent
+    // thing, and printing "0.0" for it says nothing true.
+    if (p.vendor == "amd")
+      std::printf("  gfx target:          %s\n", p.gcn_arch.c_str());
+    else
+      std::printf("  compute capability:  %d.%d\n", p.cc_major, p.cc_minor);
     std::printf("  warp size:           %u\n", p.warp_size);
     std::printf("  vram:                %.0f GiB (%llu bytes, virtual)\n", gib,
                 static_cast<unsigned long long>(p.vram_bytes));
@@ -132,6 +142,8 @@ int cmd_serve(const std::vector<std::string>& args);
 int cmd_shell(const std::vector<std::string>& args);
 // Implemented in run.cpp.
 int cmd_run(const std::vector<std::string>& args);
+// Implemented in test.cpp.
+int cmd_test(const std::vector<std::string>& args);
 
 int main(int argc, char** argv) {
   std::vector<std::string> args(argv + 1, argv + argc);
@@ -149,6 +161,7 @@ int main(int argc, char** argv) {
     if (cmd == "serve") return cmd_serve({args.begin() + 1, args.end()});
     if (cmd == "shell") return cmd_shell({args.begin() + 1, args.end()});
     if (cmd == "run") return cmd_run({args.begin() + 1, args.end()});
+    if (cmd == "test") return cmd_test({args.begin() + 1, args.end()});
     if (cmd == "info") {
       std::string gpu;
       bool json = false;

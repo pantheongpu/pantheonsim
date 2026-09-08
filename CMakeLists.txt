@@ -63,6 +63,7 @@ add_library(vgpu STATIC
   src/core/memory.cpp
   src/core/telemetry.cpp
   src/core/profiling.cpp
+  src/core/faults.cpp
   src/ptx/ast.cpp
   src/ptx/lexer.cpp
   src/ptx/parser.cpp
@@ -402,7 +403,7 @@ else()
 endif()
 
 # CLI
-add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp)
+add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/test.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
 # Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /

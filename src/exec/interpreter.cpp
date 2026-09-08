@@ -36,6 +36,7 @@
 #include <unordered_map>
 
 #include "vgpu/error.hpp"
+#include "vgpu/faults.hpp"
 #include "vgpu/exec/launch.hpp"
 
 namespace vgpu::exec {
@@ -198,6 +199,7 @@ std::atomic<bool> g_race_strict{false};
 // race detector's own test came to pass a racy kernel: an earlier launch had
 // already frozen the flag to false.
 void refresh_modes() {
+  faults::refresh();
   const char* strict = std::getenv("VGPU_STRICT");
   g_strict.store(strict && strict[0] == '1', std::memory_order_relaxed);
   const char* race = std::getenv("VGPU_RACE");
@@ -307,7 +309,7 @@ class Interpreter {
   // the point of this simulator is that a run is reproducible, which rules out
   // handing the blocks to OS threads and letting them race.
   void run_grid_cooperative(uint64_t total) {
-    auto sched = make_scheduler(cfg_.scheduler);
+    auto sched = make_scheduler(cfg_.scheduler, cfg_.scheduler_seed);
     const uint64_t gx = cfg_.grid[0], gy = cfg_.grid[1];
     std::vector<BlockState> blocks(static_cast<size_t>(total));
     for (uint64_t i = 0; i < total; ++i) {
@@ -337,7 +339,7 @@ class Interpreter {
   // independent -- that is the programming model's central promise -- so a
   // range can run on its own thread with nothing shared but device memory.
   void run_block_range(uint64_t first, uint64_t last) {
-    auto sched = make_scheduler(cfg_.scheduler);
+    auto sched = make_scheduler(cfg_.scheduler, cfg_.scheduler_seed);
     const uint64_t gx = cfg_.grid[0], gy = cfg_.grid[1];
     for (uint64_t i = first; i < last; ++i) {
       BlockCtx ctx;
@@ -452,7 +454,14 @@ class Interpreter {
     }
     const size_t picked = sched.pick(runnable);
     cur_warp_ = static_cast<uint32_t>(picked);
-    run_warp_until_yield(b.warps[picked], b.ctx, slice);
+    // Two things can bound the turn: the scheduler, which preempts to
+    // interleave, and a cooperative launch, which preempts so a spinning warp
+    // lets another block run. Whichever is shorter wins; zero from either means
+    // "no bound of mine".
+    const uint64_t sched_slice = sched.slice();
+    uint64_t turn = slice;
+    if (sched_slice && (!turn || sched_slice < turn)) turn = sched_slice;
+    run_warp_until_yield(b.warps[picked], b.ctx, turn);
     return true;
   }
 
@@ -3617,6 +3626,21 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
   const uint64_t grid_id = g_next_grid_id.fetch_add(1, std::memory_order_relaxed);
   LaunchConfig eff = cfg;
   eff.max_steps = effective_max_steps(cfg.max_steps);
+  // VGPU_SCHEDULER overrides whatever the caller asked for, so a racy program
+  // can be re-run under a different order without touching its source. A
+  // caller that set the mode explicitly still loses to the environment, which
+  // is the right way round: the environment is the person debugging.
+  {
+    SchedulerKind k = eff.scheduler;
+    uint64_t seed = eff.scheduler_seed;
+    if (scheduler_from_env(&k, &seed)) {
+      eff.scheduler = k;
+      eff.scheduler_seed = seed;
+    }
+  }
+  // A non-deterministic order is only useful if it can be replayed, and only
+  // reproducible if the blocks are not also being raced across host threads.
+  const bool ordered = eff.scheduler != SchedulerKind::Deterministic;
 
   // A cooperative launch needs the grid-barrier workspace the driver would
   // reserve on hardware: cg::this_grid().sync() finds it through %envreg1 and
@@ -3641,7 +3665,7 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
   // A cooperative launch runs on one worker whatever VGPU_THREADS says. Its
   // blocks wait on each other, so they cannot be split into independent ranges
   // -- that is precisely the promise a cooperative launch does not make.
-  const unsigned nthreads = eff.cooperative ? 1 : worker_count(blocks);
+  const unsigned nthreads = (eff.cooperative || ordered) ? 1 : worker_count(blocks);
 
   if (nthreads <= 1) {
     LaunchStats stats;

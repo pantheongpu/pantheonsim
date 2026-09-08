@@ -55,7 +55,10 @@ struct DeviceProfile {
   std::string id;            // registry id, e.g. "nvidia/h100"
   std::string vendor;        // "nvidia" | "amd"
   std::string model;         // marketing/device name as APIs report it
-  std::string architecture;  // "ampere" | "hopper" | "blackwell" | ...
+  std::string architecture;  // "ampere" | "hopper" | "blackwell" | "cdna3" | ...
+  // AMD's equivalent of a compute capability: the gfx target a binary must be
+  // built for. "gfx942" for CDNA3. Empty on NVIDIA.
+  std::string gcn_arch;
   int cc_major = 0;          // compute capability (NVIDIA) / ISA generation
   int cc_minor = 0;
   uint32_t warp_size = 0;
