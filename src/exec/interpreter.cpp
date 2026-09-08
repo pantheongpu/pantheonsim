@@ -2569,6 +2569,11 @@ class Interpreter {
       exec_wmma_mma(w, ctx, ins, *op, m);
       return;
     }
+    if (const auto* op = std::get_if<OpWmmaLoad>(&ins.op)) {
+      require_warp32(ins, "wmma.load");
+      exec_wmma_load(w, ctx, ins, *op, m);
+      return;
+    }
     if (const auto* op = std::get_if<OpWmmaStore>(&ins.op)) {
       exec_wmma_store(w, ctx, ins, *op, m);
       return;
@@ -3287,6 +3292,59 @@ class Interpreter {
         r[lane] = f32bits(D[linear / kMmaDim][linear % kMmaDim]);
       }
       write_reg(w, op.d[reg], m, r, 32);
+    }
+  }
+
+  // wmma.load.{a,b,c}. The addressing mirrors exactly what exec_wmma_mma reads
+  // back out, because a WMMA fragment is opaque: CUDA specifies no register
+  // assignment, and the only thing that has to hold is that load, mma and
+  // store agree.
+  //
+  // For A and B the layout flag cancels out. mma interprets a .col fragment as
+  // transposed, and .col memory is itself transposed, so both paths land on
+  // the same element -- which is the point: a column-major A read with .col is
+  // the same logical matrix as a row-major A read with .row.
+  //
+  // Only 16 of the 32 lanes carry distinct A/B data (16x16 halves over 32
+  // lanes is exactly a factor of two of duplication, which is what the
+  // hardware fragment does too), so lanes 16-31 duplicate lanes 0-15 rather
+  // than reading rows 16-31 of a 16-row matrix, which would be out of bounds.
+  void exec_wmma_load(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaLoad& op,
+                      Mask m) {
+    Lanes _s_base;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
+    Lanes _s_stride;
+    const Lanes& stride = read_operand(w, ctx, ins, op.stride, _s_stride);
+    const uint64_t sbase = space_base(op.space);
+    uint32_t lead = 0;
+    while (lead < W_ && !(m & (Mask{1} << lead))) ++lead;
+    if (lead == W_) return;
+    const uint64_t addr0 = sbase + base[lead] + static_cast<uint64_t>(op.addr.offset);
+    const uint64_t ld = stride[lead];
+
+    for (int reg = 0; reg < 8; ++reg) {
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        if (op.which == OpWmmaLoad::Which::C) {
+          const uint32_t linear = lane * 8 + static_cast<uint32_t>(reg);
+          const uint32_t i = linear / kMmaDim, j = linear % kMmaDim;
+          const uint64_t elem = op.layout == MatLayout::Row ? (uint64_t{i} * ld + j)
+                                                            : (uint64_t{j} * ld + i);
+          r[lane] = load_routed(w, ctx, ins, lane, addr0 + elem * 4, 4);
+        } else {
+          const uint32_t row = lane % kMmaDim;
+          uint64_t packed = 0;
+          for (int h = 0; h < 2; ++h) {
+            const uint32_t col = static_cast<uint32_t>(reg * 2 + h);
+            const uint64_t elem = uint64_t{row} * ld + col;
+            const uint64_t v = load_routed(w, ctx, ins, lane, addr0 + elem * 2, 2);
+            packed |= (v & 0xFFFF) << (16 * h);
+          }
+          r[lane] = packed;
+        }
+      }
+      write_reg(w, op.dsts[reg], m, r, 32);
     }
   }
 

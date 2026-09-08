@@ -395,6 +395,22 @@ struct OpWmmaMma {
   MatLayout alayout, blayout;
   std::vector<Reg> d, a, b, c;
 };
+// wmma.load.{a,b,c}.sync.aligned.<layout>.m16n16k16[.space].<type> {d...}, [addr], stride
+//
+// The fragment layout WMMA uses is deliberately unspecified by CUDA -- a
+// fragment is an opaque object, and the only contract is that load, mma and
+// store agree with each other. So this mirrors exactly what exec_wmma_mma
+// already reads rather than trying to reproduce NVIDIA's register assignment,
+// which is not documented and not observable through the API.
+struct OpWmmaLoad {
+  enum class Which { A, B, C } which = Which::A;
+  MatLayout layout = MatLayout::Row;
+  Space space = Space::Generic;
+  bool f32 = false;         // the C fragment is f32; A and B are f16
+  Addr addr;
+  std::vector<Reg> dsts;
+  Operand stride;
+};
 struct OpWmmaStore {
   MatLayout layout;
   Space space = Space::Generic;
@@ -506,7 +522,7 @@ struct OpCall { std::string callee; std::string retval_slot; std::vector<std::st
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
-                        OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
+                        OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpActiveMask>;
 
 struct Instr {

@@ -512,6 +512,17 @@ if(TARGET vgpucublas)
   # test never thinks to write, and this is what catches the difference. It
   # already has: nvcc lowers labeled_partition through bfind.shiftamt, which
   # nothing else here would have asked for.
+  # A full 16x16x16 matmul through the public WMMA API: load both operands and
+  # the accumulator, mma, store. The fragment layout is opaque by design -- the
+  # only observable contract is the product -- so this checks it against a host
+  # reference rather than against a register assignment.
+  add_test(NAME e2e_wmma_gemm
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_wmma_gemm.sh)
+  set_tests_properties(e2e_wmma_gemm PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_modern_dtypes
            COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_modern_dtypes.sh)
   set_tests_properties(e2e_modern_dtypes PROPERTIES

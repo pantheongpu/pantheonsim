@@ -1150,9 +1150,13 @@ class Parser {
       std::vector<MatLayout> layouts;
       Space space = Space::Generic;
       bool shape_ok = false;
+      char frag = 0;
+      bool saw_f32 = false;
       for (size_t i = 2; i < parts.size(); ++i) {
         const std::string& p = parts[i];
-        if (p == "sync" || p == "aligned" || p == "d" || p == "f32") ;
+        if (p == "sync" || p == "aligned") ;
+        else if (p == "a" || p == "b" || p == "c" || p == "d") frag = p[0];
+        else if (p == "f32") saw_f32 = true;
         else if (p == "row") layouts.push_back(MatLayout::Row);
         else if (p == "col") layouts.push_back(MatLayout::Col);
         else if (p == "m16n16k16") shape_ok = true;
@@ -1191,8 +1195,28 @@ class Parser {
         expect_punct(",");
         op.stride = parse_operand();
         ins.op = op;
+      } else if (kind == "load") {
+        OpWmmaLoad op;
+        if (frag == 'a') op.which = OpWmmaLoad::Which::A;
+        else if (frag == 'b') op.which = OpWmmaLoad::Which::B;
+        else if (frag == 'c') op.which = OpWmmaLoad::Which::C;
+        else return unsupported("wmma.load without an a/b/c fragment selector");
+        op.f32 = saw_f32;
+        if (op.which == OpWmmaLoad::Which::C && !op.f32)
+          return unsupported("wmma.load.c with an f16 accumulator (only .f32 is implemented)");
+        if (op.which != OpWmmaLoad::Which::C && op.f32)
+          return unsupported("wmma.load.a/.b with f32 elements (only .f16 is implemented)");
+        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
+        op.space = space;
+        op.dsts = parse_reg_vector_any();
+        if (op.dsts.size() != 8) return unsupported("wmma.load fragment arity (expected 8)");
+        expect_punct(",");
+        op.addr = parse_addr(fn);
+        expect_punct(",");
+        op.stride = parse_operand();
+        ins.op = op;
       } else {
-        return unsupported("wmma." + kind + " is not implemented (only .mma and .store.d)");
+        return unsupported("wmma." + kind + " is not implemented (only .load, .mma and .store.d)");
       }
     } else if (op0 == "abs") {
       if (parts.size() < 2) return unsupported("abs form");
