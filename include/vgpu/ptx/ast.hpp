@@ -277,6 +277,29 @@ struct OpSzext { bool wrap = false; bool is_signed = false; Reg dst; Operand a, 
 // fns.b32 d, mask, base, offset -- the position of the n-th set bit of mask,
 // searching from `base`. Returns 0xFFFFFFFF when there is no such bit.
 struct OpFns { Reg dst; Operand mask, base, offset; };
+// mbarrier: the split barrier Ampere introduced and Hopper's pipelines are
+// built on. Unlike bar.sync, arriving and waiting are separate instructions,
+// so a producer warp can signal and carry on while a consumer waits -- which
+// is the whole point, and what cuda::barrier and cuda::pipeline compile to.
+//
+// A barrier holds an expected arrival count and a phase bit. Each arrival
+// decrements what is outstanding; when the last one lands the phase flips and
+// the count reloads. A wait asks whether the phase it captured has completed
+// yet, and answers with a predicate rather than blocking -- so the kernel
+// spins, which is exactly what it does on hardware.
+enum class MbarOp : uint8_t {
+  Init, Inval, Arrive, ArriveDrop, TestWait, TryWait, PendingCount,
+};
+struct OpMbarrier {
+  MbarOp op = MbarOp::Init;
+  bool parity = false;      // the .parity form of test_wait/try_wait
+  Reg dst;                  // arrive's token, a wait's predicate, pending_count's value
+  Addr addr;                // the barrier object, in shared memory
+  Operand count;            // init's expected count, or arrive's increment
+  bool have_count = false;
+  Operand state;            // test_wait's token, or try_wait.parity's parity
+  bool have_state = false;
+};
 // copysign.f32/f64 d, a, b -- magnitude of b with the sign of a.
 struct OpCopysign { Type ty; Reg dst; Operand a, b; };
 // dp4a.{u32,s32}.{u32,s32} d, a, b, c -- four byte-wise products of a and b
@@ -439,7 +462,7 @@ struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpActiveMask>;
 

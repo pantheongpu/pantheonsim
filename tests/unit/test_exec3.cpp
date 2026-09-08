@@ -1939,6 +1939,132 @@ VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{512 + 256});
 }
 
+VTEST(mbarrier_orders_a_producer_against_a_consumer) {
+  // The test that matters for a split barrier: warp 0 writes a value, all
+  // threads arrive, and every thread spins on the barrier before reading. If
+  // the wait returned true early -- the easy way to get the phase comparison
+  // backwards -- the consumers would read the zero that was there before, and
+  // this would fail with 0 rather than 41.
+  //
+  // Nothing blocks in the engine here. The wait is a predicate and the kernel
+  // spins; the scheduler preempts the spinning warp, the others arrive, and
+  // the spinner then sees the phase flip.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<4>;
+    .shared .align 8 .b8 bar[8];
+    .shared .align 4 .b8 buf[4];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u64 %rd3, bar;
+    mov.u64 %rd4, buf;
+    // thread 0 initializes the barrier for all 64 threads
+    setp.ne.u32 %p0, %r1, 0;
+    @%p0 bra INITDONE;
+    mov.u32 %r2, 64;
+    mbarrier.init.shared.b64 [%rd3], %r2;
+    mov.u32 %r3, 0;
+    st.shared.u32 [%rd4], %r3;
+INITDONE:
+    bar.sync 0;
+    // the producer publishes before arriving
+    @%p0 bra ARRIVE;
+    mov.u32 %r4, 41;
+    st.shared.u32 [%rd4], %r4;
+ARRIVE:
+    mbarrier.arrive.shared.b64 %rd5, [%rd3];
+SPIN:
+    mbarrier.test_wait.shared.b64 %p1, [%rd3], %rd5;
+    @!%p1 bra SPIN;
+    // every thread reads only after the barrier released
+    ld.shared.u32 %r5, [%rd4];
+    mul.wide.u32 %rd6, %r1, 4;
+    add.s64 %rd7, %rd2, %rd6;
+    st.global.u32 [%rd7], %r5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint32_t kThreads = 64;
+  uint64_t out = e.mem.alloc(kThreads * 4);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {kThreads, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t t = 0; t < kThreads; ++t)
+    VCHECK_EQ(e.mem.load_scalar(out + t * 4, 4), uint64_t{41});
+}
+
+VTEST(mbarrier_counts_threads_not_warps) {
+  // A barrier initialized to blockDim.x completes only if every *thread*
+  // counts as an arrival. Counting one per warp is the mistake that makes it
+  // never complete -- and it would show up as a hang, not a wrong number, so
+  // pending_count is checked directly instead.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<4>;
+    .shared .align 8 .b8 bar[8];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u64 %rd3, bar;
+    setp.ne.u32 %p0, %r1, 0;
+    @%p0 bra INITDONE;
+    mov.u32 %r2, 96;              // more than the 64 threads that will arrive
+    mbarrier.init.shared.b64 [%rd3], %r2;
+INITDONE:
+    bar.sync 0;
+    mbarrier.arrive.shared.b64 %rd5, [%rd3];
+    bar.sync 0;
+    @%p0 bra DONE;
+    mbarrier.pending_count.shared.b64 %r6, [%rd3];
+    st.global.u32 [%rd2], %r6;
+DONE:
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(8);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {64, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  // 96 expected, 64 threads arrived: 32 outstanding. Per warp it would be 94.
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{32});
+}
+
+VTEST(an_uninitialized_mbarrier_is_refused) {
+  // Waiting on a barrier nobody initialized is a real bug with a silent
+  // failure mode: treated as "expected 0", it would complete immediately and
+  // the pipeline would read a buffer nobody filled.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k()
+{
+    .reg .b64 %rd<4>;
+    .shared .align 8 .b8 bar[8];
+    mov.u64 %rd1, bar;
+    mbarrier.arrive.shared.b64 %rd2, [%rd1];
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, e.mem, e.prof));
+  VCHECK(err.code() == Err::UnsupportedPtx);
+  VCHECK_CONTAINS(err.what(), "has not been initialized");
+}
+
 VTEST(red_is_an_atomic_that_keeps_no_answer) {
   // nvcc emits `red` whenever an atomicAdd()'s result is unused, which in a
   // reduction or a histogram is every call -- so a kernel full of atomics can

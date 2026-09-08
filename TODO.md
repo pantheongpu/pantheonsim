@@ -368,7 +368,12 @@ textures, grid sync and host-pinned memory long after all three worked. A
 roadmap that overstates what is missing misleads as much as one that overstates
 what is done.
 
-- PTX: `wgmma` and the cluster *memory* model, inline-asm-only instructions.
+- PTX: `wgmma`, TMA (`cp.async.bulk`) and the cluster *memory* model,
+  inline-asm-only instructions. (`mbarrier` is done -- init, inval, arrive,
+  arrive_drop, test_wait, try_wait and pending_count, including the .parity
+  form. Its transaction-counting modifiers, `expect_tx` and `complete_tx`, are
+  refused by name: they exist to pair a barrier with a TMA copy, and with no
+  `cp.async.bulk` to complete those bytes such a barrier would hang.)
   (Textures, surfaces and grid sync are done. The thread-block cluster
   scheduling level is done: `%clusterid`, `%nclusterid`, `%cluster_ctaid`,
   `%cluster_nctaid`, `%cluster_ctarank`, `%cluster_nctarank` and

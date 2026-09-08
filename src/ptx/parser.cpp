@@ -1451,6 +1451,57 @@ class Parser {
       expect_punct(",");
       op.c = parse_operand();
       ins.op = op;
+    } else if (op0 == "mbarrier") {
+      // mbarrier.<op>[.parity][.space][.sem][.scope].b64 ...
+      OpMbarrier op;
+      bool have_op = false;
+      bool saw_shared = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p2 = parts[i];
+        if (p2 == "init") { op.op = MbarOp::Init; have_op = true; }
+        else if (p2 == "inval") { op.op = MbarOp::Inval; have_op = true; }
+        else if (p2 == "arrive") { op.op = MbarOp::Arrive; have_op = true; }
+        else if (p2 == "arrive_drop") { op.op = MbarOp::ArriveDrop; have_op = true; }
+        else if (p2 == "test_wait") { op.op = MbarOp::TestWait; have_op = true; }
+        else if (p2 == "try_wait") { op.op = MbarOp::TryWait; have_op = true; }
+        else if (p2 == "pending_count") { op.op = MbarOp::PendingCount; have_op = true; }
+        else if (p2 == "parity") op.parity = true;
+        else if (p2 == "shared") saw_shared = true;
+        else if (p2 == "b64") ;
+        else if (inert_mem_modifier(p2)) ;
+        else if (p2 == "expect_tx" || p2 == "complete_tx" || p2 == "noComplete")
+          // Transaction counting exists to pair an mbarrier with a TMA copy:
+          // the barrier waits for a byte count as well as for arrivals.
+          // cp.async.bulk is not implemented, so nothing can ever complete
+          // those bytes, and a barrier that waits on them would hang rather
+          // than be wrong -- which is still worse than saying so here.
+          return unsupported("mbarrier." + p2 + " (transaction counting needs cp.async.bulk/TMA, "
+                             "which is not implemented)");
+        else return unsupported("mbarrier modifier '." + p2 + "'");
+      }
+      if (!have_op) return unsupported("mbarrier form");
+      (void)saw_shared;  // an mbarrier is a shared object whether or not it says so
+      // init and inval take no destination; everything else writes one.
+      if (op.op != MbarOp::Init && op.op != MbarOp::Inval) {
+        op.dst = expect_reg_operand("mbarrier destination");
+        expect_punct(",");
+      }
+      op.addr = parse_addr(fn);
+      if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
+        return unsupported("mbarrier through a parameter/slot name");
+      if (peek_punct(",")) {
+        next();
+        if (op.op == MbarOp::TestWait || op.op == MbarOp::TryWait) {
+          op.state = parse_operand();
+          op.have_state = true;
+        } else {
+          op.count = parse_operand();
+          op.have_count = true;
+        }
+      }
+      if (op.op == MbarOp::Init && !op.have_count)
+        return unsupported("mbarrier.init without an expected arrival count");
+      ins.op = op;
     } else if (op0 == "match") {
       // match.any.sync.b32 d, a, membermask
       // match.all.sync.b32 d|p, a, membermask

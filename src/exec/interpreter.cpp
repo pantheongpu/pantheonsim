@@ -90,6 +90,23 @@ struct BarrierReduction {
   bool complete = false;  // set when the barrier released; cleared when drained
 };
 
+// One mbarrier object. Lives in a side table keyed by its shared-memory
+// address rather than in the shared bytes themselves: PTX says the contents
+// are opaque, no kernel may read them as data, and keeping the real state
+// outside means a kernel that does read them cannot accidentally appear to
+// work.
+struct Mbarrier {
+  uint64_t expected = 0;   // arrivals per phase, from mbarrier.init
+  uint64_t arrived = 0;    // arrivals so far in the current phase
+  uint32_t phase = 0;      // flips each time the count is met
+  bool valid = false;      // false before init and after inval
+};
+
+// Every mbarrier a block has initialized, by shared address.
+struct MbarrierTable {
+  std::unordered_map<uint64_t, Mbarrier> bars;
+};
+
 // Shadow state for shared memory, one entry per 4-byte word, used only when
 // race detection is on.
 //
@@ -128,6 +145,7 @@ struct BlockCtx {
   // leaves it undefined, VirtualGPU makes it deterministic (documented).
   std::vector<uint8_t>* shared = nullptr;
   BarrierReduction* bar_red = nullptr;
+  MbarrierTable* mbar = nullptr;
   SharedShadow* shadow = nullptr;   // non-null only when race detection is on
   // Backs %clock/%clock64/%globaltimer. Advanced once per warp instruction,
   // per block -- see the note at sreg_value() for why this is a counter and
@@ -171,6 +189,12 @@ struct Warp {
   // instruction re-executes when the barrier releases, and this is how it knows
   // to collect rather than contribute a second time.
   bool bar_red_waiting = false;
+  // Set by an mbarrier wait that came back incomplete. The warp stays Ready --
+  // the wait is a predicate and the kernel is free to spin on it -- but it
+  // gives up the rest of its turn so the warps it is waiting for can run. With
+  // the deterministic scheduler a turn otherwise lasts until the warp blocks,
+  // and a spin never blocks, so the first waiter would hold the block forever.
+  bool yield_now = false;
   // Live paths. Reconvergence is by *lowest program counter*: the path with
   // the smallest pc always runs next, and paths that arrive at the same pc are
   // merged. For the structured control flow compilers emit, that reconverges
@@ -415,6 +439,7 @@ class Interpreter {
     BlockCtx ctx;
     std::vector<uint8_t> shared;
     BarrierReduction bar_red;
+    MbarrierTable mbar;
     SharedShadow shadow;
     std::vector<Warp> warps;
     uint64_t clock = 0;
@@ -427,6 +452,7 @@ class Interpreter {
     b.shared.assign(fn_.static_shared_size + cfg_.shared_bytes, 0);
     b.ctx.shared = &b.shared;
     b.ctx.bar_red = &b.bar_red;
+    b.ctx.mbar = &b.mbar;
     b.ctx.clock = &b.clock;
     if (detect_races() && !b.shared.empty()) {
       b.shadow.words.assign(b.shared.size() / 4 + 1, WordShadow{});
@@ -537,6 +563,10 @@ class Interpreter {
       if (slice && issued++ >= slice) return;
       if (w.paths.empty()) {
         w.state = Warp::State::Done;
+        return;
+      }
+      if (w.yield_now) {
+        w.yield_now = false;
         return;
       }
       size_t idx = select_path(w);
@@ -1797,6 +1827,10 @@ class Interpreter {
           r[lane] = static_cast<uint32_t>(shifted & 0xffffffffull);
         }
       write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpMbarrier>(&ins.op)) {
+      exec_mbarrier(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpMatch>(&ins.op)) {
@@ -3518,6 +3552,137 @@ class Interpreter {
         for (size_t e = 0; e < n; ++e)
           store_routed(w, ctx, ins, lane, addr + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
       }
+  }
+
+  // mbarrier: a split barrier. Arriving and waiting are different
+  // instructions, so nothing here blocks -- a wait answers with a predicate
+  // and the kernel spins, which is what it does on hardware. The scheduler
+  // preempts a spinning warp after its slice, the other warps run and arrive,
+  // and the spinner then sees the phase flip. A spin that can never be
+  // satisfied is caught by the step budget rather than hanging.
+  void exec_mbarrier(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMbarrier& op,
+                     Mask m) {
+    if (!ctx.mbar)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, "mbarrier outside a block context");
+    Lanes _s_base;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
+    const uint64_t sbase = space_base(Space::Shared);
+
+    // All lanes of a warp address the same barrier in every use this has been
+    // seen in, but that is a convention rather than a rule, so the address is
+    // taken per lane and lanes are grouped by it.
+    uint32_t lead = W_;
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) { lead = lane; break; }
+    if (lead >= W_) return;
+    const uint64_t addr = sbase + base[lead] + static_cast<uint64_t>(op.addr.offset);
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) {
+        const uint64_t a2 = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+        if (a2 != addr)
+          ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                   "mbarrier with a different address per lane is not supported");
+      }
+    if (addr % 8 != 0)
+      ctx_fail(ins, -1, Err::MisalignedAccess, "an mbarrier must be 8-byte aligned");
+
+    Mbarrier& b = ctx.mbar->bars[addr];
+    const uint32_t lanes = popcount_mask(m);
+
+    auto require_valid = [&]() {
+      if (!b.valid)
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "this mbarrier has not been initialized (or was invalidated); "
+                 "mbarrier.init must run, and be visible to this thread, first");
+    };
+
+    switch (op.op) {
+      case MbarOp::Init: {
+        Lanes _s_c;
+        const Lanes& c = read_operand(w, ctx, ins, op.count, _s_c);
+        const uint64_t want = c[lead];
+        if (want == 0)
+          ctx_fail(ins, -1, Err::UnsupportedPtx, "mbarrier.init with an expected count of 0");
+        b = Mbarrier{};
+        b.expected = want;
+        b.valid = true;
+        return;
+      }
+      case MbarOp::Inval:
+        b.valid = false;
+        return;
+      case MbarOp::Arrive:
+      case MbarOp::ArriveDrop: {
+        require_valid();
+        // Every active lane is a thread, and each arrives once -- or `count`
+        // times when the instruction carries one. Counting the warp as a
+        // single arrival is the mistake that makes a barrier initialized to
+        // blockDim.x never complete.
+        uint64_t inc = lanes;
+        if (op.have_count) {
+          Lanes _s_c;
+          const Lanes& c = read_operand(w, ctx, ins, op.count, _s_c);
+          inc = 0;
+          for (uint32_t lane = 0; lane < W_; ++lane)
+            if (m & (Mask{1} << lane)) inc += c[lane];
+        }
+        // The token names the phase this arrival belongs to, which is the
+        // phase a later test_wait asks about. Captured before any flip.
+        const uint64_t token = b.phase & 1u;
+        b.arrived += inc;
+        if (b.arrived >= b.expected) {
+          // A phase can be over-subscribed only by a malformed kernel; the
+          // surplus carries into the next phase rather than being dropped,
+          // which is what the hardware counter does.
+          b.arrived -= b.expected;
+          b.phase ^= 1u;
+        }
+        if (op.op == MbarOp::ArriveDrop) {
+          // arrive_drop also removes this thread from every later phase.
+          b.expected = inc >= b.expected ? 0 : b.expected - inc;
+          if (b.expected == 0) b.valid = false;
+        }
+        Lanes r;
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) r[lane] = token;
+        write_reg(w, op.dst, m, r, 64);
+        return;
+      }
+      case MbarOp::TestWait:
+      case MbarOp::TryWait: {
+        require_valid();
+        Mask& p = pred_slot(w, op.dst);
+        if (!op.have_state)
+          ctx_fail(ins, -1, Err::UnsupportedPtx,
+                   "mbarrier.test_wait/try_wait needs a state token or a phase parity");
+        Lanes _s_st;
+        const Lanes& st = read_operand(w, ctx, ins, op.state, _s_st);
+        for (uint32_t lane = 0; lane < W_; ++lane) {
+          if (!(m & (Mask{1} << lane))) continue;
+          // Both forms ask the same question: has the phase named by the
+          // operand finished? It has exactly when the barrier has moved on
+          // from it, so the test is a difference, not an equality -- and
+          // getting that backwards produces a wait that returns true
+          // immediately and a pipeline that reads a buffer nobody filled.
+          const uint32_t want = static_cast<uint32_t>(st[lane]) & 1u;
+          const bool complete = (b.phase & 1u) != want;
+          p = complete ? (p | (Mask{1} << lane)) : (p & ~(Mask{1} << lane));
+          // Not yet: give up the rest of this turn so whoever we are waiting
+          // for gets to run. The warp remains Ready and will re-test.
+          if (!complete) w.yield_now = true;
+        }
+        return;
+      }
+      case MbarOp::PendingCount: {
+        require_valid();
+        Lanes r;
+        const uint64_t pending = b.expected > b.arrived ? b.expected - b.arrived : 0;
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) r[lane] = pending;
+        write_reg(w, op.dst, m, r, 32);
+        return;
+      }
+    }
   }
 
   void exec_atom(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
