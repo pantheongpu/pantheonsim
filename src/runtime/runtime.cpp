@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <utility>
 #include "vgpu/runtime/runtime.hpp"
 
 #include <chrono>
@@ -192,6 +194,24 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
                (unsigned long long)cls(exec::InstClass::Tensor),
                (unsigned long long)cls(exec::InstClass::Misc),
                (unsigned long long)st.tensor_instructions);
+
+  // Per-opcode issues, most-used first. The class histogram says a kernel is
+  // memory-heavy; this says it is memory-heavy because of ld.global.nc, which
+  // is the difference between a number and a lead. Truncated because a long
+  // tail of ones is noise, and the total says what was left out.
+  const auto& names = ptx::opcode_names();
+  std::vector<std::pair<uint64_t, std::string>> ops;
+  for (size_t i = 1; i < st.inst_by_opcode.size() && i < names.size(); ++i)
+    if (st.inst_by_opcode[i]) ops.emplace_back(st.inst_by_opcode[i], names[i]);
+  if (!ops.empty()) {
+    std::sort(ops.begin(), ops.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string line = "    by opcode";
+    const size_t show = std::min<size_t>(ops.size(), 10);
+    for (size_t i = 0; i < show; ++i)
+      line += " " + ops[i].second + "=" + std::to_string(ops[i].first);
+    if (ops.size() > show) line += "  (+" + std::to_string(ops.size() - show) + " more)";
+    std::fprintf(stderr, "%s\n", line.c_str());
+  }
 }
 
 }  // namespace

@@ -32,6 +32,8 @@ int usage(FILE* to) {
                "  vgpu run [opts] <program> [args...]  Run a program against VirtualGPU, with the\n"
                "                                       simulator's CUDA libraries in front of the\n"
                "                                       real ones (vgpu run --help for options)\n"
+               "  vgpu counters                        What performance counters this reports, and\n"
+               "                                       which it cannot, with the reason\n"
                "  vgpu test --matrix <program> [args]  Run a program on every device profile and\n"
                "                                       compare the results (vgpu test --help)\n"
                "  vgpu shell                           Interactive machine simulator: pick a GPU,\n"
@@ -49,6 +51,58 @@ std::string json_escape(const std::string& s) {
     out += c;
   }
   return out;
+}
+
+// `vgpu counters` — what this engine can and cannot report, and why.
+//
+// The question this answers is "which performance counters do you have for my
+// GPU", and the honest answer has two halves that are easy to blur. Everything
+// here is counted exactly, from what the program actually executed, and is
+// therefore identical on every device profile -- these are not hardware
+// counters sampled from a particular chip's monitors. Everything a real
+// profiler reports that is missing is missing for one reason: it is derived
+// from timing, and there is no timing model to derive it from.
+//
+// Printing both lists together is the point. A gap that is written down is a
+// design decision; a gap you discover by its absence is a defect.
+int cmd_counters() {
+  struct Row { const char* name; const char* what; };
+  static const Row kProduced[] = {
+      {"blocks, warps", "launched"},
+      {"instructions", "warp-level issues, the quantity a profiler calls inst_executed"},
+      {"thread_instructions", "summed over active lanes; the ratio to the above is divergence"},
+      {"inst_by_class", "nine classes that partition every instruction"},
+      {"inst_by_opcode", "per-mnemonic issues, most-used first"},
+      {"tensor_instructions", "mma issues, per warp rather than per lane"},
+      {"divergent_branches", "branches where the active mask actually split"},
+      {"global/shared/local loads, stores, bytes", "per space, per active lane"},
+      {"atomics, atomic_bytes", "read-modify-writes and the traffic they moved"},
+      {"barriers", "bar.sync executions, per warp"},
+      {"global_sectors, local_sectors", "32-byte sectors touched, counted from the addresses"},
+      {"global/shared/local_requests", "the denominator for coalescing"},
+      {"shared_bank_conflicts", "extra passes serialization forced"},
+  };
+  static const Row kAbsent[] = {
+      {"cycles, IPC, elapsed time", "there is no timing model; %clock64 is a monotonic counter"},
+      {"achieved occupancy", "derived from residency over time"},
+      {"warp stall reasons", "requires modelling issue and dependency stalls"},
+      {"L1/L2/texture hit rates", "there is no cache model"},
+      {"DRAM read/write throughput", "requires a memory-hierarchy and timing model"},
+      {"issue slot utilisation", "same"},
+      {"instruction replay", "a hardware recovery mechanism, not a program property"},
+  };
+  std::printf("Counters VirtualGPU reports. Every one is counted exactly from what the\n"
+              "program executed, not sampled -- so they are reproducible run to run, and\n"
+              "identical on every device profile. They are not hardware counters.\n\n");
+  for (const Row& r : kProduced) std::printf("  %-42s %s\n", r.name, r.what);
+  std::printf("\nWhat a hardware profiler reports and this does not, with the reason.\n"
+              "These are absent by decision: producing them would mean inventing a\n"
+              "timing model, and a plausible wrong number is worse than no number.\n\n");
+  for (const Row& r : kAbsent) std::printf("  %-42s %s\n", r.name, r.what);
+  std::printf("\nTurn the reported ones on with VGPU_COUNTERS=1.\n"
+              "The CUPTI shim advertises zero event domains and zero metrics for the\n"
+              "same reason: nvprof gets real activity records and no counters.\n");
+  return 0;
 }
 
 int cmd_list_gpus() {
@@ -157,6 +211,7 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (cmd == "list-gpus") return cmd_list_gpus();
+    if (cmd == "counters") return cmd_counters();
     if (cmd == "smi") return cmd_smi({args.begin() + 1, args.end()});
     if (cmd == "serve") return cmd_serve({args.begin() + 1, args.end()});
     if (cmd == "shell") return cmd_shell({args.begin() + 1, args.end()});

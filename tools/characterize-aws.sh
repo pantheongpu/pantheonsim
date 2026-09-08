@@ -173,11 +173,19 @@ $SSH 'set -e
   for t in ptx_semantics control_flow; do
     nvcc -std=c++14 -arch=sm_$ARCH -Wno-deprecated-gpu-targets $t.cu -o $t 2>/dev/null && ./$t > $t.ref.txt
   done
+  # The metrics this device actually exposes. Not to implement them -- most are
+  # timing-derived and this engine has no timing model -- but so the gap is
+  # per-device data rather than a general claim. "An L4 exposes N metrics and
+  # VirtualGPU produces these M" is checkable; "we do not model timing" is a
+  # footnote someone has to take on trust.
+  (ncu --query-metrics 2>/dev/null || nv-nsight-cu-cli --query-metrics 2>/dev/null || true) \
+    > metrics.txt
+  echo "METRICS=$(wc -l < metrics.txt)"
   echo "SM_ARCH=$ARCH"
 ' > "$outdir/${type_name}.run.log" 2>&1
 head -3 "$outdir/${type_name}.run.log"
 
-for f in profile.yaml ptx_semantics.ref.txt control_flow.ref.txt; do
+for f in profile.yaml ptx_semantics.ref.txt control_flow.ref.txt metrics.txt; do
   scp -i "$key_file" -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
       ubuntu@"$IP":/tmp/$f "$outdir/${type_name}.${f/profile.yaml/yaml}" 2>/dev/null
 done

@@ -389,7 +389,18 @@ struct Instr {
   Reg pred;
   Op op;
   std::string text;                // original source text, for diagnostics
+  // The base mnemonic, interned at parse time: "add" for add.cc.u32, "ld" for
+  // ld.global.nc.f32. Counting by this gives a per-opcode histogram, which is
+  // finer than the nine instruction classes and is what a profiler's
+  // instruction mix actually looks like. Interned rather than stored as a
+  // string because it is read once per executed instruction.
+  uint16_t opcode_id = 0;
 };
+
+// The opcode table the ids index. Grown at parse time and never shrunk, so an
+// id stays valid for the life of the process.
+uint16_t intern_opcode(const std::string& mnemonic);
+const std::vector<std::string>& opcode_names();
 
 struct ParamDecl {
   std::string name;

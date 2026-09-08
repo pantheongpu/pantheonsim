@@ -81,6 +81,9 @@ $SSH 'set -e
   for t in ptx_semantics control_flow; do
     nvcc -std=c++14 -arch=sm_$ARCH -Wno-deprecated-gpu-targets $t.cu -o $t 2>/dev/null && ./$t > $t.ref.txt
   done
+  # The metrics this device exposes -- see the note in characterize-aws.sh.
+  (ncu --query-metrics 2>/dev/null || true) > metrics.txt
+  echo "METRICS=$(wc -l < metrics.txt)"
   echo "SM_ARCH=$ARCH"
 ' > "$outdir/${type_name}.run.log" 2>&1
 cat "$outdir/${type_name}.run.log" | head -3

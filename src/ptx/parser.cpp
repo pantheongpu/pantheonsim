@@ -815,6 +815,12 @@ class Parser {
       fail_unsupported(ins.line, reconstruct_from(start_tok), fn.name, hint);
     };
 
+    // Interned here rather than at each instruction's own construction site:
+    // there are dozens of those and the first attempt reached two of them, so
+    // the histogram counted almost nothing. This is the one point every
+    // instruction passes through with its mnemonic in hand.
+    ins.opcode_id = intern_opcode(parts[0]);
+
     const std::string& op0 = parts[0];
     if (op0 == "ld" || op0 == "st") {
       Space space = Space::Generic;
@@ -1532,6 +1538,7 @@ class Parser {
         ins.op = op;
         expect_punct(";");
         ins.text = reconstruct_from(start_tok);
+        ins.opcode_id = intern_opcode(parts[0]);
         return ins;
       }
       if (ty.kind == Type::Kind::Pred) {

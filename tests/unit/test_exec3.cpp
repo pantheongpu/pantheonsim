@@ -1643,6 +1643,69 @@ DONE:
 }
 )";
 
+VTEST(the_per_opcode_histogram_counts_every_mnemonic) {
+  // Nine classes say a kernel is memory-heavy; this says which instruction
+  // made it so. The first attempt at this interned the opcode at two of the
+  // parser's dozens of construction sites and counted almost nothing, so the
+  // test checks specific mnemonics rather than a non-empty total.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 1;
+    add.s32 %r2, %r1, 1;
+    add.s32 %r3, %r2, 1;
+    add.s32 %r4, %r3, 1;
+    st.global.u32 [%rd2], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  auto st = exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{4});
+
+  const auto& names = vgpu::ptx::opcode_names();
+  auto count_of = [&](const char* mnemonic) -> uint64_t {
+    for (size_t i = 1; i < names.size() && i < st.inst_by_opcode.size(); ++i)
+      if (names[i] == mnemonic) return st.inst_by_opcode[i];
+    return 0;
+  };
+  VCHECK_EQ(count_of("add"), uint64_t{3});
+  VCHECK_EQ(count_of("st"), uint64_t{1});
+  VCHECK_EQ(count_of("ret"), uint64_t{1});
+  VCHECK_EQ(count_of("cvta"), uint64_t{1});
+  // And the histogram sums to the warp-level issue count, which is what makes
+  // it comparable with `instructions` rather than a separate accounting.
+  uint64_t total = 0;
+  for (uint64_t n : st.inst_by_opcode) total += n;
+  VCHECK_EQ(total, st.instructions);
+}
+
+VTEST(merging_per_thread_counters_folds_the_opcode_histogram_too) {
+  // inst_by_opcode is a vector, not a uint64_t, so it sits outside the block
+  // that add() walks by reinterpretation. Folding it by hand is the part that
+  // is easy to forget -- and forgetting it leaves the histogram reading zero
+  // on any multi-threaded launch however carefully it was collected.
+  vgpu::exec::LaunchStats a, b;
+  a.instructions = 10;
+  a.inst_by_opcode = {0, 5, 3};
+  b.instructions = 4;
+  b.inst_by_opcode = {0, 1, 0, 7};  // longer than a's, so it must grow
+  a.add(b);
+  VCHECK_EQ(a.instructions, uint64_t{14});
+  VCHECK_EQ(a.inst_by_opcode.size(), size_t{4});
+  VCHECK_EQ(a.inst_by_opcode[1], uint64_t{6});
+  VCHECK_EQ(a.inst_by_opcode[2], uint64_t{3});
+  VCHECK_EQ(a.inst_by_opcode[3], uint64_t{7});
+}
+
 // ---- scheduler modes ----
 //
 // A kernel with a read-modify-write race between two warps through *global*

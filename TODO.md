@@ -380,6 +380,47 @@ what is done.
   `vgpu test --matrix`, shared-memory race detection, the random and
   adversarial schedulers, and fault injection are done.)
 
+## Registers and counters: what is modelled, and what cannot be
+
+Two questions that look alike and are not.
+
+**Special registers are per *architecture*, not per GPU model.** `%tid`,
+`%laneid`, `%smid` and `%clock64` are PTX ISA instructions, identical on a T4
+and a B200. What varies is which exist -- the ten thread-block cluster
+registers require sm_90 -- and what they return, which is already profile
+driven (`%nsmid` is 132 on an H100 and 58 on an L4). 24 of ~39 are implemented.
+The cluster ten are the real gap and need a scheduling level between block and
+grid, which is the same thing `wgmma` needs. `%pm0`-`%pm7` stay refused on
+purpose: they are undefined unless a profiler configured them, so a silent zero
+would be a confidently wrong answer.
+
+**Performance counters here are not hardware counters, and so are the same on
+every profile by construction.** `global_sectors` is computed from the
+addresses every lane issued, not read from a monitor wired into one chip's
+memory subsystem. That is why it is exact and reproducible where a device's is
+sampled and moves between runs -- and why it does not vary by GPU. Real
+hardware counter sets do differ per chip, which is a fact about physical
+monitors rather than about programs.
+
+So "support all counters for every GPU" is not achievable and not desirable:
+the ones that differ per device are overwhelmingly timing-derived -- cycles,
+stall reasons, hit rates, DRAM throughput -- and producing them would mean
+inventing a timing model. `vgpu counters` prints both lists, what is reported
+and what is not with the reason for each, because a gap that is written down is
+a decision and a gap you find by its absence is a defect.
+
+What was added rather than argued about: a per-opcode histogram
+(`inst_by_opcode`) alongside the nine classes, since knowing a kernel is
+memory-heavy is less useful than knowing it is memory-heavy because of
+`ld.global.nc`. And the characterization scripts now capture `ncu
+--query-metrics` from each physical device, so the boundary becomes per-device
+data -- "an L4 exposes N metrics, this produces M" is checkable -- rather than
+a claim to be taken on trust.
+
+Still countable and still missing: register-spill traffic split out from
+ordinary local traffic, and predicated-off lanes as a first-class number
+(derivable today from `instructions * 32 - thread_instructions`).
+
 ## Performance
 
 Two changes moved the needle most recently, both found by profiling rather than

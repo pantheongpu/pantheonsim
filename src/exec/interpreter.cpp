@@ -518,6 +518,13 @@ class Interpreter {
       stats_.inst_by_class[static_cast<size_t>(cls)] += lanes;
       if (cls == InstClass::Tensor) ++stats_.tensor_instructions;
       if (ctx.clock) ++*ctx.clock;
+      // Per-opcode issue count, alongside the class histogram. Counted per
+      // warp-level issue like `instructions`, so the two are comparable.
+      if (ins.opcode_id) {
+        if (ins.opcode_id >= stats_.inst_by_opcode.size())
+          stats_.inst_by_opcode.resize(ins.opcode_id + 1u, 0);
+        ++stats_.inst_by_opcode[ins.opcode_id];
+      }
       if (++stats_.instructions > cfg_.max_steps)
         throw Error::make(Err::ExecLimit, "kernel '", fn_.name, "' exceeded the launch step budget (",
                           cfg_.max_steps, " instructions) — possible infinite loop");
