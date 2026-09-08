@@ -391,10 +391,14 @@ struct OpF16x2Neg { bool bf16 = false; bool packed = true; Reg dst; Operand src;
 // hardware-matching results; kernels that depend on NVIDIA's exact
 // undocumented element distribution may differ. Documented in ARCHITECTURE.md.
 enum class MatLayout { Row, Col };
-// The element type of a WMMA A/B fragment. f16 and bf16 share the m16n16k16
-// shape but not the register count: f16 uses 8 registers per fragment and
-// duplicates the matrix across the warp, bf16 uses 4 and does not.
-enum class WmmaElem : uint8_t { F16, BF16 };
+// The element type of a WMMA A/B fragment, which decides both the register
+// count and the shape:
+//   f16   m16n16k16, 8 registers -- covers the 16x16 matrix twice, so lanes
+//         16-31 duplicate lanes 0-15
+//   bf16  m16n16k16, 4 registers -- covers it exactly once
+//   tf32  m16n16k8,  4 registers -- A is 16x8 and B is 8x16, so the two
+//         fragments do not even share an index map
+enum class WmmaElem : uint8_t { F16, BF16, TF32 };
 struct OpWmmaMma {
   WmmaElem elem = WmmaElem::F16;
   MatLayout alayout, blayout;

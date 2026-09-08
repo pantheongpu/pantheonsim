@@ -48,6 +48,21 @@ __global__ void gemm_bf16(float* d, const __nv_bfloat16* a, const __nv_bfloat16*
     wmma::store_matrix_sync(d, acc, 16, wmma::mem_row_major);
 }
 
+// tf32's m16n16k8 is a different shape entirely: A is 16x8 and B is 8x16, so
+// A and B do not share an index map and the layout cancellation the square
+// shapes rely on does not hold. Its load computes the address from the layout
+// directly, which is a separate code path worth its own answer.
+__global__ void gemm_tf32(float* d, const float* a, const float* b, const float* c) {
+    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> fa;
+    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> fb;
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc;
+    wmma::load_matrix_sync(fa, a, 8);
+    wmma::load_matrix_sync(fb, b, 8);
+    wmma::load_matrix_sync(acc, c, 16, wmma::mem_row_major);
+    wmma::mma_sync(acc, fa, fb, acc);
+    wmma::store_matrix_sync(d, acc, 16, wmma::mem_row_major);
+}
+
 int main() {
     half ha[256], hb[256];
     float hc[256], hd[256], ref[256];
@@ -119,8 +134,32 @@ int main() {
             ++bad;
         }
 
+    // tf32, k = 8. Small integers again, so tf32's 10-bit mantissa is exact
+    // and the reference is a plain integer product.
+    float ta[128], tb[128], tref[256];
+    for (int i = 0; i < 128; ++i) { ta[i] = float((i % 7) - 3); tb[i] = float((i % 5) - 2); }
+    for (int i = 0; i < 16; ++i)
+        for (int j = 0; j < 16; ++j) {
+            float acc = hc[i * 16 + j];
+            for (int k = 0; k < 8; ++k) acc += ta[i * 8 + k] * tb[j * 8 + k];
+            tref[i * 16 + j] = acc;
+        }
+    float *dta, *dtb;
+    cudaMalloc(&dta, sizeof ta); cudaMalloc(&dtb, sizeof tb);
+    cudaMemcpy(dta, ta, sizeof ta, cudaMemcpyHostToDevice);
+    cudaMemcpy(dtb, tb, sizeof tb, cudaMemcpyHostToDevice);
+    gemm_tf32<<<1, 32>>>(dd, dta, dtb, dc);
+    cudaDeviceSynchronize();
+    cudaMemcpy(hd, dd, sizeof hd, cudaMemcpyDeviceToHost);
+    for (int i = 0; i < 256; ++i)
+        if (hd[i] != tref[i]) {
+            if (bad < 12) std::printf("  tf32 [%d,%d] got %g want %g\n",
+                                      i / 16, i % 16, hd[i], tref[i]);
+            ++bad;
+        }
+
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::printf("cuda error: %s\n", cudaGetErrorString(e)); return 1; }
-    std::printf(bad ? "FAILED (%d of 768 wrong)\n" : "PASS\n", bad);
+    std::printf(bad ? "FAILED (%d of 1024 wrong)\n" : "PASS\n", bad);
     return bad ? 1 : 0;
 }

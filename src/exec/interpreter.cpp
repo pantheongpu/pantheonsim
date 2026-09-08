@@ -384,6 +384,18 @@ uint32_t double_to_fp8(double d, const Fp8Format& f, bool satfinite) {
   return sign | (static_cast<uint32_t>(e) << f.man_bits) | (man & man_mask);
 }
 
+// tf32 is f32's sign and exponent with the mantissa cut to 10 bits. Round to
+// nearest even rather than truncating: truncation biases every product toward
+// zero, which accumulates over a reduction into a visible error.
+float f32_to_tf32(float x) {
+  uint32_t b = std::bit_cast<uint32_t>(x);
+  if ((b & 0x7F800000u) == 0x7F800000u) return x;  // inf/NaN keep their payload
+  const uint32_t lsb = (b >> 13) & 1u;
+  b += 0x0FFFu + lsb;
+  b &= ~0x1FFFu;
+  return std::bit_cast<float>(b);
+}
+
 float f32(uint64_t bits) { return std::bit_cast<float>(static_cast<uint32_t>(bits)); }
 uint64_t f32bits(float f) { return std::bit_cast<uint32_t>(f); }
 double f64(uint64_t bits) { return std::bit_cast<double>(bits); }
@@ -3252,7 +3264,26 @@ class Interpreter {
     // Gather A and B (16x16 f16 each) and C (16x16 f32) from the warp.
     double A[kMmaDim][kMmaDim] = {}, B[kMmaDim][kMmaDim] = {}, C[kMmaDim][kMmaDim] = {};
     const bool bf = op.elem == WmmaElem::BF16;
-    const int ab_regs = bf ? 4 : 8;
+    const bool tf = op.elem == WmmaElem::TF32;
+    const int ab_regs = op.elem == WmmaElem::F16 ? 8 : 4;
+    // k is 8 for tf32's m16n16k8 and 16 otherwise.
+    const uint32_t K = tf ? 8u : kMmaDim;
+    if (tf) {
+      for (int reg = 0; reg < ab_regs; ++reg) {
+        Lanes _s_av;
+        const Lanes& av = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s_av);
+        Lanes _s_bv;
+        const Lanes& bv = read_operand(w, ctx, ins, Operand{RegOperand{op.b[reg]}}, _s_bv);
+        for (uint32_t lane = 0; lane < W_; ++lane) {
+          const uint32_t linear = lane * 4 + static_cast<uint32_t>(reg);
+          // A is 16x8, B is 8x16: different inner extents, so different maps.
+          const uint32_t ar = linear / 8u, ac = linear % 8u;
+          const uint32_t br = linear / kMmaDim, bc = linear % kMmaDim;
+          A[ar][ac] = f32(av[lane]);
+          B[br][bc] = f32(bv[lane]);
+        }
+      }
+    } else
     for (int reg = 0; reg < ab_regs; ++reg) {
       Lanes _s_av;
       const Lanes& av = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s_av);
@@ -3295,7 +3326,7 @@ class Interpreter {
     for (uint32_t i = 0; i < kMmaDim; ++i)
       for (uint32_t j = 0; j < kMmaDim; ++j) {
         float acc = static_cast<float>(C[i][j]);
-        for (uint32_t k = 0; k < kMmaDim; ++k)
+        for (uint32_t k = 0; k < K; ++k)
           acc += static_cast<float>(A[i][k]) * static_cast<float>(B[k][j]);
         D[i][j] = acc;
       }
@@ -3338,7 +3369,9 @@ class Interpreter {
     const uint64_t ld = stride[lead];
 
     const bool bf = op.elem == WmmaElem::BF16;
-    const int nregs = (op.which == OpWmmaLoad::Which::C || !bf) ? 8 : 4;
+    const bool tf = op.elem == WmmaElem::TF32;
+    const int nregs =
+        (op.which == OpWmmaLoad::Which::C || op.elem == WmmaElem::F16) ? 8 : 4;
     for (int reg = 0; reg < nregs; ++reg) {
       Lanes r;
       for (uint32_t lane = 0; lane < W_; ++lane) {
@@ -3349,6 +3382,21 @@ class Interpreter {
           const uint64_t elem = op.layout == MatLayout::Row ? (uint64_t{i} * ld + j)
                                                             : (uint64_t{j} * ld + i);
           r[lane] = load_routed(w, ctx, ins, lane, addr0 + elem * 4, 4);
+        } else if (tf) {
+          // m16n16k8: A is 16x8 and B is 8x16, so the two fragments do not
+          // share an index map and the square shapes' layout cancellation
+          // does not apply. The address is computed from the layout directly
+          // instead: row-major puts (r,c) at r*ld+c, column-major at c*ld+r.
+          const uint32_t linear = lane * 4 + static_cast<uint32_t>(reg);
+          const uint32_t inner = op.which == OpWmmaLoad::Which::A ? 8u : kMmaDim;
+          const uint32_t rr = linear / inner, cc = linear % inner;
+          const uint64_t elem = op.layout == MatLayout::Row ? (uint64_t{rr} * ld + cc)
+                                                            : (uint64_t{cc} * ld + rr);
+          const uint64_t bits = load_routed(w, ctx, ins, lane, addr0 + elem * 4, 4);
+          // tf32 keeps f32's exponent and 10 mantissa bits. Rounding to that
+          // here is what the hardware fragment holds; keeping all 23 would
+          // make the simulator more accurate than the part it stands in for.
+          r[lane] = f32bits(f32_to_tf32(f32(bits)));
         } else {
           uint64_t packed = 0;
           for (int h = 0; h < 2; ++h) {

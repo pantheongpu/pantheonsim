@@ -1153,6 +1153,7 @@ class Parser {
       char frag = 0;
       bool saw_f32 = false;
       WmmaElem elem = WmmaElem::F16;
+      bool k8 = false;
       for (size_t i = 2; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "sync" || p == "aligned") ;
@@ -1165,17 +1166,27 @@ class Parser {
         else if (p == "shared") space = Space::Shared;
         else if (p == "f16") ;
         else if (p == "bf16") elem = WmmaElem::BF16;
-        else if (p == "tf32" || p == "m16n16k8" || p == "m8n32k16" || p == "m32n8k16")
-          // tf32 brings a non-square shape (m16n16k8: A is 16x8, B is 8x16), and
-          // the layout cancellation the square shapes rely on does not hold
-          // there -- a load formula that ignores the layout reads the wrong
-          // element. Refused by name rather than guessed at.
-          return unsupported("wmma shape/type '." + p + "' (only m16n16k16 with f16 or bf16 "
-                             "is implemented)");
+        else if (p == "tf32") { elem = WmmaElem::TF32; }
+        else if (p == "m16n16k8") { shape_ok = true; k8 = true; }
+        else if (p == "m8n32k16" || p == "m32n8k16")
+          // The rectangular m8n32/m32n8 variants of the 16-deep shape. Their
+          // fragments are laid out differently again, and nothing has needed
+          // them yet, so they say so rather than being approximated.
+          return unsupported("wmma shape '." + p + "' (only m16n16k16 and m16n16k8 "
+                             "are implemented)");
         else return unsupported("wmma modifier '." + p + "' (only m16n16k16 f16/bf16 with an "
                                 "f32 accumulator is implemented)");
       }
-      if (!shape_ok) return unsupported("only the m16n16k16 wmma shape is implemented");
+      if (!shape_ok) return unsupported("only the m16n16k16 and m16n16k8 wmma shapes "
+                                        "are implemented");
+      // The implication only runs one way. `.tf32` always means m16n16k8, but
+      // m16n16k8 does not always mention tf32: the accumulator load and the
+      // store carry only `.f32`, because the C and D fragments are f32
+      // whatever the input type was. Requiring both tokens rejected
+      // wmma.load.c.m16n16k8.f32, which is most of a tf32 kernel.
+      if (elem == WmmaElem::TF32 && !k8)
+        return unsupported("wmma .tf32 outside the m16n16k8 shape");
+      if (k8 && (frag == 'a' || frag == 'b')) elem = WmmaElem::TF32;
       if (kind == "mma") {
         if (layouts.size() != 2) return unsupported("wmma.mma needs both A and B layouts");
         OpWmmaMma op;
@@ -1192,7 +1203,7 @@ class Parser {
         // f16 fragments duplicate the matrix across the warp and take 8
         // registers; bf16 does not and takes 4. The accumulator is 8 either
         // way, being 16x16 f32 over 32 lanes.
-        const size_t ab = elem == WmmaElem::BF16 ? 4u : 8u;
+        const size_t ab = elem == WmmaElem::F16 ? 8u : 4u;
         if (op.d.size() != 8 || op.c.size() != 8 || op.a.size() != ab || op.b.size() != ab)
           return unsupported("wmma.mma fragment arity (expected " + std::to_string(ab) +
                              " A/B registers and 8 accumulator registers)");
