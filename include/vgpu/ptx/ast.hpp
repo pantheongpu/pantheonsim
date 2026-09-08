@@ -239,6 +239,28 @@ struct OpMma {
 // ordinary mov path that writes a 32/64-bit value.
 struct OpMovPred { Reg dst; Operand src; };
 struct OpPrmt { Reg dst; Operand a, b, c; };       // byte permute (default mode)
+// lop3.b32 d, a, b, c, immLut -- an arbitrary three-input boolean function,
+// selected by an 8-bit lookup table. ptxas fuses chains of and/or/xor/not into
+// these, so optimized PTX is full of them: any kernel doing bit manipulation,
+// masking or predicate packing tends to arrive as lop3 rather than as the
+// operations it was written with.
+//
+// immLut is the truth table itself. Bit k of the table is the result when
+// (a,b,c) supply the bits of k, which is why the canonical way to compute it
+// is to evaluate the expression on the constants 0xF0, 0xCC, 0xAA -- and why
+// evaluating it that way at runtime, bit-parallel across all 32 positions at
+// once, is exact rather than a table walk.
+struct OpLop3 { Reg dst; Operand a, b, c; uint8_t lut = 0; };
+// slct.dtype.stype d, a, b, c -- a if c >= 0 else b. The selector is compared
+// as a signed integer or a float depending on stype, and picking the wrong one
+// gets -0.0 backwards.
+struct OpSlct { Type ty; bool c_is_float = false; Reg dst; Operand a, b, c; };
+// testp.op.ftype p, a -- floating-point classification (finite, infinite, nan,
+// number, normal, subnormal). isfinite()/isnan() lower to these.
+enum class TestpOp : uint8_t { Finite, Infinite, Number, NotANumber, Normal, Subnormal };
+struct OpTestp { TestpOp op = TestpOp::Finite; Type ty; Reg dst; Operand a; };
+// sad.type d, a, b, c -- |a-b| + c, the sum-of-absolute-differences step.
+struct OpSad { Type ty; Reg dst; Operand a, b, c; };
 // copysign.f32/f64 d, a, b -- magnitude of b with the sign of a.
 struct OpCopysign { Type ty; Reg dst; Operand a, b; };
 // dp4a.{u32,s32}.{u32,s32} d, a, b, c -- four byte-wise products of a and b
@@ -397,7 +419,7 @@ struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpActiveMask>;
 

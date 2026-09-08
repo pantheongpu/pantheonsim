@@ -1939,6 +1939,141 @@ VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{512 + 256});
 }
 
+VTEST(lop3_computes_the_truth_table_it_is_given) {
+  // ptxas fuses bitwise chains into lop3, so optimized PTX is full of these
+  // and a wrong truth table is a wrong mask rather than a crash. The immLut
+  // values here are the canonical ones: evaluate the expression on
+  // a=0xF0, b=0xCC, c=0xAA and the result is the table.
+  //   0xF8 = a | (b & c)      0x96 = a ^ b ^ c
+  //   0xFE = a | b | c        0x80 = a & b & c
+  //   0x01 = ~(a | b | c)
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 4042322160;      // 0xF0F0F0F0
+    mov.u32 %r2, 3435973836;      // 0xCCCCCCCC
+    mov.u32 %r3, 2863311530;      // 0xAAAAAAAA
+    lop3.b32 %r4, %r1, %r2, %r3, 0xf8;
+    lop3.b32 %r5, %r1, %r2, %r3, 0x96;
+    lop3.b32 %r6, %r1, %r2, %r3, 0xfe;
+    lop3.b32 %r7, %r1, %r2, %r3, 0x80;
+    lop3.b32 %r8, %r1, %r2, %r3, 0x01;
+    st.global.u32 [%rd2], %r4;
+    st.global.u32 [%rd2+4], %r5;
+    st.global.u32 [%rd2+8], %r6;
+    st.global.u32 [%rd2+12], %r7;
+    st.global.u32 [%rd2+16], %r8;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  const uint32_t a = 0xF0F0F0F0u, b = 0xCCCCCCCCu, c = 0xAAAAAAAAu;
+  // This one is also the defining property of the encoding: feeding the
+  // canonical constants back in returns the table itself, 0xF8 repeated. The
+  // first draft of this test asserted a & (b | c) here, which is 0xE0's table,
+  // not 0xF8's -- the check caught the comment, not the code.
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{a | (b & c)});
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0xF8F8F8F8u});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{a ^ b ^ c});
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{a | b | c});
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), uint64_t{a & b & c});
+  VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{~(a | b | c) & 0xFFFFFFFFu});
+}
+
+VTEST(slct_testp_and_sad) {
+  // slct's selector is compared as a float when the source type says so, which
+  // is the case a bit comparison gets wrong: -0.0 has its sign bit set but is
+  // >= 0, so it must select a. NaN is not >= 0 and must select b.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<4>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.f32 %f1, 0f42C80000;      // 100.0 -> "a"
+    mov.f32 %f2, 0fC2C80000;      // -100.0 -> "b"
+    mov.f32 %f3, 0f80000000;      // -0.0 : >= 0, so picks a
+    mov.f32 %f4, 0f7FC00000;      // NaN  : not >= 0, so picks b
+    slct.f32.f32 %f5, %f1, %f2, %f3;
+    slct.f32.f32 %f6, %f1, %f2, %f4;
+    st.global.f32 [%rd2], %f5;
+    st.global.f32 [%rd2+4], %f6;
+    testp.finite.f32 %p0, %f4;
+    selp.b32 %r1, 1, 0, %p0;
+    testp.notanumber.f32 %p1, %f4;
+    selp.b32 %r2, 1, 0, %p1;
+    st.global.u32 [%rd2+8], %r1;
+    st.global.u32 [%rd2+12], %r2;
+    mov.u32 %r3, 7;
+    mov.u32 %r4, 20;
+    mov.u32 %r5, 5;
+    sad.u32 %r6, %r3, %r4, %r5;   // |7-20| + 5 = 18
+    st.global.u32 [%rd2+16], %r6;
+    mov.u32 %r7, 4294967286;      // -10 as s32
+    mov.u32 %r8, 5;
+    sad.s32 %r9, %r7, %r8, %r5;   // |-10-5| + 5 = 20
+    st.global.u32 [%rd2+20], %r9;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), 100.0f);      // -0.0 selects a
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 4, 4)), -100.0f); // NaN selects b
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{0});     // NaN is not finite
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), uint64_t{1});    // NaN is notanumber
+  VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{18});
+  VCHECK_EQ(e.mem.load_scalar(out + 20, 4), uint64_t{20});
+}
+
+VTEST(cache_hints_are_accepted_and_do_nothing) {
+  // prefetch and createpolicy say where data should be kept, never what a load
+  // returns, so with no cache model here honouring them and ignoring them are
+  // the same result -- and refusing the kernel would fail it over a
+  // performance note. createpolicy still has to write its destination, or the
+  // handle would be read later and diagnosed as read-before-write.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    prefetch.global.L2 [%rd2];
+    createpolicy.fractional.L2::evict_last.b64 %rd3, 1.0;
+    mov.u32 %r1, 42;
+    st.global.u32 [%rd2], %r1;
+    cvt.u32.u64 %r2, %rd3;
+    st.global.u32 [%rd2+4], %r2;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{42});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0});  // a policy nothing consults
+}
+
 VTEST(cluster_registers_tile_the_grid) {
   // A 2x2 cluster over a 4x2 grid is two clusters side by side. Every block
   // writes where it thinks it is, and the check is against the tiling worked

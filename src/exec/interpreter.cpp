@@ -1799,6 +1799,125 @@ class Interpreter {
       write_reg(w, op->dst, m, r, 32);
       return;
     }
+    if (const auto* op = std::get_if<OpLop3>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
+          // Evaluate the truth table bit-parallel. Each of the 8 table bits
+          // names one (a,b,c) combination; for the bits where the table says
+          // 1, OR in the mask of positions whose operand bits match that
+          // combination. Building that mask from a, b and c themselves does
+          // all 32 positions at once, so this is one pass rather than 32.
+          const uint32_t av = static_cast<uint32_t>(a[lane]);
+          const uint32_t bv = static_cast<uint32_t>(b[lane]);
+          const uint32_t cv = static_cast<uint32_t>(c[lane]);
+          uint32_t out = 0;
+          for (int k = 0; k < 8; ++k) {
+            if (!((op->lut >> k) & 1)) continue;
+            const uint32_t ma = (k & 4) ? av : ~av;
+            const uint32_t mb = (k & 2) ? bv : ~bv;
+            const uint32_t mc = (k & 1) ? cv : ~cv;
+            out |= ma & mb & mc;
+          }
+          r[lane] = out;
+        }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpSlct>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
+          bool take_a;
+          if (op->c_is_float) {
+            // NaN is not >= 0, so it selects b. Comparing the bits instead
+            // would put NaN on whichever side its sign bit fell.
+            const float f = f32(c[lane]);
+            take_a = f >= 0.0f;
+          } else {
+            take_a = static_cast<int32_t>(static_cast<uint32_t>(c[lane])) >= 0;
+          }
+          r[lane] = take_a ? a[lane] : b[lane];
+        }
+      write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpTestp>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Mask& dst = pred_slot(w, op->dst);
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
+          const double v = op->ty.bits == 64 ? f64(a[lane]) : static_cast<double>(f32(a[lane]));
+          const bool nan = std::isnan(v);
+          const bool inf = std::isinf(v);
+          // "Normal" excludes zero, subnormal, infinity and NaN -- and
+          // std::isnormal already means exactly that, including for zero,
+          // which is the case a hand-rolled exponent check usually gets wrong.
+          const bool normal = std::isnormal(v);
+          const bool subnormal = !nan && !inf && v != 0.0 && !normal;
+          bool t = false;
+          switch (op->op) {
+            case TestpOp::Finite: t = !nan && !inf; break;
+            case TestpOp::Infinite: t = inf; break;
+            case TestpOp::Number: t = !nan; break;
+            case TestpOp::NotANumber: t = nan; break;
+            case TestpOp::Normal: t = normal; break;
+            case TestpOp::Subnormal: t = subnormal; break;
+          }
+          dst = t ? (dst | (Mask{1} << lane)) : (dst & ~(Mask{1} << lane));
+        }
+      return;
+    }
+    if (const auto* op = std::get_if<OpSad>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
+      Lanes r;
+      const uint32_t bits = op->ty.bits;
+      const bool sgn = op->ty.kind == Type::Kind::S;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
+          uint64_t diff;
+          if (sgn) {
+            // Sign-extend to 64 bits first: the absolute difference of two
+            // 32-bit signed values does not fit in 32 bits, and truncating
+            // before the subtraction gets the wrap case wrong.
+            auto sext = [bits](uint64_t v) -> int64_t {
+              if (bits >= 64) return static_cast<int64_t>(v);
+              const uint64_t f = v & ((1ull << bits) - 1);
+              return (f & (1ull << (bits - 1)))
+                         ? static_cast<int64_t>(f | ~((1ull << bits) - 1))
+                         : static_cast<int64_t>(f);
+            };
+            const int64_t x = sext(a[lane]);
+            const int64_t y = sext(b[lane]);
+            diff = static_cast<uint64_t>(x > y ? x - y : y - x);
+          } else {
+            const uint64_t x = mask_to_bits(a[lane], bits);
+            const uint64_t y = mask_to_bits(b[lane], bits);
+            diff = x > y ? x - y : y - x;
+          }
+          r[lane] = mask_to_bits(diff + c[lane], bits);
+        }
+      write_reg(w, op->dst, m, r, bits);
+      return;
+    }
     if (const auto* op = std::get_if<OpPrmt>(&ins.op)) {
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);

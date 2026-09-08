@@ -1451,6 +1451,95 @@ class Parser {
       expect_punct(",");
       op.c = parse_operand();
       ins.op = op;
+    } else if (op0 == "lop3") {
+      // lop3.b32 d, a, b, c, immLut
+      if (parts.size() < 2 || parts[1] != "b32") return unsupported("lop3 form (only lop3.b32)");
+      OpLop3 op;
+      op.dst = expect_reg_operand("lop3 destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      expect_punct(",");
+      op.c = parse_operand();
+      expect_punct(",");
+      op.lut = static_cast<uint8_t>(expect_int("lop3 immLut"));
+      ins.op = op;
+    } else if (op0 == "slct") {
+      // slct.dtype.stype d, a, b, c. Only the selector's type matters to the
+      // comparison; the data type just says how wide the result is.
+      if (parts.size() != 3) return unsupported("slct form (expected slct.dtype.stype)");
+      OpSlct op;
+      auto slct_ty = parse_type_token(parts[1]);
+      if (!slct_ty) return unsupported("slct data type '." + parts[1] + "'");
+      op.ty = *slct_ty;
+      if (parts[2] == "s32") op.c_is_float = false;
+      else if (parts[2] == "f32") op.c_is_float = true;
+      else return unsupported("slct selector type '." + parts[2] + "' (only .s32 and .f32)");
+      op.dst = expect_reg_operand("slct destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      expect_punct(",");
+      op.c = parse_operand();
+      ins.op = op;
+    } else if (op0 == "testp") {
+      if (parts.size() != 3) return unsupported("testp form (expected testp.op.ftype)");
+      OpTestp op;
+      if (parts[1] == "finite") op.op = TestpOp::Finite;
+      else if (parts[1] == "infinite") op.op = TestpOp::Infinite;
+      else if (parts[1] == "number") op.op = TestpOp::Number;
+      else if (parts[1] == "notanumber") op.op = TestpOp::NotANumber;
+      else if (parts[1] == "normal") op.op = TestpOp::Normal;
+      else if (parts[1] == "subnormal") op.op = TestpOp::Subnormal;
+      else return unsupported("testp predicate '." + parts[1] + "'");
+      auto testp_ty = parse_type_token(parts[2]);
+      if (!testp_ty || !testp_ty->is_float() ||
+          (testp_ty->bits != 32 && testp_ty->bits != 64))
+        return unsupported("testp type '." + parts[2] + "' (only .f32 and .f64)");
+      op.ty = *testp_ty;
+      op.dst = expect_reg_operand("testp destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      ins.op = op;
+    } else if (op0 == "sad") {
+      if (parts.size() != 2) return unsupported("sad form (expected sad.type)");
+      OpSad op;
+      auto sad_ty = parse_type_token(parts[1]);
+      if (!sad_ty) return unsupported("sad type '." + parts[1] + "'");
+      op.ty = *sad_ty;
+      op.dst = expect_reg_operand("sad destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      expect_punct(",");
+      op.c = parse_operand();
+      ins.op = op;
+    } else if (op0 == "prefetch" || op0 == "prefetchu" || op0 == "createpolicy" ||
+               op0 == "applypriority" || op0 == "discard") {
+      // Cache-management hints. Every one of these says where data should be
+      // kept or how long, and nothing about what a load returns -- the same
+      // reason .L2::128B and .lu are already dropped. There is no cache model
+      // here, so honouring them and ignoring them produce identical results,
+      // and refusing the kernel over one would fail it for a performance note.
+      //
+      // createpolicy writes a register (the policy handle), so it cannot be
+      // skipped outright: an unwritten destination would be read later and
+      // diagnosed as read-before-write. It gets a zero handle, which is what a
+      // policy nothing consults is worth.
+      if (op0 == "createpolicy") {
+        OpMov mv;
+        mv.ty = Type{Type::Kind::B, 64};
+        mv.dst = expect_reg_operand("createpolicy destination");
+        mv.src = ImmInt{0};
+        ins.op = mv;
+        while (!at_end() && !peek_punct(";")) next();
+      } else {
+        while (!at_end() && !peek_punct(";")) next();
+        ins.op = OpNop{};
+      }
     } else if (op0 == "shf") {
       // shf.{l,r}.{wrap,clamp}.b32 d, a, b, c — funnel shift of b:a.
       if (parts.size() != 4 || (parts[1] != "l" && parts[1] != "r") ||
