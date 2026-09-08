@@ -1012,6 +1012,8 @@ class Parser {
       // cvt[.round][.sat][.ftz].<dstty>.<srcty>
       std::vector<Type> tys;
       std::string packed;  // "f16x2"/"bf16x2": two f32 sources packed into one register
+      std::string fp8;     // "e4m3x2"/"e5m2x2": the FP8 side of the conversion
+      bool satfinite = false;
       Round round = Round::None;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
@@ -1025,8 +1027,40 @@ class Parser {
         else if (p == "rpi") round = Round::Rpi;
         else if (p == "sat" || p == "ftz") ;  // saturation/flush handled conservatively below
         else if (p == "f16x2" || p == "bf16x2") packed = p;
+        else if (p == "e4m3x2" || p == "e5m2x2") fp8 = p;
+        else if (p == "satfinite") satfinite = true;
         else if (auto t2 = parse_type_token(p)) tys.push_back(*t2);
         else return unsupported("unrecognized cvt modifier '." + p + "'");
+      }
+      if (!fp8.empty()) {
+        OpCvtFp8 op;
+        op.e5m2 = fp8[1] == '5';
+        op.satfinite = satfinite;
+        // Which side of the dot the fp8 type sat on decides the direction, and
+        // `packed`/`tys` carry whatever the other side was.
+        const size_t fp8_pos = opcode.find(fp8);
+        const size_t other_pos = packed.empty() ? std::string::npos : opcode.find(packed);
+        op.to_fp8 = other_pos == std::string::npos ? !tys.empty() : fp8_pos < other_pos;
+        op.bf16 = !packed.empty() && packed[0] == 'b';
+        if (!packed.empty()) {
+          op.src_f32_pair = false;
+        } else {
+          if (tys.size() != 1 || tys[0].bits != 32 || !tys[0].is_float())
+            return unsupported("cvt between " + fp8 + " and a type other than f32/f16x2/bf16x2");
+          op.src_f32_pair = true;
+        }
+        if (!op.to_fp8 && op.src_f32_pair)
+          return unsupported("cvt from " + fp8 + " to f32 (PTX unpacks to f16x2)");
+        op.dst = expect_reg_operand("cvt destination");
+        expect_punct(",");
+        op.a = parse_operand();
+        if (op.to_fp8 && op.src_f32_pair) {
+          expect_punct(",");
+          op.b = parse_operand();
+        }
+        ins.op = op;
+        expect_punct(";");
+        return ins;
       }
       if (!packed.empty()) {
         // cvt.rn.f16x2.f32 d, a, b -- two f32 converted and packed, a high, b low.

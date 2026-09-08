@@ -287,6 +287,103 @@ uint64_t double_to_f16(double d) {
   return sign | (static_cast<uint32_t>(e16) << 10) | (mant & 0x3FF);
 }
 
+// ---- FP8 -------------------------------------------------------------
+//
+// Two formats, and they are not the same shape with a different bias.
+//
+//   e4m3: 4 exponent bits (bias 7), 3 mantissa bits. NO infinity -- the
+//         all-ones exponent is a normal range, and only S.1111.111 is NaN, so
+//         the largest finite value is 448.
+//   e5m2: 5 exponent bits (bias 15), 2 mantissa bits, and an IEEE-shaped top
+//         exponent, so it does have infinity and its max finite is 57344.
+//
+// Getting e4m3's missing infinity wrong is the interesting failure: treating
+// its top exponent as reserved costs half the representable range, and the
+// values that vanish are the large activations FP8 inference is scaled to
+// keep. Reading 0x7F as an ordinary number instead of NaN is the same mistake
+// pointing the other way.
+struct Fp8Format {
+  int exp_bits, man_bits, bias;
+  bool has_inf;
+  double max_finite;
+};
+inline constexpr Fp8Format kE4M3{4, 3, 7, false, 448.0};
+inline constexpr Fp8Format kE5M2{5, 2, 15, true, 57344.0};
+
+double fp8_to_double(uint32_t byte, const Fp8Format& f) {
+  const uint32_t man_mask = (1u << f.man_bits) - 1u;
+  const uint32_t exp_mask = (1u << f.exp_bits) - 1u;
+  const bool sign = (byte >> (f.exp_bits + f.man_bits)) & 1u;
+  const uint32_t exp = (byte >> f.man_bits) & exp_mask;
+  const uint32_t man = byte & man_mask;
+  double v;
+  if (exp == exp_mask) {
+    if (f.has_inf) {
+      v = man ? std::numeric_limits<double>::quiet_NaN()
+              : std::numeric_limits<double>::infinity();
+    } else {
+      // e4m3 spends this exponent on ordinary numbers; only all-ones mantissa
+      // is NaN.
+      v = man == man_mask
+              ? std::numeric_limits<double>::quiet_NaN()
+              : std::ldexp(1.0 + static_cast<double>(man) / (man_mask + 1),
+                           static_cast<int>(exp) - f.bias);
+    }
+  } else if (exp == 0) {
+    v = std::ldexp(static_cast<double>(man) / (man_mask + 1), 1 - f.bias);
+  } else {
+    v = std::ldexp(1.0 + static_cast<double>(man) / (man_mask + 1),
+                   static_cast<int>(exp) - f.bias);
+  }
+  return sign ? -v : v;
+}
+
+// satfinite clamps to the largest finite value instead of producing infinity
+// or NaN, which is what every FP8 conversion nvcc emits actually asks for.
+uint32_t double_to_fp8(double d, const Fp8Format& f, bool satfinite) {
+  const uint32_t man_mask = (1u << f.man_bits) - 1u;
+  const uint32_t exp_mask = (1u << f.exp_bits) - 1u;
+  const uint32_t sign_bit = 1u << (f.exp_bits + f.man_bits);
+  const uint32_t nan_bits = f.has_inf ? ((exp_mask << f.man_bits) | 1u)
+                                      : ((exp_mask << f.man_bits) | man_mask);
+  if (std::isnan(d)) return nan_bits;
+  const uint32_t sign = std::signbit(d) ? sign_bit : 0u;
+  double a = std::fabs(d);
+  const uint32_t max_bits =
+      f.has_inf ? (((exp_mask - 1u) << f.man_bits) | man_mask)
+                : ((exp_mask << f.man_bits) | (man_mask - 1u));
+  if (std::isinf(a) || a > f.max_finite) {
+    if (satfinite) return sign | max_bits;
+    if (f.has_inf) return sign | (exp_mask << f.man_bits);
+    return nan_bits;  // e4m3 has no infinity to overflow into
+  }
+  const int min_sub = 1 - f.bias - f.man_bits;   // exponent of the smallest subnormal
+  if (a < std::ldexp(1.0, min_sub - 1)) return sign;  // rounds to zero
+  int exp = 0;
+  const double frac = std::frexp(a, &exp);       // a = frac * 2^exp, frac in [0.5, 1)
+  int e = exp - 1 + f.bias;
+  if (e <= 0) {                                   // subnormal
+    const uint32_t man =
+        static_cast<uint32_t>(std::nearbyint(std::ldexp(a, f.man_bits + f.bias - 1)));
+    // Rounding a subnormal up can carry it into the smallest normal, which is
+    // exactly representable and must not be truncated back down.
+    return sign | (man & ((man_mask << 1) | 1u));
+  }
+  uint32_t man = static_cast<uint32_t>(
+      std::nearbyint((frac * 2.0 - 1.0) * static_cast<double>(man_mask + 1)));
+  if (man == man_mask + 1) {  // rounding carried into the exponent
+    man = 0;
+    ++e;
+  }
+  if (static_cast<uint32_t>(e) > exp_mask ||
+      (f.has_inf && static_cast<uint32_t>(e) >= exp_mask) ||
+      (!f.has_inf && static_cast<uint32_t>(e) == exp_mask && man == man_mask)) {
+    if (satfinite) return sign | max_bits;
+    return f.has_inf ? (sign | (exp_mask << f.man_bits)) : nan_bits;
+  }
+  return sign | (static_cast<uint32_t>(e) << f.man_bits) | (man & man_mask);
+}
+
 float f32(uint64_t bits) { return std::bit_cast<float>(static_cast<uint32_t>(bits)); }
 uint64_t f32bits(float f) { return std::bit_cast<uint32_t>(f); }
 double f64(uint64_t bits) { return std::bit_cast<double>(bits); }
@@ -1826,6 +1923,49 @@ class Interpreter {
           const uint64_t shifted = base >= 32u ? 0ull : (bits << base);
           r[lane] = static_cast<uint32_t>(shifted & 0xffffffffull);
         }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpCvtFp8>(&ins.op)) {
+      const Fp8Format& f = op->e5m2 ? kE5M2 : kE4M3;
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes r;
+      if (op->to_fp8) {
+        if (op->src_f32_pair) {
+          Lanes _s_b;
+          const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+          for (uint32_t lane = 0; lane < W_; ++lane)
+            if (m & (Mask{1} << lane)) {
+              // a is the high byte and b the low one, matching the f16x2
+              // conversion's operand order.
+              const uint32_t hi = double_to_fp8(f32(a[lane]), f, op->satfinite);
+              const uint32_t lo = double_to_fp8(f32(b[lane]), f, op->satfinite);
+              r[lane] = (hi << 8) | lo;
+            }
+        } else {
+          for (uint32_t lane = 0; lane < W_; ++lane)
+            if (m & (Mask{1} << lane)) {
+              uint32_t out = 0;
+              for (int h = 0; h < 2; ++h) {
+                const uint64_t bits = (a[lane] >> (16 * h)) & 0xFFFF;
+                const double v = op->bf16 ? bf16_to_double(bits) : f16_to_double(bits);
+                out |= double_to_fp8(v, f, op->satfinite) << (8 * h);
+              }
+              r[lane] = out;
+            }
+        }
+      } else {
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) {
+            uint64_t out = 0;
+            for (int h = 0; h < 2; ++h) {
+              const double v = fp8_to_double((a[lane] >> (8 * h)) & 0xFF, f);
+              out |= (op->bf16 ? double_to_bf16(v) : double_to_f16(v)) << (16 * h);
+            }
+            r[lane] = out;
+          }
+      }
       write_reg(w, op->dst, m, r, 32);
       return;
     }

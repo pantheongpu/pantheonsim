@@ -23,6 +23,8 @@ using vgpu::exec::TexKind;
 
 namespace {
 const char* kHeader = ".version 8.3\n.target sm_86\n.address_size 64\n";
+// Hopper and later, for the features that only exist there.
+const char* kHeader90 = ".version 8.3\n.target sm_90a\n.address_size 64\n";
 std::vector<uint8_t> arg_u64(uint64_t v) {
   std::vector<uint8_t> b(8);
   std::memcpy(b.data(), &v, 8);
@@ -1937,6 +1939,65 @@ VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
   VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{512});
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{512 + 256});
+}
+
+VTEST(fp8_e4m3_and_e5m2_are_different_formats) {
+  // The two FP8 formats are not one shape with a different bias. e4m3 spends
+  // its top exponent on ordinary numbers -- it has NO infinity -- so its
+  // largest finite value is 448 and 1000 saturates to it. e5m2 is IEEE-shaped
+  // with a wider range, and represents 1000 as 1024 (two mantissa bits).
+  //
+  // Treating e4m3's top exponent as reserved would cost half its range, and
+  // the values that vanish are exactly the large activations FP8 inference is
+  // scaled to keep.
+  std::string ptx = std::string(kHeader90) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<20>;
+    .reg .f32 %f<20>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.f32 %f1, 0f3F800000;   // 1.0
+    mov.f32 %f2, 0f40000000;   // 2.0
+    cvt.rn.satfinite.e4m3x2.f32 %r1, %f2, %f1;   // a is the high byte
+    st.global.u32 [%rd2], %r1;
+    cvt.rn.f16x2.e4m3x2 %r2, %r1;                // and back again
+    st.global.u32 [%rd2+4], %r2;
+    mov.f32 %f3, 0f447A0000;   // 1000.0
+    mov.f32 %f4, 0f00000000;
+    cvt.rn.satfinite.e4m3x2.f32 %r3, %f3, %f4;
+    cvt.rn.f16x2.e4m3x2 %r4, %r3;
+    st.global.u32 [%rd2+8], %r4;
+    cvt.rn.satfinite.e5m2x2.f32 %r5, %f3, %f4;
+    cvt.rn.f16x2.e5m2x2 %r6, %r5;
+    st.global.u32 [%rd2+12], %r6;
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  auto half = [](uint16_t h) {
+    const uint32_t s = (h >> 15) & 1, ex = (h >> 10) & 0x1F, mn = h & 0x3FF;
+    if (ex == 0) return static_cast<float>((s ? -1 : 1) * std::ldexp(static_cast<double>(mn), -24));
+    const double v = std::ldexp(static_cast<double>(mn | 0x400), static_cast<int>(ex) - 25);
+    return static_cast<float>(s ? -v : v);
+  };
+  // The packed bytes themselves: e4m3 1.0 is 0x38, 2.0 is 0x40.
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0x4038});
+  const uint32_t rt = static_cast<uint32_t>(e.mem.load_scalar(out + 4, 4));
+  VCHECK_EQ(half(static_cast<uint16_t>(rt & 0xFFFF)), 1.0f);
+  VCHECK_EQ(half(static_cast<uint16_t>(rt >> 16)), 2.0f);
+  // 1000 saturates in e4m3 and does not in e5m2 -- the whole difference.
+  const uint32_t big4 = static_cast<uint32_t>(e.mem.load_scalar(out + 8, 4));
+  const uint32_t big5 = static_cast<uint32_t>(e.mem.load_scalar(out + 12, 4));
+  VCHECK_EQ(half(static_cast<uint16_t>(big4 >> 16)), 448.0f);
+  VCHECK_EQ(half(static_cast<uint16_t>(big5 >> 16)), 1024.0f);
 }
 
 VTEST(nan_propagating_min_and_half_atomics) {

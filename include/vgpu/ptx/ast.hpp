@@ -314,6 +314,20 @@ struct OpMbarrier {
   Operand state;            // test_wait's token, or try_wait.parity's parity
   bool have_state = false;
 };
+// FP8 pack/unpack. The conversions always move a *pair*: PTX has no scalar
+// FP8 type, only e4m3x2/e5m2x2 occupying the low 16 bits of a register.
+//   to_fp8   from f32: cvt.rn.satfinite.e4m3x2.f32   d, a, b   (a high, b low)
+//   to_fp8   from f16: cvt.rn.satfinite.e4m3x2.f16x2 d, a
+//   from_fp8 to   f16: cvt.rn.f16x2.e4m3x2           d, a
+struct OpCvtFp8 {
+  bool e5m2 = false;        // which of the two formats
+  bool to_fp8 = true;       // direction
+  bool src_f32_pair = false;  // the two-source f32 form
+  bool bf16 = false;        // the half side is bf16 rather than f16
+  bool satfinite = false;
+  Reg dst;
+  Operand a, b;
+};
 // copysign.f32/f64 d, a, b -- magnitude of b with the sign of a.
 struct OpCopysign { Type ty; Reg dst; Operand a, b; };
 // dp4a.{u32,s32}.{u32,s32} d, a, b, c -- four byte-wise products of a and b
@@ -491,7 +505,7 @@ struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpActiveMask>;
 

@@ -36,6 +36,33 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   module .global variables, aggregate by-value params, device printf (vprintf),
   transcendentals (ex2/lg2/sin/cos/sqrt/rsqrt/rcp/tanh), bfe/bfi/brev/popc/clz,
   mad.wide, mov pack/unpack, NaN-aware setp forms, inline-asm register locals.
+- PTX found by probing what real toolchains emit rather than by reading the
+  spec, which is how several of these stayed missing: `lop3` (ptxas fuses
+  bitwise chains into it, so optimized PTX is dense with them), `red` (an
+  atomic whose result is discarded -- what an unused atomicAdd() compiles to,
+  which in a reduction is every call), `slct`, `testp`, `sad`/`vabsdiff`,
+  `match.any/all.sync`, `mul24`, `szext`, `fns`, `bfind[.shiftamt]`,
+  `elect.sync`, `isspacep`. Cache-management hints (`prefetch`,
+  `createpolicy`, `applypriority`, `discard`) and the scheduling directives
+  `griddepcontrol` and `setmaxnreg` are accepted and do nothing, each for a
+  stated reason rather than a shrug.
+- Half precision beyond f16x2: f16, bf16, f16x2 and bf16x2 arithmetic
+  (add/sub/mul/fma/neg/min/max), the same four types on every transcendental,
+  and atom/red.add on all of them. bf16 is a different decode, not a scaled
+  f16 -- it carries f32's exponent range with a 7-bit mantissa.
+- `min.NaN`/`max.NaN`, which propagate a NaN instead of returning the other
+  operand. The plain forms follow fmin/fmax; the two disagree on exactly the
+  inputs a kernel clamping to keep NaNs visible cares about.
+- FP8: `cvt` between e4m3x2/e5m2x2 and f32/f16x2/bf16x2, with `.satfinite`.
+  The two formats are not one shape with a different bias -- e4m3 spends its
+  top exponent on ordinary numbers and has no infinity, so 448 is its largest
+  finite value and 1000 saturates to it, while e5m2 is IEEE-shaped and
+  represents 1000 as 1024.
+- `mbarrier` (init/inval/arrive/arrive_drop/test_wait/try_wait[.parity]/
+  pending_count) and `cp.async.mbarrier.arrive`: the split barrier that
+  cuda::barrier and cuda::pipeline are built on. Nothing blocks -- a wait is a
+  predicate and the kernel spins, and an incomplete wait yields its scheduler
+  turn so the warps it is waiting for can run.
 - Shared memory: static + dynamic (extern) .shared, per-block zeroed frames,
   ld/st/atom.shared, correct space-relative addressing (cvta to/from generic).
 - Warp shuffles (shfl.sync up/down/bfly/idx, + predicate output) and
