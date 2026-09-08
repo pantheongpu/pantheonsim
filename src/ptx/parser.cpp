@@ -1451,6 +1451,83 @@ class Parser {
       expect_punct(",");
       op.c = parse_operand();
       ins.op = op;
+    } else if (op0 == "match") {
+      // match.any.sync.b32 d, a, membermask
+      // match.all.sync.b32 d|p, a, membermask
+      if (parts.size() != 4 || parts[2] != "sync")
+        return unsupported("match form (expected match.{any,all}.sync.b{32,64})");
+      OpMatch op;
+      if (parts[1] == "any") op.all = false;
+      else if (parts[1] == "all") op.all = true;
+      else return unsupported("match mode '." + parts[1] + "'");
+      auto mty = parse_type_token(parts[3]);
+      if (!mty || (mty->bits != 32 && mty->bits != 64))
+        return unsupported("match type '." + parts[3] + "' (only .b32 and .b64)");
+      op.dst = expect_reg_operand("match destination");
+      if (op.all && peek_punct("|")) {
+        next();
+        op.pred_dst = expect_reg_operand("match.all predicate destination");
+      }
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.membermask = parse_operand();
+      ins.op = op;
+    } else if (op0 == "mul24") {
+      if (parts.size() != 3 || (parts[1] != "lo" && parts[1] != "hi"))
+        return unsupported("mul24 form (expected mul24.{lo,hi}.{u32,s32})");
+      OpMul24 op;
+      op.hi = parts[1] == "hi";
+      if (parts[2] == "s32") op.is_signed = true;
+      else if (parts[2] != "u32") return unsupported("mul24 type '." + parts[2] + "'");
+      op.dst = expect_reg_operand("mul24 destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      ins.op = op;
+    } else if (op0 == "szext") {
+      if (parts.size() != 3 || (parts[1] != "clamp" && parts[1] != "wrap"))
+        return unsupported("szext form (expected szext.{clamp,wrap}.{u32,s32})");
+      OpSzext op;
+      op.wrap = parts[1] == "wrap";
+      if (parts[2] == "s32") op.is_signed = true;
+      else if (parts[2] != "u32") return unsupported("szext type '." + parts[2] + "'");
+      op.dst = expect_reg_operand("szext destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      ins.op = op;
+    } else if (op0 == "fns") {
+      if (parts.size() != 2 || parts[1] != "b32")
+        return unsupported("fns form (expected fns.b32)");
+      OpFns op;
+      op.dst = expect_reg_operand("fns destination");
+      expect_punct(",");
+      op.mask = parse_operand();
+      expect_punct(",");
+      op.base = parse_operand();
+      expect_punct(",");
+      op.offset = parse_operand();
+      ins.op = op;
+    } else if (op0 == "vabsdiff") {
+      // The scalar form is |a-b|+c, which is sad's definition, so it shares
+      // the node. The SIMD forms (vabsdiff2/vabsdiff4) split the operands into
+      // halves or bytes and are a different instruction with a similar name.
+      if (parts.size() != 4) return unsupported("vabsdiff form (expected vabsdiff.dtype.atype.btype)");
+      OpSad op;
+      auto vty = parse_type_token(parts[1]);
+      if (!vty) return unsupported("vabsdiff type '." + parts[1] + "'");
+      op.ty = *vty;
+      op.dst = expect_reg_operand("vabsdiff destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      expect_punct(",");
+      op.c = parse_operand();
+      ins.op = op;
     } else if (op0 == "lop3") {
       // lop3.b32 d, a, b, c, immLut
       if (parts.size() < 2 || parts[1] != "b32") return unsupported("lop3 form (only lop3.b32)");
@@ -1556,8 +1633,10 @@ class Parser {
       expect_punct(",");
       op.c = parse_operand();
       ins.op = op;
-    } else if (op0 == "atom") {
+    } else if (op0 == "atom" || op0 == "red") {
       // atom[.space][.sem][.scope].<op>.<type> d, [a], b [, c]
+      // red[.space][.sem][.scope].<op>.<type>    [a], b        -- same, no d.
+      const bool discards = (op0 == "red");
       Space space = Space::Generic;
       std::optional<AtomOp> aop;
       Type ty{};
@@ -1595,12 +1674,18 @@ class Parser {
           return unsupported("float atomics are implemented for f32 and f64; f16/bf16 atomics "
                              "are not yet");
       }
+      if (discards && *aop == AtomOp::Cas)
+        return unsupported("red.cas (a compare-and-swap whose result is discarded "
+                           "cannot report whether it swapped)");
       OpAtom op;
       op.op = *aop;
       op.ty = ty;
       op.space = space;
-      op.dst = expect_reg_operand("atom destination");
-      expect_punct(",");
+      op.discards_result = discards;
+      if (!discards) {
+        op.dst = expect_reg_operand("atom destination");
+        expect_punct(",");
+      }
       op.addr = parse_addr(fn);
       if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
         return unsupported("atom through a parameter/slot name");

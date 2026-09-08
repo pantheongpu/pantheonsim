@@ -1799,6 +1799,111 @@ class Interpreter {
       write_reg(w, op->dst, m, r, 32);
       return;
     }
+    if (const auto* op = std::get_if<OpMatch>(&ins.op)) {
+      require_warp32(ins, "match.sync");
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_mm;
+      const Lanes& mm = read_operand(w, ctx, ins, op->membermask, _s_mm);
+      Lanes r;
+      Mask all_agreed = 0;
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        // Participants are the lanes named by the member mask that are also
+        // actually active. A lane listed in the mask but not executing cannot
+        // contribute a value, and reading its stale register would invent one.
+        const Mask members = static_cast<Mask>(mm[lane]) & m;
+        Mask same = 0;
+        for (uint32_t o = 0; o < W_; ++o)
+          if ((members & (Mask{1} << o)) && a[o] == a[lane]) same |= (Mask{1} << o);
+        r[lane] = static_cast<uint64_t>(same);
+        if (same == members) all_agreed |= (Mask{1} << lane);
+      }
+      write_reg(w, op->dst, m, r, 32);
+      if (op->all && op->pred_dst.id != kNoReg) {
+        Mask& p = pred_slot(w, op->pred_dst);
+        p = (p & ~m) | (all_agreed & m);
+      }
+      return;
+    }
+    if (const auto* op = std::get_if<OpMul24>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
+          // The product is 48 bits wide, which is why .hi cannot be had by
+          // masking the inputs of a 32-bit multiply: it wants bits 47:24.
+          int64_t prod;
+          if (op->is_signed) {
+            auto s24 = [](uint64_t v) -> int64_t {
+              const uint32_t f = static_cast<uint32_t>(v) & 0xFFFFFFu;
+              return (f & 0x800000u) ? static_cast<int64_t>(f) - 0x1000000 : static_cast<int64_t>(f);
+            };
+            prod = s24(a[lane]) * s24(b[lane]);
+          } else {
+            prod = static_cast<int64_t>((a[lane] & 0xFFFFFFu) * (b[lane] & 0xFFFFFFu));
+          }
+          const uint64_t u = static_cast<uint64_t>(prod);
+          r[lane] = op->hi ? ((u >> 24) & 0xFFFFFFFFull) : (u & 0xFFFFFFFFull);
+        }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpSzext>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
+          uint32_t n = static_cast<uint32_t>(b[lane]);
+          n = op->wrap ? (n & 31u) : (n > 32u ? 32u : n);
+          const uint32_t v = static_cast<uint32_t>(a[lane]);
+          if (n == 0) { r[lane] = op->is_signed ? 0u : 0u; continue; }
+          if (n >= 32) { r[lane] = v; continue; }
+          const uint32_t keep = v & ((1u << n) - 1u);
+          r[lane] = (op->is_signed && (keep & (1u << (n - 1))))
+                        ? (keep | ~((1u << n) - 1u))
+                        : keep;
+        }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpFns>(&ins.op)) {
+      Lanes _s_mask;
+      const Lanes& mv = read_operand(w, ctx, ins, op->mask, _s_mask);
+      Lanes _s_base;
+      const Lanes& bv = read_operand(w, ctx, ins, op->base, _s_base);
+      Lanes _s_off;
+      const Lanes& ov = read_operand(w, ctx, ins, op->offset, _s_off);
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
+          const uint32_t bits = static_cast<uint32_t>(mv[lane]);
+          const uint32_t base = static_cast<uint32_t>(bv[lane]) & 31u;
+          const int32_t off = static_cast<int32_t>(static_cast<uint32_t>(ov[lane]));
+          uint32_t found = 0xFFFFFFFFu;
+          if (off > 0) {
+            int32_t n = off;
+            for (int i = static_cast<int>(base); i < 32; ++i)
+              if ((bits >> i) & 1u) { if (--n == 0) { found = static_cast<uint32_t>(i); break; } }
+          } else if (off < 0) {
+            int32_t n = -off;
+            for (int i = static_cast<int>(base); i >= 0; --i)
+              if ((bits >> i) & 1u) { if (--n == 0) { found = static_cast<uint32_t>(i); break; } }
+          } else {
+            // offset 0 asks for the bit at `base` itself.
+            if ((bits >> base) & 1u) found = base;
+          }
+          r[lane] = found;
+        }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
     if (const auto* op = std::get_if<OpLop3>(&ins.op)) {
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
@@ -3511,7 +3616,10 @@ class Interpreter {
         store_routed(w, ctx, ins, lane, addr, size, mask_to_bits(nv, op.ty.bits));
         r[lane] = old;
       }
-    write_reg(w, op.dst, m, r, op.ty.bits);
+    // `red` performed the read-modify-write and has nowhere to put the old
+    // value. The memory side above already happened, which is the whole
+    // instruction; only the write-back is skipped.
+    if (!op.discards_result) write_reg(w, op.dst, m, r, op.ty.bits);
   }
 
   // ---- device printf (the vprintf builtin) ----

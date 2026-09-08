@@ -1939,6 +1939,113 @@ VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{512 + 256});
 }
 
+VTEST(red_is_an_atomic_that_keeps_no_answer) {
+  // nvcc emits `red` whenever an atomicAdd()'s result is unused, which in a
+  // reduction or a histogram is every call -- so a kernel full of atomics can
+  // contain no `atom` at all. The memory side must be identical to atom's;
+  // only the write-back is skipped.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    add.s32 %r2, %r1, 1;
+    red.global.add.u32 [%rd2], %r2;
+    red.global.max.u32 [%rd2+4], %r2;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  e.mem.store_scalar(out, 4, 0);
+  e.mem.store_scalar(out + 4, 4, 0);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {64, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{64 * 65 / 2});  // 1..64 summed
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{64});
+}
+
+VTEST(match_any_groups_lanes_by_value) {
+  // CUB's and cooperative_groups' value-keyed partitions are this instruction.
+  // Lanes are given tid/8, so each group of 8 consecutive lanes shares a value
+  // and must see exactly its own 8 bits set.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 3;
+    match.any.sync.b32 %r3, %r2, -1;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 4);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t lane = 0; lane < 32; ++lane) {
+    const uint32_t group = lane / 8;
+    const uint64_t want = uint64_t{0xFFu} << (group * 8);
+    VCHECK_EQ(e.mem.load_scalar(out + lane * 4, 4), want);
+  }
+}
+
+VTEST(mul24_szext_and_fns) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 16777215;        // 0xFFFFFF, the widest 24-bit value
+    mul24.lo.u32 %r2, %r1, %r1;
+    mul24.hi.u32 %r3, %r1, %r1;
+    st.global.u32 [%rd2], %r2;
+    st.global.u32 [%rd2+4], %r3;
+    mov.u32 %r4, 255;             // 0xFF
+    mov.u32 %r5, 8;
+    szext.clamp.s32 %r6, %r4, %r5;   // sign-extend 0xFF from 8 bits -> -1
+    szext.clamp.u32 %r7, %r4, %r5;   // zero-extend -> 255
+    st.global.u32 [%rd2+8], %r6;
+    st.global.u32 [%rd2+12], %r7;
+    mov.u32 %r8, 164;             // 0b10100100: bits 2, 5, 7
+    mov.u32 %r9, 0;
+    mov.u32 %r10, 2;
+    fns.b32 %r11, %r8, %r9, %r10;    // 2nd set bit at or above 0 -> 5
+    st.global.u32 [%rd2+16], %r11;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  const uint64_t prod = uint64_t{0xFFFFFFu} * 0xFFFFFFu;   // 48 bits wide
+  VCHECK_EQ(e.mem.load_scalar(out, 4), prod & 0xFFFFFFFFull);
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), (prod >> 24) & 0xFFFFFFFFull);
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{0xFFFFFFFFu});  // -1
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), uint64_t{255});
+  VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{5});
+}
+
 VTEST(lop3_computes_the_truth_table_it_is_given) {
   // ptxas fuses bitwise chains into lop3, so optimized PTX is full of these
   // and a wrong truth table is a wrong mask rather than a crash. The immLut

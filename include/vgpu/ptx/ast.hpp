@@ -261,6 +261,22 @@ enum class TestpOp : uint8_t { Finite, Infinite, Number, NotANumber, Normal, Sub
 struct OpTestp { TestpOp op = TestpOp::Finite; Type ty; Reg dst; Operand a; };
 // sad.type d, a, b, c -- |a-b| + c, the sum-of-absolute-differences step.
 struct OpSad { Type ty; Reg dst; Operand a, b, c; };
+// match.any.sync.b{32,64} d, a, membermask -- the mask of participating lanes
+// whose value of a equals this lane's. CUB and cooperative_groups build
+// value-keyed partitions out of it: labeled_partition() is this instruction.
+// The .all form additionally reports whether every participant agreed, which
+// needs a second destination, so it is parsed separately.
+struct OpMatch { bool all = false; Reg dst; Reg pred_dst; Operand a; Operand membermask; };
+// mul24.{lo,hi}.{u32,s32} d, a, b -- a product of the low 24 bits. A separate
+// instruction rather than a mul with a mask: the hi form takes bits 47:24 of
+// the 48-bit product, which masking the inputs of a 32-bit multiply cannot
+// produce.
+struct OpMul24 { bool hi = false; bool is_signed = false; Reg dst; Operand a, b; };
+// szext.{clamp,wrap}.{u32,s32} d, a, b -- sign- or zero-extend a from bit b.
+struct OpSzext { bool wrap = false; bool is_signed = false; Reg dst; Operand a, b; };
+// fns.b32 d, mask, base, offset -- the position of the n-th set bit of mask,
+// searching from `base`. Returns 0xFFFFFFFF when there is no such bit.
+struct OpFns { Reg dst; Operand mask, base, offset; };
 // copysign.f32/f64 d, a, b -- magnitude of b with the sign of a.
 struct OpCopysign { Type ty; Reg dst; Operand a, b; };
 // dp4a.{u32,s32}.{u32,s32} d, a, b, c -- four byte-wise products of a and b
@@ -330,7 +346,11 @@ struct OpSetp { CmpOp cmp = CmpOp::Eq; Type ty; Reg dst; Operand a, b; };
 struct OpSelp { Type ty; Reg dst; Operand a, b; Reg pred; };
 struct OpPredBin { PredBinOp op = PredBinOp::And; Reg dst; Reg a, b; };
 struct OpNotPred { Reg dst; Reg src; };
-struct OpAtom { AtomOp op = AtomOp::Add; Space space = Space::Generic; Type ty; Reg dst; Addr addr; Operand b; Operand c; };
+// atom and red are the same instruction; red is the form that discards the
+// old value. nvcc emits it whenever the result of an atomicAdd() is unused,
+// which in a reduction or a histogram is every call, so a kernel full of
+// atomics can easily contain no `atom` at all.
+struct OpAtom { AtomOp op = AtomOp::Add; Space space = Space::Generic; Type ty; Reg dst; Addr addr; Operand b; Operand c; bool discards_result = false; };
 struct OpBra { size_t target = 0; std::string label; };  // target = instruction index
 struct OpBar {};                                     // bar.sync 0
 // An instruction with nothing to do here: a memory fence, or a backoff hint.
@@ -419,7 +439,7 @@ struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpActiveMask>;
 
