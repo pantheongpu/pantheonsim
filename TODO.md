@@ -67,10 +67,12 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   ld/st/atom.shared, correct space-relative addressing (cvta to/from generic).
 - Warp shuffles (shfl.sync up/down/bfly/idx, + predicate output) and
   vote/ballot.
-- Tensor cores: wmma.load.{a,b,c}, wmma.mma m16n16k16 f32.f32 (row/col
-  layouts), wmma.store.d -- so `nvcuda::wmma`'s load_matrix_sync/mma_sync/
-  store_matrix_sync all work and a 16x16x16 GEMM through the public API
-  matches a host reference for both B layouts;
+- Tensor cores: wmma.load.{a,b,c}, wmma.mma m16n16k16 with f16 or bf16 inputs
+  and an f32 accumulator (row/col layouts), wmma.store.d -- so `nvcuda::wmma`'s
+  load_matrix_sync/mma_sync/store_matrix_sync all work and a 16x16x16 GEMM
+  through the public API matches a host reference for both B layouts and both
+  element types. tf32 (m16n16k8) is refused by name: it is a non-square shape,
+  and the layout cancellation the square shapes rely on does not hold there;
   ldmatrix.m8n8.x{1,2,4}[.trans], mma.sync.m16n8k{8,16,32} over f16/bf16/tf32/
   s8, and movmatrix.m8n8.trans (the register-only transpose).
 - Asynchronous copy: cp.async.{ca,cg} with commit_group / wait_group / wait_all

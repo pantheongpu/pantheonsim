@@ -3251,19 +3251,34 @@ class Interpreter {
   void exec_wmma_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaMma& op, Mask m) {
     // Gather A and B (16x16 f16 each) and C (16x16 f32) from the warp.
     double A[kMmaDim][kMmaDim] = {}, B[kMmaDim][kMmaDim] = {}, C[kMmaDim][kMmaDim] = {};
-    for (int reg = 0; reg < 8; ++reg) {
+    const bool bf = op.elem == WmmaElem::BF16;
+    const int ab_regs = bf ? 4 : 8;
+    for (int reg = 0; reg < ab_regs; ++reg) {
       Lanes _s_av;
       const Lanes& av = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s_av);
       Lanes _s_bv;
       const Lanes& bv = read_operand(w, ctx, ins, Operand{RegOperand{op.b[reg]}}, _s_bv);
-      for (uint32_t lane = 0; lane < kMmaDim; ++lane) {
+      // A bf16 fragment covers the matrix exactly once across all 32 lanes; an
+      // f16 fragment covers it twice, so only the first 16 lanes are read.
+      const uint32_t lanes_used = bf ? W_ : kMmaDim;
+      for (uint32_t lane = 0; lane < lanes_used; ++lane) {
         for (int h = 0; h < 2; ++h) {
-          uint32_t col = static_cast<uint32_t>(reg * 2 + h);
-          double a = f16_to_double((av[lane] >> (16 * h)) & 0xFFFF);
-          double b = f16_to_double((bv[lane] >> (16 * h)) & 0xFFFF);
-          // .row: element (lane, col); .col: transposed.
-          if (op.alayout == MatLayout::Row) A[lane][col] = a; else A[col][lane] = a;
-          if (op.blayout == MatLayout::Row) B[lane][col] = b; else B[col][lane] = b;
+          uint32_t row, col;
+          if (bf) {
+            const uint32_t linear = lane * 8 + static_cast<uint32_t>(reg * 2 + h);
+            row = linear / kMmaDim;
+            col = linear % kMmaDim;
+          } else {
+            row = lane;
+            col = static_cast<uint32_t>(reg * 2 + h);
+          }
+          const uint64_t abits = (av[lane] >> (16 * h)) & 0xFFFF;
+          const uint64_t bbits = (bv[lane] >> (16 * h)) & 0xFFFF;
+          const double a = bf ? bf16_to_double(abits) : f16_to_double(abits);
+          const double b = bf ? bf16_to_double(bbits) : f16_to_double(bbits);
+          // .row: element (row, col); .col: transposed.
+          if (op.alayout == MatLayout::Row) A[row][col] = a; else A[col][row] = a;
+          if (op.blayout == MatLayout::Row) B[row][col] = b; else B[col][row] = b;
         }
       }
     }
@@ -3322,7 +3337,9 @@ class Interpreter {
     const uint64_t addr0 = sbase + base[lead] + static_cast<uint64_t>(op.addr.offset);
     const uint64_t ld = stride[lead];
 
-    for (int reg = 0; reg < 8; ++reg) {
+    const bool bf = op.elem == WmmaElem::BF16;
+    const int nregs = (op.which == OpWmmaLoad::Which::C || !bf) ? 8 : 4;
+    for (int reg = 0; reg < nregs; ++reg) {
       Lanes r;
       for (uint32_t lane = 0; lane < W_; ++lane) {
         if (!(m & (Mask{1} << lane))) continue;
@@ -3333,10 +3350,23 @@ class Interpreter {
                                                             : (uint64_t{j} * ld + i);
           r[lane] = load_routed(w, ctx, ins, lane, addr0 + elem * 4, 4);
         } else {
-          const uint32_t row = lane % kMmaDim;
           uint64_t packed = 0;
           for (int h = 0; h < 2; ++h) {
-            const uint32_t col = static_cast<uint32_t>(reg * 2 + h);
+            uint32_t row, col;
+            if (bf) {
+              // 4 registers x 2 halves x 32 lanes is exactly 16x16, so a bf16
+              // fragment covers the matrix once with no duplication and every
+              // lane carries distinct data.
+              const uint32_t linear = lane * 8 + static_cast<uint32_t>(reg * 2 + h);
+              row = linear / kMmaDim;
+              col = linear % kMmaDim;
+            } else {
+              // f16 takes 8 registers, which is twice the matrix, so lanes
+              // 16-31 duplicate lanes 0-15 rather than reading rows that do
+              // not exist.
+              row = lane % kMmaDim;
+              col = static_cast<uint32_t>(reg * 2 + h);
+            }
             const uint64_t elem = uint64_t{row} * ld + col;
             const uint64_t v = load_routed(w, ctx, ins, lane, addr0 + elem * 2, 2);
             packed |= (v & 0xFFFF) << (16 * h);

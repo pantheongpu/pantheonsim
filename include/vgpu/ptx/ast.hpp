@@ -391,7 +391,12 @@ struct OpF16x2Neg { bool bf16 = false; bool packed = true; Reg dst; Operand src;
 // hardware-matching results; kernels that depend on NVIDIA's exact
 // undocumented element distribution may differ. Documented in ARCHITECTURE.md.
 enum class MatLayout { Row, Col };
+// The element type of a WMMA A/B fragment. f16 and bf16 share the m16n16k16
+// shape but not the register count: f16 uses 8 registers per fragment and
+// duplicates the matrix across the warp, bf16 uses 4 and does not.
+enum class WmmaElem : uint8_t { F16, BF16 };
 struct OpWmmaMma {
+  WmmaElem elem = WmmaElem::F16;
   MatLayout alayout, blayout;
   std::vector<Reg> d, a, b, c;
 };
@@ -404,6 +409,7 @@ struct OpWmmaMma {
 // which is not documented and not observable through the API.
 struct OpWmmaLoad {
   enum class Which { A, B, C } which = Which::A;
+  WmmaElem elem = WmmaElem::F16;
   MatLayout layout = MatLayout::Row;
   Space space = Space::Generic;
   bool f32 = false;         // the C fragment is f32; A and B are f16

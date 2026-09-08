@@ -3,6 +3,7 @@
 // layout is opaque, so this checks the only thing that is observable -- the
 // product -- against a host reference.
 #include <cstdio>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <mma.h>
 using namespace nvcuda;
@@ -24,6 +25,21 @@ __global__ void gemm(float* d, const half* a, const half* b, const float* c) {
 __global__ void gemm_colb(float* d, const half* a, const half* b, const float* c) {
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> fb;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::load_matrix_sync(fa, a, 16);
+    wmma::load_matrix_sync(fb, b, 16);
+    wmma::load_matrix_sync(acc, c, 16, wmma::mem_row_major);
+    wmma::mma_sync(acc, fa, fb, acc);
+    wmma::store_matrix_sync(d, acc, 16, wmma::mem_row_major);
+}
+
+// bf16 fragments are a different shape from f16 -- 4 registers instead of 8,
+// covering the matrix once instead of twice -- so this is a separate path
+// through both load and mma, not the same one with another decode.
+__global__ void gemm_bf16(float* d, const __nv_bfloat16* a, const __nv_bfloat16* b,
+                          const float* c) {
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> fa;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> fb;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
     wmma::load_matrix_sync(fa, a, 16);
     wmma::load_matrix_sync(fb, b, 16);
@@ -82,8 +98,29 @@ int main() {
                                      i / 16, i % 16, hd[i], refc[i]);
             ++bad;
         }
+    // The same column-major product again, in bf16. The values are small
+    // integers, exact in both formats, so the reference does not change.
+    __nv_bfloat16 hab[256], hbb[256];
+    for (int i = 0; i < 256; ++i) {
+        hab[i] = __float2bfloat16(static_cast<float>((i % 7) - 3));
+        hbb[i] = __float2bfloat16(static_cast<float>((i % 5) - 2));
+    }
+    __nv_bfloat16 *dab, *dbb;
+    cudaMalloc(&dab, sizeof hab); cudaMalloc(&dbb, sizeof hbb);
+    cudaMemcpy(dab, hab, sizeof hab, cudaMemcpyHostToDevice);
+    cudaMemcpy(dbb, hbb, sizeof hbb, cudaMemcpyHostToDevice);
+    gemm_bf16<<<1, 32>>>(dd, dab, dbb, dc);
+    cudaDeviceSynchronize();
+    cudaMemcpy(hd, dd, sizeof hd, cudaMemcpyDeviceToHost);
+    for (int i = 0; i < 256; ++i)
+        if (hd[i] != refc[i]) {
+            if (bad < 9) std::printf("  bf16 [%d,%d] got %g want %g\n",
+                                     i / 16, i % 16, hd[i], refc[i]);
+            ++bad;
+        }
+
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::printf("cuda error: %s\n", cudaGetErrorString(e)); return 1; }
-    std::printf(bad ? "FAILED (%d of 512 wrong)\n" : "PASS\n", bad);
+    std::printf(bad ? "FAILED (%d of 768 wrong)\n" : "PASS\n", bad);
     return bad ? 1 : 0;
 }
