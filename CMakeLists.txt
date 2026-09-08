@@ -506,6 +506,18 @@ if(TARGET vgpucublas)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
+
+  # bf16 arithmetic, half2 atomics and labeled_partition, through nvcc. The
+  # unit tests feed hand-written PTX; a compiler emits forms a hand-written
+  # test never thinks to write, and this is what catches the difference. It
+  # already has: nvcc lowers labeled_partition through bfind.shiftamt, which
+  # nothing else here would have asked for.
+  add_test(NAME e2e_modern_dtypes
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_modern_dtypes.sh)
+  set_tests_properties(e2e_modern_dtypes PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
 endif()
 
 # A program profiling itself through CUPTI, which is how every profiler reads a
