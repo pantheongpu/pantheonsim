@@ -89,7 +89,7 @@ an instance left running bills by the hour).
 `tools/compare-profile.py` diffs a measured profile against the one in the
 tree, so corrections are visible rather than silently applied.
 
-Verified against real hardware, ten devices across seven architectures --
+Verified against real hardware, eleven devices across seven architectures --
 including the first AMD part:
 
 | profile | device | how |
@@ -102,10 +102,11 @@ including the first AMD part:
 | `nvidia/h100-pcie` | H100 80GB PCIe (sm_90) | Lambda `gpu_1x_h100_pcie` |
 | `nvidia/t4` | Tesla T4 (sm_75, Turing) | EC2 `g4dn.xlarge` |
 | `nvidia/a10g` | A10G (sm_86) | EC2 `g5.xlarge` |
-| `nvidia/l4` | L4 (sm_89, Ada Lovelace) | EC2 `g6.xlarge` |
+| `nvidia/l4` | L4 (sm_89, Ada Lovelace, AD104) | EC2 `g6.xlarge` |
+| `nvidia/l40s` | L40S (sm_89, Ada Lovelace, AD102) | EC2 `g6e.2xlarge` |
 | `amd/mi325x` | MI325X (gfx942, CDNA3) | DigitalOcean `gpu-mi325x1-256gb` |
 
-All nine match the physical device on **512 conformance values each** -- the
+All ten NVIDIA parts match the physical device on **512 conformance values each** -- the
 same binary run on hardware and on VirtualGPU, diffed.
 
 **The AMD one is discovery, not execution.** `amd/mi325x` describes a real

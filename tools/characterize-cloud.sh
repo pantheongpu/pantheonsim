@@ -82,7 +82,8 @@ $SSH 'set -e
     nvcc -std=c++14 -arch=sm_$ARCH -Wno-deprecated-gpu-targets $t.cu -o $t 2>/dev/null && ./$t > $t.ref.txt
   done
   # The metrics this device exposes -- see the note in characterize-aws.sh.
-  (ncu --query-metrics 2>/dev/null || true) > metrics.txt
+  (sudo -n ncu --query-metrics 2>/dev/null || ncu --query-metrics 2>/dev/null || true) > metrics.txt
+  grep -q ERR_NVGPUCTRPERM metrics.txt && echo "METRICS_DENIED=1"
   echo "METRICS=$(wc -l < metrics.txt)"
   echo "SM_ARCH=$ARCH"
 ' > "$outdir/${type_name}.run.log" 2>&1

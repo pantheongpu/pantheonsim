@@ -178,8 +178,17 @@ $SSH 'set -e
   # per-device data rather than a general claim. "An L4 exposes N metrics and
   # VirtualGPU produces these M" is checkable; "we do not model timing" is a
   # footnote someone has to take on trust.
-  (ncu --query-metrics 2>/dev/null || nv-nsight-cu-cli --query-metrics 2>/dev/null || true) \
+  # Under sudo, because --query-metrics opens the device to ask it: the L40S
+  # run came back with only ERR_NVGPUCTRPERM, "the user does not have
+  # permission to access NVIDIA GPU Performance Counters". The driver restricts
+  # profiling to admin by default, so an unprivileged query returns an error
+  # message where the metric list should be -- and a two-line metrics.txt looks
+  # like a device that exposes two metrics.
+  (sudo -n ncu --query-metrics 2>/dev/null || ncu --query-metrics 2>/dev/null \
+   || sudo -n nv-nsight-cu-cli --query-metrics 2>/dev/null \
+   || nv-nsight-cu-cli --query-metrics 2>/dev/null || true) \
     > metrics.txt
+  grep -q ERR_NVGPUCTRPERM metrics.txt && echo "METRICS_DENIED=1"
   echo "METRICS=$(wc -l < metrics.txt)"
   echo "SM_ARCH=$ARCH"
 ' > "$outdir/${type_name}.run.log" 2>&1

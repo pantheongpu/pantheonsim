@@ -18,7 +18,7 @@ VTEST(registry_lists_all_gpus) {
       "nvidia/a10",   "nvidia/a100", "nvidia/h100",   "nvidia/h200",
       "nvidia/b200",  "nvidia/rtx3060", "nvidia/a100-sxm4-40gb",
       "nvidia/gh200-480gb", "nvidia/h100-pcie", "nvidia/t4", "nvidia/a10g",
-      "nvidia/l4",
+      "nvidia/l4", "nvidia/l40s",
       "amd/mi300x", "amd/mi325x", "amd/mi350x"};
   VCHECK_EQ(ids.size(), expected.size());
   for (const auto& want : expected)
@@ -42,6 +42,7 @@ VTEST(all_builtin_profiles_parse) {
                           p.id == "nvidia/h100" || p.id == "nvidia/gh200-480gb" ||
                           p.id == "nvidia/h100-pcie" || p.id == "nvidia/t4" ||
                           p.id == "nvidia/a10g" || p.id == "nvidia/l4" ||
+                          p.id == "nvidia/l40s" ||
                           p.id == "amd/mi325x");
     // AMD parts have no compute capability, and the profile that carried a
     // plausible "9.4" was inventing one. Each vendor is asked for the thing it
