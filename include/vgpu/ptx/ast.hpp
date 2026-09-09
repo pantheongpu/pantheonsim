@@ -575,6 +575,11 @@ struct OpCall {
   std::string retval_slot;
   std::vector<std::string> param_slots;
   std::shared_ptr<const EntryFn> target;  // null for the builtins
+  // An indirect call through a function pointer: the callee is whatever
+  // address this register holds, so it is resolved per execution rather than
+  // at parse time.
+  bool indirect = false;
+  Reg target_reg;
 };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
@@ -637,6 +642,9 @@ struct EntryFn {
   std::vector<uint32_t> param_slot_bytes;      // byte size of each, structs included
   std::string retval_slot_name;                // empty when it returns void
   uint32_t retval_bytes = 0;
+  // Every device function in the module, in definition order. An indirect call
+  // carries an address, and the address is the index -- see kFuncVaBase.
+  std::vector<std::shared_ptr<const EntryFn>> module_funcs;
   std::vector<ParamDecl> params;
   std::vector<Instr> body;
   std::map<std::string, Type> reg_decls;      // declared virtual registers
@@ -679,9 +687,15 @@ struct GlobalVar {
   uint64_t size = 0;
   std::vector<uint8_t> init;  // empty or size bytes
   // A pointer-valued global can be initialised with another symbol's address
-  // ("= my_array;"). The address is not known until the module is loaded, so
-  // the name is carried here and resolved then.
-  std::string init_symbol;
+  // ("= my_array;"), and an array of them with a list ("= {f, g, h};") -- a
+  // table of function pointers is exactly that. Addresses are not known until
+  // the module is loaded, so the names are carried here with the byte offset
+  // each one belongs at, and resolved then.
+  struct SymbolInit {
+    uint64_t offset = 0;
+    std::string name;
+  };
+  std::vector<SymbolInit> init_symbols;
 };
 
 struct Module {

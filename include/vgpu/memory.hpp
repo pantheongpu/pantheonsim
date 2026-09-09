@@ -30,6 +30,14 @@
 namespace vgpu {
 
 inline constexpr uint64_t kDeviceVaBase = 0x7fff'0000'0000ull;
+// Device functions get addresses in their own window so a function pointer is
+// a real value that can be stored, loaded and compared -- and so an indirect
+// call can find the function again. The index is the address: nothing is ever
+// loaded *from* this range, and giving it a window of its own means a stray
+// dereference of a function pointer is diagnosable rather than a wild read.
+inline constexpr uint64_t kFuncVaBase = 0x6ffb'0000'0000ull;
+inline constexpr uint64_t kFuncVaStride = 8;
+inline constexpr uint64_t kFuncVaSize = 1ull << 20;
 // Each device owns a disjoint 1 TiB window above that base. CUDA guarantees
 // unified virtual addressing -- a device pointer is unique process-wide and
 // identifies the device that owns it -- and without separate windows two

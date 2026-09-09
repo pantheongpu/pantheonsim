@@ -291,9 +291,10 @@ class Parser {
     std::unordered_map<std::string, std::shared_ptr<EntryFn>> by_name;
     for (auto& f : m.funcs) by_name[f->name] = f;
     auto fix = [&](EntryFn& fn) {
+      fn.module_funcs.assign(m.funcs.begin(), m.funcs.end());
       for (Instr& ins : fn.body) {
         auto* call = std::get_if<OpCall>(&ins.op);
-        if (!call || call->callee.empty()) continue;
+        if (!call || call->indirect || call->callee.empty()) continue;
         if (call->callee == "vprintf" || call->callee == "__assertfail" ||
             call->callee == "malloc" || call->callee == "free")
           continue;
@@ -413,10 +414,19 @@ class Parser {
         next();
         g.init.reserve(g.size);
         while (!peek_punct("}")) {
-          int64_t v = expect_int("initializer element");
-          // Little-endian element append.
-          for (uint32_t b = 0; b < ty.bytes(); ++b)
-            g.init.push_back(static_cast<uint8_t>((static_cast<uint64_t>(v) >> (8 * b)) & 0xFF));
+          // An element may be a symbol rather than a number -- a table of
+          // function pointers is "{f, g, h}". Its slot is zeroed here and the
+          // address written by the loader, which is the same treatment the
+          // scalar "= symbol" form gets.
+          if (peek().kind == Token::Kind::Word && is_identifier_start(peek().text[0])) {
+            g.init_symbols.push_back({g.init.size(), next().text});
+            g.init.resize(g.init.size() + ty.bytes(), 0);
+          } else {
+            int64_t v = expect_int("initializer element");
+            // Little-endian element append.
+            for (uint32_t b = 0; b < ty.bytes(); ++b)
+              g.init.push_back(static_cast<uint8_t>((static_cast<uint64_t>(v) >> (8 * b)) & 0xFF));
+          }
           if (peek_punct(",")) next();
         }
         next();  // '}'
@@ -425,7 +435,7 @@ class Parser {
         // only exists once the module is loaded. The lexer gives numbers and
         // identifiers the same token kind, so the first character is what
         // separates them -- "= 5" is a value, not a symbol named "5".
-        g.init_symbol = next().text;
+        g.init_symbols.push_back({0, next().text});
       } else {
         int64_t v = expect_int("initializer");
         for (uint32_t b = 0; b < ty.bytes(); ++b)
@@ -435,7 +445,7 @@ class Parser {
         fail(line, "initializer for '" + g.name + "' longer than its declared size");
       // A symbol initialiser leaves no bytes here: the address is written by
       // the loader once every global has one.
-      if (g.init_symbol.empty()) g.init.resize(g.size, 0);
+      g.init.resize(g.size, 0);
     }
     expect_punct(";");
     return g;
@@ -722,6 +732,16 @@ class Parser {
       // hints for the code generator; neither changes what the kernel computes,
       // and both appear in anything compiled with line tables -- Triton emits a
       // ".loc" per statement.
+      if (t.kind == Token::Kind::Word && t.text == ".callprototype") {
+        // "proto : .callprototype (.param .b32 _) _ (.param .b32 _, ...);"
+        // The label was already consumed as a label. The signature would let a
+        // call be type-checked, which nothing here does, so it is dropped --
+        // but it must be consumed or the token stream desynchronizes.
+        next();
+        while (!at_end() && !peek_punct(";")) next();
+        if (peek_punct(";")) next();
+        continue;
+      }
       if (t.kind == Token::Kind::Word && (t.text == ".loc" || t.text == ".pragma")) {
         next();
         while (!at_end() && !peek_punct(";") && peek().line == t.line) next();
@@ -2397,7 +2417,13 @@ class Parser {
         expect_punct(")");
         expect_punct(",");
       }
-      op.callee = expect_word("call target");
+      // The target is either a name or a register holding a function address.
+      if (peek().kind == Token::Kind::Word && !peek().text.empty() && peek().text[0] == '%') {
+        op.indirect = true;
+        op.target_reg = expect_reg_operand("indirect call target");
+      } else {
+        op.callee = expect_word("call target");
+      }
       expect_punct(",");
       expect_punct("(");
       while (!peek_punct(")")) {
@@ -2405,6 +2431,11 @@ class Parser {
         if (peek_punct(",")) next();
       }
       next();
+      // An indirect call names its prototype after the arguments.
+      if (peek_punct(",")) {
+        next();
+        expect_word("call prototype name");
+      }
       // Whether this names a builtin or a device function defined elsewhere in
       // the module is settled after parsing, by resolve_calls.
       ins.op = op;

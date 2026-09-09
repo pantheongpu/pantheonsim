@@ -67,8 +67,12 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   mid-call, so a barrier inside a device function is refused by name rather
   than silently skipping the rest of the body. Structs and arrays pass and
   return by value: a call slot is a per-lane byte buffer, so `st.param
-  [param0+8]` lands where it should. Still refused: indirect calls through a
-  function pointer (`.callprototype`).
+  [param0+8]` lands where it should. Indirect calls work too: device functions
+  have addresses in a window of their own, an array global can be initialised
+  with a list of symbols (`= {f, g, h}` -- a function-pointer table), and a
+  call through a register resolves the address back to the function. All
+  participating lanes must agree on the target; a divergent function pointer
+  is refused rather than picking one body and running it for everyone.
 - Builtins a kernel can call: `vprintf`, `__assertfail` (a failed `assert()`
   reports its message and source location, and `cudaErrorAssert`), and the
   device heap -- `malloc`/`free` from inside a kernel, backed by the same

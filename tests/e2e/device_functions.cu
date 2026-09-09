@@ -24,12 +24,23 @@ __device__ __noinline__ int fact(int n) { return n <= 1 ? 1 : n * fact(n - 1); }
 // Structs by value, in both directions. A call slot is a byte buffer per lane,
 // so a 16-byte struct is as much a slot as an int is -- but it only became one
 // when the slot stopped being a single value per lane.
+// Indirect calls. The table is an array global initialised with a list of
+// symbols, so it exercises three things at once: functions having addresses at
+// all, an array initialiser that is a list of names rather than numbers, and
+// a call whose target is only known at execution.
+typedef int (*binop)(int, int);
+__device__ int d_add(int a, int b) { return a + b; }
+__device__ int d_mul(int a, int b) { return a * b; }
+__device__ int d_sub(int a, int b) { return a - b; }
+__device__ binop d_table[3] = {d_add, d_mul, d_sub};
+
 struct Big { float a, b, c, d; };
 __device__ __noinline__ Big make_big(float x) { return Big{x, x + 1, x + 2, x + 3}; }
 __device__ __noinline__ float consume(Big b) { return b.a + b.b * 2 + b.c * 3 + b.d * 4; }
 
-__global__ void k(int* out, float* fout) {
+__global__ void k(int* out, float* fout, int which) {
     const int t = threadIdx.x;
+    { binop f = d_table[which]; out[96 + t] = f(t + 2, 3); }
     out[t] = slow_add(t, 7);
     fout[t] = slow_scale((float)t, 2.0f);
     out[32 + t] = branchy(t);
@@ -42,7 +53,7 @@ int main() {
     int* d; float* f;
     cudaMalloc(&d, 128 * sizeof(int));
     cudaMalloc(&f, 128 * sizeof(float));
-    k<<<1, 32>>>(d, f);
+    k<<<1, 32>>>(d, f, 1);   // d_mul
     cudaDeviceSynchronize();
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::printf("cuda error: %s\n", cudaGetErrorString(e)); return 1; }
@@ -62,6 +73,9 @@ int main() {
         float con = x + (x+1)*2 + (x+2)*3 + (x+3)*4;
         if (hf[32+t] != sum) { std::printf("FAIL struct ret[%d]=%g want %g\n", t, hf[32+t], sum); ++bad; }
         if (hf[64+t] != con) { std::printf("FAIL struct arg[%d]=%g want %g\n", t, hf[64+t], con); ++bad; }
+        if (h[96+t] != (t + 2) * 3) {
+            std::printf("FAIL funcptr[%d]=%d want %d\n", t, h[96+t], (t+2)*3); ++bad;
+        }
     }
     std::printf(bad ? "FAILED\n" : "PASS\n");
     return bad ? 1 : 0;

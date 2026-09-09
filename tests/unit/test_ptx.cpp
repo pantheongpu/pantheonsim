@@ -202,10 +202,10 @@ VTEST(global_scalar_initialiser_is_not_a_symbol) {
       ".global .align 4 .f32 one = 0f3F800000;\n"
       ".visible .entry k()\n{\nret;\n}\n");
   VCHECK_EQ(m.globals.size(), size_t{2});
-  VCHECK(m.globals[0].init_symbol.empty());
+  VCHECK(m.globals[0].init_symbols.empty());
   VCHECK_EQ(m.globals[0].init.size(), size_t{4});
   VCHECK_EQ(int(m.globals[0].init[0]), 42);
-  VCHECK(m.globals[1].init_symbol.empty());
+  VCHECK(m.globals[1].init_symbols.empty());
   VCHECK_EQ(m.globals[1].init.size(), size_t{4});
 }
 
@@ -295,8 +295,11 @@ VTEST(global_initialised_with_a_symbol) {
       ".visible .entry k()\n{\nret;\n}\n");
   VCHECK_EQ(m.globals.size(), size_t{2});
   VCHECK_EQ(m.globals[1].name, std::string("pointer"));
-  VCHECK_EQ(m.globals[1].init_symbol, std::string("target"));
-  VCHECK(m.globals[1].init.empty());  // the address is only known at load time
+  VCHECK_EQ(m.globals[1].init_symbols.size(), size_t{1});
+  VCHECK_EQ(m.globals[1].init_symbols[0].name, std::string("target"));
+  VCHECK_EQ(m.globals[1].init_symbols[0].offset, uint64_t{0});
+  // The slot is zeroed; the address is written by the loader.
+  VCHECK_EQ(m.globals[1].init.size(), size_t{8});
 }
 
 // Cache hints tell the hardware how far to prefetch; they never change what a

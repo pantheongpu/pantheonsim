@@ -2795,6 +2795,10 @@ class Interpreter {
         exec_device_heap(w, ctx, ins, *op, m);
         return;
       }
+      if (op->indirect) {
+        exec_indirect_call(w, ctx, ins, *op, m);
+        return;
+      }
       if (op->target) {
         exec_user_call(w, ctx, ins, *op, m);
         return;
@@ -4507,6 +4511,43 @@ class Interpreter {
     ctx_fail(ins, static_cast<int>(lane), Err::DeviceAssert,
              "device assertion failed: " + msg + "\n  at " + file + ":" + std::to_string(line) +
              " in " + fn);
+  }
+
+  // An indirect call: the callee is whatever function the target register
+  // points at. Addresses come from kFuncVaBase and encode the index into the
+  // module's function table, so decoding one is arithmetic rather than a
+  // lookup that could go stale.
+  //
+  // Every participating lane must agree on the target. Divergent function
+  // pointers are legal PTX and would need the call split per target with the
+  // mask narrowed each time; nothing has produced that yet, and guessing which
+  // callee "wins" would run the wrong body for some lanes silently.
+  void exec_indirect_call(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op,
+                          Mask m) {
+    Lanes _s_t;
+    const Lanes& target = read_operand(w, ctx, ins, Operand{RegOperand{op.target_reg}}, _s_t);
+    uint32_t lead = W_;
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) { lead = lane; break; }
+    if (lead >= W_) return;
+    const uint64_t addr = target[lead];
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if ((m & (Mask{1} << lane)) && target[lane] != addr)
+        ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                 "indirect call with a different target per lane is not supported");
+    if (addr < kFuncVaBase || addr >= kFuncVaBase + kFuncVaSize ||
+        (addr - kFuncVaBase) % kFuncVaStride != 0)
+      ctx_fail(ins, static_cast<int>(lead), Err::InvalidPointer,
+               "indirect call through a pointer that is not the address of a device function");
+    const uint64_t index = (addr - kFuncVaBase) / kFuncVaStride;
+    if (index >= fn_.module_funcs.size())
+      ctx_fail(ins, static_cast<int>(lead), Err::InvalidPointer,
+               "indirect call to function index " + std::to_string(index) +
+                   ", which this module does not define");
+    OpCall resolved = op;
+    resolved.target = fn_.module_funcs[static_cast<size_t>(index)];
+    resolved.indirect = false;
+    exec_user_call(w, ctx, ins, resolved, m);
   }
 
   // ---- calls to device functions ----
