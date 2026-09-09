@@ -634,7 +634,9 @@ struct EntryFn {
   // buffer, because each lane passes its own arguments.
   bool is_device_func = false;
   std::vector<std::string> param_slot_names;   // in signature order
+  std::vector<uint32_t> param_slot_bytes;      // byte size of each, structs included
   std::string retval_slot_name;                // empty when it returns void
+  uint32_t retval_bytes = 0;
   std::vector<ParamDecl> params;
   std::vector<Instr> body;
   std::map<std::string, Type> reg_decls;      // declared virtual registers

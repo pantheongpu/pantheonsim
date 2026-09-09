@@ -21,22 +21,32 @@ __device__ __noinline__ int branchy(int n) {   // divergence inside the callee
 }
 __device__ __noinline__ int fact(int n) { return n <= 1 ? 1 : n * fact(n - 1); }
 
+// Structs by value, in both directions. A call slot is a byte buffer per lane,
+// so a 16-byte struct is as much a slot as an int is -- but it only became one
+// when the slot stopped being a single value per lane.
+struct Big { float a, b, c, d; };
+__device__ __noinline__ Big make_big(float x) { return Big{x, x + 1, x + 2, x + 3}; }
+__device__ __noinline__ float consume(Big b) { return b.a + b.b * 2 + b.c * 3 + b.d * 4; }
+
 __global__ void k(int* out, float* fout) {
     const int t = threadIdx.x;
     out[t] = slow_add(t, 7);
     fout[t] = slow_scale((float)t, 2.0f);
     out[32 + t] = branchy(t);
     out[64 + t] = fact(t % 7);
+    Big b = make_big((float)t);
+    fout[32 + t] = b.a + b.b + b.c + b.d;
+    fout[64 + t] = consume(b);
 }
 int main() {
     int* d; float* f;
     cudaMalloc(&d, 128 * sizeof(int));
-    cudaMalloc(&f, 32 * sizeof(float));
+    cudaMalloc(&f, 128 * sizeof(float));
     k<<<1, 32>>>(d, f);
     cudaDeviceSynchronize();
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::printf("cuda error: %s\n", cudaGetErrorString(e)); return 1; }
-    int h[128]; float hf[32];
+    int h[128]; float hf[128];
     cudaMemcpy(h, d, sizeof h, cudaMemcpyDeviceToHost);
     cudaMemcpy(hf, f, sizeof hf, cudaMemcpyDeviceToHost);
     int bad = 0;
@@ -47,6 +57,11 @@ int main() {
         if (h[32+t] != wb) { std::printf("FAIL branchy[%d]=%d want %d\n", t, h[32+t], wb); ++bad; }
         int n = t % 7, wf = 1; for (int i = 2; i <= n; ++i) wf *= i;
         if (h[64+t] != wf) { std::printf("FAIL fact[%d]=%d want %d\n", t, h[64+t], wf); ++bad; }
+        float x = (float)t;
+        float sum = x + (x+1) + (x+2) + (x+3);
+        float con = x + (x+1)*2 + (x+2)*3 + (x+3)*4;
+        if (hf[32+t] != sum) { std::printf("FAIL struct ret[%d]=%g want %g\n", t, hf[32+t], sum); ++bad; }
+        if (hf[64+t] != con) { std::printf("FAIL struct arg[%d]=%g want %g\n", t, hf[64+t], con); ++bad; }
     }
     std::printf(bad ? "FAILED\n" : "PASS\n");
     return bad ? 1 : 0;

@@ -468,16 +468,16 @@ class Parser {
         next();
         expect_int("alignment");
       }
-      expect_type("return value declaration");
+      const Type rty = expect_type("return value declaration");
       fn.retval_slot_name = expect_word("return value name");
+      // An aggregate return: ".param .align 4 .b8 func_retval0[16]". The
+      // element type is .b8 and the bracket carries the byte count.
       if (peek_punct("[")) {
-        // An aggregate return: ".param .align 4 .b8 func_retval0[16]". A call
-        // slot holds one value per lane, so a 16-byte struct has nowhere to
-        // sit. Truncating it to the first 8 bytes would return a struct whose
-        // tail is whatever was there before, which is worse than not running.
-        fail_unsupported(peek().line, ".func returning an aggregate", fn.name,
-                         "device functions returning a struct or array are not supported; "
-                         "scalar returns are");
+        next();
+        fn.retval_bytes = static_cast<uint32_t>(expect_int("return value size")) * rty.bytes();
+        expect_punct("]");
+      } else {
+        fn.retval_bytes = rty.bytes();
       }
       call_slots_.insert(fn.retval_slot_name);
       expect_punct(")");
@@ -493,14 +493,16 @@ class Parser {
           next();
           expect_int("alignment");
         }
-        expect_type("parameter declaration");
+        const Type pty = expect_type("parameter declaration");
         while (peek().kind == Token::Kind::Word && peek().text[0] == '.') next();  // ptr annotations
         const std::string pname = expect_word("parameter name");
-        if (peek_punct("[")) {
-          fail_unsupported(peek().line, ".func taking an aggregate", fn.name,
-                           "device function parameters that are structs or arrays are not "
-                           "supported; scalar parameters are");
+        uint32_t pbytes = pty.bytes();
+        if (peek_punct("[")) {  // a struct or array passed by value
+          next();
+          pbytes = static_cast<uint32_t>(expect_int("parameter size")) * pty.bytes();
+          expect_punct("]");
         }
+        fn.param_slot_bytes.push_back(pbytes);
         fn.param_slot_names.push_back(pname);
         call_slots_.insert(pname);
         if (peek_punct(",")) next();
@@ -688,12 +690,21 @@ class Parser {
         Instr ins;
         ins.line = t.line;
         OpDeclSlot d;
+        // ".param .align 4 .b8 retval0[16];" -- an aggregate call slot. The
+        // alignment is a layout hint the slot does not need (it is a private
+        // byte buffer, not device memory), but it must be consumed.
+        if (peek().kind == Token::Kind::Word && peek().text == ".align") {
+          next();
+          expect_int("slot alignment");
+        }
         Type ty = expect_type(".param slot declaration");
         d.name = expect_word("slot name");
         d.size = ty.bytes();
-        if (peek_punct("["))
-          fail_unsupported(t.line, ".param array call slot", fn.name,
-                           "aggregate call arguments are not supported yet");
+        if (peek_punct("[")) {
+          next();
+          d.size = static_cast<uint32_t>(expect_int("slot size")) * ty.bytes();
+          expect_punct("]");
+        }
         expect_punct(";");
         call_slots_.insert(d.name);
         ins.op = d;

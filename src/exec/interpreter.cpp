@@ -214,7 +214,31 @@ struct Warp {
   // land; reused per read to avoid touching the allocator.
   mutable std::array<Lanes, 4> widen_scratch;
   mutable uint32_t widen_next = 0;
-  std::unordered_map<std::string, Lanes> slots;  // call-argument slots
+  // Call-argument slots. Byte-addressable rather than one value per lane,
+  // because a .param slot can hold a struct: "st.param.b32 [param0+8], %r"
+  // writes at an offset, and a slot that stored a single 64-bit value per lane
+  // had nowhere to put the rest. Laid out lane-major: bytes[lane*size + off].
+  struct Slot {
+    uint32_t size = 8;
+    std::vector<uint8_t> bytes;
+    void reset(uint32_t sz, uint32_t lanes) {
+      size = sz ? sz : 8;
+      bytes.assign(static_cast<size_t>(size) * lanes, 0);
+    }
+    uint64_t read(uint32_t lane, uint32_t off, uint32_t nbytes) const {
+      uint64_t v = 0;
+      const size_t base = static_cast<size_t>(lane) * size + off;
+      if (base + nbytes > bytes.size()) return 0;
+      std::memcpy(&v, bytes.data() + base, nbytes);
+      return v;
+    }
+    void write(uint32_t lane, uint32_t off, uint32_t nbytes, uint64_t v) {
+      const size_t base = static_cast<size_t>(lane) * size + off;
+      if (base + nbytes > bytes.size()) return;
+      std::memcpy(bytes.data() + base, &v, nbytes);
+    }
+  };
+  std::unordered_map<std::string, Slot> slots;
   std::vector<std::vector<uint8_t>> local;       // per-lane .local frames (lazy)
   std::array<uint32_t, kMaxWarpSize> tid_x{}, tid_y{}, tid_z{};
   // PTX's condition-code carry bit, one per lane. Written by ".cc" arithmetic
@@ -2725,26 +2749,41 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpDeclSlot>(&ins.op)) {
-      w.slots[op->name].fill(0);
+      w.slots[op->name].reset(op->size, W_);
       return;
     }
     if (const auto* op = std::get_if<OpStSlot>(&ins.op)) {
-      if (op->offset != 0)
-        ctx_fail(ins, -1, Err::UnsupportedPtx, "st.param at a non-zero slot offset");
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
-      Lanes& slot = w.slots[op->slot];
+      Warp::Slot& slot = w.slots[op->slot];
+      const uint32_t nbytes = op->ty.bytes() ? op->ty.bytes() : 4u;
+      // A slot written before it was declared (or wider than declared) grows
+      // to fit rather than dropping the write silently.
+      const uint32_t need = static_cast<uint32_t>(op->offset) + nbytes;
+      if (slot.bytes.empty() || slot.size < need) {
+        Warp::Slot grown;
+        grown.reset(slot.size < need ? need : slot.size, W_);
+        for (uint32_t lane = 0; lane < W_ && !slot.bytes.empty(); ++lane)
+          std::memcpy(grown.bytes.data() + static_cast<size_t>(lane) * grown.size,
+                      slot.bytes.data() + static_cast<size_t>(lane) * slot.size, slot.size);
+        slot = std::move(grown);
+      }
       for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane)) slot[lane] = mask_to_bits(v[lane], op->ty.bits);
+        if (m & (Mask{1} << lane))
+          slot.write(lane, static_cast<uint32_t>(op->offset), nbytes,
+                     mask_to_bits(v[lane], op->ty.bits));
       return;
     }
     if (const auto* op = std::get_if<OpLdSlot>(&ins.op)) {
       auto it = w.slots.find(op->slot);
       if (it == w.slots.end())
         ctx_fail(ins, -1, Err::UninitializedRegister, "call slot '" + op->slot + "' read before write");
-      if (op->offset != 0)
-        ctx_fail(ins, -1, Err::UnsupportedPtx, "ld.param at a non-zero slot offset");
-      write_reg(w, op->dst, m, it->second, op->ty.bits);
+      const uint32_t nbytes = op->ty.bytes() ? op->ty.bytes() : 4u;
+      Lanes r{};
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane))
+          r[lane] = it->second.read(lane, static_cast<uint32_t>(op->offset), nbytes);
+      write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
     if (const auto* op = std::get_if<OpCall>(&ins.op)) {
@@ -4459,7 +4498,7 @@ class Interpreter {
       auto it = w.slots.find(op.param_slots[i]);
       if (it == w.slots.end())
         ctx_fail(ins, -1, Err::UninitializedRegister, "__assertfail argument slot read before write");
-      return it->second[lane];
+      return it->second.read(lane, 0, 8);
     };
     const std::string msg = read_cstring(w, ctx, ins, lane, slot(0));
     const std::string file = read_cstring(w, ctx, ins, lane, slot(1));
@@ -4498,7 +4537,7 @@ class Interpreter {
 
     // Bind arguments before anything is swapped out: they live in the caller's
     // slot map and are read per lane.
-    std::unordered_map<std::string, Lanes> args;
+    std::unordered_map<std::string, Warp::Slot> args;
     for (size_t i = 0; i < op.param_slots.size(); ++i) {
       auto it = w.slots.find(op.param_slots[i]);
       if (it == w.slots.end()) {
@@ -4506,6 +4545,8 @@ class Interpreter {
         ctx_fail(ins, -1, Err::UninitializedRegister,
                  "argument slot '" + op.param_slots[i] + "' read before write");
       }
+      // Copied whole, bytes and all: a struct argument is as much a slot as a
+      // scalar one, and only the name changes across the call boundary.
       args[callee.param_slot_names[i]] = it->second;
     }
 
@@ -4543,7 +4584,7 @@ class Interpreter {
       --call_depth_;
     };
 
-    Lanes retval{};
+    Warp::Slot retval;
     bool have_ret = false;
     try {
       // The callee's own divergence is handled by the same path machinery; it
@@ -4627,7 +4668,7 @@ class Interpreter {
     Lanes result{};
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
-      const uint64_t arg = it->second[lane];
+      const uint64_t arg = it->second.read(lane, 0, 8);
       std::lock_guard<std::mutex> guard(device_heap_mu());
       if (allocating) {
         auto& used = device_heap_used();
@@ -4659,7 +4700,12 @@ class Interpreter {
         mem_.free(arg);
       }
     }
-    if (allocating && !op.retval_slot.empty()) w.slots[op.retval_slot] = result;
+    if (allocating && !op.retval_slot.empty()) {
+      Warp::Slot& out = w.slots[op.retval_slot];
+      if (out.bytes.empty()) out.reset(8, W_);
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) out.write(lane, 0, 8, result[lane]);
+    }
   }
 
   static constexpr uint64_t kDeviceHeapBytes = 8ull << 20;  // CUDA's default
@@ -4687,8 +4733,8 @@ class Interpreter {
     Lanes counts{};
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
-      std::string fmt = read_cstring(w, ctx, ins, lane, fmt_it->second[lane]);
-      uint64_t valist = va_it->second[lane];
+      std::string fmt = read_cstring(w, ctx, ins, lane, fmt_it->second.read(lane, 0, 8));
+      uint64_t valist = va_it->second.read(lane, 0, 8);
       uint64_t cursor = 0;
       std::string out;
       char buf[256];
@@ -4777,9 +4823,10 @@ class Interpreter {
       counts[lane] = out.size();
     }
     if (!op.retval_slot.empty()) {
-      Lanes& slot = w.slots[op.retval_slot];
+      Warp::Slot& slot = w.slots[op.retval_slot];
+      if (slot.bytes.empty()) slot.reset(4, W_);
       for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane)) slot[lane] = counts[lane];
+        if (m & (Mask{1} << lane)) slot.write(lane, 0, 4, counts[lane]);
     }
   }
 
