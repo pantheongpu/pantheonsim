@@ -138,6 +138,7 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
     // reported as CUDA_ERROR_UNKNOWN -- the least informative code available,
     // for the two conditions this project most wants to be legible.
     case Err::Trap: return CUDA_ERROR_ILLEGAL_INSTRUCTION;
+    case Err::DeviceAssert: return CUDA_ERROR_ASSERT;
     case Err::DataRace: return CUDA_ERROR_LAUNCH_FAILED;
     case Err::DoubleFree:
     case Err::InvalidFree:

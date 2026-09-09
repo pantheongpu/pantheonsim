@@ -53,6 +53,18 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
 - `min.NaN`/`max.NaN`, which propagate a NaN instead of returning the other
   operand. The plain forms follow fmin/fmax; the two disagree on exactly the
   inputs a kernel clamping to keep NaNs visible cares about.
+- Builtins a kernel can call: `vprintf`, `__assertfail` (a failed `assert()`
+  reports its message and source location, and `cudaErrorAssert`), and the
+  device heap -- `malloc`/`free` from inside a kernel, backed by the same
+  allocator `cudaMalloc` uses so a device allocation gets the same
+  out-of-bounds and use-after-free checking. Capped at CUDA's default 8 MiB;
+  memory allocated there is reachable from the host here and is not on a
+  device, which is a permissive difference and recorded as one.
+- The SIMD video instructions (`vadd4`, `vsub4`, `vabsdiff4`, `vmin4`,
+  `vmax4`, `vavrg4` and the 2-way forms), `set` (setp's sibling that writes a
+  value, where an integer destination gets all-ones for true and a float one
+  gets 1.0), `atom.inc`/`.dec` (which wrap against the operand rather than
+  counting), and `abs` on the half types.
 - FP8: `cvt` between e4m3x2/e5m2x2 and f32/f16x2/bf16x2, with `.satfinite`.
   The two formats are not one shape with a different bias -- e4m3 spends its
   top exponent on ordinary numbers and has no infinity, so 448 is its largest

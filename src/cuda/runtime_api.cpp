@@ -171,6 +171,7 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
     // "trap" is what a failed device assert and an unreachable path compile to,
     // and hardware surfaces it as an illegal instruction.
     case Err::Trap: code = cudaErrorIllegalInstruction; break;
+    case Err::DeviceAssert: code = cudaErrorAssert; break;
     // A data race is this simulator's own finding rather than a CUDA condition.
     // "unspecified launch failure" is the closest real code, and it is at least
     // true that the launch did not produce a result anyone should use.
@@ -548,9 +549,19 @@ VGPU_EXPORT cudaError_t cudaGetDeviceFlags(unsigned int* flags) {
 // programs check for errors. Returning the sticky error (and clearing it, as
 // CUDA does) keeps a failed kernel from looking like success.
 VGPU_EXPORT cudaError_t cudaDeviceSynchronize(void) {
-  cudaError_t e = g_last_error;
-  g_last_error = cudaSuccess;
-  return e;
+  // Returns the recorded error but does NOT clear it. CUDA resets the recorded
+  // error in exactly one place -- cudaGetLastError -- and clearing it here
+  // broke the most common way anyone checks a kernel:
+  //
+  //     kernel<<<...>>>();
+  //     cudaDeviceSynchronize();
+  //     if (cudaGetLastError() != cudaSuccess) ...
+  //
+  // The sync consumed the error, the check found cudaSuccess, and a kernel
+  // that had died on an illegal address reported success. Every launch here is
+  // synchronous, so by the time this is called the error is already recorded;
+  // there is nothing to wait for and nothing to consume.
+  return g_last_error;
 }
 VGPU_EXPORT cudaError_t cudaDeviceReset(void) {
   g_last_error = cudaSuccess;
@@ -1678,6 +1689,7 @@ VGPU_EXPORT const char* cudaGetErrorString(cudaError_t error) {
     case cudaErrorNotSupported: return "operation not supported";
     case cudaErrorInvalidConfiguration: return "invalid configuration argument";
     case cudaErrorIllegalInstruction: return "an illegal instruction was encountered";
+    case cudaErrorAssert: return "device-side assert triggered";
     case cudaErrorLaunchFailure: return "unspecified launch failure";
     case cudaErrorCooperativeLaunchTooLarge:
       return "too many blocks in cooperative launch";

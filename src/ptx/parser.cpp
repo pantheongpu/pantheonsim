@@ -109,6 +109,32 @@ std::vector<std::string> split_dots(const std::string& s) {
   return parts;
 }
 
+// Is this a SIMD video mnemonic? The name is v<op><lanes>, so the operation is
+// everything between the leading v and the trailing lane count.
+const char* video_simd_base(const std::string& op0) {
+  static const char* kOps[] = {"add", "sub", "absdiff", "min", "max", "avrg"};
+  const std::string base = op0.substr(1, op0.size() - 2);
+  for (const char* o : kOps)
+    if (base == o) return o;
+  return nullptr;
+}
+
+// The comparison suffixes, shared by setp and set.
+const std::unordered_map<std::string, CmpOp>& cmp_table() {
+  static const std::unordered_map<std::string, CmpOp> t = {
+      {"eq", CmpOp::Eq},   {"ne", CmpOp::Ne},   {"lt", CmpOp::Lt},
+      {"le", CmpOp::Le},   {"gt", CmpOp::Gt},   {"ge", CmpOp::Ge},
+      // Unsigned integer forms share the ordered comparators; the operand
+      // type already selects signed vs unsigned interpretation.
+      {"lo", CmpOp::Lt},   {"ls", CmpOp::Le},   {"hi", CmpOp::Gt},
+      {"hs", CmpOp::Ge},
+      // Float unordered (NaN-true) forms and the NaN tests.
+      {"equ", CmpOp::Equ}, {"neu", CmpOp::Neu}, {"ltu", CmpOp::Ltu},
+      {"leu", CmpOp::Leu}, {"gtu", CmpOp::Gtu}, {"geu", CmpOp::Geu},
+      {"num", CmpOp::Num}, {"nan", CmpOp::Nan}};
+  return t;
+}
+
 std::optional<Type> parse_type_token(const std::string& part) {
   if (part == "pred") return Type{Type::Kind::Pred, 1};
   if (part == "bf16") return Type{Type::Kind::BF, 16};
@@ -502,6 +528,22 @@ class Parser {
         parse_reg_decl(fn);
         continue;
       }
+      // ".reg.b16 hl, hu;" -- the type glued to the directive with no space.
+      // CUDA's own headers write it this way inside inline asm: h2exp, h2log
+      // and the rest of the half2 math family all begin with a line like that,
+      // so a kernel calling any of them arrives here. The lexer sees one word,
+      // and splitting it is the whole fix.
+      if (t.kind == Token::Kind::Word && t.text.size() > 4 &&
+          t.text.compare(0, 5, ".reg.") == 0) {
+        const std::string type_part = t.text.substr(5);
+        auto ty = parse_type_token(type_part);
+        if (!ty)
+          fail_unsupported(t.line, t.text, fn.name,
+                           "register type '." + type_part + "' is not implemented");
+        next();
+        parse_reg_decl_of_type(fn, *ty);
+        continue;
+      }
       if (t.kind == Token::Kind::Word && t.text == ".local") {
         next();
         parse_local_decl(fn, t.line);
@@ -571,7 +613,10 @@ class Parser {
   }
 
   void parse_reg_decl(EntryFn& fn) {
-    Type ty = expect_type(".reg declaration");
+    parse_reg_decl_of_type(fn, expect_type(".reg declaration"));
+  }
+
+  void parse_reg_decl_of_type(EntryFn& fn, Type ty) {
     while (true) {
       std::string name = expect_word("register name");
       if (peek_punct("<")) {  // parameterized: .reg .b32 %r<6> declares %r0..%r5
@@ -1105,7 +1150,7 @@ class Parser {
         ins.op = op;
       }
     } else if ((op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "fma" || op0 == "neg" ||
-                op0 == "min" || op0 == "max") &&
+                op0 == "abs" || op0 == "min" || op0 == "max") &&
                (opcode.find("f16") != std::string::npos ||
                 opcode.find("bf16") != std::string::npos)) {
       // Half-precision arithmetic in all four shapes: f16, f16x2, bf16, bf16x2.
@@ -1124,8 +1169,8 @@ class Parser {
       Reg dst = expect_reg_operand("destination");
       expect_punct(",");
       Operand a = parse_operand();
-      if (op0 == "neg") {
-        ins.op = OpF16x2Neg{is_bf, is_packed, dst, a};
+      if (op0 == "neg" || op0 == "abs") {
+        ins.op = OpF16x2Neg{is_bf, is_packed, op0 == "abs", dst, a};
       } else {
         expect_punct(",");
         Operand b = parse_operand();
@@ -1562,6 +1607,47 @@ class Parser {
       expect_punct(",");
       op.c = parse_operand();
       ins.op = op;
+    } else if (op0.size() > 3 && op0[0] == 'v' &&
+               (op0.back() == '2' || op0.back() == '4') &&
+               video_simd_base(op0) != nullptr) {
+      // vadd4 / vsub4 / vabsdiff4 / vmin4 / vmax4 / vavrg4, and the 2-way forms.
+      OpVideoSimd op;
+      op.lanes = op0.back() == '4' ? 4u : 2u;
+      const std::string base = op0.substr(1, op0.size() - 2);
+      if (base == "add") op.op = VideoOp::Add;
+      else if (base == "sub") op.op = VideoOp::Sub;
+      else if (base == "absdiff") op.op = VideoOp::AbsDiff;
+      else if (base == "min") op.op = VideoOp::Min;
+      else if (base == "max") op.op = VideoOp::Max;
+      else if (base == "avrg") op.op = VideoOp::Avrg;
+      else return unsupported("SIMD video op '" + op0 + "'");
+      std::vector<std::string> tys;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        if (parts[i] == "sat") { op.sat = true; continue; }
+        // The secondary-operation forms fold the lanes into a scalar with c,
+        // which is a different instruction wearing the same name.
+        if (parts[i] == "add" || parts[i] == "min" || parts[i] == "max")
+          return unsupported(op0 + " with a secondary '." + parts[i] + "' operation");
+        tys.push_back(parts[i]);
+      }
+      if (tys.size() != 3) return unsupported(op0 + " form (expected .dtype.atype.btype)");
+      auto sgn = [](const std::string& t) { return !t.empty() && t[0] == 's'; };
+      op.d_signed = sgn(tys[0]);
+      op.a_signed = sgn(tys[1]);
+      op.b_signed = sgn(tys[2]);
+      op.dst = expect_reg_operand(op0 + " destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      // The byte/halfword selector forms pick which lane of the source each
+      // lane reads. Nothing emits them here yet, and guessing at the selection
+      // would silently permute the result.
+      if (peek_punct(".")) return unsupported(op0 + " with a lane selector");
+      expect_punct(",");
+      op.b = parse_operand();
+      if (peek_punct(".")) return unsupported(op0 + " with a lane selector");
+      expect_punct(",");
+      op.c = parse_operand();
+      ins.op = op;
     } else if (op0 == "bfind") {
       OpBfind op;
       size_t ti = 1;
@@ -1866,6 +1952,8 @@ class Parser {
         else if (p == "xor") aop = AtomOp::Xor;
         else if (p == "exch") aop = AtomOp::Exch;
         else if (p == "cas") aop = AtomOp::Cas;
+        else if (p == "inc") aop = AtomOp::Inc;
+        else if (p == "dec") aop = AtomOp::Dec;
         else if (p == "f16x2") { ty = Type{Type::Kind::F, 16}; have_ty = true; packed_half = true; }
         else if (p == "bf16x2") { ty = Type{Type::Kind::BF, 16}; have_ty = true; packed_half = true; }
         else if (auto t2 = parse_type_token(p)) {
@@ -1879,6 +1967,9 @@ class Parser {
       // ML work. CUDA exposes add/exch/min/max on float and double; the
       // bitwise ops and CAS are integer-only there too, and a program that
       // wants CAS on a float does it through .b32.
+      if ((*aop == AtomOp::Inc || *aop == AtomOp::Dec) &&
+          !(ty.kind == Type::Kind::U && ty.bits == 32))
+        return unsupported("atom.inc/.dec are defined for .u32 only");
       if (ty.is_float()) {
         if (*aop != AtomOp::Add && *aop != AtomOp::Exch && *aop != AtomOp::Min &&
             *aop != AtomOp::Max)
@@ -2089,23 +2180,42 @@ class Parser {
         if (!lo) return unsupported("integer mad requires .lo or .wide");
         ins.op = OpMadLo{ty, dst, a, b, c, carry_in, carry_out};
       }
+    } else if (op0 == "set") {
+      // set.<cmp>[.ftz].<dtype>.<stype> d, a, b
+      std::vector<std::string> ps = parts;
+      for (size_t i = 2; i < ps.size();)
+        if (ps[i] == "ftz") ps.erase(ps.begin() + i); else ++i;
+      if (ps.size() != 4) return unsupported("set form (expected set.<cmp>.<dtype>.<stype>)");
+      auto it = cmp_table().find(ps[1]);
+      if (it == cmp_table().end()) return unsupported("comparison '." + ps[1] + "'");
+      OpSet op;
+      op.cmp = it->second;
+      auto dt = ps[2] == "f16x2"  ? std::optional<Type>{Type{Type::Kind::F, 16}}
+              : ps[2] == "bf16x2" ? std::optional<Type>{Type{Type::Kind::BF, 16}}
+                                  : parse_type_token(ps[2]);
+      auto st = ps[3] == "f16x2"  ? std::optional<Type>{Type{Type::Kind::F, 16}}
+              : ps[3] == "bf16x2" ? std::optional<Type>{Type{Type::Kind::BF, 16}}
+                                  : parse_type_token(ps[3]);
+      if (!dt || !st) return unsupported("set types '." + ps[2] + "." + ps[3] + "'");
+      const bool dpack = ps[2] == "f16x2" || ps[2] == "bf16x2";
+      const bool spack = ps[3] == "f16x2" || ps[3] == "bf16x2";
+      if (dpack != spack)
+        return unsupported("set with only one side packed ('." + ps[2] + "." + ps[3] + "')");
+      op.dty = *dt;
+      op.sty = *st;
+      op.packed = dpack;
+      op.dst = expect_reg_operand("set destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      ins.op = op;
     } else if (op0 == "setp") {
       // setp.<cmp>[.ftz].<type> — drop the flush-to-zero qualifier.
       if (parts.size() == 4 && parts[2] == "ftz") parts.erase(parts.begin() + 2);
       if (parts.size() != 3) return unsupported("setp form (only setp.<cmp>.<type> is implemented)");
-      static const std::unordered_map<std::string, CmpOp> cmps = {
-          {"eq", CmpOp::Eq},   {"ne", CmpOp::Ne},   {"lt", CmpOp::Lt},
-          {"le", CmpOp::Le},   {"gt", CmpOp::Gt},   {"ge", CmpOp::Ge},
-          // Unsigned integer forms share the ordered comparators; the operand
-          // type already selects signed vs unsigned interpretation.
-          {"lo", CmpOp::Lt},   {"ls", CmpOp::Le},   {"hi", CmpOp::Gt},
-          {"hs", CmpOp::Ge},
-          // Float unordered (NaN-true) forms and the NaN tests.
-          {"equ", CmpOp::Equ}, {"neu", CmpOp::Neu}, {"ltu", CmpOp::Ltu},
-          {"leu", CmpOp::Leu}, {"gtu", CmpOp::Gtu}, {"geu", CmpOp::Geu},
-          {"num", CmpOp::Num}, {"nan", CmpOp::Nan}};
-      auto it = cmps.find(parts[1]);
-      if (it == cmps.end()) return unsupported("comparison '." + parts[1] + "'");
+      auto it = cmp_table().find(parts[1]);
+      if (it == cmp_table().end()) return unsupported("comparison '." + parts[1] + "'");
       auto ty = parse_type_token(parts[2]);
       if (!ty) fail(ins.line, "setp missing type");
       OpSetp op;
@@ -2152,8 +2262,10 @@ class Parser {
         if (peek_punct(",")) next();
       }
       next();
-      if (op.callee != "vprintf")
-        return unsupported("call to '" + op.callee + "' (only the vprintf builtin is callable)");
+      if (op.callee != "vprintf" && op.callee != "__assertfail" && op.callee != "malloc" &&
+          op.callee != "free")
+        return unsupported("call to '" + op.callee +
+                           "' (callable builtins are vprintf, __assertfail, malloc and free)");
       ins.op = op;
     } else if (op0 == "activemask") {
       OpActiveMask op;

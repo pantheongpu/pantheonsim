@@ -1651,6 +1651,67 @@ class Interpreter {
       write_reg(w, op->dst, m, r, op->src_bits * 2);  // .wide doubles the width
       return;
     }
+    if (const auto* op = std::get_if<OpSet>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes r;
+      const bool dfloat = op->dty.is_real();
+      const bool sbf = op->sty.is_bfloat();
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        const int halves = op->packed ? 2 : 1;
+        uint64_t out = 0;
+        for (int h = 0; h < halves; ++h) {
+          double x, y;
+          if (op->packed) {
+            const uint64_t ax = (a[lane] >> (16 * h)) & 0xFFFF;
+            const uint64_t bx = (b[lane] >> (16 * h)) & 0xFFFF;
+            x = sbf ? bf16_to_double(ax) : f16_to_double(ax);
+            y = sbf ? bf16_to_double(bx) : f16_to_double(bx);
+          } else if (op->sty.is_real()) {
+            x = op->sty.bits == 64 ? f64(a[lane])
+              : op->sty.bits == 32 ? static_cast<double>(f32(a[lane]))
+              : sbf                ? bf16_to_double(a[lane] & 0xFFFF)
+                                   : f16_to_double(a[lane] & 0xFFFF);
+            y = op->sty.bits == 64 ? f64(b[lane])
+              : op->sty.bits == 32 ? static_cast<double>(f32(b[lane]))
+              : sbf                ? bf16_to_double(b[lane] & 0xFFFF)
+                                   : f16_to_double(b[lane] & 0xFFFF);
+          } else {
+            x = y = 0;  // integer compare below
+          }
+          bool t;
+          if (op->packed) {
+            t = compare_float(op->cmp, x, y);
+          } else {
+            // The scalar path reuses setp's comparator, which already handles
+            // the signed/unsigned and NaN-aware cases from the source type.
+            t = compare(op->cmp, op->sty, a[lane], b[lane]);
+          }
+          (void)x; (void)y;
+          // True's encoding comes from the *destination* type: an integer
+          // destination gets all ones, a float destination gets 1.0. Writing 1
+          // into an integer destination is the easy mistake, and it makes
+          // every use of the result as a mask select a single bit.
+          if (op->packed) {
+            const uint64_t one = op->dty.is_bfloat() ? double_to_bf16(1.0) : double_to_f16(1.0);
+            out |= (t ? one : 0ull) << (16 * h);
+          } else if (dfloat) {
+            out = op->dty.bits == 64 ? f64bits(t ? 1.0 : 0.0)
+                : op->dty.bits == 32 ? f32bits(t ? 1.0f : 0.0f)
+                : op->dty.is_bfloat() ? double_to_bf16(t ? 1.0 : 0.0)
+                                      : double_to_f16(t ? 1.0 : 0.0);
+          } else {
+            out = t ? mask_to_bits(~0ull, op->dty.bits) : 0ull;
+          }
+        }
+        r[lane] = out;
+      }
+      write_reg(w, op->dst, m, r, op->packed ? 32u : (op->dty.bits < 32 ? 32u : op->dty.bits));
+      return;
+    }
     if (const auto* op = std::get_if<OpSelp>(&ins.op)) {
       Mask p = read_pred(w, ins, op->pred);
       Lanes _s_a;
@@ -1977,6 +2038,54 @@ class Interpreter {
             }
             r[lane] = out;
           }
+      }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpVideoSimd>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      Lanes _s_b;
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes r;
+      const uint32_t width = 32u / op->lanes;             // 8 or 16 bits per lane
+      const uint64_t lane_mask = (1ull << width) - 1ull;
+      const int64_t lo = op->d_signed ? -(int64_t{1} << (width - 1)) : 0;
+      const int64_t hi = op->d_signed ? (int64_t{1} << (width - 1)) - 1
+                                      : static_cast<int64_t>(lane_mask);
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        uint64_t out = 0;
+        for (uint32_t i = 0; i < op->lanes; ++i) {
+          const uint64_t ab = (a[lane] >> (width * i)) & lane_mask;
+          const uint64_t bb = (b[lane] >> (width * i)) & lane_mask;
+          // Sign extension happens per lane, from the lane's own width. Reading
+          // the register as one value and letting a borrow cross a lane
+          // boundary is what makes these instructions worth having.
+          auto ext = [&](uint64_t v, bool sgn) -> int64_t {
+            if (!sgn) return static_cast<int64_t>(v);
+            return (v & (1ull << (width - 1)))
+                       ? static_cast<int64_t>(v | ~lane_mask)
+                       : static_cast<int64_t>(v);
+          };
+          const int64_t x = ext(ab, op->a_signed), y = ext(bb, op->b_signed);
+          int64_t v;
+          switch (op->op) {
+            case VideoOp::Add: v = x + y; break;
+            case VideoOp::Sub: v = x - y; break;
+            case VideoOp::AbsDiff: v = x > y ? x - y : y - x; break;
+            case VideoOp::Min: v = x < y ? x : y; break;
+            case VideoOp::Max: v = x > y ? x : y; break;
+            // vavrg rounds away from zero, which is what the video codecs it
+            // exists for expect; a plain >> 1 rounds toward negative infinity
+            // and is off by one on every odd negative sum.
+            case VideoOp::Avrg: v = (x + y + (x + y >= 0 ? 1 : -1)) / 2; break;
+            default: v = 0; break;
+          }
+          if (op->sat) v = v < lo ? lo : (v > hi ? hi : v);
+          out |= (static_cast<uint64_t>(v) & lane_mask) << (width * i);
+        }
+        r[lane] = out;
       }
       write_reg(w, op->dst, m, r, 32);
       return;
@@ -2569,9 +2678,9 @@ class Interpreter {
         if (m & (Mask{1} << lane)) {
           // The sign bit is the top bit of each 16-bit half for both f16 and
           // bf16, so this is one mask either way; only how many halves take
-          // part differs.
-          const uint64_t flip = op->packed ? 0x80008000ull : 0x00008000ull;
-          r[lane] = v[lane] ^ flip;
+          // part differs. neg flips it, abs clears it.
+          const uint64_t sign = op->packed ? 0x80008000ull : 0x00008000ull;
+          r[lane] = op->absolute ? (v[lane] & ~sign) : (v[lane] ^ sign);
         }
       write_reg(w, op->dst, m, r, 32);
       return;
@@ -2628,6 +2737,14 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpCall>(&ins.op)) {
+      if (op->callee == "__assertfail") {
+        exec_assertfail(w, ctx, ins, *op, m);
+        return;
+      }
+      if (op->callee == "malloc" || op->callee == "free") {
+        exec_device_heap(w, ctx, ins, *op, m);
+        return;
+      }
       exec_vprintf(w, ctx, ins, *op, m);
       return;
     }
@@ -4277,6 +4394,13 @@ class Interpreter {
                      : std::max(old, b);
             break;
           case AtomOp::Cas: nv = (old == mask_to_bits(cv[lane], op.ty.bits)) ? b : old; break;
+          // The wrapping forms. atomicInc counts up to b and then rolls to
+          // zero, which is what makes it a ring-buffer index rather than a
+          // counter; atomicDec counts down and rolls to b. Implementing them
+          // as +1/-1 gives a value that is right until the first wrap and
+          // wrong forever after.
+          case AtomOp::Inc: nv = (old >= b) ? 0ull : old + 1ull; break;
+          case AtomOp::Dec: nv = (old == 0ull || old > b) ? b : old - 1ull; break;
         }
         store_routed(w, ctx, ins, lane, addr, size, mask_to_bits(nv, size * 8u));
         r[lane] = old;
@@ -4301,6 +4425,109 @@ class Interpreter {
     }
     ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
              "printf format string exceeds 8 KiB (missing NUL terminator?)");
+  }
+
+  // Device-side assert(). nvcc lowers a failing assert to a call to
+  //   __assertfail(message, file, line, function, charSize)
+  // followed by a trap. Reporting the message is the whole value: an assert
+  // that failed with only "trap" tells you a kernel died and nothing about
+  // which invariant it died on, and the source location is right there in the
+  // arguments.
+  void exec_assertfail(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
+    if (op.param_slots.size() < 4)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "__assertfail expects (message, file, line, function, charSize)");
+    uint32_t lane = 0;
+    while (lane < W_ && !(m & (Mask{1} << lane))) ++lane;
+    if (lane >= W_) return;
+    auto slot = [&](size_t i) -> uint64_t {
+      auto it = w.slots.find(op.param_slots[i]);
+      if (it == w.slots.end())
+        ctx_fail(ins, -1, Err::UninitializedRegister, "__assertfail argument slot read before write");
+      return it->second[lane];
+    };
+    const std::string msg = read_cstring(w, ctx, ins, lane, slot(0));
+    const std::string file = read_cstring(w, ctx, ins, lane, slot(1));
+    const uint64_t line = slot(2);
+    const std::string fn = read_cstring(w, ctx, ins, lane, slot(3));
+    ctx_fail(ins, static_cast<int>(lane), Err::DeviceAssert,
+             "device assertion failed: " + msg + "\n  at " + file + ":" + std::to_string(line) +
+             " in " + fn);
+  }
+
+  // ---- the device heap: malloc() and free() called from a kernel ----
+  //
+  // Backed by the same allocator host-side cudaMalloc uses, so a device
+  // allocation gets the same out-of-bounds and use-after-free checking every
+  // other device pointer gets -- which is worth more here than a bump
+  // allocator would be.
+  //
+  // Two documented divergences. The heap is capped at CUDA's default 8 MiB so
+  // a runaway allocation fails the way it does on hardware rather than
+  // exhausting the host; cudaDeviceSetLimit(cudaLimitMallocHeapSize) is not
+  // wired to it yet. And memory allocated here is reachable from the host,
+  // where on a device it is not -- a permissive difference, so a program that
+  // works on hardware works here, but one that copies a device-malloc'd
+  // pointer to the host will pass here and fail there.
+  void exec_device_heap(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
+    const bool allocating = op.callee == "malloc";
+    if (op.param_slots.size() != 1)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               std::string(allocating ? "malloc" : "free") + " expects exactly one argument");
+    auto it = w.slots.find(op.param_slots[0]);
+    if (it == w.slots.end())
+      ctx_fail(ins, -1, Err::UninitializedRegister, "device heap argument slot read before write");
+
+    Lanes result{};
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint64_t arg = it->second[lane];
+      std::lock_guard<std::mutex> guard(device_heap_mu());
+      if (allocating) {
+        auto& used = device_heap_used();
+        // Each thread allocates independently, exactly as on hardware -- this
+        // is not a warp-collective call.
+        if (arg == 0 || used + arg > kDeviceHeapBytes) {
+          result[lane] = 0;  // out of heap: malloc returns null, it does not fail
+          continue;
+        }
+        uint64_t p = 0;
+        try {
+          p = mem_.alloc(arg);
+        } catch (const Error&) {
+          result[lane] = 0;
+          continue;
+        }
+        used += arg;
+        device_heap_sizes()[p] = arg;
+        result[lane] = p;
+      } else {
+        if (arg == 0) continue;  // free(nullptr) is a no-op
+        auto& sizes = device_heap_sizes();
+        auto sz = sizes.find(arg);
+        if (sz == sizes.end())
+          ctx_fail(ins, static_cast<int>(lane), Err::InvalidFree,
+                   "device free() of a pointer this kernel's heap did not allocate");
+        device_heap_used() -= sz->second;
+        sizes.erase(sz);
+        mem_.free(arg);
+      }
+    }
+    if (allocating && !op.retval_slot.empty()) w.slots[op.retval_slot] = result;
+  }
+
+  static constexpr uint64_t kDeviceHeapBytes = 8ull << 20;  // CUDA's default
+  static std::mutex& device_heap_mu() {
+    static std::mutex mu;
+    return mu;
+  }
+  static uint64_t& device_heap_used() {
+    static uint64_t used = 0;
+    return used;
+  }
+  static std::unordered_map<uint64_t, uint64_t>& device_heap_sizes() {
+    static std::unordered_map<uint64_t, uint64_t> sizes;
+    return sizes;
   }
 
   void exec_vprintf(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {

@@ -142,7 +142,11 @@ enum class FloatBinOp { Add, Sub, Mul, Min, Max, Div };
 // Ordered comparisons plus the float unordered/NaN-aware forms. The "u"
 // variants are true when either operand is NaN; Num/Nan test NaN-ness only.
 enum class CmpOp { Eq, Ne, Lt, Le, Gt, Ge, Equ, Neu, Ltu, Leu, Gtu, Geu, Num, Nan };
-enum class AtomOp { Add, Min, Max, And, Or, Xor, Exch, Cas };
+// Inc and Dec are not "add 1" and "subtract 1": they wrap against the operand.
+//   inc: old >= val            ? 0   : old + 1
+//   dec: old == 0 || old > val ? val : old - 1
+// which is what makes atomicInc a ring-buffer index and not a counter.
+enum class AtomOp { Add, Min, Max, And, Or, Xor, Exch, Cas, Inc, Dec };
 enum class PredBinOp { And, Or, Xor };
 
 // Vector loads/stores (v2/v4) carry 2 or 4 registers; scalar ops carry 1.
@@ -328,6 +332,23 @@ struct OpCvtFp8 {
   Reg dst;
   Operand a, b;
 };
+// The SIMD video instructions: vadd4, vsub4, vabsdiff4, vmin4, vmax4, vavrg4
+// and their 2-way halfword counterparts. Each treats a 32-bit register as four
+// bytes (or two halves) and applies the operation lane by lane.
+//
+// The operand types decide the signedness of the *lanes*, not of the register:
+// vabsdiff4.u32.s32.s32 compares signed bytes and produces unsigned ones, and
+// reading them all as one 32-bit value gets every lane after the first wrong
+// through borrow.
+enum class VideoOp : uint8_t { Add, Sub, AbsDiff, Min, Max, Avrg };
+struct OpVideoSimd {
+  VideoOp op = VideoOp::Add;
+  uint32_t lanes = 4;        // 4 bytes or 2 halfwords
+  bool a_signed = false, b_signed = false, d_signed = false;
+  bool sat = false;
+  Reg dst;
+  Operand a, b, c;
+};
 // copysign.f32/f64 d, a, b -- magnitude of b with the sign of a.
 struct OpCopysign { Type ty; Reg dst; Operand a, b; };
 // dp4a.{u32,s32}.{u32,s32} d, a, b, c -- four byte-wise products of a and b
@@ -379,7 +400,9 @@ struct OpFma { Type ty; Reg dst; Operand a, b, c; };
 // a 7-bit mantissa -- so the flag selects a different decode, not a scale.
 struct OpF16x2Bin { FloatBinOp op = FloatBinOp::Add; bool bf16 = false; bool packed = true; Reg dst; Operand a, b; };
 struct OpF16x2Fma { bool bf16 = false; bool packed = true; Reg dst; Operand a, b, c; };
-struct OpF16x2Neg { bool bf16 = false; bool packed = true; Reg dst; Operand src; };
+// neg and abs on half types: both are a mask over the sign bits, which sits in
+// the top bit of each 16-bit half for f16 and bf16 alike.
+struct OpF16x2Neg { bool bf16 = false; bool packed = true; bool absolute = false; Reg dst; Operand src; };
 
 // Tensor-core MMA (m16n16k16, f16 inputs, f32 accumulate). A warp-collective
 // operation: the 32 lanes jointly hold the matrices.
@@ -429,6 +452,19 @@ struct OpWmmaStore {
   Operand stride;
 };
 struct OpSetp { CmpOp cmp = CmpOp::Eq; Type ty; Reg dst; Operand a, b; };
+// set.<cmp>.<dtype>.<stype> d, a, b -- setp's sibling that writes a value
+// instead of a predicate. The result depends on the destination type, not on
+// the comparison: an integer d gets all-ones for true, a float d gets 1.0.
+// Writing 1 into an integer d is the easy mistake, and it makes every use as a
+// mask silently select one bit.
+struct OpSet {
+  CmpOp cmp = CmpOp::Eq;
+  Type dty;         // destination type: decides true's encoding
+  Type sty;         // source type: decides how a and b are compared
+  bool packed = false;  // f16x2/bf16x2: two independent comparisons
+  Reg dst;
+  Operand a, b;
+};
 struct OpSelp { Type ty; Reg dst; Operand a, b; Reg pred; };
 struct OpPredBin { PredBinOp op = PredBinOp::And; Reg dst; Reg a, b; };
 struct OpNotPred { Reg dst; Reg src; };
@@ -531,8 +567,8 @@ struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; };
 struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
-                        OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpActiveMask>;
 
 struct Instr {
