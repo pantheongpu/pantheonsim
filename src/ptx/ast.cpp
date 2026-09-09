@@ -7,12 +7,18 @@ namespace vgpu::ptx {
 
 std::string Type::str() const {
   if (kind == Kind::Pred) return ".pred";
+  // bfloat16 is its own kind, and it was missing here: it fell through to the
+  // 'b' default and printed as ".b16", so every diagnostic naming a bf16 type
+  // said "bits" instead. The switch is exhaustive now so the compiler catches
+  // the next kind that is added.
+  if (kind == Kind::BF) return ".bf" + std::to_string(bits);
   char k = 'b';
   switch (kind) {
     case Kind::B: k = 'b'; break;
     case Kind::U: k = 'u'; break;
     case Kind::S: k = 's'; break;
     case Kind::F: k = 'f'; break;
+    case Kind::BF: break;   // handled above
     case Kind::Pred: break;
   }
   return std::string(".") + k + std::to_string(bits);

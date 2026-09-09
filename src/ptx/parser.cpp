@@ -290,10 +290,18 @@ class Parser {
   void resolve_calls(Module& m) {
     std::unordered_map<std::string, std::shared_ptr<EntryFn>> by_name;
     for (auto& f : m.funcs) by_name[f->name] = f;
-    auto fix = [&](EntryFn& fn) {
-      fn.module_funcs.assign(m.funcs.begin(), m.funcs.end());
-      fn.module_entry_names.clear();
-      for (const auto& e : m.entries) fn.module_entry_names.push_back(e.name);
+    // `with_tables` is false for the device functions themselves. Giving every
+    // EntryFn a list of shared_ptrs to all of them makes each function hold a
+    // shared_ptr to itself -- a reference cycle, so no .func is ever freed and
+    // every module leaks its whole body. Nothing needs it there anyway: an
+    // indirect call resolves against the *kernel's* table, which is the one
+    // the interpreter reads.
+    auto fix = [&](EntryFn& fn, bool with_tables) {
+      if (with_tables) {
+        fn.module_funcs.assign(m.funcs.begin(), m.funcs.end());
+        fn.module_entry_names.clear();
+        for (const auto& e : m.entries) fn.module_entry_names.push_back(e.name);
+      }
       for (Instr& ins : fn.body) {
         auto* call = std::get_if<OpCall>(&ins.op);
         if (!call || call->indirect || call->callee.empty()) continue;
@@ -311,8 +319,8 @@ class Parser {
         if (it != by_name.end()) call->target = it->second;
       }
     };
-    for (auto& e : m.entries) fix(e);
-    for (auto& f : m.funcs) fix(*f);
+    for (auto& e : m.entries) fix(e, /*with_tables=*/true);
+    for (auto& f : m.funcs) fix(*f, /*with_tables=*/false);
   }
 
   [[noreturn]] void fail(size_t line, const std::string& msg) {

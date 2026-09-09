@@ -458,9 +458,14 @@ class Interpreter {
   Interpreter(const EntryFn& fn, const LaunchConfig& cfg, const ParamBuffer& params, MemoryManager& mem,
               const DeviceProfile& profile, const SymbolTable* symbols, LaunchStats& stats,
               const ProgressFn& progress)
-      : fn_(fn), cfg_(cfg), params_(params), mem_(mem), profile_(profile), symbols_(symbols),
-        stats_(stats), progress_(progress), W_(profile.warp_size),
-        all_(all_lanes(profile.warp_size)) {
+      // Listed in declaration order, which is the order they are actually
+      // initialised in. W_ and all_ sit between profile_ and symbols_, and
+      // writing them last read correctly only because both come from
+      // `profile` rather than from each other -- the day one is written as
+      // all_(all_lanes(W_)) that stops being true, silently.
+      : fn_(fn), cfg_(cfg), params_(params), mem_(mem), profile_(profile),
+        W_(profile.warp_size), all_(all_lanes(profile.warp_size)), symbols_(symbols),
+        stats_(stats), progress_(progress) {
     if (progress_) last_progress_ = std::chrono::steady_clock::now();
   }
 
