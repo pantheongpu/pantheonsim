@@ -53,6 +53,17 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
 - `min.NaN`/`max.NaN`, which propagate a NaN instead of returning the other
   operand. The plain forms follow fmin/fmax; the two disagree on exactly the
   inputs a kernel clamping to keep NaNs visible cares about.
+- Separately compiled builds (`-rdc=true`). Such a build leaves the primary
+  fatbin empty -- 16 bytes, just a header -- and hangs the real device code off
+  the wrapper's fourth field as a NULL-terminated list of *relocatable*
+  fatbins. Device linking would consume them, but with a PTX-only `-code` there
+  is nothing for nvlink to link, so the pieces arrive still separate and the
+  runtime puts them together: PTX from each is concatenated, cross-piece
+  references resolve by name, and only the first piece's `.version`/`.target`
+  header survives (it is the translation unit; the rest are libraries built for
+  whatever the toolkit's default architecture was). An unresolved call is
+  reported when it is *reached* rather than at load, because the device-runtime
+  library declares functions the driver supplies and defines them nowhere.
 - `__constant__` and `__device__` variables reached from the host:
   `cudaMemcpyToSymbol`/`FromSymbol` (and the Async forms),
   `cudaGetSymbolAddress`/`Size`, fed by `__cudaRegisterVar`. On the kernel side

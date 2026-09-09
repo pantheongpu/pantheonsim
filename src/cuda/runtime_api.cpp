@@ -266,18 +266,91 @@ VGPU_EXPORT void** __cudaRegisterFatBinary(void* fatCubin) {
     ensure_init(s);
     auto rm = std::make_unique<RegisteredModule>();
     // fatCubin is a __fatBinC_Wrapper_t*; extract the best PTX image.
+    // Drops the leading .version/.target/.address_size directives from a
+    // linked-in piece, so the first piece's header describes the whole module.
+    auto strip_ptx_header = [](const std::string& text) {
+      size_t pos = 0;
+      while (pos < text.size()) {
+        const size_t eol = text.find('\n', pos);
+        const size_t len = (eol == std::string::npos ? text.size() : eol) - pos;
+        std::string line = text.substr(pos, len);
+        size_t a = line.find_first_not_of(" \t");
+        const bool blank = a == std::string::npos;
+        const bool header = !blank && (line.compare(a, 8, ".version") == 0 ||
+                                       line.compare(a, 7, ".target") == 0 ||
+                                       line.compare(a, 13, ".address_size") == 0 ||
+                                       line.compare(a, 2, "//") == 0);
+        if (!blank && !header) break;
+        if (eol == std::string::npos) return std::string{};
+        pos = eol + 1;
+      }
+      return text.substr(pos);
+    };
+    auto pick_best = [](std::vector<vgpu::cuda::FatbinPtx>& v) -> std::string {
+      if (v.empty()) return {};
+      size_t best = 0;
+      for (size_t i = 1; i < v.size(); ++i)
+        if (v[i].arch > v[best].arch) best = i;
+      return std::move(v[best].text);
+    };
     auto ptxs = vgpu::cuda::extract_ptx(fatCubin);
-    if (ptxs.empty()) {
-      if (!quiet())
+    rm->ptx = pick_best(ptxs);
+    if (rm->ptx.empty()) {
+      // A separately compiled build (-rdc=true) leaves the primary fatbin
+      // empty -- 16 bytes, just a header -- and puts the real device code in a
+      // list of *relocatable* fatbins hanging off the wrapper's fourth field.
+      // Device linking would normally consume them; with a PTX-only -code
+      // there is nothing for nvlink to link, so the pieces arrive here still
+      // separate and the runtime is expected to put them together.
+      //
+      // The wrapper is
+      //   { int magic; int version; const void* data; void* filename_or_fatbins; }
+      // and that last field is a filename in version 1 and a NULL-terminated
+      // array of fatbin pointers in version 2 -- so the version has to be
+      // checked before it is walked, or a char* gets dereferenced as an array.
+      int version = 0;
+      const void* const* relocatable = nullptr;
+      const uint8_t* wp = static_cast<const uint8_t*>(fatCubin);
+      if (wp) {
+        std::memcpy(&version, wp + 4, 4);
+        if (version >= 2) std::memcpy(&relocatable, wp + 16, 8);
+      }
+      std::string linked;
+      size_t pieces = 0;
+      for (size_t i = 0; relocatable && relocatable[i] && i < 64; ++i) {
+        try {
+          auto part = vgpu::cuda::extract_ptx(relocatable[i]);
+          std::string text = pick_best(part);
+          if (text.empty()) continue;
+          // Concatenated rather than merged: cross-piece references resolve
+          // by name, exactly as they would after a link.
+          //
+          // Every piece carries its own .version/.target/.address_size header,
+          // and only the first one's counts. The first relocatable fatbin is
+          // the translation unit being registered; the rest are libraries
+          // linked into it, compiled for whatever the toolkit's default
+          // architecture happened to be. Letting the last header win made a
+          // module built for sm_80 claim to target sm_121 and be refused on an
+          // A100 -- with an error about the *device* being too old, which is
+          // the opposite of what had happened.
+          if (pieces > 0) text = strip_ptx_header(text);
+          linked += text;
+          linked += "\n";
+          ++pieces;
+        } catch (const std::exception&) {
+          // A piece that will not parse is skipped rather than failing the
+          // whole registration: the others may still hold the kernel.
+        }
+      }
+      rm->ptx = std::move(linked);
+      if (trace() && pieces)
+        std::fprintf(stderr, "[vgpu][trace] linked %zu relocatable PTX pieces (-rdc build)\n",
+                     pieces);
+      if (rm->ptx.empty() && !quiet())
         std::fprintf(stderr,
                      "[vgpu] __cudaRegisterFatBinary: no PTX in fatbin (SASS-only build); rebuild "
                      "with an -arch that embeds PTX\n");
       // Return a handle anyway; the failure surfaces at launch with context.
-    } else {
-      size_t best = 0;
-      for (size_t i = 1; i < ptxs.size(); ++i)
-        if (ptxs[i].arch > ptxs[best].arch) best = i;
-      rm->ptx = std::move(ptxs[best].text);
     }
     RegisteredModule* raw = rm.get();
     s.modules.push_back(std::move(rm));

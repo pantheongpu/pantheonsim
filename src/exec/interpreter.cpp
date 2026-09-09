@@ -2803,6 +2803,15 @@ class Interpreter {
         exec_user_call(w, ctx, ins, *op, m);
         return;
       }
+      // Everything that is neither a builtin nor a resolved device function.
+      // Reported here rather than at parse time because a separately compiled
+      // build links in CUDA's device-runtime library, which declares functions
+      // the driver supplies and defines them nowhere -- refusing at load
+      // rejected whole programs over a library function nobody calls.
+      if (op->callee != "vprintf")
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "call to '" + op->callee +
+                     "', which this module neither defines nor implements as a builtin");
       exec_vprintf(w, ctx, ins, *op, m);
       return;
     }

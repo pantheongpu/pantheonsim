@@ -532,6 +532,17 @@ if(TARGET vgpucublas)
   # __constant__ and __device__ variables written and read from the host. The
   # kernel side needs ld.const; the host side needs the symbol API, which
   # __cudaRegisterVar has to feed.
+  # The same programs built with -rdc=true. A separately compiled build takes a
+  # different loading path entirely -- an empty primary fatbin plus a list of
+  # relocatable ones the runtime has to link -- so any of these failing here
+  # and passing normally means the linking is wrong, not the program.
+  add_test(NAME e2e_rdc_link
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_rdc_link.sh)
+  set_tests_properties(e2e_rdc_link PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_symbols
            COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_symbols.sh)
   set_tests_properties(e2e_symbols PROPERTIES

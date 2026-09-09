@@ -298,12 +298,15 @@ class Parser {
         if (call->callee == "vprintf" || call->callee == "__assertfail" ||
             call->callee == "malloc" || call->callee == "free")
           continue;
+        // An unresolved name is left unresolved rather than refused here. A
+        // separately compiled build links in CUDA's device-runtime library,
+        // which declares functions the driver supplies (cnpGetLastError and
+        // friends) and defines them nowhere in the module -- so refusing at
+        // parse time rejected a whole program because a library function
+        // nobody calls had no body. Execution reports it if it is ever
+        // reached, which is the point at which it actually matters.
         auto it = by_name.find(call->callee);
-        if (it == by_name.end())
-          throw Error::make(Err::UnsupportedPtx, "call to '", call->callee,
-                            "' in kernel '", fn.name,
-                            "', which this module neither defines nor implements as a builtin");
-        call->target = it->second;
+        if (it != by_name.end()) call->target = it->second;
       }
     };
     for (auto& e : m.entries) fix(e);
@@ -418,7 +421,17 @@ class Parser {
           // function pointers is "{f, g, h}". Its slot is zeroed here and the
           // address written by the loader, which is the same treatment the
           // scalar "= symbol" form gets.
-          if (peek().kind == Token::Kind::Word && is_identifier_start(peek().text[0])) {
+          if (peek().kind == Token::Kind::Word && peek().text == "generic" &&
+              peek(1).kind == Token::Kind::Punct && peek(1).text == "(") {
+            // "generic(sym)" casts a symbol's address into the generic window.
+            // Every address in this model is already generic, so the cast is
+            // the identity and only the symbol matters.
+            next();
+            next();
+            g.init_symbols.push_back({g.init.size(), expect_word("symbol in generic()")});
+            expect_punct(")");
+            g.init.resize(g.init.size() + ty.bytes(), 0);
+          } else if (peek().kind == Token::Kind::Word && is_identifier_start(peek().text[0])) {
             g.init_symbols.push_back({g.init.size(), next().text});
             g.init.resize(g.init.size() + ty.bytes(), 0);
           } else {
@@ -430,6 +443,12 @@ class Parser {
           if (peek_punct(",")) next();
         }
         next();  // '}'
+      } else if (peek().kind == Token::Kind::Word && peek().text == "generic" &&
+                 peek(1).kind == Token::Kind::Punct && peek(1).text == "(") {
+        next();
+        next();
+        g.init_symbols.push_back({0, expect_word("symbol in generic()")});
+        expect_punct(")");
       } else if (peek().kind == Token::Kind::Word && is_identifier_start(peek().text[0])) {
         // "= some_symbol": the initialiser is another symbol's address, which
         // only exists once the module is loaded. The lexer gives numbers and
