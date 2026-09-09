@@ -1056,6 +1056,11 @@ class Parser {
         const std::string& p = parts[i];
         if (p == "param") space = Space::Param;
         else if (p == "global") space = Space::Global;
+        // __constant__ variables are parsed into the module's globals, so a
+        // constant-bank read is a global read of a range nothing writes. The
+        // read-only-ness is a promise the program makes, not one this engine
+        // has to enforce -- a kernel that writes there is already invalid.
+        else if (p == "const") space = Space::Global;
         else if (p == "shared") space = Space::Shared;
         else if (p == "local") space = Space::Local;
         else if (inert_mem_modifier(p)) ;

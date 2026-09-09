@@ -53,6 +53,11 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
 - `min.NaN`/`max.NaN`, which propagate a NaN instead of returning the other
   operand. The plain forms follow fmin/fmax; the two disagree on exactly the
   inputs a kernel clamping to keep NaNs visible cares about.
+- `__constant__` and `__device__` variables reached from the host:
+  `cudaMemcpyToSymbol`/`FromSymbol` (and the Async forms),
+  `cudaGetSymbolAddress`/`Size`, fed by `__cudaRegisterVar`. On the kernel side
+  `ld.const` is a global read of a range nothing writes -- the read-only-ness
+  is a promise the program makes, not one this engine enforces.
 - Non-inlined device functions (`.func`): a real call with its own register
   file, `.local` frame and path stack, so divergence inside a callee and
   recursion both work. Parameters and the return value travel as call slots

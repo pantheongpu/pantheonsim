@@ -97,12 +97,24 @@ struct KernelInfo {
   std::string entry_name;
 };
 
+// A __device__ or __constant__ variable. The host handle nvcc passes to
+// cudaMemcpyToSymbol is the address of a *host* shadow object, never a device
+// pointer, so the only way to reach the device copy is to remember what that
+// handle was registered as.
+struct VarInfo {
+  RegisteredModule* mod = nullptr;
+  std::string device_name;
+  size_t size = 0;
+  bool is_constant = false;
+};
+
 struct State {
   std::recursive_mutex mu;
   std::unique_ptr<vgpu::runtime::Runtime> rt;
   int current_device = 0;
   std::vector<std::unique_ptr<RegisteredModule>> modules;
   std::unordered_map<const void*, KernelInfo> kernels;  // host stub ptr -> kernel
+  std::unordered_map<const void*, VarInfo> vars;        // host shadow ptr -> device symbol
   std::map<void*, size_t> host_allocs;
   // Managed allocations, kept apart from host_allocs because freeing one has
   // to unmap it from the device side as well.
@@ -300,12 +312,108 @@ VGPU_EXPORT void __cudaRegisterFunction(void** fatCubinHandle, const char* hostF
                  deviceName);
 }
 
-VGPU_EXPORT void __cudaRegisterVar(void** /*handle*/, char* /*hostVar*/, char* /*deviceAddress*/,
-                                   const char* /*deviceName*/, int /*ext*/, size_t /*size*/,
-                                   int /*constant*/, int /*global*/) {
-  // __device__/__constant__ variables: the workloads in scope do not read them
-  // from the host, so recording is deferred. (No silent misbehavior: a kernel
-  // that references an unregistered global still gets a clear symbol error.)
+VGPU_EXPORT void __cudaRegisterVar(void** fatCubinHandle, char* hostVar, char* /*deviceAddress*/,
+                                   const char* deviceName, int /*ext*/, size_t size,
+                                   int constant, int /*global*/) {
+  // Recorded now, because cudaMemcpyToSymbol has nothing else to go on: the
+  // handle it receives is the address of a host shadow object, and only this
+  // registration ties it to a name in the module.
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  auto* mod = reinterpret_cast<RegisteredModule*>(fatCubinHandle);
+  s.vars[reinterpret_cast<const void*>(hostVar)] =
+      VarInfo{mod, deviceName ? deviceName : "", size, constant != 0};
+  if (trace())
+    std::fprintf(stderr, "[vgpu][trace] __cudaRegisterVar: %p -> '%s' (%zu bytes%s)\n",
+                 (void*)hostVar, deviceName ? deviceName : "?", size,
+                 constant ? ", constant" : "");
+}
+
+namespace {
+// Device address and size of a registered symbol, or an error.
+cudaError_t symbol_address(State& s, const void* symbol, uint64_t* addr, size_t* size) {
+  auto it = s.vars.find(symbol);
+  if (it == s.vars.end()) {
+    if (!quiet())
+      std::fprintf(stderr,
+                   "[vgpu] symbol %p is not a registered __device__ or __constant__ variable\n",
+                   symbol);
+    return cudaErrorInvalidSymbol;
+  }
+  VarInfo& v = it->second;
+  if (!v.mod || v.mod->ptx.empty()) return cudaErrorInvalidSymbol;
+  const uint64_t mid = module_on_current(s, *v.mod);
+  const vgpu::exec::SymbolTable* syms = current(s).symbols(mid);
+  if (!syms) return cudaErrorInvalidSymbol;
+  auto sym = syms->find(v.device_name);
+  if (sym == syms->end()) {
+    if (!quiet())
+      std::fprintf(stderr, "[vgpu] '%s' is registered but the module defines no such global\n",
+                   v.device_name.c_str());
+    return cudaErrorInvalidSymbol;
+  }
+  *addr = sym->second;
+  *size = v.size;
+  return cudaSuccess;
+}
+}  // namespace
+
+VGPU_EXPORT cudaError_t cudaMemcpyToSymbol(const void* symbol, const void* src, size_t count,
+                                           size_t offset, cudaMemcpyKind /*kind*/) {
+  return guard("cudaMemcpyToSymbol", [&](State& s) -> cudaError_t {
+    uint64_t addr = 0;
+    size_t size = 0;
+    const cudaError_t e = symbol_address(s, symbol, &addr, &size);
+    if (e != cudaSuccess) return e;
+    if (offset + count > size) return cudaErrorInvalidValue;
+    current(s).memory().write(addr + offset, src, count);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemcpyFromSymbol(void* dst, const void* symbol, size_t count,
+                                             size_t offset, cudaMemcpyKind /*kind*/) {
+  return guard("cudaMemcpyFromSymbol", [&](State& s) -> cudaError_t {
+    uint64_t addr = 0;
+    size_t size = 0;
+    const cudaError_t e = symbol_address(s, symbol, &addr, &size);
+    if (e != cudaSuccess) return e;
+    if (offset + count > size) return cudaErrorInvalidValue;
+    current(s).memory().read(addr + offset, dst, count);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemcpyToSymbolAsync(const void* symbol, const void* src, size_t count,
+                                                size_t offset, cudaMemcpyKind kind, cudaStream_t) {
+  return cudaMemcpyToSymbol(symbol, src, count, offset, kind);
+}
+VGPU_EXPORT cudaError_t cudaMemcpyFromSymbolAsync(void* dst, const void* symbol, size_t count,
+                                                  size_t offset, cudaMemcpyKind kind,
+                                                  cudaStream_t) {
+  return cudaMemcpyFromSymbol(dst, symbol, count, offset, kind);
+}
+
+VGPU_EXPORT cudaError_t cudaGetSymbolAddress(void** devPtr, const void* symbol) {
+  return guard("cudaGetSymbolAddress", [&](State& s) -> cudaError_t {
+    uint64_t addr = 0;
+    size_t size = 0;
+    const cudaError_t e = symbol_address(s, symbol, &addr, &size);
+    if (e != cudaSuccess) return e;
+    if (devPtr) *devPtr = reinterpret_cast<void*>(addr);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaGetSymbolSize(size_t* out, const void* symbol) {
+  return guard("cudaGetSymbolSize", [&](State& s) -> cudaError_t {
+    uint64_t addr = 0;
+    size_t size = 0;
+    const cudaError_t e = symbol_address(s, symbol, &addr, &size);
+    if (e != cudaSuccess) return e;
+    if (out) *out = size;
+    return cudaSuccess;
+  });
 }
 
 VGPU_EXPORT unsigned __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim, size_t sharedMem,

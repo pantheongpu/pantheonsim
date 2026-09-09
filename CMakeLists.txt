@@ -529,6 +529,16 @@ if(TARGET vgpucublas)
   # reporting cudaErrorAssert with its message through cudaDeviceSynchronize.
   # Non-inlined device functions -- a real call frame, with divergence inside
   # the callee and recursion, which cannot be inlined at all.
+  # __constant__ and __device__ variables written and read from the host. The
+  # kernel side needs ld.const; the host side needs the symbol API, which
+  # __cudaRegisterVar has to feed.
+  add_test(NAME e2e_symbols
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_symbols.sh)
+  set_tests_properties(e2e_symbols PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_device_functions
            COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_device_functions.sh)
   set_tests_properties(e2e_device_functions PROPERTIES
