@@ -292,6 +292,8 @@ class Parser {
     for (auto& f : m.funcs) by_name[f->name] = f;
     auto fix = [&](EntryFn& fn) {
       fn.module_funcs.assign(m.funcs.begin(), m.funcs.end());
+      fn.module_entry_names.clear();
+      for (const auto& e : m.entries) fn.module_entry_names.push_back(e.name);
       for (Instr& ins : fn.body) {
         auto* call = std::get_if<OpCall>(&ins.op);
         if (!call || call->indirect || call->callee.empty()) continue;

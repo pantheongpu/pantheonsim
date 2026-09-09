@@ -645,6 +645,10 @@ struct EntryFn {
   // Every device function in the module, in definition order. An indirect call
   // carries an address, and the address is the index -- see kFuncVaBase.
   std::vector<std::shared_ptr<const EntryFn>> module_funcs;
+  // The names of the module's kernels. Only used to tell "you took the address
+  // of a kernel" apart from "you named something that does not exist", which
+  // are the same error message otherwise and point at very different problems.
+  std::vector<std::string> module_entry_names;
   std::vector<ParamDecl> params;
   std::vector<Instr> body;
   std::map<std::string, Type> reg_decls;      // declared virtual registers

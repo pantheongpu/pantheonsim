@@ -64,6 +64,8 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   whatever the toolkit's default architecture was). An unresolved call is
   reported when it is *reached* rather than at load, because the device-runtime
   library declares functions the driver supplies and defines them nowhere.
+  Verified on a genuine two-unit build: device functions and a `__constant__`
+  defined in one translation unit, used from a kernel in another.
 - `__constant__` and `__device__` variables reached from the host:
   `cudaMemcpyToSymbol`/`FromSymbol` (and the Async forms),
   `cudaGetSymbolAddress`/`Size`, fed by `__cudaRegisterVar`. On the kernel side
@@ -461,6 +463,11 @@ what is done.
   which is a memory-model change, and stays refused rather than approximated.)
 - Runtime: async copies, the virtual memory management API
   (cuMemAddressReserve…). (Managed memory and host-pinned memory are done.)
+- Dynamic parallelism (a kernel launching a kernel). Taking a kernel's address
+  in device code now says so by name instead of reporting an unknown symbol,
+  which sent you looking for a typo in a name that was right there. Running it
+  would need a child grid scheduled from inside the parent's instruction
+  stream, which nothing here can do.
 - Frontends: cubin/SASS loading, and AMD execution -- HIP runtime and the CDNA
   ISA. AMD *discovery* exists: `tools/rocminfo-to-profile.py` reads a real
   MI325X and `profiles/amd/mi325x.yaml` is verified against one. The warp width

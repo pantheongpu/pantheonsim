@@ -821,9 +821,21 @@ class Interpreter {
     // resolve back to the parameter buffer.
     if (auto it = params_.layout.find(name); it != params_.layout.end())
       return kParamVaBase + it->second.first;
+    // Taking the address of a *kernel* means one thing in device code: a
+    // device-side launch. Saying so is worth a branch, because "unknown
+    // symbol" sends you looking for a typo in a name that is right there in
+    // the module.
+    for (const std::string& k : fn_.module_entry_names)
+      if (k == name)
+        ctx_fail(ins, -1, Err::Unsupported,
+                 "kernel '" + name +
+                     "' had its address taken, which in device code means a device-side launch "
+                     "(dynamic parallelism). That is not implemented: a child grid would have to "
+                     "run from inside the parent's instruction stream, and nothing here can "
+                     "schedule one");
     ctx_fail(ins, -1, Err::NotFound,
-             "unknown symbol '" + name + "' (not a .local depot, module .global variable, or "
-             "kernel parameter)");
+             "unknown symbol '" + name + "' (not a .local depot, module .global variable, "
+             "kernel parameter, or device function)");
   }
 
   // Returns a reference to the operand's lane vector. Register operands alias

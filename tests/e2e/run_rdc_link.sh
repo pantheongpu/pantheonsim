@@ -37,4 +37,24 @@ for src in device_functions symbols device_intrinsics; do
   echo "rdc $src: $(printf '%s' "$result" | tail -1)"
   [[ "$result" == *PASS* ]] || failures=$((failures + 1))
 done
+# A genuine two-unit build: device functions and a __constant__ defined in one
+# translation unit, used from a kernel in another. Concatenating the pieces is
+# only a link if references actually resolve across them, and this is what says
+# whether they do.
+mtu="$root/tests/e2e/multitu"
+nvcc -std=c++17 -cudart shared -rdc=true -arch=compute_80 -code=compute_80 \
+     -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") \
+     -I"$mtu" -c "$mtu/lib.cu" -o "$tmp/lib.o"
+nvcc -std=c++17 -cudart shared -rdc=true -arch=compute_80 -code=compute_80 \
+     -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") \
+     -I"$mtu" -c "$mtu/main.cu" -o "$tmp/main.o"
+nvcc -std=c++17 -cudart shared -rdc=true -arch=compute_80 -code=compute_80 \
+     -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") \
+     "$tmp/lib.o" "$tmp/main.o" -o "$tmp/multitu"
+if require_shim_libs "$shim" "$tmp/multitu"; then
+  result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/a100 LD_LIBRARY_PATH="$shim" "$tmp/multitu" 2>&1)" || true
+  echo "rdc two translation units: $(printf '%s' "$result" | tail -1)"
+  [[ "$result" == *PASS* ]] || failures=$((failures + 1))
+fi
+
 exit $failures
