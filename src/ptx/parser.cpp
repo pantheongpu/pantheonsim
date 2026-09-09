@@ -256,17 +256,59 @@ class Parser {
         m.globals.push_back(parse_global(t.line));
         continue;
       }
-      if (t.text == ".func")
-        fail_unsupported(t.line, ".func", "", "device functions are not supported (only .entry kernels)");
+      if (t.text == ".func" || t.text == ".weak" || t.text == ".visible") {
+        // ".weak .func" and ".visible .func" are the linkage-qualified forms.
+        // A qualifier on anything else falls through to the error below.
+        size_t look = 0;
+        if (t.text != ".func") {
+          if (peek(1).kind != Token::Kind::Word || peek(1).text != ".func") {
+            fail_unsupported(t.line, t.text, "", "linkage qualifier on an unsupported directive");
+          }
+          look = 1;
+        }
+        (void)look;
+        next();
+        if (t.text != ".func") next();  // consume ".func" after the qualifier
+        auto fn = std::make_shared<EntryFn>();
+        if (parse_device_func(fn.get())) m.funcs.push_back(std::move(fn));
+        continue;
+      }
       fail_unsupported(t.line, t.text, "",
                        "directive not in the implemented PTX subset (supported: .version .target "
                        ".address_size .visible .weak .common .extern .global .const .entry .file .loc "
                        ".section)");
     }
+    resolve_calls(m);
     return m;
   }
 
  private:
+  // Point every call at the function it names. Done after the whole module is
+  // parsed because PTX declares prototypes first and a call can precede the
+  // definition -- resolving eagerly would refuse a forward reference that is
+  // perfectly well defined thirty lines later.
+  void resolve_calls(Module& m) {
+    std::unordered_map<std::string, std::shared_ptr<EntryFn>> by_name;
+    for (auto& f : m.funcs) by_name[f->name] = f;
+    auto fix = [&](EntryFn& fn) {
+      for (Instr& ins : fn.body) {
+        auto* call = std::get_if<OpCall>(&ins.op);
+        if (!call || call->callee.empty()) continue;
+        if (call->callee == "vprintf" || call->callee == "__assertfail" ||
+            call->callee == "malloc" || call->callee == "free")
+          continue;
+        auto it = by_name.find(call->callee);
+        if (it == by_name.end())
+          throw Error::make(Err::UnsupportedPtx, "call to '", call->callee,
+                            "' in kernel '", fn.name,
+                            "', which this module neither defines nor implements as a builtin");
+        call->target = it->second;
+      }
+    };
+    for (auto& e : m.entries) fix(e);
+    for (auto& f : m.funcs) fix(*f);
+  }
+
   [[noreturn]] void fail(size_t line, const std::string& msg) {
     throw Error::make(Err::PtxParse, "line ", line, ": ", msg);
   }
@@ -403,6 +445,91 @@ class Parser {
 
   // Returns false when this was a declaration rather than a definition, in
   // which case *out is not meaningful.
+  // .func [(.param .type func_retval0)] name ( .param .type name_param_0, ... )
+  // followed by a body, or by ";" for a prototype.
+  //
+  // The parameters and the return value are handled as *call slots*, not as a
+  // launch parameter buffer: every lane of a warp passes its own arguments, so
+  // there is no single byte buffer to read them from. Registering the names in
+  // call_slots_ before the body is parsed is what makes "ld.param [x_param_0]"
+  // inside the function compile to a slot read rather than a kernel-parameter
+  // read.
+  bool parse_device_func(EntryFn* out) {
+    EntryFn& fn = *out;
+    cur_fn_ = &fn;
+    fn.is_device_func = true;
+    call_slots_.clear();
+    declared_regs_.clear();
+    if (peek_punct("(")) {
+      next();
+      const std::string kw = expect_word("'.param'");
+      if (kw != ".param") fail(peek().line, "expected .param in a .func return value");
+      if (peek().kind == Token::Kind::Word && peek().text == ".align") {
+        next();
+        expect_int("alignment");
+      }
+      expect_type("return value declaration");
+      fn.retval_slot_name = expect_word("return value name");
+      if (peek_punct("[")) {
+        // An aggregate return: ".param .align 4 .b8 func_retval0[16]". A call
+        // slot holds one value per lane, so a 16-byte struct has nowhere to
+        // sit. Truncating it to the first 8 bytes would return a struct whose
+        // tail is whatever was there before, which is worse than not running.
+        fail_unsupported(peek().line, ".func returning an aggregate", fn.name,
+                         "device functions returning a struct or array are not supported; "
+                         "scalar returns are");
+      }
+      call_slots_.insert(fn.retval_slot_name);
+      expect_punct(")");
+    }
+    fn.name = expect_word("device function name");
+    current_kernel_ = fn.name;
+    if (peek_punct("(")) {
+      next();
+      while (!peek_punct(")")) {
+        const std::string kw = expect_word("'.param'");
+        if (kw != ".param") fail(peek().line, "expected .param in a .func signature");
+        if (peek().kind == Token::Kind::Word && peek().text == ".align") {
+          next();
+          expect_int("alignment");
+        }
+        expect_type("parameter declaration");
+        while (peek().kind == Token::Kind::Word && peek().text[0] == '.') next();  // ptr annotations
+        const std::string pname = expect_word("parameter name");
+        if (peek_punct("[")) {
+          fail_unsupported(peek().line, ".func taking an aggregate", fn.name,
+                           "device function parameters that are structs or arrays are not "
+                           "supported; scalar parameters are");
+        }
+        fn.param_slot_names.push_back(pname);
+        call_slots_.insert(pname);
+        if (peek_punct(",")) next();
+      }
+      next();
+    }
+    if (peek_punct(";")) {  // a prototype, not a definition
+      next();
+      current_kernel_.clear();
+      cur_fn_ = nullptr;
+      return false;
+    }
+    // .noreturn and friends may sit between the signature and the body.
+    while (peek().kind == Token::Kind::Word && peek().text[0] == '.' && !peek_punct("{")) {
+      if (peek().text == ".noreturn" || peek().text == ".pragma") {
+        next();
+        while (!at_end() && !peek_punct(";") && !peek_punct("{")) next();
+        if (peek_punct(";")) next();
+        continue;
+      }
+      break;
+    }
+    expect_punct("{");
+    parse_body(fn);
+    current_kernel_.clear();
+    cur_fn_ = nullptr;
+    return true;
+  }
+
   bool parse_entry(EntryFn* out) {
     EntryFn& fn = *out;
     cur_fn_ = &fn;
@@ -2262,10 +2389,8 @@ class Parser {
         if (peek_punct(",")) next();
       }
       next();
-      if (op.callee != "vprintf" && op.callee != "__assertfail" && op.callee != "malloc" &&
-          op.callee != "free")
-        return unsupported("call to '" + op.callee +
-                           "' (callable builtins are vprintf, __assertfail, malloc and free)");
+      // Whether this names a builtin or a device function defined elsewhere in
+      // the module is settled after parsing, by resolve_calls.
       ins.op = op;
     } else if (op0 == "activemask") {
       OpActiveMask op;

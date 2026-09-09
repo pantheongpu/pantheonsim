@@ -527,6 +527,15 @@ if(TARGET vgpucublas)
   # the per-byte SIMD video ops, device malloc/free, the half2 math family
   # (whose inline asm declares ".reg.b16" with no space), and a device assert
   # reporting cudaErrorAssert with its message through cudaDeviceSynchronize.
+  # Non-inlined device functions -- a real call frame, with divergence inside
+  # the callee and recursion, which cannot be inlined at all.
+  add_test(NAME e2e_device_functions
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_device_functions.sh)
+  set_tests_properties(e2e_device_functions PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_device_intrinsics
            COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_device_intrinsics.sh)
   set_tests_properties(e2e_device_intrinsics PROPERTIES

@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <variant>
@@ -564,7 +565,17 @@ struct OpCpAsyncGroup {
 };
 
 struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; };
-struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
+// A call. `callee` names either a builtin (vprintf, __assertfail, malloc,
+// free) or a device function defined in the same module, in which case
+// `target` points at it. Held by shared_ptr so a resolved call stays valid
+// however the module's containers are moved around.
+struct EntryFn;
+struct OpCall {
+  std::string callee;
+  std::string retval_slot;
+  std::vector<std::string> param_slots;
+  std::shared_ptr<const EntryFn> target;  // null for the builtins
+};
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
@@ -618,6 +629,12 @@ struct SharedDecl {
 
 struct EntryFn {
   std::string name;
+  // A .func rather than a .entry: called from a kernel instead of launched.
+  // Its parameters and return value are call slots, not a launch parameter
+  // buffer, because each lane passes its own arguments.
+  bool is_device_func = false;
+  std::vector<std::string> param_slot_names;   // in signature order
+  std::string retval_slot_name;                // empty when it returns void
   std::vector<ParamDecl> params;
   std::vector<Instr> body;
   std::map<std::string, Type> reg_decls;      // declared virtual registers
@@ -671,6 +688,9 @@ struct Module {
   uint32_t address_size = 64;
   std::vector<EntryFn> entries;
   std::vector<GlobalVar> globals;
+  // Device functions, by definition order. Kept as shared_ptr so an OpCall can
+  // hold one without caring how the module is copied or moved.
+  std::vector<std::shared_ptr<EntryFn>> funcs;
   std::vector<SharedDecl> module_shared;  // module-scope .shared variables
 
   const EntryFn* find_entry(const std::string& name) const {

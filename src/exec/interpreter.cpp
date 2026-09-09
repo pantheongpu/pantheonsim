@@ -526,7 +526,8 @@ class Interpreter {
  private:
   // Re-throws a lower-level error with kernel/instruction context attached.
   [[noreturn]] void rethrow_with_context(const Error& e, const Instr& ins, int lane) {
-    throw Error::make(e.code(), e.message(), "\n  in kernel '", fn_.name, "', PTX line ", ins.line,
+    throw Error::make(e.code(), e.message(), "\n  in ", cur_ == &fn_ ? "kernel '" : "device function '",
+                      cur_->name, "', PTX line ", ins.line,
                       lane >= 0 ? "\n  lane " + std::to_string(lane) : "",
                       "\n  instruction: ", ins.text.empty() ? "?" : ins.text,
                       "\n  GPU profile: ", profile_.id);
@@ -679,10 +680,10 @@ class Interpreter {
         return;
       }
       size_t idx = select_path(w);
-      if (w.paths[idx].pc >= fn_.body.size())
-        throw Error::make(Err::PtxParse, "control fell off the end of kernel '", fn_.name,
+      if (w.paths[idx].pc >= cur_->body.size())
+        throw Error::make(Err::PtxParse, "control fell off the end of '", cur_->name,
                           "' (missing ret)");
-      const Instr& ins = fn_.body[w.paths[idx].pc];
+      const Instr& ins = cur_->body[w.paths[idx].pc];
       if (progress_ && (stats_.instructions & 0xFFFFF) == 0) report_progress();
       // Warp-level issue count, plus the per-lane total: their ratio is the
       // average lane utilisation, which is divergence measured directly.
@@ -710,6 +711,10 @@ class Interpreter {
   }
 
   InstClass class_of_pc(size_t pc) const {
+    // The cache is per kernel. Inside a device function the pc indexes a
+    // different body, so classify directly rather than reading another
+    // function's entry.
+    if (cur_ != &fn_) return classify(cur_->body[pc]);
     if (class_by_pc_.empty()) {
       class_by_pc_.resize(fn_.body.size());
       for (size_t i = 0; i < fn_.body.size(); ++i)
@@ -781,7 +786,7 @@ class Interpreter {
   uint64_t resolve_symbol(const Instr& ins, const std::string& name) {
     // .local/.shared variables name an offset within their address space, not
     // a generic address; cvta converts when the kernel needs a generic pointer.
-    if (auto it = fn_.locals.find(name); it != fn_.locals.end()) return it->second.offset;
+    if (auto it = cur_->locals.find(name); it != cur_->locals.end()) return it->second.offset;
     if (auto it = fn_.shared.find(name); it != fn_.shared.end()) return it->second.offset;
     if (symbols_) {
       if (auto it = symbols_->find(name); it != symbols_->end()) return it->second;
@@ -1081,7 +1086,7 @@ class Interpreter {
   // Predicates are declared .pred, so they live in the narrow numbering; the
   // slot index is offset past the 64-bit file to keep one predicate vector.
   uint32_t pred_index(const Reg& reg) const {
-    return reg.wide ? fn_.num_regs32 + reg.id : reg.id;
+    return reg.wide ? cur_->num_regs32 + reg.id : reg.id;
   }
 
   Mask read_pred(Warp& w, const Instr& ins, const Reg& reg) {
@@ -1303,17 +1308,17 @@ class Interpreter {
   std::vector<uint8_t>& lane_local(Warp& w, uint32_t lane) {
     if (w.local.empty()) w.local.resize(W_);
     auto& buf = w.local[lane];
-    if (buf.size() < fn_.local_frame_size) buf.resize(fn_.local_frame_size, 0);
+    if (buf.size() < cur_->local_frame_size) buf.resize(cur_->local_frame_size, 0);
     return buf;
   }
 
   void check_local(const Instr& ins, int lane, uint64_t addr, uint32_t size) {
     uint64_t off = addr - kLocalVaBase;
-    if (off + size > fn_.local_frame_size)
+    if (off + size > cur_->local_frame_size)
       ctx_fail(ins, lane, Err::OutOfBounds,
                "local memory access at frame offset " + std::to_string(off) + " (+" +
                    std::to_string(size) + " bytes) exceeds the " +
-                   std::to_string(fn_.local_frame_size) + "-byte .local frame");
+                   std::to_string(cur_->local_frame_size) + "-byte .local frame");
   }
 
   uint64_t load_routed(Warp& w, const BlockCtx& ctx, const Instr& ins, uint32_t lane, uint64_t addr,
@@ -1491,7 +1496,13 @@ class Interpreter {
   }
 
   void exec_ret(Warp& w, const BlockCtx& ctx, const Instr& ins, size_t idx, Mask m) {
-    w.exited |= m;
+    // Inside a device function `ret` means "return to the caller", not "this
+    // thread is finished". Retiring the lanes and marking the warp Done there
+    // ended the whole thread at the first call that returned -- and because
+    // the caller then resumed with its own saved state, the damage showed up
+    // later as a warp that had silently stopped executing.
+    const bool in_call = call_depth_ > 0;
+    if (!in_call) w.exited |= m;
     Mask survivors = w.paths[idx].mask & ~m;
     if (survivors == 0) {
       w.paths.erase(w.paths.begin() + static_cast<long>(idx));
@@ -1500,7 +1511,7 @@ class Interpreter {
       w.paths[idx].mask = survivors;
       ++w.paths[idx].pc;
     }
-    if (w.paths.empty()) {
+    if (w.paths.empty() && !in_call) {
       w.state = Warp::State::Done;
       drain_async_copies(w, ctx, ins);
     }
@@ -2743,6 +2754,10 @@ class Interpreter {
       }
       if (op->callee == "malloc" || op->callee == "free") {
         exec_device_heap(w, ctx, ins, *op, m);
+        return;
+      }
+      if (op->target) {
+        exec_user_call(w, ctx, ins, *op, m);
         return;
       }
       exec_vprintf(w, ctx, ins, *op, m);
@@ -4455,6 +4470,137 @@ class Interpreter {
              " in " + fn);
   }
 
+  // ---- calls to device functions ----
+  //
+  // Runs the callee to completion inside the caller's instruction, rather than
+  // pushing a frame the outer scheduler walks. That keeps the path stack, the
+  // register files and the pc of the caller untouched and makes recursion fall
+  // out of the host stack -- at the cost that a warp does not yield in the
+  // middle of a device function, so a spin-wait inside one would not let other
+  // warps run. Nothing emits that shape, and the step budget still catches it.
+  //
+  // Parameters and the return value travel as call slots, not as a parameter
+  // buffer: each lane passes its own arguments, so there is no single set of
+  // bytes to read them from. The caller has already written its slots with
+  // st.param; this binds them to the names the callee's body reads.
+  void exec_user_call(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
+    const EntryFn& callee = *op.target;
+    if (op.param_slots.size() != callee.param_slot_names.size())
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "call to '" + callee.name + "' passes " + std::to_string(op.param_slots.size()) +
+                   " arguments; it takes " + std::to_string(callee.param_slot_names.size()));
+    if (++call_depth_ > kMaxCallDepth) {
+      --call_depth_;
+      ctx_fail(ins, -1, Err::ExecLimit,
+               "device call nested more than " + std::to_string(kMaxCallDepth) +
+                   " deep in '" + callee.name + "' (runaway recursion?)");
+    }
+
+    // Bind arguments before anything is swapped out: they live in the caller's
+    // slot map and are read per lane.
+    std::unordered_map<std::string, Lanes> args;
+    for (size_t i = 0; i < op.param_slots.size(); ++i) {
+      auto it = w.slots.find(op.param_slots[i]);
+      if (it == w.slots.end()) {
+        --call_depth_;
+        ctx_fail(ins, -1, Err::UninitializedRegister,
+                 "argument slot '" + op.param_slots[i] + "' read before write");
+      }
+      args[callee.param_slot_names[i]] = it->second;
+    }
+
+    // Swap in the callee's world.
+    const EntryFn* saved_fn = cur_;
+    auto saved_paths = std::move(w.paths);
+    auto saved_r32 = std::move(w.regs32);
+    auto saved_r64 = std::move(w.regs64);
+    auto saved_pred = std::move(w.preds);
+    auto saved_w32 = std::move(w.written32);
+    auto saved_w64 = std::move(w.written64);
+    auto saved_slots = std::move(w.slots);
+    const auto saved_state = w.state;
+
+    cur_ = &callee;
+    w.paths.clear();
+    w.paths.push_back(Path{0, m});
+    w.regs32.assign(callee.num_regs32, Lanes32{});
+    w.regs64.assign(callee.num_regs64, Lanes{});
+    w.preds.assign(callee.num_regs32 + callee.num_regs64, 0);
+    w.written32.assign(callee.num_regs32, 0);
+    w.written64.assign(callee.num_regs64, 0);
+    w.slots = std::move(args);
+    w.state = Warp::State::Ready;
+
+    auto restore = [&]() {
+      cur_ = saved_fn;
+      w.paths = std::move(saved_paths);
+      w.regs32 = std::move(saved_r32);
+      w.regs64 = std::move(saved_r64);
+      w.preds = std::move(saved_pred);
+      w.written32 = std::move(saved_w32);
+      w.written64 = std::move(saved_w64);
+      w.state = saved_state;
+      --call_depth_;
+    };
+
+    Lanes retval{};
+    bool have_ret = false;
+    try {
+      // The callee's own divergence is handled by the same path machinery; it
+      // is finished when every path has returned.
+      while (w.state == Warp::State::Ready && !w.paths.empty()) {
+        if (w.paths[0].pc >= callee.body.size())
+          ctx_fail(ins, -1, Err::PtxParse,
+                   "control fell off the end of device function '" + callee.name + "'");
+        const size_t idx = select_path(w);
+        const Instr& inner = callee.body[w.paths[idx].pc];
+        if (++stats_.instructions > cfg_.max_steps)
+          throw Error::make(Err::ExecLimit, "kernel '", fn_.name,
+                            "' exceeded the launch step budget (", cfg_.max_steps,
+                            " instructions) — possible infinite loop");
+        const uint64_t lanes = static_cast<uint64_t>(popcount_mask(w.paths[idx].mask));
+        stats_.thread_instructions += lanes;
+        const InstClass cls = class_of_pc(w.paths[idx].pc);
+        stats_.inst_by_class[static_cast<size_t>(cls)] += lanes;
+        if (cls == InstClass::Tensor) ++stats_.tensor_instructions;
+        if (inner.opcode_id) {
+          if (inner.opcode_id >= stats_.inst_by_opcode.size())
+            stats_.inst_by_opcode.resize(inner.opcode_id + 1, 0);
+          ++stats_.inst_by_opcode[inner.opcode_id];
+        }
+        if (ctx.clock) ++*ctx.clock;
+        step(w, ctx, idx, inner);
+      }
+      // The nested loop ends when every path has returned. Ending any other
+      // way means the callee blocked -- a bar.sync or an mbarrier wait inside
+      // a device function -- and this executor cannot yield from there, so the
+      // rest of the function would be skipped and the caller would carry on
+      // with a half-computed result. Refuse instead.
+      if (w.state != Warp::State::Ready && !w.paths.empty())
+        throw Error::make(Err::UnsupportedPtx, "device function '", callee.name,
+                          "' blocked on a barrier; barriers inside a non-inlined device "
+                          "function are not supported (the call runs to completion without "
+                          "yielding to other warps)");
+      if (!callee.retval_slot_name.empty()) {
+        auto it = w.slots.find(callee.retval_slot_name);
+        if (it != w.slots.end()) {
+          retval = it->second;
+          have_ret = true;
+        }
+      }
+    } catch (...) {
+      restore();
+      w.slots = std::move(saved_slots);
+      throw;
+    }
+    restore();
+    w.slots = std::move(saved_slots);
+    if (have_ret && !op.retval_slot.empty()) w.slots[op.retval_slot] = retval;
+  }
+
+  static constexpr uint32_t kMaxCallDepth = 256;
+  uint32_t call_depth_ = 0;
+
   // ---- the device heap: malloc() and free() called from a kernel ----
   //
   // Backed by the same allocator host-side cudaMalloc uses, so a device
@@ -4655,6 +4801,10 @@ class Interpreter {
   }
 
   const EntryFn& fn_;
+  // The function currently executing. Equal to &fn_ except while a call to a
+  // device function is in flight, when everything that reads a body, a
+  // register count or a .local frame must follow the callee instead.
+  const EntryFn* cur_ = &fn_;
   const LaunchConfig& cfg_;
   const ParamBuffer& params_;
   MemoryManager& mem_;
