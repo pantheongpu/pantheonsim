@@ -26,6 +26,15 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   libvgpucudart (CUDA Runtime API + nvcc host-registration ABI +
   cuLibrary/cuKernel + fatbin PTX extraction incl. zstd). Verified with the
   external C11 driver-API harness AND an nvcc-compiled vectorAdd e2e test.
+- Thrust and CUB run unmodified, and are under test: thrust::sort/reduce/
+  inclusive_scan, and CUB's device-level DeviceReduce, DeviceScan (decoupled
+  look-back, so it depends on ordering across blocks) and DeviceRadixSort. A
+  radix sort is a tuned multi-kernel pipeline with its own temporary storage
+  and warp primitives throughout, so it exercises far more than a hand-written
+  kernel does. Also verified by probe, not yet pinned by a test: streams and
+  events with cross-stream waits, managed and pinned memory, pitched 2D
+  allocation with cudaMemcpy2D, the async memory pool (cudaMallocAsync), the
+  >48 KiB dynamic shared-memory opt-in, and occupancy queries.
 - Pantheon workloads: the pantheongpu stress/diagnostics kernels run
   unmodified (idle, memory_read/write, galpat, march_test, memory_hammer,
   atomic/int/compute virus). memory_read differential-matches a physical RTX

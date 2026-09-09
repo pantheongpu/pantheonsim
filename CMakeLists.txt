@@ -536,6 +536,18 @@ if(TARGET vgpucublas)
   # different loading path entirely -- an empty primary fatbin plus a list of
   # relocatable ones the runtime has to link -- so any of these failing here
   # and passing normally means the linking is wrong, not the program.
+  # Thrust and CUB device-level algorithms, unmodified. Neither is a thin
+  # wrapper -- a radix sort is a tuned multi-kernel pipeline with its own
+  # temporary storage, decoupled look-back scan and warp primitives throughout
+  # -- so running them end to end exercises far more than a hand-written kernel
+  # does, and the answer is checked rather than the launch's return code.
+  add_test(NAME e2e_libraries
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_libraries.sh)
+  set_tests_properties(e2e_libraries PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
   add_test(NAME e2e_rdc_link
            COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_rdc_link.sh)
   set_tests_properties(e2e_rdc_link PROPERTIES
