@@ -286,6 +286,18 @@ Shared idle_snapshot(const DeviceProfile& p, int device_count) {
   Shared s{};
   s.magic = kMagic;
   s.version = kVersion;
+  // The versions belong to the machine, not to any running workload, so they
+  // have to be filled here too: this is the path taken whenever nothing is
+  // publishing, which is most of the time. Without them nvidia-smi printed an
+  // empty "Driver Version:" -- a header no real driver ever produces, and the
+  // first thing that makes the output look wrong. `vgpu shell` exports both.
+  auto copy_env = [](char* dst, size_t n, const char* var, const char* fallback) {
+    const char* v = std::getenv(var);
+    if (!v || !*v) v = fallback;
+    std::snprintf(dst, n, "%s", v);
+  };
+  copy_env(s.driver_version, sizeof s.driver_version, "VGPU_DRIVER_VERSION", "580.00.00");
+  copy_env(s.cuda_version, sizeof s.cuda_version, "VGPU_CUDA_VERSION", "13.0");
   s.device_count = static_cast<uint32_t>(
       device_count < 1 ? 1 : (device_count > kMaxDevices ? kMaxDevices : device_count));
   for (uint32_t i = 0; i < s.device_count; ++i) {
@@ -304,6 +316,27 @@ Shared idle_snapshot(const DeviceProfile& p, int device_count) {
     d.proc_count = 0;
   }
   return s;
+}
+
+// What nvidia-smi puts in the "Process name" column: the executable, not the
+// pid, which the pid field beside it already carries. The publisher is another
+// process, so this is read from /proc at observation time -- and it can fail
+// (the process may have exited between publishing and being read), which is
+// why the pid remains the fallback rather than an error.
+void process_name(uint32_t pid, char* out, size_t n) {
+  char path[64];
+  std::snprintf(path, sizeof path, "/proc/%u/cmdline", pid);
+  if (std::FILE* f = std::fopen(path, "rb")) {
+    char buf[256] = {0};
+    const size_t got = std::fread(buf, 1, sizeof buf - 1, f);
+    std::fclose(f);
+    // cmdline is NUL-separated; argv[0] is the whole of what we want.
+    if (got > 0 && buf[0]) {
+      std::snprintf(out, n, "%s", buf);
+      return;
+    }
+  }
+  std::snprintf(out, n, "pid %u", pid);
 }
 
 bool read_snapshot(Shared* out, const std::string& dir) {
@@ -357,7 +390,7 @@ bool read_snapshot(Shared* out, const std::string& dir) {
         ProcSample& ps = agg.procs[agg.proc_count++];
         ps.pid = p.writer_pid;
         ps.used_bytes = s.vram_used_bytes;
-        std::snprintf(ps.name, sizeof ps.name, "pid %u", p.writer_pid);
+        process_name(p.writer_pid, ps.name, sizeof ps.name);
       }
     }
     agg.utilization_gpu = util;

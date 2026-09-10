@@ -455,6 +455,11 @@ target_include_directories(vector_add_driver PRIVATE include)
 add_test(NAME c_harness_vector_add COMMAND vector_add_driver)
 set_tests_properties(c_harness_vector_add PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100")
 
+# nvidia-smi's table is scraped positionally by real tooling, so its geometry
+# is pinned against a physical driver's output rather than left to drift.
+add_test(NAME smi_format COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_smi_format.sh)
+set_tests_properties(smi_format PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+
 # End-to-end: an nvcc-compiled CUDA app run through libvgpucudart. Depends on
 # the runtime shim; only meaningful when it was built (CUDA headers present).
 if(TARGET vgpucudart)
