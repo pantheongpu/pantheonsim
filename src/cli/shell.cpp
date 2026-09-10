@@ -421,9 +421,33 @@ int cmd_shell(const std::vector<std::string>& args) {
     else if (a == "-c" || a == "--command") c.command = next();
     else if (a == "--no-prompt" || a == "-y") prompt = false;
     else if (a == "--os") {
-      std::string want = next();
-      for (const auto& o : kOsChoices)
-        if (want == std::string(o.id) + ":" + o.version_id || want == o.id) c.os = o;
+      // Accepts "rocky", "rocky:9" and "rocky:9.3". Rocky's version_id is
+      // "9.3", so requiring the exact string made "--os rocky:9" match nothing
+      // -- and an unmatched --os used to leave the default in place silently,
+      // which handed back a different machine than the one asked for. An
+      // argument that names no OS is an error now.
+      const std::string want = next();
+      const OsChoice* found = nullptr;
+      for (const auto& o : kOsChoices) {
+        const std::string id(o.id), ver(o.version_id);
+        if (want == id || want == id + ":" + ver) { found = &o; break; }
+        // "rocky:9" matches "rocky:9.3", but "ubuntu:2" must not match
+        // "ubuntu:22.04" -- so the split has to land on a version boundary.
+        if (want.rfind(id + ":", 0) == 0) {
+          const std::string part = want.substr(id.size() + 1);
+          if (ver.rfind(part, 0) == 0 && (ver.size() == part.size() || ver[part.size()] == '.')) {
+            found = &o;
+            break;
+          }
+        }
+      }
+      if (!found) {
+        std::fprintf(stderr, "vgpu shell: unknown OS '%s'. Available:\n", want.c_str());
+        for (const auto& o : kOsChoices)
+          std::fprintf(stderr, "  %s:%s  (%s)\n", o.id, o.version_id, o.label);
+        return 2;
+      }
+      c.os = *found;
     } else if (a == "--stage2") {
       stage2_session = next();
       prompt = false;
@@ -432,6 +456,14 @@ int cmd_shell(const std::vector<std::string>& args) {
       return 2;
     }
   }
+
+  // Prompting only makes sense when there is someone to answer. With -c the
+  // session is a one-shot command, and with stdin closed or piped there is no
+  // one at all -- and an unanswered prompt does not fail, it silently takes
+  // the default. That is how `--os rocky:9` became Ubuntu 22.04: the flag was
+  // parsed, the prompt ran anyway, read EOF, and overwrote it. A machine that
+  // quietly differs from the one that was asked for is worse than an error.
+  if (!c.command.empty() || !::isatty(STDIN_FILENO)) prompt = false;
 
   if (prompt) {
     std::cout << "\n  VirtualGPU machine simulator\n"
