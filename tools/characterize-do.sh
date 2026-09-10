@@ -6,6 +6,32 @@
 #   tools/characterize-do.sh gpu-mi300x1-192gb [region]
 #   tools/characterize-do.sh gpu-h200x1-141gb  [region]
 #
+# KNOWN LIMIT: MI300X is not reachable this way. The AMD Developer Cloud runs on
+# DigitalOcean and its token is an ordinary dop_v1_ one, so it is tempting to
+# assume the console and the API front the same inventory. They do not.
+# gpu-mi325x1-256gb creates fine through the API -- that is where the verified
+# mi325x profile came from -- while gpu-mi300x1-192gb returns
+#
+#     {"id":"unprocessable_entity","message":"Size is not available in this region."}
+#
+# in every region tried, at the same time as the AMD console offers MI300X for
+# immediate creation. `tools/do-sizes.sh mi3` explains why, and is the thing to
+# run before ever attempting a create: the size reports available:true with an
+# EMPTY region list, so the API knows the product and will never place it for
+# this token. No region argument can fix that. The error message is misleading
+# -- it says "not available in this region" for a size that is available in no
+# region at all.
+#
+# So for MI300X: create the machine in the AMD console, then collect the dump
+# by hand -- the SSH block below is the only part that needs the device, and
+# rocminfo-to-profile.py runs at home:
+#
+#     export PATH=$PATH:/opt/rocm/bin
+#     { rocminfo; rocm-smi --showallinfo; } > mi300x.rocminfo.txt 2>&1
+#
+# Do not iterate on the droplet. The AMD image ships hipcc without the HIP
+# headers, which is what made this script collect raw text in the first place.
+#
 # Destruction is the whole discipline here. These droplets cost between $2.59
 # and $11.19 an hour, and this runs against an account with a fixed credit
 # balance rather than a card, so a droplet left up does not produce a surprising
