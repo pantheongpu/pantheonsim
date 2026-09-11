@@ -51,6 +51,10 @@ jobs:
   workloads:
     name: pantheon workloads
     runs-on: ubuntu-24.04
+    # A passing run takes about 35 minutes on a 4-core runner (int_virus is
+    # most of it). Nothing else bounds it, so a hang would otherwise hold the
+    # job for GitHub's six-hour default.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
