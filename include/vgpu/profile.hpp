@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <string>
 
@@ -49,13 +50,24 @@ struct TelemetryClass {
   uint32_t temperature_max_c = 0;
   uint32_t pci_vendor_id = 0;
   uint32_t pci_device_id = 0;
+  // Memory the driver keeps for itself: the framebuffer nvidia-smi and NVML
+  // report as "total", minus the totalGlobalMem a CUDA program sees. On a real
+  // H100 those are 81559 and 81089 MiB, and every datacenter card differs by a
+  // few hundred. vram_bytes stays the CUDA number -- that is what the verified
+  // profiles measured and what programs size their work by -- and the monitor
+  // adds this back. Kept as a difference rather than an absolute so that
+  // shrinking VRAM for a laptop-scale run shrinks what nvidia-smi says too.
+  uint64_t framebuffer_reserve_bytes = 0;
 };
 
 struct DeviceProfile {
   std::string id;            // registry id, e.g. "nvidia/h100"
   std::string vendor;        // "nvidia" | "amd"
   std::string model;         // marketing/device name as APIs report it
-  std::string architecture;  // "ampere" | "hopper" | "blackwell" | ...
+  std::string architecture;  // "ampere" | "hopper" | "blackwell" | "cdna3" | ...
+  // AMD's equivalent of a compute capability: the gfx target a binary must be
+  // built for. "gfx942" for CDNA3. Empty on NVIDIA.
+  std::string gcn_arch;
   int cc_major = 0;          // compute capability (NVIDIA) / ISA generation
   int cc_minor = 0;
   uint32_t warp_size = 0;
@@ -68,5 +80,24 @@ struct DeviceProfile {
   // Parses a profile document. `origin` names the source in error messages.
   static DeviceProfile from_yaml(const std::string& src, const std::string& origin);
 };
+
+// VGPU_VRAM_MB resizes the card a run sees -- totalGlobalMem directly, and
+// nvidia-smi's total through the reserve above. One function so its readers
+// cannot disagree: it used to be copied into the runtime and the driver and
+// missing from the idle nvidia-smi path, which reported the whole 80 GB card to
+// a session whose programs had been given 4. A value that is not a positive
+// number is ignored rather than turning the card into one with no memory.
+inline void apply_vram_override(DeviceProfile& p) {
+  const char* mb = std::getenv("VGPU_VRAM_MB");
+  // Digits only. strtoull accepts a leading minus and wraps it -- "-5" parsed
+  // as 18446744073709551611 and made a card of about 16 EiB -- and a value
+  // that large overflows the multiplication below anyway.
+  if (!mb || *mb < '0' || *mb > '9') return;
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(mb, &end, 10);
+  constexpr unsigned long long kMiB = 1024ull * 1024ull;
+  if (*end != '\0' || v == 0 || v > UINT64_MAX / kMiB) return;
+  p.vram_bytes = v * kMiB;
+}
 
 }  // namespace vgpu

@@ -10,7 +10,9 @@ id: amd/mi350x
 vendor: amd
 model: "AMD Instinct MI350X"
 architecture: cdna4
-compute_capability: "9.5"
+# AMD parts have no compute capability; the gfx target is what identifies them.
+# Placeholder, like the rest of this file: not read from a device.
+gcn_arch: "gfx950"
 warp_size: 64
 vram_bytes: 309237645312
 verified: false

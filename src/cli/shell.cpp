@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -421,9 +422,33 @@ int cmd_shell(const std::vector<std::string>& args) {
     else if (a == "-c" || a == "--command") c.command = next();
     else if (a == "--no-prompt" || a == "-y") prompt = false;
     else if (a == "--os") {
-      std::string want = next();
-      for (const auto& o : kOsChoices)
-        if (want == std::string(o.id) + ":" + o.version_id || want == o.id) c.os = o;
+      // Accepts "rocky", "rocky:9" and "rocky:9.3". Rocky's version_id is
+      // "9.3", so requiring the exact string made "--os rocky:9" match nothing
+      // -- and an unmatched --os used to leave the default in place silently,
+      // which handed back a different machine than the one asked for. An
+      // argument that names no OS is an error now.
+      const std::string want = next();
+      const OsChoice* found = nullptr;
+      for (const auto& o : kOsChoices) {
+        const std::string id(o.id), ver(o.version_id);
+        if (want == id || want == id + ":" + ver) { found = &o; break; }
+        // "rocky:9" matches "rocky:9.3", but "ubuntu:2" must not match
+        // "ubuntu:22.04" -- so the split has to land on a version boundary.
+        if (want.rfind(id + ":", 0) == 0) {
+          const std::string part = want.substr(id.size() + 1);
+          if (ver.rfind(part, 0) == 0 && (ver.size() == part.size() || ver[part.size()] == '.')) {
+            found = &o;
+            break;
+          }
+        }
+      }
+      if (!found) {
+        std::fprintf(stderr, "vgpu shell: unknown OS '%s'. Available:\n", want.c_str());
+        for (const auto& o : kOsChoices)
+          std::fprintf(stderr, "  %s:%s  (%s)\n", o.id, o.version_id, o.label);
+        return 2;
+      }
+      c.os = *found;
     } else if (a == "--stage2") {
       stage2_session = next();
       prompt = false;
@@ -432,6 +457,14 @@ int cmd_shell(const std::vector<std::string>& args) {
       return 2;
     }
   }
+
+  // Prompting only makes sense when there is someone to answer. With -c the
+  // session is a one-shot command, and with stdin closed or piped there is no
+  // one at all -- and an unanswered prompt does not fail, it silently takes
+  // the default. That is how `--os rocky:9` became Ubuntu 22.04: the flag was
+  // parsed, the prompt ran anyway, read EOF, and overwrote it. A machine that
+  // quietly differs from the one that was asked for is worse than an error.
+  if (!c.command.empty() || !::isatty(STDIN_FILENO)) prompt = false;
 
   if (prompt) {
     std::cout << "\n  VirtualGPU machine simulator\n"
@@ -496,8 +529,15 @@ int cmd_shell(const std::vector<std::string>& args) {
     for (auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
     cargv.push_back(nullptr);
     ::execvp("unshare", cargv.data());
-    // unshare unavailable: fall through and run without isolation.
+    // unshare unavailable: fall through and run without isolation -- and
+    // actually without it. This used to print that message and then carry on
+    // with c.isolate still set, so the bind mounts below ran in the *host's*
+    // mount namespace: `mount --make-rprivate /`, then /etc/os-release,
+    // /proc/driver and /sys/class/drm overlaid for every process on the
+    // machine. As a normal user those fail and nobody notices; as root, on a
+    // box without unshare, they succeed.
     std::fprintf(stderr, "[vgpu] namespaces unavailable; continuing without /proc isolation\n");
+    c.isolate = false;
     stage2_session = s.dir;
   }
 
@@ -521,13 +561,20 @@ int cmd_shell(const std::vector<std::string>& args) {
       std::string cmd = "mount --bind '" + src + "' '" + dst + "' 2>/dev/null";
       return std::system(cmd.c_str()) == 0;
     };
-    std::system("mount --make-rprivate / 2>/dev/null");
-    bool ok = bind(s.root + "/etc/os-release", "/etc/os-release");
+    // Private first, and only then bind. This is what keeps the overlays
+    // inside the session's own namespace; on a host whose / is a shared mount,
+    // a bind made without it propagates out. If it cannot be done, the binds
+    // are not attempted at all -- the host's files showing through is the
+    // documented fallback, and overlaying the host's is not.
+    bool ok = false;
+    if (std::system("mount --make-rprivate / 2>/dev/null") == 0) {
+      ok = bind(s.root + "/etc/os-release", "/etc/os-release");
     // procfs will not accept new entries, so overlay the whole /proc/driver
     // directory. That makes /proc/driver/nvidia/version -- which plenty of
     // tools and install scripts check -- appear for the simulated driver.
     ok = bind(s.root + "/proc/driver", "/proc/driver") || ok;
-    ok = bind(s.root + "/sys/class/drm", "/sys/class/drm") || ok;
+      ok = bind(s.root + "/sys/class/drm", "/sys/class/drm") || ok;
+    }
     isolated = ok;
   }
 
@@ -623,8 +670,12 @@ int cmd_shell(const std::vector<std::string>& args) {
   if (pump.joinable()) pump.join();
   // Remove the session directory; otherwise every run leaves its generated
   // tools and system files behind in /tmp.
-  if (s.dir.rfind("/tmp/vgpu-session-", 0) == 0)
-    std::system(("rm -rf '" + s.dir + "' 2>/dev/null").c_str());
+  // No shell: the path is ours and the prefix check stays, but removing a
+  // directory does not need /bin/sh, quoting, or a return value to ignore.
+  if (s.dir.rfind("/tmp/vgpu-session-", 0) == 0) {
+    std::error_code ec;
+    std::filesystem::remove_all(s.dir, ec);
+  }
   if (c.command.empty())
     std::printf("\n  Session ended. Simulated %d x %s.\n", c.count, profile.model.c_str());
   return WIFEXITED(status) ? WEXITSTATUS(status) : 1;

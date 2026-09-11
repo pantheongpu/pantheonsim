@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -21,7 +22,14 @@ struct LaunchConfig {
   std::array<uint32_t, 3> grid{1, 1, 1};
   std::array<uint32_t, 3> block{1, 1, 1};
   uint32_t shared_bytes = 0;
+  // Thread-block cluster shape in CTAs (cudaLaunchAttributeClusterDimension,
+  // or __cluster_dims__ compiled into the kernel). All zeros means no explicit
+  // cluster, which PTX defines as behaving like 1x1x1.
+  std::array<uint32_t, 3> cluster{0, 0, 0};
   SchedulerKind scheduler = SchedulerKind::Deterministic;
+  // Seed for the random and adversarial schedulers; ignored by the
+  // deterministic one. The same seed replays the same execution.
+  uint64_t scheduler_seed = 0;
   // Safety net against infinite loops; counts executed instructions per launch.
   uint64_t max_steps = 1ull << 30;
   // A cooperative launch: every block is resident at once and may wait on the
@@ -141,6 +149,16 @@ struct LaunchStats {
   // say 32 for something that happened once.
   uint64_t tensor_instructions = 0;
 
+  // Per-opcode issue counts, indexed by the interned opcode id (see
+  // ptx::intern_opcode). Nine classes tell you a kernel is memory-heavy; this
+  // tells you it is memory-heavy because of ld.global.nc, which is the
+  // difference between a number and a lead. Counted per warp-level issue, like
+  // `instructions`.
+  //
+  // Not a uint64_t member, so it sits outside the block the merge below walks
+  // and is folded in by hand -- see add().
+  std::vector<uint64_t> inst_by_opcode;
+
   // Adding a counter used to mean remembering to add it to the merge that
   // folds each host thread's totals together, and forgetting left the new one
   // reading zero however carefully it was collected. Every field is a uint64_t
@@ -149,15 +167,30 @@ struct LaunchStats {
   // Every member is a uint64_t count, which is what makes walking them safe.
   // A member of any other type must not be folded in by reinterpretation --
   // give it its own handling instead of letting this reach it.
-  void add(const LaunchStats& other) {
-    auto* dst = reinterpret_cast<uint64_t*>(this);
-    const auto* src = reinterpret_cast<const uint64_t*>(&other);
-    for (size_t i = 0; i < sizeof(LaunchStats) / sizeof(uint64_t); ++i) dst[i] += src[i];
-  }
+  // Defined out of line: it needs offsetof, which needs the complete type.
+  void add(const LaunchStats& other);
 };
 
-static_assert(sizeof(LaunchStats) % sizeof(uint64_t) == 0,
-              "LaunchStats must be a block of uint64_t counters; see add()");
+// Where the plain-counter block ends. Everything before `inst_by_opcode` is a
+// uint64_t count and is summed by walking the block; the vector after it is
+// not, and reinterpreting it as counters would corrupt it.
+inline constexpr size_t kCounterWords =
+    offsetof(LaunchStats, inst_by_opcode) / sizeof(uint64_t);
+
+static_assert(offsetof(LaunchStats, inst_by_opcode) % sizeof(uint64_t) == 0,
+              "the counter block before inst_by_opcode must be whole uint64_t words; see add()");
+
+inline void LaunchStats::add(const LaunchStats& other) {
+  // Fold the vector first, by hand, then walk only the block that precedes it.
+  if (other.inst_by_opcode.size() > inst_by_opcode.size())
+    inst_by_opcode.resize(other.inst_by_opcode.size(), 0);
+  for (size_t i = 0; i < other.inst_by_opcode.size(); ++i)
+    inst_by_opcode[i] += other.inst_by_opcode[i];
+
+  auto* dst = reinterpret_cast<uint64_t*>(this);
+  const auto* src = reinterpret_cast<const uint64_t*>(&other);
+  for (size_t i = 0; i < kCounterWords; ++i) dst[i] += src[i];
+}
 
 // Module global-variable addresses (name -> device VA), materialized by the
 // runtime at module load. Kernels referencing globals need this at launch.

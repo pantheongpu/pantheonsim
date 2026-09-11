@@ -5,6 +5,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
 #include "vgpu/exec/texture.hpp"
+#include "vgpu/exec/scheduler.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
@@ -22,6 +23,8 @@ using vgpu::exec::TexKind;
 
 namespace {
 const char* kHeader = ".version 8.3\n.target sm_86\n.address_size 64\n";
+// Hopper and later, for the features that only exist there.
+const char* kHeader90 = ".version 8.3\n.target sm_90a\n.address_size 64\n";
 std::vector<uint8_t> arg_u64(uint64_t v) {
   std::vector<uint8_t> b(8);
   std::memcpy(b.data(), &v, 8);
@@ -1642,6 +1645,201 @@ DONE:
 }
 )";
 
+VTEST(the_per_opcode_histogram_counts_every_mnemonic) {
+  // Nine classes say a kernel is memory-heavy; this says which instruction
+  // made it so. The first attempt at this interned the opcode at two of the
+  // parser's dozens of construction sites and counted almost nothing, so the
+  // test checks specific mnemonics rather than a non-empty total.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 1;
+    add.s32 %r2, %r1, 1;
+    add.s32 %r3, %r2, 1;
+    add.s32 %r4, %r3, 1;
+    st.global.u32 [%rd2], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  auto st = exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{4});
+
+  const auto& names = vgpu::ptx::opcode_names();
+  auto count_of = [&](const char* mnemonic) -> uint64_t {
+    for (size_t i = 1; i < names.size() && i < st.inst_by_opcode.size(); ++i)
+      if (names[i] == mnemonic) return st.inst_by_opcode[i];
+    return 0;
+  };
+  VCHECK_EQ(count_of("add"), uint64_t{3});
+  VCHECK_EQ(count_of("st"), uint64_t{1});
+  VCHECK_EQ(count_of("ret"), uint64_t{1});
+  VCHECK_EQ(count_of("cvta"), uint64_t{1});
+  // And the histogram sums to the warp-level issue count, which is what makes
+  // it comparable with `instructions` rather than a separate accounting.
+  uint64_t total = 0;
+  for (uint64_t n : st.inst_by_opcode) total += n;
+  VCHECK_EQ(total, st.instructions);
+}
+
+VTEST(merging_per_thread_counters_folds_the_opcode_histogram_too) {
+  // inst_by_opcode is a vector, not a uint64_t, so it sits outside the block
+  // that add() walks by reinterpretation. Folding it by hand is the part that
+  // is easy to forget -- and forgetting it leaves the histogram reading zero
+  // on any multi-threaded launch however carefully it was collected.
+  vgpu::exec::LaunchStats a, b;
+  a.instructions = 10;
+  a.inst_by_opcode = {0, 5, 3};
+  b.instructions = 4;
+  b.inst_by_opcode = {0, 1, 0, 7};  // longer than a's, so it must grow
+  a.add(b);
+  VCHECK_EQ(a.instructions, uint64_t{14});
+  VCHECK_EQ(a.inst_by_opcode.size(), size_t{4});
+  VCHECK_EQ(a.inst_by_opcode[1], uint64_t{6});
+  VCHECK_EQ(a.inst_by_opcode[2], uint64_t{3});
+  VCHECK_EQ(a.inst_by_opcode[3], uint64_t{7});
+}
+
+// ---- scheduler modes ----
+//
+// A kernel with a read-modify-write race between two warps through *global*
+// memory. The shared-memory detector cannot see this one -- it is not shared
+// memory -- so the only thing that exposes it is an execution order in which
+// the two warps interleave.
+//
+// Under the deterministic scheduler they never do: a warp runs from one
+// barrier to the next without interruption, so warp 0 completes its whole
+// read-modify-write before warp 1 starts, and the answer comes out "right"
+// every time. That is the failure mode these modes exist for.
+static const char* kGlobalRaceKernel = R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    // Every thread does a non-atomic increment of the same word, 8 times.
+    // With any interleaving at all, updates are lost.
+    mov.u32 %r5, 0;
+LOOP:
+    ld.global.u32 %r1, [%rd2];
+    add.s32 %r2, %r1, 1;
+    st.global.u32 [%rd2], %r2;
+    add.s32 %r5, %r5, 1;
+    setp.lt.u32 %p1, %r5, 8;
+    @%p1 bra LOOP;
+    ret;
+}
+)";
+
+static uint64_t run_global_race(Env& e, const ptx::Module& m, vgpu::exec::SchedulerKind kind,
+                                uint64_t seed) {
+  uint64_t out = e.mem.alloc(16);
+  e.mem.store_scalar(out, 4, 0);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};  // two warps
+  cfg.scheduler = kind;
+  cfg.scheduler_seed = seed;
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  return e.mem.load_scalar(out, 4);
+}
+
+VTEST(the_same_seed_replays_the_same_execution) {
+  // The property the whole mode rests on: a race you cannot re-run is a race
+  // you cannot fix.
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kGlobalRaceKernel);
+  const uint64_t a = run_global_race(e, m, vgpu::exec::SchedulerKind::Random, 12345);
+  const uint64_t b = run_global_race(e, m, vgpu::exec::SchedulerKind::Random, 12345);
+  VCHECK_EQ(a, b);
+  const uint64_t c = run_global_race(e, m, vgpu::exec::SchedulerKind::Adversarial, 999);
+  const uint64_t d = run_global_race(e, m, vgpu::exec::SchedulerKind::Adversarial, 999);
+  VCHECK_EQ(c, d);
+}
+
+VTEST(an_adversarial_order_loses_updates_the_deterministic_one_does_not) {
+  // 64 threads x 8 increments = 512 if every update landed. The deterministic
+  // order runs each warp to completion, so within a warp the lanes are
+  // lockstep and the two warps do not interleave: it reports one fixed answer.
+  // The adversarial order preempts every instruction, so updates are lost --
+  // which is what the hardware would also do, and what the fixed order hides.
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kGlobalRaceKernel);
+  const uint64_t det = run_global_race(e, m, vgpu::exec::SchedulerKind::Deterministic, 0);
+  const uint64_t adv = run_global_race(e, m, vgpu::exec::SchedulerKind::Adversarial, 7);
+  VCHECK(adv < det);
+}
+
+VTEST(different_seeds_explore_different_orders) {
+  // If every seed produced the same answer the mode would be a search in name
+  // only. At least one pair out of several must differ.
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kGlobalRaceKernel);
+  std::vector<uint64_t> seen;
+  for (uint64_t seed = 1; seed <= 12; ++seed)
+    seen.push_back(run_global_race(e, m, vgpu::exec::SchedulerKind::Random, seed));
+  bool any_differ = false;
+  for (size_t i = 1; i < seen.size(); ++i)
+    if (seen[i] != seen[0]) any_differ = true;
+  VCHECK(any_differ);
+}
+
+VTEST(a_race_free_kernel_gives_the_same_answer_under_every_order) {
+  // The other half, and the one that keeps the modes honest: reordering must
+  // not change a correct program. A scheduler that broke race-free kernels
+  // would make every report suspect.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    mul.lo.s32 %r2, %r1, 3;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+)";
+  auto check = [&](vgpu::exec::SchedulerKind kind, uint64_t seed) {
+    Env e;
+    auto m = ptx::parse(ptx);
+    uint64_t out = e.mem.alloc(512);
+    LaunchConfig cfg;
+    cfg.block = {64, 1, 1};
+    cfg.scheduler = kind;
+    cfg.scheduler_seed = seed;
+    exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+    for (uint32_t i = 0; i < 64; ++i)
+      VCHECK_EQ(e.mem.load_scalar(out + i * 4, 4), uint64_t{i * 3});
+  };
+  check(vgpu::exec::SchedulerKind::Deterministic, 0);
+  check(vgpu::exec::SchedulerKind::Random, 4242);
+  check(vgpu::exec::SchedulerKind::Adversarial, 4242);
+}
+
+VTEST(an_unknown_scheduler_name_is_refused_rather_than_defaulted) {
+  // Running the default under a name nobody recognises would mean a result
+  // that cannot be attributed to an execution order, which is the one thing
+  // these modes exist to provide.
+  setenv("VGPU_SCHEDULER", "aggressive", 1);
+  vgpu::exec::SchedulerKind k = vgpu::exec::SchedulerKind::Deterministic;
+  uint64_t seed = 0;
+  auto err = VCAPTURE(Error, vgpu::exec::scheduler_from_env(&k, &seed));
+  unsetenv("VGPU_SCHEDULER");
+  VCHECK(err.code() == Err::InvalidValue);
+}
+
 // ---- special registers added for kernels that read them ----
 
 VTEST(clock64_advances_and_never_goes_backwards) {
@@ -1741,6 +1939,847 @@ VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
   VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{512});
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{512 + 256});
+}
+
+VTEST(fp8_e4m3_and_e5m2_are_different_formats) {
+  // The two FP8 formats are not one shape with a different bias. e4m3 spends
+  // its top exponent on ordinary numbers -- it has NO infinity -- so its
+  // largest finite value is 448 and 1000 saturates to it. e5m2 is IEEE-shaped
+  // with a wider range, and represents 1000 as 1024 (two mantissa bits).
+  //
+  // Treating e4m3's top exponent as reserved would cost half its range, and
+  // the values that vanish are exactly the large activations FP8 inference is
+  // scaled to keep.
+  std::string ptx = std::string(kHeader90) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<20>;
+    .reg .f32 %f<20>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.f32 %f1, 0f3F800000;   // 1.0
+    mov.f32 %f2, 0f40000000;   // 2.0
+    cvt.rn.satfinite.e4m3x2.f32 %r1, %f2, %f1;   // a is the high byte
+    st.global.u32 [%rd2], %r1;
+    cvt.rn.f16x2.e4m3x2 %r2, %r1;                // and back again
+    st.global.u32 [%rd2+4], %r2;
+    mov.f32 %f3, 0f447A0000;   // 1000.0
+    mov.f32 %f4, 0f00000000;
+    cvt.rn.satfinite.e4m3x2.f32 %r3, %f3, %f4;
+    cvt.rn.f16x2.e4m3x2 %r4, %r3;
+    st.global.u32 [%rd2+8], %r4;
+    cvt.rn.satfinite.e5m2x2.f32 %r5, %f3, %f4;
+    cvt.rn.f16x2.e5m2x2 %r6, %r5;
+    st.global.u32 [%rd2+12], %r6;
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  auto half = [](uint16_t h) {
+    const uint32_t s = (h >> 15) & 1, ex = (h >> 10) & 0x1F, mn = h & 0x3FF;
+    if (ex == 0) return static_cast<float>((s ? -1 : 1) * std::ldexp(static_cast<double>(mn), -24));
+    const double v = std::ldexp(static_cast<double>(mn | 0x400), static_cast<int>(ex) - 25);
+    return static_cast<float>(s ? -v : v);
+  };
+  // The packed bytes themselves: e4m3 1.0 is 0x38, 2.0 is 0x40.
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0x4038});
+  const uint32_t rt = static_cast<uint32_t>(e.mem.load_scalar(out + 4, 4));
+  VCHECK_EQ(half(static_cast<uint16_t>(rt & 0xFFFF)), 1.0f);
+  VCHECK_EQ(half(static_cast<uint16_t>(rt >> 16)), 2.0f);
+  // 1000 saturates in e4m3 and does not in e5m2 -- the whole difference.
+  const uint32_t big4 = static_cast<uint32_t>(e.mem.load_scalar(out + 8, 4));
+  const uint32_t big5 = static_cast<uint32_t>(e.mem.load_scalar(out + 12, 4));
+  VCHECK_EQ(half(static_cast<uint16_t>(big4 >> 16)), 448.0f);
+  VCHECK_EQ(half(static_cast<uint16_t>(big5 >> 16)), 1024.0f);
+}
+
+VTEST(nan_propagating_min_and_half_atomics) {
+  // min.NaN/max.NaN return NaN when either operand is NaN; plain min/max
+  // return the other operand, which is fmin/fmax's rule. A clamp written as
+  // max.NaN to keep NaNs visible would quietly launder them away if the
+  // modifier were dropped, so the two forms are checked against each other.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.f32 %f1, 0f7FC00000;      // NaN
+    mov.f32 %f2, 0f40400000;      // 3.0
+    min.f32 %f3, %f1, %f2;        // plain: returns 3.0
+    min.NaN.f32 %f4, %f1, %f2;    // .NaN: returns NaN
+    st.global.f32 [%rd2], %f3;
+    st.global.f32 [%rd2+4], %f4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), 3.0f);
+  VCHECK(std::isnan(as_f32(e.mem.load_scalar(out + 4, 4))));
+}
+
+VTEST(packed_half_atomics_update_both_channels) {
+  // atom.add.f16x2 is one atomic over two independent halves, which is the
+  // point of it: a gradient accumulation touches both channels of a half2
+  // without racing on two separate atomics. 64 threads each add {1.0, 2.0}.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.f32 %f1, 0f3F800000;      // 1.0
+    mov.f32 %f2, 0f40000000;      // 2.0
+    cvt.rn.f16x2.f32 %r1, %f2, %f1;   // hi = 2.0, lo = 1.0
+    red.global.add.noftz.f16x2 [%rd2], %r1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(8);
+  e.mem.store_scalar(out, 4, 0);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {64, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  const uint32_t packed = static_cast<uint32_t>(e.mem.load_scalar(out, 4));
+  // f16 has an 11-bit mantissa, so 64 and 128 are both exact.
+  auto half_to_float = [](uint16_t h) {
+    const uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1F, man = h & 0x3FF;
+    if (exp == 0) return std::ldexp(static_cast<float>(man), -24) * (sign ? -1 : 1);
+    const float v = std::ldexp(static_cast<float>(man | 0x400), static_cast<int>(exp) - 25);
+    return sign ? -v : v;
+  };
+  VCHECK_EQ(half_to_float(static_cast<uint16_t>(packed & 0xFFFF)), 64.0f);
+  VCHECK_EQ(half_to_float(static_cast<uint16_t>(packed >> 16)), 128.0f);
+}
+
+VTEST(bf16_arithmetic_is_bf16_not_f16) {
+  // bf16 is not an f16 with a different bias: it has f32's exponent range and
+  // a 7-bit mantissa. The distinction is visible at 300.0, which bf16 rounds
+  // to 300 exactly but which is well inside f16's range too -- so the value
+  // that separates them is one f16 cannot hold at all. 70000 overflows f16 to
+  // infinity and is an ordinary bf16.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.f32 %f1, 0f477A3000;      // 64099 -- finite in bf16, infinite in f16
+    cvt.rn.bf16.f32 %r1, %f1;
+    mov.f32 %f2, 0f40000000;      // 2.0
+    cvt.rn.bf16.f32 %r2, %f2;
+    mul.rn.bf16 %r3, %r1, %r2;    // ~128k, still finite in bf16
+    cvt.f32.bf16 %f3, %r3;
+    st.global.f32 [%rd2], %f3;
+    // packed bf16x2: two independent halves
+    mov.f32 %f4, 0f3F800000;      // 1.0
+    cvt.rn.bf16.f32 %r4, %f4;
+    shl.b32 %r5, %r2, 16;
+    or.b32 %r6, %r4, %r5;         // {lo=1.0, hi=2.0}
+    add.rn.bf16x2 %r7, %r6, %r6;  // {2.0, 4.0}
+    and.b32 %r8, %r7, 65535;
+    cvt.f32.bf16 %f5, %r8;
+    shr.u32 %r9, %r7, 16;
+    cvt.f32.bf16 %f6, %r9;
+    st.global.f32 [%rd2+4], %f5;
+    st.global.f32 [%rd2+8], %f6;
+    // max propagates the non-NaN operand, which fmin/fmax do and < does not
+    max.bf16 %r10, %r4, %r2;
+    cvt.f32.bf16 %f7, %r10;
+    st.global.f32 [%rd2+12], %f7;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  // 64099 rounds to bf16 as 64256; doubled that is 128512, and it must be
+  // finite -- an f16 decode would have made it infinity long before here.
+  const float doubled = as_f32(e.mem.load_scalar(out, 4));
+  VCHECK(std::isfinite(doubled));
+  VCHECK(doubled > 100000.0f && doubled < 160000.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 4, 4)), 2.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 8, 4)), 4.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 12, 4)), 2.0f);
+}
+
+VTEST(bfind_elect_and_isspacep) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<4>;
+    .shared .align 4 .b8 tile[64];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 1024;            // bit 10
+    bfind.u32 %r2, %r1;
+    bfind.shiftamt.u32 %r3, %r1;  // 31 - 10
+    mov.u32 %r4, 0;
+    bfind.u32 %r5, %r4;           // no set bit -> 0xFFFFFFFF
+    mov.u32 %r6, 4294967291;      // -5 as s32; ~(-5) = 4, top differing bit is 2
+    bfind.s32 %r7, %r6;
+    st.global.u32 [%rd2], %r2;
+    st.global.u32 [%rd2+4], %r3;
+    st.global.u32 [%rd2+8], %r5;
+    st.global.u32 [%rd2+12], %r7;
+    // one leader for the whole warp
+    elect.sync %r8|%p0, -1;
+    selp.b32 %r9, 1, 0, %p0;
+    st.global.u32 [%rd2+16], %r8;
+    // generic pointers: a shared address is shared, a global one is global
+    mov.u64 %rd3, tile;
+    cvta.shared.u64 %rd4, %rd3;
+    isspacep.shared %p1, %rd4;
+    selp.b32 %r10, 1, 0, %p1;
+    isspacep.global %p2, %rd4;
+    selp.b32 %r11, 1, 0, %p2;
+    isspacep.global %p3, %rd1;
+    selp.b32 %r12, 1, 0, %p3;
+    st.global.u32 [%rd2+20], %r10;
+    st.global.u32 [%rd2+24], %r11;
+    st.global.u32 [%rd2+28], %r12;
+    griddepcontrol.wait;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(64);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{10});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{21});          // 31 - 10
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{0xFFFFFFFFu}); // no bit set
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), uint64_t{2});          // bfind.s32 of -5
+  VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{0});          // lane 0 elected
+  VCHECK_EQ(e.mem.load_scalar(out + 20, 4), uint64_t{1});          // shared is shared
+  VCHECK_EQ(e.mem.load_scalar(out + 24, 4), uint64_t{0});          // and is not global
+  VCHECK_EQ(e.mem.load_scalar(out + 28, 4), uint64_t{1});          // the buffer is global
+}
+
+VTEST(cp_async_mbarrier_arrive_lands_the_copy_before_the_arrival) {
+  // The ordering an Ampere pipeline depends on. Warp 0 issues a cp.async into
+  // shared memory and signals the barrier with cp.async.mbarrier.arrive; every
+  // thread waits and then reads. If the arrival were signalled before the copy
+  // landed, the consumers would read the zero that cp.async deliberately
+  // leaves visible until its wait -- so this reads 7 or it reads 0.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 src, .param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<12>;
+    .reg .pred %p<4>;
+    .shared .align 8 .b8 bar[8];
+    .shared .align 16 .b8 stage[16];
+    ld.param.u64 %rd1, [src];
+    cvta.to.global.u64 %rd2, %rd1;
+    ld.param.u64 %rd3, [out];
+    cvta.to.global.u64 %rd4, %rd3;
+    mov.u32 %r1, %tid.x;
+    mov.u64 %rd5, bar;
+    mov.u64 %rd6, stage;
+    setp.ne.u32 %p0, %r1, 0;
+    @%p0 bra INITDONE;
+    mov.u32 %r2, 64;
+    mbarrier.init.shared.b64 [%rd5], %r2;
+    mov.u32 %r3, 0;
+    st.shared.u32 [%rd6], %r3;
+INITDONE:
+    bar.sync 0;
+    @%p0 bra ARRIVE;
+    cp.async.ca.shared.global [%rd6], [%rd2], 4;
+    cp.async.mbarrier.arrive.shared.b64 [%rd5];
+    bra WAIT;
+ARRIVE:
+    mbarrier.arrive.shared.b64 %rd7, [%rd5];
+WAIT:
+    mbarrier.arrive.shared.b64 %rd8, [%rd5];
+SPIN:
+    mbarrier.test_wait.shared.b64 %p1, [%rd5], %rd8;
+    @!%p1 bra SPIN;
+    ld.shared.u32 %r5, [%rd6];
+    mul.wide.u32 %rd9, %r1, 4;
+    add.s64 %rd10, %rd4, %rd9;
+    st.global.u32 [%rd10], %r5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint32_t kThreads = 64;
+  uint64_t src = e.mem.alloc(16);
+  e.mem.store_scalar(src, 4, 7);
+  uint64_t out = e.mem.alloc(kThreads * 4);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {kThreads, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(src), arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t t = 0; t < kThreads; ++t)
+    VCHECK_EQ(e.mem.load_scalar(out + t * 4, 4), uint64_t{7});
+}
+
+VTEST(mbarrier_orders_a_producer_against_a_consumer) {
+  // The test that matters for a split barrier: warp 0 writes a value, all
+  // threads arrive, and every thread spins on the barrier before reading. If
+  // the wait returned true early -- the easy way to get the phase comparison
+  // backwards -- the consumers would read the zero that was there before, and
+  // this would fail with 0 rather than 41.
+  //
+  // Nothing blocks in the engine here. The wait is a predicate and the kernel
+  // spins; the scheduler preempts the spinning warp, the others arrive, and
+  // the spinner then sees the phase flip.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<4>;
+    .shared .align 8 .b8 bar[8];
+    .shared .align 4 .b8 buf[4];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u64 %rd3, bar;
+    mov.u64 %rd4, buf;
+    // thread 0 initializes the barrier for all 64 threads
+    setp.ne.u32 %p0, %r1, 0;
+    @%p0 bra INITDONE;
+    mov.u32 %r2, 64;
+    mbarrier.init.shared.b64 [%rd3], %r2;
+    mov.u32 %r3, 0;
+    st.shared.u32 [%rd4], %r3;
+INITDONE:
+    bar.sync 0;
+    // the producer publishes before arriving
+    @%p0 bra ARRIVE;
+    mov.u32 %r4, 41;
+    st.shared.u32 [%rd4], %r4;
+ARRIVE:
+    mbarrier.arrive.shared.b64 %rd5, [%rd3];
+SPIN:
+    mbarrier.test_wait.shared.b64 %p1, [%rd3], %rd5;
+    @!%p1 bra SPIN;
+    // every thread reads only after the barrier released
+    ld.shared.u32 %r5, [%rd4];
+    mul.wide.u32 %rd6, %r1, 4;
+    add.s64 %rd7, %rd2, %rd6;
+    st.global.u32 [%rd7], %r5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint32_t kThreads = 64;
+  uint64_t out = e.mem.alloc(kThreads * 4);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {kThreads, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t t = 0; t < kThreads; ++t)
+    VCHECK_EQ(e.mem.load_scalar(out + t * 4, 4), uint64_t{41});
+}
+
+VTEST(mbarrier_counts_threads_not_warps) {
+  // A barrier initialized to blockDim.x completes only if every *thread*
+  // counts as an arrival. Counting one per warp is the mistake that makes it
+  // never complete -- and it would show up as a hang, not a wrong number, so
+  // pending_count is checked directly instead.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<4>;
+    .shared .align 8 .b8 bar[8];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u64 %rd3, bar;
+    setp.ne.u32 %p0, %r1, 0;
+    @%p0 bra INITDONE;
+    mov.u32 %r2, 96;              // more than the 64 threads that will arrive
+    mbarrier.init.shared.b64 [%rd3], %r2;
+INITDONE:
+    bar.sync 0;
+    mbarrier.arrive.shared.b64 %rd5, [%rd3];
+    bar.sync 0;
+    @%p0 bra DONE;
+    mbarrier.pending_count.shared.b64 %r6, [%rd3];
+    st.global.u32 [%rd2], %r6;
+DONE:
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(8);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {64, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  // 96 expected, 64 threads arrived: 32 outstanding. Per warp it would be 94.
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{32});
+}
+
+VTEST(an_uninitialized_mbarrier_is_refused) {
+  // Waiting on a barrier nobody initialized is a real bug with a silent
+  // failure mode: treated as "expected 0", it would complete immediately and
+  // the pipeline would read a buffer nobody filled.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k()
+{
+    .reg .b64 %rd<4>;
+    .shared .align 8 .b8 bar[8];
+    mov.u64 %rd1, bar;
+    mbarrier.arrive.shared.b64 %rd2, [%rd1];
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, e.mem, e.prof));
+  VCHECK(err.code() == Err::UnsupportedPtx);
+  VCHECK_CONTAINS(err.what(), "has not been initialized");
+}
+
+VTEST(red_is_an_atomic_that_keeps_no_answer) {
+  // nvcc emits `red` whenever an atomicAdd()'s result is unused, which in a
+  // reduction or a histogram is every call -- so a kernel full of atomics can
+  // contain no `atom` at all. The memory side must be identical to atom's;
+  // only the write-back is skipped.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    add.s32 %r2, %r1, 1;
+    red.global.add.u32 [%rd2], %r2;
+    red.global.max.u32 [%rd2+4], %r2;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  e.mem.store_scalar(out, 4, 0);
+  e.mem.store_scalar(out + 4, 4, 0);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {64, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{64 * 65 / 2});  // 1..64 summed
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{64});
+}
+
+VTEST(match_any_groups_lanes_by_value) {
+  // CUB's and cooperative_groups' value-keyed partitions are this instruction.
+  // Lanes are given tid/8, so each group of 8 consecutive lanes shares a value
+  // and must see exactly its own 8 bits set.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 3;
+    match.any.sync.b32 %r3, %r2, -1;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 4);
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t lane = 0; lane < 32; ++lane) {
+    const uint32_t group = lane / 8;
+    const uint64_t want = uint64_t{0xFFu} << (group * 8);
+    VCHECK_EQ(e.mem.load_scalar(out + lane * 4, 4), want);
+  }
+}
+
+VTEST(mul24_szext_and_fns) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 16777215;        // 0xFFFFFF, the widest 24-bit value
+    mul24.lo.u32 %r2, %r1, %r1;
+    mul24.hi.u32 %r3, %r1, %r1;
+    st.global.u32 [%rd2], %r2;
+    st.global.u32 [%rd2+4], %r3;
+    mov.u32 %r4, 255;             // 0xFF
+    mov.u32 %r5, 8;
+    szext.clamp.s32 %r6, %r4, %r5;   // sign-extend 0xFF from 8 bits -> -1
+    szext.clamp.u32 %r7, %r4, %r5;   // zero-extend -> 255
+    st.global.u32 [%rd2+8], %r6;
+    st.global.u32 [%rd2+12], %r7;
+    mov.u32 %r8, 164;             // 0b10100100: bits 2, 5, 7
+    mov.u32 %r9, 0;
+    mov.u32 %r10, 2;
+    fns.b32 %r11, %r8, %r9, %r10;    // 2nd set bit at or above 0 -> 5
+    st.global.u32 [%rd2+16], %r11;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  const uint64_t prod = uint64_t{0xFFFFFFu} * 0xFFFFFFu;   // 48 bits wide
+  VCHECK_EQ(e.mem.load_scalar(out, 4), prod & 0xFFFFFFFFull);
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), (prod >> 24) & 0xFFFFFFFFull);
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{0xFFFFFFFFu});  // -1
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), uint64_t{255});
+  VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{5});
+}
+
+VTEST(lop3_computes_the_truth_table_it_is_given) {
+  // ptxas fuses bitwise chains into lop3, so optimized PTX is full of these
+  // and a wrong truth table is a wrong mask rather than a crash. The immLut
+  // values here are the canonical ones: evaluate the expression on
+  // a=0xF0, b=0xCC, c=0xAA and the result is the table.
+  //   0xF8 = a | (b & c)      0x96 = a ^ b ^ c
+  //   0xFE = a | b | c        0x80 = a & b & c
+  //   0x01 = ~(a | b | c)
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 4042322160;      // 0xF0F0F0F0
+    mov.u32 %r2, 3435973836;      // 0xCCCCCCCC
+    mov.u32 %r3, 2863311530;      // 0xAAAAAAAA
+    lop3.b32 %r4, %r1, %r2, %r3, 0xf8;
+    lop3.b32 %r5, %r1, %r2, %r3, 0x96;
+    lop3.b32 %r6, %r1, %r2, %r3, 0xfe;
+    lop3.b32 %r7, %r1, %r2, %r3, 0x80;
+    lop3.b32 %r8, %r1, %r2, %r3, 0x01;
+    st.global.u32 [%rd2], %r4;
+    st.global.u32 [%rd2+4], %r5;
+    st.global.u32 [%rd2+8], %r6;
+    st.global.u32 [%rd2+12], %r7;
+    st.global.u32 [%rd2+16], %r8;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  const uint32_t a = 0xF0F0F0F0u, b = 0xCCCCCCCCu, c = 0xAAAAAAAAu;
+  // This one is also the defining property of the encoding: feeding the
+  // canonical constants back in returns the table itself, 0xF8 repeated. The
+  // first draft of this test asserted a & (b | c) here, which is 0xE0's table,
+  // not 0xF8's -- the check caught the comment, not the code.
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{a | (b & c)});
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0xF8F8F8F8u});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{a ^ b ^ c});
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{a | b | c});
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), uint64_t{a & b & c});
+  VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{~(a | b | c) & 0xFFFFFFFFu});
+}
+
+VTEST(slct_testp_and_sad) {
+  // slct's selector is compared as a float when the source type says so, which
+  // is the case a bit comparison gets wrong: -0.0 has its sign bit set but is
+  // >= 0, so it must select a. NaN is not >= 0 and must select b.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<4>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.f32 %f1, 0f42C80000;      // 100.0 -> "a"
+    mov.f32 %f2, 0fC2C80000;      // -100.0 -> "b"
+    mov.f32 %f3, 0f80000000;      // -0.0 : >= 0, so picks a
+    mov.f32 %f4, 0f7FC00000;      // NaN  : not >= 0, so picks b
+    slct.f32.f32 %f5, %f1, %f2, %f3;
+    slct.f32.f32 %f6, %f1, %f2, %f4;
+    st.global.f32 [%rd2], %f5;
+    st.global.f32 [%rd2+4], %f6;
+    testp.finite.f32 %p0, %f4;
+    selp.b32 %r1, 1, 0, %p0;
+    testp.notanumber.f32 %p1, %f4;
+    selp.b32 %r2, 1, 0, %p1;
+    st.global.u32 [%rd2+8], %r1;
+    st.global.u32 [%rd2+12], %r2;
+    mov.u32 %r3, 7;
+    mov.u32 %r4, 20;
+    mov.u32 %r5, 5;
+    sad.u32 %r6, %r3, %r4, %r5;   // |7-20| + 5 = 18
+    st.global.u32 [%rd2+16], %r6;
+    mov.u32 %r7, 4294967286;      // -10 as s32
+    mov.u32 %r8, 5;
+    sad.s32 %r9, %r7, %r8, %r5;   // |-10-5| + 5 = 20
+    st.global.u32 [%rd2+20], %r9;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), 100.0f);      // -0.0 selects a
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 4, 4)), -100.0f); // NaN selects b
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{0});     // NaN is not finite
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), uint64_t{1});    // NaN is notanumber
+  VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{18});
+  VCHECK_EQ(e.mem.load_scalar(out + 20, 4), uint64_t{20});
+}
+
+VTEST(cache_hints_are_accepted_and_do_nothing) {
+  // prefetch and createpolicy say where data should be kept, never what a load
+  // returns, so with no cache model here honouring them and ignoring them are
+  // the same result -- and refusing the kernel would fail it over a
+  // performance note. createpolicy still has to write its destination, or the
+  // handle would be read later and diagnosed as read-before-write.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    prefetch.global.L2 [%rd2];
+    createpolicy.fractional.L2::evict_last.b64 %rd3, 1.0;
+    mov.u32 %r1, 42;
+    st.global.u32 [%rd2], %r1;
+    cvt.u32.u64 %r2, %rd3;
+    st.global.u32 [%rd2+4], %r2;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{42});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0});  // a policy nothing consults
+}
+
+VTEST(cluster_registers_tile_the_grid) {
+  // A 2x2 cluster over a 4x2 grid is two clusters side by side. Every block
+  // writes where it thinks it is, and the check is against the tiling worked
+  // out by hand rather than against the same arithmetic the engine used.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ctaid.y;
+    mov.u32 %r3, %nctaid.x;
+    mad.lo.s32 %r4, %r2, %r3, %r1;        // linear block id
+    mul.lo.s32 %r5, %r4, 16;              // 4 words per block
+    cvt.u64.u32 %rd3, %r5;
+    add.s64 %rd4, %rd2, %rd3;
+    mov.u32 %r6, %clusterid.x;
+    mov.u32 %r7, %cluster_ctaid.x;
+    mov.u32 %r8, %cluster_ctarank;
+    mov.u32 %r9, %cluster_nctarank;
+    st.global.u32 [%rd4], %r6;
+    st.global.u32 [%rd4+4], %r7;
+    st.global.u32 [%rd4+8], %r8;
+    st.global.u32 [%rd4+12], %r9;
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");   // clusters are sm_90 and later
+  auto m = ptx::parse(ptx);
+  const uint32_t kBlocks = 8;
+  uint64_t out = e.mem.alloc(kBlocks * 16);
+  LaunchConfig cfg;
+  cfg.grid = {4, 2, 1};
+  cfg.block = {1, 1, 1};
+  cfg.cluster = {2, 2, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t by = 0; by < 2; ++by) {
+    for (uint32_t bx = 0; bx < 4; ++bx) {
+      const uint32_t b = by * 4 + bx;
+      const uint64_t base = out + b * 16;
+      VCHECK_EQ(e.mem.load_scalar(base, 4), uint64_t{bx / 2});          // %clusterid.x
+      VCHECK_EQ(e.mem.load_scalar(base + 4, 4), uint64_t{bx % 2});      // %cluster_ctaid.x
+      // rank is x-fastest within the 2x2 cluster
+      VCHECK_EQ(e.mem.load_scalar(base + 8, 4), uint64_t{(bx % 2) + (by % 2) * 2});
+      VCHECK_EQ(e.mem.load_scalar(base + 12, 4), uint64_t{4});          // %cluster_nctarank
+    }
+  }
+}
+
+VTEST(without_a_cluster_every_block_is_its_own) {
+  // PTX defines a launch with no cluster dimension as behaving like a 1x1x1
+  // cluster, so these registers answer on any launch rather than being a
+  // cluster-only feature. %clusterid then equals %ctaid, the rank is 0, and
+  // %is_explicit_cluster is false -- which is what an H100 reports, and the
+  // reason a kernel reading them need not be refused.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %ctaid.x;
+    mul.lo.s32 %r2, %r1, 16;
+    cvt.u64.u32 %rd3, %r2;
+    add.s64 %rd4, %rd2, %rd3;
+    mov.u32 %r3, %clusterid.x;
+    mov.u32 %r4, %cluster_ctarank;
+    mov.u32 %r5, %cluster_nctarank;
+    mov.u32 %r6, %is_explicit_cluster;
+    st.global.u32 [%rd4], %r3;
+    st.global.u32 [%rd4+4], %r4;
+    st.global.u32 [%rd4+8], %r5;
+    st.global.u32 [%rd4+12], %r6;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(3 * 16);
+  LaunchConfig cfg;
+  cfg.grid = {3, 1, 1};
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t b = 0; b < 3; ++b) {
+    const uint64_t base = out + b * 16;
+    VCHECK_EQ(e.mem.load_scalar(base, 4), uint64_t{b});    // %clusterid.x == %ctaid.x
+    VCHECK_EQ(e.mem.load_scalar(base + 4, 4), uint64_t{0});
+    VCHECK_EQ(e.mem.load_scalar(base + 8, 4), uint64_t{1});
+    VCHECK_EQ(e.mem.load_scalar(base + 12, 4), uint64_t{0});
+  }
+}
+
+VTEST(a_cluster_that_does_not_tile_the_grid_is_refused) {
+  // Hardware rejects a grid that is not a whole number of clusters, because
+  // the leftover blocks belong to no cluster. Inventing a partial one would
+  // give %cluster_nctarank a value no block in it agrees with.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k() { ret; }
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  LaunchConfig cfg;
+  cfg.grid = {5, 1, 1};      // 5 is not a multiple of 2
+  cfg.block = {1, 1, 1};
+  cfg.cluster = {2, 1, 1};
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, e.mem, e.prof));
+  VCHECK(err.code() == Err::LaunchConfig);
+  VCHECK_CONTAINS(err.what(), "not a multiple of the cluster");
+}
+
+VTEST(clusters_need_hopper) {
+  // Reporting a scheduling level a part does not have is the failure mode this
+  // engine exists to avoid, so an A10 refuses rather than pretending.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k() { ret; }
+)";
+  Env e;   // nvidia/a10, sm_86
+  auto m = ptx::parse(ptx);
+  LaunchConfig cfg;
+  cfg.grid = {4, 1, 1};
+  cfg.block = {1, 1, 1};
+  cfg.cluster = {2, 1, 1};
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, e.mem, e.prof));
+  VCHECK(err.code() == Err::LaunchConfig);
+  VCHECK_CONTAINS(err.what(), "compute capability 9.0");
+}
+
+VTEST(cluster_dims_compiled_into_the_kernel_apply_without_a_launch_attribute) {
+  // __cluster_dims__(2,1,1) becomes .reqnctapercluster in the PTX. It is a
+  // property of the kernel, so a plain launch still runs 2-block clusters --
+  // and %is_explicit_cluster is true, because one was.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out) .reqnctapercluster 2, 1, 1
+{
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %ctaid.x;
+    mul.lo.s32 %r2, %r1, 8;
+    cvt.u64.u32 %rd3, %r2;
+    add.s64 %rd4, %rd2, %rd3;
+    mov.u32 %r3, %cluster_ctarank;
+    mov.u32 %r4, %is_explicit_cluster;
+    st.global.u32 [%rd4], %r3;
+    st.global.u32 [%rd4+4], %r4;
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4 * 8);
+  LaunchConfig cfg;
+  cfg.grid = {4, 1, 1};
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t b = 0; b < 4; ++b) {
+    VCHECK_EQ(e.mem.load_scalar(out + b * 8, 4), uint64_t{b % 2});
+    VCHECK_EQ(e.mem.load_scalar(out + b * 8 + 4, 4), uint64_t{1});
+  }
 }
 
 VTEST(gridid_differs_between_launches) {

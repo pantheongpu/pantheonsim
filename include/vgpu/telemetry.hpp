@@ -7,7 +7,11 @@
 //
 // WHAT IS REAL AND WHAT IS MODELLED -- this matters, because VirtualGPU does
 // not do performance modelling:
-//   * memory used/total .... REAL. Taken straight from the MemoryManager.
+//   * memory used ......... REAL. Taken straight from the MemoryManager.
+//   * memory total ........ REAL. The framebuffer measured on the real card,
+//                            as nvidia-smi and NVML report it -- larger than
+//                            the totalGlobalMem CUDA reports by the driver's
+//                            reserve (see TelemetryClass).
 //   * utilization .......... REAL. The fraction of wall-clock time the device
 //                            spent inside kernel launches, plus the share of
 //                            that time doing memory traffic.

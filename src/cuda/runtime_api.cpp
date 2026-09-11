@@ -57,7 +57,9 @@ static_assert(sizeof(cudaDeviceProp) == 1032,
 #else
 #warning "unrecognised CUDA runtime version: cudaDeviceProp layout is unchecked"
 #endif
+#include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
+#include "vgpu/faults.hpp"
 #include "vgpu/profiling.hpp"
 #include "vgpu/telemetry.hpp"
 #include "vgpu/registry.hpp"
@@ -73,7 +75,9 @@ namespace {
 constexpr int kRuntimeVersion = CUDART_VERSION;
 // The driver is at least as new as the runtime it serves; reporting the same
 // number is what a matched pair looks like.
-constexpr int kDriverVersion = CUDART_VERSION;
+// cudaDriverGetVersion reports the driver's version, not the runtime's: see
+// vgpu::driver_version(). It used to return CUDART_VERSION, which is the
+// toolkit this shim was built with and says nothing about the driver.
 
 bool quiet() {
   const char* q = std::getenv("VGPU_QUIET");
@@ -96,13 +100,28 @@ struct KernelInfo {
   std::string entry_name;
 };
 
+// A __device__ or __constant__ variable. The host handle nvcc passes to
+// cudaMemcpyToSymbol is the address of a *host* shadow object, never a device
+// pointer, so the only way to reach the device copy is to remember what that
+// handle was registered as.
+struct VarInfo {
+  RegisteredModule* mod = nullptr;
+  std::string device_name;
+  size_t size = 0;
+  bool is_constant = false;
+};
+
 struct State {
   std::recursive_mutex mu;
   std::unique_ptr<vgpu::runtime::Runtime> rt;
   int current_device = 0;
   std::vector<std::unique_ptr<RegisteredModule>> modules;
   std::unordered_map<const void*, KernelInfo> kernels;  // host stub ptr -> kernel
+  std::unordered_map<const void*, VarInfo> vars;        // host shadow ptr -> device symbol
   std::map<void*, size_t> host_allocs;
+  // Managed allocations, kept apart from host_allocs because freeing one has
+  // to unmap it from the device side as well.
+  std::map<void*, size_t> managed_allocs;
   bool initialized = false;
 };
 
@@ -132,8 +151,7 @@ void ensure_init(State& s) {
   // Optional: shrink advertised VRAM so VRAM-proportional stress tests run at
   // laptop scale (their size is a % of device memory). Functional behavior is
   // unchanged; only the working-set size the app chooses shrinks.
-  if (const char* mb = std::getenv("VGPU_VRAM_MB"); mb && mb[0])
-    profile.vram_bytes = static_cast<uint64_t>(std::strtoull(mb, nullptr, 10)) * 1024ull * 1024ull;
+  vgpu::apply_vram_override(profile);
   s.rt = std::make_unique<vgpu::runtime::Runtime>(profile, count);
   s.initialized = true;
   init_driver_shim_if_loaded();
@@ -167,6 +185,7 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
     // "trap" is what a failed device assert and an unreachable path compile to,
     // and hardware surfaces it as an illegal instruction.
     case Err::Trap: code = cudaErrorIllegalInstruction; break;
+    case Err::DeviceAssert: code = cudaErrorAssert; break;
     // A data race is this simulator's own finding rather than a CUDA condition.
     // "unspecified launch failure" is the closest real code, and it is at least
     // true that the launch did not produce a result anyone should use.
@@ -249,18 +268,91 @@ VGPU_EXPORT void** __cudaRegisterFatBinary(void* fatCubin) {
     ensure_init(s);
     auto rm = std::make_unique<RegisteredModule>();
     // fatCubin is a __fatBinC_Wrapper_t*; extract the best PTX image.
+    // Drops the leading .version/.target/.address_size directives from a
+    // linked-in piece, so the first piece's header describes the whole module.
+    auto strip_ptx_header = [](const std::string& text) {
+      size_t pos = 0;
+      while (pos < text.size()) {
+        const size_t eol = text.find('\n', pos);
+        const size_t len = (eol == std::string::npos ? text.size() : eol) - pos;
+        std::string line = text.substr(pos, len);
+        size_t a = line.find_first_not_of(" \t");
+        const bool blank = a == std::string::npos;
+        const bool header = !blank && (line.compare(a, 8, ".version") == 0 ||
+                                       line.compare(a, 7, ".target") == 0 ||
+                                       line.compare(a, 13, ".address_size") == 0 ||
+                                       line.compare(a, 2, "//") == 0);
+        if (!blank && !header) break;
+        if (eol == std::string::npos) return std::string{};
+        pos = eol + 1;
+      }
+      return text.substr(pos);
+    };
+    auto pick_best = [](std::vector<vgpu::cuda::FatbinPtx>& v) -> std::string {
+      if (v.empty()) return {};
+      size_t best = 0;
+      for (size_t i = 1; i < v.size(); ++i)
+        if (v[i].arch > v[best].arch) best = i;
+      return std::move(v[best].text);
+    };
     auto ptxs = vgpu::cuda::extract_ptx(fatCubin);
-    if (ptxs.empty()) {
-      if (!quiet())
+    rm->ptx = pick_best(ptxs);
+    if (rm->ptx.empty()) {
+      // A separately compiled build (-rdc=true) leaves the primary fatbin
+      // empty -- 16 bytes, just a header -- and puts the real device code in a
+      // list of *relocatable* fatbins hanging off the wrapper's fourth field.
+      // Device linking would normally consume them; with a PTX-only -code
+      // there is nothing for nvlink to link, so the pieces arrive here still
+      // separate and the runtime is expected to put them together.
+      //
+      // The wrapper is
+      //   { int magic; int version; const void* data; void* filename_or_fatbins; }
+      // and that last field is a filename in version 1 and a NULL-terminated
+      // array of fatbin pointers in version 2 -- so the version has to be
+      // checked before it is walked, or a char* gets dereferenced as an array.
+      int version = 0;
+      const void* const* relocatable = nullptr;
+      const uint8_t* wp = static_cast<const uint8_t*>(fatCubin);
+      if (wp) {
+        std::memcpy(&version, wp + 4, 4);
+        if (version >= 2) std::memcpy(&relocatable, wp + 16, 8);
+      }
+      std::string linked;
+      size_t pieces = 0;
+      for (size_t i = 0; relocatable && relocatable[i] && i < 64; ++i) {
+        try {
+          auto part = vgpu::cuda::extract_ptx(relocatable[i]);
+          std::string text = pick_best(part);
+          if (text.empty()) continue;
+          // Concatenated rather than merged: cross-piece references resolve
+          // by name, exactly as they would after a link.
+          //
+          // Every piece carries its own .version/.target/.address_size header,
+          // and only the first one's counts. The first relocatable fatbin is
+          // the translation unit being registered; the rest are libraries
+          // linked into it, compiled for whatever the toolkit's default
+          // architecture happened to be. Letting the last header win made a
+          // module built for sm_80 claim to target sm_121 and be refused on an
+          // A100 -- with an error about the *device* being too old, which is
+          // the opposite of what had happened.
+          if (pieces > 0) text = strip_ptx_header(text);
+          linked += text;
+          linked += "\n";
+          ++pieces;
+        } catch (const std::exception&) {
+          // A piece that will not parse is skipped rather than failing the
+          // whole registration: the others may still hold the kernel.
+        }
+      }
+      rm->ptx = std::move(linked);
+      if (trace() && pieces)
+        std::fprintf(stderr, "[vgpu][trace] linked %zu relocatable PTX pieces (-rdc build)\n",
+                     pieces);
+      if (rm->ptx.empty() && !quiet())
         std::fprintf(stderr,
                      "[vgpu] __cudaRegisterFatBinary: no PTX in fatbin (SASS-only build); rebuild "
                      "with an -arch that embeds PTX\n");
       // Return a handle anyway; the failure surfaces at launch with context.
-    } else {
-      size_t best = 0;
-      for (size_t i = 1; i < ptxs.size(); ++i)
-        if (ptxs[i].arch > ptxs[best].arch) best = i;
-      rm->ptx = std::move(ptxs[best].text);
     }
     RegisteredModule* raw = rm.get();
     s.modules.push_back(std::move(rm));
@@ -295,12 +387,108 @@ VGPU_EXPORT void __cudaRegisterFunction(void** fatCubinHandle, const char* hostF
                  deviceName);
 }
 
-VGPU_EXPORT void __cudaRegisterVar(void** /*handle*/, char* /*hostVar*/, char* /*deviceAddress*/,
-                                   const char* /*deviceName*/, int /*ext*/, size_t /*size*/,
-                                   int /*constant*/, int /*global*/) {
-  // __device__/__constant__ variables: the workloads in scope do not read them
-  // from the host, so recording is deferred. (No silent misbehavior: a kernel
-  // that references an unregistered global still gets a clear symbol error.)
+VGPU_EXPORT void __cudaRegisterVar(void** fatCubinHandle, char* hostVar, char* /*deviceAddress*/,
+                                   const char* deviceName, int /*ext*/, size_t size,
+                                   int constant, int /*global*/) {
+  // Recorded now, because cudaMemcpyToSymbol has nothing else to go on: the
+  // handle it receives is the address of a host shadow object, and only this
+  // registration ties it to a name in the module.
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  auto* mod = reinterpret_cast<RegisteredModule*>(fatCubinHandle);
+  s.vars[reinterpret_cast<const void*>(hostVar)] =
+      VarInfo{mod, deviceName ? deviceName : "", size, constant != 0};
+  if (trace())
+    std::fprintf(stderr, "[vgpu][trace] __cudaRegisterVar: %p -> '%s' (%zu bytes%s)\n",
+                 (void*)hostVar, deviceName ? deviceName : "?", size,
+                 constant ? ", constant" : "");
+}
+
+namespace {
+// Device address and size of a registered symbol, or an error.
+cudaError_t symbol_address(State& s, const void* symbol, uint64_t* addr, size_t* size) {
+  auto it = s.vars.find(symbol);
+  if (it == s.vars.end()) {
+    if (!quiet())
+      std::fprintf(stderr,
+                   "[vgpu] symbol %p is not a registered __device__ or __constant__ variable\n",
+                   symbol);
+    return cudaErrorInvalidSymbol;
+  }
+  VarInfo& v = it->second;
+  if (!v.mod || v.mod->ptx.empty()) return cudaErrorInvalidSymbol;
+  const uint64_t mid = module_on_current(s, *v.mod);
+  const vgpu::exec::SymbolTable* syms = current(s).symbols(mid);
+  if (!syms) return cudaErrorInvalidSymbol;
+  auto sym = syms->find(v.device_name);
+  if (sym == syms->end()) {
+    if (!quiet())
+      std::fprintf(stderr, "[vgpu] '%s' is registered but the module defines no such global\n",
+                   v.device_name.c_str());
+    return cudaErrorInvalidSymbol;
+  }
+  *addr = sym->second;
+  *size = v.size;
+  return cudaSuccess;
+}
+}  // namespace
+
+VGPU_EXPORT cudaError_t cudaMemcpyToSymbol(const void* symbol, const void* src, size_t count,
+                                           size_t offset, cudaMemcpyKind /*kind*/) {
+  return guard("cudaMemcpyToSymbol", [&](State& s) -> cudaError_t {
+    uint64_t addr = 0;
+    size_t size = 0;
+    const cudaError_t e = symbol_address(s, symbol, &addr, &size);
+    if (e != cudaSuccess) return e;
+    if (offset + count > size) return cudaErrorInvalidValue;
+    current(s).memory().write(addr + offset, src, count);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemcpyFromSymbol(void* dst, const void* symbol, size_t count,
+                                             size_t offset, cudaMemcpyKind /*kind*/) {
+  return guard("cudaMemcpyFromSymbol", [&](State& s) -> cudaError_t {
+    uint64_t addr = 0;
+    size_t size = 0;
+    const cudaError_t e = symbol_address(s, symbol, &addr, &size);
+    if (e != cudaSuccess) return e;
+    if (offset + count > size) return cudaErrorInvalidValue;
+    current(s).memory().read(addr + offset, dst, count);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemcpyToSymbolAsync(const void* symbol, const void* src, size_t count,
+                                                size_t offset, cudaMemcpyKind kind, cudaStream_t) {
+  return cudaMemcpyToSymbol(symbol, src, count, offset, kind);
+}
+VGPU_EXPORT cudaError_t cudaMemcpyFromSymbolAsync(void* dst, const void* symbol, size_t count,
+                                                  size_t offset, cudaMemcpyKind kind,
+                                                  cudaStream_t) {
+  return cudaMemcpyFromSymbol(dst, symbol, count, offset, kind);
+}
+
+VGPU_EXPORT cudaError_t cudaGetSymbolAddress(void** devPtr, const void* symbol) {
+  return guard("cudaGetSymbolAddress", [&](State& s) -> cudaError_t {
+    uint64_t addr = 0;
+    size_t size = 0;
+    const cudaError_t e = symbol_address(s, symbol, &addr, &size);
+    if (e != cudaSuccess) return e;
+    if (devPtr) *devPtr = reinterpret_cast<void*>(addr);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaGetSymbolSize(size_t* out, const void* symbol) {
+  return guard("cudaGetSymbolSize", [&](State& s) -> cudaError_t {
+    uint64_t addr = 0;
+    size_t size = 0;
+    const cudaError_t e = symbol_address(s, symbol, &addr, &size);
+    if (e != cudaSuccess) return e;
+    if (out) *out = size;
+    return cudaSuccess;
+  });
 }
 
 VGPU_EXPORT unsigned __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim, size_t sharedMem,
@@ -365,7 +553,8 @@ bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()>
 // wait on each other. See the scheduler note in interpreter.cpp.
 static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gridDim,
                                       dim3 blockDim, void** args, size_t sharedMem,
-                                      cudaStream_t stream, bool cooperative) {
+                                      cudaStream_t stream, bool cooperative,
+                                      std::array<uint32_t, 3> cluster = {0, 0, 0}) {
   return guard(api, [&](State& s) -> cudaError_t {
     auto it = s.kernels.find(func);
     if (it == s.kernels.end()) {
@@ -413,6 +602,13 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     if (vgpu_record_launch_if_capturing(func, gridDim, blockDim, args, sharedMem, stream, param_sizes))
       return cudaSuccess;
 
+    if (vgpu::faults::should_fail(vgpu::faults::Op::Launch)) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] %s: failing this launch, as VGPU_FAIL_LAUNCH asked. This is "
+                             "injected, not a real failure\n", api);
+      return cudaErrorLaunchFailure;
+    }
+
     std::vector<std::vector<uint8_t>> kargs(fn->params.size());
     for (size_t i = 0; i < fn->params.size(); ++i) {
       kargs[i].resize(param_sizes[i]);
@@ -423,6 +619,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     cfg.block = {blockDim.x, blockDim.y, blockDim.z};
     cfg.shared_bytes = static_cast<uint32_t>(sharedMem);
     cfg.cooperative = cooperative;
+    cfg.cluster = cluster;
     if (cooperative) {
       // A cooperative launch promises every block is resident, so the grid has
       // to fit. Hardware refuses a grid that does not, and so does this: a
@@ -535,9 +732,19 @@ VGPU_EXPORT cudaError_t cudaGetDeviceFlags(unsigned int* flags) {
 // programs check for errors. Returning the sticky error (and clearing it, as
 // CUDA does) keeps a failed kernel from looking like success.
 VGPU_EXPORT cudaError_t cudaDeviceSynchronize(void) {
-  cudaError_t e = g_last_error;
-  g_last_error = cudaSuccess;
-  return e;
+  // Returns the recorded error but does NOT clear it. CUDA resets the recorded
+  // error in exactly one place -- cudaGetLastError -- and clearing it here
+  // broke the most common way anyone checks a kernel:
+  //
+  //     kernel<<<...>>>();
+  //     cudaDeviceSynchronize();
+  //     if (cudaGetLastError() != cudaSuccess) ...
+  //
+  // The sync consumed the error, the check found cudaSuccess, and a kernel
+  // that had died on an illegal address reported success. Every launch here is
+  // synchronous, so by the time this is called the error is already recorded;
+  // there is nothing to wait for and nothing to consume.
+  return g_last_error;
 }
 VGPU_EXPORT cudaError_t cudaDeviceReset(void) {
   g_last_error = cudaSuccess;
@@ -649,7 +856,7 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, 
       case cudaDevAttrIntegrated: *value = 0; break;
       case cudaDevAttrEccEnabled: *value = 0; break;
       case cudaDevAttrCanMapHostMemory: *value = 0; break;
-      case cudaDevAttrManagedMemory: *value = 0; break;       // cudaMallocManaged is refused
+      case cudaDevAttrManagedMemory: *value = 1; break;
       // Grid-wide sync works under cudaLaunchCooperativeKernel; the
       // multi-device form does not.
       case cudaDevAttrCooperativeLaunch: *value = 1; break;
@@ -818,6 +1025,15 @@ VGPU_EXPORT cudaError_t cudaMemGetInfo(size_t* free_b, size_t* total_b) {
 VGPU_EXPORT cudaError_t cudaMalloc(void** ptr, size_t size) {
   return guard("cudaMalloc", [&](State& s) {
     if (!ptr) return cudaErrorInvalidValue;
+    // Injected failure, if this occurrence was selected. Returns the documented
+    // out-of-memory the API is allowed to return at any time, which is the
+    // error most callers claim to handle and few ever execute.
+    if (vgpu::faults::should_fail(vgpu::faults::Op::Alloc)) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] cudaMalloc: failing this allocation, as VGPU_FAIL_ALLOC "
+                             "asked. This is injected, not a real exhaustion\n");
+      return cudaErrorMemoryAllocation;
+    }
     // A zero-byte allocation succeeds on hardware and yields a distinct pointer
     // that can be freed. ggml asks for one and treats a failure as fatal, so
     // rejecting it stopped whole operations that were doing nothing wrong.
@@ -832,6 +1048,17 @@ VGPU_EXPORT cudaError_t cudaMalloc(void** ptr, size_t size) {
 VGPU_EXPORT cudaError_t cudaFree(void* ptr) {
   return guard("cudaFree", [&](State& s) {
     if (!ptr) return cudaSuccess;  // cudaFree(NULL) is a documented no-op
+    // Managed memory frees the same way as device memory from the caller's
+    // side, but it is host memory underneath, so it has to leave the device's
+    // map before it is released -- otherwise a later kernel could address a
+    // pointer this process has given back to the allocator.
+    auto mit = s.managed_allocs.find(ptr);
+    if (mit != s.managed_allocs.end()) {
+      current(s).memory().unmap_host(reinterpret_cast<uint64_t>(ptr));
+      s.managed_allocs.erase(mit);
+      std::free(ptr);
+      return cudaSuccess;
+    }
     owner_memory(s, ptr).free(reinterpret_cast<uint64_t>(ptr));
     return cudaSuccess;
   });
@@ -839,6 +1066,12 @@ VGPU_EXPORT cudaError_t cudaFree(void* ptr) {
 
 VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cudaMemcpyKind kind) {
   return guard("cudaMemcpy", [&](State& s) {
+    if (vgpu::faults::should_fail(vgpu::faults::Op::Memcpy)) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] cudaMemcpy: failing this copy, as VGPU_FAIL_MEMCPY asked. "
+                             "This is injected, not a real failure\n");
+      return cudaErrorInvalidValue;
+    }
     auto _t0 = std::chrono::steady_clock::now();
     bool dd = is_device_ptr(dst), sd = is_device_ptr(src);
     // Under unified addressing a device pointer names its own device, so each
@@ -1463,10 +1696,50 @@ VGPU_EXPORT cudaError_t cudaGetTextureObjectResourceDesc(cudaResourceDesc*, cuda
 // Managed memory is one allocation the CPU and GPU both address. Device memory
 // here lives in a separate virtual window that host code cannot dereference, so
 // handing back a device pointer would fault the moment the host touched it.
-VGPU_EXPORT cudaError_t cudaMallocManaged(void** ptr, size_t, unsigned int) {
-  if (!ptr) return cudaErrorInvalidValue;
-  return cudaErrorNotSupported;
+VGPU_EXPORT cudaError_t cudaMallocManaged(void** ptr, size_t size, unsigned int) {
+  return guard("cudaMallocManaged", [&](State& s) -> cudaError_t {
+    if (!ptr) return cudaErrorInvalidValue;
+    if (vgpu::faults::should_fail(vgpu::faults::Op::Alloc)) return cudaErrorMemoryAllocation;
+    const size_t n = size ? size : 1;
+    void* p = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
+    if (!p) return cudaErrorMemoryAllocation;
+    // Real host memory, addressable by kernels at its own address. This is the
+    // one place being a simulator makes something *easier*: on hardware
+    // managed memory needs page migration between two physical memories, and
+    // here there is only one.
+    current(s).memory().map_host(reinterpret_cast<uint64_t>(p), p, n);
+    st().managed_allocs[p] = n;
+    *ptr = p;
+    return cudaSuccess;
+  });
 }
+
+// Prefetching and advice describe where pages should live. There is one memory
+// here, so both are honest no-ops rather than refusals: a caller that
+// prefetches is asking for a performance hint, and not getting one is not a
+// behavioural difference it can observe.
+//
+// CUDA 13 changed both to take a cudaMemLocation where 12 took an int device,
+// so each needs the signature of the toolkit in use. The vendor header is
+// included, and C linkage makes a mismatch a hard error rather than a subtle
+// one -- which is how the last one of these was caught.
+#if CUDART_VERSION >= 13000
+VGPU_EXPORT cudaError_t cudaMemPrefetchAsync(const void*, size_t, struct cudaMemLocation,
+                                             unsigned int, cudaStream_t) {
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaMemAdvise(const void*, size_t, cudaMemoryAdvise,
+                                      struct cudaMemLocation) {
+  return cudaSuccess;
+}
+#else
+VGPU_EXPORT cudaError_t cudaMemPrefetchAsync(const void*, size_t, int, cudaStream_t) {
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaMemAdvise(const void*, size_t, cudaMemoryAdvise, int) {
+  return cudaSuccess;
+}
+#endif
 
 VGPU_EXPORT cudaError_t cudaGraphDebugDotPrint(cudaGraph_t, const char* path, unsigned int) {
   if (!path) return cudaErrorInvalidValue;
@@ -1483,8 +1756,32 @@ VGPU_EXPORT cudaError_t cudaGraphDebugDotPrint(cudaGraph_t, const char* path, un
 VGPU_EXPORT cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* cfg, const void* func,
                                             void** args) {
   if (!cfg) return cudaErrorInvalidValue;
-  return cudaLaunchKernel(func, cfg->gridDim, cfg->blockDim, args, cfg->dynamicSmemBytes,
-                          cfg->stream);
+  // The attribute list is the whole point of the Ex form, and this used to
+  // drop it. That was invisible until thread-block clusters existed: a kernel
+  // launched with cudaLaunchAttributeClusterDimension ran with no cluster at
+  // all, and every block read %cluster_ctarank as 0 and %cluster_nctarank as
+  // 1. The launch succeeded and the answer was wrong, which is the failure
+  // this engine is built to not have.
+  //
+  // The vendor struct is used rather than a hand-rolled one because its size
+  // is not stable: sizeof(cudaLaunchAttribute) is 72 with this toolkit, and a
+  // guess at the stride would walk the array wrong on any other version.
+  unsigned cluster[3] = {0, 0, 0};
+  for (unsigned i = 0; i < cfg->numAttrs; ++i) {
+    const cudaLaunchAttribute& a = cfg->attrs[i];
+    if (a.id == cudaLaunchAttributeClusterDimension) {
+      cluster[0] = a.val.clusterDim.x;
+      cluster[1] = a.val.clusterDim.y;
+      cluster[2] = a.val.clusterDim.z;
+    }
+    // Every other attribute is inert here for a reason that is already true
+    // elsewhere in this shim: priority and memory-sync domains need a stream
+    // scheduler, access policy windows need a cache model, and programmatic
+    // events need asynchrony. None of them changes what a kernel computes.
+  }
+  return launch_kernel_impl("cudaLaunchKernelEx", func, cfg->gridDim, cfg->blockDim, args,
+                            cfg->dynamicSmemBytes, cfg->stream, /*cooperative=*/false,
+                            {cluster[0], cluster[1], cluster[2]});
 }
 
 // Profiler control is a no-op: there is no external profiler attached, and a
@@ -1575,6 +1872,7 @@ VGPU_EXPORT const char* cudaGetErrorString(cudaError_t error) {
     case cudaErrorNotSupported: return "operation not supported";
     case cudaErrorInvalidConfiguration: return "invalid configuration argument";
     case cudaErrorIllegalInstruction: return "an illegal instruction was encountered";
+    case cudaErrorAssert: return "device-side assert triggered";
     case cudaErrorLaunchFailure: return "unspecified launch failure";
     case cudaErrorCooperativeLaunchTooLarge:
       return "too many blocks in cooperative launch";
@@ -1611,7 +1909,7 @@ VGPU_EXPORT const char* cudaGetErrorName(cudaError_t error) {
 }
 
 VGPU_EXPORT cudaError_t cudaDriverGetVersion(int* v) {
-  if (v) *v = kDriverVersion;
+  if (v) *v = vgpu::driver_version();
   return cudaSuccess;
 }
 VGPU_EXPORT cudaError_t cudaRuntimeGetVersion(int* v) {

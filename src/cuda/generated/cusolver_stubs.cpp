@@ -21,7 +21,10 @@ void vgpu_report_unimplemented(const char* fn) {
   static std::set<std::string> seen;
   std::lock_guard<std::mutex> lock(mu);
   if (!seen.insert(fn).second) return;
-  if (std::getenv("VGPU_QUIET")) return;
+  // =1 silences, as include/vgpu_cuda.h documents and every hand-written shim
+  // reads it. This used to test for presence, so VGPU_QUIET=0 meant quiet here
+  // and not quiet everywhere else.
+  if (const char* q = std::getenv("VGPU_QUIET"); q && q[0] == '1') return;
   std::fprintf(stderr,
                "[vgpu] %s is not implemented by VirtualGPU; returning CUSOLVER_STATUS_NOT_SUPPORTED.\n"
                "       The call site will see a failure rather than a wrong answer.\n", fn);

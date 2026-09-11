@@ -18,6 +18,7 @@
 //  - Every access is bounds-checked and produces a rich diagnostic on failure
 //    (these diagnostics are a product feature for CI, not just debug aids).
 #pragma once
+#include <mutex>
 
 #include <atomic>
 #include <cstdint>
@@ -29,6 +30,14 @@
 namespace vgpu {
 
 inline constexpr uint64_t kDeviceVaBase = 0x7fff'0000'0000ull;
+// Device functions get addresses in their own window so a function pointer is
+// a real value that can be stored, loaded and compared -- and so an indirect
+// call can find the function again. The index is the address: nothing is ever
+// loaded *from* this range, and giving it a window of its own means a stray
+// dereference of a function pointer is diagnosable rather than a wild read.
+inline constexpr uint64_t kFuncVaBase = 0x6ffb'0000'0000ull;
+inline constexpr uint64_t kFuncVaStride = 8;
+inline constexpr uint64_t kFuncVaSize = 1ull << 20;
 // Each device owns a disjoint 1 TiB window above that base. CUDA guarantees
 // unified virtual addressing -- a device pointer is unique process-wide and
 // identifies the device that owns it -- and without separate windows two
@@ -52,7 +61,12 @@ class MemoryManager {
   // The device's window in the process-wide address space, and whether an
   // address falls inside it.
   uint64_t va_base() const { return va_base_; }
-  bool owns(uint64_t addr) const { return addr >= va_base_ && addr < va_base_ + kDeviceVaStride; }
+  bool owns(uint64_t addr) const {
+    if (addr >= va_base_ && addr < va_base_ + kDeviceVaStride) return true;
+    // Managed buffers live at their real host address, outside every device
+    // window, and are still device-addressable.
+    return host_maps_ && is_host_mapped(addr);
+  }
 
   // Allocates `size` bytes of virtual device memory. size == 0 is invalid.
   uint64_t alloc(uint64_t size);
@@ -82,6 +96,25 @@ class MemoryManager {
 
   // Locates the live allocation containing `addr`. Returns false if none.
   bool find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const;
+
+  // ---- managed memory ----
+  //
+  // One buffer both the host and a kernel can address, which is what
+  // cudaMallocManaged promises. Everywhere else in this engine a device
+  // pointer is a virtual address with no host meaning, so host code cannot
+  // dereference it -- that is exactly why cudaMallocManaged used to refuse.
+  //
+  // The way out is available only to a simulator: allocate real host memory
+  // and tell the device side to address it at its own real address. The host
+  // dereferences it because it is an ordinary pointer, and a kernel reaches it
+  // because these two calls put it on the map that read/write consult.
+  //
+  // Cost when unused is one relaxed atomic load, so a program with no managed
+  // memory pays nothing.
+  void map_host(uint64_t addr, void* host, uint64_t len);
+  void unmap_host(uint64_t addr);
+  // True when `addr` falls in a mapped host buffer rather than device VA.
+  bool is_host_mapped(uint64_t addr) const;
 
   // Host memory actually backing this device's allocations: chunks that have
   // been materialized, times the chunk size. This is the quantity the sparse
@@ -160,6 +193,26 @@ class MemoryManager {
   }
 
   std::function<void(uint64_t)> usage_observer_;
+
+  // Managed buffers: real host memory the device can also address. Rare and
+  // written only at allocation, so a flag keeps the read path free for the
+  // programs that never use it.
+  struct HostMap {
+    uint64_t base = 0;
+    uint64_t len = 0;
+    uint8_t* host = nullptr;
+  };
+  // Behind a pointer, and not for indirection's sake: a mutex and an atomic as
+  // direct members make MemoryManager non-movable, and it is moved (a test
+  // returns one by value). The pointer is also the fast-path check -- null
+  // means no managed memory, which is almost every program.
+  struct HostMaps {
+    std::vector<HostMap> maps;
+    std::mutex mu;
+  };
+  std::unique_ptr<HostMaps> host_maps_;
+  const HostMap* find_host_map_locked(uint64_t addr, uint64_t len) const;
+  const uint8_t* scalar_location(uint64_t addr, uint32_t size, bool create) const;
   std::map<uint64_t, Allocation> live_;        // base -> allocation
   // base -> record, bounded to kQuarantineEntries (oldest evicted first).
   std::map<uint64_t, FreedRecord> freed_;

@@ -19,6 +19,7 @@ const char* err_name(Err e) {
     case Err::UninitializedRegister: return "uninitialized-register";
     case Err::DataRace: return "data-race";
     case Err::Trap: return "trap";
+    case Err::DeviceAssert: return "device-assert";
     case Err::LaunchConfig: return "launch-config";
     case Err::ExecLimit: return "exec-limit";
     case Err::NotFound: return "not-found";

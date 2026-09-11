@@ -1,11 +1,24 @@
 #include "vgpu/memory.hpp"
 
+#include <atomic>
 #include <cstring>
 
 #include "vgpu/error.hpp"
 
 namespace vgpu {
 namespace {
+
+// A kernel's scalar access, as an atomic on the backing bytes. The chunk is an
+// unsigned-char array, which C++20 lets hold objects of other trivial types.
+template <typename T>
+uint64_t relaxed_load(const uint8_t* p) {
+  return std::atomic_ref<T>(*reinterpret_cast<T*>(const_cast<uint8_t*>(p)))
+      .load(std::memory_order_relaxed);
+}
+template <typename T>
+void relaxed_store(uint8_t* p, uint64_t v) {
+  std::atomic_ref<T>(*reinterpret_cast<T*>(p)).store(static_cast<T>(v), std::memory_order_relaxed);
+}
 
 // Formats an address as 0x-prefixed hex for diagnostics.
 struct Hex {
@@ -188,6 +201,13 @@ uint64_t MemoryManager::resident_bytes() const {
 
 void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   if (len == 0) return;
+  if (host_maps_) {
+    std::lock_guard<std::mutex> lock(host_maps_->mu);
+    if (const HostMap* m = find_host_map_locked(dst, len)) {
+      std::memcpy(m->host + (dst - m->base), src, len);
+      return;
+    }
+  }
   // A null host buffer would be dereferenced by the memcpy below and take the
   // process down with a signal, losing the diagnosis. Saying which argument was
   // null is the whole point of running on a simulator.
@@ -212,8 +232,47 @@ void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   }
 }
 
+const MemoryManager::HostMap* MemoryManager::find_host_map_locked(uint64_t addr,
+                                                                   uint64_t len) const {
+  if (!host_maps_) return nullptr;
+  for (const HostMap& m : host_maps_->maps)
+    if (addr >= m.base && addr + len <= m.base + m.len) return &m;
+  return nullptr;
+}
+
+void MemoryManager::map_host(uint64_t addr, void* host, uint64_t len) {
+  if (!host_maps_) host_maps_ = std::make_unique<HostMaps>();
+  std::lock_guard<std::mutex> lock(host_maps_->mu);
+  host_maps_->maps.push_back(HostMap{addr, len, static_cast<uint8_t*>(host)});
+}
+
+void MemoryManager::unmap_host(uint64_t addr) {
+  if (!host_maps_) return;
+  std::lock_guard<std::mutex> lock(host_maps_->mu);
+  auto& v = host_maps_->maps;
+  for (size_t i = 0; i < v.size(); ++i)
+    if (v[i].base == addr) {
+      v.erase(v.begin() + static_cast<long>(i));
+      break;
+    }
+}
+
+bool MemoryManager::is_host_mapped(uint64_t addr) const {
+  if (!host_maps_) return false;
+  std::lock_guard<std::mutex> lock(host_maps_->mu);
+  return find_host_map_locked(addr, 1) != nullptr;
+}
+
 void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
   if (len == 0) return;
+  // Managed memory is the caller's own buffer; there is no chunk table to walk.
+  if (host_maps_) {
+    std::lock_guard<std::mutex> lock(host_maps_->mu);
+    if (const HostMap* m = find_host_map_locked(src, len)) {
+      std::memcpy(dst, m->host + (src - m->base), len);
+      return;
+    }
+  }
   if (!dst)
     throw Error::make(Err::InvalidPointer,
                       "device memory read into a NULL host pointer (", len, " bytes from ",
@@ -253,6 +312,14 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
   if (addr % size != 0)
     throw Error::make(Err::MisalignedAccess, "load of ", size, " bytes at ", Hex{addr},
                       " is not naturally aligned (real GPUs fault on this)");
+  if (const uint8_t* p = scalar_location(addr, size, /*create=*/false)) {
+    switch (size) {
+      case 1: return relaxed_load<uint8_t>(p);
+      case 2: return relaxed_load<uint16_t>(p);
+      case 4: return relaxed_load<uint32_t>(p);
+      default: return relaxed_load<uint64_t>(p);
+    }
+  }
   uint64_t v = 0;
   read(addr, &v, size);  // little-endian host assumption, documented in ARCHITECTURE.md
   return v;
@@ -264,7 +331,54 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
   if (addr % size != 0)
     throw Error::make(Err::MisalignedAccess, "store of ", size, " bytes at ", Hex{addr},
                       " is not naturally aligned (real GPUs fault on this)");
+  if (uint8_t* p = const_cast<uint8_t*>(scalar_location(addr, size, /*create=*/true))) {
+    switch (size) {
+      case 1: relaxed_store<uint8_t>(p, value); return;
+      case 2: relaxed_store<uint16_t>(p, value); return;
+      case 4: relaxed_store<uint32_t>(p, value); return;
+      default: relaxed_store<uint64_t>(p, value); return;
+    }
+  }
   write(addr, &value, size);
+}
+
+// Where a kernel's scalar load or store lives in the chunk table, or null when
+// it should take the general path instead: managed memory (the caller's own
+// buffer, behind a lock), memory never written (reads as zero and shares no
+// bytes with anyone), or a host address that is not aligned for an atomic.
+//
+// Why this exists. Blocks run on several host threads, and a kernel is allowed
+// to share memory between blocks -- CUB's decoupled look-back scan, under
+// Thrust's sort and CUB's radix sort, publishes each block's prefix for later
+// blocks to spin on. These accesses used to be a plain memcpy, which made that
+// a C++ data race: undefined behaviour, reported by ThreadSanitizer the first
+// time CI ran it. It worked in release builds because an aligned 8-byte copy
+// is one instruction on x86, which nothing promises -- a torn read of a tile
+// status is a wrong prefix or a spin that never ends. A GPU's accesses are
+// atomic at this granularity; so are these now, relaxed, which on x86 is the
+// same single instruction and costs nothing. Ordering is the fences' job (see
+// the interpreter), not the load's.
+//
+// A naturally aligned scalar cannot straddle a chunk -- kChunkSize is a
+// multiple of 8 -- so it is always one location in one chunk.
+const uint8_t* MemoryManager::scalar_location(uint64_t addr, uint32_t size, bool create) const {
+  if (host_maps_) {
+    std::lock_guard<std::mutex> lock(host_maps_->mu);
+    if (find_host_map_locked(addr, size)) return nullptr;
+  }
+  uint64_t base = 0;
+  auto& a = const_cast<Allocation&>(resolve(addr, size, create ? "device memory write"
+                                                                 : "device memory read", &base));
+  const uint64_t off = addr - base;
+  const uint64_t chunk_idx = off / kChunkSize;
+  uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
+  if (!chunk) {
+    if (!create) return nullptr;
+    chunk = const_cast<MemoryManager*>(this)->materialize(a, chunk_idx);
+  }
+  const uint8_t* p = chunk + off % kChunkSize;
+  if (reinterpret_cast<uintptr_t>(p) % size != 0) return nullptr;
+  return p;
 }
 
 }  // namespace vgpu

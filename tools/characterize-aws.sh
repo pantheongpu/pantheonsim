@@ -173,11 +173,28 @@ $SSH 'set -e
   for t in ptx_semantics control_flow; do
     nvcc -std=c++14 -arch=sm_$ARCH -Wno-deprecated-gpu-targets $t.cu -o $t 2>/dev/null && ./$t > $t.ref.txt
   done
+  # The metrics this device actually exposes. Not to implement them -- most are
+  # timing-derived and this engine has no timing model -- but so the gap is
+  # per-device data rather than a general claim. "An L4 exposes N metrics and
+  # VirtualGPU produces these M" is checkable; "we do not model timing" is a
+  # footnote someone has to take on trust.
+  # Under sudo, because --query-metrics opens the device to ask it: the L40S
+  # run came back with only ERR_NVGPUCTRPERM, "the user does not have
+  # permission to access NVIDIA GPU Performance Counters". The driver restricts
+  # profiling to admin by default, so an unprivileged query returns an error
+  # message where the metric list should be -- and a two-line metrics.txt looks
+  # like a device that exposes two metrics.
+  (sudo -n ncu --query-metrics 2>/dev/null || ncu --query-metrics 2>/dev/null \
+   || sudo -n nv-nsight-cu-cli --query-metrics 2>/dev/null \
+   || nv-nsight-cu-cli --query-metrics 2>/dev/null || true) \
+    > metrics.txt
+  grep -q ERR_NVGPUCTRPERM metrics.txt && echo "METRICS_DENIED=1"
+  echo "METRICS=$(wc -l < metrics.txt)"
   echo "SM_ARCH=$ARCH"
 ' > "$outdir/${type_name}.run.log" 2>&1
 head -3 "$outdir/${type_name}.run.log"
 
-for f in profile.yaml ptx_semantics.ref.txt control_flow.ref.txt; do
+for f in profile.yaml ptx_semantics.ref.txt control_flow.ref.txt metrics.txt; do
   scp -i "$key_file" -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
       ubuntu@"$IP":/tmp/$f "$outdir/${type_name}.${f/profile.yaml/yaml}" 2>/dev/null
 done

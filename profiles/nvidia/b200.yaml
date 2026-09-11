@@ -8,7 +8,12 @@ model: "NVIDIA B200"
 architecture: blackwell
 compute_capability: "10.0"
 warp_size: 32
-vram_bytes: 206158430208         # 192 GiB HBM3e (spec sheet; SMI-visible size TBD)
+vram_bytes: 192265846784         # capped at the measured framebuffer -- see below
+# The spec sheet's "192 GB" is decimal (183105 MiB) and was stored here as
+# 192 GiB (196608 MiB) -- 13 GB more than a real B200 has in total, which
+# nvidia-smi on one showed as 183359 MiB (driver 580.105.08). totalGlobalMem
+# is smaller than the framebuffer by the driver's reserve and has not been
+# measured yet, so this is an upper bound rather than a characterization.
 verified: false
 limits:
   max_threads_per_block: 1024
@@ -33,6 +38,7 @@ features:
 # NOT used by the execution engine -- VirtualGPU does not model performance.
 # Public spec-sheet figures; PCI ids from the public NVIDIA device list.
 telemetry:
+  framebuffer_mb: 183359          # nvidia-smi total on real cards (1 run in the benchmark database)
   power_limit_w: 1000
   sm_clock_max_mhz: 1965
   mem_clock_max_mhz: 4000

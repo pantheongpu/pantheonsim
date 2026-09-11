@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -24,44 +25,96 @@ const char* perf_state_name(uint32_t p) {
 
 int mib(uint64_t bytes) { return static_cast<int>(bytes / (1024 * 1024)); }
 
-void print_table(const vgpu::telemetry::Shared& s) {
-  std::printf(
-      "+-----------------------------------------------------------------------------------------+\n");
-  std::printf("| VGPU-SMI 0.1.0                  Driver Version: %-13s CUDA Version: %-7s |\n",
-              s.driver_version, s.cuda_version);
-  std::printf(
-      "|-----------------------------------------+------------------------+----------------------|\n");
-  std::printf(
-      "| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n");
-  std::printf(
-      "| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n");
-  std::printf(
-      "|                                         |                        |               MIG M. |\n");
-  std::printf(
-      "|=========================================+========================+======================|\n");
+// The frame nvidia-smi draws: 91 columns, three fields of 41, 24 and 22
+// between the bars. Every width below was measured from a real driver's output
+// rather than guessed, because this table is a parsed interface -- people
+// scrape these columns with awk and cut, and a session that renders its own
+// idea of the layout is a session those scripts break on. Nothing here is
+// copied from NVIDIA: the format is read off the observable output, the same
+// way the --query-gpu shape below already is.
+const char* const kFrame =
+    "+-----------------------------------------------------------------------------------------+\n";
+const char* const kRowRule =
+    "+-----------------------------------------+------------------------+----------------------+\n";
+
+void print_gpu_table(const vgpu::telemetry::Shared& s) {
+  // Real nvidia-smi opens with the wall clock, padded out to the frame width.
+  std::time_t now = std::time(nullptr);
+  std::tm tm{};
+  ::localtime_r(&now, &tm);
+  char when[64];
+  std::strftime(when, sizeof when, "%a %b %e %H:%M:%S %Y", &tm);
+  std::printf("%-31s\n", when);
+
+  // The left-hand version is nvidia-smi's own, which tracks the driver on a
+  // real machine; there is one binary here, so it reports the driver too.
+  const char* driver = s.driver_version[0] ? s.driver_version : "580.00.00";
+  const char* cuda = s.cuda_version[0] ? s.cuda_version : "13.0";
+
+  std::printf("%s", kFrame);
+  std::printf("| NVIDIA-SMI %-23.23sDriver Version: %-15.15sCUDA Version: %-9.9s|\n",
+              driver, driver, cuda);
+  std::printf("%s", kRowRule);
+  std::printf("| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n");
+  std::printf("| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n");
+  std::printf("|                                         |                        |               MIG M. |\n");
+  std::printf("|=========================================+========================+======================|\n");
+
   for (uint32_t i = 0; i < s.device_count; ++i) {
     const auto& d = s.devices[i];
+    // "58W /  700W": the cap is padded to four digits, which is what puts the
+    // two numbers under one another across a multi-GPU listing.
     char power[32];
-    std::snprintf(power, sizeof power, "%uW / %uW", d.power_mw / 1000, d.power_limit_mw / 1000);
-    char memory[32];
-    std::snprintf(memory, sizeof memory, "%dMiB / %dMiB", mib(d.vram_used_bytes),
-                  mib(d.vram_total_bytes));
-    std::printf("| %3u  %-28.28s On  | %-16.16s Off |                  N/A |\n", i, d.name,
-                d.bus_id);
-    std::printf("| %2u%%  %3uC    %-3s   %15.15s | %22.22s |    %3u%%      Default |\n",
-                d.fan_percent, d.temperature_c, perf_state_name(d.perf_state), power, memory,
-                d.utilization_gpu);
-    std::printf(
-        "|                                         |                        |                  N/A |\n");
-    std::printf(
-        "+-----------------------------------------+------------------------+----------------------+\n");
+    std::snprintf(power, sizeof power, "%uW / %4uW", d.power_mw / 1000, d.power_limit_mw / 1000);
+
+    // ECC and MIG are "N/A" because the device profiles carry no ECC or MIG
+    // state to report. A number here would be invented, and this table is
+    // exactly where an invented number would be believed.
+    std::printf("|%4u  %-30.30s%3s  |   %-16.16s %3s |%21s |\n", i, d.name, "On", d.bus_id, "Off",
+                "N/A");
+    std::printf("|%3u%%%5uC%6s%24s |%8uMiB /%7uMiB |%7u%%%13s |\n", d.fan_percent, d.temperature_c,
+                perf_state_name(d.perf_state), power, mib(d.vram_used_bytes),
+                mib(d.vram_total_bytes), d.utilization_gpu, "Default");
+    std::printf("|                                         |                        |%21s |\n", "N/A");
+    std::printf("%s", kRowRule);
   }
+
+  // The process table is not optional decoration -- a missing block is itself
+  // a difference from the real tool, and "no processes" is a normal answer.
   std::printf("\n");
-  std::printf(
-      "+-----------------------------------------------------------------------------------------+\n");
+  std::printf("%s", kFrame);
+  std::printf("| Processes:                                                                              |\n");
+  std::printf("|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |\n");
+  std::printf("|        ID   ID                                                               Usage      |\n");
+  std::printf("|=========================================================================================|\n");
+  uint32_t shown = 0;
+  for (uint32_t i = 0; i < s.device_count; ++i) {
+    const auto& d = s.devices[i];
+    for (uint32_t j = 0; j < d.proc_count && j < vgpu::telemetry::kMaxProcs; ++j) {
+      const auto& pr = d.procs[j];
+      char used[16];
+      std::snprintf(used, sizeof used, "%dMiB", mib(pr.used_bytes));
+      // GI and CI are MIG instance ids; without MIG a real driver prints N/A.
+      // Type C is "compute", which is the only kind of context here.
+      std::printf("|%5u   %3s  %3s%16u%7s   %-38.38s%-9s|\n", i, "N/A", "N/A", pr.pid, "C",
+                  pr.name, used);
+      ++shown;
+    }
+  }
+  if (shown == 0)
+    std::printf("|  %-87s|\n", "No running processes found");
+  std::printf("%s", kFrame);
+}
+
+// What the frame above cannot say: which of those columns came from the
+// simulator and which came from a model. Off by default because the default
+// has to match the real tool byte for byte, and available because a number
+// whose origin you cannot check is worse than no number.
+void print_virtual_details(const vgpu::telemetry::Shared& s) {
+  std::printf("\n");
+  std::printf("%s", kFrame);
   std::printf("| Virtual device details                                                                  |\n");
-  std::printf(
-      "|=========================================================================================|\n");
+  std::printf("|=========================================================================================|\n");
   for (uint32_t i = 0; i < s.device_count; ++i) {
     const auto& d = s.devices[i];
     char line[128];
@@ -79,8 +132,7 @@ void print_table(const vgpu::telemetry::Shared& s) {
     std::snprintf(line, sizeof line, "   Kernels     : %" PRIu64 "             Bytes moved: %" PRIu64,
                   d.kernels_launched, d.bytes_moved);
     std::printf("| %-87.87s |\n", line);
-    std::printf(
-        "+-----------------------------------------------------------------------------------------+\n");
+    std::printf("%s", kFrame);
   }
 }
 
@@ -324,7 +376,7 @@ void print_explain() {
 
 int cmd_smi(const std::vector<std::string>& args) {
   bool csv = false, explain = false, rocm = false, agents = false, lspci = false,
-       lspci_dump = false, verbose = false;
+       lspci_dump = false, verbose = false, details = false;
   std::string query_fields;
   bool header = true, units = true;
   for (size_t i = 0; i < args.size(); ++i) {
@@ -345,6 +397,8 @@ int cmd_smi(const std::vector<std::string>& args) {
       csv = true;
     else if (args[i] == "--explain")
       explain = true;
+    else if (args[i] == "--details")
+      details = true;
     else if (args[i] == "--rocm")
       rocm = true;
     else if (args[i] == "--agents")
@@ -372,8 +426,9 @@ int cmd_smi(const std::vector<std::string>& args) {
     int count = 1;
     if (const char* c = std::getenv("VGPU_DEVICE_COUNT"); c && c[0]) count = std::atoi(c);
     try {
-      snap = vgpu::telemetry::idle_snapshot(vgpu::load_gpu(gpu && *gpu ? gpu : "nvidia/h100"),
-                                            count);
+      vgpu::DeviceProfile p = vgpu::load_gpu(gpu && *gpu ? gpu : "nvidia/h100");
+      vgpu::apply_vram_override(p);   // the card the session's programs see
+      snap = vgpu::telemetry::idle_snapshot(p, count);
     } catch (const std::exception& e) {
       std::fprintf(stderr, "vgpu smi: no running VirtualGPU and no usable profile (%s)\n",
                    e.what());
@@ -395,7 +450,9 @@ int cmd_smi(const std::vector<std::string>& args) {
     print_agents(snap);
   else if (lspci || lspci_dump)
     print_lspci(snap, lspci_dump);
-  else
-    print_table(snap);
+  else {
+    print_gpu_table(snap);
+    if (details) print_virtual_details(snap);
+  }
   return 0;
 }

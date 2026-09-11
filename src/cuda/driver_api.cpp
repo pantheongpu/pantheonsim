@@ -27,6 +27,7 @@
 #include <set>
 
 #include "fatbin.hpp"
+#include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/profiling.hpp"
 #include "vgpu/registry.hpp"
@@ -34,13 +35,10 @@
 
 namespace {
 
-// Reported by cuDriverGetVersion. Fixed rather than derived from a toolkit,
-// because this shim deliberately has no toolkit dependency -- it builds against
-// the clean-room vgpu_cuda.h and exists on machines with no CUDA installed at
-// all. libvgpucudart takes its version from the toolkit it was built against,
-// so the two can differ; a driver at least as new as the runtime it serves is
-// the normal configuration on real machines too, not a disagreement.
-constexpr int kDriverVersion = 13000;  // reported as CUDA 13.0
+// cuDriverGetVersion comes from vgpu::driver_version() -- the session's
+// declared CUDA version, shared with the runtime shim and nvidia-smi so the
+// three cannot disagree. See include/vgpu/driver_version.hpp. Still no toolkit
+// dependency: it reads an environment variable, not a CUDA header.
 
 // Handle tagging: low 3 bits encode the handle type so passing e.g. a module
 // where a context belongs is caught instead of misbehaving.
@@ -138,6 +136,7 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
     // reported as CUDA_ERROR_UNKNOWN -- the least informative code available,
     // for the two conditions this project most wants to be legible.
     case Err::Trap: return CUDA_ERROR_ILLEGAL_INSTRUCTION;
+    case Err::DeviceAssert: return CUDA_ERROR_ASSERT;
     case Err::DataRace: return CUDA_ERROR_LAUNCH_FAILED;
     case Err::DoubleFree:
     case Err::InvalidFree:
@@ -443,8 +442,7 @@ VGPU_EXPORT CUresult cuInit(unsigned int flags) {
     int count = 1;
     if (const char* c = std::getenv("VGPU_DEVICE_COUNT"); c && c[0]) count = std::atoi(c);
     vgpu::DeviceProfile profile = vgpu::load_gpu(id);
-    if (const char* mb = std::getenv("VGPU_VRAM_MB"); mb && mb[0])
-      profile.vram_bytes = static_cast<uint64_t>(std::strtoull(mb, nullptr, 10)) * 1024ull * 1024ull;
+    vgpu::apply_vram_override(profile);
     s.rt = std::make_unique<vgpu::runtime::Runtime>(profile, count);
     s.initialized = true;
     if (!quiet())
@@ -457,7 +455,7 @@ VGPU_EXPORT CUresult cuInit(unsigned int flags) {
 
 VGPU_EXPORT CUresult cuDriverGetVersion(int* driverVersion) {
   if (!driverVersion) return CUDA_ERROR_INVALID_VALUE;
-  *driverVersion = kDriverVersion;
+  *driverVersion = vgpu::driver_version();
   return CUDA_SUCCESS;
 }
 
@@ -554,7 +552,19 @@ VGPU_EXPORT CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CU
     if (!pi) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
     const vgpu::DeviceProfile& p = s.rt->device(dev).profile();
-    switch (attrib) {
+    // Read the attribute as the integer the ABI actually passes, not as the
+    // enum. A caller built against a newer CUDA header legitimately passes
+    // values this shim's headers do not enumerate -- CUDA 13 sends 134, and
+    // the `default:` arm below exists precisely to answer them. But *loading*
+    // an enum object holding a value outside its enumerators is undefined:
+    // UBSan reports it, and a compiler is entitled to assume the value is in
+    // range and delete the default arm, which would turn forward compatibility
+    // into a wrong answer with no diagnostic. memcpy reads the bytes without
+    // making that claim about them.
+    static_assert(sizeof(attrib) == sizeof(int), "CUdevice_attribute is not int-sized");
+    int attr_id;
+    std::memcpy(&attr_id, &attrib, sizeof attr_id);
+    switch (attr_id) {
       case CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: *pi = (int)p.limits.max_threads_per_block; break;
       case CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X: *pi = (int)p.limits.max_block_dim[0]; break;
       case CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y: *pi = (int)p.limits.max_block_dim[1]; break;
@@ -574,7 +584,7 @@ VGPU_EXPORT CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CU
       case CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: *pi = p.cc_major; break;
       case CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: *pi = p.cc_minor; break;
       default:
-        *pi = extra_attribute(p, static_cast<int>(attrib));
+        *pi = extra_attribute(p, attr_id);
         break;
     }
     return CUDA_SUCCESS;
@@ -1244,6 +1254,37 @@ VGPU_EXPORT CUresult cuLaunchKernelEx(const void* config, CUfunction f, void** k
   };
   const auto* c = static_cast<const LaunchCfgABI*>(config);
   if (!c) return CUDA_ERROR_INVALID_VALUE;
+  // Attributes are refused rather than dropped.
+  //
+  // This shim forwarded the config and ignored `attrs` entirely, which was
+  // harmless while nothing it could carry was implemented. Thread-block
+  // clusters changed that: a launch carrying
+  // CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION would have run with no cluster, and
+  // every block would have read %cluster_ctarank as 0 and %cluster_nctarank
+  // as 1. It would have succeeded and been wrong, silently, which is the one
+  // outcome this engine is built to not produce.
+  //
+  // Walking the array is not an option here. Unlike the runtime shim, this
+  // file deliberately depends on no vendor header -- see vgpu_cuda.h -- and
+  // the entry stride is not a constant that can be hard-coded:
+  // sizeof(CUlaunchAttribute) is 72 with CUDA 13 against the 40 an older
+  // toolkit's union gives, so a fixed guess reads the wrong bytes on some
+  // toolkit and reports a cluster shape nobody asked for.
+  //
+  // So: no attributes is the supported case, and anything else says so. The
+  // runtime entry point (cudaLaunchKernelEx) does read attributes, because
+  // that shim is compiled against the vendor headers, and it is the path CUDA
+  // C++ actually takes.
+  if (c->num_attrs != 0 && c->attrs != nullptr) {
+    if (!quiet())
+      std::fprintf(stderr,
+                   "[vgpu] cuLaunchKernelEx: %u launch attribute(s) given; this entry point "
+                   "cannot read them (the attribute struct size differs between CUDA "
+                   "toolkits) and will not ignore them silently. Use cudaLaunchKernelEx, "
+                   "which does read them.\n",
+                   c->num_attrs);
+    return CUDA_ERROR_NOT_SUPPORTED;
+  }
   return cuLaunchKernel(f, c->gx, c->gy, c->gz, c->bx, c->by, c->bz, c->shared_bytes, c->stream,
                         kernelParams, extra);
 }

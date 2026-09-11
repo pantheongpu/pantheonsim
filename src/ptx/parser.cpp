@@ -40,6 +40,21 @@ const std::unordered_map<std::string, Sreg>& sreg_table() {
       {"%dynamic_smem_size", Sreg::DynamicSmemSize},
       {"%total_smem_size", Sreg::TotalSmemSize},
       {"%gridid", Sreg::GridId},
+      {"%clusterid.x", Sreg::ClusterIdX},
+      {"%clusterid.y", Sreg::ClusterIdY},
+      {"%clusterid.z", Sreg::ClusterIdZ},
+      {"%nclusterid.x", Sreg::NClusterIdX},
+      {"%nclusterid.y", Sreg::NClusterIdY},
+      {"%nclusterid.z", Sreg::NClusterIdZ},
+      {"%cluster_ctaid.x", Sreg::ClusterCtaIdX},
+      {"%cluster_ctaid.y", Sreg::ClusterCtaIdY},
+      {"%cluster_ctaid.z", Sreg::ClusterCtaIdZ},
+      {"%cluster_nctaid.x", Sreg::ClusterNCtaIdX},
+      {"%cluster_nctaid.y", Sreg::ClusterNCtaIdY},
+      {"%cluster_nctaid.z", Sreg::ClusterNCtaIdZ},
+      {"%cluster_ctarank", Sreg::ClusterCtaRank},
+      {"%cluster_nctarank", Sreg::ClusterNCtaRank},
+      {"%is_explicit_cluster", Sreg::IsExplicitCluster},
   };
   return t;
 }
@@ -49,7 +64,14 @@ const std::unordered_map<std::string, Sreg>& sreg_table() {
 bool inert_mem_modifier(const std::string& p) {
   static const std::set<std::string> inert = {"volatile", "nc", "ca", "cg", "cs", "lu",  "cv",
                                               "wb",       "wt", "relaxed", "acquire", "release",
-                                              "acq_rel",  "cta", "gpu", "sys"};
+                                              "acq_rel",  "cta", "gpu", "sys",
+                                              // .noftz keeps subnormal halves rather than
+                                              // flushing them, and this engine never flushes,
+                                              // so it asks for the behaviour already in place.
+                                              "noftz",
+                                              // Cluster scope on an ordinary access is a
+                                              // visibility promise, not a different address.
+                                              "cluster"};
   return inert.count(p) > 0;
 }
 
@@ -85,6 +107,32 @@ std::vector<std::string> split_dots(const std::string& s) {
   }
   if (!cur.empty() && !is_cache_hint(cur)) parts.push_back(normalize_scope(cur));
   return parts;
+}
+
+// Is this a SIMD video mnemonic? The name is v<op><lanes>, so the operation is
+// everything between the leading v and the trailing lane count.
+const char* video_simd_base(const std::string& op0) {
+  static const char* kOps[] = {"add", "sub", "absdiff", "min", "max", "avrg"};
+  const std::string base = op0.substr(1, op0.size() - 2);
+  for (const char* o : kOps)
+    if (base == o) return o;
+  return nullptr;
+}
+
+// The comparison suffixes, shared by setp and set.
+const std::unordered_map<std::string, CmpOp>& cmp_table() {
+  static const std::unordered_map<std::string, CmpOp> t = {
+      {"eq", CmpOp::Eq},   {"ne", CmpOp::Ne},   {"lt", CmpOp::Lt},
+      {"le", CmpOp::Le},   {"gt", CmpOp::Gt},   {"ge", CmpOp::Ge},
+      // Unsigned integer forms share the ordered comparators; the operand
+      // type already selects signed vs unsigned interpretation.
+      {"lo", CmpOp::Lt},   {"ls", CmpOp::Le},   {"hi", CmpOp::Gt},
+      {"hs", CmpOp::Ge},
+      // Float unordered (NaN-true) forms and the NaN tests.
+      {"equ", CmpOp::Equ}, {"neu", CmpOp::Neu}, {"ltu", CmpOp::Ltu},
+      {"leu", CmpOp::Leu}, {"gtu", CmpOp::Gtu}, {"geu", CmpOp::Geu},
+      {"num", CmpOp::Num}, {"nan", CmpOp::Nan}};
+  return t;
 }
 
 std::optional<Type> parse_type_token(const std::string& part) {
@@ -208,17 +256,73 @@ class Parser {
         m.globals.push_back(parse_global(t.line));
         continue;
       }
-      if (t.text == ".func")
-        fail_unsupported(t.line, ".func", "", "device functions are not supported (only .entry kernels)");
+      if (t.text == ".func" || t.text == ".weak" || t.text == ".visible") {
+        // ".weak .func" and ".visible .func" are the linkage-qualified forms.
+        // A qualifier on anything else falls through to the error below.
+        size_t look = 0;
+        if (t.text != ".func") {
+          if (peek(1).kind != Token::Kind::Word || peek(1).text != ".func") {
+            fail_unsupported(t.line, t.text, "", "linkage qualifier on an unsupported directive");
+          }
+          look = 1;
+        }
+        (void)look;
+        next();
+        if (t.text != ".func") next();  // consume ".func" after the qualifier
+        auto fn = std::make_shared<EntryFn>();
+        if (parse_device_func(fn.get())) m.funcs.push_back(std::move(fn));
+        continue;
+      }
       fail_unsupported(t.line, t.text, "",
                        "directive not in the implemented PTX subset (supported: .version .target "
                        ".address_size .visible .weak .common .extern .global .const .entry .file .loc "
                        ".section)");
     }
+    resolve_calls(m);
     return m;
   }
 
  private:
+  // Point every call at the function it names. Done after the whole module is
+  // parsed because PTX declares prototypes first and a call can precede the
+  // definition -- resolving eagerly would refuse a forward reference that is
+  // perfectly well defined thirty lines later.
+  void resolve_calls(Module& m) {
+    std::unordered_map<std::string, std::shared_ptr<EntryFn>> by_name;
+    for (auto& f : m.funcs) by_name[f->name] = f;
+    // `with_tables` is false for the device functions themselves. Giving every
+    // EntryFn a list of shared_ptrs to all of them makes each function hold a
+    // shared_ptr to itself -- a reference cycle, so no .func is ever freed and
+    // every module leaks its whole body. Nothing needs it there anyway: an
+    // indirect call resolves against the *kernel's* table, which is the one
+    // the interpreter reads.
+    auto fix = [&](EntryFn& fn, bool with_tables) {
+      if (with_tables) {
+        fn.module_funcs.assign(m.funcs.begin(), m.funcs.end());
+        fn.module_entry_names.clear();
+        for (const auto& e : m.entries) fn.module_entry_names.push_back(e.name);
+      }
+      for (Instr& ins : fn.body) {
+        auto* call = std::get_if<OpCall>(&ins.op);
+        if (!call || call->indirect || call->callee.empty()) continue;
+        if (call->callee == "vprintf" || call->callee == "__assertfail" ||
+            call->callee == "malloc" || call->callee == "free")
+          continue;
+        // An unresolved name is left unresolved rather than refused here. A
+        // separately compiled build links in CUDA's device-runtime library,
+        // which declares functions the driver supplies (cnpGetLastError and
+        // friends) and defines them nowhere in the module -- so refusing at
+        // parse time rejected a whole program because a library function
+        // nobody calls had no body. Execution reports it if it is ever
+        // reached, which is the point at which it actually matters.
+        auto it = by_name.find(call->callee);
+        if (it != by_name.end()) call->target = it->second;
+      }
+    };
+    for (auto& e : m.entries) fix(e, /*with_tables=*/true);
+    for (auto& f : m.funcs) fix(*f, /*with_tables=*/false);
+  }
+
   [[noreturn]] void fail(size_t line, const std::string& msg) {
     throw Error::make(Err::PtxParse, "line ", line, ": ", msg);
   }
@@ -323,19 +427,44 @@ class Parser {
         next();
         g.init.reserve(g.size);
         while (!peek_punct("}")) {
-          int64_t v = expect_int("initializer element");
-          // Little-endian element append.
-          for (uint32_t b = 0; b < ty.bytes(); ++b)
-            g.init.push_back(static_cast<uint8_t>((static_cast<uint64_t>(v) >> (8 * b)) & 0xFF));
+          // An element may be a symbol rather than a number -- a table of
+          // function pointers is "{f, g, h}". Its slot is zeroed here and the
+          // address written by the loader, which is the same treatment the
+          // scalar "= symbol" form gets.
+          if (peek().kind == Token::Kind::Word && peek().text == "generic" &&
+              peek(1).kind == Token::Kind::Punct && peek(1).text == "(") {
+            // "generic(sym)" casts a symbol's address into the generic window.
+            // Every address in this model is already generic, so the cast is
+            // the identity and only the symbol matters.
+            next();
+            next();
+            g.init_symbols.push_back({g.init.size(), expect_word("symbol in generic()")});
+            expect_punct(")");
+            g.init.resize(g.init.size() + ty.bytes(), 0);
+          } else if (peek().kind == Token::Kind::Word && is_identifier_start(peek().text[0])) {
+            g.init_symbols.push_back({g.init.size(), next().text});
+            g.init.resize(g.init.size() + ty.bytes(), 0);
+          } else {
+            int64_t v = expect_int("initializer element");
+            // Little-endian element append.
+            for (uint32_t b = 0; b < ty.bytes(); ++b)
+              g.init.push_back(static_cast<uint8_t>((static_cast<uint64_t>(v) >> (8 * b)) & 0xFF));
+          }
           if (peek_punct(",")) next();
         }
         next();  // '}'
+      } else if (peek().kind == Token::Kind::Word && peek().text == "generic" &&
+                 peek(1).kind == Token::Kind::Punct && peek(1).text == "(") {
+        next();
+        next();
+        g.init_symbols.push_back({0, expect_word("symbol in generic()")});
+        expect_punct(")");
       } else if (peek().kind == Token::Kind::Word && is_identifier_start(peek().text[0])) {
         // "= some_symbol": the initialiser is another symbol's address, which
         // only exists once the module is loaded. The lexer gives numbers and
         // identifiers the same token kind, so the first character is what
         // separates them -- "= 5" is a value, not a symbol named "5".
-        g.init_symbol = next().text;
+        g.init_symbols.push_back({0, next().text});
       } else {
         int64_t v = expect_int("initializer");
         for (uint32_t b = 0; b < ty.bytes(); ++b)
@@ -345,7 +474,7 @@ class Parser {
         fail(line, "initializer for '" + g.name + "' longer than its declared size");
       // A symbol initialiser leaves no bytes here: the address is written by
       // the loader once every global has one.
-      if (g.init_symbol.empty()) g.init.resize(g.size, 0);
+      g.init.resize(g.size, 0);
     }
     expect_punct(";");
     return g;
@@ -355,6 +484,93 @@ class Parser {
 
   // Returns false when this was a declaration rather than a definition, in
   // which case *out is not meaningful.
+  // .func [(.param .type func_retval0)] name ( .param .type name_param_0, ... )
+  // followed by a body, or by ";" for a prototype.
+  //
+  // The parameters and the return value are handled as *call slots*, not as a
+  // launch parameter buffer: every lane of a warp passes its own arguments, so
+  // there is no single byte buffer to read them from. Registering the names in
+  // call_slots_ before the body is parsed is what makes "ld.param [x_param_0]"
+  // inside the function compile to a slot read rather than a kernel-parameter
+  // read.
+  bool parse_device_func(EntryFn* out) {
+    EntryFn& fn = *out;
+    cur_fn_ = &fn;
+    fn.is_device_func = true;
+    call_slots_.clear();
+    declared_regs_.clear();
+    if (peek_punct("(")) {
+      next();
+      const std::string kw = expect_word("'.param'");
+      if (kw != ".param") fail(peek().line, "expected .param in a .func return value");
+      if (peek().kind == Token::Kind::Word && peek().text == ".align") {
+        next();
+        expect_int("alignment");
+      }
+      const Type rty = expect_type("return value declaration");
+      fn.retval_slot_name = expect_word("return value name");
+      // An aggregate return: ".param .align 4 .b8 func_retval0[16]". The
+      // element type is .b8 and the bracket carries the byte count.
+      if (peek_punct("[")) {
+        next();
+        fn.retval_bytes = static_cast<uint32_t>(expect_int("return value size")) * rty.bytes();
+        expect_punct("]");
+      } else {
+        fn.retval_bytes = rty.bytes();
+      }
+      call_slots_.insert(fn.retval_slot_name);
+      expect_punct(")");
+    }
+    fn.name = expect_word("device function name");
+    current_kernel_ = fn.name;
+    if (peek_punct("(")) {
+      next();
+      while (!peek_punct(")")) {
+        const std::string kw = expect_word("'.param'");
+        if (kw != ".param") fail(peek().line, "expected .param in a .func signature");
+        if (peek().kind == Token::Kind::Word && peek().text == ".align") {
+          next();
+          expect_int("alignment");
+        }
+        const Type pty = expect_type("parameter declaration");
+        while (peek().kind == Token::Kind::Word && peek().text[0] == '.') next();  // ptr annotations
+        const std::string pname = expect_word("parameter name");
+        uint32_t pbytes = pty.bytes();
+        if (peek_punct("[")) {  // a struct or array passed by value
+          next();
+          pbytes = static_cast<uint32_t>(expect_int("parameter size")) * pty.bytes();
+          expect_punct("]");
+        }
+        fn.param_slot_bytes.push_back(pbytes);
+        fn.param_slot_names.push_back(pname);
+        call_slots_.insert(pname);
+        if (peek_punct(",")) next();
+      }
+      next();
+    }
+    if (peek_punct(";")) {  // a prototype, not a definition
+      next();
+      current_kernel_.clear();
+      cur_fn_ = nullptr;
+      return false;
+    }
+    // .noreturn and friends may sit between the signature and the body.
+    while (peek().kind == Token::Kind::Word && peek().text[0] == '.' && !peek_punct("{")) {
+      if (peek().text == ".noreturn" || peek().text == ".pragma") {
+        next();
+        while (!at_end() && !peek_punct(";") && !peek_punct("{")) next();
+        if (peek_punct(";")) next();
+        continue;
+      }
+      break;
+    }
+    expect_punct("{");
+    parse_body(fn);
+    current_kernel_.clear();
+    cur_fn_ = nullptr;
+    return true;
+  }
+
   bool parse_entry(EntryFn* out) {
     EntryFn& fn = *out;
     cur_fn_ = &fn;
@@ -408,6 +624,26 @@ class Parser {
         }
         if (d == ".maxntid") fn.max_ntid = dims;
         else fn.req_ntid = dims;
+      } else if (d == ".reqnctapercluster") {
+        // __cluster_dims__(x,y,z). Fewer than three values means the trailing
+        // dimensions are 1, the same shorthand .maxntid uses.
+        next();
+        std::array<uint32_t, 3> dims{1, 1, 1};
+        for (int i = 0; i < 3; ++i) {
+          dims[i] = static_cast<uint32_t>(expect_int("cluster dimension"));
+          if (i < 2 && peek_punct(",")) next();
+          else if (i < 2) break;
+        }
+        fn.req_cluster = dims;
+      } else if (d == ".explicitcluster") {
+        next();
+        fn.explicit_cluster = true;
+      } else if (d == ".maxclusterrank") {
+        // A ceiling on cluster size for occupancy, not a shape. Recorded
+        // nowhere because nothing here schedules by it, but it must be
+        // consumed or the token stream desynchronizes.
+        next();
+        expect_int("directive value");
       } else if (d == ".minnctapersm" || d == ".maxnreg" || d == ".maxnctapersm") {
         next();
         uint32_t v = static_cast<uint32_t>(expect_int("directive value"));
@@ -460,6 +696,22 @@ class Parser {
         parse_reg_decl(fn);
         continue;
       }
+      // ".reg.b16 hl, hu;" -- the type glued to the directive with no space.
+      // CUDA's own headers write it this way inside inline asm: h2exp, h2log
+      // and the rest of the half2 math family all begin with a line like that,
+      // so a kernel calling any of them arrives here. The lexer sees one word,
+      // and splitting it is the whole fix.
+      if (t.kind == Token::Kind::Word && t.text.size() > 4 &&
+          t.text.compare(0, 5, ".reg.") == 0) {
+        const std::string type_part = t.text.substr(5);
+        auto ty = parse_type_token(type_part);
+        if (!ty)
+          fail_unsupported(t.line, t.text, fn.name,
+                           "register type '." + type_part + "' is not implemented");
+        next();
+        parse_reg_decl_of_type(fn, *ty);
+        continue;
+      }
       if (t.kind == Token::Kind::Word && t.text == ".local") {
         next();
         parse_local_decl(fn, t.line);
@@ -477,12 +729,21 @@ class Parser {
         Instr ins;
         ins.line = t.line;
         OpDeclSlot d;
+        // ".param .align 4 .b8 retval0[16];" -- an aggregate call slot. The
+        // alignment is a layout hint the slot does not need (it is a private
+        // byte buffer, not device memory), but it must be consumed.
+        if (peek().kind == Token::Kind::Word && peek().text == ".align") {
+          next();
+          expect_int("slot alignment");
+        }
         Type ty = expect_type(".param slot declaration");
         d.name = expect_word("slot name");
         d.size = ty.bytes();
-        if (peek_punct("["))
-          fail_unsupported(t.line, ".param array call slot", fn.name,
-                           "aggregate call arguments are not supported yet");
+        if (peek_punct("[")) {
+          next();
+          d.size = static_cast<uint32_t>(expect_int("slot size")) * ty.bytes();
+          expect_punct("]");
+        }
         expect_punct(";");
         call_slots_.insert(d.name);
         ins.op = d;
@@ -500,6 +761,16 @@ class Parser {
       // hints for the code generator; neither changes what the kernel computes,
       // and both appear in anything compiled with line tables -- Triton emits a
       // ".loc" per statement.
+      if (t.kind == Token::Kind::Word && t.text == ".callprototype") {
+        // "proto : .callprototype (.param .b32 _) _ (.param .b32 _, ...);"
+        // The label was already consumed as a label. The signature would let a
+        // call be type-checked, which nothing here does, so it is dropped --
+        // but it must be consumed or the token stream desynchronizes.
+        next();
+        while (!at_end() && !peek_punct(";")) next();
+        if (peek_punct(";")) next();
+        continue;
+      }
       if (t.kind == Token::Kind::Word && (t.text == ".loc" || t.text == ".pragma")) {
         next();
         while (!at_end() && !peek_punct(";") && peek().line == t.line) next();
@@ -529,7 +800,10 @@ class Parser {
   }
 
   void parse_reg_decl(EntryFn& fn) {
-    Type ty = expect_type(".reg declaration");
+    parse_reg_decl_of_type(fn, expect_type(".reg declaration"));
+  }
+
+  void parse_reg_decl_of_type(EntryFn& fn, Type ty) {
     while (true) {
       std::string name = expect_word("register name");
       if (peek_punct("<")) {  // parameterized: .reg .b32 %r<6> declares %r0..%r5
@@ -815,16 +1089,30 @@ class Parser {
       fail_unsupported(ins.line, reconstruct_from(start_tok), fn.name, hint);
     };
 
+    // Interned here rather than at each instruction's own construction site:
+    // there are dozens of those and the first attempt reached two of them, so
+    // the histogram counted almost nothing. This is the one point every
+    // instruction passes through with its mnemonic in hand.
+    ins.opcode_id = intern_opcode(parts[0]);
+
     const std::string& op0 = parts[0];
     if (op0 == "ld" || op0 == "st") {
       Space space = Space::Generic;
       size_t vec = 1;
       Type ty{};
       bool have_ty = false;
+      bool acquire = false, release = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
-        if (p == "param") space = Space::Param;
+        if (p == "acquire") acquire = true;
+        else if (p == "release") release = true;
+        else if (p == "param") space = Space::Param;
         else if (p == "global") space = Space::Global;
+        // __constant__ variables are parsed into the module's globals, so a
+        // constant-bank read is a global read of a range nothing writes. The
+        // read-only-ness is a promise the program makes, not one this engine
+        // has to enforce -- a kernel that writes there is already invalid.
+        else if (p == "const") space = Space::Global;
         else if (p == "shared") space = Space::Shared;
         else if (p == "local") space = Space::Local;
         else if (inert_mem_modifier(p)) ;
@@ -886,6 +1174,9 @@ class Parser {
           ins.op = OpSt{space, ty, addr, std::move(srcs)};
         }
       }
+      // The ordering the kernel asked for, on whichever op this became.
+      if (auto* l = std::get_if<OpLd>(&ins.op)) l->acquire = acquire;
+      if (auto* st = std::get_if<OpSt>(&ins.op)) st->release = release;
     } else if (op0 == "mov") {
       if (parts.size() != 2) return unsupported("mov form");
       auto ty = parse_type_token(parts[1]);
@@ -964,6 +1255,8 @@ class Parser {
       // cvt[.round][.sat][.ftz].<dstty>.<srcty>
       std::vector<Type> tys;
       std::string packed;  // "f16x2"/"bf16x2": two f32 sources packed into one register
+      std::string fp8;     // "e4m3x2"/"e5m2x2": the FP8 side of the conversion
+      bool satfinite = false;
       Round round = Round::None;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
@@ -977,8 +1270,40 @@ class Parser {
         else if (p == "rpi") round = Round::Rpi;
         else if (p == "sat" || p == "ftz") ;  // saturation/flush handled conservatively below
         else if (p == "f16x2" || p == "bf16x2") packed = p;
+        else if (p == "e4m3x2" || p == "e5m2x2") fp8 = p;
+        else if (p == "satfinite") satfinite = true;
         else if (auto t2 = parse_type_token(p)) tys.push_back(*t2);
         else return unsupported("unrecognized cvt modifier '." + p + "'");
+      }
+      if (!fp8.empty()) {
+        OpCvtFp8 op;
+        op.e5m2 = fp8[1] == '5';
+        op.satfinite = satfinite;
+        // Which side of the dot the fp8 type sat on decides the direction, and
+        // `packed`/`tys` carry whatever the other side was.
+        const size_t fp8_pos = opcode.find(fp8);
+        const size_t other_pos = packed.empty() ? std::string::npos : opcode.find(packed);
+        op.to_fp8 = other_pos == std::string::npos ? !tys.empty() : fp8_pos < other_pos;
+        op.bf16 = !packed.empty() && packed[0] == 'b';
+        if (!packed.empty()) {
+          op.src_f32_pair = false;
+        } else {
+          if (tys.size() != 1 || tys[0].bits != 32 || !tys[0].is_float())
+            return unsupported("cvt between " + fp8 + " and a type other than f32/f16x2/bf16x2");
+          op.src_f32_pair = true;
+        }
+        if (!op.to_fp8 && op.src_f32_pair)
+          return unsupported("cvt from " + fp8 + " to f32 (PTX unpacks to f16x2)");
+        op.dst = expect_reg_operand("cvt destination");
+        expect_punct(",");
+        op.a = parse_operand();
+        if (op.to_fp8 && op.src_f32_pair) {
+          expect_punct(",");
+          op.b = parse_operand();
+        }
+        ins.op = op;
+        expect_punct(";");
+        return ins;
       }
       if (!packed.empty()) {
         // cvt.rn.f16x2.f32 d, a, b -- two f32 converted and packed, a high, b low.
@@ -1022,30 +1347,42 @@ class Parser {
         op.src = parse_operand();
         ins.op = op;
       }
-    } else if ((op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "fma" || op0 == "neg") &&
-               opcode.find("f16x2") != std::string::npos) {
-      // Packed half2 arithmetic.
-      for (size_t i = 1; i < parts.size(); ++i)
-        if (parts[i] != "f16x2" && parts[i] != "rn" && parts[i] != "ftz" && parts[i] != "sat" &&
-            parts[i] != "rz" && parts[i] != "rm" && parts[i] != "rp")
-          return unsupported("f16x2 modifier '." + parts[i] + "'");
+    } else if ((op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "fma" || op0 == "neg" ||
+                op0 == "abs" || op0 == "min" || op0 == "max") &&
+               (opcode.find("f16") != std::string::npos ||
+                opcode.find("bf16") != std::string::npos)) {
+      // Half-precision arithmetic in all four shapes: f16, f16x2, bf16, bf16x2.
+      bool is_bf = false, is_packed = false, saw_ty = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p2 = parts[i];
+        if (p2 == "f16") { saw_ty = true; }
+        else if (p2 == "f16x2") { saw_ty = true; is_packed = true; }
+        else if (p2 == "bf16") { saw_ty = true; is_bf = true; }
+        else if (p2 == "bf16x2") { saw_ty = true; is_bf = true; is_packed = true; }
+        else if (p2 == "rn" || p2 == "ftz" || p2 == "sat" || p2 == "rz" || p2 == "rm" ||
+                 p2 == "rp" || p2 == "NaN" || p2 == "xorsign" || p2 == "abs") ;
+        else return unsupported("half-precision modifier '." + p2 + "'");
+      }
+      if (!saw_ty) return unsupported("half-precision form without a type");
       Reg dst = expect_reg_operand("destination");
       expect_punct(",");
       Operand a = parse_operand();
-      if (op0 == "neg") {
-        ins.op = OpF16x2Neg{dst, a};
+      if (op0 == "neg" || op0 == "abs") {
+        ins.op = OpF16x2Neg{is_bf, is_packed, op0 == "abs", dst, a};
       } else {
         expect_punct(",");
         Operand b = parse_operand();
         if (op0 == "fma") {
           expect_punct(",");
           Operand c = parse_operand();
-          ins.op = OpF16x2Fma{dst, a, b, c};
+          ins.op = OpF16x2Fma{is_bf, is_packed, dst, a, b, c};
         } else {
           FloatBinOp fop = op0 == "add"   ? FloatBinOp::Add
                            : op0 == "sub" ? FloatBinOp::Sub
+                           : op0 == "min" ? FloatBinOp::Min
+                           : op0 == "max" ? FloatBinOp::Max
                                           : FloatBinOp::Mul;
-          ins.op = OpF16x2Bin{fop, dst, a, b};
+          ins.op = OpF16x2Bin{fop, is_bf, is_packed, dst, a, b};
         }
       }
     } else if (op0 == "wmma") {
@@ -1056,18 +1393,43 @@ class Parser {
       std::vector<MatLayout> layouts;
       Space space = Space::Generic;
       bool shape_ok = false;
+      char frag = 0;
+      bool saw_f32 = false;
+      WmmaElem elem = WmmaElem::F16;
+      bool k8 = false;
       for (size_t i = 2; i < parts.size(); ++i) {
         const std::string& p = parts[i];
-        if (p == "sync" || p == "aligned" || p == "d" || p == "f32") ;
+        if (p == "sync" || p == "aligned") ;
+        else if (p == "a" || p == "b" || p == "c" || p == "d") frag = p[0];
+        else if (p == "f32") saw_f32 = true;
         else if (p == "row") layouts.push_back(MatLayout::Row);
         else if (p == "col") layouts.push_back(MatLayout::Col);
         else if (p == "m16n16k16") shape_ok = true;
         else if (p == "global") space = Space::Global;
         else if (p == "shared") space = Space::Shared;
         else if (p == "f16") ;
-        else return unsupported("wmma modifier '." + p + "' (only m16n16k16 f32 is implemented)");
+        else if (p == "bf16") elem = WmmaElem::BF16;
+        else if (p == "tf32") { elem = WmmaElem::TF32; }
+        else if (p == "m16n16k8") { shape_ok = true; k8 = true; }
+        else if (p == "m8n32k16" || p == "m32n8k16")
+          // The rectangular m8n32/m32n8 variants of the 16-deep shape. Their
+          // fragments are laid out differently again, and nothing has needed
+          // them yet, so they say so rather than being approximated.
+          return unsupported("wmma shape '." + p + "' (only m16n16k16 and m16n16k8 "
+                             "are implemented)");
+        else return unsupported("wmma modifier '." + p + "' (only m16n16k16 f16/bf16 with an "
+                                "f32 accumulator is implemented)");
       }
-      if (!shape_ok) return unsupported("only the m16n16k16 wmma shape is implemented");
+      if (!shape_ok) return unsupported("only the m16n16k16 and m16n16k8 wmma shapes "
+                                        "are implemented");
+      // The implication only runs one way. `.tf32` always means m16n16k8, but
+      // m16n16k8 does not always mention tf32: the accumulator load and the
+      // store carry only `.f32`, because the C and D fragments are f32
+      // whatever the input type was. Requiring both tokens rejected
+      // wmma.load.c.m16n16k8.f32, which is most of a tf32 kernel.
+      if (elem == WmmaElem::TF32 && !k8)
+        return unsupported("wmma .tf32 outside the m16n16k8 shape");
+      if (k8 && (frag == 'a' || frag == 'b')) elem = WmmaElem::TF32;
       if (kind == "mma") {
         if (layouts.size() != 2) return unsupported("wmma.mma needs both A and B layouts");
         OpWmmaMma op;
@@ -1080,8 +1442,14 @@ class Parser {
         op.b = parse_reg_vector_any();
         expect_punct(",");
         op.c = parse_reg_vector_any();
-        if (op.d.size() != 8 || op.a.size() != 8 || op.b.size() != 8 || op.c.size() != 8)
-          return unsupported("wmma.mma fragment arity (expected 8 registers each)");
+        op.elem = elem;
+        // f16 fragments duplicate the matrix across the warp and take 8
+        // registers; bf16 does not and takes 4. The accumulator is 8 either
+        // way, being 16x16 f32 over 32 lanes.
+        const size_t ab = elem == WmmaElem::F16 ? 8u : 4u;
+        if (op.d.size() != 8 || op.c.size() != 8 || op.a.size() != ab || op.b.size() != ab)
+          return unsupported("wmma.mma fragment arity (expected " + std::to_string(ab) +
+                             " A/B registers and 8 accumulator registers)");
         ins.op = op;
       } else if (kind == "store") {
         OpWmmaStore op;
@@ -1097,8 +1465,31 @@ class Parser {
         expect_punct(",");
         op.stride = parse_operand();
         ins.op = op;
+      } else if (kind == "load") {
+        OpWmmaLoad op;
+        if (frag == 'a') op.which = OpWmmaLoad::Which::A;
+        else if (frag == 'b') op.which = OpWmmaLoad::Which::B;
+        else if (frag == 'c') op.which = OpWmmaLoad::Which::C;
+        else return unsupported("wmma.load without an a/b/c fragment selector");
+        op.f32 = saw_f32;
+        if (op.which == OpWmmaLoad::Which::C && !op.f32)
+          return unsupported("wmma.load.c with an f16 accumulator (only .f32 is implemented)");
+        if (op.which != OpWmmaLoad::Which::C && op.f32)
+          return unsupported("wmma.load.a/.b with f32 elements (only .f16 is implemented)");
+        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
+        op.space = space;
+        op.elem = elem;
+        op.dsts = parse_reg_vector_any();
+        const size_t want = (op.which == OpWmmaLoad::Which::C || elem == WmmaElem::F16) ? 8u : 4u;
+        if (op.dsts.size() != want)
+          return unsupported("wmma.load fragment arity (expected " + std::to_string(want) + ")");
+        expect_punct(",");
+        op.addr = parse_addr(fn);
+        expect_punct(",");
+        op.stride = parse_operand();
+        ins.op = op;
       } else {
-        return unsupported("wmma." + kind + " is not implemented (only .mma and .store.d)");
+        return unsupported("wmma." + kind + " is not implemented (only .load, .mma and .store.d)");
       }
     } else if (op0 == "abs") {
       if (parts.size() < 2) return unsupported("abs form");
@@ -1118,6 +1509,7 @@ class Parser {
           {"rcp", MathOp::Rcp},     {"tanh", MathOp::Tanh}};
       Type ty{};
       bool have_ty = false;
+      bool packed_half = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         // approx/rn/rz/ftz/full select precision on hardware; VirtualGPU always
@@ -1125,17 +1517,20 @@ class Parser {
         if (p == "approx" || p == "rn" || p == "rz" || p == "rm" || p == "rp" || p == "ftz" ||
             p == "full")
           ;
+        else if (p == "f16x2") { ty = Type{Type::Kind::F, 16}; have_ty = true; packed_half = true; }
+        else if (p == "bf16x2") { ty = Type{Type::Kind::BF, 16}; have_ty = true; packed_half = true; }
         else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
         } else return unsupported("unrecognized modifier '." + p + "'");
       }
       if (!have_ty) fail(ins.line, opcode + " missing type");
-      if (!ty.is_float() || (ty.bits != 32 && ty.bits != 64))
-        return unsupported("only f32/f64 " + op0 + " is implemented");
+      if (!ty.is_real() || (ty.bits != 16 && ty.bits != 32 && ty.bits != 64))
+        return unsupported(op0 + " on '" + parts.back() + "'");
       OpMath op;
       op.op = mops.at(op0);
       op.ty = ty;
+      op.packed = packed_half;
       op.dst = expect_reg_operand("destination");
       expect_punct(",");
       op.src = parse_operand();
@@ -1410,6 +1805,313 @@ class Parser {
       expect_punct(",");
       op.c = parse_operand();
       ins.op = op;
+    } else if (op0.size() > 3 && op0[0] == 'v' &&
+               (op0.back() == '2' || op0.back() == '4') &&
+               video_simd_base(op0) != nullptr) {
+      // vadd4 / vsub4 / vabsdiff4 / vmin4 / vmax4 / vavrg4, and the 2-way forms.
+      OpVideoSimd op;
+      op.lanes = op0.back() == '4' ? 4u : 2u;
+      const std::string base = op0.substr(1, op0.size() - 2);
+      if (base == "add") op.op = VideoOp::Add;
+      else if (base == "sub") op.op = VideoOp::Sub;
+      else if (base == "absdiff") op.op = VideoOp::AbsDiff;
+      else if (base == "min") op.op = VideoOp::Min;
+      else if (base == "max") op.op = VideoOp::Max;
+      else if (base == "avrg") op.op = VideoOp::Avrg;
+      else return unsupported("SIMD video op '" + op0 + "'");
+      std::vector<std::string> tys;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        if (parts[i] == "sat") { op.sat = true; continue; }
+        // The secondary-operation forms fold the lanes into a scalar with c,
+        // which is a different instruction wearing the same name.
+        if (parts[i] == "add" || parts[i] == "min" || parts[i] == "max")
+          return unsupported(op0 + " with a secondary '." + parts[i] + "' operation");
+        tys.push_back(parts[i]);
+      }
+      if (tys.size() != 3) return unsupported(op0 + " form (expected .dtype.atype.btype)");
+      auto sgn = [](const std::string& t) { return !t.empty() && t[0] == 's'; };
+      op.d_signed = sgn(tys[0]);
+      op.a_signed = sgn(tys[1]);
+      op.b_signed = sgn(tys[2]);
+      op.dst = expect_reg_operand(op0 + " destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      // The byte/halfword selector forms pick which lane of the source each
+      // lane reads. Nothing emits them here yet, and guessing at the selection
+      // would silently permute the result.
+      if (peek_punct(".")) return unsupported(op0 + " with a lane selector");
+      expect_punct(",");
+      op.b = parse_operand();
+      if (peek_punct(".")) return unsupported(op0 + " with a lane selector");
+      expect_punct(",");
+      op.c = parse_operand();
+      ins.op = op;
+    } else if (op0 == "bfind") {
+      OpBfind op;
+      size_t ti = 1;
+      if (parts.size() > 1 && parts[1] == "shiftamt") { op.shiftamt = true; ti = 2; }
+      if (ti >= parts.size()) return unsupported("bfind form (expected bfind[.shiftamt].type)");
+      auto bty = parse_type_token(parts[ti]);
+      if (!bty || (bty->bits != 32 && bty->bits != 64))
+        return unsupported("bfind type '." + parts[ti] + "' (only 32- and 64-bit)");
+      op.ty = *bty;
+      op.dst = expect_reg_operand("bfind destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "elect") {
+      if (parts.size() != 2 || parts[1] != "sync")
+        return unsupported("elect form (expected elect.sync)");
+      OpElect op;
+      // The syntax is "d|p" or just "|p": the leader's lane id, the predicate,
+      // or both. A bare "|" means only the predicate is wanted.
+      if (!peek_punct("|")) op.dst = expect_reg_operand("elect destination");
+      if (peek_punct("|")) {
+        next();
+        op.pred_dst = expect_reg_operand("elect predicate destination");
+      }
+      expect_punct(",");
+      op.membermask = parse_operand();
+      ins.op = op;
+    } else if (op0 == "isspacep") {
+      if (parts.size() != 2) return unsupported("isspacep form (expected isspacep.space)");
+      OpIsSpacep op;
+      if (parts[1] == "global") op.space = Space::Global;
+      else if (parts[1] == "shared") op.space = Space::Shared;
+      else if (parts[1] == "local") op.space = Space::Local;
+      else if (parts[1] == "const") op.space = Space::Global;
+      else return unsupported("isspacep space '." + parts[1] + "'");
+      op.dst = expect_reg_operand("isspacep destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "griddepcontrol" || op0 == "setmaxnreg") {
+      // Both are scheduling directives with no effect on what a kernel
+      // computes. griddepcontrol orders a grid against its predecessor, and
+      // launches here are synchronous, so the predecessor has already finished
+      // by the time this executes -- .wait has nothing to wait for and
+      // .launch_dependents nothing to release. setmaxnreg reshapes a
+      // warpgroup's register budget, and there is no architectural register
+      // file to reshape.
+      while (!at_end() && !peek_punct(";")) next();
+      ins.op = OpNop{};
+    } else if (op0 == "mbarrier") {
+      // mbarrier.<op>[.parity][.space][.sem][.scope].b64 ...
+      OpMbarrier op;
+      bool have_op = false;
+      bool saw_shared = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p2 = parts[i];
+        if (p2 == "init") { op.op = MbarOp::Init; have_op = true; }
+        else if (p2 == "inval") { op.op = MbarOp::Inval; have_op = true; }
+        else if (p2 == "arrive") { op.op = MbarOp::Arrive; have_op = true; }
+        else if (p2 == "arrive_drop") { op.op = MbarOp::ArriveDrop; have_op = true; }
+        else if (p2 == "test_wait") { op.op = MbarOp::TestWait; have_op = true; }
+        else if (p2 == "try_wait") { op.op = MbarOp::TryWait; have_op = true; }
+        else if (p2 == "pending_count") { op.op = MbarOp::PendingCount; have_op = true; }
+        else if (p2 == "parity") op.parity = true;
+        else if (p2 == "shared") saw_shared = true;
+        else if (p2 == "b64") ;
+        else if (inert_mem_modifier(p2)) ;
+        else if (p2 == "expect_tx" || p2 == "complete_tx" || p2 == "noComplete")
+          // Transaction counting exists to pair an mbarrier with a TMA copy:
+          // the barrier waits for a byte count as well as for arrivals.
+          // cp.async.bulk is not implemented, so nothing can ever complete
+          // those bytes, and a barrier that waits on them would hang rather
+          // than be wrong -- which is still worse than saying so here.
+          return unsupported("mbarrier." + p2 + " (transaction counting needs cp.async.bulk/TMA, "
+                             "which is not implemented)");
+        else return unsupported("mbarrier modifier '." + p2 + "'");
+      }
+      if (!have_op) return unsupported("mbarrier form");
+      (void)saw_shared;  // an mbarrier is a shared object whether or not it says so
+      // init and inval take no destination; everything else writes one.
+      if (op.op != MbarOp::Init && op.op != MbarOp::Inval) {
+        op.dst = expect_reg_operand("mbarrier destination");
+        expect_punct(",");
+      }
+      op.addr = parse_addr(fn);
+      if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
+        return unsupported("mbarrier through a parameter/slot name");
+      if (peek_punct(",")) {
+        next();
+        if (op.op == MbarOp::TestWait || op.op == MbarOp::TryWait) {
+          op.state = parse_operand();
+          op.have_state = true;
+        } else {
+          op.count = parse_operand();
+          op.have_count = true;
+        }
+      }
+      if (op.op == MbarOp::Init && !op.have_count)
+        return unsupported("mbarrier.init without an expected arrival count");
+      ins.op = op;
+    } else if (op0 == "match") {
+      // match.any.sync.b32 d, a, membermask
+      // match.all.sync.b32 d|p, a, membermask
+      if (parts.size() != 4 || parts[2] != "sync")
+        return unsupported("match form (expected match.{any,all}.sync.b{32,64})");
+      OpMatch op;
+      if (parts[1] == "any") op.all = false;
+      else if (parts[1] == "all") op.all = true;
+      else return unsupported("match mode '." + parts[1] + "'");
+      auto mty = parse_type_token(parts[3]);
+      if (!mty || (mty->bits != 32 && mty->bits != 64))
+        return unsupported("match type '." + parts[3] + "' (only .b32 and .b64)");
+      op.dst = expect_reg_operand("match destination");
+      if (op.all && peek_punct("|")) {
+        next();
+        op.pred_dst = expect_reg_operand("match.all predicate destination");
+      }
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.membermask = parse_operand();
+      ins.op = op;
+    } else if (op0 == "mul24") {
+      if (parts.size() != 3 || (parts[1] != "lo" && parts[1] != "hi"))
+        return unsupported("mul24 form (expected mul24.{lo,hi}.{u32,s32})");
+      OpMul24 op;
+      op.hi = parts[1] == "hi";
+      if (parts[2] == "s32") op.is_signed = true;
+      else if (parts[2] != "u32") return unsupported("mul24 type '." + parts[2] + "'");
+      op.dst = expect_reg_operand("mul24 destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      ins.op = op;
+    } else if (op0 == "szext") {
+      if (parts.size() != 3 || (parts[1] != "clamp" && parts[1] != "wrap"))
+        return unsupported("szext form (expected szext.{clamp,wrap}.{u32,s32})");
+      OpSzext op;
+      op.wrap = parts[1] == "wrap";
+      if (parts[2] == "s32") op.is_signed = true;
+      else if (parts[2] != "u32") return unsupported("szext type '." + parts[2] + "'");
+      op.dst = expect_reg_operand("szext destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      ins.op = op;
+    } else if (op0 == "fns") {
+      if (parts.size() != 2 || parts[1] != "b32")
+        return unsupported("fns form (expected fns.b32)");
+      OpFns op;
+      op.dst = expect_reg_operand("fns destination");
+      expect_punct(",");
+      op.mask = parse_operand();
+      expect_punct(",");
+      op.base = parse_operand();
+      expect_punct(",");
+      op.offset = parse_operand();
+      ins.op = op;
+    } else if (op0 == "vabsdiff") {
+      // The scalar form is |a-b|+c, which is sad's definition, so it shares
+      // the node. The SIMD forms (vabsdiff2/vabsdiff4) split the operands into
+      // halves or bytes and are a different instruction with a similar name.
+      if (parts.size() != 4) return unsupported("vabsdiff form (expected vabsdiff.dtype.atype.btype)");
+      OpSad op;
+      auto vty = parse_type_token(parts[1]);
+      if (!vty) return unsupported("vabsdiff type '." + parts[1] + "'");
+      op.ty = *vty;
+      op.dst = expect_reg_operand("vabsdiff destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      expect_punct(",");
+      op.c = parse_operand();
+      ins.op = op;
+    } else if (op0 == "lop3") {
+      // lop3.b32 d, a, b, c, immLut
+      if (parts.size() < 2 || parts[1] != "b32") return unsupported("lop3 form (only lop3.b32)");
+      OpLop3 op;
+      op.dst = expect_reg_operand("lop3 destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      expect_punct(",");
+      op.c = parse_operand();
+      expect_punct(",");
+      op.lut = static_cast<uint8_t>(expect_int("lop3 immLut"));
+      ins.op = op;
+    } else if (op0 == "slct") {
+      // slct.dtype.stype d, a, b, c. Only the selector's type matters to the
+      // comparison; the data type just says how wide the result is.
+      if (parts.size() != 3) return unsupported("slct form (expected slct.dtype.stype)");
+      OpSlct op;
+      auto slct_ty = parse_type_token(parts[1]);
+      if (!slct_ty) return unsupported("slct data type '." + parts[1] + "'");
+      op.ty = *slct_ty;
+      if (parts[2] == "s32") op.c_is_float = false;
+      else if (parts[2] == "f32") op.c_is_float = true;
+      else return unsupported("slct selector type '." + parts[2] + "' (only .s32 and .f32)");
+      op.dst = expect_reg_operand("slct destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      expect_punct(",");
+      op.c = parse_operand();
+      ins.op = op;
+    } else if (op0 == "testp") {
+      if (parts.size() != 3) return unsupported("testp form (expected testp.op.ftype)");
+      OpTestp op;
+      if (parts[1] == "finite") op.op = TestpOp::Finite;
+      else if (parts[1] == "infinite") op.op = TestpOp::Infinite;
+      else if (parts[1] == "number") op.op = TestpOp::Number;
+      else if (parts[1] == "notanumber") op.op = TestpOp::NotANumber;
+      else if (parts[1] == "normal") op.op = TestpOp::Normal;
+      else if (parts[1] == "subnormal") op.op = TestpOp::Subnormal;
+      else return unsupported("testp predicate '." + parts[1] + "'");
+      auto testp_ty = parse_type_token(parts[2]);
+      if (!testp_ty || !testp_ty->is_float() ||
+          (testp_ty->bits != 32 && testp_ty->bits != 64))
+        return unsupported("testp type '." + parts[2] + "' (only .f32 and .f64)");
+      op.ty = *testp_ty;
+      op.dst = expect_reg_operand("testp destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      ins.op = op;
+    } else if (op0 == "sad") {
+      if (parts.size() != 2) return unsupported("sad form (expected sad.type)");
+      OpSad op;
+      auto sad_ty = parse_type_token(parts[1]);
+      if (!sad_ty) return unsupported("sad type '." + parts[1] + "'");
+      op.ty = *sad_ty;
+      op.dst = expect_reg_operand("sad destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      expect_punct(",");
+      op.c = parse_operand();
+      ins.op = op;
+    } else if (op0 == "prefetch" || op0 == "prefetchu" || op0 == "createpolicy" ||
+               op0 == "applypriority" || op0 == "discard") {
+      // Cache-management hints. Every one of these says where data should be
+      // kept or how long, and nothing about what a load returns -- the same
+      // reason .L2::128B and .lu are already dropped. There is no cache model
+      // here, so honouring them and ignoring them produce identical results,
+      // and refusing the kernel over one would fail it for a performance note.
+      //
+      // createpolicy writes a register (the policy handle), so it cannot be
+      // skipped outright: an unwritten destination would be read later and
+      // diagnosed as read-before-write. It gets a zero handle, which is what a
+      // policy nothing consults is worth.
+      if (op0 == "createpolicy") {
+        OpMov mv;
+        mv.ty = Type{Type::Kind::B, 64};
+        mv.dst = expect_reg_operand("createpolicy destination");
+        mv.src = ImmInt{0};
+        ins.op = mv;
+        while (!at_end() && !peek_punct(";")) next();
+      } else {
+        while (!at_end() && !peek_punct(";")) next();
+        ins.op = OpNop{};
+      }
     } else if (op0 == "shf") {
       // shf.{l,r}.{wrap,clamp}.b32 d, a, b, c — funnel shift of b:a.
       if (parts.size() != 4 || (parts[1] != "l" && parts[1] != "r") ||
@@ -1426,12 +2128,15 @@ class Parser {
       expect_punct(",");
       op.c = parse_operand();
       ins.op = op;
-    } else if (op0 == "atom") {
+    } else if (op0 == "atom" || op0 == "red") {
       // atom[.space][.sem][.scope].<op>.<type> d, [a], b [, c]
+      // red[.space][.sem][.scope].<op>.<type>    [a], b        -- same, no d.
+      const bool discards = (op0 == "red");
       Space space = Space::Generic;
       std::optional<AtomOp> aop;
       Type ty{};
       bool have_ty = false;
+      bool packed_half = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "global") space = Space::Global;
@@ -1445,6 +2150,10 @@ class Parser {
         else if (p == "xor") aop = AtomOp::Xor;
         else if (p == "exch") aop = AtomOp::Exch;
         else if (p == "cas") aop = AtomOp::Cas;
+        else if (p == "inc") aop = AtomOp::Inc;
+        else if (p == "dec") aop = AtomOp::Dec;
+        else if (p == "f16x2") { ty = Type{Type::Kind::F, 16}; have_ty = true; packed_half = true; }
+        else if (p == "bf16x2") { ty = Type{Type::Kind::BF, 16}; have_ty = true; packed_half = true; }
         else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
@@ -1456,21 +2165,32 @@ class Parser {
       // ML work. CUDA exposes add/exch/min/max on float and double; the
       // bitwise ops and CAS are integer-only there too, and a program that
       // wants CAS on a float does it through .b32.
+      if ((*aop == AtomOp::Inc || *aop == AtomOp::Dec) &&
+          !(ty.kind == Type::Kind::U && ty.bits == 32))
+        return unsupported("atom.inc/.dec are defined for .u32 only");
       if (ty.is_float()) {
         if (*aop != AtomOp::Add && *aop != AtomOp::Exch && *aop != AtomOp::Min &&
             *aop != AtomOp::Max)
           return unsupported("atom." + std::string(*aop == AtomOp::Cas ? "cas" : "bitwise") +
                              " on a float type (CUDA has no such instruction; use .b32)");
-        if (ty.bits != 32 && ty.bits != 64)
-          return unsupported("float atomics are implemented for f32 and f64; f16/bf16 atomics "
-                             "are not yet");
+        if (ty.bits == 16 && *aop != AtomOp::Add)
+          return unsupported("only atom.add is defined for f16/bf16");
+        if (ty.bits != 16 && ty.bits != 32 && ty.bits != 64)
+          return unsupported("float atomics are implemented for f16, bf16, f32 and f64");
       }
+      if (discards && *aop == AtomOp::Cas)
+        return unsupported("red.cas (a compare-and-swap whose result is discarded "
+                           "cannot report whether it swapped)");
       OpAtom op;
       op.op = *aop;
       op.ty = ty;
       op.space = space;
-      op.dst = expect_reg_operand("atom destination");
-      expect_punct(",");
+      op.discards_result = discards;
+      op.packed_half = packed_half;
+      if (!discards) {
+        op.dst = expect_reg_operand("atom destination");
+        expect_punct(",");
+      }
       op.addr = parse_addr(fn);
       if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
         return unsupported("atom through a parameter/slot name");
@@ -1488,6 +2208,7 @@ class Parser {
       const bool carry_in = (op0 == "addc" || op0 == "subc");
       const std::string base_op = carry_in ? op0.substr(0, 3) : op0;
       bool carry_out = false;
+      bool nan_propagate = false;
       bool wide = false, lo = false, hi = false;
       FRound frnd = FRound::Nearest;
       Type ty{};
@@ -1509,6 +2230,14 @@ class Parser {
         // same policy the SFU transcendentals already follow: correct to better
         // than hardware, never bit-identical to it.
         else if (p == "approx" || p == "full") ;
+        // min.NaN/max.NaN propagate a NaN operand instead of returning the
+        // other one. That is exactly what fmin/fmax do NOT do, so it cannot be
+        // dropped -- it is handled at execution, and recorded here.
+        else if (p == "NaN") nan_propagate = true;
+        // .xorsign.abs takes the magnitude and xors the signs; a semantic
+        // change rather than an accuracy one.
+        else if (p == "xorsign" || p == "abs")
+          return unsupported("modifier '." + p + "' on " + op0 + " is not implemented");
         // .sat clamps the result into [0,1]. That is a semantic change, not an
         // accuracy one, so ignoring it would silently produce wrong numbers.
         else if (p == "sat")
@@ -1532,6 +2261,7 @@ class Parser {
         ins.op = op;
         expect_punct(";");
         ins.text = reconstruct_from(start_tok);
+        ins.opcode_id = intern_opcode(parts[0]);
         return ins;
       }
       if (ty.kind == Type::Kind::Pred) {
@@ -1560,6 +2290,7 @@ class Parser {
         OpFloatBin op;
         op.round = frnd;
         op.op = it->second;
+        op.nan_propagate = nan_propagate;
         op.ty = ty;
         op.dst = expect_reg_operand("destination");
         expect_punct(",");
@@ -1647,23 +2378,42 @@ class Parser {
         if (!lo) return unsupported("integer mad requires .lo or .wide");
         ins.op = OpMadLo{ty, dst, a, b, c, carry_in, carry_out};
       }
+    } else if (op0 == "set") {
+      // set.<cmp>[.ftz].<dtype>.<stype> d, a, b
+      std::vector<std::string> ps = parts;
+      for (size_t i = 2; i < ps.size();)
+        if (ps[i] == "ftz") ps.erase(ps.begin() + i); else ++i;
+      if (ps.size() != 4) return unsupported("set form (expected set.<cmp>.<dtype>.<stype>)");
+      auto it = cmp_table().find(ps[1]);
+      if (it == cmp_table().end()) return unsupported("comparison '." + ps[1] + "'");
+      OpSet op;
+      op.cmp = it->second;
+      auto dt = ps[2] == "f16x2"  ? std::optional<Type>{Type{Type::Kind::F, 16}}
+              : ps[2] == "bf16x2" ? std::optional<Type>{Type{Type::Kind::BF, 16}}
+                                  : parse_type_token(ps[2]);
+      auto st = ps[3] == "f16x2"  ? std::optional<Type>{Type{Type::Kind::F, 16}}
+              : ps[3] == "bf16x2" ? std::optional<Type>{Type{Type::Kind::BF, 16}}
+                                  : parse_type_token(ps[3]);
+      if (!dt || !st) return unsupported("set types '." + ps[2] + "." + ps[3] + "'");
+      const bool dpack = ps[2] == "f16x2" || ps[2] == "bf16x2";
+      const bool spack = ps[3] == "f16x2" || ps[3] == "bf16x2";
+      if (dpack != spack)
+        return unsupported("set with only one side packed ('." + ps[2] + "." + ps[3] + "')");
+      op.dty = *dt;
+      op.sty = *st;
+      op.packed = dpack;
+      op.dst = expect_reg_operand("set destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      ins.op = op;
     } else if (op0 == "setp") {
       // setp.<cmp>[.ftz].<type> — drop the flush-to-zero qualifier.
       if (parts.size() == 4 && parts[2] == "ftz") parts.erase(parts.begin() + 2);
       if (parts.size() != 3) return unsupported("setp form (only setp.<cmp>.<type> is implemented)");
-      static const std::unordered_map<std::string, CmpOp> cmps = {
-          {"eq", CmpOp::Eq},   {"ne", CmpOp::Ne},   {"lt", CmpOp::Lt},
-          {"le", CmpOp::Le},   {"gt", CmpOp::Gt},   {"ge", CmpOp::Ge},
-          // Unsigned integer forms share the ordered comparators; the operand
-          // type already selects signed vs unsigned interpretation.
-          {"lo", CmpOp::Lt},   {"ls", CmpOp::Le},   {"hi", CmpOp::Gt},
-          {"hs", CmpOp::Ge},
-          // Float unordered (NaN-true) forms and the NaN tests.
-          {"equ", CmpOp::Equ}, {"neu", CmpOp::Neu}, {"ltu", CmpOp::Ltu},
-          {"leu", CmpOp::Leu}, {"gtu", CmpOp::Gtu}, {"geu", CmpOp::Geu},
-          {"num", CmpOp::Num}, {"nan", CmpOp::Nan}};
-      auto it = cmps.find(parts[1]);
-      if (it == cmps.end()) return unsupported("comparison '." + parts[1] + "'");
+      auto it = cmp_table().find(parts[1]);
+      if (it == cmp_table().end()) return unsupported("comparison '." + parts[1] + "'");
       auto ty = parse_type_token(parts[2]);
       if (!ty) fail(ins.line, "setp missing type");
       OpSetp op;
@@ -1702,7 +2452,13 @@ class Parser {
         expect_punct(")");
         expect_punct(",");
       }
-      op.callee = expect_word("call target");
+      // The target is either a name or a register holding a function address.
+      if (peek().kind == Token::Kind::Word && !peek().text.empty() && peek().text[0] == '%') {
+        op.indirect = true;
+        op.target_reg = expect_reg_operand("indirect call target");
+      } else {
+        op.callee = expect_word("call target");
+      }
       expect_punct(",");
       expect_punct("(");
       while (!peek_punct(")")) {
@@ -1710,8 +2466,13 @@ class Parser {
         if (peek_punct(",")) next();
       }
       next();
-      if (op.callee != "vprintf")
-        return unsupported("call to '" + op.callee + "' (only the vprintf builtin is callable)");
+      // An indirect call names its prototype after the arguments.
+      if (peek_punct(",")) {
+        next();
+        expect_word("call prototype name");
+      }
+      // Whether this names a builtin or a device function defined elsewhere in
+      // the module is settled after parsing, by resolve_calls.
       ins.op = op;
     } else if (op0 == "activemask") {
       OpActiveMask op;
@@ -1816,12 +2577,14 @@ class Parser {
         ins.op = std::move(op);
       }
     } else if (op0 == "membar" || op0 == "fence") {
-      // Blocks execute their instructions in order and device atomics are
-      // serialized by a lock, so every prior write is already visible to
-      // whoever could observe it. There is no reordering here to fence against
-      // -- but a fence is not a barrier, and this used to be OpBar, which made
-      // it wait for every warp in the block.
-      ins.op = OpNop{};
+      // A host memory fence, not a no-op. This used to reason that blocks run
+      // their instructions in order so there was nothing to fence against --
+      // true of one thread, but blocks run on several, and on a weak-memory host
+      // (ARM: Graviton, or a GH200's own Grace) the hardware reorders across
+      // them. CUB's decoupled look-back depends on exactly this fence. It is
+      // still not a barrier: this used to be OpBar, which made it wait for every
+      // warp in the block.
+      ins.op = OpFence{};
     } else if (op0 == "nanosleep") {
       // A backoff hint. Consuming it as a no-op is correct; the operand is a
       // duration nothing here can meaningfully honour.
@@ -1849,16 +2612,32 @@ class Parser {
     } else if (op0 == "cp" && parts.size() > 1 && parts[1] == "async") {
       // The group operations first: they carry no addresses.
       if (parts.size() > 2 && parts[2] == "commit_group") {
-        ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::Commit, 0};
+        OpCpAsyncGroup g;
+        g.kind = OpCpAsyncGroup::Kind::Commit;
+        ins.op = g;
       } else if (parts.size() > 2 && parts[2] == "wait_all") {
-        ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::WaitAll, 0};
+        OpCpAsyncGroup g;
+        g.kind = OpCpAsyncGroup::Kind::WaitAll;
+        ins.op = g;
+      } else if (parts.size() > 3 && parts[2] == "mbarrier" && parts[3] == "arrive") {
+        // cp.async.mbarrier.arrive[.noinc].shared.b64 [bar]
+        OpCpAsyncGroup g;
+        g.kind = OpCpAsyncGroup::Kind::MbarrierArrive;
+        for (size_t i = 4; i < parts.size(); ++i)
+          if (parts[i] == "noinc") g.noinc = true;
+        g.bar = parse_addr(fn);
+        if (g.bar.base_kind == Addr::Base::CallSlot || g.bar.base_kind == Addr::Base::EntryParam)
+          return unsupported("cp.async.mbarrier.arrive through a parameter/slot name");
+        ins.op = g;
       } else if (parts.size() > 2 && parts[2] == "wait_group") {
         Operand n = parse_operand();
         auto* imm = std::get_if<ImmInt>(&n);
         if (!imm || imm->value < 0)
           return unsupported("cp.async.wait_group needs a non-negative immediate");
-        ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::WaitGroup,
-                                static_cast<uint32_t>(imm->value)};
+        OpCpAsyncGroup g;
+        g.kind = OpCpAsyncGroup::Kind::WaitGroup;
+        g.keep = static_cast<uint32_t>(imm->value);
+        ins.op = g;
       } else {
         // cp.async.<ca|cg>.shared.global [dst], [src], cp-size{, src-size};
         bool cg = false, ca = false, shared_seen = false, global_seen = false;
@@ -1868,7 +2647,6 @@ class Parser {
           else if (p == "ca") ca = true;
           else if (p == "shared") shared_seen = true;
           else if (p == "global") global_seen = true;
-          else if (p == "mbarrier") return unsupported("cp.async.mbarrier");
           else return unsupported("cp.async modifier '." + p + "'");
         }
         if (!shared_seen || !global_seen)

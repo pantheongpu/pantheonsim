@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -245,6 +246,144 @@ VTEST(null_host_pointers_are_diagnosed_not_dereferenced) {
   auto r = VCAPTURE(Error, mem.read(p, nullptr, 8));
   VCHECK(r.code() == Err::InvalidPointer);
   VCHECK_CONTAINS(r.what(), "NULL host pointer");
+}
+
+// ---- managed memory ----
+//
+// One buffer the host dereferences directly and a kernel also addresses. Every
+// other device pointer here is a virtual address with no host meaning, which
+// is why cudaMallocManaged used to refuse; a managed buffer is real host
+// memory put on the device's map.
+
+VTEST(a_mapped_host_buffer_is_readable_and_writable_from_the_device_side) {
+  MemoryManager mem(1 << 20);
+  std::vector<uint32_t> host(64, 0);
+  const uint64_t addr = reinterpret_cast<uint64_t>(host.data());
+  mem.map_host(addr, host.data(), host.size() * sizeof(uint32_t));
+
+  // The device side writes; the host sees it without a copy.
+  mem.store_scalar(addr + 4 * 4, 4, 0xABCDu);
+  VCHECK_EQ(host[4], 0xABCDu);
+  // The host writes; the device side sees it without a copy.
+  host[9] = 0x1234u;
+  VCHECK_EQ(mem.load_scalar(addr + 9 * 4, 4), uint64_t{0x1234u});
+
+  mem.unmap_host(addr);
+}
+
+VTEST(a_mapped_buffer_is_owned_by_the_device_even_outside_its_window) {
+  // owns() is what decides whether a pointer is treated as device memory, and
+  // a managed buffer lives at its real host address -- outside every device
+  // VA window -- while still being device-addressable.
+  MemoryManager mem(1 << 20);
+  std::vector<uint32_t> host(16, 0);
+  const uint64_t addr = reinterpret_cast<uint64_t>(host.data());
+  VCHECK(!mem.owns(addr));
+  mem.map_host(addr, host.data(), host.size() * sizeof(uint32_t));
+  VCHECK(mem.owns(addr));
+  VCHECK(mem.is_host_mapped(addr));
+  mem.unmap_host(addr);
+  // And once unmapped it is not device memory again, so a kernel cannot reach
+  // a pointer the process has given back to the allocator.
+  VCHECK(!mem.owns(addr));
+  VCHECK(!mem.is_host_mapped(addr));
+}
+
+VTEST(ordinary_device_memory_is_unaffected_by_a_mapping_existing) {
+  // The mapped-range check sits on the read and write path, so it has to be
+  // invisible to everything that is not managed.
+  MemoryManager mem(1 << 20);
+  std::vector<uint32_t> host(16, 7);
+  const uint64_t mapped = reinterpret_cast<uint64_t>(host.data());
+  mem.map_host(mapped, host.data(), host.size() * sizeof(uint32_t));
+
+  const uint64_t dev = mem.alloc(256);
+  mem.store_scalar(dev, 4, 0x5555u);
+  VCHECK_EQ(mem.load_scalar(dev, 4), uint64_t{0x5555u});
+  VCHECK_EQ(host[0], 7u);  // untouched by the device-memory write
+  mem.free(dev);
+  mem.unmap_host(mapped);
+}
+
+// Blocks run on several host threads and may share global memory: CUB's
+// decoupled look-back publishes a block's prefix for later blocks to spin on.
+// A kernel's aligned scalar access is atomic on a GPU, so it must be here --
+// never half of one store and half of another. Under ThreadSanitizer this is
+// also the check that the access is not a data race.
+VTEST(concurrent_scalar_accesses_are_never_torn) {
+  MemoryManager mm(1 << 20);
+  const uint64_t p = mm.alloc(64);
+  mm.store_scalar(p, 8, 0);
+  constexpr uint64_t kA = 0, kB = ~0ull;
+  constexpr int kIters = 20000;
+  std::atomic<bool> torn{false};
+  std::thread writer([&] {
+    for (int i = 0; i < kIters; ++i) mm.store_scalar(p, 8, (i & 1) ? kB : kA);
+  });
+  std::thread reader([&] {
+    for (int i = 0; i < kIters; ++i) {
+      const uint64_t v = mm.load_scalar(p, 8);
+      if (v != kA && v != kB) torn = true;
+    }
+  });
+  writer.join();
+  reader.join();
+  VCHECK(!torn.load());
+  mm.free(p);
+}
+
+// The look-back pattern itself: one block writes its aggregate, fences, and
+// sets a flag; another spins on the flag, fences, and must then see the
+// aggregate. The fences are the kernel's (membar.gl / fence.acq_rel).
+VTEST(a_fenced_flag_publishes_the_data_written_before_it) {
+  MemoryManager mm(1 << 20);
+  const uint64_t data = mm.alloc(64), flag = mm.alloc(64);
+  std::thread producer([&] {
+    mm.store_scalar(data, 4, 0x1234abcd);
+    std::atomic_thread_fence(std::memory_order_release);
+    mm.store_scalar(flag, 4, 1);
+  });
+  uint64_t seen = 0;
+  std::thread consumer([&] {
+    while (mm.load_scalar(flag, 4) == 0) std::this_thread::yield();
+    std::atomic_thread_fence(std::memory_order_acquire);
+    seen = mm.load_scalar(data, 4);
+  });
+  producer.join();
+  consumer.join();
+  VCHECK_EQ(seen, uint64_t{0x1234abcd});
+  mm.free(data);
+  mm.free(flag);
+}
+
+// Two blocks storing into the same untouched chunk at once both materialize
+// it. Only one copy survives, and neither store may land in the discarded one.
+VTEST(first_stores_racing_into_a_fresh_chunk_both_survive) {
+  for (int round = 0; round < 200; ++round) {
+    MemoryManager mm(1 << 20);
+    const uint64_t p = mm.alloc(4096);
+    std::thread a([&] { mm.store_scalar(p, 8, 0xAAAAAAAAAAAAAAAAull); });
+    std::thread b([&] { mm.store_scalar(p + 2048, 8, 0xBBBBBBBBBBBBBBBBull); });
+    a.join();
+    b.join();
+    VCHECK_EQ(mm.load_scalar(p, 8), 0xAAAAAAAAAAAAAAAAull);
+    VCHECK_EQ(mm.load_scalar(p + 2048, 8), 0xBBBBBBBBBBBBBBBBull);
+  }
+}
+
+// A load from memory nothing has written reads zero without creating backing
+// storage; only a store materializes.
+VTEST(a_scalar_load_of_untouched_memory_is_zero_and_allocates_nothing) {
+  MemoryManager mm(1 << 20);
+  const uint64_t p = mm.alloc(1 << 16);
+  VCHECK_EQ(mm.load_scalar(p + 8, 8), uint64_t{0});
+  VCHECK_EQ(mm.load_scalar(p + 3, 1), uint64_t{0});
+  VCHECK_EQ(mm.resident_bytes(), uint64_t{0});
+  mm.store_scalar(p + 6, 2, 0xbeef);
+  VCHECK_EQ(mm.load_scalar(p + 6, 2), uint64_t{0xbeef});
+  VCHECK_EQ(mm.load_scalar(p + 4, 4), uint64_t{0xbeef0000});
+  VCHECK_EQ(mm.resident_bytes(), vgpu::kChunkSize);
+  mm.free(p);
 }
 
 VTEST_MAIN

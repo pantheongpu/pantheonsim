@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <utility>
 #include "vgpu/runtime/runtime.hpp"
 
 #include <chrono>
@@ -48,6 +50,11 @@ uint64_t Device::load_module(const std::string& ptx_src) {
       lm.symbols[g.name] = va;
       lm.global_vas.push_back(va);
     }
+    // Device functions get an address so a function pointer can be stored in a
+    // global, loaded and called. The address encodes the index, which is what
+    // an indirect call decodes to find the function again.
+    for (size_t i = 0; i < mod->funcs.size(); ++i)
+      lm.symbols[mod->funcs[i]->name] = kFuncVaBase + i * kFuncVaStride;
     // Second pass: a global initialised with another symbol's address can only
     // be filled in once every global has one. A symbol that names a kernel
     // rather than a variable has no address in this model and stays zero --
@@ -55,12 +62,15 @@ uint64_t Device::load_module(const std::string& ptx_src) {
     // uses it to carry a mangled name (which is what NVRTC's name expressions
     // compile to) never dereferences it.
     for (const auto& g : mod->globals) {
-      if (g.init_symbol.empty()) continue;
-      auto it = lm.symbols.find(g.init_symbol);
-      const uint64_t target = it == lm.symbols.end() ? 0 : it->second;
+      if (g.init_symbols.empty()) continue;
       const uint64_t slot = lm.symbols[g.name];
-      const uint64_t bytes = g.size < sizeof(uint64_t) ? g.size : sizeof(uint64_t);
-      mem_.write(slot, &target, bytes);
+      for (const auto& si : g.init_symbols) {
+        auto it = lm.symbols.find(si.name);
+        const uint64_t target = it == lm.symbols.end() ? 0 : it->second;
+        const uint64_t room = g.size > si.offset ? g.size - si.offset : 0;
+        const uint64_t bytes = room < sizeof(uint64_t) ? room : sizeof(uint64_t);
+        if (bytes) mem_.write(slot + si.offset, &target, bytes);
+      }
     }
     lm.mod = std::move(mod);
     uint64_t id = lm.id;
@@ -192,6 +202,24 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
                (unsigned long long)cls(exec::InstClass::Tensor),
                (unsigned long long)cls(exec::InstClass::Misc),
                (unsigned long long)st.tensor_instructions);
+
+  // Per-opcode issues, most-used first. The class histogram says a kernel is
+  // memory-heavy; this says it is memory-heavy because of ld.global.nc, which
+  // is the difference between a number and a lead. Truncated because a long
+  // tail of ones is noise, and the total says what was left out.
+  const auto& names = ptx::opcode_names();
+  std::vector<std::pair<uint64_t, std::string>> ops;
+  for (size_t i = 1; i < st.inst_by_opcode.size() && i < names.size(); ++i)
+    if (st.inst_by_opcode[i]) ops.emplace_back(st.inst_by_opcode[i], names[i]);
+  if (!ops.empty()) {
+    std::sort(ops.begin(), ops.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string line = "    by opcode";
+    const size_t show = std::min<size_t>(ops.size(), 10);
+    for (size_t i = 0; i < show; ++i)
+      line += " " + ops[i].second + "=" + std::to_string(ops[i].first);
+    if (ops.size() > show) line += "  (+" + std::to_string(ops.size() - show) + " more)";
+    std::fprintf(stderr, "%s\n", line.c_str());
+  }
 }
 
 }  // namespace

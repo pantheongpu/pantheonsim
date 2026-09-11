@@ -37,6 +37,7 @@ set(VGPU_PROFILES
   nvidia/t4
   nvidia/a10g
   nvidia/l4
+  nvidia/l40s
   amd/mi300x
   amd/mi325x
   amd/mi350x
@@ -63,6 +64,7 @@ add_library(vgpu STATIC
   src/core/memory.cpp
   src/core/telemetry.cpp
   src/core/profiling.cpp
+  src/core/faults.cpp
   src/ptx/ast.cpp
   src/ptx/lexer.cpp
   src/ptx/parser.cpp
@@ -402,7 +404,7 @@ else()
 endif()
 
 # CLI
-add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp)
+add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/test.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
 # Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /
@@ -430,6 +432,7 @@ endfunction()
 
 vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_profile)
+vgpu_unit_test(test_driver_version)
 vgpu_unit_test(test_memory)
 vgpu_unit_test(test_ptx)
 target_compile_definitions(test_ptx PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR}/tests/kernels")
@@ -452,6 +455,31 @@ target_link_libraries(vector_add_driver PRIVATE vgpucuda)
 target_include_directories(vector_add_driver PRIVATE include)
 add_test(NAME c_harness_vector_add COMMAND vector_add_driver)
 set_tests_properties(c_harness_vector_add PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100")
+
+# nvidia-smi's table is scraped positionally by real tooling, so its geometry
+# is pinned against a physical driver's output rather than left to drift.
+add_test(NAME smi_format COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_smi_format.sh)
+set_tests_properties(smi_format PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+
+# With no `unshare`, vgpu shell must not touch the host's mounts.
+add_test(NAME isolation_fallback COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_isolation_fallback.sh)
+set_tests_properties(isolation_fallback PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+
+# VGPU_QUIET=1 silences and nothing else does. Skips itself without the cuFFT shim.
+add_test(NAME quiet_semantics COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_quiet.sh)
+set_tests_properties(quiet_semantics PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+
+# The simulator's reports agree with each other and with real cards: one CUDA
+# version across the driver API, the runtime API and nvidia-smi; and two memory
+# totals, framebuffer and totalGlobalMem, that differ by the card's reserve.
+if(TARGET vgpucudart)
+  add_test(NAME driver_version COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_driver_version.sh)
+  set_tests_properties(driver_version PROPERTIES DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+  add_test(NAME memory_totals COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_memory_totals.sh)
+  set_tests_properties(memory_totals PROPERTIES DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+endif()
 
 # End-to-end: an nvcc-compiled CUDA app run through libvgpucudart. Depends on
 # the runtime shim; only meaningful when it was built (CUDA headers present).
@@ -501,6 +529,82 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_mma_layout
            COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_mma_layout.sh)
   set_tests_properties(e2e_mma_layout PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # bf16 arithmetic, half2 atomics and labeled_partition, through nvcc. The
+  # unit tests feed hand-written PTX; a compiler emits forms a hand-written
+  # test never thinks to write, and this is what catches the difference. It
+  # already has: nvcc lowers labeled_partition through bfind.shiftamt, which
+  # nothing else here would have asked for.
+  # A full 16x16x16 matmul through the public WMMA API: load both operands and
+  # the accumulator, mma, store. The fragment layout is opaque by design -- the
+  # only observable contract is the product -- so this checks it against a host
+  # reference rather than against a register assignment.
+  add_test(NAME e2e_wmma_gemm
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_wmma_gemm.sh)
+  set_tests_properties(e2e_wmma_gemm PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # Intrinsics and builtins the PTX probe turned up: atomicInc/Dec's wrapping,
+  # the per-byte SIMD video ops, device malloc/free, the half2 math family
+  # (whose inline asm declares ".reg.b16" with no space), and a device assert
+  # reporting cudaErrorAssert with its message through cudaDeviceSynchronize.
+  # Non-inlined device functions -- a real call frame, with divergence inside
+  # the callee and recursion, which cannot be inlined at all.
+  # __constant__ and __device__ variables written and read from the host. The
+  # kernel side needs ld.const; the host side needs the symbol API, which
+  # __cudaRegisterVar has to feed.
+  # The same programs built with -rdc=true. A separately compiled build takes a
+  # different loading path entirely -- an empty primary fatbin plus a list of
+  # relocatable ones the runtime has to link -- so any of these failing here
+  # and passing normally means the linking is wrong, not the program.
+  # Thrust and CUB device-level algorithms, unmodified. Neither is a thin
+  # wrapper -- a radix sort is a tuned multi-kernel pipeline with its own
+  # temporary storage, decoupled look-back scan and warp primitives throughout
+  # -- so running them end to end exercises far more than a hand-written kernel
+  # does, and the answer is checked rather than the launch's return code.
+  add_test(NAME e2e_libraries
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_libraries.sh)
+  set_tests_properties(e2e_libraries PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
+  add_test(NAME e2e_rdc_link
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_rdc_link.sh)
+  set_tests_properties(e2e_rdc_link PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_symbols
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_symbols.sh)
+  set_tests_properties(e2e_symbols PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_device_functions
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_device_functions.sh)
+  set_tests_properties(e2e_device_functions PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_device_intrinsics
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_device_intrinsics.sh)
+  set_tests_properties(e2e_device_intrinsics PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_modern_dtypes
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_modern_dtypes.sh)
+  set_tests_properties(e2e_modern_dtypes PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)

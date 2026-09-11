@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <variant>
@@ -69,6 +70,25 @@ enum class Sreg : uint8_t {
   // A serial number for the launch, distinct from every other launch in the
   // process.
   GridId,
+  // Thread-block clusters (sm_90 and later). A cluster is a group of CTAs
+  // co-scheduled close enough to address each other's shared memory. This
+  // engine models the *scheduling level* -- which cluster a block is in, where
+  // it sits inside that cluster, and how many there are -- and not the
+  // distributed shared memory, which is a memory-model change and stays
+  // refused (`.shared::cluster`, mapa, cluster barriers).
+  //
+  // These are defined for every launch, not only explicit-cluster ones. PTX
+  // says a grid launched without a cluster dimension behaves as though the
+  // cluster were 1x1x1, so %cluster_ctarank is 0 and %clusterid equals
+  // %ctaid. That is what hardware reports, so it is what these report; a
+  // kernel that reads them outside a cluster launch gets the same answer here
+  // as on an H100 rather than a refusal.
+  ClusterIdX, ClusterIdY, ClusterIdZ,
+  NClusterIdX, NClusterIdY, NClusterIdZ,
+  ClusterCtaIdX, ClusterCtaIdY, ClusterCtaIdZ,
+  ClusterNCtaIdX, ClusterNCtaIdY, ClusterNCtaIdZ,
+  ClusterCtaRank, ClusterNCtaRank,
+  IsExplicitCluster,
 };
 
 // A virtual register reference. `id` is a dense per-kernel index assigned at
@@ -123,12 +143,18 @@ enum class FloatBinOp { Add, Sub, Mul, Min, Max, Div };
 // Ordered comparisons plus the float unordered/NaN-aware forms. The "u"
 // variants are true when either operand is NaN; Num/Nan test NaN-ness only.
 enum class CmpOp { Eq, Ne, Lt, Le, Gt, Ge, Equ, Neu, Ltu, Leu, Gtu, Geu, Num, Nan };
-enum class AtomOp { Add, Min, Max, And, Or, Xor, Exch, Cas };
+// Inc and Dec are not "add 1" and "subtract 1": they wrap against the operand.
+//   inc: old >= val            ? 0   : old + 1
+//   dec: old == 0 || old > val ? val : old - 1
+// which is what makes atomicInc a ring-buffer index and not a counter.
+enum class AtomOp { Add, Min, Max, And, Or, Xor, Exch, Cas, Inc, Dec };
 enum class PredBinOp { And, Or, Xor };
 
 // Vector loads/stores (v2/v4) carry 2 or 4 registers; scalar ops carry 1.
-struct OpLd { Space space = Space::Generic; Type ty; std::vector<Reg> dsts; Addr addr; };
-struct OpSt { Space space = Space::Generic; Type ty; Addr addr; std::vector<Operand> srcs; };
+// acquire/release are kept, not dropped as inert: blocks run on several host
+// threads, so the ordering a kernel asks for has to be real on the host too.
+struct OpLd { Space space = Space::Generic; Type ty; std::vector<Reg> dsts; Addr addr; bool acquire = false; };
+struct OpSt { Space space = Space::Generic; Type ty; Addr addr; std::vector<Operand> srcs; bool release = false; };
 struct OpMov { Type ty; Reg dst; Operand src; };
 // Vector forms of mov used by inline asm to pack/unpack sub-word registers:
 //   mov.b32 %r, {%rs1, %rs2};      pack two 16-bit halves into 32 bits
@@ -157,13 +183,27 @@ struct OpAbs { Type ty; Reg dst; Operand src; };
 // documented approximation tolerance but not bit-identical to a real SFU
 // (a documented divergence — see ARCHITECTURE.md).
 enum class MathOp { Ex2, Lg2, Sin, Cos, Sqrt, Rsqrt, Rcp, Tanh };
-struct OpMath { MathOp op; Type ty; Reg dst; Operand src; };
+// packed is the .f16x2/.bf16x2 form: two independent 16-bit results in one
+// 32-bit register. The type carries which of f16/bf16 the halves are.
+struct OpMath { MathOp op; Type ty; bool packed = false; Reg dst; Operand src; };
 
 // Bitfield extract/insert.
 struct OpBfe { Type ty; Reg dst; Operand a, b, c; };        // b=start, c=len
 struct OpBfi { Type ty; Reg dst; Operand a, b, c, d; };     // insert a into b
 struct OpBrev { Type ty; Reg dst; Operand src; };           // bit reverse
 struct OpPopcClz { bool popc = false; Type ty; Reg dst; Operand src; };
+// bfind.{u32,s32,u64,s64}[.shiftamt] d, a -- the index of the most significant
+// set bit, or 0xFFFFFFFF when there is none. The signed form searches for the
+// most significant bit that differs from the sign, which is what makes it an
+// integer log2 for negative numbers too. .shiftamt reports the distance from
+// the top instead of the index, which is what a normalizing shift wants.
+struct OpBfind { bool shiftamt = false; Type ty; Reg dst; Operand src; };
+// elect.sync d|p, membermask -- names one lane of the member set as leader.
+// Hopper's warp-specialized kernels use it to pick the thread that issues a
+// TMA copy or drives an mbarrier.
+struct OpElect { Reg dst; Reg pred_dst; Operand membermask; };
+// isspacep.<space> p, a -- does this generic address point into that window?
+struct OpIsSpacep { Space space = Space::Global; Reg dst; Operand src; };
 
 // Warp shuffle. `pred_dst` is the optional "d|p" second destination.
 enum class ShflMode { Up, Down, Bfly, Idx };
@@ -220,6 +260,98 @@ struct OpMma {
 // ordinary mov path that writes a 32/64-bit value.
 struct OpMovPred { Reg dst; Operand src; };
 struct OpPrmt { Reg dst; Operand a, b, c; };       // byte permute (default mode)
+// lop3.b32 d, a, b, c, immLut -- an arbitrary three-input boolean function,
+// selected by an 8-bit lookup table. ptxas fuses chains of and/or/xor/not into
+// these, so optimized PTX is full of them: any kernel doing bit manipulation,
+// masking or predicate packing tends to arrive as lop3 rather than as the
+// operations it was written with.
+//
+// immLut is the truth table itself. Bit k of the table is the result when
+// (a,b,c) supply the bits of k, which is why the canonical way to compute it
+// is to evaluate the expression on the constants 0xF0, 0xCC, 0xAA -- and why
+// evaluating it that way at runtime, bit-parallel across all 32 positions at
+// once, is exact rather than a table walk.
+struct OpLop3 { Reg dst; Operand a, b, c; uint8_t lut = 0; };
+// slct.dtype.stype d, a, b, c -- a if c >= 0 else b. The selector is compared
+// as a signed integer or a float depending on stype, and picking the wrong one
+// gets -0.0 backwards.
+struct OpSlct { Type ty; bool c_is_float = false; Reg dst; Operand a, b, c; };
+// testp.op.ftype p, a -- floating-point classification (finite, infinite, nan,
+// number, normal, subnormal). isfinite()/isnan() lower to these.
+enum class TestpOp : uint8_t { Finite, Infinite, Number, NotANumber, Normal, Subnormal };
+struct OpTestp { TestpOp op = TestpOp::Finite; Type ty; Reg dst; Operand a; };
+// sad.type d, a, b, c -- |a-b| + c, the sum-of-absolute-differences step.
+struct OpSad { Type ty; Reg dst; Operand a, b, c; };
+// match.any.sync.b{32,64} d, a, membermask -- the mask of participating lanes
+// whose value of a equals this lane's. CUB and cooperative_groups build
+// value-keyed partitions out of it: labeled_partition() is this instruction.
+// The .all form additionally reports whether every participant agreed, which
+// needs a second destination, so it is parsed separately.
+struct OpMatch { bool all = false; Reg dst; Reg pred_dst; Operand a; Operand membermask; };
+// mul24.{lo,hi}.{u32,s32} d, a, b -- a product of the low 24 bits. A separate
+// instruction rather than a mul with a mask: the hi form takes bits 47:24 of
+// the 48-bit product, which masking the inputs of a 32-bit multiply cannot
+// produce.
+struct OpMul24 { bool hi = false; bool is_signed = false; Reg dst; Operand a, b; };
+// szext.{clamp,wrap}.{u32,s32} d, a, b -- sign- or zero-extend a from bit b.
+struct OpSzext { bool wrap = false; bool is_signed = false; Reg dst; Operand a, b; };
+// fns.b32 d, mask, base, offset -- the position of the n-th set bit of mask,
+// searching from `base`. Returns 0xFFFFFFFF when there is no such bit.
+struct OpFns { Reg dst; Operand mask, base, offset; };
+// mbarrier: the split barrier Ampere introduced and Hopper's pipelines are
+// built on. Unlike bar.sync, arriving and waiting are separate instructions,
+// so a producer warp can signal and carry on while a consumer waits -- which
+// is the whole point, and what cuda::barrier and cuda::pipeline compile to.
+//
+// A barrier holds an expected arrival count and a phase bit. Each arrival
+// decrements what is outstanding; when the last one lands the phase flips and
+// the count reloads. A wait asks whether the phase it captured has completed
+// yet, and answers with a predicate rather than blocking -- so the kernel
+// spins, which is exactly what it does on hardware.
+enum class MbarOp : uint8_t {
+  Init, Inval, Arrive, ArriveDrop, TestWait, TryWait, PendingCount,
+};
+struct OpMbarrier {
+  MbarOp op = MbarOp::Init;
+  bool parity = false;      // the .parity form of test_wait/try_wait
+  Reg dst;                  // arrive's token, a wait's predicate, pending_count's value
+  Addr addr;                // the barrier object, in shared memory
+  Operand count;            // init's expected count, or arrive's increment
+  bool have_count = false;
+  Operand state;            // test_wait's token, or try_wait.parity's parity
+  bool have_state = false;
+};
+// FP8 pack/unpack. The conversions always move a *pair*: PTX has no scalar
+// FP8 type, only e4m3x2/e5m2x2 occupying the low 16 bits of a register.
+//   to_fp8   from f32: cvt.rn.satfinite.e4m3x2.f32   d, a, b   (a high, b low)
+//   to_fp8   from f16: cvt.rn.satfinite.e4m3x2.f16x2 d, a
+//   from_fp8 to   f16: cvt.rn.f16x2.e4m3x2           d, a
+struct OpCvtFp8 {
+  bool e5m2 = false;        // which of the two formats
+  bool to_fp8 = true;       // direction
+  bool src_f32_pair = false;  // the two-source f32 form
+  bool bf16 = false;        // the half side is bf16 rather than f16
+  bool satfinite = false;
+  Reg dst;
+  Operand a, b;
+};
+// The SIMD video instructions: vadd4, vsub4, vabsdiff4, vmin4, vmax4, vavrg4
+// and their 2-way halfword counterparts. Each treats a 32-bit register as four
+// bytes (or two halves) and applies the operation lane by lane.
+//
+// The operand types decide the signedness of the *lanes*, not of the register:
+// vabsdiff4.u32.s32.s32 compares signed bytes and produces unsigned ones, and
+// reading them all as one 32-bit value gets every lane after the first wrong
+// through borrow.
+enum class VideoOp : uint8_t { Add, Sub, AbsDiff, Min, Max, Avrg };
+struct OpVideoSimd {
+  VideoOp op = VideoOp::Add;
+  uint32_t lanes = 4;        // 4 bytes or 2 halfwords
+  bool a_signed = false, b_signed = false, d_signed = false;
+  bool sat = false;
+  Reg dst;
+  Operand a, b, c;
+};
 // copysign.f32/f64 d, a, b -- magnitude of b with the sign of a.
 struct OpCopysign { Type ty; Reg dst; Operand a, b; };
 // dp4a.{u32,s32}.{u32,s32} d, a, b, c -- four byte-wise products of a and b
@@ -257,12 +389,23 @@ struct OpShf { bool left = false; bool wrap = false; Reg dst; Operand a, b, c; }
 // which only relaxes accuracy, these change the result -- quantization kernels
 // depend on .rz truncating -- so they are carried through and applied.
 enum class FRound { Nearest, Zero, MinusInf, PlusInf };
-struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; Type ty; Reg dst; Operand a, b; };
+// nan_propagate is min.NaN/max.NaN, which returns NaN when either operand is
+// NaN. Plain min/max return the non-NaN operand, which is fmin/fmax's rule --
+// the two disagree on exactly the inputs a numerically fragile kernel cares
+// about, so the modifier cannot be dropped.
+struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; bool nan_propagate = false; Type ty; Reg dst; Operand a, b; };
 struct OpFma { Type ty; Reg dst; Operand a, b, c; };
 // Packed half2 SIMD: one 32-bit register holds two f16 lanes.
-struct OpF16x2Bin { FloatBinOp op = FloatBinOp::Add; Reg dst; Operand a, b; };
-struct OpF16x2Fma { Reg dst; Operand a, b, c; };
-struct OpF16x2Neg { Reg dst; Operand src; };
+// Half-precision arithmetic. One node covers four shapes, because they differ
+// only in how many 16-bit values a 32-bit register holds and how those bits
+// decode: f16 and bf16 scalars occupy the low half, f16x2 and bf16x2 pack two.
+// bf16 is not an f16 with a different bias -- it has f32's exponent range and
+// a 7-bit mantissa -- so the flag selects a different decode, not a scale.
+struct OpF16x2Bin { FloatBinOp op = FloatBinOp::Add; bool bf16 = false; bool packed = true; Reg dst; Operand a, b; };
+struct OpF16x2Fma { bool bf16 = false; bool packed = true; Reg dst; Operand a, b, c; };
+// neg and abs on half types: both are a mask over the sign bits, which sits in
+// the top bit of each 16-bit half for f16 and bf16 alike.
+struct OpF16x2Neg { bool bf16 = false; bool packed = true; bool absolute = false; Reg dst; Operand src; };
 
 // Tensor-core MMA (m16n16k16, f16 inputs, f32 accumulate). A warp-collective
 // operation: the 32 lanes jointly hold the matrices.
@@ -274,9 +417,35 @@ struct OpF16x2Neg { Reg dst; Operand src; };
 // hardware-matching results; kernels that depend on NVIDIA's exact
 // undocumented element distribution may differ. Documented in ARCHITECTURE.md.
 enum class MatLayout { Row, Col };
+// The element type of a WMMA A/B fragment, which decides both the register
+// count and the shape:
+//   f16   m16n16k16, 8 registers -- covers the 16x16 matrix twice, so lanes
+//         16-31 duplicate lanes 0-15
+//   bf16  m16n16k16, 4 registers -- covers it exactly once
+//   tf32  m16n16k8,  4 registers -- A is 16x8 and B is 8x16, so the two
+//         fragments do not even share an index map
+enum class WmmaElem : uint8_t { F16, BF16, TF32 };
 struct OpWmmaMma {
+  WmmaElem elem = WmmaElem::F16;
   MatLayout alayout, blayout;
   std::vector<Reg> d, a, b, c;
+};
+// wmma.load.{a,b,c}.sync.aligned.<layout>.m16n16k16[.space].<type> {d...}, [addr], stride
+//
+// The fragment layout WMMA uses is deliberately unspecified by CUDA -- a
+// fragment is an opaque object, and the only contract is that load, mma and
+// store agree with each other. So this mirrors exactly what exec_wmma_mma
+// already reads rather than trying to reproduce NVIDIA's register assignment,
+// which is not documented and not observable through the API.
+struct OpWmmaLoad {
+  enum class Which { A, B, C } which = Which::A;
+  WmmaElem elem = WmmaElem::F16;
+  MatLayout layout = MatLayout::Row;
+  Space space = Space::Generic;
+  bool f32 = false;         // the C fragment is f32; A and B are f16
+  Addr addr;
+  std::vector<Reg> dsts;
+  Operand stride;
 };
 struct OpWmmaStore {
   MatLayout layout;
@@ -286,10 +455,27 @@ struct OpWmmaStore {
   Operand stride;
 };
 struct OpSetp { CmpOp cmp = CmpOp::Eq; Type ty; Reg dst; Operand a, b; };
+// set.<cmp>.<dtype>.<stype> d, a, b -- setp's sibling that writes a value
+// instead of a predicate. The result depends on the destination type, not on
+// the comparison: an integer d gets all-ones for true, a float d gets 1.0.
+// Writing 1 into an integer d is the easy mistake, and it makes every use as a
+// mask silently select one bit.
+struct OpSet {
+  CmpOp cmp = CmpOp::Eq;
+  Type dty;         // destination type: decides true's encoding
+  Type sty;         // source type: decides how a and b are compared
+  bool packed = false;  // f16x2/bf16x2: two independent comparisons
+  Reg dst;
+  Operand a, b;
+};
 struct OpSelp { Type ty; Reg dst; Operand a, b; Reg pred; };
 struct OpPredBin { PredBinOp op = PredBinOp::And; Reg dst; Reg a, b; };
 struct OpNotPred { Reg dst; Reg src; };
-struct OpAtom { AtomOp op = AtomOp::Add; Space space = Space::Generic; Type ty; Reg dst; Addr addr; Operand b; Operand c; };
+// atom and red are the same instruction; red is the form that discards the
+// old value. nvcc emits it whenever the result of an atomicAdd() is unused,
+// which in a reduction or a histogram is every call, so a kernel full of
+// atomics can easily contain no `atom` at all.
+struct OpAtom { AtomOp op = AtomOp::Add; Space space = Space::Generic; Type ty; Reg dst; Addr addr; Operand b; Operand c; bool discards_result = false; bool packed_half = false; };
 struct OpBra { size_t target = 0; std::string label; };  // target = instruction index
 struct OpBar {};                                     // bar.sync 0
 // An instruction with nothing to do here: a memory fence, or a backoff hint.
@@ -297,6 +483,10 @@ struct OpBar {};                                     // bar.sync 0
 // bar.sync made every fence wait for the whole block, which a kernel that
 // fences on one warp's path would have hung on.
 struct OpNop {};
+// membar / fence. Executed as a host memory fence, because blocks run on
+// several host threads and what one block wrote must be visible, in order,
+// to another that synchronizes through memory rather than a barrier.
+struct OpFence {};
 // activemask.b32 d -- the mask of lanes of this warp currently executing. Warp
 // algorithms use it as the membership for a following .sync operation.
 struct OpActiveMask { Reg dst; };
@@ -370,17 +560,38 @@ struct OpCpAsync {
 // The group operations. These carry no data: what they do is order the copies
 // above against the reads that consume them.
 struct OpCpAsyncGroup {
-  enum class Kind { Commit, WaitGroup, WaitAll } kind = Kind::Commit;
+  // MbarrierArrive is cp.async.mbarrier.arrive: instead of joining a numbered
+  // group, the outstanding copies are made to complete and then an arrival is
+  // signalled on an mbarrier. It is how an Ampere-style pipeline hands a
+  // filled buffer to its consumer.
+  enum class Kind { Commit, WaitGroup, WaitAll, MbarrierArrive } kind = Kind::Commit;
   uint32_t keep = 0;                   // wait_group N: leave at most N outstanding
+  Addr bar;                            // MbarrierArrive: the barrier to signal
+  bool noinc = false;                  // .noinc: do not add an arrival of our own
 };
 
 struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; };
-struct OpCall { std::string callee; std::string retval_slot; std::vector<std::string> param_slots; };
+// A call. `callee` names either a builtin (vprintf, __assertfail, malloc,
+// free) or a device function defined in the same module, in which case
+// `target` points at it. Held by shared_ptr so a resolved call stays valid
+// however the module's containers are moved around.
+struct EntryFn;
+struct OpCall {
+  std::string callee;
+  std::string retval_slot;
+  std::vector<std::string> param_slots;
+  std::shared_ptr<const EntryFn> target;  // null for the builtins
+  // An indirect call through a function pointer: the callee is whatever
+  // address this register holds, so it is resolved per execution rather than
+  // at parse time.
+  bool indirect = false;
+  Reg target_reg;
+};
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
-                        OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaStore, OpSetp, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
-                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpActiveMask>;
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
+                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask>;
 
 struct Instr {
   size_t line = 0;                 // source line, for diagnostics
@@ -389,7 +600,18 @@ struct Instr {
   Reg pred;
   Op op;
   std::string text;                // original source text, for diagnostics
+  // The base mnemonic, interned at parse time: "add" for add.cc.u32, "ld" for
+  // ld.global.nc.f32. Counting by this gives a per-opcode histogram, which is
+  // finer than the nine instruction classes and is what a profiler's
+  // instruction mix actually looks like. Interned rather than stored as a
+  // string because it is read once per executed instruction.
+  uint16_t opcode_id = 0;
 };
+
+// The opcode table the ids index. Grown at parse time and never shrunk, so an
+// id stays valid for the life of the process.
+uint16_t intern_opcode(const std::string& mnemonic);
+const std::vector<std::string>& opcode_names();
 
 struct ParamDecl {
   std::string name;
@@ -418,6 +640,21 @@ struct SharedDecl {
 
 struct EntryFn {
   std::string name;
+  // A .func rather than a .entry: called from a kernel instead of launched.
+  // Its parameters and return value are call slots, not a launch parameter
+  // buffer, because each lane passes its own arguments.
+  bool is_device_func = false;
+  std::vector<std::string> param_slot_names;   // in signature order
+  std::vector<uint32_t> param_slot_bytes;      // byte size of each, structs included
+  std::string retval_slot_name;                // empty when it returns void
+  uint32_t retval_bytes = 0;
+  // Every device function in the module, in definition order. An indirect call
+  // carries an address, and the address is the index -- see kFuncVaBase.
+  std::vector<std::shared_ptr<const EntryFn>> module_funcs;
+  // The names of the module's kernels. Only used to tell "you took the address
+  // of a kernel" apart from "you named something that does not exist", which
+  // are the same error message otherwise and point at very different problems.
+  std::vector<std::string> module_entry_names;
   std::vector<ParamDecl> params;
   std::vector<Instr> body;
   std::map<std::string, Type> reg_decls;      // declared virtual registers
@@ -435,6 +672,11 @@ struct EntryFn {
   std::array<uint32_t, 3> max_ntid{0, 0, 0};
   std::array<uint32_t, 3> req_ntid{0, 0, 0};
   uint32_t min_ctas_per_sm = 0;
+  // .reqnctapercluster: the cluster shape in CTAs the kernel was compiled for
+  // (__cluster_dims__). Zero means the kernel names no cluster shape.
+  // .explicitcluster says the kernel must be launched with one.
+  std::array<uint32_t, 3> req_cluster{0, 0, 0};
+  bool explicit_cluster = false;
   // Memoized register analysis. Held here rather than in a pointer-keyed
   // side table: a freed module's address can be reused by the next one, and
   // such a cache then hands back another kernel's register count.
@@ -455,9 +697,15 @@ struct GlobalVar {
   uint64_t size = 0;
   std::vector<uint8_t> init;  // empty or size bytes
   // A pointer-valued global can be initialised with another symbol's address
-  // ("= my_array;"). The address is not known until the module is loaded, so
-  // the name is carried here and resolved then.
-  std::string init_symbol;
+  // ("= my_array;"), and an array of them with a list ("= {f, g, h};") -- a
+  // table of function pointers is exactly that. Addresses are not known until
+  // the module is loaded, so the names are carried here with the byte offset
+  // each one belongs at, and resolved then.
+  struct SymbolInit {
+    uint64_t offset = 0;
+    std::string name;
+  };
+  std::vector<SymbolInit> init_symbols;
 };
 
 struct Module {
@@ -466,6 +714,9 @@ struct Module {
   uint32_t address_size = 64;
   std::vector<EntryFn> entries;
   std::vector<GlobalVar> globals;
+  // Device functions, by definition order. Kept as shared_ptr so an OpCall can
+  // hold one without caring how the module is copied or moved.
+  std::vector<std::shared_ptr<EntryFn>> funcs;
   std::vector<SharedDecl> module_shared;  // module-scope .shared variables
 
   const EntryFn* find_entry(const std::string& name) const {

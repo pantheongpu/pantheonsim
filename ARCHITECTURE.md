@@ -89,9 +89,22 @@ the interpreter. This is the foundation of the "TSan for GPUs" ambition;
 nothing in the engine may assume a fixed warp order beyond what a scheduler
 provides.
 
-Blocks currently run sequentially in fixed order (a legal schedule). Inter-
-block parallelism on host threads can come later; it must preserve the
-scheduler abstraction per block.
+Blocks are spread over host threads, one block per thread at a time, and each
+block keeps its own scheduler. `VGPU_THREADS` sets the count (default: every
+core); `VGPU_THREADS=1` runs them sequentially in fixed order, a legal schedule
+and the one the determinism contract below is stated for. Blocks on different
+threads can share global memory, and kernels rely on it (CUB's decoupled
+look-back spins on flags other blocks publish), so the engine follows the GPU
+memory model rather than assuming one thread:
+
+- An aligned scalar global load or store is a relaxed atomic on the backing
+  bytes. It is never torn, and it is not a C++ data race. On x86 this is the
+  same single instruction a plain copy was.
+- `membar`/`fence` are host `seq_cst` fences; `ld.acquire` and `st.release`
+  carry acquire and release fences. A fence is not a barrier.
+- Atomics that can cross blocks take a striped lock.
+
+The threads CI job runs the whole suite under ThreadSanitizer to hold this.
 
 ### D3. Virtual memory is sparse, monotonic, and paranoid
 
@@ -252,4 +265,6 @@ stable error codes (comparable outcomes), stats from every launch.
 
 Same binary + same inputs + same profile + same scheduler ⇒ identical device
 memory afterward, identical errors, byte-for-byte. Anything that would break
-this (host-thread parallelism, address randomization) must be opt-in.
+this (address randomization) must be opt-in. Host-thread parallelism is on by
+default because it only changes results for kernels whose output depends on
+block order -- float atomics, races -- and `VGPU_THREADS=1` turns it off.

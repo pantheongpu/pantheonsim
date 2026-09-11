@@ -33,6 +33,7 @@ features:
 # NOT used by the execution engine -- VirtualGPU does not model performance.
 # Public spec-sheet figures; PCI ids from the public NVIDIA device list.
 telemetry:
+  framebuffer_mb: 81920          # nvidia-smi total on real cards (38 runs in the benchmark database)
   power_limit_w: 400
   sm_clock_max_mhz: 1410
   mem_clock_max_mhz: 1593

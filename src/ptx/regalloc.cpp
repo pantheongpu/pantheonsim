@@ -30,7 +30,6 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
 
   std::visit(
       [&](const auto& op) {
-        using T = std::decay_t<decltype(op)>;
         if constexpr (requires { op.dst; }) {
           if constexpr (std::is_same_v<std::decay_t<decltype(op.dst)>, Reg>) {
             if (op.dst.id != kNoReg) defs.push_back(op.dst.id);

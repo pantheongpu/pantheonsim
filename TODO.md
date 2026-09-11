@@ -26,6 +26,15 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   libvgpucudart (CUDA Runtime API + nvcc host-registration ABI +
   cuLibrary/cuKernel + fatbin PTX extraction incl. zstd). Verified with the
   external C11 driver-API harness AND an nvcc-compiled vectorAdd e2e test.
+- Thrust and CUB run unmodified, and are under test: thrust::sort/reduce/
+  inclusive_scan, and CUB's device-level DeviceReduce, DeviceScan (decoupled
+  look-back, so it depends on ordering across blocks) and DeviceRadixSort. A
+  radix sort is a tuned multi-kernel pipeline with its own temporary storage
+  and warp primitives throughout, so it exercises far more than a hand-written
+  kernel does. Also verified by probe, not yet pinned by a test: streams and
+  events with cross-stream waits, managed and pinned memory, pitched 2D
+  allocation with cudaMemcpy2D, the async memory pool (cudaMallocAsync), the
+  >48 KiB dynamic shared-memory opt-in, and occupancy queries.
 - Pantheon workloads: the pantheongpu stress/diagnostics kernels run
   unmodified (idle, memory_read/write, galpat, march_test, memory_hammer,
   atomic/int/compute virus). memory_read differential-matches a physical RTX
@@ -36,11 +45,90 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   module .global variables, aggregate by-value params, device printf (vprintf),
   transcendentals (ex2/lg2/sin/cos/sqrt/rsqrt/rcp/tanh), bfe/bfi/brev/popc/clz,
   mad.wide, mov pack/unpack, NaN-aware setp forms, inline-asm register locals.
+- PTX found by probing what real toolchains emit rather than by reading the
+  spec, which is how several of these stayed missing: `lop3` (ptxas fuses
+  bitwise chains into it, so optimized PTX is dense with them), `red` (an
+  atomic whose result is discarded -- what an unused atomicAdd() compiles to,
+  which in a reduction is every call), `slct`, `testp`, `sad`/`vabsdiff`,
+  `match.any/all.sync`, `mul24`, `szext`, `fns`, `bfind[.shiftamt]`,
+  `elect.sync`, `isspacep`. Cache-management hints (`prefetch`,
+  `createpolicy`, `applypriority`, `discard`) and the scheduling directives
+  `griddepcontrol` and `setmaxnreg` are accepted and do nothing, each for a
+  stated reason rather than a shrug.
+- Half precision beyond f16x2: f16, bf16, f16x2 and bf16x2 arithmetic
+  (add/sub/mul/fma/neg/min/max), the same four types on every transcendental,
+  and atom/red.add on all of them. bf16 is a different decode, not a scaled
+  f16 -- it carries f32's exponent range with a 7-bit mantissa.
+- `min.NaN`/`max.NaN`, which propagate a NaN instead of returning the other
+  operand. The plain forms follow fmin/fmax; the two disagree on exactly the
+  inputs a kernel clamping to keep NaNs visible cares about.
+- Separately compiled builds (`-rdc=true`). Such a build leaves the primary
+  fatbin empty -- 16 bytes, just a header -- and hangs the real device code off
+  the wrapper's fourth field as a NULL-terminated list of *relocatable*
+  fatbins. Device linking would consume them, but with a PTX-only `-code` there
+  is nothing for nvlink to link, so the pieces arrive still separate and the
+  runtime puts them together: PTX from each is concatenated, cross-piece
+  references resolve by name, and only the first piece's `.version`/`.target`
+  header survives (it is the translation unit; the rest are libraries built for
+  whatever the toolkit's default architecture was). An unresolved call is
+  reported when it is *reached* rather than at load, because the device-runtime
+  library declares functions the driver supplies and defines them nowhere.
+  Verified on a genuine two-unit build: device functions and a `__constant__`
+  defined in one translation unit, used from a kernel in another.
+- `__constant__` and `__device__` variables reached from the host:
+  `cudaMemcpyToSymbol`/`FromSymbol` (and the Async forms),
+  `cudaGetSymbolAddress`/`Size`, fed by `__cudaRegisterVar`. On the kernel side
+  `ld.const` is a global read of a range nothing writes -- the read-only-ness
+  is a promise the program makes, not one this engine enforces.
+- Non-inlined device functions (`.func`): a real call with its own register
+  file, `.local` frame and path stack, so divergence inside a callee and
+  recursion both work. Parameters and the return value travel as call slots
+  rather than a parameter buffer, because each lane passes its own arguments.
+  The callee runs to completion inside the caller's instruction, which is what
+  makes recursion fall out of the host stack -- and means a warp does not yield
+  mid-call, so a barrier inside a device function is refused by name rather
+  than silently skipping the rest of the body. Structs and arrays pass and
+  return by value: a call slot is a per-lane byte buffer, so `st.param
+  [param0+8]` lands where it should. Indirect calls work too: device functions
+  have addresses in a window of their own, an array global can be initialised
+  with a list of symbols (`= {f, g, h}` -- a function-pointer table), and a
+  call through a register resolves the address back to the function. All
+  participating lanes must agree on the target; a divergent function pointer
+  is refused rather than picking one body and running it for everyone.
+- Builtins a kernel can call: `vprintf`, `__assertfail` (a failed `assert()`
+  reports its message and source location, and `cudaErrorAssert`), and the
+  device heap -- `malloc`/`free` from inside a kernel, backed by the same
+  allocator `cudaMalloc` uses so a device allocation gets the same
+  out-of-bounds and use-after-free checking. Capped at CUDA's default 8 MiB;
+  memory allocated there is reachable from the host here and is not on a
+  device, which is a permissive difference and recorded as one.
+- The SIMD video instructions (`vadd4`, `vsub4`, `vabsdiff4`, `vmin4`,
+  `vmax4`, `vavrg4` and the 2-way forms), `set` (setp's sibling that writes a
+  value, where an integer destination gets all-ones for true and a float one
+  gets 1.0), `atom.inc`/`.dec` (which wrap against the operand rather than
+  counting), and `abs` on the half types.
+- FP8: `cvt` between e4m3x2/e5m2x2 and f32/f16x2/bf16x2, with `.satfinite`.
+  The two formats are not one shape with a different bias -- e4m3 spends its
+  top exponent on ordinary numbers and has no infinity, so 448 is its largest
+  finite value and 1000 saturates to it, while e5m2 is IEEE-shaped and
+  represents 1000 as 1024.
+- `mbarrier` (init/inval/arrive/arrive_drop/test_wait/try_wait[.parity]/
+  pending_count) and `cp.async.mbarrier.arrive`: the split barrier that
+  cuda::barrier and cuda::pipeline are built on. Nothing blocks -- a wait is a
+  predicate and the kernel spins, and an incomplete wait yields its scheduler
+  turn so the warps it is waiting for can run.
 - Shared memory: static + dynamic (extern) .shared, per-block zeroed frames,
   ld/st/atom.shared, correct space-relative addressing (cvta to/from generic).
 - Warp shuffles (shfl.sync up/down/bfly/idx, + predicate output) and
   vote/ballot.
-- Tensor cores: wmma.mma m16n16k16 f32.f32 (row/col layouts), wmma.store.d;
+- Tensor cores: wmma.load.{a,b,c}, wmma.mma m16n16k16 with f16 or bf16 inputs
+  and an f32 accumulator (row/col layouts), wmma.store.d -- so `nvcuda::wmma`'s
+  load_matrix_sync/mma_sync/store_matrix_sync all work and a 16x16x16 GEMM
+  through the public API matches a host reference for both B layouts and both
+  element types -- and tf32's m16n16k8, whose A is 16x8 and B is 8x16, so its
+  load computes the address from the layout directly rather than relying on the
+  cancellation the square shapes get for free. The rectangular m8n32k16 and
+  m32n8k16 variants are still refused by name;
   ldmatrix.m8n8.x{1,2,4}[.trans], mma.sync.m16n8k{8,16,32} over f16/bf16/tf32/
   s8, and movmatrix.m8n8.trans (the register-only transpose).
 - Asynchronous copy: cp.async.{ca,cg} with commit_group / wait_group / wait_all
@@ -89,7 +177,8 @@ an instance left running bills by the hour).
 `tools/compare-profile.py` diffs a measured profile against the one in the
 tree, so corrections are visible rather than silently applied.
 
-Verified against real hardware, nine devices across six architectures:
+Verified against real hardware, eleven devices across seven architectures --
+including the first AMD part:
 
 | profile | device | how |
 | --- | --- | --- |
@@ -101,12 +190,32 @@ Verified against real hardware, nine devices across six architectures:
 | `nvidia/h100-pcie` | H100 80GB PCIe (sm_90) | Lambda `gpu_1x_h100_pcie` |
 | `nvidia/t4` | Tesla T4 (sm_75, Turing) | EC2 `g4dn.xlarge` |
 | `nvidia/a10g` | A10G (sm_86) | EC2 `g5.xlarge` |
-| `nvidia/l4` | L4 (sm_89, Ada Lovelace) | EC2 `g6.xlarge` |
+| `nvidia/l4` | L4 (sm_89, Ada Lovelace, AD104) | EC2 `g6.xlarge` |
+| `nvidia/l40s` | L40S (sm_89, Ada Lovelace, AD102) | EC2 `g6e.2xlarge` |
+| `amd/mi325x` | MI325X (gfx942, CDNA3) | DigitalOcean `gpu-mi325x1-256gb` |
 
-All nine match the physical device on **512 conformance values each** -- the
+All ten NVIDIA parts match the physical device on **512 conformance values each** -- the
 same binary run on hardware and on VirtualGPU, diffed.
 
-Ada was the last architecture gap in the supported range. It stayed open for a
+**The AMD one is discovery, not execution.** `amd/mi325x` describes a real
+MI325X -- 304 CUs, 64-lane wavefronts, 64 KiB LDS, gfx942 -- and nothing can
+run on it yet, because the interpreter's warp is 32 lanes wide. The profile is
+deliberately ahead of the engine rather than rounded to fit it.
+
+It also cost three droplets to get, and two of those were avoidable. The first
+two attempts compiled a HIP program on the rented machine and failed
+identically: DigitalOcean's AMD image ships `hipcc` but not the HIP development
+headers, so `hip/hip_runtime.h` exists nowhere under `/opt/rocm`. The third run
+dumped `rocminfo`, which was installed all along and reports everything the
+schema needs, and every subsequent iteration was free.
+`tools/rocminfo-to-profile.py` parses it at home for that reason.
+
+MI300X was the intended target and is not launchable: a create was attempted in
+all sixteen available DigitalOcean regions and every one answered "Size is not
+available in this region". MI325X is the same gfx942 CDNA3 target, so only
+`vram_bytes` differs between them.
+
+Ada was the last architecture gap in the NVIDIA range. It stayed open for a
 while because capacity and quota were both against it: us-east-1 had no L4
 capacity when it was first tried, and the G-instance vCPU quota is still zero
 in every region except us-east-1. It launched on the third availability zone
@@ -342,15 +451,83 @@ narrows what counts as observable, not what the detector looks at.
 
 ## Not implemented (fails loudly, never silently)
 
-- PTX: textures/surfaces, wgmma, grid sync, inline-asm-only instructions
-- Runtime: async copies, unified/managed memory, virtual memory mgmt API
-  (cuMemAddressReserve…), host-pinned memory
-- Frontends: cubin/SASS loading, cuGetProcAddress dispatch, AMD everything
-  (HIP, ROCm-SMI, CDNA ISA)
-- Tooling: `vgpu test --matrix`, trace record/replay, schedulers
-  random/adversarial, OOM injection, characterization/differential-fuzz
-  harness, conformance DB + compat scores. (`vgpu run` and shared-memory race
-  detection are done.)
+This list was stale for a while, which is its own kind of wrong: it still named
+textures, grid sync and host-pinned memory long after all three worked. A
+roadmap that overstates what is missing misleads as much as one that overstates
+what is done.
+
+- PTX: `wgmma`, TMA (`cp.async.bulk`) and the cluster *memory* model,
+  inline-asm-only instructions. (`mbarrier` is done -- init, inval, arrive,
+  arrive_drop, test_wait, try_wait and pending_count, including the .parity
+  form. Its transaction-counting modifiers, `expect_tx` and `complete_tx`, are
+  refused by name: they exist to pair a barrier with a TMA copy, and with no
+  `cp.async.bulk` to complete those bytes such a barrier would hang.)
+  (Textures, surfaces and grid sync are done. The thread-block cluster
+  scheduling level is done: `%clusterid`, `%nclusterid`, `%cluster_ctaid`,
+  `%cluster_nctaid`, `%cluster_ctarank`, `%cluster_nctarank` and
+  `%is_explicit_cluster` all report, driven by a cluster shape that comes from
+  `.reqnctapercluster` or from `cudaLaunchAttributeClusterDimension`. What is
+  still missing is the part that makes a cluster more than a numbering:
+  distributed shared memory -- `.shared::cluster`, `mapa`, cluster barriers --
+  which is a memory-model change, and stays refused rather than approximated.)
+- Runtime: async copies, the virtual memory management API
+  (cuMemAddressReserve…). (Managed memory and host-pinned memory are done.)
+- Dynamic parallelism (a kernel launching a kernel). Taking a kernel's address
+  in device code now says so by name instead of reporting an unknown symbol,
+  which sent you looking for a typo in a name that was right there. Running it
+  would need a child grid scheduled from inside the parent's instruction
+  stream, which nothing here can do.
+- Frontends: cubin/SASS loading, and AMD execution -- HIP runtime and the CDNA
+  ISA. AMD *discovery* exists: `tools/rocminfo-to-profile.py` reads a real
+  MI325X and `profiles/amd/mi325x.yaml` is verified against one. The warp width
+  is no longer the blocker: the interpreter is warp-width parametric, masks are
+  64-bit, and a 64-lane profile launches and executes. What is missing now is
+  the front-end -- HIP compiles to a GCN code object, not to PTX, so there is
+  nothing yet to feed a 64-lane wavefront.
+- Tooling: trace record/replay, conformance DB + compat scores. (`vgpu run`,
+  `vgpu test --matrix`, shared-memory race detection, the random and
+  adversarial schedulers, and fault injection are done.)
+
+## Registers and counters: what is modelled, and what cannot be
+
+Two questions that look alike and are not.
+
+**Special registers are per *architecture*, not per GPU model.** `%tid`,
+`%laneid`, `%smid` and `%clock64` are PTX ISA instructions, identical on a T4
+and a B200. What varies is which exist -- the ten thread-block cluster
+registers require sm_90 -- and what they return, which is already profile
+driven (`%nsmid` is 132 on an H100 and 58 on an L4). 24 of ~39 are implemented.
+The cluster ten are the real gap and need a scheduling level between block and
+grid, which is the same thing `wgmma` needs. `%pm0`-`%pm7` stay refused on
+purpose: they are undefined unless a profiler configured them, so a silent zero
+would be a confidently wrong answer.
+
+**Performance counters here are not hardware counters, and so are the same on
+every profile by construction.** `global_sectors` is computed from the
+addresses every lane issued, not read from a monitor wired into one chip's
+memory subsystem. That is why it is exact and reproducible where a device's is
+sampled and moves between runs -- and why it does not vary by GPU. Real
+hardware counter sets do differ per chip, which is a fact about physical
+monitors rather than about programs.
+
+So "support all counters for every GPU" is not achievable and not desirable:
+the ones that differ per device are overwhelmingly timing-derived -- cycles,
+stall reasons, hit rates, DRAM throughput -- and producing them would mean
+inventing a timing model. `vgpu counters` prints both lists, what is reported
+and what is not with the reason for each, because a gap that is written down is
+a decision and a gap you find by its absence is a defect.
+
+What was added rather than argued about: a per-opcode histogram
+(`inst_by_opcode`) alongside the nine classes, since knowing a kernel is
+memory-heavy is less useful than knowing it is memory-heavy because of
+`ld.global.nc`. And the characterization scripts now capture `ncu
+--query-metrics` from each physical device, so the boundary becomes per-device
+data -- "an L4 exposes N metrics, this produces M" is checkable -- rather than
+a claim to be taken on trust.
+
+Still countable and still missing: register-spill traffic split out from
+ordinary local traffic, and predicated-off lanes as a first-class number
+(derivable today from `instructions * 32 - thread_instructions`).
 
 ## Performance
 
@@ -425,8 +602,28 @@ scripts/run-pantheon-workloads.sh.
 1. **Interpreter speed**: intern register names to dense indices at parse
    time (see Performance above) — the single biggest win available without
    the JIT.
-2. **Scheduler: random mode** (seeded) + first differential scheduling tests,
-   then the adversarial mode that makes VirtualGPU a race detector.
+2. **Scheduler: random and adversarial modes** -- done. `VGPU_SCHEDULER` picks
+   between `deterministic`, `random` and `adversarial`, and
+   `VGPU_SCHEDULER_SEED` makes the last two replayable: the same seed replays
+   the same execution exactly, which is the property that makes a race
+   fixable rather than merely observed.
+
+   The half that mattered was not which warp runs next but *for how long*.
+   Under the deterministic scheduler a warp runs from one barrier to the next
+   without interruption, so two warps in the same epoch never interleave at
+   all. The shared-memory detector still finds their conflict, because it
+   reasons about epochs rather than orderings -- but a race through *global*
+   memory produces no detector report, and with no interleaving it produces no
+   wrong answer either. It simply does not appear. The new modes preempt
+   mid-warp, and a test pins the difference: a non-atomic increment from two
+   warps loses updates under the adversarial order and does not under the
+   deterministic one.
+
+   Still to do: an adversarial mode guided by what the warps are about to
+   touch. The scheduler is not told about memory, so today it maximises
+   switching and lets that do the work rather than aiming at a specific pair of
+   conflicting accesses. Aiming would mean feeding the race detector's shadow
+   state back into scheduling.
 3. **Characterization harness v0**: run the same micro-tests on a physical
    GPU (bench/ rents them) and on virtual profiles, diff, and start flipping
    `verified` bits in the profiles.

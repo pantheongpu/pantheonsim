@@ -1,5 +1,7 @@
 // Unit tests for device profiles and the built-in registry.
 #include <algorithm>
+#include <string>
+#include <utility>
 #include "vgpu/profile.hpp"
 
 #include "vgpu/error.hpp"
@@ -18,7 +20,7 @@ VTEST(registry_lists_all_gpus) {
       "nvidia/a10",   "nvidia/a100", "nvidia/h100",   "nvidia/h200",
       "nvidia/b200",  "nvidia/rtx3060", "nvidia/a100-sxm4-40gb",
       "nvidia/gh200-480gb", "nvidia/h100-pcie", "nvidia/t4", "nvidia/a10g",
-      "nvidia/l4",
+      "nvidia/l4", "nvidia/l40s",
       "amd/mi300x", "amd/mi325x", "amd/mi350x"};
   VCHECK_EQ(ids.size(), expected.size());
   for (const auto& want : expected)
@@ -41,7 +43,18 @@ VTEST(all_builtin_profiles_parse) {
                           p.id == "nvidia/a100-sxm4-40gb" || p.id == "nvidia/a100" ||
                           p.id == "nvidia/h100" || p.id == "nvidia/gh200-480gb" ||
                           p.id == "nvidia/h100-pcie" || p.id == "nvidia/t4" ||
-                          p.id == "nvidia/a10g" || p.id == "nvidia/l4");
+                          p.id == "nvidia/a10g" || p.id == "nvidia/l4" ||
+                          p.id == "nvidia/l40s" ||
+                          p.id == "amd/mi325x");
+    // AMD parts have no compute capability, and the profile that carried a
+    // plausible "9.4" was inventing one. Each vendor is asked for the thing it
+    // actually has.
+    if (p.vendor == "amd") {
+      VCHECK(!p.gcn_arch.empty());
+      VCHECK_EQ(p.cc_major, 0);
+    } else {
+      VCHECK(p.cc_major > 0);
+    }
   }
 }
 
@@ -122,6 +135,82 @@ VTEST(the_gh200_profile_loads_and_says_what_hardware_said) {
   VCHECK_EQ(p.cc_minor, 0);
   VCHECK_EQ(p.limits.multiprocessors, 132u);
   VCHECK_EQ(p.warp_size, 32u);
+}
+
+namespace {
+// A minimal valid profile whose telemetry block the tests below vary.
+std::string profile_with_telemetry(const std::string& telemetry, const char* vram = "85028896768") {
+  return std::string(R"(
+id: nvidia/testcard
+vendor: nvidia
+model: "Test Card"
+architecture: hopper
+compute_capability: "9.0"
+warp_size: 32
+vram_bytes: )") + vram + R"(
+verified: true
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 232448
+  registers_per_block: 65536
+  multiprocessors: 132
+  registers_per_sm: 65536
+  max_threads_per_sm: 2048
+  max_blocks_per_sm: 32
+telemetry:
+  power_limit_w: 700
+)" + telemetry;
+}
+constexpr uint64_t kMiB = 1024ull * 1024ull;
+}  // namespace
+
+VTEST(framebuffer_mb_becomes_the_driver_reserve) {
+  // An H100: nvidia-smi says 81559 MiB, CUDA says 85028896768 bytes. The
+  // profile keeps the CUDA number and carries the difference.
+  DeviceProfile p = DeviceProfile::from_yaml(profile_with_telemetry("  framebuffer_mb: 81559\n"), "t");
+  VCHECK_EQ(p.vram_bytes, 85028896768ull);
+  VCHECK_EQ(p.vram_bytes + p.telemetry.framebuffer_reserve_bytes, 81559 * kMiB);
+}
+
+VTEST(framebuffer_mb_is_optional) {
+  DeviceProfile p = DeviceProfile::from_yaml(profile_with_telemetry(""), "t");
+  VCHECK_EQ(p.telemetry.framebuffer_reserve_bytes, 0ull);
+}
+
+VTEST(a_framebuffer_smaller_than_cuda_memory_is_an_impossible_card) {
+  // The B200 profile did exactly this: 192 GB read as 192 GiB made its CUDA
+  // memory 13 GB larger than the real card's whole framebuffer.
+  auto err = VCAPTURE(Error, DeviceProfile::from_yaml(
+      profile_with_telemetry("  framebuffer_mb: 183359\n", "206158430208"), "test-origin"));
+  VCHECK(err.code() == Err::ProfileParse);
+  VCHECK_CONTAINS(err.what(), "framebuffer_mb");
+  VCHECK_CONTAINS(err.what(), "smaller than vram_bytes");
+}
+
+VTEST(every_builtin_reserve_is_plausible) {
+  // A real driver keeps a few hundred MiB at most. A reserve in the gigabytes
+  // is the signature of a unit error in either number -- the next B200.
+  for (const auto& id : vgpu::available_gpus()) {
+    DeviceProfile p = vgpu::load_gpu(id);
+    VCHECK(p.telemetry.framebuffer_reserve_bytes < 2048 * kMiB);
+  }
+}
+
+VTEST(measured_framebuffers_match_real_nvidia_smi) {
+  // From nvidia-smi on real cards (pantheongpu_website/database). If one of
+  // these moves, the profile has stopped describing the hardware.
+  const std::pair<const char*, uint64_t> real[] = {
+      {"nvidia/h100", 81559},  {"nvidia/h100-pcie", 81559}, {"nvidia/a100", 81920},
+      {"nvidia/a100-sxm4-40gb", 40960}, {"nvidia/a10", 23028}, {"nvidia/a10g", 23028},
+      {"nvidia/l4", 23034},    {"nvidia/l40s", 46068},     {"nvidia/t4", 15360},
+      {"nvidia/rtx3060", 12288}, {"nvidia/gh200-480gb", 97871}, {"nvidia/b200", 183359}};
+  for (const auto& [id, mib] : real) {
+    DeviceProfile p = vgpu::load_gpu(id);
+    VCHECK_EQ(p.vram_bytes + p.telemetry.framebuffer_reserve_bytes, mib * kMiB);
+  }
 }
 
 VTEST_MAIN

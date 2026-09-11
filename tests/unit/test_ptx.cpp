@@ -106,13 +106,15 @@ VTEST(an_unknown_special_register_is_not_silently_a_register) {
   // zero and stored four bytes below its shared array. An unimplemented special
   // register has to say so.
   //
-  // The example has to be one that is genuinely still unimplemented: this test
-  // named %total_smem_size until that was implemented, and then failed --
-  // which is the test working, not breaking. %clusterid needs a thread-block
-  // cluster concept the scheduler does not have.
-  auto err = VCAPTURE(Error, parse(wrap_kernel("mov.u32 %r1, %clusterid.x;\nret;")));
+  // The example has to be one that is genuinely still unimplemented, and this
+  // test keeps outliving its examples: it named %total_smem_size until that
+  // was implemented, then %clusterid until the cluster registers were. Each
+  // time it failed, which is the test working rather than breaking.
+  // %current_graph_exec is the current one -- it identifies the graph
+  // executable a kernel is running inside, and nothing here tracks that.
+  auto err = VCAPTURE(Error, parse(wrap_kernel("mov.u64 %rd1, %current_graph_exec;\nret;")));
   VCHECK(err.code() == Err::UnsupportedPtx);
-  VCHECK_CONTAINS(err.what(), "%clusterid");
+  VCHECK_CONTAINS(err.what(), "%current_graph_exec");
 }
 
 VTEST(lane_masks_are_the_masks_they_name) {
@@ -200,10 +202,10 @@ VTEST(global_scalar_initialiser_is_not_a_symbol) {
       ".global .align 4 .f32 one = 0f3F800000;\n"
       ".visible .entry k()\n{\nret;\n}\n");
   VCHECK_EQ(m.globals.size(), size_t{2});
-  VCHECK(m.globals[0].init_symbol.empty());
+  VCHECK(m.globals[0].init_symbols.empty());
   VCHECK_EQ(m.globals[0].init.size(), size_t{4});
   VCHECK_EQ(int(m.globals[0].init[0]), 42);
-  VCHECK(m.globals[1].init_symbol.empty());
+  VCHECK(m.globals[1].init_symbols.empty());
   VCHECK_EQ(m.globals[1].init.size(), size_t{4});
 }
 
@@ -293,8 +295,11 @@ VTEST(global_initialised_with_a_symbol) {
       ".visible .entry k()\n{\nret;\n}\n");
   VCHECK_EQ(m.globals.size(), size_t{2});
   VCHECK_EQ(m.globals[1].name, std::string("pointer"));
-  VCHECK_EQ(m.globals[1].init_symbol, std::string("target"));
-  VCHECK(m.globals[1].init.empty());  // the address is only known at load time
+  VCHECK_EQ(m.globals[1].init_symbols.size(), size_t{1});
+  VCHECK_EQ(m.globals[1].init_symbols[0].name, std::string("target"));
+  VCHECK_EQ(m.globals[1].init_symbols[0].offset, uint64_t{0});
+  // The slot is zeroed; the address is written by the loader.
+  VCHECK_EQ(m.globals[1].init.size(), size_t{8});
 }
 
 // Cache hints tell the hardware how far to prefetch; they never change what a
@@ -322,6 +327,49 @@ VTEST(cache_hints_are_accepted_and_ignored) {
   }
   VCHECK_EQ(loads, size_t{3});   // ld.param plus the two hinted global loads
   VCHECK_EQ(stores, size_t{1});
+}
+
+// A fence orders memory between blocks, which run on different host threads.
+// It was once a no-op (and before that a block-wide barrier); neither is what
+// CUB's decoupled look-back needs.
+VTEST(membar_and_fence_parse_as_fences_not_barriers) {
+  Module m = parse(wrap_kernel("membar.gl;\nmembar.cta;\nfence.acq_rel.gpu;\nfence.sc.sys;\nret;"));
+  size_t fences = 0, bars = 0;
+  for (const auto& i : m.entries[0].body) {
+    if (std::holds_alternative<OpFence>(i.op)) ++fences;
+    if (std::holds_alternative<OpBar>(i.op)) ++bars;
+  }
+  VCHECK_EQ(fences, size_t{4});
+  VCHECK_EQ(bars, size_t{0});
+}
+
+// ld.acquire and st.release carry their ordering to the interpreter; the
+// relaxed and volatile forms, and a plain access, carry none.
+VTEST(acquire_and_release_are_recorded_on_loads_and_stores) {
+  Module m = parse(wrap_kernel(
+      "ld.acquire.gpu.global.u32 %r1, [%rd1];\n"
+      "ld.relaxed.gpu.global.u32 %r2, [%rd1];\n"
+      "ld.volatile.global.u32 %r3, [%rd1];\n"
+      "ld.global.u32 %r4, [%rd1];\n"
+      "st.release.gpu.global.u32 [%rd1], %r1;\n"
+      "st.relaxed.gpu.global.u32 [%rd1], %r1;\n"
+      "st.global.u32 [%rd1], %r1;\n"
+      "ret;"));
+  std::vector<const OpLd*> lds;
+  std::vector<const OpSt*> sts;
+  for (const auto& i : m.entries[0].body) {
+    if (const auto* l = std::get_if<OpLd>(&i.op)) lds.push_back(l);
+    if (const auto* t = std::get_if<OpSt>(&i.op)) sts.push_back(t);
+  }
+  VCHECK_EQ(lds.size(), size_t{4});
+  VCHECK(lds[0]->acquire);
+  VCHECK(!lds[1]->acquire);
+  VCHECK(!lds[2]->acquire);
+  VCHECK(!lds[3]->acquire);
+  VCHECK_EQ(sts.size(), size_t{3});
+  VCHECK(sts[0]->release);
+  VCHECK(!sts[1]->release);
+  VCHECK(!sts[2]->release);
 }
 
 VTEST_MAIN
