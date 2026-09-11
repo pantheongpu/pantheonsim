@@ -464,6 +464,10 @@ set_tests_properties(smi_format PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_B
 add_test(NAME isolation_fallback COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_isolation_fallback.sh)
 set_tests_properties(isolation_fallback PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
 
+# VGPU_QUIET=1 silences and nothing else does. Skips itself without the cuFFT shim.
+add_test(NAME quiet_semantics COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_quiet.sh)
+set_tests_properties(quiet_semantics PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+
 # End-to-end: an nvcc-compiled CUDA app run through libvgpucudart. Depends on
 # the runtime shim; only meaningful when it was built (CUDA headers present).
 if(TARGET vgpucudart)
