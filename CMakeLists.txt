@@ -468,6 +468,18 @@ set_tests_properties(isolation_fallback PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=$
 add_test(NAME quiet_semantics COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_quiet.sh)
 set_tests_properties(quiet_semantics PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
 
+# The simulator's reports agree with each other and with real cards: one CUDA
+# version across the driver API, the runtime API and nvidia-smi; and two memory
+# totals, framebuffer and totalGlobalMem, that differ by the card's reserve.
+if(TARGET vgpucudart)
+  add_test(NAME driver_version COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_driver_version.sh)
+  set_tests_properties(driver_version PROPERTIES DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+  add_test(NAME memory_totals COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_memory_totals.sh)
+  set_tests_properties(memory_totals PROPERTIES DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+endif()
+
 # End-to-end: an nvcc-compiled CUDA app run through libvgpucudart. Depends on
 # the runtime shim; only meaningful when it was built (CUDA headers present).
 if(TARGET vgpucudart)

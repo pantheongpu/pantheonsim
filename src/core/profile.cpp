@@ -149,6 +149,17 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
     p.telemetry.temperature_max_c = static_cast<uint32_t>(opt_int(t, "temperature_max_c", origin, 0));
     p.telemetry.pci_vendor_id = static_cast<uint32_t>(opt_int(t, "pci_vendor_id", origin, 0));
     p.telemetry.pci_device_id = static_cast<uint32_t>(opt_int(t, "pci_device_id", origin, 0));
+    // framebuffer_mb is recorded as measured -- the "Memory-Usage" total from
+    // nvidia-smi on the real card -- and turned into the driver's reserve here.
+    // It can be absent (not yet measured) but it cannot be smaller than the
+    // memory CUDA reports: that is a profile describing an impossible card.
+    if (const int64_t fb = opt_int(t, "framebuffer_mb", origin, 0); fb > 0) {
+      const uint64_t fb_bytes = static_cast<uint64_t>(fb) * 1024ull * 1024ull;
+      if (fb_bytes < p.vram_bytes)
+        fail(origin, "telemetry.framebuffer_mb (" + std::to_string(fb) +
+                         " MiB) is smaller than vram_bytes; the framebuffer includes it");
+      p.telemetry.framebuffer_reserve_bytes = fb_bytes - p.vram_bytes;
+    }
   }
 
   if (auto it = doc.map.find("features"); it != doc.map.end()) {

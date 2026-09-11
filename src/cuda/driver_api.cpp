@@ -27,6 +27,7 @@
 #include <set>
 
 #include "fatbin.hpp"
+#include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/profiling.hpp"
 #include "vgpu/registry.hpp"
@@ -34,13 +35,10 @@
 
 namespace {
 
-// Reported by cuDriverGetVersion. Fixed rather than derived from a toolkit,
-// because this shim deliberately has no toolkit dependency -- it builds against
-// the clean-room vgpu_cuda.h and exists on machines with no CUDA installed at
-// all. libvgpucudart takes its version from the toolkit it was built against,
-// so the two can differ; a driver at least as new as the runtime it serves is
-// the normal configuration on real machines too, not a disagreement.
-constexpr int kDriverVersion = 13000;  // reported as CUDA 13.0
+// cuDriverGetVersion comes from vgpu::driver_version() -- the session's
+// declared CUDA version, shared with the runtime shim and nvidia-smi so the
+// three cannot disagree. See include/vgpu/driver_version.hpp. Still no toolkit
+// dependency: it reads an environment variable, not a CUDA header.
 
 // Handle tagging: low 3 bits encode the handle type so passing e.g. a module
 // where a context belongs is caught instead of misbehaving.
@@ -444,8 +442,7 @@ VGPU_EXPORT CUresult cuInit(unsigned int flags) {
     int count = 1;
     if (const char* c = std::getenv("VGPU_DEVICE_COUNT"); c && c[0]) count = std::atoi(c);
     vgpu::DeviceProfile profile = vgpu::load_gpu(id);
-    if (const char* mb = std::getenv("VGPU_VRAM_MB"); mb && mb[0])
-      profile.vram_bytes = static_cast<uint64_t>(std::strtoull(mb, nullptr, 10)) * 1024ull * 1024ull;
+    vgpu::apply_vram_override(profile);
     s.rt = std::make_unique<vgpu::runtime::Runtime>(profile, count);
     s.initialized = true;
     if (!quiet())
@@ -458,7 +455,7 @@ VGPU_EXPORT CUresult cuInit(unsigned int flags) {
 
 VGPU_EXPORT CUresult cuDriverGetVersion(int* driverVersion) {
   if (!driverVersion) return CUDA_ERROR_INVALID_VALUE;
-  *driverVersion = kDriverVersion;
+  *driverVersion = vgpu::driver_version();
   return CUDA_SUCCESS;
 }
 

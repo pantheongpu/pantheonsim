@@ -41,7 +41,13 @@ VTEST(publishes_device_identity) {
   VCHECK_EQ(std::string(snap.devices[0].name), "NVIDIA H100 80GB HBM3");
   VCHECK_EQ(std::string(snap.devices[0].vendor), "nvidia");
   VCHECK_EQ(std::string(snap.devices[0].architecture), "hopper");
-  VCHECK_EQ(snap.devices[0].vram_total_bytes, 85028896768ull);  // measured on hardware
+  // Two memory totals, both measured on a real H100, and they are different
+  // quantities. The monitor reports the framebuffer (nvidia-smi and NVML both
+  // show 81559 MiB); CUDA reports totalGlobalMem (81089 MiB), which excludes the
+  // driver's reserve. The monitor used to report the CUDA number, which left
+  // nvidia-smi 470 MiB short of any real H100.
+  VCHECK_EQ(snap.devices[0].vram_total_bytes, 81559ull * 1024 * 1024);   // framebuffer
+  VCHECK_EQ(load_gpu("nvidia/h100").vram_bytes, 85028896768ull);        // totalGlobalMem
   // Each virtual device gets its own PCI slot and a distinct UUID.
   VCHECK_EQ(std::string(snap.devices[0].bus_id), "00000000:01:00.0");
   VCHECK_EQ(std::string(snap.devices[2].bus_id), "00000000:03:00.0");

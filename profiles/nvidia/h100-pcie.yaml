@@ -28,6 +28,7 @@ features:
   fp64: true
   tensor_cores: true
 telemetry:
+  framebuffer_mb: 81559          # nvidia-smi total on real cards (235 runs in the benchmark database)
   power_limit_w: 350
   sm_clock_max_mhz: 1755
   mem_clock_max_mhz: 1593

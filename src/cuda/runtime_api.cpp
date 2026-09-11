@@ -57,6 +57,7 @@ static_assert(sizeof(cudaDeviceProp) == 1032,
 #else
 #warning "unrecognised CUDA runtime version: cudaDeviceProp layout is unchecked"
 #endif
+#include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/faults.hpp"
 #include "vgpu/profiling.hpp"
@@ -74,7 +75,9 @@ namespace {
 constexpr int kRuntimeVersion = CUDART_VERSION;
 // The driver is at least as new as the runtime it serves; reporting the same
 // number is what a matched pair looks like.
-constexpr int kDriverVersion = CUDART_VERSION;
+// cudaDriverGetVersion reports the driver's version, not the runtime's: see
+// vgpu::driver_version(). It used to return CUDART_VERSION, which is the
+// toolkit this shim was built with and says nothing about the driver.
 
 bool quiet() {
   const char* q = std::getenv("VGPU_QUIET");
@@ -148,8 +151,7 @@ void ensure_init(State& s) {
   // Optional: shrink advertised VRAM so VRAM-proportional stress tests run at
   // laptop scale (their size is a % of device memory). Functional behavior is
   // unchanged; only the working-set size the app chooses shrinks.
-  if (const char* mb = std::getenv("VGPU_VRAM_MB"); mb && mb[0])
-    profile.vram_bytes = static_cast<uint64_t>(std::strtoull(mb, nullptr, 10)) * 1024ull * 1024ull;
+  vgpu::apply_vram_override(profile);
   s.rt = std::make_unique<vgpu::runtime::Runtime>(profile, count);
   s.initialized = true;
   init_driver_shim_if_loaded();
@@ -1907,7 +1909,7 @@ VGPU_EXPORT const char* cudaGetErrorName(cudaError_t error) {
 }
 
 VGPU_EXPORT cudaError_t cudaDriverGetVersion(int* v) {
-  if (v) *v = kDriverVersion;
+  if (v) *v = vgpu::driver_version();
   return cudaSuccess;
 }
 VGPU_EXPORT cudaError_t cudaRuntimeGetVersion(int* v) {

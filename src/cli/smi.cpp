@@ -426,8 +426,9 @@ int cmd_smi(const std::vector<std::string>& args) {
     int count = 1;
     if (const char* c = std::getenv("VGPU_DEVICE_COUNT"); c && c[0]) count = std::atoi(c);
     try {
-      snap = vgpu::telemetry::idle_snapshot(vgpu::load_gpu(gpu && *gpu ? gpu : "nvidia/h100"),
-                                            count);
+      vgpu::DeviceProfile p = vgpu::load_gpu(gpu && *gpu ? gpu : "nvidia/h100");
+      vgpu::apply_vram_override(p);   // the card the session's programs see
+      snap = vgpu::telemetry::idle_snapshot(p, count);
     } catch (const std::exception& e) {
       std::fprintf(stderr, "vgpu smi: no running VirtualGPU and no usable profile (%s)\n",
                    e.what());
