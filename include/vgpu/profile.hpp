@@ -89,10 +89,15 @@ struct DeviceProfile {
 // number is ignored rather than turning the card into one with no memory.
 inline void apply_vram_override(DeviceProfile& p) {
   const char* mb = std::getenv("VGPU_VRAM_MB");
-  if (!mb || !*mb) return;
+  // Digits only. strtoull accepts a leading minus and wraps it -- "-5" parsed
+  // as 18446744073709551611 and made a card of about 16 EiB -- and a value
+  // that large overflows the multiplication below anyway.
+  if (!mb || *mb < '0' || *mb > '9') return;
   char* end = nullptr;
   const unsigned long long v = std::strtoull(mb, &end, 10);
-  if (end != mb && *end == '\0' && v > 0) p.vram_bytes = v * 1024ull * 1024ull;
+  constexpr unsigned long long kMiB = 1024ull * 1024ull;
+  if (*end != '\0' || v == 0 || v > UINT64_MAX / kMiB) return;
+  p.vram_bytes = v * kMiB;
 }
 
 }  // namespace vgpu

@@ -13,6 +13,14 @@
 #     used to leave a card with no memory at all.
 set -uo pipefail
 build="${VGPU_BUILD_DIR:-build}"
+
+# Loading an instrumented shim into the system Python aborts ("ASan runtime
+# does not come first"), so under a sanitizer build this defers to the C++ unit
+# tests, which check the same logic with the instrumentation on.
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/shim_guard.sh"
+san="$(shim_sanitizer "$build/shim")"
+if [[ -n "$san" ]]; then echo "SKIP: shim is built with $san, and the Python interpreter is not instrumented"; exit 0; fi
 command -v python3 >/dev/null || { echo "SKIP: no python3"; exit 0; }
 rt=$(ls "$build"/shim/libcudart.so.* 2>/dev/null | head -1)
 [[ -n "$rt" ]] || { echo "SKIP: no runtime shim"; exit 0; }

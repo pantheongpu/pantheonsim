@@ -1101,9 +1101,12 @@ class Parser {
       size_t vec = 1;
       Type ty{};
       bool have_ty = false;
+      bool acquire = false, release = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
-        if (p == "param") space = Space::Param;
+        if (p == "acquire") acquire = true;
+        else if (p == "release") release = true;
+        else if (p == "param") space = Space::Param;
         else if (p == "global") space = Space::Global;
         // __constant__ variables are parsed into the module's globals, so a
         // constant-bank read is a global read of a range nothing writes. The
@@ -1171,6 +1174,9 @@ class Parser {
           ins.op = OpSt{space, ty, addr, std::move(srcs)};
         }
       }
+      // The ordering the kernel asked for, on whichever op this became.
+      if (auto* l = std::get_if<OpLd>(&ins.op)) l->acquire = acquire;
+      if (auto* st = std::get_if<OpSt>(&ins.op)) st->release = release;
     } else if (op0 == "mov") {
       if (parts.size() != 2) return unsupported("mov form");
       auto ty = parse_type_token(parts[1]);
@@ -2571,12 +2577,14 @@ class Parser {
         ins.op = std::move(op);
       }
     } else if (op0 == "membar" || op0 == "fence") {
-      // Blocks execute their instructions in order and device atomics are
-      // serialized by a lock, so every prior write is already visible to
-      // whoever could observe it. There is no reordering here to fence against
-      // -- but a fence is not a barrier, and this used to be OpBar, which made
-      // it wait for every warp in the block.
-      ins.op = OpNop{};
+      // A host memory fence, not a no-op. This used to reason that blocks run
+      // their instructions in order so there was nothing to fence against --
+      // true of one thread, but blocks run on several, and on a weak-memory host
+      // (ARM: Graviton, or a GH200's own Grace) the hardware reorders across
+      // them. CUB's decoupled look-back depends on exactly this fence. It is
+      // still not a barrier: this used to be OpBar, which made it wait for every
+      // warp in the block.
+      ins.op = OpFence{};
     } else if (op0 == "nanosleep") {
       // A backoff hint. Consuming it as a no-op is correct; the operand is a
       // duration nothing here can meaningfully honour.
@@ -2604,9 +2612,13 @@ class Parser {
     } else if (op0 == "cp" && parts.size() > 1 && parts[1] == "async") {
       // The group operations first: they carry no addresses.
       if (parts.size() > 2 && parts[2] == "commit_group") {
-        ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::Commit, 0};
+        OpCpAsyncGroup g;
+        g.kind = OpCpAsyncGroup::Kind::Commit;
+        ins.op = g;
       } else if (parts.size() > 2 && parts[2] == "wait_all") {
-        ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::WaitAll, 0};
+        OpCpAsyncGroup g;
+        g.kind = OpCpAsyncGroup::Kind::WaitAll;
+        ins.op = g;
       } else if (parts.size() > 3 && parts[2] == "mbarrier" && parts[3] == "arrive") {
         // cp.async.mbarrier.arrive[.noinc].shared.b64 [bar]
         OpCpAsyncGroup g;
@@ -2622,8 +2634,10 @@ class Parser {
         auto* imm = std::get_if<ImmInt>(&n);
         if (!imm || imm->value < 0)
           return unsupported("cp.async.wait_group needs a non-negative immediate");
-        ins.op = OpCpAsyncGroup{OpCpAsyncGroup::Kind::WaitGroup,
-                                static_cast<uint32_t>(imm->value)};
+        OpCpAsyncGroup g;
+        g.kind = OpCpAsyncGroup::Kind::WaitGroup;
+        g.keep = static_cast<uint32_t>(imm->value);
+        ins.op = g;
       } else {
         // cp.async.<ca|cg>.shared.global [dst], [src], cp-size{, src-size};
         bool cg = false, ca = false, shared_seen = false, global_seen = false;

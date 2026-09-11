@@ -70,13 +70,17 @@ int main() {
 
     __half2* d_acc;
     cudaMalloc(&d_acc, sizeof(__half2));
-    __half2 zero = __halves2half2(__float2half(0.0f), __float2half(0.0f));
-    cudaMemcpy(d_acc, &zero, sizeof zero, cudaMemcpyHostToDevice);
+    // Host code here uses no half2 helpers. __halves2half2, __low2half and
+    // __high2half are device-only in the CUDA 12.0 that CI builds with, and
+    // host-callable only in newer toolkits -- so this compiled on every
+    // developer machine and failed the first time CI ever ran it. A zero half
+    // is all-zero bits, and a __half2's halves are its public .x and .y.
+    cudaMemset(d_acc, 0, sizeof(__half2));
     half2_atomic<<<1, 64>>>(d_acc);
     cudaDeviceSynchronize();
     __half2 acc;
     cudaMemcpy(&acc, d_acc, sizeof acc, cudaMemcpyDeviceToHost);
-    const float lo = __half2float(__low2half(acc)), hi = __half2float(__high2half(acc));
+    const float lo = __half2float(acc.x), hi = __half2float(acc.y);
     if (lo != 64.0f || hi != 128.0f) {
         std::printf("FAIL half2 atomicAdd: got {%g, %g} want {64, 128}\n", lo, hi);
         ++failures;

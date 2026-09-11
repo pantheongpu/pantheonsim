@@ -20,6 +20,7 @@
 //    barriers or retirement. Blocks run sequentially in a fixed order.
 //    Everything is deterministic by construction.
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <thread>
@@ -1581,6 +1582,11 @@ class Interpreter {
       return;
     }
     if (std::holds_alternative<OpNop>(ins.op)) return;
+    if (std::holds_alternative<OpFence>(ins.op)) {
+      // Blocks run on several host threads; see OpFence.
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      return;
+    }
     if (const auto* op = std::get_if<OpActiveMask>(&ins.op)) {
       require_warp32(ins, "activemask");
       Lanes r;  // every active lane sees the same membership
@@ -1600,10 +1606,14 @@ class Interpreter {
     if (const auto* op = std::get_if<OpLd>(&ins.op)) {
       count_memory(op->space, op->ty.bytes(), popcount_mask(m), /*is_store=*/false);
       exec_ld(w, ctx, ins, *op, m);
+      // ld.acquire: nothing after it may be seen to happen before it.
+      if (op->acquire) std::atomic_thread_fence(std::memory_order_acquire);
       return;
     }
     if (const auto* op = std::get_if<OpSt>(&ins.op)) {
       count_memory(op->space, op->ty.bytes(), popcount_mask(m), /*is_store=*/true);
+      // st.release: nothing before it may be seen to happen after it.
+      if (op->release) std::atomic_thread_fence(std::memory_order_release);
       exec_st(w, ctx, ins, *op, m);
       return;
     }

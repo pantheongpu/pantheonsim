@@ -329,4 +329,47 @@ VTEST(cache_hints_are_accepted_and_ignored) {
   VCHECK_EQ(stores, size_t{1});
 }
 
+// A fence orders memory between blocks, which run on different host threads.
+// It was once a no-op (and before that a block-wide barrier); neither is what
+// CUB's decoupled look-back needs.
+VTEST(membar_and_fence_parse_as_fences_not_barriers) {
+  Module m = parse(wrap_kernel("membar.gl;\nmembar.cta;\nfence.acq_rel.gpu;\nfence.sc.sys;\nret;"));
+  size_t fences = 0, bars = 0;
+  for (const auto& i : m.entries[0].body) {
+    if (std::holds_alternative<OpFence>(i.op)) ++fences;
+    if (std::holds_alternative<OpBar>(i.op)) ++bars;
+  }
+  VCHECK_EQ(fences, size_t{4});
+  VCHECK_EQ(bars, size_t{0});
+}
+
+// ld.acquire and st.release carry their ordering to the interpreter; the
+// relaxed and volatile forms, and a plain access, carry none.
+VTEST(acquire_and_release_are_recorded_on_loads_and_stores) {
+  Module m = parse(wrap_kernel(
+      "ld.acquire.gpu.global.u32 %r1, [%rd1];\n"
+      "ld.relaxed.gpu.global.u32 %r2, [%rd1];\n"
+      "ld.volatile.global.u32 %r3, [%rd1];\n"
+      "ld.global.u32 %r4, [%rd1];\n"
+      "st.release.gpu.global.u32 [%rd1], %r1;\n"
+      "st.relaxed.gpu.global.u32 [%rd1], %r1;\n"
+      "st.global.u32 [%rd1], %r1;\n"
+      "ret;"));
+  std::vector<const OpLd*> lds;
+  std::vector<const OpSt*> sts;
+  for (const auto& i : m.entries[0].body) {
+    if (const auto* l = std::get_if<OpLd>(&i.op)) lds.push_back(l);
+    if (const auto* t = std::get_if<OpSt>(&i.op)) sts.push_back(t);
+  }
+  VCHECK_EQ(lds.size(), size_t{4});
+  VCHECK(lds[0]->acquire);
+  VCHECK(!lds[1]->acquire);
+  VCHECK(!lds[2]->acquire);
+  VCHECK(!lds[3]->acquire);
+  VCHECK_EQ(sts.size(), size_t{3});
+  VCHECK(sts[0]->release);
+  VCHECK(!sts[1]->release);
+  VCHECK(!sts[2]->release);
+}
+
 VTEST_MAIN

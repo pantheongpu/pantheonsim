@@ -151,8 +151,10 @@ enum class AtomOp { Add, Min, Max, And, Or, Xor, Exch, Cas, Inc, Dec };
 enum class PredBinOp { And, Or, Xor };
 
 // Vector loads/stores (v2/v4) carry 2 or 4 registers; scalar ops carry 1.
-struct OpLd { Space space = Space::Generic; Type ty; std::vector<Reg> dsts; Addr addr; };
-struct OpSt { Space space = Space::Generic; Type ty; Addr addr; std::vector<Operand> srcs; };
+// acquire/release are kept, not dropped as inert: blocks run on several host
+// threads, so the ordering a kernel asks for has to be real on the host too.
+struct OpLd { Space space = Space::Generic; Type ty; std::vector<Reg> dsts; Addr addr; bool acquire = false; };
+struct OpSt { Space space = Space::Generic; Type ty; Addr addr; std::vector<Operand> srcs; bool release = false; };
 struct OpMov { Type ty; Reg dst; Operand src; };
 // Vector forms of mov used by inline asm to pack/unpack sub-word registers:
 //   mov.b32 %r, {%rs1, %rs2};      pack two 16-bit halves into 32 bits
@@ -481,6 +483,10 @@ struct OpBar {};                                     // bar.sync 0
 // bar.sync made every fence wait for the whole block, which a kernel that
 // fences on one warp's path would have hung on.
 struct OpNop {};
+// membar / fence. Executed as a host memory fence, because blocks run on
+// several host threads and what one block wrote must be visible, in order,
+// to another that synchronizes through memory rather than a barrier.
+struct OpFence {};
 // activemask.b32 d -- the mask of lanes of this warp currently executing. Warp
 // algorithms use it as the membership for a following .sync operation.
 struct OpActiveMask { Reg dst; };
@@ -585,7 +591,7 @@ struct OpCall {
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
-                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpActiveMask>;
+                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask>;
 
 struct Instr {
   size_t line = 0;                 // source line, for diagnostics

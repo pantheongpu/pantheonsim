@@ -432,6 +432,7 @@ endfunction()
 
 vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_profile)
+vgpu_unit_test(test_driver_version)
 vgpu_unit_test(test_memory)
 vgpu_unit_test(test_ptx)
 target_compile_definitions(test_ptx PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR}/tests/kernels")

@@ -212,6 +212,7 @@ class MemoryManager {
   };
   std::unique_ptr<HostMaps> host_maps_;
   const HostMap* find_host_map_locked(uint64_t addr, uint64_t len) const;
+  const uint8_t* scalar_location(uint64_t addr, uint32_t size, bool create) const;
   std::map<uint64_t, Allocation> live_;        // base -> allocation
   // base -> record, bounded to kQuarantineEntries (oldest evicted first).
   std::map<uint64_t, FreedRecord> freed_;
