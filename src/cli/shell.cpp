@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -528,8 +529,15 @@ int cmd_shell(const std::vector<std::string>& args) {
     for (auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
     cargv.push_back(nullptr);
     ::execvp("unshare", cargv.data());
-    // unshare unavailable: fall through and run without isolation.
+    // unshare unavailable: fall through and run without isolation -- and
+    // actually without it. This used to print that message and then carry on
+    // with c.isolate still set, so the bind mounts below ran in the *host's*
+    // mount namespace: `mount --make-rprivate /`, then /etc/os-release,
+    // /proc/driver and /sys/class/drm overlaid for every process on the
+    // machine. As a normal user those fail and nobody notices; as root, on a
+    // box without unshare, they succeed.
     std::fprintf(stderr, "[vgpu] namespaces unavailable; continuing without /proc isolation\n");
+    c.isolate = false;
     stage2_session = s.dir;
   }
 
@@ -553,13 +561,20 @@ int cmd_shell(const std::vector<std::string>& args) {
       std::string cmd = "mount --bind '" + src + "' '" + dst + "' 2>/dev/null";
       return std::system(cmd.c_str()) == 0;
     };
-    std::system("mount --make-rprivate / 2>/dev/null");
-    bool ok = bind(s.root + "/etc/os-release", "/etc/os-release");
+    // Private first, and only then bind. This is what keeps the overlays
+    // inside the session's own namespace; on a host whose / is a shared mount,
+    // a bind made without it propagates out. If it cannot be done, the binds
+    // are not attempted at all -- the host's files showing through is the
+    // documented fallback, and overlaying the host's is not.
+    bool ok = false;
+    if (std::system("mount --make-rprivate / 2>/dev/null") == 0) {
+      ok = bind(s.root + "/etc/os-release", "/etc/os-release");
     // procfs will not accept new entries, so overlay the whole /proc/driver
     // directory. That makes /proc/driver/nvidia/version -- which plenty of
     // tools and install scripts check -- appear for the simulated driver.
     ok = bind(s.root + "/proc/driver", "/proc/driver") || ok;
-    ok = bind(s.root + "/sys/class/drm", "/sys/class/drm") || ok;
+      ok = bind(s.root + "/sys/class/drm", "/sys/class/drm") || ok;
+    }
     isolated = ok;
   }
 
@@ -655,8 +670,12 @@ int cmd_shell(const std::vector<std::string>& args) {
   if (pump.joinable()) pump.join();
   // Remove the session directory; otherwise every run leaves its generated
   // tools and system files behind in /tmp.
-  if (s.dir.rfind("/tmp/vgpu-session-", 0) == 0)
-    std::system(("rm -rf '" + s.dir + "' 2>/dev/null").c_str());
+  // No shell: the path is ours and the prefix check stays, but removing a
+  // directory does not need /bin/sh, quoting, or a return value to ignore.
+  if (s.dir.rfind("/tmp/vgpu-session-", 0) == 0) {
+    std::error_code ec;
+    std::filesystem::remove_all(s.dir, ec);
+  }
   if (c.command.empty())
     std::printf("\n  Session ended. Simulated %d x %s.\n", c.count, profile.model.c_str());
   return WIFEXITED(status) ? WEXITSTATUS(status) : 1;

@@ -4723,7 +4723,7 @@ class Interpreter {
   // where on a device it is not -- a permissive difference, so a program that
   // works on hardware works here, but one that copies a device-malloc'd
   // pointer to the host will pass here and fail there.
-  void exec_device_heap(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
+  void exec_device_heap(Warp& w, [[maybe_unused]] const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
     const bool allocating = op.callee == "malloc";
     if (op.param_slots.size() != 1)
       ctx_fail(ins, -1, Err::UnsupportedPtx,

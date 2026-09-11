@@ -460,6 +460,10 @@ set_tests_properties(c_harness_vector_add PROPERTIES ENVIRONMENT "VGPU_GPU=nvidi
 add_test(NAME smi_format COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_smi_format.sh)
 set_tests_properties(smi_format PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
 
+# With no `unshare`, vgpu shell must not touch the host's mounts.
+add_test(NAME isolation_fallback COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_isolation_fallback.sh)
+set_tests_properties(isolation_fallback PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+
 # End-to-end: an nvcc-compiled CUDA app run through libvgpucudart. Depends on
 # the runtime shim; only meaningful when it was built (CUDA headers present).
 if(TARGET vgpucudart)
