@@ -665,6 +665,10 @@ set_tests_properties(e2e_vgpu_run PROPERTIES
   DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
+add_test(NAME e2e_shell_nvcc_native COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_shell_nvcc_native.sh)
+set_tests_properties(e2e_shell_nvcc_native PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
 
 # Numba and Triton compiling Python straight to kernels that run here. Neither
 # framework uses cudart, so neither is reached by any other test: Numba goes
