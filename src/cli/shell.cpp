@@ -349,6 +349,27 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   // script over it: a PATH search at run time would find only this script and
   // exec itself forever.
   const std::string real_nvcc = find_program("nvcc");
+  // -arch=native, resolved to the card this session has. The real nvcc asks
+  // the driver and gets that answer too -- then builds for it as machine code
+  // alone (code=sm_75, no PTX), which a GPU runs and this simulator cannot, so
+  // the most common line in current tutorials built a binary whose every
+  // launch was refused. -arch=sm_XX is the same target with PTX embedded.
+  const std::string native_arch =
+      p.vendor == "nvidia" && p.cc_major > 0
+          ? "sm_" + std::to_string(p.cc_major) + std::to_string(p.cc_minor)
+          : "";
+  const std::string native_rewrite =
+      native_arch.empty()
+          ? ""
+          : "prev=\n"
+            "for a do\n"
+            "  shift\n"
+            "  case \"$a\" in\n"
+            "    -arch=native|--gpu-architecture=native) a=\"${a%%=*}=" + native_arch + "\" ;;\n"
+            "    native) case \"$prev\" in -arch|--gpu-architecture) a=" + native_arch + " ;; esac ;;\n"
+            "  esac\n"
+            "  set -- \"$@\" \"$a\"; prev=\"$a\"\n"
+            "done\n";
   tool("nvcc",
        "# The session compiler. VGPU_NVCC_PASSTHROUGH=1 removes the -cudart flag.\n"
        "if [ \"${1:-}\" = \"--version\" ]; then\n"
@@ -357,7 +378,8 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
        "  exit 0\nfi\n"
        "REAL='" + real_nvcc + "'\n"
        "[ -x \"$REAL\" ] || { echo 'nvcc: no CUDA toolkit in this session' >&2; exit 127; }\n"
-       "[ \"${VGPU_NVCC_PASSTHROUGH:-0}\" = 1 ] && exec \"$REAL\" \"$@\"\n"
+       "[ \"${VGPU_NVCC_PASSTHROUGH:-0}\" = 1 ] && exec \"$REAL\" \"$@\"\n" +
+       native_rewrite +
        "for a in \"$@\"; do\n"
        "  case \"$a\" in\n"
        "    -cudart|-cudart=*|--cudart|--cudart=*|--help|-h) exec \"$REAL\" \"$@\" ;;\n"
