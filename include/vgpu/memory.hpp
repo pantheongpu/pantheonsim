@@ -212,7 +212,11 @@ class MemoryManager {
   };
   std::unique_ptr<HostMaps> host_maps_;
   const HostMap* find_host_map_locked(uint64_t addr, uint64_t len) const;
-  const uint8_t* scalar_location(uint64_t addr, uint32_t size, bool create) const;
+  // Where a kernel's scalar access lands: bytes in a chunk, memory nothing has
+  // written (a load reads zero and must not copy), or a managed host mapping.
+  enum class ScalarAt { Chunk, Untouched, HostMap };
+  ScalarAt scalar_location(uint64_t addr, uint32_t size, bool create,
+                           const uint8_t** where) const;
   std::map<uint64_t, Allocation> live_;        // base -> allocation
   // base -> record, bounded to kQuarantineEntries (oldest evicted first).
   std::map<uint64_t, FreedRecord> freed_;

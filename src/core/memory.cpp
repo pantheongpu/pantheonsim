@@ -20,6 +20,34 @@ void relaxed_store(uint8_t* p, uint64_t v) {
   std::atomic_ref<T>(*reinterpret_cast<T*>(p)).store(static_cast<T>(v), std::memory_order_relaxed);
 }
 
+// A scalar in place, as an atomic of its own width -- or byte by byte when the
+// chunk's storage is not aligned for that width, so no path copies the bytes a
+// concurrent store is writing.
+uint64_t load_at(const uint8_t* p, uint32_t size) {
+  if (reinterpret_cast<uintptr_t>(p) % size == 0) {
+    switch (size) {
+      case 1: return relaxed_load<uint8_t>(p);
+      case 2: return relaxed_load<uint16_t>(p);
+      case 4: return relaxed_load<uint32_t>(p);
+      default: return relaxed_load<uint64_t>(p);
+    }
+  }
+  uint64_t v = 0;
+  for (uint32_t i = 0; i < size; ++i) v |= relaxed_load<uint8_t>(p + i) << (8 * i);
+  return v;
+}
+void store_at(uint8_t* p, uint32_t size, uint64_t v) {
+  if (reinterpret_cast<uintptr_t>(p) % size == 0) {
+    switch (size) {
+      case 1: relaxed_store<uint8_t>(p, v); return;
+      case 2: relaxed_store<uint16_t>(p, v); return;
+      case 4: relaxed_store<uint32_t>(p, v); return;
+      default: relaxed_store<uint64_t>(p, v); return;
+    }
+  }
+  for (uint32_t i = 0; i < size; ++i) relaxed_store<uint8_t>(p + i, (v >> (8 * i)) & 0xff);
+}
+
 // Formats an address as 0x-prefixed hex for diagnostics.
 struct Hex {
   uint64_t v;
@@ -312,13 +340,18 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
   if (addr % size != 0)
     throw Error::make(Err::MisalignedAccess, "load of ", size, " bytes at ", Hex{addr},
                       " is not naturally aligned (real GPUs fault on this)");
-  if (const uint8_t* p = scalar_location(addr, size, /*create=*/false)) {
-    switch (size) {
-      case 1: return relaxed_load<uint8_t>(p);
-      case 2: return relaxed_load<uint16_t>(p);
-      case 4: return relaxed_load<uint32_t>(p);
-      default: return relaxed_load<uint64_t>(p);
-    }
+  const uint8_t* p = nullptr;
+  switch (scalar_location(addr, size, /*create=*/false, &p)) {
+    case ScalarAt::Chunk:
+      return load_at(p, size);
+    case ScalarAt::Untouched:
+      // Zero, answered here. Falling back to read() instead was a race: a
+      // first store on another thread could materialize the chunk between
+      // this check and read()'s copy, which then memcpy'd bytes an atomic
+      // store was writing. ThreadSanitizer caught it on main.
+      return 0;
+    case ScalarAt::HostMap:
+      break;
   }
   uint64_t v = 0;
   read(addr, &v, size);  // little-endian host assumption, documented in ARCHITECTURE.md
@@ -331,21 +364,18 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
   if (addr % size != 0)
     throw Error::make(Err::MisalignedAccess, "store of ", size, " bytes at ", Hex{addr},
                       " is not naturally aligned (real GPUs fault on this)");
-  if (uint8_t* p = const_cast<uint8_t*>(scalar_location(addr, size, /*create=*/true))) {
-    switch (size) {
-      case 1: relaxed_store<uint8_t>(p, value); return;
-      case 2: relaxed_store<uint16_t>(p, value); return;
-      case 4: relaxed_store<uint32_t>(p, value); return;
-      default: relaxed_store<uint64_t>(p, value); return;
-    }
+  const uint8_t* p = nullptr;
+  if (scalar_location(addr, size, /*create=*/true, &p) == ScalarAt::Chunk) {
+    store_at(const_cast<uint8_t*>(p), size, value);
+    return;
   }
-  write(addr, &value, size);
+  write(addr, &value, size);  // a managed host mapping, behind its own lock
 }
 
-// Where a kernel's scalar load or store lives in the chunk table, or null when
-// it should take the general path instead: managed memory (the caller's own
-// buffer, behind a lock), memory never written (reads as zero and shares no
-// bytes with anyone), or a host address that is not aligned for an atomic.
+// Where a kernel's scalar load or store lives: bytes in a chunk (materialized
+// first when this is a store), memory nothing has written (only ever answered
+// for a load), or managed memory -- the caller's own buffer, which takes the
+// general path behind its lock.
 //
 // Why this exists. Blocks run on several host threads, and a kernel is allowed
 // to share memory between blocks -- CUB's decoupled look-back scan, under
@@ -361,10 +391,11 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
 //
 // A naturally aligned scalar cannot straddle a chunk -- kChunkSize is a
 // multiple of 8 -- so it is always one location in one chunk.
-const uint8_t* MemoryManager::scalar_location(uint64_t addr, uint32_t size, bool create) const {
+MemoryManager::ScalarAt MemoryManager::scalar_location(uint64_t addr, uint32_t size, bool create,
+                                                       const uint8_t** where) const {
   if (host_maps_) {
     std::lock_guard<std::mutex> lock(host_maps_->mu);
-    if (find_host_map_locked(addr, size)) return nullptr;
+    if (find_host_map_locked(addr, size)) return ScalarAt::HostMap;
   }
   uint64_t base = 0;
   auto& a = const_cast<Allocation&>(resolve(addr, size, create ? "device memory write"
@@ -373,12 +404,11 @@ const uint8_t* MemoryManager::scalar_location(uint64_t addr, uint32_t size, bool
   const uint64_t chunk_idx = off / kChunkSize;
   uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
   if (!chunk) {
-    if (!create) return nullptr;
+    if (!create) return ScalarAt::Untouched;
     chunk = const_cast<MemoryManager*>(this)->materialize(a, chunk_idx);
   }
-  const uint8_t* p = chunk + off % kChunkSize;
-  if (reinterpret_cast<uintptr_t>(p) % size != 0) return nullptr;
-  return p;
+  *where = chunk + off % kChunkSize;
+  return ScalarAt::Chunk;
 }
 
 }  // namespace vgpu
