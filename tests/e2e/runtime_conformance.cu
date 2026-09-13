@@ -26,14 +26,14 @@ int main() {
   cudaError_t e = cudaSetDevice(2);
   CHECK("cudaSetDevice out of range", e == cudaErrorInvalidDevice, "got %d", e);
   cudaGetLastError();
-  CHECK("cudaFree(nullptr)", cudaFree(nullptr) == cudaSuccess, "");
+  CHECK("cudaFree(nullptr)", cudaFree(nullptr) == cudaSuccess, "unexpected");
 
   int* big = nullptr;
   e = cudaMalloc(&big, (size_t)1 << 50);
   CHECK("cudaMalloc beyond the device", e == cudaErrorMemoryAllocation, "got %d", e);
-  CHECK("peek does not reset", cudaPeekAtLastError() == cudaErrorMemoryAllocation, "");
-  CHECK("get returns it", cudaGetLastError() == cudaErrorMemoryAllocation, "");
-  CHECK("and resets", cudaGetLastError() == cudaSuccess, "");
+  CHECK("peek does not reset", cudaPeekAtLastError() == cudaErrorMemoryAllocation, "unexpected");
+  CHECK("get returns it", cudaGetLastError() == cudaErrorMemoryAllocation, "unexpected");
+  CHECK("and resets", cudaGetLastError() == cudaSuccess, "unexpected");
 
   cudaDeviceProp p;
   std::memset(&p, 0, sizeof p);
@@ -43,7 +43,7 @@ int main() {
         "%s %d.%d %d %d", p.name, p.major, p.minor, p.maxThreadsPerBlock, p.maxThreadsDim[2]);
   size_t free0 = 0, total = 0;
   cudaMemGetInfo(&free0, &total);
-  CHECK("memGetInfo total", total == p.totalGlobalMem && free0 <= total, "");
+  CHECK("memGetInfo total", total == p.totalGlobalMem && free0 <= total, "unexpected");
 
   // Where a pointer lives. Pinned and managed memory used to report
   // "unregistered".
@@ -80,7 +80,7 @@ int main() {
   e = cudaGetLastError();
   CHECK("an empty grid", e == cudaErrorInvalidConfiguration, "got %d", e);
   fill<<<1, 64>>>(d, 64);
-  CHECK("a valid launch still works after them", cudaDeviceSynchronize() == cudaSuccess, "");
+  CHECK("a valid launch still works after them", cudaDeviceSynchronize() == cudaSuccess, "unexpected");
 
   cudaStream_t s;
   cudaStreamCreate(&s);
@@ -91,16 +91,23 @@ int main() {
   cudaStreamSynchronize(s);
   CHECK("async round trip", pinned[63] == 1063, "got %d", pinned[63]);
 
+  // Everything this program allocated on the host, released while the context
+  // is still usable -- after the illegal address below, frees fail too. CI runs
+  // with LeakSanitizer, which counts these.
+  CHECK("frees succeed", cudaFreeHost(pinned) == cudaSuccess && cudaFree(m) == cudaSuccess,
+        "unexpected");
+  std::free(host);
+
   // Last: a kernel's illegal address corrupts the context, and it stays
   // corrupted until a reset. The next call used to succeed.
   oob<<<1, 1>>>(d);
   e = cudaDeviceSynchronize();
   CHECK("out-of-bounds write -> illegal address", e == cudaErrorIllegalAddress, "got %d", e);
   int* after = nullptr;
-  CHECK("sticky: the next malloc fails", cudaMalloc(&after, 16) == cudaErrorIllegalAddress, "");
+  CHECK("sticky: the next malloc fails", cudaMalloc(&after, 16) == cudaErrorIllegalAddress, "unexpected");
   CHECK("sticky: reading it does not clear it", cudaGetLastError() == cudaErrorIllegalAddress &&
-                                                   cudaGetLastError() == cudaErrorIllegalAddress, "");
-  CHECK("reset clears it", cudaDeviceReset() == cudaSuccess && cudaMalloc(&after, 16) == cudaSuccess, "");
+                                                   cudaGetLastError() == cudaErrorIllegalAddress, "unexpected");
+  CHECK("reset clears it", cudaDeviceReset() == cudaSuccess && cudaMalloc(&after, 16) == cudaSuccess, "unexpected");
 
   std::printf("%d failed\n", fails);
   return fails != 0;
