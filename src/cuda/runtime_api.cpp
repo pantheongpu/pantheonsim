@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <dlfcn.h>
@@ -166,6 +167,36 @@ void ensure_init(State& s) {
 // Sticky last error, per the runtime API contract.
 thread_local cudaError_t g_last_error = cudaSuccess;
 
+// A context a kernel has corrupted. CUDA documents an illegal address, an
+// illegal instruction and a device-side assert as leaving the context unusable:
+// every later call fails the same way until the device is reset. This used to
+// be forgotten on the next call -- cudaMalloc succeeded right after a kernel had
+// written past its allocation -- so a program that did not check the launch
+// carried on computing with whatever the dead kernel had left behind, which on
+// hardware it could not have done. Per process, like the context it models.
+cudaError_t g_sticky_error = cudaSuccess;
+
+// Only faults inside a kernel poison the context. The same codes from a host
+// call -- a cudaMemcpy past the end of a buffer -- are argument errors, and a
+// data race is this simulator's own finding, not a condition hardware has.
+bool poisons_context(const char* api, vgpu::Err e) {
+  using vgpu::Err;
+  const bool in_kernel = std::strncmp(api, "cudaLaunch", 10) == 0 ||
+                         std::strncmp(api, "cudaGraphLaunch", 15) == 0;
+  switch (e) {
+    case Err::InvalidPointer:
+    case Err::UseAfterFree:
+    case Err::OutOfBounds:
+    case Err::MisalignedAccess:
+    case Err::UninitializedRegister:
+    case Err::Trap:
+    case Err::DeviceAssert:
+      return in_kernel;
+    default:
+      return false;
+  }
+}
+
 cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
   using vgpu::Err;
   cudaError_t code;
@@ -190,9 +221,17 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
     // "unspecified launch failure" is the closest real code, and it is at least
     // true that the launch did not produce a result anyone should use.
     case Err::DataRace: code = cudaErrorLaunchFailure; break;
+    // Too many threads per block, a block or grid dimension past the device's
+    // limit, or a zero-sized one. CUDA's name for that is "invalid configuration
+    // argument"; it used to fall through to cudaErrorInvalidValue, which is not
+    // what anyone searching for that message would find. (The driver API's
+    // cuLaunchKernel reports CUDA_ERROR_INVALID_VALUE for the same launch, and
+    // keeps doing so in driver_api.cpp.)
+    case Err::LaunchConfig: code = cudaErrorInvalidConfiguration; break;
     default: code = cudaErrorInvalidValue; break;
   }
   (void)s;
+  if (poisons_context(api, e.code())) g_sticky_error = code;
   if (!quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", api, e.what());
   g_last_error = code;
   return code;
@@ -227,6 +266,10 @@ cudaError_t guard(const char* api, F&& body) {
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   try {
     ensure_init(s);
+    if (g_sticky_error != cudaSuccess) {
+      g_last_error = g_sticky_error;
+      return g_sticky_error;
+    }
     cudaError_t rc = body(s);
     if (rc != cudaSuccess) g_last_error = rc;
     return rc;
@@ -744,10 +787,12 @@ VGPU_EXPORT cudaError_t cudaDeviceSynchronize(void) {
   // that had died on an illegal address reported success. Every launch here is
   // synchronous, so by the time this is called the error is already recorded;
   // there is nothing to wait for and nothing to consume.
-  return g_last_error;
+  return g_sticky_error != cudaSuccess ? g_sticky_error : g_last_error;
 }
+// The one way out of a corrupted context, as on hardware.
 VGPU_EXPORT cudaError_t cudaDeviceReset(void) {
   g_last_error = cudaSuccess;
+  g_sticky_error = cudaSuccess;
   return cudaSuccess;
 }
 VGPU_EXPORT cudaError_t cudaThreadSynchronize(void) { return cudaDeviceSynchronize(); }
@@ -1316,9 +1361,28 @@ VGPU_EXPORT cudaError_t cudaPointerGetAttributes(cudaPointerAttributes* attr, co
       attr->device = static_cast<int>((a - vgpu::kDeviceVaBase) / vgpu::kDeviceVaStride);
       attr->devicePointer = const_cast<void*>(p);
     } else {
-      attr->type = cudaMemoryTypeUnregistered;
+      // Pinned and managed allocations are host addresses too, and callers
+      // branch on the difference: a framework picks a zero-copy path for a
+      // pinned buffer and a migration path for a managed one. Both used to come
+      // back "unregistered", as if nobody had allocated them through CUDA.
+      auto inside = [p](const std::map<void*, size_t>& allocs) {
+        auto it = allocs.upper_bound(const_cast<void*>(p));
+        if (it == allocs.begin()) return false;
+        --it;
+        return static_cast<const char*>(p) <
+               static_cast<const char*>(it->first) + std::max<size_t>(it->second, 1);
+      };
       attr->device = st.current_device;
       attr->hostPointer = const_cast<void*>(p);
+      if (inside(st.managed_allocs)) {
+        attr->type = cudaMemoryTypeManaged;
+        attr->devicePointer = const_cast<void*>(p);   // one address, as with UVA
+      } else if (inside(st.host_allocs)) {
+        attr->type = cudaMemoryTypeHost;
+        attr->devicePointer = const_cast<void*>(p);   // mapped at the same address
+      } else {
+        attr->type = cudaMemoryTypeUnregistered;
+      }
     }
     return cudaSuccess;
   });
@@ -1847,12 +1911,15 @@ VGPU_EXPORT cudaError_t cudaEventDestroy(cudaEvent_t e) {
 /* Errors and versions                                                   */
 /* ===================================================================== */
 
+// A sticky error is not cleared by reading it: the context is still unusable.
 VGPU_EXPORT cudaError_t cudaGetLastError(void) {
   cudaError_t e = g_last_error;
   g_last_error = cudaSuccess;
-  return e;
+  return g_sticky_error != cudaSuccess ? g_sticky_error : e;
 }
-VGPU_EXPORT cudaError_t cudaPeekAtLastError(void) { return g_last_error; }
+VGPU_EXPORT cudaError_t cudaPeekAtLastError(void) {
+  return g_sticky_error != cudaSuccess ? g_sticky_error : g_last_error;
+}
 
 // Both of these must name every code this shim can return. They did not: the
 // tables listed eight of the seventeen, so a program that printed

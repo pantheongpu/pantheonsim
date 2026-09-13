@@ -311,7 +311,6 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
        "  --version) echo \"NVIDIA-SMI version  : VirtualGPU (simulated)\";\n"
        "             echo \"DRIVER version      : " + c.driver + "\";\n"
        "             echo \"CUDA Version        : " + c.cuda + "\"; exit 0 ;;\n"
-       "  -L|--list-gpus) exec \"" + vgpu + "\" smi --list ;;\n"
        "esac\nexec \"" + vgpu + "\" smi \"$@\"\n");
   tool("rocm-smi", "exec \"" + vgpu + "\" smi --rocm \"$@\"\n");
   tool("rocm_agent_enumerator", "exec \"" + vgpu + "\" smi --agents\n");

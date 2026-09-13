@@ -460,6 +460,10 @@ set_tests_properties(c_harness_vector_add PROPERTIES ENVIRONMENT "VGPU_GPU=nvidi
 # is pinned against a physical driver's output rather than left to drift.
 add_test(NAME smi_format COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_smi_format.sh)
 set_tests_properties(smi_format PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+add_test(NAME smi_queries COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_smi_queries.sh)
+set_tests_properties(smi_queries PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+add_test(NAME nvml_api COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_nvml_api.sh)
+set_tests_properties(nvml_api PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
 
 # With no `unshare`, vgpu shell must not touch the host's mounts.
 add_test(NAME isolation_fallback COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_isolation_fallback.sh)
@@ -665,6 +669,10 @@ set_tests_properties(e2e_vgpu_run PROPERTIES
   DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
+add_test(NAME e2e_runtime_conformance COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_runtime_conformance.sh)
+set_tests_properties(e2e_runtime_conformance PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
 add_test(NAME e2e_shell_nvcc_native COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_shell_nvcc_native.sh)
 set_tests_properties(e2e_shell_nvcc_native PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
