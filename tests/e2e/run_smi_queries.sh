@@ -53,4 +53,30 @@ expect "-q names the brand" "Product Brand : NVIDIA" "$(grep -m1 'Product Brand'
 expect "-q names the architecture" "Product Architecture : Turing" \
   "$(grep -m1 'Product Architecture' <<< "$q" | tr -s ' ' | sed 's/^ //')"
 
+# topo -m: the matrix scripts split on tabs. Links go through the host, so
+# every pair is PHB; no NVLink is claimed that no profile measured.
+topo=$(smi topo -m)
+expect "topo -m header names each GPU and the affinity columns" \
+  $'\tGPU0\tGPU1\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID' "$(head -1 <<< "$topo")"
+expect "topo -m rows: self is X, peers are PHB" "GPU0| X |PHB GPU1|PHB| X " \
+  "$(sed -n 2,3p <<< "$topo" | awk -F'\t' '{printf "%s|%s|%s ", $1, $2, $3}' | sed 's/ $//')"
+expect "topo -m has its legend" "yes" "$(grep -q '^  PHB  = ' <<< "$topo" && echo yes || echo no)"
+smi topo >/dev/null 2>&1; expect "topo without -m is refused" "2" "$?"
+
+# -q -x: well-formed XML under the real element names.
+if command -v python3 >/dev/null; then
+  xml=$(smi -q -x -i 1)
+  got=$(python3 -c '
+import sys, xml.dom.minidom as m
+d = m.parseString(sys.stdin.read())
+t = lambda n, e=d: e.getElementsByTagName(n)[0].firstChild.data
+gpus = d.getElementsByTagName("gpu")
+print(t("driver_version"), t("cuda_version"), t("attached_gpus"), len(gpus),
+      gpus[0].getAttribute("id"), t("product_name", gpus[0]), t("product_architecture", gpus[0]),
+      t("total", gpus[0].getElementsByTagName("fb_memory_usage")[0]), t("gpu_util", gpus[0]))
+' <<< "$xml" 2>&1)
+  expect "-q -x parses and carries the -q values" \
+    "550.54.15 12.4 2 1 00000000:02:00.0 Tesla T4 Turing 15360 MiB 0 %" "$got"
+fi
+
 exit $fail
