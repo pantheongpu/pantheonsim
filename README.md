@@ -119,6 +119,25 @@ scripts/run-pantheon-workloads.sh        # builds and runs the whole suite
 
 See [docs/pantheon-workloads.md](docs/pantheon-workloads.md).
 
+### Running CUDA tests in GitHub Actions
+
+Hosted runners have no GPU; this repository is also a GitHub Action that gives
+a job simulated ones:
+
+```yaml
+- uses: pantheongpu/pantheonsim@main
+  with:
+    gpu: nvidia/h100
+    count: 2
+- run: |
+    nvcc -arch=compute_90 my_test.cu -o my_test
+    vgpu run ./my_test
+```
+
+It builds the simulator (cached across runs), puts `vgpu`, `nvidia-smi` and the
+`nvcc` wrapper on `PATH`, and sets the GPU for the rest of the job. See
+[docs/github-action.md](docs/github-action.md).
+
 ### Running a driver-API program against the virtual GPU
 
 ```c

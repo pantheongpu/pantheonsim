@@ -1,0 +1,111 @@
+name: PantheonSim
+description: Run CUDA programs and tests on simulated NVIDIA GPUs, on a runner that has no GPU.
+author: PantheonGPU
+branding:
+  icon: cpu
+  color: green
+
+inputs:
+  gpu:
+    description: The GPU to simulate, by profile id (`vgpu list-gpus`), e.g. nvidia/h100 or nvidia/t4.
+    default: nvidia/t4
+  count:
+    description: How many of them.
+    default: '1'
+  cuda-toolkit:
+    description: >
+      `apt` installs Ubuntu's nvidia-cuda-toolkit so the job can compile CUDA code.
+      `none` uses a toolkit the job has already installed (the simulator's CUDA
+      libraries are built against whichever toolkit is present, and match its version).
+    default: apt
+
+outputs:
+  build-dir:
+    description: Where the simulator was built.
+    value: ${{ steps.paths.outputs.build }}
+  shim-dir:
+    description: The simulator's CUDA libraries, for LD_LIBRARY_PATH when not using `vgpu run`.
+    value: ${{ steps.paths.outputs.shim }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the runner
+      shell: bash
+      run: |
+        if [[ "$RUNNER_OS" != Linux ]]; then
+          echo "::error::PantheonSim runs on Linux runners (it simulates a Linux GPU driver)."
+          exit 1
+        fi
+
+    - name: Install build tools
+      shell: bash
+      env:
+        TOOLKIT: ${{ inputs.cuda-toolkit }}
+      run: |
+        case "$TOOLKIT" in apt|none) ;; *) echo "::error::cuda-toolkit must be apt or none, not '$TOOLKIT'"; exit 1 ;; esac
+        pkgs="cmake ninja-build g++"
+        # Ubuntu's toolkit is CUDA 12.0, whose nvcc accepts gcc 12 at most.
+        [[ "$TOOLKIT" == apt ]] && pkgs="$pkgs nvidia-cuda-toolkit g++-12"
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends $pkgs
+
+    - name: Work out the build
+      id: paths
+      shell: bash
+      env:
+        SRC: ${{ github.action_path }}
+      run: |
+        build="$RUNNER_TEMP/pantheonsim-build"
+        # The cache key is the source itself, so a moving ref like @main rebuilds
+        # exactly when the simulator changed -- and the toolkit version, because
+        # the CUDA libraries are built against its headers.
+        src=$(cd "$SRC" && find CMakeLists.txt src include profiles tools scripts -type f -print0 \
+              | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-20)
+        nvcc_version=$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1)
+        {
+          echo "build=$build"
+          echo "shim=$build/shim"
+          echo "key=pantheonsim-${RUNNER_OS}-${RUNNER_ARCH}-${src}-cuda${nvcc_version:-none}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore a previous build
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.paths.outputs.build }}
+        key: ${{ steps.paths.outputs.key }}
+
+    - name: Build the simulator
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        SRC: ${{ github.action_path }}
+        BUILD: ${{ steps.paths.outputs.build }}
+      run: |
+        cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
+        cmake --build "$BUILD" -j"$(nproc)"
+
+    - name: Put the simulated GPUs in place
+      shell: bash
+      env:
+        BUILD: ${{ steps.paths.outputs.build }}
+        GPU: ${{ inputs.gpu }}
+        COUNT: ${{ inputs.count }}
+        TOOLKIT: ${{ inputs.cuda-toolkit }}
+      run: |
+        # An unknown profile fails here, by name, rather than in the job's tests.
+        "$BUILD/vgpu" info --gpu "$GPU" > /dev/null || { echo "::error::no GPU profile '$GPU' (see vgpu list-gpus)"; exit 1; }
+        if ! [[ "$COUNT" =~ ^[1-9][0-9]*$ ]]; then echo "::error::count must be a positive number, not '$COUNT'"; exit 1; fi
+        # vgpu lives one level up and finds its shim beside itself; the build
+        # links it into bin, but a cached build from before that did not.
+        [[ -e "$BUILD/bin/vgpu" ]] || ln -s ../vgpu "$BUILD/bin/vgpu"
+        # build/bin first: nvidia-smi and nvcc there are the simulator's drop-ins
+        # (nvcc adds -cudart shared, so unmodified build systems link the runtime
+        # the simulator can stand in for), and vgpu runs programs against it.
+        echo "$BUILD/bin" >> "$GITHUB_PATH"
+        { echo "VGPU_GPU=$GPU"; echo "VGPU_DEVICE_COUNT=$COUNT"; echo "VGPU_SHIM_DIR=$BUILD/shim"; } >> "$GITHUB_ENV"
+        if [[ "$TOOLKIT" == apt ]] && command -v g++-12 > /dev/null; then
+          echo "NVCC_PREPEND_FLAGS=-ccbin g++-12" >> "$GITHUB_ENV"
+        fi
+        VGPU_GPU="$GPU" VGPU_DEVICE_COUNT="$COUNT" "$BUILD/bin/nvidia-smi" -L
