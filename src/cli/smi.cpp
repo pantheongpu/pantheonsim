@@ -5,6 +5,7 @@
 // from real simulator state (memory, utilization) are exact; the power /
 // temperature / clock / voltage columns are a synthetic model driven by real
 // utilization and are marked as such by --explain.
+#include <cctype>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -25,6 +26,65 @@ const char* perf_state_name(uint32_t p) {
 
 int mib(uint64_t bytes) { return static_cast<int>(bytes / (1024 * 1024)); }
 
+// Which devices a command talks about: all of them, or the -i/--id selection.
+// nvidia-smi accepts an index, a UUID or a PCI bus id, comma-separated, and the
+// selection used to be read and thrown away -- `nvidia-smi -i 1` printed every
+// GPU, and `-i 7` on a two-GPU machine printed both and exited 0, so a script
+// asking about one card got the whole rack and no error.
+std::string lower(std::string v) {
+  for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return v;
+}
+bool select_devices(const vgpu::telemetry::Shared& s, const std::string& spec,
+                    std::vector<uint32_t>* out) {
+  out->clear();
+  if (spec.empty()) {
+    for (uint32_t i = 0; i < s.device_count; ++i) out->push_back(i);
+    return true;
+  }
+  for (size_t at = 0; at <= spec.size();) {
+    const size_t comma = spec.find(',', at);
+    std::string tok = spec.substr(at, (comma == std::string::npos ? spec.size() : comma) - at);
+    while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
+    while (!tok.empty() && tok.back() == ' ') tok.pop_back();
+    bool found = false;
+    for (uint32_t i = 0; i < s.device_count && !found; ++i) {
+      const auto& d = s.devices[i];
+      const bool digits = !tok.empty() &&
+                          tok.find_first_not_of("0123456789") == std::string::npos;
+      if (digits) {
+        found = std::to_string(i) == std::to_string(std::stoul(tok));
+      } else if (lower(tok) == lower(d.uuid)) {
+        found = true;
+      } else if (tok.find(':') != std::string::npos) {
+        // "00000000:01:00.0", "0000:01:00.0" and "01:00.0" all name the same
+        // device, so compare from the right.
+        const std::string id = lower(d.bus_id), want = lower(tok);
+        found = id.size() >= want.size() && id.compare(id.size() - want.size(), want.size(), want) == 0;
+      }
+      if (found) out->push_back(i);
+    }
+    if (!found) return false;
+    if (comma == std::string::npos) break;
+    at = comma + 1;
+  }
+  return true;
+}
+
+// What -q prints for brand and architecture. The profile carries lower-case
+// ids ("turing", "nvidia"); the tool prints names.
+const char* brand_name(const vgpu::telemetry::DeviceSample& d) {
+  if (std::strcmp(d.vendor, "amd") == 0) return "AMD";
+  return std::strstr(d.name, "GeForce") || std::strstr(d.name, "RTX 30") ? "GeForce" : "NVIDIA";
+}
+std::string architecture_name(const char* arch) {
+  const std::string a = lower(arch);
+  if (a == "ada" || a == "ada_lovelace" || a == "ada lovelace") return "Ada Lovelace";
+  std::string out = arch;
+  if (!out.empty()) out[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(out[0])));
+  return out;
+}
+
 // The frame nvidia-smi draws: 91 columns, three fields of 41, 24 and 22
 // between the bars. Every width below was measured from a real driver's output
 // rather than guessed, because this table is a parsed interface -- people
@@ -37,7 +97,7 @@ const char* const kFrame =
 const char* const kRowRule =
     "+-----------------------------------------+------------------------+----------------------+\n";
 
-void print_gpu_table(const vgpu::telemetry::Shared& s) {
+void print_gpu_table(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>& sel) {
   // Real nvidia-smi opens with the wall clock, padded out to the frame width.
   std::time_t now = std::time(nullptr);
   std::tm tm{};
@@ -60,7 +120,7 @@ void print_gpu_table(const vgpu::telemetry::Shared& s) {
   std::printf("|                                         |                        |               MIG M. |\n");
   std::printf("|=========================================+========================+======================|\n");
 
-  for (uint32_t i = 0; i < s.device_count; ++i) {
+  for (uint32_t i : sel) {
     const auto& d = s.devices[i];
     // "58W /  700W": the cap is padded to four digits, which is what puts the
     // two numbers under one another across a multi-GPU listing.
@@ -88,7 +148,7 @@ void print_gpu_table(const vgpu::telemetry::Shared& s) {
   std::printf("|        ID   ID                                                               Usage      |\n");
   std::printf("|=========================================================================================|\n");
   uint32_t shown = 0;
-  for (uint32_t i = 0; i < s.device_count; ++i) {
+  for (uint32_t i : sel) {
     const auto& d = s.devices[i];
     for (uint32_t j = 0; j < d.proc_count && j < vgpu::telemetry::kMaxProcs; ++j) {
       const auto& pr = d.procs[j];
@@ -154,10 +214,10 @@ std::string query_field(const vgpu::telemetry::DeviceSample& d, uint32_t index,
   if (field == "uuid" || field == "gpu_uuid") return d.uuid;
   if (field == "serial" || field == "gpu_serial") return "[N/A]";
   if (field == "pci.bus_id" || field == "gpu_bus_id") return d.bus_id;
-  if (field == "driver_version") {
-    const char* v = std::getenv("VGPU_DRIVER_VERSION");
-    return v && *v ? v : "580.00.00";
-  }
+  if (field == "driver_version")
+    // The snapshot's, as the table header prints: an environment lookup here
+    // could disagree with the header two lines above it.
+    return s.driver_version[0] ? s.driver_version : "580.00.00";
   if (field == "compute_cap") {
     std::snprintf(buf, sizeof buf, "%u.%u", d.cc_major, d.cc_minor);
     return buf;
@@ -178,18 +238,36 @@ std::string query_field(const vgpu::telemetry::DeviceSample& d, uint32_t index,
     std::snprintf(buf, sizeof buf, "%.2f", d.power_limit_mw / 1000.0);
     return with(buf, "W");
   }
-  if (field == "clocks.sm" || field == "clocks.current.sm") return num(d.sm_clock_mhz, "MHz");
+  // clocks.gr is the documented short form of the graphics (SM) clock, and the
+  // one Pantheon queries; it used to come back [N/A].
+  if (field == "clocks.sm" || field == "clocks.current.sm" || field == "clocks.gr" ||
+      field == "clocks.current.graphics")
+    return num(d.sm_clock_mhz, "MHz");
   if (field == "clocks.mem" || field == "clocks.current.memory")
     return num(d.mem_clock_mhz, "MHz");
-  if (field == "clocks.max.sm") return num(d.sm_clock_max_mhz, "MHz");
+  if (field == "clocks.max.sm" || field == "clocks.max.gr" || field == "clocks.max.graphics")
+    return num(d.sm_clock_max_mhz, "MHz");
   if (field == "clocks.max.memory") return num(d.mem_clock_max_mhz, "MHz");
   if (field == "fan.speed") return num(d.fan_percent, "%");
+  // Nothing throttles a simulated clock, so the honest bitmask is empty.
+  if (field == "clocks_throttle_reasons.active" || field == "clocks_event_reasons.active")
+    return "0x0000000000000000";
   if (field == "pstate") { std::snprintf(buf, sizeof buf, "P%u", d.perf_state); return buf; }
   return "[N/A]";
 }
 
-void print_query_gpu(const vgpu::telemetry::Shared& s, const std::string& fields, bool header,
-                     bool units) {
+// The unit nvidia-smi puts in a CSV header, "memory.total [MiB]". It is there
+// with or without nounits -- nounits strips the values, not the header -- and
+// scripts that read the CSV by column name look for exactly that string.
+const char* field_unit(const std::string& f) {
+  if (f.rfind("memory.", 0) == 0) return "MiB";
+  if (f.rfind("utilization.", 0) == 0 || f == "fan.speed") return "%";
+  if (f.rfind("power.", 0) == 0 || f == "enforced.power.limit") return "W";
+  if (f.rfind("clocks.", 0) == 0) return "MHz";
+  return nullptr;
+}
+
+std::vector<std::string> split_fields(const std::string& fields) {
   std::vector<std::string> names;
   for (size_t at = 0; at <= fields.size();) {
     const size_t comma = fields.find(',', at);
@@ -201,33 +279,86 @@ void print_query_gpu(const vgpu::telemetry::Shared& s, const std::string& fields
     if (comma == std::string::npos) break;
     at = comma + 1;
   }
-  if (names.empty()) return;
-  if (header) {
-    for (size_t i = 0; i < names.size(); ++i)
-      std::printf("%s%s", i ? ", " : "", names[i].c_str());
-    std::printf("\n");
+  return names;
+}
+
+void print_header(const std::vector<std::string>& names,
+                  const char* (*unit_of)(const std::string&),
+                  std::string (*label_of)(const std::string&)) {
+  for (size_t i = 0; i < names.size(); ++i) {
+    const char* unit = unit_of(names[i]);
+    std::printf("%s%s%s%s%s", i ? ", " : "", label_of(names[i]).c_str(), unit ? " [" : "",
+                unit ? unit : "", unit ? "]" : "");
   }
-  for (uint32_t g = 0; g < s.device_count; ++g)
+  std::printf("\n");
+}
+std::string same_label(const std::string& f) { return f; }
+
+void print_query_gpu(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>& sel,
+                     const std::string& fields, bool header, bool units) {
+  const std::vector<std::string> names = split_fields(fields);
+  if (names.empty()) return;
+  if (header) print_header(names, field_unit, same_label);
+  for (uint32_t g : sel)
     for (size_t i = 0; i < names.size(); ++i)
       std::printf("%s%s%s", i ? ", " : "",
                   query_field(s.devices[g], g, s, names[i], units).c_str(),
                   i + 1 == names.size() ? "\n" : "");
 }
 
+// --query-compute-apps: one row per process holding a context. With nothing
+// running a real driver prints the header and no rows, which is the normal
+// answer on an idle machine -- scripts that check for stray processes before a
+// job read exactly that.
+const char* app_unit(const std::string& f) {
+  return f == "used_memory" || f == "used_gpu_memory" ? "MiB" : nullptr;
+}
+std::string app_label(const std::string& f) {
+  if (f == "used_memory") return "used_gpu_memory";
+  if (f == "name") return "process_name";
+  return f;
+}
+void print_query_apps(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>& sel,
+                      const std::string& fields, bool header, bool units) {
+  const std::vector<std::string> names = split_fields(fields);
+  if (names.empty()) return;
+  if (header) print_header(names, app_unit, app_label);
+  for (uint32_t g : sel) {
+    const auto& d = s.devices[g];
+    for (uint32_t j = 0; j < d.proc_count && j < vgpu::telemetry::kMaxProcs; ++j) {
+      const auto& pr = d.procs[j];
+      for (size_t i = 0; i < names.size(); ++i) {
+        const std::string& f = names[i];
+        std::string v;
+        if (f == "pid") v = std::to_string(pr.pid);
+        else if (f == "process_name" || f == "name") v = pr.name;
+        else if (f == "used_memory" || f == "used_gpu_memory")
+          v = std::to_string(mib(pr.used_bytes)) + (units ? " MiB" : "");
+        else if (f == "gpu_uuid") v = d.uuid;
+        else if (f == "gpu_bus_id") v = d.bus_id;
+        else if (f == "gpu_name") v = d.name;
+        else v = "[N/A]";
+        std::printf("%s%s%s", i ? ", " : "", v.c_str(), i + 1 == names.size() ? "\n" : "");
+      }
+    }
+  }
+}
+
 // The verbose "-q" report. Tools scrape it for identity and limits, so the
 // indentation and the "key : value" alignment are part of the interface.
-void print_verbose(const vgpu::telemetry::Shared& s) {
-  const char* drv = std::getenv("VGPU_DRIVER_VERSION");
+void print_verbose(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>& sel) {
+  // The same versions the table header prints. This used to say CUDA 13.0
+  // whatever the session was, beside a header two commands away that said 12.4.
   std::printf("\n==============NVSMI LOG==============\n\n");
-  std::printf("%-55s: %s\n", "Driver Version", drv && *drv ? drv : "580.00.00");
-  std::printf("%-55s: %s\n", "CUDA Version", "13.0");
+  std::printf("%-55s: %s\n", "Driver Version", s.driver_version[0] ? s.driver_version : "580.00.00");
+  std::printf("%-55s: %s\n", "CUDA Version", s.cuda_version[0] ? s.cuda_version : "13.0");
   std::printf("\n%-55s: %u\n", "Attached GPUs", s.device_count);
-  for (uint32_t i = 0; i < s.device_count; ++i) {
+  for (uint32_t i : sel) {
     const auto& d = s.devices[i];
     std::printf("GPU %s\n", d.bus_id);
     std::printf("    %-51s: %s\n", "Product Name", d.name);
-    std::printf("    %-51s: %s\n", "Product Brand", d.vendor);
-    std::printf("    %-51s: %s\n", "Product Architecture", d.architecture);
+    std::printf("    %-51s: %s\n", "Product Brand", brand_name(d));
+    std::printf("    %-51s: %s\n", "Product Architecture", architecture_name(d.architecture).c_str());
     std::printf("    %-51s: %s\n", "Virtualization Mode", "Pass-Through");
     std::printf("    %-51s: %s\n", "Serial Number", "N/A");
     std::printf("    %-51s: %s\n", "GPU UUID", d.uuid);
@@ -377,22 +508,34 @@ void print_explain() {
 int cmd_smi(const std::vector<std::string>& args) {
   bool csv = false, explain = false, rocm = false, agents = false, lspci = false,
        lspci_dump = false, verbose = false, details = false;
-  std::string query_fields;
-  bool header = true, units = true;
+  std::string query_fields, app_fields, id_spec;
+  bool header = true, units = true, list = false;
   for (size_t i = 0; i < args.size(); ++i) {
     if (args[i].rfind("--query-gpu=", 0) == 0) {
       query_fields = args[i].substr(std::string("--query-gpu=").size());
+    } else if (args[i].rfind("--query-compute-apps=", 0) == 0) {
+      app_fields = args[i].substr(std::string("--query-compute-apps=").size());
+    } else if (args[i] == "-i" || args[i] == "--id") {
+      if (i + 1 >= args.size()) {
+        std::fprintf(stderr, "vgpu smi: %s needs a device\n", args[i].c_str());
+        return 2;
+      }
+      id_spec = args[++i];
+    } else if (args[i].rfind("--id=", 0) == 0 || args[i].rfind("-i=", 0) == 0) {
+      id_spec = args[i].substr(args[i].find('=') + 1);
     } else if (args[i].rfind("--format=", 0) == 0) {
       const std::string fmt = args[i].substr(std::string("--format=").size());
       header = fmt.find("noheader") == std::string::npos;
       units = fmt.find("nounits") == std::string::npos;
     } else if (args[i] == "-q" || args[i] == "--query") {
       verbose = true;
-    } else if (args[i] == "-d" || args[i] == "--display" || args[i] == "-i" || args[i] == "--id") {
-      ++i;   // a selector we render the whole snapshot for; skip its value
-    } else if (args[i] == "--list") {
-      // nvidia-smi -L: one line per GPU, "GPU <n>: <name> (UUID: <uuid>)".
-      query_fields = "__list__";
+    } else if (args[i] == "-d" || args[i] == "--display") {
+      ++i;   // a section filter for -q; the whole report is printed
+    } else if (args[i] == "-L" || args[i] == "--list-gpus" || args[i] == "--list") {
+      // One line per GPU, "GPU <n>: <name> (UUID: <uuid>)". Recognized here,
+      // wherever it appears: the session wrapper only translated it as the
+      // first argument, so `nvidia-smi -i 1 -L` was an unknown argument.
+      list = true;
     } else if (args[i] == "--csv")
       csv = true;
     else if (args[i] == "--explain")
@@ -435,13 +578,22 @@ int cmd_smi(const std::vector<std::string>& args) {
       return 1;
     }
   }
-  if (query_fields == "__list__") {
-    for (uint32_t i = 0; i < snap.device_count; ++i)
+  std::vector<uint32_t> sel;
+  if (!select_devices(snap, id_spec, &sel)) {
+    // What the real tool says, and its exit code for "the object asked for
+    // was not found".
+    std::printf("No devices were found\n");
+    return 6;
+  }
+  if (list) {
+    for (uint32_t i : sel)
       std::printf("GPU %u: %s (UUID: %s)\n", i, snap.devices[i].name, snap.devices[i].uuid);
-  } else if (!query_fields.empty())
-    print_query_gpu(snap, query_fields, header, units);
+  } else if (!app_fields.empty())
+    print_query_apps(snap, sel, app_fields, header, units);
+  else if (!query_fields.empty())
+    print_query_gpu(snap, sel, query_fields, header, units);
   else if (verbose)
-    print_verbose(snap);
+    print_verbose(snap, sel);
   else if (csv)
     print_csv(snap);
   else if (rocm)
@@ -451,7 +603,7 @@ int cmd_smi(const std::vector<std::string>& args) {
   else if (lspci || lspci_dump)
     print_lspci(snap, lspci_dump);
   else {
-    print_gpu_table(snap);
+    print_gpu_table(snap, sel);
     if (details) print_virtual_details(snap);
   }
   return 0;
