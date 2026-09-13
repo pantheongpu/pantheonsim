@@ -1,0 +1,67 @@
+name: Action
+
+# The GitHub Action in action.yml, used the way a project would use it: install,
+# then compile and run a CUDA program on the simulated GPUs it provides.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  use-the-action:
+    name: compile and run CUDA on simulated GPUs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PantheonSim
+        id: sim
+        uses: ./
+        with:
+          gpu: nvidia/t4
+          count: 2
+
+      - name: The job sees two T4s
+        run: |
+          nvidia-smi -L
+          test "$(nvidia-smi --query-gpu=name --format=csv,noheader | grep -c 'Tesla T4')" = 2
+
+      - name: Compile a kernel with plain nvcc and run it
+        run: |
+          cat > vectoradd.cu <<'CU'
+          #include <cstdio>
+          __global__ void add(float* c, const float* a, const float* b, int n) {
+            int i = blockIdx.x * blockDim.x + threadIdx.x;
+            if (i < n) c[i] = a[i] + b[i];
+          }
+          int main() {
+            const int n = 4096;
+            float a[n], b[n], c[n];
+            for (int i = 0; i < n; ++i) { a[i] = i; b[i] = 2 * i; }
+            float* da, *db, *dc;
+            cudaMalloc(&da, sizeof a); cudaMalloc(&db, sizeof b); cudaMalloc(&dc, sizeof c);
+            cudaMemcpy(da, a, sizeof a, cudaMemcpyHostToDevice);
+            cudaMemcpy(db, b, sizeof b, cudaMemcpyHostToDevice);
+            add<<<(n + 255) / 256, 256>>>(dc, da, db, n);
+            if (cudaDeviceSynchronize() != cudaSuccess) return 2;
+            cudaMemcpy(c, dc, sizeof c, cudaMemcpyDeviceToHost);
+            for (int i = 0; i < n; ++i) if (c[i] != 3 * i) { std::printf("wrong at %d\n", i); return 1; }
+            std::printf("ok: %d elements\n", n);
+            return 0;
+          }
+          CU
+          nvcc -arch=compute_75 -code=compute_75 vectoradd.cu -o vectoradd
+          vgpu run ./vectoradd
+
+      - name: The same binary on every GPU profile
+        run: |
+          vgpu test --matrix ./vectoradd | tee matrix.txt
+          grep -q ' 0 different' matrix.txt
+
+      - name: The outputs name the build
+        run: test -x "${{ steps.sim.outputs.build-dir }}/vgpu" && test -e "${{ steps.sim.outputs.shim-dir }}/libcudart.so"
