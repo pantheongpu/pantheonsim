@@ -3,7 +3,7 @@ name: Workloads
 # Every pantheon workload, on a spread of simulated machines.
 #
 # The pull-request CI runs three workloads on one A10 so a change gets an answer
-# in minutes. This is the check that the other forty-odd still run, on the cards,
+# in minutes. This is the check that the other forty-odd still run, on every card,
 # GPU counts and CUDA versions people actually use. It runs when a change merges
 # and again every day: the workloads live in their own repository and change
 # without this one changing, and a break from that side should not wait for the
@@ -49,10 +49,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One machine per architecture the workloads build for, since each gets
-        # its own kernels (the Makefile reads the architecture off nvidia-smi).
-        # Counts above one take all_reduce and p2p_thrasher down their real
-        # multi-GPU paths.
+        # Every NVIDIA profile the simulator carries (the coverage job below
+        # fails when one is added without a row here). The Makefile builds for
+        # the architecture nvidia-smi reports, and profiles that share an
+        # architecture still differ in memory, device identity and what
+        # nvidia-smi and NVML report. CUDA 12.0 and 13.0 alternate across each
+        # architecture, and counts above one take all_reduce and p2p_thrasher
+        # down their real multi-GPU paths.
         include:
           - { key: t4-x1-cuda12.0,    gpu: nvidia/t4,          count: 1, cuda: '12.0' }  # Turing 7.5
           - { key: a100-x1-cuda12.0,  gpu: nvidia/a100,        count: 1, cuda: '12.0' }  # Ampere 8.0
@@ -61,6 +64,12 @@ jobs:
           - { key: h100-x8-cuda13.0,  gpu: nvidia/h100,        count: 8, cuda: '13.0' }  # Hopper 9.0, a full node
           - { key: gh200-x1-cuda13.0, gpu: nvidia/gh200-480gb, count: 1, cuda: '13.0' }  # Grace Hopper
           - { key: b200-x2-cuda13.0,  gpu: nvidia/b200,        count: 2, cuda: '13.0' }  # Blackwell 10.0, CUDA 12.8+
+          - { key: l40s-x1-cuda12.0,  gpu: nvidia/l40s,        count: 1, cuda: '12.0' }  # Ada 8.9
+          - { key: rtx3060-x1-cuda12.0, gpu: nvidia/rtx3060,   count: 1, cuda: '12.0' }  # Ampere 8.6, consumer
+          - { key: a10g-x1-cuda13.0,  gpu: nvidia/a10g,        count: 1, cuda: '13.0' }  # Ampere 8.6
+          - { key: a100-40gb-x2-cuda13.0, gpu: nvidia/a100-sxm4-40gb, count: 2, cuda: '13.0' }  # Ampere 8.0
+          - { key: h100-pcie-x1-cuda12.0, gpu: nvidia/h100-pcie, count: 1, cuda: '12.0' }  # Hopper 9.0 on CUDA 12
+          - { key: h200-x4-cuda13.0,  gpu: nvidia/h200,        count: 4, cuda: '13.0' }  # Hopper 9.0
     env:
       # CUDA 13 packages from NVIDIA's repository: the compiler and the headers
       # of every library the simulator stands in for.
@@ -137,6 +146,27 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # A profile added to the simulator without a row in the matrix would go
+  # untested without anyone noticing; this says so on the pull request.
+  coverage:
+    name: every profile is in the matrix
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/workflows
+            profiles
+      - name: Compare the matrix with profiles/nvidia
+        run: |
+          have=$(grep -oE 'gpu: nvidia/[a-z0-9-]+' .github/workflows/workloads.yml | sed 's#gpu: nvidia/##' | sort -u)
+          want=$(find profiles/nvidia -name '*.yaml' -printf '%f\n' | sed 's/[.]yaml$//' | sort -u)
+          missing=$(comm -13 <(printf '%s\n' "$have") <(printf '%s\n' "$want") | tr '\n' ' ')
+          stale=$(comm -23 <(printf '%s\n' "$have") <(printf '%s\n' "$want") | tr '\n' ' ')
+          echo "matrix: $(printf '%s\n' "$have" | wc -l) profiles; profiles/nvidia: $(printf '%s\n' "$want" | wc -l)"
+          [ -z "${missing// }" ] || { echo "::error::not in the workloads matrix: $missing"; exit 1; }
+          [ -z "${stale// }" ] || { echo "::error::in the matrix but not a profile: $stale"; exit 1; }
+
   summary:
     name: every machine
     needs: machine
@@ -148,7 +178,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: tests/workloads
+          sparse-checkout: |
+            tests/workloads
+            profiles
 
       - uses: actions/download-artifact@v4
         with:
@@ -157,8 +189,9 @@ jobs:
 
       - name: One table
         run: |
-          # 7: the machines in the matrix above, so one that wrote nothing is reported.
-          python3 tests/workloads/workload_matrix.py results 7 > matrix.md
+          # One machine per NVIDIA profile (the coverage job holds the matrix to
+          # that), so a machine that wrote nothing is reported as missing.
+          python3 tests/workloads/workload_matrix.py results "$(find profiles/nvidia -name '*.yaml' | wc -l)" > matrix.md
           cat matrix.md >> "$GITHUB_STEP_SUMMARY"
 
       # While main is broken there is one open issue saying where, updated by

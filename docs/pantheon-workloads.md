@@ -106,13 +106,25 @@ Two workflows run the workloads, at two depths:
 | When | What | Where |
 | --- | --- | --- |
 | Every pull request | `compute_virus`, `int_virus`, `cache_latency` on one A10 | `ci.yml`, job *pantheon workloads* |
-| Every merge to main, and daily at 06:23 UTC | every workload, on seven machines | `workloads.yml` |
+| Every merge to main, and daily at 06:23 UTC | every workload, on every NVIDIA profile (13 machines) | `workloads.yml` |
 
-The seven machines cover each architecture the workloads build for, both CUDA
-majors and the multi-GPU paths: 1 x T4, 1 x A100 and 2 x A10 on CUDA 12.0; 1 x
-L4, 8 x H100, 1 x GH200 and 2 x B200 on CUDA 13.0. Each builds the workloads with
-pantheon's own Makefile inside `vgpu shell`, which reads the architecture off
-the simulated `nvidia-smi` exactly as it would on the card.
+Each NVIDIA profile gets a machine, alternating CUDA 12.0 and 13.0 within each
+architecture and with GPU counts above one for the multi-GPU paths:
+
+| CUDA 12.0 | CUDA 13.0 |
+| --- | --- |
+| 1 x T4 (Turing 7.5) | 1 x L4 (Ada 8.9) |
+| 1 x A100 (Ampere 8.0) | 2 x A100 SXM4 40GB (Ampere 8.0) |
+| 2 x A10 (Ampere 8.6) | 1 x A10G (Ampere 8.6) |
+| 1 x RTX 3060 (Ampere 8.6) | 8 x H100 (Hopper 9.0) |
+| 1 x L40S (Ada 8.9) | 4 x H200 (Hopper 9.0) |
+| 1 x H100 PCIe (Hopper 9.0) | 1 x GH200 (Grace Hopper 9.0) |
+| | 2 x B200 (Blackwell 10.0, needs CUDA 12.8+) |
+
+A *coverage* job fails the pull request that adds a profile without adding it
+to the matrix. Each machine builds the workloads with pantheon's own Makefile
+inside `vgpu shell`, which reads the architecture off the simulated
+`nvidia-smi` exactly as it would on the card.
 
 The run's summary page has one table, a row per workload and a column per
 machine, with failures first and the reason for each. While main is failing,
