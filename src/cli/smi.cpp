@@ -5,8 +5,12 @@
 // from real simulator state (memory, utilization) are exact; the power /
 // temperature / clock / voltage columns are a synthetic model driven by real
 // utilization and are marked as such by --explain.
+#include <sched.h>
+#include <unistd.h>
+
 #include <cctype>
 #include <cinttypes>
+#include <filesystem>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -388,6 +392,160 @@ void print_verbose(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>
   }
 }
 
+// The CPUs this process may run on, as nvidia-smi prints affinity: "0-15" or
+// "0-7,16-23". Real, from the host -- the one part of a topology the
+// simulator does not have to model.
+std::string cpu_affinity() {
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  if (sched_getaffinity(0, sizeof set, &set) != 0) return "N/A";
+  std::string out;
+  for (int c = 0; c < CPU_SETSIZE;) {
+    if (!CPU_ISSET(c, &set)) { ++c; continue; }
+    int end = c;
+    while (end + 1 < CPU_SETSIZE && CPU_ISSET(end + 1, &set)) ++end;
+    if (!out.empty()) out += ",";
+    out += end > c ? std::to_string(c) + "-" + std::to_string(end) : std::to_string(c);
+    c = end + 1;
+  }
+  return out.empty() ? "N/A" : out;
+}
+
+int numa_nodes() {
+  int n = 0;
+  std::error_code ec;
+  for (const auto& e : std::filesystem::directory_iterator("/sys/devices/system/node", ec)) {
+    const std::string name = e.path().filename().string();
+    if (name.rfind("node", 0) == 0 && name.size() > 4 &&
+        name.find_first_not_of("0123456789", 4) == std::string::npos)
+      ++n;
+  }
+  return n;
+}
+
+// `nvidia-smi topo -m`: how each pair of GPUs is connected, and which CPUs are
+// near each one. Tab-separated, like the real matrix, because that is what
+// scripts split it on.
+//
+// Every simulated device reaches every other through the host -- peer copies
+// and NCCL's transport both go through host memory -- and no profile carries
+// NVLink data measured from a card. So the honest link is PHB, "through a host
+// bridge". An NV# here would be a number made up for a machine that has no
+// links, and a topology-aware program would then act on it.
+void print_topology(const vgpu::telemetry::Shared& s) {
+  const std::string affinity = cpu_affinity();
+  const std::string numa = numa_nodes() == 1 ? "0" : "N/A";
+  std::printf("\t");
+  for (uint32_t j = 0; j < s.device_count; ++j) std::printf("GPU%u\t", j);
+  std::printf("CPU Affinity\tNUMA Affinity\tGPU NUMA ID\n");
+  for (uint32_t i = 0; i < s.device_count; ++i) {
+    std::printf("GPU%u\t", i);
+    for (uint32_t j = 0; j < s.device_count; ++j) std::printf("%s\t", i == j ? " X " : "PHB");
+    std::printf("%s\t%s\t\tN/A\n", affinity.c_str(), numa.c_str());
+  }
+  std::printf("\nLegend:\n\n"
+              "  X    = Self\n"
+              "  SYS  = Across PCIe and the interconnect between NUMA nodes\n"
+              "  NODE = Across PCIe and the host bridges within one NUMA node\n"
+              "  PHB  = Across PCIe and a PCIe host bridge (usually the CPU)\n"
+              "  PXB  = Across more than one PCIe bridge, without the host bridge\n"
+              "  PIX  = Across at most one PCIe bridge\n"
+              "  NV#  = Across a bonded set of # NVLinks\n");
+}
+
+std::string xml_escape(const char* v) {
+  std::string out;
+  for (const char* p = v; *p; ++p) {
+    switch (*p) {
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      default: out += *p;
+    }
+  }
+  return out;
+}
+
+// `nvidia-smi -q -x`: the verbose report as XML, under the element names the
+// real tool uses (nvsmi_device's schema), for the tools that parse XML rather
+// than scrape text. Same values as -q, from the same snapshot.
+void print_verbose_xml(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>& sel) {
+  char when[64];
+  std::time_t now = std::time(nullptr);
+  std::tm tm{};
+  ::localtime_r(&now, &tm);
+  std::strftime(when, sizeof when, "%a %b %e %H:%M:%S %Y", &tm);
+  std::printf("<?xml version=\"1.0\" ?>\n");
+  std::printf("<!DOCTYPE nvidia_smi_log SYSTEM \"nvsmi_device_v12.dtd\">\n");
+  std::printf("<nvidia_smi_log>\n");
+  std::printf("\t<timestamp>%s</timestamp>\n", when);
+  std::printf("\t<driver_version>%s</driver_version>\n",
+              xml_escape(s.driver_version[0] ? s.driver_version : "580.00.00").c_str());
+  std::printf("\t<cuda_version>%s</cuda_version>\n",
+              xml_escape(s.cuda_version[0] ? s.cuda_version : "13.0").c_str());
+  std::printf("\t<attached_gpus>%u</attached_gpus>\n", s.device_count);
+  for (uint32_t i : sel) {
+    const auto& d = s.devices[i];
+    unsigned domain = 0, bus = 0, dev = 0, fn = 0;
+    std::sscanf(d.bus_id, "%x:%x:%x.%x", &domain, &bus, &dev, &fn);
+    std::printf("\t<gpu id=\"%s\">\n", xml_escape(d.bus_id).c_str());
+    std::printf("\t\t<product_name>%s</product_name>\n", xml_escape(d.name).c_str());
+    std::printf("\t\t<product_brand>%s</product_brand>\n", brand_name(d));
+    std::printf("\t\t<product_architecture>%s</product_architecture>\n",
+                xml_escape(architecture_name(d.architecture).c_str()).c_str());
+    std::printf("\t\t<persistence_mode>Enabled</persistence_mode>\n");
+    std::printf("\t\t<serial>N/A</serial>\n");
+    std::printf("\t\t<uuid>%s</uuid>\n", xml_escape(d.uuid).c_str());
+    std::printf("\t\t<minor_number>%u</minor_number>\n", i);
+    std::printf("\t\t<pci>\n");
+    std::printf("\t\t\t<pci_bus>%02X</pci_bus>\n", bus);
+    std::printf("\t\t\t<pci_device>%02X</pci_device>\n", dev);
+    std::printf("\t\t\t<pci_domain>%04X</pci_domain>\n", domain);
+    std::printf("\t\t\t<pci_device_id>%08X</pci_device_id>\n", d.pci_device_id);
+    std::printf("\t\t\t<pci_bus_id>%s</pci_bus_id>\n", xml_escape(d.bus_id).c_str());
+    std::printf("\t\t\t<pci_sub_system_id>%08X</pci_sub_system_id>\n", d.pci_subsystem_id);
+    std::printf("\t\t</pci>\n");
+    std::printf("\t\t<fan_speed>%u %%</fan_speed>\n", d.fan_percent);
+    std::printf("\t\t<performance_state>P%u</performance_state>\n", d.perf_state);
+    std::printf("\t\t<fb_memory_usage>\n");
+    std::printf("\t\t\t<total>%d MiB</total>\n", mib(d.vram_total_bytes));
+    std::printf("\t\t\t<used>%d MiB</used>\n", mib(d.vram_used_bytes));
+    std::printf("\t\t\t<free>%d MiB</free>\n", mib(d.vram_total_bytes) - mib(d.vram_used_bytes));
+    std::printf("\t\t</fb_memory_usage>\n");
+    std::printf("\t\t<compute_mode>Default</compute_mode>\n");
+    std::printf("\t\t<utilization>\n");
+    std::printf("\t\t\t<gpu_util>%u %%</gpu_util>\n", d.utilization_gpu);
+    std::printf("\t\t\t<memory_util>%u %%</memory_util>\n", d.utilization_mem);
+    std::printf("\t\t</utilization>\n");
+    std::printf("\t\t<temperature>\n");
+    std::printf("\t\t\t<gpu_temp>%u C</gpu_temp>\n", d.temperature_c);
+    std::printf("\t\t</temperature>\n");
+    std::printf("\t\t<gpu_power_readings>\n");
+    std::printf("\t\t\t<power_state>P%u</power_state>\n", d.perf_state);
+    std::printf("\t\t\t<power_draw>%.2f W</power_draw>\n", d.power_mw / 1000.0);
+    std::printf("\t\t\t<current_power_limit>%.2f W</current_power_limit>\n", d.power_limit_mw / 1000.0);
+    std::printf("\t\t</gpu_power_readings>\n");
+    std::printf("\t\t<clocks>\n");
+    std::printf("\t\t\t<graphics_clock>%u MHz</graphics_clock>\n", d.sm_clock_mhz);
+    std::printf("\t\t\t<mem_clock>%u MHz</mem_clock>\n", d.mem_clock_mhz);
+    std::printf("\t\t</clocks>\n");
+    std::printf("\t\t<processes>\n");
+    for (uint32_t j = 0; j < d.proc_count && j < vgpu::telemetry::kMaxProcs; ++j) {
+      const auto& pr = d.procs[j];
+      std::printf("\t\t\t<process_info>\n");
+      std::printf("\t\t\t\t<pid>%u</pid>\n", pr.pid);
+      std::printf("\t\t\t\t<type>C</type>\n");
+      std::printf("\t\t\t\t<process_name>%s</process_name>\n", xml_escape(pr.name).c_str());
+      std::printf("\t\t\t\t<used_memory>%d MiB</used_memory>\n", mib(pr.used_bytes));
+      std::printf("\t\t\t</process_info>\n");
+    }
+    std::printf("\t\t</processes>\n");
+    std::printf("\t</gpu>\n");
+  }
+  std::printf("</nvidia_smi_log>\n");
+}
+
 void print_csv(const vgpu::telemetry::Shared& s) {
   std::printf("index,name,uuid,bus_id,memory.total,memory.used,utilization.gpu,temperature.gpu,"
               "power.draw,power.limit,clocks.sm,clocks.mem\n");
@@ -509,7 +667,7 @@ int cmd_smi(const std::vector<std::string>& args) {
   bool csv = false, explain = false, rocm = false, agents = false, lspci = false,
        lspci_dump = false, verbose = false, details = false;
   std::string query_fields, app_fields, id_spec;
-  bool header = true, units = true, list = false;
+  bool header = true, units = true, list = false, xml = false, topo = false;
   for (size_t i = 0; i < args.size(); ++i) {
     if (args[i].rfind("--query-gpu=", 0) == 0) {
       query_fields = args[i].substr(std::string("--query-gpu=").size());
@@ -529,6 +687,17 @@ int cmd_smi(const std::vector<std::string>& args) {
       units = fmt.find("nounits") == std::string::npos;
     } else if (args[i] == "-q" || args[i] == "--query") {
       verbose = true;
+    } else if (args[i] == "-x" || args[i] == "--xml-format") {
+      xml = true;   // with -q: the same report as XML
+    } else if (args[i] == "topo") {
+      // Only the matrix. The real subcommand also answers pairwise questions
+      // (-p2p, -i) that need link data no profile has.
+      if (i + 1 >= args.size() || (args[i + 1] != "-m" && args[i + 1] != "--matrix")) {
+        std::fprintf(stderr, "vgpu smi: topo supports -m (--matrix)\n");
+        return 2;
+      }
+      topo = true;
+      ++i;
     } else if (args[i] == "-d" || args[i] == "--display") {
       ++i;   // a section filter for -q; the whole report is printed
     } else if (args[i] == "-L" || args[i] == "--list-gpus" || args[i] == "--list") {
@@ -585,13 +754,17 @@ int cmd_smi(const std::vector<std::string>& args) {
     std::printf("No devices were found\n");
     return 6;
   }
-  if (list) {
+  if (topo) {
+    print_topology(snap);
+  } else if (list) {
     for (uint32_t i : sel)
       std::printf("GPU %u: %s (UUID: %s)\n", i, snap.devices[i].name, snap.devices[i].uuid);
   } else if (!app_fields.empty())
     print_query_apps(snap, sel, app_fields, header, units);
   else if (!query_fields.empty())
     print_query_gpu(snap, sel, query_fields, header, units);
+  else if (verbose && xml)
+    print_verbose_xml(snap, sel);
   else if (verbose)
     print_verbose(snap, sel);
   else if (csv)
