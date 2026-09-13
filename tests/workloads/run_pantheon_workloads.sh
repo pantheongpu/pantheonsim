@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs a few real pantheon workloads against VirtualGPU.
+# Runs real pantheon workloads against VirtualGPU.
 #
 # The unit tests cover instructions and API calls one at a time. These cover the
 # thing that actually matters: an unmodified GPU diagnostic, built by its own
@@ -9,6 +9,17 @@
 # Pantheon is a separate public repository. Point VGPU_PANTHEON_DIR at a
 # checkout, or let this find one next to the build. Skips cleanly when absent so
 # a contributor without it still gets a green run.
+#
+# By default it runs three quick workloads on one simulated A10, which is what
+# ctest and every pull request run. The nightly workflow runs all of them on a
+# spread of machines:
+#
+#   VGPU_WORKLOADS=all             every workload in kernels/ (or a list of names)
+#   VGPU_WORKLOAD_GPU=nvidia/h100  the profile; the Makefile builds for its arch
+#   VGPU_WORKLOAD_COUNT=8          how many GPUs (all_reduce and p2p_thrasher need 2)
+#   VGPU_WORKLOAD_ARGS="..."       extra workload flags, e.g. a CPU-sized --grid_size
+#   VGPU_WORKLOAD_TIMEOUT=300      seconds before one workload counts as hung
+#   VGPU_WORKLOAD_REPORT=dir       write results.tsv, summary.md and each log there
 set -uo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -40,13 +51,24 @@ if (( ${#_cudart[@]} )); then
   fi
 fi
 
+# Not CUDA, so not simulated: OptiX is NVIDIA's ray-tracing library and NVENC its
+# hardware video encoder. Reported as skipped, never as passed.
+OUT_OF_SCOPE="rt_virus media_enc_virus"
+
 # Small, fast, and between them they exercise the paths that have broken before:
 # integer and float arithmetic, global traffic, shared memory and atomics.
-WORKLOADS=("${VGPU_WORKLOADS:-compute_virus int_virus cache_latency}")
+WORKLOADS="${VGPU_WORKLOADS:-compute_virus int_virus cache_latency}"
+if [[ "$WORKLOADS" == all ]]; then
+  WORKLOADS=$(cd "$pantheon/kernels" && for d in */; do d="${d%/}"; [[ "$d" == common ]] || printf '%s ' "$d"; done)
+fi
 GPU="${VGPU_WORKLOAD_GPU:-nvidia/a10}"
+COUNT="${VGPU_WORKLOAD_COUNT:-1}"
 VRAM_MB="${VGPU_WORKLOAD_VRAM_MB:-1024}"
 DURATION="${VGPU_WORKLOAD_SECONDS:-2}"
 MEM_PCT="${VGPU_WORKLOAD_MEM_PCT:-2}"
+ARGS="${VGPU_WORKLOAD_ARGS:-}"
+TIMEOUT="${VGPU_WORKLOAD_TIMEOUT:-0}"
+REPORT="${VGPU_WORKLOAD_REPORT:-}"
 # These are soak kernels: they are built to keep a GPU busy for a duration, so
 # their launches are legitimately long and the default step budget -- which
 # exists to catch a kernel looping forever -- cuts them off. int_virus trips it.
@@ -54,36 +76,65 @@ MEM_PCT="${VGPU_WORKLOAD_MEM_PCT:-2}"
 # property that makes them worth testing. Still finite, so a real runaway stops.
 export VGPU_MAX_STEPS="${VGPU_MAX_STEPS:-17179869184}"
 
-echo "pantheon: $pantheon"
-echo "workloads: ${WORKLOADS[*]}  (gpu=$GPU vram=${VRAM_MB}MB ${DURATION}s ${MEM_PCT}% max_steps=$VGPU_MAX_STEPS)"
+logs="${REPORT:-$(mktemp -d)}"
+mkdir -p "$logs"
+logs="$(cd "$logs" && pwd)"
+
+echo "pantheon: $pantheon ($(git -C "$pantheon" rev-parse --short HEAD 2>/dev/null || echo unknown))"
+echo "machine:  $COUNT x $GPU, ${VRAM_MB} MB each, $(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/CUDA \1/p' | head -1)"
+echo "run:      ${DURATION}s ${MEM_PCT}% ${ARGS:+$ARGS }timeout=${TIMEOUT}s max_steps=$VGPU_MAX_STEPS"
+echo "workloads: $(wc -w <<<"$WORKLOADS")"
 
 # Build and run inside the shell: it supplies an nvcc that links the shared CUDA
 # runtime, without which the binaries link a static one that cannot run against
-# a simulated driver.
-inner=$(cat <<INNER
-set -e
-cd "$pantheon"
+# a simulated driver, and an nvidia-smi that reports the simulated card, which
+# is what the Makefile reads to pick the architecture to build for.
+inner=$(cat <<'INNER'
+set -u
+cd "$VGPU_WL_PANTHEON"
 # Targets are named by their output path: a bare name hits make's builtin
 # rule and compiles the .cpp with g++, which cannot take CUDA flags.
-targets=""; for w in ${WORKLOADS[*]}; do targets="\$targets build/\$w"; done
-make -k PLATFORM=CUDA BUILD_DIR=build -j"\$(nproc)" \$targets >/tmp/vgpu_wl_build.log 2>&1 || {
-  echo "BUILD FAILED"; tail -20 /tmp/vgpu_wl_build.log; exit 1; }
+# A separate build directory per architecture: the Makefile's signature check
+# would otherwise rebuild everything each time the matrix changes card.
+bdir="build-vgpu-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d .)"
+targets=""; for w in $VGPU_WL_NAMES; do case " $VGPU_WL_SKIP " in *" $w "*) ;; *) targets="$targets $bdir/$w" ;; esac; done
+make -k PLATFORM=CUDA BUILD_DIR="$bdir" -j"$(nproc)" $targets >"$VGPU_WL_LOGS/build.log" 2>&1 || true
 rc=0
-for w in ${WORKLOADS[*]}; do
-  bin="build/\$w"
-  [ -x "\$bin" ] || { echo "MISSING: \$w did not build"; rc=1; continue; }
-  out=\$("\$bin" 0 $DURATION $MEM_PCT 2>&1) || { echo "FAIL: \$w exited nonzero"; echo "\$out" | tail -5; rc=1; continue; }
+: >"$VGPU_WL_LOGS/results.tsv"
+record() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$VGPU_WL_LOGS/results.tsv"; printf '%-26s %-8s %5ss  %s\n' "$1" "$2" "$3" "$4"; }
+printf '\n%-26s %-8s %6s  %s\n' WORKLOAD RESULT TIME DETAIL
+for w in $VGPU_WL_NAMES; do
+  case " $VGPU_WL_SKIP " in *" $w "*) record "$w" SKIP 0 "needs OptiX or NVENC, which are not CUDA"; continue ;; esac
+  bin="$bdir/$w"
+  log="$VGPU_WL_LOGS/$w.log"
+  if [ ! -x "$bin" ]; then
+    grep -E "$w" "$VGPU_WL_LOGS/build.log" | grep -iE "error" | head -3 >"$log"
+    record "$w" MISSING 0 "did not build: $(head -1 "$log" | cut -c1-80)"; rc=1; continue
+  fi
+  start=$(date +%s)
+  if [ "$VGPU_WL_TIMEOUT" -gt 0 ]; then
+    timeout "$VGPU_WL_TIMEOUT" "$bin" 0 "$VGPU_WL_DURATION" "$VGPU_WL_MEMPCT" $VGPU_WL_ARGS >"$log" 2>&1
+  else
+    "$bin" 0 "$VGPU_WL_DURATION" "$VGPU_WL_MEMPCT" $VGPU_WL_ARGS >"$log" 2>&1
+  fi
+  status=$?
+  secs=$(( $(date +%s) - start ))
+  why=$(grep -iE "PANTHEON ERROR|CUDA error|integrity|VirtualGPU error|unsupported PTX|Verification: FAIL" "$log" | head -1 | cut -c1-100)
+  if [ "$status" -eq 124 ]; then
+    record "$w" TIMEOUT "$secs" "still running after ${VGPU_WL_TIMEOUT}s"; rc=1
+  elif [ "$status" -ne 0 ]; then
+    record "$w" FAIL "$secs" "exit $status${why:+: $why}"; rc=1
+  elif [ -n "$why" ]; then
+    record "$w" FAIL "$secs" "$why"; rc=1
   # A workload that ran must say something about what it measured. A silent
   # success is the failure this project cares about most.
-  if ! printf '%s' "\$out" | grep -qiE "throughput|bandwidth|latency|ops/s|GB/s|PANTHEON"; then
-    echo "FAIL: \$w produced no measurement"; printf '%s\n' "\$out" | tail -5; rc=1; continue
+  elif ! grep -qiE "throughput|bandwidth|latency|ops/s|GB/s|PANTHEON|Verification: PASS" "$log"; then
+    record "$w" FAIL "$secs" "exited 0 but reported no measurement"; rc=1
+  else
+    record "$w" PASS "$secs" "$(grep -iE 'throughput|ops/s|GB/s|Verification' "$log" | head -1 | tr -s ' ' | cut -c1-80)"
   fi
-  if printf '%s' "\$out" | grep -qiE "PANTHEON ERROR|CUDA error|integrity"; then
-    echo "FAIL: \$w reported an error"; printf '%s' "\$out" | grep -iE "PANTHEON ERROR|CUDA error|integrity" | head -3; rc=1; continue
-  fi
-  echo "ok   \$w"
 done
-exit \$rc
+exit $rc
 INNER
 )
 
@@ -99,7 +150,40 @@ if ! unshare --user --map-root-user true >/dev/null 2>&1; then
   isolate=(--no-isolate)
 fi
 
-"$build/vgpu" shell --gpu "$GPU" --vram-mb "$VRAM_MB" "${isolate[@]}" -y -c "$inner"
+VGPU_WL_PANTHEON="$pantheon" VGPU_WL_NAMES="$WORKLOADS" VGPU_WL_SKIP="$OUT_OF_SCOPE" \
+VGPU_WL_LOGS="$logs" VGPU_WL_DURATION="$DURATION" VGPU_WL_MEMPCT="$MEM_PCT" \
+VGPU_WL_ARGS="$ARGS" VGPU_WL_TIMEOUT="$TIMEOUT" \
+  "$build/vgpu" shell --gpu "$GPU" --count "$COUNT" --vram-mb "$VRAM_MB" "${isolate[@]}" -y -c "$inner"
 status=$?
+
+results="$logs/results.tsv"
+if [[ -s "$results" ]]; then
+  pass=$(grep -c $'\tPASS\t' "$results"); skip=$(grep -c $'\tSKIP\t' "$results")
+  bad=$(grep -cvE $'\t(PASS|SKIP)\t' "$results")
+  echo
+  echo "pantheon workloads on $COUNT x $GPU: $pass passed, $bad failed, $skip skipped"
+  if [[ -n "$REPORT" ]]; then
+    echo "$COUNT x ${GPU#nvidia/}, CUDA $(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1)" >"$logs/machine.txt"
+    {
+      echo "### $COUNT x $GPU, $(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/CUDA \1/p' | head -1)"
+      echo
+      echo "$pass passed, $bad failed, $skip skipped (pantheon $(git -C "$pantheon" rev-parse --short HEAD 2>/dev/null))"
+      echo
+      if (( bad )); then
+        echo "| Workload | Result | Seconds | Detail |"
+        echo "| --- | --- | ---: | --- |"
+        grep -vE $'\t(PASS|SKIP)\t' "$results" | awk -F'\t' '{ gsub(/\|/, "\\|", $4); printf "| %s | **%s** | %s | %s |\n", $1, $2, $3, $4 }'
+        echo
+      fi
+      echo "<details><summary>All results</summary>"
+      echo
+      echo "| Workload | Result | Seconds | Detail |"
+      echo "| --- | --- | ---: | --- |"
+      awk -F'\t' '{ gsub(/\|/, "\\|", $4); printf "| %s | %s | %s | %s |\n", $1, $2, $3, $4 }' "$results"
+      echo
+      echo "</details>"
+    } >"$logs/summary.md"
+  fi
+fi
 [[ $status -eq 0 ]] && echo "pantheon workloads: all passed"
 exit $status

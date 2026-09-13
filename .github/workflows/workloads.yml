@@ -1,0 +1,186 @@
+name: Workloads
+
+# Every pantheon workload, on a spread of simulated machines.
+#
+# The pull-request CI runs three workloads on one A10 so a change gets an answer
+# in minutes. This is the check that the other forty-odd still run, on the cards,
+# GPU counts and CUDA versions people actually use. It runs when a change merges
+# and again every day: the workloads live in their own repository and change
+# without this one changing, and a break from that side should not wait for the
+# next simulator commit to be noticed.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+    inputs:
+      workloads:
+        description: Workloads to run, space separated, or all
+        default: all
+      pantheon-ref:
+        description: Branch, tag or commit of pantheongpu/pantheon
+        default: main
+  # A change to this workflow or the runner is tested the way it will run.
+  pull_request:
+    paths:
+      - .github/workflows/workloads.yml
+      - tests/workloads/**
+  # For the pantheon repository to trigger a run when it changes.
+  repository_dispatch:
+    types: [pantheon-updated]
+
+permissions:
+  contents: read
+
+# A merge supersedes the run for the merge before it; a scheduled run is never
+# cancelled by one.
+concurrency:
+  group: workloads-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+jobs:
+  machine:
+    name: ${{ matrix.count }} x ${{ matrix.gpu }}, CUDA ${{ matrix.cuda }}
+    runs-on: ubuntu-24.04
+    # A full suite takes 20 to 40 minutes on a 4-core runner. Every workload
+    # also has its own timeout below, so a hang costs one row, not the job.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # One machine per architecture the workloads build for, since each gets
+        # its own kernels (the Makefile reads the architecture off nvidia-smi).
+        # Counts above one take all_reduce and p2p_thrasher down their real
+        # multi-GPU paths.
+        include:
+          - { key: t4-x1-cuda12.0,    gpu: nvidia/t4,          count: 1, cuda: '12.0' }  # Turing 7.5
+          - { key: a100-x1-cuda12.0,  gpu: nvidia/a100,        count: 1, cuda: '12.0' }  # Ampere 8.0
+          - { key: a10-x2-cuda12.0,   gpu: nvidia/a10,         count: 2, cuda: '12.0' }  # Ampere 8.6
+          - { key: l4-x1-cuda13.0,    gpu: nvidia/l4,          count: 1, cuda: '13.0' }  # Ada 8.9
+          - { key: h100-x8-cuda13.0,  gpu: nvidia/h100,        count: 8, cuda: '13.0' }  # Hopper 9.0, a full node
+          - { key: gh200-x1-cuda13.0, gpu: nvidia/gh200-480gb, count: 1, cuda: '13.0' }  # Grace Hopper
+          - { key: b200-x2-cuda13.0,  gpu: nvidia/b200,        count: 2, cuda: '13.0' }  # Blackwell 10.0, CUDA 12.8+
+    env:
+      # CUDA 13 packages from NVIDIA's repository: the compiler and the headers
+      # of every library the simulator stands in for.
+      CUDA13_PACKAGES: >-
+        cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0
+        cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0
+        libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pantheonsim
+
+      - uses: actions/checkout@v4
+        with:
+          repository: pantheongpu/pantheon
+          ref: ${{ inputs.pantheon-ref || 'main' }}
+          path: pantheon
+
+      - name: Install CUDA ${{ matrix.cuda }}
+        env:
+          CUDA: ${{ matrix.cuda }}
+        run: |
+          sudo apt-get update -qq
+          if [[ "$CUDA" == 12.0 ]]; then
+            # Ubuntu's own toolkit. Its nvcc rejects GCC 13's headers, so it
+            # compiles with GCC 12.
+            sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit
+            echo "NVCC_PREPEND_FLAGS=-ccbin g++-12" >> "$GITHUB_ENV"
+          else
+            sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+            wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+            sudo dpkg -i /tmp/keyring.deb
+            sudo apt-get update -qq
+            read -ra packages <<<"$CUDA13_PACKAGES"
+            sudo apt-get install -y -qq --no-install-recommends "${packages[@]}"
+            echo "/usr/local/cuda-$CUDA/bin" >> "$GITHUB_PATH"
+            echo "CUDA_HOME=/usr/local/cuda-$CUDA" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build VirtualGPU
+        working-directory: pantheonsim
+        run: |
+          nvcc --version | tail -2
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+          ls build/shim/libcudart.so.*
+
+      - name: Run every workload
+        working-directory: pantheonsim
+        env:
+          VGPU_PANTHEON_DIR: ${{ github.workspace }}/pantheon
+          VGPU_BUILD_DIR: ${{ github.workspace }}/pantheonsim/build
+          VGPU_WORKLOADS: ${{ inputs.workloads || 'all' }}
+          VGPU_WORKLOAD_GPU: ${{ matrix.gpu }}
+          VGPU_WORKLOAD_COUNT: ${{ matrix.count }}
+          # CPU-sized: the same code over a smaller working set. A GPU retires
+          # about 10^13 operations a second and this interpreter about 10^8.
+          VGPU_WORKLOAD_SECONDS: '5'
+          VGPU_WORKLOAD_ARGS: --kernel_loops 2 --warmup_iters 1 --grid_size 4
+          VGPU_WORKLOAD_TIMEOUT: '300'
+          VGPU_WORKLOAD_REPORT: ${{ runner.temp }}/report/${{ matrix.key }}
+        run: ./tests/workloads/run_pantheon_workloads.sh
+
+      - name: Results
+        if: always()
+        run: cat "$RUNNER_TEMP/report/${{ matrix.key }}/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no results were written" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workloads-${{ matrix.key }}
+          path: ${{ runner.temp }}/report/${{ matrix.key }}
+          retention-days: 14
+          if-no-files-found: ignore
+
+  summary:
+    name: every machine
+    needs: machine
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tests/workloads
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: workloads-*
+          path: results
+
+      - name: One table
+        run: |
+          # 7: the machines in the matrix above, so one that wrote nothing is reported.
+          python3 tests/workloads/workload_matrix.py results 7 > matrix.md
+          cat matrix.md >> "$GITHUB_STEP_SUMMARY"
+
+      # While main is broken there is one open issue saying where, updated by
+      # each run and closed by the first run that passes. A red scheduled run
+      # nobody opens is the failure this is here to prevent.
+      - name: Track failures in an issue
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ needs.machine.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          label=workloads-failing
+          gh label create "$label" --color B60205 --description "The nightly pantheon workloads run is failing" --force >/dev/null
+          open=$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')
+          if [[ "$RESULT" == success ]]; then
+            [[ -n "$open" ]] && gh issue close "$open" --comment "Passing again on every machine: $RUN_URL"
+            exit 0
+          fi
+          { echo "Workloads are failing on main ($GITHUB_EVENT_NAME, ${GITHUB_SHA::7}): $RUN_URL"; echo; cat matrix.md; } > body.md
+          if [[ -n "$open" ]]; then
+            gh issue comment "$open" --body-file body.md
+          else
+            gh issue create --title "Pantheon workloads failing on main" --label "$label" --body-file body.md
+          fi
