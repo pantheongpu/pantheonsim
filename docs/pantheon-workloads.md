@@ -99,6 +99,57 @@ path and exit cleanly. On a host that *also* has real NVIDIA driver libraries
 (e.g. WSL), they load the real library and then try to reach real hardware
 through the virtual device, so the runner skips them.
 
+## In CI
+
+Two workflows run the workloads, at two depths:
+
+| When | What | Where |
+| --- | --- | --- |
+| Every pull request | `compute_virus`, `int_virus`, `cache_latency` on one A10 | `ci.yml`, job *pantheon workloads* |
+| Every merge to main, and daily at 06:23 UTC | every workload, on seven machines | `workloads.yml` |
+
+The seven machines cover each architecture the workloads build for, both CUDA
+majors and the multi-GPU paths: 1 x T4, 1 x A100 and 2 x A10 on CUDA 12.0; 1 x
+L4, 8 x H100, 1 x GH200 and 2 x B200 on CUDA 13.0. Each builds the workloads with
+pantheon's own Makefile inside `vgpu shell`, which reads the architecture off
+the simulated `nvidia-smi` exactly as it would on the card.
+
+The run's summary page has one table, a row per workload and a column per
+machine, with failures first and the reason for each. While main is failing,
+an issue labelled `workloads-failing` stays open and each run comments on it;
+the first run that passes everywhere closes it. It also runs daily because
+pantheon lives in its own repository: a change there can break a workload
+without anything here changing. *Run workflow* on the Actions page takes a
+list of workloads and a pantheon ref, to check a pantheon branch before it
+merges.
+
+The same run locally, for any machine:
+
+```bash
+VGPU_WORKLOADS=all VGPU_WORKLOAD_GPU=nvidia/h100 VGPU_WORKLOAD_COUNT=8 \
+VGPU_WORKLOAD_SECONDS=5 VGPU_WORKLOAD_TIMEOUT=300 \
+VGPU_WORKLOAD_ARGS="--kernel_loops 2 --warmup_iters 1 --grid_size 4" \
+VGPU_WORKLOAD_REPORT=/tmp/wl VGPU_PANTHEON_DIR=../pantheon \
+  tests/workloads/run_pantheon_workloads.sh
+python3 tests/workloads/workload_matrix.py /tmp/wl
+```
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `VGPU_WORKLOADS` | `all`, or workload names | the three quick ones |
+| `VGPU_WORKLOAD_GPU` | profile; the build follows its architecture | `nvidia/a10` |
+| `VGPU_WORKLOAD_COUNT` | GPUs in the machine | 1 |
+| `VGPU_WORKLOAD_VRAM_MB` | memory per GPU | 1024 |
+| `VGPU_WORKLOAD_SECONDS` | how long each workload runs | 2 |
+| `VGPU_WORKLOAD_MEM_PCT` | percent of memory each allocates | 2 |
+| `VGPU_WORKLOAD_ARGS` | extra workload flags | none |
+| `VGPU_WORKLOAD_TIMEOUT` | seconds before a workload counts as hung | none |
+| `VGPU_WORKLOAD_REPORT` | directory for `results.tsv`, `summary.md` and logs | a temporary one |
+
+A result is `PASS` only when the workload exits 0, reports a measurement, and
+prints no CUDA or pantheon error. Otherwise it is `FAIL`, `TIMEOUT`, or
+`MISSING` when it did not build; OptiX and NVENC workloads are `SKIP`.
+
 ## Differential validation against real hardware
 
 `memory_read` was validated against a physical RTX 3060 (the intended
