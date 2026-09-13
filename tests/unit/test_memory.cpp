@@ -386,4 +386,52 @@ VTEST(a_scalar_load_of_untouched_memory_is_zero_and_allocates_nothing) {
   mm.free(p);
 }
 
+// A load of memory nothing has written, racing the first store into it. The
+// load used to find the chunk unmaterialized and fall back to a plain copy --
+// and the store could materialize and write the chunk in between, so the copy
+// read bytes mid-write: undefined, and reported by ThreadSanitizer on main.
+// Untouched memory now answers zero without copying anything. Many rounds,
+// because the window is a few instructions wide.
+VTEST(a_load_racing_the_first_store_into_untouched_memory_is_never_a_copy) {
+  bool wrong = false;
+  for (int round = 0; round < 300 && !wrong; ++round) {
+    MemoryManager mm(1 << 20);
+    const uint64_t p = mm.alloc(64);
+    std::atomic<bool> go{false};
+    std::thread writer([&] {
+      while (!go.load()) std::this_thread::yield();
+      mm.store_scalar(p, 4, 0xdecafbad);
+    });
+    std::thread reader([&] {
+      go = true;
+      for (;;) {
+        const uint64_t v = mm.load_scalar(p, 4);
+        if (v == 0xdecafbad) break;
+        if (v != 0) { wrong = true; break; }
+      }
+    });
+    writer.join();
+    reader.join();
+    mm.free(p);
+  }
+  VCHECK(!wrong);
+}
+
+// A scalar whose storage is not aligned for its width still round-trips: it
+// is read and written a byte at a time rather than copied.
+VTEST(scalar_store_and_load_agree_at_every_size) {
+  MemoryManager mm(1 << 20);
+  const uint64_t p = mm.alloc(64);
+  mm.store_scalar(p + 8, 8, 0x0123456789abcdefull);
+  mm.store_scalar(p + 20, 4, 0xa1b2c3d4);
+  mm.store_scalar(p + 26, 2, 0xbeef);
+  mm.store_scalar(p + 31, 1, 0x7f);
+  VCHECK_EQ(mm.load_scalar(p + 8, 8), 0x0123456789abcdefull);
+  VCHECK_EQ(mm.load_scalar(p + 20, 4), uint64_t{0xa1b2c3d4});
+  VCHECK_EQ(mm.load_scalar(p + 26, 2), uint64_t{0xbeef});
+  VCHECK_EQ(mm.load_scalar(p + 31, 1), uint64_t{0x7f});
+  VCHECK_EQ(mm.load_scalar(p + 12, 4), uint64_t{0x01234567});   // the high half of the u64
+  mm.free(p);
+}
+
 VTEST_MAIN
