@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -599,6 +600,45 @@ VTEST(a_uniform_fill_never_spills) {
     VCHECK_EQ(vgpu::backing::spill_bytes(), 0ull);
     VCHECK_EQ(mm.load_scalar(p + n - 1, 1), uint64_t{0x5A});
     mm.free(p);
+  }
+  vgpu::backing::configure({});
+  ::rmdir(dir);
+}
+
+// A forked child that frees its copy of spilled device memory, or exits and
+// runs its destructors, must not zero the parent's: the spill file is shared.
+VTEST(a_forked_child_freeing_spilled_memory_leaves_the_parents_intact) {
+  using vgpu::kChunkSize;
+  char dir[] = "/tmp/vgpu-fork-XXXXXX";
+  VCHECK(::mkdtemp(dir) != nullptr);
+  vgpu::backing::configure({0, dir});
+  {
+    MemoryManager mm(1ull << 30);
+    const uint64_t n = 16 * kChunkSize;
+    const uint64_t p = mm.alloc(n);
+    std::vector<uint8_t> in(n), out(n);
+    for (uint64_t i = 0; i < n; ++i) in[i] = static_cast<uint8_t>(i * 7 + 1);
+    mm.write(p, in.data(), n);
+    const pid_t child = ::fork();
+    if (child == 0) {
+      mm.free(p);
+      // And a fresh spill of its own, which must not reuse the parent's chunks.
+      const uint64_t q = mm.alloc(4 * kChunkSize);
+      std::vector<uint8_t> junk(4 * kChunkSize, 0xEE);
+      mm.write(q, junk.data(), junk.size());
+      ::_exit(0);
+    }
+    int status = 0;
+    VCHECK(::waitpid(child, &status, 0) == child);
+    VCHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    mm.read(p, out.data(), n);
+    VCHECK(in == out);
+    // The parent's own spill still works and still frees.
+    const uint64_t r = mm.alloc(4 * kChunkSize);
+    mm.write(r, in.data(), 4 * kChunkSize);
+    mm.free(r);
+    mm.free(p);
+    VCHECK_EQ(vgpu::backing::spill_bytes(), 0ull);
   }
   vgpu::backing::configure({});
   ::rmdir(dir);

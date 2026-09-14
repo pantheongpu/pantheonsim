@@ -29,9 +29,13 @@ struct State {
   uint64_t ram = 0;
   uint64_t spill = 0;
   int fd = -1;
+  pid_t owner = 0;                      // the process that created the spill file
   uint64_t file_size = 0;
   std::map<uint8_t*, uint64_t> slices;  // mapping base -> offset in the file
   std::vector<uint8_t*> free_file;      // file chunks ready to hand out, zero
+  // Slices a forked child inherited from its parent: still mapped, never
+  // released or handed out again here.
+  std::map<uint8_t*, uint64_t> inherited;
 };
 
 // Never destroyed: device memory can be released during static destruction,
@@ -52,14 +56,34 @@ void configure_from_env(State& s) {
   }
 }
 
-// The file offset of a chunk, if the chunk is in the spill file.
-bool file_offset(const State& s, uint8_t* chunk, uint64_t* off) {
-  auto it = s.slices.upper_bound(chunk);
-  if (it == s.slices.begin()) return false;
+// The file offset of a chunk, if the chunk is in one of these slices.
+bool in_slices(const std::map<uint8_t*, uint64_t>& slices, uint8_t* chunk, uint64_t* off) {
+  auto it = slices.upper_bound(chunk);
+  if (it == slices.begin()) return false;
   --it;
   if (chunk >= it->first + kSliceBytes) return false;
   *off = it->second + static_cast<uint64_t>(chunk - it->first);
   return true;
+}
+bool file_offset(const State& s, uint8_t* chunk, uint64_t* off) { return in_slices(s.slices, chunk, off); }
+
+// A forked child shares the spill file's pages with its parent -- a shared
+// mapping is the point of the file. Freeing a chunk there punched a hole in the
+// parent's device memory, which read back as zeros, and a free chunk handed
+// out in both processes would be the same bytes twice. So the first time a
+// child touches the backing, everything it inherited is set aside: those
+// chunks are left alone (the parent owns them), and the child spills into a
+// file of its own. CUDA is not usable in a forked child anyway; this is about
+// a child that frees memory or simply exits and runs its destructors.
+void adopt_after_fork(State& s) {
+  if (s.fd < 0 || s.owner == ::getpid()) return;
+  s.inherited.insert(s.slices.begin(), s.slices.end());
+  s.slices.clear();
+  s.free_file.clear();
+  ::close(s.fd);
+  s.fd = -1;
+  s.file_size = 0;
+  s.spill = 0;
 }
 
 [[noreturn]] void cannot_spill(const State& s, const char* what) {
@@ -80,6 +104,7 @@ void grow(State& s) {
       if (s.fd >= 0) ::unlink(name.c_str());
     }
     if (s.fd < 0) cannot_spill(s, "the spill file could not be created");
+    s.owner = ::getpid();
   }
   // Reserved, not merely sized: a write into an unreserved page of a shared
   // mapping on a full disk is a SIGBUS, which would take the program down
@@ -105,6 +130,7 @@ void configure(const Config& config) {
   s.config = config;
   // A spill file with nothing in it belongs to the old configuration: close it,
   // so the next spill uses the directory just given rather than the last one.
+  adopt_after_fork(s);
   if (s.fd >= 0 && s.spill == 0) {
     for (const auto& [base, off] : s.slices) ::munmap(base, kSliceBytes);
     s.slices.clear();
@@ -119,6 +145,7 @@ uint8_t* acquire() {
   State& s = state();
   std::unique_lock<std::mutex> lock(s.mu);
   configure_from_env(s);
+  adopt_after_fork(s);
   const bool spill = !s.config.spill_dir.empty() && s.ram + kChunkSize > s.config.ram_limit_bytes;
   if (!spill) {
     s.ram += kChunkSize;
@@ -143,7 +170,9 @@ void release(uint8_t* chunk) {
   if (!chunk) return;
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mu);
+  adopt_after_fork(s);
   uint64_t off = 0;
+  if (in_slices(s.inherited, chunk, &off)) return;  // the parent's; see adopt_after_fork
   if (s.fd >= 0 && file_offset(s, chunk, &off)) {
     // The hole returns the disk space and makes the chunk read as zero when it
     // is handed out again. Where holes are not supported, zero it by hand.
