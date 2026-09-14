@@ -156,7 +156,7 @@ jobs:
         with:
           sparse-checkout: |
             .github/workflows
-            profiles
+            nvidia/profiles
       - name: Compare the matrix with nvidia/profiles
         run: |
           have=$(grep -oE 'gpu: nvidia/[a-z0-9-]+' .github/workflows/workloads.yml | sed 's#gpu: nvidia/##' | sort -u)
