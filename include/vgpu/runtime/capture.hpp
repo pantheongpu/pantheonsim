@@ -1,7 +1,7 @@
 // Graph capture hook for the vendor-library shims.
 //
 // cuBLAS and its siblings are implemented on the host rather than through the
-// SIMT interpreter (see docs/cublas.md). That boundary is invisible to a
+// SIMT interpreter (see nvidia/docs/cublas.md). That boundary is invisible to a
 // program until it captures a CUDA graph: on hardware a library call inside a
 // captured region is *recorded* and runs when the graph is launched, so its
 // operands are whatever the captured kernels produced. A host implementation

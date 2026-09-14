@@ -156,14 +156,14 @@ jobs:
         with:
           sparse-checkout: |
             .github/workflows
-            profiles
-      - name: Compare the matrix with profiles/nvidia
+            nvidia/profiles
+      - name: Compare the matrix with nvidia/profiles
         run: |
           have=$(grep -oE 'gpu: nvidia/[a-z0-9-]+' .github/workflows/workloads.yml | sed 's#gpu: nvidia/##' | sort -u)
-          want=$(find profiles/nvidia -name '*.yaml' -printf '%f\n' | sed 's/[.]yaml$//' | sort -u)
+          want=$(find nvidia/profiles -name '*.yaml' -printf '%f\n' | sed 's/[.]yaml$//' | sort -u)
           missing=$(comm -13 <(printf '%s\n' "$have") <(printf '%s\n' "$want") | tr '\n' ' ')
           stale=$(comm -23 <(printf '%s\n' "$have") <(printf '%s\n' "$want") | tr '\n' ' ')
-          echo "matrix: $(printf '%s\n' "$have" | wc -l) profiles; profiles/nvidia: $(printf '%s\n' "$want" | wc -l)"
+          echo "matrix: $(printf '%s\n' "$have" | wc -l) profiles; nvidia/profiles: $(printf '%s\n' "$want" | wc -l)"
           [ -z "${missing// }" ] || { echo "::error::not in the workloads matrix: $missing"; exit 1; }
           [ -z "${stale// }" ] || { echo "::error::in the matrix but not a profile: $stale"; exit 1; }
 
@@ -180,7 +180,7 @@ jobs:
         with:
           sparse-checkout: |
             tests/workloads
-            profiles
+            nvidia/profiles
 
       - uses: actions/download-artifact@v4
         with:
@@ -191,7 +191,7 @@ jobs:
         run: |
           # One machine per NVIDIA profile (the coverage job holds the matrix to
           # that), so a machine that wrote nothing is reported as missing.
-          python3 tests/workloads/workload_matrix.py results "$(find profiles/nvidia -name '*.yaml' | wc -l)" > matrix.md
+          python3 tests/workloads/workload_matrix.py results "$(find nvidia/profiles -name '*.yaml' | wc -l)" > matrix.md
           cat matrix.md >> "$GITHUB_STEP_SUMMARY"
 
       # While main is broken there is one open issue saying where, updated by

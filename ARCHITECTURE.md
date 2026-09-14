@@ -12,7 +12,7 @@ architecture semantics     PTX subset -> AST                  [future: sm_xx fea
         |                                                      AMD GCN/CDNA IR]
 common CPU engine          SIMT warp interpreter + virtual memory + scheduler
         |
-device profile             profiles/nvidia/*.yaml  (data, not code)
+device profile             nvidia/profiles/*.yaml  (data, not code)
 ```
 
 An H100 and an H200 differ only in their profile data. Hopper and Blackwell
@@ -28,22 +28,38 @@ width 64 is a parameter, not a rewrite — enforced today by an explicit
   next. (Core working)
 - **L3 Compute** — PTX kernels execute functionally on CPU. (Working subset)
 - **L4 Ecosystem** — cuBLAS/cuBLASLt/cuDNN/cuFFT/cuRAND/cuSPARSE/cuSOLVER/NCCL/NVRTC/NPP/nvJPEG
-  are implemented and verified against hardware (docs/libraries.md);
+  are implemented and verified against hardware (nvidia/docs/libraries.md);
   PyTorch itself is not.
 
 ## Repository map
 
+Vendor-neutral engine at the top; everything specific to one vendor under its
+own folder.
+
 ```
-include/vgpu/…, src/
-  core/      profiles, registry, restricted-YAML, virtual memory, errors
-  ptx/       lexer, parser, AST                       (vendor frontend, NVIDIA)
+include/vgpu/…, src/          the engine, shared by every vendor
+  core/      profiles, registry, restricted-YAML, device memory, errors
+  ptx/       lexer, parser, AST
   exec/      SIMT interpreter, scheduler              (common CPU engine)
   runtime/   Device/Runtime facade (primary-context model)
-  cuda/      libvgpucuda.so — C ABI driver-API shim   (vendor frontend, NVIDIA)
-  cli/       vgpu binary
-include/vgpu_cuda.h   clean-room driver-API subset header (public ABI)
-profiles/  nvidia/{a10,a100,h100,h200,b200}.yaml  amd/ (placeholder)
-tests/     unit/ framework/ c_harness/ kernels/
+  cli/       vgpu binary (shell, smi, run, test)
+tests/       unit/ framework/ kernels/ workloads/      engine tests and the pantheon workloads
+scripts/     build, test, run
+tools/       bench.sh (interpreter throughput)
+
+nvidia/                       NVIDIA GPUs and CUDA
+  src/       libvgpucuda (driver API), libcudart, NVML, CUPTI, NVENC, vendor libraries
+  include/   vgpu_cuda.h — clean-room driver-API subset header (public ABI)
+  profiles/  one YAML per GPU; id nvidia/<name>
+  third_party/  public cuDNN and NCCL headers
+  tools/     nvidia-smi, nvcc, profile characterization and verification
+  tests/     e2e/ conformance/ c_harness/
+  docs/      cuBLAS, CUPTI, dark API, JIT, libraries, textures
+
+amd/                          AMD GPUs and ROCm (discovery today)
+  profiles/  MI300X, MI325X, MI350X; id amd/<name>
+  tools/     rocm-smi, rocm_agent_enumerator, characterization
+  src/       the HIP runtime and ROCm libraries, once written
 ```
 
 C++20, CMake, **zero external dependencies** (hand-rolled restricted-YAML +
@@ -194,7 +210,7 @@ a framework will hand it over:
   `cuModuleLoadData` loads. Nothing is faked -- `cuLinkComplete` really does
   yield something the loader accepts.
 - **Triton** goes one step further and runs `ptxas` itself, so what arrives is
-  a cubin. We decline it rather than pretend, and `tools/vgpu_triton.py` ends
+  a cubin. We decline it rather than pretend, and `nvidia/tools/vgpu_triton.py` ends
   Triton's pipeline at PTX through its own documented stage hook. A SASS
   decoder would be the alternative, and SASS is undocumented.
 - **CuPy** links the runtime statically, so it never reaches either path; it

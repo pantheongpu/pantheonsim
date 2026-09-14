@@ -1,0 +1,42 @@
+# VirtualGPU device profile: NVIDIA A100 (SXM4 80GB variant).
+# Read from a physical A100-SXM4-80GB on a Lambda 8x instance by
+# nvidia/tools/characterize.cu. The residency ceilings are the sm_80 constants, which
+# the 40 GB part reported identically.
+id: nvidia/a100
+vendor: nvidia
+model: "NVIDIA A100-SXM4-80GB"
+architecture: ampere
+compute_capability: "8.0"
+warp_size: 32
+vram_bytes: 85095874560          # what the device reports, not the 80 GiB label
+verified: true
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 166912   # 163 KiB (sm_80)
+  registers_per_block: 65536
+  multiprocessors: 108
+  registers_per_sm: 65536
+  max_threads_per_sm: 2048
+  max_blocks_per_sm: 32
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 167936
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+# Public spec-sheet figures; PCI ids from the public NVIDIA device list.
+telemetry:
+  framebuffer_mb: 81920          # nvidia-smi total on real cards (38 runs in the benchmark database)
+  power_limit_w: 400
+  sm_clock_max_mhz: 1410
+  mem_clock_max_mhz: 1593
+  temperature_max_c: 85
+  pci_vendor_id: 4318          # 0x10DE NVIDIA
+  pci_device_id: 8370        # 0x20b2 GA100 [A100 SXM4 80GB]

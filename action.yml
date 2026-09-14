@@ -60,7 +60,7 @@ runs:
         # The cache key is the source itself, so a moving ref like @main rebuilds
         # exactly when the simulator changed -- and the toolkit version, because
         # the CUDA libraries are built against its headers.
-        src=$(cd "$SRC" && find CMakeLists.txt src include profiles tools scripts -type f -print0 \
+        src=$(cd "$SRC" && find CMakeLists.txt src include nvidia amd tools scripts -type f -print0 \
               | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-20)
         nvcc_version=$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1)
         {

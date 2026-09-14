@@ -90,7 +90,7 @@ VTEST(profile_missing_key_is_an_error) {
 VTEST(a_driver_that_reports_no_thermal_threshold_still_loads) {
   // Telemetry is presentation-only and a device that does not report a value is
   // a fact about the device, not a broken profile. A real GH200's driver
-  // reports no thermal threshold, so tools/characterize-telemetry.sh comments
+  // reports no thermal threshold, so nvidia/tools/characterize-telemetry.sh comments
   // the key out -- and requiring it made every profile characterized from one
   // fail to load at all, which surfaced as the device having no memory.
   const char* yaml = R"(
