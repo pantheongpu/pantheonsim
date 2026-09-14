@@ -97,6 +97,18 @@ add_custom_command(TARGET vgpucuda POST_BUILD
 # applications (built against shared cudart) run on VirtualGPU. Requires the
 # CUDA toolkit's ABI headers at build time (driver_types.h) for exact struct
 # layout; built only when they are found, so the core stays dependency-free.
+# find_path keeps a path it has cached even after that directory is gone, and
+# never searches again. Every build directory configured before the vendored
+# headers moved from third_party/ to nvidia/third_party/ kept the old path, and
+# the build then failed with "nccl.h: No such file or directory". A cached path
+# whose header no longer exists is forgotten, so the search runs again.
+function(vgpu_forget_stale_path var header)
+  if(${var} AND NOT EXISTS "${${var}}/${header}")
+    message(STATUS "${var}: ${${var}}/${header} is gone; searching again")
+    unset(${var} CACHE)
+  endif()
+endfunction()
+
 # ---------------------------------------------------------------------------
 # Derive the ABI include from the nvcc that will compile the workloads, so the
 # shim's cudaDeviceProp layout matches the application's exactly. A mismatched
@@ -339,6 +351,7 @@ if(CUDA_ABI_INCLUDE)
   # bytes over, so the transport is a directory of memory-mapped files -- which
   # is what lets one-rank-per-process launchers (torchrun) work unmodified.
   # ---------------------------------------------------------------------------
+  vgpu_forget_stale_path(NCCL_INCLUDE nccl.h)
   find_path(NCCL_INCLUDE nccl.h
     PATHS "${CMAKE_SOURCE_DIR}/nvidia/third_party/nccl_include" ENV NCCL_HEADER_DIR
     NO_DEFAULT_PATH)
@@ -367,6 +380,7 @@ if(CUDA_ABI_INCLUDE)
   # script gives ours the same tag so the loader binds without the
   # "no version information available" warning.
   # ---------------------------------------------------------------------------
+  vgpu_forget_stale_path(CUDNN_INCLUDE cudnn.h)
   find_path(CUDNN_INCLUDE cudnn.h
     PATHS "${CMAKE_SOURCE_DIR}/nvidia/third_party/cudnn_include" ENV CUDNN_HEADER_DIR
     NO_DEFAULT_PATH)
@@ -395,6 +409,7 @@ if(CUDA_ABI_INCLUDE)
   # LD_LIBRARY_PATH first, so the shim directory wins over the real driver
   # library. Needs the Video Codec SDK header (vendored by the workload tree).
   # ---------------------------------------------------------------------------
+  vgpu_forget_stale_path(NVENC_INCLUDE nvEncodeAPI.h)
   find_path(NVENC_INCLUDE nvEncodeAPI.h
     PATHS "${CMAKE_SOURCE_DIR}/../pantheongpu/kernels/common/nvenc"
           ENV NVENC_HEADER_DIR)
