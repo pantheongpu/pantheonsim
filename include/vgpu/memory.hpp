@@ -5,7 +5,11 @@
 //    can never be confused with host pointers.
 //  - Backing is sparse: 64 KiB chunks materialize on first write. A virtual
 //    H200 can advertise 141 GB of VRAM on a 16 GB laptop; only touched pages
-//    cost host RAM -- or disk, past VGPU_MEMORY_RAM_MB (memory_backing.hpp). Untouched device memory reads as zero (documented
+//    cost host RAM -- or disk, past VGPU_MEMORY_RAM_MB (memory_backing.hpp).
+//  - A chunk that holds one byte value throughout costs nothing at all: it is
+//    stored as that value. A memory stress test fills the whole card with one
+//    pattern and then works a small part of it, so a 12 GB fill becomes a table
+//    of tags, and only the chunks written with other data take RAM or disk. Untouched device memory reads as zero (documented
 //    VirtualGPU behavior; real GPUs leave it undefined).
 //  - Virtual addresses are handed out monotonically and never reused, so a
 //    freed pointer can never alias a later allocation.
@@ -168,7 +172,10 @@ class MemoryManager {
    private:
     void release() {
       if (!chunks) return;
-      for (size_t i = 0; i < chunk_count; ++i) backing::release(chunks[i].load(std::memory_order_relaxed));
+      for (size_t i = 0; i < chunk_count; ++i) {
+        uint8_t* c = chunks[i].load(std::memory_order_relaxed);
+        if (!is_uniform(c)) backing::release(c);
+      }
     }
 
    public:
@@ -178,8 +185,20 @@ class MemoryManager {
     uint64_t seq = 0;  // eviction order
   };
 
-  // Creates chunk `chunk_idx` if absent and returns the chunk that won the
-  // race; safe to call from several block threads at once.
+  // A uniform chunk is a tagged value in the chunk table: the byte, shifted up,
+  // with the low bit set. Real chunks come from new[] or mmap and are always
+  // aligned, so their low bit is clear and the two can never be confused.
+  static bool is_uniform(const uint8_t* c) { return (reinterpret_cast<uintptr_t>(c) & 1) != 0; }
+  static uint8_t uniform_byte(const uint8_t* c) {
+    return static_cast<uint8_t>(reinterpret_cast<uintptr_t>(c) >> 1);
+  }
+  static uint8_t* uniform_chunk(uint8_t b) {
+    return reinterpret_cast<uint8_t*>((static_cast<uintptr_t>(b) << 1) | 1);
+  }
+
+  // Makes chunk `chunk_idx` real -- from nothing, or from a uniform chunk's byte --
+  // and returns the chunk that won the race; safe to call from several block
+  // threads at once.
   static uint8_t* materialize(Allocation& a, uint64_t chunk_idx);
 
   // Maps addr to (allocation base, allocation); throws with diagnostics.
@@ -215,9 +234,11 @@ class MemoryManager {
   std::unique_ptr<HostMaps> host_maps_;
   const HostMap* find_host_map_locked(uint64_t addr, uint64_t len) const;
   // Where a kernel's scalar access lands: bytes in a chunk, memory nothing has
-  // written (a load reads zero and must not copy), or a managed host mapping.
-  enum class ScalarAt { Chunk, Untouched, HostMap };
-  ScalarAt scalar_location(uint64_t addr, uint32_t size, bool create,
+  // written (a load reads zero and must not copy), a uniform chunk (a load reads
+  // its byte; a store of that same byte changes nothing), or a managed host
+  // mapping. `store` is the value being stored, or null for a load.
+  enum class ScalarAt { Chunk, Untouched, Uniform, Unchanged, HostMap };
+  ScalarAt scalar_location(uint64_t addr, uint32_t size, const uint64_t* store,
                            const uint8_t** where) const;
   std::map<uint64_t, Allocation> live_;        // base -> allocation
   // base -> record, bounded to kQuarantineEntries (oldest evicted first).

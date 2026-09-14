@@ -214,15 +214,22 @@ VTEST(nonzero_fill_costs_about_one_copy) {
   // Backing is exactly one chunk per touched chunk now, so this is an equality
   // rather than a range: the earlier version compared the process's resident
   // size, which a sanitizer's shadow memory and the allocator both perturb.
+  // A one-byte fill costs nothing at all (whole chunks become uniform), so the
+  // copy is measured with a four-byte pattern, which needs real bytes.
   MemoryManager mm(1ull << 40);
   const uint64_t n = 256ull * 1024 * 1024;
   uint64_t p = mm.alloc(n);
+  const uint8_t pattern[4] = {0xC3, 0x3C, 0x5A, 0xA5};
+  mm.fill(p, pattern, 4, n);
+  VCHECK_EQ(mm.resident_bytes(), n);  // one copy, not two
+  VCHECK_EQ(mm.load_scalar(p + n - 4, 4), uint64_t{0xA55A3CC3});
+  // A second fill over the same range materializes nothing further.
+  mm.fill(p, pattern, 4, n);
+  VCHECK_EQ(mm.resident_bytes(), n);
+  // One byte over it gives every chunk back.
   const uint8_t v = 0xC3;
   mm.fill(p, &v, 1, n);
-  VCHECK_EQ(mm.resident_bytes(), n);  // one copy, not two
-  // A second fill over the same range materializes nothing further.
-  mm.fill(p, &v, 1, n);
-  VCHECK_EQ(mm.resident_bytes(), n);
+  VCHECK_EQ(mm.resident_bytes(), 0ull);
   mm.free(p);
   VCHECK_EQ(mm.resident_bytes(), 0ull);
 }
@@ -493,6 +500,108 @@ VTEST(device_memory_with_nowhere_to_spill_is_out_of_memory) {
     mm.free(p);
   }
   vgpu::backing::configure({});
+}
+
+// A card filled with one byte costs no memory: a stress test's 12 GB fill is a
+// table of tags. Reads see the byte, storing it again changes nothing, and only
+// a chunk written with something else becomes real.
+VTEST(a_uniform_fill_costs_nothing_until_other_data_is_written) {
+  using vgpu::kChunkSize;
+  MemoryManager mm(64ull << 30);
+  const uint64_t n = 1ull << 30;  // 1 GiB
+  const uint64_t p = mm.alloc(n);
+  const uint8_t ff = 0xFF;
+  mm.fill(p, &ff, 1, n);
+  VCHECK_EQ(mm.resident_bytes(), 0ull);
+  VCHECK_EQ(mm.load_scalar(p + 12345 * 4, 4), uint64_t{0xFFFFFFFF});
+  VCHECK_EQ(mm.load_scalar(p + n - 8, 8), ~uint64_t{0});
+  std::vector<uint8_t> out(3 * kChunkSize, 0);
+  mm.read(p + kChunkSize / 2, out.data(), out.size());
+  bool all_ff = true;
+  for (uint8_t b : out) all_ff = all_ff && b == 0xFF;
+  VCHECK(all_ff);
+
+  // The fill pattern, stored or written again: still nothing.
+  for (uint64_t i = 0; i < 1000; ++i) mm.store_scalar(p + i * 4096, 4, 0xFFFFFFFF);
+  const std::vector<uint8_t> again(4096, 0xFF);
+  mm.write(p + 7 * kChunkSize + 100, again.data(), again.size());
+  VCHECK_EQ(mm.resident_bytes(), 0ull);
+
+  // Something else: one real chunk, the rest of it still the fill byte.
+  mm.store_scalar(p + 5 * kChunkSize + 16, 4, 0x12345678);
+  VCHECK_EQ(mm.resident_bytes(), kChunkSize);
+  VCHECK_EQ(mm.load_scalar(p + 5 * kChunkSize + 16, 4), uint64_t{0x12345678});
+  VCHECK_EQ(mm.load_scalar(p + 5 * kChunkSize + 20, 4), uint64_t{0xFFFFFFFF});
+  VCHECK_EQ(mm.load_scalar(p + 6 * kChunkSize, 4), uint64_t{0xFFFFFFFF});
+
+  // Filled again, the real chunk goes back; filled with zero, it is untouched memory.
+  mm.fill(p, &ff, 1, n);
+  VCHECK_EQ(mm.resident_bytes(), 0ull);
+  const uint8_t zero = 0;
+  mm.write(p, again.data(), 16);
+  mm.store_scalar(p + 64, 8, 42);
+  mm.fill(p, &zero, 1, n);
+  VCHECK_EQ(mm.resident_bytes(), 0ull);
+  VCHECK_EQ(mm.load_scalar(p + 64, 8), 0ull);
+  mm.free(p);
+}
+
+// A fill that does not cover a chunk exactly still lands byte for byte.
+VTEST(a_partial_fill_over_a_uniform_chunk_keeps_both_values) {
+  using vgpu::kChunkSize;
+  MemoryManager mm(1ull << 30);
+  const uint64_t p = mm.alloc(4 * kChunkSize);
+  const uint8_t a = 0xAA, b = 0x55;
+  mm.fill(p, &a, 1, 4 * kChunkSize);
+  mm.fill(p + kChunkSize + 10, &b, 1, 20);
+  VCHECK_EQ(mm.load_scalar(p + kChunkSize + 8, 1), uint64_t{0xAA});
+  VCHECK_EQ(mm.load_scalar(p + kChunkSize + 10, 1), uint64_t{0x55});
+  VCHECK_EQ(mm.load_scalar(p + kChunkSize + 29, 1), uint64_t{0x55});
+  VCHECK_EQ(mm.load_scalar(p + kChunkSize + 30, 1), uint64_t{0xAA});
+  VCHECK_EQ(mm.resident_bytes(), kChunkSize);
+  mm.free(p);
+}
+
+// Blocks writing different values into the same uniform chunk at once all land.
+VTEST(stores_racing_into_a_uniform_chunk_all_land) {
+  using vgpu::kChunkSize;
+  MemoryManager mm(1ull << 30);
+  const uint64_t p = mm.alloc(kChunkSize);
+  const uint8_t ff = 0xFF;
+  mm.fill(p, &ff, 1, kChunkSize);
+  std::vector<std::thread> threads;
+  for (uint32_t t = 0; t < 8; ++t)
+    threads.emplace_back([&, t] {
+      for (uint64_t i = 0; i < 512; ++i) mm.store_scalar(p + (t * 1024 + i) * 8, 8, t * 100000 + i);
+    });
+  for (auto& th : threads) th.join();
+  bool ok = true;
+  for (uint32_t t = 0; t < 8; ++t)
+    for (uint64_t i = 0; i < 512; ++i) ok = ok && mm.load_scalar(p + (t * 1024 + i) * 8, 8) == t * 100000 + i;
+  VCHECK(ok);
+  VCHECK_EQ(mm.resident_bytes(), kChunkSize);
+  mm.free(p);
+}
+
+// With the RAM limit at nothing and a spill directory, a uniform fill still
+// touches neither.
+VTEST(a_uniform_fill_never_spills) {
+  using vgpu::kChunkSize;
+  char dir[] = "/tmp/vgpu-uniform-XXXXXX";
+  VCHECK(::mkdtemp(dir) != nullptr);
+  vgpu::backing::configure({0, dir});
+  {
+    MemoryManager mm(64ull << 30);
+    const uint64_t n = 256 * kChunkSize;
+    const uint64_t p = mm.alloc(n);
+    const uint8_t v = 0x5A;
+    mm.fill(p, &v, 1, n);
+    VCHECK_EQ(vgpu::backing::spill_bytes(), 0ull);
+    VCHECK_EQ(mm.load_scalar(p + n - 1, 1), uint64_t{0x5A});
+    mm.free(p);
+  }
+  vgpu::backing::configure({});
+  ::rmdir(dir);
 }
 
 VTEST_MAIN

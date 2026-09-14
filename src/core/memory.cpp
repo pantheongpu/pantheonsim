@@ -48,6 +48,17 @@ void store_at(uint8_t* p, uint32_t size, uint64_t v) {
   for (uint32_t i = 0; i < size; ++i) relaxed_store<uint8_t>(p + i, (v >> (8 * i)) & 0xff);
 }
 
+// A `size`-byte scalar whose every byte is `b`, and whether `v` is one.
+uint64_t repeated(uint8_t b, uint32_t size) {
+  const uint64_t all = 0x0101010101010101ull * b;
+  return size == 8 ? all : all & ((uint64_t{1} << (8 * size)) - 1);
+}
+bool all_bytes(const uint8_t* p, uint64_t n, uint8_t b) {
+  for (uint64_t i = 0; i < n; ++i)
+    if (p[i] != b) return false;
+  return true;
+}
+
 // Formats an address as 0x-prefixed hex for diagnostics.
 struct Hex {
   uint64_t v;
@@ -173,16 +184,20 @@ MemoryManager::Allocation& MemoryManager::resolve_mut(uint64_t addr, uint64_t le
 }
 
 uint8_t* MemoryManager::materialize(Allocation& a, uint64_t chunk_idx) {
-  // First touch materializes the chunk. Two threads can race here; the loser
-  // gives its copy back and uses the winner's, so the pointer a reader sees is
-  // always the one that stays. The backing hands chunks out zeroed -- untouched
-  // device memory reads as zero -- from the heap or, past its RAM limit, from a
-  // file on disk.
-  uint8_t* fresh = backing::acquire();
-  uint8_t* expected = nullptr;
-  if (a.chunks[chunk_idx].compare_exchange_strong(expected, fresh, std::memory_order_acq_rel))
-    return fresh;
-  backing::release(fresh);
+  // A chunk becomes real on the first write that needs its bytes: from nothing,
+  // which reads as zero, or from a uniform chunk, which reads as its byte. Two
+  // threads can race here; the loser gives its copy back and uses the winner's,
+  // so the pointer a reader sees is always the one that stays -- and a reader
+  // that saw the tag read the same byte the real chunk starts with. The backing
+  // hands chunks out zeroed, from the heap or, past its RAM limit, from disk.
+  uint8_t* expected = a.chunks[chunk_idx].load(std::memory_order_acquire);
+  while (!expected || is_uniform(expected)) {
+    uint8_t* fresh = backing::acquire();
+    if (expected && uniform_byte(expected)) std::memset(fresh, uniform_byte(expected), kChunkSize);
+    if (a.chunks[chunk_idx].compare_exchange_strong(expected, fresh, std::memory_order_acq_rel))
+      return fresh;
+    backing::release(fresh);
+  }
   return expected;
 }
 
@@ -200,10 +215,20 @@ void MemoryManager::fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_
     uint64_t chunk_off = off % kChunkSize;
     uint64_t n = std::min(len, kChunkSize - chunk_off);
     uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
-    // Zeroing a chunk that was never touched is a no-op that would otherwise
-    // cost 64 KiB of host RAM to express.
-    if (chunk || !all_zero) {
-      if (!chunk) chunk = materialize(a, chunk_idx);
+    if (pattern_len == 1 && chunk_off == 0 && n == kChunkSize) {
+      // A whole chunk of one byte is that byte: no RAM, no disk. Whatever it
+      // held goes back to the backing, and zero is simply untouched memory.
+      // Host calls do not run beside kernels -- launches are synchronous -- so
+      // nothing is reading the chunk being replaced.
+      uint8_t* old = a.chunks[chunk_idx].exchange(pattern[0] ? uniform_chunk(pattern[0]) : nullptr,
+                                                  std::memory_order_acq_rel);
+      if (old && !is_uniform(old)) backing::release(old);
+    } else if (pattern_len == 1 && is_uniform(chunk) && uniform_byte(chunk) == pattern[0]) {
+      // Already that byte throughout.
+    } else if (chunk || !all_zero) {
+      // Zeroing a chunk that was never touched is a no-op that would otherwise
+      // cost 64 KiB of host RAM to express.
+      if (!chunk || is_uniform(chunk)) chunk = materialize(a, chunk_idx);
       if (pattern_len == 1) {
         std::memset(chunk + chunk_off, pattern[0], static_cast<size_t>(n));
       } else {
@@ -222,8 +247,10 @@ uint64_t MemoryManager::resident_bytes() const {
   for (const auto& [base, a] : live_) {
     (void)base;
     if (!a.chunks) continue;
-    for (size_t i = 0; i < a.chunk_count; ++i)
-      if (a.chunks[i].load(std::memory_order_relaxed)) ++chunks;
+    for (size_t i = 0; i < a.chunk_count; ++i) {
+      const uint8_t* c = a.chunks[i].load(std::memory_order_relaxed);
+      if (c && !is_uniform(c)) ++chunks;
+    }
   }
   return chunks * kChunkSize;
 }
@@ -253,8 +280,12 @@ void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
     uint64_t chunk_off = off % kChunkSize;
     uint64_t n = std::min(len, kChunkSize - chunk_off);
     uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
-    if (!chunk) chunk = materialize(a, chunk_idx);
-    std::memcpy(chunk + chunk_off, s, n);
+    // Writing a uniform chunk's own byte changes nothing, and must not turn
+    // 64 KiB of nothing into a chunk: a stress test rewrites its fill pattern.
+    if (!(is_uniform(chunk) && all_bytes(s, n, uniform_byte(chunk)))) {
+      if (!chunk || is_uniform(chunk)) chunk = materialize(a, chunk_idx);
+      std::memcpy(chunk + chunk_off, s, n);
+    }
     s += n;
     off += n;
     len -= n;
@@ -317,6 +348,8 @@ void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
     const uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
     if (!chunk)
       std::memset(d, 0, n);  // untouched device memory reads as zero (documented)
+    else if (is_uniform(chunk))
+      std::memset(d, uniform_byte(chunk), n);
     else
       std::memcpy(d, chunk + chunk_off, n);
     d += n;
@@ -342,9 +375,13 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
     throw Error::make(Err::MisalignedAccess, "load of ", size, " bytes at ", Hex{addr},
                       " is not naturally aligned (real GPUs fault on this)");
   const uint8_t* p = nullptr;
-  switch (scalar_location(addr, size, /*create=*/false, &p)) {
+  switch (scalar_location(addr, size, /*store=*/nullptr, &p)) {
     case ScalarAt::Chunk:
       return load_at(p, size);
+    case ScalarAt::Uniform:
+      return repeated(uniform_byte(p), size);
+    case ScalarAt::Unchanged:
+      break;  // only answered for a store
     case ScalarAt::Untouched:
       // Zero, answered here. Falling back to read() instead was a race: a
       // first store on another thread could materialize the chunk between
@@ -366,9 +403,14 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
     throw Error::make(Err::MisalignedAccess, "store of ", size, " bytes at ", Hex{addr},
                       " is not naturally aligned (real GPUs fault on this)");
   const uint8_t* p = nullptr;
-  if (scalar_location(addr, size, /*create=*/true, &p) == ScalarAt::Chunk) {
-    store_at(const_cast<uint8_t*>(p), size, value);
-    return;
+  switch (scalar_location(addr, size, &value, &p)) {
+    case ScalarAt::Chunk:
+      store_at(const_cast<uint8_t*>(p), size, value);
+      return;
+    case ScalarAt::Unchanged:
+      return;
+    default:
+      break;
   }
   write(addr, &value, size);  // a managed host mapping, behind its own lock
 }
@@ -392,8 +434,10 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
 //
 // A naturally aligned scalar cannot straddle a chunk -- kChunkSize is a
 // multiple of 8 -- so it is always one location in one chunk.
-MemoryManager::ScalarAt MemoryManager::scalar_location(uint64_t addr, uint32_t size, bool create,
+MemoryManager::ScalarAt MemoryManager::scalar_location(uint64_t addr, uint32_t size,
+                                                       const uint64_t* store,
                                                        const uint8_t** where) const {
+  const bool create = store != nullptr;
   if (host_maps_) {
     std::lock_guard<std::mutex> lock(host_maps_->mu);
     if (find_host_map_locked(addr, size)) return ScalarAt::HostMap;
@@ -404,8 +448,12 @@ MemoryManager::ScalarAt MemoryManager::scalar_location(uint64_t addr, uint32_t s
   const uint64_t off = addr - base;
   const uint64_t chunk_idx = off / kChunkSize;
   uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
-  if (!chunk) {
-    if (!create) return ScalarAt::Untouched;
+  if (is_uniform(chunk)) {
+    if (!create) { *where = chunk; return ScalarAt::Uniform; }
+    if (*store == repeated(uniform_byte(chunk), size)) return ScalarAt::Unchanged;
+  }
+  if (!chunk || is_uniform(chunk)) {
+    if (!chunk && !create) return ScalarAt::Untouched;
     chunk = const_cast<MemoryManager*>(this)->materialize(a, chunk_idx);
   }
   *where = chunk + off % kChunkSize;
