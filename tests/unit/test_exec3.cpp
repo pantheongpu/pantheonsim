@@ -3614,4 +3614,104 @@ VTEST(decimal_literals_above_int64_max_keep_their_bit_pattern) {
   VCHECK_EQ(e.mem.load_scalar(out, 8), uint64_t{0x8000000000000000ull});
 }
 
+// INT64_MIN / -1 is the one signed quotient that does not fit. It was a SIGFPE
+// that took the process down; it wraps, and the remainder is zero.
+VTEST(signed_64bit_division_of_min_by_minus_one_wraps) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    mov.s64 %rd2, 9223372036854775808;
+    div.s64 %rd3, %rd2, -1;
+    rem.s64 %rd4, %rd2, -1;
+    st.global.u64 [%rd1], %rd3;
+    st.global.u64 [%rd1+8], %rd4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 8), 0x8000000000000000ull);
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 8), 0ull);
+}
+
+// 64-bit float -> int saturates at the integer limits. Clamping to INT64_MAX as
+// a double rounded up to 2^63, and +inf came out as INT64_MIN (0 for u64).
+VTEST(cvt_float_to_64bit_int_saturates_at_the_limits) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b64 %rd<16>;
+    ld.param.u64 %rd1, [out];
+    mov.f64 %rd2, 0d7FF0000000000000;
+    cvt.s64.f64 %rd3, %rd2;
+    st.global.u64 [%rd1], %rd3;
+    mov.f64 %rd4, 0d43E0000000000000;
+    cvt.s64.f64 %rd5, %rd4;
+    st.global.u64 [%rd1+8], %rd5;
+    cvt.u64.f64 %rd6, %rd2;
+    st.global.u64 [%rd1+16], %rd6;
+    mov.f64 %rd7, 0d43F0000000000000;
+    cvt.u64.f64 %rd8, %rd7;
+    st.global.u64 [%rd1+24], %rd8;
+    mov.f64 %rd9, 0dFFF0000000000000;
+    cvt.s64.f64 %rd10, %rd9;
+    st.global.u64 [%rd1+32], %rd10;
+    mov.f64 %rd11, 0d7FF8000000000000;
+    cvt.s64.f64 %rd12, %rd11;
+    st.global.u64 [%rd1+40], %rd12;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(48);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 8), 0x7fffffffffffffffull);        // +inf -> s64 max
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 8), 0x7fffffffffffffffull);    // 2^63 -> s64 max
+  VCHECK_EQ(e.mem.load_scalar(out + 16, 8), 0xffffffffffffffffull);   // +inf -> u64 max
+  VCHECK_EQ(e.mem.load_scalar(out + 24, 8), 0xffffffffffffffffull);   // 2^64 -> u64 max
+  VCHECK_EQ(e.mem.load_scalar(out + 32, 8), 0x8000000000000000ull);   // -inf -> s64 min
+  VCHECK_EQ(e.mem.load_scalar(out + 40, 8), 0ull);                    // NaN -> 0
+}
+
+// Malformed PTX gets a precise parse error, never a crash, a wrong register or
+// a silently truncated number.
+VTEST(malformed_ptx_is_refused_with_a_reason) {
+  auto refuses = [](const std::string& body, const char* says) {
+    const std::string ptx = std::string(kHeader) + ".visible .entry k(.param .u64 out)\n{\n" + body + "\n    ret;\n}\n";
+    auto err = VCAPTURE(Error, ptx::parse(ptx));
+    VCHECK_CONTAINS(err.what(), says);
+  };
+  // A register redeclared at another width kept its narrow id: a heap overflow.
+  refuses("    .reg .b32 %r<4>;\n    .reg .b64 %r2;", "already used or declared as a 32-bit register");
+  // Used first as 32-bit, then declared 64-bit: the value written was lost.
+  refuses("    mov.u64 %x9, 7;\n    .reg .b64 %x9;", "already used or declared as a 32-bit register");
+  refuses("    .reg .b32 %r<100000000>;", "register count must be 1 to");
+  refuses("    .reg .b32 %r<abc>;", "bad integer literal");
+  refuses("    .reg .b64 %rd<2>;\n    mov.u64 %rd1, 12abc;", "bad integer literal '12abc'");
+  refuses("    .reg .b64 %rd<2>;\n    mov.u64 %rd1, 12uu;", "bad integer literal '12uu'");
+  // C integer suffixes are part of a number: nvcc writes "0x3fb8aa3bU".
+  ptx::parse(std::string(kHeader) + ".visible .entry k(.param .u64 out)\n{\n    .reg .b64 %rd<3>;\n"
+             "    mov.u64 %rd1, 0x3fb8aa3bU;\n    mov.u64 %rd2, 12ULL;\n    ret;\n}\n");
+  refuses("    .reg .b32 %r<2>;\n    mov.f32 %r1, 0fZZZZZZZZ;", "bad float literal");
+  refuses("    .shared .align 4 .b32 a[1073741824];", "is too large");
+  refuses("    .shared .align 3 .b32 a[4];", "alignment must be a power of two");
+  refuses("    .local .b32 a[-1];", "array size cannot be negative");
+  refuses("    .reg .b64 %rd<2>;\n    .reg .pred %p<2>;\n    ld.global.v2.pred {%p1, %p0}, [%rd1];", "no storage size");
+  auto err = VCAPTURE(Error, ptx::parse(std::string(kHeader) + ".visible .entry k(.param .pred out)\n{\n    ret;\n}\n"));
+  VCHECK_CONTAINS(err.what(), "no storage size");
+  // The most negative literal is still accepted, and still exact.
+  const auto m = ptx::parse(std::string(kHeader) +
+      ".visible .entry k(.param .u64 out)\n{\n    .reg .b64 %rd<3>;\n    ld.param.u64 %rd1, [out];\n"
+      "    mov.s64 %rd2, -9223372036854775808;\n    st.global.u64 [%rd1], %rd2;\n    ret;\n}\n");
+  Env e;
+  uint64_t out = e.mem.alloc(8);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 8), 0x8000000000000000ull);
+}
+
 VTEST_MAIN

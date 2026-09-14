@@ -207,6 +207,9 @@ VTEST(global_scalar_initialiser_is_not_a_symbol) {
   VCHECK_EQ(int(m.globals[0].init[0]), 42);
   VCHECK(m.globals[1].init_symbols.empty());
   VCHECK_EQ(m.globals[1].init.size(), size_t{4});
+  // 1.0f, little-endian: the float literal is its bits, not 0.
+  VCHECK_EQ(int(m.globals[1].init[2]), 0x80);
+  VCHECK_EQ(int(m.globals[1].init[3]), 0x3F);
 }
 
 // ".common" is a tentative definition: zero-initialised, and merged with any

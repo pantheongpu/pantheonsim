@@ -4,9 +4,12 @@
 // instruction, source line, and kernel — never a silent wrong answer.
 #include "vgpu/ptx/parser.hpp"
 
+#include <cctype>
+#include <cstring>
 #include <cstdlib>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <unordered_map>
 
 #include "lexer.hpp"
@@ -362,22 +365,119 @@ class Parser {
     fail(t.line, "expected a type in " + ctx + ", got '" + t.text + "'");
   }
 
-  int64_t parse_int_literal(const std::string& w, size_t line) {
+  int64_t parse_int_literal(const std::string& word, size_t line) {
+    // Every character has to be part of the number. std::stoll stops at the
+    // first one that is not, so "12abc" used to be read as 12. The one tail a
+    // number may carry is a C integer suffix -- nvcc writes "0x3fb8aa3bU" --
+    // which is taken off before the digits are checked.
+    std::string w = word;
+    size_t suffix = 0;
+    while (suffix < 3 && suffix < w.size() - 1 &&
+           std::strchr("uUlL", w[w.size() - 1 - suffix]) != nullptr)
+      ++suffix;
+    const std::string tail = w.substr(w.size() - suffix);
+    static const char* const kSuffixes[] = {"", "u", "l", "ul", "lu", "ll", "ull", "llu"};
+    std::string lower = tail;
+    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    bool known = false;
+    for (const char* k : kSuffixes) known = known || lower == k;
+    if (known) w.resize(w.size() - suffix);
+    auto whole = [&](size_t used, size_t len) {
+      if (!known || used != len) throw std::invalid_argument(word);
+    };
     try {
-      if (w.size() > 2 && w[0] == '0' && (w[1] == 'x' || w[1] == 'X'))
-        return static_cast<int64_t>(std::stoull(w.substr(2), nullptr, 16));
+      size_t used = 0;
+      if (w.size() > 2 && w[0] == '0' && (w[1] == 'x' || w[1] == 'X')) {
+        const std::string digits = w.substr(2);
+        const uint64_t v = std::stoull(digits, &used, 16);
+        whole(used, digits.size());
+        return static_cast<int64_t>(v);
+      }
       // Decimal immediates above INT64_MAX are legal PTX for .u64/.b64 operands
       // -- 9223372036854775808 is the sign-bit mask a float negation uses, and
       // ptxas prints it in decimal. Fall back to an unsigned parse and keep the
       // bit pattern; the instruction's type decides how it is read.
       try {
-        return std::stoll(w);
+        const int64_t v = std::stoll(w, &used);
+        whole(used, w.size());
+        return v;
       } catch (const std::out_of_range&) {
-        return static_cast<int64_t>(std::stoull(w));
+        const uint64_t v = std::stoull(w, &used);
+        whole(used, w.size());
+        return static_cast<int64_t>(v);
       }
     } catch (const std::exception&) {
-      fail(line, "bad integer literal '" + w + "'");
+      fail(line, "bad integer literal '" + word + "'");
     }
+  }
+
+  // Negation of a literal, through unsigned arithmetic: "-9223372036854775808"
+  // is INT64_MIN, and negating it as a signed value is undefined.
+  static int64_t negate(int64_t v) { return static_cast<int64_t>(uint64_t{0} - static_cast<uint64_t>(v)); }
+
+  // A float immediate's bits: 0fXXXXXXXX or 0dXXXXXXXXXXXXXXXX. A malformed one
+  // used to escape as a bare std::invalid_argument with no line to go on.
+  uint64_t parse_float_bits(const std::string& w, size_t line) {
+    try {
+      size_t used = 0;
+      const uint64_t v = std::stoull(w.substr(2), &used, 16);
+      if (used == w.size() - 2) return v;
+    } catch (const std::exception&) {
+    }
+    fail(line, "bad float literal '" + w + "'");
+  }
+
+  // A count that sizes something: an array, a register bank. Negative counts
+  // turned into enormous unsigned ones.
+  uint64_t expect_count(const std::string& what) {
+    const size_t line = peek().line;
+    const int64_t v = expect_int(what);
+    if (v < 0) fail(line, what + " cannot be negative");
+    return static_cast<uint64_t>(v);
+  }
+
+  // Alignment is a power of two, and a sensible one; anything else made the
+  // layout arithmetic divide by zero or round to nonsense.
+  uint32_t expect_align() {
+    const size_t line = peek().line;
+    const int64_t v = expect_int("alignment");
+    if (v < 1 || v > 65536 || (v & (v - 1)) != 0)
+      fail(line, "alignment must be a power of two from 1 to 65536, got " + std::to_string(v));
+    return static_cast<uint32_t>(v);
+  }
+
+  // The bytes a type occupies in memory. A predicate (.pred) has no storage
+  // size, and as a parameter, a variable or a load type its zero size became a
+  // zero alignment and a division by zero at launch.
+  uint32_t storage_bytes(Type ty, size_t line, const std::string& what) {
+    if (ty.bytes() == 0) fail(line, what + " has type " + ty.str() + ", which has no storage size");
+    return ty.bytes();
+  }
+
+  // elems * bytes, refused when it does not fit in `limit`. Computed in 32 bits,
+  // a .shared array of 2^30 32-bit elements wrapped to size 0 and aliased the
+  // next array, and the profile's shared-memory limit never saw it.
+  uint64_t checked_size(uint64_t elems, uint32_t bytes, uint64_t limit, size_t line,
+                        const std::string& what) {
+    if (bytes != 0 && elems > limit / bytes)
+      fail(line, what + " is too large (" + std::to_string(elems) + " elements of " +
+                     std::to_string(bytes) + " bytes)");
+    return elems * bytes;
+  }
+
+  // An initializer value: an integer, or a float's bits written 0fXXXXXXXX or
+  // 0dXXXXXXXXXXXXXXXX. Float initializers used to go through the integer
+  // parse, which stopped at the 'f' and stored 0 -- so a .f32 global declared
+  // "= 0f3F800000" (1.0) started as 0.0.
+  int64_t expect_init_value(const std::string& what) {
+    const Token& t = peek();
+    if (t.kind == Token::Kind::Word && t.text.size() > 2 && t.text[0] == '0' &&
+        ((t.text.size() == 10 && (t.text[1] == 'f' || t.text[1] == 'F')) ||
+         (t.text.size() == 18 && (t.text[1] == 'd' || t.text[1] == 'D')))) {
+      const std::string w = next().text;
+      return static_cast<int64_t>(parse_float_bits(w, t.line));
+    }
+    return expect_int(what);
   }
 
   // Reads "N" or "-N".
@@ -389,7 +489,7 @@ class Parser {
     }
     std::string w = expect_word(what);
     int64_t v = parse_int_literal(w, peek().line);
-    return neg ? -v : v;
+    return neg ? negate(v) : v;
   }
 
   // ---- module-scope .global/.const variables ----
@@ -406,7 +506,7 @@ class Parser {
     while (peek().kind == Token::Kind::Word && peek().text[0] == '.') {
       if (peek().text == ".align") {
         next();
-        g.align = static_cast<uint32_t>(expect_int("alignment"));
+        g.align = expect_align();
         continue;
       }
       break;
@@ -416,10 +516,11 @@ class Parser {
     uint64_t elems = 1;
     if (peek_punct("[")) {
       next();
-      elems = static_cast<uint64_t>(expect_int("array size"));
+      elems = expect_count("array size");
       expect_punct("]");
     }
-    g.size = elems * ty.bytes();
+    g.size = checked_size(elems, storage_bytes(ty, line, "global '" + g.name + "'"), uint64_t{1} << 40, line,
+                          "global '" + g.name + "'");
     if (g.size == 0) fail(line, "zero-sized global '" + g.name + "'");
     if (peek_punct("=")) {
       next();
@@ -445,7 +546,7 @@ class Parser {
             g.init_symbols.push_back({g.init.size(), next().text});
             g.init.resize(g.init.size() + ty.bytes(), 0);
           } else {
-            int64_t v = expect_int("initializer element");
+            int64_t v = expect_init_value("initializer element");
             // Little-endian element append.
             for (uint32_t b = 0; b < ty.bytes(); ++b)
               g.init.push_back(static_cast<uint8_t>((static_cast<uint64_t>(v) >> (8 * b)) & 0xFF));
@@ -466,7 +567,7 @@ class Parser {
         // separates them -- "= 5" is a value, not a symbol named "5".
         g.init_symbols.push_back({0, next().text});
       } else {
-        int64_t v = expect_int("initializer");
+        int64_t v = expect_init_value("initializer");
         for (uint32_t b = 0; b < ty.bytes(); ++b)
           g.init.push_back(static_cast<uint8_t>((static_cast<uint64_t>(v) >> (8 * b)) & 0xFF));
       }
@@ -587,20 +688,22 @@ class Parser {
         // Optional ".align N" then type, then optional pointer annotations.
         if (peek().kind == Token::Kind::Word && peek().text == ".align") {
           next();
-          p.align = static_cast<uint32_t>(expect_int("alignment"));
+          p.align = expect_align();
         }
         Type ty = expect_type("parameter declaration");
         while (peek().kind == Token::Kind::Word && peek().text[0] == '.') {
           std::string ann = next().text;
-          if (ann == ".align") p.align = static_cast<uint32_t>(expect_int("alignment"));
+          if (ann == ".align") p.align = expect_align();
           // .ptr / .global / .const: functional no-ops for us
         }
         p.name = expect_word("parameter name");
         p.ty = ty;
-        p.size = ty.bytes();
+        p.size = storage_bytes(ty, peek().line, "parameter '" + p.name + "'");
         if (peek_punct("[")) {  // aggregate: .param .align 8 .b8 name[24]
           next();
-          p.size = static_cast<uint32_t>(expect_int("parameter array size"));
+          const size_t line = peek().line;
+          p.size = static_cast<uint32_t>(checked_size(expect_count("parameter array size"), 1, UINT32_MAX, line,
+                                                      "parameter '" + p.name + "'"));
           expect_punct("]");
         }
         if (p.align == 0) p.align = p.size < 8 ? p.size : 8;
@@ -799,6 +902,29 @@ class Parser {
     }
   }
 
+  static constexpr int64_t kMaxRegisterBank = 1 << 16;
+
+  // Declares one register. Its id is fixed the first time the name is interned,
+  // in the register file its width selects. A second declaration at another
+  // width -- or a 64-bit declaration of a name already used as a 32-bit
+  // register -- used to change the width and keep the narrow id, so a 64-bit
+  // store wrote past the end of the 64-bit register file (and a value written
+  // before the declaration read back as 0).
+  void declare_reg(EntryFn& fn, const std::string& nm, Type ty, size_t line) {
+    const bool wide = ty.bits > 32 && ty.kind != Type::Kind::Pred;
+    if (fn.reg_ids.count(nm)) {
+      auto was = fn.reg_wide.find(nm);
+      const bool was_wide = was != fn.reg_wide.end() && was->second;
+      if (was_wide != wide)
+        fail(line, "register '" + nm + "' is declared " + ty.str() + " but was already " +
+                       (was_wide ? "declared 64-bit" : "used or declared as a 32-bit register"));
+    }
+    fn.reg_decls[nm] = ty;
+    declared_regs_.insert(nm);
+    fn.reg_wide[nm] = wide;
+    intern(nm);
+  }
+
   void parse_reg_decl(EntryFn& fn) {
     parse_reg_decl_of_type(fn, expect_type(".reg declaration"));
   }
@@ -809,20 +935,16 @@ class Parser {
       if (peek_punct("<")) {  // parameterized: .reg .b32 %r<6> declares %r0..%r5
         next();
         std::string count = expect_word("register count");
+        const size_t line = peek().line;
         expect_punct(">");
-        int n = std::atoi(count.c_str());
-        for (int i = 0; i < n; ++i) {
-          const std::string nm = name + std::to_string(i);
-          fn.reg_decls[nm] = ty;
-          declared_regs_.insert(nm);
-          fn.reg_wide[nm] = ty.bits > 32 && ty.kind != Type::Kind::Pred;
-          intern(nm);
-        }
+        // Strictly a number, and bounded: std::atoi took "abc" as 0, and an
+        // unbounded count was an unbounded allocation (%r<5000000> took 1.5 GB).
+        const int64_t n = parse_int_literal(count, line);
+        if (n < 1 || n > kMaxRegisterBank)
+          fail(line, "register count must be 1 to " + std::to_string(kMaxRegisterBank) + ", got '" + count + "'");
+        for (int64_t i = 0; i < n; ++i) declare_reg(fn, name + std::to_string(i), ty, line);
       } else {
-        fn.reg_decls[name] = ty;
-        declared_regs_.insert(name);
-        fn.reg_wide[name] = ty.bits > 32 && ty.kind != Type::Kind::Pred;
-        intern(name);
+        declare_reg(fn, name, ty, peek().line);
       }
       if (peek_punct(",")) {
         next();
@@ -839,7 +961,7 @@ class Parser {
     SharedDecl d;
     while (peek().kind == Token::Kind::Word && peek().text == ".align") {
       next();
-      d.align = static_cast<uint32_t>(expect_int("alignment"));
+      d.align = expect_align();
     }
     Type ty = expect_type(".shared declaration");
     d.name = expect_word("shared variable name");
@@ -848,7 +970,7 @@ class Parser {
     if (peek_punct("[")) {
       next();
       if (!peek_punct("]")) {
-        elems = static_cast<uint64_t>(expect_int("array size"));
+        elems = expect_count("array size");
         sized = true;
       }
       expect_punct("]");
@@ -856,7 +978,8 @@ class Parser {
       elems = 1;
       sized = true;
     }
-    d.size = static_cast<uint32_t>(elems * ty.bytes());
+    d.size = static_cast<uint32_t>(checked_size(elems, storage_bytes(ty, line, ".shared '" + d.name + "'"),
+                                                UINT32_MAX, line, ".shared '" + d.name + "'"));
     if (!sized) {
       if (!allow_unsized) fail(line, "unsized .shared array '" + d.name + "'");
       d.dynamic = true;
@@ -874,9 +997,10 @@ class Parser {
       fn.uses_dynamic_shared = true;
       d.offset = 0;
     } else {
-      uint32_t off = (fn.static_shared_size + d.align - 1) / d.align * d.align;
-      d.offset = off;
-      fn.static_shared_size = off + d.size;
+      const uint64_t off = (uint64_t{fn.static_shared_size} + d.align - 1) / d.align * d.align;
+      if (off + d.size > UINT32_MAX) fail(line, ".shared memory of this kernel is too large");
+      d.offset = static_cast<uint32_t>(off);
+      fn.static_shared_size = static_cast<uint32_t>(off + d.size);
     }
     if (!fn.shared.emplace(d.name, d).second) fail(line, "duplicate .shared '" + d.name + "'");
   }
@@ -885,21 +1009,23 @@ class Parser {
     LocalDecl d;
     while (peek().kind == Token::Kind::Word && peek().text == ".align") {
       next();
-      d.align = static_cast<uint32_t>(expect_int("alignment"));
+      d.align = expect_align();
     }
     Type ty = expect_type(".local declaration");
     d.name = expect_word("local variable name");
     uint64_t elems = 1;
     if (peek_punct("[")) {
       next();
-      elems = static_cast<uint64_t>(expect_int("array size"));
+      elems = expect_count("array size");
       expect_punct("]");
     }
-    d.size = static_cast<uint32_t>(elems * ty.bytes());
+    d.size = static_cast<uint32_t>(checked_size(elems, storage_bytes(ty, line, ".local '" + d.name + "'"),
+                                                UINT32_MAX, line, ".local '" + d.name + "'"));
     if (d.align == 0) d.align = 8;
-    uint32_t off = (fn.local_frame_size + d.align - 1) / d.align * d.align;
-    d.offset = off;
-    fn.local_frame_size = off + d.size;
+    const uint64_t off = (uint64_t{fn.local_frame_size} + d.align - 1) / d.align * d.align;
+    if (off + d.size > UINT32_MAX) fail(line, ".local frame of this kernel is too large");
+    d.offset = static_cast<uint32_t>(off);
+    fn.local_frame_size = static_cast<uint32_t>(off + d.size);
     if (!fn.locals.emplace(d.name, d).second) fail(line, "duplicate .local '" + d.name + "'");
     expect_punct(";");
   }
@@ -910,7 +1036,7 @@ class Parser {
     const Token& t = next();
     if (t.kind == Token::Kind::Punct && t.text == "-") {
       std::string w = expect_word("number after '-'");
-      return ImmInt{-parse_int_literal(w, t.line)};
+      return ImmInt{negate(parse_int_literal(w, t.line))};
     }
     if (t.kind != Token::Kind::Word) fail(t.line, "expected operand, got '" + t.text + "'");
     const std::string& w = t.text;
@@ -938,9 +1064,9 @@ class Parser {
     }
     if (isdigit(static_cast<unsigned char>(w[0]))) {
       if (w.size() == 10 && w[0] == '0' && (w[1] == 'f' || w[1] == 'F'))
-        return ImmFloatBits{std::stoull(w.substr(2), nullptr, 16), 32};
+        return ImmFloatBits{parse_float_bits(w, t.line), 32};
       if (w.size() == 18 && w[0] == '0' && (w[1] == 'd' || w[1] == 'D'))
-        return ImmFloatBits{std::stoull(w.substr(2), nullptr, 16), 64};
+        return ImmFloatBits{parse_float_bits(w, t.line), 64};
       return ImmInt{parse_int_literal(w, t.line)};
     }
     // A bare identifier is an inline-asm register local if it was declared as
@@ -1124,6 +1250,7 @@ class Parser {
         } else return unsupported("unrecognized ld/st modifier '." + p + "'");
       }
       if (!have_ty) fail(ins.line, "ld/st missing type: " + opcode);
+      storage_bytes(ty, ins.line, opcode);
       if (op0 == "ld") {
         Addr addr;
         std::vector<Reg> dsts;
