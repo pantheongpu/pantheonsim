@@ -170,6 +170,16 @@ if(CUDA_ABI_INCLUDE)
   message(STATUS "CUDA ABI headers at ${CUDA_ABI_INCLUDE}: building libvgpucudart")
   vgpu_toolkit_soversion(cudart 13 SO_CUDART)
   message(STATUS "toolkit runtime soname: libcudart.so.${SO_CUDART}")
+  # The runtime shim reports this toolkit's CUDART_VERSION, and a driver older
+  # than the runtime is one every framework refuses to start on. Hand the
+  # number to the core, so the default driver version -- what nvidia-smi prints
+  # outside a session and what `vgpu shell` offers -- is never below it.
+  file(STRINGS "${CUDA_ABI_INCLUDE}/cuda_runtime_api.h" _cudart_define
+       REGEX "^#define[ \t]+CUDART_VERSION[ \t]+[0-9]+")
+  if(_cudart_define MATCHES "([0-9]+)[ \t]*$")
+    target_compile_definitions(vgpu PUBLIC VGPU_TOOLKIT_CUDART_VERSION=${CMAKE_MATCH_1})
+    message(STATUS "toolkit runtime version: CUDART_VERSION ${CMAKE_MATCH_1}")
+  endif()
   add_library(vgpucudart SHARED nvidia/src/runtime_api.cpp nvidia/src/fatbin.cpp)
   target_link_libraries(vgpucudart PRIVATE vgpu ${CMAKE_DL_LIBS})
   target_include_directories(vgpucudart PRIVATE ${CUDA_ABI_INCLUDE} nvidia/src)
@@ -466,6 +476,19 @@ add_test(NAME smi_format COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_smi_fo
 set_tests_properties(smi_format PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
 add_test(NAME smi_queries COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_smi_queries.sh)
 set_tests_properties(smi_queries PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+# The rest of the command-line surface scripts drive: nvidia-smi's -d, -x, -h,
+# loops and field checks, the drop-in scripts, rocm-smi's own flags; vgpu
+# shell's defaults, identity, flag checks and exit status; and the exit codes
+# of test --matrix. Each check is a bug that shipped.
+add_test(NAME smi_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_smi_cli.sh)
+set_tests_properties(smi_cli PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
+add_test(NAME shell_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_shell_cli.sh)
+set_tests_properties(shell_cli PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
+add_test(NAME test_matrix_exit COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_test_matrix.sh)
+set_tests_properties(test_matrix_exit PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 add_test(NAME nvml_api COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_api.sh)
 set_tests_properties(nvml_api PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
 

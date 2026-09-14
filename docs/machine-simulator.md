@@ -25,8 +25,8 @@ build/bin/vgpu shell
   GPU model [nvidia/h100]: nvidia/h200
   How many GPUs [1]: 8
   VRAM per GPU (MiB) [144384]:
-  CUDA version [12.4]: 12.6
-  Driver version [550.54.15]: 560.35.03
+  CUDA version [13.0]: 12.6
+  Driver version [580.00.00]: 560.35.03
   OS (number) [1]: 2
   Kernel version [6.8.0-45-generic]:
   Hostname [vgpu-sim]: dgx-h200
@@ -62,23 +62,31 @@ build/bin/vgpu shell -y --gpu amd/mi300x --count 8 --rocm 6.2.0 \
 
 | Flag | Meaning |
 | --- | --- |
-| `--gpu`, `--count`, `--vram-mb` | the rack |
-| `--cuda`, `--rocm`, `--driver` | reported toolkit and driver versions |
+| `--gpu`, `--count 1..16`, `--vram-mb` | the rack |
+| `--cuda`, `--rocm`, `--driver` | reported toolkit and driver versions; the defaults are the ones this build's runtime carries (what `build/bin/nvidia-smi --version` prints outside a session) |
 | `--os ubuntu:22.04\|ubuntu:24.04\|rocky\|debian`, `--kernel`, `--hostname` | machine identity |
 | `--load 0..1` | background load, so the telemetry columns move |
-| `--no-isolate` | skip the mount namespace (session tools only) |
+| `--no-isolate` | skip the namespaces (session tools only) |
 | `-y` / `--no-prompt` | non-interactive |
+| `-c <command>` | run one command and exit with its status (128+N if a signal killed it) |
+
+Every value is checked before the session starts: a flag with no value, a
+number that is not a whole number in range, or a version that is not dotted
+digits is an error (exit 2) naming the flag, not a quiet default. `-c` runs
+under `$SHELL`; bash gets the session rcfile, and other shells (dash, zsh) run
+without it, with the session's `PATH` and `LD_LIBRARY_PATH` already set.
 
 ## What works inside the session
 
 | Command | Behavior |
 | --- | --- |
-| `nvidia-smi` | live table, CSV via `--query-gpu=...`, `--version` |
-| `rocm-smi` | ROCm concise-info table |
+| `nvidia-smi` | live table, `-q [-d SECTIONS]`, `-x`, `--query-gpu=... --format=csv`, `-L`, `-i`, `-l`/`-lms`, `topo -m`, `--version`, `-h` |
+| `rocm-smi` | ROCm concise-info table; `-a`, `--showid`, `--showproductname`, `--showmeminfo vram`, `--showtemp`, `--showpower`, `--showuse`, `-d N`, `--json`, `--csv` |
 | `rocm_agent_enumerator` | `gfx000` plus one target per virtual AMD device |
 | `lspci` | the real lspci, fed synthesized PCI config space |
 | `dmesg` | synthetic kernel ring buffer: boot, PCI enumeration, driver bring-up |
-| `uname -r` / `-a` | the configured kernel and hostname |
+| `uname` | the configured kernel and hostname, for any of `-asnrvmpio`, combined (`-sr`) or long (`--kernel-release`) |
+| `hostname` | the configured hostname |
 | `nvcc --version` | the configured CUDA version (a real nvcc still compiles) |
 | `cat /proc/driver/nvidia/version` | the simulated NVRM banner |
 | `ls /proc/driver/nvidia/gpus/` | one entry per device, with an `information` file |
@@ -100,15 +108,19 @@ Two layers:
    silently shadows the shim and programs reach NVIDIA's real cudart instead.
 
 2. **When user namespaces are available** (the default; `--no-isolate` to skip).
-   The tool re-executes itself under `unshare -r -m` and bind-mounts the
+   The tool re-executes itself under `unshare -r -m -u`, bind-mounts the
    synthesized `/proc/driver`, `/sys/class/drm` and `/etc/os-release` over the
-   real ones. That is what makes unmodified programs — not just our wrappers —
-   see the simulated machine. procfs will not accept new entries, so the whole
+   real ones, and sets `--hostname` in the session's own UTS namespace. That is
+   what makes unmodified programs — not just our wrappers — see the simulated
+   machine: `gethostname()` and `/proc/sys/kernel/hostname` report the
+   configured name. procfs will not accept new entries, so the whole
    `/proc/driver` directory is overlaid rather than a single file.
 
-   No privileges are needed: the mounts live in an unprivileged user namespace
-   and vanish with the session. If namespaces are unavailable the session still
-   runs, with the tools working and the `/proc` paths left alone — and says so.
+   No privileges are needed: the mounts and the hostname live in unprivileged
+   namespaces and vanish with the session; the host's hostname is untouched. If
+   namespaces are unavailable the session still runs, with the tools working
+   (the session's `hostname` and `uname` still print the configured name) and
+   the `/proc` paths left alone — and says so.
 
 ## Processes share the machine
 

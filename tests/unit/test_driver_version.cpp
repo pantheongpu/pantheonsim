@@ -22,8 +22,16 @@ struct Env {
 
 VTEST(driver_version_defaults_to_13_0_outside_a_session) {
   Env e("VGPU_CUDA_VERSION", nullptr);
-  VCHECK_EQ(vgpu::driver_version(), 13000);
-  VCHECK_EQ(vgpu::driver_version_string(), std::string("13.0"));
+  // 13.0, or the build toolkit's runtime version when that is newer: a default
+  // driver older than the runtime shim would be refused by every framework.
+  VCHECK(vgpu::kDefaultDriverVersion >= 13000);
+#if defined(VGPU_TOOLKIT_CUDART_VERSION)
+  VCHECK(vgpu::kDefaultDriverVersion >= VGPU_TOOLKIT_CUDART_VERSION);
+#endif
+  VCHECK_EQ(vgpu::driver_version(), vgpu::kDefaultDriverVersion);
+  VCHECK_EQ(vgpu::driver_version_string(),
+            vgpu::cuda_version_string(vgpu::kDefaultDriverVersion));
+  VCHECK_EQ(vgpu::cuda_version_string(13000), std::string("13.0"));
 }
 
 VTEST(driver_version_follows_the_session_declaration) {

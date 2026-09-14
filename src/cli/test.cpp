@@ -11,9 +11,11 @@
 // launches on an H100 and is rejected on a T4 has found a real portability
 // limit -- a block size the older part cannot hold, or a shared-memory request
 // above what it has -- and it found it without the T4.
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,11 +27,19 @@
 
 namespace {
 
+// Exit codes, documented in usage() below. "Results differ" is a finding and
+// "the program never ran" is a broken test, and a CI job has to be able to
+// tell them apart from each other and from an error in vgpu itself (1).
+constexpr int kExitDiffer = 3;
+constexpr int kExitBaselineDidNotRun = 4;
+
 struct Result {
   std::string profile;
   int exit_code = 0;
   std::string output;
-  bool ran = false;
+  bool ran = false;         // the child was started and reaped
+  int exec_errno = 0;       // exec itself failed: not found, not executable
+  int signal = 0;           // killed by this signal
 };
 
 // Runs `argv` with VGPU_GPU set, capturing stdout and stderr together. Output
@@ -41,15 +51,27 @@ Result run_one(const std::string& profile, const std::vector<std::string>& argv,
   r.profile = profile;
   int fds[2];
   if (pipe(fds) != 0) return r;
+  // A close-on-exec pipe the child writes errno into only if exec fails. A
+  // successful exec closes it with nothing written, so the parent learns which
+  // happened without guessing from an exit status the program could also use.
+  int errfds[2];
+  if (pipe2(errfds, O_CLOEXEC) != 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return r;
+  }
 
   const pid_t pid = fork();
   if (pid < 0) {
     close(fds[0]);
     close(fds[1]);
+    close(errfds[0]);
+    close(errfds[1]);
     return r;
   }
   if (pid == 0) {
     close(fds[0]);
+    close(errfds[0]);
     dup2(fds[1], STDOUT_FILENO);
     dup2(fds[1], STDERR_FILENO);
     close(fds[1]);
@@ -65,19 +87,41 @@ Result run_one(const std::string& profile, const std::vector<std::string>& argv,
     for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
     cargv.push_back(nullptr);
     execvp(cargv[0], cargv.data());
+    const int e = errno;
+    if (::write(errfds[1], &e, sizeof e) < 0) {}
     _exit(127);
   }
 
   close(fds[1]);
+  close(errfds[1]);
   char buf[4096];
   ssize_t n;
   while ((n = ::read(fds[0], buf, sizeof buf)) > 0) r.output.append(buf, static_cast<size_t>(n));
   close(fds[0]);
+  int e = 0;
+  if (::read(errfds[0], &e, sizeof e) == static_cast<ssize_t>(sizeof e)) r.exec_errno = e;
+  close(errfds[0]);
   int status = 0;
   waitpid(pid, &status, 0);
+  if (WIFSIGNALED(status)) r.signal = WTERMSIG(status);
   r.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
   r.ran = true;
   return r;
+}
+
+// Why the baseline run says nothing about the program, or "" if it does. Every
+// profile compared against a program that was never started is "identical",
+// which is how a typo in the program name passed a matrix with exit 0. 127 and
+// 126 are also what a wrapper (sh -c, env, a launcher script) returns when *it*
+// could not find or execute the program, so they count as not having run.
+std::string did_not_run(const Result& r) {
+  if (!r.ran) return "could not be started";
+  if (r.exec_errno) return std::string("could not be executed: ") + std::strerror(r.exec_errno);
+  if (r.signal) return std::string("was killed by signal ") + std::to_string(r.signal) + " (" +
+                       strsignal(r.signal) + ")";
+  if (r.exit_code == 127) return "exited 127 (command not found)";
+  if (r.exit_code == 126) return "exited 126 (found but not executable)";
+  return "";
 }
 
 std::string exe_dir_shim() {
@@ -116,7 +160,17 @@ int usage(FILE* to) {
                "\n"
                "  --gpus <a,b,c>   Only these profiles (default: every verified NVIDIA one)\n"
                "  --all            Include unverified profiles too\n"
-               "  --show-diff      Print the output of the first profile that differs\n");
+               "  --show-diff      Print the output of the first profile that differs\n"
+               "\n"
+               "Exit status:\n"
+               "  0  every profile matched the baseline\n"
+               "  1  vgpu itself failed (an unknown profile name, for example)\n"
+               "  2  usage error\n"
+               "  3  results differ: at least one profile's output or exit code did not\n"
+               "     match the baseline\n"
+               "  4  the program did not run on the baseline profile (not found, not\n"
+               "     executable, exited 126 or 127, or killed by a signal), so there is\n"
+               "     nothing to compare against\n");
   return to == stdout ? 0 : 2;
 }
 
@@ -132,7 +186,20 @@ int cmd_test(const std::vector<std::string>& args) {
     if (a == "--matrix") { matrix = true; continue; }
     if (a == "--all") { all = true; continue; }
     if (a == "--show-diff") { show_diff = true; continue; }
-    if (a == "--gpus" && i + 1 < args.size()) { gpus = split_commas(args[++i]); continue; }
+    if (a == "--gpus") {
+      // Missing or empty used to fall through: "unknown option '--gpus'" for
+      // the first, and every profile, silently, for the second.
+      if (i + 1 >= args.size()) {
+        std::fprintf(stderr, "vgpu test: --gpus needs a value\n\n");
+        return usage(stderr);
+      }
+      gpus = split_commas(args[++i]);
+      if (gpus.empty()) {
+        std::fprintf(stderr, "vgpu test: --gpus needs at least one profile name\n\n");
+        return usage(stderr);
+      }
+      continue;
+    }
     if (a == "--") { ++i; break; }
     if (a.empty() || a[0] != '-') break;
     std::fprintf(stderr, "vgpu test: unknown option '%s'\n\n", a.c_str());
@@ -168,15 +235,28 @@ int cmd_test(const std::vector<std::string>& args) {
     return 1;
   }
 
+  // Every name is checked before anything runs. This used to load each profile
+  // just before its own run, so `--gpus nvidia/h100,nvidia/bogus` ran the whole
+  // program on the H100 and only then failed on the typo.
+  for (const auto& g : gpus) vgpu::load_gpu(g);
+
   const std::string shim = exe_dir_shim();
   std::vector<Result> results;
   results.reserve(gpus.size());
   for (const auto& g : gpus) {
-    vgpu::load_gpu(g);  // fail on a bad name before running anything
     results.push_back(run_one(g, program, shim));
+    // Nothing that follows can be compared with a baseline that never ran, so
+    // stop rather than run the rest of the matrix to report the same thing.
+    if (results.size() == 1 && !did_not_run(results.front()).empty()) break;
   }
 
   const Result& base = results.front();
+  if (const std::string why = did_not_run(base); !why.empty()) {
+    std::fprintf(stderr, "vgpu test: '%s' %s on the baseline profile %s, so there is nothing to compare\n",
+                 program.front().c_str(), why.c_str(), base.profile.c_str());
+    if (!base.output.empty()) std::fprintf(stderr, "--- its output ---\n%s", base.output.c_str());
+    return kExitBaselineDidNotRun;
+  }
   size_t same = 0, differ = 0;
   std::printf("%-24s %6s  %s\n", "profile", "exit", "output");
   for (const Result& r : results) {
@@ -200,6 +280,7 @@ int cmd_test(const std::vector<std::string>& args) {
     }
   }
   // A difference is the finding, not an error: exit non-zero so a CI job can
-  // gate on it, and say so plainly rather than calling it a failure.
-  return differ ? 1 : 0;
+  // gate on it, and with a code of its own so the job can tell it from vgpu
+  // failing (1) or from a usage mistake (2).
+  return differ ? kExitDiffer : 0;
 }

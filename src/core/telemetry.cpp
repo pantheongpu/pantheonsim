@@ -79,7 +79,7 @@ Publisher::Publisher() {
   const char* drv = std::getenv("VGPU_DRIVER_VERSION");
   const char* cuda = std::getenv("VGPU_CUDA_VERSION");
   std::snprintf(shared_->driver_version, sizeof shared_->driver_version, "%s",
-                drv && drv[0] ? drv : "580.00.00");
+                drv && drv[0] ? drv : vgpu::kDefaultDriverRelease);
   // The CUDA version comes from the driver's own answer, not from the
   // environment string, so nvidia-smi cannot show a version the driver API
   // would not report. See vgpu/driver_version.hpp.
@@ -303,7 +303,7 @@ Shared idle_snapshot(const DeviceProfile& p, int device_count) {
     if (!v || !*v) v = fallback;
     std::snprintf(dst, n, "%s", v);
   };
-  copy_env(s.driver_version, sizeof s.driver_version, "VGPU_DRIVER_VERSION", "580.00.00");
+  copy_env(s.driver_version, sizeof s.driver_version, "VGPU_DRIVER_VERSION", vgpu::kDefaultDriverRelease);
   std::snprintf(s.cuda_version, sizeof s.cuda_version, "%s",
                 vgpu::driver_version_string().c_str());
   s.device_count = static_cast<uint32_t>(

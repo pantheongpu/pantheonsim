@@ -12,14 +12,17 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "args.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
+#include "vgpu/telemetry.hpp"
 
 namespace {
 std::atomic<bool> g_stop{false};
@@ -31,23 +34,42 @@ int cmd_serve(const std::vector<std::string>& args) {
   int count = 1;
   double load = 0.0;      // fraction of time to appear busy
   long long alloc_mb = 0; // device memory to hold, to show a memory footprint
+  // A flag with its value missing used to fall through to "unknown argument",
+  // naming the flag as if it were the mistake; and numbers went through
+  // atoi/atof, so `--load abc` served an idle rack without a word.
+  auto value = [&](size_t& i) -> const std::string& {
+    if (i + 1 >= args.size()) {
+      std::fprintf(stderr, "vgpu serve: %s needs a value\n", args[i].c_str());
+      std::exit(2);
+    }
+    return args[++i];
+  };
+  auto bad = [](const char* flag, const char* what, const std::string& v) {
+    std::fprintf(stderr, "vgpu serve: %s needs %s, got '%s'\n", flag, what, v.c_str());
+    return 2;
+  };
   for (size_t i = 0; i < args.size(); ++i) {
-    if (args[i] == "--gpu" && i + 1 < args.size())
-      gpu = args[++i];
-    else if (args[i] == "--count" && i + 1 < args.size())
-      count = std::atoi(args[++i].c_str());
-    else if (args[i] == "--load" && i + 1 < args.size())
-      load = std::atof(args[++i].c_str());
-    else if (args[i] == "--alloc-mb" && i + 1 < args.size())
-      alloc_mb = std::atoll(args[++i].c_str());
-    else {
+    long long n = 0;
+    if (args[i] == "--gpu") {
+      gpu = value(i);
+    } else if (args[i] == "--count") {
+      const std::string& v = value(i);
+      if (!vgpu::cli::parse_int(v, 1, vgpu::telemetry::kMaxDevices, &n))
+        return bad("--count", "a whole number from 1 to 16", v);
+      count = static_cast<int>(n);
+    } else if (args[i] == "--load") {
+      const std::string& v = value(i);
+      if (!vgpu::cli::parse_double(v, 0.0, 1.0, &load))
+        return bad("--load", "a number from 0 to 1", v);
+    } else if (args[i] == "--alloc-mb") {
+      const std::string& v = value(i);
+      if (!vgpu::cli::parse_int(v, 0, 1ll << 30, &n))
+        return bad("--alloc-mb", "a whole number of MiB (0 for none)", v);
+      alloc_mb = n;
+    } else {
       std::fprintf(stderr, "vgpu serve: unknown argument '%s'\n", args[i].c_str());
       return 2;
     }
-  }
-  if (count < 1) {
-    std::fprintf(stderr, "vgpu serve: --count must be >= 1\n");
-    return 2;
   }
 
   vgpu::DeviceProfile profile = vgpu::load_gpu(gpu);

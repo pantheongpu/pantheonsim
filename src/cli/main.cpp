@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "args.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/registry.hpp"
 
@@ -234,9 +235,13 @@ int main(int argc, char** argv) {
       std::string gpu;
       bool json = false;
       for (size_t i = 1; i < args.size(); ++i) {
-        if (args[i] == "--gpu" && i + 1 < args.size())
+        if (args[i] == "--gpu") {
+          if (i + 1 >= args.size()) {
+            std::fprintf(stderr, "vgpu info: --gpu needs a value\n");
+            return 2;
+          }
           gpu = args[++i];
-        else if (args[i] == "--json")
+        } else if (args[i] == "--json")
           json = true;
         else {
           std::fprintf(stderr, "vgpu info: unknown argument '%s'\n", args[i].c_str());
@@ -258,11 +263,22 @@ int main(int argc, char** argv) {
       std::string gpu = "nvidia/h100";
       long long n = 65536;
       for (size_t i = 2; i < args.size(); ++i) {
-        if (args[i] == "--gpu" && i + 1 < args.size())
+        if ((args[i] == "--gpu" || args[i] == "-n") && i + 1 >= args.size()) {
+          std::fprintf(stderr, "vgpu demo: %s needs a value\n", args[i].c_str());
+          return 2;
+        }
+        if (args[i] == "--gpu") {
           gpu = args[++i];
-        else if (args[i] == "-n" && i + 1 < args.size())
-          n = std::stoll(args[++i]);
-        else {
+        } else if (args[i] == "-n") {
+          // std::stoll let "abc" escape as an exception whose only text was
+          // "stoll", and took "12abc" as 12.
+          const std::string& v = args[++i];
+          if (!vgpu::cli::parse_int(v, 1, 1ll << 31, &n)) {
+            std::fprintf(stderr, "vgpu demo: -n needs a whole number in [1, 2^31], got '%s'\n",
+                         v.c_str());
+            return 2;
+          }
+        } else {
           std::fprintf(stderr, "vgpu demo: unknown argument '%s'\n", args[i].c_str());
           return 2;
         }

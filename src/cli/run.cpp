@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,8 +33,10 @@
 #include <string>
 #include <vector>
 
+#include "args.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/registry.hpp"
+#include "vgpu/telemetry.hpp"
 
 namespace {
 
@@ -236,7 +239,7 @@ int usage(FILE* to) {
                "  --vram-mb <n>         VRAM per device, in MiB\n"
                "\n"
                "Execution:\n"
-               "  --threads <n>         Interpreter worker threads (0 = one per core)\n"
+               "  --threads <n>         Interpreter worker threads, at least 1 (default: one per core)\n"
                "  --max-steps <n>       Per-thread instruction budget (0 disables the guard)\n"
                "  --strict              Refuse undefined behaviour instead of continuing\n"
                "  --race                Detect shared-memory data races\n"
@@ -244,7 +247,9 @@ int usage(FILE* to) {
                "\n"
                "Output:\n"
                "  --trace               Log driver-level activity\n"
-               "  --quiet               Suppress the startup banner\n"
+               "  --quiet               Silence every VirtualGPU diagnostic on stderr, errors and\n"
+               "                        warnings included (sets VGPU_QUIET=1). The program's own\n"
+               "                        output and exit code are unaffected.\n"
                "\n"
                "Loading:\n"
                "  --preload             Also LD_PRELOAD the shim. Needed when the program\n"
@@ -287,6 +292,24 @@ int cmd_run(const std::vector<std::string>& args) {
       std::fprintf(stderr, "vgpu run: unknown option '%s'\n\n", a.c_str());
       return usage(stderr);
     }
+  }
+  // The values go into the environment as strings, and the libraries that read
+  // them back are lenient on purpose (a bad VGPU_THREADS becomes 1, a bad
+  // VGPU_VRAM_MB is ignored). That is right for an environment variable nobody
+  // may be watching, and wrong for a flag someone just typed: `--vram-mb 1x`
+  // ran with the full card and `--count 0` with one device, and neither said so.
+  {
+    long long n = 0;
+    auto check = [&](const std::string& v, const char* flag, long long lo, long long hi,
+                     const char* what) {
+      if (v.empty() || vgpu::cli::parse_int(v, lo, hi, &n)) return;
+      std::fprintf(stderr, "vgpu run: %s needs %s, got '%s'\n", flag, what, v.c_str());
+      std::exit(2);
+    };
+    check(o.count, "--count", 1, vgpu::telemetry::kMaxDevices, "a whole number from 1 to 16");
+    check(o.vram_mb, "--vram-mb", 1, 1ll << 30, "a positive whole number of MiB");
+    check(o.threads, "--threads", 1, 1 << 16, "a whole number of at least 1");
+    check(o.max_steps, "--max-steps", 0, LLONG_MAX, "a whole number of at least 0");
   }
   if (i >= args.size()) {
     std::fprintf(stderr, "vgpu run: no program given\n\n");
