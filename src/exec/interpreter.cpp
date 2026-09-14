@@ -3723,16 +3723,21 @@ class Interpreter {
       }
       // float -> int: round then clamp to the destination range.
       double rounded = round_int(x, op->round == Round::None ? Round::Rzi : op->round);
+      // Saturate against the powers of two themselves, which a double holds
+      // exactly. Clamping to INT64_MAX as a double rounded it up to 2^63, and
+      // converting 2^63 back was undefined: +inf and 2^63 came out as INT64_MIN
+      // for s64, and as 0 for u64. The 32-bit limits are exact doubles, which is
+      // why only the 64-bit conversions were wrong.
+      if (std::isnan(rounded)) return 0;
       if (d.is_signed()) {
-        long double lo = -std::pow(2.0L, d.bits - 1), hi = std::pow(2.0L, d.bits - 1) - 1;
-        if (std::isnan(rounded)) return 0;
-        if (rounded < lo) rounded = static_cast<double>(lo);
-        if (rounded > hi) rounded = static_cast<double>(hi);
+        const double limit = std::ldexp(1.0, static_cast<int>(d.bits) - 1);
+        const uint64_t max = (uint64_t{1} << (d.bits - 1)) - 1;
+        if (rounded >= limit) return mask_to_bits(max, d.bits);
+        if (rounded < -limit) return mask_to_bits(~max, d.bits);
         return mask_to_bits(static_cast<uint64_t>(static_cast<int64_t>(rounded)), d.bits);
       }
-      long double hi = std::pow(2.0L, d.bits) - 1;
-      if (std::isnan(rounded) || rounded < 0) return 0;
-      if (rounded > hi) rounded = static_cast<double>(hi);
+      if (rounded < 0) return 0;
+      if (rounded >= std::ldexp(1.0, static_cast<int>(d.bits))) return mask_to_bits(~uint64_t{0}, d.bits);
       return mask_to_bits(static_cast<uint64_t>(rounded), d.bits);
     }
     // Integer source: sign/zero-extend to 64 bits first.
@@ -3806,6 +3811,11 @@ class Interpreter {
             ctx_fail(ins, -1, Err::InvalidValue, "integer division by zero");
           return op == IntBinOp::Div ? narrow_u(~uint64_t{0}, ty.bits) : u(a);
         }
+        // The one signed quotient that does not fit: INT64_MIN / -1 is a
+        // SIGFPE on x86, and it is data, not a malformed kernel. It wraps, as
+        // the narrower widths already do, and the remainder is zero.
+        if (sig && s(b) == -1)
+          return op == IntBinOp::Div ? uint64_t{0} - static_cast<uint64_t>(s(a)) : uint64_t{0};
         if (op == IntBinOp::Div)
           return sig ? static_cast<uint64_t>(s(a) / s(b)) : u(a) / u(b);
         return sig ? static_cast<uint64_t>(s(a) % s(b)) : u(a) % u(b);
