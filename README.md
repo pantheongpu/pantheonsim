@@ -238,7 +238,7 @@ Errors return documented `CUresult` codes **and** print a rich diagnostic:
 
 ```
 [vgpu] cuLaunchKernel: VirtualGPU error [out-of-bounds]: device memory read at
-0x7fff00003140 is 0 bytes past the end of the 64-byte allocation at 0x7fff00003100
+0x200000003140 is 0 bytes past the end of the 64-byte allocation at 0x200000003100
   in kernel 'vecAdd', PTX line 30
   lane 16
   instruction: ld.global.f32 %f1,[%rd8]

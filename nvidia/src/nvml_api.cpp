@@ -24,19 +24,31 @@
 #include <mutex>
 #include <string>
 
+#include "vgpu/profile.hpp"
+#include "vgpu/registry.hpp"
 #include "vgpu/telemetry.hpp"
 
 namespace {
 
-std::mutex g_mu;
+// Recursive, because entry points forward to one another (the unversioned
+// names call their _v2/_v3 forms) and every one of them holds it.
+std::recursive_mutex g_mu;
 // NVML is reference counted: every nvmlInit needs its own nvmlShutdown, and
 // with the count at zero every query answers NVML_ERROR_UNINITIALIZED. This
 // was a flag that nothing read, so a tool that shut NVML down and kept calling
 // was still answered -- the bug a tool's own tests exist to catch.
-std::atomic<int> g_init_count{0};
-#define REQUIRE_INIT() \
-  if (g_init_count.load() == 0) return NVML_ERROR_UNINITIALIZED
+int g_init_count = 0;
+// Takes the lock for the rest of the entry point and then checks the count.
+// The check used to happen before the lock, so a query racing the last
+// nvmlShutdown on another thread could pass it and read state being torn down.
+#define REQUIRE_INIT()                                        \
+  std::lock_guard<std::recursive_mutex> init_lock_(g_mu);     \
+  if (g_init_count == 0) return NVML_ERROR_UNINITIALIZED
 vgpu::telemetry::Shared g_snap{};
+// Set when the machine is described by VGPU_GPU / VGPU_DEVICE_COUNT rather
+// than by a live publisher; see nvmlInit_v2.
+bool g_have_profile = false;
+vgpu::telemetry::Shared g_idle{};
 
 // Handles are 1-based indices encoded as pointers, so they are never null.
 nvmlDevice_t handle_for(unsigned int index) {
@@ -52,8 +64,38 @@ bool index_of(nvmlDevice_t dev, unsigned int* out) {
 }
 
 // Re-reads telemetry so repeated queries (nvidia-smi -l) show live values.
+// With nothing publishing, a machine described by the environment answers as
+// an idle rack -- see nvmlInit_v2.
 bool refresh() {
-  return vgpu::telemetry::read_snapshot(&g_snap);
+  if (vgpu::telemetry::read_snapshot(&g_snap)) return true;
+  if (!g_have_profile) return false;
+  g_snap = g_idle;
+  return true;
+}
+
+// The machine VGPU_GPU / VGPU_DEVICE_COUNT describe, as an idle snapshot.
+// `vgpu run` and the GitHub Action set both for the program they start, and a
+// program that asks NVML before (or without) touching CUDA -- pynvml, gpustat,
+// a framework probing for GPUs -- runs before any simulated process has
+// published telemetry. Answering DRIVER_NOT_LOADED there told it the machine
+// had no GPU at all, which is the one answer that is certainly wrong: the
+// profile says what the devices are, and `vgpu smi` already answers from it.
+// Memory reads as unused because nothing is using it.
+bool load_described_machine() {
+  if (g_have_profile) return true;
+  const char* gpu = std::getenv("VGPU_GPU");
+  const char* count = std::getenv("VGPU_DEVICE_COUNT");
+  const bool described = (gpu && gpu[0]) || (count && count[0]);
+  if (!described) return false;
+  try {
+    vgpu::DeviceProfile p = vgpu::load_gpu(gpu && gpu[0] ? gpu : "nvidia/h100");
+    vgpu::apply_vram_override(p);  // the card the program's CUDA calls will see
+    g_idle = vgpu::telemetry::idle_snapshot(p, count && count[0] ? std::atoi(count) : 1);
+    g_have_profile = true;
+  } catch (const std::exception&) {
+    return false;  // an unknown profile id: there is no machine to describe
+  }
+  return true;
 }
 
 const vgpu::telemetry::DeviceSample* sample(nvmlDevice_t dev) {
@@ -62,9 +104,15 @@ const vgpu::telemetry::DeviceSample* sample(nvmlDevice_t dev) {
   return &g_snap.devices[idx];
 }
 
+// NVML documents NVML_ERROR_INSUFFICIENT_SIZE for a buffer too small for the
+// answer. This used to truncate into it and report success, so a tool that
+// sized a UUID buffer wrong got a prefix it believed was the whole UUID -- and
+// a lookup by that UUID then failed somewhere far from the cause.
 nvmlReturn_t copy_string(const char* src, char* dst, unsigned int len) {
-  if (!dst || len == 0) return NVML_ERROR_INVALID_ARGUMENT;
-  std::snprintf(dst, len, "%s", src);
+  if (!dst) return NVML_ERROR_INVALID_ARGUMENT;
+  const size_t need = std::strlen(src) + 1;
+  if (need > len) return NVML_ERROR_INSUFFICIENT_SIZE;
+  std::memcpy(dst, src, need);
   return NVML_SUCCESS;
 }
 
@@ -75,34 +123,62 @@ nvmlReturn_t copy_string(const char* src, char* dst, unsigned int len) {
 /* ---- lifecycle ---- */
 
 VGPU_EXPORT nvmlReturn_t nvmlInit_v2(void) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  if (!refresh()) {
-    // No live VirtualGPU: report "driver not loaded", exactly as NVML does on
-    // a machine with no NVIDIA driver.
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  if (!refresh() && !(load_described_machine() && refresh())) {
+    // No live VirtualGPU and no machine described: report "driver not
+    // loaded", exactly as NVML does on a machine with no NVIDIA driver.
     return NVML_ERROR_DRIVER_NOT_LOADED;
   }
-  g_init_count.fetch_add(1);
+  ++g_init_count;
   return NVML_SUCCESS;
 }
 VGPU_EXPORT nvmlReturn_t nvmlInit(void) { return nvmlInit_v2(); }
 VGPU_EXPORT nvmlReturn_t nvmlInitWithFlags(unsigned int) { return nvmlInit_v2(); }
 VGPU_EXPORT nvmlReturn_t nvmlShutdown(void) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  if (g_init_count.load() == 0) return NVML_ERROR_UNINITIALIZED;
-  g_init_count.fetch_sub(1);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  if (g_init_count == 0) return NVML_ERROR_UNINITIALIZED;
+  --g_init_count;
   return NVML_SUCCESS;
 }
 
+// Every code nvml.h declares. Numbers rather than enumerators, because the
+// shim also builds against CUDA 12.0's nvml.h, which predates the last few.
+// Previously eight codes had strings and the rest -- NO_PERMISSION, GPU_IS_LOST,
+// RESET_REQUIRED, the ones a monitoring tool most needs to explain -- all read
+// "Unknown Error".
 VGPU_EXPORT const char* nvmlErrorString(nvmlReturn_t result) {
-  switch (result) {
-    case NVML_SUCCESS: return "The operation was successful";
-    case NVML_ERROR_UNINITIALIZED: return "Uninitialized";
-    case NVML_ERROR_INVALID_ARGUMENT: return "Invalid Argument";
-    case NVML_ERROR_NOT_SUPPORTED: return "Not Supported";
-    case NVML_ERROR_NOT_FOUND: return "Not Found";
-    case NVML_ERROR_INSUFFICIENT_SIZE: return "Insufficient Size";
-    case NVML_ERROR_DRIVER_NOT_LOADED: return "Driver Not Loaded";
-    case NVML_ERROR_FUNCTION_NOT_FOUND: return "Function Not Found";
+  switch (static_cast<int>(result)) {
+    case 0: return "The operation was successful";
+    case 1: return "Uninitialized";
+    case 2: return "Invalid Argument";
+    case 3: return "Not Supported";
+    case 4: return "Insufficient Permissions";
+    case 5: return "Already Initialized";
+    case 6: return "Not Found";
+    case 7: return "Insufficient Size";
+    case 8: return "Insufficient External Power";
+    case 9: return "Driver Not Loaded";
+    case 10: return "Timeout";
+    case 11: return "Interrupt Request Issue";
+    case 12: return "NVML Shared Library Not Found";
+    case 13: return "Function Not Found";
+    case 14: return "Corrupted infoROM";
+    case 15: return "GPU is lost";
+    case 16: return "GPU requires restart";
+    case 17: return "The operating system has blocked the request";
+    case 18: return "RM has detected an NVML/RM version mismatch";
+    case 19: return "In use by another client";
+    case 20: return "Insufficient Memory";
+    case 21: return "No data";
+    case 22: return "The requested vgpu operation is not available on target device, because ECC is enabled";
+    case 23: return "Insufficient Resources";
+    case 24: return "Frequency not supported";
+    case 25: return "Argument version mismatch";
+    case 26: return "Deprecated";
+    case 27: return "Not Ready";
+    case 28: return "GPU not found";
+    case 29: return "Invalid state";
+    case 30: return "Reset type not supported";
     default: return "Unknown Error";
   }
 }
@@ -110,7 +186,7 @@ VGPU_EXPORT const char* nvmlErrorString(nvmlReturn_t result) {
 /* ---- system ---- */
 
 VGPU_EXPORT nvmlReturn_t nvmlSystemGetDriverVersion(char* version, unsigned int length) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   return copy_string(g_snap.driver_version, version, length);
 }
@@ -126,7 +202,7 @@ VGPU_EXPORT nvmlReturn_t nvmlSystemGetNVMLVersion(char* version, unsigned int le
 // 12040). It was 13000 whatever the session was.
 VGPU_EXPORT nvmlReturn_t nvmlSystemGetCudaDriverVersion(int* version) { REQUIRE_INIT();
   if (!version) return NVML_ERROR_INVALID_ARGUMENT;
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   int major = 13, minor = 0;
   if (g_snap.cuda_version[0]) std::sscanf(g_snap.cuda_version, "%d.%d", &major, &minor);
@@ -140,7 +216,7 @@ VGPU_EXPORT nvmlReturn_t nvmlSystemGetCudaDriverVersion_v2(int* version) { REQUI
 /* ---- enumeration and identity ---- */
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCount_v2(unsigned int* count) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (!count) return NVML_ERROR_INVALID_ARGUMENT;
   refresh();
   *count = g_snap.device_count;
@@ -151,7 +227,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCount(unsigned int* count) { REQUIRE_INIT(
 }
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetHandleByIndex_v2(unsigned int index, nvmlDevice_t* device) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (!device) return NVML_ERROR_INVALID_ARGUMENT;
   refresh();
   if (index >= g_snap.device_count) return NVML_ERROR_INVALID_ARGUMENT;
@@ -163,20 +239,20 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetHandleByIndex(unsigned int index, nvmlDevi
 }
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetIndex(nvmlDevice_t device, unsigned int* index) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (!index) return NVML_ERROR_INVALID_ARGUMENT;
   return index_of(device, index) ? NVML_SUCCESS : NVML_ERROR_INVALID_ARGUMENT;
 }
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetName(nvmlDevice_t device, char* name, unsigned int length) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   return d ? copy_string(d->name, name, length) : NVML_ERROR_INVALID_ARGUMENT;
 }
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetUUID(nvmlDevice_t device, char* uuid, unsigned int length) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   return d ? copy_string(d->uuid, uuid, length) : NVML_ERROR_INVALID_ARGUMENT;
@@ -187,7 +263,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetSerial(nvmlDevice_t, char*, unsigned int) 
 }
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPciInfo_v3(nvmlDevice_t device, nvmlPciInfo_t* pci) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !pci) return NVML_ERROR_INVALID_ARGUMENT;
@@ -218,7 +294,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPciInfo(nvmlDevice_t device, nvmlPciInfo_t
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCudaComputeCapability(nvmlDevice_t device, int* major,
                                                             int* minor) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !major || !minor) return NVML_ERROR_INVALID_ARGUMENT;
@@ -228,7 +304,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCudaComputeCapability(nvmlDevice_t device,
 }
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetNumGpuCores(nvmlDevice_t device, unsigned int* cores) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !cores) return NVML_ERROR_INVALID_ARGUMENT;
@@ -239,7 +315,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetNumGpuCores(nvmlDevice_t device, unsigned 
 /* ---- live measurements (memory + utilization are REAL) ---- */
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory_t* memory) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !memory) return NVML_ERROR_INVALID_ARGUMENT;
@@ -250,7 +326,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory
 }
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMemoryInfo_v2(nvmlDevice_t device, nvmlMemory_v2_t* memory) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !memory) return NVML_ERROR_INVALID_ARGUMENT;
@@ -264,7 +340,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMemoryInfo_v2(nvmlDevice_t device, nvmlMem
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t device,
                                                        nvmlUtilization_t* utilization) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !utilization) return NVML_ERROR_INVALID_ARGUMENT;
@@ -278,7 +354,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t device,
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTemperature(nvmlDevice_t device,
                                                   nvmlTemperatureSensors_t sensorType,
                                                   unsigned int* temp) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !temp) return NVML_ERROR_INVALID_ARGUMENT;
@@ -290,7 +366,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTemperature(nvmlDevice_t device,
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTemperatureThreshold(nvmlDevice_t device,
                                                            nvmlTemperatureThresholds_t which,
                                                            unsigned int* temp) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !temp) return NVML_ERROR_INVALID_ARGUMENT;
@@ -308,7 +384,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTemperatureThreshold(nvmlDevice_t device,
 }
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPowerUsage(nvmlDevice_t device, unsigned int* milliwatts) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !milliwatts) return NVML_ERROR_INVALID_ARGUMENT;
@@ -317,7 +393,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPowerUsage(nvmlDevice_t device, unsigned i
 }
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetEnforcedPowerLimit(nvmlDevice_t device, unsigned int* limit) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !limit) return NVML_ERROR_INVALID_ARGUMENT;
@@ -335,7 +411,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPowerManagementDefaultLimit(nvmlDevice_t d
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPowerManagementLimitConstraints(nvmlDevice_t device,
                                                                       unsigned int* minLimit,
                                                                       unsigned int* maxLimit) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !minLimit || !maxLimit) return NVML_ERROR_INVALID_ARGUMENT;
@@ -346,7 +422,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPowerManagementLimitConstraints(nvmlDevice
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetClockInfo(nvmlDevice_t device, nvmlClockType_t type,
                                                 unsigned int* clock) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !clock) return NVML_ERROR_INVALID_ARGUMENT;
@@ -362,7 +438,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetClockInfo(nvmlDevice_t device, nvmlClockTy
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMaxClockInfo(nvmlDevice_t device, nvmlClockType_t type,
                                                    unsigned int* clock) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !clock) return NVML_ERROR_INVALID_ARGUMENT;
@@ -377,7 +453,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMaxClockInfo(nvmlDevice_t device, nvmlCloc
 }
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFanSpeed(nvmlDevice_t device, unsigned int* speed) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !speed) return NVML_ERROR_INVALID_ARGUMENT;
@@ -386,7 +462,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFanSpeed(nvmlDevice_t device, unsigned int
 }
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPerformanceState(nvmlDevice_t device, nvmlPstates_t* state) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !state) return NVML_ERROR_INVALID_ARGUMENT;
@@ -396,13 +472,19 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPerformanceState(nvmlDevice_t device, nvml
 
 /* ---- modes and processes ---- */
 
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPersistenceMode(nvmlDevice_t, nvmlEnableState_t* mode) { REQUIRE_INIT();
-  if (!mode) return NVML_ERROR_INVALID_ARGUMENT;
+// The mode queries answer constants, and used to answer them for any handle at
+// all -- NULL, a stale one, a number from nowhere -- so a tool iterating past
+// the last device got plausible modes for GPUs that do not exist. The handle is
+// checked like every other device query.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPersistenceMode(nvmlDevice_t device, nvmlEnableState_t* mode) { REQUIRE_INIT();
+  unsigned int idx;
+  if (!index_of(device, &idx) || !mode) return NVML_ERROR_INVALID_ARGUMENT;
   *mode = NVML_FEATURE_ENABLED;
   return NVML_SUCCESS;
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetComputeMode(nvmlDevice_t, nvmlComputeMode_t* mode) { REQUIRE_INIT();
-  if (!mode) return NVML_ERROR_INVALID_ARGUMENT;
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetComputeMode(nvmlDevice_t device, nvmlComputeMode_t* mode) { REQUIRE_INIT();
+  unsigned int idx;
+  if (!index_of(device, &idx) || !mode) return NVML_ERROR_INVALID_ARGUMENT;
   *mode = NVML_COMPUTEMODE_DEFAULT;
   return NVML_SUCCESS;
 }
@@ -417,13 +499,15 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetEccMode(nvmlDevice_t, nvmlEnableState_t* c
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMigMode(nvmlDevice_t, unsigned int*, unsigned int*) { REQUIRE_INIT();
   return NVML_ERROR_NOT_SUPPORTED;
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDisplayMode(nvmlDevice_t, nvmlEnableState_t* mode) { REQUIRE_INIT();
-  if (!mode) return NVML_ERROR_INVALID_ARGUMENT;
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDisplayMode(nvmlDevice_t device, nvmlEnableState_t* mode) { REQUIRE_INIT();
+  unsigned int idx;
+  if (!index_of(device, &idx) || !mode) return NVML_ERROR_INVALID_ARGUMENT;
   *mode = NVML_FEATURE_DISABLED;
   return NVML_SUCCESS;
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDisplayActive(nvmlDevice_t, nvmlEnableState_t* mode) { REQUIRE_INIT();
-  if (!mode) return NVML_ERROR_INVALID_ARGUMENT;
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDisplayActive(nvmlDevice_t device, nvmlEnableState_t* mode) { REQUIRE_INIT();
+  unsigned int idx;
+  if (!index_of(device, &idx) || !mode) return NVML_ERROR_INVALID_ARGUMENT;
   *mode = NVML_FEATURE_DISABLED;
   return NVML_SUCCESS;
 }
@@ -431,7 +515,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDisplayActive(nvmlDevice_t, nvmlEnableStat
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v3(nvmlDevice_t device,
                                                                  unsigned int* infoCount,
                                                                  nvmlProcessInfo_t* infos) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !infoCount) return NVML_ERROR_INVALID_ARGUMENT;
@@ -456,7 +540,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v3(nvmlDevice_t de
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v2(nvmlDevice_t device,
                                                                  unsigned int* infoCount,
                                                                  nvmlProcessInfo_v2_t* infos) { REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !infoCount) return NVML_ERROR_INVALID_ARGUMENT;
@@ -510,7 +594,7 @@ bool same_bus_id(const char* a, const char* b) {
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetHandleByUUID(const char* uuid, nvmlDevice_t* device) {
   REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (!uuid || !device) return NVML_ERROR_INVALID_ARGUMENT;
   refresh();
   for (unsigned int i = 0; i < g_snap.device_count; ++i)
@@ -523,7 +607,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetHandleByUUID(const char* uuid, nvmlDevice_
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetHandleByPciBusId_v2(const char* busId, nvmlDevice_t* device) {
   REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (!busId || !device) return NVML_ERROR_INVALID_ARGUMENT;
   refresh();
   for (unsigned int i = 0; i < g_snap.device_count; ++i)
@@ -539,7 +623,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetHandleByPciBusId(const char* busId, nvmlDe
 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMinorNumber(nvmlDevice_t device, unsigned int* minor) {
   REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (!minor) return NVML_ERROR_INVALID_ARGUMENT;
   return index_of(device, minor) ? NVML_SUCCESS : NVML_ERROR_INVALID_ARGUMENT;  // /dev/nvidiaN
 }
@@ -547,7 +631,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMinorNumber(nvmlDevice_t device, unsigned 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetArchitecture(nvmlDevice_t device,
                                                    nvmlDeviceArchitecture_t* arch) {
   REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !arch) return NVML_ERROR_INVALID_ARGUMENT;
@@ -568,7 +652,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetArchitecture(nvmlDevice_t device,
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCurrentClocksThrottleReasons(nvmlDevice_t device,
                                                                    unsigned long long* reasons) {
   REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   if (!sample(device) || !reasons) return NVML_ERROR_INVALID_ARGUMENT;
   *reasons = 0;
@@ -593,7 +677,7 @@ VGPU_EXPORT nvmlReturn_t nvmlSystemGetProcessName(unsigned int pid, char* name, 
 // MIG: these devices are not partitioned, which is an answer, not a gap.
 VGPU_EXPORT nvmlReturn_t nvmlDeviceIsMigDeviceHandle(nvmlDevice_t device, unsigned int* isMig) {
   REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (!isMig) return NVML_ERROR_INVALID_ARGUMENT;
   unsigned int idx;
   if (!index_of(device, &idx)) return NVML_ERROR_INVALID_ARGUMENT;
@@ -664,7 +748,7 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetProcessUtilization(nvmlDevice_t, nvmlProce
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFieldValues(nvmlDevice_t device, int count,
                                                   nvmlFieldValue_t* values) {
   REQUIRE_INIT();
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
   unsigned int idx;
   if (!index_of(device, &idx) || count < 0 || (count > 0 && !values))
     return NVML_ERROR_INVALID_ARGUMENT;

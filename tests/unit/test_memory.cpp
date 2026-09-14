@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <sys/wait.h>
+#include <memory>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -642,6 +643,23 @@ VTEST(a_forked_child_freeing_spilled_memory_leaves_the_parents_intact) {
   }
   vgpu::backing::configure({});
   ::rmdir(dir);
+}
+
+// Device windows must not cover host memory. They began at 0x7fff'0000'0000,
+// where the stack lives, and a stack buffer was taken for a device pointer.
+VTEST(stack_and_heap_addresses_are_never_device_addresses) {
+  int on_stack = 0;
+  const auto heap = std::make_unique<int>(0);
+  VCHECK(!vgpu::is_device_va(reinterpret_cast<uint64_t>(&on_stack)));
+  VCHECK(!vgpu::is_device_va(reinterpret_cast<uint64_t>(heap.get())));
+  VCHECK(!vgpu::is_device_va(0x7fff'4d6e'2190ull));   // the stack address from the flaky copy
+  VCHECK(!vgpu::is_device_va(0));
+  MemoryManager last(1 << 20, static_cast<uint32_t>(vgpu::kDeviceVaWindows - 1));
+  const uint64_t p = last.alloc(64);
+  VCHECK(vgpu::is_device_va(p));
+  VCHECK(vgpu::is_device_va(vgpu::kDeviceVaEnd - 1));
+  VCHECK(!vgpu::is_device_va(vgpu::kDeviceVaEnd));
+  last.free(p);
 }
 
 VTEST_MAIN

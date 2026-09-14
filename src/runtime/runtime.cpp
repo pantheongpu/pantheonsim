@@ -83,6 +83,15 @@ uint64_t Device::load_module(const std::string& ptx_src) {
   }
 }
 
+void Device::reset() {
+  // Modules first: their globals are allocations, and unloading frees them by
+  // handle. Whatever is left afterwards -- cudaMalloc, arrays, pitched
+  // buffers -- goes in one sweep.
+  while (!modules_.empty()) unload_module(modules_.back().id);
+  textures_.clear();
+  mem_.free_all();
+}
+
 void Device::unload_module(uint64_t module_id) {
   for (auto it = modules_.begin(); it != modules_.end(); ++it) {
     if (it->id == module_id) {
@@ -259,6 +268,8 @@ void Runtime::publish_identity(const DeviceProfile& p, int ordinal) {
 
 Runtime::Runtime(const DeviceProfile& profile, int device_count) {
   if (device_count < 1) throw Error::make(Err::InvalidValue, "device_count must be >= 1");
+  // Every device needs an address window of its own (memory.hpp).
+  static_assert(telemetry::kMaxDevices <= vgpu::kDeviceVaWindows);
   if (device_count > telemetry::kMaxDevices)
     throw Error::make(Err::InvalidValue, "device_count must be <= ", telemetry::kMaxDevices);
   telemetry_.set_device_count(static_cast<uint32_t>(device_count));

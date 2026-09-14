@@ -35,7 +35,14 @@
 
 namespace vgpu {
 
-inline constexpr uint64_t kDeviceVaBase = 0x7fff'0000'0000ull;
+// Device windows are 0x2000'0000'0000 to 0x3000'0000'0000. They used to start
+// at 0x7fff'0000'0000, which is where Linux puts the stack: a stack buffer at
+// 0x7fff'4d6e'2190 passed to cudaMemcpyDefault was taken for device memory, and
+// a copy failed one run in five. Every range this can collide with is
+// elsewhere: the stack and shared libraries near 0x7fff'…/0x7f…, a PIE program
+// and its heap near 0x55…–0x56…, a non-PIE one near 0x40'0000, and the engine's
+// own private windows at 0x6ffb'…–0x6fff'…. Every check is bounded above too.
+inline constexpr uint64_t kDeviceVaBase = 0x2000'0000'0000ull;
 // Device functions get addresses in their own window so a function pointer is
 // a real value that can be stored, loaded and compared -- and so an indirect
 // call can find the function again. The index is the address: nothing is ever
@@ -50,6 +57,12 @@ inline constexpr uint64_t kFuncVaSize = 1ull << 20;
 // devices hand out the same numeric address for different memory, so a
 // cross-device copy silently reads the wrong buffer instead of failing.
 inline constexpr uint64_t kDeviceVaStride = 0x100'0000'0000ull;  // 1 TiB
+// One window per device, as many as a rack may hold (telemetry::kMaxDevices).
+inline constexpr uint64_t kDeviceVaWindows = 16;
+inline constexpr uint64_t kDeviceVaEnd = kDeviceVaBase + kDeviceVaWindows * kDeviceVaStride;
+// Whether an address is in some device's window. "At or above the base" alone
+// claimed every higher address -- the stack included -- for the devices.
+inline constexpr bool is_device_va(uint64_t addr) { return addr >= kDeviceVaBase && addr < kDeviceVaEnd; }
 inline constexpr uint64_t kAllocAlign = 256;  // matches CUDA's documented minimum alignment
 inline constexpr uint64_t kChunkSize = 64 * 1024;
 // How many freed allocations stay individually diagnosable. Bounded so that
@@ -79,6 +92,11 @@ class MemoryManager {
 
   // Frees an allocation. `ptr` must be the exact base returned by alloc().
   void free(uint64_t ptr);
+
+  // Frees every live allocation, as a device reset does. Each goes through
+  // free(), so the pointers stay in the quarantine and a program that uses one
+  // afterwards is told it was freed.
+  void free_all();
 
   // Bulk copies (the H2D/D2H/D2D building blocks).
   void write(uint64_t dst, const void* src, uint64_t len);
@@ -229,8 +247,26 @@ class MemoryManager {
   // means no managed memory, which is almost every program.
   struct HostMaps {
     std::vector<HostMap> maps;
+    // Recently unmapped buffers, so a kernel that touches one after it was
+    // freed is told it is a use-after-free rather than "not a device pointer".
+    // Bounded like the device-memory quarantine; a new mapping over the same
+    // range retires the record, because the allocator reuses host addresses.
+    std::vector<HostMap> retired;
     std::mutex mu;
+    // The lowest and highest address ever mapped. Pinned buffers make host
+    // maps common rather than rare, and without these every scalar access a
+    // kernel makes to ordinary device memory would take the lock above to
+    // learn it is not in a host map. Device windows sit far above the host
+    // heap, so a relaxed range check sends those straight to the chunk table.
+    // Only ever widened, so a stale read is conservative, never wrong.
+    std::atomic<uint64_t> lo{UINT64_MAX};
+    std::atomic<uint64_t> hi{0};
+    bool may_contain(uint64_t addr) const {
+      return addr >= lo.load(std::memory_order_relaxed) &&
+             addr < hi.load(std::memory_order_relaxed);
+    }
   };
+  static constexpr size_t kRetiredHostMaps = 256;
   std::unique_ptr<HostMaps> host_maps_;
   const HostMap* find_host_map_locked(uint64_t addr, uint64_t len) const;
   // Where a kernel's scalar access lands: bytes in a chunk, memory nothing has

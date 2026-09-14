@@ -51,6 +51,12 @@ class Device {
     if (telemetry_) telemetry_->note_transfer(static_cast<uint32_t>(ordinal_), bytes, seconds);
   }
 
+  // Destroys everything this device holds -- loaded modules and their globals,
+  // texture objects, every allocation -- as cudaDeviceReset documents. Handles
+  // issued before the reset are invalid afterwards; the device itself stays
+  // usable, and modules load again on next use.
+  void reset();
+
   // Loads a PTX module; returns a module handle valid for this device.
   // PTX errors are augmented with the device's profile id.
   uint64_t load_module(const std::string& ptx_src);

@@ -10,7 +10,9 @@ exits on.
 import ctypes, os, sys
 
 SUCCESS, UNINITIALIZED, INVALID_ARGUMENT, NOT_SUPPORTED, NOT_FOUND = 0, 1, 2, 3, 6
+INSUFFICIENT_SIZE, DRIVER_NOT_LOADED = 7, 9
 lib = ctypes.CDLL(os.path.join(sys.argv[1], "libnvidia-ml.so.1"))
+lib.nvmlErrorString.restype = ctypes.c_char_p
 fails = 0
 
 
@@ -18,6 +20,39 @@ def check(name, ok, got=""):
     global fails
     print(("ok    " if ok else "FAIL  ") + name + ("" if ok else f"  -> {got}"))
     fails += 0 if ok else 1
+
+
+class Memory(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+
+# `--described`: nothing is publishing telemetry, as for a program `vgpu run`
+# starts before it has touched CUDA. The machine VGPU_GPU / VGPU_DEVICE_COUNT
+# describe must still answer, idle. It used to be DRIVER_NOT_LOADED.
+# `--undescribed`: no telemetry and no description, which is a machine with no
+# driver.
+if len(sys.argv) > 2 and sys.argv[2] == "--undescribed":
+    rc = lib.nvmlInit_v2()
+    check("no telemetry and no machine described: DRIVER_NOT_LOADED", rc == DRIVER_NOT_LOADED, rc)
+    sys.exit(1 if fails else 0)
+if len(sys.argv) > 2 and sys.argv[2] == "--described":
+    rc = lib.nvmlInit_v2()
+    check("no telemetry, machine described: init succeeds", rc == SUCCESS, rc)
+    n = ctypes.c_uint()
+    lib.nvmlDeviceGetCount_v2(ctypes.byref(n))
+    want = int(os.environ.get("VGPU_DEVICE_COUNT", "1"))
+    check("device count is the described one", n.value == want, (n.value, want))
+    h = ctypes.c_void_p()
+    lib.nvmlDeviceGetHandleByIndex_v2(ctypes.c_uint(n.value - 1), ctypes.byref(h))
+    name = ctypes.create_string_buffer(96)
+    rc = lib.nvmlDeviceGetName(h, name, ctypes.c_uint(96))
+    check("name comes from the profile", rc == SUCCESS and b"T4" in name.value, (rc, name.value))
+    mem = Memory()
+    rc = lib.nvmlDeviceGetMemoryInfo(h, ctypes.byref(mem))
+    check("memory is total and unused", rc == SUCCESS and mem.total > 0 and mem.used == 0, (rc, mem.total, mem.used))
+    check("shutdown", lib.nvmlShutdown() == SUCCESS)
+    print(f"{fails} failed")
+    sys.exit(1 if fails else 0)
 
 
 def handle(i):
@@ -75,6 +110,31 @@ lib.nvmlSystemGetCudaDriverVersion_v2(ctypes.byref(cuda))
 major, minor_v = (os.environ.get("VGPU_CUDA_VERSION", "13.0").split(".") + ["0"])[:2]
 want = int(major) * 1000 + int(minor_v) * 10
 check("CUDA driver version is the session's", cuda.value == want, (cuda.value, want))
+
+# A buffer too small is INSUFFICIENT_SIZE. It used to be a truncated string and
+# SUCCESS, which a caller cannot tell from the real answer.
+rc, short = string(lib.nvmlDeviceGetUUID, h1, 8)
+check("a UUID buffer too small is INSUFFICIENT_SIZE", rc == INSUFFICIENT_SIZE, (rc, short))
+rc, short = string(lib.nvmlDeviceGetName, h1, 4)
+check("a name buffer too small is INSUFFICIENT_SIZE", rc == INSUFFICIENT_SIZE, (rc, short))
+rc, full = string(lib.nvmlDeviceGetUUID, h1, len(uuid1) + 1)
+check("a buffer of exactly the right size succeeds", rc == SUCCESS and full == uuid1, (rc, full))
+
+# The mode queries check the handle. They used to answer for any handle at all.
+mode = ctypes.c_int(-1)
+check("persistence mode of a bogus handle is INVALID_ARGUMENT",
+      lib.nvmlDeviceGetPersistenceMode(ctypes.c_void_p(0xdeadbeef), ctypes.byref(mode)) == INVALID_ARGUMENT)
+check("compute mode of a bogus handle is INVALID_ARGUMENT",
+      lib.nvmlDeviceGetComputeMode(ctypes.c_void_p(0xdeadbeef), ctypes.byref(mode)) == INVALID_ARGUMENT)
+check("display mode of a NULL handle is INVALID_ARGUMENT",
+      lib.nvmlDeviceGetDisplayMode(ctypes.c_void_p(0), ctypes.byref(mode)) == INVALID_ARGUMENT)
+check("persistence mode of a real handle still answers",
+      lib.nvmlDeviceGetPersistenceMode(ctypes.c_void_p(h1), ctypes.byref(mode)) == SUCCESS)
+
+# Every declared code has a string; these read "Unknown Error".
+check("error strings cover the header",
+      all(lib.nvmlErrorString(c) != b"Unknown Error" for c in (4, 5, 8, 10, 11, 12, 14, 15, 16, 17)),
+      [lib.nvmlErrorString(c) for c in (4, 15)])
 
 # Reference counting: two inits need two shutdowns.
 check("a second init", lib.nvmlInit_v2() == SUCCESS)

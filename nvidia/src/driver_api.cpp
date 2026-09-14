@@ -26,6 +26,7 @@
 #include <ctime>
 #include <set>
 
+#include "error_names.hpp"
 #include "fatbin.hpp"
 #include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
@@ -77,7 +78,10 @@ struct ShimState {
 
   std::unordered_map<uintptr_t, int> contexts;         // ctx handle -> device ordinal
   std::unordered_map<int, uintptr_t> primary_ctx;      // device -> primary ctx handle
-  std::vector<uintptr_t> ctx_stack;                    // current-context stack (global)
+  // Retain count per device. A release with nothing retained is an error the
+  // caller needs to see: it means some other component's retain is about to
+  // be undone out from under it.
+  std::unordered_map<int, int> primary_refs;
   std::unordered_map<uintptr_t, std::pair<int, uint64_t>> modules;  // handle -> (dev, module id)
   std::unordered_map<uintptr_t, FuncRec> functions;
   std::unordered_map<uintptr_t, LibRec> libraries;
@@ -90,6 +94,17 @@ struct ShimState {
 ShimState& state() {
   static ShimState s;
   return s;
+}
+
+// The current-context stack. CUDA documents it as belonging to the calling
+// host thread, and it used to be one stack shared by the whole process: a new
+// thread's cuCtxGetCurrent returned whatever the main thread had pushed, and a
+// push in a worker changed which device the main thread's next allocation
+// landed on. Contexts themselves stay process-wide (ShimState::contexts); only
+// which one is current is per thread, and a new thread starts with none.
+std::vector<uintptr_t>& ctx_stack() {
+  thread_local std::vector<uintptr_t> stack;
+  return stack;
 }
 
 bool quiet() {
@@ -173,11 +188,19 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
 }
 
 int current_device(ShimState& s) {
-  if (s.ctx_stack.empty())
+  if (ctx_stack().empty())
     throw vgpu::Error::make(vgpu::Err::InvalidValue,
                             "no current context (create one with cuCtxCreate or "
                             "cuDevicePrimaryCtxRetain + cuCtxSetCurrent)");
-  return s.contexts.at(s.ctx_stack.back());
+  // With a stack per thread, another thread can destroy the context this one
+  // still has current. That is the caller's error, and it should be reported
+  // as one rather than escaping as std::out_of_range and CUDA_ERROR_UNKNOWN.
+  auto it = s.contexts.find(ctx_stack().back());
+  if (it == s.contexts.end())
+    throw vgpu::Error::make(vgpu::Err::InvalidValue,
+                            "the current context has been destroyed (by cuCtxDestroy, possibly on "
+                            "another thread)");
+  return it->second;
 }
 
 vgpu::runtime::Device& current(ShimState& s) { return s.rt->device(current_device(s)); }
@@ -459,51 +482,24 @@ VGPU_EXPORT CUresult cuDriverGetVersion(int* driverVersion) {
   return CUDA_SUCCESS;
 }
 
-namespace {
-struct ErrEntry {
-  CUresult code;
-  const char* name;
-  const char* str;
-};
-constexpr ErrEntry kErrTable[] = {
-    {CUDA_SUCCESS, "CUDA_SUCCESS", "no error"},
-    {CUDA_ERROR_INVALID_VALUE, "CUDA_ERROR_INVALID_VALUE", "invalid argument"},
-    {CUDA_ERROR_OUT_OF_MEMORY, "CUDA_ERROR_OUT_OF_MEMORY", "out of memory"},
-    {CUDA_ERROR_NOT_INITIALIZED, "CUDA_ERROR_NOT_INITIALIZED", "initialization error"},
-    {CUDA_ERROR_INVALID_DEVICE, "CUDA_ERROR_INVALID_DEVICE", "invalid device ordinal"},
-    {CUDA_ERROR_INVALID_CONTEXT, "CUDA_ERROR_INVALID_CONTEXT", "invalid device context"},
-    {CUDA_ERROR_INVALID_PTX, "CUDA_ERROR_INVALID_PTX", "a PTX JIT compilation failed"},
-    {CUDA_ERROR_NOT_FOUND, "CUDA_ERROR_NOT_FOUND", "named symbol not found"},
-    {CUDA_ERROR_ILLEGAL_ADDRESS, "CUDA_ERROR_ILLEGAL_ADDRESS",
-     "an illegal memory access was encountered"},
-    {CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES, "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES",
-     "too many resources requested for launch"},
-    {CUDA_ERROR_LAUNCH_TIMEOUT, "CUDA_ERROR_LAUNCH_TIMEOUT", "the launch timed out and was terminated"},
-    {CUDA_ERROR_NOT_SUPPORTED, "CUDA_ERROR_NOT_SUPPORTED", "operation not supported"},
-    {CUDA_ERROR_UNKNOWN, "CUDA_ERROR_UNKNOWN", "unknown error"},
-};
-}  // namespace
-
+// Both look the code up in the table the runtime shim shares
+// (error_names.hpp), which lists every CUresult cuda.h declares. This used to
+// be a table of the thirteen codes this file returns, so a program asking for
+// the name of CUDA_ERROR_NO_DEVICE or CUDA_ERROR_NOT_READY -- codes it can
+// receive from any library -- was told the code itself was invalid. A code no
+// header declares still gets CUDA_ERROR_INVALID_VALUE and NULL, as documented.
 VGPU_EXPORT CUresult cuGetErrorName(CUresult error, const char** pStr) {
   if (!pStr) return CUDA_ERROR_INVALID_VALUE;
-  for (const auto& e : kErrTable)
-    if (e.code == error) {
-      *pStr = e.name;
-      return CUDA_SUCCESS;
-    }
-  *pStr = nullptr;
-  return CUDA_ERROR_INVALID_VALUE;
+  const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(static_cast<int>(error));
+  *pStr = e ? e->driver_name : nullptr;
+  return *pStr ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 
 VGPU_EXPORT CUresult cuGetErrorString(CUresult error, const char** pStr) {
   if (!pStr) return CUDA_ERROR_INVALID_VALUE;
-  for (const auto& e : kErrTable)
-    if (e.code == error) {
-      *pStr = e.str;
-      return CUDA_SUCCESS;
-    }
-  *pStr = nullptr;
-  return CUDA_ERROR_INVALID_VALUE;
+  const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(static_cast<int>(error));
+  *pStr = e && e->driver_name ? e->text : nullptr;
+  return *pStr ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 
 /* ---- device discovery ---- */
@@ -610,7 +606,7 @@ VGPU_EXPORT CUresult cuCtxCreate_v2(CUcontext* pctx, unsigned int flags, CUdevic
     check_device(s, dev);
     uintptr_t h = make_handle(s, kTagCtx);
     s.contexts[h] = dev;
-    s.ctx_stack.push_back(h);  // cuCtxCreate makes the new context current
+    ctx_stack().push_back(h);  // cuCtxCreate makes the new context current
     *pctx = reinterpret_cast<CUcontext>(h);
     return CUDA_SUCCESS;
   });
@@ -638,7 +634,7 @@ VGPU_EXPORT CUresult cuCtxDestroy_v2(CUcontext ctx) {
   return api("cuCtxDestroy", true, false, [&](ShimState& s) {
     uintptr_t h = check_handle(reinterpret_cast<uintptr_t>(ctx), kTagCtx, "context");
     if (!s.contexts.erase(h)) return CUDA_ERROR_INVALID_CONTEXT;
-    std::erase(s.ctx_stack, h);
+    std::erase(ctx_stack(), h);
     return CUDA_SUCCESS;
   });
 }
@@ -647,15 +643,15 @@ VGPU_EXPORT CUresult cuCtxDestroy(CUcontext ctx) { return cuCtxDestroy_v2(ctx); 
 VGPU_EXPORT CUresult cuCtxSetCurrent(CUcontext ctx) {
   return api("cuCtxSetCurrent", true, false, [&](ShimState& s) {
     if (!ctx) {  // NULL pops/clears the current context binding
-      if (!s.ctx_stack.empty()) s.ctx_stack.pop_back();
+      if (!ctx_stack().empty()) ctx_stack().pop_back();
       return CUDA_SUCCESS;
     }
     uintptr_t h = check_handle(reinterpret_cast<uintptr_t>(ctx), kTagCtx, "context");
     if (!s.contexts.count(h)) return CUDA_ERROR_INVALID_CONTEXT;
-    if (!s.ctx_stack.empty())
-      s.ctx_stack.back() = h;
+    if (!ctx_stack().empty())
+      ctx_stack().back() = h;
     else
-      s.ctx_stack.push_back(h);
+      ctx_stack().push_back(h);
     return CUDA_SUCCESS;
   });
 }
@@ -663,7 +659,7 @@ VGPU_EXPORT CUresult cuCtxSetCurrent(CUcontext ctx) {
 VGPU_EXPORT CUresult cuCtxGetCurrent(CUcontext* pctx) {
   return api("cuCtxGetCurrent", true, false, [&](ShimState& s) {
     if (!pctx) return CUDA_ERROR_INVALID_VALUE;
-    *pctx = s.ctx_stack.empty() ? nullptr : reinterpret_cast<CUcontext>(s.ctx_stack.back());
+    *pctx = ctx_stack().empty() ? nullptr : reinterpret_cast<CUcontext>(ctx_stack().back());
     return CUDA_SUCCESS;
   });
 }
@@ -693,15 +689,30 @@ VGPU_EXPORT CUresult cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev) {
       s.contexts[h] = dev;
       it = s.primary_ctx.emplace(dev, h).first;
     }
+    ++s.primary_refs[dev];
     *pctx = reinterpret_cast<CUcontext>(it->second);  // NOTE: does not make it current
     return CUDA_SUCCESS;
   });
 }
 
+// Every retain needs its release, and a release with nothing retained is an
+// error. It used to succeed no matter how many times it was called, which hid
+// the bug a library's own teardown most often has: releasing a primary context
+// it never retained, and so dropping a reference some other component holds.
+// The context handle survives a count of zero -- a later retain gets the same
+// one back -- but cuDevicePrimaryCtxGetState reports it inactive.
 VGPU_EXPORT CUresult cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
   return api("cuDevicePrimaryCtxRelease", true, false, [&](ShimState& s) {
     check_device(s, dev);
-    return CUDA_SUCCESS;  // refcounting is a no-op while contexts share the device state
+    auto it = s.primary_refs.find(dev);
+    if (it == s.primary_refs.end() || it->second == 0) {
+      report("cuDevicePrimaryCtxRelease",
+             "primary context of device " + std::to_string(dev) +
+                 " released more times than it was retained");
+      return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    --it->second;
+    return CUDA_SUCCESS;
   });
 }
 VGPU_EXPORT CUresult cuDevicePrimaryCtxRelease(CUdevice dev) {
@@ -1147,7 +1158,7 @@ VGPU_EXPORT CUresult cuLibraryGetKernel(void** pKernel, void* library, const cha
     auto it = s.libraries.find(h);
     if (it == s.libraries.end()) return CUDA_ERROR_INVALID_VALUE;
     // Validate the kernel exists (parse errors surface here, like a JIT would).
-    int dev = s.ctx_stack.empty() ? 0 : current_device(s);
+    int dev = ctx_stack().empty() ? 0 : current_device(s);
     uint64_t mid = library_module_on(s, h, dev);
     (void)s.rt->device(dev).get_function(mid, name);
     uintptr_t kh = make_handle(s, kTagKernel);
@@ -1308,7 +1319,7 @@ VGPU_EXPORT CUresult cuMemcpyDtoDAsync_v2(CUdeviceptr a, CUdeviceptr b, size_t n
 }
 
 namespace {
-bool is_device_ptr(uint64_t p) { return p >= vgpu::kDeviceVaBase; }
+bool is_device_ptr(uint64_t p) { return vgpu::is_device_va(p); }
 }  // namespace
 
 // Direction-inferring copies (UVA style): device-range vs host pointers.
@@ -1554,16 +1565,16 @@ VGPU_EXPORT CUresult cuCtxPushCurrent_v2(CUcontext ctx) {
   return api("cuCtxPushCurrent", true, false, [&](ShimState& s) {
     uintptr_t h = check_handle(reinterpret_cast<uintptr_t>(ctx), kTagCtx, "context");
     if (!s.contexts.count(h)) return CUDA_ERROR_INVALID_CONTEXT;
-    s.ctx_stack.push_back(h);
+    ctx_stack().push_back(h);
     return CUDA_SUCCESS;
   });
 }
 VGPU_EXPORT CUresult cuCtxPushCurrent(CUcontext ctx) { return cuCtxPushCurrent_v2(ctx); }
 VGPU_EXPORT CUresult cuCtxPopCurrent_v2(CUcontext* pctx) {
   return api("cuCtxPopCurrent", true, false, [&](ShimState& s) {
-    if (s.ctx_stack.empty()) return CUDA_ERROR_INVALID_CONTEXT;
-    if (pctx) *pctx = reinterpret_cast<CUcontext>(s.ctx_stack.back());
-    s.ctx_stack.pop_back();
+    if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
+    if (pctx) *pctx = reinterpret_cast<CUcontext>(ctx_stack().back());
+    ctx_stack().pop_back();
     return CUDA_SUCCESS;
   });
 }
@@ -1605,7 +1616,8 @@ VGPU_EXPORT CUresult cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int* flag
   return api("cuDevicePrimaryCtxGetState", true, false, [&](ShimState& s) {
     check_device(s, dev);
     if (flags) *flags = 0;
-    if (active) *active = s.primary_ctx.count(dev) ? 1 : 0;
+    const auto refs = s.primary_refs.find(dev);
+    if (active) *active = refs != s.primary_refs.end() && refs->second > 0 ? 1 : 0;
     return CUDA_SUCCESS;
   });
 }
@@ -1648,7 +1660,7 @@ VGPU_EXPORT CUresult cuDeviceCanAccessPeer(int* can, CUdevice, CUdevice) {
 
 VGPU_EXPORT CUresult cuPointerGetAttribute(void* data, int attribute, CUdeviceptr ptr) {
   if (!data) return CUDA_ERROR_INVALID_VALUE;
-  bool dev = ptr >= vgpu::kDeviceVaBase;
+  bool dev = vgpu::is_device_va(ptr);
   switch (attribute) {
     case 1: {  // CU_POINTER_ATTRIBUTE_CONTEXT
       if (!dev) return CUDA_ERROR_INVALID_VALUE;

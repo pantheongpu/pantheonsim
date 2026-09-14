@@ -124,8 +124,10 @@ The threads CI job runs the whole suite under ThreadSanitizer to hold this.
 
 ### D3. Virtual memory is sparse, monotonic, and paranoid
 
-- Device VAs live at `0x7fff'0000'0000+`, far from host pointers; a host
-  pointer passed as a device pointer is diagnosed by range.
+- Device VAs live in 16 one-TiB windows from `0x2000'0000'0000`, clear of the
+  stack and shared libraries (`0x7f…`), a program and its heap (`0x55…`) and
+  the engine's private windows (`0x6ff…`); a host pointer passed as a device
+  pointer is diagnosed by range, and the range is bounded on both sides.
 - Backing is 64 KiB chunks materialized on first write: profiles can claim
   any VRAM size regardless of host RAM. Untouched device memory reads as
   **zero, deterministically** (real GPUs: undefined — documented divergence).
