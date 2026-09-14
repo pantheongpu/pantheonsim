@@ -2223,7 +2223,7 @@ class Interpreter {
             // Global is everything that is a device address and not one of the
             // engine's private windows. Answering "not shared and not local"
             // would also claim a null pointer is global.
-            in_space = v >= kDeviceVaBase && !(v >= kSharedVaBase && v < kSharedVaBase + kSharedVaSize) &&
+            in_space = is_device_va(v) && !(v >= kSharedVaBase && v < kSharedVaBase + kSharedVaSize) &&
                        !(v >= kLocalVaBase && v < kLocalVaBase + kLocalVaSize) &&
                        !(v >= kParamVaBase && v < kParamVaBase + kParamVaSize);
             break;

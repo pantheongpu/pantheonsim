@@ -10,6 +10,7 @@
 #include <cuda.h>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #define CK(x) do { CUresult r_ = (x); if (r_ != CUDA_SUCCESS) { \
@@ -207,6 +208,56 @@ int main() {
   CK(cuMemGetAddressRange(&base, &size, buf + 16));
   printf("address range covers the pointer: %s\n",
          (base == buf && size == n * sizeof(int)) ? "yes" : "no");
+
+  // The current context belongs to the calling thread: a new thread starts
+  // with none, and what it pushes stays on its own stack. The stack used to be
+  // shared by the whole process.
+  CUcontext mine = nullptr, seen = reinterpret_cast<CUcontext>(1), still = nullptr;
+  CK(cuCtxGetCurrent(&mine));
+  CUresult pushed = CUDA_ERROR_UNKNOWN;
+  std::thread([&] {
+    cuCtxGetCurrent(&seen);
+    pushed = cuCtxPushCurrent(mine);
+  }).join();
+  CK(cuCtxGetCurrent(&still));
+  if (seen != nullptr || pushed != CUDA_SUCCESS || still != mine) {
+    printf("FAIL context stack shared between threads: new thread saw %p\n", (void*)seen);
+    return 1;
+  }
+
+  // Primary contexts are reference counted; releasing more than was retained
+  // is an error. It used to succeed however often it was called.
+  CUcontext primary = nullptr;
+  CK(cuDevicePrimaryCtxRetain(&primary, 0));
+  CUresult rel = CUDA_SUCCESS;
+  int releases = 0;
+  while ((rel = cuDevicePrimaryCtxRelease(0)) == CUDA_SUCCESS && releases < 100) ++releases;
+  unsigned int pflags = 0;
+  int active = -1;
+  CK(cuDevicePrimaryCtxGetState(0, &pflags, &active));
+  if (releases < 1 || rel != CUDA_ERROR_INVALID_CONTEXT || active != 0) {
+    printf("FAIL primary context over-release: %d releases, then %d, active %d\n", releases,
+           (int)rel, active);
+    return 1;
+  }
+
+  // Every code cuda.h declares has a name and a description; an undeclared
+  // one is CUDA_ERROR_INVALID_VALUE with NULL. Several real codes used to be
+  // reported as undeclared.
+  for (int code : {4, 5, 6, 100, 200, 300, 400, 600, 704}) {
+    const char* nm = nullptr;
+    const char* str = nullptr;
+    if (cuGetErrorName(static_cast<CUresult>(code), &nm) != CUDA_SUCCESS || !nm ||
+        cuGetErrorString(static_cast<CUresult>(code), &str) != CUDA_SUCCESS || !str) {
+      printf("FAIL cuGetErrorName/cuGetErrorString(%d)\n", code);
+      return 1;
+    }
+  }
+  const char* none = "not reset";
+  if (cuGetErrorName(static_cast<CUresult>(12345), &none) != CUDA_ERROR_INVALID_VALUE || none) {
+    printf("FAIL an undeclared code has a name\n");
+    return 1;
+  }
 
   CK(cuMemFree(buf));
   CK(cuModuleUnload(mod));

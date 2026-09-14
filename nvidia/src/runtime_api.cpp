@@ -33,12 +33,15 @@
 #include <cstring>
 #include <functional>
 #include <dlfcn.h>
+#include <atomic>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "error_names.hpp"
 #include "fatbin.hpp"
 // cudaDeviceProp is filled in by this shim and read by the application, so
 // both sides must agree on its layout. The original failure was a stale
@@ -112,23 +115,74 @@ struct VarInfo {
   bool is_constant = false;
 };
 
+// A host buffer the runtime allocated or was handed, and the device that was
+// current when that happened -- which is the device a cudaDeviceReset of that
+// device releases it with.
+struct HostRange {
+  size_t size = 0;
+  int device = 0;
+};
+
 struct State {
   std::recursive_mutex mu;
   std::unique_ptr<vgpu::runtime::Runtime> rt;
-  int current_device = 0;
   std::vector<std::unique_ptr<RegisteredModule>> modules;
   std::unordered_map<const void*, KernelInfo> kernels;  // host stub ptr -> kernel
   std::unordered_map<const void*, VarInfo> vars;        // host shadow ptr -> device symbol
-  std::map<void*, size_t> host_allocs;
+  // cudaMallocHost / cudaHostAlloc results. cudaFreeHost consults this before
+  // it frees anything: it used to hand whatever it was given to free(), so a
+  // malloc'd pointer, a device pointer or a second free took the process down
+  // inside the allocator instead of returning cudaErrorInvalidValue.
+  std::map<void*, HostRange> host_allocs;
   // Managed allocations, kept apart from host_allocs because freeing one has
   // to unmap it from the device side as well.
-  std::map<void*, size_t> managed_allocs;
+  std::map<void*, HostRange> managed_allocs;
+  // cudaHostRegister'd ranges. The memory is the caller's; only the record
+  // and the device mapping are ours.
+  std::map<void*, HostRange> registered;
+  // Enabled peer mappings as (accessing device, peer device). Direction
+  // matters: enabling 0 -> 1 says nothing about 1 -> 0.
+  std::set<std::pair<int, int>> peer_access;
   bool initialized = false;
 };
 
 State& st() {
   static State s;
   return s;
+}
+
+// The device cudaSetDevice selected, for the calling host thread only. CUDA
+// documents the current device as per-thread state, with every new thread
+// starting on device 0. This was a field of the process-wide State, so a worker
+// thread that called cudaSetDevice(1) silently moved the main thread's next
+// allocation and launch onto device 1 -- the usual one-thread-per-GPU pattern
+// then raced on a single variable.
+thread_local int t_current_device = 0;
+
+// The first mapped host range in `m` containing `p`, or m.end().
+std::map<void*, HostRange>::iterator find_range(std::map<void*, HostRange>& m, const void* p) {
+  auto it = m.upper_bound(const_cast<void*>(p));
+  if (it == m.begin()) return m.end();
+  --it;
+  const bool inside = static_cast<const char*>(p) <
+                      static_cast<const char*>(it->first) + std::max<size_t>(it->second.size, 1);
+  return inside ? it : m.end();
+}
+
+// Pinned, managed and registered host memory are addressable by kernels on
+// every device, at their host address -- that is what unified addressing
+// promises, and what cudaPointerGetAttributes reports. Mapping only on the
+// device that happened to be current made a managed buffer allocated with
+// device 0 current an illegal address on device 1, and unmapping only on the
+// current device left a freed buffer mapped on the others, where a kernel
+// could still write into memory the allocator had taken back.
+void map_host_everywhere(State& s, void* p, size_t n) {
+  for (int d = 0; d < s.rt->device_count(); ++d)
+    s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, std::max<size_t>(n, 1));
+}
+void unmap_host_everywhere(State& s, void* p) {
+  for (int d = 0; d < s.rt->device_count(); ++d)
+    s.rt->device(d).memory().unmap_host(reinterpret_cast<uint64_t>(p));
 }
 
 // The driver shim keeps its own initialization flag, and a program that mixes
@@ -167,6 +221,14 @@ void ensure_init(State& s) {
 // Sticky last error, per the runtime API contract.
 thread_local cudaError_t g_last_error = cudaSuccess;
 
+// The failure of a kernel launch, as opposed to any other call that was
+// refused. On hardware a kernel runs after its launch has returned, so this is
+// what cudaDeviceSynchronize exists to report -- and a launch that could not
+// run at all (a sampling mode refused, a kernel with no PTX) must not look
+// like work that finished. Here it is recorded when the launch returns, and
+// kept until cudaGetLastError collects it, like the last error.
+thread_local cudaError_t g_async_error = cudaSuccess;
+
 // A context a kernel has corrupted. CUDA documents an illegal address, an
 // illegal instruction and a device-side assert as leaving the context unusable:
 // every later call fails the same way until the device is reset. This used to
@@ -174,15 +236,24 @@ thread_local cudaError_t g_last_error = cudaSuccess;
 // written past its allocation -- so a program that did not check the launch
 // carried on computing with whatever the dead kernel had left behind, which on
 // hardware it could not have done. Per process, like the context it models.
-cudaError_t g_sticky_error = cudaSuccess;
+//
+// Atomic because it is read without the state lock -- cudaGetLastError,
+// cudaPeekAtLastError and cudaDeviceSynchronize take none -- while a launch on
+// another thread may be setting it. As a plain global that was a data race.
+std::atomic<cudaError_t> g_sticky_error{cudaSuccess};
+
+// Whether an error arose inside a running kernel rather than in the host call.
+bool in_kernel(const char* api) {
+  return std::strncmp(api, "cudaLaunch", 10) == 0 ||
+         std::strncmp(api, "cudaGraphLaunch", 15) == 0;
+}
 
 // Only faults inside a kernel poison the context. The same codes from a host
 // call -- a cudaMemcpy past the end of a buffer -- are argument errors, and a
 // data race is this simulator's own finding, not a condition hardware has.
 bool poisons_context(const char* api, vgpu::Err e) {
   using vgpu::Err;
-  const bool in_kernel = std::strncmp(api, "cudaLaunch", 10) == 0 ||
-                         std::strncmp(api, "cudaGraphLaunch", 15) == 0;
+  const bool kernel = in_kernel(api);
   switch (e) {
     case Err::InvalidPointer:
     case Err::UseAfterFree:
@@ -191,7 +262,7 @@ bool poisons_context(const char* api, vgpu::Err e) {
     case Err::UninitializedRegister:
     case Err::Trap:
     case Err::DeviceAssert:
-      return in_kernel;
+      return kernel;
     default:
       return false;
   }
@@ -208,10 +279,19 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
     case Err::Unsupported: code = cudaErrorNotSupported; break;
     case Err::NotFound: code = cudaErrorInvalidDeviceFunction; break;
     case Err::ExecLimit: code = cudaErrorLaunchTimeout; break;
+    // A bad pointer is an illegal address only when a kernel dereferenced it.
+    // Handed to a host call -- a stack address to cudaFree, a host buffer to a
+    // copy whose kind says device, a peer copy with its devices swapped -- it
+    // is an argument the call refuses, and the documented answer is
+    // cudaErrorInvalidValue, which the driver shim already gave. Reporting 700
+    // for those sent people hunting a kernel fault in programs whose kernels
+    // were fine.
     case Err::InvalidPointer:
     case Err::UseAfterFree:
     case Err::OutOfBounds:
     case Err::MisalignedAccess:
+      code = in_kernel(api) ? cudaErrorIllegalAddress : cudaErrorInvalidValue;
+      break;
     case Err::UninitializedRegister: code = cudaErrorIllegalAddress; break;
     // "trap" is what a failed device assert and an unreachable path compile to,
     // and hardware surfaces it as an illegal instruction.
@@ -231,13 +311,13 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
     default: code = cudaErrorInvalidValue; break;
   }
   (void)s;
-  if (poisons_context(api, e.code())) g_sticky_error = code;
+  if (poisons_context(api, e.code())) g_sticky_error.store(code);
   if (!quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", api, e.what());
   g_last_error = code;
   return code;
 }
 
-vgpu::runtime::Device& current(State& s) { return s.rt->device(s.current_device); }
+vgpu::runtime::Device& current(State& s) { return s.rt->device(t_current_device); }
 
 // The memory of whichever device owns this pointer. Device VA windows are
 // disjoint, so the address alone identifies the owner; falling back to the
@@ -252,7 +332,7 @@ vgpu::MemoryManager& owner_memory(State& s, const void* p) {
 
 // Loads (once) the runtime module for a registered fatbin on the current device.
 uint64_t module_on_current(State& s, RegisteredModule& m) {
-  int dev = s.current_device;
+  int dev = t_current_device;
   auto it = m.module_per_device.find(dev);
   if (it != m.module_per_device.end()) return it->second;
   uint64_t mid = s.rt->device(dev).load_module(m.ptx);
@@ -266,9 +346,9 @@ cudaError_t guard(const char* api, F&& body) {
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   try {
     ensure_init(s);
-    if (g_sticky_error != cudaSuccess) {
-      g_last_error = g_sticky_error;
-      return g_sticky_error;
+    if (const cudaError_t sticky = g_sticky_error.load(); sticky != cudaSuccess) {
+      g_last_error = sticky;
+      return sticky;
     }
     cudaError_t rc = body(s);
     if (rc != cudaSuccess) g_last_error = rc;
@@ -283,7 +363,7 @@ cudaError_t guard(const char* api, F&& body) {
 }
 
 bool is_device_ptr(const void* p) {
-  return reinterpret_cast<uint64_t>(p) >= vgpu::kDeviceVaBase;
+  return vgpu::is_device_va(reinterpret_cast<uint64_t>(p));
 }
 
 // Pending chevron launch configuration, pushed by __cudaPushCallConfiguration
@@ -598,7 +678,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
                                       dim3 blockDim, void** args, size_t sharedMem,
                                       cudaStream_t stream, bool cooperative,
                                       std::array<uint32_t, 3> cluster = {0, 0, 0}) {
-  return guard(api, [&](State& s) -> cudaError_t {
+  const cudaError_t rc = guard(api, [&](State& s) -> cudaError_t {
     auto it = s.kernels.find(func);
     if (it == s.kernels.end()) {
       if (!quiet())
@@ -690,7 +770,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       ev.kind = vgpu::profiling::EventKind::Kernel;
       ev.start_ns = t0;
       ev.end_ns = vgpu::profiling::now_ns();
-      ev.device = static_cast<uint32_t>(s.current_device);
+      ev.device = static_cast<uint32_t>(t_current_device);
       ev.correlation = vgpu::profiling::next_correlation();
       ev.stream = reinterpret_cast<uint64_t>(stream);
       ev.name = ki.entry_name;
@@ -701,6 +781,8 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     }
     return cudaSuccess;
   });
+  if (rc != cudaSuccess) g_async_error = rc;  // see g_async_error
+  return rc;
 }
 
 VGPU_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args,
@@ -751,7 +833,7 @@ VGPU_EXPORT cudaError_t cudaGetDeviceCount(int* count) {
 VGPU_EXPORT cudaError_t cudaSetDevice(int device) {
   return guard("cudaSetDevice", [&](State& s) {
     if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
-    s.current_device = device;
+    t_current_device = device;
     return cudaSuccess;
   });
 }
@@ -759,7 +841,7 @@ VGPU_EXPORT cudaError_t cudaSetDevice(int device) {
 VGPU_EXPORT cudaError_t cudaGetDevice(int* device) {
   return guard("cudaGetDevice", [&](State& s) {
     if (!device) return cudaErrorInvalidValue;
-    *device = s.current_device;
+    *device = t_current_device;
     return cudaSuccess;
   });
 }
@@ -787,12 +869,62 @@ VGPU_EXPORT cudaError_t cudaDeviceSynchronize(void) {
   // that had died on an illegal address reported success. Every launch here is
   // synchronous, so by the time this is called the error is already recorded;
   // there is nothing to wait for and nothing to consume.
-  return g_sticky_error != cudaSuccess ? g_sticky_error : g_last_error;
+  //
+  // What it reports is the failure of launched work -- a sticky fault, or a
+  // launch that failed without poisoning the context -- and nothing else. It
+  // used to return the last error of any kind, so after a cudaMalloc refused
+  // with out-of-memory, a synchronize with no kernel in sight reported
+  // cudaErrorMemoryAllocation. A refused call is reported by that call and by
+  // cudaGetLastError, not by synchronization.
+  const cudaError_t sticky = g_sticky_error.load();
+  return sticky != cudaSuccess ? sticky : g_async_error;
 }
-// The one way out of a corrupted context, as on hardware.
+
+static void forget_arrays_on(int device);
+
+// The one way out of a corrupted context, as on hardware -- and, as documented,
+// the end of everything the current device holds: cudaMalloc, pitched and array
+// allocations, loaded modules and texture objects, the pinned, managed and
+// registered host memory set up with it current, and its peer mappings. This
+// used to clear the error and release nothing, so a test harness that reset
+// between cases grew without bound, cudaMemGetInfo never recovered, and a
+// pointer from before the reset still freed successfully afterwards.
+//
+// Not through guard(): a reset is exactly the call a sticky error must not
+// refuse.
 VGPU_EXPORT cudaError_t cudaDeviceReset(void) {
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
   g_last_error = cudaSuccess;
-  g_sticky_error = cudaSuccess;
+  g_async_error = cudaSuccess;
+  g_sticky_error.store(cudaSuccess);
+  if (!s.initialized) return cudaSuccess;  // nothing was ever set up
+  const int dev = t_current_device;
+  auto release = [&](std::map<void*, HostRange>& m, bool ours) {
+    for (auto it = m.begin(); it != m.end();) {
+      if (it->second.device != dev) {
+        ++it;
+        continue;
+      }
+      unmap_host_everywhere(s, it->first);
+      if (ours) std::free(it->first);  // registered memory belongs to the caller
+      it = m.erase(it);
+    }
+  };
+  release(s.host_allocs, true);
+  release(s.managed_allocs, true);
+  release(s.registered, false);
+  std::erase_if(s.peer_access,
+                [dev](const std::pair<int, int>& p) { return p.first == dev || p.second == dev; });
+  // Registered fatbins load again on the next launch, as they would into a
+  // freshly created context.
+  for (auto& m : s.modules) m->module_per_device.erase(dev);
+  forget_arrays_on(dev);
+  try {
+    s.rt->device(dev).reset();
+  } catch (const std::exception& e) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] cudaDeviceReset: %s\n", e.what());
+  }
   return cudaSuccess;
 }
 VGPU_EXPORT cudaError_t cudaThreadSynchronize(void) { return cudaDeviceSynchronize(); }
@@ -900,7 +1032,9 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, 
       case cudaDevAttrAsyncEngineCount: *value = 1; break;
       case cudaDevAttrIntegrated: *value = 0; break;
       case cudaDevAttrEccEnabled: *value = 0; break;
-      case cudaDevAttrCanMapHostMemory: *value = 0; break;
+      // Pinned and registered host memory is mapped into every device at its
+      // host address; see cudaHostGetDevicePointer.
+      case cudaDevAttrCanMapHostMemory: *value = 1; break;
       case cudaDevAttrManagedMemory: *value = 1; break;
       // Grid-wide sync works under cudaLaunchCooperativeKernel; the
       // multi-device form does not.
@@ -1027,14 +1161,31 @@ VGPU_EXPORT cudaError_t cudaDeviceCanAccessPeer(int* can, int device, int peerDe
     return cudaSuccess;
   });
 }
-VGPU_EXPORT cudaError_t cudaDeviceEnablePeerAccess(int peerDevice, unsigned int) {
-  return guard("cudaDeviceEnablePeerAccess", [&](State& s) {
+// Peer mappings are implicit in this engine -- every device window is reachable
+// from every kernel -- but whether one has been enabled is state a program can
+// observe, and callers act on the documented answers: enabling twice is
+// cudaErrorPeerAccessAlreadyEnabled, which frameworks deliberately tolerate,
+// and disabling what was never enabled is cudaErrorPeerAccessNotEnabled. Both
+// used to succeed unconditionally, whatever the flags, and so did disabling a
+// device that does not exist.
+VGPU_EXPORT cudaError_t cudaDeviceEnablePeerAccess(int peerDevice, unsigned int flags) {
+  return guard("cudaDeviceEnablePeerAccess", [&](State& s) -> cudaError_t {
     if (peerDevice < 0 || peerDevice >= s.rt->device_count()) return cudaErrorInvalidDevice;
-    if (peerDevice == s.current_device) return cudaErrorInvalidDevice;
-    return cudaSuccess;  // peer mappings are implicit in this engine
+    // A device is not its own peer; cudaDeviceCanAccessPeer says so.
+    if (peerDevice == t_current_device) return cudaErrorInvalidDevice;
+    if (flags != 0) return cudaErrorInvalidValue;  // reserved, must be 0
+    if (!s.peer_access.emplace(t_current_device, peerDevice).second)
+      return cudaErrorPeerAccessAlreadyEnabled;
+    return cudaSuccess;
   });
 }
-VGPU_EXPORT cudaError_t cudaDeviceDisablePeerAccess(int) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaDeviceDisablePeerAccess(int peerDevice) {
+  return guard("cudaDeviceDisablePeerAccess", [&](State& s) -> cudaError_t {
+    if (peerDevice < 0 || peerDevice >= s.rt->device_count()) return cudaErrorInvalidDevice;
+    if (!s.peer_access.erase({t_current_device, peerDevice})) return cudaErrorPeerAccessNotEnabled;
+    return cudaSuccess;
+  });
+}
 
 // Copies between two virtual devices' memories. Device pointers are only
 // meaningful on their own device, so each side is resolved against its own
@@ -1099,7 +1250,7 @@ VGPU_EXPORT cudaError_t cudaFree(void* ptr) {
     // pointer this process has given back to the allocator.
     auto mit = s.managed_allocs.find(ptr);
     if (mit != s.managed_allocs.end()) {
-      current(s).memory().unmap_host(reinterpret_cast<uint64_t>(ptr));
+      unmap_host_everywhere(s, ptr);
       s.managed_allocs.erase(mit);
       std::free(ptr);
       return cudaSuccess;
@@ -1160,7 +1311,7 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
       ev.start_ns = ev.end_ns - static_cast<uint64_t>(
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                                         _t1 - _t0).count());
-      ev.device = static_cast<uint32_t>(s.current_device);
+      ev.device = static_cast<uint32_t>(t_current_device);
       ev.correlation = vgpu::profiling::next_correlation();
       ev.bytes = count;
       ev.copy_kind = static_cast<uint32_t>(kind);
@@ -1244,11 +1395,15 @@ VGPU_EXPORT cudaError_t cudaMemset2DAsync(void* dst, size_t pitch, int value, si
 
 
 VGPU_EXPORT cudaError_t cudaMallocHost(void** ptr, size_t size) {
-  return guard("cudaMallocHost", [&](State&) {
+  return guard("cudaMallocHost", [&](State& s) -> cudaError_t {
     if (!ptr) return cudaErrorInvalidValue;
-    void* p = std::aligned_alloc(4096, (size + 4095) / 4096 * 4096);
+    const size_t n = size ? size : 1;
+    void* p = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
     if (!p) return cudaErrorMemoryAllocation;
-    st().host_allocs[p] = size;
+    s.host_allocs[p] = HostRange{n, t_current_device};
+    // Pinned memory is device-addressable under unified addressing, at its
+    // host address; see cudaHostGetDevicePointer.
+    map_host_everywhere(s, p, n);
     *ptr = p;
     return cudaSuccess;
   });
@@ -1257,9 +1412,22 @@ VGPU_EXPORT cudaError_t cudaHostAlloc(void** ptr, size_t size, unsigned int) {
   return cudaMallocHost(ptr, size);
 }
 VGPU_EXPORT cudaError_t cudaFreeHost(void* ptr) {
-  return guard("cudaFreeHost", [&](State& s) {
+  return guard("cudaFreeHost", [&](State& s) -> cudaError_t {
     if (!ptr) return cudaSuccess;
-    s.host_allocs.erase(ptr);
+    // Only a base pointer this runtime handed out, and only once. Anything
+    // else used to go straight to free(): a malloc'd pointer aborted inside
+    // glibc, a device pointer segfaulted, and a second free corrupted the heap.
+    auto it = s.host_allocs.find(ptr);
+    if (it == s.host_allocs.end()) {
+      if (!quiet())
+        std::fprintf(stderr,
+                     "[vgpu] cudaFreeHost: %p was not returned by cudaMallocHost or cudaHostAlloc, "
+                     "or has already been freed\n",
+                     ptr);
+      return cudaErrorInvalidValue;
+    }
+    unmap_host_everywhere(s, ptr);
+    s.host_allocs.erase(it);
     std::free(ptr);
     return cudaSuccess;
   });
@@ -1333,20 +1501,59 @@ VGPU_EXPORT cudaError_t cudaMemPoolSetAccess(cudaMemPool_t, const cudaMemAccessD
 }
 VGPU_EXPORT cudaError_t cudaMemPoolTrimTo(cudaMemPool_t, size_t) { return cudaSuccess; }
 
-// Page-locking host memory changes nothing when the "device" shares the host's
-// address space, so registration succeeds and maps to the same pointer.
-VGPU_EXPORT cudaError_t cudaHostRegister(void* p, size_t, unsigned int) {
-  return p ? cudaSuccess : cudaErrorInvalidValue;
+// Page-locking changes nothing when the "device" shares the host's memory, but
+// a registration is still state: it makes the range device-addressable, it is
+// what cudaPointerGetAttributes reports, and the documented errors depend on
+// it. These used to succeed for anything non-NULL, so registering twice,
+// unregistering what was never registered, and asking what registered memory
+// was all got answers no driver gives.
+VGPU_EXPORT cudaError_t cudaHostRegister(void* p, size_t size, unsigned int) {
+  return guard("cudaHostRegister", [&](State& s) -> cudaError_t {
+    if (!p || size == 0) return cudaErrorInvalidValue;
+    const char* lo = static_cast<const char*>(p);
+    void* hi = static_cast<char*>(p) + size;
+    // Any overlap with a registered range, or with memory CUDA already pins,
+    // is "already registered". Ranges in each map are disjoint, so the one
+    // starting last below `hi` is the only one that can reach past `lo`.
+    auto overlaps = [&](const std::map<void*, HostRange>& m) {
+      auto it = m.lower_bound(hi);
+      if (it == m.begin()) return false;
+      --it;
+      return static_cast<const char*>(it->first) + std::max<size_t>(it->second.size, 1) > lo;
+    };
+    if (overlaps(s.registered) || overlaps(s.host_allocs) || overlaps(s.managed_allocs))
+      return cudaErrorHostMemoryAlreadyRegistered;
+    s.registered[p] = HostRange{size, t_current_device};
+    map_host_everywhere(s, p, size);
+    return cudaSuccess;
+  });
 }
 VGPU_EXPORT cudaError_t cudaHostUnregister(void* p) {
-  return p ? cudaSuccess : cudaErrorInvalidValue;
+  return guard("cudaHostUnregister", [&](State& s) -> cudaError_t {
+    if (!p) return cudaErrorInvalidValue;
+    auto it = s.registered.find(p);
+    if (it == s.registered.end()) return cudaErrorHostMemoryNotRegistered;
+    unmap_host_everywhere(s, p);
+    s.registered.erase(it);
+    return cudaSuccess;
+  });
 }
-VGPU_EXPORT cudaError_t cudaHostGetDevicePointer(void** dev, void* host, unsigned int) {
-  if (!dev || !host) return cudaErrorInvalidValue;
-  // Host allocations are not addressable by device code here: a kernel would
-  // resolve the pointer against device memory and read the wrong bytes. Say so
-  // rather than hand back something that appears to work.
-  return cudaErrorInvalidValue;
+// Under unified addressing, memory CUDA pins or registers is reachable from
+// every device at its host address, and that is the device pointer -- the same
+// one cudaPointerGetAttributes reports. This used to refuse even
+// cudaHostAllocMapped memory, which exists to be asked this, while the
+// attributes call named the host address as the device pointer; a kernel given
+// that pointer then failed with an illegal address, because nothing had
+// mapped it.
+VGPU_EXPORT cudaError_t cudaHostGetDevicePointer(void** dev, void* host, unsigned int flags) {
+  return guard("cudaHostGetDevicePointer", [&](State& s) -> cudaError_t {
+    if (!dev || !host || flags != 0) return cudaErrorInvalidValue;
+    if (find_range(s.host_allocs, host) == s.host_allocs.end() &&
+        find_range(s.registered, host) == s.registered.end())
+      return cudaErrorInvalidValue;
+    *dev = host;
+    return cudaSuccess;
+  });
 }
 
 // Where a pointer lives. Frameworks branch on this to pick a copy path, so
@@ -1356,34 +1563,48 @@ VGPU_EXPORT cudaError_t cudaPointerGetAttributes(cudaPointerAttributes* attr, co
     if (!attr) return cudaErrorInvalidValue;
     std::memset(attr, 0, sizeof *attr);
     const uint64_t a = reinterpret_cast<uint64_t>(p);
-    if (a >= vgpu::kDeviceVaBase) {
-      attr->type = cudaMemoryTypeDevice;
-      attr->device = static_cast<int>((a - vgpu::kDeviceVaBase) / vgpu::kDeviceVaStride);
-      attr->devicePointer = const_cast<void*>(p);
-    } else {
-      // Pinned and managed allocations are host addresses too, and callers
-      // branch on the difference: a framework picks a zero-copy path for a
-      // pinned buffer and a migration path for a managed one. Both used to come
-      // back "unregistered", as if nobody had allocated them through CUDA.
-      auto inside = [p](const std::map<void*, size_t>& allocs) {
-        auto it = allocs.upper_bound(const_cast<void*>(p));
-        if (it == allocs.begin()) return false;
-        --it;
-        return static_cast<const char*>(p) <
-               static_cast<const char*>(it->first) + std::max<size_t>(it->second, 1);
-      };
-      attr->device = st.current_device;
+    // Pinned, registered and managed allocations are host addresses, and
+    // callers branch on the difference: a framework picks a zero-copy path for
+    // a pinned buffer and a migration path for a managed one. Each is
+    // addressable by kernels at the same address, as with UVA.
+    auto host_kind = [&](std::map<void*, HostRange>& m, cudaMemoryType type) {
+      auto it = find_range(m, p);
+      if (it == m.end()) return false;
+      attr->type = type;
+      attr->device = it->second.device;
       attr->hostPointer = const_cast<void*>(p);
-      if (inside(st.managed_allocs)) {
-        attr->type = cudaMemoryTypeManaged;
-        attr->devicePointer = const_cast<void*>(p);   // one address, as with UVA
-      } else if (inside(st.host_allocs)) {
-        attr->type = cudaMemoryTypeHost;
-        attr->devicePointer = const_cast<void*>(p);   // mapped at the same address
-      } else {
-        attr->type = cudaMemoryTypeUnregistered;
+      attr->devicePointer = const_cast<void*>(p);
+      return true;
+    };
+    if (host_kind(st.managed_allocs, cudaMemoryTypeManaged) ||
+        host_kind(st.host_allocs, cudaMemoryTypeHost) ||
+        host_kind(st.registered, cudaMemoryTypeHost))
+      return cudaSuccess;
+    if (vgpu::is_device_va(a)) {
+      // An address in a device window is a device pointer only while something
+      // is allocated there. This used to answer "device memory" for any address
+      // past the base -- a freed pointer, a random one -- with a device ordinal
+      // computed from it that no rack has, so an is-this-mine check accepted
+      // memory that was gone.
+      const uint64_t ord = (a - vgpu::kDeviceVaBase) / vgpu::kDeviceVaStride;
+      if (ord >= static_cast<uint64_t>(st.rt->device_count()) ||
+          !st.rt->device(static_cast<int>(ord)).memory().find_allocation(a, nullptr, nullptr)) {
+        if (!quiet())
+          std::fprintf(stderr,
+                       "[vgpu] cudaPointerGetAttributes: %p is in the device address range but "
+                       "not inside any live allocation (freed, or never allocated)\n",
+                       p);
+        return cudaErrorInvalidValue;
       }
+      attr->type = cudaMemoryTypeDevice;
+      attr->device = static_cast<int>(ord);
+      attr->devicePointer = const_cast<void*>(p);
+      return cudaSuccess;
     }
+    // Plain host memory CUDA knows nothing about.
+    attr->type = cudaMemoryTypeUnregistered;
+    attr->device = t_current_device;
+    attr->hostPointer = const_cast<void*>(p);
     return cudaSuccess;
   });
 }
@@ -1584,6 +1805,12 @@ cudaError_t fill_from_resource(const cudaResourceDesc* res, vgpu::exec::TextureD
 
 }  // namespace
 
+// The array records of one device, dropped by cudaDeviceReset along with the
+// memory behind them.
+static void forget_arrays_on(int device) {
+  std::erase_if(g_arrays, [device](const auto& kv) { return kv.second.device == device; });
+}
+
 // The templated cudaCreateChannelDesc<T>() in the toolkit header is an inline
 // that calls this, so it has to exist even though it computes nothing that
 // needs a device.
@@ -1611,7 +1838,7 @@ VGPU_EXPORT cudaError_t cudaMallocArray(cudaArray_t* array, const cudaChannelFor
     rec.height = static_cast<uint32_t>(height);
     rec.depth = 0;
     rec.bytes = uint64_t{rec.width} * (rec.height ? rec.height : 1) * rec.texel_bytes;
-    rec.device = s.current_device;
+    rec.device = t_current_device;
     rec.base = current(s).memory().alloc(rec.bytes);
     const uint64_t handle = g_next_array++;
     g_arrays[handle] = rec;
@@ -1771,8 +1998,8 @@ VGPU_EXPORT cudaError_t cudaMallocManaged(void** ptr, size_t size, unsigned int)
     // one place being a simulator makes something *easier*: on hardware
     // managed memory needs page migration between two physical memories, and
     // here there is only one.
-    current(s).memory().map_host(reinterpret_cast<uint64_t>(p), p, n);
-    st().managed_allocs[p] = n;
+    map_host_everywhere(s, p, n);
+    s.managed_allocs[p] = HostRange{n, t_current_device};
     *ptr = p;
     return cudaSuccess;
   });
@@ -1888,23 +2115,74 @@ VGPU_EXPORT cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned 
 }
 // cudaStreamIsCapturing is defined with the CUDA Graph machinery below.
 
-VGPU_EXPORT cudaError_t cudaEventCreate(cudaEvent_t* e) {
-  if (e) *e = reinterpret_cast<cudaEvent_t>(std::malloc(sizeof(long long)));
+// Events keep the host clock at cudaEventRecord. Work is synchronous, so an
+// event is complete the moment it is recorded, and the interval between two is
+// the host time spent between them -- what a program timing a region with
+// events measures on hardware too. This used to report 0 ms for every pair,
+// recorded or not, so a benchmark divided by zero and a timing check could
+// never fail. (The driver shim's cuEvent* already kept timestamps; this is the
+// same record.) Handles are looked up, so a destroyed or made-up event is
+// cudaErrorInvalidResourceHandle rather than a free() of something nobody
+// allocated.
+namespace {
+struct RtEvent {
+  bool timing = true;
+  bool recorded = false;
+  std::chrono::steady_clock::time_point when{};
+};
+std::mutex g_event_mu;
+std::unordered_map<cudaEvent_t, std::unique_ptr<RtEvent>> g_events;
+RtEvent* find_event(cudaEvent_t e) {  // caller holds g_event_mu
+  auto it = g_events.find(e);
+  return it == g_events.end() ? nullptr : it->second.get();
+}
+}  // namespace
+
+VGPU_EXPORT cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned int flags) {
+  if (!e) return cudaErrorInvalidValue;
+  auto rec = std::make_unique<RtEvent>();
+  rec->timing = (flags & cudaEventDisableTiming) == 0;
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  *e = reinterpret_cast<cudaEvent_t>(rec.get());
+  g_events[*e] = std::move(rec);
   return cudaSuccess;
 }
-VGPU_EXPORT cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned int) {
-  return cudaEventCreate(e);
+VGPU_EXPORT cudaError_t cudaEventCreate(cudaEvent_t* e) {
+  return cudaEventCreateWithFlags(e, cudaEventDefault);
 }
-VGPU_EXPORT cudaError_t cudaEventRecord(cudaEvent_t, cudaStream_t) { return cudaSuccess; }
-VGPU_EXPORT cudaError_t cudaEventSynchronize(cudaEvent_t) { return cudaSuccess; }
-VGPU_EXPORT cudaError_t cudaEventQuery(cudaEvent_t) { return cudaSuccess; }
-VGPU_EXPORT cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t, cudaEvent_t) {
-  if (ms) *ms = 0.0f;  // VirtualGPU does not model timing
+VGPU_EXPORT cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t) {
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  RtEvent* r = find_event(e);
+  if (!r) return cudaErrorInvalidResourceHandle;
+  r->recorded = true;
+  r->when = std::chrono::steady_clock::now();
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaEventSynchronize(cudaEvent_t e) {
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  return find_event(e) ? cudaSuccess : cudaErrorInvalidResourceHandle;
+}
+VGPU_EXPORT cudaError_t cudaEventQuery(cudaEvent_t e) {
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  return find_event(e) ? cudaSuccess : cudaErrorInvalidResourceHandle;
+}
+VGPU_EXPORT cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t start, cudaEvent_t end) {
+  if (!ms) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  const RtEvent* a = find_event(start);
+  const RtEvent* b = find_event(end);
+  // Documented: an event never recorded, or created with
+  // cudaEventDisableTiming, is cudaErrorInvalidResourceHandle.
+  // cudaErrorNotReady is for recorded work that has not finished, which a
+  // synchronous engine never leaves behind.
+  if (!a || !b || !a->recorded || !b->recorded || !a->timing || !b->timing)
+    return cudaErrorInvalidResourceHandle;
+  *ms = std::chrono::duration<float, std::milli>(b->when - a->when).count();
   return cudaSuccess;
 }
 VGPU_EXPORT cudaError_t cudaEventDestroy(cudaEvent_t e) {
-  std::free(e);
-  return cudaSuccess;
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  return g_events.erase(e) ? cudaSuccess : cudaErrorInvalidResourceHandle;
 }
 
 /* ===================================================================== */
@@ -1915,64 +2193,28 @@ VGPU_EXPORT cudaError_t cudaEventDestroy(cudaEvent_t e) {
 VGPU_EXPORT cudaError_t cudaGetLastError(void) {
   cudaError_t e = g_last_error;
   g_last_error = cudaSuccess;
-  return g_sticky_error != cudaSuccess ? g_sticky_error : e;
+  g_async_error = cudaSuccess;
+  const cudaError_t sticky = g_sticky_error.load();
+  return sticky != cudaSuccess ? sticky : e;
 }
 VGPU_EXPORT cudaError_t cudaPeekAtLastError(void) {
-  return g_sticky_error != cudaSuccess ? g_sticky_error : g_last_error;
+  const cudaError_t sticky = g_sticky_error.load();
+  return sticky != cudaSuccess ? sticky : g_last_error;
 }
 
-// Both of these must name every code this shim can return. They did not: the
-// tables listed eight of the seventeen, so a program that printed
-// cudaGetErrorName() of a real, correctly-returned error was told
-// "cudaErrorUnknown" -- confidently wrong, and indistinguishable from the
-// simulator having no idea what happened.
+// Both name every code the runtime API declares, from the table shared with
+// the driver shim (error_names.hpp). They used to name only the codes this
+// shim returns, so a program printing the name of a real code it got from a
+// library -- cudaErrorNoDevice, cudaErrorNotReady, cudaErrorPeerAccessAlreadyEnabled
+// -- was told "cudaErrorUnknown", confidently wrong. A code no header declares
+// gets the documented "unrecognized error code".
 VGPU_EXPORT const char* cudaGetErrorString(cudaError_t error) {
-  switch (error) {
-    case cudaSuccess: return "no error";
-    case cudaErrorMemoryAllocation: return "out of memory";
-    case cudaErrorInvalidValue: return "invalid argument";
-    case cudaErrorInvalidDevice: return "invalid device ordinal";
-    case cudaErrorInvalidDeviceFunction: return "invalid device function";
-    case cudaErrorInvalidPtx: return "a PTX JIT compilation failed";
-    case cudaErrorIllegalAddress: return "an illegal memory access was encountered";
-    case cudaErrorLaunchTimeout: return "the launch timed out and was terminated";
-    case cudaErrorNotSupported: return "operation not supported";
-    case cudaErrorInvalidConfiguration: return "invalid configuration argument";
-    case cudaErrorIllegalInstruction: return "an illegal instruction was encountered";
-    case cudaErrorAssert: return "device-side assert triggered";
-    case cudaErrorLaunchFailure: return "unspecified launch failure";
-    case cudaErrorCooperativeLaunchTooLarge:
-      return "too many blocks in cooperative launch";
-    case cudaErrorStreamCaptureImplicit:
-      return "operation would make the legacy stream depend on a capturing stream";
-    case cudaErrorStreamCaptureInvalidated:
-      return "operation failed due to a previous error during capture";
-    case cudaErrorGraphExecUpdateFailure: return "the graph update was not performed";
-    case cudaErrorOperatingSystem: return "OS call failed or operation not supported on this OS";
-    default: return "unknown error";
-  }
+  const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(static_cast<int>(error));
+  return e && e->runtime_name ? e->text : "unrecognized error code";
 }
 VGPU_EXPORT const char* cudaGetErrorName(cudaError_t error) {
-  switch (error) {
-    case cudaSuccess: return "cudaSuccess";
-    case cudaErrorMemoryAllocation: return "cudaErrorMemoryAllocation";
-    case cudaErrorInvalidValue: return "cudaErrorInvalidValue";
-    case cudaErrorInvalidDevice: return "cudaErrorInvalidDevice";
-    case cudaErrorInvalidDeviceFunction: return "cudaErrorInvalidDeviceFunction";
-    case cudaErrorInvalidPtx: return "cudaErrorInvalidPtx";
-    case cudaErrorIllegalAddress: return "cudaErrorIllegalAddress";
-    case cudaErrorNotSupported: return "cudaErrorNotSupported";
-    case cudaErrorLaunchTimeout: return "cudaErrorLaunchTimeout";
-    case cudaErrorInvalidConfiguration: return "cudaErrorInvalidConfiguration";
-    case cudaErrorIllegalInstruction: return "cudaErrorIllegalInstruction";
-    case cudaErrorLaunchFailure: return "cudaErrorLaunchFailure";
-    case cudaErrorCooperativeLaunchTooLarge: return "cudaErrorCooperativeLaunchTooLarge";
-    case cudaErrorStreamCaptureImplicit: return "cudaErrorStreamCaptureImplicit";
-    case cudaErrorStreamCaptureInvalidated: return "cudaErrorStreamCaptureInvalidated";
-    case cudaErrorGraphExecUpdateFailure: return "cudaErrorGraphExecUpdateFailure";
-    case cudaErrorOperatingSystem: return "cudaErrorOperatingSystem";
-    default: return "cudaErrorUnknown";
-  }
+  const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(static_cast<int>(error));
+  return e && e->runtime_name ? e->runtime_name : "unrecognized error code";
 }
 
 VGPU_EXPORT cudaError_t cudaDriverGetVersion(int* v) {

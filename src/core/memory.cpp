@@ -171,9 +171,19 @@ const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t 
                       " is inside the retired address range: the allocation it belonged to was "
                       "freed (older than the ", kQuarantineEntries,
                       "-entry quarantine, so its size is no longer recorded)");
+  // A managed or pinned buffer that has since been freed lives at a host
+  // address, outside every device window; without this a kernel touching it
+  // was told it had a stray host pointer rather than a freed one.
+  if (host_maps_ && !is_device_va(addr)) {
+    std::lock_guard<std::mutex> lock(host_maps_->mu);
+    for (const HostMap& r : host_maps_->retired)
+      if (addr >= r.base && addr - r.base < r.len)
+        throw Error::make(Err::UseAfterFree, op, " at ", Hex{addr}, " touches host buffer ",
+                          Hex{r.base}, " (", r.len, " bytes), which has been freed or unregistered");
+  }
   throw Error::make(Err::InvalidPointer, op, " at ", Hex{addr},
                     ": address is not inside any device allocation",
-                    addr < kDeviceVaBase   ? " (looks like a host pointer, not a device pointer)"
+                    !is_device_va(addr)  ? " (looks like a host pointer, not a device pointer)"
                     : !owns(addr)      ? " (belongs to a different device)"
                                        : "");
 }
@@ -257,7 +267,7 @@ uint64_t MemoryManager::resident_bytes() const {
 
 void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   if (len == 0) return;
-  if (host_maps_) {
+  if (host_maps_ && host_maps_->may_contain(dst)) {
     std::lock_guard<std::mutex> lock(host_maps_->mu);
     if (const HostMap* m = find_host_map_locked(dst, len)) {
       std::memcpy(m->host + (dst - m->base), src, len);
@@ -304,6 +314,15 @@ void MemoryManager::map_host(uint64_t addr, void* host, uint64_t len) {
   if (!host_maps_) host_maps_ = std::make_unique<HostMaps>();
   std::lock_guard<std::mutex> lock(host_maps_->mu);
   host_maps_->maps.push_back(HostMap{addr, len, static_cast<uint8_t*>(host)});
+  // The allocator hands freed host addresses out again, so an old record of a
+  // free at this address now describes someone else's live buffer.
+  std::erase_if(host_maps_->retired, [&](const HostMap& r) {
+    return r.base < addr + len && addr < r.base + r.len;
+  });
+  if (addr < host_maps_->lo.load(std::memory_order_relaxed))
+    host_maps_->lo.store(addr, std::memory_order_relaxed);
+  if (addr + len > host_maps_->hi.load(std::memory_order_relaxed))
+    host_maps_->hi.store(addr + len, std::memory_order_relaxed);
 }
 
 void MemoryManager::unmap_host(uint64_t addr) {
@@ -312,9 +331,19 @@ void MemoryManager::unmap_host(uint64_t addr) {
   auto& v = host_maps_->maps;
   for (size_t i = 0; i < v.size(); ++i)
     if (v[i].base == addr) {
+      auto& retired = host_maps_->retired;
+      if (retired.size() >= kRetiredHostMaps) retired.erase(retired.begin());
+      retired.push_back(HostMap{v[i].base, v[i].len, nullptr});
       v.erase(v.begin() + static_cast<long>(i));
       break;
     }
+}
+
+void MemoryManager::free_all() {
+  std::vector<uint64_t> bases;
+  bases.reserve(live_.size());
+  for (const auto& [base, a] : live_) bases.push_back(base);
+  for (uint64_t base : bases) free(base);
 }
 
 bool MemoryManager::is_host_mapped(uint64_t addr) const {
@@ -326,7 +355,7 @@ bool MemoryManager::is_host_mapped(uint64_t addr) const {
 void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
   if (len == 0) return;
   // Managed memory is the caller's own buffer; there is no chunk table to walk.
-  if (host_maps_) {
+  if (host_maps_ && host_maps_->may_contain(src)) {
     std::lock_guard<std::mutex> lock(host_maps_->mu);
     if (const HostMap* m = find_host_map_locked(src, len)) {
       std::memcpy(dst, m->host + (src - m->base), len);
@@ -438,7 +467,7 @@ MemoryManager::ScalarAt MemoryManager::scalar_location(uint64_t addr, uint32_t s
                                                        const uint64_t* store,
                                                        const uint8_t** where) const {
   const bool create = store != nullptr;
-  if (host_maps_) {
+  if (host_maps_ && host_maps_->may_contain(addr)) {
     std::lock_guard<std::mutex> lock(host_maps_->mu);
     if (find_host_map_locked(addr, size)) return ScalarAt::HostMap;
   }
