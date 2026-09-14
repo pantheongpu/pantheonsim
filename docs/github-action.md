@@ -32,7 +32,8 @@ After it, `nvidia-smi` reports the GPUs you asked for, `nvcc` is the real
 compiler with `-cudart shared` added (so unmodified build systems link the
 runtime the simulator stands in for), and `vgpu run ./program` runs a program on
 the simulated GPUs. `vgpu test --matrix ./program` runs it on every measured
-profile and compares the output.
+profile and compares the output; it exits 3 when a profile's result differs
+and 4 when the program did not run at all (`vgpu test --help`).
 
 ## Inputs
 

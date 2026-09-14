@@ -7,20 +7,13 @@
 # startup on nvmlInternalGetExportTable, an undocumented internal vtable.
 # Tools that use the documented NVML API -- pynvml, DCGM, framework memory
 # queries -- work against build/shim/libnvidia-ml.so.1 normally.)
+#
+# Every argument goes through untouched, --version and -L included. This used
+# to answer those two itself: `-L -i 1` became `smi --list` with the selection
+# dropped, so it listed every GPU, and --version printed text of its own that
+# disagreed with the session's nvidia-smi. `vgpu smi` handles both, in one
+# place, for this script and for the one `vgpu shell` generates.
 here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 vgpu="$here/vgpu"
 [[ -x "$vgpu" ]] || vgpu="$here/../vgpu"
-case "${1:-}" in
-  --version)
-    echo "NVIDIA-SMI version  : VirtualGPU 0.1.0"
-    echo "NVML version        : 13.580.00.00 (VirtualGPU)"
-    echo "DRIVER version      : ${VGPU_DRIVER_VERSION:-580.00.00} (virtual)"
-    exit 0 ;;
-  -L|--list-gpus)
-    exec "$vgpu" smi --list ;;
-esac
-# --query-gpu, --format and -q are passed through rather than collapsed into a
-# fixed CSV: callers ask for particular fields in a particular shape and parse
-# what comes back, so answering a different question is worse than not
-# answering at all.
 exec "$vgpu" smi "$@"

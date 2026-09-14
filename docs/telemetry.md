@@ -93,7 +93,11 @@ correct, not decorative. Each virtual device gets its own bus slot
 AMD profiles (`amd/mi300x`, `amd/mi325x`, `amd/mi350x`) are **discovery only**.
 `rocm-smi`, `rocm_agent_enumerator`, and `lspci` report them correctly, and
 `rocm_agent_enumerator` prints the right ISA targets (`gfx942` for CDNA3,
-`gfx950` for CDNA4). Launching a kernel on one fails with a clear
+`gfx950` for CDNA4). `rocm-smi` takes its documented `-a`, `--showid`,
+`--showproductname`, `--showmeminfo vram`, `--showtemp`, `--showpower`,
+`--showuse`, `-d N`, `--json` and `--csv`, the same inside `vgpu shell` and out.
+Outside a session both tools describe `VGPU_GPU`; with no AMD GPU configured,
+`rocm_agent_enumerator` lists only `gfx000` and says on stderr how to pick one. Launching a kernel on one fails with a clear
 "warp size 64 is unsupported" error — AMD *execution* is not implemented, and
 VirtualGPU says so rather than producing wrong answers. See TODO.md.
 

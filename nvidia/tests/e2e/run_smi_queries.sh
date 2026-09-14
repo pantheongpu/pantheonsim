@@ -61,7 +61,8 @@ expect "topo -m header names each GPU and the affinity columns" \
 expect "topo -m rows: self is X, peers are PHB" "GPU0| X |PHB GPU1|PHB| X " \
   "$(sed -n 2,3p <<< "$topo" | awk -F'\t' '{printf "%s|%s|%s ", $1, $2, $3}' | sed 's/ $//')"
 expect "topo -m has its legend" "yes" "$(grep -q '^  PHB  = ' <<< "$topo" && echo yes || echo no)"
-smi topo >/dev/null 2>&1; expect "topo without -m is refused" "2" "$?"
+smi topo >/dev/null 2>&1; expect "bare topo prints its usage, as nvidia-smi does" "0" "$?"
+smi topo -p2p r >/dev/null 2>&1; expect "a topo form without link data is refused" "2" "$?"
 
 # -q -x: well-formed XML under the real element names.
 if command -v python3 >/dev/null; then
