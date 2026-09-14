@@ -1,0 +1,57 @@
+# VirtualGPU device profile: NVIDIA H200 (SXM).
+#
+# Provenance, because "placeholder" understated this one. The H200 is the same
+# GH100 die as the H100 SXM5 at the same compute capability, so every field the
+# execution model consults -- the whole limits block, the features, the SM
+# count -- is inherited from nvidia/profiles/h100.yaml, which *was* read from a
+# physical card and matches it on 512 conformance values. Diff the two files
+# and the functional part is identical.
+#
+# Three fields were read from no device: vram_bytes, mem_clock_max_mhz and
+# pci_device_id. Only the first is functional; the other two are telemetry,
+# which is presentation and never consulted by the interpreter.
+#
+# verified stays false, and vram_bytes is exactly why. It is the one field that
+# differs between two *physically identical* cards -- an A10 with ECC on reads
+# 1.5 GiB below the same A10 with it off, and two H100 SXM5s differed by 10 MiB
+# of driver reservation. So the single functional value not inherited here is
+# also the single least inferable one, and inheriting the rest correctly does
+# not make it measured. `verified` means read from hardware; it does not mean
+# believed to be right.
+id: nvidia/h200
+vendor: nvidia
+model: "NVIDIA H200"
+architecture: hopper
+compute_capability: "9.0"
+warp_size: 32
+vram_bytes: 151397597184         # 141 GiB HBM3e (marketing "141 GB"; placeholder)
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 232448   # 227 KiB (sm_90)
+  registers_per_block: 65536
+  multiprocessors: 132
+  registers_per_sm: 65536
+  max_threads_per_sm: 2048
+  max_blocks_per_sm: 32
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 233472
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+# Public spec-sheet figures; PCI ids from the public NVIDIA device list.
+telemetry:
+  power_limit_w: 700
+  sm_clock_max_mhz: 1980
+  mem_clock_max_mhz: 3201
+  temperature_max_c: 87
+  pci_vendor_id: 4318          # 0x10DE NVIDIA
+  pci_device_id: 9013        # 0x2335 GH100 [H200 SXM 141GB]

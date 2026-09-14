@@ -168,13 +168,13 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
 
 ## Hardware characterization
 
-`tools/characterize.cu` + `tools/characterize-telemetry.sh` read a physical
+`nvidia/tools/characterize.cu` + `nvidia/tools/characterize-telemetry.sh` read a physical
 device and emit a profile with `verified: true`.
-`tools/characterize-cloud.sh <instance-type> <region>` does the whole thing on
+`nvidia/tools/characterize-cloud.sh <instance-type> <region>` does the whole thing on
 a rented GPU -- launch, characterize, capture conformance references, and
 terminate (termination is registered before launch and then confirmed, because
 an instance left running bills by the hour).
-`tools/compare-profile.py` diffs a measured profile against the one in the
+`nvidia/tools/compare-profile.py` diffs a measured profile against the one in the
 tree, so corrections are visible rather than silently applied.
 
 Verified against real hardware, eleven devices across seven architectures --
@@ -208,7 +208,7 @@ identically: DigitalOcean's AMD image ships `hipcc` but not the HIP development
 headers, so `hip/hip_runtime.h` exists nowhere under `/opt/rocm`. The third run
 dumped `rocminfo`, which was installed all along and reports everything the
 schema needs, and every subsequent iteration was free.
-`tools/rocminfo-to-profile.py` parses it at home for that reason.
+`amd/tools/rocminfo-to-profile.py` parses it at home for that reason.
 
 MI300X was the intended target and is not launchable: a create was attempted in
 all sixteen available DigitalOcean regions and every one answered "Size is not
@@ -239,7 +239,7 @@ still open.
 characterized months apart differ by 1.5 GiB, which is the ECC reservation:
 one had ECC on and the other off. Two H100 SXM5s differ by 10 MiB of
 driver-reserved memory. Both readings in each pair are correct, so
-`tools/compare-profile.py` reports this field separately rather than as a
+`nvidia/tools/compare-profile.py` reports this field separately rather than as a
 correction to apply. Matching a specific device exactly is what `VGPU_VRAM_MB`
 is for.
 
@@ -306,7 +306,7 @@ against NVIDIA's own library on a physical GPU: cuDNN, cuFFT and cuSPARSE are
 bit-identical on every value the conformance suite reports, cuSOLVER on
 everything but one f32 eigenvalue, and NCCL on all 24 values at two ranks
 across two physical GPUs. The math runs on the host rather than through the
-interpreter, because a vendor library is not user code — see docs/libraries.md
+interpreter, because a vendor library is not user code — see nvidia/docs/libraries.md
 for the boundary, the per-library scope, and what each one deliberately refuses.
 
 NVRTC works by invoking the toolkit's own nvcc, which runs on the host and
@@ -323,7 +323,7 @@ because none of them uses NVRTC:
   matmul, `shfl_up_sync` scans and streams.
 - **Triton works, with a one-line hook.** It compiles all the way to PTX and
   then shells out to `ptxas` for a cubin, which is the one artifact in its
-  pipeline VirtualGPU cannot load. `tools/vgpu_triton.py` ends the pipeline at
+  pipeline VirtualGPU cannot load. `nvidia/tools/vgpu_triton.py` ends the pipeline at
   PTX using `knobs.runtime.add_stages_inspection_hook`, Triton's own extension
   point. Verified on a fused softmax, a `tl.dot` matmul (real `mma.sync` and
   `ldmatrix`) and an atomic reduction.
@@ -478,8 +478,8 @@ what is done.
   would need a child grid scheduled from inside the parent's instruction
   stream, which nothing here can do.
 - Frontends: cubin/SASS loading, and AMD execution -- HIP runtime and the CDNA
-  ISA. AMD *discovery* exists: `tools/rocminfo-to-profile.py` reads a real
-  MI325X and `profiles/amd/mi325x.yaml` is verified against one. The warp width
+  ISA. AMD *discovery* exists: `amd/tools/rocminfo-to-profile.py` reads a real
+  MI325X and `amd/profiles/mi325x.yaml` is verified against one. The warp width
   is no longer the blocker: the interpreter is warp-width parametric, masks are
   64-bit, and a 64-lane profile launches and executes. What is missing now is
   the front-end -- HIP compiles to a GCN code object, not to PTX, so there is
@@ -630,7 +630,7 @@ scripts/run-pantheon-workloads.sh.
 4. **Static cudart hosting**: satisfy NVIDIA's undocumented driver export
    tables (cuGetExportTable dark API) so binaries built with the *default*
    (static) cudart also run without a `-cudart shared` rebuild. **Investigated
-   and stopped, with a reason** -- see docs/dark-api.md for the full bootstrap
+   and stopped, with a reason** -- see nvidia/docs/dark-api.md for the full bootstrap
    map. The static runtime asks for seven tables (three of them mandatory:
    without them the process aborts before `main`), queries the device through
    the ordinary documented API, and then fails its own validity self-test with
@@ -646,7 +646,7 @@ scripts/run-pantheon-workloads.sh.
    CUPTI, loaded by absolute path from its install directory, and that copy
    reaches the driver the same way -- so `nsys` produces a report with OS
    runtime traces and no CUDA data. nvprof works, because its path goes through
-   the public CUPTI this does implement. See docs/cupti.md. CuPy is the other:
+   the public CUPTI this does implement. See nvidia/docs/cupti.md. CuPy is the other:
    it links the runtime statically and dies in the same place, at
    `getDeviceCount()`, before it compiles anything.
 5. **More PTX as workloads demand it**: bf16, cp.async, mma.sync, the
@@ -683,7 +683,7 @@ scripts/run-pantheon-workloads.sh.
    float implementation would differ from the device in the low bits -- which
    is precisely what the differential testing here exists to catch. Also
    refused: mipmaps, layered and cubemap textures, sRGB, anisotropy, and the
-   `.clamp`/`.zero` surface out-of-range policies. See docs/textures.md.
+   `.clamp`/`.zero` surface out-of-range policies. See nvidia/docs/textures.md.
 
    `wgmma` is what is left, and it is not workload-driven yet: nothing in
    llama.cpp or the pantheon suite uses it, and it needs TMA and mbarrier

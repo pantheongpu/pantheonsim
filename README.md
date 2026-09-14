@@ -25,21 +25,24 @@ $ VGPU_GPU=nvidia/b200 ./my_driver_api_app   # same binary, now sees a B200
 
 ## Status (early — NVIDIA MVP)
 
+The engine is vendor-neutral; NVIDIA and CUDA support lives in [`nvidia/`](nvidia/README.md) and
+AMD and ROCm in [`amd/`](amd/README.md). [ARCHITECTURE.md](ARCHITECTURE.md) has the map.
+
 Working today, all CPU-only:
 
 | Area | State |
 | --- | --- |
-| Device profiles | Ten NVIDIA profiles verified against physical cards across six architectures — Turing, Ampere sm_80/sm_86, Ada, Hopper, Grace-Hopper — each matching its device on 512 conformance values. `h200` and `b200` are not yet characterized, and AMD MI300X/MI325X/MI350X are discovery-only placeholders; each profile's header says where its values came from |
+| Device profiles | Eleven NVIDIA profiles verified against physical cards across six architectures — Turing, Ampere sm_80/sm_86, Ada, Hopper, Grace-Hopper — each matching its device on 512 conformance values. `h200` and `b200` are not yet characterized, and AMD MI300X/MI325X/MI350X are discovery-only placeholders; each profile's header says where its values came from |
 | `vgpu` CLI | `list-gpus`, `info --gpu <id> [--json]`, `demo vectoradd` |
-| Virtual VRAM | sparse/lazy backing — a virtual H200 claims 141 GB on a 16 GB host; OOB / use-after-free / double-free / misalignment diagnostics |
+| Virtual VRAM | sparse/lazy backing — a virtual H200 claims 141 GB on a 16 GB host, and past `VGPU_MEMORY_RAM_MB` it spills to disk; OOB / use-after-free / double-free / misalignment diagnostics |
 | PTX | lexer/parser for a growing subset (see ARCHITECTURE.md); precise `unsupported` errors for the rest |
 | Execution | SIMT warp interpreter: 32-lane warps, divergence masks, shared memory, `bar.sync`, warp shuffles/vote, atomics, tensor-core `wmma`, f16/f16x2, deterministic scheduling |
 | Driver API | `libvgpucuda.so` + clean-room `vgpu_cuda.h`: init/discovery/context/memory/module/`cuLaunchKernel`, `cuLibrary`/`cuKernel`, `cuGetProcAddress` |
 | Runtime API | `libvgpucudart` (drop-in `libcudart.so.13`): the CUDA **Runtime** API + nvcc host-registration ABI, so unmodified nvcc apps run unchanged |
 | Fatbin | extracts embedded PTX from nvcc fatbins (uncompressed, zstd and LZ4 — so binaries from CUDA 12 and 13 both work) |
 | Multi-GPU | a virtual rack of N devices with disjoint address windows; peer copies and per-device isolation match a real two-GPU machine |
-| Vendor libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP and nvJPEG under their real sonames, each differential-tested against NVIDIA's own library on a physical GPU — see [docs/libraries.md](docs/libraries.md) |
-| Python JIT | Numba runs unmodified (its PTX is assembled through the driver's JIT link API); Triton runs with a one-line hook that stops its pipeline at PTX — see [docs/jit.md](docs/jit.md) |
+| Vendor libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP and nvJPEG under their real sonames, each differential-tested against NVIDIA's own library on a physical GPU — see [nvidia/docs/libraries.md](nvidia/docs/libraries.md) |
+| Python JIT | Numba runs unmodified (its PTX is assembled through the driver's JIT link API); Triton runs with a one-line hook that stops its pipeline at PTX — see [nvidia/docs/jit.md](nvidia/docs/jit.md) |
 | Discovery | live telemetry + NVML; drop-in `nvidia-smi`, `rocm-smi`, `rocm_agent_enumerator`, and `lspci` output — see [docs/telemetry.md](docs/telemetry.md) |
 | NVENC | `libnvidia-encode.so.1` with a deterministic content-derived encoder, so video-encode SDC tests run |
 | Proof | an nvcc-compiled CUDA program **and** the unmodified pantheon stress kernels run on the CPU; `memory_read` differential-matches a physical RTX 3060 (incl. fault injection + device printf) |
@@ -52,7 +55,7 @@ Known limitations (deliberate, documented):
   loader can substitute VirtualGPU's `libcudart.so.13`. The source is untouched;
   hosting a *statically* linked cudart needs NVIDIA's undocumented driver export
   tables and is future work. This is what stops CuPy, which links cudart
-  statically — see [docs/jit.md](docs/jit.md).
+  statically — see [nvidia/docs/jit.md](nvidia/docs/jit.md).
 - `wmma` fragment layout is VirtualGPU's own (PTX leaves it unspecified) —
   see ARCHITECTURE.md D8. bf16, `cp.async`, `mma.sync`, `ldmatrix` and the
   extended-precision carry family are implemented; textures, surfaces, `wgmma`
@@ -60,7 +63,7 @@ Known limitations (deliberate, documented):
   profile), never silently.
 - OptiX (ray tracing) and NVENC (video encode) are separate NVIDIA
   subsystems, not CUDA, and are out of scope.
-- AMD (MI300X/MI325X/MI350X) is designed for but not started.
+- AMD (MI300X/MI325X/MI350X) answers discovery only; execution is not started — see [amd/README.md](amd/README.md).
 
 ## Build & test
 
