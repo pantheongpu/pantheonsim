@@ -180,7 +180,7 @@ jobs:
         with:
           sparse-checkout: |
             tests/workloads
-            profiles
+            nvidia/profiles
 
       - uses: actions/download-artifact@v4
         with:
