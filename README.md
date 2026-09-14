@@ -158,6 +158,8 @@ Environment knobs:
 | `VGPU_GPU` | virtual GPU profile id | `nvidia/h100` |
 | `VGPU_DEVICE_COUNT` | number of identical virtual devices | `1` |
 | `VGPU_QUIET` | `1` silences stderr diagnostics | unset |
+| `VGPU_MEMORY_RAM_MB` | host RAM device memory may use before the rest goes to `VGPU_MEMORY_DIR` | unlimited |
+| `VGPU_MEMORY_DIR` | directory for device memory past `VGPU_MEMORY_RAM_MB`: a card larger than the machine's RAM runs, at the speed of the disk | unset (never spill) |
 | `VGPU_TRACE` | `1` logs every runtime/driver entry point | unset |
 | `VGPU_MAX_STEPS` | raises the runaway-kernel step budget; `0` removes it | built-in |
 | `VGPU_THREADS` | host threads used to run blocks | auto |

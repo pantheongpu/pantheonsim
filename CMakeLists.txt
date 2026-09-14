@@ -62,6 +62,7 @@ add_library(vgpu STATIC
   src/core/profile.cpp
   src/core/registry.cpp
   src/core/memory.cpp
+  src/core/memory_backing.cpp
   src/core/telemetry.cpp
   src/core/profiling.cpp
   src/core/faults.cpp

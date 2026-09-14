@@ -5,7 +5,7 @@
 //    can never be confused with host pointers.
 //  - Backing is sparse: 64 KiB chunks materialize on first write. A virtual
 //    H200 can advertise 141 GB of VRAM on a 16 GB laptop; only touched pages
-//    cost host RAM. Untouched device memory reads as zero (documented
+//    cost host RAM -- or disk, past VGPU_MEMORY_RAM_MB (memory_backing.hpp). Untouched device memory reads as zero (documented
 //    VirtualGPU behavior; real GPUs leave it undefined).
 //  - Virtual addresses are handed out monotonically and never reused, so a
 //    freed pointer can never alias a later allocation.
@@ -26,6 +26,8 @@
 #include <map>
 #include <memory>
 #include <vector>
+
+#include "vgpu/memory_backing.hpp"
 
 namespace vgpu {
 
@@ -166,7 +168,7 @@ class MemoryManager {
    private:
     void release() {
       if (!chunks) return;
-      for (size_t i = 0; i < chunk_count; ++i) delete[] chunks[i].load(std::memory_order_relaxed);
+      for (size_t i = 0; i < chunk_count; ++i) backing::release(chunks[i].load(std::memory_order_relaxed));
     }
 
    public:

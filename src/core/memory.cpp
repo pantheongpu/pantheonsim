@@ -174,14 +174,15 @@ MemoryManager::Allocation& MemoryManager::resolve_mut(uint64_t addr, uint64_t le
 
 uint8_t* MemoryManager::materialize(Allocation& a, uint64_t chunk_idx) {
   // First touch materializes the chunk. Two threads can race here; the loser
-  // frees its copy and uses the winner's, so the pointer a reader sees is
-  // always the one that stays. make_unique value-initializes, so the chunk
-  // arrives zeroed -- untouched device memory reads as zero.
-  auto fresh = std::make_unique<uint8_t[]>(kChunkSize);
+  // gives its copy back and uses the winner's, so the pointer a reader sees is
+  // always the one that stays. The backing hands chunks out zeroed -- untouched
+  // device memory reads as zero -- from the heap or, past its RAM limit, from a
+  // file on disk.
+  uint8_t* fresh = backing::acquire();
   uint8_t* expected = nullptr;
-  if (a.chunks[chunk_idx].compare_exchange_strong(expected, fresh.get(),
-                                                  std::memory_order_acq_rel))
-    return fresh.release();
+  if (a.chunks[chunk_idx].compare_exchange_strong(expected, fresh, std::memory_order_acq_rel))
+    return fresh;
+  backing::release(fresh);
   return expected;
 }
 

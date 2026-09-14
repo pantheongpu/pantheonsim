@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "vgpu/error.hpp"
+#include "vgpu/memory_backing.hpp"
 #include "vtest.hpp"
 
 using vgpu::Err;
@@ -432,6 +433,66 @@ VTEST(scalar_store_and_load_agree_at_every_size) {
   VCHECK_EQ(mm.load_scalar(p + 31, 1), uint64_t{0x7f});
   VCHECK_EQ(mm.load_scalar(p + 12, 4), uint64_t{0x01234567});   // the high half of the u64
   mm.free(p);
+}
+
+// A card larger than the machine's RAM: chunks past the RAM limit live in a
+// file, read back exactly, and give their disk space back when freed.
+VTEST(device_memory_past_the_ram_limit_spills_to_disk) {
+  using vgpu::kChunkSize;
+  char dir[] = "/tmp/vgpu-spill-XXXXXX";
+  VCHECK(::mkdtemp(dir) != nullptr);
+  vgpu::backing::configure({4 * kChunkSize, dir});
+  const uint64_t ram0 = vgpu::backing::ram_bytes();
+  {
+    MemoryManager mm(1ull << 30);
+    const uint64_t n = 64 * kChunkSize;  // 4 MiB: 4 chunks in RAM, 60 on disk
+    const uint64_t p = mm.alloc(n);
+    std::vector<uint8_t> in(n), out(n, 0);
+    for (uint64_t i = 0; i < n; ++i) in[i] = static_cast<uint8_t>(i * 131 + 7);
+    mm.write(p, in.data(), n);
+    VCHECK_EQ(vgpu::backing::ram_bytes() - ram0, 4 * kChunkSize);
+    VCHECK_EQ(vgpu::backing::spill_bytes(), 60 * kChunkSize);
+    mm.read(p, out.data(), n);
+    VCHECK(in == out);
+    // Scalar access goes straight to the chunk, file or not.
+    mm.store_scalar(p + 40 * kChunkSize + 16, 8, 0x1122334455667788ull);
+    VCHECK_EQ(mm.load_scalar(p + 40 * kChunkSize + 16, 8), 0x1122334455667788ull);
+    mm.free(p);
+    VCHECK_EQ(vgpu::backing::spill_bytes(), 0ull);
+    VCHECK_EQ(vgpu::backing::ram_bytes(), ram0);
+
+    // Chunks handed out again read as zero, as untouched memory does.
+    const uint64_t q = mm.alloc(n);
+    const uint8_t one = 1;
+    for (uint64_t c = 0; c < 64; ++c) mm.write(q + c * kChunkSize, &one, 1);
+    std::vector<uint8_t> again(n, 0xEE);
+    mm.read(q, again.data(), n);
+    bool rest_zero = true;
+    for (uint64_t i = 0; i < n; ++i)
+      if (again[i] != (i % kChunkSize == 0 ? 1 : 0)) rest_zero = false;
+    VCHECK(rest_zero);
+    mm.free(q);
+  }
+  vgpu::backing::configure({});
+  ::rmdir(dir);
+}
+
+// Nowhere to spill is a CUDA out-of-memory error, not a crash.
+VTEST(device_memory_with_nowhere_to_spill_is_out_of_memory) {
+  vgpu::backing::configure({0, "/nonexistent/vgpu-spill"});
+  {
+    MemoryManager mm(1 << 20);
+    const uint64_t p = mm.alloc(64);
+    bool oom = false;
+    try {
+      mm.store_scalar(p, 8, 42);
+    } catch (const Error& e) {
+      oom = e.code() == Err::OutOfMemory;
+    }
+    VCHECK(oom);
+    mm.free(p);
+  }
+  vgpu::backing::configure({});
 }
 
 VTEST_MAIN
