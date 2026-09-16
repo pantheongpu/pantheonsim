@@ -61,8 +61,11 @@ Known limitations (deliberate, documented):
   extended-precision carry family are implemented; textures, surfaces, `wgmma`
   and grid sync are not. Every gap fails loudly (instruction, PTX line, kernel,
   profile), never silently.
-- OptiX (ray tracing) and NVENC (video encode) are separate NVIDIA
-  subsystems, not CUDA, and are out of scope.
+- NVENC (video encode) is served by `libvgpunvenc`, presented as
+  `libnvidia-encode.so.1`: the documented API with a deterministic,
+  content-derived bitstream, so encoder stress and corruption checks run, but
+  the output is not a decodable video stream. OptiX (ray tracing) is a separate
+  NVIDIA subsystem, not CUDA, and is out of scope.
 - AMD (MI300X/MI325X/MI350X) answers discovery only; execution is not started — see [amd/README.md](amd/README.md).
 
 ## Build & test

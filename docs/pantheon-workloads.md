@@ -87,17 +87,24 @@ runner gives those a larger virtual device. Configurable virtual VRAM and
 device count are product features, not workarounds: `VGPU_VRAM_MB` and
 `VGPU_DEVICE_COUNT` let one laptop present whatever rack the test expects.
 
-The two exceptions are **not CUDA**:
+One workload is **not CUDA** and is out of scope:
 
 | Workload | Needs | Why it is out of scope |
 | --- | --- | --- |
 | `rt_virus` | OptiX (`libnvoptix.so.1`) | NVIDIA's ray-tracing library — a separate product with its own pipeline/BVH runtime |
-| `media_enc_virus` | NVENC (`libnvidia-encode.so.1`) | NVIDIA's hardware video encoder — fixed-function silicon, not CUDA |
 
-On a CPU-only machine both take their own documented "driver not installed"
-path and exit cleanly. On a host that *also* has real NVIDIA driver libraries
-(e.g. WSL), they load the real library and then try to reach real hardware
-through the virtual device, so the runner skips them.
+On a CPU-only machine it takes its own documented "driver not installed" path
+and exits cleanly. On a host that *also* has real NVIDIA driver libraries
+(e.g. WSL), it loads the real library and then tries to reach real hardware
+through the virtual device, so the runner skips it.
+
+`media_enc_virus` runs. NVENC is a driver component rather than CUDA, but
+applications load it by its bare soname, so `libvgpunvenc` stands in as
+`libnvidia-encode.so.1`: the documented encode API with a deterministic,
+content-derived bitstream. Identical frames encode identically and any changed
+pixel changes the output, which is what the workload's golden-bitstream check
+relies on. The output is not a decodable video stream. The runner skips the
+workload only when the shim was not built.
 
 ## In CI
 
@@ -160,7 +167,8 @@ python3 tests/workloads/workload_matrix.py /tmp/wl
 
 A result is `PASS` only when the workload exits 0, reports a measurement, and
 prints no CUDA or pantheon error. Otherwise it is `FAIL`, `TIMEOUT`, or
-`MISSING` when it did not build; OptiX and NVENC workloads are `SKIP`.
+`MISSING` when it did not build; `rt_virus` is `SKIP`, and so is
+`media_enc_virus` when the NVENC shim was not built.
 
 ## Differential validation against real hardware
 

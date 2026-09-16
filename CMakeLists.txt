@@ -407,11 +407,14 @@ if(CUDA_ABI_INCLUDE)
   # libvgpunvenc: VirtualGPU's NVENC implementation, presented as
   # libnvidia-encode.so.1. Applications dlopen that bare soname, which searches
   # LD_LIBRARY_PATH first, so the shim directory wins over the real driver
-  # library. Needs the Video Codec SDK header (vendored by the workload tree).
+  # library. Needs the Video Codec SDK header, vendored in
+  # nvidia/third_party/nvenc_include so the shim builds from this tree alone
+  # (a container build sees nothing beside it).
   # ---------------------------------------------------------------------------
   vgpu_forget_stale_path(NVENC_INCLUDE nvEncodeAPI.h)
   find_path(NVENC_INCLUDE nvEncodeAPI.h
-    PATHS "${CMAKE_SOURCE_DIR}/../pantheongpu/kernels/common/nvenc"
+    PATHS "${CMAKE_SOURCE_DIR}/nvidia/third_party/nvenc_include"
+          "${CMAKE_SOURCE_DIR}/../pantheongpu/kernels/common/nvenc"
           ENV NVENC_HEADER_DIR)
   if(NVENC_INCLUDE)
     message(STATUS "NVENC header at ${NVENC_INCLUDE}: building libvgpunvenc")
@@ -626,6 +629,19 @@ if(TARGET vgpucublas)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
+
+  # NVENC through the bare soname applications dlopen. The shim is not a codec,
+  # so what is checked is what encoder stress and corruption tests rely on: the
+  # same frame encodes to the same bytes, and a changed pixel, luma or chroma,
+  # changes them. The 4:2:0 case also fills the whole frame the buffer holds.
+  if(TARGET vgpunvenc)
+    add_test(NAME e2e_nvenc
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvenc.sh)
+    set_tests_properties(e2e_nvenc PROPERTIES
+      DEPENDS vgpunvenc
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};NVENC_INCLUDE=${NVENC_INCLUDE}"
+      TIMEOUT 300)
+  endif()
 
   add_test(NAME e2e_symbols
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_symbols.sh)

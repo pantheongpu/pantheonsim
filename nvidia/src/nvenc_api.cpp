@@ -59,6 +59,10 @@ bool quiet() {
 
 struct InputBuffer {
   uint32_t width = 0, height = 0, pitch = 0;
+  // Rows of bytes the buffer holds: the image height for packed RGB, and one
+  // and a half times it for the 4:2:0 formats, whose chroma follows the luma.
+  uint32_t rows = 0;
+  NV_ENC_BUFFER_FORMAT format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
   size_t bytes = 0;
   void* device_ptr = nullptr;  // VirtualGPU device memory, kernel-writable
   bool locked = false;
@@ -87,7 +91,8 @@ std::map<void*, Session*> g_sessions;
 // FNV-1a hash of its pixels, so identical frames encode identically and any
 // changed pixel changes the output — the property SDC verification needs.
 std::vector<uint8_t> encode_frame(const std::vector<uint8_t>& frame, uint32_t width,
-                                  uint32_t height, uint32_t pitch, uint32_t bytes_per_pixel) {
+                                  uint32_t height, uint32_t rows, uint32_t pitch,
+                                  uint32_t bytes_per_pixel) {
   std::vector<uint8_t> out;
   // A short pseudo-header so consumers see stable, plausible framing.
   const uint8_t header[] = {0x00, 0x00, 0x00, 0x01, 'V', 'G', 'P', 'U'};
@@ -99,10 +104,12 @@ std::vector<uint8_t> encode_frame(const std::vector<uint8_t>& frame, uint32_t wi
   push32(height);
 
   constexpr uint32_t kTile = 64;
-  for (uint32_t ty = 0; ty < height; ty += kTile) {
+  // Every row of the buffer, chroma included: a corrupted chroma sample must
+  // change the output as surely as a corrupted luma sample does.
+  for (uint32_t ty = 0; ty < rows; ty += kTile) {
     for (uint32_t tx = 0; tx < width; tx += kTile) {
       uint32_t h = 2166136261u;
-      for (uint32_t y = ty; y < std::min(ty + kTile, height); ++y) {
+      for (uint32_t y = ty; y < std::min(ty + kTile, rows); ++y) {
         const uint8_t* row = frame.data() + static_cast<size_t>(y) * pitch;
         for (uint32_t x = tx; x < std::min(tx + kTile, width); ++x) {
           for (uint32_t b = 0; b < bytes_per_pixel; ++b)
@@ -128,6 +135,20 @@ uint32_t bytes_per_pixel(NV_ENC_BUFFER_FORMAT fmt) {
       return 1;  // luma plane stride; chroma follows
     default:
       return 4;
+  }
+}
+
+// Rows of bytes a frame occupies. The 4:2:0 formats carry half-height chroma
+// after the luma, so a buffer sized for the luma alone is a third too small and
+// an application filling the whole frame writes past its end.
+uint32_t buffer_rows(NV_ENC_BUFFER_FORMAT fmt, uint32_t height) {
+  switch (fmt) {
+    case NV_ENC_BUFFER_FORMAT_NV12:
+    case NV_ENC_BUFFER_FORMAT_YV12:
+    case NV_ENC_BUFFER_FORMAT_IYUV:
+      return height + (height + 1) / 2;
+    default:
+      return height;
   }
 }
 
@@ -199,7 +220,9 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncCreateInputBuffer(void* encoder,
   buf.height = params->height;
   uint32_t bpp = bytes_per_pixel(params->bufferFmt);
   buf.pitch = params->width * bpp;
-  buf.bytes = static_cast<size_t>(buf.pitch) * params->height;
+  buf.rows = buffer_rows(params->bufferFmt, params->height);
+  buf.format = params->bufferFmt;
+  buf.bytes = static_cast<size_t>(buf.pitch) * buf.rows;
   // Device memory: applications legitimately run CUDA kernels on the locked
   // pointer, so it must be addressable by the virtual GPU.
   void* dptr = nullptr;
@@ -277,8 +300,8 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncEncodePicture(void* encoder, NV_ENC_PIC_PA
   std::vector<uint8_t> frame(in.bytes);
   if (cudaMemcpy(frame.data(), in.device_ptr, in.bytes, kMemcpyDeviceToHost) != 0)
     return NV_ENC_ERR_GENERIC;
-  s->pending = encode_frame(frame, in.width, in.height, in.pitch,
-                            bytes_per_pixel(params->bufferFmt));
+  s->pending = encode_frame(frame, in.width, in.height, in.rows, in.pitch,
+                            bytes_per_pixel(in.format));
   s->pending_output = params->outputBitstream;
   ++s->frame_index;
   return NV_ENC_SUCCESS;
@@ -314,6 +337,9 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncDestroyEncoder(void* encoder) {
   Session* s = session_of(encoder);
   if (!s) return NV_ENC_ERR_INVALID_PTR;
   for (auto& [ptr, buf] : s->inputs) cudaFree(buf.device_ptr);
+  // Bitstream handles are heap objects the caller never frees once the
+  // session is gone: DestroyBitstreamBuffer rejects a destroyed session.
+  for (auto& [ptr, buf] : s->outputs) delete static_cast<BitstreamBuffer*>(ptr);
   g_sessions.erase(encoder);
   delete s;
   return NV_ENC_SUCCESS;

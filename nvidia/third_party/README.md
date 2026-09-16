@@ -13,3 +13,8 @@ shims implement the documented APIs, not any NVIDIA code.
 Refresh with:
 
     pip download --no-deps --dest /tmp/nvpkg nvidia-cudnn-cu12 nvidia-nccl-cu12
+
+`nvenc_include/nvEncodeAPI.h` is the public NVENC API header from NVIDIA's
+Video Codec SDK, which NVIDIA licenses under the MIT terms printed at the top of
+the file. It lets `libvgpunvenc` (presented as `libnvidia-encode.so.1`) build
+from this tree alone. Refresh it from the SDK's `Interface/` directory.
