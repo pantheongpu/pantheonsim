@@ -30,7 +30,8 @@ struct LaunchConfig {
   // Seed for the random and adversarial schedulers; ignored by the
   // deterministic one. The same seed replays the same execution.
   uint64_t scheduler_seed = 0;
-  // Safety net against infinite loops; counts executed instructions per launch.
+  // Safety net against infinite loops; counts the instructions each warp
+  // executes, so a large grid of threads that each finish is not cut off.
   uint64_t max_steps = 1ull << 30;
   // A cooperative launch: every block is resident at once and may wait on the
   // others. Ordinary launches make the opposite promise -- blocks are
