@@ -457,6 +457,29 @@ VTEST(max_steps_env_ignores_junk) {
   }
 }
 
+VTEST(step_budget_counts_each_warp_not_the_whole_launch) {
+  // The budget is there to catch one thread looping forever. A big grid of
+  // threads that each finish adds up to far more instructions than any one of
+  // them runs, and must not be mistaken for a runaway -- nor may the verdict
+  // depend on how many host threads the grid is spread over.
+  ptx::Module m = ptx::parse(kCountdownPtx);
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/h100");
+  LaunchConfig cfg;
+  cfg.grid = {16, 1, 1};
+  cfg.block = {256, 1, 1};
+  cfg.max_steps = 10000;  // ~1,500 per warp; at least 16 warps, so over 24,000 in all
+
+  EnvGuard steps("VGPU_MAX_STEPS");
+  ::unsetenv("VGPU_MAX_STEPS");
+  EnvGuard threads("VGPU_THREADS");
+  for (const char* n : {"1", "4"}) {
+    threads.set(n);
+    exec::LaunchStats stats = exec::launch(m.entries[0], cfg, {}, mem, prof);
+    VCHECK(stats.instructions > cfg.max_steps);
+  }
+}
+
 VTEST(launch_bounds_limit_the_total_not_each_dimension) {
   // __launch_bounds__(128) emits ".maxntid 128, 1, 1". A 32x4x1 block is 128
   // threads and hardware accepts it; checking dimension by dimension rejected

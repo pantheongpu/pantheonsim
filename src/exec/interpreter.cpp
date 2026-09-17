@@ -196,6 +196,13 @@ struct Warp {
   // the deterministic scheduler a turn otherwise lasts until the warp blocks,
   // and a spin never blocks, so the first waiter would hold the block forever.
   bool yield_now = false;
+  // Instructions this warp has issued, for the step budget. Counted per warp
+  // rather than per launch: the budget exists to catch a thread that never
+  // finishes, and a launch's total grows with its grid -- a 12 GB sweep over
+  // 43,008 threads is some 10^11 instructions of legitimate work, while each
+  // warp's share stays small. It also keeps the verdict independent of how
+  // many host threads the grid happens to be spread over.
+  uint64_t steps = 0;
   // Live paths. Reconvergence is by *lowest program counter*: the path with
   // the smallest pc always runs next, and paths that arrive at the same pc are
   // merged. For the structured control flow compilers emit, that reconverges
@@ -274,20 +281,27 @@ void refresh_modes() {
 // IEEE 754 binary16 <-> double, implemented in software so the engine needs no
 // host f16 support. Round-to-nearest-even, with subnormals and inf/NaN.
 double f16_to_double(uint64_t bits) {
-  uint16_t h = static_cast<uint16_t>(bits);
-  uint32_t sign = (h >> 15) & 0x1;
-  uint32_t exp = (h >> 10) & 0x1F;
-  uint32_t mant = h & 0x3FF;
-  double mag;
-  if (exp == 0) {
-    mag = std::ldexp(static_cast<double>(mant), -24);  // subnormal
-  } else if (exp == 31) {
-    mag = mant ? std::numeric_limits<double>::quiet_NaN()
-               : std::numeric_limits<double>::infinity();
+  // Assembled field by field rather than through ldexp: every binary16 value
+  // is exact in a double, so sign, exponent and mantissa carry straight across,
+  // and the libm call this replaced was most of an f16 matrix kernel's time.
+  // Bit-identical to the ldexp form on all 65536 inputs.
+  const uint32_t h = static_cast<uint32_t>(bits) & 0xFFFFu;
+  const uint64_t sign = uint64_t{h >> 15} << 63;
+  const uint32_t exp = (h >> 10) & 0x1F;
+  const uint64_t mant = h & 0x3FF;
+  uint64_t out;
+  if (exp == 31) {
+    out = sign | (mant ? 0x7FF8'0000'0000'0000ull : 0x7FF0'0000'0000'0000ull);
+  } else if (exp != 0) {
+    out = sign | (uint64_t{exp - 15 + 1023} << 52) | (mant << 42);
+  } else if (mant == 0) {
+    out = sign;
   } else {
-    mag = std::ldexp(1.0 + static_cast<double>(mant) / 1024.0, static_cast<int>(exp) - 15);
+    // Subnormal: mant * 2^-24, normalized so its leading one is implicit.
+    const int top = 63 - std::countl_zero(mant);
+    out = sign | (uint64_t(top - 24 + 1023) << 52) | ((mant << (52 - top)) & ((1ull << 52) - 1));
   }
-  return sign ? -mag : mag;
+  return std::bit_cast<double>(out);
 }
 
 uint64_t double_to_f16(double d) {
@@ -733,9 +747,10 @@ class Interpreter {
           stats_.inst_by_opcode.resize(ins.opcode_id + 1u, 0);
         ++stats_.inst_by_opcode[ins.opcode_id];
       }
-      if (++stats_.instructions > cfg_.max_steps)
-        throw Error::make(Err::ExecLimit, "kernel '", fn_.name, "' exceeded the launch step budget (",
-                          cfg_.max_steps, " instructions) — possible infinite loop");
+      ++stats_.instructions;
+      if (++w.steps > cfg_.max_steps)
+        throw Error::make(Err::ExecLimit, "kernel '", fn_.name, "' exceeded the step budget (",
+                          cfg_.max_steps, " instructions in one warp) — possible infinite loop");
       step(w, ctx, idx, ins);
     }
   }
@@ -1142,7 +1157,12 @@ class Interpreter {
   }
 
   static uint32_t popcount_mask(Mask m) {
-    return static_cast<uint32_t>(__builtin_popcountll(m));
+    // Counted inline: without -mpopcnt the builtin is a call into libgcc, and
+    // this runs for every instruction.
+    m = m - ((m >> 1) & 0x5555'5555'5555'5555ull);
+    m = (m & 0x3333'3333'3333'3333ull) + ((m >> 2) & 0x3333'3333'3333'3333ull);
+    m = (m + (m >> 4)) & 0x0F0F'0F0F'0F0F'0F0Full;
+    return static_cast<uint32_t>((m * 0x0101'0101'0101'0101ull) >> 56);
   }
 
   // Memory traffic, counted per active lane. Space matters: a shared access and
@@ -1641,7 +1661,9 @@ class Interpreter {
       // .rz specifically because truncation is what they want. Set the host
       // mode around the arithmetic and put it back, so nothing else observes
       // the change.
-      const int prev_round = std::fegetround();
+      // Only an explicit mode touches the environment: fegetround is a libc call,
+      // and round-to-nearest is what nearly every instruction asks for.
+      const int prev_round = op->round == FRound::Nearest ? 0 : std::fegetround();
       switch (op->round) {
         case FRound::Zero: std::fesetround(FE_TOWARDZERO); break;
         case FRound::MinusInf: std::fesetround(FE_DOWNWARD); break;
@@ -3387,7 +3409,12 @@ class Interpreter {
     if (op.a.size() != a_regs || op.b.size() != b_regs)
       ctx_fail(ins, -1, Err::UnsupportedPtx, "mma fragment arity does not match the shape");
 
-    std::vector<double> A(kM * K, 0.0), B(K * kN, 0.0), C(kM * kN, 0.0);
+    // The parser admits k8, k16 and k32 only, so the matrices fit on the stack;
+    // allocating them cost a malloc and free of each on every instruction.
+    if (K > 32) ctx_fail(ins, -1, Err::UnsupportedPtx, "mma k above 32");
+    std::array<double, kM * 32> A{};
+    std::array<double, 32 * kN> B{};
+    std::array<double, kM * kN> C{};
     // A: lane (groupID, tid) holds rows {groupID, groupID+8} at the column
     // block the register index selects.
     for (uint32_t reg = 0; reg < a_regs; ++reg) {
@@ -3438,7 +3465,7 @@ class Interpreter {
     }
     // D = A x B + C. Float shapes accumulate in f32 and integer shapes in s32,
     // matching the accumulate type the instruction names.
-    std::vector<double> D(kM * kN, 0.0);
+    std::array<double, kM * kN> D{};
     for (uint32_t i = 0; i < kM; ++i)
       for (uint32_t j = 0; j < kN; ++j) {
         if (op.acc_int) {
@@ -3473,7 +3500,9 @@ class Interpreter {
 
   void exec_wmma_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaMma& op, Mask m) {
     // Gather A and B (16x16 f16 each) and C (16x16 f32) from the warp.
-    double A[kMmaDim][kMmaDim] = {}, B[kMmaDim][kMmaDim] = {}, C[kMmaDim][kMmaDim] = {};
+    // Held as f32, which every element type here fits exactly (f16 and bf16 are
+    // both exact in a float), since the product is accumulated in f32 anyway.
+    float A[kMmaDim][kMmaDim] = {}, B[kMmaDim][kMmaDim] = {}, C[kMmaDim][kMmaDim] = {};
     const bool bf = op.elem == WmmaElem::BF16;
     const bool tf = op.elem == WmmaElem::TF32;
     const int ab_regs = op.elem == WmmaElem::F16 ? 8 : 4;
@@ -3533,14 +3562,16 @@ class Interpreter {
       }
     }
     // D = A x B + C, accumulated in f32 (matching the .f32 accumulate type).
+    // Each element still accumulates its products in k order, exactly as the
+    // element-by-element form did; running j innermost lets it vectorize.
     float D[kMmaDim][kMmaDim];
-    for (uint32_t i = 0; i < kMmaDim; ++i)
-      for (uint32_t j = 0; j < kMmaDim; ++j) {
-        float acc = static_cast<float>(C[i][j]);
-        for (uint32_t k = 0; k < K; ++k)
-          acc += static_cast<float>(A[i][k]) * static_cast<float>(B[k][j]);
-        D[i][j] = acc;
+    for (uint32_t i = 0; i < kMmaDim; ++i) {
+      for (uint32_t j = 0; j < kMmaDim; ++j) D[i][j] = C[i][j];
+      for (uint32_t k = 0; k < K; ++k) {
+        const float aik = A[i][k];
+        for (uint32_t j = 0; j < kMmaDim; ++j) D[i][j] += aik * B[k][j];
       }
+    }
     // Scatter D back into the destination fragment.
     for (int reg = 0; reg < 8; ++reg) {
       Lanes r;  // written for every active lane below
@@ -4682,10 +4713,11 @@ class Interpreter {
                    "control fell off the end of device function '" + callee.name + "'");
         const size_t idx = select_path(w);
         const Instr& inner = callee.body[w.paths[idx].pc];
-        if (++stats_.instructions > cfg_.max_steps)
+        ++stats_.instructions;
+        if (++w.steps > cfg_.max_steps)
           throw Error::make(Err::ExecLimit, "kernel '", fn_.name,
-                            "' exceeded the launch step budget (", cfg_.max_steps,
-                            " instructions) — possible infinite loop");
+                            "' exceeded the step budget (", cfg_.max_steps,
+                            " instructions in one warp) — possible infinite loop");
         const uint64_t lanes = static_cast<uint64_t>(popcount_mask(w.paths[idx].mask));
         stats_.thread_instructions += lanes;
         const InstClass cls = class_of_pc(w.paths[idx].pc);

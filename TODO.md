@@ -434,10 +434,9 @@ narrows what counts as observable, not what the detector looks at.
 ## Known out of scope (not CUDA)
 
 - `rt_virus` needs **OptiX** (NVIDIA's ray-tracing library, loaded from
-  libnvoptix.so.1) and `media_enc_virus` needs **NVENC**
-  (libnvidia-encode.so.1). Both are separate NVIDIA subsystems, not CUDA;
-  emulating them is a distinct project. They fail with the vendor library's
-  own error rather than a VirtualGPU error.
+  libnvoptix.so.1), a separate NVIDIA subsystem, not CUDA; emulating it is a
+  distinct project. It fails with the vendor library's own error rather than a
+  VirtualGPU error. (`media_enc_virus` runs: `libvgpunvenc` implements NVENC.)
 
 ## Partially implemented
 

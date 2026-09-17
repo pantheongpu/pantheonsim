@@ -51,9 +51,12 @@ if (( ${#_cudart[@]} )); then
   fi
 fi
 
-# Not CUDA, so not simulated: OptiX is NVIDIA's ray-tracing library and NVENC its
-# hardware video encoder. Reported as skipped, never as passed.
-OUT_OF_SCOPE="rt_virus media_enc_virus"
+# Not CUDA, so not simulated: OptiX is NVIDIA's ray-tracing library. Reported as
+# skipped, never as passed. NVENC is a driver component too, but the build
+# supplies libvgpunvenc in its place, so media_enc_virus runs whenever that shim
+# was built; it is missing only when nvEncodeAPI.h was not found.
+OUT_OF_SCOPE="rt_virus"
+[[ -e "$build/shim/libnvidia-encode.so.1" ]] || OUT_OF_SCOPE="$OUT_OF_SCOPE media_enc_virus"
 
 # Small, fast, and between them they exercise the paths that have broken before:
 # integer and float arithmetic, global traffic, shared memory and atomics.
@@ -104,7 +107,7 @@ rc=0
 record() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$VGPU_WL_LOGS/results.tsv"; printf '%-26s %-8s %5ss  %s\n' "$1" "$2" "$3" "$4"; }
 printf '\n%-26s %-8s %6s  %s\n' WORKLOAD RESULT TIME DETAIL
 for w in $VGPU_WL_NAMES; do
-  case " $VGPU_WL_SKIP " in *" $w "*) record "$w" SKIP 0 "needs OptiX or NVENC, which are not CUDA"; continue ;; esac
+  case " $VGPU_WL_SKIP " in *" $w "*) record "$w" SKIP 0 "needs OptiX (not CUDA), or the NVENC shim, which was not built"; continue ;; esac
   bin="$bdir/$w"
   log="$VGPU_WL_LOGS/$w.log"
   if [ ! -x "$bin" ]; then
