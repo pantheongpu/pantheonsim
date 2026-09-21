@@ -38,6 +38,7 @@
 #include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/registry.hpp"
+#include "vgpu/telemetry.hpp"
 #include "vgpu/runtime/runtime.hpp"
 #include "vgpu/telemetry.hpp"
 
@@ -238,9 +239,9 @@ std::string dmesg_log(const Config& c, const vgpu::DeviceProfile& p) {
     std::snprintf(buf, sizeof buf, "pci %s: [%04x:%04x] type 00 class 0x030200", bdf,
                   p.telemetry.pci_vendor_id, p.telemetry.pci_device_id);
     line(t += 0.001, buf);
-    std::snprintf(buf, sizeof buf, "pci %s: reg 0x10: [mem 0x%08x-0x%08x 64bit pref]", bdf,
-                  0xf0000000 + i * 0x1000000, 0xf0ffffff + i * 0x1000000);
-    line(t += 0.001, buf);
+    // No BAR assignment line: config space reports BAR0 as unassigned until
+    // BARs are modelled, and a log claiming a mapping that config space denies
+    // is a contradiction a bring-up script would trip on.
   }
   if (amd) {
     line(t += 0.30, "[drm] amdgpu kernel modesetting enabled.");
@@ -313,13 +314,17 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
     std::snprintf(bdf, sizeof bdf, "0000:%02x:00.0", i + 1);
     std::string gpudir = s.root + "/proc/driver/nvidia/gpus/" + bdf;
     make_dirs(gpudir);
+    // The UUID nvidia-smi and NVML report for this device, and no VBIOS, which
+    // is also NVML's answer: this file used to carry its own version of both.
+    vgpu::telemetry::DeviceSample ds{};
+    vgpu::telemetry::describe_device(p, i, &ds);
     char info[512];
     std::snprintf(info, sizeof info,
-                  "Model: \t\t %s\nIRQ:   \t\t %d\nGPU UUID: \t GPU-simulated-%d\n"
-                  "Video BIOS: \t 96.00.00.00.00\nBus Type: \t PCIe\n"
+                  "Model: \t\t %s\nIRQ:   \t\t %d\nGPU UUID: \t %s\n"
+                  "Video BIOS: \t N/A\nBus Type: \t PCIe\n"
                   "DMA Size: \t 47 bits\nDMA Mask: \t 0x7fffffffffff\n"
                   "Bus Location: \t %s\nDevice Minor: \t %d\n",
-                  p.model.c_str(), 128 + i, i, bdf, i);
+                  p.model.c_str(), 128 + i, ds.uuid, bdf, i);
     write_file(gpudir + "/information", info);
     std::string card = s.root + "/sys/class/drm/card" + std::to_string(i);
     make_dirs(card + "/device");

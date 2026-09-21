@@ -57,10 +57,10 @@ Known limitations (deliberate, documented):
   tables and is future work. This is what stops CuPy, which links cudart
   statically — see [nvidia/docs/jit.md](nvidia/docs/jit.md).
 - `wmma` fragment layout is VirtualGPU's own (PTX leaves it unspecified) —
-  see ARCHITECTURE.md D8. bf16, `cp.async`, `mma.sync`, `ldmatrix` and the
-  extended-precision carry family are implemented; textures, surfaces, `wgmma`
-  and grid sync are not. Every gap fails loudly (instruction, PTX line, kernel,
-  profile), never silently.
+  see ARCHITECTURE.md D8. bf16, `cp.async`, `mma.sync`, `ldmatrix`, the
+  extended-precision carry family, textures, surfaces and grid sync are
+  implemented; `wgmma`, TMA and distributed shared memory are not. Every gap
+  fails loudly (instruction, PTX line, kernel, profile), never silently.
 - NVENC (video encode) is served by `libvgpunvenc`, presented as
   `libnvidia-encode.so.1`: the documented API with a deterministic,
   content-derived bitstream, so encoder stress and corruption checks run, but
