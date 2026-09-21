@@ -3,6 +3,8 @@
 # surface a health tool reads -- nvidia-smi's fields and table, nvidia-smi -p,
 # and rocm-smi.
 set -uo pipefail
+root="$(cd "$(dirname "$0")/../../.." && pwd)"
+. "$root/tests/shim_guard.sh"
 build="${VGPU_BUILD_DIR:-build}"
 vgpu="$build/vgpu"
 [[ -x "$vgpu" ]] || { echo "no vgpu at $vgpu"; exit 1; }
@@ -100,7 +102,9 @@ expect "a thermal slowdown reads at the T4's slowdown threshold, a power cap at 
 expect "the other GPU is not throttled" "0x0000000000000001" "$(q 1 clocks_event_reasons.active)"
 expect "fault show names the reasons" "yes" \
   "$(t4 fault show --gpu 0 | grep -q 'clock-event reasons    sw_power_cap, sw_thermal_slowdown (until cleared)' && echo yes || echo no)"
-if [[ -e "$build/shim/libnvidia-ml.so.1" ]] && command -v python3 >/dev/null; then
+# ctypes loads the NVML shim into python, which a sanitizer runtime refuses.
+if [[ -e "$build/shim/libnvidia-ml.so.1" ]] && command -v python3 >/dev/null &&
+   [[ -z "$(shim_sanitizer "$build/shim")" ]]; then
   got=$(VGPU_GPU=nvidia/t4 VGPU_DEVICE_COUNT=2 python3 -c '
 import ctypes, sys
 lib = ctypes.CDLL(sys.argv[1])
