@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "vgpu/telemetry.hpp"
 
@@ -57,8 +58,8 @@ struct Counters {
   // Faults armed for delivery to a running kernel (volatile file only), by
   // where they are taken (Target) and then corrected, uncorrected, bit flip;
   // how many are armed at each target; and the silent bit flips delivered.
-  uint64_t armed[3][3];
-  uint64_t armed_pending[3];
+  uint64_t armed[4][3];
+  uint64_t armed_pending[4];
   uint64_t bitflips_delivered;
   // A kernel hang armed for the next launch (not counted in armed_total, which
   // loads read), and how long it lasts: 0 is until the process is stopped.
@@ -71,6 +72,10 @@ struct Counters {
   // written, and a ring of {seq, type, data, time_ns}.
   uint64_t event_seq;
   uint64_t events[32][4];
+  // Stuck cells (volatile file only, kept across a driver reload): how many,
+  // and up to 16 of {byte offset, kStuckValid | value << 8 | bit}.
+  uint64_t stuck_count;
+  uint64_t stuck[16][2];
 
   uint64_t ecc_total(Severity s) const;
   uint64_t armed_total() const;
@@ -120,14 +125,16 @@ std::string state_dir();
 enum class Armed : uint32_t { None, Corrected, Uncorrected, Bitflip, Hang };
 // Where a fault is taken: device-memory loads, device-memory stores (bit flips
 // only -- ECC is checked when memory is read, so a store's flip is what the
-// next read finds), or shared-memory loads, whose ECC errors count as the L1
-// cache's since shared memory and L1 are one SRAM.
-enum class Target : uint32_t { Load, Store, Shared };
-inline constexpr uint32_t kTargets = 3;
+// next read finds), shared-memory loads, whose ECC errors count as the L1
+// cache's since shared memory and L1 are one SRAM, or floating-point and
+// matrix results (bit flips only: no ECC covers an ALU, so nothing counts or
+// reports the error -- silent data corruption, which result checks catch).
+enum class Target : uint32_t { Load, Store, Shared, Alu };
+inline constexpr uint32_t kTargets = 4;
 static_assert(sizeof(Counters::armed_pending) / sizeof(uint64_t) == kTargets);
 const char* target_name(Target t);
 bool parse_target(const std::string& s, Target* out);
-// Throws std::invalid_argument for an ECC error armed on stores.
+// Throws std::invalid_argument for an ECC error armed on stores or results.
 void arm(const std::string& uuid, Armed kind, uint64_t n, Target at = Target::Load);
 // A hang for the next kernel launch: it stalls for `seconds` and then fails
 // with cudaErrorLaunchTimeout, or with seconds 0 never returns.
@@ -149,11 +156,35 @@ class ArmedFaults {
   void note_bitflip();
   // Takes an armed hang, if there is one, with how long it lasts.
   bool take_hang(uint64_t* seconds);
+  // Non-zero while any cell is stuck.
+  const uint64_t* stuck_pending() const;
+  // Forces the stuck bits that fall in `len` bytes read from `offset`.
+  void apply_stuck(uint64_t offset, uint8_t* bytes, uint64_t len) const;
 
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// ---- Stuck cells ------------------------------------------------------------
+//
+// `vgpu fault stuck`: a bit of device memory that reads as 0 or 1 whatever was
+// written to it, which is what an address-aware memory test looks for. Every
+// read sees it -- a kernel's loads and atomics, and copies back to the host.
+// The offset counts bytes from the start of the device's memory, which is
+// where its first allocation starts; allocations follow in order and are never
+// moved or reused. A cell stays stuck across a driver reload, as a real one
+// does, until cleared.
+inline constexpr uint32_t kStuckCells = 16;
+struct StuckCell {
+  uint64_t offset;
+  uint32_t bit;     // 0-7, within the byte
+  uint32_t value;   // what it reads as
+};
+// Throws std::length_error when kStuckCells are already stuck.
+void stick(const std::string& uuid, uint64_t offset, uint32_t bit, uint32_t value);
+void unstick_all(const std::string& uuid);
+std::vector<StuckCell> stuck_cells(const std::string& uuid);
 
 // ---- The kernel log ---------------------------------------------------------
 //
@@ -167,6 +198,10 @@ void log_kernel(const std::string& message);
 // error no process caused, which the driver prints as pid='<unknown>'.
 std::string xid_line(const std::string& bus_id, int xid, const std::string& process,
                      const std::string& detail);
+
+// The amdgpu driver's line for ECC errors it counted in a RAS block: device
+// memory is the UMC block, the on-chip memories GFX.
+std::string amdgpu_ras_line(const std::string& bus_id, Severity s, Location l, uint64_t n);
 
 // The kernel's AER line for a PCIe error on bus_id, or "" for a counter AER
 // does not report (NAKs, lane errors, recovery entries).

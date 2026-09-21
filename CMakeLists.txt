@@ -437,7 +437,7 @@ endif()
 
 # CLI
 add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/test.cpp
-               src/cli/fault.cpp src/cli/machine.cpp)
+               src/cli/fault.cpp src/cli/machine.cpp src/cli/amdsmi.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
 # Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /
@@ -449,6 +449,7 @@ add_custom_command(TARGET vgpu_cli POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/nvidia/tools/nvidia-smi" "${CMAKE_BINARY_DIR}/bin/nvidia-smi"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/nvidia/tools/nvcc" "${CMAKE_BINARY_DIR}/bin/nvcc"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/amd/tools/rocm-smi" "${CMAKE_BINARY_DIR}/bin/rocm-smi"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/amd/tools/amd-smi" "${CMAKE_BINARY_DIR}/bin/amd-smi"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/amd/tools/rocm_agent_enumerator" "${CMAKE_BINARY_DIR}/bin/rocm_agent_enumerator"
   COMMENT "Installing drop-in monitoring tools into build/bin")
 

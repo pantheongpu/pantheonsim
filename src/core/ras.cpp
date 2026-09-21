@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstddef>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -22,8 +23,9 @@ namespace vgpu::ras {
 namespace {
 
 constexpr uint32_t kMagic = 0x56524153;  // "VRAS"
-constexpr uint32_t kVersion = 5;  // 2: armed faults; 3: hangs and clock-event reasons; 4: events;
-                                  // 5: faults armed on stores and shared memory
+constexpr uint32_t kVersion = 7;  // 2: armed faults; 3: hangs and clock-event reasons; 4: events;
+                                  // 5: faults armed on stores and shared memory; 6: stuck cells;
+                                  // 7: faults armed on arithmetic results
 
 struct File {
   uint32_t magic;
@@ -166,8 +168,13 @@ void inject_pcie(const std::string& uuid, Pcie c, uint64_t n) {
 void reset_volatile(const std::string& uuid, bool driver_reload) {
   {
     Mapped v(volatile_path(uuid), false);
+    // Everything but the stuck cells, which a driver reload does not mend.
+    constexpr size_t kStuckFirst = offsetof(Counters, stuck_count) / sizeof(uint64_t);
+    constexpr size_t kStuckEnd = kStuckFirst + 1 + kStuckCells * 2;
+    static_assert(offsetof(Counters, stuck) == (kStuckFirst + 1) * sizeof(uint64_t));
     if (uint64_t* w = v.words())
-      for (size_t i = 0; i < kWords; ++i) set(&w[i], 0);
+      for (size_t i = 0; i < kWords; ++i)
+        if (i < kStuckFirst || i >= kStuckEnd) set(&w[i], 0);
   }
   if (!driver_reload) return;
   // Pending retirements and remaps take effect at a driver load.
@@ -225,7 +232,7 @@ namespace {
 uint32_t armed_slot(Armed kind) {
   return kind == Armed::Corrected ? 0 : kind == Armed::Uncorrected ? 1 : 2;
 }
-constexpr const char* kTargetNames[kTargets] = {"load", "store", "shared"};
+constexpr const char* kTargetNames[kTargets] = {"load", "store", "shared", "alu"};
 }  // namespace
 
 const char* target_name(Target t) { return kTargetNames[static_cast<uint32_t>(t)]; }
@@ -249,6 +256,8 @@ void arm(const std::string& uuid, Armed kind, uint64_t n, Target at) {
   if (n == 0 || kind == Armed::None || kind == Armed::Hang) return;
   if (at == Target::Store && kind != Armed::Bitflip)
     throw std::invalid_argument("an ECC error is found when memory is read, not written");
+  if (at == Target::Alu && kind != Armed::Bitflip)
+    throw std::invalid_argument("no ECC covers an arithmetic result");
   Mapped v(volatile_path(uuid), true);
   Counters* c = v.counters();
   const uint32_t t = static_cast<uint32_t>(at);
@@ -290,6 +299,76 @@ Armed ArmedFaults::take(Target at) {
 }
 
 void ArmedFaults::note_bitflip() { add(&impl_->file.counters()->bitflips_delivered, 1); }
+
+// ---- Stuck cells --------------------------------------------------------------
+
+namespace {
+constexpr uint64_t kStuckValid = uint64_t{1} << 63;
+constexpr uint64_t kStuckClaimed = uint64_t{1} << 62;   // being written
+}  // namespace
+
+void stick(const std::string& uuid, uint64_t offset, uint32_t bit, uint32_t value) {
+  if (bit > 7) throw std::invalid_argument("a stuck bit is 0-7 within its byte");
+  Mapped v(volatile_path(uuid), true);
+  Counters* c = v.counters();
+  const uint64_t word = kStuckValid | uint64_t{value ? 1u : 0u} << 8 | bit;
+  // The same bit again changes what it is stuck at.
+  for (auto& cell : c->stuck) {
+    const uint64_t w = __atomic_load_n(&cell[1], __ATOMIC_ACQUIRE);
+    if ((w & kStuckValid) && (w & 0xFF) == bit && __atomic_load_n(&cell[0], __ATOMIC_RELAXED) == offset) {
+      __atomic_store_n(&cell[1], word, __ATOMIC_RELEASE);
+      return;
+    }
+  }
+  for (auto& cell : c->stuck) {
+    uint64_t free_slot = 0;
+    if (!__atomic_compare_exchange_n(&cell[1], &free_slot, kStuckClaimed, false, __ATOMIC_ACQ_REL,
+                                     __ATOMIC_RELAXED))
+      continue;
+    __atomic_store_n(&cell[0], offset, __ATOMIC_RELAXED);
+    __atomic_store_n(&cell[1], word, __ATOMIC_RELEASE);   // published last
+    add(&c->stuck_count, 1);
+    return;
+  }
+  throw std::length_error("already " + std::to_string(kStuckCells) + " stuck cells on this GPU");
+}
+
+void unstick_all(const std::string& uuid) {
+  Mapped v(volatile_path(uuid), false);
+  Counters* c = v.counters();
+  if (!c) return;
+  set(&c->stuck_count, 0);
+  for (auto& cell : c->stuck) __atomic_store_n(&cell[1], uint64_t{0}, __ATOMIC_RELEASE);
+}
+
+std::vector<StuckCell> stuck_cells(const std::string& uuid) {
+  std::vector<StuckCell> out;
+  Mapped v(volatile_path(uuid), false);
+  const Counters* c = v.counters();
+  if (!c) return out;
+  for (const auto& cell : c->stuck) {
+    const uint64_t w = __atomic_load_n(&cell[1], __ATOMIC_ACQUIRE);
+    if (w & kStuckValid)
+      out.push_back({__atomic_load_n(&cell[0], __ATOMIC_RELAXED), static_cast<uint32_t>(w & 0xFF),
+                     static_cast<uint32_t>((w >> 8) & 1)});
+  }
+  return out;
+}
+
+const uint64_t* ArmedFaults::stuck_pending() const { return &impl_->file.counters()->stuck_count; }
+
+void ArmedFaults::apply_stuck(uint64_t offset, uint8_t* bytes, uint64_t len) const {
+  const Counters* c = impl_->file.counters();
+  for (const auto& cell : c->stuck) {
+    const uint64_t w = __atomic_load_n(&cell[1], __ATOMIC_ACQUIRE);
+    if (!(w & kStuckValid)) continue;
+    const uint64_t at = __atomic_load_n(&cell[0], __ATOMIC_RELAXED);
+    if (at < offset || at - offset >= len) continue;
+    const uint8_t mask = static_cast<uint8_t>(1u << (w & 7));
+    uint8_t& b = bytes[at - offset];
+    b = ((w >> 8) & 1) ? static_cast<uint8_t>(b | mask) : static_cast<uint8_t>(b & ~mask);
+  }
+}
 
 // ---- The kernel log ---------------------------------------------------------
 
@@ -344,6 +423,13 @@ std::string xid_line(const std::string& bus_id, int xid, const std::string& proc
                 xid, process.empty() ? "pid='<unknown>', name=<unknown>" : process.c_str(),
                 detail.c_str());
   return out;
+}
+
+std::string amdgpu_ras_line(const std::string& bus_id, Severity s, Location l, uint64_t n) {
+  const std::string bdf = bus_id.size() > 4 && bus_id.compare(0, 4, "0000") == 0 ? bus_id.substr(4) : bus_id;
+  return "amdgpu " + bdf + ": amdgpu: " + std::to_string(n) + " " +
+         (s == Severity::Corrected ? "correctable" : "uncorrectable") +
+         " hardware errors detected in " + (l == Location::DeviceMemory ? "umc" : "gfx") + " block";
 }
 
 std::string aer_line(const std::string& bus_id, Pcie c) {

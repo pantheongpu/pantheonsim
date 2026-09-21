@@ -1524,14 +1524,17 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
 
 }  // namespace
 
+// amd-smi (amdsmi.cpp).
+int cmd_amd_smi(const std::vector<std::string>& args);
+
 int cmd_smi(const std::vector<std::string>& args) {
   // rocm-smi has arguments of its own, some of which mean something else to
   // nvidia-smi (-i, -d), so it gets its own parser.
   for (size_t k = 0; k < args.size(); ++k) {
-    if (args[k] == "--rocm") {
+    if (args[k] == "--rocm" || args[k] == "--amd") {
       std::vector<std::string> rest(args.begin(), args.end());
       rest.erase(rest.begin() + static_cast<std::ptrdiff_t>(k));
-      return cmd_rocm_smi(rest);
+      return args[k] == "--rocm" ? cmd_rocm_smi(rest) : cmd_amd_smi(rest);
     }
   }
 

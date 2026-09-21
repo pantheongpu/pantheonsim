@@ -290,8 +290,11 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
     case Err::InvalidPointer:
     case Err::UseAfterFree:
     case Err::OutOfBounds:
-    case Err::MisalignedAccess:
       code = in_kernel(api) ? cudaErrorIllegalAddress : cudaErrorInvalidValue;
+      break;
+    // A kernel's misaligned access has a code of its own on hardware (716).
+    case Err::MisalignedAccess:
+      code = in_kernel(api) ? cudaErrorMisalignedAddress : cudaErrorInvalidValue;
       break;
     case Err::UninitializedRegister: code = cudaErrorIllegalAddress; break;
     // "trap" is what a failed device assert and an unreachable path compile to,

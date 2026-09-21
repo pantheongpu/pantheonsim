@@ -68,7 +68,26 @@ import json, sys
 c = json.load(sys.stdin)["card0"]
 print(c["UMC uncorrectable errors"], c["GFX correctable errors"])' 2>&1)
   expect "rocm-smi puts memory errors on UMC and on-chip ones on GFX" "2 1" "$got"
+  got=$(amd smi --amd metric -e -k --gpu 0 --json | python3 -c '
+import json, sys
+g = json.load(sys.stdin)[0]
+e, b = g["ecc"], g["ecc_blocks"]
+print(g["gpu"], e["total_uncorrectable_count"], e["total_correctable_count"], e["cache_correctable_count"],
+      b["UMC"]["uncorrectable_count"], b["GFX"]["correctable_count"], b["SDMA"]["correctable_count"])' 2>&1)
+  expect "amd-smi agrees, in its own shape: totals, cache and per block" "0 2 1 1 2 1 0" "$got"
+  got=$(amd smi --amd list --json | python3 -c '
+import json, sys
+g = json.load(sys.stdin)[0]
+print(g["gpu"], g["bdf"], g["node_id"], g["partition_id"])' 2>&1)
+  expect "amd-smi lists the GPU at its four-digit-domain address" "0 0000:01:00.0 1 0" "$got"
 fi
+expect "amd-smi ras --cper lists the records as text, as it does even under --json" \
+  "NONFATAL-UNCORRECTED NONFATAL-CORRECTED" \
+  "$(amd smi --amd ras --cper --gpu 0 --json | awk 'NR > 2 {printf "%s%s", sep, $NF; sep = " "}')"
+expect "and filters them by severity" "1" \
+  "$(amd smi --amd ras --cper --severity nonfatal-corrected | awk 'NR > 2' | wc -l | tr -d ' ')"
+t4 smi --amd list >/dev/null; expect "amd-smi on an NVIDIA machine finds no AMD GPU" "1" "$?"
+amd smi --amd metric -p >/dev/null; expect "amd-smi refuses a metric it does not model" "2" "$?"
 
 # Inside a session the driver and the kernel log what happened, in their forms.
 sess="$tmp/session"
@@ -83,6 +102,12 @@ expect "a fatal PCIe error is logged by AER; a NAK is not" "1 4" \
   "$(grep -c 'pcieport 0000:00:01.0: AER: Uncorrected (Fatal) error received: 0000:02:00.0' "$sess/dmesg.log") $(wc -l < "$sess/dmesg.log" | tr -d ' ')"
 expect "logged lines are stamped after the boot log" "yes" \
   "$(awk -F'[][]' 'NR > 1 && $2 + 0 <= 3.141593 { bad = 1 } END { print bad ? "no" : "yes" }' "$sess/dmesg.log")"
+: > "$sess/dmesg.log"
+VGPU_SESSION="$sess" amd fault inject --ecc uncorrected --count 2 >/dev/null
+VGPU_SESSION="$sess" amd fault inject --ecc corrected --location l2_cache >/dev/null
+expect "amdgpu logs its counts by RAS block, and no NVIDIA Xid" \
+  "amdgpu 0000:01:00.0: amdgpu: 2 uncorrectable hardware errors detected in umc block|amdgpu 0000:01:00.0: amdgpu: 1 correctable hardware errors detected in gfx block|0" \
+  "$(sed 's/^\[[^]]*\] //' "$sess/dmesg.log" | paste -sd'|')|$(grep -c 'NVRM' "$sess/dmesg.log")"
 
 out=$(VGPU_GPU=nvidia/rtx3060 VGPU_DEVICE_COUNT=1 "$vgpu" fault arm --ecc uncorrected 2>&1); rc=$?
 expect "ECC faults cannot be armed on a card without ECC" "2 yes" "$rc $(grep -q 'has no ECC' <<< "$out" && echo yes || echo no)"

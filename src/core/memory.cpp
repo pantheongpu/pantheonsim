@@ -369,7 +369,11 @@ void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
   uint64_t base = 0;
   const Allocation& a = resolve(src, len, "device memory read", &base);
   uint8_t* d = static_cast<uint8_t*>(dst);
-  uint64_t off = src - base;
+  read_chunks(a, src - base, d, len);
+  if (any_stuck()) access_fault_->on_read(src - va_base_, d, len);
+}
+
+void MemoryManager::read_chunks(const Allocation& a, uint64_t off, uint8_t* d, uint64_t len) const {
   while (len > 0) {
     uint64_t chunk_idx = off / kChunkSize;
     uint64_t chunk_off = off % kChunkSize;
@@ -425,6 +429,9 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
       read(addr, &v, size);  // little-endian host assumption, documented in ARCHITECTURE.md
       return v;
   }
+  // What the cells hold, stuck bits included (little-endian, as above), and
+  // then whatever fault is armed for the load.
+  if (any_stuck()) access_fault_->on_read(addr - va_base_, reinterpret_cast<uint8_t*>(&v), size);
   if (access_fault_ && access_fault_->load_pending &&
       __atomic_load_n(access_fault_->load_pending, __ATOMIC_RELAXED))
     return access_fault_->on_load(addr, size, v);

@@ -43,7 +43,7 @@ Working today, all CPU-only:
 | Multi-GPU | a virtual rack of N devices with disjoint address windows; peer copies and per-device isolation match a real two-GPU machine |
 | Vendor libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP and nvJPEG under their real sonames, each differential-tested against NVIDIA's own library on a physical GPU — see [nvidia/docs/libraries.md](nvidia/docs/libraries.md) |
 | Python JIT | Numba runs unmodified (its PTX is assembled through the driver's JIT link API); Triton runs with a one-line hook that stops its pipeline at PTX — see [nvidia/docs/jit.md](nvidia/docs/jit.md) |
-| Discovery | live telemetry + NVML; drop-in `nvidia-smi`, `rocm-smi`, `rocm_agent_enumerator`, and `lspci` output — see [docs/telemetry.md](docs/telemetry.md) |
+| Discovery | live telemetry + NVML; drop-in `nvidia-smi`, `rocm-smi`, `amd-smi`, `rocm_agent_enumerator`, and `lspci` output — see [docs/telemetry.md](docs/telemetry.md) |
 | NVENC | `libnvidia-encode.so.1` with a deterministic content-derived encoder, so video-encode SDC tests run |
 | Proof | an nvcc-compiled CUDA program **and** the unmodified pantheon stress kernels run on the CPU; `memory_read` differential-matches a physical RTX 3060 (incl. fault injection + device printf) |
 
@@ -92,7 +92,7 @@ Then:
 build/bin/vgpu shell        # pick a GPU, CUDA/driver and OS, then get a shell
 ```
 
-Inside it, `nvidia-smi`, `rocm-smi`, `rocm_agent_enumerator`, `lspci`, `dmesg`,
+Inside it, `nvidia-smi`, `rocm-smi`, `amd-smi`, `rocm_agent_enumerator`, `lspci`, `dmesg`,
 `uname` and `/proc/driver/nvidia/version` all reflect the machine you asked
 for, and CUDA programs run on the CPU engine. See
 [docs/machine-simulator.md](docs/machine-simulator.md).

@@ -80,8 +80,11 @@ class Device {
 
  private:
   // Delivers faults armed with `vgpu fault arm` to this device: to its kernel
-  // loads, and a hang to its next launch.
+  // accesses, and a hang to its next launch. It also logs the Xid a kernel's
+  // own fault raises.
   void install_fault_hook();
+  void run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
+                  const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms);
   std::unique_ptr<class FaultHook> fault_;
   DeviceProfile profile_;
   int ordinal_;
