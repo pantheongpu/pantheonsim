@@ -392,17 +392,17 @@ int cmd_fault(const std::vector<std::string>& args) {
     // The driver's log of it: Xid 48 for an uncorrectable error in device
     // memory, and Xid 63 for the page or row it takes out of service.
     if (severity == vgpu::ras::Severity::Uncorrected && loc == vgpu::ras::Location::DeviceMemory) {
-      vgpu::ras::log_kernel(vgpu::ras::xid_line(
-          d.bus_id, 48, "",
+      vgpu::ras::report_xid(
+          d.uuid, d.bus_id, 48, "",
           "An uncorrectable double bit error (DBE) has been detected on GPU in the framebuffer at "
-          "partition 0, subpartition 0."));
+          "partition 0, subpartition 0.");
       if (scheme_of(d) == vgpu::ras::Retirement::Pages)
-        vgpu::ras::log_kernel(vgpu::ras::xid_line(
-            d.bus_id, 63, "",
-            "ECC page retirement recording event: a page is pending retirement, reboot to activate."));
+        vgpu::ras::report_xid(
+            d.uuid, d.bus_id, 63, "",
+            "ECC page retirement recording event: a page is pending retirement, reboot to activate.");
       else if (scheme_of(d) == vgpu::ras::Retirement::Rows)
-        vgpu::ras::log_kernel(vgpu::ras::xid_line(
-            d.bus_id, 63, "", "Row Remapper: New row marked for remapping, reset gpu to activate."));
+        vgpu::ras::report_xid(
+            d.uuid, d.bus_id, 63, "", "Row Remapper: New row marked for remapping, reset gpu to activate.");
     }
     std::printf("Injected %lld %s %s ECC error%s into GPU %u (%s).\n", count, ecc.c_str(),
                 vgpu::ras::location_name(loc), count == 1 ? "" : "s", i, d.name);

@@ -152,6 +152,16 @@ reading agrees with them: nvidia-smi's and NVML's reasons and their time
 counters, a thermal slowdown's temperature at the slowdown threshold, a power
 cap's draw at the limit, and a slowdown's SM clock pulled down.
 
+Every ECC error and Xid is also an NVML event, so a health daemon blocked in
+`nvmlEventSetWait` wakes up the way it does on a real machine, whichever
+process injected or hit the fault. A card offers the events it could raise:
+Xid on all of them, single- and double-bit ECC only where the card has ECC
+(`nvmlDeviceGetSupportedEventTypes`), and registering for any other type is
+`NVML_ERROR_NOT_SUPPORTED`. A waiter sees what happens after it registers, and
+the last 32 events per GPU are kept for waiters that fall behind; a driver
+reload (`vgpu fault reset --volatile`) clears them with the other volatile
+state. One `vgpu fault inject --count N` raises one ECC event, not N.
+
 ## lspci
 
 `vgpu smi --lspci` prints the listing directly. `vgpu smi --lspci-dump`

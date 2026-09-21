@@ -264,9 +264,9 @@ class FaultHook final : public MemoryManager::LoadFault {
       if (seconds && waited >= static_cast<double>(seconds)) break;
     }
     if (pub) pub->note_kernel(ord, 0.0);
-    ras::log_kernel(ras::xid_line(bus_id_, 8,
+    ras::report_xid(uuid_, bus_id_, 8,
                                   "pid=" + std::to_string(::getpid()) + ", name=" + process_name(),
-                                  "GPU stopped processing"));
+                                  "GPU stopped processing");
     throw Error::make(Err::ExecLimit, "kernel '", kernel, "' hung for ", seconds,
                       " s and was stopped (armed with `vgpu fault arm --hang`)");
   }
@@ -288,16 +288,16 @@ class FaultHook final : public MemoryManager::LoadFault {
     }
     ras::inject_ecc(uuid_, ras::Severity::Uncorrected, ras::Location::DeviceMemory, 1, scheme_);
     const std::string who = "pid=" + std::to_string(::getpid()) + ", name=" + process_name();
-    ras::log_kernel(ras::xid_line(bus_id_, 48, who,
+    ras::report_xid(uuid_, bus_id_, 48, who,
                                   "An uncorrectable double bit error (DBE) has been detected on GPU "
-                                  "in the framebuffer at partition 0, subpartition 0."));
+                                  "in the framebuffer at partition 0, subpartition 0.");
     if (scheme_ == ras::Retirement::Pages)
-      ras::log_kernel(ras::xid_line(bus_id_, 63, "",
+      ras::report_xid(uuid_, bus_id_, 63, "",
                                     "ECC page retirement recording event: a page is pending "
-                                    "retirement, reboot to activate."));
+                                    "retirement, reboot to activate.");
     else if (scheme_ == ras::Retirement::Rows)
-      ras::log_kernel(ras::xid_line(bus_id_, 63, "",
-                                    "Row Remapper: New row marked for remapping, reset gpu to activate."));
+      ras::report_xid(uuid_, bus_id_, 63, "",
+                                    "Row Remapper: New row marked for remapping, reset gpu to activate.");
     char at[32];
     std::snprintf(at, sizeof at, "0x%llx", static_cast<unsigned long long>(addr));
     throw Error::make(Err::EccUncorrectable, "uncorrectable ECC error in device memory at ", at,

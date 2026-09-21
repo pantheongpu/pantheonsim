@@ -452,8 +452,9 @@ narrows what counts as observable, not what the detector looks at.
   and rocm-smi (docs/telemetry.md). `vgpu fault arm` delivers bit flips and
   ECC errors to a running kernel's loads, and a session's dmesg carries Xid
   and AER lines. `vgpu fault arm --hang` stalls a launch, and `vgpu fault
-  throttle` makes clock-event reasons active with readings to match. Not yet:
-  nvmlEvent*, PCIe AER in sysfs, faults on stores and on shared memory.
+  throttle` makes clock-event reasons active with readings to match. ECC
+  errors and Xids are NVML events (nvmlEventSetWait). Not yet: PCIe AER in
+  sysfs, faults on stores and on shared memory, clock-change and power events.
 
 ## Not implemented (fails loudly, never silently)
 
