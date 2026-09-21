@@ -25,9 +25,11 @@ int usage(FILE* to) {
                "usage: vgpu fault inject [--gpu N] --ecc corrected|uncorrected [--location LOC] [--count N]\n"
                "       vgpu fault inject [--gpu N] --pcie COUNTER [--count N]\n"
                "       vgpu fault arm [--gpu N] --ecc corrected|uncorrected|--bitflip [--count N]\n"
-               "                      [--on load|store|shared|alu]\n"
+               "                      [--on load|store|shared|alu|copy]\n"
                "       vgpu fault arm [--gpu N] --hang [--seconds S]\n"
                "       vgpu fault stuck [--gpu N] --offset BYTES --bit B --value 0|1 | --clear\n"
+               "       vgpu fault lose [--gpu N] [--clear]\n"
+               "       vgpu fault link [--gpu N] [--gen G] [--width W] | --clear\n"
                "       vgpu fault throttle [--gpu N] --reason R[,R...] [--seconds S] | --clear\n"
                "       vgpu fault show [--gpu N]\n"
                "       vgpu fault reset [--gpu N] --volatile|--aggregate\n"
@@ -64,6 +66,10 @@ int usage(FILE* to) {
                "                    (tensor core) instructions. Bit flips only, in the upper\n"
                "                    half of the result's bits; no ECC covers an ALU, so nothing\n"
                "                    counts or reports them\n"
+               "  copy              copies out of device memory (to the host, or to another\n"
+               "                    buffer or GPU): an uncorrected error fails the copy with\n"
+               "                    cudaErrorECCUncorrectable, a bit flip corrupts what it\n"
+               "                    delivers and leaves memory as it was\n"
                "\n"
                "arm --hang stalls the next kernel launch, the device shown fully busy, for S\n"
                "seconds and then fails it with cudaErrorLaunchTimeout -- or, without --seconds,\n"
@@ -75,6 +81,15 @@ int usage(FILE* to) {
                "from the start of the device's memory, where its first allocation starts;\n"
                "allocations follow in order and are never moved. B is the bit, 0-7, within\n"
                "that byte. Up to 16 cells per GPU; a driver reload does not mend them.\n"
+               "\n"
+               "lose makes an NVIDIA GPU fall off the bus, logged as Xid 79: NVML answers\n"
+               "NVML_ERROR_GPU_IS_LOST for it, nvidia-smi reports it lost and exits 15, and a\n"
+               "program's next launch on it fails with an unspecified launch failure. A driver\n"
+               "reload does not bring it back; --clear does, as a reset would.\n"
+               "\n"
+               "link trains the PCIe link below what card and slot support -- generation G,\n"
+               "W lanes, or both -- as a bad riser or a marginal slot leaves it. The current\n"
+               "link reads degraded beside an unchanged maximum, until --clear.\n"
                "\n"
                "throttle makes clock-event reasons active, for S seconds or until --clear:\n"
                "sw_power_cap, hw_slowdown, sw_thermal_slowdown, hw_thermal_slowdown and\n"
@@ -145,13 +160,18 @@ void show(uint32_t index, const vgpu::telemetry::DeviceSample& d) {
     std::printf("  armed hang             next launch, %s\n",
                 now.hang_seconds ? (std::to_string(now.hang_seconds) + " s").c_str()
                                  : "until the process is stopped");
-  static constexpr const char* kOn[vgpu::ras::kTargets] = {"loads", "stores", "shared", "results"};
+  static constexpr const char* kOn[vgpu::ras::kTargets] = {"loads", "stores", "shared", "results",
+                                                           "copies"};
   for (uint32_t t = 0; t < vgpu::ras::kTargets; ++t)
     if (now.armed_pending[t])
       std::printf("  armed on %-13s corrected %llu, uncorrected %llu, bit flips %llu\n", kOn[t],
                   static_cast<unsigned long long>(now.armed[t][0]),
                   static_cast<unsigned long long>(now.armed[t][1]),
                   static_cast<unsigned long long>(now.armed[t][2]));
+  if (now.lost) std::printf("  bus                    fallen off (Xid 79) until cleared\n");
+  if (d.pcie_gen != d.pcie_gen_max || d.pcie_width != d.pcie_width_max)
+    std::printf("  PCIe link              Gen%u x%u, of Gen%u x%u, until cleared\n", d.pcie_gen, d.pcie_width,
+                d.pcie_gen_max, d.pcie_width_max);
   for (const auto& cell : vgpu::ras::stuck_cells(d.uuid))
     std::printf("  stuck cell             bit %u of byte 0x%llx reads as %u\n", cell.bit,
                 static_cast<unsigned long long>(cell.offset), cell.value);
@@ -165,22 +185,25 @@ int cmd_fault(const std::vector<std::string>& args) {
   if (args.empty()) return usage(stderr);
   const std::string& verb = args[0];
   if (verb == "-h" || verb == "--help" || verb == "help") return usage(stdout);
-  if (verb != "inject" && verb != "arm" && verb != "stuck" && verb != "throttle" && verb != "show" &&
-      verb != "reset") {
-    std::fprintf(stderr, "vgpu fault: unknown action '%s' (inject, arm, stuck, throttle, show or reset)\n",
+  if (verb != "inject" && verb != "arm" && verb != "stuck" && verb != "lose" && verb != "link" &&
+      verb != "throttle" && verb != "show" && verb != "reset") {
+    std::fprintf(stderr,
+                 "vgpu fault: unknown action '%s' (inject, arm, stuck, lose, link, throttle, show or "
+                 "reset)\n",
                  verb.c_str());
     return 2;
   }
 
   std::string gpu, ecc, location, pcie, reasons, on, offset_text;
-  long long bit = -1, value = -1;
+  long long bit = -1, value = -1, gen = 0, width = 0;
   bool vol = false, agg = false, bitflip = false, hang = false, clear = false;
   long long count = 1, seconds = -1;
   for (size_t i = 1; i < args.size(); ++i) {
     const std::string& a = args[i];
     const bool takes_value = a == "--gpu" || a == "--ecc" || a == "--location" || a == "--pcie" ||
                              a == "--count" || a == "--reason" || a == "--seconds" || a == "--on" ||
-                             a == "--offset" || a == "--bit" || a == "--value";
+                             a == "--offset" || a == "--bit" || a == "--value" ||
+                             a == "--gen" || a == "--width";
     if (takes_value && i + 1 >= args.size()) {
       std::fprintf(stderr, "vgpu fault: %s needs a value\n", a.c_str());
       return 2;
@@ -190,6 +213,15 @@ int cmd_fault(const std::vector<std::string>& args) {
     else if (a == "--location") location = args[++i];
     else if (a == "--on") on = args[++i];
     else if (a == "--offset") offset_text = args[++i];
+    else if (a == "--gen" || a == "--width") {
+      long long v = 0;
+      if (!vgpu::cli::parse_int(args[++i], 1, a == "--gen" ? 6 : 32, &v)) {
+        std::fprintf(stderr, "vgpu fault: %s needs a %s, got '%s'\n", a.c_str(),
+                     a == "--gen" ? "PCIe generation, 1-6" : "lane count", args[i].c_str());
+        return 2;
+      }
+      (a == "--gen" ? gen : width) = v;
+    }
     else if (a == "--bit") {
       if (!vgpu::cli::parse_int(args[++i], 0, 7, &bit)) {
         std::fprintf(stderr, "vgpu fault: --bit is 0-7, the bit within the byte, got '%s'\n",
@@ -248,8 +280,9 @@ int cmd_fault(const std::vector<std::string>& args) {
     std::fprintf(stderr, "vgpu fault %s: --reason belongs to throttle\n", verb.c_str());
     return 2;
   }
-  if (clear && verb != "throttle" && verb != "stuck") {
-    std::fprintf(stderr, "vgpu fault %s: --clear belongs to throttle and stuck\n", verb.c_str());
+  if (clear && verb != "throttle" && verb != "stuck" && verb != "lose" && verb != "link") {
+    std::fprintf(stderr, "vgpu fault %s: --clear belongs to throttle, stuck, lose and link\n",
+                 verb.c_str());
     return 2;
   }
   if (verb != "stuck" && (!offset_text.empty() || bit >= 0 || value >= 0)) {
@@ -361,6 +394,77 @@ int cmd_fault(const std::vector<std::string>& args) {
     return 0;
   }
 
+  if (verb != "link" && (gen || width)) {
+    std::fprintf(stderr, "vgpu fault %s: --gen and --width belong to link\n", verb.c_str());
+    return 2;
+  }
+  if (verb == "link") {
+    if (!ecc.empty() || !pcie.empty() || !location.empty() || vol || agg || bitflip || count != 1) {
+      std::fprintf(stderr, "vgpu fault link: takes --gen, --width, --clear and --gpu\n");
+      return 2;
+    }
+    if (clear == (gen || width)) {
+      std::fprintf(stderr, "vgpu fault link: name --gen, --width or both, or --clear\n");
+      return 2;
+    }
+    if (width && (width & (width - 1))) {
+      std::fprintf(stderr, "vgpu fault link: a link is 1, 2, 4, 8, 16 or 32 lanes, not %lld\n", width);
+      return 2;
+    }
+    for (uint32_t i : sel) {
+      const auto& d = snap.devices[i];
+      if (!d.pcie_gen_max) {
+        std::fprintf(stderr, "vgpu fault link: GPU %u (%s) has no PCIe link in its profile\n", i, d.name);
+        return 2;
+      }
+      if ((gen && gen >= d.pcie_gen_max) || (width && width >= d.pcie_width_max)) {
+        std::fprintf(stderr, "vgpu fault link: GPU %u (%s) trains at Gen%u x%u; a degraded link is "
+                             "below that\n",
+                     i, d.name, d.pcie_gen_max, d.pcie_width_max);
+        return 2;
+      }
+    }
+    for (uint32_t i : sel) {
+      const auto& d = snap.devices[i];
+      if (clear) {
+        vgpu::ras::restore_link(d.uuid);
+        std::printf("GPU %u (%s) is back at Gen%u x%u.\n", i, d.name, d.pcie_gen_max, d.pcie_width_max);
+      } else {
+        vgpu::ras::degrade_link(d.uuid, static_cast<uint32_t>(gen), static_cast<uint32_t>(width));
+        std::printf("GPU %u (%s) now trains at Gen%lld x%lld, of Gen%u x%u.\n", i, d.name,
+                    gen ? gen : static_cast<long long>(d.pcie_gen_max),
+                    width ? width : static_cast<long long>(d.pcie_width_max), d.pcie_gen_max,
+                    d.pcie_width_max);
+      }
+    }
+    return 0;
+  }
+
+  if (verb == "lose") {
+    if (!ecc.empty() || !pcie.empty() || !location.empty() || vol || agg || bitflip || count != 1) {
+      std::fprintf(stderr, "vgpu fault lose: takes --clear and --gpu\n");
+      return 2;
+    }
+    for (uint32_t i : sel)
+      if (std::strcmp(snap.devices[i].vendor, "amd") == 0) {
+        std::fprintf(stderr, "vgpu fault lose: GPU %u (%s) is AMD; a lost GPU is modelled for NVIDIA "
+                             "only\n",
+                     i, snap.devices[i].name);
+        return 2;
+      }
+    for (uint32_t i : sel) {
+      const auto& d = snap.devices[i];
+      if (clear) {
+        vgpu::ras::recover(d.uuid);
+        std::printf("GPU %u (%s) is back on the bus.\n", i, d.name);
+      } else {
+        vgpu::ras::lose(d.uuid, d.bus_id);
+        std::printf("GPU %u (%s) has fallen off the bus.\n", i, d.name);
+      }
+    }
+    return 0;
+  }
+
   if (verb == "show") {
     if (!ecc.empty() || !pcie.empty() || !location.empty() || vol || agg || bitflip) {
       std::fprintf(stderr, "vgpu fault show: takes only --gpu\n");
@@ -430,7 +534,8 @@ int cmd_fault(const std::vector<std::string>& args) {
     }
     vgpu::ras::Target at = vgpu::ras::Target::Load;
     if (!on.empty() && !vgpu::ras::parse_target(on, &at)) {
-      std::fprintf(stderr, "vgpu fault arm: --on is load, store, shared or alu, got '%s'\n", on.c_str());
+      std::fprintf(stderr, "vgpu fault arm: --on is load, store, shared, alu or copy, got '%s'\n",
+                   on.c_str());
       return 2;
     }
     if (at == vgpu::ras::Target::Store && kind != vgpu::ras::Armed::Bitflip) {
@@ -448,6 +553,7 @@ int cmd_fault(const std::vector<std::string>& args) {
     const char* accesses = at == vgpu::ras::Target::Store    ? "device-memory stores"
                            : at == vgpu::ras::Target::Shared ? "shared-memory loads"
                            : at == vgpu::ras::Target::Alu    ? "arithmetic results"
+                           : at == vgpu::ras::Target::Copy   ? "copies out of device memory"
                                                              : "device-memory loads";
     for (uint32_t i : sel) {
       vgpu::ras::arm(snap.devices[i].uuid, kind, static_cast<uint64_t>(count), at);

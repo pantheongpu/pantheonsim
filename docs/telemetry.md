@@ -162,6 +162,12 @@ check of only the last pass misses a flip in an earlier one.
 vgpu fault arm --bitflip --on alu --count 5
 ```
 
+`--on copy` puts a fault on copies out of device memory -- to the host, to
+another buffer or to another GPU. A corrected error is counted; an
+uncorrectable one is counted, logged, and fails the copy with
+`cudaErrorECCUncorrectable`, which poisons the context as a kernel's would; a
+bit flip corrupts what that one copy delivers and leaves memory as it was.
+
 An armed fault strikes whichever access comes next. A stuck cell stays at one
 address: a bit that reads as 0 or 1 whatever is written to it, as a failed cell
 does, on every read -- a kernel's loads and atomics, and copies back to the
@@ -185,6 +191,44 @@ allocation covers as Xid 31, an MMU fault naming the page and the access, and a
 misaligned access, or a shared- or local-memory access out of range, as Xid 13,
 an exception the SM raises. Faults only this simulator finds (a data race, an
 uninitialized register) have no Xid.
+
+The session's sysfs keeps the counts too, and they read live:
+`/sys/class/drm/cardN/device/aer_dev_correctable`, `aer_dev_nonfatal` and
+`aer_dev_fatal` in the kernel's AER stats form, and on an AMD card amdgpu's
+`ras/umc_err_count`, `ras/gfx_err_count` and the other blocks' (`ue: N`,
+`ce: N`). An injected PCIe counter lands on the AER bit it corresponds to: a
+replay is a replay-timer Timeout, a replay rollover is Rollover, an LCRC or bad
+TLP is BadTLP, an unspecified correctable error is RxErr, and unspecified
+non-fatal and fatal errors are a completion timeout and a data link protocol
+error, the default severities of each.
+
+A GPU can also fall off the bus:
+
+```bash
+vgpu fault lose --gpu 1        # Xid 79
+vgpu fault lose --gpu 1 --clear
+```
+
+NVML still counts it but answers `NVML_ERROR_GPU_IS_LOST` for its handle and
+every query about it; nvidia-smi reports the other GPUs, prints "Unable to
+determine the device handle for GPU...: GPU is lost" for it and exits 15; and a
+program's next launch on it fails with `cudaErrorLaunchFailure` (719), what
+programs report when it happens. A driver reload does not bring it back;
+`--clear` does, as a reset would. It is modelled for NVIDIA GPUs only.
+
+A link can train below what card and slot support, as a bad riser, a dirty
+contact or a marginal slot leaves it:
+
+```bash
+vgpu fault link --gpu 0 --width 4          # x4 of x8
+vgpu fault link --gpu 1 --gen 1 --width 2
+vgpu fault link --clear
+```
+
+The link's current generation and width read degraded -- nvidia-smi's
+`pcie.link.gen.current` and `pcie.link.width.current`, `-q`'s GPU Link Info,
+NVML's `nvmlDeviceGetCurrPcieLink*` -- beside its unchanged maximum. A driver
+reload does not retrain it; `--clear` does.
 
 Two more faults a health tool has to handle:
 

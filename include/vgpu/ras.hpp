@@ -58,8 +58,8 @@ struct Counters {
   // Faults armed for delivery to a running kernel (volatile file only), by
   // where they are taken (Target) and then corrected, uncorrected, bit flip;
   // how many are armed at each target; and the silent bit flips delivered.
-  uint64_t armed[4][3];
-  uint64_t armed_pending[4];
+  uint64_t armed[5][3];
+  uint64_t armed_pending[5];
   uint64_t bitflips_delivered;
   // A kernel hang armed for the next launch (not counted in armed_total, which
   // loads read), and how long it lasts: 0 is until the process is stopped.
@@ -72,8 +72,11 @@ struct Counters {
   // written, and a ring of {seq, type, data, time_ns}.
   uint64_t event_seq;
   uint64_t events[32][4];
-  // Stuck cells (volatile file only, kept across a driver reload): how many,
-  // and up to 16 of {byte offset, kStuckValid | value << 8 | bit}.
+  // Whether the GPU has fallen off the bus, and stuck cells: how many, and up
+  // to 16 of {byte offset, kStuckValid | value << 8 | bit}. Volatile file only,
+  // and kept across a driver reload.
+  uint64_t lost;
+  uint64_t link_gen, link_width;   // a degraded link (`vgpu fault link`); 0 is as trained
   uint64_t stuck_count;
   uint64_t stuck[16][2];
 
@@ -115,6 +118,20 @@ bool parse_pcie(const std::string& s, Pcie* out);
 // Where aggregate state is kept (see above).
 std::string state_dir();
 
+// ---- The session's sysfs ------------------------------------------------------
+//
+// Inside `vgpu shell`, the files the kernel and amdgpu keep for a device --
+// the PCIe AER stats (aer_dev_correctable, aer_dev_nonfatal, aer_dev_fatal)
+// and amdgpu's per-block ras/*_err_count -- rewritten from this state whenever
+// a count changes, under <session>/ras/<uuid>/. The session's
+// /sys/class/drm/cardN/device links to them. Outside a session (no
+// VGPU_SESSION, or `session` empty) this does nothing.
+void publish_session(const std::string& uuid, const std::string& session = "");
+// amdgpu's RAS blocks with an err_count file, in its names.
+inline constexpr const char* kAmdgpuRasBlocks[] = {"umc", "sdma", "gfx", "mmhub", "pcie_bif", "hdp",
+                                                    "xgmi_wafl"};
+inline constexpr const char* kAerFiles[] = {"aer_dev_correctable", "aer_dev_nonfatal", "aer_dev_fatal"};
+
 // ---- Faults delivered to a running kernel -----------------------------------
 //
 // `vgpu fault arm` loads faults that a running kernel's next accesses take: a
@@ -128,9 +145,11 @@ enum class Armed : uint32_t { None, Corrected, Uncorrected, Bitflip, Hang };
 // next read finds), shared-memory loads, whose ECC errors count as the L1
 // cache's since shared memory and L1 are one SRAM, or floating-point and
 // matrix results (bit flips only: no ECC covers an ALU, so nothing counts or
-// reports the error -- silent data corruption, which result checks catch).
-enum class Target : uint32_t { Load, Store, Shared, Alu };
-inline constexpr uint32_t kTargets = 4;
+// reports the error -- silent data corruption, which result checks catch), or
+// copies out of device memory: a corrected error is counted, an uncorrectable
+// one fails the copy, and a bit flip corrupts what that copy delivers.
+enum class Target : uint32_t { Load, Store, Shared, Alu, Copy };
+inline constexpr uint32_t kTargets = 5;
 static_assert(sizeof(Counters::armed_pending) / sizeof(uint64_t) == kTargets);
 const char* target_name(Target t);
 bool parse_target(const std::string& s, Target* out);
@@ -158,6 +177,8 @@ class ArmedFaults {
   bool take_hang(uint64_t* seconds);
   // Non-zero while any cell is stuck.
   const uint64_t* stuck_pending() const;
+  // Whether the GPU has fallen off the bus.
+  bool lost() const;
   // Forces the stuck bits that fall in `len` bytes read from `offset`.
   void apply_stuck(uint64_t offset, uint8_t* bytes, uint64_t len) const;
 
@@ -185,6 +206,16 @@ struct StuckCell {
 void stick(const std::string& uuid, uint64_t offset, uint32_t bit, uint32_t value);
 void unstick_all(const std::string& uuid);
 std::vector<StuckCell> stuck_cells(const std::string& uuid);
+
+// ---- A GPU that has fallen off the bus ------------------------------------------
+//
+// `vgpu fault lose`: the GPU stops answering, as one does after Xid 79. NVML
+// answers NVML_ERROR_GPU_IS_LOST for it, nvidia-smi reports it lost and exits
+// 15, and a program's next launch on it fails. A driver reload does not bring
+// it back; `vgpu fault lose --clear` does, as a reset or reboot would.
+void lose(const std::string& uuid, const std::string& bus_id);
+void recover(const std::string& uuid);
+bool is_lost(const std::string& uuid);
 
 // ---- The kernel log ---------------------------------------------------------
 //
@@ -228,6 +259,18 @@ void clear_throttle(const std::string& uuid);
 // hardware reasons, to three quarters for the software ones). Sets
 // d.clock_event_reasons; returns it.
 uint64_t apply_throttle(telemetry::DeviceSample& d);
+
+// ---- A degraded PCIe link (`vgpu fault link`) ---------------------------------
+//
+// The link trained below what the card and slot support -- a lower generation,
+// fewer lanes, or both -- as a bad riser, a dirty contact or a marginal slot
+// leaves it. Reported as the link's current state, beside its unchanged
+// maximum. A driver reload does not retrain it; clearing does, as a reset would.
+// gen or width 0 leaves that half as trained.
+void degrade_link(const std::string& uuid, uint32_t gen, uint32_t width);
+void restore_link(const std::string& uuid);
+// Applies the degraded link to a reading, as apply_throttle does its reasons.
+void apply_link(telemetry::DeviceSample& d);
 
 // How long a reason has been active, over every window, in microseconds.
 uint64_t throttle_time_us(const std::string& uuid, uint64_t reason);

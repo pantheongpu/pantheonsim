@@ -459,9 +459,12 @@ narrows what counts as observable, not what the detector looks at.
   `vgpu fault stuck` fixes a bit at an address for every read. Atomics take
   what loads and stores take; `--on alu` puts silent flips in floating-point
   and matrix results. AMD: amd-smi (list, metric -e/-k, ras --cper)
-  and amdgpu's dmesg lines. Not yet: faults on copies (a copy engine's own
-  errors), PCIe AER and amdgpu RAS counts in sysfs, CPER record files,
-  clock-change and power events.
+  and amdgpu's dmesg lines. The session's sysfs has live AER stats and amdgpu
+  RAS counts, `vgpu fault lose` drops a GPU off the bus (Xid 79), and `vgpu
+  fault link` degrades its PCIe link. NVML's clock and P-state events are
+  documented as Kepler-only and its power-source event as a laptop's, so none
+  is offered. `--on copy` puts faults on copies out of device memory. Not yet:
+  CPER record files, a lost AMD GPU, the link in lspci's config space (phase 3).
 
 ## Not implemented (fails loudly, never silently)
 

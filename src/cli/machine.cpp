@@ -18,6 +18,7 @@ void apply_faults(vgpu::telemetry::Shared* snap) {
   for (uint32_t i = 0; i < snap->device_count; ++i) {
     try {
       vgpu::ras::apply_throttle(snap->devices[i]);
+      vgpu::ras::apply_link(snap->devices[i]);
     } catch (const std::exception&) {
     }
   }

@@ -109,6 +109,85 @@ expect "amdgpu logs its counts by RAS block, and no NVIDIA Xid" \
   "amdgpu 0000:01:00.0: amdgpu: 2 uncorrectable hardware errors detected in umc block|amdgpu 0000:01:00.0: amdgpu: 1 correctable hardware errors detected in gfx block|0" \
   "$(sed 's/^\[[^]]*\] //' "$sess/dmesg.log" | paste -sd'|')|$(grep -c 'NVRM' "$sess/dmesg.log")"
 
+# The session's sysfs: AER stats and amdgpu's per-block counts, rewritten as
+# counts change (the session links /sys/class/drm/cardN/device to them).
+uuid=$(amd smi --query-gpu=uuid --format=csv,noheader)
+VGPU_SESSION="$sess" amd fault inject --pcie bad_tlp --count 2 >/dev/null
+VGPU_SESSION="$sess" amd fault inject --pcie non_fatal >/dev/null
+ras="$sess/ras/$uuid"
+expect "amdgpu's counts per block, since the driver loaded" "ue: 4|ce: 0 ue: 0|ce: 2 ue: 0|ce: 0" \
+  "$(paste -sd'|' "$ras/umc_err_count") $(paste -sd'|' "$ras/gfx_err_count") $(paste -sd'|' "$ras/sdma_err_count")"
+expect "AER stats count a bad TLP as correctable and total it" "BadTLP 2 TOTAL_ERR_COR 2" \
+  "$(grep -E '^(BadTLP|TOTAL_ERR_COR) ' "$ras/aer_dev_correctable" | paste -sd' ')"
+expect "and an unspecified non-fatal error as a completion timeout" "CmpltTO 1 TOTAL_ERR_NONFATAL 1 TOTAL_ERR_FATAL 0" \
+  "$(grep -E '^(CmpltTO|TOTAL_ERR_NONFATAL) ' "$ras/aer_dev_nonfatal" | paste -sd' ') $(grep TOTAL "$ras/aer_dev_fatal")"
+VGPU_SESSION="$sess" amd fault reset --volatile >/dev/null
+expect "a driver reload starts them again" "ue: 0 TOTAL_ERR_COR 0" \
+  "$(head -1 "$ras/umc_err_count") $(grep TOTAL "$ras/aer_dev_correctable")"
+
+# A GPU that falls off the bus: logged as Xid 79, and gone from every surface.
+: > "$sess/dmesg.log"
+VGPU_SESSION="$sess" t4 fault lose --gpu 1 >/dev/null
+expect "falling off the bus is logged as the driver logs it" \
+  "NVRM: Xid (PCI:0000:02:00): 79, pid='<unknown>', name=<unknown>, GPU has fallen off the bus.|NVRM: GPU 0000:02:00.0: GPU has fallen off the bus." \
+  "$(sed 's/^\[[^]]*\] //' "$sess/dmesg.log" | paste -sd'|')"
+out=$(VGPU_GPU=nvidia/t4 VGPU_DEVICE_COUNT=2 "$vgpu" smi --query-gpu=index,pci.bus_id --format=csv,noheader 2>"$tmp/err"); rc=$?
+expect "nvidia-smi reports the rest, says the lost one is lost, and exits 15" \
+  "0, 00000000:01:00.0|15|Unable to determine the device handle for GPU00000000:02:00.0: GPU is lost.  Reboot the system to recover this GPU" \
+  "$out|$rc|$(cat "$tmp/err")"
+if [[ -e "$build/shim/libnvidia-ml.so.1" ]] && command -v python3 >/dev/null &&
+   [[ -z "$(shim_sanitizer "$build/shim")" ]]; then
+  got=$(VGPU_GPU=nvidia/t4 VGPU_DEVICE_COUNT=2 python3 -c '
+import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+lib.nvmlInit_v2()
+n = ctypes.c_uint(); lib.nvmlDeviceGetCount_v2(ctypes.byref(n))
+h = ctypes.c_void_p()
+lost = lib.nvmlDeviceGetHandleByIndex_v2(1, ctypes.byref(h))
+ok = lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(h))
+t = ctypes.c_uint()
+temp = lib.nvmlDeviceGetTemperature(ctypes.c_void_p(2), 0, ctypes.byref(t))   # the lost GPU, by its handle
+print(n.value, lost, ok, temp)' "$build/shim/libnvidia-ml.so.1" 2>&1)
+  expect "NVML still counts it, and answers GPU_IS_LOST for its handle and its queries" "2 15 0 15" "$got"
+fi
+t4 fault reset --volatile --gpu 1 >/dev/null
+expect "a driver reload does not bring it back" "15" \
+  "$(t4 smi --query-gpu=index --format=csv,noheader >/dev/null 2>&1; echo $?)"
+t4 fault lose --gpu 1 --clear >/dev/null
+expect "clearing does" "0, 1" "$(t4 smi --query-gpu=index --format=csv,noheader | paste -sd' ' | sed 's/ /, /')"
+t4 fault lose --gpu 0 --location dram >/dev/null; expect "lose takes no ECC options" "2" "$?"
+amd fault lose >/dev/null; expect "a lost GPU is NVIDIA-only for now" "2" "$?"
+
+# A degraded link: the current state drops, the maximum stays.
+lq() { q "$1" pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max; }
+expect "a T4's link trains at its profile's Gen3 x8" "3, 3, 8, 8" "$(lq 0)"
+t4 fault link --gpu 0 --width 4 >/dev/null
+t4 fault link --gpu 1 --gen 1 --width 2 >/dev/null
+expect "a link down to x4 reads so beside its maximum" "3, 3, 4, 8" "$(lq 0)"
+expect "and one down to Gen1 x2" "1, 3, 2, 8" "$(lq 1)"
+expect "nvidia-smi -q shows it under GPU Link Info" "Max: 3|Current: 1|Max: 8x|Current: 2x" \
+  "$(t4 smi -q -i 1 | grep -A9 'GPU Link Info' | grep -E '^ +(Max|Current) ' | sed -E 's/^ +//; s/ +:/:/' | paste -sd'|')"
+if [[ -e "$build/shim/libnvidia-ml.so.1" ]] && command -v python3 >/dev/null &&
+   [[ -z "$(shim_sanitizer "$build/shim")" ]]; then
+  got=$(VGPU_GPU=nvidia/t4 VGPU_DEVICE_COUNT=2 python3 -c '
+import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+lib.nvmlInit_v2()
+h = ctypes.c_void_p(); lib.nvmlDeviceGetHandleByIndex_v2(1, ctypes.byref(h))
+out = []
+for f in ("nvmlDeviceGetCurrPcieLinkGeneration", "nvmlDeviceGetMaxPcieLinkGeneration",
+          "nvmlDeviceGetCurrPcieLinkWidth", "nvmlDeviceGetMaxPcieLinkWidth"):
+    v = ctypes.c_uint(); getattr(lib, f)(h, ctypes.byref(v)); out.append(str(v.value))
+print(" ".join(out))' "$build/shim/libnvidia-ml.so.1" 2>&1)
+  expect "NVML agrees" "1 3 2 8" "$got"
+fi
+t4 fault reset --volatile --gpu 0 >/dev/null
+expect "a driver reload does not retrain it" "4" "$(q 0 pcie.link.width.current)"
+t4 fault link --clear >/dev/null
+expect "clearing does" "8 8" "$(q 0 pcie.link.width.current) $(q 1 pcie.link.width.current)"
+t4 fault link --gen 3 >/dev/null; expect "a degraded link is below the trained one" "2" "$?"
+t4 fault link --width 3 >/dev/null; expect "a link has a power-of-two lane count" "2" "$?"
+
 out=$(VGPU_GPU=nvidia/rtx3060 VGPU_DEVICE_COUNT=1 "$vgpu" fault arm --ecc uncorrected 2>&1); rc=$?
 expect "ECC faults cannot be armed on a card without ECC" "2 yes" "$rc $(grep -q 'has no ECC' <<< "$out" && echo yes || echo no)"
 VGPU_GPU=nvidia/rtx3060 VGPU_DEVICE_COUNT=1 "$vgpu" fault arm --bitflip >/dev/null

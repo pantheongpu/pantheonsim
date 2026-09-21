@@ -252,6 +252,14 @@ class FaultHook final : public MemoryManager::AccessFault {
     shared_pending = faults_.pending(ras::Target::Shared);
     stuck_pending = faults_.stuck_pending();
     alu_pending = faults_.pending(ras::Target::Alu);
+    copy_pending = faults_.pending(ras::Target::Copy);
+  }
+
+  // A GPU that has fallen off the bus runs nothing.
+  void check_lost(const std::string& kernel) {
+    if (faults_.lost())
+      throw Error::make(Err::DeviceLost, "kernel '", kernel,
+                        "' was not run: the GPU has fallen off the bus (`vgpu fault lose`)");
   }
 
   // A hang armed for this launch: it stalls the launch, with the device shown
@@ -334,6 +342,25 @@ class FaultHook final : public MemoryManager::AccessFault {
   void on_read(uint64_t offset, uint8_t* bytes, uint64_t len) override {
     faults_.apply_stuck(offset, bytes, len);
   }
+  void on_copy(uint64_t addr, uint8_t* bytes, uint64_t len) override {
+    switch (faults_.take(ras::Target::Copy)) {
+      case ras::Armed::Corrected:
+        ras::inject_ecc(uuid_, ras::Severity::Corrected, ras::Location::DeviceMemory, 1, scheme_);
+        return;
+      case ras::Armed::Bitflip: {
+        // One bit of one byte of what this copy delivers; memory keeps its value.
+        const uint64_t n = flips_.fetch_add(1);
+        bytes[(n * 2654435761u) % len] ^= static_cast<uint8_t>(1u << (n % 8));
+        faults_.note_bitflip();
+        return;
+      }
+      case ras::Armed::Uncorrected:
+        uncorrectable_in_memory(addr, " during a copy");
+      default:
+        return;
+    }
+  }
+
   // A flip in the upper half of the result's bits -- an integer's high bits, a
   // float's exponent or leading mantissa -- so the error is one a result check
   // can see rather than a last-place difference inside its tolerance.
@@ -366,18 +393,23 @@ class FaultHook final : public MemoryManager::AccessFault {
       case ras::Armed::Uncorrected:
         break;
     }
+    if (!shared) uncorrectable_in_memory(addr, "");
     ras::inject_ecc(uuid_, ras::Severity::Uncorrected, where, 1, scheme_);
-    const std::string who = "pid=" + std::to_string(::getpid()) + ", name=" + process_name();
     char at_text[32];
     std::snprintf(at_text, sizeof at_text, "0x%llx", static_cast<unsigned long long>(addr));
-    if (shared) {
-      ras::report_xid(uuid_, bus_id_, 48, who,
-                      "An uncorrectable double bit error (DBE) has been detected on GPU in the SM "
-                      "L1 cache.");
-      throw Error::make(Err::EccUncorrectable, "uncorrectable ECC error in shared memory at offset ",
-                        at_text, " (armed with `vgpu fault arm --on shared`)");
-    }
-    ras::report_xid(uuid_, bus_id_, 48, who,
+    ras::report_xid(uuid_, bus_id_, 48, "pid=" + std::to_string(::getpid()) + ", name=" + process_name(),
+                    "An uncorrectable double bit error (DBE) has been detected on GPU in the SM "
+                    "L1 cache.");
+    throw Error::make(Err::EccUncorrectable, "uncorrectable ECC error in shared memory at offset ",
+                      at_text, " (armed with `vgpu fault arm --on shared`)");
+  }
+
+  // An uncorrectable error in device memory, taken by a kernel's load or by a
+  // copy: counted, logged as Xid 48 and then Xid 63 for the page or row it
+  // takes out of service, and the operation fails.
+  [[noreturn]] void uncorrectable_in_memory(uint64_t addr, const char* during) {
+    ras::inject_ecc(uuid_, ras::Severity::Uncorrected, ras::Location::DeviceMemory, 1, scheme_);
+    ras::report_xid(uuid_, bus_id_, 48, "pid=" + std::to_string(::getpid()) + ", name=" + process_name(),
                     "An uncorrectable double bit error (DBE) has been detected on GPU "
                     "in the framebuffer at partition 0, subpartition 0.");
     if (scheme_ == ras::Retirement::Pages)
@@ -387,8 +419,10 @@ class FaultHook final : public MemoryManager::AccessFault {
     else if (scheme_ == ras::Retirement::Rows)
       ras::report_xid(uuid_, bus_id_, 63, "",
                       "Row Remapper: New row marked for remapping, reset gpu to activate.");
+    char at_text[32];
+    std::snprintf(at_text, sizeof at_text, "0x%llx", static_cast<unsigned long long>(addr));
     throw Error::make(Err::EccUncorrectable, "uncorrectable ECC error in device memory at ", at_text,
-                      " (armed with `vgpu fault arm`)");
+                      during, " (armed with `vgpu fault arm`)");
   }
 
   // The device's UUID and bus id, the ones nvidia-smi reports, and the way it
@@ -452,7 +486,10 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   // its own table.
   exec::LaunchConfig cfg = in_cfg;
   if (!cfg.textures && !textures_.empty()) cfg.textures = &textures_;
-  if (fault_) fault_->maybe_hang(fn.name, telemetry_, static_cast<uint32_t>(ordinal_));
+  if (fault_) {
+    fault_->check_lost(fn.name);
+    fault_->maybe_hang(fn.name, telemetry_, static_cast<uint32_t>(ordinal_));
+  }
   try {
     run_kernel(fn, cfg, args, syms);
   } catch (const Error& e) {

@@ -133,6 +133,10 @@ class MemoryManager {
     virtual void on_read(uint64_t offset, uint8_t* bytes, uint64_t len) = 0;
     // An arithmetic result `bits` wide, as a kernel computed it.
     virtual uint64_t on_alu(uint64_t value, uint32_t bits) = 0;
+    // `len` bytes a copy read from device memory at `addr`, about to be
+    // delivered; may change them, or throw.
+    virtual void on_copy(uint64_t addr, uint8_t* bytes, uint64_t len) = 0;
+    const uint64_t* copy_pending = nullptr;
     const uint64_t* stuck_pending = nullptr;
     const uint64_t* alu_pending = nullptr;
     const uint64_t* load_pending = nullptr;

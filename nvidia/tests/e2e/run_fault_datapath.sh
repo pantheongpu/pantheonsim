@@ -112,6 +112,21 @@ expect "a misaligned read fails the kernel" \
 expect "and the SM's exception is logged as Xid 13" "yes" \
   "$(xids '$p' | grep -qE ': 13, pid=[0-9]+, name=fault_datapath, Graphics SM Warp Exception on \(GPC 0, TPC 0, SM 0\): Misaligned Address$' && echo yes || echo no)"
 
+"$vgpu" fault arm --bitflip --on copy >/dev/null
+expect "a flip armed on copies corrupts what the copy back delivers" "mismatches: 1" "$(run)"
+expect "and leaves memory as it was: the next copy is clean" "mismatches: 0" "$(run)"
+"$vgpu" fault arm --ecc uncorrected --on copy >/dev/null
+expect "an uncorrectable error fails the copy with error 214" \
+  "copy failed: 214 cudaErrorECCUncorrectable" "$(run)"
+expect "counted (since the reload above), logged as Xid 48 and 63" "1 yes" \
+  "$(q ecc.errors.uncorrected.volatile.total) $(grep -q 'Xid (PCI:0000:01:00): 63' "$tmp/session/dmesg.log" && echo yes || echo no)"
+
+"$vgpu" fault lose >/dev/null
+expect "a launch on a GPU that has fallen off the bus fails" \
+  "launch failed: 719 cudaErrorLaunchFailure" "$(run)"
+"$vgpu" fault lose --clear >/dev/null
+expect "and runs again once it is back" "mismatches: 0" "$(run)"
+
 "$vgpu" fault arm --hang --seconds 2 >/dev/null
 start=$(date +%s.%N)
 got=$(run)

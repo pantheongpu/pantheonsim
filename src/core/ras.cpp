@@ -23,9 +23,10 @@ namespace vgpu::ras {
 namespace {
 
 constexpr uint32_t kMagic = 0x56524153;  // "VRAS"
-constexpr uint32_t kVersion = 7;  // 2: armed faults; 3: hangs and clock-event reasons; 4: events;
+constexpr uint32_t kVersion = 10;  // 2: armed faults; 3: hangs and clock-event reasons; 4: events;
                                   // 5: faults armed on stores and shared memory; 6: stuck cells;
-                                  // 7: faults armed on arithmetic results
+                                  // 7: faults armed on arithmetic results; 8: lost GPUs;
+                                  // 9: degraded links; 10: faults armed on copies
 
 struct File {
   uint32_t magic;
@@ -157,32 +158,40 @@ void inject_ecc(const std::string& uuid, Severity s, Location l, uint64_t n, Ret
       set(&c->rows_pending, 1);
     }
   }
+  publish_session(uuid);
 }
 
 void inject_pcie(const std::string& uuid, Pcie c, uint64_t n) {
   if (n == 0) return;
-  Mapped v(volatile_path(uuid), true);
-  add(&v.counters()->pcie[static_cast<uint32_t>(c)], n);
+  {
+    Mapped v(volatile_path(uuid), true);
+    add(&v.counters()->pcie[static_cast<uint32_t>(c)], n);
+  }
+  publish_session(uuid);
 }
 
 void reset_volatile(const std::string& uuid, bool driver_reload) {
   {
     Mapped v(volatile_path(uuid), false);
-    // Everything but the stuck cells, which a driver reload does not mend.
-    constexpr size_t kStuckFirst = offsetof(Counters, stuck_count) / sizeof(uint64_t);
-    constexpr size_t kStuckEnd = kStuckFirst + 1 + kStuckCells * 2;
-    static_assert(offsetof(Counters, stuck) == (kStuckFirst + 1) * sizeof(uint64_t));
+    // Everything but a lost GPU, a degraded link and the stuck cells, which a
+    // driver reload does not mend.
+    constexpr size_t kStuckFirst = offsetof(Counters, lost) / sizeof(uint64_t);
+    constexpr size_t kStuckEnd = kStuckFirst + 4 + kStuckCells * 2;
+    static_assert(offsetof(Counters, stuck_count) == (kStuckFirst + 3) * sizeof(uint64_t));
+    static_assert(offsetof(Counters, stuck) == (kStuckFirst + 4) * sizeof(uint64_t));
     if (uint64_t* w = v.words())
       for (size_t i = 0; i < kWords; ++i)
         if (i < kStuckFirst || i >= kStuckEnd) set(&w[i], 0);
   }
-  if (!driver_reload) return;
-  // Pending retirements and remaps take effect at a driver load.
-  Mapped a(aggregate_path(uuid), false);
-  if (Counters* c = a.counters()) {
-    set(&c->retired_pending, 0);
-    set(&c->rows_pending, 0);
+  if (driver_reload) {
+    // Pending retirements and remaps take effect at a driver load.
+    Mapped a(aggregate_path(uuid), false);
+    if (Counters* c = a.counters()) {
+      set(&c->retired_pending, 0);
+      set(&c->rows_pending, 0);
+    }
   }
+  publish_session(uuid);
 }
 
 void reset_aggregate(const std::string& uuid) {
@@ -190,6 +199,91 @@ void reset_aggregate(const std::string& uuid) {
   if (Counters* c = a.counters())
     for (uint32_t s = 0; s < kSeverities; ++s)
       for (uint32_t l = 0; l < kLocations; ++l) set(&c->ecc[s][l], 0);
+}
+
+// ---- The session's sysfs ------------------------------------------------------
+
+namespace {
+
+// Replaces a file whole, so a reader never sees half of one.
+void replace_file(const std::string& path, const std::string& text) {
+  const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out) return;
+    out << text;
+  }
+  if (std::rename(tmp.c_str(), path.c_str()) != 0) std::remove(tmp.c_str());
+}
+
+// One line per error the kernel's AER stats name, then the total, in the form
+// of Documentation/ABI/testing/sysfs-bus-pci-devices-aer_stats.
+std::string aer_stats(const std::vector<std::pair<const char*, uint64_t>>& rows, const char* total) {
+  std::string out;
+  uint64_t sum = 0;
+  for (const auto& [name, n] : rows) {
+    out += std::string(name) + " " + std::to_string(n) + "\n";
+    sum += n;
+  }
+  return out + total + " " + std::to_string(sum) + "\n";
+}
+
+}  // namespace
+
+void publish_session(const std::string& uuid, const std::string& session) {
+  std::string dir = session;
+  if (dir.empty()) {
+    const char* s = std::getenv("VGPU_SESSION");
+    if (!s || !*s) return;
+    dir = s;
+  }
+  dir += "/ras/" + uuid;
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  if (ec) return;
+  const Counters c = read(uuid).since_load;
+  const auto pcie = [&](Pcie p) { return c.pcie[static_cast<uint32_t>(p)]; };
+  // Which AER bit each injected counter is: the link's replay timer running
+  // out is Timeout and its replay count rolling over is Rollover; a TLP whose
+  // LCRC fails is a Bad TLP; an unspecified correctable error is a receiver
+  // error, the commonest; an unspecified uncorrectable one is a completion
+  // timeout if non-fatal and a data link protocol error if fatal, the default
+  // severities of each.
+  replace_file(dir + "/aer_dev_correctable",
+               aer_stats({{"RxErr", pcie(Pcie::Correctable)},
+                          {"BadTLP", pcie(Pcie::BadTlp) + pcie(Pcie::Lcrc)},
+                          {"BadDLLP", pcie(Pcie::BadDllp)},
+                          {"Rollover", pcie(Pcie::ReplayRollover)},
+                          {"Timeout", pcie(Pcie::Replay)},
+                          {"NonFatalErr", 0}, {"CorrIntErr", 0}, {"HeaderOF", 0}},
+                         "TOTAL_ERR_COR"));
+  const auto uncorrectable = [&](uint64_t dlp, uint64_t cmplt_to, const char* total) {
+    return aer_stats({{"Undefined", 0}, {"DLP", dlp}, {"SDES", 0}, {"TLP", 0}, {"FCP", 0},
+                      {"CmpltTO", cmplt_to}, {"CmpltAbrt", 0}, {"UnxCmplt", 0}, {"RxOF", 0},
+                      {"MalfTLP", 0}, {"ECRC", 0}, {"UnsupReq", 0}, {"ACSViol", 0},
+                      {"UncorrIntErr", 0}, {"BlockedTLP", 0}, {"AtomicOpBlocked", 0},
+                      {"TLPBlockedErr", 0}},
+                     total);
+  };
+  replace_file(dir + "/aer_dev_nonfatal", uncorrectable(0, pcie(Pcie::NonFatal), "TOTAL_ERR_NONFATAL"));
+  replace_file(dir + "/aer_dev_fatal", uncorrectable(pcie(Pcie::Fatal), 0, "TOTAL_ERR_FATAL"));
+  // amdgpu's counts since the driver loaded, per block: device memory is the
+  // UMC, the on-chip memories GFX.
+  for (const char* block : kAmdgpuRasBlocks) {
+    uint64_t ue = 0, ce = 0;
+    const auto dram = [&](Severity s) {
+      return c.ecc[static_cast<uint32_t>(s)][static_cast<uint32_t>(Location::DeviceMemory)];
+    };
+    if (std::strcmp(block, "umc") == 0) {
+      ue = dram(Severity::Uncorrected);
+      ce = dram(Severity::Corrected);
+    } else if (std::strcmp(block, "gfx") == 0) {
+      ue = c.ecc_total(Severity::Uncorrected) - dram(Severity::Uncorrected);
+      ce = c.ecc_total(Severity::Corrected) - dram(Severity::Corrected);
+    }
+    replace_file(dir + "/" + block + "_err_count",
+                 "ue: " + std::to_string(ue) + "\nce: " + std::to_string(ce) + "\n");
+  }
 }
 
 const char* location_name(Location l) { return kLocationNames[static_cast<uint32_t>(l)]; }
@@ -232,7 +326,7 @@ namespace {
 uint32_t armed_slot(Armed kind) {
   return kind == Armed::Corrected ? 0 : kind == Armed::Uncorrected ? 1 : 2;
 }
-constexpr const char* kTargetNames[kTargets] = {"load", "store", "shared", "alu"};
+constexpr const char* kTargetNames[kTargets] = {"load", "store", "shared", "alu", "copy"};
 }  // namespace
 
 const char* target_name(Target t) { return kTargetNames[static_cast<uint32_t>(t)]; }
@@ -356,6 +450,8 @@ std::vector<StuckCell> stuck_cells(const std::string& uuid) {
 }
 
 const uint64_t* ArmedFaults::stuck_pending() const { return &impl_->file.counters()->stuck_count; }
+
+bool ArmedFaults::lost() const { return __atomic_load_n(&impl_->file.counters()->lost, __ATOMIC_ACQUIRE); }
 
 void ArmedFaults::apply_stuck(uint64_t offset, uint8_t* bytes, uint64_t len) const {
   const Counters* c = impl_->file.counters();
@@ -612,6 +708,49 @@ void report_xid(const std::string& uuid, const std::string& bus_id, int xid,
                 const std::string& process, const std::string& detail) {
   log_kernel(xid_line(bus_id, xid, process, detail));
   record_event(uuid, kEventXid, static_cast<uint64_t>(xid));
+}
+
+// ---- A GPU that has fallen off the bus ------------------------------------------
+
+void lose(const std::string& uuid, const std::string& bus_id) {
+  {
+    Mapped v(volatile_path(uuid), true);
+    if (__atomic_exchange_n(&v.counters()->lost, uint64_t{1}, __ATOMIC_ACQ_REL)) return;   // already
+  }
+  report_xid(uuid, bus_id, 79, "", "GPU has fallen off the bus.");
+  log_kernel("NVRM: GPU " + kernel_bdf(bus_id) + ": GPU has fallen off the bus.");
+}
+
+void recover(const std::string& uuid) {
+  Mapped v(volatile_path(uuid), false);
+  if (Counters* c = v.counters()) __atomic_store_n(&c->lost, uint64_t{0}, __ATOMIC_RELEASE);
+}
+
+bool is_lost(const std::string& uuid) {
+  Mapped v(volatile_path(uuid), false);
+  const Counters* c = v.counters();
+  return c && __atomic_load_n(&c->lost, __ATOMIC_ACQUIRE);
+}
+
+// ---- A degraded PCIe link ------------------------------------------------------
+
+void degrade_link(const std::string& uuid, uint32_t gen, uint32_t width) {
+  Mapped v(volatile_path(uuid), true);
+  Counters* c = v.counters();
+  set(&c->link_gen, gen);
+  set(&c->link_width, width);
+}
+
+void restore_link(const std::string& uuid) { degrade_link(uuid, 0, 0); }
+
+void apply_link(telemetry::DeviceSample& d) {
+  Mapped v(volatile_path(d.uuid), false);
+  const Counters* c = v.counters();
+  if (!c) return;
+  const uint64_t gen = __atomic_load_n(&c->link_gen, __ATOMIC_RELAXED);
+  const uint64_t width = __atomic_load_n(&c->link_width, __ATOMIC_RELAXED);
+  if (gen && gen < d.pcie_gen_max) d.pcie_gen = static_cast<uint32_t>(gen);
+  if (width && width < d.pcie_width_max) d.pcie_width = static_cast<uint32_t>(width);
 }
 
 }  // namespace vgpu::ras

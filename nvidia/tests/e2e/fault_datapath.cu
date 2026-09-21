@@ -66,8 +66,11 @@ int main(int argc, char** argv) {
   if (e != cudaSuccess) {
     printf("launch failed: %d %s\n", static_cast<int>(e), cudaGetErrorName(e));
     rc = 3;
+  } else if (const cudaError_t c = cudaMemcpy(got, out, bytes, cudaMemcpyDeviceToHost);
+             c != cudaSuccess) {
+    printf("copy failed: %d %s\n", static_cast<int>(c), cudaGetErrorName(c));
+    rc = 4;
   } else {
-    cudaMemcpy(got, out, bytes, cudaMemcpyDeviceToHost);
     int bad = 0;
     for (int i = 0; i < n; ++i) bad += got[i] != want[i];
     printf("mismatches: %d\n", bad);

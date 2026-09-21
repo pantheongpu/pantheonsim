@@ -34,7 +34,8 @@
 namespace vgpu::telemetry {
 
 inline constexpr uint32_t kMagic = 0x56475054;  // "VGPT"
-inline constexpr uint32_t kVersion = 3;  // 2: reliability and link; 3: clock-event reasons
+inline constexpr uint32_t kVersion = 4;  // 2: reliability and link; 3: clock-event reasons;
+                                         // 4: the link's maximum apart from its current state
 inline constexpr int kMaxDevices = 16;
 inline constexpr int kMaxProcs = 8;
 
@@ -80,8 +81,10 @@ struct DeviceSample {
   uint32_t memory_retirement;       // profile: 0 none, 1 page retirement, 2 row remapping
   uint32_t has_memory_temperature;  // profile: the driver reports a memory sensor
   uint32_t temperature_mem_c;       // synthetic; meaningful only with the flag above
-  uint32_t pcie_gen;                // profile: the link real cards most often run at
-  uint32_t pcie_width;
+  uint32_t pcie_gen;                // the link as trained now: the profile's, unless degraded
+  uint32_t pcie_width;              // (`vgpu fault link`, applied by ras::apply_link)
+  uint32_t pcie_gen_max;            // profile: the link real cards most often run at
+  uint32_t pcie_width_max;
   // Clock-event reasons injected with `vgpu fault throttle`, NVML's bits. Set
   // when a reading is taken (ras::apply_throttle), never by a publisher.
   uint64_t clock_event_reasons;

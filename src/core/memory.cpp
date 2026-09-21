@@ -371,6 +371,11 @@ void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
   uint8_t* d = static_cast<uint8_t*>(dst);
   read_chunks(a, src - base, d, len);
   if (any_stuck()) access_fault_->on_read(src - va_base_, d, len);
+  // Only copies read device memory in bulk -- kernels read it a scalar at a
+  // time -- so this is where a fault armed on copies is taken.
+  if (access_fault_ && access_fault_->copy_pending &&
+      __atomic_load_n(access_fault_->copy_pending, __ATOMIC_RELAXED))
+    access_fault_->on_copy(src, d, len);
 }
 
 void MemoryManager::read_chunks(const Allocation& a, uint64_t off, uint8_t* d, uint64_t len) const {
