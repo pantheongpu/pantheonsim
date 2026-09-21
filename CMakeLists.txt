@@ -642,6 +642,15 @@ if(TARGET vgpucublas)
   # so what is checked is what encoder stress and corruption tests rely on: the
   # same frame encodes to the same bytes, and a changed pixel, luma or chroma,
   # changes them. The 4:2:0 case also fills the whole frame the buffer holds.
+  # Faults armed with `vgpu fault arm`, taken by a real nvcc-built kernel's
+  # loads: silent bit flips, corrected errors, and cudaErrorECCUncorrectable.
+  add_test(NAME e2e_fault_datapath
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_fault_datapath.sh)
+  set_tests_properties(e2e_fault_datapath PROPERTIES
+    DEPENDS "vgpucudart;vgpu_cli"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   if(TARGET vgpunvenc)
     add_test(NAME e2e_nvenc
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvenc.sh)

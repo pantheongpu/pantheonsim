@@ -404,24 +404,29 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
     throw Error::make(Err::MisalignedAccess, "load of ", size, " bytes at ", Hex{addr},
                       " is not naturally aligned (real GPUs fault on this)");
   const uint8_t* p = nullptr;
+  uint64_t v = 0;
   switch (scalar_location(addr, size, /*store=*/nullptr, &p)) {
     case ScalarAt::Chunk:
-      return load_at(p, size);
+      v = load_at(p, size);
+      break;
     case ScalarAt::Uniform:
-      return repeated(uniform_byte(p), size);
-    case ScalarAt::Unchanged:
-      break;  // only answered for a store
+      v = repeated(uniform_byte(p), size);
+      break;
     case ScalarAt::Untouched:
       // Zero, answered here. Falling back to read() instead was a race: a
       // first store on another thread could materialize the chunk between
       // this check and read()'s copy, which then memcpy'd bytes an atomic
       // store was writing. ThreadSanitizer caught it on main.
-      return 0;
-    case ScalarAt::HostMap:
+      v = 0;
       break;
+    case ScalarAt::Unchanged:  // only answered for a store
+    case ScalarAt::HostMap:
+      // Host memory, mapped: no device ECC covers it, so no fault is taken.
+      read(addr, &v, size);  // little-endian host assumption, documented in ARCHITECTURE.md
+      return v;
   }
-  uint64_t v = 0;
-  read(addr, &v, size);  // little-endian host assumption, documented in ARCHITECTURE.md
+  if (load_fault_ && load_fault_->pending && __atomic_load_n(load_fault_->pending, __ATOMIC_RELAXED))
+    return load_fault_->on_load(addr, size, v);
   return v;
 }
 

@@ -449,10 +449,10 @@ narrows what counts as observable, not what the detector looks at.
   an unmodified nvcc-built binary (embedded-PTX driver-API apps work today).
 - Reliability: ECC counts by location, retired pages, remapped rows and PCIe
   error counters are injected with `vgpu fault` and read by nvidia-smi, NVML
-  and rocm-smi (docs/telemetry.md). Not yet: faults in the data path (a bit
-  flipped in simulated memory, an uncorrectable error raised to the context),
-  Xid events in dmesg and nvmlEvent*, PCIe AER in sysfs, a throttle state
-  machine, and hang or silent-corruption injection.
+  and rocm-smi (docs/telemetry.md). `vgpu fault arm` delivers bit flips and
+  ECC errors to a running kernel's loads, and a session's dmesg carries Xid
+  and AER lines. Not yet: nvmlEvent*, PCIe AER in sysfs, a throttle state
+  machine, faults on stores and on shared memory, and hang injection.
 
 ## Not implemented (fails loudly, never silently)
 

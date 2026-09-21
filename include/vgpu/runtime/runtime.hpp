@@ -34,6 +34,7 @@ class Device {
       mem_.set_usage_observer(
           [pub, ord](uint64_t used) { pub->note_memory(static_cast<uint32_t>(ord), used); });
     }
+    install_fault_hook();
   }
 
   const DeviceProfile& profile() const { return profile_; }
@@ -85,6 +86,9 @@ class Device {
   const exec::TextureTable& textures() const { return textures_; }
 
  private:
+  // Delivers faults armed with `vgpu fault arm` to this device's kernel loads.
+  void install_fault_hook();
+  std::unique_ptr<MemoryManager::LoadFault> fault_;
   DeviceProfile profile_;
   int ordinal_;
   MemoryManager mem_;

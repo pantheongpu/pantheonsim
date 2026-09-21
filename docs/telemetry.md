@@ -115,8 +115,26 @@ GDDR card or remaps a row on an HBM card, pending until the next driver load. A
 card without ECC refuses ECC injection: it has nowhere to count one.
 
 nvidia-smi's ECC, retired-page and remapped-row fields, its table, NVML's ECC
-and PCIe counters, and rocm-smi's RAS blocks all read these counts. Nothing
-in the simulator produces them on its own yet: they come only from injection.
+and PCIe counters, and rocm-smi's RAS blocks all read these counts. Nothing in
+the simulator produces them on its own: they come only from injection.
+
+`vgpu fault arm` goes one step further and puts faults in a running program's
+path. The next device-memory loads of its kernels take them:
+
+```bash
+vgpu fault arm --bitflip --count 3         # three loads return a flipped bit
+vgpu fault arm --ecc corrected --count 2   # counted; the data is intact
+vgpu fault arm --ecc uncorrected           # counted, logged, and the kernel fails
+```
+
+A bit flip is silent -- nothing counts it, as nothing counts a fault ECC does
+not cover -- which is what a memory test or a silent-data-corruption check
+exists to catch. An uncorrectable error fails the kernel with
+`cudaErrorECCUncorrectable` (214), which poisons the context as on a real card.
+
+Inside `vgpu shell`, these errors also reach `dmesg` the way the driver and the
+kernel log them: an uncorrectable ECC error as Xid 48, the page or row it takes
+out of service as Xid 63, and PCIe errors as AER lines.
 
 ## lspci
 

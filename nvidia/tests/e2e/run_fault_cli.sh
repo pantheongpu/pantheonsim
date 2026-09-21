@@ -68,6 +68,27 @@ print(c["UMC uncorrectable errors"], c["GFX correctable errors"])' 2>&1)
   expect "rocm-smi puts memory errors on UMC and on-chip ones on GFX" "2 1" "$got"
 fi
 
+# Inside a session the driver and the kernel log what happened, in their forms.
+sess="$tmp/session"
+mkdir -p "$sess"
+printf '[    3.141593] nvidia 0000:01:00.0: enabling device (0000 -> 0003)\n' > "$sess/dmesg.log"
+VGPU_SESSION="$sess" t4 fault inject --gpu 0 --ecc uncorrected >/dev/null
+VGPU_SESSION="$sess" t4 fault inject --gpu 1 --pcie fatal >/dev/null
+VGPU_SESSION="$sess" t4 fault inject --gpu 1 --pcie naks_sent >/dev/null
+expect "an uncorrectable error is logged as Xid 48, with the page as Xid 63" "1 1" \
+  "$(grep -c "NVRM: Xid (PCI:0000:01:00): 48, pid='<unknown>', name=<unknown>, An uncorrectable double bit error" "$sess/dmesg.log") $(grep -c 'NVRM: Xid (PCI:0000:01:00): 63, ' "$sess/dmesg.log")"
+expect "a fatal PCIe error is logged by AER; a NAK is not" "1 4" \
+  "$(grep -c 'pcieport 0000:00:01.0: AER: Uncorrected (Fatal) error received: 0000:02:00.0' "$sess/dmesg.log") $(wc -l < "$sess/dmesg.log" | tr -d ' ')"
+expect "logged lines are stamped after the boot log" "yes" \
+  "$(awk -F'[][]' 'NR > 1 && $2 + 0 <= 3.141593 { bad = 1 } END { print bad ? "no" : "yes" }' "$sess/dmesg.log")"
+
+out=$(VGPU_GPU=nvidia/rtx3060 VGPU_DEVICE_COUNT=1 "$vgpu" fault arm --ecc uncorrected 2>&1); rc=$?
+expect "ECC faults cannot be armed on a card without ECC" "2 yes" "$rc $(grep -q 'has no ECC' <<< "$out" && echo yes || echo no)"
+VGPU_GPU=nvidia/rtx3060 VGPU_DEVICE_COUNT=1 "$vgpu" fault arm --bitflip >/dev/null
+expect "a bit flip can be armed on any card" "0" "$?"
+t4 fault inject --bitflip >/dev/null; expect "a bit flip is armed, not injected" "2" "$?"
+t4 fault arm --ecc corrected --bitflip >/dev/null; expect "arm takes one kind at a time" "2" "$?"
+
 t4 fault inject --ecc sideways >/dev/null; expect "an unknown ECC kind is refused" "2" "$?"
 t4 fault inject --gpu 9 --ecc corrected >/dev/null; expect "a GPU that is not there is refused" "2" "$?"
 t4 fault inject --pcie replay --location l2_cache >/dev/null; expect "--location with --pcie is refused" "2" "$?"
