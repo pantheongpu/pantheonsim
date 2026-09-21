@@ -35,3 +35,6 @@ telemetry:
   # temperature_max_c: this driver did not report a thermal threshold
   pci_vendor_id: 4318          # 0x10DE
   pci_device_id: 9913          # 0x26B9
+  ecc: true                    # supported and on by default (NVIDIA datasheet)
+  memory: gddr                 # pages are retired on failure
+  pcie_link: "Gen4 x8"         # most common link on real cards (510 runs in the benchmark database)

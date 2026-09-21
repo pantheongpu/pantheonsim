@@ -36,3 +36,7 @@ telemetry:
   temperature_max_c: 89
   pci_vendor_id: 4318          # 0x10DE
   pci_device_id: 8368          # 0x20B0
+  ecc: true                    # supported and on by default (NVIDIA datasheet)
+  memory: hbm                  # rows are remapped on failure
+  memory_temperature: false    # most real runs report no memory sensor
+  pcie_link: "Gen4 x16"        # most common link on real cards (899 runs in the benchmark database)

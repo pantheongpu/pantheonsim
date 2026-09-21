@@ -32,6 +32,11 @@ This distinction matters, because VirtualGPU does not model performance.
 | `utilization.gpu` | **REAL** — fraction of wall time inside kernel launches |
 | kernels launched, bytes moved | **REAL** — exact counters |
 | power, temperature, voltage, clocks, fan, perf state | **SYNTHETIC** |
+| memory temperature | **SYNTHETIC**, and only on profiles whose real cards report a sensor |
+| ECC mode, retired pages or remapped rows | **PROFILE** — which the card has; every count is zero, because nothing faults in simulated memory |
+| PCIe link generation and width | **PROFILE** — the link real cards of the model most often run at |
+| PCIe replay and error counters | zero — a simulated link has no transport errors |
+| clock-event reasons | GPU idle only — nothing slows a simulated clock |
 
 The synthetic columns are a deterministic first-order model driven by the real
 utilization above: power tracks load quickly, temperature lags behind it with
@@ -55,8 +60,27 @@ LD_LIBRARY_PATH=build/shim python -c "import pynvml; pynvml.nvmlInit(); ..."
 ```
 
 Queries VirtualGPU cannot answer return `NVML_ERROR_NOT_SUPPORTED`, which tools
-render as `N/A` — the honest result rather than an invented number. ECC state
-is one such query: virtual memory has no ECC to report.
+render as `N/A` — the honest result rather than an invented number.
+
+## Reliability and link in profiles
+
+Four optional `telemetry` keys describe what a card reports about memory
+reliability and its PCIe link:
+
+| Key | Meaning | Source |
+| --- | --- | --- |
+| `ecc` | the card has ECC and ships with it on | datasheet |
+| `memory` | `hbm` or `gddr`: HBM cards remap failing rows, GDDR cards with ECC retire pages | datasheet |
+| `memory_temperature` | the driver reports a memory sensor | real runs; most HBM cards report none |
+| `pcie_link` | the link real cards most often run at, such as `"Gen4 x8"` | the benchmark database of real runs |
+
+The link is a fact about how cards are hosted, not the slot they fit: a T4 is
+an x16 card that clouds attach at x8, and a GH200's Hopper die reaches its
+Grace CPU over NVLink-C2C with an x1 PCIe link. From these, nvidia-smi and NVML
+answer ECC mode, the ECC counters, retired pages or remapped rows, the link and
+the memory sensor the way a real card of that model does. A card without ECC
+still answers the SRAM breakdown (`ecc.errors.uncorrected.*.sram.*`) with 0, as
+a real RTX 3060 does.
 
 **The stock `nvidia-smi` binary will not run against this NVML.** It gates
 startup on `nvmlInternalGetExportTable`, an undocumented internal vtable (the
@@ -95,7 +119,12 @@ AMD profiles (`amd/mi300x`, `amd/mi325x`, `amd/mi350x`) are **discovery only**.
 `rocm_agent_enumerator` prints the right ISA targets (`gfx942` for CDNA3,
 `gfx950` for CDNA4). `rocm-smi` takes its documented `-a`, `--showid`,
 `--showproductname`, `--showmeminfo vram`, `--showtemp`, `--showpower`,
-`--showuse`, `-d N`, `--json` and `--csv`, the same inside `vgpu shell` and out.
+`--showuse`, `--showvbios`, `--showclocks`, `--showfan`, `--showmaxpower`,
+`--showserial`, `--showuniqueid`, `--showmemvendor`, `--showrasinfo`, `-d N`,
+`--json` and `--csv`, the same inside `vgpu shell` and out. The key names of
+the newer sections and the AMD profiles' ECC, memory sensor and link values
+follow AMD's documentation and have not yet been checked against a real
+MI-series card.
 Outside a session both tools describe `VGPU_GPU`; with no AMD GPU configured,
 `rocm_agent_enumerator` lists only `gfx000` and says on stderr how to pick one. Launching a kernel on one fails with a clear
 "warp size 64 is unsupported" error — AMD *execution* is not implemented, and

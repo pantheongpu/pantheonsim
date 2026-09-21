@@ -41,3 +41,7 @@ telemetry:
   temperature_max_c: 100
   pci_vendor_id: 4098          # 0x1002 AMD
   pci_device_id: 29857        # 0x74a1 Aqua Vanjaram [Instinct MI300X]
+  ecc: true                    # HBM with ECC, always on (AMD datasheet)
+  memory: hbm                  # rows are remapped on failure
+  memory_temperature: true     # rocm-smi reports an HBM sensor; unchecked on a real card
+  pcie_link: "Gen5 x16"        # datasheet; unchecked on a real card

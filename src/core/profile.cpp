@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "vgpu/profile.hpp"
 
 #include "vgpu/error.hpp"
@@ -159,6 +160,31 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
         fail(origin, "telemetry.framebuffer_mb (" + std::to_string(fb) +
                          " MiB) is smaller than vram_bytes; the framebuffer includes it");
       p.telemetry.framebuffer_reserve_bytes = fb_bytes - p.vram_bytes;
+    }
+    // Reliability and link; TelemetryClass says what each means and where the
+    // values come from. All optional: a profile without them reports no ECC,
+    // no memory sensor and no link, which is [N/A] rather than a guess.
+    auto flag = [&](const char* key) {
+      auto f = t.map.find(key);
+      if (f == t.map.end()) return false;
+      if (f->second.kind != Value::Kind::Bool)
+        fail(origin, "telemetry." + std::string(key) + " must be true/false");
+      return f->second.b;
+    };
+    p.telemetry.ecc = flag("ecc");
+    p.telemetry.memory_temperature = flag("memory_temperature");
+    const std::string memory = get_str_opt(t, "memory");
+    if (!memory.empty() && memory != "hbm" && memory != "gddr")
+      fail(origin, "telemetry.memory must be hbm or gddr, got: " + memory);
+    p.telemetry.hbm = memory == "hbm";
+    if (const std::string link = get_str_opt(t, "pcie_link"); !link.empty()) {
+      unsigned gen = 0, width = 0;
+      char extra = 0;
+      if (std::sscanf(link.c_str(), "Gen%u x%u%c", &gen, &width, &extra) != 2 || gen < 1 ||
+          gen > 6 || (width != 1 && width != 2 && width != 4 && width != 8 && width != 16))
+        fail(origin, "telemetry.pcie_link must look like \"Gen4 x16\", got: " + link);
+      p.telemetry.pcie_gen = gen;
+      p.telemetry.pcie_width = width;
     }
   }
 
