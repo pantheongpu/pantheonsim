@@ -21,18 +21,23 @@ int main() {
   cudaMemcpy(in, want, bytes, cudaMemcpyHostToDevice);
   cudaMemset(out, 0, bytes);
   copy<<<(n + 255) / 256, 256>>>(in, out, n);
+  // Every path frees what it allocated: the e2e run is under LeakSanitizer, and
+  // the uncorrectable-error path is the one that returns early.
+  int rc = 0;
   const cudaError_t e = cudaDeviceSynchronize();
   if (e != cudaSuccess) {
     printf("launch failed: %d %s\n", static_cast<int>(e), cudaGetErrorName(e));
-    return 3;
+    rc = 3;
+  } else {
+    cudaMemcpy(got, out, bytes, cudaMemcpyDeviceToHost);
+    int bad = 0;
+    for (int i = 0; i < n; ++i) bad += got[i] != want[i];
+    printf("mismatches: %d\n", bad);
+    rc = bad ? 1 : 0;
   }
-  cudaMemcpy(got, out, bytes, cudaMemcpyDeviceToHost);
-  int bad = 0;
-  for (int i = 0; i < n; ++i) bad += got[i] != want[i];
-  printf("mismatches: %d\n", bad);
   cudaFree(in);
   cudaFree(out);
   free(want);
   free(got);
-  return bad ? 1 : 0;
+  return rc;
 }
