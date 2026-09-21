@@ -37,16 +37,16 @@ int usage(FILE* to) {
                "                    naks_received, bad_tlp, naks_sent, bad_dllp, non_fatal, fatal,\n"
                "                    lcrc, lane\n"
                "  --count N         how many (default 1)\n"
+               "  --volatile        reset: zero the counts since the driver loaded, as a driver\n"
+               "                    reload does, and complete pending retirements\n"
+               "  --aggregate       reset: zero the lifetime ECC counts (nvidia-smi -p 1)\n"
                "\n"
                "arm loads faults that the next device-memory loads of a running kernel take: a\n"
                "corrected error is counted and changes nothing, an uncorrected one is counted,\n"
                "logged as Xid 48 and fails the kernel with cudaErrorECCUncorrectable, and\n"
                "--bitflip silently flips one bit of the value loaded, as a fault ECC does not\n"
                "cover would -- what memory tests exist to catch. Inside `vgpu shell`, errors\n"
-               "also appear in dmesg as the driver and kernel log them.\n"
-               "  --volatile        reset: zero the counts since the driver loaded, as a driver\n"
-               "                    reload does, and complete pending retirements\n"
-               "  --aggregate       reset: zero the lifetime ECC counts (nvidia-smi -p 1)\n");
+               "also appear in dmesg as the driver and kernel log them.\n");
   return to == stdout ? 0 : 2;
 }
 
