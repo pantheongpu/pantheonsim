@@ -1,6 +1,7 @@
 #include "vgpu/ras.hpp"
 #include <unistd.h>
 #include <atomic>
+#include <thread>
 #include <algorithm>
 #include <utility>
 #include "vgpu/runtime/runtime.hpp"
@@ -236,18 +237,38 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
 
 }  // namespace
 
-namespace {
-
 // Takes faults armed with `vgpu fault arm` on this device's kernel loads. A
 // corrected error is counted and the load goes on; an uncorrectable one is
 // counted, logged as the driver logs it (Xid 48, then 63 for the page or row
 // it takes out of service), and ends the kernel; a bit flip corrupts the
 // value silently. Loads on several host threads may race to take the last
 // armed fault; ArmedFaults::take lets exactly one have it.
-class ArmedFaultHook final : public MemoryManager::LoadFault {
+class FaultHook final : public MemoryManager::LoadFault {
  public:
-  ArmedFaultHook(const DeviceProfile& p, int ordinal) : faults_(identify(p, ordinal)) {
+  FaultHook(const DeviceProfile& p, int ordinal) : faults_(identify(p, ordinal)) {
     pending = faults_.pending();
+  }
+
+  // A hang armed for this launch: it stalls the launch, with the device shown
+  // fully busy as a hung card is, for `seconds` -- or, with 0, until the
+  // process is stopped -- and then fails it the way a timed-out launch fails.
+  void maybe_hang(const std::string& kernel, telemetry::Publisher* pub, uint32_t ord) {
+    uint64_t seconds = 0;
+    if (!faults_.take_hang(&seconds)) return;
+    const auto start = std::chrono::steady_clock::now();
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      if (pub) pub->note_kernel(ord, 0.25);
+      const double waited =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+      if (seconds && waited >= static_cast<double>(seconds)) break;
+    }
+    if (pub) pub->note_kernel(ord, 0.0);
+    ras::log_kernel(ras::xid_line(bus_id_, 8,
+                                  "pid=" + std::to_string(::getpid()) + ", name=" + process_name(),
+                                  "GPU stopped processing"));
+    throw Error::make(Err::ExecLimit, "kernel '", kernel, "' hung for ", seconds,
+                      " s and was stopped (armed with `vgpu fault arm --hang`)");
   }
 
   uint64_t on_load(uint64_t addr, uint32_t size, uint64_t value) override {
@@ -313,13 +334,25 @@ class ArmedFaultHook final : public MemoryManager::LoadFault {
   std::atomic<uint64_t> flips_{0};
 };
 
-}  // namespace
+Device::Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemetry)
+    : profile_(std::move(profile)), ordinal_(ordinal),
+      mem_(profile_.vram_bytes, static_cast<uint32_t>(ordinal)), telemetry_(telemetry) {
+  if (telemetry_) {
+    int ord = ordinal_;
+    telemetry::Publisher* pub = telemetry_;
+    mem_.set_usage_observer(
+        [pub, ord](uint64_t used) { pub->note_memory(static_cast<uint32_t>(ord), used); });
+  }
+  install_fault_hook();
+}
+
+Device::~Device() = default;
 
 void Device::install_fault_hook() {
   // Without a writable runtime directory no fault can be armed for this device;
   // everything else works exactly as before.
   try {
-    fault_ = std::make_unique<ArmedFaultHook>(profile_, ordinal_);
+    fault_ = std::make_unique<FaultHook>(profile_, ordinal_);
     mem_.set_load_fault(fault_.get());
   } catch (const std::exception&) {
     fault_.reset();
@@ -333,6 +366,7 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   // its own table.
   exec::LaunchConfig cfg = in_cfg;
   if (!cfg.textures && !textures_.empty()) cfg.textures = &textures_;
+  if (fault_) fault_->maybe_hang(fn.name, telemetry_, static_cast<uint32_t>(ordinal_));
   if (!telemetry_) {
     report_counters(fn.name, cfg, exec::launch(fn, cfg, args, mem_, profile_, syms));
     return;

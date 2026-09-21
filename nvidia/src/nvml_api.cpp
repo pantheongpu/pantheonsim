@@ -69,9 +69,18 @@ bool index_of(nvmlDevice_t dev, unsigned int* out) {
 // With nothing publishing, a machine described by the environment answers as
 // an idle rack -- see nvmlInit_v2.
 bool refresh() {
-  if (vgpu::telemetry::read_snapshot(&g_snap)) return true;
-  if (!g_have_profile) return false;
-  g_snap = g_idle;
+  if (!vgpu::telemetry::read_snapshot(&g_snap)) {
+    if (!g_have_profile) return false;
+    g_snap = g_idle;
+  }
+  // Injected clock-event reasons and the readings they imply, applied once
+  // here so every getter agrees with every other, and with nvidia-smi.
+  for (uint32_t i = 0; i < g_snap.device_count; ++i) {
+    try {
+      vgpu::ras::apply_throttle(g_snap.devices[i]);
+    } catch (const std::exception&) {
+    }
+  }
   return true;
 }
 
@@ -662,9 +671,9 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCurrentClocksThrottleReasons(nvmlDevice_t 
   refresh();
   const auto* d = sample(device);
   if (!d || !reasons) return NVML_ERROR_INVALID_ARGUMENT;
-  // Nothing slows a simulated clock. The one reason a real idle card reports
-  // is GPU idle (bit 0), so that is what an idle device reports here too.
-  *reasons = d->utilization_gpu == 0 ? 0x1ull : 0;
+  // GPU idle (bit 0) whenever the device is, as a real idle card reports it,
+  // and whatever was injected with `vgpu fault throttle`.
+  *reasons = (d->utilization_gpu == 0 ? vgpu::ras::kGpuIdle : 0) | d->clock_event_reasons;
   return NVML_SUCCESS;
 }
 

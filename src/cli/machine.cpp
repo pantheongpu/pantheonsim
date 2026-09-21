@@ -4,11 +4,35 @@
 #include <cstdlib>
 #include <exception>
 
+#include "vgpu/ras.hpp"
 #include "vgpu/registry.hpp"
 
 namespace vgpu::cli {
 
+namespace {
+// Injected clock-event reasons (`vgpu fault throttle`) and the readings they
+// imply, applied to what every command reads so nvidia-smi, rocm-smi and
+// `vgpu fault show` agree. Unreadable reliability state leaves the readings
+// as they were rather than failing the report.
+void apply_faults(vgpu::telemetry::Shared* snap) {
+  for (uint32_t i = 0; i < snap->device_count; ++i) {
+    try {
+      vgpu::ras::apply_throttle(snap->devices[i]);
+    } catch (const std::exception&) {
+    }
+  }
+}
+bool read_live_or_idle(vgpu::telemetry::Shared* snap);
+}  // namespace
+
 bool read_machine(vgpu::telemetry::Shared* snap) {
+  if (!read_live_or_idle(snap)) return false;
+  apply_faults(snap);
+  return true;
+}
+
+namespace {
+bool read_live_or_idle(vgpu::telemetry::Shared* snap) {
   if (vgpu::telemetry::read_snapshot(snap)) return true;
   // Nothing is publishing, which on a real machine is the ordinary case:
   // nvidia-smi answers about an idle GPU rather than failing. Monitoring
@@ -27,5 +51,6 @@ bool read_machine(vgpu::telemetry::Shared* snap) {
   }
   return true;
 }
+}  // namespace
 
 }  // namespace vgpu::cli

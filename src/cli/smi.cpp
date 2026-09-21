@@ -527,18 +527,26 @@ std::string query_field(const vgpu::telemetry::DeviceSample& d, uint32_t index,
   if (field == "clocks.max.memory" || field == "clocks.max.mem")
     return num(d.mem_clock_max_mhz, "MHz");
   if (field == "fan.speed") return num(d.fan_percent, "%");
-  // Clock-event reasons, in the forms a real driver prints. Nothing slows a
-  // simulated clock, so the one reason that can be active is the one a real
-  // idle card reports: GPU idle, bit 0. The supported mask is an RTX 3060's.
-  const bool idle = d.utilization_gpu == 0;
-  if (field == "clocks_throttle_reasons.active" || field == "clocks_event_reasons.active")
-    return idle ? "0x0000000000000001" : "0x0000000000000000";
+  // Clock-event reasons, in the forms a real driver prints: GPU idle whenever
+  // the device is, as a real idle card reports it, and whatever was injected
+  // with `vgpu fault throttle` (read_machine applied it). The supported mask
+  // is an RTX 3060's.
+  const uint64_t active =
+      (d.utilization_gpu == 0 ? vgpu::ras::kGpuIdle : 0) | d.clock_event_reasons;
+  if (field == "clocks_throttle_reasons.active" || field == "clocks_event_reasons.active") {
+    std::snprintf(buf, sizeof buf, "0x%016llX", static_cast<unsigned long long>(active));
+    return buf;
+  }
   if (field == "clocks_throttle_reasons.supported" || field == "clocks_event_reasons.supported")
     return "0x00000000000001FF";
-  if (field.rfind("clocks_event_reasons_counters.", 0) == 0) return num(0, "us");
+  if (field.rfind("clocks_event_reasons_counters.", 0) == 0) {
+    const uint64_t bit = vgpu::ras::reason_bit(field.substr(field.find_last_of('.') + 1));
+    return num(bit ? static_cast<long long>(vgpu::ras::throttle_time_us(d.uuid, bit)) : 0, "us");
+  }
   if (field.rfind("clocks_event_reasons.", 0) == 0 || field.rfind("clocks_throttle_reasons.", 0) == 0) {
-    const bool gpu_idle = field.size() > 9 && field.compare(field.size() - 9, 9, ".gpu_idle") == 0;
-    return gpu_idle && idle ? "Active" : "Not Active";
+    const std::string name = field.substr(field.find('.') + 1);
+    const uint64_t bit = name == "gpu_idle" ? vgpu::ras::kGpuIdle : vgpu::ras::reason_bit(name);
+    return bit && (active & bit) ? "Active" : "Not Active";
   }
   if (field == "pstate") { std::snprintf(buf, sizeof buf, "P%u", d.perf_state); return buf; }
   return "[N/A]";

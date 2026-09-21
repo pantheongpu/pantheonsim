@@ -25,17 +25,10 @@ namespace vgpu::runtime {
 
 class Device {
  public:
-  Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemetry)
-      : profile_(std::move(profile)), ordinal_(ordinal), mem_(profile_.vram_bytes, static_cast<uint32_t>(ordinal)),
-        telemetry_(telemetry) {
-    if (telemetry_) {
-      int ord = ordinal_;
-      telemetry::Publisher* pub = telemetry_;
-      mem_.set_usage_observer(
-          [pub, ord](uint64_t used) { pub->note_memory(static_cast<uint32_t>(ord), used); });
-    }
-    install_fault_hook();
-  }
+  // Defined with the fault hook it installs, which is only complete there.
+  Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemetry);
+
+  ~Device();
 
   const DeviceProfile& profile() const { return profile_; }
   int ordinal() const { return ordinal_; }
@@ -86,9 +79,10 @@ class Device {
   const exec::TextureTable& textures() const { return textures_; }
 
  private:
-  // Delivers faults armed with `vgpu fault arm` to this device's kernel loads.
+  // Delivers faults armed with `vgpu fault arm` to this device: to its kernel
+  // loads, and a hang to its next launch.
   void install_fault_hook();
-  std::unique_ptr<MemoryManager::LoadFault> fault_;
+  std::unique_ptr<class FaultHook> fault_;
   DeviceProfile profile_;
   int ordinal_;
   MemoryManager mem_;

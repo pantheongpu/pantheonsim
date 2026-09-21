@@ -7,6 +7,8 @@
 
 #include <cstdlib>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <filesystem>
 #include <string>
@@ -235,6 +237,60 @@ VTEST(the_kernel_log_is_written_only_inside_a_session) {
   VCHECK_EQ(texts.size(), 3u);
   VCHECK_EQ(texts[2], std::string("second"));
   VCHECK(stamps[1] > stamps[0] && stamps[2] > stamps[1]);
+}
+
+VTEST(a_hang_is_armed_for_launches_not_loads) {
+  TempMachine m("hang");
+  ras::ArmedFaults faults(kGpu);
+  ras::arm_hang(kGpu, 3);
+  VCHECK_EQ(*faults.pending(), 0u);   // loads never see a hang
+  uint64_t seconds = 0;
+  VCHECK(faults.take_hang(&seconds));
+  VCHECK_EQ(seconds, 3u);
+  VCHECK(!faults.take_hang(&seconds));
+}
+
+VTEST(throttle_reasons_are_active_for_their_window_and_their_time_is_kept) {
+  TempMachine m("throttle");
+  VCHECK_EQ(ras::reason_bit("sw_thermal_slowdown"), ras::kSwThermalSlowdown);
+  VCHECK_EQ(ras::reason_bit("gpu_idle"), 0u);   // reported, never injected
+  ras::throttle(kGpu, ras::kSwThermalSlowdown | ras::kSwPowerCap, 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  telemetry::DeviceSample d{};
+  std::snprintf(d.uuid, sizeof d.uuid, "%s", kGpu);
+  d.temperature_c = 40;
+  d.temperature_max_c = 90;
+  d.power_mw = 20000;
+  d.power_limit_mw = 70000;
+  d.sm_clock_max_mhz = 1600;
+  d.sm_clock_mhz = 1600;
+  VCHECK_EQ(ras::apply_throttle(d), ras::kSwThermalSlowdown | ras::kSwPowerCap);
+  VCHECK_EQ(d.temperature_c, 90u);    // at the slowdown threshold
+  VCHECK_EQ(d.power_mw, 70000u);      // held at the limit
+  VCHECK_EQ(d.sm_clock_mhz, 1200u);   // three quarters, for software reasons
+  VCHECK(ras::throttle_time_us(kGpu, ras::kSwThermalSlowdown) >= 20000);
+  ras::clear_throttle(kGpu);
+  const uint64_t kept = ras::throttle_time_us(kGpu, ras::kSwThermalSlowdown);
+  VCHECK(kept >= 20000);
+  telemetry::DeviceSample after{};
+  std::snprintf(after.uuid, sizeof after.uuid, "%s", kGpu);
+  VCHECK_EQ(ras::apply_throttle(after), 0u);
+  VCHECK_EQ(ras::throttle_time_us(kGpu, ras::kSwThermalSlowdown), kept);   // stopped counting
+}
+
+VTEST(a_throttle_window_ends_by_itself) {
+  TempMachine m("expiry");
+  ras::throttle(kGpu, ras::kHwSlowdown, 1);
+  telemetry::DeviceSample d{};
+  std::snprintf(d.uuid, sizeof d.uuid, "%s", kGpu);
+  d.sm_clock_max_mhz = 2000;
+  d.sm_clock_mhz = 2000;
+  VCHECK_EQ(ras::apply_throttle(d), ras::kHwSlowdown);
+  VCHECK_EQ(d.sm_clock_mhz, 1000u);   // half, for a hardware reason
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  VCHECK_EQ(ras::apply_throttle(d), 0u);
+  const uint64_t us = ras::throttle_time_us(kGpu, ras::kHwSlowdown);
+  VCHECK(us >= 990000 && us <= 1010000);   // the window, not the time since
 }
 
 VTEST_MAIN
