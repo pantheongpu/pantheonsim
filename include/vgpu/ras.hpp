@@ -22,6 +22,8 @@
 #include <memory>
 #include <string>
 
+#include "vgpu/telemetry.hpp"
+
 namespace vgpu::ras {
 
 enum class Severity : uint32_t { Corrected, Uncorrected };
@@ -56,6 +58,13 @@ struct Counters {
   // the silent bit flips delivered so far.
   uint64_t armed_corrected, armed_uncorrected, armed_bitflip, armed_total;
   uint64_t bitflips_delivered;
+  // A kernel hang armed for the next launch (not counted in armed_total, which
+  // loads read), and how long it lasts: 0 is until the process is stopped.
+  uint64_t armed_hang, hang_seconds;
+  // Injected clock-event reasons: the current window, and the time each reason
+  // was active in windows already closed, in microseconds.
+  uint64_t throttle_mask, throttle_since_ns, throttle_until_ns;
+  uint64_t throttle_us[8];
 
   uint64_t ecc_total(Severity s) const;
 };
@@ -101,8 +110,11 @@ std::string state_dir();
 // uncorrectable one is counted, logged, and fails the kernel with
 // cudaErrorECCUncorrectable; a bit flip silently corrupts the value loaded,
 // the way a fault that ECC does not cover would. Most severe first.
-enum class Armed : uint32_t { None, Corrected, Uncorrected, Bitflip };
+enum class Armed : uint32_t { None, Corrected, Uncorrected, Bitflip, Hang };
 void arm(const std::string& uuid, Armed kind, uint64_t n);
+// A hang for the next kernel launch: it stalls for `seconds` and then fails
+// with cudaErrorLaunchTimeout, or with seconds 0 never returns.
+void arm_hang(const std::string& uuid, uint64_t seconds);
 
 // One device's armed faults, mapped for the life of the process. Checked on
 // every device-memory load, so what is read there is a single word.
@@ -118,6 +130,8 @@ class ArmedFaults {
   // Takes one fault, most severe first. None when another thread took the last.
   Armed take();
   void note_bitflip();
+  // Takes an armed hang, if there is one, with how long it lasts.
+  bool take_hang(uint64_t* seconds);
 
  private:
   struct Impl;
@@ -140,5 +154,30 @@ std::string xid_line(const std::string& bus_id, int xid, const std::string& proc
 // The kernel's AER line for a PCIe error on bus_id, or "" for a counter AER
 // does not report (NAKs, lane errors, recovery entries).
 std::string aer_line(const std::string& bus_id, Pcie c);
+
+// ---- Clock-event reasons (`vgpu fault throttle`) ----------------------------
+//
+// NVML's bits. GPU idle is never injected: it is reported whenever a device is
+// idle, as a real one reports it.
+inline constexpr uint64_t kGpuIdle = 0x1, kSwPowerCap = 0x4, kHwSlowdown = 0x8,
+                          kSwThermalSlowdown = 0x20, kHwThermalSlowdown = 0x40,
+                          kHwPowerBrakeSlowdown = 0x80;
+// nvidia-smi's names for the injectable ones; 0 for any other name.
+uint64_t reason_bit(const std::string& name);
+
+// Starts a window with these reasons active, for `seconds` or (0) until cleared.
+// Starting one closes the last, so its time is kept in the counters.
+void throttle(const std::string& uuid, uint64_t reasons, uint64_t seconds);
+void clear_throttle(const std::string& uuid);
+
+// The reasons active now, and a reading adjusted to agree with them: a thermal
+// slowdown puts the temperature at the slowdown threshold, a power cap holds
+// power at the limit, and a slowdown pulls the SM clock down (to half for the
+// hardware reasons, to three quarters for the software ones). Sets
+// d.clock_event_reasons; returns it.
+uint64_t apply_throttle(telemetry::DeviceSample& d);
+
+// How long a reason has been active, over every window, in microseconds.
+uint64_t throttle_time_us(const std::string& uuid, uint64_t reason);
 
 }  // namespace vgpu::ras

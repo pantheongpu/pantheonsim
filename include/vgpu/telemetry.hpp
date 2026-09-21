@@ -34,7 +34,7 @@
 namespace vgpu::telemetry {
 
 inline constexpr uint32_t kMagic = 0x56475054;  // "VGPT"
-inline constexpr uint32_t kVersion = 2;  // 2: reliability and PCIe link fields
+inline constexpr uint32_t kVersion = 3;  // 2: reliability and link; 3: clock-event reasons
 inline constexpr int kMaxDevices = 16;
 inline constexpr int kMaxProcs = 8;
 
@@ -82,6 +82,9 @@ struct DeviceSample {
   uint32_t temperature_mem_c;       // synthetic; meaningful only with the flag above
   uint32_t pcie_gen;                // profile: the link real cards most often run at
   uint32_t pcie_width;
+  // Clock-event reasons injected with `vgpu fault throttle`, NVML's bits. Set
+  // when a reading is taken (ras::apply_throttle), never by a publisher.
+  uint64_t clock_event_reasons;
 
   uint32_t proc_count;
   ProcSample procs[kMaxProcs];

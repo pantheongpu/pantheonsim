@@ -22,6 +22,8 @@ int usage(FILE* to) {
                "usage: vgpu fault inject [--gpu N] --ecc corrected|uncorrected [--location LOC] [--count N]\n"
                "       vgpu fault inject [--gpu N] --pcie COUNTER [--count N]\n"
                "       vgpu fault arm [--gpu N] --ecc corrected|uncorrected|--bitflip [--count N]\n"
+               "       vgpu fault arm [--gpu N] --hang [--seconds S]\n"
+               "       vgpu fault throttle [--gpu N] --reason R[,R...] [--seconds S] | --clear\n"
                "       vgpu fault show [--gpu N]\n"
                "       vgpu fault reset [--gpu N] --volatile|--aggregate\n"
                "\n"
@@ -46,7 +48,17 @@ int usage(FILE* to) {
                "logged as Xid 48 and fails the kernel with cudaErrorECCUncorrectable, and\n"
                "--bitflip silently flips one bit of the value loaded, as a fault ECC does not\n"
                "cover would -- what memory tests exist to catch. Inside `vgpu shell`, errors\n"
-               "also appear in dmesg as the driver and kernel log them.\n");
+               "also appear in dmesg as the driver and kernel log them.\n"
+               "\n"
+               "arm --hang stalls the next kernel launch, the device shown fully busy, for S\n"
+               "seconds and then fails it with cudaErrorLaunchTimeout -- or, without --seconds,\n"
+               "until the process is stopped, which is what a watchdog exists to catch.\n"
+               "\n"
+               "throttle makes clock-event reasons active, for S seconds or until --clear:\n"
+               "sw_power_cap, hw_slowdown, sw_thermal_slowdown, hw_thermal_slowdown and\n"
+               "hw_power_brake_slowdown. Readings agree with them: a thermal slowdown puts the\n"
+               "temperature at the slowdown threshold, a power cap holds power at the limit,\n"
+               "and a slowdown pulls the SM clock down.\n");
   return to == stdout ? 0 : 2;
 }
 
@@ -94,6 +106,23 @@ void show(uint32_t index, const vgpu::telemetry::DeviceSample& d) {
               std::to_string(st.since_load.pcie[c]);
   std::printf("  PCIe errors            %s\n", pcie.empty() ? "none" : pcie.c_str());
   const vgpu::ras::Counters& now = st.since_load;
+  if (d.clock_event_reasons) {
+    static const std::pair<uint64_t, const char*> kNames[] = {
+        {vgpu::ras::kSwPowerCap, "sw_power_cap"},
+        {vgpu::ras::kHwSlowdown, "hw_slowdown"},
+        {vgpu::ras::kSwThermalSlowdown, "sw_thermal_slowdown"},
+        {vgpu::ras::kHwThermalSlowdown, "hw_thermal_slowdown"},
+        {vgpu::ras::kHwPowerBrakeSlowdown, "hw_power_brake_slowdown"}};
+    std::string names;
+    for (const auto& [bit, name] : kNames)
+      if (d.clock_event_reasons & bit) names += std::string(names.empty() ? "" : ", ") + name;
+    std::printf("  clock-event reasons    %s%s\n", names.c_str(),
+                now.throttle_until_ns ? "" : " (until cleared)");
+  }
+  if (now.armed_hang)
+    std::printf("  armed hang             next launch, %s\n",
+                now.hang_seconds ? (std::to_string(now.hang_seconds) + " s").c_str()
+                                 : "until the process is stopped");
   if (now.armed_total || now.bitflips_delivered)
     std::printf("  armed                  corrected %llu, uncorrected %llu, bit flips %llu "
                 "(bit flips delivered: %llu)\n",
@@ -109,19 +138,19 @@ int cmd_fault(const std::vector<std::string>& args) {
   if (args.empty()) return usage(stderr);
   const std::string& verb = args[0];
   if (verb == "-h" || verb == "--help" || verb == "help") return usage(stdout);
-  if (verb != "inject" && verb != "arm" && verb != "show" && verb != "reset") {
-    std::fprintf(stderr, "vgpu fault: unknown action '%s' (inject, arm, show or reset)\n",
+  if (verb != "inject" && verb != "arm" && verb != "throttle" && verb != "show" && verb != "reset") {
+    std::fprintf(stderr, "vgpu fault: unknown action '%s' (inject, arm, throttle, show or reset)\n",
                  verb.c_str());
     return 2;
   }
 
-  std::string gpu, ecc, location, pcie;
-  bool vol = false, agg = false, bitflip = false;
-  long long count = 1;
+  std::string gpu, ecc, location, pcie, reasons;
+  bool vol = false, agg = false, bitflip = false, hang = false, clear = false;
+  long long count = 1, seconds = -1;
   for (size_t i = 1; i < args.size(); ++i) {
     const std::string& a = args[i];
     const bool takes_value = a == "--gpu" || a == "--ecc" || a == "--location" || a == "--pcie" ||
-                             a == "--count";
+                             a == "--count" || a == "--reason" || a == "--seconds";
     if (takes_value && i + 1 >= args.size()) {
       std::fprintf(stderr, "vgpu fault: %s needs a value\n", a.c_str());
       return 2;
@@ -136,7 +165,16 @@ int cmd_fault(const std::vector<std::string>& args) {
                      args[i].c_str());
         return 2;
       }
-    } else if (a == "--bitflip") bitflip = true;
+    } else if (a == "--seconds") {
+      if (!vgpu::cli::parse_int(args[++i], 1, 86400LL * 365, &seconds)) {
+        std::fprintf(stderr, "vgpu fault: --seconds needs a whole number from 1, got '%s'\n",
+                     args[i].c_str());
+        return 2;
+      }
+    } else if (a == "--reason") reasons = args[++i];
+    else if (a == "--hang") hang = true;
+    else if (a == "--clear") clear = true;
+    else if (a == "--bitflip") bitflip = true;
     else if (a == "--volatile") vol = true;
     else if (a == "--aggregate") agg = true;
     else if (a == "-h" || a == "--help") return usage(stdout);
@@ -159,6 +197,62 @@ int cmd_fault(const std::vector<std::string>& args) {
       return 2;
     }
     sel.push_back(static_cast<uint32_t>(n));
+  }
+
+  // Options that belong to one action are refused by the others.
+  if (verb != "throttle" && (!reasons.empty() || clear)) {
+    std::fprintf(stderr, "vgpu fault %s: --reason and --clear belong to throttle\n", verb.c_str());
+    return 2;
+  }
+  if (seconds >= 0 && verb != "throttle" && !(verb == "arm" && hang)) {
+    std::fprintf(stderr, "vgpu fault %s: --seconds belongs to throttle and arm --hang\n", verb.c_str());
+    return 2;
+  }
+  if (hang && verb != "arm") {
+    std::fprintf(stderr, "vgpu fault %s: --hang belongs to arm\n", verb.c_str());
+    return 2;
+  }
+
+  if (verb == "throttle") {
+    if (!ecc.empty() || !pcie.empty() || !location.empty() || vol || agg || bitflip) {
+      std::fprintf(stderr, "vgpu fault throttle: takes --reason, --seconds, --clear and --gpu\n");
+      return 2;
+    }
+    if (reasons.empty() == !clear) {
+      std::fprintf(stderr, "vgpu fault throttle: name one of --reason or --clear\n");
+      return 2;
+    }
+    if (clear) {
+      for (uint32_t i : sel) {
+        vgpu::ras::clear_throttle(snap.devices[i].uuid);
+        std::printf("Cleared clock-event reasons on GPU %u (%s).\n", i, snap.devices[i].name);
+      }
+      return 0;
+    }
+    uint64_t mask = 0;
+    for (size_t at = 0; at <= reasons.size();) {
+      const size_t comma = reasons.find(',', at);
+      const std::string r = reasons.substr(at, (comma == std::string::npos ? reasons.size() : comma) - at);
+      const uint64_t bit = vgpu::ras::reason_bit(r);
+      if (!bit) {
+        std::fprintf(stderr, "vgpu fault throttle: unknown reason '%s' (sw_power_cap, hw_slowdown, "
+                             "sw_thermal_slowdown, hw_thermal_slowdown, hw_power_brake_slowdown)\n",
+                     r.c_str());
+        return 2;
+      }
+      mask |= bit;
+      at = comma == std::string::npos ? reasons.size() + 1 : comma + 1;
+    }
+    for (uint32_t i : sel) {
+      vgpu::ras::throttle(snap.devices[i].uuid, mask, seconds > 0 ? static_cast<uint64_t>(seconds) : 0);
+      if (seconds > 0)
+        std::printf("Throttling GPU %u (%s): %s for %lld s.\n", i, snap.devices[i].name, reasons.c_str(),
+                    seconds);
+      else
+        std::printf("Throttling GPU %u (%s): %s until cleared.\n", i, snap.devices[i].name,
+                    reasons.c_str());
+    }
+    return 0;
   }
 
   if (verb == "show") {
@@ -187,8 +281,26 @@ int cmd_fault(const std::vector<std::string>& args) {
 
   if (verb == "arm") {
     if (!pcie.empty() || !location.empty() || vol || agg) {
-      std::fprintf(stderr, "vgpu fault arm: takes --ecc or --bitflip, with --gpu and --count\n");
+      std::fprintf(stderr, "vgpu fault arm: takes --ecc, --bitflip or --hang, with --gpu and --count\n");
       return 2;
+    }
+    if (hang) {
+      if (!ecc.empty() || bitflip) {
+        std::fprintf(stderr, "vgpu fault arm: --hang is armed on its own\n");
+        return 2;
+      }
+      for (uint32_t i : sel) {
+        for (long long k = 0; k < count; ++k)
+          vgpu::ras::arm_hang(snap.devices[i].uuid, seconds > 0 ? static_cast<uint64_t>(seconds) : 0);
+        if (seconds > 0)
+          std::printf("Armed a %lld s hang for the next kernel launch on GPU %u (%s).\n", seconds, i,
+                      snap.devices[i].name);
+        else
+          std::printf("Armed a hang for the next kernel launch on GPU %u (%s); it lasts until the "
+                      "process is stopped.\n",
+                      i, snap.devices[i].name);
+      }
+      return 0;
     }
     if (ecc.empty() == !bitflip) {
       std::fprintf(stderr, "vgpu fault arm: name one of --ecc or --bitflip\n");

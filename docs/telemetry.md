@@ -136,6 +136,22 @@ Inside `vgpu shell`, these errors also reach `dmesg` the way the driver and the
 kernel log them: an uncorrectable ECC error as Xid 48, the page or row it takes
 out of service as Xid 63, and PCIe errors as AER lines.
 
+Two more faults a health tool has to handle:
+
+```bash
+vgpu fault arm --hang --seconds 30      # the next launch stalls, then times out
+vgpu fault arm --hang                   # ... or stalls until the process is stopped
+vgpu fault throttle --reason sw_thermal_slowdown --seconds 60
+vgpu fault throttle --clear
+```
+
+A hung launch shows the device fully busy, as a hung card does, and then fails
+with `cudaErrorLaunchTimeout` and Xid 8 -- or never returns, which is what a
+watchdog exists to catch. A throttle makes clock-event reasons active, and every
+reading agrees with them: nvidia-smi's and NVML's reasons and their time
+counters, a thermal slowdown's temperature at the slowdown threshold, a power
+cap's draw at the limit, and a slowdown's SM clock pulled down.
+
 ## lspci
 
 `vgpu smi --lspci` prints the listing directly. `vgpu smi --lspci-dump`

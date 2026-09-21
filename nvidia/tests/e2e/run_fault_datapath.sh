@@ -55,4 +55,12 @@ expect "an uncorrectable error fails the kernel with error 214" \
 expect "counted, with a page pending retirement" "1, 1, Yes" \
   "$(q ecc.errors.uncorrected.volatile.total,retired_pages.dbe,retired_pages.pending)"
 expect "nothing is left armed" "mismatches: 0" "$(run)"
+
+"$vgpu" fault arm --hang --seconds 2 >/dev/null
+start=$(date +%s.%N)
+got=$(run)
+took=$(echo "$(date +%s.%N) - $start" | bc)
+expect "a hung launch fails with a launch timeout" "launch failed: 702 cudaErrorLaunchTimeout" "$got"
+expect "after the time it was armed for" "yes" "$( (( $(echo "$took >= 2" | bc) )) && echo yes || echo no)"
+expect "and the next run is clean" "mismatches: 0" "$(run)"
 exit $fail

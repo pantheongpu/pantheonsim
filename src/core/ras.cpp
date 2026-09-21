@@ -21,7 +21,7 @@ namespace vgpu::ras {
 namespace {
 
 constexpr uint32_t kMagic = 0x56524153;  // "VRAS"
-constexpr uint32_t kVersion = 2;  // 2: armed faults
+constexpr uint32_t kVersion = 3;  // 2: armed faults; 3: hangs and clock-event reasons
 
 struct File {
   uint32_t magic;
@@ -327,6 +327,122 @@ std::string aer_line(const std::string& bus_id, Pcie c) {
     default: return "";
   }
   return std::string("pcieport 0000:00:01.0: AER: ") + kind + ": " + kernel_bdf(bus_id);
+}
+
+// ---- Hangs --------------------------------------------------------------------
+
+void arm_hang(const std::string& uuid, uint64_t seconds) {
+  Mapped v(volatile_path(uuid), true);
+  Counters* c = v.counters();
+  set(&c->hang_seconds, seconds);
+  add(&c->armed_hang, 1);
+}
+
+bool ArmedFaults::take_hang(uint64_t* seconds) {
+  Counters* c = impl_->file.counters();
+  uint64_t have = __atomic_load_n(&c->armed_hang, __ATOMIC_RELAXED);
+  while (have > 0)
+    if (__atomic_compare_exchange_n(&c->armed_hang, &have, have - 1, false, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_RELAXED)) {
+      *seconds = __atomic_load_n(&c->hang_seconds, __ATOMIC_RELAXED);
+      return true;
+    }
+  return false;
+}
+
+// ---- Clock-event reasons ------------------------------------------------------
+
+namespace {
+
+// Where each reason's time accumulates, by bit position.
+int reason_slot(uint64_t bit) {
+  for (int i = 0; i < 8; ++i)
+    if (bit == (uint64_t{1} << i)) return i;
+  return -1;
+}
+
+uint64_t now_ns() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count());
+}
+
+// The end of the current window, as of `now`: its expiry if that has passed.
+uint64_t window_end(const Counters& c, uint64_t now) {
+  return c.throttle_until_ns && c.throttle_until_ns < now ? c.throttle_until_ns : now;
+}
+
+// Moves the current window's time into the counters and ends it.
+void close_window(Counters* c) {
+  const uint64_t mask = __atomic_load_n(&c->throttle_mask, __ATOMIC_RELAXED);
+  if (mask) {
+    const uint64_t end = window_end(*c, now_ns());
+    const uint64_t since = __atomic_load_n(&c->throttle_since_ns, __ATOMIC_RELAXED);
+    const uint64_t us = end > since ? (end - since) / 1000 : 0;
+    for (int i = 0; i < 8; ++i)
+      if (mask & (uint64_t{1} << i)) add(&c->throttle_us[i], us);
+  }
+  set(&c->throttle_mask, 0);
+  set(&c->throttle_since_ns, 0);
+  set(&c->throttle_until_ns, 0);
+}
+
+}  // namespace
+
+uint64_t reason_bit(const std::string& name) {
+  if (name == "sw_power_cap") return kSwPowerCap;
+  if (name == "hw_slowdown") return kHwSlowdown;
+  if (name == "sw_thermal_slowdown") return kSwThermalSlowdown;
+  if (name == "hw_thermal_slowdown") return kHwThermalSlowdown;
+  if (name == "hw_power_brake_slowdown") return kHwPowerBrakeSlowdown;
+  return 0;
+}
+
+void throttle(const std::string& uuid, uint64_t reasons, uint64_t seconds) {
+  Mapped v(volatile_path(uuid), true);
+  Counters* c = v.counters();
+  close_window(c);
+  const uint64_t now = now_ns();
+  set(&c->throttle_since_ns, now);
+  set(&c->throttle_until_ns, seconds ? now + seconds * 1000000000ull : 0);
+  set(&c->throttle_mask, reasons);
+}
+
+void clear_throttle(const std::string& uuid) {
+  Mapped v(volatile_path(uuid), false);
+  if (Counters* c = v.counters()) close_window(c);
+}
+
+uint64_t apply_throttle(telemetry::DeviceSample& d) {
+  const Counters c = read(d.uuid).since_load;
+  const uint64_t now = now_ns();
+  const bool live = c.throttle_mask && (!c.throttle_until_ns || now < c.throttle_until_ns);
+  const uint64_t active = live ? c.throttle_mask : 0;
+  d.clock_event_reasons = active;
+  if (!active) return 0;
+  if (active & (kSwThermalSlowdown | kHwThermalSlowdown)) {
+    const uint32_t slowdown = d.temperature_max_c ? d.temperature_max_c : 85;
+    if (d.temperature_c < slowdown) d.temperature_c = slowdown;
+  }
+  if ((active & kSwPowerCap) && d.power_limit_mw) d.power_mw = d.power_limit_mw;
+  double factor = 1.0;
+  if (active & (kHwSlowdown | kHwThermalSlowdown | kHwPowerBrakeSlowdown)) factor = 0.5;
+  else if (active & (kSwThermalSlowdown | kSwPowerCap)) factor = 0.75;
+  const auto cap = static_cast<uint32_t>(d.sm_clock_max_mhz * factor);
+  if (d.sm_clock_mhz > cap) d.sm_clock_mhz = cap;
+  return active;
+}
+
+uint64_t throttle_time_us(const std::string& uuid, uint64_t reason) {
+  const int slot = reason_slot(reason);
+  if (slot < 0) return 0;
+  const Counters c = read(uuid).since_load;
+  uint64_t us = c.throttle_us[slot];
+  if (c.throttle_mask & reason) {
+    const uint64_t end = window_end(c, now_ns());
+    if (end > c.throttle_since_ns) us += (end - c.throttle_since_ns) / 1000;
+  }
+  return us;
 }
 
 }  // namespace vgpu::ras

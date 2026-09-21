@@ -3,6 +3,8 @@
 # surface a health tool reads -- nvidia-smi's fields and table, nvidia-smi -p,
 # and rocm-smi.
 set -uo pipefail
+root="$(cd "$(dirname "$0")/../../.." && pwd)"
+. "$root/tests/shim_guard.sh"
 build="${VGPU_BUILD_DIR:-build}"
 vgpu="$build/vgpu"
 [[ -x "$vgpu" ]] || { echo "no vgpu at $vgpu"; exit 1; }
@@ -88,6 +90,43 @@ VGPU_GPU=nvidia/rtx3060 VGPU_DEVICE_COUNT=1 "$vgpu" fault arm --bitflip >/dev/nu
 expect "a bit flip can be armed on any card" "0" "$?"
 t4 fault inject --bitflip >/dev/null; expect "a bit flip is armed, not injected" "2" "$?"
 t4 fault arm --ecc corrected --bitflip >/dev/null; expect "arm takes one kind at a time" "2" "$?"
+
+# Clock-event reasons: every reading agrees with an injected throttle.
+t4 fault throttle --gpu 0 --reason sw_thermal_slowdown,sw_power_cap >/dev/null
+expect "throttle starts" "0" "$?"
+expect "the reasons are active, with GPU idle, in the driver's mask" \
+  "0x0000000000000025, Active, Active, Not Active" \
+  "$(q 0 clocks_event_reasons.active,clocks_event_reasons.sw_thermal_slowdown,clocks_event_reasons.sw_power_cap,clocks_event_reasons.hw_slowdown)"
+expect "a thermal slowdown reads at the T4's slowdown threshold, a power cap at the limit" "93, 70.00 W" \
+  "$(q 0 temperature.gpu,power.draw)"
+expect "the other GPU is not throttled" "0x0000000000000001" "$(q 1 clocks_event_reasons.active)"
+expect "fault show names the reasons" "yes" \
+  "$(t4 fault show --gpu 0 | grep -q 'clock-event reasons    sw_power_cap, sw_thermal_slowdown (until cleared)' && echo yes || echo no)"
+# ctypes loads the NVML shim into python, which a sanitizer runtime refuses.
+if [[ -e "$build/shim/libnvidia-ml.so.1" ]] && command -v python3 >/dev/null &&
+   [[ -z "$(shim_sanitizer "$build/shim")" ]]; then
+  got=$(VGPU_GPU=nvidia/t4 VGPU_DEVICE_COUNT=2 python3 -c '
+import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+lib.nvmlInit_v2()
+h = ctypes.c_void_p()
+lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(h))
+r = ctypes.c_ulonglong()
+lib.nvmlDeviceGetCurrentClocksThrottleReasons(h, ctypes.byref(r))
+print(hex(r.value))' "$build/shim/libnvidia-ml.so.1" 2>&1)
+  expect "NVML reports the same reasons" "0x25" "$got"
+fi
+sleep 0.2
+t4 fault throttle --gpu 0 --clear >/dev/null
+expect "clearing ends them; the time they were active is kept" "0x0000000000000001 yes" \
+  "$(q 0 clocks_event_reasons.active) $( [[ "$(t4 smi -i 0 --query-gpu=clocks_event_reasons_counters.sw_thermal_slowdown --format=csv,noheader,nounits)" -ge 100000 ]] && echo yes || echo no)"
+t4 fault throttle --gpu 1 --reason hw_slowdown --seconds 1 >/dev/null
+expect "a timed throttle is active" "Active" "$(q 1 clocks_event_reasons.hw_slowdown)"
+sleep 1.3
+expect "and ends by itself" "Not Active" "$(q 1 clocks_event_reasons.hw_slowdown)"
+t4 fault throttle --reason gpu_idle >/dev/null; expect "GPU idle cannot be injected" "2" "$?"
+t4 fault throttle --reason hw_slowdown --clear >/dev/null; expect "throttle takes --reason or --clear" "2" "$?"
+t4 fault inject --ecc corrected --seconds 3 >/dev/null; expect "--seconds does not belong to inject" "2" "$?"
 
 t4 fault inject --ecc sideways >/dev/null; expect "an unknown ECC kind is refused" "2" "$?"
 t4 fault inject --gpu 9 --ecc corrected >/dev/null; expect "a GPU that is not there is refused" "2" "$?"
