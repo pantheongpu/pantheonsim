@@ -30,6 +30,7 @@ enum class Err {
   DeviceAssert,           // a device-side assert() failed, with its own message
   LaunchConfig,           // grid/block/shared config violates profile limits
   ExecLimit,              // step budget exceeded (likely infinite loop)
+  EccUncorrectable,       // an uncorrectable ECC error in device memory (vgpu fault arm)
   NotFound,               // module/function lookup failure
   Unsupported,            // unimplemented runtime feature
   Internal,               // invariant violation in the emulator itself

@@ -6,9 +6,12 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <type_traits>
 
 #include "vgpu/error.hpp"
@@ -18,7 +21,7 @@ namespace vgpu::ras {
 namespace {
 
 constexpr uint32_t kMagic = 0x56524153;  // "VRAS"
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;  // 2: armed faults
 
 struct File {
   uint32_t magic;
@@ -210,6 +213,120 @@ std::string state_dir() {
   if (const char* x = std::getenv("XDG_STATE_HOME"); x && *x) return std::string(x) + "/vgpu";
   if (const char* h = std::getenv("HOME"); h && *h) return std::string(h) + "/.local/state/vgpu";
   return "/tmp/vgpu-state-" + std::to_string(::getuid());
+}
+
+// ---- Faults delivered to a running kernel -----------------------------------
+
+void arm(const std::string& uuid, Armed kind, uint64_t n) {
+  if (n == 0 || kind == Armed::None) return;
+  Mapped v(volatile_path(uuid), true);
+  Counters* c = v.counters();
+  add(kind == Armed::Corrected     ? &c->armed_corrected
+      : kind == Armed::Uncorrected ? &c->armed_uncorrected
+                                   : &c->armed_bitflip,
+      n);
+  add(&c->armed_total, n);
+}
+
+struct ArmedFaults::Impl {
+  explicit Impl(const std::string& uuid) : file(volatile_path(uuid), true) {}
+  Mapped file;
+};
+
+ArmedFaults::ArmedFaults(const std::string& uuid) : impl_(std::make_unique<Impl>(uuid)) {}
+ArmedFaults::~ArmedFaults() = default;
+
+const uint64_t* ArmedFaults::pending() const { return &impl_->file.counters()->armed_total; }
+
+Armed ArmedFaults::take() {
+  Counters* c = impl_->file.counters();
+  // Decrements a counter only if it is above zero, so two threads taking the
+  // last one cannot both have it.
+  auto take_one = [](uint64_t* word) {
+    uint64_t have = __atomic_load_n(word, __ATOMIC_RELAXED);
+    while (have > 0)
+      if (__atomic_compare_exchange_n(word, &have, have - 1, false, __ATOMIC_ACQ_REL,
+                                      __ATOMIC_RELAXED))
+        return true;
+    return false;
+  };
+  Armed got = Armed::None;
+  if (take_one(&c->armed_uncorrected)) got = Armed::Uncorrected;
+  else if (take_one(&c->armed_bitflip)) got = Armed::Bitflip;
+  else if (take_one(&c->armed_corrected)) got = Armed::Corrected;
+  if (got != Armed::None) take_one(&c->armed_total);
+  return got;
+}
+
+void ArmedFaults::note_bitflip() { add(&impl_->file.counters()->bitflips_delivered, 1); }
+
+// ---- The kernel log ---------------------------------------------------------
+
+void log_kernel(const std::string& message) {
+  const char* session = std::getenv("VGPU_SESSION");
+  if (!session || !*session) return;
+  const std::string path = std::string(session) + "/dmesg.log";
+  // After the last stamp in the file, by as long as it has been since the file
+  // was last written: the boot lines are stamped seconds after "boot", and an
+  // event must not appear before them.
+  double last = 0.0;
+  if (std::ifstream in{path, std::ios::ate}) {
+    const std::streamoff size = in.tellg();
+    in.seekg(size > 4096 ? size - 4096 : 0);
+    std::string line;
+    while (std::getline(in, line)) {
+      double t = 0;
+      if (std::sscanf(line.c_str(), "[%lf]", &t) == 1) last = t;
+    }
+  }
+  double since = 0.0;
+  std::error_code ec;
+  const auto mtime = std::filesystem::last_write_time(path, ec);
+  if (!ec)
+    since = std::chrono::duration<double>(std::filesystem::file_time_type::clock::now() - mtime).count();
+  char line[1024];
+  std::snprintf(line, sizeof line, "[%12.6f] %s\n", last + (since > 1e-6 ? since : 1e-6), message.c_str());
+  if (std::FILE* f = std::fopen(path.c_str(), "a")) {
+    std::fputs(line, f);
+    std::fclose(f);
+  }
+}
+
+namespace {
+// "00000000:01:00.0" -> "0000:01:00.0": sysfs and the kernel log use a
+// four-digit domain where nvidia-smi uses eight.
+std::string kernel_bdf(const std::string& bus_id) {
+  unsigned domain = 0, bus = 0, dev = 0, fn = 0;
+  std::sscanf(bus_id.c_str(), "%x:%x:%x.%x", &domain, &bus, &dev, &fn);
+  char out[32];
+  std::snprintf(out, sizeof out, "%04x:%02x:%02x.%x", domain, bus, dev, fn);
+  return out;
+}
+}  // namespace
+
+std::string xid_line(const std::string& bus_id, int xid, const std::string& process,
+                     const std::string& detail) {
+  // The driver names the device by domain, bus and slot, without the function.
+  const std::string bdf = kernel_bdf(bus_id);
+  char out[1024];
+  std::snprintf(out, sizeof out, "NVRM: Xid (PCI:%s): %d, %s, %s", bdf.substr(0, bdf.rfind('.')).c_str(),
+                xid, process.empty() ? "pid='<unknown>', name=<unknown>" : process.c_str(),
+                detail.c_str());
+  return out;
+}
+
+std::string aer_line(const std::string& bus_id, Pcie c) {
+  const char* kind = nullptr;
+  switch (c) {
+    case Pcie::Correctable: case Pcie::Replay: case Pcie::ReplayRollover:
+    case Pcie::BadTlp: case Pcie::BadDllp: case Pcie::Lcrc:
+      kind = "Corrected error received";
+      break;
+    case Pcie::NonFatal: kind = "Uncorrected (Non-Fatal) error received"; break;
+    case Pcie::Fatal: kind = "Uncorrected (Fatal) error received"; break;
+    default: return "";
+  }
+  return std::string("pcieport 0000:00:01.0: AER: ") + kind + ": " + kernel_bdf(bus_id);
 }
 
 }  // namespace vgpu::ras

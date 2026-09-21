@@ -21,6 +21,7 @@ int usage(FILE* to) {
   std::fprintf(to,
                "usage: vgpu fault inject [--gpu N] --ecc corrected|uncorrected [--location LOC] [--count N]\n"
                "       vgpu fault inject [--gpu N] --pcie COUNTER [--count N]\n"
+               "       vgpu fault arm [--gpu N] --ecc corrected|uncorrected|--bitflip [--count N]\n"
                "       vgpu fault show [--gpu N]\n"
                "       vgpu fault reset [--gpu N] --volatile|--aggregate\n"
                "\n"
@@ -36,6 +37,13 @@ int usage(FILE* to) {
                "                    naks_received, bad_tlp, naks_sent, bad_dllp, non_fatal, fatal,\n"
                "                    lcrc, lane\n"
                "  --count N         how many (default 1)\n"
+               "\n"
+               "arm loads faults that the next device-memory loads of a running kernel take: a\n"
+               "corrected error is counted and changes nothing, an uncorrected one is counted,\n"
+               "logged as Xid 48 and fails the kernel with cudaErrorECCUncorrectable, and\n"
+               "--bitflip silently flips one bit of the value loaded, as a fault ECC does not\n"
+               "cover would -- what memory tests exist to catch. Inside `vgpu shell`, errors\n"
+               "also appear in dmesg as the driver and kernel log them.\n"
                "  --volatile        reset: zero the counts since the driver loaded, as a driver\n"
                "                    reload does, and complete pending retirements\n"
                "  --aggregate       reset: zero the lifetime ECC counts (nvidia-smi -p 1)\n");
@@ -85,6 +93,14 @@ void show(uint32_t index, const vgpu::telemetry::DeviceSample& d) {
               vgpu::ras::pcie_name(static_cast<vgpu::ras::Pcie>(c)) + " " +
               std::to_string(st.since_load.pcie[c]);
   std::printf("  PCIe errors            %s\n", pcie.empty() ? "none" : pcie.c_str());
+  const vgpu::ras::Counters& now = st.since_load;
+  if (now.armed_total || now.bitflips_delivered)
+    std::printf("  armed                  corrected %llu, uncorrected %llu, bit flips %llu "
+                "(bit flips delivered: %llu)\n",
+                static_cast<unsigned long long>(now.armed_corrected),
+                static_cast<unsigned long long>(now.armed_uncorrected),
+                static_cast<unsigned long long>(now.armed_bitflip),
+                static_cast<unsigned long long>(now.bitflips_delivered));
 }
 
 }  // namespace
@@ -93,13 +109,14 @@ int cmd_fault(const std::vector<std::string>& args) {
   if (args.empty()) return usage(stderr);
   const std::string& verb = args[0];
   if (verb == "-h" || verb == "--help" || verb == "help") return usage(stdout);
-  if (verb != "inject" && verb != "show" && verb != "reset") {
-    std::fprintf(stderr, "vgpu fault: unknown action '%s' (inject, show or reset)\n", verb.c_str());
+  if (verb != "inject" && verb != "arm" && verb != "show" && verb != "reset") {
+    std::fprintf(stderr, "vgpu fault: unknown action '%s' (inject, arm, show or reset)\n",
+                 verb.c_str());
     return 2;
   }
 
   std::string gpu, ecc, location, pcie;
-  bool vol = false, agg = false;
+  bool vol = false, agg = false, bitflip = false;
   long long count = 1;
   for (size_t i = 1; i < args.size(); ++i) {
     const std::string& a = args[i];
@@ -119,7 +136,8 @@ int cmd_fault(const std::vector<std::string>& args) {
                      args[i].c_str());
         return 2;
       }
-    } else if (a == "--volatile") vol = true;
+    } else if (a == "--bitflip") bitflip = true;
+    else if (a == "--volatile") vol = true;
     else if (a == "--aggregate") agg = true;
     else if (a == "-h" || a == "--help") return usage(stdout);
     else {
@@ -144,7 +162,7 @@ int cmd_fault(const std::vector<std::string>& args) {
   }
 
   if (verb == "show") {
-    if (!ecc.empty() || !pcie.empty() || !location.empty() || vol || agg) {
+    if (!ecc.empty() || !pcie.empty() || !location.empty() || vol || agg || bitflip) {
       std::fprintf(stderr, "vgpu fault show: takes only --gpu\n");
       return 2;
     }
@@ -167,7 +185,47 @@ int cmd_fault(const std::vector<std::string>& args) {
     return 0;
   }
 
+  if (verb == "arm") {
+    if (!pcie.empty() || !location.empty() || vol || agg) {
+      std::fprintf(stderr, "vgpu fault arm: takes --ecc or --bitflip, with --gpu and --count\n");
+      return 2;
+    }
+    if (ecc.empty() == !bitflip) {
+      std::fprintf(stderr, "vgpu fault arm: name one of --ecc or --bitflip\n");
+      return 2;
+    }
+    vgpu::ras::Armed kind = vgpu::ras::Armed::Bitflip;
+    if (!ecc.empty()) {
+      if (ecc == "corrected") kind = vgpu::ras::Armed::Corrected;
+      else if (ecc == "uncorrected") kind = vgpu::ras::Armed::Uncorrected;
+      else {
+        std::fprintf(stderr, "vgpu fault arm: --ecc is corrected or uncorrected, got '%s'\n", ecc.c_str());
+        return 2;
+      }
+      for (uint32_t i : sel)
+        if (!snap.devices[i].ecc_enabled) {
+          std::fprintf(stderr, "vgpu fault arm: GPU %u (%s) has no ECC, so it cannot report an ECC "
+                               "error; --bitflip corrupts data on any card\n",
+                       i, snap.devices[i].name);
+          return 2;
+        }
+    }
+    const char* what = kind == vgpu::ras::Armed::Bitflip ? "bit flip" : ecc == "corrected"
+                                                                           ? "corrected ECC error"
+                                                                           : "uncorrected ECC error";
+    for (uint32_t i : sel) {
+      vgpu::ras::arm(snap.devices[i].uuid, kind, static_cast<uint64_t>(count));
+      std::printf("Armed %lld %s%s for the next device-memory loads on GPU %u (%s).\n", count, what,
+                  count == 1 ? "" : "s", i, snap.devices[i].name);
+    }
+    return 0;
+  }
+
   // inject
+  if (bitflip) {
+    std::fprintf(stderr, "vgpu fault inject: --bitflip belongs to arm, since a flip happens on a load\n");
+    return 2;
+  }
   if (vol || agg) {
     std::fprintf(stderr, "vgpu fault inject: --volatile and --aggregate belong to reset\n");
     return 2;
@@ -189,6 +247,8 @@ int cmd_fault(const std::vector<std::string>& args) {
     }
     for (uint32_t i : sel) {
       vgpu::ras::inject_pcie(snap.devices[i].uuid, counter, static_cast<uint64_t>(count));
+      if (const std::string line = vgpu::ras::aer_line(snap.devices[i].bus_id, counter); !line.empty())
+        for (long long k = 0; k < count && k < 100; ++k) vgpu::ras::log_kernel(line);
       std::printf("Injected %lld PCIe %s error%s into GPU %u (%s).\n", count, pcie.c_str(),
                   count == 1 ? "" : "s", i, snap.devices[i].name);
     }
@@ -217,6 +277,21 @@ int cmd_fault(const std::vector<std::string>& args) {
   for (uint32_t i : sel) {
     const auto& d = snap.devices[i];
     vgpu::ras::inject_ecc(d.uuid, severity, loc, static_cast<uint64_t>(count), scheme_of(d));
+    // The driver's log of it: Xid 48 for an uncorrectable error in device
+    // memory, and Xid 63 for the page or row it takes out of service.
+    if (severity == vgpu::ras::Severity::Uncorrected && loc == vgpu::ras::Location::DeviceMemory) {
+      vgpu::ras::log_kernel(vgpu::ras::xid_line(
+          d.bus_id, 48, "",
+          "An uncorrectable double bit error (DBE) has been detected on GPU in the framebuffer at "
+          "partition 0, subpartition 0."));
+      if (scheme_of(d) == vgpu::ras::Retirement::Pages)
+        vgpu::ras::log_kernel(vgpu::ras::xid_line(
+            d.bus_id, 63, "",
+            "ECC page retirement recording event: a page is pending retirement, reboot to activate."));
+      else if (scheme_of(d) == vgpu::ras::Retirement::Rows)
+        vgpu::ras::log_kernel(vgpu::ras::xid_line(
+            d.bus_id, 63, "", "Row Remapper: New row marked for remapping, reset gpu to activate."));
+    }
     std::printf("Injected %lld %s %s ECC error%s into GPU %u (%s).\n", count, ecc.c_str(),
                 vgpu::ras::location_name(loc), count == 1 ? "" : "s", i, d.name);
   }

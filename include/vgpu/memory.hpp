@@ -118,6 +118,15 @@ class MemoryManager {
   // live memory telemetry; optional and unset by default.
   void set_usage_observer(std::function<void(uint64_t)> obs) { usage_observer_ = std::move(obs); }
 
+  // A fault taken on a kernel's device-memory load (`vgpu fault arm`). While
+  // `pending` reads zero -- nearly always -- a load costs that one read.
+  struct LoadFault {
+    virtual ~LoadFault() = default;
+    virtual uint64_t on_load(uint64_t addr, uint32_t size, uint64_t value) = 0;
+    const uint64_t* pending = nullptr;
+  };
+  void set_load_fault(LoadFault* f) { load_fault_ = f; }
+
   // Locates the live allocation containing `addr`. Returns false if none.
   bool find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const;
 
@@ -152,6 +161,7 @@ class MemoryManager {
   size_t live_allocations() const { return live_.size(); }
 
  private:
+  LoadFault* load_fault_ = nullptr;
   // Chunks are a flat array of owning pointers rather than a map: a lookup is
   // then an index instead of a red-black tree walk, which is the difference
   // between one instruction and a cache-missing traversal on every scalar

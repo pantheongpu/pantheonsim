@@ -6,6 +6,8 @@
 #include <unistd.h>
 
 #include <cstdlib>
+#include <atomic>
+#include <fstream>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -155,6 +157,84 @@ VTEST(a_state_file_from_another_build_is_started_again) {
   VCHECK_EQ(ras::read(kGpu).lifetime.ecc_total(Severity::Corrected), 0u);
   ras::inject_ecc(kGpu, Severity::Corrected, Location::DeviceMemory, 1, Retirement::Pages);
   VCHECK_EQ(ras::read(kGpu).lifetime.ecc_total(Severity::Corrected), 1u);
+}
+
+VTEST(armed_faults_are_taken_most_severe_first_and_only_once) {
+  TempMachine m("armed");
+  ras::ArmedFaults faults(kGpu);
+  VCHECK_EQ(*faults.pending(), 0u);
+  ras::arm(kGpu, ras::Armed::Corrected, 1);
+  ras::arm(kGpu, ras::Armed::Bitflip, 1);
+  ras::arm(kGpu, ras::Armed::Uncorrected, 1);
+  VCHECK_EQ(*faults.pending(), 3u);   // the same file, seen through this process's mapping
+  VCHECK(faults.take() == ras::Armed::Uncorrected);
+  VCHECK(faults.take() == ras::Armed::Bitflip);
+  VCHECK(faults.take() == ras::Armed::Corrected);
+  VCHECK(faults.take() == ras::Armed::None);
+  VCHECK_EQ(*faults.pending(), 0u);
+}
+
+VTEST(concurrent_loads_take_exactly_what_was_armed) {
+  TempMachine m("race");
+  ras::ArmedFaults faults(kGpu);
+  ras::arm(kGpu, ras::Armed::Bitflip, 100);
+  std::atomic<int> taken{0};
+  std::vector<std::thread> workers;
+  for (int t = 0; t < 8; ++t)
+    workers.emplace_back([&] {
+      for (int i = 0; i < 50; ++i)
+        if (faults.take() == ras::Armed::Bitflip) ++taken;
+    });
+  for (auto& w : workers) w.join();
+  VCHECK_EQ(taken.load(), 100);
+  VCHECK_EQ(*faults.pending(), 0u);
+}
+
+VTEST(a_driver_reload_disarms) {
+  TempMachine m("disarm");
+  ras::arm(kGpu, ras::Armed::Uncorrected, 2);
+  ras::reset_volatile(kGpu);
+  VCHECK_EQ(ras::read(kGpu).since_load.armed_total, 0u);
+}
+
+VTEST(log_lines_follow_the_driver_and_kernel_forms) {
+  VCHECK_EQ(ras::xid_line("00000000:01:00.0", 48, "pid=42, name=python3", "An uncorrectable error."),
+            std::string("NVRM: Xid (PCI:0000:01:00): 48, pid=42, name=python3, An uncorrectable error."));
+  VCHECK_EQ(ras::xid_line("00000000:3B:00.0", 63, "", "Row Remapper: New row marked."),
+            std::string("NVRM: Xid (PCI:0000:3b:00): 63, pid='<unknown>', name=<unknown>, Row Remapper: New row marked."));
+  VCHECK_EQ(ras::aer_line("00000000:02:00.0", ras::Pcie::Replay),
+            std::string("pcieport 0000:00:01.0: AER: Corrected error received: 0000:02:00.0"));
+  VCHECK_EQ(ras::aer_line("00000000:02:00.0", ras::Pcie::NonFatal),
+            std::string("pcieport 0000:00:01.0: AER: Uncorrected (Non-Fatal) error received: 0000:02:00.0"));
+  VCHECK_EQ(ras::aer_line("00000000:02:00.0", ras::Pcie::NaksSent), std::string(""));
+}
+
+VTEST(the_kernel_log_is_written_only_inside_a_session) {
+  TempMachine m("dmesg");
+  unsetenv("VGPU_SESSION");
+  ras::log_kernel("nowhere to go");   // outside a session: nothing, and no error
+  const std::string sess = m.root + "/session";
+  std::filesystem::create_directories(sess);
+  { std::ofstream(sess + "/dmesg.log") << "[    7.000000] booted\n"; }
+  setenv("VGPU_SESSION", sess.c_str(), 1);
+  ras::log_kernel("first");
+  ras::log_kernel("second");
+  unsetenv("VGPU_SESSION");
+  std::ifstream in(sess + "/dmesg.log");
+  std::string line;
+  std::vector<double> stamps;
+  std::vector<std::string> texts;
+  while (std::getline(in, line)) {
+    double t = 0;
+    char text[64] = {0};
+    if (std::sscanf(line.c_str(), "[%lf] %63[^\n]", &t, text) == 2) {
+      stamps.push_back(t);
+      texts.emplace_back(text);
+    }
+  }
+  VCHECK_EQ(texts.size(), 3u);
+  VCHECK_EQ(texts[2], std::string("second"));
+  VCHECK(stamps[1] > stamps[0] && stamps[2] > stamps[1]);
 }
 
 VTEST_MAIN

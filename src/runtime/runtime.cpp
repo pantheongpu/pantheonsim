@@ -1,3 +1,6 @@
+#include "vgpu/ras.hpp"
+#include <unistd.h>
+#include <atomic>
 #include <algorithm>
 #include <utility>
 #include "vgpu/runtime/runtime.hpp"
@@ -232,6 +235,96 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
 }
 
 }  // namespace
+
+namespace {
+
+// Takes faults armed with `vgpu fault arm` on this device's kernel loads. A
+// corrected error is counted and the load goes on; an uncorrectable one is
+// counted, logged as the driver logs it (Xid 48, then 63 for the page or row
+// it takes out of service), and ends the kernel; a bit flip corrupts the
+// value silently. Loads on several host threads may race to take the last
+// armed fault; ArmedFaults::take lets exactly one have it.
+class ArmedFaultHook final : public MemoryManager::LoadFault {
+ public:
+  ArmedFaultHook(const DeviceProfile& p, int ordinal) : faults_(identify(p, ordinal)) {
+    pending = faults_.pending();
+  }
+
+  uint64_t on_load(uint64_t addr, uint32_t size, uint64_t value) override {
+    switch (faults_.take()) {
+      case ras::Armed::None:
+        return value;
+      case ras::Armed::Corrected:
+        ras::inject_ecc(uuid_, ras::Severity::Corrected, ras::Location::DeviceMemory, 1, scheme_);
+        return value;
+      case ras::Armed::Bitflip: {
+        const uint32_t bit = static_cast<uint32_t>((addr * 8 + flips_.fetch_add(1)) % (size * 8u));
+        faults_.note_bitflip();
+        return value ^ (uint64_t{1} << bit);
+      }
+      case ras::Armed::Uncorrected:
+        break;
+    }
+    ras::inject_ecc(uuid_, ras::Severity::Uncorrected, ras::Location::DeviceMemory, 1, scheme_);
+    const std::string who = "pid=" + std::to_string(::getpid()) + ", name=" + process_name();
+    ras::log_kernel(ras::xid_line(bus_id_, 48, who,
+                                  "An uncorrectable double bit error (DBE) has been detected on GPU "
+                                  "in the framebuffer at partition 0, subpartition 0."));
+    if (scheme_ == ras::Retirement::Pages)
+      ras::log_kernel(ras::xid_line(bus_id_, 63, "",
+                                    "ECC page retirement recording event: a page is pending "
+                                    "retirement, reboot to activate."));
+    else if (scheme_ == ras::Retirement::Rows)
+      ras::log_kernel(ras::xid_line(bus_id_, 63, "",
+                                    "Row Remapper: New row marked for remapping, reset gpu to activate."));
+    char at[32];
+    std::snprintf(at, sizeof at, "0x%llx", static_cast<unsigned long long>(addr));
+    throw Error::make(Err::EccUncorrectable, "uncorrectable ECC error in device memory at ", at,
+                      " (armed with `vgpu fault arm`)");
+  }
+
+ private:
+  // The device's UUID and bus id, the ones nvidia-smi reports, and the way it
+  // takes failing memory out of service.
+  std::string identify(const DeviceProfile& p, int ordinal) {
+    telemetry::DeviceSample d{};
+    telemetry::describe_device(p, ordinal, &d);
+    uuid_ = d.uuid;
+    bus_id_ = d.bus_id;
+    scheme_ = static_cast<ras::Retirement>(d.memory_retirement);
+    return uuid_;
+  }
+  static std::string process_name() {
+    std::string name = "<unknown>";
+    if (std::FILE* f = std::fopen("/proc/self/comm", "r")) {
+      char buf[64] = {0};
+      if (std::fgets(buf, sizeof buf, f)) {
+        name = buf;
+        while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back();
+      }
+      std::fclose(f);
+    }
+    return name;
+  }
+
+  std::string uuid_, bus_id_;
+  ras::Retirement scheme_ = ras::Retirement::None;
+  ras::ArmedFaults faults_;
+  std::atomic<uint64_t> flips_{0};
+};
+
+}  // namespace
+
+void Device::install_fault_hook() {
+  // Without a writable runtime directory no fault can be armed for this device;
+  // everything else works exactly as before.
+  try {
+    fault_ = std::make_unique<ArmedFaultHook>(profile_, ordinal_);
+    mem_.set_load_fault(fault_.get());
+  } catch (const std::exception&) {
+    fault_.reset();
+  }
+}
 
 void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
                     const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms) {

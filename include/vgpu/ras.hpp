@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 namespace vgpu::ras {
@@ -51,6 +52,10 @@ struct Counters {
   uint64_t retired_sbe, retired_dbe, retired_pending;
   uint64_t rows_correctable, rows_uncorrectable, rows_pending, rows_failure;
   uint64_t pcie[kPcieCounters];
+  // Faults armed for delivery to a running kernel (volatile file only), and
+  // the silent bit flips delivered so far.
+  uint64_t armed_corrected, armed_uncorrected, armed_bitflip, armed_total;
+  uint64_t bitflips_delivered;
 
   uint64_t ecc_total(Severity s) const;
 };
@@ -88,5 +93,52 @@ bool parse_pcie(const std::string& s, Pcie* out);
 
 // Where aggregate state is kept (see above).
 std::string state_dir();
+
+// ---- Faults delivered to a running kernel -----------------------------------
+//
+// `vgpu fault arm` loads faults that the next device-memory loads of a running
+// kernel take: a corrected error is counted and changes nothing; an
+// uncorrectable one is counted, logged, and fails the kernel with
+// cudaErrorECCUncorrectable; a bit flip silently corrupts the value loaded,
+// the way a fault that ECC does not cover would. Most severe first.
+enum class Armed : uint32_t { None, Corrected, Uncorrected, Bitflip };
+void arm(const std::string& uuid, Armed kind, uint64_t n);
+
+// One device's armed faults, mapped for the life of the process. Checked on
+// every device-memory load, so what is read there is a single word.
+class ArmedFaults {
+ public:
+  explicit ArmedFaults(const std::string& uuid);   // creates the state file
+  ~ArmedFaults();
+  ArmedFaults(const ArmedFaults&) = delete;
+  ArmedFaults& operator=(const ArmedFaults&) = delete;
+
+  // Non-zero while anything is armed.
+  const uint64_t* pending() const;
+  // Takes one fault, most severe first. None when another thread took the last.
+  Armed take();
+  void note_bitflip();
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+// ---- The kernel log ---------------------------------------------------------
+//
+// Appends a line to the session's dmesg ($VGPU_SESSION/dmesg.log), stamped
+// after the last line already there. Outside a session there is no simulated
+// kernel log, and this does nothing.
+void log_kernel(const std::string& message);
+
+// A line in the NVIDIA driver's Xid form, for the device at bus_id
+// ("00000000:01:00.0"). `process` is "pid=123, name=python3", or empty for an
+// error no process caused, which the driver prints as pid='<unknown>'.
+std::string xid_line(const std::string& bus_id, int xid, const std::string& process,
+                     const std::string& detail);
+
+// The kernel's AER line for a PCIe error on bus_id, or "" for a counter AER
+// does not report (NAKs, lane errors, recovery entries).
+std::string aer_line(const std::string& bus_id, Pcie c);
 
 }  // namespace vgpu::ras
