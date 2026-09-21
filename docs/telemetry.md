@@ -132,6 +132,19 @@ not cover -- which is what a memory test or a silent-data-corruption check
 exists to catch. An uncorrectable error fails the kernel with
 `cudaErrorECCUncorrectable` (214), which poisons the context as on a real card.
 
+`--on` moves a fault to other accesses. `--on store` flips a bit of what a
+kernel's store writes, so memory holds the wrong value and every later read
+finds it, a copy back to the host included; ECC errors cannot be armed there,
+since ECC is checked when memory is read. `--on shared` puts any of the three
+on shared-memory loads: shared memory and L1 are one SRAM in the SM, so its
+ECC errors count as the L1 cache's, and an uncorrectable one fails the kernel
+without retiring a page or row of device memory.
+
+```bash
+vgpu fault arm --bitflip --on store --count 2
+vgpu fault arm --ecc uncorrected --on shared
+```
+
 Inside `vgpu shell`, these errors also reach `dmesg` the way the driver and the
 kernel log them: an uncorrectable ECC error as Xid 48, the page or row it takes
 out of service as Xid 63, and PCIe errors as AER lines.

@@ -1,5 +1,6 @@
 // A kernel that copies a buffer, and a host check of what came back: the
 // program `vgpu fault arm` is tested against. It knows nothing of VirtualGPU.
+// With the argument "shared", the copy is staged through shared memory.
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -9,7 +10,20 @@ __global__ void copy(const unsigned* in, unsigned* out, int n) {
   if (i < n) out[i] = in[i];
 }
 
-int main() {
+__global__ void staged(const unsigned* in, unsigned* out, int n) {
+  __shared__ unsigned tile[256];
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  tile[threadIdx.x] = i < n ? in[i] : 0u;
+  __syncthreads();
+  // Each thread writes out a neighbour's element, so the value really is read
+  // back from shared memory.
+  const unsigned j = (threadIdx.x + 1) % blockDim.x;
+  const int k = blockIdx.x * blockDim.x + static_cast<int>(j);
+  if (k < n) out[k] = tile[j];
+}
+
+int main(int argc, char** argv) {
+  const bool through_shared = argc > 1 && argv[1][0] == 's';
   const int n = 4096;
   const size_t bytes = n * sizeof(unsigned);
   unsigned* want = static_cast<unsigned*>(malloc(bytes));
@@ -20,7 +34,10 @@ int main() {
   cudaMalloc(&out, bytes);
   cudaMemcpy(in, want, bytes, cudaMemcpyHostToDevice);
   cudaMemset(out, 0, bytes);
-  copy<<<(n + 255) / 256, 256>>>(in, out, n);
+  if (through_shared)
+    staged<<<(n + 255) / 256, 256>>>(in, out, n);
+  else
+    copy<<<(n + 255) / 256, 256>>>(in, out, n);
   // Every path frees what it allocated: the e2e run is under LeakSanitizer, and
   // the uncorrectable-error path is the one that returns early.
   int rc = 0;

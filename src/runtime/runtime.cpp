@@ -237,16 +237,19 @@ void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
 
 }  // namespace
 
-// Takes faults armed with `vgpu fault arm` on this device's kernel loads. A
-// corrected error is counted and the load goes on; an uncorrectable one is
+// Takes faults armed with `vgpu fault arm` on this device's kernel accesses. A
+// corrected error is counted and the access goes on; an uncorrectable one is
 // counted, logged as the driver logs it (Xid 48, then 63 for the page or row
-// it takes out of service), and ends the kernel; a bit flip corrupts the
-// value silently. Loads on several host threads may race to take the last
-// armed fault; ArmedFaults::take lets exactly one have it.
-class FaultHook final : public MemoryManager::LoadFault {
+// it takes out of service when it is in device memory), and ends the kernel;
+// a bit flip corrupts the value silently -- on a store, the value written, so
+// every later read finds it. Accesses on several host threads may race to take
+// the last armed fault; ArmedFaults::take lets exactly one have it.
+class FaultHook final : public MemoryManager::AccessFault {
  public:
   FaultHook(const DeviceProfile& p, int ordinal) : faults_(identify(p, ordinal)) {
-    pending = faults_.pending();
+    load_pending = faults_.pending(ras::Target::Load);
+    store_pending = faults_.pending(ras::Target::Store);
+    shared_pending = faults_.pending(ras::Target::Shared);
   }
 
   // A hang armed for this launch: it stalls the launch, with the device shown
@@ -265,18 +268,34 @@ class FaultHook final : public MemoryManager::LoadFault {
     }
     if (pub) pub->note_kernel(ord, 0.0);
     ras::report_xid(uuid_, bus_id_, 8,
-                                  "pid=" + std::to_string(::getpid()) + ", name=" + process_name(),
-                                  "GPU stopped processing");
+                    "pid=" + std::to_string(::getpid()) + ", name=" + process_name(),
+                    "GPU stopped processing");
     throw Error::make(Err::ExecLimit, "kernel '", kernel, "' hung for ", seconds,
                       " s and was stopped (armed with `vgpu fault arm --hang`)");
   }
 
   uint64_t on_load(uint64_t addr, uint32_t size, uint64_t value) override {
-    switch (faults_.take()) {
+    return take(ras::Target::Load, addr, size, value);
+  }
+  uint64_t on_store(uint64_t addr, uint32_t size, uint64_t value) override {
+    return take(ras::Target::Store, addr, size, value);
+  }
+  uint64_t on_shared_load(uint64_t offset, uint32_t size, uint64_t value) override {
+    return take(ras::Target::Shared, offset, size, value);
+  }
+
+ private:
+  uint64_t take(ras::Target at, uint64_t addr, uint32_t size, uint64_t value) {
+    // Shared memory and L1 are one SRAM in the SM: its errors are the L1
+    // cache's, and no page or row of device memory is taken out of service.
+    const bool shared = at == ras::Target::Shared;
+    const ras::Location where = shared ? ras::Location::L1Cache : ras::Location::DeviceMemory;
+    switch (faults_.take(at)) {
       case ras::Armed::None:
+      case ras::Armed::Hang:
         return value;
       case ras::Armed::Corrected:
-        ras::inject_ecc(uuid_, ras::Severity::Corrected, ras::Location::DeviceMemory, 1, scheme_);
+        ras::inject_ecc(uuid_, ras::Severity::Corrected, where, 1, scheme_);
         return value;
       case ras::Armed::Bitflip: {
         const uint32_t bit = static_cast<uint32_t>((addr * 8 + flips_.fetch_add(1)) % (size * 8u));
@@ -286,25 +305,31 @@ class FaultHook final : public MemoryManager::LoadFault {
       case ras::Armed::Uncorrected:
         break;
     }
-    ras::inject_ecc(uuid_, ras::Severity::Uncorrected, ras::Location::DeviceMemory, 1, scheme_);
+    ras::inject_ecc(uuid_, ras::Severity::Uncorrected, where, 1, scheme_);
     const std::string who = "pid=" + std::to_string(::getpid()) + ", name=" + process_name();
+    char at_text[32];
+    std::snprintf(at_text, sizeof at_text, "0x%llx", static_cast<unsigned long long>(addr));
+    if (shared) {
+      ras::report_xid(uuid_, bus_id_, 48, who,
+                      "An uncorrectable double bit error (DBE) has been detected on GPU in the SM "
+                      "L1 cache.");
+      throw Error::make(Err::EccUncorrectable, "uncorrectable ECC error in shared memory at offset ",
+                        at_text, " (armed with `vgpu fault arm --on shared`)");
+    }
     ras::report_xid(uuid_, bus_id_, 48, who,
-                                  "An uncorrectable double bit error (DBE) has been detected on GPU "
-                                  "in the framebuffer at partition 0, subpartition 0.");
+                    "An uncorrectable double bit error (DBE) has been detected on GPU "
+                    "in the framebuffer at partition 0, subpartition 0.");
     if (scheme_ == ras::Retirement::Pages)
       ras::report_xid(uuid_, bus_id_, 63, "",
-                                    "ECC page retirement recording event: a page is pending "
-                                    "retirement, reboot to activate.");
+                      "ECC page retirement recording event: a page is pending "
+                      "retirement, reboot to activate.");
     else if (scheme_ == ras::Retirement::Rows)
       ras::report_xid(uuid_, bus_id_, 63, "",
-                                    "Row Remapper: New row marked for remapping, reset gpu to activate.");
-    char at[32];
-    std::snprintf(at, sizeof at, "0x%llx", static_cast<unsigned long long>(addr));
-    throw Error::make(Err::EccUncorrectable, "uncorrectable ECC error in device memory at ", at,
+                      "Row Remapper: New row marked for remapping, reset gpu to activate.");
+    throw Error::make(Err::EccUncorrectable, "uncorrectable ECC error in device memory at ", at_text,
                       " (armed with `vgpu fault arm`)");
   }
 
- private:
   // The device's UUID and bus id, the ones nvidia-smi reports, and the way it
   // takes failing memory out of service.
   std::string identify(const DeviceProfile& p, int ordinal) {
@@ -353,7 +378,7 @@ void Device::install_fault_hook() {
   // everything else works exactly as before.
   try {
     fault_ = std::make_unique<FaultHook>(profile_, ordinal_);
-    mem_.set_load_fault(fault_.get());
+    mem_.set_access_fault(fault_.get());
   } catch (const std::exception&) {
     fault_.reset();
   }

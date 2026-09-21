@@ -12,6 +12,7 @@
 #include <fstream>
 #include <filesystem>
 #include <iterator>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -177,6 +178,35 @@ VTEST(armed_faults_are_taken_most_severe_first_and_only_once) {
   VCHECK_EQ(*faults.pending(), 0u);
 }
 
+VTEST(a_fault_is_taken_only_by_the_accesses_it_was_armed_on) {
+  TempMachine m("targets");
+  ras::ArmedFaults faults(kGpu);
+  ras::arm(kGpu, ras::Armed::Bitflip, 2, ras::Target::Store);
+  ras::arm(kGpu, ras::Armed::Uncorrected, 1, ras::Target::Shared);
+  VCHECK_EQ(*faults.pending(ras::Target::Load), 0u);   // loads still cost one zero read
+  VCHECK_EQ(*faults.pending(ras::Target::Store), 2u);
+  VCHECK_EQ(*faults.pending(ras::Target::Shared), 1u);
+  VCHECK(faults.take(ras::Target::Load) == ras::Armed::None);
+  VCHECK(faults.take(ras::Target::Shared) == ras::Armed::Uncorrected);
+  VCHECK(faults.take(ras::Target::Store) == ras::Armed::Bitflip);
+  VCHECK_EQ(ras::read(kGpu).since_load.armed_total(), 1u);
+}
+
+VTEST(an_ecc_error_cannot_be_armed_on_stores) {
+  TempMachine m("store-ecc");
+  bool refused = false;
+  try {
+    ras::arm(kGpu, ras::Armed::Uncorrected, 1, ras::Target::Store);
+  } catch (const std::invalid_argument&) {
+    refused = true;
+  }
+  VCHECK(refused);
+  ras::Target t{};
+  VCHECK(ras::parse_target("shared", &t) && t == ras::Target::Shared);
+  VCHECK(!ras::parse_target("texture", &t));
+  VCHECK_EQ(std::string(ras::target_name(ras::Target::Store)), std::string("store"));
+}
+
 VTEST(concurrent_loads_take_exactly_what_was_armed) {
   TempMachine m("race");
   ras::ArmedFaults faults(kGpu);
@@ -197,7 +227,7 @@ VTEST(a_driver_reload_disarms) {
   TempMachine m("disarm");
   ras::arm(kGpu, ras::Armed::Uncorrected, 2);
   ras::reset_volatile(kGpu);
-  VCHECK_EQ(ras::read(kGpu).since_load.armed_total, 0u);
+  VCHECK_EQ(ras::read(kGpu).since_load.armed_total(), 0u);
 }
 
 VTEST(log_lines_follow_the_driver_and_kernel_forms) {

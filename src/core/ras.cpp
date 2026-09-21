@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <type_traits>
 
 #include "vgpu/error.hpp"
@@ -21,7 +22,8 @@ namespace vgpu::ras {
 namespace {
 
 constexpr uint32_t kMagic = 0x56524153;  // "VRAS"
-constexpr uint32_t kVersion = 4;  // 2: armed faults; 3: hangs and clock-event reasons; 4: events
+constexpr uint32_t kVersion = 5;  // 2: armed faults; 3: hangs and clock-event reasons; 4: events;
+                                  // 5: faults armed on stores and shared memory
 
 struct File {
   uint32_t magic;
@@ -218,15 +220,40 @@ std::string state_dir() {
 
 // ---- Faults delivered to a running kernel -----------------------------------
 
-void arm(const std::string& uuid, Armed kind, uint64_t n) {
-  if (n == 0 || kind == Armed::None) return;
+namespace {
+// The slot of a fault kind in Counters::armed.
+uint32_t armed_slot(Armed kind) {
+  return kind == Armed::Corrected ? 0 : kind == Armed::Uncorrected ? 1 : 2;
+}
+constexpr const char* kTargetNames[kTargets] = {"load", "store", "shared"};
+}  // namespace
+
+const char* target_name(Target t) { return kTargetNames[static_cast<uint32_t>(t)]; }
+
+bool parse_target(const std::string& s, Target* out) {
+  for (uint32_t i = 0; i < kTargets; ++i)
+    if (s == kTargetNames[i]) {
+      *out = static_cast<Target>(i);
+      return true;
+    }
+  return false;
+}
+
+uint64_t Counters::armed_total() const {
+  uint64_t n = 0;
+  for (uint64_t p : armed_pending) n += p;
+  return n;
+}
+
+void arm(const std::string& uuid, Armed kind, uint64_t n, Target at) {
+  if (n == 0 || kind == Armed::None || kind == Armed::Hang) return;
+  if (at == Target::Store && kind != Armed::Bitflip)
+    throw std::invalid_argument("an ECC error is found when memory is read, not written");
   Mapped v(volatile_path(uuid), true);
   Counters* c = v.counters();
-  add(kind == Armed::Corrected     ? &c->armed_corrected
-      : kind == Armed::Uncorrected ? &c->armed_uncorrected
-                                   : &c->armed_bitflip,
-      n);
-  add(&c->armed_total, n);
+  const uint32_t t = static_cast<uint32_t>(at);
+  add(&c->armed[t][armed_slot(kind)], n);
+  add(&c->armed_pending[t], n);
 }
 
 struct ArmedFaults::Impl {
@@ -237,10 +264,13 @@ struct ArmedFaults::Impl {
 ArmedFaults::ArmedFaults(const std::string& uuid) : impl_(std::make_unique<Impl>(uuid)) {}
 ArmedFaults::~ArmedFaults() = default;
 
-const uint64_t* ArmedFaults::pending() const { return &impl_->file.counters()->armed_total; }
+const uint64_t* ArmedFaults::pending(Target at) const {
+  return &impl_->file.counters()->armed_pending[static_cast<uint32_t>(at)];
+}
 
-Armed ArmedFaults::take() {
+Armed ArmedFaults::take(Target at) {
   Counters* c = impl_->file.counters();
+  uint64_t* armed = c->armed[static_cast<uint32_t>(at)];
   // Decrements a counter only if it is above zero, so two threads taking the
   // last one cannot both have it.
   auto take_one = [](uint64_t* word) {
@@ -252,10 +282,10 @@ Armed ArmedFaults::take() {
     return false;
   };
   Armed got = Armed::None;
-  if (take_one(&c->armed_uncorrected)) got = Armed::Uncorrected;
-  else if (take_one(&c->armed_bitflip)) got = Armed::Bitflip;
-  else if (take_one(&c->armed_corrected)) got = Armed::Corrected;
-  if (got != Armed::None) take_one(&c->armed_total);
+  if (take_one(&armed[armed_slot(Armed::Uncorrected)])) got = Armed::Uncorrected;
+  else if (take_one(&armed[armed_slot(Armed::Bitflip)])) got = Armed::Bitflip;
+  else if (take_one(&armed[armed_slot(Armed::Corrected)])) got = Armed::Corrected;
+  if (got != Armed::None) take_one(&c->armed_pending[static_cast<uint32_t>(at)]);
   return got;
 }
 

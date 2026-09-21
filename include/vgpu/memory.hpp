@@ -118,14 +118,30 @@ class MemoryManager {
   // live memory telemetry; optional and unset by default.
   void set_usage_observer(std::function<void(uint64_t)> obs) { usage_observer_ = std::move(obs); }
 
-  // A fault taken on a kernel's device-memory load (`vgpu fault arm`). While
-  // `pending` reads zero -- nearly always -- a load costs that one read.
-  struct LoadFault {
-    virtual ~LoadFault() = default;
+  // Faults taken on a kernel's accesses (`vgpu fault arm`): its device-memory
+  // loads and stores, and its shared-memory loads. While an access's pending
+  // word reads zero -- nearly always -- the access costs that one read. Each
+  // returns the value to use in place of `value`, or throws.
+  struct AccessFault {
+    virtual ~AccessFault() = default;
     virtual uint64_t on_load(uint64_t addr, uint32_t size, uint64_t value) = 0;
-    const uint64_t* pending = nullptr;
+    virtual uint64_t on_store(uint64_t addr, uint32_t size, uint64_t value) = 0;
+    virtual uint64_t on_shared_load(uint64_t offset, uint32_t size, uint64_t value) = 0;
+    const uint64_t* load_pending = nullptr;
+    const uint64_t* store_pending = nullptr;
+    const uint64_t* shared_pending = nullptr;
   };
-  void set_load_fault(LoadFault* f) { load_fault_ = f; }
+  void set_access_fault(AccessFault* f) { access_fault_ = f; }
+
+  // A kernel's shared-memory load, at `offset` in its block's shared memory.
+  // Shared memory is the SM's, not this manager's, but its faults are armed
+  // with the device's.
+  uint64_t shared_loaded(uint64_t offset, uint32_t size, uint64_t value) const {
+    if (access_fault_ && access_fault_->shared_pending &&
+        __atomic_load_n(access_fault_->shared_pending, __ATOMIC_RELAXED))
+      return access_fault_->on_shared_load(offset, size, value);
+    return value;
+  }
 
   // Locates the live allocation containing `addr`. Returns false if none.
   bool find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const;
@@ -161,7 +177,7 @@ class MemoryManager {
   size_t live_allocations() const { return live_.size(); }
 
  private:
-  LoadFault* load_fault_ = nullptr;
+  AccessFault* access_fault_ = nullptr;
   // Chunks are a flat array of owning pointers rather than a map: a lookup is
   // then an index instead of a red-black tree walk, which is the difference
   // between one instruction and a cache-missing traversal on every scalar

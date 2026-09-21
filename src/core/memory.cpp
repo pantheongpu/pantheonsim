@@ -425,8 +425,9 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
       read(addr, &v, size);  // little-endian host assumption, documented in ARCHITECTURE.md
       return v;
   }
-  if (load_fault_ && load_fault_->pending && __atomic_load_n(load_fault_->pending, __ATOMIC_RELAXED))
-    return load_fault_->on_load(addr, size, v);
+  if (access_fault_ && access_fault_->load_pending &&
+      __atomic_load_n(access_fault_->load_pending, __ATOMIC_RELAXED))
+    return access_fault_->on_load(addr, size, v);
   return v;
 }
 
@@ -436,6 +437,11 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
   if (addr % size != 0)
     throw Error::make(Err::MisalignedAccess, "store of ", size, " bytes at ", Hex{addr},
                       " is not naturally aligned (real GPUs fault on this)");
+  // A fault armed on stores changes what reaches device memory, so every later
+  // read finds it. Mapped host memory has no device ECC and takes none.
+  if (access_fault_ && access_fault_->store_pending &&
+      __atomic_load_n(access_fault_->store_pending, __ATOMIC_RELAXED) && !is_host_mapped(addr))
+    value = access_fault_->on_store(addr, size, value);
   const uint8_t* p = nullptr;
   switch (scalar_location(addr, size, &value, &p)) {
     case ScalarAt::Chunk:

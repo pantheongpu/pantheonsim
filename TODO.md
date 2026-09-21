@@ -453,8 +453,10 @@ narrows what counts as observable, not what the detector looks at.
   ECC errors to a running kernel's loads, and a session's dmesg carries Xid
   and AER lines. `vgpu fault arm --hang` stalls a launch, and `vgpu fault
   throttle` makes clock-event reasons active with readings to match. ECC
-  errors and Xids are NVML events (nvmlEventSetWait). Not yet: PCIe AER in
-  sysfs, faults on stores and on shared memory, clock-change and power events.
+  errors and Xids are NVML events (nvmlEventSetWait). `vgpu fault arm --on
+  store|shared` puts faults on kernel stores and shared-memory loads. Not yet:
+  stuck cells at an address, faults on atomics and copies, PCIe AER in sysfs,
+  clock-change and power events.
 
 ## Not implemented (fails loudly, never silently)
 
