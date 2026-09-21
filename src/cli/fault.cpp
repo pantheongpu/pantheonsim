@@ -22,6 +22,7 @@ int usage(FILE* to) {
                "usage: vgpu fault inject [--gpu N] --ecc corrected|uncorrected [--location LOC] [--count N]\n"
                "       vgpu fault inject [--gpu N] --pcie COUNTER [--count N]\n"
                "       vgpu fault arm [--gpu N] --ecc corrected|uncorrected|--bitflip [--count N]\n"
+               "                      [--on load|store|shared]\n"
                "       vgpu fault arm [--gpu N] --hang [--seconds S]\n"
                "       vgpu fault throttle [--gpu N] --reason R[,R...] [--seconds S] | --clear\n"
                "       vgpu fault show [--gpu N]\n"
@@ -43,12 +44,18 @@ int usage(FILE* to) {
                "                    reload does, and complete pending retirements\n"
                "  --aggregate       reset: zero the lifetime ECC counts (nvidia-smi -p 1)\n"
                "\n"
-               "arm loads faults that the next device-memory loads of a running kernel take: a\n"
-               "corrected error is counted and changes nothing, an uncorrected one is counted,\n"
-               "logged as Xid 48 and fails the kernel with cudaErrorECCUncorrectable, and\n"
-               "--bitflip silently flips one bit of the value loaded, as a fault ECC does not\n"
-               "cover would -- what memory tests exist to catch. Inside `vgpu shell`, errors\n"
-               "also appear in dmesg as the driver and kernel log them.\n"
+               "arm loads faults that a running kernel's next accesses take: a corrected error\n"
+               "is counted and changes nothing, an uncorrected one is counted, logged as Xid 48\n"
+               "and fails the kernel with cudaErrorECCUncorrectable, and --bitflip silently\n"
+               "flips one bit, as a fault ECC does not cover would -- what memory tests exist\n"
+               "to catch. Inside `vgpu shell`, errors also appear in dmesg as the driver and\n"
+               "kernel log them. --on says which accesses take them:\n"
+               "  load              device-memory loads (default)\n"
+               "  store             device-memory stores: the flipped value is what memory\n"
+               "                    holds, so every later read finds it. Bit flips only, since\n"
+               "                    ECC is checked when memory is read\n"
+               "  shared            shared-memory loads, whose ECC errors count as the L1\n"
+               "                    cache's and retire no page or row\n"
                "\n"
                "arm --hang stalls the next kernel launch, the device shown fully busy, for S\n"
                "seconds and then fails it with cudaErrorLaunchTimeout -- or, without --seconds,\n"
@@ -123,13 +130,15 @@ void show(uint32_t index, const vgpu::telemetry::DeviceSample& d) {
     std::printf("  armed hang             next launch, %s\n",
                 now.hang_seconds ? (std::to_string(now.hang_seconds) + " s").c_str()
                                  : "until the process is stopped");
-  if (now.armed_total || now.bitflips_delivered)
-    std::printf("  armed                  corrected %llu, uncorrected %llu, bit flips %llu "
-                "(bit flips delivered: %llu)\n",
-                static_cast<unsigned long long>(now.armed_corrected),
-                static_cast<unsigned long long>(now.armed_uncorrected),
-                static_cast<unsigned long long>(now.armed_bitflip),
-                static_cast<unsigned long long>(now.bitflips_delivered));
+  for (uint32_t t = 0; t < vgpu::ras::kTargets; ++t)
+    if (now.armed_pending[t])
+      std::printf("  armed on %-13s corrected %llu, uncorrected %llu, bit flips %llu\n",
+                  (std::string(vgpu::ras::target_name(static_cast<vgpu::ras::Target>(t))) + "s").c_str(),
+                  static_cast<unsigned long long>(now.armed[t][0]),
+                  static_cast<unsigned long long>(now.armed[t][1]),
+                  static_cast<unsigned long long>(now.armed[t][2]));
+  if (now.bitflips_delivered)
+    std::printf("  bit flips delivered    %llu\n", static_cast<unsigned long long>(now.bitflips_delivered));
 }
 
 }  // namespace
@@ -144,13 +153,13 @@ int cmd_fault(const std::vector<std::string>& args) {
     return 2;
   }
 
-  std::string gpu, ecc, location, pcie, reasons;
+  std::string gpu, ecc, location, pcie, reasons, on;
   bool vol = false, agg = false, bitflip = false, hang = false, clear = false;
   long long count = 1, seconds = -1;
   for (size_t i = 1; i < args.size(); ++i) {
     const std::string& a = args[i];
     const bool takes_value = a == "--gpu" || a == "--ecc" || a == "--location" || a == "--pcie" ||
-                             a == "--count" || a == "--reason" || a == "--seconds";
+                             a == "--count" || a == "--reason" || a == "--seconds" || a == "--on";
     if (takes_value && i + 1 >= args.size()) {
       std::fprintf(stderr, "vgpu fault: %s needs a value\n", a.c_str());
       return 2;
@@ -158,6 +167,7 @@ int cmd_fault(const std::vector<std::string>& args) {
     if (a == "--gpu") gpu = args[++i];
     else if (a == "--ecc") ecc = args[++i];
     else if (a == "--location") location = args[++i];
+    else if (a == "--on") on = args[++i];
     else if (a == "--pcie") pcie = args[++i];
     else if (a == "--count") {
       if (!vgpu::cli::parse_int(args[++i], 1, 1000000000000LL, &count)) {
@@ -206,6 +216,10 @@ int cmd_fault(const std::vector<std::string>& args) {
   }
   if (seconds >= 0 && verb != "throttle" && !(verb == "arm" && hang)) {
     std::fprintf(stderr, "vgpu fault %s: --seconds belongs to throttle and arm --hang\n", verb.c_str());
+    return 2;
+  }
+  if (!on.empty() && (verb != "arm" || hang)) {
+    std::fprintf(stderr, "vgpu fault %s: --on belongs to arm --ecc and arm --bitflip\n", verb.c_str());
     return 2;
   }
   if (hang && verb != "arm") {
@@ -322,13 +336,26 @@ int cmd_fault(const std::vector<std::string>& args) {
           return 2;
         }
     }
+    vgpu::ras::Target at = vgpu::ras::Target::Load;
+    if (!on.empty() && !vgpu::ras::parse_target(on, &at)) {
+      std::fprintf(stderr, "vgpu fault arm: --on is load, store or shared, got '%s'\n", on.c_str());
+      return 2;
+    }
+    if (at == vgpu::ras::Target::Store && kind != vgpu::ras::Armed::Bitflip) {
+      std::fprintf(stderr, "vgpu fault arm: an ECC error is found when memory is read, not written; "
+                           "arm it on loads, or a --bitflip on stores\n");
+      return 2;
+    }
     const char* what = kind == vgpu::ras::Armed::Bitflip ? "bit flip" : ecc == "corrected"
                                                                            ? "corrected ECC error"
                                                                            : "uncorrected ECC error";
+    const char* accesses = at == vgpu::ras::Target::Store    ? "device-memory stores"
+                           : at == vgpu::ras::Target::Shared ? "shared-memory loads"
+                                                             : "device-memory loads";
     for (uint32_t i : sel) {
-      vgpu::ras::arm(snap.devices[i].uuid, kind, static_cast<uint64_t>(count));
-      std::printf("Armed %lld %s%s for the next device-memory loads on GPU %u (%s).\n", count, what,
-                  count == 1 ? "" : "s", i, snap.devices[i].name);
+      vgpu::ras::arm(snap.devices[i].uuid, kind, static_cast<uint64_t>(count), at);
+      std::printf("Armed %lld %s%s for the next %s on GPU %u (%s).\n", count, what,
+                  count == 1 ? "" : "s", accesses, i, snap.devices[i].name);
     }
     return 0;
   }

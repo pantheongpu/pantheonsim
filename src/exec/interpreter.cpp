@@ -1390,7 +1390,11 @@ class Interpreter {
       note_shared_access(ctx, ins, addr, size, /*is_write=*/false);
       uint64_t v = 0;
       std::memcpy(&v, ctx.shared->data() + (addr - kSharedVaBase), size);
-      return v;
+      try {
+        return mem_.shared_loaded(addr - kSharedVaBase, size, v);
+      } catch (const Error& e) {
+        rethrow_with_context(e, ins, static_cast<int>(lane));
+      }
     }
     if (is_local(addr)) {
       check_local(ins, static_cast<int>(lane), addr, size);
@@ -5276,7 +5280,8 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
   if (eff.cooperative) {
     constexpr uint64_t kCoopWorkspaceBytes = 64;
     coop.addr = mem.alloc(kCoopWorkspaceBytes);
-    for (uint64_t i = 0; i < kCoopWorkspaceBytes; i += 8) mem.store_scalar(coop.addr + i, 8, 0);
+    const uint8_t zero = 0;   // not a kernel's store, so no armed fault takes it
+    mem.fill(coop.addr, &zero, 1, kCoopWorkspaceBytes);
     eff.coop_workspace = coop.addr;
   }
   ParamBuffer pb = build_params(fn, args);

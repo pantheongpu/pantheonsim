@@ -54,9 +54,11 @@ struct Counters {
   uint64_t retired_sbe, retired_dbe, retired_pending;
   uint64_t rows_correctable, rows_uncorrectable, rows_pending, rows_failure;
   uint64_t pcie[kPcieCounters];
-  // Faults armed for delivery to a running kernel (volatile file only), and
-  // the silent bit flips delivered so far.
-  uint64_t armed_corrected, armed_uncorrected, armed_bitflip, armed_total;
+  // Faults armed for delivery to a running kernel (volatile file only), by
+  // where they are taken (Target) and then corrected, uncorrected, bit flip;
+  // how many are armed at each target; and the silent bit flips delivered.
+  uint64_t armed[3][3];
+  uint64_t armed_pending[3];
   uint64_t bitflips_delivered;
   // A kernel hang armed for the next launch (not counted in armed_total, which
   // loads read), and how long it lasts: 0 is until the process is stopped.
@@ -71,6 +73,7 @@ struct Counters {
   uint64_t events[32][4];
 
   uint64_t ecc_total(Severity s) const;
+  uint64_t armed_total() const;
 };
 
 struct State {
@@ -109,19 +112,29 @@ std::string state_dir();
 
 // ---- Faults delivered to a running kernel -----------------------------------
 //
-// `vgpu fault arm` loads faults that the next device-memory loads of a running
-// kernel take: a corrected error is counted and changes nothing; an
-// uncorrectable one is counted, logged, and fails the kernel with
-// cudaErrorECCUncorrectable; a bit flip silently corrupts the value loaded,
-// the way a fault that ECC does not cover would. Most severe first.
+// `vgpu fault arm` loads faults that a running kernel's next accesses take: a
+// corrected error is counted and changes nothing; an uncorrectable one is
+// counted, logged, and fails the kernel with cudaErrorECCUncorrectable; a bit
+// flip silently corrupts the value, the way a fault that ECC does not cover
+// would. Most severe first.
 enum class Armed : uint32_t { None, Corrected, Uncorrected, Bitflip, Hang };
-void arm(const std::string& uuid, Armed kind, uint64_t n);
+// Where a fault is taken: device-memory loads, device-memory stores (bit flips
+// only -- ECC is checked when memory is read, so a store's flip is what the
+// next read finds), or shared-memory loads, whose ECC errors count as the L1
+// cache's since shared memory and L1 are one SRAM.
+enum class Target : uint32_t { Load, Store, Shared };
+inline constexpr uint32_t kTargets = 3;
+static_assert(sizeof(Counters::armed_pending) / sizeof(uint64_t) == kTargets);
+const char* target_name(Target t);
+bool parse_target(const std::string& s, Target* out);
+// Throws std::invalid_argument for an ECC error armed on stores.
+void arm(const std::string& uuid, Armed kind, uint64_t n, Target at = Target::Load);
 // A hang for the next kernel launch: it stalls for `seconds` and then fails
 // with cudaErrorLaunchTimeout, or with seconds 0 never returns.
 void arm_hang(const std::string& uuid, uint64_t seconds);
 
 // One device's armed faults, mapped for the life of the process. Checked on
-// every device-memory load, so what is read there is a single word.
+// every access of a target, so what is read there is a single word.
 class ArmedFaults {
  public:
   explicit ArmedFaults(const std::string& uuid);   // creates the state file
@@ -129,10 +142,10 @@ class ArmedFaults {
   ArmedFaults(const ArmedFaults&) = delete;
   ArmedFaults& operator=(const ArmedFaults&) = delete;
 
-  // Non-zero while anything is armed.
-  const uint64_t* pending() const;
+  // Non-zero while anything is armed at `at`.
+  const uint64_t* pending(Target at = Target::Load) const;
   // Takes one fault, most severe first. None when another thread took the last.
-  Armed take();
+  Armed take(Target at = Target::Load);
   void note_bitflip();
   // Takes an armed hang, if there is one, with how long it lasts.
   bool take_hang(uint64_t* seconds);
