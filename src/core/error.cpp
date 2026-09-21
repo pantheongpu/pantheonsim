@@ -21,6 +21,7 @@ const char* err_name(Err e) {
     case Err::Trap: return "trap";
     case Err::DeviceAssert: return "device-assert";
     case Err::EccUncorrectable: return "ecc-uncorrectable";
+    case Err::DeviceLost: return "device-lost";
     case Err::LaunchConfig: return "launch-config";
     case Err::ExecLimit: return "exec-limit";
     case Err::NotFound: return "not-found";

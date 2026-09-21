@@ -31,6 +31,7 @@ enum class Err {
   LaunchConfig,           // grid/block/shared config violates profile limits
   ExecLimit,              // step budget exceeded (likely infinite loop)
   EccUncorrectable,       // an uncorrectable ECC error in device memory (vgpu fault arm)
+  DeviceLost,             // the GPU has fallen off the bus (vgpu fault lose)
   NotFound,               // module/function lookup failure
   Unsupported,            // unimplemented runtime feature
   Internal,               // invariant violation in the emulator itself

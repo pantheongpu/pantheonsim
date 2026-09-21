@@ -37,6 +37,7 @@
 #include "args.hpp"
 #include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
+#include "vgpu/ras.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/telemetry.hpp"
 #include "vgpu/runtime/runtime.hpp"
@@ -333,6 +334,19 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
     write_file(card + "/device/vendor", id);
     std::snprintf(id, sizeof id, "0x%04x\n", p.telemetry.pci_device_id);
     write_file(card + "/device/device", id);
+    // The device's error counts, as the kernel's AER stats and (on AMD)
+    // amdgpu's RAS blocks keep them: links to files rewritten whenever a
+    // count changes, so they read live (vgpu/ras.hpp, publish_session).
+    const std::string ras = s.dir + "/ras/" + ds.uuid + "/";
+    std::error_code ec;
+    for (const char* f : vgpu::ras::kAerFiles)
+      std::filesystem::create_symlink(ras + f, card + "/device/" + f, ec);
+    if (std::strcmp(ds.vendor, "amd") == 0) {
+      make_dirs(card + "/device/ras");
+      for (const char* b : vgpu::ras::kAmdgpuRasBlocks)
+        std::filesystem::create_symlink(ras + b + "_err_count",
+                                        card + "/device/ras/" + std::string(b) + "_err_count", ec);
+    }
   }
 
   // Resolves a program to an absolute path using PATH as it stands now, which
@@ -781,6 +795,15 @@ int cmd_shell(const std::vector<std::string>& args) {
   setenv("VGPU_DRIVER_VERSION", c.driver.c_str(), 1);
   setenv("VGPU_CUDA_VERSION", c.cuda.c_str(), 1);
   setenv("VGPU_SESSION", s.dir.c_str(), 1);
+  // What the sysfs links point at, from the counts as they stand.
+  for (int i = 0; i < c.count; ++i) {
+    vgpu::telemetry::DeviceSample ds{};
+    vgpu::telemetry::describe_device(profile, i, &ds);
+    try {
+      vgpu::ras::publish_session(ds.uuid);
+    } catch (const std::exception&) {
+    }
+  }
 
   // Hold the devices open for the whole session: this is what publishes
   // telemetry that nvidia-smi / rocm-smi read.

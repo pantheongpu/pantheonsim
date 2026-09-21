@@ -155,6 +155,8 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
     case Err::Trap: return CUDA_ERROR_ILLEGAL_INSTRUCTION;
     case Err::DeviceAssert: return CUDA_ERROR_ASSERT;
     case Err::EccUncorrectable: return CUDA_ERROR_ECC_UNCORRECTABLE;
+    // What programs report when their GPU falls off the bus.
+    case Err::DeviceLost: return CUDA_ERROR_LAUNCH_FAILED;
     case Err::DataRace: return CUDA_ERROR_LAUNCH_FAILED;
     case Err::DoubleFree:
     case Err::InvalidFree:

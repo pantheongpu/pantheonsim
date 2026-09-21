@@ -482,10 +482,16 @@ std::string query_field(const vgpu::telemetry::DeviceSample& d, uint32_t index,
     return d.has_memory_temperature
                ? std::to_string(d.temperature_mem_c ? d.temperature_mem_c : d.temperature_c)
                : "N/A";
-  if (field.rfind("pcie.link.gen.", 0) == 0)
-    return d.pcie_gen ? std::to_string(d.pcie_gen) : "[N/A]";
-  if (field.rfind("pcie.link.width.", 0) == 0)
-    return d.pcie_width ? std::to_string(d.pcie_width) : "[N/A]";
+  // current and gpucurrent are the link as trained now; max, gpumax and
+  // hostmax what it can train to.
+  if (field.rfind("pcie.link.gen.", 0) == 0) {
+    const uint32_t g = field.find("current") != std::string::npos ? d.pcie_gen : d.pcie_gen_max;
+    return g ? std::to_string(g) : "[N/A]";
+  }
+  if (field.rfind("pcie.link.width.", 0) == 0) {
+    const uint32_t w = field.find("current") != std::string::npos ? d.pcie_width : d.pcie_width_max;
+    return w ? std::to_string(w) : "[N/A]";
+  }
   if (field == "count") return std::to_string(s.device_count);
   if (field == "name" || field == "gpu_name") return d.name;
   if (field == "uuid" || field == "gpu_uuid") return d.uuid;
@@ -691,6 +697,19 @@ void print_verbose(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>
       std::printf("    PCI\n");
       std::printf("        %-47s: %s\n", "Bus Id", d.bus_id);
       std::printf("        %-47s: 0x%08X\n", "Device Id", d.pci_device_id);
+      if (d.pcie_gen_max) {
+        // Current is the link as trained now, Max what it can train to.
+        std::printf("        GPU Link Info\n");
+        std::printf("            PCIe Generation\n");
+        std::printf("                %-39s: %u\n", "Max", d.pcie_gen_max);
+        std::printf("                %-39s: %u\n", "Current", d.pcie_gen);
+        std::printf("                %-39s: %u\n", "Device Current", d.pcie_gen);
+        std::printf("                %-39s: %u\n", "Device Max", d.pcie_gen_max);
+        std::printf("                %-39s: %u\n", "Host Max", d.pcie_gen_max);
+        std::printf("            Link Width\n");
+        std::printf("                %-39s: %ux\n", "Max", d.pcie_width_max);
+        std::printf("                %-39s: %ux\n", "Current", d.pcie_width);
+      }
       std::printf("    %-51s: %u %%\n", "Fan Speed", d.fan_percent);
     }
     if (want(kSecPerformance)) std::printf("    %-51s: P%u\n", "Performance State", d.perf_state);
@@ -1756,6 +1775,31 @@ int cmd_smi(const std::vector<std::string>& args) {
       std::printf("No devices were found\n");
       return 6;
     }
+    // A GPU that has fallen off the bus (`vgpu fault lose`) has no handle to
+    // report through: the tool says so, reports the rest, and exits 15, its
+    // code for a GPU that has become inaccessible.
+    bool any_lost = false;
+    if (!agents && !lspci && !lspci_dump) {
+      std::vector<uint32_t> answering;
+      for (uint32_t i : sel) {
+        bool lost = false;
+        try {
+          lost = vgpu::ras::is_lost(snap.devices[i].uuid);
+        } catch (const std::exception&) {
+        }
+        if (!lost) {
+          answering.push_back(i);
+          continue;
+        }
+        std::fprintf(stderr,
+                     "Unable to determine the device handle for GPU%s: GPU is lost.  Reboot the "
+                     "system to recover this GPU\n",
+                     snap.devices[i].bus_id);
+        any_lost = true;
+      }
+      sel = answering;
+      if (sel.empty()) return 15;
+    }
     // A looping query prints its header once, so the output is one CSV that
     // can be appended to a file and read back as one.
     const bool with_header = header && first;
@@ -1800,7 +1844,7 @@ int cmd_smi(const std::vector<std::string>& args) {
       print_gpu_table(snap, sel);
       if (details) print_virtual_details(snap);
     }
-    return 0;
+    return any_lost ? 15 : 0;
   };
   if (loop_ms == 0) return render(true);
 

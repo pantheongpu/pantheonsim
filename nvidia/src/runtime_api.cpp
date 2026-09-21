@@ -262,8 +262,12 @@ bool poisons_context(const char* api, vgpu::Err e) {
     case Err::UninitializedRegister:
     case Err::Trap:
     case Err::DeviceAssert:
-    case Err::EccUncorrectable:
+    case Err::DeviceLost:
       return kernel;
+    // Uncorrectable memory is fatal to the context whichever operation read
+    // it, a kernel or a copy.
+    case Err::EccUncorrectable:
+      return true;
     default:
       return false;
   }
@@ -302,6 +306,9 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
     case Err::Trap: code = cudaErrorIllegalInstruction; break;
     case Err::DeviceAssert: code = cudaErrorAssert; break;
     case Err::EccUncorrectable: code = cudaErrorECCUncorrectable; break;
+    // "unspecified launch failure": what programs report when their GPU falls
+    // off the bus.
+    case Err::DeviceLost: code = cudaErrorLaunchFailure; break;
     // A data race is this simulator's own finding rather than a CUDA condition.
     // "unspecified launch failure" is the closest real code, and it is at least
     // true that the launch did not produce a result anyone should use.

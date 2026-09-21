@@ -292,8 +292,8 @@ void describe_device(const DeviceProfile& p, int ordinal, DeviceSample* d) {
   d->ecc_enabled = p.telemetry.ecc ? 1 : 0;
   d->memory_retirement = !p.telemetry.ecc ? 0 : p.telemetry.hbm ? 2 : 1;
   d->has_memory_temperature = p.telemetry.memory_temperature ? 1 : 0;
-  d->pcie_gen = p.telemetry.pcie_gen;
-  d->pcie_width = p.telemetry.pcie_width;
+  d->pcie_gen = d->pcie_gen_max = p.telemetry.pcie_gen;
+  d->pcie_width = d->pcie_width_max = p.telemetry.pcie_width;
 }
 
 Shared idle_snapshot(const DeviceProfile& p, int device_count) {
