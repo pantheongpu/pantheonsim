@@ -18,10 +18,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <string>
 #include <vector>
 
 #include "args.hpp"
+#include "machine.hpp"
+#include "vgpu/ras.hpp"
 #include "vgpu/driver_version.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/telemetry.hpp"
@@ -141,12 +144,15 @@ void print_gpu_table(const vgpu::telemetry::Shared& s, const std::vector<uint32_
     char power[32];
     std::snprintf(power, sizeof power, "%uW / %4uW", d.power_mw / 1000, d.power_limit_mw / 1000);
 
-    // The uncorrected-ECC count: 0 on a card that ships with ECC, since nothing
-    // has faulted in simulated memory, and N/A on one without it -- the same
-    // answers the query fields give. MIG, on the line below, is N/A because no
-    // profile carries MIG state.
+    // The volatile uncorrected-ECC count on a card that ships with ECC, and N/A
+    // on one without it -- the same answers the query fields give. MIG, on the
+    // line below, is N/A because no profile carries MIG state.
+    const std::string uncorrected =
+        d.ecc_enabled ? std::to_string(vgpu::ras::read(d.uuid).since_load.ecc_total(
+                            vgpu::ras::Severity::Uncorrected))
+                      : "N/A";
     std::printf("|%4u  %-30.30s%3s  |   %-16.16s %3s |%21s |\n", i, d.name, "On", d.bus_id, "Off",
-                d.ecc_enabled ? "0" : "N/A");
+                uncorrected.c_str());
     std::printf("|%3u%%%5uC%6s%24s |%8uMiB /%7uMiB |%7u%%%13s |\n", d.fan_percent, d.temperature_c,
                 perf_state_name(d.perf_state), power, mib(d.vram_used_bytes),
                 mib(d.vram_total_bytes), d.utilization_gpu, "Default");
@@ -378,6 +384,20 @@ std::string query_timestamp() {
 // so the shape matters as much as the numbers -- the separator is a comma
 // followed by a space, and a field with no value is "[N/A]", both of which real
 // nvidia-smi does and both of which parsers depend on.
+// A device's reliability counts, read once per report: every field of one
+// report sees the same counts, and a loop sees them change between reports.
+const vgpu::ras::State& ras_for(const vgpu::telemetry::DeviceSample& d, const std::string& when) {
+  static std::string cached_when;
+  static std::map<std::string, vgpu::ras::State> cache;
+  if (when != cached_when) {
+    cache.clear();
+    cached_when = when;
+  }
+  auto it = cache.find(d.uuid);
+  if (it == cache.end()) it = cache.emplace(d.uuid, vgpu::ras::read(d.uuid)).first;
+  return it->second;
+}
+
 std::string query_field(const vgpu::telemetry::DeviceSample& d, uint32_t index,
                         const vgpu::telemetry::Shared& s, const std::string& field, bool units,
                         const std::string& when) {
@@ -407,11 +427,12 @@ std::string query_field(const vgpu::telemetry::DeviceSample& d, uint32_t index,
   if (field == "persistence_mode") return "Enabled";
   if (field == "compute_mode") return "Default";
   if (field == "mig.mode.current") return "[N/A]";
-  // ECC. A card that ships with it reports it on, with every counter at zero:
-  // nothing has faulted in simulated memory. One without it answers [N/A], as
-  // a GeForce card does. The SRAM breakdown and its threshold flag answer on
-  // every card -- a real RTX 3060 reports 0 and "No" -- and they are what makes
-  // Pantheon's RAS check find a supported source on a card without ECC.
+  // ECC. A card that ships with it reports it on, with the counts injected into
+  // it (`vgpu fault`) -- zero until then, since nothing faults on its own. One
+  // without it answers [N/A], as a GeForce card does. The SRAM breakdown and
+  // its threshold flag answer on every card -- a real RTX 3060 reports 0 and
+  // "No" -- and they are what makes Pantheon's RAS check find a supported
+  // source on a card without ECC.
   if (field == "ecc.mode.current" || field == "ecc.mode.pending")
     return d.ecc_enabled ? "Enabled" : "[N/A]";
   if (field.rfind("ecc.errors.", 0) == 0) {
@@ -419,17 +440,41 @@ std::string query_field(const vgpu::telemetry::DeviceSample& d, uint32_t index,
       return field.size() > 17 && field.compare(field.size() - 17, 17, "thresholdExceeded") == 0
                  ? "No"
                  : "0";
-    return d.ecc_enabled ? "0" : "[N/A]";
+    if (!d.ecc_enabled) return "[N/A]";
+    // ecc.errors.<corrected|uncorrected>.<volatile|aggregate>.<location>
+    std::vector<std::string> part;
+    for (size_t at = 0; at <= field.size();) {
+      const size_t dot = field.find('.', at);
+      part.push_back(field.substr(at, (dot == std::string::npos ? field.size() : dot) - at));
+      at = dot == std::string::npos ? field.size() + 1 : dot + 1;
+    }
+    if (part.size() != 5) return "[N/A]";
+    const vgpu::ras::State& st = ras_for(d, when);
+    const vgpu::ras::Counters& c = part[3] == "aggregate" ? st.lifetime : st.since_load;
+    const auto sev = part[2] == "corrected" ? vgpu::ras::Severity::Corrected
+                                            : vgpu::ras::Severity::Uncorrected;
+    if (part[4] == "total") return std::to_string(c.ecc_total(sev));
+    vgpu::ras::Location loc;
+    if (!vgpu::ras::parse_location(part[4], &loc)) return "[N/A]";
+    return std::to_string(c.ecc[static_cast<uint32_t>(sev)][static_cast<uint32_t>(loc)]);
   }
   // GDDR cards with ECC retire pages; HBM cards remap rows. The bank-availability
   // histogram needs a per-card bank count that no profile records yet.
   if (field.rfind("retired_pages.", 0) == 0) {
     if (d.memory_retirement != 1) return "[N/A]";
-    return field == "retired_pages.pending" ? "No" : "0";
+    const vgpu::ras::Counters& life = ras_for(d, when).lifetime;
+    if (field == "retired_pages.pending") return life.retired_pending ? "Yes" : "No";
+    const bool single = field == "retired_pages.sbe" || field == "retired_pages.single_bit_ecc.count";
+    return std::to_string(single ? life.retired_sbe : life.retired_dbe);
   }
   if (field.rfind("remapped_rows.", 0) == 0) {
     if (d.memory_retirement != 2 || field.rfind("remapped_rows.histogram.", 0) == 0) return "[N/A]";
-    return field == "remapped_rows.pending" || field == "remapped_rows.failure" ? "No" : "0";
+    const vgpu::ras::Counters& life = ras_for(d, when).lifetime;
+    if (field == "remapped_rows.pending") return life.rows_pending ? "Yes" : "No";
+    if (field == "remapped_rows.failure") return life.rows_failure ? "Yes" : "No";
+    if (field == "remapped_rows.correctable") return std::to_string(life.rows_correctable);
+    if (field == "remapped_rows.uncorrectable") return std::to_string(life.rows_uncorrectable);
+    return "0";   // the *_inactive counts: rows remapped in a bank since swapped out
   }
   // A memory sensor only where real cards of the model report one. The real
   // driver prints this field's absence as N/A, without the brackets.
@@ -1028,27 +1073,7 @@ void print_explain() {
 
 namespace {
 
-// The machine a report describes: live telemetry when anything is publishing,
-// otherwise the configured rack, idle.
-bool read_machine(vgpu::telemetry::Shared* snap) {
-  if (vgpu::telemetry::read_snapshot(snap)) return true;
-  // Nothing is publishing, which on a real machine is the ordinary case:
-  // nvidia-smi answers about an idle GPU rather than failing. Monitoring
-  // tools poll before and after a workload and treat a non-zero exit as "no
-  // GPU", so describe the configured rack as idle instead.
-  const char* gpu = std::getenv("VGPU_GPU");
-  int count = 1;
-  if (const char* c = std::getenv("VGPU_DEVICE_COUNT"); c && c[0]) count = std::atoi(c);
-  try {
-    vgpu::DeviceProfile p = vgpu::load_gpu(gpu && *gpu ? gpu : "nvidia/h100");
-    vgpu::apply_vram_override(p);   // the card the session's programs see
-    *snap = vgpu::telemetry::idle_snapshot(p, count);
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "vgpu smi: no running VirtualGPU and no usable profile (%s)\n", e.what());
-    return false;
-  }
-  return true;
-}
+using vgpu::cli::read_machine;
 
 // `nvidia-smi --version`: the four lines the real tool prints, every one a
 // number. NVML's version is the CUDA major followed by the driver release
@@ -1421,19 +1446,29 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
     });
   if (show_ras)
     add("RAS Info", [&](const Sample& d, Values& v) {
-      // Per-block ECC state and error counts: zero on a card with ECC, since
-      // nothing has faulted in simulated memory. The key names follow the
-      // columns of rocm-smi's RAS table and are not yet checked against a
-      // real MI-series card.
+      // Per-block ECC state and the counts since the driver loaded, from the
+      // same state nvidia-smi reads: device memory is the UMC (memory
+      // controller) block, and the on-chip memories are GFX. The key names
+      // follow the columns of rocm-smi's RAS table and are not yet checked
+      // against a real MI-series card.
+      const vgpu::ras::Counters c = vgpu::ras::read(d.uuid).since_load;
+      auto count = [&](const std::string& blk, vgpu::ras::Severity s) -> uint64_t {
+        const auto si = static_cast<uint32_t>(s);
+        if (blk == "umc") return c.ecc[si][static_cast<uint32_t>(vgpu::ras::Location::DeviceMemory)];
+        if (blk == "gfx") return c.ecc_total(s) - c.ecc[si][static_cast<uint32_t>(vgpu::ras::Location::DeviceMemory)];
+        return 0;
+      };
       for (const char* block : kRasBlocks) {
         if (!ras_blocks.empty() &&
             std::find(ras_blocks.begin(), ras_blocks.end(), block) == ras_blocks.end())
           continue;
         std::string up = block;
-        for (char& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        for (char& ch : up) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
         v.emplace_back(up + " RAS status", d.ecc_enabled ? "ENABLED" : "DISABLED");
-        v.emplace_back(up + " correctable errors", d.ecc_enabled ? "0" : "N/A");
-        v.emplace_back(up + " uncorrectable errors", d.ecc_enabled ? "0" : "N/A");
+        v.emplace_back(up + " correctable errors",
+                       d.ecc_enabled ? std::to_string(count(block, vgpu::ras::Severity::Corrected)) : "N/A");
+        v.emplace_back(up + " uncorrectable errors",
+                       d.ecc_enabled ? std::to_string(count(block, vgpu::ras::Severity::Uncorrected)) : "N/A");
       }
     });
 
@@ -1497,6 +1532,7 @@ int cmd_smi(const std::vector<std::string>& args) {
   std::string query_fields, app_fields, id_spec, format, display;
   bool have_query_gpu = false, have_query_apps = false, have_format = false, have_display = false;
   bool header = true, units = true, list = false, xml = false, topo = false;
+  int reset_ecc = -1;   // -p: 0 volatile, 1 aggregate
   long long loop_ms = 0;
   auto fail = [](const std::string& msg) {
     std::fprintf(stderr, "vgpu smi: %s\n", msg.c_str());
@@ -1597,6 +1633,12 @@ int cmd_smi(const std::vector<std::string>& args) {
       explain = true;
     } else if (a == "--details") {
       details = true;
+    } else if (a == "-p" || a == "--reset-ecc-errors" || a.rfind("--reset-ecc-errors=", 0) == 0) {
+      std::string v;
+      if (a.rfind("--reset-ecc-errors=", 0) == 0) v = a.substr(a.find('=') + 1);
+      else if (i + 1 < args.size()) v = args[++i];
+      if (v != "0" && v != "1") return fail(a + " needs 0 (volatile) or 1 (aggregate)");
+      reset_ecc = v == "1" ? 1 : 0;
     } else if (a == "--agents") {
       agents = true;
     } else if (a == "--lspci") {
@@ -1619,6 +1661,31 @@ int cmd_smi(const std::vector<std::string>& args) {
   if (version) {
     print_version();
     return 0;
+  }
+  // -p resets the ECC counts of the selected GPUs, all of them by default.
+  if (reset_ecc >= 0) {
+    vgpu::telemetry::Shared snap{};
+    if (!read_machine(&snap)) return 1;
+    std::vector<uint32_t> sel;
+    if (!select_devices(snap, id_spec, &sel)) {
+      std::printf("No devices were found\n");
+      return 6;
+    }
+    int done = 0;
+    for (uint32_t i : sel) {
+      const auto& d = snap.devices[i];
+      if (!d.ecc_enabled) {
+        std::printf("Resetting ECC errors is not supported for GPU %s.\n", d.bus_id);
+        continue;
+      }
+      if (reset_ecc == 0) vgpu::ras::reset_volatile(d.uuid, /*driver_reload=*/false);
+      else vgpu::ras::reset_aggregate(d.uuid);
+      std::printf("Reset %s ECC errors to zero for GPU %s.\n", reset_ecc ? "aggregate" : "volatile",
+                  d.bus_id);
+      ++done;
+    }
+    std::printf("All done.\n");
+    return done ? 0 : 3;
   }
 
   // The query forms are checked the way nvidia-smi checks them, before anything

@@ -91,6 +91,33 @@ telemetry. On a CPU-only machine there is no stock `nvidia-smi` anyway — nor
 `rocm-smi` nor `rocm_agent_enumerator` — so supplying these commands is the
 fix, not a workaround.
 
+## Injecting faults
+
+A health tool is tested against the errors it exists to catch, and on real
+hardware an uncorrectable ECC error cannot be provoked on demand. Here it is one
+command, and every surface a tool reads reports it:
+
+```bash
+vgpu fault inject --gpu 0 --ecc uncorrected                 # one, in device memory
+vgpu fault inject --ecc corrected --location l2_cache --count 5
+vgpu fault inject --pcie replay --count 3
+vgpu fault show
+vgpu fault reset --volatile        # a driver reload
+nvidia-smi -i 0 -p 1               # zero the aggregate ECC counts
+```
+
+The counts live in files, not in any process, because a real card's counts do
+not reset when the program that caused them exits. Volatile counts sit with the
+machine's telemetry, so a new `vgpu shell` session starts at zero; aggregate
+counts sit in `VGPU_STATE_DIR` (default `~/.local/state/vgpu`), keyed by the
+device UUID. An uncorrectable error in device memory also retires a page on a
+GDDR card or remaps a row on an HBM card, pending until the next driver load. A
+card without ECC refuses ECC injection: it has nowhere to count one.
+
+nvidia-smi's ECC, retired-page and remapped-row fields, its table, NVML's ECC
+and PCIe counters, and rocm-smi's RAS blocks all read these counts. Nothing
+in the simulator produces them on its own yet: they come only from injection.
+
 ## lspci
 
 `vgpu smi --lspci` prints the listing directly. `vgpu smi --lspci-dump`
