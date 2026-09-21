@@ -21,7 +21,7 @@ namespace vgpu::ras {
 namespace {
 
 constexpr uint32_t kMagic = 0x56524153;  // "VRAS"
-constexpr uint32_t kVersion = 3;  // 2: armed faults; 3: hangs and clock-event reasons
+constexpr uint32_t kVersion = 4;  // 2: armed faults; 3: hangs and clock-event reasons; 4: events
 
 struct File {
   uint32_t magic;
@@ -140,6 +140,7 @@ void inject_ecc(const std::string& uuid, Severity s, Location l, uint64_t n, Ret
   Mapped a(aggregate_path(uuid), true);
   Counters* c = a.counters();
   add(&c->ecc[si][li], n);
+  record_event(uuid, s == Severity::Corrected ? kEventSingleBitEcc : kEventDoubleBitEcc, 0);
   // An uncorrectable error in device memory takes that memory out of service.
   // Corrected errors do not here: a real card retires a page only after
   // several at the same address, and injection does not model addresses yet.
@@ -443,6 +444,58 @@ uint64_t throttle_time_us(const std::string& uuid, uint64_t reason) {
     if (end > c.throttle_since_ns) us += (end - c.throttle_since_ns) / 1000;
   }
   return us;
+}
+
+// ---- NVML events --------------------------------------------------------------
+
+void record_event(const std::string& uuid, uint64_t type, uint64_t data) {
+  Mapped v(volatile_path(uuid), true);
+  Counters* c = v.counters();
+  const uint64_t seq = __atomic_add_fetch(&c->event_seq, 1, __ATOMIC_ACQ_REL);
+  uint64_t* e = c->events[(seq - 1) % kEvents];
+  set(&e[1], type);
+  set(&e[2], data);
+  set(&e[3], now_ns());
+  // Published last, so a reader that sees this sequence sees the event too.
+  __atomic_store_n(&e[0], seq, __ATOMIC_RELEASE);
+}
+
+uint64_t event_head(const std::string& uuid) {
+  Mapped v(volatile_path(uuid), false);
+  const Counters* c = v.counters();
+  return c ? __atomic_load_n(&c->event_seq, __ATOMIC_ACQUIRE) : 0;
+}
+
+bool next_event(const std::string& uuid, uint64_t mask, uint64_t* after, Event* out) {
+  Mapped v(volatile_path(uuid), false);
+  Counters* c = v.counters();
+  if (!c) return false;
+  const uint64_t head = __atomic_load_n(&c->event_seq, __ATOMIC_ACQUIRE);
+  if (head < *after) *after = 0;                                    // the ring was reset
+  if (head > kEvents && *after < head - kEvents) *after = head - kEvents;  // overwritten
+  while (*after < head) {
+    const uint64_t want = *after + 1;
+    uint64_t* e = c->events[(want - 1) % kEvents];
+    const uint64_t seq = __atomic_load_n(&e[0], __ATOMIC_ACQUIRE);
+    if (seq < want) return false;   // claimed but not yet published: next time
+    *after = want;
+    if (seq > want) continue;       // overwritten while we looked
+    const Event ev{seq, __atomic_load_n(&e[1], __ATOMIC_RELAXED),
+                   __atomic_load_n(&e[2], __ATOMIC_RELAXED), __atomic_load_n(&e[3], __ATOMIC_RELAXED)};
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&e[0], __ATOMIC_RELAXED) != want) continue;   // overwritten as we read it
+    if (ev.type & mask) {
+      *out = ev;
+      return true;
+    }
+  }
+  return false;
+}
+
+void report_xid(const std::string& uuid, const std::string& bus_id, int xid,
+                const std::string& process, const std::string& detail) {
+  log_kernel(xid_line(bus_id, xid, process, detail));
+  record_event(uuid, kEventXid, static_cast<uint64_t>(xid));
 }
 
 }  // namespace vgpu::ras

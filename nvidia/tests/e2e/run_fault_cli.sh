@@ -128,6 +128,49 @@ t4 fault throttle --reason gpu_idle >/dev/null; expect "GPU idle cannot be injec
 t4 fault throttle --reason hw_slowdown --clear >/dev/null; expect "throttle takes --reason or --clear" "2" "$?"
 t4 fault inject --ecc corrected --seconds 3 >/dev/null; expect "--seconds does not belong to inject" "2" "$?"
 
+# NVML events, as a health daemon waits for them: registered before the error,
+# raised by `vgpu fault` in another process. A card without ECC offers Xid only.
+if [[ -e "$build/shim/libnvidia-ml.so.1" ]] && command -v python3 >/dev/null &&
+   [[ -z "$(shim_sanitizer "$build/shim")" ]]; then
+  cat > "$tmp/events.py" <<'PY'
+import ctypes, subprocess, sys
+class EventData(ctypes.Structure):
+    _fields_ = [("device", ctypes.c_void_p), ("eventType", ctypes.c_ulonglong),
+                ("eventData", ctypes.c_ulonglong), ("gpuInstanceId", ctypes.c_uint),
+                ("computeInstanceId", ctypes.c_uint)]
+lib = ctypes.CDLL(sys.argv[1])
+lib.nvmlInit_v2()
+h = ctypes.c_void_p()
+lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(h))
+types = ctypes.c_ulonglong()
+lib.nvmlDeviceGetSupportedEventTypes(h, ctypes.byref(types))
+out = [hex(types.value)]
+s = ctypes.c_void_p()
+lib.nvmlEventSetCreate(ctypes.byref(s))
+if len(sys.argv) > 2:   # a card without ECC
+    out.append(str(lib.nvmlDeviceRegisterEvents(h, ctypes.c_ulonglong(0x1), s)))
+    out.append(str(lib.nvmlDeviceRegisterEvents(h, ctypes.c_ulonglong(0x8), s)))
+else:
+    out.append(str(lib.nvmlDeviceRegisterEvents(h, ctypes.c_ulonglong(0x2 | 0x8), s)))
+    subprocess.run(["sh", "-c", "$VGPU_BIN fault inject --gpu 0 --ecc uncorrected >/dev/null"], check=True)
+    d = EventData()
+    for _ in range(3):
+        rc = lib.nvmlEventSetWait_v2(s, ctypes.byref(d), 2000)
+        out.append("%d:%#x:%d:%s" % (rc, d.eventType, d.eventData, d.device == h.value))
+    out.append("%#x" % d.gpuInstanceId)
+    out.append(str(lib.nvmlEventSetWait_v2(s, ctypes.byref(d), 50)))
+lib.nvmlEventSetFree(s)
+lib.nvmlShutdown()
+print(" ".join(out))
+PY
+  export VGPU_BIN="$vgpu"
+  expect "NVML delivers the DBE and its Xids, then times out" \
+    "0xb 0 0:0x2:0:True 0:0x8:48:True 0:0x8:63:True 0xffffffff 10" \
+    "$(VGPU_GPU=nvidia/t4 VGPU_DEVICE_COUNT=2 python3 "$tmp/events.py" "$build/shim/libnvidia-ml.so.1" 2>&1)"
+  expect "without ECC only Xid events can be registered" "0x8 3 0" \
+    "$(VGPU_GPU=nvidia/rtx3060 VGPU_TELEMETRY_PATH="$tmp/run-3060" python3 "$tmp/events.py" "$build/shim/libnvidia-ml.so.1" no-ecc 2>&1)"
+fi
+
 t4 fault inject --ecc sideways >/dev/null; expect "an unknown ECC kind is refused" "2" "$?"
 t4 fault inject --gpu 9 --ecc corrected >/dev/null; expect "a GPU that is not there is refused" "2" "$?"
 t4 fault inject --pcie replay --location l2_cache >/dev/null; expect "--location with --pcie is refused" "2" "$?"

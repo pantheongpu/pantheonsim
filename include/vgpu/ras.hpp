@@ -65,6 +65,10 @@ struct Counters {
   // was active in windows already closed, in microseconds.
   uint64_t throttle_mask, throttle_since_ns, throttle_until_ns;
   uint64_t throttle_us[8];
+  // NVML events, the newest kEvents of them: the sequence of the last one
+  // written, and a ring of {seq, type, data, time_ns}.
+  uint64_t event_seq;
+  uint64_t events[32][4];
 
   uint64_t ecc_total(Severity s) const;
 };
@@ -179,5 +183,28 @@ uint64_t apply_throttle(telemetry::DeviceSample& d);
 
 // How long a reason has been active, over every window, in microseconds.
 uint64_t throttle_time_us(const std::string& uuid, uint64_t reason);
+
+// ---- NVML events --------------------------------------------------------------
+//
+// What an NVML event set waits for, recorded where every process on the machine
+// can see it: `vgpu fault` and faults delivered to running kernels record them,
+// and a health daemon in another process receives them.
+inline constexpr uint64_t kEventSingleBitEcc = 0x1, kEventDoubleBitEcc = 0x2, kEventXid = 0x8;
+inline constexpr uint32_t kEvents = 32;
+struct Event {
+  uint64_t seq, type, data, time_ns;
+};
+// Records one event: data is the Xid for kEventXid, and 0 otherwise.
+void record_event(const std::string& uuid, uint64_t type, uint64_t data);
+// The sequence of the newest event, 0 when there is none. A new watch starts
+// here, so it sees only what happens after it began.
+uint64_t event_head(const std::string& uuid);
+// The first event after *after whose type is in `mask`, if there is one yet.
+// Moves *after past every event it looked at, past any the ring has already
+// overwritten, and back to the start if the ring was reset.
+bool next_event(const std::string& uuid, uint64_t mask, uint64_t* after, Event* out);
+// An Xid as the driver reports it: the line in dmesg and the NVML event.
+void report_xid(const std::string& uuid, const std::string& bus_id, int xid,
+                const std::string& process, const std::string& detail);
 
 }  // namespace vgpu::ras

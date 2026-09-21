@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -291,6 +292,76 @@ VTEST(a_throttle_window_ends_by_itself) {
   VCHECK_EQ(ras::apply_throttle(d), 0u);
   const uint64_t us = ras::throttle_time_us(kGpu, ras::kHwSlowdown);
   VCHECK(us >= 990000 && us <= 1010000);   // the window, not the time since
+}
+
+VTEST(events_are_read_in_order_from_where_the_reader_started) {
+  TempMachine m("events");
+  ras::record_event(kGpu, ras::kEventXid, 13);   // before the reader: not seen
+  uint64_t after = ras::event_head(kGpu);
+  VCHECK_EQ(after, 1u);
+  ras::inject_ecc(kGpu, Severity::Corrected, Location::DeviceMemory, 4, Retirement::Pages);
+  ras::record_event(kGpu, ras::kEventXid, 48);
+  ras::Event e{};
+  VCHECK(ras::next_event(kGpu, ~0ull, &after, &e));
+  VCHECK_EQ(e.type, ras::kEventSingleBitEcc);
+  VCHECK(e.time_ns > 0);
+  VCHECK(ras::next_event(kGpu, ~0ull, &after, &e));
+  VCHECK_EQ(e.type, ras::kEventXid);
+  VCHECK_EQ(e.data, 48u);
+  VCHECK(!ras::next_event(kGpu, ~0ull, &after, &e));
+}
+
+VTEST(a_reader_sees_only_the_types_it_asked_for) {
+  TempMachine m("mask");
+  uint64_t after = ras::event_head(kGpu);
+  ras::record_event(kGpu, ras::kEventSingleBitEcc, 0);
+  ras::record_event(kGpu, ras::kEventXid, 63);
+  ras::Event e{};
+  VCHECK(ras::next_event(kGpu, ras::kEventXid | ras::kEventDoubleBitEcc, &after, &e));
+  VCHECK_EQ(e.data, 63u);
+  VCHECK_EQ(after, 2u);   // the skipped event is behind it too
+}
+
+VTEST(a_reader_that_fell_behind_resumes_at_the_oldest_event_kept) {
+  TempMachine m("wrap");
+  uint64_t after = ras::event_head(kGpu);
+  for (uint64_t i = 1; i <= ras::kEvents + 5; ++i) ras::record_event(kGpu, ras::kEventXid, i);
+  ras::Event e{};
+  VCHECK(ras::next_event(kGpu, ~0ull, &after, &e));
+  VCHECK_EQ(e.data, 6u);
+  uint64_t n = 1;
+  while (ras::next_event(kGpu, ~0ull, &after, &e)) ++n;
+  VCHECK_EQ(n, uint64_t{ras::kEvents});
+  VCHECK_EQ(e.data, uint64_t{ras::kEvents} + 5);
+}
+
+VTEST(a_driver_reload_starts_the_events_again) {
+  TempMachine m("evreset");
+  ras::record_event(kGpu, ras::kEventXid, 1);
+  ras::record_event(kGpu, ras::kEventXid, 2);
+  uint64_t after = ras::event_head(kGpu);
+  ras::reset_volatile(kGpu);
+  VCHECK_EQ(ras::event_head(kGpu), 0u);
+  ras::record_event(kGpu, ras::kEventXid, 79);
+  ras::Event e{};
+  VCHECK(ras::next_event(kGpu, ~0ull, &after, &e));
+  VCHECK_EQ(e.data, 79u);
+}
+
+VTEST(an_xid_is_logged_and_raised_as_an_event) {
+  TempMachine m("xid");
+  const std::string sess = m.root + "/session";
+  std::filesystem::create_directories(sess);
+  setenv("VGPU_SESSION", sess.c_str(), 1);
+  uint64_t after = ras::event_head(kGpu);
+  ras::report_xid(kGpu, "00000000:01:00.0", 48, "", "An uncorrectable error.");
+  unsetenv("VGPU_SESSION");
+  ras::Event e{};
+  VCHECK(ras::next_event(kGpu, ras::kEventXid, &after, &e));
+  VCHECK_EQ(e.data, 48u);
+  std::ifstream in(sess + "/dmesg.log");
+  std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  VCHECK(text.find("NVRM: Xid (PCI:0000:01:00): 48, ") != std::string::npos);
 }
 
 VTEST_MAIN

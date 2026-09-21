@@ -24,6 +24,8 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
+#include <thread>
 
 #include "vgpu/profile.hpp"
 #include "vgpu/ras.hpp"
@@ -891,6 +893,135 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFieldValues(nvmlDevice_t device, int count
   }
   return NVML_SUCCESS;
 }
+/* ---- events ---- */
+// An event set watches devices for the event types each was registered for.
+// Events come from the machine's reliability state (vgpu/ras.hpp), where
+// `vgpu fault` and faults delivered to running kernels record them, so a health
+// daemon waiting here sees what happens in any process on the machine.
+struct nvmlEventSet_st {
+  struct Watch {
+    unsigned int index;
+    std::string uuid;
+    unsigned long long types;
+    uint64_t after;   // the last event this watch has looked at
+  };
+  std::mutex mu;
+  std::vector<Watch> watches;
+};
+
+namespace {
+// Xid on every card; ECC events only where there is ECC to report them.
+unsigned long long supported_events(const vgpu::telemetry::DeviceSample& d) {
+  return vgpu::ras::kEventXid |
+         (d.ecc_enabled ? vgpu::ras::kEventSingleBitEcc | vgpu::ras::kEventDoubleBitEcc : 0);
+}
+
+// Polls the watches until one has an event or the time runs out. The set's
+// lock is released while sleeping, so another thread may register meanwhile.
+nvmlReturn_t wait_event(nvmlEventSet_t set, unsigned int timeout_ms, nvmlDevice_t* device,
+                        unsigned long long* type, unsigned long long* data) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> lock(set->mu);
+      for (auto& w : set->watches) {
+        vgpu::ras::Event e{};
+        bool got = false;
+        try {
+          got = vgpu::ras::next_event(w.uuid, w.types, &w.after, &e);
+        } catch (const std::exception&) {
+        }
+        if (got) {
+          *device = handle_for(w.index);
+          *type = e.type;
+          *data = e.data;
+          return NVML_SUCCESS;
+        }
+      }
+    }
+    if (std::chrono::steady_clock::now() >= deadline) return NVML_ERROR_TIMEOUT;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+}
+}  // namespace
+
+VGPU_EXPORT nvmlReturn_t nvmlEventSetCreate(nvmlEventSet_t* set) {
+  REQUIRE_INIT();
+  if (!set) return NVML_ERROR_INVALID_ARGUMENT;
+  *set = new nvmlEventSet_st();
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlEventSetFree(nvmlEventSet_t set) {
+  REQUIRE_INIT();
+  if (!set) return NVML_ERROR_INVALID_ARGUMENT;
+  delete set;
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetSupportedEventTypes(nvmlDevice_t device,
+                                                          unsigned long long* types) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !types) return NVML_ERROR_INVALID_ARGUMENT;
+  *types = supported_events(*d);
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceRegisterEvents(nvmlDevice_t device, unsigned long long types,
+                                                  nvmlEventSet_t set) {
+  REQUIRE_INIT();
+  std::string uuid;
+  unsigned int index = 0;
+  unsigned long long supported = 0;
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_mu);
+    refresh();
+    const auto* d = sample(device);
+    if (!d || !set || !index_of(device, &index)) return NVML_ERROR_INVALID_ARGUMENT;
+    supported = supported_events(*d);
+    uuid = d->uuid;
+  }
+  if (types & ~supported) return NVML_ERROR_NOT_SUPPORTED;
+  uint64_t head = 0;
+  try {
+    head = vgpu::ras::event_head(uuid);   // only what happens from now on
+  } catch (const std::exception&) {
+  }
+  std::lock_guard<std::mutex> lock(set->mu);
+  set->watches.push_back({index, uuid, types, head});
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlEventSetWait_v2(nvmlEventSet_t set, nvmlEventData_t* data,
+                                             unsigned int timeout_ms) {
+  REQUIRE_INIT();
+  if (!set || !data) return NVML_ERROR_INVALID_ARGUMENT;
+  nvmlDevice_t device = nullptr;
+  unsigned long long type = 0, value = 0;
+  if (const nvmlReturn_t rc = wait_event(set, timeout_ms, &device, &type, &value); rc != NVML_SUCCESS)
+    return rc;
+  data->device = device;
+  data->eventType = type;
+  data->eventData = value;
+  data->gpuInstanceId = 0xFFFFFFFFu;       // not attributable to a MIG instance
+  data->computeInstanceId = 0xFFFFFFFFu;
+  return NVML_SUCCESS;
+}
+// The first version, from before MIG: its event data ends after eventData, so
+// writing the instance ids would run past the caller's structure.
+VGPU_EXPORT nvmlReturn_t nvmlEventSetWait(nvmlEventSet_t set, nvmlEventData_t* data,
+                                          unsigned int timeout_ms) {
+  REQUIRE_INIT();
+  if (!set || !data) return NVML_ERROR_INVALID_ARGUMENT;
+  nvmlDevice_t device = nullptr;
+  unsigned long long type = 0, value = 0;
+  if (const nvmlReturn_t rc = wait_event(set, timeout_ms, &device, &type, &value); rc != NVML_SUCCESS)
+    return rc;
+  data->device = device;
+  data->eventType = type;
+  data->eventData = value;
+  return NVML_SUCCESS;
+}
+
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses_v2(nvmlDevice_t, unsigned int* n,
                                                                   nvmlProcessInfo_v2_t*) {
   REQUIRE_INIT();
