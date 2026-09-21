@@ -372,6 +372,7 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   // nvidia/tools/nvidia-smi cannot drift apart again.
   tool("nvidia-smi", "# VirtualGPU session tool.\nexec \"" + vgpu + "\" smi \"$@\"\n");
   tool("rocm-smi", "exec \"" + vgpu + "\" smi --rocm \"$@\"\n");
+  tool("amd-smi", "exec \"" + vgpu + "\" smi --amd \"$@\"\n");
   tool("rocm_agent_enumerator", "exec \"" + vgpu + "\" smi --agents\n");
   tool("dmesg",
        "# Replays this session's synthetic kernel ring buffer.\n"

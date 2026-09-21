@@ -454,8 +454,13 @@ narrows what counts as observable, not what the detector looks at.
   and AER lines. `vgpu fault arm --hang` stalls a launch, and `vgpu fault
   throttle` makes clock-event reasons active with readings to match. ECC
   errors and Xids are NVML events (nvmlEventSetWait). `vgpu fault arm --on
-  store|shared` puts faults on kernel stores and shared-memory loads. Not yet:
-  stuck cells at an address, faults on atomics and copies, PCIe AER in sysfs,
+  store|shared` puts faults on kernel stores and shared-memory loads. A
+  kernel's own faults log Xid 31 (MMU fault) and Xid 13 (SM exception), and
+  `vgpu fault stuck` fixes a bit at an address for every read. Atomics take
+  what loads and stores take; `--on alu` puts silent flips in floating-point
+  and matrix results. AMD: amd-smi (list, metric -e/-k, ras --cper)
+  and amdgpu's dmesg lines. Not yet: faults on copies (a copy engine's own
+  errors), PCIe AER and amdgpu RAS counts in sysfs, CPER record files,
   clock-change and power events.
 
 ## Not implemented (fails loudly, never silently)

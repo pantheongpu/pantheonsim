@@ -1383,6 +1383,19 @@ class Interpreter {
                    std::to_string(cur_->local_frame_size) + "-byte .local frame");
   }
 
+  // A bit flip armed on arithmetic results (`vgpu fault arm --bitflip --on
+  // alu`) corrupts one lane's result -- the lowest active one -- of the next
+  // floating-point, math or matrix instruction: the values a result check
+  // verifies. Integer results are left alone; they are mostly addresses and
+  // loop counters, where a flip is a crash or a hang rather than silent
+  // corruption. While nothing is armed this is one relaxed load per
+  // instruction, not per lane.
+  void alu_fault(Lanes& r, Mask m, uint32_t bits) {
+    if (!m || !mem_.alu_fault_armed()) return;
+    const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(static_cast<unsigned long long>(m)));
+    r[lane] = mem_.alu_result(r[lane], bits);
+  }
+
   uint64_t load_routed(Warp& w, const BlockCtx& ctx, const Instr& ins, uint32_t lane, uint64_t addr,
                        uint32_t size) {
     if (is_shared(addr)) {
@@ -1677,6 +1690,7 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) r[lane] = float_bin(op->op, op->ty, a[lane], b[lane], op->nan_propagate);
       if (op->round != FRound::Nearest) std::fesetround(prev_round);
+      alu_fault(r, m, op->ty.bits);
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -1712,6 +1726,7 @@ class Interpreter {
         for_active(m, W_, [&](uint32_t l) { r[l] = f32bits(std::fma(f32(a[l]), f32(b[l]), f32(c[l]))); });
       else
         for_active(m, W_, [&](uint32_t l) { r[l] = f64bits(std::fma(f64(a[l]), f64(b[l]), f64(c[l]))); });
+      alu_fault(r, m, op->ty.bits);
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -2572,6 +2587,7 @@ class Interpreter {
           r[lane] = op->ty.bits == 32 ? f32bits(static_cast<float>(y)) : f64bits(y);
         }
       // A half result still occupies a 32-bit register, packed or not.
+      alu_fault(r, m, op->ty.bits == 16 ? 16u : op->ty.bits);
       write_reg(w, op->dst, m, r, op->ty.bits == 16 ? 32u : op->ty.bits);
       return;
     }
@@ -3498,6 +3514,7 @@ class Interpreter {
             r[lane] = f32bits(static_cast<float>(D[cd_index(lane, reg)]));
           }
         }
+      alu_fault(r, m, 32);
       write_reg(w, op.d[reg], m, r, 32);
     }
   }
@@ -3583,6 +3600,7 @@ class Interpreter {
         uint32_t linear = lane * 8 + static_cast<uint32_t>(reg);
         r[lane] = f32bits(D[linear / kMmaDim][linear % kMmaDim]);
       }
+      alu_fault(r, m, 32);
       write_reg(w, op.d[reg], m, r, 32);
     }
   }

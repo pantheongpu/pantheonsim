@@ -143,9 +143,11 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
     case Err::InvalidPointer:
     case Err::UseAfterFree:
     case Err::OutOfBounds:
-    case Err::MisalignedAccess:
       // Inside a kernel these are the moral equivalent of a device-side fault.
       return kernel_context ? CUDA_ERROR_ILLEGAL_ADDRESS : CUDA_ERROR_INVALID_VALUE;
+    // A kernel's misaligned access has a code of its own on hardware.
+    case Err::MisalignedAccess:
+      return kernel_context ? CUDA_ERROR_MISALIGNED_ADDRESS : CUDA_ERROR_INVALID_VALUE;
     case Err::UninitializedRegister: return CUDA_ERROR_ILLEGAL_ADDRESS;
     // Both of these reached the switch's fallthrough before, and so were
     // reported as CUDA_ERROR_UNKNOWN -- the least informative code available,

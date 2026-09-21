@@ -201,10 +201,68 @@ VTEST(an_ecc_error_cannot_be_armed_on_stores) {
     refused = true;
   }
   VCHECK(refused);
+  refused = false;
+  try {
+    ras::arm(kGpu, ras::Armed::Corrected, 1, ras::Target::Alu);
+  } catch (const std::invalid_argument&) {
+    refused = true;
+  }
+  VCHECK(refused);
   ras::Target t{};
+  VCHECK(ras::parse_target("alu", &t) && t == ras::Target::Alu);
   VCHECK(ras::parse_target("shared", &t) && t == ras::Target::Shared);
   VCHECK(!ras::parse_target("texture", &t));
   VCHECK_EQ(std::string(ras::target_name(ras::Target::Store)), std::string("store"));
+}
+
+VTEST(a_stuck_bit_reads_as_its_value_whatever_was_written) {
+  TempMachine m("stuck");
+  ras::ArmedFaults faults(kGpu);
+  VCHECK_EQ(*faults.stuck_pending(), 0u);
+  ras::stick(kGpu, 0x1001, 3, 1);
+  ras::stick(kGpu, 0x1002, 0, 0);
+  VCHECK_EQ(*faults.stuck_pending(), 2u);
+  uint8_t bytes[4] = {0x00, 0x00, 0xFF, 0xAA};   // read from offset 0x1000
+  faults.apply_stuck(0x1000, bytes, sizeof bytes);
+  VCHECK_EQ(bytes[0], 0x00);
+  VCHECK_EQ(bytes[1], 0x08);
+  VCHECK_EQ(bytes[2], 0xFE);
+  VCHECK_EQ(bytes[3], 0xAA);
+  uint8_t outside[2] = {0, 0};
+  faults.apply_stuck(0x1003, outside, sizeof outside);   // a read that misses both
+  VCHECK_EQ(outside[0] | outside[1], 0);
+  ras::stick(kGpu, 0x1001, 3, 0);   // the same bit again: now stuck at 0
+  VCHECK_EQ(ras::stuck_cells(kGpu).size(), 2u);
+  uint8_t again = 0xFF;
+  faults.apply_stuck(0x1001, &again, 1);
+  VCHECK_EQ(again, 0xF7);
+}
+
+VTEST(stuck_cells_outlast_a_driver_reload_until_cleared) {
+  TempMachine m("unstick");
+  ras::stick(kGpu, 64, 7, 1);
+  ras::arm(kGpu, ras::Armed::Bitflip, 1);
+  ras::reset_volatile(kGpu);
+  VCHECK_EQ(ras::read(kGpu).since_load.armed_total(), 0u);
+  VCHECK_EQ(ras::stuck_cells(kGpu).size(), 1u);
+  VCHECK_EQ(ras::stuck_cells(kGpu)[0].offset, 64u);
+  ras::unstick_all(kGpu);
+  VCHECK(ras::stuck_cells(kGpu).empty());
+  VCHECK_EQ(ras::read(kGpu).since_load.stuck_count, 0u);
+}
+
+VTEST(a_gpu_holds_sixteen_stuck_cells) {
+  TempMachine m("stuckfull");
+  for (uint32_t i = 0; i < ras::kStuckCells; ++i) ras::stick(kGpu, i, 0, 1);
+  bool full = false;
+  try {
+    ras::stick(kGpu, 1000, 0, 1);
+  } catch (const std::length_error&) {
+    full = true;
+  }
+  VCHECK(full);
+  ras::stick(kGpu, 3, 0, 0);   // changing one already stuck still works
+  VCHECK_EQ(ras::stuck_cells(kGpu).size(), size_t{ras::kStuckCells});
 }
 
 VTEST(concurrent_loads_take_exactly_what_was_armed) {

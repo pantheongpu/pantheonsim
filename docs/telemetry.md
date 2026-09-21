@@ -1,8 +1,8 @@
 # Device discovery and telemetry
 
 VirtualGPU presents its virtual devices to the tools people actually use to
-look at GPUs: `nvidia-smi`, `rocm-smi`, `rocm_agent_enumerator`, `lspci`, and
-anything speaking NVML.
+look at GPUs: `nvidia-smi`, `rocm-smi`, `amd-smi`, `rocm_agent_enumerator`,
+`lspci`, and anything speaking NVML.
 
 ```bash
 ./scripts/build.sh
@@ -115,8 +115,11 @@ GDDR card or remaps a row on an HBM card, pending until the next driver load. A
 card without ECC refuses ECC injection: it has nowhere to count one.
 
 nvidia-smi's ECC, retired-page and remapped-row fields, its table, NVML's ECC
-and PCIe counters, and rocm-smi's RAS blocks all read these counts. Nothing in
-the simulator produces them on its own: they come only from injection.
+and PCIe counters, rocm-smi's RAS blocks and amd-smi's ECC metrics all read
+these counts. Nothing in the simulator produces them on its own: they come only
+from injection. On an AMD card the session's dmesg carries amdgpu's lines
+instead of Xids: `amdgpu 0000:01:00.0: amdgpu: 2 uncorrectable hardware errors
+detected in umc block`.
 
 `vgpu fault arm` goes one step further and puts faults in a running program's
 path. The next device-memory loads of its kernels take them:
@@ -145,9 +148,43 @@ vgpu fault arm --bitflip --on store --count 2
 vgpu fault arm --ecc uncorrected --on shared
 ```
 
+`--on alu` flips a bit of a floating-point, math or matrix (tensor core)
+result: silent data corruption, which nothing counts because no ECC covers an
+ALU, and which only a check of the results can find. Integer results are left
+alone, since they are mostly addresses and loop counters, where a flip is a
+crash or a hang rather than silent corruption. The bit is in the upper half of
+the result, so the error is not a last-place difference inside a tolerance.
+Whether a single flip is caught depends on the check, as on hardware: a later
+pass that recomputes the value, or a clamp that resets it, masks it, and a
+check of only the last pass misses a flip in an earlier one.
+
+```bash
+vgpu fault arm --bitflip --on alu --count 5
+```
+
+An armed fault strikes whichever access comes next. A stuck cell stays at one
+address: a bit that reads as 0 or 1 whatever is written to it, as a failed cell
+does, on every read -- a kernel's loads and atomics, and copies back to the
+host. It is what an address-aware memory test looks for; Pantheon's galpat,
+unmodified, reports the cell's element and the bit that differs.
+
+```bash
+vgpu fault stuck --offset 0x100 --bit 2 --value 1   # up to 16 cells per GPU
+vgpu fault stuck --clear
+```
+
+The offset counts bytes from the start of the device's memory, where its first
+allocation starts; allocations follow in order and are never moved or reused.
+A driver reload (`vgpu fault reset --volatile`) does not mend a stuck cell.
+
 Inside `vgpu shell`, these errors also reach `dmesg` the way the driver and the
 kernel log them: an uncorrectable ECC error as Xid 48, the page or row it takes
-out of service as Xid 63, and PCIe errors as AER lines.
+out of service as Xid 63, and PCIe errors as AER lines. A kernel's own faults
+are logged too, as the driver logs them: a read or write of an address no
+allocation covers as Xid 31, an MMU fault naming the page and the access, and a
+misaligned access, or a shared- or local-memory access out of range, as Xid 13,
+an exception the SM raises. Faults only this simulator finds (a data race, an
+uninitialized register) have no Xid.
 
 Two more faults a health tool has to handle:
 
@@ -209,6 +246,15 @@ AMD profiles (`amd/mi300x`, `amd/mi325x`, `amd/mi350x`) are **discovery only**.
 the newer sections and the AMD profiles' ECC, memory sensor and link values
 follow AMD's documentation and have not yet been checked against a real
 MI-series card.
+
+`amd-smi` answers the commands health tools run: `list`, `metric -e` (ECC
+totals) and `-k` (ECC counts per RAS block, device memory as UMC and the
+on-chip memories as GFX), and `ras --cper`, which lists recent ECC errors as
+CPER records in amd-smi's text table -- a table even under `--json`, as the
+real tool prints it. Other metrics, `--csv` and CPER record files (`--folder`)
+are refused as not modelled. JSON output is amd-smi's: a list with one object
+per GPU, keyed by `gpu`, indented by four.
+
 Outside a session both tools describe `VGPU_GPU`; with no AMD GPU configured,
 `rocm_agent_enumerator` lists only `gfx000` and says on stderr how to pick one. Launching a kernel on one fails with a clear
 "warp size 64 is unsupported" error — AMD *execution* is not implemented, and

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Drop-in amd-smi for VirtualGPU. ROCm is not installed on a CPU-only machine,
+# so this provides the command: `vgpu smi --amd` answers list, metric --ecc and
+# --ecc-blocks, and ras --cper from the same machine state rocm-smi reads.
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+vgpu="$here/vgpu"; [[ -x "$vgpu" ]] || vgpu="$here/../vgpu"
+exec "$vgpu" smi --amd "$@"

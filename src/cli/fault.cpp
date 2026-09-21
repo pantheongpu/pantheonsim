@@ -5,8 +5,11 @@
 // On real hardware an uncorrectable ECC error cannot be provoked on demand;
 // here it is one command, and every surface a tool reads -- nvidia-smi, NVML,
 // rocm-smi -- reports it, because they all read the same state (vgpu/ras.hpp).
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -22,8 +25,9 @@ int usage(FILE* to) {
                "usage: vgpu fault inject [--gpu N] --ecc corrected|uncorrected [--location LOC] [--count N]\n"
                "       vgpu fault inject [--gpu N] --pcie COUNTER [--count N]\n"
                "       vgpu fault arm [--gpu N] --ecc corrected|uncorrected|--bitflip [--count N]\n"
-               "                      [--on load|store|shared]\n"
+               "                      [--on load|store|shared|alu]\n"
                "       vgpu fault arm [--gpu N] --hang [--seconds S]\n"
+               "       vgpu fault stuck [--gpu N] --offset BYTES --bit B --value 0|1 | --clear\n"
                "       vgpu fault throttle [--gpu N] --reason R[,R...] [--seconds S] | --clear\n"
                "       vgpu fault show [--gpu N]\n"
                "       vgpu fault reset [--gpu N] --volatile|--aggregate\n"
@@ -56,10 +60,21 @@ int usage(FILE* to) {
                "                    ECC is checked when memory is read\n"
                "  shared            shared-memory loads, whose ECC errors count as the L1\n"
                "                    cache's and retire no page or row\n"
+               "  alu               arithmetic results: floating-point, math and matrix\n"
+               "                    (tensor core) instructions. Bit flips only, in the upper\n"
+               "                    half of the result's bits; no ECC covers an ALU, so nothing\n"
+               "                    counts or reports them\n"
                "\n"
                "arm --hang stalls the next kernel launch, the device shown fully busy, for S\n"
                "seconds and then fails it with cudaErrorLaunchTimeout -- or, without --seconds,\n"
                "until the process is stopped, which is what a watchdog exists to catch.\n"
+               "\n"
+               "stuck makes one bit of device memory read as 0 or 1 whatever is written to it,\n"
+               "as a failed cell does, until --clear: for every read, a kernel's loads and\n"
+               "atomics and copies back to the host alike. BYTES (decimal or 0x hex) counts\n"
+               "from the start of the device's memory, where its first allocation starts;\n"
+               "allocations follow in order and are never moved. B is the bit, 0-7, within\n"
+               "that byte. Up to 16 cells per GPU; a driver reload does not mend them.\n"
                "\n"
                "throttle makes clock-event reasons active, for S seconds or until --clear:\n"
                "sw_power_cap, hw_slowdown, sw_thermal_slowdown, hw_thermal_slowdown and\n"
@@ -130,13 +145,16 @@ void show(uint32_t index, const vgpu::telemetry::DeviceSample& d) {
     std::printf("  armed hang             next launch, %s\n",
                 now.hang_seconds ? (std::to_string(now.hang_seconds) + " s").c_str()
                                  : "until the process is stopped");
+  static constexpr const char* kOn[vgpu::ras::kTargets] = {"loads", "stores", "shared", "results"};
   for (uint32_t t = 0; t < vgpu::ras::kTargets; ++t)
     if (now.armed_pending[t])
-      std::printf("  armed on %-13s corrected %llu, uncorrected %llu, bit flips %llu\n",
-                  (std::string(vgpu::ras::target_name(static_cast<vgpu::ras::Target>(t))) + "s").c_str(),
+      std::printf("  armed on %-13s corrected %llu, uncorrected %llu, bit flips %llu\n", kOn[t],
                   static_cast<unsigned long long>(now.armed[t][0]),
                   static_cast<unsigned long long>(now.armed[t][1]),
                   static_cast<unsigned long long>(now.armed[t][2]));
+  for (const auto& cell : vgpu::ras::stuck_cells(d.uuid))
+    std::printf("  stuck cell             bit %u of byte 0x%llx reads as %u\n", cell.bit,
+                static_cast<unsigned long long>(cell.offset), cell.value);
   if (now.bitflips_delivered)
     std::printf("  bit flips delivered    %llu\n", static_cast<unsigned long long>(now.bitflips_delivered));
 }
@@ -147,19 +165,22 @@ int cmd_fault(const std::vector<std::string>& args) {
   if (args.empty()) return usage(stderr);
   const std::string& verb = args[0];
   if (verb == "-h" || verb == "--help" || verb == "help") return usage(stdout);
-  if (verb != "inject" && verb != "arm" && verb != "throttle" && verb != "show" && verb != "reset") {
-    std::fprintf(stderr, "vgpu fault: unknown action '%s' (inject, arm, throttle, show or reset)\n",
+  if (verb != "inject" && verb != "arm" && verb != "stuck" && verb != "throttle" && verb != "show" &&
+      verb != "reset") {
+    std::fprintf(stderr, "vgpu fault: unknown action '%s' (inject, arm, stuck, throttle, show or reset)\n",
                  verb.c_str());
     return 2;
   }
 
-  std::string gpu, ecc, location, pcie, reasons, on;
+  std::string gpu, ecc, location, pcie, reasons, on, offset_text;
+  long long bit = -1, value = -1;
   bool vol = false, agg = false, bitflip = false, hang = false, clear = false;
   long long count = 1, seconds = -1;
   for (size_t i = 1; i < args.size(); ++i) {
     const std::string& a = args[i];
     const bool takes_value = a == "--gpu" || a == "--ecc" || a == "--location" || a == "--pcie" ||
-                             a == "--count" || a == "--reason" || a == "--seconds" || a == "--on";
+                             a == "--count" || a == "--reason" || a == "--seconds" || a == "--on" ||
+                             a == "--offset" || a == "--bit" || a == "--value";
     if (takes_value && i + 1 >= args.size()) {
       std::fprintf(stderr, "vgpu fault: %s needs a value\n", a.c_str());
       return 2;
@@ -168,6 +189,19 @@ int cmd_fault(const std::vector<std::string>& args) {
     else if (a == "--ecc") ecc = args[++i];
     else if (a == "--location") location = args[++i];
     else if (a == "--on") on = args[++i];
+    else if (a == "--offset") offset_text = args[++i];
+    else if (a == "--bit") {
+      if (!vgpu::cli::parse_int(args[++i], 0, 7, &bit)) {
+        std::fprintf(stderr, "vgpu fault: --bit is 0-7, the bit within the byte, got '%s'\n",
+                     args[i].c_str());
+        return 2;
+      }
+    } else if (a == "--value") {
+      if (!vgpu::cli::parse_int(args[++i], 0, 1, &value)) {
+        std::fprintf(stderr, "vgpu fault: --value is 0 or 1, got '%s'\n", args[i].c_str());
+        return 2;
+      }
+    }
     else if (a == "--pcie") pcie = args[++i];
     else if (a == "--count") {
       if (!vgpu::cli::parse_int(args[++i], 1, 1000000000000LL, &count)) {
@@ -210,8 +244,16 @@ int cmd_fault(const std::vector<std::string>& args) {
   }
 
   // Options that belong to one action are refused by the others.
-  if (verb != "throttle" && (!reasons.empty() || clear)) {
-    std::fprintf(stderr, "vgpu fault %s: --reason and --clear belong to throttle\n", verb.c_str());
+  if (verb != "throttle" && !reasons.empty()) {
+    std::fprintf(stderr, "vgpu fault %s: --reason belongs to throttle\n", verb.c_str());
+    return 2;
+  }
+  if (clear && verb != "throttle" && verb != "stuck") {
+    std::fprintf(stderr, "vgpu fault %s: --clear belongs to throttle and stuck\n", verb.c_str());
+    return 2;
+  }
+  if (verb != "stuck" && (!offset_text.empty() || bit >= 0 || value >= 0)) {
+    std::fprintf(stderr, "vgpu fault %s: --offset, --bit and --value belong to stuck\n", verb.c_str());
     return 2;
   }
   if (seconds >= 0 && verb != "throttle" && !(verb == "arm" && hang)) {
@@ -265,6 +307,56 @@ int cmd_fault(const std::vector<std::string>& args) {
       else
         std::printf("Throttling GPU %u (%s): %s until cleared.\n", i, snap.devices[i].name,
                     reasons.c_str());
+    }
+    return 0;
+  }
+
+  if (verb == "stuck") {
+    if (!ecc.empty() || !pcie.empty() || !location.empty() || vol || agg || bitflip || count != 1) {
+      std::fprintf(stderr, "vgpu fault stuck: takes --offset, --bit, --value, --clear and --gpu\n");
+      return 2;
+    }
+    if (clear) {
+      if (!offset_text.empty() || bit >= 0 || value >= 0) {
+        std::fprintf(stderr, "vgpu fault stuck: --clear takes no cell\n");
+        return 2;
+      }
+      for (uint32_t i : sel) {
+        vgpu::ras::unstick_all(snap.devices[i].uuid);
+        std::printf("Cleared stuck cells on GPU %u (%s).\n", i, snap.devices[i].name);
+      }
+      return 0;
+    }
+    if (offset_text.empty() || bit < 0 || value < 0) {
+      std::fprintf(stderr, "vgpu fault stuck: name the cell with --offset, --bit and --value, or --clear\n");
+      return 2;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long offset = std::strtoull(offset_text.c_str(), &end, 0);
+    if (offset_text[0] == '-' || errno || !end || *end) {
+      std::fprintf(stderr, "vgpu fault stuck: --offset is a byte offset, decimal or 0x hex, got '%s'\n",
+                   offset_text.c_str());
+      return 2;
+    }
+    for (uint32_t i : sel) {
+      const auto& d = snap.devices[i];
+      if (offset >= d.vram_total_bytes) {
+        std::fprintf(stderr, "vgpu fault stuck: offset 0x%llx is past GPU %u's %llu bytes of memory\n",
+                     offset, i, static_cast<unsigned long long>(d.vram_total_bytes));
+        return 2;
+      }
+    }
+    for (uint32_t i : sel) {
+      const auto& d = snap.devices[i];
+      try {
+        vgpu::ras::stick(d.uuid, offset, static_cast<uint32_t>(bit), static_cast<uint32_t>(value));
+      } catch (const std::length_error& e) {
+        std::fprintf(stderr, "vgpu fault stuck: %s; clear them first\n", e.what());
+        return 1;
+      }
+      std::printf("Bit %lld of byte 0x%llx on GPU %u (%s) now reads as %lld.\n", bit, offset, i, d.name,
+                  value);
     }
     return 0;
   }
@@ -338,7 +430,7 @@ int cmd_fault(const std::vector<std::string>& args) {
     }
     vgpu::ras::Target at = vgpu::ras::Target::Load;
     if (!on.empty() && !vgpu::ras::parse_target(on, &at)) {
-      std::fprintf(stderr, "vgpu fault arm: --on is load, store or shared, got '%s'\n", on.c_str());
+      std::fprintf(stderr, "vgpu fault arm: --on is load, store, shared or alu, got '%s'\n", on.c_str());
       return 2;
     }
     if (at == vgpu::ras::Target::Store && kind != vgpu::ras::Armed::Bitflip) {
@@ -346,11 +438,16 @@ int cmd_fault(const std::vector<std::string>& args) {
                            "arm it on loads, or a --bitflip on stores\n");
       return 2;
     }
+    if (at == vgpu::ras::Target::Alu && kind != vgpu::ras::Armed::Bitflip) {
+      std::fprintf(stderr, "vgpu fault arm: no ECC covers an arithmetic result; arm a --bitflip on alu\n");
+      return 2;
+    }
     const char* what = kind == vgpu::ras::Armed::Bitflip ? "bit flip" : ecc == "corrected"
                                                                            ? "corrected ECC error"
                                                                            : "uncorrected ECC error";
     const char* accesses = at == vgpu::ras::Target::Store    ? "device-memory stores"
                            : at == vgpu::ras::Target::Shared ? "shared-memory loads"
+                           : at == vgpu::ras::Target::Alu    ? "arithmetic results"
                                                              : "device-memory loads";
     for (uint32_t i : sel) {
       vgpu::ras::arm(snap.devices[i].uuid, kind, static_cast<uint64_t>(count), at);
@@ -416,9 +513,13 @@ int cmd_fault(const std::vector<std::string>& args) {
   for (uint32_t i : sel) {
     const auto& d = snap.devices[i];
     vgpu::ras::inject_ecc(d.uuid, severity, loc, static_cast<uint64_t>(count), scheme_of(d));
-    // The driver's log of it: Xid 48 for an uncorrectable error in device
+    // The driver's log of it. amdgpu reports every count it collects, by
+    // block; NVIDIA's driver logs Xid 48 for an uncorrectable error in device
     // memory, and Xid 63 for the page or row it takes out of service.
-    if (severity == vgpu::ras::Severity::Uncorrected && loc == vgpu::ras::Location::DeviceMemory) {
+    if (std::strcmp(d.vendor, "amd") == 0) {
+      vgpu::ras::log_kernel(vgpu::ras::amdgpu_ras_line(d.bus_id, severity, loc, static_cast<uint64_t>(count)));
+    } else if (severity == vgpu::ras::Severity::Uncorrected &&
+               loc == vgpu::ras::Location::DeviceMemory) {
       vgpu::ras::report_xid(
           d.uuid, d.bus_id, 48, "",
           "An uncorrectable double bit error (DBE) has been detected on GPU in the framebuffer at "

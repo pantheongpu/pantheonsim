@@ -250,6 +250,8 @@ class FaultHook final : public MemoryManager::AccessFault {
     load_pending = faults_.pending(ras::Target::Load);
     store_pending = faults_.pending(ras::Target::Store);
     shared_pending = faults_.pending(ras::Target::Shared);
+    stuck_pending = faults_.stuck_pending();
+    alu_pending = faults_.pending(ras::Target::Alu);
   }
 
   // A hang armed for this launch: it stalls the launch, with the device shown
@@ -274,6 +276,52 @@ class FaultHook final : public MemoryManager::AccessFault {
                       " s and was stopped (armed with `vgpu fault arm --hang`)");
   }
 
+  // A kernel that faulted on its own -- a bad address, a misaligned access --
+  // is logged the way the driver logs it: Xid 31 for an address the MMU has no
+  // mapping for, Xid 13 for an exception the SM raises itself. Faults this
+  // simulator finds that hardware would not (a data race, an uninitialized
+  // register) and ones logged where they happen (ECC, hangs) are not logged.
+  void report_kernel_fault(const Error& e) {
+    const std::string& m = e.message();
+    const std::string who = "pid=" + std::to_string(::getpid()) + ", name=" + process_name();
+    const bool on_chip = m.rfind("shared memory", 0) == 0 || m.rfind("local memory", 0) == 0;
+    switch (e.code()) {
+      case Err::InvalidPointer:
+      case Err::UseAfterFree:
+      case Err::OutOfBounds: {
+        if (on_chip) {
+          ras::report_xid(uuid_, bus_id_, 13, who,
+                          "Graphics SM Warp Exception on (GPC 0, TPC 0, SM 0): Out Of Range Address");
+          return;
+        }
+        // The page the access fell in, printed as the driver prints it.
+        uint64_t addr = 0;
+        if (const size_t at = m.find(" at 0x"); at != std::string::npos)
+          addr = std::strtoull(m.c_str() + at + 4, nullptr, 16);
+        char where[32];
+        std::snprintf(where, sizeof where, "0x%llx_%08llx",
+                      static_cast<unsigned long long>(addr >> 32),
+                      static_cast<unsigned long long>(addr & 0xFFFFF000u));
+        // Past the end of an allocation, inside its last page, is a page with
+        // no valid entry; anywhere else no page table covers the address.
+        const char* type = e.code() == Err::OutOfBounds ? "FAULT_PTE" : "FAULT_PDE";
+        const char* access = m.find("write") != std::string::npos ? "ACCESS_TYPE_VIRT_WRITE"
+                                                                   : "ACCESS_TYPE_VIRT_READ";
+        ras::report_xid(uuid_, bus_id_, 31, who,
+                        std::string("Ch 00000008, intr 00000000. MMU Fault: ENGINE GRAPHICS GPC0 "
+                                    "GPCCLIENT_T1_0 faulted @ ") +
+                            where + ". Fault is of type " + type + " " + access);
+        return;
+      }
+      case Err::MisalignedAccess:
+        ras::report_xid(uuid_, bus_id_, 13, who,
+                        "Graphics SM Warp Exception on (GPC 0, TPC 0, SM 0): Misaligned Address");
+        return;
+      default:
+        return;
+    }
+  }
+
   uint64_t on_load(uint64_t addr, uint32_t size, uint64_t value) override {
     return take(ras::Target::Load, addr, size, value);
   }
@@ -282,6 +330,19 @@ class FaultHook final : public MemoryManager::AccessFault {
   }
   uint64_t on_shared_load(uint64_t offset, uint32_t size, uint64_t value) override {
     return take(ras::Target::Shared, offset, size, value);
+  }
+  void on_read(uint64_t offset, uint8_t* bytes, uint64_t len) override {
+    faults_.apply_stuck(offset, bytes, len);
+  }
+  // A flip in the upper half of the result's bits -- an integer's high bits, a
+  // float's exponent or leading mantissa -- so the error is one a result check
+  // can see rather than a last-place difference inside its tolerance.
+  uint64_t on_alu(uint64_t value, uint32_t bits) override {
+    if (faults_.take(ras::Target::Alu) != ras::Armed::Bitflip) return value;
+    const uint32_t half = std::max(bits / 2, 1u);
+    const uint32_t bit = bits - 2 - static_cast<uint32_t>(flips_.fetch_add(1) % (half - 1 ? half - 1 : 1));
+    faults_.note_bitflip();
+    return value ^ (uint64_t{1} << bit);
   }
 
  private:
@@ -392,6 +453,22 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   exec::LaunchConfig cfg = in_cfg;
   if (!cfg.textures && !textures_.empty()) cfg.textures = &textures_;
   if (fault_) fault_->maybe_hang(fn.name, telemetry_, static_cast<uint32_t>(ordinal_));
+  try {
+    run_kernel(fn, cfg, args, syms);
+  } catch (const Error& e) {
+    if (fault_) {
+      try {
+        fault_->report_kernel_fault(e);
+      } catch (const std::exception&) {
+        // No runtime directory to log to: the kernel's own error still stands.
+      }
+    }
+    throw;
+  }
+}
+
+void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
+                        const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms) {
   if (!telemetry_) {
     report_counters(fn.name, cfg, exec::launch(fn, cfg, args, mem_, profile_, syms));
     return;

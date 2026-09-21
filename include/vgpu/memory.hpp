@@ -127,6 +127,14 @@ class MemoryManager {
     virtual uint64_t on_load(uint64_t addr, uint32_t size, uint64_t value) = 0;
     virtual uint64_t on_store(uint64_t addr, uint32_t size, uint64_t value) = 0;
     virtual uint64_t on_shared_load(uint64_t offset, uint32_t size, uint64_t value) = 0;
+    // Stuck cells: forces the bits stuck in `len` bytes read from `offset`,
+    // counted from the start of this device's memory. Every read of device
+    // memory goes through it, copies included.
+    virtual void on_read(uint64_t offset, uint8_t* bytes, uint64_t len) = 0;
+    // An arithmetic result `bits` wide, as a kernel computed it.
+    virtual uint64_t on_alu(uint64_t value, uint32_t bits) = 0;
+    const uint64_t* stuck_pending = nullptr;
+    const uint64_t* alu_pending = nullptr;
     const uint64_t* load_pending = nullptr;
     const uint64_t* store_pending = nullptr;
     const uint64_t* shared_pending = nullptr;
@@ -136,6 +144,14 @@ class MemoryManager {
   // A kernel's shared-memory load, at `offset` in its block's shared memory.
   // Shared memory is the SM's, not this manager's, but its faults are armed
   // with the device's.
+  // Faults on arithmetic results reach kernels through here too, since this
+  // is the device's one link to its armed faults. True while any is armed.
+  bool alu_fault_armed() const {
+    return access_fault_ && access_fault_->alu_pending &&
+           __atomic_load_n(access_fault_->alu_pending, __ATOMIC_RELAXED);
+  }
+  uint64_t alu_result(uint64_t value, uint32_t bits) const { return access_fault_->on_alu(value, bits); }
+
   uint64_t shared_loaded(uint64_t offset, uint32_t size, uint64_t value) const {
     if (access_fault_ && access_fault_->shared_pending &&
         __atomic_load_n(access_fault_->shared_pending, __ATOMIC_RELAXED))
@@ -178,6 +194,10 @@ class MemoryManager {
 
  private:
   AccessFault* access_fault_ = nullptr;
+  bool any_stuck() const {
+    return access_fault_ && access_fault_->stuck_pending &&
+           __atomic_load_n(access_fault_->stuck_pending, __ATOMIC_RELAXED);
+  }
   // Chunks are a flat array of owning pointers rather than a map: a lookup is
   // then an index instead of a red-black tree walk, which is the difference
   // between one instruction and a cache-missing traversal on every scalar
@@ -247,6 +267,8 @@ class MemoryManager {
 
   // Maps addr to (allocation base, allocation); throws with diagnostics.
   const Allocation& resolve(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out) const;
+  // Copies `len` bytes at offset `off` in allocation `a` out to `d`.
+  void read_chunks(const Allocation& a, uint64_t off, uint8_t* d, uint64_t len) const;
   Allocation& resolve_mut(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out);
 
   uint64_t capacity_;
