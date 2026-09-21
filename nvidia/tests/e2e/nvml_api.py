@@ -115,6 +115,9 @@ check("ECC is on", rc == SUCCESS and (cur.value, pend.value) == (1, 1), (rc, cur
 errors = ctypes.c_ulonglong(99)
 rc = lib.nvmlDeviceGetTotalEccErrors(ctypes.c_void_p(h1), 1, 0, ctypes.byref(errors))
 check("no ECC errors", rc == SUCCESS and errors.value == 0, (rc, errors.value))
+errors = ctypes.c_ulonglong(99)
+rc = lib.nvmlDeviceGetMemoryErrorCounter(ctypes.c_void_p(h1), 1, 1, 2, ctypes.byref(errors))  # uncorrected, aggregate, DRAM
+check("no device-memory errors by location either", rc == SUCCESS and errors.value == 0, (rc, errors.value))
 gen, width = ctypes.c_uint(), ctypes.c_uint()
 rc_g = lib.nvmlDeviceGetCurrPcieLinkGeneration(ctypes.c_void_p(h1), ctypes.byref(gen))
 rc_w = lib.nvmlDeviceGetCurrPcieLinkWidth(ctypes.c_void_p(h1), ctypes.byref(width))

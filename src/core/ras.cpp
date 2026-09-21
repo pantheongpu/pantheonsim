@@ -1,0 +1,215 @@
+#include "vgpu/ras.hpp"
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <type_traits>
+
+#include "vgpu/error.hpp"
+#include "vgpu/telemetry.hpp"
+
+namespace vgpu::ras {
+namespace {
+
+constexpr uint32_t kMagic = 0x56524153;  // "VRAS"
+constexpr uint32_t kVersion = 1;
+
+struct File {
+  uint32_t magic;
+  uint32_t version;
+  uint64_t reserved;
+  Counters counters;
+};
+static_assert(std::is_standard_layout_v<Counters> && sizeof(Counters) % sizeof(uint64_t) == 0,
+              "Counters is read and written a word at a time");
+constexpr size_t kWords = sizeof(Counters) / sizeof(uint64_t);
+
+std::string volatile_path(const std::string& uuid) {
+  return telemetry::default_path() + "/ras-" + uuid + ".volatile";
+}
+std::string aggregate_path(const std::string& uuid) {
+  return state_dir() + "/ras-" + uuid + ".aggregate";
+}
+
+// A state file mapped shared, so every process that touches the machine sees
+// one set of counts; unmapped when it goes out of scope. Opened without
+// `create`, a file that does not exist maps to nothing and reads as zero.
+class Mapped {
+ public:
+  Mapped(const std::string& path, bool create) {
+    if (create) {
+      std::error_code ec;
+      std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    }
+    fd_ = ::open(path.c_str(), create ? (O_RDWR | O_CREAT) : O_RDWR, 0600);
+    if (fd_ < 0) {
+      if (!create && errno == ENOENT) return;
+      throw Error::make(Err::Internal, "cannot open reliability state ", path, ": ",
+                        std::strerror(errno));
+    }
+    struct stat st {};
+    if (::fstat(fd_, &st) == 0 && st.st_size < static_cast<off_t>(sizeof(File)) &&
+        ::ftruncate(fd_, sizeof(File)) != 0)
+      throw Error::make(Err::Internal, "cannot size reliability state ", path, ": ",
+                        std::strerror(errno));
+    void* p = ::mmap(nullptr, sizeof(File), PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+    if (p == MAP_FAILED)
+      throw Error::make(Err::Internal, "cannot map reliability state ", path, ": ",
+                        std::strerror(errno));
+    file_ = static_cast<File*>(p);
+    // A new file is all zeros, and the first process to see it claims it. Two
+    // processes creating it at once must not both clear it -- the second would
+    // erase the first one's increment -- hence the compare-and-swap. A file
+    // from an incompatible build is started again rather than misread.
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n(&file_->magic, &expected, kMagic, false, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE)) {
+      __atomic_store_n(&file_->version, kVersion, __ATOMIC_RELEASE);
+    } else if (expected != kMagic || __atomic_load_n(&file_->version, __ATOMIC_ACQUIRE) != kVersion) {
+      uint64_t* w = words();
+      for (size_t i = 0; i < kWords; ++i) __atomic_store_n(&w[i], 0, __ATOMIC_RELAXED);
+      __atomic_store_n(&file_->version, kVersion, __ATOMIC_RELEASE);
+      __atomic_store_n(&file_->magic, kMagic, __ATOMIC_RELEASE);
+    }
+  }
+  ~Mapped() {
+    if (file_) ::munmap(file_, sizeof(File));
+    if (fd_ >= 0) ::close(fd_);
+  }
+  Mapped(const Mapped&) = delete;
+  Mapped& operator=(const Mapped&) = delete;
+
+  Counters* counters() { return file_ ? &file_->counters : nullptr; }
+  uint64_t* words() { return file_ ? reinterpret_cast<uint64_t*>(&file_->counters) : nullptr; }
+
+ private:
+  int fd_ = -1;
+  File* file_ = nullptr;
+};
+
+Counters load(const std::string& path) {
+  Counters out{};
+  Mapped m(path, false);
+  if (uint64_t* w = m.words()) {
+    uint64_t* dst = reinterpret_cast<uint64_t*>(&out);
+    for (size_t i = 0; i < kWords; ++i) dst[i] = __atomic_load_n(&w[i], __ATOMIC_RELAXED);
+  }
+  return out;
+}
+
+void add(uint64_t* field, uint64_t n) { __atomic_fetch_add(field, n, __ATOMIC_RELAXED); }
+void set(uint64_t* field, uint64_t v) { __atomic_store_n(field, v, __ATOMIC_RELAXED); }
+
+constexpr const char* kLocationNames[kLocations] = {
+    "device_memory", "register_file", "l1_cache", "l2_cache", "texture_memory", "cbu", "sram"};
+constexpr const char* kPcieNames[kPcieCounters] = {
+    "replay", "replay_rollover", "l0_to_recovery", "correctable", "naks_received", "bad_tlp",
+    "naks_sent", "bad_dllp", "non_fatal", "fatal", "lcrc", "lane"};
+
+}  // namespace
+
+uint64_t Counters::ecc_total(Severity s) const {
+  uint64_t sum = 0;
+  for (uint32_t l = 0; l < kLocations; ++l) sum += ecc[static_cast<uint32_t>(s)][l];
+  return sum;
+}
+
+State read(const std::string& uuid) {
+  State s;
+  s.since_load = load(volatile_path(uuid));
+  s.lifetime = load(aggregate_path(uuid));
+  return s;
+}
+
+void inject_ecc(const std::string& uuid, Severity s, Location l, uint64_t n, Retirement scheme) {
+  if (n == 0) return;
+  const auto si = static_cast<uint32_t>(s), li = static_cast<uint32_t>(l);
+  {
+    Mapped v(volatile_path(uuid), true);
+    add(&v.counters()->ecc[si][li], n);
+  }
+  Mapped a(aggregate_path(uuid), true);
+  Counters* c = a.counters();
+  add(&c->ecc[si][li], n);
+  // An uncorrectable error in device memory takes that memory out of service.
+  // Corrected errors do not here: a real card retires a page only after
+  // several at the same address, and injection does not model addresses yet.
+  if (s == Severity::Uncorrected && l == Location::DeviceMemory) {
+    if (scheme == Retirement::Pages) {
+      add(&c->retired_dbe, n);
+      set(&c->retired_pending, 1);
+    } else if (scheme == Retirement::Rows) {
+      add(&c->rows_uncorrectable, n);
+      set(&c->rows_pending, 1);
+    }
+  }
+}
+
+void inject_pcie(const std::string& uuid, Pcie c, uint64_t n) {
+  if (n == 0) return;
+  Mapped v(volatile_path(uuid), true);
+  add(&v.counters()->pcie[static_cast<uint32_t>(c)], n);
+}
+
+void reset_volatile(const std::string& uuid, bool driver_reload) {
+  {
+    Mapped v(volatile_path(uuid), false);
+    if (uint64_t* w = v.words())
+      for (size_t i = 0; i < kWords; ++i) set(&w[i], 0);
+  }
+  if (!driver_reload) return;
+  // Pending retirements and remaps take effect at a driver load.
+  Mapped a(aggregate_path(uuid), false);
+  if (Counters* c = a.counters()) {
+    set(&c->retired_pending, 0);
+    set(&c->rows_pending, 0);
+  }
+}
+
+void reset_aggregate(const std::string& uuid) {
+  Mapped a(aggregate_path(uuid), false);
+  if (Counters* c = a.counters())
+    for (uint32_t s = 0; s < kSeverities; ++s)
+      for (uint32_t l = 0; l < kLocations; ++l) set(&c->ecc[s][l], 0);
+}
+
+const char* location_name(Location l) { return kLocationNames[static_cast<uint32_t>(l)]; }
+
+bool parse_location(const std::string& s, Location* out) {
+  if (s == "dram") {
+    *out = Location::DeviceMemory;
+    return true;
+  }
+  for (uint32_t i = 0; i < kLocations; ++i)
+    if (s == kLocationNames[i]) {
+      *out = static_cast<Location>(i);
+      return true;
+    }
+  return false;
+}
+
+const char* pcie_name(Pcie c) { return kPcieNames[static_cast<uint32_t>(c)]; }
+
+bool parse_pcie(const std::string& s, Pcie* out) {
+  for (uint32_t i = 0; i < kPcieCounters; ++i)
+    if (s == kPcieNames[i]) {
+      *out = static_cast<Pcie>(i);
+      return true;
+    }
+  return false;
+}
+
+std::string state_dir() {
+  if (const char* d = std::getenv("VGPU_STATE_DIR"); d && *d) return d;
+  if (const char* x = std::getenv("XDG_STATE_HOME"); x && *x) return std::string(x) + "/vgpu";
+  if (const char* h = std::getenv("HOME"); h && *h) return std::string(h) + "/.local/state/vgpu";
+  return "/tmp/vgpu-state-" + std::to_string(::getuid());
+}
+
+}  // namespace vgpu::ras

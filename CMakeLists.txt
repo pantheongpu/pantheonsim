@@ -68,6 +68,7 @@ add_library(vgpu STATIC
   src/core/telemetry.cpp
   src/core/profiling.cpp
   src/core/faults.cpp
+  src/core/ras.cpp
   src/ptx/ast.cpp
   src/ptx/lexer.cpp
   src/ptx/parser.cpp
@@ -435,7 +436,8 @@ else()
 endif()
 
 # CLI
-add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/test.cpp)
+add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/test.cpp
+               src/cli/fault.cpp src/cli/machine.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
 # Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /
@@ -473,6 +475,7 @@ vgpu_unit_test(test_runtime)
 vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
 vgpu_unit_test(test_telemetry)
+vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regalloc)
 vgpu_unit_test(test_robustness)
 target_include_directories(test_robustness PRIVATE nvidia/src)
@@ -498,6 +501,11 @@ set_tests_properties(smi_queries PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_
 # loops and field checks, the drop-in scripts, rocm-smi's own flags; vgpu
 # shell's defaults, identity, flag checks and exit status; and the exit codes
 # of test --matrix. Each check is a bug that shipped.
+# Reliability faults injected with `vgpu fault`, read back through every surface
+# a health tool uses: nvidia-smi fields, the table, rocm-smi, and nvidia-smi -p.
+add_test(NAME fault_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_fault_cli.sh)
+set_tests_properties(fault_cli PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
 add_test(NAME smi_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_smi_cli.sh)
 set_tests_properties(smi_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)

@@ -26,6 +26,7 @@
 #include <string>
 
 #include "vgpu/profile.hpp"
+#include "vgpu/ras.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/telemetry.hpp"
 
@@ -742,15 +743,56 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCurrPcieLinkWidth(nvmlDevice_t device, uns
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMaxPcieLinkWidth(nvmlDevice_t device, unsigned int* width) {
   REQUIRE_INIT(); return pcie_link(device, width, false);
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTotalEccErrors(nvmlDevice_t device, nvmlMemoryErrorType_t,
-                                                     nvmlEccCounterType_t, unsigned long long* count) {
+// ECC counts come from the machine's reliability state (vgpu/ras.hpp), the one
+// nvidia-smi reads: zero until something is injected with `vgpu fault`.
+// errorType 0 is corrected, 1 uncorrected; counterType 0 volatile, 1 aggregate.
+static const vgpu::ras::Counters& ecc_counts(const vgpu::ras::State& st, int counter_type) {
+  return counter_type == 1 ? st.lifetime : st.since_load;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTotalEccErrors(nvmlDevice_t device, nvmlMemoryErrorType_t error_type,
+                                                     nvmlEccCounterType_t counter_type,
+                                                     unsigned long long* count) {
   REQUIRE_INIT();
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
-  if (!d || !count) return NVML_ERROR_INVALID_ARGUMENT;
+  if (!d || !count || static_cast<int>(error_type) > 1 || static_cast<int>(counter_type) > 1)
+    return NVML_ERROR_INVALID_ARGUMENT;
   if (!d->ecc_enabled) return NVML_ERROR_NOT_SUPPORTED;   // matches nvmlDeviceGetEccMode
-  *count = 0;  // nothing has faulted in simulated memory
+  const vgpu::ras::State st = vgpu::ras::read(d->uuid);
+  *count = ecc_counts(st, static_cast<int>(counter_type))
+               .ecc_total(error_type == 0 ? vgpu::ras::Severity::Corrected : vgpu::ras::Severity::Uncorrected);
+  return NVML_SUCCESS;
+}
+// The same counts by where they happened. NVML's locations, by number: L1 0,
+// L2 1, device memory 2, register file 3, texture memory 4, texture shared 5,
+// CBU 6, SRAM 7. Texture shared memory is not a location VirtualGPU tracks.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMemoryErrorCounter(nvmlDevice_t device,
+                                                         nvmlMemoryErrorType_t error_type,
+                                                         nvmlEccCounterType_t counter_type,
+                                                         nvmlMemoryLocation_t location,
+                                                         unsigned long long* count) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  const int loc = static_cast<int>(location);
+  if (!d || !count || static_cast<int>(error_type) > 1 || static_cast<int>(counter_type) > 1 ||
+      loc < 0 || loc > 7)
+    return NVML_ERROR_INVALID_ARGUMENT;
+  if (!d->ecc_enabled) return NVML_ERROR_NOT_SUPPORTED;
+  using L = vgpu::ras::Location;
+  static const int kMap[8] = {static_cast<int>(L::L1Cache),       static_cast<int>(L::L2Cache),
+                              static_cast<int>(L::DeviceMemory),  static_cast<int>(L::RegisterFile),
+                              static_cast<int>(L::TextureMemory), -1,
+                              static_cast<int>(L::Cbu),           static_cast<int>(L::Sram)};
+  if (kMap[loc] < 0) {
+    *count = 0;
+    return NVML_SUCCESS;
+  }
+  const vgpu::ras::State st = vgpu::ras::read(d->uuid);
+  const auto sev = error_type == 0 ? 0u : 1u;
+  *count = ecc_counts(st, static_cast<int>(counter_type)).ecc[sev][kMap[loc]];
   return NVML_SUCCESS;
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDriverModel(nvmlDevice_t, nvmlDriverModel_t*, nvmlDriverModel_t*) {
@@ -790,6 +832,26 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFieldValues(nvmlDevice_t device, int count
   };
   const long long now_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                std::chrono::system_clock::now().time_since_epoch()).count();
+  const vgpu::ras::Counters pcie = d ? vgpu::ras::read(d->uuid).since_load : vgpu::ras::Counters{};
+  auto pcie_count = [&](unsigned field) -> unsigned long long {
+    using P = vgpu::ras::Pcie;
+    P c;
+    switch (field) {
+      case kPcieReplay: c = P::Replay; break;
+      case kPcieReplayRollover: c = P::ReplayRollover; break;
+      case kPcieL0ToRecovery: c = P::L0ToRecovery; break;
+      case kPcieCorrectable: c = P::Correctable; break;
+      case kPcieNaksReceived: c = P::NaksReceived; break;
+      case kPcieBadTlp: c = P::BadTlp; break;
+      case kPcieNaksSent: c = P::NaksSent; break;
+      case kPcieBadDllp: c = P::BadDllp; break;
+      case kPcieNonFatal: c = P::NonFatal; break;
+      case kPcieFatal: c = P::Fatal; break;
+      case kPcieLcrc: c = P::Lcrc; break;
+      default: c = P::Lane; break;
+    }
+    return pcie.pcie[static_cast<uint32_t>(c)];
+  };
   for (int i = 0; i < count; ++i) {
     nvmlFieldValue_t& v = values[i];
     v.nvmlReturn = NVML_ERROR_NOT_SUPPORTED;
@@ -797,13 +859,13 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFieldValues(nvmlDevice_t device, int count
     v.latencyUsec = 0;
     switch (v.fieldId) {
       // PCIe transport error counters. A real card answers these whatever its
-      // class -- an RTX 3060 does -- and a simulated link has had no transport
-      // errors, so they are zero rather than unsupported.
+      // class -- an RTX 3060 does. A simulated link errs only when an error is
+      // injected (`vgpu fault inject --pcie`), so they are zero until then.
       case kPcieReplay: case kPcieReplayRollover: case kPcieL0ToRecovery:
       case kPcieCorrectable: case kPcieNaksReceived: case kPcieBadTlp: case kPcieNaksSent:
       case kPcieBadDllp: case kPcieNonFatal: case kPcieFatal: case kPcieLcrc: case kPcieLane:
         v.valueType = NVML_VALUE_TYPE_UNSIGNED_LONG_LONG;
-        v.value.ullVal = 0;
+        v.value.ullVal = pcie_count(v.fieldId);
         v.nvmlReturn = NVML_SUCCESS;
         break;
       // The memory sensor, only where real cards of the model report one.
