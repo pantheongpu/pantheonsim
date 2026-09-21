@@ -55,3 +55,7 @@ telemetry:
   temperature_max_c: 87
   pci_vendor_id: 4318          # 0x10DE NVIDIA
   pci_device_id: 9013        # 0x2335 GH100 [H200 SXM 141GB]
+  ecc: true                    # supported and on by default (NVIDIA datasheet)
+  memory: hbm                  # rows are remapped on failure
+  memory_temperature: false    # most real runs report no memory sensor
+  pcie_link: "Gen5 x16"        # datasheet; the database's H200 runs are on a Grace host

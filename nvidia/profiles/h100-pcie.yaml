@@ -35,3 +35,7 @@ telemetry:
   # temperature_max_c: this driver did not report a thermal threshold
   pci_vendor_id: 4318          # 0x10DE
   pci_device_id: 9009          # 0x2331
+  ecc: true                    # supported and on by default (NVIDIA datasheet)
+  memory: hbm                  # rows are remapped on failure
+  memory_temperature: false    # most real runs report no memory sensor
+  pcie_link: "Gen5 x16"        # most common link on real cards (239 runs in the benchmark database)

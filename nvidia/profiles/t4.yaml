@@ -35,3 +35,6 @@ telemetry:
   temperature_max_c: 93
   pci_vendor_id: 4318          # 0x10DE
   pci_device_id: 7864          # 0x1EB8
+  ecc: true                    # supported and on by default (NVIDIA datasheet)
+  memory: gddr                 # pages are retired on failure
+  pcie_link: "Gen3 x8"         # most common link on real cards (596 runs in the benchmark database)

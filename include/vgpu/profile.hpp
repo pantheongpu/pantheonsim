@@ -58,6 +58,21 @@ struct TelemetryClass {
   // adds this back. Kept as a difference rather than an absolute so that
   // shrinking VRAM for a laptop-scale run shrinks what nvidia-smi says too.
   uint64_t framebuffer_reserve_bytes = 0;
+  // Memory reliability and the PCIe link, as monitoring tools read them.
+  //   ecc                 the card has ECC and ships with it on (datasheet).
+  //   hbm                 HBM memory. HBM parts remap failing rows; GDDR parts
+  //                       with ECC retire pages instead.
+  //   memory_temperature  the driver reports a memory sensor. Taken from real
+  //                       runs, not from the memory type: most HBM cards in
+  //                       the benchmark database report none.
+  //   pcie_gen/width      the link real cards of the model most often run at,
+  //                       which depends on how they are hosted: a T4 is an x16
+  //                       card that clouds attach at x8.
+  bool ecc = false;
+  bool hbm = false;
+  bool memory_temperature = false;
+  uint32_t pcie_gen = 0;
+  uint32_t pcie_width = 0;
 };
 
 struct DeviceProfile {

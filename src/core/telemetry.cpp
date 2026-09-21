@@ -207,6 +207,8 @@ void Publisher::refresh(uint32_t ordinal) {
   d->utilization_mem = static_cast<uint32_t>(std::lround(mem_util * 100.0));
   d->power_mw = static_cast<uint32_t>(std::lround(a.power_w * 1000.0));
   d->temperature_c = static_cast<uint32_t>(std::lround(a.temp_c));
+  // SYNTHETIC: memory follows the die, a little warmer under memory traffic.
+  d->temperature_mem_c = static_cast<uint32_t>(std::lround(a.temp_c + 4.0 * mem_util));
   // Clocks and voltage step with load, mimicking a boost curve.
   d->sm_clock_mhz = static_cast<uint32_t>(
       std::lround(d->sm_clock_max_mhz * (util > 0.02 ? (0.55 + 0.45 * util) : 0.15)));
@@ -287,6 +289,11 @@ void describe_device(const DeviceProfile& p, int ordinal, DeviceSample* d) {
   d->temperature_max_c = p.telemetry.temperature_max_c;
   d->sm_clock_max_mhz = p.telemetry.sm_clock_max_mhz;
   d->mem_clock_max_mhz = p.telemetry.mem_clock_max_mhz;
+  d->ecc_enabled = p.telemetry.ecc ? 1 : 0;
+  d->memory_retirement = !p.telemetry.ecc ? 0 : p.telemetry.hbm ? 2 : 1;
+  d->has_memory_temperature = p.telemetry.memory_temperature ? 1 : 0;
+  d->pcie_gen = p.telemetry.pcie_gen;
+  d->pcie_width = p.telemetry.pcie_width;
 }
 
 Shared idle_snapshot(const DeviceProfile& p, int device_count) {

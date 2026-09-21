@@ -39,7 +39,7 @@ expect "CSV headers carry units, with or without nounits" \
   "$(smi --query-gpu=name,memory.total,utilization.gpu,power.draw,temperature.gpu --format=csv,nounits | head -1)"
 expect "clocks.gr is the graphics clock" "yes" \
   "$( [[ "$(smi --query-gpu=clocks.gr --format=csv,noheader,nounits)" =~ ^[0-9]+$'\n'[0-9]+$ ]] && echo yes || echo no)"
-expect "nothing throttles" "0x0000000000000000" \
+expect "an idle card reports only the idle reason, as a real one does" "0x0000000000000001" \
   "$(smi -i 0 --query-gpu=clocks_throttle_reasons.active --format=csv,noheader)"
 
 expect "--query-compute-apps on an idle machine is a header and no rows" \
@@ -79,5 +79,46 @@ print(t("driver_version"), t("cuda_version"), t("attached_gpus"), len(gpus),
   expect "-q -x parses and carries the -q values" \
     "550.54.15 12.4 2 1 00000000:02:00.0 Tesla T4 Turing 15360 MiB 0 %" "$got"
 fi
+
+# Reliability, link and clock-event fields, answered the way real cards answer
+# them. smi() is a T4: ECC on, GDDR so pages are retired, no memory sensor, and
+# the Gen3 x8 link clouds attach it at.
+q() { smi -i 0 --query-gpu="$1" --format=csv,noheader; }
+expect "ECC is on for a card that ships with it" "Enabled, Enabled" "$(q ecc.mode.current,ecc.mode.pending)"
+expect "ECC counters are zero" "0, 0" \
+  "$(q ecc.errors.corrected.volatile.total,ecc.errors.uncorrected.aggregate.device_memory)"
+expect "a GDDR card retires pages and does not remap rows" "0, 0, No, [N/A]" \
+  "$(q retired_pages.sbe,retired_pages.double_bit.count,retired_pages.pending,remapped_rows.correctable)"
+expect "no memory sensor, printed as the real driver prints it" "N/A" "$(q temperature.memory)"
+expect "the link real T4s run at" "3, 8, 3, 8" \
+  "$(q pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,pcie.link.width.max)"
+expect "an idle card reports the idle clock-event reason" \
+  "0x00000000000001FF, 0x0000000000000001, Active, Not Active" \
+  "$(q clocks_event_reasons.supported,clocks_event_reasons.active,clocks_event_reasons.gpu_idle,clocks_event_reasons.hw_slowdown)"
+expect "the throttle spelling is accepted too" "0x0000000000000001" "$(q clocks_throttle_reasons.active)"
+expect "the table's ECC column agrees" "yes" \
+  "$(smi | grep -q 'Off |                    0 |' && echo yes || echo no)"
+# Pantheon's RAS snapshot asks for all of these in one query. One name missing
+# failed the whole query, and Pantheon read that as RAS unavailable.
+ras="ecc.mode.current"
+for sev in corrected uncorrected; do for win in volatile aggregate; do
+  for loc in device_memory dram register_file l1_cache l2_cache texture_memory cbu sram total; do
+    ras="$ras,ecc.errors.$sev.$win.$loc"
+  done
+done; done
+ras="$ras,ecc.errors.uncorrected.volatile.sram.parity,ecc.errors.uncorrected.aggregate.sram.thresholdExceeded"
+ras="$ras,retired_pages.sbe,retired_pages.dbe,retired_pages.pending"
+smi -i 0 --query-gpu="$ras" --format=csv,noheader,nounits >/dev/null
+expect "Pantheon's whole RAS query is accepted" "0" "$?"
+# A GeForce card has no ECC but answers the SRAM breakdown, as a real RTX 3060
+# does; an HBM card remaps rows instead of retiring pages.
+card() { VGPU_GPU="$1" VGPU_DEVICE_COUNT=1 VGPU_TELEMETRY_PATH=/nonexistent-so-idle \
+           "$vgpu" smi --query-gpu="$2" --format=csv,noheader 2>&1; }
+expect "no ECC on a GeForce card, SRAM breakdown still answered" "[N/A], [N/A], 0, No" \
+  "$(card nvidia/rtx3060 ecc.mode.current,ecc.errors.corrected.volatile.total,ecc.errors.uncorrected.volatile.sram.parity,ecc.errors.uncorrected.aggregate.sram.thresholdExceeded)"
+expect "an HBM card remaps rows and does not retire pages" "[N/A], 0, No" \
+  "$(card nvidia/h100 retired_pages.sbe,remapped_rows.correctable,remapped_rows.pending)"
+expect "a memory sensor where real cards report one" "yes" \
+  "$(card nvidia/b200 temperature.memory | grep -qE '^[0-9]+$' && echo yes || echo no)"
 
 exit $fail

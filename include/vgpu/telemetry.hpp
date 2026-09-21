@@ -34,7 +34,7 @@
 namespace vgpu::telemetry {
 
 inline constexpr uint32_t kMagic = 0x56475054;  // "VGPT"
-inline constexpr uint32_t kVersion = 1;
+inline constexpr uint32_t kVersion = 2;  // 2: reliability and PCIe link fields
 inline constexpr int kMaxDevices = 16;
 inline constexpr int kMaxProcs = 8;
 
@@ -74,6 +74,14 @@ struct DeviceSample {
   uint32_t mem_clock_max_mhz;  // synthetic
   uint32_t fan_percent;        // synthetic
   uint32_t perf_state;         // synthetic, 0 = P0 (max) .. 8 = P8 (idle)
+
+  // Reliability and link, from the profile (see vgpu::TelemetryClass).
+  uint32_t ecc_enabled;             // profile: 1 when the card ships with ECC on
+  uint32_t memory_retirement;       // profile: 0 none, 1 page retirement, 2 row remapping
+  uint32_t has_memory_temperature;  // profile: the driver reports a memory sensor
+  uint32_t temperature_mem_c;       // synthetic; meaningful only with the flag above
+  uint32_t pcie_gen;                // profile: the link real cards most often run at
+  uint32_t pcie_width;
 
   uint32_t proc_count;
   ProcSample procs[kMaxProcs];

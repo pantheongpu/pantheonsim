@@ -104,6 +104,29 @@ out=$(rs -d 1)
 expect "the concise rocm-smi table honours -d" "1" "$(grep -E '^[0-9]+ ' <<< "$out" | cut -d' ' -f1)"
 rs --bogus >/dev/null; expect "rocm-smi refuses an unknown flag" "2" "$?"
 rs --showmeminfo bogus >/dev/null; expect "rocm-smi refuses an unknown memory type" "2" "$?"
+# The forms Pantheon runs on an AMD machine, exactly as it runs them. Each used
+# to be refused, which left it with no AMD telemetry, an empty GPU list and no
+# RAS data.
+rs -v -P -t -c -f --json >/dev/null; expect "Pantheon's AMD telemetry poll is accepted" "0" "$?"
+rs --showproductname --showmeminfo vram --showmaxpower --showserial --showuniqueid --showmemvendor \
+  --json >/dev/null
+expect "Pantheon's AMD inventory query is accepted" "0" "$?"
+rs --showrasinfo --json >/dev/null; expect "rocm-smi --showrasinfo is accepted" "0" "$?"
+rs --showrasinfo bogus >/dev/null; expect "rocm-smi refuses an unknown RAS block" "2" "$?"
+if command -v python3 >/dev/null; then
+  rsj() { "${amd[@]}" "$build/bin/rocm-smi" "$@" 2>/dev/null; }
+  inv='import json,sys; c=json.load(sys.stdin)["card0"]
+print(c["Max Graphics Package Power (W)"], c["Unique ID"][:2], c["GPU memory vendor"])'
+  expect "the inventory carries power cap, unique ID and memory vendor" "750.0 0x unknown" \
+    "$(rsj --showproductname --showmaxpower --showuniqueid --showmemvendor --json | python3 -c "$inv" 2>&1)"
+  ras='import json,sys; c=json.load(sys.stdin)["card0"]
+print(c["UMC RAS status"], c["UMC correctable errors"], c["UMC uncorrectable errors"])'
+  expect "RAS info reports ECC on and no errors" "ENABLED 0 0" "$(rsj --showrasinfo --json | python3 -c "$ras" 2>&1)"
+  tmp='import json,sys; c=json.load(sys.stdin)["card0"]
+print(" ".join(sorted(k.split("Sensor ")[1].split(")")[0] for k in c if k.startswith("Temperature"))))'
+  expect "edge, junction and memory sensors are reported" "edge junction memory" \
+    "$(rsj -t --json | python3 -c "$tmp" 2>&1)"
+fi
 if command -v python3 >/dev/null; then
   check='import json, sys; d = json.load(sys.stdin); print(sorted(d), bool(d["card1"]["Card Series"]), "VRAM Total Memory (B)" in d["card0"])'
   expect "rocm-smi --json parses" "['card0', 'card1'] True True" \

@@ -35,3 +35,6 @@ telemetry:
   temperature_max_c: 95
   pci_vendor_id: 4318          # 0x10DE
   pci_device_id: 9476          # 0x2504
+  ecc: false                   # GeForce: no ECC
+  memory: gddr                 # no ECC, so nothing is retired
+  pcie_link: "Gen4 x16"        # most common link on real cards (275 of 335 runs in the benchmark database)

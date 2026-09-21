@@ -45,3 +45,7 @@ telemetry:
   temperature_max_c: 90
   pci_vendor_id: 4318          # 0x10DE NVIDIA
   pci_device_id: 10497        # 0x2901 [B200] -- not in the local pci.ids; public listing
+  ecc: true                    # supported and on by default (NVIDIA datasheet)
+  memory: hbm                  # rows are remapped on failure
+  memory_temperature: true     # reported on every real run in the benchmark database
+  pcie_link: "Gen5 x16"        # most common link on real cards (30 runs in the benchmark database)

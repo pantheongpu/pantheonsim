@@ -102,8 +102,39 @@ util, period = ctypes.c_uint(), ctypes.c_uint()
 check("encoder utilization exists and says NOT_SUPPORTED",
       lib.nvmlDeviceGetEncoderUtilization(ctypes.c_void_p(h1), ctypes.byref(util), ctypes.byref(period)) == NOT_SUPPORTED)
 reasons = ctypes.c_ulonglong(99)
-check("nothing throttles", lib.nvmlDeviceGetCurrentClocksThrottleReasons(ctypes.c_void_p(h1), ctypes.byref(reasons))
-      == SUCCESS and reasons.value == 0, reasons.value)
+check("an idle card reports only the idle reason, as a real one does",
+      lib.nvmlDeviceGetCurrentClocksThrottleReasons(ctypes.c_void_p(h1), ctypes.byref(reasons))
+      == SUCCESS and reasons.value == 1, reasons.value)
+
+# Reliability and link, from the T4 profile: ECC on, the Gen3 x8 link clouds
+# attach it at, PCIe error counters answered (a real RTX 3060 answers them
+# too), no memory sensor.
+cur, pend = ctypes.c_int(-1), ctypes.c_int(-1)
+rc = lib.nvmlDeviceGetEccMode(ctypes.c_void_p(h1), ctypes.byref(cur), ctypes.byref(pend))
+check("ECC is on", rc == SUCCESS and (cur.value, pend.value) == (1, 1), (rc, cur.value, pend.value))
+errors = ctypes.c_ulonglong(99)
+rc = lib.nvmlDeviceGetTotalEccErrors(ctypes.c_void_p(h1), 1, 0, ctypes.byref(errors))
+check("no ECC errors", rc == SUCCESS and errors.value == 0, (rc, errors.value))
+gen, width = ctypes.c_uint(), ctypes.c_uint()
+rc_g = lib.nvmlDeviceGetCurrPcieLinkGeneration(ctypes.c_void_p(h1), ctypes.byref(gen))
+rc_w = lib.nvmlDeviceGetCurrPcieLinkWidth(ctypes.c_void_p(h1), ctypes.byref(width))
+check("PCIe link is Gen3 x8", (rc_g, rc_w, gen.value, width.value) == (SUCCESS, SUCCESS, 3, 8),
+      (rc_g, rc_w, gen.value, width.value))
+
+
+class FieldValue(ctypes.Structure):
+    _fields_ = [("fieldId", ctypes.c_uint), ("scopeId", ctypes.c_uint), ("timestamp", ctypes.c_longlong),
+                ("latencyUsec", ctypes.c_longlong), ("valueType", ctypes.c_int), ("nvmlReturn", ctypes.c_int),
+                ("value", ctypes.c_ulonglong)]
+
+
+fields = (FieldValue * 3)()
+fields[0].fieldId, fields[1].fieldId, fields[2].fieldId = 94, 180, 82  # replay, fatal, memory temp
+rc = lib.nvmlDeviceGetFieldValues(ctypes.c_void_p(h1), 3, fields)
+check("PCIe replay and fatal-error counters answer zero",
+      rc == SUCCESS and [(f.nvmlReturn, f.value) for f in fields[:2]] == [(SUCCESS, 0), (SUCCESS, 0)],
+      (rc, [(f.nvmlReturn, f.value) for f in fields[:2]]))
+check("no memory temperature on a T4", fields[2].nvmlReturn == NOT_SUPPORTED, fields[2].nvmlReturn)
 
 cuda = ctypes.c_int()
 lib.nvmlSystemGetCudaDriverVersion_v2(ctypes.byref(cuda))

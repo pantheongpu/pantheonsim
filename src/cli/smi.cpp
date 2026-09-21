@@ -141,11 +141,12 @@ void print_gpu_table(const vgpu::telemetry::Shared& s, const std::vector<uint32_
     char power[32];
     std::snprintf(power, sizeof power, "%uW / %4uW", d.power_mw / 1000, d.power_limit_mw / 1000);
 
-    // ECC and MIG are "N/A" because the device profiles carry no ECC or MIG
-    // state to report. A number here would be invented, and this table is
-    // exactly where an invented number would be believed.
+    // The uncorrected-ECC count: 0 on a card that ships with ECC, since nothing
+    // has faulted in simulated memory, and N/A on one without it -- the same
+    // answers the query fields give. MIG, on the line below, is N/A because no
+    // profile carries MIG state.
     std::printf("|%4u  %-30.30s%3s  |   %-16.16s %3s |%21s |\n", i, d.name, "On", d.bus_id, "Off",
-                "N/A");
+                d.ecc_enabled ? "0" : "N/A");
     std::printf("|%3u%%%5uC%6s%24s |%8uMiB /%7uMiB |%7u%%%13s |\n", d.fan_percent, d.temperature_c,
                 perf_state_name(d.perf_state), power, mib(d.vram_used_bytes),
                 mib(d.vram_total_bytes), d.utilization_gpu, "Default");
@@ -245,6 +246,105 @@ const QueryField kGpuFields[] = {
     // callers that already use them keep working.
     {"clocks.sm", "MHz"}, {"clocks.current.sm", "MHz"}, {"clocks.max.sm", "MHz"},
     {"clocks_throttle_reasons.active", nullptr}, {"clocks_event_reasons.active", nullptr},
+    // Reliability, link and clock-event fields, as nvidia-smi 595 lists them in
+    // --help-query-gpu, with the retired_pages.sbe/.dbe aliases it also accepts.
+    // Pantheon's RAS snapshot asks for most of them in one query, and one name
+    // missing here failed the whole query.
+    {"ecc.mode.pending", nullptr},
+    {"ecc.errors.corrected.volatile.device_memory", nullptr},
+    {"ecc.errors.corrected.volatile.dram", nullptr},
+    {"ecc.errors.corrected.volatile.register_file", nullptr},
+    {"ecc.errors.corrected.volatile.l1_cache", nullptr},
+    {"ecc.errors.corrected.volatile.l2_cache", nullptr},
+    {"ecc.errors.corrected.volatile.texture_memory", nullptr},
+    {"ecc.errors.corrected.volatile.cbu", nullptr},
+    {"ecc.errors.corrected.volatile.sram", nullptr},
+    {"ecc.errors.corrected.volatile.total", nullptr},
+    {"ecc.errors.corrected.aggregate.device_memory", nullptr},
+    {"ecc.errors.corrected.aggregate.dram", nullptr},
+    {"ecc.errors.corrected.aggregate.register_file", nullptr},
+    {"ecc.errors.corrected.aggregate.l1_cache", nullptr},
+    {"ecc.errors.corrected.aggregate.l2_cache", nullptr},
+    {"ecc.errors.corrected.aggregate.texture_memory", nullptr},
+    {"ecc.errors.corrected.aggregate.cbu", nullptr},
+    {"ecc.errors.corrected.aggregate.sram", nullptr},
+    {"ecc.errors.corrected.aggregate.total", nullptr},
+    {"ecc.errors.uncorrected.volatile.device_memory", nullptr},
+    {"ecc.errors.uncorrected.volatile.dram", nullptr},
+    {"ecc.errors.uncorrected.volatile.register_file", nullptr},
+    {"ecc.errors.uncorrected.volatile.l1_cache", nullptr},
+    {"ecc.errors.uncorrected.volatile.l2_cache", nullptr},
+    {"ecc.errors.uncorrected.volatile.texture_memory", nullptr},
+    {"ecc.errors.uncorrected.volatile.cbu", nullptr},
+    {"ecc.errors.uncorrected.volatile.sram", nullptr},
+    {"ecc.errors.uncorrected.volatile.total", nullptr},
+    {"ecc.errors.uncorrected.aggregate.device_memory", nullptr},
+    {"ecc.errors.uncorrected.aggregate.dram", nullptr},
+    {"ecc.errors.uncorrected.aggregate.register_file", nullptr},
+    {"ecc.errors.uncorrected.aggregate.l1_cache", nullptr},
+    {"ecc.errors.uncorrected.aggregate.l2_cache", nullptr},
+    {"ecc.errors.uncorrected.aggregate.texture_memory", nullptr},
+    {"ecc.errors.uncorrected.aggregate.cbu", nullptr},
+    {"ecc.errors.uncorrected.aggregate.sram", nullptr},
+    {"ecc.errors.uncorrected.aggregate.total", nullptr},
+    {"ecc.errors.uncorrected.volatile.sram.parity", nullptr},
+    {"ecc.errors.uncorrected.volatile.sram.secded", nullptr},
+    {"ecc.errors.uncorrected.aggregate.sram.parity", nullptr},
+    {"ecc.errors.uncorrected.aggregate.sram.secded", nullptr},
+    {"ecc.errors.uncorrected.aggregate.sram.thresholdExceeded", nullptr},
+    {"ecc.errors.uncorrected.aggregate.sram.l2", nullptr},
+    {"ecc.errors.uncorrected.aggregate.sram.sm", nullptr},
+    {"ecc.errors.uncorrected.aggregate.sram.mcu", nullptr},
+    {"ecc.errors.uncorrected.aggregate.sram.pcie", nullptr},
+    {"ecc.errors.uncorrected.aggregate.sram.other", nullptr},
+    {"retired_pages.single_bit_ecc.count", nullptr},
+    {"retired_pages.sbe", nullptr},
+    {"retired_pages.double_bit.count", nullptr},
+    {"retired_pages.dbe", nullptr},
+    {"retired_pages.pending", nullptr},
+    {"remapped_rows.correctable", nullptr},
+    {"remapped_rows.correctable_inactive", nullptr},
+    {"remapped_rows.uncorrectable", nullptr},
+    {"remapped_rows.uncorrectable_inactive", nullptr},
+    {"remapped_rows.pending", nullptr},
+    {"remapped_rows.failure", nullptr},
+    {"remapped_rows.histogram.max", nullptr},
+    {"remapped_rows.histogram.high", nullptr},
+    {"remapped_rows.histogram.partial", nullptr},
+    {"remapped_rows.histogram.low", nullptr},
+    {"remapped_rows.histogram.none", nullptr},
+    {"temperature.gpu.tlimit", nullptr},
+    {"temperature.memory", nullptr},
+    {"pcie.link.gen.current", nullptr},
+    {"pcie.link.gen.gpucurrent", nullptr},
+    {"pcie.link.gen.max", nullptr},
+    {"pcie.link.gen.gpumax", nullptr},
+    {"pcie.link.gen.hostmax", nullptr},
+    {"pcie.link.width.current", nullptr},
+    {"pcie.link.width.max", nullptr},
+    {"clocks_event_reasons.supported", nullptr},
+    {"clocks_event_reasons.gpu_idle", nullptr},
+    {"clocks_event_reasons.applications_clocks_setting", nullptr},
+    {"clocks_event_reasons.sw_power_cap", nullptr},
+    {"clocks_event_reasons.hw_slowdown", nullptr},
+    {"clocks_event_reasons.hw_thermal_slowdown", nullptr},
+    {"clocks_event_reasons.hw_power_brake_slowdown", nullptr},
+    {"clocks_event_reasons.sw_thermal_slowdown", nullptr},
+    {"clocks_event_reasons.sync_boost", nullptr},
+    {"clocks_throttle_reasons.supported", nullptr},
+    {"clocks_throttle_reasons.gpu_idle", nullptr},
+    {"clocks_throttle_reasons.applications_clocks_setting", nullptr},
+    {"clocks_throttle_reasons.sw_power_cap", nullptr},
+    {"clocks_throttle_reasons.hw_slowdown", nullptr},
+    {"clocks_throttle_reasons.hw_thermal_slowdown", nullptr},
+    {"clocks_throttle_reasons.hw_power_brake_slowdown", nullptr},
+    {"clocks_throttle_reasons.sw_thermal_slowdown", nullptr},
+    {"clocks_throttle_reasons.sync_boost", nullptr},
+    {"clocks_event_reasons_counters.sw_power_cap", "us"},
+    {"clocks_event_reasons_counters.sync_boost", "us"},
+    {"clocks_event_reasons_counters.sw_thermal_slowdown", "us"},
+    {"clocks_event_reasons_counters.hw_thermal_slowdown", "us"},
+    {"clocks_event_reasons_counters.hw_power_brake_slowdown", "us"},
 };
 // The same for --query-compute-apps (`nvidia-smi --help-query-compute-apps`).
 const QueryField kAppFields[] = {
@@ -303,10 +403,44 @@ std::string query_field(const vgpu::telemetry::DeviceSample& d, uint32_t index,
     return buf;
   }
   // The table's "On" and "Default" columns, in the words the query form uses;
-  // ECC and MIG are N/A there too, since no profile carries either.
+  // MIG is N/A there too, since no profile carries it.
   if (field == "persistence_mode") return "Enabled";
   if (field == "compute_mode") return "Default";
-  if (field == "ecc.mode.current" || field == "mig.mode.current") return "[N/A]";
+  if (field == "mig.mode.current") return "[N/A]";
+  // ECC. A card that ships with it reports it on, with every counter at zero:
+  // nothing has faulted in simulated memory. One without it answers [N/A], as
+  // a GeForce card does. The SRAM breakdown and its threshold flag answer on
+  // every card -- a real RTX 3060 reports 0 and "No" -- and they are what makes
+  // Pantheon's RAS check find a supported source on a card without ECC.
+  if (field == "ecc.mode.current" || field == "ecc.mode.pending")
+    return d.ecc_enabled ? "Enabled" : "[N/A]";
+  if (field.rfind("ecc.errors.", 0) == 0) {
+    if (field.find(".sram.") != std::string::npos)
+      return field.size() > 17 && field.compare(field.size() - 17, 17, "thresholdExceeded") == 0
+                 ? "No"
+                 : "0";
+    return d.ecc_enabled ? "0" : "[N/A]";
+  }
+  // GDDR cards with ECC retire pages; HBM cards remap rows. The bank-availability
+  // histogram needs a per-card bank count that no profile records yet.
+  if (field.rfind("retired_pages.", 0) == 0) {
+    if (d.memory_retirement != 1) return "[N/A]";
+    return field == "retired_pages.pending" ? "No" : "0";
+  }
+  if (field.rfind("remapped_rows.", 0) == 0) {
+    if (d.memory_retirement != 2 || field.rfind("remapped_rows.histogram.", 0) == 0) return "[N/A]";
+    return field == "remapped_rows.pending" || field == "remapped_rows.failure" ? "No" : "0";
+  }
+  // A memory sensor only where real cards of the model report one. The real
+  // driver prints this field's absence as N/A, without the brackets.
+  if (field == "temperature.memory")
+    return d.has_memory_temperature
+               ? std::to_string(d.temperature_mem_c ? d.temperature_mem_c : d.temperature_c)
+               : "N/A";
+  if (field.rfind("pcie.link.gen.", 0) == 0)
+    return d.pcie_gen ? std::to_string(d.pcie_gen) : "[N/A]";
+  if (field.rfind("pcie.link.width.", 0) == 0)
+    return d.pcie_width ? std::to_string(d.pcie_width) : "[N/A]";
   if (field == "count") return std::to_string(s.device_count);
   if (field == "name" || field == "gpu_name") return d.name;
   if (field == "uuid" || field == "gpu_uuid") return d.uuid;
@@ -348,9 +482,19 @@ std::string query_field(const vgpu::telemetry::DeviceSample& d, uint32_t index,
   if (field == "clocks.max.memory" || field == "clocks.max.mem")
     return num(d.mem_clock_max_mhz, "MHz");
   if (field == "fan.speed") return num(d.fan_percent, "%");
-  // Nothing throttles a simulated clock, so the honest bitmask is empty.
+  // Clock-event reasons, in the forms a real driver prints. Nothing slows a
+  // simulated clock, so the one reason that can be active is the one a real
+  // idle card reports: GPU idle, bit 0. The supported mask is an RTX 3060's.
+  const bool idle = d.utilization_gpu == 0;
   if (field == "clocks_throttle_reasons.active" || field == "clocks_event_reasons.active")
-    return "0x0000000000000000";
+    return idle ? "0x0000000000000001" : "0x0000000000000000";
+  if (field == "clocks_throttle_reasons.supported" || field == "clocks_event_reasons.supported")
+    return "0x00000000000001FF";
+  if (field.rfind("clocks_event_reasons_counters.", 0) == 0) return num(0, "us");
+  if (field.rfind("clocks_event_reasons.", 0) == 0 || field.rfind("clocks_throttle_reasons.", 0) == 0) {
+    const bool gpu_idle = field.size() > 9 && field.compare(field.size() - 9, 9, ".gpu_idle") == 0;
+    return gpu_idle && idle ? "Active" : "Not Active";
+  }
   if (field == "pstate") { std::snprintf(buf, sizeof buf, "P%u", d.perf_state); return buf; }
   return "[N/A]";
 }
@@ -511,15 +655,21 @@ void print_verbose(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>
       std::printf("        %-47s: %u %%\n", "Memory", d.utilization_mem);
     }
     if (want(kSecEcc)) {
-      // No profile carries ECC state, so both are N/A, as the table's ECC
-      // column already says. A mode here would be a claim nothing backs.
+      // The profile says whether the card ships with ECC on; the table's ECC
+      // column and the ecc.mode query fields give the same answer.
+      const char* mode = d.ecc_enabled ? "Enabled" : "N/A";
       std::printf("    ECC Mode\n");
-      std::printf("        %-47s: %s\n", "Current", "N/A");
-      std::printf("        %-47s: %s\n", "Pending", "N/A");
+      std::printf("        %-47s: %s\n", "Current", mode);
+      std::printf("        %-47s: %s\n", "Pending", mode);
     }
     if (want(kSecTemperature)) {
       std::printf("    Temperature\n");
       std::printf("        %-47s: %u C\n", "GPU Current Temp", d.temperature_c);
+      if (d.has_memory_temperature)
+        std::printf("        %-47s: %u C\n", "Memory Current Temp",
+                    d.temperature_mem_c ? d.temperature_mem_c : d.temperature_c);
+      else
+        std::printf("        %-47s: %s\n", "Memory Current Temp", "N/A");
     }
     if (want(kSecPower)) {
       std::printf("    Power Readings\n");
@@ -972,7 +1122,8 @@ void print_rocm_usage(FILE* to) {
       to,
       "usage: rocm-smi [-h] [--version] [-d DEVICE [DEVICE ...]] [-a] [-i]\n"
       "                [--showproductname] [--showmeminfo TYPE [TYPE ...]] [-t] [-P] [-u]\n"
-      "                [--json] [--csv]\n"
+      "                [-v] [-c] [-f] [--showmaxpower] [--showserial] [--showuniqueid]\n"
+      "                [--showmemvendor] [--showrasinfo [BLOCK ...]] [--json] [--csv]\n"
       "\n"
       "VirtualGPU's drop-in rocm-smi. With no option it prints the concise table.\n"
       "\n"
@@ -984,6 +1135,14 @@ void print_rocm_usage(FILE* to) {
       "  -t, --showtemp            temperature\n"
       "  -P, --showpower           power draw\n"
       "  -u, --showuse             GPU use\n"
+      "  -v, --showvbios           VBIOS version (none is modelled: N/A)\n"
+      "  -c, --showclocks          current sclk and mclk\n"
+      "  -f, --showfan             fan speed (N/A: Instinct cards are passively cooled)\n"
+      "      --showmaxpower        power cap\n"
+      "      --showserial          serial number (N/A)\n"
+      "      --showuniqueid        unique ID, stable per device\n"
+      "      --showmemvendor       memory vendor (unknown: no profile records it)\n"
+      "      --showrasinfo [BLOCK] ECC state and error counts per RAS block\n"
       "      --json                the selected values as JSON\n"
       "      --csv                 the selected values as CSV\n");
 }
@@ -1027,7 +1186,14 @@ std::string csv_cell(const std::string& v) {
 // ignored them, printing the nvidia-smi table for -a.
 int cmd_rocm_smi(const std::vector<std::string>& args) {
   bool json = false, csv = false, all = false, show_id = false, show_product = false,
-       show_temp = false, show_power = false, show_use = false;
+       show_temp = false, show_power = false, show_use = false, show_vbios = false,
+       show_clocks = false, show_fan = false, show_maxpower = false, show_serial = false,
+       show_uniqueid = false, show_memvendor = false, show_ras = false;
+  // rocm-smi's RAS block names, in the order its table lists them.
+  static const char* const kRasBlocks[] = {"umc", "sdma", "gfx", "mmhub", "athub", "pcie_bif",
+                                           "hdp", "xgmi_wafl", "df", "smn", "sem", "mp0", "mp1",
+                                           "fuse"};
+  std::vector<std::string> ras_blocks;
   std::vector<std::string> mem_types;
   std::vector<long long> want;
   auto error = [](const std::string& msg) {
@@ -1057,6 +1223,25 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
     else if (a == "-t" || a == "--showtemp") show_temp = true;
     else if (a == "-P" || a == "--showpower") show_power = true;
     else if (a == "-u" || a == "--showuse") show_use = true;
+    // The forms Pantheon's AMD telemetry poll and inventory use. Each used to be
+    // refused, which left it with no AMD telemetry and an empty GPU list.
+    else if (a == "-v" || a == "--showvbios") show_vbios = true;
+    else if (a == "-c" || a == "--showclocks") show_clocks = true;
+    else if (a == "-f" || a == "--showfan") show_fan = true;
+    else if (a == "--showmaxpower") show_maxpower = true;
+    else if (a == "--showserial") show_serial = true;
+    else if (a == "--showuniqueid") show_uniqueid = true;
+    else if (a == "--showmemvendor") show_memvendor = true;
+    else if (a == "--showrasinfo") {
+      // An optional list of blocks; none means every block.
+      for (const std::string& b : words(i)) {
+        if (std::find_if(std::begin(kRasBlocks), std::end(kRasBlocks),
+                         [&](const char* k) { return b == k; }) == std::end(kRasBlocks))
+          return error("argument --showrasinfo: invalid choice: '" + b + "'");
+        ras_blocks.push_back(b);
+      }
+      show_ras = true;
+    }
     else if (a == "--json") json = true;
     else if (a == "--csv") csv = true;
     else if (a == "--showmeminfo") {
@@ -1104,7 +1289,8 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
   }
 
   const bool any_show = all || show_id || show_product || show_temp || show_power || show_use ||
-                        !mem_types.empty();
+                        show_vbios || show_clocks || show_fan || show_maxpower || show_serial ||
+                        show_uniqueid || show_memvendor || show_ras || !mem_types.empty();
   if (!any_show && !json && !csv) {
     print_rocm(snap, sel);
     return 0;
@@ -1116,6 +1302,8 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
   }
   if (all) {
     show_id = show_product = show_temp = show_power = show_use = true;
+    show_vbios = show_clocks = show_fan = show_maxpower = show_serial = show_uniqueid =
+        show_memvendor = show_ras = true;
     mem_types = {"vram", "vis_vram", "gtt"};
   }
 
@@ -1171,7 +1359,15 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
     });
   if (show_temp)
     add("Temperature", [&](const Sample& d, Values& v) {
+      // One synthetic die temperature serves as both edge and junction. Memory
+      // is reported only where the profile says real cards have the sensor.
       v.emplace_back("Temperature (Sensor edge) (C)", std::to_string(d.temperature_c) + ".0");
+      v.emplace_back("Temperature (Sensor junction) (C)", std::to_string(d.temperature_c) + ".0");
+      v.emplace_back("Temperature (Sensor memory) (C)",
+                     d.has_memory_temperature
+                         ? std::to_string(d.temperature_mem_c ? d.temperature_mem_c
+                                                              : d.temperature_c) + ".0"
+                         : "N/A");
     });
   if (show_power)
     add("Power Consumption", [&](const Sample& d, Values& v) {
@@ -1182,6 +1378,63 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
   if (show_use)
     add("% time GPU is busy", [&](const Sample& d, Values& v) {
       v.emplace_back("GPU use (%)", std::to_string(d.utilization_gpu));
+    });
+  if (show_vbios)
+    add("VBIOS", [&](const Sample&, Values& v) {
+      // No profile records a VBIOS, so N/A -- the answer NVML gives as well.
+      v.emplace_back("VBIOS version", "N/A");
+    });
+  if (show_clocks)
+    add("Current clock frequencies", [&](const Sample& d, Values& v) {
+      v.emplace_back("mclk clock speed:", "(" + std::to_string(d.mem_clock_mhz) + "Mhz)");
+      v.emplace_back("sclk clock speed:", "(" + std::to_string(d.sm_clock_mhz) + "Mhz)");
+    });
+  if (show_fan)
+    add("Fan speed", [&](const Sample& d, Values& v) {
+      // Instinct accelerators are passively cooled, so there is no fan to read.
+      const std::string pct = is_amd(d) ? "N/A" : std::to_string(d.fan_percent);
+      v.emplace_back("Fan speed (level)", "N/A");
+      v.emplace_back("Fan speed (%)", pct);
+      v.emplace_back("Fan RPM", "N/A");
+    });
+  if (show_maxpower)
+    add("Power Cap", [&](const Sample& d, Values& v) {
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "%.1f", d.power_limit_mw / 1000.0);
+      v.emplace_back("Max Graphics Package Power (W)", buf);
+    });
+  if (show_serial)
+    add("Serial Number", [&](const Sample&, Values& v) { v.emplace_back("Serial Number", "N/A"); });
+  if (show_uniqueid)
+    add("Unique ID", [&](const Sample& d, Values& v) {
+      // Stable per profile and device: derived from the UUID NVML reports.
+      uint64_t h = 1469598103934665603ull;
+      for (const char* c = d.uuid; *c; ++c) h = (h ^ static_cast<unsigned char>(*c)) * 1099511628211ull;
+      char buf[24];
+      std::snprintf(buf, sizeof buf, "0x%016llx", static_cast<unsigned long long>(h));
+      v.emplace_back("Unique ID", buf);
+    });
+  if (show_memvendor)
+    add("GPU memory vendor", [&](const Sample&, Values& v) {
+      // No profile records whose memory a card carries.
+      v.emplace_back("GPU memory vendor", "unknown");
+    });
+  if (show_ras)
+    add("RAS Info", [&](const Sample& d, Values& v) {
+      // Per-block ECC state and error counts: zero on a card with ECC, since
+      // nothing has faulted in simulated memory. The key names follow the
+      // columns of rocm-smi's RAS table and are not yet checked against a
+      // real MI-series card.
+      for (const char* block : kRasBlocks) {
+        if (!ras_blocks.empty() &&
+            std::find(ras_blocks.begin(), ras_blocks.end(), block) == ras_blocks.end())
+          continue;
+        std::string up = block;
+        for (char& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        v.emplace_back(up + " RAS status", d.ecc_enabled ? "ENABLED" : "DISABLED");
+        v.emplace_back(up + " correctable errors", d.ecc_enabled ? "0" : "N/A");
+        v.emplace_back(up + " uncorrectable errors", d.ecc_enabled ? "0" : "N/A");
+      }
     });
 
   if (json) {

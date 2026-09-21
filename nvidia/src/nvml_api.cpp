@@ -17,6 +17,7 @@
 #include <nvml.h>
 
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -488,13 +489,17 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetComputeMode(nvmlDevice_t device, nvmlCompu
   *mode = NVML_COMPUTEMODE_DEFAULT;
   return NVML_SUCCESS;
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetEccMode(nvmlDevice_t, nvmlEnableState_t* current,
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetEccMode(nvmlDevice_t device, nvmlEnableState_t* current,
                                               nvmlEnableState_t* pending) { REQUIRE_INIT();
-  // Virtual memory has no ECC to model; report the feature as absent rather
-  // than claiming a clean ECC state that means nothing here.
-  (void)current;
-  (void)pending;
-  return NVML_ERROR_NOT_SUPPORTED;
+  // On for a card that ships with ECC, which the profile records; absent on
+  // one without it, as on a GeForce card.
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !current || !pending) return NVML_ERROR_INVALID_ARGUMENT;
+  if (!d->ecc_enabled) return NVML_ERROR_NOT_SUPPORTED;
+  *current = *pending = NVML_FEATURE_ENABLED;
+  return NVML_SUCCESS;
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMigMode(nvmlDevice_t, unsigned int*, unsigned int*) { REQUIRE_INIT();
   return NVML_ERROR_NOT_SUPPORTED;
@@ -654,8 +659,11 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCurrentClocksThrottleReasons(nvmlDevice_t 
   REQUIRE_INIT();
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
-  if (!sample(device) || !reasons) return NVML_ERROR_INVALID_ARGUMENT;
-  *reasons = 0;
+  const auto* d = sample(device);
+  if (!d || !reasons) return NVML_ERROR_INVALID_ARGUMENT;
+  // Nothing slows a simulated clock. The one reason a real idle card reports
+  // is GPU idle (bit 0), so that is what an idle device reports here too.
+  *reasons = d->utilization_gpu == 0 ? 0x1ull : 0;
   return NVML_SUCCESS;
 }
 
@@ -710,21 +718,40 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDecoderUtilization(nvmlDevice_t, unsigned 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPcieThroughput(nvmlDevice_t, nvmlPcieUtilCounter_t, unsigned int*) {
   REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCurrPcieLinkGeneration(nvmlDevice_t, unsigned int*) {
-  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+// The PCIe link the profile records: the one real cards of the model most often
+// run at. A simulated link does not retrain, so current and maximum agree.
+static nvmlReturn_t pcie_link(nvmlDevice_t device, unsigned int* out, bool generation) {
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !out) return NVML_ERROR_INVALID_ARGUMENT;
+  const unsigned v = generation ? d->pcie_gen : d->pcie_width;
+  if (!v) return NVML_ERROR_NOT_SUPPORTED;
+  *out = v;
+  return NVML_SUCCESS;
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMaxPcieLinkGeneration(nvmlDevice_t, unsigned int*) {
-  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCurrPcieLinkGeneration(nvmlDevice_t device, unsigned int* gen) {
+  REQUIRE_INIT(); return pcie_link(device, gen, true);
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCurrPcieLinkWidth(nvmlDevice_t, unsigned int*) {
-  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMaxPcieLinkGeneration(nvmlDevice_t device, unsigned int* gen) {
+  REQUIRE_INIT(); return pcie_link(device, gen, true);
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMaxPcieLinkWidth(nvmlDevice_t, unsigned int*) {
-  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCurrPcieLinkWidth(nvmlDevice_t device, unsigned int* width) {
+  REQUIRE_INIT(); return pcie_link(device, width, false);
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTotalEccErrors(nvmlDevice_t, nvmlMemoryErrorType_t,
-                                                     nvmlEccCounterType_t, unsigned long long*) {
-  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;   // matches nvmlDeviceGetEccMode
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMaxPcieLinkWidth(nvmlDevice_t device, unsigned int* width) {
+  REQUIRE_INIT(); return pcie_link(device, width, false);
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTotalEccErrors(nvmlDevice_t device, nvmlMemoryErrorType_t,
+                                                     nvmlEccCounterType_t, unsigned long long* count) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !count) return NVML_ERROR_INVALID_ARGUMENT;
+  if (!d->ecc_enabled) return NVML_ERROR_NOT_SUPPORTED;   // matches nvmlDeviceGetEccMode
+  *count = 0;  // nothing has faulted in simulated memory
+  return NVML_SUCCESS;
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDriverModel(nvmlDevice_t, nvmlDriverModel_t*, nvmlDriverModel_t*) {
   REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;   // a Windows-only query
@@ -752,7 +779,45 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFieldValues(nvmlDevice_t device, int count
   unsigned int idx;
   if (!index_of(device, &idx) || count < 0 || (count > 0 && !values))
     return NVML_ERROR_INVALID_ARGUMENT;
-  for (int i = 0; i < count; ++i) values[i].nvmlReturn = NVML_ERROR_NOT_SUPPORTED;
+  refresh();
+  const auto* d = sample(device);
+  // NVML's documented field ids, by number: they are ABI, and the oldest
+  // toolkit headers this builds against predate some of the names.
+  enum : unsigned {
+    kMemoryTemp = 82, kPcieReplay = 94, kPcieReplayRollover = 95, kPcieL0ToRecovery = 169,
+    kPcieCorrectable = 173, kPcieNaksReceived = 174, kPcieBadTlp = 176, kPcieNaksSent = 177,
+    kPcieBadDllp = 178, kPcieNonFatal = 179, kPcieFatal = 180, kPcieLcrc = 182, kPcieLane = 183,
+  };
+  const long long now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::system_clock::now().time_since_epoch()).count();
+  for (int i = 0; i < count; ++i) {
+    nvmlFieldValue_t& v = values[i];
+    v.nvmlReturn = NVML_ERROR_NOT_SUPPORTED;
+    v.timestamp = now_us;
+    v.latencyUsec = 0;
+    switch (v.fieldId) {
+      // PCIe transport error counters. A real card answers these whatever its
+      // class -- an RTX 3060 does -- and a simulated link has had no transport
+      // errors, so they are zero rather than unsupported.
+      case kPcieReplay: case kPcieReplayRollover: case kPcieL0ToRecovery:
+      case kPcieCorrectable: case kPcieNaksReceived: case kPcieBadTlp: case kPcieNaksSent:
+      case kPcieBadDllp: case kPcieNonFatal: case kPcieFatal: case kPcieLcrc: case kPcieLane:
+        v.valueType = NVML_VALUE_TYPE_UNSIGNED_LONG_LONG;
+        v.value.ullVal = 0;
+        v.nvmlReturn = NVML_SUCCESS;
+        break;
+      // The memory sensor, only where real cards of the model report one.
+      case kMemoryTemp:
+        if (d && d->has_memory_temperature) {
+          v.valueType = NVML_VALUE_TYPE_UNSIGNED_INT;
+          v.value.uiVal = d->temperature_mem_c ? d->temperature_mem_c : d->temperature_c;
+          v.nvmlReturn = NVML_SUCCESS;
+        }
+        break;
+      default:
+        break;
+    }
+  }
   return NVML_SUCCESS;
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses_v2(nvmlDevice_t, unsigned int* n,
