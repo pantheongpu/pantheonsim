@@ -133,6 +133,35 @@ jobs:
         env:
           VGPU_OLLAMA_PULL: '1'
         run: ctest --test-dir build --output-on-failure -R '^e2e_ollama$'
+  amd-code-objects:
+    name: AMD code objects and CDNA decoding
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # clang builds the gfx942 code objects these tests read, and
+      # llvm-objdump prints the instructions the decoder is checked against.
+      # No ROCm is needed for either. They are installed here rather than left
+      # to the image so the checks cannot quietly skip.
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build clang llvm
+          clang --print-targets | grep amdgcn
+          llvm-objdump --version | head -2
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)" --target test_amd_codeobject test_amd_gcn
+
+      - name: Read code objects, decode CDNA, and check it against the assembler
+        run: |
+          ctest --test-dir build --output-on-failure -R "test_amd_codeobject|test_amd_gcn|amd_gcn_disasm" | tee out
+          # A skip here would hide a decoder that no longer matches the
+          # assembler, which is the whole point of this job.
+          grep -q "amd_gcn_disasm .* Passed" out
 
   sanitizers:
     name: ASan + UBSan
