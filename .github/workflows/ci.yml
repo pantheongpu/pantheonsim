@@ -107,9 +107,13 @@ jobs:
           wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i /tmp/keyring.deb
           sudo apt-get update -qq
+          # Every library the simulator stands in for: each shim is compiled
+          # against that library's own header, so a missing one fails the build
+          # (libcurand-dev did).
           sudo apt-get install -y -qq --no-install-recommends \
             cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
-            cuda-nvrtc-dev-13-0 libcublas-dev-13-0
+            cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
+            libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
           echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
           echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/ollama"
