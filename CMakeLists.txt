@@ -75,6 +75,7 @@ add_library(vgpu STATIC
   src/core/yamlish.cpp
   src/core/shared_state.cpp
   src/core/regs.cpp
+  src/core/machine.cpp
   src/core/profile.cpp
   src/core/registry.cpp
   src/core/memory.cpp
@@ -451,7 +452,7 @@ endif()
 
 # CLI
 add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/test.cpp
-               src/cli/fault.cpp src/cli/machine.cpp src/cli/amdsmi.cpp src/cli/regs.cpp)
+               src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
 # Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /
@@ -506,6 +507,20 @@ target_link_libraries(vector_add_driver PRIVATE vgpucuda)
 target_include_directories(vector_add_driver PRIVATE include)
 add_test(NAME c_harness_vector_add COMMAND vector_add_driver)
 set_tests_properties(c_harness_vector_add PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100")
+
+# The register C API for bring-up software (vgpu_regs.h), and a plain C
+# program against it.
+add_library(vgpuregs SHARED src/capi/regs_capi.cpp)
+target_link_libraries(vgpuregs PRIVATE vgpu)
+# Only the C API is exported: the engine inside stays the library's own.
+target_link_options(vgpuregs PRIVATE -Wl,--exclude-libs,ALL)
+set_target_properties(vgpuregs PROPERTIES SOVERSION 1 VERSION 1.0)
+add_executable(regs_capi tests/c_harness/regs_capi.c)
+target_include_directories(regs_capi PRIVATE include)
+target_link_libraries(regs_capi PRIVATE vgpuregs)
+add_test(NAME c_harness_regs COMMAND regs_capi)
+set_tests_properties(c_harness_regs PROPERTIES ENVIRONMENT
+  "VGPU_GPU=amd/mi300x;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/test-state/regs-capi;VGPU_STATE_DIR=${CMAKE_BINARY_DIR}/test-state/regs-capi")
 
 # nvidia-smi's table is scraped positionally by real tooling, so its geometry
 # is pinned against a physical driver's output rather than left to drift.

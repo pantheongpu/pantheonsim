@@ -113,6 +113,32 @@ learns its bases at boot from its IP discovery table; the database uses
 Aldebaran's (MI200's), the same GFX9 family. That, the engine status values and
 the firmware version are a model until checked on a card.
 
+## From C
+
+Bring-up software reaches the same registers through `vgpu_regs.h` and
+`libvgpuregs.so` (in the build directory), with the same semantics and the same
+access log as `vgpu regs`:
+
+```c
+#include "vgpu_regs.h"
+
+vgpu_regs* mmio;
+uint32_t off, resp;
+vgpu_regs_open(0, "mmio", &mmio);                     /* or "config" */
+vgpu_regs_find("mmio", "smu_message", &off, NULL);
+vgpu_regs_write(mmio, off, 4, 0x2);                   /* GetSmuVersion */
+vgpu_regs_find("mmio", "smu_response", &off, NULL);
+vgpu_regs_read(mmio, off, 4, &resp);                  /* 1: answered */
+vgpu_regs_close(mmio);
+```
+
+Each call returns `VGPU_REGS_OK` or a negative code -- `EINVAL` for a bad
+access, `ENODEV` for no such GPU, `ENOTSUP` for a space the GPU does not have,
+`ENOENT` for an unknown name -- and `vgpu_regs_last_error()` says what went
+wrong. A read reflects the device at the moment of the read, so polling engine
+status sees it change. Build against it with `-Iinclude -Lbuild -lvgpuregs`;
+`tests/c_harness/regs_capi.c` is a complete example.
+
 ## Who reads the registers
 
 NVML and nvidia-smi report the PCIe link by reading it from the registers --

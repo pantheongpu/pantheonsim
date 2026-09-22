@@ -44,7 +44,7 @@ Working today, all CPU-only:
 | Vendor libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP and nvJPEG under their real sonames, each differential-tested against NVIDIA's own library on a physical GPU — see [nvidia/docs/libraries.md](nvidia/docs/libraries.md) |
 | Python JIT | Numba runs unmodified (its PTX is assembled through the driver's JIT link API); Triton runs with a one-line hook that stops its pipeline at PTX — see [nvidia/docs/jit.md](nvidia/docs/jit.md) |
 | Discovery | live telemetry + NVML; drop-in `nvidia-smi`, `rocm-smi`, `amd-smi`, `rocm_agent_enumerator`, and `lspci` output — see [docs/telemetry.md](docs/telemetry.md) |
-| Registers | PCI configuration space from a register database: header, PM, MSI, PCI Express and AER, live link and error state, BAR sizing; `vgpu regs list/read/write/dump/log` with an access log — see [docs/registers.md](docs/registers.md) |
+| Registers | PCI configuration space from a register database: header, PM, MSI, PCI Express and AER, live link and error state, BAR sizing; `vgpu regs list/read/write/dump/log` with an access log; AMD MMIO (engine status, the SMU mailbox) from the amdgpu headers; a C API, `vgpu_regs.h` — see [docs/registers.md](docs/registers.md) |
 | NVENC | `libnvidia-encode.so.1` with a deterministic content-derived encoder, so video-encode SDC tests run |
 | Proof | an nvcc-compiled CUDA program **and** the unmodified pantheon stress kernels run on the CPU; `memory_read` differential-matches a physical RTX 3060 (incl. fault injection + device printf) |
 
@@ -267,5 +267,8 @@ which real GPUs cannot give you cheaply.
 
 Apache-2.0 (see LICENSE). The `vgpu_cuda.h` header is a clean-room subset
 written from NVIDIA's public driver API documentation; it contains no NVIDIA
-code. CUDA is a trademark of NVIDIA Corporation; this project is not
-affiliated with or endorsed by NVIDIA or AMD.
+code. The AMD register offsets, fields and SMU message numbers in
+`registers/amd-mmio.yaml` come from the Linux kernel's amdgpu headers, under
+AMD's MIT license (`registers/LICENSES/amdgpu-headers.txt`). CUDA is a
+trademark of NVIDIA Corporation; this project is not affiliated with or
+endorsed by NVIDIA or AMD.
