@@ -268,7 +268,7 @@ which real GPUs cannot give you cheaply.
 Apache-2.0 (see LICENSE). The `vgpu_cuda.h` header is a clean-room subset
 written from NVIDIA's public driver API documentation; it contains no NVIDIA
 code. The AMD register offsets, fields and SMU message numbers in
-`registers/amd-mmio.yaml` come from the Linux kernel's amdgpu headers, under
-AMD's MIT license (`registers/LICENSES/amdgpu-headers.txt`). CUDA is a
+`amd/registers/mmio.yaml` come from the Linux kernel's amdgpu headers, under
+AMD's MIT license (`amd/registers/LICENSES/amdgpu-headers.txt`). CUDA is a
 trademark of NVIDIA Corporation; this project is not affiliated with or
 endorsed by NVIDIA or AMD.

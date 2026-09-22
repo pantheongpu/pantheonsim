@@ -107,10 +107,11 @@ expect "a busy GPU's GRBM_STATUS has GUI_ACTIVE and CP busy set" "yes" \
 # files regenerated fails here.
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 "$vgpu" regs export --out "$tmp/gpus" >/dev/null
-expect "registers/gpus is what \`vgpu regs export\` writes" "" \
-  "$(diff -r "$root/registers/gpus" "$tmp/gpus" 2>&1 | head -5)"
-cp -r "$root/registers/gpus" "$tmp/edited"
-sed -i -E 's/^(  subsystem_id: +\[0x02e, 16, ro, )0x[0-9a-f]+\]/\10x1234]/' "$tmp/edited/amd/mi300x.yaml"
+expect "each vendor's registers/gpus is what \`vgpu regs export\` writes" "" \
+  "$(for v in amd nvidia; do diff -r "$root/$v/registers/gpus" "$tmp/gpus/$v/registers/gpus" 2>&1; done | head -5)"
+expect "and export writes nothing else" "amd nvidia" "$(ls "$tmp/gpus" | paste -sd' ')"
+cp -r "$root/amd/registers/gpus" "$tmp/edited"
+sed -i -E 's/^(  subsystem_id: +\[0x02e, 16, ro, )0x[0-9a-f]+\]/\10x1234]/' "$tmp/edited/mi300x.yaml"
 expect "a value edited in the file is what the GPU reads" "0x1234" \
   "$(VGPU_REGISTERS_DIR="$tmp/edited" VGPU_GPU=amd/mi300x "$vgpu" regs read subsystem_id | head -1 | awk '{print $4}')"
 

@@ -1,5 +1,5 @@
 # MMIO registers of an NVIDIA GPU behind BAR0, as measured on real cards with
-# tools/regprobe (registers/measurements/): the map grows as registers are read
+# tools/regprobe (nvidia/registers/measurements/): the map grows as registers are read
 # and identified. Offsets are byte addresses in BAR0. Only the measured card's
 # own profile has this space: nvidia/rtx3080ti (GA102, driver 595.84).
 #

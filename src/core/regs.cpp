@@ -16,17 +16,38 @@
 #include <optional>
 #include <stdexcept>
 
-#include "vgpu/amd_metrics.hpp"
 #include "vgpu/embedded_config_images.hpp"
 #include "vgpu/embedded_gpu_registers.hpp"
 #include "vgpu/embedded_registers.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/ras.hpp"
+#include "vgpu/regs_vendor.hpp"
 #include "vgpu/shared_state.hpp"
 #include "vgpu/yamlish.hpp"
 
 namespace vgpu::regs {
+
+namespace vendor {
+const Vendor& of(const telemetry::DeviceSample& d) { return std::strcmp(d.vendor, "amd") == 0 ? amd() : nvidia(); }
+const Vendor* owning(Space s) {
+  return s == Space::AmdMmio ? &amd() : s == Space::NvidiaMmio ? &nvidia() : nullptr;
+}
+uint64_t pow2_at_least(uint64_t v) {
+  uint64_t p = 1;
+  while (p < v) p <<= 1;
+  return p;
+}
+Windows windows(const telemetry::DeviceSample& d) {
+  // "00000000:01:00.0": bus 1 is slot 0.
+  const char* colon = std::strchr(d.bus_id, ':');
+  const unsigned bus = colon ? static_cast<unsigned>(std::strtoul(colon + 1, nullptr, 16)) : 1;
+  const uint64_t slot = bus ? bus - 1 : 0;
+  return {slot, 0xE0000000ull + slot * 0x02000000ull, 0x200000000000ull + slot * 0x10000000000ull};
+}
+}  // namespace vendor
+
 namespace {
+using vendor::BarLayout;
 
 // ---- The database ---------------------------------------------------------------
 
@@ -94,9 +115,13 @@ std::vector<Register> load(const char* yaml, const std::string& origin, uint32_t
   return out;
 }
 
-// The database file each space is declared in.
+// The database each space is declared in: PCI configuration space's, shared by
+// every vendor, or the vendor's MMIO database.
 const char* database_name(Space s) {
-  return s == Space::Config ? "pci-config" : s == Space::AmdMmio ? "amd-mmio" : "nvidia-mmio";
+  return s == Space::Config ? "pci-config" : vendor::owning(s)->mmio_database;
+}
+std::string database_origin(Space s) {
+  return s == Space::Config ? "registers/pci-config.yaml" : vendor::owning(s)->mmio_origin;
 }
 
 const char* space_yaml(Space s) {
@@ -113,60 +138,6 @@ uint32_t database_version(Space s) {
   return h | 1u;
 }
 
-// ---- Base address registers -----------------------------------------------------
-
-struct BarLayout {
-  uint64_t size = 0;   // 0: not implemented
-  bool io = false, is64 = false, pref = false;
-  bool high = false;   // the upper half of the 64-bit BAR before it
-  uint64_t base = 0;   // where firmware put it
-};
-
-uint64_t pow2_at_least(uint64_t v) {
-  uint64_t p = 1;
-  while (p < v) p <<= 1;
-  return p;
-}
-
-bool is_amd(const telemetry::DeviceSample& d) { return std::strcmp(d.vendor, "amd") == 0; }
-bool is_geforce(const telemetry::DeviceSample& d) {
-  return std::strstr(d.name, "GeForce") || std::strstr(d.name, "RTX 30");
-}
-
-unsigned bus_number(const telemetry::DeviceSample& d) {
-  // "00000000:01:00.0"
-  const char* colon = std::strchr(d.bus_id, ':');
-  return colon ? static_cast<unsigned>(std::strtoul(colon + 1, nullptr, 16)) : 1;
-}
-
-// NVIDIA: BAR0 16 MiB of registers; BAR1 the framebuffer aperture, 64-bit and
-// prefetchable -- 256 MiB on a GeForce, the framebuffer rounded up to a power
-// of two on data-center cards; BAR3 32 MiB, 64-bit; an I/O BAR on a GeForce.
-// AMD: BAR0 the framebuffer aperture, BAR2 the doorbells, BAR5 the registers.
-// Sizes are a model, not measured per card.
-std::array<BarLayout, 6> bar_layout(const telemetry::DeviceSample& d) {
-  std::array<BarLayout, 6> b{};
-  const uint64_t slot = bus_number(d) ? bus_number(d) - 1 : 0;
-  const uint64_t mmio32 = 0xE0000000ull + slot * 0x02000000ull;
-  const uint64_t mmio64 = 0x200000000000ull + slot * 0x10000000000ull;
-  const uint64_t fb = pow2_at_least(d.vram_total_bytes ? d.vram_total_bytes : (1ull << 28));
-  if (is_amd(d)) {
-    b[0] = {fb, false, true, true, false, mmio64};
-    b[1].high = true;
-    b[2] = {2ull << 20, false, true, true, false, mmio64 + 0x8000000000ull};
-    b[3].high = true;
-    b[5] = {512ull << 10, false, false, false, false, mmio32 + 0x01000000ull};
-  } else {
-    b[0] = {16ull << 20, false, false, false, false, mmio32};
-    b[1] = {is_geforce(d) ? (256ull << 20) : fb, false, true, true, false, mmio64};
-    b[2].high = true;
-    b[3] = {32ull << 20, false, true, true, false, mmio64 + 0x8000000000ull};
-    b[4].high = true;
-    if (is_geforce(d)) b[5] = {128, true, false, false, false, 0x3000ull + slot * 0x1000ull};
-  }
-  return b;
-}
-
 // ---- Shared state ------------------------------------------------------------------
 
 constexpr uint32_t kMagic = 0x56524547;  // "VREG"
@@ -181,7 +152,7 @@ struct State {
   uint64_t base_correctable[32];         // write-1-to-clear: the count when each bit was cleared
   uint64_t base_uncorrectable[32];
   uint64_t base_devsta[4];
-  uint64_t mailbox[4];                   // the SMU's: message, argument, response, response set
+  uint64_t vendor_words[vendor::kStateWords];   // the vendor's device logic (the SMU mailbox, on AMD)
   uint64_t log_seq;
   uint64_t log[kLogEntries][kLogWords];
 };
@@ -263,15 +234,6 @@ uint32_t generic_capability(const std::string& cap) {
   return cap == "pm" ? 0x60 : cap == "msi" ? 0x68 : cap == "pcie" ? 0x78 : cap == "aer" ? 0x100 : 0;
 }
 
-// The captured configuration space a device replays, if its family has one:
-// an Ampere GeForce, the RTX 3080 Ti's (registers/measurements/nvidia-rtx3080ti).
-const embedded::ConfigImage* measured_image(const telemetry::DeviceSample& d) {
-  if (is_amd(d) || !is_geforce(d) || std::strcmp(d.architecture, "ampere") != 0) return nullptr;
-  for (const auto& img : embedded::kConfigImages)
-    if (std::strcmp(img.name, "nvidia-rtx3080ti") == 0) return &img;
-  return nullptr;
-}
-
 // Each capability's header in a configuration space, found as a driver finds
 // it: the standard chain from the capabilities pointer, the extended chain
 // from 0x100. First of each kind wins; a malformed chain ends the walk.
@@ -295,35 +257,7 @@ std::map<std::string, uint32_t> walk_capabilities(const uint8_t* img) {
   return at;
 }
 
-// The SMU mailbox, as the driver drives it: clear the response, write the
-// argument, write the message; the SMU answers in the response register, and
-// in the argument register when the message returns a value.
-void smu_write(State* s, const std::string& backing, uint32_t v) {
-  if (backing == "smu.argument") {
-    __atomic_store_n(&s->mailbox[1], uint64_t{v}, __ATOMIC_RELAXED);
-  } else if (backing == "smu.response") {
-    __atomic_store_n(&s->mailbox[2], uint64_t{v}, __ATOMIC_RELAXED);
-    __atomic_store_n(&s->mailbox[3], uint64_t{1}, __ATOMIC_RELEASE);
-  } else if (backing == "smu.message") {
-    __atomic_store_n(&s->mailbox[0], uint64_t{v}, __ATOMIC_RELAXED);
-    const uint32_t arg = static_cast<uint32_t>(__atomic_load_n(&s->mailbox[1], __ATOMIC_RELAXED));
-    uint32_t reply = arg, result = kSmuResultOk;
-    switch (v) {
-      case kSmuTestMessage: reply = arg + 1; break;
-      // A firmware version in the form the driver prints as 85.111.0; a model.
-      case kSmuGetSmuVersion: reply = 0x00556F00u; break;
-      // The interface version the driver expects (SMU13_0_6_DRIVER_IF_VERSION).
-      case kSmuGetDriverIfVersion: reply = 0x08042024u; break;
-      case kSmuGetMetricsVersion: reply = 0x11u; break;   // SMU_METRICS_TABLE_VERSION
-      default: result = kSmuResultUnknownCmd; break;
-    }
-    __atomic_store_n(&s->mailbox[1], uint64_t{reply}, __ATOMIC_RELAXED);
-    __atomic_store_n(&s->mailbox[2], uint64_t{result}, __ATOMIC_RELAXED);
-    __atomic_store_n(&s->mailbox[3], uint64_t{1}, __ATOMIC_RELEASE);
-  }
-}
-
-// ---- Each GPU model's registers (registers/gpus/) -------------------------------------
+// ---- Each GPU model's registers (<vendor>/registers/gpus/) ----------------------------
 
 Access parse_access(const std::string& a, const std::string& where) {
   return a == "ro" ? Access::Ro : a == "rw" ? Access::Rw : a == "rw1c" ? Access::Rw1c
@@ -378,7 +312,7 @@ const std::vector<GpuRegisters>& gpu_files() {
   std::vector<GpuRegisters> files;
   if (dir.empty()) {
     for (const auto& e : embedded::kGpuRegisters)
-      if (e.profile) files.push_back(load_gpu_file(e.yaml, std::string("registers/gpus/") + e.profile + ".yaml"));
+      if (e.profile) files.push_back(load_gpu_file(e.yaml, gpu_registers_file(e.profile)));
   } else {
     std::error_code ec;
     std::vector<std::string> paths;
@@ -404,6 +338,12 @@ bool fixed_backing(const std::string& backing) { return backing.empty() || backi
 
 }  // namespace
 
+std::string gpu_registers_file(const std::string& profile) {
+  const size_t slash = profile.find('/');
+  if (slash == std::string::npos) return profile + ".yaml";
+  return profile.substr(0, slash) + "/registers/gpus/" + profile.substr(slash + 1) + ".yaml";
+}
+
 const GpuRegisters* gpu_registers(const telemetry::DeviceSample& d) {
   for (const auto& g : gpu_files())
     if (g.device_id == d.pci_device_id >> 16) return &g;
@@ -423,8 +363,7 @@ const char* access_name(Access a) {
 const char* space_name(Space s) { return s == Space::Config ? "config" : "mmio"; }
 
 Space resolve_space(const telemetry::DeviceSample& d, Space s) {
-  if (s == Space::Config) return s;
-  return is_amd(d) ? Space::AmdMmio : Space::NvidiaMmio;
+  return s == Space::Config ? s : vendor::of(d).mmio;
 }
 
 bool parse_space(const std::string& name, Space* out) {
@@ -434,25 +373,18 @@ bool parse_space(const std::string& name, Space* out) {
   return true;
 }
 
-uint32_t space_size(Space s) {
-  return s == Space::Config ? kConfigSize : s == Space::AmdMmio ? 512u << 10 : 16u << 20;
-}
-
-// The NVIDIA cards whose BAR0 has been measured, by PCI device ID.
-bool nvidia_mmio_measured(const telemetry::DeviceSample& d) {
-  return !is_amd(d) && (d.pci_device_id >> 16) == 0x2208;   // RTX 3080 Ti
-}
+uint32_t space_size(Space s) { return s == Space::Config ? kConfigSize : vendor::owning(s)->mmio_size; }
 
 bool has_space(const telemetry::DeviceSample& d, Space s) {
-  s = resolve_space(d, s);
-  return s == Space::Config || (s == Space::AmdMmio && is_amd(d)) ||
-         (s == Space::NvidiaMmio && nvidia_mmio_measured(d));
+  if (s == Space::Config) return true;
+  const vendor::Vendor& v = vendor::of(d);
+  return resolve_space(d, s) == v.mmio && v.has_mmio(d);
 }
 
 const std::vector<Register>& registers(Space space) {
   // Each loaded on first use, so one space's database cannot stop another's.
   const auto loaded = [](Space s) {
-    auto r = load(space_yaml(s), std::string("registers/") + database_name(s) + ".yaml", space_size(s));
+    auto r = load(space_yaml(s), database_origin(s), space_size(s));
     if (r.size() > kMaxRegisters) throw Error::make(Err::Internal, "more than ", kMaxRegisters, " registers");
     return r;
   };
@@ -484,7 +416,7 @@ const Register* find(Space space, const std::string& key) {
 
 struct RegisterSpace::Impl {
   Impl(Space sp, const telemetry::DeviceSample& dev, bool derive)
-      : space(sp), d(dev), derived(derive), bars(bar_layout(dev)) {
+      : space(sp), d(dev), derived(derive), vend(vendor::of(dev)), bars(vend.bars(dev)) {
     if (derived) fresh = std::make_unique<State>();
     else file.emplace(state_path(dev.uuid, sp), true, kMagic, database_version(sp), sizeof(State), "register state");
     // Where each register is on this device: the generic layout's offset, or
@@ -492,7 +424,7 @@ struct RegisterSpace::Impl {
     // register's capability.
     const auto& rs = registers(space);
     at.resize(rs.size());
-    if (space == Space::Config) image_src = measured_image(d);
+    if (space == Space::Config) image_src = vend.captured_config(d);
     std::map<std::string, uint32_t> caps;
     if (image_src) caps = walk_capabilities(image_src->bytes);
     for (size_t i = 0; i < rs.size(); ++i) {
@@ -510,6 +442,7 @@ struct RegisterSpace::Impl {
   Space space;
   telemetry::DeviceSample d;
   bool derived = false;
+  const vendor::Vendor& vend;
   std::optional<SharedState> file;     // the machine's state, shared by every process
   std::unique_ptr<State> fresh;        // or a private power-on state
   std::array<BarLayout, 6> bars;
@@ -564,6 +497,7 @@ struct RegisterSpace::Impl {
   }
 
   State* state() { return derived ? fresh.get() : static_cast<State*>(file->payload()); }
+  vendor::Context context(const Register& r) { return {d, base(r), state()->vendor_words}; }
 
   // A GPU that has fallen off the bus (`vgpu fault lose`) no longer answers:
   // every read completes as all ones, the way a PCIe read nothing claims
@@ -615,26 +549,10 @@ struct RegisterSpace::Impl {
     if ((k == "profile.subsystem_vendor_id" || k == "profile.subsystem_id") && same_card) return base(r);
     if (k == "profile.vendor_id" || k == "profile.subsystem_vendor_id") return vendor;
     if (k == "profile.device_id" || k == "profile.subsystem_id") return device;
-    if (k == "profile.revision") return is_amd(d) ? 0x00 : 0xa1;
-    // As a bound driver leaves it: memory and bus mastering on, INTx off for
-    // MSI, and I/O on where there is an I/O BAR (measured: RTX 3080 Ti, 0x0407).
-    if (k == "profile.command") return is_geforce(d) ? 0x0407 : 0x0406;
-    // A GeForce is function 0 of two, the second its HDMI audio controller
-    // (measured: RTX 3080 Ti, 0x80).
-    if (k == "profile.header_type") return is_geforce(d) ? 0x80 : 0x00;
-    // AMD's Instinct cards are processing accelerators; NVIDIA's data-center
-    // cards 3D controllers; a GeForce a VGA controller.
-    if (k == "profile.class") return is_amd(d) ? 0x120000 : is_geforce(d) ? 0x030000 : 0x030200;
-    // An AMD GPU's NBIO: the device ID and revision strapped, with the
-    // function enabled; and the memory partition modes it supports -- NPS1
-    // and NPS4 on CDNA3 (GC 9.4.3 and 9.4.4, which amdgpu assumes when the
-    // register is not read, gmc_v9_0.c), NPS1 and NPS2 on CDNA4.
-    if (k == "profile.nbio_strap0") return (1u << 28) | device;
-    if (k == "profile.nps_cap") return std::strcmp(d.architecture, "cdna4") == 0 ? 0x3u : 0x9u;
+    // What only the vendor's cards have: its profile values -- revision,
+    // command, header type, class -- and its live device state.
+    if (uint32_t v = 0; vend.backed(k, context(r), &v)) return v;
     if (k.rfind("bar.", 0) == 0) return bar_value(static_cast<uint32_t>(k[4] - '0'));
-    // The VRAM in MiB, as this device has it: VGPU_VRAM_MB changes it for a
-    // run, so it follows the device rather than the model.
-    if (k == "vram.memsize_mb") return static_cast<uint32_t>(d.vram_total_bytes >> 20);
     if (k == "link.capabilities") {
       // Max speed and width, from the profile; on a captured card the rest --
       // ASPM, exit latencies, clock power management -- as the card had it,
@@ -643,33 +561,16 @@ struct RegisterSpace::Impl {
       return (d.pcie_gen_max & 0xF) | ((d.pcie_width_max & 0x3F) << 4) | rest;
     }
     if (k == "link.status") {
-      // Current speed and width, and the slot's reference clock. A GeForce
-      // drops its link to Gen1 while idle and retrains when work arrives
-      // (measured: RTX 3080 Ti, 2.5 GT/s idle of 16 GT/s).
-      const uint32_t gen = is_geforce(d) && d.utilization_gpu == 0 && d.pcie_gen ? 1 : d.pcie_gen;
+      // Current speed and width, as the vendor's link reports it now, and the
+      // slot's reference clock.
+      const uint32_t gen = vend.link_gen(d);
       const uint32_t rest = image_src ? base(r) & ~0x3FFu : 1u << 12;
       return (gen & 0xF) | ((d.pcie_width & 0x3F) << 4) | rest;
     }
     if (k == "link.capabilities2")
       return (image_src ? base(r) & ~0xFEu : 0) | (d.pcie_gen_max ? (((1u << d.pcie_gen_max) - 1) << 1) : 0);
     if (k == "link.control2") return (image_src ? base(r) & ~0xFu : 0) | (d.pcie_gen_max & 0xF);
-    // Engine status: the units a busy GPU has working, and the idle state's
-    // command FIFOs available and DB and CB clean. Values are a model.
-    const bool busy = d.utilization_gpu > 0;
-    if (k == "engine.grbm_status")
-      return busy ? 0xE7D84008u   // GUI active, CP, CB, DB, PA, SC, BCI, SPI, SX, IA, TA busy
-                  : 0x00003028u;  // FIFOs available, DB and CB clean
-    if (k == "engine.grbm_status2") return busy ? 0x73018008u : 0x00000008u;
-    if (k == "engine.cp_stat") return busy ? 0x80000000u : 0u;
-    if (k == "engine.rlc_stat") return busy ? 0x00000005u : 0u;
     State* s = state();
-    if (k == "smu.message") return static_cast<uint32_t>(__atomic_load_n(&s->mailbox[0], __ATOMIC_RELAXED));
-    if (k == "smu.argument") return static_cast<uint32_t>(__atomic_load_n(&s->mailbox[1], __ATOMIC_RELAXED));
-    if (k == "smu.response")
-      // Ready after reset, as the SMU is once the driver has loaded.
-      return __atomic_load_n(&s->mailbox[3], __ATOMIC_ACQUIRE)
-                 ? static_cast<uint32_t>(__atomic_load_n(&s->mailbox[2], __ATOMIC_RELAXED))
-                 : kSmuResultOk;
     if (k == "aer.correctable" || k == "aer.uncorrectable" || k == "devsta") {
       uint32_t v = 0;
       for (uint32_t bit = 0; bit < (k == "devsta" ? 3u : 32u); ++bit) {
@@ -698,9 +599,10 @@ struct RegisterSpace::Impl {
     State* s = state();
     switch (r.access) {
       case Access::Rw:
-        // The SMU mailbox is live; any other backing is the reset value, which
-        // follows the device until something writes the register.
-        if (r.backing.rfind("smu.", 0) == 0) return backed(r, c);
+        // A live backing is the vendor's device logic (the SMU mailbox); any
+        // other is the reset value, which follows the device until something
+        // writes the register.
+        if (!fixed_backing(r.backing)) return backed(r, c);
         return __atomic_load_n(&s->rw_set[i], __ATOMIC_ACQUIRE)
                    ? static_cast<uint32_t>(__atomic_load_n(&s->rw_value[i], __ATOMIC_RELAXED))
                    : r.backing.empty() ? base(r) : backed(r, c);
@@ -797,9 +699,10 @@ uint32_t RegisterSpace::read(uint32_t offset, uint32_t size) {
   }
   // The registers the access covers; bytes no register declares read as 0.
   const ras::Counters c = impl_->counts();
-  // What no register declares: an NVIDIA GPU's BAR0 answers 0xbadf5040 there
-  // (measured); configuration space reads as the captured card's, or zero.
-  uint32_t v = impl_->space == Space::NvidiaMmio ? 0xbadf5040u : 0;
+  // What no register declares: MMIO answers as the vendor's does there (an
+  // NVIDIA GPU's BAR0 0xbadf5040, measured); configuration space reads as the
+  // captured card's, or zero.
+  uint32_t v = impl_->space == Space::Config ? 0 : vendor::owning(impl_->space)->mmio_undeclared;
   if (impl_->image_src)   // what no register declares reads as the captured card's
     for (uint32_t b = 0; b < size; ++b) v |= static_cast<uint32_t>(impl_->image_src->bytes[offset + b]) << (8 * b);
   const auto& rs = impl_->regs();
@@ -858,8 +761,8 @@ void RegisterSpace::write(uint32_t offset, uint32_t size, uint32_t value) {
       case Access::Ro:
         break;
       case Access::Rw: {
-        if (r.backing.rfind("smu.", 0) == 0) {
-          smu_write(s, r.backing, (impl_->evaluate(r, c) & ~covered) | (bits & covered));
+        if (!fixed_backing(r.backing)) {   // the vendor's device logic
+          impl_->vend.write(r.backing, impl_->context(r), (impl_->evaluate(r, c) & ~covered) | (bits & covered));
           break;
         }
         const uint32_t old = impl_->evaluate(r, c);
@@ -1004,39 +907,13 @@ void write_sysfs_files(const telemetry::DeviceSample& d, const std::string& dir)
     res += line;
   }
   replace_file(dir + "/resource", res);
-  // An AMD GPU's metrics table (vgpu/amd_metrics.hpp).
-  if (is_amd(d)) {
-    ras::Counters c{};
-    try {
-      c = ras::read(d.uuid).since_load;
-    } catch (const std::exception&) {
-    }
-    replace_file(dir + "/gpu_metrics", amd::gpu_metrics(d, c));
-    amd::write_driver_files(d, dir);
-    // The partition modes, as amdgpu reads NBIO for them and names them
-    // (amdgpu_gfx.c's current_compute_partition, amdgpu_gmc.c's
-    // current_memory_partition and available_memory_partition).
-    RegisterSpace mmio(Space::AmdMmio, d);
-    const auto reg = [&](const char* name) { return mmio.value(*find(Space::AmdMmio, name)); };
-    static const char* const kCompute[] = {"SPX", "DPX", "TPX", "QPX", "CPX"};
-    const uint32_t px = (reg("nbio_partition_compute_status") >> 4) & 0xF;
-    replace_file(dir + "/current_compute_partition", std::string(px < 5 ? kCompute[px] : "UNKNOWN") + "\n");
-    const auto nps_known = [](int m) { return m == 1 || m == 2 || m == 3 || m == 4 || m == 6 || m == 8; };
-    const int nps = __builtin_ffs(static_cast<int>((reg("nbio_partition_mem_status") >> 4) & 0xFF));
-    replace_file(dir + "/current_memory_partition",
-                 (nps_known(nps) ? "NPS" + std::to_string(nps) : std::string("UNKNOWN")) + "\n");
-    std::string avail, sep;
-    for (uint32_t cap = reg("nbio_partition_mem_cap"); cap; cap &= cap - 1)
-      if (const int m = __builtin_ffs(static_cast<int>(cap)); nps_known(m)) {
-        avail += sep + "NPS" + std::to_string(m);
-        sep = ", ";
-      }
-    replace_file(dir + "/available_memory_partition", avail + "\n");
-  }
+  // The vendor's driver files beside them (amdgpu's metrics table, device
+  // files, hwmon and partition modes).
+  vendor::of(d).sysfs(d, dir);
 }
 
 Bar bar(RegisterSpace& cs, const telemetry::DeviceSample& d, int n) {
-  const auto layout = bar_layout(d);
+  const auto layout = vendor::of(d).bars(d);
   Bar b;
   if (n < 0 || n > 5) return b;
   const BarLayout& l = layout[static_cast<size_t>(n)];
@@ -1073,7 +950,8 @@ std::string export_registers(const std::string& profile, const telemetry::Device
       "#                                                     engines); VALUE is at power-on\n"
       "#\n"
       "# Generated by `vgpu regs export " + profile + "` from the register database\n"
-      "# (registers/*.yaml) and the profile. Change those and regenerate: a test fails\n"
+      "# (registers/pci-config.yaml, <vendor>/registers/mmio.yaml) and the profile.\n"
+      "# Change those and regenerate: a test fails\n"
       "# when this file and what they give differ. docs/registers.md has the details.\n\n";
   RegisterSpace cs(Space::Config, d, true);
   std::snprintf(line, sizeof line, "profile: %s\npci_device_id: 0x%04x\nlayout: %s\n", profile.c_str(),
@@ -1093,9 +971,11 @@ std::string export_registers(const std::string& profile, const telemetry::Device
     }
   };
   emit(cs, "config", 3);
-  if (has_space(d, Space::AmdMmio)) {   // "mmio": the device's own, either vendor's
-    RegisterSpace mmio(Space::AmdMmio, d, true);
-    emit(mmio, "mmio", mmio.space() == Space::AmdMmio ? 5 : 6);
+  if (const Space own = resolve_space(d, Space::AmdMmio); has_space(d, own)) {   // the vendor's MMIO
+    RegisterSpace mmio(own, d, true);
+    int digits = 0;   // as many hex digits as the space's last offset has
+    for (uint32_t last = space_size(own) - 1; last; last >>= 4) ++digits;
+    emit(mmio, "mmio", digits);
   }
   return out;
 }

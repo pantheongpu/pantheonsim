@@ -493,7 +493,7 @@ narrows what counts as observable, not what the detector looks at.
   session's /sys/bus/pci devices carry config, resource, IDs and link files
   from the registers, and NVML and nvidia-smi read the link through them, each
   access logged under the tool's name. Every GPU model's registers and
-  power-on values are kept in registers/gpus/ (`vgpu regs export`), and every
+  power-on values are kept in <vendor>/registers/gpus/ (`vgpu regs export`), and every
   simulated GPU of the model starts from them.
 
 ## Not implemented (fails loudly, never silently)
