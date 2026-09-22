@@ -25,7 +25,7 @@ int usage(FILE* to) {
                "usage: vgpu fault inject [--gpu N] --ecc corrected|uncorrected [--location LOC] [--count N]\n"
                "       vgpu fault inject [--gpu N] --pcie COUNTER [--count N]\n"
                "       vgpu fault arm [--gpu N] --ecc corrected|uncorrected|--bitflip [--count N]\n"
-               "                      [--on load|store|shared|alu|copy]\n"
+               "                      [--on load|store|shared|alu|copy] [--rate P [--seed S]]\n"
                "       vgpu fault arm [--gpu N] --hang [--seconds S]\n"
                "       vgpu fault stuck [--gpu N] --offset BYTES --bit B --value 0|1 | --clear\n"
                "       vgpu fault lose [--gpu N] [--clear]\n"
@@ -70,6 +70,11 @@ int usage(FILE* to) {
                "                    buffer or GPU): an uncorrected error fails the copy with\n"
                "                    cudaErrorECCUncorrectable, a bit flip corrupts what it\n"
                "                    delivers and leaves memory as it was\n"
+               "\n"
+               "--rate P arms a fault at a rate instead of a count: every access at the target\n"
+               "takes one with probability P (for example 1e-6), from a generator seeded with S\n"
+               "(default 1), until --rate 0 or a driver reload -- so errors grow with memory\n"
+               "traffic, as a failing part's do.\n"
                "\n"
                "arm --hang stalls the next kernel launch, the device shown fully busy, for S\n"
                "seconds and then fails it with cudaErrorLaunchTimeout -- or, without --seconds,\n"
@@ -162,8 +167,23 @@ void show(uint32_t index, const vgpu::telemetry::DeviceSample& d) {
                                  : "until the process is stopped");
   static constexpr const char* kOn[vgpu::ras::kTargets] = {"loads", "stores", "shared", "results",
                                                            "copies"};
+  for (uint32_t t = 0; t < vgpu::ras::kTargets; ++t) {
+    const auto at = static_cast<vgpu::ras::Target>(t);
+    std::string rates;
+    for (auto [kind, name] : {std::pair{vgpu::ras::Armed::Corrected, "corrected"},
+                              std::pair{vgpu::ras::Armed::Uncorrected, "uncorrected"},
+                              std::pair{vgpu::ras::Armed::Bitflip, "bit flips"}})
+      if (const double r = vgpu::ras::rate_of(now, at, kind); r > 0) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%s%s %g", rates.empty() ? "" : ", ", name, r);
+        rates += buf;
+      }
+    if (!rates.empty())
+      std::printf("  rate on %-14s %s per access (seed %llu)\n", kOn[t], rates.c_str(),
+                  static_cast<unsigned long long>(now.rate_seed));
+  }
   for (uint32_t t = 0; t < vgpu::ras::kTargets; ++t)
-    if (now.armed_pending[t])
+    if (now.armed_pending[t] % vgpu::ras::kRatePending)
       std::printf("  armed on %-13s corrected %llu, uncorrected %llu, bit flips %llu\n", kOn[t],
                   static_cast<unsigned long long>(now.armed[t][0]),
                   static_cast<unsigned long long>(now.armed[t][1]),
@@ -195,6 +215,8 @@ int cmd_fault(const std::vector<std::string>& args) {
   }
 
   std::string gpu, ecc, location, pcie, reasons, on, offset_text;
+  double rate = -1;
+  long long seed = 1;
   long long bit = -1, value = -1, gen = 0, width = 0;
   bool vol = false, agg = false, bitflip = false, hang = false, clear = false;
   long long count = 1, seconds = -1;
@@ -203,7 +225,8 @@ int cmd_fault(const std::vector<std::string>& args) {
     const bool takes_value = a == "--gpu" || a == "--ecc" || a == "--location" || a == "--pcie" ||
                              a == "--count" || a == "--reason" || a == "--seconds" || a == "--on" ||
                              a == "--offset" || a == "--bit" || a == "--value" ||
-                             a == "--gen" || a == "--width";
+                             a == "--gen" || a == "--width" ||
+                             a == "--rate" || a == "--seed";
     if (takes_value && i + 1 >= args.size()) {
       std::fprintf(stderr, "vgpu fault: %s needs a value\n", a.c_str());
       return 2;
@@ -213,6 +236,18 @@ int cmd_fault(const std::vector<std::string>& args) {
     else if (a == "--location") location = args[++i];
     else if (a == "--on") on = args[++i];
     else if (a == "--offset") offset_text = args[++i];
+    else if (a == "--rate") {
+      if (!vgpu::cli::parse_double(args[++i], 0, 1, &rate)) {
+        std::fprintf(stderr, "vgpu fault: --rate is a probability per access, 0 to 1, got '%s'\n",
+                     args[i].c_str());
+        return 2;
+      }
+    } else if (a == "--seed") {
+      if (!vgpu::cli::parse_int(args[++i], 0, 9223372036854775807LL, &seed)) {
+        std::fprintf(stderr, "vgpu fault: --seed is a whole number, got '%s'\n", args[i].c_str());
+        return 2;
+      }
+    }
     else if (a == "--gen" || a == "--width") {
       long long v = 0;
       if (!vgpu::cli::parse_int(args[++i], 1, a == "--gen" ? 6 : 32, &v)) {
@@ -394,6 +429,19 @@ int cmd_fault(const std::vector<std::string>& args) {
     return 0;
   }
 
+  if ((rate >= 0 || seed != 1) && (verb != "arm" || hang)) {
+    std::fprintf(stderr, "vgpu fault %s: --rate and --seed belong to arm --ecc and arm --bitflip\n",
+                 verb.c_str());
+    return 2;
+  }
+  if (rate >= 0 && count != 1) {
+    std::fprintf(stderr, "vgpu fault arm: a fault is armed by --count or at a --rate, not both\n");
+    return 2;
+  }
+  if (seed != 1 && rate < 0) {
+    std::fprintf(stderr, "vgpu fault arm: --seed seeds a --rate\n");
+    return 2;
+  }
   if (verb != "link" && (gen || width)) {
     std::fprintf(stderr, "vgpu fault %s: --gen and --width belong to link\n", verb.c_str());
     return 2;
@@ -555,6 +603,18 @@ int cmd_fault(const std::vector<std::string>& args) {
                            : at == vgpu::ras::Target::Alu    ? "arithmetic results"
                            : at == vgpu::ras::Target::Copy   ? "copies out of device memory"
                                                              : "device-memory loads";
+    if (rate >= 0) {
+      for (uint32_t i : sel) {
+        vgpu::ras::arm_rate(snap.devices[i].uuid, kind, rate, at, static_cast<uint64_t>(seed));
+        if (rate > 0)
+          std::printf("Armed %ss at %g per access on the %s of GPU %u (%s), seed %lld.\n", what, rate,
+                      accesses, i, snap.devices[i].name, seed);
+        else
+          std::printf("Stopped %ss at a rate on the %s of GPU %u (%s).\n", what, accesses, i,
+                      snap.devices[i].name);
+      }
+      return 0;
+    }
     for (uint32_t i : sel) {
       vgpu::ras::arm(snap.devices[i].uuid, kind, static_cast<uint64_t>(count), at);
       std::printf("Armed %lld %s%s for the next %s on GPU %u (%s).\n", count, what,

@@ -168,6 +168,18 @@ uncorrectable one is counted, logged, and fails the copy with
 `cudaErrorECCUncorrectable`, which poisons the context as a kernel's would; a
 bit flip corrupts what that one copy delivers and leaves memory as it was.
 
+Instead of a count, a fault can be armed at a rate: every access at the target
+takes one with a given probability, until the rate is set back to 0 or the
+driver reloads. Errors then grow with memory traffic, as a failing part's do,
+which is what an error-rate threshold or an SBE-rate policy is tested against.
+The generator is seeded, so a run takes the same number of faults every time.
+
+```bash
+vgpu fault arm --ecc corrected --rate 1e-6 --seed 7
+vgpu fault arm --bitflip --on copy --rate 1e-4
+vgpu fault arm --ecc corrected --rate 0      # stop
+```
+
 An armed fault strikes whichever access comes next. A stuck cell stays at one
 address: a bit that reads as 0 or 1 whatever is written to it, as a failed cell
 does, on every read -- a kernel's loads and atomics, and copies back to the

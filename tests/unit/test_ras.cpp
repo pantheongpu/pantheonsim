@@ -265,6 +265,39 @@ VTEST(a_gpu_holds_sixteen_stuck_cells) {
   VCHECK_EQ(ras::stuck_cells(kGpu).size(), size_t{ras::kStuckCells});
 }
 
+VTEST(a_fault_at_a_rate_is_taken_about_that_often_and_after_counted_ones) {
+  TempMachine m("rate");
+  ras::ArmedFaults faults(kGpu);
+  ras::arm_rate(kGpu, ras::Armed::Corrected, 0.25, ras::Target::Load, 42);
+  VCHECK(*faults.pending(ras::Target::Load) != 0u);   // every load has to look
+  VCHECK_EQ(ras::read(kGpu).since_load.armed_total(), 0u);   // but nothing is counted as armed
+  ras::arm(kGpu, ras::Armed::Uncorrected, 1);
+  VCHECK(faults.take() == ras::Armed::Uncorrected);   // the counted one first
+  int taken = 0;
+  for (int i = 0; i < 20000; ++i) taken += faults.take() == ras::Armed::Corrected;
+  VCHECK(taken > 4600 && taken < 5400);
+  VCHECK(faults.take(ras::Target::Shared) == ras::Armed::None);   // only where it was armed
+  ras::arm_rate(kGpu, ras::Armed::Corrected, 0, ras::Target::Load, 42);
+  VCHECK_EQ(*faults.pending(ras::Target::Load), 0u);
+  for (int i = 0; i < 1000; ++i) VCHECK(faults.take() == ras::Armed::None);
+}
+
+VTEST(a_rate_of_one_takes_every_access_and_a_driver_reload_stops_it) {
+  TempMachine m("rate1");
+  ras::ArmedFaults faults(kGpu);
+  ras::arm_rate(kGpu, ras::Armed::Bitflip, 1.0, ras::Target::Copy, 1);
+  for (int i = 0; i < 100; ++i) VCHECK(faults.take(ras::Target::Copy) == ras::Armed::Bitflip);
+  ras::reset_volatile(kGpu);
+  VCHECK(faults.take(ras::Target::Copy) == ras::Armed::None);
+  bool refused = false;
+  try {
+    ras::arm_rate(kGpu, ras::Armed::Corrected, 0.1, ras::Target::Store, 1);
+  } catch (const std::invalid_argument&) {
+    refused = true;
+  }
+  VCHECK(refused);
+}
+
 VTEST(concurrent_loads_take_exactly_what_was_armed) {
   TempMachine m("race");
   ras::ArmedFaults faults(kGpu);
