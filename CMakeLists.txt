@@ -119,6 +119,7 @@ add_library(vgpu STATIC
   src/core/yamlish.cpp
   src/core/shared_state.cpp
   src/core/regs.cpp
+  amd/src/codeobject.cpp
   src/core/machine.cpp
   # Each vendor's part of the register model and its driver files.
   amd/src/regs.cpp
@@ -521,8 +522,14 @@ add_custom_command(TARGET vgpu_cli POST_BUILD
 # Tests
 # ---------------------------------------------------------------------------
 enable_testing()
+# vgpu_unit_test(NAME [SOURCE]): tests/unit/<name>.cpp, or a source of its own
+# for a vendor's tests (amd/tests/unit, nvidia/tests/unit).
 function(vgpu_unit_test name)
-  add_executable(${name} tests/unit/${name}.cpp)
+  set(_src tests/unit/${name}.cpp)
+  if(ARGC GREATER 1)
+    set(_src ${ARGV1})
+  endif()
+  add_executable(${name} ${_src})
   target_link_libraries(${name} PRIVATE vgpu)
   target_include_directories(${name} PRIVATE tests/framework)
   add_test(NAME ${name} COMMAND ${name})
@@ -544,6 +551,9 @@ vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
 target_compile_definitions(test_regs PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_regalloc)
+# AMD code objects: what a HIP program hands the driver to run.
+vgpu_unit_test(test_amd_codeobject amd/tests/unit/test_codeobject.cpp)
+target_compile_definitions(test_amd_codeobject PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_robustness)
 target_include_directories(test_robustness PRIVATE nvidia/src)
 target_sources(test_robustness PRIVATE nvidia/src/fatbin.cpp)
