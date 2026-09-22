@@ -187,4 +187,72 @@ VTEST(every_access_is_logged_with_its_process) {
   VCHECK_EQ(full.back().seq, uint64_t{regs::kLogEntries} + 13);
 }
 
+VTEST(an_amd_gpu_has_mmio_registers_and_an_nvidia_one_does_not_yet) {
+  TempMachine m("mmio");
+  VCHECK(regs::has_space(device("amd/mi300x"), regs::Space::AmdMmio));
+  VCHECK(!regs::has_space(device("nvidia/h100"), regs::Space::AmdMmio));
+  bool refused = false;
+  try {
+    regs::RegisterSpace cs(regs::Space::AmdMmio, device("nvidia/h100"));
+  } catch (const std::invalid_argument&) {
+    refused = true;
+  }
+  VCHECK(refused);
+  for (const auto& r : regs::registers(regs::Space::AmdMmio)) {
+    VCHECK_EQ(r.width, 32u);
+    VCHECK_EQ(r.offset % 4, 0u);
+    VCHECK(!r.source.empty());   // every offset says which header it comes from
+  }
+}
+
+VTEST(engine_status_follows_whether_the_gpu_is_busy) {
+  TempMachine m("grbm");
+  auto d = device("amd/mi300x");
+  regs::RegisterSpace idle(regs::Space::AmdMmio, d);
+  const uint32_t at = regs::find(regs::Space::AmdMmio, "grbm_status")->offset;
+  VCHECK_EQ(at, 0x8010u);                             // (GC base 0x2000 + 0x0004) * 4
+  VCHECK_EQ(idle.read(at, 4) >> 31, 0u);              // GUI_ACTIVE clear
+  VCHECK_EQ((idle.read(at, 4) >> 12) & 3, 3u);        // DB and CB clean
+  d.utilization_gpu = 80;
+  regs::RegisterSpace busy(regs::Space::AmdMmio, d);
+  VCHECK_EQ(busy.read(at, 4) >> 31, 1u);
+  VCHECK_EQ((busy.read(at, 4) >> 29) & 1, 1u);        // CP busy
+}
+
+VTEST(the_smu_mailbox_answers_as_the_firmware_does) {
+  TempMachine m("smu");
+  regs::RegisterSpace cs(regs::Space::AmdMmio, device("amd/mi300x"));
+  const auto at = [](const char* name) { return regs::find(regs::Space::AmdMmio, name)->offset; };
+  VCHECK_EQ(cs.read(at("smu_response"), 4), regs::kSmuResultOk);   // ready once loaded
+  auto send = [&](uint32_t msg, uint32_t arg) {
+    cs.write(at("smu_response"), 4, 0);
+    cs.write(at("smu_argument"), 4, arg);
+    cs.write(at("smu_message"), 4, msg);
+    return std::pair{cs.read(at("smu_response"), 4), cs.read(at("smu_argument"), 4)};
+  };
+  VCHECK(send(regs::kSmuTestMessage, 41) == (std::pair{regs::kSmuResultOk, 42u}));
+  VCHECK(send(regs::kSmuGetDriverIfVersion, 0) == (std::pair{regs::kSmuResultOk, 0x08042024u}));
+  VCHECK_EQ(send(regs::kSmuGetSmuVersion, 0).second >> 16, 0x55u);   // 85.x.x
+  VCHECK_EQ(send(0x77, 5).first, regs::kSmuResultUnknownCmd);
+  regs::RegisterSpace again(regs::Space::AmdMmio, device("amd/mi300x"));   // another process
+  VCHECK_EQ(again.read(at("smu_response"), 4), regs::kSmuResultUnknownCmd);
+  VCHECK(regs::access_log(device("amd/mi300x").uuid, regs::Space::AmdMmio).size() > 10);
+  VCHECK(regs::access_log(device("amd/mi300x").uuid, regs::Space::Config).empty());   // a log per space
+}
+
+VTEST(an_mmio_access_is_a_whole_aligned_dword) {
+  TempMachine m("mmioalign");
+  regs::RegisterSpace cs(regs::Space::AmdMmio, device("amd/mi300x"));
+  VCHECK_EQ(cs.read(0x8014, 4), 0u);   // undeclared: reads as zero
+  for (auto [off, size] : {std::pair{0x8010u, 2u}, {0x8012u, 4u}, {0x80000u, 4u}}) {
+    bool refused = false;
+    try {
+      cs.read(off, size);
+    } catch (const std::invalid_argument&) {
+      refused = true;
+    }
+    VCHECK(refused);
+  }
+}
+
 VTEST_MAIN

@@ -1,0 +1,87 @@
+# MMIO registers of an AMD Instinct GPU (MI300 class: GC 9.4.3, MP1 13.0.6),
+# as the driver reaches them through BAR5. Offsets are byte addresses in the
+# BAR: (IP block base + register offset) * 4, with the register offsets, bit
+# fields and SMU message numbers from the Linux amdgpu headers (see
+# LICENSES/amdgpu-headers.txt). MI300 finds its IP block bases at boot in its
+# IP discovery table; the bases here are Aldebaran's (MI200), the same GFX9
+# family: GC segment 0 at 0x2000, segment 1 at 0xA000, MP1 at 0x16000 -- so the
+# offsets are a model until checked on a card. Keys as in pci-config.yaml,
+# plus `source`, the header symbol an offset comes from.
+#
+# Backings: engine.* (engine status, from whether the GPU is busy) and smu.*
+# (the SMU mailbox: write the argument, then the message; the response
+# register reads 1 when the SMU has answered and the argument register holds
+# its reply).
+
+grbm_status2:
+  offset: "0x08008"
+  width: 32
+  access: ro
+  backing: engine.grbm_status2
+  source: "gc_9_4_3_offset.h regGRBM_STATUS2 0x0002, GC segment 0"
+  fields: ["3:0 me0pipe1_cmdfifo_avail", "14 rlc_rq_pending", "15 utcl2_busy", "16 ea_busy", "24 rlc_busy", "25 tc_busy", "28 cpf_busy", "29 cpc_busy", "30 cpg_busy"]
+  surfaces: [umr, amdgpu hang dumps]
+  status: model
+
+grbm_status:
+  offset: "0x08010"
+  width: 32
+  access: ro
+  backing: engine.grbm_status
+  source: "gc_9_4_3_offset.h regGRBM_STATUS 0x0004, GC segment 0"
+  fields: ["3:0 me0pipe0_cmdfifo_avail", "12 db_clean", "13 cb_clean", "14 ta_busy", "19 ia_busy", "20 sx_busy", "22 spi_busy", "23 bci_busy", "24 sc_busy", "25 pa_busy", "26 db_busy", "29 cp_busy", "30 cb_busy", "31 gui_active"]
+  surfaces: [umr, amdgpu hang dumps, radeontop]
+  status: model
+
+cp_stat:
+  offset: "0x08680"
+  width: 32
+  access: ro
+  backing: engine.cp_stat
+  source: "gc_9_4_3_offset.h regCP_STAT 0x01a0, GC segment 0"
+  fields: ["31 cp_busy"]
+  surfaces: [umr, amdgpu hang dumps]
+  status: model
+
+rlc_stat:
+  offset: "0x3b010"
+  width: 32
+  access: ro
+  backing: engine.rlc_stat
+  source: "gc_9_4_3_offset.h regRLC_STAT 0x4c04, GC segment 1"
+  fields: ["0 rlc_busy", "2 rlc_gpm_busy", "3 rlc_spm_busy"]
+  surfaces: [umr, amdgpu hang dumps]
+  status: model
+
+smu_message:
+  offset: "0x58a08"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  backing: smu.message
+  source: "mp_13_0_6_offset.h regMP1_SMN_C2PMSG_66 0x0282, MP1 segment 0"
+  fields: ["31:0 message (PPSMC_MSG_*)"]
+  surfaces: [amdgpu, umr]
+  status: model
+
+smu_argument:
+  offset: "0x58a48"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  backing: smu.argument
+  source: "mp_13_0_6_offset.h regMP1_SMN_C2PMSG_82 0x0292, MP1 segment 0"
+  fields: ["31:0 argument and the SMU's reply"]
+  surfaces: [amdgpu, umr]
+  status: model
+
+smu_response:
+  offset: "0x58a68"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  backing: smu.response
+  source: "mp_13_0_6_offset.h regMP1_SMN_C2PMSG_90 0x029a, MP1 segment 0"
+  fields: ["31:0 response (1 ok and 0xfe unknown command and 0 pending)"]
+  surfaces: [amdgpu, umr]
+  status: model
