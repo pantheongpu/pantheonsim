@@ -475,7 +475,8 @@ narrows what counts as observable, not what the detector looks at.
   MI300. Not yet: more AMD blocks (UMC ECC, SMU metrics, NBIO), NVIDIA MMIO
   (waits on a decision about the register source). A C API (vgpu_regs.h,
   libvgpuregs) gives bring-up software the same access. tools/regprobe
-  captures real cards (read-only) to check and map the model against; an RTX
+  captures real cards (read-only) to check and map the model against. AMD's
+  gpu_metrics table (v1.5) is published live in the session's sysfs. An RTX
   3080 Ti's header, read without root, is in registers/measurements/. Root on
   a real card is next: its capabilities, the extended space and BAR0. The
   session's /sys/bus/pci devices carry config, resource, IDs and link files

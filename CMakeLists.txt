@@ -76,6 +76,7 @@ add_library(vgpu STATIC
   src/core/shared_state.cpp
   src/core/regs.cpp
   src/core/machine.cpp
+  src/core/amd_metrics.cpp
   src/core/profile.cpp
   src/core/registry.cpp
   src/core/memory.cpp
