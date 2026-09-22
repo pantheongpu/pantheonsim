@@ -66,6 +66,7 @@ jobs:
           - { key: b200-x2-cuda13.0,  gpu: nvidia/b200,        count: 2, cuda: '13.0' }  # Blackwell 10.0, CUDA 12.8+
           - { key: l40s-x1-cuda12.0,  gpu: nvidia/l40s,        count: 1, cuda: '12.0' }  # Ada 8.9
           - { key: rtx3060-x1-cuda12.0, gpu: nvidia/rtx3060,   count: 1, cuda: '12.0' }  # Ampere 8.6, consumer
+          - { key: rtx3080ti-x1-cuda13.0, gpu: nvidia/rtx3080ti, count: 1, cuda: '13.0' }  # Ampere 8.6, the measured card
           - { key: a10g-x1-cuda13.0,  gpu: nvidia/a10g,        count: 1, cuda: '13.0' }  # Ampere 8.6
           - { key: a100-40gb-x2-cuda13.0, gpu: nvidia/a100-sxm4-40gb, count: 2, cuda: '13.0' }  # Ampere 8.0
           - { key: h100-pcie-x1-cuda12.0, gpu: nvidia/h100-pcie, count: 1, cuda: '12.0' }  # Hopper 9.0 on CUDA 12
