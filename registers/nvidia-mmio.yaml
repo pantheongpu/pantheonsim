@@ -1,0 +1,35 @@
+# MMIO registers of an NVIDIA GPU behind BAR0, as measured on real cards with
+# tools/regprobe (registers/measurements/): the map grows as registers are read
+# and identified. Offsets are byte addresses in BAR0. Only the measured card's
+# own profile has this space: nvidia/rtx3080ti (GA102, driver 595.84).
+#
+# A register the map does not declare reads as 0xbadf5040, the value the card
+# answered with from 0xc on -- what a protected or absent register reads as.
+
+chip_id:
+  offset: "0x000000"
+  width: 32
+  access: ro
+  reset: "0xb72000a1"
+  fields: ["7:0 revision (0xa1 as in configuration space)", "31:8 chip"]
+  surfaces: [driver probe, bring-up scripts]
+  status: done
+  measured: "RTX 3080 Ti: 0xb72000a1"
+
+reg_000004:
+  offset: "0x000004"
+  width: 32
+  access: ro
+  reset: "0x00000000"
+  surfaces: []
+  status: done
+  measured: "RTX 3080 Ti: 0x00000000; not yet identified"
+
+reg_000008:
+  offset: "0x000008"
+  width: 32
+  access: ro
+  reset: "0x00000000"
+  surfaces: []
+  status: done
+  measured: "RTX 3080 Ti: 0x00000000; not yet identified"

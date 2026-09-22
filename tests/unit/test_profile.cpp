@@ -18,7 +18,7 @@ VTEST(registry_lists_all_gpus) {
   auto ids = vgpu::available_gpus();
   const std::vector<std::string> expected = {
       "nvidia/a10",   "nvidia/a100", "nvidia/h100",   "nvidia/h200",
-      "nvidia/b200",  "nvidia/rtx3060", "nvidia/a100-sxm4-40gb",
+      "nvidia/b200",  "nvidia/rtx3060", "nvidia/rtx3080ti", "nvidia/a100-sxm4-40gb",
       "nvidia/gh200-480gb", "nvidia/h100-pcie", "nvidia/t4", "nvidia/a10g",
       "nvidia/l4", "nvidia/l40s",
       "amd/mi300x", "amd/mi325x", "amd/mi350x"};
@@ -39,7 +39,7 @@ VTEST(all_builtin_profiles_parse) {
     VCHECK(p.telemetry.pci_vendor_id != 0);
     // These were read from physical devices; the rest are still placeholders
     // from public documentation, and the flag has to say which is which.
-    VCHECK_EQ(p.verified, p.id == "nvidia/rtx3060" || p.id == "nvidia/a10" ||
+    VCHECK_EQ(p.verified, p.id == "nvidia/rtx3060" || p.id == "nvidia/rtx3080ti" || p.id == "nvidia/a10" ||
                           p.id == "nvidia/a100-sxm4-40gb" || p.id == "nvidia/a100" ||
                           p.id == "nvidia/h100" || p.id == "nvidia/gh200-480gb" ||
                           p.id == "nvidia/h100-pcie" || p.id == "nvidia/t4" ||

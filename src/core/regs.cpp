@@ -90,7 +90,9 @@ std::vector<Register> load(const char* yaml, const std::string& origin, uint32_t
 }
 
 // The database file each space is declared in.
-const char* database_name(Space s) { return s == Space::Config ? "pci-config" : "amd-mmio"; }
+const char* database_name(Space s) {
+  return s == Space::Config ? "pci-config" : s == Space::AmdMmio ? "amd-mmio" : "nvidia-mmio";
+}
 
 const char* space_yaml(Space s) {
   for (const auto& e : embedded::kRegisterSpaces)
@@ -330,16 +332,32 @@ const char* access_name(Access a) {
 
 const char* space_name(Space s) { return s == Space::Config ? "config" : "mmio"; }
 
+Space resolve_space(const telemetry::DeviceSample& d, Space s) {
+  if (s == Space::Config) return s;
+  return is_amd(d) ? Space::AmdMmio : Space::NvidiaMmio;
+}
+
 bool parse_space(const std::string& name, Space* out) {
   if (name == "config") *out = Space::Config;
-  else if (name == "mmio") *out = Space::AmdMmio;
+  else if (name == "mmio") *out = Space::AmdMmio;   // resolved per device (resolve_space)
   else return false;
   return true;
 }
 
-uint32_t space_size(Space s) { return s == Space::Config ? kConfigSize : 512u << 10; }
+uint32_t space_size(Space s) {
+  return s == Space::Config ? kConfigSize : s == Space::AmdMmio ? 512u << 10 : 16u << 20;
+}
 
-bool has_space(const telemetry::DeviceSample& d, Space s) { return s == Space::Config || is_amd(d); }
+// The NVIDIA cards whose BAR0 has been measured, by PCI device ID.
+bool nvidia_mmio_measured(const telemetry::DeviceSample& d) {
+  return !is_amd(d) && (d.pci_device_id >> 16) == 0x2208;   // RTX 3080 Ti
+}
+
+bool has_space(const telemetry::DeviceSample& d, Space s) {
+  s = resolve_space(d, s);
+  return s == Space::Config || (s == Space::AmdMmio && is_amd(d)) ||
+         (s == Space::NvidiaMmio && nvidia_mmio_measured(d));
+}
 
 const std::vector<Register>& registers(Space space) {
   // Each loaded on first use, so one space's database cannot stop another's.
@@ -352,8 +370,12 @@ const std::vector<Register>& registers(Space space) {
     static const std::vector<Register> config = loaded(Space::Config);
     return config;
   }
-  static const std::vector<Register> mmio = loaded(Space::AmdMmio);
-  return mmio;
+  if (space == Space::AmdMmio) {
+    static const std::vector<Register> amd = loaded(Space::AmdMmio);
+    return amd;
+  }
+  static const std::vector<Register> nvidia = loaded(Space::NvidiaMmio);
+  return nvidia;
 }
 
 const Register* find(Space space, const std::string& key) {
@@ -445,6 +467,10 @@ struct RegisterSpace::Impl {
   uint32_t backed(const Register& r, const ras::Counters& c) {
     const std::string& k = r.backing;
     const uint32_t vendor = d.pci_device_id & 0xFFFF, device = d.pci_device_id >> 16;
+    // A device replaying a capture of its own model has that board's subsystem
+    // IDs; any other has its own vendor and device IDs there.
+    const bool same_card = image_src && (image_src->bytes[2] | image_src->bytes[3] << 8) == device;
+    if ((k == "profile.subsystem_vendor_id" || k == "profile.subsystem_id") && same_card) return base(r);
     if (k == "profile.vendor_id" || k == "profile.subsystem_vendor_id") return vendor;
     if (k == "profile.device_id" || k == "profile.subsystem_id") return device;
     if (k == "profile.revision") return is_amd(d) ? 0x00 : 0xa1;
@@ -571,9 +597,10 @@ struct RegisterSpace::Impl {
 
 namespace {
 void check_access(Space space, uint32_t offset, uint32_t size) {
-  if (space == Space::AmdMmio) {
+  if (space != Space::Config) {
     if (size != 4 || offset % 4 || offset + size > space_size(space))
-      throw std::invalid_argument("an MMIO access is 4 bytes, aligned, inside the 512 KiB BAR");
+      throw std::invalid_argument("an MMIO access is 4 bytes, aligned, inside the " +
+                                  std::to_string(space_size(space) >> 10) + " KiB BAR");
     return;
   }
   if ((size != 1 && size != 2 && size != 4) || offset % size || offset + size > kConfigSize)
@@ -583,6 +610,7 @@ void check_access(Space space, uint32_t offset, uint32_t size) {
 }  // namespace
 
 RegisterSpace::RegisterSpace(Space s, const telemetry::DeviceSample& d) {
+  s = resolve_space(d, s);
   if (!has_space(d, s))
     throw std::invalid_argument(std::string(d.name) + " has no " + space_name(s) + " registers modelled");
   impl_ = std::make_unique<Impl>(s, d);
@@ -607,7 +635,9 @@ uint32_t RegisterSpace::read(uint32_t offset, uint32_t size) {
   check_access(impl_->space, offset, size);
   // The registers the access covers; bytes no register declares read as 0.
   const ras::Counters c = impl_->counts();
-  uint32_t v = 0;
+  // What no register declares: an NVIDIA GPU's BAR0 answers 0xbadf5040 there
+  // (measured); configuration space reads as the captured card's, or zero.
+  uint32_t v = impl_->space == Space::NvidiaMmio ? 0xbadf5040u : 0;
   if (impl_->image_src)   // what no register declares reads as the captured card's
     for (uint32_t b = 0; b < size; ++b) v |= static_cast<uint32_t>(impl_->image_src->bytes[offset + b]) << (8 * b);
   const auto& rs = impl_->regs();

@@ -181,8 +181,17 @@ generic layout's 0x100, so `aer_correctable_status` is at 0x430 -- and keep
 their live behaviour; every byte the database does not declare is the captured
 card's: its thirteen capabilities, from Virtual Channel and L1 substates to
 Resizable BAR and lane margining. `lspci -vvv` of the simulated RTX 3060 matches
-the real card's but for the IDs and the BAR addresses. Other cards use the
-generic layout. `vgpu regs list` shows which capability each register belongs
+the real card's but for the IDs and the BAR addresses, and the
+`nvidia/rtx3080ti` profile -- characterized from the same card, verified on
+512 conformance values -- matches it byte for byte but for the BAR addresses its
+host's firmware chose. Other cards use the generic layout.
+
+`--space mmio` on that profile is its BAR0, as measured so far: `chip_id` at
+0x0 (`0xb72000a1`, revision a1 as in configuration space) and zeros at 0x4 and
+0x8, with every register the map does not declare answering `0xbadf5040`, as
+the card does. The map in `registers/nvidia-mmio.yaml` grows as `regprobe`
+reads and identifies more; other NVIDIA profiles have no MMIO space until a
+card of their model is measured. `vgpu regs list` shows which capability each register belongs
 to; `vgpu regs read` takes a name and finds it on the chosen GPU, and the C
 API's `vgpu_regs_locate` does the same.
 

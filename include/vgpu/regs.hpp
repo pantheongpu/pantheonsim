@@ -27,10 +27,15 @@ namespace vgpu::regs {
 enum class Access { Ro, Rw, Rw1c, Bar };
 const char* access_name(Access a);
 
-enum class Space { Config, AmdMmio };
+// "mmio" names a GPU's MMIO space, whichever vendor's: an AMD GPU's registers
+// behind BAR5 (from the amdgpu headers), or an NVIDIA GPU's behind BAR0 (as
+// measured on real cards -- so far only the measured card's own profile).
+enum class Space { Config, AmdMmio, NvidiaMmio };
 const char* space_name(Space s);                 // "config", "mmio"
 bool parse_space(const std::string& name, Space* out);
 uint32_t space_size(Space s);                    // bytes
+// The space `s` names on this device: "mmio" is the device's own MMIO space.
+Space resolve_space(const telemetry::DeviceSample& d, Space s);
 
 struct Register {
   std::string name;
@@ -55,7 +60,8 @@ const std::vector<Register>& registers(Space s);
 const Register* find(Space s, const std::string& name_or_offset);
 inline const std::vector<Register>& config_registers() { return registers(Space::Config); }
 inline const Register* find_config(const std::string& key) { return find(Space::Config, key); }
-// Whether a device has the space: AMD MMIO only on an AMD GPU.
+// Whether a device has the space: AMD MMIO on an AMD GPU, NVIDIA MMIO where a
+// card of its model was measured.
 bool has_space(const telemetry::DeviceSample& d, Space s);
 
 inline constexpr uint32_t kConfigSize = 4096;

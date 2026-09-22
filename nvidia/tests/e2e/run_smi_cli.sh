@@ -72,7 +72,11 @@ if timeout --preserve-status 1 true 2>/dev/null; then
   tables=$("${idle[@]}" timeout --preserve-status -s TERM 2.5 "$vgpu" smi -l 1 2>&1); rc=$?
   expect "-l 1 repeats the table until SIGTERM, then exits 0" "0 yes" \
     "$rc $([[ $(grep -c '^| NVIDIA-SMI' <<< "$tables") -ge 2 ]] && echo yes || echo no)"
-  "${idle[@]}" timeout --preserve-status -s INT 0.5 "$vgpu" smi --loop=1 --query-gpu=index --format=csv >/dev/null 2>&1
+  # Two seconds, like the loops above. With half a second, an AddressSanitizer
+  # build on a heavily loaded machine now and then never ended the loop (about
+  # 1 run in 20 under 16 busy cores; never in the normal build) -- CI runs the
+  # sanitizer suite one test at a time and was not affected.
+  "${idle[@]}" timeout --preserve-status -s INT 2 "$vgpu" smi --loop=1 --query-gpu=index --format=csv >/dev/null 2>&1
   expect "--loop=N is accepted" "0" "$?"
 else
   echo "skip  loops: no timeout --preserve-status"
