@@ -121,6 +121,23 @@ expect "an uncorrectable error fails the copy with error 214" \
 expect "counted (since the reload above), logged as Xid 48 and 63" "1 yes" \
   "$(q ecc.errors.uncorrected.volatile.total) $(grep -q 'Xid (PCI:0000:01:00): 63' "$tmp/session/dmesg.log" && echo yes || echo no)"
 
+# Faults at a rate: the same seed, the same number taken, run after run.
+"$vgpu" fault arm --bitflip --rate 0.001 --seed 7 >/dev/null
+first=$(run); second=$(run)
+expect "bit flips at a rate corrupt a few values, the same few for a seed" "yes yes" \
+  "$([[ "$first" =~ ^mismatches:\ [1-9][0-9]?$ ]] && echo yes || echo no) $([[ "$first" == "$second" ]] && echo yes || echo no)"
+"$vgpu" fault arm --bitflip --rate 0 >/dev/null
+expect "a rate of 0 stops them" "mismatches: 0" "$(run)"
+before=$(q ecc.errors.corrected.volatile.total)
+"$vgpu" fault arm --ecc corrected --rate 0.01 --seed 3 >/dev/null
+run >/dev/null
+after=$(q ecc.errors.corrected.volatile.total)
+expect "corrected errors at 1% of about 4,000 loads are counted near 40" "yes" \
+  "$( (( after - before >= 20 && after - before <= 60 )) && echo yes || echo no)"
+"$vgpu" fault arm --ecc corrected --rate 0 >/dev/null
+expect "a count and a rate are not armed together" "2" \
+  "$("$vgpu" fault arm --bitflip --count 2 --rate 0.1 >/dev/null 2>&1; echo $?)"
+
 "$vgpu" fault lose >/dev/null
 expect "a launch on a GPU that has fallen off the bus fails" \
   "launch failed: 719 cudaErrorLaunchFailure" "$(run)"

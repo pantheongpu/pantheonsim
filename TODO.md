@@ -463,7 +463,8 @@ narrows what counts as observable, not what the detector looks at.
   RAS counts, `vgpu fault lose` drops a GPU off the bus (Xid 79), and `vgpu
   fault link` degrades its PCIe link. NVML's clock and P-state events are
   documented as Kepler-only and its power-source event as a laptop's, so none
-  is offered. `--on copy` puts faults on copies out of device memory. Not yet:
+  is offered. `--on copy` puts faults on copies out of device memory, and
+  `--rate` arms any fault at a seeded rate per access. Not yet:
   CPER record files, a lost AMD GPU, the link in lspci's config space (phase 3).
 
 ## Not implemented (fails loudly, never silently)

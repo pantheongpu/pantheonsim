@@ -59,7 +59,11 @@ struct Counters {
   // where they are taken (Target) and then corrected, uncorrected, bit flip;
   // how many are armed at each target; and the silent bit flips delivered.
   uint64_t armed[5][3];
-  uint64_t armed_pending[5];
+  uint64_t armed_pending[5];   // plus kRatePending while a rate is set at the target
+  // Faults taken at a rate instead of a count: the chance each access takes
+  // one, in units of 2^-32, by target and kind; and the generator's seed.
+  uint64_t rate[5][3];
+  uint64_t rate_seed;
   uint64_t bitflips_delivered;
   // A kernel hang armed for the next launch (not counted in armed_total, which
   // loads read), and how long it lasts: 0 is until the process is stopped.
@@ -155,6 +159,13 @@ const char* target_name(Target t);
 bool parse_target(const std::string& s, Target* out);
 // Throws std::invalid_argument for an ECC error armed on stores or results.
 void arm(const std::string& uuid, Armed kind, uint64_t n, Target at = Target::Load);
+// A fault taken at a rate: every access at `at` takes one with probability
+// `per_access` (0 stops it), drawn from a generator seeded with `seed`, until
+// stopped or a driver reload. Counted faults armed at the same target are
+// taken first. Errors then grow with memory traffic, as a failing part's do.
+inline constexpr uint64_t kRatePending = uint64_t{1} << 40;
+void arm_rate(const std::string& uuid, Armed kind, double per_access, Target at, uint64_t seed);
+double rate_of(const Counters& c, Target at, Armed kind);
 // A hang for the next kernel launch: it stalls for `seconds` and then fails
 // with cudaErrorLaunchTimeout, or with seconds 0 never returns.
 void arm_hang(const std::string& uuid, uint64_t seconds);

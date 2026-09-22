@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <chrono>
@@ -23,10 +24,11 @@ namespace vgpu::ras {
 namespace {
 
 constexpr uint32_t kMagic = 0x56524153;  // "VRAS"
-constexpr uint32_t kVersion = 10;  // 2: armed faults; 3: hangs and clock-event reasons; 4: events;
+constexpr uint32_t kVersion = 11;  // 2: armed faults; 3: hangs and clock-event reasons; 4: events;
                                   // 5: faults armed on stores and shared memory; 6: stuck cells;
                                   // 7: faults armed on arithmetic results; 8: lost GPUs;
-                                  // 9: degraded links; 10: faults armed on copies
+                                  // 9: degraded links; 10: faults armed on copies;
+                                  // 11: faults taken at a rate
 
 struct File {
   uint32_t magic;
@@ -342,8 +344,39 @@ bool parse_target(const std::string& s, Target* out) {
 
 uint64_t Counters::armed_total() const {
   uint64_t n = 0;
-  for (uint64_t p : armed_pending) n += p;
+  for (uint64_t p : armed_pending) n += p % kRatePending;
   return n;
+}
+
+double rate_of(const Counters& c, Target at, Armed kind) {
+  return static_cast<double>(c.rate[static_cast<uint32_t>(at)][armed_slot(kind)]) / 4294967296.0;
+}
+
+void arm_rate(const std::string& uuid, Armed kind, double per_access, Target at, uint64_t seed) {
+  if (kind == Armed::None || kind == Armed::Hang) return;
+  if (at == Target::Store && kind != Armed::Bitflip)
+    throw std::invalid_argument("an ECC error is found when memory is read, not written");
+  if (at == Target::Alu && kind != Armed::Bitflip)
+    throw std::invalid_argument("no ECC covers an arithmetic result");
+  if (!(per_access >= 0 && per_access <= 1)) throw std::invalid_argument("a rate is 0 to 1 per access");
+  uint64_t scaled = static_cast<uint64_t>(per_access * 4294967296.0 + 0.5);
+  if (per_access > 0 && scaled == 0) scaled = 1;   // the smallest rate there is, not none
+  Mapped v(volatile_path(uuid), true);
+  Counters* c = v.counters();
+  const uint32_t t = static_cast<uint32_t>(at);
+  const auto any = [&] {
+    for (const uint64_t& r : c->rate[t])
+      if (__atomic_load_n(&r, __ATOMIC_RELAXED)) return true;
+    return false;
+  };
+  const bool before = any();
+  set(&c->rate_seed, seed);
+  set(&c->rate[t][armed_slot(kind)], scaled);
+  const bool after = any();
+  // While a rate is set every access at the target has to look, so it counts
+  // as pending there.
+  if (after && !before) add(&c->armed_pending[t], kRatePending);
+  if (before && !after) __atomic_sub_fetch(&c->armed_pending[t], kRatePending, __ATOMIC_ACQ_REL);
 }
 
 void arm(const std::string& uuid, Armed kind, uint64_t n, Target at) {
@@ -362,7 +395,18 @@ void arm(const std::string& uuid, Armed kind, uint64_t n, Target at) {
 struct ArmedFaults::Impl {
   explicit Impl(const std::string& uuid) : file(volatile_path(uuid), true) {}
   Mapped file;
+  std::atomic<uint64_t> draws{0};   // this process's draws from the rate generator
 };
+
+namespace {
+// splitmix64: one well-mixed 64-bit value per (seed, draw number).
+uint64_t mix(uint64_t x) {
+  x += 0x9E3779B97F4A7C15ull;
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+  return x ^ (x >> 31);
+}
+}  // namespace
 
 ArmedFaults::ArmedFaults(const std::string& uuid) : impl_(std::make_unique<Impl>(uuid)) {}
 ArmedFaults::~ArmedFaults() = default;
@@ -388,8 +432,20 @@ Armed ArmedFaults::take(Target at) {
   if (take_one(&armed[armed_slot(Armed::Uncorrected)])) got = Armed::Uncorrected;
   else if (take_one(&armed[armed_slot(Armed::Bitflip)])) got = Armed::Bitflip;
   else if (take_one(&armed[armed_slot(Armed::Corrected)])) got = Armed::Corrected;
-  if (got != Armed::None) take_one(&c->armed_pending[static_cast<uint32_t>(at)]);
-  return got;
+  if (got != Armed::None) {
+    take_one(&c->armed_pending[static_cast<uint32_t>(at)]);
+    return got;
+  }
+  // Then a fault at a rate, most severe first.
+  const uint64_t* rate = c->rate[static_cast<uint32_t>(at)];
+  for (Armed kind : {Armed::Uncorrected, Armed::Bitflip, Armed::Corrected}) {
+    const uint64_t r = __atomic_load_n(&rate[armed_slot(kind)], __ATOMIC_RELAXED);
+    if (!r) continue;
+    const uint64_t seed = __atomic_load_n(&c->rate_seed, __ATOMIC_RELAXED);
+    const uint64_t draw = mix(seed ^ mix(impl_->draws.fetch_add(1, std::memory_order_relaxed)));
+    if ((draw >> 32) < r) return kind;
+  }
+  return Armed::None;
 }
 
 void ArmedFaults::note_bitflip() { add(&impl_->file.counters()->bitflips_delivered, 1); }
