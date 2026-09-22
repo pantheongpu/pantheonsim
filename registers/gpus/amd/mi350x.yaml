@@ -68,6 +68,11 @@ config:
   aer_capabilities_control:    [0x118, 32, ro, 0x000000a0]
 
 mmio:
+  nbio_strap0:                 [0x034d8, 32, ro, 0x10007550]
+  nbio_config_memsize:         [0x0378c, 32, ro, 0x00048000, vram.memsize_mb]
+  nbio_partition_mem_cap:      [0x03a08, 32, ro, 0x00000003]
+  nbio_partition_compute_status: [0x03a0c, 32, ro, 0x00000000]
+  nbio_partition_mem_status:   [0x03a10, 32, ro, 0x00000010]
   grbm_status2:                [0x08008, 32, ro, 0x00000008, engine.grbm_status2]
   grbm_status:                 [0x08010, 32, ro, 0x00003028, engine.grbm_status]
   cp_stat:                     [0x08680, 32, ro, 0x00000000, engine.cp_stat]

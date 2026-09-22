@@ -625,7 +625,16 @@ struct RegisterSpace::Impl {
     // AMD's Instinct cards are processing accelerators; NVIDIA's data-center
     // cards 3D controllers; a GeForce a VGA controller.
     if (k == "profile.class") return is_amd(d) ? 0x120000 : is_geforce(d) ? 0x030000 : 0x030200;
+    // An AMD GPU's NBIO: the device ID and revision strapped, with the
+    // function enabled; and the memory partition modes it supports -- NPS1
+    // and NPS4 on CDNA3 (GC 9.4.3 and 9.4.4, which amdgpu assumes when the
+    // register is not read, gmc_v9_0.c), NPS1 and NPS2 on CDNA4.
+    if (k == "profile.nbio_strap0") return (1u << 28) | device;
+    if (k == "profile.nps_cap") return std::strcmp(d.architecture, "cdna4") == 0 ? 0x3u : 0x9u;
     if (k.rfind("bar.", 0) == 0) return bar_value(static_cast<uint32_t>(k[4] - '0'));
+    // The VRAM in MiB, as this device has it: VGPU_VRAM_MB changes it for a
+    // run, so it follows the device rather than the model.
+    if (k == "vram.memsize_mb") return static_cast<uint32_t>(d.vram_total_bytes >> 20);
     if (k == "link.capabilities") {
       // Max speed and width, from the profile; on a captured card the rest --
       // ASPM, exit latencies, clock power management -- as the card had it,
@@ -1004,6 +1013,25 @@ void write_sysfs_files(const telemetry::DeviceSample& d, const std::string& dir)
     }
     replace_file(dir + "/gpu_metrics", amd::gpu_metrics(d, c));
     amd::write_driver_files(d, dir);
+    // The partition modes, as amdgpu reads NBIO for them and names them
+    // (amdgpu_gfx.c's current_compute_partition, amdgpu_gmc.c's
+    // current_memory_partition and available_memory_partition).
+    RegisterSpace mmio(Space::AmdMmio, d);
+    const auto reg = [&](const char* name) { return mmio.value(*find(Space::AmdMmio, name)); };
+    static const char* const kCompute[] = {"SPX", "DPX", "TPX", "QPX", "CPX"};
+    const uint32_t px = (reg("nbio_partition_compute_status") >> 4) & 0xF;
+    replace_file(dir + "/current_compute_partition", std::string(px < 5 ? kCompute[px] : "UNKNOWN") + "\n");
+    const auto nps_known = [](int m) { return m == 1 || m == 2 || m == 3 || m == 4 || m == 6 || m == 8; };
+    const int nps = __builtin_ffs(static_cast<int>((reg("nbio_partition_mem_status") >> 4) & 0xFF));
+    replace_file(dir + "/current_memory_partition",
+                 (nps_known(nps) ? "NPS" + std::to_string(nps) : std::string("UNKNOWN")) + "\n");
+    std::string avail, sep;
+    for (uint32_t cap = reg("nbio_partition_mem_cap"); cap; cap &= cap - 1)
+      if (const int m = __builtin_ffs(static_cast<int>(cap)); nps_known(m)) {
+        avail += sep + "NPS" + std::to_string(m);
+        sep = ", ";
+      }
+    replace_file(dir + "/available_memory_partition", avail + "\n");
   }
 }
 

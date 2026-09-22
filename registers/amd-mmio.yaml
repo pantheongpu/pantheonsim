@@ -4,11 +4,14 @@
 # fields and SMU message numbers from the Linux amdgpu headers (see
 # LICENSES/amdgpu-headers.txt). MI300 finds its IP block bases at boot in its
 # IP discovery table; the bases here are Aldebaran's (MI200), the same GFX9
-# family: GC segment 0 at 0x2000, segment 1 at 0xA000, MP1 at 0x16000 -- so the
+# family: GC segment 0 at 0x2000, segment 1 at 0xA000, MP1 at 0x16000, NBIO
+# segment 2 at 0xD20 -- so the
 # offsets are a model until checked on a card. Keys as in pci-config.yaml,
 # plus `source`, the header symbol an offset comes from.
 #
-# Backings: engine.* (engine status, from whether the GPU is busy) and smu.*
+# Backings: profile.* (what the profile gives the NBIO straps and partition
+# capabilities), vram.* (the VRAM as the device has it this run),
+# engine.* (engine status, from whether the GPU is busy) and smu.*
 # (the SMU mailbox: write the argument, then the message; the response
 # register reads 1 when the SMU has answered and the argument register holds
 # its reply).
@@ -84,4 +87,55 @@ smu_response:
   source: "mp_13_0_6_offset.h regMP1_SMN_C2PMSG_90 0x029a, MP1 segment 0"
   fields: ["31:0 response (1 ok and 0xfe unknown command and 0 pending)"]
   surfaces: [amdgpu, umr]
+  status: model
+
+nbio_strap0:
+  offset: "0x034d8"
+  width: 32
+  access: ro
+  backing: profile.nbio_strap0
+  source: "nbio_7_9_0_offset.h regRCC_STRAP0_RCC_DEV0_EPF0_STRAP0 0x0016, NBIO segment 2"
+  fields: ["15:0 strap_device_id", "19:16 strap_major_rev_id", "23:20 strap_minor_rev_id", "27:24 strap_ati_rev_id", "28 strap_func_en"]
+  surfaces: [amdgpu (nbio get_rev_id)]
+  status: model
+
+nbio_config_memsize:
+  offset: "0x0378c"
+  width: 32
+  access: ro
+  backing: vram.memsize_mb
+  source: "nbio_7_9_0_offset.h regRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE 0x00c3, NBIO segment 2"
+  fields: ["31:0 config_memsize (MiB of VRAM; amdgpu sizes VRAM from it)"]
+  surfaces: [amdgpu (nbio get_memsize), sysfs.mem_info_vram_total]
+  status: model
+
+nbio_partition_mem_cap:
+  offset: "0x03a08"
+  width: 32
+  access: ro
+  backing: profile.nps_cap
+  source: "nbio_7_9_0_offset.h regBIF_BX_PF0_PARTITION_MEM_CAP 0x0162, NBIO segment 2"
+  fields: ["0 nps1_support", "1 nps2_support", "2 nps3_support", "3 nps4_support", "5 nps6_support", "7 nps8_support"]
+  surfaces: [amdgpu (nbio get_memory_partition_mode), sysfs.available_memory_partition]
+  status: model
+  measured: "not measured; NPS1 and NPS4 on GC 9.4.3/9.4.4, as amdgpu assumes for them (gmc_v9_0.c), NPS1 and NPS2 on MI350"
+
+nbio_partition_compute_status:
+  offset: "0x03a0c"
+  width: 32
+  access: ro
+  reset: "0x00000000"
+  source: "nbio_7_9_0_offset.h regBIF_BX_PF0_PARTITION_COMPUTE_STATUS 0x0163, NBIO segment 2"
+  fields: ["7:4 partition_mode (0 SPX 1 DPX 2 TPX 3 QPX 4 CPX)"]
+  surfaces: [amdgpu (nbio get_compute_partition_mode), sysfs.current_compute_partition]
+  status: model
+
+nbio_partition_mem_status:
+  offset: "0x03a10"
+  width: 32
+  access: ro
+  reset: "0x00000010"
+  source: "nbio_7_9_0_offset.h regBIF_BX_PF0_PARTITION_MEM_STATUS 0x0164, NBIO segment 2"
+  fields: ["3:0 change_statue (8 a switch requested)", "11:4 nps_mode (one bit: NPSn at bit n-1)"]
+  surfaces: [amdgpu (nbio get_memory_partition_mode), sysfs.current_memory_partition]
   status: model

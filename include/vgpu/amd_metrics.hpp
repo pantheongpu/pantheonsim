@@ -29,8 +29,9 @@ inline constexpr size_t kGpuMetricsSize = 360;
 // and the graphics and memory clocks (freq1, freq2). What sensors, nvtop and
 // exporters read.
 void write_driver_files(const telemetry::DeviceSample& d, const std::string& dir);
-// The files write_driver_files writes, for a session to link to.
-extern const char* const kDriverFiles[6];
+// The files write_driver_files writes, and the partition files
+// regs::write_sysfs_files writes from NBIO's registers, for a session to link to.
+extern const char* const kDriverFiles[9];
 extern const char* const kHwmonFiles[21];
 
 }  // namespace vgpu::amd
