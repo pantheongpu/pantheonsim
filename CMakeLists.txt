@@ -857,3 +857,15 @@ add_test(NAME pantheon_workloads
 set_tests_properties(pantheon_workloads PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 1800)
+
+# Ollama, unmodified, running a model on every simulated NVIDIA GPU it fits:
+# found, fully offloaded, and generating what its CPU backend does. Skips when
+# ollama or the model is not installed; CI runs it in its own job.
+if(TARGET vgpucublas)
+  add_test(NAME e2e_ollama COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_ollama.sh)
+  set_tests_properties(e2e_ollama PROPERTIES
+    DEPENDS vgpucublas
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 3600)
+endif()

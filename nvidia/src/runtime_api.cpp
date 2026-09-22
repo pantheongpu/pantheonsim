@@ -423,11 +423,23 @@ VGPU_EXPORT void** __cudaRegisterFatBinary(void* fatCubin) {
       }
       return text.substr(pos);
     };
-    auto pick_best = [](std::vector<vgpu::cuda::FatbinPtx>& v) -> std::string {
+    // The PTX the driver would JIT for this device: the newest whose target
+    // it can run -- no newer than its compute capability -- as a fatbin built
+    // for many architectures (sm_75 ... sm_121) carries one per target. Only
+    // when none qualifies, the newest of all, which is then refused at load
+    // with the reason. (Every device of a simulated machine has one profile.)
+    const vgpu::DeviceProfile& dev = s.rt->device(0).profile();
+    const uint32_t cc = static_cast<uint32_t>(dev.cc_major * 10 + dev.cc_minor);
+    auto pick_best = [cc](std::vector<vgpu::cuda::FatbinPtx>& v) -> std::string {
       if (v.empty()) return {};
-      size_t best = 0;
-      for (size_t i = 1; i < v.size(); ++i)
-        if (v[i].arch > v[best].arch) best = i;
+      size_t best = v.size();
+      for (size_t i = 0; i < v.size(); ++i)
+        if (v[i].arch <= cc && (best == v.size() || v[i].arch > v[best].arch)) best = i;
+      if (best == v.size()) {
+        best = 0;
+        for (size_t i = 1; i < v.size(); ++i)
+          if (v[i].arch > v[best].arch) best = i;
+      }
       return std::move(v[best].text);
     };
     auto ptxs = vgpu::cuda::extract_ptx(fatCubin);
@@ -1447,6 +1459,35 @@ VGPU_EXPORT cudaError_t cudaFreeHost(void* ptr) {
 VGPU_EXPORT cudaError_t cudaMemcpyPeerAsync(void* dst, int dstDevice, const void* src,
                                             int srcDevice, size_t count, cudaStream_t) {
   return cudaMemcpyPeer(dst, dstDevice, src, srcDevice, count);
+}
+
+// A 3D copy between devices' linear, pitched memory: each row of the extent
+// (width bytes) from its place in the source to its place in the destination,
+// through the peer copy. CUDA arrays are not modelled for 3D copies.
+VGPU_EXPORT cudaError_t cudaMemcpy3DPeer(const cudaMemcpy3DPeerParms* p) {
+  if (!p) return cudaErrorInvalidValue;
+  if (p->srcArray || p->dstArray) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] cudaMemcpy3DPeer: CUDA arrays are not supported\n");
+    return cudaErrorNotSupported;
+  }
+  const cudaPitchedPtr& sp = p->srcPtr;
+  const cudaPitchedPtr& dp = p->dstPtr;
+  if (!sp.ptr || !dp.ptr || p->extent.width > sp.pitch || p->extent.width > dp.pitch)
+    return cudaErrorInvalidValue;
+  const size_t src_slice = sp.pitch * sp.ysize, dst_slice = dp.pitch * dp.ysize;
+  for (size_t z = 0; z < p->extent.depth; ++z)
+    for (size_t y = 0; y < p->extent.height; ++y) {
+      const char* s = static_cast<const char*>(sp.ptr) + (p->srcPos.z + z) * src_slice +
+                      (p->srcPos.y + y) * sp.pitch + p->srcPos.x;
+      char* d = static_cast<char*>(dp.ptr) + (p->dstPos.z + z) * dst_slice + (p->dstPos.y + y) * dp.pitch +
+                p->dstPos.x;
+      const cudaError_t e = cudaMemcpyPeer(d, p->dstDevice, s, p->srcDevice, p->extent.width);
+      if (e != cudaSuccess) return e;
+    }
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaMemcpy3DPeerAsync(const cudaMemcpy3DPeerParms* p, cudaStream_t) {
+  return cudaMemcpy3DPeer(p);
 }
 
 /* ===================================================================== */
