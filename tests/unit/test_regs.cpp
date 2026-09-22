@@ -14,6 +14,8 @@
 #include <string>
 
 #include "vgpu/amd_metrics.hpp"
+#include "vgpu/embedded_gpu_registers.hpp"
+#include "vgpu/error.hpp"
 #include "vgpu/ras.hpp"
 #include "vgpu/registry.hpp"
 #include "vtest.hpp"
@@ -395,3 +397,157 @@ VTEST(amdgpus_driver_files_are_in_the_hwmon_abis_units) {
 }
 
 VTEST_MAIN
+
+// ---- Each GPU model's registers file (registers/gpus/) ------------------------------
+
+namespace {
+std::string read_file(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+std::string source_file(const std::string& profile) {
+  return std::string(VGPU_SOURCE_DIR) + "/registers/gpus/" + profile + ".yaml";
+}
+// A register's value as software reads it: a 24-bit one as the dword around it.
+uint32_t read_register(regs::RegisterSpace& rs, const regs::GpuRegister& r) {
+  if (r.width == 24) return rs.read(r.offset & ~3u, 4) >> 8;
+  return rs.read(r.offset, r.width / 8);
+}
+// Points VGPU_REGISTERS_DIR at a directory of its own for as long as it lives.
+struct RegistersDir {
+  std::string dir;
+  explicit RegistersDir(const std::string& root) : dir(root + "/gpus") {
+    std::filesystem::create_directories(dir);
+    setenv("VGPU_REGISTERS_DIR", dir.c_str(), 1);
+  }
+  ~RegistersDir() { unsetenv("VGPU_REGISTERS_DIR"); }
+  void write(const std::string& name, const std::string& text) const { std::ofstream(dir + "/" + name) << text; }
+};
+std::string replaced(std::string text, const std::string& from, const std::string& to) {
+  const size_t at = text.find(from);
+  if (at == std::string::npos) throw std::runtime_error("no '" + from + "' in the file");
+  return text.replace(at, from.size(), to);
+}
+}  // namespace
+
+// Every built-in profile has its file, the build embedded the one in the
+// repository, and it is what the database and the profile give today: a
+// change to either that is not regenerated into the file fails here.
+VTEST(every_gpu_has_its_registers_file_and_it_is_current) {
+  size_t embedded_files = 0;
+  for (const auto& e : embedded::kGpuRegisters) embedded_files += e.profile != nullptr;
+  VCHECK_EQ(embedded_files, available_gpus().size());
+  for (const std::string& gpu : available_gpus()) {
+    const auto d = device(gpu.c_str());
+    const regs::GpuRegisters* g = regs::gpu_registers(d);
+    VCHECK(g != nullptr);
+    VCHECK_EQ(g->profile, gpu);
+    VCHECK_EQ(g->device_id, d.pci_device_id >> 16);
+    const std::string file = read_file(source_file(gpu));
+    VCHECK(!file.empty());
+    if (regs::export_registers(gpu, d) != file)
+      throw vtest::Failure("registers/gpus/" + gpu + ".yaml is not what the register database and the profile " +
+                           "give; regenerate it: vgpu regs export --out registers/gpus");
+    bool embedded_same = false;
+    for (const auto& e : embedded::kGpuRegisters)
+      if (e.profile && gpu == e.profile) embedded_same = file == e.yaml;
+    VCHECK(embedded_same);
+  }
+}
+
+// A GPU reads, register by register, what its model's file says at power-on --
+// the live registers included, since the file holds their power-on values.
+VTEST(every_gpu_starts_from_its_registers_file) {
+  for (const std::string& gpu : available_gpus()) {
+    TempMachine m(("start-" + gpu.substr(gpu.find('/') + 1)).c_str());
+    const auto d = device(gpu.c_str());
+    const regs::GpuRegisters* g = regs::gpu_registers(d);
+    VCHECK(g != nullptr);
+    regs::ConfigSpace cs(d);
+    VCHECK_EQ(std::string(cs.layout()), g->layout);
+    VCHECK(!g->config.empty());
+    for (const auto& r : g->config) {
+      VCHECK_EQ(cs.offset_of(*regs::find_config(r.name)), r.offset);
+      if (read_register(cs, r) != r.value)
+        throw vtest::Failure(gpu + ": " + r.name + " does not read as its file's value");
+    }
+    VCHECK_EQ(!g->mmio.empty(), regs::has_space(d, regs::Space::AmdMmio));
+    if (g->mmio.empty()) continue;
+    regs::RegisterSpace mmio(regs::Space::AmdMmio, d);
+    for (const auto& r : g->mmio)
+      if (read_register(mmio, r) != r.value) throw vtest::Failure(gpu + ": " + r.name + " does not read as its file's value");
+  }
+}
+
+// The files are unique per model: no two share a device, and models differ in
+// what they hold -- identity, class, link, BARs.
+VTEST(each_gpu_models_registers_are_its_own) {
+  std::set<uint32_t> ids;
+  std::set<std::string> configs;
+  for (const std::string& gpu : available_gpus()) {
+    const regs::GpuRegisters* g = regs::gpu_registers(device(gpu.c_str()));
+    VCHECK(ids.insert(g->device_id).second);
+    std::string values;
+    for (const auto& r : g->config) values += r.name + "=" + std::to_string(r.value) + ";";
+    VCHECK(configs.insert(values).second);
+  }
+  const auto* t4 = regs::gpu_registers(device("nvidia/t4"));
+  const auto* ti = regs::gpu_registers(device("nvidia/rtx3080ti"));
+  const auto* mi = regs::gpu_registers(device("amd/mi300x"));
+  VCHECK(t4->mmio.empty());           // no BAR0 measured for a T4
+  VCHECK(!ti->mmio.empty());          // the measured card's BAR0
+  VCHECK(!mi->mmio.empty());          // an AMD GPU's registers behind BAR5
+  VCHECK_EQ(ti->layout, std::string("nvidia-rtx3080ti"));
+  VCHECK_EQ(t4->layout, std::string("generic"));
+}
+
+// A value changed in the file is what the GPU reads, without a rebuild: the
+// simulator takes its registers from the file, not from the database.
+VTEST(a_value_changed_in_the_file_is_what_the_gpu_reads) {
+  TempMachine m("edited");
+  const std::string root = std::string("/tmp/vgpu-regs-test-edited-") + std::to_string(getpid());
+  const std::string t4 = read_file(source_file("nvidia/t4"));
+  {
+    RegistersDir none(root + "-none");
+    VCHECK(regs::gpu_registers(device("nvidia/t4")) == nullptr);   // no file: the model derives its registers
+    regs::ConfigSpace cs(device("nvidia/t4"));
+    VCHECK_EQ(cs.read(0x2e, 2), 0x1eb8u);   // subsystem_id, derived
+  }
+  RegistersDir dir(root + "-files");
+  dir.write("t4.yaml", replaced(replaced(t4, "[0x02e, 16, ro, 0x1eb8]", "[0x02e, 16, ro, 0x12a2]"),
+                                "[0x00e, 8, ro, 0x00]", "[0x00e, 8, ro, 0x80]"));
+  regs::ConfigSpace cs(device("nvidia/t4"));
+  VCHECK_EQ(cs.read(0x2e, 2), 0x12a2u);
+  VCHECK_EQ(cs.read(0x0e, 1), 0x80u);
+  VCHECK_EQ(cs.read(0x00, 2), 0x10deu);   // the rest as it was
+  std::filesystem::remove_all(root + "-none");
+  std::filesystem::remove_all(root + "-files");
+}
+
+// A file that disagrees with the database -- another width, a register the
+// database does not have, one missing, another layout -- is refused, naming
+// the register and how to regenerate it, rather than half applied.
+VTEST(a_registers_file_that_disagrees_with_the_database_is_refused) {
+  TempMachine m("stale");
+  const std::string root = std::string("/tmp/vgpu-regs-test-stale-") + std::to_string(getpid()) + "-files";
+  const std::string t4 = read_file(source_file("nvidia/t4"));
+  const auto refused = [&](const std::string& text, const std::string& why) {
+    std::filesystem::remove_all(root + "_" + why);
+    RegistersDir dir(root + "_" + why);
+    dir.write("t4.yaml", text);
+    auto err = VCAPTURE(Error, regs::ConfigSpace(device("nvidia/t4")));
+    VCHECK_CONTAINS(err.what(), "vgpu regs export nvidia/t4");
+    std::filesystem::remove_all(root + "_" + why);
+    return std::string(err.what());
+  };
+  VCHECK_CONTAINS(refused(replaced(t4, "[0x02e, 16, ro, 0x1eb8]", "[0x02e, 32, ro, 0x1eb8]"), "width"),
+                  "subsystem_id differs");
+  VCHECK_CONTAINS(refused(replaced(t4, "  subsystem_id:", "  subsystem_idd:"), "unknown"),
+                  "subsystem_idd is not in the register database");
+  VCHECK_CONTAINS(refused(replaced(t4, "  subsystem_id:                [0x02e, 16, ro, 0x1eb8]\n", ""), "missing"),
+                  "1 of the device's config registers are missing");
+  VCHECK_CONTAINS(refused(replaced(t4, "layout: generic", "layout: nvidia-rtx3080ti"), "layout"),
+                  "layout nvidia-rtx3080ti");
+  VCHECK_CONTAINS(refused(replaced(t4, "[0x08a, 16, ro, 0x1083, link.status]", "[0x08a, 16, ro, 0x1083]"), "live"),
+                  "link_status differs");
+}

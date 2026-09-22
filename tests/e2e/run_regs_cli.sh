@@ -102,6 +102,18 @@ kill $loaded 2>/dev/null; wait $loaded 2>/dev/null
 expect "a busy GPU's GRBM_STATUS has GUI_ACTIVE and CP busy set" "yes" \
   "$( (( (busy >> 31) & 1 && (busy >> 29) & 1 )) && echo yes || echo no)"
 
+# Every GPU model's registers are kept in the repository, and what is kept is
+# what the database and the profiles give: a change to either without the
+# files regenerated fails here.
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+"$vgpu" regs export --out "$tmp/gpus" >/dev/null
+expect "registers/gpus is what \`vgpu regs export\` writes" "" \
+  "$(diff -r "$root/registers/gpus" "$tmp/gpus" 2>&1 | head -5)"
+cp -r "$root/registers/gpus" "$tmp/edited"
+sed -i -E 's/^(  subsystem_id: +\[0x02e, 16, ro, )0x[0-9a-f]+\]/\10x1234]/' "$tmp/edited/amd/mi300x.yaml"
+expect "a value edited in the file is what the GPU reads" "0x1234" \
+  "$(VGPU_REGISTERS_DIR="$tmp/edited" VGPU_GPU=amd/mi300x "$vgpu" regs read subsystem_id | head -1 | awk '{print $4}')"
+
 if command -v lspci >/dev/null; then
   h100 fault link --gpu 0 --gen 3 --width 8 >/dev/null
   h100 fault inject --gpu 0 --pcie replay >/dev/null

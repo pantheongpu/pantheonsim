@@ -66,6 +66,40 @@ bool has_space(const telemetry::DeviceSample& d, Space s);
 
 inline constexpr uint32_t kConfigSize = 4096;
 
+// The registers of one GPU model and their values at power-on, as the
+// repository keeps them (registers/gpus/<vendor>/<model>.yaml, embedded at
+// build time): every register of every space the model has, where the model
+// has it. A device of the model starts from these values, so every simulator
+// started as that GPU reads the same. Registers whose value follows the
+// device's state -- the link, the BARs, error status, engine activity, the
+// SMU mailbox -- name what they follow and hold their power-on value.
+//
+// VGPU_REGISTERS_DIR, when set, is searched (recursively, *.yaml) in place of
+// the embedded files: a changed value takes effect without a rebuild.
+struct GpuRegister {
+  std::string name;
+  uint32_t offset = 0;    // on this model, capability chain included
+  uint32_t width = 0;
+  Access access = Access::Ro;
+  uint32_t value = 0;     // at power-on
+  std::string live;       // the backing it follows; "" for a fixed value
+};
+struct GpuRegisters {
+  std::string origin;     // the file, for errors
+  std::string profile;    // "nvidia/t4"
+  uint32_t device_id = 0; // PCI device ID, which identifies the model
+  std::string layout;     // "generic", or the captured card it replays
+  std::vector<GpuRegister> config, mmio;
+};
+// The model's registers, found by PCI device ID; null when the repository has
+// no file for it (a profile added without one), and the model's registers are
+// then derived from the database and the profile. Throws on a malformed file.
+const GpuRegisters* gpu_registers(const telemetry::DeviceSample& d);
+// A model's file as `vgpu regs export` writes it: derived from the register
+// database and the profile, never from an existing file. `d` is the model's
+// first device at power-on (telemetry::describe_device, ordinal 0).
+std::string export_registers(const std::string& profile, const telemetry::DeviceSample& d);
+
 // One access, as the log keeps it.
 struct LogEntry {
   uint64_t seq = 0;
@@ -86,6 +120,10 @@ inline constexpr uint32_t kLogEntries = 256;
 class RegisterSpace {
  public:
   RegisterSpace(Space s, const telemetry::DeviceSample& d);
+  // `derived`: the database's and profile's values, ignoring the model's file,
+  // over a private power-on state -- no writes, no error counts, no log shared
+  // with other processes. What `vgpu regs export` reads.
+  RegisterSpace(Space s, const telemetry::DeviceSample& d, bool derived);
   ~RegisterSpace();
   RegisterSpace(const RegisterSpace&) = delete;
   RegisterSpace& operator=(const RegisterSpace&) = delete;

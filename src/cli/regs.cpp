@@ -6,12 +6,15 @@
 #include <cstdlib>
 #include <ctime>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "args.hpp"
 #include "machine.hpp"
+#include "vgpu/registry.hpp"
 #include "vgpu/regs.hpp"
 #include "vgpu/telemetry.hpp"
 
@@ -24,6 +27,7 @@ int usage(FILE* to) {
                "       vgpu regs write [--space S] [--gpu N] REGISTER VALUE [--size 1|2|4]\n"
                "       vgpu regs dump [--space S] [--gpu N] [--extended]\n"
                "       vgpu regs log [--space S] [--gpu N] [--last K]\n"
+               "       vgpu regs export [PROFILE...] [--out DIR]\n"
                "\n"
                "A device's registers, from the register database: each register's offset,\n"
                "width, access and what backs it. --space is config (default), the PCI\n"
@@ -34,7 +38,13 @@ int usage(FILE* to) {
                "written to an rw1c status bit clears it until its cause recurs, and a base\n"
                "address register reads back its size after all ones are written. Writes are\n"
                "shared by every process on the machine, and every access is logged with the\n"
-               "process that made it. --gpu defaults to 0.\n");
+               "process that made it. --gpu defaults to 0.\n"
+               "\n"
+               "Every GPU model's registers and their power-on values are kept in the\n"
+               "repository, registers/gpus/<vendor>/<model>.yaml, and every simulated GPU of\n"
+               "the model starts from them. `export` writes those files from the database and\n"
+               "the profiles: to stdout, or with --out as DIR/<vendor>/<model>.yaml. With no\n"
+               "PROFILE, every built-in one.\n");
   return to == stdout ? 0 : 2;
 }
 
@@ -80,16 +90,64 @@ void print_register(const vgpu::regs::Register& r, uint32_t at, uint32_t v) {
   }
 }
 
+// `vgpu regs export`: each profile's registers file, from its first device at
+// power-on.
+int export_files(const std::vector<std::string>& args) {
+  std::string out_dir;
+  std::vector<std::string> profiles;
+  for (size_t i = 0; i < args.size(); ++i) {
+    if (args[i] == "--out") {
+      if (i + 1 >= args.size()) {
+        std::fprintf(stderr, "vgpu regs export: --out needs a directory\n");
+        return 2;
+      }
+      out_dir = args[++i];
+    } else if (args[i].rfind("--", 0) == 0) {
+      std::fprintf(stderr, "vgpu regs export: unknown option '%s'\n", args[i].c_str());
+      return 2;
+    } else {
+      profiles.push_back(args[i]);
+    }
+  }
+  if (profiles.empty()) profiles = vgpu::available_gpus();
+  try {
+    for (const std::string& p : profiles) {
+      const vgpu::DeviceProfile prof = vgpu::load_gpu(p);
+      vgpu::telemetry::DeviceSample d{};
+      vgpu::telemetry::describe_device(prof, 0, &d);
+      const std::string text = vgpu::regs::export_registers(prof.id, d);
+      if (out_dir.empty()) {
+        std::fputs(text.c_str(), stdout);
+        continue;
+      }
+      const std::filesystem::path path = std::filesystem::path(out_dir) / (prof.id + ".yaml");
+      std::filesystem::create_directories(path.parent_path());
+      std::ofstream f(path, std::ios::trunc);
+      f << text;
+      if (!f) {
+        std::fprintf(stderr, "vgpu regs export: could not write %s\n", path.c_str());
+        return 1;
+      }
+      std::printf("wrote %s\n", path.c_str());
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "vgpu regs export: %s\n", e.what());
+    return 2;
+  }
+  return 0;
+}
+
 }  // namespace
 
 int cmd_regs(const std::vector<std::string>& args) {
   if (args.empty()) return usage(stderr);
   const std::string& verb = args[0];
   if (verb == "-h" || verb == "--help" || verb == "help") return usage(stdout);
-  if (verb != "list" && verb != "read" && verb != "write" && verb != "dump" && verb != "log") {
-    std::fprintf(stderr, "vgpu regs: unknown action '%s' (list, read, write, dump or log)\n", verb.c_str());
+  if (verb != "list" && verb != "read" && verb != "write" && verb != "dump" && verb != "log" && verb != "export") {
+    std::fprintf(stderr, "vgpu regs: unknown action '%s' (list, read, write, dump, log or export)\n", verb.c_str());
     return 2;
   }
+  if (verb == "export") return export_files(std::vector<std::string>(args.begin() + 1, args.end()));
   long long gpu = 0, size = 0, last = 20;
   bool extended = false;
   std::string status;

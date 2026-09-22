@@ -47,6 +47,55 @@ The database is embedded at build time. A value is never a guess: a register
 either has a reset value or a backing, and a backing the engine does not know
 is an error, not a zero.
 
+## Each GPU's registers
+
+The database says what a register is; `registers/gpus/<vendor>/<model>.yaml`
+says what it holds on one GPU model. There is a file for every profile, listing
+every register of each space the model has, at the offset the model has it
+(a card whose capability chain is laid out differently has its registers where
+its chain puts them), with the value it reads as at power-on:
+
+```yaml
+profile: amd/mi300x
+pci_device_id: 0x74a1
+layout: generic
+
+config:
+  device_id:                   [0x002, 16, ro, 0x74a1]
+  link_status:                 [0x08a, 16, ro, 0x1105, link.status]
+```
+
+A register with a fifth element follows the device's state -- the link, the
+BARs, error status, the engines, the SMU mailbox -- and its value is the one it
+has at power-on. Every other value is fixed for the model. The files are
+embedded at build time, and every simulated GPU of the model, in every process,
+starts from them: two runs of the same GPU read the same registers.
+
+The files are generated, not written by hand:
+
+```bash
+vgpu regs export amd/mi300x                 # one model's file, to stdout
+vgpu regs export --out registers/gpus       # every profile's
+```
+
+Change a register in the database or a profile, then regenerate. `regs_cli`
+fails when a committed file differs from what `export` writes, and the unit
+tests fail when a profile has no file, two files claim one PCI device ID, or a
+file disagrees with the database (a register missing, unknown, at another
+offset, with another width or access, or fixed where the database has it
+live). A stale file is refused with the command that regenerates it, never
+half applied.
+
+To try other values without a rebuild, point `VGPU_REGISTERS_DIR` at a copy of
+the directory and edit it. The simulator reads that directory in place of the
+embedded files:
+
+```bash
+cp -r registers/gpus /tmp/gpus
+$EDITOR /tmp/gpus/amd/mi300x.yaml
+VGPU_REGISTERS_DIR=/tmp/gpus VGPU_GPU=amd/mi300x vgpu regs read subsystem_id
+```
+
 ## Configuration space
 
 The type-0 header; capabilities for power management (0x60), MSI (0x68) and
