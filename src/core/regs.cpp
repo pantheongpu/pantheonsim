@@ -65,6 +65,7 @@ std::vector<Register> load(const char* yaml, const std::string& origin, uint32_t
     r.backing = str("backing", false);
     r.status = str("status", true);
     r.source = str("source", false);
+    r.measured = str("measured", false);
     r.fields = list("fields");
     r.surfaces = list("surfaces");
     if (r.access == Access::Rw && !r.write_mask)
@@ -370,6 +371,12 @@ struct RegisterSpace::Impl {
     if (k == "profile.vendor_id" || k == "profile.subsystem_vendor_id") return vendor;
     if (k == "profile.device_id" || k == "profile.subsystem_id") return device;
     if (k == "profile.revision") return is_amd(d) ? 0x00 : 0xa1;
+    // As a bound driver leaves it: memory and bus mastering on, INTx off for
+    // MSI, and I/O on where there is an I/O BAR (measured: RTX 3080 Ti, 0x0407).
+    if (k == "profile.command") return is_geforce(d) ? 0x0407 : 0x0406;
+    // A GeForce is function 0 of two, the second its HDMI audio controller
+    // (measured: RTX 3080 Ti, 0x80).
+    if (k == "profile.header_type") return is_geforce(d) ? 0x80 : 0x00;
     // AMD's Instinct cards are processing accelerators; NVIDIA's data-center
     // cards 3D controllers; a GeForce a VGA controller.
     if (k == "profile.class") return is_amd(d) ? 0x120000 : is_geforce(d) ? 0x030000 : 0x030200;
@@ -377,9 +384,13 @@ struct RegisterSpace::Impl {
     if (k == "link.capabilities")
       // Max speed and width, ASPM L1 supported, L1 exit latency under 32 us.
       return (d.pcie_gen_max & 0xF) | ((d.pcie_width_max & 0x3F) << 4) | (2u << 10) | (6u << 15);
-    if (k == "link.status")
-      // Current speed and width, and the slot's reference clock.
-      return (d.pcie_gen & 0xF) | ((d.pcie_width & 0x3F) << 4) | (1u << 12);
+    if (k == "link.status") {
+      // Current speed and width, and the slot's reference clock. A GeForce
+      // drops its link to Gen1 while idle and retrains when work arrives
+      // (measured: RTX 3080 Ti, 2.5 GT/s idle of 16 GT/s).
+      const uint32_t gen = is_geforce(d) && d.utilization_gpu == 0 && d.pcie_gen ? 1 : d.pcie_gen;
+      return (gen & 0xF) | ((d.pcie_width & 0x3F) << 4) | (1u << 12);
+    }
     if (k == "link.capabilities2")
       return d.pcie_gen_max ? (((1u << d.pcie_gen_max) - 1) << 1) : 0;
     if (k == "link.control2") return d.pcie_gen_max & 0xF;
@@ -428,10 +439,12 @@ struct RegisterSpace::Impl {
     State* s = state();
     switch (r.access) {
       case Access::Rw:
-        if (!r.backing.empty()) return backed(r, c);
+        // The SMU mailbox is live; any other backing is the reset value, which
+        // follows the device until something writes the register.
+        if (r.backing.rfind("smu.", 0) == 0) return backed(r, c);
         return __atomic_load_n(&s->rw_set[i], __ATOMIC_ACQUIRE)
                    ? static_cast<uint32_t>(__atomic_load_n(&s->rw_value[i], __ATOMIC_RELAXED))
-                   : r.reset;
+                   : r.backing.empty() ? r.reset : backed(r, c);
       case Access::Ro:
         return r.backing.empty() ? r.reset : backed(r, c);
       case Access::Rw1c:
@@ -547,7 +560,7 @@ void RegisterSpace::write(uint32_t offset, uint32_t size, uint32_t value) {
       case Access::Ro:
         break;
       case Access::Rw: {
-        if (!r.backing.empty()) {
+        if (r.backing.rfind("smu.", 0) == 0) {
           smu_write(s, r.backing, (impl_->evaluate(r, c) & ~covered) | (bits & covered));
           break;
         }

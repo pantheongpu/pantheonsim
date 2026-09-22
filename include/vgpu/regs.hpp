@@ -44,6 +44,7 @@ struct Register {
   std::vector<std::string> surfaces;
   std::string status;          // "done" or "model"
   std::string source;          // where the offset comes from, when it is not a standard's
+  std::string measured;        // what a real card read, where one has been checked
 };
 
 // A space's registers, ordered by offset. Throws on a malformed database,

@@ -7,6 +7,8 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -97,7 +99,7 @@ VTEST(read_write_bits_are_kept_and_read_only_ones_are_not) {
   const auto d = device("nvidia/h100");
   {
     regs::ConfigSpace cs(d);
-    VCHECK_EQ(cs.read(0x04, 2), 0x0006u);
+    VCHECK_EQ(cs.read(0x04, 2), 0x0406u);   // as a bound driver leaves it
     cs.write(0x04, 2, 0xFFFF);
     VCHECK_EQ(cs.read(0x04, 2), 0x0547u);   // only the writable bits
     cs.write(0x04, 1, 0x02);                // a byte write leaves the other byte alone
@@ -253,6 +255,30 @@ VTEST(an_mmio_access_is_a_whole_aligned_dword) {
     }
     VCHECK(refused);
   }
+}
+
+// The GA10x GeForce the RTX 3060 profile models, against a real RTX 3080 Ti
+// (GA102) read by tools/regprobe (registers/measurements/nvidia-rtx3080ti):
+// every header byte that is not this card's or this host's own -- IDs,
+// addresses, the IRQ line -- must match.
+VTEST(a_geforce_header_matches_the_one_measured) {
+  TempMachine m("measured");
+  std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/registers/measurements/nvidia-rtx3080ti/config-header.bin",
+                   std::ios::binary);
+  const std::string real((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  VCHECK_EQ(real.size(), 64u);
+  regs::ConfigSpace cs(device("nvidia/rtx3060"));
+  const auto model = cs.image(64);
+  const auto byte = [&](size_t i) { return static_cast<uint8_t>(real[i]); };
+  for (size_t i : {0x00, 0x01,            // vendor
+                   0x04, 0x05, 0x06, 0x07,  // command, status
+                   0x08, 0x09, 0x0a, 0x0b,  // revision, class
+                   0x0c, 0x0d, 0x0e,        // cache line, latency, header type
+                   0x2c, 0x2d,              // subsystem vendor
+                   0x34, 0x3d})             // capabilities pointer, interrupt pin
+    VCHECK_EQ(static_cast<int>(model[i]), static_cast<int>(byte(i)));
+  // BAR types: the low bits of each (32-bit, 64-bit prefetchable, I/O).
+  for (size_t bar : {0x10, 0x14, 0x1c, 0x24}) VCHECK_EQ(model[bar] & 0xF, byte(bar) & 0xF);
 }
 
 VTEST_MAIN
