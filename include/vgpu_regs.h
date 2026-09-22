@@ -36,9 +36,15 @@ void vgpu_regs_close(vgpu_regs* regs);
 int vgpu_regs_read(vgpu_regs* regs, uint32_t offset, uint32_t size, uint32_t* value);
 int vgpu_regs_write(vgpu_regs* regs, uint32_t offset, uint32_t size, uint32_t value);
 
-/* A register of `space` by the name the database gives it: its offset, and its
- * width in bits. */
+/* A register of `space` by the name the database gives it: its offset in the
+ * generic layout, and its width in bits. */
 int vgpu_regs_find(const char* space, const char* name, uint32_t* offset, uint32_t* width_bits);
+
+/* The same register where this GPU has it. A capability's register (PCI
+ * Express, AER, ...) is wherever the GPU's capability chain puts the
+ * capability, which on a card whose space was captured from real hardware can
+ * differ from the generic layout; ENOENT when the GPU does not have it. */
+int vgpu_regs_locate(vgpu_regs* regs, const char* name, uint32_t* offset, uint32_t* width_bits);
 
 /* What went wrong with this thread's last call, or "" after a success. */
 const char* vgpu_regs_last_error(void);

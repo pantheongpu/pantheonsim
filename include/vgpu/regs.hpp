@@ -45,6 +45,7 @@ struct Register {
   std::string status;          // "done" or "model"
   std::string source;          // where the offset comes from, when it is not a standard's
   std::string measured;        // what a real card read, where one has been checked
+  std::string capability;      // pm, msi, pcie or aer: found through the capability chain
 };
 
 // A space's registers, ordered by offset. Throws on a malformed database,
@@ -94,6 +95,16 @@ class RegisterSpace {
 
   // The value a register reads as now, without logging.
   uint32_t value(const Register& r);
+  // Where a register is on this device: its offset in the generic layout, or,
+  // for a capability's register, wherever the device's capability chain puts
+  // that capability. kAbsent when the device does not have it.
+  static constexpr uint32_t kAbsent = 0xFFFFFFFFu;
+  uint32_t offset_of(const Register& r) const;
+  // The register at an offset on this device, or null.
+  const Register* at(uint32_t offset) const;
+  // "generic", or the captured card whose configuration space this device
+  // replays (registers/measurements/).
+  const char* layout() const;
   // The first `len` bytes of the space, without logging: for files a session
   // keeps up to date, which no tool has read yet.
   std::vector<uint8_t> image_unlogged(uint32_t len);

@@ -60,7 +60,9 @@ VTEST(the_database_loads_in_offset_order_with_no_overlaps) {
 
 VTEST(the_capability_chains_lead_from_the_pointer_to_the_end) {
   TempMachine m("chain");
-  for (const char* gpu : {"nvidia/h100", "nvidia/rtx3060", "amd/mi300x"}) {
+  // The generic layout's chains; a card that replays a captured space has the
+  // captured card's (a_geforce_replays_the_measured_configuration_space).
+  for (const char* gpu : {"nvidia/h100", "nvidia/t4", "amd/mi300x"}) {
     regs::ConfigSpace cs(device(gpu));
     const auto img = cs.image(regs::kConfigSize);
     std::set<uint8_t> ids;
@@ -258,28 +260,51 @@ VTEST(an_mmio_access_is_a_whole_aligned_dword) {
   }
 }
 
-// The GA10x GeForce the RTX 3060 profile models, against a real RTX 3080 Ti
-// (GA102) read by tools/regprobe (registers/measurements/nvidia-rtx3080ti):
-// every header byte that is not this card's or this host's own -- IDs,
-// addresses, the IRQ line -- must match.
-VTEST(a_geforce_header_matches_the_one_measured) {
+// The GA10x GeForce the RTX 3060 profile models replays a real RTX 3080 Ti's
+// configuration space (GA102, read as root by tools/regprobe;
+// registers/measurements/nvidia-rtx3080ti): all 4096 bytes must match but for
+// what is this card's or this host's own -- its IDs and its BAR addresses.
+VTEST(a_geforce_replays_the_measured_configuration_space) {
   TempMachine m("measured");
-  std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/registers/measurements/nvidia-rtx3080ti/config-header.bin",
+  std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/registers/measurements/nvidia-rtx3080ti/config.bin",
                    std::ios::binary);
   const std::string real((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  VCHECK_EQ(real.size(), 64u);
+  VCHECK_EQ(real.size(), size_t{regs::kConfigSize});
   regs::ConfigSpace cs(device("nvidia/rtx3060"));
-  const auto model = cs.image(64);
-  const auto byte = [&](size_t i) { return static_cast<uint8_t>(real[i]); };
-  for (size_t i : {0x00, 0x01,            // vendor
-                   0x04, 0x05, 0x06, 0x07,  // command, status
-                   0x08, 0x09, 0x0a, 0x0b,  // revision, class
-                   0x0c, 0x0d, 0x0e,        // cache line, latency, header type
-                   0x2c, 0x2d,              // subsystem vendor
-                   0x34, 0x3d})             // capabilities pointer, interrupt pin
-    VCHECK_EQ(static_cast<int>(model[i]), static_cast<int>(byte(i)));
-  // BAR types: the low bits of each (32-bit, 64-bit prefetchable, I/O).
-  for (size_t bar : {0x10, 0x14, 0x1c, 0x24}) VCHECK_EQ(model[bar] & 0xF, byte(bar) & 0xF);
+  VCHECK_EQ(std::string(cs.layout()), std::string("nvidia-rtx3080ti"));
+  const auto model = cs.image(regs::kConfigSize);
+  const std::set<size_t> own = {0x02, 0x03, 0x2e, 0x2f};   // device and subsystem IDs
+  for (size_t i = 0; i < regs::kConfigSize; ++i) {
+    // BAR addresses, not their type bits: every byte of the 64-bit BARs' upper
+    // halves (BAR2 and BAR4), the address bytes of the rest.
+    if (own.count(i) || (i >= 0x18 && i < 0x1c) || (i >= 0x20 && i < 0x24) ||
+        (i >= 0x10 && i < 0x28 && (i & 3) != 0))
+      continue;
+    if (model[i] != static_cast<uint8_t>(real[i])) {
+      std::fprintf(stderr, "  byte 0x%03zx: model 0x%02x, measured 0x%02x\n", i, model[i],
+                   static_cast<uint8_t>(real[i]));
+      VCHECK(false);
+    }
+  }
+}
+
+VTEST(capability_registers_are_found_through_each_cards_chain) {
+  TempMachine m("chainwalk");
+  const auto* aer = regs::find_config("aer_correctable_status");
+  const auto* link = regs::find_config("link_status");
+  regs::ConfigSpace generic(device("nvidia/h100"));
+  VCHECK_EQ(std::string(generic.layout()), std::string("generic"));
+  VCHECK_EQ(generic.offset_of(*aer), 0x110u);
+  const auto d = device("nvidia/rtx3060");
+  regs::ConfigSpace geforce(d);
+  VCHECK_EQ(geforce.offset_of(*aer), 0x430u);   // the captured card's AER is at 0x420
+  VCHECK_EQ(geforce.offset_of(*link), 0x8au);
+  VCHECK(geforce.at(0x430) == aer);
+  ras::inject_pcie(d.uuid, ras::Pcie::BadTlp, 1);
+  VCHECK_EQ(geforce.read(0x430, 4), 1u << 6);   // live, where the chain put it
+  geforce.write(0x430, 4, 1u << 6);
+  VCHECK_EQ(geforce.read(0x430, 4), 0u);
+  VCHECK_EQ(regs::link(geforce).max_gen, 4u);    // the profile's link, through the relocated registers
 }
 
 VTEST(an_amd_gpus_metrics_table_is_the_drivers_v1_5_layout) {

@@ -98,4 +98,20 @@ VGPU_EXPORT int vgpu_regs_find(const char* space, const char* name, uint32_t* of
   return VGPU_REGS_OK;
 }
 
+VGPU_EXPORT int vgpu_regs_locate(vgpu_regs* regs, const char* name, uint32_t* offset, uint32_t* width_bits) {
+  if (!name) return fail(VGPU_REGS_EINVAL, "no register name");
+  const vgpu::regs::Register* r = nullptr;
+  uint32_t at = vgpu::regs::RegisterSpace::kAbsent;
+  const int rc = with_space(regs, [&](vgpu::regs::RegisterSpace& rs) {
+    if ((r = vgpu::regs::find(rs.space(), name))) at = rs.offset_of(*r);
+  });
+  if (rc != VGPU_REGS_OK) return rc;
+  if (!r) return fail(VGPU_REGS_ENOENT, std::string("no register '") + name + "'");
+  if (at == vgpu::regs::RegisterSpace::kAbsent)
+    return fail(VGPU_REGS_ENOENT, std::string("this GPU has no ") + r->capability + " capability");
+  if (offset) *offset = at;
+  if (width_bits) *width_bits = r->width;
+  return VGPU_REGS_OK;
+}
+
 VGPU_EXPORT const char* vgpu_regs_last_error(void) { return g_error.c_str(); }

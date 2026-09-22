@@ -9,9 +9,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <stdexcept>
 
 #include "vgpu/amd_metrics.hpp"
+#include "vgpu/embedded_config_images.hpp"
 #include "vgpu/embedded_registers.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/ras.hpp"
@@ -67,6 +69,10 @@ std::vector<Register> load(const char* yaml, const std::string& origin, uint32_t
     r.status = str("status", true);
     r.source = str("source", false);
     r.measured = str("measured", false);
+    r.capability = str("capability", false);
+    if (!r.capability.empty() && r.capability != "pm" && r.capability != "msi" && r.capability != "pcie" &&
+        r.capability != "aer")
+      throw Error::make(Err::ProfileParse, where, ": capability is pm, msi, pcie or aer");
     r.fields = list("fields");
     r.surfaces = list("surfaces");
     if (r.access == Access::Rw && !r.write_mask)
@@ -245,6 +251,43 @@ bool raised(uint64_t count, uint64_t cleared_at) {
   return count > (cleared_at <= count ? cleared_at : 0);
 }
 
+// Where each capability's header is in the generic layout.
+uint32_t generic_capability(const std::string& cap) {
+  return cap == "pm" ? 0x60 : cap == "msi" ? 0x68 : cap == "pcie" ? 0x78 : cap == "aer" ? 0x100 : 0;
+}
+
+// The captured configuration space a device replays, if its family has one:
+// an Ampere GeForce, the RTX 3080 Ti's (registers/measurements/nvidia-rtx3080ti).
+const embedded::ConfigImage* measured_image(const telemetry::DeviceSample& d) {
+  if (is_amd(d) || !is_geforce(d) || std::strcmp(d.architecture, "ampere") != 0) return nullptr;
+  for (const auto& img : embedded::kConfigImages)
+    if (std::strcmp(img.name, "nvidia-rtx3080ti") == 0) return &img;
+  return nullptr;
+}
+
+// Each capability's header in a configuration space, found as a driver finds
+// it: the standard chain from the capabilities pointer, the extended chain
+// from 0x100. First of each kind wins; a malformed chain ends the walk.
+std::map<std::string, uint32_t> walk_capabilities(const uint8_t* img) {
+  std::map<std::string, uint32_t> at;
+  uint32_t p = img[0x34] & 0xFC;
+  for (int hops = 0; p >= 0x40 && p < 0x100 && hops < 48; ++hops) {
+    const uint8_t id = img[p];
+    const char* name = id == 0x01 ? "pm" : id == 0x05 ? "msi" : id == 0x10 ? "pcie" : nullptr;
+    if (name && !at.count(name)) at[name] = p;
+    p = img[p + 1] & 0xFC;
+  }
+  p = 0x100;
+  for (int hops = 0; p >= 0x100 && p < kConfigSize && hops < 64; ++hops) {
+    const uint32_t hdr = img[p] | img[p + 1] << 8 | img[p + 2] << 16 | static_cast<uint32_t>(img[p + 3]) << 24;
+    if (!hdr) break;
+    if ((hdr & 0xFFFF) == 0x0001 && !at.count("aer")) at["aer"] = p;
+    p = (hdr >> 20) & 0xFFC;
+    if (!p) break;
+  }
+  return at;
+}
+
 // The SMU mailbox, as the driver drives it: clear the response, write the
 // argument, write the message; the SMU answers in the response register, and
 // in the argument register when the message returns a value.
@@ -332,11 +375,44 @@ struct RegisterSpace::Impl {
       : space(sp),
         d(dev),
         file(state_path(dev.uuid, sp), true, kMagic, database_version(sp), sizeof(State), "register state"),
-        bars(bar_layout(dev)) {}
+        bars(bar_layout(dev)) {
+    // Where each register is on this device: the generic layout's offset, or
+    // for a device replaying a captured space, wherever its chain puts the
+    // register's capability.
+    const auto& rs = registers(space);
+    at.resize(rs.size());
+    if (space == Space::Config) image_src = measured_image(d);
+    std::map<std::string, uint32_t> caps;
+    if (image_src) caps = walk_capabilities(image_src->bytes);
+    for (size_t i = 0; i < rs.size(); ++i) {
+      const Register& r = rs[i];
+      if (!image_src || r.capability.empty()) {
+        at[i] = r.offset;
+        continue;
+      }
+      const auto it = caps.find(r.capability);
+      at[i] = it == caps.end() ? RegisterSpace::kAbsent
+                               : it->second + (r.offset - generic_capability(r.capability));
+    }
+  }
   Space space;
   telemetry::DeviceSample d;
   SharedState file;
   std::array<BarLayout, 6> bars;
+  const embedded::ConfigImage* image_src = nullptr;
+  std::vector<uint32_t> at;   // by register index
+
+  size_t index(const Register& r) const { return static_cast<size_t>(&r - registers(space).data()); }
+
+  // A register's reset value: the captured card's bytes where the device
+  // replays one, the database's otherwise.
+  uint32_t base(const Register& r) const {
+    if (!image_src) return r.reset;
+    const uint32_t off = at[index(r)];
+    uint32_t v = 0;
+    for (uint32_t b = 0; b < r.width / 8; ++b) v |= static_cast<uint32_t>(image_src->bytes[off + b]) << (8 * b);
+    return v;
+  }
 
   State* state() { return static_cast<State*>(file.payload()); }
 
@@ -382,19 +458,24 @@ struct RegisterSpace::Impl {
     // cards 3D controllers; a GeForce a VGA controller.
     if (k == "profile.class") return is_amd(d) ? 0x120000 : is_geforce(d) ? 0x030000 : 0x030200;
     if (k.rfind("bar.", 0) == 0) return bar_value(static_cast<uint32_t>(k[4] - '0'));
-    if (k == "link.capabilities")
-      // Max speed and width, ASPM L1 supported, L1 exit latency under 32 us.
-      return (d.pcie_gen_max & 0xF) | ((d.pcie_width_max & 0x3F) << 4) | (2u << 10) | (6u << 15);
+    if (k == "link.capabilities") {
+      // Max speed and width, from the profile; on a captured card the rest --
+      // ASPM, exit latencies, clock power management -- as the card had it,
+      // and otherwise ASPM L1 with an L1 exit latency under 32 us.
+      const uint32_t rest = image_src ? base(r) & ~0x3FFu : (2u << 10) | (6u << 15);
+      return (d.pcie_gen_max & 0xF) | ((d.pcie_width_max & 0x3F) << 4) | rest;
+    }
     if (k == "link.status") {
       // Current speed and width, and the slot's reference clock. A GeForce
       // drops its link to Gen1 while idle and retrains when work arrives
       // (measured: RTX 3080 Ti, 2.5 GT/s idle of 16 GT/s).
       const uint32_t gen = is_geforce(d) && d.utilization_gpu == 0 && d.pcie_gen ? 1 : d.pcie_gen;
-      return (gen & 0xF) | ((d.pcie_width & 0x3F) << 4) | (1u << 12);
+      const uint32_t rest = image_src ? base(r) & ~0x3FFu : 1u << 12;
+      return (gen & 0xF) | ((d.pcie_width & 0x3F) << 4) | rest;
     }
     if (k == "link.capabilities2")
-      return d.pcie_gen_max ? (((1u << d.pcie_gen_max) - 1) << 1) : 0;
-    if (k == "link.control2") return d.pcie_gen_max & 0xF;
+      return (image_src ? base(r) & ~0xFEu : 0) | (d.pcie_gen_max ? (((1u << d.pcie_gen_max) - 1) << 1) : 0);
+    if (k == "link.control2") return (image_src ? base(r) & ~0xFu : 0) | (d.pcie_gen_max & 0xF);
     // Engine status: the units a busy GPU has working, and the idle state's
     // command FIFOs available and DB and CB clean. Values are a model.
     const bool busy = d.utilization_gpu > 0;
@@ -436,7 +517,7 @@ struct RegisterSpace::Impl {
   const std::vector<Register>& regs() const { return registers(space); }
 
   uint32_t evaluate(const Register& r, const ras::Counters& c) {
-    const size_t i = static_cast<size_t>(&r - regs().data());
+    const size_t i = index(r);
     State* s = state();
     switch (r.access) {
       case Access::Rw:
@@ -445,9 +526,9 @@ struct RegisterSpace::Impl {
         if (r.backing.rfind("smu.", 0) == 0) return backed(r, c);
         return __atomic_load_n(&s->rw_set[i], __ATOMIC_ACQUIRE)
                    ? static_cast<uint32_t>(__atomic_load_n(&s->rw_value[i], __ATOMIC_RELAXED))
-                   : r.backing.empty() ? r.reset : backed(r, c);
+                   : r.backing.empty() ? base(r) : backed(r, c);
       case Access::Ro:
-        return r.backing.empty() ? r.reset : backed(r, c);
+        return r.backing.empty() ? base(r) : backed(r, c);
       case Access::Rw1c:
       case Access::Bar:
         return backed(r, c);
@@ -455,14 +536,19 @@ struct RegisterSpace::Impl {
     return 0;
   }
 
+  // The whole space: a captured card's bytes (or zeros) under the registers
+  // the database declares, each where this device has it.
   void fill(uint8_t* out, uint32_t len) {
-    std::memset(out, 0, len);
+    if (image_src) std::memcpy(out, image_src->bytes, std::min(len, kConfigSize));
+    else std::memset(out, 0, len);
     const ras::Counters c = counts();
-    for (const Register& r : regs()) {
-      if (r.offset >= len) break;
-      const uint32_t v = evaluate(r, c);
-      for (uint32_t b = 0; b < r.width / 8 && r.offset + b < len; ++b)
-        out[r.offset + b] = static_cast<uint8_t>(v >> (8 * b));
+    const auto& rs = regs();
+    for (size_t i = 0; i < rs.size(); ++i) {
+      const uint32_t off = at[i];
+      if (off == RegisterSpace::kAbsent || off >= len) continue;
+      const uint32_t v = evaluate(rs[i], c);
+      for (uint32_t b = 0; b < rs[i].width / 8 && off + b < len; ++b)
+        out[off + b] = static_cast<uint8_t>(v >> (8 * b));
     }
   }
 
@@ -504,6 +590,17 @@ RegisterSpace::RegisterSpace(Space s, const telemetry::DeviceSample& d) {
 RegisterSpace::~RegisterSpace() = default;
 Space RegisterSpace::space() const { return impl_->space; }
 
+uint32_t RegisterSpace::offset_of(const Register& r) const { return impl_->at[impl_->index(r)]; }
+
+const Register* RegisterSpace::at(uint32_t offset) const {
+  const auto& rs = impl_->regs();
+  for (size_t i = 0; i < rs.size(); ++i)
+    if (impl_->at[i] == offset) return &rs[i];
+  return nullptr;
+}
+
+const char* RegisterSpace::layout() const { return impl_->image_src ? impl_->image_src->name : "generic"; }
+
 uint32_t RegisterSpace::value(const Register& r) { return impl_->evaluate(r, impl_->counts()); }
 
 uint32_t RegisterSpace::read(uint32_t offset, uint32_t size) {
@@ -511,13 +608,20 @@ uint32_t RegisterSpace::read(uint32_t offset, uint32_t size) {
   // The registers the access covers; bytes no register declares read as 0.
   const ras::Counters c = impl_->counts();
   uint32_t v = 0;
-  for (const Register& r : impl_->regs()) {
-    const uint32_t rbytes = r.width / 8;
-    if (r.offset + rbytes <= offset || r.offset >= offset + size) continue;
+  if (impl_->image_src)   // what no register declares reads as the captured card's
+    for (uint32_t b = 0; b < size; ++b) v |= static_cast<uint32_t>(impl_->image_src->bytes[offset + b]) << (8 * b);
+  const auto& rs = impl_->regs();
+  for (size_t i = 0; i < rs.size(); ++i) {
+    const Register& r = rs[i];
+    const uint32_t roff = impl_->at[i], rbytes = r.width / 8;
+    if (roff == kAbsent || roff + rbytes <= offset || roff >= offset + size) continue;
     const uint32_t rv = impl_->evaluate(r, c);
     for (uint32_t b = 0; b < rbytes; ++b) {
-      const uint32_t at = r.offset + b;
-      if (at >= offset && at < offset + size) v |= ((rv >> (8 * b)) & 0xFFu) << (8 * (at - offset));
+      const uint32_t at = roff + b;
+      if (at >= offset && at < offset + size) {
+        v &= ~(0xFFu << (8 * (at - offset)));
+        v |= ((rv >> (8 * b)) & 0xFFu) << (8 * (at - offset));
+      }
     }
   }
   impl_->log(false, offset, size, v);
@@ -547,12 +651,12 @@ void RegisterSpace::write(uint32_t offset, uint32_t size, uint32_t value) {
   const auto& regs = impl_->regs();
   for (size_t i = 0; i < regs.size(); ++i) {
     const Register& r = regs[i];
-    const uint32_t rbytes = r.width / 8;
-    if (r.offset + rbytes <= offset || r.offset >= offset + size) continue;
+    const uint32_t roff = impl_->at[i], rbytes = r.width / 8;
+    if (roff == kAbsent || roff + rbytes <= offset || roff >= offset + size) continue;
     // The bytes of this register the write covers, and what it writes there.
     uint32_t covered = 0, bits = 0;
     for (uint32_t b = 0; b < rbytes; ++b) {
-      const uint32_t at = r.offset + b;
+      const uint32_t at = roff + b;
       if (at < offset || at >= offset + size) continue;
       covered |= 0xFFu << (8 * b);
       bits |= ((value >> (8 * (at - offset))) & 0xFFu) << (8 * b);
@@ -626,8 +730,8 @@ std::vector<LogEntry> access_log(const std::string& uuid, Space space) {
 }
 
 Link link(RegisterSpace& cs) {
-  const uint32_t cap = cs.read(0x84, 4);
-  const uint32_t sta = cs.read(0x8a, 2);
+  const uint32_t cap = cs.read(cs.offset_of(*find_config("link_capabilities")), 4);
+  const uint32_t sta = cs.read(cs.offset_of(*find_config("link_status")), 2);
   Link l;
   l.max_gen = cap & 0xF;
   l.max_width = (cap >> 4) & 0x3F;
@@ -679,7 +783,8 @@ void write_sysfs_files(const telemetry::DeviceSample& d, const std::string& dir)
   replace_file(dir + "/revision", hex(cfg[0x08], 2));
   replace_file(dir + "/subsystem_vendor", hex(word(0x2c), 4));
   replace_file(dir + "/subsystem_device", hex(word(0x2e), 4));
-  const uint32_t cap = dword(0x84), sta = word(0x8a);
+  const uint32_t cap = dword(cs.offset_of(*find_config("link_capabilities")));
+  const uint32_t sta = word(cs.offset_of(*find_config("link_status")));
   replace_file(dir + "/current_link_speed", std::string(speed_name(sta & 0xF)) + "\n");
   replace_file(dir + "/current_link_width", std::to_string((sta >> 4) & 0x3F) + "\n");
   replace_file(dir + "/max_link_speed", std::string(speed_name(cap & 0xF)) + "\n");
