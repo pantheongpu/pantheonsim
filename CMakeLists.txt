@@ -120,6 +120,7 @@ add_library(vgpu STATIC
   src/core/shared_state.cpp
   src/core/regs.cpp
   amd/src/codeobject.cpp
+  amd/src/gcn_decode.cpp
   src/core/machine.cpp
   # Each vendor's part of the register model and its driver files.
   amd/src/regs.cpp
@@ -554,6 +555,9 @@ vgpu_unit_test(test_regalloc)
 # AMD code objects: what a HIP program hands the driver to run.
 vgpu_unit_test(test_amd_codeobject amd/tests/unit/test_codeobject.cpp)
 target_compile_definitions(test_amd_codeobject PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# CDNA machine code, decoded and checked against what the assembler wrote.
+vgpu_unit_test(test_amd_gcn amd/tests/unit/test_gcn.cpp)
+target_compile_definitions(test_amd_gcn PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_robustness)
 target_include_directories(test_robustness PRIVATE nvidia/src)
 target_sources(test_robustness PRIVATE nvidia/src/fatbin.cpp)
