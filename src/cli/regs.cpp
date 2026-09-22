@@ -66,6 +66,7 @@ void print_register(const vgpu::regs::Register& r, uint32_t v) {
   std::printf("0x%03x  %-28s = 0x%0*x   (%s, %s)\n", r.offset, r.name.c_str(), digits, v,
               vgpu::regs::access_name(r.access), r.status.c_str());
   if (!r.source.empty()) std::printf("       from %s\n", r.source.c_str());
+  if (!r.measured.empty()) std::printf("       measured: %s\n", r.measured.c_str());
   for (const std::string& f : r.fields) {
     uint32_t hi = 0, lo = 0;
     std::string name;

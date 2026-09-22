@@ -16,6 +16,8 @@
 #   fields    bit fields, "hi:lo name" or "bit name"
 #   surfaces  the tools and files that read it
 #   status    done: behaves as on hardware; model: a plausible value, not measured
+#   measured  what a real card read, where one has been checked
+#             (tools/regprobe; registers/measurements/)
 
 vendor_id:
   offset: "0x000"
@@ -37,11 +39,12 @@ command:
   offset: "0x004"
   width: 16
   access: rw
-  reset: "0x0006"
+  backing: profile.command
   write_mask: "0x0547"
   fields: ["0 io_space", "1 memory_space", "2 bus_master", "6 parity_error_response", "8 serr", "10 intx_disable"]
   surfaces: [lspci, driver]
   status: done
+  measured: "RTX 3080 Ti, driver 595.84: 0x0407 -- memory and bus mastering on, INTx off for MSI, I/O on for its I/O BAR"
 
 status:
   offset: "0x006"
@@ -90,10 +93,11 @@ header_type:
   offset: "0x00e"
   width: 8
   access: ro
-  reset: "0x00"
+  backing: profile.header_type
   fields: ["6:0 layout", "7 multifunction"]
   surfaces: [lspci]
   status: done
+  measured: "RTX 3080 Ti: 0x80 -- a GeForce is multifunction, its HDMI audio controller function 1"
 
 bar0:
   offset: "0x010"
@@ -344,6 +348,7 @@ link_status:
   width: 16
   access: ro
   backing: link.status
+  measured: "RTX 3080 Ti: 2.5 GT/s x16 while idle of 16 GT/s x16 -- a GeForce drops its link to Gen1 when idle"
   fields: ["3:0 current_link_speed", "9:4 negotiated_link_width", "11 link_training", "12 slot_clock"]
   surfaces: [lspci, nvml.pcie.current, smi.pcie.link.current]
   status: done

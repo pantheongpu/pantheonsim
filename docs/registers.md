@@ -139,6 +139,32 @@ wrong. A read reflects the device at the moment of the read, so polling engine
 status sees it change. Build against it with `-Iinclude -Lbuild -lvgpuregs`;
 `tests/c_harness/regs_capi.c` is a complete example.
 
+## Measured on real hardware
+
+`tools/regprobe/regprobe.py` runs on a machine with a real GPU and captures what
+the model is checked against. Every step is read-only.
+
+```bash
+python3 tools/regprobe/regprobe.py capture out/                 # config space, sysfs, lspci, nvidia-smi -q
+sudo python3 tools/regprobe/regprobe.py mmio out/ --bdf 0000:0a:00.0 --range 0x0-0x1000
+sudo python3 tools/regprobe/regprobe.py correlate out/ --bdf 0000:0a:00.0 \
+    --range 0x0-0x1000 --seconds 120 --load "./a-gpu-burn"       # what follows temperature, clocks, power
+python3 tools/regprobe/regprobe.py compare out/ --profile nvidia/rtx3060 --vgpu build/vgpu
+```
+
+`capture` reads all 4096 bytes of configuration space as root, and the 64-byte
+header the kernel gives anyone otherwise. `mmio` reads a BAR's registers, each
+value written to disk as it is read, so a read that hangs the card keeps
+everything before it. `correlate` samples registers idle and then under load
+beside nvidia-smi's readings, and ranks the offsets whose values follow them --
+candidates for what each register is. A sweep of an undocumented region can
+hang a GPU or its host: sweep a card no one else is using, starting small.
+
+What a real card read is kept in `registers/measurements/`, and each register
+it changed carries a `measured:` note that `vgpu regs read` prints. So far: an
+RTX 3080 Ti's header and sysfs files, read without root, which corrected the
+command register, the header type and the idle link of a GeForce.
+
 ## Who reads the registers
 
 NVML and nvidia-smi report the PCIe link by reading it from the registers --

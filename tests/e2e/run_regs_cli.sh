@@ -23,7 +23,7 @@ expect "a read names and decodes the register" "0x08a link_status = 0x1105" \
   "$(h100 regs read link_status | head -1 | awk '{print $1, $2, $3, $4}')"
 expect "and its fields" "16" "$(h100 regs read link_status | awk '$2 == "negotiated_link_width" {print $3}')"
 h100 regs write --gpu 1 command 0x0002 >/dev/null
-expect "a write in one process is what the next one reads" "0x0002 0x0006" "$(val --gpu 1 command) $(val --gpu 0 command)"
+expect "a write in one process is what the next one reads" "0x0002 0x0406" "$(val --gpu 1 command) $(val --gpu 0 command)"
 h100 regs write bar0 0xffffffff >/dev/null
 expect "a BAR answers a sizing probe with its size (16 MiB)" "0xff000000" "$(val bar0)"
 h100 fault inject --pcie bad_tlp >/dev/null

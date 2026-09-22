@@ -169,7 +169,8 @@ void replace_file(const std::string& path, const std::string& text) {
 }
 
 // One line per error the kernel's AER stats name, then the total, in the form
-// of Documentation/ABI/testing/sysfs-bus-pci-devices-aer_stats.
+// of Documentation/ABI/testing/sysfs-bus-pci-devices-aer_stats, in the order
+// and with the names a 6.8 kernel prints them (measured: RTX 3080 Ti's files).
 std::string aer_stats(const std::vector<std::pair<const char*, uint64_t>>& rows, const char* total) {
   std::string out;
   uint64_t sum = 0;
@@ -223,7 +224,8 @@ void publish_session(const std::string& uuid, const std::string& session) {
                       {"CmpltTO", cmplt_to}, {"CmpltAbrt", 0}, {"UnxCmplt", 0}, {"RxOF", 0},
                       {"MalfTLP", 0}, {"ECRC", 0}, {"UnsupReq", 0}, {"ACSViol", 0},
                       {"UncorrIntErr", 0}, {"BlockedTLP", 0}, {"AtomicOpBlocked", 0},
-                      {"TLPBlockedErr", 0}},
+                      {"TLPBlockedErr", 0}, {"PoisonTLPBlocked", 0}, {"DMWrReqBlocked", 0},
+                      {"IDECheck", 0}, {"MisIDETLP", 0}, {"PCRC_CHECK", 0}, {"TLPXlatBlocked", 0}},
                      total);
   };
   replace_file(dir + "/aer_dev_nonfatal", uncorrectable(0, pcie(Pcie::NonFatal), "TOTAL_ERR_NONFATAL"));
