@@ -577,6 +577,10 @@ set_tests_properties(fault_cli PROPERTIES DEPENDS vgpu_cli
 add_test(NAME amd_lost_gpu COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_lost_gpu.sh)
 set_tests_properties(amd_lost_gpu PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
+# An AMD GPU's NBIO registers and the partition files amdgpu writes from them.
+add_test(NAME amd_nbio COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_nbio.sh)
+set_tests_properties(amd_nbio PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
 # CPER records for AMD ECC errors: amd-smi's --folder dump, byte by byte.
 add_test(NAME amd_cper COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_cper.sh)
 set_tests_properties(amd_cper PROPERTIES DEPENDS vgpu_cli

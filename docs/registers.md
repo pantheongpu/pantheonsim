@@ -140,6 +140,10 @@ vgpu regs read --space mmio grbm_status
 | `grbm_status`, `grbm_status2` | 0x08010, 0x08008 | graphics engine status: GUI_ACTIVE and the busy units while the GPU works; FIFOs available and DB and CB clean when idle |
 | `cp_stat`, `rlc_stat` | 0x08680, 0x3b010 | the command processor's and RLC's busy bits |
 | `smu_message`, `smu_argument`, `smu_response` | 0x58a08, 0x58a48, 0x58a68 | the SMU mailbox (MP1 C2PMSG_66, _82, _90) |
+| `nbio_strap0` | 0x034d8 | the strap amdgpu reads the revision from: the device ID, the revision, the function enabled |
+| `nbio_config_memsize` | 0x0378c | the VRAM in MiB, which amdgpu sizes memory by; it follows the device, `VGPU_VRAM_MB` included |
+| `nbio_partition_compute_status` | 0x03a0c | the compute partition mode: SPX |
+| `nbio_partition_mem_status`, `nbio_partition_mem_cap` | 0x03a10, 0x03a08 | the memory partition mode, NPS1, and the modes the GPU supports: NPS1 and NPS4 on MI300X and MI325X, NPS1 and NPS2 on MI350X |
 
 The mailbox works as the driver drives it: clear the response, write the
 argument, write the message, and the SMU answers -- `1` in the response
@@ -164,8 +168,18 @@ graphics and memory clocks. What the simulator has nothing for -- energy,
 XGMI, video engines -- reads as all ones, as the driver leaves fields a GPU does
 not report. Later kernels publish later versions of the table.
 
+The partition modes reach tools as amdgpu's sysfs files, which the session
+writes from the NBIO registers the way the driver reads them:
+`current_compute_partition` (`SPX`), `current_memory_partition` (`NPS1`) and
+`available_memory_partition` (`NPS1, NPS4` on MI300X). CDNA3's pair of
+supported modes is the one amdgpu itself assumes for GC 9.4.3 and 9.4.4 when
+it cannot read the register (gmc_v9_0.c); MI350X's is AMD's documented pair.
+Switching partitions is not modelled, so `available_compute_partition` is not
+published: which compute modes are offered depends on the memory mode and the
+XCC count in ways not checked yet.
+
 The register offsets, bit fields and message numbers come from the amdgpu
-headers (`gc_9_4_3_*.h`, `mp_13_0_6_offset.h`, `smu_v13_0_6_ppsmc.h`; their
+headers (`gc_9_4_3_*.h`, `mp_13_0_6_offset.h`, `nbio_7_9_0_*.h`, `smu_v13_0_6_ppsmc.h`; their
 MIT notice is in `registers/LICENSES/amdgpu-headers.txt`), and each entry's
 `source` names the symbol. They are offsets from an IP block's base, and MI300
 learns its bases at boot from its IP discovery table; the database uses
