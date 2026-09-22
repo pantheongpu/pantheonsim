@@ -794,6 +794,7 @@ if(TARGET vgpucupti)
   set_tests_properties(e2e_cupti_activity PROPERTIES
     DEPENDS vgpucupti
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
 
   # And the same thing through a tool nobody here wrote.
@@ -801,6 +802,7 @@ if(TARGET vgpucupti)
   set_tests_properties(e2e_nvprof PROPERTIES
     DEPENDS vgpucupti
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
 endif()
 

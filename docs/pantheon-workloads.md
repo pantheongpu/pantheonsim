@@ -113,7 +113,7 @@ Two workflows run the workloads, at two depths:
 | When | What | Where |
 | --- | --- | --- |
 | Every pull request | `compute_virus`, `int_virus`, `cache_latency` on one A10 | `ci.yml`, job *pantheon workloads* |
-| Every merge to main, and daily at 06:23 UTC | every workload, on every NVIDIA profile (13 machines) | `workloads.yml` |
+| Every merge to main, and daily at 06:23 UTC | every workload, on every NVIDIA profile (14 machines) | `workloads.yml` |
 
 Each NVIDIA profile gets a machine, alternating CUDA 12.0 and 13.0 within each
 architecture and with GPU counts above one for the multi-GPU paths:

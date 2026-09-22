@@ -39,18 +39,33 @@ otherwise never start.
 Works, on a matching toolkit major:
 
 ```
- GPU activities:   92.15%  521.27us  1  vecAdd(float const *, float const *, float*, int)
-                    7.09%  40.108us  2  [CUDA memcpy HtoD]
-                    0.75%  4.2680us  1  [CUDA memcpy DtoH]
+            Type  Time(%)      Time     Calls       Avg       Min       Max  Name
+ GPU activities:   98.34%  3.1957ms         1  3.1957ms  3.1957ms  3.1957ms  vecAdd(float const *, float const *, float*, int)
+                    1.44%  46.911us         2  23.455us  22.869us  24.042us  [CUDA memcpy HtoD]
+                    0.22%  7.0950us         1  7.0950us  7.0950us  7.0950us  [CUDA memcpy DtoH]
+      API calls:   98.00%  3.1975ms         1  3.1975ms  3.1975ms  3.1975ms  cudaLaunchKernel
+                    1.70%  55.423us         3  18.474us  7.6570us  24.692us  cudaMemcpy
+                    0.16%  5.0910us         3  1.6970us     492ns  2.9510us  cudaFree
+                    0.14%  4.5850us         3  1.5280us     300ns  3.9690us  cudaMalloc
 ```
+
+`--print-gpu-trace`, `--print-api-trace` and `--export-profile` work too.
 
 Two constraints are nvprof's own rather than this engine's. It refuses compute
 capability 8.0 and above, so profiling uses a Turing profile; and it links a
 CUPTI of its own toolkit's major, so a CUDA 12 nvprof needs the CUDA 12 shim.
-`nvidia/tests/e2e/run_nvprof.sh` checks both and skips when they cannot be met.
+`nvidia/tests/e2e/run_nvprof.sh` checks both and skips when they cannot be met;
+CI's build job installs Ubuntu's `nvidia-profiler` (nvprof 12.0) beside its CUDA
+12.0 toolkit, so there it runs. `--metrics` and `--events` print nvprof's own
+warning that it does not profile compute capability 7.5 and above, as on a real
+T4.
 
-"No API activities were profiled" is expected and correct: that line refers to
-the Callback API, which is deliberately not dispatched -- see below.
+## PyTorch's profiler
+
+libtorch links CUPTI by soname, so with the shims preloaded it loads this one
+and finds the simulated GPU. Its kernels do not run: prebuilt PyTorch wheels
+carry SASS only, and the simulator executes PTX. Profiling PyTorch here needs a
+PyTorch built with PTX for the profile's architecture.
 
 ## Nsight Systems
 
@@ -83,6 +98,7 @@ The Activity API, which is what produces a timeline:
 - `cuptiGetVersion`, `cuptiGetResultString`, `cuptiGetLastError`,
   `cuptiGetTimestamp`, `cuptiFinalize`
 - `cuptiActivityPushExternalCorrelationId` / `Pop`
+- `cuptiGetCallbackName`, for the runtime functions whose calls are recorded
 
 Records produced:
 
@@ -90,6 +106,10 @@ Records produced:
 | --- | --- |
 | `CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL` | name, grid and block, dynamic shared bytes, device, stream, correlation id, start and end |
 | `CUPTI_ACTIVITY_KIND_MEMCPY` | direction, bytes, device, stream, correlation id, start and end |
+| `CUPTI_ACTIVITY_KIND_RUNTIME` | the runtime call (`cbid`), process and thread, return value, correlation id, start and end |
+
+A kernel or copy has the correlation id of the runtime call that issued it,
+which is how a profiler connects the GPU timeline to the host calls.
 
 Enabling a kind that is not produced succeeds and yields nothing. Refusing
 would stop a profiler that asks for everything and uses what arrives, which is
@@ -103,7 +123,7 @@ answer.
 can attach, but nothing is dispatched. The points a real CUPTI intercepts are
 inside the driver, and synthesising them here would mean reporting API entries
 and exits that did not happen the way the consumer is told they did. The
-activity records above carry the same information for the kinds that exist.
+`RUNTIME` activity records carry the runtime calls themselves.
 
 **No metrics or events.** The Profiling and Event APIs report hardware
 performance counters. The exact counters this engine keeps -- instruction mix,

@@ -8,6 +8,9 @@
 #include <chrono>
 #include <mutex>
 
+#include <sys/syscall.h>
+#include <unistd.h>
+
 namespace vgpu::profiling {
 namespace {
 
@@ -15,6 +18,7 @@ std::atomic<bool> g_on{false};
 std::mutex g_mu;
 std::vector<Event> g_events;
 std::atomic<uint32_t> g_correlation{1};
+thread_local uint32_t t_api_correlation = 0;   // the API call this thread is inside
 
 // A profiler that never drains must not grow the process without bound. The
 // oldest events go first, which is the right end to lose: a timeline is read
@@ -48,6 +52,32 @@ uint64_t now_ns() {
 }
 
 uint32_t next_correlation() { return g_correlation.fetch_add(1, std::memory_order_relaxed); }
+
+uint32_t work_correlation() { return t_api_correlation ? t_api_correlation : next_correlation(); }
+
+ApiCall::ApiCall(const char* name) {
+  if (!enabled()) return;
+  name_ = name;
+  correlation_ = next_correlation();
+  outer_ = t_api_correlation;
+  t_api_correlation = correlation_;
+  start_ = now_ns();
+}
+
+ApiCall::~ApiCall() {
+  if (!name_) return;
+  t_api_correlation = outer_;
+  Event e;
+  e.kind = EventKind::Api;
+  e.start_ns = start_;
+  e.end_ns = now_ns();
+  e.correlation = correlation_;
+  e.name = name_;
+  e.process_id = static_cast<uint32_t>(::getpid());
+  e.thread_id = static_cast<uint32_t>(::syscall(SYS_gettid));
+  e.result = result_;
+  record(std::move(e));
+}
 
 }  // namespace vgpu::profiling
 
