@@ -1,4 +1,4 @@
-#include "machine.hpp"
+#include "vgpu/machine.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -7,7 +7,7 @@
 #include "vgpu/ras.hpp"
 #include "vgpu/registry.hpp"
 
-namespace vgpu::cli {
+namespace vgpu {
 
 namespace {
 // Injected clock-event reasons (`vgpu fault throttle`) and the readings they
@@ -54,4 +54,4 @@ bool read_live_or_idle(vgpu::telemetry::Shared* snap) {
 }
 }  // namespace
 
-}  // namespace vgpu::cli
+}  // namespace vgpu

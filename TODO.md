@@ -473,7 +473,8 @@ narrows what counts as observable, not what the detector looks at.
   real lspci. AMD MMIO behind BAR5 (`--space mmio`): engine status and the SMU
   mailbox, from the amdgpu headers, on Aldebaran's IP bases until checked on an
   MI300. Not yet: more AMD blocks (UMC ECC, SMU metrics, NBIO), NVIDIA MMIO
-  (waits on a decision about the register source), a C API. The
+  (waits on a decision about the register source). A C API (vgpu_regs.h,
+  libvgpuregs) gives bring-up software the same access. The
   session's /sys/bus/pci devices carry config, resource, IDs and link files
   from the registers, and NVML and nvidia-smi read the link through them, each
   access logged under the tool's name.
