@@ -80,6 +80,20 @@ VGPU_QUIET=1 "$vgpu" serve --gpu amd/mi300x --count 1 --load 0.9 >/dev/null 2>&1
 loaded=$!
 busy=""
 for _ in $(seq 50); do busy=$(mval grbm_status); [[ "$busy" == 0x8* || "$busy" == 0xe* ]] && break; sleep 0.1; done
+# The metrics table amd-smi and rocm-smi read, in a session's sysfs.
+VGPU_SESSION="$sess" mi fault inject --pcie replay --count 3 >/dev/null
+metrics="$sess/sysfs/$(mi smi --query-gpu=uuid --format=csv,noheader)/gpu_metrics"
+if command -v python3 >/dev/null; then
+  expect "gpu_metrics is the driver's v1.5 table, live: size, version, activity, link, replays" "360 1 5 yes 16 3" \
+    "$(python3 -c '
+import struct, sys
+t = open(sys.argv[1], "rb").read()
+size, fmt, content = struct.unpack_from("<HBB", t, 0)
+activity, = struct.unpack_from("<H", t, 12)
+width, = struct.unpack_from("<H", t, 112)
+replays, = struct.unpack_from("<Q", t, 152)
+print(len(t), fmt, content, "yes" if activity > 0 else "no", width, replays)' "$metrics")"
+fi
 kill $loaded 2>/dev/null; wait $loaded 2>/dev/null
 expect "a busy GPU's GRBM_STATUS has GUI_ACTIVE and CP busy set" "yes" \
   "$( (( (busy >> 31) & 1 && (busy >> 29) & 1 )) && echo yes || echo no)"

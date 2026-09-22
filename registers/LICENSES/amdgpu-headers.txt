@@ -1,7 +1,9 @@
-The register offsets, bit fields and SMU message numbers in registers/amd-mmio.yaml
-are taken from the Linux kernel's amdgpu headers -- asic_reg/gc/gc_9_4_3_offset.h,
-gc_9_4_3_sh_mask.h, asic_reg/mp/mp_13_0_6_offset.h, aldebaran_ip_offset.h and
-pm/swsmu/inc/pmfw_if/smu_v13_0_6_ppsmc.h -- which carry this notice:
+The register offsets, bit fields and SMU message numbers in registers/amd-mmio.yaml,
+and the gpu_metrics_v1_5 layout in src/core/amd_metrics.cpp, are taken from the
+Linux kernel's amdgpu headers -- asic_reg/gc/gc_9_4_3_offset.h, gc_9_4_3_sh_mask.h,
+asic_reg/mp/mp_13_0_6_offset.h, aldebaran_ip_offset.h,
+pm/swsmu/inc/pmfw_if/smu_v13_0_6_ppsmc.h and include/kgd_pp_interface.h -- which
+carry this notice:
 
 Copyright 2022 Advanced Micro Devices, Inc.
 

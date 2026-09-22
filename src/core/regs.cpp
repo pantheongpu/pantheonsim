@@ -11,6 +11,7 @@
 #include <fstream>
 #include <stdexcept>
 
+#include "vgpu/amd_metrics.hpp"
 #include "vgpu/embedded_registers.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/ras.hpp"
@@ -705,6 +706,15 @@ void write_sysfs_files(const telemetry::DeviceSample& d, const std::string& dir)
     res += line;
   }
   replace_file(dir + "/resource", res);
+  // An AMD GPU's metrics table (vgpu/amd_metrics.hpp).
+  if (is_amd(d)) {
+    ras::Counters c{};
+    try {
+      c = ras::read(d.uuid).since_load;
+    } catch (const std::exception&) {
+    }
+    replace_file(dir + "/gpu_metrics", amd::gpu_metrics(d, c));
+  }
 }
 
 Bar bar(RegisterSpace& cs, const telemetry::DeviceSample& d, int n) {

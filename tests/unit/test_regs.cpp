@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "vgpu/amd_metrics.hpp"
 #include "vgpu/ras.hpp"
 #include "vgpu/registry.hpp"
 #include "vtest.hpp"
@@ -279,6 +280,34 @@ VTEST(a_geforce_header_matches_the_one_measured) {
     VCHECK_EQ(static_cast<int>(model[i]), static_cast<int>(byte(i)));
   // BAR types: the low bits of each (32-bit, 64-bit prefetchable, I/O).
   for (size_t bar : {0x10, 0x14, 0x1c, 0x24}) VCHECK_EQ(model[bar] & 0xF, byte(bar) & 0xF);
+}
+
+VTEST(an_amd_gpus_metrics_table_is_the_drivers_v1_5_layout) {
+  auto d = device("amd/mi300x");
+  d.temperature_c = 61;
+  d.power_mw = 312500;
+  d.utilization_gpu = 87;
+  ras::Counters c{};
+  c.pcie[static_cast<uint32_t>(ras::Pcie::Replay)] = 5;
+  const std::string t = amd::gpu_metrics(d, c);
+  VCHECK_EQ(t.size(), amd::kGpuMetricsSize);
+  const auto u8 = [&](size_t o) { return static_cast<unsigned>(static_cast<uint8_t>(t[o])); };
+  const auto u16 = [&](size_t o) { return u8(o) | u8(o + 1) << 8; };
+  const auto u64 = [&](size_t o) {
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; --i) v = v << 8 | u8(o + static_cast<size_t>(i));
+    return v;
+  };
+  VCHECK_EQ(u16(0), 360u);                 // structure size
+  VCHECK_EQ(u8(2), 1u);                    // format 1
+  VCHECK_EQ(u8(3), 5u);                    // content 5
+  VCHECK_EQ(u16(4), 61u);                  // hotspot temperature
+  VCHECK_EQ(u16(10), 312u);                // socket power, W
+  VCHECK_EQ(u16(12), 87u);                 // GFX activity
+  VCHECK_EQ(u16(112), d.pcie_width);       // link width
+  VCHECK_EQ(u16(114), 320u);               // Gen5, in 0.1 GT/s
+  VCHECK_EQ(u64(152), 5u);                 // replays
+  VCHECK_EQ(u64(88), ~uint64_t{0});        // energy: not reported
 }
 
 VTEST_MAIN

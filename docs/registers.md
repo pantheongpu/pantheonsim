@@ -105,6 +105,16 @@ vgpu regs write --space mmio smu_message 0x2        # GetSmuVersion
 vgpu regs read --space mmio smu_argument            # 0x00556f00: 85.111.0
 ```
 
+The SMU's metrics reach tools as a table, not registers: `gpu_metrics` in the
+device's sysfs directory, the binary struct amd-smi and rocm-smi read. Inside
+`vgpu shell` an AMD GPU publishes it in the driver's `gpu_metrics_v1_5` layout
+(360 bytes, format 1, content 5), live: hotspot and memory temperature, socket
+power, GFX and memory activity, the link's width and speed, the PCIe replay,
+rollover, recovery and NAK counts `vgpu fault inject --pcie` adds, and the
+graphics and memory clocks. What the simulator has nothing for -- energy,
+XGMI, video engines -- reads as all ones, as the driver leaves fields a GPU does
+not report. Later kernels publish later versions of the table.
+
 The register offsets, bit fields and message numbers come from the amdgpu
 headers (`gc_9_4_3_*.h`, `mp_13_0_6_offset.h`, `smu_v13_0_6_ppsmc.h`; their
 MIT notice is in `registers/LICENSES/amdgpu-headers.txt`), and each entry's

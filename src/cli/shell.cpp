@@ -343,6 +343,7 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
     for (const char* f : vgpu::regs::kSysfsFiles) std::filesystem::create_symlink(files + f, dev + "/" + f, ec);
     for (const char* f : vgpu::ras::kAerFiles) std::filesystem::create_symlink(files + f, dev + "/" + f, ec);
     if (std::strcmp(ds.vendor, "amd") == 0) {
+      std::filesystem::create_symlink(files + "gpu_metrics", dev + "/gpu_metrics", ec);
       make_dirs(dev + "/ras");
       for (const char* b : vgpu::ras::kAmdgpuRasBlocks)
         std::filesystem::create_symlink(files + b + "_err_count", dev + "/ras/" + std::string(b) + "_err_count", ec);
