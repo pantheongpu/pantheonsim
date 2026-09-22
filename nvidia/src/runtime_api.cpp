@@ -356,22 +356,29 @@ template <class F>
 cudaError_t guard(const char* api, F&& body) {
   State& s = st();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
-  try {
-    ensure_init(s);
-    if (const cudaError_t sticky = g_sticky_error.load(); sticky != cudaSuccess) {
-      g_last_error = sticky;
-      return sticky;
+  // A profiler's API trace, and the correlation the work this call issues
+  // carries (vgpu/profiling.hpp).
+  vgpu::profiling::ApiCall call(api);
+  const cudaError_t rc = [&]() -> cudaError_t {
+    try {
+      ensure_init(s);
+      if (const cudaError_t sticky = g_sticky_error.load(); sticky != cudaSuccess) {
+        g_last_error = sticky;
+        return sticky;
+      }
+      const cudaError_t r = body(s);
+      if (r != cudaSuccess) g_last_error = r;
+      return r;
+    } catch (const vgpu::Error& e) {
+      return set_error(s, e, api);
+    } catch (const std::exception& e) {
+      if (!quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", api, e.what());
+      g_last_error = cudaErrorUnknown;
+      return cudaErrorUnknown;
     }
-    cudaError_t rc = body(s);
-    if (rc != cudaSuccess) g_last_error = rc;
-    return rc;
-  } catch (const vgpu::Error& e) {
-    return set_error(s, e, api);
-  } catch (const std::exception& e) {
-    if (!quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", api, e.what());
-    g_last_error = cudaErrorUnknown;
-    return cudaErrorUnknown;
-  }
+  }();
+  call.set_result(rc);
+  return rc;
 }
 
 bool is_device_ptr(const void* p) {
@@ -795,7 +802,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       ev.start_ns = t0;
       ev.end_ns = vgpu::profiling::now_ns();
       ev.device = static_cast<uint32_t>(t_current_device);
-      ev.correlation = vgpu::profiling::next_correlation();
+      ev.correlation = vgpu::profiling::work_correlation();
       ev.stream = reinterpret_cast<uint64_t>(stream);
       ev.name = ki.entry_name;
       ev.grid[0] = gridDim.x; ev.grid[1] = gridDim.y; ev.grid[2] = gridDim.z;
@@ -1336,7 +1343,7 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                                         _t1 - _t0).count());
       ev.device = static_cast<uint32_t>(t_current_device);
-      ev.correlation = vgpu::profiling::next_correlation();
+      ev.correlation = vgpu::profiling::work_correlation();
       ev.bytes = count;
       ev.copy_kind = static_cast<uint32_t>(kind);
       vgpu::profiling::record(std::move(ev));

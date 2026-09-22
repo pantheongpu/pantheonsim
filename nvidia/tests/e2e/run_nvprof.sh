@@ -82,10 +82,10 @@ fi
 if grep -q "No profile data collected" "$log"; then
   echo "FAIL: nvprof collected nothing"; sed 's/^/    /' "$log"; rm -f "$log"; exit 1
 fi
-for want in "vecAdd" "CUDA memcpy HtoD" "CUDA memcpy DtoH"; do
+for want in "vecAdd" "CUDA memcpy HtoD" "CUDA memcpy DtoH" "API calls:" "cudaLaunchKernel" "cudaMalloc"; do
   if ! grep -q "$want" "$log"; then
     echo "FAIL: nvprof output does not mention '$want'"; sed 's/^/    /' "$log"; rm -f "$log"; exit 1
   fi
 done
 rm -f "$log"
-echo "nvprof profiled the simulator: kernel and both copy directions reported"
+echo "nvprof profiled the simulator: kernel, both copy directions and the API calls reported"

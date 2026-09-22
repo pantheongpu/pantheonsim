@@ -55,7 +55,8 @@ bool g_announced = false;
 // with no timing model and no hardware counters behind these kinds.
 bool produced(CUpti_ActivityKind k) {
   return k == CUPTI_ACTIVITY_KIND_KERNEL || k == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL ||
-         k == CUPTI_ACTIVITY_KIND_MEMCPY || k == CUPTI_ACTIVITY_KIND_MEMSET;
+         k == CUPTI_ACTIVITY_KIND_MEMCPY || k == CUPTI_ACTIVITY_KIND_MEMSET ||
+         k == CUPTI_ACTIVITY_KIND_RUNTIME;
 }
 
 void announce_once() {
@@ -116,14 +117,82 @@ size_t fill_memcpy(uint8_t* out, const vgpu::profiling::Event& e) {
   return sizeof *m;
 }
 
+// The runtime functions whose calls are recorded, by the callback ID CUPTI
+// names each with (cupti_runtime_cbid.h). A call not listed here is not
+// reported: a record with no ID would name no function.
+const std::unordered_map<std::string, CUpti_CallbackId>& runtime_cbids() {
+#define VGPU_CBID(fn, ver) {#fn, CUPTI_RUNTIME_TRACE_CBID_##fn##_##ver}
+  static const std::unordered_map<std::string, CUpti_CallbackId> ids = {
+      VGPU_CBID(cudaMalloc, v3020), VGPU_CBID(cudaFree, v3020), VGPU_CBID(cudaMallocHost, v3020),
+      VGPU_CBID(cudaFreeHost, v3020), VGPU_CBID(cudaMallocManaged, v6000), VGPU_CBID(cudaMallocPitch, v3020),
+      VGPU_CBID(cudaMallocArray, v3020), VGPU_CBID(cudaFreeArray, v3020), VGPU_CBID(cudaHostRegister, v4000),
+      VGPU_CBID(cudaHostUnregister, v4000), VGPU_CBID(cudaHostGetDevicePointer, v3020),
+      VGPU_CBID(cudaMemcpy, v3020), VGPU_CBID(cudaMemcpyPeer, v4000), VGPU_CBID(cudaMemcpyToSymbol, v3020),
+      VGPU_CBID(cudaMemcpyFromSymbol, v3020), VGPU_CBID(cudaMemcpy2DToArray, v3020),
+      VGPU_CBID(cudaMemcpy2DFromArray, v3020), VGPU_CBID(cudaMemset, v3020), VGPU_CBID(cudaMemGetInfo, v3020),
+      VGPU_CBID(cudaLaunchKernel, v7000), VGPU_CBID(cudaLaunchCooperativeKernel, v9000),
+      VGPU_CBID(cudaLaunchKernelExC, v11060), VGPU_CBID(cudaFuncGetAttributes, v3020),
+      VGPU_CBID(cudaOccupancyMaxActiveBlocksPerMultiprocessor, v6050), VGPU_CBID(cudaGetDevice, v3020),
+      VGPU_CBID(cudaSetDevice, v3020), VGPU_CBID(cudaGetDeviceCount, v3020),
+      VGPU_CBID(cudaDeviceGetAttribute, v5000), VGPU_CBID(cudaDeviceGetPCIBusId, v4010),
+      VGPU_CBID(cudaDeviceCanAccessPeer, v4000), VGPU_CBID(cudaDeviceEnablePeerAccess, v4000),
+      VGPU_CBID(cudaDeviceDisablePeerAccess, v4000), VGPU_CBID(cudaPointerGetAttributes, v4000),
+      VGPU_CBID(cudaGetSymbolAddress, v3020), VGPU_CBID(cudaGetSymbolSize, v3020),
+      VGPU_CBID(cudaGetChannelDesc, v3020), VGPU_CBID(cudaCreateTextureObject, v5000),
+      VGPU_CBID(cudaDestroyTextureObject, v5000), VGPU_CBID(cudaCreateSurfaceObject, v5000),
+      VGPU_CBID(cudaDestroySurfaceObject, v5000),
+  };
+#undef VGPU_CBID
+  return ids;
+}
+
+CUpti_CallbackId runtime_cbid(const std::string& name) {
+  const auto& ids = runtime_cbids();
+  // The runtime records cudaLaunchKernelEx under its own name; CUPTI reports
+  // it as the C entry point it goes through.
+  const auto it = ids.find(name == "cudaLaunchKernelEx" ? "cudaLaunchKernelExC" : name);
+  return it == ids.end() ? CUPTI_RUNTIME_TRACE_CBID_INVALID : it->second;
+}
+
+size_t fill_api(uint8_t* out, const vgpu::profiling::Event& e) {
+  auto* a = reinterpret_cast<CUpti_ActivityAPI*>(out);
+  std::memset(a, 0, sizeof *a);
+  a->kind = CUPTI_ACTIVITY_KIND_RUNTIME;
+  a->cbid = runtime_cbid(e.name);
+  a->start = e.start_ns;
+  a->end = e.end_ns;
+  a->processId = e.process_id;
+  a->threadId = e.thread_id;
+  a->correlationId = e.correlation;
+  a->returnValue = static_cast<uint32_t>(e.result);
+  return sizeof *a;
+}
+
+size_t kind_size(CUpti_ActivityKind k) {
+  return k == CUPTI_ACTIVITY_KIND_MEMCPY    ? sizeof(CUpti_ActivityMemcpy5)
+         : k == CUPTI_ACTIVITY_KIND_RUNTIME ? sizeof(CUpti_ActivityAPI)
+                                            : sizeof(CUpti_ActivityKernel9);
+}
+
 size_t record_size(const vgpu::profiling::Event& e) {
   return e.kind == vgpu::profiling::EventKind::Kernel ? sizeof(CUpti_ActivityKernel9)
+         : e.kind == vgpu::profiling::EventKind::Api  ? sizeof(CUpti_ActivityAPI)
                                                       : sizeof(CUpti_ActivityMemcpy5);
+}
+
+size_t fill(uint8_t* out, const vgpu::profiling::Event& e) {
+  switch (e.kind) {
+    case vgpu::profiling::EventKind::Kernel: return fill_kernel(out, e);
+    case vgpu::profiling::EventKind::Api: return fill_api(out, e);
+    default: return fill_memcpy(out, e);
+  }
 }
 
 bool kind_wanted(const vgpu::profiling::Event& e) {
   if (e.kind == vgpu::profiling::EventKind::Kernel)
     return g_kinds[CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL] || g_kinds[CUPTI_ACTIVITY_KIND_KERNEL];
+  if (e.kind == vgpu::profiling::EventKind::Api)
+    return g_kinds[CUPTI_ACTIVITY_KIND_RUNTIME] && runtime_cbid(e.name) != CUPTI_RUNTIME_TRACE_CBID_INVALID;
   return g_kinds[CUPTI_ACTIVITY_KIND_MEMCPY];
 }
 
@@ -208,8 +277,7 @@ VGPU_EXPORT CUptiResult cuptiActivityGetNextRecord(uint8_t* buffer, size_t valid
   if (*record) {
     const auto* cur = *record;
     offset = reinterpret_cast<const uint8_t*>(cur) - buffer;
-    offset += cur->kind == CUPTI_ACTIVITY_KIND_MEMCPY ? sizeof(CUpti_ActivityMemcpy5)
-                                                      : sizeof(CUpti_ActivityKernel9);
+    offset += kind_size(cur->kind);
   }
   if (offset >= validBufferSizeBytes) return CUPTI_ERROR_MAX_LIMIT_REACHED;
   *record = reinterpret_cast<CUpti_Activity*>(buffer + offset);
@@ -249,9 +317,7 @@ VGPU_EXPORT CUptiResult cuptiActivityFlushAll(uint32_t) {
       const size_t need = record_size(wanted[i]);
       if (used + need > size) break;
       if (max_records && written >= max_records) break;
-      used += wanted[i].kind == vgpu::profiling::EventKind::Kernel
-                  ? fill_kernel(buffer + used, wanted[i])
-                  : fill_memcpy(buffer + used, wanted[i]);
+      used += fill(buffer + used, wanted[i]);
       ++written;
       ++i;
     }
@@ -338,9 +404,18 @@ VGPU_EXPORT CUptiResult cuptiGetStreamId(CUcontext, CUstream stream, uint32_t* i
 VGPU_EXPORT CUptiResult cuptiGetStreamIdEx(CUcontext c, CUstream stream, uint8_t, uint32_t* id) {
   return cuptiGetStreamId(c, stream, id);
 }
-VGPU_EXPORT CUptiResult cuptiGetCallbackName(CUpti_CallbackDomain, uint32_t, const char** name) {
+// The names of the runtime functions whose calls are recorded, for a tool
+// labelling the records it reads (nvprof's API calls). Callbacks themselves
+// are not dispatched.
+VGPU_EXPORT CUptiResult cuptiGetCallbackName(CUpti_CallbackDomain domain, uint32_t cbid, const char** name) {
   if (!name) return CUPTI_ERROR_INVALID_PARAMETER;
-  // No callbacks are dispatched, so no callback has a name to report.
+  *name = nullptr;
+  if (domain == CUPTI_CB_DOMAIN_RUNTIME_API)
+    for (const auto& [fn, id] : runtime_cbids())
+      if (id == cbid) {
+        *name = fn.c_str();
+        return CUPTI_SUCCESS;
+      }
   return CUPTI_ERROR_INVALID_PARAMETER;
 }
 VGPU_EXPORT CUptiResult cuptiActivitySetAttribute(CUpti_ActivityAttribute, size_t*, void*) {
@@ -411,6 +486,10 @@ VGPU_EXPORT CUptiResult cuptiEventGroupGetAttribute(CUpti_EventGroup, CUpti_Even
 }
 VGPU_EXPORT CUptiResult cuptiEventGroupSetAttribute(CUpti_EventGroup, CUpti_EventGroupAttribute,
                                                     size_t, void*) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiEventGroupReadEvent(CUpti_EventGroup, CUpti_ReadEventFlags, CUpti_EventID,
+                                                 size_t*, uint64_t*) {
   return CUPTI_ERROR_NOT_SUPPORTED;
 }
 VGPU_EXPORT CUptiResult cuptiEventGroupReadAllEvents(CUpti_EventGroup, CUpti_ReadEventFlags,

@@ -28,8 +28,10 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update -qq
+          # nvidia-profiler is nvprof, an unmodified profiler run against the
+          # simulator by e2e_nvprof; without it that test skips.
           sudo apt-get install -y -qq --no-install-recommends \
-            build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit
+            build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit nvidia-profiler
           nvcc --version | tail -2
           cmake --version | head -1
 
