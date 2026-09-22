@@ -9,12 +9,15 @@
 #include <cstring>
 #include <ctime>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "args.hpp"
 #include "machine.hpp"
+#include "vgpu/amd_cper.hpp"
 #include "vgpu/ras.hpp"
 #include "vgpu/telemetry.hpp"
 
@@ -92,13 +95,15 @@ int usage(FILE* to) {
   std::fprintf(to,
                "usage: amd-smi list [-g GPU ...] [--json]\n"
                "       amd-smi metric [-e] [-k] [-g GPU ...] [--json]\n"
-               "       amd-smi ras --cper [--severity SEVERITY ...] [-g GPU ...]\n"
+               "       amd-smi ras --cper [--severity SEVERITY ...] [--folder DIR [--file-limit N]]\n"
+               "                   [-g GPU ...]\n"
                "       amd-smi version\n"
                "\n"
                "VirtualGPU's drop-in amd-smi, answering from the same machine state as rocm-smi.\n"
                "Of metric, only the ECC counts are modelled: -e the totals, -k per RAS block.\n"
-               "ras --cper lists the machine's recent ECC error records; --folder is not\n"
-               "modelled, since no CPER record files are written.\n");
+               "ras --cper lists the CPER records amdgpu wrote for each GPU's ECC errors;\n"
+               "--folder writes each as a .cper file with its header beside it as .json, as\n"
+               "amd-smi dumps them, and --file-limit keeps only the newest N.\n");
   return to == stdout ? 0 : 2;
 }
 
@@ -152,18 +157,11 @@ Node ecc_blocks(const vgpu::telemetry::DeviceSample& d, const vgpu::ras::Counter
 // CPER records for a GPU's recent ECC errors, oldest first: an uncorrectable
 // error in device memory is recorded as non-fatal (the page is retired and the
 // device goes on), a corrected one as corrected.
-struct Cper {
-  uint64_t time_ns;
-  bool uncorrected;
-};
-std::vector<Cper> cper_records(const std::string& uuid) {
-  std::vector<Cper> out;
-  uint64_t after = 0;
-  vgpu::ras::Event e{};
-  while (vgpu::ras::next_event(uuid, vgpu::ras::kEventSingleBitEcc | vgpu::ras::kEventDoubleBitEcc,
-                               &after, &e))
-    out.push_back({e.time_ns, e.type == vgpu::ras::kEventDoubleBitEcc});
-  return out;
+// Writes a file whole; false when it cannot be written.
+bool write_file(const std::filesystem::path& path, const std::string& bytes) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  return static_cast<bool>(out);
 }
 
 std::string cper_time(uint64_t ns) {
@@ -188,7 +186,7 @@ int cmd_amd_smi(const std::vector<std::string>& args) {
   }
 
   bool json = false, csv = false, ecc = false, blocks = false, cper = false;
-  std::vector<std::string> gpu_args, severities;
+  std::vector<std::string> gpu_args, severities, folder, file_limit;
   for (size_t i = 1; i < args.size(); ++i) {
     std::string a = args[i];
     std::string inline_value;
@@ -211,13 +209,14 @@ int cmd_amd_smi(const std::vector<std::string>& args) {
     else if (cmd == "metric" && (a == "-k" || a == "--ecc-blocks")) blocks = true;
     else if (cmd == "ras" && a == "--cper") cper = true;
     else if (cmd == "ras" && a == "--severity") values(&severities);
+    else if (cmd == "ras" && a == "--folder") values(&folder);
+    else if (cmd == "ras" && a == "--file-limit") values(&file_limit);
     else if (a == "-h" || a == "--help") return usage(stdout);
     else if (cmd == "metric" && a.rfind("-", 0) == 0) {
       std::fprintf(stderr, "amd-smi metric: %s is not modelled by VirtualGPU; -e and -k are\n", a.c_str());
       return 2;
-    } else if (cmd == "ras" && (a == "--folder" || a == "--follow" || a == "--file-limit" || a == "--afid")) {
-      std::fprintf(stderr, "amd-smi ras: %s is not modelled: VirtualGPU writes no CPER record files\n",
-                   a.c_str());
+    } else if (cmd == "ras" && (a == "--follow" || a == "--afid" || a == "--cper-file")) {
+      std::fprintf(stderr, "amd-smi ras: %s is not modelled by VirtualGPU\n", a.c_str());
       return 2;
     } else {
       std::fprintf(stderr, "amd-smi %s: unrecognized argument '%s'\n", cmd.c_str(), a.c_str());
@@ -282,22 +281,71 @@ int cmd_amd_smi(const std::vector<std::string>& args) {
       }
     }
     (void)want_fatal;   // nothing injected is fatal
-    // amd-smi prints this table whatever format was asked for.
-    std::printf("WARNING: No CPER files will be dumped unless --folder=<folder_name> is specified "
-                "and cper entries exist.\n");
-    std::printf("%-20s %-7s %-20s\n", "timestamp", "gpu_id", "severity");
+    if (folder.size() > 1 || file_limit.size() > 1 || (!file_limit.empty() && folder.empty())) {
+      std::fprintf(stderr, "amd-smi ras: --folder takes one directory, and --file-limit one count with it\n");
+      return 2;
+    }
+    long long limit = 0;
+    if (!file_limit.empty() && !vgpu::cli::parse_int(file_limit[0], 1, 1 << 30, &limit)) {
+      std::fprintf(stderr, "amd-smi ras: --file-limit is a positive count, got '%s'\n", file_limit[0].c_str());
+      return 2;
+    }
+    const std::filesystem::path dir = folder.empty() ? "" : folder[0];
+    std::error_code ec;
+    if (!folder.empty() && (std::filesystem::create_directories(dir, ec), ec)) {
+      std::fprintf(stderr, "amd-smi ras: cannot create %s: %s\n", dir.c_str(), ec.message().c_str());
+      return 1;
+    }
+    // amd-smi prints this table whatever format was asked for; with a folder
+    // it names each file it wrote and the AFIDs decoded from it.
+    if (folder.empty()) {
+      std::printf("WARNING: No CPER files will be dumped unless --folder=<folder_name> is specified "
+                  "and cper entries exist.\n");
+      std::printf("%-20s %-7s %-20s\n", "timestamp", "gpu_id", "severity");
+    } else {
+      std::printf("%-20s %-7s %-20s %-17s %s\n", "timestamp", "gpu_id", "severity", "file_name", "list of afids");
+    }
+    int count = 0;   // numbers the files across GPUs, as amd-smi does
+    std::vector<std::string> rows;
     for (uint32_t g : sel) {
-      std::vector<Cper> records;
+      std::vector<vgpu::amd::CperRecord> records;
       try {
-        records = cper_records(snap.devices[amd[g]].uuid);
+        records = vgpu::amd::cper_records(snap.devices[amd[g]], g);
       } catch (const std::exception&) {
       }
-      for (const Cper& r : records) {
-        if (r.uncorrected ? !want_uncorrected : !want_corrected) continue;
-        std::printf("%-20s %-7u %-20s\n", cper_time(r.time_ns).c_str(), g,
-                    r.uncorrected ? "NONFATAL-UNCORRECTED" : "NONFATAL-CORRECTED");
+      for (const auto& r : records) {
+        const bool uncorrected = r.severity == vgpu::amd::CperSeverity::NonFatalUncorrected;
+        if (uncorrected ? !want_uncorrected : !want_corrected) continue;
+        const char* severity = uncorrected ? "NONFATAL-UNCORRECTED" : "NONFATAL-CORRECTED";
+        char row[160];
+        if (folder.empty()) {
+          std::snprintf(row, sizeof row, "%-20s %-7u %-20s", cper_time(r.time_ns).c_str(), g, severity);
+        } else {
+          const std::string name = std::string(uncorrected ? "uncorrected" : "corrected") + "-" + std::to_string(++count);
+          if (!write_file(dir / (name + ".cper"), r.bytes) ||
+              !write_file(dir / (name + ".json"), vgpu::amd::cper_header_json(r, 0) + "\n")) {
+            std::fprintf(stderr, "amd-smi ras: cannot write %s in %s\n", name.c_str(), dir.c_str());
+            return 1;
+          }
+          std::snprintf(row, sizeof row, "%-20s %-7u %-20s %-17s %d", cper_time(r.time_ns).c_str(), g, severity,
+                        (name + ".cper").c_str(), r.afid);
+        }
+        rows.push_back(row);
       }
     }
+    // Over the limit, the oldest files go, each with its .json, once all are
+    // written -- oldest by modification time, as amd-smi sorts them.
+    if (limit) {
+      std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> files;
+      for (const auto& f : std::filesystem::directory_iterator(dir, ec))
+        if (f.path().extension() == ".cper") files.emplace_back(f.last_write_time(ec), f.path());
+      std::sort(files.begin(), files.end());
+      for (size_t k = 0; k + static_cast<size_t>(limit) < files.size(); ++k) {
+        std::filesystem::remove(files[k].second, ec);
+        std::filesystem::remove(std::filesystem::path(files[k].second).replace_extension(".json"), ec);
+      }
+    }
+    for (const auto& row : rows) std::printf("%s\n", row.c_str());
     return 0;
   }
 

@@ -110,6 +110,7 @@ add_library(vgpu STATIC
   src/core/regs.cpp
   src/core/machine.cpp
   src/core/amd_metrics.cpp
+  src/core/amd_cper.cpp
   src/core/profile.cpp
   src/core/registry.cpp
   src/core/memory.cpp
@@ -576,6 +577,10 @@ set_tests_properties(fault_cli PROPERTIES DEPENDS vgpu_cli
 add_test(NAME amd_lost_gpu COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_lost_gpu.sh)
 set_tests_properties(amd_lost_gpu PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
+# CPER records for AMD ECC errors: amd-smi's --folder dump, byte by byte.
+add_test(NAME amd_cper COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_cper.sh)
+set_tests_properties(amd_cper PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 # `vgpu regs` and configuration space, rendered by the real lspci where installed.
 add_test(NAME regs_cli COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_regs_cli.sh)
 set_tests_properties(regs_cli PROPERTIES DEPENDS vgpu_cli

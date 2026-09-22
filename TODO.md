@@ -467,8 +467,11 @@ narrows what counts as observable, not what the detector looks at.
   is offered. `--on copy` puts faults on copies out of device memory, and
   `--rate` arms any fault at a seeded rate per access. A lost AMD GPU is
   amdgpu's permanent PCI failure: the recovery in the kernel log, gone from
-  rocm-smi and amd-smi, registers reading all ones. Not yet: CPER record
-  files, and a lost AMD GPU's sysfs entries going away.
+  rocm-smi and amd-smi, registers reading all ones. `amd-smi ras --cper
+  --folder` writes amdgpu's CPER records for ECC errors, decoded by AMD's own
+  ras-decode to the AFIDs it prints. Not yet: the CPER ring in debugfs, fatal
+  and bad-page-threshold records, and a lost AMD GPU's sysfs entries going
+  away.
 - Registers (docs/registers.md): PCI configuration space from a register
   database (registers/pci-config.yaml) -- header, power management, MSI, PCI
   Express with the live link, AER fed by the fault model, BAR sizing -- read,
