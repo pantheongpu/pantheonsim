@@ -5,8 +5,8 @@ register database: every register is declared once, with its offset, width,
 access and what backs its value, and every tool reads the same state through
 it. Two kinds of space: **PCI configuration space**, the same layout on every
 vendor's card, and each vendor's **MMIO registers** -- an AMD GPU's behind BAR5,
-from the Linux amdgpu headers, and an NVIDIA GPU's BAR0 as far as a real card
-has been measured.
+from the Linux amdgpu headers, and an NVIDIA GPU's behind BAR0, from NVIDIA's
+own published register headers.
 
 ```bash
 vgpu regs list                          # the database: offset, width, access, backing
@@ -266,12 +266,42 @@ the real card's but for the IDs and the BAR addresses, and the
 512 conformance values -- matches it byte for byte but for the BAR addresses its
 host's firmware chose. Other cards use the generic layout.
 
-`--space mmio` on that profile is its BAR0, as measured so far: `chip_id` at
-0x0 (`0xb72000a1`, revision a1 as in configuration space) and zeros at 0x4 and
-0x8, with every register the map does not declare answering `0xbadf5040`, as
-the card does. The map in `nvidia/registers/mmio.yaml` grows as `regprobe`
-reads and identifies more; other NVIDIA profiles have no MMIO space until a
-card of their model is measured. `vgpu regs list` shows which capability each register belongs
+`--space mmio` on an NVIDIA GPU is its BAR0 (`nvidia/registers/mmio.yaml`).
+Every offset and bit field there comes from the published register headers of
+NVIDIA's open GPU kernel modules, which carry an MIT license
+(`nvidia/registers/LICENSES/nvidia-open-gpu-kernel-modules.txt` names the files,
+and each entry's `source` names the symbol). The values are this project's:
+
+- `pmc_boot_0` at 0x0 is the card's identity, in the header's own fields. The
+  architecture is the published id for the profile's architecture -- Turing
+  0x16 through Blackwell 0x1a -- so software that reads a card's family off
+  BAR0 gets the right answer on every profile. The die (`implementation`) is
+  filled in only for the card that was read, which answered 2, GA102; every
+  other model reports 0 rather than a guess. On the measured card the whole
+  register reads `0xb72000a1`, which is what that card gave, and its low byte is
+  the revision configuration space reports.
+- `pmc_boot_1` at 0x4 says whether software is on a card or on a virtual
+  function of one. It reads 0, a real card, which is what this simulator
+  presents -- and what the measured card answered.
+- `pmc_enable` at 0x200 is which engines a bound driver leaves running: the host
+  and graphics engines, two copy engines, the power and security
+  microcontrollers, the performance monitor, and the display engine only where
+  there are display outputs. A model, marked as one. The video bits are
+  declared because software decodes them and read 0: which decoders and
+  encoders a card has differs by model and the profiles do not record it.
+- The VBIOS scratch words at 0x1400 and the BAR1 and BAR2 block registers keep
+  what is written, which is their whole contract.
+- `ptimer_vf_timer_0` at 0x9800 advances with the clock the engine keeps time
+  by, so software polling it sees time pass. It measures simulation, not a
+  device, and the model's own file records where it starts.
+
+Registers the map does not declare answer `0xbadf5040`, which is what the
+measured card answered from 0xc on.
+
+The map grew from the headers rather than from more measurement for a reason
+worth recording: a read-only sweep of the rest of that card's BAR0 halted its
+microcontroller (Xid 62) and the GPU needed a reset. Reading a card register by
+register is not a safe way to map it while a driver is bound. `vgpu regs list` shows which capability each register belongs
 to; `vgpu regs read` takes a name and finds it on the chosen GPU, and the C
 API's `vgpu_regs_locate` does the same.
 

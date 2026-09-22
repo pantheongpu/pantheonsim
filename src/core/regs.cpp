@@ -497,7 +497,9 @@ struct RegisterSpace::Impl {
   }
 
   State* state() { return derived ? fresh.get() : static_cast<State*>(file->payload()); }
-  vendor::Context context(const Register& r) { return {d, base(r), state()->vendor_words}; }
+  vendor::Context context(const Register& r) {
+    return {d, base(r), state()->vendor_words, derived};
+  }
 
   // A GPU that has fallen off the bus (`vgpu fault lose`) no longer answers:
   // every read completes as all ones, the way a PCIe read nothing claims

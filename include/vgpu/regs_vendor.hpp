@@ -44,6 +44,12 @@ struct Context {
   const telemetry::DeviceSample& d;
   uint32_t base;       // the register's reset value on this device
   uint64_t* words;     // kStateWords of shared state
+  // True while the value being computed is the model's own, for the file a
+  // GPU's registers are kept in (`vgpu regs export`) rather than for a device
+  // that is running. A backing that follows a clock or a counter answers with
+  // its power-on value here, so what the repository keeps is the same every
+  // time it is written.
+  bool derived = false;
 };
 
 struct Vendor {
