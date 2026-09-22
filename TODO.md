@@ -465,7 +465,15 @@ narrows what counts as observable, not what the detector looks at.
   documented as Kepler-only and its power-source event as a laptop's, so none
   is offered. `--on copy` puts faults on copies out of device memory, and
   `--rate` arms any fault at a seeded rate per access. Not yet:
-  CPER record files, a lost AMD GPU, the link in lspci's config space (phase 3).
+  CPER record files, a lost AMD GPU.
+- Registers (docs/registers.md): PCI configuration space from a register
+  database (registers/pci-config.yaml) -- header, power management, MSI, PCI
+  Express with the live link, AER fed by the fault model, BAR sizing -- read,
+  written and dumped with `vgpu regs`, every access logged, and rendered by the
+  real lspci. Not yet: MMIO behind BAR0 (AMD first: its register definitions
+  are public; NVIDIA waits on a decision about the register source), the
+  session's /sys/bus/pci and `config` files, NVML and nvidia-smi reading the
+  link and error state through the registers.
 
 ## Not implemented (fails loudly, never silently)
 

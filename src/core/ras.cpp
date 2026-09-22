@@ -18,6 +18,7 @@
 #include <type_traits>
 
 #include "vgpu/error.hpp"
+#include "vgpu/shared_state.hpp"
 #include "vgpu/telemetry.hpp"
 
 namespace vgpu::ras {
@@ -30,12 +31,6 @@ constexpr uint32_t kVersion = 11;  // 2: armed faults; 3: hangs and clock-event 
                                   // 9: degraded links; 10: faults armed on copies;
                                   // 11: faults taken at a rate
 
-struct File {
-  uint32_t magic;
-  uint32_t version;
-  uint64_t reserved;
-  Counters counters;
-};
 static_assert(std::is_standard_layout_v<Counters> && sizeof(Counters) % sizeof(uint64_t) == 0,
               "Counters is read and written a word at a time");
 constexpr size_t kWords = sizeof(Counters) / sizeof(uint64_t);
@@ -47,60 +42,14 @@ std::string aggregate_path(const std::string& uuid) {
   return state_dir() + "/ras-" + uuid + ".aggregate";
 }
 
-// A state file mapped shared, so every process that touches the machine sees
-// one set of counts; unmapped when it goes out of scope. Opened without
-// `create`, a file that does not exist maps to nothing and reads as zero.
-class Mapped {
+// A device's counts, mapped shared so every process that touches the machine
+// sees one set; unmapped when it goes out of scope. Opened without `create`, a
+// file that does not exist maps to nothing and reads as zero.
+class Mapped : public SharedState {
  public:
-  Mapped(const std::string& path, bool create) {
-    if (create) {
-      std::error_code ec;
-      std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-    }
-    fd_ = ::open(path.c_str(), create ? (O_RDWR | O_CREAT) : O_RDWR, 0600);
-    if (fd_ < 0) {
-      if (!create && errno == ENOENT) return;
-      throw Error::make(Err::Internal, "cannot open reliability state ", path, ": ",
-                        std::strerror(errno));
-    }
-    struct stat st {};
-    if (::fstat(fd_, &st) == 0 && st.st_size < static_cast<off_t>(sizeof(File)) &&
-        ::ftruncate(fd_, sizeof(File)) != 0)
-      throw Error::make(Err::Internal, "cannot size reliability state ", path, ": ",
-                        std::strerror(errno));
-    void* p = ::mmap(nullptr, sizeof(File), PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
-    if (p == MAP_FAILED)
-      throw Error::make(Err::Internal, "cannot map reliability state ", path, ": ",
-                        std::strerror(errno));
-    file_ = static_cast<File*>(p);
-    // A new file is all zeros, and the first process to see it claims it. Two
-    // processes creating it at once must not both clear it -- the second would
-    // erase the first one's increment -- hence the compare-and-swap. A file
-    // from an incompatible build is started again rather than misread.
-    uint32_t expected = 0;
-    if (__atomic_compare_exchange_n(&file_->magic, &expected, kMagic, false, __ATOMIC_ACQ_REL,
-                                    __ATOMIC_ACQUIRE)) {
-      __atomic_store_n(&file_->version, kVersion, __ATOMIC_RELEASE);
-    } else if (expected != kMagic || __atomic_load_n(&file_->version, __ATOMIC_ACQUIRE) != kVersion) {
-      uint64_t* w = words();
-      for (size_t i = 0; i < kWords; ++i) __atomic_store_n(&w[i], 0, __ATOMIC_RELAXED);
-      __atomic_store_n(&file_->version, kVersion, __ATOMIC_RELEASE);
-      __atomic_store_n(&file_->magic, kMagic, __ATOMIC_RELEASE);
-    }
-  }
-  ~Mapped() {
-    if (file_) ::munmap(file_, sizeof(File));
-    if (fd_ >= 0) ::close(fd_);
-  }
-  Mapped(const Mapped&) = delete;
-  Mapped& operator=(const Mapped&) = delete;
-
-  Counters* counters() { return file_ ? &file_->counters : nullptr; }
-  uint64_t* words() { return file_ ? reinterpret_cast<uint64_t*>(&file_->counters) : nullptr; }
-
- private:
-  int fd_ = -1;
-  File* file_ = nullptr;
+  Mapped(const std::string& path, bool create)
+      : SharedState(path, create, kMagic, kVersion, sizeof(Counters), "reliability state") {}
+  Counters* counters() { return static_cast<Counters*>(payload()); }
 };
 
 Counters load(const std::string& path) {

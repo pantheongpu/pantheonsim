@@ -271,8 +271,9 @@ state. One `vgpu fault inject --count N` raises one ECC event, not N.
 ## lspci
 
 `vgpu smi --lspci` prints the listing directly. `vgpu smi --lspci-dump`
-synthesizes a PCI configuration space in `lspci -x` format, which the **real**
-`lspci` renders:
+writes each device's configuration space, from the register model (see
+[registers.md](registers.md)), in `lspci -xxxx` format, which the **real**
+`lspci` renders -- with `-vvv`, capabilities, link state and AER status too:
 
 ```bash
 build/bin/vgpu smi --lspci-dump > /tmp/vgpu-pci.dump
