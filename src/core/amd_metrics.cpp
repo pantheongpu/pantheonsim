@@ -4,7 +4,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 
 namespace vgpu::amd {
 namespace {
@@ -94,6 +97,68 @@ std::string gpu_metrics(const telemetry::DeviceSample& d, const ras::Counters& c
   m.current_uclk = static_cast<uint16_t>(d.mem_clock_mhz);
   m.padding = 0;
   return std::string(reinterpret_cast<const char*>(&m), sizeof m);
+}
+
+const char* const kDriverFiles[6] = {"gpu_busy_percent",      "mem_busy_percent",
+                                    "mem_info_vram_total",   "mem_info_vram_used",
+                                    "mem_info_vis_vram_total", "mem_info_vis_vram_used"};
+const char* const kHwmonFiles[21] = {
+    "name",          "temp2_input",   "temp2_label",    "temp2_crit",      "temp2_crit_hyst",
+    "temp2_emergency", "temp3_input", "temp3_label",    "temp3_crit",      "temp3_crit_hyst",
+    "temp3_emergency", "power1_average", "power1_label", "power1_cap",     "power1_cap_max",
+    "power1_cap_min", "power1_cap_default", "freq1_input", "freq1_label", "freq2_input", "freq2_label"};
+
+namespace {
+// Replaces a file whole, so a reader never sees half of one.
+void put(const std::string& path, const std::string& text) {
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out) return;
+    out << text << "\n";
+  }
+  if (std::rename(tmp.c_str(), path.c_str()) != 0) std::remove(tmp.c_str());
+}
+std::string num(uint64_t v) { return std::to_string(v); }
+}  // namespace
+
+void write_driver_files(const telemetry::DeviceSample& d, const std::string& dir) {
+  put(dir + "/gpu_busy_percent", num(d.utilization_gpu));
+  put(dir + "/mem_busy_percent", num(d.utilization_mem));
+  // The framebuffer is all CPU-visible on a large-BAR Instinct card.
+  put(dir + "/mem_info_vram_total", num(d.vram_total_bytes));
+  put(dir + "/mem_info_vram_used", num(d.vram_used_bytes));
+  put(dir + "/mem_info_vis_vram_total", num(d.vram_total_bytes));
+  put(dir + "/mem_info_vis_vram_used", num(d.vram_used_bytes));
+  const std::string h = dir + "/hwmon";
+  std::error_code ec;
+  std::filesystem::create_directories(h, ec);
+  // hwmon's units: millidegrees Celsius, microwatts, hertz. The critical limit
+  // is the device's slowdown threshold; the hysteresis and emergency margins
+  // are a model.
+  const uint64_t crit = uint64_t{d.temperature_max_c} * 1000;
+  const uint64_t mem_c = d.has_memory_temperature && d.temperature_mem_c ? d.temperature_mem_c : d.temperature_c;
+  put(h + "/name", "amdgpu");
+  put(h + "/temp2_input", num(uint64_t{d.temperature_c} * 1000));
+  put(h + "/temp2_label", "junction");
+  put(h + "/temp2_crit", num(crit));
+  put(h + "/temp2_crit_hyst", num(crit - 5000));
+  put(h + "/temp2_emergency", num(crit + 10000));
+  put(h + "/temp3_input", num(mem_c * 1000));
+  put(h + "/temp3_label", "mem");
+  put(h + "/temp3_crit", num(crit));
+  put(h + "/temp3_crit_hyst", num(crit - 5000));
+  put(h + "/temp3_emergency", num(crit + 10000));
+  put(h + "/power1_average", num(uint64_t{d.power_mw} * 1000));
+  put(h + "/power1_label", "PPT");
+  put(h + "/power1_cap", num(uint64_t{d.power_limit_mw} * 1000));
+  put(h + "/power1_cap_max", num(uint64_t{d.power_limit_mw} * 1000));
+  put(h + "/power1_cap_min", "0");
+  put(h + "/power1_cap_default", num(uint64_t{d.power_limit_mw} * 1000));
+  put(h + "/freq1_input", num(uint64_t{d.sm_clock_mhz} * 1000000));
+  put(h + "/freq1_label", "sclk");
+  put(h + "/freq2_input", num(uint64_t{d.mem_clock_mhz} * 1000000));
+  put(h + "/freq2_label", "mclk");
 }
 
 }  // namespace vgpu::amd

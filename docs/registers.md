@@ -211,6 +211,26 @@ degraded link:
 | `current_link_speed`, `current_link_width`, `max_link_speed`, `max_link_width` | the link, as `8.0 GT/s PCIe` and `8` |
 | `aer_dev_correctable`, `aer_dev_nonfatal`, `aer_dev_fatal` | the AER stats (see [telemetry.md](telemetry.md)) |
 | `ras/*_err_count` | amdgpu's per-block counts, on AMD cards |
+| `gpu_metrics` | the SMU's metrics table, on AMD cards (see AMD MMIO above) |
+| `gpu_busy_percent`, `mem_busy_percent`, `mem_info_vram_total`, `mem_info_vram_used`, `mem_info_vis_vram_*` | amdgpu's activity and memory counts, on AMD cards |
+| `hwmon/hwmonN/` | amdgpu's hwmon, on AMD cards: `temp2` (junction) and `temp3` (memory) with their `crit`, `crit_hyst` and `emergency` limits, `power1_average` and `power1_cap*`, `freq1` (sclk) and `freq2` (mclk), in hwmon's units -- the set an MI300 exposes, which has no edge sensor or voltage |
+
+`/sys/class/hwmon` in the session lists the GPUs' hwmon devices, so
+`sensors` reads them as it reads a real amdgpu:
+
+```
+amdgpu-pci-0100
+Adapter: PCI adapter
+junction:     +38.0°C  (crit = +100.0°C, hyst = +95.0°C)
+                       (emerg = +110.0°C)
+mem:          +38.0°C  (crit = +100.0°C, hyst = +95.0°C)
+                       (emerg = +110.0°C)
+PPT:         368.93 W  (cap = 750.00 W)
+```
+
+Utilization, temperature and power change on their own, so the session
+rewrites these files every second, and at once when a fault or a register write
+changes the device. The limits' hysteresis and emergency margins are a model.
 
 ## lspci
 

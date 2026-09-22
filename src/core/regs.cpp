@@ -714,6 +714,7 @@ void write_sysfs_files(const telemetry::DeviceSample& d, const std::string& dir)
     } catch (const std::exception&) {
     }
     replace_file(dir + "/gpu_metrics", amd::gpu_metrics(d, c));
+    amd::write_driver_files(d, dir);
   }
 }
 

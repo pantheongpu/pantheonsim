@@ -63,6 +63,19 @@ if unshare -r -m -u true 2>/dev/null; then
   expect "an isolated session sets the kernel's own hostname" "iso-node" \
     "$(timeout 60 "$vgpu" shell -y --hostname iso-node -c 'cat /proc/sys/kernel/hostname' </dev/null 2>/dev/null)"
   expect "and the host's hostname is untouched" "$host_before" "$(cat /proc/sys/kernel/hostname)"
+  # The session's PCI devices, as the kernel's sysfs has them, and an AMD
+  # GPU's driver files and hwmon -- read by the real tools where installed.
+  out=$(timeout 90 "$vgpu" shell -y --gpu amd/mi300x --count 2 --load 0.5 -c '
+    d=/sys/bus/pci/devices/0000:01:00.0
+    readlink -f /sys/class/drm/card0/device | grep -c "0000:01:00.0$"
+    cat $d/vendor $d/class $d/max_link_width
+    sleep 2
+    b=$(cat $d/gpu_busy_percent); [ "$b" -gt 0 ] && echo busy
+    cat /sys/class/hwmon/hwmon0/name /sys/class/hwmon/hwmon0/temp2_label
+    command -v sensors >/dev/null && sensors 2>/dev/null | grep -c "^amdgpu-pci-0[12]00$" || echo 2
+  ' </dev/null 2>/dev/null)
+  expect "a session's AMD GPUs are PCI devices with amdgpu's files and hwmon, which sensors reads" \
+    $'1\n0x1002\n0x120000\n16\nbusy\namdgpu\njunction\n2' "$out"
 else
   echo "skip  isolated hostname: user namespaces are unavailable here"
 fi

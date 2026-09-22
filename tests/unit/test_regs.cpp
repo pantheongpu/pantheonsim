@@ -310,4 +310,30 @@ VTEST(an_amd_gpus_metrics_table_is_the_drivers_v1_5_layout) {
   VCHECK_EQ(u64(88), ~uint64_t{0});        // energy: not reported
 }
 
+VTEST(amdgpus_driver_files_are_in_the_hwmon_abis_units) {
+  TempMachine m("hwmon");
+  auto d = device("amd/mi300x");
+  d.temperature_c = 47;
+  d.power_mw = 412000;
+  d.utilization_gpu = 33;
+  const std::string dir = m.root + "/files";
+  std::filesystem::create_directories(dir);
+  amd::write_driver_files(d, dir);
+  const auto read = [&](const std::string& f) {
+    std::ifstream in(dir + "/" + f);
+    std::string s;
+    std::getline(in, s);
+    return s;
+  };
+  VCHECK_EQ(read("gpu_busy_percent"), std::string("33"));
+  VCHECK_EQ(read("mem_info_vram_total"), std::to_string(d.vram_total_bytes));
+  VCHECK_EQ(read("hwmon/name"), std::string("amdgpu"));
+  VCHECK_EQ(read("hwmon/temp2_input"), std::string("47000"));      // millidegrees
+  VCHECK_EQ(read("hwmon/temp2_label"), std::string("junction"));
+  VCHECK_EQ(read("hwmon/power1_average"), std::string("412000000"));   // microwatts
+  VCHECK_EQ(read("hwmon/freq1_input"), std::to_string(uint64_t{d.sm_clock_mhz} * 1000000));   // hertz
+  for (const char* f : amd::kHwmonFiles) VCHECK(std::filesystem::exists(dir + "/hwmon/" + f));
+  VCHECK(!std::filesystem::exists(dir + "/hwmon/temp1_input"));   // an MI300 has no edge sensor
+}
+
 VTEST_MAIN
