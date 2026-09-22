@@ -86,6 +86,48 @@ jobs:
           VGPU_BUILD_DIR: ${{ github.workspace }}/pantheonsim/build
         run: ./tests/workloads/run_pantheon_workloads.sh
 
+  ollama:
+    name: ollama on every GPU
+    runs-on: ubuntu-24.04
+    # Fourteen GPUs take about 18 minutes on 8 cores; a 4-core runner is slower.
+    timeout-minutes: 90
+    env:
+      # Shims built against CUDA 13 make Ollama pick its cuda_v13 backend,
+      # whose PTX starts at sm_75 and so covers every profile.
+      NVCC_PREPEND_FLAGS: ''
+      OLLAMA_VERSION: v0.21.0
+      OLLAMA_MODELS: ${{ github.workspace }}/ollama-models
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA 13 and ollama
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates zstd
+          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/keyring.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
+            cuda-nvrtc-dev-13-0 libcublas-dev-13-0
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/ollama"
+          wget -qO- "https://github.com/ollama/ollama/releases/download/$OLLAMA_VERSION/ollama-linux-amd64.tar.zst" |
+            zstd -d | tar -x -C "$RUNNER_TEMP/ollama"
+          echo "$RUNNER_TEMP/ollama/bin" >> "$GITHUB_PATH"
+
+      - name: Build VirtualGPU
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+          ls build/shim/libcudart.so.*
+
+      - name: A model on every simulated NVIDIA GPU
+        env:
+          VGPU_OLLAMA_PULL: '1'
+        run: ctest --test-dir build --output-on-failure -R '^e2e_ollama$'
+
   sanitizers:
     name: ASan + UBSan
     runs-on: ubuntu-24.04
