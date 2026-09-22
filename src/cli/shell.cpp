@@ -36,6 +36,7 @@
 
 #include "args.hpp"
 #include "vgpu/driver_version.hpp"
+#include "vgpu/amd_metrics.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/ras.hpp"
 #include "vgpu/regs.hpp"
@@ -302,6 +303,7 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   make_dirs(s.root + "/proc/driver/nvidia/gpus");
   make_dirs(s.root + "/sys/class/drm");
   make_dirs(s.root + "/sys/bus/pci/devices");
+  make_dirs(s.root + "/sys/class/hwmon");
   make_dirs(s.root + "/etc");
 
   const std::string vgpu = exe_path();
@@ -344,11 +346,25 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
     for (const char* f : vgpu::ras::kAerFiles) std::filesystem::create_symlink(files + f, dev + "/" + f, ec);
     if (std::strcmp(ds.vendor, "amd") == 0) {
       std::filesystem::create_symlink(files + "gpu_metrics", dev + "/gpu_metrics", ec);
+      for (const char* f : vgpu::amd::kDriverFiles) std::filesystem::create_symlink(files + f, dev + "/" + f, ec);
+      // hwmon, where sensors and nvtop look: hwmon/hwmonN, numbered per card.
+      // The directory itself is the published one, since libsensors takes
+      // only regular files for attributes, not links to them; in it, as the
+      // kernel links them, `device` leads back to the GPU, and the class entry
+      // leads to it.
+      make_dirs(files + "hwmon");
+      std::filesystem::create_symlink(dev, files + "hwmon/device", ec);
+      make_dirs(dev + "/hwmon");
+      const std::string hw = dev + "/hwmon/hwmon" + std::to_string(i);
+      std::filesystem::create_symlink(files + "hwmon", hw, ec);
+      std::filesystem::create_symlink(hw, s.root + "/sys/class/hwmon/hwmon" + std::to_string(i), ec);
       make_dirs(dev + "/ras");
       for (const char* b : vgpu::ras::kAmdgpuRasBlocks)
         std::filesystem::create_symlink(files + b + "_err_count", dev + "/ras/" + std::string(b) + "_err_count", ec);
     }
     std::filesystem::create_symlink(dev, s.root + "/sys/bus/pci/devices/" + bdf, ec);
+    // The bus it sits on, which libsensors and udev read to know it is PCI.
+    std::filesystem::create_symlink(s.root + "/sys/bus/pci", dev + "/subsystem", ec);
     const std::string card = s.root + "/sys/class/drm/card" + std::to_string(i);
     make_dirs(card);
     std::filesystem::create_symlink(dev, card + "/device", ec);
@@ -789,6 +805,7 @@ int cmd_shell(const std::vector<std::string>& args) {
       // The session's PCI devices in place of the host's, as lspci and
       // anything walking /sys/bus/pci find them.
       bind(s.root + "/sys/bus/pci/devices", "/sys/bus/pci/devices");
+      bind(s.root + "/sys/class/hwmon", "/sys/class/hwmon");
     }
     isolated = ok;
     // The UTS namespace from `unshare -u` belongs to this session, so the
@@ -831,6 +848,22 @@ int cmd_shell(const std::vector<std::string>& args) {
       }
     });
   }
+  // Utilization, temperature and power change without anything being
+  // injected, so the sysfs files that report them -- gpu_busy_percent,
+  // hwmon, gpu_metrics, the idle link -- are rewritten every second.
+  std::thread refresh([&] {
+    while (!stop) {
+      for (int i = 0; i < c.count && !stop; ++i) {
+        vgpu::telemetry::DeviceSample ds{};
+        vgpu::telemetry::describe_device(profile, i, &ds);
+        try {
+          vgpu::ras::publish_session(ds.uuid);
+        } catch (const std::exception&) {
+        }
+      }
+      for (int t = 0; t < 10 && !stop; ++t) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
 
   // The session's tools go first, and every CUDA bin directory a build system
   // might reach for goes right behind them. Tools routinely prepend the
@@ -914,6 +947,7 @@ int cmd_shell(const std::vector<std::string>& args) {
   ::waitpid(pid, &status, 0);
   stop = true;
   if (pump.joinable()) pump.join();
+  refresh.join();
   // Remove the session directory; otherwise every run leaves its generated
   // tools and system files behind in /tmp.
   // No shell: the path is ours and the prefix check stays, but removing a
