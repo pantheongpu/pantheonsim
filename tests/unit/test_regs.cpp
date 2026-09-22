@@ -288,6 +288,39 @@ VTEST(a_geforce_replays_the_measured_configuration_space) {
   }
 }
 
+// The card itself: every byte of its configuration space is the measured
+// card's, but for the BAR addresses its host's firmware chose.
+VTEST(the_rtx_3080_ti_profile_is_the_measured_card_to_the_byte) {
+  TempMachine m("sameCard");
+  std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/registers/measurements/nvidia-rtx3080ti/config.bin",
+                   std::ios::binary);
+  const std::string real((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  regs::ConfigSpace cs(device("nvidia/rtx3080ti"));
+  const auto model = cs.image(regs::kConfigSize);
+  for (size_t i = 0; i < regs::kConfigSize; ++i) {
+    const bool bar_address = i >= 0x10 && i < 0x28 && !((i & 3) == 0 && i != 0x18 && i != 0x20);
+    if (!bar_address) VCHECK_EQ(static_cast<int>(model[i]), static_cast<int>(static_cast<uint8_t>(real[i])));
+  }
+}
+
+// An NVIDIA GPU's BAR0, as far as it has been measured: only on the measured
+// card's own model, and what the map does not declare reads as the card did.
+VTEST(an_nvidia_bar0_answers_as_the_measured_card) {
+  TempMachine m("nvmmio");
+  const auto ti = device("nvidia/rtx3080ti");
+  VCHECK(regs::has_space(ti, regs::Space::AmdMmio));   // "mmio" is the GPU's own
+  VCHECK(regs::resolve_space(ti, regs::Space::AmdMmio) == regs::Space::NvidiaMmio);
+  VCHECK(!regs::has_space(device("nvidia/rtx3060"), regs::Space::AmdMmio));   // not measured
+  VCHECK(!regs::has_space(device("nvidia/h100"), regs::Space::AmdMmio));
+  regs::RegisterSpace bar0(regs::Space::AmdMmio, ti);
+  VCHECK(bar0.space() == regs::Space::NvidiaMmio);
+  VCHECK_EQ(bar0.read(0x0, 4), 0xb72000a1u);
+  VCHECK_EQ(bar0.read(0x4, 4), 0u);
+  VCHECK_EQ(bar0.read(0xc, 4), 0xbadf5040u);
+  VCHECK_EQ(bar0.read(0x100000, 4), 0xbadf5040u);
+  VCHECK_EQ(bar0.read(0x0, 4) & 0xFF, 0xa1u);   // the revision configuration space reports
+}
+
 VTEST(capability_registers_are_found_through_each_cards_chain) {
   TempMachine m("chainwalk");
   const auto* aer = regs::find_config("aer_correctable_status");

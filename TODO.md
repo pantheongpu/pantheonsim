@@ -177,12 +177,13 @@ an instance left running bills by the hour).
 `nvidia/tools/compare-profile.py` diffs a measured profile against the one in the
 tree, so corrections are visible rather than silently applied.
 
-Verified against real hardware, eleven devices across seven architectures --
+Verified against real hardware, twelve devices across seven architectures --
 including the first AMD part:
 
 | profile | device | how |
 | --- | --- | --- |
 | `nvidia/rtx3060` | RTX 3060 (sm_86) | local |
+| `nvidia/rtx3080ti` | RTX 3080 Ti (sm_86, GA102) | server1; its registers are mapped too |
 | `nvidia/a10` | A10 (sm_86) | Lambda `gpu_1x_a10` |
 | `nvidia/a100-sxm4-40gb` | A100 SXM4 40GB (sm_80) | Lambda `gpu_1x_a100_sxm4` |
 | `nvidia/h100` | H100 SXM5 80GB (sm_90) | Lambda `gpu_1x_h100_sxm5` |
@@ -194,7 +195,7 @@ including the first AMD part:
 | `nvidia/l40s` | L40S (sm_89, Ada Lovelace, AD102) | EC2 `g6e.2xlarge` |
 | `amd/mi325x` | MI325X (gfx942, CDNA3) | DigitalOcean `gpu-mi325x1-256gb` |
 
-All ten NVIDIA parts match the physical device on **512 conformance values each** -- the
+All eleven NVIDIA parts match the physical device on **512 conformance values each** -- the
 same binary run on hardware and on VirtualGPU, diffed.
 
 **The AMD one is discovery, not execution.** `amd/mi325x` describes a real
@@ -479,9 +480,10 @@ narrows what counts as observable, not what the detector looks at.
   gpu_metrics table (v1.5), amdgpu's busy and memory files and its hwmon (read
   by `sensors`) are published live in the session's sysfs. An RTX 3080 Ti's
   whole configuration space, read as root, is replayed for Ampere GeForce
-  profiles, its registers found through its capability chain. Next: BAR0 of
-  that card (its identification reads 0xb72000a1; unmapped registers
-  0xbadf5040), and captures of data-center and AMD cards. The
+  profiles, its registers found through its capability chain; an
+  nvidia/rtx3080ti profile of that card is verified on 512 values, and its
+  measured BAR0 (identification 0xb72000a1, unmapped 0xbadf5040) is its MMIO
+  space. Next: map more of BAR0, and capture data-center and AMD cards. The
   session's /sys/bus/pci devices carry config, resource, IDs and link files
   from the registers, and NVML and nvidia-smi read the link through them, each
   access logged under the tool's name.

@@ -836,35 +836,6 @@ int cmd_shell(const std::vector<std::string>& args) {
     }
   }
 
-  std::atomic<bool> stop{false};
-  std::thread pump;
-  if (c.load > 0) {
-    pump = std::thread([&] {
-      const auto slice = std::chrono::milliseconds(100);
-      while (!stop) {
-        for (int i = 0; i < c.count; ++i)
-          rt.device(i).note_busy(std::chrono::duration<double>(slice).count() * c.load);
-        std::this_thread::sleep_for(slice);
-      }
-    });
-  }
-  // Utilization, temperature and power change without anything being
-  // injected, so the sysfs files that report them -- gpu_busy_percent,
-  // hwmon, gpu_metrics, the idle link -- are rewritten every second.
-  std::thread refresh([&] {
-    while (!stop) {
-      for (int i = 0; i < c.count && !stop; ++i) {
-        vgpu::telemetry::DeviceSample ds{};
-        vgpu::telemetry::describe_device(profile, i, &ds);
-        try {
-          vgpu::ras::publish_session(ds.uuid);
-        } catch (const std::exception&) {
-        }
-      }
-      for (int t = 0; t < 10 && !stop; ++t) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-  });
-
   // The session's tools go first, and every CUDA bin directory a build system
   // might reach for goes right behind them. Tools routinely prepend the
   // toolkit's directory to whatever PATH they were given -- pantheon.py does
@@ -922,6 +893,38 @@ int cmd_shell(const std::vector<std::string>& args) {
   // and LD_LIBRARY_PATH are already in the environment they inherit.
   const std::string shell_path(shell);
   const bool is_bash = shell_path.substr(shell_path.find_last_of('/') + 1) == "bash";
+
+  // The threads start only now, after the last setenv: getenv on one thread
+  // while another calls setenv can read an environment being reallocated,
+  // and the refresher's publish_session reads the environment every second.
+  std::atomic<bool> stop{false};
+  std::thread pump;
+  if (c.load > 0) {
+    pump = std::thread([&] {
+      const auto slice = std::chrono::milliseconds(100);
+      while (!stop) {
+        for (int i = 0; i < c.count; ++i)
+          rt.device(i).note_busy(std::chrono::duration<double>(slice).count() * c.load);
+        std::this_thread::sleep_for(slice);
+      }
+    });
+  }
+  // Utilization, temperature and power change without anything being
+  // injected, so the sysfs files that report them -- gpu_busy_percent,
+  // hwmon, gpu_metrics, the idle link -- are rewritten every second.
+  std::thread refresh([&] {
+    while (!stop) {
+      for (int i = 0; i < c.count && !stop; ++i) {
+        vgpu::telemetry::DeviceSample ds{};
+        vgpu::telemetry::describe_device(profile, i, &ds);
+        try {
+          vgpu::ras::publish_session(ds.uuid);
+        } catch (const std::exception&) {
+        }
+      }
+      for (int t = 0; t < 10 && !stop; ++t) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
 
   pid_t pid = ::fork();
   if (pid == 0) {

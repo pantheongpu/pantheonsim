@@ -143,6 +143,10 @@ int cmd_regs(const std::vector<std::string>& args) {
   }
 
   try {
+    // "mmio" is the chosen GPU's own MMIO space, whichever vendor's.
+    vgpu::telemetry::Shared snap{};
+    const bool have_machine = vgpu::cli::read_machine(&snap);
+    if (have_machine && gpu < snap.device_count) space = vgpu::regs::resolve_space(snap.devices[gpu], space);
     if (verb == "list") {
       // A capability's registers sit where each card's capability chain puts
       // the capability; OFFSET is the generic layout's.
@@ -156,15 +160,16 @@ int cmd_regs(const std::vector<std::string>& args) {
       return 0;
     }
 
-    vgpu::telemetry::Shared snap{};
-    if (!vgpu::cli::read_machine(&snap)) return 1;
+    if (!have_machine) return 1;
     if (gpu >= snap.device_count) {
       std::fprintf(stderr, "vgpu regs: there is no GPU %lld (this machine has %u)\n", gpu, snap.device_count);
       return 2;
     }
     const auto& d = snap.devices[gpu];
     if (!vgpu::regs::has_space(d, space)) {
-      std::fprintf(stderr, "vgpu regs: GPU %lld (%s) has no %s registers modelled; they are an AMD GPU's\n",
+      std::fprintf(stderr,
+                   "vgpu regs: GPU %lld (%s) has no %s registers modelled: an AMD GPU's are, and an NVIDIA "
+                   "GPU's where a card of its model has been measured\n",
                    gpu, d.name, vgpu::regs::space_name(space));
       return 2;
     }

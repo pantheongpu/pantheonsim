@@ -74,7 +74,11 @@ expect "the SMU answers a test message with its argument plus one" "0x00000001 0
   "$(mval smu_response) $(mval smu_argument)"
 mi regs write --space mmio smu_message 0x77 >/dev/null
 expect "and refuses a message it does not know" "0x000000fe" "$(mval smu_response)"
-h100 regs read --space mmio grbm_status >/dev/null; expect "an NVIDIA GPU has no MMIO modelled yet" "2" "$?"
+h100 regs read --space mmio 0x0 >/dev/null; expect "an NVIDIA GPU's MMIO only where its model was measured" "2" "$?"
+ti() { VGPU_GPU=nvidia/rtx3080ti VGPU_DEVICE_COUNT=1 "$vgpu" "$@" 2>&1; }
+expect "the measured RTX 3080 Ti's BAR0: its identification, and 0xbadf5040 where nothing is mapped" \
+  "0xb72000a1 0xbadf5040" \
+  "$(ti regs read --space mmio chip_id | head -1 | awk '{print $4}') $(ti regs read --space mmio 0x10 | awk '{print $3}')"
 mi regs read --space mmio 0x8012 >/dev/null; expect "an MMIO access is a whole aligned dword" "2" "$?"
 VGPU_QUIET=1 "$vgpu" serve --gpu amd/mi300x --count 1 --load 0.9 >/dev/null 2>&1 &
 loaded=$!
