@@ -8,12 +8,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 
 #include "vgpu/amd_metrics.hpp"
 #include "vgpu/embedded_config_images.hpp"
+#include "vgpu/embedded_gpu_registers.hpp"
 #include "vgpu/embedded_registers.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/ras.hpp"
@@ -318,7 +323,92 @@ void smu_write(State* s, const std::string& backing, uint32_t v) {
   }
 }
 
+// ---- Each GPU model's registers (registers/gpus/) -------------------------------------
+
+Access parse_access(const std::string& a, const std::string& where) {
+  return a == "ro" ? Access::Ro : a == "rw" ? Access::Rw : a == "rw1c" ? Access::Rw1c
+       : a == "bar" ? Access::Bar : throw Error::make(Err::ProfileParse, where, ": unknown access '", a, "'");
+}
+
+GpuRegisters load_gpu_file(const std::string& yaml, const std::string& origin) {
+  const yamlish::Value doc = yamlish::parse(yaml, origin);
+  GpuRegisters g;
+  g.origin = origin;
+  auto top = [&](const char* key) -> std::string {
+    const auto it = doc.map.find(key);
+    if (it == doc.map.end() || it->second.kind != yamlish::Value::Kind::Str)
+      throw Error::make(Err::ProfileParse, origin, ": missing ", key);
+    return it->second.str;
+  };
+  g.profile = top("profile");
+  g.device_id = parse_hex(top("pci_device_id"), origin + ": pci_device_id");
+  g.layout = top("layout");
+  for (const char* space : {"config", "mmio"}) {
+    const auto sit = doc.map.find(space);
+    if (sit == doc.map.end()) continue;
+    if (sit->second.kind != yamlish::Value::Kind::Map) throw Error::make(Err::ProfileParse, origin, ": ", space, " is a map");
+    std::vector<GpuRegister>& out = std::strcmp(space, "config") == 0 ? g.config : g.mmio;
+    for (const auto& [name, v] : sit->second.map) {
+      const std::string where = origin + ": " + space + "." + name;
+      if (v.kind != yamlish::Value::Kind::List || (v.list.size() != 4 && v.list.size() != 5))
+        throw Error::make(Err::ProfileParse, where, ": expected [offset, width, access, value] or [..., backing]");
+      auto s = [&](size_t i) { return v.list[i].kind == yamlish::Value::Kind::Int ? std::to_string(v.list[i].i) : v.list[i].str; };
+      GpuRegister r;
+      r.name = name;
+      r.offset = parse_hex(s(0), where);
+      r.width = static_cast<uint32_t>(std::atoi(s(1).c_str()));
+      r.access = parse_access(s(2), where);
+      r.value = parse_hex(s(3), where);
+      if (v.list.size() == 5) r.live = s(4);
+      out.push_back(std::move(r));
+    }
+    std::sort(out.begin(), out.end(), [](const GpuRegister& x, const GpuRegister& y) { return x.offset < y.offset; });
+  }
+  return g;
+}
+
+// Every model's file: the embedded ones, or VGPU_REGISTERS_DIR's.
+const std::vector<GpuRegisters>& gpu_files() {
+  static std::mutex mu;
+  static std::map<std::string, std::vector<GpuRegisters>> by_dir;   // "" for the embedded files
+  const char* env = std::getenv("VGPU_REGISTERS_DIR");
+  const std::string dir = env ? env : "";
+  std::lock_guard<std::mutex> lock(mu);
+  if (const auto it = by_dir.find(dir); it != by_dir.end()) return it->second;
+  std::vector<GpuRegisters> files;
+  if (dir.empty()) {
+    for (const auto& e : embedded::kGpuRegisters)
+      if (e.profile) files.push_back(load_gpu_file(e.yaml, std::string("registers/gpus/") + e.profile + ".yaml"));
+  } else {
+    std::error_code ec;
+    std::vector<std::string> paths;
+    for (const auto& f : std::filesystem::recursive_directory_iterator(dir, ec))
+      if (f.is_regular_file() && f.path().extension() == ".yaml") paths.push_back(f.path().string());
+    if (ec) throw Error::make(Err::ProfileParse, "VGPU_REGISTERS_DIR ", dir, ": ", ec.message());
+    std::sort(paths.begin(), paths.end());
+    for (const auto& p : paths) {
+      std::ifstream in(p);
+      files.push_back(load_gpu_file(std::string(std::istreambuf_iterator<char>(in), {}), p));
+    }
+  }
+  for (size_t i = 0; i < files.size(); ++i)
+    for (size_t j = 0; j < i; ++j)
+      if (files[i].device_id == files[j].device_id)
+        throw Error::make(Err::ProfileParse, files[i].origin, ": its PCI device ID is ", files[j].origin, "'s too");
+  return by_dir.emplace(dir, std::move(files)).first->second;
+}
+
+// A backing that is the profile's is fixed for the model; any other follows
+// the device's state.
+bool fixed_backing(const std::string& backing) { return backing.empty() || backing.rfind("profile.", 0) == 0; }
+
 }  // namespace
+
+const GpuRegisters* gpu_registers(const telemetry::DeviceSample& d) {
+  for (const auto& g : gpu_files())
+    if (g.device_id == d.pci_device_id >> 16) return &g;
+  return nullptr;
+}
 
 const char* access_name(Access a) {
   switch (a) {
@@ -393,11 +483,10 @@ const Register* find(Space space, const std::string& key) {
 }
 
 struct RegisterSpace::Impl {
-  Impl(Space sp, const telemetry::DeviceSample& dev)
-      : space(sp),
-        d(dev),
-        file(state_path(dev.uuid, sp), true, kMagic, database_version(sp), sizeof(State), "register state"),
-        bars(bar_layout(dev)) {
+  Impl(Space sp, const telemetry::DeviceSample& dev, bool derive)
+      : space(sp), d(dev), derived(derive), bars(bar_layout(dev)) {
+    if (derived) fresh = std::make_unique<State>();
+    else file.emplace(state_path(dev.uuid, sp), true, kMagic, database_version(sp), sizeof(State), "register state");
     // Where each register is on this device: the generic layout's offset, or
     // for a device replaying a captured space, wherever its chain puts the
     // register's capability.
@@ -416,19 +505,57 @@ struct RegisterSpace::Impl {
       at[i] = it == caps.end() ? RegisterSpace::kAbsent
                                : it->second + (r.offset - generic_capability(r.capability));
     }
+    if (!derived) adopt(gpu_registers(d));
   }
   Space space;
   telemetry::DeviceSample d;
-  SharedState file;
+  bool derived = false;
+  std::optional<SharedState> file;     // the machine's state, shared by every process
+  std::unique_ptr<State> fresh;        // or a private power-on state
   std::array<BarLayout, 6> bars;
   const embedded::ConfigImage* image_src = nullptr;
-  std::vector<uint32_t> at;   // by register index
+  std::vector<uint32_t> at;            // by register index
+  const GpuRegisters* model = nullptr;
+  std::vector<const GpuRegister*> kept;   // by register index: the model's file's entry
 
   size_t index(const Register& r) const { return static_cast<size_t>(&r - registers(space).data()); }
 
-  // A register's reset value: the captured card's bytes where the device
-  // replays one, the database's otherwise.
+  // The model's file, checked against the database and this device: the same
+  // registers, each where the device has it, with the same width and access.
+  // A file that disagrees was written for another database and is refused,
+  // naming the register, rather than half applied.
+  void adopt(const GpuRegisters* g) {
+    if (!g) return;
+    const auto& entries = space == Space::Config ? g->config : g->mmio;
+    const auto& rs = registers(space);
+    const std::string again = "; regenerate it with `vgpu regs export " + g->profile + "`";
+    if (space == Space::Config && g->layout != (image_src ? image_src->name : "generic"))
+      throw Error::make(Err::ProfileParse, g->origin, ": layout ", g->layout, " is not this device's", again);
+    kept.assign(rs.size(), nullptr);
+    size_t found = 0;
+    for (const GpuRegister& e : entries) {
+      const Register* r = find(space, e.name);
+      if (!r) throw Error::make(Err::ProfileParse, g->origin, ": ", e.name, " is not in the register database", again);
+      const size_t i = index(*r);
+      if (at[i] != e.offset || r->width != e.width || r->access != e.access ||
+          e.live != (fixed_backing(r->backing) ? "" : r->backing))
+        throw Error::make(Err::ProfileParse, g->origin, ": ", e.name, " differs from the register database", again);
+      kept[i] = &e;
+      ++found;
+    }
+    size_t present = 0;
+    for (uint32_t off : at) present += off != RegisterSpace::kAbsent;
+    if (found != present)
+      throw Error::make(Err::ProfileParse, g->origin, ": ", present - found, " of the device's ", space_name(space),
+                        " registers are missing", again);
+    model = g;
+  }
+
+  // A register's reset value: the model's where its file has it; otherwise
+  // the captured card's bytes where the device replays one, and the
+  // database's.
   uint32_t base(const Register& r) const {
+    if (model && kept[index(r)]) return kept[index(r)]->value;
     if (!image_src) return r.reset;
     const uint32_t off = at[index(r)];
     uint32_t v = 0;
@@ -436,9 +563,10 @@ struct RegisterSpace::Impl {
     return v;
   }
 
-  State* state() { return static_cast<State*>(file.payload()); }
+  State* state() { return derived ? fresh.get() : static_cast<State*>(file->payload()); }
 
   ras::Counters counts() {
+    if (derived) return {};   // power-on: no errors counted
     try {
       return ras::read(d.uuid).since_load;
     } catch (const std::exception&) {
@@ -466,6 +594,8 @@ struct RegisterSpace::Impl {
 
   uint32_t backed(const Register& r, const ras::Counters& c) {
     const std::string& k = r.backing;
+    // What the profile gives a register, the model's file has.
+    if (model && kept[index(r)] && fixed_backing(k)) return base(r);
     const uint32_t vendor = d.pci_device_id & 0xFFFF, device = d.pci_device_id >> 16;
     // A device replaying a capture of its own model has that board's subsystem
     // IDs; any other has its own vendor and device IDs there.
@@ -609,11 +739,13 @@ void check_access(Space space, uint32_t offset, uint32_t size) {
 }
 }  // namespace
 
-RegisterSpace::RegisterSpace(Space s, const telemetry::DeviceSample& d) {
+RegisterSpace::RegisterSpace(Space s, const telemetry::DeviceSample& d) : RegisterSpace(s, d, false) {}
+
+RegisterSpace::RegisterSpace(Space s, const telemetry::DeviceSample& d, bool derived) {
   s = resolve_space(d, s);
   if (!has_space(d, s))
     throw std::invalid_argument(std::string(d.name) + " has no " + space_name(s) + " registers modelled");
-  impl_ = std::make_unique<Impl>(s, d);
+  impl_ = std::make_unique<Impl>(s, d, derived);
 }
 RegisterSpace::~RegisterSpace() = default;
 Space RegisterSpace::space() const { return impl_->space; }
@@ -869,6 +1001,53 @@ Bar bar(RegisterSpace& cs, const telemetry::DeviceSample& d, int n) {
   b.is64 = l.is64;
   b.prefetchable = l.pref;
   return b;
+}
+
+}  // namespace vgpu::regs
+
+namespace vgpu::regs {
+
+std::string export_registers(const std::string& profile, const telemetry::DeviceSample& d) {
+  char line[160];
+  std::string out;
+  std::snprintf(line, sizeof line, "# %s (%s): its registers at power-on.\n", d.name, profile.c_str());
+  out += line;
+  out +=
+      "#\n"
+      "# Every register of each space the GPU has, where it has it, and the value it\n"
+      "# reads as. Every simulated GPU of this model starts from these values.\n"
+      "#\n"
+      "#   REGISTER: [OFFSET, WIDTH, ACCESS, VALUE]           a fixed value\n"
+      "#   REGISTER: [OFFSET, WIDTH, ACCESS, VALUE, BACKING]  follows the device's state\n"
+      "#                                                     (the link, BARs, error status,\n"
+      "#                                                     engines); VALUE is at power-on\n"
+      "#\n"
+      "# Generated by `vgpu regs export " + profile + "` from the register database\n"
+      "# (registers/*.yaml) and the profile. Change those and regenerate: a test fails\n"
+      "# when this file and what they give differ. docs/registers.md has the details.\n\n";
+  RegisterSpace cs(Space::Config, d, true);
+  std::snprintf(line, sizeof line, "profile: %s\npci_device_id: 0x%04x\nlayout: %s\n", profile.c_str(),
+                d.pci_device_id >> 16, cs.layout());
+  out += line;
+  const auto emit = [&](RegisterSpace& rs, const char* title, int digits) {
+    out += std::string("\n") + title + ":\n";
+    std::vector<std::pair<uint32_t, const Register*>> order;
+    for (const Register& r : registers(rs.space()))
+      if (const uint32_t at = rs.offset_of(r); at != RegisterSpace::kAbsent) order.emplace_back(at, &r);
+    std::sort(order.begin(), order.end());
+    for (const auto& [at, r] : order) {
+      std::snprintf(line, sizeof line, "  %-28s [0x%0*x, %u, %s, 0x%0*x", (r->name + ":").c_str(), digits, at, r->width,
+                    access_name(r->access), static_cast<int>(r->width / 4), rs.value(*r));
+      out += line;
+      out += fixed_backing(r->backing) ? "]\n" : ", " + r->backing + "]\n";
+    }
+  };
+  emit(cs, "config", 3);
+  if (has_space(d, Space::AmdMmio)) {   // "mmio": the device's own, either vendor's
+    RegisterSpace mmio(Space::AmdMmio, d, true);
+    emit(mmio, "mmio", mmio.space() == Space::AmdMmio ? 5 : 6);
+  }
+  return out;
 }
 
 }  // namespace vgpu::regs
