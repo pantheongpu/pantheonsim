@@ -3,10 +3,10 @@
 A VirtualGPU device has register spaces the way a card does, each backed by a
 register database: every register is declared once, with its offset, width,
 access and what backs its value, and every tool reads the same state through
-it. Two spaces so far: **PCI configuration space**, the same layout on every
-vendor's card, and an **AMD GPU's MMIO registers** behind BAR5, from the Linux
-amdgpu headers. NVIDIA's MMIO waits on a decision about where its register
-definitions may come from.
+it. Two kinds of space: **PCI configuration space**, the same layout on every
+vendor's card, and each vendor's **MMIO registers** -- an AMD GPU's behind BAR5,
+from the Linux amdgpu headers, and an NVIDIA GPU's BAR0 as far as a real card
+has been measured.
 
 ```bash
 vgpu regs list                          # the database: offset, width, access, backing
@@ -18,6 +18,23 @@ vgpu regs log                           # who read and wrote what
 
 `--gpu N` picks the device (0 by default); `read` and `write` take a register's
 name or its offset (`0x08a`), and `--size 1|2|4` for a partial access.
+
+## Where it lives
+
+What every PCI device shares is in one place, and what only one vendor's cards
+have is in that vendor's directory:
+
+| | Shared | AMD | NVIDIA |
+| --- | --- | --- | --- |
+| Register databases | `registers/pci-config.yaml` | `amd/registers/mmio.yaml` | `nvidia/registers/mmio.yaml` |
+| Each GPU model's registers | | `amd/registers/gpus/` | `nvidia/registers/gpus/` |
+| Captured from real cards | | | `nvidia/registers/measurements/` |
+| Code | `src/core/regs.cpp`: the databases' semantics, configuration space and its capability chains, BAR sizing, AER status, the shared state and log, the model files | `amd/src/regs.cpp`: BARs, identity, engine status, the SMU mailbox, NBIO, amdgpu's sysfs files; `metrics.cpp`, `cper.cpp` | `nvidia/src/regs.cpp`: BARs, identity, the replayed configuration space, BAR0's undeclared answer, the GeForce idle link |
+
+The engine reaches a vendor's part through one table of hooks
+(`include/vgpu/regs_vendor.hpp`): its MMIO space, BAR layout, captured
+configuration space, current link generation, the backings only it has, the
+writes its device logic answers, and its driver files in sysfs.
 
 ## The database
 
@@ -49,7 +66,7 @@ is an error, not a zero.
 
 ## Each GPU's registers
 
-The database says what a register is; `registers/gpus/<vendor>/<model>.yaml`
+The database says what a register is; `<vendor>/registers/gpus/<model>.yaml`
 says what it holds on one GPU model. There is a file for every profile, listing
 every register of each space the model has, at the offset the model has it
 (a card whose capability chain is laid out differently has its registers where
@@ -75,7 +92,7 @@ The files are generated, not written by hand:
 
 ```bash
 vgpu regs export amd/mi300x                 # one model's file, to stdout
-vgpu regs export --out registers/gpus       # every profile's
+vgpu regs export --out .                    # every profile's, at the repository root
 ```
 
 Change a register in the database or a profile, then regenerate. `regs_cli`
@@ -91,8 +108,8 @@ the directory and edit it. The simulator reads that directory in place of the
 embedded files:
 
 ```bash
-cp -r registers/gpus /tmp/gpus
-$EDITOR /tmp/gpus/amd/mi300x.yaml
+cp -r amd/registers/gpus /tmp/gpus
+$EDITOR /tmp/gpus/mi300x.yaml
 VGPU_REGISTERS_DIR=/tmp/gpus VGPU_GPU=amd/mi300x vgpu regs read subsystem_id
 ```
 
@@ -180,7 +197,7 @@ XCC count in ways not checked yet.
 
 The register offsets, bit fields and message numbers come from the amdgpu
 headers (`gc_9_4_3_*.h`, `mp_13_0_6_offset.h`, `nbio_7_9_0_*.h`, `smu_v13_0_6_ppsmc.h`; their
-MIT notice is in `registers/LICENSES/amdgpu-headers.txt`), and each entry's
+MIT notice is in `amd/registers/LICENSES/amdgpu-headers.txt`), and each entry's
 `source` names the symbol. They are offsets from an IP block's base, and MI300
 learns its bases at boot from its IP discovery table; the database uses
 Aldebaran's (MI200's), the same GFX9 family. That, the engine status values and
@@ -233,7 +250,7 @@ beside nvidia-smi's readings, and ranks the offsets whose values follow them --
 candidates for what each register is. A sweep of an undocumented region can
 hang a GPU or its host: sweep a card no one else is using, starting small.
 
-What a real card read is kept in `registers/measurements/`, and each register
+What a real card read is kept in `<vendor>/registers/measurements/`, and each register
 it changed carries a `measured:` note that `vgpu regs read` prints.
 
 A card whose whole configuration space was captured is replayed for the
@@ -252,7 +269,7 @@ host's firmware chose. Other cards use the generic layout.
 `--space mmio` on that profile is its BAR0, as measured so far: `chip_id` at
 0x0 (`0xb72000a1`, revision a1 as in configuration space) and zeros at 0x4 and
 0x8, with every register the map does not declare answering `0xbadf5040`, as
-the card does. The map in `registers/nvidia-mmio.yaml` grows as `regprobe`
+the card does. The map in `nvidia/registers/mmio.yaml` grows as `regprobe`
 reads and identifies more; other NVIDIA profiles have no MMIO space until a
 card of their model is measured. `vgpu regs list` shows which capability each register belongs
 to; `vgpu regs read` takes a name and finds it on the chosen GPU, and the C

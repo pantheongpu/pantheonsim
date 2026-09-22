@@ -32,7 +32,7 @@ int usage(FILE* to) {
                "A device's registers, from the register database: each register's offset,\n"
                "width, access and what backs it. --space is config (default), the PCI\n"
                "configuration space (registers/pci-config.yaml), or mmio, an AMD GPU's\n"
-               "registers behind BAR5 (registers/amd-mmio.yaml): engine status and the SMU\n"
+               "registers behind BAR5 (amd/registers/mmio.yaml): engine status and the SMU\n"
                "mailbox. REGISTER is a name from `list` or an offset (0x08a); a read decodes\n"
                "its fields. A write follows the register's access: rw bits are kept, a 1\n"
                "written to an rw1c status bit clears it until its cause recurs, and a base\n"
@@ -41,10 +41,10 @@ int usage(FILE* to) {
                "process that made it. --gpu defaults to 0.\n"
                "\n"
                "Every GPU model's registers and their power-on values are kept in the\n"
-               "repository, registers/gpus/<vendor>/<model>.yaml, and every simulated GPU of\n"
+               "repository, <vendor>/registers/gpus/<model>.yaml, and every simulated GPU of\n"
                "the model starts from them. `export` writes those files from the database and\n"
-               "the profiles: to stdout, or with --out as DIR/<vendor>/<model>.yaml. With no\n"
-               "PROFILE, every built-in one.\n");
+               "the profiles: to stdout, or with --out under DIR as they sit in the repository\n"
+               "(--out . at its root regenerates them). With no PROFILE, every built-in one.\n");
   return to == stdout ? 0 : 2;
 }
 
@@ -120,7 +120,7 @@ int export_files(const std::vector<std::string>& args) {
         std::fputs(text.c_str(), stdout);
         continue;
       }
-      const std::filesystem::path path = std::filesystem::path(out_dir) / (prof.id + ".yaml");
+      const std::filesystem::path path = std::filesystem::path(out_dir) / vgpu::regs::gpu_registers_file(prof.id);
       std::filesystem::create_directories(path.parent_path());
       std::ofstream f(path, std::ios::trunc);
       f << text;

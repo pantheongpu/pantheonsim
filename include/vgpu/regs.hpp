@@ -67,7 +67,7 @@ bool has_space(const telemetry::DeviceSample& d, Space s);
 inline constexpr uint32_t kConfigSize = 4096;
 
 // The registers of one GPU model and their values at power-on, as the
-// repository keeps them (registers/gpus/<vendor>/<model>.yaml, embedded at
+// repository keeps them (<vendor>/registers/gpus/<model>.yaml, embedded at
 // build time): every register of every space the model has, where the model
 // has it. A device of the model starts from these values, so every simulator
 // started as that GPU reads the same. Registers whose value follows the
@@ -95,6 +95,9 @@ struct GpuRegisters {
 // no file for it (a profile added without one), and the model's registers are
 // then derived from the database and the profile. Throws on a malformed file.
 const GpuRegisters* gpu_registers(const telemetry::DeviceSample& d);
+// Where a profile's file is in the repository: "amd/mi300x" is
+// amd/registers/gpus/mi300x.yaml.
+std::string gpu_registers_file(const std::string& profile);
 // A model's file as `vgpu regs export` writes it: derived from the register
 // database and the profile, never from an existing file. `d` is the model's
 // first device at power-on (telemetry::describe_device, ordinal 0).
@@ -147,7 +150,7 @@ class RegisterSpace {
   // The register at an offset on this device, or null.
   const Register* at(uint32_t offset) const;
   // "generic", or the captured card whose configuration space this device
-  // replays (registers/measurements/).
+  // replays (<vendor>/registers/measurements/).
   const char* layout() const;
   // The first `len` bytes of the space, without logging: for files a session
   // keeps up to date, which no tool has read yet.
@@ -163,12 +166,6 @@ class ConfigSpace : public RegisterSpace {
  public:
   explicit ConfigSpace(const telemetry::DeviceSample& d) : RegisterSpace(Space::Config, d) {}
 };
-
-// The SMU messages the mailbox answers, from smu_v13_0_6_ppsmc.h, and what it
-// answers with. Any other message is refused as an unknown command.
-inline constexpr uint32_t kSmuTestMessage = 0x1, kSmuGetSmuVersion = 0x2, kSmuGetDriverIfVersion = 0x4,
-                          kSmuGetMetricsVersion = 0x8;
-inline constexpr uint32_t kSmuResultOk = 0x1, kSmuResultUnknownCmd = 0xFE;
 
 // The PCIe link as its registers report it -- Link Capabilities for the
 // maximum, Link Status for the link as trained -- read (and logged) the way a

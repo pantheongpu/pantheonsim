@@ -14,6 +14,7 @@
 #include <string>
 
 #include "vgpu/amd_metrics.hpp"
+#include "vgpu/amd_regs.hpp"
 #include "vgpu/embedded_gpu_registers.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/ras.hpp"
@@ -264,11 +265,11 @@ VTEST(an_mmio_access_is_a_whole_aligned_dword) {
 
 // The GA10x GeForce the RTX 3060 profile models replays a real RTX 3080 Ti's
 // configuration space (GA102, read as root by tools/regprobe;
-// registers/measurements/nvidia-rtx3080ti): all 4096 bytes must match but for
+// nvidia/registers/measurements/rtx3080ti): all 4096 bytes must match but for
 // what is this card's or this host's own -- its IDs and its BAR addresses.
 VTEST(a_geforce_replays_the_measured_configuration_space) {
   TempMachine m("measured");
-  std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/registers/measurements/nvidia-rtx3080ti/config.bin",
+  std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/nvidia/registers/measurements/rtx3080ti/config.bin",
                    std::ios::binary);
   const std::string real((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   VCHECK_EQ(real.size(), size_t{regs::kConfigSize});
@@ -294,7 +295,7 @@ VTEST(a_geforce_replays_the_measured_configuration_space) {
 // card's, but for the BAR addresses its host's firmware chose.
 VTEST(the_rtx_3080_ti_profile_is_the_measured_card_to_the_byte) {
   TempMachine m("sameCard");
-  std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/registers/measurements/nvidia-rtx3080ti/config.bin",
+  std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/nvidia/registers/measurements/rtx3080ti/config.bin",
                    std::ios::binary);
   const std::string real((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   regs::ConfigSpace cs(device("nvidia/rtx3080ti"));
@@ -398,7 +399,7 @@ VTEST(amdgpus_driver_files_are_in_the_hwmon_abis_units) {
 
 VTEST_MAIN
 
-// ---- Each GPU model's registers file (registers/gpus/) ------------------------------
+// ---- Each GPU model's registers file (<vendor>/registers/gpus/) ---------------------
 
 namespace {
 std::string read_file(const std::string& path) {
@@ -406,7 +407,7 @@ std::string read_file(const std::string& path) {
   return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 std::string source_file(const std::string& profile) {
-  return std::string(VGPU_SOURCE_DIR) + "/registers/gpus/" + profile + ".yaml";
+  return std::string(VGPU_SOURCE_DIR) + "/" + regs::gpu_registers_file(profile);
 }
 // A register's value as software reads it: a 24-bit one as the dword around it.
 uint32_t read_register(regs::RegisterSpace& rs, const regs::GpuRegister& r) {
@@ -446,8 +447,8 @@ VTEST(every_gpu_has_its_registers_file_and_it_is_current) {
     const std::string file = read_file(source_file(gpu));
     VCHECK(!file.empty());
     if (regs::export_registers(gpu, d) != file)
-      throw vtest::Failure("registers/gpus/" + gpu + ".yaml is not what the register database and the profile " +
-                           "give; regenerate it: vgpu regs export --out registers/gpus");
+      throw vtest::Failure(regs::gpu_registers_file(gpu) + " is not what the register database and the profile " +
+                           "give; regenerate it at the repository root: vgpu regs export --out .");
     bool embedded_same = false;
     for (const auto& e : embedded::kGpuRegisters)
       if (e.profile && gpu == e.profile) embedded_same = file == e.yaml;

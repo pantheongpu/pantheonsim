@@ -2,7 +2,7 @@
 // (/sys/class/drm/cardN/device/gpu_metrics): a binary struct the SMU fills and
 // amd-smi, rocm-smi and monitoring daemons read. The layout is the Linux
 // kernel's gpu_metrics_v1_5 (kgd_pp_interface.h; MIT, notice in
-// registers/LICENSES/amdgpu-headers.txt), the one MI300-class GPUs have
+// amd/registers/LICENSES/amdgpu-headers.txt), the one MI300-class GPUs have
 // published; later kernels moved to later versions.
 #pragma once
 

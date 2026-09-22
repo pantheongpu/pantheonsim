@@ -9,7 +9,7 @@
 #             register is found through the capability chain, as drivers find
 #             it, at the same distance from its capability's header as in the
 #             generic layout -- so a card whose chain is laid out differently
-#             (a captured one, registers/measurements/) has it where it has it
+#             (a captured one, <vendor>/registers/measurements/) has it where it has it
 #   width     8, 16 or 32 bits
 #   access    ro    read-only; the backing or reset value
 #             rw    read-write; writes are kept (only write_mask bits change)
@@ -22,7 +22,7 @@
 #   surfaces  the tools and files that read it
 #   status    done: behaves as on hardware; model: a plausible value, not measured
 #   measured  what a real card read, where one has been checked
-#             (tools/regprobe; registers/measurements/)
+#             (tools/regprobe; <vendor>/registers/measurements/)
 
 vendor_id:
   offset: "0x000"
