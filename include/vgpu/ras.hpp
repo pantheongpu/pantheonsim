@@ -127,8 +127,9 @@ std::string state_dir();
 // Inside `vgpu shell`, the files the kernel and amdgpu keep for a device --
 // the PCIe AER stats (aer_dev_correctable, aer_dev_nonfatal, aer_dev_fatal)
 // and amdgpu's per-block ras/*_err_count -- rewritten from this state whenever
-// a count changes, under <session>/ras/<uuid>/. The session's
-// /sys/class/drm/cardN/device links to them. Outside a session (no
+// a count changes, under <session>/sysfs/<uuid>/, with the PCI device's own
+// files from the register model (regs::write_sysfs_files). The session's
+// /sys/bus/pci/devices and /sys/class/drm/cardN/device link to them. Outside a session (no
 // VGPU_SESSION, or `session` empty) this does nothing.
 void publish_session(const std::string& uuid, const std::string& session = "");
 // amdgpu's RAS blocks with an err_count file, in its names.

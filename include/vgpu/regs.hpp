@@ -80,11 +80,31 @@ class ConfigSpace {
 
   // The value a register reads as now, without logging.
   uint32_t value(const Register& r);
+  // The first `len` bytes of the space, without logging: for files a session
+  // keeps up to date, which no tool has read yet.
+  std::vector<uint8_t> image_unlogged(uint32_t len);
 
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// The PCIe link as its registers report it -- Link Capabilities for the
+// maximum, Link Status for the link as trained -- read (and logged) the way a
+// monitoring tool reads them. nvidia-smi and NVML report the link from here.
+struct Link {
+  uint32_t gen = 0, width = 0;          // as trained now
+  uint32_t max_gen = 0, max_width = 0;  // what the card and slot support
+};
+Link link(ConfigSpace& cs);
+
+// The files the kernel keeps for a PCI device in sysfs -- config, resource,
+// vendor, device, class, subsystem_vendor, subsystem_device, revision, and
+// current_ and max_link_speed and _width -- written from the register model
+// into `dir`, for a device `d` read with its faults applied.
+void write_sysfs_files(const telemetry::DeviceSample& d, const std::string& dir);
+// The file names write_sysfs_files writes, for a session to link to.
+extern const char* const kSysfsFiles[12];
 
 // The newest accesses to a device's registers, oldest first.
 std::vector<LogEntry> access_log(const std::string& uuid);

@@ -471,9 +471,10 @@ narrows what counts as observable, not what the detector looks at.
   Express with the live link, AER fed by the fault model, BAR sizing -- read,
   written and dumped with `vgpu regs`, every access logged, and rendered by the
   real lspci. Not yet: MMIO behind BAR0 (AMD first: its register definitions
-  are public; NVIDIA waits on a decision about the register source), the
-  session's /sys/bus/pci and `config` files, NVML and nvidia-smi reading the
-  link and error state through the registers.
+  are public; NVIDIA waits on a decision about the register source). The
+  session's /sys/bus/pci devices carry config, resource, IDs and link files
+  from the registers, and NVML and nvidia-smi read the link through them, each
+  access logged under the tool's name.
 
 ## Not implemented (fails loudly, never silently)
 

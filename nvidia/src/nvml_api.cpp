@@ -29,6 +29,7 @@
 
 #include "vgpu/profile.hpp"
 #include "vgpu/ras.hpp"
+#include "vgpu/regs.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/telemetry.hpp"
 
@@ -746,16 +747,22 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDecoderUtilization(nvmlDevice_t, unsigned 
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPcieThroughput(nvmlDevice_t, nvmlPcieUtilCounter_t, unsigned int*) {
   REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
 }
-// The PCIe link: its maximum is the one the profile records, the link real
-// cards of the model most often run at, and its current state that same link
-// unless it has been degraded (`vgpu fault link`).
+// The PCIe link, read from the device's PCI Express capability as a driver
+// reads it -- Link Capabilities for the maximum, Link Status for the link as
+// trained -- so the read shows in the register access log (vgpu regs log).
+// Without register state to read, the reading's own link.
 static nvmlReturn_t pcie_link(nvmlDevice_t device, unsigned int* out, bool generation, bool current) {
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   refresh();
   const auto* d = sample(device);
   if (!d || !out) return bad(device);
-  const unsigned v = generation ? (current ? d->pcie_gen : d->pcie_gen_max)
-                                : (current ? d->pcie_width : d->pcie_width_max);
+  vgpu::regs::Link l{d->pcie_gen, d->pcie_width, d->pcie_gen_max, d->pcie_width_max};
+  try {
+    vgpu::regs::ConfigSpace cs(*d);
+    l = vgpu::regs::link(cs);
+  } catch (const std::exception&) {
+  }
+  const unsigned v = generation ? (current ? l.gen : l.max_gen) : (current ? l.width : l.max_width);
   if (!v) return NVML_ERROR_NOT_SUPPORTED;
   *out = v;
   return NVML_SUCCESS;
