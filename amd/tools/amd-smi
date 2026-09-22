@@ -4,4 +4,4 @@
 # --ecc-blocks, and ras --cper from the same machine state rocm-smi reads.
 here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 vgpu="$here/vgpu"; [[ -x "$vgpu" ]] || vgpu="$here/../vgpu"
-exec "$vgpu" smi --amd "$@"
+exec -a amd-smi "$vgpu" smi --amd "$@"

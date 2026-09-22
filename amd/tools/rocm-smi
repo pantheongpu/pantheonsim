@@ -8,4 +8,4 @@
 # other flag was ignored, while the session's copy rejected the same flags.
 here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 vgpu="$here/vgpu"; [[ -x "$vgpu" ]] || vgpu="$here/../vgpu"
-exec "$vgpu" smi --rocm "$@"
+exec -a rocm-smi "$vgpu" smi --rocm "$@"

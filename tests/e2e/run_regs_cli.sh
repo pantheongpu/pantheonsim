@@ -36,6 +36,31 @@ h100 regs read nothing >/dev/null; expect "an unknown register is refused" "2" "
 h100 regs read 0x001 --size 2 >/dev/null; expect "a misaligned access is refused" "2" "$?"
 h100 regs read --gpu 7 link_status >/dev/null; expect "a GPU that is not there is refused" "2" "$?"
 
+# A machine something publishes, as a session's is: the PCI device's sysfs
+# files are written from the registers, and change with them.
+sess="$tmp/session"; mkdir -p "$sess"
+VGPU_GPU=nvidia/h100 VGPU_QUIET=1 "$vgpu" serve --gpu nvidia/h100 --count 2 >/dev/null 2>&1 &
+serve=$!
+trap 'kill $serve 2>/dev/null; wait $serve 2>/dev/null; rm -rf "$tmp"' EXIT
+for _ in $(seq 50); do [[ -n "$(ls "$tmp/run" 2>/dev/null | grep -v '^ras-\|^regs-')" ]] && break; sleep 0.1; done
+uuid=$(h100 smi -i 1 --query-gpu=uuid --format=csv,noheader)
+files="$sess/sysfs/$uuid"
+VGPU_SESSION="$sess" h100 fault link --gpu 1 --width 8 >/dev/null
+expect "the device's sysfs files come from its registers" "0x10de 0x030200 32.0 GT/s PCIe 8 16" \
+  "$(cat "$files/vendor" "$files/class" "$files/current_link_speed" "$files/current_link_width" "$files/max_link_width" | paste -sd' ')"
+expect "config is the whole space, byte for byte" "4096 de10" \
+  "$(stat -c %s "$files/config") $(od -An -tx1 -N2 "$files/config" | tr -d ' ')"
+expect "resource lists the BARs as the kernel does" "0x00000000e2000000 0x00000000e2ffffff 0x0000000000040200" \
+  "$(head -1 "$files/resource")"
+VGPU_SESSION="$sess" h100 regs write --gpu 1 command 0x0002 >/dev/null
+expect "a register write reaches the config file" "02 00" "$(od -An -tx1 -j4 -N2 "$files/config" | sed 's/^ //')"
+"$build/bin/nvidia-smi" -i 1 --query-gpu=pcie.link.width.current --format=csv,noheader >/dev/null 2>&1
+expect "nvidia-smi reads the link through the registers, and the log names it" \
+  "nvidia-smi link_capabilities nvidia-smi link_status" \
+  "$(h100 regs log --gpu 1 --last 2 | awk '{printf "%s%s %s", sep, $2, $7; sep = " "}')"
+VGPU_SESSION="$sess" h100 fault link --gpu 1 --clear >/dev/null
+kill $serve 2>/dev/null; wait $serve 2>/dev/null
+
 if command -v lspci >/dev/null; then
   h100 fault link --gpu 0 --gen 3 --width 8 >/dev/null
   h100 fault inject --gpu 0 --pcie replay >/dev/null

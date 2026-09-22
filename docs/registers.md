@@ -75,11 +75,42 @@ What is written is kept in a state file beside the reliability state, shared by
 every process on the machine: one process's write is the next one's read. A
 database that changes starts the state again.
 
-## The access log
+## Who reads the registers
 
-Every access is logged -- offset, size, value, and the process that made it
--- and `vgpu regs log` shows the newest 256. A whole-space read, as `lspci`
-dumps it, is one entry.
+NVML and nvidia-smi report the PCIe link by reading it from the registers --
+Link Capabilities for the maximum, Link Status for the link as trained -- as a
+driver does, so the link every tool reports is the one the registers hold.
+
+Every access is logged -- offset, size, value, and the process that made it,
+by the name it was started under -- and `vgpu regs log` shows the newest 256.
+The drop-in tools run under their own names, so the log tells nvidia-smi from
+rocm-smi from a Python program using NVML:
+
+```
+19:50:46.596  nvidia-smi       pid 914796  read   0x084 link_capabilities        4 bytes = 0x00030905
+19:50:46.596  nvidia-smi       pid 914796  read   0x08a link_status              2 bytes = 0x1043
+19:50:46.613  python3          pid 914797  read   0x084 link_capabilities        4 bytes = 0x00030905
+```
+
+A whole-space read, as `lspci` dumps it, is one entry.
+
+## sysfs
+
+Inside `vgpu shell`, each GPU is a PCI device where the kernel keeps one:
+`/sys/devices/pci0000:00/0000:00:0N.0/0000:0N:00.0`, reached from
+`/sys/bus/pci/devices` (the session's devices in place of the host's) and from
+`/sys/class/drm/cardN/device`. Its files are written from the registers and
+rewritten whenever the device changes -- a register write, an injected error, a
+degraded link:
+
+| File | Content |
+| --- | --- |
+| `config` | the 4096-byte configuration space |
+| `resource` | start, end and flags of each BAR, then the ROM and SR-IOV slots, as the kernel prints them |
+| `vendor`, `device`, `class`, `revision`, `subsystem_vendor`, `subsystem_device` | the IDs, in hex |
+| `current_link_speed`, `current_link_width`, `max_link_speed`, `max_link_width` | the link, as `8.0 GT/s PCIe` and `8` |
+| `aer_dev_correctable`, `aer_dev_nonfatal`, `aer_dev_fatal` | the AER stats (see [telemetry.md](telemetry.md)) |
+| `ras/*_err_count` | amdgpu's per-block counts, on AMD cards |
 
 ## lspci
 

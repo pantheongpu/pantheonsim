@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 
 #include "vgpu/embedded_registers.hpp"
@@ -170,15 +171,26 @@ std::string state_path(const std::string& uuid) {
   return telemetry::default_path() + "/regs-" + uuid;
 }
 
+// The name the process was started under: argv[0]'s last component, which is
+// the tool's own name even where it is a script that execs vgpu under it
+// (nvidia-smi, rocm-smi, amd-smi). The kernel's short name when that fails.
 std::string process_name() {
-  char buf[64] = {0};
-  if (std::FILE* f = std::fopen("/proc/self/comm", "r")) {
-    if (!std::fgets(buf, sizeof buf, f)) buf[0] = 0;
+  char buf[256] = {0};
+  if (std::FILE* f = std::fopen("/proc/self/cmdline", "r")) {
+    const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+    buf[n] = 0;
     std::fclose(f);
   }
-  std::string n = buf;
-  while (!n.empty() && (n.back() == '\n' || n.back() == '\r')) n.pop_back();
-  return n;
+  std::string name = buf;   // up to the first NUL: argv[0]
+  if (const size_t slash = name.rfind('/'); slash != std::string::npos) name = name.substr(slash + 1);
+  if (name.empty()) {
+    if (std::FILE* f = std::fopen("/proc/self/comm", "r")) {
+      if (std::fgets(buf, sizeof buf, f)) name = buf;
+      std::fclose(f);
+    }
+    while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back();
+  }
+  return name;
 }
 
 uint64_t now_ns() {
@@ -408,6 +420,13 @@ uint32_t ConfigSpace::read(uint32_t offset, uint32_t size) {
   return v;
 }
 
+std::vector<uint8_t> ConfigSpace::image_unlogged(uint32_t len) {
+  len = std::min(len, kConfigSize);
+  std::vector<uint8_t> out(len);
+  impl_->fill(out.data(), len);
+  return out;
+}
+
 std::vector<uint8_t> ConfigSpace::image(uint32_t len) {
   len = std::min(len, kConfigSize);
   std::vector<uint8_t> out(len);
@@ -467,6 +486,7 @@ void ConfigSpace::write(uint32_t offset, uint32_t size, uint32_t value) {
       }
     }
   }
+  ras::publish_session(impl_->d.uuid);   // the session's config file, rewritten
 }
 
 std::vector<LogEntry> access_log(const std::string& uuid) {
@@ -494,6 +514,89 @@ std::vector<LogEntry> access_log(const std::string& uuid) {
     out.push_back(l);
   }
   return out;
+}
+
+Link link(ConfigSpace& cs) {
+  const uint32_t cap = cs.read(0x84, 4);
+  const uint32_t sta = cs.read(0x8a, 2);
+  Link l;
+  l.max_gen = cap & 0xF;
+  l.max_width = (cap >> 4) & 0x3F;
+  l.gen = sta & 0xF;
+  l.width = (sta >> 4) & 0x3F;
+  return l;
+}
+
+const char* const kSysfsFiles[12] = {"config", "resource", "vendor", "device", "class",
+                                     "subsystem_vendor", "subsystem_device", "revision",
+                                     "current_link_speed", "current_link_width", "max_link_speed",
+                                     "max_link_width"};
+
+namespace {
+// Replaces a file whole, so a reader never sees half of one.
+void replace_file(const std::string& path, const std::string& bytes) {
+  const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) return;
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  }
+  if (std::rename(tmp.c_str(), path.c_str()) != 0) std::remove(tmp.c_str());
+}
+
+// The kernel's names for the link speeds, by generation.
+const char* speed_name(uint32_t gen) {
+  static const char* const kNames[] = {"Unknown", "2.5 GT/s PCIe", "5.0 GT/s PCIe", "8.0 GT/s PCIe",
+                                       "16.0 GT/s PCIe", "32.0 GT/s PCIe", "64.0 GT/s PCIe"};
+  return gen < 7 ? kNames[gen] : kNames[0];
+}
+
+std::string hex(uint32_t v, int digits) {
+  char b[16];
+  std::snprintf(b, sizeof b, "0x%0*x\n", digits, v);
+  return b;
+}
+}  // namespace
+
+void write_sysfs_files(const telemetry::DeviceSample& d, const std::string& dir) {
+  ConfigSpace cs(d);
+  const std::vector<uint8_t> cfg = cs.image_unlogged(kConfigSize);
+  const auto word = [&](uint32_t off) { return static_cast<uint32_t>(cfg[off] | cfg[off + 1] << 8); };
+  const auto dword = [&](uint32_t off) { return word(off) | word(off + 2) << 16; };
+  replace_file(dir + "/config", std::string(cfg.begin(), cfg.end()));
+  replace_file(dir + "/vendor", hex(word(0x00), 4));
+  replace_file(dir + "/device", hex(word(0x02), 4));
+  replace_file(dir + "/class", hex(dword(0x08) >> 8, 6));
+  replace_file(dir + "/revision", hex(cfg[0x08], 2));
+  replace_file(dir + "/subsystem_vendor", hex(word(0x2c), 4));
+  replace_file(dir + "/subsystem_device", hex(word(0x2e), 4));
+  const uint32_t cap = dword(0x84), sta = word(0x8a);
+  replace_file(dir + "/current_link_speed", std::string(speed_name(sta & 0xF)) + "\n");
+  replace_file(dir + "/current_link_width", std::to_string((sta >> 4) & 0x3F) + "\n");
+  replace_file(dir + "/max_link_speed", std::string(speed_name(cap & 0xF)) + "\n");
+  replace_file(dir + "/max_link_width", std::to_string((cap >> 4) & 0x3F) + "\n");
+  // resource: start, end and flags of each BAR, then the expansion ROM and the
+  // SR-IOV BARs, as the kernel prints them; an unimplemented one is all zeros.
+  std::string res;
+  for (int n = 0; n < 13; ++n) {
+    uint64_t start = 0, end = 0, flags = 0;
+    if (n < 6) {
+      const Bar b = bar(cs, d, n);
+      if (b.size) {
+        start = b.base;
+        end = b.base + b.size - 1;
+        // IORESOURCE_IO or _MEM, _PREFETCH, _MEM_64 and _SIZEALIGN, with the
+        // BAR's own low bits, as the kernel keeps them.
+        flags = b.io ? 0x40101 : 0x40200 | (b.prefetchable ? 0x2000 : 0) | (b.is64 ? 0x100000 : 0) |
+                                     (b.prefetchable ? 0x8 : 0) | (b.is64 ? 0x4 : 0);
+      }
+    }
+    char line[80];
+    std::snprintf(line, sizeof line, "0x%016llx 0x%016llx 0x%016llx\n", static_cast<unsigned long long>(start),
+                  static_cast<unsigned long long>(end), static_cast<unsigned long long>(flags));
+    res += line;
+  }
+  replace_file(dir + "/resource", res);
 }
 
 Bar bar(ConfigSpace& cs, const telemetry::DeviceSample& d, int n) {

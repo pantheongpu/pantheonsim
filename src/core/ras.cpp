@@ -18,6 +18,7 @@
 #include <type_traits>
 
 #include "vgpu/error.hpp"
+#include "vgpu/regs.hpp"
 #include "vgpu/shared_state.hpp"
 #include "vgpu/telemetry.hpp"
 
@@ -188,10 +189,19 @@ void publish_session(const std::string& uuid, const std::string& session) {
     if (!s || !*s) return;
     dir = s;
   }
-  dir += "/ras/" + uuid;
+  dir += "/sysfs/" + uuid;
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   if (ec) return;
+  // The PCI device's own files, from the register model, as the device reads
+  // now -- only while something publishes it, as the session's devices are.
+  if (auto snap = std::make_unique<telemetry::Shared>(); telemetry::read_snapshot(snap.get()))
+    for (uint32_t i = 0; i < snap->device_count; ++i)
+      if (uuid == snap->devices[i].uuid) {
+        telemetry::DeviceSample d = snap->devices[i];
+        apply_link(d);
+        regs::write_sysfs_files(d, dir);
+      }
   const Counters c = read(uuid).since_load;
   const auto pcie = [&](Pcie p) { return c.pcie[static_cast<uint32_t>(p)]; };
   // Which AER bit each injected counter is: the link's replay timer running
@@ -744,6 +754,7 @@ void degrade_link(const std::string& uuid, uint32_t gen, uint32_t width) {
   Counters* c = v.counters();
   set(&c->link_gen, gen);
   set(&c->link_width, width);
+  publish_session(uuid);
 }
 
 void restore_link(const std::string& uuid) { degrade_link(uuid, 0, 0); }

@@ -91,6 +91,19 @@ bool select_devices(const vgpu::telemetry::Shared& s, const std::string& spec,
 
 // What -q prints for brand and architecture. The profile carries lower-case
 // ids ("turing", "nvidia"); the tool prints names.
+// The PCIe link, read from the device's registers as a driver reads it, so the
+// read shows in the register access log; without register state, the
+// reading's own link.
+vgpu::regs::Link link_of(const vgpu::telemetry::DeviceSample& d) {
+  vgpu::regs::Link l{d.pcie_gen, d.pcie_width, d.pcie_gen_max, d.pcie_width_max};
+  try {
+    vgpu::regs::ConfigSpace cs(d);
+    l = vgpu::regs::link(cs);
+  } catch (const std::exception&) {
+  }
+  return l;
+}
+
 const char* brand_name(const vgpu::telemetry::DeviceSample& d) {
   if (std::strcmp(d.vendor, "amd") == 0) return "AMD";
   return std::strstr(d.name, "GeForce") || std::strstr(d.name, "RTX 30") ? "GeForce" : "NVIDIA";
@@ -485,13 +498,12 @@ std::string query_field(const vgpu::telemetry::DeviceSample& d, uint32_t index,
                : "N/A";
   // current and gpucurrent are the link as trained now; max, gpumax and
   // hostmax what it can train to.
-  if (field.rfind("pcie.link.gen.", 0) == 0) {
-    const uint32_t g = field.find("current") != std::string::npos ? d.pcie_gen : d.pcie_gen_max;
-    return g ? std::to_string(g) : "[N/A]";
-  }
-  if (field.rfind("pcie.link.width.", 0) == 0) {
-    const uint32_t w = field.find("current") != std::string::npos ? d.pcie_width : d.pcie_width_max;
-    return w ? std::to_string(w) : "[N/A]";
+  if (field.rfind("pcie.link.gen.", 0) == 0 || field.rfind("pcie.link.width.", 0) == 0) {
+    const vgpu::regs::Link l = link_of(d);
+    const bool current = field.find("current") != std::string::npos;
+    const uint32_t v = field.rfind("pcie.link.gen.", 0) == 0 ? (current ? l.gen : l.max_gen)
+                                                            : (current ? l.width : l.max_width);
+    return v ? std::to_string(v) : "[N/A]";
   }
   if (field == "count") return std::to_string(s.device_count);
   if (field == "name" || field == "gpu_name") return d.name;
@@ -700,16 +712,17 @@ void print_verbose(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>
       std::printf("        %-47s: 0x%08X\n", "Device Id", d.pci_device_id);
       if (d.pcie_gen_max) {
         // Current is the link as trained now, Max what it can train to.
+        const vgpu::regs::Link l = link_of(d);
         std::printf("        GPU Link Info\n");
         std::printf("            PCIe Generation\n");
-        std::printf("                %-39s: %u\n", "Max", d.pcie_gen_max);
-        std::printf("                %-39s: %u\n", "Current", d.pcie_gen);
-        std::printf("                %-39s: %u\n", "Device Current", d.pcie_gen);
-        std::printf("                %-39s: %u\n", "Device Max", d.pcie_gen_max);
-        std::printf("                %-39s: %u\n", "Host Max", d.pcie_gen_max);
+        std::printf("                %-39s: %u\n", "Max", l.max_gen);
+        std::printf("                %-39s: %u\n", "Current", l.gen);
+        std::printf("                %-39s: %u\n", "Device Current", l.gen);
+        std::printf("                %-39s: %u\n", "Device Max", l.max_gen);
+        std::printf("                %-39s: %u\n", "Host Max", l.max_gen);
         std::printf("            Link Width\n");
-        std::printf("                %-39s: %ux\n", "Max", d.pcie_width_max);
-        std::printf("                %-39s: %ux\n", "Current", d.pcie_width);
+        std::printf("                %-39s: %ux\n", "Max", l.max_width);
+        std::printf("                %-39s: %ux\n", "Current", l.width);
       }
       std::printf("    %-51s: %u %%\n", "Fan Speed", d.fan_percent);
     }

@@ -38,6 +38,7 @@
 #include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/ras.hpp"
+#include "vgpu/regs.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/telemetry.hpp"
 #include "vgpu/runtime/runtime.hpp"
@@ -300,6 +301,7 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   make_dirs(s.bin);
   make_dirs(s.root + "/proc/driver/nvidia/gpus");
   make_dirs(s.root + "/sys/class/drm");
+  make_dirs(s.root + "/sys/bus/pci/devices");
   make_dirs(s.root + "/etc");
 
   const std::string vgpu = exe_path();
@@ -327,26 +329,28 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
                   "Bus Location: \t %s\nDevice Minor: \t %d\n",
                   p.model.c_str(), 128 + i, ds.uuid, bdf, i);
     write_file(gpudir + "/information", info);
-    std::string card = s.root + "/sys/class/drm/card" + std::to_string(i);
-    make_dirs(card + "/device");
-    char id[16];
-    std::snprintf(id, sizeof id, "0x%04x\n", p.telemetry.pci_vendor_id);
-    write_file(card + "/device/vendor", id);
-    std::snprintf(id, sizeof id, "0x%04x\n", p.telemetry.pci_device_id);
-    write_file(card + "/device/device", id);
-    // The device's error counts, as the kernel's AER stats and (on AMD)
-    // amdgpu's RAS blocks keep them: links to files rewritten whenever a
-    // count changes, so they read live (vgpu/ras.hpp, publish_session).
-    const std::string ras = s.dir + "/ras/" + ds.uuid + "/";
+    // The PCI device, where the kernel keeps it: behind a root port of its
+    // own, reached from /sys/bus/pci/devices and from its DRM card. Its files
+    // -- config space, resources, IDs, link speed and width, the AER stats,
+    // and on AMD amdgpu's RAS counts -- link to ones rewritten whenever the
+    // device changes, so they read live (ras::publish_session).
+    char port[32];
+    std::snprintf(port, sizeof port, "0000:00:%02x.0", i + 1);
+    const std::string dev = s.root + "/sys/devices/pci0000:00/" + port + "/" + bdf;
+    make_dirs(dev);
+    const std::string files = s.dir + "/sysfs/" + ds.uuid + "/";
     std::error_code ec;
-    for (const char* f : vgpu::ras::kAerFiles)
-      std::filesystem::create_symlink(ras + f, card + "/device/" + f, ec);
+    for (const char* f : vgpu::regs::kSysfsFiles) std::filesystem::create_symlink(files + f, dev + "/" + f, ec);
+    for (const char* f : vgpu::ras::kAerFiles) std::filesystem::create_symlink(files + f, dev + "/" + f, ec);
     if (std::strcmp(ds.vendor, "amd") == 0) {
-      make_dirs(card + "/device/ras");
+      make_dirs(dev + "/ras");
       for (const char* b : vgpu::ras::kAmdgpuRasBlocks)
-        std::filesystem::create_symlink(ras + b + "_err_count",
-                                        card + "/device/ras/" + std::string(b) + "_err_count", ec);
+        std::filesystem::create_symlink(files + b + "_err_count", dev + "/ras/" + std::string(b) + "_err_count", ec);
     }
+    std::filesystem::create_symlink(dev, s.root + "/sys/bus/pci/devices/" + bdf, ec);
+    const std::string card = s.root + "/sys/class/drm/card" + std::to_string(i);
+    make_dirs(card);
+    std::filesystem::create_symlink(dev, card + "/device", ec);
   }
 
   // Resolves a program to an absolute path using PATH as it stands now, which
@@ -384,10 +388,12 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   // --version too: `vgpu smi` prints it from VGPU_DRIVER_VERSION and
   // VGPU_CUDA_VERSION, which the session exports, so this and
   // nvidia/tools/nvidia-smi cannot drift apart again.
-  tool("nvidia-smi", "# VirtualGPU session tool.\nexec \"" + vgpu + "\" smi \"$@\"\n");
-  tool("rocm-smi", "exec \"" + vgpu + "\" smi --rocm \"$@\"\n");
-  tool("amd-smi", "exec \"" + vgpu + "\" smi --amd \"$@\"\n");
-  tool("rocm_agent_enumerator", "exec \"" + vgpu + "\" smi --agents\n");
+  // Each runs under its own name (exec -a), so the register access log names
+  // the tool that made an access rather than vgpu.
+  tool("nvidia-smi", "# VirtualGPU session tool.\nexec -a nvidia-smi \"" + vgpu + "\" smi \"$@\"\n");
+  tool("rocm-smi", "exec -a rocm-smi \"" + vgpu + "\" smi --rocm \"$@\"\n");
+  tool("amd-smi", "exec -a amd-smi \"" + vgpu + "\" smi --amd \"$@\"\n");
+  tool("rocm_agent_enumerator", "exec -a rocm_agent_enumerator \"" + vgpu + "\" smi --agents\n");
   tool("dmesg",
        "# Replays this session's synthetic kernel ring buffer.\n"
        "case \" $* \" in\n"
@@ -779,6 +785,9 @@ int cmd_shell(const std::vector<std::string>& args) {
     // tools and install scripts check -- appear for the simulated driver.
     ok = bind(s.root + "/proc/driver", "/proc/driver") || ok;
       ok = bind(s.root + "/sys/class/drm", "/sys/class/drm") || ok;
+      // The session's PCI devices in place of the host's, as lspci and
+      // anything walking /sys/bus/pci find them.
+      bind(s.root + "/sys/bus/pci/devices", "/sys/bus/pci/devices");
     }
     isolated = ok;
     // The UTS namespace from `unshare -u` belongs to this session, so the
@@ -795,7 +804,11 @@ int cmd_shell(const std::vector<std::string>& args) {
   setenv("VGPU_DRIVER_VERSION", c.driver.c_str(), 1);
   setenv("VGPU_CUDA_VERSION", c.cuda.c_str(), 1);
   setenv("VGPU_SESSION", s.dir.c_str(), 1);
-  // What the sysfs links point at, from the counts as they stand.
+  // Hold the devices open for the whole session: this is what publishes
+  // telemetry that nvidia-smi / rocm-smi read.
+  vgpu::runtime::Runtime rt(profile, c.count);
+  // What the sysfs links point at, from the devices as they stand -- published now,
+  // so the register model can read them.
   for (int i = 0; i < c.count; ++i) {
     vgpu::telemetry::DeviceSample ds{};
     vgpu::telemetry::describe_device(profile, i, &ds);
@@ -805,9 +818,6 @@ int cmd_shell(const std::vector<std::string>& args) {
     }
   }
 
-  // Hold the devices open for the whole session: this is what publishes
-  // telemetry that nvidia-smi / rocm-smi read.
-  vgpu::runtime::Runtime rt(profile, c.count);
   std::atomic<bool> stop{false};
   std::thread pump;
   if (c.load > 0) {

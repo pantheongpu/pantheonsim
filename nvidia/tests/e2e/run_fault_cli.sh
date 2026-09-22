@@ -114,7 +114,7 @@ expect "amdgpu logs its counts by RAS block, and no NVIDIA Xid" \
 uuid=$(amd smi --query-gpu=uuid --format=csv,noheader)
 VGPU_SESSION="$sess" amd fault inject --pcie bad_tlp --count 2 >/dev/null
 VGPU_SESSION="$sess" amd fault inject --pcie non_fatal >/dev/null
-ras="$sess/ras/$uuid"
+ras="$sess/sysfs/$uuid"
 expect "amdgpu's counts per block, since the driver loaded" "ue: 4|ce: 0 ue: 0|ce: 2 ue: 0|ce: 0" \
   "$(paste -sd'|' "$ras/umc_err_count") $(paste -sd'|' "$ras/gfx_err_count") $(paste -sd'|' "$ras/sdma_err_count")"
 expect "AER stats count a bad TLP as correctable and total it" "BadTLP 2 TOTAL_ERR_COR 2" \

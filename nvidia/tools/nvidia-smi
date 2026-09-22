@@ -16,4 +16,4 @@
 here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 vgpu="$here/vgpu"
 [[ -x "$vgpu" ]] || vgpu="$here/../vgpu"
-exec "$vgpu" smi "$@"
+exec -a nvidia-smi "$vgpu" smi "$@"

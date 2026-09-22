@@ -204,8 +204,9 @@ misaligned access, or a shared- or local-memory access out of range, as Xid 13,
 an exception the SM raises. Faults only this simulator finds (a data race, an
 uninitialized register) have no Xid.
 
-The session's sysfs keeps the counts too, and they read live:
-`/sys/class/drm/cardN/device/aer_dev_correctable`, `aer_dev_nonfatal` and
+The session's sysfs keeps the counts too, and they read live: in each PCI
+device's directory (`/sys/bus/pci/devices/0000:01:00.0`, which
+`/sys/class/drm/cardN/device` also leads to), `aer_dev_correctable`, `aer_dev_nonfatal` and
 `aer_dev_fatal` in the kernel's AER stats form, and on an AMD card amdgpu's
 `ras/umc_err_count`, `ras/gfx_err_count` and the other blocks' (`ue: N`,
 `ce: N`). An injected PCIe counter lands on the AER bit it corresponds to: a
