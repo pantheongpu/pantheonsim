@@ -227,7 +227,31 @@ every query about it; nvidia-smi reports the other GPUs, prints "Unable to
 determine the device handle for GPU...: GPU is lost" for it and exits 15; and a
 program's next launch on it fails with `cudaErrorLaunchFailure` (719), what
 programs report when it happens. A driver reload does not bring it back;
-`--clear` does, as a reset would. It is modelled for NVIDIA GPUs only.
+`--clear` does, as a reset would.
+
+An AMD GPU is lost the way amdgpu loses one. The kernel log has the PCI core's
+recovery and the driver's answers to it (drivers/pci/pcie/err.c and
+amdgpu_pci_error_detected): the fatal AER error, a frozen channel, a slot reset
+that fails, then the permanent failure, which amdgpu answers by letting the
+device go:
+
+```
+pcieport 0000:00:01.0: AER: Uncorrected (Fatal) error received: 0000:01:00.0
+amdgpu 0000:01:00.0: amdgpu: PCI error: detected callback!!
+amdgpu 0000:01:00.0: amdgpu: pci_channel_io_frozen: state(2)!!
+pcieport 0000:00:01.0: AER: subordinate device reset failed
+amdgpu 0000:01:00.0: amdgpu: PCI error: detected callback!!
+amdgpu 0000:01:00.0: amdgpu: pci_channel_io_perm_failure: state(3)!!
+pcieport 0000:00:01.0: AER: device recovery failed
+```
+
+After that the driver has no device to report: rocm-smi, amd-smi and
+rocm_agent_enumerator list the GPUs that are left, and the ones after it move
+up. `vgpu` keeps every GPU's index, and the lost one's registers (`vgpu regs`,
+configuration space and MMIO alike) read as all ones, as a device that no
+longer answers on PCIe reads, and writes to them go nowhere. That is true of a
+lost NVIDIA GPU's registers too. Not yet: the session's `/sys/class/drm` and
+hwmon entries for the GPU stay in place.
 
 A link can train below what card and slot support, as a bad riser, a dirty
 contact or a marginal slot leaves it:

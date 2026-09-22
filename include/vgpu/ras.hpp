@@ -225,7 +225,13 @@ std::vector<StuckCell> stuck_cells(const std::string& uuid);
 // answers NVML_ERROR_GPU_IS_LOST for it, nvidia-smi reports it lost and exits
 // 15, and a program's next launch on it fails. A driver reload does not bring
 // it back; `vgpu fault lose --clear` does, as a reset or reboot would.
-void lose(const std::string& uuid, const std::string& bus_id);
+//
+// An AMD GPU (`amd`) is lost the way amdgpu loses one: a fatal AER error, a
+// slot reset that fails, and the driver told the failure is permanent, which
+// it answers by letting the device go (amdgpu_pci_error_detected). rocm-smi
+// and amd-smi no longer list it, and its registers read as all ones, as a
+// device that no longer answers on PCIe does.
+void lose(const std::string& uuid, const std::string& bus_id, bool amd = false);
 void recover(const std::string& uuid);
 bool is_lost(const std::string& uuid);
 

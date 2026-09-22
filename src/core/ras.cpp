@@ -729,10 +729,25 @@ void report_xid(const std::string& uuid, const std::string& bus_id, int xid,
 
 // ---- A GPU that has fallen off the bus ------------------------------------------
 
-void lose(const std::string& uuid, const std::string& bus_id) {
+void lose(const std::string& uuid, const std::string& bus_id, bool amd) {
   {
     Mapped v(volatile_path(uuid), true);
     if (__atomic_exchange_n(&v.counters()->lost, uint64_t{1}, __ATOMIC_ACQ_REL)) return;   // already
+  }
+  if (amd) {
+    // The PCI core's recovery (drivers/pci/pcie/err.c) and amdgpu's answers
+    // to it: a frozen channel first, and when the slot reset cannot bring the
+    // link back, a permanent failure, which amdgpu answers with DISCONNECT.
+    const std::string dev = "amdgpu " + kernel_bdf(bus_id) + ": amdgpu: ";
+    log_kernel(aer_line(bus_id, Pcie::Fatal));
+    log_kernel(dev + "PCI error: detected callback!!");
+    log_kernel(dev + "pci_channel_io_frozen: state(2)!!");
+    log_kernel("pcieport 0000:00:01.0: AER: subordinate device reset failed");
+    log_kernel(dev + "PCI error: detected callback!!");
+    log_kernel(dev + "pci_channel_io_perm_failure: state(3)!!");
+    log_kernel("pcieport 0000:00:01.0: AER: device recovery failed");
+    publish_session(uuid);
+    return;
   }
   report_xid(uuid, bus_id, 79, "", "GPU has fallen off the bus.");
   log_kernel("NVRM: GPU " + kernel_bdf(bus_id) + ": GPU has fallen off the bus.");
@@ -741,6 +756,7 @@ void lose(const std::string& uuid, const std::string& bus_id) {
 void recover(const std::string& uuid) {
   Mapped v(volatile_path(uuid), false);
   if (Counters* c = v.counters()) __atomic_store_n(&c->lost, uint64_t{0}, __ATOMIC_RELEASE);
+  publish_session(uuid);
 }
 
 bool is_lost(const std::string& uuid) {
