@@ -236,6 +236,7 @@ int cmd_amd_smi(const std::vector<std::string>& args) {
 
   vgpu::telemetry::Shared snap{};
   if (!vgpu::cli::read_machine(&snap)) return 1;
+  vgpu::drop_lost_amd(&snap);
   std::vector<uint32_t> amd;
   for (uint32_t i = 0; i < snap.device_count; ++i)
     if (is_amd(snap.devices[i])) amd.push_back(i);

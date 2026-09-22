@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 
 #include "vgpu/ras.hpp"
@@ -30,6 +31,19 @@ bool read_machine(vgpu::telemetry::Shared* snap) {
   if (!read_live_or_idle(snap)) return false;
   apply_faults(snap);
   return true;
+}
+
+void drop_lost_amd(vgpu::telemetry::Shared* snap) {
+  uint32_t kept = 0;
+  for (uint32_t i = 0; i < snap->device_count; ++i) {
+    bool gone = false;
+    try {
+      gone = std::strcmp(snap->devices[i].vendor, "amd") == 0 && vgpu::ras::is_lost(snap->devices[i].uuid);
+    } catch (const std::exception&) {
+    }
+    if (!gone) snap->devices[kept++] = snap->devices[i];
+  }
+  snap->device_count = kept;
 }
 
 namespace {

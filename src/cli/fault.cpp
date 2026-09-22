@@ -90,7 +90,10 @@ int usage(FILE* to) {
                "lose makes an NVIDIA GPU fall off the bus, logged as Xid 79: NVML answers\n"
                "NVML_ERROR_GPU_IS_LOST for it, nvidia-smi reports it lost and exits 15, and a\n"
                "program's next launch on it fails with an unspecified launch failure. A driver\n"
-               "reload does not bring it back; --clear does, as a reset would.\n"
+               "reload does not bring it back; --clear does, as a reset would. An AMD GPU is\n"
+               "lost as amdgpu loses one: a fatal AER error and a failed slot reset in the\n"
+               "kernel log, after which rocm-smi and amd-smi no longer list it and its\n"
+               "registers read as all ones.\n"
                "\n"
                "link trains the PCIe link below what card and slot support -- generation G,\n"
                "W lanes, or both -- as a bad riser or a marginal slot leaves it. The current\n"
@@ -188,7 +191,9 @@ void show(uint32_t index, const vgpu::telemetry::DeviceSample& d) {
                   static_cast<unsigned long long>(now.armed[t][0]),
                   static_cast<unsigned long long>(now.armed[t][1]),
                   static_cast<unsigned long long>(now.armed[t][2]));
-  if (now.lost) std::printf("  bus                    fallen off (Xid 79) until cleared\n");
+  if (now.lost)
+    std::printf("  bus                    fallen off (%s) until cleared\n",
+                std::strcmp(d.vendor, "amd") == 0 ? "PCIe recovery failed" : "Xid 79");
   if (d.pcie_gen != d.pcie_gen_max || d.pcie_width != d.pcie_width_max)
     std::printf("  PCIe link              Gen%u x%u, of Gen%u x%u, until cleared\n", d.pcie_gen, d.pcie_width,
                 d.pcie_gen_max, d.pcie_width_max);
@@ -493,20 +498,13 @@ int cmd_fault(const std::vector<std::string>& args) {
       std::fprintf(stderr, "vgpu fault lose: takes --clear and --gpu\n");
       return 2;
     }
-    for (uint32_t i : sel)
-      if (std::strcmp(snap.devices[i].vendor, "amd") == 0) {
-        std::fprintf(stderr, "vgpu fault lose: GPU %u (%s) is AMD; a lost GPU is modelled for NVIDIA "
-                             "only\n",
-                     i, snap.devices[i].name);
-        return 2;
-      }
     for (uint32_t i : sel) {
       const auto& d = snap.devices[i];
       if (clear) {
         vgpu::ras::recover(d.uuid);
         std::printf("GPU %u (%s) is back on the bus.\n", i, d.name);
       } else {
-        vgpu::ras::lose(d.uuid, d.bus_id);
+        vgpu::ras::lose(d.uuid, d.bus_id, std::strcmp(d.vendor, "amd") == 0);
         std::printf("GPU %u (%s) has fallen off the bus.\n", i, d.name);
       }
     }

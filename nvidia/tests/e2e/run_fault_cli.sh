@@ -156,7 +156,9 @@ expect "a driver reload does not bring it back" "15" \
 t4 fault lose --gpu 1 --clear >/dev/null
 expect "clearing does" "0, 1" "$(t4 smi --query-gpu=index --format=csv,noheader | paste -sd' ' | sed 's/ /, /')"
 t4 fault lose --gpu 0 --location dram >/dev/null; expect "lose takes no ECC options" "2" "$?"
-amd fault lose >/dev/null; expect "a lost GPU is NVIDIA-only for now" "2" "$?"
+# An AMD GPU is lost too (amd/tests/e2e/run_lost_gpu.sh has the rest).
+amd fault lose >/dev/null; expect "an AMD GPU can be lost" "0" "$?"
+amd fault lose --clear >/dev/null
 
 # A degraded link: the current state drops, the maximum stays.
 lq() { q "$1" pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max; }

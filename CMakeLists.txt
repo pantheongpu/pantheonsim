@@ -572,6 +572,10 @@ set_tests_properties(smi_queries PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_
 add_test(NAME fault_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_fault_cli.sh)
 set_tests_properties(fault_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
+# An AMD GPU lost as amdgpu loses one: the kernel log, rocm-smi and amd-smi, its registers.
+add_test(NAME amd_lost_gpu COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_lost_gpu.sh)
+set_tests_properties(amd_lost_gpu PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
 # `vgpu regs` and configuration space, rendered by the real lspci where installed.
 add_test(NAME regs_cli COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_regs_cli.sh)
 set_tests_properties(regs_cli PROPERTIES DEPENDS vgpu_cli

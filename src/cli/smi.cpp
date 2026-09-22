@@ -1033,16 +1033,20 @@ const char* gfx_target(const vgpu::telemetry::DeviceSample& d) {
 
 // rocm_agent_enumerator output: one ISA target per line, CPU agent first.
 // Returns how many GPU agents were listed.
-int print_agents(const vgpu::telemetry::Shared& s) {
+// Returns the number of AMD GPUs the machine has, listed or not: a lost one
+// is not an agent any more (drop_lost_amd), but it is not a missing profile.
+int print_agents(const vgpu::telemetry::Shared& machine) {
   std::printf("gfx000\n");  // the host CPU agent, as ROCm reports
-  int listed = 0;
+  int amd = 0;
+  for (uint32_t i = 0; i < machine.device_count; ++i) amd += std::strcmp(machine.devices[i].vendor, "amd") == 0;
+  vgpu::telemetry::Shared s = machine;
+  vgpu::drop_lost_amd(&s);
   for (uint32_t i = 0; i < s.device_count; ++i) {
     const auto& d = s.devices[i];
     if (std::strcmp(d.vendor, "amd") != 0) continue;
     std::printf("%s\n", gfx_target(d));
-    ++listed;
   }
-  return listed;
+  return amd;
 }
 
 // An lspci view of the virtual devices.
@@ -1324,6 +1328,7 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
 
   vgpu::telemetry::Shared snap{};
   if (!read_machine(&snap)) return 1;
+  vgpu::drop_lost_amd(&snap);
   std::vector<uint32_t> sel;
   if (want.empty()) {
     for (uint32_t i = 0; i < snap.device_count; ++i) sel.push_back(i);

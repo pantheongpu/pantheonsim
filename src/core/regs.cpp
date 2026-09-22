@@ -565,6 +565,18 @@ struct RegisterSpace::Impl {
 
   State* state() { return derived ? fresh.get() : static_cast<State*>(file->payload()); }
 
+  // A GPU that has fallen off the bus (`vgpu fault lose`) no longer answers:
+  // every read completes as all ones, the way a PCIe read nothing claims
+  // does, and writes go nowhere.
+  bool gone() const {
+    if (derived) return false;
+    try {
+      return ras::is_lost(d.uuid);
+    } catch (const std::exception&) {
+      return false;
+    }
+  }
+
   ras::Counters counts() {
     if (derived) return {};   // power-on: no errors counted
     try {
@@ -695,6 +707,10 @@ struct RegisterSpace::Impl {
   // The whole space: a captured card's bytes (or zeros) under the registers
   // the database declares, each where this device has it.
   void fill(uint8_t* out, uint32_t len) {
+    if (gone()) {
+      std::memset(out, 0xFF, len);
+      return;
+    }
     if (image_src) std::memcpy(out, image_src->bytes, std::min(len, kConfigSize));
     else std::memset(out, 0, len);
     const ras::Counters c = counts();
@@ -765,6 +781,11 @@ uint32_t RegisterSpace::value(const Register& r) { return impl_->evaluate(r, imp
 
 uint32_t RegisterSpace::read(uint32_t offset, uint32_t size) {
   check_access(impl_->space, offset, size);
+  if (impl_->gone()) {
+    const uint32_t v = size == 4 ? 0xFFFFFFFFu : (1u << (8 * size)) - 1;
+    impl_->log(false, offset, size, v);
+    return v;
+  }
   // The registers the access covers; bytes no register declares read as 0.
   const ras::Counters c = impl_->counts();
   // What no register declares: an NVIDIA GPU's BAR0 answers 0xbadf5040 there
@@ -808,6 +829,7 @@ std::vector<uint8_t> RegisterSpace::image(uint32_t len) {
 void RegisterSpace::write(uint32_t offset, uint32_t size, uint32_t value) {
   check_access(impl_->space, offset, size);
   impl_->log(true, offset, size, value);
+  if (impl_->gone()) return;
   State* s = impl_->state();
   const ras::Counters c = impl_->counts();
   const auto& regs = impl_->regs();
