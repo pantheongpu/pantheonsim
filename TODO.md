@@ -517,8 +517,17 @@ what is done.
   still missing is the part that makes a cluster more than a numbering:
   distributed shared memory -- `.shared::cluster`, `mapa`, cluster barriers --
   which is a memory-model change, and stays refused rather than approximated.)
-- Runtime: async copies, the virtual memory management API
-  (cuMemAddressReserve…). (Managed memory and host-pinned memory are done.)
+- Runtime: async copies. (Managed memory and host-pinned memory are done. The
+  virtual memory management API is done: cuMemAddressReserve, cuMemCreate,
+  cuMemMap, cuMemSetAccess, cuMemGetAccess, cuMemUnmap, cuMemRelease,
+  cuMemAddressFree, cuMemRetainAllocationHandle and
+  cuMemGetAllocationPropertiesFromHandle, with physical handles separable from
+  addresses -- which is what PyTorch's expandable segments and NCCL's windows
+  use to grow a buffer without moving it. Reserved-but-unmapped space, a
+  mapping with no access granted, and a write through a read-only mapping each
+  fault with a diagnostic naming which it was. Exporting a handle to another
+  process still refuses: device memory here is this process's own sparse
+  backing.)
 - Dynamic parallelism (a kernel launching a kernel). Taking a kernel's address
   in device code now says so by name instead of reporting an unknown symbol,
   which sent you looking for a typo in a name that was right there. Running it

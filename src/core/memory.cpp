@@ -131,8 +131,52 @@ void MemoryManager::free(uint64_t ptr) {
                     " (never returned by an allocation)");
 }
 
+const MemoryManager::Allocation* MemoryManager::resolve_mapped(uint64_t addr, uint64_t len,
+                                                               const char* op, uint64_t* base_out,
+                                                               bool writing) const {
+  if (maps_.empty() && reserved_.empty()) return nullptr;
+  auto mu = maps_.upper_bound(addr);
+  if (mu != maps_.begin()) {
+    auto prev = std::prev(mu);
+    const uint64_t va = prev->first;
+    const Mapping& m = prev->second;
+    if (addr - va < m.size) {
+      const uint64_t remaining = va + m.size - addr;
+      if (len > remaining)
+        throw Error::make(Err::OutOfBounds, op, " of ", len, " bytes at ", Hex{addr},
+                          " runs past the end of the ", m.size, "-byte mapping at ", Hex{va},
+                          " (mapped address space ends at ", Hex{va + m.size - 1}, ")");
+      // Mapped is not yet usable: CUDA grants access separately, and a device
+      // faults on memory it was never given access to.
+      if (!m.readable && !m.writable)
+        throw Error::make(Err::InvalidPointer, op, " at ", Hex{addr},
+                          " is mapped but no device has been given access to it "
+                          "(cuMemSetAccess)");
+      if (writing && !m.writable)
+        throw Error::make(Err::InvalidPointer, op, " at ", Hex{addr},
+                          " is through a read-only mapping (cuMemSetAccess granted read access "
+                          "only)");
+      const auto h = handles_.find(m.handle);
+      if (h == handles_.end())
+        throw Error::make(Err::Internal, op, " at ", Hex{addr}, ": mapping has no handle");
+      // The handle's own offset 0 sits this far below the mapping's address, so
+      // the caller's `addr - base` lands at the right offset in its chunks.
+      if (base_out) *base_out = va - m.offset;
+      return &h->second.mem;
+    }
+  }
+  auto ru = reserved_.upper_bound(addr);
+  if (ru != reserved_.begin()) {
+    auto prev = std::prev(ru);
+    if (addr - prev->first < prev->second.size)
+      throw Error::make(Err::InvalidPointer, op, " at ", Hex{addr},
+                        " is inside reserved address space with nothing mapped there (cuMemMap)");
+  }
+  return nullptr;
+}
+
 const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t len, const char* op,
-                                                        uint64_t* base_out) const {
+                                                        uint64_t* base_out, bool writing) const {
   auto up = live_.upper_bound(addr);
   if (up != live_.begin()) {
     auto prev = std::prev(up);
@@ -158,6 +202,7 @@ const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t 
       throw Error::make(Err::OutOfBounds, op, " at ", Hex{addr}, " is ", addr - (base + a.size),
                         " bytes past the end of the ", a.size, "-byte allocation at ", Hex{base});
   }
+  if (const Allocation* mapped = resolve_mapped(addr, len, op, base_out, writing)) return *mapped;
   // Freed allocation?
   auto fup = freed_.upper_bound(addr);
   if (fup != freed_.begin()) {
@@ -190,7 +235,7 @@ const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t 
 
 MemoryManager::Allocation& MemoryManager::resolve_mut(uint64_t addr, uint64_t len, const char* op,
                                                       uint64_t* base_out) {
-  return const_cast<Allocation&>(resolve(addr, len, op, base_out));
+  return const_cast<Allocation&>(resolve(addr, len, op, base_out, /*writing=*/true));
 }
 
 uint8_t* MemoryManager::materialize(Allocation& a, uint64_t chunk_idx) {
@@ -340,10 +385,204 @@ void MemoryManager::unmap_host(uint64_t addr) {
 }
 
 void MemoryManager::free_all() {
+  // A reset takes mapped memory, reservations and handles with it, as it takes
+  // allocations: nothing survives it on a real device either.
+  maps_.clear();
+  reserved_.clear();
+  for (auto& [id, h] : handles_) used_ -= h.size;
+  handles_.clear();
   std::vector<uint64_t> bases;
   bases.reserve(live_.size());
   for (const auto& [base, a] : live_) bases.push_back(base);
   for (uint64_t base : bases) free(base);
+}
+
+// ---- virtual memory management ------------------------------------------------
+//
+// Validation is CUDA's: sizes and addresses are multiples of the granularity,
+// a mapping goes inside a reservation, and nothing overlaps.
+
+namespace {
+uint64_t round_up(uint64_t v, uint64_t to) { return (v + to - 1) / to * to; }
+}  // namespace
+
+uint64_t MemoryManager::reserve(uint64_t size, uint64_t alignment) {
+  if (size == 0 || size % kVmmGranularity)
+    throw Error::make(Err::InvalidValue, "reserving ", size,
+                      " bytes of address space: the size must be a non-zero multiple of the ",
+                      kVmmGranularity, "-byte granularity");
+  if (alignment == 0) alignment = kVmmGranularity;
+  if (alignment % kVmmGranularity || (alignment & (alignment - 1)))
+    throw Error::make(Err::InvalidValue, "address space alignment ", alignment,
+                      " is not a power of two multiple of the ", kVmmGranularity,
+                      "-byte granularity");
+  const uint64_t base = round_up(next_va_, alignment);
+  // Address space is this device's 1 TiB window; a reservation past it would
+  // hand out addresses another device owns.
+  if (base + size > va_base_ + kDeviceVaStride || base + size < base)
+    throw Error::make(Err::OutOfMemory, "reserving ", size,
+                      " bytes of address space would run past this device's window");
+  next_va_ = base + size;
+  high_water_va_ = next_va_;
+  reserved_.emplace(base, Reservation{size});
+  return base;
+}
+
+void MemoryManager::address_free(uint64_t va, uint64_t size) {
+  auto it = reserved_.find(va);
+  if (it == reserved_.end() || it->second.size != size)
+    throw Error::make(Err::InvalidValue, "freeing address space at ", Hex{va}, " of ", size,
+                      " bytes: no reservation of exactly that address and size");
+  auto m = maps_.lower_bound(va);
+  if (m != maps_.end() && m->first < va + size)
+    throw Error::make(Err::InvalidValue, "freeing address space at ", Hex{va},
+                      " while ", Hex{m->first}, " is still mapped (cuMemUnmap first)");
+  reserved_.erase(it);
+}
+
+uint64_t MemoryManager::create_handle(uint64_t size) {
+  if (size == 0 || size % kVmmGranularity)
+    throw Error::make(Err::InvalidValue, "creating ", size,
+                      " bytes of device memory: the size must be a non-zero multiple of the ",
+                      kVmmGranularity, "-byte granularity");
+  if (used_ + size > capacity_ || used_ + size < used_)
+    throw Error::make(Err::OutOfMemory, "device out of memory: requested ", size, " bytes, ", used_,
+                      " of ", capacity_, " bytes already in use");
+  used_ += size;
+  Handle h;
+  h.size = size;
+  h.mem.size = size;
+  h.mem.chunk_count = static_cast<size_t>((size + kChunkSize - 1) / kChunkSize);
+  h.mem.chunks = std::make_unique<std::atomic<uint8_t*>[]>(h.mem.chunk_count);
+  const uint64_t id = next_handle_++;
+  handles_.emplace(id, std::move(h));
+  notify_usage();
+  return id;
+}
+
+uint64_t MemoryManager::handle_size(uint64_t handle) const {
+  auto it = handles_.find(handle);
+  if (it == handles_.end())
+    throw Error::make(Err::InvalidValue, "no such memory handle: ", handle);
+  return it->second.size;
+}
+
+void MemoryManager::retain_handle(uint64_t handle) {
+  auto it = handles_.find(handle);
+  if (it == handles_.end())
+    throw Error::make(Err::InvalidValue, "no such memory handle: ", handle);
+  ++it->second.refs;
+}
+
+uint64_t MemoryManager::retain_handle_at(uint64_t va) {
+  auto mu = maps_.upper_bound(va);
+  if (mu == maps_.begin()) return 0;
+  auto prev = std::prev(mu);
+  if (va - prev->first >= prev->second.size) return 0;
+  const uint64_t handle = prev->second.handle;
+  retain_handle(handle);
+  return handle;
+}
+
+void MemoryManager::release_handle(uint64_t handle) {
+  auto it = handles_.find(handle);
+  if (it == handles_.end())
+    throw Error::make(Err::InvalidValue, "releasing memory handle ", handle,
+                      ", which does not exist (already released?)");
+  if (it->second.refs == 0)
+    throw Error::make(Err::InvalidValue, "releasing memory handle ", handle,
+                      ", which holds no references");
+  --it->second.refs;
+  collect_handle(handle);
+}
+
+void MemoryManager::collect_handle(uint64_t handle) {
+  auto it = handles_.find(handle);
+  if (it == handles_.end() || it->second.refs || it->second.mapped) return;
+  used_ -= it->second.size;
+  handles_.erase(it);
+  notify_usage();
+}
+
+void MemoryManager::map(uint64_t va, uint64_t size, uint64_t offset, uint64_t handle) {
+  if (size == 0 || size % kVmmGranularity || va % kVmmGranularity)
+    throw Error::make(Err::InvalidValue, "mapping ", size, " bytes at ", Hex{va},
+                      ": the address and size must be multiples of the ", kVmmGranularity,
+                      "-byte granularity");
+  // cuMemMap documents that the offset into the handle must be zero.
+  if (offset != 0)
+    throw Error::make(Err::InvalidValue, "mapping at an offset of ", offset,
+                      " bytes into a handle: cuMemMap takes an offset of 0");
+  auto h = handles_.find(handle);
+  if (h == handles_.end())
+    throw Error::make(Err::InvalidValue, "mapping memory handle ", handle, ", which does not exist");
+  if (size > h->second.size - offset)
+    throw Error::make(Err::InvalidValue, "mapping ", size, " bytes of memory handle ", handle,
+                      ", which holds ", h->second.size, " bytes");
+  // Inside one reservation, and it must be.
+  auto ru = reserved_.upper_bound(va);
+  bool inside = false;
+  if (ru != reserved_.begin()) {
+    auto prev = std::prev(ru);
+    inside = va - prev->first < prev->second.size && va + size <= prev->first + prev->second.size;
+  }
+  if (!inside)
+    throw Error::make(Err::InvalidValue, "mapping ", size, " bytes at ", Hex{va},
+                      ": the range is not inside one reservation (cuMemAddressReserve)");
+  // Nothing else may be mapped there.
+  auto after = maps_.lower_bound(va);
+  if (after != maps_.end() && after->first < va + size)
+    throw Error::make(Err::InvalidValue, "mapping ", size, " bytes at ", Hex{va},
+                      ": ", Hex{after->first}, " is already mapped");
+  if (after != maps_.begin()) {
+    auto before = std::prev(after);
+    if (va - before->first < before->second.size)
+      throw Error::make(Err::InvalidValue, "mapping ", size, " bytes at ", Hex{va},
+                        ": it overlaps the mapping at ", Hex{before->first});
+  }
+  maps_.emplace(va, Mapping{size, offset, handle, false, false});
+  ++h->second.mapped;
+}
+
+void MemoryManager::unmap(uint64_t va, uint64_t size) {
+  auto it = maps_.find(va);
+  if (it == maps_.end() || it->second.size != size)
+    throw Error::make(Err::InvalidValue, "unmapping ", size, " bytes at ", Hex{va},
+                      ": no mapping of exactly that address and size");
+  const uint64_t handle = it->second.handle;
+  maps_.erase(it);
+  auto h = handles_.find(handle);
+  if (h != handles_.end() && h->second.mapped) --h->second.mapped;
+  collect_handle(handle);
+}
+
+void MemoryManager::set_access(uint64_t va, uint64_t size, bool readable, bool writable) {
+  if (size == 0 || size % kVmmGranularity || va % kVmmGranularity)
+    throw Error::make(Err::InvalidValue, "granting access to ", size, " bytes at ", Hex{va},
+                      ": the address and size must be multiples of the ", kVmmGranularity,
+                      "-byte granularity");
+  // Every byte of the range has to be mapped: granting access to address space
+  // with nothing behind it would leave a pointer that faults on first use.
+  uint64_t at = va;
+  while (at < va + size) {
+    auto it = maps_.find(at);
+    if (it == maps_.end() || it->second.size > va + size - at)
+      throw Error::make(Err::InvalidValue, "granting access to ", size, " bytes at ", Hex{va},
+                        ": ", Hex{at}, " is not the start of a mapping inside that range");
+    it->second.readable = readable;
+    it->second.writable = writable;
+    at += it->second.size;
+  }
+}
+
+bool MemoryManager::access_at(uint64_t va, bool* readable, bool* writable) const {
+  auto mu = maps_.upper_bound(va);
+  if (mu == maps_.begin()) return false;
+  auto prev = std::prev(mu);
+  if (va - prev->first >= prev->second.size) return false;
+  if (readable) *readable = prev->second.readable;
+  if (writable) *writable = prev->second.writable;
+  return true;
 }
 
 bool MemoryManager::is_host_mapped(uint64_t addr) const {

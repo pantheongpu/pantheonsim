@@ -663,3 +663,179 @@ VTEST(stack_and_heap_addresses_are_never_device_addresses) {
 }
 
 VTEST_MAIN
+
+// ---- virtual memory management -------------------------------------------------
+//
+// Address space, physical handles and the mapping between them. Each test is a
+// state a real device distinguishes: reserved with nothing mapped, mapped with
+// no access, read-only, unmapped again.
+
+VTEST(reserved_address_space_has_nothing_behind_it) {
+  MemoryManager mm(4 << 20);
+  const uint64_t g = MemoryManager::kVmmGranularity;
+  uint64_t va = mm.reserve(4 * g, 0);
+  VCHECK(va >= vgpu::kDeviceVaBase && va % g == 0);
+  VCHECK_EQ(mm.reservations(), size_t{1});
+  VCHECK_EQ(mm.used(), uint64_t{0});   // address space costs no memory
+  uint8_t byte = 0;
+  auto err = VCAPTURE(Error, mm.read(va, &byte, 1));
+  VCHECK(err.code() == Err::InvalidPointer);
+  VCHECK_CONTAINS(err.what(), "reserved address space with nothing mapped");
+}
+
+VTEST(a_handle_is_memory_without_an_address) {
+  MemoryManager mm(4 << 20);
+  const uint64_t g = MemoryManager::kVmmGranularity;
+  uint64_t h = mm.create_handle(2 * g);
+  VCHECK(h != 0);
+  VCHECK_EQ(mm.handle_size(h), 2 * g);
+  VCHECK_EQ(mm.used(), 2 * g);          // memory is charged at create, not at map
+  VCHECK_EQ(mm.handles(), size_t{1});
+  mm.release_handle(h);
+  VCHECK_EQ(mm.used(), uint64_t{0});
+  VCHECK_EQ(mm.handles(), size_t{0});
+  auto err = VCAPTURE(Error, mm.handle_size(h));
+  VCHECK(err.code() == Err::InvalidValue);
+}
+
+VTEST(mapped_memory_is_unusable_until_access_is_granted) {
+  MemoryManager mm(4 << 20);
+  const uint64_t g = MemoryManager::kVmmGranularity;
+  uint64_t va = mm.reserve(2 * g, 0), h = mm.create_handle(g);
+  mm.map(va, g, 0, h);
+  uint8_t byte = 0;
+  auto err = VCAPTURE(Error, mm.read(va, &byte, 1));
+  VCHECK_CONTAINS(err.what(), "no device has been given access");
+  mm.set_access(va, g, /*readable=*/true, /*writable=*/true);
+  std::vector<uint8_t> in{1, 2, 3, 4}, out(4, 0);
+  mm.write(va, in.data(), in.size());
+  mm.read(va, out.data(), out.size());
+  VCHECK(out == in);
+  bool r = false, w = false;
+  VCHECK(mm.access_at(va, &r, &w) && r && w);
+}
+
+VTEST(a_read_only_mapping_refuses_a_write) {
+  MemoryManager mm(4 << 20);
+  const uint64_t g = MemoryManager::kVmmGranularity;
+  uint64_t va = mm.reserve(g, 0), h = mm.create_handle(g);
+  mm.map(va, g, 0, h);
+  mm.set_access(va, g, /*readable=*/true, /*writable=*/false);
+  uint8_t byte = 7;
+  auto err = VCAPTURE(Error, mm.write(va, &byte, 1));
+  VCHECK_CONTAINS(err.what(), "read-only mapping");
+  mm.read(va, &byte, 1);               // reading is allowed
+  VCHECK_EQ(static_cast<int>(byte), 0);
+  bool r = false, w = true;
+  VCHECK(mm.access_at(va, &r, &w) && r && !w);
+}
+
+VTEST(the_same_memory_shows_through_every_address_it_is_mapped_at) {
+  MemoryManager mm(8 << 20);
+  const uint64_t g = MemoryManager::kVmmGranularity;
+  uint64_t a = mm.reserve(g, 0), b = mm.reserve(g, 0), h = mm.create_handle(g);
+  mm.map(a, g, 0, h);
+  mm.map(b, g, 0, h);
+  mm.set_access(a, g, true, true);
+  mm.set_access(b, g, true, true);
+  const uint8_t in[4] = {9, 8, 7, 6};
+  mm.write(a, in, sizeof in);
+  uint8_t out[4] = {0, 0, 0, 0};
+  mm.read(b, out, sizeof out);          // one allocation, two addresses
+  VCHECK(std::memcmp(in, out, sizeof in) == 0);
+  VCHECK_EQ(mm.used(), g);              // charged once, not twice
+}
+
+VTEST(unmapping_takes_the_memory_away_from_the_address) {
+  MemoryManager mm(4 << 20);
+  const uint64_t g = MemoryManager::kVmmGranularity;
+  uint64_t va = mm.reserve(g, 0), h = mm.create_handle(g);
+  mm.map(va, g, 0, h);
+  mm.set_access(va, g, true, true);
+  uint8_t byte = 5;
+  mm.write(va, &byte, 1);
+  mm.unmap(va, g);
+  auto err = VCAPTURE(Error, mm.read(va, &byte, 1));
+  VCHECK_CONTAINS(err.what(), "reserved address space with nothing mapped");
+  VCHECK_EQ(mm.mappings(), size_t{0});
+  // The handle still holds the memory: nothing has released it.
+  VCHECK_EQ(mm.used(), g);
+  mm.release_handle(h);
+  VCHECK_EQ(mm.used(), uint64_t{0});
+}
+
+// CUDA lets a handle be released while it is still mapped; the mapping keeps
+// working and the memory goes when the last mapping does.
+VTEST(a_released_handle_stays_alive_while_it_is_mapped) {
+  MemoryManager mm(4 << 20);
+  const uint64_t g = MemoryManager::kVmmGranularity;
+  uint64_t va = mm.reserve(g, 0), h = mm.create_handle(g);
+  mm.map(va, g, 0, h);
+  mm.set_access(va, g, true, true);
+  mm.release_handle(h);
+  VCHECK_EQ(mm.used(), g);
+  uint8_t byte = 3;
+  mm.write(va, &byte, 1);
+  byte = 0;
+  mm.read(va, &byte, 1);
+  VCHECK_EQ(static_cast<int>(byte), 3);
+  mm.unmap(va, g);
+  VCHECK_EQ(mm.used(), uint64_t{0});
+}
+
+VTEST(vmm_refuses_what_a_device_would) {
+  MemoryManager mm(4 << 20);
+  const uint64_t g = MemoryManager::kVmmGranularity;
+  VCHECK(VCAPTURE(Error, mm.reserve(g + 1, 0)).code() == Err::InvalidValue);        // size
+  VCHECK(VCAPTURE(Error, mm.reserve(g, g / 2)).code() == Err::InvalidValue);        // alignment
+  VCHECK(VCAPTURE(Error, mm.create_handle(g - 1)).code() == Err::InvalidValue);
+  VCHECK(VCAPTURE(Error, mm.create_handle(64 << 20)).code() == Err::OutOfMemory);   // past capacity
+  uint64_t va = mm.reserve(2 * g, 0), h = mm.create_handle(g);
+  VCHECK_CONTAINS(VCAPTURE(Error, mm.map(va, g, g, h)).what(), "offset of 0");
+  VCHECK_CONTAINS(VCAPTURE(Error, mm.map(va, g, 0, h + 99)).what(), "does not exist");
+  VCHECK_CONTAINS(VCAPTURE(Error, mm.map(va, 2 * g, 0, h)).what(), "which holds");
+  VCHECK_CONTAINS(VCAPTURE(Error, mm.map(va + 8, g, 0, h)).what(), "multiples of the");
+  VCHECK_CONTAINS(VCAPTURE(Error, mm.map(va + 4 * g, g, 0, h)).what(), "not inside one reservation");
+  mm.map(va, g, 0, h);
+  VCHECK_CONTAINS(VCAPTURE(Error, mm.map(va, g, 0, h)).what(), "already mapped");
+  VCHECK_CONTAINS(VCAPTURE(Error, mm.unmap(va, 2 * g)).what(), "no mapping of exactly");
+  VCHECK_CONTAINS(VCAPTURE(Error, mm.set_access(va, 2 * g, true, true)).what(),
+                  "not the start of a mapping");
+  VCHECK_CONTAINS(VCAPTURE(Error, mm.address_free(va, 2 * g)).what(), "still mapped");
+  mm.set_access(va, g, true, true);
+  // An access that starts inside the mapping and runs past it is an overrun,
+  // not an unmapped address.
+  std::vector<uint8_t> big(static_cast<size_t>(g) + 16, 0);
+  VCHECK(VCAPTURE(Error, mm.read(va, big.data(), big.size())).code() == Err::OutOfBounds);
+  mm.unmap(va, g);
+  mm.release_handle(h);
+  mm.address_free(va, 2 * g);
+  VCHECK_EQ(mm.reservations(), size_t{0});
+}
+
+VTEST(a_device_reset_takes_mappings_reservations_and_handles) {
+  MemoryManager mm(4 << 20);
+  const uint64_t g = MemoryManager::kVmmGranularity;
+  uint64_t va = mm.reserve(g, 0), h = mm.create_handle(g);
+  mm.map(va, g, 0, h);
+  mm.set_access(va, g, true, true);
+  mm.free_all();
+  VCHECK_EQ(mm.mappings(), size_t{0});
+  VCHECK_EQ(mm.reservations(), size_t{0});
+  VCHECK_EQ(mm.handles(), size_t{0});
+  VCHECK_EQ(mm.used(), uint64_t{0});
+}
+
+// Only chunks that were written cost host memory, mapped or not: the sparse
+// backing is what lets a handle be as large as the card.
+VTEST(a_mapped_handle_is_as_sparse_as_any_other_allocation) {
+  MemoryManager mm(1ull << 32);
+  const uint64_t g = MemoryManager::kVmmGranularity;
+  uint64_t va = mm.reserve(1ull << 30, 0), h = mm.create_handle(1ull << 30);
+  mm.map(va, 1ull << 30, 0, h);
+  mm.set_access(va, 1ull << 30, true, true);
+  const uint8_t one = 1;
+  mm.write(va + (1ull << 29), &one, 1);   // one byte, in the middle
+  VCHECK(mm.resident_bytes() <= 2 * g);
+  VCHECK_EQ(mm.used(), 1ull << 30);       // the card's own accounting is the full size
+}

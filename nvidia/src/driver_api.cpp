@@ -960,35 +960,187 @@ VGPU_EXPORT CUresult cuLinkDestroy(void* state) {
 }
 
 /* ---- virtual memory management ----
- * The VMM API reserves address space and maps physical handles into it, which
- * is how PyTorch's expandable_segments allocator works. The sparse chunk model
- * here has no separable physical handles to map, so these refuse: a framework
- * that asked for a mapping and got silent success would write into memory that
- * was never backed.
+ * Address space, physical memory and the mapping between them, as CUDA
+ * documents them: cuMemAddressReserve takes addresses with nothing behind
+ * them, cuMemCreate takes memory with no address, cuMemMap joins the two and
+ * cuMemSetAccess makes the result usable. This is how PyTorch's expandable
+ * segments and NCCL's windows grow a buffer without moving it.
+ *
+ * Every refusal a device makes, the engine makes: touching reserved space with
+ * nothing mapped, touching a mapping before access is granted, and writing
+ * through a read-only mapping all fault with a diagnostic naming which it was
+ * (vgpu/memory.hpp).
  */
-VGPU_EXPORT CUresult cuMemAddressReserve(CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long) {
-  return CUDA_ERROR_NOT_SUPPORTED;
-}
-VGPU_EXPORT CUresult cuMemAddressFree(CUdeviceptr, size_t) { return CUDA_ERROR_NOT_SUPPORTED; }
-VGPU_EXPORT CUresult cuMemCreate(void*, size_t, const void*, unsigned long long) {
-  return CUDA_ERROR_NOT_SUPPORTED;
-}
-VGPU_EXPORT CUresult cuMemRelease(unsigned long long) { return CUDA_ERROR_NOT_SUPPORTED; }
-VGPU_EXPORT CUresult cuMemMap(CUdeviceptr, size_t, size_t, unsigned long long, unsigned long long) {
-  return CUDA_ERROR_NOT_SUPPORTED;
-}
-VGPU_EXPORT CUresult cuMemUnmap(CUdeviceptr, size_t) { return CUDA_ERROR_NOT_SUPPORTED; }
-VGPU_EXPORT CUresult cuMemSetAccess(CUdeviceptr, size_t, const void*, size_t) {
-  return CUDA_ERROR_NOT_SUPPORTED;
-}
-VGPU_EXPORT CUresult cuMemGetAllocationGranularity(size_t* granularity, const void*, int) {
-  // Answering this one is harmless and lets a caller size a request before
-  // discovering the mapping calls are unavailable.
-  if (!granularity) return CUDA_ERROR_INVALID_VALUE;
-  *granularity = 64u * 1024u;  // the chunk size the sparse backing uses
+
+// A handle id the engine gave out, as the API's opaque handle. The engine's
+// ids start at 1, so 0 stays available as "no handle".
+namespace {
+constexpr size_t kVmmGranularity = 64u * 1024u;
+
+// The property struct a caller passes. Only a device-local pinned allocation
+// exists here; anything else is refused rather than quietly treated as one.
+CUresult check_prop(const CUmemAllocationProp* prop, ShimState& s, int* device_out) {
+  if (!prop) return CUDA_ERROR_INVALID_VALUE;
+  if (prop->type != CU_MEM_ALLOCATION_TYPE_PINNED) return CUDA_ERROR_INVALID_VALUE;
+  if (prop->location.type != CU_MEM_LOCATION_TYPE_DEVICE) return CUDA_ERROR_INVALID_VALUE;
+  if (prop->location.id < 0 || prop->location.id >= s.rt->device_count())
+    return CUDA_ERROR_INVALID_DEVICE;
+  // An exportable handle would have to mean something to another process.
+  if (prop->requestedHandleTypes != 0) return CUDA_ERROR_NOT_SUPPORTED;
+  if (device_out) *device_out = prop->location.id;
   return CUDA_SUCCESS;
 }
+}  // namespace
+
+VGPU_EXPORT CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment,
+                                         CUdeviceptr addr, unsigned long long flags) {
+  return api("cuMemAddressReserve", true, false, [&](ShimState& s) {
+    if (!ptr || size == 0 || flags != 0) return CUDA_ERROR_INVALID_VALUE;
+    // A fixed address is a request for one particular range; the engine hands
+    // out address space monotonically and cannot honour it.
+    if (addr != 0) return CUDA_ERROR_NOT_SUPPORTED;
+    *ptr = current(s).memory().reserve(size, alignment);
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
+  return api("cuMemAddressFree", true, false, [&](ShimState& s) {
+    owner_memory(s, ptr).address_free(ptr, size);
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuMemCreate(CUmemGenericAllocationHandle* handle, size_t size,
+                                 const CUmemAllocationProp* prop, unsigned long long flags) {
+  return api("cuMemCreate", true, false, [&](ShimState& s) {
+    if (!handle || size == 0 || flags != 0) return CUDA_ERROR_INVALID_VALUE;
+    int device = 0;
+    if (const CUresult rc = check_prop(prop, s, &device); rc != CUDA_SUCCESS) return rc;
+    *handle = s.rt->device(device).memory().create_handle(size);
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuMemRelease(CUmemGenericAllocationHandle handle) {
+  return api("cuMemRelease", true, false, [&](ShimState& s) {
+    // A handle belongs to the device it was created on, and nothing in the
+    // handle says which that is, so every device is asked.
+    for (int d = 0; d < s.rt->device_count(); ++d) {
+      try {
+        s.rt->device(d).memory().handle_size(handle);
+      } catch (const vgpu::Error&) {
+        continue;
+      }
+      s.rt->device(d).memory().release_handle(handle);
+      return CUDA_SUCCESS;
+    }
+    return CUDA_ERROR_INVALID_VALUE;
+  });
+}
+
+VGPU_EXPORT CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
+                              CUmemGenericAllocationHandle handle, unsigned long long flags) {
+  return api("cuMemMap", true, false, [&](ShimState& s) {
+    if (flags != 0) return CUDA_ERROR_INVALID_VALUE;
+    owner_memory(s, ptr).map(ptr, size, offset, handle);
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
+  return api("cuMemUnmap", true, false, [&](ShimState& s) {
+    owner_memory(s, ptr).unmap(ptr, size);
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc,
+                                    size_t count) {
+  return api("cuMemSetAccess", true, false, [&](ShimState& s) {
+    if (!desc || count == 0) return CUDA_ERROR_INVALID_VALUE;
+    vgpu::MemoryManager& mem = owner_memory(s, ptr);
+    // Each descriptor names a device and what it may do. The engine keeps one
+    // set of flags per mapping, which is the right model while every device
+    // here reaches the memory through the same address.
+    bool readable = false, writable = false;
+    for (size_t i = 0; i < count; ++i) {
+      if (desc[i].location.type != CU_MEM_LOCATION_TYPE_DEVICE) return CUDA_ERROR_INVALID_VALUE;
+      if (desc[i].location.id < 0 || desc[i].location.id >= s.rt->device_count())
+        return CUDA_ERROR_INVALID_DEVICE;
+      switch (desc[i].flags) {
+        case CU_MEM_ACCESS_FLAGS_PROT_READWRITE: readable = writable = true; break;
+        case CU_MEM_ACCESS_FLAGS_PROT_READ: readable = true; break;
+        case CU_MEM_ACCESS_FLAGS_PROT_NONE: break;
+        default: return CUDA_ERROR_INVALID_VALUE;
+      }
+    }
+    mem.set_access(ptr, size, readable, writable);
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuMemGetAccess(unsigned long long* flags, const CUmemLocation* location,
+                                    CUdeviceptr ptr) {
+  return api("cuMemGetAccess", true, false, [&](ShimState& s) {
+    if (!flags || !location) return CUDA_ERROR_INVALID_VALUE;
+    if (location->type != CU_MEM_LOCATION_TYPE_DEVICE) return CUDA_ERROR_INVALID_VALUE;
+    if (location->id < 0 || location->id >= s.rt->device_count()) return CUDA_ERROR_INVALID_DEVICE;
+    bool readable = false, writable = false;
+    if (!owner_memory(s, ptr).access_at(ptr, &readable, &writable)) return CUDA_ERROR_INVALID_VALUE;
+    *flags = writable ? CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+                      : readable ? CU_MEM_ACCESS_FLAGS_PROT_READ : CU_MEM_ACCESS_FLAGS_PROT_NONE;
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuMemGetAllocationGranularity(size_t* granularity,
+                                                   const CUmemAllocationProp* prop,
+                                                   CUmemAllocationGranularity_flags option) {
+  if (!granularity) return CUDA_ERROR_INVALID_VALUE;
+  if (option != CU_MEM_ALLOC_GRANULARITY_MINIMUM && option != CU_MEM_ALLOC_GRANULARITY_RECOMMENDED)
+    return CUDA_ERROR_INVALID_VALUE;
+  (void)prop;
+  // The chunk the sparse backing materializes, which is the unit every
+  // reservation, handle and mapping here is measured in.
+  *granularity = kVmmGranularity;
+  return CUDA_SUCCESS;
+}
+
+VGPU_EXPORT CUresult cuMemGetAllocationPropertiesFromHandle(CUmemAllocationProp* prop,
+                                                            CUmemGenericAllocationHandle handle) {
+  return api("cuMemGetAllocationPropertiesFromHandle", true, false, [&](ShimState& s) {
+    if (!prop) return CUDA_ERROR_INVALID_VALUE;
+    for (int d = 0; d < s.rt->device_count(); ++d) {
+      try {
+        s.rt->device(d).memory().handle_size(handle);
+      } catch (const vgpu::Error&) {
+        continue;
+      }
+      *prop = CUmemAllocationProp{};
+      prop->type = CU_MEM_ALLOCATION_TYPE_PINNED;
+      prop->location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      prop->location.id = d;
+      return CUDA_SUCCESS;
+    }
+    return CUDA_ERROR_INVALID_VALUE;
+  });
+}
+
+VGPU_EXPORT CUresult cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* handle, void* addr) {
+  return api("cuMemRetainAllocationHandle", true, false, [&](ShimState& s) {
+    if (!handle || !addr) return CUDA_ERROR_INVALID_VALUE;
+    const auto va = static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(addr));
+    const uint64_t h = owner_memory(s, va).retain_handle_at(va);
+    if (!h) return CUDA_ERROR_INVALID_VALUE;
+    *handle = h;
+    return CUDA_SUCCESS;
+  });
+}
+
 VGPU_EXPORT CUresult cuMemExportToShareableHandle(void*, unsigned long long, int, unsigned long long) {
+  // Another process would have to be able to map the same memory; device
+  // memory here lives in this process's own sparse backing.
   return CUDA_ERROR_NOT_SUPPORTED;
 }
 VGPU_EXPORT CUresult cuMemImportFromShareableHandle(unsigned long long*, void*, int) {

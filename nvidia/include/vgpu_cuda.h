@@ -120,6 +120,61 @@ CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t By
 CUresult cuMemGetInfo(size_t* free, size_t* total);
 CUresult cuMemGetInfo_v2(size_t* free, size_t* total);
 
+/* Virtual memory management: address space, physical handles and mappings.
+ *
+ * The struct layouts and enumerator values are the documented ones, so a
+ * program compiled against NVIDIA's cuda.h passes the same bytes.
+ */
+typedef unsigned long long CUmemGenericAllocationHandle;
+typedef enum CUmemAllocationType_enum { CU_MEM_ALLOCATION_TYPE_INVALID = 0x0,
+                                        CU_MEM_ALLOCATION_TYPE_PINNED = 0x1 } CUmemAllocationType;
+typedef enum CUmemLocationType_enum { CU_MEM_LOCATION_TYPE_INVALID = 0x0,
+                                      CU_MEM_LOCATION_TYPE_DEVICE = 0x1 } CUmemLocationType;
+typedef enum CUmemAccess_flags_enum { CU_MEM_ACCESS_FLAGS_PROT_NONE = 0x0,
+                                      CU_MEM_ACCESS_FLAGS_PROT_READ = 0x1,
+                                      CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 0x3 } CUmemAccess_flags;
+typedef enum CUmemAllocationGranularity_flags_enum {
+  CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0x0,
+  CU_MEM_ALLOC_GRANULARITY_RECOMMENDED = 0x1
+} CUmemAllocationGranularity_flags;
+typedef struct CUmemLocation_st {
+  CUmemLocationType type;
+  int id;
+} CUmemLocation;
+typedef struct CUmemAllocationProp_st {
+  CUmemAllocationType type;
+  int requestedHandleTypes;
+  CUmemLocation location;
+  void* win32HandleMetaData;
+  struct {
+    unsigned char compressionType;
+    unsigned char gpuDirectRDMACapable;
+    unsigned short usage;
+    unsigned char reserved[4];
+  } allocFlags;
+} CUmemAllocationProp;
+typedef struct CUmemAccessDesc_st {
+  CUmemLocation location;
+  CUmemAccess_flags flags;
+} CUmemAccessDesc;
+
+CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr,
+                             unsigned long long flags);
+CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size);
+CUresult cuMemCreate(CUmemGenericAllocationHandle* handle, size_t size,
+                     const CUmemAllocationProp* prop, unsigned long long flags);
+CUresult cuMemRelease(CUmemGenericAllocationHandle handle);
+CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
+                  CUmemGenericAllocationHandle handle, unsigned long long flags);
+CUresult cuMemUnmap(CUdeviceptr ptr, size_t size);
+CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc, size_t count);
+CUresult cuMemGetAccess(unsigned long long* flags, const CUmemLocation* location, CUdeviceptr ptr);
+CUresult cuMemGetAllocationGranularity(size_t* granularity, const CUmemAllocationProp* prop,
+                                       CUmemAllocationGranularity_flags option);
+CUresult cuMemGetAllocationPropertiesFromHandle(CUmemAllocationProp* prop,
+                                                CUmemGenericAllocationHandle handle);
+CUresult cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* handle, void* addr);
+
 /* Modules and kernels. cuModuleLoadData expects NUL-terminated PTX text
  * (cubin/fatbin images are not supported yet — documented limitation). */
 CUresult cuModuleLoadData(CUmodule* module, const void* image);
