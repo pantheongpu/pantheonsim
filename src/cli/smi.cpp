@@ -25,6 +25,7 @@
 #include "args.hpp"
 #include "machine.hpp"
 #include "vgpu/ras.hpp"
+#include "vgpu/regs.hpp"
 #include "vgpu/driver_version.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/telemetry.hpp"
@@ -1034,44 +1035,29 @@ int print_agents(const vgpu::telemetry::Shared& s) {
 // An lspci view of the virtual devices.
 //
 // `--lspci` prints the familiar one-line-per-device listing. `--lspci-dump`
-// emits a synthesized PCI configuration space in `lspci -x` format, which the
-// REAL lspci can render with `lspci -F <file>` -- so the system tool shows the
-// virtual GPUs, looking their names up from the host's pci.ids as usual.
+// emits each device's configuration space -- all 4096 bytes, from the register
+// model (vgpu/regs.hpp) -- in `lspci -xxxx` format, which the REAL lspci renders
+// with `lspci -F <file>`, capabilities and all: `lspci -F <file> -vvv` shows the
+// link's speed and width and the AER status the fault model has set.
 void print_lspci(const vgpu::telemetry::Shared& s, bool dump) {
   for (uint32_t i = 0; i < s.device_count; ++i) {
     const auto& d = s.devices[i];
-    uint32_t vendor = d.pci_device_id & 0xFFFF;
-    uint32_t device = (d.pci_device_id >> 16) & 0xFFFF;
     // NVML-style bus ids carry an 8-digit domain; lspci uses 4.
     const char* bdf = std::strlen(d.bus_id) > 4 ? d.bus_id + 4 : d.bus_id;
     const char* vendor_name = std::strcmp(d.vendor, "amd") == 0
                                   ? "Advanced Micro Devices, Inc. [AMD/ATI]"
                                   : "NVIDIA Corporation";
-    if (!dump) {
-      std::printf("%s 3D controller: %s %s (rev a1)\n", bdf, vendor_name, d.name);
-      continue;
-    }
-    // Type-0 configuration header. Class 0x030200 = 3D controller, which is
-    // what compute GPUs report.
-    unsigned char cfg[64];
-    std::memset(cfg, 0, sizeof cfg);
-    cfg[0x00] = vendor & 0xFF;         cfg[0x01] = (vendor >> 8) & 0xFF;
-    cfg[0x02] = device & 0xFF;         cfg[0x03] = (device >> 8) & 0xFF;
-    cfg[0x04] = 0x07;                  cfg[0x05] = 0x00;   // command: mem+bus master
-    cfg[0x06] = 0x10;                  cfg[0x07] = 0x00;   // status: caps list
-    cfg[0x08] = 0xa1;                                      // revision
-    cfg[0x09] = 0x00;                  // prog-if
-    cfg[0x0a] = 0x02;                  // subclass: 3D controller
-    cfg[0x0b] = 0x03;                  // class: display controller
-    cfg[0x0e] = 0x00;                  // header type 0
-    cfg[0x2c] = vendor & 0xFF;         cfg[0x2d] = (vendor >> 8) & 0xFF;
-    cfg[0x2e] = device & 0xFF;         cfg[0x2f] = (device >> 8) & 0xFF;
-    cfg[0x34] = 0x60;                  // capabilities pointer
-
-    std::printf("%s 3D controller: %s %s (rev a1)\n", bdf, vendor_name, d.name);
-    for (int row = 0; row < 4; ++row) {
+    vgpu::regs::ConfigSpace cs(d);
+    const std::vector<uint8_t> cfg = cs.image(dump ? vgpu::regs::kConfigSize : 16);
+    const uint32_t cls = static_cast<uint32_t>(cfg[0x0b]) << 8 | cfg[0x0a];
+    const char* class_name = cls == 0x0300 ? "VGA compatible controller"
+                             : cls == 0x1200 ? "Processing accelerators"
+                                             : "3D controller";
+    std::printf("%s %s: %s %s (rev %02x)\n", bdf, class_name, vendor_name, d.name, cfg[0x08]);
+    if (!dump) continue;
+    for (uint32_t row = 0; row < vgpu::regs::kConfigSize / 16; ++row) {
       std::printf("%02x:", row * 16);
-      for (int col = 0; col < 16; ++col) std::printf(" %02x", cfg[row * 16 + col]);
+      for (uint32_t col = 0; col < 16; ++col) std::printf(" %02x", cfg[row * 16 + col]);
       std::printf("\n");
     }
     std::printf("\n");

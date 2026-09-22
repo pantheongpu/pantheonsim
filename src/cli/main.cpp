@@ -37,8 +37,10 @@ int usage(FILE* to) {
                "                                       which it cannot, with the reason\n"
                "  vgpu test --matrix <program> [args]  Run a program on every device profile and\n"
                "                                       compare the results (vgpu test --help)\n"
-               "  vgpu fault inject|show|reset [opts]  Inject ECC and PCIe errors that nvidia-smi,\n"
-               "                                       NVML and rocm-smi then report (--help)\n"
+               "  vgpu fault inject|arm|stuck|lose|... Inject faults: ECC, PCIe, hangs, a lost GPU,\n"
+               "                                       a degraded link (vgpu fault --help)\n"
+               "  vgpu regs list|read|write|dump|log   A device's registers: PCI configuration\n"
+               "                                       space, decoded, with an access log\n"
                "  vgpu shell                           Interactive machine simulator: pick a GPU,\n"
                "                                       CUDA/driver and OS, then get a shell where\n"
                "                                       nvidia-smi/rocm-smi/lspci/dmesg all work\n"
@@ -211,6 +213,7 @@ int cmd_smi(const std::vector<std::string>& args);
 int cmd_serve(const std::vector<std::string>& args);
 // Implemented in fault.cpp.
 int cmd_fault(const std::vector<std::string>& args);
+int cmd_regs(const std::vector<std::string>& args);
 int cmd_shell(const std::vector<std::string>& args);
 // Implemented in run.cpp.
 int cmd_run(const std::vector<std::string>& args);
@@ -233,6 +236,7 @@ int main(int argc, char** argv) {
     if (cmd == "smi") return cmd_smi({args.begin() + 1, args.end()});
     if (cmd == "serve") return cmd_serve({args.begin() + 1, args.end()});
     if (cmd == "fault") return cmd_fault({args.begin() + 1, args.end()});
+    if (cmd == "regs") return cmd_regs({args.begin() + 1, args.end()});
     if (cmd == "shell") return cmd_shell({args.begin() + 1, args.end()});
     if (cmd == "run") return cmd_run({args.begin() + 1, args.end()});
     if (cmd == "test") return cmd_test({args.begin() + 1, args.end()});

@@ -1,0 +1,459 @@
+# PCI configuration space of a VirtualGPU device: the type-0 header, the
+# capability chain (power management, MSI, PCI Express) and the extended space
+# (AER). The layout is the PCI and PCI Express base specifications', the same on
+# every vendor's card; what differs per device comes from the backing.
+#
+# One register per entry:
+#   offset    byte offset in configuration space ("0x..")
+#   width     8, 16 or 32 bits
+#   access    ro    read-only; the backing or reset value
+#             rw    read-write; writes are kept (only write_mask bits change)
+#             rw1c  status bits: writing 1 clears a bit until its cause recurs
+#             bar   a base address register: sizing probes read back the size
+#   reset     the value after reset, when nothing backs the register
+#   backing   where a value comes from (vgpu/regs.hpp lists them):
+#             const, profile.*, bar.N, link.*, aer.*, devsta
+#   fields    bit fields, "hi:lo name" or "bit name"
+#   surfaces  the tools and files that read it
+#   status    done: behaves as on hardware; model: a plausible value, not measured
+
+vendor_id:
+  offset: "0x000"
+  width: 16
+  access: ro
+  backing: profile.vendor_id
+  surfaces: [lspci, sysfs.vendor, nvml.pci]
+  status: done
+
+device_id:
+  offset: "0x002"
+  width: 16
+  access: ro
+  backing: profile.device_id
+  surfaces: [lspci, sysfs.device, nvml.pci]
+  status: done
+
+command:
+  offset: "0x004"
+  width: 16
+  access: rw
+  reset: "0x0006"
+  write_mask: "0x0547"
+  fields: ["0 io_space", "1 memory_space", "2 bus_master", "6 parity_error_response", "8 serr", "10 intx_disable"]
+  surfaces: [lspci, driver]
+  status: done
+
+status:
+  offset: "0x006"
+  width: 16
+  access: ro
+  reset: "0x0010"
+  fields: ["4 capabilities_list"]
+  surfaces: [lspci]
+  status: done
+
+revision:
+  offset: "0x008"
+  width: 8
+  access: ro
+  backing: profile.revision
+  surfaces: [lspci]
+  status: model
+
+class_code:
+  offset: "0x009"
+  width: 24
+  access: ro
+  backing: profile.class
+  fields: ["7:0 prog_if", "15:8 subclass", "23:16 base_class"]
+  surfaces: [lspci, sysfs.class]
+  status: done
+
+cache_line_size:
+  offset: "0x00c"
+  width: 8
+  access: rw
+  reset: "0x00"
+  write_mask: "0xff"
+  surfaces: [lspci]
+  status: done
+
+latency_timer:
+  offset: "0x00d"
+  width: 8
+  access: ro
+  reset: "0x00"
+  surfaces: [lspci]
+  status: done
+
+header_type:
+  offset: "0x00e"
+  width: 8
+  access: ro
+  reset: "0x00"
+  fields: ["6:0 layout", "7 multifunction"]
+  surfaces: [lspci]
+  status: done
+
+bar0:
+  offset: "0x010"
+  width: 32
+  access: bar
+  backing: bar.0
+  fields: ["0 io", "2:1 type", "3 prefetchable", "31:4 base"]
+  surfaces: [lspci, sysfs.resource, driver]
+  status: model
+
+bar1:
+  offset: "0x014"
+  width: 32
+  access: bar
+  backing: bar.1
+  surfaces: [lspci, sysfs.resource, driver]
+  status: model
+
+bar2:
+  offset: "0x018"
+  width: 32
+  access: bar
+  backing: bar.2
+  surfaces: [lspci, sysfs.resource, driver]
+  status: model
+
+bar3:
+  offset: "0x01c"
+  width: 32
+  access: bar
+  backing: bar.3
+  surfaces: [lspci, sysfs.resource, driver]
+  status: model
+
+bar4:
+  offset: "0x020"
+  width: 32
+  access: bar
+  backing: bar.4
+  surfaces: [lspci, sysfs.resource, driver]
+  status: model
+
+bar5:
+  offset: "0x024"
+  width: 32
+  access: bar
+  backing: bar.5
+  surfaces: [lspci, sysfs.resource, driver]
+  status: model
+
+subsystem_vendor_id:
+  offset: "0x02c"
+  width: 16
+  access: ro
+  backing: profile.subsystem_vendor_id
+  surfaces: [lspci, nvml.pci]
+  status: model
+
+subsystem_id:
+  offset: "0x02e"
+  width: 16
+  access: ro
+  backing: profile.subsystem_id
+  surfaces: [lspci, nvml.pci]
+  status: model
+
+expansion_rom:
+  offset: "0x030"
+  width: 32
+  access: ro
+  reset: "0x00000000"
+  surfaces: [lspci]
+  status: done
+
+capabilities_pointer:
+  offset: "0x034"
+  width: 8
+  access: ro
+  reset: "0x60"
+  surfaces: [lspci]
+  status: done
+
+interrupt_line:
+  offset: "0x03c"
+  width: 8
+  access: rw
+  reset: "0xff"
+  write_mask: "0xff"
+  surfaces: [lspci]
+  status: done
+
+interrupt_pin:
+  offset: "0x03d"
+  width: 8
+  access: ro
+  reset: "0x01"
+  fields: ["7:0 pin (1 is INTA)"]
+  surfaces: [lspci]
+  status: done
+
+# ---- Power management capability ---------------------------------------------
+
+pm_header:
+  offset: "0x060"
+  width: 16
+  access: ro
+  reset: "0x6801"
+  fields: ["7:0 id (0x01 power management)", "15:8 next"]
+  surfaces: [lspci]
+  status: done
+
+pm_capabilities:
+  offset: "0x062"
+  width: 16
+  access: ro
+  reset: "0x0003"
+  fields: ["2:0 version"]
+  surfaces: [lspci]
+  status: done
+
+pm_control_status:
+  offset: "0x064"
+  width: 16
+  access: rw
+  reset: "0x0008"
+  write_mask: "0x0003"
+  fields: ["1:0 power_state (0 is D0)", "3 no_soft_reset"]
+  surfaces: [lspci, driver]
+  status: done
+
+# ---- MSI capability ------------------------------------------------------------
+
+msi_header:
+  offset: "0x068"
+  width: 16
+  access: ro
+  reset: "0x7805"
+  fields: ["7:0 id (0x05 MSI)", "15:8 next"]
+  surfaces: [lspci]
+  status: done
+
+msi_control:
+  offset: "0x06a"
+  width: 16
+  access: rw
+  reset: "0x0080"
+  write_mask: "0x0071"
+  fields: ["0 enable", "3:1 multiple_message_capable", "6:4 multiple_message_enable", "7 address_64"]
+  surfaces: [lspci, driver]
+  status: done
+
+msi_address_low:
+  offset: "0x06c"
+  width: 32
+  access: rw
+  reset: "0x00000000"
+  write_mask: "0xfffffffc"
+  surfaces: [lspci, driver]
+  status: done
+
+msi_address_high:
+  offset: "0x070"
+  width: 32
+  access: rw
+  reset: "0x00000000"
+  write_mask: "0xffffffff"
+  surfaces: [lspci, driver]
+  status: done
+
+msi_data:
+  offset: "0x074"
+  width: 16
+  access: rw
+  reset: "0x0000"
+  write_mask: "0xffff"
+  surfaces: [lspci, driver]
+  status: done
+
+# ---- PCI Express capability ------------------------------------------------------
+
+pcie_header:
+  offset: "0x078"
+  width: 16
+  access: ro
+  reset: "0x0010"
+  fields: ["7:0 id (0x10 PCI Express)", "15:8 next (none)"]
+  surfaces: [lspci]
+  status: done
+
+pcie_capabilities:
+  offset: "0x07a"
+  width: 16
+  access: ro
+  reset: "0x0002"
+  fields: ["3:0 version", "7:4 device_port_type (0 is an endpoint)"]
+  surfaces: [lspci]
+  status: done
+
+device_capabilities:
+  offset: "0x07c"
+  width: 32
+  access: ro
+  reset: "0x10008fe2"
+  fields: ["2:0 max_payload_supported (2 is 512 bytes)", "5 extended_tag", "8:6 l0s_latency", "11:9 l1_latency", "15 role_based_error_reporting", "28 flr"]
+  surfaces: [lspci]
+  status: model
+
+device_control:
+  offset: "0x080"
+  width: 16
+  access: rw
+  reset: "0x2930"
+  write_mask: "0xffff"
+  fields: ["0 correctable_reporting", "1 nonfatal_reporting", "2 fatal_reporting", "3 unsupported_request_reporting", "4 relaxed_ordering", "7:5 max_payload", "8 extended_tag", "14:12 max_read_request"]
+  surfaces: [lspci, driver]
+  status: done
+
+device_status:
+  offset: "0x082"
+  width: 16
+  access: rw1c
+  backing: devsta
+  fields: ["0 correctable_error", "1 nonfatal_error", "2 fatal_error", "3 unsupported_request", "5 transactions_pending"]
+  surfaces: [lspci, kernel.aer]
+  status: done
+
+link_capabilities:
+  offset: "0x084"
+  width: 32
+  access: ro
+  backing: link.capabilities
+  fields: ["3:0 max_link_speed", "9:4 max_link_width", "11:10 aspm_support", "14:12 l0s_exit_latency", "17:15 l1_exit_latency", "31:24 port_number"]
+  surfaces: [lspci, nvml.pcie.max, smi.pcie.link.max]
+  status: done
+
+link_control:
+  offset: "0x088"
+  width: 16
+  access: rw
+  reset: "0x0040"
+  write_mask: "0x0fff"
+  fields: ["1:0 aspm_control", "3 read_completion_boundary", "4 link_disable", "5 retrain_link", "6 common_clock"]
+  surfaces: [lspci, driver]
+  status: done
+
+link_status:
+  offset: "0x08a"
+  width: 16
+  access: ro
+  backing: link.status
+  fields: ["3:0 current_link_speed", "9:4 negotiated_link_width", "11 link_training", "12 slot_clock"]
+  surfaces: [lspci, nvml.pcie.current, smi.pcie.link.current]
+  status: done
+
+device_capabilities2:
+  offset: "0x09c"
+  width: 32
+  access: ro
+  reset: "0x00000010"
+  fields: ["3:0 completion_timeout_ranges", "4 completion_timeout_disable"]
+  surfaces: [lspci]
+  status: model
+
+device_control2:
+  offset: "0x0a0"
+  width: 16
+  access: rw
+  reset: "0x0000"
+  write_mask: "0xffff"
+  surfaces: [lspci, driver]
+  status: done
+
+link_capabilities2:
+  offset: "0x0a4"
+  width: 32
+  access: ro
+  backing: link.capabilities2
+  fields: ["7:1 supported_link_speeds"]
+  surfaces: [lspci]
+  status: done
+
+link_control2:
+  offset: "0x0a8"
+  width: 16
+  access: ro
+  backing: link.control2
+  fields: ["3:0 target_link_speed"]
+  surfaces: [lspci]
+  status: done
+
+link_status2:
+  offset: "0x0aa"
+  width: 16
+  access: ro
+  reset: "0x0000"
+  surfaces: [lspci]
+  status: done
+
+# ---- Advanced Error Reporting (extended capability) --------------------------------
+
+aer_header:
+  offset: "0x100"
+  width: 32
+  access: ro
+  reset: "0x00020001"
+  fields: ["15:0 id (0x0001 AER)", "19:16 version", "31:20 next (none)"]
+  surfaces: [lspci]
+  status: done
+
+aer_uncorrectable_status:
+  offset: "0x104"
+  width: 32
+  access: rw1c
+  backing: aer.uncorrectable
+  fields: ["4 data_link_protocol", "5 surprise_down", "12 poisoned_tlp", "13 flow_control_protocol", "14 completion_timeout", "15 completer_abort", "16 unexpected_completion", "17 receiver_overflow", "18 malformed_tlp", "19 ecrc", "20 unsupported_request"]
+  surfaces: [lspci, kernel.aer, sysfs.aer_dev_nonfatal, sysfs.aer_dev_fatal]
+  status: done
+
+aer_uncorrectable_mask:
+  offset: "0x108"
+  width: 32
+  access: rw
+  reset: "0x00000000"
+  write_mask: "0x03fff030"
+  surfaces: [lspci, kernel.aer]
+  status: done
+
+aer_uncorrectable_severity:
+  offset: "0x10c"
+  width: 32
+  access: rw
+  reset: "0x00462030"
+  write_mask: "0x03fff030"
+  fields: ["a set bit is fatal and a clear one non-fatal"]
+  surfaces: [lspci, kernel.aer]
+  status: done
+
+aer_correctable_status:
+  offset: "0x110"
+  width: 32
+  access: rw1c
+  backing: aer.correctable
+  fields: ["0 receiver_error", "6 bad_tlp", "7 bad_dllp", "8 replay_num_rollover", "12 replay_timer_timeout", "13 advisory_nonfatal"]
+  surfaces: [lspci, kernel.aer, sysfs.aer_dev_correctable, nvml.pcie.replay]
+  status: done
+
+aer_correctable_mask:
+  offset: "0x114"
+  width: 32
+  access: rw
+  reset: "0x00002000"
+  write_mask: "0x0000f1c1"
+  surfaces: [lspci, kernel.aer]
+  status: done
+
+aer_capabilities_control:
+  offset: "0x118"
+  width: 32
+  access: ro
+  reset: "0x000000a0"
+  fields: ["4:0 first_error_pointer", "5 ecrc_generation_capable", "7 ecrc_check_capable"]
+  surfaces: [lspci, kernel.aer]
+  status: model
