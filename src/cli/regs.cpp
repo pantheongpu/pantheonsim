@@ -61,9 +61,11 @@ bool field_bits(const std::string& f, uint32_t* hi, uint32_t* lo, std::string* n
   return *hi < 32 && *lo <= *hi;
 }
 
-void print_register(const vgpu::regs::Register& r, uint32_t v) {
+// `at` is where the register is on this device, which for a capability's
+// register depends on the device's capability chain.
+void print_register(const vgpu::regs::Register& r, uint32_t at, uint32_t v) {
   const int digits = static_cast<int>(r.width / 4);
-  std::printf("0x%03x  %-28s = 0x%0*x   (%s, %s)\n", r.offset, r.name.c_str(), digits, v,
+  std::printf("0x%03x  %-28s = 0x%0*x   (%s, %s)\n", at, r.name.c_str(), digits, v,
               vgpu::regs::access_name(r.access), r.status.c_str());
   if (!r.source.empty()) std::printf("       from %s\n", r.source.c_str());
   if (!r.measured.empty()) std::printf("       measured: %s\n", r.measured.c_str());
@@ -76,12 +78,6 @@ void print_register(const vgpu::regs::Register& r, uint32_t v) {
     const std::string bits = hi == lo ? std::to_string(hi) : std::to_string(hi) + ":" + std::to_string(lo);
     std::printf("       %6s %-40s %u\n", bits.c_str(), name.c_str(), fv);
   }
-}
-
-std::string offset_key(uint32_t offset) {
-  char b[16];
-  std::snprintf(b, sizeof b, "0x%x", offset);
-  return b;
 }
 
 }  // namespace
@@ -148,11 +144,14 @@ int cmd_regs(const std::vector<std::string>& args) {
 
   try {
     if (verb == "list") {
-      std::printf("%-7s %-5s %-6s %-28s %-22s %s\n", "OFFSET", "WIDTH", "ACCESS", "REGISTER", "BACKING", "STATUS");
+      // A capability's registers sit where each card's capability chain puts
+      // the capability; OFFSET is the generic layout's.
+      std::printf("%-7s %-5s %-6s %-5s %-28s %-22s %s\n", "OFFSET", "WIDTH", "ACCESS", "CAP", "REGISTER", "BACKING",
+                  "STATUS");
       for (const auto& r : vgpu::regs::registers(space)) {
         if (!status.empty() && r.status != status) continue;
-        std::printf("0x%05x %-5u %-6s %-28s %-22s %s\n", r.offset, r.width, vgpu::regs::access_name(r.access),
-                    r.name.c_str(), r.backing.empty() ? "reset value" : r.backing.c_str(), r.status.c_str());
+        std::printf("0x%05x %-5u %-6s %-5s %-28s %-22s %s\n", r.offset, r.width, vgpu::regs::access_name(r.access),
+                    r.capability.empty() ? "-" : r.capability.c_str(), r.name.c_str(), r.backing.empty() ? "reset value" : r.backing.c_str(), r.status.c_str());
       }
       return 0;
     }
@@ -169,6 +168,7 @@ int cmd_regs(const std::vector<std::string>& args) {
                    gpu, d.name, vgpu::regs::space_name(space));
       return 2;
     }
+    vgpu::regs::RegisterSpace cs(space, d);
 
     if (verb == "log") {
       const auto log = vgpu::regs::access_log(d.uuid, space);
@@ -180,7 +180,7 @@ int cmd_regs(const std::vector<std::string>& args) {
         localtime_r(&t, &tm);
         char when[32];
         std::strftime(when, sizeof when, "%H:%M:%S", &tm);
-        const auto* r = vgpu::regs::find(space, offset_key(e.offset));
+        const auto* r = cs.at(e.offset);
         if (e.size > 4)
           std::printf("%s.%03llu  %-16s pid %-7u read   0x%03x-0x%03x (%u bytes)\n", when,
                       static_cast<unsigned long long>(e.time_ns / 1000000 % 1000), e.process.c_str(), e.pid,
@@ -194,10 +194,9 @@ int cmd_regs(const std::vector<std::string>& args) {
       return 0;
     }
 
-    vgpu::regs::RegisterSpace cs(space, d);
     if (verb == "dump" && space == vgpu::regs::Space::AmdMmio) {
       // Half a megabyte of mostly undeclared space: the declared registers.
-      for (const auto& r : vgpu::regs::registers(space)) print_register(r, cs.read(r.offset, 4));
+      for (const auto& r : vgpu::regs::registers(space)) print_register(r, r.offset, cs.read(r.offset, 4));
       return 0;
     }
     if (verb == "dump") {
@@ -210,11 +209,23 @@ int cmd_regs(const std::vector<std::string>& args) {
       return 0;
     }
 
-    const vgpu::regs::Register* r = vgpu::regs::find(space, pos[0]);
+    // A name, found where this device has it, or an offset on this device.
+    const vgpu::regs::Register* r = nullptr;
     uint32_t offset = 0;
-    if (r) {
-      offset = r->offset;
-    } else if (!parse_u32(pos[0], &offset) || offset >= vgpu::regs::space_size(space)) {
+    if (parse_u32(pos[0], &offset)) {
+      if (offset >= vgpu::regs::space_size(space)) {
+        std::fprintf(stderr, "vgpu regs: 0x%x is past the end of the space\n", offset);
+        return 2;
+      }
+      r = cs.at(offset);
+    } else if ((r = vgpu::regs::find(space, pos[0]))) {
+      offset = cs.offset_of(*r);
+      if (offset == vgpu::regs::RegisterSpace::kAbsent) {
+        std::fprintf(stderr, "vgpu regs: GPU %lld has no %s capability, so no %s\n", gpu, r->capability.c_str(),
+                     r->name.c_str());
+        return 2;
+      }
+    } else {
       std::fprintf(stderr, "vgpu regs: no register '%s'; `vgpu regs list` names them\n", pos[0].c_str());
       return 2;
     }
@@ -224,9 +235,10 @@ int cmd_regs(const std::vector<std::string>& args) {
     if (r && r->width == 24 && !size) offset &= ~3u;
     if (verb == "read") {
       const uint32_t v = cs.read(offset, sz);
-      const vgpu::regs::Register* at = vgpu::regs::find(space, offset_key(offset));
+      const vgpu::regs::Register* at = cs.at(offset);
       if (r && r->width == 24) at = r;
-      if (at && sz * 8 >= at->width) print_register(*at, at == r && r->width == 24 ? v >> 8 : v);
+      if (at && sz * 8 >= at->width)
+        print_register(*at, cs.offset_of(*at), at == r && r->width == 24 ? v >> 8 : v);
       else std::printf("0x%03x = 0x%0*x\n", offset, static_cast<int>(sz * 2), v);
       return 0;
     }
@@ -236,7 +248,7 @@ int cmd_regs(const std::vector<std::string>& args) {
       return 2;
     }
     cs.write(offset, sz, value);
-    if (r && r->width != 24) print_register(*r, cs.value(*r));
+    if (r && r->width != 24) print_register(*r, cs.offset_of(*r), cs.value(*r));
     return 0;
   } catch (const std::invalid_argument& e) {
     std::fprintf(stderr, "vgpu regs: %s\n", e.what());

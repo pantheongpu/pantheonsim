@@ -65,7 +65,7 @@ kill $serve 2>/dev/null; wait $serve 2>/dev/null
 mi() { VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=1 "$vgpu" "$@" 2>&1; }
 mval() { mi regs read --space mmio "$@" | head -1 | awk '{print $4}'; }
 expect "mmio lists the registers with where each offset comes from" "0x08010 grbm_status" \
-  "$(mi regs list --space mmio | awk '$4 == "grbm_status" {print $1, $4}')"
+  "$(mi regs list --space mmio | awk '$5 == "grbm_status" {print $1, $5}')"
 expect "an idle GPU's GRBM_STATUS: FIFOs available, DB and CB clean" "0x00003028" "$(mval grbm_status)"
 mi regs write --space mmio smu_response 0 >/dev/null
 mi regs write --space mmio smu_argument 41 >/dev/null

@@ -4,7 +4,12 @@
 # every vendor's card; what differs per device comes from the backing.
 #
 # One register per entry:
-#   offset    byte offset in configuration space ("0x..")
+#   offset    byte offset in configuration space ("0x..") in the generic layout
+#   capability the capability a register belongs to (pm, msi, pcie, aer): the
+#             register is found through the capability chain, as drivers find
+#             it, at the same distance from its capability's header as in the
+#             generic layout -- so a card whose chain is laid out differently
+#             (a captured one, registers/measurements/) has it where it has it
 #   width     8, 16 or 32 bits
 #   access    ro    read-only; the backing or reset value
 #             rw    read-write; writes are kept (only write_mask bits change)
@@ -202,6 +207,7 @@ interrupt_pin:
 
 pm_header:
   offset: "0x060"
+  capability: pm
   width: 16
   access: ro
   reset: "0x6801"
@@ -211,6 +217,7 @@ pm_header:
 
 pm_capabilities:
   offset: "0x062"
+  capability: pm
   width: 16
   access: ro
   reset: "0x0003"
@@ -220,6 +227,7 @@ pm_capabilities:
 
 pm_control_status:
   offset: "0x064"
+  capability: pm
   width: 16
   access: rw
   reset: "0x0008"
@@ -232,6 +240,7 @@ pm_control_status:
 
 msi_header:
   offset: "0x068"
+  capability: msi
   width: 16
   access: ro
   reset: "0x7805"
@@ -241,6 +250,7 @@ msi_header:
 
 msi_control:
   offset: "0x06a"
+  capability: msi
   width: 16
   access: rw
   reset: "0x0080"
@@ -251,6 +261,7 @@ msi_control:
 
 msi_address_low:
   offset: "0x06c"
+  capability: msi
   width: 32
   access: rw
   reset: "0x00000000"
@@ -260,6 +271,7 @@ msi_address_low:
 
 msi_address_high:
   offset: "0x070"
+  capability: msi
   width: 32
   access: rw
   reset: "0x00000000"
@@ -269,6 +281,7 @@ msi_address_high:
 
 msi_data:
   offset: "0x074"
+  capability: msi
   width: 16
   access: rw
   reset: "0x0000"
@@ -280,6 +293,7 @@ msi_data:
 
 pcie_header:
   offset: "0x078"
+  capability: pcie
   width: 16
   access: ro
   reset: "0x0010"
@@ -289,6 +303,7 @@ pcie_header:
 
 pcie_capabilities:
   offset: "0x07a"
+  capability: pcie
   width: 16
   access: ro
   reset: "0x0002"
@@ -298,6 +313,7 @@ pcie_capabilities:
 
 device_capabilities:
   offset: "0x07c"
+  capability: pcie
   width: 32
   access: ro
   reset: "0x10008fe2"
@@ -307,6 +323,7 @@ device_capabilities:
 
 device_control:
   offset: "0x080"
+  capability: pcie
   width: 16
   access: rw
   reset: "0x2930"
@@ -317,6 +334,7 @@ device_control:
 
 device_status:
   offset: "0x082"
+  capability: pcie
   width: 16
   access: rw1c
   backing: devsta
@@ -326,6 +344,7 @@ device_status:
 
 link_capabilities:
   offset: "0x084"
+  capability: pcie
   width: 32
   access: ro
   backing: link.capabilities
@@ -335,6 +354,7 @@ link_capabilities:
 
 link_control:
   offset: "0x088"
+  capability: pcie
   width: 16
   access: rw
   reset: "0x0040"
@@ -345,6 +365,7 @@ link_control:
 
 link_status:
   offset: "0x08a"
+  capability: pcie
   width: 16
   access: ro
   backing: link.status
@@ -355,6 +376,7 @@ link_status:
 
 device_capabilities2:
   offset: "0x09c"
+  capability: pcie
   width: 32
   access: ro
   reset: "0x00000010"
@@ -364,6 +386,7 @@ device_capabilities2:
 
 device_control2:
   offset: "0x0a0"
+  capability: pcie
   width: 16
   access: rw
   reset: "0x0000"
@@ -373,6 +396,7 @@ device_control2:
 
 link_capabilities2:
   offset: "0x0a4"
+  capability: pcie
   width: 32
   access: ro
   backing: link.capabilities2
@@ -382,6 +406,7 @@ link_capabilities2:
 
 link_control2:
   offset: "0x0a8"
+  capability: pcie
   width: 16
   access: ro
   backing: link.control2
@@ -391,6 +416,7 @@ link_control2:
 
 link_status2:
   offset: "0x0aa"
+  capability: pcie
   width: 16
   access: ro
   reset: "0x0000"
@@ -401,6 +427,7 @@ link_status2:
 
 aer_header:
   offset: "0x100"
+  capability: aer
   width: 32
   access: ro
   reset: "0x00020001"
@@ -410,6 +437,7 @@ aer_header:
 
 aer_uncorrectable_status:
   offset: "0x104"
+  capability: aer
   width: 32
   access: rw1c
   backing: aer.uncorrectable
@@ -419,6 +447,7 @@ aer_uncorrectable_status:
 
 aer_uncorrectable_mask:
   offset: "0x108"
+  capability: aer
   width: 32
   access: rw
   reset: "0x00000000"
@@ -428,6 +457,7 @@ aer_uncorrectable_mask:
 
 aer_uncorrectable_severity:
   offset: "0x10c"
+  capability: aer
   width: 32
   access: rw
   reset: "0x00462030"
@@ -438,6 +468,7 @@ aer_uncorrectable_severity:
 
 aer_correctable_status:
   offset: "0x110"
+  capability: aer
   width: 32
   access: rw1c
   backing: aer.correctable
@@ -447,6 +478,7 @@ aer_correctable_status:
 
 aer_correctable_mask:
   offset: "0x114"
+  capability: aer
   width: 32
   access: rw
   reset: "0x00002000"
@@ -456,6 +488,7 @@ aer_correctable_mask:
 
 aer_capabilities_control:
   offset: "0x118"
+  capability: aer
   width: 32
   access: ro
   reset: "0x000000a0"

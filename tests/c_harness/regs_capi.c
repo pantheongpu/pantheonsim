@@ -49,6 +49,13 @@ int main(void) {
   CHECK(vgpu_regs_read(mmio, reg("mmio", "grbm_status"), 4, &v) == VGPU_REGS_OK && (v >> 31) == 0);
   CHECK(vgpu_regs_read(mmio, 0x8010, 2, &v) == VGPU_REGS_EINVAL);
 
+  /* A capability's register, where this GPU's chain puts it. */
+  uint32_t found = 0, located = 0;
+  CHECK(vgpu_regs_find("config", "aer_correctable_status", &found, NULL) == VGPU_REGS_OK);
+  CHECK(vgpu_regs_locate(cfg, "aer_correctable_status", &located, NULL) == VGPU_REGS_OK);
+  CHECK(located == found);   /* this GPU has the generic layout */
+  CHECK(vgpu_regs_locate(cfg, "no_such_register", &located, NULL) == VGPU_REGS_ENOENT);
+
   /* Refusals. */
   vgpu_regs* none = NULL;
   CHECK(vgpu_regs_open(7, "config", &none) == VGPU_REGS_ENODEV && none == NULL);
