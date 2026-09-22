@@ -9,9 +9,10 @@
 // the machine, beside the reliability state, so one tool's write is the next
 // tool's read. Every access is logged with the process that made it.
 //
-// The first space is PCI configuration space, the same layout on every
+// Two spaces so far. PCI configuration space, the same layout on every
 // vendor's card: the type-0 header, power management, MSI, PCI Express, and
-// AER in the extended space.
+// AER in the extended space. And an AMD GPU's MMIO registers behind BAR5:
+// engine status and the SMU mailbox, from the Linux amdgpu headers.
 #pragma once
 
 #include <cstdint>
@@ -26,6 +27,11 @@ namespace vgpu::regs {
 enum class Access { Ro, Rw, Rw1c, Bar };
 const char* access_name(Access a);
 
+enum class Space { Config, AmdMmio };
+const char* space_name(Space s);                 // "config", "mmio"
+bool parse_space(const std::string& name, Space* out);
+uint32_t space_size(Space s);                    // bytes
+
 struct Register {
   std::string name;
   uint32_t offset = 0;
@@ -37,13 +43,18 @@ struct Register {
   std::vector<std::string> fields;
   std::vector<std::string> surfaces;
   std::string status;          // "done" or "model"
+  std::string source;          // where the offset comes from, when it is not a standard's
 };
 
-// The configuration-space registers, ordered by offset. Throws on a malformed
-// database, naming the entry.
-const std::vector<Register>& config_registers();
+// A space's registers, ordered by offset. Throws on a malformed database,
+// naming the entry.
+const std::vector<Register>& registers(Space s);
 // The register at `offset` exactly, or by name; null when there is none.
-const Register* find_config(const std::string& name_or_offset);
+const Register* find(Space s, const std::string& name_or_offset);
+inline const std::vector<Register>& config_registers() { return registers(Space::Config); }
+inline const Register* find_config(const std::string& key) { return find(Space::Config, key); }
+// Whether a device has the space: AMD MMIO only on an AMD GPU.
+bool has_space(const telemetry::DeviceSample& d, Space s);
 
 inline constexpr uint32_t kConfigSize = 4096;
 
@@ -60,18 +71,20 @@ struct LogEntry {
 };
 inline constexpr uint32_t kLogEntries = 256;
 
-// One device's configuration space. `d` is a reading of the device with the
+// One register space of one device. `d` is a reading of the device with the
 // injected faults applied (cli::read_machine, NVML's refresh), which is what
-// its link and error state come from.
-class ConfigSpace {
+// its link, error and engine state come from. Throws std::invalid_argument for
+// a space the device does not have.
+class RegisterSpace {
  public:
-  explicit ConfigSpace(const telemetry::DeviceSample& d);
-  ~ConfigSpace();
-  ConfigSpace(const ConfigSpace&) = delete;
-  ConfigSpace& operator=(const ConfigSpace&) = delete;
+  RegisterSpace(Space s, const telemetry::DeviceSample& d);
+  ~RegisterSpace();
+  RegisterSpace(const RegisterSpace&) = delete;
+  RegisterSpace& operator=(const RegisterSpace&) = delete;
+  Space space() const;
 
-  // A 1-, 2- or 4-byte access, naturally aligned, inside the space; throws
-  // std::invalid_argument otherwise.
+  // An access inside the space -- in configuration space 1, 2 or 4 bytes,
+  // naturally aligned; in MMIO 4 bytes, aligned -- or std::invalid_argument.
   uint32_t read(uint32_t offset, uint32_t size);
   void write(uint32_t offset, uint32_t size, uint32_t value);
   // The first `len` bytes of the space (256 for the standard header and
@@ -89,6 +102,18 @@ class ConfigSpace {
   std::unique_ptr<Impl> impl_;
 };
 
+// A device's configuration space.
+class ConfigSpace : public RegisterSpace {
+ public:
+  explicit ConfigSpace(const telemetry::DeviceSample& d) : RegisterSpace(Space::Config, d) {}
+};
+
+// The SMU messages the mailbox answers, from smu_v13_0_6_ppsmc.h, and what it
+// answers with. Any other message is refused as an unknown command.
+inline constexpr uint32_t kSmuTestMessage = 0x1, kSmuGetSmuVersion = 0x2, kSmuGetDriverIfVersion = 0x4,
+                          kSmuGetMetricsVersion = 0x8;
+inline constexpr uint32_t kSmuResultOk = 0x1, kSmuResultUnknownCmd = 0xFE;
+
 // The PCIe link as its registers report it -- Link Capabilities for the
 // maximum, Link Status for the link as trained -- read (and logged) the way a
 // monitoring tool reads them. nvidia-smi and NVML report the link from here.
@@ -96,7 +121,7 @@ struct Link {
   uint32_t gen = 0, width = 0;          // as trained now
   uint32_t max_gen = 0, max_width = 0;  // what the card and slot support
 };
-Link link(ConfigSpace& cs);
+Link link(RegisterSpace& cs);
 
 // The files the kernel keeps for a PCI device in sysfs -- config, resource,
 // vendor, device, class, subsystem_vendor, subsystem_device, revision, and
@@ -106,8 +131,8 @@ void write_sysfs_files(const telemetry::DeviceSample& d, const std::string& dir)
 // The file names write_sysfs_files writes, for a session to link to.
 extern const char* const kSysfsFiles[12];
 
-// The newest accesses to a device's registers, oldest first.
-std::vector<LogEntry> access_log(const std::string& uuid);
+// The newest accesses to one of a device's register spaces, oldest first.
+std::vector<LogEntry> access_log(const std::string& uuid, Space s = Space::Config);
 
 // A base address register's region: what lspci -v and sysfs `resource` show.
 struct Bar {
@@ -119,6 +144,6 @@ struct Bar {
 };
 // BAR n (0-5) of the device as programmed now. The high half of a 64-bit BAR
 // reads as not implemented.
-Bar bar(ConfigSpace& cs, const telemetry::DeviceSample& d, int n);
+Bar bar(RegisterSpace& cs, const telemetry::DeviceSample& d, int n);
 
 }  // namespace vgpu::regs

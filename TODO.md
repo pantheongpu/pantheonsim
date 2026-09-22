@@ -470,8 +470,10 @@ narrows what counts as observable, not what the detector looks at.
   database (registers/pci-config.yaml) -- header, power management, MSI, PCI
   Express with the live link, AER fed by the fault model, BAR sizing -- read,
   written and dumped with `vgpu regs`, every access logged, and rendered by the
-  real lspci. Not yet: MMIO behind BAR0 (AMD first: its register definitions
-  are public; NVIDIA waits on a decision about the register source). The
+  real lspci. AMD MMIO behind BAR5 (`--space mmio`): engine status and the SMU
+  mailbox, from the amdgpu headers, on Aldebaran's IP bases until checked on an
+  MI300. Not yet: more AMD blocks (UMC ECC, SMU metrics, NBIO), NVIDIA MMIO
+  (waits on a decision about the register source), a C API. The
   session's /sys/bus/pci devices carry config, resource, IDs and link files
   from the registers, and NVML and nvidia-smi read the link through them, each
   access logged under the tool's name.

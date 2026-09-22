@@ -30,7 +30,7 @@ uint32_t parse_hex(const std::string& s, const std::string& where) {
   return static_cast<uint32_t>(v);
 }
 
-std::vector<Register> load(const char* yaml, const std::string& origin) {
+std::vector<Register> load(const char* yaml, const std::string& origin, uint32_t size) {
   const yamlish::Value doc = yamlish::parse(yaml, origin);
   std::vector<Register> out;
   for (const auto& [name, v] : doc.map) {
@@ -64,14 +64,14 @@ std::vector<Register> load(const char* yaml, const std::string& origin) {
     if (const std::string mask = str("write_mask", false); !mask.empty()) r.write_mask = parse_hex(mask, where);
     r.backing = str("backing", false);
     r.status = str("status", true);
+    r.source = str("source", false);
     r.fields = list("fields");
     r.surfaces = list("surfaces");
     if (r.access == Access::Rw && !r.write_mask)
       throw Error::make(Err::ProfileParse, where, ": a rw register needs a write_mask");
     if ((r.access == Access::Rw1c || r.access == Access::Bar) && r.backing.empty())
       throw Error::make(Err::ProfileParse, where, ": a ", a, " register needs a backing");
-    if (r.offset + r.width / 8 > kConfigSize)
-      throw Error::make(Err::ProfileParse, where, ": past the end of configuration space");
+    if (r.offset + r.width / 8 > size) throw Error::make(Err::ProfileParse, where, ": past the end of the space");
     out.push_back(std::move(r));
   }
   std::sort(out.begin(), out.end(), [](const Register& x, const Register& y) { return x.offset < y.offset; });
@@ -81,17 +81,20 @@ std::vector<Register> load(const char* yaml, const std::string& origin) {
   return out;
 }
 
-const char* config_yaml() {
-  for (const auto& s : embedded::kRegisterSpaces)
-    if (std::strcmp(s.space, "pci-config") == 0) return s.yaml;
-  throw Error::make(Err::Internal, "no pci-config register database was embedded");
+// The database file each space is declared in.
+const char* database_name(Space s) { return s == Space::Config ? "pci-config" : "amd-mmio"; }
+
+const char* space_yaml(Space s) {
+  for (const auto& e : embedded::kRegisterSpaces)
+    if (std::strcmp(e.space, database_name(s)) == 0) return e.yaml;
+  throw Error::make(Err::Internal, "no ", database_name(s), " register database was embedded");
 }
 
 // Changes when the database does, so a state file written against another
 // layout is started again rather than misread.
-uint32_t database_version() {
+uint32_t database_version(Space s) {
   uint32_t h = 2166136261u;
-  for (const char* p = config_yaml(); *p; ++p) h = (h ^ static_cast<unsigned char>(*p)) * 16777619u;
+  for (const char* p = space_yaml(s); *p; ++p) h = (h ^ static_cast<unsigned char>(*p)) * 16777619u;
   return h | 1u;
 }
 
@@ -163,12 +166,13 @@ struct State {
   uint64_t base_correctable[32];         // write-1-to-clear: the count when each bit was cleared
   uint64_t base_uncorrectable[32];
   uint64_t base_devsta[4];
+  uint64_t mailbox[4];                   // the SMU's: message, argument, response, response set
   uint64_t log_seq;
   uint64_t log[kLogEntries][kLogWords];
 };
 
-std::string state_path(const std::string& uuid) {
-  return telemetry::default_path() + "/regs-" + uuid;
+std::string state_path(const std::string& uuid, Space s) {
+  return telemetry::default_path() + "/regs-" + uuid + (s == Space::Config ? "" : ".mmio");
 }
 
 // The name the process was started under: argv[0]'s last component, which is
@@ -239,6 +243,34 @@ bool raised(uint64_t count, uint64_t cleared_at) {
   return count > (cleared_at <= count ? cleared_at : 0);
 }
 
+// The SMU mailbox, as the driver drives it: clear the response, write the
+// argument, write the message; the SMU answers in the response register, and
+// in the argument register when the message returns a value.
+void smu_write(State* s, const std::string& backing, uint32_t v) {
+  if (backing == "smu.argument") {
+    __atomic_store_n(&s->mailbox[1], uint64_t{v}, __ATOMIC_RELAXED);
+  } else if (backing == "smu.response") {
+    __atomic_store_n(&s->mailbox[2], uint64_t{v}, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->mailbox[3], uint64_t{1}, __ATOMIC_RELEASE);
+  } else if (backing == "smu.message") {
+    __atomic_store_n(&s->mailbox[0], uint64_t{v}, __ATOMIC_RELAXED);
+    const uint32_t arg = static_cast<uint32_t>(__atomic_load_n(&s->mailbox[1], __ATOMIC_RELAXED));
+    uint32_t reply = arg, result = kSmuResultOk;
+    switch (v) {
+      case kSmuTestMessage: reply = arg + 1; break;
+      // A firmware version in the form the driver prints as 85.111.0; a model.
+      case kSmuGetSmuVersion: reply = 0x00556F00u; break;
+      // The interface version the driver expects (SMU13_0_6_DRIVER_IF_VERSION).
+      case kSmuGetDriverIfVersion: reply = 0x08042024u; break;
+      case kSmuGetMetricsVersion: reply = 0x11u; break;   // SMU_METRICS_TABLE_VERSION
+      default: result = kSmuResultUnknownCmd; break;
+    }
+    __atomic_store_n(&s->mailbox[1], uint64_t{reply}, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->mailbox[2], uint64_t{result}, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->mailbox[3], uint64_t{1}, __ATOMIC_RELEASE);
+  }
+}
+
 }  // namespace
 
 const char* access_name(Access a) {
@@ -251,17 +283,36 @@ const char* access_name(Access a) {
   return "?";
 }
 
-const std::vector<Register>& config_registers() {
-  static const std::vector<Register> regs = [] {
-    auto r = load(config_yaml(), "registers/pci-config.yaml");
-    if (r.size() > kMaxRegisters) throw Error::make(Err::Internal, "more than ", kMaxRegisters, " registers");
-    return r;
-  }();
-  return regs;
+const char* space_name(Space s) { return s == Space::Config ? "config" : "mmio"; }
+
+bool parse_space(const std::string& name, Space* out) {
+  if (name == "config") *out = Space::Config;
+  else if (name == "mmio") *out = Space::AmdMmio;
+  else return false;
+  return true;
 }
 
-const Register* find_config(const std::string& key) {
-  const auto& regs = config_registers();
+uint32_t space_size(Space s) { return s == Space::Config ? kConfigSize : 512u << 10; }
+
+bool has_space(const telemetry::DeviceSample& d, Space s) { return s == Space::Config || is_amd(d); }
+
+const std::vector<Register>& registers(Space space) {
+  // Each loaded on first use, so one space's database cannot stop another's.
+  const auto loaded = [](Space s) {
+    auto r = load(space_yaml(s), std::string("registers/") + database_name(s) + ".yaml", space_size(s));
+    if (r.size() > kMaxRegisters) throw Error::make(Err::Internal, "more than ", kMaxRegisters, " registers");
+    return r;
+  };
+  if (space == Space::Config) {
+    static const std::vector<Register> config = loaded(Space::Config);
+    return config;
+  }
+  static const std::vector<Register> mmio = loaded(Space::AmdMmio);
+  return mmio;
+}
+
+const Register* find(Space space, const std::string& key) {
+  const auto& regs = registers(space);
   if (key.rfind("0x", 0) == 0) {
     char* end = nullptr;
     const unsigned long off = std::strtoul(key.c_str(), &end, 16);
@@ -274,11 +325,13 @@ const Register* find_config(const std::string& key) {
   return nullptr;
 }
 
-struct ConfigSpace::Impl {
-  explicit Impl(const telemetry::DeviceSample& dev)
-      : d(dev),
-        file(state_path(dev.uuid), true, kMagic, database_version(), sizeof(State), "register state"),
+struct RegisterSpace::Impl {
+  Impl(Space sp, const telemetry::DeviceSample& dev)
+      : space(sp),
+        d(dev),
+        file(state_path(dev.uuid, sp), true, kMagic, database_version(sp), sizeof(State), "register state"),
         bars(bar_layout(dev)) {}
+  Space space;
   telemetry::DeviceSample d;
   SharedState file;
   std::array<BarLayout, 6> bars;
@@ -330,7 +383,23 @@ struct ConfigSpace::Impl {
     if (k == "link.capabilities2")
       return d.pcie_gen_max ? (((1u << d.pcie_gen_max) - 1) << 1) : 0;
     if (k == "link.control2") return d.pcie_gen_max & 0xF;
+    // Engine status: the units a busy GPU has working, and the idle state's
+    // command FIFOs available and DB and CB clean. Values are a model.
+    const bool busy = d.utilization_gpu > 0;
+    if (k == "engine.grbm_status")
+      return busy ? 0xE7D84008u   // GUI active, CP, CB, DB, PA, SC, BCI, SPI, SX, IA, TA busy
+                  : 0x00003028u;  // FIFOs available, DB and CB clean
+    if (k == "engine.grbm_status2") return busy ? 0x73018008u : 0x00000008u;
+    if (k == "engine.cp_stat") return busy ? 0x80000000u : 0u;
+    if (k == "engine.rlc_stat") return busy ? 0x00000005u : 0u;
     State* s = state();
+    if (k == "smu.message") return static_cast<uint32_t>(__atomic_load_n(&s->mailbox[0], __ATOMIC_RELAXED));
+    if (k == "smu.argument") return static_cast<uint32_t>(__atomic_load_n(&s->mailbox[1], __ATOMIC_RELAXED));
+    if (k == "smu.response")
+      // Ready after reset, as the SMU is once the driver has loaded.
+      return __atomic_load_n(&s->mailbox[3], __ATOMIC_ACQUIRE)
+                 ? static_cast<uint32_t>(__atomic_load_n(&s->mailbox[2], __ATOMIC_RELAXED))
+                 : kSmuResultOk;
     if (k == "aer.correctable" || k == "aer.uncorrectable" || k == "devsta") {
       uint32_t v = 0;
       for (uint32_t bit = 0; bit < (k == "devsta" ? 3u : 32u); ++bit) {
@@ -352,11 +421,14 @@ struct ConfigSpace::Impl {
     throw Error::make(Err::Internal, "register ", r.name, ": unknown backing '", k, "'");
   }
 
+  const std::vector<Register>& regs() const { return registers(space); }
+
   uint32_t evaluate(const Register& r, const ras::Counters& c) {
-    const size_t i = static_cast<size_t>(&r - config_registers().data());
+    const size_t i = static_cast<size_t>(&r - regs().data());
     State* s = state();
     switch (r.access) {
       case Access::Rw:
+        if (!r.backing.empty()) return backed(r, c);
         return __atomic_load_n(&s->rw_set[i], __ATOMIC_ACQUIRE)
                    ? static_cast<uint32_t>(__atomic_load_n(&s->rw_value[i], __ATOMIC_RELAXED))
                    : r.reset;
@@ -372,7 +444,7 @@ struct ConfigSpace::Impl {
   void fill(uint8_t* out, uint32_t len) {
     std::memset(out, 0, len);
     const ras::Counters c = counts();
-    for (const Register& r : config_registers()) {
+    for (const Register& r : regs()) {
       if (r.offset >= len) break;
       const uint32_t v = evaluate(r, c);
       for (uint32_t b = 0; b < r.width / 8 && r.offset + b < len; ++b)
@@ -398,49 +470,67 @@ struct ConfigSpace::Impl {
 };
 
 namespace {
-void check_access(uint32_t offset, uint32_t size) {
+void check_access(Space space, uint32_t offset, uint32_t size) {
+  if (space == Space::AmdMmio) {
+    if (size != 4 || offset % 4 || offset + size > space_size(space))
+      throw std::invalid_argument("an MMIO access is 4 bytes, aligned, inside the 512 KiB BAR");
+    return;
+  }
   if ((size != 1 && size != 2 && size != 4) || offset % size || offset + size > kConfigSize)
     throw std::invalid_argument("a configuration access is 1, 2 or 4 bytes, naturally aligned, inside "
                                 "the 4096-byte space");
 }
 }  // namespace
 
-ConfigSpace::ConfigSpace(const telemetry::DeviceSample& d) : impl_(std::make_unique<Impl>(d)) {}
-ConfigSpace::~ConfigSpace() = default;
+RegisterSpace::RegisterSpace(Space s, const telemetry::DeviceSample& d) {
+  if (!has_space(d, s))
+    throw std::invalid_argument(std::string(d.name) + " has no " + space_name(s) + " registers modelled");
+  impl_ = std::make_unique<Impl>(s, d);
+}
+RegisterSpace::~RegisterSpace() = default;
+Space RegisterSpace::space() const { return impl_->space; }
 
-uint32_t ConfigSpace::value(const Register& r) { return impl_->evaluate(r, impl_->counts()); }
+uint32_t RegisterSpace::value(const Register& r) { return impl_->evaluate(r, impl_->counts()); }
 
-uint32_t ConfigSpace::read(uint32_t offset, uint32_t size) {
-  check_access(offset, size);
-  std::array<uint8_t, kConfigSize> img;
-  impl_->fill(img.data(), kConfigSize);
+uint32_t RegisterSpace::read(uint32_t offset, uint32_t size) {
+  check_access(impl_->space, offset, size);
+  // The registers the access covers; bytes no register declares read as 0.
+  const ras::Counters c = impl_->counts();
   uint32_t v = 0;
-  for (uint32_t b = 0; b < size; ++b) v |= static_cast<uint32_t>(img[offset + b]) << (8 * b);
+  for (const Register& r : impl_->regs()) {
+    const uint32_t rbytes = r.width / 8;
+    if (r.offset + rbytes <= offset || r.offset >= offset + size) continue;
+    const uint32_t rv = impl_->evaluate(r, c);
+    for (uint32_t b = 0; b < rbytes; ++b) {
+      const uint32_t at = r.offset + b;
+      if (at >= offset && at < offset + size) v |= ((rv >> (8 * b)) & 0xFFu) << (8 * (at - offset));
+    }
+  }
   impl_->log(false, offset, size, v);
   return v;
 }
 
-std::vector<uint8_t> ConfigSpace::image_unlogged(uint32_t len) {
-  len = std::min(len, kConfigSize);
+std::vector<uint8_t> RegisterSpace::image_unlogged(uint32_t len) {
+  len = std::min(len, space_size(impl_->space));
   std::vector<uint8_t> out(len);
   impl_->fill(out.data(), len);
   return out;
 }
 
-std::vector<uint8_t> ConfigSpace::image(uint32_t len) {
-  len = std::min(len, kConfigSize);
+std::vector<uint8_t> RegisterSpace::image(uint32_t len) {
+  len = std::min(len, space_size(impl_->space));
   std::vector<uint8_t> out(len);
   impl_->fill(out.data(), len);
   impl_->log(false, 0, len, 0);
   return out;
 }
 
-void ConfigSpace::write(uint32_t offset, uint32_t size, uint32_t value) {
-  check_access(offset, size);
+void RegisterSpace::write(uint32_t offset, uint32_t size, uint32_t value) {
+  check_access(impl_->space, offset, size);
   impl_->log(true, offset, size, value);
   State* s = impl_->state();
   const ras::Counters c = impl_->counts();
-  const auto& regs = config_registers();
+  const auto& regs = impl_->regs();
   for (size_t i = 0; i < regs.size(); ++i) {
     const Register& r = regs[i];
     const uint32_t rbytes = r.width / 8;
@@ -457,6 +547,10 @@ void ConfigSpace::write(uint32_t offset, uint32_t size, uint32_t value) {
       case Access::Ro:
         break;
       case Access::Rw: {
+        if (!r.backing.empty()) {
+          smu_write(s, r.backing, (impl_->evaluate(r, c) & ~covered) | (bits & covered));
+          break;
+        }
         const uint32_t old = impl_->evaluate(r, c);
         const uint32_t mask = r.write_mask & covered;
         __atomic_store_n(&s->rw_value[i], uint64_t{(old & ~mask) | (bits & mask)}, __ATOMIC_RELAXED);
@@ -489,9 +583,10 @@ void ConfigSpace::write(uint32_t offset, uint32_t size, uint32_t value) {
   ras::publish_session(impl_->d.uuid);   // the session's config file, rewritten
 }
 
-std::vector<LogEntry> access_log(const std::string& uuid) {
+std::vector<LogEntry> access_log(const std::string& uuid, Space space) {
   std::vector<LogEntry> out;
-  SharedState file(state_path(uuid), false, kMagic, database_version(), sizeof(State), "register state");
+  SharedState file(state_path(uuid, space), false, kMagic, database_version(space), sizeof(State),
+                   "register state");
   const State* s = static_cast<const State*>(file.payload());
   if (!s) return out;
   const uint64_t head = __atomic_load_n(&s->log_seq, __ATOMIC_ACQUIRE);
@@ -516,7 +611,7 @@ std::vector<LogEntry> access_log(const std::string& uuid) {
   return out;
 }
 
-Link link(ConfigSpace& cs) {
+Link link(RegisterSpace& cs) {
   const uint32_t cap = cs.read(0x84, 4);
   const uint32_t sta = cs.read(0x8a, 2);
   Link l;
@@ -599,7 +694,7 @@ void write_sysfs_files(const telemetry::DeviceSample& d, const std::string& dir)
   replace_file(dir + "/resource", res);
 }
 
-Bar bar(ConfigSpace& cs, const telemetry::DeviceSample& d, int n) {
+Bar bar(RegisterSpace& cs, const telemetry::DeviceSample& d, int n) {
   const auto layout = bar_layout(d);
   Bar b;
   if (n < 0 || n > 5) return b;

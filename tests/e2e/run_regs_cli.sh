@@ -61,6 +61,29 @@ expect "nvidia-smi reads the link through the registers, and the log names it" \
 VGPU_SESSION="$sess" h100 fault link --gpu 1 --clear >/dev/null
 kill $serve 2>/dev/null; wait $serve 2>/dev/null
 
+# An AMD GPU's MMIO registers: engine status, and the SMU mailbox.
+mi() { VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=1 "$vgpu" "$@" 2>&1; }
+mval() { mi regs read --space mmio "$@" | head -1 | awk '{print $4}'; }
+expect "mmio lists the registers with where each offset comes from" "0x08010 grbm_status" \
+  "$(mi regs list --space mmio | awk '$4 == "grbm_status" {print $1, $4}')"
+expect "an idle GPU's GRBM_STATUS: FIFOs available, DB and CB clean" "0x00003028" "$(mval grbm_status)"
+mi regs write --space mmio smu_response 0 >/dev/null
+mi regs write --space mmio smu_argument 41 >/dev/null
+mi regs write --space mmio smu_message 0x1 >/dev/null
+expect "the SMU answers a test message with its argument plus one" "0x00000001 0x0000002a" \
+  "$(mval smu_response) $(mval smu_argument)"
+mi regs write --space mmio smu_message 0x77 >/dev/null
+expect "and refuses a message it does not know" "0x000000fe" "$(mval smu_response)"
+h100 regs read --space mmio grbm_status >/dev/null; expect "an NVIDIA GPU has no MMIO modelled yet" "2" "$?"
+mi regs read --space mmio 0x8012 >/dev/null; expect "an MMIO access is a whole aligned dword" "2" "$?"
+VGPU_QUIET=1 "$vgpu" serve --gpu amd/mi300x --count 1 --load 0.9 >/dev/null 2>&1 &
+loaded=$!
+busy=""
+for _ in $(seq 50); do busy=$(mval grbm_status); [[ "$busy" == 0x8* || "$busy" == 0xe* ]] && break; sleep 0.1; done
+kill $loaded 2>/dev/null; wait $loaded 2>/dev/null
+expect "a busy GPU's GRBM_STATUS has GUI_ACTIVE and CP busy set" "yes" \
+  "$( (( (busy >> 31) & 1 && (busy >> 29) & 1 )) && echo yes || echo no)"
+
 if command -v lspci >/dev/null; then
   h100 fault link --gpu 0 --gen 3 --width 8 >/dev/null
   h100 fault inject --gpu 0 --pcie replay >/dev/null

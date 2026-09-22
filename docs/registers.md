@@ -3,9 +3,10 @@
 A VirtualGPU device has register spaces the way a card does, each backed by a
 register database: every register is declared once, with its offset, width,
 access and what backs its value, and every tool reads the same state through
-it. The first space is **PCI configuration space**, the same layout on every
-vendor's card. MMIO behind BAR0 comes next, AMD first, since its register
-definitions are public.
+it. Two spaces so far: **PCI configuration space**, the same layout on every
+vendor's card, and an **AMD GPU's MMIO registers** behind BAR5, from the Linux
+amdgpu headers. NVIDIA's MMIO waits on a decision about where its register
+definitions may come from.
 
 ```bash
 vgpu regs list                          # the database: offset, width, access, backing
@@ -74,6 +75,43 @@ PCI Express (0x78); and in the extended space, Advanced Error Reporting at
 What is written is kept in a state file beside the reliability state, shared by
 every process on the machine: one process's write is the next one's read. A
 database that changes starts the state again.
+
+## AMD MMIO
+
+`--space mmio` reaches an AMD Instinct GPU's registers behind BAR5, as the
+driver and umr do: 32-bit accesses at byte addresses in the BAR.
+
+```bash
+vgpu regs list --space mmio
+vgpu regs read --space mmio grbm_status
+```
+
+| Register | Offset | What it does |
+| --- | --- | --- |
+| `grbm_status`, `grbm_status2` | 0x08010, 0x08008 | graphics engine status: GUI_ACTIVE and the busy units while the GPU works; FIFOs available and DB and CB clean when idle |
+| `cp_stat`, `rlc_stat` | 0x08680, 0x3b010 | the command processor's and RLC's busy bits |
+| `smu_message`, `smu_argument`, `smu_response` | 0x58a08, 0x58a48, 0x58a68 | the SMU mailbox (MP1 C2PMSG_66, _82, _90) |
+
+The mailbox works as the driver drives it: clear the response, write the
+argument, write the message, and the SMU answers -- `1` in the response
+register, and its reply in the argument register. It answers TestMessage (the
+argument plus one), GetSmuVersion, GetDriverIfVersion and GetMetricsVersion,
+and refuses any other message with `0xfe`, unknown command:
+
+```bash
+vgpu regs write --space mmio smu_response 0
+vgpu regs write --space mmio smu_argument 0
+vgpu regs write --space mmio smu_message 0x2        # GetSmuVersion
+vgpu regs read --space mmio smu_argument            # 0x00556f00: 85.111.0
+```
+
+The register offsets, bit fields and message numbers come from the amdgpu
+headers (`gc_9_4_3_*.h`, `mp_13_0_6_offset.h`, `smu_v13_0_6_ppsmc.h`; their
+MIT notice is in `registers/LICENSES/amdgpu-headers.txt`), and each entry's
+`source` names the symbol. They are offsets from an IP block's base, and MI300
+learns its bases at boot from its IP discovery table; the database uses
+Aldebaran's (MI200's), the same GFX9 family. That, the engine status values and
+the firmware version are a model until checked on a card.
 
 ## Who reads the registers
 

@@ -19,15 +19,17 @@ namespace {
 
 int usage(FILE* to) {
   std::fprintf(to,
-               "usage: vgpu regs list [--status done|model]\n"
-               "       vgpu regs read [--gpu N] REGISTER [--size 1|2|4]\n"
-               "       vgpu regs write [--gpu N] REGISTER VALUE [--size 1|2|4]\n"
-               "       vgpu regs dump [--gpu N] [--extended]\n"
-               "       vgpu regs log [--gpu N] [--last K]\n"
+               "usage: vgpu regs list [--space S] [--status done|model]\n"
+               "       vgpu regs read [--space S] [--gpu N] REGISTER [--size 1|2|4]\n"
+               "       vgpu regs write [--space S] [--gpu N] REGISTER VALUE [--size 1|2|4]\n"
+               "       vgpu regs dump [--space S] [--gpu N] [--extended]\n"
+               "       vgpu regs log [--space S] [--gpu N] [--last K]\n"
                "\n"
-               "A device's PCI configuration space, from the register database\n"
-               "(registers/pci-config.yaml): each register's offset, width, access and what\n"
-               "backs it. REGISTER is a name from `list` or an offset (0x08a); a read decodes\n"
+               "A device's registers, from the register database: each register's offset,\n"
+               "width, access and what backs it. --space is config (default), the PCI\n"
+               "configuration space (registers/pci-config.yaml), or mmio, an AMD GPU's\n"
+               "registers behind BAR5 (registers/amd-mmio.yaml): engine status and the SMU\n"
+               "mailbox. REGISTER is a name from `list` or an offset (0x08a); a read decodes\n"
                "its fields. A write follows the register's access: rw bits are kept, a 1\n"
                "written to an rw1c status bit clears it until its cause recurs, and a base\n"
                "address register reads back its size after all ones are written. Writes are\n"
@@ -63,6 +65,7 @@ void print_register(const vgpu::regs::Register& r, uint32_t v) {
   const int digits = static_cast<int>(r.width / 4);
   std::printf("0x%03x  %-28s = 0x%0*x   (%s, %s)\n", r.offset, r.name.c_str(), digits, v,
               vgpu::regs::access_name(r.access), r.status.c_str());
+  if (!r.source.empty()) std::printf("       from %s\n", r.source.c_str());
   for (const std::string& f : r.fields) {
     uint32_t hi = 0, lo = 0;
     std::string name;
@@ -75,8 +78,8 @@ void print_register(const vgpu::regs::Register& r, uint32_t v) {
 }
 
 std::string offset_key(uint32_t offset) {
-  char b[8];
-  std::snprintf(b, sizeof b, "0x%03x", offset);
+  char b[16];
+  std::snprintf(b, sizeof b, "0x%x", offset);
   return b;
 }
 
@@ -93,10 +96,11 @@ int cmd_regs(const std::vector<std::string>& args) {
   long long gpu = 0, size = 0, last = 20;
   bool extended = false;
   std::string status;
+  vgpu::regs::Space space = vgpu::regs::Space::Config;
   std::vector<std::string> pos;
   for (size_t i = 1; i < args.size(); ++i) {
     const std::string& a = args[i];
-    const bool takes = a == "--gpu" || a == "--size" || a == "--last" || a == "--status";
+    const bool takes = a == "--gpu" || a == "--size" || a == "--last" || a == "--status" || a == "--space";
     if (takes && i + 1 >= args.size()) {
       std::fprintf(stderr, "vgpu regs: %s needs a value\n", a.c_str());
       return 2;
@@ -118,6 +122,11 @@ int cmd_regs(const std::vector<std::string>& args) {
       }
     } else if (a == "--status") {
       status = args[++i];
+    } else if (a == "--space") {
+      if (!vgpu::regs::parse_space(args[++i], &space)) {
+        std::fprintf(stderr, "vgpu regs: --space is config or mmio, got '%s'\n", args[i].c_str());
+        return 2;
+      }
     } else if (a == "--extended") {
       extended = true;
     } else if (a == "-h" || a == "--help") {
@@ -138,10 +147,10 @@ int cmd_regs(const std::vector<std::string>& args) {
 
   try {
     if (verb == "list") {
-      std::printf("%-6s %-5s %-5s %-28s %-22s %s\n", "OFFSET", "WIDTH", "ACCESS", "REGISTER", "BACKING", "STATUS");
-      for (const auto& r : vgpu::regs::config_registers()) {
+      std::printf("%-7s %-5s %-6s %-28s %-22s %s\n", "OFFSET", "WIDTH", "ACCESS", "REGISTER", "BACKING", "STATUS");
+      for (const auto& r : vgpu::regs::registers(space)) {
         if (!status.empty() && r.status != status) continue;
-        std::printf("0x%03x  %-5u %-6s %-28s %-22s %s\n", r.offset, r.width, vgpu::regs::access_name(r.access),
+        std::printf("0x%05x %-5u %-6s %-28s %-22s %s\n", r.offset, r.width, vgpu::regs::access_name(r.access),
                     r.name.c_str(), r.backing.empty() ? "reset value" : r.backing.c_str(), r.status.c_str());
       }
       return 0;
@@ -154,9 +163,14 @@ int cmd_regs(const std::vector<std::string>& args) {
       return 2;
     }
     const auto& d = snap.devices[gpu];
+    if (!vgpu::regs::has_space(d, space)) {
+      std::fprintf(stderr, "vgpu regs: GPU %lld (%s) has no %s registers modelled; they are an AMD GPU's\n",
+                   gpu, d.name, vgpu::regs::space_name(space));
+      return 2;
+    }
 
     if (verb == "log") {
-      const auto log = vgpu::regs::access_log(d.uuid);
+      const auto log = vgpu::regs::access_log(d.uuid, space);
       const size_t from = log.size() > static_cast<size_t>(last) ? log.size() - static_cast<size_t>(last) : 0;
       for (size_t i = from; i < log.size(); ++i) {
         const auto& e = log[i];
@@ -165,7 +179,7 @@ int cmd_regs(const std::vector<std::string>& args) {
         localtime_r(&t, &tm);
         char when[32];
         std::strftime(when, sizeof when, "%H:%M:%S", &tm);
-        const auto* r = vgpu::regs::find_config(offset_key(e.offset));
+        const auto* r = vgpu::regs::find(space, offset_key(e.offset));
         if (e.size > 4)
           std::printf("%s.%03llu  %-16s pid %-7u read   0x%03x-0x%03x (%u bytes)\n", when,
                       static_cast<unsigned long long>(e.time_ns / 1000000 % 1000), e.process.c_str(), e.pid,
@@ -179,7 +193,12 @@ int cmd_regs(const std::vector<std::string>& args) {
       return 0;
     }
 
-    vgpu::regs::ConfigSpace cs(d);
+    vgpu::regs::RegisterSpace cs(space, d);
+    if (verb == "dump" && space == vgpu::regs::Space::AmdMmio) {
+      // Half a megabyte of mostly undeclared space: the declared registers.
+      for (const auto& r : vgpu::regs::registers(space)) print_register(r, cs.read(r.offset, 4));
+      return 0;
+    }
     if (verb == "dump") {
       const auto img = cs.image(extended ? vgpu::regs::kConfigSize : 256);
       for (size_t row = 0; row < img.size() / 16; ++row) {
@@ -190,11 +209,11 @@ int cmd_regs(const std::vector<std::string>& args) {
       return 0;
     }
 
-    const vgpu::regs::Register* r = vgpu::regs::find_config(pos[0]);
+    const vgpu::regs::Register* r = vgpu::regs::find(space, pos[0]);
     uint32_t offset = 0;
     if (r) {
       offset = r->offset;
-    } else if (!parse_u32(pos[0], &offset) || offset >= vgpu::regs::kConfigSize) {
+    } else if (!parse_u32(pos[0], &offset) || offset >= vgpu::regs::space_size(space)) {
       std::fprintf(stderr, "vgpu regs: no register '%s'; `vgpu regs list` names them\n", pos[0].c_str());
       return 2;
     }
@@ -204,7 +223,7 @@ int cmd_regs(const std::vector<std::string>& args) {
     if (r && r->width == 24 && !size) offset &= ~3u;
     if (verb == "read") {
       const uint32_t v = cs.read(offset, sz);
-      const vgpu::regs::Register* at = vgpu::regs::find_config(offset_key(offset));
+      const vgpu::regs::Register* at = vgpu::regs::find(space, offset_key(offset));
       if (r && r->width == 24) at = r;
       if (at && sz * 8 >= at->width) print_register(*at, at == r && r->width == 24 ? v >> 8 : v);
       else std::printf("0x%03x = 0x%0*x\n", offset, static_cast<int>(sz * 2), v);
