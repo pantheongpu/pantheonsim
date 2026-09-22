@@ -333,9 +333,26 @@ MI-series card.
 totals) and `-k` (ECC counts per RAS block, device memory as UMC and the
 on-chip memories as GFX), and `ras --cper`, which lists recent ECC errors as
 CPER records in amd-smi's text table -- a table even under `--json`, as the
-real tool prints it. Other metrics, `--csv` and CPER record files (`--folder`)
+real tool prints it. Other metrics, `--csv`, `ras --follow` and `ras --afid`
 are refused as not modelled. JSON output is amd-smi's: a list with one object
 per GPU, keyed by `gpu`, indented by four.
+
+`ras --cper --folder DIR` writes the records themselves, as amd-smi dumps
+amdgpu's CPER ring: `corrected-1.cper`, `uncorrected-2.cper` and so on,
+numbered across GPUs, each with its header beside it as `.json`, and the table
+names each file and the AFID decoded from it. `--file-limit N` keeps the
+newest N. Each record is what amdgpu writes for a RAS error (amdgpu_cper.c,
+the layout of amd_cper.h): a UEFI CPER header -- CMC for a corrected error,
+MCE for an uncorrected one, `platform_id` the PCI IDs, `record_id` the OAM
+socket and a count -- one section descriptor, and one AMD non-standard error
+section carrying the UMC bank's ACA registers. An uncorrectable error in
+device memory is recorded as non-fatal with the latent-error flag, as amdgpu
+records poison. The ACA values are AMD's own example of an HBM error (amdsmi's
+ras-decode); AMD's decoder, run on the files written here, reads them as bank
+umc, On-die ECC, AFID 24 corrected and 22 uncorrected, which is what the table
+prints. Not modelled: the ring in debugfs (`/sys/kernel/debug/dri/N/
+amdgpu_ring_cper`, which the real amd-smi reads as root), fatal and boot
+records, and the bad-page-threshold record.
 
 Outside a session both tools describe `VGPU_GPU`; with no AMD GPU configured,
 `rocm_agent_enumerator` lists only `gfx000` and says on stderr how to pick one. Launching a kernel on one fails with a clear
