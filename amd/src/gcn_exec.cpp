@@ -202,6 +202,9 @@ struct Machine {
       write_scalar(w, in.dst[0], a);
     } else if (op == "s_movk_i32") {
       write_scalar(w, in.dst[0], static_cast<uint64_t>(static_cast<int64_t>(in.simm)));
+    } else if (op == "s_mulk_i32") {
+      // The destination is also a source: it is multiplied in place.
+      write_scalar(w, in.dst[0], static_cast<uint32_t>(scalar(w, in.dst[0]) * static_cast<uint32_t>(in.simm)));
     } else if (op == "s_add_u32") {
       const uint64_t sum = static_cast<uint32_t>(a) + static_cast<uint64_t>(static_cast<uint32_t>(b));
       write_scalar(w, in.dst[0], static_cast<uint32_t>(sum));
@@ -226,6 +229,8 @@ struct Machine {
       const uint32_t v = static_cast<uint32_t>(a) ^ static_cast<uint32_t>(b);
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
+    } else if (op == "s_mul_i32") {
+      write_scalar(w, in.dst[0], static_cast<uint32_t>(a) * static_cast<uint32_t>(b));
     } else if (op == "s_ashr_i32") {
       const uint32_t v = static_cast<uint32_t>(static_cast<int32_t>(a) >> (b & 31));
       write_scalar(w, in.dst[0], v);
@@ -825,6 +830,75 @@ struct Machine {
 
 }  // namespace
 
+namespace {
+
+// What the runtime tells a kernel about the grid it is part of, written into
+// the kernarg segment after the kernel's own arguments. The names and offsets
+// are the code object's own (its metadata lists them); the values are this
+// dispatch's.
+void fill_hidden_arguments(const Dispatch& d, const Kernel& k, MemoryManager& mem) {
+  const uint64_t threads_x = uint64_t{d.groups[0]} * d.group_size[0];
+  const uint64_t threads_y = uint64_t{d.groups[1]} * d.group_size[1];
+  const uint64_t threads_z = uint64_t{d.groups[2]} * d.group_size[2];
+  const uint32_t dims = d.groups[2] > 1 || d.group_size[2] > 1   ? 3
+                        : d.groups[1] > 1 || d.group_size[1] > 1 ? 2
+                                                                 : 1;
+  for (const KernelArg& a : k.args) {
+    if (!a.hidden()) continue;
+    uint64_t value = 0;
+    const std::string& kind = a.kind;
+    if (kind == "hidden_block_count_x") value = d.groups[0];
+    else if (kind == "hidden_block_count_y") value = d.groups[1];
+    else if (kind == "hidden_block_count_z") value = d.groups[2];
+    else if (kind == "hidden_group_size_x") value = d.group_size[0];
+    else if (kind == "hidden_group_size_y") value = d.group_size[1];
+    else if (kind == "hidden_group_size_z") value = d.group_size[2];
+    else if (kind == "hidden_grid_size_x") value = threads_x;
+    else if (kind == "hidden_grid_size_y") value = threads_y;
+    else if (kind == "hidden_grid_size_z") value = threads_z;
+    else if (kind == "hidden_grid_dims") value = dims;
+    else if (kind == "hidden_shared_base") value = kSharedBase;
+    // Everything else -- the remainders of a grid that divides evenly, the
+    // global offsets, the buffers a hostcall or a printf would use -- is
+    // zero, and a kernel that needs one of those will say so by failing on a
+    // null pointer rather than reading something made up.
+    else continue;
+    if (a.offset + a.size > k.kernarg_size) continue;
+    for (uint32_t b = 0; b < a.size && b < 8; ++b)
+      mem.store_scalar(d.kernarg + a.offset + b, 1, (value >> (8 * b)) & 0xFF);
+  }
+}
+
+// The packet the hardware is given for a dispatch, which a kernel may read
+// instead of its implicit arguments (the HSA kernel dispatch packet: its
+// sizes, its segments, and where its arguments are).
+uint64_t write_dispatch_packet(const Dispatch& d, const Kernel& k, MemoryManager& mem) {
+  const uint32_t dims = d.groups[2] > 1 || d.group_size[2] > 1   ? 3
+                        : d.groups[1] > 1 || d.group_size[1] > 1 ? 2
+                                                                 : 1;
+  std::vector<uint8_t> packet(64, 0);
+  const auto put16 = [&](uint32_t at, uint16_t v) { std::memcpy(&packet[at], &v, 2); };
+  const auto put32 = [&](uint32_t at, uint32_t v) { std::memcpy(&packet[at], &v, 4); };
+  const auto put64 = [&](uint32_t at, uint64_t v) { std::memcpy(&packet[at], &v, 8); };
+  put16(0, 2 << 0);                       // header: a kernel dispatch packet
+  put16(2, static_cast<uint16_t>(dims));  // setup: how many dimensions the grid has
+  put16(4, static_cast<uint16_t>(d.group_size[0]));
+  put16(6, static_cast<uint16_t>(d.group_size[1]));
+  put16(8, static_cast<uint16_t>(d.group_size[2]));
+  put32(12, static_cast<uint32_t>(uint64_t{d.groups[0]} * d.group_size[0]));
+  put32(16, static_cast<uint32_t>(uint64_t{d.groups[1]} * d.group_size[1]));
+  put32(20, static_cast<uint32_t>(uint64_t{d.groups[2]} * d.group_size[2]));
+  put32(24, k.private_segment);
+  put32(28, k.group_segment);
+  put64(32, k.entry);
+  put64(40, d.kernarg);
+  const uint64_t where = mem.alloc(packet.size());
+  mem.write(where, packet.data(), packet.size());
+  return where;
+}
+
+}  // namespace
+
 DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   if (!d.object || !d.kernel) throw Error::make(Err::InvalidValue, "a dispatch needs a kernel");
   const Kernel& k = *d.kernel;
@@ -835,6 +909,12 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   if (k.max_flat_workgroup_size && threads > k.max_flat_workgroup_size)
     throw Error::make(Err::InvalidValue, "a work-group of ", threads, " work-items is past the ",
                       k.max_flat_workgroup_size, " this kernel allows");
+
+  // What the kernel is told about its grid, and the packet it may read it
+  // from. Both are written before any wave starts.
+  if (d.kernarg) fill_hidden_arguments(d, k, mem);
+  uint64_t packet = 0;
+  if (k.dispatch_ptr) packet = write_dispatch_packet(d, k, mem);
 
   Machine m{d, mem, {}};
   const uint32_t waves_per_group = static_cast<uint32_t>((threads + kLanes - 1) / kLanes);
@@ -862,7 +942,10 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
           // group has those dimensions).
           uint32_t at = 0;
           if (k.private_segment_buffer) at += 4;
-          if (k.dispatch_ptr) at += 2;
+          if (k.dispatch_ptr) {
+            m.set_sgpr64(w, at, packet);
+            at += 2;
+          }
           if (k.queue_ptr) at += 2;
           if (k.kernarg_segment_ptr) {
             m.set_sgpr64(w, at, d.kernarg);
@@ -915,6 +998,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
           }
         }
       }
+  if (packet) mem.free(packet);
   return m.stats;
 }
 
