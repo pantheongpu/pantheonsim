@@ -45,6 +45,20 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   their high-water marks are what a pool reports, and a mark resets by writing
   zero to it. e2e_mempool checks reuse (the same pointer comes back), the
   statistics, trimming, an explicit pool, and the refusals.
+- Device memory shared between processes (cudaIpcGetMemHandle,
+  cudaIpcOpenMemHandle, cudaIpcCloseMemHandle and the event handles): an
+  exported allocation moves into a file of its own in the machine directory,
+  mapped MAP_SHARED and still at the same device address, and the importing
+  process maps the same file at an address of its own. Both then read and write
+  the same bytes, kernels included -- which is what vLLM shares a KV cache
+  through and what NCCL uses for peer buffers on one host. A process cannot
+  import its own export, as CUDA documents. An event another process recorded is
+  complete by the time its handle can be read, since every operation here
+  finishes before its call returns, so a cross-process wait on it is satisfied
+  rather than skipped. e2e_ipc runs two processes against one simulated machine:
+  the importer sees what the exporter's kernel wrote, writes back, and the
+  exporter sees that. Exporting to another *machine* is still refused; there is
+  no fabric here.
 - Managed-memory hints: cudaMemAdvise records what it is told -- read-mostly, a
   preferred location, which devices access a range -- and
   cudaMemRangeGetAttribute(s) reports it, answering with a value only where

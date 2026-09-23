@@ -2,6 +2,9 @@
 
 #include <atomic>
 #include <cstring>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "vgpu/error.hpp"
 
@@ -92,6 +95,17 @@ uint64_t MemoryManager::alloc(uint64_t size) {
 }
 
 void MemoryManager::free(uint64_t ptr) {
+  // An allocation that was exported for another process lives in a file now,
+  // not in chunks. Freeing it takes the mapping and the file with it, which is
+  // what the exporting process owns.
+  if (const auto sh = shared_.find(ptr); sh != shared_.end() && sh->second.owner) {
+    used_ -= sh->second.size;
+    freed_[ptr] = FreedRecord{sh->second.size, freed_seq_};
+    freed_order_[freed_seq_++] = ptr;
+    drop_shared(sh);
+    notify_usage();
+    return;
+  }
   auto it = live_.find(ptr);
   if (it != live_.end()) {
     used_ -= it->second.size;
@@ -391,6 +405,15 @@ void MemoryManager::free_all() {
   reserved_.clear();
   for (auto& [id, h] : handles_) used_ -= h.size;
   handles_.clear();
+
+  // Exported allocations first: they are not in live_, and a reset takes them.
+  while (true) {
+    auto it = std::find_if(shared_.begin(), shared_.end(),
+                           [](const auto& kv) { return kv.second.owner; });
+    if (it == shared_.end()) break;
+    used_ -= it->second.size;
+    drop_shared(it);
+  }
   std::vector<uint64_t> bases;
   bases.reserve(live_.size());
   for (const auto& [base, a] : live_) bases.push_back(base);
@@ -583,6 +606,80 @@ bool MemoryManager::access_at(uint64_t va, bool* readable, bool* writable) const
   if (readable) *readable = prev->second.readable;
   if (writable) *writable = prev->second.writable;
   return true;
+}
+
+// ---- memory another process can map -------------------------------------------
+
+uint64_t MemoryManager::share(uint64_t ptr, const std::string& path) {
+  if (const auto it = shared_.find(ptr); it != shared_.end()) return it->second.size;
+  const auto live = live_.find(ptr);
+  if (live == live_.end())
+    throw Error::make(Err::InvalidPointer, "sharing device pointer ", Hex{ptr},
+                      " that is not the base of a live allocation");
+  const uint64_t size = live->second.size;
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+  if (fd < 0)
+    throw Error::make(Err::Internal, "sharing device memory: could not create ", path, ": ",
+                      std::strerror(errno));
+  // Sparse: the file is as large as the allocation, and costs only the pages
+  // that are written -- the same property the sparse chunks have.
+  void* host = nullptr;
+  if (::ftruncate(fd, static_cast<off_t>(size)) == 0) {
+    host = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (host == MAP_FAILED) host = nullptr;
+  }
+  const int err = errno;
+  ::close(fd);
+  if (!host) {
+    ::unlink(path.c_str());
+    throw Error::make(Err::Internal, "sharing device memory: could not map ", path, ": ",
+                      std::strerror(err));
+  }
+  // Move what is there now, then let the allocation's chunks go: from here on
+  // the file is the memory, at the same device address.
+  read_chunks(live->second, 0, static_cast<uint8_t*>(host), size);
+  live_.erase(live);
+  map_host(ptr, host, size);
+  shared_[ptr] = SharedRegion{ptr, size, host, path, /*owner=*/true};
+  return size;
+}
+
+bool MemoryManager::is_shared(uint64_t ptr) const { return shared_.count(ptr) != 0; }
+
+uint64_t MemoryManager::adopt(const std::string& path, uint64_t size) {
+  const int fd = ::open(path.c_str(), O_RDWR);
+  if (fd < 0)
+    throw Error::make(Err::InvalidValue, "opening shared device memory ", path, ": ",
+                      std::strerror(errno));
+  void* host = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  const int err = errno;
+  ::close(fd);
+  if (host == MAP_FAILED)
+    throw Error::make(Err::Internal, "mapping shared device memory ", path, ": ",
+                      std::strerror(err));
+  // An address of this device's own, never reused, so the imported buffer can
+  // never be confused with a local allocation -- present or freed.
+  const uint64_t va = next_va_;
+  next_va_ += (size + kAllocAlign - 1) / kAllocAlign * kAllocAlign;
+  high_water_va_ = next_va_;
+  map_host(va, host, size);
+  shared_[va] = SharedRegion{va, size, host, path, /*owner=*/false};
+  return va;
+}
+
+void MemoryManager::abandon(uint64_t va) {
+  const auto it = shared_.find(va);
+  if (it == shared_.end() || it->second.owner)
+    throw Error::make(Err::InvalidPointer, "closing shared device memory at ", Hex{va},
+                      ": this process did not map it from another");
+  drop_shared(it);
+}
+
+void MemoryManager::drop_shared(std::map<uint64_t, SharedRegion>::iterator it) {
+  unmap_host(it->second.va);
+  ::munmap(it->second.host, it->second.size);
+  if (it->second.owner) ::unlink(it->second.path.c_str());
+  shared_.erase(it);
 }
 
 bool MemoryManager::is_host_mapped(uint64_t addr) const {

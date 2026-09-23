@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 #include <functional>
 #include <map>
 #include <memory>
@@ -215,6 +216,31 @@ class MemoryManager {
   size_t mappings() const { return maps_.size(); }
   size_t handles() const { return handles_.size(); }
 
+  // ---- memory another process can map (IPC) ----
+  //
+  // Device memory here is this process's own sparse chunks, which is why a
+  // handle to it used to be refused: a pointer means nothing in another
+  // process. What can be shared is a file, and the backing store already maps
+  // its spill slices MAP_SHARED -- so an allocation that is exported is moved
+  // into a file of its own, mapped shared, and put back at the same device
+  // address. Its bytes then live somewhere another process can map them, and
+  // every read, write and kernel access reaches them through the same path
+  // managed memory uses.
+  //
+  // `share` moves the allocation at `ptr` into `path` and keeps the address
+  // working. Returns the number of bytes now shared. Called once per
+  // allocation; a second call returns the same size and changes nothing.
+  uint64_t share(uint64_t ptr, const std::string& path);
+  // Whether `ptr` is the base of an allocation this process has exported.
+  bool is_shared(uint64_t ptr) const;
+  // Maps `path` (`size` bytes, already shared by another process) at a device
+  // address of this device's own, and returns it. The bytes are not copied:
+  // both processes see the same memory.
+  uint64_t adopt(const std::string& path, uint64_t size);
+  // Gives up a mapping `adopt` returned. The file stays; the process that
+  // exported it owns it.
+  void abandon(uint64_t va);
+
   // ---- managed memory ----
   //
   // One buffer both the host and a kernel can address, which is what
@@ -367,6 +393,20 @@ class MemoryManager {
   uint64_t next_handle_ = 1;
   // Drops a handle when its last reference and last mapping are gone.
   void collect_handle(uint64_t handle);
+
+  // An allocation moved into a file for another process to map, or a mapping of
+  // one this process did not export. Both are host mappings as far as reads and
+  // writes are concerned; this is what free and close need to undo them.
+  struct SharedRegion {
+    uint64_t va = 0;
+    uint64_t size = 0;
+    void* host = nullptr;    // the MAP_SHARED mapping
+    std::string path;
+    bool owner = false;      // this process exported it, so it unlinks the file
+  };
+  std::map<uint64_t, SharedRegion> shared_;
+  // Unmaps a shared region and forgets it; unlinks the file if we own it.
+  void drop_shared(std::map<uint64_t, SharedRegion>::iterator it);
 
   // Managed buffers: real host memory the device can also address. Rare and
   // written only at allocation, so a flag keeps the read path free for the

@@ -403,7 +403,7 @@ int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
     case 120: return 0;                              // CLUSTER_LAUNCH (no thread-block clusters)
     case 121: return 0;                              // DEFERRED_MAPPING_CUDA_ARRAY_SUPPORTED
     case 124: return 0;                              // DMA_BUF_SUPPORTED
-    case 125: return 0;                              // IPC_EVENT_SUPPORTED (see cuIpc* above)
+    case 125: return 1;                              // IPC_EVENT_SUPPORTED (cuIpc* above)
     case 128: return 0;                              // TENSOR_MAP_ACCESS_SUPPORTED
     case 129: return 0;                              // UNIFIED_FUNCTION_POINTERS
     case 130: return 0;                              // NUMA_CONFIG (not NUMA-attached)
@@ -2055,30 +2055,131 @@ const void* dark_table_for(const unsigned char* uuid) {
 }  // namespace
 
 /* ---- interprocess memory ----
-   Device memory here is a per-process virtual address space with per-process
-   backing, so a handle from one process names nothing in another. Saying so is
-   the honest answer, and the runtime API's cudaIpc* family says the same.
+   The same sharing the runtime API offers, through the same handles: an
+   exported allocation is moved into a file in the machine directory, mapped
+   MAP_SHARED and left at the same device address, and another process maps that
+   file at an address of its own (vgpu/memory.hpp, nvidia/src/runtime_api.cpp).
+   A handle from either API opens in either, as on a real driver.
 
-   They have to exist even so: a caller that looks the symbols up at startup --
-   Numba resolves cuIpcOpenMemHandle before it will report a device at all --
-   fails on the lookup rather than on the call, which reads as "no CUDA here"
-   instead of "no interprocess sharing here". */
+   They also have to exist at all: a caller that looks the symbols up at startup
+   -- Numba resolves cuIpcOpenMemHandle before it will report a device -- fails
+   on the lookup rather than on the call, which reads as "no CUDA here". */
 
-VGPU_EXPORT CUresult cuIpcGetMemHandle(CUipcMemHandle*, CUdeviceptr) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+namespace {
+
+constexpr uint32_t kIpcMagic = 0x43504956;   // "VIPC", as the runtime writes it
+constexpr uint32_t kIpcVersion = 1;
+
+struct IpcMemPayload {
+  uint32_t magic;
+  uint32_t version;
+  uint64_t size;
+  uint32_t device;
+  uint32_t pid;
+  char id[40];
+};
+static_assert(sizeof(IpcMemPayload) == 64, "an IPC handle is 64 bytes");
+
+std::string ipc_path(const char* id) { return vgpu::telemetry::default_path() + "/ipc-" + id; }
+
+std::mutex g_ipc_mu;
+std::map<CUdeviceptr, int> g_ipc_open;   // imported pointer -> device
+
+}  // namespace
+
+VGPU_EXPORT CUresult cuIpcGetMemHandle(CUipcMemHandle* handle, CUdeviceptr ptr) {
+  return api("cuIpcGetMemHandle", true, false, [&](ShimState& s) -> CUresult {
+    if (!handle || !ptr) return CUDA_ERROR_INVALID_VALUE;
+    int device = -1;
+    for (int d = 0; d < s.rt->device_count(); ++d)
+      if (s.rt->device(d).memory().owns(ptr)) device = d;
+    if (device < 0) return CUDA_ERROR_INVALID_VALUE;
+    static std::atomic<uint32_t> counter{0};
+    char id[40] = {0};
+    std::snprintf(id, sizeof id, "%x-d%x", static_cast<unsigned>(::getpid()),
+                  counter.fetch_add(1) + 1);
+    IpcMemPayload p{};
+    p.magic = kIpcMagic;
+    p.version = kIpcVersion;
+    p.device = static_cast<uint32_t>(device);
+    p.pid = static_cast<uint32_t>(::getpid());
+    std::memcpy(p.id, id, sizeof p.id);
+    p.size = s.rt->device(device).memory().share(ptr, ipc_path(id));
+    std::memcpy(handle, &p, sizeof p);
+    return CUDA_SUCCESS;
+  });
 }
-VGPU_EXPORT CUresult cuIpcOpenMemHandle(CUdeviceptr*, CUipcMemHandle, unsigned int) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+
+VGPU_EXPORT CUresult cuIpcOpenMemHandle_v2(CUdeviceptr* ptr, CUipcMemHandle handle,
+                                           unsigned int flags) {
+  return api("cuIpcOpenMemHandle", true, false, [&](ShimState& s) -> CUresult {
+    if (!ptr) return CUDA_ERROR_INVALID_VALUE;
+    // CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS is the only flag, and it is required.
+    if (flags != 1) return CUDA_ERROR_INVALID_VALUE;
+    IpcMemPayload p{};
+    std::memcpy(&p, &handle, sizeof p);
+    if (p.magic != kIpcMagic || p.version != kIpcVersion || !p.size)
+      return CUDA_ERROR_INVALID_VALUE;
+    if (p.pid == static_cast<uint32_t>(::getpid())) return CUDA_ERROR_INVALID_VALUE;
+    char id[sizeof p.id + 1] = {0};
+    std::memcpy(id, p.id, sizeof p.id);
+    const int device = p.device < static_cast<uint32_t>(s.rt->device_count())
+                           ? static_cast<int>(p.device) : 0;
+    *ptr = s.rt->device(device).memory().adopt(ipc_path(id), p.size);
+    std::lock_guard<std::mutex> lock(g_ipc_mu);
+    g_ipc_open[*ptr] = device;
+    return CUDA_SUCCESS;
+  });
 }
-VGPU_EXPORT CUresult cuIpcOpenMemHandle_v2(CUdeviceptr*, CUipcMemHandle, unsigned int) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+
+VGPU_EXPORT CUresult cuIpcOpenMemHandle(CUdeviceptr* ptr, CUipcMemHandle handle,
+                                        unsigned int flags) {
+  return cuIpcOpenMemHandle_v2(ptr, handle, flags);
 }
-VGPU_EXPORT CUresult cuIpcCloseMemHandle(CUdeviceptr) { return CUDA_ERROR_NOT_SUPPORTED; }
-VGPU_EXPORT CUresult cuIpcGetEventHandle(CUipcEventHandle*, CUevent) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+
+VGPU_EXPORT CUresult cuIpcCloseMemHandle(CUdeviceptr ptr) {
+  return api("cuIpcCloseMemHandle", true, false, [&](ShimState& s) -> CUresult {
+    int device = -1;
+    {
+      std::lock_guard<std::mutex> lock(g_ipc_mu);
+      auto it = g_ipc_open.find(ptr);
+      if (it == g_ipc_open.end()) return CUDA_ERROR_INVALID_VALUE;
+      device = it->second;
+      g_ipc_open.erase(it);
+    }
+    s.rt->device(device).memory().abandon(ptr);
+    return CUDA_SUCCESS;
+  });
 }
-VGPU_EXPORT CUresult cuIpcOpenEventHandle(CUevent*, CUipcEventHandle) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+
+// An event handle carries its origin and nothing else: every operation here
+// finishes before the call that started it returns, so an event whose handle
+// another process can read is already complete.
+VGPU_EXPORT CUresult cuIpcGetEventHandle(CUipcEventHandle* handle, CUevent ev) {
+  return api("cuIpcGetEventHandle", true, false, [&](ShimState& s) -> CUresult {
+    if (!handle) return CUDA_ERROR_INVALID_VALUE;
+    if (!s.events.count(reinterpret_cast<uintptr_t>(ev))) return CUDA_ERROR_INVALID_VALUE;
+    IpcMemPayload p{};
+    p.magic = kIpcMagic;
+    p.version = kIpcVersion;
+    p.pid = static_cast<uint32_t>(::getpid());
+    std::memcpy(handle, &p, sizeof p);
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuIpcOpenEventHandle(CUevent* ev, CUipcEventHandle handle) {
+  return api("cuIpcOpenEventHandle", true, false, [&](ShimState& s) -> CUresult {
+    if (!ev) return CUDA_ERROR_INVALID_VALUE;
+    IpcMemPayload p{};
+    std::memcpy(&p, &handle, sizeof p);
+    if (p.magic != kIpcMagic || p.version != kIpcVersion) return CUDA_ERROR_INVALID_VALUE;
+    if (p.pid == static_cast<uint32_t>(::getpid())) return CUDA_ERROR_INVALID_VALUE;
+    const uintptr_t h = make_handle(s, kTagEvent);
+    s.events[h] = {};
+    *ev = reinterpret_cast<CUevent>(h);
+    return CUDA_SUCCESS;
+  });
 }
 
 VGPU_EXPORT CUresult cuGetExportTable(const void** table, const void* uuid) {

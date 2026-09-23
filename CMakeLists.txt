@@ -912,6 +912,17 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# Device memory shared between two processes (CUDA IPC). Two processes on
+# purpose: a handle that only worked inside one process would pass a
+# single-process test and be useless for what the API is for.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_ipc COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ipc.sh)
+  set_tests_properties(e2e_ipc PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # The `vgpu run` wrapper, and the two pre-flight checks that are the reason it
 # exists: a CUDA soname the shim does not carry, and a DT_RPATH that outranks
 # LD_LIBRARY_PATH. Both are silent failures without it.
