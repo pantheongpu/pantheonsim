@@ -269,6 +269,11 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     out.target = t->s;
     out.isa = out.target.substr(out.target.rfind('-') + 1);
   }
+  if (const Msgpack* v = metadata.at("amdhsa.version");
+      v && v->kind == Msgpack::Kind::Array && v->list.size() >= 2) {
+    out.abi_major = static_cast<uint32_t>(v->list[0].i);
+    out.abi_minor = static_cast<uint32_t>(v->list[1].i);
+  }
 
   for (const Msgpack& k : kernels->list) {
     if (k.kind != Msgpack::Kind::Map) continue;

@@ -54,6 +54,11 @@ struct Kernel {
 struct CodeObject {
   std::string target;                     // "amdgcn-amd-amdhsa--gfx942", where the note gives it
   std::string isa;                        // "gfx942"
+  // The code object ABI the metadata declares. It says where a work-item
+  // finds its id: from version 5 (1.2) the three are packed into v0, and
+  // before it each has a register of its own.
+  uint32_t abi_major = 1, abi_minor = 0;
+  bool packed_work_item_id() const { return abi_major > 1 || abi_minor >= 2; }
   std::vector<uint8_t> text;              // the .text section
   uint64_t text_addr = 0;                 // its address, which kernel entries are relative to
   std::vector<Kernel> kernels;

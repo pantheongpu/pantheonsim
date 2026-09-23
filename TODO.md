@@ -538,9 +538,13 @@ what is done.
   and a reduction through LDS -- give the answers their C would. amd/src/hip_api.cpp
   is libamdhip64 over that: a HIP program written against the documented API
   (amd/include/vgpu_hip.h) gets devices, memory and the module API, and its
-  kernel runs. Still missing: the fatbin path hipcc compiles
-  (__hipRegisterFatBinary, hipLaunchKernel), streams that are more than
-  handles, and every instruction outside what the fixture's kernels use.
+  kernel runs. The instruction set covers what clang emits for the fixtures --
+  integer and float math including division, conversions, comparisons, LDS,
+  global loads and stores, an atomic add, loops and both kinds of branch --
+  each checked against the assembler's output and against what the C means.
+  Still missing: the fatbin path hipcc compiles (__hipRegisterFatBinary,
+  hipLaunchKernel), streams that are more than handles, and every instruction
+  outside what those kernels use, which is refused by name.
 - Tooling: trace record/replay, conformance DB + compat scores. (`vgpu run`,
   `vgpu test --matrix`, shared-memory race detection, the random and
   adversarial schedulers, and fault injection are done.)
