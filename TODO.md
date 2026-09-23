@@ -528,9 +528,13 @@ what is done.
   ISA. AMD *discovery* exists: `amd/tools/rocminfo-to-profile.py` reads a real
   MI325X and `amd/profiles/mi325x.yaml` is verified against one. The warp width
   is no longer the blocker: the interpreter is warp-width parametric, masks are
-  64-bit, and a 64-lane profile launches and executes. What is missing now is
-  the front-end -- HIP compiles to a GCN code object, not to PTX, so there is
-  nothing yet to feed a 64-lane wavefront.
+  64-bit, and a 64-lane profile launches and executes. The front-end has
+  started: amd/src/codeobject.cpp reads the code object a HIP program hands
+  the driver (kernels, kernarg layout, LDS, registers) and amd/src/gcn_decode.cpp
+  decodes its CDNA instructions, checked against the assembler's own output on
+  a freshly built object. Still missing: the wavefront -- scalar registers and
+  the EXEC mask, which the PTX interpreter has no model for -- and the HIP
+  runtime above it.
 - Tooling: trace record/replay, conformance DB + compat scores. (`vgpu run`,
   `vgpu test --matrix`, shared-memory race detection, the random and
   adversarial schedulers, and fault injection are done.)

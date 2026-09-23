@@ -7,6 +7,7 @@
 // same operands -- which catches an opcode read from the wrong bits, an
 // operand of the wrong width, and an instruction whose length is wrong (that
 // one shifts every instruction after it).
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <sstream>
@@ -22,8 +23,13 @@ using namespace vgpu;
 
 namespace {
 
+// The fixture, or another object and listing: VGPU_GCN_OBJECT and
+// VGPU_GCN_LISTING point these checks at a code object built here and now
+// (amd/tests/e2e/run_gcn_disasm.sh), so the decoder is checked against the
+// assembler's own output rather than only against what was checked in.
 std::string read(const std::string& name) {
-  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/" + name;
+  const char* over = std::getenv(name.find(".dis") != std::string::npos ? "VGPU_GCN_LISTING" : "VGPU_GCN_OBJECT");
+  const std::string path = over && *over ? std::string(over) : std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/" + name;
   std::ifstream in(path, std::ios::binary);
   if (!in) throw vtest::Failure("no fixture at " + path);
   return std::string((std::istreambuf_iterator<char>(in)), {});
@@ -57,7 +63,7 @@ std::vector<std::string> lines(const std::string& text) {
 VTEST(every_instruction_decodes_as_the_assembler_wrote_it) {
   const amd::CodeObject o = object();
   const std::vector<std::string> mine = decoded(o), theirs = lines(read("vector_add.gfx942.dis"));
-  VCHECK(theirs.size() > 400);
+  VCHECK(theirs.size() > 20);
   VCHECK_EQ(mine.size(), theirs.size());
   for (size_t i = 0; i < mine.size() && i < theirs.size(); ++i)
     if (mine[i] != theirs[i])

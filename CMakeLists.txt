@@ -601,6 +601,10 @@ set_tests_properties(smi_queries PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_
 add_test(NAME fault_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_fault_cli.sh)
 set_tests_properties(fault_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
+# The GCN decoder against the real assembler, on a code object built here and now.
+add_test(NAME amd_gcn_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_gcn_disasm.sh)
+set_tests_properties(amd_gcn_disasm PROPERTIES DEPENDS test_amd_gcn
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 # An AMD GPU lost as amdgpu loses one: the kernel log, rocm-smi and amd-smi, its registers.
 add_test(NAME amd_lost_gpu COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_lost_gpu.sh)
 set_tests_properties(amd_lost_gpu PROPERTIES DEPENDS vgpu_cli
