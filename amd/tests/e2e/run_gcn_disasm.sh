@@ -29,8 +29,10 @@ expect() {  # expect <name> <expected> <actual>
     echo "FAIL  $1"; echo "      expected: $2"; echo "      actual:   $3"; fail=1; fi
 }
 
-cp "$root/amd/tests/data/vector_add.c" "$tmp/"
-( cd "$tmp" && "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx942 -nogpulib -O2 -c vector_add.c -o fresh.o ) \
+# The kernels with the wider instruction mix, so a clang that emits something
+# new for them fails here rather than in a kernel's results.
+cp "$root/amd/tests/data/vector_add.c" "$root/amd/tests/data/ops.c" "$tmp/"
+( cd "$tmp" && "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx942 -nogpulib -O2 -c ops.c -o fresh.o ) \
   2>"$tmp/clang.err"
 if [[ ! -s "$tmp/fresh.o" ]]; then
   echo "SKIP: this clang could not build for gfx942: $(head -2 "$tmp/clang.err")"; exit 0
@@ -51,8 +53,10 @@ expect "and the rest of the decoder's checks hold on it" "0" \
 # The version that is checked in has to stay the version the tests read: a
 # code object whose listing was regenerated without the object, or the other
 # way round, would pass here and fail for everyone else.
-committed=$("$objdump" -d --mcpu=gfx942 "$root/amd/tests/data/vector_add.gfx942.o" |
-  sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g')
-expect "the checked-in object and listing are of the same build" "" \
-  "$(diff <(echo "$committed") "$root/amd/tests/data/vector_add.gfx942.dis" | head -5)"
+for name in vector_add ops; do
+  committed=$("$objdump" -d --mcpu=gfx942 "$root/amd/tests/data/$name.gfx942.o" |
+    sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g')
+  expect "the checked-in $name object and listing are of the same build" "" \
+    "$(diff <(echo "$committed") "$root/amd/tests/data/$name.gfx942.dis" | head -5)"
+done
 exit $fail

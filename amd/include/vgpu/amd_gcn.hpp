@@ -24,12 +24,14 @@ const char* enc_name(Enc e);
 
 // Where an operand lives. The ISA numbers scalar registers, vector registers
 // and the inline constants in one 9-bit space; this splits them apart.
-enum class OperandKind { Sgpr, Vgpr, Vcc, Exec, M0, Inline, Literal, None };
+enum class OperandKind { Sgpr, Vgpr, Vcc, Exec, ExecLo, ExecHi, M0, Inline, InlineFloat, Literal, None };
 struct Operand {
   OperandKind kind = OperandKind::None;
   uint32_t index = 0;    // the register's number
   int64_t value = 0;     // an inline constant's or a literal's value
+  double fvalue = 0;     // an inline float constant's value (0.5, 1.0, 2.0, 4.0 and their negatives)
   uint32_t width = 1;    // how many 32-bit registers it covers
+  bool neg = false;      // VOP3: the source is negated
 };
 std::string operand_text(const Operand& o);
 
@@ -50,6 +52,10 @@ struct Inst {
   // immediate gives it.
   int32_t simm = 0;
   uint64_t target = 0;
+  // A memory instruction's scope bits (global_atomic_*'s sc0/sc1/nt), which
+  // say how far a write is published. Every access here is already visible to
+  // every wave, so they change nothing and are kept for the listing.
+  uint32_t cache = 0;
 };
 
 // Decodes the instruction at `at` in `code`. Throws Err::Unsupported naming

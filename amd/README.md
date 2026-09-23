@@ -30,9 +30,22 @@ registers, RAS counts, CPER records and amdgpu sysfs files are modelled
 The interface is `include/vgpu_hip.h`, a clean-room subset of the documented
 HIP API. What is implemented is devices, memory and the module API; the
 kernel-launch syntax `hipcc` compiles (`__hipRegisterFatBinary` and
-`hipLaunchKernel`) is not there yet, so a program uses the module API. The
-instructions implemented are those the fixture's kernels use, and any other is
-refused by name rather than guessed.
+`hipLaunchKernel`) is not there yet, so a program uses the module API.
+
+The instructions implemented are those clang emits for the kernels in
+`tests/data/`: scalar and vector integer arithmetic, the logical and shift
+ops, 32- and 64-bit values, float add, multiply, fma and the sequence a
+division compiles to, conversions, comparisons in both their forms,
+`v_cndmask`, the lane-counting ops, scalar and EXEC branches, LDS, global
+loads and stores, and an atomic add. Any other instruction is refused by name,
+and so is a modifier this does not model (an absolute value, a clamp, an
+output multiplier): a wrong guess would run and give a wrong answer.
+
+Two things are modelled rather than copied, and are marked where they are
+written: the reciprocal (`v_rcp_f32`) is exact here where the hardware's is a
+table good to about one unit in the last place, and the scope bits on a memory
+instruction change nothing, since every access here is already visible to every
+wave.
 
 | Folder | What |
 | --- | --- |

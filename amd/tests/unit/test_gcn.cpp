@@ -27,15 +27,21 @@ namespace {
 // VGPU_GCN_LISTING point these checks at a code object built here and now
 // (amd/tests/e2e/run_gcn_disasm.sh), so the decoder is checked against the
 // assembler's own output rather than only against what was checked in.
-std::string read(const std::string& name) {
-  const char* over = std::getenv(name.find(".dis") != std::string::npos ? "VGPU_GCN_LISTING" : "VGPU_GCN_OBJECT");
+std::string read(const std::string& name, bool allow_override = true) {
+  const char* over =
+      allow_override ? std::getenv(name.find(".dis") != std::string::npos ? "VGPU_GCN_LISTING" : "VGPU_GCN_OBJECT")
+                     : nullptr;
   const std::string path = over && *over ? std::string(over) : std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/" + name;
   std::ifstream in(path, std::ios::binary);
   if (!in) throw vtest::Failure("no fixture at " + path);
   return std::string((std::istreambuf_iterator<char>(in)), {});
 }
 
-amd::CodeObject object() { return amd::load_code_object(read("vector_add.gfx942.o"), "vector_add.gfx942.o"); }
+// The fixture itself: the checks below name its instructions, so they read it
+// whatever object the listing comparison was pointed at.
+amd::CodeObject object() {
+  return amd::load_code_object(read("vector_add.gfx942.o", false), "vector_add.gfx942.o");
+}
 
 // Every instruction in the object's .text, in order, as this decodes them --
 // the kernels and the padding the assembler puts between them, which is what
@@ -60,15 +66,25 @@ std::vector<std::string> lines(const std::string& text) {
 
 }  // namespace
 
-VTEST(every_instruction_decodes_as_the_assembler_wrote_it) {
-  const amd::CodeObject o = object();
-  const std::vector<std::string> mine = decoded(o), theirs = lines(read("vector_add.gfx942.dis"));
-  VCHECK(theirs.size() > 20);
-  VCHECK_EQ(mine.size(), theirs.size());
-  for (size_t i = 0; i < mine.size() && i < theirs.size(); ++i)
+// One object against its listing, instruction by instruction.
+void check_against_assembler(const std::string& object_name, const std::string& listing_name) {
+  const amd::CodeObject o = amd::load_code_object(read(object_name), object_name);
+  const std::vector<std::string> mine = decoded(o), theirs = lines(read(listing_name));
+  if (theirs.size() < 20) throw vtest::Failure(listing_name + " has too few instructions to be the listing");
+  if (mine.size() != theirs.size())
+    throw vtest::Failure(object_name + ": decoded " + std::to_string(mine.size()) + " instructions, the assembler " +
+                         "wrote " + std::to_string(theirs.size()));
+  for (size_t i = 0; i < mine.size(); ++i)
     if (mine[i] != theirs[i])
-      throw vtest::Failure("instruction " + std::to_string(i) + ": decoded \"" + mine[i] + "\", assembler wrote \"" +
-                           theirs[i] + "\"");
+      throw vtest::Failure(object_name + ", instruction " + std::to_string(i) + ": decoded \"" + mine[i] +
+                           "\", assembler wrote \"" + theirs[i] + "\"");
+}
+
+VTEST(every_instruction_decodes_as_the_assembler_wrote_it) {
+  check_against_assembler("vector_add.gfx942.o", "vector_add.gfx942.dis");
+  // The second fixture is the one that exercises the instructions a real
+  // kernel uses: integer and float math, division, a loop, an atomic.
+  if (!std::getenv("VGPU_GCN_OBJECT")) check_against_assembler("ops.gfx942.o", "ops.gfx942.dis");
 }
 
 VTEST(an_instruction_says_where_its_operands_are) {

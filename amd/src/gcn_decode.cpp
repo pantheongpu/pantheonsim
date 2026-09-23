@@ -15,6 +15,11 @@ struct Shape {
   uint32_t dst_width = 1;       // 0: it writes no register
   uint32_t srcs = 2;            // how many sources the assembler prints
   uint32_t w0 = 1, w1 = 1, w2 = 1;
+  // VOP3b: the instruction also writes a scalar pair (a carry-out, or the
+  // condition v_div_scale reports). VOP3 with a scalar destination instead
+  // (v_readlane, and the comparisons in their long form).
+  bool sdst = false;
+  bool scalar_dst = false;
   uint32_t src_width(uint32_t i) const { return i == 0 ? w0 : i == 1 ? w1 : w2; }
 };
 
@@ -26,12 +31,17 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // SOP1: one scalar source, one scalar destination.
       {{Enc::Sop1, 0x00}, {"s_mov_b32", 1, 1}},
       {{Enc::Sop1, 0x01}, {"s_mov_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x11}, {"s_ff1_i32_b64", 1, 1, 2}},
       {{Enc::Sop1, 0x20}, {"s_and_saveexec_b64", 2, 1, 2}},
       // SOP2: two scalar sources.
       {{Enc::Sop2, 0x00}, {"s_add_u32", 1, 2}},
+      {{Enc::Sop2, 0x02}, {"s_add_i32", 1, 2}},
       {{Enc::Sop2, 0x04}, {"s_addc_u32", 1, 2}},
-      {{Enc::Sop2, 0x0c}, {"s_and_b64", 2, 2, 2, 2}},
+      {{Enc::Sop2, 0x0c}, {"s_and_b32", 1, 2}},
+      {{Enc::Sop2, 0x0d}, {"s_and_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x0f}, {"s_or_b64", 2, 2, 2, 2}},
+      {{Enc::Sop2, 0x11}, {"s_xor_b64", 2, 2, 2, 2}},
+      {{Enc::Sop2, 0x13}, {"s_andn2_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x1d}, {"s_lshl_b64", 2, 2, 2, 1}},
       // SOPK: a 16-bit immediate.
       {{Enc::Sopk, 0x00}, {"s_movk_i32", 1, 0}},
@@ -39,10 +49,16 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sopp, 0x00}, {"s_nop", 0, 0}},
       {{Enc::Sopp, 0x01}, {"s_endpgm", 0, 0}},
       {{Enc::Sopp, 0x02}, {"s_branch", 0, 0}},
+      {{Enc::Sopp, 0x04}, {"s_cbranch_scc0", 0, 0}},
+      {{Enc::Sopp, 0x05}, {"s_cbranch_scc1", 0, 0}},
       {{Enc::Sopp, 0x08}, {"s_cbranch_execz", 0, 0}},
       {{Enc::Sopp, 0x09}, {"s_cbranch_execnz", 0, 0}},
       {{Enc::Sopp, 0x0a}, {"s_barrier", 0, 0}},
       {{Enc::Sopp, 0x0c}, {"s_waitcnt", 0, 0}},
+      // SOPC: a scalar comparison, which sets SCC.
+      {{Enc::Sopc, 0x04}, {"s_cmp_lt_i32", 0, 2}},
+      {{Enc::Sopc, 0x06}, {"s_cmp_eq_u32", 0, 2}},
+      {{Enc::Sopc, 0x13}, {"s_cmp_lg_u64", 0, 2, 2, 2}},
       // SMEM: a scalar load through a 64-bit base address.
       {{Enc::Smem, 0x00}, {"s_load_dword", 1, 1, 2}},
       {{Enc::Smem, 0x01}, {"s_load_dwordx2", 2, 1, 2}},
@@ -59,11 +75,36 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vopc, 0xc4}, {"v_cmp_gt_i32_e32", 2, 2}},
       {{Enc::Vopc, 0xca}, {"v_cmp_eq_u32_e32", 2, 2}},
       {{Enc::Vopc, 0xcc}, {"v_cmp_gt_u32_e32", 2, 2}},
+      {{Enc::Vop1, 0x005}, {"v_cvt_f32_i32_e32", 1, 1}},
+      {{Enc::Vop1, 0x006}, {"v_cvt_f32_u32_e32", 1, 1}},
+      {{Enc::Vop1, 0x022}, {"v_rcp_f32_e32", 1, 1}},
+      {{Enc::Vop2, 0x013}, {"v_and_b32_e32", 1, 2}},
+      {{Enc::Vop2, 0x014}, {"v_or_b32_e32", 1, 2}},
+      {{Enc::Vop2, 0x015}, {"v_xor_b32_e32", 1, 2}},
+      {{Enc::Vop2, 0x034}, {"v_add_u32_e32", 1, 2}},
+      {{Enc::Vop2, 0x035}, {"v_sub_u32_e32", 1, 2}},
+      {{Enc::Vop2, 0x03b}, {"v_fmac_f32_e32", 1, 2}},
+      {{Enc::Vopc, 0x0c1}, {"v_cmp_lt_i32_e32", 2, 2}},
       // VOP3: the long form. v_lshl_add shifts its first source and adds the
       // third; the shift itself is always 32-bit.
+      {{Enc::Vop3, 0x041}, {"v_cmp_lt_f32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x100}, {"v_cndmask_b32_e64", 1, 3, 1, 1, 2}},
+      {{Enc::Vop3, 0x1c8}, {"v_bfe_u32", 1, 3}},
+      {{Enc::Vop3, 0x1cb}, {"v_fma_f32", 1, 3}},
+      {{Enc::Vop3, 0x1de}, {"v_div_fixup_f32", 1, 3}},
+      {{Enc::Vop3, 0x1e0}, {"v_div_scale_f32", 1, 3, 1, 1, 1, true}},
+      {{Enc::Vop3, 0x1e2}, {"v_div_fmas_f32", 1, 3}},
+      {{Enc::Vop3, 0x1e8}, {"v_mad_u64_u32", 2, 3, 1, 1, 2, true}},
       {{Enc::Vop3, 0x1fd}, {"v_lshl_add_u32", 1, 3}},
+      {{Enc::Vop3, 0x1ff}, {"v_add3_u32", 1, 3}},
       {{Enc::Vop3, 0x208}, {"v_lshl_add_u64", 2, 3, 2, 1, 2}},
+      {{Enc::Vop3, 0x285}, {"v_mul_lo_u32", 1, 2}},
+      {{Enc::Vop3, 0x287}, {"v_mul_hi_i32", 1, 2}},
+      {{Enc::Vop3, 0x289}, {"v_readlane_b32", 1, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x28c}, {"v_mbcnt_lo_u32_b32", 1, 2}},
+      {{Enc::Vop3, 0x28d}, {"v_mbcnt_hi_u32_b32", 1, 2}},
       {{Enc::Vop3, 0x28f}, {"v_lshlrev_b64", 2, 2, 1, 2}},
+      {{Enc::Vop3, 0x291}, {"v_ashrrev_i64", 2, 2, 1, 2}},
       // DS: LDS reads and writes. A read takes the address; a write takes the
       // address and the data.
       {{Enc::Ds, 0x0d}, {"ds_write_b32", 0, 2}},
@@ -72,7 +113,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // FLAT, in its global form: an address in a VGPR pair, or a scalar base
       // with a 32-bit offset in one VGPR.
       {{Enc::Flat, 0x14}, {"global_load_dword", 1, 1}},
+      {{Enc::Flat, 0x15}, {"global_load_dwordx2", 2, 1}},
       {{Enc::Flat, 0x1c}, {"global_store_dword", 0, 2}},
+      {{Enc::Flat, 0x1d}, {"global_store_dwordx2", 0, 2, 1, 2}},
+      {{Enc::Flat, 0x42}, {"global_atomic_add", 0, 2}},
   };
   return t;
 }
@@ -97,8 +141,15 @@ Operand operand(uint32_t code, uint32_t width) {
   } else if (code == 124) {
     o.kind = OperandKind::M0;
   } else if (code == 126) {
-    o.kind = OperandKind::Exec;
-    o.width = 2;
+    o.kind = width >= 2 ? OperandKind::Exec : OperandKind::ExecLo;
+    o.width = width >= 2 ? 2 : 1;
+  } else if (code == 127) {
+    o.kind = OperandKind::ExecHi;
+  } else if (code >= 240 && code <= 247) {
+    // The inline float constants, in the ISA's order.
+    static const double kFloats[] = {0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0};
+    o.kind = OperandKind::InlineFloat;
+    o.fvalue = kFloats[code - 240];
   } else if (code >= 128 && code <= 192) {
     o.kind = OperandKind::Inline;
     o.value = code - 128;   // 0 through 64
@@ -247,9 +298,25 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.name = s.name;
     in.size = 8;
     const uint32_t w1 = word(code, at + 4);
-    in.dst.push_back(vgpr(w0 & 0xFF, s.dst_width));
-    for (uint32_t k = 0; k < s.srcs; ++k)
-      in.src.push_back(take((w1 >> (9 * k)) & 0x1FF, s.src_width(k)));
+    // What this does not model is refused rather than dropped: an absolute
+    // value, a clamp or an output multiplier that is ignored would give a
+    // wrong answer with no sign that anything was missed.
+    const uint32_t abs = s.sdst ? 0 : (w0 >> 8) & 0x7, clamp = s.sdst ? 0 : (w0 >> 15) & 1;
+    const uint32_t omod = (w1 >> 27) & 0x3;
+    if (abs || clamp || omod)
+      throw Error::make(Err::Unsupported, in.name, " uses a source or output modifier this does not model (abs ",
+                        abs, ", clamp ", clamp, ", omod ", omod, ")");
+    if (s.scalar_dst) in.dst.push_back(sgpr(w0 & 0xFF, s.dst_width));
+    else in.dst.push_back(vgpr(w0 & 0xFF, s.dst_width));
+    // VOP3b also writes a scalar pair: a carry out, or the condition
+    // v_div_scale reports.
+    if (s.sdst) in.dst.push_back(sgpr((w0 >> 8) & 0x7F, 2));
+    const uint32_t neg = (w1 >> 29) & 0x7;
+    for (uint32_t k = 0; k < s.srcs; ++k) {
+      Operand o = take((w1 >> (9 * k)) & 0x1FF, s.src_width(k));
+      o.neg = (neg >> k) & 1;
+      in.src.push_back(o);
+    }
   } else if ((w0 >> 26) == 0x36) {    // DS
     in.enc = Enc::Ds;
     in.opcode = (w0 >> 17) & 0xFF;
@@ -276,12 +343,17 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.size = 8;
     const uint32_t w1 = word(code, at + 4);
     in.offset = static_cast<int32_t>(w0 & 0x1FFF) << 19 >> 19;   // 13 bits, signed
+    // The scope bits: sc0 and nt beside the offset, sc1 above the opcode.
+    // They say how far a write is published; every access here is already
+    // visible to every wave, so they change nothing and are kept for the
+    // listing.
+    in.cache = ((w0 >> 16) & 1) | ((w0 >> 17) & 1) << 1 | ((w0 >> 25) & 1) << 2;
     const uint32_t saddr = (w1 >> 16) & 0x7F;
     in.has_saddr = saddr != 0x7F;                    // 0x7f: the address is the VGPR pair's
     in.saddr = saddr;
     if (s.dst_width) in.dst.push_back(vgpr((w1 >> 24) & 0xFF, s.dst_width));
     in.src.push_back(vgpr(w1 & 0xFF, in.has_saddr ? 1 : 2));        // the address
-    if (s.srcs > 1) in.src.push_back(vgpr((w1 >> 8) & 0xFF, 1));    // the data written
+    if (s.srcs > 1) in.src.push_back(vgpr((w1 >> 8) & 0xFF, s.src_width(1)));   // the data written
   } else if ((w0 >> 31) == 0) {       // VOP2
     in.enc = Enc::Vop2;
     in.opcode = (w0 >> 25) & 0x3F;
@@ -305,21 +377,32 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
 
 std::string operand_text(const Operand& o) {
   char b[64];
+  const std::string neg = o.neg ? "-" : "";
   const auto range = [&](const char* kind) {
     if (o.width <= 1) std::snprintf(b, sizeof b, "%s%u", kind, o.index);
     else std::snprintf(b, sizeof b, "%s[%u:%u]", kind, o.index, o.index + o.width - 1);
     return std::string(b);
   };
   switch (o.kind) {
-    case OperandKind::Sgpr: return range("s");
-    case OperandKind::Vgpr: return range("v");
-    case OperandKind::Vcc: return "vcc";
-    case OperandKind::Exec: return "exec";
-    case OperandKind::M0: return "m0";
+    case OperandKind::Sgpr: return neg + range("s");
+    case OperandKind::Vgpr: return neg + range("v");
+    case OperandKind::Vcc: return neg + "vcc";
+    case OperandKind::Exec: return neg + "exec";
+    case OperandKind::ExecLo: return neg + "exec_lo";
+    case OperandKind::ExecHi: return neg + "exec_hi";
+    case OperandKind::M0: return neg + "m0";
+    case OperandKind::InlineFloat:
+      // As the assembler writes them: 1.0, -0.5, and so on.
+      std::snprintf(b, sizeof b, "%.1f", o.fvalue);
+      return neg + b;
     case OperandKind::Inline:
-    case OperandKind::Literal:
       std::snprintf(b, sizeof b, "%lld", static_cast<long long>(o.value));
-      return b;
+      return neg + b;
+    case OperandKind::Literal:
+      // A literal is a word of the instruction stream, and the assembler
+      // prints it as one.
+      std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(static_cast<uint32_t>(o.value)));
+      return neg + b;
     case OperandKind::None: break;
   }
   return "?";
@@ -356,6 +439,9 @@ std::string to_text(const Inst& i) {
       std::snprintf(b, sizeof b, " offset:%d", i.offset);
       s += b;
     }
+    if (i.cache & 1) s += " sc0";
+    if (i.cache & 2) s += " nt";
+    if (i.cache & 4) s += " sc1";
   } else if (i.name == "s_nop") {
     std::snprintf(b, sizeof b, " %d", i.simm);   // how many cycles to wait
     s += b;
@@ -377,7 +463,8 @@ std::string to_text(const Inst& i) {
       s += b;
     }
   } else if (i.enc == Enc::Sopp && i.target) {
-    std::snprintf(b, sizeof b, " %d", i.simm);   // as the assembler writes it: instructions ahead
+    // As the assembler writes it: the immediate itself, unsigned.
+    std::snprintf(b, sizeof b, " %u", static_cast<uint32_t>(i.simm) & 0xFFFF);
     s += b;
   } else if (i.enc == Enc::Sopk) {
     std::snprintf(b, sizeof b, ", 0x%x", (unsigned)(i.simm & 0xFFFF));

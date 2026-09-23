@@ -578,6 +578,9 @@ target_compile_definitions(test_amd_gcn PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_
 # And run: a wavefront over that machine code, against device memory.
 vgpu_unit_test(test_amd_gcn_exec amd/tests/unit/test_gcn_exec.cpp)
 target_compile_definitions(test_amd_gcn_exec PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The instructions a real kernel uses, run and checked against what the C means.
+vgpu_unit_test(test_amd_gcn_ops amd/tests/unit/test_gcn_ops.cpp)
+target_compile_definitions(test_amd_gcn_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_robustness)
 target_include_directories(test_robustness PRIVATE nvidia/src)
 target_sources(test_robustness PRIVATE nvidia/src/fatbin.cpp)
