@@ -7,15 +7,25 @@ Support for AMD GPUs and ROCm, which is at the start.
 registers, RAS counts, CPER records and amdgpu sysfs files are modelled
 (`docs/registers.md`, `docs/telemetry.md`).
 
-**Execution** is being built, and a program cannot run on an AMD device yet.
-The front of it is here: a HIP program hands the driver a code object, so
-`src/codeobject.cpp` reads one (the ELF, each kernel's descriptor and the
-metadata note: kernels, kernarg layout, LDS, registers) and `src/gcn_decode.cpp`
-decodes the CDNA instructions in it. The decoder is checked instruction by
-instruction against what the assembler wrote, on the object in `tests/data/`
-and on one built during the test run (`tests/e2e/run_gcn_disasm.sh`). What is
-missing is the wavefront itself -- scalar registers and the EXEC mask -- and
-then the HIP runtime.
+**Execution** is being built, and CDNA kernels now run:
+
+- `src/codeobject.cpp` reads the code object a HIP program hands the driver --
+  the ELF, each kernel's descriptor, and the metadata note naming the kernels
+  and laying out their arguments.
+- `src/gcn_decode.cpp` decodes the CDNA instructions in it, checked
+  instruction by instruction against what the assembler wrote, both on the
+  object in `tests/data/` and on one built during the test run
+  (`tests/e2e/run_gcn_disasm.sh`).
+- `src/gcn_exec.cpp` runs them: work-groups of 64-lane wavefronts, each with
+  the scalar registers, VCC, SCC and the EXEC mask the ISA exposes, over LDS
+  and device memory, with barriers between the waves of a group. Divergence is
+  what the compiler writes -- save EXEC, narrow it, put it back -- not a path
+  stack.
+
+What is missing is the HIP runtime above it, so a HIP program still cannot
+reach any of this on its own; the tests dispatch kernels directly. The
+instructions implemented are those the fixture's kernels use, and any other is
+refused by name rather than guessed.
 
 | Folder | What |
 | --- | --- |

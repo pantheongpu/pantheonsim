@@ -154,11 +154,11 @@ jobs:
       - name: Build
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)" --target test_amd_codeobject test_amd_gcn
+          cmake --build build -j"$(nproc)" --target test_amd_codeobject test_amd_gcn test_amd_gcn_exec
 
-      - name: Read code objects, decode CDNA, and check it against the assembler
+      - name: Read code objects, decode CDNA, run it, and check it against the assembler
         run: |
-          ctest --test-dir build --output-on-failure -R "test_amd_codeobject|test_amd_gcn|amd_gcn_disasm" | tee out
+          ctest --test-dir build --output-on-failure -R "test_amd_codeobject|test_amd_gcn|test_amd_gcn_exec|amd_gcn_disasm" | tee out
           # A skip here would hide a decoder that no longer matches the
           # assembler, which is the whole point of this job.
           grep -q "amd_gcn_disasm .* Passed" out

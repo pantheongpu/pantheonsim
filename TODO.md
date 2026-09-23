@@ -532,9 +532,12 @@ what is done.
   started: amd/src/codeobject.cpp reads the code object a HIP program hands
   the driver (kernels, kernarg layout, LDS, registers) and amd/src/gcn_decode.cpp
   decodes its CDNA instructions, checked against the assembler's own output on
-  a freshly built object. Still missing: the wavefront -- scalar registers and
-  the EXEC mask, which the PTX interpreter has no model for -- and the HIP
-  runtime above it.
+  a freshly built object. amd/src/gcn_exec.cpp runs them on 64-lane
+  wavefronts with the scalar registers and the EXEC mask the ISA exposes, over
+  LDS and device memory, with barriers: the fixture's kernels -- a vector add
+  and a reduction through LDS -- give the answers their C would. Still
+  missing: the HIP runtime above it, so a HIP program cannot reach this yet,
+  and every instruction outside what those kernels use.
 - Tooling: trace record/replay, conformance DB + compat scores. (`vgpu run`,
   `vgpu test --matrix`, shared-memory race detection, the random and
   adversarial schedulers, and fault injection are done.)
