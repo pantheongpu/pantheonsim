@@ -901,6 +901,17 @@ set_tests_properties(e2e_vmm PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
 
+# Stream-ordered memory pools and managed-memory hints: a pool caches what is
+# freed to it, hands it back and reports what it holds, which is what an async
+# allocator reads; and advice set on managed memory reads back.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_mempool COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mempool.sh)
+  set_tests_properties(e2e_mempool PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # The `vgpu run` wrapper, and the two pre-flight checks that are the reason it
 # exists: a CUDA soname the shim does not carry, and a DT_RPATH that outranks
 # LD_LIBRARY_PATH. Both are silent failures without it.

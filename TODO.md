@@ -33,8 +33,26 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   and warp primitives throughout, so it exercises far more than a hand-written
   kernel does. Also verified by probe, not yet pinned by a test: streams and
   events with cross-stream waits, managed and pinned memory, pitched 2D
-  allocation with cudaMemcpy2D, the async memory pool (cudaMallocAsync), the
-  >48 KiB dynamic shared-memory opt-in, and occupancy queries.
+  allocation with cudaMemcpy2D, the >48 KiB dynamic shared-memory opt-in, and
+  occupancy queries.
+- Stream-ordered memory pools (cudaMallocAsync, cudaMemPoolCreate,
+  cudaMallocFromPoolAsync, cudaFreeAsync, the pool attributes, TrimTo,
+  cudaDeviceSetMemPool): a pool holds what is freed to it up to its release
+  threshold and hands it out again, so an allocator asks the device once and
+  reuses after that -- what PyTorch's async allocator and RMM are built on.
+  The default threshold is 0, which the API documents as giving memory straight
+  back, so caching starts when a program sets one. Used and reserved totals and
+  their high-water marks are what a pool reports, and a mark resets by writing
+  zero to it. e2e_mempool checks reuse (the same pointer comes back), the
+  statistics, trimming, an explicit pool, and the refusals.
+- Managed-memory hints: cudaMemAdvise records what it is told -- read-mostly, a
+  preferred location, which devices access a range -- and
+  cudaMemRangeGetAttribute(s) reports it, answering with a value only where
+  every byte of the range agrees, as CUDA does. Nothing migrates, because there
+  is one physical copy of managed memory here, so the hints change no result;
+  they are state a program sets and reads. Both calls now refuse memory that is
+  not managed and a device that does not exist, where they used to return
+  success for any pointer at all.
 - Pantheon workloads: the pantheongpu stress/diagnostics kernels run
   unmodified (idle, memory_read/write, galpat, march_test, memory_hammer,
   atomic/int/compute virus). memory_read differential-matches a physical RTX
