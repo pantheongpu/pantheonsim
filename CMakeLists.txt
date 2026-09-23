@@ -161,6 +161,22 @@ add_custom_command(TARGET vgpucuda POST_BUILD
   COMMENT "Creating driver shim symlinks (build/shim/libcuda.so.1)")
 
 # ---------------------------------------------------------------------------
+# libamdhip64: the HIP runtime API shim. A HIP program links against it the
+# way it links against AMD's, and its kernels run on a simulated AMD GPU.
+# ---------------------------------------------------------------------------
+add_library(vgpuhip SHARED amd/src/hip_api.cpp)
+target_link_libraries(vgpuhip PRIVATE vgpu ${CMAKE_DL_LIBS})
+target_include_directories(vgpuhip PRIVATE amd/include)
+# The real runtime's identity: a HIP program records SONAME "libamdhip64.so.6"
+# and resolves to this library through LD_LIBRARY_PATH at run time.
+set_target_properties(vgpuhip PROPERTIES OUTPUT_NAME amdhip64 SOVERSION 6 VERSION 6.4)
+add_custom_command(TARGET vgpuhip POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.6"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so"
+  COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6)")
+
+# ---------------------------------------------------------------------------
 # libvgpucudart: the CUDA *runtime* API shim. Lets unmodified nvcc-compiled
 # applications (built against shared cudart) run on VirtualGPU. Requires the
 # CUDA toolkit's ABI headers at build time (driver_types.h) for exact struct
@@ -605,6 +621,10 @@ set_tests_properties(smi_queries PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_
 add_test(NAME fault_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_fault_cli.sh)
 set_tests_properties(fault_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
+# A HIP program, linked against the shim, running a kernel on a simulated AMD GPU.
+add_test(NAME amd_hip COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip.sh)
+set_tests_properties(amd_hip PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 # The GCN decoder against the real assembler, on a code object built here and now.
 add_test(NAME amd_gcn_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_gcn_disasm.sh)
 set_tests_properties(amd_gcn_disasm PROPERTIES DEPENDS test_amd_gcn

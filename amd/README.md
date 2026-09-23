@@ -22,8 +22,15 @@ registers, RAS counts, CPER records and amdgpu sysfs files are modelled
   what the compiler writes -- save EXEC, narrow it, put it back -- not a path
   stack.
 
-What is missing is the HIP runtime above it, so a HIP program still cannot
-reach any of this on its own; the tests dispatch kernels directly. The
+- `src/hip_api.cpp` is `libamdhip64`: the HIP runtime API, over those pieces.
+  A HIP program links against it the way it links against AMD's, asks for
+  devices and memory, loads a code object and launches the kernels in it
+  (`tests/e2e/run_hip.sh` does exactly that, and checks the answers).
+
+The interface is `include/vgpu_hip.h`, a clean-room subset of the documented
+HIP API. What is implemented is devices, memory and the module API; the
+kernel-launch syntax `hipcc` compiles (`__hipRegisterFatBinary` and
+`hipLaunchKernel`) is not there yet, so a program uses the module API. The
 instructions implemented are those the fixture's kernels use, and any other is
 refused by name rather than guessed.
 
