@@ -27,6 +27,12 @@ registers, RAS counts, CPER records and amdgpu sysfs files are modelled
   devices and memory, loads a code object and launches the kernels in it
   (`tests/e2e/run_hip.sh` does exactly that, and checks the answers).
 
+A kernel learns the shape of its grid the way the ABI says: from the
+arguments the compiler adds after its own (which the launch fills in), or
+from the packet a dispatch is described by (which the launch writes where the
+kernel asked for it). A kernel compiled from HIP reads `blockDim` and
+`gridDim` through the first of those.
+
 A module brings its own variables -- what a `__device__` global compiles to.
 The loader places them on the device and fills in the addresses the code was
 left to have (`R_AMDGPU_REL32_LO` and `_HI`, which a kernel adds to the

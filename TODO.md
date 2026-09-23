@@ -544,8 +544,12 @@ what is done.
   kinds of branch, and the memory a kernel uses: global, LDS and their
   atomics, private memory for spills, a cross-lane read, flat accesses, and a
   module's own variables (the relocations that find them, and
-  hipModuleGetGlobal) -- each checked against the assembler's output and
-  against what the C means.
+  hipModuleGetGlobal), and the grid's shape as a kernel reads it (the implicit
+  arguments and the dispatch packet) -- each checked against the assembler's
+  output and against what the C means. Not implemented: the matrix
+  instructions (v_mfma_*), which are refused by name -- their register layout
+  cannot be checked against anything here, and a wrong layout would return
+  plausible wrong matrices.
   Still missing: the fatbin path hipcc compiles (__hipRegisterFatBinary,
   hipLaunchKernel), streams that are more than handles, and every instruction
   outside what those kernels use, which is refused by name.

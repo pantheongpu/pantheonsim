@@ -50,8 +50,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop2, 0x13}, {"s_andn2_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x1d}, {"s_lshl_b64", 2, 2, 2, 1}},
       {{Enc::Sop2, 0x20}, {"s_ashr_i32", 1, 2}},
+      {{Enc::Sop2, 0x24}, {"s_mul_i32", 1, 2}},
       // SOPK: a 16-bit immediate.
       {{Enc::Sopk, 0x00}, {"s_movk_i32", 1, 0}},
+      {{Enc::Sopk, 0x0f}, {"s_mulk_i32", 1, 0}},
       // SOPP: an immediate, and no registers.
       {{Enc::Sopp, 0x00}, {"s_nop", 0, 0}},
       {{Enc::Sopp, 0x01}, {"s_endpgm", 0, 0}},
