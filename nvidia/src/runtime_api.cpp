@@ -2214,22 +2214,6 @@ VGPU_EXPORT cudaError_t cudaIpcCloseMemHandle(void* ptr) {
 // Graphs are captured and replayed by running the work inline, so a captured
 // graph has no node list to walk. Report an empty graph rather than a count a
 // caller would then try to read nodes out of.
-VGPU_EXPORT cudaError_t cudaGraphGetNodes(cudaGraph_t, cudaGraphNode_t*, size_t* numNodes) {
-  if (numNodes) *numNodes = 0;
-  return cudaSuccess;
-}
-// Graphs execute inline, so an instantiated graph holds no captured topology
-// to compare against. Report that the update did not apply rather than
-// claiming success: a caller told the update succeeded will skip
-// re-instantiating and then replay work that was never updated.
-VGPU_EXPORT cudaError_t cudaGraphExecUpdate(cudaGraphExec_t, cudaGraph_t,
-                                            cudaGraphExecUpdateResultInfo* info) {
-  if (info) {
-    std::memset(info, 0, sizeof *info);
-    info->result = cudaGraphExecUpdateErrorTopologyChanged;
-  }
-  return cudaErrorGraphExecUpdateFailure;
-}
 
 /* ===================================================================== */
 /* Texture and surface objects                                           */
@@ -2713,14 +2697,6 @@ VGPU_EXPORT cudaError_t cudaMemRangeGetAttributes(void** data, size_t* data_size
   });
 }
 
-VGPU_EXPORT cudaError_t cudaGraphDebugDotPrint(cudaGraph_t, const char* path, unsigned int) {
-  if (!path) return cudaErrorInvalidValue;
-  std::FILE* f = std::fopen(path, "w");
-  if (!f) return cudaErrorOperatingSystem;
-  std::fprintf(f, "digraph vgpu {\n  // graphs execute inline; no captured nodes\n}\n");
-  std::fclose(f);
-  return cudaSuccess;
-}
 
 // The extended launch form carries an attribute list (cluster dims, cooperative
 // launch, programmatic dependencies). None changes what the interpreter does
@@ -2979,8 +2955,27 @@ struct RecordedLaunch {
   std::function<void()> host_op;
 };
 
+// A graph is a directed acyclic graph of nodes, which is what CUDA's own
+// structure is and what the explicit API builds: a program adds nodes, says
+// which depend on which, and the launch runs them in an order that respects
+// that. Capture builds the same structure -- each recorded operation depends on
+// the one before it, which is the order the stream would have run them in.
+//
+// A node's address is its handle, so nodes are held behind pointers and never
+// move.
+struct GraphNodeRec {
+  cudaGraphNodeType type = cudaGraphNodeTypeKernel;
+  RecordedLaunch work;                    // empty nodes carry none
+  std::vector<GraphNodeRec*> deps;        // the nodes that must run first
+  struct GraphRec* child = nullptr;       // a child-graph node's graph
+};
+
 struct GraphRec {
-  std::vector<RecordedLaunch> launches;
+  std::vector<std::unique_ptr<GraphNodeRec>> nodes;
+  // Child graphs a node points at, cloned when the node was added so a later
+  // change to the original graph cannot change this one -- which is what CUDA
+  // documents.
+  std::vector<std::unique_ptr<GraphRec>> children;
   // Set when something happened during capture that this implementation cannot
   // record. Kernel launches, copies, fills and host-computed library calls are
   // all captured; anything else would run immediately and be missing from every
@@ -2988,10 +2983,83 @@ struct GraphRec {
   // not be used.
   bool invalidated = false;
   const char* invalidated_by = nullptr;
+  // The node a captured operation depends on: the previous one.
+  GraphNodeRec* last_capture = nullptr;
+
+  // Adds a node with the given predecessors. Returns its handle.
+  GraphNodeRec* add(cudaGraphNodeType type, RecordedLaunch work,
+                    const std::vector<GraphNodeRec*>& deps) {
+    nodes.push_back(std::make_unique<GraphNodeRec>());
+    GraphNodeRec* n = nodes.back().get();
+    n->type = type;
+    n->work = std::move(work);
+    n->deps = deps;
+    return n;
+  }
+  bool holds(const GraphNodeRec* n) const {
+    for (const auto& up : nodes)
+      if (up.get() == n) return true;
+    return false;
+  }
 };
+
+// Deep copy, with dependencies remapped onto the new nodes. `mapping` receives
+// old -> new for every node, which is what cudaGraphNodeFindInClone answers
+// from.
+std::unique_ptr<GraphRec> clone_graph(const GraphRec& src,
+                                      std::map<const GraphNodeRec*, GraphNodeRec*>* mapping) {
+  auto out = std::make_unique<GraphRec>();
+  out->invalidated = src.invalidated;
+  out->invalidated_by = src.invalidated_by;
+  std::map<const GraphNodeRec*, GraphNodeRec*> local;
+  for (const auto& up : src.nodes) {
+    out->nodes.push_back(std::make_unique<GraphNodeRec>());
+    GraphNodeRec* n = out->nodes.back().get();
+    n->type = up->type;
+    n->work = up->work;
+    local[up.get()] = n;
+  }
+  for (const auto& up : src.nodes) {
+    GraphNodeRec* n = local[up.get()];
+    for (const GraphNodeRec* d : up->deps) n->deps.push_back(local[d]);
+    if (up->child) {
+      out->children.push_back(clone_graph(*up->child, nullptr));
+      n->child = out->children.back().get();
+    }
+  }
+  if (const auto it = local.find(src.last_capture); it != local.end()) out->last_capture = it->second;
+  if (mapping) *mapping = local;
+  return out;
+}
+
+// The nodes in an order that runs every node after everything it depends on.
+// Empty when the dependencies contain a cycle, which is how adding one is
+// refused.
+std::vector<GraphNodeRec*> topological_order(const GraphRec& g) {
+  std::map<const GraphNodeRec*, size_t> remaining;
+  for (const auto& up : g.nodes) remaining[up.get()] = up->deps.size();
+  std::vector<GraphNodeRec*> out, ready;
+  for (const auto& up : g.nodes)
+    if (up->deps.empty()) ready.push_back(up.get());
+  while (!ready.empty()) {
+    GraphNodeRec* n = ready.back();
+    ready.pop_back();
+    out.push_back(n);
+    for (const auto& up : g.nodes) {
+      if (std::find(up->deps.begin(), up->deps.end(), n) == up->deps.end()) continue;
+      if (--remaining[up.get()] == 0) ready.push_back(up.get());
+    }
+  }
+  if (out.size() != g.nodes.size()) return {};   // a cycle
+  return out;
+}
 
 std::mutex g_graph_mu;
 std::unordered_map<void*, std::unique_ptr<GraphRec>> g_graphs;      // graph handles
+// A child graph a caller asked to look at: the node owns it, so this holds a
+// handle for it without owning it. Destroying one through cudaGraphDestroy is
+// refused, as CUDA refuses it -- the node's graph is the node's.
+std::unordered_map<void*, GraphRec*> g_borrowed_graphs;
 std::unordered_map<void*, std::unique_ptr<GraphRec>> g_graph_execs; // instantiated graphs
 // Streams currently capturing. VirtualGPU's streams are all the same
 // synchronous engine, so capture state is keyed by the stream handle value.
@@ -3018,7 +3086,10 @@ bool vgpu_record_memcpy_if_capturing(void* dst, const void* src, size_t bytes,
   r.src = src;
   r.bytes = bytes;
   r.copy_kind = kind;
-  g->launches.push_back(std::move(r));
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  g->last_capture = g->add(cudaGraphNodeTypeMemcpy, std::move(r),
+                           g->last_capture ? std::vector<GraphNodeRec*>{g->last_capture}
+                                           : std::vector<GraphNodeRec*>{});
   return true;
 }
 
@@ -3030,7 +3101,10 @@ bool vgpu_record_memset_if_capturing(void* dst, int value, size_t bytes, cudaStr
   r.dst = dst;
   r.fill_value = value;
   r.bytes = bytes;
-  g->launches.push_back(std::move(r));
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  g->last_capture = g->add(cudaGraphNodeTypeMemset, std::move(r),
+                           g->last_capture ? std::vector<GraphNodeRec*>{g->last_capture}
+                                           : std::vector<GraphNodeRec*>{});
   return true;
 }
 
@@ -3043,7 +3117,9 @@ bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()>
   r.kind = RecordedLaunch::Kind::Host;
   r.host_op = std::move(op);
   std::lock_guard<std::mutex> lock(g_graph_mu);
-  g->launches.push_back(std::move(r));
+  g->last_capture = g->add(cudaGraphNodeTypeHost, std::move(r),
+                           g->last_capture ? std::vector<GraphNodeRec*>{g->last_capture}
+                                           : std::vector<GraphNodeRec*>{});
   return true;
 }
 
@@ -3077,7 +3153,9 @@ bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, vo
     std::memcpy(rl.arg_bytes[i].data(), args[i], param_sizes[i]);
   }
   std::lock_guard<std::mutex> lock(g_graph_mu);
-  g->launches.push_back(std::move(rl));
+  g->last_capture = g->add(cudaGraphNodeTypeKernel, std::move(rl),
+                           g->last_capture ? std::vector<GraphNodeRec*>{g->last_capture}
+                                           : std::vector<GraphNodeRec*>{});
   return true;
 }
 
@@ -3122,7 +3200,9 @@ VGPU_EXPORT cudaError_t cudaGraphInstantiate(cudaGraphExec_t* pExec, cudaGraph_t
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto it = g_graphs.find(static_cast<void*>(graph));
   if (it == g_graphs.end()) return cudaErrorInvalidValue;
-  auto exec = std::make_unique<GraphRec>(*it->second);  // snapshot at instantiate time
+  if (topological_order(*it->second).empty() && !it->second->nodes.empty())
+    return cudaErrorInvalidValue;                      // a cycle cannot be instantiated
+  auto exec = clone_graph(*it->second, nullptr);        // a snapshot, as CUDA takes
   void* handle = exec.get();
   g_graph_execs[handle] = std::move(exec);
   if (pExec) *pExec = static_cast<cudaGraphExec_t>(handle);
@@ -3133,34 +3213,758 @@ VGPU_EXPORT cudaError_t cudaGraphInstantiateWithFlags(cudaGraphExec_t* pExec, cu
   return cudaGraphInstantiate(pExec, graph, flags);
 }
 
-VGPU_EXPORT cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t stream) {
-  std::vector<RecordedLaunch> replay;
-  {
-    std::lock_guard<std::mutex> lock(g_graph_mu);
-    auto it = g_graph_execs.find(static_cast<void*>(exec));
-    if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
-    replay = it->second->launches;  // copy so we can run without holding the lock
-  }
-  for (auto& rl : replay) {
-    cudaError_t rc = cudaSuccess;
-    if (rl.kind == RecordedLaunch::Kind::Memcpy) {
-      rc = cudaMemcpy(rl.dst, rl.src, rl.bytes, rl.copy_kind);
-    } else if (rl.kind == RecordedLaunch::Kind::Memset) {
-      rc = cudaMemset(rl.dst, rl.fill_value, rl.bytes);
-    } else if (rl.kind == RecordedLaunch::Kind::Host) {
-      rl.host_op();
-    } else {
-      std::vector<void*> ptrs(rl.arg_bytes.size());
-      for (size_t i = 0; i < rl.arg_bytes.size(); ++i) ptrs[i] = rl.arg_bytes[i].data();
-      rc = cudaLaunchKernel(rl.func, rl.grid, rl.block, ptrs.data(), rl.shared, stream);
-    }
+// Runs one node's work. Nodes with no work of their own (empty ones) do
+// nothing but order the nodes around them.
+static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream);
+
+// Every node of a graph, in an order that respects its dependencies. With one
+// synchronous engine any such order is a correct execution of the graph, and a
+// program that depended on more than the order it asked for would be depending
+// on something CUDA does not promise either.
+static cudaError_t run_graph(GraphRec& g, cudaStream_t stream) {
+  const std::vector<GraphNodeRec*> order = topological_order(g);
+  if (order.size() != g.nodes.size()) return cudaErrorInvalidValue;
+  for (GraphNodeRec* n : order) {
+    const cudaError_t rc = run_graph_node(n, stream);
     if (rc != cudaSuccess) return rc;
   }
   return cudaSuccess;
 }
 
+static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
+  RecordedLaunch& rl = n->work;
+  switch (n->type) {
+    case cudaGraphNodeTypeEmpty:
+      return cudaSuccess;
+    case cudaGraphNodeTypeMemcpy:
+      return cudaMemcpy(rl.dst, rl.src, rl.bytes, rl.copy_kind);
+    case cudaGraphNodeTypeMemset:
+      return cudaMemset(rl.dst, rl.fill_value, rl.bytes);
+    case cudaGraphNodeTypeHost:
+      if (rl.host_op) rl.host_op();
+      return cudaSuccess;
+    case cudaGraphNodeTypeGraph:
+      return n->child ? run_graph(*n->child, stream) : cudaSuccess;
+    default: {
+      std::vector<void*> ptrs(rl.arg_bytes.size());
+      for (size_t i = 0; i < rl.arg_bytes.size(); ++i) ptrs[i] = rl.arg_bytes[i].data();
+      return cudaLaunchKernel(rl.func, rl.grid, rl.block, ptrs.data(), rl.shared, stream);
+    }
+  }
+}
+
+VGPU_EXPORT cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t stream) {
+  std::unique_ptr<GraphRec> replay;
+  {
+    std::lock_guard<std::mutex> lock(g_graph_mu);
+    auto it = g_graph_execs.find(static_cast<void*>(exec));
+    if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
+    replay = clone_graph(*it->second, nullptr);   // run without holding the lock
+  }
+  return run_graph(*replay, stream);
+}
+
+/* ---- building a graph node by node -------------------------------------------
+ *
+ * The other way to make a graph: instead of capturing a stream, a program
+ * creates an empty graph, adds nodes and says which depend on which. This is
+ * how a framework that knows its own dependency structure builds one --
+ * cuDNN's and TensorRT's graphs, and anything that reuses a graph with new
+ * parameters through cudaGraphExecKernelNodeSetParams.
+ *
+ * A node's handle is its address. Nodes are owned by their graph and outlive
+ * nothing: destroying the graph destroys them.
+ */
+namespace {
+
+// The parameter sizes of a registered kernel stub, which a graph node needs to
+// copy argument values the way a launch does. Returns false for a stub this
+// process never registered, or one whose module has no PTX.
+bool kernel_param_sizes(const void* func, std::vector<uint32_t>* out) {
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (!s.rt) return false;
+  auto it = s.kernels.find(func);
+  if (it == s.kernels.end() || !it->second.mod || it->second.mod->ptx.empty()) return false;
+  const uint64_t mid = module_on_current(s, *it->second.mod);
+  const vgpu::ptx::EntryFn* fn = current(s).get_function(mid, it->second.entry_name);
+  if (!fn) return false;
+  out->resize(fn->params.size());
+  for (size_t i = 0; i < fn->params.size(); ++i) (*out)[i] = fn->params[i].size;
+  return true;
+}
+
+GraphRec* graph_from(cudaGraph_t h) {   // caller holds g_graph_mu
+  if (const auto it = g_graphs.find(static_cast<void*>(h)); it != g_graphs.end())
+    return it->second.get();
+  const auto borrowed = g_borrowed_graphs.find(static_cast<void*>(h));
+  return borrowed == g_borrowed_graphs.end() ? nullptr : borrowed->second;
+}
+
+// Checks the dependency list a caller passed: every node has to belong to this
+// graph, which is what stops a dependency on another graph's node.
+bool deps_ok(const GraphRec& g, const cudaGraphNode_t* deps, size_t count,
+             std::vector<GraphNodeRec*>* out) {
+  for (size_t i = 0; i < count; ++i) {
+    auto* n = reinterpret_cast<GraphNodeRec*>(deps[i]);
+    if (!n || !g.holds(n)) return false;
+    out->push_back(n);
+  }
+  return true;
+}
+
+// Copies a kernel node's parameters out of the API's struct.
+cudaError_t fill_kernel_work(RecordedLaunch* w, const cudaKernelNodeParams* p) {
+  if (!p || !p->func) return cudaErrorInvalidValue;
+  w->kind = RecordedLaunch::Kind::Kernel;
+  w->func = p->func;
+  w->grid = p->gridDim;
+  w->block = p->blockDim;
+  w->shared = p->sharedMemBytes;
+  // The parameter values are copied, not the pointers: a graph launched later
+  // has to use what the arguments were when the node was set up, which is the
+  // same rule capture follows.
+  std::vector<uint32_t> sizes;
+  if (!kernel_param_sizes(p->func, &sizes)) return cudaErrorInvalidDeviceFunction;
+  w->arg_bytes.assign(sizes.size(), {});
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    w->arg_bytes[i].resize(sizes[i]);
+    if (!p->kernelParams || !p->kernelParams[i]) return cudaErrorInvalidValue;
+    std::memcpy(w->arg_bytes[i].data(), p->kernelParams[i], sizes[i]);
+  }
+  return cudaSuccess;
+}
+
+// A 3D copy this engine can run: one contiguous run of bytes. Anything with a
+// real pitch or more than one row would need a shape the replay does not carry,
+// and is refused rather than copied wrongly.
+cudaError_t fill_memcpy_work(RecordedLaunch* w, const cudaMemcpy3DParms* p) {
+  if (!p) return cudaErrorInvalidValue;
+  if (p->extent.height > 1 || p->extent.depth > 1) return cudaErrorNotSupported;
+  if (p->srcPtr.ptr == nullptr || p->dstPtr.ptr == nullptr) return cudaErrorInvalidValue;
+  w->kind = RecordedLaunch::Kind::Memcpy;
+  w->src = p->srcPtr.ptr;
+  w->dst = p->dstPtr.ptr;
+  w->bytes = p->extent.width;
+  w->copy_kind = p->kind;
+  return cudaSuccess;
+}
+
+cudaError_t fill_memset_work(RecordedLaunch* w, const cudaMemsetParams* p) {
+  if (!p || !p->dst) return cudaErrorInvalidValue;
+  if (p->height > 1) return cudaErrorNotSupported;   // a 2D fill needs a pitch this cannot carry
+  if (p->elementSize != 1 && p->elementSize != 2 && p->elementSize != 4)
+    return cudaErrorInvalidValue;
+  w->kind = RecordedLaunch::Kind::Memset;
+  w->dst = p->dst;
+  w->fill_value = static_cast<int>(p->value);
+  w->bytes = static_cast<size_t>(p->width) * p->elementSize;
+  return cudaSuccess;
+}
+
+// Whether `from` can already be reached from `to`: adding to -> from would then
+// close a cycle, which CUDA refuses.
+bool reaches(const GraphNodeRec* from, const GraphNodeRec* to) {
+  if (from == to) return true;
+  for (const GraphNodeRec* d : from->deps)
+    if (reaches(d, to)) return true;
+  return false;
+}
+
+}  // namespace
+
+VGPU_EXPORT cudaError_t cudaGraphCreate(cudaGraph_t* pGraph, unsigned int flags) {
+  if (!pGraph || flags != 0) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto g = std::make_unique<GraphRec>();
+  void* handle = g.get();
+  g_graphs[handle] = std::move(g);
+  *pGraph = static_cast<cudaGraph_t>(handle);
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphAddKernelNode(cudaGraphNode_t* pNode, cudaGraph_t graph,
+                                              const cudaGraphNode_t* deps, size_t numDeps,
+                                              const cudaKernelNodeParams* params) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  if (!g || !pNode) return cudaErrorInvalidValue;
+  std::vector<GraphNodeRec*> pred;
+  if (!deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
+  RecordedLaunch w;
+  if (const cudaError_t rc = fill_kernel_work(&w, params); rc != cudaSuccess) return rc;
+  *pNode = reinterpret_cast<cudaGraphNode_t>(g->add(cudaGraphNodeTypeKernel, std::move(w), pred));
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphAddMemcpyNode(cudaGraphNode_t* pNode, cudaGraph_t graph,
+                                               const cudaGraphNode_t* deps, size_t numDeps,
+                                               const cudaMemcpy3DParms* params) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  if (!g || !pNode) return cudaErrorInvalidValue;
+  std::vector<GraphNodeRec*> pred;
+  if (!deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
+  RecordedLaunch w;
+  if (const cudaError_t rc = fill_memcpy_work(&w, params); rc != cudaSuccess) return rc;
+  *pNode = reinterpret_cast<cudaGraphNode_t>(g->add(cudaGraphNodeTypeMemcpy, std::move(w), pred));
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphAddMemcpyNode1D(cudaGraphNode_t* pNode, cudaGraph_t graph,
+                                                 const cudaGraphNode_t* deps, size_t numDeps,
+                                                 void* dst, const void* src, size_t count,
+                                                 cudaMemcpyKind kind) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  if (!g || !pNode || !dst || !src) return cudaErrorInvalidValue;
+  std::vector<GraphNodeRec*> pred;
+  if (!deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
+  RecordedLaunch w;
+  w.kind = RecordedLaunch::Kind::Memcpy;
+  w.dst = dst;
+  w.src = src;
+  w.bytes = count;
+  w.copy_kind = kind;
+  *pNode = reinterpret_cast<cudaGraphNode_t>(g->add(cudaGraphNodeTypeMemcpy, std::move(w), pred));
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphAddMemsetNode(cudaGraphNode_t* pNode, cudaGraph_t graph,
+                                               const cudaGraphNode_t* deps, size_t numDeps,
+                                               const cudaMemsetParams* params) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  if (!g || !pNode) return cudaErrorInvalidValue;
+  std::vector<GraphNodeRec*> pred;
+  if (!deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
+  RecordedLaunch w;
+  if (const cudaError_t rc = fill_memset_work(&w, params); rc != cudaSuccess) return rc;
+  *pNode = reinterpret_cast<cudaGraphNode_t>(g->add(cudaGraphNodeTypeMemset, std::move(w), pred));
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphAddEmptyNode(cudaGraphNode_t* pNode, cudaGraph_t graph,
+                                              const cudaGraphNode_t* deps, size_t numDeps) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  if (!g || !pNode) return cudaErrorInvalidValue;
+  std::vector<GraphNodeRec*> pred;
+  if (!deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
+  *pNode = reinterpret_cast<cudaGraphNode_t>(g->add(cudaGraphNodeTypeEmpty, RecordedLaunch{}, pred));
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphAddChildGraphNode(cudaGraphNode_t* pNode, cudaGraph_t graph,
+                                                   const cudaGraphNode_t* deps, size_t numDeps,
+                                                   cudaGraph_t childGraph) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  GraphRec* child = graph_from(childGraph);
+  if (!g || !child || !pNode || g == child) return cudaErrorInvalidValue;
+  std::vector<GraphNodeRec*> pred;
+  if (!deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
+  // Cloned now: CUDA takes the child's structure as it is at this moment.
+  g->children.push_back(clone_graph(*child, nullptr));
+  GraphNodeRec* n = g->add(cudaGraphNodeTypeGraph, RecordedLaunch{}, pred);
+  n->child = g->children.back().get();
+  *pNode = reinterpret_cast<cudaGraphNode_t>(n);
+  return cudaSuccess;
+}
+
+static cudaError_t graph_add_deps(cudaGraph_t graph, const cudaGraphNode_t* from,
+                                 const cudaGraphNode_t* to, size_t numDeps) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  if (!g || (numDeps && (!from || !to))) return cudaErrorInvalidValue;
+  for (size_t i = 0; i < numDeps; ++i) {
+    auto* f = reinterpret_cast<GraphNodeRec*>(from[i]);
+    auto* t = reinterpret_cast<GraphNodeRec*>(to[i]);
+    if (!f || !t || !g->holds(f) || !g->holds(t)) return cudaErrorInvalidValue;
+    // `to` runs after `from`. A dependency that closes a cycle is refused,
+    // because a graph with one could never be launched.
+    if (reaches(f, t)) return cudaErrorInvalidValue;
+    if (std::find(t->deps.begin(), t->deps.end(), f) == t->deps.end()) t->deps.push_back(f);
+  }
+  return cudaSuccess;
+}
+
+static cudaError_t graph_remove_deps(cudaGraph_t graph, const cudaGraphNode_t* from,
+                                    const cudaGraphNode_t* to, size_t numDeps) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  if (!g || (numDeps && (!from || !to))) return cudaErrorInvalidValue;
+  for (size_t i = 0; i < numDeps; ++i) {
+    auto* f = reinterpret_cast<GraphNodeRec*>(from[i]);
+    auto* t = reinterpret_cast<GraphNodeRec*>(to[i]);
+    if (!f || !t || !g->holds(f) || !g->holds(t)) return cudaErrorInvalidValue;
+    const auto at = std::find(t->deps.begin(), t->deps.end(), f);
+    if (at == t->deps.end()) return cudaErrorInvalidValue;   // not a dependency
+    t->deps.erase(at);
+  }
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphDestroyNode(cudaGraphNode_t node) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  for (auto& [handle, g] : g_graphs) {
+    if (!g->holds(n)) continue;
+    for (auto& up : g->nodes)
+      up->deps.erase(std::remove(up->deps.begin(), up->deps.end(), n), up->deps.end());
+    if (g->last_capture == n) g->last_capture = nullptr;
+    std::erase_if(g->nodes, [&](const std::unique_ptr<GraphNodeRec>& up) { return up.get() == n; });
+    return cudaSuccess;
+  }
+  return cudaErrorInvalidValue;
+}
+
+// ---- what a graph is, read back ----
+
+VGPU_EXPORT cudaError_t cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t* nodes,
+                                          size_t* numNodes) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  if (!g || !numNodes) return cudaErrorInvalidValue;
+  // With no array, the count is the answer; with one, it says how many fit.
+  const size_t have = g->nodes.size();
+  if (!nodes) {
+    *numNodes = have;
+    return cudaSuccess;
+  }
+  const size_t take = std::min(*numNodes, have);
+  for (size_t i = 0; i < take; ++i)
+    nodes[i] = reinterpret_cast<cudaGraphNode_t>(g->nodes[i].get());
+  *numNodes = take;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphGetRootNodes(cudaGraph_t graph, cudaGraphNode_t* nodes,
+                                              size_t* numRootNodes) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  if (!g || !numRootNodes) return cudaErrorInvalidValue;
+  std::vector<GraphNodeRec*> roots;
+  for (const auto& up : g->nodes)
+    if (up->deps.empty()) roots.push_back(up.get());
+  if (!nodes) {
+    *numRootNodes = roots.size();
+    return cudaSuccess;
+  }
+  const size_t take = std::min(*numRootNodes, roots.size());
+  for (size_t i = 0; i < take; ++i) nodes[i] = reinterpret_cast<cudaGraphNode_t>(roots[i]);
+  *numRootNodes = take;
+  return cudaSuccess;
+}
+
+static cudaError_t graph_get_edges(cudaGraph_t graph, cudaGraphNode_t* from,
+                                  cudaGraphNode_t* to, size_t* numEdges) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  if (!g || !numEdges) return cudaErrorInvalidValue;
+  std::vector<std::pair<GraphNodeRec*, GraphNodeRec*>> edges;
+  for (const auto& up : g->nodes)
+    for (GraphNodeRec* d : up->deps) edges.emplace_back(d, up.get());
+  if (!from || !to) {
+    *numEdges = edges.size();
+    return cudaSuccess;
+  }
+  const size_t take = std::min(*numEdges, edges.size());
+  for (size_t i = 0; i < take; ++i) {
+    from[i] = reinterpret_cast<cudaGraphNode_t>(edges[i].first);
+    to[i] = reinterpret_cast<cudaGraphNode_t>(edges[i].second);
+  }
+  *numEdges = take;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphNodeGetType(cudaGraphNode_t node, cudaGraphNodeType* type) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  if (!n || !type) return cudaErrorInvalidValue;
+  for (auto& [handle, g] : g_graphs)
+    if (g->holds(n)) {
+      *type = n->type;
+      return cudaSuccess;
+    }
+  return cudaErrorInvalidValue;
+}
+
+static cudaError_t node_get_deps(cudaGraphNode_t node, cudaGraphNode_t* deps, size_t* numDeps) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  if (!n || !numDeps) return cudaErrorInvalidValue;
+  if (!deps) {
+    *numDeps = n->deps.size();
+    return cudaSuccess;
+  }
+  const size_t take = std::min(*numDeps, n->deps.size());
+  for (size_t i = 0; i < take; ++i) deps[i] = reinterpret_cast<cudaGraphNode_t>(n->deps[i]);
+  *numDeps = take;
+  return cudaSuccess;
+}
+
+static cudaError_t node_get_dependents(cudaGraphNode_t node, cudaGraphNode_t* dependent,
+                                      size_t* numDependentNodes) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  if (!n || !numDependentNodes) return cudaErrorInvalidValue;
+  std::vector<GraphNodeRec*> after;
+  for (auto& [handle, g] : g_graphs) {
+    if (!g->holds(n)) continue;
+    for (const auto& up : g->nodes)
+      if (std::find(up->deps.begin(), up->deps.end(), n) != up->deps.end()) after.push_back(up.get());
+    break;
+  }
+  if (!dependent) {
+    *numDependentNodes = after.size();
+    return cudaSuccess;
+  }
+  const size_t take = std::min(*numDependentNodes, after.size());
+  for (size_t i = 0; i < take; ++i) dependent[i] = reinterpret_cast<cudaGraphNode_t>(after[i]);
+  *numDependentNodes = take;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphChildGraphNodeGetGraph(cudaGraphNode_t node, cudaGraph_t* pGraph) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  if (!n || !pGraph || n->type != cudaGraphNodeTypeGraph || !n->child) return cudaErrorInvalidValue;
+  // The node owns its child graph. What is handed out is a handle that can be
+  // read like any other graph and not destroyed: the parent's node frees it.
+  g_borrowed_graphs[n->child] = n->child;
+  *pGraph = reinterpret_cast<cudaGraph_t>(n->child);
+  return cudaSuccess;
+}
+
+// ---- parameters, read and changed ----
+
+VGPU_EXPORT cudaError_t cudaGraphKernelNodeGetParams(cudaGraphNode_t node,
+                                                     cudaKernelNodeParams* params) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  if (!n || !params || n->type != cudaGraphNodeTypeKernel) return cudaErrorInvalidValue;
+  params->func = const_cast<void*>(n->work.func);
+  params->gridDim = n->work.grid;
+  params->blockDim = n->work.block;
+  params->sharedMemBytes = static_cast<unsigned>(n->work.shared);
+  // The argument *values* live in the node; a caller reading them back gets
+  // pointers into the node's own copies, which is what the driver does too.
+  n->work.arg_ptrs.resize(n->work.arg_bytes.size());
+  for (size_t i = 0; i < n->work.arg_bytes.size(); ++i)
+    n->work.arg_ptrs[i] = n->work.arg_bytes[i].data();
+  params->kernelParams = n->work.arg_ptrs.data();
+  params->extra = nullptr;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphKernelNodeSetParams(cudaGraphNode_t node,
+                                                     const cudaKernelNodeParams* params) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  if (!n || n->type != cudaGraphNodeTypeKernel) return cudaErrorInvalidValue;
+  RecordedLaunch w;
+  if (const cudaError_t rc = fill_kernel_work(&w, params); rc != cudaSuccess) return rc;
+  // The kernel a node runs cannot change, only its arguments and shape.
+  if (w.func != n->work.func) return cudaErrorInvalidValue;
+  n->work = std::move(w);
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphMemsetNodeGetParams(cudaGraphNode_t node,
+                                                     cudaMemsetParams* params) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  if (!n || !params || n->type != cudaGraphNodeTypeMemset) return cudaErrorInvalidValue;
+  std::memset(params, 0, sizeof *params);
+  params->dst = n->work.dst;
+  params->value = static_cast<unsigned>(n->work.fill_value);
+  params->elementSize = 1;
+  params->width = n->work.bytes;
+  params->height = 1;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphMemsetNodeSetParams(cudaGraphNode_t node,
+                                                     const cudaMemsetParams* params) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  if (!n || n->type != cudaGraphNodeTypeMemset) return cudaErrorInvalidValue;
+  return fill_memset_work(&n->work, params);
+}
+
+VGPU_EXPORT cudaError_t cudaGraphMemcpyNodeGetParams(cudaGraphNode_t node,
+                                                     cudaMemcpy3DParms* params) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  if (!n || !params || n->type != cudaGraphNodeTypeMemcpy) return cudaErrorInvalidValue;
+  std::memset(params, 0, sizeof *params);
+  // One contiguous run of bytes, described the way a 3D copy describes it.
+  params->srcPtr = cudaPitchedPtr{const_cast<void*>(n->work.src), n->work.bytes, n->work.bytes, 1};
+  params->dstPtr = cudaPitchedPtr{n->work.dst, n->work.bytes, n->work.bytes, 1};
+  params->extent = cudaExtent{n->work.bytes, 1, 1};
+  params->kind = n->work.copy_kind;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphMemcpyNodeSetParams(cudaGraphNode_t node,
+                                                     const cudaMemcpy3DParms* params) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  if (!n || n->type != cudaGraphNodeTypeMemcpy) return cudaErrorInvalidValue;
+  return fill_memcpy_work(&n->work, params);
+}
+
+VGPU_EXPORT cudaError_t cudaGraphMemcpyNodeSetParams1D(cudaGraphNode_t node, void* dst,
+                                                       const void* src, size_t count,
+                                                       cudaMemcpyKind kind) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  if (!n || !dst || !src || n->type != cudaGraphNodeTypeMemcpy) return cudaErrorInvalidValue;
+  n->work.dst = dst;
+  n->work.src = src;
+  n->work.bytes = count;
+  n->work.copy_kind = kind;
+  return cudaSuccess;
+}
+
+// ---- cloning, and updating an instantiated graph ----
+
+VGPU_EXPORT cudaError_t cudaGraphClone(cudaGraph_t* pGraphClone, cudaGraph_t originalGraph) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* src = graph_from(originalGraph);
+  if (!src || !pGraphClone) return cudaErrorInvalidValue;
+  auto copy = clone_graph(*src, nullptr);
+  void* handle = copy.get();
+  g_graphs[handle] = std::move(copy);
+  *pGraphClone = static_cast<cudaGraph_t>(handle);
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphNodeFindInClone(cudaGraphNode_t* pNode,
+                                                 cudaGraphNode_t originalNode,
+                                                 cudaGraph_t clonedGraph) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* clone = graph_from(clonedGraph);
+  auto* original = reinterpret_cast<GraphNodeRec*>(originalNode);
+  if (!clone || !original || !pNode) return cudaErrorInvalidValue;
+  // A clone keeps its nodes in the order the original had them, so the node at
+  // the same position is the same node.
+  for (auto& [handle, g] : g_graphs) {
+    if (!g->holds(original)) continue;
+    for (size_t i = 0; i < g->nodes.size(); ++i)
+      if (g->nodes[i].get() == original) {
+        if (i >= clone->nodes.size()) return cudaErrorInvalidValue;
+        *pNode = reinterpret_cast<cudaGraphNode_t>(clone->nodes[i].get());
+        return cudaSuccess;
+      }
+  }
+  return cudaErrorInvalidValue;
+}
+
+// An instantiated graph can take new parameters without being built again, as
+// long as the shape it was built from has not changed. That is the whole point
+// of the call: a framework re-uses one executable graph with new pointers.
+VGPU_EXPORT cudaError_t cudaGraphExecUpdate(cudaGraphExec_t exec, cudaGraph_t graph,
+                                            cudaGraphExecUpdateResultInfo* info) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  if (info) std::memset(info, 0, sizeof *info);
+  auto it = g_graph_execs.find(static_cast<void*>(exec));
+  GraphRec* want = graph_from(graph);
+  if (it == g_graph_execs.end() || !want) return cudaErrorInvalidValue;
+  GraphRec& have = *it->second;
+  const auto topology_differs = [&]() {
+    if (have.nodes.size() != want->nodes.size()) return true;
+    for (size_t i = 0; i < have.nodes.size(); ++i) {
+      if (have.nodes[i]->type != want->nodes[i]->type) return true;
+      if (have.nodes[i]->deps.size() != want->nodes[i]->deps.size()) return true;
+    }
+    return false;
+  };
+  if (topology_differs()) {
+    if (info) info->result = cudaGraphExecUpdateErrorTopologyChanged;
+    return cudaErrorGraphExecUpdateFailure;
+  }
+  // The kernel each node runs is part of the shape, not a parameter.
+  for (size_t i = 0; i < have.nodes.size(); ++i)
+    if (have.nodes[i]->type == cudaGraphNodeTypeKernel &&
+        have.nodes[i]->work.func != want->nodes[i]->work.func) {
+      if (info) {
+        info->result = cudaGraphExecUpdateErrorFunctionChanged;
+        info->errorNode = reinterpret_cast<cudaGraphNode_t>(want->nodes[i].get());
+      }
+      return cudaErrorGraphExecUpdateFailure;
+    }
+  for (size_t i = 0; i < have.nodes.size(); ++i) {
+    GraphNodeRec* dst = have.nodes[i].get();
+    const GraphNodeRec* src = want->nodes[i].get();
+    dst->work.grid = src->work.grid;
+    dst->work.block = src->work.block;
+    dst->work.shared = src->work.shared;
+    dst->work.arg_bytes = src->work.arg_bytes;
+    dst->work.dst = src->work.dst;
+    dst->work.src = src->work.src;
+    dst->work.bytes = src->work.bytes;
+    dst->work.copy_kind = src->work.copy_kind;
+    dst->work.fill_value = src->work.fill_value;
+    dst->work.host_op = src->work.host_op;
+  }
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphExecKernelNodeSetParams(cudaGraphExec_t exec,
+                                                          cudaGraphNode_t node,
+                                                          const cudaKernelNodeParams* params) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto it = g_graph_execs.find(static_cast<void*>(exec));
+  if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
+  auto* original = reinterpret_cast<GraphNodeRec*>(node);
+  if (!original) return cudaErrorInvalidValue;
+  // The node named is the one in the graph that was instantiated; the
+  // executable graph holds its own copy at the same position.
+  for (auto& [handle, g] : g_graphs) {
+    if (!g->holds(original)) continue;
+    for (size_t i = 0; i < g->nodes.size(); ++i) {
+      if (g->nodes[i].get() != original) continue;
+      if (i >= it->second->nodes.size()) return cudaErrorInvalidValue;
+      GraphNodeRec* target = it->second->nodes[i].get();
+      if (target->type != cudaGraphNodeTypeKernel) return cudaErrorInvalidValue;
+      RecordedLaunch w;
+      if (const cudaError_t rc = fill_kernel_work(&w, params); rc != cudaSuccess) return rc;
+      if (w.func != target->work.func) return cudaErrorInvalidValue;
+      target->work = std::move(w);
+      return cudaSuccess;
+    }
+  }
+  return cudaErrorInvalidValue;
+}
+
+
+// CUDA 13 added an edge-data argument to each of these: ordering information
+// for an edge, whose only value this engine can honour is the default. The
+// shim is built against one toolkit, so each is exported with that toolkit's
+// own signature -- C linkage makes a mismatch a hard error rather than a
+// crash in somebody's program.
+namespace {
+// An edge-data array is accepted when it asks for the default edge; anything
+// else describes ordering this engine does not model.
+#if CUDART_VERSION >= 13000
+bool default_edges(const cudaGraphEdgeData* data, size_t count) {
+  if (!data) return true;
+  for (size_t i = 0; i < count; ++i)
+    if (data[i].from_port || data[i].to_port || data[i].type) return false;
+  return true;
+}
+#endif
+}  // namespace
+
+#if CUDART_VERSION >= 13000
+VGPU_EXPORT cudaError_t cudaGraphAddDependencies(cudaGraph_t graph, const cudaGraphNode_t* from,
+                                                const cudaGraphNode_t* to,
+                                                const cudaGraphEdgeData* edgeData,
+                                                size_t numDeps) {
+  if (!default_edges(edgeData, numDeps)) return cudaErrorNotSupported;
+  return graph_add_deps(graph, from, to, numDeps);
+}
+VGPU_EXPORT cudaError_t cudaGraphRemoveDependencies(cudaGraph_t graph, const cudaGraphNode_t* from,
+                                                   const cudaGraphNode_t* to,
+                                                   const cudaGraphEdgeData* edgeData,
+                                                   size_t numDeps) {
+  if (!default_edges(edgeData, numDeps)) return cudaErrorNotSupported;
+  return graph_remove_deps(graph, from, to, numDeps);
+}
+VGPU_EXPORT cudaError_t cudaGraphGetEdges(cudaGraph_t graph, cudaGraphNode_t* from,
+                                         cudaGraphNode_t* to, cudaGraphEdgeData* edgeData,
+                                         size_t* numEdges) {
+  const cudaError_t rc = graph_get_edges(graph, from, to, numEdges);
+  // Every edge this engine has is a plain dependency.
+  if (rc == cudaSuccess && edgeData && numEdges)
+    std::memset(edgeData, 0, *numEdges * sizeof(cudaGraphEdgeData));
+  return rc;
+}
+VGPU_EXPORT cudaError_t cudaGraphNodeGetDependencies(cudaGraphNode_t node, cudaGraphNode_t* deps,
+                                                    cudaGraphEdgeData* edgeData, size_t* numDeps) {
+  const cudaError_t rc = node_get_deps(node, deps, numDeps);
+  if (rc == cudaSuccess && edgeData && numDeps)
+    std::memset(edgeData, 0, *numDeps * sizeof(cudaGraphEdgeData));
+  return rc;
+}
+VGPU_EXPORT cudaError_t cudaGraphNodeGetDependentNodes(cudaGraphNode_t node,
+                                                      cudaGraphNode_t* dependent,
+                                                      cudaGraphEdgeData* edgeData,
+                                                      size_t* numDependentNodes) {
+  const cudaError_t rc = node_get_dependents(node, dependent, numDependentNodes);
+  if (rc == cudaSuccess && edgeData && numDependentNodes)
+    std::memset(edgeData, 0, *numDependentNodes * sizeof(cudaGraphEdgeData));
+  return rc;
+}
+#else
+VGPU_EXPORT cudaError_t cudaGraphAddDependencies(cudaGraph_t graph, const cudaGraphNode_t* from,
+                                                const cudaGraphNode_t* to, size_t numDeps) {
+  return graph_add_deps(graph, from, to, numDeps);
+}
+VGPU_EXPORT cudaError_t cudaGraphRemoveDependencies(cudaGraph_t graph, const cudaGraphNode_t* from,
+                                                   const cudaGraphNode_t* to, size_t numDeps) {
+  return graph_remove_deps(graph, from, to, numDeps);
+}
+VGPU_EXPORT cudaError_t cudaGraphGetEdges(cudaGraph_t graph, cudaGraphNode_t* from,
+                                         cudaGraphNode_t* to, size_t* numEdges) {
+  return graph_get_edges(graph, from, to, numEdges);
+}
+VGPU_EXPORT cudaError_t cudaGraphNodeGetDependencies(cudaGraphNode_t node, cudaGraphNode_t* deps,
+                                                    size_t* numDeps) {
+  return node_get_deps(node, deps, numDeps);
+}
+VGPU_EXPORT cudaError_t cudaGraphNodeGetDependentNodes(cudaGraphNode_t node,
+                                                      cudaGraphNode_t* dependent,
+                                                      size_t* numDependentNodes) {
+  return node_get_dependents(node, dependent, numDependentNodes);
+}
+#endif
+
+// The graph as a DOT drawing: one node per node, one edge per dependency. It
+// used to print an empty graph, which is a picture of nothing.
+VGPU_EXPORT cudaError_t cudaGraphDebugDotPrint(cudaGraph_t graph, const char* path, unsigned int) {
+  if (!path) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  if (!g) return cudaErrorInvalidValue;
+  std::FILE* f = std::fopen(path, "w");
+  if (!f) return cudaErrorOperatingSystem;
+  const auto label = [](cudaGraphNodeType t) {
+    switch (t) {
+      case cudaGraphNodeTypeKernel: return "KERNEL";
+      case cudaGraphNodeTypeMemcpy: return "MEMCPY";
+      case cudaGraphNodeTypeMemset: return "MEMSET";
+      case cudaGraphNodeTypeHost: return "HOST";
+      case cudaGraphNodeTypeGraph: return "GRAPH";
+      case cudaGraphNodeTypeEmpty: return "EMPTY";
+      default: return "NODE";
+    }
+  };
+  std::map<const GraphNodeRec*, size_t> index;
+  for (size_t i = 0; i < g->nodes.size(); ++i) index[g->nodes[i].get()] = i;
+  std::fprintf(f, "digraph dot {\n");
+  for (size_t i = 0; i < g->nodes.size(); ++i)
+    std::fprintf(f, "  \"graph_%zu\" [label=\"%zu\\n%s\"]\n", i, i, label(g->nodes[i]->type));
+  for (size_t i = 0; i < g->nodes.size(); ++i)
+    for (const GraphNodeRec* d : g->nodes[i]->deps)
+      std::fprintf(f, "  \"graph_%zu\" -> \"graph_%zu\"\n", index[d], i);
+  std::fprintf(f, "}\n");
+  std::fclose(f);
+  return cudaSuccess;
+}
+
 VGPU_EXPORT cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
+  // A child graph belongs to the node that holds it; destroying it here would
+  // free memory the node still points at.
+  if (g_borrowed_graphs.count(static_cast<void*>(graph)) &&
+      !g_graphs.count(static_cast<void*>(graph)))
+    return cudaErrorInvalidValue;
+  if (GraphRec* g = graph_from(graph))
+    for (const auto& child : g->children) std::erase_if(
+        g_borrowed_graphs, [&](const auto& kv) { return kv.second == child.get(); });
   g_graphs.erase(static_cast<void*>(graph));
   return cudaSuccess;
 }
