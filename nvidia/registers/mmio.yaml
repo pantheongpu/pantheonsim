@@ -1,29 +1,43 @@
-# MMIO registers of an NVIDIA GPU behind BAR0, as measured on real cards with
-# tools/regprobe (nvidia/registers/measurements/): the map grows as registers are read
-# and identified. Offsets are byte addresses in BAR0. Only the measured card's
-# own profile has this space: nvidia/rtx3080ti (GA102, driver 595.84).
+# MMIO registers of an NVIDIA GPU behind BAR0. Offsets are byte addresses in
+# BAR0, and every one of them comes from NVIDIA's own published register
+# headers -- the open GPU kernel modules' swref/published tree, MIT licensed
+# (nvidia/registers/LICENSES/nvidia-open-gpu-kernel-modules.txt names the files). Each
+# register's `source` says which header and symbol it is.
 #
-# A register the map does not declare reads as 0xbadf5040, the value the card
-# answered with from 0xc on -- what a protected or absent register reads as.
+# Values are this project's, not the headers': `measured` says what a real card
+# answered where one was read (nvidia/registers/measurements/, tools/regprobe),
+# and `status` says whether the value behaves as hardware does (done) or is a
+# plausible model (model). Nothing here was read from a card beyond
+# measurements/bar0-head.tsv -- a sweep of the rest halted the card's
+# microcontroller, so the map grew from the published headers instead.
+#
+# A register the map does not declare reads as 0xbadf5040, the value the
+# measured card answered from 0xc on: a protected or absent register.
 
-chip_id:
+pmc_boot_0:
   offset: "0x000000"
   width: 32
   access: ro
-  reset: "0xb72000a1"
-  fields: ["7:0 revision (0xa1 as in configuration space)", "31:8 chip"]
-  surfaces: [driver probe, bring-up scripts]
+  backing: nvidia.pmc_boot_0
+  fields: ["3:0 minor_revision", "7:4 major_revision", "8 architecture_1", "23:20 implementation", "28:24 architecture_0"]
+  surfaces: [driver probe, bring-up scripts, nvidia-bug-report]
+  source: "nv_ref.h NV_PMC_BOOT_0, with the architecture ids from the same header"
   status: done
-  measured: "RTX 3080 Ti: 0xb72000a1"
+  measured: "RTX 3080 Ti: 0xb72000a1 -- architecture 0x17 (GA100 family), implementation 2 (GA102), revision a1, which is the revision configuration space reports"
 
-reg_000004:
+# Whether software is talking to a card or to a virtual function of one. Zero
+# is a real card, which is what this simulator presents: it models a whole GPU,
+# not an SR-IOV slice of one.
+pmc_boot_1:
   offset: "0x000004"
   width: 32
   access: ro
   reset: "0x00000000"
-  surfaces: []
+  fields: ["8 vgpu8 -- 0 real / 1 virtual", "17:16 vgpu -- 0 real / 1 paravirtual / 2 virtual function"]
+  surfaces: [driver probe]
+  source: "nv_ref.h NV_PMC_BOOT_1"
   status: done
-  measured: "RTX 3080 Ti: 0x00000000; not yet identified"
+  measured: "RTX 3080 Ti: 0x00000000 -- a real card, not a virtual function"
 
 reg_000008:
   offset: "0x000008"
@@ -32,4 +46,147 @@ reg_000008:
   reset: "0x00000000"
   surfaces: []
   status: done
-  measured: "RTX 3080 Ti: 0x00000000; not yet identified"
+  measured: "RTX 3080 Ti: 0x00000000; the published headers name no register here"
+
+# Interrupt status, and the mask that gates it. Nothing in this engine raises a
+# device interrupt -- there is no hardware to raise one -- so the status reads
+# as no interrupt pending, always. The mask is a register software owns.
+pmc_intr_0:
+  offset: "0x000100"
+  width: 32
+  access: ro
+  reset: "0x00000000"
+  surfaces: [driver interrupt handler]
+  source: "turing/tu102/dev_pmc.h NV_PMC_INTR(0)"
+  status: model
+
+pmc_intr_en_0:
+  offset: "0x000140"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver interrupt setup]
+  source: "turing/tu102/dev_pmc.h NV_PMC_INTR_EN(0)"
+  status: model
+
+# Which engines are out of reset: the host and graphics engines, the first two
+# copy engines, the power and security microcontrollers, the performance
+# monitor, and the display engine only on a card with display outputs. A model,
+# not a measurement -- the bit positions are the header's, the choice of which
+# are set is ours. The video bits below are declared because software decodes
+# them, and they read as 0: which decoders and encoders a card has differs by
+# model and the profiles do not record it, so setting them would be a guess.
+pmc_enable:
+  offset: "0x000200"
+  width: 32
+  access: rw
+  backing: nvidia.pmc_enable
+  write_mask: "0xffffffff"
+  fields: ["4 pmedia", "6 ce0", "7 ce1", "8 pfifo", "12 pgraph", "13 pwr", "14 sec", "15 nvdec0", "18 nvenc0", "28 perfmon", "30 pdisp", "31 nvjpg0"]
+  surfaces: [driver bring-up, engine reset]
+  source: "turing/tu102/dev_pmc.h NV_PMC_ENABLE and its per-engine bits"
+  status: model
+
+# The scratch words the VBIOS and the driver pass each other. Real scratch:
+# what is written reads back, which is the whole contract. The array is longer
+# on hardware; these are the ones this map declares.
+pbus_sw_scratch_0:
+  offset: "0x001400"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  source: "turing/tu102/dev_bus.h NV_PBUS_SW_SCRATCH(0)"
+  status: done
+
+pbus_sw_scratch_1:
+  offset: "0x001404"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  source: "turing/tu102/dev_bus.h NV_PBUS_SW_SCRATCH(1)"
+  status: done
+
+pbus_sw_scratch_2:
+  offset: "0x001408"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  source: "turing/tu102/dev_bus.h NV_PBUS_SW_SCRATCH(2)"
+  status: done
+
+pbus_sw_scratch_3:
+  offset: "0x00140c"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  source: "turing/tu102/dev_bus.h NV_PBUS_SW_SCRATCH(3)"
+  status: done
+
+# Where BAR1 and BAR2 point inside device memory, and how: a page-table
+# pointer, its target, and whether the aperture is physical or virtual. The
+# driver programs these during bring-up; this engine keeps what was written
+# rather than re-aiming an aperture it does not have.
+pbus_bar1_block:
+  offset: "0x001704"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["27:0 ptr", "29:28 target -- 0 video memory / 2 coherent system memory / 3 non-coherent", "31 mode -- 0 physical / 1 virtual"]
+  surfaces: [driver bring-up]
+  source: "turing/tu102/dev_bus.h NV_PBUS_BAR1_BLOCK"
+  status: model
+
+pbus_bar2_block:
+  offset: "0x001714"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["27:0 ptr", "29:28 target", "31 mode"]
+  surfaces: [driver bring-up]
+  source: "turing/tu102/dev_bus.h NV_PBUS_BAR2_BLOCK"
+  status: model
+
+# The timer block. The counter advances with the clock the rest of the engine
+# keeps time by, so two reads differ by the time between them -- what software
+# polling it expects. It is not a device clock and says nothing about how long
+# hardware would take.
+ptimer_intr_0:
+  offset: "0x009100"
+  width: 32
+  access: ro
+  reset: "0x00000000"
+  surfaces: [driver timer interrupt]
+  source: "turing/tu102/dev_timer.h NV_PTIMER_INTR_0"
+  status: model
+
+ptimer_intr_en_0:
+  offset: "0x009140"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [driver timer setup]
+  source: "turing/tu102/dev_timer.h NV_PTIMER_INTR_EN_0"
+  status: model
+
+ptimer_vf_timer_0:
+  offset: "0x009800"
+  width: 32
+  access: ro
+  backing: nvidia.ptimer_nsec
+  fields: ["31:0 nsec"]
+  surfaces: [driver timekeeping]
+  source: "turing/tu102/dev_timer.h NV_PTIMER_VF_TIMER(0)"
+  status: model

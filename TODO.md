@@ -479,8 +479,13 @@ narrows what counts as observable, not what the detector looks at.
   real lspci. AMD MMIO behind BAR5 (`--space mmio`): engine status and the SMU
   mailbox, from the amdgpu headers, on Aldebaran's IP bases until checked on an
   MI300, and NBIO's strap, VRAM size and partition modes, which the session's
-  sysfs partition files are written from. Not yet: more AMD blocks (UMC ECC), NVIDIA MMIO
-  (waits on a decision about the register source). A C API (vgpu_regs.h,
+  sysfs partition files are written from. NVIDIA MMIO behind BAR0, from NVIDIA's own published
+  register headers (MIT, nvidia/registers/LICENSES/): identity with the
+  architecture in the header's own fields on every profile and the measured
+  card's value to the bit, whether the card is a virtual function, which
+  engines a bound driver leaves running, the VBIOS scratch words, the BAR1 and
+  BAR2 block registers, and a timer that advances with the engine's clock.
+  Not yet: more AMD blocks (UMC ECC). A C API (vgpu_regs.h,
   libvgpuregs) gives bring-up software the same access. tools/regprobe
   captures real cards (read-only) to check and map the model against. AMD's
   gpu_metrics table (v1.5), amdgpu's busy and memory files and its hwmon (read

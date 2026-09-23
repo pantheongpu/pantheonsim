@@ -195,21 +195,36 @@ VTEST(every_access_is_logged_with_its_process) {
   VCHECK_EQ(full.back().seq, uint64_t{regs::kLogEntries} + 13);
 }
 
-VTEST(an_amd_gpu_has_mmio_registers_and_an_nvidia_one_does_not_yet) {
+// Both vendors have MMIO registers, each in its own space, and every offset in
+// either map says which vendor header it came from.
+VTEST(each_vendor_has_its_own_mmio_registers) {
   TempMachine m("mmio");
-  VCHECK(regs::has_space(device("amd/mi300x"), regs::Space::AmdMmio));
-  VCHECK(!regs::has_space(device("nvidia/h100"), regs::Space::AmdMmio));
-  bool refused = false;
-  try {
-    regs::RegisterSpace cs(regs::Space::AmdMmio, device("nvidia/h100"));
-  } catch (const std::invalid_argument&) {
-    refused = true;
-  }
-  VCHECK(refused);
-  for (const auto& r : regs::registers(regs::Space::AmdMmio)) {
-    VCHECK_EQ(r.width, 32u);
-    VCHECK_EQ(r.offset % 4, 0u);
-    VCHECK(!r.source.empty());   // every offset says which header it comes from
+  const auto mi = device("amd/mi300x");
+  const auto h100 = device("nvidia/h100");
+  VCHECK(regs::has_space(mi, regs::Space::AmdMmio));
+  VCHECK(regs::has_space(h100, regs::Space::AmdMmio));   // "mmio" is the GPU's own
+  VCHECK(regs::resolve_space(mi, regs::Space::AmdMmio) == regs::Space::AmdMmio);
+  VCHECK(regs::resolve_space(h100, regs::Space::AmdMmio) == regs::Space::NvidiaMmio);
+  // Either spelling asks for the device's *own* space, which is the point of
+  // resolve_space: a tool says "mmio" and gets the map that card has.
+  regs::RegisterSpace amd_bar5(regs::Space::NvidiaMmio, mi);
+  VCHECK(amd_bar5.space() == regs::Space::AmdMmio);
+  regs::RegisterSpace nv_bar0(regs::Space::AmdMmio, h100);
+  VCHECK(nv_bar0.space() == regs::Space::NvidiaMmio);
+  // And the two maps are different registers: BAR0's identity register is not
+  // in AMD's map, whose first register is an engine status.
+  VCHECK(regs::find(regs::Space::NvidiaMmio, "pmc_boot_0") != nullptr);
+  VCHECK(regs::find(regs::Space::AmdMmio, "pmc_boot_0") == nullptr);
+  for (regs::Space sp : {regs::Space::AmdMmio, regs::Space::NvidiaMmio}) {
+    VCHECK(!regs::registers(sp).empty());
+    for (const auto& r : regs::registers(sp)) {
+      VCHECK_EQ(r.width, 32u);
+      VCHECK_EQ(r.offset % 4, 0u);
+      // Every offset is accounted for: a vendor header names it, or a card was
+      // read at it. reg_000008 is the second kind -- the published headers name
+      // nothing there and a real card answered zero.
+      VCHECK(!r.source.empty() || !r.measured.empty());
+    }
   }
 }
 
@@ -306,22 +321,82 @@ VTEST(the_rtx_3080_ti_profile_is_the_measured_card_to_the_byte) {
   }
 }
 
-// An NVIDIA GPU's BAR0, as far as it has been measured: only on the measured
-// card's own model, and what the map does not declare reads as the card did.
+// An NVIDIA GPU's BAR0. Every NVIDIA card has the space -- the offsets and
+// fields are NVIDIA's published headers', which cover every architecture here --
+// and on the one card that was read it answers exactly what that card did.
 VTEST(an_nvidia_bar0_answers_as_the_measured_card) {
   TempMachine m("nvmmio");
   const auto ti = device("nvidia/rtx3080ti");
   VCHECK(regs::has_space(ti, regs::Space::AmdMmio));   // "mmio" is the GPU's own
   VCHECK(regs::resolve_space(ti, regs::Space::AmdMmio) == regs::Space::NvidiaMmio);
-  VCHECK(!regs::has_space(device("nvidia/rtx3060"), regs::Space::AmdMmio));   // not measured
-  VCHECK(!regs::has_space(device("nvidia/h100"), regs::Space::AmdMmio));
+  VCHECK(regs::has_space(device("nvidia/rtx3060"), regs::Space::AmdMmio));
+  VCHECK(regs::has_space(device("nvidia/h100"), regs::Space::AmdMmio));
   regs::RegisterSpace bar0(regs::Space::AmdMmio, ti);
   VCHECK(bar0.space() == regs::Space::NvidiaMmio);
-  VCHECK_EQ(bar0.read(0x0, 4), 0xb72000a1u);
-  VCHECK_EQ(bar0.read(0x4, 4), 0u);
-  VCHECK_EQ(bar0.read(0xc, 4), 0xbadf5040u);
+  VCHECK_EQ(bar0.read(0x0, 4), 0xb72000a1u);   // measured, to the bit
+  VCHECK_EQ(bar0.read(0x4, 4), 0u);            // measured: a real card, not a virtual function
+  VCHECK_EQ(bar0.read(0x8, 4), 0u);            // measured
+  VCHECK_EQ(bar0.read(0xc, 4), 0xbadf5040u);   // measured: nothing there
   VCHECK_EQ(bar0.read(0x100000, 4), 0xbadf5040u);
   VCHECK_EQ(bar0.read(0x0, 4) & 0xFF, 0xa1u);   // the revision configuration space reports
+}
+
+// PMC_BOOT_0 carries the architecture and die in the fields NVIDIA's header
+// defines, so software that reads a card's family off BAR0 gets the right
+// answer on every profile -- and the measured card's whole value back.
+VTEST(every_nvidia_card_reports_its_architecture_in_bar0) {
+  TempMachine m("nvarch");
+  struct Want {
+    const char* gpu;
+    uint32_t architecture;   // NV_PMC_BOOT_0_ARCHITECTURE_*
+  };
+  for (const Want& w : {Want{"nvidia/t4", 0x16},            // TU100: Turing
+                        Want{"nvidia/a100", 0x17},          // GA100: Ampere
+                        Want{"nvidia/rtx3080ti", 0x17},
+                        Want{"nvidia/h100", 0x18},          // GH100: Hopper
+                        Want{"nvidia/gh200-480gb", 0x18},
+                        Want{"nvidia/l4", 0x19},            // AD100: Ada
+                        Want{"nvidia/l40s", 0x19},
+                        Want{"nvidia/b200", 0x1a}}) {       // GB100: Blackwell
+    regs::RegisterSpace bar0(regs::Space::AmdMmio, device(w.gpu));
+    const uint32_t v = bar0.read(0x0, 4);
+    if (((v >> 24) & 0x1F) != w.architecture)
+      throw vtest::Failure(std::string(w.gpu) + ": PMC_BOOT_0 architecture is " +
+                           std::to_string((v >> 24) & 0x1F) + ", expected " +
+                           std::to_string(w.architecture));
+    VCHECK_EQ(v & 0xFFu, 0xa1u);   // the revision, as configuration space reports it
+    // The die is known only where a card was read: the RTX 3080 Ti is GA102,
+    // which that card reported as implementation 2.
+    VCHECK_EQ((v >> 20) & 0xFu, std::string(w.gpu) == "nvidia/rtx3080ti" ? 2u : 0u);
+  }
+}
+
+// The registers a driver writes keep what was written, and the counter
+// software polls for time moves forward. Both are what BAR0 is read for.
+VTEST(nvidia_bar0_scratch_keeps_writes_and_the_timer_advances) {
+  TempMachine m("nvscratch");
+  regs::RegisterSpace bar0(regs::Space::AmdMmio, device("nvidia/t4"));
+  bar0.write(0x1400, 4, 0xdeadbeef);            // PBUS_SW_SCRATCH(0)
+  bar0.write(0x140c, 4, 0x0000f00d);            // PBUS_SW_SCRATCH(3)
+  VCHECK_EQ(bar0.read(0x1400, 4), 0xdeadbeefu);
+  VCHECK_EQ(bar0.read(0x140c, 4), 0x0000f00du);
+  VCHECK_EQ(bar0.read(0x1404, 4), 0u);          // its neighbours are untouched
+  bar0.write(0x1704, 4, 0x80000123);            // BAR1_BLOCK: pointer, target and mode
+  VCHECK_EQ(bar0.read(0x1704, 4), 0x80000123u);
+  // Read-only registers ignore a write, as the database says they do.
+  bar0.write(0x0, 4, 0);
+  VCHECK_EQ(bar0.read(0x0, 4) >> 24, 0xb6u);    // still a Turing card
+  const uint32_t t0 = bar0.read(0x9800, 4);     // PTIMER_VF_TIMER(0), nanoseconds
+  uint32_t t1 = t0;
+  for (int i = 0; i < 1000 && t1 == t0; ++i) t1 = bar0.read(0x9800, 4);
+  VCHECK(t1 != t0);
+  // Which engines a bound driver leaves running: the host and graphics engines
+  // at least, and the display engine only where there are display outputs.
+  const uint32_t enable = bar0.read(0x200, 4);
+  VCHECK((enable & (1u << 12)) && (enable & (1u << 8)));          // pgraph, pfifo
+  VCHECK(!(enable & (1u << 30)));                                 // no display on a T4
+  regs::RegisterSpace geforce(regs::Space::AmdMmio, device("nvidia/rtx3080ti"));
+  VCHECK(geforce.read(0x200, 4) & (1u << 30));                    // pdisp on a GeForce
 }
 
 VTEST(capability_registers_are_found_through_each_cards_chain) {
@@ -475,8 +550,14 @@ VTEST(every_gpu_starts_from_its_registers_file) {
     VCHECK_EQ(!g->mmio.empty(), regs::has_space(d, regs::Space::AmdMmio));
     if (g->mmio.empty()) continue;
     regs::RegisterSpace mmio(regs::Space::AmdMmio, d);
-    for (const auto& r : g->mmio)
-      if (read_register(mmio, r) != r.value) throw vtest::Failure(gpu + ": " + r.name + " does not read as its file's value");
+    for (const auto& r : g->mmio) {
+      // A counter that follows the clock cannot read back its power-on value a
+      // moment later; the file records where it starts, and that it moves is
+      // what nvidia_bar0_scratch_keeps_writes_and_the_timer_advances checks.
+      if (r.live == "nvidia.ptimer_nsec") continue;
+      if (read_register(mmio, r) != r.value)
+        throw vtest::Failure(gpu + ": " + r.name + " does not read as its file's value");
+    }
   }
 }
 
@@ -495,9 +576,19 @@ VTEST(each_gpu_models_registers_are_its_own) {
   const auto* t4 = regs::gpu_registers(device("nvidia/t4"));
   const auto* ti = regs::gpu_registers(device("nvidia/rtx3080ti"));
   const auto* mi = regs::gpu_registers(device("amd/mi300x"));
-  VCHECK(t4->mmio.empty());           // no BAR0 measured for a T4
-  VCHECK(!ti->mmio.empty());          // the measured card's BAR0
+  VCHECK(!t4->mmio.empty());          // every NVIDIA card has BAR0 registers
+  VCHECK(!ti->mmio.empty());
   VCHECK(!mi->mmio.empty());          // an AMD GPU's registers behind BAR5
+  // The same registers, different identities: the two NVIDIA cards report
+  // different architectures in PMC_BOOT_0, and the AMD card has another map.
+  const auto boot = [](const regs::GpuRegisters* g) {
+    for (const auto& r : g->mmio)
+      if (r.name == "pmc_boot_0") return r.value;
+    return 0u;
+  };
+  VCHECK_EQ(boot(ti), 0xb72000a1u);
+  VCHECK_EQ(boot(t4) >> 24, 0xb6u);
+  VCHECK_EQ(boot(mi), 0u);            // no such register in AMD's map
   VCHECK_EQ(ti->layout, std::string("nvidia-rtx3080ti"));
   VCHECK_EQ(t4->layout, std::string("generic"));
 }
