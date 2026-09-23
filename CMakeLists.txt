@@ -587,6 +587,9 @@ target_compile_definitions(test_amd_gcn_math PRIVATE VGPU_SOURCE_DIR="${CMAKE_SO
 # Scratch, LDS atomics, a cross-lane read, and flat pointers.
 vgpu_unit_test(test_amd_gcn_memory amd/tests/unit/test_gcn_memory.cpp)
 target_compile_definitions(test_amd_gcn_memory PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# A module's own variables, and the relocations that find them.
+vgpu_unit_test(test_amd_gcn_globals amd/tests/unit/test_gcn_globals.cpp)
+target_compile_definitions(test_amd_gcn_globals PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_robustness)
 target_include_directories(test_robustness PRIVATE nvidia/src)
 target_sources(test_robustness PRIVATE nvidia/src/fatbin.cpp)

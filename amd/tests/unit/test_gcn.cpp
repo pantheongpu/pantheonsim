@@ -89,6 +89,7 @@ VTEST(every_instruction_decodes_as_the_assembler_wrote_it) {
     check_against_assembler("ops.gfx942.o", "ops.gfx942.dis");
     check_against_assembler("math.gfx942.o", "math.gfx942.dis");
     check_against_assembler("memory.gfx942.o", "memory.gfx942.dis");
+    check_against_assembler("globals.gfx942.o", "globals.gfx942.dis");
   }
 }
 

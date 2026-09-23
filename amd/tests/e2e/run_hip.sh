@@ -37,13 +37,20 @@ expect "a HIP program links against the shim" "yes" \
   "$([[ -x "$tmp/vector_add_hip" ]] && echo yes || echo "no: $(head -3 "$tmp/cc.err")")"
 [[ -x "$tmp/vector_add_hip" ]] || exit 1
 
-out=$(VGPU_GPU=amd/mi300x "$tmp/vector_add_hip" "$root/amd/tests/data/vector_add.gfx942.o" 2>&1)
+out=$(VGPU_GPU=amd/mi300x "$tmp/vector_add_hip" "$root/amd/tests/data/vector_add.gfx942.o" \
+        "$root/amd/tests/data/globals.gfx942.o" 2>&1)
 status=$?
 echo "$out" | sed 's/^/      /'
 expect "it runs and every element is right" "0" "$status"
 expect "it sees the GPU the profile describes" "device AMD Instinct MI300X gfx942 warp 64" \
   "$(grep -o '^device AMD Instinct MI300X gfx942 warp 64' <<< "$out")"
 expect "and no element came out wrong" "wrong 0 of 1000" "$(grep -o 'wrong 0 of 1000' <<< "$out")"
+expect "a module's variable is where hipModuleGetGlobal says" "scale is 4 bytes" \
+  "$(grep -o 'scale is 4 bytes' <<< "$out")"
+expect "and what the host writes there is what the kernel reads" "global scale applied 1" \
+  "$(grep -o 'global scale applied 1' <<< "$out")"
+expect "and the host reads back what the kernel wrote into it" "kernel wrote its own array 1" \
+  "$(grep -o 'kernel wrote its own array 1' <<< "$out")"
 expect "a kernel the code object does not have is refused" "missing kernel refused 1" \
   "$(grep -o 'missing kernel refused 1' <<< "$out")"
 expect "and so is a launch with no work-items" "empty launch refused 1" \

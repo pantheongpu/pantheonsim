@@ -542,8 +542,10 @@ what is done.
   integer and float math including division, double and packed half
   precision, the transcendentals, conversions, comparisons, loops and both
   kinds of branch, and the memory a kernel uses: global, LDS and their
-  atomics, private memory for spills, a cross-lane read, and flat accesses --
-  each checked against the assembler's output and against what the C means.
+  atomics, private memory for spills, a cross-lane read, flat accesses, and a
+  module's own variables (the relocations that find them, and
+  hipModuleGetGlobal) -- each checked against the assembler's output and
+  against what the C means.
   Still missing: the fatbin path hipcc compiles (__hipRegisterFatBinary,
   hipLaunchKernel), streams that are more than handles, and every instruction
   outside what those kernels use, which is refused by name.
