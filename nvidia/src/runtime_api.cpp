@@ -34,6 +34,7 @@
 #include <functional>
 #include <dlfcn.h>
 #include <atomic>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <set>
@@ -123,6 +124,114 @@ struct HostRange {
   int device = 0;
 };
 
+// What cudaMemAdvise was told about which bytes, so cudaMemRangeGetAttribute
+// can answer. A value covers a range; a query over a range is answered only
+// when every byte of it agrees, which is what CUDA reports.
+//
+// CUDA applies advice by page, so a hint about part of a page reaches the whole
+// page. This records exactly the bytes it was given, which differs only for a
+// range that is not page-aligned -- and differs by being more precise about
+// what was asked for.
+class RangeValues {
+ public:
+  void set(uint64_t begin, uint64_t end, int value) {
+    clear(begin, end);
+    if (begin < end) spans_[begin] = {end, value};
+    merge();
+  }
+  void clear(uint64_t begin, uint64_t end) {
+    if (begin >= end) return;
+    // Split or trim every span that overlaps [begin, end).
+    std::map<uint64_t, std::pair<uint64_t, int>> out;
+    for (const auto& [b, ev] : spans_) {
+      const auto [e, v] = ev;
+      if (e <= begin || b >= end) { out[b] = {e, v}; continue; }
+      if (b < begin) out[b] = {begin, v};
+      if (e > end) out[end] = {e, v};
+    }
+    spans_.swap(out);
+  }
+  // The one value every byte of [begin, end) has, or false when the range is
+  // not covered by a single value.
+  bool uniform(uint64_t begin, uint64_t end, int* value) const {
+    if (begin >= end) return false;
+    uint64_t at = begin;
+    int seen = 0;
+    bool first = true;
+    while (at < end) {
+      auto it = spans_.upper_bound(at);
+      if (it == spans_.begin()) return false;
+      --it;
+      const auto [span_end, v] = it->second;
+      if (at < it->first || at >= span_end) return false;   // a gap
+      if (first) { seen = v; first = false; }
+      else if (v != seen) return false;
+      at = span_end;
+    }
+    if (value) *value = seen;
+    return true;
+  }
+  bool empty() const { return spans_.empty(); }
+
+ private:
+  // Joins neighbours that carry the same value, so a range advised in pieces
+  // answers as one.
+  void merge() {
+    for (auto it = spans_.begin(); it != spans_.end();) {
+      auto next = std::next(it);
+      if (next != spans_.end() && it->second.first == next->first &&
+          it->second.second == next->second.second) {
+        it->second.first = next->second.first;
+        spans_.erase(next);
+      } else {
+        ++it;
+      }
+    }
+  }
+  std::map<uint64_t, std::pair<uint64_t, int>> spans_;   // begin -> (end, value)
+};
+
+// The hints a managed allocation carries. Advice is a performance hint and
+// changes nothing about what a program computes -- there is one physical copy
+// of managed memory here -- but it is state a program sets and reads back.
+struct ManagedAdvice {
+  RangeValues read_mostly;        // 1 where set
+  RangeValues preferred;          // the device id, or cudaCpuDeviceId
+  RangeValues last_prefetch;      // the device id of the last prefetch
+  std::map<int, RangeValues> accessed_by;   // by device id
+};
+
+// One stream-ordered memory pool.
+//
+// CUDA documents what is observable: what a pool has handed out
+// (UsedMemCurrent), what it holds from the device (ReservedMemCurrent), the
+// high-water marks of both, and a release threshold -- the bytes of freed-but-
+// cached memory it keeps rather than giving back. The default threshold is 0,
+// so by default a free goes straight back to the device and the pool caches
+// nothing, exactly as the documentation says.
+//
+// Which cached block a request reuses is this engine's choice, not the API's:
+// the first block at least as large as the request and no more than twice its
+// size, so reuse never quietly wastes a multiple of what was asked for.
+struct MemPool {
+  int device = 0;
+  bool is_default = false;
+  bool destroyed = false;
+  unsigned long long threshold = 0;   // cudaMemPoolAttrReleaseThreshold
+  // The reuse policies. All three are on by default on a device, and here
+  // every stream is already synchronous, so they change nothing that can be
+  // observed; they are kept and reported because a program reads them back.
+  int reuse_follow_event_deps = 1, reuse_allow_opportunistic = 1, reuse_allow_internal_deps = 1;
+  uint64_t used = 0, used_high = 0, reserved = 0, reserved_high = 0;
+  std::map<uint64_t, uint64_t> live;                 // handed out: pointer -> size
+  std::vector<std::pair<uint64_t, uint64_t>> cached; // freed and kept, oldest first
+  uint64_t cached_bytes() const {
+    uint64_t n = 0;
+    for (const auto& [p, sz] : cached) n += sz;
+    return n;
+  }
+};
+
 struct State {
   std::recursive_mutex mu;
   std::unique_ptr<vgpu::runtime::Runtime> rt;
@@ -137,12 +246,24 @@ struct State {
   // Managed allocations, kept apart from host_allocs because freeing one has
   // to unmap it from the device side as well.
   std::map<void*, HostRange> managed_allocs;
+  // What cudaMemAdvise and cudaMemPrefetchAsync were told about them.
+  std::map<void*, ManagedAdvice> managed_advice;
   // cudaHostRegister'd ranges. The memory is the caller's; only the record
   // and the device mapping are ours.
   std::map<void*, HostRange> registered;
   // Enabled peer mappings as (accessing device, peer device). Direction
   // matters: enabling 0 -> 1 says nothing about 1 -> 0.
   std::set<std::pair<int, int>> peer_access;
+  // Stream-ordered memory pools (cudaMallocAsync). A pool caches what is freed
+  // to it and hands it out again, which is the whole reason the API exists: an
+  // allocator that asks the driver once and reuses after that.
+  //
+  // Held in a deque so a pool's address is its handle and never moves. Each
+  // device's default pool is made on first use; a program may also create its
+  // own and make one of them the device's current pool.
+  std::deque<MemPool> pools;
+  std::map<int, MemPool*> default_pool;   // by device
+  std::map<int, MemPool*> current_pool;
   bool initialized = false;
 };
 
@@ -1283,6 +1404,7 @@ VGPU_EXPORT cudaError_t cudaFree(void* ptr) {
     if (mit != s.managed_allocs.end()) {
       unmap_host_everywhere(s, ptr);
       s.managed_allocs.erase(mit);
+      s.managed_advice.erase(ptr);   // its hints go with it
       std::free(ptr);
       return cudaSuccess;
     }
@@ -1528,38 +1650,299 @@ VGPU_EXPORT cudaError_t cudaStreamCreateWithPriority(cudaStream_t* s, unsigned i
   return cudaStreamCreate(s);
 }
 
-// The async allocator maps onto the ordinary one: work is synchronous here, so
-// a stream-ordered allocation is already complete when it returns.
-VGPU_EXPORT cudaError_t cudaMallocAsync(void** ptr, size_t size, cudaStream_t) {
-  return cudaMalloc(ptr, size);
+// ---- stream-ordered memory pools -------------------------------------------------
+//
+// Every stream here is synchronous, so the *ordering* half of the API needs
+// nothing: an allocation is usable when it returns and a free is complete when
+// it returns. What the API is really for is the caching, and that is modelled
+// for real -- a pool holds what was freed to it, up to its release threshold,
+// and hands it out again.
+
+namespace {
+
+MemPool& default_pool_for(State& s, int device) {
+  auto it = s.default_pool.find(device);
+  if (it != s.default_pool.end()) return *it->second;
+  s.pools.push_back(MemPool{});
+  MemPool& p = s.pools.back();
+  p.device = device;
+  p.is_default = true;
+  s.default_pool[device] = &p;
+  return p;
 }
-VGPU_EXPORT cudaError_t cudaFreeAsync(void* ptr, cudaStream_t) { return cudaFree(ptr); }
-VGPU_EXPORT cudaError_t cudaDeviceGetDefaultMemPool(cudaMemPool_t* pool, int) {
-  if (!pool) return cudaErrorInvalidValue;
-  *pool = reinterpret_cast<cudaMemPool_t>(0x1);
-  return cudaSuccess;
+
+MemPool& pool_for(State& s, int device) {
+  auto it = s.current_pool.find(device);
+  return it != s.current_pool.end() ? *it->second : default_pool_for(s, device);
 }
-VGPU_EXPORT cudaError_t cudaMemPoolSetAttribute(cudaMemPool_t, cudaMemPoolAttr, void*) {
-  return cudaSuccess;  // pool trimming and thresholds have no effect here
+
+// A handle is the pool's address; this checks one before following it.
+MemPool* from_handle(State& s, cudaMemPool_t h) {
+  for (MemPool& p : s.pools)
+    if (reinterpret_cast<cudaMemPool_t>(&p) == h && !p.destroyed) return &p;
+  return nullptr;
 }
-VGPU_EXPORT cudaError_t cudaMemPoolGetAttribute(cudaMemPool_t, cudaMemPoolAttr attr, void* value) {
-  if (!value) return cudaErrorInvalidValue;
-  // The numeric attributes are byte counts; nothing is pooled, so they are 0.
-  switch (attr) {
-    case cudaMemPoolReuseFollowEventDependencies:
-    case cudaMemPoolReuseAllowOpportunistic:
-    case cudaMemPoolReuseAllowInternalDependencies:
-      *static_cast<int*>(value) = 0;
-      return cudaSuccess;
-    default:
-      *static_cast<unsigned long long*>(value) = 0;
-      return cudaSuccess;
+
+// Gives cached blocks back to the device until no more than `keep` bytes are
+// held, oldest first.
+void release_cached(State& s, MemPool& p, uint64_t keep) {
+  while (p.cached_bytes() > keep && !p.cached.empty()) {
+    const auto [ptr, size] = p.cached.front();
+    p.cached.erase(p.cached.begin());
+    s.rt->device(p.device).memory().free(ptr);
+    p.reserved -= size;
   }
 }
-VGPU_EXPORT cudaError_t cudaMemPoolSetAccess(cudaMemPool_t, const cudaMemAccessDesc*, size_t) {
+
+cudaError_t pool_alloc(State& s, MemPool& p, size_t size, void** out) {
+  // Reuse: the first cached block big enough, and no more than twice the size
+  // asked for, so a small request cannot take a huge block out of circulation.
+  for (size_t i = 0; i < p.cached.size(); ++i) {
+    const auto [ptr, block] = p.cached[i];
+    if (block >= size && block <= 2 * size) {
+      p.cached.erase(p.cached.begin() + static_cast<long>(i));
+      p.live[ptr] = block;
+      p.used += block;
+      p.used_high = std::max(p.used_high, p.used);
+      *out = reinterpret_cast<void*>(ptr);
+      return cudaSuccess;
+    }
+  }
+  const uint64_t ptr = s.rt->device(p.device).memory().alloc(size ? size : 1);
+  p.live[ptr] = size ? size : 1;
+  p.used += p.live[ptr];
+  p.reserved += p.live[ptr];
+  p.used_high = std::max(p.used_high, p.used);
+  p.reserved_high = std::max(p.reserved_high, p.reserved);
+  *out = reinterpret_cast<void*>(ptr);
   return cudaSuccess;
 }
-VGPU_EXPORT cudaError_t cudaMemPoolTrimTo(cudaMemPool_t, size_t) { return cudaSuccess; }
+
+// The pool a pointer came from, or null: what tells cudaFreeAsync whether it is
+// freeing pool memory or an ordinary allocation.
+MemPool* pool_of(State& s, uint64_t ptr) {
+  for (MemPool& p : s.pools)
+    if (p.live.count(ptr)) return &p;
+  return nullptr;
+}
+
+void pool_free(State& s, MemPool& p, uint64_t ptr) {
+  const uint64_t size = p.live[ptr];
+  p.live.erase(ptr);
+  p.used -= size;
+  p.cached.emplace_back(ptr, size);
+  // The default threshold is 0, so by default this hands the memory straight
+  // back to the device and the pool keeps nothing.
+  release_cached(s, p, p.threshold);
+}
+
+}  // namespace
+
+VGPU_EXPORT cudaError_t cudaMallocAsync(void** ptr, size_t size, cudaStream_t) {
+  return guard("cudaMallocAsync", [&](State& s) -> cudaError_t {
+    if (!ptr) return cudaErrorInvalidValue;
+    if (vgpu::faults::should_fail(vgpu::faults::Op::Alloc)) return cudaErrorMemoryAllocation;
+    return pool_alloc(s, pool_for(s, t_current_device), size, ptr);
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMallocFromPoolAsync(void** ptr, size_t size, cudaMemPool_t pool,
+                                                cudaStream_t) {
+  return guard("cudaMallocFromPoolAsync", [&](State& s) -> cudaError_t {
+    if (!ptr) return cudaErrorInvalidValue;
+    MemPool* p = from_handle(s, pool);
+    if (!p) return cudaErrorInvalidValue;
+    return pool_alloc(s, *p, size, ptr);
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaFreeAsync(void* ptr, cudaStream_t) {
+  return guard("cudaFreeAsync", [&](State& s) -> cudaError_t {
+    if (!ptr) return cudaSuccess;   // as cudaFree(nullptr) is
+    if (MemPool* p = pool_of(s, reinterpret_cast<uint64_t>(ptr))) {
+      pool_free(s, *p, reinterpret_cast<uint64_t>(ptr));
+      return cudaSuccess;
+    }
+    // Not pool memory: an ordinary allocation, which cudaFreeAsync also takes.
+    return cudaFree(ptr);
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaDeviceGetDefaultMemPool(cudaMemPool_t* pool, int device) {
+  return guard("cudaDeviceGetDefaultMemPool", [&](State& s) -> cudaError_t {
+    if (!pool || device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidValue;
+    *pool = reinterpret_cast<cudaMemPool_t>(&default_pool_for(s, device));
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaDeviceGetMemPool(cudaMemPool_t* pool, int device) {
+  return guard("cudaDeviceGetMemPool", [&](State& s) -> cudaError_t {
+    if (!pool || device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidValue;
+    *pool = reinterpret_cast<cudaMemPool_t>(&pool_for(s, device));
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaDeviceSetMemPool(int device, cudaMemPool_t pool) {
+  return guard("cudaDeviceSetMemPool", [&](State& s) -> cudaError_t {
+    if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidValue;
+    MemPool* p = from_handle(s, pool);
+    if (!p) return cudaErrorInvalidValue;
+    // A pool belongs to the device it was made for; pointing another device at
+    // it would hand out addresses that device does not own.
+    if (p->device != device) return cudaErrorInvalidValue;
+    s.current_pool[device] = p;
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemPoolCreate(cudaMemPool_t* pool, const cudaMemPoolProps* props) {
+  return guard("cudaMemPoolCreate", [&](State& s) -> cudaError_t {
+    if (!pool || !props) return cudaErrorInvalidValue;
+    if (props->allocType != cudaMemAllocationTypePinned) return cudaErrorInvalidValue;
+    if (props->location.type != cudaMemLocationTypeDevice) return cudaErrorInvalidValue;
+    if (props->location.id < 0 || props->location.id >= s.rt->device_count())
+      return cudaErrorInvalidDevice;
+    // A pool another process could allocate from would have to share this
+    // process's own memory.
+    if (props->handleTypes != cudaMemHandleTypeNone) return cudaErrorNotSupported;
+    s.pools.push_back(MemPool{});
+    MemPool& p = s.pools.back();
+    p.device = props->location.id;
+    *pool = reinterpret_cast<cudaMemPool_t>(&p);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemPoolDestroy(cudaMemPool_t pool) {
+  return guard("cudaMemPoolDestroy", [&](State& s) -> cudaError_t {
+    MemPool* p = from_handle(s, pool);
+    if (!p || p->is_default) return cudaErrorInvalidValue;   // the default pool is the device's
+    // Outstanding allocations outlive the pool on hardware only until they are
+    // freed, and freeing them afterwards needs the pool. Refuse instead.
+    if (!p->live.empty()) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] cudaMemPoolDestroy: the pool still has %zu allocation(s); "
+                             "free them with cudaFreeAsync first\n", p->live.size());
+      return cudaErrorInvalidValue;
+    }
+    release_cached(s, *p, 0);
+    p->destroyed = true;
+    for (auto it = s.current_pool.begin(); it != s.current_pool.end();)
+      it = it->second == p ? s.current_pool.erase(it) : std::next(it);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemPoolSetAttribute(cudaMemPool_t pool, cudaMemPoolAttr attr,
+                                                void* value) {
+  return guard("cudaMemPoolSetAttribute", [&](State& s) -> cudaError_t {
+    MemPool* p = from_handle(s, pool);
+    if (!p || !value) return cudaErrorInvalidValue;
+    switch (attr) {
+      case cudaMemPoolAttrReleaseThreshold:
+        p->threshold = *static_cast<unsigned long long*>(value);
+        // Lowering it takes effect now, as it does on a device at the next
+        // synchronization -- and here every operation is already synchronous.
+        release_cached(s, *p, p->threshold);
+        return cudaSuccess;
+      case cudaMemPoolReuseFollowEventDependencies:
+        p->reuse_follow_event_deps = *static_cast<int*>(value);
+        return cudaSuccess;
+      case cudaMemPoolReuseAllowOpportunistic:
+        p->reuse_allow_opportunistic = *static_cast<int*>(value);
+        return cudaSuccess;
+      case cudaMemPoolReuseAllowInternalDependencies:
+        p->reuse_allow_internal_deps = *static_cast<int*>(value);
+        return cudaSuccess;
+      // The documented way to reset a high-water mark is to write 0 to it.
+      case cudaMemPoolAttrReservedMemHigh:
+        if (*static_cast<unsigned long long*>(value) != 0) return cudaErrorInvalidValue;
+        p->reserved_high = p->reserved;
+        return cudaSuccess;
+      case cudaMemPoolAttrUsedMemHigh:
+        if (*static_cast<unsigned long long*>(value) != 0) return cudaErrorInvalidValue;
+        p->used_high = p->used;
+        return cudaSuccess;
+      default:
+        return cudaErrorInvalidValue;   // the current totals are read-only
+    }
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemPoolGetAttribute(cudaMemPool_t pool, cudaMemPoolAttr attr,
+                                                void* value) {
+  return guard("cudaMemPoolGetAttribute", [&](State& s) -> cudaError_t {
+    MemPool* p = from_handle(s, pool);
+    if (!p || !value) return cudaErrorInvalidValue;
+    switch (attr) {
+      case cudaMemPoolReuseFollowEventDependencies:
+        *static_cast<int*>(value) = p->reuse_follow_event_deps;
+        return cudaSuccess;
+      case cudaMemPoolReuseAllowOpportunistic:
+        *static_cast<int*>(value) = p->reuse_allow_opportunistic;
+        return cudaSuccess;
+      case cudaMemPoolReuseAllowInternalDependencies:
+        *static_cast<int*>(value) = p->reuse_allow_internal_deps;
+        return cudaSuccess;
+      case cudaMemPoolAttrReleaseThreshold:
+        *static_cast<unsigned long long*>(value) = p->threshold;
+        return cudaSuccess;
+      case cudaMemPoolAttrReservedMemCurrent:
+        *static_cast<unsigned long long*>(value) = p->reserved;
+        return cudaSuccess;
+      case cudaMemPoolAttrReservedMemHigh:
+        *static_cast<unsigned long long*>(value) = p->reserved_high;
+        return cudaSuccess;
+      case cudaMemPoolAttrUsedMemCurrent:
+        *static_cast<unsigned long long*>(value) = p->used;
+        return cudaSuccess;
+      case cudaMemPoolAttrUsedMemHigh:
+        *static_cast<unsigned long long*>(value) = p->used_high;
+        return cudaSuccess;
+      default:
+        return cudaErrorInvalidValue;
+    }
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemPoolSetAccess(cudaMemPool_t pool, const cudaMemAccessDesc* desc,
+                                             size_t count) {
+  return guard("cudaMemPoolSetAccess", [&](State& s) -> cudaError_t {
+    MemPool* p = from_handle(s, pool);
+    if (!p || (!desc && count)) return cudaErrorInvalidValue;
+    // Every device here reaches a pool's memory through the same address, and
+    // the owning device always may, so the only request that means anything is
+    // one for a device that exists.
+    for (size_t i = 0; i < count; ++i)
+      if (desc[i].location.type != cudaMemLocationTypeDevice ||
+          desc[i].location.id < 0 || desc[i].location.id >= s.rt->device_count())
+        return cudaErrorInvalidValue;
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemPoolGetAccess(enum cudaMemAccessFlags* flags, cudaMemPool_t pool,
+                                             struct cudaMemLocation* location) {
+  return guard("cudaMemPoolGetAccess", [&](State& s) -> cudaError_t {
+    MemPool* p = from_handle(s, pool);
+    if (!p || !flags || !location) return cudaErrorInvalidValue;
+    if (location->type != cudaMemLocationTypeDevice) return cudaErrorInvalidValue;
+    if (location->id < 0 || location->id >= s.rt->device_count()) return cudaErrorInvalidValue;
+    *flags = cudaMemAccessFlagsProtReadWrite;
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMemPoolTrimTo(cudaMemPool_t pool, size_t keep) {
+  return guard("cudaMemPoolTrimTo", [&](State& s) -> cudaError_t {
+    MemPool* p = from_handle(s, pool);
+    if (!p) return cudaErrorInvalidValue;
+    release_cached(s, *p, keep);
+    return cudaSuccess;
+  });
+}
 
 // Page-locking changes nothing when the "device" shares the host's memory, but
 // a registration is still state: it makes the range device-addressable, it is
@@ -2066,31 +2449,161 @@ VGPU_EXPORT cudaError_t cudaMallocManaged(void** ptr, size_t size, unsigned int)
 }
 
 // Prefetching and advice describe where pages should live. There is one memory
-// here, so both are honest no-ops rather than refusals: a caller that
-// prefetches is asking for a performance hint, and not getting one is not a
-// behavioural difference it can observe.
+// here, so neither moves anything -- but both are state a program sets and
+// reads back through cudaMemRangeGetAttribute, and both refuse what a driver
+// refuses: memory that is not managed, and a device that does not exist. They
+// used to return success for any pointer at all, which told a caller its hint
+// had been accepted for memory the API does not accept hints about.
 //
 // CUDA 13 changed both to take a cudaMemLocation where 12 took an int device,
 // so each needs the signature of the toolkit in use. The vendor header is
 // included, and C linkage makes a mismatch a hard error rather than a subtle
 // one -- which is how the last one of these was caught.
-#if CUDART_VERSION >= 13000
-VGPU_EXPORT cudaError_t cudaMemPrefetchAsync(const void*, size_t, struct cudaMemLocation,
-                                             unsigned int, cudaStream_t) {
+namespace {
+
+// The managed allocation holding [p, p+n), or null. Advice is only for managed
+// memory, and only within one allocation.
+std::pair<void* const, HostRange>* managed_range(State& s, const void* p, size_t n) {
+  const auto addr = reinterpret_cast<uint64_t>(p);
+  for (auto& entry : s.managed_allocs) {
+    const auto base = reinterpret_cast<uint64_t>(entry.first);
+    if (addr >= base && addr + n <= base + entry.second.size && n) return &entry;
+  }
+  return nullptr;
+}
+
+cudaError_t advise(State& s, const void* p, size_t n, cudaMemoryAdvise kind, int device) {
+  auto* range = managed_range(s, p, n);
+  if (!range) return cudaErrorInvalidValue;
+  const bool needs_device = kind == cudaMemAdviseSetAccessedBy || kind == cudaMemAdviseUnsetAccessedBy ||
+                            kind == cudaMemAdviseSetPreferredLocation ||
+                            kind == cudaMemAdviseUnsetPreferredLocation;
+  if (needs_device && device != cudaCpuDeviceId &&
+      (device < 0 || device >= s.rt->device_count()))
+    return cudaErrorInvalidDevice;
+  ManagedAdvice& a = s.managed_advice[range->first];
+  const auto begin = reinterpret_cast<uint64_t>(p);
+  const uint64_t end = begin + n;
+  switch (kind) {
+    case cudaMemAdviseSetReadMostly: a.read_mostly.set(begin, end, 1); return cudaSuccess;
+    case cudaMemAdviseUnsetReadMostly: a.read_mostly.clear(begin, end); return cudaSuccess;
+    case cudaMemAdviseSetPreferredLocation: a.preferred.set(begin, end, device); return cudaSuccess;
+    case cudaMemAdviseUnsetPreferredLocation: a.preferred.clear(begin, end); return cudaSuccess;
+    case cudaMemAdviseSetAccessedBy: a.accessed_by[device].set(begin, end, 1); return cudaSuccess;
+    case cudaMemAdviseUnsetAccessedBy: a.accessed_by[device].clear(begin, end); return cudaSuccess;
+    default: return cudaErrorInvalidValue;
+  }
+}
+
+cudaError_t prefetch(State& s, const void* p, size_t n, int device) {
+  auto* range = managed_range(s, p, n);
+  if (!range) return cudaErrorInvalidValue;
+  if (device != cudaCpuDeviceId && (device < 0 || device >= s.rt->device_count()))
+    return cudaErrorInvalidDevice;
+  const auto begin = reinterpret_cast<uint64_t>(p);
+  s.managed_advice[range->first].last_prefetch.set(begin, begin + n, device);
   return cudaSuccess;
 }
-VGPU_EXPORT cudaError_t cudaMemAdvise(const void*, size_t, cudaMemoryAdvise,
-                                      struct cudaMemLocation) {
-  return cudaSuccess;
+
+// One attribute of one range, as cudaMemRangeGetAttribute reports it: a value
+// only when every byte of the range agrees, and the documented "no answer"
+// otherwise -- 0 for read-mostly, an invalid device id for the locations.
+cudaError_t range_attribute(State& s, void* data, size_t data_size, cudaMemRangeAttribute attr,
+                            const void* p, size_t n) {
+  if (!data || !data_size) return cudaErrorInvalidValue;
+  auto* range = managed_range(s, p, n);
+  if (!range) return cudaErrorInvalidValue;
+  const ManagedAdvice& a = s.managed_advice[range->first];
+  const auto begin = reinterpret_cast<uint64_t>(p);
+  const uint64_t end = begin + n;
+  switch (attr) {
+    case cudaMemRangeAttributeReadMostly: {
+      if (data_size != sizeof(int)) return cudaErrorInvalidValue;
+      int v = 0;
+      *static_cast<int*>(data) = a.read_mostly.uniform(begin, end, &v) ? 1 : 0;
+      return cudaSuccess;
+    }
+    case cudaMemRangeAttributePreferredLocation: {
+      if (data_size != sizeof(int)) return cudaErrorInvalidValue;
+      int v = cudaInvalidDeviceId;
+      if (!a.preferred.uniform(begin, end, &v)) v = cudaInvalidDeviceId;
+      *static_cast<int*>(data) = v;
+      return cudaSuccess;
+    }
+    case cudaMemRangeAttributeLastPrefetchLocation: {
+      if (data_size != sizeof(int)) return cudaErrorInvalidValue;
+      int v = cudaInvalidDeviceId;
+      if (!a.last_prefetch.uniform(begin, end, &v)) v = cudaInvalidDeviceId;
+      *static_cast<int*>(data) = v;
+      return cudaSuccess;
+    }
+    case cudaMemRangeAttributeAccessedBy: {
+      // An array of device ids, as many as fit; the rest are filled with the
+      // invalid id, which is how a caller knows where the list ends.
+      if (data_size % sizeof(int)) return cudaErrorInvalidValue;
+      int* out = static_cast<int*>(data);
+      const size_t slots = data_size / sizeof(int);
+      size_t at = 0;
+      for (const auto& [device, where] : a.accessed_by) {
+        if (at == slots) break;
+        int v = 0;
+        if (where.uniform(begin, end, &v)) out[at++] = device;
+      }
+      for (; at < slots; ++at) out[at] = cudaInvalidDeviceId;
+      return cudaSuccess;
+    }
+    default:
+      return cudaErrorInvalidValue;
+  }
+}
+
+}  // namespace
+
+#if CUDART_VERSION >= 13000
+VGPU_EXPORT cudaError_t cudaMemPrefetchAsync(const void* p, size_t n, struct cudaMemLocation loc,
+                                             unsigned int, cudaStream_t) {
+  return guard("cudaMemPrefetchAsync", [&](State& s) -> cudaError_t {
+    if (loc.type != cudaMemLocationTypeDevice && loc.type != cudaMemLocationTypeHost)
+      return cudaErrorInvalidValue;
+    return prefetch(s, p, n, loc.type == cudaMemLocationTypeHost ? cudaCpuDeviceId : loc.id);
+  });
+}
+VGPU_EXPORT cudaError_t cudaMemAdvise(const void* p, size_t n, cudaMemoryAdvise kind,
+                                      struct cudaMemLocation loc) {
+  return guard("cudaMemAdvise", [&](State& s) -> cudaError_t {
+    if (loc.type != cudaMemLocationTypeDevice && loc.type != cudaMemLocationTypeHost)
+      return cudaErrorInvalidValue;
+    return advise(s, p, n, kind, loc.type == cudaMemLocationTypeHost ? cudaCpuDeviceId : loc.id);
+  });
 }
 #else
-VGPU_EXPORT cudaError_t cudaMemPrefetchAsync(const void*, size_t, int, cudaStream_t) {
-  return cudaSuccess;
+VGPU_EXPORT cudaError_t cudaMemPrefetchAsync(const void* p, size_t n, int device, cudaStream_t) {
+  return guard("cudaMemPrefetchAsync", [&](State& s) { return prefetch(s, p, n, device); });
 }
-VGPU_EXPORT cudaError_t cudaMemAdvise(const void*, size_t, cudaMemoryAdvise, int) {
-  return cudaSuccess;
+VGPU_EXPORT cudaError_t cudaMemAdvise(const void* p, size_t n, cudaMemoryAdvise kind, int device) {
+  return guard("cudaMemAdvise", [&](State& s) { return advise(s, p, n, kind, device); });
 }
 #endif
+
+VGPU_EXPORT cudaError_t cudaMemRangeGetAttribute(void* data, size_t data_size,
+                                                 cudaMemRangeAttribute attr, const void* p,
+                                                 size_t n) {
+  return guard("cudaMemRangeGetAttribute",
+               [&](State& s) { return range_attribute(s, data, data_size, attr, p, n); });
+}
+
+VGPU_EXPORT cudaError_t cudaMemRangeGetAttributes(void** data, size_t* data_sizes,
+                                                  cudaMemRangeAttribute* attrs, size_t count,
+                                                  const void* p, size_t n) {
+  return guard("cudaMemRangeGetAttributes", [&](State& s) -> cudaError_t {
+    if (!data || !data_sizes || !attrs || !count) return cudaErrorInvalidValue;
+    for (size_t i = 0; i < count; ++i) {
+      const cudaError_t rc = range_attribute(s, data[i], data_sizes[i], attrs[i], p, n);
+      if (rc != cudaSuccess) return rc;
+    }
+    return cudaSuccess;
+  });
+}
 
 VGPU_EXPORT cudaError_t cudaGraphDebugDotPrint(cudaGraph_t, const char* path, unsigned int) {
   if (!path) return cudaErrorInvalidValue;
