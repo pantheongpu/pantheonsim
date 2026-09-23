@@ -581,6 +581,9 @@ target_compile_definitions(test_amd_gcn_exec PRIVATE VGPU_SOURCE_DIR="${CMAKE_SO
 # The instructions a real kernel uses, run and checked against what the C means.
 vgpu_unit_test(test_amd_gcn_ops amd/tests/unit/test_gcn_ops.cpp)
 target_compile_definitions(test_amd_gcn_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# Doubles, packed halves, the modifiers, the transcendentals and the atomics.
+vgpu_unit_test(test_amd_gcn_math amd/tests/unit/test_gcn_math.cpp)
+target_compile_definitions(test_amd_gcn_math PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_robustness)
 target_include_directories(test_robustness PRIVATE nvidia/src)
 target_sources(test_robustness PRIVATE nvidia/src/fatbin.cpp)

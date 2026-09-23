@@ -36,13 +36,17 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // SOP2: two scalar sources.
       {{Enc::Sop2, 0x00}, {"s_add_u32", 1, 2}},
       {{Enc::Sop2, 0x02}, {"s_add_i32", 1, 2}},
+      {{Enc::Sop2, 0x03}, {"s_sub_i32", 1, 2}},
       {{Enc::Sop2, 0x04}, {"s_addc_u32", 1, 2}},
       {{Enc::Sop2, 0x0c}, {"s_and_b32", 1, 2}},
       {{Enc::Sop2, 0x0d}, {"s_and_b64", 2, 2, 2, 2}},
+      {{Enc::Sop2, 0x0e}, {"s_or_b32", 1, 2}},
       {{Enc::Sop2, 0x0f}, {"s_or_b64", 2, 2, 2, 2}},
+      {{Enc::Sop2, 0x10}, {"s_xor_b32", 1, 2}},
       {{Enc::Sop2, 0x11}, {"s_xor_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x13}, {"s_andn2_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x1d}, {"s_lshl_b64", 2, 2, 2, 1}},
+      {{Enc::Sop2, 0x20}, {"s_ashr_i32", 1, 2}},
       // SOPK: a 16-bit immediate.
       {{Enc::Sopk, 0x00}, {"s_movk_i32", 1, 0}},
       // SOPP: an immediate, and no registers.
@@ -66,7 +70,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Smem, 0x03}, {"s_load_dwordx8", 8, 1, 2}},
       // VOP1 and VOP2, the vector ALU's short forms.
       {{Enc::Vop1, 0x01}, {"v_mov_b32_e32", 1, 1}},
+      {{Enc::Vop2, 0x00}, {"v_cndmask_b32_e32", 1, 2}},
       {{Enc::Vop2, 0x01}, {"v_add_f32_e32", 1, 2}},
+      {{Enc::Vop2, 0x02}, {"v_sub_f32_e32", 1, 2}},
+      {{Enc::Vop2, 0x04}, {"v_fmac_f64_e32", 2, 2, 2, 2}},
       {{Enc::Vop2, 0x05}, {"v_mul_f32_e32", 1, 2}},
       {{Enc::Vop2, 0x10}, {"v_lshrrev_b32_e32", 1, 2}},
       {{Enc::Vop2, 0x12}, {"v_lshlrev_b32_e32", 1, 2}},
@@ -77,30 +84,60 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vopc, 0xcc}, {"v_cmp_gt_u32_e32", 2, 2}},
       {{Enc::Vop1, 0x005}, {"v_cvt_f32_i32_e32", 1, 1}},
       {{Enc::Vop1, 0x006}, {"v_cvt_f32_u32_e32", 1, 1}},
+      {{Enc::Vop1, 0x007}, {"v_cvt_u32_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x020}, {"v_exp_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x021}, {"v_log_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x022}, {"v_rcp_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x023}, {"v_rcp_iflag_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x025}, {"v_rcp_f64_e32", 2, 1, 2}},
+      {{Enc::Vop1, 0x027}, {"v_sqrt_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x02d}, {"v_ffbh_u32_e32", 1, 1}},
+      {{Enc::Vop2, 0x00a}, {"v_min_f32_e32", 1, 2}},
+      {{Enc::Vop2, 0x00b}, {"v_max_f32_e32", 1, 2}},
+      {{Enc::Vop2, 0x00f}, {"v_max_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x013}, {"v_and_b32_e32", 1, 2}},
       {{Enc::Vop2, 0x014}, {"v_or_b32_e32", 1, 2}},
       {{Enc::Vop2, 0x015}, {"v_xor_b32_e32", 1, 2}},
       {{Enc::Vop2, 0x034}, {"v_add_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x035}, {"v_sub_u32_e32", 1, 2}},
+      {{Enc::Vop2, 0x036}, {"v_subrev_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x03b}, {"v_fmac_f32_e32", 1, 2}},
+      // The float comparisons share their opcodes with the long forms above.
+      // A class test: the second source is a mask of the kinds of float
+      // (NaN, infinity, normal, denormal, zero, each with a sign) it asks about.
+      {{Enc::Vopc, 0x010}, {"v_cmp_class_f32_e32", 2, 2}},
+      {{Enc::Vopc, 0x041}, {"v_cmp_lt_f32_e32", 2, 2}},
+      {{Enc::Vopc, 0x044}, {"v_cmp_gt_f32_e32", 2, 2}},
+      {{Enc::Vopc, 0x046}, {"v_cmp_ge_f32_e32", 2, 2}},
       {{Enc::Vopc, 0x0c1}, {"v_cmp_lt_i32_e32", 2, 2}},
+      {{Enc::Vopc, 0x0cb}, {"v_cmp_le_u32_e32", 2, 2}},
       // VOP3: the long form. v_lshl_add shifts its first source and adds the
       // third; the shift itself is always 32-bit.
       {{Enc::Vop3, 0x041}, {"v_cmp_lt_f32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x044}, {"v_cmp_gt_f32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x101}, {"v_add_f32_e64", 1, 2}},
+      {{Enc::Vop3, 0x10b}, {"v_max_f32_e64", 1, 2}},
       {{Enc::Vop3, 0x100}, {"v_cndmask_b32_e64", 1, 3, 1, 1, 2}},
       {{Enc::Vop3, 0x1c8}, {"v_bfe_u32", 1, 3}},
       {{Enc::Vop3, 0x1cb}, {"v_fma_f32", 1, 3}},
+      {{Enc::Vop3, 0x1cc}, {"v_fma_f64", 2, 3, 2, 2, 2}},
       {{Enc::Vop3, 0x1de}, {"v_div_fixup_f32", 1, 3}},
       {{Enc::Vop3, 0x1e0}, {"v_div_scale_f32", 1, 3, 1, 1, 1, true}},
+      {{Enc::Vop3, 0x1df}, {"v_div_fixup_f64", 2, 3, 2, 2, 2}},
+      {{Enc::Vop3, 0x1e1}, {"v_div_scale_f64", 2, 3, 2, 2, 2, true}},
       {{Enc::Vop3, 0x1e2}, {"v_div_fmas_f32", 1, 3}},
+      {{Enc::Vop3, 0x1e3}, {"v_div_fmas_f64", 2, 3, 2, 2, 2}},
       {{Enc::Vop3, 0x1e8}, {"v_mad_u64_u32", 2, 3, 1, 1, 2, true}},
       {{Enc::Vop3, 0x1fd}, {"v_lshl_add_u32", 1, 3}},
       {{Enc::Vop3, 0x1ff}, {"v_add3_u32", 1, 3}},
       {{Enc::Vop3, 0x208}, {"v_lshl_add_u64", 2, 3, 2, 1, 2}},
+      {{Enc::Vop3, 0x280}, {"v_add_f64", 2, 2, 2, 2}},
+      {{Enc::Vop3, 0x281}, {"v_mul_f64", 2, 2, 2, 2}},
       {{Enc::Vop3, 0x285}, {"v_mul_lo_u32", 1, 2}},
+      {{Enc::Vop3, 0x286}, {"v_mul_hi_u32", 1, 2}},
       {{Enc::Vop3, 0x287}, {"v_mul_hi_i32", 1, 2}},
       {{Enc::Vop3, 0x289}, {"v_readlane_b32", 1, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x28b}, {"v_bcnt_u32_b32", 1, 2}},
       {{Enc::Vop3, 0x28c}, {"v_mbcnt_lo_u32_b32", 1, 2}},
       {{Enc::Vop3, 0x28d}, {"v_mbcnt_hi_u32_b32", 1, 2}},
       {{Enc::Vop3, 0x28f}, {"v_lshlrev_b64", 2, 2, 1, 2}},
@@ -116,7 +153,12 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Flat, 0x15}, {"global_load_dwordx2", 2, 1}},
       {{Enc::Flat, 0x1c}, {"global_store_dword", 0, 2}},
       {{Enc::Flat, 0x1d}, {"global_store_dwordx2", 0, 2, 1, 2}},
+      {{Enc::Flat, 0x41}, {"global_atomic_cmpswap", 0, 2, 1, 2}},
       {{Enc::Flat, 0x42}, {"global_atomic_add", 0, 2}},
+      {{Enc::Flat, 0x48}, {"global_atomic_and", 0, 2}},
+      {{Enc::Flat, 0x49}, {"global_atomic_or", 0, 2}},
+      // VOP3P: a packed pair of halves in one register, both computed at once.
+      {{Enc::Vop3p, 0x0e}, {"v_pk_fma_f16", 1, 3}},
   };
   return t;
 }
@@ -205,6 +247,7 @@ const char* enc_name(Enc e) {
     case Enc::Vop1: return "VOP1";
     case Enc::Vop2: return "VOP2";
     case Enc::Vop3: return "VOP3";
+    case Enc::Vop3p: return "VOP3P";
     case Enc::Vopc: return "VOPC";
     case Enc::Ds: return "DS";
     case Enc::Flat: return "FLAT";
@@ -291,6 +334,31 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.dst.push_back(vcc);
     in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
     in.src.push_back(vgpr((w0 >> 9) & 0xFF, s.src_width(1)));
+  } else if ((w0 >> 23) == 0x1a7) {   // VOP3P: the packed forms
+    in.enc = Enc::Vop3p;
+    in.opcode = (w0 >> 16) & 0x7F;
+    const Shape& s = shape(in.enc, in.opcode);
+    in.name = s.name;
+    in.size = 8;
+    const uint32_t w1 = word(code, at + 4);
+    in.clamp = (w0 >> 15) & 1;
+    // op_sel picks which half of each source feeds which half of the result.
+    // Plain packed work is op_sel 0 with op_sel_hi all ones, and anything
+    // else is a shuffle this does not model.
+    const uint32_t op_sel = (w0 >> 11) & 0x7, neg_hi = (w0 >> 8) & 0x7;
+    const uint32_t op_sel_hi = ((w0 >> 14) & 1) << 2 | ((w1 >> 27) & 0x3);
+    if (op_sel != 0 || op_sel_hi != 0x7)
+      throw Error::make(Err::Unsupported, in.name, " selects halves (op_sel ", op_sel, ", op_sel_hi ", op_sel_hi,
+                        "), which this does not model");
+    in.dst.push_back(vgpr(w0 & 0xFF, s.dst_width));
+    const uint32_t neg = (w1 >> 29) & 0x7;
+    for (uint32_t k = 0; k < s.srcs; ++k) {
+      Operand o = take((w1 >> (9 * k)) & 0x1FF, s.src_width(k));
+      o.neg = (neg >> k) & 1;
+      if ((neg_hi >> k) & 1)
+        throw Error::make(Err::Unsupported, in.name, " negates one half only, which this does not model");
+      in.src.push_back(o);
+    }
   } else if ((w0 >> 26) == 0x34) {    // VOP3
     in.enc = Enc::Vop3;
     in.opcode = (w0 >> 16) & 0x3FF;
@@ -298,14 +366,14 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.name = s.name;
     in.size = 8;
     const uint32_t w1 = word(code, at + 4);
-    // What this does not model is refused rather than dropped: an absolute
-    // value, a clamp or an output multiplier that is ignored would give a
-    // wrong answer with no sign that anything was missed.
-    const uint32_t abs = s.sdst ? 0 : (w0 >> 8) & 0x7, clamp = s.sdst ? 0 : (w0 >> 15) & 1;
-    const uint32_t omod = (w1 >> 27) & 0x3;
-    if (abs || clamp || omod)
-      throw Error::make(Err::Unsupported, in.name, " uses a source or output modifier this does not model (abs ",
-                        abs, ", clamp ", clamp, ", omod ", omod, ")");
+    // The modifiers: a source's absolute value and negation, and a clamp of
+    // the result. An output multiplier is refused rather than dropped, since
+    // dropping one gives a wrong answer with nothing to show for it.
+    const uint32_t abs = s.sdst ? 0 : (w0 >> 8) & 0x7;
+    in.clamp = s.sdst ? false : ((w0 >> 15) & 1) != 0;
+    if (const uint32_t omod = (w1 >> 27) & 0x3; omod)
+      throw Error::make(Err::Unsupported, in.name, " uses an output multiplier (omod ", omod,
+                        "), which this does not model");
     if (s.scalar_dst) in.dst.push_back(sgpr(w0 & 0xFF, s.dst_width));
     else in.dst.push_back(vgpr(w0 & 0xFF, s.dst_width));
     // VOP3b also writes a scalar pair: a carry out, or the condition
@@ -315,6 +383,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     for (uint32_t k = 0; k < s.srcs; ++k) {
       Operand o = take((w1 >> (9 * k)) & 0x1FF, s.src_width(k));
       o.neg = (neg >> k) & 1;
+      o.abs = (abs >> k) & 1;
       in.src.push_back(o);
     }
   } else if ((w0 >> 26) == 0x36) {    // DS
@@ -362,6 +431,14 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.dst.push_back(vgpr((w0 >> 17) & 0xFF, s.dst_width));
     in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
     in.src.push_back(vgpr((w0 >> 9) & 0xFF, s.src_width(1)));
+    // The short form of the select reads its condition from VCC, which the
+    // encoding does not spell out and the assembler does.
+    if (in.name == "v_cndmask_b32_e32") {
+      Operand vcc;
+      vcc.kind = OperandKind::Vcc;
+      vcc.width = 2;
+      in.src.push_back(vcc);
+    }
   } else {
     throw Error::make(Err::Unsupported, "an instruction encoding this does not decode yet");
   }
@@ -378,19 +455,21 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
 std::string operand_text(const Operand& o) {
   char b[64];
   const std::string neg = o.neg ? "-" : "";
+  // The assembler writes an absolute value as |v1|, with the negation outside it.
+  const auto wrap = [&](const std::string& text) { return o.abs ? neg + "|" + text + "|" : neg + text; };
   const auto range = [&](const char* kind) {
     if (o.width <= 1) std::snprintf(b, sizeof b, "%s%u", kind, o.index);
     else std::snprintf(b, sizeof b, "%s[%u:%u]", kind, o.index, o.index + o.width - 1);
     return std::string(b);
   };
   switch (o.kind) {
-    case OperandKind::Sgpr: return neg + range("s");
-    case OperandKind::Vgpr: return neg + range("v");
-    case OperandKind::Vcc: return neg + "vcc";
-    case OperandKind::Exec: return neg + "exec";
-    case OperandKind::ExecLo: return neg + "exec_lo";
-    case OperandKind::ExecHi: return neg + "exec_hi";
-    case OperandKind::M0: return neg + "m0";
+    case OperandKind::Sgpr: return wrap(range("s"));
+    case OperandKind::Vgpr: return wrap(range("v"));
+    case OperandKind::Vcc: return wrap("vcc");
+    case OperandKind::Exec: return wrap("exec");
+    case OperandKind::ExecLo: return wrap("exec_lo");
+    case OperandKind::ExecHi: return wrap("exec_hi");
+    case OperandKind::M0: return wrap("m0");
     case OperandKind::InlineFloat:
       // As the assembler writes them: 1.0, -0.5, and so on.
       std::snprintf(b, sizeof b, "%.1f", o.fvalue);
@@ -420,6 +499,7 @@ std::string to_text(const Inst& i) {
     s += sep + operand_text(o);
     sep = ", ";
   }
+  if (i.clamp) s += " clamp";
   if (i.enc == Enc::Smem) {
     std::snprintf(b, sizeof b, ", 0x%x", i.offset);
     s += b;

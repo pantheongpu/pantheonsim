@@ -31,9 +31,11 @@ expect() {  # expect <name> <expected> <actual>
 
 # The kernels with the wider instruction mix, so a clang that emits something
 # new for them fails here rather than in a kernel's results.
-cp "$root/amd/tests/data/vector_add.c" "$root/amd/tests/data/ops.c" "$tmp/"
-( cd "$tmp" && "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx942 -nogpulib -O2 -c ops.c -o fresh.o ) \
-  2>"$tmp/clang.err"
+cp "$root"/amd/tests/data/*.c "$tmp/"
+# One object of everything the fixtures use, which is the widest set of
+# instructions this has to decode.
+( cd "$tmp" && cat ops.c math.c > both.c &&
+  "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx942 -nogpulib -O2 -c both.c -o fresh.o ) 2>"$tmp/clang.err"
 if [[ ! -s "$tmp/fresh.o" ]]; then
   echo "SKIP: this clang could not build for gfx942: $(head -2 "$tmp/clang.err")"; exit 0
 fi
@@ -56,8 +58,8 @@ expect "and the rest of the decoder's checks hold on it" "0" \
 # clones, which is exactly what happened once.
 if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
   untracked=""
-  for f in amd/tests/data/vector_add.gfx942.o amd/tests/data/ops.gfx942.o \
-           amd/tests/data/vector_add.gfx942.dis amd/tests/data/ops.gfx942.dis; do
+  for f in amd/tests/data/vector_add.gfx942.o amd/tests/data/ops.gfx942.o amd/tests/data/math.gfx942.o \
+           amd/tests/data/vector_add.gfx942.dis amd/tests/data/ops.gfx942.dis amd/tests/data/math.gfx942.dis; do
     git -C "$root" ls-files --error-unmatch "$f" >/dev/null 2>&1 || untracked="$untracked $f"
   done
   expect "every fixture the tests read is in the repository" "" "$untracked"
@@ -66,7 +68,7 @@ fi
 # The version that is checked in has to stay the version the tests read: a
 # code object whose listing was regenerated without the object, or the other
 # way round, would pass here and fail for everyone else.
-for name in vector_add ops; do
+for name in vector_add ops math; do
   committed=$("$objdump" -d --mcpu=gfx942 "$root/amd/tests/data/$name.gfx942.o" |
     sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g')
   expect "the checked-in $name object and listing are of the same build" "" \
