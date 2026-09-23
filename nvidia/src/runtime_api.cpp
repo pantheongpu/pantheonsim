@@ -3280,6 +3280,12 @@ namespace {
 // The parameter sizes of a registered kernel stub, which a graph node needs to
 // copy argument values the way a launch does. Returns false for a stub this
 // process never registered, or one whose module has no PTX.
+//
+// This takes the runtime's own lock, so a caller must not already hold
+// g_graph_mu: a launch inside a capture holds the runtime lock and then takes
+// the graph lock, and the reverse order in the other direction is a deadlock
+// between a thread building a graph and a thread launching a kernel. The rule
+// for the whole file is the runtime's lock first, the graph lock second.
 bool kernel_param_sizes(const void* func, std::vector<uint32_t>* out) {
   State& s = st();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
@@ -3386,13 +3392,15 @@ VGPU_EXPORT cudaError_t cudaGraphCreate(cudaGraph_t* pGraph, unsigned int flags)
 VGPU_EXPORT cudaError_t cudaGraphAddKernelNode(cudaGraphNode_t* pNode, cudaGraph_t graph,
                                               const cudaGraphNode_t* deps, size_t numDeps,
                                               const cudaKernelNodeParams* params) {
+  // Before the graph lock, because copying the parameters needs the runtime's
+  // lock and that one comes first everywhere (see kernel_param_sizes).
+  RecordedLaunch w;
+  if (const cudaError_t rc = fill_kernel_work(&w, params); rc != cudaSuccess) return rc;
   std::lock_guard<std::mutex> lock(g_graph_mu);
   GraphRec* g = graph_from(graph);
   if (!g || !pNode) return cudaErrorInvalidValue;
   std::vector<GraphNodeRec*> pred;
   if (!deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
-  RecordedLaunch w;
-  if (const cudaError_t rc = fill_kernel_work(&w, params); rc != cudaSuccess) return rc;
   *pNode = reinterpret_cast<cudaGraphNode_t>(g->add(cudaGraphNodeTypeKernel, std::move(w), pred));
   return cudaSuccess;
 }
@@ -3660,11 +3668,11 @@ VGPU_EXPORT cudaError_t cudaGraphKernelNodeGetParams(cudaGraphNode_t node,
 
 VGPU_EXPORT cudaError_t cudaGraphKernelNodeSetParams(cudaGraphNode_t node,
                                                      const cudaKernelNodeParams* params) {
+  RecordedLaunch w;   // the runtime's lock first, then the graph lock
+  if (const cudaError_t rc = fill_kernel_work(&w, params); rc != cudaSuccess) return rc;
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto* n = reinterpret_cast<GraphNodeRec*>(node);
   if (!n || n->type != cudaGraphNodeTypeKernel) return cudaErrorInvalidValue;
-  RecordedLaunch w;
-  if (const cudaError_t rc = fill_kernel_work(&w, params); rc != cudaSuccess) return rc;
   // The kernel a node runs cannot change, only its arguments and shape.
   if (w.func != n->work.func) return cudaErrorInvalidValue;
   n->work = std::move(w);
@@ -3815,6 +3823,8 @@ VGPU_EXPORT cudaError_t cudaGraphExecUpdate(cudaGraphExec_t exec, cudaGraph_t gr
 VGPU_EXPORT cudaError_t cudaGraphExecKernelNodeSetParams(cudaGraphExec_t exec,
                                                           cudaGraphNode_t node,
                                                           const cudaKernelNodeParams* params) {
+  RecordedLaunch w;   // the runtime's lock first, then the graph lock
+  if (const cudaError_t rc = fill_kernel_work(&w, params); rc != cudaSuccess) return rc;
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto it = g_graph_execs.find(static_cast<void*>(exec));
   if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
@@ -3829,8 +3839,6 @@ VGPU_EXPORT cudaError_t cudaGraphExecKernelNodeSetParams(cudaGraphExec_t exec,
       if (i >= it->second->nodes.size()) return cudaErrorInvalidValue;
       GraphNodeRec* target = it->second->nodes[i].get();
       if (target->type != cudaGraphNodeTypeKernel) return cudaErrorInvalidValue;
-      RecordedLaunch w;
-      if (const cudaError_t rc = fill_kernel_work(&w, params); rc != cudaSuccess) return rc;
       if (w.func != target->work.func) return cudaErrorInvalidValue;
       target->work = std::move(w);
       return cudaSuccess;
