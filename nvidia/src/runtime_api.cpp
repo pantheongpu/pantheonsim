@@ -2086,22 +2086,130 @@ VGPU_EXPORT cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMod
   return cudaSuccess;
 }
 
-// IPC shares device memory between processes through the driver. Device memory
-// here is this process's heap, so a handle would be meaningless in another
-// process -- and silently producing one would corrupt data rather than fail.
-VGPU_EXPORT cudaError_t cudaIpcGetMemHandle(cudaIpcMemHandle_t*, void*) {
-  return cudaErrorNotSupported;
+// ---- sharing memory between processes (IPC) ---------------------------------------
+//
+// A device pointer means nothing in another process, which is why these used to
+// refuse. What can cross a process boundary is a file, and the memory backing
+// already maps its slices MAP_SHARED -- so exporting an allocation moves it into
+// a file of its own in the machine directory, mapped shared, still at the same
+// device address (vgpu/memory.hpp). The importing process maps the same file at
+// an address of its own. Both then read and write the same bytes, which is what
+// the API promises, and a kernel in either process reaches them the way it
+// reaches managed memory.
+//
+// The handle is 64 bytes, as CUDA's is, and carries only what the other process
+// needs: the file's name inside the machine directory, its size, the device it
+// belongs to, and the process that exported it.
+namespace {
+
+constexpr uint32_t kIpcMagic = 0x43504956;   // "VIPC"
+constexpr uint32_t kIpcVersion = 1;
+
+struct IpcMemPayload {
+  uint32_t magic;
+  uint32_t version;
+  uint64_t size;
+  uint32_t device;
+  uint32_t pid;
+  char id[40];       // file name, NUL-padded
+};
+static_assert(sizeof(IpcMemPayload) == CUDA_IPC_HANDLE_SIZE,
+              "an IPC handle payload has to fit the handle CUDA defines");
+
+struct IpcEventPayload {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t pid;
+  uint32_t reserved;
+  char unused[CUDA_IPC_HANDLE_SIZE - 16];
+};
+static_assert(sizeof(IpcEventPayload) == CUDA_IPC_HANDLE_SIZE, "same for an event handle");
+
+std::string ipc_path(const char* id) { return vgpu::telemetry::default_path() + "/ipc-" + id; }
+
+// Imported mappings, so close can undo exactly what open did.
+std::mutex g_ipc_mu;
+std::map<void*, int> g_ipc_open;   // pointer -> device it was mapped on
+
+}  // namespace
+
+VGPU_EXPORT cudaError_t cudaIpcGetMemHandle(cudaIpcMemHandle_t* handle, void* ptr) {
+  return guard("cudaIpcGetMemHandle", [&](State& s) -> cudaError_t {
+    if (!handle || !ptr) return cudaErrorInvalidValue;
+    const auto addr = reinterpret_cast<uint64_t>(ptr);
+    // Which device owns it, since the handle names it and the importer checks.
+    int device = -1;
+    for (int d = 0; d < s.rt->device_count(); ++d)
+      if (s.rt->device(d).memory().owns(addr)) device = d;
+    // cudaIpcGetMemHandle's documented errors do not include an
+    // invalid-device-pointer, so a pointer that is not a device allocation is an
+    // invalid value -- which is in that set.
+    if (device < 0) return cudaErrorInvalidValue;
+    static std::atomic<uint32_t> counter{0};
+    char id[40] = {0};
+    std::snprintf(id, sizeof id, "%x-%x", static_cast<unsigned>(::getpid()),
+                  counter.fetch_add(1) + 1);
+    IpcMemPayload p{};
+    p.magic = kIpcMagic;
+    p.version = kIpcVersion;
+    p.device = static_cast<uint32_t>(device);
+    p.pid = static_cast<uint32_t>(::getpid());
+    std::memcpy(p.id, id, sizeof p.id);
+    // Moves the allocation into the file and keeps this process's pointer
+    // working; throws if `ptr` is not the base of a live allocation, which is
+    // what CUDA refuses too.
+    p.size = s.rt->device(device).memory().share(addr, ipc_path(id));
+    std::memcpy(handle, &p, sizeof p);
+    return cudaSuccess;
+  });
 }
-VGPU_EXPORT cudaError_t cudaIpcOpenMemHandle(void**, cudaIpcMemHandle_t, unsigned int) {
-  return cudaErrorNotSupported;
+
+VGPU_EXPORT cudaError_t cudaIpcOpenMemHandle(void** ptr, cudaIpcMemHandle_t handle,
+                                             unsigned int flags) {
+  return guard("cudaIpcOpenMemHandle", [&](State& s) -> cudaError_t {
+    if (!ptr) return cudaErrorInvalidValue;
+    // The only documented flag, and it is required.
+    if (flags != cudaIpcMemLazyEnablePeerAccess) return cudaErrorInvalidValue;
+    IpcMemPayload p{};
+    std::memcpy(&p, &handle, sizeof p);
+    if (p.magic != kIpcMagic || p.version != kIpcVersion || !p.size) return cudaErrorInvalidValue;
+    // CUDA does not support opening a handle in the process that exported it,
+    // and neither does this: the exporter already has the memory mapped.
+    if (p.pid == static_cast<uint32_t>(::getpid())) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] cudaIpcOpenMemHandle: this handle was exported by this "
+                             "process; a process cannot import its own memory\n");
+      return cudaErrorInvalidValue;
+    }
+    char id[sizeof p.id + 1] = {0};
+    std::memcpy(id, p.id, sizeof p.id);
+    const int device = p.device < static_cast<uint32_t>(s.rt->device_count())
+                           ? static_cast<int>(p.device) : t_current_device;
+    const uint64_t va = s.rt->device(device).memory().adopt(ipc_path(id), p.size);
+    *ptr = reinterpret_cast<void*>(va);
+    std::lock_guard<std::mutex> lock(g_ipc_mu);
+    g_ipc_open[*ptr] = device;
+    return cudaSuccess;
+  });
 }
-VGPU_EXPORT cudaError_t cudaIpcCloseMemHandle(void*) { return cudaErrorNotSupported; }
-VGPU_EXPORT cudaError_t cudaIpcGetEventHandle(cudaIpcEventHandle_t*, cudaEvent_t) {
-  return cudaErrorNotSupported;
+
+VGPU_EXPORT cudaError_t cudaIpcCloseMemHandle(void* ptr) {
+  return guard("cudaIpcCloseMemHandle", [&](State& s) -> cudaError_t {
+    if (!ptr) return cudaErrorInvalidValue;
+    int device = -1;
+    {
+      std::lock_guard<std::mutex> lock(g_ipc_mu);
+      auto it = g_ipc_open.find(ptr);
+      if (it == g_ipc_open.end()) return cudaErrorInvalidValue;
+      device = it->second;
+      g_ipc_open.erase(it);
+    }
+    s.rt->device(device).memory().abandon(reinterpret_cast<uint64_t>(ptr));
+    return cudaSuccess;
+  });
 }
-VGPU_EXPORT cudaError_t cudaIpcOpenEventHandle(cudaEvent_t*, cudaIpcEventHandle_t) {
-  return cudaErrorNotSupported;
-}
+
+
 
 // Graphs are captured and replayed by running the work inline, so a captured
 // graph has no node list to walk. Report an empty graph rather than a count a
@@ -2731,6 +2839,43 @@ VGPU_EXPORT cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t) {
   r->when = std::chrono::steady_clock::now();
   return cudaSuccess;
 }
+
+// An event handle carries no state beyond its origin. Every operation here
+// finishes before the call that started it returns, so an event another process
+// records is complete by the time its handle can be read -- which makes a
+// cross-process wait on it satisfied, rather than skipped.
+VGPU_EXPORT cudaError_t cudaIpcGetEventHandle(cudaIpcEventHandle_t* handle, cudaEvent_t event) {
+  if (!handle) return cudaErrorInvalidValue;
+  {
+    std::lock_guard<std::mutex> lock(g_event_mu);
+    if (!find_event(event)) return cudaErrorInvalidResourceHandle;
+  }
+  IpcEventPayload p{};
+  p.magic = kIpcMagic;
+  p.version = kIpcVersion;
+  p.pid = static_cast<uint32_t>(::getpid());
+  std::memcpy(handle, &p, sizeof p);
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaIpcOpenEventHandle(cudaEvent_t* event, cudaIpcEventHandle_t handle) {
+  if (!event) return cudaErrorInvalidValue;
+  IpcEventPayload p{};
+  std::memcpy(&p, &handle, sizeof p);
+  if (p.magic != kIpcMagic || p.version != kIpcVersion) return cudaErrorInvalidValue;
+  if (p.pid == static_cast<uint32_t>(::getpid())) return cudaErrorInvalidValue;
+  // Already recorded: the work it stands for was complete before the exporting
+  // process could hand the handle over.
+  const cudaError_t rc = cudaEventCreateWithFlags(event, cudaEventDisableTiming);
+  if (rc != cudaSuccess) return rc;
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  if (RtEvent* r = find_event(*event)) {
+    r->recorded = true;
+    r->when = std::chrono::steady_clock::now();
+  }
+  return cudaSuccess;
+}
+
 VGPU_EXPORT cudaError_t cudaEventSynchronize(cudaEvent_t e) {
   std::lock_guard<std::mutex> lock(g_event_mu);
   return find_event(e) ? cudaSuccess : cudaErrorInvalidResourceHandle;

@@ -3,6 +3,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <sys/wait.h>
 #include <memory>
 #include <thread>
@@ -838,4 +840,79 @@ VTEST(a_mapped_handle_is_as_sparse_as_any_other_allocation) {
   mm.write(va + (1ull << 29), &one, 1);   // one byte, in the middle
   VCHECK(mm.resident_bytes() <= 2 * g);
   VCHECK_EQ(mm.used(), 1ull << 30);       // the card's own accounting is the full size
+}
+
+// ---- memory another process can map ---------------------------------------------
+//
+// The mechanics, without a second process: an exported allocation keeps working
+// at the same address, its bytes move into a file, and a mapping of that file
+// reads them back. e2e_ipc is the test that runs two real processes.
+
+VTEST(an_exported_allocation_keeps_its_address_and_its_contents) {
+  MemoryManager mm(4 << 20);
+  const std::string path = std::string("/tmp/vgpu-share-test-") + std::to_string(getpid());
+  std::filesystem::remove(path);
+  uint64_t p = mm.alloc(4096);
+  std::vector<uint8_t> in(4096);
+  for (size_t i = 0; i < in.size(); ++i) in[i] = static_cast<uint8_t>(i * 3 + 1);
+  mm.write(p, in.data(), in.size());
+
+  VCHECK_EQ(mm.share(p, path), uint64_t{4096});
+  VCHECK(mm.is_shared(p));
+  VCHECK(std::filesystem::exists(path));
+  // The same address, the same bytes, and writes still land.
+  std::vector<uint8_t> out(4096, 0);
+  mm.read(p, out.data(), out.size());
+  VCHECK(out == in);
+  const uint8_t marker = 0x5a;
+  mm.write(p + 8, &marker, 1);
+  uint8_t got = 0;
+  mm.read(p + 8, &got, 1);
+  VCHECK_EQ(static_cast<int>(got), 0x5a);
+  // Sharing twice is the same share.
+  VCHECK_EQ(mm.share(p, path + "-again"), uint64_t{4096});
+  VCHECK(!std::filesystem::exists(path + "-again"));
+
+  // What another process would see: the file holds the bytes.
+  std::ifstream f(path, std::ios::binary);
+  std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  VCHECK_EQ(file.size(), size_t{4096});
+  VCHECK_EQ(static_cast<int>(file[8]), 0x5a);
+  f.close();
+
+  // Freeing it takes the file with it: the exporting process owns it.
+  mm.free(p);
+  VCHECK(!std::filesystem::exists(path));
+  VCHECK(!mm.is_shared(p));
+  VCHECK_EQ(mm.used(), uint64_t{0});
+}
+
+VTEST(a_mapping_of_shared_memory_sees_the_same_bytes) {
+  MemoryManager owner(4 << 20), other(4 << 20, 1);   // as two processes would have
+  const std::string path = std::string("/tmp/vgpu-adopt-test-") + std::to_string(getpid());
+  std::filesystem::remove(path);
+  uint64_t p = owner.alloc(4096);
+  const uint8_t seven = 7;
+  owner.write(p + 16, &seven, 1);
+  owner.share(p, path);
+
+  const uint64_t mapped = other.adopt(path, 4096);
+  VCHECK(mapped != p);            // a different address, as IPC gives
+  uint8_t got = 0;
+  other.read(mapped + 16, &got, 1);
+  VCHECK_EQ(static_cast<int>(got), 7);
+  // A write through one mapping shows in the other: this is shared memory.
+  const uint8_t nine = 9;
+  other.write(mapped + 32, &nine, 1);
+  owner.read(p + 32, &got, 1);
+  VCHECK_EQ(static_cast<int>(got), 9);
+
+  other.abandon(mapped);
+  // Abandoning what was not adopted, or adopting what is not there, is refused.
+  VCHECK(VCAPTURE(Error, other.abandon(mapped)).code() == Err::InvalidPointer);
+  VCHECK(VCAPTURE(Error, owner.abandon(p)).code() == Err::InvalidPointer);
+  VCHECK(VCAPTURE(Error, other.adopt(path + "-missing", 4096)).code() == Err::InvalidValue);
+  VCHECK(VCAPTURE(Error, owner.share(p + 64, path + "-interior")).code() == Err::InvalidPointer);
+  owner.free(p);
+  VCHECK(!std::filesystem::exists(path));
 }
