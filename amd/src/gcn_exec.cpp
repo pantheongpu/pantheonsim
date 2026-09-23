@@ -29,6 +29,38 @@ uint32_t as_bits(float f) {
   std::memcpy(&b, &f, 4);
   return b;
 }
+double as_double(uint64_t bits) {
+  double d;
+  std::memcpy(&d, &bits, 8);
+  return d;
+}
+uint64_t as_bits(double d) {
+  uint64_t b;
+  std::memcpy(&b, &d, 8);
+  return b;
+}
+_Float16 as_half(uint16_t bits) {
+  _Float16 h;
+  std::memcpy(&h, &bits, 2);
+  return h;
+}
+uint16_t as_bits(_Float16 h) {
+  uint16_t b;
+  std::memcpy(&b, &h, 2);
+  return b;
+}
+
+// The kinds of float v_cmp_class asks about, one bit each, in the ISA's order.
+bool matches_class(float f, uint32_t mask) {
+  const bool negative = std::signbit(f);
+  uint32_t bit = 0;
+  if (std::isnan(f)) bit = 1u << 1;                       // a quiet NaN; nothing here signals
+  else if (std::isinf(f)) bit = negative ? 1u << 2 : 1u << 9;
+  else if (f == 0) bit = negative ? 1u << 5 : 1u << 6;
+  else if (std::fpclassify(f) == FP_SUBNORMAL) bit = negative ? 1u << 4 : 1u << 7;
+  else bit = negative ? 1u << 3 : 1u << 8;
+  return (mask & bit) != 0;
+}
 
 // One wavefront: its own scalar registers, VCC, EXEC and SCC, and 64 lanes of
 // vector registers.
@@ -112,12 +144,31 @@ struct Machine {
   uint64_t lane_src64(const Wave& w, const Operand& o, uint32_t lane) const {
     if (o.kind == OperandKind::Vgpr)
       return w.vgpr[o.index][lane] | static_cast<uint64_t>(w.vgpr[o.index + 1][lane]) << 32;
+    // An inline constant is the number itself, so in a 64-bit instruction it
+    // is that number as a double, not a float's bits with something above them.
+    if (o.kind == OperandKind::InlineFloat) return as_bits(o.fvalue);
     return scalar(w, o);
   }
-  // A source read as a float, with the negate modifier VOP3 sources carry.
+  // A source read as a float, with the modifiers a VOP3 source carries: the
+  // absolute value first, then the negation, as the ISA applies them.
   float lane_float(const Wave& w, const Operand& o, uint32_t lane) const {
-    const float f = as_float(lane_src(w, o, lane));
+    float f = as_float(lane_src(w, o, lane));
+    if (o.abs) f = std::fabs(f);
     return o.neg ? -f : f;
+  }
+  double lane_double(const Wave& w, const Operand& o, uint32_t lane) const {
+    double d = as_double(lane_src64(w, o, lane));
+    if (o.abs) d = std::fabs(d);
+    return o.neg ? -d : d;
+  }
+  // A float result, held to [0, 1] where the instruction asked for it.
+  void write_float(Wave& w, const Inst& in, uint32_t lane, float v) {
+    if (in.clamp) v = std::isnan(v) ? 0.0f : std::fmin(1.0f, std::fmax(0.0f, v));
+    write_lane(w, in.dst[0], lane, as_bits(v));
+  }
+  void write_double(Wave& w, const Inst& in, uint32_t lane, double v) {
+    if (in.clamp) v = std::isnan(v) ? 0.0 : std::fmin(1.0, std::fmax(0.0, v));
+    write_lane64(w, in.dst[0], lane, as_bits(v));
   }
   void write_lane(Wave& w, const Operand& o, uint32_t lane, uint32_t v) { w.vgpr[o.index][lane] = v; }
   void write_lane64(Wave& w, const Operand& o, uint32_t lane, uint64_t v) {
@@ -147,6 +198,22 @@ struct Machine {
       const int64_t sum = static_cast<int32_t>(a) + static_cast<int64_t>(static_cast<int32_t>(b));
       write_scalar(w, in.dst[0], static_cast<uint32_t>(sum));
       w.scc = sum != static_cast<int32_t>(sum);      // signed overflow
+    } else if (op == "s_sub_i32") {
+      const int64_t diff = static_cast<int32_t>(a) - static_cast<int64_t>(static_cast<int32_t>(b));
+      write_scalar(w, in.dst[0], static_cast<uint32_t>(diff));
+      w.scc = diff != static_cast<int32_t>(diff);
+    } else if (op == "s_or_b32") {
+      const uint32_t v = static_cast<uint32_t>(a) | static_cast<uint32_t>(b);
+      write_scalar(w, in.dst[0], v);
+      w.scc = v != 0;
+    } else if (op == "s_xor_b32") {
+      const uint32_t v = static_cast<uint32_t>(a) ^ static_cast<uint32_t>(b);
+      write_scalar(w, in.dst[0], v);
+      w.scc = v != 0;
+    } else if (op == "s_ashr_i32") {
+      const uint32_t v = static_cast<uint32_t>(static_cast<int32_t>(a) >> (b & 31));
+      write_scalar(w, in.dst[0], v);
+      w.scc = v != 0;
     } else if (op == "s_and_b32") {
       const uint32_t v = static_cast<uint32_t>(a) & static_cast<uint32_t>(b);
       write_scalar(w, in.dst[0], v);
@@ -216,6 +283,48 @@ struct Machine {
   // quotient either way.
   void divide_step(Wave& w, const Inst& in, uint32_t lane) {
     const std::string& op = in.name;
+    // The same three steps, in double precision: the ISA gives each a form of
+    // its own, and the scaling is by 2^128 rather than 2^64.
+    if (op.size() > 4 && op.compare(op.size() - 4, 4, "_f64") == 0) {
+      if (op == "v_div_scale_f64") {
+        const double value = lane_double(w, in.src[0], lane), den = lane_double(w, in.src[1], lane),
+                     num = lane_double(w, in.src[2], lane);
+        bool scaled = false;
+        double out = value;
+        // Both have to be ordinary numbers to compare their exponents:
+        // ilogb of a zero is INT_MIN, and subtracting that overflows.
+        if (std::isfinite(den) && std::isfinite(num) && den != 0 && num != 0) {
+          const int64_t de = std::ilogb(den), ne = std::ilogb(num);
+          if (ne - de >= 1022 || ne - de <= -1022) {
+            out = std::ldexp(value, 128);
+            scaled = true;
+          }
+        }
+        write_lane64(w, in.dst[0], lane, as_bits(out));
+        if (in.dst.size() > 1) {
+          const uint64_t bit = uint64_t{1} << lane;
+          write_scalar(w, in.dst[1], (scalar(w, in.dst[1]) & ~bit) | (scaled ? bit : 0));
+        }
+      } else if (op == "v_div_fmas_f64") {
+        const double r = std::fma(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane),
+                                  lane_double(w, in.src[2], lane));
+        write_lane64(w, in.dst[0], lane, as_bits((w.vcc >> lane) & 1 ? std::ldexp(r, 128) : r));
+      } else {   // v_div_fixup_f64
+        const double q = lane_double(w, in.src[0], lane), den = lane_double(w, in.src[1], lane),
+                     num = lane_double(w, in.src[2], lane);
+        double out = q;
+        if (std::isnan(num) || std::isnan(den)) out = std::numeric_limits<double>::quiet_NaN();
+        else if (den == 0) out = num == 0 ? std::numeric_limits<double>::quiet_NaN()
+                                          : std::copysign(std::numeric_limits<double>::infinity(), num) *
+                                                std::copysign(1.0, den);
+        else if (std::isinf(den)) out = std::isinf(num) ? std::numeric_limits<double>::quiet_NaN()
+                                                        : std::copysign(0.0, num) * std::copysign(1.0, den);
+        else if (std::isinf(num)) out = std::copysign(std::numeric_limits<double>::infinity(), num) *
+                                        std::copysign(1.0, den);
+        write_lane64(w, in.dst[0], lane, as_bits(out));
+      }
+      return;
+    }
     if (op == "v_div_scale_f32") {
       // src0 is the value to scale, src1 the denominator, src2 the numerator.
       const float value = lane_float(w, in.src[0], lane), den = lane_float(w, in.src[1], lane),
@@ -224,8 +333,9 @@ struct Machine {
       // zero: the ISA scales by 2^64, and says so in the condition register.
       bool scaled = false;
       float out = value;
-      if (std::isfinite(den) && std::isfinite(num) && den != 0) {
-        const int de = std::ilogb(den), ne = std::ilogb(num);
+      // As above: a zero has no exponent to compare.
+      if (std::isfinite(den) && std::isfinite(num) && den != 0 && num != 0) {
+        const int64_t de = std::ilogb(den), ne = std::ilogb(num);
         if (ne - de >= 126 || ne - de <= -126) {
           out = std::ldexp(value, 64);
           scaled = true;
@@ -333,11 +443,73 @@ struct Machine {
         // One lane's bit of the condition register picks a source.
         const uint64_t cond = scalar(w, in.src[2]);
         write_lane(w, in.dst[0], lane, lane_src(w, (cond >> lane) & 1 ? in.src[1] : in.src[0], lane));
-      } else if (op == "v_rcp_f32_e32") {
+      } else if (op == "v_sub_f32_e32") {
+        write_float(w, in, lane, lane_float(w, in.src[0], lane) - lane_float(w, in.src[1], lane));
+      } else if (op == "v_min_f32_e32") {
+        write_float(w, in, lane, std::fmin(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
+      } else if (op == "v_max_f32_e32" || op == "v_max_f32_e64") {
+        write_float(w, in, lane, std::fmax(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
+      } else if (op == "v_add_f32_e64") {
+        write_float(w, in, lane, lane_float(w, in.src[0], lane) + lane_float(w, in.src[1], lane));
+      } else if (op == "v_max_u32_e32") {
+        write_lane(w, in.dst[0], lane, std::max(lane_src(w, in.src[0], lane), lane_src(w, in.src[1], lane)));
+      } else if (op == "v_subrev_u32_e32") {
+        write_lane(w, in.dst[0], lane, lane_src(w, in.src[1], lane) - lane_src(w, in.src[0], lane));
+      } else if (op == "v_mul_hi_u32") {
+        const uint64_t p = static_cast<uint64_t>(lane_src(w, in.src[0], lane)) * lane_src(w, in.src[1], lane);
+        write_lane(w, in.dst[0], lane, static_cast<uint32_t>(p >> 32));
+      } else if (op == "v_bcnt_u32_b32") {
+        // The set bits of the first source, counted into the second.
+        write_lane(w, in.dst[0], lane,
+                   lane_src(w, in.src[1], lane) + static_cast<uint32_t>(__builtin_popcount(lane_src(w, in.src[0], lane))));
+      } else if (op == "v_ffbh_u32_e32") {
+        // The leading zeros, and -1 when there is no set bit at all.
+        const uint32_t v = lane_src(w, in.src[0], lane);
+        write_lane(w, in.dst[0], lane, v ? static_cast<uint32_t>(__builtin_clz(v)) : 0xFFFFFFFFu);
+      } else if (op == "v_cvt_u32_f32_e32") {
+        const float f = lane_float(w, in.src[0], lane);
+        write_lane(w, in.dst[0], lane,
+                   std::isnan(f) || f <= 0 ? 0u : f >= 4294967296.0f ? 0xFFFFFFFFu : static_cast<uint32_t>(f));
+      } else if (op == "v_sqrt_f32_e32") {
+        write_float(w, in, lane, std::sqrt(lane_float(w, in.src[0], lane)));
+      } else if (op == "v_exp_f32_e32") {
+        write_float(w, in, lane, std::exp2(lane_float(w, in.src[0], lane)));
+      } else if (op == "v_log_f32_e32") {
+        write_float(w, in, lane, std::log2(lane_float(w, in.src[0], lane)));
+      } else if (op == "v_cndmask_b32_e32") {
+        const uint64_t cond = scalar(w, in.src[2]);
+        write_lane(w, in.dst[0], lane, lane_src(w, (cond >> lane) & 1 ? in.src[1] : in.src[0], lane));
+      } else if (op == "v_add_f64") {
+        write_double(w, in, lane, lane_double(w, in.src[0], lane) + lane_double(w, in.src[1], lane));
+      } else if (op == "v_mul_f64") {
+        write_double(w, in, lane, lane_double(w, in.src[0], lane) * lane_double(w, in.src[1], lane));
+      } else if (op == "v_fma_f64") {
+        write_double(w, in, lane,
+                     std::fma(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane),
+                              lane_double(w, in.src[2], lane)));
+      } else if (op == "v_fmac_f64_e32") {
+        write_double(w, in, lane,
+                     std::fma(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane),
+                              as_double(lane_src64(w, in.dst[0], lane))));
+      } else if (op == "v_rcp_f64_e32") {
+        write_double(w, in, lane, 1.0 / lane_double(w, in.src[0], lane));
+      } else if (op == "v_pk_fma_f16") {
+        // Two halves in one register, each its own multiply-add.
+        const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane),
+                       c = lane_src(w, in.src[2], lane);
+        const auto half_fma = [&](uint32_t shift) {
+          const _Float16 x = as_half(static_cast<uint16_t>(a >> shift)), y = as_half(static_cast<uint16_t>(b >> shift)),
+                         z = as_half(static_cast<uint16_t>(c >> shift));
+          return as_bits(static_cast<_Float16>(static_cast<float>(x) * static_cast<float>(y) + static_cast<float>(z)));
+        };
+        write_lane(w, in.dst[0], lane, half_fma(0) | static_cast<uint32_t>(half_fma(16)) << 16);
+      } else if (op == "v_rcp_f32_e32" || op == "v_rcp_iflag_f32_e32") {
         // The hardware's reciprocal is a table good to about one unit in the
         // last place; this is the exact one, so a program that refines it
-        // (which is how the compiler divides) lands on the same answer.
-        write_lane(w, in.dst[0], lane, as_bits(1.0f / lane_float(w, in.src[0], lane)));
+        // (which is how the compiler divides) lands on the same answer. The
+        // iflag form differs only in which exceptions it raises, and nothing
+        // here raises any.
+        write_float(w, in, lane, 1.0f / lane_float(w, in.src[0], lane));
       } else if (op == "v_mbcnt_lo_u32_b32" || op == "v_mbcnt_hi_u32_b32") {
         // The lanes below this one that are set in the mask, counted into the
         // second source: how a wave numbers its active lanes.
@@ -347,7 +519,7 @@ struct Machine {
                                    : (lane < 32 ? 0u : (1u << (lane - 32)) - 1);
         write_lane(w, in.dst[0], lane,
                    lane_src(w, in.src[1], lane) + static_cast<uint32_t>(__builtin_popcount(mask & below)));
-      } else if (op == "v_div_scale_f32" || op == "v_div_fmas_f32" || op == "v_div_fixup_f32") {
+      } else if (op.rfind("v_div_", 0) == 0) {
         divide_step(w, in, lane);
       } else if (op == "v_mad_u64_u32") {
         // A 32x32 product added to a 64-bit value, with the carry out.
@@ -381,7 +553,13 @@ struct Machine {
       else if (op == "v_cmp_lt_i32_e32") set = static_cast<int32_t>(a) < static_cast<int32_t>(b);
       else if (op == "v_cmp_gt_u32_e32") set = a > b;
       else if (op == "v_cmp_eq_u32_e32") set = a == b;
-      else if (op == "v_cmp_lt_f32_e64") set = lane_float(w, in.src[0], lane) < lane_float(w, in.src[1], lane);
+      else if (op == "v_cmp_le_u32_e32") set = a <= b;
+      else if (op == "v_cmp_lt_f32_e64" || op == "v_cmp_lt_f32_e32")
+        set = lane_float(w, in.src[0], lane) < lane_float(w, in.src[1], lane);
+      else if (op == "v_cmp_gt_f32_e64" || op == "v_cmp_gt_f32_e32")
+        set = lane_float(w, in.src[0], lane) > lane_float(w, in.src[1], lane);
+      else if (op == "v_cmp_ge_f32_e32") set = lane_float(w, in.src[0], lane) >= lane_float(w, in.src[1], lane);
+      else if (op == "v_cmp_class_f32_e32") set = matches_class(lane_float(w, in.src[0], lane), b);
       else throw Error::make(Err::Unsupported, "comparison ", op, " is decoded but not implemented");
       if (set) result |= uint64_t{1} << lane;
     }
@@ -438,6 +616,14 @@ struct Machine {
         mem.store_scalar(addr, 4, lane_src(w, in.src[1], lane));
       } else if (op == "global_store_dwordx2") {
         mem.store_scalar(addr, 8, lane_src64(w, in.src[1], lane));
+      } else if (op == "global_atomic_and" || op == "global_atomic_or") {
+        const uint32_t before = static_cast<uint32_t>(mem.load_scalar(addr, 4)), v = lane_src(w, in.src[1], lane);
+        mem.store_scalar(addr, 4, op == "global_atomic_and" ? before & v : before | v);
+      } else if (op == "global_atomic_cmpswap") {
+        // The pair is the value to write and the one it must find.
+        const uint32_t value = lane_src(w, in.src[1], lane),
+                       expected = w.vgpr[in.src[1].index + 1][lane];
+        if (static_cast<uint32_t>(mem.load_scalar(addr, 4)) == expected) mem.store_scalar(addr, 4, value);
       } else if (op == "global_atomic_add") {
         // Lane by lane, which is what makes it atomic: every lane's addition
         // lands, whatever order they come in.
@@ -471,6 +657,7 @@ struct Machine {
       case gcn::Enc::Vop1:
       case gcn::Enc::Vop2:
       case gcn::Enc::Vop3:
+      case gcn::Enc::Vop3p:
         // A comparison in its long form is still a comparison: it writes a
         // mask of the lanes that passed, not a value per lane.
         if (in.name.rfind("v_cmp_", 0) == 0) compare(w, in);

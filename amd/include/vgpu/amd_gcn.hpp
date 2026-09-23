@@ -19,7 +19,7 @@
 namespace vgpu::amd::gcn {
 
 // The encodings, by the ISA's names for them.
-enum class Enc { Sop1, Sop2, Sopk, Sopc, Sopp, Smem, Vop1, Vop2, Vop3, Vopc, Ds, Flat, Unknown };
+enum class Enc { Sop1, Sop2, Sopk, Sopc, Sopp, Smem, Vop1, Vop2, Vop3, Vop3p, Vopc, Ds, Flat, Unknown };
 const char* enc_name(Enc e);
 
 // Where an operand lives. The ISA numbers scalar registers, vector registers
@@ -32,6 +32,7 @@ struct Operand {
   double fvalue = 0;     // an inline float constant's value (0.5, 1.0, 2.0, 4.0 and their negatives)
   uint32_t width = 1;    // how many 32-bit registers it covers
   bool neg = false;      // VOP3: the source is negated
+  bool abs = false;      // VOP3: its absolute value is taken, before the negation
 };
 std::string operand_text(const Operand& o);
 
@@ -52,6 +53,8 @@ struct Inst {
   // immediate gives it.
   int32_t simm = 0;
   uint64_t target = 0;
+  // VOP3's clamp: a float result is held to [0, 1].
+  bool clamp = false;
   // A memory instruction's scope bits (global_atomic_*'s sc0/sc1/nt), which
   // say how far a write is published. Every access here is already visible to
   // every wave, so they change nothing and are kept for the listing.

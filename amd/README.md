@@ -34,18 +34,22 @@ kernel-launch syntax `hipcc` compiles (`__hipRegisterFatBinary` and
 
 The instructions implemented are those clang emits for the kernels in
 `tests/data/`: scalar and vector integer arithmetic, the logical and shift
-ops, 32- and 64-bit values, float add, multiply, fma and the sequence a
-division compiles to, conversions, comparisons in both their forms,
-`v_cndmask`, the lane-counting ops, scalar and EXEC branches, LDS, global
-loads and stores, and an atomic add. Any other instruction is refused by name,
-and so is a modifier this does not model (an absolute value, a clamp, an
-output multiplier): a wrong guess would run and give a wrong answer.
+ops, 32- and 64-bit values, single and double precision (add, multiply, fma,
+min, max and the sequence a division compiles to), packed half precision,
+conversions, the transcendentals, bit counting, comparisons in both their
+forms and the class test, `v_cndmask`, the lane-counting ops, scalar and EXEC
+branches, LDS, global loads and stores, and the atomics. The source modifiers
+are applied -- an absolute value, a negation, a clamp of the result.
+
+Any other instruction is refused by name, and so is anything this does not
+model: an output multiplier, a packed operation that shuffles halves. A wrong
+guess would run and give a wrong answer, which is worse than a refusal.
 
 Two things are modelled rather than copied, and are marked where they are
-written: the reciprocal (`v_rcp_f32`) is exact here where the hardware's is a
-table good to about one unit in the last place, and the scope bits on a memory
-instruction change nothing, since every access here is already visible to every
-wave.
+written: the reciprocal, square root, exponent and logarithm are the host's
+exact results where the hardware's are tables good to about one unit in the
+last place, and the scope bits on a memory instruction change nothing, since
+every access here is already visible to every wave.
 
 | Folder | What |
 | --- | --- |

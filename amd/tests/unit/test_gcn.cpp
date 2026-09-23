@@ -82,9 +82,13 @@ void check_against_assembler(const std::string& object_name, const std::string& 
 
 VTEST(every_instruction_decodes_as_the_assembler_wrote_it) {
   check_against_assembler("vector_add.gfx942.o", "vector_add.gfx942.dis");
-  // The second fixture is the one that exercises the instructions a real
-  // kernel uses: integer and float math, division, a loop, an atomic.
-  if (!std::getenv("VGPU_GCN_OBJECT")) check_against_assembler("ops.gfx942.o", "ops.gfx942.dis");
+  // The other fixtures exercise what a real kernel uses: integer and float
+  // math, a division, a loop and an atomic in one, and doubles, packed
+  // halves, the modifiers and the transcendentals in the other.
+  if (!std::getenv("VGPU_GCN_OBJECT")) {
+    check_against_assembler("ops.gfx942.o", "ops.gfx942.dis");
+    check_against_assembler("math.gfx942.o", "math.gfx942.dis");
+  }
 }
 
 VTEST(an_instruction_says_where_its_operands_are) {
