@@ -38,6 +38,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop2, 0x02}, {"s_add_i32", 1, 2}},
       {{Enc::Sop2, 0x03}, {"s_sub_i32", 1, 2}},
       {{Enc::Sop2, 0x04}, {"s_addc_u32", 1, 2}},
+      {{Enc::Sop2, 0x0b}, {"s_cselect_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x0c}, {"s_and_b32", 1, 2}},
       {{Enc::Sop2, 0x0d}, {"s_and_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x0e}, {"s_or_b32", 1, 2}},
@@ -84,7 +85,9 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vopc, 0xcc}, {"v_cmp_gt_u32_e32", 2, 2}},
       {{Enc::Vop1, 0x005}, {"v_cvt_f32_i32_e32", 1, 1}},
       {{Enc::Vop1, 0x006}, {"v_cvt_f32_u32_e32", 1, 1}},
+      {{Enc::Vop1, 0x002}, {"v_readfirstlane_b32", 1, 1, 1, 1, 1, false, true}},
       {{Enc::Vop1, 0x007}, {"v_cvt_u32_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x008}, {"v_cvt_i32_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x020}, {"v_exp_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x021}, {"v_log_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x022}, {"v_rcp_f32_e32", 1, 1}},
@@ -92,6 +95,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x025}, {"v_rcp_f64_e32", 2, 1, 2}},
       {{Enc::Vop1, 0x027}, {"v_sqrt_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x02d}, {"v_ffbh_u32_e32", 1, 1}},
+      {{Enc::Vop2, 0x008}, {"v_mul_u32_u24_e32", 1, 2}},
       {{Enc::Vop2, 0x00a}, {"v_min_f32_e32", 1, 2}},
       {{Enc::Vop2, 0x00b}, {"v_max_f32_e32", 1, 2}},
       {{Enc::Vop2, 0x00f}, {"v_max_u32_e32", 1, 2}},
@@ -111,6 +115,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vopc, 0x046}, {"v_cmp_ge_f32_e32", 2, 2}},
       {{Enc::Vopc, 0x0c1}, {"v_cmp_lt_i32_e32", 2, 2}},
       {{Enc::Vopc, 0x0cb}, {"v_cmp_le_u32_e32", 2, 2}},
+      {{Enc::Vopc, 0x0cd}, {"v_cmp_ne_u32_e32", 2, 2}},
       // VOP3: the long form. v_lshl_add shifts its first source and adds the
       // third; the shift itself is always 32-bit.
       {{Enc::Vop3, 0x041}, {"v_cmp_lt_f32_e64", 2, 2, 1, 1, 1, false, true}},
@@ -144,19 +149,27 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x291}, {"v_ashrrev_i64", 2, 2, 1, 2}},
       // DS: LDS reads and writes. A read takes the address; a write takes the
       // address and the data.
+      {{Enc::Ds, 0x00}, {"ds_add_u32", 0, 2}},
       {{Enc::Ds, 0x0d}, {"ds_write_b32", 0, 2}},
       {{Enc::Ds, 0x36}, {"ds_read_b32", 1, 1}},
       {{Enc::Ds, 0x38}, {"ds_read2st64_b32", 2, 1}},
-      // FLAT, in its global form: an address in a VGPR pair, or a scalar base
-      // with a 32-bit offset in one VGPR.
-      {{Enc::Flat, 0x14}, {"global_load_dword", 1, 1}},
-      {{Enc::Flat, 0x15}, {"global_load_dwordx2", 2, 1}},
-      {{Enc::Flat, 0x1c}, {"global_store_dword", 0, 2}},
-      {{Enc::Flat, 0x1d}, {"global_store_dwordx2", 0, 2, 1, 2}},
-      {{Enc::Flat, 0x41}, {"global_atomic_cmpswap", 0, 2, 1, 2}},
-      {{Enc::Flat, 0x42}, {"global_atomic_add", 0, 2}},
-      {{Enc::Flat, 0x48}, {"global_atomic_and", 0, 2}},
-      {{Enc::Flat, 0x49}, {"global_atomic_or", 0, 2}},
+      // A lane reads the value another lane holds: the address says which.
+      {{Enc::Ds, 0x3f}, {"ds_bpermute_b32", 1, 2}},
+      // FLAT and the two segments that share its opcodes: global (an address
+      // in a register pair, or a scalar base and a per-lane offset) and
+      // scratch (each work-item's private memory). The name carries the
+      // segment, which the encoding keeps separately, so the table holds what
+      // follows it.
+      {{Enc::Flat, 0x14}, {"load_dword", 1, 1}},
+      {{Enc::Flat, 0x15}, {"load_dwordx2", 2, 1}},
+      {{Enc::Flat, 0x1c}, {"store_dword", 0, 2}},
+      {{Enc::Flat, 0x1d}, {"store_dwordx2", 0, 2, 1, 2}},
+      {{Enc::Flat, 0x1e}, {"store_dwordx3", 0, 2, 1, 3}},
+      {{Enc::Flat, 0x1f}, {"store_dwordx4", 0, 2, 1, 4}},
+      {{Enc::Flat, 0x41}, {"atomic_cmpswap", 0, 2, 1, 2}},
+      {{Enc::Flat, 0x42}, {"atomic_add", 0, 2}},
+      {{Enc::Flat, 0x48}, {"atomic_and", 0, 2}},
+      {{Enc::Flat, 0x49}, {"atomic_or", 0, 2}},
       // VOP3P: a packed pair of halves in one register, both computed at once.
       {{Enc::Vop3p, 0x0e}, {"v_pk_fma_f16", 1, 3}},
   };
@@ -187,6 +200,10 @@ Operand operand(uint32_t code, uint32_t width) {
     o.width = width >= 2 ? 2 : 1;
   } else if (code == 127) {
     o.kind = OperandKind::ExecHi;
+  } else if (code == 235) {
+    // Where LDS sits in the one address space a flat access uses.
+    o.kind = OperandKind::SharedBase;
+    o.width = 2;
   } else if (code >= 240 && code <= 247) {
     // The inline float constants, in the ISA's order.
     static const double kFloats[] = {0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0};
@@ -321,7 +338,8 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.opcode = (w0 >> 9) & 0xFF;
     const Shape& s = shape(in.enc, in.opcode);
     in.name = s.name;
-    in.dst.push_back(vgpr((w0 >> 17) & 0xFF, s.dst_width));
+    if (s.scalar_dst) in.dst.push_back(sgpr((w0 >> 17) & 0xFF, s.dst_width));
+    else in.dst.push_back(vgpr((w0 >> 17) & 0xFF, s.dst_width));
     in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
   } else if ((w0 >> 25) == 0x3e) {    // VOPC
     in.enc = Enc::Vopc;
@@ -408,10 +426,14 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.enc = Enc::Flat;
     in.opcode = (w0 >> 18) & 0x7F;
     const Shape& s = shape(in.enc, in.opcode);
-    in.name = s.name;
+    // The segment is in the encoding, and the assembler puts it in the name.
+    const uint32_t seg = (w0 >> 14) & 0x3;
+    in.segment = seg == 0 ? Inst::Segment::Flat : seg == 1 ? Inst::Segment::Scratch : Inst::Segment::Global;
+    in.name = (seg == 0 ? "flat_" : seg == 1 ? "scratch_" : "global_") + std::string(s.name);
     in.size = 8;
     const uint32_t w1 = word(code, at + 4);
-    in.offset = static_cast<int32_t>(w0 & 0x1FFF) << 19 >> 19;   // 13 bits, signed
+    in.offset = seg == 2 ? static_cast<int32_t>(w0 & 0x1FFF) << 19 >> 19   // global: signed
+                         : static_cast<int32_t>(w0 & 0xFFF);               // flat and scratch: unsigned
     // The scope bits: sc0 and nt beside the offset, sc1 above the opcode.
     // They say how far a write is published; every access here is already
     // visible to every wave, so they change nothing and are kept for the
@@ -420,8 +442,15 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     const uint32_t saddr = (w1 >> 16) & 0x7F;
     in.has_saddr = saddr != 0x7F;                    // 0x7f: the address is the VGPR pair's
     in.saddr = saddr;
+    // A scratch access may have neither an address register nor a scalar
+    // base: then the offset alone says where in the work-item's own memory.
+    in.has_vaddr = in.segment != Inst::Segment::Scratch || ((w0 >> 13) & 1) != 0;
     if (s.dst_width) in.dst.push_back(vgpr((w1 >> 24) & 0xFF, s.dst_width));
-    in.src.push_back(vgpr(w1 & 0xFF, in.has_saddr ? 1 : 2));        // the address
+    // A flat address is 64-bit; a global one is 64-bit unless a scalar base
+    // carries the top of it; a scratch one is a 32-bit offset.
+    const uint32_t addr_width = in.segment == Inst::Segment::Global ? (in.has_saddr ? 1 : 2)
+                                                                   : in.segment == Inst::Segment::Flat ? 2 : 1;
+    in.src.push_back(vgpr(w1 & 0xFF, addr_width));
     if (s.srcs > 1) in.src.push_back(vgpr((w1 >> 8) & 0xFF, s.src_width(1)));   // the data written
   } else if ((w0 >> 31) == 0) {       // VOP2
     in.enc = Enc::Vop2;
@@ -470,6 +499,7 @@ std::string operand_text(const Operand& o) {
     case OperandKind::ExecLo: return wrap("exec_lo");
     case OperandKind::ExecHi: return wrap("exec_hi");
     case OperandKind::M0: return wrap("m0");
+    case OperandKind::SharedBase: return wrap("src_shared_base");
     case OperandKind::InlineFloat:
       // As the assembler writes them: 1.0, -0.5, and so on.
       std::snprintf(b, sizeof b, "%.1f", o.fvalue);
@@ -490,13 +520,16 @@ std::string operand_text(const Operand& o) {
 std::string to_text(const Inst& i) {
   std::string s = i.name;
   std::string sep = " ";
+  // A scratch access with no address register: the assembler writes "off"
+  // where the register would be.
+  const bool scratch_no_addr = i.enc == Enc::Flat && i.segment == Inst::Segment::Scratch && !i.has_vaddr;
   char b[64];
   for (const Operand& o : i.dst) {
     s += sep + operand_text(o);
     sep = ", ";
   }
-  for (const Operand& o : i.src) {
-    s += sep + operand_text(o);
+  for (size_t k = 0; k < i.src.size(); ++k) {
+    s += sep + (scratch_no_addr && k == 0 ? "off" : operand_text(i.src[k]));
     sep = ", ";
   }
   if (i.clamp) s += " clamp";
@@ -514,7 +547,10 @@ std::string to_text(const Inst& i) {
       s += b;
     }
   } else if (i.enc == Enc::Flat) {
-    s += i.has_saddr ? ", s[" + std::to_string(i.saddr) + ":" + std::to_string(i.saddr + 1) + "]" : ", off";
+    // flat prints only its address and data; global and scratch print the
+    // scalar base, or "off" where there is none.
+    if (i.segment != Inst::Segment::Flat)
+      s += i.has_saddr ? ", s[" + std::to_string(i.saddr) + ":" + std::to_string(i.saddr + 1) + "]" : ", off";
     if (i.offset) {
       std::snprintf(b, sizeof b, " offset:%d", i.offset);
       s += b;

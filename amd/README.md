@@ -38,18 +38,24 @@ ops, 32- and 64-bit values, single and double precision (add, multiply, fma,
 min, max and the sequence a division compiles to), packed half precision,
 conversions, the transcendentals, bit counting, comparisons in both their
 forms and the class test, `v_cndmask`, the lane-counting ops, scalar and EXEC
-branches, LDS, global loads and stores, and the atomics. The source modifiers
-are applied -- an absolute value, a negation, a clamp of the result.
+branches, and the memory a kernel uses: global loads and stores and their
+atomics, LDS and its atomics, a work-item's private memory (what a kernel
+spills into when it runs out of registers), a value read from another lane,
+and a flat access, whose address says for itself whether it means LDS or the
+device. The source modifiers are applied -- an absolute value, a negation, a
+clamp of the result.
 
 Any other instruction is refused by name, and so is anything this does not
 model: an output multiplier, a packed operation that shuffles halves. A wrong
 guess would run and give a wrong answer, which is worse than a refusal.
 
-Two things are modelled rather than copied, and are marked where they are
+Three things are modelled rather than copied, and are marked where they are
 written: the reciprocal, square root, exponent and logarithm are the host's
 exact results where the hardware's are tables good to about one unit in the
-last place, and the scope bits on a memory instruction change nothing, since
-every access here is already visible to every wave.
+last place; the scope bits on a memory instruction change nothing, since every
+access here is already visible to every wave; and LDS sits at an address of
+this model's choosing, which a kernel reads from `src_shared_base` the way it
+reads the hardware's.
 
 | Folder | What |
 | --- | --- |

@@ -24,7 +24,7 @@ const char* enc_name(Enc e);
 
 // Where an operand lives. The ISA numbers scalar registers, vector registers
 // and the inline constants in one 9-bit space; this splits them apart.
-enum class OperandKind { Sgpr, Vgpr, Vcc, Exec, ExecLo, ExecHi, M0, Inline, InlineFloat, Literal, None };
+enum class OperandKind { Sgpr, Vgpr, Vcc, Exec, ExecLo, ExecHi, M0, SharedBase, Inline, InlineFloat, Literal, None };
 struct Operand {
   OperandKind kind = OperandKind::None;
   uint32_t index = 0;    // the register's number
@@ -49,6 +49,10 @@ struct Inst {
   int32_t offset = 0, offset1 = 0;
   uint32_t saddr = 0;            // a global_* instruction's scalar base, when it has one
   bool has_saddr = false;
+  bool has_vaddr = true;         // a scratch_* instruction may address by offset alone
+  // Which of the one address space a memory instruction reaches: flat (the
+  // address decides), global, or a work-item's private memory.
+  enum class Segment { Flat, Scratch, Global } segment = Segment::Global;
   // s_waitcnt's counts, and the branch target of a branch, as the ISA's
   // immediate gives it.
   int32_t simm = 0;

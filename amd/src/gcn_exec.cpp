@@ -19,6 +19,13 @@ constexpr uint32_t kSgprs = 102;      // s0 through s101
 constexpr uint32_t kVgprs = 256;
 constexpr uint32_t kLanes = 64;
 
+// Where LDS sits in the one address space a flat access uses. The hardware
+// puts it in an aperture the wave reads from src_shared_base; this model puts
+// it below every device allocation (vgpu/memory.hpp starts those at
+// 0x2000'0000'0000), so an address says for itself which memory it means.
+constexpr uint64_t kSharedBase = 0x1000'0000'0000ull;
+constexpr uint64_t kSharedSize = 1ull << 20;
+
 float as_float(uint32_t bits) {
   float f;
   std::memcpy(&f, &bits, 4);
@@ -79,6 +86,10 @@ struct Wave {
 // reach the barrier.
 struct Group {
   std::vector<uint8_t> lds;
+  // Each work-item's private memory, one block per lane of the group: what a
+  // kernel spills into when it runs out of registers.
+  std::vector<uint8_t> scratch;
+  uint32_t scratch_per_lane = 0;
   std::vector<Wave> waves;
 };
 
@@ -112,6 +123,7 @@ struct Machine {
       case OperandKind::ExecLo: return static_cast<uint32_t>(w.exec);
       case OperandKind::ExecHi: return static_cast<uint32_t>(w.exec >> 32);
       case OperandKind::InlineFloat: return as_bits(static_cast<float>(o.fvalue));
+      case OperandKind::SharedBase: return kSharedBase;
       case OperandKind::Inline:
       case OperandKind::Literal: return static_cast<uint64_t>(o.value);
       case OperandKind::M0: return 0;
@@ -241,6 +253,9 @@ struct Machine {
       const uint64_t v = a << (b & 63);
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
+    } else if (op == "s_cselect_b64") {
+      // What the last comparison decided picks a source.
+      write_scalar(w, in.dst[0], w.scc ? a : b);
     } else if (op == "s_and_saveexec_b64") {
       // Divergence, as the compiler writes it: keep EXEC, narrow it to the
       // lanes the condition took.
@@ -466,6 +481,21 @@ struct Machine {
         // The leading zeros, and -1 when there is no set bit at all.
         const uint32_t v = lane_src(w, in.src[0], lane);
         write_lane(w, in.dst[0], lane, v ? static_cast<uint32_t>(__builtin_clz(v)) : 0xFFFFFFFFu);
+      } else if (op == "v_cvt_i32_f32_e32") {
+        const float f = lane_float(w, in.src[0], lane);
+        write_lane(w, in.dst[0], lane,
+                   static_cast<uint32_t>(std::isnan(f)          ? 0
+                                         : f <= -2147483648.0f  ? INT32_MIN
+                                         : f >= 2147483648.0f   ? INT32_MAX
+                                                                : static_cast<int32_t>(f)));
+      } else if (op == "v_mul_u32_u24_e32") {
+        // Only the low 24 bits of each source take part.
+        write_lane(w, in.dst[0], lane,
+                   (lane_src(w, in.src[0], lane) & 0xFFFFFF) * (lane_src(w, in.src[1], lane) & 0xFFFFFF));
+      } else if (op == "v_readfirstlane_b32") {
+        // The value in the first active lane, into a scalar register.
+        if (lane != first_active(w)) continue;
+        write_scalar(w, in.dst[0], w.vgpr[in.src[0].index][lane]);
       } else if (op == "v_cvt_u32_f32_e32") {
         const float f = lane_float(w, in.src[0], lane);
         write_lane(w, in.dst[0], lane,
@@ -554,6 +584,7 @@ struct Machine {
       else if (op == "v_cmp_gt_u32_e32") set = a > b;
       else if (op == "v_cmp_eq_u32_e32") set = a == b;
       else if (op == "v_cmp_le_u32_e32") set = a <= b;
+      else if (op == "v_cmp_ne_u32_e32") set = a != b;
       else if (op == "v_cmp_lt_f32_e64" || op == "v_cmp_lt_f32_e32")
         set = lane_float(w, in.src[0], lane) < lane_float(w, in.src[1], lane);
       else if (op == "v_cmp_gt_f32_e64" || op == "v_cmp_gt_f32_e32")
@@ -566,12 +597,21 @@ struct Machine {
     write_scalar(w, in.dst[0], result);
   }
 
+  // One work-item's private memory: its own block of the group's scratch.
+  uint8_t* scratch_at(Group& g, const Wave& w, uint32_t lane, uint64_t offset, uint32_t bytes) {
+    const uint64_t base = uint64_t{w.first_lane + lane} * g.scratch_per_lane;
+    if (offset + bytes > g.scratch_per_lane || base + offset + bytes > g.scratch.size())
+      throw Error::make(Err::InvalidValue, "a scratch access at ", offset, " is past the ", g.scratch_per_lane,
+                        " bytes a work-item reserved");
+    return &g.scratch[base + offset];
+  }
+
   // LDS, which the work-group shares.
   void lds_access(Wave& w, const Inst& in, Group& g) {
     const std::string& op = in.name;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
-      const uint32_t addr = lane_src(w, in.src[0], lane);
+      const uint32_t addr = in.name == "ds_bpermute_b32" ? 0 : lane_src(w, in.src[0], lane);
       const auto at = [&](uint64_t offset) {
         const uint64_t a = addr + offset;
         if (a + 4 > g.lds.size())
@@ -586,6 +626,17 @@ struct Machine {
         uint32_t v = 0;
         std::memcpy(&v, &g.lds[at(static_cast<uint64_t>(in.offset))], 4);
         write_lane(w, in.dst[0], lane, v);
+      } else if (op == "ds_add_u32") {
+        // An atomic add in LDS: every lane's addition lands.
+        uint32_t v = 0;
+        std::memcpy(&v, &g.lds[at(static_cast<uint64_t>(in.offset))], 4);
+        v += lane_src(w, in.src[1], lane);
+        std::memcpy(&g.lds[at(static_cast<uint64_t>(in.offset))], &v, 4);
+      } else if (op == "ds_bpermute_b32") {
+        // A lane reads what another lane holds: the address says which, in
+        // bytes, and the source register is read across the wave.
+        const uint32_t from = (lane_src(w, in.src[0], lane) >> 2) & (kLanes - 1);
+        write_lane(w, in.dst[0], lane, w.vgpr[in.src[1].index][from]);
       } else if (op == "ds_read2st64_b32") {
         // Two dwords, each offset by its own count of 64 dwords.
         uint32_t v0 = 0, v1 = 0;
@@ -595,6 +646,61 @@ struct Machine {
         w.vgpr[in.dst[0].index + 1][lane] = v1;
       } else {
         throw Error::make(Err::Unsupported, "LDS instruction ", op, " is decoded but not implemented");
+      }
+    }
+  }
+
+  // A flat address says for itself which memory it means: the shared
+  // aperture is LDS, and everything else is the device's.
+  void flat_access(Wave& w, const Inst& in, Group& g) {
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      if (!(w.exec >> lane & 1)) continue;
+      const uint64_t addr = lane_src64(w, in.src[0], lane) + static_cast<uint64_t>(in.offset);
+      const bool shared = addr >= kSharedBase && addr < kSharedBase + kSharedSize;
+      const uint64_t where = shared ? addr - kSharedBase : addr;
+      if (shared && where + 4 > g.lds.size())
+        throw Error::make(Err::InvalidValue, "a flat access reaches LDS at ", where, ", past the ", g.lds.size(),
+                          " bytes the kernel reserved");
+      if (in.name == "flat_store_dword") {
+        const uint32_t v = lane_src(w, in.src[1], lane);
+        if (shared) std::memcpy(&g.lds[where], &v, 4);
+        else mem.store_scalar(where, 4, v);
+      } else if (in.name == "flat_load_dword") {
+        uint32_t v = 0;
+        if (shared) std::memcpy(&v, &g.lds[where], 4);
+        else v = static_cast<uint32_t>(mem.load_scalar(where, 4));
+        write_lane(w, in.dst[0], lane, v);
+      } else {
+        throw Error::make(Err::Unsupported, "flat instruction ", in.name, " is decoded but not implemented");
+      }
+    }
+  }
+
+  // A work-item's private memory, which a kernel spills into.
+  void scratch_access(Wave& w, const Inst& in, Group& g) {
+    const std::string& op = in.name;
+    const uint32_t words = op == "scratch_store_dwordx4"   ? 4
+                           : op == "scratch_store_dwordx3" ? 3
+                           : op == "scratch_store_dwordx2" ? 2
+                                                           : 1;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      if (!(w.exec >> lane & 1)) continue;
+      const uint64_t offset =
+          (in.has_vaddr ? lane_src(w, in.src[0], lane) : 0) + static_cast<uint64_t>(in.offset);
+      uint8_t* at = scratch_at(g, w, lane, offset, 4 * words);
+      if (op.rfind("scratch_store", 0) == 0) {
+        for (uint32_t k = 0; k < words; ++k) {
+          const uint32_t v = w.vgpr[in.src[1].index + k][lane];
+          std::memcpy(at + 4 * k, &v, 4);
+        }
+      } else if (op.rfind("scratch_load", 0) == 0) {
+        for (uint32_t k = 0; k < words; ++k) {
+          uint32_t v = 0;
+          std::memcpy(&v, at + 4 * k, 4);
+          w.vgpr[in.dst[0].index + k][lane] = v;
+        }
+      } else {
+        throw Error::make(Err::Unsupported, "scratch instruction ", op, " is decoded but not implemented");
       }
     }
   }
@@ -670,7 +776,9 @@ struct Machine {
         lds_access(w, in, g);
         return true;
       case gcn::Enc::Flat:
-        global_access(w, in);
+        if (in.segment == Inst::Segment::Scratch) scratch_access(w, in, g);
+        else if (in.segment == Inst::Segment::Flat) flat_access(w, in, g);
+        else global_access(w, in);
         return true;
       case gcn::Enc::Sopp: break;
       default:
@@ -731,6 +839,10 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
       for (uint32_t gx = 0; gx < d.groups[0]; ++gx) {
         Group group;
         group.lds.assign(k.group_segment, 0);
+        // Each work-item's private memory. A kernel that spills says how much
+        // it needs; the rest get none.
+        group.scratch_per_lane = (k.private_segment + 3) & ~3u;
+        group.scratch.assign(static_cast<size_t>(group.scratch_per_lane) * threads, 0);
         group.waves.resize(waves_per_group);
         for (uint32_t i = 0; i < waves_per_group; ++i) {
           Wave& w = group.waves[i];
