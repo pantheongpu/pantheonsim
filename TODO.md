@@ -45,6 +45,21 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   their high-water marks are what a pool reports, and a mark resets by writing
   zero to it. e2e_mempool checks reuse (the same pointer comes back), the
   statistics, trimming, an explicit pool, and the refusals.
+- Graphs built node by node, not only captured: cudaGraphCreate,
+  cudaGraphAddKernelNode, AddMemcpyNode(1D), AddMemsetNode, AddEmptyNode,
+  AddChildGraphNode, Add/RemoveDependencies, DestroyNode, the queries
+  (GetNodes, GetRootNodes, GetEdges, NodeGetType, NodeGetDependencies,
+  NodeGetDependentNodes), the per-node parameters, Clone, NodeFindInClone,
+  cudaGraphExecKernelNodeSetParams and a real cudaGraphExecUpdate. A graph is a
+  DAG now rather than a list: nodes carry their dependencies, a launch runs them
+  in an order that respects them, and a dependency that would close a cycle is
+  refused. Capture builds the same structure, each operation depending on the
+  one before it, so a captured graph can be read back with the same calls.
+  cudaGraphDebugDotPrint draws the real nodes and edges, where it used to print
+  an empty graph. e2e_graph_build builds a diamond, launches it, changes a
+  node's parameters on the instantiated graph without rebuilding, updates it
+  from the graph, clones it and runs it as a child graph. A 2D fill or a pitched
+  copy in a node is refused by name rather than run as something else.
 - Device memory shared between processes (cudaIpcGetMemHandle,
   cudaIpcOpenMemHandle, cudaIpcCloseMemHandle and the event handles): an
   exported allocation moves into a file of its own in the machine directory,

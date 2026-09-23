@@ -923,6 +923,16 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# A graph built node by node rather than captured: a diamond of dependencies,
+# launched, then given new parameters without being rebuilt.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_graph_build COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_build.sh)
+  set_tests_properties(e2e_graph_build PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # The `vgpu run` wrapper, and the two pre-flight checks that are the reason it
 # exists: a CUDA soname the shim does not carry, and a DT_RPATH that outranks
 # LD_LIBRARY_PATH. Both are silent failures without it.
