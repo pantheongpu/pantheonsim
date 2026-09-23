@@ -535,9 +535,12 @@ what is done.
   a freshly built object. amd/src/gcn_exec.cpp runs them on 64-lane
   wavefronts with the scalar registers and the EXEC mask the ISA exposes, over
   LDS and device memory, with barriers: the fixture's kernels -- a vector add
-  and a reduction through LDS -- give the answers their C would. Still
-  missing: the HIP runtime above it, so a HIP program cannot reach this yet,
-  and every instruction outside what those kernels use.
+  and a reduction through LDS -- give the answers their C would. amd/src/hip_api.cpp
+  is libamdhip64 over that: a HIP program written against the documented API
+  (amd/include/vgpu_hip.h) gets devices, memory and the module API, and its
+  kernel runs. Still missing: the fatbin path hipcc compiles
+  (__hipRegisterFatBinary, hipLaunchKernel), streams that are more than
+  handles, and every instruction outside what the fixture's kernels use.
 - Tooling: trace record/replay, conformance DB + compat scores. (`vgpu run`,
   `vgpu test --matrix`, shared-memory race detection, the random and
   adversarial schedulers, and fault injection are done.)
