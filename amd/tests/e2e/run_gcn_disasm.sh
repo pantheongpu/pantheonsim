@@ -50,6 +50,19 @@ expect "every instruction it emitted decodes as it prints it" "yes" \
 expect "and the rest of the decoder's checks hold on it" "0" \
   "$(grep -c "^\[ FAIL \]" <<< "$out")"
 
+# Every fixture the tests read has to be in the repository. .gitignore covers
+# *.o, so a code object is only there because something asked for it
+# explicitly: without this check the tests pass here and fail for everyone who
+# clones, which is exactly what happened once.
+if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+  untracked=""
+  for f in amd/tests/data/vector_add.gfx942.o amd/tests/data/ops.gfx942.o \
+           amd/tests/data/vector_add.gfx942.dis amd/tests/data/ops.gfx942.dis; do
+    git -C "$root" ls-files --error-unmatch "$f" >/dev/null 2>&1 || untracked="$untracked $f"
+  done
+  expect "every fixture the tests read is in the repository" "" "$untracked"
+fi
+
 # The version that is checked in has to stay the version the tests read: a
 # code object whose listing was regenerated without the object, or the other
 # way round, would pass here and fail for everyone else.
