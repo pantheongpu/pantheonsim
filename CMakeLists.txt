@@ -892,6 +892,15 @@ set_tests_properties(e2e_driver_abi PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
 
+# The virtual memory management API through a real program: reserve, create,
+# map, grant access, run a kernel, grow the buffer in place, unmap. Also
+# compiled against the vendor header, since it passes the vendor's structs.
+add_test(NAME e2e_vmm COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_vmm.sh)
+set_tests_properties(e2e_vmm PROPERTIES
+  DEPENDS vgpucuda
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
 # The `vgpu run` wrapper, and the two pre-flight checks that are the reason it
 # exists: a CUDA soname the shim does not carry, and a DT_RPATH that outranks
 # LD_LIBRARY_PATH. Both are silent failures without it.

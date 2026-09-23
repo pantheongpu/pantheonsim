@@ -166,6 +166,55 @@ class MemoryManager {
   // Locates the live allocation containing `addr`. Returns false if none.
   bool find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const;
 
+  // ---- virtual memory management ----
+  //
+  // What the cuMem* mapping API needs, and the shape CUDA documents: address
+  // space is *reserved* without memory behind it, memory is *created* as a
+  // handle that has no address, a handle is *mapped* into a reservation, and a
+  // mapping is unusable until access is granted for a device. That is how
+  // PyTorch's expandable segments and NCCL's window allocations grow a buffer
+  // without moving it, and it needs physical allocations separable from
+  // addresses -- which is why the sparse chunk model alone could not answer it.
+  //
+  // Every state a real device faults on faults here, with a diagnostic saying
+  // which one it was: reserved with nothing mapped, mapped with no access
+  // granted, written through a read-only mapping, or touched after unmap.
+  //
+  // Sizes and addresses are multiples of kVmmGranularity, which is what
+  // cuMemGetAllocationGranularity reports.
+  static constexpr uint64_t kVmmGranularity = kChunkSize;
+
+  // Address space with nothing behind it. `alignment` 0 means the granularity.
+  uint64_t reserve(uint64_t size, uint64_t alignment);
+  // Gives a reservation back. It must have nothing mapped in it.
+  void address_free(uint64_t va, uint64_t size);
+
+  // Physical memory with no address, counted against the device's capacity.
+  // Returns a handle; handles are never 0 and are never reused.
+  uint64_t create_handle(uint64_t size);
+  uint64_t handle_size(uint64_t handle) const;
+  // The handle mapped at `va` (retaining a reference), or 0 when nothing is.
+  uint64_t retain_handle_at(uint64_t va);
+  void retain_handle(uint64_t handle);
+  // One reference. The memory goes when the last reference and the last
+  // mapping are gone, in either order -- CUDA lets a handle be released while
+  // it is still mapped, and the mapping keeps working.
+  void release_handle(uint64_t handle);
+
+  // Puts `handle`'s memory at `va`. `offset` into the handle must be 0, as
+  // cuMemMap documents.
+  void map(uint64_t va, uint64_t size, uint64_t offset, uint64_t handle);
+  // Takes it away again. The range must be exactly one mapping.
+  void unmap(uint64_t va, uint64_t size);
+  // Grants (or withdraws) a device's access to mapped address space.
+  void set_access(uint64_t va, uint64_t size, bool readable, bool writable);
+  // The access flags at `va`; false when nothing is mapped there.
+  bool access_at(uint64_t va, bool* readable, bool* writable) const;
+  // Reservations, mappings and handles that exist now, for tests and `vgpu`.
+  size_t reservations() const { return reserved_.size(); }
+  size_t mappings() const { return maps_.size(); }
+  size_t handles() const { return handles_.size(); }
+
   // ---- managed memory ----
   //
   // One buffer both the host and a kernel can address, which is what
@@ -270,7 +319,13 @@ class MemoryManager {
   static uint8_t* materialize(Allocation& a, uint64_t chunk_idx);
 
   // Maps addr to (allocation base, allocation); throws with diagnostics.
-  const Allocation& resolve(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out) const;
+  // `writing` picks the diagnostic for a read-only mapping.
+  const Allocation& resolve(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
+                            bool writing = false) const;
+  // The mapped-memory half of resolve: a hit returns the handle's allocation,
+  // a miss returns null so the caller can carry on with its own diagnostics.
+  const Allocation* resolve_mapped(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
+                                   bool writing) const;
   // Copies `len` bytes at offset `off` in allocation `a` out to `d`.
   void read_chunks(const Allocation& a, uint64_t off, uint8_t* d, uint64_t len) const;
   Allocation& resolve_mut(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out);
@@ -284,6 +339,34 @@ class MemoryManager {
   }
 
   std::function<void(uint64_t)> usage_observer_;
+
+  // ---- virtual memory management state ----
+  // A reservation is address space and nothing else. A handle is memory and no
+  // address: its chunks are an Allocation like any other, which is what lets a
+  // mapped range use the same read, write and fault paths. A mapping joins the
+  // two, and carries the access a device was granted.
+  struct Reservation {
+    uint64_t size = 0;
+  };
+  struct Handle {
+    uint64_t size = 0;
+    uint32_t refs = 1;      // cuMemCreate's own reference, plus every retain
+    uint32_t mapped = 0;    // mappings pointing at it
+    Allocation mem;
+  };
+  struct Mapping {
+    uint64_t size = 0;
+    uint64_t offset = 0;    // into the handle
+    uint64_t handle = 0;
+    bool readable = false;  // until cuMemSetAccess, a mapping is unusable
+    bool writable = false;
+  };
+  std::map<uint64_t, Reservation> reserved_;   // by address
+  std::map<uint64_t, Mapping> maps_;           // by address
+  std::map<uint64_t, Handle> handles_;         // by handle id
+  uint64_t next_handle_ = 1;
+  // Drops a handle when its last reference and last mapping are gone.
+  void collect_handle(uint64_t handle);
 
   // Managed buffers: real host memory the device can also address. Rare and
   // written only at allocation, so a flag keeps the read path free for the
