@@ -46,6 +46,7 @@ hipError_t fail(hipError_t code, const std::string& what) {
 
 struct Module {
   CodeObject object;
+  uint64_t globals = 0;   // where the module's own variables were placed
 };
 
 // A kernel a program has looked up: the module it came from, and which kernel.
@@ -320,9 +321,18 @@ hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
   std::memcpy(&shentsize, bytes + 0x3A, 2);
   std::memcpy(&shnum, bytes + 0x3C, 2);
   const uint64_t size = shoff + uint64_t{shentsize} * shnum;
+  vgpu::runtime::Device* d = device(s);
+  if (!d) return record(s, hipErrorInvalidDevice);
   try {
     auto m = std::make_unique<Module>();
     m->object = vgpu::amd::load_code_object(std::string(reinterpret_cast<const char*>(bytes), size), "the image");
+    // The module's own variables go on the device, and the code is told where
+    // they are: until that is done, a kernel reaching one reads nothing.
+    if (!m->object.data.empty()) {
+      m->globals = d->memory().alloc(m->object.data.size());
+      d->memory().write(m->globals, m->object.data.data(), m->object.data.size());
+    }
+    vgpu::amd::place_globals(m->object, m->globals);
     *module = reinterpret_cast<hipModule_t>(m.get());
     s.modules.push_back(std::move(m));
   } catch (const std::exception& e) {
@@ -347,6 +357,14 @@ hipError_t hipModuleUnload(hipModule_t module) {
     if (reinterpret_cast<hipModule_t>(s.modules[i].get()) == module) {
       for (size_t f = s.functions.size(); f-- > 0;)
         if (s.functions[f]->module == s.modules[i].get()) s.functions.erase(s.functions.begin() + f);
+      if (s.modules[i]->globals) {
+        if (vgpu::runtime::Device* d = device(s)) {
+          try {
+            d->memory().free(s.modules[i]->globals);
+          } catch (const std::exception&) {
+          }
+        }
+      }
       s.modules.erase(s.modules.begin() + i);
       return record(s, hipSuccess);
     }
@@ -365,6 +383,18 @@ hipError_t hipModuleGetFunction(hipFunction_t* function, hipModule_t module, con
   f->kernel = k;
   *function = reinterpret_cast<hipFunction_t>(f.get());
   s.functions.push_back(std::move(f));
+  return record(s, hipSuccess);
+}
+
+hipError_t hipModuleGetGlobal(void** dptr, size_t* bytes, hipModule_t module, const char* name) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!module || !name) return record(s, hipErrorInvalidValue);
+  Module* m = reinterpret_cast<Module*>(module);
+  const vgpu::amd::GlobalVar* g = vgpu::amd::find_global(m->object, name);
+  if (!g) return record(s, fail(hipErrorNotFound, std::string("the module has no variable named ") + name));
+  if (dptr) *dptr = reinterpret_cast<void*>(m->globals + g->offset);
+  if (bytes) *bytes = static_cast<size_t>(g->size);
   return record(s, hipSuccess);
 }
 

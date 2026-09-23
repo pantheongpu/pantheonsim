@@ -71,6 +71,44 @@ int main(int argc, char** argv) {
     }
   printf("wrong %d of %d\n", wrong, n);
 
+  /* A module's own variables, through the documented interface: the second
+   * code object declares scale and counters, and a program sets one before
+   * the kernel reads it. */
+  if (argc > 2) {
+    hipModule_t globals;
+    hipFunction_t use_global;
+    CHECK(hipModuleLoad(&globals, argv[2]));
+    CHECK(hipModuleGetFunction(&use_global, globals, "use_global"));
+    void* dscale = NULL;
+    size_t scale_bytes = 0;
+    CHECK(hipModuleGetGlobal(&dscale, &scale_bytes, globals, "scale"));
+    printf("scale is %zu bytes\n", scale_bytes);
+    float two = 2.0f;
+    CHECK(hipMemcpy(dscale, &two, sizeof two, hipMemcpyHostToDevice));
+
+    int* din = NULL;
+    int* dsum = NULL;
+    int ones[64];
+    for (int i = 0; i < 64; ++i) ones[i] = 10;
+    CHECK(hipMalloc((void**)&din, sizeof ones));
+    CHECK(hipMalloc((void**)&dsum, sizeof ones));
+    CHECK(hipMemcpy(din, ones, sizeof ones, hipMemcpyHostToDevice));
+    int sixty_four = 64;
+    void* gargs[] = {&din, &dsum, &sixty_four};
+    CHECK(hipModuleLaunchKernel(use_global, 1, 1, 1, 64, 1, 1, 0, NULL, gargs, NULL));
+    int back[64];
+    CHECK(hipMemcpy(back, dsum, sizeof back, hipMemcpyDeviceToHost));
+    printf("global scale applied %d\n", back[0] == 20 && back[63] == 20);
+    /* What the kernel wrote into the module's own array, read from the host. */
+    int* dcounters = NULL;
+    CHECK(hipModuleGetGlobal((void**)&dcounters, NULL, globals, "counters"));
+    CHECK(hipMemcpy(back, dcounters, sizeof back, hipMemcpyDeviceToHost));
+    printf("kernel wrote its own array %d\n", back[0] == 10 && back[63] == 10);
+    CHECK(hipFree(din));
+    CHECK(hipFree(dsum));
+    CHECK(hipModuleUnload(globals));
+  }
+
   /* A kernel this code object does not have, and a launch with no work-items:
    * both must be refused rather than quietly doing nothing. */
   hipFunction_t missing;

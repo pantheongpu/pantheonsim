@@ -27,6 +27,11 @@ registers, RAS counts, CPER records and amdgpu sysfs files are modelled
   devices and memory, loads a code object and launches the kernels in it
   (`tests/e2e/run_hip.sh` does exactly that, and checks the answers).
 
+A module brings its own variables -- what a `__device__` global compiles to.
+The loader places them on the device and fills in the addresses the code was
+left to have (`R_AMDGPU_REL32_LO` and `_HI`, which a kernel adds to the
+program counter), and `hipModuleGetGlobal` hands a program the address of one.
+
 The interface is `include/vgpu_hip.h`, a clean-room subset of the documented
 HIP API. What is implemented is devices, memory and the module API; the
 kernel-launch syntax `hipcc` compiles (`__hipRegisterFatBinary` and

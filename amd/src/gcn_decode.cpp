@@ -32,6 +32,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop1, 0x00}, {"s_mov_b32", 1, 1}},
       {{Enc::Sop1, 0x01}, {"s_mov_b64", 2, 1, 2}},
       {{Enc::Sop1, 0x11}, {"s_ff1_i32_b64", 1, 1, 2}},
+      // Where the wave is: what a kernel adds a constant to, to reach a global.
+      {{Enc::Sop1, 0x1c}, {"s_getpc_b64", 2, 0}},
       {{Enc::Sop1, 0x20}, {"s_and_saveexec_b64", 2, 1, 2}},
       // SOP2: two scalar sources.
       {{Enc::Sop2, 0x00}, {"s_add_u32", 1, 2}},
@@ -507,11 +509,17 @@ std::string operand_text(const Operand& o) {
     case OperandKind::Inline:
       std::snprintf(b, sizeof b, "%lld", static_cast<long long>(o.value));
       return neg + b;
-    case OperandKind::Literal:
+    case OperandKind::Literal: {
       // A literal is a word of the instruction stream, and the assembler
-      // prints it as one.
-      std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(static_cast<uint32_t>(o.value)));
+      // prints it in hex -- unless its value is one an inline constant could
+      // have carried, which it writes as the number itself. (The compiler
+      // spends a literal on such a value when the word is going to be
+      // rewritten, as the address of a global is.)
+      const int32_t v = static_cast<int32_t>(static_cast<uint32_t>(o.value));
+      if (v >= -16 && v <= 64) std::snprintf(b, sizeof b, "%d", v);
+      else std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(static_cast<uint32_t>(o.value)));
       return neg + b;
+    }
     case OperandKind::None: break;
   }
   return "?";

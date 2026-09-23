@@ -194,7 +194,11 @@ struct Machine {
     const std::string& op = in.name;
     const uint64_t a = in.src.empty() ? 0 : scalar(w, in.src[0]);
     const uint64_t b = in.src.size() > 1 ? scalar(w, in.src[1]) : 0;
-    if (op == "s_mov_b32" || op == "s_mov_b64") {
+    if (op == "s_getpc_b64") {
+      // The address of the instruction after this one, which is what the
+      // hardware gives: the program counter has already moved on.
+      write_scalar(w, in.dst[0], w.pc);
+    } else if (op == "s_mov_b32" || op == "s_mov_b64") {
       write_scalar(w, in.dst[0], a);
     } else if (op == "s_movk_i32") {
       write_scalar(w, in.dst[0], static_cast<uint64_t>(static_cast<int64_t>(in.simm)));

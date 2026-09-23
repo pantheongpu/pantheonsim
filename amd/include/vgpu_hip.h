@@ -98,6 +98,7 @@ hipError_t hipModuleLoad(hipModule_t* module, const char* path);
 hipError_t hipModuleLoadData(hipModule_t* module, const void* image);
 hipError_t hipModuleUnload(hipModule_t module);
 hipError_t hipModuleGetFunction(hipFunction_t* function, hipModule_t module, const char* name);
+hipError_t hipModuleGetGlobal(void** dptr, size_t* bytes, hipModule_t module, const char* name);
 hipError_t hipModuleLaunchKernel(hipFunction_t f, unsigned int gridDimX, unsigned int gridDimY,
                                  unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY,
                                  unsigned int blockDimZ, unsigned int sharedMemBytes, hipStream_t stream,

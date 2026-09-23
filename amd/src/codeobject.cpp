@@ -214,22 +214,51 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     throw Error::make(Err::ProfileParse, origin, ": no .text section");
   }
 
+  // The module's own memory: the initialised variables and the zeroed ones,
+  // laid out one after the other. A loader places this on the device.
+  std::map<uint16_t, uint64_t> data_at;   // section index -> where it starts in the image
+  for (uint16_t i = 0; i < shnum; ++i) {
+    const Section& sec = sections[i];
+    const bool bss = sec.type == 8 /* SHT_NOBITS */;
+    if (sec.name != ".data" && sec.name != ".bss" && !(bss && sec.name.rfind(".bss", 0) == 0)) continue;
+    const uint64_t align = 16;
+    uint64_t at = (out.data.size() + align - 1) & ~(align - 1);
+    out.data.resize(at + sec.size, 0);
+    if (!bss) {
+      r.need(sec.offset, sec.size);
+      std::memcpy(out.data.data() + at, bytes.data() + sec.offset, sec.size);
+    }
+    data_at[i] = at;
+  }
+
   // Every kernel's descriptor, by the symbol that names it ("<kernel>.kd"),
   // and where each kernel's code is, from the function symbol of its name.
   // The descriptor's entry offset is a relocation in an object that has not
   // been linked, so the symbol is what says where the code starts.
   std::map<std::string, Descriptor> descriptors;
   std::map<std::string, std::pair<uint64_t, uint64_t>> code;   // name -> address, size
+  std::map<std::string, uint64_t> symbol_at;                   // a global's offset in the data image
+  std::map<uint32_t, std::string> symbol_name;                 // by index, for the relocations
   for (const auto& s : sections) {
     if (s.type != 2 /* SHT_SYMTAB */ || !s.entsize) continue;
     if (s.link >= sections.size()) continue;
     const uint64_t strtab = sections[s.link].offset;
     for (uint64_t at = s.offset; at + s.entsize <= s.offset + s.size; at += s.entsize) {
       const std::string name = r.cstr(strtab + r.u32(at));
+      symbol_name[static_cast<uint32_t>((at - s.offset) / s.entsize)] = name;
       const uint8_t type = r.u8(at + 4) & 0xF;
       const uint16_t shndx = r.u16(at + 6);
       const uint64_t value = r.u64(at + 8), size = r.u64(at + 16);
       if (type == 2 /* STT_FUNC */ && !name.empty()) code[name] = {value, size};
+      // A variable in the module's memory, and where it lands in the image.
+      if (type == 1 /* STT_OBJECT */ && !name.empty() && data_at.count(shndx)) {
+        GlobalVar g;
+        g.name = name;
+        g.offset = data_at[shndx] + value;
+        g.size = size;
+        out.globals.push_back(std::move(g));
+        symbol_at[name] = g.offset;
+      }
       if (name.size() < 4 || name.compare(name.size() - 3, 3, ".kd") != 0) continue;
       if (shndx >= sections.size() || size < 64) continue;
       const uint64_t kd = sections[shndx].offset + (value - sections[shndx].addr);
@@ -242,6 +271,29 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
       d.rsrc2 = r.u32(kd + 52);
       d.properties = r.u16(kd + 56);
       descriptors[name.substr(0, name.size() - 3)] = d;
+    }
+  }
+
+  // What the code has to be told once the module is placed: where each global
+  // ended up. The compiler leaves room for the address and a relocation
+  // saying which global it meant.
+  for (const Section& sec : sections) {
+    if (sec.type != 4 /* SHT_RELA */ || sec.name != ".rela.text" || !sec.entsize) continue;
+    for (uint64_t at = sec.offset; at + sec.entsize <= sec.offset + sec.size; at += sec.entsize) {
+      const uint64_t where = r.u64(at);
+      const uint64_t info = r.u64(at + 8);
+      const int64_t addend = static_cast<int64_t>(r.u64(at + 16));
+      const uint32_t kind = static_cast<uint32_t>(info), sym = static_cast<uint32_t>(info >> 32);
+      // R_AMDGPU_REL32_LO and _HI: the halves of an address relative to the
+      // instruction that reads it.
+      if (kind != 10 && kind != 11) continue;
+      const auto named = symbol_name.find(sym);
+      if (named == symbol_name.end()) continue;
+      const auto found = symbol_at.find(named->second);
+      if (found == symbol_at.end())
+        throw Error::make(Err::ProfileParse, origin, ": the code refers to ", named->second,
+                          ", which is not a variable this module defines");
+      out.relocations.push_back({where, found->second, addend, kind == 11});
     }
   }
 
@@ -334,6 +386,35 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
 const Kernel* find_kernel(const CodeObject& o, const std::string& name) {
   for (const Kernel& k : o.kernels)
     if (k.name == name) return &k;
+  return nullptr;
+}
+
+}  // namespace vgpu::amd
+
+namespace vgpu::amd {
+
+void place_globals(CodeObject& o, uint64_t base) {
+  if (o.placed && o.data_base != base)
+    throw Error::make(Err::InvalidValue, "this module's globals are already at another address");
+  for (const Relocation& rel : o.relocations) {
+    // The address the code needs, relative to the instruction that reads it,
+    // which is how a kernel reaches a global: the program counter plus a
+    // constant.
+    const uint64_t symbol = base + rel.symbol;
+    const uint64_t place = o.text_addr + rel.at;
+    const uint64_t value = symbol + static_cast<uint64_t>(rel.addend) - place;
+    const uint32_t half = static_cast<uint32_t>(rel.high ? value >> 32 : value);
+    if (rel.at + 4 > o.text.size())
+      throw Error::make(Err::ProfileParse, "a relocation points past the end of the code");
+    for (uint32_t b = 0; b < 4; ++b) o.text[rel.at + b] = static_cast<uint8_t>(half >> (8 * b));
+  }
+  o.placed = true;
+  o.data_base = base;
+}
+
+const GlobalVar* find_global(const CodeObject& o, const std::string& name) {
+  for (const GlobalVar& g : o.globals)
+    if (g.name == name) return &g;
   return nullptr;
 }
 

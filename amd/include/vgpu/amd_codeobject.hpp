@@ -51,6 +51,23 @@ struct Kernel {
   uint32_t user_sgpr_count = 0;
 };
 
+// A variable the kernels share: a __device__ global. It lives in the module's
+// own memory, which a loader places on the device.
+struct GlobalVar {
+  std::string name;
+  uint64_t offset = 0;   // where it is in the module's data image
+  uint64_t size = 0;
+};
+
+// One relocation in the code: where a global's address has to be written once
+// the module has been placed.
+struct Relocation {
+  uint64_t at = 0;       // where in .text
+  uint64_t symbol = 0;   // the symbol's offset in the data image
+  int64_t addend = 0;
+  bool high = false;     // the top half of the address, rather than the bottom
+};
+
 struct CodeObject {
   std::string target;                     // "amdgcn-amd-amdhsa--gfx942", where the note gives it
   std::string isa;                        // "gfx942"
@@ -62,7 +79,22 @@ struct CodeObject {
   std::vector<uint8_t> text;              // the .text section
   uint64_t text_addr = 0;                 // its address, which kernel entries are relative to
   std::vector<Kernel> kernels;
+  // The module's own memory: its initialised variables, then the zeroed ones.
+  // A loader places this on the device and calls place_globals.
+  std::vector<uint8_t> data;
+  std::vector<GlobalVar> globals;
+  std::vector<Relocation> relocations;
+  bool placed = false;
+  uint64_t data_base = 0;   // where the data image was placed, once it was
 };
+
+// Writes the addresses of the module's globals into its code, for a data
+// image placed at `base`. A kernel reaches a global by adding a constant to
+// the program counter, and that constant is what this fills in: before it,
+// the code has zeros there. Throws if called twice with different bases.
+void place_globals(CodeObject& o, uint64_t base);
+// The global of that name, or null.
+const GlobalVar* find_global(const CodeObject& o, const std::string& name);
 
 // Reads a code object. Throws Err::ProfileParse naming what is wrong: not an
 // ELF, not AMDGPU, a note that is not MessagePack, a kernel whose descriptor
