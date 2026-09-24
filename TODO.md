@@ -71,6 +71,24 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   compares which nodes each node depends on, not only how many: a graph rewired
   between two nodes used to pass as the same shape and have its parameters taken.
   e2e_graph_nodes covers all of it.
+- Memory a graph owns: cudaGraphAddMemAllocNode allocates when the graph reaches
+  it and cudaGraphAddMemFreeNode frees it, so scratch space belongs to the graph
+  rather than to the program for the graph's whole life. The address is fixed
+  across instantiations and launches, as CUDA documents, because the address
+  space is reserved when the node is built and only the physical memory behind it
+  comes and goes -- which is what the mapping API (cuMemMap and friends) is for.
+  cudaDeviceGetGraphMemAttribute reports what graphs hold: `used` between an
+  allocation node running and the free that ends it, `reserved` for what the
+  device has actually handed over, which outlives a free because the memory is
+  kept for the next launch. cudaDeviceGraphMemTrim gives that back and the
+  address survives it. The documented restrictions are enforced rather than
+  ignored: such a graph cannot be cloned, cannot be a child of another graph,
+  cannot have nodes or edges removed, has one instantiation at a time, and its
+  allocation is freed once and in one graph. An allocation the graph does not free
+  outlives the launch and the program frees it; with
+  cudaGraphInstantiateFlagAutoFreeOnLaunch each launch frees what the last one
+  left. e2e_graph_memory checks the address really does not move, including across
+  a trim and across a free from outside the graph.
 - Device memory shared between processes (cudaIpcGetMemHandle,
   cudaIpcOpenMemHandle, cudaIpcCloseMemHandle and the event handles): an
   exported allocation moves into a file of its own in the machine directory,

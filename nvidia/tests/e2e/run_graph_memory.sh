@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# The graph node types that are not work on the device: a host function, an
-# event recorded and one waited on, and a node switched off in an instantiated
-# graph without rebuilding it. Skips if nvcc is unavailable.
+# Memory a graph owns: allocation and free nodes, the attributes that report what
+# graphs hold, and a trim that gives memory back without moving the address.
+# Skips if nvcc is unavailable.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
 shim="${VGPU_BUILD_DIR:-$root/build}/shim"
-src="$root/nvidia/tests/e2e/graph_nodes.cu"
-out="${TMPDIR:-/tmp}/vgpu_e2e_graph_nodes_$$"
+src="$root/nvidia/tests/e2e/graph_memory.cu"
+out="${TMPDIR:-/tmp}/vgpu_e2e_graph_memory_$$"
 if ! command -v nvcc >/dev/null 2>&1; then
   echo "SKIP: nvcc not found (e2e needs the CUDA toolkit to compile the app)"; exit 0
 fi
@@ -28,5 +28,5 @@ if ! require_shim_libs "$shim" "$out"; then rm -f "$out"; exit 0; fi
 # exit before printing, and a CI log would show the failure with no reason in it.
 result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/h100 LD_LIBRARY_PATH="$shim" "$out" 2>&1 || true)"
 rm -f "$out"
-echo "host, event and disabled graph nodes: $result"
+echo "memory a graph owns: $result"
 [[ "$result" == "PASS" ]]
