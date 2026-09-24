@@ -308,6 +308,14 @@ struct Machine {
       w.exec = a & saved;
       write_scalar(w, in.dst[0], saved);
       w.scc = w.exec != 0;
+    } else if (op == "s_swappc_b64") {
+      // A call: where to come back to is what the program counter already
+      // holds, since it was moved past this instruction before it ran.
+      const uint64_t to = scalar(w, in.src[0]);
+      write_scalar(w, in.dst[0], w.pc);
+      w.pc = to;
+    } else if (op == "s_setpc_b64") {
+      w.pc = scalar(w, in.src[0]);   // the return
     } else if (op == "s_andn2_saveexec_b64") {
       // The other half of a divergence: keep EXEC, and take the lanes the
       // condition did not.

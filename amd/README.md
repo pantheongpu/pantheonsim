@@ -62,7 +62,8 @@ double precision (add, multiply, fma,
 min, max and the sequence a division compiles to), half precision, one value at a time and packed two to a register,
 conversions, the transcendentals, bit counting, comparisons in both their
 forms and the class test, `v_cndmask`, the lane-counting ops, scalar and EXEC
-branches, and the memory a kernel uses: global loads and stores and their
+branches, a call to a function the compiler did not inline and the return
+from it, and the memory a kernel uses: global loads and stores and their
 atomics (an add, a subtract, the logical ones, an exchange and a
 compare-and-swap, on a 32-bit value, on a float and on a pair, each able to
 give back what it replaced), LDS and its atomics, a work-item's private memory (what a kernel

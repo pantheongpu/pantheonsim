@@ -63,9 +63,13 @@ struct GlobalVar {
 // the module has been placed.
 struct Relocation {
   uint64_t at = 0;       // where in .text
-  uint64_t symbol = 0;   // the symbol's offset in the data image
+  uint64_t symbol = 0;   // the symbol's offset in the data image, or in .text
   int64_t addend = 0;
   bool high = false;     // the top half of the address, rather than the bottom
+  // A call reaches a function the same way a kernel reaches a global, but
+  // both ends are in .text, so the distance between them is known as soon as
+  // the module is read and the loader fills it in then.
+  bool in_text = false;
 };
 
 struct CodeObject {
