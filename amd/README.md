@@ -60,7 +60,9 @@ the low half of a register with the high half zeroed, which is why the
 compiler leaves out the mask a widening would otherwise need), single and
 double precision (add, multiply, fma,
 min, max and the sequence a division compiles to), half precision, one value at a time and packed two to a register,
-conversions, the transcendentals, bit counting, comparisons in both their
+conversions, the transcendentals, the rounding functions, the sine and the cosine (whose
+argument is a turn rather than a radian, which is why the compiler multiplies
+by one over two pi first), bit counting, comparisons in both their
 forms and the class test, `v_cndmask`, the lane-counting ops, scalar and EXEC
 branches, a call to a function the compiler did not inline and the return
 from it, and the memory a kernel uses: global loads and stores and their
@@ -82,9 +84,11 @@ Three things are modelled rather than copied, and are marked where they are
 written: the reciprocal, square root, exponent and logarithm are the host's
 exact results where the hardware's are tables good to about one unit in the
 last place; the scope bits on a memory instruction change nothing, since every
-access here is already visible to every wave; and LDS sits at an address of
+access here is already visible to every wave; LDS sits at an address of
 this model's choosing, which a kernel reads from `src_shared_base` the way it
-reads the hardware's.
+reads the hardware's; and the counter a wave reads to time itself counts the
+instructions the dispatch has retired, which is this model's cycle, where a
+card's counts at a fixed rate.
 
 | Folder | What |
 | --- | --- |

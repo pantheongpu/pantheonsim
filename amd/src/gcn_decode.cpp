@@ -79,6 +79,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Smem, 0x01}, {"s_load_dwordx2", 2, 1, 2}},
       {{Enc::Smem, 0x02}, {"s_load_dwordx4", 4, 1, 2}},
       {{Enc::Smem, 0x03}, {"s_load_dwordx8", 8, 1, 2}},
+      // A counter the wave reads: no address, and nothing but the pair it
+      // writes.
+      {{Enc::Smem, 0x24}, {"s_memtime", 2, 0}},
+      {{Enc::Smem, 0x25}, {"s_memrealtime", 2, 0}},
       // VOP1 and VOP2, the vector ALU's short forms.
       {{Enc::Vop1, 0x01}, {"v_mov_b32_e32", 1, 1}},
       {{Enc::Vop2, 0x00}, {"v_cndmask_b32_e32", 1, 2}},
@@ -103,14 +107,22 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x00b}, {"v_cvt_f32_f16_e32", 1, 1}},
       {{Enc::Vop1, 0x00f}, {"v_cvt_f32_f64_e32", 1, 1, 2}},
       {{Enc::Vop1, 0x01c}, {"v_trunc_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x01d}, {"v_ceil_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x01e}, {"v_rndne_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x01f}, {"v_floor_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x020}, {"v_exp_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x021}, {"v_log_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x022}, {"v_rcp_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x023}, {"v_rcp_iflag_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x025}, {"v_rcp_f64_e32", 2, 1, 2}},
       {{Enc::Vop1, 0x027}, {"v_sqrt_f32_e32", 1, 1}},
+      // The sine and the cosine of a turn: the argument is in turns, not
+      // radians, which is why the compiler multiplies by 1/2pi first.
+      {{Enc::Vop1, 0x029}, {"v_sin_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x02a}, {"v_cos_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x02c}, {"v_bfrev_b32_e32", 1, 1}},
       {{Enc::Vop1, 0x02d}, {"v_ffbh_u32_e32", 1, 1}},
+      {{Enc::Vop1, 0x038}, {"v_mov_b64_e32", 2, 1, 2}},
       {{Enc::Vop2, 0x006}, {"v_mul_i32_i24_e32", 1, 2}},
       {{Enc::Vop2, 0x008}, {"v_mul_u32_u24_e32", 1, 2}},
       {{Enc::Vop2, 0x00a}, {"v_min_f32_e32", 1, 2}},
@@ -180,7 +192,12 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x11e}, {"v_subbrev_co_u32_e64", 1, 3, 1, 1, 2, true}},
       {{Enc::Vop3, 0x10b}, {"v_max_f32_e64", 1, 2}},
       {{Enc::Vop3, 0x100}, {"v_cndmask_b32_e64", 1, 3, 1, 1, 2}},
+      {{Enc::Vop3, 0x102}, {"v_sub_f32_e64", 1, 2}},
       {{Enc::Vop3, 0x1c8}, {"v_bfe_u32", 1, 3}},
+      {{Enc::Vop3, 0x1d0}, {"v_min3_f32", 1, 3}},
+      {{Enc::Vop3, 0x1d1}, {"v_min3_i32", 1, 3}},
+      {{Enc::Vop3, 0x1d3}, {"v_max3_f32", 1, 3}},
+      {{Enc::Vop3, 0x1d4}, {"v_max3_i32", 1, 3}},
       {{Enc::Vop3, 0x1c9}, {"v_bfe_i32", 1, 3}},
       {{Enc::Vop3, 0x1cb}, {"v_fma_f32", 1, 3}},
       {{Enc::Vop3, 0x1cc}, {"v_fma_f64", 2, 3, 2, 2, 2}},
@@ -193,6 +210,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x1e8}, {"v_mad_u64_u32", 2, 3, 1, 1, 2, true}},
       {{Enc::Vop3, 0x1eb}, {"v_mad_legacy_u16", 1, 3}},
       {{Enc::Vop3, 0x1fd}, {"v_lshl_add_u32", 1, 3}},
+      {{Enc::Vop3, 0x1ed}, {"v_perm_b32", 1, 3}},
       {{Enc::Vop3, 0x1f3}, {"v_xad_u32", 1, 3}},
       {{Enc::Vop3, 0x1ff}, {"v_add3_u32", 1, 3}},
       {{Enc::Vop3, 0x200}, {"v_lshl_or_b32", 1, 3}},
@@ -204,6 +222,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x285}, {"v_mul_lo_u32", 1, 2}},
       {{Enc::Vop3, 0x286}, {"v_mul_hi_u32", 1, 2}},
       {{Enc::Vop3, 0x287}, {"v_mul_hi_i32", 1, 2}},
+      {{Enc::Vop3, 0x288}, {"v_ldexp_f32", 1, 2}},
       {{Enc::Vop3, 0x289}, {"v_readlane_b32", 1, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x28a}, {"v_writelane_b32", 1, 2}},
       {{Enc::Vop3, 0x28b}, {"v_bcnt_u32_b32", 1, 2}},
@@ -234,6 +253,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Flat, 0x13}, {"load_sshort", 1, 1}},
       {{Enc::Flat, 0x14}, {"load_dword", 1, 1}},
       {{Enc::Flat, 0x15}, {"load_dwordx2", 2, 1}},
+      {{Enc::Flat, 0x17}, {"load_dwordx4", 4, 1}},
       {{Enc::Flat, 0x18}, {"store_byte", 0, 2}},
       {{Enc::Flat, 0x1a}, {"store_short", 0, 2}},
       {{Enc::Flat, 0x1c}, {"store_dword", 0, 2}},
@@ -270,8 +290,10 @@ Operand operand(uint32_t code, uint32_t width) {
     o.kind = OperandKind::Sgpr;
     o.index = code;
   } else if (code == 106) {
+    // A 32-bit instruction that reads VCC reads its low half, and the
+    // assembler says so.
     o.kind = OperandKind::Vcc;
-    o.width = 2;
+    o.width = width >= 2 ? 2 : 1;
   } else if (code == 124) {
     o.kind = OperandKind::M0;
   } else if (code == 126) {
@@ -283,9 +305,11 @@ Operand operand(uint32_t code, uint32_t width) {
     // Where LDS sits in the one address space a flat access uses.
     o.kind = OperandKind::SharedBase;
     o.width = 2;
-  } else if (code >= 240 && code <= 247) {
-    // The inline float constants, in the ISA's order.
-    static const double kFloats[] = {0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0};
+  } else if (code >= 240 && code <= 248) {
+    // The inline float constants, in the ISA's order, ending with the one the
+    // sine and the cosine need: a turn is 2pi radians, so a kernel that asked
+    // for radians multiplies by this first.
+    static const double kFloats[] = {0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 0.15915494309189532};
     o.kind = OperandKind::InlineFloat;
     o.fvalue = kFloats[code - 240];
   } else if (code >= 128 && code <= 192) {
@@ -410,8 +434,10 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.size = 8;
     const uint32_t w1 = word(code, at + 4);
     in.dst.push_back(sgpr((w0 >> 6) & 0x7F, s.dst_width));
-    in.src.push_back(sgpr(((w0 & 0x3F) << 1), s.src_width(0)));   // sbase counts register pairs
-    in.offset = static_cast<int32_t>(w1 & 0x1FFFFF);
+    if (s.srcs > 0) {
+      in.src.push_back(sgpr(((w0 & 0x3F) << 1), s.src_width(0)));   // sbase counts register pairs
+      in.offset = static_cast<int32_t>(w1 & 0x1FFFFF);
+    }
   } else if ((w0 >> 25) == 0x3f) {    // VOP1
     in.enc = Enc::Vop1;
     in.opcode = (w0 >> 9) & 0xFF;
@@ -638,14 +664,16 @@ std::string operand_text(const Operand& o) {
   switch (o.kind) {
     case OperandKind::Sgpr: return wrap(range("s"));
     case OperandKind::Vgpr: return wrap(o.sext ? "sext(" + range("v") + ")" : range("v"));
-    case OperandKind::Vcc: return wrap("vcc");
+    case OperandKind::Vcc: return wrap(o.width >= 2 ? "vcc" : "vcc_lo");
     case OperandKind::Exec: return wrap("exec");
     case OperandKind::ExecLo: return wrap("exec_lo");
     case OperandKind::ExecHi: return wrap("exec_hi");
     case OperandKind::M0: return wrap("m0");
     case OperandKind::SharedBase: return wrap("src_shared_base");
     case OperandKind::InlineFloat:
-      // As the assembler writes them: 1.0, -0.5, and so on.
+      // As the assembler writes them: 1.0, -0.5, and, for one over two pi,
+      // the digits of the float it stands for.
+      if (o.fvalue > 0.159 && o.fvalue < 0.16) return neg + "0.15915494";
       std::snprintf(b, sizeof b, "%.1f", o.fvalue);
       return neg + b;
     case OperandKind::Inline:
@@ -691,8 +719,10 @@ std::string to_text(const Inst& i) {
       s += " src" + std::to_string(k) + "_sel:" + kParts[i.src[k].sel & 7];
   }
   if (i.enc == Enc::Smem) {
-    std::snprintf(b, sizeof b, ", 0x%x", i.offset);
-    s += b;
+    if (!i.src.empty()) {
+      std::snprintf(b, sizeof b, ", 0x%x", i.offset);
+      s += b;
+    }
   } else if (i.enc == Enc::Ds) {
     const bool two = i.name.find("read2") != std::string::npos || i.name.find("write2") != std::string::npos;
     if (i.offset) {

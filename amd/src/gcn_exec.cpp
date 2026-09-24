@@ -119,7 +119,7 @@ struct Machine {
   uint64_t scalar(const Wave& w, const Operand& o) const {
     switch (o.kind) {
       case OperandKind::Sgpr: return o.width >= 2 ? sgpr64(w, o.index) : sgpr(w, o.index);
-      case OperandKind::Vcc: return w.vcc;
+      case OperandKind::Vcc: return o.width >= 2 ? w.vcc : static_cast<uint32_t>(w.vcc);
       case OperandKind::Exec: return w.exec;
       case OperandKind::ExecLo: return static_cast<uint32_t>(w.exec);
       case OperandKind::ExecHi: return static_cast<uint32_t>(w.exec >> 32);
@@ -339,6 +339,15 @@ struct Machine {
   }
 
   void scalar_load(Wave& w, const Inst& in) {
+    // A counter, rather than a load. What a card returns is a clock at a
+    // fixed rate; what this returns is the instructions the dispatch has
+    // retired, which is this model's cycle count. It only ever goes up, which
+    // is what a program timing a stretch of its own code depends on.
+    if (in.name == "s_memtime" || in.name == "s_memrealtime") {
+      set_sgpr(w, in.dst[0].index, static_cast<uint32_t>(stats.instructions));
+      set_sgpr(w, in.dst[0].index + 1, static_cast<uint32_t>(stats.instructions >> 32));
+      return;
+    }
     const uint64_t base = scalar(w, in.src[0]) + static_cast<uint64_t>(in.offset);
     const uint32_t words = in.dst[0].width;
     for (uint32_t i = 0; i < words; ++i)
@@ -554,6 +563,55 @@ struct Machine {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane) +
                                          lane_src(w, in.src[2], lane)));
+      } else if (op == "v_mov_b64_e32") {
+        write_lane64(w, in.dst[0], lane, lane_src64(w, in.src[0], lane));
+      } else if (op == "v_floor_f32_e32") {
+        write_float(w, in, lane, std::floor(lane_float(w, in.src[0], lane)));
+      } else if (op == "v_ceil_f32_e32") {
+        write_float(w, in, lane, std::ceil(lane_float(w, in.src[0], lane)));
+      } else if (op == "v_rndne_f32_e32") {
+        // To the nearest, and to the even one where it falls in the middle.
+        write_float(w, in, lane, std::nearbyint(lane_float(w, in.src[0], lane)));
+      } else if (op == "v_sin_f32_e32" || op == "v_cos_f32_e32") {
+        // The argument is in turns: a whole turn is 1.0, not 2pi.
+        const double turns = static_cast<double>(lane_float(w, in.src[0], lane));
+        const double radians = turns * 6.283185307179586476925286766559;
+        write_float(w, in, lane,
+                    static_cast<float>(op == "v_sin_f32_e32" ? std::sin(radians) : std::cos(radians)));
+      } else if (op == "v_ldexp_f32") {
+        write_float(w, in, lane,
+                    std::ldexp(lane_float(w, in.src[0], lane),
+                               static_cast<int32_t>(lane_src(w, in.src[1], lane))));
+      } else if (op == "v_min3_f32" || op == "v_max3_f32") {
+        const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane),
+                    z = lane_float(w, in.src[2], lane);
+        write_float(w, in, lane, op == "v_min3_f32" ? std::fmin(std::fmin(x, y), z)
+                                                    : std::fmax(std::fmax(x, y), z));
+      } else if (op == "v_min3_i32" || op == "v_max3_i32") {
+        const int32_t x = static_cast<int32_t>(lane_src(w, in.src[0], lane)),
+                      y = static_cast<int32_t>(lane_src(w, in.src[1], lane)),
+                      z = static_cast<int32_t>(lane_src(w, in.src[2], lane));
+        write_lane(w, in.dst[0], lane,
+                   static_cast<uint32_t>(op == "v_min3_i32" ? std::min(std::min(x, y), z)
+                                                            : std::max(std::max(x, y), z)));
+      } else if (op == "v_perm_b32") {
+        // Four bytes chosen out of the eight the two sources make, the first
+        // source holding the top four. A selector that asks for a sign or a
+        // constant instead is refused: the compiler emits these to move bytes
+        // about, and nothing here has been seen to ask for the rest.
+        const uint64_t bytes = static_cast<uint64_t>(lane_src(w, in.src[0], lane)) << 32 |
+                               lane_src(w, in.src[1], lane);
+        const uint32_t sel = lane_src(w, in.src[2], lane);
+        uint32_t out = 0;
+        for (uint32_t k = 0; k < 4; ++k) {
+          const uint32_t which = (sel >> (8 * k)) & 0xFF;
+          if (which > 7)
+            throw Error::make(Err::Unsupported, "v_perm_b32 asked for byte ", which,
+                              ", which is a sign or a constant rather than one of the eight, and this does not "
+                              "model those");
+          out |= static_cast<uint32_t>((bytes >> (8 * which)) & 0xFF) << (8 * k);
+        }
+        write_lane(w, in.dst[0], lane, out);
       } else if (op == "v_or3_b32") {
         write_lane(w, in.dst[0], lane,
                    lane_src(w, in.src[0], lane) | lane_src(w, in.src[1], lane) | lane_src(w, in.src[2], lane));
@@ -639,7 +697,7 @@ struct Machine {
         // One lane's bit of the condition register picks a source.
         const uint64_t cond = scalar(w, in.src[2]);
         write_lane(w, in.dst[0], lane, lane_src(w, (cond >> lane) & 1 ? in.src[1] : in.src[0], lane));
-      } else if (op == "v_sub_f32_e32") {
+      } else if (op == "v_sub_f32_e32" || op == "v_sub_f32_e64") {
         write_float(w, in, lane, lane_float(w, in.src[0], lane) - lane_float(w, in.src[1], lane));
       } else if (op == "v_min_f32_e32") {
         write_float(w, in, lane, std::fmin(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
@@ -980,14 +1038,13 @@ struct Machine {
       if (narrow(op, &n)) {
         if (op.rfind("global_store", 0) == 0) mem.store_scalar(addr, n.bytes, lane_src(w, in.src[1], lane));
         else write_lane(w, in.dst[0], lane, widen(mem.load_scalar(addr, n.bytes), n));
-      } else if (op == "global_load_dword") {
-        write_lane(w, in.dst[0], lane, static_cast<uint32_t>(mem.load_scalar(addr, 4)));
-      } else if (op == "global_load_dwordx2") {
-        write_lane64(w, in.dst[0], lane, mem.load_scalar(addr, 8));
-      } else if (op == "global_store_dword") {
-        mem.store_scalar(addr, 4, lane_src(w, in.src[1], lane));
-      } else if (op == "global_store_dwordx2") {
-        mem.store_scalar(addr, 8, lane_src64(w, in.src[1], lane));
+      } else if (op.rfind("global_load_dword", 0) == 0) {
+        // One word, or two, or four: a register each, in order.
+        for (uint32_t k = 0; k < in.dst[0].width; ++k)
+          w.vgpr[in.dst[0].index + k][lane] = static_cast<uint32_t>(mem.load_scalar(addr + 4 * k, 4));
+      } else if (op.rfind("global_store_dword", 0) == 0) {
+        for (uint32_t k = 0; k < in.src[1].width; ++k)
+          mem.store_scalar(addr + 4 * k, 4, w.vgpr[in.src[1].index + k][lane]);
       } else if (op == "global_atomic_add_x2") {
         // The one that works on a pair; every other atomic here is 32-bit.
         const uint64_t before = mem.load_scalar(addr, 8);
