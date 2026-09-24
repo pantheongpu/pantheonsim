@@ -970,6 +970,16 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# A cooperative launch through cudaLaunchKernelEx, and a library splicing nodes
+# into a stream capture through the capture queries.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_capture_splice COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_capture_splice.sh)
+  set_tests_properties(e2e_capture_splice PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # stmatrix: where the warp's registers land in shared memory, and that it is the
 # inverse of ldmatrix. Needs a toolkit that assembles sm_90; skips otherwise.
 if(TARGET vgpucudart)

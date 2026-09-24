@@ -71,6 +71,20 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   compares which nodes each node depends on, not only how many: a graph rewired
   between two nodes used to pass as the same shape and have its parameters taken.
   e2e_graph_nodes covers all of it.
+- Splicing into a stream capture, which is what a library does when the stream
+  it was handed turns out to be capturing: cudaStreamGetCaptureInfo reports the
+  capture's own graph, the nodes the next operation will depend on, and an id
+  unique to the capture sequence, and cudaStreamUpdateCaptureDependencies sets or
+  extends that dependency set. A library adds its own nodes to the graph and says
+  the capture continues from them, so one stream can capture a fork and a join.
+  The query used to report an active capture with no graph and no dependencies,
+  and under CUDA 13 -- which gave both calls an edge-data argument -- the plain
+  cudaStreamGetCaptureInfo was not exported at all. The graph handed out during
+  the capture is the one cudaStreamEndCapture returns, and the capture owns it:
+  cudaGraphDestroy refuses it until then. cudaLaunchKernelEx honours
+  cudaLaunchAttributeCooperative, which it used to drop, so a kernel calling
+  grid.sync() through the extended launch form gets its grid barrier instead of
+  trapping. e2e_capture_splice covers both.
 - Memory a graph owns: cudaGraphAddMemAllocNode allocates when the graph reaches
   it and cudaGraphAddMemFreeNode frees it, so scratch space belongs to the graph
   rather than to the program for the graph's whole life. The address is fixed
