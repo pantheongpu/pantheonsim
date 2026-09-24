@@ -47,6 +47,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop2, 0x02}, {"s_add_i32", 1, 2}},
       {{Enc::Sop2, 0x03}, {"s_sub_i32", 1, 2}},
       {{Enc::Sop2, 0x04}, {"s_addc_u32", 1, 2}},
+      {{Enc::Sop2, 0x0a}, {"s_cselect_b32", 1, 2}},
       {{Enc::Sop2, 0x0b}, {"s_cselect_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x0c}, {"s_and_b32", 1, 2}},
       {{Enc::Sop2, 0x0d}, {"s_and_b64", 2, 2, 2, 2}},
@@ -56,8 +57,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop2, 0x11}, {"s_xor_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x13}, {"s_andn2_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x1d}, {"s_lshl_b64", 2, 2, 2, 1}},
+      {{Enc::Sop2, 0x1e}, {"s_lshr_b32", 1, 2}},
       {{Enc::Sop2, 0x20}, {"s_ashr_i32", 1, 2}},
       {{Enc::Sop2, 0x24}, {"s_mul_i32", 1, 2}},
+      {{Enc::Sop2, 0x2c}, {"s_mul_hi_u32", 1, 2}},
       // SOPK: a 16-bit immediate.
       {{Enc::Sopk, 0x00}, {"s_movk_i32", 1, 0}},
       {{Enc::Sopk, 0x0f}, {"s_mulk_i32", 1, 0}},
@@ -74,6 +77,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // SOPC: a scalar comparison, which sets SCC.
       {{Enc::Sopc, 0x04}, {"s_cmp_lt_i32", 0, 2}},
       {{Enc::Sopc, 0x06}, {"s_cmp_eq_u32", 0, 2}},
+      {{Enc::Sopc, 0x09}, {"s_cmp_ge_u32", 0, 2}},
+      {{Enc::Sopc, 0x0a}, {"s_cmp_lt_u32", 0, 2}},
       {{Enc::Sopc, 0x13}, {"s_cmp_lg_u64", 0, 2, 2, 2}},
       // SMEM: a scalar load through a 64-bit base address.
       {{Enc::Smem, 0x00}, {"s_load_dword", 1, 1, 2}},
@@ -147,6 +152,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // zeroed: the compiler drops the mask a widening would otherwise need
       // after one of these, which it could not do if the half were kept.
       {{Enc::Vop2, 0x026}, {"v_add_u16_e32", 1, 2}},
+      {{Enc::Vop2, 0x027}, {"v_sub_u16_e32", 1, 2}},
       {{Enc::Vop2, 0x029}, {"v_mul_lo_u16_e32", 1, 2}},
       {{Enc::Vop2, 0x02a}, {"v_lshlrev_b16_e32", 1, 2}},
       // Half precision one value at a time, where the packed form does two.
@@ -205,6 +211,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // The long forms of the carry arithmetic, which name the pair they
       // write the carry to rather than always using VCC.
       {{Enc::Vop3, 0x11a}, {"v_sub_co_u32_e64", 1, 2, 1, 1, 1, true}},
+      // The long forms of the 16-bit arithmetic, which name a source the
+      // short form could not reach.
+      {{Enc::Vop3, 0x126}, {"v_add_u16_e64", 1, 2}},
+      {{Enc::Vop3, 0x12a}, {"v_lshlrev_b16_e64", 1, 2}},
       {{Enc::Vop3, 0x11d}, {"v_subb_co_u32_e64", 1, 3, 1, 1, 2, true}},
       {{Enc::Vop3, 0x11e}, {"v_subbrev_co_u32_e64", 1, 3, 1, 1, 2, true}},
       {{Enc::Vop3, 0x10b}, {"v_max_f32_e64", 1, 2}},
@@ -405,6 +415,37 @@ const char* enc_name(Enc e) {
   return "unknown";
 }
 
+// The second word of a sub-dword instruction: which part of each source it
+// reads, with or without the sign, and which part of the destination it
+// writes. A source is a vector register unless its own bit says the field
+// names one of the scalars instead.
+void read_sdwa(Inst& in, const Shape& s, uint32_t w0, uint32_t w1, uint32_t srcs) {
+  in.sdwa = true;
+  if (const size_t at_e32 = in.name.rfind("_e32"); at_e32 != std::string::npos) in.name.resize(at_e32);
+  in.name += "_sdwa";
+  in.size = 8;
+  in.dst_sel = (w1 >> 8) & 0x7;
+  in.dst_unused = (w1 >> 11) & 0x3;
+  in.clamp = ((w1 >> 13) & 1) != 0;
+  if (const uint32_t omod = (w1 >> 14) & 0x3; omod)
+    throw Error::make(Err::Unsupported, in.name, " uses an output multiplier (omod ", omod,
+                      "), which this does not model");
+  in.dst.push_back(vgpr((w0 >> 17) & 0xFF, s.dst_width));
+  // Each source has its own group of bits: the part of the register, the
+  // sign, the two modifiers, and whether it is a scalar register at all.
+  for (uint32_t k = 0; k < srcs; ++k) {
+    const uint32_t bits = k == 0 ? (w1 >> 16) & 0xFF : (w1 >> 24) & 0xFF;
+    const uint32_t field = k == 0 ? w1 & 0xFF : (w0 >> 9) & 0xFF;
+    const bool scalar = (bits >> 7) & 1;
+    Operand o = scalar ? operand(field, s.src_width(k)) : vgpr(field, s.src_width(k));
+    o.sel = bits & 0x7;
+    o.sext = (bits >> 3) & 1;
+    o.neg = (bits >> 4) & 1;
+    o.abs = (bits >> 5) & 1;
+    in.src.push_back(o);
+  }
+}
+
 // The second word of a DPP instruction: which lane each lane reads its first
 // source from, which lanes are written, and what happens where the lane to
 // read is not there. The first source's register is in this word too, since
@@ -530,6 +571,9 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       in.size = 8;
       in.name = in.name.substr(0, in.name.size() - 4) + "_dpp";
       in.src.push_back(read_dpp(in, word(code, at + 4)));
+    } else if ((w0 & 0x1FF) == 249) {   // the sub-dword form, which has one source here
+      in.dst.clear();
+      read_sdwa(in, s, w0, word(code, at + 4), 1);
     } else {
       in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
     }
@@ -676,39 +720,8 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       o.width = 2;
       return o;
     };
-    // The sub-dword form: the first source field says 249 instead of naming a
-    // register, and a second word says which part of each register the
-    // instruction reads and which part of the destination it writes.
-    if ((w0 & 0x1FF) == 249) {
-      in.sdwa = true;
-      in.name = std::string(s.name);
-      if (const size_t at_e32 = in.name.rfind("_e32"); at_e32 != std::string::npos) in.name.resize(at_e32);
-      in.name += "_sdwa";
-      in.size = 8;
-      const uint32_t w1 = word(code, at + 4);
-      in.dst_sel = (w1 >> 8) & 0x7;
-      in.dst_unused = (w1 >> 11) & 0x3;
-      in.clamp = ((w1 >> 13) & 1) != 0;
-      if (const uint32_t omod = (w1 >> 14) & 0x3; omod)
-        throw Error::make(Err::Unsupported, in.name, " uses an output multiplier (omod ", omod,
-                          "), which this does not model");
-      if (((w1 >> 22) & 1) || ((w1 >> 30) & 1))
-        throw Error::make(Err::Unsupported, in.name,
-                          " reads a scalar register through the sub-dword form, which this has never seen the "
-                          "compiler emit and so does not decode");
-      in.dst.push_back(vgpr((w0 >> 17) & 0xFF, s.dst_width));
-      Operand src0 = vgpr(w1 & 0xFF, s.src_width(0));
-      src0.sel = (w1 >> 16) & 0x7;
-      src0.sext = ((w1 >> 19) & 1) != 0;
-      src0.neg = ((w1 >> 20) & 1) != 0;
-      src0.abs = ((w1 >> 21) & 1) != 0;
-      Operand src1 = vgpr((w0 >> 9) & 0xFF, s.src_width(1));
-      src1.sel = (w1 >> 24) & 0x7;
-      src1.sext = ((w1 >> 27) & 1) != 0;
-      src1.neg = ((w1 >> 28) & 1) != 0;
-      src1.abs = ((w1 >> 29) & 1) != 0;
-      in.src.push_back(src0);
-      in.src.push_back(src1);
+    if ((w0 & 0x1FF) == 249) {   // the sub-dword form
+      read_sdwa(in, s, w0, word(code, at + 4), 2);
       return in;
     }
     const bool carry_out = in.name == "v_add_co_u32_e32" || in.name == "v_sub_co_u32_e32" ||

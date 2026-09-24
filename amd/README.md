@@ -86,9 +86,13 @@ are written. The forms that reach across the whole wave are decoded and
 refused, since nothing available here settles which way they carry.
 
 The source modifiers are applied -- an absolute value, a negation, a clamp of
-the result -- and so is the sub-dword form, where a 32-bit instruction reads
-a named byte or half of each source, with its sign or without, which is how
-the compiler mixes widths.
+the result -- and so is the sub-dword form, where an instruction reads a
+named byte or half of each source, with its sign or without, and writes its
+result into a named part of the destination with the rest zeroed. That form
+is how the compiler mixes widths and how it packs two values into one
+register; a source of it may be a scalar register rather than a vector one.
+Filling the rest of a destination with the sign instead of zeroes, or leaving
+it as it was, is refused: nothing here has been seen to ask for either.
 
 Any other instruction is refused by name, and so is anything this does not
 model: an output multiplier, a packed operation that shuffles halves. A wrong
