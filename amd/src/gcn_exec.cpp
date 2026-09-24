@@ -1355,11 +1355,14 @@ struct Machine {
 
   // A flat address says for itself which memory it means: the shared
   // aperture is LDS, and everything else is the device's.
-  void flat_access(Wave& w, const Inst& in, Group& g) {
+  // Returns whether any lane's address was in LDS.
+  bool flat_access(Wave& w, const Inst& in, Group& g) {
+    bool reached_lds = false;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       const uint64_t addr = lane_src64(w, in.src[0], lane) + static_cast<uint64_t>(in.offset);
       const bool shared = addr >= kSharedBase && addr < kSharedBase + kSharedSize;
+      reached_lds = reached_lds || shared;
       const uint64_t where = shared ? addr - kSharedBase : addr;
       if (shared && where + 4 > g.lds.size())
         throw Error::make(Err::InvalidValue, "a flat access reaches LDS at ", where, ", past the ", g.lds.size(),
@@ -1392,6 +1395,7 @@ struct Machine {
         throw Error::make(Err::Unsupported, "flat instruction ", in.name, " is decoded but not implemented");
       }
     }
+    return reached_lds;
   }
 
   // A work-item's private memory, which a kernel spills into.
@@ -1631,41 +1635,56 @@ struct Machine {
     const Inst in = gcn::decode(o.text, w.pc - o.text_addr, w.pc);
     w.pc += in.size;
     ++stats.instructions;
+    InstructionCounts& n = stats.counts;
     switch (in.enc) {
       case gcn::Enc::Sop1:
       case gcn::Enc::Sop2:
       case gcn::Enc::Sopk:
+        ++n.salu;
         scalar_alu(w, in);
         return true;
       case gcn::Enc::Sopc:
+        ++n.salu;
         scalar_compare(w, in);
         return true;
       case gcn::Enc::Smem:
+        ++n.smem;
         scalar_load(w, in);
         return true;
       case gcn::Enc::Vop1:
       case gcn::Enc::Vop2:
       case gcn::Enc::Vop3:
       case gcn::Enc::Vop3p:
+        ++n.valu;
         // A comparison in its long form is still a comparison: it writes a
         // mask of the lanes that passed, not a value per lane.
-        if (in.name.rfind("v_mfma", 0) == 0) matrix_multiply(w, in);
-        else if (in.name.rfind("v_cmp_", 0) == 0) compare(w, in);
+        if (in.name.rfind("v_mfma", 0) == 0) {
+          ++n.mfma;
+          matrix_multiply(w, in);
+        } else if (in.name.rfind("v_cmp_", 0) == 0) compare(w, in);
         else if (in.dpp) cross_lane_alu(w, in);
         else vector_alu(w, in);
         return true;
       case gcn::Enc::Vopc:
+        ++n.valu;
         compare(w, in);
         return true;
       case gcn::Enc::Ds:
+        ++n.lds;
         lds_access(w, in, g);
         return true;
       case gcn::Enc::Flat:
+        ++n.vmem;
+        ++n.flat;
+        if (in.name.find("_atomic") != std::string::npos) ++n.flat_atomic;
+        else if (in.name.find("_store") != std::string::npos) ++n.flat_write;
+        else ++n.flat_read;
         if (in.segment == Inst::Segment::Scratch) scratch_access(w, in, g);
-        else if (in.segment == Inst::Segment::Flat) flat_access(w, in, g);
+        else if (in.segment == Inst::Segment::Flat) n.lds += flat_access(w, in, g);
         else global_access(w, in);
         return true;
       case gcn::Enc::Mubuf:
+        ++n.vmem;
         // A write-back or an invalidate of the caches, which a fence compiles
         // to. Every access here reaches memory directly, so there is nothing
         // to write back and nothing stale to drop.
@@ -1676,6 +1695,8 @@ struct Machine {
         throw Error::make(Err::Unsupported, gcn::enc_name(in.enc), " is decoded but not implemented");
     }
     // The program-flow instructions.
+    if (in.name == "s_branch" || in.name.rfind("s_cbranch_", 0) == 0) ++n.branch;
+    if (in.name == "s_sendmsg") ++n.sendmsg;
     if (in.name == "s_endpgm") {
       w.done = true;
       return false;
@@ -1874,6 +1895,12 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
             }
           }
           ++m.stats.waves;
+          const uint64_t lanes = left >= kLanes ? kLanes : left;
+          if (lanes == kLanes) ++m.stats.waves_eq64;
+          else ++m.stats.waves_lt64;
+          m.stats.waves_lt48 += lanes < 48;
+          m.stats.waves_lt32 += lanes < 32;
+          m.stats.waves_lt16 += lanes < 16;
         }
 
         // The group's waves run until every one has stopped. A wave parked at
