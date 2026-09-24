@@ -60,6 +60,17 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   node's parameters on the instantiated graph without rebuilding, updates it
   from the graph, clones it and runs it as a child graph. A 2D fill or a pitched
   copy in a node is refused by name rather than run as something else.
+- The graph node types that are not device work: a host function
+  (cudaGraphAddHostNode) runs on the CPU when the graph reaches it, and event
+  record and wait nodes let a graph be timed and joined to work outside it. A
+  node can be switched off in an instantiated graph (cudaGraphNodeSetEnabled) --
+  kernel, memset and memcpy nodes, as documented -- so a program skips a step
+  this launch instead of rebuilding the graph around it. The whole
+  cudaGraphExec*NodeSetParams family is there now, so any node whose parameters
+  can change without rebuilding can have them changed. cudaGraphExecUpdate
+  compares which nodes each node depends on, not only how many: a graph rewired
+  between two nodes used to pass as the same shape and have its parameters taken.
+  e2e_graph_nodes covers all of it.
 - Device memory shared between processes (cudaIpcGetMemHandle,
   cudaIpcOpenMemHandle, cudaIpcCloseMemHandle and the event handles): an
   exported allocation moves into a file of its own in the machine directory,
