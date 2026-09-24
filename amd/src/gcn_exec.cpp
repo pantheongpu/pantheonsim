@@ -243,7 +243,22 @@ struct Machine {
     if (w.agpr.size() <= index) w.agpr.resize(index + 1);
     return w.agpr[index];
   }
+  // Set while a sub-dword instruction runs, when it writes part of its
+  // destination rather than all of it.
+  const Operand* narrow_dst = nullptr;
+  uint8_t narrow_dst_sel = 6;
+
   void write_lane(Wave& w, const Operand& o, uint32_t lane, uint32_t v) {
+    // Where the instruction named part of the destination, the result's low
+    // bits go there and the rest of the register is zeroed, which is what
+    // padding the unused part means.
+    if (&o == narrow_dst) {
+      const uint8_t sel = narrow_dst_sel;
+      v = sel <= 3   ? (v & 0xFFu) << (8 * sel)
+          : sel == 4 ? v & 0xFFFFu
+          : sel == 5 ? (v & 0xFFFFu) << 16
+                     : v;
+    }
     if (o.kind == OperandKind::Agpr) acc(w, o.index)[lane] = v;
     else w.vgpr[o.index][lane] = v;
   }
@@ -344,6 +359,15 @@ struct Machine {
       w.pc = to;
     } else if (op == "s_setpc_b64") {
       w.pc = scalar(w, in.src[0]);   // the return
+    } else if (op == "s_lshr_b32") {
+      write_scalar(w, in.dst[0], static_cast<uint32_t>(a) >> (b & 31));
+      w.scc = static_cast<uint32_t>(a) >> (b & 31);
+    } else if (op == "s_mul_hi_u32") {
+      write_scalar(w, in.dst[0],
+                   static_cast<uint32_t>((static_cast<uint64_t>(static_cast<uint32_t>(a)) *
+                                          static_cast<uint32_t>(b)) >> 32));
+    } else if (op == "s_cselect_b32") {
+      write_scalar(w, in.dst[0], w.scc ? a : b);
     } else if (op == "s_brev_b32") {
       uint32_t v = static_cast<uint32_t>(a), r = 0;
       for (uint32_t k = 0; k < 32; ++k) r |= ((v >> k) & 1) << (31 - k);
@@ -368,6 +392,8 @@ struct Machine {
     const std::string& op = in.name;
     if (op == "s_cmp_lt_i32") w.scc = static_cast<int32_t>(a) < static_cast<int32_t>(b);
     else if (op == "s_cmp_eq_u32") w.scc = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
+    else if (op == "s_cmp_ge_u32") w.scc = static_cast<uint32_t>(a) >= static_cast<uint32_t>(b);
+    else if (op == "s_cmp_lt_u32") w.scc = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
     else if (op == "s_cmp_lg_u64") w.scc = a != b;
     else throw Error::make(Err::Unsupported, "scalar comparison ", op, " is decoded but not implemented");
   }
@@ -535,6 +561,20 @@ struct Machine {
     dpp_values = nullptr;
   }
 
+  // Holds the destination's part for as long as the instruction runs.
+  struct Narrowed {
+    Machine& m;
+    explicit Narrowed(Machine& machine, const Inst& in) : m(machine) {
+      if (!in.sdwa || in.dst_sel == 6 || in.dst.empty()) return;
+      m.narrow_dst = &in.dst[0];
+      m.narrow_dst_sel = in.dst_sel;
+    }
+    ~Narrowed() {
+      m.narrow_dst = nullptr;
+      m.narrow_dst_sel = 6;
+    }
+  };
+
   void vector_alu(Wave& w, const Inst& in) {
     // The sub-dword form of an instruction does what the short form does,
     // over the part of each register it names, and the cross-lane form does
@@ -543,14 +583,19 @@ struct Machine {
     const std::string as_short =
         in.sdwa   ? in.name.substr(0, in.name.size() - 5) + "_e32"
         : in.dpp  ? in.name.substr(0, in.name.size() - 4) + "_e32"
+        : in.name.size() > 4 && in.name.compare(in.name.size() - 4, 4, "_e64") == 0 &&
+                (in.name.find("_u16") != std::string::npos || in.name.find("_b16") != std::string::npos)
+                  ? in.name.substr(0, in.name.size() - 4) + "_e32"
                   : std::string();
-    const std::string& op = in.sdwa || in.dpp ? as_short : in.name;
-    // A sub-dword instruction that writes only part of its destination is
-    // refused: every one the compiler has been seen to emit writes all of it,
-    // and guessing at the rest would give a wrong answer with nothing to show
-    // for it.
-    if (in.sdwa && (in.dst_sel != 6 || in.dst_unused != 0))
-      throw Error::make(Err::Unsupported, op, " writes only part of its destination, which this does not model");
+    const std::string& op = as_short.empty() ? in.name : as_short;
+    // A sub-dword instruction may write part of its destination and pad the
+    // rest with zeroes. The other two ways of filling the rest -- carrying
+    // the sign into it, or keeping what was there -- are refused: nothing
+    // here has been seen to emit them.
+    if (in.sdwa && in.dst_unused != 0)
+      throw Error::make(Err::Unsupported, op, " fills the rest of its destination with something other than "
+                                              "zeroes, which this does not model");
+    Narrowed narrowed(*this, in);
     if (carry_alu(w, in)) return;
     if (op == "v_writelane_b32") {
       // The one instruction here that names the lane it writes: a scalar
@@ -611,6 +656,9 @@ struct Machine {
         const int64_t p = static_cast<int64_t>(static_cast<int32_t>(lane_src(w, in.src[0], lane))) *
                           static_cast<int32_t>(lane_src(w, in.src[1], lane));
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(static_cast<uint64_t>(p) >> 32));
+      } else if (op == "v_sub_u16_e32") {
+        write_lane(w, in.dst[0], lane,
+                   static_cast<uint16_t>(lane_src(w, in.src[0], lane) - lane_src(w, in.src[1], lane)));
       } else if (op == "v_add_u16_e32") {
         // 16-bit arithmetic writes the low half of the destination and zeroes
         // the high half: the compiler leaves out the mask a widening would
@@ -1128,8 +1176,21 @@ struct Machine {
       if (!(w.exec >> lane & 1)) continue;
       const uint64_t offset =
           (in.has_vaddr ? lane_src(w, in.src[0], lane) : 0) + static_cast<uint64_t>(in.offset);
-      uint8_t* at = scratch_at(g, w, lane, offset, 4 * words);
-      if (op.rfind("scratch_store", 0) == 0) {
+      // A narrow access moves one byte or two; every other one moves whole
+      // registers.
+      Narrow n;
+      const bool part = narrow(op, &n);
+      uint8_t* at = scratch_at(g, w, lane, offset, part ? n.bytes : 4 * words);
+      // A byte or a half first: its name begins the same way a whole
+      // register's does, so asking about the width has to come first.
+      if (part && op.rfind("scratch_store", 0) == 0) {
+        const uint32_t v = lane_src(w, in.src[1], lane);
+        std::memcpy(at, &v, n.bytes);
+      } else if (part) {
+        uint64_t raw = 0;
+        std::memcpy(&raw, at, n.bytes);
+        write_lane(w, in.dst[0], lane, widen(raw, n));
+      } else if (op.rfind("scratch_store", 0) == 0) {
         for (uint32_t k = 0; k < words; ++k) {
           const uint32_t v = w.vgpr[in.src[1].index + k][lane];
           std::memcpy(at + 4 * k, &v, 4);
