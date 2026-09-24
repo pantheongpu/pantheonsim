@@ -50,7 +50,11 @@ program uses the module API.
 
 The instructions implemented are those clang emits for the kernels in
 `tests/data/`: scalar and vector integer arithmetic, the logical and shift
-ops, 32- and 64-bit values, single and double precision (add, multiply, fma,
+ops, 32- and 64-bit values, the bytes and shorts a kernel loads, computes on
+and stores back (and the 16-bit arithmetic it gets for them, whose result is
+the low half of a register with the high half zeroed, which is why the
+compiler leaves out the mask a widening would otherwise need), single and
+double precision (add, multiply, fma,
 min, max and the sequence a division compiles to), packed half precision,
 conversions, the transcendentals, bit counting, comparisons in both their
 forms and the class test, `v_cndmask`, the lane-counting ops, scalar and EXEC

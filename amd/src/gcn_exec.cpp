@@ -445,6 +445,29 @@ struct Machine {
         const int64_t p = static_cast<int64_t>(static_cast<int32_t>(lane_src(w, in.src[0], lane))) *
                           static_cast<int32_t>(lane_src(w, in.src[1], lane));
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(static_cast<uint64_t>(p) >> 32));
+      } else if (op == "v_add_u16_e32") {
+        // 16-bit arithmetic writes the low half of the destination and zeroes
+        // the high half: the compiler leaves out the mask a widening would
+        // otherwise need after one of these.
+        write_lane(w, in.dst[0], lane,
+                   static_cast<uint16_t>(lane_src(w, in.src[0], lane) + lane_src(w, in.src[1], lane)));
+      } else if (op == "v_lshlrev_b16_e32") {
+        write_lane(w, in.dst[0], lane,
+                   static_cast<uint16_t>(lane_src(w, in.src[1], lane) << (lane_src(w, in.src[0], lane) & 15)));
+      } else if (op == "v_mad_legacy_u16") {
+        write_lane(w, in.dst[0], lane,
+                   static_cast<uint16_t>(lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane) +
+                                         lane_src(w, in.src[2], lane)));
+      } else if (op == "v_bfe_i32") {
+        // The same bits as v_bfe_u32, with the top one carried into the rest.
+        const uint32_t value = lane_src(w, in.src[0], lane), start = lane_src(w, in.src[1], lane) & 31,
+                       width = lane_src(w, in.src[2], lane) & 31;
+        uint32_t out = 0;
+        if (width != 0) {
+          out = width >= 32 ? value >> start : (value >> start) & ((1u << width) - 1);
+          if (width < 32 && (out >> (width - 1) & 1)) out |= ~((1u << width) - 1);
+        }
+        write_lane(w, in.dst[0], lane, out);
       } else if (op == "v_bfe_u32") {
         // The bits src2 wide starting at src1.
         const uint32_t value = lane_src(w, in.src[0], lane), start = lane_src(w, in.src[1], lane) & 31,
@@ -659,6 +682,33 @@ struct Machine {
     }
   }
 
+  // What a load or store narrower than a register moves, and whether what it
+  // loads keeps its sign: the name says so, and the three segments spell it
+  // the same way.
+  struct Narrow {
+    uint32_t bytes = 0;
+    bool sign = false;
+  };
+  static bool narrow(const std::string& op, Narrow* n) {
+    const size_t at = op.rfind('_');
+    if (at == std::string::npos) return false;
+    const std::string what = op.substr(at + 1);
+    if (what == "ubyte" || what == "byte") *n = {1, false};
+    else if (what == "sbyte") *n = {1, true};
+    else if (what == "ushort" || what == "short") *n = {2, false};
+    else if (what == "sshort") *n = {2, true};
+    else return false;
+    return true;
+  }
+
+  // What a narrow load puts in the register: the bytes it read, with the sign
+  // carried into the rest where the name says so.
+  static uint32_t widen(uint64_t raw, const Narrow& n) {
+    if (!n.sign) return static_cast<uint32_t>(raw);
+    return n.bytes == 1 ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)))
+                        : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+  }
+
   // A flat address says for itself which memory it means: the shared
   // aperture is LDS, and everything else is the device's.
   void flat_access(Wave& w, const Inst& in, Group& g) {
@@ -670,7 +720,22 @@ struct Machine {
       if (shared && where + 4 > g.lds.size())
         throw Error::make(Err::InvalidValue, "a flat access reaches LDS at ", where, ", past the ", g.lds.size(),
                           " bytes the kernel reserved");
-      if (in.name == "flat_store_dword") {
+      Narrow n;
+      if (narrow(in.name, &n)) {
+        if (shared && where + n.bytes > g.lds.size())
+          throw Error::make(Err::InvalidValue, "a flat access reaches LDS at ", where, ", past the ", g.lds.size(),
+                            " bytes the kernel reserved");
+        if (in.name.rfind("flat_store", 0) == 0) {
+          const uint32_t v = lane_src(w, in.src[1], lane);
+          if (shared) std::memcpy(&g.lds[where], &v, n.bytes);
+          else mem.store_scalar(where, n.bytes, v);
+        } else {
+          uint64_t raw = 0;
+          if (shared) std::memcpy(&raw, &g.lds[where], n.bytes);
+          else raw = mem.load_scalar(where, n.bytes);
+          write_lane(w, in.dst[0], lane, widen(raw, n));
+        }
+      } else if (in.name == "flat_store_dword") {
         const uint32_t v = lane_src(w, in.src[1], lane);
         if (shared) std::memcpy(&g.lds[where], &v, 4);
         else mem.store_scalar(where, 4, v);
@@ -723,7 +788,11 @@ struct Machine {
       const uint64_t addr = (in.has_saddr ? sgpr64(w, in.saddr) + lane_src(w, in.src[0], lane)
                                           : lane_src64(w, in.src[0], lane)) +
                             static_cast<uint64_t>(static_cast<int64_t>(in.offset));
-      if (op == "global_load_dword") {
+      Narrow n;
+      if (narrow(op, &n)) {
+        if (op.rfind("global_store", 0) == 0) mem.store_scalar(addr, n.bytes, lane_src(w, in.src[1], lane));
+        else write_lane(w, in.dst[0], lane, widen(mem.load_scalar(addr, n.bytes), n));
+      } else if (op == "global_load_dword") {
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(mem.load_scalar(addr, 4)));
       } else if (op == "global_load_dwordx2") {
         write_lane64(w, in.dst[0], lane, mem.load_scalar(addr, 8));
