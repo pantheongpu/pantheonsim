@@ -106,6 +106,12 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop2, 0x013}, {"v_and_b32_e32", 1, 2}},
       {{Enc::Vop2, 0x014}, {"v_or_b32_e32", 1, 2}},
       {{Enc::Vop2, 0x015}, {"v_xor_b32_e32", 1, 2}},
+      // 16-bit arithmetic, which a kernel gets for a short or a char. The
+      // result is the low half of the destination, and the high half is
+      // zeroed: the compiler drops the mask a widening would otherwise need
+      // after one of these, which it could not do if the half were kept.
+      {{Enc::Vop2, 0x026}, {"v_add_u16_e32", 1, 2}},
+      {{Enc::Vop2, 0x02a}, {"v_lshlrev_b16_e32", 1, 2}},
       {{Enc::Vop2, 0x034}, {"v_add_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x035}, {"v_sub_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x036}, {"v_subrev_u32_e32", 1, 2}},
@@ -128,6 +134,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x10b}, {"v_max_f32_e64", 1, 2}},
       {{Enc::Vop3, 0x100}, {"v_cndmask_b32_e64", 1, 3, 1, 1, 2}},
       {{Enc::Vop3, 0x1c8}, {"v_bfe_u32", 1, 3}},
+      {{Enc::Vop3, 0x1c9}, {"v_bfe_i32", 1, 3}},
       {{Enc::Vop3, 0x1cb}, {"v_fma_f32", 1, 3}},
       {{Enc::Vop3, 0x1cc}, {"v_fma_f64", 2, 3, 2, 2, 2}},
       {{Enc::Vop3, 0x1de}, {"v_div_fixup_f32", 1, 3}},
@@ -137,6 +144,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x1e2}, {"v_div_fmas_f32", 1, 3}},
       {{Enc::Vop3, 0x1e3}, {"v_div_fmas_f64", 2, 3, 2, 2, 2}},
       {{Enc::Vop3, 0x1e8}, {"v_mad_u64_u32", 2, 3, 1, 1, 2, true}},
+      {{Enc::Vop3, 0x1eb}, {"v_mad_legacy_u16", 1, 3}},
       {{Enc::Vop3, 0x1fd}, {"v_lshl_add_u32", 1, 3}},
       {{Enc::Vop3, 0x1ff}, {"v_add3_u32", 1, 3}},
       {{Enc::Vop3, 0x208}, {"v_lshl_add_u64", 2, 3, 2, 1, 2}},
@@ -164,8 +172,14 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // scratch (each work-item's private memory). The name carries the
       // segment, which the encoding keeps separately, so the table holds what
       // follows it.
+      {{Enc::Flat, 0x10}, {"load_ubyte", 1, 1}},
+      {{Enc::Flat, 0x11}, {"load_sbyte", 1, 1}},
+      {{Enc::Flat, 0x12}, {"load_ushort", 1, 1}},
+      {{Enc::Flat, 0x13}, {"load_sshort", 1, 1}},
       {{Enc::Flat, 0x14}, {"load_dword", 1, 1}},
       {{Enc::Flat, 0x15}, {"load_dwordx2", 2, 1}},
+      {{Enc::Flat, 0x18}, {"store_byte", 0, 2}},
+      {{Enc::Flat, 0x1a}, {"store_short", 0, 2}},
       {{Enc::Flat, 0x1c}, {"store_dword", 0, 2}},
       {{Enc::Flat, 0x1d}, {"store_dwordx2", 0, 2, 1, 2}},
       {{Enc::Flat, 0x1e}, {"store_dwordx3", 0, 2, 1, 3}},
@@ -478,8 +492,14 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
 
   if (literal) {
     const uint32_t value = word(code, at + in.size);
+    // A 16-bit instruction reads the low half of the word, and the assembler
+    // prints that half. A packed instruction is 16-bit twice over and takes
+    // the whole word.
+    const bool half = in.name.rfind("v_pk_", 0) != 0 &&
+                      (in.name.find("_u16") != std::string::npos || in.name.find("_i16") != std::string::npos ||
+                       in.name.find("_b16") != std::string::npos || in.name.find("_f16") != std::string::npos);
     for (Operand& o : in.src)
-      if (o.kind == OperandKind::Literal) o.value = value;
+      if (o.kind == OperandKind::Literal) o.value = half ? (value & 0xFFFF) : value;
     in.size += 4;
   }
   return in;
