@@ -95,6 +95,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x007}, {"v_cvt_u32_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x008}, {"v_cvt_i32_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x003}, {"v_cvt_i32_f64_e32", 1, 1, 2}},
+      {{Enc::Vop1, 0x00a}, {"v_cvt_f16_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x00b}, {"v_cvt_f32_f16_e32", 1, 1}},
       {{Enc::Vop1, 0x00f}, {"v_cvt_f32_f64_e32", 1, 1, 2}},
       {{Enc::Vop1, 0x01c}, {"v_trunc_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x020}, {"v_exp_f32_e32", 1, 1}},
@@ -121,6 +123,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop2, 0x026}, {"v_add_u16_e32", 1, 2}},
       {{Enc::Vop2, 0x029}, {"v_mul_lo_u16_e32", 1, 2}},
       {{Enc::Vop2, 0x02a}, {"v_lshlrev_b16_e32", 1, 2}},
+      // Half precision one value at a time, where the packed form does two.
+      {{Enc::Vop2, 0x01f}, {"v_add_f16_e32", 1, 2}},
+      {{Enc::Vop2, 0x020}, {"v_sub_f16_e32", 1, 2}},
+      {{Enc::Vop2, 0x022}, {"v_mul_f16_e32", 1, 2}},
       // A constant of the instruction's own, between its two sources.
       {{Enc::Vop2, 0x017}, {"v_fmamk_f32", 1, 2}},
       // The carry forms: each writes a mask of the lanes that carried beside
@@ -137,6 +143,12 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // A class test: the second source is a mask of the kinds of float
       // (NaN, infinity, normal, denormal, zero, each with a sign) it asks about.
       {{Enc::Vopc, 0x010}, {"v_cmp_class_f32_e32", 2, 2}},
+      {{Enc::Vopc, 0x021}, {"v_cmp_lt_f16_e32", 2, 2}},
+      {{Enc::Vopc, 0x022}, {"v_cmp_eq_f16_e32", 2, 2}},
+      {{Enc::Vopc, 0x024}, {"v_cmp_gt_f16_e32", 2, 2}},
+      {{Enc::Vopc, 0x026}, {"v_cmp_ge_f16_e32", 2, 2}},
+      {{Enc::Vopc, 0x02b}, {"v_cmp_ngt_f16_e32", 2, 2}},
+      {{Enc::Vopc, 0x02d}, {"v_cmp_neq_f16_e32", 2, 2}},
       {{Enc::Vopc, 0x041}, {"v_cmp_lt_f32_e32", 2, 2}},
       {{Enc::Vopc, 0x044}, {"v_cmp_gt_f32_e32", 2, 2}},
       {{Enc::Vopc, 0x046}, {"v_cmp_ge_f32_e32", 2, 2}},
@@ -180,6 +192,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x1f3}, {"v_xad_u32", 1, 3}},
       {{Enc::Vop3, 0x1ff}, {"v_add3_u32", 1, 3}},
       {{Enc::Vop3, 0x200}, {"v_lshl_or_b32", 1, 3}},
+      {{Enc::Vop3, 0x202}, {"v_or3_b32", 1, 3}},
+      {{Enc::Vop3, 0x206}, {"v_fma_f16", 1, 3}},
       {{Enc::Vop3, 0x208}, {"v_lshl_add_u64", 2, 3, 2, 1, 2}},
       {{Enc::Vop3, 0x280}, {"v_add_f64", 2, 2, 2, 2}},
       {{Enc::Vop3, 0x281}, {"v_mul_f64", 2, 2, 2, 2}},

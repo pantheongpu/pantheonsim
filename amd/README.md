@@ -59,7 +59,7 @@ and stores back (and the 16-bit arithmetic it gets for them, whose result is
 the low half of a register with the high half zeroed, which is why the
 compiler leaves out the mask a widening would otherwise need), single and
 double precision (add, multiply, fma,
-min, max and the sequence a division compiles to), packed half precision,
+min, max and the sequence a division compiles to), half precision, one value at a time and packed two to a register,
 conversions, the transcendentals, bit counting, comparisons in both their
 forms and the class test, `v_cndmask`, the lane-counting ops, scalar and EXEC
 branches, and the memory a kernel uses: global loads and stores and their
