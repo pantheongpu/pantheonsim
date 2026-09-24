@@ -1715,6 +1715,35 @@ class Parser {
       expect_punct(",");
       op.addr = parse_addr(fn);
       ins.op = op;
+    } else if (op0 == "stmatrix") {
+      // The same modifiers as ldmatrix, and the same restriction: the 8x8 b16
+      // shapes, which is what this engine's matrix fragments are.
+      uint32_t count = 0;
+      bool trans = false, shape_ok = false, b16 = false, shared_space = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "sync" || p == "aligned") ;
+        else if (p == "m8n8") shape_ok = true;
+        else if (p == "x1") count = 1;
+        else if (p == "x2") count = 2;
+        else if (p == "x4") count = 4;
+        else if (p == "trans") trans = true;
+        else if (p == "b16") b16 = true;
+        else if (p == "shared") shared_space = true;
+        else if (p == "cta") ;  // scope qualifier on .shared::cta
+        else return unsupported("stmatrix modifier '." + p + "'");
+      }
+      if (!shape_ok || !count || !b16)
+        return unsupported("only stmatrix.m8n8.x{1,2,4}.b16 is implemented");
+      OpStMatrix op;
+      op.count = count;
+      op.trans = trans;
+      op.shared_space = shared_space;
+      op.addr = parse_addr(fn);
+      expect_punct(",");
+      op.srcs = parse_operand_vector_any();
+      if (op.srcs.size() != count) return unsupported("stmatrix source arity");
+      ins.op = op;
     } else if (op0 == "mma") {
       // mma.sync.aligned.m16n8kK.row.col.<d>.<a>.<b>.<c>
       uint32_t k = 0;

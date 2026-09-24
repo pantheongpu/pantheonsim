@@ -207,6 +207,11 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   m32n8k16 variants are still refused by name;
   ldmatrix.m8n8.x{1,2,4}[.trans], mma.sync.m16n8k{8,16,32} over f16/bf16/tf32/
   s8, and movmatrix.m8n8.trans (the register-only transpose).
+  stmatrix.m8n8.x{1,2,4}[.trans] is the store counterpart of ldmatrix: the warp
+  writes the 8x8 matrices its registers hold back to shared memory, which is how
+  a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
+  checks where every element lands and that a fragment stored by one instruction
+  and loaded by the other comes back unchanged.
 - Asynchronous copy: cp.async.{ca,cg} with commit_group / wait_group / wait_all
   and the src-size zero-fill form. The copy is deferred until the wait rather
   than performed on the spot, so a kernel that reads its destination early sees

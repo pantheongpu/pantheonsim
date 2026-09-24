@@ -290,6 +290,49 @@ VTEST(ldmatrix_records_whether_the_shared_space_was_named) {
   VCHECK(!lms[1]->shared_space);
 }
 
+// stmatrix takes the address first and the registers after it, the opposite of
+// ldmatrix, and the count in the modifier has to match how many were given.
+VTEST(stmatrix_parses_its_forms_and_checks_the_arity) {
+  Module m = parse(
+      ".version 8.3\n.target sm_90\n.address_size 64\n"
+      ".visible .entry k()\n{\n"
+      ".reg .b32 %r<8>;\n"
+      "stmatrix.sync.aligned.m8n8.x1.shared.b16 [%r5], {%r1};\n"
+      "stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%r5], {%r1, %r2, %r3, %r4};\n"
+      "stmatrix.sync.aligned.m8n8.x2.b16 [%r5], {%r1, %r2};\n"
+      "ret;\n}\n");
+  const auto& body = m.entries[0].body;
+  std::vector<const OpStMatrix*> sms;
+  for (const auto& ins : body)
+    if (const auto* st = std::get_if<OpStMatrix>(&ins.op)) sms.push_back(st);
+  VCHECK_EQ(sms.size(), size_t{3});
+  VCHECK_EQ(sms[0]->count, 1u);
+  VCHECK(sms[0]->shared_space);
+  VCHECK(!sms[0]->trans);
+  VCHECK_EQ(sms[1]->count, 4u);
+  VCHECK(sms[1]->trans);
+  VCHECK_EQ(sms[1]->srcs.size(), size_t{4});
+  // Without ".shared" the address register holds a generic address instead.
+  VCHECK(!sms[2]->shared_space);
+  VCHECK_EQ(sms[2]->count, 2u);
+}
+
+// A count that does not match the registers given is a mistake in the kernel,
+// not something to store half of.
+VTEST(stmatrix_refuses_a_count_that_does_not_match) {
+  bool threw = false;
+  try {
+    parse(".version 8.3\n.target sm_90\n.address_size 64\n"
+          ".visible .entry k()\n{\n"
+          ".reg .b32 %r<8>;\n"
+          "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%r5], {%r1, %r2};\n"
+          "ret;\n}\n");
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  VCHECK(threw);
+}
+
 VTEST(global_initialised_with_a_symbol) {
   Module m = parse(
       ".version 8.3\n.target sm_90\n.address_size 64\n"

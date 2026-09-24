@@ -242,6 +242,20 @@ struct OpLdMatrix {
   Addr addr;
 };
 
+// stmatrix.sync.aligned.m8n8.x{1,2,4}[.trans].shared[::cta].b16 [p], {r, ...}
+// The store counterpart of ldmatrix: the warp writes the 8x8 matrices its
+// registers hold back to shared memory, in the same distribution ldmatrix reads
+// them in. It is how a kernel gets an mma result out of registers and into
+// shared memory for the next stage -- what a fused attention kernel's epilogue
+// does between its two multiplies.
+struct OpStMatrix {
+  uint32_t count = 1;
+  bool trans = false;
+  bool shared_space = false;
+  std::vector<Operand> srcs;   // one 32-bit register per matrix, per lane
+  Addr addr;
+};
+
 // mma.sync.aligned.m16n8kK.row.col.<dtype>.<atype>.<btype>.<ctype>
 // The warp-wide tensor-core multiply-accumulate. Distinct from wmma, which is
 // the older whole-fragment API: this one names the exact shape and the
@@ -589,7 +603,7 @@ struct OpCall {
 };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpStMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask>;
 
