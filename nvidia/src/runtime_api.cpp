@@ -823,6 +823,12 @@ bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, vo
                                      const std::vector<uint32_t>& param_sizes);
 bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()> op);
 
+// Defined with the graph machinery. Frees an allocation that a graph's allocation
+// node made, when a program frees it from outside the graph: `*handled` says
+// whether the pointer was one of those at all, and the result is what cudaFree
+// should return when it was.
+cudaError_t free_graph_alloc(State& s, void* ptr, bool* handled);
+
 // The body of both launch entry points. `cooperative` is the only difference,
 // and it changes one thing: whether the blocks are resident together and may
 // wait on each other. See the scheduler note in interpreter.cpp.
@@ -1408,6 +1414,12 @@ VGPU_EXPORT cudaError_t cudaFree(void* ptr) {
       std::free(ptr);
       return cudaSuccess;
     }
+    // An allocation a graph made and did not free itself can be freed from
+    // outside, which is what the API documents; one that a free node in its own
+    // graph ends belongs to that graph, and freeing it here is refused.
+    bool was_graph_alloc = false;
+    if (const cudaError_t rc = free_graph_alloc(s, ptr, &was_graph_alloc); was_graph_alloc)
+      return rc;
     owner_memory(s, ptr).free(reinterpret_cast<uint64_t>(ptr));
     return cudaSuccess;
   });
@@ -3044,6 +3056,68 @@ std::unique_ptr<GraphRec> clone_graph(const GraphRec& src,
   return out;
 }
 
+/* ---- memory a graph owns ------------------------------------------------------
+ *
+ * An allocation node allocates when the graph reaches it and a free node frees
+ * it, so a graph that needs scratch space carries it instead of the program
+ * holding it for the graph's whole life. CUDA documents one thing about the
+ * address that shapes the whole implementation: it is fixed, across every
+ * instantiation and every launch. So the address space is reserved when the node
+ * is built and kept until the allocation is gone for good, and only the physical
+ * memory behind it comes and goes -- which is exactly what the mapping API this
+ * engine already has is for.
+ *
+ * That gives the accounting its meaning, and the two attribute pairs their
+ * difference: `used` is what a graph is holding right now, between an allocation
+ * node running and the free that ends it, and `reserved` is what the device has
+ * actually handed over, which outlives a free because the memory is kept for the
+ * next launch. cudaDeviceGraphMemTrim is what gives that back, and the address
+ * survives it: the next launch maps new memory at the same place.
+ */
+struct GraphAlloc {
+  uint64_t va = 0;              // the fixed address, reserved for its whole life
+  uint64_t reserved_size = 0;   // rounded up to the mapping granularity
+  size_t size = 0;              // what the program asked for
+  int device = 0;
+  void* owner = nullptr;        // handle of the graph whose node created it
+  bool freed_in_owner = false;  // a free node in the owning graph ends it
+  bool freed_elsewhere = false; // a free node in another graph ends it
+  bool mapped = false;          // physical memory is behind the address
+  bool in_use = false;          // allocated and not yet freed
+  // The owning graph has been destroyed, so no launch can allocate here again
+  // and the address itself can go -- which a trim does, or the free that ends
+  // the allocation if the program is still holding it.
+  bool owner_gone = false;
+};
+
+struct GraphMemStats {
+  uint64_t used = 0, used_high = 0, reserved = 0, reserved_high = 0;
+};
+
+std::mutex g_graph_mem_mu;      // a leaf: nothing else is taken while it is held
+std::map<uint64_t, GraphAlloc> g_graph_allocs;
+std::map<int, GraphMemStats> g_graph_mem;
+// Which graph an instantiated graph came from, and whether it was asked to free
+// what a previous launch left allocated. Both are needed only by graphs that own
+// memory: one graph that owns memory may have one instantiation at a time, and
+// the auto-free flag is about its allocations.
+std::map<void*, void*> g_exec_source;        // exec handle -> graph handle
+std::set<void*> g_exec_auto_free;            // execs instantiated with the flag
+
+uint64_t round_up_to(uint64_t v, uint64_t to) { return (v + to - 1) / to * to; }
+
+// Whether a graph holds an allocation or free node, which brings the
+// restrictions CUDA documents with it: such a graph cannot be cloned, cannot be
+// a child of another graph, and cannot have nodes or edges taken out of it.
+// Every one of those would leave an allocation whose address nothing owns.
+bool holds_graph_memory(const GraphRec& g) {
+  for (const auto& up : g.nodes) {
+    if (up->type == cudaGraphNodeTypeMemAlloc || up->type == cudaGraphNodeTypeMemFree) return true;
+    if (up->child && holds_graph_memory(*up->child)) return true;
+  }
+  return false;
+}
+
 // The nodes in an order that runs every node after everything it depends on.
 // Empty when the dependencies contain a cycle, which is how adding one is
 // refused.
@@ -3208,15 +3282,23 @@ VGPU_EXPORT cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* p
 }
 
 VGPU_EXPORT cudaError_t cudaGraphInstantiate(cudaGraphExec_t* pExec, cudaGraph_t graph,
-                                             unsigned long long) {
+                                             unsigned long long flags) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto it = g_graphs.find(static_cast<void*>(graph));
   if (it == g_graphs.end()) return cudaErrorInvalidValue;
   if (topological_order(*it->second).empty() && !it->second->nodes.empty())
     return cudaErrorInvalidValue;                      // a cycle cannot be instantiated
+  if (holds_graph_memory(*it->second)) {
+    // One instantiation at a time, as documented: two would each believe they
+    // own the allocation, and the second to free it would free it twice.
+    for (const auto& [exec_handle, source] : g_exec_source)
+      if (source == static_cast<void*>(graph)) return cudaErrorInvalidValue;
+  }
   auto exec = clone_graph(*it->second, nullptr);        // a snapshot, as CUDA takes
   void* handle = exec.get();
   g_graph_execs[handle] = std::move(exec);
+  g_exec_source[handle] = static_cast<void*>(graph);
+  if (flags & cudaGraphInstantiateFlagAutoFreeOnLaunch) g_exec_auto_free.insert(handle);
   if (pExec) *pExec = static_cast<cudaGraphExec_t>(handle);
   return cudaSuccess;
 }
@@ -3228,6 +3310,56 @@ VGPU_EXPORT cudaError_t cudaGraphInstantiateWithFlags(cudaGraphExec_t* pExec, cu
 // Runs one node's work. Nodes with no work of their own (empty ones) do
 // nothing but order the nodes around them.
 static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream);
+
+namespace {
+
+// Puts physical memory behind a graph allocation's address, which is what its
+// node does when a launch reaches it. The address was reserved when the node was
+// built and does not change; on the second and later launches the memory is
+// usually still mapped, because a free keeps it for the next launch.
+cudaError_t graph_mem_alloc_run(uint64_t va) {
+  return guard("cudaGraphLaunch", [&](State& s) -> cudaError_t {
+    std::lock_guard<std::mutex> lock(g_graph_mem_mu);
+    const auto it = g_graph_allocs.find(va);
+    if (it == g_graph_allocs.end()) return cudaErrorInvalidValue;
+    GraphAlloc& a = it->second;
+    if (a.in_use) return cudaSuccess;   // a launch of a graph already holding it
+    vgpu::MemoryManager& mm = s.rt->device(a.device).memory();
+    if (!a.mapped) {
+      const uint64_t handle = mm.create_handle(a.reserved_size);
+      mm.map(a.va, a.reserved_size, 0, handle);
+      mm.set_access(a.va, a.reserved_size, true, true);
+      mm.release_handle(handle);   // the mapping holds it now
+      a.mapped = true;
+      GraphMemStats& st_ = g_graph_mem[a.device];
+      st_.reserved += a.reserved_size;
+      st_.reserved_high = std::max(st_.reserved_high, st_.reserved);
+    }
+    a.in_use = true;
+    GraphMemStats& st_ = g_graph_mem[a.device];
+    st_.used += a.size;
+    st_.used_high = std::max(st_.used_high, st_.used);
+    return cudaSuccess;
+  });
+}
+
+// Ends a graph allocation's life as an allocation, which is what its free node
+// does. The memory stays mapped, because the next launch of the same graph will
+// allocate at the same address and CUDA documents that address as fixed; what
+// gives it back is cudaDeviceGraphMemTrim.
+cudaError_t graph_mem_free_run(uint64_t va) {
+  std::lock_guard<std::mutex> lock(g_graph_mem_mu);
+  const auto it = g_graph_allocs.find(va);
+  if (it == g_graph_allocs.end()) return cudaErrorInvalidValue;
+  GraphAlloc& a = it->second;
+  if (!a.in_use) return cudaSuccess;
+  a.in_use = false;
+  GraphMemStats& st_ = g_graph_mem[a.device];
+  st_.used -= std::min<uint64_t>(st_.used, a.size);
+  return cudaSuccess;
+}
+
+}  // namespace
 
 // Every node of a graph, in an order that respects its dependencies. With one
 // synchronous engine any such order is a correct execution of the graph, and a
@@ -3258,6 +3390,10 @@ static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
       if (rl.host_fn) rl.host_fn(rl.host_user);
       else if (rl.host_op) rl.host_op();
       return cudaSuccess;
+    case cudaGraphNodeTypeMemAlloc:
+      return graph_mem_alloc_run(reinterpret_cast<uint64_t>(rl.dst));
+    case cudaGraphNodeTypeMemFree:
+      return graph_mem_free_run(reinterpret_cast<uint64_t>(rl.dst));
     case cudaGraphNodeTypeEventRecord:
       return cudaEventRecord(rl.event, stream);
     case cudaGraphNodeTypeWaitEvent:
@@ -3278,11 +3414,28 @@ static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
 
 VGPU_EXPORT cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t stream) {
   std::unique_ptr<GraphRec> replay;
+  bool auto_free = false;
+  void* source = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_graph_mu);
     auto it = g_graph_execs.find(static_cast<void*>(exec));
     if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
     replay = clone_graph(*it->second, nullptr);   // run without holding the lock
+    auto_free = g_exec_auto_free.count(static_cast<void*>(exec)) != 0;
+    if (const auto src = g_exec_source.find(static_cast<void*>(exec)); src != g_exec_source.end())
+      source = src->second;
+  }
+  // Instantiated with cudaGraphInstantiateFlagAutoFreeOnLaunch: what a previous
+  // launch allocated and did not free is freed before this one runs, which is
+  // what lets a graph with allocation nodes and no free nodes be relaunched.
+  if (auto_free && source) {
+    std::lock_guard<std::mutex> lock(g_graph_mem_mu);
+    for (auto& [va, a] : g_graph_allocs) {
+      if (a.owner != source || !a.in_use) continue;
+      a.in_use = false;
+      GraphMemStats& st_ = g_graph_mem[a.device];
+      st_.used -= std::min<uint64_t>(st_.used, a.size);
+    }
   }
   return run_graph(*replay, stream);
 }
@@ -3585,6 +3738,10 @@ VGPU_EXPORT cudaError_t cudaGraphAddChildGraphNode(cudaGraphNode_t* pNode, cudaG
   if (!g || !child || !pNode || g == child) return cudaErrorInvalidValue;
   std::vector<GraphNodeRec*> pred;
   if (!deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
+  // A graph that owns memory cannot be a child of another graph: the child is
+  // taken by copy, and a copy of an allocation node would name an address the
+  // original owns. CUDA documents the same restriction.
+  if (holds_graph_memory(*child)) return cudaErrorInvalidValue;
   // Cloned now: CUDA takes the child's structure as it is at this moment.
   g->children.push_back(clone_graph(*child, nullptr));
   GraphNodeRec* n = g->add(cudaGraphNodeTypeGraph, RecordedLaunch{}, pred);
@@ -3615,6 +3772,9 @@ static cudaError_t graph_remove_deps(cudaGraph_t graph, const cudaGraphNode_t* f
   std::lock_guard<std::mutex> lock(g_graph_mu);
   GraphRec* g = graph_from(graph);
   if (!g || (numDeps && (!from || !to))) return cudaErrorInvalidValue;
+  // Edges cannot be taken out of a graph that owns memory: the order an
+  // allocation, its uses and its free run in is the whole reason it is safe.
+  if (holds_graph_memory(*g)) return cudaErrorInvalidValue;
   for (size_t i = 0; i < numDeps; ++i) {
     auto* f = reinterpret_cast<GraphNodeRec*>(from[i]);
     auto* t = reinterpret_cast<GraphNodeRec*>(to[i]);
@@ -3631,6 +3791,9 @@ VGPU_EXPORT cudaError_t cudaGraphDestroyNode(cudaGraphNode_t node) {
   auto* n = reinterpret_cast<GraphNodeRec*>(node);
   for (auto& [handle, g] : g_graphs) {
     if (!g->holds(n)) continue;
+    // Nodes cannot be taken out of a graph that owns memory: removing the
+    // allocation node or the free node would leave the other one alone.
+    if (holds_graph_memory(*g)) return cudaErrorInvalidValue;
     for (auto& up : g->nodes)
       up->deps.erase(std::remove(up->deps.begin(), up->deps.end(), n), up->deps.end());
     if (g->last_capture == n) g->last_capture = nullptr;
@@ -3855,6 +4018,10 @@ VGPU_EXPORT cudaError_t cudaGraphClone(cudaGraph_t* pGraphClone, cudaGraph_t ori
   std::lock_guard<std::mutex> lock(g_graph_mu);
   GraphRec* src = graph_from(originalGraph);
   if (!src || !pGraphClone) return cudaErrorInvalidValue;
+  // A graph that owns memory cannot be cloned: the clone's allocation nodes
+  // would name the original's addresses, and one of the two graphs would free
+  // memory the other still uses. CUDA refuses it for the same reason.
+  if (holds_graph_memory(*src)) return cudaErrorInvalidValue;
   auto copy = clone_graph(*src, nullptr);
   void* handle = copy.get();
   g_graphs[handle] = std::move(copy);
@@ -4222,6 +4389,207 @@ VGPU_EXPORT cudaError_t cudaGraphUpload(cudaGraphExec_t exec, cudaStream_t) {
   return g_graph_execs.count(static_cast<void*>(exec)) ? cudaSuccess : cudaErrorInvalidValue;
 }
 
+cudaError_t free_graph_alloc(State& s, void* ptr, bool* handled) {
+  std::lock_guard<std::mutex> lock(g_graph_mem_mu);
+  *handled = false;
+  const auto it = g_graph_allocs.find(reinterpret_cast<uint64_t>(ptr));
+  if (it == g_graph_allocs.end()) return cudaSuccess;
+  *handled = true;
+  GraphAlloc& a = it->second;
+  // Freed by a node in the graph that owns it: that graph frees it, and a second
+  // free from outside would be freeing an address the graph still allocates at.
+  if (a.freed_in_owner) return cudaErrorInvalidValue;
+  vgpu::MemoryManager& mm = s.rt->device(a.device).memory();
+  GraphMemStats& st_ = g_graph_mem[a.device];
+  if (a.in_use) st_.used -= std::min<uint64_t>(st_.used, a.size);
+  a.in_use = false;
+  if (a.mapped) {
+    mm.unmap(a.va, a.reserved_size);
+    a.mapped = false;
+    st_.reserved -= std::min<uint64_t>(st_.reserved, a.reserved_size);
+  }
+  // The address stays while the node that allocates at it still exists: a later
+  // launch of that graph allocates here again, which is the fixed address CUDA
+  // documents. Once the graph is gone, nothing can, and the address goes too.
+  if (a.owner_gone) {
+    mm.address_free(a.va, a.reserved_size);
+    g_graph_allocs.erase(it);
+  }
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphAddMemAllocNode(cudaGraphNode_t* pNode, cudaGraph_t graph,
+                                                 const cudaGraphNode_t* deps, size_t numDeps,
+                                                 cudaMemAllocNodeParams* params) {
+  if (!pNode || !params || params->bytesize == 0) return cudaErrorInvalidValue;
+  // Sharing a graph allocation with another process would need a handle type
+  // this does not offer, and the API documents IPC as unsupported here too.
+  if (params->poolProps.handleTypes != cudaMemHandleTypeNone) return cudaErrorNotSupported;
+  const int device = params->poolProps.location.type == cudaMemLocationTypeDevice
+                         ? params->poolProps.location.id
+                         : -1;
+  uint64_t va = 0, reserved_size = 0;
+  int use_device = 0;
+  // The address is reserved now, under the runtime's lock, before the graph lock
+  // is taken: that is the one lock order this file keeps.
+  const cudaError_t rc = guard("cudaGraphAddMemAllocNode", [&](State& s) -> cudaError_t {
+    if (device >= 0) {
+      if (device >= static_cast<int>(s.rt->device_count())) return cudaErrorInvalidDevice;
+      use_device = device;
+    } else {
+      use_device = t_current_device;
+    }
+    vgpu::MemoryManager& mm = s.rt->device(use_device).memory();
+    reserved_size = round_up_to(params->bytesize, vgpu::MemoryManager::kVmmGranularity);
+    va = mm.reserve(reserved_size, 0);
+    return cudaSuccess;
+  });
+  if (rc != cudaSuccess) return rc;
+
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  std::vector<GraphNodeRec*> pred;
+  if (!g || !deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
+  RecordedLaunch w;
+  w.dst = reinterpret_cast<void*>(va);
+  w.bytes = params->bytesize;
+  GraphNodeRec* n = g->add(cudaGraphNodeTypeMemAlloc, std::move(w), pred);
+  {
+    std::lock_guard<std::mutex> mem_lock(g_graph_mem_mu);
+    GraphAlloc a;
+    a.va = va;
+    a.reserved_size = reserved_size;
+    a.size = params->bytesize;
+    a.device = use_device;
+    a.owner = static_cast<void*>(graph);
+    g_graph_allocs[va] = a;
+  }
+  params->dptr = reinterpret_cast<void*>(va);   // the address, now and for good
+  *pNode = reinterpret_cast<cudaGraphNode_t>(n);
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphMemAllocNodeGetParams(cudaGraphNode_t node,
+                                                      cudaMemAllocNodeParams* params) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  if (!n || !params || n->type != cudaGraphNodeTypeMemAlloc) return cudaErrorInvalidValue;
+  std::memset(params, 0, sizeof *params);
+  params->bytesize = n->work.bytes;
+  params->dptr = n->work.dst;
+  params->poolProps.allocType = cudaMemAllocationTypePinned;
+  params->poolProps.location.type = cudaMemLocationTypeDevice;
+  {
+    std::lock_guard<std::mutex> mem_lock(g_graph_mem_mu);
+    const auto it = g_graph_allocs.find(reinterpret_cast<uint64_t>(n->work.dst));
+    if (it != g_graph_allocs.end()) params->poolProps.location.id = it->second.device;
+  }
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphAddMemFreeNode(cudaGraphNode_t* pNode, cudaGraph_t graph,
+                                                const cudaGraphNode_t* deps, size_t numDeps,
+                                                void* dptr) {
+  if (!pNode || !dptr) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  std::vector<GraphNodeRec*> pred;
+  if (!g || !deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
+  {
+    std::lock_guard<std::mutex> mem_lock(g_graph_mem_mu);
+    const auto it = g_graph_allocs.find(reinterpret_cast<uint64_t>(dptr));
+    if (it == g_graph_allocs.end()) return cudaErrorInvalidValue;   // not a graph allocation
+    GraphAlloc& a = it->second;
+    // An allocation is freed once, and in one graph: either the graph that owns
+    // it or another one, never both. Both rules are CUDA's, and both exist
+    // because a second free would be freeing an address nothing holds.
+    if (a.freed_in_owner || a.freed_elsewhere) return cudaErrorInvalidValue;
+    if (a.owner == static_cast<void*>(graph)) a.freed_in_owner = true;
+    else a.freed_elsewhere = true;
+  }
+  RecordedLaunch w;
+  w.dst = dptr;
+  *pNode = reinterpret_cast<cudaGraphNode_t>(
+      g->add(cudaGraphNodeTypeMemFree, std::move(w), pred));
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphMemFreeNodeGetParams(cudaGraphNode_t node, void* dptr_out) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = reinterpret_cast<GraphNodeRec*>(node);
+  if (!n || !dptr_out || n->type != cudaGraphNodeTypeMemFree) return cudaErrorInvalidValue;
+  *static_cast<void**>(dptr_out) = n->work.dst;
+  return cudaSuccess;
+}
+
+// Gives back the memory behind graph allocations nothing is holding: those a
+// free node has ended, and those whose node has never been reached. The
+// addresses stay reserved, so a later launch allocates at the same place, which
+// is the guarantee that makes a graph allocation usable at all.
+VGPU_EXPORT cudaError_t cudaDeviceGraphMemTrim(int device) {
+  return guard("cudaDeviceGraphMemTrim", [&](State& s) -> cudaError_t {
+    if (device < 0 || device >= static_cast<int>(s.rt->device_count())) return cudaErrorInvalidDevice;
+    std::lock_guard<std::mutex> lock(g_graph_mem_mu);
+    vgpu::MemoryManager& mm = s.rt->device(device).memory();
+    for (auto& [va, a] : g_graph_allocs) {
+      if (a.device != device || a.in_use) continue;
+      if (a.mapped) {
+        mm.unmap(a.va, a.reserved_size);
+        a.mapped = false;
+        GraphMemStats& st_ = g_graph_mem[device];
+        st_.reserved -= std::min<uint64_t>(st_.reserved, a.reserved_size);
+      }
+      // Nothing can allocate here again, so the address space goes back as well.
+      if (a.owner_gone) mm.address_free(a.va, a.reserved_size);
+    }
+    std::erase_if(g_graph_allocs, [&](const auto& kv) {
+      return kv.second.device == device && kv.second.owner_gone && !kv.second.in_use;
+    });
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaDeviceGetGraphMemAttribute(int device,
+                                                       cudaGraphMemAttributeType attr,
+                                                       void* value) {
+  if (!value) return cudaErrorInvalidValue;
+  return guard("cudaDeviceGetGraphMemAttribute", [&](State& s) -> cudaError_t {
+    if (device < 0 || device >= static_cast<int>(s.rt->device_count())) return cudaErrorInvalidDevice;
+    std::lock_guard<std::mutex> lock(g_graph_mem_mu);
+    const GraphMemStats& st_ = g_graph_mem[device];
+    switch (attr) {
+      case cudaGraphMemAttrUsedMemCurrent: *static_cast<uint64_t*>(value) = st_.used; return cudaSuccess;
+      case cudaGraphMemAttrUsedMemHigh: *static_cast<uint64_t*>(value) = st_.used_high; return cudaSuccess;
+      case cudaGraphMemAttrReservedMemCurrent:
+        *static_cast<uint64_t*>(value) = st_.reserved;
+        return cudaSuccess;
+      case cudaGraphMemAttrReservedMemHigh:
+        *static_cast<uint64_t*>(value) = st_.reserved_high;
+        return cudaSuccess;
+      default: return cudaErrorInvalidValue;
+    }
+  });
+}
+
+// A high-water mark is reset by writing zero to it, and nothing else can be
+// written: the current totals are what they are.
+VGPU_EXPORT cudaError_t cudaDeviceSetGraphMemAttribute(int device,
+                                                       cudaGraphMemAttributeType attr,
+                                                       void* value) {
+  if (!value) return cudaErrorInvalidValue;
+  return guard("cudaDeviceSetGraphMemAttribute", [&](State& s) -> cudaError_t {
+    if (device < 0 || device >= static_cast<int>(s.rt->device_count())) return cudaErrorInvalidDevice;
+    if (*static_cast<uint64_t*>(value) != 0) return cudaErrorInvalidValue;
+    std::lock_guard<std::mutex> lock(g_graph_mem_mu);
+    GraphMemStats& st_ = g_graph_mem[device];
+    switch (attr) {
+      case cudaGraphMemAttrUsedMemHigh: st_.used_high = st_.used; return cudaSuccess;
+      case cudaGraphMemAttrReservedMemHigh: st_.reserved_high = st_.reserved; return cudaSuccess;
+      default: return cudaErrorInvalidValue;   // the current totals are not settable
+    }
+  });
+}
+
 // CUDA 13 added an edge-data argument to each of these: ordering information
 // for an edge, whose only value this engine can honour is the default. The
 // shim is built against one toolkit, so each is exported with that toolkit's
@@ -4349,12 +4717,23 @@ VGPU_EXPORT cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
   if (GraphRec* g = graph_from(graph))
     for (const auto& child : g->children) std::erase_if(
         g_borrowed_graphs, [&](const auto& kv) { return kv.second == child.get(); });
+  // Allocations this graph made outlive it, as CUDA documents: a program still
+  // holding one frees it itself. What ends with the graph is the chance of ever
+  // allocating at that address again, so the address can be given back -- by the
+  // free that ends the allocation, or by the next trim.
+  {
+    std::lock_guard<std::mutex> mem_lock(g_graph_mem_mu);
+    for (auto& [va, a] : g_graph_allocs)
+      if (a.owner == static_cast<void*>(graph)) a.owner_gone = true;
+  }
   g_graphs.erase(static_cast<void*>(graph));
   return cudaSuccess;
 }
 VGPU_EXPORT cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   g_graph_execs.erase(static_cast<void*>(exec));
+  g_exec_source.erase(static_cast<void*>(exec));
+  g_exec_auto_free.erase(static_cast<void*>(exec));
   return cudaSuccess;
 }
 VGPU_EXPORT cudaError_t cudaStreamIsCapturing(cudaStream_t stream,
