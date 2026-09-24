@@ -204,6 +204,19 @@ struct Machine {
     if (o.abs) h = h < static_cast<_Float16>(0) ? -h : h;
     return o.neg ? -h : h;
   }
+  // A float narrowed to a half, rounded toward zero rather than to nearest:
+  // the nearest half, stepped one toward zero where it landed further out
+  // than the float was. A float past the largest half becomes the largest
+  // half, not an infinity, since rounding toward zero never grows.
+  static uint16_t half_toward_zero(float x) {
+    const _Float16 nearest = static_cast<_Float16>(x);
+    uint16_t bits = 0;
+    std::memcpy(&bits, &nearest, 2);
+    if (std::isnan(x)) return bits;
+    if (std::fabs(static_cast<double>(nearest)) > std::fabs(static_cast<double>(x))) --bits;   // sign and magnitude: one step toward zero
+    return bits;
+  }
+
   // A half result, which fills the low half of the register and zeroes the
   // high half, as every 16-bit instruction here does.
   void write_half(Wave& w, const Inst& in, uint32_t lane, _Float16 v) {
@@ -778,6 +791,59 @@ struct Machine {
       } else if (op == "v_mul_lo_u16_e32") {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane)));
+      } else if (op == "v_bfi_b32") {
+        // The bits the first source selects come from the second, the rest
+        // from the third.
+        const uint32_t m = lane_src(w, in.src[0], lane);
+        write_lane(w, in.dst[0], lane, (m & lane_src(w, in.src[1], lane)) | (~m & lane_src(w, in.src[2], lane)));
+      } else if (op == "v_alignbit_b32") {
+        // Two registers side by side, the first above the second, and the 32
+        // bits that start where the third says: a rotate, when both are one.
+        const uint64_t pair = static_cast<uint64_t>(lane_src(w, in.src[0], lane)) << 32 | lane_src(w, in.src[1], lane);
+        write_lane(w, in.dst[0], lane, static_cast<uint32_t>(pair >> (lane_src(w, in.src[2], lane) & 31)));
+      } else if (op == "v_med3_i32") {
+        const int32_t x = static_cast<int32_t>(lane_src(w, in.src[0], lane)),
+                      y = static_cast<int32_t>(lane_src(w, in.src[1], lane)),
+                      z = static_cast<int32_t>(lane_src(w, in.src[2], lane));
+        write_lane(w, in.dst[0], lane, static_cast<uint32_t>(std::max(std::min(x, y), std::min(std::max(x, y), z))));
+      } else if (op == "v_frexp_mant_f32_e32" || op == "v_frexp_exp_i32_f32_e32") {
+        // A float as a mantissa in [0.5, 1) and a power of two. An infinity
+        // or a NaN has no such parts: the mantissa is the value itself and
+        // the exponent zero, which is also what the host's frexp gives.
+        const float x = lane_float(w, in.src[0], lane);
+        int e = 0;
+        const float m = std::isfinite(x) ? std::frexp(x, &e) : x;
+        if (!std::isfinite(x)) e = 0;
+        write_lane(w, in.dst[0], lane, op == "v_frexp_mant_f32_e32" ? as_bits(m) : static_cast<uint32_t>(e));
+      } else if (op == "v_dot4c_i32_i8_e32") {
+        // Four signed bytes times four, added into the destination. Nothing
+        // clamps it: a sum past what 32 bits hold wraps.
+        const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
+        uint32_t sum = w.vgpr[in.dst[0].index][lane];
+        for (uint32_t k = 0; k < 4; ++k)
+          sum += static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(a >> (8 * k))) *
+                                       static_cast<int32_t>(static_cast<int8_t>(b >> (8 * k))));
+        write_lane(w, in.dst[0], lane, sum);
+      } else if (op == "v_dot2c_f32_f16_e32") {
+        // Two pairs of halves multiplied and added into a float. Each product
+        // is exact in a float; the sum is worked out in double and rounded
+        // once, which is this model's reading of a dot product -- where the
+        // sum fits a float exactly, any reading gives the same answer.
+        const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
+        const auto half = [](uint32_t v, uint32_t k) {
+          _Float16 h;
+          const uint16_t bits = static_cast<uint16_t>(v >> (16 * k));
+          std::memcpy(&h, &bits, 2);
+          return static_cast<double>(h);
+        };
+        const double sum = half(a, 0) * half(b, 0) + half(a, 1) * half(b, 1) +
+                           static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane]));
+        write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(sum)));
+      } else if (op == "v_cvt_pkrtz_f16_f32") {
+        // Two floats narrowed to halves and packed, each rounded toward zero.
+        write_lane(w, in.dst[0], lane,
+                   half_toward_zero(lane_float(w, in.src[0], lane)) |
+                       static_cast<uint32_t>(half_toward_zero(lane_float(w, in.src[1], lane))) << 16);
       } else if (op == "v_xad_u32") {
         write_lane(w, in.dst[0], lane,
                    (lane_src(w, in.src[0], lane) ^ lane_src(w, in.src[1], lane)) + lane_src(w, in.src[2], lane));

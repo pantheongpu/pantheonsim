@@ -66,7 +66,12 @@ value at a time and packed two to a register, and two floats pack into a
 register pair. Beside those: the transcendentals, the sine and the cosine
 (whose argument is a turn rather than a radian, which is why the compiler
 multiplies by one over two pi first), bit counting, the comparisons in both
-their forms and the class test, `v_cndmask`, and the lane-counting ops.
+their forms and the class test, `v_cndmask`, and the lane-counting ops. So
+are the idioms a kernel writes out by hand: a clamp (the median of three), a
+rotate or a funnel shift, a bitfield insert, frexp, the integer and half dot
+products, and two floats packed into halves rounded toward zero. A half dot
+product whose sum does not fit a float exactly is rounded once here; a card
+may round it differently.
 
 The control flow: scalar and EXEC branches, and a call to a function the
 compiler did not inline with the return from it.
