@@ -1034,18 +1034,37 @@ struct Machine {
   }
 
   // LDS, which the work-group shares.
+  // Which lane a lane reads under a swizzle pattern: four lanes choosing
+  // among their own four, or, within a group of 32, the lane its own number
+  // becomes once ANDed, ORed and XORed with the pattern's three masks.
+  static uint32_t swizzle_source(uint32_t pattern, uint32_t lane) {
+    if (pattern & 0x8000) return (lane & ~3u) + ((pattern >> (2 * (lane & 3))) & 3);
+    const uint32_t and_mask = pattern & 0x1F, or_mask = (pattern >> 5) & 0x1F, xor_mask = (pattern >> 10) & 0x1F;
+    return (lane & ~31u) | ((((lane & 31u) & and_mask) | or_mask) ^ xor_mask);
+  }
+
   void lds_access(Wave& w, const Inst& in, Group& g) {
     const std::string& op = in.name;
+    // The two that move values between lanes read every lane's value before
+    // any lane's result is written: the destination may be the very register
+    // they read, and a lane further on must still see what was there.
+    const bool across = op == "ds_bpermute_b32" || op == "ds_swizzle_b32";
+    std::array<uint32_t, kLanes> before{};
+    if (across) {
+      const Operand& data = op == "ds_bpermute_b32" ? in.src[1] : in.src[0];
+      for (uint32_t lane = 0; lane < kLanes; ++lane) before[lane] = w.vgpr[data.index][lane];
+    }
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
-      const uint32_t addr = in.name == "ds_bpermute_b32" ? 0 : lane_src(w, in.src[0], lane);
-      const auto at = [&](uint64_t offset) {
+      const uint32_t addr = across ? 0 : lane_src(w, in.src[0], lane);
+      const auto at = [&](uint64_t offset, uint64_t bytes = 4) {
         const uint64_t a = addr + offset;
-        if (a + 4 > g.lds.size())
+        if (a + bytes > g.lds.size())
           throw Error::make(Err::InvalidValue, "an LDS access at ", a, " is past the ", g.lds.size(),
                             " bytes the kernel reserved");
         return a;
       };
+      const uint64_t off = static_cast<uint64_t>(in.offset);
       if (op == "ds_write_b32") {
         const uint32_t v = lane_src(w, in.src[1], lane);
         std::memcpy(&g.lds[at(static_cast<uint64_t>(in.offset))], &v, 4);
@@ -1063,7 +1082,40 @@ struct Machine {
         // A lane reads what another lane holds: the address says which, in
         // bytes, and the source register is read across the wave.
         const uint32_t from = (lane_src(w, in.src[0], lane) >> 2) & (kLanes - 1);
-        write_lane(w, in.dst[0], lane, w.vgpr[in.src[1].index][from]);
+        write_lane(w, in.dst[0], lane, before[from]);
+      } else if (op == "ds_swizzle_b32") {
+        write_lane(w, in.dst[0], lane, before[swizzle_source(static_cast<uint32_t>(in.offset), lane)]);
+      } else if (op == "ds_add_f32") {
+        // A float atomic, lane by lane, as the integer one is.
+        float v = 0;
+        std::memcpy(&v, &g.lds[at(off)], 4);
+        v += as_float(lane_src(w, in.src[1], lane));
+        std::memcpy(&g.lds[at(off)], &v, 4);
+      } else if (op == "ds_write_b8" || op == "ds_write_b16") {
+        const uint32_t v = lane_src(w, in.src[1], lane);
+        const uint64_t bytes = op == "ds_write_b8" ? 1 : 2;
+        std::memcpy(&g.lds[at(off, bytes)], &v, bytes);
+      } else if (op == "ds_read_u8" || op == "ds_read_i8" || op == "ds_read_u16") {
+        const uint64_t bytes = op == "ds_read_u16" ? 2 : 1;
+        uint32_t v = 0;
+        std::memcpy(&v, &g.lds[at(off, bytes)], bytes);
+        if (op == "ds_read_i8") v = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v)));
+        write_lane(w, in.dst[0], lane, v);
+      } else if (op == "ds_write_b64" || op == "ds_write_b128") {
+        const uint32_t words = in.src[1].width;
+        const uint64_t a = at(off, 4 * words);
+        for (uint32_t k = 0; k < words; ++k) {
+          const uint32_t v = w.vgpr[in.src[1].index + k][lane];
+          std::memcpy(&g.lds[a + 4 * k], &v, 4);
+        }
+      } else if (op == "ds_read_b64" || op == "ds_read_b128") {
+        const uint32_t words = in.dst[0].width;
+        const uint64_t a = at(off, 4 * words);
+        for (uint32_t k = 0; k < words; ++k) {
+          uint32_t v = 0;
+          std::memcpy(&v, &g.lds[a + 4 * k], 4);
+          w.vgpr[in.dst[0].index + k][lane] = v;
+        }
       } else if (op == "ds_read2st64_b32") {
         // Two dwords, each offset by its own count of 64 dwords.
         uint32_t v0 = 0, v1 = 0;

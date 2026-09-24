@@ -267,9 +267,25 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Ds, 0x0b}, {"ds_xor_b32", 0, 2}},
       {{Enc::Ds, 0x0d}, {"ds_write_b32", 0, 2}},
       {{Enc::Ds, 0x0e}, {"ds_write2_b32", 0, 3}},
+      {{Enc::Ds, 0x15}, {"ds_add_f32", 0, 2}},
+      // Narrower than a word, and wider: a byte, a half, and two or four
+      // words at once.
+      {{Enc::Ds, 0x1e}, {"ds_write_b8", 0, 2}},
+      {{Enc::Ds, 0x1f}, {"ds_write_b16", 0, 2}},
       {{Enc::Ds, 0x37}, {"ds_read2_b32", 2, 1}},
       {{Enc::Ds, 0x36}, {"ds_read_b32", 1, 1}},
       {{Enc::Ds, 0x38}, {"ds_read2st64_b32", 2, 1}},
+      {{Enc::Ds, 0x39}, {"ds_read_i8", 1, 1}},
+      {{Enc::Ds, 0x3a}, {"ds_read_u8", 1, 1}},
+      {{Enc::Ds, 0x3c}, {"ds_read_u16", 1, 1}},
+      {{Enc::Ds, 0x4d}, {"ds_write_b64", 0, 2, 1, 2}},
+      {{Enc::Ds, 0x76}, {"ds_read_b64", 2, 1}},
+      {{Enc::Ds, 0xdf}, {"ds_write_b128", 0, 2, 1, 4}},
+      {{Enc::Ds, 0xff}, {"ds_read_b128", 4, 1}},
+      // Lanes trading values without touching LDS at all: the offset is a
+      // pattern saying which lane each one reads, and the data register sits
+      // where an address would.
+      {{Enc::Ds, 0x3d}, {"ds_swizzle_b32", 1, 1}},
       // A lane reads the value another lane holds: the address says which.
       {{Enc::Ds, 0x3f}, {"ds_bpermute_b32", 1, 2}},
       // FLAT and the two segments that share its opcodes: global (an address
@@ -413,6 +429,43 @@ const char* enc_name(Enc e) {
     case Enc::Unknown: return "unknown";
   }
   return "unknown";
+}
+
+// How the assembler spells a swizzle's pattern. Four lanes choosing among
+// their own four is a quad permute. Otherwise each lane of a group of 32
+// reads the lane its own number becomes once it is ANDed with one mask, ORed
+// with a second and XORed with a third, and the assembler names the common
+// shapes of that -- a swap of groups, a reversal, a broadcast -- before
+// falling back to spelling each of the five bits out.
+std::string swizzle_text(uint32_t imm) {
+  char b[64];
+  if (imm & 0x8000) {
+    std::snprintf(b, sizeof b, "swizzle(QUAD_PERM,%u,%u,%u,%u)", imm & 3, (imm >> 2) & 3, (imm >> 4) & 3,
+                  (imm >> 6) & 3);
+    return b;
+  }
+  const uint32_t and_mask = imm & 0x1F, or_mask = (imm >> 5) & 0x1F, xor_mask = (imm >> 10) & 0x1F;
+  if (and_mask == 0x1F && or_mask == 0 && xor_mask && !(xor_mask & (xor_mask - 1))) {
+    std::snprintf(b, sizeof b, "swizzle(SWAP,%u)", xor_mask);
+    return b;
+  }
+  if (and_mask == 0x1F && or_mask == 0 && xor_mask && !((xor_mask + 1) & xor_mask)) {
+    std::snprintf(b, sizeof b, "swizzle(REVERSE,%u)", xor_mask + 1);
+    return b;
+  }
+  if (xor_mask == 0) {
+    for (uint32_t size = 2; size <= 32; size *= 2)
+      if (and_mask == (0x1Fu & ~(size - 1)) && or_mask < size) {
+        std::snprintf(b, sizeof b, "swizzle(BROADCAST,%u,%u)", size, or_mask);
+        return b;
+      }
+  }
+  std::string bits = "swizzle(BITMASK_PERM,\"";
+  for (int k = 4; k >= 0; --k) {
+    const bool a = (and_mask >> k) & 1, o = (or_mask >> k) & 1, x = (xor_mask >> k) & 1;
+    bits += a && !o ? (x ? 'i' : 'p') : ((o ^ x) ? '1' : '0');
+  }
+  return bits + "\")";
 }
 
 // The second word of a sub-dword instruction: which part of each source it
@@ -669,7 +722,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     }
     if (s.dst_width) in.dst.push_back(vgpr((w1 >> 24) & 0xFF, s.dst_width));
     in.src.push_back(vgpr(w1 & 0xFF));                              // the address
-    if (s.srcs > 1) in.src.push_back(vgpr((w1 >> 8) & 0xFF));       // the data written
+    if (s.srcs > 1) in.src.push_back(vgpr((w1 >> 8) & 0xFF, s.src_width(1)));   // the data written
     if (s.srcs > 2) in.src.push_back(vgpr((w1 >> 16) & 0xFF));      // and the second, for a two-address write
   } else if ((w0 >> 26) == 0x37) {    // FLAT, and its global and scratch forms
     in.enc = Enc::Flat;
@@ -866,7 +919,9 @@ std::string to_text(const Inst& i) {
     }
   } else if (i.enc == Enc::Ds) {
     const bool two = i.name.find("read2") != std::string::npos || i.name.find("write2") != std::string::npos;
-    if (i.offset) {
+    if (i.name == "ds_swizzle_b32") {
+      if (i.offset) s += " offset:" + swizzle_text(static_cast<uint32_t>(i.offset));
+    } else if (i.offset) {
       std::snprintf(b, sizeof b, two ? " offset0:%d" : " offset:%d", i.offset);
       s += b;
     }
