@@ -87,6 +87,37 @@ int main(int argc, char** argv) {
   printf("a launch that forgets it is refused %d\n",
          hipModuleLaunchKernel(dyn, 1, 1, 1, n, 1, 1, 0, stream, args, NULL) != hipSuccess);
 
+  /* Timing what the device did: two events around a launch, and how long
+   * there was between them. Nothing here runs behind the program's back, so
+   * what that measures is the simulator's own time. */
+  hipEvent_t before = NULL, after = NULL, never = NULL, untimed = NULL;
+  CHECK(hipEventCreate(&before));
+  CHECK(hipEventCreate(&after));
+  CHECK(hipEventCreate(&never));
+  CHECK(hipEventCreateWithFlags(&untimed, hipEventDisableTiming));
+  CHECK(hipEventRecord(before, stream));
+  CHECK(hipModuleLaunchKernel(dyn, 8, 1, 1, n, 1, 1, n * sizeof(float), stream, args, NULL));
+  CHECK(hipEventRecord(after, stream));
+  CHECK(hipEventSynchronize(after));
+  float ms = -1.0f;
+  CHECK(hipEventElapsedTime(&ms, before, after));
+  printf("a kernel takes a measurable time %d\n", ms > 0.0f && ms < 60000.0f);
+  printf("an event with nothing recorded has no time %d\n",
+         hipEventElapsedTime(&ms, never, after) != hipSuccess);
+  printf("and neither has one created without timing %d\n",
+         hipEventRecord(untimed, stream) == hipSuccess && hipEventElapsedTime(&ms, untimed, after) != hipSuccess);
+  printf("an event is queried and destroyed %d\n",
+         hipEventQuery(after) == hipSuccess && hipEventDestroy(after) == hipSuccess &&
+             hipEventDestroy(after) != hipSuccess);
+  CHECK(hipEventDestroy(before));
+  CHECK(hipEventDestroy(never));
+  CHECK(hipEventDestroy(untimed));
+
+  hipStream_t other = NULL;
+  CHECK(hipStreamCreateWithFlags(&other, hipStreamNonBlocking));
+  printf("a stream is created with the flags it asked for %d\n", other != stream);
+  CHECK(hipStreamDestroy(other));
+
   CHECK(hipStreamDestroy(stream));
   CHECK(hipModuleUnload(module));
 

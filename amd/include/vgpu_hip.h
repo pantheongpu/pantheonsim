@@ -40,7 +40,9 @@ typedef enum hipError_t {
   hipErrorInvalidImage = 200,
   hipErrorInvalidContext = 201,
   hipErrorFileNotFound = 301,
+  hipErrorInvalidHandle = 400,
   hipErrorNotFound = 500,
+  hipErrorNotReady = 600,
   hipErrorNotSupported = 801,
   hipErrorUnknown = 999,
 } hipError_t;
@@ -56,6 +58,7 @@ typedef enum hipMemcpyKind {
 typedef struct ihipModule_t* hipModule_t;
 typedef struct ihipModuleSymbol_t* hipFunction_t;
 typedef struct ihipStream_t* hipStream_t;
+typedef struct ihipEvent_t* hipEvent_t;
 typedef int hipDevice_t;
 
 /* What hipModuleLaunchKernel takes in `extra`, as HIP documents it: the
@@ -116,8 +119,24 @@ hipError_t hipGetLastError(void);
 hipError_t hipPeekAtLastError(void);
 int hipGetStreamDeviceId(hipStream_t stream);
 hipError_t hipStreamCreate(hipStream_t* stream);
+hipError_t hipStreamCreateWithFlags(hipStream_t* stream, unsigned int flags);
 hipError_t hipStreamDestroy(hipStream_t stream);
 hipError_t hipStreamSynchronize(hipStream_t stream);
+/* Events, which a program uses to time what the device did. */
+#define hipEventDefault 0x0
+#define hipEventBlockingSync 0x1
+#define hipEventDisableTiming 0x2
+#define hipStreamDefault 0x0
+#define hipStreamNonBlocking 0x1
+
+hipError_t hipEventCreate(hipEvent_t* event);
+hipError_t hipEventCreateWithFlags(hipEvent_t* event, unsigned int flags);
+hipError_t hipEventDestroy(hipEvent_t event);
+hipError_t hipEventRecord(hipEvent_t event, hipStream_t stream);
+hipError_t hipEventSynchronize(hipEvent_t event);
+hipError_t hipEventQuery(hipEvent_t event);
+hipError_t hipEventElapsedTime(float* ms, hipEvent_t start, hipEvent_t end);
+
 hipError_t hipRuntimeGetVersion(int* version);
 hipError_t hipDriverGetVersion(int* version);
 
