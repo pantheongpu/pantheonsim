@@ -958,6 +958,16 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# stmatrix: where the warp's registers land in shared memory, and that it is the
+# inverse of ldmatrix. Needs a toolkit that assembles sm_90; skips otherwise.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_stmatrix COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_stmatrix.sh)
+  set_tests_properties(e2e_stmatrix PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # Memory a graph owns: an allocation node, a free node, what the graph-memory
 # attributes report, and a trim that keeps the address it documents as fixed.
 if(TARGET vgpucudart)

@@ -815,6 +815,7 @@ class Interpreter {
         std::holds_alternative<OpAtom>(ins.op) || std::holds_alternative<OpCpAsync>(ins.op) ||
         std::holds_alternative<OpCpAsyncGroup>(ins.op) ||
         std::holds_alternative<OpLdMatrix>(ins.op) ||
+        std::holds_alternative<OpStMatrix>(ins.op) ||
         std::holds_alternative<OpWmmaStore>(ins.op) ||
         std::holds_alternative<OpLdSlot>(ins.op) || std::holds_alternative<OpStSlot>(ins.op))
       return InstClass::Memory;
@@ -1078,6 +1079,11 @@ class Interpreter {
 
   // Widens a 32-bit register into the 64-bit operand form. A small rotating
   // set of buffers keeps several operands of one instruction alive at once.
+  // The returned reference lives in a small rotating ring, so it stays valid
+  // only until a few more widening reads have happened. A caller that reads
+  // other operands before using it must take a copy first -- stmatrix reads four
+  // source registers between taking its addresses and storing through them, and
+  // with a reference the fourth read overwrote the addresses.
   const Lanes& widen(Warp& w, const Lanes32& src) {
     Lanes& out = w.widen_scratch[w.widen_next];
     w.widen_next = (w.widen_next + 1) % w.widen_scratch.size();
@@ -1954,6 +1960,10 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpLdMatrix>(&ins.op)) {
       exec_ldmatrix(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpStMatrix>(&ins.op)) {
+      exec_stmatrix(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpMovMatrix>(&ins.op)) {
@@ -3074,6 +3084,49 @@ class Interpreter {
           r[lane] = (static_cast<uint64_t>(hi) << 16) | lo;
         }
       write_reg(w, op.dsts[mat], m, r, 32);
+    }
+  }
+
+  // stmatrix: the inverse. Every lane hands over two consecutive 16-bit elements
+  // of one row, the warp reassembles each 8x8 matrix, and row r of matrix i goes
+  // to the address supplied by lane i*8+r -- the same lanes that would have
+  // supplied it to ldmatrix, so a fragment loaded by one can be stored by the
+  // other and land where it started.
+  void exec_stmatrix(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpStMatrix& op, Mask m) {
+    Lanes _s_base;
+    // A copy, not a reference: reading the source registers below goes through
+    // the widening ring, which would overwrite the addresses in place.
+    const Lanes base = addr_base(w, ctx, ins, op.addr, _s_base);
+    // Same reasoning as ldmatrix: with ".shared" the register is a bare offset
+    // into the window, without it cvta has already made it an address.
+    const uint64_t window = op.shared_space ? space_base(Space::Shared) : 0;
+    for (uint32_t mat = 0; mat < op.count; ++mat) {
+      Lanes _s_val;
+      const Lanes& val = read_operand(w, ctx, ins, op.srcs[mat], _s_val);
+      // Put the matrix back together from what the lanes hold.
+      uint16_t tile[8][8] = {};
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        const uint32_t row = lane / 4, colpair = lane % 4;
+        const uint16_t lo = static_cast<uint16_t>(val[lane] & 0xFFFFu);
+        const uint16_t hi = static_cast<uint16_t>((val[lane] >> 16) & 0xFFFFu);
+        if (op.trans) {
+          tile[colpair * 2][row] = lo;
+          tile[colpair * 2 + 1][row] = hi;
+        } else {
+          tile[row][colpair * 2] = lo;
+          tile[row][colpair * 2 + 1] = hi;
+        }
+      }
+      for (uint32_t r = 0; r < 8; ++r) {
+        const uint32_t dst_lane = mat * 8 + r;
+        if (!(m & (Mask{1} << dst_lane)))
+          ctx_fail(ins, static_cast<int>(dst_lane), Err::UnsupportedPtx,
+                   "stmatrix needs every lane that supplies a row address to be active");
+        const uint64_t addr = window + base[dst_lane] + static_cast<uint64_t>(op.addr.offset);
+        for (uint32_t c = 0; c < 8; ++c)
+          store_routed(w, ctx, ins, dst_lane, addr + c * 2, 2, tile[r][c]);
+      }
     }
   }
 
