@@ -170,11 +170,18 @@ target_include_directories(vgpuhip PRIVATE amd/include)
 # The real runtime's identity: a HIP program records SONAME "libamdhip64.so.6"
 # and resolves to this library through LD_LIBRARY_PATH at run time.
 set_target_properties(vgpuhip PROPERTIES OUTPUT_NAME amdhip64 SOVERSION 6 VERSION 6.4)
+# Each HIP function under the version the real library defines it with: a
+# program built by hipcc asks for hipMalloc@hip_4.2, not just hipMalloc.
+target_link_options(vgpuhip PRIVATE "-Wl,--version-script=${CMAKE_SOURCE_DIR}/amd/src/libamdhip64.map")
+set_target_properties(vgpuhip PROPERTIES LINK_DEPENDS "${CMAKE_SOURCE_DIR}/amd/src/libamdhip64.map")
+# ROCm 7 renamed the library libamdhip64.so.7; a program built with it asks for
+# that name, and the loader goes by the file name, so both point here.
 add_custom_command(TARGET vgpuhip POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.6"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.7"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so"
-  COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6)")
+  COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7)")
 
 # ---------------------------------------------------------------------------
 # libvgpucudart: the CUDA *runtime* API shim. Lets unmodified nvcc-compiled
@@ -630,6 +637,8 @@ target_compile_definitions(test_amd_gcn_lds PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOU
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
 target_compile_definitions(test_amd_gcn_idioms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
+vgpu_unit_test(test_amd_hip_abi amd/tests/unit/test_hip_abi.cpp)
+
 vgpu_unit_test(test_amd_gcn_globals amd/tests/unit/test_gcn_globals.cpp)
 target_compile_definitions(test_amd_gcn_globals PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # How a kernel learns the shape of the grid it is part of.
@@ -682,6 +691,14 @@ set_tests_properties(fault_cli PROPERTIES DEPENDS vgpu_cli
 add_test(NAME amd_hip COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip.sh)
 set_tests_properties(amd_hip PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+# A program built by hipcc -- device code inside the executable, chevron
+# launches, the real headers' structures -- run unmodified on the shim.
+add_test(NAME amd_hipcc COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc.sh)
+set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+# The HIP structures against the HIP headers, field by field, where ROCm is installed.
+add_test(NAME amd_hip_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_abi.sh)
+set_tests_properties(amd_hip_abi PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 # The GCN decoder against the real assembler, on a code object built here and now.
 add_test(NAME amd_gcn_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_gcn_disasm.sh)
 set_tests_properties(amd_gcn_disasm PROPERTIES DEPENDS test_amd_gcn

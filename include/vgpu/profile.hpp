@@ -34,6 +34,9 @@ struct Limits {
   uint32_t max_blocks_per_sm = 0;
   uint32_t max_registers_per_thread = 255;
   uint32_t shared_mem_per_sm = 0;
+  // The L2 a program is told the device has, which some size a buffer
+  // against so it does not fit. Zero where the profile does not say.
+  uint64_t l2_cache_bytes = 0;
 };
 
 // Presentation values for monitoring tools (nvidia-smi, rocm-smi, `vgpu smi`).
