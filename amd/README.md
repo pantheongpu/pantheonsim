@@ -73,11 +73,18 @@ compiler did not inline with the return from it.
 
 The memory: global loads and stores and their atomics -- an add, a subtract,
 the logical ones, an exchange and a compare-and-swap, on a 32-bit value, on a
-float and on a pair, each able to give back what it replaced -- LDS and its
-atomics, a work-item's private memory (what a kernel spills into when it runs
+float and on a pair, each able to give back what it replaced -- LDS, a byte,
+a half, a word, two or four at a time, and its atomics on integers and
+floats, a work-item's private memory (what a kernel spills into when it runs
 out of registers) and the accumulation registers (which it spills into
 first), a value read from another lane, and a flat access, whose address says
 for itself whether it means LDS or the device.
+
+Lanes trade values through the LDS unit without touching LDS, too: a lane
+reads the lane an address names, or the lane a swizzle pattern names -- four
+lanes choosing among their own four, or a group of 32 swapped, reversed or
+broadcast. Both read every lane's value before any lane's result is written,
+since the destination may be the register they read.
 
 A lane can also read another lane's register through the cross-lane form,
 within its row of sixteen: the shifts and the rotate, the two mirrors, the
