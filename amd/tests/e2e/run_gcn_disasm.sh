@@ -24,7 +24,7 @@ objdump=${VGPU_LLVM_OBJDUMP:-$(dirname "$(readlink -f "$(command -v "$clang")")"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fail=0
-fixtures="vector_add ops math memory globals grid bytes int64 atomics mixed half calls builtins packed spill crosslane doubles"
+fixtures="vector_add ops math memory globals grid bytes int64 atomics mixed half calls builtins packed spill crosslane doubles narrow"
 expect() {  # expect <name> <expected> <actual>
   if [[ "$3" == "$2" ]]; then echo "ok    $1"; else
     echo "FAIL  $1"; echo "      expected: $2"; echo "      actual:   $3"; fail=1; fi
@@ -35,7 +35,7 @@ expect() {  # expect <name> <expected> <actual>
 cp "$root"/amd/tests/data/*.c "$tmp/"
 # One object of everything the fixtures use, which is the widest set of
 # instructions this has to decode.
-( cd "$tmp" && cat ops.c math.c memory.c globals.c grid.c bytes.c int64.c atomics.c mixed.c half.c calls.c builtins.c packed.c spill.c crosslane.c doubles.c > both.c &&
+( cd "$tmp" && cat ops.c math.c memory.c globals.c grid.c bytes.c int64.c atomics.c mixed.c half.c calls.c builtins.c packed.c spill.c crosslane.c doubles.c narrow.c > both.c &&
   "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx942 -nogpulib -O2 -c both.c -o fresh.o ) 2>"$tmp/clang.err"
 if [[ ! -s "$tmp/fresh.o" ]]; then
   echo "SKIP: this clang could not build for gfx942: $(head -2 "$tmp/clang.err")"; exit 0
