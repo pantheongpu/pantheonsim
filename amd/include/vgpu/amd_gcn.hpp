@@ -19,7 +19,7 @@
 namespace vgpu::amd::gcn {
 
 // The encodings, by the ISA's names for them.
-enum class Enc { Sop1, Sop2, Sopk, Sopc, Sopp, Smem, Vop1, Vop2, Vop3, Vop3p, Vopc, Ds, Flat, Unknown };
+enum class Enc { Sop1, Sop2, Sopk, Sopc, Sopp, Smem, Vop1, Vop2, Vop3, Vop3p, Vopc, Ds, Flat, Mubuf, Unknown };
 const char* enc_name(Enc e);
 
 // Where an operand lives. The ISA numbers scalar registers, vector registers

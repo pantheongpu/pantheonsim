@@ -5,6 +5,7 @@ __pycache__/
 # what a compiler produced, checked in so the tests need no compiler
 # (amd/tests/data/build.sh rebuilds them).
 !amd/tests/data/*.gfx942.o
+!amd/tests/hipcc/*.gfx942.o
 *.so
 compile_commands.json
 .cache/
