@@ -73,7 +73,11 @@ give back what it replaced), LDS and its atomics, a work-item's private memory (
 spills into when it runs out of registers) and the accumulation registers
 (which it spills into first), a value read from another lane,
 and a flat access, whose address says for itself whether it means LDS or the
-device. The source modifiers are applied -- an absolute value, a negation, a
+device. A lane can also read another lane's register through the cross-lane
+form, within its row of sixteen: the shifts and the rotate, the two mirrors,
+the broadcasts that carry a row into the next, and the masks that say which
+lanes are written. The forms that reach across the whole wave are decoded and
+refused, since nothing available here settles which way they carry. The source modifiers are applied -- an absolute value, a negation, a
 clamp of the result -- and so is the sub-dword form, where a 32-bit
 instruction reads a named byte or half of each source, with its sign or
 without, which is how the compiler mixes widths.

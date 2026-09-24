@@ -385,6 +385,58 @@ const char* enc_name(Enc e) {
   return "unknown";
 }
 
+// The second word of a DPP instruction: which lane each lane reads its first
+// source from, which lanes are written, and what happens where the lane to
+// read is not there. The first source's register is in this word too, since
+// the field that would have held it says "DPP" instead.
+Operand read_dpp(Inst& in, uint32_t w1) {
+  in.dpp = true;
+  in.dpp_ctrl = (w1 >> 8) & 0x1FF;
+  in.bound_ctrl = ((w1 >> 19) & 1) != 0;
+  in.bank_mask = static_cast<uint8_t>((w1 >> 24) & 0xF);
+  in.row_mask = static_cast<uint8_t>((w1 >> 28) & 0xF);
+  Operand o;
+  o.kind = OperandKind::Vgpr;
+  o.index = w1 & 0xFF;
+  o.neg = ((w1 >> 20) & 1) != 0;
+  o.abs = ((w1 >> 21) & 1) != 0;
+  return o;
+}
+
+// How the assembler spells a control.
+std::string dpp_control_text(uint32_t ctrl) {
+  char b[64];
+  if (ctrl <= 0xFF) {
+    std::snprintf(b, sizeof b, "quad_perm:[%u,%u,%u,%u]", ctrl & 3, (ctrl >> 2) & 3, (ctrl >> 4) & 3,
+                  (ctrl >> 6) & 3);
+    return b;
+  }
+  if (ctrl >= 0x101 && ctrl <= 0x10F) {
+    std::snprintf(b, sizeof b, "row_shl:%u", ctrl - 0x100);
+    return b;
+  }
+  if (ctrl >= 0x111 && ctrl <= 0x11F) {
+    std::snprintf(b, sizeof b, "row_shr:%u", ctrl - 0x110);
+    return b;
+  }
+  if (ctrl >= 0x121 && ctrl <= 0x12F) {
+    std::snprintf(b, sizeof b, "row_ror:%u", ctrl - 0x120);
+    return b;
+  }
+  switch (ctrl) {
+    case 0x130: return "wave_shl:1";
+    case 0x134: return "wave_rol:1";
+    case 0x138: return "wave_shr:1";
+    case 0x13C: return "wave_ror:1";
+    case 0x140: return "row_mirror";
+    case 0x141: return "row_half_mirror";
+    case 0x142: return "row_bcast:15";
+    case 0x143: return "row_bcast:31";
+    default: break;
+  }
+  throw Error::make(Err::Unsupported, "a DPP control this does not decode yet (", ctrl, ")");
+}
+
 Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
   const uint32_t w0 = word(code, at);
   Inst in;
@@ -454,7 +506,13 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.name = s.name;
     if (s.scalar_dst) in.dst.push_back(sgpr((w0 >> 17) & 0xFF, s.dst_width));
     else in.dst.push_back(vgpr((w0 >> 17) & 0xFF, s.dst_width));
-    in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
+    if ((w0 & 0x1FF) == 250) {   // the first source comes from another lane
+      in.size = 8;
+      in.name = in.name.substr(0, in.name.size() - 4) + "_dpp";
+      in.src.push_back(read_dpp(in, word(code, at + 4)));
+    } else {
+      in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
+    }
   } else if ((w0 >> 25) == 0x3e) {    // VOPC
     in.enc = Enc::Vopc;
     in.opcode = (w0 >> 17) & 0xFF;
@@ -640,6 +698,16 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     // The short forms of the carry arithmetic write VCC beside their result,
     // which the encoding does not spell out and the assembler does.
     if (carry_out) in.dst.push_back(vcc());
+    if ((w0 & 0x1FF) == 250) {   // the first source comes from another lane
+      in.size = 8;
+      in.name = in.name.substr(0, in.name.size() - 4) + "_dpp";
+      in.src.push_back(read_dpp(in, word(code, at + 4)));
+      in.src.push_back(vgpr((w0 >> 9) & 0xFF, s.src_width(1)));
+      if (carry_out || in.name.rfind("v_cndmask", 0) == 0)
+        throw Error::make(Err::Unsupported, in.name,
+                          " reads a lane of its own beside writing VCC, which this does not decode yet");
+      return in;
+    }
     in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
     // v_fmamk_f32 carries a constant of its own, which sits between the two
     // sources rather than taking one of their places.
@@ -731,6 +799,12 @@ std::string to_text(const Inst& i) {
   for (size_t k = 0; k < i.src.size(); ++k) {
     s += sep + (scratch_no_addr && k == 0 ? "off" : operand_text(i.src[k]));
     sep = ", ";
+  }
+  if (i.dpp) {
+    char m[64];
+    std::snprintf(m, sizeof m, " row_mask:0x%x bank_mask:0x%x", i.row_mask, i.bank_mask);
+    s += " " + dpp_control_text(i.dpp_ctrl) + m;
+    if (i.bound_ctrl) s += " bound_ctrl:1";
   }
   if (i.enc == Enc::Vop3p) {
     // The assembler prints these only where they are not the plain
