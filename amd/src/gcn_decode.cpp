@@ -35,6 +35,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop1, 0x11}, {"s_ff1_i32_b64", 1, 1, 2}},
       // Where the wave is: what a kernel adds a constant to, to reach a global.
       {{Enc::Sop1, 0x1c}, {"s_getpc_b64", 2, 0}},
+      // A call, and the return from it: one saves where to come back to
+      // while it jumps, the other jumps back.
+      {{Enc::Sop1, 0x1d}, {"s_setpc_b64", 0, 1, 2}},
+      {{Enc::Sop1, 0x1e}, {"s_swappc_b64", 2, 1, 2}},
       {{Enc::Sop1, 0x20}, {"s_and_saveexec_b64", 2, 1, 2}},
       {{Enc::Sop1, 0x23}, {"s_andn2_saveexec_b64", 2, 1, 2}},
       // SOP2: two scalar sources.

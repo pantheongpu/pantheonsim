@@ -289,11 +289,16 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
       if (kind != 10 && kind != 11) continue;
       const auto named = symbol_name.find(sym);
       if (named == symbol_name.end()) continue;
-      const auto found = symbol_at.find(named->second);
-      if (found == symbol_at.end())
+      if (const auto found = symbol_at.find(named->second); found != symbol_at.end()) {
+        out.relocations.push_back({where, found->second, addend, kind == 11, false});
+        continue;
+      }
+      // A call: the symbol is a function in this module's own code.
+      const auto called = code.find(named->second);
+      if (called == code.end())
         throw Error::make(Err::ProfileParse, origin, ": the code refers to ", named->second,
-                          ", which is not a variable this module defines");
-      out.relocations.push_back({where, found->second, addend, kind == 11});
+                          ", which is not a variable or a function this module defines");
+      out.relocations.push_back({where, called->second.first, addend, kind == 11, true});
     }
   }
 
@@ -399,8 +404,10 @@ void place_globals(CodeObject& o, uint64_t base) {
   for (const Relocation& rel : o.relocations) {
     // The address the code needs, relative to the instruction that reads it,
     // which is how a kernel reaches a global: the program counter plus a
-    // constant.
-    const uint64_t symbol = base + rel.symbol;
+    // constant. Where the code reaches another part of itself -- a call --
+    // the distance is the same wherever the module was placed, and the base
+    // does not come into it.
+    const uint64_t symbol = rel.in_text ? o.text_addr + rel.symbol : base + rel.symbol;
     const uint64_t place = o.text_addr + rel.at;
     const uint64_t value = symbol + static_cast<uint64_t>(rel.addend) - place;
     const uint32_t half = static_cast<uint32_t>(rel.high ? value >> 32 : value);
