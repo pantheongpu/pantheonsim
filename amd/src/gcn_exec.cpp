@@ -153,9 +153,17 @@ struct Machine {
     throw Error::make(Err::Internal, "a scalar destination this does not write");
   }
 
+  // ---- Reading a lane of another lane's register ---------------------------
+  //
+  // Set while a cross-lane instruction runs: the operand whose lanes were
+  // shuffled, and what each lane's copy of it came to.
+  const Operand* dpp_operand = nullptr;
+  const std::array<uint32_t, kLanes>* dpp_values = nullptr;
+
   // A source as one lane sees it: a vector register's lane, or the same
   // scalar value for every lane.
   uint32_t lane_src(const Wave& w, const Operand& o, uint32_t lane) const {
+    if (&o == dpp_operand) return (*dpp_values)[lane];
     if (o.kind == OperandKind::Agpr)
       return o.index < w.agpr.size() ? w.agpr[o.index][lane] : 0;   // one never written holds nothing
     const uint32_t v = o.kind == OperandKind::Vgpr ? w.vgpr[o.index][lane] : static_cast<uint32_t>(scalar(w, o));
@@ -496,13 +504,40 @@ struct Machine {
     return true;
   }
 
+  // The same arithmetic, with the first source taken from another lane and
+  // only some of the lanes written. Narrowing EXEC to those lanes is what
+  // keeps the rest of them as they were, since every write here asks EXEC
+  // first.
+  void cross_lane_alu(Wave& w, const Inst& in) {
+    std::array<uint32_t, kLanes> values{};
+    const uint64_t writes = dpp_shuffle(w, in, values);
+    const uint64_t saved = w.exec;
+    dpp_operand = &in.src[0];
+    dpp_values = &values;
+    w.exec = writes;
+    try {
+      vector_alu(w, in);
+    } catch (...) {
+      w.exec = saved;
+      dpp_operand = nullptr;
+      dpp_values = nullptr;
+      throw;
+    }
+    w.exec = saved;
+    dpp_operand = nullptr;
+    dpp_values = nullptr;
+  }
+
   void vector_alu(Wave& w, const Inst& in) {
     // The sub-dword form of an instruction does what the short form does,
-    // over the part of each register it names, so it is the same arithmetic
-    // under the name the short form has.
-    const std::string sdwa_as_short =
-        in.sdwa ? in.name.substr(0, in.name.size() - 5) + "_e32" : std::string();
-    const std::string& op = in.sdwa ? sdwa_as_short : in.name;
+    // over the part of each register it names, and the cross-lane form does
+    // it over the lanes it named, so both are the same arithmetic under the
+    // name the short form has.
+    const std::string as_short =
+        in.sdwa   ? in.name.substr(0, in.name.size() - 5) + "_e32"
+        : in.dpp  ? in.name.substr(0, in.name.size() - 4) + "_e32"
+                  : std::string();
+    const std::string& op = in.sdwa || in.dpp ? as_short : in.name;
     // A sub-dword instruction that writes only part of its destination is
     // refused: every one the compiler has been seen to emit writes all of it,
     // and guessing at the rest would give a wrong answer with nothing to show
@@ -1119,6 +1154,80 @@ struct Machine {
     }
   }
 
+  // Which lane a lane reads its first source from, when the instruction says
+  // another lane's. A row is sixteen lanes and a bank is four of those; a
+  // shift, a rotate or a mirror stays inside its row, and the two broadcasts
+  // carry the last lane of a row into the rows above it. False where there is
+  // no such lane.
+  //
+  // The direction is not a guess: the sequence a wave adds itself up with
+  // shifts by one, two, four and eight and ends with the total in the last
+  // lane, which only comes out if each lane reads the lane below it.
+  static bool dpp_source(uint32_t ctrl, uint32_t lane, uint32_t* from) {
+    const uint32_t row = lane & ~15u, in_row = lane & 15u;
+    if (ctrl <= 0xFF) {   // four lanes choosing among their own four
+      *from = (lane & ~3u) + ((ctrl >> (2 * (lane & 3))) & 3);
+      return true;
+    }
+    if (ctrl >= 0x101 && ctrl <= 0x10F) {   // row_shl: the lane above
+      const uint32_t n = ctrl - 0x100;
+      if (in_row + n > 15) return false;
+      *from = row + in_row + n;
+      return true;
+    }
+    if (ctrl >= 0x111 && ctrl <= 0x11F) {   // row_shr: the lane below
+      const uint32_t n = ctrl - 0x110;
+      if (n > in_row) return false;
+      *from = row + in_row - n;
+      return true;
+    }
+    if (ctrl >= 0x121 && ctrl <= 0x12F) {   // row_ror: the same, wrapping
+      const uint32_t n = ctrl - 0x120;
+      *from = row + ((in_row + 16 - n) & 15);
+      return true;
+    }
+    if (ctrl == 0x140) {   // the row reversed
+      *from = row + (15 - in_row);
+      return true;
+    }
+    if (ctrl == 0x141) {   // each half of the row reversed
+      *from = (lane & ~7u) + (7 - (lane & 7));
+      return true;
+    }
+    if (ctrl == 0x142) {   // the last lane of the row below
+      if (lane < 16) return false;
+      *from = row - 1;
+      return true;
+    }
+    if (ctrl == 0x143) {   // the last lane of the half of the wave below
+      if (lane < 32) return false;
+      *from = (lane & ~31u) - 1;
+      return true;
+    }
+    throw Error::make(Err::Unsupported, "a cross-lane instruction reading across the whole wave rather than "
+                                        "within a row, which this decodes but does not model");
+  }
+
+  // What each lane's first source comes to, and which lanes the instruction
+  // writes at all: a row and a bank mask say which, and bound_ctrl says
+  // whether a lane with no lane to read gets a zero or is left alone.
+  uint64_t dpp_shuffle(const Wave& w, const Inst& in, std::array<uint32_t, kLanes>& values) {
+    const Operand& o = in.src[0];
+    uint64_t writes = 0;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      values[lane] = 0;
+      if (!(w.exec >> lane & 1)) continue;
+      if (!((in.row_mask >> (lane >> 4)) & 1)) continue;
+      if (!((in.bank_mask >> ((lane >> 2) & 3)) & 1)) continue;
+      uint32_t from = 0;
+      const bool there = dpp_source(in.dpp_ctrl, lane, &from) && ((w.exec >> from) & 1);
+      if (!there && !in.bound_ctrl) continue;   // nothing to read, and nothing written
+      values[lane] = there ? w.vgpr[o.index][from] : 0u;
+      writes |= uint64_t{1} << lane;
+    }
+    return writes;
+  }
+
   // Runs one instruction. Returns false when the wave has stopped or parked
   // at a barrier, so the group can run another wave.
   bool step(Wave& w, Group& g) {
@@ -1145,6 +1254,7 @@ struct Machine {
         // A comparison in its long form is still a comparison: it writes a
         // mask of the lanes that passed, not a value per lane.
         if (in.name.rfind("v_cmp_", 0) == 0) compare(w, in);
+        else if (in.dpp) cross_lane_alu(w, in);
         else vector_alu(w, in);
         return true;
       case gcn::Enc::Vopc:

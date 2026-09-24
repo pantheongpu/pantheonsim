@@ -77,6 +77,15 @@ struct Inst {
   // the low register, which is how a single value is used by both.
   uint8_t op_sel = 0;
   uint8_t op_sel_hi = 7;
+  // DPP: the instruction reads its first source from another lane. The
+  // control says which lane, the two masks say which lanes are written at
+  // all, and bound_ctrl says what a lane gets when the lane it would read
+  // is not there -- zero, or nothing written.
+  bool dpp = false;
+  uint32_t dpp_ctrl = 0;
+  uint8_t row_mask = 0xF;
+  uint8_t bank_mask = 0xF;
+  bool bound_ctrl = false;
   bool sdwa = false;
   uint8_t dst_sel = 6;
   uint8_t dst_unused = 0;   // 0 pads the rest with zeroes, 1 with the sign, 2 keeps it
