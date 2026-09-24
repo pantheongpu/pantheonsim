@@ -1,0 +1,105 @@
+/* The symbol versions libamdhip64 defines, as ROCm 7.1's own library defines them.
+ *
+ * A program built by hipcc binds each HIP call to a version as well as a name --
+ * hipMalloc@hip_4.2, hipGetDevicePropertiesR0600@hip_6.0 -- and the loader refuses
+ * a library that defines the name under any other. So each function here sits in
+ * the version the real library gives it. The whole chain of versions is declared
+ * even where no function here belongs to one, so a program asking for any of them
+ * finds it. Everything that is not HIP's own API stays local to the library.
+ *
+ * Regenerate with amd/tools/hip-version-script.py when a function is added. */
+
+hip_4.2 {
+  global:
+    __hipPopCallConfiguration;
+    __hipPushCallConfiguration;
+    __hipRegisterFatBinary;
+    __hipRegisterFunction;
+    __hipUnregisterFatBinary;
+    hipDeviceCanAccessPeer;
+    hipDeviceEnablePeerAccess;
+    hipDeviceGet;
+    hipDeviceGetName;
+    hipDeviceReset;
+    hipDeviceSynchronize;
+    hipDeviceTotalMem;
+    hipDriverGetVersion;
+    hipEventCreate;
+    hipEventCreateWithFlags;
+    hipEventDestroy;
+    hipEventElapsedTime;
+    hipEventQuery;
+    hipEventRecord;
+    hipEventSynchronize;
+    hipFree;
+    hipGetDevice;
+    hipGetDeviceCount;
+    hipGetDeviceProperties;
+    hipGetErrorName;
+    hipGetErrorString;
+    hipGetLastError;
+    hipGetStreamDeviceId;
+    hipHostFree;
+    hipHostMalloc;
+    hipInit;
+    hipLaunchKernel;
+    hipMalloc;
+    hipMemGetInfo;
+    hipMemcpy;
+    hipMemcpyAsync;
+    hipMemcpyPeerAsync;
+    hipMemset;
+    hipMemsetAsync;
+    hipModuleGetFunction;
+    hipModuleGetGlobal;
+    hipModuleLaunchKernel;
+    hipModuleLoad;
+    hipModuleLoadData;
+    hipModuleUnload;
+    hipPeekAtLastError;
+    hipRuntimeGetVersion;
+    hipSetDevice;
+    hipSetDeviceFlags;
+    hipStreamCreate;
+    hipStreamCreateWithFlags;
+    hipStreamDestroy;
+    hipStreamSynchronize;
+  local: *;
+};
+hip_4.3 {
+  global:
+    hipGraphDestroy;
+    hipGraphExecDestroy;
+    hipGraphInstantiate;
+    hipGraphLaunch;
+    hipStreamBeginCapture;
+    hipStreamEndCapture;
+} hip_4.2;
+hip_4.4 {
+} hip_4.3;
+hip_4.5 {
+} hip_4.4;
+hip_5.0 {
+} hip_4.5;
+hip_5.1 {
+} hip_5.0;
+hip_5.2 {
+} hip_5.1;
+hip_5.3 {
+} hip_5.2;
+hip_5.5 {
+} hip_5.3;
+hip_5.6 {
+} hip_5.5;
+hip_6.0 {
+  global:
+    hipGetDevicePropertiesR0600;
+} hip_5.6;
+hip_6.1 {
+} hip_6.0;
+hip_6.2 {
+} hip_6.1;
+hip_6.4 {
+} hip_6.2;
+hip_6.5 {
+} hip_6.4;
