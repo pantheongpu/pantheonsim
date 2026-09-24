@@ -51,36 +51,44 @@ call returns. The kernel-launch syntax `hipcc` compiles
 program uses the module API.
 
 The instructions implemented are those clang emits for the kernels in
-`tests/data/`: scalar and vector integer arithmetic, the logical and shift
-ops, 32- and 64-bit values (a 64-bit add is the compiler's: the low halves,
-a mask of the lanes that carried, and the high halves with it added back),
-the bytes and shorts a kernel loads, computes on
-and stores back (and the 16-bit arithmetic it gets for them, whose result is
-the low half of a register with the high half zeroed, which is why the
-compiler leaves out the mask a widening would otherwise need), single and
-double precision (add, multiply, fma,
-min, max and the sequence a division compiles to), half precision, one value at a time and packed two to a register, two floats
-packed into a register pair,
-conversions, the transcendentals, the rounding functions, the sine and the cosine (whose
-argument is a turn rather than a radian, which is why the compiler multiplies
-by one over two pi first), bit counting, comparisons in both their
-forms and the class test, `v_cndmask`, the lane-counting ops, scalar and EXEC
-branches, a call to a function the compiler did not inline and the return
-from it, and the memory a kernel uses: global loads and stores and their
-atomics (an add, a subtract, the logical ones, an exchange and a
-compare-and-swap, on a 32-bit value, on a float and on a pair, each able to
-give back what it replaced), LDS and its atomics, a work-item's private memory (what a kernel
-spills into when it runs out of registers) and the accumulation registers
-(which it spills into first), a value read from another lane,
-and a flat access, whose address says for itself whether it means LDS or the
-device. A lane can also read another lane's register through the cross-lane
-form, within its row of sixteen: the shifts and the rotate, the two mirrors,
-the broadcasts that carry a row into the next, and the masks that say which
-lanes are written. The forms that reach across the whole wave are decoded and
-refused, since nothing available here settles which way they carry. The source modifiers are applied -- an absolute value, a negation, a
-clamp of the result -- and so is the sub-dword form, where a 32-bit
-instruction reads a named byte or half of each source, with its sign or
-without, which is how the compiler mixes widths.
+`tests/data/`.
+
+The arithmetic: scalar and vector integers, the logical and shift ops, and
+values of every width a kernel uses. A 64-bit add is the compiler's own --
+the low halves, a mask of the lanes that carried, and the high halves with it
+added back. Bytes and shorts are loaded, computed on and stored back, and the
+16-bit arithmetic they get writes the low half of a register and zeroes the
+high half, which is why the compiler leaves out the mask a widening would
+otherwise need. Single and double precision have their add, multiply, fma,
+min and max, the sequence a division compiles to, the roundings, the
+comparisons and the conversions between them. Half precision comes both one
+value at a time and packed two to a register, and two floats pack into a
+register pair. Beside those: the transcendentals, the sine and the cosine
+(whose argument is a turn rather than a radian, which is why the compiler
+multiplies by one over two pi first), bit counting, the comparisons in both
+their forms and the class test, `v_cndmask`, and the lane-counting ops.
+
+The control flow: scalar and EXEC branches, and a call to a function the
+compiler did not inline with the return from it.
+
+The memory: global loads and stores and their atomics -- an add, a subtract,
+the logical ones, an exchange and a compare-and-swap, on a 32-bit value, on a
+float and on a pair, each able to give back what it replaced -- LDS and its
+atomics, a work-item's private memory (what a kernel spills into when it runs
+out of registers) and the accumulation registers (which it spills into
+first), a value read from another lane, and a flat access, whose address says
+for itself whether it means LDS or the device.
+
+A lane can also read another lane's register through the cross-lane form,
+within its row of sixteen: the shifts and the rotate, the two mirrors, the
+broadcasts that carry a row into the next, and the masks that say which lanes
+are written. The forms that reach across the whole wave are decoded and
+refused, since nothing available here settles which way they carry.
+
+The source modifiers are applied -- an absolute value, a negation, a clamp of
+the result -- and so is the sub-dword form, where a 32-bit instruction reads
+a named byte or half of each source, with its sign or without, which is how
+the compiler mixes widths.
 
 Any other instruction is refused by name, and so is anything this does not
 model: an output multiplier, a packed operation that shuffles halves. A wrong

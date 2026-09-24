@@ -32,6 +32,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // SOP1: one scalar source, one scalar destination.
       {{Enc::Sop1, 0x00}, {"s_mov_b32", 1, 1}},
       {{Enc::Sop1, 0x01}, {"s_mov_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x08}, {"s_brev_b32", 1, 1}},
       {{Enc::Sop1, 0x11}, {"s_ff1_i32_b64", 1, 1, 2}},
       // Where the wave is: what a kernel adds a constant to, to reach a global.
       {{Enc::Sop1, 0x1c}, {"s_getpc_b64", 2, 0}},
@@ -103,10 +104,18 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x007}, {"v_cvt_u32_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x008}, {"v_cvt_i32_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x003}, {"v_cvt_i32_f64_e32", 1, 1, 2}},
+      {{Enc::Vop1, 0x004}, {"v_cvt_f64_i32_e32", 2, 1, 1}},
       {{Enc::Vop1, 0x00a}, {"v_cvt_f16_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x00b}, {"v_cvt_f32_f16_e32", 1, 1}},
       {{Enc::Vop1, 0x00f}, {"v_cvt_f32_f64_e32", 1, 1, 2}},
       {{Enc::Vop1, 0x01c}, {"v_trunc_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x010}, {"v_cvt_f64_f32_e32", 2, 1, 1}},
+      {{Enc::Vop1, 0x016}, {"v_cvt_f64_u32_e32", 2, 1, 1}},
+      // The same rounding over a double, which a register pair holds.
+      {{Enc::Vop1, 0x017}, {"v_trunc_f64_e32", 2, 1, 2}},
+      {{Enc::Vop1, 0x018}, {"v_ceil_f64_e32", 2, 1, 2}},
+      {{Enc::Vop1, 0x019}, {"v_rndne_f64_e32", 2, 1, 2}},
+      {{Enc::Vop1, 0x01a}, {"v_floor_f64_e32", 2, 1, 2}},
       {{Enc::Vop1, 0x01d}, {"v_ceil_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x01e}, {"v_rndne_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x01f}, {"v_floor_f32_e32", 1, 1}},
@@ -115,6 +124,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x022}, {"v_rcp_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x023}, {"v_rcp_iflag_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x025}, {"v_rcp_f64_e32", 2, 1, 2}},
+      {{Enc::Vop1, 0x026}, {"v_rsq_f64_e32", 2, 1, 2}},
       {{Enc::Vop1, 0x027}, {"v_sqrt_f32_e32", 1, 1}},
       // The sine and the cosine of a turn: the argument is in turns, not
       // radians, which is why the compiler multiplies by 1/2pi first.
@@ -159,12 +169,19 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // A class test: the second source is a mask of the kinds of float
       // (NaN, infinity, normal, denormal, zero, each with a sign) it asks about.
       {{Enc::Vopc, 0x010}, {"v_cmp_class_f32_e32", 2, 2}},
+      {{Enc::Vopc, 0x012}, {"v_cmp_class_f64_e32", 2, 2, 2, 1}},
       {{Enc::Vopc, 0x021}, {"v_cmp_lt_f16_e32", 2, 2}},
       {{Enc::Vopc, 0x022}, {"v_cmp_eq_f16_e32", 2, 2}},
       {{Enc::Vopc, 0x024}, {"v_cmp_gt_f16_e32", 2, 2}},
       {{Enc::Vopc, 0x026}, {"v_cmp_ge_f16_e32", 2, 2}},
       {{Enc::Vopc, 0x02b}, {"v_cmp_ngt_f16_e32", 2, 2}},
       {{Enc::Vopc, 0x02d}, {"v_cmp_neq_f16_e32", 2, 2}},
+      // The comparisons over a double.
+      {{Enc::Vopc, 0x061}, {"v_cmp_lt_f64_e32", 2, 2, 2, 2}},
+      {{Enc::Vopc, 0x062}, {"v_cmp_eq_f64_e32", 2, 2, 2, 2}},
+      {{Enc::Vopc, 0x064}, {"v_cmp_gt_f64_e32", 2, 2, 2, 2}},
+      {{Enc::Vopc, 0x066}, {"v_cmp_ge_f64_e32", 2, 2, 2, 2}},
+      {{Enc::Vopc, 0x06d}, {"v_cmp_neq_f64_e32", 2, 2, 2, 2}},
       {{Enc::Vopc, 0x041}, {"v_cmp_lt_f32_e32", 2, 2}},
       {{Enc::Vopc, 0x044}, {"v_cmp_gt_f32_e32", 2, 2}},
       {{Enc::Vopc, 0x046}, {"v_cmp_ge_f32_e32", 2, 2}},
@@ -219,6 +236,9 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x208}, {"v_lshl_add_u64", 2, 3, 2, 1, 2}},
       {{Enc::Vop3, 0x280}, {"v_add_f64", 2, 2, 2, 2}},
       {{Enc::Vop3, 0x281}, {"v_mul_f64", 2, 2, 2, 2}},
+      {{Enc::Vop3, 0x282}, {"v_min_f64", 2, 2, 2, 2}},
+      {{Enc::Vop3, 0x283}, {"v_max_f64", 2, 2, 2, 2}},
+      {{Enc::Vop3, 0x284}, {"v_ldexp_f64", 2, 2, 2, 1}},
       {{Enc::Vop3, 0x285}, {"v_mul_lo_u32", 1, 2}},
       {{Enc::Vop3, 0x286}, {"v_mul_hi_u32", 1, 2}},
       {{Enc::Vop3, 0x287}, {"v_mul_hi_i32", 1, 2}},

@@ -59,7 +59,8 @@ uint16_t as_bits(_Float16 h) {
 }
 
 // The kinds of float v_cmp_class asks about, one bit each, in the ISA's order.
-bool matches_class(float f, uint32_t mask) {
+template <typename T>
+bool matches_class(T f, uint32_t mask) {
   const bool negative = std::signbit(f);
   uint32_t bit = 0;
   if (std::isnan(f)) bit = 1u << 1;                       // a quiet NaN; nothing here signals
@@ -343,6 +344,12 @@ struct Machine {
       w.pc = to;
     } else if (op == "s_setpc_b64") {
       w.pc = scalar(w, in.src[0]);   // the return
+    } else if (op == "s_brev_b32") {
+      uint32_t v = static_cast<uint32_t>(a), r = 0;
+      for (uint32_t k = 0; k < 32; ++k) r |= ((v >> k) & 1) << (31 - k);
+      write_scalar(w, in.dst[0], r);
+      // A bit reversal sets no condition code, as the move it is a form of
+      // does not.
     } else if (op == "s_andn2_saveexec_b64") {
       // The other half of a divergence: keep EXEC, and take the lanes the
       // condition did not.
@@ -619,6 +626,33 @@ struct Machine {
                                          lane_src(w, in.src[2], lane)));
       } else if (op == "v_accvgpr_read_b32" || op == "v_accvgpr_write_b32") {
         write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane));
+      } else if (op == "v_cvt_f64_f32_e32") {
+        write_lane64(w, in.dst[0], lane, as_bits(static_cast<double>(lane_float(w, in.src[0], lane))));
+      } else if (op == "v_cvt_f64_i32_e32") {
+        write_lane64(w, in.dst[0], lane,
+                     as_bits(static_cast<double>(static_cast<int32_t>(lane_src(w, in.src[0], lane)))));
+      } else if (op == "v_cvt_f64_u32_e32") {
+        write_lane64(w, in.dst[0], lane, as_bits(static_cast<double>(lane_src(w, in.src[0], lane))));
+      } else if (op == "v_trunc_f64_e32") {
+        write_double(w, in, lane, std::trunc(lane_double(w, in.src[0], lane)));
+      } else if (op == "v_ceil_f64_e32") {
+        write_double(w, in, lane, std::ceil(lane_double(w, in.src[0], lane)));
+      } else if (op == "v_floor_f64_e32") {
+        write_double(w, in, lane, std::floor(lane_double(w, in.src[0], lane)));
+      } else if (op == "v_rndne_f64_e32") {
+        write_double(w, in, lane, std::nearbyint(lane_double(w, in.src[0], lane)));
+      } else if (op == "v_rsq_f64_e32") {
+        // As with the reciprocal: the hardware's is a table and this is the
+        // exact one, so the refinement the compiler builds around it lands on
+        // the same answer either way.
+        write_double(w, in, lane, 1.0 / std::sqrt(lane_double(w, in.src[0], lane)));
+      } else if (op == "v_min_f64" || op == "v_max_f64") {
+        const double x = lane_double(w, in.src[0], lane), y = lane_double(w, in.src[1], lane);
+        write_double(w, in, lane, op == "v_min_f64" ? std::fmin(x, y) : std::fmax(x, y));
+      } else if (op == "v_ldexp_f64") {
+        write_double(w, in, lane,
+                     std::ldexp(lane_double(w, in.src[0], lane),
+                                static_cast<int32_t>(lane_src(w, in.src[1], lane))));
       } else if (op == "v_mov_b64_e32") {
         write_lane64(w, in.dst[0], lane, lane_src64(w, in.src[0], lane));
       } else if (op == "v_floor_f32_e32") {
@@ -915,6 +949,17 @@ struct Machine {
         set = lane_float(w, in.src[0], lane) > lane_float(w, in.src[1], lane);
       else if (op == "v_cmp_ge_f32_e32") set = lane_float(w, in.src[0], lane) >= lane_float(w, in.src[1], lane);
       else if (op == "v_cmp_class_f32_e32") set = matches_class(lane_float(w, in.src[0], lane), b);
+      else if (op == "v_cmp_class_f64_e32")
+        set = matches_class(lane_double(w, in.src[0], lane), lane_src(w, in.src[1], lane));
+      else if (op.find("_f64_") != std::string::npos) {
+        const double x = lane_double(w, in.src[0], lane), y = lane_double(w, in.src[1], lane);
+        if (op == "v_cmp_lt_f64_e32") set = x < y;
+        else if (op == "v_cmp_eq_f64_e32") set = x == y;
+        else if (op == "v_cmp_gt_f64_e32") set = x > y;
+        else if (op == "v_cmp_ge_f64_e32") set = x >= y;
+        else if (op == "v_cmp_neq_f64_e32") set = !(x == y);   // a NaN is not equal to itself
+        else throw Error::make(Err::Unsupported, "comparison ", op, " is decoded but not implemented");
+      }
       else if (op.find("_f16_") != std::string::npos) {
         const _Float16 x = lane_half(w, in.src[0], lane), y = lane_half(w, in.src[1], lane);
         if (op == "v_cmp_lt_f16_e32") set = x < y;
