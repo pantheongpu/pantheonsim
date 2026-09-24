@@ -10,7 +10,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 clang=${1:-clang}
-sources="vector_add ops math memory globals grid bytes int64 atomics mixed half calls builtins"
+sources="vector_add ops math memory globals grid bytes int64 atomics mixed half calls builtins packed"
 for src in $sources; do
   "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx942 -nogpulib -O2 -c "$src.c" -o "$src.gfx942.o"
   echo "wrote $(pwd)/$src.gfx942.o"

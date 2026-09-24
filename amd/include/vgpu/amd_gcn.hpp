@@ -67,6 +67,12 @@ struct Inst {
   // SDWA: the instruction reads part of a register rather than all of it,
   // which is how the compiler mixes widths. The destination has the same
   // choice, and says what becomes of the rest of the register.
+  // VOP3P: which half of each source feeds the low result and which feeds the
+  // high one, a bit per source. For the packed float form a "half" is one
+  // register of a pair, and a zero in op_sel_hi means the high result reads
+  // the low register, which is how a single value is used by both.
+  uint8_t op_sel = 0;
+  uint8_t op_sel_hi = 7;
   bool sdwa = false;
   uint8_t dst_sel = 6;
   uint8_t dst_unused = 0;   // 0 pads the rest with zeroes, 1 with the sign, 2 keeps it
