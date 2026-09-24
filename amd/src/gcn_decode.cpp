@@ -275,6 +275,11 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x30}, {"v_pk_fma_f32", 2, 3, 2, 2, 2}},
       {{Enc::Vop3p, 0x32}, {"v_pk_add_f32", 2, 2, 2, 2}},
       {{Enc::Vop3p, 0x31}, {"v_pk_mul_f32", 2, 2, 2, 2}},
+      // Between a vector register and an accumulation register, which is
+      // where a kernel puts what will not fit in the vector ones. They share
+      // the packed forms' encoding without being packed.
+      {{Enc::Vop3p, 0x58}, {"v_accvgpr_read_b32", 1, 1}},
+      {{Enc::Vop3p, 0x59}, {"v_accvgpr_write_b32", 1, 1}},
   };
   return t;
 }
@@ -492,6 +497,11 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
         throw Error::make(Err::Unsupported, in.name, " negates one half only, which this does not model");
       in.src.push_back(o);
     }
+    // The two that move a value to or from an accumulation register: the
+    // encoding numbers those in the vector registers' space, and which bank
+    // is meant is the instruction itself.
+    if (in.name == "v_accvgpr_read_b32") in.src[0].kind = OperandKind::Agpr;
+    if (in.name == "v_accvgpr_write_b32") in.dst[0].kind = OperandKind::Agpr;
   } else if ((w0 >> 26) == 0x34) {    // VOP3
     in.enc = Enc::Vop3;
     in.opcode = (w0 >> 16) & 0x3FF;
@@ -519,6 +529,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       o.abs = (abs >> k) & 1;
       in.src.push_back(o);
     }
+
   } else if ((w0 >> 26) == 0x36) {    // DS
     in.enc = Enc::Ds;
     in.opcode = (w0 >> 17) & 0xFF;
@@ -674,6 +685,7 @@ std::string operand_text(const Operand& o) {
   switch (o.kind) {
     case OperandKind::Sgpr: return wrap(range("s"));
     case OperandKind::Vgpr: return wrap(o.sext ? "sext(" + range("v") + ")" : range("v"));
+    case OperandKind::Agpr: return wrap(range("a"));
     case OperandKind::Vcc: return wrap(o.width >= 2 ? "vcc" : "vcc_lo");
     case OperandKind::Exec: return wrap("exec");
     case OperandKind::ExecLo: return wrap("exec_lo");

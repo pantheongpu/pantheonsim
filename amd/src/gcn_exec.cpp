@@ -3,6 +3,7 @@
 #include <cmath>
 #include <limits>
 #include <cstring>
+#include <array>
 #include <vector>
 
 #include "vgpu/amd_gcn.hpp"
@@ -74,6 +75,9 @@ bool matches_class(float f, uint32_t mask) {
 struct Wave {
   uint32_t sgpr[kSgprs] = {};
   uint32_t vgpr[kVgprs][kLanes] = {};
+  // The accumulation registers: a second bank a kernel keeps values in when
+  // it has more of them than the vector registers hold.
+  std::vector<std::array<uint32_t, kLanes>> agpr;
   uint64_t vcc = 0, exec = 0;
   uint32_t m0 = 0;   // a lane number, where an instruction takes one from it
   bool scc = false;
@@ -152,6 +156,8 @@ struct Machine {
   // A source as one lane sees it: a vector register's lane, or the same
   // scalar value for every lane.
   uint32_t lane_src(const Wave& w, const Operand& o, uint32_t lane) const {
+    if (o.kind == OperandKind::Agpr)
+      return o.index < w.agpr.size() ? w.agpr[o.index][lane] : 0;   // one never written holds nothing
     const uint32_t v = o.kind == OperandKind::Vgpr ? w.vgpr[o.index][lane] : static_cast<uint32_t>(scalar(w, o));
     return o.sel == 6 ? v : selected(v, o.sel, o.sext);
   }
@@ -218,7 +224,20 @@ struct Machine {
     if (in.clamp) v = std::isnan(v) ? 0.0 : std::fmin(1.0, std::fmax(0.0, v));
     write_lane64(w, in.dst[0], lane, as_bits(v));
   }
-  void write_lane(Wave& w, const Operand& o, uint32_t lane, uint32_t v) { w.vgpr[o.index][lane] = v; }
+  // An accumulation register is written the first time a kernel uses one, so
+  // the bank grows to what the kernel actually asked for rather than always
+  // being as large as it could be.
+  static std::array<uint32_t, kLanes>& acc(Wave& w, uint32_t index) {
+    if (index >= kVgprs)
+      throw Error::make(Err::InvalidValue, "an accumulation register numbered ", index, " is past the ", kVgprs,
+                        " a wave has");
+    if (w.agpr.size() <= index) w.agpr.resize(index + 1);
+    return w.agpr[index];
+  }
+  void write_lane(Wave& w, const Operand& o, uint32_t lane, uint32_t v) {
+    if (o.kind == OperandKind::Agpr) acc(w, o.index)[lane] = v;
+    else w.vgpr[o.index][lane] = v;
+  }
   void write_lane64(Wave& w, const Operand& o, uint32_t lane, uint64_t v) {
     w.vgpr[o.index][lane] = static_cast<uint32_t>(v);
     w.vgpr[o.index + 1][lane] = static_cast<uint32_t>(v >> 32);
@@ -563,6 +582,8 @@ struct Machine {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane) +
                                          lane_src(w, in.src[2], lane)));
+      } else if (op == "v_accvgpr_read_b32" || op == "v_accvgpr_write_b32") {
+        write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane));
       } else if (op == "v_mov_b64_e32") {
         write_lane64(w, in.dst[0], lane, lane_src64(w, in.src[0], lane));
       } else if (op == "v_floor_f32_e32") {
