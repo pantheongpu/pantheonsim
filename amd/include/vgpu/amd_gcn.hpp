@@ -24,7 +24,11 @@ const char* enc_name(Enc e);
 
 // Where an operand lives. The ISA numbers scalar registers, vector registers
 // and the inline constants in one 9-bit space; this splits them apart.
-enum class OperandKind { Sgpr, Vgpr, Vcc, Exec, ExecLo, ExecHi, M0, SharedBase, Inline, InlineFloat, Literal, None };
+// Agpr: the accumulation registers, which a kernel with more values than it
+// has vector registers keeps the rest of them in.
+enum class OperandKind {
+  Sgpr, Vgpr, Agpr, Vcc, Exec, ExecLo, ExecHi, M0, SharedBase, Inline, InlineFloat, Literal, None
+};
 struct Operand {
   OperandKind kind = OperandKind::None;
   uint32_t index = 0;    // the register's number
