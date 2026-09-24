@@ -942,6 +942,16 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# The graph node types that are not device work -- a host function, an event
+# recorded and one waited on -- and a node switched off in an instantiated graph.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_graph_nodes COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_nodes.sh)
+  set_tests_properties(e2e_graph_nodes PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # The `vgpu run` wrapper, and the two pre-flight checks that are the reason it
 # exists: a CUDA soname the shim does not carry, and a DT_RPATH that outranks
 # LD_LIBRARY_PATH. Both are silent failures without it.
