@@ -137,6 +137,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x02a}, {"v_cos_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x02c}, {"v_bfrev_b32_e32", 1, 1}},
       {{Enc::Vop1, 0x02d}, {"v_ffbh_u32_e32", 1, 1}},
+      {{Enc::Vop1, 0x033}, {"v_frexp_exp_i32_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x034}, {"v_frexp_mant_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x038}, {"v_mov_b64_e32", 2, 1, 2}},
       {{Enc::Vop2, 0x006}, {"v_mul_i32_i24_e32", 1, 2}},
       {{Enc::Vop2, 0x008}, {"v_mul_u32_u24_e32", 1, 2}},
@@ -170,6 +172,9 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop2, 0x034}, {"v_add_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x035}, {"v_sub_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x036}, {"v_subrev_u32_e32", 1, 2}},
+      // The dot products, which add into their destination as fmac does.
+      {{Enc::Vop2, 0x037}, {"v_dot2c_f32_f16_e32", 1, 2}},
+      {{Enc::Vop2, 0x039}, {"v_dot4c_i32_i8_e32", 1, 2}},
       {{Enc::Vop2, 0x03b}, {"v_fmac_f32_e32", 1, 2}},
       // The float comparisons share their opcodes with the long forms above.
       // A class test: the second source is a mask of the kinds of float
@@ -225,8 +230,11 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x1d1}, {"v_min3_i32", 1, 3}},
       {{Enc::Vop3, 0x1d3}, {"v_max3_f32", 1, 3}},
       {{Enc::Vop3, 0x1d4}, {"v_max3_i32", 1, 3}},
+      {{Enc::Vop3, 0x1d7}, {"v_med3_i32", 1, 3}},
       {{Enc::Vop3, 0x1c9}, {"v_bfe_i32", 1, 3}},
+      {{Enc::Vop3, 0x1ca}, {"v_bfi_b32", 1, 3}},
       {{Enc::Vop3, 0x1cb}, {"v_fma_f32", 1, 3}},
+      {{Enc::Vop3, 0x1ce}, {"v_alignbit_b32", 1, 3}},
       {{Enc::Vop3, 0x1cc}, {"v_fma_f64", 2, 3, 2, 2, 2}},
       {{Enc::Vop3, 0x1de}, {"v_div_fixup_f32", 1, 3}},
       {{Enc::Vop3, 0x1e0}, {"v_div_scale_f32", 1, 3, 1, 1, 1, true}},
@@ -259,6 +267,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x28c}, {"v_mbcnt_lo_u32_b32", 1, 2}},
       {{Enc::Vop3, 0x28d}, {"v_mbcnt_hi_u32_b32", 1, 2}},
       {{Enc::Vop3, 0x28f}, {"v_lshlrev_b64", 2, 2, 1, 2}},
+      {{Enc::Vop3, 0x296}, {"v_cvt_pkrtz_f16_f32", 1, 2}},
       {{Enc::Vop3, 0x291}, {"v_ashrrev_i64", 2, 2, 1, 2}},
       // DS: LDS reads and writes. A read takes the address; a write takes the
       // address and the data.
