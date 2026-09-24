@@ -248,6 +248,27 @@ struct State {
   std::map<void*, HostRange> managed_allocs;
   // What cudaMemAdvise and cudaMemPrefetchAsync were told about them.
   std::map<void*, ManagedAdvice> managed_advice;
+  // cudaDeviceSetLimit, per device, with the defaults CUDA documents or current
+  // devices report. Two of them may not change once a kernel that uses them has
+  // launched on the device, which is what the two flags record.
+  struct DeviceLimits {
+    size_t stack = 1024;
+    size_t printf_fifo = 1u << 20;
+    size_t malloc_heap = 8u << 20;
+    size_t sync_depth = 2;
+    size_t pending_launches = 2048;
+    size_t l2_fetch_granularity = 64;
+    size_t persisting_l2 = 0;
+    bool heap_used = false;     // a kernel that calls malloc() or free() has launched
+    bool printf_used = false;   // a kernel that calls printf() has launched
+  };
+  std::map<int, DeviceLimits> limits;
+  // Which device system calls each kernel makes, found once from its code.
+  struct KernelCalls {
+    bool heap = false;
+    bool printf = false;
+  };
+  std::unordered_map<const vgpu::ptx::EntryFn*, KernelCalls> kernel_calls;
   // cudaHostRegister'd ranges. The memory is the caller's; only the record
   // and the device mapping are ours.
   std::map<void*, HostRange> registered;
@@ -822,6 +843,8 @@ bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, vo
                                      size_t sharedMem, cudaStream_t stream,
                                      const std::vector<uint32_t>& param_sizes);
 bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()> op);
+// Discards a capture in progress on a stream that is being destroyed.
+void vgpu_drop_capture(cudaStream_t stream);
 
 // Defined with the graph machinery. Frees an allocation that a graph's allocation
 // node made, when a program frees it from outside the graph: `*handled` says
@@ -901,6 +924,26 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     cfg.shared_bytes = static_cast<uint32_t>(sharedMem);
     cfg.cooperative = cooperative;
     cfg.cluster = cluster;
+    {
+      // The heap and printf limits stop being settable once a kernel that uses
+      // them has launched on this device, which is decided by what the kernel's
+      // code calls rather than by what one run of it happened to reach.
+      auto& calls = s.kernel_calls;
+      auto kc = calls.find(fn);
+      if (kc == calls.end()) {
+        State::KernelCalls found;
+        for (const auto& ins : fn->body)
+          if (const auto* c = std::get_if<vgpu::ptx::OpCall>(&ins.op)) {
+            if (c->callee == "malloc" || c->callee == "free") found.heap = true;
+            if (c->callee == "vprintf") found.printf = true;
+          }
+        kc = calls.emplace(fn, found).first;
+      }
+      State::DeviceLimits& lim = s.limits[t_current_device];
+      lim.heap_used = lim.heap_used || kc->second.heap;
+      lim.printf_used = lim.printf_used || kc->second.printf;
+      cfg.device_heap_bytes = lim.malloc_heap;
+    }
     if (cooperative) {
       // A cooperative launch promises every block is resident, so the grid has
       // to fit. Hardware refuses a grid that does not, and so does this: a
@@ -1078,6 +1121,7 @@ VGPU_EXPORT cudaError_t cudaDeviceReset(void) {
   // freshly created context.
   for (auto& m : s.modules) m->module_per_device.erase(dev);
   forget_arrays_on(dev);
+  s.limits.erase(dev);   // a fresh context starts from the default limits
   try {
     s.rt->device(dev).reset();
   } catch (const std::exception& e) {
@@ -1635,12 +1679,183 @@ VGPU_EXPORT cudaError_t cudaMemcpy3DPeerAsync(const cudaMemcpy3DPeerParms* p, cu
 /* Streams and events (synchronous / wall-clock)                         */
 /* ===================================================================== */
 
-VGPU_EXPORT cudaError_t cudaStreamCreate(cudaStream_t* s) {
-  if (s) *s = reinterpret_cast<cudaStream_t>(0x1);
+// ---- streams ----------------------------------------------------------------
+//
+// Every stream runs on the same synchronous engine, so what a stream is for here
+// is identity: which one a capture is recording, and what a program is told
+// when it asks about one. Every cudaStreamCreate used to return the same handle
+// -- 0x1, which is cudaStreamLegacy -- so two streams compared equal, a capture
+// begun on one captured the work sent to every other, and a kernel launched on
+// a second stream during a capture never ran: it was recorded into the first
+// stream's graph instead. A stream is a record now, and its address is its
+// handle.
+//
+// The default streams have no record: 0 and cudaStreamLegacy are the legacy
+// stream, and cudaStreamPerThread is each thread's own. A handle this runtime
+// did not create may be a stream the driver API made, which this library cannot
+// see, so it is answered the way every stream here behaves -- the defaults --
+// rather than refused.
+struct RtStream {
+  unsigned flags = cudaStreamDefault;
+  int priority = 0;
+  int device = 0;
+  unsigned long long id = 0;
+  // Attributes a program set on the stream. Access-policy windows and memory
+  // synchronisation domains are performance policy for hardware this does not
+  // model, and a set attribute reads back as what was set, which is the
+  // contract; the priority attribute is the stream's priority.
+  std::map<int, cudaStreamAttrValue> attrs;
+};
+
+std::mutex g_stream_mu;
+std::unordered_map<void*, std::unique_ptr<RtStream>> g_streams;
+// Ids are never reused, and start well above any small integer so an id cannot
+// be mistaken for the handle of a stream the driver API made.
+std::atomic<unsigned long long> g_next_stream_id{1ull << 32};
+constexpr unsigned long long kLegacyStreamId = 1;
+
+bool is_default_stream(cudaStream_t s) {
+  return s == nullptr || s == cudaStreamLegacy || s == cudaStreamPerThread;
+}
+
+// The record for a stream this runtime created, or nullptr. Caller holds
+// g_stream_mu.
+RtStream* stream_record(cudaStream_t s) {
+  const auto it = g_streams.find(static_cast<void*>(s));
+  return it == g_streams.end() ? nullptr : it->second.get();
+}
+
+// Each thread's per-thread default stream is its own stream, so it has its own
+// id, taken the first time the thread asks.
+unsigned long long per_thread_stream_id() {
+  thread_local unsigned long long id = g_next_stream_id.fetch_add(1);
+  return id;
+}
+
+// Priorities are clamped to the device's range, as CUDA documents. The range
+// here is a single level, so every stream gets it.
+int clamp_priority(int p) {
+  int least = 0, greatest = 0;
+  cudaDeviceGetStreamPriorityRange(&least, &greatest);
+  return std::min(std::max(p, greatest), least);
+}
+
+cudaError_t create_stream(cudaStream_t* out, unsigned flags, int priority) {
+  if (!out) return cudaErrorInvalidValue;
+  if (flags & ~static_cast<unsigned>(cudaStreamNonBlocking)) return cudaErrorInvalidValue;
+  auto rec = std::make_unique<RtStream>();
+  rec->flags = flags;
+  rec->priority = clamp_priority(priority);
+  rec->device = t_current_device;
+  rec->id = g_next_stream_id.fetch_add(1);
+  void* handle = rec.get();
+  {
+    std::lock_guard<std::mutex> lock(g_stream_mu);
+    g_streams[handle] = std::move(rec);
+  }
+  *out = static_cast<cudaStream_t>(handle);
   return cudaSuccess;
 }
-VGPU_EXPORT cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned int) {
-  return cudaStreamCreate(s);
+
+VGPU_EXPORT cudaError_t cudaStreamCreate(cudaStream_t* s) {
+  return create_stream(s, cudaStreamDefault, 0);
+}
+VGPU_EXPORT cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned int flags) {
+  return create_stream(s, flags, 0);
+}
+
+VGPU_EXPORT cudaError_t cudaStreamGetFlags(cudaStream_t stream, unsigned int* flags) {
+  if (!flags) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_stream_mu);
+  const RtStream* r = stream_record(stream);
+  *flags = r ? r->flags : cudaStreamDefault;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaStreamGetDevice(cudaStream_t stream, int* device) {
+  if (!device) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_stream_mu);
+  const RtStream* r = stream_record(stream);
+  // A stream belongs to the device that was current when it was made; the
+  // default streams, and streams this runtime did not make, to the current one.
+  *device = r ? r->device : t_current_device;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaStreamGetId(cudaStream_t stream, unsigned long long* id) {
+  if (!id) return cudaErrorInvalidValue;
+  if (stream == nullptr || stream == cudaStreamLegacy) {
+    *id = kLegacyStreamId;
+    return cudaSuccess;
+  }
+  if (stream == cudaStreamPerThread) {
+    *id = per_thread_stream_id();
+    return cudaSuccess;
+  }
+  std::lock_guard<std::mutex> lock(g_stream_mu);
+  const RtStream* r = stream_record(stream);
+  // A stream the driver API made is known here only by its handle, which is
+  // unique among live streams and below every id this runtime hands out.
+  *id = r ? r->id : reinterpret_cast<uintptr_t>(stream);
+  return cudaSuccess;
+}
+
+namespace {
+bool is_stream_attribute(cudaStreamAttrID a) {
+  return a == cudaStreamAttributeAccessPolicyWindow ||
+         a == cudaStreamAttributeSynchronizationPolicy ||
+         a == cudaStreamAttributeMemSyncDomainMap || a == cudaStreamAttributeMemSyncDomain ||
+         a == cudaStreamAttributePriority;
+}
+// Default streams keep their attributes in records of their own, made the first
+// time something is set on them: one for the legacy stream, one per thread for
+// the per-thread stream.
+RtStream& attribute_record(cudaStream_t s) {  // caller holds g_stream_mu
+  if (RtStream* r = stream_record(s)) return *r;
+  if (s == cudaStreamPerThread) {
+    thread_local RtStream per_thread;
+    return per_thread;
+  }
+  static RtStream legacy;   // the legacy stream, and any stream made elsewhere
+  return legacy;
+}
+}  // namespace
+
+VGPU_EXPORT cudaError_t cudaStreamGetAttribute(cudaStream_t stream, cudaStreamAttrID attr,
+                                               cudaStreamAttrValue* value) {
+  if (!value || !is_stream_attribute(attr)) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_stream_mu);
+  RtStream& r = attribute_record(stream);
+  std::memset(value, 0, sizeof *value);
+  if (attr == cudaStreamAttributePriority) {
+    value->priority = r.priority;
+    return cudaSuccess;
+  }
+  if (const auto it = r.attrs.find(static_cast<int>(attr)); it != r.attrs.end()) *value = it->second;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaStreamSetAttribute(cudaStream_t stream, cudaStreamAttrID attr,
+                                               const cudaStreamAttrValue* value) {
+  if (!value || !is_stream_attribute(attr)) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_stream_mu);
+  RtStream& r = attribute_record(stream);
+  if (attr == cudaStreamAttributePriority) {
+    r.priority = clamp_priority(value->priority);
+    return cudaSuccess;
+  }
+  r.attrs[static_cast<int>(attr)] = *value;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaStreamCopyAttributes(cudaStream_t dst, cudaStream_t src) {
+  std::lock_guard<std::mutex> lock(g_stream_mu);
+  RtStream& from = attribute_record(src);
+  RtStream& to = attribute_record(dst);
+  if (&from == &to) return cudaSuccess;
+  to.attrs = from.attrs;
+  to.priority = from.priority;
+  return cudaSuccess;
 }
 
 /* ---- entry points PyTorch and other frameworks link against ----
@@ -1651,6 +1866,93 @@ VGPU_EXPORT cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned int)
  * make a framework believe it had memory or a capability it does not have.
  */
 
+// Resource limits. Each is kept per device and reads back as what was set,
+// after the clamping CUDA documents the driver may do. The heap limit is real:
+// it is the size of the heap a kernel's malloc() draws from. The stack and
+// printf-buffer sizes are recorded and reported but bound nothing here -- a
+// kernel's stack grows as far as it needs, and printf output is written as it
+// happens rather than through a buffer that can fill -- so a program that fits
+// the hardware's limits runs here too. The device-runtime limits describe
+// dynamic parallelism, which is not implemented, and the L2 ones are
+// performance hints CUDA itself says may be ignored.
+namespace {
+// The limit a caller passed, as the integer it is. A program built against a
+// newer toolkit can pass a limit this one does not name, and switching on an
+// enum holding a value outside its enumerators is undefined behaviour -- which
+// UBSan reports -- so the bytes are read as an int and the unknown case is a
+// clean cudaErrorUnsupportedLimit.
+int limit_id(cudaLimit limit) {
+  int id = 0;
+  std::memcpy(&id, &limit, sizeof id < sizeof limit ? sizeof id : sizeof limit);
+  return id;
+}
+}  // namespace
+
+VGPU_EXPORT cudaError_t cudaDeviceSetLimit(cudaLimit limit, size_t value) {
+  const int id = limit_id(limit);
+  return guard("cudaDeviceSetLimit", [&](State& s) -> cudaError_t {
+    State::DeviceLimits& lim = s.limits[t_current_device];
+    switch (id) {
+      case cudaLimitStackSize:
+        lim.stack = (value + 15) / 16 * 16;   // rounded up to a whole element
+        return cudaSuccess;
+      case cudaLimitPrintfFifoSize:
+        // Not after a kernel that calls printf() has launched, as documented.
+        if (lim.printf_used) return cudaErrorInvalidValue;
+        lim.printf_fifo = value;
+        return cudaSuccess;
+      case cudaLimitMallocHeapSize:
+        // Not after a kernel that calls malloc() or free() has launched: the
+        // heap it drew from is already laid out.
+        if (lim.heap_used) return cudaErrorInvalidValue;
+        lim.malloc_heap = value;
+        return cudaSuccess;
+      case cudaLimitDevRuntimeSyncDepth: {
+        // Only below compute capability 9.0, and no deeper than 24 levels.
+        const vgpu::DeviceProfile& p = s.rt->device(t_current_device).profile();
+        if (p.cc_major >= 9) return cudaErrorUnsupportedLimit;
+        lim.sync_depth = std::min<size_t>(value, 24);
+        return cudaSuccess;
+      }
+      case cudaLimitDevRuntimePendingLaunchCount:
+        lim.pending_launches = value;
+        return cudaSuccess;
+      case cudaLimitMaxL2FetchGranularity:
+        lim.l2_fetch_granularity = std::min<size_t>(value, 128);   // 0 to 128 bytes
+        return cudaSuccess;
+      case cudaLimitPersistingL2CacheSize:
+        // Clamped to what the device reports it can set aside, which is none.
+        lim.persisting_l2 = 0;
+        return cudaSuccess;
+      default:
+        return cudaErrorUnsupportedLimit;
+    }
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaDeviceGetLimit(size_t* value, cudaLimit limit) {
+  if (!value) return cudaErrorInvalidValue;
+  const int id = limit_id(limit);
+  return guard("cudaDeviceGetLimit", [&](State& s) -> cudaError_t {
+    const State::DeviceLimits& lim = s.limits[t_current_device];
+    switch (id) {
+      case cudaLimitStackSize: *value = lim.stack; return cudaSuccess;
+      case cudaLimitPrintfFifoSize: *value = lim.printf_fifo; return cudaSuccess;
+      case cudaLimitMallocHeapSize: *value = lim.malloc_heap; return cudaSuccess;
+      case cudaLimitDevRuntimeSyncDepth: {
+        const vgpu::DeviceProfile& p = s.rt->device(t_current_device).profile();
+        if (p.cc_major >= 9) return cudaErrorUnsupportedLimit;
+        *value = lim.sync_depth;
+        return cudaSuccess;
+      }
+      case cudaLimitDevRuntimePendingLaunchCount: *value = lim.pending_launches; return cudaSuccess;
+      case cudaLimitMaxL2FetchGranularity: *value = lim.l2_fetch_granularity; return cudaSuccess;
+      case cudaLimitPersistingL2CacheSize: *value = lim.persisting_l2; return cudaSuccess;
+      default: return cudaErrorUnsupportedLimit;
+    }
+  });
+}
+
 // Streams are executed inline, so every priority is equally honoured. CUDA
 // reports the range as [greatest, least] with lower meaning higher priority.
 VGPU_EXPORT cudaError_t cudaDeviceGetStreamPriorityRange(int* least, int* greatest) {
@@ -1658,8 +1960,9 @@ VGPU_EXPORT cudaError_t cudaDeviceGetStreamPriorityRange(int* least, int* greate
   if (greatest) *greatest = 0;
   return cudaSuccess;
 }
-VGPU_EXPORT cudaError_t cudaStreamCreateWithPriority(cudaStream_t* s, unsigned int, int) {
-  return cudaStreamCreate(s);
+VGPU_EXPORT cudaError_t cudaStreamCreateWithPriority(cudaStream_t* s, unsigned int flags,
+                                                     int priority) {
+  return create_stream(s, flags, priority);
 }
 
 // ---- stream-ordered memory pools -------------------------------------------------
@@ -2758,9 +3061,10 @@ VGPU_EXPORT cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* cfg, const
 VGPU_EXPORT cudaError_t cudaProfilerStart(void) { return cudaSuccess; }
 VGPU_EXPORT cudaError_t cudaProfilerStop(void) { return cudaSuccess; }
 
-VGPU_EXPORT cudaError_t cudaStreamGetPriority(cudaStream_t, int* priority) {
+VGPU_EXPORT cudaError_t cudaStreamGetPriority(cudaStream_t stream, int* priority) {
   if (!priority) return cudaErrorInvalidValue;
-  *priority = 0;  // the single priority this implementation offers
+  std::lock_guard<std::mutex> lock(g_stream_mu);
+  *priority = attribute_record(stream).priority;
   return cudaSuccess;
 }
 
@@ -2774,7 +3078,20 @@ VGPU_EXPORT cudaError_t cudaLaunchHostFunc(cudaStream_t, cudaHostFn_t fn, void* 
 
 // cudaStreamGetCaptureInfo_v2 is defined with the graph machinery below: what
 // it reports is the capture's own graph and dependency set.
-VGPU_EXPORT cudaError_t cudaStreamDestroy(cudaStream_t) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaStreamDestroy(cudaStream_t stream) {
+  // The default streams are not a program's to destroy.
+  if (is_default_stream(stream)) return cudaErrorInvalidResourceHandle;
+  {
+    std::lock_guard<std::mutex> lock(g_stream_mu);
+    // A handle this runtime did not make may be a driver-API stream, which the
+    // driver destroys; there is nothing here to free for it.
+    g_streams.erase(static_cast<void*>(stream));
+  }
+  // A capture in progress on it ends with it. Left behind, it would be
+  // inherited by the next stream that happened to get the same address.
+  vgpu_drop_capture(stream);
+  return cudaSuccess;
+}
 VGPU_EXPORT cudaError_t cudaStreamSynchronize(cudaStream_t) { return cudaDeviceSynchronize(); }
 VGPU_EXPORT cudaError_t cudaStreamQuery(cudaStream_t) { return cudaSuccess; }
 VGPU_EXPORT cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned int) {
@@ -3219,6 +3536,14 @@ bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()>
   std::lock_guard<std::mutex> lock(g_graph_mu);
   capture_add(*g, cudaGraphNodeTypeHost, std::move(r));
   return true;
+}
+
+void vgpu_drop_capture(cudaStream_t stream) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  const auto it = g_capturing.find(reinterpret_cast<void*>(stream));
+  if (it == g_capturing.end()) return;
+  g_borrowed_graphs.erase(it->second.get());
+  g_capturing.erase(it);
 }
 
 // Marks any in-flight capture as unusable. Called by the operations that this
