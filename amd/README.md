@@ -61,7 +61,9 @@ min, max and the sequence a division compiles to), packed half precision,
 conversions, the transcendentals, bit counting, comparisons in both their
 forms and the class test, `v_cndmask`, the lane-counting ops, scalar and EXEC
 branches, and the memory a kernel uses: global loads and stores and their
-atomics, LDS and its atomics, a work-item's private memory (what a kernel
+atomics (an add, a subtract, the logical ones, an exchange and a
+compare-and-swap, on a 32-bit value, on a float and on a pair, each able to
+give back what it replaced), LDS and its atomics, a work-item's private memory (what a kernel
 spills into when it runs out of registers), a value read from another lane,
 and a flat access, whose address says for itself whether it means LDS or the
 device. The source modifiers are applied -- an absolute value, a negation, a

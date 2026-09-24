@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <string>
 #include <map>
 
 #include "vgpu/amd_gcn.hpp"
@@ -102,6 +103,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x023}, {"v_rcp_iflag_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x025}, {"v_rcp_f64_e32", 2, 1, 2}},
       {{Enc::Vop1, 0x027}, {"v_sqrt_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x02c}, {"v_bfrev_b32_e32", 1, 1}},
       {{Enc::Vop1, 0x02d}, {"v_ffbh_u32_e32", 1, 1}},
       {{Enc::Vop2, 0x008}, {"v_mul_u32_u24_e32", 1, 2}},
       {{Enc::Vop2, 0x00a}, {"v_min_f32_e32", 1, 2}},
@@ -173,6 +175,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x1e8}, {"v_mad_u64_u32", 2, 3, 1, 1, 2, true}},
       {{Enc::Vop3, 0x1eb}, {"v_mad_legacy_u16", 1, 3}},
       {{Enc::Vop3, 0x1fd}, {"v_lshl_add_u32", 1, 3}},
+      {{Enc::Vop3, 0x1f3}, {"v_xad_u32", 1, 3}},
       {{Enc::Vop3, 0x1ff}, {"v_add3_u32", 1, 3}},
       {{Enc::Vop3, 0x200}, {"v_lshl_or_b32", 1, 3}},
       {{Enc::Vop3, 0x208}, {"v_lshl_add_u64", 2, 3, 2, 1, 2}},
@@ -182,6 +185,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x286}, {"v_mul_hi_u32", 1, 2}},
       {{Enc::Vop3, 0x287}, {"v_mul_hi_i32", 1, 2}},
       {{Enc::Vop3, 0x289}, {"v_readlane_b32", 1, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x28a}, {"v_writelane_b32", 1, 2}},
       {{Enc::Vop3, 0x28b}, {"v_bcnt_u32_b32", 1, 2}},
       {{Enc::Vop3, 0x28c}, {"v_mbcnt_lo_u32_b32", 1, 2}},
       {{Enc::Vop3, 0x28d}, {"v_mbcnt_hi_u32_b32", 1, 2}},
@@ -190,7 +194,11 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // DS: LDS reads and writes. A read takes the address; a write takes the
       // address and the data.
       {{Enc::Ds, 0x00}, {"ds_add_u32", 0, 2}},
+      {{Enc::Ds, 0x06}, {"ds_max_i32", 0, 2}},
+      {{Enc::Ds, 0x0b}, {"ds_xor_b32", 0, 2}},
       {{Enc::Ds, 0x0d}, {"ds_write_b32", 0, 2}},
+      {{Enc::Ds, 0x0e}, {"ds_write2_b32", 0, 3}},
+      {{Enc::Ds, 0x37}, {"ds_read2_b32", 2, 1}},
       {{Enc::Ds, 0x36}, {"ds_read_b32", 1, 1}},
       {{Enc::Ds, 0x38}, {"ds_read2st64_b32", 2, 1}},
       // A lane reads the value another lane holds: the address says which.
@@ -212,10 +220,15 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Flat, 0x1d}, {"store_dwordx2", 0, 2, 1, 2}},
       {{Enc::Flat, 0x1e}, {"store_dwordx3", 0, 2, 1, 3}},
       {{Enc::Flat, 0x1f}, {"store_dwordx4", 0, 2, 1, 4}},
+      {{Enc::Flat, 0x40}, {"atomic_swap", 0, 2}},
       {{Enc::Flat, 0x41}, {"atomic_cmpswap", 0, 2, 1, 2}},
       {{Enc::Flat, 0x42}, {"atomic_add", 0, 2}},
+      {{Enc::Flat, 0x43}, {"atomic_sub", 0, 2}},
       {{Enc::Flat, 0x48}, {"atomic_and", 0, 2}},
       {{Enc::Flat, 0x49}, {"atomic_or", 0, 2}},
+      {{Enc::Flat, 0x4a}, {"atomic_xor", 0, 2}},
+      {{Enc::Flat, 0x4d}, {"atomic_add_f32", 0, 2}},
+      {{Enc::Flat, 0x62}, {"atomic_add_x2", 0, 2, 1, 2}},
       // VOP3P: a packed pair of halves in one register, both computed at once.
       {{Enc::Vop3p, 0x0e}, {"v_pk_fma_f16", 1, 3}},
   };
@@ -468,6 +481,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     if (s.dst_width) in.dst.push_back(vgpr((w1 >> 24) & 0xFF, s.dst_width));
     in.src.push_back(vgpr(w1 & 0xFF));                              // the address
     if (s.srcs > 1) in.src.push_back(vgpr((w1 >> 8) & 0xFF));       // the data written
+    if (s.srcs > 2) in.src.push_back(vgpr((w1 >> 16) & 0xFF));      // and the second, for a two-address write
   } else if ((w0 >> 26) == 0x37) {    // FLAT, and its global and scratch forms
     in.enc = Enc::Flat;
     in.opcode = (w0 >> 18) & 0x7F;
@@ -491,7 +505,15 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     // A scratch access may have neither an address register nor a scalar
     // base: then the offset alone says where in the work-item's own memory.
     in.has_vaddr = in.segment != Inst::Segment::Scratch || ((w0 >> 13) & 1) != 0;
+    // An atomic gives back the value it replaced where sc0 asks for it, and
+    // the register it gives it back in is the one a load would write. A
+    // compare-and-swap takes a pair and gives back one of them.
+    const bool returns = std::string(s.name).rfind("atomic", 0) == 0 && (in.cache & 1);
     if (s.dst_width) in.dst.push_back(vgpr((w1 >> 24) & 0xFF, s.dst_width));
+    else if (returns)
+      in.dst.push_back(vgpr((w1 >> 24) & 0xFF,
+                            std::string(s.name).find("cmpswap") != std::string::npos ? s.src_width(1) / 2
+                                                                                     : s.src_width(1)));
     // A flat address is 64-bit; a global one is 64-bit unless a scalar base
     // carries the top of it; a scratch one is a 32-bit offset.
     const uint32_t addr_width = in.segment == Inst::Segment::Global ? (in.has_saddr ? 1 : 2)

@@ -75,6 +75,7 @@ struct Wave {
   uint32_t sgpr[kSgprs] = {};
   uint32_t vgpr[kVgprs][kLanes] = {};
   uint64_t vcc = 0, exec = 0;
+  uint32_t m0 = 0;   // a lane number, where an instruction takes one from it
   bool scc = false;
   uint64_t pc = 0;
   bool done = false;
@@ -126,7 +127,7 @@ struct Machine {
       case OperandKind::SharedBase: return kSharedBase;
       case OperandKind::Inline:
       case OperandKind::Literal: return static_cast<uint64_t>(o.value);
-      case OperandKind::M0: return 0;
+      case OperandKind::M0: return w.m0;
       case OperandKind::Vgpr:
       case OperandKind::None: break;
     }
@@ -142,6 +143,7 @@ struct Machine {
       case OperandKind::Exec: w.exec = v; return;
       case OperandKind::ExecLo: w.exec = (w.exec & ~0xFFFFFFFFull) | static_cast<uint32_t>(v); return;
       case OperandKind::ExecHi: w.exec = (w.exec & 0xFFFFFFFFull) | (v << 32); return;
+      case OperandKind::M0: w.m0 = static_cast<uint32_t>(v); return;
       default: break;
     }
     throw Error::make(Err::Internal, "a scalar destination this does not write");
@@ -427,6 +429,13 @@ struct Machine {
   void vector_alu(Wave& w, const Inst& in) {
     const std::string& op = in.name;
     if (carry_alu(w, in)) return;
+    if (op == "v_writelane_b32") {
+      // The one instruction here that names the lane it writes: a scalar
+      // value into one lane of a register, whatever EXEC says.
+      const uint32_t lane = static_cast<uint32_t>(scalar(w, in.src[1])) & 63;
+      w.vgpr[in.dst[0].index][lane] = static_cast<uint32_t>(scalar(w, in.src[0]));
+      return;
+    }
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;   // EXEC says which lanes write
       if (op == "v_mov_b32_e32") {
@@ -492,6 +501,13 @@ struct Machine {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane) +
                                          lane_src(w, in.src[2], lane)));
+      } else if (op == "v_xad_u32") {
+        write_lane(w, in.dst[0], lane,
+                   (lane_src(w, in.src[0], lane) ^ lane_src(w, in.src[1], lane)) + lane_src(w, in.src[2], lane));
+      } else if (op == "v_bfrev_b32_e32") {
+        uint32_t v = lane_src(w, in.src[0], lane), r = 0;
+        for (uint32_t k = 0; k < 32; ++k) r |= ((v >> k) & 1) << (31 - k);
+        write_lane(w, in.dst[0], lane, r);
       } else if (op == "v_min_u32_e32") {
         write_lane(w, in.dst[0], lane, std::min(lane_src(w, in.src[0], lane), lane_src(w, in.src[1], lane)));
       } else if (op == "v_lshl_or_b32") {
@@ -737,6 +753,26 @@ struct Machine {
         std::memcpy(&v1, &g.lds[at(uint64_t{static_cast<uint32_t>(in.offset1)} * 64 * 4)], 4);
         write_lane(w, in.dst[0], lane, v0);
         w.vgpr[in.dst[0].index + 1][lane] = v1;
+      } else if (op == "ds_xor_b32" || op == "ds_max_i32") {
+        uint32_t before = 0;
+        std::memcpy(&before, &g.lds[at(static_cast<uint64_t>(in.offset))], 4);
+        const uint32_t v = lane_src(w, in.src[1], lane);
+        const uint32_t after = op == "ds_xor_b32"
+                                   ? before ^ v
+                                   : static_cast<uint32_t>(std::max(static_cast<int32_t>(before),
+                                                                    static_cast<int32_t>(v)));
+        std::memcpy(&g.lds[at(static_cast<uint64_t>(in.offset))], &after, 4);
+      } else if (op == "ds_write2_b32") {
+        // Two words, each at its own offset, counted in words.
+        const uint32_t v0 = lane_src(w, in.src[1], lane), v1 = lane_src(w, in.src[2], lane);
+        std::memcpy(&g.lds[at(uint64_t{static_cast<uint32_t>(in.offset)} * 4)], &v0, 4);
+        std::memcpy(&g.lds[at(uint64_t{static_cast<uint32_t>(in.offset1)} * 4)], &v1, 4);
+      } else if (op == "ds_read2_b32") {
+        uint32_t v0 = 0, v1 = 0;
+        std::memcpy(&v0, &g.lds[at(uint64_t{static_cast<uint32_t>(in.offset)} * 4)], 4);
+        std::memcpy(&v1, &g.lds[at(uint64_t{static_cast<uint32_t>(in.offset1)} * 4)], 4);
+        w.vgpr[in.dst[0].index][lane] = v0;
+        w.vgpr[in.dst[0].index + 1][lane] = v1;
       } else {
         throw Error::make(Err::Unsupported, "LDS instruction ", op, " is decoded but not implemented");
       }
@@ -861,19 +897,33 @@ struct Machine {
         mem.store_scalar(addr, 4, lane_src(w, in.src[1], lane));
       } else if (op == "global_store_dwordx2") {
         mem.store_scalar(addr, 8, lane_src64(w, in.src[1], lane));
-      } else if (op == "global_atomic_and" || op == "global_atomic_or") {
-        const uint32_t before = static_cast<uint32_t>(mem.load_scalar(addr, 4)), v = lane_src(w, in.src[1], lane);
-        mem.store_scalar(addr, 4, op == "global_atomic_and" ? before & v : before | v);
+      } else if (op == "global_atomic_add_x2") {
+        // The one that works on a pair; every other atomic here is 32-bit.
+        const uint64_t before = mem.load_scalar(addr, 8);
+        mem.store_scalar(addr, 8, before + lane_src64(w, in.src[1], lane));
+        if (!in.dst.empty()) write_lane64(w, in.dst[0], lane, before);
       } else if (op == "global_atomic_cmpswap") {
         // The pair is the value to write and the one it must find.
         const uint32_t value = lane_src(w, in.src[1], lane),
                        expected = w.vgpr[in.src[1].index + 1][lane];
-        if (static_cast<uint32_t>(mem.load_scalar(addr, 4)) == expected) mem.store_scalar(addr, 4, value);
-      } else if (op == "global_atomic_add") {
-        // Lane by lane, which is what makes it atomic: every lane's addition
-        // lands, whatever order they come in.
         const uint32_t before = static_cast<uint32_t>(mem.load_scalar(addr, 4));
-        mem.store_scalar(addr, 4, before + lane_src(w, in.src[1], lane));
+        if (before == expected) mem.store_scalar(addr, 4, value);
+        if (!in.dst.empty()) write_lane(w, in.dst[0], lane, before);
+      } else if (op.rfind("global_atomic_", 0) == 0) {
+        // Lane by lane, which is what makes these atomic: every lane's turn
+        // lands, whatever order they come in, and each is told what it found.
+        const uint32_t before = static_cast<uint32_t>(mem.load_scalar(addr, 4)), v = lane_src(w, in.src[1], lane);
+        uint32_t after = 0;
+        if (op == "global_atomic_add") after = before + v;
+        else if (op == "global_atomic_sub") after = before - v;
+        else if (op == "global_atomic_and") after = before & v;
+        else if (op == "global_atomic_or") after = before | v;
+        else if (op == "global_atomic_xor") after = before ^ v;
+        else if (op == "global_atomic_swap") after = v;
+        else if (op == "global_atomic_add_f32") after = as_bits(as_float(before) + as_float(v));
+        else throw Error::make(Err::Unsupported, "memory instruction ", op, " is decoded but not implemented");
+        mem.store_scalar(addr, 4, after);
+        if (!in.dst.empty()) write_lane(w, in.dst[0], lane, before);
       } else {
         throw Error::make(Err::Unsupported, "memory instruction ", op, " is decoded but not implemented");
       }
