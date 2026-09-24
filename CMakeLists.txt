@@ -639,6 +639,9 @@ target_compile_definitions(test_amd_gcn_idioms PRIVATE VGPU_SOURCE_DIR="${CMAKE_
 
 vgpu_unit_test(test_amd_hip_abi amd/tests/unit/test_hip_abi.cpp)
 
+vgpu_unit_test(test_amd_hipcc_ops amd/tests/unit/test_hipcc_ops.cpp)
+target_compile_definitions(test_amd_hipcc_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
 vgpu_unit_test(test_amd_gcn_globals amd/tests/unit/test_gcn_globals.cpp)
 target_compile_definitions(test_amd_gcn_globals PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # How a kernel learns the shape of the grid it is part of.
@@ -696,6 +699,14 @@ set_tests_properties(amd_hip PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_hipcc COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc.sh)
 set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+# The decoder against ROCm's assembler on code ROCm's compiler built: the
+# checked-in object everywhere, and a fresh build wherever ROCm is installed.
+add_test(NAME test_amd_hipcc_ops_decode COMMAND test_amd_gcn)
+set_tests_properties(test_amd_hipcc_ops_decode PROPERTIES ENVIRONMENT
+  "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/ops.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/ops.gfx942.dis")
+add_test(NAME amd_hipcc_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc_disasm.sh)
+set_tests_properties(amd_hipcc_disasm PROPERTIES DEPENDS test_amd_gcn
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 # The HIP structures against the HIP headers, field by field, where ROCm is installed.
 add_test(NAME amd_hip_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_abi.sh)
 set_tests_properties(amd_hip_abi PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
