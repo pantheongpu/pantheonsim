@@ -28,6 +28,9 @@ struct Dispatch {
   uint32_t groups[3] = {1, 1, 1};    // work-groups
   uint32_t group_size[3] = {1, 1, 1};   // work-items in each
   uint32_t wave_size = 64;
+  // LDS the launch adds to what the kernel reserves, which is what a HIP
+  // program passes as its third launch parameter.
+  uint32_t dynamic_lds = 0;
 };
 
 // What a dispatch did, which is what a launch reports and what the tests

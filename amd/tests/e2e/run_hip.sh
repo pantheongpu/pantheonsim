@@ -31,10 +31,13 @@ if command -v objdump >/dev/null; then
     *libasan*) sanitize="-fsanitize=address,undefined -fno-omit-frame-pointer -g" ;;
   esac
 fi
-"$cc" -O1 $sanitize -I"$root/amd/include" "$root/amd/tests/e2e/vector_add_hip.c" -o "$tmp/vector_add_hip" \
-  -L"$shim" -lamdhip64 -Wl,-rpath,"$shim" 2>"$tmp/cc.err"
+build() {  # build <name>
+  "$cc" -O1 $sanitize -I"$root/amd/include" "$root/amd/tests/e2e/$1.c" -o "$tmp/$1" \
+    -L"$shim" -lamdhip64 -Wl,-rpath,"$shim" 2>"$tmp/$1.err"
+}
+build vector_add_hip
 expect "a HIP program links against the shim" "yes" \
-  "$([[ -x "$tmp/vector_add_hip" ]] && echo yes || echo "no: $(head -3 "$tmp/cc.err")")"
+  "$([[ -x "$tmp/vector_add_hip" ]] && echo yes || echo "no: $(head -3 "$tmp/vector_add_hip.err")")"
 [[ -x "$tmp/vector_add_hip" ]] || exit 1
 
 out=$(VGPU_GPU=amd/mi300x "$tmp/vector_add_hip" "$root/amd/tests/data/vector_add.gfx942.o" \
@@ -55,6 +58,30 @@ expect "a kernel the code object does not have is refused" "missing kernel refus
   "$(grep -o 'missing kernel refused 1' <<< "$out")"
 expect "and so is a launch with no work-items" "empty launch refused 1" \
   "$(grep -o 'empty launch refused 1' <<< "$out")"
+
+# What a program asks of the runtime besides a launch: how much memory the
+# device has, work issued on a stream, LDS the launch pays for, and a second
+# device that keeps its own memory.
+build runtime_hip
+expect "the runtime program links against the shim" "yes" \
+  "$([[ -x "$tmp/runtime_hip" ]] && echo yes || echo "no: $(head -3 "$tmp/runtime_hip.err")")"
+if [[ -x "$tmp/runtime_hip" ]]; then
+  out=$(VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 "$tmp/runtime_hip" "$root/amd/tests/data/memory.gfx942.o" 2>&1)
+  status=$?
+  echo "$out" | sed 's/^/      /'
+  expect "it runs" "0" "$status"
+  for line in \
+    "an allocation costs what it asked for 1" \
+    "and freeing it gives that back 1" \
+    "a copy on a stream lands 1" \
+    "a kernel whose LDS the launch paid for 1" \
+    "a launch that forgets it is refused 1" \
+    "devices 2" \
+    "a second device keeps its own memory 1" \
+    "and what it holds is not missing from the first 1"; do
+    expect "$line" "$line" "$(grep -Fo "$line" <<< "$out")"
+  done
+fi
 
 # The same program on an NVIDIA profile: HIP runs on AMD GPUs, and saying so
 # is better than running the kernel on a card that could not have run it.

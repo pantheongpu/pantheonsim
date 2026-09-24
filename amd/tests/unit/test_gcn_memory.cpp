@@ -56,13 +56,15 @@ const amd::Kernel& kernel(const amd::CodeObject& o, const char* name) {
   return *k;
 }
 
-void run(const amd::CodeObject& o, const char* name, MemoryManager& mem, const std::vector<uint64_t>& args) {
+void run(const amd::CodeObject& o, const char* name, MemoryManager& mem, const std::vector<uint64_t>& args,
+         uint32_t dynamic_lds = 0) {
   amd::Dispatch d;
   d.object = &o;
   d.kernel = &kernel(o, name);
   d.kernarg = kernargs(mem, *d.kernel, args);
   d.groups[0] = 1;
   d.group_size[0] = 64;
+  d.dynamic_lds = dynamic_lds;
   amd::execute(d, mem);
 }
 
@@ -163,6 +165,59 @@ VTEST(a_pointer_that_may_be_either_memory_reaches_the_right_one) {
     const std::vector<uint32_t> g = download<uint32_t>(mem, pg, n);
     for (int i = 0; i < n; ++i) VCHECK_EQ(g[i], 0xFFFFFFFFu);
   }
+}
+
+VTEST(lds_the_launch_sizes_rather_than_the_kernel) {
+  const amd::CodeObject o = object();
+  // An array with no size of its own costs the kernel no LDS: the launch is
+  // what pays for it, which is why the reserved amount is zero.
+  VCHECK_EQ(kernel(o, "dyn_lds").group_segment, 0u);
+
+  const int n = 64;
+  std::vector<float> in(n);
+  for (int i = 0; i < n; ++i) in[i] = static_cast<float>(i) * 0.5f - 3.0f;
+
+  MemoryManager mem(64ull << 20);
+  const uint64_t pin = upload(mem, in), pout = mem.alloc(n * 4);
+  run(o, "dyn_lds", mem, {pin, pout, static_cast<uint64_t>(n)}, n * 4);
+
+  // Each work-item doubles its own element into the shared array and reads
+  // its neighbour's back out.
+  const std::vector<float> out = download<float>(mem, pout, n);
+  for (int i = 0; i < n; ++i) {
+    const float want = in[(i + 1) % n] * 2.0f;
+    if (out[i] != want)
+      throw vtest::Failure("dyn_lds[" + std::to_string(i) + "] is " + std::to_string(out[i]) + ", not " +
+                           std::to_string(want));
+  }
+}
+
+VTEST(a_launch_that_does_not_pay_for_that_lds_is_caught_rather_than_silently_wrong) {
+  const amd::CodeObject o = object();
+  MemoryManager mem(64ull << 20);
+  const std::vector<float> in(64, 1.0f);
+  const uint64_t pin = upload(mem, in), pout = mem.alloc(64 * 4);
+  std::string what;
+  try {
+    run(o, "dyn_lds", mem, {pin, pout, 64}, 0);
+  } catch (const std::exception& e) {
+    what = e.what();
+  }
+  VCHECK_CONTAINS(what, "past the 0");
+}
+
+VTEST(more_lds_than_a_work_group_has_is_refused) {
+  const amd::CodeObject o = object();
+  MemoryManager mem(64ull << 20);
+  const std::vector<float> in(64, 1.0f);
+  const uint64_t pin = upload(mem, in), pout = mem.alloc(64 * 4);
+  std::string what;
+  try {
+    run(o, "dyn_lds", mem, {pin, pout, 64}, (64u << 10) + 4u);
+  } catch (const std::exception& e) {
+    what = e.what();
+  }
+  VCHECK_CONTAINS(what, "past the 65536");
 }
 
 VTEST_MAIN

@@ -39,9 +39,14 @@ left to have (`R_AMDGPU_REL32_LO` and `_HI`, which a kernel adds to the
 program counter), and `hipModuleGetGlobal` hands a program the address of one.
 
 The interface is `include/vgpu_hip.h`, a clean-room subset of the documented
-HIP API. What is implemented is devices, memory and the module API; the
-kernel-launch syntax `hipcc` compiles (`__hipRegisterFatBinary` and
-`hipLaunchKernel`) is not there yet, so a program uses the module API.
+HIP API. What is implemented is devices, memory and the module API: how much
+memory a device has and how much is left, several devices each keeping their
+own, streams, and a launch whose shared-memory parameter sizes the LDS the
+kernel did not reserve for itself. Nothing runs behind the program's back, so
+the asynchronous calls are the synchronous ones and a stream is done when the
+call returns. The kernel-launch syntax `hipcc` compiles
+(`__hipRegisterFatBinary` and `hipLaunchKernel`) is not there yet, so a
+program uses the module API.
 
 The instructions implemented are those clang emits for the kernels in
 `tests/data/`: scalar and vector integer arithmetic, the logical and shift

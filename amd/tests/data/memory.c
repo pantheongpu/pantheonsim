@@ -35,3 +35,13 @@ __attribute__((amdgpu_kernel)) void generic_ptr(float* g, int use_lds, float* ou
   *p = (float)t;
   out[t] = *p * 2.0f;
 }
+// LDS the launch sizes rather than the kernel: an array with no size of its
+// own, which is what HIP's extern __shared__ compiles to and what a launch's
+// third parameter pays for.
+__attribute__((address_space(3))) extern float dynamic_lds[];
+__attribute__((amdgpu_kernel)) void dyn_lds(const float* in, float* out, int n) {
+  unsigned t = __builtin_amdgcn_workitem_id_x();
+  dynamic_lds[t] = in[t] * 2.0f;
+  __builtin_amdgcn_s_barrier();
+  out[t] = dynamic_lds[((int)t + 1) % n];
+}
