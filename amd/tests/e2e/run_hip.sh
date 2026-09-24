@@ -76,6 +76,11 @@ if [[ -x "$tmp/runtime_hip" ]]; then
     "a copy on a stream lands 1" \
     "a kernel whose LDS the launch paid for 1" \
     "a launch that forgets it is refused 1" \
+    "a kernel takes a measurable time 1" \
+    "an event with nothing recorded has no time 1" \
+    "and neither has one created without timing 1" \
+    "an event is queried and destroyed 1" \
+    "a stream is created with the flags it asked for 1" \
     "devices 2" \
     "a second device keeps its own memory 1" \
     "and what it holds is not missing from the first 1"; do

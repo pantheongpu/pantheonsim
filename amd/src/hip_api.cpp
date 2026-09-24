@@ -10,11 +10,13 @@
 // from AMD's public documentation); nothing here is AMD's code. What is not
 // implemented is refused by name rather than ignored, because a HIP program
 // that believes a launch happened will compare wrong answers.
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -564,8 +566,86 @@ hipError_t hipStreamCreate(hipStream_t* stream) {
   *stream = reinterpret_cast<hipStream_t>(static_cast<intptr_t>(next++));
   return hipSuccess;
 }
+hipError_t hipStreamCreateWithFlags(hipStream_t* stream, unsigned int flags) {
+  // Neither flag changes anything here: there is no other work for a stream
+  // to be blocking on, and nothing to synchronise against.
+  if (flags & ~static_cast<unsigned>(hipStreamNonBlocking)) return hipErrorInvalidValue;
+  return hipStreamCreate(stream);
+}
 hipError_t hipStreamDestroy(hipStream_t) { return hipSuccess; }
 hipError_t hipStreamSynchronize(hipStream_t) { return hipSuccess; }
+
+// Events: a program records one before its work and one after, and asks how
+// long there was between them. Every launch here has finished by the time it
+// returns, so an event is recorded the moment the call is made and the time
+// between two of them is the time the simulator took -- not what a card would
+// have taken, which this does not claim to know.
+namespace {
+
+struct Event {
+  bool timing = true;
+  bool recorded = false;
+  std::chrono::steady_clock::time_point when{};
+};
+
+std::mutex g_event_mutex;
+std::map<hipEvent_t, std::unique_ptr<Event>> g_events;
+
+Event* find_event(hipEvent_t e) {   // the caller holds g_event_mutex
+  const auto it = g_events.find(e);
+  return it == g_events.end() ? nullptr : it->second.get();
+}
+
+}  // namespace
+
+hipError_t hipEventCreateWithFlags(hipEvent_t* event, unsigned int flags) {
+  if (!event) return hipErrorInvalidValue;
+  if (flags & ~static_cast<unsigned>(hipEventBlockingSync | hipEventDisableTiming)) return hipErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_event_mutex);
+  static intptr_t next = 1;
+  const hipEvent_t handle = reinterpret_cast<hipEvent_t>(next++);
+  auto e = std::make_unique<Event>();
+  e->timing = (flags & hipEventDisableTiming) == 0;
+  g_events.emplace(handle, std::move(e));
+  *event = handle;
+  return hipSuccess;
+}
+
+hipError_t hipEventCreate(hipEvent_t* event) { return hipEventCreateWithFlags(event, hipEventDefault); }
+
+hipError_t hipEventDestroy(hipEvent_t event) {
+  std::lock_guard<std::mutex> lock(g_event_mutex);
+  return g_events.erase(event) ? hipSuccess : hipErrorInvalidHandle;
+}
+
+hipError_t hipEventRecord(hipEvent_t event, hipStream_t) {
+  std::lock_guard<std::mutex> lock(g_event_mutex);
+  Event* e = find_event(event);
+  if (!e) return hipErrorInvalidHandle;
+  e->recorded = true;
+  e->when = std::chrono::steady_clock::now();
+  return hipSuccess;
+}
+
+// There is never work left behind an event, so both of these answer at once.
+hipError_t hipEventSynchronize(hipEvent_t event) {
+  std::lock_guard<std::mutex> lock(g_event_mutex);
+  return find_event(event) ? hipSuccess : hipErrorInvalidHandle;
+}
+
+hipError_t hipEventQuery(hipEvent_t event) { return hipEventSynchronize(event); }
+
+hipError_t hipEventElapsedTime(float* ms, hipEvent_t start, hipEvent_t end) {
+  if (!ms) return hipErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_event_mutex);
+  const Event* a = find_event(start);
+  const Event* b = find_event(end);
+  // An event that was never recorded, or one created without timing, has no
+  // time to give.
+  if (!a || !b || !a->recorded || !b->recorded || !a->timing || !b->timing) return hipErrorInvalidHandle;
+  *ms = std::chrono::duration<float, std::milli>(b->when - a->when).count();
+  return hipSuccess;
+}
 
 // The versions a program checks before it trusts a feature. HIP reports
 // these as major * 10000000 + minor * 100000 + patch.

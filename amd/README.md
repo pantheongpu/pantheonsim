@@ -41,8 +41,10 @@ program counter), and `hipModuleGetGlobal` hands a program the address of one.
 The interface is `include/vgpu_hip.h`, a clean-room subset of the documented
 HIP API. What is implemented is devices, memory and the module API: how much
 memory a device has and how much is left, several devices each keeping their
-own, streams, and a launch whose shared-memory parameter sizes the LDS the
-kernel did not reserve for itself. Nothing runs behind the program's back, so
+own, streams and the events a program times its work with, and a launch whose
+shared-memory parameter sizes the LDS the kernel did not reserve for itself.
+The time between two events is the simulator's own, not what a card would have
+taken, which this does not claim to know. Nothing runs behind the program's back, so
 the asynchronous calls are the synchronous ones and a stream is done when the
 call returns. The kernel-launch syntax `hipcc` compiles
 (`__hipRegisterFatBinary` and `hipLaunchKernel`) is not there yet, so a
