@@ -69,7 +69,9 @@ give back what it replaced), LDS and its atomics, a work-item's private memory (
 spills into when it runs out of registers), a value read from another lane,
 and a flat access, whose address says for itself whether it means LDS or the
 device. The source modifiers are applied -- an absolute value, a negation, a
-clamp of the result.
+clamp of the result -- and so is the sub-dword form, where a 32-bit
+instruction reads a named byte or half of each source, with its sign or
+without, which is how the compiler mixes widths.
 
 Any other instruction is refused by name, and so is anything this does not
 model: an output multiplier, a packed operation that shuffles halves. A wrong

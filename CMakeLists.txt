@@ -597,6 +597,9 @@ target_compile_definitions(test_amd_gcn_int64 PRIVATE VGPU_SOURCE_DIR="${CMAKE_S
 vgpu_unit_test(test_amd_gcn_atomics amd/tests/unit/test_gcn_atomics.cpp)
 target_compile_definitions(test_amd_gcn_atomics PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
+vgpu_unit_test(test_amd_gcn_mixed amd/tests/unit/test_gcn_mixed.cpp)
+target_compile_definitions(test_amd_gcn_mixed PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
 vgpu_unit_test(test_amd_gcn_globals amd/tests/unit/test_gcn_globals.cpp)
 target_compile_definitions(test_amd_gcn_globals PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # How a kernel learns the shape of the grid it is part of.
