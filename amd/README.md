@@ -46,9 +46,16 @@ shared-memory parameter sizes the LDS the kernel did not reserve for itself.
 The time between two events is the simulator's own, not what a card would have
 taken, which this does not claim to know. Nothing runs behind the program's back, so
 the asynchronous calls are the synchronous ones and a stream is done when the
-call returns. The kernel-launch syntax `hipcc` compiles
-(`__hipRegisterFatBinary` and `hipLaunchKernel`) is not there yet, so a
-program uses the module API.
+call returns. A program built by `hipcc` runs unmodified too:
+its device code is registered from inside the executable before `main`, its
+chevron launches go through `hipLaunchKernel`, and it reads the device through
+the real headers' `hipDeviceProp_t`, which is laid out here field for field as
+ROCm lays it out. Graph capture and replay, peer access between devices, and
+pinned host memory used to stage copies are there for the programs that use
+them. The library answers to both of ROCm's names for it (`libamdhip64.so.6`
+and `.so.7`) and gives each function the symbol version the real one does,
+since a program built by `hipcc` asks for `hipMalloc@hip_4.2`, not just
+`hipMalloc`.
 
 The instructions implemented are those clang emits for the kernels in
 `tests/data/`.
