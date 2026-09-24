@@ -195,6 +195,23 @@ std::string shim_dir() {
   return dir + "/shim";
 }
 
+// The ROCm bin directories a tool is likely to put in front of PATH, in the
+// order pantheon.py and ROCm's own scripts look: $ROCM_PATH, $HIP_PATH, then
+// /opt/rocm.
+std::vector<std::string> rocm_bin_directories() {
+  std::vector<std::string> out;
+  auto add = [&](const std::string& d) {
+    struct stat st{};
+    if (::stat(d.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && std::find(out.begin(), out.end(), d) == out.end())
+      out.push_back(d);
+  };
+  for (const char* var : {"ROCM_PATH", "HIP_PATH"})
+    if (const char* r = std::getenv(var); r && *r) add(std::string(r) + "/bin");
+  add("/opt/rocm/bin");
+  add("/opt/rocm/llvm/bin");
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic system files
 // ---------------------------------------------------------------------------
@@ -550,6 +567,37 @@ exit 1
          "done\n"
          "exec \"$REAL\" -cudart shared \"$@\"\n");
   }
+  // rocprofv3, AMD's profiler, unmodified: it loads rocprofiler-sdk from the
+  // ROCm installation it sits in, by path, and --rocm-root names that
+  // installation. The session's is the real one with VirtualGPU's
+  // librocprofiler-sdk in place of ROCm's, which answers from the simulated
+  // devices (amd/src/rocprofiler_sdk.cpp); everything else is ROCm's own.
+  if (!nvidia) {
+    std::string real_rocprof = find_program("rocprofv3");
+    for (const std::string& dir : rocm_bin_directories())
+      if (real_rocprof.empty() && ::access((dir + "/rocprofv3").c_str(), X_OK) == 0) {
+        char resolved[4096];
+        if (::realpath((dir + "/rocprofv3").c_str(), resolved)) real_rocprof = resolved;
+      }
+    const std::string sdk = shim + "/librocprofiler-sdk.so.1";
+    if (!real_rocprof.empty() && ::access(sdk.c_str(), R_OK) == 0) {
+      const std::filesystem::path root = std::filesystem::path(real_rocprof).parent_path().parent_path();
+      const std::string overlay = s.dir + "/rocm";
+      std::error_code ec;
+      make_dirs(overlay + "/lib");
+      for (const auto& e : std::filesystem::directory_iterator(root, ec))
+        if (e.path().filename() != "lib") std::filesystem::create_symlink(e.path(), overlay + "/" + e.path().filename().string(), ec);
+      for (const auto& e : std::filesystem::directory_iterator(root / "lib", ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("librocprofiler-sdk.so", 0) == 0) continue;
+        std::filesystem::create_symlink(e.path(), overlay + "/lib/" + name, ec);
+      }
+      std::filesystem::create_symlink(sdk, overlay + "/lib/librocprofiler-sdk.so.1", ec);
+      std::filesystem::create_symlink(sdk, overlay + "/lib/librocprofiler-sdk.so", ec);
+      tool("rocprofv3", "# AMD's rocprofv3 over the simulated GPU (vgpu shell).\n"
+                        "exec \"" + real_rocprof + "\" --rocm-root \"" + overlay + "\" \"$@\"\n");
+    }
+  }
   tool("vgpu", "exec \"" + vgpu + "\" \"$@\"\n");
   return s;
 }
@@ -881,15 +929,15 @@ int cmd_shell(const std::vector<std::string>& args) {
     }
   }
 
-  // The session's tools go first, and every CUDA bin directory a build system
-  // might reach for goes right behind them. Tools routinely prepend the
-  // toolkit's directory to whatever PATH they were given -- pantheon.py does
-  // exactly that -- but only when it is not already there, so listing them all
-  // here is what keeps the session's nvcc in front of the real one.
+  // The session's tools go first, and every CUDA (or, on an AMD machine,
+  // ROCm) bin directory a build system might reach for goes right behind
+  // them. Tools routinely prepend the toolkit's directory to whatever PATH
+  // they were given -- pantheon.py does exactly that -- but only when it is
+  // not already there, so listing them all here is what keeps the session's
+  // nvcc and rocprofv3 in front of the real ones.
   std::string path = s.bin;
-  if (profile.vendor != "amd")
-    for (const std::string& dir : cuda_bin_directories())
-      if (path.find(dir) == std::string::npos) path += ":" + dir;
+  for (const std::string& dir : profile.vendor == "amd" ? rocm_bin_directories() : cuda_bin_directories())
+    if (path.find(dir) == std::string::npos) path += ":" + dir;
   path += ":" + std::string(std::getenv("PATH") ? std::getenv("PATH") : "/usr/bin:/bin");
   setenv("PATH", path.c_str(), 1);
   if (profile.vendor == "amd" && !isolated)

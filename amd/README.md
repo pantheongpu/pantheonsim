@@ -142,6 +142,53 @@ reads the hardware's; and the counter a wave reads to time itself counts the
 instructions the dispatch has retired, which is this model's cycle, where a
 card's counts at a fixed rate.
 
+## Profiling
+
+AMD's profiler, `rocprofv3`, runs unmodified on a simulated GPU. It is a front
+end over a tool library that asks `librocprofiler-sdk` for the machine's agents
+and counters and subscribes to what the runtime does; VirtualGPU's
+`librocprofiler-sdk` (`src/rocprofiler_sdk.cpp`, built into `build/shim`)
+answers from the simulated devices, and the HIP runtime reports to it every
+HIP call, every code object placed on a device and its kernels, every copy
+and allocation, and every launch with what its waves did. Inside
+`vgpu shell --gpu amd/mi300x`, with ROCm and its rocprofiler-sdk installed:
+
+    rocprofv3 --pmc SQ_WAVES SQ_INSTS_VALU TA_FLAT_READ_WAVEFRONTS --kernel-trace -d out -- ./app
+    rocprofv3 --runtime-trace --output-format csv -d out -- ./app
+    rocprofv3-avail list --pmc
+
+The session's `rocprofv3` is ROCm's own, given `--rocm-root` pointing at a copy
+of the installation whose `librocprofiler-sdk` is VirtualGPU's (rocprofv3
+loads it by path); `rocprofv3-avail` needs nothing, since its library finds
+the shim's first.
+
+The counters offered are the ones the interpreter counts exactly, because
+every instruction a wave issues passes through it once: `SQ_WAVES` and the
+waves by how many lanes they start with, the instructions each unit issues
+(`SQ_INSTS_VALU`, `_MFMA`, `_SALU`, `_SMEM`, `_VMEM`, `_FLAT`, `_LDS`,
+`_BRANCH`, `_SENDMSG`, `_GDS`), and the flat reads, writes and atomics the
+texture addresser takes (`TA_FLAT_*`). Each is the device's total, as one
+instance. A counter of cycles, stalls, cache hits or memory traffic would
+need a model of the hardware's timing, and there is none, so those are not
+offered: rocprofv3 says the device does not have one, as it does for a
+counter a real GPU lacks, rather than printing a number that was made up.
+One count is a reading of AMD's description rather than a measurement on a
+card: a generic flat access that reaches LDS counts toward `SQ_INSTS_LDS` as
+well as `SQ_INSTS_FLAT` ("including FLAT").
+
+Times in the traces are the simulation's own, on the clock
+`/proc/<pid>/stat` uses: a truthful order and truthful durations of the
+simulation, and nothing about how long a card would take. There is no HSA
+runtime, so no HSA trace; no PC sampling or thread trace, which need the
+hardware's sampling and trace units; and no records of the kernels ROCm's
+runtime runs on its own behalf (a device-to-device copy or a memset is not a
+kernel here).
+
+`test_amd_rocprofiler` is a profiling tool of its own that runs everywhere;
+`amd_rocprofv3` runs AMD's rocprofv3 in a session wherever rocprofiler-sdk is
+installed, and `amd_rocprofiler_abi` checks every structure against its
+headers.
+
 ## The pantheon workloads
 
 `amd/tools/run-pantheon-workloads.sh [pantheongpu-repo]` builds the pantheon
@@ -183,7 +230,7 @@ modelled yet.
 | `profiles/` | MI300X, MI325X and MI350X. MI325X was read from a physical card with `tools/rocminfo-to-profile.py`; the others are placeholders, and each file's header says which |
 | `registers/` | the MMIO database, each model's registers and their power-on values, and the amdgpu headers' licence |
 | `src/` | the register model, the metrics table and CPER records; code objects and CDNA decoding; the HIP runtime and ROCm libraries once they are written |
-| `tools/` | `rocm-smi`, `amd-smi` and `rocm_agent_enumerator` for simulated machines, and the scripts that characterize a card (`characterize-hip.cpp`, the DigitalOcean scripts) |
+| `tools/` | `rocm-smi`, `amd-smi` and `rocm_agent_enumerator` for simulated machines, the generators of the HIP version script and rocprofiler-sdk's HIP call numbers, and the scripts that characterize a card (`characterize-hip.cpp`, the DigitalOcean scripts) |
 | `tests/` | the AMD unit and end-to-end tests, and the code object they read (`tests/data/build.sh` rebuilds it with clang; no ROCm needed) |
 
 The libraries follow the runtime, each checked against the real one on

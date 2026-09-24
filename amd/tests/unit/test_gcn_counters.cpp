@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "vgpu/amd_codeobject.hpp"
+#include "counters_oracle.hpp"
 #include "vgpu/amd_exec.hpp"
 #include "vtest.hpp"
 
@@ -26,55 +27,6 @@ amd::CodeObject object() {
   std::ifstream in(path, std::ios::binary);
   if (!in) throw vtest::Failure("no code object at " + path);
   return amd::load_code_object(std::string((std::istreambuf_iterator<char>(in)), {}), path);
-}
-
-bool starts(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
-
-// One wave's counts, from the listing.
-struct Expected {
-  uint64_t all = 0, valu = 0, mfma = 0, salu = 0, smem = 0, vmem = 0, flat = 0, generic = 0, lds = 0, branch = 0;
-  uint64_t reads = 0, writes = 0, atomics = 0;
-};
-
-Expected from_listing() {
-  std::ifstream in(kData + "counters.gfx942.dis");
-  if (!in) throw vtest::Failure("no listing at " + kData + "counters.gfx942.dis");
-  Expected e;
-  // counted_mix, the first kernel in the listing, up to its s_endpgm.
-  // The sequencer's own instructions: they go to no execution unit.
-  const std::vector<std::string> sequencer = {"s_nop", "s_waitcnt", "s_endpgm", "s_barrier", "s_sleep",
-                                              "s_setprio", "s_sendmsg", "s_trap", "s_icache_inv"};
-  std::string line;
-  while (std::getline(in, line)) {
-    const std::string m = line.substr(0, line.find(' '));
-    ++e.all;
-    if (starts(m, "v_")) {
-      ++e.valu;
-      e.mfma += starts(m, "v_mfma") || starts(m, "v_smfmac");
-    } else if (starts(m, "ds_")) {
-      ++e.lds;
-    } else if (starts(m, "global_") || starts(m, "flat_") || starts(m, "scratch_")) {
-      ++e.vmem;
-      ++e.flat;
-      e.generic += starts(m, "flat_");
-      if (m.find("_atomic") != std::string::npos) ++e.atomics;
-      else if (m.find("_store") != std::string::npos) ++e.writes;
-      else ++e.reads;
-    } else if (starts(m, "buffer_")) {
-      ++e.vmem;
-    } else if (starts(m, "s_load") || starts(m, "s_buffer_load") || starts(m, "s_store") || starts(m, "s_dcache") ||
-               starts(m, "s_memtime") || starts(m, "s_memrealtime")) {
-      ++e.smem;
-    } else if (m == "s_branch" || starts(m, "s_cbranch_")) {
-      ++e.branch;
-    } else if (starts(m, "s_")) {
-      bool seq = false;
-      for (const std::string& s : sequencer) seq = seq || m == s;
-      e.salu += !seq;
-    }
-    if (m == "s_endpgm") break;
-  }
-  return e;
 }
 
 uint64_t kernargs(MemoryManager& mem, const amd::Kernel& k, const std::vector<uint64_t>& values) {
@@ -110,7 +62,7 @@ amd::DispatchStats run(const amd::CodeObject& o, const char* name, uint32_t grou
 
 VTEST(the_counting_kernel_has_no_branches) {
   // What makes a count the listing's times the waves.
-  const Expected e = from_listing();
+  const Expected e = from_listing(kData);
   VCHECK_EQ(e.branch, 0u);
   VCHECK(e.valu > 0 && e.mfma == 1 && e.salu > 0 && e.smem > 0 && e.lds == 2 && e.generic == 1);
   VCHECK(e.reads > 0 && e.writes > 0 && e.atomics == 1);
@@ -118,7 +70,7 @@ VTEST(the_counting_kernel_has_no_branches) {
 
 VTEST(each_count_is_the_listing_times_the_waves) {
   const amd::CodeObject o = object();
-  const Expected e = from_listing();
+  const Expected e = from_listing(kData);
   const amd::DispatchStats s = run(o, "counted_mix", 3, 64, false);
   const uint64_t w = 3;
   VCHECK_EQ(s.waves, w);
@@ -140,7 +92,7 @@ VTEST(each_count_is_the_listing_times_the_waves) {
 
 VTEST(a_flat_access_that_reaches_lds_counts_as_lds_too) {
   const amd::CodeObject o = object();
-  const Expected e = from_listing();
+  const Expected e = from_listing(kData);
   const amd::DispatchStats s = run(o, "counted_mix", 2, 64, true);
   VCHECK_EQ(s.counts.lds, (e.lds + e.generic) * 2);
   VCHECK_EQ(s.counts.flat, e.flat * 2);   // and is still a flat instruction
