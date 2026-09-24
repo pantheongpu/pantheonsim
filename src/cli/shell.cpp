@@ -408,6 +408,9 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   // Each runs under its own name (exec -a), so the register access log names
   // the tool that made an access rather than vgpu.
   tool("nvidia-smi", "# VirtualGPU session tool.\nexec -a nvidia-smi \"" + vgpu + "\" smi \"$@\"\n");
+  // NVIDIA's ncu cannot attach to a simulated driver, so the session's ncu is
+  // `vgpu ncu`: the same command line, answered from the simulator's counters.
+  tool("ncu", "# VirtualGPU session tool.\nexec -a ncu \"" + vgpu + "\" ncu \"$@\"\n");
   tool("rocm-smi", "exec -a rocm-smi \"" + vgpu + "\" smi --rocm \"$@\"\n");
   tool("amd-smi", "exec -a amd-smi \"" + vgpu + "\" smi --amd \"$@\"\n");
   tool("rocm_agent_enumerator", "exec -a rocm_agent_enumerator \"" + vgpu + "\" smi --agents\n");

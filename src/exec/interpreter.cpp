@@ -1181,7 +1181,8 @@ class Interpreter {
   // `addrs` holds one address per lane, valid where `m` is set. `bytes` is the
   // per-lane access width, `count` the number of consecutive elements a vector
   // access touches from that address.
-  void count_addresses(Space space, const Lanes& addrs, Mask m, uint32_t bytes, size_t count) {
+  void count_addresses(Space space, const Lanes& addrs, Mask m, uint32_t bytes, size_t count,
+                       bool is_store) {
     if (m == 0) return;
     const uint64_t span = static_cast<uint64_t>(bytes) * count;
 
@@ -1210,6 +1211,13 @@ class Interpreter {
       }
       stats_.shared_bank_conflicts += worst - 1;
       ++stats_.shared_requests;
+      if (is_store) {
+        stats_.shared_bank_conflicts_st += worst - 1;
+        ++stats_.shared_requests_st;
+      } else {
+        stats_.shared_bank_conflicts_ld += worst - 1;
+        ++stats_.shared_requests_ld;
+      }
       return;
     }
 
@@ -1237,6 +1245,16 @@ class Interpreter {
     } else {
       stats_.global_sectors += distinct;
       ++stats_.global_requests;
+      const uint64_t asked = span * popcount_mask(m);   // bytes the lanes asked for
+      if (is_store) {
+        stats_.global_sectors_st += distinct;
+        ++stats_.global_requests_st;
+        stats_.global_bytes_st += asked;
+      } else {
+        stats_.global_sectors_ld += distinct;
+        ++stats_.global_requests_ld;
+        stats_.global_bytes_ld += asked;
+      }
     }
   }
 
@@ -1647,14 +1665,18 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpLd>(&ins.op)) {
-      count_memory(op->space, op->ty.bytes(), popcount_mask(m), /*is_store=*/false);
+      // Every element of a vector access: an ld.v4 moves four times the
+      // element's bytes, and counting one element undercounted it that much.
+      count_memory(op->space, op->ty.bytes() * static_cast<uint32_t>(op->dsts.size()),
+                   popcount_mask(m), /*is_store=*/false);
       exec_ld(w, ctx, ins, *op, m);
       // ld.acquire: nothing after it may be seen to happen before it.
       if (op->acquire) std::atomic_thread_fence(std::memory_order_acquire);
       return;
     }
     if (const auto* op = std::get_if<OpSt>(&ins.op)) {
-      count_memory(op->space, op->ty.bytes(), popcount_mask(m), /*is_store=*/true);
+      count_memory(op->space, op->ty.bytes() * static_cast<uint32_t>(op->srcs.size()),
+                   popcount_mask(m), /*is_store=*/true);
       // st.release: nothing before it may be seen to happen after it.
       if (op->release) std::atomic_thread_fence(std::memory_order_release);
       exec_st(w, ctx, ins, *op, m);
@@ -4266,7 +4288,7 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane))
           at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
-      count_addresses(op.space, at, m, size, n);
+      count_addresses(op.space, at, m, size, n, /*is_store=*/false);
     }
     std::vector<Lanes> results(n);
     for (uint32_t lane = 0; lane < W_; ++lane)
@@ -4331,7 +4353,7 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane))
           at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
-      count_addresses(op.space, at, m, size, n);
+      count_addresses(op.space, at, m, size, n, /*is_store=*/true);
     }
     for (uint32_t lane = 0; lane < W_; ++lane)
       if (m & (Mask{1} << lane)) {

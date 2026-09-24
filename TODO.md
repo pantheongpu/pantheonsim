@@ -71,6 +71,24 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   compares which nodes each node depends on, not only how many: a graph rewired
   between two nodes used to pass as the same shape and have its parameters taken.
   e2e_graph_nodes covers all of it.
+- Nsight Compute's command line over the simulator's counters: `vgpu ncu`, which
+  is what `ncu` runs inside `vgpu shell`. NVIDIA's ncu cannot attach to a
+  simulated driver -- it reaches the driver through undocumented interfaces and
+  reports it "failed to connect" -- so Pantheon's --profile failed at its counter
+  pass. This answers the commands Pantheon drives (--query-metrics, --csv,
+  --metrics, --set, launch and kernel filters, --log-file) with the counters the
+  engine records for every launch, written per launch to VGPU_COUNTERS_FILE. It
+  lists and reports only metrics counted exactly under Nsight Compute's own
+  definitions -- global and shared load/store instruction counts, global sectors
+  and requests, bytes used per sector, shared bank conflicts, twelve in all --
+  and names the rest as not reported rather than inventing them. Pantheon's
+  --profile now completes: twelve metrics validated, the other seventy-four
+  recorded as skipped in its manifest, and its timeline pass still uses NVIDIA's
+  nsys, which produces a genuine report with OS-runtime rows and no CUDA ones.
+  Along the way, vector loads and stores were counted as one element in the byte
+  totals, a quarter of an ld.v4's traffic; they count every element now.
+  e2e_ncu checks values against kernels whose metrics follow from their
+  addresses.
 - Streams are distinct. Every cudaStreamCreate used to return the same handle,
   0x1 -- cudaStreamLegacy -- so two streams compared equal, a capture begun on
   one captured the work sent to every other, and a kernel launched on a second

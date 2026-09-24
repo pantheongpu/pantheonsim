@@ -563,6 +563,51 @@ VTEST(launch_counters_are_exact) {
   mem.free(buf);
 }
 
+
+// A vector access moves every element: ld.global.v4 reads sixteen bytes a lane,
+// not four. The byte totals used to count one element, so a float4 kernel was
+// reported as moving a quarter of what it did. The direction-split counts a
+// profiler reads come out alongside: one request each way, sixteen sectors.
+VTEST(vector_accesses_count_every_element_they_move) {
+  const char* kPtx = R"(
+.version 8.0
+.target sm_86
+.address_size 64
+.visible .entry v4(.param .u64 p)
+{
+  .reg .b32 %r<2>;
+  .reg .f32 %f<5>;
+  .reg .b64 %rd<5>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd3, %r1, 16;
+  add.s64 %rd4, %rd2, %rd3;
+  ld.global.v4.f32 {%f1, %f2, %f3, %f4}, [%rd4];
+  st.global.v4.f32 [%rd4], {%f1, %f2, %f3, %f4};
+  ret;
+}
+)";
+  ptx::Module m = ptx::parse(kPtx);
+  MemoryManager mem(1 << 20);
+  uint64_t buf = mem.alloc(32 * 16);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {32, 1, 1};
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &buf, 8);
+  auto st = exec::launch(m.entries[0], cfg, {arg}, mem, prof);
+
+  VCHECK_EQ(st.global_bytes_read, 32ull * 16);
+  VCHECK_EQ(st.global_bytes_written, 32ull * 16);
+  VCHECK_EQ(st.global_bytes_ld, 32ull * 16);
+  VCHECK_EQ(st.global_bytes_st, 32ull * 16);
+  VCHECK_EQ(st.global_requests_ld, 1ull);
+  VCHECK_EQ(st.global_requests_st, 1ull);
+  VCHECK_EQ(st.global_sectors_ld, 16ull);   // 512 contiguous bytes
+  VCHECK_EQ(st.global_sectors_st, 16ull);
+}
 VTEST(divergence_is_counted_only_when_lanes_disagree) {
   // Half the warp takes the branch, so it diverges exactly once per warp.
   const char* kPtx = R"(

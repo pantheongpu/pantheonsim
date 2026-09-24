@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <atomic>
 #include <thread>
+#include <mutex>
 #include <algorithm>
 #include <utility>
 #include "vgpu/runtime/runtime.hpp"
@@ -156,8 +157,52 @@ bool counters_enabled() {
   return on;
 }
 
-void report_counters(const std::string& kernel, const exec::LaunchConfig& cfg,
+// One record per launch, as a line of JSON, for a tool that reads counters
+// rather than a person: `vgpu ncu` sets VGPU_COUNTERS_FILE, runs the program,
+// and reports from the file. Every counter is written under the name it has in
+// LaunchStats, so the reader decides what each means rather than this file.
+void record_counters(int device, const std::string& kernel, const exec::LaunchConfig& cfg,
                      const exec::LaunchStats& st) {
+  static const char* path = std::getenv("VGPU_COUNTERS_FILE");
+  if (!path || !*path) return;
+  static std::mutex mu;
+  static std::atomic<uint64_t> seq{0};
+  char buf[4096];
+  const auto u = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+  const int n = std::snprintf(
+      buf, sizeof buf,
+      "{\"launch\":%llu,\"pid\":%d,\"device\":%d,\"kernel\":\"%s\","
+      "\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],"
+      "\"blocks\":%llu,\"warps\":%llu,\"instructions\":%llu,\"thread_instructions\":%llu,"
+      "\"global_loads\":%llu,\"global_stores\":%llu,"
+      "\"global_bytes_read\":%llu,\"global_bytes_written\":%llu,"
+      "\"shared_loads\":%llu,\"shared_stores\":%llu,"
+      "\"shared_bytes_read\":%llu,\"shared_bytes_written\":%llu,"
+      "\"global_sectors_ld\":%llu,\"global_sectors_st\":%llu,"
+      "\"global_requests_ld\":%llu,\"global_requests_st\":%llu,"
+      "\"shared_requests_ld\":%llu,\"shared_requests_st\":%llu,"
+      "\"shared_bank_conflicts_ld\":%llu,\"shared_bank_conflicts_st\":%llu,"
+      "\"global_bytes_ld\":%llu,\"global_bytes_st\":%llu}\n",
+      u(seq.fetch_add(1)), static_cast<int>(getpid()), device, kernel.c_str(), cfg.grid[0],
+      cfg.grid[1], cfg.grid[2], cfg.block[0], cfg.block[1], cfg.block[2], u(st.blocks),
+      u(st.warps), u(st.instructions), u(st.thread_instructions), u(st.global_loads),
+      u(st.global_stores), u(st.global_bytes_read), u(st.global_bytes_written),
+      u(st.shared_loads), u(st.shared_stores), u(st.shared_bytes_read),
+      u(st.shared_bytes_written), u(st.global_sectors_ld), u(st.global_sectors_st),
+      u(st.global_requests_ld), u(st.global_requests_st), u(st.shared_requests_ld),
+      u(st.shared_requests_st), u(st.shared_bank_conflicts_ld), u(st.shared_bank_conflicts_st),
+      u(st.global_bytes_ld), u(st.global_bytes_st));
+  if (n <= 0 || static_cast<size_t>(n) >= sizeof buf) return;   // a name too long to record
+  std::lock_guard<std::mutex> lock(mu);
+  if (std::FILE* f = std::fopen(path, "a")) {
+    std::fwrite(buf, 1, static_cast<size_t>(n), f);
+    std::fclose(f);
+  }
+}
+
+void report_counters(int device, const std::string& kernel, const exec::LaunchConfig& cfg,
+                     const exec::LaunchStats& st) {
+  record_counters(device, kernel, cfg, st);
   if (!counters_enabled()) return;
   const double lanes = st.instructions ? static_cast<double>(st.thread_instructions) /
                                              static_cast<double>(st.instructions)
@@ -507,7 +552,7 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
 void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
                         const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms) {
   if (!telemetry_) {
-    report_counters(fn.name, cfg, exec::launch(fn, cfg, args, mem_, profile_, syms));
+    report_counters(ordinal_, fn.name, cfg, exec::launch(fn, cfg, args, mem_, profile_, syms));
     return;
   }
   // Utilization is the real fraction of wall time spent executing kernels. The
@@ -518,7 +563,7 @@ void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
   auto start = std::chrono::steady_clock::now();
   const exec::LaunchStats st = exec::launch(fn, cfg, args, mem_, profile_, syms,
                [pub, ord](double dt) { pub->note_kernel(ord, dt); });
-  report_counters(fn.name, cfg, st);
+  report_counters(ordinal_, fn.name, cfg, st);
   double busy = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   pub->note_kernel(ord, 0.0);
   (void)busy;

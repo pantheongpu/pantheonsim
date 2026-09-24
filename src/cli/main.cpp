@@ -35,6 +35,8 @@ int usage(FILE* to) {
                "                                       real ones (vgpu run --help for options)\n"
                "  vgpu counters                        What performance counters this reports, and\n"
                "                                       which it cannot, with the reason\n"
+               "  vgpu ncu [opts] <program> [args...]  Nsight Compute's command line over those\n"
+               "                                       counters; `ncu` in a vgpu shell (--help)\n"
                "  vgpu test --matrix <program> [args]  Run a program on every device profile and\n"
                "                                       compare the results (vgpu test --help)\n"
                "  vgpu fault inject|arm|stuck|lose|... Inject faults: ECC, PCIe, hangs, a lost GPU,\n"
@@ -118,6 +120,9 @@ int cmd_counters() {
               "timing model, and a plausible wrong number is worse than no number.\n\n");
   for (const Row& r : kAbsent) std::printf("  %-42s %s\n", r.name, r.what);
   std::printf("\nTurn the reported ones on with VGPU_COUNTERS=1.\n"
+              "`vgpu ncu` -- `ncu` inside `vgpu shell` -- answers Nsight Compute's command\n"
+              "line from these: the memory metrics fixed by the addresses a kernel used,\n"
+              "under Nsight Compute's names, and nothing that needs the models above.\n"
               "The CUPTI shim advertises zero event domains and zero metrics for the\n"
               "same reason: nvprof gets real activity records and no counters.\n");
   return 0;
@@ -219,6 +224,8 @@ int cmd_shell(const std::vector<std::string>& args);
 int cmd_run(const std::vector<std::string>& args);
 // Implemented in test.cpp.
 int cmd_test(const std::vector<std::string>& args);
+// Implemented in ncu.cpp.
+int cmd_ncu(const std::vector<std::string>& args);
 
 int main(int argc, char** argv) {
   std::vector<std::string> args(argv + 1, argv + argc);
@@ -240,6 +247,7 @@ int main(int argc, char** argv) {
     if (cmd == "shell") return cmd_shell({args.begin() + 1, args.end()});
     if (cmd == "run") return cmd_run({args.begin() + 1, args.end()});
     if (cmd == "test") return cmd_test({args.begin() + 1, args.end()});
+    if (cmd == "ncu") return cmd_ncu({args.begin() + 1, args.end()});
     if (cmd == "info") {
       std::string gpu;
       bool json = false;
