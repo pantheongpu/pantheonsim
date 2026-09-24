@@ -33,6 +33,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop1, 0x00}, {"s_mov_b32", 1, 1}},
       {{Enc::Sop1, 0x01}, {"s_mov_b64", 2, 1, 2}},
       {{Enc::Sop1, 0x08}, {"s_brev_b32", 1, 1}},
+      {{Enc::Sop1, 0x0d}, {"s_bcnt1_i32_b64", 1, 1, 2}},
       {{Enc::Sop1, 0x11}, {"s_ff1_i32_b64", 1, 1, 2}},
       // Where the wave is: what a kernel adds a constant to, to reach a global.
       {{Enc::Sop1, 0x1c}, {"s_getpc_b64", 2, 0}},
@@ -41,12 +42,15 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop1, 0x1d}, {"s_setpc_b64", 0, 1, 2}},
       {{Enc::Sop1, 0x1e}, {"s_swappc_b64", 2, 1, 2}},
       {{Enc::Sop1, 0x20}, {"s_and_saveexec_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x21}, {"s_or_saveexec_b64", 2, 1, 2}},
       {{Enc::Sop1, 0x23}, {"s_andn2_saveexec_b64", 2, 1, 2}},
       // SOP2: two scalar sources.
       {{Enc::Sop2, 0x00}, {"s_add_u32", 1, 2}},
+      {{Enc::Sop2, 0x01}, {"s_sub_u32", 1, 2}},
       {{Enc::Sop2, 0x02}, {"s_add_i32", 1, 2}},
       {{Enc::Sop2, 0x03}, {"s_sub_i32", 1, 2}},
       {{Enc::Sop2, 0x04}, {"s_addc_u32", 1, 2}},
+      {{Enc::Sop2, 0x05}, {"s_subb_u32", 1, 2}},
       {{Enc::Sop2, 0x0a}, {"s_cselect_b32", 1, 2}},
       {{Enc::Sop2, 0x0b}, {"s_cselect_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x0c}, {"s_and_b32", 1, 2}},
@@ -56,29 +60,46 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop2, 0x10}, {"s_xor_b32", 1, 2}},
       {{Enc::Sop2, 0x11}, {"s_xor_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x13}, {"s_andn2_b64", 2, 2, 2, 2}},
+      {{Enc::Sop2, 0x15}, {"s_orn2_b64", 2, 2, 2, 2}},
+      {{Enc::Sop2, 0x1c}, {"s_lshl_b32", 1, 2}},
       {{Enc::Sop2, 0x1d}, {"s_lshl_b64", 2, 2, 2, 1}},
       {{Enc::Sop2, 0x1e}, {"s_lshr_b32", 1, 2}},
+      {{Enc::Sop2, 0x1f}, {"s_lshr_b64", 2, 2, 2, 1}},
       {{Enc::Sop2, 0x20}, {"s_ashr_i32", 1, 2}},
       {{Enc::Sop2, 0x24}, {"s_mul_i32", 1, 2}},
       {{Enc::Sop2, 0x2c}, {"s_mul_hi_u32", 1, 2}},
       // SOPK: a 16-bit immediate.
       {{Enc::Sopk, 0x00}, {"s_movk_i32", 1, 0}},
       {{Enc::Sopk, 0x0f}, {"s_mulk_i32", 1, 0}},
+      // A comparison against the instruction's own constant: the register
+      // field names what is compared, not where a result goes.
+      {{Enc::Sopk, 0x02}, {"s_cmpk_eq_i32", 1, 0}},
       // SOPP: an immediate, and no registers.
       {{Enc::Sopp, 0x00}, {"s_nop", 0, 0}},
       {{Enc::Sopp, 0x01}, {"s_endpgm", 0, 0}},
       {{Enc::Sopp, 0x02}, {"s_branch", 0, 0}},
       {{Enc::Sopp, 0x04}, {"s_cbranch_scc0", 0, 0}},
       {{Enc::Sopp, 0x05}, {"s_cbranch_scc1", 0, 0}},
+      {{Enc::Sopp, 0x06}, {"s_cbranch_vccz", 0, 0}},
+      {{Enc::Sopp, 0x07}, {"s_cbranch_vccnz", 0, 0}},
       {{Enc::Sopp, 0x08}, {"s_cbranch_execz", 0, 0}},
       {{Enc::Sopp, 0x09}, {"s_cbranch_execnz", 0, 0}},
       {{Enc::Sopp, 0x0a}, {"s_barrier", 0, 0}},
       {{Enc::Sopp, 0x0c}, {"s_waitcnt", 0, 0}},
+      {{Enc::Sopp, 0x0e}, {"s_sleep", 0, 0}},
+      // A message to the host: MSG_INTERRUPT is how a kernel wakes the host
+      // for a hostcall, which is what device-side printf is built on.
+      {{Enc::Sopp, 0x10}, {"s_sendmsg", 0, 0}},
       // SOPC: a scalar comparison, which sets SCC.
+      {{Enc::Sopc, 0x02}, {"s_cmp_gt_i32", 0, 2}},
+      {{Enc::Sopc, 0x03}, {"s_cmp_ge_i32", 0, 2}},
       {{Enc::Sopc, 0x04}, {"s_cmp_lt_i32", 0, 2}},
       {{Enc::Sopc, 0x06}, {"s_cmp_eq_u32", 0, 2}},
+      {{Enc::Sopc, 0x07}, {"s_cmp_lg_u32", 0, 2}},
+      {{Enc::Sopc, 0x08}, {"s_cmp_gt_u32", 0, 2}},
       {{Enc::Sopc, 0x09}, {"s_cmp_ge_u32", 0, 2}},
       {{Enc::Sopc, 0x0a}, {"s_cmp_lt_u32", 0, 2}},
+      {{Enc::Sopc, 0x12}, {"s_cmp_eq_u64", 0, 2, 2, 2}},
       {{Enc::Sopc, 0x13}, {"s_cmp_lg_u64", 0, 2, 2, 2}},
       // SMEM: a scalar load through a 64-bit base address.
       {{Enc::Smem, 0x00}, {"s_load_dword", 1, 1, 2}},
@@ -121,6 +142,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x018}, {"v_ceil_f64_e32", 2, 1, 2}},
       {{Enc::Vop1, 0x019}, {"v_rndne_f64_e32", 2, 1, 2}},
       {{Enc::Vop1, 0x01a}, {"v_floor_f64_e32", 2, 1, 2}},
+      {{Enc::Vop1, 0x011}, {"v_cvt_f32_ubyte0_e32", 1, 1}},
       {{Enc::Vop1, 0x01d}, {"v_ceil_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x01e}, {"v_rndne_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x01f}, {"v_floor_f32_e32", 1, 1}},
@@ -130,11 +152,13 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x023}, {"v_rcp_iflag_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x025}, {"v_rcp_f64_e32", 2, 1, 2}},
       {{Enc::Vop1, 0x026}, {"v_rsq_f64_e32", 2, 1, 2}},
+      {{Enc::Vop1, 0x024}, {"v_rsq_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x027}, {"v_sqrt_f32_e32", 1, 1}},
       // The sine and the cosine of a turn: the argument is in turns, not
       // radians, which is why the compiler multiplies by 1/2pi first.
       {{Enc::Vop1, 0x029}, {"v_sin_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x02a}, {"v_cos_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x02b}, {"v_not_b32_e32", 1, 1}},
       {{Enc::Vop1, 0x02c}, {"v_bfrev_b32_e32", 1, 1}},
       {{Enc::Vop1, 0x02d}, {"v_ffbh_u32_e32", 1, 1}},
       {{Enc::Vop1, 0x033}, {"v_frexp_exp_i32_f32_e32", 1, 1}},
@@ -165,6 +189,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop2, 0x017}, {"v_fmamk_f32", 1, 2}},
       // The carry forms: each writes a mask of the lanes that carried beside
       // its result, and the two that take one read it back.
+      // ...and v_fmaak_f32, whose constant comes last.
+      {{Enc::Vop2, 0x018}, {"v_fmaak_f32", 1, 2}},
       {{Enc::Vop2, 0x019}, {"v_add_co_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x01a}, {"v_sub_co_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x01c}, {"v_addc_co_u32_e32", 1, 2}},
@@ -194,6 +220,17 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vopc, 0x066}, {"v_cmp_ge_f64_e32", 2, 2, 2, 2}},
       {{Enc::Vopc, 0x06d}, {"v_cmp_neq_f64_e32", 2, 2, 2, 2}},
       {{Enc::Vopc, 0x041}, {"v_cmp_lt_f32_e32", 2, 2}},
+      {{Enc::Vopc, 0x042}, {"v_cmp_eq_f32_e32", 2, 2}},
+      // The negated forms, which a NaN answers "yes" to.
+      {{Enc::Vopc, 0x049}, {"v_cmp_nge_f32_e32", 2, 2}},
+      {{Enc::Vopc, 0x04b}, {"v_cmp_ngt_f32_e32", 2, 2}},
+      {{Enc::Vopc, 0x04d}, {"v_cmp_neq_f32_e32", 2, 2}},
+      {{Enc::Vopc, 0x04e}, {"v_cmp_nlt_f32_e32", 2, 2}},
+      {{Enc::Vopc, 0x0ad}, {"v_cmp_ne_u16_e32", 2, 2}},
+      {{Enc::Vopc, 0x0c9}, {"v_cmp_lt_u32_e32", 2, 2}},
+      {{Enc::Vopc, 0x0eb}, {"v_cmp_le_u64_e32", 2, 2, 2, 2}},
+      {{Enc::Vopc, 0x0ec}, {"v_cmp_gt_u64_e32", 2, 2, 2, 2}},
+      {{Enc::Vopc, 0x0ee}, {"v_cmp_ge_u64_e32", 2, 2, 2, 2}},
       {{Enc::Vopc, 0x044}, {"v_cmp_gt_f32_e32", 2, 2}},
       {{Enc::Vopc, 0x046}, {"v_cmp_ge_f32_e32", 2, 2}},
       {{Enc::Vopc, 0x0c1}, {"v_cmp_lt_i32_e32", 2, 2}},
@@ -208,10 +245,20 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // third; the shift itself is always 32-bit.
       {{Enc::Vop3, 0x041}, {"v_cmp_lt_f32_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x044}, {"v_cmp_gt_f32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x010}, {"v_cmp_class_f32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x02b}, {"v_cmp_ngt_f16_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x04b}, {"v_cmp_ngt_f32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x04e}, {"v_cmp_nlt_f32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x06b}, {"v_cmp_ngt_f64_e64", 2, 2, 2, 2, 1, false, true}},
       {{Enc::Vop3, 0x0c9}, {"v_cmp_lt_u32_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x0ca}, {"v_cmp_eq_u32_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x0cd}, {"v_cmp_ne_u32_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x0ce}, {"v_cmp_ge_u32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x0cb}, {"v_cmp_le_u32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x0cc}, {"v_cmp_gt_u32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x0e9}, {"v_cmp_lt_u64_e64", 2, 2, 2, 2, 1, false, true}},
+      {{Enc::Vop3, 0x0eb}, {"v_cmp_le_u64_e64", 2, 2, 2, 2, 1, false, true}},
+      {{Enc::Vop3, 0x0ec}, {"v_cmp_gt_u64_e64", 2, 2, 2, 2, 1, false, true}},
       {{Enc::Vop3, 0x101}, {"v_add_f32_e64", 1, 2}},
       // The long forms of the carry arithmetic, which name the pair they
       // write the carry to rather than always using VCC.
@@ -225,6 +272,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x10b}, {"v_max_f32_e64", 1, 2}},
       {{Enc::Vop3, 0x100}, {"v_cndmask_b32_e64", 1, 3, 1, 1, 2}},
       {{Enc::Vop3, 0x102}, {"v_sub_f32_e64", 1, 2}},
+      {{Enc::Vop3, 0x105}, {"v_mul_f32_e64", 1, 2}},
+      {{Enc::Vop3, 0x112}, {"v_lshlrev_b32_e64", 1, 2}},
+      {{Enc::Vop3, 0x11b}, {"v_subrev_co_u32_e64", 1, 2, 1, 1, 1, true}},
+      {{Enc::Vop3, 0x1c3}, {"v_mad_u32_u24", 1, 3}},
       {{Enc::Vop3, 0x1c8}, {"v_bfe_u32", 1, 3}},
       {{Enc::Vop3, 0x1d0}, {"v_min3_f32", 1, 3}},
       {{Enc::Vop3, 0x1d1}, {"v_min3_i32", 1, 3}},
@@ -247,7 +298,9 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x1fd}, {"v_lshl_add_u32", 1, 3}},
       {{Enc::Vop3, 0x1ed}, {"v_perm_b32", 1, 3}},
       {{Enc::Vop3, 0x1f3}, {"v_xad_u32", 1, 3}},
+      {{Enc::Vop3, 0x1fe}, {"v_add_lshl_u32", 1, 3}},
       {{Enc::Vop3, 0x1ff}, {"v_add3_u32", 1, 3}},
+      {{Enc::Vop3, 0x201}, {"v_and_or_b32", 1, 3}},
       {{Enc::Vop3, 0x200}, {"v_lshl_or_b32", 1, 3}},
       {{Enc::Vop3, 0x202}, {"v_or3_b32", 1, 3}},
       {{Enc::Vop3, 0x206}, {"v_fma_f16", 1, 3}},
@@ -268,7 +321,9 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x28d}, {"v_mbcnt_hi_u32_b32", 1, 2}},
       {{Enc::Vop3, 0x28f}, {"v_lshlrev_b64", 2, 2, 1, 2}},
       {{Enc::Vop3, 0x296}, {"v_cvt_pkrtz_f16_f32", 1, 2}},
+      {{Enc::Vop3, 0x290}, {"v_lshrrev_b64", 2, 2, 1, 2}},
       {{Enc::Vop3, 0x291}, {"v_ashrrev_i64", 2, 2, 1, 2}},
+      {{Enc::Vop3, 0x2a0}, {"v_pack_b32_f16", 1, 2}},
       // DS: LDS reads and writes. A read takes the address; a write takes the
       // address and the data.
       {{Enc::Ds, 0x00}, {"ds_add_u32", 0, 2}},
@@ -308,6 +363,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Flat, 0x13}, {"load_sshort", 1, 1}},
       {{Enc::Flat, 0x14}, {"load_dword", 1, 1}},
       {{Enc::Flat, 0x15}, {"load_dwordx2", 2, 1}},
+      {{Enc::Flat, 0x16}, {"load_dwordx3", 3, 1}},
       {{Enc::Flat, 0x17}, {"load_dwordx4", 4, 1}},
       {{Enc::Flat, 0x18}, {"store_byte", 0, 2}},
       {{Enc::Flat, 0x1a}, {"store_short", 0, 2}},
@@ -323,10 +379,20 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Flat, 0x49}, {"atomic_or", 0, 2}},
       {{Enc::Flat, 0x4a}, {"atomic_xor", 0, 2}},
       {{Enc::Flat, 0x4d}, {"atomic_add_f32", 0, 2}},
+      {{Enc::Flat, 0x61}, {"atomic_cmpswap_x2", 0, 2, 1, 4}},
       {{Enc::Flat, 0x62}, {"atomic_add_x2", 0, 2, 1, 2}},
+      // MUBUF: the buffer instructions. Only the two that act on the caches
+      // are decoded -- a write-back of L2 and an invalidate, which a memory
+      // fence compiles to -- and they take no operands.
+      {{Enc::Mubuf, 0x28}, {"buffer_wbl2", 0, 0}},
+      {{Enc::Mubuf, 0x29}, {"buffer_inv", 0, 0}},
       // VOP3P: a packed pair of halves in one register, both computed at once.
       {{Enc::Vop3p, 0x0e}, {"v_pk_fma_f16", 1, 3}},
       // And the packed float form, where each of the two is a whole register.
+      // A multiply-add over sources that may each be a float or a half,
+      // rounded to a half and written into one half of the destination.
+      {{Enc::Vop3p, 0x21}, {"v_fma_mixlo_f16", 1, 3}},
+      {{Enc::Vop3p, 0x22}, {"v_fma_mixhi_f16", 1, 3}},
       {{Enc::Vop3p, 0x30}, {"v_pk_fma_f32", 2, 3, 2, 2, 2}},
       {{Enc::Vop3p, 0x32}, {"v_pk_add_f32", 2, 2, 2, 2}},
       {{Enc::Vop3p, 0x31}, {"v_pk_mul_f32", 2, 2, 2, 2}},
@@ -435,6 +501,7 @@ const char* enc_name(Enc e) {
     case Enc::Vopc: return "VOPC";
     case Enc::Ds: return "DS";
     case Enc::Flat: return "FLAT";
+    case Enc::Mubuf: return "MUBUF";
     case Enc::Unknown: return "unknown";
   }
   return "unknown";
@@ -669,7 +736,11 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     // float form is modelled beyond the plain arrangement: there a zero in
     // op_sel_hi means one value serves both halves, which is what the
     // compiler does with a constant.
-    if (op_sel != 0 || (op_sel_hi != 0x7 && in.name.find("_f32") == std::string::npos))
+    const bool mix = in.name.rfind("v_fma_mix", 0) == 0;
+    if (mix && (op_sel != 0 || in.clamp))
+      throw Error::make(Err::Unsupported, in.name, " takes a half from the top of a register or clamps its result",
+                        ", which this does not model");
+    if (!mix && (op_sel != 0 || (op_sel_hi != 0x7 && in.name.find("_f32") == std::string::npos)))
       throw Error::make(Err::Unsupported, in.name, " selects halves (op_sel ", op_sel, ", op_sel_hi ", op_sel_hi,
                         "), which this does not model");
     in.dst.push_back(vgpr(w0 & 0xFF, s.dst_width));
@@ -733,6 +804,13 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.src.push_back(vgpr(w1 & 0xFF));                              // the address
     if (s.srcs > 1) in.src.push_back(vgpr((w1 >> 8) & 0xFF, s.src_width(1)));   // the data written
     if (s.srcs > 2) in.src.push_back(vgpr((w1 >> 16) & 0xFF));      // and the second, for a two-address write
+  } else if ((w0 >> 26) == 0x38) {    // MUBUF: here only the cache operations
+    in.enc = Enc::Mubuf;
+    in.opcode = (w0 >> 18) & 0x7F;
+    const Shape& s = shape(in.enc, in.opcode);
+    in.name = s.name;
+    in.size = 8;
+    in.cache = ((w0 >> 14) & 1) | ((w0 >> 17) & 1) << 1 | ((w0 >> 15) & 1) << 2;   // sc0, nt, sc1
   } else if ((w0 >> 26) == 0x37) {    // FLAT, and its global and scratch forms
     in.enc = Enc::Flat;
     in.opcode = (w0 >> 18) & 0x7F;
@@ -813,6 +891,12 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       literal = true;
     }
     in.src.push_back(vgpr((w0 >> 9) & 0xFF, s.src_width(1)));
+    if (in.name == "v_fmaak_f32") {
+      Operand k;
+      k.kind = OperandKind::Literal;
+      in.src.push_back(k);
+      literal = true;
+    }
     // The short form of the select reads its condition from VCC, as the two
     // that take a carry in read theirs.
     if (in.name == "v_cndmask_b32_e32" || carry_in) in.src.push_back(vcc());
@@ -910,8 +994,11 @@ std::string to_text(const Inst& i) {
       for (size_t k = 0; k < i.src.size(); ++k) out += (k ? "," : "") + std::to_string((v >> k) & 1);
       return out + "]";
     };
+    // The mixed-precision forms read every source as a float unless op_sel_hi
+    // says otherwise, so for them the plain arrangement is all zeroes.
+    const uint8_t plain_hi = i.name.rfind("v_fma_mix", 0) == 0 ? 0 : 0x7;
     if (i.op_sel) s += " op_sel:" + bits(i.op_sel);
-    if (i.op_sel_hi != 0x7) s += " op_sel_hi:" + bits(i.op_sel_hi);
+    if (i.op_sel_hi != plain_hi) s += " op_sel_hi:" + bits(i.op_sel_hi);
   }
   if (i.clamp) s += " clamp";
   if (i.sdwa) {
@@ -950,7 +1037,17 @@ std::string to_text(const Inst& i) {
     if (i.cache & 1) s += " sc0";
     if (i.cache & 2) s += " nt";
     if (i.cache & 4) s += " sc1";
-  } else if (i.name == "s_nop") {
+  } else if (i.enc == Enc::Mubuf) {
+    if (i.cache & 1) s += " sc0";
+    if (i.cache & 2) s += " nt";
+    if (i.cache & 4) s += " sc1";
+  } else if (i.name == "s_sendmsg") {
+    const uint32_t msg = static_cast<uint32_t>(i.simm) & 0xF;
+    if (msg != 1 || (static_cast<uint32_t>(i.simm) & 0xFFF0))
+      throw Error::make(Err::Unsupported, "s_sendmsg with message ", static_cast<uint32_t>(i.simm) & 0xFFFF,
+                        " is not decoded yet");
+    s += " sendmsg(MSG_INTERRUPT)";
+  } else if (i.name == "s_nop" || i.name == "s_sleep") {
     std::snprintf(b, sizeof b, " %d", i.simm);   // how many cycles to wait
     s += b;
   } else if (i.name == "s_waitcnt") {

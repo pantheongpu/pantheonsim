@@ -104,6 +104,11 @@ broadcasts that carry a row into the next, and the masks that say which lanes
 are written. The forms that reach across the whole wave are decoded and
 refused, since nothing available here settles which way they carry.
 
+A memory fence compiles to a write-back and an invalidate of the caches;
+every access here reaches memory directly, so both do nothing. A kernel that
+calls the host -- device-side `printf` is built on this -- is refused where it
+does, by name, rather than left spinning on a reply that will not come.
+
 The source modifiers are applied -- an absolute value, a negation, a clamp of
 the result -- and so is the sub-dword form, where an instruction reads a
 named byte or half of each source, with its sign or without, and writes its
