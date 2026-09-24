@@ -979,6 +979,26 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# Streams are distinct -- a capture on one does not take another's work -- and
+# answer for their own flags, priority, device, id and attributes.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_stream_identity COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_stream_identity.sh)
+  set_tests_properties(e2e_stream_identity PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# cudaDeviceSetLimit and cudaDeviceGetLimit, with the heap limit governing
+# malloc() in a kernel.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_device_limits COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_limits.sh)
+  set_tests_properties(e2e_device_limits PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # A cooperative launch through cudaLaunchKernelEx, and a library splicing nodes
 # into a stream capture through the capture queries.
 if(TARGET vgpucudart)

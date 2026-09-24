@@ -71,6 +71,24 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   compares which nodes each node depends on, not only how many: a graph rewired
   between two nodes used to pass as the same shape and have its parameters taken.
   e2e_graph_nodes covers all of it.
+- Streams are distinct. Every cudaStreamCreate used to return the same handle,
+  0x1 -- cudaStreamLegacy -- so two streams compared equal, a capture begun on
+  one captured the work sent to every other, and a kernel launched on a second
+  stream during a capture never ran: it went into the first stream's graph. A
+  stream is a record now and its address is its handle, and it answers for
+  itself: cudaStreamGetFlags, GetPriority (clamped to the device's range, as
+  documented), GetDevice, GetId (unique, including each thread's per-thread
+  stream), and Get/Set/CopyAttributes. The default streams cannot be destroyed.
+  e2e_stream_identity.
+- cudaDeviceSetLimit and cudaDeviceGetLimit, per device, with the defaults and
+  the rounding and clamping CUDA documents. The heap limit is real: malloc() in a
+  kernel draws from a heap of cudaLimitMallocHeapSize bytes, per device, so a
+  program that raises it gets the room and one past it gets null -- the engine
+  had said this was not wired. The heap and printf limits refuse to change once
+  a kernel that calls malloc/free or printf has launched, decided from the
+  kernel's code. Stack and printf-buffer sizes are recorded and reported but
+  bound nothing here. e2e_device_limits allocates up to a raised limit and one
+  past it.
 - Splicing into a stream capture, which is what a library does when the stream
   it was handed turns out to be capturing: cudaStreamGetCaptureInfo reports the
   capture's own graph, the nodes the next operation will depend on, and an id

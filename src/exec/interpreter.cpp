@@ -4843,10 +4843,12 @@ class Interpreter {
   // other device pointer gets -- which is worth more here than a bump
   // allocator would be.
   //
-  // Two documented divergences. The heap is capped at CUDA's default 8 MiB so
-  // a runaway allocation fails the way it does on hardware rather than
-  // exhausting the host; cudaDeviceSetLimit(cudaLimitMallocHeapSize) is not
-  // wired to it yet. And memory allocated here is reachable from the host,
+  // The heap is the size cudaLimitMallocHeapSize gives the device -- CUDA's
+  // default 8 MiB unless the program set it -- so a runaway allocation fails the
+  // way it does on hardware rather than exhausting the host, and a program that
+  // raises the limit gets the room it asked for. Each device has its own heap,
+  // as each has its own limit. One documented divergence: memory allocated here
+  // is reachable from the host,
   // where on a device it is not -- a permissive difference, so a program that
   // works on hardware works here, but one that copies a device-malloc'd
   // pointer to the host will pass here and fail there.
@@ -4864,11 +4866,12 @@ class Interpreter {
       if (!(m & (Mask{1} << lane))) continue;
       const uint64_t arg = it->second.read(lane, 0, 8);
       std::lock_guard<std::mutex> guard(device_heap_mu());
+      DeviceHeap& heap = device_heap(mem_);
       if (allocating) {
-        auto& used = device_heap_used();
+        auto& used = heap.used;
         // Each thread allocates independently, exactly as on hardware -- this
         // is not a warp-collective call.
-        if (arg == 0 || used + arg > kDeviceHeapBytes) {
+        if (arg == 0 || used + arg > cfg_.device_heap_bytes) {
           result[lane] = 0;  // out of heap: malloc returns null, it does not fail
           continue;
         }
@@ -4880,16 +4883,16 @@ class Interpreter {
           continue;
         }
         used += arg;
-        device_heap_sizes()[p] = arg;
+        heap.sizes[p] = arg;
         result[lane] = p;
       } else {
         if (arg == 0) continue;  // free(nullptr) is a no-op
-        auto& sizes = device_heap_sizes();
+        auto& sizes = heap.sizes;
         auto sz = sizes.find(arg);
         if (sz == sizes.end())
           ctx_fail(ins, static_cast<int>(lane), Err::InvalidFree,
                    "device free() of a pointer this kernel's heap did not allocate");
-        device_heap_used() -= sz->second;
+        heap.used -= sz->second;
         sizes.erase(sz);
         mem_.free(arg);
       }
@@ -4902,18 +4905,19 @@ class Interpreter {
     }
   }
 
-  static constexpr uint64_t kDeviceHeapBytes = 8ull << 20;  // CUDA's default
+  // What a device's heap has handed out, kept per device -- keyed by the
+  // device's memory -- because each device has its own heap and its own limit.
+  struct DeviceHeap {
+    uint64_t used = 0;
+    std::unordered_map<uint64_t, uint64_t> sizes;
+  };
   static std::mutex& device_heap_mu() {
     static std::mutex mu;
     return mu;
   }
-  static uint64_t& device_heap_used() {
-    static uint64_t used = 0;
-    return used;
-  }
-  static std::unordered_map<uint64_t, uint64_t>& device_heap_sizes() {
-    static std::unordered_map<uint64_t, uint64_t> sizes;
-    return sizes;
+  static DeviceHeap& device_heap(const MemoryManager& device_memory) {  // holds device_heap_mu
+    static std::unordered_map<const MemoryManager*, DeviceHeap> heaps;
+    return heaps[&device_memory];
   }
 
   void exec_vprintf(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
