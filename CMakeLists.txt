@@ -636,6 +636,8 @@ target_compile_definitions(test_amd_gcn_lds PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOU
 
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
 target_compile_definitions(test_amd_gcn_idioms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_unit_test(test_amd_gcn_counters amd/tests/unit/test_gcn_counters.cpp)
+target_compile_definitions(test_amd_gcn_counters PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 vgpu_unit_test(test_amd_hip_abi amd/tests/unit/test_hip_abi.cpp)
 
