@@ -272,6 +272,13 @@ struct Machine {
       w.exec = a & saved;
       write_scalar(w, in.dst[0], saved);
       w.scc = w.exec != 0;
+    } else if (op == "s_andn2_saveexec_b64") {
+      // The other half of a divergence: keep EXEC, and take the lanes the
+      // condition did not.
+      const uint64_t saved = w.exec;
+      w.exec = a & ~saved;
+      write_scalar(w, in.dst[0], saved);
+      w.scc = w.exec != 0;
     } else {
       throw Error::make(Err::Unsupported, "scalar instruction ", op, " is decoded but not implemented");
     }
@@ -391,8 +398,35 @@ struct Machine {
     }
   }
 
+  // The arithmetic a 64-bit value needs, which a register pair holds: an add
+  // or a subtract over one half at a time, reporting what carried out of it
+  // as a mask of lanes, and the forms that read that mask back for the other
+  // half. The mask goes to VCC in the short form, and to the pair the long
+  // form names.
+  bool carry_alu(Wave& w, const Inst& in) {
+    const std::string& op = in.name;
+    if (op.find("_co_u32") == std::string::npos) return false;
+    const bool add = op.rfind("v_add", 0) == 0;
+    const bool takes_carry = op.find("_addc_") != std::string::npos || op.find("_subb") != std::string::npos;
+    const bool reversed = op.find("subbrev") != std::string::npos;   // it subtracts the first from the second
+    const uint64_t carried_in = takes_carry ? scalar(w, in.src[2]) : 0;
+    uint64_t carried_out = 0;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      if (!(w.exec >> lane & 1)) continue;
+      uint64_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
+      if (reversed) std::swap(a, b);
+      const uint64_t c = takes_carry ? (carried_in >> lane) & 1 : 0;
+      const uint64_t r = add ? a + b + c : a - b - c;
+      if (add ? (r >> 32) & 1 : a < b + c) carried_out |= uint64_t{1} << lane;
+      write_lane(w, in.dst[0], lane, static_cast<uint32_t>(r));
+    }
+    write_scalar(w, in.dst[1], carried_out);
+    return true;
+  }
+
   void vector_alu(Wave& w, const Inst& in) {
     const std::string& op = in.name;
+    if (carry_alu(w, in)) return;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;   // EXEC says which lanes write
       if (op == "v_mov_b32_e32") {
@@ -458,6 +492,24 @@ struct Machine {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane) +
                                          lane_src(w, in.src[2], lane)));
+      } else if (op == "v_min_u32_e32") {
+        write_lane(w, in.dst[0], lane, std::min(lane_src(w, in.src[0], lane), lane_src(w, in.src[1], lane)));
+      } else if (op == "v_lshl_or_b32") {
+        write_lane(w, in.dst[0], lane,
+                   (lane_src(w, in.src[0], lane) << (lane_src(w, in.src[1], lane) & 31)) |
+                       lane_src(w, in.src[2], lane));
+      } else if (op == "v_trunc_f32_e32") {
+        write_lane(w, in.dst[0], lane, as_bits(std::trunc(lane_float(w, in.src[0], lane))));
+      } else if (op == "v_cvt_f32_f64_e32") {
+        write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(as_double(lane_src64(w, in.src[0], lane)))));
+      } else if (op == "v_cvt_i32_f64_e32") {
+        write_lane(w, in.dst[0], lane,
+                   static_cast<uint32_t>(static_cast<int32_t>(as_double(lane_src64(w, in.src[0], lane)))));
+      } else if (op == "v_fmamk_f32") {
+        // The middle source is the constant the instruction carries.
+        write_lane(w, in.dst[0], lane,
+                   as_bits(std::fma(lane_float(w, in.src[0], lane), as_float(static_cast<uint32_t>(in.src[1].value)),
+                                    lane_float(w, in.src[2], lane))));
       } else if (op == "v_bfe_i32") {
         // The same bits as v_bfe_u32, with the top one carried into the rest.
         const uint32_t value = lane_src(w, in.src[0], lane), start = lane_src(w, in.src[1], lane) & 31,
@@ -616,7 +668,16 @@ struct Machine {
       else if (op == "v_cmp_gt_u32_e32") set = a > b;
       else if (op == "v_cmp_eq_u32_e32") set = a == b;
       else if (op == "v_cmp_le_u32_e32") set = a <= b;
-      else if (op == "v_cmp_ne_u32_e32") set = a != b;
+      else if (op == "v_cmp_ne_u32_e32" || op == "v_cmp_ne_u32_e64") set = a != b;
+      else if (op == "v_cmp_eq_u32_e64") set = a == b;
+      else if (op == "v_cmp_lt_u32_e64") set = a < b;
+      else if (op == "v_cmp_ge_u32_e32" || op == "v_cmp_ge_u32_e64") set = a >= b;
+      else if (op == "v_cmp_lt_u64_e32")
+        set = lane_src64(w, in.src[0], lane) < lane_src64(w, in.src[1], lane);
+      else if (op == "v_cmp_eq_u64_e32")
+        set = lane_src64(w, in.src[0], lane) == lane_src64(w, in.src[1], lane);
+      else if (op == "v_cmp_ne_u64_e32")
+        set = lane_src64(w, in.src[0], lane) != lane_src64(w, in.src[1], lane);
       else if (op == "v_cmp_lt_f32_e64" || op == "v_cmp_lt_f32_e32")
         set = lane_float(w, in.src[0], lane) < lane_float(w, in.src[1], lane);
       else if (op == "v_cmp_gt_f32_e64" || op == "v_cmp_gt_f32_e32")

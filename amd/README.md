@@ -50,7 +50,9 @@ program uses the module API.
 
 The instructions implemented are those clang emits for the kernels in
 `tests/data/`: scalar and vector integer arithmetic, the logical and shift
-ops, 32- and 64-bit values, the bytes and shorts a kernel loads, computes on
+ops, 32- and 64-bit values (a 64-bit add is the compiler's: the low halves,
+a mask of the lanes that carried, and the high halves with it added back),
+the bytes and shorts a kernel loads, computes on
 and stores back (and the 16-bit arithmetic it gets for them, whose result is
 the low half of a register with the high half zeroed, which is why the
 compiler leaves out the mask a widening would otherwise need), single and
