@@ -35,6 +35,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // Where the wave is: what a kernel adds a constant to, to reach a global.
       {{Enc::Sop1, 0x1c}, {"s_getpc_b64", 2, 0}},
       {{Enc::Sop1, 0x20}, {"s_and_saveexec_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x23}, {"s_andn2_saveexec_b64", 2, 1, 2}},
       // SOP2: two scalar sources.
       {{Enc::Sop2, 0x00}, {"s_add_u32", 1, 2}},
       {{Enc::Sop2, 0x02}, {"s_add_i32", 1, 2}},
@@ -92,6 +93,9 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x002}, {"v_readfirstlane_b32", 1, 1, 1, 1, 1, false, true}},
       {{Enc::Vop1, 0x007}, {"v_cvt_u32_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x008}, {"v_cvt_i32_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x003}, {"v_cvt_i32_f64_e32", 1, 1, 2}},
+      {{Enc::Vop1, 0x00f}, {"v_cvt_f32_f64_e32", 1, 1, 2}},
+      {{Enc::Vop1, 0x01c}, {"v_trunc_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x020}, {"v_exp_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x021}, {"v_log_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x022}, {"v_rcp_f32_e32", 1, 1}},
@@ -103,6 +107,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop2, 0x00a}, {"v_min_f32_e32", 1, 2}},
       {{Enc::Vop2, 0x00b}, {"v_max_f32_e32", 1, 2}},
       {{Enc::Vop2, 0x00f}, {"v_max_u32_e32", 1, 2}},
+      {{Enc::Vop2, 0x00e}, {"v_min_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x013}, {"v_and_b32_e32", 1, 2}},
       {{Enc::Vop2, 0x014}, {"v_or_b32_e32", 1, 2}},
       {{Enc::Vop2, 0x015}, {"v_xor_b32_e32", 1, 2}},
@@ -112,6 +117,14 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // after one of these, which it could not do if the half were kept.
       {{Enc::Vop2, 0x026}, {"v_add_u16_e32", 1, 2}},
       {{Enc::Vop2, 0x02a}, {"v_lshlrev_b16_e32", 1, 2}},
+      // A constant of the instruction's own, between its two sources.
+      {{Enc::Vop2, 0x017}, {"v_fmamk_f32", 1, 2}},
+      // The carry forms: each writes a mask of the lanes that carried beside
+      // its result, and the two that take one read it back.
+      {{Enc::Vop2, 0x019}, {"v_add_co_u32_e32", 1, 2}},
+      {{Enc::Vop2, 0x01a}, {"v_sub_co_u32_e32", 1, 2}},
+      {{Enc::Vop2, 0x01c}, {"v_addc_co_u32_e32", 1, 2}},
+      {{Enc::Vop2, 0x01d}, {"v_subb_co_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x034}, {"v_add_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x035}, {"v_sub_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x036}, {"v_subrev_u32_e32", 1, 2}},
@@ -126,11 +139,25 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vopc, 0x0c1}, {"v_cmp_lt_i32_e32", 2, 2}},
       {{Enc::Vopc, 0x0cb}, {"v_cmp_le_u32_e32", 2, 2}},
       {{Enc::Vopc, 0x0cd}, {"v_cmp_ne_u32_e32", 2, 2}},
+      {{Enc::Vopc, 0x0ce}, {"v_cmp_ge_u32_e32", 2, 2}},
+      // The same comparisons over a register pair.
+      {{Enc::Vopc, 0x0e9}, {"v_cmp_lt_u64_e32", 2, 2, 2, 2}},
+      {{Enc::Vopc, 0x0ea}, {"v_cmp_eq_u64_e32", 2, 2, 2, 2}},
+      {{Enc::Vopc, 0x0ed}, {"v_cmp_ne_u64_e32", 2, 2, 2, 2}},
       // VOP3: the long form. v_lshl_add shifts its first source and adds the
       // third; the shift itself is always 32-bit.
       {{Enc::Vop3, 0x041}, {"v_cmp_lt_f32_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x044}, {"v_cmp_gt_f32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x0c9}, {"v_cmp_lt_u32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x0ca}, {"v_cmp_eq_u32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x0cd}, {"v_cmp_ne_u32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x0ce}, {"v_cmp_ge_u32_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x101}, {"v_add_f32_e64", 1, 2}},
+      // The long forms of the carry arithmetic, which name the pair they
+      // write the carry to rather than always using VCC.
+      {{Enc::Vop3, 0x11a}, {"v_sub_co_u32_e64", 1, 2, 1, 1, 1, true}},
+      {{Enc::Vop3, 0x11d}, {"v_subb_co_u32_e64", 1, 3, 1, 1, 2, true}},
+      {{Enc::Vop3, 0x11e}, {"v_subbrev_co_u32_e64", 1, 3, 1, 1, 2, true}},
       {{Enc::Vop3, 0x10b}, {"v_max_f32_e64", 1, 2}},
       {{Enc::Vop3, 0x100}, {"v_cndmask_b32_e64", 1, 3, 1, 1, 2}},
       {{Enc::Vop3, 0x1c8}, {"v_bfe_u32", 1, 3}},
@@ -147,6 +174,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x1eb}, {"v_mad_legacy_u16", 1, 3}},
       {{Enc::Vop3, 0x1fd}, {"v_lshl_add_u32", 1, 3}},
       {{Enc::Vop3, 0x1ff}, {"v_add3_u32", 1, 3}},
+      {{Enc::Vop3, 0x200}, {"v_lshl_or_b32", 1, 3}},
       {{Enc::Vop3, 0x208}, {"v_lshl_add_u64", 2, 3, 2, 1, 2}},
       {{Enc::Vop3, 0x280}, {"v_add_f64", 2, 2, 2, 2}},
       {{Enc::Vop3, 0x281}, {"v_mul_f64", 2, 2, 2, 2}},
@@ -475,17 +503,32 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.opcode = (w0 >> 25) & 0x3F;
     const Shape& s = shape(in.enc, in.opcode);
     in.name = s.name;
+    const auto vcc = [] {
+      Operand o;
+      o.kind = OperandKind::Vcc;
+      o.width = 2;
+      return o;
+    };
+    const bool carry_out = in.name == "v_add_co_u32_e32" || in.name == "v_sub_co_u32_e32" ||
+                           in.name == "v_addc_co_u32_e32" || in.name == "v_subb_co_u32_e32";
+    const bool carry_in = in.name == "v_addc_co_u32_e32" || in.name == "v_subb_co_u32_e32";
     in.dst.push_back(vgpr((w0 >> 17) & 0xFF, s.dst_width));
+    // The short forms of the carry arithmetic write VCC beside their result,
+    // which the encoding does not spell out and the assembler does.
+    if (carry_out) in.dst.push_back(vcc());
     in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
-    in.src.push_back(vgpr((w0 >> 9) & 0xFF, s.src_width(1)));
-    // The short form of the select reads its condition from VCC, which the
-    // encoding does not spell out and the assembler does.
-    if (in.name == "v_cndmask_b32_e32") {
-      Operand vcc;
-      vcc.kind = OperandKind::Vcc;
-      vcc.width = 2;
-      in.src.push_back(vcc);
+    // v_fmamk_f32 carries a constant of its own, which sits between the two
+    // sources rather than taking one of their places.
+    if (in.name == "v_fmamk_f32") {
+      Operand k;
+      k.kind = OperandKind::Literal;
+      in.src.push_back(k);
+      literal = true;
     }
+    in.src.push_back(vgpr((w0 >> 9) & 0xFF, s.src_width(1)));
+    // The short form of the select reads its condition from VCC, as the two
+    // that take a carry in read theirs.
+    if (in.name == "v_cndmask_b32_e32" || carry_in) in.src.push_back(vcc());
   } else {
     throw Error::make(Err::Unsupported, "an instruction encoding this does not decode yet");
   }
