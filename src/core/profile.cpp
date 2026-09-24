@@ -139,6 +139,8 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
   p.limits.max_blocks_per_sm = opt("max_blocks_per_sm", 16);
   p.limits.max_registers_per_thread = opt("max_registers_per_thread", 255);
   p.limits.shared_mem_per_sm = opt("shared_mem_per_sm", p.limits.shared_mem_per_block_optin);
+  if (auto it = lim.map.find("l2_cache_bytes"); it != lim.map.end() && it->second.kind == Value::Kind::Int)
+    p.limits.l2_cache_bytes = static_cast<uint64_t>(it->second.i);
 
   // Optional: presentation-only values for monitoring tools.
   if (auto it = doc.map.find("telemetry"); it != doc.map.end()) {

@@ -29,6 +29,9 @@ limits:
   max_blocks_per_sm: 32
   max_registers_per_thread: 255
   shared_mem_per_sm: 65536
+  # One XCD's L2, which is what HIP reports: the CDNA3 whitepaper gives 4 MB
+  # per XCD (MI300X and MI325X are the same die). Datasheet, not measured.
+  l2_cache_bytes: 4194304
 features:
   fp16: true
   bf16: true
