@@ -176,6 +176,27 @@ struct Machine {
     if (o.kind == OperandKind::InlineFloat) return as_bits(o.fvalue);
     return scalar(w, o);
   }
+  // A source read as a half: the low half of the register, or an inline
+  // constant, which is the number itself rather than a float's bits.
+  _Float16 lane_half(const Wave& w, const Operand& o, uint32_t lane) const {
+    _Float16 h;
+    if (o.kind == OperandKind::InlineFloat) {
+      h = static_cast<_Float16>(o.fvalue);
+    } else {
+      const uint16_t bits = static_cast<uint16_t>(lane_src(w, o, lane));
+      std::memcpy(&h, &bits, 2);
+    }
+    if (o.abs) h = h < static_cast<_Float16>(0) ? -h : h;
+    return o.neg ? -h : h;
+  }
+  // A half result, which fills the low half of the register and zeroes the
+  // high half, as every 16-bit instruction here does.
+  void write_half(Wave& w, const Inst& in, uint32_t lane, _Float16 v) {
+    uint16_t bits = 0;
+    std::memcpy(&bits, &v, 2);
+    write_lane(w, in.dst[0], lane, bits);
+  }
+
   // A source read as a float, with the modifiers a VOP3 source carries: the
   // absolute value first, then the negation, as the ISA applies them.
   float lane_float(const Wave& w, const Operand& o, uint32_t lane) const {
@@ -525,6 +546,26 @@ struct Machine {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane) +
                                          lane_src(w, in.src[2], lane)));
+      } else if (op == "v_or3_b32") {
+        write_lane(w, in.dst[0], lane,
+                   lane_src(w, in.src[0], lane) | lane_src(w, in.src[1], lane) | lane_src(w, in.src[2], lane));
+      } else if (op == "v_add_f16_e32") {
+        write_half(w, in, lane, lane_half(w, in.src[0], lane) + lane_half(w, in.src[1], lane));
+      } else if (op == "v_sub_f16_e32") {
+        write_half(w, in, lane, lane_half(w, in.src[0], lane) - lane_half(w, in.src[1], lane));
+      } else if (op == "v_mul_f16_e32") {
+        write_half(w, in, lane, lane_half(w, in.src[0], lane) * lane_half(w, in.src[1], lane));
+      } else if (op == "v_fma_f16") {
+        // A fused multiply-add: one rounding, which is what the C means by
+        // fma and what the half the compiler folded into it expects.
+        write_half(w, in, lane,
+                   static_cast<_Float16>(std::fma(static_cast<float>(lane_half(w, in.src[0], lane)),
+                                                  static_cast<float>(lane_half(w, in.src[1], lane)),
+                                                  static_cast<float>(lane_half(w, in.src[2], lane)))));
+      } else if (op == "v_cvt_f16_f32_e32") {
+        write_half(w, in, lane, static_cast<_Float16>(lane_float(w, in.src[0], lane)));
+      } else if (op == "v_cvt_f32_f16_e32") {
+        write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(lane_half(w, in.src[0], lane))));
       } else if (op == "v_mul_i32_i24_e32") {
         // The low 24 bits of each source, as signed numbers.
         const auto i24 = [](uint32_t v) { return static_cast<int32_t>(v << 8) >> 8; };
@@ -732,6 +773,16 @@ struct Machine {
         set = lane_float(w, in.src[0], lane) > lane_float(w, in.src[1], lane);
       else if (op == "v_cmp_ge_f32_e32") set = lane_float(w, in.src[0], lane) >= lane_float(w, in.src[1], lane);
       else if (op == "v_cmp_class_f32_e32") set = matches_class(lane_float(w, in.src[0], lane), b);
+      else if (op.find("_f16_") != std::string::npos) {
+        const _Float16 x = lane_half(w, in.src[0], lane), y = lane_half(w, in.src[1], lane);
+        if (op == "v_cmp_lt_f16_e32") set = x < y;
+        else if (op == "v_cmp_eq_f16_e32") set = x == y;
+        else if (op == "v_cmp_gt_f16_e32") set = x > y;
+        else if (op == "v_cmp_ge_f16_e32") set = x >= y;
+        else if (op == "v_cmp_neq_f16_e32") set = !(x == y);   // a NaN is not equal to itself
+        else if (op == "v_cmp_ngt_f16_e32") set = !(x > y);    // and it is not greater either
+        else throw Error::make(Err::Unsupported, "comparison ", op, " is decoded but not implemented");
+      }
       else throw Error::make(Err::Unsupported, "comparison ", op, " is decoded but not implemented");
       if (set) result |= uint64_t{1} << lane;
     }
