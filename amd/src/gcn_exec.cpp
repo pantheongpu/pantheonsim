@@ -152,8 +152,21 @@ struct Machine {
   // A source as one lane sees it: a vector register's lane, or the same
   // scalar value for every lane.
   uint32_t lane_src(const Wave& w, const Operand& o, uint32_t lane) const {
-    if (o.kind == OperandKind::Vgpr) return w.vgpr[o.index][lane];
-    return static_cast<uint32_t>(scalar(w, o));
+    const uint32_t v = o.kind == OperandKind::Vgpr ? w.vgpr[o.index][lane] : static_cast<uint32_t>(scalar(w, o));
+    return o.sel == 6 ? v : selected(v, o.sel, o.sext);
+  }
+  // The part of a register a sub-dword instruction reads: a byte or a half of
+  // it, taken into 32 bits with its sign or without.
+  static uint32_t selected(uint32_t v, uint8_t sel, bool sext) {
+    if (sel <= 3) {
+      const uint8_t byte = static_cast<uint8_t>(v >> (8 * sel));
+      return sext ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(byte))) : byte;
+    }
+    if (sel <= 5) {
+      const uint16_t half = static_cast<uint16_t>(sel == 4 ? v : v >> 16);
+      return sext ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(half))) : half;
+    }
+    return v;
   }
   uint64_t lane_src64(const Wave& w, const Operand& o, uint32_t lane) const {
     if (o.kind == OperandKind::Vgpr)
@@ -427,7 +440,18 @@ struct Machine {
   }
 
   void vector_alu(Wave& w, const Inst& in) {
-    const std::string& op = in.name;
+    // The sub-dword form of an instruction does what the short form does,
+    // over the part of each register it names, so it is the same arithmetic
+    // under the name the short form has.
+    const std::string sdwa_as_short =
+        in.sdwa ? in.name.substr(0, in.name.size() - 5) + "_e32" : std::string();
+    const std::string& op = in.sdwa ? sdwa_as_short : in.name;
+    // A sub-dword instruction that writes only part of its destination is
+    // refused: every one the compiler has been seen to emit writes all of it,
+    // and guessing at the rest would give a wrong answer with nothing to show
+    // for it.
+    if (in.sdwa && (in.dst_sel != 6 || in.dst_unused != 0))
+      throw Error::make(Err::Unsupported, op, " writes only part of its destination, which this does not model");
     if (carry_alu(w, in)) return;
     if (op == "v_writelane_b32") {
       // The one instruction here that names the lane it writes: a scalar
@@ -501,6 +525,14 @@ struct Machine {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane) +
                                          lane_src(w, in.src[2], lane)));
+      } else if (op == "v_mul_i32_i24_e32") {
+        // The low 24 bits of each source, as signed numbers.
+        const auto i24 = [](uint32_t v) { return static_cast<int32_t>(v << 8) >> 8; };
+        write_lane(w, in.dst[0], lane,
+                   static_cast<uint32_t>(i24(lane_src(w, in.src[0], lane)) * i24(lane_src(w, in.src[1], lane))));
+      } else if (op == "v_mul_lo_u16_e32") {
+        write_lane(w, in.dst[0], lane,
+                   static_cast<uint16_t>(lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane)));
       } else if (op == "v_xad_u32") {
         write_lane(w, in.dst[0], lane,
                    (lane_src(w, in.src[0], lane) ^ lane_src(w, in.src[1], lane)) + lane_src(w, in.src[2], lane));

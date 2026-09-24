@@ -105,6 +105,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x027}, {"v_sqrt_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x02c}, {"v_bfrev_b32_e32", 1, 1}},
       {{Enc::Vop1, 0x02d}, {"v_ffbh_u32_e32", 1, 1}},
+      {{Enc::Vop2, 0x006}, {"v_mul_i32_i24_e32", 1, 2}},
       {{Enc::Vop2, 0x008}, {"v_mul_u32_u24_e32", 1, 2}},
       {{Enc::Vop2, 0x00a}, {"v_min_f32_e32", 1, 2}},
       {{Enc::Vop2, 0x00b}, {"v_max_f32_e32", 1, 2}},
@@ -118,6 +119,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // zeroed: the compiler drops the mask a widening would otherwise need
       // after one of these, which it could not do if the half were kept.
       {{Enc::Vop2, 0x026}, {"v_add_u16_e32", 1, 2}},
+      {{Enc::Vop2, 0x029}, {"v_mul_lo_u16_e32", 1, 2}},
       {{Enc::Vop2, 0x02a}, {"v_lshlrev_b16_e32", 1, 2}},
       // A constant of the instruction's own, between its two sources.
       {{Enc::Vop2, 0x017}, {"v_fmamk_f32", 1, 2}},
@@ -531,6 +533,41 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       o.width = 2;
       return o;
     };
+    // The sub-dword form: the first source field says 249 instead of naming a
+    // register, and a second word says which part of each register the
+    // instruction reads and which part of the destination it writes.
+    if ((w0 & 0x1FF) == 249) {
+      in.sdwa = true;
+      in.name = std::string(s.name);
+      if (const size_t at_e32 = in.name.rfind("_e32"); at_e32 != std::string::npos) in.name.resize(at_e32);
+      in.name += "_sdwa";
+      in.size = 8;
+      const uint32_t w1 = word(code, at + 4);
+      in.dst_sel = (w1 >> 8) & 0x7;
+      in.dst_unused = (w1 >> 11) & 0x3;
+      in.clamp = ((w1 >> 13) & 1) != 0;
+      if (const uint32_t omod = (w1 >> 14) & 0x3; omod)
+        throw Error::make(Err::Unsupported, in.name, " uses an output multiplier (omod ", omod,
+                          "), which this does not model");
+      if (((w1 >> 22) & 1) || ((w1 >> 30) & 1))
+        throw Error::make(Err::Unsupported, in.name,
+                          " reads a scalar register through the sub-dword form, which this has never seen the "
+                          "compiler emit and so does not decode");
+      in.dst.push_back(vgpr((w0 >> 17) & 0xFF, s.dst_width));
+      Operand src0 = vgpr(w1 & 0xFF, s.src_width(0));
+      src0.sel = (w1 >> 16) & 0x7;
+      src0.sext = ((w1 >> 19) & 1) != 0;
+      src0.neg = ((w1 >> 20) & 1) != 0;
+      src0.abs = ((w1 >> 21) & 1) != 0;
+      Operand src1 = vgpr((w0 >> 9) & 0xFF, s.src_width(1));
+      src1.sel = (w1 >> 24) & 0x7;
+      src1.sext = ((w1 >> 27) & 1) != 0;
+      src1.neg = ((w1 >> 28) & 1) != 0;
+      src1.abs = ((w1 >> 29) & 1) != 0;
+      in.src.push_back(src0);
+      in.src.push_back(src1);
+      return in;
+    }
     const bool carry_out = in.name == "v_add_co_u32_e32" || in.name == "v_sub_co_u32_e32" ||
                            in.name == "v_addc_co_u32_e32" || in.name == "v_subb_co_u32_e32";
     const bool carry_in = in.name == "v_addc_co_u32_e32" || in.name == "v_subb_co_u32_e32";
@@ -582,7 +619,7 @@ std::string operand_text(const Operand& o) {
   };
   switch (o.kind) {
     case OperandKind::Sgpr: return wrap(range("s"));
-    case OperandKind::Vgpr: return wrap(range("v"));
+    case OperandKind::Vgpr: return wrap(o.sext ? "sext(" + range("v") + ")" : range("v"));
     case OperandKind::Vcc: return wrap("vcc");
     case OperandKind::Exec: return wrap("exec");
     case OperandKind::ExecLo: return wrap("exec_lo");
@@ -628,6 +665,13 @@ std::string to_text(const Inst& i) {
     sep = ", ";
   }
   if (i.clamp) s += " clamp";
+  if (i.sdwa) {
+    static const char* kParts[8] = {"BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD", "?"};
+    static const char* kUnused[4] = {"UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE", "?"};
+    s += std::string(" dst_sel:") + kParts[i.dst_sel & 7] + " dst_unused:" + kUnused[i.dst_unused & 3];
+    for (size_t k = 0; k < i.src.size(); ++k)
+      s += " src" + std::to_string(k) + "_sel:" + kParts[i.src[k].sel & 7];
+  }
   if (i.enc == Enc::Smem) {
     std::snprintf(b, sizeof b, ", 0x%x", i.offset);
     s += b;

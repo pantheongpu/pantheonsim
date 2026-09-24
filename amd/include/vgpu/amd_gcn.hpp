@@ -33,6 +33,11 @@ struct Operand {
   uint32_t width = 1;    // how many 32-bit registers it covers
   bool neg = false;      // VOP3: the source is negated
   bool abs = false;      // VOP3: its absolute value is taken, before the negation
+  // SDWA: which part of the register the instruction reads (0 to 3 a byte,
+  // 4 and 5 a half, 6 the whole of it), and whether what it reads keeps its
+  // sign on the way into a 32-bit operation.
+  uint8_t sel = 6;
+  bool sext = false;
 };
 std::string operand_text(const Operand& o);
 
@@ -59,6 +64,12 @@ struct Inst {
   uint64_t target = 0;
   // VOP3's clamp: a float result is held to [0, 1].
   bool clamp = false;
+  // SDWA: the instruction reads part of a register rather than all of it,
+  // which is how the compiler mixes widths. The destination has the same
+  // choice, and says what becomes of the rest of the register.
+  bool sdwa = false;
+  uint8_t dst_sel = 6;
+  uint8_t dst_unused = 0;   // 0 pads the rest with zeroes, 1 with the sign, 2 keeps it
   // A memory instruction's scope bits (global_atomic_*'s sc0/sc1/nt), which
   // say how far a write is published. Every access here is already visible to
   // every wave, so they change nothing and are kept for the listing.
