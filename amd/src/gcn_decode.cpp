@@ -271,6 +271,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Flat, 0x62}, {"atomic_add_x2", 0, 2, 1, 2}},
       // VOP3P: a packed pair of halves in one register, both computed at once.
       {{Enc::Vop3p, 0x0e}, {"v_pk_fma_f16", 1, 3}},
+      // And the packed float form, where each of the two is a whole register.
+      {{Enc::Vop3p, 0x30}, {"v_pk_fma_f32", 2, 3, 2, 2, 2}},
+      {{Enc::Vop3p, 0x32}, {"v_pk_add_f32", 2, 2, 2, 2}},
+      {{Enc::Vop3p, 0x31}, {"v_pk_mul_f32", 2, 2, 2, 2}},
   };
   return t;
 }
@@ -470,7 +474,13 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     // else is a shuffle this does not model.
     const uint32_t op_sel = (w0 >> 11) & 0x7, neg_hi = (w0 >> 8) & 0x7;
     const uint32_t op_sel_hi = ((w0 >> 14) & 1) << 2 | ((w1 >> 27) & 0x3);
-    if (op_sel != 0 || op_sel_hi != 0x7)
+    in.op_sel = static_cast<uint8_t>(op_sel);
+    in.op_sel_hi = static_cast<uint8_t>(op_sel_hi);
+    // Taking the halves in their own order is a shuffle, and only the packed
+    // float form is modelled beyond the plain arrangement: there a zero in
+    // op_sel_hi means one value serves both halves, which is what the
+    // compiler does with a constant.
+    if (op_sel != 0 || (op_sel_hi != 0x7 && in.name.find("_f32") == std::string::npos))
       throw Error::make(Err::Unsupported, in.name, " selects halves (op_sel ", op_sel, ", op_sel_hi ", op_sel_hi,
                         "), which this does not model");
     in.dst.push_back(vgpr(w0 & 0xFF, s.dst_width));
@@ -709,6 +719,18 @@ std::string to_text(const Inst& i) {
   for (size_t k = 0; k < i.src.size(); ++k) {
     s += sep + (scratch_no_addr && k == 0 ? "off" : operand_text(i.src[k]));
     sep = ", ";
+  }
+  if (i.enc == Enc::Vop3p) {
+    // The assembler prints these only where they are not the plain
+    // arrangement: every source's low half to the low result, every source's
+    // high half to the high one.
+    const auto bits = [&](uint8_t v) {
+      std::string out = "[";
+      for (size_t k = 0; k < i.src.size(); ++k) out += (k ? "," : "") + std::to_string((v >> k) & 1);
+      return out + "]";
+    };
+    if (i.op_sel) s += " op_sel:" + bits(i.op_sel);
+    if (i.op_sel_hi != 0x7) s += " op_sel_hi:" + bits(i.op_sel_hi);
   }
   if (i.clamp) s += " clamp";
   if (i.sdwa) {

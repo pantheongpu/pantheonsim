@@ -762,6 +762,26 @@ struct Machine {
                               as_double(lane_src64(w, in.dst[0], lane))));
       } else if (op == "v_rcp_f64_e32") {
         write_double(w, in, lane, 1.0 / lane_double(w, in.src[0], lane));
+      } else if (op == "v_pk_fma_f32" || op == "v_pk_add_f32" || op == "v_pk_mul_f32") {
+        // Two floats in a register pair, each its own arithmetic. Which
+        // register of a pair feeds which result is op_sel and op_sel_hi: a
+        // zero in op_sel_hi means one value serves both, which is what a
+        // constant is.
+        const auto part = [&](size_t which, bool high) {
+          const Operand& o = in.src[which];
+          const uint32_t pick = high ? (in.op_sel_hi >> which) & 1 : (in.op_sel >> which) & 1;
+          float f = o.kind == OperandKind::Vgpr ? as_float(w.vgpr[o.index + pick][lane])
+                                                : as_float(static_cast<uint32_t>(scalar(w, o)));
+          return o.neg ? -f : f;
+        };
+        for (uint32_t half = 0; half < 2; ++half) {
+          const bool high = half == 1;
+          const float x = part(0, high), y = part(1, high);
+          const float r = op == "v_pk_add_f32"   ? x + y
+                          : op == "v_pk_mul_f32" ? x * y
+                                                 : std::fma(x, y, part(2, high));
+          w.vgpr[in.dst[0].index + half][lane] = as_bits(r);
+        }
       } else if (op == "v_pk_fma_f16") {
         // Two halves in one register, each its own multiply-add.
         const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane),

@@ -59,7 +59,8 @@ and stores back (and the 16-bit arithmetic it gets for them, whose result is
 the low half of a register with the high half zeroed, which is why the
 compiler leaves out the mask a widening would otherwise need), single and
 double precision (add, multiply, fma,
-min, max and the sequence a division compiles to), half precision, one value at a time and packed two to a register,
+min, max and the sequence a division compiles to), half precision, one value at a time and packed two to a register, two floats
+packed into a register pair,
 conversions, the transcendentals, the rounding functions, the sine and the cosine (whose
 argument is a turn rather than a radian, which is why the compiler multiplies
 by one over two pi first), bit counting, comparisons in both their
