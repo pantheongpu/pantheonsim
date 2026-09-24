@@ -93,6 +93,12 @@ hipError_t hipMalloc(void** ptr, size_t size);
 hipError_t hipFree(void* ptr);
 hipError_t hipMemcpy(void* dst, const void* src, size_t bytes, hipMemcpyKind kind);
 hipError_t hipMemset(void* dst, int value, size_t bytes);
+hipError_t hipMemcpyAsync(void* dst, const void* src, size_t bytes, hipMemcpyKind kind, hipStream_t stream);
+hipError_t hipMemsetAsync(void* dst, int value, size_t bytes, hipStream_t stream);
+hipError_t hipMemGetInfo(size_t* free, size_t* total);
+hipError_t hipDeviceTotalMem(size_t* bytes, hipDevice_t device);
+hipError_t hipDeviceGetName(char* name, int len, hipDevice_t device);
+hipError_t hipDeviceGet(hipDevice_t* device, int ordinal);
 
 hipError_t hipModuleLoad(hipModule_t* module, const char* path);
 hipError_t hipModuleLoadData(hipModule_t* module, const void* image);

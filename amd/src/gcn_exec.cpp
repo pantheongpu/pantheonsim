@@ -858,6 +858,7 @@ void fill_hidden_arguments(const Dispatch& d, const Kernel& k, MemoryManager& me
     else if (kind == "hidden_grid_size_z") value = threads_z;
     else if (kind == "hidden_grid_dims") value = dims;
     else if (kind == "hidden_shared_base") value = kSharedBase;
+    else if (kind == "hidden_dynamic_lds_size") value = d.dynamic_lds;
     // Everything else -- the remainders of a grid that divides evenly, the
     // global offsets, the buffers a hostcall or a printf would use -- is
     // zero, and a kernel that needs one of those will say so by failing on a
@@ -909,6 +910,12 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   if (k.max_flat_workgroup_size && threads > k.max_flat_workgroup_size)
     throw Error::make(Err::InvalidValue, "a work-group of ", threads, " work-items is past the ",
                       k.max_flat_workgroup_size, " this kernel allows");
+  // What the work-group's LDS comes to: what the kernel reserved, and what
+  // the launch added.
+  const uint64_t group_segment = uint64_t{k.group_segment} + d.dynamic_lds;
+  if (group_segment > (64u << 10))
+    throw Error::make(Err::InvalidValue, "a work-group asking for ", group_segment,
+                      " bytes of LDS is past the 65536 a CDNA work-group has");
 
   // What the kernel is told about its grid, and the packet it may read it
   // from. Both are written before any wave starts.
@@ -922,7 +929,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     for (uint32_t gy = 0; gy < d.groups[1]; ++gy)
       for (uint32_t gx = 0; gx < d.groups[0]; ++gx) {
         Group group;
-        group.lds.assign(k.group_segment, 0);
+        group.lds.assign(group_segment, 0);
         // Each work-item's private memory. A kernel that spills says how much
         // it needs; the rest get none.
         group.scratch_per_lane = (k.private_segment + 3) & ~3u;

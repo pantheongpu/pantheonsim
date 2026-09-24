@@ -305,6 +305,58 @@ hipError_t hipMemset(void* dst, int value, size_t bytes) {
   return record(s, hipSuccess);
 }
 
+// Every launch and copy here finishes before it returns, so the asynchronous
+// forms are the synchronous ones: a stream is a handle, and there is nothing
+// for it to be waiting on.
+hipError_t hipMemcpyAsync(void* dst, const void* src, size_t bytes, hipMemcpyKind kind, hipStream_t) {
+  return hipMemcpy(dst, src, bytes, kind);
+}
+
+hipError_t hipMemsetAsync(void* dst, int value, size_t bytes, hipStream_t) {
+  return hipMemset(dst, value, bytes);
+}
+
+hipError_t hipMemGetInfo(size_t* free, size_t* total) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  vgpu::runtime::Device* d = device(s);
+  if (!d) return record(s, hipErrorInvalidDevice);
+  const uint64_t capacity = d->memory().capacity(), used = d->memory().used();
+  if (total) *total = static_cast<size_t>(capacity);
+  if (free) *free = static_cast<size_t>(capacity > used ? capacity - used : 0);
+  return record(s, hipSuccess);
+}
+
+hipError_t hipDeviceTotalMem(size_t* bytes, hipDevice_t ordinal) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!bytes) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
+  *bytes = static_cast<size_t>(s.rt->device(ordinal).profile().vram_bytes);
+  return record(s, hipSuccess);
+}
+
+hipError_t hipDeviceGetName(char* name, int len, hipDevice_t ordinal) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!name || len <= 0) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
+  std::snprintf(name, static_cast<size_t>(len), "%s", s.rt->device(ordinal).profile().model.c_str());
+  return record(s, hipSuccess);
+}
+
+hipError_t hipDeviceGet(hipDevice_t* device_out, int ordinal) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!device_out) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
+  *device_out = ordinal;   // a device is its ordinal here
+  return record(s, hipSuccess);
+}
+
 hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
@@ -408,11 +460,6 @@ hipError_t hipModuleLaunchKernel(hipFunction_t f, unsigned int gx, unsigned int 
   if (!d) return record(s, hipErrorInvalidDevice);
   Function* fn = reinterpret_cast<Function*>(f);
   if (!bx || !by || !bz || !gx || !gy || !gz) return record(s, hipErrorInvalidConfiguration);
-  if (shared)
-    return record(s, fail(hipErrorNotSupported,
-                          "dynamic shared memory is not modelled: a kernel's LDS is what its code object "
-                          "reserves"));
-
   std::vector<uint8_t> args;
   if (const hipError_t e = build_kernargs(*fn->kernel, params, extra, &args); e != hipSuccess)
     return record(s, e);
@@ -433,6 +480,7 @@ hipError_t hipModuleLaunchKernel(hipFunction_t f, unsigned int gx, unsigned int 
     dispatch.group_size[1] = by;
     dispatch.group_size[2] = bz;
     dispatch.wave_size = static_cast<uint32_t>(d->profile().warp_size);
+    dispatch.dynamic_lds = shared;   // what the launch adds to the kernel's own LDS
     const vgpu::amd::DispatchStats stats = vgpu::amd::execute(dispatch, mem);
     mem.free(kernarg);
     // What the device spent, as telemetry reports a kernel: the instructions
