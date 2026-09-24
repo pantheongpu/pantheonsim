@@ -1,0 +1,462 @@
+s_load_dwordx4 s[4:7], s[0:1], 0x0
+s_load_dwordx2 s[2:3], s[0:1], 0x10
+v_lshlrev_b32_e32 v1, 3, v0
+v_lshlrev_b32_e32 v0, 2, v0
+s_waitcnt lgkmcnt(0)
+global_load_dwordx2 v[2:3], v1, s[4:5]
+global_load_dwordx2 v[4:5], v1, s[6:7]
+s_waitcnt vmcnt(0)
+v_cmp_lt_f64_e32 vcc, v[2:3], v[4:5]
+s_nop 1
+v_cndmask_b32_e64 v1, 0, 1, vcc
+v_cmp_ge_f64_e32 vcc, v[2:3], v[4:5]
+s_nop 1
+v_cndmask_b32_e64 v6, 0, 1, vcc
+v_cmp_eq_f64_e32 vcc, v[2:3], v[4:5]
+v_lshl_or_b32 v1, v6, 1, v1
+s_nop 0
+v_cndmask_b32_e64 v7, 0, 1, vcc
+v_cmp_neq_f64_e32 vcc, v[2:3], v[4:5]
+v_lshlrev_b32_e32 v3, 2, v7
+s_nop 0
+v_cndmask_b32_e64 v2, 0, 1, vcc
+v_lshlrev_b32_e32 v2, 3, v2
+v_or3_b32 v1, v1, v3, v2
+global_store_dword v0, v1, s[2:3]
+s_endpgm
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_load_dwordx4 s[4:7], s[0:1], 0x0
+s_load_dwordx2 s[2:3], s[0:1], 0x10
+v_lshlrev_b32_e32 v14, 3, v0
+s_waitcnt lgkmcnt(0)
+global_load_dwordx2 v[0:1], v14, s[6:7]
+global_load_dwordx2 v[2:3], v14, s[4:5]
+s_waitcnt vmcnt(1)
+v_max_f64 v[4:5], v[0:1], v[0:1]
+s_waitcnt vmcnt(0)
+v_max_f64 v[6:7], v[2:3], v[2:3]
+v_min_f64 v[12:13], v[6:7], v[4:5]
+v_max_f64 v[4:5], v[6:7], v[4:5]
+v_add_f64 v[4:5], v[12:13], v[4:5]
+v_floor_f64_e32 v[8:9], v[0:1]
+v_add_f64 v[4:5], |v[2:3]|, v[4:5]
+v_trunc_f64_e32 v[10:11], v[2:3]
+v_add_f64 v[4:5], v[8:9], v[4:5]
+v_ceil_f64_e32 v[0:1], v[0:1]
+v_add_f64 v[4:5], v[10:11], v[4:5]
+v_add_f64 v[0:1], v[0:1], v[4:5]
+v_rndne_f64_e32 v[2:3], v[2:3]
+v_add_f64 v[0:1], v[2:3], v[0:1]
+global_store_dwordx2 v14, v[0:1], s[2:3]
+s_endpgm
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_load_dwordx8 s[4:11], s[0:1], 0x0
+v_lshlrev_b32_e32 v8, 2, v0
+s_load_dwordx4 s[0:3], s[0:1], 0x20
+v_lshlrev_b32_e32 v0, 3, v0
+s_waitcnt lgkmcnt(0)
+global_load_dword v1, v8, s[6:7]
+global_load_dword v4, v8, s[8:9]
+global_load_dword v6, v8, s[10:11]
+s_waitcnt vmcnt(2)
+v_cvt_f64_f32_e32 v[2:3], v1
+s_waitcnt vmcnt(1)
+v_cvt_f64_i32_e32 v[4:5], v4
+s_waitcnt vmcnt(0)
+v_cvt_f64_u32_e32 v[6:7], v6
+v_add_f64 v[2:3], v[2:3], v[4:5]
+v_add_f64 v[2:3], v[2:3], v[6:7]
+global_store_dwordx2 v0, v[2:3], s[0:1]
+global_load_dwordx2 v[0:1], v0, s[4:5]
+s_waitcnt vmcnt(0)
+v_cvt_f32_f64_e32 v0, v[0:1]
+global_store_dword v8, v0, s[2:3]
+s_endpgm
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_load_dwordx4 s[0:3], s[0:1], 0x0
+v_lshlrev_b32_e32 v8, 3, v0
+v_mov_b32_e32 v4, 0xffffff80
+v_mov_b32_e32 v9, 0x260
+s_waitcnt lgkmcnt(0)
+global_load_dwordx2 v[0:1], v8, s[0:1]
+s_mov_b32 s0, 0
+s_brev_b32 s1, 8
+s_waitcnt vmcnt(0)
+v_xor_b32_e32 v2, 0x80000000, v1
+v_cmp_gt_f64_e32 vcc, 0, v[0:1]
+s_nop 1
+v_cndmask_b32_e32 v1, v1, v2, vcc
+v_cndmask_b32_e32 v0, v0, v0, vcc
+v_cmp_gt_f64_e32 vcc, s[0:1], v[0:1]
+s_nop 1
+v_cndmask_b32_e64 v2, 0, 1, vcc
+v_lshlrev_b32_e32 v2, 8, v2
+v_ldexp_f64 v[0:1], v[0:1], v2
+v_rsq_f64_e32 v[2:3], v[0:1]
+v_cndmask_b32_e32 v10, 0, v4, vcc
+v_cmp_class_f64_e32 vcc, v[0:1], v9
+v_mul_f64 v[4:5], v[0:1], v[2:3]
+v_mul_f64 v[2:3], v[2:3], 0.5
+v_fma_f64 v[6:7], -v[2:3], v[4:5], 0.5
+v_fmac_f64_e32 v[4:5], v[4:5], v[6:7]
+v_fmac_f64_e32 v[2:3], v[2:3], v[6:7]
+v_fma_f64 v[6:7], -v[4:5], v[4:5], v[0:1]
+v_fmac_f64_e32 v[4:5], v[6:7], v[2:3]
+v_fma_f64 v[6:7], -v[4:5], v[4:5], v[0:1]
+v_fmac_f64_e32 v[4:5], v[6:7], v[2:3]
+v_ldexp_f64 v[2:3], v[4:5], v10
+v_cndmask_b32_e32 v1, v3, v1, vcc
+v_cndmask_b32_e32 v0, v2, v0, vcc
+global_store_dwordx2 v8, v[0:1], s[2:3]
+s_endpgm
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
