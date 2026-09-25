@@ -203,7 +203,15 @@ struct OpBfind { bool shiftamt = false; Type ty; Reg dst; Operand src; };
 // TMA copy or drives an mbarrier.
 struct OpElect { Reg dst; Reg pred_dst; Operand membermask; };
 // isspacep.<space> p, a -- does this generic address point into that window?
-struct OpIsSpacep { Space space = Space::Global; Reg dst; Operand src; };
+// `cluster`: isspacep.shared::cluster -- shared memory of any block of the
+// cluster, where plain .shared means this block's.
+struct OpIsSpacep { Space space = Space::Global; bool cluster = false; Reg dst; Operand src; };
+// mapa: the address of the same shared variable in another block of the
+// cluster. `generic` for mapa.u64 on generic addresses, else
+// mapa.shared::cluster on shared-window ones.
+struct OpMapa { bool generic = false; bool wide = false; Reg dst; Operand src; Operand rank; };
+// getctarank: which block of the cluster a shared address belongs to.
+struct OpGetCtaRank { bool generic = false; Reg dst; Operand src; };
 
 // Warp shuffle. `pred_dst` is the optional "d|p" second destination.
 enum class ShflMode { Up, Down, Bfly, Idx };
@@ -358,6 +366,7 @@ struct OpMbarrier {
   bool have_state = false;
   bool expect_tx = false;   // arrive.expect_tx: `count` is the transaction bytes
   bool no_complete = false; // arrive.noComplete: must not complete the phase
+  bool cluster = false;     // .shared::cluster: the barrier may be another block's
 };
 // barrier.cluster.arrive / barrier.cluster.wait: all threads of a
 // thread-block cluster.
@@ -378,6 +387,20 @@ struct OpBulkCopy {
   Addr mbar;                    // loads: the barrier that counts the bytes
   bool multicast = false;
   Operand cta_mask;
+  // shared::cta -> shared::cluster: a block's shared memory into another's,
+  // completing on a barrier in the destination block. `gmem` is then the
+  // source, a shared::cta address.
+  bool shared_to_shared = false;
+};
+// st.async / red.async (sm_90): a store or reduction into shared memory of a
+// block of the cluster that completes its bytes on an mbarrier there.
+struct OpStAsync {
+  bool red = false;
+  AtomOp op = AtomOp::Add;   // red.async's operation
+  Type ty;
+  Addr addr;
+  std::vector<Operand> srcs;
+  Addr mbar;
 };
 // cp.async.bulk.commit_group / cp.async.bulk.wait_group[.read] N
 struct OpBulkGroup { bool wait = false; uint32_t keep = 0; };
@@ -653,7 +676,7 @@ struct OpCall {
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
-                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask>;
+                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync>;
 
 struct Instr {
   size_t line = 0;                 // source line, for diagnostics

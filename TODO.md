@@ -719,6 +719,36 @@ narrows what counts as observable, not what the detector looks at.
   `cvta.param` no longer adds the parameter window twice. A step-budget error
   now names the instruction the warp was spinning in.
 
+- Distributed shared memory (sm_90): the blocks of a cluster reach each
+  other's shared memory. `mapa` (generic and `.shared::cluster`, 32- and
+  64-bit), `getctarank`, `isspacep.shared::cluster`, `cvta` to and from
+  `.shared::cluster`, and `ld`, `st`, `atom` and `red` on `.shared::cluster`
+  addresses; `mbarrier.arrive`, `arrive_drop`, `expect_tx` and `complete_tx`
+  on another block's barrier (the ISA allows only those remotely, and a
+  remote arrive must discard its state -- both refused by name otherwise);
+  `st.async` and `red.async`, whose bytes complete on the destination's
+  barrier; multicast TMA (`.multicast::cluster` with a ctaMask, tensor and
+  plain), which lands the same bytes at the same offset in every block the
+  mask names, each completing its own barrier; and
+  `cp.async.bulk.shared::cluster.shared::cta`, one block's shared memory into
+  another's. A shared::cluster address carries its block's rank above the
+  offset, with zero meaning the issuing block, so every ordinary shared
+  address is already a valid shared::cluster address for its own block, as
+  the ISA requires. What hardware leaves undefined is reported instead:
+  reaching a block that has exited ("its shared memory went with it" -- the
+  reason a kernel ends with `cluster.sync()`), a rank past the cluster, and
+  an mbarrier or st.async whose barrier is not in the block it writes. The
+  race detector orders warps by their own block's barriers, so remote
+  accesses are not checked for races. Checked three ways: unit tests
+  (tests/unit/test_dsmem.cpp, each confirmed to fail when the feature it
+  covers is broken); CUTLASS's own `tma_mcast_load` test, unmodified
+  (run_cutlass_hopper.sh), which fails on the previous build and passes on
+  this one; and a CUDA C++ program using cooperative_groups'
+  `map_shared_rank`, `__cluster_query_shared_rank` and `cluster.sync()`,
+  with clusters from `__cluster_dims__` and from `cudaLaunchKernelEx`
+  (nvidia/tests/e2e/dsmem_cluster.cu): a ring exchange and a histogram whose
+  bins are spread across the cluster, both exact.
+
 ## Not implemented (fails loudly, never silently)
 
 This list was stale for a while, which is its own kind of wrong: it still named
@@ -726,18 +756,15 @@ textures, grid sync and host-pinned memory long after all three worked. A
 roadmap that overstates what is missing misleads as much as one that overstates
 what is done.
 
-- PTX: the cluster *memory* model -- distributed shared memory:
-  `.shared::cluster` accesses to another block, `mapa`, a remote mbarrier
-  arrive, and multicast TMA to other blocks of a cluster -- which is a
-  memory-model change and stays refused, by name, rather than approximated.
-  Also refused by name: TMA's im2col mode, gather/scatter, attribute
+- PTX, refused by name: TMA's im2col mode, gather/scatter, attribute
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle with 32B/64B atoms
   (Blackwell), `cp.reduce.async.bulk`, `tensormap.replace`, the sparse and
   single-bit `wgmma` forms, and inline-asm-only instructions. (`wgmma`, TMA,
-  the mbarrier transaction counts and `barrier.cluster` are done -- see
-  "Hopper's warpgroup MMA" and "TMA and clusters" above. Textures, surfaces
-  and grid sync are done.)
+  the mbarrier transaction counts, `barrier.cluster` and distributed shared
+  memory are done -- see "Hopper's warpgroup MMA", "TMA and clusters" and
+  "Distributed shared memory" above. Textures, surfaces and grid sync are
+  done.)
 - Runtime: async copies. (Managed memory and host-pinned memory are done. The
   virtual memory management API is done: cuMemAddressReserve, cuMemCreate,
   cuMemMap, cuMemSetAccess, cuMemGetAccess, cuMemUnmap, cuMemRelease,
@@ -985,5 +1012,7 @@ scripts/run-pantheon-workloads.sh.
    refused: mipmaps, layered and cubemap textures, sRGB, anisotropy, and the
    `.clamp`/`.zero` surface out-of-range policies. See nvidia/docs/textures.md.
 
-   `wgmma` and TMA are done now (see "Hopper's warpgroup MMA" and "TMA and
-   clusters"); distributed shared memory is what is left of Hopper.
+   `wgmma`, TMA and distributed shared memory are done now (see "Hopper's
+   warpgroup MMA", "TMA and clusters" and "Distributed shared memory"). What
+   is left of Hopper is `cp.reduce.async.bulk`, `tensormap.replace` and TMA's
+   im2col and gather modes, each refused by name.

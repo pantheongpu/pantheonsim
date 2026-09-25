@@ -594,6 +594,8 @@ vgpu_unit_test(test_exec3)
 vgpu_unit_test(test_hopper)
 # The interpreter's fast paths, bit for bit against its general path.
 vgpu_unit_test(test_fastpath)
+# Distributed shared memory: blocks of a cluster reaching each other's.
+vgpu_unit_test(test_dsmem)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
@@ -1177,11 +1179,20 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 900)
   add_test(NAME e2e_cutlass_hopper COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_hopper.sh)
-  # Long enough for the four compiles to run one after another on a small runner.
+  # Long enough for the five compiles to run one after another on a small runner.
   set_tests_properties(e2e_cutlass_hopper PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 3000)
+endif()
+
+# Distributed shared memory through cooperative_groups' cluster API.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_dsmem_cluster COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dsmem_cluster.sh)
+  set_tests_properties(e2e_dsmem_cluster PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
 endif()
 
 # stmatrix: where the warp's registers land in shared memory, and that it is the
