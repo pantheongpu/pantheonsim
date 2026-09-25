@@ -942,6 +942,233 @@ VTEST(bulk_reduce_forms_the_isa_does_not_define_are_refused) {
                   "no .u64 form");
 }
 
+// tensormap.replace the way CUTLASS's grouped GEMMs use it: copy the map
+// into shared memory, point it at another tensor with other extents and a
+// wider row, fence it back out to global memory, and load through it. The
+// new dimension cuts the box, so the load's zero fill shows the dimension
+// took; the new stride shows the row pitch did. global_stride changed unit
+// at PTX ISA 8.5 (see the parser), so the same kernel runs under both.
+namespace {
+void retarget_and_load(const char* version, uint64_t stride_operand) {
+  constexpr int W1 = 16, W2 = 32, H = 4;
+  MemoryManager mem{1 << 20};
+  const uint64_t g1 = mem.alloc(W1 * H * 4), g2 = mem.alloc(W2 * H * 4);
+  const uint64_t gmap = mem.alloc(128 + 128), out = mem.alloc(16 * H * 4);
+  const uint64_t gmap_al = (gmap + 127) / 128 * 128;
+  for (int i = 0; i < W1 * H; ++i) mem.store_scalar(g1 + i * 4, 4, 0xDEAD0000u + i);
+  for (int i = 0; i < W2 * H; ++i) mem.store_scalar(g2 + i * 4, 4, 0x20000u + i);
+  exec::TensorMap t;
+  t.address = g1;
+  t.rank = 2;
+  t.type = exec::TmapType::U32;
+  t.dim = {W1, H, 1, 1, 1};
+  t.stride = {4, W1 * 4, 0, 0, 0};
+  t.box = {16, H, 1, 1, 1};
+  t.elem_stride = {1, 1, 1, 1, 1};
+  const std::string ptx = std::string(".version ") + version + R"(
+.target sm_90a
+.address_size 64
+.visible .entry k(.param .align 64 .b8 tmap[128], .param .u64 g2, .param .u64 gmap, .param .u64 stride, .param .u64 out)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<16>;
+    .shared .align 128 .b8 smap[128];
+    .shared .align 128 .b8 tile[256];
+    .shared .align 8 .b64 bar;
+    mov.u32 %r1, %tid.x;
+    setp.ne.u32 %p1, %r1, 0;
+    @%p1 bra WAIT;
+    mov.b64 %rd1, tmap;
+    cvta.param.u64 %rd2, %rd1;
+    mov.u32 %r2, smap;
+    mov.u32 %r3, 0;
+COPY:
+    cvt.u64.u32 %rd3, %r3;
+    add.u64 %rd4, %rd2, %rd3;
+    ld.u64 %rd5, [%rd4];
+    add.u32 %r4, %r2, %r3;
+    st.shared.u64 [%r4], %rd5;
+    add.u32 %r3, %r3, 8;
+    setp.lt.u32 %p2, %r3, 128;
+    @%p2 bra COPY;
+    ld.param.u64 %rd6, [g2];
+    ld.param.u64 %rd7, [gmap];
+    ld.param.u64 %rd8, [stride];
+    tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%r2], %rd6;
+    tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%r2], 0, 8;
+    tensormap.replace.tile.global_stride.shared::cta.b1024.b64 [%r2], 0, %rd8;
+    tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned [%rd7], [%r2], 128;
+    fence.proxy.tensormap::generic.acquire.gpu [%rd7], 128;
+    mov.u32 %r5, bar;
+    mbarrier.init.shared::cta.b64 [%r5], 1;
+    mbarrier.arrive.expect_tx.shared::cta.b64 _, [%r5], 256;
+    mov.u32 %r6, tile;
+    mov.u32 %r7, 0;
+    cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%r6], [%rd7, {%r7, %r7}], [%r5];
+WAIT:
+    bar.sync 0;
+    @%p1 bra DONE;
+    mov.u32 %r5, bar;
+SPIN:
+    mbarrier.try_wait.parity.shared::cta.b64 %p3, [%r5], 0;
+    @!%p3 bra SPIN;
+    ld.param.u64 %rd9, [out];
+    mov.u32 %r6, tile;
+    mov.u32 %r3, 0;
+OUT:
+    add.u32 %r4, %r6, %r3;
+    ld.shared.u32 %r8, [%r4];
+    cvt.u64.u32 %rd10, %r3;
+    add.u64 %rd11, %rd9, %rd10;
+    st.global.u32 [%rd11], %r8;
+    add.u32 %r3, %r3, 4;
+    setp.lt.u32 %p2, %r3, 256;
+    @%p2 bra OUT;
+DONE:
+    ret;
+}
+)";
+  DeviceProfile prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  LaunchConfig c;
+  c.block = {32, 1, 1};
+  exec::launch(m.entries[0], c, {tmap_arg(t), arg_u64(g2), arg_u64(gmap_al), arg_u64(stride_operand), arg_u64(out)},
+               mem, prof);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < 16; ++x) {
+      const uint64_t want = x < 8 ? 0x20000u + uint64_t(y * W2 + x) : 0;
+      VCHECK_EQ(mem.load_scalar(out + (y * 16 + x) * 4, 4), want);
+    }
+}
+}  // namespace
+
+VTEST(tensormap_replace_retargets_a_map_that_a_load_then_uses) {
+  retarget_and_load("8.5", 32 * 4);        // bytes, from PTX ISA 8.5
+  retarget_and_load("8.3", (32 * 4) >> 4);  // 16-byte units before it
+}
+
+// Every field, written into a map in global memory and read back by the
+// host's decoder: the value lands in the field it names, element types take
+// the ISA's numbering (not the driver's), and the rank is zero-based.
+VTEST(tensormap_replace_writes_each_field) {
+  MemoryManager mem{1 << 20};
+  const uint64_t raw = mem.alloc(256), gmap = (raw + 127) / 128 * 128;
+  exec::TensorMap t;
+  t.address = 0x1000;
+  t.rank = 2;
+  t.type = exec::TmapType::U32;
+  t.dim = {16, 4, 1, 1, 1};
+  t.stride = {4, 64, 0, 0, 0};
+  t.box = {16, 4, 1, 1, 1};
+  t.elem_stride = {1, 1, 1, 1, 1};
+  std::vector<uint8_t> bytes(128);
+  t.encode(bytes.data());
+  mem.write(gmap, bytes.data(), 128);
+  run(R"(
+.visible .entry k(.param .u64 m)
+{
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [m];
+    mov.u64 %rd2, 0x7000;
+    tensormap.replace.tile.global_address.global.b1024.b64 [%rd1], %rd2;
+    tensormap.replace.tile.rank.global.b1024.b32 [%rd1], 2;
+    tensormap.replace.tile.box_dim.global.b1024.b32 [%rd1], 2, 5;
+    tensormap.replace.tile.global_dim.global.b1024.b32 [%rd1], 2, 9;
+    mov.u64 %rd3, 256;   // 4096 bytes: this header is PTX 8.3, 16-byte units
+    tensormap.replace.tile.global_stride.global.b1024.b64 [%rd1], 1, %rd3;
+    tensormap.replace.tile.element_stride.global.b1024.b32 [%rd1], 1, 2;
+    tensormap.replace.tile.elemtype.global.b1024.b32 [%rd1], 6;
+    tensormap.replace.tile.swizzle_mode.global.b1024.b32 [%rd1], 3;
+    tensormap.replace.tile.fill_mode.global.b1024.b32 [%rd1], 1;
+    ret;
+}
+)", LaunchConfig{}, {arg_u64(gmap)}, mem);
+  mem.read(gmap, bytes.data(), 128);
+  exec::TensorMap r;
+  VCHECK(r.decode(bytes.data()));
+  VCHECK_EQ(r.address, uint64_t{0x7000});
+  VCHECK_EQ(r.rank, 3u);
+  VCHECK_EQ(r.box[2], 5u);
+  VCHECK_EQ(r.dim[2], uint64_t{9});
+  VCHECK_EQ(r.stride[2], uint64_t{4096});
+  VCHECK_EQ(r.elem_stride[1], 2u);
+  VCHECK(r.type == exec::TmapType::F16);   // ISA value 6; the driver's 6 is also F16,
+  VCHECK_EQ(r.stride[0], uint64_t{2});     // so the element size is the check that matters
+  VCHECK(r.swizzle == exec::TmapSwizzle::B128);
+  VCHECK_EQ(unsigned(r.oob_nan), 1u);
+  // Untouched fields stay as they were.
+  VCHECK_EQ(r.box[0], 16u);
+  VCHECK_EQ(r.dim[1], uint64_t{4});
+  VCHECK_EQ(r.stride[1], uint64_t{64});
+}
+
+// Where the two numberings differ: the ISA's 9 is f64, the driver's 9 is bf16.
+VTEST(tensormap_replace_elemtype_uses_the_isas_numbering) {
+  MemoryManager mem{1 << 20};
+  const uint64_t raw = mem.alloc(256), gmap = (raw + 127) / 128 * 128;
+  exec::TensorMap t;
+  t.address = 0x1000;
+  t.rank = 1;
+  t.type = exec::TmapType::U32;
+  t.dim = {16, 1, 1, 1, 1};
+  t.box = {16, 1, 1, 1, 1};
+  t.elem_stride = {1, 1, 1, 1, 1};
+  std::vector<uint8_t> bytes(128);
+  t.encode(bytes.data());
+  mem.write(gmap, bytes.data(), 128);
+  run(R"(
+.visible .entry k(.param .u64 m)
+{
+    .reg .b64 %rd<2>;
+    ld.param.u64 %rd1, [m];
+    tensormap.replace.tile.elemtype.global.b1024.b32 [%rd1], 9;
+    ret;
+}
+)", LaunchConfig{}, {arg_u64(gmap)}, mem);
+  mem.read(gmap, bytes.data(), 128);
+  exec::TensorMap r;
+  VCHECK(r.decode(bytes.data()));
+  VCHECK(r.type == exec::TmapType::F64);
+}
+
+VTEST(tensormap_replace_refuses_what_no_map_could_hold) {
+  MemoryManager mem{1 << 20};
+  const uint64_t raw = mem.alloc(256), gmap = (raw + 127) / 128 * 128;
+  exec::TensorMap t;
+  t.address = 0x1000;
+  t.rank = 1;
+  t.type = exec::TmapType::U32;
+  t.dim = {16, 1, 1, 1, 1};
+  t.box = {16, 1, 1, 1, 1};
+  t.elem_stride = {1, 1, 1, 1, 1};
+  std::vector<uint8_t> bytes(128);
+  t.encode(bytes.data());
+  mem.write(gmap, bytes.data(), 128);
+  auto one = [&](const std::string& line) {
+    return VCAPTURE(Error, run(".visible .entry k(.param .u64 m)\n{\n    .reg .b64 %rd<2>;\n"
+                               "    ld.param.u64 %rd1, [m];\n    " + line + "\n    ret;\n}\n",
+                               LaunchConfig{}, {arg_u64(gmap)}, mem));
+  };
+  VCHECK_CONTAINS(one("tensormap.replace.tile.element_stride.global.b1024.b32 [%rd1], 0, 0;").message(),
+                  "element stride is 1 to 8");
+  VCHECK_CONTAINS(one("tensormap.replace.tile.box_dim.global.b1024.b32 [%rd1], 0, 300;").message(),
+                  "box dimension is 1 to 256");
+  VCHECK_CONTAINS(one("tensormap.replace.tile.swizzle_mode.global.b1024.b32 [%rd1], 4;").message(),
+                  "96-byte swizzle");
+  auto parse_err = [](const std::string& target, const std::string& line) {
+    return VCAPTURE(Error, ptx::parse(".version 8.3\n.target " + target + "\n.address_size 64\n"
+                                      ".visible .entry k()\n{\n    .reg .b32 %r<2>;\n    .reg .b64 %rd<2>;\n    " +
+                                      line + "\n    ret;\n}\n")).message();
+  };
+  VCHECK_CONTAINS(parse_err("sm_90", "tensormap.replace.tile.rank.global.b1024.b32 [%rd1], 1;"),
+                  "arch-specific target");
+  VCHECK_CONTAINS(parse_err("sm_90a", "tensormap.replace.tile.global_address.global.b1024.b32 [%rd1], %r1;"),
+                  ".b64 for global_address");
+  VCHECK_CONTAINS(parse_err("sm_90a", "tensormap.replace.tile.swizzle_mode.global.b1024.b32 [%rd1], %r1;"),
+                  "value is an immediate");
+}
+
 VTEST(tensor_copy_refuses_a_map_nothing_encoded) {
   MemoryManager mem{1 << 20};
   std::vector<uint8_t> junk(128, 0x5A);

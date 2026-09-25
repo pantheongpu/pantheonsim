@@ -3251,6 +3251,25 @@ class Interpreter {
       exec_st_async(w, ctx, ins, *op, m);
       return;
     }
+    if (const auto* op = std::get_if<OpTensormapReplace>(&ins.op)) {
+      exec_tensormap_replace(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpTensormapCopy>(&ins.op)) {
+      // A plain 128-byte copy; the proxy fence it carries orders it before
+      // the tensor-map reads that follow, which here are ordinary loads.
+      Lanes _s_d, _s_s;
+      const Lanes dst = addr_base(w, ctx, ins, op->dst, _s_d);
+      const Lanes src = addr_base(w, ctx, ins, op->src, _s_s);
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        const uint64_t d = dst[lane] + static_cast<uint64_t>(op->dst.offset);
+        const uint64_t sa = kSharedVaBase + src[lane] + static_cast<uint64_t>(op->src.offset);
+        for (uint64_t i = 0; i < 128; i += 8)
+          store_routed(w, ctx, ins, lane, d + i, 8, load_routed(w, ctx, ins, lane, sa + i, 8));
+      }
+      return;
+    }
     if (const auto* op = std::get_if<OpBulkCopy>(&ins.op)) {
       exec_bulk_copy(w, ctx, ins, *op, m);
       return;
@@ -5652,6 +5671,108 @@ class Interpreter {
                "the tensor map this copy names was not made by cuTensorMapEncodeTiled (or was "
                "overwritten); its first bytes are not the encoder's");
     return m;
+  }
+
+  // tensormap.replace: decode the map, change one field, encode it back. A
+  // value the hardware would take but that no map cuTensorMapEncodeTiled
+  // makes could have (a box of 300, a traversal stride of 0) leaves the
+  // behaviour undefined, so it is refused here rather than carried into a
+  // copy that would then do something arbitrary.
+  void exec_tensormap_replace(Warp& w, const BlockCtx& ctx, const Instr& ins,
+                              const OpTensormapReplace& op, Mask m) {
+    Lanes _s_a, _s_v;
+    const Lanes base = addr_base(w, ctx, ins, op.addr, _s_a);
+    const Lanes& val = read_operand(w, ctx, ins, op.value, _s_v);
+    const uint64_t sbase = space_base(op.space);
+    const bool wide = op.field == TmapField::GlobalAddress || op.field == TmapField::GlobalStride;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const int li = static_cast<int>(lane);
+      const uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+      if (addr % 64)
+        ctx_fail(ins, li, Err::MisalignedAccess, "a tensor map must be 64-byte aligned");
+      uint64_t q[16];
+      for (int i = 0; i < 16; ++i) q[i] = load_routed(w, ctx, ins, lane, addr + 8 * i, 8);
+      exec::TensorMap t;
+      if (!t.decode(q))
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "tensormap.replace on 128 bytes that are not a tensor map made by "
+                 "cuTensorMapEncodeTiled (or a copy of one)");
+      const uint64_t v = wide ? val[lane] : static_cast<uint32_t>(val[lane]);
+      auto bad = [&](const std::string& what) {
+        ctx_fail(ins, li, Err::InvalidValue, "tensormap.replace: " + what);
+      };
+      auto refused = [&](const std::string& what) {
+        ctx_fail(ins, li, Err::UnsupportedPtx, "tensormap.replace: " + what);
+      };
+      using exec::TmapType;
+      using exec::TmapSwizzle;
+      switch (op.field) {
+        case TmapField::GlobalAddress:
+          if (v % 16) bad("a tensor's global address must be 16-byte aligned");
+          t.address = v;
+          break;
+        case TmapField::Rank:
+          // Zero-based: the value is the rank less one.
+          if (v > 4) bad("the rank field is the rank less one, 0 to 4; got " + std::to_string(v));
+          t.rank = static_cast<uint32_t>(v) + 1;
+          break;
+        case TmapField::BoxDim:
+          if (v < 1 || v > 256) bad("a box dimension is 1 to 256 elements; got " + std::to_string(v));
+          t.box[op.ord] = static_cast<uint32_t>(v);
+          break;
+        case TmapField::GlobalDim:
+          if (v < 1) bad("a global dimension is at least 1");
+          t.dim[op.ord] = v;
+          break;
+        case TmapField::GlobalStride: {
+          // Ordinal i is the stride of dimension i + 1; dimension 0's is the
+          // element size.
+          if (op.ord > 3) bad("a map has four strides, ordinals 0 to 3");
+          const uint64_t bytes = op.stride_in_16b ? v << 4 : v;
+          if (bytes % 16 || bytes >= (1ull << 40))
+            bad("a global stride is a multiple of 16 bytes below 2^40; got " + std::to_string(bytes));
+          t.stride[op.ord + 1] = bytes;
+          break;
+        }
+        case TmapField::ElementStride:
+          if (v < 1 || v > 8) bad("an element stride is 1 to 8; got " + std::to_string(v));
+          t.elem_stride[op.ord] = static_cast<uint32_t>(v);
+          break;
+        case TmapField::ElemType: {
+          // The ISA's own numbering (Table 36), which is not CUtensorMapDataType's.
+          static const TmapType types[] = {
+              TmapType::U8,  TmapType::U16,    TmapType::U32, TmapType::S32,  TmapType::U64,
+              TmapType::S64, TmapType::F16,    TmapType::F32, TmapType::F32Ftz, TmapType::F64,
+              TmapType::BF16, TmapType::TF32, TmapType::TF32Ftz};
+          if (v >= 13 && v <= 15) refused("the packed 4- and 6-bit element types are Blackwell's");
+          if (v > 15) bad("element type " + std::to_string(v) + " is not in the ISA's table");
+          t.type = types[v];
+          t.stride[0] = exec::TensorMap::type_bytes(t.type);
+          break;
+        }
+        case TmapField::InterleaveLayout:
+          if (v > 2) bad("interleave layout " + std::to_string(v) + " is not in the ISA's table");
+          t.interleave = static_cast<uint8_t>(v);
+          break;
+        case TmapField::SwizzleMode:
+          if (v == 4) refused("the 96-byte swizzle is sm_103a's and sm_107a's");
+          if (v > 4) bad("swizzle mode " + std::to_string(v) + " is not in the ISA's table");
+          t.swizzle = static_cast<TmapSwizzle>(v);   // none, 32B, 64B, 128B, in the same order
+          break;
+        case TmapField::SwizzleAtomicity:
+          // 16 bytes is what sm_90 swizzles at, so it changes nothing there;
+          // the wider atoms are Blackwell's.
+          if (v != 0) refused("swizzle atomicities other than 16 bytes are Blackwell's");
+          break;
+        case TmapField::FillMode:
+          if (v > 1) bad("fill mode " + std::to_string(v) + " is not in the ISA's table");
+          t.oob_nan = static_cast<uint8_t>(v);
+          break;
+      }
+      t.encode(q);
+      for (int i = 0; i < 16; ++i) store_routed(w, ctx, ins, lane, addr + 8 * i, 8, q[i]);
+    }
   }
 
   // The mbarrier at a shared::cluster address, which must be initialized.

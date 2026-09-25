@@ -398,6 +398,26 @@ struct OpBulkCopy {
   AtomOp red_op = AtomOp::Add;
   Type red_ty;
 };
+// tensormap.replace (sm_90a): one field of a 128-byte tensor map in global or
+// shared memory rewritten in place, as CUTLASS's grouped GEMMs retarget a map
+// per group. `ord` picks the dimension for the per-dimension fields.
+enum class TmapField {
+  GlobalAddress, Rank, BoxDim, GlobalDim, GlobalStride, ElementStride,
+  ElemType, InterleaveLayout, SwizzleMode, SwizzleAtomicity, FillMode,
+};
+struct OpTensormapReplace {
+  TmapField field = TmapField::GlobalAddress;
+  Space space = Space::Generic;
+  Addr addr;
+  uint32_t ord = 0;
+  Operand value;
+  // global_stride in 16-byte units, as PTX before ISA 8.5 took it (see the
+  // parser); bytes from 8.5 on.
+  bool stride_in_16b = false;
+};
+// tensormap.cp_fenceproxy: 128 bytes from shared to global memory, fenced
+// for the tensor-map proxy.
+struct OpTensormapCopy { Addr dst; Addr src; };
 // st.async / red.async (sm_90): a store or reduction into shared memory of a
 // block of the cluster that completes its bytes on an mbarrier there.
 struct OpStAsync {
@@ -682,7 +702,7 @@ struct OpCall {
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
-                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync>;
+                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy>;
 
 struct Instr {
   size_t line = 0;                 // source line, for diagnostics

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <optional>
@@ -183,6 +184,7 @@ class Parser {
       if (t.text == ".version") {
         next();
         m.version = expect_word("PTX version");
+        version_ = m.version;
         continue;
       }
       if (t.text == ".target") {
@@ -1219,6 +1221,8 @@ class Parser {
 
   // The module's .target line, for the instructions only one target has.
   std::string target_;
+  // And its .version, for the one instruction whose operand changed meaning.
+  std::string version_;
 
   Instr parse_instruction(const EntryFn& fn, std::vector<std::pair<size_t, std::string>>& bra_fixups) {
     Instr ins;
@@ -2241,6 +2245,98 @@ class Parser {
       }
       expect_punct(",");
       op.membermask = parse_operand();
+      ins.op = op;
+    } else if (op0 == "tensormap" && parts.size() > 1 && parts[1] == "replace") {
+      // tensormap.replace.tile.<field>{.global|.shared::cta}.b1024.{b32|b64} [addr], {ord,} new_val
+      OpTensormapReplace op;
+      bool tile = false, b1024 = false, have_field = false, b64 = false, have_ty = false;
+      static const std::unordered_map<std::string, TmapField> fields = {
+          {"global_address", TmapField::GlobalAddress}, {"rank", TmapField::Rank},
+          {"box_dim", TmapField::BoxDim}, {"global_dim", TmapField::GlobalDim},
+          {"global_stride", TmapField::GlobalStride}, {"element_stride", TmapField::ElementStride},
+          {"elemtype", TmapField::ElemType}, {"interleave_layout", TmapField::InterleaveLayout},
+          {"swizzle_mode", TmapField::SwizzleMode}, {"swizzle_atomicity", TmapField::SwizzleAtomicity},
+          {"fill_mode", TmapField::FillMode}};
+      for (size_t i = 2; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "tile") tile = true;
+        else if (auto f = fields.find(p); f != fields.end()) { op.field = f->second; have_field = true; }
+        else if (p == "global") op.space = Space::Global;
+        else if (p == "shared") op.space = Space::Shared;
+        else if (p == "b1024") b1024 = true;
+        else if (p == "b32") have_ty = true;
+        else if (p == "b64") { have_ty = true; b64 = true; }
+        else return unsupported("tensormap.replace modifier '." + p + "'");
+      }
+      if (!tile || !have_field || !b1024 || !have_ty)
+        return unsupported("tensormap.replace form (expected tensormap.replace.tile.<field>.b1024.<type>)");
+      // Arch-specific, like wgmma: sm_90a, and the a and f targets after it.
+      {
+        const char last = target_.empty() ? ' ' : target_.back();
+        int sm = 0;
+        std::sscanf(target_.c_str(), "sm_%d", &sm);
+        if (sm < 90 || (last != 'a' && last != 'f'))
+          fail(ins.line, "tensormap.replace requires an arch-specific target (.target sm_90a or "
+                         "later a/f targets); this module targets " + (target_.empty() ? std::string("nothing") : target_));
+      }
+      const bool wide_field = op.field == TmapField::GlobalAddress || op.field == TmapField::GlobalStride;
+      if (b64 != wide_field)
+        return unsupported("tensormap.replace takes .b64 for global_address and global_stride and "
+                           ".b32 for every other field");
+      const bool per_dim = op.field == TmapField::BoxDim || op.field == TmapField::GlobalDim ||
+                           op.field == TmapField::GlobalStride || op.field == TmapField::ElementStride;
+      const bool field3 = op.field >= TmapField::ElemType;
+      op.addr = parse_addr(fn);
+      expect_punct(",");
+      if (per_dim) {
+        auto ord = parse_operand();
+        auto* imm = std::get_if<ImmInt>(&ord);
+        if (!imm || imm->value < 0 || imm->value > 4)
+          return unsupported("tensormap.replace's ordinal is an immediate from 0 to 4");
+        op.ord = static_cast<uint32_t>(imm->value);
+        expect_punct(",");
+      }
+      op.value = parse_operand();
+      if (field3 && !std::holds_alternative<ImmInt>(op.value))
+        return unsupported("tensormap.replace's ." + parts[3] + " value is an immediate");
+      // The ISA does not say what unit global_stride is in, and it changed:
+      // CuTe hands it the stride in bytes when compiled by CUDA 12.5 or later
+      // and the stride shifted right by 4 before that ("4 LSBs are not
+      // included", cute/arch/copy_sm90_desc.hpp). CUDA 12.5 is PTX ISA 8.5,
+      // so the module's .version decides.
+      if (op.field == TmapField::GlobalStride) {
+        int major = 0, minor = 0;
+        std::sscanf(version_.c_str(), "%d.%d", &major, &minor);
+        op.stride_in_16b = major < 8 || (major == 8 && minor < 5);
+      }
+      if (op.addr.base_kind == Addr::Base::CallSlot)
+        return unsupported("tensormap.replace through a call slot");
+      ins.op = op;
+    } else if (op0 == "tensormap" && parts.size() > 1 && parts[1] == "cp_fenceproxy") {
+      // tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.<scope>.sync.aligned [dst], [src], 128
+      bool global = false, shared = false;
+      for (size_t i = 2; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "global") global = true;
+        else if (p == "shared") shared = true;
+        else if (p == "tensormap::generic" || p == "release" || p == "sync" || p == "aligned" ||
+                 inert_mem_modifier(p)) ;
+        else return unsupported("tensormap.cp_fenceproxy modifier '." + p + "'");
+      }
+      if (!global || !shared)
+        return unsupported("tensormap.cp_fenceproxy copies from .shared::cta to .global");
+      OpTensormapCopy op;
+      op.dst = parse_addr(fn);
+      expect_punct(",");
+      op.src = parse_addr(fn);
+      expect_punct(",");
+      auto size = parse_operand();
+      auto* imm = std::get_if<ImmInt>(&size);
+      if (!imm || imm->value != 128)
+        return unsupported("tensormap.cp_fenceproxy copies 128 bytes, the size of a tensor map");
+      for (const Addr* a : {&op.dst, &op.src})
+        if (a->base_kind == Addr::Base::CallSlot)
+          return unsupported("tensormap.cp_fenceproxy through a call slot");
       ins.op = op;
     } else if (op0 == "mapa" || op0 == "getctarank") {
       // mapa{.shared::cluster}.{u32,u64} d, a, rank

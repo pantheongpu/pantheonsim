@@ -770,6 +770,28 @@ narrows what counts as observable, not what the detector looks at.
   swizzle and f16 unswizzled, exact with one host thread and with eight. It
   fails on main.
 
+- Tensor maps changed on the device (sm_90a): `tensormap.replace` on a map
+  in global or shared memory, every field the ISA names (address, rank, box
+  and global extents, strides, traversal strides, element type, interleave,
+  swizzle, fill), and `tensormap.cp_fenceproxy`, which publishes a map edited
+  in shared memory. This is how CUTLASS's grouped and pointer-array GEMMs
+  point one descriptor at each group's tensors. Two things the ISA leaves to
+  the reader, settled from evidence: the element type uses the ISA's own
+  numbering (Table 36), which is not the driver's; and `global_stride` is in
+  bytes from PTX ISA 8.5 and in 16-byte units before it -- the ISA does not
+  say, but CuTe passes bytes when compiled by CUDA 12.5 or later and the
+  stride shifted right by 4 before that, so the module's `.version` decides.
+  A value no map from `cuTensorMapEncodeTiled` could hold (a box past 256, a
+  traversal stride of 0) is refused rather than carried into a copy, and
+  the Blackwell-only values (packed 4/6-bit types, the 96B swizzle, wider
+  swizzle atoms) are refused by name. Checked by unit tests (each field read
+  back by the host's decoder; the ISA's 9 is f64 where the driver's 9 is
+  bf16; a retargeted map loaded through under PTX 8.3 and 8.5; each confirmed
+  to fail with the rule it covers broken), and by a CuTe program
+  (tensormap_replace_cute.cu) that retargets a descriptor through CuTe's own
+  helpers in shared memory and in global memory and loads through it,
+  exact; it fails on main.
+
 ## Not implemented (fails loudly, never silently)
 
 This list was stale for a while, which is its own kind of wrong: it still named
@@ -780,7 +802,7 @@ what is done.
 - PTX, refused by name: TMA's im2col mode, gather/scatter, attribute
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle with 32B/64B atoms
-  (Blackwell), `tensormap.replace`, the sparse and
+  (Blackwell), the sparse and
   single-bit `wgmma` forms, and inline-asm-only instructions. (`wgmma`, TMA,
   the mbarrier transaction counts, `barrier.cluster` and distributed shared
   memory are done -- see "Hopper's warpgroup MMA", "TMA and clusters" and
@@ -1035,6 +1057,6 @@ scripts/run-pantheon-workloads.sh.
 
    `wgmma`, TMA and distributed shared memory are done now (see "Hopper's
    warpgroup MMA", "TMA and clusters" and "Distributed shared memory"). What
-   is left of Hopper is `tensormap.replace` and TMA's im2col and gather
-   modes, each refused by name. (`cp.reduce.async.bulk` is done -- see "TMA
-   reductions".)
+   is left of Hopper is TMA's im2col and gather modes, refused by name.
+   (`cp.reduce.async.bulk` and `tensormap.replace` are done -- see "TMA
+   reductions" and "Tensor maps changed on the device".)
