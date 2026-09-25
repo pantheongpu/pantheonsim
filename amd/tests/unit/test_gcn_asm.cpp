@@ -103,9 +103,9 @@ VTEST(scalar_bit_fields_shifts_and_comparisons_give_what_the_isa_says) {
   const amd::CodeObject o = object("asm_scalar");
   for (auto [x, y] : std::vector<std::pair<int32_t, int32_t>>{{0x12345678, -7}, {-40000, 40000}, {33, 33}, {INT_MIN, 3}}) {
     MemoryManager mem(16ull << 20);
-    const uint64_t out = mem.alloc(26 * 4);
+    const uint64_t out = mem.alloc(28 * 4);
     const std::vector<uint32_t> r =
-        run(o, "scalar", mem, out, 26, {out, static_cast<uint32_t>(x), static_cast<uint32_t>(y)});
+        run(o, "scalar", mem, out, 28, {out, static_cast<uint32_t>(x), static_cast<uint32_t>(y)});
     const uint32_t ux = static_cast<uint32_t>(x), uy = static_cast<uint32_t>(y);
     const uint64_t pair = ux | static_cast<uint64_t>(uy) << 32;
     const int64_t field = static_cast<int64_t>(pair << (64 - 32)) >> (64 - 12);   // bits 20..31, signed
@@ -126,7 +126,8 @@ VTEST(scalar_bit_fields_shifts_and_comparisons_give_what_the_isa_says) {
         (ux & 0xFFFF) | (uy & 0xFFFF) << 16,
         ~ux, ux & ~uy,
         x != y ? ux : 7u,
-        ~ux, ~uy};
+        ~ux, ~uy,
+        0u, 0x3FF00000u};   // s_mov_b64 of 1.0: the double
     for (size_t i = 0; i < want.size(); ++i) VCHECK_EQ(r[i], want[i]);
   }
 }
@@ -188,9 +189,9 @@ VTEST(buffers_lds_and_private_memory_are_reached_as_a_card_reaches_them) {
 VTEST(vector_comparisons_packed_math_and_mixed_precision_give_what_the_isa_says) {
   const amd::CodeObject o = object("asm_vector");
   MemoryManager mem(16ull << 20);
-  const uint64_t out = mem.alloc(26 * 4);
+  const uint64_t out = mem.alloc(28 * 4);
   const int32_t x = 10, y = 7;
-  const std::vector<uint32_t> r = run(o, "vector", mem, out, 26, {out, x, y});
+  const std::vector<uint32_t> r = run(o, "vector", mem, out, 28, {out, x, y});
   VCHECK_EQ(r[0], 10u);    // EXEC narrowed to the lanes below x
   VCHECK_EQ(r[1], 10u);    // and VCC written with it
   VCHECK_EQ(r[2], 1u);     // then to lane 3 alone
@@ -218,6 +219,8 @@ VTEST(vector_comparisons_packed_math_and_mixed_precision_give_what_the_isa_says)
   VCHECK_EQ(r[23], 0u);                // and no lane carried
   VCHECK_EQ(r[24], f(-2.0f));          // a select of a negated source
   VCHECK_EQ(r[25], f(4.0f));           // and of a source's absolute value
+  VCHECK_EQ(r[26], f(3.0f * 2.0f));    // (3, 7) times (2, 5), written over the (3, 7)
+  VCHECK_EQ(r[27], f(3.0f * 5.0f));    // whose high result reads the 3 as it was
 }
 
 VTEST_MAIN

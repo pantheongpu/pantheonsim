@@ -267,7 +267,11 @@ struct Machine {
       case OperandKind::Exec: return w.exec;
       case OperandKind::ExecLo: return static_cast<uint32_t>(w.exec);
       case OperandKind::ExecHi: return static_cast<uint32_t>(w.exec >> 32);
-      case OperandKind::InlineFloat: return as_bits(static_cast<float>(o.fvalue));
+      // An inline float constant is the number itself: a float's bits in a
+      // 32-bit operand, a double's in a 64-bit one (s_mov_b64 s[6:7], 1.0 is
+      // the double 1.0, not a float's bits with zeroes above them).
+      case OperandKind::InlineFloat:
+        return o.width >= 2 ? as_bits(o.fvalue) : as_bits(static_cast<float>(o.fvalue));
       // An aperture's base as a pair is the address; as one register, the
       // high half of it, which is what a kernel puts above an offset.
       case OperandKind::SharedBase: return o.width >= 2 ? kSharedBase : kSharedBase >> 32;
@@ -382,6 +386,9 @@ struct Machine {
       case OperandKind::Literal:
         if (top)
           throw Error::make(Err::Unsupported, in.name, " takes the second part of a constant, which this does not model");
+        // Each half of a packed float is a float: an inline float constant
+        // is a float's bits here, though the operand is a register pair.
+        if (o.kind == OperandKind::InlineFloat) return as_bits(static_cast<float>(o.fvalue));
         return static_cast<uint32_t>(scalar(w, o));
       default: return static_cast<uint32_t>(scalar(w, o) >> (32 * top));
     }
@@ -1632,14 +1639,18 @@ struct Machine {
       });
     } else if (op == "v_pk_fma_f32"_op || op == "v_pk_add_f32"_op || op == "v_pk_mul_f32"_op) {
       each([&](uint32_t lane) {
-        // Two floats in a register pair, each its own arithmetic.
+        // Two floats in a register pair, each its own arithmetic -- both
+        // worked out before either is written, since the destination may be
+        // a source whose low register the high result reads.
+        float r[2];
         for (uint32_t half = 0; half < 2; ++half) {
           const float x = packed_float(w, in, 0, half, lane), y = packed_float(w, in, 1, half, lane);
-          const float r = op == "v_pk_add_f32"_op   ? x + y
-                          : op == "v_pk_mul_f32"_op ? x * y
-                                                 : std::fma(x, y, packed_float(w, in, 2, half, lane));
-          set_word(w, in.dst[0], half, lane, as_bits(r));
+          r[half] = op == "v_pk_add_f32"_op   ? x + y
+                    : op == "v_pk_mul_f32"_op ? x * y
+                                           : std::fma(x, y, packed_float(w, in, 2, half, lane));
         }
+        set_word(w, in.dst[0], 0, lane, as_bits(r[0]));
+        set_word(w, in.dst[0], 1, lane, as_bits(r[1]));
       });
     } else if (op == "v_pk_mov_b32"_op) {
       // The low register from the first source and the high from the second,
@@ -2464,7 +2475,10 @@ struct Machine {
     const auto reg = [&](const Operand& o, uint32_t k, uint32_t lane) -> uint32_t {
       if (o.kind == OperandKind::Agpr) return o.index + k < w.agpr.size() ? w.agpr[o.index + k][lane] : 0;
       if (o.kind == OperandKind::Vgpr) return w.vgpr[o.index + k][lane];
-      return static_cast<uint32_t>(scalar(w, o));   // an inline constant, the same in every lane and register
+      // An inline constant, the same in every lane and register: a float
+      // constant a float's bits in each, whatever the operand's width.
+      if (o.kind == OperandKind::InlineFloat) return as_bits(static_cast<float>(o.fvalue));
+      return static_cast<uint32_t>(scalar(w, o));
     };
     // Value e of a source's run in one lane: a half (two to a register), a
     // float, or a double (a register pair).

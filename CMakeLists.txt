@@ -746,6 +746,10 @@ set_tests_properties(amd_hip PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_rocblas_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas_disasm.sh)
 set_tests_properties(amd_rocblas_disasm PROPERTIES DEPENDS test_amd_gcn
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# Programs built by each current ROCm release (6.4, 7.0, 7.1, 7.2), run on the shim.
+add_test(NAME amd_rocm_versions COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocm_versions.sh)
+set_tests_properties(amd_rocm_versions PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 # AMD's rocBLAS, unmodified, where ROCm with rocBLAS is installed.
 add_test(NAME amd_rocblas COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas.sh)
 set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip

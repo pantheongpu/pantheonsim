@@ -1,0 +1,4 @@
+lane 0 of 64: short, beef,  0.00, 2.500000e-03, a, 1099511627776, 100%, prime 7
+lane 1 of 64: a string long enough that it takes more than one packet to carry it, bef0,  1.50, 2.500000e-03, b, 1099511627776, 100%, prime 11
+lane 2 of 64: short, bef1,  3.00, 2.500000e-03, c, 1099511627776, 100%, prime 13
+printf returned what it printed for 3 of 3 lanes

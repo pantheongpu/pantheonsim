@@ -74,3 +74,23 @@ s_waitcnt vmcnt(0)
 global_store_dword v10, v27, s[6:7] offset:48
 global_store_dword v10, v28, s[6:7] offset:52
 s_endpgm
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_load_dwordx8 s[4:11], s[0:1], 0x0
+s_waitcnt lgkmcnt(0)
+s_mov_b64 exec, 1
+v_mov_b32_e32 v0, 0
+v_mov_b32_e32 v1, 1
+global_store_dword v0, v1, s[4:5]
+s_endpgm

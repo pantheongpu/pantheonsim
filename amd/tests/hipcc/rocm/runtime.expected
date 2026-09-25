@@ -1,0 +1,6 @@
+work-groups a compute unit holds: plain 8, of 65 threads 16, with 20000 bytes of LDS 3, tiled 2, wide 3
+filling the device: plain 608 of 1024, wide 912 of 256
+30 of 30 attributes agree with the properties
+a device that is not there: hipErrorInvalidDevice
+a kernel on device 0 read and wrote device 1's memory right for 256 of 256 elements
+disabling it again: hipErrorPeerAccessNotEnabled

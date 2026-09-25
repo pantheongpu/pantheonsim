@@ -7,7 +7,7 @@
 // comparison of part of a register. Built for gfx942 by build.sh, with
 // clang's assembler.
 //
-// vector(int* out, int x, int y) writes 26 words, in the order the test
+// vector(int* out, int x, int y) writes 28 words, in the order the test
 // lists them; x is the number of lanes the first comparison keeps.
   .amdgcn_target "amdgcn-amd-amdhsa--gfx942"
   .text
@@ -55,6 +55,11 @@ vector:
   v_pk_mul_f32 v[14:15], s[8:9], v[12:13] op_sel:[1,0] op_sel_hi:[0,1]
   v_pk_add_f32 v[16:17], v[12:13], s[8:9] neg_hi:[0,1]
   v_pk_mov_b32 v[18:19], v[12:13], s[8:9] op_sel:[1,1]
+  // A packed multiply whose destination is its first source, the high
+  // result reading that source's low register: both halves read their
+  // sources before either is written (rocBLAS's small trsm).
+  v_mov_b64_e32 v[34:35], v[12:13]
+  v_pk_mul_f32 v[34:35], v[34:35], s[8:9] op_sel_hi:[0,1]
   // The top half of v6 as a half, times a float, plus a float.
   v_fma_mix_f32 v20, v6, v12, v13 op_sel:[1,0,0] op_sel_hi:[1,0,0]
   // The high word of v21 against v22, and then its low word.
@@ -110,6 +115,8 @@ vector:
   global_store_dword v0, v1, s[2:3] offset:92
   global_store_dword v0, v28, s[2:3] offset:96
   global_store_dword v0, v29, s[2:3] offset:100
+  global_store_dword v0, v34, s[2:3] offset:104
+  global_store_dword v0, v35, s[2:3] offset:108
   s_endpgm
 .Lvector_end:
   .size vector, .Lvector_end-vector
@@ -118,7 +125,7 @@ vector:
   .p2align 6
   .amdhsa_kernel vector
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
-    .amdhsa_next_free_vgpr 32
+    .amdhsa_next_free_vgpr 40
     .amdhsa_next_free_sgpr 48
     .amdhsa_accum_offset 32
   .end_amdhsa_kernel
@@ -135,7 +142,7 @@ amdhsa.kernels:
     .private_segment_fixed_size: 0
     .wavefront_size: 64
     .sgpr_count: 48
-    .vgpr_count: 32
+    .vgpr_count: 40
     .max_flat_workgroup_size: 64
     .args:
       - .size: 8

@@ -11,8 +11,10 @@
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 sdk=""; rocm=""
+# Newest release first: the SDK and the HSA headers it is checked with belong
+# together, and an older release's HSA headers may predate the SDK.
 for c in "${VGPU_ROCPROFILER_SDK_PATH:-}" "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm \
-         "$HOME"/.local/share/rocm-*/opt/rocm-* "$HOME"/.local/share/rocprofiler-sdk*/opt/rocm-*; do
+         $(ls -d "$HOME"/.local/share/rocm-*/opt/rocm-* 2>/dev/null | sort -rV) "$HOME"/.local/share/rocprofiler-sdk*/opt/rocm-*; do
   [[ -n "$c" && -e "$c/include/rocprofiler-sdk/rocprofiler.h" && -z "$sdk" ]] && sdk=$c
   [[ -n "$c" && -e "$c/include/hsa/hsa.h" && -z "$rocm" ]] && rocm=$c
 done

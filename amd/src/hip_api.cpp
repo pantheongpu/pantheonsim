@@ -24,6 +24,7 @@
 #include <set>
 #include <mutex>
 #include <string>
+#include <dlfcn.h>
 #include <unistd.h>
 #include <vector>
 
@@ -336,8 +337,15 @@ hipError_t dispatch_kernel(State& s, int ordinal, const Module& module, const Ke
   uint64_t start = 0;
   uint64_t grid_sync = 0;
   try {
-    kernarg = mem.alloc(args.empty() ? 1 : args.size());
-    if (!args.empty()) mem.write(kernarg, args.data(), args.size());
+    // The segment with room past its end, zeroed: ROCm hands kernels
+    // kernarg memory padded well beyond what they declare, and the compiler
+    // counts on it, widening a scalar load of the last arguments past the
+    // segment's size (rocBLAS's rotmg reads 32 bytes at 0x60 of 124).
+    const size_t padded = (args.size() + 63) / 64 * 64 + 64;
+    kernarg = mem.alloc(padded);
+    std::vector<uint8_t> segment(padded, 0);
+    std::copy(args.begin(), args.end(), segment.begin());
+    mem.write(kernarg, segment.data(), segment.size());
     if (cooperative) {
       // What the device library's grid barrier counts on (ockl's mg_info): a
       // grid of one, its work-groups, its work-items, and a counter for a
@@ -519,31 +527,6 @@ hipError_t hipGetDevice(int* d) {
   return record(s, hipSuccess);
 }
 
-hipError_t hipGetDeviceProperties(hipDeviceProp_t* props, int ordinal) {
-  const ApiCall api("hipGetDeviceProperties");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!props) return record(s, hipErrorInvalidValue);
-  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
-  if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
-  const vgpu::DeviceProfile& p = s.rt->device(ordinal).profile();
-  *props = {};
-  std::snprintf(props->name, sizeof props->name, "%s", p.model.c_str());
-  std::snprintf(props->gcnArchName, sizeof props->gcnArchName, "%s", p.gcn_arch_full.c_str());
-  props->totalGlobalMem = static_cast<size_t>(p.vram_bytes);
-  props->sharedMemPerBlock = static_cast<size_t>(p.limits.shared_mem_per_block);
-  props->warpSize = static_cast<int>(p.warp_size);
-  props->maxThreadsPerBlock = static_cast<int>(p.limits.max_threads_per_block);
-  for (int i = 0; i < 3; ++i) {
-    props->maxThreadsDim[i] = static_cast<int>(p.limits.max_block_dim[i]);
-    props->maxGridSize[i] = static_cast<int>(p.limits.max_grid_dim[i]);
-  }
-  props->clockRate = static_cast<int>(p.telemetry.sm_clock_max_mhz) * 1000;
-  props->multiProcessorCount = static_cast<int>(p.limits.multiprocessors);
-  props->major = p.cc_major;
-  props->minor = p.cc_minor;
-  return record(s, hipSuccess);
-}
 
 hipError_t hipDeviceSynchronize(void) {
   const ApiCall api("hipDeviceSynchronize");
@@ -1216,9 +1199,94 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   props->ECCEnabled = p.telemetry.ecc ? 1 : 0;
 }
 
+// The same properties in the older layout: what hipGetDeviceProperties (and
+// hipGetDevicePropertiesR0000) fills, for a program built to that ABI. Each field is the R0600 one of the same name, so the two cannot
+// disagree; R0000's gcnArch, the number a gfx target was before it had a
+// name, is the target's digits (942).
+void fill_properties_r0000(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0000* out) {
+  vgpu::amd::abi::DevicePropR0600 in;
+  fill_properties(p, ordinal, &in);
+  *out = {};
+  std::memcpy(out->name, in.name, sizeof out->name);
+  std::memcpy(out->gcnArchName, in.gcnArchName, sizeof out->gcnArchName);
+  for (int i = 0; i < 3; ++i) {
+    out->maxThreadsDim[i] = in.maxThreadsDim[i];
+    out->maxGridSize[i] = in.maxGridSize[i];
+    out->maxTexture3D[i] = in.maxTexture3D[i];
+  }
+  for (int i = 0; i < 2; ++i) out->maxTexture2D[i] = in.maxTexture2D[i];
+  out->totalGlobalMem = in.totalGlobalMem;
+  out->sharedMemPerBlock = in.sharedMemPerBlock;
+  out->regsPerBlock = in.regsPerBlock;
+  out->warpSize = in.warpSize;
+  out->maxThreadsPerBlock = in.maxThreadsPerBlock;
+  out->clockRate = in.clockRate;
+  out->memoryClockRate = in.memoryClockRate;
+  out->memoryBusWidth = in.memoryBusWidth;
+  out->totalConstMem = in.totalConstMem;
+  out->major = in.major;
+  out->minor = in.minor;
+  out->multiProcessorCount = in.multiProcessorCount;
+  out->l2CacheSize = in.l2CacheSize;
+  out->maxThreadsPerMultiProcessor = in.maxThreadsPerMultiProcessor;
+  out->computeMode = in.computeMode;
+  out->clockInstructionRate = in.clockInstructionRate;
+  out->arch = in.arch;
+  out->concurrentKernels = in.concurrentKernels;
+  out->pciDomainID = in.pciDomainID;
+  out->pciBusID = in.pciBusID;
+  out->pciDeviceID = in.pciDeviceID;
+  out->maxSharedMemoryPerMultiProcessor = in.maxSharedMemoryPerMultiProcessor;
+  out->isMultiGpuBoard = in.isMultiGpuBoard;
+  out->canMapHostMemory = in.canMapHostMemory;
+  out->integrated = in.integrated;
+  out->cooperativeLaunch = in.cooperativeLaunch;
+  out->cooperativeMultiDeviceLaunch = in.cooperativeMultiDeviceLaunch;
+  out->maxTexture1DLinear = in.maxTexture1DLinear;
+  out->maxTexture1D = in.maxTexture1D;
+  out->hdpMemFlushCntl = in.hdpMemFlushCntl;
+  out->hdpRegFlushCntl = in.hdpRegFlushCntl;
+  out->memPitch = in.memPitch;
+  out->textureAlignment = in.textureAlignment;
+  out->texturePitchAlignment = in.texturePitchAlignment;
+  out->kernelExecTimeoutEnabled = in.kernelExecTimeoutEnabled;
+  out->ECCEnabled = in.ECCEnabled;
+  out->tccDriver = in.tccDriver;
+  out->cooperativeMultiDeviceUnmatchedFunc = in.cooperativeMultiDeviceUnmatchedFunc;
+  out->cooperativeMultiDeviceUnmatchedGridDim = in.cooperativeMultiDeviceUnmatchedGridDim;
+  out->cooperativeMultiDeviceUnmatchedBlockDim = in.cooperativeMultiDeviceUnmatchedBlockDim;
+  out->cooperativeMultiDeviceUnmatchedSharedMem = in.cooperativeMultiDeviceUnmatchedSharedMem;
+  out->isLargeBar = in.isLargeBar;
+  out->asicRevision = in.asicRevision;
+  out->managedMemory = in.managedMemory;
+  out->directManagedMemAccessFromHost = in.directManagedMemAccessFromHost;
+  out->concurrentManagedAccess = in.concurrentManagedAccess;
+  out->pageableMemoryAccess = in.pageableMemoryAccess;
+  out->pageableMemoryAccessUsesHostPageTables = in.pageableMemoryAccessUsesHostPageTables;
+  out->gcnArch = std::atoi(p.gcn_arch.c_str() + (p.gcn_arch.rfind("gfx", 0) == 0 ? 3 : 0));
+}
+
 }  // namespace
 
 extern "C" {
+
+// The older layout, under both names a program may ask for it by.
+static_assert(sizeof(hipDeviceProp_t) == sizeof(vgpu::amd::abi::DevicePropR0000),
+              "vgpu_hip.h's hipDeviceProp_t is the R0000 layout");
+hipError_t hipGetDevicePropertiesR0000(vgpu::amd::abi::DevicePropR0000* props, int ordinal) {
+  const ApiCall api("hipGetDevicePropertiesR0000");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!props) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
+  fill_properties_r0000(s.rt->device(ordinal).profile(), ordinal, props);
+  return record(s, hipSuccess);
+}
+hipError_t hipGetDeviceProperties(hipDeviceProp_t* props, int ordinal) {
+  const ApiCall api("hipGetDeviceProperties");
+  return hipGetDevicePropertiesR0000(reinterpret_cast<vgpu::amd::abi::DevicePropR0000*>(props), ordinal);
+}
 
 hipError_t hipGetDevicePropertiesR0600(vgpu::amd::abi::DevicePropR0600* props, int ordinal) {
   const ApiCall api("hipGetDevicePropertiesR0600");

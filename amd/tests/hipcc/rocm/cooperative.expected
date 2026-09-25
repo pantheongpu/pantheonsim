@@ -1,0 +1,3 @@
+cooperative launch 1, 16 work-groups of 128 a compute unit
+after the grid barrier, 16 of 16 groups saw every group's value
+a grid too large to be resident at once: hipErrorCooperativeLaunchTooLarge

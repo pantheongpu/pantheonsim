@@ -31,6 +31,8 @@ v_mov_b32_e32 v13, 0x40e00000
 v_pk_mul_f32 v[14:15], s[8:9], v[12:13] op_sel:[1,0] op_sel_hi:[0,1]
 v_pk_add_f32 v[16:17], v[12:13], s[8:9] neg_hi:[0,1]
 v_pk_mov_b32 v[18:19], v[12:13], s[8:9] op_sel:[1,1]
+v_mov_b64_e32 v[34:35], v[12:13]
+v_pk_mul_f32 v[34:35], v[34:35], s[8:9] op_sel_hi:[0,1]
 v_fma_mix_f32 v20, v6, v12, v13 op_sel:[1,0,0] op_sel_hi:[1,0,0]
 v_mov_b32_e32 v21, 0x50003
 v_mov_b32_e32 v22, 5
@@ -81,4 +83,6 @@ v_mov_b32_e32 v1, s40
 global_store_dword v0, v1, s[2:3] offset:92
 global_store_dword v0, v28, s[2:3] offset:96
 global_store_dword v0, v29, s[2:3] offset:100
+global_store_dword v0, v34, s[2:3] offset:104
+global_store_dword v0, v35, s[2:3] offset:108
 s_endpgm

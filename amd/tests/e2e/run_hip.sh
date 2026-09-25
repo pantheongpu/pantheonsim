@@ -66,12 +66,14 @@ build runtime_hip
 expect "the runtime program links against the shim" "yes" \
   "$([[ -x "$tmp/runtime_hip" ]] && echo yes || echo "no: $(head -3 "$tmp/runtime_hip.err")")"
 if [[ -x "$tmp/runtime_hip" ]]; then
-  out=$(VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 "$tmp/runtime_hip" "$root/amd/tests/data/memory.gfx942.o" 2>&1)
+  out=$(VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 "$tmp/runtime_hip" "$root/amd/tests/data/memory.gfx942.o" \
+    "$root/amd/tests/data/asm_memory.gfx942.o" 2>&1)
   status=$?
   echo "$out" | sed 's/^/      /'
   expect "it runs" "0" "$status"
   for line in \
     "an allocation costs what it asked for 1" \
+    "a kernel reading past its arguments runs 1" \
     "and freeing it gives that back 1" \
     "a copy on a stream lands 1" \
     "a kernel whose LDS the launch paid for 1" \
