@@ -90,6 +90,13 @@ struct CodeObject {
   std::vector<Relocation> relocations;
   bool placed = false;
   uint64_t data_base = 0;   // where the data image was placed, once it was
+  // A linked object (what hipcc builds): everything it loads, laid out by
+  // address from zero -- its code, its constants, its variables. A loader
+  // copies this to the device, and that base plus an address is where each
+  // thing is; the code finds its constants and variables that way, relative
+  // to itself. Empty for an object not yet linked, whose variables are `data`.
+  bool linked = false;
+  std::vector<uint8_t> image;
 };
 
 // Writes the addresses of the module's globals into its code, for a data

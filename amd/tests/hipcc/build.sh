@@ -10,6 +10,26 @@ export ROCM_PATH=$rocm HIP_PATH=$rocm HIP_CLANG_PATH=$rocm/lib/llvm/bin HIP_DEVI
 "$rocm/bin/hipcc" --version 2>/dev/null | grep "HIP version" || true
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 chevron.cpp -o chevron.gfx942
 echo "wrote $(pwd)/chevron.gfx942"
+# Device-side printf: the program, and its device code with the listing, since
+# the path ROCm's device library takes through a hostcall is thousands of
+# instructions of its own.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 printf.cpp -o printf.gfx942
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 --offload-device-only --no-gpu-bundle-output \
+  -c printf.cpp -o printf.gfx942.o
+"$rocm/lib/llvm/bin/llvm-objdump" -d --mcpu=gfx942 printf.gfx942.o |
+  sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > printf.gfx942.dis
+echo "wrote $(pwd)/printf.gfx942, printf.gfx942.o and its listing ($(wc -l < printf.gfx942.dis) instructions)"
+# Occupancy, device attributes, and a kernel reaching another device's memory.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 runtime.cpp -o runtime.gfx942
+echo "wrote $(pwd)/runtime.gfx942"
+# A cooperative launch, whose work-groups wait for one another at a grid
+# barrier: the program, and its device code with the listing.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 cooperative.cpp -o cooperative.gfx942
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 --offload-device-only --no-gpu-bundle-output \
+  -c cooperative.cpp -o cooperative.gfx942.o
+"$rocm/lib/llvm/bin/llvm-objdump" -d --mcpu=gfx942 cooperative.gfx942.o |
+  sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > cooperative.gfx942.dis
+echo "wrote $(pwd)/cooperative.gfx942, cooperative.gfx942.o and its listing ($(wc -l < cooperative.gfx942.dis) instructions)"
 
 # The device code alone, for the decoder and the executor to be checked
 # against, and the listing of it from the same toolchain's llvm-objdump.

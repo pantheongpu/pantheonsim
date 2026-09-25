@@ -13,6 +13,8 @@
 #include <cstdio>
 
 #include "vgpu/error.hpp"
+#include <cctype>
+
 #include "vgpu/ptx/parser.hpp"
 
 namespace vgpu::runtime {
@@ -46,6 +48,22 @@ uint64_t Device::load_module(const std::string& ptx_src) {
                         " but this device is compute capability ", profile_.cc_major, ".",
                         profile_.cc_minor,
                         "; PTX runs on newer architectures, not older ones");
+    // The suffixed targets narrow that. sm_90a code uses features only
+    // compute capability 9.0 has (wgmma is gone on Blackwell), and sm_100f
+    // code runs within its family, 10.x, and no further.
+    const size_t sm = mod->target.find("sm_");
+    const char suffix = [&]() -> char {
+      if (sm == std::string::npos) return 0;
+      size_t i = sm + 3;
+      while (i < mod->target.size() && std::isdigit(static_cast<unsigned char>(mod->target[i]))) ++i;
+      return i < mod->target.size() ? mod->target[i] : 0;
+    }();
+    if (want && have && ((suffix == 'a' && want != have) || (suffix == 'f' && want / 10 != have / 10)))
+      throw Error::make(Err::PtxParse, "module targets ", mod->target,
+                        ", which is specific to compute capability ",
+                        suffix == 'a' ? std::to_string(want / 10) + "." + std::to_string(want % 10)
+                                      : std::to_string(want / 10) + ".x",
+                        ", and this device is ", profile_.cc_major, ".", profile_.cc_minor);
     LoadedModule lm;
     lm.id = next_module_id_++;
     // Materialize module .global variables into device memory.

@@ -22,7 +22,11 @@ if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
   untracked=""
   for f in amd/tests/hipcc/ops.hip amd/tests/hipcc/ops.gfx942.o amd/tests/hipcc/ops.gfx942.dis \
            amd/tests/hipcc/wmma.cpp amd/tests/hipcc/wmma.gfx942.o amd/tests/hipcc/wmma.gfx942.dis \
-           amd/tests/hipcc/chevron.cpp amd/tests/hipcc/chevron.gfx942; do
+           amd/tests/hipcc/chevron.cpp amd/tests/hipcc/chevron.gfx942 \
+           amd/tests/hipcc/printf.cpp amd/tests/hipcc/printf.gfx942 amd/tests/hipcc/printf.gfx942.o \
+           amd/tests/hipcc/printf.gfx942.dis amd/tests/hipcc/cooperative.cpp amd/tests/hipcc/cooperative.gfx942 \
+           amd/tests/hipcc/cooperative.gfx942.o amd/tests/hipcc/cooperative.gfx942.dis \
+           amd/tests/hipcc/runtime.cpp amd/tests/hipcc/runtime.gfx942; do
     git -C "$root" ls-files --error-unmatch "$f" >/dev/null 2>&1 || untracked="$untracked $f"
   done
   expect "every hipcc fixture is in the repository" "" "$untracked"

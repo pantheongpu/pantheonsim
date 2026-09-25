@@ -2,10 +2,8 @@
 # Values from public AMD documentation. verified: false means nothing here has
 # been confirmed by hardware characterization yet -- treat as placeholders.
 #
-# NOTE: AMD execution is NOT implemented. This profile exists for Level 1
-# (discovery) so rocm-smi / rocm_agent_enumerator / lspci report the device.
-# Launching a kernel on it fails with a clear "wavefront size 64 unsupported"
-# error rather than producing wrong answers.
+# Kernels built for gfx942 run on it (amd/README.md); the numbers below that
+# say how fast are placeholders like the rest.
 id: amd/mi300x
 vendor: amd
 model: "AMD Instinct MI300X"

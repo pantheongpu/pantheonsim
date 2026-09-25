@@ -15,10 +15,13 @@ hip_4.2 {
     __hipPushCallConfiguration;
     __hipRegisterFatBinary;
     __hipRegisterFunction;
+    __hipRegisterVar;
     __hipUnregisterFatBinary;
     hipDeviceCanAccessPeer;
+    hipDeviceDisablePeerAccess;
     hipDeviceEnablePeerAccess;
     hipDeviceGet;
+    hipDeviceGetAttribute;
     hipDeviceGetName;
     hipDeviceReset;
     hipDeviceSynchronize;
@@ -39,15 +42,22 @@ hip_4.2 {
     hipGetErrorString;
     hipGetLastError;
     hipGetStreamDeviceId;
+    hipGetSymbolAddress;
+    hipGetSymbolSize;
     hipHostFree;
     hipHostMalloc;
     hipInit;
+    hipLaunchCooperativeKernel;
     hipLaunchKernel;
     hipMalloc;
     hipMemGetInfo;
     hipMemcpy;
     hipMemcpyAsync;
+    hipMemcpyFromSymbol;
+    hipMemcpyFromSymbolAsync;
     hipMemcpyPeerAsync;
+    hipMemcpyToSymbol;
+    hipMemcpyToSymbolAsync;
     hipMemset;
     hipMemsetAsync;
     hipModuleGetFunction;
@@ -55,7 +65,12 @@ hip_4.2 {
     hipModuleLaunchKernel;
     hipModuleLoad;
     hipModuleLoadData;
+    hipModuleOccupancyMaxActiveBlocksPerMultiprocessor;
+    hipModuleOccupancyMaxPotentialBlockSize;
     hipModuleUnload;
+    hipOccupancyMaxActiveBlocksPerMultiprocessor;
+    hipOccupancyMaxActiveBlocksPerMultiprocessorWithFlags;
+    hipOccupancyMaxPotentialBlockSize;
     hipPeekAtLastError;
     hipRuntimeGetVersion;
     hipSetDevice;
@@ -103,3 +118,8 @@ hip_6.4 {
 } hip_6.2;
 hip_6.5 {
 } hip_6.4;
+VGPU_PRIVATE {
+  global:
+    vgpu_hip_profiler_attach;
+    vgpu_hip_profiler_device;
+};

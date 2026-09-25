@@ -122,6 +122,7 @@ add_library(vgpu STATIC
   amd/src/codeobject.cpp
   amd/src/gcn_decode.cpp
   amd/src/gcn_exec.cpp
+  amd/src/hostcall.cpp
   src/core/machine.cpp
   # Each vendor's part of the register model and its driver files.
   amd/src/regs.cpp
@@ -182,6 +183,23 @@ add_custom_command(TARGET vgpuhip POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.7"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so"
   COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7)")
+# How fast the CDNA interpreter runs a kernel (amd/tools/exec-bench.cpp).
+add_executable(amd_exec_bench amd/tools/exec-bench.cpp)
+target_link_libraries(amd_exec_bench PRIVATE vgpu)
+target_include_directories(amd_exec_bench PRIVATE amd/include)
+# librocprofiler-sdk: rocprofiler-sdk's interface over the HIP shim, so AMD's
+# profiler (rocprofv3) runs unmodified on a simulated GPU. It sits beside
+# libamdhip64 in build/shim, where a tool linked to librocprofiler-sdk.so.1
+# finds it first.
+add_library(vgpurocprof SHARED amd/src/rocprofiler_sdk.cpp)
+target_link_libraries(vgpurocprof PRIVATE vgpuhip ${CMAKE_DL_LIBS})
+target_include_directories(vgpurocprof PRIVATE include amd/include)
+set_target_properties(vgpurocprof PROPERTIES OUTPUT_NAME rocprofiler-sdk SOVERSION 1 VERSION 1.0.0)
+add_custom_command(TARGET vgpurocprof POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocprofiler-sdk.so.1.0.0" "${CMAKE_BINARY_DIR}/shim/librocprofiler-sdk.so.1"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocprofiler-sdk.so.1.0.0" "${CMAKE_BINARY_DIR}/shim/librocprofiler-sdk.so"
+  COMMENT "Creating rocprofiler-sdk shim symlinks (build/shim/librocprofiler-sdk.so.1)")
 
 # ---------------------------------------------------------------------------
 # libvgpucudart: the CUDA *runtime* API shim. Lets unmodified nvcc-compiled
@@ -571,6 +589,8 @@ target_compile_definitions(test_exec PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR
 vgpu_unit_test(test_runtime)
 vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
+# Hopper (sm_90a): the warpgroup MMA, against the ISA's own layout examples.
+vgpu_unit_test(test_hopper)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
@@ -636,6 +656,23 @@ target_compile_definitions(test_amd_gcn_lds PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOU
 
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
 target_compile_definitions(test_amd_gcn_idioms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_unit_test(test_amd_gcn_asm amd/tests/unit/test_gcn_asm.cpp)
+target_compile_definitions(test_amd_gcn_asm PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_unit_test(test_amd_hostcall amd/tests/unit/test_hostcall.cpp)
+vgpu_unit_test(test_amd_gcn_counters amd/tests/unit/test_gcn_counters.cpp)
+target_compile_definitions(test_amd_gcn_counters PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# rocprofiler-sdk's interface from a tool's side: the test is the tool, and
+# runs a HIP program through libamdhip64.
+add_executable(test_amd_rocprofiler amd/tests/unit/test_rocprofiler.cpp)
+target_link_libraries(test_amd_rocprofiler PRIVATE vgpurocprof vgpuhip)
+target_include_directories(test_amd_rocprofiler PRIVATE tests/framework amd/include)
+target_compile_definitions(test_amd_rocprofiler PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_amd_rocprofiler COMMAND test_amd_rocprofiler)
+set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
+add_test(NAME amd_rocprofiler_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofiler_abi.sh)
+add_test(NAME amd_rocprofv3 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofv3.sh)
+set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 600)
 
 vgpu_unit_test(test_amd_hip_abi amd/tests/unit/test_hip_abi.cpp)
 
@@ -707,6 +744,14 @@ set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
 add_test(NAME test_amd_hipcc_ops_decode COMMAND test_amd_gcn)
 set_tests_properties(test_amd_hipcc_ops_decode PROPERTIES ENVIRONMENT
   "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/ops.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/ops.gfx942.dis")
+# ROCm's device library's printf: the thousands of instructions a hostcall takes.
+add_test(NAME test_amd_hipcc_printf_decode COMMAND test_amd_gcn)
+set_tests_properties(test_amd_hipcc_printf_decode PROPERTIES ENVIRONMENT
+  "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/printf.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/printf.gfx942.dis")
+# cooperative_groups' grid barrier, and the sub-dword compares around it.
+add_test(NAME test_amd_hipcc_cooperative_decode COMMAND test_amd_gcn)
+set_tests_properties(test_amd_hipcc_cooperative_decode PROPERTIES ENVIRONMENT
+  "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/cooperative.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/cooperative.gfx942.dis")
 add_test(NAME test_amd_hipcc_mfma_decode COMMAND test_amd_gcn)
 set_tests_properties(test_amd_hipcc_mfma_decode PROPERTIES ENVIRONMENT
   "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/wmma.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/wmma.gfx942.dis")
@@ -741,6 +786,9 @@ set_tests_properties(smi_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 add_test(NAME shell_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_shell_cli.sh)
 set_tests_properties(shell_cli PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
+add_test(NAME amd_session COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_amd_session.sh)
+set_tests_properties(amd_session PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 add_test(NAME test_matrix_exit COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_test_matrix.sh)
 set_tests_properties(test_matrix_exit PROPERTIES DEPENDS vgpu_cli
@@ -1019,6 +1067,42 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# Checks on the code rather than on behaviour, each guarding a class of bug that
+# shipped once: an entry point that puts work on a stream without knowing about
+# capture (the work goes missing from every replay), and a shim library with a
+# reference nothing can resolve (it cannot be loaded by anything that binds at
+# load time).
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME lint_capture_coverage
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_capture_coverage.py)
+endif()
+add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_symbols.sh)
+set_tests_properties(lint_shim_symbols PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
+
+# Copies and fills with a shape in graphs, and the async copies a capture has to
+# record rather than run; two simulated devices, for the peer copy.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_graph_shapes COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_shapes.sh)
+  set_tests_properties(e2e_graph_shapes PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# Stream capture across streams -- fork, join, and the documented refusals --
+# and host functions, events, allocation, cooperative launches and graph
+# launches on a capturing stream.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_capture_streams COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_capture_streams.sh)
+  set_tests_properties(e2e_capture_streams PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # The session's ncu: Nsight Compute's command line answered from the simulator's
 # counters, checked against kernels whose metrics follow from their addresses.
 if(TARGET vgpucudart)
@@ -1057,6 +1141,32 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
+endif()
+
+# wgmma: Hopper's warpgroup MMA, checked against CuTe's layouts and descriptors
+# across every swizzle mode and element type. Fetches a pinned CUTLASS release
+# (headers only) into the build directory unless CUTLASS_DIR names one.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_wgmma_cute COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wgmma_cute.sh)
+  set_tests_properties(e2e_wgmma_cute PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 900)
+endif()
+
+# TMA: a CUTLASS-style Hopper GEMM (clusters, a TMA pipeline, wgmma) checked
+# exactly, and CUTLASS's own TMA and bulk-copy unit tests run unmodified.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_tma_gemm_cute COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_tma_gemm_cute.sh)
+  set_tests_properties(e2e_tma_gemm_cute PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 900)
+  add_test(NAME e2e_cutlass_hopper COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_hopper.sh)
+  set_tests_properties(e2e_cutlass_hopper PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 1500)
 endif()
 
 # stmatrix: where the warp's registers land in shared memory, and that it is the

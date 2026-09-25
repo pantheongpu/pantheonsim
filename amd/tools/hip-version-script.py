@@ -26,6 +26,14 @@ HEADER = '''/* The symbol versions libamdhip64 defines, as ROCm 7.1's own librar
  * Regenerate with amd/tools/hip-version-script.py when a function is added. */
 '''
 
+# VirtualGPU's own: what its librocprofiler-sdk attaches through
+# (vgpu/hip_profiler.hpp). No HIP program asks for these.
+PRIVATE = '''VGPU_PRIVATE {
+  global:
+    vgpu_hip_profiler_attach;
+    vgpu_hip_profiler_device;
+};'''
+
 
 def versions(real):
     out = subprocess.run(['readelf', '--dyn-syms', '--wide', real], capture_output=True, text=True).stdout
@@ -59,6 +67,7 @@ def main():
         loc = '  local: *;\n' if k == 'hip_4.2' else ''
         text.append(f'{k} {{\n{glob}{loc}}}' + (f' {prev};' if prev else ';'))
         prev = k
+    text.append(PRIVATE)
     open(dest, 'w').write('\n'.join(text) + '\n')
 
 

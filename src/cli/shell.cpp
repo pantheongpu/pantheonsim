@@ -195,6 +195,23 @@ std::string shim_dir() {
   return dir + "/shim";
 }
 
+// The ROCm bin directories a tool is likely to put in front of PATH, in the
+// order pantheon.py and ROCm's own scripts look: $ROCM_PATH, $HIP_PATH, then
+// /opt/rocm.
+std::vector<std::string> rocm_bin_directories() {
+  std::vector<std::string> out;
+  auto add = [&](const std::string& d) {
+    struct stat st{};
+    if (::stat(d.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && std::find(out.begin(), out.end(), d) == out.end())
+      out.push_back(d);
+  };
+  for (const char* var : {"ROCM_PATH", "HIP_PATH"})
+    if (const char* r = std::getenv(var); r && *r) add(std::string(r) + "/bin");
+  add("/opt/rocm/bin");
+  add("/opt/rocm/llvm/bin");
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic system files
 // ---------------------------------------------------------------------------
@@ -299,8 +316,13 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   s.telemetry = s.dir + "/telemetry";
   s.dmesg_path = s.dir + "/dmesg.log";
   s.pci_dump = s.dir + "/pci.dump";
+  // A machine has the driver of the GPUs in it: an AMD one has no
+  // /proc/driver/nvidia and no nvidia-smi, which is how tools that pick a
+  // vendor tell the two apart.
+  const bool nvidia = p.vendor != "amd";
   make_dirs(s.bin);
-  make_dirs(s.root + "/proc/driver/nvidia/gpus");
+  make_dirs(s.root + "/proc/driver");
+  if (nvidia) make_dirs(s.root + "/proc/driver/nvidia/gpus");
   make_dirs(s.root + "/sys/class/drm");
   make_dirs(s.root + "/sys/bus/pci/devices");
   make_dirs(s.root + "/sys/class/hwmon");
@@ -309,7 +331,7 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   const std::string vgpu = exe_path();
   const std::string shim = shim_dir();
 
-  write_file(s.root + "/proc/driver/nvidia/version", nvidia_proc_version(c));
+  if (nvidia) write_file(s.root + "/proc/driver/nvidia/version", nvidia_proc_version(c));
   write_file(s.root + "/etc/os-release", os_release(c));
   write_file(s.dmesg_path, dmesg_log(c, p));
 
@@ -317,20 +339,22 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   for (int i = 0; i < c.count; ++i) {
     char bdf[32];
     std::snprintf(bdf, sizeof bdf, "0000:%02x:00.0", i + 1);
-    std::string gpudir = s.root + "/proc/driver/nvidia/gpus/" + bdf;
-    make_dirs(gpudir);
-    // The UUID nvidia-smi and NVML report for this device, and no VBIOS, which
-    // is also NVML's answer: this file used to carry its own version of both.
     vgpu::telemetry::DeviceSample ds{};
     vgpu::telemetry::describe_device(p, i, &ds);
-    char info[512];
-    std::snprintf(info, sizeof info,
-                  "Model: \t\t %s\nIRQ:   \t\t %d\nGPU UUID: \t %s\n"
-                  "Video BIOS: \t N/A\nBus Type: \t PCIe\n"
-                  "DMA Size: \t 47 bits\nDMA Mask: \t 0x7fffffffffff\n"
-                  "Bus Location: \t %s\nDevice Minor: \t %d\n",
-                  p.model.c_str(), 128 + i, ds.uuid, bdf, i);
-    write_file(gpudir + "/information", info);
+    // The UUID nvidia-smi and NVML report for this device, and no VBIOS, which
+    // is also NVML's answer: this file used to carry its own version of both.
+    if (nvidia) {
+      std::string gpudir = s.root + "/proc/driver/nvidia/gpus/" + bdf;
+      make_dirs(gpudir);
+      char info[512];
+      std::snprintf(info, sizeof info,
+                    "Model: \t\t %s\nIRQ:   \t\t %d\nGPU UUID: \t %s\n"
+                    "Video BIOS: \t N/A\nBus Type: \t PCIe\n"
+                    "DMA Size: \t 47 bits\nDMA Mask: \t 0x7fffffffffff\n"
+                    "Bus Location: \t %s\nDevice Minor: \t %d\n",
+                    p.model.c_str(), 128 + i, ds.uuid, bdf, i);
+      write_file(gpudir + "/information", info);
+    }
     // The PCI device, where the kernel keeps it: behind a root port of its
     // own, reached from /sys/bus/pci/devices and from its DRM card. Its files
     // -- config space, resources, IDs, link speed and width, the AER stats,
@@ -407,10 +431,10 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   // nvidia/tools/nvidia-smi cannot drift apart again.
   // Each runs under its own name (exec -a), so the register access log names
   // the tool that made an access rather than vgpu.
-  tool("nvidia-smi", "# VirtualGPU session tool.\nexec -a nvidia-smi \"" + vgpu + "\" smi \"$@\"\n");
+  if (nvidia) tool("nvidia-smi", "# VirtualGPU session tool.\nexec -a nvidia-smi \"" + vgpu + "\" smi \"$@\"\n");
   // NVIDIA's ncu cannot attach to a simulated driver, so the session's ncu is
   // `vgpu ncu`: the same command line, answered from the simulator's counters.
-  tool("ncu", "# VirtualGPU session tool.\nexec -a ncu \"" + vgpu + "\" ncu \"$@\"\n");
+  if (nvidia) tool("ncu", "# VirtualGPU session tool.\nexec -a ncu \"" + vgpu + "\" ncu \"$@\"\n");
   tool("rocm-smi", "exec -a rocm-smi \"" + vgpu + "\" smi --rocm \"$@\"\n");
   tool("amd-smi", "exec -a amd-smi \"" + vgpu + "\" smi --amd \"$@\"\n");
   tool("rocm_agent_enumerator", "exec -a rocm_agent_enumerator \"" + vgpu + "\" smi --agents\n");
@@ -528,22 +552,55 @@ exit 1
             "  esac\n"
             "  set -- \"$@\" \"$a\"; prev=\"$a\"\n"
             "done\n";
-  tool("nvcc",
-       "# The session compiler. VGPU_NVCC_PASSTHROUGH=1 removes the -cudart flag.\n"
-       "if [ \"${1:-}\" = \"--version\" ]; then\n"
-       "  echo 'nvcc: NVIDIA (R) Cuda compiler driver'\n"
-       "  echo 'Cuda compilation tools, release " + c.cuda + " (VirtualGPU session)'\n"
-       "  exit 0\nfi\n"
-       "REAL='" + real_nvcc + "'\n"
-       "[ -x \"$REAL\" ] || { echo 'nvcc: no CUDA toolkit in this session' >&2; exit 127; }\n"
-       "[ \"${VGPU_NVCC_PASSTHROUGH:-0}\" = 1 ] && exec \"$REAL\" \"$@\"\n" +
-       native_rewrite +
-       "for a in \"$@\"; do\n"
-       "  case \"$a\" in\n"
-       "    -cudart|-cudart=*|--cudart|--cudart=*|--help|-h) exec \"$REAL\" \"$@\" ;;\n"
-       "  esac\n"
-       "done\n"
-       "exec \"$REAL\" -cudart shared \"$@\"\n");
+  if (nvidia) {
+    tool("nvcc",
+         "# The session compiler. VGPU_NVCC_PASSTHROUGH=1 removes the -cudart flag.\n"
+         "if [ \"${1:-}\" = \"--version\" ]; then\n"
+         "  echo 'nvcc: NVIDIA (R) Cuda compiler driver'\n"
+         "  echo 'Cuda compilation tools, release " + c.cuda + " (VirtualGPU session)'\n"
+         "  exit 0\nfi\n"
+         "REAL='" + real_nvcc + "'\n"
+         "[ -x \"$REAL\" ] || { echo 'nvcc: no CUDA toolkit in this session' >&2; exit 127; }\n"
+         "[ \"${VGPU_NVCC_PASSTHROUGH:-0}\" = 1 ] && exec \"$REAL\" \"$@\"\n" +
+         native_rewrite +
+         "for a in \"$@\"; do\n"
+         "  case \"$a\" in\n"
+         "    -cudart|-cudart=*|--cudart|--cudart=*|--help|-h) exec \"$REAL\" \"$@\" ;;\n"
+         "  esac\n"
+         "done\n"
+         "exec \"$REAL\" -cudart shared \"$@\"\n");
+  }
+  // rocprofv3, AMD's profiler, unmodified: it loads rocprofiler-sdk from the
+  // ROCm installation it sits in, by path, and --rocm-root names that
+  // installation. The session's is the real one with VirtualGPU's
+  // librocprofiler-sdk in place of ROCm's, which answers from the simulated
+  // devices (amd/src/rocprofiler_sdk.cpp); everything else is ROCm's own.
+  if (!nvidia) {
+    std::string real_rocprof = find_program("rocprofv3");
+    for (const std::string& dir : rocm_bin_directories())
+      if (real_rocprof.empty() && ::access((dir + "/rocprofv3").c_str(), X_OK) == 0) {
+        char resolved[4096];
+        if (::realpath((dir + "/rocprofv3").c_str(), resolved)) real_rocprof = resolved;
+      }
+    const std::string sdk = shim + "/librocprofiler-sdk.so.1";
+    if (!real_rocprof.empty() && ::access(sdk.c_str(), R_OK) == 0) {
+      const std::filesystem::path root = std::filesystem::path(real_rocprof).parent_path().parent_path();
+      const std::string overlay = s.dir + "/rocm";
+      std::error_code ec;
+      make_dirs(overlay + "/lib");
+      for (const auto& e : std::filesystem::directory_iterator(root, ec))
+        if (e.path().filename() != "lib") std::filesystem::create_symlink(e.path(), overlay + "/" + e.path().filename().string(), ec);
+      for (const auto& e : std::filesystem::directory_iterator(root / "lib", ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("librocprofiler-sdk.so", 0) == 0) continue;
+        std::filesystem::create_symlink(e.path(), overlay + "/lib/" + name, ec);
+      }
+      std::filesystem::create_symlink(sdk, overlay + "/lib/librocprofiler-sdk.so.1", ec);
+      std::filesystem::create_symlink(sdk, overlay + "/lib/librocprofiler-sdk.so", ec);
+      tool("rocprofv3", "# AMD's rocprofv3 over the simulated GPU (vgpu shell).\n"
+                        "exec \"" + real_rocprof + "\" --rocm-root \"" + overlay + "\" \"$@\"\n");
+    }
+  }
   tool("vgpu", "exec \"" + vgpu + "\" \"$@\"\n");
   return s;
 }
@@ -570,6 +627,29 @@ std::vector<std::string> cuda_bin_directories() {
     ::closedir(d);
     std::sort(versioned.rbegin(), versioned.rend());
     for (const auto& v : versioned) add(v);
+  }
+  return out;
+}
+
+// Every executable of this name on the host's PATH, resolved through links
+// and listed once each.
+std::vector<std::string> host_programs(const char* name) {
+  std::vector<std::string> out;
+  const char* env = std::getenv("PATH");
+  const std::string path = env ? env : "";
+  size_t at = 0;
+  while (at <= path.size()) {
+    const size_t colon = path.find(':', at);
+    const std::string dir = path.substr(at, colon == std::string::npos ? std::string::npos : colon - at);
+    if (!dir.empty()) {
+      const std::string cand = dir + "/" + name;
+      char resolved[4096];
+      if (::access(cand.c_str(), X_OK) == 0 && ::realpath(cand.c_str(), resolved) &&
+          std::find(out.begin(), out.end(), resolved) == out.end())
+        out.push_back(resolved);
+    }
+    if (colon == std::string::npos) break;
+    at = colon + 1;
   }
   return out;
 }
@@ -693,9 +773,8 @@ int cmd_shell(const std::vector<std::string>& args) {
     auto ids = vgpu::available_gpus();
     for (size_t i = 0; i < ids.size(); ++i) {
       vgpu::DeviceProfile p = vgpu::load_gpu(ids[i]);
-      std::printf("    %-14s %-28s %s%s\n", ids[i].c_str(), p.model.c_str(),
-                  human_vram(p.vram_bytes).c_str(),
-                  p.vendor == "amd" ? "   (discovery only: AMD execution unimplemented)" : "");
+      std::printf("    %-14s %-28s %s\n", ids[i].c_str(), p.model.c_str(),
+                  human_vram(p.vram_bytes).c_str());
     }
     std::cout << "\n";
     c.gpu = ask("GPU model", c.gpu);
@@ -809,6 +888,20 @@ int cmd_shell(const std::vector<std::string>& args) {
       // anything walking /sys/bus/pci find them.
       bind(s.root + "/sys/bus/pci/devices", "/sys/bus/pci/devices");
       bind(s.root + "/sys/class/hwmon", "/sys/class/hwmon");
+      // An AMD machine has no NVIDIA driver, so no nvidia-smi: the host's is
+      // covered by an empty file that is not executable, which a PATH search
+      // (execvp, which, Python's shutil.which) passes over as it would a
+      // missing one; bash's `command -v` still names it, and running it fails
+      // with 126 rather than 127. Tools choose a vendor by
+      // whether it is there -- pantheon.py builds for CUDA when it is -- and a
+      // workstation with an NVIDIA card would otherwise make every simulated
+      // MI300X look like one.
+      if (profile.vendor == "amd") {
+        const std::string absent = s.dir + "/absent";
+        write_file(absent, "");
+        ::chmod(absent.c_str(), 0644);
+        for (const std::string& real : host_programs("nvidia-smi")) bind(absent, real);
+      }
     }
     isolated = ok;
     // The UTS namespace from `unshare -u` belongs to this session, so the
@@ -839,16 +932,23 @@ int cmd_shell(const std::vector<std::string>& args) {
     }
   }
 
-  // The session's tools go first, and every CUDA bin directory a build system
-  // might reach for goes right behind them. Tools routinely prepend the
-  // toolkit's directory to whatever PATH they were given -- pantheon.py does
-  // exactly that -- but only when it is not already there, so listing them all
-  // here is what keeps the session's nvcc in front of the real one.
+  // The session's tools go first, and every CUDA (or, on an AMD machine,
+  // ROCm) bin directory a build system might reach for goes right behind
+  // them. Tools routinely prepend the toolkit's directory to whatever PATH
+  // they were given -- pantheon.py does exactly that -- but only when it is
+  // not already there, so listing them all here is what keeps the session's
+  // nvcc and rocprofv3 in front of the real ones.
   std::string path = s.bin;
-  for (const std::string& dir : cuda_bin_directories())
+  for (const std::string& dir : profile.vendor == "amd" ? rocm_bin_directories() : cuda_bin_directories())
     if (path.find(dir) == std::string::npos) path += ":" + dir;
   path += ":" + std::string(std::getenv("PATH") ? std::getenv("PATH") : "/usr/bin:/bin");
   setenv("PATH", path.c_str(), 1);
+  if (profile.vendor == "amd" && !isolated)
+    for (const std::string& real : host_programs("nvidia-smi"))
+      std::fprintf(stderr,
+                   "[vgpu] note: the host's %s is visible without isolation; a tool that looks for it will "
+                   "take this machine for an NVIDIA one\n",
+                   real.c_str());
   std::string shim = shim_dir();
   const char* old_ld = std::getenv("LD_LIBRARY_PATH");
   setenv("LD_LIBRARY_PATH", (shim + (old_ld ? std::string(":") + old_ld : "")).c_str(), 1);
