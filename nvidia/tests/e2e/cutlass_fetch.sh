@@ -19,6 +19,14 @@ fetch_into() {  # fetch_into <dir> <url> <tar members...>
   rm -rf "$dir"
   mv "$tmp" "$dir"
 }
+# The tests that source this run in parallel under ctest -j, and a fetch ends by
+# replacing the directory: without a lock, the second one to finish deleted the
+# checkout the first was already compiling against ("cute/tensor.hpp: No such
+# file"). So one fetches at a time and the rest find its result; the lock is let
+# go as soon as the fetching is done, not held for the test.
+mkdir -p "$build/_deps"
+exec {fetch_lock}>"$build/_deps/.fetch.lock"
+flock "$fetch_lock"
 if [[ ! -f "$cutlass/test/unit/test_unit.cpp" ]]; then
   if [[ -n "${CUTLASS_DIR:-}" ]]; then
     echo "FAIL: CUTLASS_DIR=$CUTLASS_DIR is not a CUTLASS checkout with its unit tests"; exit 1
@@ -43,3 +51,5 @@ if [[ "${need_gtest:-0}" == 1 ]]; then
       ar rcs ../libgtest.a gtest-all.o ) || { echo "FAIL: googletest did not build"; exit 1; }
   fi
 fi
+flock -u "$fetch_lock"
+exec {fetch_lock}>&-

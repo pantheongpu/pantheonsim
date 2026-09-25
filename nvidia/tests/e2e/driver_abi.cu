@@ -281,8 +281,11 @@ int main() {
         {"a box of 257", enc(base, big, CU_TENSOR_MAP_SWIZZLE_NONE), CUDA_ERROR_INVALID_VALUE},
         {"a 128-byte box row under the 64-byte swizzle", enc(base, wide, CU_TENSOR_MAP_SWIZZLE_64B),
          CUDA_ERROR_INVALID_VALUE},
+#if CUDA_VERSION >= 12080
+        // Blackwell's swizzle atoms, which CUDA 12.0's header does not name.
         {"the 128B swizzle with 32B atoms", enc(base, box, CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B),
          CUDA_ERROR_NOT_SUPPORTED},
+#endif
         {"a replaced address off 16 bytes", cuTensorMapReplaceAddress(&map, odd), CUDA_ERROR_INVALID_VALUE},
     };
     for (const auto& c : cases)
