@@ -71,8 +71,8 @@ VTEST(what_is_not_a_bundle_is_not_read_as_one) {
 }
 
 VTEST(a_linked_object_has_every_kernel_each_note_names) {
-  const std::string so = file("linked.gfx942.so");
-  const amd::CodeObject o = amd::load_code_object(so, "linked.gfx942.so");
+  const std::string so = file("linked.gfx942.hsaco");
+  const amd::CodeObject o = amd::load_code_object(so, "linked.gfx942.hsaco");
   VCHECK_EQ(o.kernels.size(), size_t{2});
   VCHECK(amd::find_kernel(o, "scalar") != nullptr);
   VCHECK(amd::find_kernel(o, "vector") != nullptr);

@@ -56,6 +56,6 @@ raw = open("bundle.bin", "rb").read()
 packed = zlib.compress(raw, 9)
 head = b"CCOB" + struct.pack("<HHII", 2, 0, 24 + len(packed), len(raw)) + hashlib.md5(raw).digest()[:8]
 open("bundle_zlib.bin", "wb").write(head + packed)'
-  "$lld" -shared asm_scalar.gfx942.o asm_vector.gfx942.o -o linked.gfx942.so
-  echo "wrote the bundles and linked.gfx942.so"
+  "$lld" -shared asm_scalar.gfx942.o asm_vector.gfx942.o -o linked.gfx942.hsaco
+  echo "wrote the bundles and linked.gfx942.hsaco"
 fi
