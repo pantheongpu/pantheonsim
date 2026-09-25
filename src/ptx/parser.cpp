@@ -4,6 +4,7 @@
 // instruction, source line, and kernel — never a silent wrong answer.
 #include "vgpu/ptx/parser.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
@@ -97,6 +98,19 @@ std::string normalize_scope(std::string part) {
   return part;
 }
 
+// Dynamic shared memory lives above every static allocation, at the
+// alignment its declaration states. Every extern .shared names the same
+// bytes, so they share one offset. Starting it at the unaligned end of the
+// static data put a TMA destination declared .align 16 at offset 8.
+void place_dynamic_shared(EntryFn& fn) {
+  uint32_t align = 1;
+  for (const auto& [name, d] : fn.shared)
+    if (d.dynamic) align = std::max(align, d.align);
+  fn.dynamic_shared_offset = (fn.static_shared_size + align - 1) / align * align;
+  for (auto& [name, d] : fn.shared)
+    if (d.dynamic) d.offset = fn.dynamic_shared_offset;
+}
+
 std::vector<std::string> split_dots(const std::string& s) {
   std::vector<std::string> parts;
   std::string cur;
@@ -178,6 +192,7 @@ class Parser {
           next();
           m.target += "," + expect_word("target option");
         }
+        target_ = m.target;
         continue;
       }
       if (t.text == ".address_size") {
@@ -767,31 +782,37 @@ class Parser {
     }
     expect_punct("{");
     parse_body(fn);
-    // Dynamic shared memory lives above every static allocation.
-    for (auto& [name, d] : fn.shared)
-      if (d.dynamic) d.offset = fn.static_shared_size;
+    place_dynamic_shared(fn);
     current_kernel_.clear();
     cur_fn_ = nullptr;
     return true;
   }
 
   void parse_body(EntryFn& fn) {
+    // Labels are scoped to the { } block that defines them (PTX ISA 4.x
+    // "Statements"), and inline asm relies on it: CUTLASS's barrier waits are
+    // each a block with its own LAB_WAIT and DONE, so one kernel holds many.
+    // A label is keyed by name and the block it was defined in, and a branch
+    // takes the innermost definition visible from where it stands.
     std::unordered_map<std::string, size_t> labels;
     std::vector<std::pair<size_t, std::string>> bra_fixups;
-    int depth = 0;  // nested { } scopes (call sequences)
+    std::vector<std::vector<int>> fixup_scopes;   // the scope chain at each branch
+    std::vector<int> scopes{0};                   // innermost last
+    int next_scope = 1;
+    auto key = [](const std::string& name, int scope) { return name + '\x01' + std::to_string(scope); };
 
     while (true) {
       const Token& t = peek();
       if (t.kind == Token::Kind::End) fail(t.line, "unexpected end of file inside kernel body");
       if (peek_punct("{")) {
         next();
-        ++depth;
+        scopes.push_back(next_scope++);
         continue;
       }
       if (peek_punct("}")) {
         next();
-        if (depth == 0) break;
-        --depth;
+        if (scopes.size() == 1) break;
+        scopes.pop_back();
         continue;
       }
       if (t.kind == Token::Kind::Word && t.text == ".reg") {
@@ -885,17 +906,21 @@ class Parser {
       }
       // Label?
       if (t.kind == Token::Kind::Word && peek_punct(":", 1)) {
-        if (!labels.emplace(t.text, fn.body.size()).second)
+        if (!labels.emplace(key(t.text, scopes.back()), fn.body.size()).second)
           fail(t.line, "duplicate label '" + t.text + "'");
         next();
         next();
         continue;
       }
       fn.body.push_back(parse_instruction(fn, bra_fixups));
+      while (fixup_scopes.size() < bra_fixups.size()) fixup_scopes.push_back(scopes);
     }
 
-    for (auto& [idx, label] : bra_fixups) {
-      auto it = labels.find(label);
+    for (size_t f = 0; f < bra_fixups.size(); ++f) {
+      const auto& [idx, label] = bra_fixups[f];
+      const std::vector<int>& chain = fixup_scopes[f];
+      auto it = labels.end();
+      for (size_t i = chain.size(); i-- > 0 && it == labels.end();) it = labels.find(key(label, chain[i]));
       if (it == labels.end())
         fail(fn.body[idx].line, "branch to undefined label '" + label + "' in kernel '" + fn.name + "'");
       std::get<OpBra>(fn.body[idx].op).target = it->second;
@@ -1191,6 +1216,9 @@ class Parser {
   }
 
   // ---- instructions ----
+
+  // The module's .target line, for the instructions only one target has.
+  std::string target_;
 
   Instr parse_instruction(const EntryFn& fn, std::vector<std::pair<size_t, std::string>>& bra_fixups) {
     Instr ins;
@@ -1786,6 +1814,148 @@ class Parser {
       op.c = parse_reg_vector_any();
       if (op.d.size() != op.c.size()) return unsupported("mma D and C arity differ");
       ins.op = op;
+    } else if (op0 == "wgmma") {
+      // wgmma.fence.sync.aligned;  wgmma.commit_group.sync.aligned;
+      // wgmma.wait_group.sync.aligned N;
+      // wgmma.mma_async.sync.aligned.m64nNkK.<dtype>.<atype>.<btype>[.satfinite]
+      //     d, a-desc|{a}, b-desc, scale-d[, imm-scale-a, imm-scale-b[, imm-trans-a], imm-trans-b];
+      if (parts.size() < 2) return unsupported("wgmma form");
+      // Arch-specific: sm_90a and nothing else, not sm_90 and not Blackwell
+      // (which replaced it with tcgen05). ptxas refuses it anywhere else, so
+      // a module that uses it under another target is not a real program.
+      if (target_.rfind("sm_90a", 0) != 0)
+        fail(ins.line, "wgmma requires .target sm_90a; this module targets " +
+                           (target_.empty() ? std::string("nothing") : target_));
+      OpWgmma op;
+      const std::string& what = parts[1];
+      if (what == "fence") op.kind = WgmmaKind::Fence;
+      else if (what == "commit_group") op.kind = WgmmaKind::Commit;
+      else if (what == "wait_group") op.kind = WgmmaKind::Wait;
+      else if (what == "mma_async") op.kind = WgmmaKind::Mma;
+      else return unsupported("wgmma." + what);
+      std::vector<std::string> types;
+      bool shape = false;
+      for (size_t i = 2; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        unsigned mm = 0, nn = 0, kk = 0;
+        char tail = 0;
+        if (p == "sync" || p == "aligned") ;
+        else if (p == "satfinite") op.satfinite = true;
+        else if (p == "sp") return unsupported("wgmma.mma_async.sp (sparse A)");
+        else if (std::sscanf(p.c_str(), "m%un%uk%u%c", &mm, &nn, &kk, &tail) == 3) {
+          if (mm != 64 || nn == 0 || nn > 256 || nn % 8 != 0)
+            return unsupported("wgmma shape '." + p + "'");
+          op.n = nn;
+          op.k = kk;
+          shape = true;
+        } else if (p == "f16" || p == "bf16" || p == "tf32" || p == "f32" || p == "s32" ||
+                   p == "e4m3" || p == "e5m2" || p == "s8" || p == "u8")
+          types.push_back(p);
+        else if (p == "b1" || p == "and" || p == "popc")
+          return unsupported("wgmma single-bit (.b1) forms");
+        else return unsupported("wgmma modifier '." + p + "'");
+      }
+      if (op.kind == WgmmaKind::Wait) {
+        const Operand n = parse_operand();
+        const auto* imm = std::get_if<ImmInt>(&n);
+        if (!imm || imm->value < 0) return unsupported("wgmma.wait_group needs a constant count");
+        op.wait_n = static_cast<uint32_t>(imm->value);
+      }
+      if (op.kind != WgmmaKind::Mma) {
+        ins.op = op;
+      } else {
+        if (!shape || types.size() != 3)
+          return unsupported("wgmma.mma_async needs .m64nNkK.<dtype>.<atype>.<btype>");
+        auto elem = [&](const std::string& t, WgmmaElem* out) {
+          if (t == "f16") *out = WgmmaElem::F16;
+          else if (t == "bf16") *out = WgmmaElem::BF16;
+          else if (t == "tf32") *out = WgmmaElem::TF32;
+          else if (t == "e4m3") *out = WgmmaElem::E4M3;
+          else if (t == "e5m2") *out = WgmmaElem::E5M2;
+          else if (t == "s8") *out = WgmmaElem::S8;
+          else if (t == "u8") *out = WgmmaElem::U8;
+          else return false;
+          return true;
+        };
+        if (!elem(types[1], &op.a_type) || !elem(types[2], &op.b_type))
+          return unsupported("wgmma multiplicand types ." + types[1] + "." + types[2]);
+        if (types[0] == "f16") op.d_type = WgmmaAcc::F16;
+        else if (types[0] == "f32") op.d_type = WgmmaAcc::F32;
+        else if (types[0] == "s32") op.d_type = WgmmaAcc::S32;
+        else return unsupported("wgmma accumulator type ." + types[0]);
+        // The combinations the ISA defines (9.7.17.3), and the K each implies.
+        const bool is16 = op.a_type == WgmmaElem::F16 || op.a_type == WgmmaElem::BF16;
+        const bool fp8 = op.a_type == WgmmaElem::E4M3 || op.a_type == WgmmaElem::E5M2;
+        const bool int8 = op.a_type == WgmmaElem::S8 || op.a_type == WgmmaElem::U8;
+        const bool b_fp8 = op.b_type == WgmmaElem::E4M3 || op.b_type == WgmmaElem::E5M2;
+        const bool b_int8 = op.b_type == WgmmaElem::S8 || op.b_type == WgmmaElem::U8;
+        bool ok = false;
+        uint32_t want_k = 0;
+        if (is16) {
+          ok = op.a_type == op.b_type &&
+               (op.d_type == WgmmaAcc::F32 || (op.a_type == WgmmaElem::F16 && op.d_type == WgmmaAcc::F16));
+          want_k = 16;
+        } else if (op.a_type == WgmmaElem::TF32) {
+          ok = op.b_type == WgmmaElem::TF32 && op.d_type == WgmmaAcc::F32;
+          want_k = 8;
+        } else if (fp8) {
+          ok = b_fp8 && op.d_type != WgmmaAcc::S32;
+          want_k = 32;
+        } else if (int8) {
+          ok = b_int8 && op.d_type == WgmmaAcc::S32;
+          want_k = 32;
+          // The integer shapes skip some N: 8, 16, 24, 32, then multiples of 16.
+          if (op.n > 32 && op.n % 16 != 0) ok = false;
+        }
+        if (!ok || op.k != want_k)
+          return unsupported("wgmma.mma_async." + types[0] + "." + types[1] + "." + types[2] +
+                             " with k" + std::to_string(op.k) + " is not a form the ISA defines");
+        if (op.satfinite && !int8) return unsupported("wgmma .satfinite outside the integer forms");
+        op.d = parse_reg_vector_any();
+        const size_t want_d = op.d_type == WgmmaAcc::F16 ? op.n / 4 : op.n / 2;
+        if (op.d.size() != want_d)
+          return unsupported("wgmma accumulator arity (expected " + std::to_string(want_d) + ")");
+        expect_punct(",");
+        if (peek_punct("{")) {
+          op.a_regs = true;
+          op.a = parse_reg_vector_any();
+          if (op.a.size() != 4) return unsupported("wgmma A fragment arity (expected 4)");
+        } else {
+          op.a_desc = parse_operand();
+        }
+        expect_punct(",");
+        op.b_desc = parse_operand();
+        expect_punct(",");
+        op.scale_d = parse_operand();
+        // The immediates that follow depend on the form: floats take the two
+        // negate flags, and the 16-bit forms add the transposes -- trans-b only
+        // when A is in registers, since a register fragment has no major-ness.
+        std::vector<int> imms;
+        while (peek_punct(",")) {
+          next();
+          const Operand o = parse_operand();
+          const auto* imm = std::get_if<ImmInt>(&o);
+          if (!imm) return unsupported("wgmma scale/transpose arguments must be immediates");
+          imms.push_back(static_cast<int>(imm->value));
+        }
+        const size_t want_imms = int8 ? 0u : (is16 ? (op.a_regs ? 3u : 4u) : 2u);
+        if (imms.size() != want_imms)
+          return unsupported("wgmma.mma_async takes " + std::to_string(want_imms) +
+                             " immediate arguments after scale-d in this form");
+        if (!int8) {
+          op.scale_a = imms[0];
+          op.scale_b = imms[1];
+          if ((op.scale_a != 1 && op.scale_a != -1) || (op.scale_b != 1 && op.scale_b != -1))
+            return unsupported("wgmma imm-scale-a/imm-scale-b must be 1 or -1");
+        }
+        if (is16) {
+          if (op.a_regs) op.trans_b = imms[2];
+          else { op.trans_a = imms[2]; op.trans_b = imms[3]; }
+          if ((op.trans_a != 0 && op.trans_a != 1) || (op.trans_b != 0 && op.trans_b != 1))
+            return unsupported("wgmma imm-trans-a/imm-trans-b must be 0 or 1");
+        }
+        ins.op = op;
+      }
     } else if (op0 == "redux") {
       // redux.sync.<op>.<type> d, a, membermask
       std::optional<ReduxOp> rop;
@@ -2059,6 +2229,17 @@ class Parser {
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p2 = parts[i];
         if (p2 == "init") { op.op = MbarOp::Init; have_op = true; }
+        else if (p2 == "expect_tx" && have_op && op.op == MbarOp::Arrive) op.expect_tx = true;
+        else if (p2 == "expect_tx") { op.op = MbarOp::ExpectTx; have_op = true; }
+        else if (p2 == "complete_tx") { op.op = MbarOp::CompleteTx; have_op = true; }
+        else if (p2 == "noComplete") op.no_complete = true;
+        else if (p2 == "shared::cluster")
+          // An mbarrier in another block's shared memory: that is distributed
+          // shared memory, which this does not model yet.
+          return unsupported("mbarrier on .shared::cluster (a barrier in another block of the "
+                             "cluster needs distributed shared memory, which is not implemented)");
+        else if (p2.rfind("phase_type::", 0) == 0)
+          return unsupported("mbarrier ." + p2 + " (the report-carrying phase types)");
         else if (p2 == "inval") { op.op = MbarOp::Inval; have_op = true; }
         else if (p2 == "arrive") { op.op = MbarOp::Arrive; have_op = true; }
         else if (p2 == "arrive_drop") { op.op = MbarOp::ArriveDrop; have_op = true; }
@@ -2069,21 +2250,16 @@ class Parser {
         else if (p2 == "shared") saw_shared = true;
         else if (p2 == "b64") ;
         else if (inert_mem_modifier(p2)) ;
-        else if (p2 == "expect_tx" || p2 == "complete_tx" || p2 == "noComplete")
-          // Transaction counting exists to pair an mbarrier with a TMA copy:
-          // the barrier waits for a byte count as well as for arrivals.
-          // cp.async.bulk is not implemented, so nothing can ever complete
-          // those bytes, and a barrier that waits on them would hang rather
-          // than be wrong -- which is still worse than saying so here.
-          return unsupported("mbarrier." + p2 + " (transaction counting needs cp.async.bulk/TMA, "
-                             "which is not implemented)");
         else return unsupported("mbarrier modifier '." + p2 + "'");
       }
       if (!have_op) return unsupported("mbarrier form");
       (void)saw_shared;  // an mbarrier is a shared object whether or not it says so
-      // init and inval take no destination; everything else writes one.
-      if (op.op != MbarOp::Init && op.op != MbarOp::Inval) {
-        op.dst = expect_reg_operand("mbarrier destination");
+      // init, inval and the transaction counts take no destination; everything
+      // else writes one -- or names the sink, `_`, to discard it.
+      if (op.op != MbarOp::Init && op.op != MbarOp::Inval && op.op != MbarOp::ExpectTx &&
+          op.op != MbarOp::CompleteTx) {
+        if (peek().text == "_") next();
+        else op.dst = expect_reg_operand("mbarrier destination");
         expect_punct(",");
       }
       op.addr = parse_addr(fn);
@@ -2094,6 +2270,12 @@ class Parser {
         if (op.op == MbarOp::TestWait || op.op == MbarOp::TryWait) {
           op.state = parse_operand();
           op.have_state = true;
+          // try_wait's optional suspend-time hint: how long a thread may sleep
+          // before re-testing, which changes nothing a wait returns.
+          if (op.op == MbarOp::TryWait && peek_punct(",")) {
+            next();
+            (void)parse_operand();
+          }
         } else {
           op.count = parse_operand();
           op.have_count = true;
@@ -2101,6 +2283,10 @@ class Parser {
       }
       if (op.op == MbarOp::Init && !op.have_count)
         return unsupported("mbarrier.init without an expected arrival count");
+      if ((op.op == MbarOp::ExpectTx || op.op == MbarOp::CompleteTx || op.expect_tx) && !op.have_count)
+        return unsupported("mbarrier transaction count missing");
+      if (op.op == MbarOp::ExpectTx || op.op == MbarOp::CompleteTx || op.expect_tx)
+        if (peek_punct(",")) return unsupported("mbarrier multicast (a ctaMask operand)");
       ins.op = op;
     } else if (op0 == "match") {
       // match.any.sync.b32 d, a, membermask
@@ -2636,6 +2822,13 @@ class Parser {
       ins.op = op;
     } else if (op0 == "trap") {
       ins.op = OpTrap{};
+    } else if (op0 == "brkpt") {
+      // Libraries put one on paths they consider unreachable (CuTe's invalid
+      // control path does), so refusing the whole kernel for containing it
+      // turned away programs that never execute it.
+      OpTrap op;
+      op.breakpoint = true;
+      ins.op = op;
     } else if (op0 == "tex") {
       // tex.<geom>[.level|.grad].v4.<dtype>.<ctype> {d,d,d,d}, [obj, {c,...}]
       uint32_t dims = 0;
@@ -2740,6 +2933,9 @@ class Parser {
       // them. CUB's decoupled look-back depends on exactly this fence. It is
       // still not a barrier: this used to be OpBar, which made it wait for every
       // warp in the block.
+      // fence.proxy.tensormap::generic takes the map's address and size; the
+      // other proxy fences take nothing. Either way it orders, and orders only.
+      while (!at_end() && !peek_punct(";")) next();
       ins.op = OpFence{};
     } else if (op0 == "nanosleep") {
       // A backoff hint. Consuming it as a no-op is correct; the operand is a
@@ -2765,6 +2961,104 @@ class Parser {
       expect_punct(",");
       op.src = parse_operand();
       ins.op = op;
+    } else if (op0 == "cp" && parts.size() > 2 && parts[1] == "async" && parts[2] == "bulk") {
+      // Hopper's bulk copies (TMA). Forms, after cp.async.bulk:
+      //   .commit_group / .wait_group[.read] N
+      //   .prefetch[.tensor]...                      an L2 hint
+      //   [.tensor.Nd].<dst>.<src>...  operands per direction below
+      if (parts.size() > 3 && parts[3] == "commit_group") {
+        ins.op = OpBulkGroup{};
+      } else if (parts.size() > 3 && parts[3] == "wait_group") {
+        for (size_t i = 4; i < parts.size(); ++i)
+          if (parts[i] != "read") return unsupported("cp.async.bulk.wait_group modifier '." + parts[i] + "'");
+        Operand n = parse_operand();
+        auto* imm = std::get_if<ImmInt>(&n);
+        if (!imm || imm->value < 0)
+          return unsupported("cp.async.bulk.wait_group needs a non-negative immediate");
+        OpBulkGroup g;
+        g.wait = true;
+        g.keep = static_cast<uint32_t>(imm->value);
+        ins.op = g;
+      } else if (parts.size() > 3 && parts[3] == "prefetch") {
+        // Brings data into L2 ahead of a later copy; there is no cache here,
+        // so it changes nothing -- like prefetch itself.
+        while (!at_end() && !peek_punct(";")) next();
+        ins.op = OpNop{};
+      } else {
+        OpBulkCopy op;
+        std::vector<std::string> spaces;
+        bool mbar_completion = false, group_completion = false;
+        for (size_t i = 3; i < parts.size(); ++i) {
+          const std::string& p = parts[i];
+          if (p == "tensor") op.tensor = true;
+          else if (p.size() == 2 && p[1] == 'd' && p[0] >= '1' && p[0] <= '5') op.dims = p[0] - '0';
+          else if (p == "shared" || p == "shared::cluster" || p == "global") spaces.push_back(p);
+          else if (p == "mbarrier::complete_tx::bytes") mbar_completion = true;
+          else if (p == "bulk_group") group_completion = true;
+          else if (p == "tile" || p == "weak" || p == "b128" || inert_mem_modifier(p)) ;
+          else if (p == "multicast::cluster" || p == "multicast::cluster::16b") op.multicast = true;
+          else return unsupported("cp.async.bulk modifier '." + p + "' (im2col, gather/scatter, "
+                                  "masks, overrides and reports are not implemented)");
+        }
+        if (spaces.size() != 2) return unsupported("cp.async.bulk needs a destination and a source space");
+        if (op.tensor && !op.dims) return unsupported("cp.async.bulk.tensor needs .1d to .5d");
+        const bool g2s = spaces[1] == "global" && spaces[0] != "global";
+        const bool s2g = spaces[0] == "global" && spaces[1] == "shared";
+        if (!g2s && !s2g)
+          return unsupported("cp.async.bulk from shared memory to another block's (distributed "
+                             "shared memory is not implemented)");
+        op.to_shared = g2s;
+        if (g2s && !mbar_completion)
+          return unsupported("a cp.async.bulk load completes on an mbarrier (.mbarrier::complete_tx::bytes)");
+        if (s2g && !group_completion)
+          return unsupported("a cp.async.bulk store completes in a bulk group (.bulk_group)");
+        // [tensorMap, {c0, ...}]
+        auto parse_tensor = [&]() {
+          expect_punct("[");
+          op.tmap = parse_operand();
+          expect_punct(",");
+          op.coords = parse_operand_vector_any();
+          expect_punct("]");
+        };
+        if (g2s) {
+          op.smem = parse_addr(fn);
+          expect_punct(",");
+          if (op.tensor) parse_tensor();
+          else {
+            op.gmem = parse_addr(fn);
+            expect_punct(",");
+            op.size = parse_operand();
+          }
+          expect_punct(",");
+          op.mbar = parse_addr(fn);
+          if (op.multicast) {
+            expect_punct(",");
+            op.cta_mask = parse_operand();
+          }
+        } else {
+          if (op.tensor) parse_tensor();
+          else op.gmem = parse_addr(fn);
+          expect_punct(",");
+          op.smem = parse_addr(fn);
+          if (!op.tensor) {
+            expect_punct(",");
+            op.size = parse_operand();
+          }
+        }
+        // A trailing cache policy (from .L2::cache_hint, which the splitter
+        // drops): a hint, read by nothing.
+        if (peek_punct(",")) {
+          next();
+          (void)parse_operand();
+        }
+        if (op.tensor && op.coords.size() != op.dims)
+          return unsupported("cp.async.bulk.tensor coordinate count does not match ." +
+                             std::to_string(op.dims) + "d");
+        for (const Addr* a : {&op.smem, &op.gmem, &op.mbar})
+          if (a->base_kind == Addr::Base::CallSlot)
+            return unsupported("cp.async.bulk through a call slot");
+        ins.op = op;
+      }
     } else if (op0 == "cp" && parts.size() > 1 && parts[1] == "async") {
       // The group operations first: they carry no addresses.
       if (parts.size() > 2 && parts[2] == "commit_group") {
@@ -2830,6 +3124,17 @@ class Parser {
         }
         ins.op = op;
       }
+    } else if (op0 == "barrier" && parts.size() > 2 && parts[1] == "cluster") {
+      // barrier.cluster.arrive[.release|.relaxed][.aligned];
+      // barrier.cluster.wait[.acquire][.aligned];
+      OpClusterBarrier op;
+      if (parts[2] == "arrive") op.wait = false;
+      else if (parts[2] == "wait") op.wait = true;
+      else return unsupported("barrier.cluster." + parts[2]);
+      for (size_t i = 3; i < parts.size(); ++i)
+        if (parts[i] != "aligned" && !inert_mem_modifier(parts[i]))
+          return unsupported("barrier.cluster modifier '." + parts[i] + "'");
+      ins.op = op;
     } else if ((op0 == "bar" || op0 == "barrier") && parts.size() > 1 && parts[1] == "red") {
       // bar.red.<op>.<type> d, 0, [!]p
       std::optional<BarRedOp> rop;
@@ -2939,8 +3244,7 @@ Module parse(const std::string& src) {
       }
       fn.shared.emplace(d.name, d);
     }
-    for (auto& [name, d] : fn.shared)
-      if (d.dynamic) d.offset = fn.static_shared_size;
+    place_dynamic_shared(fn);
   }
   return m;
 }

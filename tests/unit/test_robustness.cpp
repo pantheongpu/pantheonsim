@@ -1,6 +1,7 @@
 // Regression tests for defects found by the differential and fuzz passes.
 // Each one crashed, hung, leaked, or silently produced wrong answers before.
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "fatbin.hpp"
@@ -147,6 +148,37 @@ VTEST(malformed_fatbin_fails_cleanly) {
   std::memcpy(wrapper.data(), &wmagic, 4);
   auto err = VCAPTURE(Error, vgpu::cuda::extract_ptx(wrapper.data()));
   VCHECK(err.code() == Err::InvalidValue);
+}
+
+// Which PTX a fatbin's images the driver would JIT. The entry header says 90
+// for sm_90 and sm_90a alike, so the rule has to read the .target line: nvcc
+// -arch=sm_90a embeds both, and only the second has the arch-specific
+// instructions (wgmma) that the matching SASS was built from.
+VTEST(ptx_choice_follows_the_target_suffix) {
+  using vgpu::cuda::FatbinPtx;
+  auto img = [](uint32_t arch, const char* target) {
+    FatbinPtx p;
+    p.arch = arch;
+    p.text = std::string(".version 8.3\n.target ") + target + "\n.address_size 64\n";
+    return p;
+  };
+  const std::vector<FatbinPtx> hopper = {img(90, "sm_90"), img(90, "sm_90a")};
+  VCHECK_EQ(vgpu::cuda::pick_ptx(hopper, 90), size_t{1});   // the specific one on 9.0
+  VCHECK_EQ(vgpu::cuda::pick_ptx(hopper, 100), size_t{0});  // and never past it
+  // Order does not matter.
+  const std::vector<FatbinPtx> swapped = {img(90, "sm_90a"), img(90, "sm_90")};
+  VCHECK_EQ(vgpu::cuda::pick_ptx(swapped, 90), size_t{0});
+  VCHECK_EQ(vgpu::cuda::pick_ptx(swapped, 100), size_t{1});
+  // Family code runs within its major version: sm_100f on a 10.3, not a 12.0.
+  const std::vector<FatbinPtx> fam = {img(80, "sm_80"), img(100, "sm_100f")};
+  VCHECK_EQ(vgpu::cuda::pick_ptx(fam, 103), size_t{1});
+  VCHECK_EQ(vgpu::cuda::pick_ptx(fam, 120), size_t{0});
+  VCHECK_EQ(vgpu::cuda::pick_ptx(fam, 90), size_t{0});
+  // Newest runnable wins; with nothing runnable, the newest overall (the
+  // load then refuses it with the reason).
+  const std::vector<FatbinPtx> many = {img(75, "sm_75"), img(86, "sm_86"), img(90, "sm_90")};
+  VCHECK_EQ(vgpu::cuda::pick_ptx(many, 89), size_t{1});
+  VCHECK_EQ(vgpu::cuda::pick_ptx(many, 70), size_t{2});
 }
 
 VTEST(freed_allocation_tracking_is_bounded) {
