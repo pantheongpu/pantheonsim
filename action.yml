@@ -249,6 +249,22 @@ runs:
           false) ;;
           *) echo "::error::library-path must be true or false, not '$LIBRARY_PATH_INPUT'"; exit 1 ;;
         esac
+        # CMake links CUDA programs with the static runtime unless told
+        # otherwise, and the static runtime cannot talk to a simulated driver.
+        # A toolchain file (read from the environment by CMake 3.21 and later)
+        # makes the shared one the default; a project's own choice still wins.
+        if [[ "$GPU" != amd/* ]]; then
+          if [[ -n "${CMAKE_TOOLCHAIN_FILE:-}" ]]; then
+            echo "::warning::CMAKE_TOOLCHAIN_FILE is already set, so CMake keeps its default static CUDA runtime, which cannot run on the simulator. Add set(CMAKE_CUDA_RUNTIME_LIBRARY Shared) to that toolchain file."
+          else
+            tc="$RUNNER_TEMP/pantheonsim-toolchain.cmake"
+            {
+              echo "# Written by the PantheonSim action: link CUDA programs with the shared runtime."
+              echo 'set(CMAKE_CUDA_RUNTIME_LIBRARY Shared CACHE STRING "CUDA runtime library")'
+            } > "$tc"
+            echo "CMAKE_TOOLCHAIN_FILE=$tc" >> "$GITHUB_ENV"
+          fi
+        fi
         case "$GPU" in
           amd/*) VGPU_GPU="$GPU" VGPU_DEVICE_COUNT="$COUNT" "$BUILD/bin/rocm-smi" ;;
           *)     VGPU_GPU="$GPU" VGPU_DEVICE_COUNT="$COUNT" "$BUILD/bin/nvidia-smi" -L ;;

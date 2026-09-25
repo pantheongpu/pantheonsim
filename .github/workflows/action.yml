@@ -214,6 +214,8 @@ jobs:
           gpu: ${{ matrix.gpu }}
       - name: Configure, build and ctest, unmodified
         run: |
-          cmake -S .github/action-tests/${{ matrix.project }} -B build-test -G Ninja
+          # Release, as CI builds usually are. Unoptimized HIP code (-O0, which
+          # is what CMake builds with no build type) does not run yet.
+          cmake -S .github/action-tests/${{ matrix.project }} -B build-test -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build-test -v
           ctest --test-dir build-test --output-on-failure
