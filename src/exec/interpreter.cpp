@@ -6716,17 +6716,27 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
     if (c[0] * c[1] * c[2] <= 1) return blocks;
     return uint64_t{eff.grid[0] / c[0]} * (eff.grid[1] / c[1]) * (eff.grid[2] / c[2]);
   }();
+  // Work is handed out in small chunks as threads free up, not split into
+  // equal ranges up front: on a host whose cores differ in speed (performance
+  // and efficiency cores), equal ranges left the fast cores idle while the
+  // slow ones finished theirs. Blocks are independent, so which thread runs
+  // one changes nothing it computes.
+  std::atomic<uint64_t> next_unit{0};
+  const uint64_t chunk = std::max<uint64_t>(1, units / (uint64_t{nthreads} * 8));
   for (unsigned t = 0; t < nthreads; ++t) {
-    const uint64_t begin = units * t / nthreads;
-    const uint64_t end = units * (t + 1) / nthreads;
-    workers.emplace_back([&, t, begin, end] {
+    workers.emplace_back([&, t] {
       try {
         Interpreter interp(fn, eff, pb, mem, profile, symbols, per_thread[t],
                            t == 0 ? progress : ProgressFn{});
         interp.set_concurrent(true);
         interp.set_grid_id(grid_id);
-        interp.run_units(begin, end);
+        for (;;) {
+          const uint64_t begin = next_unit.fetch_add(chunk, std::memory_order_relaxed);
+          if (begin >= units) break;
+          interp.run_units(begin, std::min(units, begin + chunk));
+        }
       } catch (...) {
+        next_unit.store(units, std::memory_order_relaxed);   // the launch has failed; stop
         std::lock_guard<std::mutex> lock(err_mu);
         if (!first_error) first_error = std::current_exception();
       }
