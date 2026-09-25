@@ -65,3 +65,11 @@ __global__ void gemm_f16_32x32x16(const float16_t* a, const float16_t* b, const 
 __global__ void gemm_i8_32x32x16(const int8_t* a, const int8_t* b, const int32_t* c, int32_t* d) {
   gemm_mixed<int8_t, int32_t, 32, 16>(a, b, c, d);
 }
+// And 8-bit floats, as gfx942 has them (fp8 and bf8 without infinities or a
+// negative zero), eight to a register pair.
+__global__ void gemm_fp8_16x16x32(const float8_fnuz_t* a, const float8_fnuz_t* b, const float* c, float* d) {
+  gemm_mixed<float8_fnuz_t, float, 16, 32>(a, b, c, d);
+}
+__global__ void gemm_bf8_32x32x16(const bfloat8_fnuz_t* a, const bfloat8_fnuz_t* b, const float* c, float* d) {
+  gemm_mixed<bfloat8_fnuz_t, float, 32, 16>(a, b, c, d);
+}

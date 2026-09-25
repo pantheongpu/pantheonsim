@@ -363,6 +363,55 @@ struct Machine {
     return bits;
   }
 
+  // The 8-bit floats as gfx942 has them, the forms without infinities or a
+  // negative zero ("FNUZ"): fp8 with four exponent bits (bias 8) and three
+  // of mantissa, bf8 with five (bias 16) and two. 0x80 is the one NaN, and
+  // 0x7f the largest value in each.
+  struct F8 {
+    int mant, bias;
+    double max;
+  };
+  static constexpr F8 kFp8{3, 8, 240.0}, kBf8{2, 16, 57344.0};
+  static float f8_to_float(uint32_t byte, const F8& t) {
+    byte &= 0xFF;
+    if (byte == 0x80) return std::numeric_limits<float>::quiet_NaN();
+    const int e = static_cast<int>(byte & 0x7F) >> t.mant, m = static_cast<int>(byte) & ((1 << t.mant) - 1);
+    const float mag = e == 0 ? std::ldexp(static_cast<float>(m), 1 - t.bias - t.mant)
+                             : std::ldexp(static_cast<float>((1 << t.mant) | m), e - t.bias - t.mant);
+    return byte & 0x80 ? -mag : mag;
+  }
+  // A float narrowed to one, rounded to nearest with ties to even -- or,
+  // given random bits, stochastically: the bits the narrowing drops (the
+  // float's 23 - mantissa lowest, counted where an 8-bit float's last
+  // mantissa bit falls) have the random ones added before they are cut
+  // off. A float past the largest value -- before any rounding, so 241 is
+  // past 240 -- becomes the NaN, or with saturate the largest. An infinity
+  // becomes the NaN either way.
+  static uint32_t float_to_f8(float x, const F8& t, bool saturate, const uint32_t* random) {
+    if (std::isnan(x) || std::isinf(x)) return 0x80;
+    const uint32_t sign = std::signbit(x) ? 0x80 : 0;
+    const double a = std::fabs(static_cast<double>(x));
+    if (a > t.max) return saturate ? sign | 0x7F : 0x80;
+    if (a == 0) return 0;
+    const int emin = 1 - t.bias;
+    const int e = std::max(std::ilogb(a), emin);
+    const double step = std::ldexp(1.0, e - t.mant);   // between neighbouring values near a
+    double n = a / step;                                 // exact: a whole number of steps and a fraction
+    if (random) {
+      const int drop = 23 - t.mant;
+      const double scale = std::ldexp(1.0, drop);
+      n = std::floor((std::floor(n * scale) + static_cast<double>(*random & ((1u << drop) - 1))) / scale);
+    } else {
+      n = std::nearbyint(n);
+    }
+    const double v = n * step;
+    if (v == 0) return 0;
+    if (v < std::ldexp(1.0, emin)) return sign | static_cast<uint32_t>(n);   // below the least normal
+    const int ve = std::ilogb(v);
+    const uint32_t m = static_cast<uint32_t>(std::ldexp(v, t.mant - ve)) - (1u << t.mant);
+    return sign | static_cast<uint32_t>(ve + t.bias) << t.mant | m;
+  }
+
   // A half result, which fills the low half of the register and zeroes the
   // high half, as every 16-bit instruction here does.
   void write_half(Wave& w, const Inst& in, uint32_t lane, _Float16 v) {
@@ -403,8 +452,12 @@ struct Machine {
     const uint32_t top = ((half ? in.op_sel_hi : in.op_sel) >> k) & 1;
     uint16_t bits;
     if (o.kind == OperandKind::Inline || o.kind == OperandKind::InlineFloat || o.kind == OperandKind::Literal) {
-      if (top)
-        throw Error::make(Err::Unsupported, in.name, " takes the second half of a constant, which this does not model");
+      // An inline constant is the same in both halves: the compiler uses
+      // one only where both halves it wants are that value (a splat), and
+      // rocBLAS's geam kernels add 0 to both. A literal's second half is
+      // not something this can say.
+      if (top && o.kind == OperandKind::Literal)
+        throw Error::make(Err::Unsupported, in.name, " takes the second half of a literal, which this does not model");
       bits = o.kind == OperandKind::InlineFloat ? as_bits(static_cast<_Float16>(o.fvalue))
                                                 : static_cast<uint16_t>(o.value);
     } else {
@@ -1170,6 +1223,51 @@ struct Machine {
         write_float(w, in, lane, op == "v_min3_f32"_op ? std::fmin(std::fmin(x, y), z)
                                                     : std::fmax(std::fmax(x, y), z));
       });
+    } else if (op == "v_med3_f32"_op) {
+      each([&](uint32_t lane) {
+        // The middle one of three; with a NaN among them, the least, as
+        // min3 gives it (a NaN losing to any number).
+        const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane),
+                    z = lane_float(w, in.src[2], lane);
+        write_float(w, in, lane,
+                    std::isnan(x) || std::isnan(y) || std::isnan(z)
+                        ? std::fmin(std::fmin(x, y), z)
+                        : std::fmax(std::fmin(x, y), std::fmin(std::fmax(x, y), z)));
+      });
+    } else if (op == "v_cvt_f32_fp8_e32"_op || op == "v_cvt_f32_bf8_e32"_op ||
+               op == "v_cvt_pk_f32_fp8_e32"_op || op == "v_cvt_pk_f32_bf8_e32"_op) {
+      // One 8-bit float widened, from the source's low byte, or two from its
+      // low half -- the part SDWA picked, or the register's bottom.
+      if (in.promoted && in.op_sel)
+        throw Error::make(Err::Unsupported, in.name, " picks its byte with op_sel, which this does not model");
+      const F8& t = op == "v_cvt_f32_fp8_e32"_op || op == "v_cvt_pk_f32_fp8_e32"_op ? kFp8 : kBf8;
+      const bool pair = op == "v_cvt_pk_f32_fp8_e32"_op || op == "v_cvt_pk_f32_bf8_e32"_op;
+      each([&](uint32_t lane) {
+        const uint32_t v = lane_src(w, in.src[0], lane);
+        set_word(w, in.dst[0], 0, lane, as_bits(f8_to_float(v, t)));
+        if (pair) set_word(w, in.dst[0], 1, lane, as_bits(f8_to_float(v >> 8, t)));
+      });
+    } else if (op == "v_cvt_pk_fp8_f32"_op || op == "v_cvt_pk_bf8_f32"_op) {
+      // Two floats narrowed into one half of the destination (op_sel's
+      // bit 3 says the high one), the other half kept.
+      const F8& t = op == "v_cvt_pk_fp8_f32"_op ? kFp8 : kBf8;
+      each([&](uint32_t lane) {
+        const uint32_t two = float_to_f8(lane_float(w, in.src[0], lane), t, in.clamp, nullptr) |
+                             float_to_f8(lane_float(w, in.src[1], lane), t, in.clamp, nullptr) << 8;
+        const uint32_t was = w.vgpr[in.dst[0].index][lane];
+        write_lane(w, in.dst[0], lane, in.op_sel & 8 ? (was & 0xFFFFu) | two << 16 : (was & 0xFFFF0000u) | two);
+      });
+    } else if (op == "v_cvt_sr_fp8_f32"_op || op == "v_cvt_sr_bf8_f32"_op) {
+      // One float narrowed, rounded by the second source's random bits,
+      // into the byte op_sel's bits 2 and 3 name, the others kept.
+      const F8& t = op == "v_cvt_sr_fp8_f32"_op ? kFp8 : kBf8;
+      const uint32_t at = 8 * ((in.op_sel >> 2) & 3);
+      each([&](uint32_t lane) {
+        const uint32_t random = lane_src(w, in.src[1], lane);
+        const uint32_t b = float_to_f8(lane_float(w, in.src[0], lane), t, in.clamp, &random);
+        const uint32_t was = w.vgpr[in.dst[0].index][lane];
+        write_lane(w, in.dst[0], lane, (was & ~(0xFFu << at)) | b << at);
+      });
     } else if (op == "v_min3_i32"_op || op == "v_max3_i32"_op) {
       each([&](uint32_t lane) {
         const int32_t x = static_cast<int32_t>(lane_src(w, in.src[0], lane)),
@@ -1182,20 +1280,21 @@ struct Machine {
     } else if (op == "v_perm_b32"_op) {
       each([&](uint32_t lane) {
         // Four bytes chosen out of the eight the two sources make, the first
-        // source holding the top four. A selector that asks for a sign or a
-        // constant instead is refused: the compiler emits these to move bytes
-        // about, and nothing here has been seen to ask for the rest.
+        // source holding the top four. Past those, a selector asks for the
+        // sign of byte 1, 3, 5 or 7 spread over a byte (8 to 11), a zero
+        // byte (12), or a byte of ones (13 on): Tensile's int8 GEMMs widen
+        // bytes with them.
         const uint64_t bytes = static_cast<uint64_t>(lane_src(w, in.src[0], lane)) << 32 |
                                lane_src(w, in.src[1], lane);
         const uint32_t sel = lane_src(w, in.src[2], lane);
         uint32_t out = 0;
         for (uint32_t k = 0; k < 4; ++k) {
           const uint32_t which = (sel >> (8 * k)) & 0xFF;
-          if (which > 7)
-            throw Error::make(Err::Unsupported, "v_perm_b32 asked for byte ", which,
-                              ", which is a sign or a constant rather than one of the eight, and this does not "
-                              "model those");
-          out |= static_cast<uint32_t>((bytes >> (8 * which)) & 0xFF) << (8 * k);
+          const uint32_t b = which < 8    ? (bytes >> (8 * which)) & 0xFF
+                             : which < 12 ? ((bytes >> (8 * (2 * (which - 8) + 1) + 7)) & 1) * 0xFFu
+                             : which == 12 ? 0u
+                                           : 0xFFu;
+          out |= b << (8 * k);
         }
         write_lane(w, in.dst[0], lane, out);
       });
@@ -2491,7 +2590,9 @@ struct Machine {
   // them off is not something this can check.
   struct MatrixShape {
     uint32_t m, n, k, blocks;
-    char in, out;   // 'h' a half, 'b' a bfloat16, 'c' a signed byte, 'f' a float, 'd' a double, 'i' an int32
+    char in, out;   // 'h' a half, 'b' a bfloat16, 'c' a signed byte, 'e' an fp8, 'g' a bf8,
+                    // 'f' a float, 'd' a double, 'i' an int32
+    char in_b = 0;  // B's type, where it is not A's
   };
   static const MatrixShape* matrix_shape(const OpName& op) {
     static const MatrixShape f16_16x16x16{16, 16, 16, 1, 'h', 'f'}, f32_16x16x4{16, 16, 4, 1, 'f', 'f'},
@@ -2501,7 +2602,23 @@ struct Machine {
         bf16_32x32x8{32, 32, 8, 1, 'b', 'f'}, i8_32x32x16{32, 32, 16, 1, 'c', 'i'},
         f16_4x4x4_16b{4, 4, 4, 16, 'h', 'f'}, bf16_4x4x4_16b{4, 4, 4, 16, 'b', 'f'},
         f16_16x16x4_4b{16, 16, 4, 4, 'h', 'f'}, bf16_16x16x4_4b{16, 16, 4, 4, 'b', 'f'},
-        i8_16x16x32{16, 16, 32, 1, 'c', 'i'};
+        i8_16x16x32{16, 16, 32, 1, 'c', 'i'}, f8_16x16x32[4] = {{16, 16, 32, 1, 'g', 'f', 'g'},
+                                                                 {16, 16, 32, 1, 'g', 'f', 'e'},
+                                                                 {16, 16, 32, 1, 'e', 'f', 'g'},
+                                                                 {16, 16, 32, 1, 'e', 'f', 'e'}},
+        f8_32x32x16[4] = {{32, 32, 16, 1, 'g', 'f', 'g'},
+                          {32, 32, 16, 1, 'g', 'f', 'e'},
+                          {32, 32, 16, 1, 'e', 'f', 'g'},
+                          {32, 32, 16, 1, 'e', 'f', 'e'}};
+    // The 8-bit float forms, named for A's type then B's.
+    if (op == "v_mfma_f32_16x16x32_bf8_bf8"_op) return &f8_16x16x32[0];
+    if (op == "v_mfma_f32_16x16x32_bf8_fp8"_op) return &f8_16x16x32[1];
+    if (op == "v_mfma_f32_16x16x32_fp8_bf8"_op) return &f8_16x16x32[2];
+    if (op == "v_mfma_f32_16x16x32_fp8_fp8"_op) return &f8_16x16x32[3];
+    if (op == "v_mfma_f32_32x32x16_bf8_bf8"_op) return &f8_32x32x16[0];
+    if (op == "v_mfma_f32_32x32x16_bf8_fp8"_op) return &f8_32x32x16[1];
+    if (op == "v_mfma_f32_32x32x16_fp8_bf8"_op) return &f8_32x32x16[2];
+    if (op == "v_mfma_f32_32x32x16_fp8_fp8"_op) return &f8_32x32x16[3];
     if (op == "v_mfma_f32_16x16x16_f16"_op) return &f16_16x16x16;
     if (op == "v_mfma_f32_16x16x4_f32"_op) return &f32_16x16x4;
     if (op == "v_mfma_f32_32x32x2_f32"_op) return &f32_32x32x2;
@@ -2560,6 +2677,7 @@ struct Machine {
     const auto value = [&](const Operand& o, char type, uint32_t e, uint32_t lane) -> double {
       if (type == 'b') return static_cast<double>(as_float((reg(o, e / 2, lane) >> (16 * (e % 2))) << 16));
       if (type == 'c') return static_cast<double>(static_cast<int8_t>(reg(o, e / 4, lane) >> (8 * (e % 4))));
+      if (type == 'e' || type == 'g') return f8_to_float(reg(o, e / 4, lane) >> (8 * (e % 4)), type == 'e' ? kFp8 : kBf8);
       if (type == 'i') return static_cast<double>(static_cast<int32_t>(reg(o, e, lane)));
       if (type == 'h') {
         _Float16 h;
@@ -2581,7 +2699,7 @@ struct Machine {
       const uint32_t bl = lane / lanes_per_block, within = lane % lanes_per_block, g = within / s.m;
       for (uint32_t e = 0; e < per_lane; ++e) {
         A(bl, within % s.m, g * per_lane + e) = value(in.src[0], s.in, e, lane);
-        B(bl, g * per_lane + e, within % s.n) = value(in.src[1], s.in, e, lane);
+        B(bl, g * per_lane + e, within % s.n) = value(in.src[1], s.in_b ? s.in_b : s.in, e, lane);
       }
       for (uint32_t r = 0; r < outs; ++r) {
         uint32_t ob = 0, row = 0;

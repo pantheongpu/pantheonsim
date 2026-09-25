@@ -1,13 +1,14 @@
 // AMD's rocBLAS, unmodified, on a simulated MI300X: a level-1 call, a
-// reduction, single- and double-precision GEMMs, and gemm_ex on halves,
-// bfloat16s and bytes, each checked against the same arithmetic done on the
-// host. rocBLAS brings its own kernels -- some built into the library, the
-// GEMMs from the Tensile code objects it loads at run time -- so what runs
-// is AMD's code, not ours.
+// reduction, single- and double-precision GEMMs, gemm_ex on halves,
+// bfloat16s and bytes, and complex GEMMs, each checked against the same
+// arithmetic done on the host. rocBLAS brings its own kernels -- some built
+// into the library, the GEMMs from the Tensile code objects it loads at run
+// time -- so what runs is AMD's code, not ours.
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
 
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -191,6 +192,47 @@ int gemm_ex(rocblas_handle handle, const Type& in, const Type& out, const Type& 
   return 1;
 }
 
+// C = alpha * op(A) * op(B) + beta * C for complex floats or doubles, each
+// op none, transposed or conjugated and transposed, checked against the
+// same sums on the host in complex double. Returns whether all of C is
+// within tolerance.
+template <typename T, typename Blas>
+int complex_gemm(rocblas_handle handle, Blas gemm, double tolerance, int ta, int tb, int m, int n, int k) {
+  using C = std::complex<T>;
+  const auto op = [](int t) {
+    return t == 0 ? rocblas_operation_none : t == 1 ? rocblas_operation_transpose : rocblas_operation_conjugate_transpose;
+  };
+  const int lda = ta ? k : m, ldb = tb ? n : k;
+  const auto fill = [](size_t count, int seed) {
+    const std::vector<T> re = filled<T>(count, seed), im = filled<T>(count, seed + 50);
+    std::vector<C> v(count);
+    for (size_t i = 0; i < count; ++i) v[i] = C(re[i], im[i]);
+    return v;
+  };
+  const std::vector<C> a = fill(size_t(lda) * (ta ? m : k), 40 + ta), b = fill(size_t(ldb) * (tb ? k : n), 45 + tb),
+                       c = fill(size_t(m) * n, 49);
+  C *da = to_device(a), *db = to_device(b), *dc = to_device(c);
+  if (!da || !db || !dc) return 0;
+  const C alpha(T(1.25), T(-0.5)), beta(T(-0.75), T(0.25));
+  const rocblas_status s = gemm(handle, op(ta), op(tb), m, n, k, &alpha, da, lda, db, ldb, &beta, dc, m);
+  const std::vector<C> got = to_host(dc, size_t(m) * n);
+  for (void* p : {static_cast<void*>(da), static_cast<void*>(db), static_cast<void*>(dc)}) (void)hipFree(p);
+  if (s != rocblas_status_success) return 0;
+  using D = std::complex<double>;
+  const auto at = [](const std::vector<C>& v, int t, int ld, int i, int j) {   // op(X)[i][j]
+    const D x = t ? D(v[size_t(i) * ld + j]) : D(v[size_t(j) * ld + i]);
+    return t == 2 ? std::conj(x) : x;
+  };
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) {
+      D sum = 0;
+      for (int l = 0; l < k; ++l) sum += at(a, ta, lda, i, l) * at(b, tb, ldb, l, j);
+      const D want = D(alpha) * sum + D(beta) * D(c[size_t(j) * m + i]);
+      if (std::abs(D(got[size_t(j) * m + i]) - want) > tolerance * (1 + std::abs(want))) return 0;
+    }
+  return 1;
+}
+
 int main() {
   rocblas_handle handle;
   BLAS(rocblas_create_handle(&handle));
@@ -299,6 +341,39 @@ int main() {
         ++mixed;
       }
   std::printf("gemm_ex, halves, bfloat16s and bytes, every transpose: %d of %d right\n", mixed_right, mixed);
+
+  // Complex GEMMs, each operand as it is, transposed, or conjugated and
+  // transposed.
+  const int complex_sizes[][3] = {{1, 1, 1}, {33, 17, 5}, {64, 65, 66}, {96, 80, 64}, {130, 70, 40}};
+  int complexes = 0, complex_right = 0;
+  for (const auto& sz : complex_sizes)
+    for (int ta = 0; ta < 3; ++ta)
+      for (int tb = 0; tb < 3; ++tb) {
+        complex_right += complex_gemm<float>(
+            handle,
+            [](rocblas_handle h, rocblas_operation oa, rocblas_operation ob, int m, int n, int k, const void* al,
+               const void* a, int lda, const void* b, int ldb, const void* be, void* c, int ldc) {
+              return rocblas_cgemm(h, oa, ob, m, n, k, static_cast<const rocblas_float_complex*>(al),
+                                   static_cast<const rocblas_float_complex*>(a), lda,
+                                   static_cast<const rocblas_float_complex*>(b), ldb,
+                                   static_cast<const rocblas_float_complex*>(be),
+                                   static_cast<rocblas_float_complex*>(c), ldc);
+            },
+            1e-4, ta, tb, sz[0], sz[1], sz[2]);
+        complex_right += complex_gemm<double>(
+            handle,
+            [](rocblas_handle h, rocblas_operation oa, rocblas_operation ob, int m, int n, int k, const void* al,
+               const void* a, int lda, const void* b, int ldb, const void* be, void* c, int ldc) {
+              return rocblas_zgemm(h, oa, ob, m, n, k, static_cast<const rocblas_double_complex*>(al),
+                                   static_cast<const rocblas_double_complex*>(a), lda,
+                                   static_cast<const rocblas_double_complex*>(b), ldb,
+                                   static_cast<const rocblas_double_complex*>(be),
+                                   static_cast<rocblas_double_complex*>(c), ldc);
+            },
+            1e-12, ta, tb, sz[0], sz[1], sz[2]);
+        complexes += 2;
+      }
+  std::printf("complex GEMMs, every transpose and conjugate: %d of %d right\n", complex_right, complexes);
   BLAS(rocblas_destroy_handle(handle));
   return 0;
 }

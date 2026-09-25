@@ -168,9 +168,9 @@ VTEST(a_rocwmma_gemm_of_doubles_gives_the_product_worked_out_in_c) {
   check_gemm<double>("_Z17gemm_f64_16x16x16PKdS0_S0_Pd", 16, 16);
 }
 
-// The same for halves, bfloat16s and bytes into float and int32
-// accumulators. Each input is a small integer, which all three hold exactly;
-// encode says how one is stored.
+// The same for halves, bfloat16s, bytes and 8-bit floats into float and
+// int32 accumulators. Each input is an integer from -8 to 8, which all of
+// them hold exactly; encode says how one is stored.
 template <typename Stored, typename Acc, typename Encode>
 void check_mixed(const char* kernel, int m, int kk, Encode encode) {
   const amd::CodeObject o = object();
@@ -181,7 +181,7 @@ void check_mixed(const char* kernel, int m, int kk, Encode encode) {
   for (int i = 0; i < m; ++i)
     for (int k = 0; k < kk; ++k) {
       a[i * kk + k] = (i * 5 + k * 3) % 17 - 8;
-      b[i * kk + k] = (k * 7 + i * 11) % 19 - 9;
+      b[i * kk + k] = (k * 7 + i * 11) % 17 - 8;
       sa[i * kk + k] = encode(a[i * kk + k]);
       sb[i * kk + k] = encode(b[i * kk + k]);
     }
@@ -212,6 +212,21 @@ VTEST(a_rocwmma_gemm_of_bfloat16s_halves_and_bytes_gives_the_product_worked_out_
   check_mixed<uint16_t, float>("_Z18gemm_bf16_32x32x16PK12hip_bfloat16S1_PKfPf", 32, 16, bf16);
   check_mixed<uint16_t, float>("_Z17gemm_f16_32x32x16PKDF16_S0_PKfPf", 32, 16, f16);
   check_mixed<int8_t, int32_t>("_Z16gemm_i8_32x32x16PKaS0_PKiPi", 32, 16, i8);
+}
+
+VTEST(a_rocwmma_gemm_of_8_bit_floats_gives_the_product_worked_out_in_c) {
+  // gfx942's 8-bit floats: a sign, then the exponent (bias 8 in fp8's four
+  // bits, 16 in bf8's five), then the mantissa; zero is all zeroes.
+  const auto f8 = [](int v, int mant, int bias) {
+    if (v == 0) return uint8_t{0};
+    const int a = v < 0 ? -v : v, e = 31 - __builtin_clz(static_cast<unsigned>(a));
+    const int m = ((a << mant) >> e) - (1 << mant);
+    return static_cast<uint8_t>((v < 0 ? 0x80 : 0) | (e + bias) << mant | m);
+  };
+  check_mixed<uint8_t, float>("_Z17gemm_fp8_16x16x32PK19__hip_fp8_e4m3_fnuzS1_PKfPf", 16, 32,
+                              [&](int v) { return f8(v, 3, 8); });
+  check_mixed<uint8_t, float>("_Z17gemm_bf8_32x32x16PK19__hip_fp8_e5m2_fnuzS1_PKfPf", 32, 16,
+                              [&](int v) { return f8(v, 2, 16); });
 }
 
 VTEST_MAIN

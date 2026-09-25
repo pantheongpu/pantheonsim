@@ -58,4 +58,6 @@ expect "ragged GEMMs, where the kernels count on a buffer's bounds at the edges"
   "ragged GEMMs, every transpose, float and double: 48 of 48 right" "$(grep -o '^ragged GEMMs.*' <<< "$out")"
 expect "gemm_ex of halves, bfloat16s and bytes, through their matrix instructions and half-register loads" \
   "gemm_ex, halves, bfloat16s and bytes, every transpose: 100 of 100 right" "$(grep -o '^gemm_ex, .*' <<< "$out")"
+expect "complex GEMMs, float and double, each operand transposed, conjugated or neither" \
+  "complex GEMMs, every transpose and conjugate: 90 of 90 right" "$(grep -o '^complex GEMMs.*' <<< "$out")"
 exit $fail
