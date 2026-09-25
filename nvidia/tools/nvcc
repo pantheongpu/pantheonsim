@@ -37,16 +37,34 @@ if [[ "${VGPU_NVCC_PASSTHROUGH:-0}" == "1" ]]; then
   exec "$real" "$@"
 fi
 
-# Leave informational invocations and an explicit -cudart choice alone.
-inject=1
-for a in "$@"; do
+# A request for the static runtime becomes the shared one, however it is
+# spelled: CMake links CUDA programs with cudart_static unless told otherwise
+# (CMAKE_CUDA_RUNTIME_LIBRARY), and CUDA::cudart_static names the archive by
+# path. Left alone, those programs build and then cannot run here at all.
+# -cudart none is a real choice (a driver-API-only program) and is kept.
+args=()
+explicit=0
+info=0
+while (( $# )); do
+  a="$1"; shift
   case "$a" in
-    --version|-V|--help|-h|--list-gpu-arch|--list-gpu-code) inject=0 ;;
-    -cudart|-cudart=*|--cudart|--cudart=*) inject=0 ;;
+    --version|-V|--help|-h|--list-gpu-arch|--list-gpu-code) info=1; args+=("$a") ;;
+    -cudart|--cudart)
+      explicit=1
+      v="${1:-}"; (( $# )) && shift
+      [[ "$v" == static ]] && v=shared
+      args+=("$a" "$v") ;;
+    -cudart=*|--cudart=*)
+      explicit=1
+      [[ "${a#*=}" == static ]] && a="${a%%=*}=shared"
+      args+=("$a") ;;
+    -lcudart_static) args+=(-lcudart) ;;
+    */libcudart_static.a) args+=(-lcudart) ;;
+    *) args+=("$a") ;;
   esac
 done
 
-if [[ $inject -eq 1 ]]; then
-  exec "$real" -cudart shared "$@"
+if [[ $info -eq 0 && $explicit -eq 0 ]]; then
+  exec "$real" -cudart shared "${args[@]}"
 fi
-exec "$real" "$@"
+exec "$real" "${args[@]}"

@@ -215,5 +215,5 @@ jobs:
       - name: Configure, build and ctest, unmodified
         run: |
           cmake -S .github/action-tests/${{ matrix.project }} -B build-test -G Ninja
-          cmake --build build-test
+          cmake --build build-test -v
           ctest --test-dir build-test --output-on-failure

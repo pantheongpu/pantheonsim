@@ -70,6 +70,7 @@ and 4 when the program did not run at all (`vgpu test --help`).
 | `count` | `1` | How many GPUs |
 | `cuda-toolkit` | `apt` for NVIDIA, `none` for AMD | `apt` installs Ubuntu's toolkit; a version like `12.6` or `13.0` installs that `nvcc` from NVIDIA; `none` uses one the job already installed |
 | `rocm` | `7.1` for AMD, `none` for NVIDIA | The ROCm version whose `hipcc` to install; `none` uses one the job already installed |
+| `library-path` | `true` | Puts the simulator's libraries on `LD_LIBRARY_PATH`, so programs run directly (ctest, scripts) as well as under `vgpu run` |
 
 ## Outputs
 
@@ -86,4 +87,12 @@ and 4 when the program did not run at all (`vgpu test --help`).
   MI350X.
 - The simulator's CUDA libraries are built against the job's toolkit, so their
   version always matches the `nvcc` that compiled the program.
+- Test suites run unchanged. With `library-path: true` (the default), a
+  program run directly, by `ctest` or a script, reaches the simulated GPUs
+  just as it does under `vgpu run`. CMake projects work as they are: the `nvcc`
+  wrapper links the shared CUDA runtime even where CMake asks for the static
+  one, because the static runtime cannot talk to a simulated driver.
+- Runners: `ubuntu-24.04` and `ubuntu-22.04`, and container jobs (which run as
+  root without `sudo`). On 22.04, Ubuntu's own CUDA toolkit is 11.5, older than
+  the simulator supports, so an NVIDIA job there gets CUDA 12.6 from NVIDIA.
 - It checks behaviour, not performance: timings mean nothing here.
