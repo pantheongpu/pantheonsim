@@ -68,6 +68,9 @@ struct Inst {
   uint64_t target = 0;
   // VOP3's clamp: a float result is held to [0, 1].
   bool clamp = false;
+  // The VOP3 form of a VOP1 or VOP2 instruction, decoded from the short
+  // form's entry: it runs as the short form does.
+  bool promoted = false;
   // SDWA: the instruction reads part of a register rather than all of it,
   // which is how the compiler mixes widths. The destination has the same
   // choice, and says what becomes of the rest of the register.

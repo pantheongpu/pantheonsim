@@ -766,6 +766,11 @@ set_tests_properties(test_amd_hipcc_printf_decode PROPERTIES ENVIRONMENT
 add_test(NAME test_amd_hipcc_cooperative_decode COMMAND test_amd_gcn)
 set_tests_properties(test_amd_hipcc_cooperative_decode PROPERTIES ENVIRONMENT
   "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/cooperative.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/cooperative.gfx942.dis")
+# The same program unoptimized: device library calls, lane spills and the long
+# form of nearly every vector instruction.
+add_test(NAME test_amd_hipcc_O0_decode COMMAND test_amd_gcn)
+set_tests_properties(test_amd_hipcc_O0_decode PROPERTIES ENVIRONMENT
+  "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/chevron.O0.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/chevron.O0.gfx942.dis")
 add_test(NAME test_amd_hipcc_mfma_decode COMMAND test_amd_gcn)
 set_tests_properties(test_amd_hipcc_mfma_decode PROPERTIES ENVIRONMENT
   "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/wmma.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/wmma.gfx942.dis")

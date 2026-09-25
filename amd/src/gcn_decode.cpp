@@ -22,6 +22,9 @@ struct Shape {
   // (v_readlane, and the comparisons in their long form).
   bool sdst = false;
   bool scalar_dst = false;
+  // A long form made from a short one's entry (add_long_forms), which runs as
+  // the short form does.
+  bool promoted = false;
   uint32_t src_width(uint32_t i) const { return i == 0 ? w0 : i == 1 ? w1 : w2; }
 };
 
@@ -63,6 +66,31 @@ void add_comparisons(std::map<std::pair<Enc, uint32_t>, Shape>& t) {
 // The instructions decoded so far: those the compiler emits for the kernels
 // this runs. Each is <encoding, opcode> -> its name and operand shape, from
 // the CDNA3 ISA reference guide's opcode tables.
+// The VOP3 form of every VOP1 and VOP2 instruction that has no entry of its
+// own: the ISA puts them at 0x140 plus the VOP1 opcode and 0x100 plus the
+// VOP2 one, doing the same arithmetic with VOP3's modifiers and any source in
+// any slot. Optimized code rarely needs the long form of these, since the
+// short one fits; unoptimized code uses it all the time. Anything that reads
+// or writes VCC implicitly in its short form (v_cndmask, the carries) does
+// something else in its long one, and those are listed by hand or refused.
+void add_long_forms(std::map<std::pair<Enc, uint32_t>, Shape>& t) {
+  static std::vector<std::string> names;   // the shapes point at their names
+  names.reserve(256);
+  std::vector<std::pair<uint32_t, Shape>> add;
+  for (const auto& [key, sh] : t) {
+    const auto [enc, op] = key;
+    if (enc != Enc::Vop1 && enc != Enc::Vop2) continue;
+    const std::string name = sh.name;
+    if (name.size() < 4 || name.compare(name.size() - 4, 4, "_e32") != 0) continue;
+    if (name.find("cndmask") != std::string::npos || name.find("_co_") != std::string::npos) continue;
+    add.emplace_back((enc == Enc::Vop1 ? 0x140 : 0x100) + op, sh);
+    names.push_back(name.substr(0, name.size() - 4) + "_e64");
+    add.back().second.name = names.back().c_str();
+    add.back().second.promoted = true;
+  }
+  for (const auto& [op, sh] : add) t.emplace(std::make_pair(Enc::Vop3, op), sh);   // a listed entry stays
+}
+
 const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
   static const std::map<std::pair<Enc, uint32_t>, Shape> t = [] {
     std::map<std::pair<Enc, uint32_t>, Shape> m = {
@@ -88,6 +116,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop1, 0x1e}, {"s_swappc_b64", 2, 1, 2}},
       {{Enc::Sop1, 0x20}, {"s_and_saveexec_b64", 2, 1, 2}},
       {{Enc::Sop1, 0x21}, {"s_or_saveexec_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x22}, {"s_xor_saveexec_b64", 2, 1, 2}},
       {{Enc::Sop1, 0x23}, {"s_andn2_saveexec_b64", 2, 1, 2}},
       // SOP2: two scalar sources.
       {{Enc::Sop2, 0x00}, {"s_add_u32", 1, 2}},
@@ -161,6 +190,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // A message to the host: MSG_INTERRUPT is how a kernel wakes the host
       // for a hostcall, which is what device-side printf is built on.
       {{Enc::Sopp, 0x10}, {"s_sendmsg", 0, 0}},
+      // A trap into the handler: 2 is llvm.trap, what __builtin_trap and
+      // abort() compile to, and what unoptimized device library code keeps on
+      // the paths optimization proves unreachable.
+      {{Enc::Sopp, 0x12}, {"s_trap", 0, 0}},
       // SOPC: a scalar comparison, which sets SCC.
       {{Enc::Sopc, 0x00}, {"s_cmp_eq_i32", 0, 2}},
       {{Enc::Sopc, 0x01}, {"s_cmp_lg_i32", 0, 2}},
@@ -552,6 +585,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x59}, {"v_accvgpr_write_b32", 1, 1}},
     };
     add_comparisons(m);
+    add_long_forms(m);
     return m;
   }();
   return t;
@@ -960,6 +994,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.opcode = (w0 >> 16) & 0x3FF;
     const Shape& s = shape(in.enc, in.opcode);
     in.name = s.name;
+    in.promoted = s.promoted;
     in.size = 8;
     const uint32_t w1 = word(code, at + 4);
     // The modifiers: a source's absolute value and negation, and a clamp of
@@ -1189,8 +1224,11 @@ std::string operand_text(const Operand& o) {
       // have carried, which it writes as the number itself. (The compiler
       // spends a literal on such a value when the word is going to be
       // rewritten, as the address of a global is.)
-      const int32_t v = static_cast<int32_t>(static_cast<uint32_t>(o.value));
-      if (v >= -16 && v <= 64) std::snprintf(b, sizeof b, "%d", v);
+      // A 64-bit operand zero-extends its literal, so 0xffffffff there is
+      // not the -1 an inline constant would sign-extend to.
+      const int64_t v = o.width == 2 ? static_cast<int64_t>(static_cast<uint32_t>(o.value))
+                                     : static_cast<int32_t>(static_cast<uint32_t>(o.value));
+      if (v >= -16 && v <= 64) std::snprintf(b, sizeof b, "%lld", static_cast<long long>(v));
       else std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(static_cast<uint32_t>(o.value)));
       return neg + b;
     }
@@ -1304,7 +1342,7 @@ std::string to_text(const Inst& i) {
       throw Error::make(Err::Unsupported, "s_sendmsg with message ", static_cast<uint32_t>(i.simm) & 0xFFFF,
                         " is not decoded yet");
     s += " sendmsg(MSG_INTERRUPT)";
-  } else if (i.name == "s_nop" || i.name == "s_sleep" || i.name == "s_setprio") {
+  } else if (i.name == "s_nop" || i.name == "s_sleep" || i.name == "s_setprio" || i.name == "s_trap") {
     std::snprintf(b, sizeof b, " %d", i.simm);   // how many cycles to wait
     s += b;
   } else if (i.name == "s_waitcnt") {

@@ -54,6 +54,22 @@ expect "a peer is reachable, once, and a copy to it arrives intact" \
   "peer can 1, enabling twice says hipErrorPeerAccessAlreadyEnabled, copy intact 1" \
   "$(grep -o 'peer can .*' <<< "$out")"
 
+# The same program built unoptimized (-O0, what CMake builds HIP with when no
+# build type is set) computes the same answers. Its device library calls are
+# real calls, it spills scalars into lanes and reads them back with every lane
+# off, and nearly every vector instruction is in its long form.
+out=$(VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/chevron.O0.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "unoptimized, it runs to the end" "0" "$status"
+expect "unoptimized, a chevron launch computes every element" "chevron launch wrong 0 of 3000" \
+  "$(grep -o 'chevron launch wrong .*' <<< "$out")"
+expect "unoptimized, a capture runs nothing and each replay runs the launch once" "graph captured 0 replayed 6" \
+  "$(grep -o 'graph captured .*' <<< "$out")"
+expect "unoptimized, a copy to a peer arrives intact" \
+  "peer can 1, enabling twice says hipErrorPeerAccessAlreadyEnabled, copy intact 1" \
+  "$(grep -o 'peer can .*' <<< "$out")"
+
 # Device-side printf: three lanes print through the hostcall buffer -- one of
 # them a string that takes several packets -- and a __constant__ table is read
 # from the program's own code object. printf's return value is checked by the

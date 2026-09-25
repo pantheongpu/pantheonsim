@@ -23,6 +23,7 @@ if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
   for f in amd/tests/hipcc/ops.hip amd/tests/hipcc/ops.gfx942.o amd/tests/hipcc/ops.gfx942.dis \
            amd/tests/hipcc/wmma.cpp amd/tests/hipcc/wmma.gfx942.o amd/tests/hipcc/wmma.gfx942.dis \
            amd/tests/hipcc/chevron.cpp amd/tests/hipcc/chevron.gfx942 \
+           amd/tests/hipcc/chevron.O0.gfx942 amd/tests/hipcc/chevron.O0.gfx942.o amd/tests/hipcc/chevron.O0.gfx942.dis \
            amd/tests/hipcc/printf.cpp amd/tests/hipcc/printf.gfx942 amd/tests/hipcc/printf.gfx942.o \
            amd/tests/hipcc/printf.gfx942.dis amd/tests/hipcc/cooperative.cpp amd/tests/hipcc/cooperative.gfx942 \
            amd/tests/hipcc/cooperative.gfx942.o amd/tests/hipcc/cooperative.gfx942.dis \

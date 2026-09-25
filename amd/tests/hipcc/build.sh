@@ -13,6 +13,15 @@ echo "wrote $(pwd)/chevron.gfx942"
 # Device-side printf: the program, and its device code with the listing, since
 # the path ROCm's device library takes through a hostcall is thousands of
 # instructions of its own.
+# The same program unoptimized, as CMake builds HIP with no build type: device
+# library calls that are not inlined, scalars spilled into lanes and read back
+# with every lane off, and the long form of nearly every vector instruction.
+"$rocm/bin/hipcc" -O0 -std=c++17 --offload-arch=gfx942 chevron.cpp -o chevron.O0.gfx942
+"$rocm/bin/hipcc" -O0 -std=c++17 --offload-arch=gfx942 --offload-device-only --no-gpu-bundle-output \
+  -c chevron.cpp -o chevron.O0.gfx942.o
+"$rocm/lib/llvm/bin/llvm-objdump" -d --mcpu=gfx942 chevron.O0.gfx942.o |
+  sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > chevron.O0.gfx942.dis
+echo "wrote $(pwd)/chevron.O0.gfx942, chevron.O0.gfx942.o and its listing ($(wc -l < chevron.O0.gfx942.dis) instructions)"
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 printf.cpp -o printf.gfx942
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 --offload-device-only --no-gpu-bundle-output \
   -c printf.cpp -o printf.gfx942.o
