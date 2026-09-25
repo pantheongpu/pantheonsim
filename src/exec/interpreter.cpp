@@ -605,6 +605,22 @@ double fma_hw(double a, double b, double c) { return std::fma(a, b, c); }
 // The correctly rounded fused multiply-add, without libm's per-call dispatch.
 inline double host_fma(double a, double b, double c) { return g_hw_fma ? fma_hw(a, b, c) : std::fma(a, b, c); }
 
+// Per-element lanes for a vector load, store or register pack: up to four on
+// the stack, as the parser allows, instead of a heap allocation on every
+// memory instruction. More than four still works, from the heap.
+struct LaneSet {
+  explicit LaneSet(size_t n) : n_(n) {
+    if (n > inline_.size()) heap_.resize(n);
+  }
+  Lanes& operator[](size_t i) { return n_ > inline_.size() ? heap_[i] : inline_[i]; }
+  size_t size() const { return n_; }
+
+ private:
+  size_t n_;
+  std::array<Lanes, 4> inline_;
+  std::vector<Lanes> heap_;
+};
+
 uint64_t mask_to_bits(uint64_t v, uint32_t bits) {
   return bits >= 64 ? v : (v & ((1ull << bits) - 1));
 }
@@ -1938,13 +1954,18 @@ class Interpreter {
 
   bool fast_path(Warp& w, const BlockCtx& ctx, const Instr& ins, Mask m) {
     switch (ins.op.index()) {
-      case op_index<OpIntBin>(): return fast_int_bin(w, ins, std::get<OpIntBin>(ins.op), m);
+      case op_index<OpIntBin>(): {
+        const auto& op = std::get<OpIntBin>(ins.op);
+        return op.ty.bits == 64 ? fast_int_bin64(w, ctx, ins, op, m) : fast_int_bin(w, ins, op, m);
+      }
       case op_index<OpMadLo>(): return fast_mad_lo(w, ins, std::get<OpMadLo>(ins.op), m);
       case op_index<OpMov>(): return fast_mov(w, ins, std::get<OpMov>(ins.op), m);
       case op_index<OpSetp>(): return fast_setp(w, ins, std::get<OpSetp>(ins.op), m);
       case op_index<OpFma>(): return fast_fma(w, ctx, ins, std::get<OpFma>(ins.op), m);
       case op_index<OpFloatBin>(): return fast_float_bin(w, ins, std::get<OpFloatBin>(ins.op), m);
       case op_index<OpF16x2Fma>(): return fast_f16x2_fma(w, ins, std::get<OpF16x2Fma>(ins.op), m);
+      case op_index<OpCvt>(): return fast_cvt_int(w, ctx, ins, std::get<OpCvt>(ins.op), m);
+      case op_index<OpMulWide>(): return fast_mul_wide(w, ins, std::get<OpMulWide>(ins.op), m);
       default: return false;
     }
   }
@@ -2113,6 +2134,101 @@ class Interpreter {
       case FloatBinOp::Max: run([](float x, float y) { return std::fmax(x, y); }); break;
     }
     w.written32[op.dst.id] = 1;
+    return true;
+  }
+
+  // 64-bit integer arithmetic: the address computations around every memory
+  // access. 64-bit registers are read in place, never widened.
+  bool fast_int_bin64(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpIntBin& op, Mask m) {
+    if (op.carry_in || op.carry_out || !op.dst.wide || op.op == IntBinOp::Div || op.op == IntBinOp::Rem)
+      return false;
+    Lanes sa, sb;
+    const Lanes& a = read_operand(w, ctx, ins, op.a, sa);
+    const Lanes& b = read_operand(w, ctx, ins, op.b, sb);
+    uint64_t* d = w.regs64[op.dst.id].data();
+    const bool sig = op.ty.is_signed();
+    auto run = [&](auto f) { for_active(m, W_, [&](uint32_t l) { d[l] = f(a[l], b[l]); }); };
+    switch (op.op) {
+      case IntBinOp::Add: run([](uint64_t x, uint64_t y) { return x + y; }); break;
+      case IntBinOp::Sub: run([](uint64_t x, uint64_t y) { return x - y; }); break;
+      case IntBinOp::Mul: run([](uint64_t x, uint64_t y) { return x * y; }); break;
+      case IntBinOp::And: run([](uint64_t x, uint64_t y) { return x & y; }); break;
+      case IntBinOp::Or: run([](uint64_t x, uint64_t y) { return x | y; }); break;
+      case IntBinOp::Xor: run([](uint64_t x, uint64_t y) { return x ^ y; }); break;
+      case IntBinOp::Min:
+        if (sig) run([](uint64_t x, uint64_t y) {
+            return static_cast<uint64_t>(std::min(static_cast<int64_t>(x), static_cast<int64_t>(y)));
+          });
+        else run([](uint64_t x, uint64_t y) { return std::min(x, y); });
+        break;
+      case IntBinOp::Max:
+        if (sig) run([](uint64_t x, uint64_t y) {
+            return static_cast<uint64_t>(std::max(static_cast<int64_t>(x), static_cast<int64_t>(y)));
+          });
+        else run([](uint64_t x, uint64_t y) { return std::max(x, y); });
+        break;
+      case IntBinOp::Shl: run([](uint64_t x, uint64_t y) { return y >= 64 ? 0 : x << y; }); break;
+      case IntBinOp::Shr:
+        if (sig) run([](uint64_t x, uint64_t y) {
+            const int64_t v = static_cast<int64_t>(x);
+            return static_cast<uint64_t>(y >= 64 ? (v < 0 ? -1 : 0) : v >> y);
+          });
+        else run([](uint64_t x, uint64_t y) { return y >= 64 ? 0 : x >> y; });
+        break;
+      default: return false;
+    }
+    w.written64[op.dst.id] = 1;
+    return true;
+  }
+
+  // cvt between integer types: sign- or zero-extend from the source width,
+  // then truncate to the destination's -- the widenings and narrowings that
+  // turn a 32-bit index into a 64-bit address and back.
+  bool fast_cvt_int(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCvt& op, Mask m) {
+    const Type& st = op.src_ty;
+    const Type& dt = op.dst_ty;
+    if (st.is_real() || dt.is_real() || st.kind == Type::Kind::Pred || dt.kind == Type::Kind::Pred ||
+        op.round != Round::None)
+      return false;
+    Lanes sv;
+    const Lanes& v = read_operand(w, ctx, ins, op.src, sv);
+    const uint64_t src_mask = st.bits >= 64 ? ~uint64_t{0} : (uint64_t{1} << st.bits) - 1;
+    const uint64_t sign = st.bits >= 64 ? 0 : uint64_t{1} << (st.bits - 1);
+    const bool extend = st.is_signed() && st.bits < 64;
+    auto value = [&](uint64_t in) {
+      uint64_t x = in & src_mask;
+      if (extend && (x & sign)) x |= ~src_mask;
+      return x;
+    };
+    if (op.dst.wide) {
+      const uint64_t keep = dt.bits >= 64 ? ~uint64_t{0} : (uint64_t{1} << dt.bits) - 1;
+      uint64_t* d = w.regs64[op.dst.id].data();
+      for_active(m, W_, [&](uint32_t l) { d[l] = value(v[l]) & keep; });
+      w.written64[op.dst.id] = 1;
+    } else {
+      const uint32_t keep = dt.bits >= 32 ? ~0u : (1u << dt.bits) - 1;
+      uint32_t* d = w.regs32[op.dst.id].data();
+      for_active(m, W_, [&](uint32_t l) { d[l] = static_cast<uint32_t>(value(v[l])) & keep; });
+      w.written32[op.dst.id] = 1;
+    }
+    return true;
+  }
+
+  // mul.wide from 32 bits: the full 64-bit product of two 32-bit values.
+  bool fast_mul_wide(Warp& w, const Instr& ins, const OpMulWide& op, Mask m) {
+    if (op.src_bits != 32 || !op.dst.wide || !narrow_operand(op.a) || !narrow_operand(op.b))
+      return false;
+    Lanes32 sa, sb;
+    const Lanes32& a = read_narrow(w, ins, op.a, sa);
+    const Lanes32& b = read_narrow(w, ins, op.b, sb);
+    uint64_t* d = w.regs64[op.dst.id].data();
+    if (op.is_signed)
+      for_active(m, W_, [&](uint32_t l) {
+        d[l] = static_cast<uint64_t>(int64_t{static_cast<int32_t>(a[l])} * int64_t{static_cast<int32_t>(b[l])});
+      });
+    else
+      for_active(m, W_, [&](uint32_t l) { d[l] = uint64_t{a[l]} * uint64_t{b[l]}; });
+    w.written64[op.dst.id] = 1;
     return true;
   }
 
@@ -2450,11 +2566,11 @@ class Interpreter {
     if (const auto* op = std::get_if<OpMovPack>(&ins.op)) {
       uint32_t n = static_cast<uint32_t>(op->srcs.size());
       uint32_t piece = op->ty.bits / n;
-      std::vector<Lanes> vals;
-      vals.reserve(n);
+      LaneSet vals(n);
+      size_t vi = 0;
       for (const auto& src : op->srcs) {
         Lanes tmp;
-        vals.push_back(read_operand(w, ctx, ins, src, tmp));
+        vals[vi++] = read_operand(w, ctx, ins, src, tmp);
       }
       Lanes r;  // written for every active lane below
       for (uint32_t lane = 0; lane < W_; ++lane)
@@ -5019,7 +5135,7 @@ class Interpreter {
       // Address form: the register holds a parameter-window address.
       Lanes _s_base;
       const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
-      std::vector<Lanes> results(n);
+      LaneSet results(n);
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
           const uint64_t addr =
@@ -5067,7 +5183,7 @@ class Interpreter {
           at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
       count_addresses(op.space, at, m, size, n);
     }
-    std::vector<Lanes> results(n);
+    LaneSet results(n);
     for (uint32_t lane = 0; lane < W_; ++lane)
       if (m & (Mask{1} << lane)) {
         uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
@@ -5104,8 +5220,8 @@ class Interpreter {
   void exec_st(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSt& op, Mask m) {
     uint32_t size = op.ty.bytes();
     size_t n = op.srcs.size();
-    std::vector<Lanes> vals;
-    vals.reserve(n);
+    LaneSet vals(n);
+    size_t vi = 0;
     for (const auto& src : op.srcs) {
       // A value nothing has written, on its way to memory, looks like a bug --
       // but CUB's radix sort stores exactly that into the unused part of a
@@ -5119,7 +5235,7 @@ class Interpreter {
                    "store writes register " + r->reg.name + ", which nothing has written");
       }
       Lanes tmp;
-      vals.push_back(read_operand(w, ctx, ins, src, tmp));
+      vals[vi++] = read_operand(w, ctx, ins, src, tmp);
     }
     Lanes _s_base;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);

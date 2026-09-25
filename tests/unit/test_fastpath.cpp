@@ -288,4 +288,32 @@ VTEST(fast_f16_rounding_matches_the_general_path_at_every_tie) {
   }
 }
 
+// 64-bit integer arithmetic, integer conversions of every width pairing,
+// and mul.wide: the address arithmetic around memory accesses.
+VTEST(fast_address_arithmetic_matches_the_general_path) {
+  std::vector<uint64_t> a;
+  const uint64_t v[] = {0, 1, 63, 64, 65, 100, ~0ull, 0x8000000000000000ull, 0x7FFFFFFFFFFFFFFFull,
+                        0xFFFFFFFFull, 0x80000000ull, 0x7FFFFFFFull, 0x123456789ABCDEF0ull,
+                        0xFFFFFFFF80000000ull, 0x10000ull, 0xFFFFull, 0x8000ull, 0x80ull, 32};
+  for (int i = 0; i < kThreads; ++i) a.push_back(v[(i * 7 + i / 19) % (sizeof v / sizeof v[0])]);
+  const auto b = rotate(a, 3), c = rotate(a, 10);
+  for (const char* op : {"add.s64", "sub.s64", "mul.lo.s64", "and.b64", "or.b64", "xor.b64",
+                         "min.s64", "max.s64", "min.u64", "max.u64", "shl.b64", "shr.u64", "shr.s64"}) {
+    same(std::string(op) + " %D, %A, %B;", true, a, b, c);
+    same(std::string(op) + " %A, %A, 5; mov.b64 %D, %A;", true, a, b, c);
+  }
+  same("shl.b64 %D, %A, %b;", true, a, b, c);   // a 32-bit shift count
+  same("div.u64 %D, %A, %B;", true, a, b, c);   // declined: general path both times
+  for (const char* cvt : {"cvt.u64.u32 %D, %a;", "cvt.s64.s32 %D, %a;", "cvt.u64.s32 %D, %a;",
+                          "cvt.s64.u32 %D, %a;", "cvt.u32.u64 %d, %A;", "cvt.s32.s64 %d, %A;",
+                          "cvt.u16.u32 %rs1, %a; cvt.u32.u16 %d, %rs1;",
+                          "cvt.u16.u32 %rs1, %a; cvt.s32.s16 %d, %rs1;",
+                          "cvt.u16.u32 %rs1, %a; cvt.s64.s16 %D, %rs1;",
+                          "cvt.u8.u32 %rs1, %a; cvt.s32.s8 %d, %rs1;"})
+    same(cvt, std::string(cvt).find("%D") != std::string::npos, a, b, c);
+  same("mul.wide.u32 %D, %a, %b;", true, a, b, c);
+  same("mul.wide.s32 %D, %a, %b;", true, a, b, c);
+  same("mul.wide.s32 %D, %a, -3;", true, a, b, c);
+}
+
 VTEST_MAIN
