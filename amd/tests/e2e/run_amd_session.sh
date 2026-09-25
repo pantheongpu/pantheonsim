@@ -34,6 +34,11 @@ expect "and no NVIDIA driver files among the ones it overlays" "no" \
   "$(sess --no-isolate -c '[ -e "$VGPU_SESSION/root/proc/driver/nvidia" ] && echo yes || echo no')"
 expect "rocm_agent_enumerator names the card's target" "gfx942" \
   "$(sess --no-isolate -c 'rocm_agent_enumerator' | grep -v gfx000 | sort -u)"
+# CMake asks with -t GPU for the architecture to build HIP for; a failure here
+# means CMake quietly builds for gfx906, which the card refuses.
+expect "rocm_agent_enumerator -t GPU lists only the GPUs" "gfx942" \
+  "$(sess --no-isolate -c 'rocm_agent_enumerator -t GPU' | sort -u)"
+expect "and -t CPU only the CPU agent" "gfx000" "$(sess --no-isolate -c 'rocm_agent_enumerator -t CPU')"
 
 # --- isolated, the host's NVIDIA driver is out of sight too ---
 if unshare --user --map-root-user true >/dev/null 2>&1; then

@@ -3,4 +3,4 @@
 # virtual AMD agent (plus the host CPU agent, gfx000), as ROCm's does.
 here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 vgpu="$here/vgpu"; [[ -x "$vgpu" ]] || vgpu="$here/../vgpu"
-exec "$vgpu" smi --agents
+exec "$vgpu" smi --agents "$@"
