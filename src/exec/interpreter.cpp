@@ -378,13 +378,21 @@ double f16_to_double(uint64_t bits) {
 // not much cheaper.
 std::atomic<int> g_directed_rounding{0};
 
-uint64_t double_to_f16_exact(double d);
+[[gnu::noinline]] uint64_t double_to_f16_exact(double d);
 
-uint64_t double_to_f16(double d) {
+inline uint64_t double_to_f16(double d) {
   // A normal binary16 result under round-to-nearest-even, done on the bits:
   // keep the top 10 bits of the double's mantissa and round on the 42 below.
-  // The same answer as the frexp/nearbyint form below, which is kept for
-  // everything else -- NaN, overflow, subnormal results, other rounding modes.
+  // NaN, infinity and overflow are answered the same way the form below
+  // answers them, whatever the rounding mode. That form is kept for what
+  // remains: subnormal results, and anything under a directed mode.
+  if (g_fast_path.load(std::memory_order_relaxed)) {
+    const uint64_t b = std::bit_cast<uint64_t>(d);
+    const uint64_t mag = b & 0x7FFF'FFFF'FFFF'FFFFull;
+    if (mag > 0x7FF0'0000'0000'0000ull) return 0x7E00;             // NaN
+    if (mag >= 0x40EF'FE00'0000'0000ull)                             // >= 65520, or infinity
+      return (static_cast<uint32_t>(b >> 48) & 0x8000u) | 0x7C00;
+  }
   if (g_directed_rounding.load(std::memory_order_relaxed) == 0 &&
       g_fast_path.load(std::memory_order_relaxed)) {
     const uint64_t b = std::bit_cast<uint64_t>(d);
@@ -408,7 +416,7 @@ uint64_t double_to_f16(double d) {
   return double_to_f16_exact(d);
 }
 
-uint64_t double_to_f16_exact(double d) {
+[[gnu::noinline]] uint64_t double_to_f16_exact(double d) {
   if (std::isnan(d)) return 0x7E00;
   uint32_t sign = std::signbit(d) ? 0x8000u : 0u;
   double a = std::fabs(d);
@@ -594,6 +602,22 @@ __attribute__((target("fma"))) void fma_lanes_f64_hw(uint64_t* d, const uint64_t
     std::memcpy(&z, &c[l], 8);
     const double r = __builtin_fma(x, y, z);
     std::memcpy(&d[l], &r, 8);
+  });
+}
+// fma.f16x2 lanes on the FMA unit, with the decode and the rounding inlined:
+// the same double fma and double_to_f16 as the general path, without two
+// calls per half.
+__attribute__((target("fma"))) void f16x2_fma_lanes_hw(uint32_t* d, const uint32_t* a, const uint32_t* b,
+                                                      const uint32_t* c, Mask m, uint32_t width, int halves) {
+  for_active(m, width, [&](uint32_t l) {
+    uint64_t out = 0;
+    for (int h = 0; h < halves; ++h) {
+      const double v = __builtin_fma(kF16ToDouble[(a[l] >> (16 * h)) & 0xFFFF],
+                                     kF16ToDouble[(b[l] >> (16 * h)) & 0xFFFF],
+                                     kF16ToDouble[(c[l] >> (16 * h)) & 0xFFFF]);
+      out |= double_to_f16(v) << (16 * h);
+    }
+    d[l] = static_cast<uint32_t>(out);
   });
 }
 const bool g_hw_fma = __builtin_cpu_supports("fma");
@@ -2324,6 +2348,10 @@ class Interpreter {
         }
         d[l] = static_cast<uint32_t>(out);
       });
+#if defined(__x86_64__) && defined(__GNUC__)
+    } else if (g_hw_fma) {
+      f16x2_fma_lanes_hw(d, a.data(), b.data(), c.data(), m, W_, halves);
+#endif
     } else {
       for_active(m, W_, [&](uint32_t l) {
         uint64_t out = 0;
