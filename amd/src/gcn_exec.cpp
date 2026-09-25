@@ -267,7 +267,11 @@ struct Machine {
       case OperandKind::Exec: return w.exec;
       case OperandKind::ExecLo: return static_cast<uint32_t>(w.exec);
       case OperandKind::ExecHi: return static_cast<uint32_t>(w.exec >> 32);
-      case OperandKind::InlineFloat: return as_bits(static_cast<float>(o.fvalue));
+      // An inline float constant is the number itself: a float's bits in a
+      // 32-bit operand, a double's in a 64-bit one (s_mov_b64 s[6:7], 1.0 is
+      // the double 1.0, not a float's bits with zeroes above them).
+      case OperandKind::InlineFloat:
+        return o.width >= 2 ? as_bits(o.fvalue) : as_bits(static_cast<float>(o.fvalue));
       // An aperture's base as a pair is the address; as one register, the
       // high half of it, which is what a kernel puts above an offset.
       case OperandKind::SharedBase: return o.width >= 2 ? kSharedBase : kSharedBase >> 32;

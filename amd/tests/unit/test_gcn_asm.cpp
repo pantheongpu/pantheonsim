@@ -105,7 +105,7 @@ VTEST(scalar_bit_fields_shifts_and_comparisons_give_what_the_isa_says) {
     MemoryManager mem(16ull << 20);
     const uint64_t out = mem.alloc(28 * 4);
     const std::vector<uint32_t> r =
-        run(o, "scalar", mem, out, 26, {out, static_cast<uint32_t>(x), static_cast<uint32_t>(y)});
+        run(o, "scalar", mem, out, 28, {out, static_cast<uint32_t>(x), static_cast<uint32_t>(y)});
     const uint32_t ux = static_cast<uint32_t>(x), uy = static_cast<uint32_t>(y);
     const uint64_t pair = ux | static_cast<uint64_t>(uy) << 32;
     const int64_t field = static_cast<int64_t>(pair << (64 - 32)) >> (64 - 12);   // bits 20..31, signed
@@ -126,7 +126,8 @@ VTEST(scalar_bit_fields_shifts_and_comparisons_give_what_the_isa_says) {
         (ux & 0xFFFF) | (uy & 0xFFFF) << 16,
         ~ux, ux & ~uy,
         x != y ? ux : 7u,
-        ~ux, ~uy};
+        ~ux, ~uy,
+        0u, 0x3FF00000u};   // s_mov_b64 of 1.0: the double
     for (size_t i = 0; i < want.size(); ++i) VCHECK_EQ(r[i], want[i]);
   }
 }
