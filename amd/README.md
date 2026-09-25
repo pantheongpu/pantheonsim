@@ -139,8 +139,16 @@ last place; the scope bits on a memory instruction change nothing, since every
 access here is already visible to every wave; LDS sits at an address of
 this model's choosing, which a kernel reads from `src_shared_base` the way it
 reads the hardware's; and the counter a wave reads to time itself counts the
-instructions the dispatch has retired, which is this model's cycle, where a
-card's counts at a fixed rate.
+instructions retired by the host thread running it, which is this model's
+cycle, where a card's counts at a fixed rate.
+
+Work-groups run on every host core at once, as a GPU runs them in any order
+and concurrently; `VGPU_THREADS=1` runs them one after another, in order, which
+is what a kernel with a data race needs to give the same answer every time.
+Device memory is shared between the threads a word at a time, an atomic takes
+a lock striped by address, and a fence (`buffer_wbl2`, `buffer_inv`) is a
+fence on the host. `amd_exec_bench` (`tools/exec-bench.cpp`) says how fast a
+kernel runs on the interpreter.
 
 ## Profiling
 

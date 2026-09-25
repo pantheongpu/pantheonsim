@@ -34,17 +34,19 @@ expect() {  # expect <name> <expected> <actual>
     echo "FAIL  $1"; echo "      expected: $2"; echo "      actual:   $3"; fail=1; fi
 }
 
-# The asan and tsan builds' runtimes have to come first, as for any program
-# run against an instrumented shim (run_hipcc.sh).
-preload=""
-for lib in $(objdump -p "$build/shim/libamdhip64.so.7" 2>/dev/null | awk '/NEEDED/ && /lib(a|t)san/ {print $2}'); do
-  path=$(ldconfig -p | awk -v l="$lib" '$1 == l {print $NF; exit}')
-  preload="${preload:+$preload:}${path:-$lib}"
-done
+# rocprofv3's tool library is ROCm's, built without a sanitizer, and loading it
+# into a program run against a sanitizer-built shim ends in a crash that says
+# nothing about either (TSan cannot map its shadow around it). The sanitizer
+# builds cover this library through test_amd_rocprofiler instead. Read from the
+# shim's own linkage, statically, as tests/shim_guard.sh reads libcudart's.
+if objdump -p "$build/shim/libamdhip64.so.7" 2>/dev/null | awk '/NEEDED/ {print $2}' | grep -qE 'lib(a|t)san'; then
+  echo "SKIP: the shim is built with a sanitizer, and ROCm's rocprofv3 tool is not"
+  exit 0
+fi
 
 counters="SQ_WAVES SQ_INSTS_SMEM TA_FLAT_READ_WAVEFRONTS TA_FLAT_WRITE_WAVEFRONTS GRBM_COUNT"
 timeout 300 "$vgpu" shell -y --gpu amd/mi300x --count 1 -c \
-  "command -v rocprofv3; rocprofv3 ${preload:+--preload $preload} --pmc $counters --kernel-trace --memory-copy-trace \
+  "command -v rocprofv3; rocprofv3 --pmc $counters --kernel-trace --memory-copy-trace \
      --output-format csv -d '$work/out' -- '$exe'" </dev/null >"$work/log" 2>&1
 status=$?
 out=$(find "$work/out" -name '*_counter_collection.csv' | head -1)

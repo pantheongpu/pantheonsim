@@ -10,6 +10,7 @@
 // a program would get by running the lanes in order, which is what these
 // tests compare against.
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -123,6 +124,38 @@ VTEST(an_atomic_add_on_a_float_and_on_a_64_bit_value) {
   }
   VCHECK_EQ(download<float>(mem, pf, 1)[0], want_f);
   VCHECK_EQ(download<uint64_t>(mem, pq, 1)[0], want_q);
+}
+
+// Work-groups run on several host threads at once (VGPU_THREADS, every core by
+// default), and an atomic has to stay atomic across them: 512 groups add into
+// one float and one 64-bit value, on eight threads, and nothing is lost. The
+// float stays below 2^24, where every sum of whole numbers is exact, so the
+// order the groups land in cannot change it.
+VTEST(atomics_from_work_groups_on_many_threads_lose_nothing) {
+  const amd::CodeObject o = object();
+  const amd::Kernel* k = amd::find_kernel(o, "wide");
+  VCHECK(k != nullptr);
+  std::vector<int32_t> in(kN);
+  for (int i = 0; i < kN; ++i) in[i] = i + 1;
+  const uint64_t groups = 512;
+  for (const char* threads : {"8", "1"}) {
+    ::setenv("VGPU_THREADS", threads, 1);
+    MemoryManager mem(64ull << 20);
+    const uint64_t pin = upload(mem, in), pf = upload(mem, std::vector<float>{0.0f}),
+                   pq = upload(mem, std::vector<uint64_t>{0});
+    amd::Dispatch d;
+    d.object = &o;
+    d.kernel = k;
+    d.kernarg = kernargs(mem, *k, {pf, pq, pin, static_cast<uint64_t>(kN)});
+    d.groups[0] = static_cast<uint32_t>(groups);
+    d.group_size[0] = kN;
+    const amd::DispatchStats stats = amd::execute(d, mem);
+    const uint64_t per_group = uint64_t{kN} * (kN + 1) / 2;
+    VCHECK_EQ(download<uint64_t>(mem, pq, 1)[0], groups * per_group);
+    VCHECK_EQ(download<float>(mem, pf, 1)[0], static_cast<float>(groups * per_group));
+    VCHECK_EQ(stats.waves, groups);   // what each thread counted, added up
+  }
+  ::unsetenv("VGPU_THREADS");
 }
 
 VTEST(the_atomics_a_work_group_shares_in_lds) {
