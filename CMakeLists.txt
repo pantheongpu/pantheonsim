@@ -1163,10 +1163,11 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 900)
   add_test(NAME e2e_cutlass_hopper COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_hopper.sh)
+  # Long enough for the four compiles to run one after another on a small runner.
   set_tests_properties(e2e_cutlass_hopper PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    TIMEOUT 1500)
+    TIMEOUT 3000)
 endif()
 
 # stmatrix: where the warp's registers land in shared memory, and that it is the
