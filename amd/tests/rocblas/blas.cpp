@@ -1,13 +1,16 @@
 // AMD's rocBLAS, unmodified, on a simulated MI300X: a level-1 call, a
-// reduction, and single- and double-precision GEMMs, each checked against the
-// same arithmetic done on the host. rocBLAS brings its own kernels -- some
-// built into the library, the GEMMs from the Tensile code objects it loads
-// at run time -- so what runs is AMD's code, not ours.
+// reduction, single- and double-precision GEMMs, and gemm_ex on halves,
+// bfloat16s and bytes, each checked against the same arithmetic done on the
+// host. rocBLAS brings its own kernels -- some built into the library, the
+// GEMMs from the Tensile code objects it loads at run time -- so what runs
+// is AMD's code, not ours.
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #define HIP(x)                                                                      \
@@ -77,6 +80,115 @@ std::vector<T> filled(size_t n, int seed) {
     e = T(int(x % 2001) - 1000) / T(1000);
   }
   return v;
+}
+
+// The narrow types rocBLAS's gemm_ex takes, held as their bits: a half, a
+// bfloat16 (a float's top half), a byte, and the float and int32 they
+// accumulate into.
+struct Type {
+  const char* name;
+  rocblas_datatype type;
+  int bytes;
+};
+const Type f16{"f16", rocblas_datatype_f16_r, 2}, bf16{"bf16", rocblas_datatype_bf16_r, 2},
+    f32{"f32", rocblas_datatype_f32_r, 4}, i8{"i8", rocblas_datatype_i8_r, 1}, i32{"i32", rocblas_datatype_i32_r, 4};
+
+void store(const Type& t, void* at, double v) {
+  if (t.type == rocblas_datatype_f16_r) {
+    const _Float16 h = static_cast<_Float16>(v);
+    std::memcpy(at, &h, 2);
+  } else if (t.type == rocblas_datatype_bf16_r) {
+    const float f = static_cast<float>(v);
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    u = (u + 0x7fff + ((u >> 16) & 1)) >> 16;  // to nearest, ties to even
+    std::memcpy(at, &u, 2);
+  } else if (t.type == rocblas_datatype_f32_r) {
+    const float f = static_cast<float>(v);
+    std::memcpy(at, &f, 4);
+  } else if (t.type == rocblas_datatype_i8_r) {
+    const int8_t b = static_cast<int8_t>(v);
+    std::memcpy(at, &b, 1);
+  } else {
+    const int32_t i = static_cast<int32_t>(v);
+    std::memcpy(at, &i, 4);
+  }
+}
+
+double load(const Type& t, const void* at) {
+  if (t.type == rocblas_datatype_f16_r) {
+    _Float16 h;
+    std::memcpy(&h, at, 2);
+    return h;
+  }
+  if (t.type == rocblas_datatype_bf16_r) {
+    uint32_t u = 0;
+    std::memcpy(&u, at, 2);
+    u <<= 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  }
+  if (t.type == rocblas_datatype_f32_r) {
+    float f;
+    std::memcpy(&f, at, 4);
+    return f;
+  }
+  if (t.type == rocblas_datatype_i8_r) return *static_cast<const int8_t*>(at);
+  int32_t i;
+  std::memcpy(&i, at, 4);
+  return i;
+}
+
+// D = alpha * op(A) * op(B) + beta * C through rocblas_gemm_ex, with A and B
+// of type in, C and D of type out, summed in compute. The inputs are small
+// integers, which every type holds exactly, so each product and sum is exact
+// and only storing D in a half or bfloat16 rounds. Returns whether all of D
+// is right, or -1 when rocBLAS refuses.
+int gemm_ex(rocblas_handle handle, const Type& in, const Type& out, const Type& compute, bool ta, bool tb, int m,
+            int n, int k) {
+  const int lda = ta ? k : m, ldb = tb ? n : k;
+  const size_t na = size_t(lda) * (ta ? m : k), nb = size_t(ldb) * (tb ? k : n), nc = size_t(m) * n;
+  std::vector<double> a(na), b(nb), c(nc);
+  for (size_t i = 0; i < na; ++i) a[i] = int(i * 7 % 9) - 4;
+  for (size_t i = 0; i < nb; ++i) b[i] = int(i * 5 % 7) - 3;
+  for (size_t i = 0; i < nc; ++i) c[i] = int(i * 3 % 11) - 5;
+  std::vector<unsigned char> ha(na * in.bytes), hb(nb * in.bytes), hc(nc * out.bytes);
+  for (size_t i = 0; i < na; ++i) store(in, &ha[i * in.bytes], a[i]);
+  for (size_t i = 0; i < nb; ++i) store(in, &hb[i * in.bytes], b[i]);
+  for (size_t i = 0; i < nc; ++i) store(out, &hc[i * out.bytes], c[i]);
+  unsigned char *da = to_device(ha), *db = to_device(hb), *dc = to_device(hc), *dd = to_device(hc);
+  if (!da || !db || !dc || !dd) return -1;
+  const float falpha = 2, fbeta = -1;
+  const int32_t ialpha = 2, ibeta = -1;
+  const bool integer = compute.type == rocblas_datatype_i32_r;
+  const void* alpha = integer ? static_cast<const void*>(&ialpha) : &falpha;
+  const void* beta = integer ? static_cast<const void*>(&ibeta) : &fbeta;
+  const auto op = [](bool x) { return x ? rocblas_operation_transpose : rocblas_operation_none; };
+  const rocblas_status s =
+      rocblas_gemm_ex(handle, op(ta), op(tb), m, n, k, alpha, da, in.type, lda, db, in.type, ldb, beta, dc, out.type,
+                      m, dd, out.type, m, compute.type, rocblas_gemm_algo_standard, 0, 0);
+  const std::vector<unsigned char> got = to_host(dd, nc * out.bytes);
+  for (void* p : {da, db, dc, dd}) (void)hipFree(p);
+  if (s != rocblas_status_success) {
+    std::printf("  gemm_ex %s->%s %dx%dx%d: %s\n", in.name, out.name, m, n, k, rocblas_status_to_string(s));
+    return -1;
+  }
+  const bool narrow = out.type == rocblas_datatype_f16_r || out.type == rocblas_datatype_bf16_r;
+  const double tolerance = out.type == rocblas_datatype_bf16_r ? 1.0 / 128 : 1.0 / 1024;
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) {
+      double sum = 0;
+      for (int l = 0; l < k; ++l) sum += (ta ? a[i * lda + l] : a[l * lda + i]) * (tb ? b[l * ldb + j] : b[j * ldb + l]);
+      const double want = 2 * sum - c[j * m + i];
+      const double v = load(out, &got[(size_t(j) * m + i) * out.bytes]);
+      if (narrow ? std::fabs(v - want) > tolerance * std::fabs(want) : v != want) {
+        std::printf("  gemm_ex %s->%s %dx%dx%d%s%s: D[%d][%d] is %g, not %g\n", in.name, out.name, m, n, k,
+                    ta ? " A^T" : "", tb ? " B^T" : "", i, j, v, want);
+        return 0;
+      }
+    }
+  return 1;
 }
 
 int main() {
@@ -171,6 +283,22 @@ int main() {
         HIP(hipFree(p));
     }
   std::printf("ragged GEMMs, every transpose, float and double: %d of %d right\n", right, shapes);
+
+  // Halves, bfloat16s and bytes through gemm_ex, into their own type or a
+  // wider one: Tensile's kernels for these use the matrix instructions that
+  // take them, and d16 loads and stores that fill half a register.
+  const struct {
+    const Type &in, &out, &compute;
+  } kinds[] = {{f16, f16, f32}, {f16, f32, f32}, {bf16, bf16, f32}, {bf16, f32, f32}, {i8, i32, i32}};
+  const int mixed_sizes[][3] = {{96, 80, 64}, {1, 1, 1}, {33, 17, 5}, {64, 65, 66}, {200, 130, 70}};
+  int mixed = 0, mixed_right = 0;
+  for (const auto& kind : kinds)
+    for (const auto& sz : mixed_sizes)
+      for (int t = 0; t < 4; ++t) {
+        mixed_right += gemm_ex(handle, kind.in, kind.out, kind.compute, t & 1, t & 2, sz[0], sz[1], sz[2]) == 1;
+        ++mixed;
+      }
+  std::printf("gemm_ex, halves, bfloat16s and bytes, every transpose: %d of %d right\n", mixed_right, mixed);
   BLAS(rocblas_destroy_handle(handle));
   return 0;
 }

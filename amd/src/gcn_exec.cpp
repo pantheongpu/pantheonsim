@@ -1210,6 +1210,17 @@ struct Machine {
                       y = static_cast<int32_t>(lane_src(w, in.src[1], lane));
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(op == "v_min_i32_e32"_op ? std::min(x, y) : std::max(x, y)));
       });
+    } else if (op == "v_dot4_i32_i8"_op) {
+      // Four signed bytes of each multiplied pairwise and added to the third
+      // source; clamped, the sum saturates rather than wraps.
+      each([&](uint32_t lane) {
+        const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
+        int64_t sum = static_cast<int32_t>(lane_src(w, in.src[2], lane));
+        for (uint32_t k = 0; k < 4; ++k)
+          sum += static_cast<int64_t>(static_cast<int8_t>(a >> (8 * k))) * static_cast<int8_t>(b >> (8 * k));
+        if (in.clamp) sum = std::clamp<int64_t>(sum, INT32_MIN, INT32_MAX);
+        write_lane(w, in.dst[0], lane, static_cast<uint32_t>(sum));
+      });
     } else if (op == "v_min3_u32"_op) {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
@@ -1910,6 +1921,16 @@ struct Machine {
         const uint32_t v = lane_src(w, in.src[1], lane);
         const uint64_t bytes = op == "ds_write_b8"_op ? 1 : 2;
         std::memcpy(at(off, bytes), &v, bytes);
+      } else if (Half h; half_access(std::string_view(in.name).substr(3), &h)) {
+        uint8_t* p = at(off, h.bytes);
+        if (h.store) {
+          const uint32_t v = half_store(lane_src(w, in.src[1], lane), h);
+          std::memcpy(p, &v, h.bytes);
+        } else {
+          uint32_t raw = 0;
+          std::memcpy(&raw, p, h.bytes);
+          write_lane(w, in.dst[0], lane, half_load(raw, h));
+        }
       } else if (op == "ds_read_u8"_op || op == "ds_read_i8"_op || op == "ds_read_u16"_op) {
         const uint64_t bytes = op == "ds_read_u16"_op ? 2 : 1;
         uint32_t v = 0;
@@ -2009,6 +2030,34 @@ struct Machine {
     else return false;
     return true;
   }
+
+  // The half-register forms (_d16): a byte or a short loaded into one half of
+  // a register, or one half stored. A load clears the other half: with SRAM
+  // ECC on, as it is on every card here, the whole register is written
+  // (LLVM keeps the other half only where ECC is off). Tensile's tail loops
+  // count on it, loading two halves into two registers and or-ing them. Read from the name
+  // past its segment ("load_ubyte_d16_hi", "read_u16_d16", "write_b8_d16_hi").
+  struct Half {
+    uint32_t bytes = 2;
+    bool sign = false, hi = false, store = false;
+  };
+  static bool half_access(std::string_view body, Half* h) {
+    if (body.find("_d16") == std::string_view::npos) return false;
+    h->hi = body.size() >= 3 && body.substr(body.size() - 3) == "_hi";
+    h->store = body.rfind("store", 0) == 0 || body.rfind("write", 0) == 0;
+    h->bytes = body.find("short") != std::string_view::npos || body.find("16_d16") != std::string_view::npos ? 2 : 1;
+    h->sign = body.find("sbyte") != std::string_view::npos || body.find("i8") != std::string_view::npos;
+    return true;
+  }
+  // What a load puts in its half: the byte widened to 16 bits, with its sign
+  // where the name says so, or the short.
+  static uint32_t half_load(uint64_t raw, const Half& h) {
+    uint32_t v = static_cast<uint32_t>(raw) & (h.bytes == 1 ? 0xFFu : 0xFFFFu);
+    if (h.bytes == 1 && h.sign) v = static_cast<uint16_t>(static_cast<int16_t>(static_cast<int8_t>(v)));
+    return h.hi ? v << 16 : v;
+  }
+  // And what a store stores: the half it names.
+  static uint32_t half_store(uint32_t v, const Half& h) { return h.hi ? v >> 16 : v; }
 
   // What a narrow load puts in the register: the bytes it read, with the sign
   // carried into the rest where the name says so.
@@ -2165,7 +2214,13 @@ struct Machine {
       const auto fits = [&](uint64_t at, uint64_t bytes) {
         return stride ? index < records : soffset + at + bytes <= records;
       };
-      if (part) {
+      if (Half h; half_access(body, &h)) {
+        if (h.store) {
+          if (fits(offset, h.bytes)) store(addr, h.bytes, half_store(lane_src(w, data, lane), h));
+        } else {
+          write_lane(w, data, lane, half_load(fits(offset, h.bytes) ? load(addr, h.bytes) : 0, h));
+        }
+      } else if (part) {
         if (body.rfind("store", 0) == 0) {
           if (fits(offset, n.bytes)) store(addr, n.bytes, lane_src(w, data, lane));
         } else {
@@ -2217,19 +2272,20 @@ struct Machine {
     // A flat access that reaches only the device's memory comes here too, so
     // what it does is read from its name past the segment ("load_dwordx4").
     const std::string_view body = std::string_view(op).substr(op.find('_') + 1);
-    enum class Kind { Narrow, Load, Store, StoreHi16, AddX2, AddF64, CmpSwapX2, CmpSwap, Atomic } kind;
+    enum class Kind { Narrow, HalfReg, Load, Store, StoreHi16, AddX2, AddF64, CmpSwapX2, CmpSwap, Atomic } kind;
+    Half half;
     enum class Rmw { Add, Sub, And, Or, Xor, Swap, AddF32 } rmw = Rmw::Add;
     Narrow n;
     bool narrow_store = false;
     if (narrow(op, &n)) {
       kind = Kind::Narrow;
       narrow_store = body.rfind("store", 0) == 0;
+    } else if (half_access(body, &half)) {
+      kind = Kind::HalfReg;
     } else if (body.rfind("load_dword", 0) == 0) {
       kind = Kind::Load;
     } else if (body.rfind("store_dword", 0) == 0) {
       kind = Kind::Store;
-    } else if (body == "store_short_d16_hi") {
-      kind = Kind::StoreHi16;
     } else if (body == "atomic_add_x2") {
       kind = Kind::AddX2;
     } else if (body == "atomic_add_f64") {
@@ -2274,6 +2330,10 @@ struct Machine {
           break;
         case Kind::StoreHi16:
           store(addr, 2, lane_src(w, in.src[1], lane) >> 16);
+          break;
+        case Kind::HalfReg:
+          if (half.store) store(addr, half.bytes, half_store(lane_src(w, in.src[1], lane), half));
+          else write_lane(w, in.dst[0], lane, half_load(load(addr, half.bytes), half));
           break;
         case Kind::AddF64: {
           const auto guard = atomic_guard(addr);
@@ -2431,18 +2491,32 @@ struct Machine {
   // them off is not something this can check.
   struct MatrixShape {
     uint32_t m, n, k, blocks;
-    char in, out;   // 'h' a half, 'f' a float, 'd' a double
+    char in, out;   // 'h' a half, 'b' a bfloat16, 'c' a signed byte, 'f' a float, 'd' a double, 'i' an int32
   };
   static const MatrixShape* matrix_shape(const OpName& op) {
     static const MatrixShape f16_16x16x16{16, 16, 16, 1, 'h', 'f'}, f32_16x16x4{16, 16, 4, 1, 'f', 'f'},
         f32_32x32x2{32, 32, 2, 1, 'f', 'f'}, f32_16x16x1_4b{16, 16, 1, 4, 'f', 'f'},
-        f32_4x4x1_16b{4, 4, 1, 16, 'f', 'f'}, f64_16x16x4{16, 16, 4, 1, 'd', 'd'};
+        f32_4x4x1_16b{4, 4, 1, 16, 'f', 'f'}, f64_16x16x4{16, 16, 4, 1, 'd', 'd'},
+        bf16_16x16x16{16, 16, 16, 1, 'b', 'f'}, f16_32x32x8{32, 32, 8, 1, 'h', 'f'},
+        bf16_32x32x8{32, 32, 8, 1, 'b', 'f'}, i8_32x32x16{32, 32, 16, 1, 'c', 'i'},
+        f16_4x4x4_16b{4, 4, 4, 16, 'h', 'f'}, bf16_4x4x4_16b{4, 4, 4, 16, 'b', 'f'},
+        f16_16x16x4_4b{16, 16, 4, 4, 'h', 'f'}, bf16_16x16x4_4b{16, 16, 4, 4, 'b', 'f'},
+        i8_16x16x32{16, 16, 32, 1, 'c', 'i'};
     if (op == "v_mfma_f32_16x16x16_f16"_op) return &f16_16x16x16;
     if (op == "v_mfma_f32_16x16x4_f32"_op) return &f32_16x16x4;
     if (op == "v_mfma_f32_32x32x2_f32"_op) return &f32_32x32x2;
     if (op == "v_mfma_f32_16x16x1_4b_f32"_op) return &f32_16x16x1_4b;
     if (op == "v_mfma_f32_4x4x1_16b_f32"_op) return &f32_4x4x1_16b;
     if (op == "v_mfma_f64_16x16x4_f64"_op) return &f64_16x16x4;
+    if (op == "v_mfma_f32_16x16x16_bf16"_op) return &bf16_16x16x16;
+    if (op == "v_mfma_f32_32x32x8_f16"_op) return &f16_32x32x8;
+    if (op == "v_mfma_f32_32x32x8_bf16"_op) return &bf16_32x32x8;
+    if (op == "v_mfma_i32_32x32x16_i8"_op) return &i8_32x32x16;
+    if (op == "v_mfma_i32_16x16x32_i8"_op) return &i8_16x16x32;
+    if (op == "v_mfma_f32_4x4x4_16b_f16"_op) return &f16_4x4x4_16b;
+    if (op == "v_mfma_f32_4x4x4_16b_bf16"_op) return &bf16_4x4x4_16b;
+    if (op == "v_mfma_f32_16x16x4_4b_f16"_op) return &f16_16x16x4_4b;
+    if (op == "v_mfma_f32_16x16x4_4b_bf16"_op) return &bf16_16x16x4_4b;
     return nullptr;
   }
   // Which block, and which row of it, output value r of lane l is: a 16- or
@@ -2480,9 +2554,13 @@ struct Machine {
       if (o.kind == OperandKind::InlineFloat) return as_bits(static_cast<float>(o.fvalue));
       return static_cast<uint32_t>(scalar(w, o));
     };
-    // Value e of a source's run in one lane: a half (two to a register), a
-    // float, or a double (a register pair).
+    // Value e of a source's run in one lane: a half or a bfloat16 (two to a
+    // register), a signed byte (four), a float or an int32, or a double (a
+    // register pair). A bfloat16 is a float's top half, so it widens exactly.
     const auto value = [&](const Operand& o, char type, uint32_t e, uint32_t lane) -> double {
+      if (type == 'b') return static_cast<double>(as_float((reg(o, e / 2, lane) >> (16 * (e % 2))) << 16));
+      if (type == 'c') return static_cast<double>(static_cast<int8_t>(reg(o, e / 4, lane) >> (8 * (e % 4))));
+      if (type == 'i') return static_cast<double>(static_cast<int32_t>(reg(o, e, lane)));
       if (type == 'h') {
         _Float16 h;
         const uint16_t bits = static_cast<uint16_t>(reg(o, e / 2, lane) >> (16 * (e % 2)));
@@ -2516,6 +2594,13 @@ struct Machine {
         uint32_t ob = 0, i = 0;
         out_place(s, lane, r, &ob, &i);
         const uint32_t j = lane % s.n;
+        if (s.out == 'i') {
+          // Integers are summed exactly, and wrap as the hardware's do.
+          int64_t isum = static_cast<int64_t>(C(ob, i, j));
+          for (uint32_t k = 0; k < s.k; ++k) isum += static_cast<int64_t>(A(ob, i, k)) * static_cast<int64_t>(B(ob, k, j));
+          set_word(w, in.dst[0], r, lane, static_cast<uint32_t>(isum));
+          continue;
+        }
         double sum = C(ob, i, j);
         for (uint32_t k = 0; k < s.k; ++k) {
           if (s.out == 'd') sum = std::fma(A(ob, i, k), B(ob, k, j), sum);

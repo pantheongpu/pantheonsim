@@ -162,9 +162,9 @@ VTEST(buffers_lds_and_private_memory_are_reached_as_a_card_reaches_them) {
   const amd::CodeObject o = object("asm_memory");
   MemoryManager mem(16ull << 20);
   const std::vector<uint32_t> init = {100, 101, 102, 103, 104, 105, 106, 107};
-  const uint64_t buf = mem.alloc(8 * 4), out = mem.alloc(15 * 4);
+  const uint64_t buf = mem.alloc(8 * 4), out = mem.alloc(19 * 4);
   mem.write(buf, init.data(), 8 * 4);
-  const std::vector<uint32_t> r = run(o, "memory", mem, out, 15, {buf, out});
+  const std::vector<uint32_t> r = run(o, "memory", mem, out, 19, {buf, out});
   VCHECK_EQ(r[0], 630u);   // lane 0 is sent lane 63's ten times 63
   VCHECK_EQ(r[1], 101u);   // in range
   VCHECK_EQ(r[2], 0u);     // past the end
@@ -180,6 +180,10 @@ VTEST(buffers_lds_and_private_memory_are_reached_as_a_card_reaches_them) {
   VCHECK_EQ(r[11], 0u);    // far past LDS: zero, not what the register held
   VCHECK_EQ(r[12], 0x1234u);   // private memory, by offset alone
   VCHECK_EQ(r[13], 0x1234u);   // and from a scalar register's offset
+  VCHECK_EQ(r[15], 101u);        // a short into the low half, the high one cleared
+  VCHECK_EQ(r[16], 103u << 16);  // one into the high half, the low one cleared
+  VCHECK_EQ(r[17], 0x11u << 16); // and from LDS
+  VCHECK_EQ(r[18], 0u);          // past the end: all of it zero
   std::vector<uint32_t> after(8);
   mem.read(buf, after.data(), 8 * 4);
   VCHECK_EQ(after[2], 0x77u);   // the store in range landed

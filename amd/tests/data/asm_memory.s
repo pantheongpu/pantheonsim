@@ -5,11 +5,11 @@
 // to clear registers); a scalar load whose offset is a register; a lane
 // sending its value to another; and a work-item's private memory through
 // its flat aperture, read back as scratch -- once by offset alone, once
-// from a scalar register's offset. Built for gfx942 by build.sh, with
+// from a scalar register's offset; and loads into half a register. Built for gfx942 by build.sh, with
 // clang's assembler.
 //
 // memory(int* buf, int* out): buf holds eight words, of which the resource
-// covers the first four; out gets 15 words, in the order the test lists.
+// covers the first four; out gets 19 words, in the order the test lists.
   .amdgcn_target "amdgcn-amd-amdhsa--gfx942"
   .text
   .globl memory
@@ -101,6 +101,22 @@ memory:
   s_waitcnt vmcnt(0)
   global_store_dword v10, v27, s[6:7] offset:48
   global_store_dword v10, v28, s[6:7] offset:52
+  // Half-register loads, each over a register that held 0xdeadbeef: the
+  // half they load, and the other cleared, as on a card with SRAM ECC.
+  v_mov_b32_e32 v5, 0xdeadbeef
+  v_mov_b32_e32 v6, 0xdeadbeef
+  v_mov_b32_e32 v8, 0xdeadbeef
+  v_mov_b32_e32 v9, 0xdeadbeef
+  v_mov_b32_e32 v4, 4
+  buffer_load_short_d16 v5, v4, s[8:11], 0 offen
+  buffer_load_short_d16_hi v6, v4, s[8:11], 0 offen offset:8
+  buffer_load_short_d16 v9, v4, s[8:11], 0 offen offset:12   // past the end
+  ds_read_u16_d16_hi v8, v13
+  s_waitcnt vmcnt(0) lgkmcnt(0)
+  global_store_dword v10, v5, s[6:7] offset:60
+  global_store_dword v10, v6, s[6:7] offset:64
+  global_store_dword v10, v8, s[6:7] offset:68
+  global_store_dword v10, v9, s[6:7] offset:72
   s_endpgm
 .Lmemory_end:
   .size memory, .Lmemory_end-memory

@@ -56,4 +56,6 @@ expect "dgemm, through its double ones" "dgemm 96x80x64, A transposed: 7680 of 7
   "$(grep -o '^dgemm .*' <<< "$out")"
 expect "ragged GEMMs, where the kernels count on a buffer's bounds at the edges" \
   "ragged GEMMs, every transpose, float and double: 48 of 48 right" "$(grep -o '^ragged GEMMs.*' <<< "$out")"
+expect "gemm_ex of halves, bfloat16s and bytes, through their matrix instructions and half-register loads" \
+  "gemm_ex, halves, bfloat16s and bytes, every transpose: 100 of 100 right" "$(grep -o '^gemm_ex, .*' <<< "$out")"
 exit $fail

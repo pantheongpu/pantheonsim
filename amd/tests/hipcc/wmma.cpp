@@ -39,3 +39,29 @@ __global__ void gemm_f32_32x32x8(const float* a, const float* b, const float* c,
 __global__ void gemm_f64_16x16x16(const double* a, const double* b, const double* c, double* d) {
   gemm_of<double, 16, 16>(a, b, c, d);
 }
+
+// Halves, bfloat16s and bytes into float and int32 accumulators: the matrix
+// instructions the half, bfloat16 and int8 GEMMs use.
+template <typename In, typename Acc, int M, int K>
+__device__ void gemm_mixed(const In* a, const In* b, const Acc* c, Acc* d) {
+  fragment<matrix_a, M, M, K, In, row_major> fa;
+  fragment<matrix_b, M, M, K, In, col_major> fb;
+  fragment<accumulator, M, M, K, Acc> fc;
+  load_matrix_sync(fa, a, K);
+  load_matrix_sync(fb, b, K);
+  load_matrix_sync(fc, c, M, mem_row_major);
+  mma_sync(fc, fa, fb, fc);
+  store_matrix_sync(d, fc, M, mem_row_major);
+}
+__global__ void gemm_bf16_16x16x16(const bfloat16_t* a, const bfloat16_t* b, const float* c, float* d) {
+  gemm_mixed<bfloat16_t, float, 16, 16>(a, b, c, d);
+}
+__global__ void gemm_bf16_32x32x16(const bfloat16_t* a, const bfloat16_t* b, const float* c, float* d) {
+  gemm_mixed<bfloat16_t, float, 32, 16>(a, b, c, d);
+}
+__global__ void gemm_f16_32x32x16(const float16_t* a, const float16_t* b, const float* c, float* d) {
+  gemm_mixed<float16_t, float, 32, 16>(a, b, c, d);
+}
+__global__ void gemm_i8_32x32x16(const int8_t* a, const int8_t* b, const int32_t* c, int32_t* d) {
+  gemm_mixed<int8_t, int32_t, 32, 16>(a, b, c, d);
+}
