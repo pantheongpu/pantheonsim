@@ -142,6 +142,42 @@ reads the hardware's; and the counter a wave reads to time itself counts the
 instructions the dispatch has retired, which is this model's cycle, where a
 card's counts at a fixed rate.
 
+## The pantheon workloads
+
+`amd/tools/run-pantheon-workloads.sh [pantheongpu-repo]` builds the pantheon
+GPU workloads for gfx942 exactly as pantheon's Makefile does for HIP -- hipcc,
+the same flags, the sources unmodified -- and runs each on a simulated MI300X
+with `--verify`, so a pass means the workload checked its own results. It
+needs ROCm's hipcc (set `VGPU_ROCM_PATH`). The workloads' own knobs are set to
+a CPU-appropriate intensity, as the NVIDIA runner sets them; that runs the
+same code over a smaller working set.
+
+With ROCm 7.1 every workload that builds for gfx942 passes, and every
+workload's device code decodes as ROCm's llvm-objdump prints it. Three do not
+run, for reasons a card would share:
+
+- `fused_attention` does not build for AMD: it passes a 32-bit mask to
+  `__shfl_xor_sync`, which HIP requires to be 64-bit on 64-lane waves (ROCm
+  7), and which ROCm 6.4 does not declare without
+  `-DHIP_ENABLE_WARP_SYNC_BUILTINS`.
+- `rt_virus` and `media_enc_virus` skip themselves: CDNA has no ray-tracing
+  units, and the encoder workload is NVIDIA's.
+
+`mma_virus` builds its matrix path only where rocWMMA's headers are installed
+(`rocwmma-dev`, part of a full ROCm install); without them it builds a stand-in
+and skips itself, as it would on a card.
+
+What `--verify` proves is worth knowing. The memory workloads check patterns
+the host decided; most of the rest check that a kernel gives the same answer
+every time, or in every thread, which is what catches a failing card. A model
+that was consistently wrong could pass those, which is why each instruction is
+also checked on its own, against the assembler and against C. Every workload
+that verifies was also run with `--inject_error`, with knobs large enough for
+the fault to fire, and each one caught it. A workload whose check reports a
+fault with device-side `printf` ends with a refused launch rather than its own
+"Verification: FAIL" line, since `printf` needs the hostcall path that is not
+modelled yet.
+
 | Folder | What |
 | --- | --- |
 | `profiles/` | MI300X, MI325X and MI350X. MI325X was read from a physical card with `tools/rocminfo-to-profile.py`; the others are placeholders, and each file's header says which |
