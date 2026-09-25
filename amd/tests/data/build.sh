@@ -36,3 +36,26 @@ if [[ -x "$objdump" ]]; then
 else
   echo "no llvm-objdump beside $clang: keeping the listing as it is"
 fi
+
+# Offload bundles as ROCm's libraries carry device code: one code object for
+# each of three targets, plain, compressed with zstd by clang's bundler, and
+# compressed with zlib in the format clang wrote before (version 2: sizes and
+# a hash ahead of the stream). And two kernels linked into one object, as
+# Tensile links its libraries, each keeping its own metadata note.
+bundler=$(dirname "$(readlink -f "$(command -v "$clang")")")/clang-offload-bundler
+lld=$(dirname "$(readlink -f "$(command -v "$clang")")")/ld.lld
+if [[ -x "$bundler" && -x "$lld" ]]; then
+  targets=host-x86_64-unknown-linux-gnu,hipv4-amdgcn-amd-amdhsa--gfx90a
+  targets=$targets,hipv4-amdgcn-amd-amdhsa--gfx942:xnack+,hipv4-amdgcn-amd-amdhsa--gfx942:xnack-
+  inputs=(--input=/dev/null --input=asm_sopk.gfx942.o --input=asm_scalar.gfx942.o --input=asm_vector.gfx942.o)
+  "$bundler" --type=o --targets=$targets "${inputs[@]}" --output=bundle.bin
+  "$bundler" --type=o --targets=$targets "${inputs[@]}" --output=bundle_zstd.bin --compress
+  python3 -c '
+import hashlib, struct, zlib
+raw = open("bundle.bin", "rb").read()
+packed = zlib.compress(raw, 9)
+head = b"CCOB" + struct.pack("<HHII", 2, 0, 24 + len(packed), len(raw)) + hashlib.md5(raw).digest()[:8]
+open("bundle_zlib.bin", "wb").write(head + packed)'
+  "$lld" -shared asm_scalar.gfx942.o asm_vector.gfx942.o -o linked.gfx942.so
+  echo "wrote the bundles and linked.gfx942.so"
+fi

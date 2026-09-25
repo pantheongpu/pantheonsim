@@ -67,8 +67,12 @@ std::vector<std::string> lines(const std::string& text) {
 }  // namespace
 
 // One object against its listing, instruction by instruction.
-void check_against_assembler(const std::string& object_name, const std::string& listing_name) {
-  const amd::CodeObject o = amd::load_code_object(read(object_name), object_name);
+void check_against_assembler(const std::string& fixture, const std::string& listing_name) {
+  // Named in what it reports as the object it is: the fixture, or the one
+  // VGPU_GCN_OBJECT points at.
+  const char* over = std::getenv("VGPU_GCN_OBJECT");
+  const std::string object_name = over && *over ? std::string(over) : fixture;
+  const amd::CodeObject o = amd::load_code_object(read(fixture), object_name);
   const std::vector<std::string> mine = decoded(o), theirs = lines(read(listing_name));
   if (theirs.size() < 20) throw vtest::Failure(listing_name + " has too few instructions to be the listing");
   if (mine.size() != theirs.size())

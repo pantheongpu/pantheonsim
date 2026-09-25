@@ -133,6 +133,44 @@ int main() {
     std::printf("dgemm %dx%dx%d, A transposed: %d of %d elements right\n", m, nn, k,
                 close(got, gemm_on_host(true, m, nn, k, al, a, k, b, k, be, c, m), 1e-12), m * nn);
   }
+  // GEMMs of ragged sizes, every transpose of A and B: where Tensile's
+  // kernels lean on a buffer's bounds to read zeroes past a matrix's edge.
+  int shapes = 0, right = 0;
+  const int sizes[][3] = {{1, 1, 1}, {7, 3, 1}, {33, 17, 5}, {130, 1, 33}, {64, 65, 66}, {200, 130, 70}};
+  for (const auto& sz : sizes)
+    for (int t = 0; t < 4; ++t) {
+      const int m = sz[0], n2 = sz[1], k2 = sz[2];
+      const bool ta = t & 1, tb = t & 2;
+      const int lda = ta ? k2 : m, ldb = tb ? n2 : k2;
+      const auto a = filled<double>(size_t(lda) * (ta ? m : k2), 10 + t), b = filled<double>(size_t(ldb) * (tb ? k2 : n2), 20 + t),
+                 c = filled<double>(size_t(m) * n2, 30 + t);
+      double *da = to_device(a), *db = to_device(b), *dc = to_device(c);
+      const auto fa = std::vector<float>(a.begin(), a.end()), fb = std::vector<float>(b.begin(), b.end()),
+                 fc = std::vector<float>(c.begin(), c.end());
+      float *sa = to_device(fa), *sb = to_device(fb), *sc = to_device(fc);
+      if (!da || !db || !dc || !sa || !sb || !sc) return 1;
+      const double al = 1.25, be = -0.5;
+      const float fal = 1.25f, fbe = -0.5f;
+      const auto op = [](bool x) { return x ? rocblas_operation_transpose : rocblas_operation_none; };
+      BLAS(rocblas_dgemm(handle, op(ta), op(tb), m, n2, k2, &al, da, lda, db, ldb, &be, dc, m));
+      BLAS(rocblas_sgemm(handle, op(ta), op(tb), m, n2, k2, &fal, sa, lda, sb, ldb, &fbe, sc, m));
+      std::vector<double> want(size_t(m) * n2);
+      for (int j = 0; j < n2; ++j)
+        for (int i = 0; i < m; ++i) {
+          double sum = 0;
+          for (int l = 0; l < k2; ++l)
+            sum += (ta ? a[i * lda + l] : a[l * lda + i]) * (tb ? b[l * ldb + j] : b[j * ldb + l]);
+          want[j * m + i] = al * sum + be * c[j * m + i];
+        }
+      const int n_elems = m * n2;
+      right += close(to_host(dc, n_elems), want, 1e-12) == n_elems;
+      right += close(to_host(sc, n_elems), want, 1e-4) == n_elems;
+      shapes += 2;
+      for (void* p : {static_cast<void*>(da), static_cast<void*>(db), static_cast<void*>(dc), static_cast<void*>(sa),
+                      static_cast<void*>(sb), static_cast<void*>(sc)})
+        HIP(hipFree(p));
+    }
+  std::printf("ragged GEMMs, every transpose, float and double: %d of %d right\n", right, shapes);
   BLAS(rocblas_destroy_handle(handle));
   return 0;
 }
