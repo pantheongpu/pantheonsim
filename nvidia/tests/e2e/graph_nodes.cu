@@ -184,15 +184,17 @@ int main() {
 
   // ---- new parameters for one node, without rebuilding ---------------------
   //
-  // The fill writes 2 into every byte instead of zero, set on the instantiated
-  // graph. The kernel then adds one, so each int is 0x02020202 + 1.
+  // The fill writes 2 instead of zero, set on the instantiated graph. Its
+  // elements are 4 bytes, so 2 goes into every int -- not into every byte,
+  // which is what this test used to expect, wrongly -- and the kernel then adds
+  // one, so each int is 3.
   cudaMemsetParams two = mp;
   two.value = 2;
   CK(cudaGraphExecMemsetNodeSetParams(exec, fill, &two));
   CK(cudaGraphLaunch(exec, 0));
   CK(cudaDeviceSynchronize());
   CK(cudaMemcpy(host, buf, sizeof host, cudaMemcpyDeviceToHost));
-  CHECK(host[0] == 0x02020202 + 1);
+  CHECK(host[0] == 3 && host[kInts - 1] == 3);
   // A 2D fill is refused by this call as invalid, which is how it documents it.
   cudaMemsetParams two_d = two;
   two_d.height = 2;

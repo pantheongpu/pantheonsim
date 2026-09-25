@@ -89,6 +89,42 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   kernel's code. Stack and printf-buffer sizes are recorded and reported but
   bound nothing here. e2e_device_limits allocates up to a raised limit and one
   past it.
+- A capture records everything a stream is given. Several entry points ran their
+  work the moment they were called on a capturing stream, so the graph came back
+  without it and every replay silently left it out: 2D copies and fills, copies
+  to and from a symbol, peer copies, host functions (which ran once, at capture),
+  graph launches, and stream-ordered allocation (a captured malloc/free pair
+  freed the memory before the graph ever ran). Each is now what CUDA documents
+  it becomes -- a copy or fill node with its shape, a host node, a child-graph
+  node, an allocation or free node the graph owns -- and what CUDA does not allow
+  under capture (a stream callback, synchronizing or querying the capturing
+  stream) invalidates the capture with the error it documents. A captured
+  cooperative or clustered launch keeps that on replay; it ran as a plain launch
+  before, and grid.sync() trapped.
+  Capture works across streams: a stream that waits on an event recorded in a
+  capture joins it with its own position, so a fork and a join come back as a
+  graph with two branches, and cudaStreamEndCapture refuses a fork left
+  unjoined. An event recorded in a capture stands for work not yet run and
+  cannot be queried (cudaErrorCapturedEvent); cudaEventRecordWithFlags with
+  cudaEventRecordExternal is a record node that times the graph. The boundary
+  rules are CUDA's, each with its documented error: a wait on an event from
+  outside (isolation), one that would merge two captures, forking the legacy
+  stream, capturing on it, ending a capture from a stream that only joined.
+  Graph fill nodes with 2- and 4-byte elements wrote the value's low byte into
+  every byte -- a 4-byte fill of 2 gave 0x02020202 -- and now write the value
+  into every element, which a test of mine had asserted the wrong way round.
+  Copy and fill nodes carry their full shape, so 2D fills and pitched 3D copies
+  are nodes like any other, and read back exactly as they were given.
+  Not yet: capture modes. Global and thread-local capture prohibit "potentially
+  unsafe" calls (cudaMalloc, a synchronous copy) anywhere in the process; every
+  capture here behaves as relaxed.
+  Two checks guard these classes: lint_capture_coverage fails when an exported
+  function that takes a stream neither consults capture nor says why it need
+  not, and lint_shim_symbols fails when a shim library has a reference nothing
+  can resolve -- which one of these changes had at first, declared in an
+  anonymous namespace and defined outside it, and which only the Python-driven
+  tests noticed. e2e_graph_shapes and
+  e2e_capture_streams cover the behaviour.
 - Splicing into a stream capture, which is what a library does when the stream
   it was handed turns out to be capturing: cudaStreamGetCaptureInfo reports the
   capture's own graph, the nodes the next operation will depend on, and an id

@@ -755,13 +755,58 @@ VGPU_EXPORT cudaError_t cudaMemcpyFromSymbol(void* dst, const void* symbol, size
   });
 }
 
+// The capture hooks, defined with the graph machinery; declared here because
+// the first async copies that use them come before it.
+bool capture_active(cudaStream_t stream);
+bool vgpu_record_copy_if_capturing(const cudaMemcpy3DParms& p, cudaStream_t stream,
+                                   cudaError_t* rc);
+bool vgpu_record_fill_if_capturing(const cudaMemsetParams& p, cudaStream_t stream,
+                                   cudaError_t* rc);
+namespace {
+cudaMemcpy3DParms linear_copy(void* dst, const void* src, size_t count, cudaMemcpyKind kind);
+}  // namespace
+
+// On a capturing stream a symbol copy is a copy node to or from the symbol's
+// address, as CUDA records it. Run now instead, it would be missing from every
+// replay of the graph -- which is what these did.
+namespace {
+cudaError_t symbol_span(const void* symbol, size_t count, size_t offset, char** at) {
+  return guard("cudaMemcpyToSymbolAsync", [&](State& s) -> cudaError_t {
+    uint64_t addr = 0;
+    size_t size = 0;
+    const cudaError_t e = symbol_address(s, symbol, &addr, &size);
+    if (e != cudaSuccess) return e;
+    if (offset > size || count > size - offset) return cudaErrorInvalidValue;
+    *at = reinterpret_cast<char*>(addr) + offset;
+    return cudaSuccess;
+  });
+}
+}  // namespace
+
 VGPU_EXPORT cudaError_t cudaMemcpyToSymbolAsync(const void* symbol, const void* src, size_t count,
-                                                size_t offset, cudaMemcpyKind kind, cudaStream_t) {
+                                                size_t offset, cudaMemcpyKind kind,
+                                                cudaStream_t stream) {
+  if (capture_active(stream)) {
+    char* at = nullptr;
+    if (const cudaError_t e = symbol_span(symbol, count, offset, &at); e != cudaSuccess) return e;
+    cudaError_t rc = cudaSuccess;
+    if (count == 0) return cudaSuccess;
+    vgpu_record_copy_if_capturing(linear_copy(at, src, count, kind), stream, &rc);
+    return rc;
+  }
   return cudaMemcpyToSymbol(symbol, src, count, offset, kind);
 }
 VGPU_EXPORT cudaError_t cudaMemcpyFromSymbolAsync(void* dst, const void* symbol, size_t count,
                                                   size_t offset, cudaMemcpyKind kind,
-                                                  cudaStream_t) {
+                                                  cudaStream_t stream) {
+  if (capture_active(stream)) {
+    char* at = nullptr;
+    if (const cudaError_t e = symbol_span(symbol, count, offset, &at); e != cudaSuccess) return e;
+    cudaError_t rc = cudaSuccess;
+    if (count == 0) return cudaSuccess;
+    vgpu_record_copy_if_capturing(linear_copy(dst, at, count, kind), stream, &rc);
+    return rc;
+  }
   return cudaMemcpyFromSymbol(dst, symbol, count, offset, kind);
 }
 
@@ -838,10 +883,27 @@ void vgpu_invalidate_capture(const char* what);
 bool vgpu_record_memcpy_if_capturing(void* dst, const void* src, size_t bytes,
                                      cudaMemcpyKind kind, cudaStream_t stream);
 bool vgpu_record_memset_if_capturing(void* dst, int value, size_t bytes, cudaStream_t stream);
+// Whether a stream is capturing right now.
+bool capture_active(cudaStream_t stream);
+// Stream-ordered allocation, host functions and refused operations on a
+// capturing stream; each returns false when the stream is not capturing.
+bool capture_malloc(State& s, cudaStream_t stream, size_t size, int device, void** ptr,
+                    cudaError_t* rc);
+bool capture_free(cudaStream_t stream, void* ptr, cudaError_t* rc);
+bool capture_host_fn(cudaStream_t stream, cudaHostFn_t fn, void* user);
+bool capture_refuse(cudaStream_t stream, const char* what);
+// The same for copies and fills with a shape (2D, 3D, pitched). When one returns
+// true the operation belongs to the capture, and `*rc` is the call's result.
+bool vgpu_record_copy_if_capturing(const cudaMemcpy3DParms& p, cudaStream_t stream,
+                                   cudaError_t* rc);
+bool vgpu_record_fill_if_capturing(const cudaMemsetParams& p, cudaStream_t stream,
+                                   cudaError_t* rc);
 
 bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, void** args,
                                      size_t sharedMem, cudaStream_t stream,
-                                     const std::vector<uint32_t>& param_sizes);
+                                     const std::vector<uint32_t>& param_sizes,
+                                     bool cooperative = false,
+                                     std::array<uint32_t, 3> cluster = {0, 0, 0});
 bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()> op);
 // Discards a capture in progress on a stream that is being destroyed.
 void vgpu_drop_capture(cudaStream_t stream);
@@ -903,7 +965,8 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     std::vector<uint32_t> param_sizes(fn->params.size());
     for (size_t i = 0; i < fn->params.size(); ++i) param_sizes[i] = fn->params[i].size;
     // Under stream capture the launch is recorded for later replay, not run.
-    if (vgpu_record_launch_if_capturing(func, gridDim, blockDim, args, sharedMem, stream, param_sizes))
+    if (vgpu_record_launch_if_capturing(func, gridDim, blockDim, args, sharedMem, stream, param_sizes,
+                                        cooperative, cluster))
       return cudaSuccess;
 
     if (vgpu::faults::should_fail(vgpu::faults::Op::Launch)) {
@@ -1571,7 +1634,21 @@ VGPU_EXPORT cudaError_t cudaMemcpy2D(void* dst, size_t dpitch, const void* src, 
 }
 VGPU_EXPORT cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t spitch,
                                           size_t width, size_t height, cudaMemcpyKind kind,
-                                          cudaStream_t) {
+                                          cudaStream_t stream) {
+  // On a capturing stream: one copy node with the rectangle's shape, as CUDA
+  // records it, rather than a copy done now and absent from every replay.
+  if (width != 0 && height != 0 && capture_active(stream)) {
+    if (!dst || !src) return cudaErrorInvalidValue;
+    if (width > dpitch || width > spitch) return cudaErrorInvalidPitchValue;
+    cudaMemcpy3DParms p{};
+    p.srcPtr = cudaPitchedPtr{const_cast<void*>(src), spitch, width, height};
+    p.dstPtr = cudaPitchedPtr{dst, dpitch, width, height};
+    p.extent = cudaExtent{width, height, 1};
+    p.kind = kind;
+    cudaError_t rc = cudaSuccess;
+    vgpu_record_copy_if_capturing(p, stream, &rc);
+    return rc;
+  }
   return cudaMemcpy2D(dst, dpitch, src, spitch, width, height, kind);
 }
 
@@ -1598,7 +1675,20 @@ VGPU_EXPORT cudaError_t cudaMemset2D(void* dst, size_t pitch, int value, size_t 
   return cudaSuccess;
 }
 VGPU_EXPORT cudaError_t cudaMemset2DAsync(void* dst, size_t pitch, int value, size_t width,
-                                          size_t height, cudaStream_t) {
+                                          size_t height, cudaStream_t stream) {
+  if (width != 0 && height != 0 && capture_active(stream)) {
+    if (!dst) return cudaErrorInvalidValue;
+    cudaMemsetParams p{};
+    p.dst = dst;
+    p.pitch = pitch;
+    p.value = static_cast<unsigned>(value);
+    p.elementSize = 1;
+    p.width = width;
+    p.height = height;
+    cudaError_t rc = cudaSuccess;
+    vgpu_record_fill_if_capturing(p, stream, &rc);
+    return rc;
+  }
   return cudaMemset2D(dst, pitch, value, width, height);
 }
 
@@ -1642,7 +1732,15 @@ VGPU_EXPORT cudaError_t cudaFreeHost(void* ptr) {
   });
 }
 VGPU_EXPORT cudaError_t cudaMemcpyPeerAsync(void* dst, int dstDevice, const void* src,
-                                            int srcDevice, size_t count, cudaStream_t) {
+                                            int srcDevice, size_t count, cudaStream_t stream) {
+  // Captured, a peer copy is a copy node between the two devices' addresses:
+  // each side's device is found from its address when the graph runs.
+  if (count != 0 && capture_active(stream)) {
+    if (!dst || !src) return cudaErrorInvalidValue;
+    cudaError_t rc = cudaSuccess;
+    vgpu_record_copy_if_capturing(linear_copy(dst, src, count, cudaMemcpyDefault), stream, &rc);
+    return rc;
+  }
   return cudaMemcpyPeer(dst, dstDevice, src, srcDevice, count);
 }
 
@@ -1671,7 +1769,22 @@ VGPU_EXPORT cudaError_t cudaMemcpy3DPeer(const cudaMemcpy3DPeerParms* p) {
     }
   return cudaSuccess;
 }
-VGPU_EXPORT cudaError_t cudaMemcpy3DPeerAsync(const cudaMemcpy3DPeerParms* p, cudaStream_t) {
+VGPU_EXPORT cudaError_t cudaMemcpy3DPeerAsync(const cudaMemcpy3DPeerParms* p,
+                                              cudaStream_t stream) {
+  if (p && capture_active(stream)) {
+    cudaMemcpy3DParms c{};
+    c.srcArray = p->srcArray;
+    c.srcPos = p->srcPos;
+    c.srcPtr = p->srcPtr;
+    c.dstArray = p->dstArray;
+    c.dstPos = p->dstPos;
+    c.dstPtr = p->dstPtr;
+    c.extent = p->extent;
+    c.kind = cudaMemcpyDefault;
+    cudaError_t rc = cudaSuccess;
+    vgpu_record_copy_if_capturing(c, stream, &rc);
+    return rc;
+  }
   return cudaMemcpy3DPeer(p);
 }
 
@@ -2053,27 +2166,35 @@ void pool_free(State& s, MemPool& p, uint64_t ptr) {
 
 }  // namespace
 
-VGPU_EXPORT cudaError_t cudaMallocAsync(void** ptr, size_t size, cudaStream_t) {
+VGPU_EXPORT cudaError_t cudaMallocAsync(void** ptr, size_t size, cudaStream_t stream) {
   return guard("cudaMallocAsync", [&](State& s) -> cudaError_t {
     if (!ptr) return cudaErrorInvalidValue;
     if (vgpu::faults::should_fail(vgpu::faults::Op::Alloc)) return cudaErrorMemoryAllocation;
+    cudaError_t rc = cudaSuccess;
+    if (capture_malloc(s, stream, size, t_current_device, ptr, &rc)) return rc;
     return pool_alloc(s, pool_for(s, t_current_device), size, ptr);
   });
 }
 
 VGPU_EXPORT cudaError_t cudaMallocFromPoolAsync(void** ptr, size_t size, cudaMemPool_t pool,
-                                                cudaStream_t) {
+                                                cudaStream_t stream) {
   return guard("cudaMallocFromPoolAsync", [&](State& s) -> cudaError_t {
     if (!ptr) return cudaErrorInvalidValue;
     MemPool* p = from_handle(s, pool);
     if (!p) return cudaErrorInvalidValue;
+    // Captured, the pool's properties -- its device -- set the node's; the
+    // allocation belongs to the graph, not to the pool.
+    cudaError_t rc = cudaSuccess;
+    if (capture_malloc(s, stream, size, p->device, ptr, &rc)) return rc;
     return pool_alloc(s, *p, size, ptr);
   });
 }
 
-VGPU_EXPORT cudaError_t cudaFreeAsync(void* ptr, cudaStream_t) {
+VGPU_EXPORT cudaError_t cudaFreeAsync(void* ptr, cudaStream_t stream) {
   return guard("cudaFreeAsync", [&](State& s) -> cudaError_t {
     if (!ptr) return cudaSuccess;   // as cudaFree(nullptr) is
+    cudaError_t rc = cudaSuccess;
+    if (capture_free(stream, ptr, &rc)) return rc;
     if (MemPool* p = pool_of(s, reinterpret_cast<uint64_t>(ptr))) {
       pool_free(s, *p, reinterpret_cast<uint64_t>(ptr));
       return cudaSuccess;
@@ -2385,6 +2506,9 @@ VGPU_EXPORT cudaError_t cudaDeviceGetPCIBusId(char* buf, int len, int device) {
 // outstanding by the time this is reached.
 VGPU_EXPORT cudaError_t cudaStreamAddCallback(cudaStream_t stream, cudaStreamCallback_t cb,
                                               void* user, unsigned int) {
+  // Not supported under stream capture, as documented -- cudaLaunchHostFunc is
+  // the one that is -- so a capturing stream refuses it and the capture fails.
+  if (capture_refuse(stream, "cudaStreamAddCallback")) return cudaErrorStreamCaptureUnsupported;
   if (cb) cb(stream, cudaSuccess, user);
   return cudaSuccess;
 }
@@ -3070,8 +3194,9 @@ VGPU_EXPORT cudaError_t cudaStreamGetPriority(cudaStream_t stream, int* priority
 
 // A host callback is enqueued behind the stream's work. Work is synchronous
 // here, so everything before it has already finished and it runs now.
-VGPU_EXPORT cudaError_t cudaLaunchHostFunc(cudaStream_t, cudaHostFn_t fn, void* user) {
+VGPU_EXPORT cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void* user) {
   if (!fn) return cudaErrorInvalidValue;
+  if (capture_host_fn(stream, fn, user)) return cudaSuccess;   // a host node, run on launch
   fn(user);
   return cudaSuccess;
 }
@@ -3092,11 +3217,19 @@ VGPU_EXPORT cudaError_t cudaStreamDestroy(cudaStream_t stream) {
   vgpu_drop_capture(stream);
   return cudaSuccess;
 }
-VGPU_EXPORT cudaError_t cudaStreamSynchronize(cudaStream_t) { return cudaDeviceSynchronize(); }
-VGPU_EXPORT cudaError_t cudaStreamQuery(cudaStream_t) { return cudaSuccess; }
-VGPU_EXPORT cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned int) {
+// Neither is permitted on a capturing stream, as documented: its work has not
+// run and will not until the graph is launched. The capture is invalidated, as
+// CUDA invalidates it, and the call says why.
+VGPU_EXPORT cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
+  if (capture_refuse(stream, "cudaStreamSynchronize")) return cudaErrorStreamCaptureUnsupported;
+  return cudaDeviceSynchronize();
+}
+VGPU_EXPORT cudaError_t cudaStreamQuery(cudaStream_t stream) {
+  if (capture_refuse(stream, "cudaStreamQuery")) return cudaErrorStreamCaptureUnsupported;
   return cudaSuccess;
 }
+
+// cudaStreamWaitEvent is defined with the events it waits on.
 // cudaStreamIsCapturing is defined with the CUDA Graph machinery below.
 
 // Events keep the host clock at cudaEventRecord. Work is synchronous, so an
@@ -3113,9 +3246,30 @@ struct RtEvent {
   bool timing = true;
   bool recorded = false;
   std::chrono::steady_clock::time_point when{};
+  // Last recorded on a capturing stream: which capture, and the position that
+  // stream had reached. A cudaStreamWaitEvent on it depends on that position --
+  // joining the capture, or bringing the waiting stream into it -- and it cannot
+  // be queried, synchronized or timed (cudaErrorCapturedEvent, as documented)
+  // until it is recorded again outside a capture.
+  bool captured = false;
+  unsigned long long capture_id = 0;
+  std::vector<void*> capture_deps;   // the capture's nodes, as opaque pointers here
 };
 std::mutex g_event_mu;
 std::unordered_map<cudaEvent_t, std::unique_ptr<RtEvent>> g_events;
+}  // namespace
+// The capture side of events, defined with the graph machinery at file scope --
+// declared outside this anonymous namespace so the declarations and the
+// definitions are the same functions. Each returns false, or leaves a wait as a
+// plain wait, when the stream is not capturing.
+bool capture_position(cudaStream_t stream, unsigned long long* id, std::vector<void*>* deps);
+bool capture_event_node(cudaStream_t stream, bool record, cudaEvent_t e, unsigned long long* id,
+                        std::vector<void*>* deps);
+cudaError_t capture_wait(cudaStream_t stream, bool captured, unsigned long long id,
+                         const std::vector<void*>& deps);
+bool capture_refuse(cudaStream_t stream, const char* what);
+namespace {
+
 RtEvent* find_event(cudaEvent_t e) {  // caller holds g_event_mu
   auto it = g_events.find(e);
   return it == g_events.end() ? nullptr : it->second.get();
@@ -3134,13 +3288,97 @@ VGPU_EXPORT cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned int fl
 VGPU_EXPORT cudaError_t cudaEventCreate(cudaEvent_t* e) {
   return cudaEventCreateWithFlags(e, cudaEventDefault);
 }
-VGPU_EXPORT cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t) {
+VGPU_EXPORT cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t stream) {
   std::lock_guard<std::mutex> lock(g_event_mu);
   RtEvent* r = find_event(e);
   if (!r) return cudaErrorInvalidResourceHandle;
+  // On a capturing stream an event records where the capture has got to, for a
+  // later wait to depend on; it is not a node, and nothing has run. (The event
+  // lock is taken before the graph lock, the order kept everywhere.)
+  unsigned long long id = 0;
+  std::vector<void*> deps;
+  if (capture_position(stream, &id, &deps)) {
+    r->captured = true;
+    r->capture_id = id;
+    r->capture_deps = std::move(deps);
+    return cudaSuccess;
+  }
+  r->captured = false;
+  r->capture_deps.clear();
   r->recorded = true;
   r->when = std::chrono::steady_clock::now();
   return cudaSuccess;
+}
+
+// cudaEventRecordExternal makes the record a node of its own when the stream
+// is capturing -- the event is recorded each time the graph runs, which is how
+// a graph is timed from outside. Without it, this is cudaEventRecord.
+VGPU_EXPORT cudaError_t cudaEventRecordWithFlags(cudaEvent_t e, cudaStream_t stream,
+                                                 unsigned int flags) {
+  if (flags & ~static_cast<unsigned>(cudaEventRecordExternal)) return cudaErrorInvalidValue;
+  if (!(flags & cudaEventRecordExternal)) return cudaEventRecord(e, stream);
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  RtEvent* r = find_event(e);
+  if (!r) return cudaErrorInvalidResourceHandle;
+  unsigned long long id = 0;
+  std::vector<void*> deps;
+  if (capture_event_node(stream, /*record=*/true, e, &id, &deps)) {
+    r->captured = true;   // a wait later in the capture depends on the node
+    r->capture_id = id;
+    r->capture_deps = std::move(deps);
+    return cudaSuccess;
+  }
+  r->captured = false;
+  r->capture_deps.clear();
+  r->recorded = true;
+  r->when = std::chrono::steady_clock::now();
+  return cudaSuccess;
+}
+
+// What an event-record node does when its graph runs, and what a wait node
+// does: record the event now; and check it exists, since everything before a
+// wait has already finished in a synchronous engine. Neither consults capture
+// state -- they are the graph running, not a stream being captured.
+cudaError_t record_event_now(cudaEvent_t e) {
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  RtEvent* r = find_event(e);
+  if (!r) return cudaErrorInvalidResourceHandle;
+  r->captured = false;
+  r->capture_deps.clear();
+  r->recorded = true;
+  r->when = std::chrono::steady_clock::now();
+  return cudaSuccess;
+}
+cudaError_t wait_event_now(cudaEvent_t e) {
+  std::lock_guard<std::mutex> lock(g_event_mu);
+  return find_event(e) ? cudaSuccess : cudaErrorInvalidResourceHandle;
+}
+
+// Outside a capture every operation has finished before its call returns, so a
+// wait has nothing to wait for. Inside one it is how streams are joined: the
+// waiting stream's next operation depends on where the event's stream had got
+// to, and a stream not yet capturing joins the capture -- a fork. The rules on
+// what may be waited on are CUDA's, each with the error it documents.
+VGPU_EXPORT cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t e, unsigned int flags) {
+  if (flags & ~static_cast<unsigned>(cudaEventWaitExternal)) return cudaErrorInvalidValue;
+  bool captured = false;
+  unsigned long long id = 0;
+  std::vector<void*> deps;
+  {
+    std::lock_guard<std::mutex> lock(g_event_mu);
+    const RtEvent* r = find_event(e);
+    if (!r) return cudaErrorInvalidResourceHandle;
+    captured = r->captured;
+    id = r->capture_id;
+    deps = r->capture_deps;
+  }
+  // cudaEventWaitExternal: a wait node of its own in the capture, on an event
+  // from outside it.
+  if (flags & cudaEventWaitExternal) {
+    capture_event_node(stream, /*record=*/false, e, nullptr, nullptr);
+    return cudaSuccess;
+  }
+  return capture_wait(stream, captured, id, deps);
 }
 
 // An event handle carries no state beyond its origin. Every operation here
@@ -3181,11 +3419,15 @@ VGPU_EXPORT cudaError_t cudaIpcOpenEventHandle(cudaEvent_t* event, cudaIpcEventH
 
 VGPU_EXPORT cudaError_t cudaEventSynchronize(cudaEvent_t e) {
   std::lock_guard<std::mutex> lock(g_event_mu);
-  return find_event(e) ? cudaSuccess : cudaErrorInvalidResourceHandle;
+  const RtEvent* r = find_event(e);
+  if (!r) return cudaErrorInvalidResourceHandle;
+  return r->captured ? cudaErrorCapturedEvent : cudaSuccess;
 }
 VGPU_EXPORT cudaError_t cudaEventQuery(cudaEvent_t e) {
   std::lock_guard<std::mutex> lock(g_event_mu);
-  return find_event(e) ? cudaSuccess : cudaErrorInvalidResourceHandle;
+  const RtEvent* r = find_event(e);
+  if (!r) return cudaErrorInvalidResourceHandle;
+  return r->captured ? cudaErrorCapturedEvent : cudaSuccess;   // it stands for work not yet run
 }
 VGPU_EXPORT cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t start, cudaEvent_t end) {
   if (!ms) return cudaErrorInvalidValue;
@@ -3196,6 +3438,7 @@ VGPU_EXPORT cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t start, cudaE
   // cudaEventDisableTiming, is cudaErrorInvalidResourceHandle.
   // cudaErrorNotReady is for recorded work that has not finished, which a
   // synchronous engine never leaves behind.
+  if (a && b && (a->captured || b->captured)) return cudaErrorCapturedEvent;
   if (!a || !b || !a->recorded || !b->recorded || !a->timing || !b->timing)
     return cudaErrorInvalidResourceHandle;
   *ms = std::chrono::duration<float, std::milli>(b->when - a->when).count();
@@ -3268,6 +3511,12 @@ struct RecordedLaunch {
   size_t shared = 0;
   std::vector<std::vector<uint8_t>> arg_bytes;  // deep copy of parameter values
   std::vector<void*> arg_ptrs;                  // rebuilt to point at arg_bytes
+  // How it was launched, which the replay has to repeat: a cooperative launch's
+  // blocks are resident together and get the grid-barrier workspace grid.sync()
+  // needs, and a cluster shape is what %cluster_* report. Dropping either would
+  // run the kernel as something else.
+  bool cooperative = false;
+  std::array<uint32_t, 3> cluster{0, 0, 0};
   // Memcpy / Memset. Pointers are recorded, not the data behind them: a graph
   // reads whatever the buffers hold at replay time, which is what makes
   // replaying a captured step with new inputs meaningful.
@@ -3276,6 +3525,18 @@ struct RecordedLaunch {
   size_t bytes = 0;
   cudaMemcpyKind copy_kind = cudaMemcpyDefault;
   int fill_value = 0;
+  // A copy or fill with a shape: `bytes` is one row, and there are `height`
+  // rows `*_pitch` bytes apart in `depth` slices `*_slice` bytes apart. A
+  // linear one is one row. A fill writes elements of `elem_size` bytes, each
+  // the low `elem_size` bytes of `fill_value` -- a 4-byte fill of 2 writes 2
+  // into every int, not the byte 2 into every byte.
+  size_t height = 1, depth = 1;
+  size_t dst_pitch = 0, src_pitch = 0, dst_slice = 0, src_slice = 0;
+  unsigned elem_size = 1;
+  // What the node was built or set with, which Get*Params hands back as given:
+  // the shape above is how it runs, these are how it was asked for.
+  cudaMemcpy3DParms copy_params{};
+  cudaMemsetParams fill_params{};
   // Host: either the function a program handed cudaGraphAddHostNode, which
   // HostNodeGetParams has to hand back, or a vendor-library call that computes
   // on the CPU and left a closure behind. A closure is replayed by re-running
@@ -3321,16 +3582,6 @@ struct GraphRec {
   // not be used.
   bool invalidated = false;
   const char* invalidated_by = nullptr;
-  // What the next captured operation depends on. Normally the one operation
-  // captured before it, but a library splicing its own nodes into a capture
-  // sets this with cudaStreamUpdateCaptureDependencies, and then it is whatever
-  // set of nodes it named -- which is how a single-stream capture becomes a
-  // graph with more than one path through it.
-  std::vector<GraphNodeRec*> capture_deps;
-  // While capturing: the id cudaStreamGetCaptureInfo reports, unique to this
-  // capture sequence, and the handle-sized copy of capture_deps it hands out.
-  unsigned long long capture_id = 0;
-  std::vector<cudaGraphNode_t> capture_deps_out;
 
   // Adds a node with the given predecessors. Returns its handle.
   GraphNodeRec* add(cudaGraphNodeType type, RecordedLaunch work,
@@ -3374,8 +3625,6 @@ std::unique_ptr<GraphRec> clone_graph(const GraphRec& src,
       n->child = out->children.back().get();
     }
   }
-  for (const GraphNodeRec* d : src.capture_deps)
-    if (const auto it = local.find(d); it != local.end()) out->capture_deps.push_back(it->second);
   if (mapping) *mapping = local;
   return out;
 }
@@ -3471,22 +3720,61 @@ std::unordered_map<void*, std::unique_ptr<GraphRec>> g_graphs;      // graph han
 // refused, as CUDA refuses it -- the node's graph is the node's.
 std::unordered_map<void*, GraphRec*> g_borrowed_graphs;
 std::unordered_map<void*, std::unique_ptr<GraphRec>> g_graph_execs; // instantiated graphs
-// Streams currently capturing. VirtualGPU's streams are all the same
-// synchronous engine, so capture state is keyed by the stream handle value.
-std::unordered_map<void*, std::unique_ptr<GraphRec>> g_capturing;
+// Capture sequences, and the streams taking part in them. A sequence owns the
+// graph it builds until cudaStreamEndCapture hands it over. Every stream taking
+// part -- the one that began it, and any that joined by waiting on an event
+// recorded in it -- has its own position in it: the nodes its next operation
+// depends on. That is what lets two streams build two branches of one graph and
+// join them again, which is how a multi-stream program is captured.
+struct Capture {
+  std::unique_ptr<GraphRec> graph;
+  unsigned long long id = 0;
+  void* origin = nullptr;   // the stream that began it; only it can end it
+};
+struct StreamCapture {
+  Capture* cap = nullptr;
+  // Normally the one operation this stream captured last. A library splicing
+  // its own nodes in sets it with cudaStreamUpdateCaptureDependencies, and a
+  // wait on an event adds what that event captured.
+  std::vector<GraphNodeRec*> deps;
+  std::vector<cudaGraphNode_t> deps_out;   // what cudaStreamGetCaptureInfo hands out
+};
+std::unordered_map<void*, std::unique_ptr<Capture>> g_captures;   // by the stream that began each
+std::unordered_map<void*, StreamCapture> g_stream_capture;        // every stream taking part
 
-// Returns the capture buffer for `stream`, or nullptr when not capturing.
-GraphRec* capture_target(cudaStream_t stream) {
-  std::lock_guard<std::mutex> lock(g_graph_mu);
-  auto it = g_capturing.find(reinterpret_cast<void*>(stream));
-  return it == g_capturing.end() ? nullptr : it->second.get();
+// The capture state of `stream`, or nullptr. Caller holds g_graph_mu.
+StreamCapture* stream_capture(cudaStream_t stream) {
+  const auto it = g_stream_capture.find(reinterpret_cast<void*>(stream));
+  return it == g_stream_capture.end() ? nullptr : &it->second;
 }
 
-// Adds a captured operation: it depends on the capture's current dependency
-// set, and becomes that set. Caller holds g_graph_mu.
-void capture_add(GraphRec& g, cudaGraphNodeType type, RecordedLaunch work) {
-  GraphNodeRec* n = g.add(type, std::move(work), g.capture_deps);
-  g.capture_deps.assign(1, n);
+// The graph `stream` is capturing into, or nullptr when it is not capturing.
+GraphRec* capture_target(cudaStream_t stream) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  const StreamCapture* sc = stream_capture(stream);
+  return sc ? sc->cap->graph.get() : nullptr;
+}
+
+// Adds a captured operation: it depends on the stream's position, and becomes
+// it. Caller holds g_graph_mu.
+GraphNodeRec* capture_add(StreamCapture& sc, cudaGraphNodeType type, RecordedLaunch work) {
+  GraphNodeRec* n = sc.cap->graph->add(type, std::move(work), sc.deps);
+  sc.deps.assign(1, n);
+  return n;
+}
+
+// Records `work` on `stream` if it is capturing; says whether it was.
+bool capture_record(cudaStream_t stream, cudaGraphNodeType type, RecordedLaunch work) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  StreamCapture* sc = stream_capture(stream);
+  if (!sc) return false;
+  capture_add(*sc, type, std::move(work));
+  return true;
+}
+
+// Every stream taking part in `cap` leaves it. Caller holds g_graph_mu.
+void leave_capture(const Capture* cap) {
+  std::erase_if(g_stream_capture, [cap](const auto& kv) { return kv.second.cap == cap; });
 }
 
 // Every capture sequence gets its own id, as CUDA documents -- a library uses
@@ -3495,55 +3783,80 @@ std::atomic<unsigned long long> g_next_capture_id{1};
 
 }  // namespace
 
+namespace {
+// Defined with the graph-building calls; the capture hooks below use them too,
+// so a captured copy and a built one are the same node.
+cudaError_t fill_memcpy_work(RecordedLaunch* w, const cudaMemcpy3DParms* p);
+cudaError_t fill_memset_work(RecordedLaunch* w, const cudaMemsetParams* p);
+cudaMemcpy3DParms linear_copy(void* dst, const void* src, size_t count, cudaMemcpyKind kind);
+}  // namespace
+
 // Records a copy or a fill during capture. Returns true when it was recorded,
 // in which case the caller must not perform it now -- it belongs to the graph.
-bool vgpu_record_memcpy_if_capturing(void* dst, const void* src, size_t bytes,
-                                     cudaMemcpyKind kind, cudaStream_t stream) {
-  GraphRec* g = capture_target(stream);
-  if (!g) return false;
+// A copy of any shape: one node, as CUDA makes it. `*rc` is what the caller
+// should return when the copy was recorded -- a shape a node cannot carry fails
+// the call rather than being run now and missing from every replay.
+bool vgpu_record_copy_if_capturing(const cudaMemcpy3DParms& p, cudaStream_t stream,
+                                   cudaError_t* rc) {
+  if (!capture_active(stream)) return false;
   RecordedLaunch r;
-  r.kind = RecordedLaunch::Kind::Memcpy;
-  r.dst = dst;
-  r.src = src;
-  r.bytes = bytes;
-  r.copy_kind = kind;
-  std::lock_guard<std::mutex> lock(g_graph_mu);
-  capture_add(*g, cudaGraphNodeTypeMemcpy, std::move(r));
+  *rc = fill_memcpy_work(&r, &p);
+  if (*rc == cudaSuccess) capture_record(stream, cudaGraphNodeTypeMemcpy, std::move(r));
   return true;
 }
 
-bool vgpu_record_memset_if_capturing(void* dst, int value, size_t bytes, cudaStream_t stream) {
-  GraphRec* g = capture_target(stream);
-  if (!g) return false;
+bool vgpu_record_fill_if_capturing(const cudaMemsetParams& p, cudaStream_t stream,
+                                   cudaError_t* rc) {
+  if (!capture_active(stream)) return false;
   RecordedLaunch r;
-  r.kind = RecordedLaunch::Kind::Memset;
-  r.dst = dst;
-  r.fill_value = value;
-  r.bytes = bytes;
-  std::lock_guard<std::mutex> lock(g_graph_mu);
-  capture_add(*g, cudaGraphNodeTypeMemset, std::move(r));
+  *rc = fill_memset_work(&r, &p);
+  if (*rc == cudaSuccess) capture_record(stream, cudaGraphNodeTypeMemset, std::move(r));
   return true;
+}
+
+bool capture_active(cudaStream_t stream) { return capture_target(stream) != nullptr; }
+
+bool vgpu_record_memcpy_if_capturing(void* dst, const void* src, size_t bytes,
+                                     cudaMemcpyKind kind, cudaStream_t stream) {
+  if (bytes == 0) return capture_target(stream) != nullptr;   // nothing to record or do
+  cudaError_t rc = cudaSuccess;
+  return vgpu_record_copy_if_capturing(linear_copy(dst, src, bytes, kind), stream, &rc);
+}
+
+bool vgpu_record_memset_if_capturing(void* dst, int value, size_t bytes, cudaStream_t stream) {
+  if (bytes == 0) return capture_target(stream) != nullptr;
+  cudaMemsetParams p{};
+  p.dst = dst;
+  p.value = static_cast<unsigned>(value);
+  p.elementSize = 1;
+  p.width = bytes;
+  p.height = 1;
+  cudaError_t rc = cudaSuccess;
+  return vgpu_record_fill_if_capturing(p, stream, &rc);
 }
 
 // Records a host-computed library call during capture. Returns true when it was
 // recorded, in which case the caller must not do the work now.
 bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()> op) {
-  GraphRec* g = capture_target(stream);
-  if (!g) return false;
+  if (!capture_active(stream)) return false;
   RecordedLaunch r;
   r.kind = RecordedLaunch::Kind::Host;
   r.host_op = std::move(op);
-  std::lock_guard<std::mutex> lock(g_graph_mu);
-  capture_add(*g, cudaGraphNodeTypeHost, std::move(r));
-  return true;
+  return capture_record(stream, cudaGraphNodeTypeHost, std::move(r));
 }
 
 void vgpu_drop_capture(cudaStream_t stream) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
-  const auto it = g_capturing.find(reinterpret_cast<void*>(stream));
-  if (it == g_capturing.end()) return;
-  g_borrowed_graphs.erase(it->second.get());
-  g_capturing.erase(it);
+  StreamCapture* sc = stream_capture(stream);
+  if (!sc) return;
+  Capture* cap = sc->cap;
+  if (cap->origin != reinterpret_cast<void*>(stream)) {   // a stream that joined just leaves
+    g_stream_capture.erase(reinterpret_cast<void*>(stream));
+    return;
+  }
+  g_borrowed_graphs.erase(cap->graph.get());   // the stream that began it takes it along
+  leave_capture(cap);
+  g_captures.erase(reinterpret_cast<void*>(stream));
 }
 
 // Marks any in-flight capture as unusable. Called by the operations that this
@@ -3551,10 +3864,10 @@ void vgpu_drop_capture(cudaStream_t stream) {
 // fails at cudaStreamEndCapture instead of replaying an incomplete graph.
 void vgpu_invalidate_capture(const char* what) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
-  for (auto& entry : g_capturing)
-    if (entry.second && !entry.second->invalidated) {
-      entry.second->invalidated = true;
-      entry.second->invalidated_by = what;
+  for (auto& entry : g_captures)
+    if (entry.second && !entry.second->graph->invalidated) {
+      entry.second->graph->invalidated = true;
+      entry.second->graph->invalidated_by = what;
     }
 }
 
@@ -3562,22 +3875,22 @@ void vgpu_invalidate_capture(const char* what) {
 // therefore NOT execute now).
 bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, void** args,
                                      size_t sharedMem, cudaStream_t stream,
-                                     const std::vector<uint32_t>& param_sizes) {
-  GraphRec* g = capture_target(stream);
-  if (!g) return false;
+                                     const std::vector<uint32_t>& param_sizes, bool cooperative,
+                                     std::array<uint32_t, 3> cluster) {
+  if (!capture_active(stream)) return false;
   RecordedLaunch rl;
   rl.func = func;
   rl.grid = grid;
   rl.block = block;
   rl.shared = sharedMem;
+  rl.cooperative = cooperative;
+  rl.cluster = cluster;
   rl.arg_bytes.resize(param_sizes.size());
   for (size_t i = 0; i < param_sizes.size(); ++i) {
     rl.arg_bytes[i].resize(param_sizes[i]);
     std::memcpy(rl.arg_bytes[i].data(), args[i], param_sizes[i]);
   }
-  std::lock_guard<std::mutex> lock(g_graph_mu);
-  capture_add(*g, cudaGraphNodeTypeKernel, std::move(rl));
-  return true;
+  return capture_record(stream, cudaGraphNodeTypeKernel, std::move(rl));
 }
 
 VGPU_EXPORT cudaError_t cudaStreamBeginCapture(cudaStream_t stream, cudaStreamCaptureMode mode) {
@@ -3586,27 +3899,60 @@ VGPU_EXPORT cudaError_t cudaStreamBeginCapture(cudaStream_t stream, cudaStreamCa
   // replays the work it actually contained. Anything still unrecordable marks
   // the capture invalid and cudaStreamEndCapture reports it, rather than
   // handing back a graph that silently omits work.
+  // Not on the legacy stream, as documented: it synchronizes with every other
+  // stream, so everything would become part of the capture.
+  if (stream == nullptr || stream == cudaStreamLegacy) return cudaErrorStreamCaptureUnsupported;
   std::lock_guard<std::mutex> lock(g_graph_mu);
-  auto g = std::make_unique<GraphRec>();
-  g->capture_id = g_next_capture_id.fetch_add(1);
+  if (stream_capture(stream)) return cudaErrorIllegalState;   // already capturing
+  auto cap = std::make_unique<Capture>();
+  cap->graph = std::make_unique<GraphRec>();
+  cap->id = g_next_capture_id.fetch_add(1);
+  cap->origin = reinterpret_cast<void*>(stream);
   // The graph being captured into is a handle a program can use before the
   // capture ends: cudaStreamGetCaptureInfo hands it out, and a library adds its
   // own nodes to it. The capture owns it, so it is lent rather than given --
   // cudaGraphDestroy refuses it -- and it keeps its address when the capture
   // ends, so the handle is the same graph cudaStreamEndCapture returns.
-  g_borrowed_graphs[g.get()] = g.get();
-  g_capturing[reinterpret_cast<void*>(stream)] = std::move(g);
+  g_borrowed_graphs[cap->graph.get()] = cap->graph.get();
+  g_stream_capture[reinterpret_cast<void*>(stream)] = StreamCapture{cap.get(), {}, {}};
+  g_captures[reinterpret_cast<void*>(stream)] = std::move(cap);
   return cudaSuccess;
 }
 
 VGPU_EXPORT cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* pGraph) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
-  auto it = g_capturing.find(reinterpret_cast<void*>(stream));
-  if (it == g_capturing.end()) return cudaErrorStreamCaptureImplicit;
-  auto graph = std::move(it->second);
-  g_capturing.erase(it);
+  StreamCapture* sc = stream_capture(stream);
+  if (!sc) return cudaErrorIllegalState;   // not capturing
+  // Only the stream that began a capture ends it; one that joined it cannot.
+  if (sc->cap->origin != reinterpret_cast<void*>(stream)) return cudaErrorStreamCaptureUnmatched;
+  Capture* cap = sc->cap;
+  // Every stream that joined must have been joined back: whatever it did last
+  // has to come before where the stream that began the capture is now. A fork
+  // left dangling is work that would run after the graph was declared done.
+  std::set<const GraphNodeRec*> before_end;
+  {
+    std::vector<const GraphNodeRec*> todo(sc->deps.begin(), sc->deps.end());
+    while (!todo.empty()) {
+      const GraphNodeRec* n = todo.back();
+      todo.pop_back();
+      if (!before_end.insert(n).second) continue;
+      for (const GraphNodeRec* d : n->deps) todo.push_back(d);
+    }
+  }
+  bool unjoined = false;
+  for (const auto& [other, osc] : g_stream_capture) {
+    if (osc.cap != cap || other == reinterpret_cast<void*>(stream)) continue;
+    for (const GraphNodeRec* n : osc.deps)
+      if (!before_end.count(n)) unjoined = true;
+  }
+  std::unique_ptr<GraphRec> graph = std::move(cap->graph);
+  leave_capture(cap);
+  g_captures.erase(reinterpret_cast<void*>(stream));
   g_borrowed_graphs.erase(graph.get());   // no longer lent: returned, or dropped below
-  graph->capture_deps_out.clear();
+  if (unjoined) {
+    if (pGraph) *pGraph = nullptr;
+    return cudaErrorStreamCaptureUnjoined;
+  }
   if (graph->invalidated) {
     // CUDA reports a capture that saw an unsupported operation this way, and
     // callers fall back to running the work directly. Handing back a graph that
@@ -3720,6 +4066,34 @@ static cudaError_t run_graph(GraphRec& g, cudaStream_t stream) {
   return cudaSuccess;
 }
 
+// A copy node: every row of every slice, each through the same path a linear
+// copy takes, so the device each side belongs to is resolved per row.
+static cudaError_t replay_copy(const RecordedLaunch& rl) {
+  for (size_t z = 0; z < rl.depth; ++z)
+    for (size_t y = 0; y < rl.height; ++y) {
+      const cudaError_t e = cudaMemcpy(
+          static_cast<char*>(rl.dst) + z * rl.dst_slice + y * rl.dst_pitch,
+          static_cast<const char*>(rl.src) + z * rl.src_slice + y * rl.src_pitch, rl.bytes,
+          rl.copy_kind);
+      if (e != cudaSuccess) return e;
+    }
+  return cudaSuccess;
+}
+
+// A fill node: each row set to repeated elements of the node's width.
+static cudaError_t replay_fill(const RecordedLaunch& rl) {
+  return guard("cudaGraphLaunch", [&](State& s) -> cudaError_t {
+    const uint32_t value = static_cast<uint32_t>(rl.fill_value);
+    uint8_t pattern[4];
+    for (unsigned i = 0; i < 4; ++i) pattern[i] = static_cast<uint8_t>(value >> (8 * i));
+    for (size_t y = 0; y < rl.height; ++y) {
+      void* row = static_cast<char*>(rl.dst) + y * rl.dst_pitch;
+      owner_memory(s, row).fill(reinterpret_cast<uint64_t>(row), pattern, rl.elem_size, rl.bytes);
+    }
+    return cudaSuccess;
+  });
+}
+
 static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
   RecordedLaunch& rl = n->work;
   if (!n->enabled) return cudaSuccess;   // switched off: it still orders its neighbours
@@ -3727,9 +4101,9 @@ static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
     case cudaGraphNodeTypeEmpty:
       return cudaSuccess;
     case cudaGraphNodeTypeMemcpy:
-      return cudaMemcpy(rl.dst, rl.src, rl.bytes, rl.copy_kind);
+      return replay_copy(rl);
     case cudaGraphNodeTypeMemset:
-      return cudaMemset(rl.dst, rl.fill_value, rl.bytes);
+      return replay_fill(rl);
     case cudaGraphNodeTypeHost:
       // The function a program gave the node, or a captured library's closure.
       if (rl.host_fn) rl.host_fn(rl.host_user);
@@ -3740,19 +4114,20 @@ static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
     case cudaGraphNodeTypeMemFree:
       return graph_mem_free_run(reinterpret_cast<uint64_t>(rl.dst));
     case cudaGraphNodeTypeEventRecord:
-      return cudaEventRecord(rl.event, stream);
+      return record_event_now(rl.event);
     case cudaGraphNodeTypeWaitEvent:
       // Everything before this node has already finished -- one synchronous
       // engine, and a launch runs the nodes in dependency order -- so the wait
       // is satisfied rather than skipped. An event nothing has recorded is a
       // no-op here for the same reason CUDA documents it as one.
-      return cudaStreamWaitEvent(stream, rl.event, 0);
+      return wait_event_now(rl.event);
     case cudaGraphNodeTypeGraph:
       return n->child ? run_graph(*n->child, stream) : cudaSuccess;
     default: {
       std::vector<void*> ptrs(rl.arg_bytes.size());
       for (size_t i = 0; i < rl.arg_bytes.size(); ++i) ptrs[i] = rl.arg_bytes[i].data();
-      return cudaLaunchKernel(rl.func, rl.grid, rl.block, ptrs.data(), rl.shared, stream);
+      return launch_kernel_impl("cudaGraphLaunch", rl.func, rl.grid, rl.block, ptrs.data(),
+                                rl.shared, stream, rl.cooperative, rl.cluster);
     }
   }
 }
@@ -3765,6 +4140,24 @@ VGPU_EXPORT cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t strea
     std::lock_guard<std::mutex> lock(g_graph_mu);
     auto it = g_graph_execs.find(static_cast<void*>(exec));
     if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
+    // Launched on a capturing stream, a graph is captured as a child-graph node:
+    // it runs when the graph being captured runs, not now. A graph that owns
+    // memory cannot be a child, as documented, so that one refuses.
+    if (StreamCapture* sc = stream_capture(stream)) {
+      if (holds_graph_memory(*it->second)) {
+        GraphRec& g = *sc->cap->graph;
+        if (!g.invalidated) {
+          g.invalidated = true;
+          g.invalidated_by = "cudaGraphLaunch of a graph that owns memory";
+        }
+        return cudaErrorNotSupported;
+      }
+      GraphRec& g = *sc->cap->graph;
+      g.children.push_back(clone_graph(*it->second, nullptr));
+      GraphNodeRec* n = capture_add(*sc, cudaGraphNodeTypeGraph, RecordedLaunch{});
+      n->child = g.children.back().get();
+      return cudaSuccess;
+    }
     replay = clone_graph(*it->second, nullptr);   // run without holding the lock
     auto_free = g_exec_auto_free.count(static_cast<void*>(exec)) != 0;
     if (const auto src = g_exec_source.find(static_cast<void*>(exec)); src != g_exec_source.end())
@@ -3875,32 +4268,73 @@ cudaError_t fill_kernel_work(RecordedLaunch* w, const cudaKernelNodeParams* p) {
   return cudaSuccess;
 }
 
-// A 3D copy this engine can run: one contiguous run of bytes. Anything with a
-// real pitch or more than one row would need a shape the replay does not carry,
-// and is refused rather than copied wrongly.
+// A copy node's work from a 3D copy's parameters: the rows and slices of a
+// pitched region, between two pointers. Positions are in bytes for pointers,
+// as CUDA defines them, and fold into the start address. CUDA arrays are not
+// carried by a node here and are refused by name.
 cudaError_t fill_memcpy_work(RecordedLaunch* w, const cudaMemcpy3DParms* p) {
   if (!p) return cudaErrorInvalidValue;
-  if (p->extent.height > 1 || p->extent.depth > 1) return cudaErrorNotSupported;
+  if (p->srcArray || p->dstArray) return cudaErrorNotSupported;   // a CUDA array in a node
   if (p->srcPtr.ptr == nullptr || p->dstPtr.ptr == nullptr) return cudaErrorInvalidValue;
+  const cudaExtent& e = p->extent;
+  if (e.width == 0 || e.height == 0 || e.depth == 0) return cudaErrorInvalidValue;
+  const bool shaped = e.height > 1 || e.depth > 1;
+  // A row wider than the pitch would overlap the next one.
+  if (shaped && (e.width > p->srcPtr.pitch || e.width > p->dstPtr.pitch))
+    return cudaErrorInvalidValue;
+  // Slices are ysize rows apart, so more than one needs to know how many.
+  if (e.depth > 1 && (p->srcPtr.ysize == 0 || p->dstPtr.ysize == 0)) return cudaErrorInvalidValue;
+  const size_t src_slice = p->srcPtr.pitch * p->srcPtr.ysize;
+  const size_t dst_slice = p->dstPtr.pitch * p->dstPtr.ysize;
   w->kind = RecordedLaunch::Kind::Memcpy;
-  w->src = p->srcPtr.ptr;
-  w->dst = p->dstPtr.ptr;
-  w->bytes = p->extent.width;
+  w->src = static_cast<const char*>(p->srcPtr.ptr) + p->srcPos.z * src_slice +
+           p->srcPos.y * p->srcPtr.pitch + p->srcPos.x;
+  w->dst = static_cast<char*>(p->dstPtr.ptr) + p->dstPos.z * dst_slice +
+           p->dstPos.y * p->dstPtr.pitch + p->dstPos.x;
+  w->bytes = e.width;
+  w->height = e.height;
+  w->depth = e.depth;
+  w->src_pitch = p->srcPtr.pitch;
+  w->dst_pitch = p->dstPtr.pitch;
+  w->src_slice = src_slice;
+  w->dst_slice = dst_slice;
   w->copy_kind = p->kind;
+  w->copy_params = *p;
   return cudaSuccess;
 }
 
+// The 3D-copy description of a linear copy, which is how CUDA reports one.
+cudaMemcpy3DParms linear_copy(void* dst, const void* src, size_t count, cudaMemcpyKind kind) {
+  cudaMemcpy3DParms p{};
+  p.srcPtr = cudaPitchedPtr{const_cast<void*>(src), count, count, 1};
+  p.dstPtr = cudaPitchedPtr{dst, count, count, 1};
+  p.extent = cudaExtent{count, 1, 1};
+  p.kind = kind;
+  return p;
+}
+
+// A fill node's work: `height` rows of `width` elements, each `elementSize`
+// bytes set to the value's low bytes -- which is what cuMemsetD16/D32 do, and
+// what a 2- or 4-byte cudaMemsetParams asks for.
 cudaError_t fill_memset_work(RecordedLaunch* w, const cudaMemsetParams* p) {
   if (!p || !p->dst) return cudaErrorInvalidValue;
-  if (p->height > 1) return cudaErrorNotSupported;   // a 2D fill needs a pitch this cannot carry
   if (p->elementSize != 1 && p->elementSize != 2 && p->elementSize != 4)
     return cudaErrorInvalidValue;
+  if (p->width == 0 || p->height == 0) return cudaErrorInvalidValue;
+  const size_t row = static_cast<size_t>(p->width) * p->elementSize;
+  if (p->height > 1 && p->pitch < row) return cudaErrorInvalidValue;   // rows would overlap
   w->kind = RecordedLaunch::Kind::Memset;
   w->dst = p->dst;
   w->fill_value = static_cast<int>(p->value);
-  w->bytes = static_cast<size_t>(p->width) * p->elementSize;
+  w->elem_size = p->elementSize;
+  w->bytes = row;
+  w->height = p->height;
+  w->depth = 1;
+  w->dst_pitch = p->pitch;
+  w->fill_params = *p;
   return cudaSuccess;
 }
+
 
 // The node in an instantiated graph that answers for `original` in the graph it
 // was instantiated from. Every cudaGraphExec*NodeSetParams call names the node
@@ -3963,11 +4397,22 @@ void copy_params(GraphRec& dst, const GraphRec& src) {
     d.block = s.block;
     d.shared = s.shared;
     d.arg_bytes = s.arg_bytes;
+    d.cooperative = s.cooperative;
+    d.cluster = s.cluster;
     d.dst = s.dst;
     d.src = s.src;
     d.bytes = s.bytes;
     d.copy_kind = s.copy_kind;
     d.fill_value = s.fill_value;
+    d.height = s.height;
+    d.depth = s.depth;
+    d.dst_pitch = s.dst_pitch;
+    d.src_pitch = s.src_pitch;
+    d.dst_slice = s.dst_slice;
+    d.src_slice = s.src_slice;
+    d.elem_size = s.elem_size;
+    d.copy_params = s.copy_params;
+    d.fill_params = s.fill_params;
     d.host_fn = s.host_fn;
     d.host_user = s.host_user;
     d.host_op = s.host_op;
@@ -4053,11 +4498,8 @@ VGPU_EXPORT cudaError_t cudaGraphAddMemcpyNode1D(cudaGraphNode_t* pNode, cudaGra
   std::vector<GraphNodeRec*> pred;
   if (!deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
   RecordedLaunch w;
-  w.kind = RecordedLaunch::Kind::Memcpy;
-  w.dst = dst;
-  w.src = src;
-  w.bytes = count;
-  w.copy_kind = kind;
+  const cudaMemcpy3DParms p = linear_copy(dst, src, count, kind);
+  if (const cudaError_t rc = fill_memcpy_work(&w, &p); rc != cudaSuccess) return rc;
   *pNode = reinterpret_cast<cudaGraphNode_t>(g->add(cudaGraphNodeTypeMemcpy, std::move(w), pred));
   return cudaSuccess;
 }
@@ -4154,7 +4596,8 @@ VGPU_EXPORT cudaError_t cudaGraphDestroyNode(cudaGraphNode_t node) {
     if (holds_graph_memory(*g)) return cudaErrorInvalidValue;
     for (auto& up : g->nodes)
       up->deps.erase(std::remove(up->deps.begin(), up->deps.end(), n), up->deps.end());
-    std::erase(g->capture_deps, n);
+    for (auto& [s, sc] : g_stream_capture)
+      if (sc.cap->graph.get() == g.get()) std::erase(sc.deps, n);
     std::erase_if(g->nodes, [&](const std::unique_ptr<GraphNodeRec>& up) { return up.get() == n; });
     return cudaSuccess;
   }
@@ -4311,12 +4754,7 @@ VGPU_EXPORT cudaError_t cudaGraphMemsetNodeGetParams(cudaGraphNode_t node,
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto* n = reinterpret_cast<GraphNodeRec*>(node);
   if (!n || !params || n->type != cudaGraphNodeTypeMemset) return cudaErrorInvalidValue;
-  std::memset(params, 0, sizeof *params);
-  params->dst = n->work.dst;
-  params->value = static_cast<unsigned>(n->work.fill_value);
-  params->elementSize = 1;
-  params->width = n->work.bytes;
-  params->height = 1;
+  *params = n->work.fill_params;   // as it was given: element size, width, pitch, rows
   return cudaSuccess;
 }
 
@@ -4333,12 +4771,7 @@ VGPU_EXPORT cudaError_t cudaGraphMemcpyNodeGetParams(cudaGraphNode_t node,
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto* n = reinterpret_cast<GraphNodeRec*>(node);
   if (!n || !params || n->type != cudaGraphNodeTypeMemcpy) return cudaErrorInvalidValue;
-  std::memset(params, 0, sizeof *params);
-  // One contiguous run of bytes, described the way a 3D copy describes it.
-  params->srcPtr = cudaPitchedPtr{const_cast<void*>(n->work.src), n->work.bytes, n->work.bytes, 1};
-  params->dstPtr = cudaPitchedPtr{n->work.dst, n->work.bytes, n->work.bytes, 1};
-  params->extent = cudaExtent{n->work.bytes, 1, 1};
-  params->kind = n->work.copy_kind;
+  *params = n->work.copy_params;   // as it was given, positions and pitches included
   return cudaSuccess;
 }
 
@@ -4356,11 +4789,8 @@ VGPU_EXPORT cudaError_t cudaGraphMemcpyNodeSetParams1D(cudaGraphNode_t node, voi
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto* n = reinterpret_cast<GraphNodeRec*>(node);
   if (!n || !dst || !src || n->type != cudaGraphNodeTypeMemcpy) return cudaErrorInvalidValue;
-  n->work.dst = dst;
-  n->work.src = src;
-  n->work.bytes = count;
-  n->work.copy_kind = kind;
-  return cudaSuccess;
+  const cudaMemcpy3DParms p = linear_copy(dst, src, count, kind);
+  return fill_memcpy_work(&n->work, &p);
 }
 
 // ---- cloning, and updating an instantiated graph ----
@@ -4629,6 +5059,7 @@ VGPU_EXPORT cudaError_t cudaGraphExecMemsetNodeSetParams(cudaGraphExec_t exec,
   if (it == g_graph_execs.end() || !original) return cudaErrorInvalidValue;
   GraphNodeRec* target = exec_twin(*it->second, original);
   if (!target || target->type != cudaGraphNodeTypeMemset) return cudaErrorInvalidValue;
+  if (target->work.height > 1) return cudaErrorInvalidValue;   // the original was 2D
   target->work = std::move(w);
   return cudaSuccess;
 }
@@ -4638,12 +5069,16 @@ VGPU_EXPORT cudaError_t cudaGraphExecMemcpyNodeSetParams(cudaGraphExec_t exec,
                                                          const cudaMemcpy3DParms* params) {
   RecordedLaunch w;
   if (fill_memcpy_work(&w, params) != cudaSuccess) return cudaErrorInvalidValue;
+  // Both the operands it was instantiated with and the new ones have to be 1D,
+  // as this call documents; a shape changes on the graph, not here.
+  if (w.height > 1 || w.depth > 1) return cudaErrorInvalidValue;
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto it = g_graph_execs.find(static_cast<void*>(exec));
   auto* original = reinterpret_cast<GraphNodeRec*>(node);
   if (it == g_graph_execs.end() || !original) return cudaErrorInvalidValue;
   GraphNodeRec* target = exec_twin(*it->second, original);
   if (!target || target->type != cudaGraphNodeTypeMemcpy) return cudaErrorInvalidValue;
+  if (target->work.height > 1 || target->work.depth > 1) return cudaErrorInvalidValue;
   target->work = std::move(w);
   return cudaSuccess;
 }
@@ -4659,11 +5094,9 @@ VGPU_EXPORT cudaError_t cudaGraphExecMemcpyNodeSetParams1D(cudaGraphExec_t exec,
   if (it == g_graph_execs.end() || !original) return cudaErrorInvalidValue;
   GraphNodeRec* target = exec_twin(*it->second, original);
   if (!target || target->type != cudaGraphNodeTypeMemcpy) return cudaErrorInvalidValue;
-  target->work.dst = dst;
-  target->work.src = src;
-  target->work.bytes = count;
-  target->work.copy_kind = kind;
-  return cudaSuccess;
+  if (target->work.height > 1 || target->work.depth > 1) return cudaErrorInvalidValue;
+  const cudaMemcpy3DParms p = linear_copy(dst, src, count, kind);
+  return fill_memcpy_work(&target->work, &p);
 }
 
 VGPU_EXPORT cudaError_t cudaGraphExecHostNodeSetParams(cudaGraphExec_t exec, cudaGraphNode_t node,
@@ -4769,6 +5202,68 @@ cudaError_t free_graph_alloc(State& s, void* ptr, bool* handled) {
   return cudaSuccess;
 }
 
+namespace {
+// A graph allocation's fixed address, reserved on `device` (the current one
+// when negative). The caller holds the runtime's lock and no graph lock -- the
+// one order this file keeps.
+cudaError_t reserve_graph_alloc(State& s, int device, size_t bytes, int* use_device,
+                                uint64_t* va, uint64_t* reserved) {
+  if (device >= 0) {
+    if (device >= static_cast<int>(s.rt->device_count())) return cudaErrorInvalidDevice;
+    *use_device = device;
+  } else {
+    *use_device = t_current_device;
+  }
+  vgpu::MemoryManager& mm = s.rt->device(*use_device).memory();
+  *reserved = round_up_to(bytes, vgpu::MemoryManager::kVmmGranularity);
+  *va = mm.reserve(*reserved, 0);
+  return cudaSuccess;
+}
+
+// The allocation node, registered as owned by `owner` (a graph handle). The
+// caller holds g_graph_mu.
+GraphNodeRec* add_alloc_node(GraphRec& g, void* owner, const std::vector<GraphNodeRec*>& pred,
+                             uint64_t va, uint64_t reserved, size_t bytes, int device) {
+  RecordedLaunch w;
+  w.dst = reinterpret_cast<void*>(va);
+  w.bytes = bytes;
+  GraphNodeRec* n = g.add(cudaGraphNodeTypeMemAlloc, std::move(w), pred);
+  std::lock_guard<std::mutex> mem_lock(g_graph_mem_mu);
+  GraphAlloc a;
+  a.va = va;
+  a.reserved_size = reserved;
+  a.size = bytes;
+  a.device = device;
+  a.owner = owner;
+  g_graph_allocs[va] = a;
+  return n;
+}
+
+// The free node for a graph allocation, in the graph whose handle is `graph`.
+// Refused -- nullptr, with *rc set -- for anything that is not a graph
+// allocation, or one already freed by a node: an allocation is freed once, and
+// in one graph, either the one that owns it or another, never both. Both rules
+// are CUDA's, and both exist because a second free would be freeing an address
+// nothing holds. The caller holds g_graph_mu.
+GraphNodeRec* add_free_node(GraphRec& g, void* graph, const std::vector<GraphNodeRec*>& pred,
+                            void* dptr, cudaError_t* rc) {
+  {
+    std::lock_guard<std::mutex> mem_lock(g_graph_mem_mu);
+    const auto it = g_graph_allocs.find(reinterpret_cast<uint64_t>(dptr));
+    if (it == g_graph_allocs.end() || it->second.freed_in_owner || it->second.freed_elsewhere) {
+      *rc = cudaErrorInvalidValue;
+      return nullptr;
+    }
+    if (it->second.owner == graph) it->second.freed_in_owner = true;
+    else it->second.freed_elsewhere = true;
+  }
+  RecordedLaunch w;
+  w.dst = dptr;
+  *rc = cudaSuccess;
+  return g.add(cudaGraphNodeTypeMemFree, std::move(w), pred);
+}
+}  // namespace
+
 VGPU_EXPORT cudaError_t cudaGraphAddMemAllocNode(cudaGraphNode_t* pNode, cudaGraph_t graph,
                                                  const cudaGraphNode_t* deps, size_t numDeps,
                                                  cudaMemAllocNodeParams* params) {
@@ -4784,16 +5279,7 @@ VGPU_EXPORT cudaError_t cudaGraphAddMemAllocNode(cudaGraphNode_t* pNode, cudaGra
   // The address is reserved now, under the runtime's lock, before the graph lock
   // is taken: that is the one lock order this file keeps.
   const cudaError_t rc = guard("cudaGraphAddMemAllocNode", [&](State& s) -> cudaError_t {
-    if (device >= 0) {
-      if (device >= static_cast<int>(s.rt->device_count())) return cudaErrorInvalidDevice;
-      use_device = device;
-    } else {
-      use_device = t_current_device;
-    }
-    vgpu::MemoryManager& mm = s.rt->device(use_device).memory();
-    reserved_size = round_up_to(params->bytesize, vgpu::MemoryManager::kVmmGranularity);
-    va = mm.reserve(reserved_size, 0);
-    return cudaSuccess;
+    return reserve_graph_alloc(s, device, params->bytesize, &use_device, &va, &reserved_size);
   });
   if (rc != cudaSuccess) return rc;
 
@@ -4801,20 +5287,8 @@ VGPU_EXPORT cudaError_t cudaGraphAddMemAllocNode(cudaGraphNode_t* pNode, cudaGra
   GraphRec* g = graph_from(graph);
   std::vector<GraphNodeRec*> pred;
   if (!g || !deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
-  RecordedLaunch w;
-  w.dst = reinterpret_cast<void*>(va);
-  w.bytes = params->bytesize;
-  GraphNodeRec* n = g->add(cudaGraphNodeTypeMemAlloc, std::move(w), pred);
-  {
-    std::lock_guard<std::mutex> mem_lock(g_graph_mem_mu);
-    GraphAlloc a;
-    a.va = va;
-    a.reserved_size = reserved_size;
-    a.size = params->bytesize;
-    a.device = use_device;
-    a.owner = static_cast<void*>(graph);
-    g_graph_allocs[va] = a;
-  }
+  GraphNodeRec* n = add_alloc_node(*g, static_cast<void*>(graph), pred, va, reserved_size,
+                                   params->bytesize, use_device);
   params->dptr = reinterpret_cast<void*>(va);   // the address, now and for good
   *pNode = reinterpret_cast<cudaGraphNode_t>(n);
   return cudaSuccess;
@@ -4846,23 +5320,148 @@ VGPU_EXPORT cudaError_t cudaGraphAddMemFreeNode(cudaGraphNode_t* pNode, cudaGrap
   GraphRec* g = graph_from(graph);
   std::vector<GraphNodeRec*> pred;
   if (!g || !deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
-  {
-    std::lock_guard<std::mutex> mem_lock(g_graph_mem_mu);
-    const auto it = g_graph_allocs.find(reinterpret_cast<uint64_t>(dptr));
-    if (it == g_graph_allocs.end()) return cudaErrorInvalidValue;   // not a graph allocation
-    GraphAlloc& a = it->second;
-    // An allocation is freed once, and in one graph: either the graph that owns
-    // it or another one, never both. Both rules are CUDA's, and both exist
-    // because a second free would be freeing an address nothing holds.
-    if (a.freed_in_owner || a.freed_elsewhere) return cudaErrorInvalidValue;
-    if (a.owner == static_cast<void*>(graph)) a.freed_in_owner = true;
-    else a.freed_elsewhere = true;
-  }
-  RecordedLaunch w;
-  w.dst = dptr;
-  *pNode = reinterpret_cast<cudaGraphNode_t>(
-      g->add(cudaGraphNodeTypeMemFree, std::move(w), pred));
+  cudaError_t rc = cudaSuccess;
+  GraphNodeRec* n = add_free_node(*g, static_cast<void*>(graph), pred, dptr, &rc);
+  if (!n) return rc;
+  *pNode = reinterpret_cast<cudaGraphNode_t>(n);
   return cudaSuccess;
+}
+
+// ---- stream-ordered allocation and host functions on a capturing stream ----
+//
+// What CUDA documents each becomes in the capture's graph: cudaMallocAsync an
+// allocation node the graph owns, cudaFreeAsync a free node (of a graph
+// allocation, and nothing else), cudaLaunchHostFunc a host node. Each used to
+// happen the moment it was called instead, so a captured malloc/free pair freed
+// the memory before the graph ever ran and every launch used freed memory, and
+// a host function ran once, at capture, and never again.
+bool capture_malloc(State& s, cudaStream_t stream, size_t size, int device, void** ptr,
+                    cudaError_t* rc) {
+  if (!capture_active(stream)) return false;
+  if (size == 0) {
+    *ptr = nullptr;   // nothing to own; no node
+    *rc = cudaSuccess;
+    return true;
+  }
+  int use_device = 0;
+  uint64_t va = 0, reserved = 0;
+  *rc = reserve_graph_alloc(s, device, size, &use_device, &va, &reserved);
+  if (*rc != cudaSuccess) return true;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  StreamCapture* sc = stream_capture(stream);
+  if (!sc) {   // the capture ended while the address was reserved
+    s.rt->device(use_device).memory().address_free(va, reserved);
+    *rc = cudaErrorStreamCaptureInvalidated;
+    return true;
+  }
+  GraphRec& g = *sc->cap->graph;
+  GraphNodeRec* n = add_alloc_node(g, static_cast<void*>(&g), sc->deps, va, reserved, size,
+                                   use_device);
+  sc->deps.assign(1, n);
+  *ptr = reinterpret_cast<void*>(va);
+  *rc = cudaSuccess;
+  return true;
+}
+
+bool capture_free(cudaStream_t stream, void* ptr, cudaError_t* rc) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  StreamCapture* sc = stream_capture(stream);
+  if (!sc) return false;
+  GraphRec& g = *sc->cap->graph;
+  // Only a graph allocation can be freed by a node, as documented.
+  GraphNodeRec* n = add_free_node(g, static_cast<void*>(&g), sc->deps, ptr, rc);
+  if (n) sc->deps.assign(1, n);
+  return true;
+}
+
+bool capture_host_fn(cudaStream_t stream, cudaHostFn_t fn, void* user) {
+  RecordedLaunch r;
+  r.kind = RecordedLaunch::Kind::Host;
+  r.host_fn = fn;
+  r.host_user = user;
+  return capture_record(stream, cudaGraphNodeTypeHost, std::move(r));
+}
+
+// Where `stream`'s capture has got to, for an event recorded on it.
+bool capture_position(cudaStream_t stream, unsigned long long* id, std::vector<void*>* deps) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  StreamCapture* sc = stream_capture(stream);
+  if (!sc) return false;
+  *id = sc->cap->id;
+  deps->assign(sc->deps.begin(), sc->deps.end());
+  return true;
+}
+
+// An event-record or event-wait node on a capturing stream, and where the
+// stream is after it.
+bool capture_event_node(cudaStream_t stream, bool record, cudaEvent_t e, unsigned long long* id,
+                        std::vector<void*>* deps) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  StreamCapture* sc = stream_capture(stream);
+  if (!sc) return false;
+  RecordedLaunch w;
+  w.event = e;
+  capture_add(*sc, record ? cudaGraphNodeTypeEventRecord : cudaGraphNodeTypeWaitEvent,
+              std::move(w));
+  if (id) *id = sc->cap->id;
+  if (deps) deps->assign(sc->deps.begin(), sc->deps.end());
+  return true;
+}
+
+cudaError_t capture_wait(cudaStream_t stream, bool captured, unsigned long long id,
+                         const std::vector<void*>& deps) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  StreamCapture* sc = stream_capture(stream);
+  const auto invalidate = [&](const char* why) {
+    GraphRec& g = *sc->cap->graph;
+    if (!g.invalidated) {
+      g.invalidated = true;
+      g.invalidated_by = why;
+    }
+  };
+  if (!captured) {
+    if (!sc) return cudaSuccess;   // everything the event stood for has finished
+    // A capture may depend only on work inside it; an event recorded outside is
+    // a dependency across its boundary.
+    invalidate("a wait on an event recorded outside the capture");
+    return cudaErrorStreamCaptureIsolation;
+  }
+  Capture* cap = nullptr;
+  for (auto& [origin, c] : g_captures)
+    if (c->id == id) cap = c.get();
+  if (!cap) return cudaErrorCapturedEvent;   // the capture it was recorded in has ended
+  std::vector<GraphNodeRec*> pos;
+  for (void* d : deps)
+    if (auto* n = static_cast<GraphNodeRec*>(d); cap->graph->holds(n)) pos.push_back(n);
+  if (sc) {
+    if (sc->cap != cap) {
+      invalidate("a wait that would merge two captures");
+      return cudaErrorStreamCaptureMerge;
+    }
+    for (GraphNodeRec* n : pos)   // a join
+      if (std::find(sc->deps.begin(), sc->deps.end(), n) == sc->deps.end()) sc->deps.push_back(n);
+    return cudaSuccess;
+  }
+  // A fork: the stream joins the capture, starting where the event's stream was.
+  // Not the legacy stream, which every other stream synchronizes with.
+  if (stream == nullptr || stream == cudaStreamLegacy) return cudaErrorStreamCaptureImplicit;
+  g_stream_capture[reinterpret_cast<void*>(stream)] = StreamCapture{cap, std::move(pos), {}};
+  return cudaSuccess;
+}
+
+// An operation CUDA does not allow on a capturing stream. The capture it was
+// called on is invalidated, so cudaStreamEndCapture says so and names it, and
+// the call itself reports it -- rather than doing it now, outside the graph.
+bool capture_refuse(cudaStream_t stream, const char* what) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  StreamCapture* sc = stream_capture(stream);
+  if (!sc) return false;
+  GraphRec& g = *sc->cap->graph;
+  if (!g.invalidated) {
+    g.invalidated = true;
+    g.invalidated_by = what;
+  }
+  return true;
 }
 
 VGPU_EXPORT cudaError_t cudaGraphMemFreeNodeGetParams(cudaGraphNode_t node, void* dptr_out) {
@@ -5155,22 +5754,22 @@ static cudaError_t capture_info(cudaStream_t stream, cudaStreamCaptureStatus* st
                                 const cudaGraphNode_t** deps, size_t* numDeps) {
   if (!status) return cudaErrorInvalidValue;
   std::lock_guard<std::mutex> lock(g_graph_mu);
-  const auto it = g_capturing.find(reinterpret_cast<void*>(stream));
-  if (it == g_capturing.end()) {
+  StreamCapture* sc = stream_capture(stream);
+  if (!sc) {
     *status = cudaStreamCaptureStatusNone;
     return cudaSuccess;   // the other outputs mean something only while capturing
   }
-  GraphRec& g = *it->second;
+  GraphRec& g = *sc->cap->graph;
   *status = g.invalidated ? cudaStreamCaptureStatusInvalidated : cudaStreamCaptureStatusActive;
-  if (id) *id = g.capture_id;
+  if (id) *id = sc->cap->id;   // the same for every stream in the capture
   if (graph) *graph = static_cast<cudaGraph_t>(static_cast<void*>(&g));
-  // The array stays valid until the next call that names this stream, which is
-  // what the API promises and why it is kept on the capture.
-  g.capture_deps_out.assign(g.capture_deps.size(), nullptr);
-  for (size_t i = 0; i < g.capture_deps.size(); ++i)
-    g.capture_deps_out[i] = reinterpret_cast<cudaGraphNode_t>(g.capture_deps[i]);
-  if (deps) *deps = g.capture_deps_out.empty() ? nullptr : g.capture_deps_out.data();
-  if (numDeps) *numDeps = g.capture_deps_out.size();
+  // This stream's own position. The array stays valid until the next call that
+  // names this stream, which is what the API promises and why it is kept here.
+  sc->deps_out.assign(sc->deps.size(), nullptr);
+  for (size_t i = 0; i < sc->deps.size(); ++i)
+    sc->deps_out[i] = reinterpret_cast<cudaGraphNode_t>(sc->deps[i]);
+  if (deps) *deps = sc->deps_out.empty() ? nullptr : sc->deps_out.data();
+  if (numDeps) *numDeps = sc->deps_out.size();
   return cudaSuccess;
 }
 
@@ -5183,19 +5782,18 @@ static cudaError_t update_capture_deps(cudaStream_t stream, cudaGraphNode_t* dep
     return cudaErrorInvalidValue;
   if (numDependencies && !dependencies) return cudaErrorInvalidValue;
   std::lock_guard<std::mutex> lock(g_graph_mu);
-  const auto it = g_capturing.find(reinterpret_cast<void*>(stream));
-  if (it == g_capturing.end()) return cudaErrorIllegalState;   // as documented
-  GraphRec& g = *it->second;
+  StreamCapture* sc = stream_capture(stream);
+  if (!sc) return cudaErrorIllegalState;   // as documented
+  const GraphRec& g = *sc->cap->graph;
   std::vector<GraphNodeRec*> named;
   for (size_t i = 0; i < numDependencies; ++i) {
     auto* n = reinterpret_cast<GraphNodeRec*>(dependencies[i]);
     if (!n || !g.holds(n)) return cudaErrorInvalidValue;
     named.push_back(n);
   }
-  if (flags == cudaStreamSetCaptureDependencies) g.capture_deps.clear();
+  if (flags == cudaStreamSetCaptureDependencies) sc->deps.clear();
   for (GraphNodeRec* n : named)
-    if (std::find(g.capture_deps.begin(), g.capture_deps.end(), n) == g.capture_deps.end())
-      g.capture_deps.push_back(n);
+    if (std::find(sc->deps.begin(), sc->deps.end(), n) == sc->deps.end()) sc->deps.push_back(n);
   return cudaSuccess;
 }
 
