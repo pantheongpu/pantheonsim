@@ -399,6 +399,9 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // Between a vector register and an accumulation register, which is
       // where a kernel puts what will not fit in the vector ones. They share
       // the packed forms' encoding without being packed.
+      // A matrix multiply-add over the whole wave: a 16x16 by 16x16 product of
+      // halves, added into a 16x16 block of floats spread across the lanes.
+      {{Enc::Vop3p, 0x4d}, {"v_mfma_f32_16x16x16_f16", 4, 3, 2, 2, 4}},
       {{Enc::Vop3p, 0x58}, {"v_accvgpr_read_b32", 1, 1}},
       {{Enc::Vop3p, 0x59}, {"v_accvgpr_write_b32", 1, 1}},
   };
@@ -725,6 +728,27 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.size = 8;
     const uint32_t w1 = word(code, at + 4);
     in.clamp = (w0 >> 15) & 1;
+    // The matrix instructions share the packed encoding and read its bits
+    // their own way: which of the accumulation registers the result and the
+    // addend live in, and three ways of broadcasting parts of the sources,
+    // which are refused rather than guessed at.
+    if (in.name.rfind("v_mfma", 0) == 0) {
+      in.clamp = false;
+      const uint32_t cbsz = (w0 >> 8) & 0x7, abid = (w0 >> 11) & 0xF, acc_cd = (w0 >> 15) & 1;
+      const uint32_t acc = (w1 >> 27) & 0x3, blgp = (w1 >> 29) & 0x7;
+      if (cbsz || abid || blgp)
+        throw Error::make(Err::Unsupported, in.name, " broadcasts part of a source (cbsz ", cbsz, ", abid ", abid,
+                          ", blgp ", blgp, "), which this does not model");
+      in.dst.push_back(vgpr(w0 & 0xFF, s.dst_width));
+      if (acc_cd) in.dst[0].kind = OperandKind::Agpr;
+      for (uint32_t k = 0; k < s.srcs; ++k) {
+        Operand o = take((w1 >> (9 * k)) & 0x1FF, s.src_width(k));
+        if (k < 2 && ((acc >> k) & 1) && o.kind == OperandKind::Vgpr) o.kind = OperandKind::Agpr;
+        if (k == 2 && acc_cd && o.kind == OperandKind::Vgpr) o.kind = OperandKind::Agpr;
+        in.src.push_back(o);
+      }
+      return in;
+    }
     // op_sel picks which half of each source feeds which half of the result.
     // Plain packed work is op_sel 0 with op_sel_hi all ones, and anything
     // else is a shuffle this does not model.

@@ -21,6 +21,7 @@ expect() {  # expect <name> <expected> <actual>
 if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
   untracked=""
   for f in amd/tests/hipcc/ops.hip amd/tests/hipcc/ops.gfx942.o amd/tests/hipcc/ops.gfx942.dis \
+           amd/tests/hipcc/wmma.cpp amd/tests/hipcc/wmma.gfx942.o amd/tests/hipcc/wmma.gfx942.dis \
            amd/tests/hipcc/chevron.cpp amd/tests/hipcc/chevron.gfx942; do
     git -C "$root" ls-files --error-unmatch "$f" >/dev/null 2>&1 || untracked="$untracked $f"
   done

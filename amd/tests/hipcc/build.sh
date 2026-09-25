@@ -18,3 +18,11 @@ echo "wrote $(pwd)/chevron.gfx942"
 "$rocm/lib/llvm/bin/llvm-objdump" -d --mcpu=gfx942 ops.gfx942.o |
   sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > ops.gfx942.dis
 echo "wrote $(pwd)/ops.gfx942.o and its listing ($(wc -l < ops.gfx942.dis) instructions)"
+
+# A GEMM through rocWMMA, whose loads and stores put each matrix element
+# where the hardware's matrix instructions expect it. Needs rocwmma-dev.
+"$rocm/bin/hipcc" -O3 -std=c++17 --offload-arch=gfx942 --offload-device-only --no-gpu-bundle-output \
+  -c wmma.cpp -o wmma.gfx942.o
+"$rocm/lib/llvm/bin/llvm-objdump" -d --mcpu=gfx942 wmma.gfx942.o |
+  sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > wmma.gfx942.dis
+echo "wrote $(pwd)/wmma.gfx942.o and its listing ($(wc -l < wmma.gfx942.dis) instructions)"
