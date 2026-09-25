@@ -628,6 +628,40 @@ constexpr size_t op_index() {
   return Op(std::in_place_type<T>).index();
 }
 
+// D = A x B + C for a 16x16 tile, K deep, in f32: each element accumulates
+// its products in k order, one rounding for the product and one for the sum,
+// as exec_wmma_mma always has. A row is two 8-float vectors, built for AVX2 as
+// well as the baseline and chosen at load. Contraction is off here so that no
+// build -- -march=native included -- fuses the multiply and add into an FMA
+// and changes the bits.
+#pragma GCC push_options
+#pragma GCC optimize("fp-contract=off")
+typedef float WmmaRow8 __attribute__((vector_size(32)));
+#if defined(__x86_64__) && defined(__GNUC__)
+__attribute__((target_clones("avx2", "default")))
+#endif
+void wmma_tile(float (&D)[16][16], const float (&A)[16][16], const float (&B)[16][16],
+               const float (&C)[16][16], uint32_t K) {
+  for (uint32_t i = 0; i < 16; ++i) {
+    WmmaRow8 lo, hi;
+    std::memcpy(&lo, &C[i][0], sizeof lo);
+    std::memcpy(&hi, &C[i][8], sizeof hi);
+    for (uint32_t k = 0; k < K; ++k) {
+      const float aik = A[i][k];
+      const WmmaRow8 a = {aik, aik, aik, aik, aik, aik, aik, aik};
+      WmmaRow8 bl, bh;
+      std::memcpy(&bl, &B[k][0], sizeof bl);
+      std::memcpy(&bh, &B[k][8], sizeof bh);
+      const WmmaRow8 pl = a * bl, ph = a * bh;
+      lo = lo + pl;
+      hi = hi + ph;
+    }
+    std::memcpy(&D[i][0], &lo, sizeof lo);
+    std::memcpy(&D[i][8], &hi, sizeof hi);
+  }
+}
+#pragma GCC pop_options
+
 uint64_t mask_to_bits(uint64_t v, uint32_t bits) {
   return bits >= 64 ? v : (v & ((1ull << bits) - 1));
 }
@@ -3527,6 +3561,7 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpWmmaMma>(&ins.op)) {
       require_warp32(ins, "wmma.mma");
+      if (g_fast_path.load(std::memory_order_relaxed) && fast_wmma_mma(w, *op, m)) return;
       exec_wmma_mma(w, ctx, ins, *op, m);
       return;
     }
@@ -4523,6 +4558,69 @@ class Interpreter {
     }
   }
 
+  // The same fragments as exec_wmma_mma below, read from and written to the
+  // 32-bit register file in place, with the halves decoded from the table.
+  bool fast_wmma_mma(Warp& w, const OpWmmaMma& op, Mask m) {
+    if (op.elem == WmmaElem::TF32 || mem_.alu_fault_armed() || W_ != 32) return false;
+    for (const auto* v : {&op.a, &op.b, &op.c, &op.d})
+      for (const Reg& r : *v)
+        if (r.wide) return false;
+    const bool bf = op.elem == WmmaElem::BF16;
+    const int ab_regs = bf ? 4 : 8;
+    if (op.a.size() != size_t(ab_regs) || op.b.size() != size_t(ab_regs) || op.c.size() != 8 ||
+        op.d.size() != 8)
+      return false;
+    float A[kMmaDim][kMmaDim] = {}, B[kMmaDim][kMmaDim] = {}, C[kMmaDim][kMmaDim] = {};
+    // A register nothing has written reads as zero, as read_operand has it.
+    static const Lanes32 kZero{};
+    auto regs = [&](const Reg& r) -> const Lanes32& {
+      return r.id < w.regs32.size() && w.written32[r.id] ? w.regs32[r.id] : kZero;
+    };
+    const uint32_t lanes_used = bf ? W_ : kMmaDim;
+    for (int reg = 0; reg < ab_regs; ++reg) {
+      const Lanes32& av = regs(op.a[reg]);
+      const Lanes32& bv = regs(op.b[reg]);
+      for (uint32_t lane = 0; lane < lanes_used; ++lane)
+        for (int h = 0; h < 2; ++h) {
+          uint32_t row, col;
+          if (bf) {
+            const uint32_t linear = lane * 8 + static_cast<uint32_t>(reg * 2 + h);
+            row = linear / kMmaDim;
+            col = linear % kMmaDim;
+          } else {
+            row = lane;
+            col = static_cast<uint32_t>(reg * 2 + h);
+          }
+          const uint32_t abits = (av[lane] >> (16 * h)) & 0xFFFF;
+          const uint32_t bbits = (bv[lane] >> (16 * h)) & 0xFFFF;
+          const float a = static_cast<float>(bf ? bf16_to_double(abits) : kF16ToDouble[abits]);
+          const float b = static_cast<float>(bf ? bf16_to_double(bbits) : kF16ToDouble[bbits]);
+          if (op.alayout == MatLayout::Row) A[row][col] = a; else A[col][row] = a;
+          if (op.blayout == MatLayout::Row) B[row][col] = b; else B[col][row] = b;
+        }
+    }
+    for (int reg = 0; reg < 8; ++reg) {
+      const Lanes32& cv = regs(op.c[reg]);
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        const uint32_t linear = lane * 8 + static_cast<uint32_t>(reg);
+        C[linear / kMmaDim][linear % kMmaDim] = f32(cv[lane]);
+      }
+    }
+    float D[kMmaDim][kMmaDim];
+    wmma_tile(D, A, B, C, kMmaDim);
+    // Every register of D, written after all of A, B and C have been read:
+    // D may name the same registers as C.
+    for (int reg = 0; reg < 8; ++reg) {
+      uint32_t* d = w.regs32[op.d[reg].id].data();
+      for_active(m, W_, [&](uint32_t lane) {
+        const uint32_t linear = lane * 8 + static_cast<uint32_t>(reg);
+        d[lane] = static_cast<uint32_t>(f32bits(D[linear / kMmaDim][linear % kMmaDim]));
+      });
+      w.written32[op.d[reg].id] = 1;
+    }
+    return true;
+  }
+
   void exec_wmma_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaMma& op, Mask m) {
     // Gather A and B (16x16 f16 each) and C (16x16 f32) from the warp.
     // Held as f32, which every element type here fits exactly (f16 and bf16 are
@@ -4590,13 +4688,7 @@ class Interpreter {
     // Each element still accumulates its products in k order, exactly as the
     // element-by-element form did; running j innermost lets it vectorize.
     float D[kMmaDim][kMmaDim];
-    for (uint32_t i = 0; i < kMmaDim; ++i) {
-      for (uint32_t j = 0; j < kMmaDim; ++j) D[i][j] = C[i][j];
-      for (uint32_t k = 0; k < K; ++k) {
-        const float aik = A[i][k];
-        for (uint32_t j = 0; j < kMmaDim; ++j) D[i][j] += aik * B[k][j];
-      }
-    }
+    wmma_tile(D, A, B, C, K);
     // Scatter D back into the destination fragment.
     for (int reg = 0; reg < 8; ++reg) {
       Lanes r;  // written for every active lane below

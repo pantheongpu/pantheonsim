@@ -316,4 +316,84 @@ VTEST(fast_address_arithmetic_matches_the_general_path) {
   same("mul.wide.s32 %D, %a, -3;", true, a, b, c);
 }
 
+// wmma.mma from registers loaded with values that make every rounding in the
+// f32 accumulation matter -- thirds and tenths, large and small, signed zeros,
+// NaN and infinity -- in f16 and bf16, all four layout pairings, and with the
+// result written over the accumulator it read.
+namespace {
+std::vector<uint32_t> run_wmma(const std::string& shape, bool alias, const std::vector<uint32_t>& frag) {
+  std::string dregs = alias ? "%c0, %c1, %c2, %c3, %c4, %c5, %c6, %c7"
+                            : "%x0, %x1, %x2, %x3, %x4, %x5, %x6, %x7";
+  std::string loads, stores;
+  for (int r = 0; r < 8; ++r) {
+    loads += "    ld.global.u32 %a" + std::to_string(r) + ", [%rd3+" + std::to_string(r * 4) + "];\n";
+    loads += "    ld.global.u32 %b" + std::to_string(r) + ", [%rd3+" + std::to_string(32 + r * 4) + "];\n";
+    loads += "    ld.global.u32 %c" + std::to_string(r) + ", [%rd3+" + std::to_string(64 + r * 4) + "];\n";
+    stores += "    st.global.u32 [%rd4+" + std::to_string(r * 4) + "], " + (alias ? "%c" : "%x") +
+              std::to_string(r) + ";\n";
+  }
+  const bool bf = shape.find("bf16") != std::string::npos;
+  const std::string areg = bf ? "{%a0, %a1, %a2, %a3}" : "{%a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7}";
+  const std::string breg = bf ? "{%b0, %b1, %b2, %b3}" : "{%b0, %b1, %b2, %b3, %b4, %b5, %b6, %b7}";
+  const std::string ptx = std::string(".version 8.3\n.target sm_86\n.address_size 64\n") + R"(
+.visible .entry k(.param .u64 in, .param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<8>;
+    .reg .b32 %a<8>, %b<8>, %c<8>, %x<8>;
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    mov.u32 %r1, %laneid;
+    mul.wide.u32 %rd5, %r1, 96;
+    add.u64 %rd3, %rd1, %rd5;
+    mul.wide.u32 %rd6, %r1, 32;
+    add.u64 %rd4, %rd2, %rd6;
+)" + loads + "    wmma.mma.sync.aligned." + shape + " {" + dregs + "}, " + areg + ", " + breg +
+                          ", {%c0, %c1, %c2, %c3, %c4, %c5, %c6, %c7};\n" + stores + "    ret;\n}\n";
+  MemoryManager mem{1 << 20};
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  auto m = ptx::parse(ptx);
+  const uint64_t in = mem.alloc(frag.size() * 4), out = mem.alloc(32 * 32);
+  mem.write(in, frag.data(), frag.size() * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(in), arg_u64(out)}, mem, prof);
+  std::vector<uint32_t> res(32 * 8);
+  mem.read(out, res.data(), res.size() * 4);
+  return res;
+}
+}  // namespace
+
+VTEST(fast_wmma_matches_the_general_path) {
+  const uint16_t h16[] = {0x3555, 0x2E66, 0xBC00, 0x3C00, 0x7BFF, 0x0001, 0x8000, 0x4248, 0xC0A0,
+                          0x1400, 0x5A00, 0x3800, 0x7C00, 0x7E00, 0x0400, 0xB555};
+  const uint16_t hbf[] = {0x3EAB, 0x3DCD, 0xBF80, 0x3F80, 0x7F7F, 0x0001, 0x8000, 0x4049, 0xC0A0,
+                          0x3A00, 0x4700, 0x3F00, 0x7F80, 0x7FC0, 0x0080, 0xBEAB};
+  const float cv[] = {0.0f, -0.0f, 1.0f / 3, 1e-8f, -2.5f, 1e30f, 0.1f, 7.0f};
+  for (bool bf : {false, true}) {
+    std::vector<uint32_t> frag;
+    for (int lane = 0; lane < 32; ++lane) {
+      for (int r = 0; r < 16; ++r) {   // 8 A words then 8 B words
+        const uint16_t* t = bf ? hbf : h16;
+        const uint16_t lo = t[(lane * 3 + r * 5) % 16], hi = t[(lane * 7 + r * 3 + 1) % 16];
+        frag.push_back(uint32_t{lo} | (uint32_t{hi} << 16));
+      }
+      for (int r = 0; r < 8; ++r) frag.push_back(fbits(cv[(lane + r) % 8] * float(1 + lane % 5)));
+    }
+    for (const char* lay : {"row.row", "row.col", "col.row", "col.col"})
+      for (bool alias : {false, true}) {
+        const std::string shape = std::string(lay) + ".m16n16k16.f32" + (bf ? ".bf16.bf16" : ".f32");
+        setenv("VGPU_FASTPATH", "1", 1);
+        const auto fast = run_wmma(shape, alias, frag);
+        setenv("VGPU_FASTPATH", "0", 1);
+        const auto slow = run_wmma(shape, alias, frag);
+        unsetenv("VGPU_FASTPATH");
+        for (size_t i = 0; i < fast.size(); ++i)
+          if (fast[i] != slow[i])
+            throw vtest::Failure("wmma " + shape + (alias ? " (D over C)" : "") + ": word " +
+                                 std::to_string(i) + " differs");
+      }
+  }
+}
+
 VTEST_MAIN
