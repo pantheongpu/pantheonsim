@@ -1,5 +1,5 @@
 name: PantheonSim
-description: Run CUDA programs and tests on simulated NVIDIA GPUs, on a runner that has no GPU.
+description: Run CUDA and HIP programs and tests on simulated NVIDIA and AMD GPUs, on a runner that has no GPU.
 author: PantheonGPU
 branding:
   icon: cpu
@@ -7,17 +7,28 @@ branding:
 
 inputs:
   gpu:
-    description: The GPU to simulate, by profile id (`vgpu list-gpus`), e.g. nvidia/h100 or nvidia/t4.
+    description: >
+      The GPU to simulate, by profile id (`vgpu list-gpus`), e.g. nvidia/h100,
+      nvidia/t4 or amd/mi300x.
     default: nvidia/t4
   count:
     description: How many of them.
     default: '1'
   cuda-toolkit:
     description: >
-      `apt` installs Ubuntu's nvidia-cuda-toolkit so the job can compile CUDA code.
-      `none` uses a toolkit the job has already installed (the simulator's CUDA
-      libraries are built against whichever toolkit is present, and match its version).
-    default: apt
+      For an NVIDIA GPU: `apt` installs Ubuntu's nvidia-cuda-toolkit (CUDA 12.0 on
+      ubuntu-24.04); a version such as `12.6` or `13.0` installs that nvcc from
+      NVIDIA's repository; `none` uses a toolkit the job has already installed (the
+      simulator's CUDA libraries are built against whichever toolkit is present, and
+      match its version). Left empty, it is `apt` for an NVIDIA GPU and `none` for
+      an AMD one.
+    default: ''
+  rocm:
+    description: >
+      For an AMD GPU: the ROCm version whose hipcc to install from AMD's
+      repository, e.g. `7.1`, or `none` to use a ROCm the job has already
+      installed. Left empty, it is `7.1` for an AMD GPU and `none` for an NVIDIA one.
+    default: ''
 
 outputs:
   build-dir:
@@ -38,17 +49,81 @@ runs:
           exit 1
         fi
 
+    - name: Work out the toolkits
+      id: want
+      shell: bash
+      env:
+        GPU: ${{ inputs.gpu }}
+        TOOLKIT: ${{ inputs.cuda-toolkit }}
+        ROCM: ${{ inputs.rocm }}
+      run: |
+        case "$GPU" in amd/*) amd=1 ;; *) amd= ;; esac
+        [[ -n "$TOOLKIT" ]] || TOOLKIT=$([[ $amd ]] && echo none || echo apt)
+        [[ -n "$ROCM" ]] || ROCM=$([[ $amd ]] && echo 7.1 || echo none)
+        # Checked before anything reaches a shell command or a URL.
+        [[ "$TOOLKIT" =~ ^(apt|none|[0-9]+\.[0-9]+)$ ]] || { echo "::error::cuda-toolkit must be apt, none or a version like 12.6, not '$TOOLKIT'"; exit 1; }
+        [[ "$ROCM" =~ ^(none|[0-9]+\.[0-9]+(\.[0-9]+)?)$ ]] || { echo "::error::rocm must be none or a version like 7.1, not '$ROCM'"; exit 1; }
+        { echo "cuda=$TOOLKIT"; echo "rocm=$ROCM"; } >> "$GITHUB_OUTPUT"
+
     - name: Install build tools
       shell: bash
       env:
-        TOOLKIT: ${{ inputs.cuda-toolkit }}
+        TOOLKIT: ${{ steps.want.outputs.cuda }}
       run: |
-        case "$TOOLKIT" in apt|none) ;; *) echo "::error::cuda-toolkit must be apt or none, not '$TOOLKIT'"; exit 1 ;; esac
         pkgs="cmake ninja-build g++"
         # Ubuntu's toolkit is CUDA 12.0, whose nvcc accepts gcc 12 at most.
         [[ "$TOOLKIT" == apt ]] && pkgs="$pkgs nvidia-cuda-toolkit g++-12"
         sudo apt-get update -qq
         sudo apt-get install -y -qq --no-install-recommends $pkgs
+
+    - name: Install CUDA ${{ steps.want.outputs.cuda }} from NVIDIA
+      if: steps.want.outputs.cuda != 'apt' && steps.want.outputs.cuda != 'none'
+      shell: bash
+      env:
+        TOOLKIT: ${{ steps.want.outputs.cuda }}
+      run: |
+        . /etc/os-release
+        repo="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${VERSION_ID//./}/x86_64"
+        wget -qO "$RUNNER_TEMP/cuda-keyring.deb" "$repo/cuda-keyring_1.1-1_all.deb"
+        sudo dpkg -i "$RUNNER_TEMP/cuda-keyring.deb"
+        sudo apt-get update -qq
+        v="${TOOLKIT//./-}"
+        # CUDA 13 renamed the NVVM package.
+        nvvm="cuda-nvvm-$v"; [[ "${TOOLKIT%%.*}" -ge 13 ]] && nvvm="libnvvm-$v"
+        sudo apt-get install -y -qq --no-install-recommends \
+          "cuda-nvcc-$v" "cuda-cudart-dev-$v" "cuda-crt-$v" "$nvvm" \
+          || { echo "::error::could not install CUDA $TOOLKIT from NVIDIA's repository for Ubuntu $VERSION_ID"; exit 1; }
+        echo "/usr/local/cuda-$TOOLKIT/bin" >> "$GITHUB_PATH"
+
+    # hipcc and the pieces it needs to compile and link, not the ROCm runtime:
+    # the simulator is the runtime. Extracted rather than installed, because
+    # the full packages pull in the kernel driver and the whole runtime stack.
+    - name: Install ROCm ${{ steps.want.outputs.rocm }} hipcc from AMD
+      if: steps.want.outputs.rocm != 'none'
+      shell: bash
+      env:
+        ROCM: ${{ steps.want.outputs.rocm }}
+      run: |
+        . /etc/os-release
+        elf=libelf1t64; apt-cache show libelf1t64 > /dev/null 2>&1 || elf=libelf1
+        sudo apt-get install -y -qq --no-install-recommends libxml2 libnuma1 "$elf"
+        sudo mkdir -p /etc/apt/keyrings
+        wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM $VERSION_CODENAME main" \
+          | sudo tee /etc/apt/sources.list.d/rocm.list > /dev/null
+        # AMD's packages, not Ubuntu's hipcc of the same name.
+        printf 'Package: *\nPin: origin repo.radeon.com\nPin-Priority: 1001\n' | sudo tee /etc/apt/preferences.d/rocm > /dev/null
+        sudo apt-get update -qq
+        dir="$RUNNER_TEMP/rocm-debs"; mkdir -p "$dir"
+        (cd "$dir" && apt-get download hipcc hip-dev rocm-llvm rocm-device-libs rocm-core hsa-rocr-dev) \
+          || { echo "::error::could not download ROCm $ROCM for Ubuntu $VERSION_ID from repo.radeon.com"; exit 1; }
+        for d in "$dir"/*.deb; do sudo dpkg-deb -x "$d" /; done
+        rm -rf "$dir"
+        root=$(ls -d /opt/rocm-"$ROCM"* | sort -V | tail -1)
+        sudo ln -sfn "$root" /opt/rocm
+        echo "/opt/rocm/bin" >> "$GITHUB_PATH"
+        echo "ROCM_PATH=/opt/rocm" >> "$GITHUB_ENV"
+        /opt/rocm/bin/hipcc --version | head -3
 
     - name: Work out the build
       id: paths
@@ -92,7 +167,8 @@ runs:
         BUILD: ${{ steps.paths.outputs.build }}
         GPU: ${{ inputs.gpu }}
         COUNT: ${{ inputs.count }}
-        TOOLKIT: ${{ inputs.cuda-toolkit }}
+        TOOLKIT: ${{ steps.want.outputs.cuda }}
+        ROCM: ${{ steps.want.outputs.rocm }}
       run: |
         # An unknown profile fails here, by name, rather than in the job's tests.
         "$BUILD/vgpu" info --gpu "$GPU" > /dev/null || { echo "::error::no GPU profile '$GPU' (see vgpu list-gpus)"; exit 1; }
@@ -108,4 +184,14 @@ runs:
         if [[ "$TOOLKIT" == apt ]] && command -v g++-12 > /dev/null; then
           echo "NVCC_PREPEND_FLAGS=-ccbin g++-12" >> "$GITHUB_ENV"
         fi
-        VGPU_GPU="$GPU" VGPU_DEVICE_COUNT="$COUNT" "$BUILD/bin/nvidia-smi" -L
+        # A program hipcc built looks for libamdhip64 in /opt/rocm/lib first
+        # (RUNPATH). Pointing that at the simulator lets it run directly, from
+        # ctest or a script, as well as under vgpu run.
+        if [[ "$ROCM" != none && -d /opt/rocm/lib ]]; then
+          hip=$(readlink -f "$BUILD/shim/libamdhip64.so.6")
+          for n in libamdhip64.so libamdhip64.so.6 libamdhip64.so.7; do sudo ln -sfn "$hip" "/opt/rocm/lib/$n"; done
+        fi
+        case "$GPU" in
+          amd/*) VGPU_GPU="$GPU" VGPU_DEVICE_COUNT="$COUNT" "$BUILD/bin/rocm-smi" ;;
+          *)     VGPU_GPU="$GPU" VGPU_DEVICE_COUNT="$COUNT" "$BUILD/bin/nvidia-smi" -L ;;
+        esac

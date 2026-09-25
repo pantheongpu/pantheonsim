@@ -65,3 +65,92 @@ jobs:
 
       - name: The outputs name the build
         run: test -x "${{ steps.sim.outputs.build-dir }}/vgpu" && test -e "${{ steps.sim.outputs.shim-dir }}/libcudart.so"
+
+  amd:
+    name: compile and run HIP on simulated AMD GPUs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PantheonSim
+        uses: ./
+        with:
+          gpu: amd/mi300x
+          count: 2
+
+      - name: The job sees two MI300Xs, and nvcc was not installed
+        run: |
+          rocm-smi
+          test "$(rocm_agent_enumerator | grep -c gfx942)" = 2
+          ! command -v /usr/bin/nvcc
+
+      - name: Compile with ROCm's hipcc and run it, under vgpu run and directly
+        run: |
+          cat > vectoradd.hip <<'HIP'
+          #include <hip/hip_runtime.h>
+          #include <cstdio>
+          __global__ void add(float* c, const float* a, const float* b, int n) {
+            int i = blockIdx.x * blockDim.x + threadIdx.x;
+            if (i < n) c[i] = a[i] + b[i];
+          }
+          int main() {
+            const int n = 4096;
+            float a[n], b[n], c[n];
+            for (int i = 0; i < n; ++i) { a[i] = i; b[i] = 2 * i; }
+            int devices = 0;
+            if (hipGetDeviceCount(&devices) != hipSuccess || devices != 2) { std::printf("devices: %d\n", devices); return 3; }
+            float* da, *db, *dc;
+            if (hipMalloc(&da, sizeof a) || hipMalloc(&db, sizeof b) || hipMalloc(&dc, sizeof c)) return 2;
+            hipMemcpy(da, a, sizeof a, hipMemcpyHostToDevice);
+            hipMemcpy(db, b, sizeof b, hipMemcpyHostToDevice);
+            add<<<(n + 255) / 256, 256>>>(dc, da, db, n);
+            if (hipDeviceSynchronize() != hipSuccess) return 2;
+            hipMemcpy(c, dc, sizeof c, hipMemcpyDeviceToHost);
+            for (int i = 0; i < n; ++i) if (c[i] != 3 * i) { std::printf("wrong at %d\n", i); return 1; }
+            std::printf("ok: %d elements\n", n);
+            return 0;
+          }
+          HIP
+          hipcc --version | grep -i 'HIP version'
+          hipcc --offload-arch=gfx942 vectoradd.hip -o vectoradd
+          vgpu run ./vectoradd
+          ./vectoradd
+
+  cuda-version:
+    name: compile and run CUDA 12.6 from NVIDIA's repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PantheonSim
+        uses: ./
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: '12.6'
+
+      - name: nvcc is 12.6 and the job sees an H100
+        run: |
+          nvcc --version | grep -q 'release 12.6'
+          nvidia-smi -L | grep -q H100
+
+      - name: Compile for Hopper and run it
+        run: |
+          cat > hello.cu <<'CU'
+          #include <cstdio>
+          __global__ void k(int* out) { out[threadIdx.x] = threadIdx.x * 2; }
+          int main() {
+            int* d; int h[64];
+            cudaMalloc(&d, sizeof h);
+            k<<<1, 64>>>(d);
+            cudaMemcpy(h, d, sizeof h, cudaMemcpyDeviceToHost);
+            for (int i = 0; i < 64; ++i) if (h[i] != 2 * i) return 1;
+            cudaDeviceProp p; cudaGetDeviceProperties(&p, 0);
+            std::printf("ok on %s (sm_%d%d)\n", p.name, p.major, p.minor);
+            return 0;
+          }
+          CU
+          nvcc -arch=compute_90 -code=compute_90 hello.cu -o hello
+          vgpu run ./hello | tee out.txt
+          grep -q 'H100' out.txt
