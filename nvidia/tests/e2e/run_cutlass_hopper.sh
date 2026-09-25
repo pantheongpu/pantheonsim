@@ -46,18 +46,31 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu_cutlass_hopper.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 tests=(tma_load tma_store bulk_load bulk_store)
 u="$cutlass/test/unit"
-pids=()
-for t in "${tests[@]}"; do
+# Each compile instantiates most of CuTe and peaks near 10 GB (9.6 GB measured
+# for tma_load with CUDA 13). All four at once took a 16 GB GitHub runner past
+# its memory, and the runner was shut down in the middle of the job ("The runner
+# has received a shutdown signal"), three runs out of three. So as many run
+# together as the free memory holds, and never fewer than one.
+per_compile_kb=$((${VGPU_NVCC_COMPILE_MB:-10240} * 1024))
+avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+jobs=$(( avail_kb / per_compile_kb ))
+(( jobs < 1 )) && jobs=1
+(( jobs > ${#tests[@]} )) && jobs=${#tests[@]}
+compile() {
   nvcc -std=c++17 -O1 -cudart shared -arch=compute_90a -code=compute_90a --expt-relaxed-constexpr \
        -I "$cutlass/include" -I "$cutlass/tools/util/include" -I "$u/common" -I "$u" \
-       -I "$gtest/googletest/include" "$u/cute/hopper/$t.cu" "$u/test_unit.cpp" \
-       "$u/common/filter_architecture.cpp" "$gtest/libgtest.a" -o "$work/$t" >"$work/$t.log" 2>&1 &
-  pids+=($!)
-done
-for i in "${!pids[@]}"; do
-  if ! wait "${pids[$i]}"; then
-    echo "FAIL: ${tests[$i]} did not compile"; tail -20 "$work/${tests[$i]}.log"; exit 1
-  fi
+       -I "$gtest/googletest/include" "$u/cute/hopper/$1.cu" "$u/test_unit.cpp" \
+       "$u/common/filter_architecture.cpp" "$gtest/libgtest.a" -o "$work/$1" >"$work/$1.log" 2>&1
+}
+for ((first = 0; first < ${#tests[@]}; first += jobs)); do
+  pids=()
+  names=("${tests[@]:first:jobs}")
+  for t in "${names[@]}"; do compile "$t" & pids+=($!); done
+  for i in "${!pids[@]}"; do
+    if ! wait "${pids[$i]}"; then
+      echo "FAIL: ${names[$i]} did not compile"; tail -20 "$work/${names[$i]}.log"; exit 1
+    fi
+  done
 done
 fail=0
 for t in "${tests[@]}"; do
