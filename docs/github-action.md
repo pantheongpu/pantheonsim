@@ -70,6 +70,7 @@ and 4 when the program did not run at all (`vgpu test --help`).
 | `count` | `1` | How many GPUs |
 | `cuda-toolkit` | `apt` for NVIDIA, `none` for AMD | `apt` installs Ubuntu's toolkit; a version like `12.6` or `13.0` installs that `nvcc` from NVIDIA; `none` uses one the job already installed |
 | `rocm` | `7.1` for AMD, `none` for NVIDIA | The ROCm version whose `hipcc` to install; `none` uses one the job already installed |
+| `library-path` | `true` | Puts the simulator's libraries on `LD_LIBRARY_PATH`, so programs run directly (ctest, scripts) as well as under `vgpu run` |
 
 ## Outputs
 
@@ -86,4 +87,21 @@ and 4 when the program did not run at all (`vgpu test --help`).
   MI350X.
 - The simulator's CUDA libraries are built against the job's toolkit, so their
   version always matches the `nvcc` that compiled the program.
+- Test suites run unchanged. With `library-path: true` (the default), a
+  program run directly, by `ctest` or a script, reaches the simulated GPUs
+  just as it does under `vgpu run`. Programs are linked with the shared CUDA
+  runtime even where a build asks for the static one (`-cudart static`,
+  `-lcudart_static`, CMake's default), because the static runtime cannot talk
+  to a simulated driver.
+- CMake projects get the shared runtime through a toolchain file the action
+  names in `CMAKE_TOOLCHAIN_FILE`, since CMake links with the host compiler
+  where the `nvcc` wrapper cannot reach. A project that sets its own
+  toolchain file needs `set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)` in it.
+- Build HIP code with optimization (`-O1` or higher; CMake's `Release` or
+  `RelWithDebInfo`). Unoptimized HIP code (`-O0`, and CMake's default when no
+  build type is set) calls helper functions the simulator does not run
+  correctly yet.
+- Runners: `ubuntu-24.04` and `ubuntu-22.04`, and container jobs (which run as
+  root without `sudo`). On 22.04, Ubuntu's own CUDA toolkit is 11.5, older than
+  the simulator supports, so an NVIDIA job there gets CUDA 12.6 from NVIDIA.
 - It checks behaviour, not performance: timings mean nothing here.

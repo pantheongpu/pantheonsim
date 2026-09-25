@@ -157,3 +157,65 @@ jobs:
           nvcc -arch=compute_90 -code=compute_90 hello.cu -o hello
           vgpu run ./hello | tee out.txt
           grep -q 'H100' out.txt
+
+  # The runners and project setups the jobs above do not cover. Each one is a
+  # way a real project might use the action.
+  ubuntu-22-04:
+    name: ubuntu-22.04, ${{ matrix.gpu }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu: [nvidia/t4, amd/mi300x]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          gpu: ${{ matrix.gpu }}
+      - name: Build and run on the simulated GPU
+        run: |
+          if [[ "${{ matrix.gpu }}" == amd/* ]]; then
+            hipcc --offload-arch=gfx942 .github/action-tests/cmake-hip/vectoradd.hip -o vectoradd
+          else
+            nvcc -arch=compute_75 -code=compute_75 .github/action-tests/cmake-cuda/vectoradd.cu -o vectoradd
+          fi
+          vgpu run ./vectoradd
+
+  container:
+    name: in a container job (root, no sudo)
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          gpu: nvidia/t4
+      - name: Build and run on the simulated GPU
+        run: |
+          nvcc -arch=compute_75 -code=compute_75 .github/action-tests/cmake-cuda/vectoradd.cu -o vectoradd
+          vgpu run ./vectoradd
+
+  cmake:
+    name: a CMake project, ${{ matrix.gpu }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { gpu: nvidia/t4, project: cmake-cuda }
+          - { gpu: amd/mi300x, project: cmake-hip }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          gpu: ${{ matrix.gpu }}
+      - name: Configure, build and ctest, unmodified
+        run: |
+          # Release, as CI builds usually are. Unoptimized HIP code (-O0, which
+          # is what CMake builds with no build type) does not run yet.
+          cmake -S .github/action-tests/${{ matrix.project }} -B build-test -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-test -v
+          ctest --test-dir build-test --output-on-failure

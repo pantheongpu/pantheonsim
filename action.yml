@@ -29,6 +29,13 @@ inputs:
       repository, e.g. `7.1`, or `none` to use a ROCm the job has already
       installed. Left empty, it is `7.1` for an AMD GPU and `none` for an NVIDIA one.
     default: ''
+  library-path:
+    description: >
+      `true` puts the simulator's libraries on LD_LIBRARY_PATH for the rest of
+      the job, so programs run directly (from ctest, a test script, python) as
+      well as under `vgpu run`. `false` leaves LD_LIBRARY_PATH alone, and only
+      `vgpu run` reaches the simulated GPUs.
+    default: 'true'
 
 outputs:
   build-dir:
@@ -58,41 +65,61 @@ runs:
         ROCM: ${{ inputs.rocm }}
       run: |
         case "$GPU" in amd/*) amd=1 ;; *) amd= ;; esac
-        [[ -n "$TOOLKIT" ]] || TOOLKIT=$([[ $amd ]] && echo none || echo apt)
+        . /etc/os-release
+        # Ubuntu's own toolkit is CUDA 12.0 on 24.04 but 11.5 on 22.04, and the
+        # simulator needs CUDA 12 or newer. Older releases get NVIDIA's 12.6.
+        old_ubuntu=; [[ "$ID" == ubuntu && "${VERSION_ID%%.*}" -lt 24 ]] && old_ubuntu=1
+        [[ -n "$TOOLKIT" ]] || TOOLKIT=$([[ $amd ]] && echo none || { [[ $old_ubuntu ]] && echo 12.6 || echo apt; })
+        if [[ "$TOOLKIT" == apt && $old_ubuntu ]]; then
+          echo "::error::Ubuntu $VERSION_ID's CUDA toolkit is too old for the simulator, which needs CUDA 12 or newer. Use cuda-toolkit: '12.6'."
+          exit 1
+        fi
         [[ -n "$ROCM" ]] || ROCM=$([[ $amd ]] && echo 7.1 || echo none)
         # Checked before anything reaches a shell command or a URL.
         [[ "$TOOLKIT" =~ ^(apt|none|[0-9]+\.[0-9]+)$ ]] || { echo "::error::cuda-toolkit must be apt, none or a version like 12.6, not '$TOOLKIT'"; exit 1; }
         [[ "$ROCM" =~ ^(none|[0-9]+\.[0-9]+(\.[0-9]+)?)$ ]] || { echo "::error::rocm must be none or a version like 7.1, not '$ROCM'"; exit 1; }
-        { echo "cuda=$TOOLKIT"; echo "rocm=$ROCM"; } >> "$GITHUB_OUTPUT"
+        # A container job runs as root with no sudo; a hosted runner is the
+        # other way round.
+        sudo=sudo; [[ "$(id -u)" == 0 ]] && sudo=
+        { echo "cuda=$TOOLKIT"; echo "rocm=$ROCM"; echo "sudo=$sudo"; } >> "$GITHUB_OUTPUT"
 
     - name: Install build tools
       shell: bash
       env:
+        SUDO: ${{ steps.want.outputs.sudo }}
+        DEBIAN_FRONTEND: noninteractive
         TOOLKIT: ${{ steps.want.outputs.cuda }}
       run: |
-        pkgs="cmake ninja-build g++"
+        # The download tools are on every hosted runner but not in a bare
+        # container image.
+        pkgs="cmake ninja-build g++ ca-certificates wget gnupg"
         # Ubuntu's toolkit is CUDA 12.0, whose nvcc accepts gcc 12 at most.
         [[ "$TOOLKIT" == apt ]] && pkgs="$pkgs nvidia-cuda-toolkit g++-12"
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq --no-install-recommends $pkgs
+        # The simulator is C++20 and needs gcc 12 or newer; 22.04's default is 11.
+        . /etc/os-release
+        [[ "$ID" == ubuntu && "${VERSION_ID%%.*}" -lt 24 ]] && pkgs="$pkgs g++-12"
+        $SUDO apt-get update -qq
+        $SUDO apt-get install -y -qq --no-install-recommends $pkgs
 
     - name: Install CUDA ${{ steps.want.outputs.cuda }} from NVIDIA
       if: steps.want.outputs.cuda != 'apt' && steps.want.outputs.cuda != 'none'
       shell: bash
       env:
+        SUDO: ${{ steps.want.outputs.sudo }}
+        DEBIAN_FRONTEND: noninteractive
         TOOLKIT: ${{ steps.want.outputs.cuda }}
       run: |
         . /etc/os-release
         repo="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${VERSION_ID//./}/x86_64"
         wget -qO "$RUNNER_TEMP/cuda-keyring.deb" "$repo/cuda-keyring_1.1-1_all.deb"
-        sudo dpkg -i "$RUNNER_TEMP/cuda-keyring.deb"
-        sudo apt-get update -qq
+        $SUDO dpkg -i "$RUNNER_TEMP/cuda-keyring.deb"
+        $SUDO apt-get update -qq
         v="${TOOLKIT//./-}"
         # CUDA 13 renamed the NVVM package.
         nvvm="cuda-nvvm-$v"; [[ "${TOOLKIT%%.*}" -ge 13 ]] && nvvm="libnvvm-$v"
         # nvcc, plus the headers of every library the simulator stands in for:
         # it builds each one against the toolkit's own declarations.
-        sudo apt-get install -y -qq --no-install-recommends \
+        $SUDO apt-get install -y -qq --no-install-recommends \
           "cuda-nvcc-$v" "cuda-cudart-dev-$v" "cuda-crt-$v" "$nvvm" \
           "cuda-nvml-dev-$v" "cuda-cupti-dev-$v" "cuda-nvrtc-dev-$v" "libcublas-dev-$v" \
           "libcufft-dev-$v" "libcurand-dev-$v" "libcusparse-dev-$v" "libnvjpeg-dev-$v" \
@@ -107,25 +134,28 @@ runs:
       if: steps.want.outputs.rocm != 'none'
       shell: bash
       env:
+        SUDO: ${{ steps.want.outputs.sudo }}
+        DEBIAN_FRONTEND: noninteractive
         ROCM: ${{ steps.want.outputs.rocm }}
       run: |
         . /etc/os-release
-        elf=libelf1t64; apt-cache show libelf1t64 > /dev/null 2>&1 || elf=libelf1
-        sudo apt-get install -y -qq --no-install-recommends libxml2 libnuma1 "$elf"
-        sudo mkdir -p /etc/apt/keyrings
-        wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+        # Ubuntu 24.04 renamed libelf1; 22.04 knows the new name but has no package for it.
+        elf=libelf1t64; apt-cache policy libelf1t64 2>/dev/null | grep -q 'Candidate: [0-9]' || elf=libelf1
+        $SUDO apt-get install -y -qq --no-install-recommends libxml2 libnuma1 "$elf"
+        $SUDO mkdir -p /etc/apt/keyrings
+        wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor | $SUDO tee /etc/apt/keyrings/rocm.gpg > /dev/null
         echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM $VERSION_CODENAME main" \
-          | sudo tee /etc/apt/sources.list.d/rocm.list > /dev/null
+          | $SUDO tee /etc/apt/sources.list.d/rocm.list > /dev/null
         # AMD's packages, not Ubuntu's hipcc of the same name.
-        printf 'Package: *\nPin: origin repo.radeon.com\nPin-Priority: 1001\n' | sudo tee /etc/apt/preferences.d/rocm > /dev/null
-        sudo apt-get update -qq
+        printf 'Package: *\nPin: origin repo.radeon.com\nPin-Priority: 1001\n' | $SUDO tee /etc/apt/preferences.d/rocm > /dev/null
+        $SUDO apt-get update -qq
         dir="$RUNNER_TEMP/rocm-debs"; mkdir -p "$dir"
         (cd "$dir" && apt-get download hipcc hip-dev rocm-llvm rocm-device-libs rocm-core hsa-rocr-dev) \
           || { echo "::error::could not download ROCm $ROCM for Ubuntu $VERSION_ID from repo.radeon.com"; exit 1; }
-        for d in "$dir"/*.deb; do sudo dpkg-deb -x "$d" /; done
+        for d in "$dir"/*.deb; do $SUDO dpkg-deb -x "$d" /; done
         rm -rf "$dir"
         root=$(ls -d /opt/rocm-"$ROCM"* | sort -V | tail -1)
-        sudo ln -sfn "$root" /opt/rocm
+        $SUDO ln -sfn "$root" /opt/rocm
         echo "/opt/rocm/bin" >> "$GITHUB_PATH"
         echo "ROCM_PATH=/opt/rocm" >> "$GITHUB_ENV"
         /opt/rocm/bin/hipcc --version | head -3
@@ -148,7 +178,9 @@ runs:
         {
           echo "build=$build"
           echo "shim=$build/shim"
-          echo "key=pantheonsim-${RUNNER_OS}-${RUNNER_ARCH}-${src}-cuda${nvcc_version:-none}"
+          # The OS release too: a build from 24.04 does not load on 22.04.
+          . /etc/os-release
+          echo "key=pantheonsim-${RUNNER_OS}-${RUNNER_ARCH}-${ID}${VERSION_ID}-${src}-cuda${nvcc_version:-none}"
         } >> "$GITHUB_OUTPUT"
 
     - name: Restore a previous build
@@ -165,17 +197,22 @@ runs:
         SRC: ${{ github.action_path }}
         BUILD: ${{ steps.paths.outputs.build }}
       run: |
-        cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
+        cxx=g++
+        [[ "$(g++ -dumpversion | cut -d. -f1)" -lt 12 ]] && cxx=g++-12
+        cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="$cxx"
         cmake --build "$BUILD" -j"$(nproc)"
 
     - name: Put the simulated GPUs in place
       shell: bash
       env:
+        SUDO: ${{ steps.want.outputs.sudo }}
+        DEBIAN_FRONTEND: noninteractive
         BUILD: ${{ steps.paths.outputs.build }}
         GPU: ${{ inputs.gpu }}
         COUNT: ${{ inputs.count }}
         TOOLKIT: ${{ steps.want.outputs.cuda }}
         ROCM: ${{ steps.want.outputs.rocm }}
+        LIBRARY_PATH_INPUT: ${{ inputs.library-path }}
       run: |
         # An unknown profile fails here, by name, rather than in the job's tests.
         "$BUILD/vgpu" info --gpu "$GPU" > /dev/null || { echo "::error::no GPU profile '$GPU' (see vgpu list-gpus)"; exit 1; }
@@ -196,10 +233,37 @@ runs:
         # ctest or a script, as well as under vgpu run.
         if [[ "$ROCM" != none && -d /opt/rocm/lib ]]; then
           hip=$(readlink -f "$BUILD/shim/libamdhip64.so.6")
-          for n in libamdhip64.so libamdhip64.so.6 libamdhip64.so.7; do sudo ln -sfn "$hip" "/opt/rocm/lib/$n"; done
+          for n in libamdhip64.so libamdhip64.so.6 libamdhip64.so.7; do $SUDO ln -sfn "$hip" "/opt/rocm/lib/$n"; done
+          # ROCm's CMake packages (enable_language(HIP), find_package(hip)) name
+          # the runtime by its full version, which only the real runtime
+          # package installs.
+          for n in $(grep -rhoE 'libamdhip64\.so\.[0-9.]+[0-9]' /opt/rocm/lib/cmake 2>/dev/null | sort -u); do
+            $SUDO ln -sfn "$hip" "/opt/rocm/lib/$n"
+          done
           # hipcc with no --offload-arch asks this which GPUs are present, so
           # it compiles for the simulated card, as it would on a real one.
-          sudo ln -sfn "$BUILD/bin/rocm_agent_enumerator" /opt/rocm/bin/rocm_agent_enumerator
+          $SUDO ln -sfn "$BUILD/bin/rocm_agent_enumerator" /opt/rocm/bin/rocm_agent_enumerator
+        fi
+        case "$LIBRARY_PATH_INPUT" in
+          true) echo "LD_LIBRARY_PATH=$BUILD/shim${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV" ;;
+          false) ;;
+          *) echo "::error::library-path must be true or false, not '$LIBRARY_PATH_INPUT'"; exit 1 ;;
+        esac
+        # CMake links CUDA programs with the static runtime unless told
+        # otherwise, and the static runtime cannot talk to a simulated driver.
+        # A toolchain file (read from the environment by CMake 3.21 and later)
+        # makes the shared one the default; a project's own choice still wins.
+        if [[ "$GPU" != amd/* ]]; then
+          if [[ -n "${CMAKE_TOOLCHAIN_FILE:-}" ]]; then
+            echo "::warning::CMAKE_TOOLCHAIN_FILE is already set, so CMake keeps its default static CUDA runtime, which cannot run on the simulator. Add set(CMAKE_CUDA_RUNTIME_LIBRARY Shared) to that toolchain file."
+          else
+            tc="$RUNNER_TEMP/pantheonsim-toolchain.cmake"
+            {
+              echo "# Written by the PantheonSim action: link CUDA programs with the shared runtime."
+              echo 'set(CMAKE_CUDA_RUNTIME_LIBRARY Shared CACHE STRING "CUDA runtime library")'
+            } > "$tc"
+            echo "CMAKE_TOOLCHAIN_FILE=$tc" >> "$GITHUB_ENV"
+          fi
         fi
         case "$GPU" in
           amd/*) VGPU_GPU="$GPU" VGPU_DEVICE_COUNT="$COUNT" "$BUILD/bin/rocm-smi" ;;
