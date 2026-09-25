@@ -10,3 +10,11 @@ export ROCM_PATH=$rocm HIP_PATH=$rocm HIP_CLANG_PATH=$rocm/lib/llvm/bin HIP_DEVI
 "$rocm/bin/hipcc" --version 2>/dev/null | grep "HIP version" || true
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 chevron.cpp -o chevron.gfx942
 echo "wrote $(pwd)/chevron.gfx942"
+
+# The device code alone, for the decoder and the executor to be checked
+# against, and the listing of it from the same toolchain's llvm-objdump.
+"$rocm/bin/hipcc" -O3 -std=c++17 --offload-arch=gfx942 --offload-device-only --no-gpu-bundle-output \
+  -c ops.hip -o ops.gfx942.o
+"$rocm/lib/llvm/bin/llvm-objdump" -d --mcpu=gfx942 ops.gfx942.o |
+  sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > ops.gfx942.dis
+echo "wrote $(pwd)/ops.gfx942.o and its listing ($(wc -l < ops.gfx942.dis) instructions)"
