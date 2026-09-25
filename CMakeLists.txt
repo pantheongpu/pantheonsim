@@ -591,6 +591,8 @@ vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
 # Hopper (sm_90a): the warpgroup MMA, against the ISA's own layout examples.
 vgpu_unit_test(test_hopper)
+# The interpreter's fast paths, bit for bit against its general path.
+vgpu_unit_test(test_fastpath)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
