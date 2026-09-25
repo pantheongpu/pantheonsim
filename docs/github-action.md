@@ -69,7 +69,7 @@ and 4 when the program did not run at all (`vgpu test --help`).
 | `gpu` | `nvidia/t4` | The profile to simulate (`vgpu list-gpus`), e.g. `nvidia/h100` or `amd/mi300x` |
 | `count` | `1` | How many GPUs |
 | `cuda-toolkit` | `apt` for NVIDIA, `none` for AMD | `apt` installs Ubuntu's toolkit; a version like `12.6` or `13.0` installs that `nvcc` from NVIDIA; `none` uses one the job already installed |
-| `rocm` | `7.1` for AMD, `none` for NVIDIA | The ROCm version whose `hipcc` to install; `none` uses one the job already installed |
+| `rocm` | `7.1` for AMD, `none` for NVIDIA | The ROCm version whose `hipcc` to install -- `6.4`, `7.0`, `7.1` and `7.2` are the releases whose programs are checked on the simulator; `none` uses one the job already installed |
 | `library-path` | `true` | Puts the simulator's libraries on `LD_LIBRARY_PATH`, so programs run directly (ctest, scripts) as well as under `vgpu run` |
 
 ## Outputs
