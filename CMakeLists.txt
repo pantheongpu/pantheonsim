@@ -1186,6 +1186,11 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 900)
+  add_test(NAME e2e_tma_im2col COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_tma_im2col.sh)
+  set_tests_properties(e2e_tma_im2col PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
   add_test(NAME e2e_tensormap_replace_cute COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_tensormap_replace_cute.sh)
   set_tests_properties(e2e_tensormap_replace_cute PROPERTIES
     DEPENDS vgpucudart
