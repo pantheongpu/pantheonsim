@@ -18,7 +18,7 @@ done
 
 # Kernels written in assembly, for instructions a compiler emits only now and
 # then (test_amd_gcn_asm).
-for src in asm_sopk; do
+for src in asm_sopk asm_scalar asm_memory asm_vector; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx942 -c "$src.s" -o "$src.gfx942.o"
   echo "wrote $(pwd)/$src.gfx942.o"
 done
@@ -28,7 +28,7 @@ done
 # it the listing already checked in stays as it is.
 objdump=${2:-$(dirname "$(readlink -f "$(command -v "$clang")")")/llvm-objdump}
 if [[ -x "$objdump" ]]; then
-  for src in $sources asm_sopk; do
+  for src in $sources asm_sopk asm_scalar asm_memory asm_vector; do
     "$objdump" -d --mcpu=gfx942 "$src.gfx942.o" |
       sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > "$src.gfx942.dis"
     echo "wrote $(pwd)/$src.gfx942.dis ($(wc -l < "$src.gfx942.dis") instructions)"

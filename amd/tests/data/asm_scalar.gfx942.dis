@@ -1,0 +1,91 @@
+s_load_dwordx2 s[2:3], s[0:1], 0x0
+s_load_dwordx2 s[4:5], s[0:1], 0x8
+s_waitcnt lgkmcnt(0)
+s_mov_b64 exec, 1
+s_bfe_u32 s6, s4, 0x80004
+s_bfe_i64 s[8:9], s[4:5], 0xc0014
+s_ashr_i64 s[10:11], s[4:5], 7
+s_min_i32 s12, s4, s5
+s_cselect_b32 s13, 1, 0
+s_min_u32 s14, s4, s5
+s_cselect_b32 s15, 1, 0
+s_max_i32 s16, s4, s5
+s_cselect_b32 s17, 1, 0
+s_mov_b32 s18, s4
+s_bitset1_b32 s18, 3
+s_bitset0_b32 s18, 31
+s_bitcmp1_b32 s4, 5
+s_cselect_b32 s19, 1, 0
+s_bitcmp0_b32 s4, 5
+s_cselect_b32 s20, 1, 0
+s_cmpk_gt_u32 s4, 0x8000
+s_cselect_b32 s21, 1, 0
+s_cmpk_lt_i32 s4, 0x8000
+s_cselect_b32 s22, 1, 0
+s_cmp_le_u32 s4, s5
+s_cselect_b32 s23, 1, 0
+s_cmp_eq_i32 s4, s5
+s_cselect_b32 s24, 1, 0
+s_abs_i32 s25, s4
+s_mul_hi_i32 s26, s4, s5
+s_pack_ll_b32_b16 s27, s4, s5
+s_not_b32 s28, s4
+s_andn2_b32 s29, s4, s5
+s_mov_b32 s30, 7
+s_cmp_lg_u32 s4, s5
+s_cmov_b32 s30, s4
+s_not_b64 s[32:33], s[4:5]
+v_mov_b32_e32 v0, 0
+v_mov_b32_e32 v1, s6
+global_store_dword v0, v1, s[2:3]
+v_mov_b32_e32 v1, s8
+global_store_dword v0, v1, s[2:3] offset:4
+v_mov_b32_e32 v1, s9
+global_store_dword v0, v1, s[2:3] offset:8
+v_mov_b32_e32 v1, s10
+global_store_dword v0, v1, s[2:3] offset:12
+v_mov_b32_e32 v1, s11
+global_store_dword v0, v1, s[2:3] offset:16
+v_mov_b32_e32 v1, s12
+global_store_dword v0, v1, s[2:3] offset:20
+v_mov_b32_e32 v1, s13
+global_store_dword v0, v1, s[2:3] offset:24
+v_mov_b32_e32 v1, s14
+global_store_dword v0, v1, s[2:3] offset:28
+v_mov_b32_e32 v1, s15
+global_store_dword v0, v1, s[2:3] offset:32
+v_mov_b32_e32 v1, s16
+global_store_dword v0, v1, s[2:3] offset:36
+v_mov_b32_e32 v1, s17
+global_store_dword v0, v1, s[2:3] offset:40
+v_mov_b32_e32 v1, s18
+global_store_dword v0, v1, s[2:3] offset:44
+v_mov_b32_e32 v1, s19
+global_store_dword v0, v1, s[2:3] offset:48
+v_mov_b32_e32 v1, s20
+global_store_dword v0, v1, s[2:3] offset:52
+v_mov_b32_e32 v1, s21
+global_store_dword v0, v1, s[2:3] offset:56
+v_mov_b32_e32 v1, s22
+global_store_dword v0, v1, s[2:3] offset:60
+v_mov_b32_e32 v1, s23
+global_store_dword v0, v1, s[2:3] offset:64
+v_mov_b32_e32 v1, s24
+global_store_dword v0, v1, s[2:3] offset:68
+v_mov_b32_e32 v1, s25
+global_store_dword v0, v1, s[2:3] offset:72
+v_mov_b32_e32 v1, s26
+global_store_dword v0, v1, s[2:3] offset:76
+v_mov_b32_e32 v1, s27
+global_store_dword v0, v1, s[2:3] offset:80
+v_mov_b32_e32 v1, s28
+global_store_dword v0, v1, s[2:3] offset:84
+v_mov_b32_e32 v1, s29
+global_store_dword v0, v1, s[2:3] offset:88
+v_mov_b32_e32 v1, s30
+global_store_dword v0, v1, s[2:3] offset:92
+v_mov_b32_e32 v1, s32
+global_store_dword v0, v1, s[2:3] offset:96
+v_mov_b32_e32 v1, s33
+global_store_dword v0, v1, s[2:3] offset:100
+s_endpgm

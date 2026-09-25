@@ -48,6 +48,305 @@ s_nop 0
 s_nop 0
 s_nop 0
 s_nop 0
+s_load_dwordx8 s[4:11], s[0:1], 0x0
+v_lshrrev_b32_e32 v1, 2, v0
+v_and_b32_e32 v1, 12, v1
+v_lshlrev_b32_e32 v2, 4, v0
+s_movk_i32 s0, 0xf0
+v_and_or_b32 v1, v2, s0, v1
+v_lshlrev_b32_e32 v1, 2, v1
+s_waitcnt lgkmcnt(0)
+global_load_dwordx4 v[2:5], v1, s[4:5]
+global_load_dwordx4 v[6:9], v1, s[6:7]
+v_and_b32_e32 v1, 15, v0
+v_lshlrev_b32_e32 v0, 2, v0
+s_movk_i32 s0, 0xc0
+v_and_or_b32 v0, v0, s0, v1
+v_lshlrev_b32_e32 v14, 2, v0
+global_load_dword v10, v14, s[8:9]
+global_load_dword v11, v14, s[8:9] offset:64
+global_load_dword v12, v14, s[8:9] offset:128
+global_load_dword v13, v14, s[8:9] offset:192
+s_waitcnt vmcnt(0)
+v_mfma_f32_16x16x4_f32 v[10:13], v2, v6, v[10:13]
+v_mfma_f32_16x16x4_f32 v[0:3], v3, v7, v[10:13]
+v_mfma_f32_16x16x4_f32 v[0:3], v4, v8, v[0:3]
+v_mfma_f32_16x16x4_f32 v[0:3], v5, v9, v[0:3]
+s_nop 7
+s_nop 1
+global_store_dword v14, v0, s[10:11]
+global_store_dword v14, v1, s[10:11] offset:64
+global_store_dword v14, v2, s[10:11] offset:128
+global_store_dword v14, v3, s[10:11] offset:192
+s_endpgm
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_load_dwordx8 s[4:11], s[0:1], 0x0
+v_lshrrev_b32_e32 v2, 3, v0
+v_lshlrev_b32_e32 v1, 4, v0
+v_and_b32_e32 v2, 6, v2
+s_movk_i32 s0, 0xf0
+v_lshlrev_b32_e32 v0, 1, v0
+v_and_or_b32 v2, v1, s0, v2
+v_and_b32_e32 v0, 30, v0
+s_movk_i32 s0, 0x300
+v_and_or_b32 v0, v1, s0, v0
+v_lshlrev_b32_e32 v26, 2, v2
+v_lshlrev_b32_e32 v28, 2, v0
+s_waitcnt lgkmcnt(0)
+global_load_dwordx2 v[16:17], v26, s[4:5]
+global_load_dwordx2 v[18:19], v26, s[6:7] offset:32
+global_load_dwordx2 v[12:13], v28, s[8:9]
+global_load_dwordx2 v[0:1], v28, s[8:9] offset:256
+global_load_dwordx2 v[14:15], v28, s[8:9] offset:512
+global_load_dwordx2 v[2:3], v28, s[8:9] offset:768
+global_load_dwordx2 v[20:21], v26, s[6:7]
+global_load_dwordx2 v[22:23], v28, s[8:9] offset:128
+global_load_dwordx2 v[24:25], v28, s[8:9] offset:640
+global_load_dwordx2 v[4:5], v28, s[8:9] offset:384
+global_load_dwordx2 v[6:7], v28, s[8:9] offset:896
+s_waitcnt vmcnt(8)
+v_mov_b32_e32 v8, v12
+global_load_dwordx2 v[26:27], v26, s[4:5] offset:32
+s_waitcnt vmcnt(8)
+v_mov_b32_e32 v9, v0
+s_waitcnt vmcnt(7)
+v_mov_b32_e32 v10, v14
+s_waitcnt vmcnt(6)
+v_mov_b32_e32 v11, v2
+v_mov_b32_e32 v0, v13
+v_mov_b32_e32 v2, v15
+s_waitcnt vmcnt(5)
+v_mfma_f32_16x16x4_f32 v[8:11], v16, v20, v[8:11]
+s_waitcnt vmcnt(4)
+v_mov_b32_e32 v12, v22
+s_waitcnt vmcnt(2)
+v_mov_b32_e32 v13, v4
+v_mov_b32_e32 v14, v24
+s_waitcnt vmcnt(1)
+v_mov_b32_e32 v15, v6
+v_mov_b32_e32 v4, v23
+v_mov_b32_e32 v6, v25
+v_mfma_f32_16x16x4_f32 v[0:3], v16, v18, v[0:3]
+s_waitcnt vmcnt(0)
+v_mfma_f32_16x16x4_f32 v[12:15], v26, v20, v[12:15]
+v_mfma_f32_16x16x4_f32 v[4:7], v26, v18, v[4:7]
+v_mfma_f32_16x16x4_f32 v[8:11], v17, v21, v[8:11]
+v_mfma_f32_16x16x4_f32 v[0:3], v17, v19, v[0:3]
+s_nop 7
+s_nop 0
+v_mov_b32_e32 v16, v8
+v_mov_b32_e32 v8, v10
+v_mfma_f32_16x16x4_f32 v[12:15], v27, v21, v[12:15]
+v_mov_b32_e32 v17, v0
+v_mov_b32_e32 v0, v9
+v_mov_b32_e32 v9, v2
+v_mov_b32_e32 v2, v11
+v_mfma_f32_16x16x4_f32 v[4:7], v27, v19, v[4:7]
+s_nop 4
+v_mov_b32_e32 v18, v12
+v_mov_b32_e32 v12, v14
+s_nop 2
+v_mov_b32_e32 v19, v4
+v_mov_b32_e32 v4, v13
+v_mov_b32_e32 v13, v6
+v_mov_b32_e32 v6, v15
+global_store_dwordx2 v28, v[16:17], s[10:11]
+global_store_dwordx2 v28, v[18:19], s[10:11] offset:128
+global_store_dwordx2 v28, v[0:1], s[10:11] offset:256
+global_store_dwordx2 v28, v[4:5], s[10:11] offset:384
+global_store_dwordx2 v28, v[8:9], s[10:11] offset:512
+global_store_dwordx2 v28, v[12:13], s[10:11] offset:640
+global_store_dwordx2 v28, v[2:3], s[10:11] offset:768
+global_store_dwordx2 v28, v[6:7], s[10:11] offset:896
+s_endpgm
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_load_dwordx8 s[4:11], s[0:1], 0x0
+v_and_b32_e32 v1, 15, v0
+v_lshlrev_b32_e32 v4, 2, v0
+s_movk_i32 s0, 0xc0
+v_and_or_b32 v1, v4, s0, v1
+v_lshlrev_b32_e32 v28, 3, v1
+s_waitcnt lgkmcnt(0)
+global_load_dwordx2 v[2:3], v28, s[8:9]
+global_load_dwordx2 v[24:25], v28, s[8:9] offset:256
+global_load_dwordx2 v[26:27], v28, s[8:9] offset:128
+global_load_dwordx2 v[6:7], v28, s[8:9] offset:384
+v_lshrrev_b32_e32 v1, 2, v0
+s_movk_i32 s0, 0xf0
+v_lshlrev_b32_e32 v0, 4, v0
+v_and_b32_e32 v1, 12, v1
+v_and_or_b32 v0, v0, s0, v1
+v_lshlrev_b32_e32 v0, 3, v0
+global_load_dwordx4 v[8:11], v0, s[4:5]
+global_load_dwordx4 v[12:15], v0, s[6:7]
+global_load_dwordx4 v[16:19], v0, s[4:5] offset:16
+global_load_dwordx4 v[20:23], v0, s[6:7] offset:16
+v_and_b32_e32 v0, 0xfc, v4
+v_xor_b32_e32 v29, 0x80, v0
+s_waitcnt vmcnt(7)
+ds_swizzle_b32 v0, v2 offset:swizzle(ROTATE,1,16)
+ds_swizzle_b32 v1, v3 offset:swizzle(ROTATE,1,16)
+s_waitcnt vmcnt(6)
+ds_swizzle_b32 v30, v24 offset:swizzle(ROTATE,1,16)
+s_waitcnt vmcnt(5)
+ds_swizzle_b32 v31, v26 offset:swizzle(ROTATE,1,16)
+ds_swizzle_b32 v32, v27 offset:swizzle(ROTATE,1,16)
+s_waitcnt vmcnt(4)
+ds_swizzle_b32 v4, v6 offset:swizzle(ROTATE,1,16)
+ds_swizzle_b32 v5, v7 offset:swizzle(ROTATE,1,16)
+ds_swizzle_b32 v33, v25 offset:swizzle(ROTATE,1,16)
+s_waitcnt lgkmcnt(4)
+v_mov_b32_dpp v31, v2 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+s_waitcnt lgkmcnt(3)
+v_mov_b32_dpp v32, v3 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+s_waitcnt lgkmcnt(2)
+v_mov_b32_dpp v4, v24 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+s_waitcnt lgkmcnt(1)
+v_mov_b32_dpp v5, v25 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+v_mov_b32_dpp v26, v0 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+v_mov_b32_dpp v27, v1 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+v_mov_b32_dpp v6, v30 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+s_waitcnt lgkmcnt(0)
+v_mov_b32_dpp v7, v33 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+ds_permute_b32 v24, v29, v31
+ds_permute_b32 v25, v29, v32
+ds_permute_b32 v30, v29, v26
+ds_permute_b32 v0, v29, v4
+ds_permute_b32 v1, v29, v5
+ds_permute_b32 v2, v29, v6
+ds_permute_b32 v3, v29, v7
+ds_permute_b32 v33, v29, v27
+s_waitcnt lgkmcnt(4)
+v_mov_b32_dpp v0, v31 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+s_waitcnt lgkmcnt(3)
+v_mov_b32_dpp v1, v32 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+s_waitcnt lgkmcnt(2)
+v_mov_b32_dpp v2, v26 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+s_waitcnt lgkmcnt(1)
+v_mov_b32_dpp v3, v27 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+v_mov_b32_dpp v4, v24 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+v_mov_b32_dpp v5, v25 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+v_mov_b32_dpp v6, v30 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+s_waitcnt lgkmcnt(0)
+v_mov_b32_dpp v7, v33 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+s_waitcnt vmcnt(2)
+s_nop 0
+v_mfma_f64_16x16x4_f64 v[0:7], v[8:9], v[12:13], v[0:7]
+v_mfma_f64_16x16x4_f64 v[0:7], v[10:11], v[14:15], v[0:7]
+s_waitcnt vmcnt(0)
+v_mfma_f64_16x16x4_f64 v[0:7], v[16:17], v[20:21], v[0:7]
+v_mfma_f64_16x16x4_f64 v[0:7], v[18:19], v[22:23], v[0:7]
+s_nop 7
+s_nop 7
+s_nop 1
+ds_swizzle_b32 v8, v6 offset:swizzle(ROTATE,1,16)
+ds_swizzle_b32 v9, v7 offset:swizzle(ROTATE,1,16)
+ds_swizzle_b32 v10, v0 offset:swizzle(ROTATE,1,16)
+ds_swizzle_b32 v11, v1 offset:swizzle(ROTATE,1,16)
+ds_swizzle_b32 v12, v4 offset:swizzle(ROTATE,1,16)
+ds_swizzle_b32 v13, v2 offset:swizzle(ROTATE,1,16)
+ds_swizzle_b32 v14, v3 offset:swizzle(ROTATE,1,16)
+ds_swizzle_b32 v15, v5 offset:swizzle(ROTATE,1,16)
+s_waitcnt lgkmcnt(7)
+v_mov_b32_dpp v8, v4 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+s_waitcnt lgkmcnt(6)
+v_mov_b32_dpp v9, v5 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+s_waitcnt lgkmcnt(2)
+v_mov_b32_dpp v13, v0 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+s_waitcnt lgkmcnt(1)
+v_mov_b32_dpp v14, v1 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+v_mov_b32_dpp v2, v10 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+v_mov_b32_dpp v3, v11 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+v_mov_b32_dpp v6, v12 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+s_waitcnt lgkmcnt(0)
+v_mov_b32_dpp v7, v15 quad_perm:[0,1,2,3] row_mask:0x5 bank_mask:0xf
+ds_permute_b32 v0, v29, v8
+ds_permute_b32 v1, v29, v9
+ds_permute_b32 v10, v29, v13
+ds_permute_b32 v11, v29, v14
+ds_permute_b32 v12, v29, v2
+ds_permute_b32 v4, v29, v6
+ds_permute_b32 v5, v29, v7
+ds_permute_b32 v15, v29, v3
+s_waitcnt lgkmcnt(7)
+v_mov_b32_dpp v0, v13 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+s_waitcnt lgkmcnt(6)
+v_mov_b32_dpp v1, v14 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+s_waitcnt lgkmcnt(2)
+v_mov_b32_dpp v4, v2 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+s_waitcnt lgkmcnt(1)
+v_mov_b32_dpp v5, v3 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+v_mov_b32_dpp v8, v10 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+v_mov_b32_dpp v9, v11 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+v_mov_b32_dpp v6, v12 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+s_waitcnt lgkmcnt(0)
+v_mov_b32_dpp v7, v15 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+global_store_dwordx2 v28, v[0:1], s[10:11]
+global_store_dwordx2 v28, v[4:5], s[10:11] offset:128
+global_store_dwordx2 v28, v[8:9], s[10:11] offset:256
+global_store_dwordx2 v28, v[6:7], s[10:11] offset:384
+s_endpgm
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
 s_nop 0
 s_nop 0
 s_nop 0

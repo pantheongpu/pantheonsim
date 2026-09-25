@@ -1,9 +1,11 @@
-// The matrix instruction, checked against a layout nothing here decided.
+// The matrix instructions, checked against a layout nothing here decided.
 //
 // v_mfma_f32_16x16x16_f16 multiplies two 16x16 matrices spread across the
 // wave's 64 lanes, and which element sits in which lane's register is the
 // whole question: a model that had it wrong would still produce plausible
-// matrices. So the kernel here is a GEMM written with rocWMMA
+// matrices. The float and double forms (v_mfma_f32_16x16x4_f32,
+// v_mfma_f64_16x16x4_f64) are the same question again, with answers of their
+// own: a double's accumulator does not hold its rows as a float's does. So the kernel here is a GEMM written with rocWMMA
 // (amd/tests/hipcc/wmma.cpp) -- AMD's library, whose loads and stores put each
 // element where the hardware expects it -- built by hipcc 7.1, and its answer
 // is compared with the same product worked out in C. The inputs are small
@@ -129,6 +131,41 @@ VTEST(a_rocwmma_gemm_gives_the_product_worked_out_in_c) {
         throw vtest::Failure("D[" + std::to_string(i) + "][" + std::to_string(j) + "] is " +
                              std::to_string(d[i * 16 + j]) + ", not " + std::to_string(want));
     }
+}
+
+// A rocWMMA GEMM of floats or doubles, M square and K deep, against the
+// product worked out in C.
+template <typename T>
+void check_gemm(const char* kernel, int m, int kk) {
+  const amd::CodeObject o = object();
+  MemoryManager mem(64ull << 20);
+  std::vector<T> a(m * kk), b(kk * m), c(m * m);
+  for (int i = 0; i < m; ++i)
+    for (int k = 0; k < kk; ++k) {
+      a[i * kk + k] = static_cast<T>((i * 5 + k * 3) % 17 - 8);        // row-major
+      b[i * kk + k] = static_cast<T>((k * 7 + i * 11) % 19 - 9);       // column i of B, by column
+    }
+  for (int i = 0; i < m * m; ++i) c[i] = static_cast<T>(i % 97) - 40;
+  const uint64_t pa = upload(mem, a), pb = upload(mem, b), pc = upload(mem, c), pd = mem.alloc(m * m * sizeof(T));
+  run(o, kernel, mem, {pa, pb, pc, pd});
+  const std::vector<T> d = download<T>(mem, pd, m * m);
+  for (int i = 0; i < m; ++i)
+    for (int j = 0; j < m; ++j) {
+      T want = c[i * m + j];
+      for (int k = 0; k < kk; ++k) want += a[i * kk + k] * b[j * kk + k];
+      if (d[i * m + j] != want)
+        throw vtest::Failure(std::string(kernel) + ": D[" + std::to_string(i) + "][" + std::to_string(j) + "] is " +
+                             std::to_string(d[i * m + j]) + ", not " + std::to_string(want));
+    }
+}
+
+VTEST(a_rocwmma_gemm_of_floats_gives_the_product_worked_out_in_c) {
+  check_gemm<float>("_Z17gemm_f32_16x16x16PKfS0_S0_Pf", 16, 16);
+  check_gemm<float>("_Z16gemm_f32_32x32x8PKfS0_S0_Pf", 32, 8);
+}
+
+VTEST(a_rocwmma_gemm_of_doubles_gives_the_product_worked_out_in_c) {
+  check_gemm<double>("_Z17gemm_f64_16x16x16PKdS0_S0_Pd", 16, 16);
 }
 
 VTEST_MAIN

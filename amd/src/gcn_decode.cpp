@@ -455,6 +455,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // where an address would.
       {{Enc::Ds, 0x3d}, {"ds_swizzle_b32", 1, 1}},
       // A lane reads the value another lane holds: the address says which.
+      {{Enc::Ds, 0x3e}, {"ds_permute_b32", 1, 2}},
       {{Enc::Ds, 0x3f}, {"ds_bpermute_b32", 1, 2}},
       // FLAT and the two segments that share its opcodes: global (an address
       // in a register pair, or a scalar base and a per-lane offset) and
@@ -670,11 +671,18 @@ const char* enc_name(Enc e) {
 // falling back to spelling each of the five bits out.
 std::string swizzle_text(uint32_t imm) {
   char b[64];
-  if (imm & 0x8000) {
+  if ((imm & 0xFF00) == 0x8000) {
     std::snprintf(b, sizeof b, "swizzle(QUAD_PERM,%u,%u,%u,%u)", imm & 3, (imm >> 2) & 3, (imm >> 4) & 3,
                   (imm >> 6) & 3);
     return b;
   }
+  // The extended modes, each with bit 15 set: a rotation within 32 lanes
+  // (the direction, then by how many), and the FFT patterns.
+  if ((imm & 0xE000) == 0xC000) {
+    std::snprintf(b, sizeof b, "swizzle(ROTATE,%u,%u)", (imm >> 10) & 1, (imm >> 5) & 0x1F);
+    return b;
+  }
+  if (imm & 0x8000) throw Error::make(Err::Unsupported, "a ds_swizzle pattern this does not decode yet (", imm, ")");
   const uint32_t and_mask = imm & 0x1F, or_mask = (imm >> 5) & 0x1F, xor_mask = (imm >> 10) & 0x1F;
   if (and_mask == 0x1F && or_mask == 0 && xor_mask && !(xor_mask & (xor_mask - 1))) {
     std::snprintf(b, sizeof b, "swizzle(SWAP,%u)", xor_mask);

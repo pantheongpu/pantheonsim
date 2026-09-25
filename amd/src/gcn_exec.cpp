@@ -722,7 +722,10 @@ struct Machine {
       set_sgpr(w, in.dst[0].index + 1, static_cast<uint32_t>(stats.instructions >> 32));
       return;
     }
-    const uint64_t base = scalar(w, in.src[0]) + static_cast<uint64_t>(in.offset);
+    // The base, the instruction's own offset, and a scalar register's where
+    // it names one.
+    const uint64_t base = scalar(w, in.src[0]) + static_cast<uint64_t>(in.offset) +
+                          (in.has_saddr ? uint64_t{sgpr(w, in.saddr)} : 0);
     const uint32_t words = in.dst[0].width;
     for (uint32_t i = 0; i < words; ++i)
       set_sgpr(w, in.dst[0].index + i, static_cast<uint32_t>(at(base + 4 * i).load_scalar(base + 4 * i, 4)));
@@ -1783,8 +1786,14 @@ struct Machine {
   // Which lane a lane reads under a swizzle pattern: four lanes choosing
   // among their own four, or, within a group of 32, the lane its own number
   // becomes once ANDed, ORed and XORed with the pattern's three masks.
+  // Or, rotating, the lane so many further on (to the left) or back (to the
+  // right) within its 32.
   static uint32_t swizzle_source(uint32_t pattern, uint32_t lane) {
-    if (pattern & 0x8000) return (lane & ~3u) + ((pattern >> (2 * (lane & 3))) & 3);
+    if ((pattern & 0xFF00) == 0x8000) return (lane & ~3u) + ((pattern >> (2 * (lane & 3))) & 3);
+    if ((pattern & 0xE000) == 0xC000) {
+      const uint32_t by = (pattern >> 5) & 0x1F, right = (pattern >> 10) & 1;
+      return (lane & ~31u) | ((right ? lane - by : lane + by) & 31u);
+    }
     const uint32_t and_mask = pattern & 0x1F, or_mask = (pattern >> 5) & 0x1F, xor_mask = (pattern >> 10) & 0x1F;
     return (lane & ~31u) | ((((lane & 31u) & and_mask) | or_mask) ^ xor_mask);
   }
@@ -1799,6 +1808,19 @@ struct Machine {
     if (across) {
       const Operand& data = op == "ds_bpermute_b32"_op ? in.src[1] : in.src[0];
       for (uint32_t lane = 0; lane < kLanes; ++lane) before[lane] = w.vgpr[data.index][lane];
+    }
+    if (op == "ds_permute_b32"_op) {
+      // The other way round from bpermute: each lane sends its value to the
+      // lane its address names, and a lane no one sent to gets zero. Where
+      // two send to the same lane, the higher-numbered one's lands last.
+      std::array<uint32_t, kLanes> sent{};
+      for (uint32_t lane = 0; lane < kLanes; ++lane)
+        if (w.exec >> lane & 1)
+          sent[((lane_src(w, in.src[0], lane) + static_cast<uint32_t>(in.offset)) >> 2) & (kLanes - 1)] =
+              lane_src(w, in.src[1], lane);
+      for (uint32_t lane = 0; lane < kLanes; ++lane)
+        if (w.exec >> lane & 1) write_lane(w, in.dst[0], lane, sent[lane]);
+      return;
     }
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
@@ -1837,7 +1859,7 @@ struct Machine {
       } else if (op == "ds_bpermute_b32"_op) {
         // A lane reads what another lane holds: the address says which, in
         // bytes, and the source register is read across the wave.
-        const uint32_t from = (lane_src(w, in.src[0], lane) >> 2) & (kLanes - 1);
+        const uint32_t from = ((lane_src(w, in.src[0], lane) + static_cast<uint32_t>(in.offset)) >> 2) & (kLanes - 1);
         write_lane(w, in.dst[0], lane, before[from]);
       } else if (op == "ds_swizzle_b32"_op) {
         write_lane(w, in.dst[0], lane, before[swizzle_source(static_cast<uint32_t>(in.offset), lane)]);
@@ -2073,9 +2095,10 @@ struct Machine {
   // how many there are (bytes, where the stride is zero). An access past the
   // end is not a fault but a nothing -- a load reads zero, a store or an
   // atomic is dropped -- which is what Tensile's GEMMs count on at the edges
-  // of a matrix. The check is on the offset and index, not the scalar
-  // offset, as the hardware makes it; each register's worth is checked on
-  // its own.
+  // of a matrix. The scalar offset counts against the bounds as the rest of
+  // the offset does: Tensile's DGEMM moves the resource's base back and
+  // walks the scalar offset past the end, and gets zeroes there only if it
+  // counts. Each register's worth is checked on its own.
   void buffer_access(Wave& w, const Inst& in) {
     if (!w.exec) return;
     const bool reads_data = in.dst.empty();   // a store, or an atomic
@@ -2103,7 +2126,7 @@ struct Machine {
                               static_cast<uint32_t>(in.offset);
       const uint64_t addr = base + soffset + offset + uint64_t{index} * stride;
       const auto fits = [&](uint64_t at, uint64_t bytes) {
-        return stride ? index < records : at + bytes <= records;
+        return stride ? index < records : soffset + at + bytes <= records;
       };
       if (part) {
         if (body.rfind("store", 0) == 0) {
@@ -2501,7 +2524,7 @@ struct Machine {
         if (in.name.rfind("v_mfma", 0) == 0) {
           ++n.mfma;
           matrix_multiply(w, in);
-        } else if (in.name.rfind("v_cmp_", 0) == 0) compare(w, in);
+        } else if (in.name.rfind("v_cmp", 0) == 0) compare(w, in);
         else if (in.dpp) cross_lane_alu(w, in);
         else vector_alu(w, in);
         return true;
