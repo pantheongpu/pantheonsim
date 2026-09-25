@@ -97,10 +97,6 @@ and 4 when the program did not run at all (`vgpu test --help`).
   names in `CMAKE_TOOLCHAIN_FILE`, since CMake links with the host compiler
   where the `nvcc` wrapper cannot reach. A project that sets its own
   toolchain file needs `set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)` in it.
-- Build HIP code with optimization (`-O1` or higher; CMake's `Release` or
-  `RelWithDebInfo`). Unoptimized HIP code (`-O0`, and CMake's default when no
-  build type is set) calls helper functions the simulator does not run
-  correctly yet.
 - Runners: `ubuntu-24.04` and `ubuntu-22.04`, and container jobs (which run as
   root without `sudo`). On 22.04, Ubuntu's own CUDA toolkit is 11.5, older than
   the simulator supports, so an NVIDIA job there gets CUDA 12.6 from NVIDIA.
