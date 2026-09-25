@@ -755,8 +755,8 @@ what is done.
   would need a child grid scheduled from inside the parent's instruction
   stream, which nothing here can do.
 - Frontends: cubin/SASS loading. (AMD execution is done -- see
-  amd/README.md: unmodified hipcc programs built by any ROCm release from 5.7
-  to 7.1 run on a simulated MI300X, through the fatbin path, chevron
+  amd/README.md: unmodified hipcc programs built by ROCm 6.4, 7.0, 7.1 or 7.2
+  run on a simulated MI300X, through the fatbin path, chevron
   launches, device printf and cooperative launch, and AMD's own rocBLAS runs
   its level-1 kernels and Tensile's float and double GEMMs, 135,000 of its
   own quick tests passing. What AMD still lacks is listed under the next

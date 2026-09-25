@@ -187,10 +187,12 @@ struct DevicePropR0600 {
   int asicRevision;
 };
 
-// The device properties as ROCm 5 laid them out: what hipGetDeviceProperties
-// (the name without a suffix, and hipGetDevicePropertiesR0000) fills, for a
-// program built before ROCm 6 or built to that ABI. Carried over from ROCm
-// 5.7's hip_runtime_api.h, under the licence above.
+// The device properties in their older layout, hipDeviceProp_tR0000: what
+// hipGetDeviceProperties (the name without a suffix, and
+// hipGetDevicePropertiesR0000) fills in every current release, for a program
+// built to that ABI -- one built with the headers as they are calls
+// hipGetDevicePropertiesR0600 instead. Carried over from hip_deprecated.h,
+// under the licence above.
 struct DevicePropR0000 {
   char name[256];
   size_t totalGlobalMem;
@@ -260,11 +262,6 @@ struct PointerAttribute {
   unsigned allocationFlags;
 };
 enum MemoryType : int { kMemoryUnregistered = 0, kMemoryHost = 1, kMemoryDevice = 2 };
-// ROCm 5 numbered them otherwise (host 0, device 1), and knew no
-// unregistered memory: ROCm 6 renumbered them as CUDA does, and renamed the
-// library libamdhip64.so.6, so a program loads the numbering its library name
-// promises.
-enum MemoryTypeRocm5 : int { kMemoryHostRocm5 = 0, kMemoryDeviceRocm5 = 1 };
 
 // hipDeviceAttribute_t: what hipDeviceGetAttribute is asked for, by the
 // numbers hip_runtime_api.h gives them (the ones answered here; run_hip_abi.sh

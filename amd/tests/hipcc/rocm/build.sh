@@ -5,12 +5,10 @@
 # amd/tests/e2e/run_rocm_versions.sh to run on the shim. A release is found
 # at ~/.local/share/rocm-<version>/opt/rocm-* or /opt/rocm-<version>*.
 #
-# What an old release's compiler cannot build is left out: device printf of
-# a string chosen at run time before ROCm 6.1, and before ROCm 6.0 the
-# unifiedAddressing property and the cooperative-groups header.
+# The releases are the current ones: the last of ROCm 6 and every ROCm 7.
 set -uo pipefail
 cd "$(dirname "$0")"
-for v in 5.7 6.0 6.1 6.2 6.3 6.4 7.0 7.1; do
+for v in 6.4 7.0 7.1 7.2; do
   rocm=$(ls -d "$HOME"/.local/share/rocm-$v/opt/rocm-* /opt/rocm-$v* 2>/dev/null | head -1)
   [[ -n "$rocm" && -x "$rocm/bin/hipcc" ]] || { echo "ROCm $v: not installed, kept as it is"; continue; }
   export ROCM_PATH=$rocm HIP_PATH=$rocm

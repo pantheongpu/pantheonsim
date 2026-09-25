@@ -52,24 +52,22 @@ chevron launches go through `hipLaunchKernel`, and it reads the device through
 the real headers' `hipDeviceProp_t`, which is laid out here field for field as
 ROCm lays it out. Graph capture and replay, peer access between devices, and
 pinned host memory used to stage copies are there for the programs that use
-them. The library answers to every name ROCm has given it
-(`libamdhip64.so.5`, `.so.6` and `.so.7`) and gives each function the symbol
-version the real one does, since a program built by `hipcc` asks for
-`hipMalloc@hip_4.2`, not just `hipMalloc`.
+them. The library answers to both of ROCm's names for it (`libamdhip64.so.6`
+and `.so.7`) and gives each function the symbol version the real one does,
+since a program built by `hipcc` asks for `hipMalloc@hip_4.2`, not just
+`hipMalloc`.
 
-Programs built by any ROCm release from 5.7 to 7.1 run on it. The versions
-of each function are the same in every release; what changed is ROCm 6's
-break with ROCm 5, which renamed the library: a program built with ROCm 5
-reads the device properties in that release's layout (`hipGetDeviceProperties`
-fills it in every release, for programs built to it; ROCm 6's headers call
-`hipGetDevicePropertiesR0600` instead) and the memory types
-`hipPointerGetAttributes` reports in its numbering, which the shim knows from
-the name it was loaded by. `tests/hipcc/rocm/` holds five programs built by
-each of 5.7, 6.0 to 6.4, 7.0 and 7.1 -- each with that release's own device
-library, so its printf and grid barrier -- and `tests/e2e/run_rocm_versions.sh`
-runs them all against the same expected output. `tests/e2e/run_hip_abi.sh`
-checks the structures, the attribute numbers and the memory types against
-every release's headers installed.
+Programs built by each current ROCm release -- 6.4, 7.0, 7.1 and 7.2 -- run on
+it. The version each function carries is the same in all of them, and each
+later release only adds functions. `hipGetDeviceProperties` without a suffix
+fills the older layout (hipDeviceProp_tR0000) that every release keeps under
+that name for programs built to it; one built with the headers as they are
+calls `hipGetDevicePropertiesR0600`. `tests/hipcc/rocm/` holds five programs
+built by each release -- each with that release's own device library, so its
+printf and grid barrier -- and `tests/e2e/run_rocm_versions.sh` runs them all
+against the same expected output. `tests/e2e/run_hip_abi.sh` checks the
+structures, the attribute numbers and the memory types against the headers
+of each of those releases installed.
 
 `hipDeviceGetAttribute` answers each attribute with the property of the same
 name, by the numbers ROCm's header gives them (`tests/e2e/run_hip_abi.sh`

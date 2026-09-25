@@ -77,11 +77,11 @@ typedef int hipDevice_t;
 #define HIP_LAUNCH_PARAM_BUFFER_SIZE ((void*)0x02)
 #define HIP_LAUNCH_PARAM_END ((void*)0x03)
 
-/* hipDeviceProp_t as hipGetDeviceProperties fills it: the layout ROCm 5 gave
- * it, which the unsuffixed call keeps in every later release for programs
- * built to it (a program built with ROCm 6 or 7's headers calls
- * hipGetDevicePropertiesR0600 and reads that layout instead). The field list
- * is ROCm 5.7's hip_runtime_api.h (MIT licence, (c) Advanced Micro Devices);
+/* hipDeviceProp_t as hipGetDeviceProperties fills it: the older layout
+ * (hipDeviceProp_tR0000) the unsuffixed call keeps in every current release
+ * for programs built to it (a program built with the headers as they are
+ * calls hipGetDevicePropertiesR0600 and reads that layout instead). The field
+ * list is ROCm's hip_deprecated.h (MIT licence, (c) Advanced Micro Devices);
  * the architecture flags, a word of bits there, are one opaque word here. */
 typedef struct hipDeviceProp_t {
   char name[256];

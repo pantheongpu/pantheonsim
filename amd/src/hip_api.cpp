@@ -45,20 +45,6 @@ namespace {
 using vgpu::amd::CodeObject;
 using vgpu::amd::Kernel;
 
-// Whether the program loaded this library as libamdhip64.so.5 -- built with
-// ROCm 5, whose ABI ROCm 6 broke under a new library name -- and so reads
-// what ROCm 5 wrote where the two differ (hipPointerGetAttributes).
-bool rocm5_abi() {
-  static const bool five = [] {
-    Dl_info info{};
-    if (!dladdr(reinterpret_cast<void*>(&rocm5_abi), &info) || !info.dli_fname) return false;
-    const std::string name = info.dli_fname, five_name = "libamdhip64.so.5";
-    return name.size() >= five_name.size() &&
-           name.compare(name.size() - five_name.size(), five_name.size(), five_name) == 0;
-  }();
-  return five;
-}
-
 bool quiet() {
   const char* q = std::getenv("VGPU_QUIET");
   return q && q[0] == '1';
@@ -1213,9 +1199,8 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   props->ECCEnabled = p.telemetry.ecc ? 1 : 0;
 }
 
-// The same properties in ROCm 5's layout: what hipGetDeviceProperties (and
-// hipGetDevicePropertiesR0000) fills, for a program built before ROCm 6 or to
-// that ABI. Each field is the R0600 one of the same name, so the two cannot
+// The same properties in the older layout: what hipGetDeviceProperties (and
+// hipGetDevicePropertiesR0000) fills, for a program built to that ABI. Each field is the R0600 one of the same name, so the two cannot
 // disagree; R0000's gcnArch, the number a gfx target was before it had a
 // name, is the target's digits (942).
 void fill_properties_r0000(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0000* out) {
@@ -1285,9 +1270,9 @@ void fill_properties_r0000(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd:
 
 extern "C" {
 
-// The ROCm 5 layout, under both names a program may ask for it by.
+// The older layout, under both names a program may ask for it by.
 static_assert(sizeof(hipDeviceProp_t) == sizeof(vgpu::amd::abi::DevicePropR0000),
-              "vgpu_hip.h's hipDeviceProp_t is ROCm 5's layout");
+              "vgpu_hip.h's hipDeviceProp_t is the R0000 layout");
 hipError_t hipGetDevicePropertiesR0000(vgpu::amd::abi::DevicePropR0000* props, int ordinal) {
   const ApiCall api("hipGetDevicePropertiesR0000");
   State& s = state();
@@ -1978,8 +1963,7 @@ hipError_t hipMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t sp
 
 // What an address is: a device's memory, host memory hipHostMalloc gave, or
 // host memory the runtime knows nothing of -- which, as in HIP since 6.0 and
-// CUDA since 11, is an answer rather than an error (a program built with
-// ROCm 5 gets that release's numbering, and its refusal).
+// CUDA since 11, is an answer rather than an error.
 hipError_t hipPointerGetAttributes(vgpu::amd::abi::PointerAttribute* out, const void* ptr) {
   const ApiCall api("hipPointerGetAttributes");
   State& s = state();
@@ -1989,10 +1973,9 @@ hipError_t hipPointerGetAttributes(vgpu::amd::abi::PointerAttribute* out, const 
   *out = {};
   out->device = -1;
   const uint64_t va = reinterpret_cast<uint64_t>(ptr);
-  const bool five = rocm5_abi();
   for (int i = 0; i < s.rt->device_count(); ++i)
     if (s.rt->device(i).memory().owns(va)) {
-      out->type = five ? vgpu::amd::abi::kMemoryDeviceRocm5 : vgpu::amd::abi::kMemoryDevice;
+      out->type = vgpu::amd::abi::kMemoryDevice;
       out->device = i;
       out->devicePointer = const_cast<void*>(ptr);
       return record(s, hipSuccess);
@@ -2002,14 +1985,12 @@ hipError_t hipPointerGetAttributes(vgpu::amd::abi::PointerAttribute* out, const 
     auto it = g_host_allocations.upper_bound(va);
     if (it != g_host_allocations.begin() && va < std::prev(it)->first + std::prev(it)->second) {
       // Pinned memory is mapped for the device at the host's own address.
-      out->type = five ? vgpu::amd::abi::kMemoryHostRocm5 : vgpu::amd::abi::kMemoryHost;
+      out->type = vgpu::amd::abi::kMemoryHost;
       out->device = s.current;
       out->devicePointer = out->hostPointer = const_cast<void*>(ptr);
       return record(s, hipSuccess);
     }
   }
-  // ROCm 5 had no type for memory it knew nothing of, and refused it.
-  if (five) return record(s, hipErrorInvalidValue);
   out->type = vgpu::amd::abi::kMemoryUnregistered;
   return record(s, hipSuccess);
 }

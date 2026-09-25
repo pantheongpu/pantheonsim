@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# The same HIP programs, built by every ROCm release from 5.7 to 7.1, run
-# unmodified on a simulated MI300X, each giving what ROCm 7.1's build gives.
+# The same HIP programs, built by each current ROCm release (6.4, 7.0, 7.1,
+# 7.2), run unmodified on a simulated MI300X, each giving what every other
+# gives.
 #
-# Each release links a HIP runtime of its own name (libamdhip64.so.5 up to
-# 6.1, .so.6, then .so.7), binds each call to that release's symbol
-# versions, reads the device properties in its own layout (ROCm 5's, or the
-# R0600 one from 6.0) and the memory types in its own numbering, and carries
-# its own device library -- the printf and
-# the grid barrier are that release's. The binaries are checked in
+# Each release links a HIP runtime of its own name (libamdhip64.so.6, then
+# .so.7), binds each call to that release's symbol versions, and carries its
+# own device library -- the printf and the grid barrier are that release's.
+# The binaries are checked in
 # (amd/tests/hipcc/rocm/<release>/, rebuilt by its build.sh wherever the
 # releases are installed), so this runs without any ROCm.
 set -uo pipefail
@@ -35,7 +34,7 @@ for exe in "$dir"/*/*.gfx942; do
   status=$?
   runs=$((runs + 1))
   # What every release gives, unless the release's own directory says
-  # otherwise (ROCm 5's memory types).
+  # otherwise.
   expected="$dir/$program.expected"
   [[ -e "$dir/$release/$program.expected" ]] && expected="$dir/$release/$program.expected"
   if [[ $status -eq 0 ]] && diff -q <(echo "$out") "$expected" >/dev/null; then

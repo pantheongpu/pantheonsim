@@ -1,3 +1,0 @@
-device memory: type 1
-pinned host memory: type 0
-memory the runtime knows nothing of: hipErrorInvalidValue

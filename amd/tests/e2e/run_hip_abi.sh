@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 # VirtualGPU's copy of the HIP structures and numbers against the HIP headers
-# themselves, field by field, for every ROCm release installed.
+# themselves, field by field, for every current ROCm release installed (6.4
+# and later; older ones are not targeted, and are passed over).
 #
 # A hipcc-built program reads each field at the offset its own header gives,
 # so every field here has to sit where each release's header puts it: the
-# device properties in the R0600 layout of ROCm 6 and 7, and in ROCm 5's
-# layout (hipDeviceProp_t there, hipDeviceProp_tR0000 after), the pointer
-# attributes, and the numbers hipDeviceGetAttribute is asked by. Skips where
-# no ROCm headers are found: the unit test pins the fields the workloads read
-# everywhere else.
+# device properties in both layouts (R0600, and the older hipDeviceProp_tR0000
+# the unsuffixed call keeps), the pointer attributes, and the numbers
+# hipDeviceGetAttribute is asked by. Skips where no ROCm headers are found:
+# the unit test pins the fields the workloads read everywhere else.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 releases=()
 for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm "$HOME"/.local/share/rocm-*/opt/rocm-*; do
   [[ -n "$c" && -e "$c/include/hip/hip_runtime_api.h" ]] || continue
   real=$(readlink -f "$c")
+  version=$(basename "$real" | sed -n 's/^rocm-\([0-9.]*\).*/\1/p')
+  [[ -n "$version" && $(printf '%s\n' "$version" 6.4 | sort -V | head -1) != 6.4 ]] && continue   # older than 6.4
   [[ " ${releases[*]} " == *" $real "* ]] || releases+=("$real")
 done
-[[ ${#releases[@]} -gt 0 ]] || { echo "SKIP: no ROCm headers found (set VGPU_ROCM_PATH)"; exit 0; }
+[[ ${#releases[@]} -gt 0 ]] || { echo "SKIP: no ROCm 6.4 or later headers found (set VGPU_ROCM_PATH)"; exit 0; }
 cxx=${CXX:-c++}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -39,42 +41,28 @@ check() {  # check <name> <source>: compiles the static_asserts in <source>
 for rocm in "${releases[@]}"; do
   release=$(basename "$rocm")
   header="$rocm/include/hip/hip_runtime_api.h"
-  modern=$(grep -q "hipDeviceProp_tR0600" "$header" && echo 1 || echo 0)
   {
     echo '#include <cstddef>'
     echo '#include <hip/hip_runtime_api.h>'
-    # ROCm 6 and 7 keep the old layout, hipDeviceProp_tR0000, in a header of
-    # its own.
-    [[ -e "$rocm/include/hip/hip_deprecated.h" ]] && echo '#include <hip/hip_deprecated.h>'
+    # The older layout, hipDeviceProp_tR0000, is in a header of its own.
+    echo '#include <hip/hip_deprecated.h>'
     echo '#include "vgpu/hip_abi.hpp"'
-    if [[ $modern == 1 ]]; then
-      for f in $(fields DevicePropR0600); do
-        echo "static_assert(offsetof(vgpu::amd::abi::DevicePropR0600, $f) == offsetof(hipDeviceProp_tR0600, $f), \"R0600 $f is out of place\");"
-      done
-      echo 'static_assert(sizeof(vgpu::amd::abi::DevicePropR0600) == sizeof(hipDeviceProp_tR0600), "the R0600 sizes differ");'
-      old=hipDeviceProp_tR0000 type=type
-    else
-      old=hipDeviceProp_t type=memoryType   # ROCm 5: one layout, and the field before its renaming
-    fi
-    for f in $(fields DevicePropR0000); do
-      echo "static_assert(offsetof(vgpu::amd::abi::DevicePropR0000, $f) == offsetof($old, $f), \"R0000 $f is out of place\");"
+    for f in $(fields DevicePropR0600); do
+      echo "static_assert(offsetof(vgpu::amd::abi::DevicePropR0600, $f) == offsetof(hipDeviceProp_tR0600, $f), \"R0600 $f is out of place\");"
     done
-    echo "static_assert(sizeof(vgpu::amd::abi::DevicePropR0000) == sizeof($old), \"the R0000 sizes differ\");"
+    echo 'static_assert(sizeof(vgpu::amd::abi::DevicePropR0600) == sizeof(hipDeviceProp_tR0600), "the R0600 sizes differ");'
+    for f in $(fields DevicePropR0000); do
+      echo "static_assert(offsetof(vgpu::amd::abi::DevicePropR0000, $f) == offsetof(hipDeviceProp_tR0000, $f), \"R0000 $f is out of place\");"
+    done
+    echo "static_assert(sizeof(vgpu::amd::abi::DevicePropR0000) == sizeof(hipDeviceProp_tR0000), \"the R0000 sizes differ\");"
     echo 'static_assert(sizeof(vgpu::amd::abi::DeviceArch) == sizeof(hipDeviceArch_t), "the arch flags differ");'
     for f in $(fields PointerAttribute); do
-      theirs=$f; [[ $f == type ]] && theirs=$type
-      echo "static_assert(offsetof(vgpu::amd::abi::PointerAttribute, $f) == offsetof(hipPointerAttribute_t, $theirs), \"pointer attribute $f is out of place\");"
+      echo "static_assert(offsetof(vgpu::amd::abi::PointerAttribute, $f) == offsetof(hipPointerAttribute_t, $f), \"pointer attribute $f is out of place\");"
     done
     echo 'static_assert(sizeof(vgpu::amd::abi::PointerAttribute) == sizeof(hipPointerAttribute_t), "the pointer attributes differ");'
-    # ROCm 6 renumbered the memory types, and gave memory the runtime knows
-    # nothing of a type of its own.
-    if [[ $modern == 1 ]]; then
-      echo 'static_assert(vgpu::amd::abi::kMemoryUnregistered == hipMemoryTypeUnregistered && vgpu::amd::abi::kMemoryHost == hipMemoryTypeHost && vgpu::amd::abi::kMemoryDevice == hipMemoryTypeDevice, "the memory types differ");'
-    else
-      echo 'static_assert(vgpu::amd::abi::kMemoryHostRocm5 == hipMemoryTypeHost && vgpu::amd::abi::kMemoryDeviceRocm5 == hipMemoryTypeDevice, "the ROCm 5 memory types differ");'
-    fi
+    echo 'static_assert(vgpu::amd::abi::kMemoryUnregistered == hipMemoryTypeUnregistered && vgpu::amd::abi::kMemoryHost == hipMemoryTypeHost && vgpu::amd::abi::kMemoryDevice == hipMemoryTypeDevice, "the memory types differ");'
   } > "$tmp/abi.cpp"
-  check "$release: the device properties$([[ $modern == 1 ]] && echo " (R0600 and R0000)" || echo " (ROCm 5's layout)") and pointer attributes sit where its headers put them" "$tmp/abi.cpp"
+  check "$release: the device properties (R0600 and R0000) and pointer attributes sit where its headers put them" "$tmp/abi.cpp"
   # hipDeviceGetAttribute is asked by number, so each attribute VirtualGPU
   # answers has to carry the number the header gives it. VirtualGPU names each
   # after the header's own, kFoo for hipDeviceAttributeFoo.
