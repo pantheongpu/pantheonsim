@@ -798,6 +798,7 @@ struct EntryFn {
   std::array<uint32_t, 3> max_ntid{0, 0, 0};
   std::array<uint32_t, 3> req_ntid{0, 0, 0};
   uint32_t min_ctas_per_sm = 0;
+  uint32_t max_nreg = 0;   // .maxnreg: a register ceiling ptxas must meet
   // .reqnctapercluster: the cluster shape in CTAs the kernel was compiled for
   // (__cluster_dims__). Zero means the kernel names no cluster shape.
   // .explicitcluster says the kernel must be launched with one.

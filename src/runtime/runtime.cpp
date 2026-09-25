@@ -78,12 +78,19 @@ uint64_t Device::load_module(const std::string& ptx_src) {
     // an indirect call decodes to find the function again.
     for (size_t i = 0; i < mod->funcs.size(); ++i)
       lm.symbols[mod->funcs[i]->name] = kFuncVaBase + i * kFuncVaStride;
+    // Kernels too, which is what a device-side launch names its child by.
+    // Addresses are never reused, so a stale one cannot name another kernel.
+    for (const auto& e : mod->entries) {
+      const uint64_t va = next_kernel_va_;
+      next_kernel_va_ += kKernelVaStride;
+      lm.symbols[e.name] = va;
+      lm.kernels.emplace_back(va, &e);
+    }
     // Second pass: a global initialised with another symbol's address can only
-    // be filled in once every global has one. A symbol that names a kernel
-    // rather than a variable has no address in this model and stays zero --
-    // taking a kernel's address is a host-side operation, and PTX that only
-    // uses it to carry a mangled name (which is what NVRTC's name expressions
-    // compile to) never dereferences it.
+    // be filled in once every global has one. A kernel's address is its
+    // entry in the kernel window; PTX that only uses it to carry a mangled
+    // name (which is what NVRTC's name expressions compile to) never
+    // dereferences it.
     for (const auto& g : mod->globals) {
       if (g.init_symbols.empty()) continue;
       const uint64_t slot = lm.symbols[g.name];
@@ -549,6 +556,13 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   // its own table.
   exec::LaunchConfig cfg = in_cfg;
   if (!cfg.textures && !textures_.empty()) cfg.textures = &textures_;
+  // Every kernel loaded on the device, for the child grids a kernel launches.
+  exec::KernelTable kernels;
+  if (!cfg.kernels) {
+    for (const auto& lm : modules_)
+      for (const auto& [va, fn] : lm.kernels) kernels[va] = exec::KernelRef{fn, &lm.symbols};
+    cfg.kernels = &kernels;
+  }
   if (fault_) {
     fault_->check_lost(fn.name);
     fault_->maybe_hang(fn.name, telemetry_, static_cast<uint32_t>(ordinal_));

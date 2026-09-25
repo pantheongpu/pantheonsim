@@ -768,6 +768,7 @@ class Parser {
         next();
         uint32_t v = static_cast<uint32_t>(expect_int("directive value"));
         if (d == ".minnctapersm") fn.min_ctas_per_sm = v;
+        if (d == ".maxnreg") fn.max_nreg = v;
       } else if (d == ".noreturn" || d == ".pragma") {
         next();
         while (!at_end() && !peek_punct(";") && !peek_punct("{")) next();

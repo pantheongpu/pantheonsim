@@ -18,6 +18,14 @@
 
 namespace vgpu::exec {
 
+// A kernel a device-side launch can name: the kernel and the symbol table of
+// the module it came from, by the address the runtime gave it.
+struct KernelRef {
+  const ptx::EntryFn* fn = nullptr;
+  const std::map<std::string, uint64_t>* symbols = nullptr;
+};
+using KernelTable = std::map<uint64_t, KernelRef>;
+
 struct LaunchConfig {
   std::array<uint32_t, 3> grid{1, 1, 1};
   std::array<uint32_t, 3> block{1, 1, 1};
@@ -50,6 +58,10 @@ struct LaunchConfig {
   // receives is only a number; this is what it means. Null when the kernel uses
   // no textures, which is the overwhelming majority.
   const TextureTable* textures = nullptr;
+  // The kernels loaded on the device, by address, for dynamic parallelism: a
+  // kernel that launches a child grid names it by address. Null when the
+  // caller has no table, which leaves device-side launches refused.
+  const KernelTable* kernels = nullptr;
 };
 
 // Invoked periodically during a launch so long-running kernels can still

@@ -167,6 +167,43 @@ struct SharedShadow {
 struct ClusterState;
 struct Warp;
 
+// Dynamic parallelism: the child grids a launch's kernels ask for. A thread
+// gets a parameter buffer for a kernel, fills it, and launches it; the child
+// runs after the parent grid has finished and before the launch as a whole
+// returns -- a schedule CUDA allows for every device-side stream, since it
+// promises no concurrency between a parent and its children, and one it
+// requires of a tail launch. Children run in the order they were launched,
+// parent block by parent block, which makes the order reproducible when
+// blocks run on several host threads.
+struct ChildLaunch {
+  KernelRef kernel;
+  std::array<uint32_t, 3> grid{}, block{};
+  uint32_t shared = 0;
+  uint64_t buffer = 0;     // the parameter buffer, in device memory
+  uint32_t size = 0;
+  uint64_t order = 0;      // parent block, then issue order within it
+};
+struct DeviceLaunches {
+  std::mutex mu;
+  std::unordered_map<uint64_t, ChildLaunch> by_buffer;   // a buffer handed out, not launched yet
+  std::vector<ChildLaunch> queue;                       // launched, to run after the grid
+  std::unordered_map<uint64_t, uint64_t> per_block;     // launches each parent block has issued
+};
+// cudaLimitDevRuntimePendingLaunchCount's default, and CUDA's nesting limit.
+constexpr size_t kMaxPendingLaunches = 2048;
+constexpr uint32_t kMaxLaunchDepth = 24;
+
+// A kernel's parameter space: each parameter at its alignment, in order --
+// the layout the parent writes a child's arguments in.
+uint32_t param_space_bytes(const EntryFn& fn) {
+  uint32_t end = 0;
+  for (const auto& p : fn.params) {
+    const uint32_t align = p.align ? p.align : (p.size < 8 ? std::max<uint32_t>(p.size, 1) : 8);
+    end = (end + align - 1) / align * align + p.size;
+  }
+  return end;
+}
+
 // The CTA's sixteen barriers as bar.sync with a thread count and bar.arrive
 // use them: arrivals counted in threads, a warp's arrival counting all of
 // its threads (the ISA "marks warps' arrival"), and the warps waiting.
@@ -791,6 +828,7 @@ class Interpreter {
   }
 
   void set_concurrent(bool v) { concurrent_ = v; }
+  void set_device_launches(DeviceLaunches* dl) { dl_ = dl; }
   void set_grid_id(uint64_t v) { grid_id_ = v; }
 
   void run_grid() {
@@ -949,6 +987,8 @@ class Interpreter {
   }
 
  private:
+  DeviceLaunches* dl_ = nullptr;
+
   // Re-throws a lower-level error with kernel/instruction context attached.
   [[noreturn]] void rethrow_with_context(const Error& e, const Instr& ins, int lane) {
     throw Error::make(e.code(), e.message(), "\n  in ", cur_ == &fn_ ? "kernel '" : "device function '",
@@ -1315,10 +1355,9 @@ class Interpreter {
       if (k == name)
         ctx_fail(ins, -1, Err::Unsupported,
                  "kernel '" + name +
-                     "' had its address taken, which in device code means a device-side launch "
-                     "(dynamic parallelism). That is not implemented: a child grid would have to "
-                     "run from inside the parent's instruction stream, and nothing here can "
-                     "schedule one");
+                     "' had its address taken for a device-side launch (dynamic parallelism), "
+                     "but this launch has no symbol table giving kernels addresses; the runtime "
+                     "supplies one");
     ctx_fail(ins, -1, Err::NotFound,
              "unknown symbol '" + name + "' (not a .local depot, module .global variable, "
              "kernel parameter, or device function)");
@@ -3968,6 +4007,17 @@ class Interpreter {
         exec_device_heap(w, ctx, ins, *op, m);
         return;
       }
+      // The device runtime's launch entry points, as the CUDA programming
+      // guide documents them for code generators ("Device-side Launch from
+      // PTX"); CUDA 12's CDP2 compiles to the __cudaCDP2 names.
+      if (op->callee == "__cudaCDP2GetParameterBufferV2" || op->callee == "cudaGetParameterBufferV2") {
+        exec_get_parameter_buffer(w, ctx, ins, *op, m);
+        return;
+      }
+      if (op->callee == "__cudaCDP2LaunchDeviceV2" || op->callee == "cudaLaunchDeviceV2") {
+        exec_launch_device(w, ctx, ins, *op, m);
+        return;
+      }
       if (op->indirect) {
         exec_indirect_call(w, ctx, ins, *op, m);
         return;
@@ -6352,13 +6402,18 @@ class Interpreter {
       if (m & (Mask{1} << lane)) { lead = lane; break; }
     if (lead >= W_) return;
     const uint64_t addr = sbase + base[lead] + static_cast<uint64_t>(op.addr.offset);
+    // Lanes may name different barriers -- CUTLASS's cluster pipelines have
+    // each lane arrive on another block's -- and every mbarrier operation is
+    // per thread, so each barrier's lanes are handled as a group of their own.
+    Mask same = 0;
     for (uint32_t lane = 0; lane < W_; ++lane)
-      if (m & (Mask{1} << lane)) {
-        const uint64_t a2 = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
-        if (a2 != addr)
-          ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
-                   "mbarrier with a different address per lane is not supported");
-      }
+      if (m & (Mask{1} << lane) && sbase + base[lane] + static_cast<uint64_t>(op.addr.offset) == addr)
+        same |= Mask{1} << lane;
+    if (same != m) {
+      exec_mbarrier(w, ctx, ins, op, same);
+      exec_mbarrier(w, ctx, ins, op, m & ~same);
+      return;
+    }
     if (addr % 8 != 0)
       ctx_fail(ins, -1, Err::MisalignedAccess, "an mbarrier must be 8-byte aligned");
 
@@ -6864,6 +6919,100 @@ class Interpreter {
   // where on a device it is not -- a permissive difference, so a program that
   // works on hardware works here, but one that copies a device-malloc'd
   // pointer to the host will pass here and fail there.
+  const Warp::Slot& call_slot(const Warp& w, const Instr& ins, const OpCall& op, size_t i) {
+    auto it = w.slots.find(op.param_slots[i]);
+    if (it == w.slots.end())
+      ctx_fail(ins, -1, Err::UninitializedRegister, op.callee + " argument read before it was written");
+    return it->second;
+  }
+  void write_call_result(Warp& w, const OpCall& op, Mask m, const Lanes& r, uint32_t bytes) {
+    if (op.retval_slot.empty()) return;
+    Warp::Slot& out = w.slots[op.retval_slot];
+    if (out.bytes.empty()) out.reset(bytes, W_);
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) out.write(lane, 0, bytes, r[lane]);
+  }
+
+  // cudaGetParameterBufferV2(func, gridDim, blockDim, sharedMem): a buffer, in
+  // device memory, laid out as the kernel's parameters are, for the calling
+  // thread to fill. Null once too many launches are pending, as on hardware.
+  void exec_get_parameter_buffer(Warp& w, const BlockCtx&, const Instr& ins, const OpCall& op, Mask m) {
+    if (op.param_slots.size() != 4)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, op.callee + " takes four arguments");
+    if (!cfg_.kernels || !dl_)
+      ctx_fail(ins, -1, Err::Unsupported,
+               "a device-side launch, with no kernel table to find the child in (the runtime "
+               "supplies one; a bare exec::launch does not)");
+    const Warp::Slot& func = call_slot(w, ins, op, 0);
+    const Warp::Slot& grid = call_slot(w, ins, op, 1);
+    const Warp::Slot& block = call_slot(w, ins, op, 2);
+    const Warp::Slot& shared = call_slot(w, ins, op, 3);
+    Lanes r{};
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint64_t f = func.read(lane, 0, 8);
+      auto k = cfg_.kernels->find(f);
+      if (k == cfg_.kernels->end())
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                 "a device-side launch names 0x" + [&] {
+                   char b[24];
+                   std::snprintf(b, sizeof b, "%llx", static_cast<unsigned long long>(f));
+                   return std::string(b);
+                 }() + ", which is not the address of a kernel loaded on this device");
+      ChildLaunch c;
+      c.kernel = k->second;
+      for (int i = 0; i < 3; ++i) {
+        c.grid[i] = static_cast<uint32_t>(grid.read(lane, 4 * i, 4));
+        c.block[i] = static_cast<uint32_t>(block.read(lane, 4 * i, 4));
+      }
+      c.shared = static_cast<uint32_t>(shared.read(lane, 0, 4));
+      c.size = param_space_bytes(*c.kernel.fn);
+      std::lock_guard<std::mutex> guard(dl_->mu);
+      if (dl_->by_buffer.size() + dl_->queue.size() >= kMaxPendingLaunches) continue;   // null
+      c.buffer = mem_.alloc(std::max<uint64_t>(c.size, 16));
+      r[lane] = c.buffer;
+      dl_->by_buffer.emplace(c.buffer, c);
+    }
+    write_call_result(w, op, m, r, 8);
+  }
+
+  // cudaLaunchDeviceV2(parameterBuffer, stream): the child is queued to run
+  // after this grid. The stream is not needed to order it: every device-side
+  // stream's launches may run then, and children run in the order issued.
+  void exec_launch_device(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
+    if (op.param_slots.size() != 2)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, op.callee + " takes two arguments");
+    if (!dl_)
+      ctx_fail(ins, -1, Err::Unsupported, "a device-side launch outside a launch that can run it");
+    const Warp::Slot& buf = call_slot(w, ins, op, 0);
+    constexpr uint64_t kSuccess = 0, kInvalidValue = 1, kInvalidConfiguration = 9;
+    const uint64_t block_linear =
+        (uint64_t{ctx.ctaid[2]} * ctx.nctaid[1] + ctx.ctaid[1]) * ctx.nctaid[0] + ctx.ctaid[0];
+    Lanes r{};
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint64_t b = buf.read(lane, 0, 8);
+      std::lock_guard<std::mutex> guard(dl_->mu);
+      auto it = dl_->by_buffer.find(b);
+      if (it == dl_->by_buffer.end()) {
+        r[lane] = kInvalidValue;   // not a buffer cudaGetParameterBuffer handed out
+        continue;
+      }
+      ChildLaunch c = it->second;
+      dl_->by_buffer.erase(it);
+      const uint64_t threads = uint64_t{c.block[0]} * c.block[1] * c.block[2];
+      if (!c.grid[0] || !c.grid[1] || !c.grid[2] || !threads || (profile_.limits.max_threads_per_block && threads > profile_.limits.max_threads_per_block)) {
+        mem_.free(c.buffer);
+        r[lane] = kInvalidConfiguration;
+        continue;
+      }
+      c.order = (block_linear << 24) | (dl_->per_block[block_linear]++ & 0xFFFFFF);
+      dl_->queue.push_back(c);
+      r[lane] = kSuccess;
+    }
+    write_call_result(w, op, m, r, 4);
+  }
+
   void exec_device_heap(Warp& w, [[maybe_unused]] const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
     const bool allocating = op.callee == "malloc";
     if (op.param_slots.size() != 1)
@@ -7140,7 +7289,25 @@ KernelResources kernel_resources(const EntryFn& fn, const DeviceProfile& profile
   // The interpreter has no architectural register file to run out of, so this
   // only corrects what is *reported* -- the occupancy figure and the launch
   // decision, which are exactly the things the number exists to inform.
-  const uint32_t arch_max = profile.limits.max_registers_per_thread;
+  //
+  // The kernel's own bounds lower that ceiling, the same way: .maxnreg names
+  // one, and .maxntid (with .minnctapersm) promises that many threads -- that
+  // many blocks -- fit, which ptxas meets by allocating no more registers per
+  // thread than the block's and the multiprocessor's files allow, in its
+  // allocation unit of 8. CUTLASS's Hopper kernels declare .maxntid 384 and
+  // need more than 170 by this measure; hardware launches them, spilling.
+  uint32_t arch_max = profile.limits.max_registers_per_thread;
+  if (fn.max_nreg && (!arch_max || fn.max_nreg < arch_max)) arch_max = fn.max_nreg;
+  const uint64_t bound_threads = uint64_t{fn.max_ntid[0]} * std::max(1u, fn.max_ntid[1]) *
+                                 std::max(1u, fn.max_ntid[2]);
+  if (fn.max_ntid[0] && bound_threads) {
+    uint64_t cap = profile.limits.registers_per_block / bound_threads;
+    if (profile.limits.registers_per_sm)
+      cap = std::min<uint64_t>(cap, profile.limits.registers_per_sm /
+                                        (bound_threads * std::max(1u, fn.min_ctas_per_sm)));
+    cap = cap / 8 * 8;
+    if (cap && (!arch_max || cap < arch_max)) arch_max = static_cast<uint32_t>(cap);
+  }
   if (arch_max && usage.regs_per_thread > arch_max) {
     const uint32_t spilled = usage.regs_per_thread - arch_max;
     usage.spilled_regs = spilled;
@@ -7319,11 +7486,13 @@ uint64_t effective_max_steps(uint64_t configured) {
 
 }  // namespace
 
-LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
-                   const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
-                   const DeviceProfile& profile, const SymbolTable* symbols,
-                   const ProgressFn& progress) {
-  refresh_modes();
+namespace {
+
+// One grid, without the child grids it launches: those are left in `dl`.
+LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
+                        const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
+                        const DeviceProfile& profile, const SymbolTable* symbols,
+                        const ProgressFn& progress, DeviceLaunches* dl) {
   LaunchConfig with_cluster = cfg;
   // __cluster_dims__ compiles to .reqnctapercluster and is a property of the
   // kernel, so it applies whether or not the launch asked for a cluster. An
@@ -7387,6 +7556,7 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
     LaunchStats stats;
     Interpreter interp(fn, eff, pb, mem, profile, symbols, stats, progress);
     interp.set_grid_id(grid_id);
+    interp.set_device_launches(dl);
     interp.run_grid();
     return stats;
   }
@@ -7422,6 +7592,7 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
                            t == 0 ? progress : ProgressFn{});
         interp.set_concurrent(true);
         interp.set_grid_id(grid_id);
+        interp.set_device_launches(dl);
         for (;;) {
           const uint64_t begin = next_unit.fetch_add(chunk, std::memory_order_relaxed);
           if (begin >= units) break;
@@ -7440,6 +7611,73 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
   LaunchStats total;
   for (const auto& s : per_thread) total.add(s);
   return total;
+}
+
+// Runs the child grids `dl` holds, each to completion -- its own children
+// included, since a grid is complete only when they are -- before the next,
+// in the order they were launched.
+void run_children(DeviceLaunches& dl, const LaunchConfig& parent, MemoryManager& mem,
+                  const DeviceProfile& profile, const ProgressFn& progress, LaunchStats& stats,
+                  uint32_t depth) {
+  // Buffers taken and never launched go back.
+  for (auto& [buf, c] : dl.by_buffer) mem.free(buf);
+  dl.by_buffer.clear();
+  std::vector<ChildLaunch> queue = std::move(dl.queue);
+  dl.queue.clear();
+  std::stable_sort(queue.begin(), queue.end(),
+                   [](const ChildLaunch& a, const ChildLaunch& b) { return a.order < b.order; });
+  // Whatever happens, no parameter buffer outlives the launch.
+  struct Buffers {
+    MemoryManager& mem;
+    std::vector<ChildLaunch>& q;
+    ~Buffers() {
+      for (auto& c : q)
+        if (c.buffer) mem.free(c.buffer);
+    }
+  } guard{mem, queue};
+  for (ChildLaunch& c : queue) {
+    if (depth > kMaxLaunchDepth)
+      throw Error::make(Err::LaunchConfig, "kernel '", c.kernel.fn->name,
+                        "' launched at nesting depth ", depth, "; dynamic parallelism allows ",
+                        kMaxLaunchDepth);
+    std::vector<uint8_t> bytes(c.size);
+    if (c.size) mem.read(c.buffer, bytes.data(), c.size);
+    mem.free(c.buffer);
+    c.buffer = 0;
+    // The buffer back into one argument per parameter, at the offsets the
+    // parent wrote them to.
+    std::vector<std::vector<uint8_t>> args;
+    uint32_t off = 0;
+    for (const auto& p : c.kernel.fn->params) {
+      const uint32_t align = p.align ? p.align : (p.size < 8 ? std::max<uint32_t>(p.size, 1) : 8);
+      off = (off + align - 1) / align * align;
+      args.emplace_back(bytes.begin() + off, bytes.begin() + off + p.size);
+      off += p.size;
+    }
+    LaunchConfig cc = parent;
+    cc.grid = c.grid;
+    cc.block = c.block;
+    cc.shared_bytes = c.shared;
+    cc.cluster = {0, 0, 0};
+    cc.cooperative = false;
+    cc.coop_workspace = 0;
+    DeviceLaunches child;
+    stats.add(launch_grid(*c.kernel.fn, cc, args, mem, profile, c.kernel.symbols, progress, &child));
+    run_children(child, cc, mem, profile, progress, stats, depth + 1);
+  }
+}
+
+}  // namespace
+
+LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
+                   const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
+                   const DeviceProfile& profile, const SymbolTable* symbols,
+                   const ProgressFn& progress) {
+  refresh_modes();
+  DeviceLaunches dl;
+  LaunchStats stats = launch_grid(fn, cfg, args, mem, profile, symbols, progress, &dl);
+  run_children(dl, cfg, mem, profile, progress, stats, 1);
+  return stats;
 }
 
 }  // namespace vgpu::exec
