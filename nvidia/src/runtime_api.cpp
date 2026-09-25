@@ -44,6 +44,7 @@
 
 #include "error_names.hpp"
 #include "fatbin.hpp"
+#include "vgpu/exec/tensormap.hpp"
 // cudaDeviceProp is filled in by this shim and read by the application, so
 // both sides must agree on its layout. The original failure was a stale
 // /usr/include copy of the header winning over the toolkit's, which silently
@@ -3481,11 +3482,45 @@ VGPU_EXPORT cudaError_t cudaRuntimeGetVersion(int* v) {
 
 // Driver entry points: how a runtime program reaches a driver function without
 // linking libcuda -- CUTLASS gets cuTensorMapEncodeTiled this way. The answer
-// has to come from this simulator's libcuda, not from whatever libcuda.so.1 the
-// loader would find by name: on a machine with an NVIDIA driver installed that
-// is the real one, and a tensor map encoded by it means nothing here. So the
-// library is the one sitting next to this libcudart.
+// has to come from this simulator, not from whatever libcuda.so.1 the loader
+// would find by name: on a machine with an NVIDIA driver installed that is the
+// real one, and a tensor map encoded by it means nothing here.
+//
+// The tensor-map functions touch no device, so this library answers them
+// itself. Everything else comes from the simulator's libcuda beside it -- but
+// loading that into the program puts a second copy of the engine in the
+// process, which a sanitizer build reports as an ODR violation, so it is done
+// only for the entry points that need it.
 namespace {
+constexpr int kCuSuccess = 0, kCuInvalidValue = 1, kCuNotSupported = 801;
+
+int tmap_result(const char* api, vgpu::exec::TmapResult r, const std::string& why) {
+  if (r == vgpu::exec::TmapResult::Ok) return kCuSuccess;
+  if (!quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", api, why.c_str());
+  return r == vgpu::exec::TmapResult::Unsupported ? kCuNotSupported : kCuInvalidValue;
+}
+int rt_tensor_map_encode_tiled(void* tensorMap, unsigned dataType, unsigned rank, void* globalAddress,
+                               const unsigned long long* globalDim, const unsigned long long* globalStrides,
+                               const unsigned* boxDim, const unsigned* elementStrides, unsigned interleave,
+                               unsigned swizzle, unsigned l2Promotion, unsigned oobFill) {
+  std::string why;
+  const auto r = vgpu::exec::encode_tiled(tensorMap, dataType, rank, globalAddress, globalDim,
+                                          globalStrides, boxDim, elementStrides, interleave, swizzle,
+                                          l2Promotion, oobFill, &why);
+  return tmap_result("cuTensorMapEncodeTiled", r, why);
+}
+int rt_tensor_map_replace_address(void* tensorMap, void* globalAddress) {
+  std::string why;
+  return tmap_result("cuTensorMapReplaceAddress",
+                     vgpu::exec::replace_address(tensorMap, globalAddress, &why), why);
+}
+int rt_tensor_map_encode_im2col(void*, unsigned, unsigned, void*, const unsigned long long*,
+                                const unsigned long long*, const int*, const int*, unsigned, unsigned,
+                                const unsigned*, unsigned, unsigned, unsigned, unsigned) {
+  return tmap_result("cuTensorMapEncodeIm2col", vgpu::exec::TmapResult::Unsupported,
+                     "TMA's im2col mode is not implemented");
+}
+
 using GetProcAddressFn = int (*)(const char*, void**, int, unsigned long long, int*);
 GetProcAddressFn simulator_get_proc_address() {
   static GetProcAddressFn fn = []() -> GetProcAddressFn {
@@ -3506,6 +3541,17 @@ cudaError_t driver_entry_point(const char* symbol, void** funcPtr, int version,
   if (!symbol || !funcPtr) return cudaErrorInvalidValue;
   if (version > vgpu::driver_version()) return cudaErrorInvalidValue;
   *funcPtr = nullptr;
+  static const struct { const char* name; void* fn; } kLocal[] = {
+      {"cuTensorMapEncodeTiled", reinterpret_cast<void*>(&rt_tensor_map_encode_tiled)},
+      {"cuTensorMapReplaceAddress", reinterpret_cast<void*>(&rt_tensor_map_replace_address)},
+      {"cuTensorMapEncodeIm2col", reinterpret_cast<void*>(&rt_tensor_map_encode_im2col)},
+  };
+  for (const auto& e : kLocal)
+    if (std::strcmp(symbol, e.name) == 0) {
+      *funcPtr = e.fn;
+      if (driverStatus) *driverStatus = cudaDriverEntryPointSuccess;
+      return cudaSuccess;
+    }
   GetProcAddressFn get = simulator_get_proc_address();
   if (!get) {
     std::fprintf(stderr, "[vgpu] cudaGetDriverEntryPoint: this simulator's libcuda.so.1 was not "

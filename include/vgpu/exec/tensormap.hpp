@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 namespace vgpu::exec {
 
@@ -107,6 +108,86 @@ struct TensorMap {
 inline uint64_t swizzle_address(uint64_t addr, uint32_t swizzle_bytes) {
   if (!swizzle_bytes) return addr;
   return addr ^ (((addr >> 7) & (swizzle_bytes / 16 - 1)) << 4);
+}
+
+// cuTensorMapEncodeTiled's checks and encoding, shared by the driver and the
+// runtime (which answers cudaGetDriverEntryPoint for it without loading the
+// driver library). Invalid means CUDA_ERROR_INVALID_VALUE and Unsupported
+// CUDA_ERROR_NOT_SUPPORTED; `why` names the documented rule that was broken.
+enum class TmapResult { Ok, Invalid, Unsupported };
+
+inline TmapResult encode_tiled(void* tensorMap, unsigned dataType, unsigned rank, void* globalAddress,
+                               const unsigned long long* globalDim, const unsigned long long* globalStrides,
+                               const unsigned* boxDim, const unsigned* elementStrides, unsigned interleave,
+                               unsigned swizzle, unsigned l2Promotion, unsigned oobFill, std::string* why) {
+  auto bad = [&](std::string w) { *why = std::move(w); return TmapResult::Invalid; };
+  auto unsupported = [&](std::string w) { *why = std::move(w) + " is not implemented"; return TmapResult::Unsupported; };
+  if (!tensorMap || !globalDim || !boxDim || !elementStrides || (rank > 1 && !globalStrides))
+    return bad("a required pointer is null");
+  if (reinterpret_cast<uintptr_t>(tensorMap) % 64) return bad("tensorMap must be 64-byte aligned");
+  if (dataType > 15) return bad("unknown tensorDataType " + std::to_string(dataType));
+  if (rank == 0 || rank > 5) return bad("tensorRank must be 1 to 5");
+  if (interleave > 2 || swizzle > 6 || l2Promotion > 3 || oobFill > 1)
+    return bad("an enum argument is out of range");
+  const auto type = static_cast<TmapType>(dataType);
+  const uint32_t esize = TensorMap::type_bytes(type);
+  if (esize == 0) return unsupported("the packed sub-byte types (16U4, 16U6)");
+  if (interleave != 0) return unsupported("an interleaved layout (NC/8HWC8, NC/16HWC16)");
+  if (swizzle > 3) return unsupported("the 128B swizzle with 32B or 64B atomicity (Blackwell)");
+  const uint64_t addr = reinterpret_cast<uint64_t>(globalAddress);
+  if (addr % 16) return bad("globalAddress must be 16-byte aligned");
+  TensorMap m;
+  m.address = addr;
+  m.rank = rank;
+  m.type = type;
+  m.swizzle = static_cast<TmapSwizzle>(swizzle);
+  const bool is_float = type == TmapType::F16 || type == TmapType::F32 || type == TmapType::F64 ||
+                        type == TmapType::BF16 || type == TmapType::F32Ftz ||
+                        type == TmapType::TF32 || type == TmapType::TF32Ftz;
+  if (oobFill && !is_float) return bad("the NaN out-of-bounds fill needs a floating-point type");
+  m.oob_nan = static_cast<uint8_t>(oobFill);
+  m.stride[0] = esize;
+  for (unsigned i = 0; i < rank; ++i) {
+    if (globalDim[i] == 0 || globalDim[i] > (1ull << 32))
+      return bad("globalDim[" + std::to_string(i) + "] must be 1 to 2^32");
+    if (boxDim[i] == 0 || boxDim[i] > 256) return bad("boxDim[" + std::to_string(i) + "] must be 1 to 256");
+    if (elementStrides[i] == 0 || elementStrides[i] > 8)
+      return bad("elementStrides[" + std::to_string(i) + "] must be 1 to 8");
+    m.dim[i] = globalDim[i];
+    m.box[i] = boxDim[i];
+    // With no interleave the first element stride is ignored: TMA has no
+    // stride along dimension 0.
+    m.elem_stride[i] = i == 0 ? 1 : elementStrides[i];
+  }
+  for (unsigned i = 0; i + 1 < rank; ++i) {
+    if (globalStrides[i] % 16 || globalStrides[i] >= (1ull << 40))
+      return bad("globalStrides[" + std::to_string(i) + "] must be a multiple of 16 below 2^40");
+    m.stride[i + 1] = globalStrides[i];
+  }
+  if (uint64_t{boxDim[0]} * esize % 16)
+    return bad("boxDim[0] times the element size must be a multiple of 16 bytes");
+  const uint32_t swz = TensorMap::swizzle_bytes(m.swizzle);
+  if (swz && uint64_t{boxDim[0]} * esize > swz)
+    return bad("the box's inner dimension (" + std::to_string(uint64_t{boxDim[0]} * esize) +
+               " bytes) is wider than the " + std::to_string(swz) + "-byte swizzle");
+  m.encode(tensorMap);
+  return TmapResult::Ok;
+}
+
+// cuTensorMapReplaceAddress: the same map pointed at a new base.
+inline TmapResult replace_address(void* tensorMap, void* globalAddress, std::string* why) {
+  TensorMap m;
+  if (!tensorMap || !m.decode(tensorMap)) {
+    *why = "tensorMap was not made by cuTensorMapEncode*";
+    return TmapResult::Invalid;
+  }
+  if (reinterpret_cast<uint64_t>(globalAddress) % 16) {
+    *why = "globalAddress must be 16-byte aligned";
+    return TmapResult::Invalid;
+  }
+  m.address = reinterpret_cast<uint64_t>(globalAddress);
+  m.encode(tensorMap);
+  return TmapResult::Ok;
 }
 
 }  // namespace vgpu::exec
