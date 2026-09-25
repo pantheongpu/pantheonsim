@@ -234,6 +234,12 @@ struct Machine {
     } catch (const std::exception&) {
     }
     const uint64_t entry = d.code_base + (d.kernel ? d.kernel->entry : 0);
+    // Code before the kernel's entry is a function it called (unoptimized code
+    // calls the device library's helpers rather than inlining them), and a
+    // distance back from the entry would wrap into nonsense.
+    if (pc < entry)
+      return Error::make(e.code(), e.message(), " (in a function ", name, " called, at +0x", std::hex,
+                         pc - d.code_base, std::dec, " in the code object", text, ")");
     return Error::make(e.code(), e.message(), " (", name, " +0x", std::hex, pc - entry, std::dec, text, ")");
   }
 
@@ -691,6 +697,13 @@ struct Machine {
                                      static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int32_t>(b)) >> 32));
     } else if (op == "s_pack_ll_b32_b16"_op) {
       write_scalar(w, in.dst[0], (static_cast<uint32_t>(a) & 0xFFFFu) | (static_cast<uint32_t>(b) & 0xFFFFu) << 16);
+    } else if (op == "s_xor_saveexec_b64"_op) {
+      // With -1, the lanes that are off: how a function saves a register all
+      // 64 lanes share without disturbing the ones its caller left running.
+      const uint64_t saved = w.exec;
+      w.exec = a ^ saved;
+      write_scalar(w, in.dst[0], saved);
+      w.scc = w.exec != 0;
     } else if (op == "s_andn2_saveexec_b64"_op) {
       // The other half of a divergence: keep EXEC, and take the lanes the
       // condition did not.
@@ -910,6 +923,7 @@ struct Machine {
     const std::string as_short =
         in.sdwa   ? in.name.substr(0, in.name.size() - 5) + "_e32"
         : in.dpp  ? in.name.substr(0, in.name.size() - 4) + "_e32"
+        : in.promoted ? in.name.substr(0, in.name.size() - 4) + "_e32"
         : in.name.size() > 4 && in.name.compare(in.name.size() - 4, 4, "_e64") == 0 &&
                 (in.name.find("_u16") != std::string::npos || in.name.find("_b16") != std::string::npos)
                   ? in.name.substr(0, in.name.size() - 4) + "_e32"
@@ -929,6 +943,19 @@ struct Machine {
       // value into one lane of a register, whatever EXEC says.
       const uint32_t lane = static_cast<uint32_t>(scalar(w, in.src[1])) & 63;
       w.vgpr[in.dst[0].index][lane] = static_cast<uint32_t>(scalar(w, in.src[0]));
+      return;
+    }
+    if (op == "v_readlane_b32"_op) {
+      // And its reverse, one lane into a scalar register, which is just as
+      // blind to EXEC. Unoptimized code spills scalars into lanes and reads
+      // them back with every lane off, on the way out of a branch nobody took.
+      const uint32_t which = static_cast<uint32_t>(scalar(w, in.src[1])) & (kLanes - 1);
+      write_scalar(w, in.dst[0], w.vgpr[in.src[0].index][which]);
+      return;
+    }
+    if (op == "v_readfirstlane_b32"_op) {
+      // The first active lane; with none active, lane 0.
+      write_scalar(w, in.dst[0], w.vgpr[in.src[0].index][first_active(w)]);
       return;
     }
     // Which operation it is is decided once; its body then runs for each
@@ -1555,12 +1582,6 @@ struct Machine {
         write_lane(w, in.dst[0], lane,
                    (lane_src(w, in.src[0], lane) & 0xFFFFFF) * (lane_src(w, in.src[1], lane) & 0xFFFFFF));
       });
-    } else if (op == "v_readfirstlane_b32"_op) {
-      each([&](uint32_t lane) {
-        // The value in the first active lane, into a scalar register.
-        if (lane != first_active(w)) return;
-        write_scalar(w, in.dst[0], w.vgpr[in.src[0].index][lane]);
-      });
     } else if (op == "v_cvt_u32_f32_e32"_op) {
       each([&](uint32_t lane) {
         const float f = lane_float(w, in.src[0], lane);
@@ -1684,13 +1705,6 @@ struct Machine {
         if (static_cast<uint64_t>(p >> 64)) sdst_bits |= uint64_t{1} << lane;
       });
       if (in.dst.size() > 1) write_scalar(w, in.dst[1], sdst_bits);
-    } else if (op == "v_readlane_b32"_op) {
-      each([&](uint32_t lane) {
-        // Reads one lane, into a scalar register: not a per-lane operation.
-        if (lane != first_active(w)) return;
-        const uint32_t which = static_cast<uint32_t>(scalar(w, in.src[1])) & (kLanes - 1);
-        write_scalar(w, in.dst[0], w.vgpr[in.src[0].index][which]);
-      });
     } else if (w.exec) {
       // With no lane to write, an instruction changes nothing, and is not refused.
       throw Error::make(Err::Unsupported, "vector instruction ", op, " is decoded but not implemented");
@@ -2584,6 +2598,12 @@ struct Machine {
     }
     if (OpName(in.name) == "s_nop"_op || OpName(in.name) == "s_waitcnt"_op) return true;   // nothing is out of order here
     if (OpName(in.name) == "s_setprio"_op) return true;   // waves are not scheduled by priority here
+    if (OpName(in.name) == "s_trap"_op) {
+      // A real card's trap handler reports it to the queue and the runtime
+      // aborts the launch; the launch fails here, and says why.
+      throw Error::make(Err::Trap, "the kernel executed s_trap ", in.simm,
+                        in.simm == 2 ? " (llvm.trap: __builtin_trap or abort() in device code)" : "");
+    }
     if (OpName(in.name) == "s_barrier"_op) {
       w.at_barrier = true;
       ++stats.barriers;
