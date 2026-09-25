@@ -90,8 +90,13 @@ runs:
         v="${TOOLKIT//./-}"
         # CUDA 13 renamed the NVVM package.
         nvvm="cuda-nvvm-$v"; [[ "${TOOLKIT%%.*}" -ge 13 ]] && nvvm="libnvvm-$v"
+        # nvcc, plus the headers of every library the simulator stands in for:
+        # it builds each one against the toolkit's own declarations.
         sudo apt-get install -y -qq --no-install-recommends \
           "cuda-nvcc-$v" "cuda-cudart-dev-$v" "cuda-crt-$v" "$nvvm" \
+          "cuda-nvml-dev-$v" "cuda-cupti-dev-$v" "cuda-nvrtc-dev-$v" "libcublas-dev-$v" \
+          "libcufft-dev-$v" "libcurand-dev-$v" "libcusparse-dev-$v" "libnvjpeg-dev-$v" \
+          "libcusolver-dev-$v" "libnpp-dev-$v" \
           || { echo "::error::could not install CUDA $TOOLKIT from NVIDIA's repository for Ubuntu $VERSION_ID"; exit 1; }
         echo "/usr/local/cuda-$TOOLKIT/bin" >> "$GITHUB_PATH"
 
@@ -137,7 +142,9 @@ runs:
         # the CUDA libraries are built against its headers.
         src=$(cd "$SRC" && find CMakeLists.txt src include nvidia amd tools scripts -type f -print0 \
               | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-20)
-        nvcc_version=$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1)
+        # No nvcc (an AMD job, or cuda-toolkit: none without one) is a
+        # toolkit version of none, not a failed step.
+        nvcc_version=$( { nvcc --version 2>/dev/null || true; } | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1)
         {
           echo "build=$build"
           echo "shim=$build/shim"
@@ -190,6 +197,9 @@ runs:
         if [[ "$ROCM" != none && -d /opt/rocm/lib ]]; then
           hip=$(readlink -f "$BUILD/shim/libamdhip64.so.6")
           for n in libamdhip64.so libamdhip64.so.6 libamdhip64.so.7; do sudo ln -sfn "$hip" "/opt/rocm/lib/$n"; done
+          # hipcc with no --offload-arch asks this which GPUs are present, so
+          # it compiles for the simulated card, as it would on a real one.
+          sudo ln -sfn "$BUILD/bin/rocm_agent_enumerator" /opt/rocm/bin/rocm_agent_enumerator
         fi
         case "$GPU" in
           amd/*) VGPU_GPU="$GPU" VGPU_DEVICE_COUNT="$COUNT" "$BUILD/bin/rocm-smi" ;;

@@ -116,6 +116,9 @@ jobs:
           hipcc --offload-arch=gfx942 vectoradd.hip -o vectoradd
           vgpu run ./vectoradd
           ./vectoradd
+          # No --offload-arch: hipcc asks rocm_agent_enumerator, as on a real machine.
+          hipcc vectoradd.hip -o vectoradd-native
+          ./vectoradd-native
 
   cuda-version:
     name: compile and run CUDA 12.6 from NVIDIA's repository
