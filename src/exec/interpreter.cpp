@@ -621,6 +621,13 @@ struct LaneSet {
   std::vector<Lanes> heap_;
 };
 
+// The position of an instruction kind in the Op variant, for switching on
+// ins.op.index() instead of testing the alternatives one at a time.
+template <class T>
+constexpr size_t op_index() {
+  return Op(std::in_place_type<T>).index();
+}
+
 uint64_t mask_to_bits(uint64_t v, uint32_t bits) {
   return bits >= 64 ? v : (v & ((1ull << bits) - 1));
 }
@@ -642,6 +649,7 @@ class Interpreter {
     // A host program that set its own rounding mode before launching gets
     // conversions that follow it, as before; see g_directed_rounding.
     host_directed_ = std::fegetround() != FE_TONEAREST;
+    fast_enabled_ = g_fast_path.load(std::memory_order_relaxed);
     if (host_directed_) g_directed_rounding.fetch_add(1, std::memory_order_relaxed);
   }
   ~Interpreter() {
@@ -1019,7 +1027,39 @@ class Interpreter {
                      " instructions in one warp) — possible infinite loop; block (" +
                      std::to_string(ctx.ctaid[0]) + "," + std::to_string(ctx.ctaid[1]) + "," +
                      std::to_string(ctx.ctaid[2]) + "), warp " + std::to_string(cur_warp_));
+      // The fast-path kinds go straight to their handler: no trip through
+      // step() and dispatch(), whose frames cost more than the arithmetic.
+      // A form the fast path declines falls through to step() as before.
+      if (fast_enabled_ && fast_kind(ins)) {
+        Mask fm = w.paths[idx].mask;
+        if (ins.has_pred) {
+          Mask p = read_pred(w, ins, ins.pred);
+          if (ins.pred_negated) p = ~p;
+          fm &= p;
+        }
+        if (fm == 0 || fast_path(w, ctx, ins, fm)) {
+          ++w.paths[idx].pc;
+          continue;
+        }
+      }
       step(w, ctx, idx, ins);
+    }
+  }
+
+  static bool fast_kind(const Instr& ins) {
+    switch (ins.op.index()) {
+      case op_index<OpIntBin>():
+      case op_index<OpMadLo>():
+      case op_index<OpMov>():
+      case op_index<OpSetp>():
+      case op_index<OpFma>():
+      case op_index<OpFloatBin>():
+      case op_index<OpF16x2Fma>():
+      case op_index<OpCvt>():
+      case op_index<OpMulWide>():
+        return true;
+      default:
+        return false;
     }
   }
 
@@ -1947,10 +1987,6 @@ class Interpreter {
   // of once per lane, and write the result in place. Every other form returns
   // false and takes the general path below, which computes the same bits;
   // tests/unit/test_fastpath.cpp holds the two to each other.
-  template <class T>
-  static constexpr size_t op_index() {
-    return Op(std::in_place_type<T>).index();
-  }
 
   bool fast_path(Warp& w, const BlockCtx& ctx, const Instr& ins, Mask m) {
     switch (ins.op.index()) {
@@ -6233,6 +6269,7 @@ class Interpreter {
   // B of the wgmma being executed, kept across instructions so a 64x256 tile
   // does not allocate on every one. An interpreter runs on one thread.
   std::vector<double> wgmma_b_;
+  bool fast_enabled_ = true;   // VGPU_FASTPATH, sampled at launch
   bool host_directed_ = false;   // this thread was not rounding to nearest at launch
   // %gridid: a serial number distinguishing this launch from every other one in
   // the process. Assigned once per launch rather than per interpreter, so the
