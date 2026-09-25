@@ -655,34 +655,53 @@ constexpr size_t op_index() {
 // D = A x B + C for a 16x16 tile, K deep, in f32: each element accumulates
 // its products in k order, one rounding for the product and one for the sum,
 // as exec_wmma_mma always has. A row is two 8-float vectors, built for AVX2 as
-// well as the baseline and chosen at load. Contraction is off here so that no
-// build -- -march=native included -- fuses the multiply and add into an FMA
-// and changes the bits.
+// well as the baseline, and the CPU is asked which to use -- the way
+// g_hw_fma chooses. Not target_clones: that picks through an IFUNC resolver,
+// which the loader runs before main, and under ThreadSanitizer the resolver
+// runs instrumented before the sanitizer's runtime is up, so every program
+// linking the interpreter crashed at startup without a word. Contraction is
+// off here so that no build -- -march=native included -- fuses the multiply
+// and add into an FMA and changes the bits.
 #pragma GCC push_options
 #pragma GCC optimize("fp-contract=off")
 typedef float WmmaRow8 __attribute__((vector_size(32)));
+#define VGPU_WMMA_TILE_BODY                                          \
+  for (uint32_t i = 0; i < 16; ++i) {                                \
+    WmmaRow8 lo, hi;                                                 \
+    std::memcpy(&lo, &C[i][0], sizeof lo);                           \
+    std::memcpy(&hi, &C[i][8], sizeof hi);                           \
+    for (uint32_t k = 0; k < K; ++k) {                               \
+      const float aik = A[i][k];                                     \
+      const WmmaRow8 a = {aik, aik, aik, aik, aik, aik, aik, aik};   \
+      WmmaRow8 bl, bh;                                               \
+      std::memcpy(&bl, &B[k][0], sizeof bl);                         \
+      std::memcpy(&bh, &B[k][8], sizeof bh);                         \
+      const WmmaRow8 pl = a * bl, ph = a * bh;                       \
+      lo = lo + pl;                                                  \
+      hi = hi + ph;                                                  \
+    }                                                                \
+    std::memcpy(&D[i][0], &lo, sizeof lo);                           \
+    std::memcpy(&D[i][8], &hi, sizeof hi);                           \
+  }
+void wmma_tile_base(float (&D)[16][16], const float (&A)[16][16], const float (&B)[16][16],
+                    const float (&C)[16][16], uint32_t K) {
+  VGPU_WMMA_TILE_BODY
+}
 #if defined(__x86_64__) && defined(__GNUC__)
-__attribute__((target_clones("avx2", "default")))
+__attribute__((target("avx2"))) void wmma_tile_avx2(float (&D)[16][16], const float (&A)[16][16],
+                                                    const float (&B)[16][16],
+                                                    const float (&C)[16][16], uint32_t K) {
+  VGPU_WMMA_TILE_BODY
+}
+const bool g_avx2 = __builtin_cpu_supports("avx2");
 #endif
+#undef VGPU_WMMA_TILE_BODY
 void wmma_tile(float (&D)[16][16], const float (&A)[16][16], const float (&B)[16][16],
                const float (&C)[16][16], uint32_t K) {
-  for (uint32_t i = 0; i < 16; ++i) {
-    WmmaRow8 lo, hi;
-    std::memcpy(&lo, &C[i][0], sizeof lo);
-    std::memcpy(&hi, &C[i][8], sizeof hi);
-    for (uint32_t k = 0; k < K; ++k) {
-      const float aik = A[i][k];
-      const WmmaRow8 a = {aik, aik, aik, aik, aik, aik, aik, aik};
-      WmmaRow8 bl, bh;
-      std::memcpy(&bl, &B[k][0], sizeof bl);
-      std::memcpy(&bh, &B[k][8], sizeof bh);
-      const WmmaRow8 pl = a * bl, ph = a * bh;
-      lo = lo + pl;
-      hi = hi + ph;
-    }
-    std::memcpy(&D[i][0], &lo, sizeof lo);
-    std::memcpy(&D[i][8], &hi, sizeof hi);
-  }
+#if defined(__x86_64__) && defined(__GNUC__)
+  if (g_avx2) return wmma_tile_avx2(D, A, B, C, K);
+#endif
+  wmma_tile_base(D, A, B, C, K);
 }
 #pragma GCC pop_options
 
