@@ -165,6 +165,20 @@ struct SharedShadow {
 };
 
 struct ClusterState;
+struct Warp;
+
+// The CTA's sixteen barriers as bar.sync with a thread count and bar.arrive
+// use them: arrivals counted in threads, a warp's arrival counting all of
+// its threads (the ISA "marks warps' arrival"), and the warps waiting.
+// A barrier without a count is the whole CTA, which the scheduler releases
+// when every warp that has not exited is waiting (see step_block).
+struct NamedBarrier {
+  uint32_t arrived = 0;
+  uint64_t waiting = 0;   // bit per warp of the block
+};
+struct NamedBarriers {
+  std::array<NamedBarrier, 16> bar{};
+};
 
 struct BlockCtx {
   std::array<uint32_t, 3> ctaid{};
@@ -180,6 +194,8 @@ struct BlockCtx {
   // leaves it undefined, VirtualGPU makes it deterministic (documented).
   std::vector<uint8_t>* shared = nullptr;
   BarrierReduction* bar_red = nullptr;
+  NamedBarriers* bars = nullptr;
+  std::vector<Warp>* warps = nullptr;   // the block's, for releasing a named barrier's waiters
   MbarrierTable* mbar = nullptr;
   SharedShadow* shadow = nullptr;   // non-null only when race detection is on
   // The thread-block cluster this block belongs to, for barrier.cluster. A
@@ -236,6 +252,10 @@ struct Warp {
   // instruction re-executes when the barrier releases, and this is how it knows
   // to collect rather than contribute a second time.
   bool bar_red_waiting = false;
+  // At a barrier with a thread count, which that barrier's completion
+  // releases; step_block's all-warps release leaves such a warp waiting.
+  bool counted_barrier = false;
+  uint8_t barrier_id = 0;
   // Set by an mbarrier wait that came back incomplete. The warp stays Ready --
   // the wait is a predicate and the kernel is free to spin on it -- but it
   // gives up the rest of its turn so the warps it is waiting for can run. With
@@ -954,6 +974,7 @@ class Interpreter {
     BlockCtx ctx;
     std::vector<uint8_t> shared;
     BarrierReduction bar_red;
+    NamedBarriers bars;
     MbarrierTable mbar;
     SharedShadow shadow;
     std::vector<Warp> warps;
@@ -969,6 +990,8 @@ class Interpreter {
     b.ctx.shared = &b.shared;
     b.ctx.bar_red = &b.bar_red;
     b.ctx.mbar = &b.mbar;
+    b.ctx.bars = &b.bars;
+    b.ctx.warps = &b.warps;
     b.ctx.clock = &b.clock;
     b.ctx.exited = &b.exited;
     if (detect_races() && !b.shared.empty()) {
@@ -1016,12 +1039,32 @@ class Interpreter {
     for (size_t i = 0; i < b.warps.size(); ++i)
       if (b.warps[i].state == Warp::State::Ready) runnable.push_back(i);
     if (runnable.empty()) {
-      bool any_waiting = false;
+      // Every warp that has not exited is waiting. Those at a whole-CTA
+      // barrier (bar.sync without a count, bar.red) have all arrived, so it
+      // completes; those at a counted barrier are released by the arrivals
+      // that complete it, and cannot be released here.
+      bool any_waiting = false, any_counted = false;
       for (auto& w : b.warps)
         if (w.state == Warp::State::AtBarrier) {
+          if (w.counted_barrier) {
+            any_counted = true;
+            continue;
+          }
           w.state = Warp::State::Ready;
           any_waiting = true;
         }
+      if (!any_waiting && any_counted) {
+        // Nothing can run and nothing more can arrive: a hang on hardware.
+        std::string where;
+        for (size_t i = 0; i < b.bars.bar.size(); ++i)
+          if (b.bars.bar[i].waiting)
+            where += "\n  barrier " + std::to_string(i) + ": " +
+                     std::to_string(__builtin_popcountll(b.bars.bar[i].waiting)) + " warp(s) waiting, " +
+                     std::to_string(b.bars.bar[i].arrived) + " thread(s) arrived";
+        throw Error::make(Err::LaunchConfig,
+                          "deadlock: every warp of the block that has not exited is waiting at a "
+                          "barrier whose thread count can no longer be reached", where);
+      }
       // Every warp has now arrived, so a bar.red in flight has its answer.
       if (any_waiting) b.bar_red.complete = true;
       // ...and the barrier they arrived at orders everything before it
@@ -2058,8 +2101,24 @@ class Interpreter {
       ++w.paths[idx].pc;
       return;
     }
-    if (std::holds_alternative<OpBar>(ins.op)) {
-      if (ins.has_pred) ctx_fail(ins, -1, Err::UnsupportedPtx, "predicated bar.sync is not supported");
+    if (const auto* bop = std::get_if<OpBar>(&ins.op)) {
+      if (bop->warp) {   // bar.warp.sync: the warp is already reconverged here
+        ++w.paths[idx].pc;
+        return;
+      }
+      if (ins.has_pred) {
+        // A guarded barrier is fine as long as the warp agrees: all of it
+        // takes the barrier or none does. Lanes that disagree leave the
+        // aligned barrier undefined.
+        if (m == 0) {
+          ++w.paths[idx].pc;
+          return;
+        }
+        if (m != active)
+          ctx_fail(ins, -1, Err::UnsupportedPtx,
+                   "a guarded bar.sync that some lanes of the warp take and others skip; the "
+                   "barrier is aligned, so the warp must agree");
+      }
       ++stats_.barriers;
       // Every live lane must arrive before the warp yields. Lanes still on
       // other paths have a higher pc and will merge here first; if any path
@@ -2095,8 +2154,45 @@ class Interpreter {
                  "bar.sync cannot be reached by every lane of the warp: some lanes are on a path "
                  "that never arrives at this barrier" + where);
       }
+      const uint32_t lead = first_set(m);
+      Lanes _s_id;
+      const uint64_t id = read_operand(w, ctx, ins, bop->id, _s_id)[lead];
+      if (id > 15)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "barrier " + std::to_string(id) + ": a CTA has barriers 0 to 15");
       ++w.paths[idx].pc;
-      w.state = Warp::State::AtBarrier;
+      if (!bop->have_count) {
+        w.state = Warp::State::AtBarrier;
+        w.counted_barrier = false;
+        w.barrier_id = static_cast<uint8_t>(id);
+        return;
+      }
+      Lanes _s_c;
+      const uint64_t count = static_cast<uint32_t>(read_operand(w, ctx, ins, bop->count, _s_c)[lead]);
+      if (count == 0 || count % W_)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "a barrier's thread count must be a non-zero multiple of the warp size (" +
+                     std::to_string(W_) + "); got " + std::to_string(count));
+      NamedBarrier& nb = ctx.bars->bar[id];
+      nb.arrived += W_;
+      if (nb.arrived >= count) {
+        // Complete: the waiters go, and the barrier is ready for reuse.
+        for (size_t i = 0; i < ctx.warps->size(); ++i)
+          if (nb.waiting >> i & 1) {
+            Warp& other = (*ctx.warps)[i];
+            other.state = Warp::State::Ready;
+            other.counted_barrier = false;
+          }
+        nb = NamedBarrier{};
+        if (ctx.shadow) ++ctx.shadow->epoch;
+        return;
+      }
+      if (!bop->arrive) {
+        nb.waiting |= uint64_t{1} << cur_warp_;
+        w.state = Warp::State::AtBarrier;
+        w.counted_barrier = true;
+        w.barrier_id = static_cast<uint8_t>(id);
+      }
       return;
     }
 
@@ -5699,6 +5795,10 @@ class Interpreter {
         ctx_fail(ins, li, Err::InvalidValue,
                  "tensormap.replace on 128 bytes that are not a tensor map made by "
                  "cuTensorMapEncodeTiled (or a copy of one)");
+      if (t.im2col)
+        ctx_fail(ins, li, Err::UnsupportedPtx,
+                 "tensormap.replace.tile on a map made by cuTensorMapEncodeIm2col; the ISA defines "
+                 "only the .tile mode");
       const uint64_t v = wide ? val[lane] : static_cast<uint32_t>(val[lane]);
       auto bad = [&](const std::string& what) {
         ctx_fail(ins, li, Err::InvalidValue, "tensormap.replace: " + what);
@@ -5960,6 +6060,11 @@ class Interpreter {
       Lanes _s;
       coords[i] = read_operand(w, ctx, ins, op.coords[i], _s);
     }
+    std::vector<Lanes> im2col_off(op.im2col_offsets.size());
+    for (size_t i = 0; i < op.im2col_offsets.size(); ++i) {
+      Lanes _s;
+      im2col_off[i] = read_operand(w, ctx, ins, op.im2col_offsets[i], _s);
+    }
     const uint64_t shared_size = ctx.shared ? ctx.shared->size() : 0;
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
@@ -6043,27 +6148,55 @@ class Interpreter {
                      "cp.reduce.async.bulk.tensor has no form of this operation for the tensor "
                      "map's element type (9.7.10.28.5.4)");
         }
-        // Elements the box takes along each dimension: box / traversal stride,
-        // rounded up.
+        if (map.im2col != op.im2col)
+          ctx_fail(ins, li, Err::InvalidValue,
+                   map.im2col ? "a tile-mode tensor copy through a map made by cuTensorMapEncodeIm2col"
+                              : "an im2col tensor copy through a map made by cuTensorMapEncodeTiled");
+        // Elements the copy takes, in the order they sit in shared memory, and
+        // where element e is in the tensor. Tile mode: the box, dimension 0
+        // fastest, each dimension's count the box over its traversal stride
+        // rounded up. im2col mode (5.5.4): `pixels` pixels, each `channels`
+        // channels wide, the pixels walked through the bounding box -- W
+        // fastest, each spatial dimension stepping by its traversal stride
+        // from lower to dim + upper - 1 and then starting over from lower
+        // with the next dimension advanced, the batch last -- beginning at the
+        // instruction's coordinates. A load reads each pixel at that position
+        // plus its im2col offsets; outside the tensor it reads zero.
         std::array<uint64_t, 5> count{1, 1, 1, 1, 1};
         uint64_t total = 1;
-        for (uint32_t d = 0; d < map.rank; ++d) {
-          count[d] = (map.box[d] + map.elem_stride[d] - 1) / map.elem_stride[d];
-          total *= count[d];
+        if (map.im2col) {
+          total = uint64_t{map.pixels} * map.channels;
+        } else {
+          for (uint32_t d = 0; d < map.rank; ++d) {
+            count[d] = (map.box[d] + map.elem_stride[d] - 1) / map.elem_stride[d];
+            total *= count[d];
+          }
         }
         std::array<int64_t, 5> start{};
         for (uint32_t d = 0; d < map.rank; ++d)
           start[d] = static_cast<int32_t>(static_cast<uint32_t>(coords[d][lane]));
+        const uint32_t nsp = map.rank >= 2 ? map.rank - 2 : 0;   // im2col's spatial dimensions
+        std::array<int64_t, 3> off{};
+        for (uint32_t i = 0; i < op.im2col_offsets.size() && i < 3; ++i)
+          off[i] = static_cast<uint16_t>(im2col_off[i][lane]);
+        std::array<int64_t, 5> pix = start;   // im2col: the pixel being read, in [1, rank-1]
         if (op.to_shared) pb.data.resize(total * es);
         std::array<uint64_t, 5> j{};
         for (uint64_t e = 0; e < total; ++e) {
-          // Global position of element e of the box, dimension 0 fastest.
           bool inside = true;
           uint64_t gaddr = map.address;
-          for (uint32_t d = 0; d < map.rank; ++d) {
-            const int64_t g = start[d] + static_cast<int64_t>(j[d] * map.elem_stride[d]);
+          auto at = [&](uint32_t d, int64_t g) {
             if (g < 0 || static_cast<uint64_t>(g) >= map.dim[d]) inside = false;
             else gaddr += static_cast<uint64_t>(g) * map.stride[d];
+          };
+          if (map.im2col) {
+            const uint64_t ch = e % map.channels;
+            at(0, start[0] + static_cast<int64_t>(ch));
+            for (uint32_t i = 0; i < nsp; ++i) at(1 + i, pix[1 + i] + off[i]);
+            at(map.rank - 1, pix[map.rank - 1]);
+          } else {
+            for (uint32_t d = 0; d < map.rank; ++d)
+              at(d, start[d] + static_cast<int64_t>(j[d] * map.elem_stride[d]));
           }
           // Shared position: the box packed densely, then swizzled by
           // address the same way wgmma reads it back.
@@ -6101,9 +6234,22 @@ class Interpreter {
               }
             }
           }
-          for (uint32_t d = 0; d < map.rank; ++d) {
-            if (++j[d] < count[d]) break;
-            j[d] = 0;
+          if (map.im2col) {
+            // The next pixel, after the last channel of this one.
+            if ((e + 1) % map.channels == 0) {
+              uint32_t i = 0;
+              for (; i < nsp; ++i) {
+                pix[1 + i] += map.elem_stride[1 + i];
+                if (pix[1 + i] <= static_cast<int64_t>(map.dim[1 + i]) - 1 + map.upper[i]) break;
+                pix[1 + i] = map.lower[i];
+              }
+              if (i == nsp) ++pix[map.rank - 1];
+            }
+          } else {
+            for (uint32_t d = 0; d < map.rank; ++d) {
+              if (++j[d] < count[d]) break;
+              j[d] = 0;
+            }
           }
         }
         // The barrier counts every byte of the box, the zero-filled ones too.
