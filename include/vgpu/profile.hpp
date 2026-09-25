@@ -86,6 +86,10 @@ struct DeviceProfile {
   // AMD's equivalent of a compute capability: the gfx target a binary must be
   // built for. "gfx942" for CDNA3. Empty on NVIDIA.
   std::string gcn_arch;
+  // The same target as HIP names the device, with the features it runs with:
+  // "gfx942:sramecc+:xnack-". A library that ships code for each setting of a
+  // feature picks by it. The bare target where a profile does not say.
+  std::string gcn_arch_full;
   int cc_major = 0;          // compute capability (NVIDIA) / ISA generation
   int cc_minor = 0;
   uint32_t warp_size = 0;

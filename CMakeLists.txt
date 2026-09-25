@@ -119,6 +119,7 @@ add_library(vgpu STATIC
   src/core/yamlish.cpp
   src/core/shared_state.cpp
   src/core/regs.cpp
+  amd/src/bundle.cpp
   amd/src/codeobject.cpp
   amd/src/gcn_decode.cpp
   amd/src/gcn_exec.cpp

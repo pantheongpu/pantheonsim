@@ -27,7 +27,7 @@ const char* enc_name(Enc e);
 // Agpr: the accumulation registers, which a kernel with more values than it
 // has vector registers keeps the rest of them in.
 enum class OperandKind {
-  Sgpr, Vgpr, Agpr, Vcc, Exec, ExecLo, ExecHi, M0, SharedBase, Inline, InlineFloat, Literal, None
+  Sgpr, Vgpr, Agpr, Vcc, Exec, ExecLo, ExecHi, M0, SharedBase, PrivateBase, Inline, InlineFloat, Literal, None
 };
 struct Operand {
   OperandKind kind = OperandKind::None;
@@ -77,6 +77,15 @@ struct Inst {
   // the low register, which is how a single value is used by both.
   uint8_t op_sel = 0;
   uint8_t op_sel_hi = 7;
+  // VOP3P: which sources are negated on their way into the low result, and
+  // into the high one, a bit per source. (The mixed-precision forms use
+  // these bits as each source's negation and absolute value instead, and the
+  // decoder puts them on the operands.)
+  uint8_t neg_lo = 0;
+  uint8_t neg_hi = 0;
+  // MUBUF: whether the address register holds an offset into the buffer, an
+  // index into it, or (both set) the index then the offset.
+  bool offen = false, idxen = false;
   // DPP: the instruction reads its first source from another lane. The
   // control says which lane, the two masks say which lanes are written at
   // all, and bound_ctrl says what a lane gets when the lane it would read

@@ -324,10 +324,11 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     }
   }
 
-  // The metadata note: one MessagePack map, with the kernels under
-  // "amdhsa.kernels" and the target under "amdhsa.target".
-  const Msgpack* kernels = nullptr;
-  Msgpack metadata;
+  // The metadata note: a MessagePack map, with the kernels under
+  // "amdhsa.kernels" and the target under "amdhsa.target". An object linked
+  // from several -- Tensile's libraries are hundreds of kernels linked into
+  // one -- keeps each one's note, so every note's kernels are the object's.
+  std::vector<Msgpack> notes;
   for (const auto& s : sections) {
     if (s.type != 7 /* SHT_NOTE */) continue;
     for (uint64_t at = s.offset; at + 12 <= s.offset + s.size;) {
@@ -336,14 +337,15 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
       const std::string name = r.str(name_at, namesz ? namesz - 1 : 0);
       if (type == kNtAmdgpuMetadata && name == "AMDGPU") {
         uint64_t p = desc_at;
-        metadata = parse_msgpack(r, p, desc_at + descsz);
-        kernels = metadata.at("amdhsa.kernels");
+        Msgpack note = parse_msgpack(r, p, desc_at + descsz);
+        if (const Msgpack* k = note.at("amdhsa.kernels"); k && k->kind == Msgpack::Kind::Array)
+          notes.push_back(std::move(note));
       }
       at = desc_at + ((descsz + 3) & ~3u);
     }
   }
-  if (!kernels || kernels->kind != Msgpack::Kind::Array)
-    throw Error::make(Err::ProfileParse, origin, ": no AMDGPU metadata note naming its kernels");
+  if (notes.empty()) throw Error::make(Err::ProfileParse, origin, ": no AMDGPU metadata note naming its kernels");
+  const Msgpack& metadata = notes.front();
   if (const Msgpack* t = metadata.at("amdhsa.target"); t && t->kind == Msgpack::Kind::Str) {
     out.target = t->s;
     out.isa = out.target.substr(out.target.rfind('-') + 1);
@@ -354,7 +356,8 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     out.abi_minor = static_cast<uint32_t>(v->list[1].i);
   }
 
-  for (const Msgpack& k : kernels->list) {
+  for (const Msgpack& note : notes)
+  for (const Msgpack& k : note.at("amdhsa.kernels")->list) {
     if (k.kind != Msgpack::Kind::Map) continue;
     Kernel kern;
     kern.name = k.text(".name");

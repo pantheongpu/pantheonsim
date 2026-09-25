@@ -45,8 +45,8 @@ out=$(VGPU_GPU=amd/mi300x "$tmp/vector_add_hip" "$root/amd/tests/data/vector_add
 status=$?
 echo "$out" | sed 's/^/      /'
 expect "it runs and every element is right" "0" "$status"
-expect "it sees the GPU the profile describes" "device AMD Instinct MI300X gfx942 warp 64" \
-  "$(grep -o '^device AMD Instinct MI300X gfx942 warp 64' <<< "$out")"
+expect "it sees the GPU the profile describes" "device AMD Instinct MI300X gfx942:sramecc+:xnack- warp 64" \
+  "$(grep -o '^device AMD Instinct MI300X gfx942:sramecc+:xnack- warp 64' <<< "$out")"
 expect "and no element came out wrong" "wrong 0 of 1000" "$(grep -o 'wrong 0 of 1000' <<< "$out")"
 expect "a module's variable is where hipModuleGetGlobal says" "scale is 4 bytes" \
   "$(grep -o 'scale is 4 bytes' <<< "$out")"

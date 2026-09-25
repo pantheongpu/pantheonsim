@@ -34,6 +34,7 @@ typedef enum hipError_t {
   hipErrorDeinitialized = 4,
   hipErrorInvalidConfiguration = 9,
   hipErrorInvalidSymbol = 13,
+  hipErrorInvalidPitchValue = 12,
   hipErrorInvalidDevicePointer = 17,
   hipErrorInvalidDeviceFunction = 98,
   hipErrorInvalidMemcpyDirection = 21,

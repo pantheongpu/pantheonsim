@@ -89,6 +89,11 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
     p.gcn_arch = get_str_opt(doc, "gcn_arch");
     if (p.gcn_arch.empty())
       fail(origin, "an AMD profile needs gcn_arch (the gfx target, e.g. \"gfx942\")");
+    p.gcn_arch_full = get_str_opt(doc, "gcn_arch_full");
+    if (p.gcn_arch_full.empty()) p.gcn_arch_full = p.gcn_arch;
+    if (p.gcn_arch_full.compare(0, p.gcn_arch.size(), p.gcn_arch) != 0 ||
+        (p.gcn_arch_full.size() > p.gcn_arch.size() && p.gcn_arch_full[p.gcn_arch.size()] != ':'))
+      fail(origin, "gcn_arch_full must be gcn_arch with its features after it, e.g. \"gfx942:sramecc+:xnack-\"");
   } else {
     const std::string cc = get_str(doc, "compute_capability", origin);
     const size_t dot = cc.find('.');

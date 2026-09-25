@@ -187,6 +187,18 @@ struct DevicePropR0600 {
   int asicRevision;
 };
 
+// hipPointerAttribute_t: what hipPointerGetAttributes says of an address.
+// Its type is hipMemoryType's number.
+struct PointerAttribute {
+  int type;
+  int device;
+  void* devicePointer;
+  void* hostPointer;
+  int isManaged;
+  unsigned allocationFlags;
+};
+enum MemoryType : int { kMemoryUnregistered = 0, kMemoryHost = 1, kMemoryDevice = 2 };
+
 // hipDeviceAttribute_t: what hipDeviceGetAttribute is asked for, by the
 // numbers hip_runtime_api.h gives them (the ones answered here; run_hip_abi.sh
 // checks each against the header). Each is answered from the same device
