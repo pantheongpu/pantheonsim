@@ -2387,9 +2387,14 @@ struct Machine {
   }
   // Which block, and which row of it, output value r of lane l is: a 16- or
   // 4-row block holds four rows a lane group, a 32-row one eight groups of
-  // four rows spread over its two halves of the wave.
+  // four rows spread over its two halves of the wave. A double's block holds
+  // one row a lane group, the next four rows on: the vector width rocWMMA
+  // gives a double accumulator on this architecture is 1, a float's 4.
   static void out_place(const MatrixShape& s, uint32_t lane, uint32_t r, uint32_t* block, uint32_t* row) {
-    if (s.m == 4) {            // sixteen 4x4 blocks, one to each four lanes
+    if (s.out == 'd') {        // one 16x16 block of doubles
+      *block = 0;
+      *row = lane / 16 + 4 * r;
+    } else if (s.m == 4) {     // sixteen 4x4 blocks, one to each four lanes
       *block = lane / 4;
       *row = r;
     } else if (s.m == 32) {    // one 32x32 block
