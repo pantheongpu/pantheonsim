@@ -131,6 +131,32 @@ VTEST(scalar_bit_fields_shifts_and_comparisons_give_what_the_isa_says) {
   }
 }
 
+VTEST(a_kernel_finds_only_the_group_ids_it_asked_for_one_after_another) {
+  const amd::CodeObject o = object("asm_scalar");
+  const amd::Kernel* k = amd::find_kernel(o, "group_z");
+  VCHECK(k != nullptr);
+  VCHECK(k->group_id_x && !k->group_id_y && k->group_id_z);
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(3 * 4);
+  const std::vector<uint32_t> none = {99, 99, 99};
+  mem.write(out, none.data(), 3 * 4);
+  std::vector<uint8_t> args(8);
+  for (int b = 0; b < 8; ++b) args[b] = static_cast<uint8_t>(out >> (8 * b));
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = k;
+  d.kernarg = mem.alloc(8);
+  mem.write(d.kernarg, args.data(), 8);
+  d.group_size[0] = 64;
+  d.groups[2] = 3;   // three groups along z, as three batches
+  amd::execute(d, mem);
+  std::vector<uint32_t> r(3);
+  mem.read(out, r.data(), 3 * 4);
+  VCHECK_EQ(r[0], 0u);
+  VCHECK_EQ(r[1], 1u);
+  VCHECK_EQ(r[2], 2u);
+}
+
 VTEST(buffers_lds_and_private_memory_are_reached_as_a_card_reaches_them) {
   const amd::CodeObject o = object("asm_memory");
   MemoryManager mem(16ull << 20);

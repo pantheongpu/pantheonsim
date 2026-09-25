@@ -405,6 +405,9 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     kern.kernarg_segment_ptr = d.properties & (1u << 3);
     kern.dispatch_id = d.properties & (1u << 4);
     kern.flat_scratch_init = d.properties & (1u << 5);
+    kern.group_id_x = (d.rsrc2 >> 7) & 1;
+    kern.group_id_y = (d.rsrc2 >> 8) & 1;
+    kern.group_id_z = (d.rsrc2 >> 9) & 1;
     kern.user_sgpr_count = 2 * kern.private_segment_buffer + 2 * kern.dispatch_ptr + 2 * kern.queue_ptr +
                            2 * kern.kernarg_segment_ptr + 2 * kern.dispatch_id + 2 * kern.flat_scratch_init;
     out.kernels.push_back(std::move(kern));

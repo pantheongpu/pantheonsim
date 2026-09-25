@@ -107,7 +107,37 @@ scalar:
 .Lscalar_end:
   .size scalar, .Lscalar_end-scalar
 
+// group_z(int* out): a kernel that asks for the work-group's x and z ids but
+// not y, as rocBLAS's batched kernels do with the batch in z. The hardware
+// puts only the ids asked for after the user registers, so z is in s3, where
+// y would otherwise be; each group writes the z it finds at out[z].
+  .globl group_z
+  .p2align 8
+  .type group_z,@function
+group_z:
+  s_load_dwordx2 s[4:5], s[0:1], 0x0
+  s_waitcnt lgkmcnt(0)
+  s_mov_b64 exec, 1
+  s_lshl_b32 s6, s3, 2
+  v_mov_b32_e32 v0, s6
+  v_mov_b32_e32 v1, s3
+  global_store_dword v0, v1, s[4:5]
+  s_endpgm
+.Lgroup_z_end:
+  .size group_z, .Lgroup_z_end-group_z
+
   .rodata
+  .p2align 6
+  .amdhsa_kernel group_z
+    .amdhsa_user_sgpr_kernarg_segment_ptr 1
+    .amdhsa_system_sgpr_workgroup_id_x 1
+    .amdhsa_system_sgpr_workgroup_id_y 0
+    .amdhsa_system_sgpr_workgroup_id_z 1
+    .amdhsa_next_free_vgpr 2
+    .amdhsa_next_free_sgpr 8
+    .amdhsa_accum_offset 4
+  .end_amdhsa_kernel
+
   .p2align 6
   .amdhsa_kernel scalar
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
@@ -141,5 +171,20 @@ amdhsa.kernels:
       - .size: 4
         .offset: 12
         .value_kind: by_value
+  - .name: group_z
+    .symbol: group_z.kd
+    .kernarg_segment_size: 8
+    .kernarg_segment_align: 8
+    .group_segment_fixed_size: 0
+    .private_segment_fixed_size: 0
+    .wavefront_size: 64
+    .sgpr_count: 8
+    .vgpr_count: 2
+    .max_flat_workgroup_size: 64
+    .args:
+      - .size: 8
+        .offset: 0
+        .value_kind: global_buffer
+        .address_space: global
 ...
   .end_amdgpu_metadata

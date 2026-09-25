@@ -49,6 +49,11 @@ struct Kernel {
   bool kernarg_segment_ptr = false, dispatch_ptr = false, queue_ptr = false;
   bool dispatch_id = false, flat_scratch_init = false, private_segment_buffer = false;
   uint32_t user_sgpr_count = 0;
+  // Which of the work-group's ids the hardware puts in scalar registers
+  // after the user ones (COMPUTE_PGM_RSRC2's enable bits): only those, one
+  // after another, so a kernel that asks for x and z finds z where y would
+  // have been.
+  bool group_id_x = true, group_id_y = true, group_id_z = true;
 };
 
 // A variable the kernels share: a __device__ global. It lives in the module's

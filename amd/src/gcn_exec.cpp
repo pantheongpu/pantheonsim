@@ -2752,9 +2752,9 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
     }
     if (k.dispatch_id) at += 2;
     if (k.flat_scratch_init) at += 2;
-    m.set_sgpr(w, at, gx);
-    m.set_sgpr(w, at + 1, gy);
-    m.set_sgpr(w, at + 2, gz);
+    if (k.group_id_x) m.set_sgpr(w, at++, gx);
+    if (k.group_id_y) m.set_sgpr(w, at++, gy);
+    if (k.group_id_z) m.set_sgpr(w, at++, gz);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const uint64_t flat = w.first_lane + lane;
       const uint32_t x = static_cast<uint32_t>(flat % d.group_size[0]),
