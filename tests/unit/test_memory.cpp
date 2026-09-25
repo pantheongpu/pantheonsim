@@ -180,6 +180,35 @@ VTEST(fill_repeats_four_byte_pattern_in_phase) {
   mm.free(p);
 }
 
+// A 2D fill's rows start wherever the pitch puts them, so a row can begin a
+// byte or two before a chunk boundary. The pattern's phase belongs to the fill's
+// own start, not to the chunk or to alignment -- a 2-byte fill of 0xABCD that
+// starts two bytes early still writes CD AB CD AB across the boundary.
+VTEST(fill_phase_follows_its_own_start_across_a_chunk_boundary) {
+  MemoryManager mm(1 << 20);
+  const uint64_t n = vgpu::kChunkSize * 2;
+  uint64_t p = mm.alloc(n);
+  std::vector<uint8_t> seed(n, 0x11);
+  mm.write(p, seed.data(), n);
+  const uint16_t half = 0xABCD;
+  const uint32_t word = 0x12345678u;
+  const uint64_t start2 = vgpu::kChunkSize - 3;   // odd, and just before the boundary
+  const uint64_t start4 = vgpu::kChunkSize + 1001;
+  mm.fill(p + start2, reinterpret_cast<const uint8_t*>(&half), 2, 10);
+  mm.fill(p + start4, reinterpret_cast<const uint8_t*>(&word), 4, 12);
+  std::vector<uint8_t> out(n, 0);
+  mm.read(p, out.data(), n);
+  const uint8_t* h = reinterpret_cast<const uint8_t*>(&half);
+  const uint8_t* w = reinterpret_cast<const uint8_t*>(&word);
+  for (uint64_t i = 0; i < n; ++i) {
+    uint8_t want = 0x11;
+    if (i >= start2 && i < start2 + 10) want = h[(i - start2) % 2];
+    if (i >= start4 && i < start4 + 12) want = w[(i - start4) % 4];
+    VCHECK_EQ(out[i], want);
+  }
+  mm.free(p);
+}
+
 VTEST(fill_partial_range_leaves_neighbours_alone) {
   MemoryManager mm(1 << 20);
   const uint64_t n = vgpu::kChunkSize * 2;

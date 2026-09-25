@@ -1067,6 +1067,42 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# Checks on the code rather than on behaviour, each guarding a class of bug that
+# shipped once: an entry point that puts work on a stream without knowing about
+# capture (the work goes missing from every replay), and a shim library with a
+# reference nothing can resolve (it cannot be loaded by anything that binds at
+# load time).
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME lint_capture_coverage
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_capture_coverage.py)
+endif()
+add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_symbols.sh)
+set_tests_properties(lint_shim_symbols PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
+
+# Copies and fills with a shape in graphs, and the async copies a capture has to
+# record rather than run; two simulated devices, for the peer copy.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_graph_shapes COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_shapes.sh)
+  set_tests_properties(e2e_graph_shapes PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# Stream capture across streams -- fork, join, and the documented refusals --
+# and host functions, events, allocation, cooperative launches and graph
+# launches on a capturing stream.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_capture_streams COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_capture_streams.sh)
+  set_tests_properties(e2e_capture_streams PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # Streams are distinct -- a capture on one does not take another's work -- and
 # answer for their own flags, priority, device, id and attributes.
 if(TARGET vgpucudart)
