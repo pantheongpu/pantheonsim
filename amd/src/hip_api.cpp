@@ -336,8 +336,15 @@ hipError_t dispatch_kernel(State& s, int ordinal, const Module& module, const Ke
   uint64_t start = 0;
   uint64_t grid_sync = 0;
   try {
-    kernarg = mem.alloc(args.empty() ? 1 : args.size());
-    if (!args.empty()) mem.write(kernarg, args.data(), args.size());
+    // The segment with room past its end, zeroed: ROCm hands kernels
+    // kernarg memory padded well beyond what they declare, and the compiler
+    // counts on it, widening a scalar load of the last arguments past the
+    // segment's size (rocBLAS's rotmg reads 32 bytes at 0x60 of 124).
+    const size_t padded = (args.size() + 63) / 64 * 64 + 64;
+    kernarg = mem.alloc(padded);
+    std::vector<uint8_t> segment(padded, 0);
+    std::copy(args.begin(), args.end(), segment.begin());
+    mem.write(kernarg, segment.data(), segment.size());
     if (cooperative) {
       // What the device library's grid barrier counts on (ockl's mg_info): a
       // grid of one, its work-groups, its work-items, and a counter for a

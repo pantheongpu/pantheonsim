@@ -143,6 +143,24 @@ int main(int argc, char** argv) {
     CHECK(hipFree(there));
     CHECK(hipSetDevice(0));
   }
+  /* A kernel that reads past the end of its arguments, as the compiler may
+   * widen a load of the last of them: the segment a launch gives it has room
+   * there, as ROCm's does. */
+  if (argc > 2) {
+    hipModule_t tail_module;
+    hipFunction_t tail;
+    CHECK(hipModuleLoad(&tail_module, argv[2]));
+    CHECK(hipModuleGetFunction(&tail, tail_module, "kernarg_tail"));
+    int* flag = NULL;
+    CHECK(hipMalloc((void**)&flag, sizeof(int)));
+    CHECK(hipMemset(flag, 0, sizeof(int)));
+    void* tail_args[] = {&flag};
+    const hipError_t launched = hipModuleLaunchKernel(tail, 1, 1, 1, 64, 1, 1, 0, stream, tail_args, NULL);
+    int got = 0;
+    CHECK(hipMemcpy(&got, flag, sizeof got, hipMemcpyDeviceToHost));
+    printf("a kernel reading past its arguments runs %d\n", launched == hipSuccess && got == 1);
+    CHECK(hipFree(flag));
+  }
   CHECK(hipFree(din));
   CHECK(hipFree(dout));
   return wrong ? 1 : 0;
