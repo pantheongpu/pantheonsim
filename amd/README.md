@@ -199,7 +199,9 @@ Any other instruction is refused by name, and so is anything this does not
 model: an output multiplier, a packed operation that asks for the second half
 of a constant. A wrong guess would run and give a wrong answer, which is worse
 than a refusal. An error while a kernel runs names the instruction: the
-kernel, how far into it, and the instruction as the assembler writes it.
+kernel, how far into it, and the instruction as the assembler writes it. And
+`VGPU_TRACE_LAUNCHES=1` prints each launch -- the kernel, its grid and
+block, its LDS -- which is how to see what a library such as rocBLAS runs.
 
 Three things are modelled rather than copied, and are marked where they are
 written: the reciprocal, square root, exponent and logarithm are the host's

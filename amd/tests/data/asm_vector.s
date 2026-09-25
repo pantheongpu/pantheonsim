@@ -7,7 +7,7 @@
 // comparison of part of a register. Built for gfx942 by build.sh, with
 // clang's assembler.
 //
-// vector(int* out, int x, int y) writes 24 words, in the order the test
+// vector(int* out, int x, int y) writes 26 words, in the order the test
 // lists them; x is the number of lanes the first comparison keeps.
   .amdgcn_target "amdgcn-amd-amdhsa--gfx942"
   .text
@@ -62,6 +62,15 @@ vector:
   v_mov_b32_e32 v22, 5
   v_cmp_eq_u32_sdwa s[28:29], v21, v22 src0_sel:WORD_1 src1_sel:DWORD
   v_cmp_eq_u32_sdwa s[30:31], v21, v22 src0_sel:WORD_0 src1_sel:DWORD
+  // A select whose source carries a modifier: negated when the condition is
+  // clear, its absolute value when it is set -- how the compiler writes a
+  // float's negation or absolute value into a select (rocBLAS's strsv).
+  v_mov_b32_e32 v24, 2.0
+  v_mov_b32_e32 v25, -4.0
+  s_mov_b64 s[44:45], 0
+  v_cndmask_b32_e64 v28, -v24, 0, s[44:45]
+  s_mov_b64 s[44:45], 1
+  v_cndmask_b32_e64 v29, 0, |v25|, s[44:45]
   v_mov_b32_e32 v0, 0
   v_mov_b32_e32 v1, s20
   global_store_dword v0, v1, s[2:3]
@@ -99,6 +108,8 @@ vector:
   global_store_dword v0, v1, s[2:3] offset:88
   v_mov_b32_e32 v1, s40
   global_store_dword v0, v1, s[2:3] offset:92
+  global_store_dword v0, v28, s[2:3] offset:96
+  global_store_dword v0, v29, s[2:3] offset:100
   s_endpgm
 .Lvector_end:
   .size vector, .Lvector_end-vector

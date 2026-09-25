@@ -403,6 +403,16 @@ struct Machine {
 
   // A source read as a float, with the modifiers a VOP3 source carries: the
   // absolute value first, then the negation, as the ISA applies them.
+  // A source's 32 bits with its modifiers applied as a float's are: the
+  // absolute value clears the sign bit, the negation flips it. What an
+  // instruction that moves bits rather than doing arithmetic (v_cndmask)
+  // makes of them.
+  uint32_t lane_bits(const Wave& w, const Operand& o, uint32_t lane) const {
+    uint32_t v = lane_src(w, o, lane);
+    if (o.abs) v &= 0x7FFFFFFFu;
+    if (o.neg) v ^= 0x80000000u;
+    return v;
+  }
   float lane_float(const Wave& w, const Operand& o, uint32_t lane) const {
     float f = as_float(lane_src(w, o, lane));
     if (o.abs) f = std::fabs(f);
@@ -1483,9 +1493,11 @@ struct Machine {
       });
     } else if (op == "v_cndmask_b32_e64"_op) {
       each([&](uint32_t lane) {
-        // One lane's bit of the condition register picks a source.
+        // One lane's bit of the condition register picks a source, with its
+        // modifiers -- which is how the compiler negates a float, or takes
+        // its absolute value, as it selects it.
         const uint64_t cond = scalar(w, in.src[2]);
-        write_lane(w, in.dst[0], lane, lane_src(w, (cond >> lane) & 1 ? in.src[1] : in.src[0], lane));
+        write_lane(w, in.dst[0], lane, lane_bits(w, (cond >> lane) & 1 ? in.src[1] : in.src[0], lane));
       });
     } else if (op == "v_sub_f32_e32"_op || op == "v_sub_f32_e64"_op) {
       each([&](uint32_t lane) {
@@ -1569,8 +1581,9 @@ struct Machine {
       });
     } else if (op == "v_cndmask_b32_e32"_op) {
       each([&](uint32_t lane) {
+        // The sub-dword form's sources may carry modifiers too.
         const uint64_t cond = scalar(w, in.src[2]);
-        write_lane(w, in.dst[0], lane, lane_src(w, (cond >> lane) & 1 ? in.src[1] : in.src[0], lane));
+        write_lane(w, in.dst[0], lane, lane_bits(w, (cond >> lane) & 1 ? in.src[1] : in.src[0], lane));
       });
     } else if (op == "v_add_f64"_op) {
       each([&](uint32_t lane) {

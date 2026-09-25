@@ -302,6 +302,15 @@ hipError_t dispatch_kernel(State& s, int ordinal, const Module& module, const Ke
                            const std::vector<uint8_t>& args, hipStream_t stream, bool cooperative = false) {
   vgpu::runtime::Device& d = s.rt->device(ordinal);
   const CodeObject& object = module.object;
+  // VGPU_TRACE_LAUNCHES=1 says what each launch runs, one line to stderr:
+  // what a program that calls a library cannot otherwise see.
+  static const bool trace = [] {
+    const char* t = std::getenv("VGPU_TRACE_LAUNCHES");
+    return t && t[0] == '1';
+  }();
+  if (trace)
+    std::fprintf(stderr, "VirtualGPU HIP: launch %s on device %d, grid %ux%ux%u of %ux%ux%u, %u bytes of LDS\n",
+                 kernel.name.c_str(), ordinal, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared);
   auto& hostcall = s.hostcalls[ordinal];
   if (!hostcall) {
     try {

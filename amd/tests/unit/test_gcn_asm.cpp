@@ -188,9 +188,9 @@ VTEST(buffers_lds_and_private_memory_are_reached_as_a_card_reaches_them) {
 VTEST(vector_comparisons_packed_math_and_mixed_precision_give_what_the_isa_says) {
   const amd::CodeObject o = object("asm_vector");
   MemoryManager mem(16ull << 20);
-  const uint64_t out = mem.alloc(24 * 4);
+  const uint64_t out = mem.alloc(26 * 4);
   const int32_t x = 10, y = 7;
-  const std::vector<uint32_t> r = run(o, "vector", mem, out, 24, {out, x, y});
+  const std::vector<uint32_t> r = run(o, "vector", mem, out, 26, {out, x, y});
   VCHECK_EQ(r[0], 10u);    // EXEC narrowed to the lanes below x
   VCHECK_EQ(r[1], 10u);    // and VCC written with it
   VCHECK_EQ(r[2], 1u);     // then to lane 3 alone
@@ -216,6 +216,8 @@ VTEST(vector_comparisons_packed_math_and_mixed_precision_give_what_the_isa_says)
   VCHECK_EQ(r[18], 0u);                // its low word is not
   VCHECK_EQ(r[22], 3u * 63u);          // lane 63 multiplied by 3, as it was before any carry was written
   VCHECK_EQ(r[23], 0u);                // and no lane carried
+  VCHECK_EQ(r[24], f(-2.0f));          // a select of a negated source
+  VCHECK_EQ(r[25], f(4.0f));           // and of a source's absolute value
 }
 
 VTEST_MAIN
