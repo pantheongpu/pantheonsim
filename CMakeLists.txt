@@ -182,6 +182,19 @@ add_custom_command(TARGET vgpuhip POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.7"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so"
   COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7)")
+# librocprofiler-sdk: rocprofiler-sdk's interface over the HIP shim, so AMD's
+# profiler (rocprofv3) runs unmodified on a simulated GPU. It sits beside
+# libamdhip64 in build/shim, where a tool linked to librocprofiler-sdk.so.1
+# finds it first.
+add_library(vgpurocprof SHARED amd/src/rocprofiler_sdk.cpp)
+target_link_libraries(vgpurocprof PRIVATE vgpuhip ${CMAKE_DL_LIBS})
+target_include_directories(vgpurocprof PRIVATE include amd/include)
+set_target_properties(vgpurocprof PROPERTIES OUTPUT_NAME rocprofiler-sdk SOVERSION 1 VERSION 1.0.0)
+add_custom_command(TARGET vgpurocprof POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocprofiler-sdk.so.1.0.0" "${CMAKE_BINARY_DIR}/shim/librocprofiler-sdk.so.1"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocprofiler-sdk.so.1.0.0" "${CMAKE_BINARY_DIR}/shim/librocprofiler-sdk.so"
+  COMMENT "Creating rocprofiler-sdk shim symlinks (build/shim/librocprofiler-sdk.so.1)")
 
 # ---------------------------------------------------------------------------
 # libvgpucudart: the CUDA *runtime* API shim. Lets unmodified nvcc-compiled
@@ -636,6 +649,20 @@ target_compile_definitions(test_amd_gcn_lds PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOU
 
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
 target_compile_definitions(test_amd_gcn_idioms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_unit_test(test_amd_gcn_counters amd/tests/unit/test_gcn_counters.cpp)
+target_compile_definitions(test_amd_gcn_counters PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# rocprofiler-sdk's interface from a tool's side: the test is the tool, and
+# runs a HIP program through libamdhip64.
+add_executable(test_amd_rocprofiler amd/tests/unit/test_rocprofiler.cpp)
+target_link_libraries(test_amd_rocprofiler PRIVATE vgpurocprof vgpuhip)
+target_include_directories(test_amd_rocprofiler PRIVATE tests/framework amd/include)
+target_compile_definitions(test_amd_rocprofiler PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_amd_rocprofiler COMMAND test_amd_rocprofiler)
+set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
+add_test(NAME amd_rocprofiler_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofiler_abi.sh)
+add_test(NAME amd_rocprofv3 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofv3.sh)
+set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 600)
 
 vgpu_unit_test(test_amd_hip_abi amd/tests/unit/test_hip_abi.cpp)
 
@@ -741,6 +768,9 @@ set_tests_properties(smi_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 add_test(NAME shell_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_shell_cli.sh)
 set_tests_properties(shell_cli PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
+add_test(NAME amd_session COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_amd_session.sh)
+set_tests_properties(amd_session PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 add_test(NAME test_matrix_exit COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_test_matrix.sh)
 set_tests_properties(test_matrix_exit PROPERTIES DEPENDS vgpu_cli

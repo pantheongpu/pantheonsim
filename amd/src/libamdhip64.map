@@ -103,3 +103,8 @@ hip_6.4 {
 } hip_6.2;
 hip_6.5 {
 } hip_6.4;
+VGPU_PRIVATE {
+  global:
+    vgpu_hip_profiler_attach;
+    vgpu_hip_profiler_device;
+};

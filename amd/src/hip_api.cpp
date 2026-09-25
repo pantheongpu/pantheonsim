@@ -10,6 +10,7 @@
 // from AMD's public documentation); nothing here is AMD's code. What is not
 // implemented is refused by name rather than ignored, because a HIP program
 // that believes a launch happened will compare wrong answers.
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +22,7 @@
 #include <set>
 #include <mutex>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include "vgpu/amd_codeobject.hpp"
@@ -28,7 +30,9 @@
 #include "vgpu/error.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
+#include "vgpu/telemetry.hpp"
 #include "vgpu/hip_abi.hpp"
+#include "vgpu/hip_profiler.hpp"
 #include "vgpu_hip.h"
 
 namespace {
@@ -51,7 +55,92 @@ hipError_t fail(hipError_t code, const std::string& what) {
 struct Module {
   CodeObject object;
   uint64_t globals = 0;   // where the module's own variables were placed
+  // What a profiler knows it and its kernels by (vgpu/hip_profiler.hpp).
+  uint64_t code_object_id = 0;
+  std::vector<uint64_t> kernel_ids;   // one per kernel, in the object's order
 };
+
+// ---- What a profiler is told -----------------------------------------------
+//
+// A profiler that attaches (vgpu/hip_profiler.hpp) hears of every HIP call,
+// every code object placed on a device, every launch with what it counted,
+// every copy and every allocation. Nothing is attached unless one is.
+std::atomic<const vgpu::amd::hipprof::Hooks*> g_profiler{nullptr};
+std::atomic<uint64_t> g_next_code_object{1}, g_next_kernel{1}, g_next_dispatch{1};
+
+const vgpu::amd::hipprof::Hooks* profiler() { return g_profiler.load(std::memory_order_acquire); }
+
+// One HIP call, from the outermost: a call one HIP function makes through
+// another is part of the first, as it is in ROCm's runtime.
+class ApiCall {
+ public:
+  explicit ApiCall(const char* name) {
+    if (depth()++ != 0) return;
+    if (const auto* p = profiler(); p && p->api_enter) {
+      hooks_ = p;
+      token_ = p->api_enter(name);
+    }
+  }
+  ~ApiCall() {
+    --depth();
+    if (hooks_ && hooks_->api_exit) hooks_->api_exit(token_);
+  }
+  ApiCall(const ApiCall&) = delete;
+  ApiCall& operator=(const ApiCall&) = delete;
+
+ private:
+  static int& depth() {
+    thread_local int d = 0;
+    return d;
+  }
+  const vgpu::amd::hipprof::Hooks* hooks_ = nullptr;
+  uint64_t token_ = 0;
+};
+
+// A module placed on a device gets its ids here, and a profiler is told of
+// it and its kernels.
+void report_loaded(Module& m, int device, const void* image, size_t image_size) {
+  m.code_object_id = g_next_code_object.fetch_add(1);
+  m.kernel_ids.clear();
+  for (size_t i = 0; i < m.object.kernels.size(); ++i) m.kernel_ids.push_back(g_next_kernel.fetch_add(1));
+  const auto* p = profiler();
+  if (!p || !p->code_object_loaded) return;
+  // Where ROCm's loader says a code object came from when it was handed one
+  // in memory rather than a file.
+  char uri[128];
+  std::snprintf(uri, sizeof uri, "memory://%d#offset=0x%llx&size=%zu", static_cast<int>(::getpid()),
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(image)), image_size);
+  vgpu::amd::hipprof::CodeObject o;
+  o.id = m.code_object_id;
+  o.device = device;
+  o.uri = uri;
+  o.image = image;
+  o.image_size = image_size;
+  o.load_base = m.object.text_addr;
+  o.load_size = m.object.text.size();
+  std::vector<vgpu::amd::hipprof::KernelSymbol> symbols;
+  for (size_t i = 0; i < m.object.kernels.size(); ++i) {
+    const Kernel& k = m.object.kernels[i];
+    vgpu::amd::hipprof::KernelSymbol sym;
+    sym.kernel_id = m.kernel_ids[i];
+    sym.name = k.name.c_str();
+    sym.entry = m.object.text_addr + k.entry;
+    sym.kernarg_size = k.kernarg_size;
+    sym.kernarg_alignment = k.kernarg_align;
+    sym.group_segment = k.group_segment;
+    sym.private_segment = k.private_segment;
+    sym.sgprs = k.sgpr_count;
+    sym.vgprs = k.vgpr_count;
+    sym.agprs = k.agpr_count;
+    symbols.push_back(sym);
+  }
+  p->code_object_loaded(o, symbols.data(), symbols.size());
+}
+
+uint64_t kernel_id(const Module& m, const Kernel& k) {
+  const size_t i = static_cast<size_t>(&k - m.object.kernels.data());
+  return i < m.kernel_ids.size() ? m.kernel_ids[i] : 0;
+}
 
 // A kernel a program has looked up: the module it came from, and which kernel.
 struct Function {
@@ -184,12 +273,18 @@ hipError_t build_kernargs(const Kernel& k, void** params, void** extra, std::vec
 
 // Runs one kernel on one device: the arguments go into device memory as its
 // kernarg segment, and the dispatch runs to completion before this returns.
-hipError_t dispatch_kernel(State& s, vgpu::runtime::Device& d, const CodeObject& object, const Kernel& kernel,
+hipError_t dispatch_kernel(State& s, int ordinal, const Module& module, const Kernel& kernel,
                            vgpu::amd::abi::Dim3 grid, vgpu::amd::abi::Dim3 block, uint32_t shared,
-                           const std::vector<uint8_t>& args) {
+                           const std::vector<uint8_t>& args, hipStream_t stream) {
+  vgpu::runtime::Device& d = s.rt->device(ordinal);
+  const CodeObject& object = module.object;
   if (!block.x || !block.y || !block.z || !grid.x || !grid.y || !grid.z) return hipErrorInvalidConfiguration;
   vgpu::MemoryManager& mem = d.memory();
   uint64_t kernarg = 0;
+  const vgpu::amd::hipprof::Hooks* prof = profiler();
+  vgpu::amd::hipprof::Launch launch;
+  void* token = nullptr;
+  uint64_t start = 0;
   try {
     kernarg = mem.alloc(args.empty() ? 1 : args.size());
     if (!args.empty()) mem.write(kernarg, args.data(), args.size());
@@ -205,7 +300,25 @@ hipError_t dispatch_kernel(State& s, vgpu::runtime::Device& d, const CodeObject&
     dispatch.group_size[2] = block.z;
     dispatch.wave_size = static_cast<uint32_t>(d.profile().warp_size);
     dispatch.dynamic_lds = shared;   // what the launch adds to the kernel's own LDS
+    if (prof) {
+      launch.device = ordinal;
+      launch.kernel_id = kernel_id(module, kernel);
+      launch.dispatch_id = g_next_dispatch.fetch_add(1);
+      launch.stream = reinterpret_cast<uint64_t>(stream);
+      for (int i = 0; i < 3; ++i) {
+        launch.groups[i] = dispatch.groups[i];
+        launch.group_size[i] = dispatch.group_size[i];
+      }
+      launch.group_segment = kernel.group_segment + shared;
+      launch.private_segment = kernel.private_segment;
+      if (prof->launching) token = prof->launching(launch);
+      start = vgpu::amd::hipprof::now_ns();
+    }
     const vgpu::amd::DispatchStats stats = vgpu::amd::execute(dispatch, mem);
+    if (prof && prof->launched) {
+      prof->launched(launch, &stats, start, vgpu::amd::hipprof::now_ns(), token);
+      prof = nullptr;   // told
+    }
     mem.free(kernarg);
     // What the device spent, as telemetry reports a kernel: the instructions
     // a wave retires, at the profile's clock.
@@ -213,6 +326,8 @@ hipError_t dispatch_kernel(State& s, vgpu::runtime::Device& d, const CodeObject&
     const double clock = mhz ? mhz * 1e6 : 1e9;
     d.note_busy(static_cast<double>(stats.instructions) / clock);
   } catch (const std::exception& e) {
+    // A launch that failed counted nothing, and the profiler is told so.
+    if (prof && prof->launched && start) prof->launched(launch, nullptr, start, vgpu::amd::hipprof::now_ns(), token);
     if (kernarg) {
       try {
         mem.free(kernarg);
@@ -250,6 +365,7 @@ hipError_t module_on(State& s, FatBinary& fb, int ordinal, Module** out) {
       d.memory().write(m->globals, m->object.data.data(), m->object.data.size());
     }
     vgpu::amd::place_globals(m->object, m->globals);
+    report_loaded(*m, ordinal, target->second.data(), target->second.size());
     *out = m.get();
     fb.on_device.emplace(ordinal, std::move(m));
   } catch (const std::exception& e) {
@@ -298,12 +414,14 @@ thread_local std::vector<CallConfiguration> g_call_configurations;
 extern "C" {
 
 hipError_t hipInit(unsigned int) {
+  const ApiCall api("hipInit");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   return record(s, ensure_runtime(s));
 }
 
 hipError_t hipGetDeviceCount(int* count) {
+  const ApiCall api("hipGetDeviceCount");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!count) return record(s, hipErrorInvalidValue);
@@ -313,6 +431,7 @@ hipError_t hipGetDeviceCount(int* count) {
 }
 
 hipError_t hipSetDevice(int d) {
+  const ApiCall api("hipSetDevice");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
@@ -322,6 +441,7 @@ hipError_t hipSetDevice(int d) {
 }
 
 hipError_t hipGetDevice(int* d) {
+  const ApiCall api("hipGetDevice");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!d) return record(s, hipErrorInvalidValue);
@@ -330,6 +450,7 @@ hipError_t hipGetDevice(int* d) {
 }
 
 hipError_t hipGetDeviceProperties(hipDeviceProp_t* props, int ordinal) {
+  const ApiCall api("hipGetDeviceProperties");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!props) return record(s, hipErrorInvalidValue);
@@ -355,12 +476,14 @@ hipError_t hipGetDeviceProperties(hipDeviceProp_t* props, int ordinal) {
 }
 
 hipError_t hipDeviceSynchronize(void) {
+  const ApiCall api("hipDeviceSynchronize");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   return record(s, ensure_runtime(s));   // every launch here has already finished
 }
 
 hipError_t hipDeviceReset(void) {
+  const ApiCall api("hipDeviceReset");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
@@ -371,6 +494,7 @@ hipError_t hipDeviceReset(void) {
 }
 
 hipError_t hipMalloc(void** ptr, size_t size) {
+  const ApiCall api("hipMalloc");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!ptr) return record(s, hipErrorInvalidValue);
@@ -380,29 +504,37 @@ hipError_t hipMalloc(void** ptr, size_t size) {
     *ptr = nullptr;
     return record(s, hipSuccess);
   }
+  const uint64_t start = vgpu::amd::hipprof::now_ns();
   try {
     *ptr = reinterpret_cast<void*>(d->memory().alloc(size));
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorOutOfMemory, e.what()));
   }
+  if (const auto* p = profiler(); p && p->allocated)
+    p->allocated(s.current, reinterpret_cast<uint64_t>(*ptr), size, false, start, vgpu::amd::hipprof::now_ns());
   return record(s, hipSuccess);
 }
 
 hipError_t hipFree(void* ptr) {
+  const ApiCall api("hipFree");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!ptr) return record(s, hipSuccess);
   vgpu::runtime::Device* d = device(s);
   if (!d) return record(s, hipErrorInvalidDevice);
+  const uint64_t start = vgpu::amd::hipprof::now_ns();
   try {
     d->memory().free(reinterpret_cast<uint64_t>(ptr));
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorInvalidDevicePointer, e.what()));
   }
+  if (const auto* p = profiler(); p && p->allocated)
+    p->allocated(s.current, reinterpret_cast<uint64_t>(ptr), 0, true, start, vgpu::amd::hipprof::now_ns());
   return record(s, hipSuccess);
 }
 
 hipError_t hipMemcpy(void* dst, const void* src, size_t bytes, hipMemcpyKind kind) {
+  const ApiCall api("hipMemcpy");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   vgpu::runtime::Device* d = device(s);
@@ -422,6 +554,7 @@ hipError_t hipMemcpy(void* dst, const void* src, size_t bytes, hipMemcpyKind kin
              kind != hipMemcpyDeviceToDevice) {
     return record(s, hipErrorInvalidMemcpyDirection);
   }
+  const uint64_t start = vgpu::amd::hipprof::now_ns();
   try {
     if (to_device && from_device) {
       std::vector<uint8_t> buf(bytes);
@@ -438,10 +571,19 @@ hipError_t hipMemcpy(void* dst, const void* src, size_t bytes, hipMemcpyKind kin
     return record(s, fail(hipErrorInvalidValue, e.what()));
   }
   d->note_transfer(bytes, 0.0);
+  if (const auto* p = profiler(); p && p->copied) {
+    using vgpu::amd::hipprof::Copy;
+    const Copy k = to_device && from_device ? Copy::DeviceToDevice
+                   : to_device             ? Copy::HostToDevice
+                   : from_device           ? Copy::DeviceToHost
+                                           : Copy::HostToHost;
+    p->copied(k, s.current, s.current, bytes, dst_va, src_va, start, vgpu::amd::hipprof::now_ns());
+  }
   return record(s, hipSuccess);
 }
 
 hipError_t hipMemset(void* dst, int value, size_t bytes) {
+  const ApiCall api("hipMemset");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   vgpu::runtime::Device* d = device(s);
@@ -461,14 +603,17 @@ hipError_t hipMemset(void* dst, int value, size_t bytes) {
 // forms are the synchronous ones: a stream is a handle, and there is nothing
 // for it to be waiting on.
 hipError_t hipMemcpyAsync(void* dst, const void* src, size_t bytes, hipMemcpyKind kind, hipStream_t) {
+  const ApiCall api("hipMemcpyAsync");
   return hipMemcpy(dst, src, bytes, kind);
 }
 
 hipError_t hipMemsetAsync(void* dst, int value, size_t bytes, hipStream_t) {
+  const ApiCall api("hipMemsetAsync");
   return hipMemset(dst, value, bytes);
 }
 
 hipError_t hipMemGetInfo(size_t* free, size_t* total) {
+  const ApiCall api("hipMemGetInfo");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   vgpu::runtime::Device* d = device(s);
@@ -480,6 +625,7 @@ hipError_t hipMemGetInfo(size_t* free, size_t* total) {
 }
 
 hipError_t hipDeviceTotalMem(size_t* bytes, hipDevice_t ordinal) {
+  const ApiCall api("hipDeviceTotalMem");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!bytes) return record(s, hipErrorInvalidValue);
@@ -490,6 +636,7 @@ hipError_t hipDeviceTotalMem(size_t* bytes, hipDevice_t ordinal) {
 }
 
 hipError_t hipDeviceGetName(char* name, int len, hipDevice_t ordinal) {
+  const ApiCall api("hipDeviceGetName");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!name || len <= 0) return record(s, hipErrorInvalidValue);
@@ -500,6 +647,7 @@ hipError_t hipDeviceGetName(char* name, int len, hipDevice_t ordinal) {
 }
 
 hipError_t hipDeviceGet(hipDevice_t* device_out, int ordinal) {
+  const ApiCall api("hipDeviceGet");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!device_out) return record(s, hipErrorInvalidValue);
@@ -510,6 +658,7 @@ hipError_t hipDeviceGet(hipDevice_t* device_out, int ordinal) {
 }
 
 hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
+  const ApiCall api("hipModuleLoadData");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!module || !image) return record(s, hipErrorInvalidValue);
@@ -537,6 +686,7 @@ hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
       d->memory().write(m->globals, m->object.data.data(), m->object.data.size());
     }
     vgpu::amd::place_globals(m->object, m->globals);
+    report_loaded(*m, s.current, image, size);
     *module = reinterpret_cast<hipModule_t>(m.get());
     s.modules.push_back(std::move(m));
   } catch (const std::exception& e) {
@@ -546,6 +696,7 @@ hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
 }
 
 hipError_t hipModuleLoad(hipModule_t* module, const char* path) {
+  const ApiCall api("hipModuleLoad");
   if (!path) return hipErrorInvalidValue;
   std::ifstream in(path, std::ios::binary);
   if (!in) return fail(hipErrorFileNotFound, std::string("no code object at ") + path);
@@ -555,6 +706,7 @@ hipError_t hipModuleLoad(hipModule_t* module, const char* path) {
 }
 
 hipError_t hipModuleUnload(hipModule_t module) {
+  const ApiCall api("hipModuleUnload");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   for (size_t i = 0; i < s.modules.size(); ++i)
@@ -576,6 +728,7 @@ hipError_t hipModuleUnload(hipModule_t module) {
 }
 
 hipError_t hipModuleGetFunction(hipFunction_t* function, hipModule_t module, const char* name) {
+  const ApiCall api("hipModuleGetFunction");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!function || !module || !name) return record(s, hipErrorInvalidValue);
@@ -591,6 +744,7 @@ hipError_t hipModuleGetFunction(hipFunction_t* function, hipModule_t module, con
 }
 
 hipError_t hipModuleGetGlobal(void** dptr, size_t* bytes, hipModule_t module, const char* name) {
+  const ApiCall api("hipModuleGetGlobal");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!module || !name) return record(s, hipErrorInvalidValue);
@@ -604,7 +758,8 @@ hipError_t hipModuleGetGlobal(void** dptr, size_t* bytes, hipModule_t module, co
 
 hipError_t hipModuleLaunchKernel(hipFunction_t f, unsigned int gx, unsigned int gy, unsigned int gz,
                                  unsigned int bx, unsigned int by, unsigned int bz, unsigned int shared,
-                                 hipStream_t, void** params, void** extra) {
+                                 hipStream_t stream, void** params, void** extra) {
+  const ApiCall api("hipModuleLaunchKernel");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!f) return record(s, hipErrorInvalidValue);
@@ -616,10 +771,12 @@ hipError_t hipModuleLaunchKernel(hipFunction_t f, unsigned int gx, unsigned int 
   if (const hipError_t e = build_kernargs(*fn->kernel, params, extra, &args); e != hipSuccess)
     return record(s, e);
 
-  return record(s, dispatch_kernel(s, *d, fn->module->object, *fn->kernel, {gx, gy, gz}, {bx, by, bz}, shared, args));
+  return record(s, dispatch_kernel(s, s.current, *fn->module, *fn->kernel, {gx, gy, gz}, {bx, by, bz}, shared, args,
+                                   stream));
 }
 
 const char* hipGetErrorName(hipError_t e) {
+  const ApiCall api("hipGetErrorName");
   switch (e) {
     case hipSuccess: return "hipSuccess";
     case hipErrorInvalidValue: return "hipErrorInvalidValue";
@@ -652,6 +809,7 @@ const char* hipGetErrorName(hipError_t e) {
 }
 
 const char* hipGetErrorString(hipError_t e) {
+  const ApiCall api("hipGetErrorString");
   switch (e) {
     case hipSuccess: return "no error";
     case hipErrorInvalidValue: return "invalid argument";
@@ -684,6 +842,7 @@ const char* hipGetErrorString(hipError_t e) {
 }
 
 hipError_t hipGetLastError(void) {
+  const ApiCall api("hipGetLastError");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   const hipError_t e = s.last;
@@ -691,26 +850,37 @@ hipError_t hipGetLastError(void) {
   return e;
 }
 
-hipError_t hipPeekAtLastError(void) { return state().last; }
+hipError_t hipPeekAtLastError(void) {
+  const ApiCall api("hipPeekAtLastError");
+  return state().last;
+}
 
 int hipGetStreamDeviceId(hipStream_t) { return state().current; }
 
 // Streams: every launch here finishes before it returns, so a stream is a
 // handle and nothing more. The null stream is what a program gets by default.
 hipError_t hipStreamCreate(hipStream_t* stream) {
+  const ApiCall api("hipStreamCreate");
   if (!stream) return hipErrorInvalidValue;
   static int next = 1;
   *stream = reinterpret_cast<hipStream_t>(static_cast<intptr_t>(next++));
   return hipSuccess;
 }
 hipError_t hipStreamCreateWithFlags(hipStream_t* stream, unsigned int flags) {
+  const ApiCall api("hipStreamCreateWithFlags");
   // Neither flag changes anything here: there is no other work for a stream
   // to be blocking on, and nothing to synchronise against.
   if (flags & ~static_cast<unsigned>(hipStreamNonBlocking)) return hipErrorInvalidValue;
   return hipStreamCreate(stream);
 }
-hipError_t hipStreamDestroy(hipStream_t) { return hipSuccess; }
-hipError_t hipStreamSynchronize(hipStream_t) { return hipSuccess; }
+hipError_t hipStreamDestroy(hipStream_t) {
+  const ApiCall api("hipStreamDestroy");
+  return hipSuccess;
+}
+hipError_t hipStreamSynchronize(hipStream_t) {
+  const ApiCall api("hipStreamSynchronize");
+  return hipSuccess;
+}
 
 // Events: a program records one before its work and one after, and asks how
 // long there was between them. Every launch here has finished by the time it
@@ -736,6 +906,7 @@ Event* find_event(hipEvent_t e) {   // the caller holds g_event_mutex
 }  // namespace
 
 hipError_t hipEventCreateWithFlags(hipEvent_t* event, unsigned int flags) {
+  const ApiCall api("hipEventCreateWithFlags");
   if (!event) return hipErrorInvalidValue;
   if (flags & ~static_cast<unsigned>(hipEventBlockingSync | hipEventDisableTiming)) return hipErrorInvalidValue;
   std::lock_guard<std::mutex> lock(g_event_mutex);
@@ -748,14 +919,19 @@ hipError_t hipEventCreateWithFlags(hipEvent_t* event, unsigned int flags) {
   return hipSuccess;
 }
 
-hipError_t hipEventCreate(hipEvent_t* event) { return hipEventCreateWithFlags(event, hipEventDefault); }
+hipError_t hipEventCreate(hipEvent_t* event) {
+  const ApiCall api("hipEventCreate");
+  return hipEventCreateWithFlags(event, hipEventDefault);
+}
 
 hipError_t hipEventDestroy(hipEvent_t event) {
+  const ApiCall api("hipEventDestroy");
   std::lock_guard<std::mutex> lock(g_event_mutex);
   return g_events.erase(event) ? hipSuccess : hipErrorInvalidHandle;
 }
 
 hipError_t hipEventRecord(hipEvent_t event, hipStream_t) {
+  const ApiCall api("hipEventRecord");
   std::lock_guard<std::mutex> lock(g_event_mutex);
   Event* e = find_event(event);
   if (!e) return hipErrorInvalidHandle;
@@ -766,13 +942,18 @@ hipError_t hipEventRecord(hipEvent_t event, hipStream_t) {
 
 // There is never work left behind an event, so both of these answer at once.
 hipError_t hipEventSynchronize(hipEvent_t event) {
+  const ApiCall api("hipEventSynchronize");
   std::lock_guard<std::mutex> lock(g_event_mutex);
   return find_event(event) ? hipSuccess : hipErrorInvalidHandle;
 }
 
-hipError_t hipEventQuery(hipEvent_t event) { return hipEventSynchronize(event); }
+hipError_t hipEventQuery(hipEvent_t event) {
+  const ApiCall api("hipEventQuery");
+  return hipEventSynchronize(event);
+}
 
 hipError_t hipEventElapsedTime(float* ms, hipEvent_t start, hipEvent_t end) {
+  const ApiCall api("hipEventElapsedTime");
   if (!ms) return hipErrorInvalidValue;
   std::lock_guard<std::mutex> lock(g_event_mutex);
   const Event* a = find_event(start);
@@ -857,6 +1038,7 @@ hipError_t __hipPopCallConfiguration(vgpu::amd::abi::Dim3* grid, vgpu::amd::abi:
 // stream that is capturing, the launch is recorded rather than run.
 hipError_t hipLaunchKernel(const void* host_function, vgpu::amd::abi::Dim3 grid, vgpu::amd::abi::Dim3 block,
                            void** args, size_t shared, hipStream_t stream) {
+  const ApiCall api("hipLaunchKernel");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   vgpu::runtime::Device* d = device(s);
@@ -876,12 +1058,13 @@ hipError_t hipLaunchKernel(const void* host_function, vgpu::amd::abi::Dim3 grid,
     cap->second.nodes.push_back(Node{s.current, host_function, grid, block, static_cast<uint32_t>(shared), packed});
     return record(s, hipSuccess);
   }
-  return record(s, dispatch_kernel(s, *d, m->object, *k, grid, block, static_cast<uint32_t>(shared), packed));
+  return record(s, dispatch_kernel(s, s.current, *m, *k, grid, block, static_cast<uint32_t>(shared), packed, stream));
 }
 
 // ---- What the device is, in the layout the HIP headers give it ---------------
 
 hipError_t hipGetDevicePropertiesR0600(vgpu::amd::abi::DevicePropR0600* props, int ordinal) {
+  const ApiCall api("hipGetDevicePropertiesR0600");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!props) return record(s, hipErrorInvalidValue);
@@ -922,6 +1105,7 @@ hipError_t hipGetDevicePropertiesR0600(vgpu::amd::abi::DevicePropR0600* props, i
 // Nothing here waits on anything, so how a program would like to wait changes
 // nothing; the flags it may ask for are accepted and any other is refused.
 hipError_t hipSetDeviceFlags(unsigned int flags) {
+  const ApiCall api("hipSetDeviceFlags");
   const unsigned int known = 0x7 /* schedule */ | 0x8 /* map host */ | 0x10 /* lmem resize */;
   return record(state(), (flags & ~known) ? hipErrorInvalidValue : hipSuccess);
 }
@@ -933,12 +1117,14 @@ hipError_t hipSetDeviceFlags(unsigned int flags) {
 // are the device's own. The workloads use it to stage copies, which is what
 // this supports.
 hipError_t hipHostMalloc(void** ptr, size_t size, unsigned int) {
+  const ApiCall api("hipHostMalloc");
   if (!ptr) return hipErrorInvalidValue;
   *ptr = size ? std::aligned_alloc(4096, (size + 4095) / 4096 * 4096) : nullptr;
   return (size && !*ptr) ? hipErrorOutOfMemory : hipSuccess;
 }
 
 hipError_t hipHostFree(void* ptr) {
+  const ApiCall api("hipHostFree");
   std::free(ptr);
   return hipSuccess;
 }
@@ -946,6 +1132,7 @@ hipError_t hipHostFree(void* ptr) {
 // ---- One device reaching another --------------------------------------------
 
 hipError_t hipDeviceCanAccessPeer(int* can, int ordinal, int peer) {
+  const ApiCall api("hipDeviceCanAccessPeer");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!can) return record(s, hipErrorInvalidValue);
@@ -957,6 +1144,7 @@ hipError_t hipDeviceCanAccessPeer(int* can, int ordinal, int peer) {
 }
 
 hipError_t hipDeviceEnablePeerAccess(int peer, unsigned int flags) {
+  const ApiCall api("hipDeviceEnablePeerAccess");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (flags) return record(s, hipErrorInvalidValue);
@@ -970,6 +1158,7 @@ hipError_t hipDeviceEnablePeerAccess(int peer, unsigned int flags) {
 // owns it, and the device numbers the program gave have to agree.
 hipError_t hipMemcpyPeerAsync(void* dst, int dst_device, const void* src, int src_device, size_t bytes,
                               hipStream_t) {
+  const ApiCall api("hipMemcpyPeerAsync");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
@@ -982,6 +1171,7 @@ hipError_t hipMemcpyPeerAsync(void* dst, int dst_device, const void* src, int sr
   const uint64_t dst_va = reinterpret_cast<uint64_t>(dst), src_va = reinterpret_cast<uint64_t>(src);
   if (!to.owns(dst_va) || !from.owns(src_va))
     return record(s, fail(hipErrorInvalidValue, "a peer copy's addresses are not on the devices it names"));
+  const uint64_t start = vgpu::amd::hipprof::now_ns();
   try {
     std::vector<uint8_t> buf(bytes);
     from.read(src_va, buf.data(), bytes);
@@ -990,6 +1180,9 @@ hipError_t hipMemcpyPeerAsync(void* dst, int dst_device, const void* src, int sr
     return record(s, fail(hipErrorInvalidValue, e.what()));
   }
   s.rt->device(src_device).note_transfer(bytes, 0.0);
+  if (const auto* p = profiler(); p && p->copied)
+    p->copied(vgpu::amd::hipprof::Copy::DeviceToDevice, src_device, dst_device, bytes, dst_va, src_va, start,
+              vgpu::amd::hipprof::now_ns());
   return record(s, hipSuccess);
 }
 
@@ -1000,6 +1193,7 @@ hipError_t hipMemcpyPeerAsync(void* dst, int dst_device, const void* src, int sr
 // launched, which runs what was recorded, in order, with the arguments it was
 // recorded with.
 hipError_t hipStreamBeginCapture(hipStream_t stream, int) {
+  const ApiCall api("hipStreamBeginCapture");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!stream) return record(s, fail(hipErrorStreamCaptureUnsupported, "the null stream cannot be captured"));
@@ -1008,6 +1202,7 @@ hipError_t hipStreamBeginCapture(hipStream_t stream, int) {
 }
 
 hipError_t hipStreamEndCapture(hipStream_t stream, void** graph) {
+  const ApiCall api("hipStreamEndCapture");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   const auto it = s.capturing.find(stream);
@@ -1020,6 +1215,7 @@ hipError_t hipStreamEndCapture(hipStream_t stream, void** graph) {
 }
 
 hipError_t hipGraphInstantiate(void** exec, void* graph, void*, char*, size_t) {
+  const ApiCall api("hipGraphInstantiate");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!exec || !graph) return record(s, hipErrorInvalidValue);
@@ -1028,7 +1224,8 @@ hipError_t hipGraphInstantiate(void** exec, void* graph, void*, char*, size_t) {
   return record(s, hipSuccess);
 }
 
-hipError_t hipGraphLaunch(void* exec, hipStream_t) {
+hipError_t hipGraphLaunch(void* exec, hipStream_t stream) {
+  const ApiCall api("hipGraphLaunch");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!exec) return record(s, hipErrorInvalidValue);
@@ -1039,8 +1236,8 @@ hipError_t hipGraphLaunch(void* exec, hipStream_t) {
     if (const hipError_t e = module_on(s, *hf->second.binary, node.device, &m); e != hipSuccess) return record(s, e);
     const Kernel* k = vgpu::amd::find_kernel(m->object, hf->second.kernel);
     if (!k) return record(s, hipErrorInvalidDeviceFunction);
-    if (const hipError_t e = dispatch_kernel(s, s.rt->device(node.device), m->object, *k, node.grid, node.block,
-                                             node.shared, node.args);
+    if (const hipError_t e = dispatch_kernel(s, node.device, *m, *k, node.grid, node.block, node.shared, node.args,
+                                             stream);
         e != hipSuccess)
       return record(s, e);
   }
@@ -1048,6 +1245,7 @@ hipError_t hipGraphLaunch(void* exec, hipStream_t) {
 }
 
 hipError_t hipGraphDestroy(void* graph) {
+  const ApiCall api("hipGraphDestroy");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   for (size_t i = 0; i < s.graphs.size(); ++i)
@@ -1059,6 +1257,7 @@ hipError_t hipGraphDestroy(void* graph) {
 }
 
 hipError_t hipGraphExecDestroy(void* exec) {
+  const ApiCall api("hipGraphExecDestroy");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   for (size_t i = 0; i < s.graph_execs.size(); ++i)
@@ -1070,10 +1269,67 @@ hipError_t hipGraphExecDestroy(void* exec) {
 }
 
 hipError_t hipRuntimeGetVersion(int* version) {
+  const ApiCall api("hipRuntimeGetVersion");
   if (!version) return hipErrorInvalidValue;
   *version = 60443483;   // 6.4.43483, a ROCm 6.4 runtime
   return hipSuccess;
 }
-hipError_t hipDriverGetVersion(int* version) { return hipRuntimeGetVersion(version); }
+hipError_t hipDriverGetVersion(int* version) {
+  const ApiCall api("hipDriverGetVersion");
+  return hipRuntimeGetVersion(version);
+}
+
+}  // extern "C"
+
+// ---- The profiler's side (vgpu/hip_profiler.hpp) ------------------------------
+
+extern "C" {
+
+int vgpu_hip_profiler_attach(const vgpu::amd::hipprof::Hooks* hooks) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  g_profiler.store(hooks, std::memory_order_release);
+  if (ensure_runtime(s) != hipSuccess) return -1;
+  return s.rt->device_count();
+}
+
+int vgpu_hip_profiler_device(int ordinal, vgpu::amd::hipprof::Device* out) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!out || ensure_runtime(s) != hipSuccess || ordinal < 0 || ordinal >= s.rt->device_count()) return -1;
+  const vgpu::DeviceProfile& p = s.rt->device(ordinal).profile();
+  vgpu::amd::hipprof::Device d;
+  d.ordinal = ordinal;
+  d.gfx = p.gcn_arch.c_str();
+  d.model = p.model.c_str();
+  d.vendor_id = static_cast<uint16_t>(p.telemetry.pci_vendor_id);
+  d.device_id = static_cast<uint16_t>(p.telemetry.pci_device_id);
+  d.compute_units = p.limits.multiprocessors;
+  d.wave_size = p.warp_size;
+  d.lds_bytes = static_cast<uint32_t>(p.limits.shared_mem_per_block);
+  d.max_threads_per_cu = p.limits.max_threads_per_sm;
+  d.max_workgroup = p.limits.max_threads_per_block;
+  for (int i = 0; i < 3; ++i) {
+    d.max_block[i] = p.limits.max_block_dim[i];
+    d.max_grid[i] = p.limits.max_grid_dim[i];
+  }
+  d.clock_mhz = p.telemetry.sm_clock_max_mhz;
+  d.vram_bytes = p.vram_bytes;
+  // The bus and UUID the device reports everywhere else: rocm-smi, sysfs.
+  vgpu::telemetry::DeviceSample sample{};
+  vgpu::telemetry::describe_device(p, ordinal, &sample);
+  unsigned bus = 0;
+  if (std::sscanf(sample.bus_id, "%*x:%x:", &bus) == 1) d.pci_bus = bus;
+  // "GPU-xxxxxxxx-xxxx-...": its hex digits, sixteen bytes of them.
+  size_t n = 0;
+  for (const char* c = sample.uuid; *c && n < 32; ++c) {
+    int v = *c >= '0' && *c <= '9' ? *c - '0' : *c >= 'a' && *c <= 'f' ? *c - 'a' + 10 : *c >= 'A' && *c <= 'F' ? *c - 'A' + 10 : -1;
+    if (v < 0) continue;
+    d.uuid[n / 2] = static_cast<uint8_t>(d.uuid[n / 2] << 4 | v);
+    ++n;
+  }
+  *out = d;
+  return 0;
+}
 
 }  // extern "C"
