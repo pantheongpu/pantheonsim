@@ -63,7 +63,7 @@ Known limitations (deliberate, documented):
 - `wmma` fragment layout is VirtualGPU's own (PTX leaves it unspecified) —
   see ARCHITECTURE.md D8. bf16, `cp.async`, `mma.sync`, `ldmatrix`, the
   extended-precision carry family, textures, surfaces, grid sync, Hopper's
-  warpgroup MMA (`wgmma`), TMA (multicast included), thread-block cluster
+  warpgroup MMA (`wgmma`), TMA (multicast and reductions included), thread-block cluster
   barriers and distributed shared memory are implemented -- checked against
   CuTe and CUTLASS's own Hopper unit tests. Every gap fails loudly
   (instruction, PTX line, kernel, profile), never silently.

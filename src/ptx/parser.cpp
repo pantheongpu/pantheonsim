@@ -3042,6 +3042,110 @@ class Parser {
       expect_punct(",");
       op.src = parse_operand();
       ins.op = op;
+    } else if (op0 == "cp" && parts.size() > 3 && parts[1] == "reduce" && parts[2] == "async" &&
+               parts[3] == "bulk") {
+      // cp.reduce.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes.op.type [d], [s], size, [mbar]
+      // cp.reduce.async.bulk.global.shared::cta.bulk_group.op{.noftz}.type [d], [s], size{, policy}
+      // cp.reduce.async.bulk.tensor.Nd.global.shared::cta.op{.tile}.bulk_group [tmap, {c...}], [s]{, policy}
+      OpBulkCopy op;
+      op.reduce = true;
+      std::vector<std::string> spaces;
+      bool mbar_completion = false, group_completion = false, have_op = false, have_ty = false,
+           noftz = false;
+      for (size_t i = 4; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "tensor") op.tensor = true;
+        else if (p.size() == 2 && p[1] == 'd' && p[0] >= '1' && p[0] <= '5') op.dims = p[0] - '0';
+        else if (p == "shared" || p == "shared::cluster" || p == "global") spaces.push_back(p);
+        else if (p == "mbarrier::complete_tx::bytes") mbar_completion = true;
+        else if (p == "bulk_group") group_completion = true;
+        else if (p == "noftz") noftz = true;
+        else if (p == "tile" || p == "relaxed" || inert_mem_modifier(p)) ;
+        else if (p == "add") { op.red_op = AtomOp::Add; have_op = true; }
+        else if (p == "min") { op.red_op = AtomOp::Min; have_op = true; }
+        else if (p == "max") { op.red_op = AtomOp::Max; have_op = true; }
+        else if (p == "inc") { op.red_op = AtomOp::Inc; have_op = true; }
+        else if (p == "dec") { op.red_op = AtomOp::Dec; have_op = true; }
+        else if (p == "and") { op.red_op = AtomOp::And; have_op = true; }
+        else if (p == "or") { op.red_op = AtomOp::Or; have_op = true; }
+        else if (p == "xor") { op.red_op = AtomOp::Xor; have_op = true; }
+        else if (auto t = parse_type_token(p); t && !op.tensor) { op.red_ty = *t; have_ty = true; }
+        else return unsupported("cp.reduce.async.bulk modifier '." + p + "' (im2col, overrides and "
+                                "multimem are not implemented)");
+      }
+      if (!have_op) return unsupported("cp.reduce.async.bulk needs a reduction operation");
+      if (op.tensor ? !op.dims : !have_ty) return unsupported("cp.reduce.async.bulk form");
+      if (spaces.size() != 2 || spaces[1] != "shared")
+        return unsupported("cp.reduce.async.bulk reads from .shared::cta");
+      const bool to_cluster = spaces[0] == "shared::cluster";
+      if (to_cluster && (op.tensor || !mbar_completion))
+        return unsupported("cp.reduce.async.bulk into .shared::cluster is a plain reduction "
+                           "completing on an mbarrier");
+      if (!to_cluster && !group_completion)
+        return unsupported("cp.reduce.async.bulk into global memory completes in a bulk group");
+      // The combinations the ISA's tables allow (9.7.10.28.4.2); the tensor
+      // form's type comes from its map and is checked when it runs.
+      if (!op.tensor) {
+        const Type t = op.red_ty;
+        const bool i32 = t.bits == 32 && !t.is_real(), i64 = t.bits == 64 && !t.is_real();
+        const bool real = t.is_real();
+        bool ok = false;
+        switch (op.red_op) {
+          case AtomOp::Add:
+            ok = to_cluster ? (i32 && t.kind != Type::Kind::B) || (t.kind == Type::Kind::U && t.bits == 64)
+                            : (t.kind != Type::Kind::B && (i32 || (t.kind == Type::Kind::U && i64))) || real;
+            break;
+          case AtomOp::Min:
+          case AtomOp::Max:
+            ok = to_cluster ? i32 && t.kind != Type::Kind::B
+                            : ((i32 || i64) && t.kind != Type::Kind::B) || (real && t.bits == 16);
+            break;
+          case AtomOp::Inc:
+          case AtomOp::Dec: ok = i32 && t.kind == Type::Kind::U; break;
+          default: ok = to_cluster ? i32 : (i32 || i64); break;   // the bitwise ops
+        }
+        if (!ok)
+          return unsupported("cp.reduce.async.bulk has no " + t.str() + " form of this operation");
+        if (real && t.bits == 16 && op.red_op == AtomOp::Add && !noftz)
+          return unsupported("cp.reduce.async.bulk.add on .f16 and .bf16 requires .noftz");
+      }
+      op.to_shared = to_cluster;
+      op.shared_to_shared = to_cluster;
+      if (op.tensor) {
+        expect_punct("[");
+        op.tmap = parse_operand();
+        expect_punct(",");
+        op.coords = parse_operand_vector_any();
+        expect_punct("]");
+        expect_punct(",");
+        op.smem = parse_addr(fn);
+        if (op.coords.size() != op.dims)
+          return unsupported("cp.reduce.async.bulk.tensor coordinate count does not match ." +
+                             std::to_string(op.dims) + "d");
+      } else {
+        // The destination is the side the reduction writes: global memory
+        // (`gmem`, as a bulk store) or another block's shared memory (`smem`,
+        // with the source in `gmem`, as a shared-to-shared bulk copy).
+        if (to_cluster) op.smem = parse_addr(fn);
+        else op.gmem = parse_addr(fn);
+        expect_punct(",");
+        if (to_cluster) op.gmem = parse_addr(fn);
+        else op.smem = parse_addr(fn);
+        expect_punct(",");
+        op.size = parse_operand();
+        if (to_cluster) {
+          expect_punct(",");
+          op.mbar = parse_addr(fn);
+        }
+      }
+      if (peek_punct(",")) {   // a cache policy
+        next();
+        (void)parse_operand();
+      }
+      for (const Addr* a : {&op.smem, &op.gmem, &op.mbar})
+        if (a->base_kind == Addr::Base::CallSlot)
+          return unsupported("cp.reduce.async.bulk through a call slot");
+      ins.op = op;
     } else if (op0 == "cp" && parts.size() > 2 && parts[1] == "async" && parts[2] == "bulk") {
       // Hopper's bulk copies (TMA). Forms, after cp.async.bulk:
       //   .commit_group / .wait_group[.read] N

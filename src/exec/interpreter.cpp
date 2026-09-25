@@ -5703,7 +5703,7 @@ class Interpreter {
         if (op.red) {
           uint64_t old = 0;
           std::memcpy(&old, p, size);
-          v = red_async_apply(op.op, op.ty, old, v);
+          v = reduce_value(op.op, op.ty, old, v);
         }
         std::memcpy(p + e * size, &v, size);
       }
@@ -5713,10 +5713,40 @@ class Interpreter {
     count_memory(Space::Shared, size * n, popcount_mask(m), /*is_store=*/true);
   }
 
-  static uint64_t red_async_apply(AtomOp op, const Type& ty, uint64_t old, uint64_t b) {
-    const uint64_t mask = ty.bits == 64 ? ~0ull : 0xFFFFFFFFull;
+  // One element of red.async or cp.reduce.async.bulk: `old` combined with
+  // `b` by `op`, both of type `ty`. Floating-point add rounds to nearest even
+  // and keeps subnormals (the .noftz the ISA requires or defaults to); min
+  // and max return the other operand when one is NaN, as min and max do.
+  static uint64_t reduce_value(AtomOp op, const Type& ty, uint64_t old, uint64_t b) {
+    const uint64_t mask = ty.bits == 64 ? ~0ull : (1ull << ty.bits) - 1;
     old &= mask;
     b &= mask;
+    if (ty.is_real()) {
+      double x, y;
+      if (ty.bits == 16) {
+        x = ty.is_bfloat() ? bf16_to_double(old) : f16_to_double(old);
+        y = ty.is_bfloat() ? bf16_to_double(b) : f16_to_double(b);
+      } else if (ty.bits == 32) {
+        x = std::bit_cast<float>(static_cast<uint32_t>(old));
+        y = std::bit_cast<float>(static_cast<uint32_t>(b));
+      } else {
+        x = std::bit_cast<double>(old);
+        y = std::bit_cast<double>(b);
+      }
+      if (op == AtomOp::Min || op == AtomOp::Max) {
+        if (std::isnan(x)) return b;
+        if (std::isnan(y)) return old;
+        // -0 below +0, so the answer does not depend on operand order.
+        const bool y_less = y < x || (y == x && std::signbit(y) && !std::signbit(x));
+        return (op == AtomOp::Min) == y_less ? b : old;
+      }
+      // Add, in double and then rounded to the element type. A double has
+      // more than twice the precision of a float, a half or a bfloat16, so
+      // rounding twice gives the correctly rounded sum (Figueroa, 1995).
+      if (ty.bits == 16) return ty.is_bfloat() ? double_to_bf16(x + y) : double_to_f16(x + y);
+      if (ty.bits == 32) return std::bit_cast<uint32_t>(static_cast<float>(x + y));
+      return std::bit_cast<uint64_t>(x + y);
+    }
     const bool s = ty.is_signed();
     auto sx = [&](uint64_t v) { return ty.bits == 64 ? static_cast<int64_t>(v) : int64_t{static_cast<int32_t>(v)}; };
     switch (op) {
@@ -5730,6 +5760,57 @@ class Interpreter {
       case AtomOp::Dec: return (old == 0 || old > b) ? b : old - 1;
       default: return b;
     }
+  }
+
+  // cp.reduce.async.bulk into global memory: element by element, each an
+  // atomic read-modify-write, as the ISA makes them (and as they must be
+  // here, where other blocks run on other host threads).
+  void reduce_global(const Instr& ins, int lane, uint64_t addr, const uint8_t* src, uint64_t bytes,
+                     const Type& ty, AtomOp op) {
+    const uint32_t es = ty.bytes();
+    for (uint64_t off = 0; off < bytes; off += es) {
+      uint64_t b = 0;
+      std::memcpy(&b, src + off, es);
+      std::unique_lock<std::mutex> guard;
+      if (concurrent_) guard = std::unique_lock<std::mutex>(atomic_lock_for(addr + off));
+      try {
+        const uint64_t old = mem_.load_scalar(addr + off, es);
+        mem_.store_scalar(addr + off, es, reduce_value(op, ty, old, b));
+      } catch (const Error& e) {
+        rethrow_with_context(e, ins, lane);
+      }
+    }
+    stats_.atomics += bytes / es;
+    stats_.atomic_bytes += bytes;
+  }
+
+  // The element type a tensor map gives cp.reduce.async.bulk.tensor, and
+  // whether the operation has a form for it (the ISA's table in 9.7.10.28.5.4).
+  static std::optional<Type> tensor_reduce_type(exec::TmapType t, AtomOp op) {
+    using K = Type::Kind;
+    using exec::TmapType;
+    Type ty;
+    switch (t) {
+      case TmapType::U32: ty = {K::U, 32}; break;
+      case TmapType::S32: ty = {K::S, 32}; break;
+      case TmapType::U64: ty = {K::U, 64}; break;
+      case TmapType::S64: ty = {K::S, 64}; break;
+      case TmapType::F16: ty = {K::F, 16}; break;
+      case TmapType::BF16: ty = {K::BF, 16}; break;
+      case TmapType::F32: ty = {K::F, 32}; break;
+      default: return std::nullopt;
+    }
+    bool ok = false;
+    switch (op) {
+      case AtomOp::Add: ok = !(ty.kind == K::S && ty.bits == 64); break;
+      case AtomOp::Min:
+      case AtomOp::Max: ok = !(ty.kind == K::F && ty.bits == 32); break;
+      case AtomOp::Inc:
+      case AtomOp::Dec: ok = ty.kind == K::U && ty.bits == 32; break;
+      default: ok = !ty.is_real(); break;
+    }
+    if (!ok) return std::nullopt;
+    return ty;
   }
 
   void exec_bulk_copy(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpBulkCopy& op, Mask m) {
@@ -5814,10 +5895,14 @@ class Interpreter {
           if (smem + n > shared_size)
             ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
                      "a bulk store reads past the block's shared memory");
-          try {
-            mem_.write(g, ctx.shared->data() + smem, n);
-          } catch (const Error& e) {
-            rethrow_with_context(e, ins, static_cast<int>(lane));
+          if (op.reduce) {
+            reduce_global(ins, li, g, ctx.shared->data() + smem, n, op.red_ty, op.red_op);
+          } else {
+            try {
+              mem_.write(g, ctx.shared->data() + smem, n);
+            } catch (const Error& e) {
+              rethrow_with_context(e, ins, static_cast<int>(lane));
+            }
           }
         }
       } else {
@@ -5828,6 +5913,14 @@ class Interpreter {
                        std::to_string(map.rank) + " tensor map");
         const uint32_t es = static_cast<uint32_t>(map.stride[0]);
         const uint32_t swz = exec::TensorMap::swizzle_bytes(map.swizzle);
+        std::optional<Type> red_ty;
+        if (op.reduce) {
+          red_ty = tensor_reduce_type(map.type, op.red_op);
+          if (!red_ty)
+            ctx_fail(ins, li, Err::UnsupportedPtx,
+                     "cp.reduce.async.bulk.tensor has no form of this operation for the tensor "
+                     "map's element type (9.7.10.28.5.4)");
+        }
         // Elements the box takes along each dimension: box / traversal stride,
         // rounded up.
         std::array<uint64_t, 5> count{1, 1, 1, 1, 1};
@@ -5874,12 +5967,16 @@ class Interpreter {
             if (soff + es > shared_size)
               ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
                        "a bulk tensor store reads past the block's shared memory");
-            uint64_t v = 0;
-            std::memcpy(&v, ctx.shared->data() + soff, es);
-            try {
-              mem_.store_scalar(gaddr, es, v);
-            } catch (const Error& ex) {
-              rethrow_with_context(ex, ins, static_cast<int>(lane));
+            if (op.reduce) {
+              reduce_global(ins, li, gaddr, ctx.shared->data() + soff, es, *red_ty, op.red_op);
+            } else {
+              uint64_t v = 0;
+              std::memcpy(&v, ctx.shared->data() + soff, es);
+              try {
+                mem_.store_scalar(gaddr, es, v);
+              } catch (const Error& ex) {
+                rethrow_with_context(ex, ins, static_cast<int>(lane));
+              }
             }
           }
           for (uint32_t d = 0; d < map.rank; ++d) {
@@ -5898,6 +5995,27 @@ class Interpreter {
         if (bar.owner != dst.owner)
           ctx_fail(ins, li, Err::InvalidValue,
                    "a bulk copy's mbarrier must be in the block its data goes to");
+        if (op.reduce) {
+          // A reduction into another block's shared memory is made now, one
+          // of the moments the asynchronous proxy allows, and its bytes are
+          // completed with it, as st.async's are. (A copy's data instead waits
+          // for the barrier to be looked at, see Mbarrier::pending.)
+          Mbarrier& b = cluster_mbarrier(
+              ctx, ins, li, kSharedVaBase + (*mbar_base)[lane] + static_cast<uint64_t>(op.mbar.offset),
+              "cp.reduce.async.bulk");
+          const uint32_t es = op.red_ty.bytes();
+          uint8_t* d = dst.owner->shared->data() + smem;
+          for (uint64_t off = 0; off < pb.data.size(); off += es) {
+            uint64_t old = 0, v = 0;
+            std::memcpy(&old, d + off, es);
+            std::memcpy(&v, pb.data.data() + off, es);
+            v = reduce_value(op.red_op, op.red_ty, old, v);
+            std::memcpy(d + off, &v, es);
+          }
+          b.tx -= static_cast<int64_t>(pb.tx);
+          complete_phase_if_done(b);
+          continue;
+        }
         cluster_mbarrier(ctx, ins, li, kSharedVaBase + (*mbar_base)[lane] + static_cast<uint64_t>(op.mbar.offset),
                          "a bulk copy")
             .pending.push_back(std::move(pb));

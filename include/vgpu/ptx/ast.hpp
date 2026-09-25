@@ -391,6 +391,12 @@ struct OpBulkCopy {
   // completing on a barrier in the destination block. `gmem` is then the
   // source, a shared::cta address.
   bool shared_to_shared = false;
+  // cp.reduce.async.bulk: each destination element is combined with the
+  // source's by `red_op` rather than overwritten. The element type comes from
+  // `red_ty`, or for the tensor form from the tensor map.
+  bool reduce = false;
+  AtomOp red_op = AtomOp::Add;
+  Type red_ty;
 };
 // st.async / red.async (sm_90): a store or reduction into shared memory of a
 // block of the cluster that completes its bytes on an mbarrier there.

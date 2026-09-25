@@ -383,6 +383,63 @@ END:
   for (uint32_t i = 0; i < 16; ++i) VCHECK_EQ(mem.load_scalar(out + i * 4, 4), uint64_t{1000 + i});
 }
 
+// cp.reduce.async.bulk into another block's shared memory: rank 1 adds its
+// four words into rank 0's, and the 16 bytes complete on rank 0's barrier.
+VTEST(bulk_reduce_into_another_blocks_shared_memory) {
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(16);
+  run(R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    .shared .align 16 .b32 buf[4];
+    .shared .align 8 .b64 bar;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, bar;
+    mov.u32 %r2, %cluster_ctarank;
+    mov.u32 %r3, %tid.x;
+    setp.lt.u32 %p5, %r3, 4;
+    mov.u32 %r5, buf;
+    mad.lo.u32 %r6, %r3, 4, %r5;
+    mul.lo.u32 %r4, %r2, 100;
+    add.u32 %r4, %r4, %r3;
+    add.u32 %r4, %r4, 1;
+    @%p5 st.shared.u32 [%r6], %r4;
+    setp.eq.u32 %p1, %r2, 0;
+    setp.eq.u32 %p2, %r3, 0;
+    and.pred %p3, %p1, %p2;
+    @%p3 mbarrier.init.shared::cta.b64 [%r1], 1;
+    barrier.cluster.arrive.aligned;
+    barrier.cluster.wait.aligned;
+    @%p3 mbarrier.arrive.expect_tx.shared::cta.b64 _, [%r1], 16;
+    @%p1 bra WAITER;
+    @!%p2 bra END;
+    mov.u32 %r9, 0;
+    mapa.shared::cluster.u32 %r7, %r5, %r9;
+    mapa.shared::cluster.u32 %r8, %r1, %r9;
+    fence.proxy.async.shared::cta;
+    cp.reduce.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes.add.u32 [%r7], [%r5], 16, [%r8];
+    bra END;
+WAITER:
+    mbarrier.try_wait.parity.shared::cta.b64 %p4, [%r1], 0;
+    @!%p4 bra WAITER;
+    @!%p5 bra END;
+    ld.shared.u32 %r10, [%r6];
+    mul.wide.u32 %rd2, %r3, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r10;
+END:
+    barrier.cluster.arrive.aligned;
+    barrier.cluster.wait.aligned;
+    ret;
+}
+)", clusters(2, 2, 32), {arg_u64(out)}, mem);
+  // rank 0 held t + 1, rank 1 sent 100 + t + 1.
+  for (uint32_t t = 0; t < 4; ++t) VCHECK_EQ(mem.load_scalar(out + t * 4, 4), uint64_t{2 * t + 102});
+}
+
 // A block that exits takes its shared memory with it. Reading it afterwards
 // is the bug cluster.sync() at the end of a kernel exists to prevent, and it
 // is reported rather than answered from memory that is gone.

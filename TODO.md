@@ -749,6 +749,27 @@ narrows what counts as observable, not what the detector looks at.
   (nvidia/tests/e2e/dsmem_cluster.cu): a ring exchange and a histogram whose
   bins are spread across the cluster, both exact.
 
+- TMA reductions (sm_90): `cp.reduce.async.bulk` in all three forms -- a
+  tensor box into global memory (what CuTe's `SM90_TMA_REDUCE_ADD` emits), a
+  plain range into global memory, and a plain range into another block's
+  shared memory completing on its mbarrier -- with every operation and type
+  the ISA's tables allow (9.7.10.28.4.2, 9.7.10.28.5.4) and the others
+  refused by name. Each element is an atomic read-modify-write, as the ISA
+  makes it; floating-point add rounds to nearest even and keeps subnormals
+  (`.noftz`, required for halves and the default for floats); min and max
+  of a NaN give the other operand. The tensor form takes its element type
+  from the map and, like a tensor store, leaves elements past the tensor's
+  edge alone. A reduction is made when issued -- one of the moments the
+  asynchronous proxy allows -- so, as for bulk stores, a kernel that
+  overwrites its source before `wait_group.read` is not caught. Checked by
+  unit tests over the values that separate a right reduction from a
+  plausible one (a wrapping add, a signed min against INT_MIN, half ties to
+  even and subnormals, inc's wrap, a 64-bit xor; each confirmed to fail with
+  the arithmetic broken), and by a CuTe program (tma_reduce_cute.cu) in
+  which several blocks reduce into the same tiles, f32 through a 128B
+  swizzle and f16 unswizzled, exact with one host thread and with eight. It
+  fails on main.
+
 ## Not implemented (fails loudly, never silently)
 
 This list was stale for a while, which is its own kind of wrong: it still named
@@ -759,7 +780,7 @@ what is done.
 - PTX, refused by name: TMA's im2col mode, gather/scatter, attribute
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle with 32B/64B atoms
-  (Blackwell), `cp.reduce.async.bulk`, `tensormap.replace`, the sparse and
+  (Blackwell), `tensormap.replace`, the sparse and
   single-bit `wgmma` forms, and inline-asm-only instructions. (`wgmma`, TMA,
   the mbarrier transaction counts, `barrier.cluster` and distributed shared
   memory are done -- see "Hopper's warpgroup MMA", "TMA and clusters" and
@@ -1014,5 +1035,6 @@ scripts/run-pantheon-workloads.sh.
 
    `wgmma`, TMA and distributed shared memory are done now (see "Hopper's
    warpgroup MMA", "TMA and clusters" and "Distributed shared memory"). What
-   is left of Hopper is `cp.reduce.async.bulk`, `tensormap.replace` and TMA's
-   im2col and gather modes, each refused by name.
+   is left of Hopper is `tensormap.replace` and TMA's im2col and gather
+   modes, each refused by name. (`cp.reduce.async.bulk` is done -- see "TMA
+   reductions".)

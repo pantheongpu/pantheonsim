@@ -790,6 +790,158 @@ DONE:
   VCHECK_EQ(mem.load_scalar(g + uint64_t(W) * H * 4, 4), uint64_t{0xEEEEEEEEu});
 }
 
+// cp.reduce.async.bulk.tensor, as CUTLASS's SM90_TMA_REDUCE_ADD emits it: two
+// blocks add their f32 tiles into the same box, and the elements past the
+// tensor's edge are left alone. The adds are exact, so the order the blocks
+// run in cannot change the answer, and none of either block's is lost.
+VTEST(tensor_reduce_adds_into_the_box_and_only_inside_the_tensor) {
+  constexpr int W = 24, H = 6;
+  MemoryManager mem{1 << 20};
+  const uint64_t g = mem.alloc(size_t(W) * H * 4 + 256);
+  for (int i = 0; i < W * H + 64; ++i) mem.store_scalar(g + uint64_t(i) * 4, 4, f32_bits(0.5f));
+  exec::TensorMap t;
+  t.address = g;
+  t.rank = 2;
+  t.type = exec::TmapType::F32;
+  t.dim = {W, H, 1, 1, 1};
+  t.stride = {4, W * 4, 0, 0, 0};
+  t.box = {16, 4, 1, 1, 1};
+  t.elem_stride = {1, 1, 1, 1, 1};
+  run(R"(
+.visible .entry k(.param .align 64 .b8 tmap[128])
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<4>;
+    .shared .align 128 .b8 tile[256];
+    mov.b64 %rd1, tmap;
+    cvta.param.u64 %rd2, %rd1;
+    mov.u32 %r1, tile;
+    mov.u32 %r2, %tid.x;
+    shl.b32 %r3, %r2, 2;
+    add.u32 %r4, %r1, %r3;
+    cvt.rn.f32.u32 %f1, %r2;
+    add.f32 %f1, %f1, 0f3E800000;
+    st.shared.f32 [%r4], %f1;
+    bar.sync 0;
+    setp.ne.u32 %p1, %r2, 0;
+    @%p1 bra DONE;
+    mov.u32 %r6, 16;
+    mov.u32 %r7, 4;
+    fence.proxy.async.shared::cta;
+    cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group [%rd2, {%r6, %r7}], [%r1];
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group.read 0;
+DONE:
+    ret;
+}
+)", [] { LaunchConfig c; c.grid = {2, 1, 1}; c.block = {64, 1, 1}; return c; }(),
+      {tmap_arg(t)}, mem);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      const bool in_box = x >= 16 && y >= 4;
+      const float want = in_box ? 0.5f + 2.0f * (float((y - 4) * 16 + (x - 16)) + 0.25f) : 0.5f;
+      VCHECK_EQ(mem.load_scalar(g + (uint64_t(y) * W + x) * 4, 4), uint64_t{f32_bits(want)});
+    }
+  VCHECK_EQ(mem.load_scalar(g + uint64_t(W) * H * 4, 4), uint64_t{f32_bits(0.5f)});
+}
+
+// The plain form into global memory, one operation and type at a time, over
+// the values that separate a right reduction from a plausible one: an
+// unsigned add that wraps, a signed min against INT_MIN, a half-precision
+// add that keeps subnormals (.noftz) and rounds ties to even, inc's wrap to
+// zero, and a 64-bit xor.
+VTEST(bulk_reduce_into_global_memory_per_operation) {
+  MemoryManager mem{1 << 20};
+  const uint64_t g = mem.alloc(5 * 16);
+  const uint32_t add_g[4] = {1, 2, 3, 0xFFFFFFFFu}, add_s[4] = {10, 20, 30, 1};
+  const uint32_t min_g[4] = {5, uint32_t(-5), 7, 0}, min_s[4] = {uint32_t(-1), 3, 7, 0x80000000u};
+  const uint16_t h_g[8] = {0x0001, 0x3C00, 0x3C00, 0x3C00, 0x3C01, 0, 0x8001, 0x7C00};
+  const uint16_t h_s[8] = {0x0001, 0x3800, 0x1400, 0x1000, 0x1000, 0, 0x8001, 0x3C00};
+  const uint32_t inc_g[4] = {0, 5, 9, 3}, inc_s[4] = {10, 5, 9, 2};
+  const uint64_t x_g[2] = {0xF0F0F0F0F0F0F0F0ull, 1}, x_s[2] = {0xFFFFFFFF00000000ull, 3};
+  std::vector<uint8_t> src(5 * 16);
+  std::memcpy(src.data(), add_s, 16);
+  std::memcpy(src.data() + 16, min_s, 16);
+  std::memcpy(src.data() + 32, h_s, 16);
+  std::memcpy(src.data() + 48, inc_s, 16);
+  std::memcpy(src.data() + 64, x_s, 16);
+  mem.write(g, add_g, 16);
+  mem.write(g + 16, min_g, 16);
+  mem.write(g + 32, h_g, 16);
+  mem.write(g + 48, inc_g, 16);
+  mem.write(g + 64, x_g, 16);
+  const uint64_t s = mem.alloc(5 * 16);
+  mem.write(s, src.data(), src.size());
+  run(R"(
+.visible .entry k(.param .u64 g, .param .u64 s)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .shared .align 16 .b8 buf[80];
+    ld.param.u64 %rd1, [g];
+    ld.param.u64 %rd2, [s];
+    mov.u32 %r1, buf;
+    mov.u32 %r2, %tid.x;
+    shl.b32 %r3, %r2, 2;
+    cvt.u64.u32 %rd3, %r3;
+    add.u64 %rd4, %rd2, %rd3;
+    ld.global.u32 %r4, [%rd4];
+    add.u32 %r5, %r1, %r3;
+    st.shared.u32 [%r5], %r4;
+    bar.sync 0;
+    setp.ne.u32 %p1, %r2, 0;
+    @%p1 bra DONE;
+    fence.proxy.async.shared::cta;
+    cp.reduce.async.bulk.global.shared::cta.bulk_group.add.u32 [%rd1], [%r1], 16;
+    cp.reduce.async.bulk.global.shared::cta.bulk_group.min.s32 [%rd1+16], [%r1+16], 16;
+    cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.f16 [%rd1+32], [%r1+32], 16;
+    cp.reduce.async.bulk.global.shared::cta.bulk_group.inc.u32 [%rd1+48], [%r1+48], 16;
+    cp.reduce.async.bulk.global.shared::cta.bulk_group.L2::cache_hint.xor.b64 [%rd1+64], [%r1+64], 16, %rd2;
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group 0;
+DONE:
+    ret;
+}
+)", [] { LaunchConfig c; c.block = {20, 1, 1}; return c; }(), {arg_u64(g), arg_u64(s)}, mem);
+  const uint32_t add_w[4] = {11, 22, 33, 0};
+  const uint32_t min_w[4] = {uint32_t(-1), uint32_t(-5), 7, 0x80000000u};
+  // 2^-24 + 2^-24; 1 + 0.5; 1 + 2^-10 exactly; 1 + 2^-11 ties to even (1);
+  // (1 + 2^-10) + 2^-11 ties to even (1 + 2^-9); 0 + 0; two negative
+  // subnormals; infinity + 1.
+  const uint16_t h_w[8] = {0x0002, 0x3E00, 0x3C01, 0x3C00, 0x3C02, 0, 0x8002, 0x7C00};
+  const uint32_t inc_w[4] = {1, 0, 0, 0};
+  const uint64_t x_w[2] = {0x0F0F0F0FF0F0F0F0ull, 2};
+  for (int i = 0; i < 4; ++i) {
+    VCHECK_EQ(mem.load_scalar(g + i * 4, 4), uint64_t{add_w[i]});
+    VCHECK_EQ(mem.load_scalar(g + 16 + i * 4, 4), uint64_t{min_w[i]});
+    VCHECK_EQ(mem.load_scalar(g + 48 + i * 4, 4), uint64_t{inc_w[i]});
+  }
+  for (int i = 0; i < 8; ++i) VCHECK_EQ(mem.load_scalar(g + 32 + i * 2, 2), uint64_t{h_w[i]});
+  for (int i = 0; i < 2; ++i) VCHECK_EQ(mem.load_scalar(g + 64 + i * 8, 8), x_w[i]);
+}
+
+VTEST(bulk_reduce_forms_the_isa_does_not_define_are_refused) {
+  auto refusal = [](const std::string& line) -> std::string {
+    try {
+      ptx::parse(std::string(kHeader90a) + ".visible .entry k()\n{\n    .reg .b32 %r<4>;\n"
+                 "    .reg .b64 %rd<4>;\n    " + line + "\n    ret;\n}\n");
+    } catch (const Error& e) {
+      return e.message();
+    }
+    return "";
+  };
+  VCHECK_CONTAINS(refusal("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f16 [%rd1], [%r1], 16;"),
+                  "requires .noftz");
+  VCHECK_CONTAINS(refusal("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.s64 [%rd1], [%r1], 16;"),
+                  "no .s64 form");
+  VCHECK_CONTAINS(refusal("cp.reduce.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes"
+                          ".min.u64 [%r1], [%r2], 16, [%r3];"),
+                  "no .u64 form");
+}
+
 VTEST(tensor_copy_refuses_a_map_nothing_encoded) {
   MemoryManager mem{1 << 20};
   std::vector<uint8_t> junk(128, 0x5A);
