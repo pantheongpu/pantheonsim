@@ -178,6 +178,7 @@ class Parser {
           next();
           m.target += "," + expect_word("target option");
         }
+        target_ = m.target;
         continue;
       }
       if (t.text == ".address_size") {
@@ -1192,6 +1193,9 @@ class Parser {
 
   // ---- instructions ----
 
+  // The module's .target line, for the instructions only one target has.
+  std::string target_;
+
   Instr parse_instruction(const EntryFn& fn, std::vector<std::pair<size_t, std::string>>& bra_fixups) {
     Instr ins;
     size_t start_tok = pos_;
@@ -1786,6 +1790,148 @@ class Parser {
       op.c = parse_reg_vector_any();
       if (op.d.size() != op.c.size()) return unsupported("mma D and C arity differ");
       ins.op = op;
+    } else if (op0 == "wgmma") {
+      // wgmma.fence.sync.aligned;  wgmma.commit_group.sync.aligned;
+      // wgmma.wait_group.sync.aligned N;
+      // wgmma.mma_async.sync.aligned.m64nNkK.<dtype>.<atype>.<btype>[.satfinite]
+      //     d, a-desc|{a}, b-desc, scale-d[, imm-scale-a, imm-scale-b[, imm-trans-a], imm-trans-b];
+      if (parts.size() < 2) return unsupported("wgmma form");
+      // Arch-specific: sm_90a and nothing else, not sm_90 and not Blackwell
+      // (which replaced it with tcgen05). ptxas refuses it anywhere else, so
+      // a module that uses it under another target is not a real program.
+      if (target_.rfind("sm_90a", 0) != 0)
+        fail(ins.line, "wgmma requires .target sm_90a; this module targets " +
+                           (target_.empty() ? std::string("nothing") : target_));
+      OpWgmma op;
+      const std::string& what = parts[1];
+      if (what == "fence") op.kind = WgmmaKind::Fence;
+      else if (what == "commit_group") op.kind = WgmmaKind::Commit;
+      else if (what == "wait_group") op.kind = WgmmaKind::Wait;
+      else if (what == "mma_async") op.kind = WgmmaKind::Mma;
+      else return unsupported("wgmma." + what);
+      std::vector<std::string> types;
+      bool shape = false;
+      for (size_t i = 2; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        unsigned mm = 0, nn = 0, kk = 0;
+        char tail = 0;
+        if (p == "sync" || p == "aligned") ;
+        else if (p == "satfinite") op.satfinite = true;
+        else if (p == "sp") return unsupported("wgmma.mma_async.sp (sparse A)");
+        else if (std::sscanf(p.c_str(), "m%un%uk%u%c", &mm, &nn, &kk, &tail) == 3) {
+          if (mm != 64 || nn == 0 || nn > 256 || nn % 8 != 0)
+            return unsupported("wgmma shape '." + p + "'");
+          op.n = nn;
+          op.k = kk;
+          shape = true;
+        } else if (p == "f16" || p == "bf16" || p == "tf32" || p == "f32" || p == "s32" ||
+                   p == "e4m3" || p == "e5m2" || p == "s8" || p == "u8")
+          types.push_back(p);
+        else if (p == "b1" || p == "and" || p == "popc")
+          return unsupported("wgmma single-bit (.b1) forms");
+        else return unsupported("wgmma modifier '." + p + "'");
+      }
+      if (op.kind == WgmmaKind::Wait) {
+        const Operand n = parse_operand();
+        const auto* imm = std::get_if<ImmInt>(&n);
+        if (!imm || imm->value < 0) return unsupported("wgmma.wait_group needs a constant count");
+        op.wait_n = static_cast<uint32_t>(imm->value);
+      }
+      if (op.kind != WgmmaKind::Mma) {
+        ins.op = op;
+      } else {
+        if (!shape || types.size() != 3)
+          return unsupported("wgmma.mma_async needs .m64nNkK.<dtype>.<atype>.<btype>");
+        auto elem = [&](const std::string& t, WgmmaElem* out) {
+          if (t == "f16") *out = WgmmaElem::F16;
+          else if (t == "bf16") *out = WgmmaElem::BF16;
+          else if (t == "tf32") *out = WgmmaElem::TF32;
+          else if (t == "e4m3") *out = WgmmaElem::E4M3;
+          else if (t == "e5m2") *out = WgmmaElem::E5M2;
+          else if (t == "s8") *out = WgmmaElem::S8;
+          else if (t == "u8") *out = WgmmaElem::U8;
+          else return false;
+          return true;
+        };
+        if (!elem(types[1], &op.a_type) || !elem(types[2], &op.b_type))
+          return unsupported("wgmma multiplicand types ." + types[1] + "." + types[2]);
+        if (types[0] == "f16") op.d_type = WgmmaAcc::F16;
+        else if (types[0] == "f32") op.d_type = WgmmaAcc::F32;
+        else if (types[0] == "s32") op.d_type = WgmmaAcc::S32;
+        else return unsupported("wgmma accumulator type ." + types[0]);
+        // The combinations the ISA defines (9.7.17.3), and the K each implies.
+        const bool is16 = op.a_type == WgmmaElem::F16 || op.a_type == WgmmaElem::BF16;
+        const bool fp8 = op.a_type == WgmmaElem::E4M3 || op.a_type == WgmmaElem::E5M2;
+        const bool int8 = op.a_type == WgmmaElem::S8 || op.a_type == WgmmaElem::U8;
+        const bool b_fp8 = op.b_type == WgmmaElem::E4M3 || op.b_type == WgmmaElem::E5M2;
+        const bool b_int8 = op.b_type == WgmmaElem::S8 || op.b_type == WgmmaElem::U8;
+        bool ok = false;
+        uint32_t want_k = 0;
+        if (is16) {
+          ok = op.a_type == op.b_type &&
+               (op.d_type == WgmmaAcc::F32 || (op.a_type == WgmmaElem::F16 && op.d_type == WgmmaAcc::F16));
+          want_k = 16;
+        } else if (op.a_type == WgmmaElem::TF32) {
+          ok = op.b_type == WgmmaElem::TF32 && op.d_type == WgmmaAcc::F32;
+          want_k = 8;
+        } else if (fp8) {
+          ok = b_fp8 && op.d_type != WgmmaAcc::S32;
+          want_k = 32;
+        } else if (int8) {
+          ok = b_int8 && op.d_type == WgmmaAcc::S32;
+          want_k = 32;
+          // The integer shapes skip some N: 8, 16, 24, 32, then multiples of 16.
+          if (op.n > 32 && op.n % 16 != 0) ok = false;
+        }
+        if (!ok || op.k != want_k)
+          return unsupported("wgmma.mma_async." + types[0] + "." + types[1] + "." + types[2] +
+                             " with k" + std::to_string(op.k) + " is not a form the ISA defines");
+        if (op.satfinite && !int8) return unsupported("wgmma .satfinite outside the integer forms");
+        op.d = parse_reg_vector_any();
+        const size_t want_d = op.d_type == WgmmaAcc::F16 ? op.n / 4 : op.n / 2;
+        if (op.d.size() != want_d)
+          return unsupported("wgmma accumulator arity (expected " + std::to_string(want_d) + ")");
+        expect_punct(",");
+        if (peek_punct("{")) {
+          op.a_regs = true;
+          op.a = parse_reg_vector_any();
+          if (op.a.size() != 4) return unsupported("wgmma A fragment arity (expected 4)");
+        } else {
+          op.a_desc = parse_operand();
+        }
+        expect_punct(",");
+        op.b_desc = parse_operand();
+        expect_punct(",");
+        op.scale_d = parse_operand();
+        // The immediates that follow depend on the form: floats take the two
+        // negate flags, and the 16-bit forms add the transposes -- trans-b only
+        // when A is in registers, since a register fragment has no major-ness.
+        std::vector<int> imms;
+        while (peek_punct(",")) {
+          next();
+          const Operand o = parse_operand();
+          const auto* imm = std::get_if<ImmInt>(&o);
+          if (!imm) return unsupported("wgmma scale/transpose arguments must be immediates");
+          imms.push_back(static_cast<int>(imm->value));
+        }
+        const size_t want_imms = int8 ? 0u : (is16 ? (op.a_regs ? 3u : 4u) : 2u);
+        if (imms.size() != want_imms)
+          return unsupported("wgmma.mma_async takes " + std::to_string(want_imms) +
+                             " immediate arguments after scale-d in this form");
+        if (!int8) {
+          op.scale_a = imms[0];
+          op.scale_b = imms[1];
+          if ((op.scale_a != 1 && op.scale_a != -1) || (op.scale_b != 1 && op.scale_b != -1))
+            return unsupported("wgmma imm-scale-a/imm-scale-b must be 1 or -1");
+        }
+        if (is16) {
+          if (op.a_regs) op.trans_b = imms[2];
+          else { op.trans_a = imms[2]; op.trans_b = imms[3]; }
+          if ((op.trans_a != 0 && op.trans_a != 1) || (op.trans_b != 0 && op.trans_b != 1))
+            return unsupported("wgmma imm-trans-a/imm-trans-b must be 0 or 1");
+        }
+        ins.op = op;
+      }
     } else if (op0 == "redux") {
       // redux.sync.<op>.<type> d, a, membermask
       std::optional<ReduxOp> rop;
@@ -2636,6 +2782,13 @@ class Parser {
       ins.op = op;
     } else if (op0 == "trap") {
       ins.op = OpTrap{};
+    } else if (op0 == "brkpt") {
+      // Libraries put one on paths they consider unreachable (CuTe's invalid
+      // control path does), so refusing the whole kernel for containing it
+      // turned away programs that never execute it.
+      OpTrap op;
+      op.breakpoint = true;
+      ins.op = op;
     } else if (op0 == "tex") {
       // tex.<geom>[.level|.grad].v4.<dtype>.<ctype> {d,d,d,d}, [obj, {c,...}]
       uint32_t dims = 0;

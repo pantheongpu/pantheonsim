@@ -572,24 +572,13 @@ VGPU_EXPORT void** __cudaRegisterFatBinary(void* fatCubin) {
       }
       return text.substr(pos);
     };
-    // The PTX the driver would JIT for this device: the newest whose target
-    // it can run -- no newer than its compute capability -- as a fatbin built
-    // for many architectures (sm_75 ... sm_121) carries one per target. Only
-    // when none qualifies, the newest of all, which is then refused at load
-    // with the reason. (Every device of a simulated machine has one profile.)
+    // The PTX the driver would JIT for this device -- see pick_ptx for the
+    // rule. (Every device of a simulated machine has one profile.)
     const vgpu::DeviceProfile& dev = s.rt->device(0).profile();
     const uint32_t cc = static_cast<uint32_t>(dev.cc_major * 10 + dev.cc_minor);
     auto pick_best = [cc](std::vector<vgpu::cuda::FatbinPtx>& v) -> std::string {
       if (v.empty()) return {};
-      size_t best = v.size();
-      for (size_t i = 0; i < v.size(); ++i)
-        if (v[i].arch <= cc && (best == v.size() || v[i].arch > v[best].arch)) best = i;
-      if (best == v.size()) {
-        best = 0;
-        for (size_t i = 1; i < v.size(); ++i)
-          if (v[i].arch > v[best].arch) best = i;
-      }
-      return std::move(v[best].text);
+      return std::move(v[vgpu::cuda::pick_ptx(v, cc)].text);
     };
     auto ptxs = vgpu::cuda::extract_ptx(fatCubin);
     rm->ptx = pick_best(ptxs);

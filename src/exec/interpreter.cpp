@@ -821,7 +821,7 @@ class Interpreter {
       return InstClass::Memory;
 
     if (std::holds_alternative<OpMma>(ins.op) || std::holds_alternative<OpWmmaMma>(ins.op) ||
-        std::holds_alternative<OpMovMatrix>(ins.op))
+        std::holds_alternative<OpWgmma>(ins.op) || std::holds_alternative<OpMovMatrix>(ins.op))
       return InstClass::Tensor;
 
     return InstClass::Misc;
@@ -1970,6 +1970,11 @@ class Interpreter {
       exec_movmatrix(w, ctx, ins, *op, m);
       return;
     }
+    if (const auto* op = std::get_if<OpWgmma>(&ins.op)) {
+      require_warp32(ins, "wgmma");
+      exec_wgmma(w, ctx, ins, *op, m);
+      return;
+    }
     if (const auto* op = std::get_if<OpMma>(&ins.op)) {
       require_warp32(ins, "mma.sync");
       exec_mma(w, ctx, ins, *op, m);
@@ -2906,7 +2911,12 @@ class Interpreter {
       exec_sust(w, ctx, ins, *op, m);
       return;
     }
-    if (std::holds_alternative<OpTrap>(ins.op)) {
+    if (const auto* op = std::get_if<OpTrap>(&ins.op)) {
+      if (op->breakpoint)
+        ctx_fail(ins, -1, Err::Trap,
+                 "the kernel executed 'brkpt'. With no debugger attached nothing can resume it, so "
+                 "the launch ends with a device-side error; libraries place one on paths they "
+                 "consider unreachable");
       // "trap" ends the kernel with an unrecoverable device-side error. On
       // hardware the launch fails and the context is left unusable; here it is
       // an error with the line that did it, which is more use and no less true.
@@ -3569,6 +3579,228 @@ class Interpreter {
         }
       alu_fault(r, m, 32);
       write_reg(w, op.d[reg], m, r, 32);
+    }
+  }
+
+  // ---- Hopper warpgroup MMA (wgmma, sm_90a) ----
+  //
+  // Four consecutive warps form a warpgroup and compute one 64xNxK product,
+  // but the work divides exactly along M: warp r of the group holds rows
+  // 16r..16r+15 of A (when A is in registers) and of D, and every warp reads
+  // all of B (PTX ISA figures 151-158). So each warp computes its own sixteen
+  // rows when it reaches the instruction, and the group's result is the same
+  // as if all four had waited for each other.
+  //
+  // The product completes when it is issued. The ISA makes it asynchronous and
+  // leaves the accumulator undefined until wgmma.wait_group, and completing
+  // early is one of the orders that allows -- which also means a kernel that
+  // reads its accumulator before waiting is not caught here. fence,
+  // commit_group and wait_group have nothing left to order.
+
+  // A shared-memory matrix descriptor (PTX ISA 9.7.17.5.1.2.2).
+  struct WgmmaDesc {
+    uint64_t start = 0, lbo = 0, sbo = 0;
+    uint32_t swizzle = 0;   // bytes in a swizzled row: 0 (none), 32, 64 or 128
+  };
+
+  WgmmaDesc decode_wgmma_desc(const Instr& ins, uint64_t d) {
+    WgmmaDesc out;
+    out.start = (d & 0x3FFF) << 4;
+    out.lbo = ((d >> 16) & 0x3FFF) << 4;
+    out.sbo = ((d >> 32) & 0x3FFF) << 4;
+    static constexpr uint32_t kSwizzle[4] = {0, 128, 64, 32};
+    out.swizzle = kSwizzle[(d >> 62) & 3];
+    // The base offset says where a swizzle pattern starts when that is not
+    // the boundary the pattern repeats on. CUTLASS always leaves it zero and
+    // aligns its buffers instead, and the ISA does not say how a nonzero value
+    // moves the pattern; guessing would read plausible wrong matrices.
+    if (((d >> 49) & 7) != 0)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "a wgmma matrix descriptor with a nonzero base offset (bits 51-49); only "
+               "swizzle patterns that start on their repeat boundary are implemented");
+    return out;
+  }
+
+  // Shared-window offset of element (mn, k) of a matrix a descriptor
+  // describes: A is M x K and B is N x K, so `mn` is the row of A or the
+  // column of B. The strides are the canonical layouts of 9.7.17.5.1.2.1.3,
+  // written in bytes: a core matrix is 8 rows of 16 bytes, LBO and SBO step
+  // between core matrices, and a swizzled layout XORs address bits 4-6 with
+  // bits 7-9 (Swizzle<3,4,3> for 128B; 64B and 32B keep fewer of them), the
+  // same function of the address a TMA copy applies when it writes the tile.
+  static uint64_t wgmma_smem_offset(const WgmmaDesc& d, bool k_major, uint32_t eb, uint32_t mn,
+                                    uint32_t k) {
+    const uint64_t W = d.swizzle;
+    uint64_t off;
+    if (k_major) {
+      const uint64_t kb = uint64_t{k} * eb;
+      off = W ? (mn % 8) * W + (mn / 8) * d.sbo + kb
+              : (mn % 8) * 16 + (mn / 8) * d.sbo + kb % 16 + (kb / 16) * d.lbo;
+    } else {
+      const uint64_t mb = uint64_t{mn} * eb;
+      off = W ? mb % W + (mb / W) * d.lbo + (k % 8) * W + (k / 8) * d.sbo
+              : mb % 16 + (mb / 16) * d.sbo + (k % 8) * 16 + (k / 8) * d.lbo;
+    }
+    uint64_t addr = d.start + off;
+    if (W) addr ^= ((addr >> 7) & (W / 16 - 1)) << 4;
+    return addr;
+  }
+
+  static uint32_t wgmma_elem_bytes(WgmmaElem t) {
+    switch (t) {
+      case WgmmaElem::F16:
+      case WgmmaElem::BF16: return 2;
+      case WgmmaElem::TF32: return 4;
+      default: return 1;
+    }
+  }
+
+  static double wgmma_decode(WgmmaElem t, uint64_t bits) {
+    switch (t) {
+      case WgmmaElem::F16: return f16_to_double(bits & 0xFFFF);
+      case WgmmaElem::BF16: return bf16_to_double(bits & 0xFFFF);
+      // "wgmma.mma_async operation involving type .tf32 will truncate lower
+      // 13 bits of the 32-bit input data before multiplication is issued."
+      case WgmmaElem::TF32: return static_cast<double>(f32(bits & 0xFFFFE000u));
+      case WgmmaElem::E4M3: return fp8_to_double(bits & 0xFF, kE4M3);
+      case WgmmaElem::E5M2: return fp8_to_double(bits & 0xFF, kE5M2);
+      case WgmmaElem::S8: return static_cast<double>(static_cast<int8_t>(bits & 0xFF));
+      case WgmmaElem::U8: return static_cast<double>(bits & 0xFF);
+    }
+    return 0.0;
+  }
+
+  void exec_wgmma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWgmma& op, Mask m) {
+    // Every form is .sync.aligned: the whole warp, and the whole warpgroup,
+    // executes it together.
+    const uint32_t linear0 = w.tid_x[0] + w.tid_y[0] * ctx.ntid[0] +
+                             w.tid_z[0] * ctx.ntid[0] * ctx.ntid[1];
+    const uint32_t warp_index = linear0 / W_;
+    const uint32_t block_threads = ctx.ntid[0] * ctx.ntid[1] * ctx.ntid[2];
+    if ((warp_index / 4 + 1) * 4 * W_ > block_threads)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "wgmma needs a whole warpgroup -- four warps, warp ranks 4i..4i+3 -- and this "
+               "block of " + std::to_string(block_threads) + " threads has no warp " +
+                   std::to_string((warp_index / 4) * 4 + 3));
+    if (m != all_)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "wgmma is .sync.aligned: every thread of the warpgroup must execute it, and this "
+               "warp reached it with some lanes inactive or predicated off");
+    if (op.kind != WgmmaKind::Mma) return;
+
+    const uint32_t N = op.n, K = op.k;
+    const uint32_t row0 = (warp_index % 4) * 16;   // this warp's rows of A and D
+    const uint32_t ea = wgmma_elem_bytes(op.a_type), eb = wgmma_elem_bytes(op.b_type);
+    const bool int_form = op.d_type == WgmmaAcc::S32;
+    const double sa = op.scale_a, sb = op.scale_b;
+
+    // A, this warp's 16 x K slice.
+    std::array<double, 16 * 32> A{};
+    if (op.a_regs) {
+      // The same fragment an mma.m16n8kK A operand uses (figures 151, 153, 155):
+      // lane (g, t) holds rows g and g+8, and the register index picks the row
+      // half and the column block.
+      const uint32_t per_reg = 4 / ea;
+      for (uint32_t reg = 0; reg < 4; ++reg) {
+        Lanes _s;
+        const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s);
+        for (uint32_t lane = 0; lane < W_; ++lane) {
+          const uint32_t g = lane / 4, t = lane % 4;
+          const uint32_t row = g + (reg % 2) * 8;
+          const uint32_t col0 = t * per_reg + (reg / 2) * (per_reg * 4);
+          for (uint32_t e = 0; e < per_reg; ++e)
+            A[row * K + col0 + e] =
+                sa * wgmma_decode(op.a_type, v[lane] >> (8 * ea * e));
+        }
+      }
+    } else {
+      Lanes _s;
+      const Lanes& dv = read_operand(w, ctx, ins, op.a_desc, _s);
+      const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
+      for (uint32_t r = 0; r < 16; ++r)
+        for (uint32_t k = 0; k < K; ++k) {
+          const uint64_t at = wgmma_smem_offset(d, op.trans_a == 0, ea, row0 + r, k);
+          A[r * K + k] = sa * wgmma_decode(op.a_type, load_routed(w, ctx, ins, 0, kSharedVaBase + at, ea));
+        }
+    }
+    // B, all of it: K x N, read as N rows of K.
+    std::vector<double>& B = wgmma_b_;
+    B.assign(size_t{K} * N, 0.0);
+    {
+      Lanes _s;
+      const Lanes& dv = read_operand(w, ctx, ins, op.b_desc, _s);
+      const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
+      for (uint32_t n = 0; n < N; ++n)
+        for (uint32_t k = 0; k < K; ++k) {
+          const uint64_t at = wgmma_smem_offset(d, op.trans_b == 0, eb, n, k);
+          B[size_t{k} * N + n] =
+              sb * wgmma_decode(op.b_type, load_routed(w, ctx, ins, 0, kSharedVaBase + at, eb));
+        }
+    }
+    // scale-d: false means D = A*B, per the ISA. Read per lane; a kernel
+    // passes a uniform value, and per lane is what that value means for the
+    // accumulator elements each lane owns.
+    Mask keep_d = all_;
+    if (const auto* imm = std::get_if<ImmInt>(&op.scale_d)) {
+      keep_d = imm->value ? all_ : 0;
+    } else if (const auto* r = std::get_if<RegOperand>(&op.scale_d)) {
+      keep_d = read_pred(w, ins, r->reg);
+    } else {
+      ctx_fail(ins, -1, Err::UnsupportedPtx, "wgmma scale-d must be a predicate or 0/1");
+    }
+
+    // Accumulator element e of a lane: rows g and g+8, two adjacent columns,
+    // repeated across N in blocks of eight (figures 152, 154, 156).
+    auto d_pos = [](uint32_t lane, uint32_t e, uint32_t* row, uint32_t* col) {
+      const uint32_t g = lane / 4, t = lane % 4, j = e / 4, s = e % 4;
+      *row = g + 8 * (s / 2);
+      *col = 8 * j + 2 * t + (s % 2);
+    };
+    const bool f16_acc = op.d_type == WgmmaAcc::F16;
+    const uint32_t elems = N / 2;   // accumulator elements per lane
+    std::vector<Lanes> out(op.d.size());
+    for (uint32_t reg = 0; reg < op.d.size(); ++reg) {
+      Lanes _s;
+      out[reg] = read_operand(w, ctx, ins, Operand{RegOperand{op.d[reg]}}, _s);
+    }
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      const bool accumulate = keep_d & (Mask{1} << lane);
+      for (uint32_t e = 0; e < elems; ++e) {
+        uint32_t row, col;
+        d_pos(lane, e, &row, &col);
+        uint64_t& slot = out[f16_acc ? e / 2 : e][lane];
+        if (int_form) {
+          int64_t acc = accumulate ? static_cast<int32_t>(slot) : 0;
+          for (uint32_t k = 0; k < K; ++k)
+            acc += static_cast<int64_t>(A[row * K + k]) *
+                   static_cast<int64_t>(B[size_t{k} * N + col]);
+          if (op.satfinite)
+            acc = std::clamp<int64_t>(acc, std::numeric_limits<int32_t>::min(),
+                                      std::numeric_limits<int32_t>::max());
+          slot = static_cast<uint32_t>(static_cast<int32_t>(acc));
+          continue;
+        }
+        const uint32_t shift = f16_acc ? 16 * (e % 2) : 0;
+        float acc = 0.0f;
+        if (accumulate)
+          acc = f16_acc ? static_cast<float>(f16_to_double((slot >> shift) & 0xFFFF))
+                        : f32(slot);
+        // Products of every input type here are exact in f32, and the sum is
+        // kept in f32 -- "at least single precision" for an f32 accumulator,
+        // and more than the half precision an f16 one promises.
+        for (uint32_t k = 0; k < K; ++k)
+          acc += static_cast<float>(A[row * K + k]) * static_cast<float>(B[size_t{k} * N + col]);
+        if (f16_acc) {
+          const uint64_t h = double_to_f16(acc) & 0xFFFF;
+          slot = (slot & ~(uint64_t{0xFFFF} << shift) & 0xFFFFFFFFu) | (h << shift);
+        } else {
+          slot = f32bits(acc);
+        }
+      }
+    }
+    for (uint32_t reg = 0; reg < op.d.size(); ++reg) {
+      if (!int_form) alu_fault(out[reg], m, 32);
+      write_reg(w, op.d[reg], m, out[reg], 32);
     }
   }
 
@@ -5069,6 +5301,9 @@ class Interpreter {
   // of variant tests, and the instruction stream is the hottest path there is.
   mutable std::vector<uint8_t> class_by_pc_;
   uint32_t cur_warp_ = 0;     // which warp of the block is running, for race reports
+  // B of the wgmma being executed, kept across instructions so a 64x256 tile
+  // does not allocate on every one. An interpreter runs on one thread.
+  std::vector<double> wgmma_b_;
   // %gridid: a serial number distinguishing this launch from every other one in
   // the process. Assigned once per launch rather than per interpreter, so the
   // workers of one launch agree.

@@ -269,6 +269,28 @@ struct OpMma {
   bool acc_int = false;     // s32 accumulate
   std::vector<Reg> d, a, b, c;
 };
+// Hopper's warpgroup MMA (sm_90a): wgmma.fence, .commit_group, .wait_group
+// and .mma_async. Four warps compute one 64xNxK product; A comes from
+// registers or, like B always does, from shared memory through a 64-bit
+// matrix descriptor (PTX ISA 9.7.17.5.1.2.2).
+enum class WgmmaKind { Fence, Commit, Wait, Mma };
+enum class WgmmaElem { F16, BF16, TF32, E4M3, E5M2, S8, U8 };
+enum class WgmmaAcc { F16, F32, S32 };
+struct OpWgmma {
+  WgmmaKind kind = WgmmaKind::Mma;
+  uint32_t wait_n = 0;       // wait_group's operand
+  uint32_t n = 8, k = 16;    // m is always 64
+  WgmmaElem a_type = WgmmaElem::F16, b_type = WgmmaElem::F16;
+  WgmmaAcc d_type = WgmmaAcc::F32;
+  bool satfinite = false;    // integer only: clamp instead of wrap
+  std::vector<Reg> d;        // accumulator in and result out
+  bool a_regs = false;       // A from registers rather than a descriptor
+  std::vector<Reg> a;        // four registers when a_regs
+  Operand a_desc, b_desc;
+  Operand scale_d;           // predicate (or 0/1): false means D = A*B
+  int scale_a = 1, scale_b = 1;   // -1 negates, float forms only
+  int trans_a = 0, trans_b = 0;   // 1 selects M-/N-major, 16-bit forms only
+};
 // mov.pred d, {0|1|%p} -- set a predicate from an immediate or copy another.
 // Predicates live in their own register file, so this cannot go through the
 // ordinary mov path that writes a 32/64-bit value.
@@ -506,8 +528,10 @@ struct OpFence {};
 struct OpActiveMask { Reg dst; };
 // trap aborts the launch. CUDA reports it as an unspecified launch failure,
 // and a kernel that reaches it has detected something it cannot continue past,
-// so it must not be silently skipped.
-struct OpTrap {};
+// so it must not be silently skipped. brkpt is the same instruction as far as
+// a launch with no debugger attached is concerned: execution cannot continue
+// past it, so it ends the kernel with the same kind of error, named as itself.
+struct OpTrap { bool breakpoint = false; };
 
 // Texture and surface access. The object is a 64-bit handle the host created,
 // passed in as an ordinary kernel parameter; everything else about the fetch
@@ -603,7 +627,7 @@ struct OpCall {
 };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpStMatrix, OpMma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask>;
 

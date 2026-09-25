@@ -1,6 +1,8 @@
 // Tests for the runtime facade: devices, modules, function lookup.
 #include "vgpu/runtime/runtime.hpp"
 
+#include <string>
+
 #include "vgpu/error.hpp"
 #include "vgpu/registry.hpp"
 #include "vtest.hpp"
@@ -33,15 +35,34 @@ VTEST(module_lifecycle_and_lookup) {
 
 VTEST(unsupported_ptx_error_names_profile) {
   runtime::Runtime rt(load_gpu("nvidia/b200"));
-  // Any instruction outside the implemented subset will do; wgmma is Hopper's
-  // warpgroup matrix multiply, which this does not implement. cp.async used to
-  // stand here and had to be replaced once it was implemented -- an example of
-  // something unsupported has to actually still be unsupported.
+  // Any instruction outside the implemented subset will do; tcgen05 is
+  // Blackwell's tensor-core family, which this does not implement. cp.async
+  // and then wgmma used to stand here and each had to be replaced once it was
+  // implemented -- an example of something unsupported has to actually still
+  // be unsupported.
   auto err = VCAPTURE(Error, rt.device(0).load_module(
-                                 ".version 8.3\n.target sm_100\n.address_size 64\n"
-                                 ".visible .entry k() { wgmma.fence.sync.aligned; ret; }\n"));
+                                 ".version 8.7\n.target sm_100a\n.address_size 64\n"
+                                 ".visible .entry k() { tcgen05.fence::before_thread_sync; ret; }\n"));
   VCHECK(err.code() == Err::UnsupportedPtx);
   VCHECK_CONTAINS(err.what(), "GPU profile: nvidia/b200");
+}
+
+// sm_90a code runs on compute capability 9.0 and nowhere else -- not on a
+// newer Blackwell, which forward compatibility would otherwise allow -- and
+// family code (sm_100f) within its major version only.
+VTEST(arch_specific_targets_load_only_where_they_run) {
+  const std::string body = "\n.address_size 64\n.visible .entry k() { ret; }\n";
+  runtime::Runtime h100(load_gpu("nvidia/h100"));
+  runtime::Runtime b200(load_gpu("nvidia/b200"));
+  (void)h100.device(0).load_module(".version 8.3\n.target sm_90a" + body);
+  (void)b200.device(0).load_module(".version 8.3\n.target sm_90" + body);   // plain: forward
+  auto err = VCAPTURE(Error, b200.device(0).load_module(".version 8.3\n.target sm_90a" + body));
+  VCHECK(err.code() == Err::PtxParse);
+  VCHECK_CONTAINS(err.what(), "specific to compute capability 9.0");
+  (void)b200.device(0).load_module(".version 8.8\n.target sm_100f" + body);
+  (void)b200.device(0).load_module(".version 8.7\n.target sm_100a" + body);
+  auto err2 = VCAPTURE(Error, h100.device(0).load_module(".version 8.8\n.target sm_100f" + body));
+  VCHECK(err2.code() == Err::PtxParse);   // newer than the device, the plain rule
 }
 
 VTEST(devices_have_independent_memory) {

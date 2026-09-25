@@ -234,10 +234,7 @@ uintptr_t check_handle(uintptr_t h, uintptr_t tag, const char* what) {
   return h;
 }
 
-// Picks the PTX image the driver would JIT: the newest whose target the
-// device can run -- no newer than its compute capability -- since a fatbin
-// built for many architectures carries one per target. Only when none
-// qualifies, the newest of all, which the load then refuses with the reason.
+// Picks the PTX image the driver would JIT -- see pick_ptx for the rule.
 std::string best_ptx(const void* image) {
   auto ptxs = vgpu::cuda::extract_ptx(image);
   if (ptxs.empty())
@@ -250,15 +247,7 @@ std::string best_ptx(const void* image) {
     const vgpu::DeviceProfile& p = s.rt->device(0).profile();
     cc = static_cast<uint32_t>(p.cc_major * 10 + p.cc_minor);
   }
-  size_t best = ptxs.size();
-  for (size_t i = 0; i < ptxs.size(); ++i)
-    if (ptxs[i].arch <= cc && (best == ptxs.size() || ptxs[i].arch > ptxs[best].arch)) best = i;
-  if (best == ptxs.size()) {
-    best = 0;
-    for (size_t i = 1; i < ptxs.size(); ++i)
-      if (ptxs[i].arch > ptxs[best].arch) best = i;
-  }
-  return std::move(ptxs[best].text);
+  return std::move(ptxs[vgpu::cuda::pick_ptx(ptxs, cc)].text);
 }
 
 // Attribute values beyond the profile-backed set.

@@ -589,6 +589,8 @@ target_compile_definitions(test_exec PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR
 vgpu_unit_test(test_runtime)
 vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
+# Hopper (sm_90a): the warpgroup MMA, against the ISA's own layout examples.
+vgpu_unit_test(test_hopper)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
@@ -1093,6 +1095,17 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
+endif()
+
+# wgmma: Hopper's warpgroup MMA, checked against CuTe's layouts and descriptors
+# across every swizzle mode and element type. Fetches a pinned CUTLASS release
+# (headers only) into the build directory unless CUTLASS_DIR names one.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_wgmma_cute COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wgmma_cute.sh)
+  set_tests_properties(e2e_wgmma_cute PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 900)
 endif()
 
 # stmatrix: where the warp's registers land in shared memory, and that it is the

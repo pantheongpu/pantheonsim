@@ -266,4 +266,56 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
   return out;
 }
 
+// The ".target sm_XY[a|f]" line of a PTX image: the number, and the suffix
+// ('a', 'f' or 0). Images without one read as their header's arch, plain.
+static void ptx_target(const FatbinPtx& p, uint32_t* arch, char* suffix) {
+  *arch = p.arch;
+  *suffix = 0;
+  const size_t at = p.text.find(".target");
+  if (at == std::string::npos) return;
+  const size_t sm = p.text.find("sm_", at);
+  const size_t eol = p.text.find('\n', at);
+  if (sm == std::string::npos || (eol != std::string::npos && sm > eol)) return;
+  size_t i = sm + 3;
+  uint32_t n = 0;
+  bool digits = false;
+  while (i < p.text.size() && p.text[i] >= '0' && p.text[i] <= '9') {
+    n = n * 10 + static_cast<uint32_t>(p.text[i] - '0');
+    ++i;
+    digits = true;
+  }
+  if (!digits) return;
+  *arch = n;
+  if (i < p.text.size() && (p.text[i] == 'a' || p.text[i] == 'f')) *suffix = p.text[i];
+}
+
+size_t pick_ptx(const std::vector<FatbinPtx>& ptxs, uint32_t cc) {
+  if (ptxs.empty()) return 0;
+  auto specificity = [](char s) { return s == 'a' ? 2 : s == 'f' ? 1 : 0; };
+  size_t best = ptxs.size();
+  uint32_t best_arch = 0;
+  char best_suffix = 0;
+  for (size_t i = 0; i < ptxs.size(); ++i) {
+    uint32_t arch;
+    char suffix;
+    ptx_target(ptxs[i], &arch, &suffix);
+    const bool runs = suffix == 'a'   ? arch == cc
+                      : suffix == 'f' ? (arch / 10 == cc / 10 && arch <= cc)
+                                      : arch <= cc;
+    if (!runs) continue;
+    if (best == ptxs.size() || arch > best_arch ||
+        (arch == best_arch && specificity(suffix) > specificity(best_suffix))) {
+      best = i;
+      best_arch = arch;
+      best_suffix = suffix;
+    }
+  }
+  if (best == ptxs.size()) {
+    best = 0;
+    for (size_t i = 1; i < ptxs.size(); ++i)
+      if (ptxs[i].arch > ptxs[best].arch) best = i;
+  }
+  return best;
+}
+
 }  // namespace vgpu::cuda

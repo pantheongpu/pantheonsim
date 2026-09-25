@@ -614,6 +614,30 @@ narrows what counts as observable, not what the detector looks at.
   power-on values are kept in <vendor>/registers/gpus/ (`vgpu regs export`), and every
   simulated GPU of the model starts from them.
 
+- Hopper's warpgroup MMA (sm_90a): `wgmma.fence`, `.commit_group`,
+  `.wait_group` and `.mma_async` in every dense form the ISA defines -- f16
+  (f16 or f32 accumulator), bf16, tf32, e4m3/e5m2 in any pairing, s8/u8 in any
+  signedness with and without `.satfinite` -- for every N from 8 to 256, A from
+  registers or shared memory, B from shared memory, through the 64-bit matrix
+  descriptor with all four swizzle modes (none, 32B, 64B, 128B) and both
+  majornesses, the negate immediates and scale-d. Each warp of the warpgroup
+  computes its own sixteen rows, which is exact because the rows divide that
+  way (figures 151-158); the product completes when issued, one of the orders
+  the asynchronous model allows, so a kernel that reads its accumulator
+  before `wgmma.wait_group` is not caught. Checked two ways: unit tests lay
+  out shared memory from the ISA's worked examples (figures 169-173), and an
+  e2e test (nvidia/tests/e2e/wgmma_cute.cu) lets CuTe -- NVIDIA's own layout
+  code, from a pinned CUTLASS release -- build the tiles, descriptors and
+  fragments for seventeen configurations and compares every element exactly.
+  Refused by name: the sparse (`.sp`) and single-bit (`.b1`) forms, a
+  descriptor with a nonzero base offset (the ISA does not say how it moves the
+  pattern), and `wgmma` under any target but `.target sm_90a`. Loading now
+  follows the target suffixes: a fatbin's `sm_90a` PTX is preferred over its
+  `sm_90` one on a 9.0 device (nvcc -arch=sm_90a embeds both; only the first
+  has the arch-specific instructions), `sm_XYa` code loads only on exactly
+  X.Y, and `sm_XYf` within the family. `brkpt` parses and faults only if
+  reached (CuTe places one on an unreachable path).
+
 ## Not implemented (fails loudly, never silently)
 
 This list was stale for a while, which is its own kind of wrong: it still named
@@ -621,8 +645,9 @@ textures, grid sync and host-pinned memory long after all three worked. A
 roadmap that overstates what is missing misleads as much as one that overstates
 what is done.
 
-- PTX: `wgmma`, TMA (`cp.async.bulk`) and the cluster *memory* model,
-  inline-asm-only instructions. (`mbarrier` is done -- init, inval, arrive,
+- PTX: TMA (`cp.async.bulk`) and the cluster *memory* model,
+  inline-asm-only instructions. (`wgmma` is done -- see "Hopper's warpgroup
+  MMA" above. `mbarrier` is done -- init, inval, arrive,
   arrive_drop, test_wait, try_wait and pending_count, including the .parity
   form. Its transaction-counting modifiers, `expect_tx` and `complete_tx`, are
   refused by name: they exist to pair a barrier with a TMA copy, and with no
@@ -882,6 +907,5 @@ scripts/run-pantheon-workloads.sh.
    refused: mipmaps, layered and cubemap textures, sRGB, anisotropy, and the
    `.clamp`/`.zero` surface out-of-range policies. See nvidia/docs/textures.md.
 
-   `wgmma` is what is left, and it is not workload-driven yet: nothing in
-   llama.cpp or the pantheon suite uses it, and it needs TMA and mbarrier
-   alongside it to be worth having.
+   `wgmma` is done now (see "Hopper's warpgroup MMA"); TMA is what is left
+   of the Hopper data path.

@@ -78,6 +78,14 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
         if constexpr (requires { op.member_mask; }) use_operand(op.member_mask);
         if constexpr (requires { op.stride; }) use_operand(op.stride);
         if constexpr (requires { op.addr; }) use_addr(op.addr);
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpWgmma>) {
+          // The accumulator is read as well as written, and the descriptors
+          // and the scale-d predicate are ordinary sources.
+          for (const auto& r : op.d) uses.push_back(r.id);
+          use_operand(op.a_desc);
+          use_operand(op.b_desc);
+          use_operand(op.scale_d);
+        }
       },
       ins.op);
 }
