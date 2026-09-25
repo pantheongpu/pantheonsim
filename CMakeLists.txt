@@ -176,14 +176,16 @@ set_target_properties(vgpuhip PROPERTIES OUTPUT_NAME amdhip64 SOVERSION 6 VERSIO
 # program built by hipcc asks for hipMalloc@hip_4.2, not just hipMalloc.
 target_link_options(vgpuhip PRIVATE "-Wl,--version-script=${CMAKE_SOURCE_DIR}/amd/src/libamdhip64.map")
 set_target_properties(vgpuhip PROPERTIES LINK_DEPENDS "${CMAKE_SOURCE_DIR}/amd/src/libamdhip64.map")
-# ROCm 7 renamed the library libamdhip64.so.7; a program built with it asks for
-# that name, and the loader goes by the file name, so both point here.
+# ROCm 5 named the library libamdhip64.so.5 and ROCm 7 renamed it
+# libamdhip64.so.7; a program built with either asks for that name, and the
+# loader goes by the file name, so all three point here.
 add_custom_command(TARGET vgpuhip POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.5"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.6"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.7"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so"
-  COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7)")
+  COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.5, .so.6 and .so.7)")
 # How fast the CDNA interpreter runs a kernel (amd/tools/exec-bench.cpp).
 add_executable(amd_exec_bench amd/tools/exec-bench.cpp)
 target_link_libraries(amd_exec_bench PRIVATE vgpu)
@@ -746,6 +748,10 @@ set_tests_properties(amd_hip PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_rocblas_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas_disasm.sh)
 set_tests_properties(amd_rocblas_disasm PROPERTIES DEPENDS test_amd_gcn
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# Programs built by every ROCm release from 5.7 to 7.1, run on the shim.
+add_test(NAME amd_rocm_versions COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocm_versions.sh)
+set_tests_properties(amd_rocm_versions PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 # AMD's rocBLAS, unmodified, where ROCm with rocBLAS is installed.
 add_test(NAME amd_rocblas COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas.sh)
 set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip

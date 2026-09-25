@@ -77,21 +77,68 @@ typedef int hipDevice_t;
 #define HIP_LAUNCH_PARAM_BUFFER_SIZE ((void*)0x02)
 #define HIP_LAUNCH_PARAM_END ((void*)0x03)
 
-/* The subset of hipDeviceProp_t VirtualGPU fills in. The real structure has
- * more fields; a program that reads one this does not set reads zero. */
+/* hipDeviceProp_t as hipGetDeviceProperties fills it: the layout ROCm 5 gave
+ * it, which the unsuffixed call keeps in every later release for programs
+ * built to it (a program built with ROCm 6 or 7's headers calls
+ * hipGetDevicePropertiesR0600 and reads that layout instead). The field list
+ * is ROCm 5.7's hip_runtime_api.h (MIT licence, (c) Advanced Micro Devices);
+ * the architecture flags, a word of bits there, are one opaque word here. */
 typedef struct hipDeviceProp_t {
   char name[256];
   size_t totalGlobalMem;
   size_t sharedMemPerBlock;
+  int regsPerBlock;
   int warpSize;
   int maxThreadsPerBlock;
   int maxThreadsDim[3];
   int maxGridSize[3];
   int clockRate;
-  int multiProcessorCount;
+  int memoryClockRate;
+  int memoryBusWidth;
+  size_t totalConstMem;
   int major;
   int minor;
+  int multiProcessorCount;
+  int l2CacheSize;
+  int maxThreadsPerMultiProcessor;
+  int computeMode;
+  int clockInstructionRate;
+  struct { unsigned int bits; } arch;
+  int concurrentKernels;
+  int pciDomainID;
+  int pciBusID;
+  int pciDeviceID;
+  size_t maxSharedMemoryPerMultiProcessor;
+  int isMultiGpuBoard;
+  int canMapHostMemory;
+  int gcnArch;
   char gcnArchName[256];
+  int integrated;
+  int cooperativeLaunch;
+  int cooperativeMultiDeviceLaunch;
+  int maxTexture1DLinear;
+  int maxTexture1D;
+  int maxTexture2D[2];
+  int maxTexture3D[3];
+  unsigned int* hdpMemFlushCntl;
+  unsigned int* hdpRegFlushCntl;
+  size_t memPitch;
+  size_t textureAlignment;
+  size_t texturePitchAlignment;
+  int kernelExecTimeoutEnabled;
+  int ECCEnabled;
+  int tccDriver;
+  int cooperativeMultiDeviceUnmatchedFunc;
+  int cooperativeMultiDeviceUnmatchedGridDim;
+  int cooperativeMultiDeviceUnmatchedBlockDim;
+  int cooperativeMultiDeviceUnmatchedSharedMem;
+  int isLargeBar;
+  int asicRevision;
+  int managedMemory;
+  int directManagedMemAccessFromHost;
+  int concurrentManagedAccess;
+  int pageableMemoryAccess;
+  int pageableMemoryAccessUsesHostPageTables;
 } hipDeviceProp_t;
 
 hipError_t hipInit(unsigned int flags);

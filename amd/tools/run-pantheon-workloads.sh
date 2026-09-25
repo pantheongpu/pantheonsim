@@ -45,7 +45,12 @@ done
 [[ -n "$rocm" ]] || { echo "SKIP: no ROCm hipcc found (set VGPU_ROCM_PATH)"; exit 0; }
 [[ -d "$repo/kernels" ]] || { echo "SKIP: no pantheongpu checkout at $repo"; exit 0; }
 [[ -e "$shim/libamdhip64.so.7" ]] || { echo "error: build VirtualGPU first (no $shim/libamdhip64.so.7)" >&2; exit 1; }
-export ROCM_PATH=$rocm HIP_PATH=$rocm HIP_CLANG_PATH=$rocm/lib/llvm/bin HIP_DEVICE_LIB_PATH=$rocm/amdgcn/bitcode
+# ROCm 5 kept the compiler in llvm/ and the device libraries under clang's
+# own directory; later releases in lib/llvm/ and amdgcn/.
+llvm=$([[ -d $rocm/lib/llvm/bin ]] && echo "$rocm/lib/llvm" || echo "$rocm/llvm")
+bitcode=$([[ -d $rocm/amdgcn/bitcode ]] && echo "$rocm/amdgcn/bitcode" ||
+          ls -d "$llvm"/lib/clang/*/lib/amdgcn/bitcode 2>/dev/null | head -1)
+export ROCM_PATH=$rocm HIP_PATH=$rocm HIP_CLANG_PATH=$llvm/bin HIP_DEVICE_LIB_PATH=$bitcode
 
 srcs=$(cd "$repo" && find kernels -name '*.cpp' ! -path 'kernels/common/*' | sort)
 echo "Building $(wc -w <<<"$srcs") workloads with $rocm/bin/hipcc (unmodified sources)..."
@@ -60,7 +65,7 @@ wait
 # Every instruction the workloads' kernels contain, decoded and compared with
 # ROCm's own listing -- including the paths a normal run never takes.
 decode_fail=0
-if [[ -x "$build/test_amd_gcn" && -x "$rocm/lib/llvm/bin/llvm-objdump" ]]; then
+if [[ -x "$build/test_amd_gcn" && -x "$llvm/bin/llvm-objdump" ]]; then
   for exe in "$bin"/*; do
     w=$(basename "$exe")
     python3 - "$exe" "$code/$w.gfx942.o" <<'PY' || continue
@@ -81,7 +86,7 @@ for _ in range(n):
         open(dest, 'wb').write(b[eo:eo + es]); sys.exit(0)
 sys.exit(1)
 PY
-    "$rocm/lib/llvm/bin/llvm-objdump" -d --mcpu=gfx942 "$code/$w.gfx942.o" |
+    "$llvm/bin/llvm-objdump" -d --mcpu=gfx942 "$code/$w.gfx942.o" |
       sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > "$code/$w.gfx942.dis"
     res=$(VGPU_GCN_OBJECT="$code/$w.gfx942.o" VGPU_GCN_LISTING="$code/$w.gfx942.dis" "$build/test_amd_gcn" 2>&1)
     if ! grep -q '^\[ PASS \] every_instruction_decodes' <<<"$res"; then

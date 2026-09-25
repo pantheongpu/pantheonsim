@@ -187,6 +187,68 @@ struct DevicePropR0600 {
   int asicRevision;
 };
 
+// The device properties as ROCm 5 laid them out: what hipGetDeviceProperties
+// (the name without a suffix, and hipGetDevicePropertiesR0000) fills, for a
+// program built before ROCm 6 or built to that ABI. Carried over from ROCm
+// 5.7's hip_runtime_api.h, under the licence above.
+struct DevicePropR0000 {
+  char name[256];
+  size_t totalGlobalMem;
+  size_t sharedMemPerBlock;
+  int regsPerBlock;
+  int warpSize;
+  int maxThreadsPerBlock;
+  int maxThreadsDim[3];
+  int maxGridSize[3];
+  int clockRate;
+  int memoryClockRate;
+  int memoryBusWidth;
+  size_t totalConstMem;
+  int major;
+  int minor;
+  int multiProcessorCount;
+  int l2CacheSize;
+  int maxThreadsPerMultiProcessor;
+  int computeMode;
+  int clockInstructionRate;
+  DeviceArch arch;
+  int concurrentKernels;
+  int pciDomainID;
+  int pciBusID;
+  int pciDeviceID;
+  size_t maxSharedMemoryPerMultiProcessor;
+  int isMultiGpuBoard;
+  int canMapHostMemory;
+  int gcnArch;
+  char gcnArchName[256];
+  int integrated;
+  int cooperativeLaunch;
+  int cooperativeMultiDeviceLaunch;
+  int maxTexture1DLinear;
+  int maxTexture1D;
+  int maxTexture2D[2];
+  int maxTexture3D[3];
+  unsigned int* hdpMemFlushCntl;
+  unsigned int* hdpRegFlushCntl;
+  size_t memPitch;
+  size_t textureAlignment;
+  size_t texturePitchAlignment;
+  int kernelExecTimeoutEnabled;
+  int ECCEnabled;
+  int tccDriver;
+  int cooperativeMultiDeviceUnmatchedFunc;
+  int cooperativeMultiDeviceUnmatchedGridDim;
+  int cooperativeMultiDeviceUnmatchedBlockDim;
+  int cooperativeMultiDeviceUnmatchedSharedMem;
+  int isLargeBar;
+  int asicRevision;
+  int managedMemory;
+  int directManagedMemAccessFromHost;
+  int concurrentManagedAccess;
+  int pageableMemoryAccess;
+  int pageableMemoryAccessUsesHostPageTables;
+};
+
 // hipPointerAttribute_t: what hipPointerGetAttributes says of an address.
 // Its type is hipMemoryType's number.
 struct PointerAttribute {
@@ -198,6 +260,11 @@ struct PointerAttribute {
   unsigned allocationFlags;
 };
 enum MemoryType : int { kMemoryUnregistered = 0, kMemoryHost = 1, kMemoryDevice = 2 };
+// ROCm 5 numbered them otherwise (host 0, device 1), and knew no
+// unregistered memory: ROCm 6 renumbered them as CUDA does, and renamed the
+// library libamdhip64.so.6, so a program loads the numbering its library name
+// promises.
+enum MemoryTypeRocm5 : int { kMemoryHostRocm5 = 0, kMemoryDeviceRocm5 = 1 };
 
 // hipDeviceAttribute_t: what hipDeviceGetAttribute is asked for, by the
 // numbers hip_runtime_api.h gives them (the ones answered here; run_hip_abi.sh

@@ -1,0 +1,3 @@
+device memory: type 2
+pinned host memory: type 1
+memory the runtime knows nothing of: type 0

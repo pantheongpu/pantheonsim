@@ -39,6 +39,7 @@ hip_4.2 {
     hipGetDevice;
     hipGetDeviceCount;
     hipGetDeviceProperties;
+    hipGetDevicePropertiesR0000;
     hipGetErrorName;
     hipGetErrorString;
     hipGetLastError;

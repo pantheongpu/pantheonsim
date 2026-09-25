@@ -24,6 +24,7 @@
 #include <set>
 #include <mutex>
 #include <string>
+#include <dlfcn.h>
 #include <unistd.h>
 #include <vector>
 
@@ -43,6 +44,20 @@ namespace {
 
 using vgpu::amd::CodeObject;
 using vgpu::amd::Kernel;
+
+// Whether the program loaded this library as libamdhip64.so.5 -- built with
+// ROCm 5, whose ABI ROCm 6 broke under a new library name -- and so reads
+// what ROCm 5 wrote where the two differ (hipPointerGetAttributes).
+bool rocm5_abi() {
+  static const bool five = [] {
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void*>(&rocm5_abi), &info) || !info.dli_fname) return false;
+    const std::string name = info.dli_fname, five_name = "libamdhip64.so.5";
+    return name.size() >= five_name.size() &&
+           name.compare(name.size() - five_name.size(), five_name.size(), five_name) == 0;
+  }();
+  return five;
+}
 
 bool quiet() {
   const char* q = std::getenv("VGPU_QUIET");
@@ -526,31 +541,6 @@ hipError_t hipGetDevice(int* d) {
   return record(s, hipSuccess);
 }
 
-hipError_t hipGetDeviceProperties(hipDeviceProp_t* props, int ordinal) {
-  const ApiCall api("hipGetDeviceProperties");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!props) return record(s, hipErrorInvalidValue);
-  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
-  if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
-  const vgpu::DeviceProfile& p = s.rt->device(ordinal).profile();
-  *props = {};
-  std::snprintf(props->name, sizeof props->name, "%s", p.model.c_str());
-  std::snprintf(props->gcnArchName, sizeof props->gcnArchName, "%s", p.gcn_arch_full.c_str());
-  props->totalGlobalMem = static_cast<size_t>(p.vram_bytes);
-  props->sharedMemPerBlock = static_cast<size_t>(p.limits.shared_mem_per_block);
-  props->warpSize = static_cast<int>(p.warp_size);
-  props->maxThreadsPerBlock = static_cast<int>(p.limits.max_threads_per_block);
-  for (int i = 0; i < 3; ++i) {
-    props->maxThreadsDim[i] = static_cast<int>(p.limits.max_block_dim[i]);
-    props->maxGridSize[i] = static_cast<int>(p.limits.max_grid_dim[i]);
-  }
-  props->clockRate = static_cast<int>(p.telemetry.sm_clock_max_mhz) * 1000;
-  props->multiProcessorCount = static_cast<int>(p.limits.multiprocessors);
-  props->major = p.cc_major;
-  props->minor = p.cc_minor;
-  return record(s, hipSuccess);
-}
 
 hipError_t hipDeviceSynchronize(void) {
   const ApiCall api("hipDeviceSynchronize");
@@ -1223,9 +1213,95 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   props->ECCEnabled = p.telemetry.ecc ? 1 : 0;
 }
 
+// The same properties in ROCm 5's layout: what hipGetDeviceProperties (and
+// hipGetDevicePropertiesR0000) fills, for a program built before ROCm 6 or to
+// that ABI. Each field is the R0600 one of the same name, so the two cannot
+// disagree; R0000's gcnArch, the number a gfx target was before it had a
+// name, is the target's digits (942).
+void fill_properties_r0000(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0000* out) {
+  vgpu::amd::abi::DevicePropR0600 in;
+  fill_properties(p, ordinal, &in);
+  *out = {};
+  std::memcpy(out->name, in.name, sizeof out->name);
+  std::memcpy(out->gcnArchName, in.gcnArchName, sizeof out->gcnArchName);
+  for (int i = 0; i < 3; ++i) {
+    out->maxThreadsDim[i] = in.maxThreadsDim[i];
+    out->maxGridSize[i] = in.maxGridSize[i];
+    out->maxTexture3D[i] = in.maxTexture3D[i];
+  }
+  for (int i = 0; i < 2; ++i) out->maxTexture2D[i] = in.maxTexture2D[i];
+  out->totalGlobalMem = in.totalGlobalMem;
+  out->sharedMemPerBlock = in.sharedMemPerBlock;
+  out->regsPerBlock = in.regsPerBlock;
+  out->warpSize = in.warpSize;
+  out->maxThreadsPerBlock = in.maxThreadsPerBlock;
+  out->clockRate = in.clockRate;
+  out->memoryClockRate = in.memoryClockRate;
+  out->memoryBusWidth = in.memoryBusWidth;
+  out->totalConstMem = in.totalConstMem;
+  out->major = in.major;
+  out->minor = in.minor;
+  out->multiProcessorCount = in.multiProcessorCount;
+  out->l2CacheSize = in.l2CacheSize;
+  out->maxThreadsPerMultiProcessor = in.maxThreadsPerMultiProcessor;
+  out->computeMode = in.computeMode;
+  out->clockInstructionRate = in.clockInstructionRate;
+  out->arch = in.arch;
+  out->concurrentKernels = in.concurrentKernels;
+  out->pciDomainID = in.pciDomainID;
+  out->pciBusID = in.pciBusID;
+  out->pciDeviceID = in.pciDeviceID;
+  out->maxSharedMemoryPerMultiProcessor = in.maxSharedMemoryPerMultiProcessor;
+  out->isMultiGpuBoard = in.isMultiGpuBoard;
+  out->canMapHostMemory = in.canMapHostMemory;
+  out->integrated = in.integrated;
+  out->cooperativeLaunch = in.cooperativeLaunch;
+  out->cooperativeMultiDeviceLaunch = in.cooperativeMultiDeviceLaunch;
+  out->maxTexture1DLinear = in.maxTexture1DLinear;
+  out->maxTexture1D = in.maxTexture1D;
+  out->hdpMemFlushCntl = in.hdpMemFlushCntl;
+  out->hdpRegFlushCntl = in.hdpRegFlushCntl;
+  out->memPitch = in.memPitch;
+  out->textureAlignment = in.textureAlignment;
+  out->texturePitchAlignment = in.texturePitchAlignment;
+  out->kernelExecTimeoutEnabled = in.kernelExecTimeoutEnabled;
+  out->ECCEnabled = in.ECCEnabled;
+  out->tccDriver = in.tccDriver;
+  out->cooperativeMultiDeviceUnmatchedFunc = in.cooperativeMultiDeviceUnmatchedFunc;
+  out->cooperativeMultiDeviceUnmatchedGridDim = in.cooperativeMultiDeviceUnmatchedGridDim;
+  out->cooperativeMultiDeviceUnmatchedBlockDim = in.cooperativeMultiDeviceUnmatchedBlockDim;
+  out->cooperativeMultiDeviceUnmatchedSharedMem = in.cooperativeMultiDeviceUnmatchedSharedMem;
+  out->isLargeBar = in.isLargeBar;
+  out->asicRevision = in.asicRevision;
+  out->managedMemory = in.managedMemory;
+  out->directManagedMemAccessFromHost = in.directManagedMemAccessFromHost;
+  out->concurrentManagedAccess = in.concurrentManagedAccess;
+  out->pageableMemoryAccess = in.pageableMemoryAccess;
+  out->pageableMemoryAccessUsesHostPageTables = in.pageableMemoryAccessUsesHostPageTables;
+  out->gcnArch = std::atoi(p.gcn_arch.c_str() + (p.gcn_arch.rfind("gfx", 0) == 0 ? 3 : 0));
+}
+
 }  // namespace
 
 extern "C" {
+
+// The ROCm 5 layout, under both names a program may ask for it by.
+static_assert(sizeof(hipDeviceProp_t) == sizeof(vgpu::amd::abi::DevicePropR0000),
+              "vgpu_hip.h's hipDeviceProp_t is ROCm 5's layout");
+hipError_t hipGetDevicePropertiesR0000(vgpu::amd::abi::DevicePropR0000* props, int ordinal) {
+  const ApiCall api("hipGetDevicePropertiesR0000");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!props) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
+  fill_properties_r0000(s.rt->device(ordinal).profile(), ordinal, props);
+  return record(s, hipSuccess);
+}
+hipError_t hipGetDeviceProperties(hipDeviceProp_t* props, int ordinal) {
+  const ApiCall api("hipGetDeviceProperties");
+  return hipGetDevicePropertiesR0000(reinterpret_cast<vgpu::amd::abi::DevicePropR0000*>(props), ordinal);
+}
 
 hipError_t hipGetDevicePropertiesR0600(vgpu::amd::abi::DevicePropR0600* props, int ordinal) {
   const ApiCall api("hipGetDevicePropertiesR0600");
@@ -1902,7 +1978,8 @@ hipError_t hipMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t sp
 
 // What an address is: a device's memory, host memory hipHostMalloc gave, or
 // host memory the runtime knows nothing of -- which, as in HIP since 6.0 and
-// CUDA since 11, is an answer rather than an error.
+// CUDA since 11, is an answer rather than an error (a program built with
+// ROCm 5 gets that release's numbering, and its refusal).
 hipError_t hipPointerGetAttributes(vgpu::amd::abi::PointerAttribute* out, const void* ptr) {
   const ApiCall api("hipPointerGetAttributes");
   State& s = state();
@@ -1912,9 +1989,10 @@ hipError_t hipPointerGetAttributes(vgpu::amd::abi::PointerAttribute* out, const 
   *out = {};
   out->device = -1;
   const uint64_t va = reinterpret_cast<uint64_t>(ptr);
+  const bool five = rocm5_abi();
   for (int i = 0; i < s.rt->device_count(); ++i)
     if (s.rt->device(i).memory().owns(va)) {
-      out->type = vgpu::amd::abi::kMemoryDevice;
+      out->type = five ? vgpu::amd::abi::kMemoryDeviceRocm5 : vgpu::amd::abi::kMemoryDevice;
       out->device = i;
       out->devicePointer = const_cast<void*>(ptr);
       return record(s, hipSuccess);
@@ -1924,12 +2002,14 @@ hipError_t hipPointerGetAttributes(vgpu::amd::abi::PointerAttribute* out, const 
     auto it = g_host_allocations.upper_bound(va);
     if (it != g_host_allocations.begin() && va < std::prev(it)->first + std::prev(it)->second) {
       // Pinned memory is mapped for the device at the host's own address.
-      out->type = vgpu::amd::abi::kMemoryHost;
+      out->type = five ? vgpu::amd::abi::kMemoryHostRocm5 : vgpu::amd::abi::kMemoryHost;
       out->device = s.current;
       out->devicePointer = out->hostPointer = const_cast<void*>(ptr);
       return record(s, hipSuccess);
     }
   }
+  // ROCm 5 had no type for memory it knew nothing of, and refused it.
+  if (five) return record(s, hipErrorInvalidValue);
   out->type = vgpu::amd::abi::kMemoryUnregistered;
   return record(s, hipSuccess);
 }
