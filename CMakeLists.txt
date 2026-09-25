@@ -182,6 +182,10 @@ add_custom_command(TARGET vgpuhip POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.7"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so"
   COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7)")
+# How fast the CDNA interpreter runs a kernel (amd/tools/exec-bench.cpp).
+add_executable(amd_exec_bench amd/tools/exec-bench.cpp)
+target_link_libraries(amd_exec_bench PRIVATE vgpu)
+target_include_directories(amd_exec_bench PRIVATE amd/include)
 # librocprofiler-sdk: rocprofiler-sdk's interface over the HIP shim, so AMD's
 # profiler (rocprofv3) runs unmodified on a simulated GPU. It sits beside
 # libamdhip64 in build/shim, where a tool linked to librocprofiler-sdk.so.1

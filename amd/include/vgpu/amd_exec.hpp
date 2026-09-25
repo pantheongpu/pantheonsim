@@ -63,6 +63,20 @@ struct DispatchStats {
   // Waves by how many of their lanes were work-items when they started: a
   // group whose size is not a multiple of 64 ends in a wave with fewer.
   uint64_t waves_lt16 = 0, waves_lt32 = 0, waves_lt48 = 0, waves_lt64 = 0, waves_eq64 = 0;
+
+  // What another share of the same dispatch did, added in.
+  void add(const DispatchStats& o) {
+    waves += o.waves;
+    instructions += o.instructions;
+    barriers += o.barriers;
+    InstructionCounts& c = counts;
+    const InstructionCounts& a = o.counts;
+    c.valu += a.valu, c.mfma += a.mfma, c.salu += a.salu, c.smem += a.smem, c.vmem += a.vmem;
+    c.flat += a.flat, c.lds += a.lds, c.branch += a.branch, c.sendmsg += a.sendmsg, c.gds += a.gds;
+    c.flat_read += a.flat_read, c.flat_write += a.flat_write, c.flat_atomic += a.flat_atomic;
+    waves_lt16 += o.waves_lt16, waves_lt32 += o.waves_lt32, waves_lt48 += o.waves_lt48;
+    waves_lt64 += o.waves_lt64, waves_eq64 += o.waves_eq64;
+  }
 };
 
 // Runs the dispatch to completion. Throws Err::Unsupported naming the
