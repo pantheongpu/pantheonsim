@@ -54,6 +54,20 @@ expect "a peer is reachable, once, and a copy to it arrives intact" \
   "peer can 1, enabling twice says hipErrorPeerAccessAlreadyEnabled, copy intact 1" \
   "$(grep -o 'peer can .*' <<< "$out")"
 
+# Device-side printf: three lanes print through the hostcall buffer -- one of
+# them a string that takes several packets -- and a __constant__ table is read
+# from the program's own code object. printf's return value is checked by the
+# program against the host's own snprintf.
+out=$(VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/printf.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "a kernel that prints runs to the end" "0" "$status"
+expect "each lane's printf comes out whole, in lane order" \
+  "lane 0 of 64: short, beef,  0.00, 2.500000e-03, a, 1099511627776, 100%, prime 7|lane 1 of 64: a string long enough that it takes more than one packet to carry it, bef0,  1.50, 2.500000e-03, b, 1099511627776, 100%, prime 11|lane 2 of 64: short, bef1,  3.00, 2.500000e-03, c, 1099511627776, 100%, prime 13" \
+  "$(grep '^lane ' <<< "$out" | paste -sd'|')"
+expect "and printf returns what it printed" "printf returned what it printed for 3 of 3 lanes" \
+  "$(grep -o 'printf returned .*' <<< "$out")"
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)

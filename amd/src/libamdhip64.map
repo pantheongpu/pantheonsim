@@ -15,6 +15,7 @@ hip_4.2 {
     __hipPushCallConfiguration;
     __hipRegisterFatBinary;
     __hipRegisterFunction;
+    __hipRegisterVar;
     __hipUnregisterFatBinary;
     hipDeviceCanAccessPeer;
     hipDeviceEnablePeerAccess;
@@ -39,6 +40,8 @@ hip_4.2 {
     hipGetErrorString;
     hipGetLastError;
     hipGetStreamDeviceId;
+    hipGetSymbolAddress;
+    hipGetSymbolSize;
     hipHostFree;
     hipHostMalloc;
     hipInit;
@@ -47,7 +50,11 @@ hip_4.2 {
     hipMemGetInfo;
     hipMemcpy;
     hipMemcpyAsync;
+    hipMemcpyFromSymbol;
+    hipMemcpyFromSymbolAsync;
     hipMemcpyPeerAsync;
+    hipMemcpyToSymbol;
+    hipMemcpyToSymbolAsync;
     hipMemset;
     hipMemsetAsync;
     hipModuleGetFunction;

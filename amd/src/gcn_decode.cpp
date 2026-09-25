@@ -226,6 +226,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vopc, 0x04b}, {"v_cmp_ngt_f32_e32", 2, 2}},
       {{Enc::Vopc, 0x04d}, {"v_cmp_neq_f32_e32", 2, 2}},
       {{Enc::Vopc, 0x04e}, {"v_cmp_nlt_f32_e32", 2, 2}},
+      {{Enc::Vopc, 0x0aa}, {"v_cmp_eq_u16_e32", 2, 2}},
       {{Enc::Vopc, 0x0ad}, {"v_cmp_ne_u16_e32", 2, 2}},
       {{Enc::Vopc, 0x0c9}, {"v_cmp_lt_u32_e32", 2, 2}},
       {{Enc::Vopc, 0x0eb}, {"v_cmp_le_u64_e32", 2, 2, 2, 2}},
@@ -245,6 +246,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // third; the shift itself is always 32-bit.
       {{Enc::Vop3, 0x041}, {"v_cmp_lt_f32_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x044}, {"v_cmp_gt_f32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x0aa}, {"v_cmp_eq_u16_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x010}, {"v_cmp_class_f32_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x02b}, {"v_cmp_ngt_f16_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x04b}, {"v_cmp_ngt_f32_e64", 2, 2, 1, 1, 1, false, true}},

@@ -1,6 +1,7 @@
 #include "vgpu/amd_codeobject.hpp"
 
 #include <cstring>
+#include <algorithm>
 #include <map>
 
 #include "vgpu/error.hpp"
@@ -153,7 +154,7 @@ constexpr uint32_t kNtAmdgpuMetadata = 32;
 struct Section {
   std::string name;
   uint32_t type = 0;
-  uint64_t addr = 0, offset = 0, size = 0, entsize = 0;
+  uint64_t flags = 0, addr = 0, offset = 0, size = 0, entsize = 0;
   uint32_t link = 0;
 };
 
@@ -183,6 +184,7 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     const uint64_t at = shoff + uint64_t{shentsize} * i;
     Section s;
     s.type = r.u32(at + 4);
+    s.flags = r.u64(at + 8);
     s.addr = r.u64(at + 16);
     s.offset = r.u64(at + 24);
     s.size = r.u64(at + 32);
@@ -214,10 +216,29 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     throw Error::make(Err::ProfileParse, origin, ": no .text section");
   }
 
-  // The module's own memory: the initialised variables and the zeroed ones,
-  // laid out one after the other. A loader places this on the device.
+  // A linked code object -- what hipcc embeds in a program -- is laid out
+  // already: every section it loads has its address, and the code reaches its
+  // constants and variables relative to where it is itself (s_getpc_b64 and a
+  // fixed distance). So the whole of it goes on the device as one image, each
+  // section at its own address from wherever the image starts.
+  out.linked = r.u16(16) != 1 /* ET_REL */;
+  if (out.linked) {
+    uint64_t end = 0;
+    for (const Section& sec : sections)
+      if (sec.flags & 2 /* SHF_ALLOC */) end = std::max(end, sec.addr + sec.size);
+    out.image.assign(end, 0);
+    for (const Section& sec : sections) {
+      if (!(sec.flags & 2) || sec.type == 8 /* SHT_NOBITS */ || !sec.size) continue;
+      r.need(sec.offset, sec.size);
+      std::memcpy(out.image.data() + sec.addr, bytes.data() + sec.offset, sec.size);
+    }
+  }
+
+  // An object not yet linked has no addresses: its initialised variables and
+  // zeroed ones are laid out one after the other, and a loader places this on
+  // the device and tells the code where (place_globals).
   std::map<uint16_t, uint64_t> data_at;   // section index -> where it starts in the image
-  for (uint16_t i = 0; i < shnum; ++i) {
+  for (uint16_t i = 0; i < shnum && !out.linked; ++i) {
     const Section& sec = sections[i];
     const bool bss = sec.type == 8 /* SHT_NOBITS */;
     if (sec.name != ".data" && sec.name != ".bss" && !(bss && sec.name.rfind(".bss", 0) == 0)) continue;
@@ -251,10 +272,11 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
       const uint64_t value = r.u64(at + 8), size = r.u64(at + 16);
       if (type == 2 /* STT_FUNC */ && !name.empty()) code[name] = {value, size};
       // A variable in the module's memory, and where it lands in the image.
-      if (type == 1 /* STT_OBJECT */ && !name.empty() && data_at.count(shndx)) {
+      const bool loaded = out.linked && shndx < sections.size() && (sections[shndx].flags & 2);
+      if (type == 1 /* STT_OBJECT */ && !name.empty() && (data_at.count(shndx) || loaded)) {
         GlobalVar g;
         g.name = name;
-        g.offset = data_at[shndx] + value;
+        g.offset = out.linked ? value : data_at[shndx] + value;   // linked: its address in the image
         g.size = size;
         out.globals.push_back(std::move(g));
         symbol_at[name] = g.offset;

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "vgpu/amd_gcn.hpp"
+#include "vgpu/amd_hostcall.hpp"
 #include "vgpu/error.hpp"
 
 namespace vgpu::amd {
@@ -155,12 +156,24 @@ struct Machine {
   // a set of locks striped by address. On one thread there is no need: a
   // wave's lanes take their turns in order, which is atomic already.
   bool concurrent = false;
-  static std::mutex& atomic_lock_for(uint64_t addr) {
-    static std::array<std::mutex, 251> locks;
-    return locks[(addr >> 2) % locks.size()];
+  // A vector load or store of device memory. ROCm runs CDNA with unaligned
+  // access enabled (SH_MEM_CONFIG's unaligned mode), so a word may start at
+  // any byte, and the compiler counts on it -- printf packs its string eight
+  // bytes to a word from wherever the string starts. One that is aligned is a
+  // single access; one that is not is its bytes. An atomic still has to be
+  // aligned, as the hardware requires, and goes to memory directly.
+  uint64_t load(uint64_t addr, uint32_t size) const {
+    if (addr % size == 0) return mem.load_scalar(addr, size);
+    uint64_t v = 0;
+    for (uint32_t b = 0; b < size; ++b) v |= mem.load_scalar(addr + b, 1) << (8 * b);
+    return v;
+  }
+  void store(uint64_t addr, uint32_t size, uint64_t v) {
+    if (addr % size == 0) return mem.store_scalar(addr, size, v);
+    for (uint32_t b = 0; b < size; ++b) mem.store_scalar(addr + b, 1, (v >> (8 * b)) & 0xFF);
   }
   std::unique_lock<std::mutex> atomic_guard(uint64_t addr) {
-    return concurrent ? std::unique_lock<std::mutex>(atomic_lock_for(addr)) : std::unique_lock<std::mutex>();
+    return concurrent ? std::unique_lock<std::mutex>(memory_atomic_lock(addr)) : std::unique_lock<std::mutex>();
   }
   // Each instruction decoded once, the first time a wave reaches it, by where
   // it is: every wave of a dispatch runs the same code, and decoding it again
@@ -169,7 +182,7 @@ struct Machine {
 
   const Inst& fetch(uint64_t pc) {
     const CodeObject& o = *d.object;
-    const uint64_t at = pc - o.text_addr;
+    const uint64_t at = pc - d.code_base - o.text_addr;
     if (decoded.empty()) decoded.resize(o.text.size() / 4 + 1);
     if (at % 4 != 0 || at / 4 >= decoded.size())
       return *(scratch_inst = std::make_unique<const Inst>(gcn::decode(o.text, at, pc)));
@@ -1470,6 +1483,7 @@ struct Machine {
         set = !(lane_float(w, in.src[0], lane) < lane_float(w, in.src[1], lane));
       else if (op == "v_cmp_ngt_f16_e64"_op) set = !(lane_half(w, in.src[0], lane) > lane_half(w, in.src[1], lane));
       else if (op == "v_cmp_ngt_f64_e64"_op) set = !(lane_double(w, in.src[0], lane) > lane_double(w, in.src[1], lane));
+      else if (op == "v_cmp_eq_u16_e32"_op || op == "v_cmp_eq_u16_e64"_op) set = (a & 0xFFFF) == (b & 0xFFFF);
       else if (op == "v_cmp_ne_u16_e32"_op) set = (a & 0xFFFF) != (b & 0xFFFF);
       else if (op == "v_cmp_lt_u32_e32"_op) set = a < b;
       else if (op == "v_cmp_gt_u32_e64"_op) set = a > b;
@@ -1683,21 +1697,21 @@ struct Machine {
         if (in.name.rfind("flat_store", 0) == 0) {
           const uint32_t v = lane_src(w, in.src[1], lane);
           if (shared) std::memcpy(&g.lds[where], &v, n.bytes);
-          else mem.store_scalar(where, n.bytes, v);
+          else store(where, n.bytes, v);
         } else {
           uint64_t raw = 0;
           if (shared) std::memcpy(&raw, &g.lds[where], n.bytes);
-          else raw = mem.load_scalar(where, n.bytes);
+          else raw = load(where, n.bytes);
           write_lane(w, in.dst[0], lane, widen(raw, n));
         }
       } else if (OpName(in.name) == "flat_store_dword"_op) {
         const uint32_t v = lane_src(w, in.src[1], lane);
         if (shared) std::memcpy(&g.lds[where], &v, 4);
-        else mem.store_scalar(where, 4, v);
+        else store(where, 4, v);
       } else if (OpName(in.name) == "flat_load_dword"_op) {
         uint32_t v = 0;
         if (shared) std::memcpy(&v, &g.lds[where], 4);
-        else v = static_cast<uint32_t>(mem.load_scalar(where, 4));
+        else v = static_cast<uint32_t>(load(where, 4));
         write_lane(w, in.dst[0], lane, v);
       } else {
         throw Error::make(Err::Unsupported, "flat instruction ", in.name, " is decoded but not implemented");
@@ -1791,17 +1805,17 @@ struct Machine {
                             static_cast<uint64_t>(static_cast<int64_t>(in.offset));
       switch (kind) {
         case Kind::Narrow:
-          if (narrow_store) mem.store_scalar(addr, n.bytes, lane_src(w, in.src[1], lane));
-          else write_lane(w, in.dst[0], lane, widen(mem.load_scalar(addr, n.bytes), n));
+          if (narrow_store) store(addr, n.bytes, lane_src(w, in.src[1], lane));
+          else write_lane(w, in.dst[0], lane, widen(load(addr, n.bytes), n));
           break;
         case Kind::Load:
           // One word, or two, or four: a register each, in order.
           for (uint32_t k = 0; k < in.dst[0].width; ++k)
-            w.vgpr[in.dst[0].index + k][lane] = static_cast<uint32_t>(mem.load_scalar(addr + 4 * k, 4));
+            w.vgpr[in.dst[0].index + k][lane] = static_cast<uint32_t>(load(addr + 4 * k, 4));
           break;
         case Kind::Store:
           for (uint32_t k = 0; k < in.src[1].width; ++k)
-            mem.store_scalar(addr + 4 * k, 4, w.vgpr[in.src[1].index + k][lane]);
+            store(addr + 4 * k, 4, w.vgpr[in.src[1].index + k][lane]);
           break;
         case Kind::AddX2: {
           // The one that works on a pair; every other atomic here is 32-bit.
@@ -2087,9 +2101,16 @@ struct Machine {
       return true;
     }
     if (OpName(in.name) == "s_sleep"_op) return true;   // a wait, and nothing here is waiting on anything
-    if (OpName(in.name) == "s_sendmsg"_op)
-      throw Error::make(Err::Unsupported, "the kernel asked the host for attention (s_sendmsg MSG_INTERRUPT), which ",
-                        "is how device-side printf and hostcalls reach the host; this does not model hostcalls yet");
+    if (OpName(in.name) == "s_sendmsg"_op) {
+      // The kernel raised the doorbell of its hostcall buffer and asks the
+      // host for attention (MSG_INTERRUPT, the one message decoded): the
+      // host answers now, and the wave, spinning on its packet, carries on.
+      if (!d.hostcall)
+        throw Error::make(Err::Unsupported, "the kernel asked the host for attention (s_sendmsg MSG_INTERRUPT), which ",
+                          "is how device-side printf reaches the host, and the launch was given no hostcall buffer");
+      d.hostcall->service();
+      return true;
+    }
     if (OpName(in.name) == "s_cbranch_scc0"_op) {
       if (!w.scc) w.pc = in.target;
       return true;
@@ -2133,8 +2154,9 @@ void fill_hidden_arguments(const Dispatch& d, const Kernel& k, MemoryManager& me
     else if (kind == "hidden_grid_dims") value = dims;
     else if (kind == "hidden_shared_base") value = kSharedBase;
     else if (kind == "hidden_dynamic_lds_size") value = d.dynamic_lds;
+    else if (kind == "hidden_hostcall_buffer") value = d.hostcall ? d.hostcall->buffer() : 0;
     // Everything else -- the remainders of a grid that divides evenly, the
-    // global offsets, the buffers a hostcall or a printf would use -- is
+    // global offsets, a heap for device malloc -- is
     // zero, and a kernel that needs one of those will say so by failing on a
     // null pointer rather than reading something made up.
     else continue;
@@ -2165,7 +2187,7 @@ uint64_t write_dispatch_packet(const Dispatch& d, const Kernel& k, MemoryManager
   put32(20, static_cast<uint32_t>(uint64_t{d.groups[2]} * d.group_size[2]));
   put32(24, k.private_segment);
   put32(28, k.group_segment);
-  put64(32, k.entry);
+  put64(32, d.code_base + k.entry);
   put64(40, d.kernarg);
   const uint64_t where = mem.alloc(packet.size());
   mem.write(where, packet.data(), packet.size());
@@ -2207,7 +2229,7 @@ void run_group(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_se
   group.waves.resize(waves_per_group);
   for (uint32_t i = 0; i < waves_per_group; ++i) {
     Wave& w = group.waves[i];
-    w.pc = k.entry;
+    w.pc = d.code_base + k.entry;
     w.first_lane = i * kLanes;
     // The lanes this wave has of the work-group, which is short in the
     // last wave when the group is not a multiple of 64.
@@ -2283,6 +2305,11 @@ void run_group(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_se
 }
 
 }  // namespace
+
+std::mutex& memory_atomic_lock(uint64_t addr) {
+  static std::array<std::mutex, 251> locks;
+  return locks[(addr >> 2) % locks.size()];
+}
 
 DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   if (!d.object || !d.kernel) throw Error::make(Err::InvalidValue, "a dispatch needs a kernel");

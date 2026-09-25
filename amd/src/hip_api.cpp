@@ -27,6 +27,7 @@
 
 #include "vgpu/amd_codeobject.hpp"
 #include "vgpu/amd_exec.hpp"
+#include "vgpu/amd_hostcall.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
@@ -55,6 +56,9 @@ hipError_t fail(hipError_t code, const std::string& what) {
 struct Module {
   CodeObject object;
   uint64_t globals = 0;   // where the module's own variables were placed
+  // Where a linked module's image is (CodeObject::image): its code runs from
+  // there, and its variables are in it, so `globals` is the same address.
+  uint64_t code_base = 0;
   // What a profiler knows it and its kernels by (vgpu/hip_profiler.hpp).
   uint64_t code_object_id = 0;
   std::vector<uint64_t> kernel_ids;   // one per kernel, in the object's order
@@ -116,15 +120,15 @@ void report_loaded(Module& m, int device, const void* image, size_t image_size) 
   o.uri = uri;
   o.image = image;
   o.image_size = image_size;
-  o.load_base = m.object.text_addr;
-  o.load_size = m.object.text.size();
+  o.load_base = m.object.linked ? m.code_base : m.object.text_addr;
+  o.load_size = m.object.linked ? m.object.image.size() : m.object.text.size();
   std::vector<vgpu::amd::hipprof::KernelSymbol> symbols;
   for (size_t i = 0; i < m.object.kernels.size(); ++i) {
     const Kernel& k = m.object.kernels[i];
     vgpu::amd::hipprof::KernelSymbol sym;
     sym.kernel_id = m.kernel_ids[i];
     sym.name = k.name.c_str();
-    sym.entry = m.object.text_addr + k.entry;
+    sym.entry = m.code_base + k.entry;
     sym.kernarg_size = k.kernarg_size;
     sym.kernarg_alignment = k.kernarg_align;
     sym.group_segment = k.group_segment;
@@ -167,6 +171,15 @@ struct HostFunction {
   std::string kernel;
 };
 
+// A __device__ or __constant__ variable of a hipcc-built program: the host
+// has a variable of its own that stands for it (its address is what
+// hipMemcpyToSymbol is given), and the device's lives in the binary's module.
+struct HostVar {
+  FatBinary* binary = nullptr;
+  std::string name;
+  size_t size = 0;
+};
+
 // A kernel launch a graph holds: what to run and with what, copied when it was
 // captured, since a graph replays what the stream was asked to do then.
 struct Node {
@@ -187,8 +200,12 @@ struct State {
   std::vector<std::unique_ptr<Function>> functions;
   std::vector<std::unique_ptr<FatBinary>> fat_binaries;
   std::map<const void*, HostFunction> host_functions;
+  std::map<const void*, HostVar> host_vars;
   std::set<std::pair<int, int>> peers;           // (device, peer) pairs with access enabled
   std::map<hipStream_t, Graph> capturing;        // streams recording rather than running
+  // Each device's hostcall buffer, made when a kernel is first launched on it:
+  // what device-side printf writes through (vgpu/amd_hostcall.hpp).
+  std::map<int, std::unique_ptr<vgpu::amd::Hostcall>> hostcalls;
   std::vector<std::unique_ptr<Graph>> graphs, graph_execs;
   int current = 0;
   hipError_t last = hipSuccess;
@@ -278,6 +295,22 @@ hipError_t dispatch_kernel(State& s, int ordinal, const Module& module, const Ke
                            const std::vector<uint8_t>& args, hipStream_t stream) {
   vgpu::runtime::Device& d = s.rt->device(ordinal);
   const CodeObject& object = module.object;
+  auto& hostcall = s.hostcalls[ordinal];
+  if (!hostcall) {
+    try {
+      // What a kernel prints goes where the program's own printf goes, a
+      // whole printf at a time.
+      hostcall = std::make_unique<vgpu::amd::Hostcall>(d.memory(), [](int stream, const std::string& text) {
+        static std::mutex mu;
+        std::lock_guard<std::mutex> lock(mu);
+        std::FILE* f = stream == 1 ? stderr : stdout;
+        std::fwrite(text.data(), 1, text.size(), f);
+        std::fflush(f);
+      });
+    } catch (const std::exception& e) {
+      return fail(hipErrorOutOfMemory, std::string("no room for the hostcall buffer: ") + e.what());
+    }
+  }
   if (!block.x || !block.y || !block.z || !grid.x || !grid.y || !grid.z) return hipErrorInvalidConfiguration;
   vgpu::MemoryManager& mem = d.memory();
   uint64_t kernarg = 0;
@@ -300,6 +333,8 @@ hipError_t dispatch_kernel(State& s, int ordinal, const Module& module, const Ke
     dispatch.group_size[2] = block.z;
     dispatch.wave_size = static_cast<uint32_t>(d.profile().warp_size);
     dispatch.dynamic_lds = shared;   // what the launch adds to the kernel's own LDS
+    dispatch.hostcall = hostcall.get();
+    dispatch.code_base = module.code_base;
     if (prof) {
       launch.device = ordinal;
       launch.kernel_id = kernel_id(module, kernel);
@@ -339,6 +374,23 @@ hipError_t dispatch_kernel(State& s, int ordinal, const Module& module, const Ke
   return hipSuccess;
 }
 
+// Puts a loaded module on a device: a linked one's whole image, from which its
+// code runs and in which its variables sit; an unlinked one's variables, with
+// its code told where they went.
+void place(Module& m, vgpu::MemoryManager& mem) {
+  if (m.object.linked) {
+    m.code_base = mem.alloc(m.object.image.empty() ? 1 : m.object.image.size());
+    if (!m.object.image.empty()) mem.write(m.code_base, m.object.image.data(), m.object.image.size());
+    m.globals = m.code_base;
+    return;
+  }
+  if (!m.object.data.empty()) {
+    m.globals = mem.alloc(m.object.data.size());
+    mem.write(m.globals, m.object.data.data(), m.object.data.size());
+  }
+  vgpu::amd::place_globals(m.object, m.globals);
+}
+
 // The module a registered binary becomes on one device: the code object for
 // that device's gfx target, loaded, with its variables placed in the device's
 // own memory. A program built for other targets only is told so by name.
@@ -360,11 +412,7 @@ hipError_t module_on(State& s, FatBinary& fb, int ordinal, Module** out) {
   try {
     auto m = std::make_unique<Module>();
     m->object = vgpu::amd::load_code_object(target->second, "the program's " + gfx + " code");
-    if (!m->object.data.empty()) {
-      m->globals = d.memory().alloc(m->object.data.size());
-      d.memory().write(m->globals, m->object.data.data(), m->object.data.size());
-    }
-    vgpu::amd::place_globals(m->object, m->globals);
+    place(*m, d.memory());
     report_loaded(*m, ordinal, target->second.data(), target->second.size());
     *out = m.get();
     fb.on_device.emplace(ordinal, std::move(m));
@@ -489,6 +537,7 @@ hipError_t hipDeviceReset(void) {
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   s.functions.clear();
   s.modules.clear();
+  s.hostcalls.clear();   // their memory is about to go with everything else
   for (int i = 0; i < s.rt->device_count(); ++i) s.rt->device(i).reset();
   return record(s, hipSuccess);
 }
@@ -679,13 +728,9 @@ hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
   try {
     auto m = std::make_unique<Module>();
     m->object = vgpu::amd::load_code_object(std::string(reinterpret_cast<const char*>(bytes), size), "the image");
-    // The module's own variables go on the device, and the code is told where
-    // they are: until that is done, a kernel reaching one reads nothing.
-    if (!m->object.data.empty()) {
-      m->globals = d->memory().alloc(m->object.data.size());
-      d->memory().write(m->globals, m->object.data.data(), m->object.data.size());
-    }
-    vgpu::amd::place_globals(m->object, m->globals);
+    // The module goes on the device, and the code is told where its
+    // variables are: until that is done, a kernel reaching one reads nothing.
+    place(*m, d->memory());
     report_loaded(*m, s.current, image, size);
     *module = reinterpret_cast<hipModule_t>(m.get());
     s.modules.push_back(std::move(m));
@@ -994,6 +1039,15 @@ void __hipRegisterFunction(void** modules, const void* host_function, char*, con
   s.host_functions[host_function] = HostFunction{reinterpret_cast<FatBinary*>(modules), device_name};
 }
 
+// Before main, once per __device__ or __constant__ variable: which host
+// variable stands for which of the binary's.
+void __hipRegisterVar(void** modules, void* host_var, char*, const char* device_name, int, size_t size, int, int) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!modules || !host_var || !device_name) return;
+  s.host_vars[host_var] = HostVar{reinterpret_cast<FatBinary*>(modules), device_name, size};
+}
+
 // At exit: the binary's modules go, and their variables with them.
 void __hipUnregisterFatBinary(void** modules) {
   State& s = state();
@@ -1001,6 +1055,8 @@ void __hipUnregisterFatBinary(void** modules) {
   FatBinary* fb = reinterpret_cast<FatBinary*>(modules);
   for (auto it = s.host_functions.begin(); it != s.host_functions.end();)
     it = it->second.binary == fb ? s.host_functions.erase(it) : std::next(it);
+  for (auto it = s.host_vars.begin(); it != s.host_vars.end();)
+    it = it->second.binary == fb ? s.host_vars.erase(it) : std::next(it);
   for (size_t i = 0; i < s.fat_binaries.size(); ++i)
     if (s.fat_binaries[i].get() == fb) {
       for (auto& [ordinal, m] : fb->on_device)
@@ -1266,6 +1322,94 @@ hipError_t hipGraphExecDestroy(void* exec) {
       return record(s, hipSuccess);
     }
   return record(s, hipErrorInvalidValue);
+}
+
+// ---- A program's own device variables, by their host-side stand-ins ---------
+
+}  // extern "C"
+
+namespace {
+
+// Where the variable a host symbol stands for is, on the current device: in
+// the binary's module there, loaded if no kernel has been launched from it yet.
+hipError_t symbol_on(State& s, const void* symbol, uint64_t* address, size_t* size) {
+  const auto it = s.host_vars.find(symbol);
+  if (it == s.host_vars.end())
+    return fail(hipErrorInvalidSymbol, "that is not a __device__ or __constant__ variable the program registered");
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return e;
+  Module* m = nullptr;
+  if (const hipError_t e = module_on(s, *it->second.binary, s.current, &m); e != hipSuccess) return e;
+  const vgpu::amd::GlobalVar* g = vgpu::amd::find_global(m->object, it->second.name);
+  if (!g)
+    return fail(hipErrorInvalidSymbol, "the program's device code has no variable named " + it->second.name);
+  *address = m->globals + g->offset;
+  *size = static_cast<size_t>(g->size ? g->size : it->second.size);
+  return hipSuccess;
+}
+
+hipError_t copy_symbol(bool to_symbol, const void* symbol, void* host, size_t bytes, size_t offset,
+                       hipMemcpyKind kind) {
+  State& s = state();
+  uint64_t address = 0;
+  size_t size = 0;
+  {
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (const hipError_t e = symbol_on(s, symbol, &address, &size); e != hipSuccess) return record(s, e);
+    if (offset > size || bytes > size - offset)
+      return record(s, fail(hipErrorInvalidValue, "the copy runs past the end of the variable"));
+  }
+  if (kind == hipMemcpyDefault) kind = to_symbol ? hipMemcpyHostToDevice : hipMemcpyDeviceToHost;
+  void* device = reinterpret_cast<void*>(address + offset);
+  return to_symbol ? hipMemcpy(device, host, bytes, kind) : hipMemcpy(host, device, bytes, kind);
+}
+
+}  // namespace
+
+extern "C" {
+
+hipError_t hipGetSymbolAddress(void** ptr, const void* symbol) {
+  const ApiCall api("hipGetSymbolAddress");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!ptr) return record(s, hipErrorInvalidValue);
+  uint64_t address = 0;
+  size_t size = 0;
+  if (const hipError_t e = symbol_on(s, symbol, &address, &size); e != hipSuccess) return record(s, e);
+  *ptr = reinterpret_cast<void*>(address);
+  return record(s, hipSuccess);
+}
+
+hipError_t hipGetSymbolSize(size_t* bytes, const void* symbol) {
+  const ApiCall api("hipGetSymbolSize");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!bytes) return record(s, hipErrorInvalidValue);
+  uint64_t address = 0;
+  if (const hipError_t e = symbol_on(s, symbol, &address, bytes); e != hipSuccess) return record(s, e);
+  return record(s, hipSuccess);
+}
+
+hipError_t hipMemcpyToSymbol(const void* symbol, const void* src, size_t bytes, size_t offset, hipMemcpyKind kind) {
+  const ApiCall api("hipMemcpyToSymbol");
+  return copy_symbol(true, symbol, const_cast<void*>(src), bytes, offset, kind);
+}
+
+hipError_t hipMemcpyFromSymbol(void* dst, const void* symbol, size_t bytes, size_t offset, hipMemcpyKind kind) {
+  const ApiCall api("hipMemcpyFromSymbol");
+  return copy_symbol(false, symbol, dst, bytes, offset, kind);
+}
+
+// Every copy here has finished when it returns, as every launch has.
+hipError_t hipMemcpyToSymbolAsync(const void* symbol, const void* src, size_t bytes, size_t offset,
+                                  hipMemcpyKind kind, hipStream_t) {
+  const ApiCall api("hipMemcpyToSymbolAsync");
+  return copy_symbol(true, symbol, const_cast<void*>(src), bytes, offset, kind);
+}
+
+hipError_t hipMemcpyFromSymbolAsync(void* dst, const void* symbol, size_t bytes, size_t offset, hipMemcpyKind kind,
+                                    hipStream_t) {
+  const ApiCall api("hipMemcpyFromSymbolAsync");
+  return copy_symbol(false, symbol, dst, bytes, offset, kind);
 }
 
 hipError_t hipRuntimeGetVersion(int* version) {

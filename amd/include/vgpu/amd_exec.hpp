@@ -13,12 +13,15 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 #include "vgpu/amd_codeobject.hpp"
 #include "vgpu/memory.hpp"
 
 namespace vgpu::amd {
+
+class Hostcall;
 
 // A launch, as the packet a HIP runtime writes describes one.
 struct Dispatch {
@@ -31,6 +34,15 @@ struct Dispatch {
   // LDS the launch adds to what the kernel reserves, which is what a HIP
   // program passes as its third launch parameter.
   uint32_t dynamic_lds = 0;
+  // Where a linked code object's image was placed on the device (its
+  // `image`), so the program counter runs in device addresses and the code
+  // reaches its own constants and variables. Zero for an object not yet
+  // linked, whose code is run where its .text says it is.
+  uint64_t code_base = 0;
+  // Where the kernel calls the host (device-side printf), if the runtime gave
+  // it anywhere: its hidden_hostcall_buffer argument, and what answers when
+  // the kernel raises the doorbell.
+  Hostcall* hostcall = nullptr;
 };
 
 // What the GPU's performance counters would count for a dispatch: every
@@ -84,5 +96,10 @@ struct DispatchStats {
 // Err::InvalidValue for a dispatch the kernel cannot take (a work-group
 // larger than it allows, or more LDS than the device has).
 DispatchStats execute(const Dispatch& d, MemoryManager& mem);
+
+// The lock a device read-modify-write at this address takes while work-groups
+// run on several threads -- what the host takes too when it changes memory a
+// kernel changes with atomics (vgpu/amd_hostcall.hpp).
+std::mutex& memory_atomic_lock(uint64_t addr);
 
 }  // namespace vgpu::amd
