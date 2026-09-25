@@ -34,6 +34,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 #include "vgpu/exec/tensormap.hpp"
