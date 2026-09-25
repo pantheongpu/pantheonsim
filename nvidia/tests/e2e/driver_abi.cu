@@ -259,6 +259,39 @@ int main() {
     return 1;
   }
 
+  // Tensor maps: the requirements cuda.h lists for cuTensorMapEncodeTiled are
+  // checked, each with the code the documentation gives, and the modes not
+  // implemented say so rather than encoding something that would be misread.
+  {
+    alignas(64) CUtensorMap map;
+    const cuuint64_t dim[2] = {64, 32}, stride[1] = {128};
+    const cuuint32_t box[2] = {64, 8}, one[2] = {1, 1}, big[2] = {257, 8}, wide[2] = {64, 8};
+    auto enc = [&](void* addr, const cuuint32_t* b, CUtensorMapSwizzle swz,
+                   CUtensorMapDataType type = CU_TENSOR_MAP_DATA_TYPE_UINT16) {
+      return cuTensorMapEncodeTiled(&map, type, 2, addr, dim, stride, b, one,
+                                    CU_TENSOR_MAP_INTERLEAVE_NONE, swz,
+                                    CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    };
+    void* base = reinterpret_cast<void*>(static_cast<uintptr_t>(buf));
+    void* odd = reinterpret_cast<void*>(static_cast<uintptr_t>(buf) + 8);
+    CK(enc(base, box, CU_TENSOR_MAP_SWIZZLE_128B));
+    CK(cuTensorMapReplaceAddress(&map, base));
+    struct { const char* what; CUresult got, want; } cases[] = {
+        {"a global address off 16 bytes", enc(odd, box, CU_TENSOR_MAP_SWIZZLE_NONE), CUDA_ERROR_INVALID_VALUE},
+        {"a box of 257", enc(base, big, CU_TENSOR_MAP_SWIZZLE_NONE), CUDA_ERROR_INVALID_VALUE},
+        {"a 128-byte box row under the 64-byte swizzle", enc(base, wide, CU_TENSOR_MAP_SWIZZLE_64B),
+         CUDA_ERROR_INVALID_VALUE},
+        {"the 128B swizzle with 32B atoms", enc(base, box, CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B),
+         CUDA_ERROR_NOT_SUPPORTED},
+        {"a replaced address off 16 bytes", cuTensorMapReplaceAddress(&map, odd), CUDA_ERROR_INVALID_VALUE},
+    };
+    for (const auto& c : cases)
+      if (c.got != c.want) {
+        printf("FAIL cuTensorMapEncodeTiled with %s -> %d, expected %d\n", c.what, (int)c.got, (int)c.want);
+        return 1;
+      }
+  }
+
   CK(cuMemFree(buf));
   CK(cuModuleUnload(mod));
   CK(cuCtxDestroy(ctx));

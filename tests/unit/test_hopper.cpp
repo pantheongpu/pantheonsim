@@ -1,4 +1,5 @@
-// Hopper (sm_90a): the warpgroup MMA.
+// Hopper (sm_90a): the warpgroup MMA, and the TMA data path around it --
+// mbarrier transaction counts, bulk and tensor copies, thread-block clusters.
 //
 // The shared-memory tiles here are laid out from the worked examples in the
 // PTX ISA itself (section 9.7.17.5.1.2.1.3, figures 169-173), each written
@@ -16,6 +17,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
+#include "vgpu/exec/tensormap.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
@@ -562,6 +564,422 @@ SKIP:
   auto err = VCAPTURE(Error, exec::launch(m.entries[0], LaunchConfig{}, {arg(1)}, mem, prof));
   VCHECK(err.code() == Err::Trap);
   VCHECK_CONTAINS(err.message(), "brkpt");
+}
+
+// ---- the TMA data path ---------------------------------------------------------
+
+namespace {
+
+// Runs a one-kernel module; returns nothing, the kernel writes `out`.
+void run(const std::string& body_ptx, const LaunchConfig& cfg,
+         std::vector<std::vector<uint8_t>> args, MemoryManager& mem) {
+  DeviceProfile prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(std::string(kHeader90a) + body_ptx);
+  exec::launch(m.entries[0], cfg, args, mem, prof);
+}
+
+std::vector<uint8_t> tmap_arg(const exec::TensorMap& t) {
+  std::vector<uint8_t> b(128);
+  t.encode(b.data());
+  return b;
+}
+
+}  // namespace
+
+// Transactions hold a phase open: arrivals alone do not complete it while
+// expect-tx bytes are outstanding, and complete-tx releases it.
+VTEST(mbarrier_phase_waits_for_its_transaction_bytes) {
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(16);
+  run(R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    .shared .align 8 .b64 bar;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, bar;
+    mbarrier.init.shared::cta.b64 [%r1], 1;
+    mbarrier.arrive.expect_tx.shared::cta.b64 _, [%r1], 64;
+    mbarrier.test_wait.parity.shared::cta.b64 %p1, [%r1], 0;
+    mbarrier.complete_tx.shared::cta.b64 [%r1], 32;
+    mbarrier.test_wait.parity.shared::cta.b64 %p2, [%r1], 0;
+    mbarrier.complete_tx.shared::cta.b64 [%r1], 32;
+    mbarrier.try_wait.parity.shared::cta.b64 %p3, [%r1], 0, 1000;
+    selp.u32 %r2, 1, 0, %p1;
+    selp.u32 %r3, 1, 0, %p2;
+    selp.u32 %r4, 1, 0, %p3;
+    st.global.u32 [%rd1], %r2;
+    st.global.u32 [%rd1+4], %r3;
+    st.global.u32 [%rd1+8], %r4;
+    ret;
+}
+)", LaunchConfig{}, {arg_u64(out)}, mem);
+  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{0});   // arrived, 64 bytes outstanding
+  VCHECK_EQ(mem.load_scalar(out + 4, 4), uint64_t{0});   // 32 still outstanding
+  VCHECK_EQ(mem.load_scalar(out + 8, 4), uint64_t{1});   // complete
+}
+
+// A plain bulk copy in and out: global -> shared on an mbarrier, shared ->
+// global in a bulk group. The loaded bytes are not in shared memory until the
+// barrier is waited on, as on hardware they need not be.
+VTEST(bulk_copy_round_trip_lands_when_the_barrier_is_observed) {
+  MemoryManager mem{1 << 20};
+  std::vector<uint8_t> src(256);
+  for (int i = 0; i < 256; ++i) src[i] = static_cast<uint8_t>(i * 7 + 1);
+  const uint64_t in = mem.alloc(256), dst = mem.alloc(256), early = mem.alloc(4);
+  mem.write(in, src.data(), 256);
+  run(R"(
+.visible .entry k(.param .u64 in, .param .u64 dst, .param .u64 early)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    .shared .align 128 .b8 buf[256];
+    .shared .align 8 .b64 bar;
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [dst];
+    ld.param.u64 %rd3, [early];
+    mov.u32 %r1, buf;
+    mov.u32 %r2, bar;
+    mbarrier.init.shared::cta.b64 [%r2], 1;
+    mbarrier.arrive.expect_tx.shared::cta.b64 _, [%r2], 256;
+    cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%r1], [%rd1], 256, [%r2];
+    ld.shared.u32 %r3, [%r1+4];
+    st.global.u32 [%rd3], %r3;
+WAIT:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1, [%r2], 0;
+    @!%p1 bra WAIT;
+    cp.async.bulk.global.shared::cta.bulk_group [%rd2], [%r1], 256;
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group.read 0;
+    ret;
+}
+)", LaunchConfig{}, {arg_u64(in), arg_u64(dst), arg_u64(early)}, mem);
+  VCHECK_EQ(mem.load_scalar(early, 4), uint64_t{0});   // not there before the wait
+  std::vector<uint8_t> got(256);
+  mem.read(dst, got.data(), 256);
+  VCHECK(got == src);
+}
+
+// A 2D tensor load with the 128-byte swizzle and a box that runs off two
+// edges of the tensor. The expected shared-memory image is built from the
+// swizzle table in PTX ISA 5.5.7 -- each row lists which source 16-byte chunk
+// lands in each position -- not from the formula the interpreter uses.
+VTEST(tensor_load_swizzles_128b_and_zero_fills_past_the_edge) {
+  static const int kTable128[8][8] = {
+      {0, 1, 2, 3, 4, 5, 6, 7}, {1, 0, 3, 2, 5, 4, 7, 6}, {2, 3, 0, 1, 6, 7, 4, 5},
+      {3, 2, 1, 0, 7, 6, 5, 4}, {4, 5, 6, 7, 0, 1, 2, 3}, {5, 4, 7, 6, 1, 0, 3, 2},
+      {6, 7, 4, 5, 2, 3, 0, 1}, {7, 6, 5, 4, 3, 2, 1, 0}};
+  constexpr int W = 40, H = 20, kStride = 96;   // u16, rows padded to 96 bytes
+  constexpr int X0 = 8, Y0 = 16;                // box origin; 64 x 8 box
+  MemoryManager mem{1 << 20};
+  const uint64_t g = mem.alloc(size_t(H) * kStride), out = mem.alloc(1024);
+  auto gval = [](int x, int y) { return static_cast<uint16_t>(1000 + y * 64 + x); };
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) mem.store_scalar(g + uint64_t(y) * kStride + x * 2, 2, gval(x, y));
+  exec::TensorMap t;
+  t.address = g;
+  t.rank = 2;
+  t.type = exec::TmapType::U16;
+  t.swizzle = exec::TmapSwizzle::B128;
+  t.dim = {W, H, 1, 1, 1};
+  t.stride = {2, kStride, 0, 0, 0};
+  t.box = {64, 8, 1, 1, 1};
+  t.elem_stride = {1, 1, 1, 1, 1};
+  run(R"(
+.visible .entry k(.param .align 64 .b8 tmap[128], .param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .shared .align 1024 .b8 tile[1024];
+    .shared .align 8 .b64 bar;
+    ld.param.u64 %rd1, [out];
+    mov.b64 %rd2, tmap;
+    cvta.param.u64 %rd3, %rd2;
+    mov.u32 %r1, tile;
+    mov.u32 %r2, bar;
+    mov.u32 %r3, %tid.x;
+    setp.ne.u32 %p1, %r3, 0;
+    @%p1 bra ISSUED;
+    mbarrier.init.shared::cta.b64 [%r2], 1;
+    mbarrier.arrive.expect_tx.shared::cta.b64 _, [%r2], 1024;
+    mov.u32 %r4, 8;
+    mov.u32 %r5, 16;
+    cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%r1], [%rd3, {%r4, %r5}], [%r2], %rd2;
+ISSUED:
+    bar.sync 0;
+WAIT:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1, [%r2], 0;
+    @!%p1 bra WAIT;
+    shl.b32 %r6, %r3, 3;
+    add.u32 %r7, %r1, %r6;
+    ld.shared.u64 %rd4, [%r7];
+    cvt.u64.u32 %rd5, %r6;
+    add.u64 %rd6, %rd1, %rd5;
+    st.global.u64 [%rd6], %rd4;
+    ret;
+}
+)", [] { LaunchConfig c; c.block = {128, 1, 1}; return c; }(), {tmap_arg(t), arg_u64(out)}, mem);
+  for (int r = 0; r < 8; ++r)
+    for (int c = 0; c < 64; ++c) {
+      const int dense = (r * 64 + c) * 2;
+      const int line = dense / 128, chunk = (dense % 128) / 16, within = dense % 16;
+      int pos = 0;
+      while (kTable128[line % 8][pos] != chunk) ++pos;
+      const uint64_t at = uint64_t(line) * 128 + pos * 16 + within;
+      const int x = X0 + c, y = Y0 + r;
+      const uint16_t want = (x < W && y < H) ? gval(x, y) : 0;
+      VCHECK_EQ(mem.load_scalar(out + at, 2), uint64_t{want});
+    }
+}
+
+// A tensor store writes the part of the box inside the tensor and nothing
+// past its edge.
+VTEST(tensor_store_writes_only_inside_the_tensor) {
+  constexpr int W = 24, H = 6;   // u32; the 16 x 4 box at (16, 4) half hangs off
+  MemoryManager mem{1 << 20};
+  const uint64_t g = mem.alloc(size_t(W) * H * 4 + 256);
+  for (int i = 0; i < W * H + 64; ++i) mem.store_scalar(g + uint64_t(i) * 4, 4, 0xEEEEEEEEu);
+  exec::TensorMap t;
+  t.address = g;
+  t.rank = 2;
+  t.type = exec::TmapType::U32;
+  t.dim = {W, H, 1, 1, 1};
+  t.stride = {4, W * 4, 0, 0, 0};
+  t.box = {16, 4, 1, 1, 1};
+  t.elem_stride = {1, 1, 1, 1, 1};
+  run(R"(
+.visible .entry k(.param .align 64 .b8 tmap[128])
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    .shared .align 128 .b8 tile[256];
+    mov.b64 %rd1, tmap;
+    cvta.param.u64 %rd2, %rd1;
+    mov.u32 %r1, tile;
+    mov.u32 %r2, %tid.x;
+    shl.b32 %r3, %r2, 2;
+    add.u32 %r4, %r1, %r3;
+    add.u32 %r5, %r2, 100;
+    st.shared.u32 [%r4], %r5;
+    bar.sync 0;
+    setp.ne.u32 %p1, %r2, 0;
+    @%p1 bra DONE;
+    mov.u32 %r6, 16;
+    mov.u32 %r7, 4;
+    fence.proxy.async.shared::cta;
+    cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%rd2, {%r6, %r7}], [%r1];
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group 0;
+DONE:
+    ret;
+}
+)", [] { LaunchConfig c; c.block = {64, 1, 1}; return c; }(),
+      {tmap_arg(t)}, mem);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      const bool in_box = x >= 16 && y >= 4;
+      const uint64_t want = in_box ? uint64_t((y - 4) * 16 + (x - 16) + 100) : 0xEEEEEEEEu;
+      VCHECK_EQ(mem.load_scalar(g + (uint64_t(y) * W + x) * 4, 4), want);
+    }
+  // Past the tensor's end, untouched.
+  VCHECK_EQ(mem.load_scalar(g + uint64_t(W) * H * 4, 4), uint64_t{0xEEEEEEEEu});
+}
+
+VTEST(tensor_copy_refuses_a_map_nothing_encoded) {
+  MemoryManager mem{1 << 20};
+  std::vector<uint8_t> junk(128, 0x5A);
+  auto err = VCAPTURE(Error, run(R"(
+.visible .entry k(.param .align 64 .b8 tmap[128])
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    .shared .align 128 .b8 tile[256];
+    .shared .align 8 .b64 bar;
+    mov.b64 %rd1, tmap;
+    cvta.param.u64 %rd2, %rd1;
+    mov.u32 %r1, tile;
+    mov.u32 %r2, bar;
+    mov.u32 %r3, 0;
+    mbarrier.init.shared::cta.b64 [%r2], 1;
+    cp.async.bulk.tensor.1d.shared::cluster.global.mbarrier::complete_tx::bytes [%r1], [%rd2, {%r3}], [%r2];
+    ret;
+}
+)", LaunchConfig{}, {junk}, mem));
+  VCHECK_CONTAINS(err.message(), "not made by cuTensorMapEncodeTiled");
+}
+
+// barrier.cluster across the two blocks of a cluster: rank 1 publishes, rank 0
+// reads after the wait. Both blocks have four warps, which needs each block
+// to be scheduled on its own -- one scheduler shared by both handed block 0
+// only warps 0 and 2 -- and some of rank 1's threads exit early, which must
+// not hold the barrier.
+VTEST(barrier_cluster_orders_the_blocks_of_a_cluster) {
+  MemoryManager mem{1 << 20};
+  const uint64_t flag = mem.alloc(4), out = mem.alloc(128 * 4);
+  mem.store_scalar(flag, 4, 0);
+  run(R"(
+.visible .entry k(.param .u64 flag, .param .u64 out)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [flag];
+    ld.param.u64 %rd2, [out];
+    mov.u32 %r1, %cluster_ctarank;
+    mov.u32 %r2, %tid.x;
+    setp.eq.u32 %p1, %r1, 1;
+    setp.ge.u32 %p2, %r2, 120;
+    and.pred %p3, %p1, %p2;
+    @%p3 bra GONE;
+    setp.ne.u32 %p2, %r2, 0;
+    not.pred %p3, %p1;
+    or.pred %p2, %p2, %p3;
+    @%p2 bra ARRIVE;
+    mov.u32 %r3, 77;
+    st.global.u32 [%rd1], %r3;
+ARRIVE:
+    barrier.cluster.arrive.aligned;
+    barrier.cluster.wait.aligned;
+    @%p1 bra GONE;
+    ld.global.u32 %r4, [%rd1];
+    mul.wide.u32 %rd3, %r2, 4;
+    add.u64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r4;
+GONE:
+    ret;
+}
+)", [] {
+    LaunchConfig c;
+    c.grid = {2, 1, 1};
+    c.block = {128, 1, 1};
+    c.cluster = {2, 1, 1};
+    return c;
+  }(), {arg_u64(flag), arg_u64(out)}, mem);
+  for (int i = 0; i < 128; ++i) VCHECK_EQ(mem.load_scalar(out + i * 4, 4), uint64_t{77});
+}
+
+// Labels belong to the { } block that defines them: inline asm repeats the
+// same names in every block it expands to.
+VTEST(labels_are_scoped_to_their_block) {
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(8);
+  run(R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<2>;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, 0;
+    {
+    .reg .pred P1;
+    LOOP:
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 P1, %r1, 3;
+    @P1 bra LOOP;
+    }
+    {
+    .reg .pred P1;
+    LOOP:
+    add.u32 %r1, %r1, 10;
+    setp.lt.u32 P1, %r1, 33;
+    @P1 bra LOOP;
+    bra DONE;
+    DONE:
+    }
+    st.global.u32 [%rd1], %r1;
+    ret;
+}
+)", LaunchConfig{}, {arg_u64(out)}, mem);
+  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{33});
+}
+
+// A lane can reach bar.sync from a higher pc: nvcc puts a rarely taken block
+// after the kernel's ret and branches back from it. The barrier waits for it.
+VTEST(bar_sync_waits_for_lanes_in_code_placed_after_ret) {
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(64 * 4);
+  run(R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<4>;
+    .shared .align 4 .b32 x;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 bra OUTLINE;
+BACK:
+    bar.sync 0;
+    ld.shared.u32 %r2, [x];
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r2;
+    ret;
+OUTLINE:
+    mov.u32 %r3, 42;
+    st.shared.u32 [x], %r3;
+    bra BACK;
+}
+)", [] { LaunchConfig c; c.block = {64, 1, 1}; return c; }(), {arg_u64(out)}, mem);
+  for (int i = 0; i < 64; ++i) VCHECK_EQ(mem.load_scalar(out + i * 4, 4), uint64_t{42});
+}
+
+// Dynamic shared memory starts at its declared alignment, not wherever the
+// static data happens to end.
+VTEST(dynamic_shared_memory_starts_at_its_declared_alignment) {
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(8);
+  const std::string ptx = R"(
+.extern .shared .align 128 .b8 dyn[];
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<2>;
+    .shared .align 4 .b8 small[12];
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, dyn;
+    mov.u32 %r2, small;
+    st.shared.u32 [%r2], %r1;
+    st.global.u32 [%rd1], %r1;
+    st.shared.u32 [%r1], %r1;
+    ret;
+}
+)";
+  LaunchConfig c;
+  c.shared_bytes = 64;
+  run(ptx, c, {arg_u64(out)}, mem);
+  const uint64_t off = mem.load_scalar(out, 4);
+  VCHECK(off >= 12 && off % 128 == 0);
+}
+
+// A kernel parameter reached through a generic pointer -- how a
+// __grid_constant__ struct is read -- and cvta.param, which is the identity
+// on a parameter's address.
+VTEST(generic_pointer_to_a_kernel_parameter) {
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(8);
+  std::vector<uint8_t> blob(16);
+  const uint64_t v = 0x1122334455667788ull;
+  std::memcpy(blob.data() + 8, &v, 8);
+  run(R"(
+.visible .entry k(.param .align 8 .b8 blob[16], .param .u64 out)
+{
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    mov.b64 %rd2, blob;
+    cvta.param.u64 %rd3, %rd2;
+    ld.u64 %rd4, [%rd3+8];
+    st.global.u64 [%rd1], %rd4;
+    ret;
+}
+)", LaunchConfig{}, {blob, arg_u64(out)}, mem);
+  VCHECK_EQ(mem.load_scalar(out, 8), v);
 }
 
 VTEST_MAIN

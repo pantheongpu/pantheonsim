@@ -345,7 +345,7 @@ struct OpFns { Reg dst; Operand mask, base, offset; };
 // yet, and answers with a predicate rather than blocking -- so the kernel
 // spins, which is exactly what it does on hardware.
 enum class MbarOp : uint8_t {
-  Init, Inval, Arrive, ArriveDrop, TestWait, TryWait, PendingCount,
+  Init, Inval, Arrive, ArriveDrop, TestWait, TryWait, PendingCount, ExpectTx, CompleteTx,
 };
 struct OpMbarrier {
   MbarOp op = MbarOp::Init;
@@ -356,7 +356,31 @@ struct OpMbarrier {
   bool have_count = false;
   Operand state;            // test_wait's token, or try_wait.parity's parity
   bool have_state = false;
+  bool expect_tx = false;   // arrive.expect_tx: `count` is the transaction bytes
+  bool no_complete = false; // arrive.noComplete: must not complete the phase
 };
+// barrier.cluster.arrive / barrier.cluster.wait: all threads of a
+// thread-block cluster.
+struct OpClusterBarrier { bool wait = false; };
+// Hopper's bulk asynchronous copies (TMA): cp.async.bulk between global and
+// shared memory, and cp.async.bulk.tensor, which moves a box of a tensor a
+// tensor map describes. Loads complete on an mbarrier; stores join a bulk
+// async-group.
+struct OpBulkCopy {
+  bool to_shared = true;        // global -> shared (else shared -> global)
+  bool tensor = false;
+  uint32_t dims = 0;            // .1d .. .5d
+  Addr smem;                    // the shared side
+  Addr gmem;                    // the global side of a plain bulk copy
+  Operand tmap;                 // the tensor map's generic address
+  std::vector<Operand> coords;  // the box's starting coordinates
+  Operand size;                 // a plain bulk copy's byte count
+  Addr mbar;                    // loads: the barrier that counts the bytes
+  bool multicast = false;
+  Operand cta_mask;
+};
+// cp.async.bulk.commit_group / cp.async.bulk.wait_group[.read] N
+struct OpBulkGroup { bool wait = false; uint32_t keep = 0; };
 // FP8 pack/unpack. The conversions always move a *pair*: PTX has no scalar
 // FP8 type, only e4m3x2/e5m2x2 occupying the low 16 bits of a register.
 //   to_fp8   from f32: cvt.rn.satfinite.e4m3x2.f32   d, a, b   (a high, b low)
@@ -627,7 +651,7 @@ struct OpCall {
 };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask>;
 
@@ -725,6 +749,10 @@ struct EntryFn {
   std::map<std::string, SharedDecl> shared;   // .shared variables (per block)
   uint32_t static_shared_size = 0;            // statically declared shared bytes
   bool uses_dynamic_shared = false;
+  // Where dynamic shared memory begins: above the static allocations,
+  // rounded up to the largest alignment an extern .shared declaration asks
+  // for. Equal to static_shared_size when nothing asks for more.
+  uint32_t dynamic_shared_offset = 0;
 };
 
 // A module-scope .global/.const variable, materialized into device memory at

@@ -62,9 +62,10 @@ Known limitations (deliberate, documented):
   statically — see [nvidia/docs/jit.md](nvidia/docs/jit.md).
 - `wmma` fragment layout is VirtualGPU's own (PTX leaves it unspecified) —
   see ARCHITECTURE.md D8. bf16, `cp.async`, `mma.sync`, `ldmatrix`, the
-  extended-precision carry family, textures, surfaces, grid sync and Hopper's
-  warpgroup MMA (`wgmma`, checked against CuTe) are implemented; TMA and
-  distributed shared memory are not. Every gap fails loudly (instruction, PTX
+  extended-precision carry family, textures, surfaces, grid sync, Hopper's
+  warpgroup MMA (`wgmma`) and TMA with thread-block cluster barriers are
+  implemented -- checked against CuTe and CUTLASS's own Hopper unit tests;
+  distributed shared memory is not. Every gap fails loudly (instruction, PTX
   line, kernel, profile), never silently.
 - NVENC (video encode) is served by `libvgpunvenc`, presented as
   `libnvidia-encode.so.1`: the documented API with a deterministic,

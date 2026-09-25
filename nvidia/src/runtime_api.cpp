@@ -3236,6 +3236,62 @@ VGPU_EXPORT cudaError_t cudaRuntimeGetVersion(int* v) {
   return cudaSuccess;
 }
 
+// Driver entry points: how a runtime program reaches a driver function without
+// linking libcuda -- CUTLASS gets cuTensorMapEncodeTiled this way. The answer
+// has to come from this simulator's libcuda, not from whatever libcuda.so.1 the
+// loader would find by name: on a machine with an NVIDIA driver installed that
+// is the real one, and a tensor map encoded by it means nothing here. So the
+// library is the one sitting next to this libcudart.
+namespace {
+using GetProcAddressFn = int (*)(const char*, void**, int, unsigned long long, int*);
+GetProcAddressFn simulator_get_proc_address() {
+  static GetProcAddressFn fn = []() -> GetProcAddressFn {
+    Dl_info self{};
+    if (!dladdr(reinterpret_cast<void*>(&simulator_get_proc_address), &self) || !self.dli_fname)
+      return nullptr;
+    std::string dir = self.dli_fname;
+    dir = dir.substr(0, dir.find_last_of('/') + 1);
+    void* h = dlopen((dir + "libcuda.so.1").c_str(), RTLD_NOW | RTLD_GLOBAL);
+    return h ? reinterpret_cast<GetProcAddressFn>(dlsym(h, "cuGetProcAddress_v2")) : nullptr;
+  }();
+  return fn;
+}
+
+cudaError_t driver_entry_point(const char* symbol, void** funcPtr, int version,
+                               unsigned long long flags,
+                               cudaDriverEntryPointQueryResult* driverStatus) {
+  if (!symbol || !funcPtr) return cudaErrorInvalidValue;
+  if (version > vgpu::driver_version()) return cudaErrorInvalidValue;
+  *funcPtr = nullptr;
+  GetProcAddressFn get = simulator_get_proc_address();
+  if (!get) {
+    std::fprintf(stderr, "[vgpu] cudaGetDriverEntryPoint: this simulator's libcuda.so.1 was not "
+                         "found beside its libcudart\n");
+    return cudaErrorNotSupported;
+  }
+  int status = 0;
+  // The CUresult is not the question; the status says whether it was found.
+  (void)get(symbol, funcPtr, version, flags, &status);
+  if (!*funcPtr && status == 0) status = 1;   // CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND
+  if (driverStatus) *driverStatus = static_cast<cudaDriverEntryPointQueryResult>(status);
+  return cudaSuccess;
+}
+}  // namespace
+
+VGPU_EXPORT cudaError_t cudaGetDriverEntryPoint(const char* symbol, void** funcPtr,
+                                                unsigned long long flags,
+                                                cudaDriverEntryPointQueryResult* driverStatus) {
+  return driver_entry_point(symbol, funcPtr, CUDART_VERSION, flags, driverStatus);
+}
+#if CUDART_VERSION >= 12050
+VGPU_EXPORT cudaError_t cudaGetDriverEntryPointByVersion(const char* symbol, void** funcPtr,
+                                                         unsigned int cudaVersion,
+                                                         unsigned long long flags,
+                                                         cudaDriverEntryPointQueryResult* driverStatus) {
+  return driver_entry_point(symbol, funcPtr, static_cast<int>(cudaVersion), flags, driverStatus);
+}
+#endif
+
 /* ===================================================================== */
 /* CUDA Graphs: real stream capture and replay                           */
 /*                                                                       */

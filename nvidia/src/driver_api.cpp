@@ -30,6 +30,7 @@
 #include "fatbin.hpp"
 #include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
+#include "vgpu/exec/tensormap.hpp"
 #include "vgpu/profiling.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
@@ -1569,11 +1570,107 @@ VGPU_EXPORT CUresult cuLinkComplete(void* state, void** imageOut, size_t* sizeOu
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuTensorMapEncodeTiled(void*, unsigned int, unsigned int, void*,
-                                            const unsigned long long*, const unsigned long long*,
-                                            const unsigned int*, const unsigned int*, unsigned int,
-                                            unsigned int, unsigned int, unsigned int) {
-  return CUDA_ERROR_NOT_SUPPORTED;  // Hopper TMA descriptors
+// Hopper TMA descriptors. The object is opaque (include/vgpu/exec/tensormap.hpp
+// holds this simulator's layout of it); what is not opaque is the list of
+// requirements cuda.h documents, and each one is checked, so a map that the
+// real driver would refuse is refused here with the rule it broke. Encoding
+// needs no context: it touches no device, and CUTLASS calls it before any.
+VGPU_EXPORT CUresult cuTensorMapEncodeTiled(void* tensorMap, unsigned int dataType, unsigned int rank,
+                                            void* globalAddress, const unsigned long long* globalDim,
+                                            const unsigned long long* globalStrides,
+                                            const unsigned int* boxDim,
+                                            const unsigned int* elementStrides, unsigned int interleave,
+                                            unsigned int swizzle, unsigned int l2Promotion,
+                                            unsigned int oobFill) {
+  return api("cuTensorMapEncodeTiled", false, false, [&](ShimState&) -> CUresult {
+    using vgpu::exec::TensorMap;
+    using vgpu::exec::TmapSwizzle;
+    using vgpu::exec::TmapType;
+    auto bad = [](const std::string& why) -> CUresult {
+      throw vgpu::Error::make(vgpu::Err::InvalidValue, "cuTensorMapEncodeTiled: ", why);
+    };
+    auto unsupported = [](const std::string& why) -> CUresult {
+      throw vgpu::Error::make(vgpu::Err::Unsupported, "cuTensorMapEncodeTiled: ", why,
+                              " is not implemented");
+    };
+    if (!tensorMap || !globalDim || !boxDim || !elementStrides || (rank > 1 && !globalStrides))
+      return bad("a required pointer is null");
+    if (reinterpret_cast<uintptr_t>(tensorMap) % 64) return bad("tensorMap must be 64-byte aligned");
+    if (dataType > 15) return bad("unknown tensorDataType " + std::to_string(dataType));
+    if (rank == 0 || rank > 5) return bad("tensorRank must be 1 to 5");
+    if (interleave > 2 || swizzle > 6 || l2Promotion > 3 || oobFill > 1)
+      return bad("an enum argument is out of range");
+    const auto type = static_cast<TmapType>(dataType);
+    const uint32_t esize = TensorMap::type_bytes(type);
+    if (esize == 0) return unsupported("the packed sub-byte types (16U4, 16U6)");
+    if (interleave != 0) return unsupported("an interleaved layout (NC/8HWC8, NC/16HWC16)");
+    if (swizzle > 3) return unsupported("the 128B swizzle with 32B or 64B atomicity (Blackwell)");
+    const uint64_t addr = reinterpret_cast<uint64_t>(globalAddress);
+    if (addr % 16) return bad("globalAddress must be 16-byte aligned");
+    TensorMap m;
+    m.address = addr;
+    m.rank = rank;
+    m.type = type;
+    m.swizzle = static_cast<TmapSwizzle>(swizzle);
+    const bool is_float = type == TmapType::F16 || type == TmapType::F32 || type == TmapType::F64 ||
+                          type == TmapType::BF16 || type == TmapType::F32Ftz ||
+                          type == TmapType::TF32 || type == TmapType::TF32Ftz;
+    if (oobFill && !is_float) return bad("the NaN out-of-bounds fill needs a floating-point type");
+    m.oob_nan = static_cast<uint8_t>(oobFill);
+    m.stride[0] = esize;
+    for (unsigned i = 0; i < rank; ++i) {
+      if (globalDim[i] == 0 || globalDim[i] > (1ull << 32))
+        return bad("globalDim[" + std::to_string(i) + "] must be 1 to 2^32");
+      if (boxDim[i] == 0 || boxDim[i] > 256) return bad("boxDim[" + std::to_string(i) + "] must be 1 to 256");
+      if (elementStrides[i] == 0 || elementStrides[i] > 8)
+        return bad("elementStrides[" + std::to_string(i) + "] must be 1 to 8");
+      m.dim[i] = globalDim[i];
+      m.box[i] = boxDim[i];
+      // With no interleave the first element stride is ignored: TMA has no
+      // stride along dimension 0.
+      m.elem_stride[i] = i == 0 ? 1 : elementStrides[i];
+    }
+    for (unsigned i = 0; i + 1 < rank; ++i) {
+      if (globalStrides[i] % 16 || globalStrides[i] >= (1ull << 40))
+        return bad("globalStrides[" + std::to_string(i) + "] must be a multiple of 16 below 2^40");
+      m.stride[i + 1] = globalStrides[i];
+    }
+    if (uint64_t{boxDim[0]} * esize % 16)
+      return bad("boxDim[0] times the element size must be a multiple of 16 bytes");
+    const uint32_t swz = TensorMap::swizzle_bytes(m.swizzle);
+    if (swz && uint64_t{boxDim[0]} * esize > swz)
+      return bad("the box's inner dimension (" + std::to_string(uint64_t{boxDim[0]} * esize) +
+                 " bytes) is wider than the " + std::to_string(swz) + "-byte swizzle");
+    m.encode(tensorMap);
+    return CUDA_SUCCESS;
+  });
+}
+
+// Points an existing map at a new base address, keeping everything else.
+VGPU_EXPORT CUresult cuTensorMapReplaceAddress(void* tensorMap, void* globalAddress) {
+  return api("cuTensorMapReplaceAddress", false, false, [&](ShimState&) -> CUresult {
+    vgpu::exec::TensorMap m;
+    if (!tensorMap || !m.decode(tensorMap))
+      throw vgpu::Error::make(vgpu::Err::InvalidValue,
+                              "cuTensorMapReplaceAddress: tensorMap was not made by cuTensorMapEncode*");
+    if (reinterpret_cast<uint64_t>(globalAddress) % 16)
+      throw vgpu::Error::make(vgpu::Err::InvalidValue,
+                              "cuTensorMapReplaceAddress: globalAddress must be 16-byte aligned");
+    m.address = reinterpret_cast<uint64_t>(globalAddress);
+    m.encode(tensorMap);
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuTensorMapEncodeIm2col(void*, unsigned int, unsigned int, void*,
+                                             const unsigned long long*, const unsigned long long*,
+                                             const int*, const int*, unsigned int, unsigned int,
+                                             const unsigned int*, unsigned int, unsigned int,
+                                             unsigned int, unsigned int) {
+  return api("cuTensorMapEncodeIm2col", false, false, [&](ShimState&) -> CUresult {
+    throw vgpu::Error::make(vgpu::Err::Unsupported,
+                            "cuTensorMapEncodeIm2col: TMA's im2col mode is not implemented");
+  });
 }
 
 VGPU_EXPORT CUresult cuMemsetD8_v2(CUdeviceptr d, unsigned char v, size_t n) {
@@ -2257,6 +2354,8 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuOccupancyMaxActiveBlocksPerMultiprocessor),
     VGPU_PROC(cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags),
     VGPU_PROC(cuGetExportTable),
+    VGPU_PROC(cuTensorMapEncodeTiled), VGPU_PROC(cuTensorMapReplaceAddress),
+    VGPU_PROC(cuTensorMapEncodeIm2col),
 };
 
 // Versioned/suffixed request names resolve to the same synchronous impls:

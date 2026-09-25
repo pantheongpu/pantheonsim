@@ -1108,6 +1108,21 @@ if(TARGET vgpucudart)
     TIMEOUT 900)
 endif()
 
+# TMA: a CUTLASS-style Hopper GEMM (clusters, a TMA pipeline, wgmma) checked
+# exactly, and CUTLASS's own TMA and bulk-copy unit tests run unmodified.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_tma_gemm_cute COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_tma_gemm_cute.sh)
+  set_tests_properties(e2e_tma_gemm_cute PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 900)
+  add_test(NAME e2e_cutlass_hopper COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_hopper.sh)
+  set_tests_properties(e2e_cutlass_hopper PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 1500)
+endif()
+
 # stmatrix: where the warp's registers land in shared memory, and that it is the
 # inverse of ldmatrix. Needs a toolkit that assembles sm_90; skips otherwise.
 if(TARGET vgpucudart)

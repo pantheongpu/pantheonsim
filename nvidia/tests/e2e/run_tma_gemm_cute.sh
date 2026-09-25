@@ -1,20 +1,16 @@
 #!/usr/bin/env bash
-# Hopper's warpgroup MMA against CuTe: every swizzle mode, both majornesses,
-# every element type, A from registers, two warpgroups, negation and scale-d.
-# CuTe supplies the layouts and descriptors, so a misread of the ISA here would
-# disagree with NVIDIA's own code rather than agree with a test written from the
-# same misreading.
-#
-# CuTe is header-only and comes from a pinned CUTLASS release: $CUTLASS_DIR if
-# set, otherwise downloaded once into the build directory. Skips when neither
-# is possible, or when nvcc cannot target sm_90a.
+# A Hopper GEMM the way CUTLASS writes one -- 2-CTA clusters, a TMA pipeline on
+# transaction-counting mbarriers, wgmma on the swizzled tiles -- checked
+# against the exact product. Uses a pinned CUTLASS release like
+# run_wgmma_cute.sh; skips when it cannot be fetched or nvcc cannot target
+# sm_90a.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
 build="${VGPU_BUILD_DIR:-$root/build}"
 shim="$build/shim"
-src="$root/nvidia/tests/e2e/wgmma_cute.cu"
-out="${TMPDIR:-/tmp}/vgpu_e2e_wgmma_cute_$$"
+src="$root/nvidia/tests/e2e/tma_gemm_cute.cu"
+out="${TMPDIR:-/tmp}/vgpu_e2e_tma_gemm_cute_$$"
 if ! command -v nvcc >/dev/null 2>&1; then
   echo "SKIP: nvcc not found (e2e needs the CUDA toolkit to compile the app)"; exit 0
 fi
@@ -24,7 +20,7 @@ shopt -u nullglob
 if (( ${#cudart_libs[@]} == 0 )); then
   echo "SKIP: libvgpucudart not built (CUDA ABI headers absent at build time)"; exit 0
 fi
-probe="${TMPDIR:-/tmp}/vgpu_wgmma_probe_$$.cu"
+probe="${TMPDIR:-/tmp}/vgpu_tma_gemm_probe_$$.cu"
 echo '__global__ void k() { asm volatile("wgmma.fence.sync.aligned;"); }' > "$probe"
 if ! nvcc -arch=compute_90a -code=compute_90a -c "$probe" -o /dev/null 2>/dev/null; then
   rm -f "$probe"
