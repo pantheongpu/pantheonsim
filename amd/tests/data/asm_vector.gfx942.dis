@@ -3,6 +3,10 @@ s_load_dwordx2 s[4:5], s[0:1], 0x8
 s_waitcnt lgkmcnt(0)
 v_mbcnt_lo_u32_b32 v0, -1, 0
 v_mbcnt_hi_u32_b32 v0, -1, v0
+s_mov_b32 s40, 3
+s_mov_b32 s41, 0
+v_mad_u64_u32 v[26:27], s[40:41], s40, v0, 0
+v_readlane_b32 s42, v26, 63
 v_cmpx_gt_u32_e32 vcc, s4, v0
 s_bcnt1_i32_b64 s20, exec
 s_bcnt1_i32_b64 s21, vcc
@@ -65,4 +69,8 @@ v_mov_b32_e32 v1, s23
 global_store_dword v0, v1, s[2:3] offset:80
 v_mov_b32_e32 v1, s27
 global_store_dword v0, v1, s[2:3] offset:84
+v_mov_b32_e32 v1, s42
+global_store_dword v0, v1, s[2:3] offset:88
+v_mov_b32_e32 v1, s40
+global_store_dword v0, v1, s[2:3] offset:92
 s_endpgm

@@ -217,6 +217,11 @@ struct Machine {
     return *slot;
   }
   std::unique_ptr<const Inst> scratch_inst;   // one that is not where an instruction starts
+  // The mask a VOP3b instruction writes to its scalar pair (a carry out, or
+  // which lanes v_div_scale scaled), gathered lane by lane and written once
+  // every lane has run: the pair may be one the instruction reads, and every
+  // lane reads it as it was. A lane switched off leaves its bit zero.
+  uint64_t sdst_bits = 0;
 
   // An error from the instruction at pc, saying which one: the kernel, how
   // far into it, and the instruction as the assembler writes it.
@@ -762,10 +767,7 @@ struct Machine {
           }
         }
         write_lane64(w, in.dst[0], lane, as_bits(out));
-        if (in.dst.size() > 1) {
-          const uint64_t bit = uint64_t{1} << lane;
-          write_scalar(w, in.dst[1], (scalar(w, in.dst[1]) & ~bit) | (scaled ? bit : 0));
-        }
+        if (scaled) sdst_bits |= uint64_t{1} << lane;
       } else if (op == "v_div_fmas_f64"_op) {
         const double r = std::fma(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane),
                                   lane_double(w, in.src[2], lane));
@@ -803,10 +805,7 @@ struct Machine {
         }
       }
       write_lane(w, in.dst[0], lane, as_bits(out));
-      if (in.dst.size() > 1) {
-        const uint64_t bit = uint64_t{1} << lane;
-        write_scalar(w, in.dst[1], (scalar(w, in.dst[1]) & ~bit) | (scaled ? bit : 0));
-      }
+      if (scaled) sdst_bits |= uint64_t{1} << lane;
     } else if (op == "v_div_fmas_f32"_op) {
       // A fused multiply-add, times 2^64 where the scaling said so.
       const float r = std::fma(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane),
@@ -1200,6 +1199,7 @@ struct Machine {
                                          static_cast<int32_t>(lane_src(w, in.src[2], lane))));
       });
     } else if (op == "v_mad_i64_i32"_op) {
+      sdst_bits = 0;
       each([&](uint32_t lane) {
         // A signed 32x32 product added to a signed 64-bit value, and whether
         // that overflowed.
@@ -1207,11 +1207,9 @@ struct Machine {
                                static_cast<int32_t>(lane_src(w, in.src[1], lane)) +
                            static_cast<int64_t>(lane_src64(w, in.src[2], lane));
         write_lane64(w, in.dst[0], lane, static_cast<uint64_t>(p));
-        if (in.dst.size() > 1) {
-          const uint64_t over = p != static_cast<int64_t>(p) ? uint64_t{1} << lane : 0;
-          write_scalar(w, in.dst[1], (scalar(w, in.dst[1]) & ~(uint64_t{1} << lane)) | over);
-        }
+        if (p != static_cast<int64_t>(p)) sdst_bits |= uint64_t{1} << lane;
       });
+      if (in.dst.size() > 1) write_scalar(w, in.dst[1], sdst_bits);
     } else if (op == "v_add_f16_e32"_op) {
       each([&](uint32_t lane) {
         write_half(w, in, lane, lane_half(w, in.src[0], lane) + lane_half(w, in.src[1], lane));
@@ -1657,21 +1655,22 @@ struct Machine {
                    lane_src(w, in.src[1], lane) + static_cast<uint32_t>(__builtin_popcount(mask & below)));
       });
     } else if (op.rfind("v_div_", 0) == 0) {
+      sdst_bits = 0;
       each([&](uint32_t lane) {
         divide_step(w, in, lane);
       });
+      if (in.dst.size() > 1) write_scalar(w, in.dst[1], sdst_bits);
     } else if (op == "v_mad_u64_u32"_op) {
+      sdst_bits = 0;
       each([&](uint32_t lane) {
         // A 32x32 product added to a 64-bit value, with the carry out.
         const unsigned __int128 p = static_cast<unsigned __int128>(lane_src(w, in.src[0], lane)) *
                                         lane_src(w, in.src[1], lane) +
                                     lane_src64(w, in.src[2], lane);
         write_lane64(w, in.dst[0], lane, static_cast<uint64_t>(p));
-        if (in.dst.size() > 1) {
-          const uint64_t carry = static_cast<uint64_t>(p >> 64) ? uint64_t{1} << lane : 0;
-          write_scalar(w, in.dst[1], (scalar(w, in.dst[1]) & ~(uint64_t{1} << lane)) | carry);
-        }
+        if (static_cast<uint64_t>(p >> 64)) sdst_bits |= uint64_t{1} << lane;
       });
+      if (in.dst.size() > 1) write_scalar(w, in.dst[1], sdst_bits);
     } else if (op == "v_readlane_b32"_op) {
       each([&](uint32_t lane) {
         // Reads one lane, into a scalar register: not a per-lane operation.

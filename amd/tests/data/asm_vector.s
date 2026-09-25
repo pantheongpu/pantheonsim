@@ -7,7 +7,7 @@
 // comparison of part of a register. Built for gfx942 by build.sh, with
 // clang's assembler.
 //
-// vector(int* out, int x, int y) writes 22 words, in the order the test
+// vector(int* out, int x, int y) writes 24 words, in the order the test
 // lists them; x is the number of lanes the first comparison keeps.
   .amdgcn_target "amdgcn-amd-amdhsa--gfx942"
   .text
@@ -21,6 +21,13 @@ vector:
   // The comparisons that write EXEC: lanes below x, then of those lane 3.
   v_mbcnt_lo_u32_b32 v0, -1, 0
   v_mbcnt_hi_u32_b32 v0, -1, v0
+  // Every lane multiplies its number by s40, and the carry out goes to the
+  // pair s40 is in: each lane must read s40 as it was, not as an earlier
+  // lane left it (rocBLAS's strided scal does exactly this).
+  s_mov_b32 s40, 3
+  s_mov_b32 s41, 0
+  v_mad_u64_u32 v[26:27], s[40:41], s40, v0, 0
+  v_readlane_b32 s42, v26, 63
   v_cmpx_gt_u32_e32 vcc, s4, v0
   s_bcnt1_i32_b64 s20, exec
   s_bcnt1_i32_b64 s21, vcc
@@ -88,6 +95,10 @@ vector:
   global_store_dword v0, v1, s[2:3] offset:80
   v_mov_b32_e32 v1, s27
   global_store_dword v0, v1, s[2:3] offset:84
+  v_mov_b32_e32 v1, s42
+  global_store_dword v0, v1, s[2:3] offset:88
+  v_mov_b32_e32 v1, s40
+  global_store_dword v0, v1, s[2:3] offset:92
   s_endpgm
 .Lvector_end:
   .size vector, .Lvector_end-vector
@@ -97,7 +108,7 @@ vector:
   .amdhsa_kernel vector
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
     .amdhsa_next_free_vgpr 32
-    .amdhsa_next_free_sgpr 40
+    .amdhsa_next_free_sgpr 48
     .amdhsa_accum_offset 32
   .end_amdhsa_kernel
 
@@ -112,7 +123,7 @@ amdhsa.kernels:
     .group_segment_fixed_size: 0
     .private_segment_fixed_size: 0
     .wavefront_size: 64
-    .sgpr_count: 40
+    .sgpr_count: 48
     .vgpr_count: 32
     .max_flat_workgroup_size: 64
     .args:
