@@ -865,9 +865,23 @@ main on the same machine (warp instructions; `VGPU_COUNTERS` over CPU time):
 | omni_virus | 4.0 M | 10.5 M |
 | mma_virus | 0.3 M | 1.1 M |
 
-At full size (30 s, --mem 99, 4 GB A10, a machine other jobs were also
-using) int_virus, pulse_virus and memory_bank_thrash now finish inside
-pantheon's watchdog, which all three used to exceed.
+At full size (the default grid, 30 s, --mem 99, a 4 GB A10 profile) all
+seven used to exceed pantheon's 360 s watchdog. On main after the merge,
+on a machine other jobs were also loading (load average 20-30), five
+finish:
+
+| workload | full size |
+| --- | --- |
+| int_virus | 72 s |
+| memory_bank_thrash | 116 s |
+| pulse_virus | 161 s |
+| omni_virus | 175 s |
+| memory_retention_bake | 195 s |
+| fp64_virus | watchdog (360 s) |
+| mma_virus | watchdog (360 s) |
+
+fp64_virus is held back by the subnormal assists below; mma_virus by the
+matrix work itself, which is still about 1 M warp instructions a second.
 
 One limit found and left alone: on Intel cores a subnormal operand or result
 costs every FP operation a microcode assist, and fp64_virus's FMA chains
