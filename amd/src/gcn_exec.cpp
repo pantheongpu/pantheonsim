@@ -386,6 +386,9 @@ struct Machine {
       case OperandKind::Literal:
         if (top)
           throw Error::make(Err::Unsupported, in.name, " takes the second part of a constant, which this does not model");
+        // Each half of a packed float is a float: an inline float constant
+        // is a float's bits here, though the operand is a register pair.
+        if (o.kind == OperandKind::InlineFloat) return as_bits(static_cast<float>(o.fvalue));
         return static_cast<uint32_t>(scalar(w, o));
       default: return static_cast<uint32_t>(scalar(w, o) >> (32 * top));
     }
@@ -2472,7 +2475,10 @@ struct Machine {
     const auto reg = [&](const Operand& o, uint32_t k, uint32_t lane) -> uint32_t {
       if (o.kind == OperandKind::Agpr) return o.index + k < w.agpr.size() ? w.agpr[o.index + k][lane] : 0;
       if (o.kind == OperandKind::Vgpr) return w.vgpr[o.index + k][lane];
-      return static_cast<uint32_t>(scalar(w, o));   // an inline constant, the same in every lane and register
+      // An inline constant, the same in every lane and register: a float
+      // constant a float's bits in each, whatever the operand's width.
+      if (o.kind == OperandKind::InlineFloat) return as_bits(static_cast<float>(o.fvalue));
+      return static_cast<uint32_t>(scalar(w, o));
     };
     // Value e of a source's run in one lane: a half (two to a register), a
     // float, or a double (a register pair).
