@@ -960,7 +960,8 @@ int cmd_shell(const std::vector<std::string>& args) {
               human_vram(profile.vram_bytes).c_str());
   std::printf("    %-9s: %s\n", profile.vendor == "amd" ? "ROCm" : "CUDA",
               profile.vendor == "amd" ? c.rocm.c_str() : c.cuda.c_str());
-  std::printf("    Driver   : %s\n", c.driver.c_str());
+  // The driver version is NVIDIA's; an AMD machine has none to show.
+  if (profile.vendor != "amd") std::printf("    Driver   : %s\n", c.driver.c_str());
   std::printf("    OS       : %s (kernel %s)\n", c.os.pretty, c.kernel.c_str());
   std::printf("    Hostname : %s\n", c.hostname.c_str());
   std::printf("    Isolation: %s\n",
@@ -968,7 +969,9 @@ int cmd_shell(const std::vector<std::string>& args) {
                                   : "on (/proc/driver/nvidia and /etc/os-release overlaid)")
                        : renamed ? "partial (hostname set; /proc and /etc left as the host's)"
                                  : "off (session tools only)");
-  std::printf("\n  Try: nvidia-smi | rocm-smi | rocm_agent_enumerator | lspci | dmesg | uname -a\n");
+  std::printf("\n  Try: %s | lspci | dmesg | uname -a\n",
+              profile.vendor == "amd" ? "rocm-smi | amd-smi | rocm_agent_enumerator"
+                                      : "nvidia-smi | rocm-smi | rocm_agent_enumerator");
   std::printf("       vgpu smi --explain   (what is measured vs modelled)\n");
   std::printf("  Type 'exit' to end the session.\n\n");
   }
