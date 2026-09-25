@@ -164,7 +164,7 @@ jobs:
           # Without pipefail the tee's status is the step's, and a test that
           # failed or was never built would pass the job.
           set -o pipefail
-          ctest --test-dir build --output-on-failure -R "test_amd_codeobject|test_amd_gcn|test_amd_gcn_exec|test_amd_hip_abi|test_amd_hipcc|test_amd_rocprofiler|amd_gcn_disasm|amd_hip|amd_hipcc" | tee out
+          ctest --test-dir build --output-on-failure -R "test_amd_codeobject|test_amd_gcn|test_amd_gcn_exec|test_amd_hip_abi|test_amd_hipcc|test_amd_rocprofiler|test_amd_bundle|amd_gcn_disasm|amd_hip|amd_hipcc" | tee out
           # A skip here would hide a decoder that no longer matches the
           # assembler, or a HIP program that no longer runs, which is the
           # whole point of this job.

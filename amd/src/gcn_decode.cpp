@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <string>
 #include <map>
+#include <vector>
 
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/error.hpp"
@@ -24,14 +25,58 @@ struct Shape {
   uint32_t src_width(uint32_t i) const { return i == 0 ? w0 : i == 1 ? w1 : w2; }
 };
 
+// Every comparison VOPC and VOP3 have, generated rather than listed: the
+// number says the type and the test, as the ISA's tables lay them out (the
+// executor reads them the same way), in the short form writing VCC and the
+// long form a scalar pair it names. The X forms, sixteen on from each, write
+// EXEC as well.
+void add_comparisons(std::map<std::pair<Enc, uint32_t>, Shape>& t) {
+  static const char* kFloatTests[16] = {"f", "lt", "eq", "le", "gt", "lg", "ge", "o",
+                                        "u", "nge", "nlg", "ngt", "nle", "neq", "nlt", "tru"};
+  static const char* kIntTests[8] = {"f", "lt", "eq", "le", "gt", "ne", "ge", "t"};
+  static std::vector<std::string> names;   // the shapes point at their names
+  names.reserve(4 * (3 * 16 + 6 * 8 + 3));
+  const auto add_one = [&](uint32_t op, const std::string& name, uint32_t w0, uint32_t w1) {
+    names.push_back(name + "_e32");
+    t.emplace(std::make_pair(Enc::Vopc, op), Shape{names.back().c_str(), 2, 2, w0, w1});
+    names.push_back(name + "_e64");
+    t.emplace(std::make_pair(Enc::Vop3, op), Shape{names.back().c_str(), 2, 2, w0, w1, 1, false, true});
+  };
+  const auto add = [&](uint32_t op, const std::string& name, uint32_t w0, uint32_t w1) {
+    add_one(op, name, w0, w1);
+    // The class tests' X forms follow each directly; every other's sixteen on.
+    add_one(op + (op < 0x20 ? 1 : 0x10), "v_cmpx" + name.substr(5), w0, w1);
+  };
+  const struct { uint32_t base; const char* type; uint32_t width; } floats[] = {
+      {0x20, "f16", 1}, {0x40, "f32", 1}, {0x60, "f64", 2}};
+  for (const auto& f : floats)
+    for (uint32_t k = 0; k < 16; ++k) add(f.base + k, std::string("v_cmp_") + kFloatTests[k] + "_" + f.type, f.width, f.width);
+  const struct { uint32_t base; const char* type; uint32_t width; } ints[] = {
+      {0xa0, "i16", 1}, {0xa8, "u16", 1}, {0xc0, "i32", 1}, {0xc8, "u32", 1}, {0xe0, "i64", 2}, {0xe8, "u64", 2}};
+  for (const auto& i : ints)
+    for (uint32_t k = 0; k < 8; ++k) add(i.base + k, std::string("v_cmp_") + kIntTests[k] + "_" + i.type, i.width, i.width);
+  add(0x10, "v_cmp_class_f32", 1, 1);
+  add(0x12, "v_cmp_class_f64", 2, 1);
+  add(0x14, "v_cmp_class_f16", 1, 1);
+}
+
 // The instructions decoded so far: those the compiler emits for the kernels
 // this runs. Each is <encoding, opcode> -> its name and operand shape, from
 // the CDNA3 ISA reference guide's opcode tables.
 const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
-  static const std::map<std::pair<Enc, uint32_t>, Shape> t = {
+  static const std::map<std::pair<Enc, uint32_t>, Shape> t = [] {
+    std::map<std::pair<Enc, uint32_t>, Shape> m = {
       // SOP1: one scalar source, one scalar destination.
       {{Enc::Sop1, 0x00}, {"s_mov_b32", 1, 1}},
       {{Enc::Sop1, 0x01}, {"s_mov_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x04}, {"s_not_b32", 1, 1}},
+      {{Enc::Sop1, 0x05}, {"s_not_b64", 2, 1, 2}},
+      // A move only where the last comparison held.
+      {{Enc::Sop1, 0x02}, {"s_cmov_b32", 1, 1}},
+      {{Enc::Sop1, 0x30}, {"s_abs_i32", 1, 1}},
+      // Clear or set one bit of the destination, the rest of it kept.
+      {{Enc::Sop1, 0x18}, {"s_bitset0_b32", 1, 1}},
+      {{Enc::Sop1, 0x1a}, {"s_bitset1_b32", 1, 1}},
       {{Enc::Sop1, 0x08}, {"s_brev_b32", 1, 1}},
       {{Enc::Sop1, 0x0d}, {"s_bcnt1_i32_b64", 1, 1, 2}},
       {{Enc::Sop1, 0x11}, {"s_ff1_i32_b64", 1, 1, 2}},
@@ -51,6 +96,9 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop2, 0x03}, {"s_sub_i32", 1, 2}},
       {{Enc::Sop2, 0x04}, {"s_addc_u32", 1, 2}},
       {{Enc::Sop2, 0x05}, {"s_subb_u32", 1, 2}},
+      {{Enc::Sop2, 0x06}, {"s_min_i32", 1, 2}},
+      {{Enc::Sop2, 0x07}, {"s_min_u32", 1, 2}},
+      {{Enc::Sop2, 0x08}, {"s_max_i32", 1, 2}},
       {{Enc::Sop2, 0x0a}, {"s_cselect_b32", 1, 2}},
       {{Enc::Sop2, 0x0b}, {"s_cselect_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x0c}, {"s_and_b32", 1, 2}},
@@ -59,6 +107,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop2, 0x0f}, {"s_or_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x10}, {"s_xor_b32", 1, 2}},
       {{Enc::Sop2, 0x11}, {"s_xor_b64", 2, 2, 2, 2}},
+      {{Enc::Sop2, 0x12}, {"s_andn2_b32", 1, 2}},
       {{Enc::Sop2, 0x13}, {"s_andn2_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x15}, {"s_orn2_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x1c}, {"s_lshl_b32", 1, 2}},
@@ -66,8 +115,15 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop2, 0x1e}, {"s_lshr_b32", 1, 2}},
       {{Enc::Sop2, 0x1f}, {"s_lshr_b64", 2, 2, 2, 1}},
       {{Enc::Sop2, 0x20}, {"s_ashr_i32", 1, 2}},
+      {{Enc::Sop2, 0x21}, {"s_ashr_i64", 2, 2, 2, 1}},
+      // A bit field: the second source's low bits say where it starts, its
+      // bits 16 and up how wide it is.
+      {{Enc::Sop2, 0x25}, {"s_bfe_u32", 1, 2}},
+      {{Enc::Sop2, 0x28}, {"s_bfe_i64", 2, 2, 2, 1}},
       {{Enc::Sop2, 0x24}, {"s_mul_i32", 1, 2}},
       {{Enc::Sop2, 0x2c}, {"s_mul_hi_u32", 1, 2}},
+      {{Enc::Sop2, 0x2d}, {"s_mul_hi_i32", 1, 2}},
+      {{Enc::Sop2, 0x32}, {"s_pack_ll_b32_b16", 1, 2}},
       // SOPK: a 16-bit immediate.
       {{Enc::Sopk, 0x00}, {"s_movk_i32", 1, 0}},
       {{Enc::Sopk, 0x0e}, {"s_addk_i32", 1, 0}},
@@ -75,6 +131,18 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // A comparison against the instruction's own constant: the register
       // field names what is compared, not where a result goes.
       {{Enc::Sopk, 0x02}, {"s_cmpk_eq_i32", 1, 0}},
+      {{Enc::Sopk, 0x03}, {"s_cmpk_lg_i32", 1, 0}},
+      {{Enc::Sopk, 0x04}, {"s_cmpk_gt_i32", 1, 0}},
+      {{Enc::Sopk, 0x05}, {"s_cmpk_ge_i32", 1, 0}},
+      {{Enc::Sopk, 0x06}, {"s_cmpk_lt_i32", 1, 0}},
+      {{Enc::Sopk, 0x07}, {"s_cmpk_le_i32", 1, 0}},
+      // The unsigned ones take their constant without its sign.
+      {{Enc::Sopk, 0x08}, {"s_cmpk_eq_u32", 1, 0}},
+      {{Enc::Sopk, 0x09}, {"s_cmpk_lg_u32", 1, 0}},
+      {{Enc::Sopk, 0x0a}, {"s_cmpk_gt_u32", 1, 0}},
+      {{Enc::Sopk, 0x0b}, {"s_cmpk_ge_u32", 1, 0}},
+      {{Enc::Sopk, 0x0c}, {"s_cmpk_lt_u32", 1, 0}},
+      {{Enc::Sopk, 0x0d}, {"s_cmpk_le_u32", 1, 0}},
       // SOPP: an immediate, and no registers.
       {{Enc::Sopp, 0x00}, {"s_nop", 0, 0}},
       {{Enc::Sopp, 0x01}, {"s_endpgm", 0, 0}},
@@ -88,18 +156,27 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sopp, 0x0a}, {"s_barrier", 0, 0}},
       {{Enc::Sopp, 0x0c}, {"s_waitcnt", 0, 0}},
       {{Enc::Sopp, 0x0e}, {"s_sleep", 0, 0}},
+      // A wave's priority against the others: nothing here schedules by it.
+      {{Enc::Sopp, 0x0f}, {"s_setprio", 0, 0}},
       // A message to the host: MSG_INTERRUPT is how a kernel wakes the host
       // for a hostcall, which is what device-side printf is built on.
       {{Enc::Sopp, 0x10}, {"s_sendmsg", 0, 0}},
       // SOPC: a scalar comparison, which sets SCC.
+      {{Enc::Sopc, 0x00}, {"s_cmp_eq_i32", 0, 2}},
+      {{Enc::Sopc, 0x01}, {"s_cmp_lg_i32", 0, 2}},
       {{Enc::Sopc, 0x02}, {"s_cmp_gt_i32", 0, 2}},
       {{Enc::Sopc, 0x03}, {"s_cmp_ge_i32", 0, 2}},
       {{Enc::Sopc, 0x04}, {"s_cmp_lt_i32", 0, 2}},
+      {{Enc::Sopc, 0x05}, {"s_cmp_le_i32", 0, 2}},
       {{Enc::Sopc, 0x06}, {"s_cmp_eq_u32", 0, 2}},
       {{Enc::Sopc, 0x07}, {"s_cmp_lg_u32", 0, 2}},
       {{Enc::Sopc, 0x08}, {"s_cmp_gt_u32", 0, 2}},
       {{Enc::Sopc, 0x09}, {"s_cmp_ge_u32", 0, 2}},
       {{Enc::Sopc, 0x0a}, {"s_cmp_lt_u32", 0, 2}},
+      {{Enc::Sopc, 0x0b}, {"s_cmp_le_u32", 0, 2}},
+      // Whether one bit of the first source is clear, or set.
+      {{Enc::Sopc, 0x0c}, {"s_bitcmp0_b32", 0, 2}},
+      {{Enc::Sopc, 0x0d}, {"s_bitcmp1_b32", 0, 2}},
       {{Enc::Sopc, 0x12}, {"s_cmp_eq_u64", 0, 2, 2, 2}},
       {{Enc::Sopc, 0x13}, {"s_cmp_lg_u64", 0, 2, 2, 2}},
       // SMEM: a scalar load through a 64-bit base address.
@@ -107,12 +184,14 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Smem, 0x01}, {"s_load_dwordx2", 2, 1, 2}},
       {{Enc::Smem, 0x02}, {"s_load_dwordx4", 4, 1, 2}},
       {{Enc::Smem, 0x03}, {"s_load_dwordx8", 8, 1, 2}},
+      {{Enc::Smem, 0x04}, {"s_load_dwordx16", 16, 1, 2}},
       // A counter the wave reads: no address, and nothing but the pair it
       // writes.
       {{Enc::Smem, 0x24}, {"s_memtime", 2, 0}},
       {{Enc::Smem, 0x25}, {"s_memrealtime", 2, 0}},
       // VOP1 and VOP2, the vector ALU's short forms.
       {{Enc::Vop1, 0x01}, {"v_mov_b32_e32", 1, 1}},
+      {{Enc::Vop1, 0x15}, {"v_cvt_u32_f64_e32", 1, 1, 2}},
       {{Enc::Vop2, 0x00}, {"v_cndmask_b32_e32", 1, 2}},
       {{Enc::Vop2, 0x01}, {"v_add_f32_e32", 1, 2}},
       {{Enc::Vop2, 0x02}, {"v_sub_f32_e32", 1, 2}},
@@ -196,6 +275,13 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop2, 0x01a}, {"v_sub_co_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x01c}, {"v_addc_co_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x01d}, {"v_subb_co_u32_e32", 1, 2}},
+      {{Enc::Vop2, 0x01b}, {"v_subrev_co_u32_e32", 1, 2}},
+      {{Enc::Vop2, 0x01e}, {"v_subbrev_co_u32_e32", 1, 2}},
+      {{Enc::Vop2, 0x00c}, {"v_min_i32_e32", 1, 2}},
+      {{Enc::Vop2, 0x00d}, {"v_max_i32_e32", 1, 2}},
+      {{Enc::Vop2, 0x02b}, {"v_lshrrev_b16_e32", 1, 2}},
+      {{Enc::Vop2, 0x02d}, {"v_max_f16_e32", 1, 2}},
+      {{Enc::Vop2, 0x02e}, {"v_min_f16_e32", 1, 2}},
       {{Enc::Vop2, 0x034}, {"v_add_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x035}, {"v_sub_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x036}, {"v_subrev_u32_e32", 1, 2}},
@@ -278,6 +364,15 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x105}, {"v_mul_f32_e64", 1, 2}},
       {{Enc::Vop3, 0x112}, {"v_lshlrev_b32_e64", 1, 2}},
       {{Enc::Vop3, 0x11b}, {"v_subrev_co_u32_e64", 1, 2, 1, 1, 1, true}},
+      {{Enc::Vop3, 0x114}, {"v_or_b32_e64", 1, 2}},
+      {{Enc::Vop3, 0x119}, {"v_add_co_u32_e64", 1, 2, 1, 1, 1, true}},
+      {{Enc::Vop3, 0x11c}, {"v_addc_co_u32_e64", 1, 3, 1, 1, 2, true}},
+      {{Enc::Vop3, 0x134}, {"v_add_u32_e64", 1, 2}},
+      {{Enc::Vop3, 0x135}, {"v_sub_u32_e64", 1, 2}},
+      {{Enc::Vop3, 0x13b}, {"v_fmac_f32_e64", 1, 2}},
+      {{Enc::Vop3, 0x1c2}, {"v_mad_i32_i24", 1, 3}},
+      {{Enc::Vop3, 0x1d2}, {"v_min3_u32", 1, 3}},
+      {{Enc::Vop3, 0x1e9}, {"v_mad_i64_i32", 2, 3, 1, 1, 2, true}},
       {{Enc::Vop3, 0x1c3}, {"v_mad_u32_u24", 1, 3}},
       {{Enc::Vop3, 0x1c8}, {"v_bfe_u32", 1, 3}},
       {{Enc::Vop3, 0x1d0}, {"v_min3_f32", 1, 3}},
@@ -334,6 +429,12 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Ds, 0x0b}, {"ds_xor_b32", 0, 2}},
       {{Enc::Ds, 0x0d}, {"ds_write_b32", 0, 2}},
       {{Enc::Ds, 0x0e}, {"ds_write2_b32", 0, 3}},
+      {{Enc::Ds, 0x0f}, {"ds_write2st64_b32", 0, 3}},
+      {{Enc::Ds, 0x4e}, {"ds_write2_b64", 0, 3, 1, 2, 2}},
+      {{Enc::Ds, 0x4f}, {"ds_write2st64_b64", 0, 3, 1, 2, 2}},
+      {{Enc::Ds, 0x77}, {"ds_read2_b64", 4, 1}},
+      {{Enc::Ds, 0x78}, {"ds_read2st64_b64", 4, 1}},
+      {{Enc::Ds, 0xfe}, {"ds_read_b96", 3, 1}},
       {{Enc::Ds, 0x15}, {"ds_add_f32", 0, 2}},
       // Narrower than a word, and wider: a byte, a half, and two or four
       // words at once.
@@ -354,6 +455,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // where an address would.
       {{Enc::Ds, 0x3d}, {"ds_swizzle_b32", 1, 1}},
       // A lane reads the value another lane holds: the address says which.
+      {{Enc::Ds, 0x3e}, {"ds_permute_b32", 1, 2}},
       {{Enc::Ds, 0x3f}, {"ds_bpermute_b32", 1, 2}},
       // FLAT and the two segments that share its opcodes: global (an address
       // in a register pair, or a scalar base and a per-lane offset) and
@@ -370,6 +472,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Flat, 0x17}, {"load_dwordx4", 4, 1}},
       {{Enc::Flat, 0x18}, {"store_byte", 0, 2}},
       {{Enc::Flat, 0x1a}, {"store_short", 0, 2}},
+      // The top half of the register, stored as a short.
+      {{Enc::Flat, 0x1b}, {"store_short_d16_hi", 0, 2}},
       {{Enc::Flat, 0x1c}, {"store_dword", 0, 2}},
       {{Enc::Flat, 0x1d}, {"store_dwordx2", 0, 2, 1, 2}},
       {{Enc::Flat, 0x1e}, {"store_dwordx3", 0, 2, 1, 3}},
@@ -377,6 +481,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Flat, 0x40}, {"atomic_swap", 0, 2}},
       {{Enc::Flat, 0x41}, {"atomic_cmpswap", 0, 2, 1, 2}},
       {{Enc::Flat, 0x42}, {"atomic_add", 0, 2}},
+      {{Enc::Flat, 0x4f}, {"atomic_add_f64", 0, 2, 1, 2}},
       {{Enc::Flat, 0x43}, {"atomic_sub", 0, 2}},
       {{Enc::Flat, 0x48}, {"atomic_and", 0, 2}},
       {{Enc::Flat, 0x49}, {"atomic_or", 0, 2}},
@@ -389,27 +494,69 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // fence compiles to -- and they take no operands.
       {{Enc::Mubuf, 0x28}, {"buffer_wbl2", 0, 0}},
       {{Enc::Mubuf, 0x29}, {"buffer_inv", 0, 0}},
+      // Through a buffer resource: the data, then the address register, the
+      // resource and the scalar offset.
+      {{Enc::Mubuf, 0x10}, {"buffer_load_ubyte", 1, 3}},
+      {{Enc::Mubuf, 0x11}, {"buffer_load_sbyte", 1, 3}},
+      {{Enc::Mubuf, 0x12}, {"buffer_load_ushort", 1, 3}},
+      {{Enc::Mubuf, 0x13}, {"buffer_load_sshort", 1, 3}},
+      {{Enc::Mubuf, 0x14}, {"buffer_load_dword", 1, 3}},
+      {{Enc::Mubuf, 0x15}, {"buffer_load_dwordx2", 2, 3}},
+      {{Enc::Mubuf, 0x16}, {"buffer_load_dwordx3", 3, 3}},
+      {{Enc::Mubuf, 0x17}, {"buffer_load_dwordx4", 4, 3}},
+      {{Enc::Mubuf, 0x18}, {"buffer_store_byte", 0, 4, 1}},
+      {{Enc::Mubuf, 0x1a}, {"buffer_store_short", 0, 4, 1}},
+      {{Enc::Mubuf, 0x1c}, {"buffer_store_dword", 0, 4, 1}},
+      {{Enc::Mubuf, 0x1d}, {"buffer_store_dwordx2", 0, 4, 2}},
+      {{Enc::Mubuf, 0x1e}, {"buffer_store_dwordx3", 0, 4, 3}},
+      {{Enc::Mubuf, 0x1f}, {"buffer_store_dwordx4", 0, 4, 4}},
+      {{Enc::Mubuf, 0x40}, {"buffer_atomic_swap", 0, 4, 1}},
+      {{Enc::Mubuf, 0x41}, {"buffer_atomic_cmpswap", 0, 4, 2}},
+      {{Enc::Mubuf, 0x42}, {"buffer_atomic_add", 0, 4, 1}},
+      {{Enc::Mubuf, 0x61}, {"buffer_atomic_cmpswap_x2", 0, 4, 4}},
       // VOP3P: a packed pair of halves in one register, both computed at once.
       {{Enc::Vop3p, 0x0e}, {"v_pk_fma_f16", 1, 3}},
+      {{Enc::Vop3p, 0x0f}, {"v_pk_add_f16", 1, 2}},
+      {{Enc::Vop3p, 0x10}, {"v_pk_mul_f16", 1, 2}},
+      {{Enc::Vop3p, 0x11}, {"v_pk_min_f16", 1, 2}},
+      {{Enc::Vop3p, 0x12}, {"v_pk_max_f16", 1, 2}},
       // And the packed float form, where each of the two is a whole register.
       // A multiply-add over sources that may each be a float or a half,
       // rounded to a half and written into one half of the destination.
+      {{Enc::Vop3p, 0x20}, {"v_fma_mix_f32", 1, 3}},
       {{Enc::Vop3p, 0x21}, {"v_fma_mixlo_f16", 1, 3}},
       {{Enc::Vop3p, 0x22}, {"v_fma_mixhi_f16", 1, 3}},
       {{Enc::Vop3p, 0x30}, {"v_pk_fma_f32", 2, 3, 2, 2, 2}},
       {{Enc::Vop3p, 0x32}, {"v_pk_add_f32", 2, 2, 2, 2}},
       {{Enc::Vop3p, 0x31}, {"v_pk_mul_f32", 2, 2, 2, 2}},
+      // Two registers, each chosen from either source by op_sel.
+      {{Enc::Vop3p, 0x33}, {"v_pk_mov_b32", 2, 2, 2, 2}},
       // Between a vector register and an accumulation register, which is
       // where a kernel puts what will not fit in the vector ones. They share
       // the packed forms' encoding without being packed.
       // A matrix multiply-add over the whole wave: a 16x16 by 16x16 product of
       // halves, added into a 16x16 block of floats spread across the lanes.
       {{Enc::Vop3p, 0x4d}, {"v_mfma_f32_16x16x16_f16", 4, 3, 2, 2, 4}},
+      // And the others Tensile's GEMMs are built on: floats and doubles, one
+      // block, or several smaller ones side by side.
+      {{Enc::Vop3p, 0x41}, {"v_mfma_f32_16x16x1_4b_f32", 16, 3, 1, 1, 16}},
+      {{Enc::Vop3p, 0x42}, {"v_mfma_f32_4x4x1_16b_f32", 4, 3, 1, 1, 4}},
+      {{Enc::Vop3p, 0x44}, {"v_mfma_f32_32x32x2_f32", 16, 3, 1, 1, 16}},
+      {{Enc::Vop3p, 0x45}, {"v_mfma_f32_16x16x4_f32", 4, 3, 1, 1, 4}},
+      {{Enc::Vop3p, 0x6e}, {"v_mfma_f64_16x16x4_f64", 8, 3, 2, 2, 8}},
+      // The reduced-precision float forms decode, and are refused where they
+      // run: what a card rounds their inputs to is not modelled.
+      {{Enc::Vop3p, 0x3e}, {"v_mfma_f32_16x16x8_xf32", 4, 3, 2, 2, 4}},
+      {{Enc::Vop3p, 0x3f}, {"v_mfma_f32_32x32x4_xf32", 16, 3, 2, 2, 16}},
       {{Enc::Vop3p, 0x58}, {"v_accvgpr_read_b32", 1, 1}},
       {{Enc::Vop3p, 0x59}, {"v_accvgpr_write_b32", 1, 1}},
-  };
+    };
+    add_comparisons(m);
+    return m;
+  }();
   return t;
 }
+
 
 uint32_t word(const std::vector<uint8_t>& code, uint64_t at) {
   if (at + 4 > code.size()) throw Error::make(Err::Unsupported, "code ends inside an instruction");
@@ -437,10 +584,12 @@ Operand operand(uint32_t code, uint32_t width) {
     o.width = width >= 2 ? 2 : 1;
   } else if (code == 127) {
     o.kind = OperandKind::ExecHi;
-  } else if (code == 235) {
-    // Where LDS sits in the one address space a flat access uses.
-    o.kind = OperandKind::SharedBase;
-    o.width = 2;
+  } else if (code == 235 || code == 237) {
+    // Where LDS, or a work-item's private memory, sits in the one address
+    // space a flat access uses: the aperture's base as a pair, or its high
+    // half as one register.
+    o.kind = code == 235 ? OperandKind::SharedBase : OperandKind::PrivateBase;
+    o.width = width;
   } else if (code >= 240 && code <= 248) {
     // The inline float constants, in the ISA's order, ending with the one the
     // sine and the cosine need: a turn is 2pi radians, so a kernel that asked
@@ -480,8 +629,9 @@ Operand vgpr(uint32_t index, uint32_t width = 1) {
 }
 
 const Shape& shape(Enc e, uint32_t opcode) {
-  const auto it = table().find({e, opcode});
-  if (it == table().end())
+  const auto& t = table();
+  const auto it = t.find({e, opcode});
+  if (it == t.end())
     throw Error::make(Err::Unsupported, enc_name(e), " opcode 0x", [&] {
       char b[8];
       std::snprintf(b, sizeof b, "%x", opcode);
@@ -521,11 +671,18 @@ const char* enc_name(Enc e) {
 // falling back to spelling each of the five bits out.
 std::string swizzle_text(uint32_t imm) {
   char b[64];
-  if (imm & 0x8000) {
+  if ((imm & 0xFF00) == 0x8000) {
     std::snprintf(b, sizeof b, "swizzle(QUAD_PERM,%u,%u,%u,%u)", imm & 3, (imm >> 2) & 3, (imm >> 4) & 3,
                   (imm >> 6) & 3);
     return b;
   }
+  // The extended modes, each with bit 15 set: a rotation within 32 lanes
+  // (the direction, then by how many), and the FFT patterns.
+  if ((imm & 0xE000) == 0xC000) {
+    std::snprintf(b, sizeof b, "swizzle(ROTATE,%u,%u)", (imm >> 10) & 1, (imm >> 5) & 0x1F);
+    return b;
+  }
+  if (imm & 0x8000) throw Error::make(Err::Unsupported, "a ds_swizzle pattern this does not decode yet (", imm, ")");
   const uint32_t and_mask = imm & 0x1F, or_mask = (imm >> 5) & 0x1F, xor_mask = (imm >> 10) & 0x1F;
   if (and_mask == 0x1F && or_mask == 0 && xor_mask && !(xor_mask & (xor_mask - 1))) {
     std::snprintf(b, sizeof b, "swizzle(SWAP,%u)", xor_mask);
@@ -699,7 +856,15 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.dst.push_back(sgpr((w0 >> 6) & 0x7F, s.dst_width));
     if (s.srcs > 0) {
       in.src.push_back(sgpr(((w0 & 0x3F) << 1), s.src_width(0)));   // sbase counts register pairs
-      in.offset = static_cast<int32_t>(w1 & 0x1FFFFF);
+      // The offset is the instruction's own (IMM set), a scalar register's
+      // (IMM clear: the field names the register), or both (SOE with IMM,
+      // the register named above the offset).
+      const bool imm = (w0 >> 17) & 1, soe = (w0 >> 14) & 1;
+      if (imm) in.offset = static_cast<int32_t>(w1 & 0x1FFFFF);
+      if (!imm || soe) {
+        in.has_saddr = true;
+        in.saddr = imm ? (w1 >> 25) & 0x7F : w1 & 0x7F;
+      }
     }
   } else if ((w0 >> 25) == 0x3f) {    // VOP1
     in.enc = Enc::Vop1;
@@ -762,31 +927,27 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       }
       return in;
     }
-    // op_sel picks which half of each source feeds which half of the result.
-    // Plain packed work is op_sel 0 with op_sel_hi all ones, and anything
-    // else is a shuffle this does not model.
-    const uint32_t op_sel = (w0 >> 11) & 0x7, neg_hi = (w0 >> 8) & 0x7;
+    // op_sel says which half of each source feeds the low result, and
+    // op_sel_hi which feeds the high one; neg_lo and neg_hi which sources are
+    // negated on the way into each. For the mixed-precision forms, op_sel_hi
+    // says which sources are halves at all, op_sel which half, and the two
+    // negation fields are each source's negation and absolute value.
+    const uint32_t op_sel = (w0 >> 11) & 0x7, neg_hi = (w0 >> 8) & 0x7, neg = (w1 >> 29) & 0x7;
     const uint32_t op_sel_hi = ((w0 >> 14) & 1) << 2 | ((w1 >> 27) & 0x3);
     in.op_sel = static_cast<uint8_t>(op_sel);
     in.op_sel_hi = static_cast<uint8_t>(op_sel_hi);
-    // Taking the halves in their own order is a shuffle, and only the packed
-    // float form is modelled beyond the plain arrangement: there a zero in
-    // op_sel_hi means one value serves both halves, which is what the
-    // compiler does with a constant.
     const bool mix = in.name.rfind("v_fma_mix", 0) == 0;
-    if (mix && (op_sel != 0 || in.clamp))
-      throw Error::make(Err::Unsupported, in.name, " takes a half from the top of a register or clamps its result",
-                        ", which this does not model");
-    if (!mix && (op_sel != 0 || (op_sel_hi != 0x7 && in.name.find("_f32") == std::string::npos)))
-      throw Error::make(Err::Unsupported, in.name, " selects halves (op_sel ", op_sel, ", op_sel_hi ", op_sel_hi,
-                        "), which this does not model");
+    if (!mix) {
+      in.neg_lo = static_cast<uint8_t>(neg);
+      in.neg_hi = static_cast<uint8_t>(neg_hi);
+    }
     in.dst.push_back(vgpr(w0 & 0xFF, s.dst_width));
-    const uint32_t neg = (w1 >> 29) & 0x7;
     for (uint32_t k = 0; k < s.srcs; ++k) {
       Operand o = take((w1 >> (9 * k)) & 0x1FF, s.src_width(k));
-      o.neg = (neg >> k) & 1;
-      if ((neg_hi >> k) & 1)
-        throw Error::make(Err::Unsupported, in.name, " negates one half only, which this does not model");
+      if (mix) {
+        o.neg = (neg >> k) & 1;
+        o.abs = (neg_hi >> k) & 1;
+      }
       in.src.push_back(o);
     }
     // The two that move a value to or from an accumulation register: the
@@ -837,17 +998,43 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     } else {
       in.offset = w0 & 0xFFFF;
     }
-    if (s.dst_width) in.dst.push_back(vgpr((w1 >> 24) & 0xFF, s.dst_width));
+    // The data, read or written, may be accumulation registers instead.
+    const bool acc = (w0 >> 25) & 1;
+    const auto data = [&](uint32_t index, uint32_t width) {
+      Operand o = vgpr(index, width);
+      if (acc) o.kind = OperandKind::Agpr;
+      return o;
+    };
+    if (s.dst_width) in.dst.push_back(data((w1 >> 24) & 0xFF, s.dst_width));
     in.src.push_back(vgpr(w1 & 0xFF));                              // the address
-    if (s.srcs > 1) in.src.push_back(vgpr((w1 >> 8) & 0xFF, s.src_width(1)));   // the data written
-    if (s.srcs > 2) in.src.push_back(vgpr((w1 >> 16) & 0xFF));      // and the second, for a two-address write
-  } else if ((w0 >> 26) == 0x38) {    // MUBUF: here only the cache operations
+    if (s.srcs > 1) in.src.push_back(data((w1 >> 8) & 0xFF, s.src_width(1)));   // the data written
+    if (s.srcs > 2) in.src.push_back(data((w1 >> 16) & 0xFF, s.src_width(2)));  // and the second, for a two-address write
+  } else if ((w0 >> 26) == 0x38) {    // MUBUF: through a buffer resource, and the cache operations
     in.enc = Enc::Mubuf;
     in.opcode = (w0 >> 18) & 0x7F;
     const Shape& s = shape(in.enc, in.opcode);
     in.name = s.name;
     in.size = 8;
     in.cache = ((w0 >> 14) & 1) | ((w0 >> 17) & 1) << 1 | ((w0 >> 15) & 1) << 2;   // sc0, nt, sc1
+    if (s.srcs) {
+      const uint32_t w1 = word(code, at + 4);
+      if ((w0 >> 16) & 1)
+        throw Error::make(Err::Unsupported, in.name, " loads straight into LDS, which this does not model");
+      in.offset = static_cast<int32_t>(w0 & 0xFFF);
+      in.offen = (w0 >> 12) & 1;
+      in.idxen = (w0 >> 13) & 1;
+      // The data: what a load writes, what a store or an atomic reads (and
+      // an atomic gives back into, where sc0 asks). Then the address register
+      // -- an offset, an index, or the two -- the resource's four scalar
+      // registers, and the scalar offset.
+      Operand data = vgpr((w1 >> 8) & 0xFF, s.dst_width ? s.dst_width : s.src_width(0));
+      if ((w1 >> 23) & 1) data.kind = OperandKind::Agpr;
+      if (s.dst_width) in.dst.push_back(data);
+      else in.src.push_back(data);
+      in.src.push_back(vgpr(w1 & 0xFF, in.offen && in.idxen ? 2 : 1));
+      in.src.push_back(sgpr(((w1 >> 16) & 0x1F) << 2, 4));
+      in.src.push_back(take((w1 >> 24) & 0xFF, 1));
+    }
   } else if ((w0 >> 26) == 0x37) {    // FLAT, and its global and scratch forms
     in.enc = Enc::Flat;
     in.opcode = (w0 >> 18) & 0x7F;
@@ -866,7 +1053,9 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     // listing.
     in.cache = ((w0 >> 16) & 1) | ((w0 >> 17) & 1) << 1 | ((w0 >> 25) & 1) << 2;
     const uint32_t saddr = (w1 >> 16) & 0x7F;
-    in.has_saddr = saddr != 0x7F;                    // 0x7f: the address is the VGPR pair's
+    // 0x7f: the address is the VGPR pair's. A flat access has no scalar base
+    // at all, whatever the field holds.
+    in.has_saddr = in.segment != Inst::Segment::Flat && saddr != 0x7F;
     in.saddr = saddr;
     // A scratch access may have neither an address register nor a scalar
     // base: then the offset alone says where in the work-item's own memory.
@@ -875,9 +1064,16 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     // the register it gives it back in is the one a load would write. A
     // compare-and-swap takes a pair and gives back one of them.
     const bool returns = std::string(s.name).rfind("atomic", 0) == 0 && (in.cache & 1);
-    if (s.dst_width) in.dst.push_back(vgpr((w1 >> 24) & 0xFF, s.dst_width));
+    // The data, loaded or stored, may be accumulation registers instead.
+    const bool acc = (w1 >> 23) & 1;
+    const auto data = [&](uint32_t index, uint32_t width) {
+      Operand o = vgpr(index, width);
+      if (acc) o.kind = OperandKind::Agpr;
+      return o;
+    };
+    if (s.dst_width) in.dst.push_back(data((w1 >> 24) & 0xFF, s.dst_width));
     else if (returns)
-      in.dst.push_back(vgpr((w1 >> 24) & 0xFF,
+      in.dst.push_back(data((w1 >> 24) & 0xFF,
                             std::string(s.name).find("cmpswap") != std::string::npos ? s.src_width(1) / 2
                                                                                      : s.src_width(1)));
     // A flat address is 64-bit; a global one is 64-bit unless a scalar base
@@ -885,7 +1081,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     const uint32_t addr_width = in.segment == Inst::Segment::Global ? (in.has_saddr ? 1 : 2)
                                                                    : in.segment == Inst::Segment::Flat ? 2 : 1;
     in.src.push_back(vgpr(w1 & 0xFF, addr_width));
-    if (s.srcs > 1) in.src.push_back(vgpr((w1 >> 8) & 0xFF, s.src_width(1)));   // the data written
+    if (s.srcs > 1) in.src.push_back(data((w1 >> 8) & 0xFF, s.src_width(1)));   // the data written
   } else if ((w0 >> 31) == 0) {       // VOP2
     in.enc = Enc::Vop2;
     in.opcode = (w0 >> 25) & 0x3F;
@@ -901,9 +1097,10 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       read_sdwa(in, s, w0, word(code, at + 4), 2);
       return in;
     }
-    const bool carry_out = in.name == "v_add_co_u32_e32" || in.name == "v_sub_co_u32_e32" ||
-                           in.name == "v_addc_co_u32_e32" || in.name == "v_subb_co_u32_e32";
-    const bool carry_in = in.name == "v_addc_co_u32_e32" || in.name == "v_subb_co_u32_e32";
+    const bool carry_in = in.name == "v_addc_co_u32_e32" || in.name == "v_subb_co_u32_e32" ||
+                          in.name == "v_subbrev_co_u32_e32";
+    const bool carry_out = carry_in || in.name == "v_add_co_u32_e32" || in.name == "v_sub_co_u32_e32" ||
+                           in.name == "v_subrev_co_u32_e32";
     in.dst.push_back(vgpr((w0 >> 17) & 0xFF, s.dst_width));
     // The short forms of the carry arithmetic write VCC beside their result,
     // which the encoding does not spell out and the assembler does.
@@ -976,6 +1173,7 @@ std::string operand_text(const Operand& o) {
     case OperandKind::ExecHi: return wrap("exec_hi");
     case OperandKind::M0: return wrap("m0");
     case OperandKind::SharedBase: return wrap("src_shared_base");
+    case OperandKind::PrivateBase: return wrap("src_private_base");
     case OperandKind::InlineFloat:
       // As the assembler writes them: 1.0, -0.5, and, for one over two pi,
       // the digits of the float it stands for.
@@ -1013,7 +1211,10 @@ std::string to_text(const Inst& i) {
     sep = ", ";
   }
   for (size_t k = 0; k < i.src.size(); ++k) {
-    s += sep + (scratch_no_addr && k == 0 ? "off" : operand_text(i.src[k]));
+    // A buffer access that takes neither an offset nor an index from a
+    // register prints "off" where the register would be.
+    const bool no_vaddr = i.enc == Enc::Mubuf && !i.offen && !i.idxen && k == (i.dst.empty() ? 1u : 0u);
+    s += sep + ((scratch_no_addr && k == 0) || no_vaddr ? "off" : operand_text(i.src[k]));
     sep = ", ";
   }
   if (i.dpp) {
@@ -1036,6 +1237,8 @@ std::string to_text(const Inst& i) {
     const uint8_t plain_hi = i.name.rfind("v_fma_mix", 0) == 0 ? 0 : 0x7;
     if (i.op_sel) s += " op_sel:" + bits(i.op_sel);
     if (i.op_sel_hi != plain_hi) s += " op_sel_hi:" + bits(i.op_sel_hi);
+    if (i.neg_lo) s += " neg_lo:" + bits(i.neg_lo);
+    if (i.neg_hi) s += " neg_hi:" + bits(i.neg_hi);
   }
   if (i.clamp) s += " clamp";
   if (i.sdwa) {
@@ -1047,7 +1250,13 @@ std::string to_text(const Inst& i) {
       s += " src" + std::to_string(k) + "_sel:" + kParts[i.src[k].sel & 7];
   }
   if (i.enc == Enc::Smem) {
-    if (!i.src.empty()) {
+    if (!i.src.empty() && i.has_saddr) {
+      s += ", " + operand_text(operand(i.saddr, 1));
+      if (i.offset) {
+        std::snprintf(b, sizeof b, " offset:0x%x", i.offset);
+        s += b;
+      }
+    } else if (!i.src.empty()) {
       std::snprintf(b, sizeof b, ", 0x%x", i.offset);
       s += b;
     }
@@ -1067,7 +1276,11 @@ std::string to_text(const Inst& i) {
     // flat prints only its address and data; global and scratch print the
     // scalar base, or "off" where there is none.
     if (i.segment != Inst::Segment::Flat)
-      s += i.has_saddr ? ", s[" + std::to_string(i.saddr) + ":" + std::to_string(i.saddr + 1) + "]" : ", off";
+      // A global access's scalar base is a 64-bit address, a scratch one's a
+      // 32-bit offset.
+      s += !i.has_saddr                              ? ", off"
+           : i.segment == Inst::Segment::Scratch ? ", s" + std::to_string(i.saddr)
+                                                 : ", s[" + std::to_string(i.saddr) + ":" + std::to_string(i.saddr + 1) + "]";
     if (i.offset) {
       std::snprintf(b, sizeof b, " offset:%d", i.offset);
       s += b;
@@ -1076,6 +1289,12 @@ std::string to_text(const Inst& i) {
     if (i.cache & 2) s += " nt";
     if (i.cache & 4) s += " sc1";
   } else if (i.enc == Enc::Mubuf) {
+    if (i.idxen) s += " idxen";
+    if (i.offen) s += " offen";
+    if (i.offset) {
+      std::snprintf(b, sizeof b, " offset:%d", i.offset);
+      s += b;
+    }
     if (i.cache & 1) s += " sc0";
     if (i.cache & 2) s += " nt";
     if (i.cache & 4) s += " sc1";
@@ -1085,7 +1304,7 @@ std::string to_text(const Inst& i) {
       throw Error::make(Err::Unsupported, "s_sendmsg with message ", static_cast<uint32_t>(i.simm) & 0xFFFF,
                         " is not decoded yet");
     s += " sendmsg(MSG_INTERRUPT)";
-  } else if (i.name == "s_nop" || i.name == "s_sleep") {
+  } else if (i.name == "s_nop" || i.name == "s_sleep" || i.name == "s_setprio") {
     std::snprintf(b, sizeof b, " %d", i.simm);   // how many cycles to wait
     s += b;
   } else if (i.name == "s_waitcnt") {
@@ -1093,6 +1312,8 @@ std::string to_text(const Inst& i) {
     // at its maximum is not waited on, and is not printed.
     const uint32_t imm = static_cast<uint32_t>(i.simm) & 0xFFFF;
     const uint32_t vm = (imm & 0xF) | ((imm >> 14) & 0x3) << 4, exp = (imm >> 4) & 0x7, lgkm = (imm >> 8) & 0xF;
+    // Waiting on nothing at all, the assembler prints every counter.
+    if (vm == 0x3F && exp == 0x7 && lgkm == 0xF) s += " vmcnt(63) expcnt(7) lgkmcnt(15)";
     if (vm != 0x3F) {
       std::snprintf(b, sizeof b, " vmcnt(%u)", vm);
       s += b;

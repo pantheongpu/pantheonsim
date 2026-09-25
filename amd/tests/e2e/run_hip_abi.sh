@@ -31,6 +31,13 @@ fields=$(sed -n '/^struct DevicePropR0600 {/,/^};/p' "$root/amd/include/vgpu/hip
   done
   echo 'static_assert(sizeof(Ours) == sizeof(hipDeviceProp_tR0600), "the sizes differ");'
   echo 'static_assert(sizeof(vgpu::amd::abi::DeviceArch) == sizeof(hipDeviceArch_t), "the arch flags differ");'
+  # What hipPointerGetAttributes fills in.
+  for f in $(sed -n '/^struct PointerAttribute {/,/^};/p' "$root/amd/include/vgpu/hip_abi.hpp" |
+             sed -n 's/.*[ *]\([A-Za-z_][A-Za-z0-9_]*\);.*/\1/p'); do
+    echo "static_assert(offsetof(vgpu::amd::abi::PointerAttribute, $f) == offsetof(hipPointerAttribute_t, $f), \"pointer attribute $f is out of place\");"
+  done
+  echo 'static_assert(sizeof(vgpu::amd::abi::PointerAttribute) == sizeof(hipPointerAttribute_t), "the pointer attributes differ");'
+  echo 'static_assert(vgpu::amd::abi::kMemoryUnregistered == hipMemoryTypeUnregistered && vgpu::amd::abi::kMemoryHost == hipMemoryTypeHost && vgpu::amd::abi::kMemoryDevice == hipMemoryTypeDevice, "the memory types differ");'
   echo 'int main() { return 0; }'
 } > "$tmp/abi.cpp"
 count=$(wc -w <<< "$fields")

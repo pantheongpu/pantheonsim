@@ -67,8 +67,28 @@ and a grid larger than the device holds at once is refused as HIP refuses it.
 With peer access enabled, a kernel reads and writes another device's memory
 at the address that device gave it.
 
+AMD's own libraries run on it unmodified, starting with rocBLAS (and
+hipBLASLt, which it links). The device is named as HIP names it, features
+and all (`gfx942:sramecc+:xnack-`), which is how rocBLAS picks, of the code it
+ships for each setting of XNACK, the code built for this one. Its device code
+comes as compressed offload bundles, dozens of them, inflated with the
+system's zstd or zlib when a kernel first needs one rather than as the
+library loads; Tensile's GEMMs come from code objects hundreds of kernels
+were linked into, each keeping its own metadata. The stream-ordered
+allocations, pitched copies, pointer attributes and work-item-sized launches
+(`hipExtModuleLaunchKernel`) it calls are there. `tests/e2e/run_rocblas.sh`
+builds a program against rocBLAS and checks its level-1 routines and its
+float and double GEMMs -- ragged sizes, every transpose -- against the same
+arithmetic on the host; both need ROCm with rocBLAS installed and skip
+elsewhere. AMD's own rocBLAS test suite, built from ROCm 7.1's source, runs
+on it as well: of an even 1% sample of its quick float and double tests
+(1,629 of them, each checked against OpenBLAS), 1,435 pass. The half,
+bfloat16, int8 and FP8 GEMMs are not decoded yet.
+
 The instructions implemented are those clang emits for the kernels in
-`tests/data/`.
+`tests/data/`, and those rocBLAS's own kernels and Tensile's float and double
+GEMMs use: `tests/e2e/run_rocblas_disasm.sh` decodes every one of their
+eighteen million instructions and compares it with ROCm's llvm-objdump.
 
 The arithmetic: scalar and vector integers, the logical and shift ops, and
 values of every width a kernel uses. A 64-bit add is the compiler's own --
@@ -100,23 +120,36 @@ a half, a word, two or four at a time, and its atomics on integers and
 floats, a work-item's private memory (what a kernel spills into when it runs
 out of registers) and the accumulation registers (which it spills into
 first), a value read from another lane, and a flat access, whose address says
-for itself whether it means LDS or the device.
+for itself whether it means LDS, private memory or the device. And a buffer
+resource -- a base, a stride and a count of records in four scalar registers
+-- through which a load past the end reads zero and a store past it goes
+nowhere, which Tensile's GEMMs count on at the edges of a matrix; the scalar
+offset counts toward the bounds, as Tensile's DGEMM needs it to. LDS read far
+past the 64 KB a compute unit has reads zero, as a card gives it (Tensile
+clears registers that way); an access within it but past what the work-group
+reserved is caught, since that is almost always a launch that did not pay for
+its kernel's LDS.
 
 Lanes trade values through the LDS unit without touching LDS, too: a lane
-reads the lane an address names, or the lane a swizzle pattern names -- four
-lanes choosing among their own four, or a group of 32 swapped, reversed or
-broadcast. Both read every lane's value before any lane's result is written,
+reads the lane an address names, sends its value to the lane an address
+names, or reads the lane a swizzle pattern names -- four lanes choosing among
+their own four, or a group of 32 swapped, reversed, broadcast or rotated. Both read every lane's value before any lane's result is written,
 since the destination may be the register they read.
 
-The matrix instruction `v_mfma_f32_16x16x16_f16` multiplies two 16x16 matrices
-of halves spread across the wave's 64 lanes and adds a 16x16 block of floats.
-Which element sits in which lane's register is checked rather than assumed: a
-GEMM written with rocWMMA -- AMD's library, whose loads and stores put each
-element where the hardware expects it -- runs through it and matches the same
-product worked out in C, and moving any part of the arrangement makes it fail.
-Its sums are formed in double and rounded once; where a sum is not exact, a
-card may round it differently. Its broadcast modifiers, and a wave with lanes
-switched off, are refused.
+The matrix instructions multiply two matrices spread across the wave's 64
+lanes and add a third: halves into floats (`v_mfma_f32_16x16x16_f16`), floats
+(16x16x4, 32x32x2, and the multi-block 16x16x1 and 4x4x1) and doubles
+(`v_mfma_f64_16x16x4_f64`). Which element sits in which lane's register is
+checked rather than assumed: GEMMs written with rocWMMA -- AMD's library,
+whose loads and stores put each element where the hardware expects it -- run
+through the half, float and double 16x16 forms and match the same products
+worked out in C, and rocBLAS's GEMMs, built on the float and double forms,
+match a GEMM done on the host. A double's accumulator does not hold its rows
+as a float's does -- each lane group every fourth row, not four together --
+and moving any part of either arrangement makes them fail. Sums are formed in
+double (fused, for doubles) and rounded once; where a sum is not exact, a card
+may round it differently. The reduced-precision xf32 forms, the broadcast
+modifiers, and a wave with lanes switched off are refused.
 
 A lane can also read another lane's register through the cross-lane form,
 within its row of sixteen: the shifts and the rotate, the two mirrors, the
@@ -155,21 +188,28 @@ result into a named part of the destination with the rest zeroed. That form
 is how the compiler mixes widths and how it packs two values into one
 register; a source of it may be a scalar register rather than a vector one.
 A comparison has a sub-dword form too, writing VCC or the scalar pair it
-names.
+names, and every comparison has an X form, which writes EXEC as well.
+Packed instructions take op_sel and op_sel_hi -- which half, or which
+register of a pair, of each source feeds each result -- and negate each half
+on its own.
 Filling the rest of a destination with the sign instead of zeroes, or leaving
 it as it was, is refused: nothing here has been seen to ask for either.
 
 Any other instruction is refused by name, and so is anything this does not
-model: an output multiplier, a packed operation that shuffles halves. A wrong
-guess would run and give a wrong answer, which is worse than a refusal.
+model: an output multiplier, a packed operation that asks for the second half
+of a constant. A wrong guess would run and give a wrong answer, which is worse
+than a refusal. An error while a kernel runs names the instruction: the
+kernel, how far into it, and the instruction as the assembler writes it. And
+`VGPU_TRACE_LAUNCHES=1` prints each launch -- the kernel, its grid and
+block, its LDS -- which is how to see what a library such as rocBLAS runs.
 
 Three things are modelled rather than copied, and are marked where they are
 written: the reciprocal, square root, exponent and logarithm are the host's
 exact results where the hardware's are tables good to about one unit in the
 last place; the scope bits on a memory instruction change nothing, since every
-access here is already visible to every wave; LDS sits at an address of
-this model's choosing, which a kernel reads from `src_shared_base` the way it
-reads the hardware's; and the counter a wave reads to time itself counts the
+access here is already visible to every wave; LDS and a work-item's private
+memory sit at addresses of this model's choosing, which a kernel reads from
+`src_shared_base` and `src_private_base` the way it reads the hardware's; and the counter a wave reads to time itself counts the
 instructions retired by the host thread running it, which is this model's
 cycle, where a card's counts at a fixed rate.
 

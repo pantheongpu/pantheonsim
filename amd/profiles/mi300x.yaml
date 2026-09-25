@@ -11,6 +11,9 @@ architecture: cdna3
 # AMD parts have no compute capability; the gfx target is what identifies them.
 # Placeholder, like the rest of this file: not read from a device.
 gcn_arch: "gfx942"
+# As HIP names it, with the features it runs with: SRAM ECC on, XNACK off,
+# the settings an Instinct part ships with.
+gcn_arch_full: "gfx942:sramecc+:xnack-"
 warp_size: 64
 vram_bytes: 206158430208
 verified: false

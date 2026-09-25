@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "vgpu/amd_bundle.hpp"
 #include "vgpu/amd_codeobject.hpp"
 #include "vgpu/amd_exec.hpp"
 #include "vgpu/amd_hostcall.hpp"
@@ -162,9 +163,11 @@ struct Function {
 // the runtime the host-side function. The device code is a clang offload
 // bundle -- one entry per target -- and a device takes the entry for its own
 // gfx target, loaded and placed the first time a kernel runs on it, since each
-// device has memory of its own for the module's variables.
+// device has memory of its own for the module's variables. The bundle is only
+// read then: a library registers every one it carries as it loads, dozens,
+// some tens of megabytes once inflated, and a program uses few of them.
 struct FatBinary {
-  std::map<std::string, std::string> targets;   // "gfx942" -> its code object
+  const uint8_t* image = nullptr;                   // the bundle, in the program's own memory
   std::map<int, std::unique_ptr<Module>> on_device;
 };
 
@@ -201,6 +204,8 @@ struct State {
   std::vector<std::unique_ptr<Module>> modules;
   std::vector<std::unique_ptr<Function>> functions;
   std::vector<std::unique_ptr<FatBinary>> fat_binaries;
+  // Each bundle read, by where it is: a library's binaries can share one.
+  std::map<const uint8_t*, std::unique_ptr<vgpu::amd::Bundle>> bundles;
   std::map<const void*, HostFunction> host_functions;
   std::map<const void*, HostVar> host_vars;
   std::set<std::pair<int, int>> peers;           // (device, peer) pairs with access enabled
@@ -297,6 +302,15 @@ hipError_t dispatch_kernel(State& s, int ordinal, const Module& module, const Ke
                            const std::vector<uint8_t>& args, hipStream_t stream, bool cooperative = false) {
   vgpu::runtime::Device& d = s.rt->device(ordinal);
   const CodeObject& object = module.object;
+  // VGPU_TRACE_LAUNCHES=1 says what each launch runs, one line to stderr:
+  // what a program that calls a library cannot otherwise see.
+  static const bool trace = [] {
+    const char* t = std::getenv("VGPU_TRACE_LAUNCHES");
+    return t && t[0] == '1';
+  }();
+  if (trace)
+    std::fprintf(stderr, "VirtualGPU HIP: launch %s on device %d, grid %ux%ux%u of %ux%ux%u, %u bytes of LDS\n",
+                 kernel.name.c_str(), ordinal, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared);
   auto& hostcall = s.hostcalls[ordinal];
   if (!hostcall) {
     try {
@@ -430,51 +444,30 @@ hipError_t module_on(State& s, FatBinary& fb, int ordinal, Module** out) {
   }
   vgpu::runtime::Device& d = s.rt->device(ordinal);
   const std::string& gfx = d.profile().gcn_arch;
-  const auto target = fb.targets.find(gfx);
-  if (target == fb.targets.end()) {
-    std::string built;
-    for (const auto& t : fb.targets) built += (built.empty() ? "" : ", ") + t.first;
-    return fail(hipErrorNoBinaryForGpu, "the program carries device code for " + (built.empty() ? "no GPU" : built) +
-                                            ", and this device is " + gfx + ". Build it with --offload-arch=" + gfx +
-                                            ".");
+  if (!fb.image) return fail(hipErrorInvalidImage, "the program's device code is not a clang offload bundle");
+  auto& bundle = s.bundles[fb.image];
+  try {
+    if (!bundle) bundle = vgpu::amd::read_bundle(fb.image);
+  } catch (const std::exception& e) {
+    return fail(hipErrorInvalidImage, e.what());
   }
+  if (!bundle) return fail(hipErrorInvalidImage, "the program's device code is not a clang offload bundle");
+  const std::string_view* code = vgpu::amd::code_for(*bundle, d.profile().gcn_arch_full);
+  if (!code)
+    return fail(hipErrorNoBinaryForGpu, "the program carries device code for " + vgpu::amd::target_list(*bundle) +
+                                            ", and this device is " + d.profile().gcn_arch_full +
+                                            ". Build it with --offload-arch=" + gfx + ".");
   try {
     auto m = std::make_unique<Module>();
-    m->object = vgpu::amd::load_code_object(target->second, "the program's " + gfx + " code");
+    m->object = vgpu::amd::load_code_object(std::string(*code), "the program's " + gfx + " code");
     place(*m, d.memory());
-    report_loaded(*m, ordinal, target->second.data(), target->second.size());
+    report_loaded(*m, ordinal, code->data(), code->size());
     *out = m.get();
     fb.on_device.emplace(ordinal, std::move(m));
   } catch (const std::exception& e) {
     return fail(hipErrorInvalidImage, e.what());
   }
   return hipSuccess;
-}
-
-// Reads the targets out of a clang offload bundle: a magic string, a count,
-// and for each entry where its bytes are and the target it is for.
-bool read_bundle(const uint8_t* b, std::map<std::string, std::string>* out) {
-  static const char kMagic[] = "__CLANG_OFFLOAD_BUNDLE__";
-  if (std::memcmp(b, kMagic, 24) != 0) return false;
-  uint64_t count = 0;
-  std::memcpy(&count, b + 24, 8);
-  uint64_t at = 32;
-  for (uint64_t i = 0; i < count; ++i) {
-    uint64_t offset = 0, size = 0, triple_len = 0;
-    std::memcpy(&offset, b + at, 8);
-    std::memcpy(&size, b + at + 8, 8);
-    std::memcpy(&triple_len, b + at + 16, 8);
-    const std::string triple(reinterpret_cast<const char*>(b + at + 24), triple_len);
-    at += 24 + triple_len;
-    // "hipv4-amdgcn-amd-amdhsa--gfx942", perhaps with ":sramecc+:xnack-" after
-    // it: the processor is what follows the last "--", up to any feature.
-    const size_t dashes = triple.rfind("--");
-    if (triple.rfind("hip", 0) != 0 || dashes == std::string::npos || !size) continue;
-    std::string gfx = triple.substr(dashes + 2);
-    if (const size_t colon = gfx.find(':'); colon != std::string::npos) gfx.resize(colon);
-    (*out)[gfx] = std::string(reinterpret_cast<const char*>(b + offset), size);
-  }
-  return true;
 }
 
 // Each thread's pending chevron launch: hipcc pushes the configuration, then
@@ -536,7 +529,7 @@ hipError_t hipGetDeviceProperties(hipDeviceProp_t* props, int ordinal) {
   const vgpu::DeviceProfile& p = s.rt->device(ordinal).profile();
   *props = {};
   std::snprintf(props->name, sizeof props->name, "%s", p.model.c_str());
-  std::snprintf(props->gcnArchName, sizeof props->gcnArchName, "%s", p.gcn_arch.c_str());
+  std::snprintf(props->gcnArchName, sizeof props->gcnArchName, "%s", p.gcn_arch_full.c_str());
   props->totalGlobalMem = static_cast<size_t>(p.vram_bytes);
   props->sharedMemPerBlock = static_cast<size_t>(p.limits.shared_mem_per_block);
   props->warpSize = static_cast<int>(p.warp_size);
@@ -761,19 +754,19 @@ hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
   if (!d) return record(s, hipErrorInvalidDevice);
   // An offload bundle -- what hipcc --genco writes -- carries a code object
   // per target, and the device's is the one loaded.
-  std::map<std::string, std::string> targets;
-  std::string chosen;
-  if (read_bundle(bytes, &targets)) {
-    const std::string& gfx = d->profile().gcn_arch;
-    const auto it = targets.find(gfx);
-    if (it == targets.end()) {
-      std::string built;
-      for (const auto& t : targets) built += (built.empty() ? "" : ", ") + t.first;
-      return record(s, fail(hipErrorNoBinaryForGpu, "the bundle carries code for " + (built.empty() ? "no GPU" : built) +
-                                                        ", and this device is " + gfx));
+  std::unique_ptr<vgpu::amd::Bundle> bundle;
+  if (vgpu::amd::is_bundle(bytes)) {
+    try {
+      bundle = vgpu::amd::read_bundle(bytes);
+    } catch (const std::exception& e) {
+      return record(s, fail(hipErrorInvalidImage, e.what()));
     }
-    chosen = std::move(it->second);
-    bytes = reinterpret_cast<const uint8_t*>(chosen.data());
+    const std::string_view* code = bundle ? vgpu::amd::code_for(*bundle, d->profile().gcn_arch_full) : nullptr;
+    if (!code)
+      return record(s, fail(hipErrorNoBinaryForGpu, "the bundle carries code for " +
+                                                        (bundle ? vgpu::amd::target_list(*bundle) : "no GPU") +
+                                                        ", and this device is " + d->profile().gcn_arch_full));
+    bytes = reinterpret_cast<const uint8_t*>(code->data());
   }
   // A code object's length is in its own header; the ELF says where its
   // sections end, and the last of them is where the image stops.
@@ -890,6 +883,7 @@ const char* hipGetErrorName(hipError_t e) {
     case hipErrorDeinitialized: return "hipErrorDeinitialized";
     case hipErrorInvalidConfiguration: return "hipErrorInvalidConfiguration";
     case hipErrorInvalidSymbol: return "hipErrorInvalidSymbol";
+    case hipErrorInvalidPitchValue: return "hipErrorInvalidPitchValue";
     case hipErrorInvalidDevicePointer: return "hipErrorInvalidDevicePointer";
     case hipErrorInvalidMemcpyDirection: return "hipErrorInvalidMemcpyDirection";
     case hipErrorInvalidDevice: return "hipErrorInvalidDevice";
@@ -924,6 +918,7 @@ const char* hipGetErrorString(hipError_t e) {
     case hipErrorDeinitialized: return "driver shutting down";
     case hipErrorInvalidConfiguration: return "invalid configuration argument";
     case hipErrorInvalidSymbol: return "invalid device symbol";
+    case hipErrorInvalidPitchValue: return "invalid pitch argument";
     case hipErrorInvalidDevicePointer: return "invalid device pointer";
     case hipErrorInvalidMemcpyDirection: return "invalid copy direction for memcpy";
     case hipErrorInvalidDevice: return "invalid device ordinal";
@@ -1084,8 +1079,10 @@ void** __hipRegisterFatBinary(const void* data) {
   auto fb = std::make_unique<FatBinary>();
   const auto* wrapper = static_cast<const vgpu::amd::abi::FatbinWrapper*>(data);
   if (!wrapper || wrapper->magic != vgpu::amd::abi::kFatbinMagic || !wrapper->binary ||
-      !read_bundle(static_cast<const uint8_t*>(wrapper->binary), &fb->targets))
+      !vgpu::amd::is_bundle(static_cast<const uint8_t*>(wrapper->binary)))
     fail(hipErrorInvalidImage, "the program's device code is not a clang offload bundle this can read");
+  else
+    fb->image = static_cast<const uint8_t*>(wrapper->binary);
   void** handle = reinterpret_cast<void**>(fb.get());
   s.fat_binaries.push_back(std::move(fb));
   return handle;
@@ -1190,7 +1187,7 @@ namespace {
 void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0600* props) {
   std::memset(props, 0, sizeof *props);
   std::snprintf(props->name, sizeof props->name, "%s", p.model.c_str());
-  std::snprintf(props->gcnArchName, sizeof props->gcnArchName, "%s", p.gcn_arch.c_str());
+  std::snprintf(props->gcnArchName, sizeof props->gcnArchName, "%s", p.gcn_arch_full.c_str());
   props->totalGlobalMem = static_cast<size_t>(p.vram_bytes);
   props->sharedMemPerBlock = static_cast<size_t>(p.limits.shared_mem_per_block);
   props->sharedMemPerBlockOptin = static_cast<size_t>(p.limits.shared_mem_per_block_optin);
@@ -1341,6 +1338,11 @@ hipError_t hipSetDeviceFlags(unsigned int flags) {
 
 // ---- Host memory -------------------------------------------------------------
 //
+// What hipHostMalloc has handed out, by address, so that
+// hipPointerGetAttributes can say an address is host memory the runtime gave.
+std::mutex g_host_mutex;
+std::map<uint64_t, size_t> g_host_allocations;
+
 // On a card this is pinned host memory the GPU can also reach. Here a copy
 // reaches it like any host memory, and a kernel cannot: a kernel's addresses
 // are the device's own. The workloads use it to stage copies, which is what
@@ -1349,11 +1351,20 @@ hipError_t hipHostMalloc(void** ptr, size_t size, unsigned int) {
   const ApiCall api("hipHostMalloc");
   if (!ptr) return hipErrorInvalidValue;
   *ptr = size ? std::aligned_alloc(4096, (size + 4095) / 4096 * 4096) : nullptr;
-  return (size && !*ptr) ? hipErrorOutOfMemory : hipSuccess;
+  if (size && !*ptr) return hipErrorOutOfMemory;
+  if (*ptr) {
+    std::lock_guard<std::mutex> lock(g_host_mutex);
+    g_host_allocations[reinterpret_cast<uint64_t>(*ptr)] = size;
+  }
+  return hipSuccess;
 }
 
 hipError_t hipHostFree(void* ptr) {
   const ApiCall api("hipHostFree");
+  {
+    std::lock_guard<std::mutex> lock(g_host_mutex);
+    g_host_allocations.erase(reinterpret_cast<uint64_t>(ptr));
+  }
   std::free(ptr);
   return hipSuccess;
 }
@@ -1822,6 +1833,143 @@ int vgpu_hip_profiler_device(int ordinal, vgpu::amd::hipprof::Device* out) {
   }
   *out = d;
   return 0;
+}
+
+}  // extern "C"
+
+// ---- What ROCm's libraries call ---------------------------------------------
+//
+// rocBLAS, hipBLASLt and their kind call these; every one of them here is
+// what HIP's documentation says of it, over a runtime where each call has
+// finished by the time it returns.
+extern "C" {
+
+// Stream-ordered allocation: the stream has nothing queued ahead of it, so
+// the memory is there, and gone, at once.
+hipError_t hipMallocAsync(void** ptr, size_t size, hipStream_t) {
+  const ApiCall api("hipMallocAsync");
+  return hipMalloc(ptr, size);
+}
+hipError_t hipFreeAsync(void* ptr, hipStream_t) {
+  const ApiCall api("hipFreeAsync");
+  return hipFree(ptr);
+}
+
+// Each device's default pool, which stream-ordered allocations come from. It
+// holds nothing back, so trimming it has nothing to give back.
+hipError_t hipDeviceGetDefaultMemPool(void** pool, int ordinal) {
+  const ApiCall api("hipDeviceGetDefaultMemPool");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!pool) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
+  static char pools[64];
+  if (ordinal >= static_cast<int>(sizeof pools)) return record(s, hipErrorInvalidDevice);
+  *pool = &pools[ordinal];
+  return record(s, hipSuccess);
+}
+hipError_t hipMemPoolTrimTo(void* pool, size_t) {
+  const ApiCall api("hipMemPoolTrimTo");
+  return record(state(), pool ? hipSuccess : hipErrorInvalidValue);
+}
+
+// A copy of height rows, each width bytes, from one pitched buffer to another.
+hipError_t hipMemcpy2D(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height,
+                       hipMemcpyKind kind) {
+  const ApiCall api("hipMemcpy2D");
+  if (!width || !height) return record(state(), hipSuccess);
+  if (width > dpitch || width > spitch) return record(state(), hipErrorInvalidPitchValue);
+  for (size_t row = 0; row < height; ++row)
+    if (const hipError_t e = hipMemcpy(static_cast<uint8_t*>(dst) + row * dpitch,
+                                       static_cast<const uint8_t*>(src) + row * spitch, width, kind);
+        e != hipSuccess)
+      return e;
+  return hipSuccess;
+}
+hipError_t hipMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height,
+                            hipMemcpyKind kind, hipStream_t) {
+  const ApiCall api("hipMemcpy2DAsync");
+  return hipMemcpy2D(dst, dpitch, src, spitch, width, height, kind);
+}
+
+// What an address is: a device's memory, host memory hipHostMalloc gave, or
+// host memory the runtime knows nothing of -- which, as in HIP since 6.0 and
+// CUDA since 11, is an answer rather than an error.
+hipError_t hipPointerGetAttributes(vgpu::amd::abi::PointerAttribute* out, const void* ptr) {
+  const ApiCall api("hipPointerGetAttributes");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!out || !ptr) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  *out = {};
+  out->device = -1;
+  const uint64_t va = reinterpret_cast<uint64_t>(ptr);
+  for (int i = 0; i < s.rt->device_count(); ++i)
+    if (s.rt->device(i).memory().owns(va)) {
+      out->type = vgpu::amd::abi::kMemoryDevice;
+      out->device = i;
+      out->devicePointer = const_cast<void*>(ptr);
+      return record(s, hipSuccess);
+    }
+  {
+    std::lock_guard<std::mutex> host_lock(g_host_mutex);
+    auto it = g_host_allocations.upper_bound(va);
+    if (it != g_host_allocations.begin() && va < std::prev(it)->first + std::prev(it)->second) {
+      // Pinned memory is mapped for the device at the host's own address.
+      out->type = vgpu::amd::abi::kMemoryHost;
+      out->device = s.current;
+      out->devicePointer = out->hostPointer = const_cast<void*>(ptr);
+      return record(s, hipSuccess);
+    }
+  }
+  out->type = vgpu::amd::abi::kMemoryUnregistered;
+  return record(s, hipSuccess);
+}
+
+// hipStreamCaptureStatus: 0 not capturing, 1 capturing.
+hipError_t hipStreamIsCapturing(hipStream_t stream, int* status) {
+  const ApiCall api("hipStreamIsCapturing");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!status) return record(s, hipErrorInvalidValue);
+  *status = stream && s.capturing.count(stream) ? 1 : 0;
+  return record(s, hipSuccess);
+}
+
+// Nothing is ever left for a stream to do.
+hipError_t hipStreamQuery(hipStream_t) {
+  const ApiCall api("hipStreamQuery");
+  return hipSuccess;
+}
+
+hipError_t hipExtGetLastError(void) {
+  const ApiCall api("hipExtGetLastError");
+  return hipGetLastError();
+}
+
+// A module launch sized in work-items rather than work-groups, as HSA sizes a
+// dispatch, with events recorded either side of it. A grid that is not a
+// whole number of work-groups leaves its last ones partial, which this does
+// not model, and refuses.
+hipError_t hipExtModuleLaunchKernel(hipFunction_t f, uint32_t gx, uint32_t gy, uint32_t gz, uint32_t lx, uint32_t ly,
+                                    uint32_t lz, size_t shared, hipStream_t stream, void** params, void** extra,
+                                    hipEvent_t start, hipEvent_t stop, uint32_t) {
+  const ApiCall api("hipExtModuleLaunchKernel");
+  if (!lx || !ly || !lz) return record(state(), hipErrorInvalidConfiguration);
+  if (gx % lx || gy % ly || gz % lz)
+    return record(state(), fail(hipErrorNotSupported, "a grid of " + std::to_string(gx) + "x" + std::to_string(gy) +
+                                                          "x" + std::to_string(gz) +
+                                                          " work-items is not a whole number of work-groups of " +
+                                                          std::to_string(lx) + "x" + std::to_string(ly) + "x" +
+                                                          std::to_string(lz) + ", which this does not model"));
+  if (start)
+    if (const hipError_t e = hipEventRecord(start, stream); e != hipSuccess) return e;
+  if (const hipError_t e = hipModuleLaunchKernel(f, gx / lx, gy / ly, gz / lz, lx, ly, lz,
+                                                 static_cast<unsigned>(shared), stream, params, extra);
+      e != hipSuccess)
+    return e;
+  return stop ? hipEventRecord(stop, stream) : hipSuccess;
 }
 
 }  // extern "C"

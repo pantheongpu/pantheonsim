@@ -119,6 +119,7 @@ add_library(vgpu STATIC
   src/core/yamlish.cpp
   src/core/shared_state.cpp
   src/core/regs.cpp
+  amd/src/bundle.cpp
   amd/src/codeobject.cpp
   amd/src/gcn_decode.cpp
   amd/src/gcn_exec.cpp
@@ -661,6 +662,8 @@ target_compile_definitions(test_amd_gcn_idioms PRIVATE VGPU_SOURCE_DIR="${CMAKE_
 vgpu_unit_test(test_amd_gcn_asm amd/tests/unit/test_gcn_asm.cpp)
 target_compile_definitions(test_amd_gcn_asm PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_hostcall amd/tests/unit/test_hostcall.cpp)
+vgpu_unit_test(test_amd_bundle amd/tests/unit/test_bundle.cpp)
+target_compile_definitions(test_amd_bundle PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_counters amd/tests/unit/test_gcn_counters.cpp)
 target_compile_definitions(test_amd_gcn_counters PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # rocprofiler-sdk's interface from a tool's side: the test is the tool, and
@@ -738,6 +741,15 @@ set_tests_properties(amd_hip PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 # A program built by hipcc -- device code inside the executable, chevron
 # launches, the real headers' structures -- run unmodified on the shim.
+# The decoder against every instruction rocBLAS carries for gfx942, where
+# ROCm with rocBLAS is installed. Minutes, not seconds.
+add_test(NAME amd_rocblas_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas_disasm.sh)
+set_tests_properties(amd_rocblas_disasm PROPERTIES DEPENDS test_amd_gcn
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# AMD's rocBLAS, unmodified, where ROCm with rocBLAS is installed.
+add_test(NAME amd_rocblas COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas.sh)
+set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 add_test(NAME amd_hipcc COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc.sh)
 set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)

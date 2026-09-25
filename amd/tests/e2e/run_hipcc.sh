@@ -43,8 +43,8 @@ out=$(VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$shim" "$exe" 2>&
 status=$?
 echo "$out" | sed 's/^/      /'
 expect "it runs to the end" "0" "$status"
-expect "it reads the device through the real headers' layout" \
-  "device AMD Instinct MI300X gfx942 warp 64 CUs 304 threads/CU 2048 L2 4194304" \
+expect "it reads the device through the real headers' layout, named as HIP names it" \
+  "device AMD Instinct MI300X gfx942:sramecc+:xnack- warp 64 CUs 304 threads/CU 2048 L2 4194304" \
   "$(grep -o '^device .*' <<< "$out")"
 expect "a chevron launch computes every element" "chevron launch wrong 0 of 3000" \
   "$(grep -o 'chevron launch wrong .*' <<< "$out")"
