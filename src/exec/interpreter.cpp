@@ -4654,11 +4654,14 @@ class Interpreter {
       auto it = w.slots.find(op.param_slots[i]);
       if (it == w.slots.end())
         ctx_fail(ins, -1, Err::UninitializedRegister, "__assertfail argument slot read before write");
-      return it->second.read(lane, 0, 8);
+      return it->second.read(lane, 0, std::min<uint32_t>(it->second.size, 8));
     };
     const std::string msg = read_cstring(w, ctx, ins, lane, slot(0));
     const std::string file = read_cstring(w, ctx, ins, lane, slot(1));
-    const uint64_t line = slot(2);
+    // `unsigned int line`: a 4-byte argument. Reading 8 bytes of its slot
+    // reported whatever sat above it, and CuTe's asserts arrived at line
+    // 236223201335.
+    const uint64_t line = slot(2) & 0xFFFFFFFFu;
     const std::string fn = read_cstring(w, ctx, ins, lane, slot(3));
     ctx_fail(ins, static_cast<int>(lane), Err::DeviceAssert,
              "device assertion failed: " + msg + "\n  at " + file + ":" + std::to_string(line) +
