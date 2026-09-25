@@ -703,6 +703,58 @@ VTEST(mov_pred_from_immediate_and_register) {
   VCHECK_EQ(got, 7u);
 }
 
+// dp2a: a's two 16-bit halves against the low (.lo) or high (.hi) two bytes
+// of b, each sign- or zero-extended by its own type, added to c. nvcc emits
+// it for mixed-width integer arithmetic too, not only for quantized code.
+VTEST(dp2a_halves_against_bytes) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry dp(.param .u64 p, .param .u32 av, .param .u32 bv, .param .u32 cv)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  ld.param.u32 %r1, [av];
+  ld.param.u32 %r2, [bv];
+  ld.param.u32 %r3, [cv];
+  cvta.to.global.u64 %rd2, %rd1;
+  dp2a.lo.u32.u32 %r4, %r1, %r2, %r3;
+  st.global.u32 [%rd2], %r4;
+  dp2a.hi.s32.s32 %r5, %r1, %r2, %r3;
+  st.global.u32 [%rd2+4], %r5;
+  dp2a.lo.s32.u32 %r6, %r1, %r2, %r3;
+  st.global.u32 [%rd2+8], %r6;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(12);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  auto run = [&](uint32_t a, uint32_t b, uint32_t c) {
+    std::vector<uint8_t> pa(8), aa(4), ba(4), ca(4);
+    std::memcpy(pa.data(), &out, 8);
+    std::memcpy(aa.data(), &a, 4);
+    std::memcpy(ba.data(), &b, 4);
+    std::memcpy(ca.data(), &c, 4);
+    exec::launch(m.entries[0], cfg, {pa, aa, ba, ca}, mem, prof);
+    int32_t got[3] = {0, 0, 0};
+    mem.read(out, got, 12);
+    return std::array<int32_t, 3>{got[0], got[1], got[2]};
+  };
+  // a = halves 0xFFFE (low), 0x0003 (high); b = bytes 0x02, 0x05, 0xFF, 0x80.
+  // lo, unsigned: 65534*2 + 3*5 = 131083, plus c = 7.
+  // hi, signed:   -2*(-1) + 3*(-128) = -382, plus 7.
+  // lo, a signed, b unsigned: -2*2 + 3*5 = 11, plus 7.
+  const auto r = run(0x0003FFFEu, 0x80FF0502u, 7);
+  VCHECK_EQ(r[0], 131090);
+  VCHECK_EQ(r[1], -375);
+  VCHECK_EQ(r[2], 18);
+}
+
 // dp4a is the four-way byte dot product quantized inference is built on, so a
 // wrong answer here corrupts every quantized matmul while still producing
 // plausible-looking output. Concrete values, checked by hand.

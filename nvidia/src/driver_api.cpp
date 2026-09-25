@@ -52,6 +52,7 @@ struct FuncRec {
   uintptr_t module_handle = 0;
   const vgpu::ptx::EntryFn* fn = nullptr;
   const vgpu::exec::SymbolTable* syms = nullptr;
+  bool nonportable_cluster = false;   // CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED
 };
 
 // A context-independent code library (CUDA 12+ cuLibrary API): holds PTX
@@ -1246,6 +1247,7 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
                                 p.limits.max_blocks_per_sm, " blocks/SM x ",
                                 p.limits.multiprocessors, " SMs = ", resident, ")");
     }
+    cfg.nonportable_cluster = rec.nonportable_cluster;
     s.rt->device(rec.device).launch(*rec.fn, cfg, args, rec.syms);
     return CUDA_SUCCESS;
   });
@@ -1403,7 +1405,17 @@ VGPU_EXPORT CUresult cuKernelGetAttribute(int* pi, int attrib, void* kernel, CUd
   });
 }
 
-VGPU_EXPORT CUresult cuFuncSetAttribute(CUfunction, int, int) { return CUDA_SUCCESS; }
+VGPU_EXPORT CUresult cuFuncSetAttribute(CUfunction hfunc, int attrib, int value) {
+  // Only the non-portable cluster size changes what may launch; the others
+  // are tuning knobs the interpreter has no use for.
+  if (attrib != 14) return CUDA_SUCCESS;   // CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED
+  return api("cuFuncSetAttribute", true, false, [&](ShimState& s) {
+    auto it = s.functions.find(reinterpret_cast<uintptr_t>(hfunc));
+    if (it == s.functions.end()) return CUDA_ERROR_INVALID_VALUE;
+    it->second.nonportable_cluster = value != 0;
+    return CUDA_SUCCESS;
+  });
+}
 VGPU_EXPORT CUresult cuKernelSetAttribute(int, int, void*, CUdevice) { return CUDA_SUCCESS; }
 VGPU_EXPORT CUresult cuFuncSetCacheConfig(CUfunction, int) { return CUDA_SUCCESS; }
 VGPU_EXPORT CUresult cuFuncIsLoaded(int* state, CUfunction) {

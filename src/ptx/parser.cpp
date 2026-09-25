@@ -2043,13 +2043,20 @@ class Parser {
       expect_punct(",");
       op.b = parse_operand();
       ins.op = op;
-    } else if (op0 == "dp4a") {
+    } else if (op0 == "dp4a" || op0 == "dp2a") {
       // dp4a.atype.btype d, a, b, c
-      if (parts.size() != 3) return unsupported("dp4a form");
-      const bool as = parts[1] == "s32", au = parts[1] == "u32";
-      const bool bs = parts[2] == "s32", bu = parts[2] == "u32";
-      if ((!as && !au) || (!bs && !bu)) return unsupported("dp4a operand types");
+      // dp2a.{lo,hi}.atype.btype d, a, b, c
       OpDp4a op;
+      op.two = op0 == "dp2a";
+      const size_t t = op.two ? 2 : 1;
+      if (parts.size() != t + 2) return unsupported(op0 + " form");
+      if (op.two) {
+        if (parts[1] != "lo" && parts[1] != "hi") return unsupported("dp2a needs .lo or .hi");
+        op.hi = parts[1] == "hi";
+      }
+      const bool as = parts[t] == "s32", au = parts[t] == "u32";
+      const bool bs = parts[t + 1] == "s32", bu = parts[t + 1] == "u32";
+      if ((!as && !au) || (!bs && !bu)) return unsupported(op0 + " operand types");
       op.a_signed = as;
       op.b_signed = bs;
       op.dst = expect_reg_operand("dp4a destination");

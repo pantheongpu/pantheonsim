@@ -598,6 +598,8 @@ vgpu_unit_test(test_fastpath)
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
 vgpu_unit_test(test_barriers)
+# Dynamic parallelism at the PTX level.
+vgpu_unit_test(test_dynpar)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
@@ -1202,6 +1204,15 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 3600)
+endif()
+
+# Dynamic parallelism: device-side launches, nesting, order, named streams.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_dynamic_parallelism COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dynamic_parallelism.sh)
+  set_tests_properties(e2e_dynamic_parallelism PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
 endif()
 
 # Distributed shared memory through cooperative_groups' cluster API.

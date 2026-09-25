@@ -62,6 +62,9 @@ struct LaunchConfig {
   // kernel that launches a child grid names it by address. Null when the
   // caller has no table, which leaves device-side launches refused.
   const KernelTable* kernels = nullptr;
+  // cudaFuncAttributeNonPortableClusterSizeAllowed, set on the kernel: a
+  // cluster may then exceed the portable 8 blocks, up to what the part has.
+  bool nonportable_cluster = false;
 };
 
 // Invoked periodically during a launch so long-running kernels can still

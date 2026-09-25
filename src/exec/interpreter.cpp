@@ -3118,12 +3118,23 @@ class Interpreter {
           int64_t acc = op->a_signed || op->b_signed
                             ? static_cast<int64_t>(static_cast<int32_t>(c[lane]))
                             : static_cast<int64_t>(static_cast<uint32_t>(c[lane]));
-          for (int byte = 0; byte < 4; ++byte) {
-            const uint8_t ab = static_cast<uint8_t>(av >> (byte * 8));
-            const uint8_t bb = static_cast<uint8_t>(bv >> (byte * 8));
-            const int64_t ax = op->a_signed ? static_cast<int8_t>(ab) : static_cast<int64_t>(ab);
-            const int64_t bx = op->b_signed ? static_cast<int8_t>(bb) : static_cast<int64_t>(bb);
-            acc += ax * bx;
+          if (op->two) {
+            // dp2a: a's two halves against b's low or high two bytes.
+            for (int i = 0; i < 2; ++i) {
+              const uint16_t ah = static_cast<uint16_t>(av >> (i * 16));
+              const uint8_t bb = static_cast<uint8_t>(bv >> ((i + (op->hi ? 2 : 0)) * 8));
+              const int64_t ax = op->a_signed ? static_cast<int16_t>(ah) : static_cast<int64_t>(ah);
+              const int64_t bx = op->b_signed ? static_cast<int8_t>(bb) : static_cast<int64_t>(bb);
+              acc += ax * bx;
+            }
+          } else {
+            for (int byte = 0; byte < 4; ++byte) {
+              const uint8_t ab = static_cast<uint8_t>(av >> (byte * 8));
+              const uint8_t bb = static_cast<uint8_t>(bv >> (byte * 8));
+              const int64_t ax = op->a_signed ? static_cast<int8_t>(ab) : static_cast<int64_t>(ab);
+              const int64_t bx = op->b_signed ? static_cast<int8_t>(bb) : static_cast<int64_t>(bb);
+              acc += ax * bx;
+            }
           }
           r[lane] = static_cast<uint32_t>(static_cast<int32_t>(acc));
         }
@@ -7362,13 +7373,17 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
                           "dimension ", c);
       ctas *= c;
     }
-    // 8 is the portable maximum CUDA guarantees. Larger clusters exist on some
-    // parts through an opt-in, and this engine does not model the opt-in, so
-    // the portable limit is the one enforced -- a kernel that needs more is
-    // told which number it exceeded.
-    if (ctas > 8)
+    // 8 is the portable maximum CUDA guarantees. A kernel that opts in with
+    // cudaFuncAttributeNonPortableClusterSizeAllowed may have up to 16 on
+    // Hopper and Blackwell, the most those parts schedule.
+    const uint64_t nonportable_max = p.cc_major >= 9 ? 16 : 8;
+    if (ctas > 8 && !(cfg.nonportable_cluster && ctas <= nonportable_max))
       throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': cluster of ", ctas,
-                        " blocks exceeds the portable maximum of 8");
+                        " blocks exceeds ",
+                        cfg.nonportable_cluster
+                            ? "the " + std::to_string(nonportable_max) + " this part can schedule"
+                            : std::string("the portable maximum of 8 (cudaFuncAttributeNonPortable"
+                                          "ClusterSizeAllowed raises it on Hopper and later)"));
   } else if (fn.explicit_cluster) {
     // .explicitcluster means the kernel refuses to run without one.
     throw Error::make(Err::LaunchConfig, "kernel '", fn.name,

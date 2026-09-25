@@ -470,7 +470,9 @@ struct OpVideoSimd {
 struct OpCopysign { Type ty; Reg dst; Operand a, b; };
 // dp4a.{u32,s32}.{u32,s32} d, a, b, c -- four byte-wise products of a and b
 // accumulated into c. Quantized inference leans on this heavily.
-struct OpDp4a { bool a_signed = false; bool b_signed = false; Reg dst; Operand a, b, c; };
+// dp4a, and dp2a (`two`): two 16-bit elements of a against the low (or,
+// with `hi`, high) two bytes of b.
+struct OpDp4a { bool a_signed = false; bool b_signed = false; bool two = false; bool hi = false; Reg dst; Operand a, b, c; };
 // bmsk.{clamp,wrap}.b32 d, a, b -- a contiguous mask of b bits starting at a.
 struct OpBmsk { bool wrap = false; Reg dst; Operand a, b; };
 // Extended-precision arithmetic. PTX has a single per-thread condition-code
