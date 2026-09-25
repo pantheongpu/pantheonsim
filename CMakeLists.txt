@@ -122,6 +122,7 @@ add_library(vgpu STATIC
   amd/src/codeobject.cpp
   amd/src/gcn_decode.cpp
   amd/src/gcn_exec.cpp
+  amd/src/hostcall.cpp
   src/core/machine.cpp
   # Each vendor's part of the register model and its driver files.
   amd/src/regs.cpp
@@ -653,6 +654,9 @@ target_compile_definitions(test_amd_gcn_lds PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOU
 
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
 target_compile_definitions(test_amd_gcn_idioms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_unit_test(test_amd_gcn_asm amd/tests/unit/test_gcn_asm.cpp)
+target_compile_definitions(test_amd_gcn_asm PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_unit_test(test_amd_hostcall amd/tests/unit/test_hostcall.cpp)
 vgpu_unit_test(test_amd_gcn_counters amd/tests/unit/test_gcn_counters.cpp)
 target_compile_definitions(test_amd_gcn_counters PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # rocprofiler-sdk's interface from a tool's side: the test is the tool, and
@@ -738,6 +742,14 @@ set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
 add_test(NAME test_amd_hipcc_ops_decode COMMAND test_amd_gcn)
 set_tests_properties(test_amd_hipcc_ops_decode PROPERTIES ENVIRONMENT
   "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/ops.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/ops.gfx942.dis")
+# ROCm's device library's printf: the thousands of instructions a hostcall takes.
+add_test(NAME test_amd_hipcc_printf_decode COMMAND test_amd_gcn)
+set_tests_properties(test_amd_hipcc_printf_decode PROPERTIES ENVIRONMENT
+  "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/printf.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/printf.gfx942.dis")
+# cooperative_groups' grid barrier, and the sub-dword compares around it.
+add_test(NAME test_amd_hipcc_cooperative_decode COMMAND test_amd_gcn)
+set_tests_properties(test_amd_hipcc_cooperative_decode PROPERTIES ENVIRONMENT
+  "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/cooperative.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/cooperative.gfx942.dis")
 add_test(NAME test_amd_hipcc_mfma_decode COMMAND test_amd_gcn)
 set_tests_properties(test_amd_hipcc_mfma_decode PROPERTIES ENVIRONMENT
   "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/wmma.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/wmma.gfx942.dis")

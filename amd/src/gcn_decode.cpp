@@ -70,6 +70,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop2, 0x2c}, {"s_mul_hi_u32", 1, 2}},
       // SOPK: a 16-bit immediate.
       {{Enc::Sopk, 0x00}, {"s_movk_i32", 1, 0}},
+      {{Enc::Sopk, 0x0e}, {"s_addk_i32", 1, 0}},
       {{Enc::Sopk, 0x0f}, {"s_mulk_i32", 1, 0}},
       // A comparison against the instruction's own constant: the register
       // field names what is compared, not where a result goes.
@@ -226,6 +227,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vopc, 0x04b}, {"v_cmp_ngt_f32_e32", 2, 2}},
       {{Enc::Vopc, 0x04d}, {"v_cmp_neq_f32_e32", 2, 2}},
       {{Enc::Vopc, 0x04e}, {"v_cmp_nlt_f32_e32", 2, 2}},
+      {{Enc::Vopc, 0x0aa}, {"v_cmp_eq_u16_e32", 2, 2}},
       {{Enc::Vopc, 0x0ad}, {"v_cmp_ne_u16_e32", 2, 2}},
       {{Enc::Vopc, 0x0c9}, {"v_cmp_lt_u32_e32", 2, 2}},
       {{Enc::Vopc, 0x0eb}, {"v_cmp_le_u64_e32", 2, 2, 2, 2}},
@@ -245,6 +247,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // third; the shift itself is always 32-bit.
       {{Enc::Vop3, 0x041}, {"v_cmp_lt_f32_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x044}, {"v_cmp_gt_f32_e64", 2, 2, 1, 1, 1, false, true}},
+      {{Enc::Vop3, 0x0aa}, {"v_cmp_eq_u16_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x010}, {"v_cmp_class_f32_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x02b}, {"v_cmp_ngt_f16_e64", 2, 2, 1, 1, 1, false, true}},
       {{Enc::Vop3, 0x04b}, {"v_cmp_ngt_f32_e64", 2, 2, 1, 1, 1, false, true}},
@@ -550,19 +553,25 @@ std::string swizzle_text(uint32_t imm) {
 // The second word of a sub-dword instruction: which part of each source it
 // reads, with or without the sign, and which part of the destination it
 // writes. A source is a vector register unless its own bit says the field
-// names one of the scalars instead.
+// names one of the scalars instead. A comparison has no vector destination:
+// the bits that would say which part of it to write say instead which scalar
+// pair takes the result, when it is not VCC.
 void read_sdwa(Inst& in, const Shape& s, uint32_t w0, uint32_t w1, uint32_t srcs) {
   in.sdwa = true;
   if (const size_t at_e32 = in.name.rfind("_e32"); at_e32 != std::string::npos) in.name.resize(at_e32);
   in.name += "_sdwa";
   in.size = 8;
-  in.dst_sel = (w1 >> 8) & 0x7;
-  in.dst_unused = (w1 >> 11) & 0x3;
-  in.clamp = ((w1 >> 13) & 1) != 0;
-  if (const uint32_t omod = (w1 >> 14) & 0x3; omod)
-    throw Error::make(Err::Unsupported, in.name, " uses an output multiplier (omod ", omod,
-                      "), which this does not model");
-  in.dst.push_back(vgpr((w0 >> 17) & 0xFF, s.dst_width));
+  if (in.enc == Enc::Vopc) {
+    if ((w1 >> 15) & 1) in.dst[0] = operand((w1 >> 8) & 0x7F, 2);
+  } else {
+    in.dst_sel = (w1 >> 8) & 0x7;
+    in.dst_unused = (w1 >> 11) & 0x3;
+    in.clamp = ((w1 >> 13) & 1) != 0;
+    if (const uint32_t omod = (w1 >> 14) & 0x3; omod)
+      throw Error::make(Err::Unsupported, in.name, " uses an output multiplier (omod ", omod,
+                        "), which this does not model");
+    in.dst.push_back(vgpr((w0 >> 17) & 0xFF, s.dst_width));
+  }
   // Each source has its own group of bits: the part of the register, the
   // sign, the two modifiers, and whether it is a scalar register at all.
   for (uint32_t k = 0; k < srcs; ++k) {
@@ -718,8 +727,12 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     vcc.kind = OperandKind::Vcc;
     vcc.width = 2;
     in.dst.push_back(vcc);
-    in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
-    in.src.push_back(vgpr((w0 >> 9) & 0xFF, s.src_width(1)));
+    if ((w0 & 0x1FF) == 249) {   // the sub-dword form
+      read_sdwa(in, s, w0, word(code, at + 4), 2);
+    } else {
+      in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
+      in.src.push_back(vgpr((w0 >> 9) & 0xFF, s.src_width(1)));
+    }
   } else if ((w0 >> 23) == 0x1a7) {   // VOP3P: the packed forms
     in.enc = Enc::Vop3p;
     in.opcode = (w0 >> 16) & 0x7F;
@@ -1028,7 +1041,8 @@ std::string to_text(const Inst& i) {
   if (i.sdwa) {
     static const char* kParts[8] = {"BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD", "?"};
     static const char* kUnused[4] = {"UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE", "?"};
-    s += std::string(" dst_sel:") + kParts[i.dst_sel & 7] + " dst_unused:" + kUnused[i.dst_unused & 3];
+    if (i.enc != Enc::Vopc)
+      s += std::string(" dst_sel:") + kParts[i.dst_sel & 7] + " dst_unused:" + kUnused[i.dst_unused & 3];
     for (size_t k = 0; k < i.src.size(); ++k)
       s += " src" + std::to_string(k) + "_sel:" + kParts[i.src[k].sel & 7];
   }

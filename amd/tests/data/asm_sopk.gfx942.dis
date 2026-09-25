@@ -1,0 +1,23 @@
+s_load_dwordx2 s[2:3], s[0:1], 0x0
+s_load_dword s4, s[0:1], 0x8
+s_waitcnt lgkmcnt(0)
+s_mov_b32 s5, s4
+s_addk_i32 s5, 0x7fff
+s_cselect_b32 s6, 1, 0
+s_mov_b32 s7, s4
+s_addk_i32 s7, 0x8000
+s_cselect_b32 s8, 1, 0
+s_mov_b32 s9, s4
+s_mulk_i32 s9, 0xfffd
+v_mov_b32_e32 v0, 0
+v_mov_b32_e32 v1, s5
+global_store_dword v0, v1, s[2:3]
+v_mov_b32_e32 v1, s6
+global_store_dword v0, v1, s[2:3] offset:4
+v_mov_b32_e32 v1, s7
+global_store_dword v0, v1, s[2:3] offset:8
+v_mov_b32_e32 v1, s8
+global_store_dword v0, v1, s[2:3] offset:12
+v_mov_b32_e32 v1, s9
+global_store_dword v0, v1, s[2:3] offset:16
+s_endpgm

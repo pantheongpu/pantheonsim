@@ -32,7 +32,7 @@ Working today, all CPU-only:
 
 | Area | State |
 | --- | --- |
-| Device profiles | Twelve NVIDIA profiles verified against physical cards across six architectures — Turing, Ampere sm_80/sm_86, Ada, Hopper, Grace-Hopper — each matching its device on 512 conformance values. `h200` and `b200` are not yet characterized, and AMD MI300X/MI325X/MI350X are discovery-only placeholders; each profile's header says where its values came from |
+| Device profiles | Twelve NVIDIA profiles verified against physical cards across six architectures — Turing, Ampere sm_80/sm_86, Ada, Hopper, Grace-Hopper — each matching its device on 512 conformance values. `h200` and `b200` are not yet characterized. AMD: MI325X is read from a physical card; MI300X and MI350X are placeholders. Each profile's header says where its values came from |
 | `vgpu` CLI | `list-gpus`, `info --gpu <id> [--json]`, `demo vectoradd` |
 | Virtual VRAM | sparse/lazy backing — a virtual H200 claims 141 GB on a 16 GB host, and past `VGPU_MEMORY_RAM_MB` it spills to disk; OOB / use-after-free / double-free / misalignment diagnostics |
 | PTX | lexer/parser for a growing subset (see ARCHITECTURE.md); precise `unsupported` errors for the rest |
@@ -46,6 +46,7 @@ Working today, all CPU-only:
 | Python JIT | Numba runs unmodified (its PTX is assembled through the driver's JIT link API); Triton runs with a one-line hook that stops its pipeline at PTX — see [nvidia/docs/jit.md](nvidia/docs/jit.md) |
 | Discovery | live telemetry + NVML; drop-in `nvidia-smi`, `rocm-smi`, `amd-smi`, `rocm_agent_enumerator`, and `lspci` output — see [docs/telemetry.md](docs/telemetry.md) |
 | Registers | PCI configuration space from a register database: header, PM, MSI, PCI Express and AER, live link and error state, BAR sizing; `vgpu regs list/read/write/dump/log` with an access log; AMD MMIO (engine status, the SMU mailbox) from the amdgpu headers; a C API, `vgpu_regs.h` — see [docs/registers.md](docs/registers.md) |
+| AMD | unmodified hipcc-built programs run on a simulated MI300X: the HIP runtime ABI, CDNA3 (gfx942) code checked instruction by instruction against ROCm's llvm-objdump and executed on every host core, device-side `printf`, and every pantheon workload with `--verify`. AMD's `rocprofv3` runs unmodified, with the counters the interpreter counts exactly — see [amd/README.md](amd/README.md) |
 | Profiling | CUPTI's Activity API under its real soname: kernels, copies and runtime API calls, correlated; unmodified nvprof traces a program on the T4 profile. Nsight Systems and Nsight Compute are not supported. See [nvidia/docs/cupti.md](nvidia/docs/cupti.md) |
 | NVENC | `libnvidia-encode.so.1` with a deterministic content-derived encoder, so video-encode SDC tests run |
 | Proof | an nvcc-compiled CUDA program **and** the unmodified pantheon stress kernels run on the CPU; `memory_read` differential-matches a physical RTX 3060 (incl. fault injection + device printf) |
@@ -69,7 +70,10 @@ Known limitations (deliberate, documented):
   content-derived bitstream, so encoder stress and corruption checks run, but
   the output is not a decodable video stream. OptiX (ray tracing) is a separate
   NVIDIA subsystem, not CUDA, and is out of scope.
-- AMD (MI300X/MI325X/MI350X) answers discovery only; execution is not started — see [amd/README.md](amd/README.md).
+- AMD runs gfx942 (MI300X, MI325X) code; gfx950 (MI350X) and RDNA are not
+  yet checked. The HIP runtime covers what the pantheon workloads and hipcc's
+  launch ABI use, not all of HIP, and there are no ROCm libraries (rocBLAS,
+  MIOpen, RCCL) and no HSA runtime yet — see [amd/README.md](amd/README.md).
 
 ## Build & test
 

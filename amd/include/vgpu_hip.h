@@ -49,6 +49,7 @@ typedef enum hipError_t {
   hipErrorPeerAccessAlreadyEnabled = 704,
   hipErrorPeerAccessNotEnabled = 705,
   hipErrorLaunchFailure = 719,
+  hipErrorCooperativeLaunchTooLarge = 720,
   hipErrorStreamCaptureUnsupported = 900,
   hipErrorStreamCaptureUnmatched = 903,
   hipErrorNotSupported = 801,

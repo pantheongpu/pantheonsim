@@ -13,12 +13,16 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "vgpu/amd_codeobject.hpp"
 #include "vgpu/memory.hpp"
 
 namespace vgpu::amd {
+
+class Hostcall;
 
 // A launch, as the packet a HIP runtime writes describes one.
 struct Dispatch {
@@ -31,6 +35,25 @@ struct Dispatch {
   // LDS the launch adds to what the kernel reserves, which is what a HIP
   // program passes as its third launch parameter.
   uint32_t dynamic_lds = 0;
+  // Where a linked code object's image was placed on the device (its
+  // `image`), so the program counter runs in device addresses and the code
+  // reaches its own constants and variables. Zero for an object not yet
+  // linked, whose code is run where its .text says it is.
+  uint64_t code_base = 0;
+  // Where the kernel calls the host (device-side printf), if the runtime gave
+  // it anywhere: its hidden_hostcall_buffer argument, and what answers when
+  // the kernel raises the doorbell.
+  Hostcall* hostcall = nullptr;
+  // Other devices' memory the kernel may reach, by device ordinal: those the
+  // program enabled peer access to (hipDeviceEnablePeerAccess), null for the
+  // rest. Empty for none.
+  std::vector<MemoryManager*> peers;
+  // A cooperative launch (hipLaunchCooperativeKernel): every work-group is
+  // resident at once, so they can wait on one another, and grid_sync is where
+  // the device library's grid barrier keeps its count -- ROCm's mg_info, which
+  // the kernel finds through its hidden_multigrid_sync_arg argument.
+  bool cooperative = false;
+  uint64_t grid_sync = 0;
 };
 
 // What the GPU's performance counters would count for a dispatch: every
@@ -84,5 +107,10 @@ struct DispatchStats {
 // Err::InvalidValue for a dispatch the kernel cannot take (a work-group
 // larger than it allows, or more LDS than the device has).
 DispatchStats execute(const Dispatch& d, MemoryManager& mem);
+
+// The lock a device read-modify-write at this address takes while work-groups
+// run on several threads -- what the host takes too when it changes memory a
+// kernel changes with atomics (vgpu/amd_hostcall.hpp).
+std::mutex& memory_atomic_lock(uint64_t addr);
 
 }  // namespace vgpu::amd

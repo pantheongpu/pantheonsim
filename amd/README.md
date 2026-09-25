@@ -57,6 +57,16 @@ and `.so.7`) and gives each function the symbol version the real one does,
 since a program built by `hipcc` asks for `hipMalloc@hip_4.2`, not just
 `hipMalloc`.
 
+`hipDeviceGetAttribute` answers each attribute with the property of the same
+name, by the numbers ROCm's header gives them (`tests/e2e/run_hip_abi.sh`
+checks every one against the header). The occupancy calls work out how many
+work-groups a compute unit holds the way ROCm's runtime does, from the
+kernel's registers and LDS. A cooperative launch puts every work-group of its
+grid on the device at once, so a grid barrier (`this_grid().sync()`) holds,
+and a grid larger than the device holds at once is refused as HIP refuses it.
+With peer access enabled, a kernel reads and writes another device's memory
+at the address that device gave it.
+
 The instructions implemented are those clang emits for the kernels in
 `tests/data/`.
 
@@ -115,9 +125,28 @@ are written. The forms that reach across the whole wave are decoded and
 refused, since nothing available here settles which way they carry.
 
 A memory fence compiles to a write-back and an invalidate of the caches;
-every access here reaches memory directly, so both do nothing. A kernel that
-calls the host -- device-side `printf` is built on this -- is refused where it
-does, by name, rather than left spinning on a reply that will not come.
+every access here reaches memory directly, so both do nothing beyond fencing
+the host threads the work-groups run on.
+
+A kernel can call the host while it runs, which is what device-side `printf`
+is built on. The protocol is the one ROCm's device library speaks (ockl's
+hostcall): the kernel takes a packet from a buffer the runtime gave it,
+fills a slot per lane, pushes it onto a ready stack and raises a doorbell,
+whose mailbox makes it send an interrupt (`s_sendmsg`); that is where the
+host's part is done (`src/hostcall.cpp`), and the kernel, spinning on the
+packet, carries on. `printf` is the service implemented: a message per lane,
+carried in as many packets as it needs, formatted as C's printf would and
+written to the program's stdout, with printf's return value sent back. A
+hostcall for another service (device `malloc`, the address sanitizer) is
+refused by name. Vector loads and stores may be unaligned, as ROCm runs the
+hardware; the compiler counts on that when it packs a string.
+
+A program hipcc built carries linked code objects, whose code reaches its
+own constants and variables relative to itself. The whole of such an object
+goes on the device as one image and runs from there, so a format string or a
+`__constant__` table is where the code looks for it; `__hipRegisterVar` and
+the symbol calls (`hipMemcpyToSymbol` and the rest) find a program's
+variables in it.
 
 The source modifiers are applied -- an absolute value, a negation, a clamp of
 the result -- and so is the sub-dword form, where an instruction reads a
@@ -125,6 +154,8 @@ named byte or half of each source, with its sign or without, and writes its
 result into a named part of the destination with the rest zeroed. That form
 is how the compiler mixes widths and how it packs two values into one
 register; a source of it may be a scalar register rather than a vector one.
+A comparison has a sub-dword form too, writing VCC or the scalar pair it
+names.
 Filling the rest of a destination with the sign instead of zeroes, or leaving
 it as it was, is refused: nothing here has been seen to ask for either.
 
@@ -228,10 +259,9 @@ every time, or in every thread, which is what catches a failing card. A model
 that was consistently wrong could pass those, which is why each instruction is
 also checked on its own, against the assembler and against C. Every workload
 that verifies was also run with `--inject_error`, with knobs large enough for
-the fault to fire, and each one caught it. A workload whose check reports a
-fault with device-side `printf` ends with a refused launch rather than its own
-"Verification: FAIL" line, since `printf` needs the hostcall path that is not
-modelled yet.
+the fault to fire, and each one caught it, reporting the fault the way it
+would on a card: its kernel's own `printf` (`[SDC FAULT] ...`), then
+"Verification: FAIL".
 
 | Folder | What |
 | --- | --- |
