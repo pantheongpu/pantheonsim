@@ -49,4 +49,20 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes);
 // two-argument form anywhere a size exists.
 std::vector<FatbinPtx> extract_ptx(const void* data);
 
+// Which of a fatbin's PTX images the driver would JIT for a device of compute
+// capability `cc` (e.g. 90), as an index into `ptxs`; ptxs.size() if empty.
+//
+// The newest image the device can run wins. What "can run" means depends on
+// the target suffix, which only the PTX's own .target line carries -- the
+// entry header reports sm_90 and sm_90a alike as 90:
+//   sm_XY   runs on XY and everything newer;
+//   sm_XYf  runs within the family: the same major, minor XY or newer;
+//   sm_XYa  runs on XY only.
+// Between images of the same XY the more specific target wins, since it is
+// the one a build aimed at this exact device (-arch=sm_90a embeds both an
+// sm_90 and an sm_90a image, and only the second has wgmma in it). When no
+// image qualifies, the newest of all, which the load then refuses with the
+// reason.
+size_t pick_ptx(const std::vector<FatbinPtx>& ptxs, uint32_t cc);
+
 }  // namespace vgpu::cuda

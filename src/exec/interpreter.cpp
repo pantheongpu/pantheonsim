@@ -36,6 +36,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "vgpu/exec/tensormap.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/faults.hpp"
 #include "vgpu/exec/launch.hpp"
@@ -96,11 +97,31 @@ struct BarrierReduction {
 // are opaque, no kernel may read them as data, and keeping the real state
 // outside means a kernel that does read them cannot accidentally appear to
 // work.
+// Bytes a TMA (cp.async.bulk) load has read from global memory and will write
+// into shared memory, as runs of (shared offset, length) over `data`.
+struct PendingBulk {
+  std::vector<std::pair<uint32_t, uint32_t>> runs;
+  std::vector<uint8_t> data;
+  uint64_t tx = 0;         // bytes it completes on its barrier
+};
+
 struct Mbarrier {
   uint64_t expected = 0;   // arrivals per phase, from mbarrier.init
   uint64_t arrived = 0;    // arrivals so far in the current phase
   uint32_t phase = 0;      // flips each time the count is met
   bool valid = false;      // false before init and after inval
+  // Transactions (bytes) the current phase still waits for: raised by
+  // expect-tx, lowered by complete-tx. A phase completes only when the
+  // arrivals are in *and* this is zero; it may dip below zero in between,
+  // when a copy completes before its expect-tx is issued.
+  int64_t tx = 0;
+  // TMA loads that signal this barrier and have not landed yet. Their data
+  // is written to shared memory, and their bytes completed, when a thread
+  // next looks at the barrier -- a moment the asynchronous model allows, and
+  // the latest one that cannot change a correct program's result. A kernel
+  // that reads the tile without waiting sees the old contents, as it could
+  // on hardware, instead of data a synchronous copy would have put there.
+  std::vector<PendingBulk> pending;
 };
 
 // Every mbarrier a block has initialized, by shared address.
@@ -132,6 +153,8 @@ struct SharedShadow {
   uint32_t epoch = 0;
 };
 
+struct ClusterState;
+
 struct BlockCtx {
   std::array<uint32_t, 3> ctaid{};
   std::array<uint32_t, 3> ntid{};
@@ -148,6 +171,9 @@ struct BlockCtx {
   BarrierReduction* bar_red = nullptr;
   MbarrierTable* mbar = nullptr;
   SharedShadow* shadow = nullptr;   // non-null only when race detection is on
+  // The thread-block cluster this block belongs to, for barrier.cluster. A
+  // launch without clusters still has one per block.
+  ClusterState* cluster_state = nullptr;
   // Backs %clock/%clock64/%globaltimer. Advanced once per warp instruction,
   // per block -- see the note at sreg_value() for why this is a counter and
   // not a time.
@@ -158,6 +184,12 @@ struct BlockCtx {
 struct Path {
   size_t pc = 0;
   Mask mask = 0;
+  // Not runnable for now. kAtBarrier: waiting at a bar.sync for the warp's
+  // other lanes, until another path reaches the same pc and merges with it.
+  // kThisTurn: waiting on something outside the warp (barrier.cluster), so
+  // the warp's other paths get to run; it is looked at again next turn.
+  enum : uint8_t { kRunnable = 0, kAtBarrier = 1, kThisTurn = 2 };
+  uint8_t parked = kRunnable;
 };
 
 // One cp.async copy that has been issued but not yet awaited.
@@ -196,6 +228,10 @@ struct Warp {
   // the deterministic scheduler a turn otherwise lasts until the warp blocks,
   // and a spin never blocks, so the first waiter would hold the block forever.
   bool yield_now = false;
+  // barrier.cluster: the lanes that have arrived in the cluster's current
+  // phase, and the phase a later wait is waiting to see end.
+  Mask cluster_arrived = 0;
+  uint32_t cluster_wait_phase = 0;
   // Instructions this warp has issued, for the step budget. Counted per warp
   // rather than per launch: the budget exists to catch a thread that never
   // finishes, and a launch's total grows with its grid -- a 12 GB sweep over
@@ -253,6 +289,15 @@ struct Warp {
   // and read by addc/subc/madc; nothing else in the ISA touches it.
   Mask carry = 0;
   std::unique_ptr<AsyncCopies> cp;  // created on the first cp.async
+};
+
+// A thread-block cluster's shared state: its blocks' warps, which
+// barrier.cluster waits on, and that barrier's phase. The blocks of a cluster
+// are resident together and interleaved, the way a cooperative grid's are,
+// because a cluster barrier only completes if every block can reach it.
+struct ClusterState {
+  std::vector<std::vector<Warp>*> blocks;
+  uint32_t phase = 0;
 };
 
 // Strict mode, sampled once per launch: consulting it is a relaxed atomic load
@@ -503,7 +548,71 @@ class Interpreter {
   void run_grid() {
     const uint64_t total = uint64_t{cfg_.grid[0]} * cfg_.grid[1] * cfg_.grid[2];
     if (cfg_.cooperative) run_grid_cooperative(total);
-    else run_block_range(0, total);
+    else run_units(0, work_units());
+  }
+
+  // What a launch divides among host threads: whole clusters when the launch
+  // has them -- a cluster's blocks must be resident together -- and blocks
+  // otherwise.
+  uint64_t work_units() const {
+    if (!has_explicit_cluster()) return uint64_t{cfg_.grid[0]} * cfg_.grid[1] * cfg_.grid[2];
+    const auto c = cluster_shape();
+    return uint64_t{cfg_.grid[0] / c[0]} * (cfg_.grid[1] / c[1]) * (cfg_.grid[2] / c[2]);
+  }
+  void run_units(uint64_t first, uint64_t last) {
+    if (has_explicit_cluster()) run_cluster_range(first, last);
+    else run_block_range(first, last);
+  }
+
+  // Block (x, y, z) of cluster `k`, rank `r`: ranks run x fastest, as
+  // %cluster_ctarank numbers them.
+  std::array<uint32_t, 3> cluster_member(uint64_t k, uint32_t r) const {
+    const auto c = cluster_shape();
+    const uint64_t ncx = cfg_.grid[0] / c[0], ncy = cfg_.grid[1] / c[1];
+    const uint64_t kx = k % ncx, ky = (k / ncx) % ncy, kz = k / (ncx * ncy);
+    return {static_cast<uint32_t>(kx * c[0] + r % c[0]),
+            static_cast<uint32_t>(ky * c[1] + (r / c[0]) % c[1]),
+            static_cast<uint32_t>(kz * c[2] + r / (c[0] * c[1]))};
+  }
+
+  // Clusters [first, last), each with its blocks resident at once and taking
+  // bounded turns, like a cooperative grid in miniature.
+  void run_cluster_range(uint64_t first, uint64_t last) {
+    const auto c = cluster_shape();
+    if (cfg_.grid[0] % c[0] || cfg_.grid[1] % c[1] || cfg_.grid[2] % c[2])
+      throw Error::make(Err::LaunchConfig, "the grid (", cfg_.grid[0], ",", cfg_.grid[1], ",",
+                        cfg_.grid[2], ") is not a whole number of ", c[0], "x", c[1], "x", c[2],
+                        " clusters");
+    const uint32_t size = c[0] * c[1] * c[2];
+    for (uint64_t k = first; k < last; ++k) {
+      std::vector<BlockState> blocks(size);
+      std::vector<std::unique_ptr<Scheduler>> scheds;   // per block, as for a cooperative grid
+      for (uint32_t r = 0; r < size; ++r)
+        scheds.push_back(make_scheduler(cfg_.scheduler, cfg_.scheduler_seed + (k * size + r) * 0x9E3779B97F4A7C15ull));
+      ClusterState cs;
+      for (uint32_t r = 0; r < size; ++r) {
+        BlockState& b = blocks[r];
+        b.ctx.ctaid = cluster_member(k, r);
+        b.ctx.ntid = cfg_.block;
+        b.ctx.nctaid = cfg_.grid;
+        b.ctx.cluster = c;
+        b.ctx.explicit_cluster = true;
+        setup_block(b);
+        b.ctx.cluster_state = &cs;
+        cs.blocks.push_back(&b.warps);
+      }
+      constexpr uint64_t kSlice = 256;
+      size_t live = blocks.size();
+      while (live) {
+        live = 0;
+        for (uint32_t r = 0; r < size; ++r) {
+          BlockState& b = blocks[r];
+          if (b.done) continue;
+          if (step_block(b, *scheds[r], kSlice)) ++live;
+          else ++stats_.blocks;
+        }
+      }
+    }
   }
 
   // A cooperative launch: every block resident at once, interleaved.
@@ -520,9 +629,15 @@ class Interpreter {
   // the point of this simulator is that a run is reproducible, which rules out
   // handing the blocks to OS threads and letting them race.
   void run_grid_cooperative(uint64_t total) {
-    auto sched = make_scheduler(cfg_.scheduler, cfg_.scheduler_seed);
     const uint64_t gx = cfg_.grid[0], gy = cfg_.grid[1];
     std::vector<BlockState> blocks(static_cast<size_t>(total));
+    // A scheduler per block. One shared by all of them handed the blocks
+    // alternate warp indices -- with two blocks of four warps, round-robin gave
+    // block 0 only warps 0 and 2 -- and a barrier that needs every warp of a
+    // block never completed.
+    std::vector<std::unique_ptr<Scheduler>> scheds;
+    for (uint64_t i = 0; i < total; ++i)
+      scheds.push_back(make_scheduler(cfg_.scheduler, cfg_.scheduler_seed + i * 0x9E3779B97F4A7C15ull));
     for (uint64_t i = 0; i < total; ++i) {
       BlockState& b = blocks[static_cast<size_t>(i)];
       b.ctx.ctaid = {static_cast<uint32_t>(i % gx), static_cast<uint32_t>((i / gx) % gy),
@@ -533,6 +648,18 @@ class Interpreter {
       b.ctx.explicit_cluster = has_explicit_cluster();
       setup_block(b);
     }
+    // Every block is resident, so each cluster's barrier sees all its blocks.
+    const auto c = cluster_shape();
+    const uint64_t ncx = gx / c[0], ncy = gy / c[1];
+    std::vector<ClusterState> clusters(static_cast<size_t>(work_units()));
+    for (BlockState& b : blocks) {
+      const uint64_t k = (b.ctx.ctaid[0] / c[0]) + (b.ctx.ctaid[1] / c[1]) * ncx +
+                         uint64_t{b.ctx.ctaid[2] / c[2]} * ncx * ncy;
+      if (k < clusters.size()) {
+        b.ctx.cluster_state = &clusters[static_cast<size_t>(k)];
+        clusters[static_cast<size_t>(k)].blocks.push_back(&b.warps);
+      }
+    }
     // One warp-turn per block per round. Long enough that a block making real
     // progress is not paying scheduler overhead per instruction, short enough
     // that a spinning warp hands the grid back promptly.
@@ -540,9 +667,10 @@ class Interpreter {
     size_t live = blocks.size();
     while (live) {
       live = 0;
-      for (BlockState& b : blocks) {
+      for (size_t i = 0; i < blocks.size(); ++i) {
+        BlockState& b = blocks[i];
         if (b.done) continue;
-        if (step_block(b, *sched, kSlice)) ++live;
+        if (step_block(b, *scheds[i], kSlice)) ++live;
         else ++stats_.blocks;
       }
     }
@@ -603,7 +731,7 @@ class Interpreter {
   void setup_block(BlockState& b) {
     // Fresh, zeroed shared memory per block (static declarations + the
     // launch's dynamic bytes).
-    b.shared.assign(fn_.static_shared_size + cfg_.shared_bytes, 0);
+    b.shared.assign(std::max(fn_.static_shared_size, fn_.dynamic_shared_offset) + cfg_.shared_bytes, 0);
     b.ctx.shared = &b.shared;
     b.ctx.bar_red = &b.bar_red;
     b.ctx.mbar = &b.mbar;
@@ -687,6 +815,9 @@ class Interpreter {
     BlockState b;
     b.ctx = ctx;
     setup_block(b);
+    ClusterState solo;   // a block with no explicit cluster is a cluster of one
+    solo.blocks.push_back(&b.warps);
+    b.ctx.cluster_state = &solo;
     while (step_block(b, sched, /*slice=*/0)) {
     }
   }
@@ -694,18 +825,27 @@ class Interpreter {
   // Merges paths sitting at the same pc and returns the index of the one with
   // the lowest pc, which is the path that runs next.
   size_t select_path(Warp& w) {
-    if (w.paths.size() == 1) return 0;  // no divergence: nothing to merge
+    if (w.paths.size() == 1) {
+      w.paths[0].parked = Path::kRunnable;   // alone: nothing left to wait for
+      return 0;
+    }
     for (size_t i = 0; i < w.paths.size(); ++i) {
       for (size_t j = w.paths.size(); j-- > i + 1;) {
         if (w.paths[j].pc == w.paths[i].pc) {
           w.paths[i].mask |= w.paths[j].mask;
+          // Merged paths run again: at a barrier, that is the arrival that
+          // may now find every lane there.
+          w.paths[i].parked = Path::kRunnable;
           w.paths.erase(w.paths.begin() + static_cast<long>(j));
         }
       }
     }
-    size_t best = 0;
-    for (size_t i = 1; i < w.paths.size(); ++i)
-      if (w.paths[i].pc < w.paths[best].pc) best = i;
+    // Lowest pc first, among the paths not waiting at a barrier.
+    size_t best = w.paths.size();
+    for (size_t i = 0; i < w.paths.size(); ++i)
+      if (!w.paths[i].parked && (best == w.paths.size() || w.paths[i].pc < w.paths[best].pc))
+        best = i;
+    if (best == w.paths.size()) best = 0;   // cannot happen: bar.sync keeps one runnable
     return best;
   }
 
@@ -713,6 +853,8 @@ class Interpreter {
   // non-zero -- that many instructions. Zero means no bound.
   void run_warp_until_yield(Warp& w, const BlockCtx& ctx, uint64_t slice = 0) {
     uint64_t issued = 0;
+    for (Path& p : w.paths)
+      if (p.parked == Path::kThisTurn) p.parked = Path::kRunnable;
     while (w.state == Warp::State::Ready) {
       if (slice && issued++ >= slice) return;
       if (w.paths.empty()) {
@@ -748,9 +890,14 @@ class Interpreter {
         ++stats_.inst_by_opcode[ins.opcode_id];
       }
       ++stats_.instructions;
+      // Named with the instruction the warp is on: in a hang, that is almost
+      // always the wait it is spinning in, which is the whole diagnosis.
       if (++w.steps > cfg_.max_steps)
-        throw Error::make(Err::ExecLimit, "kernel '", fn_.name, "' exceeded the step budget (",
-                          cfg_.max_steps, " instructions in one warp) — possible infinite loop");
+        ctx_fail(ins, -1, Err::ExecLimit,
+                 "exceeded the step budget (" + std::to_string(cfg_.max_steps) +
+                     " instructions in one warp) — possible infinite loop; block (" +
+                     std::to_string(ctx.ctaid[0]) + "," + std::to_string(ctx.ctaid[1]) + "," +
+                     std::to_string(ctx.ctaid[2]) + "), warp " + std::to_string(cur_warp_));
       step(w, ctx, idx, ins);
     }
   }
@@ -814,6 +961,7 @@ class Interpreter {
     if (std::holds_alternative<OpLd>(ins.op) || std::holds_alternative<OpSt>(ins.op) ||
         std::holds_alternative<OpAtom>(ins.op) || std::holds_alternative<OpCpAsync>(ins.op) ||
         std::holds_alternative<OpCpAsyncGroup>(ins.op) ||
+        std::holds_alternative<OpBulkCopy>(ins.op) ||
         std::holds_alternative<OpLdMatrix>(ins.op) ||
         std::holds_alternative<OpStMatrix>(ins.op) ||
         std::holds_alternative<OpWmmaStore>(ins.op) ||
@@ -821,7 +969,7 @@ class Interpreter {
       return InstClass::Memory;
 
     if (std::holds_alternative<OpMma>(ins.op) || std::holds_alternative<OpWmmaMma>(ins.op) ||
-        std::holds_alternative<OpMovMatrix>(ins.op))
+        std::holds_alternative<OpWgmma>(ins.op) || std::holds_alternative<OpMovMatrix>(ins.op))
       return InstClass::Tensor;
 
     return InstClass::Misc;
@@ -1421,6 +1569,16 @@ class Interpreter {
       std::memcpy(&v, lane_local(w, lane).data() + (addr - kLocalVaBase), size);
       return v;
     }
+    // A generic pointer to a kernel parameter -- a __grid_constant__ taken by
+    // address, which is how a TMA tensor map reaches its instruction.
+    if (addr >= kParamVaBase && addr < kParamVaBase + kParamVaSize) {
+      if (addr + size > kParamVaBase + params_.bytes.size())
+        ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                 "a generic load reads past the end of the kernel's parameters");
+      uint64_t v = 0;
+      std::memcpy(&v, params_.bytes.data() + (addr - kParamVaBase), size);
+      return v;
+    }
     try {
       return mem_.load_scalar(addr, size);
     } catch (const Error& e) {
@@ -1441,6 +1599,9 @@ class Interpreter {
       std::memcpy(lane_local(w, lane).data() + (addr - kLocalVaBase), &value, size);
       return;
     }
+    if (addr >= kParamVaBase && addr < kParamVaBase + kParamVaSize)
+      ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+               "a store through a generic pointer to a kernel parameter; parameters are read-only");
     try {
       mem_.store_scalar(addr, size, value);
     } catch (const Error& e) {
@@ -1517,6 +1678,37 @@ class Interpreter {
       ++w.paths[idx].pc;
       return;
     }
+    if (const auto* op = std::get_if<OpClusterBarrier>(&ins.op)) {
+      if (!ctx.cluster_state)
+        ctx_fail(ins, -1, Err::UnsupportedPtx, "barrier.cluster outside a block context");
+      ClusterState& cs = *ctx.cluster_state;
+      if (!op->wait) {
+        if (w.cluster_arrived & m)
+          ctx_fail(ins, -1, Err::UnsupportedPtx,
+                   "a thread arrived at barrier.cluster twice before it completed, which the ISA "
+                   "does not allow");
+        w.cluster_arrived |= m;
+        w.cluster_wait_phase = cs.phase;
+        ++stats_.barriers;
+        complete_cluster_barrier_if_done(cs);
+        ++w.paths[idx].pc;
+        return;
+      }
+      // Waiting: the phase this warp arrived in has to end. Threads may have
+      // exited since the last look, which can complete it, so look again;
+      // if it still has not, give the turn away and re-execute later.
+      if (cs.phase == w.cluster_wait_phase) complete_cluster_barrier_if_done(cs);
+      if (cs.phase == w.cluster_wait_phase) {
+        // Other lanes of this warp may be what the barrier waits for -- on
+        // their way to exit, say -- and at a higher pc they would never run
+        // behind a lower one spinning here. Step aside for them this turn.
+        if (select_other_runnable(w, idx) != idx) w.paths[idx].parked = Path::kThisTurn;
+        else w.yield_now = true;
+        return;
+      }
+      ++w.paths[idx].pc;
+      return;
+    }
     if (std::holds_alternative<OpBar>(ins.op)) {
       if (ins.has_pred) ctx_fail(ins, -1, Err::UnsupportedPtx, "predicated bar.sync is not supported");
       ++stats_.barriers;
@@ -1525,13 +1717,34 @@ class Interpreter {
       // can never reach this barrier the kernel is malformed, and the step
       // budget catches it rather than deadlocking silently.
       if (w.paths.size() > 1) {
-        // Let the other paths run until they merge at this barrier.
-        w.paths[idx].pc = w.paths[idx].pc;  // stay put; a lower-pc path runs next
+        // Wait here for the other paths, wherever they are. Usually they are
+        // behind -- a lower pc -- but not always: nvcc places a rarely taken
+        // block after the kernel's ret and branches back from it (CUTLASS's
+        // "if (threadIdx.x == 0) prefetch(...)" compiles that way), so a lane
+        // can reach this barrier from a higher pc. Only when no path is left
+        // that could still move is the barrier unreachable.
         size_t other = select_other_runnable(w, idx);
-        if (other != idx) return;
+        if (other != idx) {
+          w.paths[idx].parked = Path::kAtBarrier;
+          return;
+        }
+        // Where the other lanes are is the diagnosis, so it is in the message.
+        std::string where;
+        for (size_t i = 0; i < w.paths.size(); ++i) {
+          if (i == idx) continue;
+          const Path& p = w.paths[i];
+          where += "\n  lanes 0x" + [&] {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "%llx", static_cast<unsigned long long>(p.mask));
+            return std::string(buf);
+          }() + " are at PTX line " +
+                   (p.pc < cur_->body.size() ? std::to_string(cur_->body[p.pc].line) + ": " +
+                                                   cur_->body[p.pc].text
+                                             : std::string("the end"));
+        }
         ctx_fail(ins, -1, Err::UnsupportedPtx,
                  "bar.sync cannot be reached by every lane of the warp: some lanes are on a path "
-                 "that never arrives at this barrier");
+                 "that never arrives at this barrier" + where);
       }
       ++w.paths[idx].pc;
       w.state = Warp::State::AtBarrier;
@@ -1550,11 +1763,11 @@ class Interpreter {
     ++w.paths[idx].pc;
   }
 
-  // Is there another path that can still run (a strictly lower pc)? Used to
-  // decide whether a barrier is merely waiting for stragglers.
+  // Is there another path that can still run -- one not itself waiting at a
+  // barrier? Used to decide whether a barrier is merely waiting for stragglers.
   size_t select_other_runnable(Warp& w, size_t idx) {
     for (size_t i = 0; i < w.paths.size(); ++i)
-      if (i != idx && w.paths[i].pc < w.paths[idx].pc) return i;
+      if (i != idx && !w.paths[i].parked) return i;
     return idx;
   }
 
@@ -1836,7 +2049,10 @@ class Interpreter {
     if (const auto* op = std::get_if<OpCvta>(&ins.op)) {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
-      uint64_t base = space_base(op->space);
+      // A parameter's address is already its generic one here: taking it
+      // ("mov.b64 %rd, param") yields the parameter window address, and
+      // converting that again added the window base twice.
+      const uint64_t base = op->space == Space::Param ? 0 : space_base(op->space);
       Lanes r;  // written for every active lane below
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane))
@@ -1968,6 +2184,11 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpMovMatrix>(&ins.op)) {
       exec_movmatrix(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpWgmma>(&ins.op)) {
+      require_warp32(ins, "wgmma");
+      exec_wgmma(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpMma>(&ins.op)) {
@@ -2281,6 +2502,15 @@ class Interpreter {
         }
         p = in_space ? (p | (Mask{1} << lane)) : (p & ~(Mask{1} << lane));
       }
+      return;
+    }
+    if (const auto* op = std::get_if<OpBulkCopy>(&ins.op)) {
+      exec_bulk_copy(w, ctx, ins, *op, m);
+      return;
+    }
+    if (std::holds_alternative<OpBulkGroup>(ins.op)) {
+      // Bulk stores write global memory when issued (see exec_bulk_copy), so
+      // a group has nothing left to wait for when it is committed.
       return;
     }
     if (const auto* op = std::get_if<OpMbarrier>(&ins.op)) {
@@ -2906,7 +3136,12 @@ class Interpreter {
       exec_sust(w, ctx, ins, *op, m);
       return;
     }
-    if (std::holds_alternative<OpTrap>(ins.op)) {
+    if (const auto* op = std::get_if<OpTrap>(&ins.op)) {
+      if (op->breakpoint)
+        ctx_fail(ins, -1, Err::Trap,
+                 "the kernel executed 'brkpt'. With no debugger attached nothing can resume it, so "
+                 "the launch ends with a device-side error; libraries place one on paths they "
+                 "consider unreachable");
       // "trap" ends the kernel with an unrecoverable device-side error. On
       // hardware the launch fails and the context is left unusable; here it is
       // an error with the line that did it, which is more use and no less true.
@@ -3569,6 +3804,226 @@ class Interpreter {
         }
       alu_fault(r, m, 32);
       write_reg(w, op.d[reg], m, r, 32);
+    }
+  }
+
+  // ---- Hopper warpgroup MMA (wgmma, sm_90a) ----
+  //
+  // Four consecutive warps form a warpgroup and compute one 64xNxK product,
+  // but the work divides exactly along M: warp r of the group holds rows
+  // 16r..16r+15 of A (when A is in registers) and of D, and every warp reads
+  // all of B (PTX ISA figures 151-158). So each warp computes its own sixteen
+  // rows when it reaches the instruction, and the group's result is the same
+  // as if all four had waited for each other.
+  //
+  // The product completes when it is issued. The ISA makes it asynchronous and
+  // leaves the accumulator undefined until wgmma.wait_group, and completing
+  // early is one of the orders that allows -- which also means a kernel that
+  // reads its accumulator before waiting is not caught here. fence,
+  // commit_group and wait_group have nothing left to order.
+
+  // A shared-memory matrix descriptor (PTX ISA 9.7.17.5.1.2.2).
+  struct WgmmaDesc {
+    uint64_t start = 0, lbo = 0, sbo = 0;
+    uint32_t swizzle = 0;   // bytes in a swizzled row: 0 (none), 32, 64 or 128
+  };
+
+  WgmmaDesc decode_wgmma_desc(const Instr& ins, uint64_t d) {
+    WgmmaDesc out;
+    out.start = (d & 0x3FFF) << 4;
+    out.lbo = ((d >> 16) & 0x3FFF) << 4;
+    out.sbo = ((d >> 32) & 0x3FFF) << 4;
+    static constexpr uint32_t kSwizzle[4] = {0, 128, 64, 32};
+    out.swizzle = kSwizzle[(d >> 62) & 3];
+    // The base offset says where a swizzle pattern starts when that is not
+    // the boundary the pattern repeats on. CUTLASS always leaves it zero and
+    // aligns its buffers instead, and the ISA does not say how a nonzero value
+    // moves the pattern; guessing would read plausible wrong matrices.
+    if (((d >> 49) & 7) != 0)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "a wgmma matrix descriptor with a nonzero base offset (bits 51-49); only "
+               "swizzle patterns that start on their repeat boundary are implemented");
+    return out;
+  }
+
+  // Shared-window offset of element (mn, k) of a matrix a descriptor
+  // describes: A is M x K and B is N x K, so `mn` is the row of A or the
+  // column of B. The strides are the canonical layouts of 9.7.17.5.1.2.1.3,
+  // written in bytes: a core matrix is 8 rows of 16 bytes, LBO and SBO step
+  // between core matrices, and a swizzled layout XORs address bits 4-6 with
+  // bits 7-9 (Swizzle<3,4,3> for 128B; 64B and 32B keep fewer of them), the
+  // same function of the address a TMA copy applies when it writes the tile.
+  static uint64_t wgmma_smem_offset(const WgmmaDesc& d, bool k_major, uint32_t eb, uint32_t mn,
+                                    uint32_t k) {
+    const uint64_t W = d.swizzle;
+    uint64_t off;
+    if (k_major) {
+      const uint64_t kb = uint64_t{k} * eb;
+      off = W ? (mn % 8) * W + (mn / 8) * d.sbo + kb
+              : (mn % 8) * 16 + (mn / 8) * d.sbo + kb % 16 + (kb / 16) * d.lbo;
+    } else {
+      const uint64_t mb = uint64_t{mn} * eb;
+      off = W ? mb % W + (mb / W) * d.lbo + (k % 8) * W + (k / 8) * d.sbo
+              : mb % 16 + (mb / 16) * d.sbo + (k % 8) * 16 + (k / 8) * d.lbo;
+    }
+    return exec::swizzle_address(d.start + off, static_cast<uint32_t>(W));
+  }
+
+  static uint32_t wgmma_elem_bytes(WgmmaElem t) {
+    switch (t) {
+      case WgmmaElem::F16:
+      case WgmmaElem::BF16: return 2;
+      case WgmmaElem::TF32: return 4;
+      default: return 1;
+    }
+  }
+
+  static double wgmma_decode(WgmmaElem t, uint64_t bits) {
+    switch (t) {
+      case WgmmaElem::F16: return f16_to_double(bits & 0xFFFF);
+      case WgmmaElem::BF16: return bf16_to_double(bits & 0xFFFF);
+      // "wgmma.mma_async operation involving type .tf32 will truncate lower
+      // 13 bits of the 32-bit input data before multiplication is issued."
+      case WgmmaElem::TF32: return static_cast<double>(f32(bits & 0xFFFFE000u));
+      case WgmmaElem::E4M3: return fp8_to_double(bits & 0xFF, kE4M3);
+      case WgmmaElem::E5M2: return fp8_to_double(bits & 0xFF, kE5M2);
+      case WgmmaElem::S8: return static_cast<double>(static_cast<int8_t>(bits & 0xFF));
+      case WgmmaElem::U8: return static_cast<double>(bits & 0xFF);
+    }
+    return 0.0;
+  }
+
+  void exec_wgmma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWgmma& op, Mask m) {
+    // Every form is .sync.aligned: the whole warp, and the whole warpgroup,
+    // executes it together.
+    const uint32_t linear0 = w.tid_x[0] + w.tid_y[0] * ctx.ntid[0] +
+                             w.tid_z[0] * ctx.ntid[0] * ctx.ntid[1];
+    const uint32_t warp_index = linear0 / W_;
+    const uint32_t block_threads = ctx.ntid[0] * ctx.ntid[1] * ctx.ntid[2];
+    if ((warp_index / 4 + 1) * 4 * W_ > block_threads)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "wgmma needs a whole warpgroup -- four warps, warp ranks 4i..4i+3 -- and this "
+               "block of " + std::to_string(block_threads) + " threads has no warp " +
+                   std::to_string((warp_index / 4) * 4 + 3));
+    if (m != all_)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "wgmma is .sync.aligned: every thread of the warpgroup must execute it, and this "
+               "warp reached it with some lanes inactive or predicated off");
+    if (op.kind != WgmmaKind::Mma) return;
+
+    const uint32_t N = op.n, K = op.k;
+    const uint32_t row0 = (warp_index % 4) * 16;   // this warp's rows of A and D
+    const uint32_t ea = wgmma_elem_bytes(op.a_type), eb = wgmma_elem_bytes(op.b_type);
+    const bool int_form = op.d_type == WgmmaAcc::S32;
+    const double sa = op.scale_a, sb = op.scale_b;
+
+    // A, this warp's 16 x K slice.
+    std::array<double, 16 * 32> A{};
+    if (op.a_regs) {
+      // The same fragment an mma.m16n8kK A operand uses (figures 151, 153, 155):
+      // lane (g, t) holds rows g and g+8, and the register index picks the row
+      // half and the column block.
+      const uint32_t per_reg = 4 / ea;
+      for (uint32_t reg = 0; reg < 4; ++reg) {
+        Lanes _s;
+        const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s);
+        for (uint32_t lane = 0; lane < W_; ++lane) {
+          const uint32_t g = lane / 4, t = lane % 4;
+          const uint32_t row = g + (reg % 2) * 8;
+          const uint32_t col0 = t * per_reg + (reg / 2) * (per_reg * 4);
+          for (uint32_t e = 0; e < per_reg; ++e)
+            A[row * K + col0 + e] =
+                sa * wgmma_decode(op.a_type, v[lane] >> (8 * ea * e));
+        }
+      }
+    } else {
+      Lanes _s;
+      const Lanes& dv = read_operand(w, ctx, ins, op.a_desc, _s);
+      const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
+      for (uint32_t r = 0; r < 16; ++r)
+        for (uint32_t k = 0; k < K; ++k) {
+          const uint64_t at = wgmma_smem_offset(d, op.trans_a == 0, ea, row0 + r, k);
+          A[r * K + k] = sa * wgmma_decode(op.a_type, load_routed(w, ctx, ins, 0, kSharedVaBase + at, ea));
+        }
+    }
+    // B, all of it: K x N, read as N rows of K.
+    std::vector<double>& B = wgmma_b_;
+    B.assign(size_t{K} * N, 0.0);
+    {
+      Lanes _s;
+      const Lanes& dv = read_operand(w, ctx, ins, op.b_desc, _s);
+      const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
+      for (uint32_t n = 0; n < N; ++n)
+        for (uint32_t k = 0; k < K; ++k) {
+          const uint64_t at = wgmma_smem_offset(d, op.trans_b == 0, eb, n, k);
+          B[size_t{k} * N + n] =
+              sb * wgmma_decode(op.b_type, load_routed(w, ctx, ins, 0, kSharedVaBase + at, eb));
+        }
+    }
+    // scale-d: false means D = A*B, per the ISA. Read per lane; a kernel
+    // passes a uniform value, and per lane is what that value means for the
+    // accumulator elements each lane owns.
+    Mask keep_d = all_;
+    if (const auto* imm = std::get_if<ImmInt>(&op.scale_d)) {
+      keep_d = imm->value ? all_ : 0;
+    } else if (const auto* r = std::get_if<RegOperand>(&op.scale_d)) {
+      keep_d = read_pred(w, ins, r->reg);
+    } else {
+      ctx_fail(ins, -1, Err::UnsupportedPtx, "wgmma scale-d must be a predicate or 0/1");
+    }
+
+    // Accumulator element e of a lane: rows g and g+8, two adjacent columns,
+    // repeated across N in blocks of eight (figures 152, 154, 156).
+    auto d_pos = [](uint32_t lane, uint32_t e, uint32_t* row, uint32_t* col) {
+      const uint32_t g = lane / 4, t = lane % 4, j = e / 4, s = e % 4;
+      *row = g + 8 * (s / 2);
+      *col = 8 * j + 2 * t + (s % 2);
+    };
+    const bool f16_acc = op.d_type == WgmmaAcc::F16;
+    const uint32_t elems = N / 2;   // accumulator elements per lane
+    std::vector<Lanes> out(op.d.size());
+    for (uint32_t reg = 0; reg < op.d.size(); ++reg) {
+      Lanes _s;
+      out[reg] = read_operand(w, ctx, ins, Operand{RegOperand{op.d[reg]}}, _s);
+    }
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      const bool accumulate = keep_d & (Mask{1} << lane);
+      for (uint32_t e = 0; e < elems; ++e) {
+        uint32_t row, col;
+        d_pos(lane, e, &row, &col);
+        uint64_t& slot = out[f16_acc ? e / 2 : e][lane];
+        if (int_form) {
+          int64_t acc = accumulate ? static_cast<int32_t>(slot) : 0;
+          for (uint32_t k = 0; k < K; ++k)
+            acc += static_cast<int64_t>(A[row * K + k]) *
+                   static_cast<int64_t>(B[size_t{k} * N + col]);
+          if (op.satfinite)
+            acc = std::clamp<int64_t>(acc, std::numeric_limits<int32_t>::min(),
+                                      std::numeric_limits<int32_t>::max());
+          slot = static_cast<uint32_t>(static_cast<int32_t>(acc));
+          continue;
+        }
+        const uint32_t shift = f16_acc ? 16 * (e % 2) : 0;
+        float acc = 0.0f;
+        if (accumulate)
+          acc = f16_acc ? static_cast<float>(f16_to_double((slot >> shift) & 0xFFFF))
+                        : f32(slot);
+        // Products of every input type here are exact in f32, and the sum is
+        // kept in f32 -- "at least single precision" for an f32 accumulator,
+        // and more than the half precision an f16 one promises.
+        for (uint32_t k = 0; k < K; ++k)
+          acc += static_cast<float>(A[row * K + k]) * static_cast<float>(B[size_t{k} * N + col]);
+        if (f16_acc) {
+          const uint64_t h = double_to_f16(acc) & 0xFFFF;
+          slot = (slot & ~(uint64_t{0xFFFF} << shift) & 0xFFFFFFFFu) | (h << shift);
+        } else {
+          slot = f32bits(acc);
+        }
+      }
+    }
+    for (uint32_t reg = 0; reg < op.d.size(); ++reg) {
+      if (!int_form) alu_fault(out[reg], m, 32);
+      write_reg(w, op.d[reg], m, out[reg], 32);
     }
   }
 
@@ -4354,6 +4809,232 @@ class Interpreter {
     return m ? static_cast<uint32_t>(__builtin_ctzll(m)) : 0u;
   }
 
+  // barrier.cluster completes when every thread of the cluster that has not
+  // exited has arrived (9.7.15.3). Exited lanes are simply no longer live, so
+  // "not exited" is "on some path".
+  static void complete_cluster_barrier_if_done(ClusterState& cs) {
+    for (std::vector<Warp>* warps : cs.blocks)
+      for (const Warp& w : *warps) {
+        Mask live = 0;
+        for (const Path& p : w.paths) live |= p.mask;
+        if (live & ~w.cluster_arrived) return;
+      }
+    for (std::vector<Warp>* warps : cs.blocks)
+      for (Warp& w : *warps) w.cluster_arrived = 0;
+    ++cs.phase;
+  }
+
+  // ---- Hopper's bulk copies (TMA) ----
+  //
+  // A load reads global memory when issued and reaches shared memory when its
+  // mbarrier is next looked at (Mbarrier::pending). A store reads shared
+  // memory and writes global memory when issued, so its bulk group is
+  // already complete when the kernel waits on it; a kernel that overwrites
+  // the source tile before cp.async.bulk.wait_group.read is not caught.
+
+  // Reads the 128-byte tensor map at a generic address: a kernel parameter
+  // (__grid_constant__), global memory or constant memory.
+  exec::TensorMap read_tensor_map(Warp& w, const BlockCtx& ctx, const Instr& ins, uint32_t lane,
+                                  uint64_t addr) {
+    if (addr % 64)
+      ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
+               "a tensor map must be 64-byte aligned");
+    uint64_t q[16];
+    for (int i = 0; i < 16; ++i) q[i] = load_routed(w, ctx, ins, lane, addr + 8 * i, 8);
+    exec::TensorMap m;
+    if (!m.decode(q))
+      ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+               "the tensor map this copy names was not made by cuTensorMapEncodeTiled (or was "
+               "overwritten); its first bytes are not the encoder's");
+    return m;
+  }
+
+  void exec_bulk_copy(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpBulkCopy& op, Mask m) {
+    // Copies, not references: a 32-bit address register is widened into a
+    // small ring of scratch lanes, and the coordinates read below would reuse
+    // the slot an address still pointed into.
+    Lanes _s_smem, _s_gmem, _s_mbar;
+    const Lanes smem_base = addr_base(w, ctx, ins, op.smem, _s_smem);
+    const Lanes gmem_lanes = op.tensor ? Lanes{} : addr_base(w, ctx, ins, op.gmem, _s_gmem);
+    const Lanes mbar_lanes = op.to_shared ? addr_base(w, ctx, ins, op.mbar, _s_mbar) : Lanes{};
+    const Lanes* gmem_base = &gmem_lanes;
+    const Lanes* mbar_base = &mbar_lanes;
+    Lanes size_v{}, tmap_v{}, mask_v{};
+    {
+      Lanes _s;
+      if (!op.tensor) size_v = read_operand(w, ctx, ins, op.size, _s);
+      else tmap_v = read_operand(w, ctx, ins, op.tmap, _s);
+    }
+    if (op.multicast) {
+      Lanes _s;
+      mask_v = read_operand(w, ctx, ins, op.cta_mask, _s);
+    }
+    std::vector<Lanes> coords(op.coords.size());
+    for (size_t i = 0; i < op.coords.size(); ++i) {
+      Lanes _s;
+      coords[i] = read_operand(w, ctx, ins, op.coords[i], _s);
+    }
+    const uint64_t shared_size = ctx.shared ? ctx.shared->size() : 0;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      ++stats_.global_loads;
+      if (op.multicast) {
+        // To this block alone it is an ordinary copy; to any other it needs
+        // distributed shared memory.
+        const uint32_t rank = static_cast<uint32_t>(sreg_value(Sreg::ClusterCtaRank, 0, w, ctx, lane));
+        if ((mask_v[lane] & 0xFFFF) != (1u << rank))
+          ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                   "a multicast bulk copy to other blocks of the cluster needs distributed shared "
+                   "memory, which is not implemented");
+      }
+      const uint64_t smem = smem_base[lane] + static_cast<uint64_t>(op.smem.offset);
+      if (smem % 16)
+        ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
+                 "a bulk copy's shared-memory address must be 16-byte aligned");
+      PendingBulk pb;
+      auto add_run = [&](uint64_t off, uint32_t len) {
+        if (off + len > shared_size)
+          ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                   "a bulk copy reaches shared offset " + std::to_string(off + len) +
+                       ", past the block's " + std::to_string(shared_size) + " bytes");
+        if (!pb.runs.empty() && pb.runs.back().first + pb.runs.back().second == off)
+          pb.runs.back().second += len;
+        else
+          pb.runs.emplace_back(static_cast<uint32_t>(off), len);
+      };
+      if (!op.tensor) {
+        const uint64_t g = (*gmem_base)[lane] + static_cast<uint64_t>(op.gmem.offset);
+        const uint64_t n = static_cast<uint32_t>(size_v[lane]);
+        if (n % 16 || g % 16)
+          ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
+                   "a bulk copy's size and global address must be multiples of 16");
+        if (op.to_shared) {
+          add_run(smem, static_cast<uint32_t>(n));
+          pb.data.resize(n);
+          try {
+            mem_.read(g, pb.data.data(), n);
+          } catch (const Error& e) {
+            rethrow_with_context(e, ins, static_cast<int>(lane));
+          }
+          pb.tx = n;
+        } else {
+          if (smem + n > shared_size)
+            ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                     "a bulk store reads past the block's shared memory");
+          try {
+            mem_.write(g, ctx.shared->data() + smem, n);
+          } catch (const Error& e) {
+            rethrow_with_context(e, ins, static_cast<int>(lane));
+          }
+        }
+      } else {
+        const exec::TensorMap map = read_tensor_map(w, ctx, ins, lane, tmap_v[lane]);
+        if (map.rank != op.dims)
+          ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                   "a ." + std::to_string(op.dims) + "d tensor copy through a rank-" +
+                       std::to_string(map.rank) + " tensor map");
+        const uint32_t es = static_cast<uint32_t>(map.stride[0]);
+        const uint32_t swz = exec::TensorMap::swizzle_bytes(map.swizzle);
+        // Elements the box takes along each dimension: box / traversal stride,
+        // rounded up.
+        std::array<uint64_t, 5> count{1, 1, 1, 1, 1};
+        uint64_t total = 1;
+        for (uint32_t d = 0; d < map.rank; ++d) {
+          count[d] = (map.box[d] + map.elem_stride[d] - 1) / map.elem_stride[d];
+          total *= count[d];
+        }
+        std::array<int64_t, 5> start{};
+        for (uint32_t d = 0; d < map.rank; ++d)
+          start[d] = static_cast<int32_t>(static_cast<uint32_t>(coords[d][lane]));
+        if (op.to_shared) pb.data.resize(total * es);
+        std::array<uint64_t, 5> j{};
+        for (uint64_t e = 0; e < total; ++e) {
+          // Global position of element e of the box, dimension 0 fastest.
+          bool inside = true;
+          uint64_t gaddr = map.address;
+          for (uint32_t d = 0; d < map.rank; ++d) {
+            const int64_t g = start[d] + static_cast<int64_t>(j[d] * map.elem_stride[d]);
+            if (g < 0 || static_cast<uint64_t>(g) >= map.dim[d]) inside = false;
+            else gaddr += static_cast<uint64_t>(g) * map.stride[d];
+          }
+          // Shared position: the box packed densely, then swizzled by
+          // address the same way wgmma reads it back.
+          const uint64_t soff = exec::swizzle_address(smem + e * es, swz);
+          if (op.to_shared) {
+            uint64_t v = 0;
+            if (inside) {
+              try {
+                v = mem_.load_scalar(gaddr, es);
+              } catch (const Error& ex) {
+                rethrow_with_context(ex, ins, static_cast<int>(lane));
+              }
+            } else if (map.oob_nan) {
+              ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                       "the box crosses the tensor's edge and the map asks for the NaN "
+                       "out-of-bounds fill, whose value is not documented; only zero fill is "
+                       "implemented");
+            }
+            std::memcpy(pb.data.data() + e * es, &v, es);
+            add_run(soff, es);
+          } else if (inside) {
+            // A store writes only the elements inside the tensor.
+            if (soff + es > shared_size)
+              ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                       "a bulk tensor store reads past the block's shared memory");
+            uint64_t v = 0;
+            std::memcpy(&v, ctx.shared->data() + soff, es);
+            try {
+              mem_.store_scalar(gaddr, es, v);
+            } catch (const Error& ex) {
+              rethrow_with_context(ex, ins, static_cast<int>(lane));
+            }
+          }
+          for (uint32_t d = 0; d < map.rank; ++d) {
+            if (++j[d] < count[d]) break;
+            j[d] = 0;
+          }
+        }
+        // The barrier counts every byte of the box, the zero-filled ones too.
+        pb.tx = total * es;
+      }
+      if (!op.to_shared) continue;
+      // The barrier this load completes on, in this block's shared memory.
+      const uint64_t bar = kSharedVaBase + (*mbar_base)[lane] + static_cast<uint64_t>(op.mbar.offset);
+      auto it = ctx.mbar->bars.find(bar);
+      if (it == ctx.mbar->bars.end() || !it->second.valid)
+        ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                 "a bulk copy completes on an mbarrier that has not been initialized");
+      it->second.pending.push_back(std::move(pb));
+    }
+  }
+
+  // A phase completes when its arrivals are all in and no transaction bytes
+  // are outstanding (9.7.15.16.8). A phase can be over-subscribed only by a
+  // malformed kernel; the surplus carries into the next phase rather than
+  // being dropped, which is what the hardware counter does.
+  static void complete_phase_if_done(Mbarrier& b) {
+    if (b.expected && b.arrived >= b.expected && b.tx == 0) {
+      b.arrived -= b.expected;
+      b.phase ^= 1u;
+    }
+  }
+
+  // Writes the TMA loads waiting on this barrier into shared memory and
+  // completes their bytes -- see Mbarrier::pending for when and why.
+  static void land_bulk_copies(const BlockCtx& ctx, Mbarrier& b) {
+    if (b.pending.empty()) return;
+    for (const PendingBulk& p : b.pending) {
+      size_t at = 0;
+      for (const auto& [off, len] : p.runs) {
+        std::memcpy(ctx.shared->data() + off, p.data.data() + at, len);
+        at += len;
+      }
+      b.tx -= static_cast<int64_t>(p.tx);
+    }
+    b.pending.clear();
+    complete_phase_if_done(b);
+  }
+
   void exec_mbarrier(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMbarrier& op,
                      Mask m) {
     if (!ctx.mbar)
@@ -4420,31 +5101,50 @@ class Interpreter {
           for (uint32_t lane = 0; lane < W_; ++lane)
             if (m & (Mask{1} << lane)) inc += c[lane];
         }
+        // arrive.expect_tx: the count operand is the transaction bytes, raised
+        // before the arrival, and each thread arrives once.
+        if (op.expect_tx) {
+          b.tx += static_cast<int64_t>(inc);
+          inc = lanes;
+        }
         // The token names the phase this arrival belongs to, which is the
         // phase a later test_wait asks about. Captured before any flip.
         const uint64_t token = b.phase & 1u;
         b.arrived += inc;
-        if (b.arrived >= b.expected) {
-          // A phase can be over-subscribed only by a malformed kernel; the
-          // surplus carries into the next phase rather than being dropped,
-          // which is what the hardware counter does.
-          b.arrived -= b.expected;
-          b.phase ^= 1u;
-        }
+        const uint32_t before = b.phase;
+        complete_phase_if_done(b);
+        if (op.no_complete && b.phase != before)
+          ctx_fail(ins, -1, Err::UnsupportedPtx,
+                   "mbarrier.arrive.noComplete completed the phase, which the ISA leaves undefined");
         if (op.op == MbarOp::ArriveDrop) {
           // arrive_drop also removes this thread from every later phase.
           b.expected = inc >= b.expected ? 0 : b.expected - inc;
           if (b.expected == 0) b.valid = false;
         }
-        Lanes r;
+        if (op.dst.id != kNoReg) {   // `_` discards the token
+          Lanes r;
+          for (uint32_t lane = 0; lane < W_; ++lane)
+            if (m & (Mask{1} << lane)) r[lane] = token;
+          write_reg(w, op.dst, m, r, 64);
+        }
+        return;
+      }
+      case MbarOp::ExpectTx:
+      case MbarOp::CompleteTx: {
+        require_valid();
+        Lanes _s_c;
+        const Lanes& c = read_operand(w, ctx, ins, op.count, _s_c);
+        int64_t n = 0;
         for (uint32_t lane = 0; lane < W_; ++lane)
-          if (m & (Mask{1} << lane)) r[lane] = token;
-        write_reg(w, op.dst, m, r, 64);
+          if (m & (Mask{1} << lane)) n += static_cast<int64_t>(static_cast<uint32_t>(c[lane]));
+        b.tx += op.op == MbarOp::ExpectTx ? n : -n;
+        complete_phase_if_done(b);
         return;
       }
       case MbarOp::TestWait:
       case MbarOp::TryWait: {
         require_valid();
+        land_bulk_copies(ctx, b);
         Mask& p = pred_slot(w, op.dst);
         if (!op.have_state)
           ctx_fail(ins, -1, Err::UnsupportedPtx,
@@ -4469,6 +5169,7 @@ class Interpreter {
       }
       case MbarOp::PendingCount: {
         require_valid();
+        land_bulk_copies(ctx, b);
         Lanes r;
         const uint64_t pending = b.expected > b.arrived ? b.expected - b.arrived : 0;
         for (uint32_t lane = 0; lane < W_; ++lane)
@@ -4654,11 +5355,14 @@ class Interpreter {
       auto it = w.slots.find(op.param_slots[i]);
       if (it == w.slots.end())
         ctx_fail(ins, -1, Err::UninitializedRegister, "__assertfail argument slot read before write");
-      return it->second.read(lane, 0, 8);
+      return it->second.read(lane, 0, std::min<uint32_t>(it->second.size, 8));
     };
     const std::string msg = read_cstring(w, ctx, ins, lane, slot(0));
     const std::string file = read_cstring(w, ctx, ins, lane, slot(1));
-    const uint64_t line = slot(2);
+    // `unsigned int line`: a 4-byte argument. Reading 8 bytes of its slot
+    // reported whatever sat above it, and CuTe's asserts arrived at line
+    // 236223201335.
+    const uint64_t line = slot(2) & 0xFFFFFFFFu;
     const std::string fn = read_cstring(w, ctx, ins, lane, slot(3));
     ctx_fail(ins, static_cast<int>(lane), Err::DeviceAssert,
              "device assertion failed: " + msg + "\n  at " + file + ":" + std::to_string(line) +
@@ -5066,6 +5770,9 @@ class Interpreter {
   // of variant tests, and the instruction stream is the hottest path there is.
   mutable std::vector<uint8_t> class_by_pc_;
   uint32_t cur_warp_ = 0;     // which warp of the block is running, for race reports
+  // B of the wgmma being executed, kept across instructions so a 64x256 tile
+  // does not allocate on every one. An interpreter runs on one thread.
+  std::vector<double> wgmma_b_;
   // %gridid: a serial number distinguishing this launch from every other one in
   // the process. Assigned once per launch rather than per interpreter, so the
   // workers of one launch agree.
@@ -5383,16 +6090,24 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
   std::mutex err_mu;
   std::exception_ptr first_error;
   workers.reserve(nthreads);
+  // Divided by clusters when the launch has them, since a cluster's blocks
+  // must run together.
+  const uint64_t units = [&] {
+    uint32_t c[3];
+    for (int i = 0; i < 3; ++i) c[i] = eff.cluster[i] ? eff.cluster[i] : 1;
+    if (c[0] * c[1] * c[2] <= 1) return blocks;
+    return uint64_t{eff.grid[0] / c[0]} * (eff.grid[1] / c[1]) * (eff.grid[2] / c[2]);
+  }();
   for (unsigned t = 0; t < nthreads; ++t) {
-    const uint64_t begin = blocks * t / nthreads;
-    const uint64_t end = blocks * (t + 1) / nthreads;
+    const uint64_t begin = units * t / nthreads;
+    const uint64_t end = units * (t + 1) / nthreads;
     workers.emplace_back([&, t, begin, end] {
       try {
         Interpreter interp(fn, eff, pb, mem, profile, symbols, per_thread[t],
                            t == 0 ? progress : ProgressFn{});
         interp.set_concurrent(true);
         interp.set_grid_id(grid_id);
-        interp.run_block_range(begin, end);
+        interp.run_units(begin, end);
       } catch (...) {
         std::lock_guard<std::mutex> lock(err_mu);
         if (!first_error) first_error = std::current_exception();

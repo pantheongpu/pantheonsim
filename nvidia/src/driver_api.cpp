@@ -30,6 +30,7 @@
 #include "fatbin.hpp"
 #include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
+#include "vgpu/exec/tensormap.hpp"
 #include "vgpu/profiling.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
@@ -234,10 +235,7 @@ uintptr_t check_handle(uintptr_t h, uintptr_t tag, const char* what) {
   return h;
 }
 
-// Picks the PTX image the driver would JIT: the newest whose target the
-// device can run -- no newer than its compute capability -- since a fatbin
-// built for many architectures carries one per target. Only when none
-// qualifies, the newest of all, which the load then refuses with the reason.
+// Picks the PTX image the driver would JIT -- see pick_ptx for the rule.
 std::string best_ptx(const void* image) {
   auto ptxs = vgpu::cuda::extract_ptx(image);
   if (ptxs.empty())
@@ -250,15 +248,7 @@ std::string best_ptx(const void* image) {
     const vgpu::DeviceProfile& p = s.rt->device(0).profile();
     cc = static_cast<uint32_t>(p.cc_major * 10 + p.cc_minor);
   }
-  size_t best = ptxs.size();
-  for (size_t i = 0; i < ptxs.size(); ++i)
-    if (ptxs[i].arch <= cc && (best == ptxs.size() || ptxs[i].arch > ptxs[best].arch)) best = i;
-  if (best == ptxs.size()) {
-    best = 0;
-    for (size_t i = 1; i < ptxs.size(); ++i)
-      if (ptxs[i].arch > ptxs[best].arch) best = i;
-  }
-  return std::move(ptxs[best].text);
+  return std::move(ptxs[vgpu::cuda::pick_ptx(ptxs, cc)].text);
 }
 
 // Attribute values beyond the profile-backed set.
@@ -1580,11 +1570,51 @@ VGPU_EXPORT CUresult cuLinkComplete(void* state, void** imageOut, size_t* sizeOu
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuTensorMapEncodeTiled(void*, unsigned int, unsigned int, void*,
-                                            const unsigned long long*, const unsigned long long*,
-                                            const unsigned int*, const unsigned int*, unsigned int,
-                                            unsigned int, unsigned int, unsigned int) {
-  return CUDA_ERROR_NOT_SUPPORTED;  // Hopper TMA descriptors
+// Hopper TMA descriptors. The object is opaque (include/vgpu/exec/tensormap.hpp
+// holds this simulator's layout of it); what is not opaque is the list of
+// requirements cuda.h documents, and each one is checked, so a map that the
+// real driver would refuse is refused here with the rule it broke. Encoding
+// needs no context: it touches no device, and CUTLASS calls it before any.
+VGPU_EXPORT CUresult cuTensorMapEncodeTiled(void* tensorMap, unsigned int dataType, unsigned int rank,
+                                            void* globalAddress, const unsigned long long* globalDim,
+                                            const unsigned long long* globalStrides,
+                                            const unsigned int* boxDim,
+                                            const unsigned int* elementStrides, unsigned int interleave,
+                                            unsigned int swizzle, unsigned int l2Promotion,
+                                            unsigned int oobFill) {
+  return api("cuTensorMapEncodeTiled", false, false, [&](ShimState&) -> CUresult {
+    std::string why;
+    switch (vgpu::exec::encode_tiled(tensorMap, dataType, rank, globalAddress, globalDim, globalStrides,
+                                     boxDim, elementStrides, interleave, swizzle, l2Promotion, oobFill,
+                                     &why)) {
+      case vgpu::exec::TmapResult::Ok: return CUDA_SUCCESS;
+      case vgpu::exec::TmapResult::Unsupported:
+        throw vgpu::Error::make(vgpu::Err::Unsupported, "cuTensorMapEncodeTiled: ", why);
+      case vgpu::exec::TmapResult::Invalid: break;
+    }
+    throw vgpu::Error::make(vgpu::Err::InvalidValue, "cuTensorMapEncodeTiled: ", why);
+  });
+}
+
+// Points an existing map at a new base address, keeping everything else.
+VGPU_EXPORT CUresult cuTensorMapReplaceAddress(void* tensorMap, void* globalAddress) {
+  return api("cuTensorMapReplaceAddress", false, false, [&](ShimState&) -> CUresult {
+    std::string why;
+    if (vgpu::exec::replace_address(tensorMap, globalAddress, &why) != vgpu::exec::TmapResult::Ok)
+      throw vgpu::Error::make(vgpu::Err::InvalidValue, "cuTensorMapReplaceAddress: ", why);
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuTensorMapEncodeIm2col(void*, unsigned int, unsigned int, void*,
+                                             const unsigned long long*, const unsigned long long*,
+                                             const int*, const int*, unsigned int, unsigned int,
+                                             const unsigned int*, unsigned int, unsigned int,
+                                             unsigned int, unsigned int) {
+  return api("cuTensorMapEncodeIm2col", false, false, [&](ShimState&) -> CUresult {
+    throw vgpu::Error::make(vgpu::Err::Unsupported,
+                            "cuTensorMapEncodeIm2col: TMA's im2col mode is not implemented");
+  });
 }
 
 VGPU_EXPORT CUresult cuMemsetD8_v2(CUdeviceptr d, unsigned char v, size_t n) {
@@ -2268,6 +2298,8 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuOccupancyMaxActiveBlocksPerMultiprocessor),
     VGPU_PROC(cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags),
     VGPU_PROC(cuGetExportTable),
+    VGPU_PROC(cuTensorMapEncodeTiled), VGPU_PROC(cuTensorMapReplaceAddress),
+    VGPU_PROC(cuTensorMapEncodeIm2col),
 };
 
 // Versioned/suffixed request names resolve to the same synchronous impls:

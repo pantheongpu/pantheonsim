@@ -216,9 +216,12 @@ int main() {
   cudaKernelNodeParams no_func = k;
   no_func.func = nullptr;
   WANT(cudaGraphAddKernelNode(&bad, graph, nullptr, 0, &no_func), cudaErrorInvalidValue);
+  // A 2D fill with no pitch would write its rows over each other. (2D fills
+  // with a real pitch are nodes like any other; see graph_shapes.)
   cudaMemsetParams tall = zero;
-  tall.height = 4;   // a 2D fill needs a pitch this engine does not carry
-  WANT(cudaGraphAddMemsetNode(&bad, graph, nullptr, 0, &tall), cudaErrorNotSupported);
+  tall.height = 4;
+  tall.pitch = 0;
+  WANT(cudaGraphAddMemsetNode(&bad, graph, nullptr, 0, &tall), cudaErrorInvalidValue);
 
   // The drawing names every node and every dependency.
   const char* dot = "/tmp/vgpu-graph-build.dot";

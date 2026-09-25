@@ -89,6 +89,42 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   kernel's code. Stack and printf-buffer sizes are recorded and reported but
   bound nothing here. e2e_device_limits allocates up to a raised limit and one
   past it.
+- A capture records everything a stream is given. Several entry points ran their
+  work the moment they were called on a capturing stream, so the graph came back
+  without it and every replay silently left it out: 2D copies and fills, copies
+  to and from a symbol, peer copies, host functions (which ran once, at capture),
+  graph launches, and stream-ordered allocation (a captured malloc/free pair
+  freed the memory before the graph ever ran). Each is now what CUDA documents
+  it becomes -- a copy or fill node with its shape, a host node, a child-graph
+  node, an allocation or free node the graph owns -- and what CUDA does not allow
+  under capture (a stream callback, synchronizing or querying the capturing
+  stream) invalidates the capture with the error it documents. A captured
+  cooperative or clustered launch keeps that on replay; it ran as a plain launch
+  before, and grid.sync() trapped.
+  Capture works across streams: a stream that waits on an event recorded in a
+  capture joins it with its own position, so a fork and a join come back as a
+  graph with two branches, and cudaStreamEndCapture refuses a fork left
+  unjoined. An event recorded in a capture stands for work not yet run and
+  cannot be queried (cudaErrorCapturedEvent); cudaEventRecordWithFlags with
+  cudaEventRecordExternal is a record node that times the graph. The boundary
+  rules are CUDA's, each with its documented error: a wait on an event from
+  outside (isolation), one that would merge two captures, forking the legacy
+  stream, capturing on it, ending a capture from a stream that only joined.
+  Graph fill nodes with 2- and 4-byte elements wrote the value's low byte into
+  every byte -- a 4-byte fill of 2 gave 0x02020202 -- and now write the value
+  into every element, which a test of mine had asserted the wrong way round.
+  Copy and fill nodes carry their full shape, so 2D fills and pitched 3D copies
+  are nodes like any other, and read back exactly as they were given.
+  Not yet: capture modes. Global and thread-local capture prohibit "potentially
+  unsafe" calls (cudaMalloc, a synchronous copy) anywhere in the process; every
+  capture here behaves as relaxed.
+  Two checks guard these classes: lint_capture_coverage fails when an exported
+  function that takes a stream neither consults capture nor says why it need
+  not, and lint_shim_symbols fails when a shim library has a reference nothing
+  can resolve -- which one of these changes had at first, declared in an
+  anonymous namespace and defined outside it, and which only the Python-driven
+  tests noticed. e2e_graph_shapes and
+  e2e_capture_streams cover the behaviour.
 - Splicing into a stream capture, which is what a library does when the stream
   it was handed turns out to be capturing: cudaStreamGetCaptureInfo reports the
   capture's own graph, the nodes the next operation will depend on, and an id
@@ -614,6 +650,57 @@ narrows what counts as observable, not what the detector looks at.
   power-on values are kept in <vendor>/registers/gpus/ (`vgpu regs export`), and every
   simulated GPU of the model starts from them.
 
+- Hopper's warpgroup MMA (sm_90a): `wgmma.fence`, `.commit_group`,
+  `.wait_group` and `.mma_async` in every dense form the ISA defines -- f16
+  (f16 or f32 accumulator), bf16, tf32, e4m3/e5m2 in any pairing, s8/u8 in any
+  signedness with and without `.satfinite` -- for every N from 8 to 256, A from
+  registers or shared memory, B from shared memory, through the 64-bit matrix
+  descriptor with all four swizzle modes (none, 32B, 64B, 128B) and both
+  majornesses, the negate immediates and scale-d. Each warp of the warpgroup
+  computes its own sixteen rows, which is exact because the rows divide that
+  way (figures 151-158); the product completes when issued, one of the orders
+  the asynchronous model allows, so a kernel that reads its accumulator
+  before `wgmma.wait_group` is not caught. Checked two ways: unit tests lay
+  out shared memory from the ISA's worked examples (figures 169-173), and an
+  e2e test (nvidia/tests/e2e/wgmma_cute.cu) lets CuTe -- NVIDIA's own layout
+  code, from a pinned CUTLASS release -- build the tiles, descriptors and
+  fragments for seventeen configurations and compares every element exactly.
+  Refused by name: the sparse (`.sp`) and single-bit (`.b1`) forms, a
+  descriptor with a nonzero base offset (the ISA does not say how it moves the
+  pattern), and `wgmma` under any target but `.target sm_90a`. Loading now
+  follows the target suffixes: a fatbin's `sm_90a` PTX is preferred over its
+  `sm_90` one on a 9.0 device (nvcc -arch=sm_90a embeds both; only the first
+  has the arch-specific instructions), `sm_XYa` code loads only on exactly
+  X.Y, and `sm_XYf` within the family. `brkpt` parses and faults only if
+  reached (CuTe places one on an unreachable path).
+
+- TMA and clusters (sm_90): `cp.async.bulk` between global and shared
+  memory, `cp.async.bulk.tensor` in one to five dimensions (tile mode) with
+  the 32B, 64B and 128B swizzles, traversal strides and zero fill past the
+  tensor's edge, both directions; bulk groups; the mbarrier transaction
+  counts (`expect_tx`, `complete_tx`, `arrive.expect_tx`); and
+  `barrier.cluster`, with a cluster's blocks resident together and
+  interleaved, each with its own warp scheduler. Tensor maps come from
+  `cuTensorMapEncodeTiled`, which checks every requirement cuda.h documents,
+  and reach runtime programs through `cudaGetDriverEntryPoint`, which answers
+  from this simulator's libcuda even when NVIDIA's is installed. A load's data
+  lands in shared memory when its barrier is next looked at -- a moment the
+  asynchronous model allows, and one at which a kernel that reads the tile
+  without waiting sees the old contents; a store is written when issued, so
+  a kernel that overwrites its source before `wait_group.read` is not caught.
+  Checked three ways: unit tests (tests/unit/test_hopper.cpp) build the
+  expected swizzled tile from the ISA's own swizzle table; CUTLASS's Hopper
+  TMA and bulk-copy unit tests run unmodified and pass, all but the 1D tests,
+  whose testbed writes 256 elements into a 128-element buffer, which this
+  reports as the out-of-bounds access it is (run_cutlass_hopper.sh); and a
+  CUTLASS-style GEMM -- 2-CTA clusters, a 3-stage TMA pipeline, wgmma -- is
+  compared exactly (tma_gemm_cute.cu). Getting there fixed four things any
+  kernel could hit: labels are scoped to their `{ }` block (inline asm
+  repeats them); a lane can reach `bar.sync` from code nvcc placed after the
+  kernel's `ret`; dynamic shared memory starts at its declared alignment; and
+  `cvta.param` no longer adds the parameter window twice. A step-budget error
+  now names the instruction the warp was spinning in.
+
 ## Not implemented (fails loudly, never silently)
 
 This list was stale for a while, which is its own kind of wrong: it still named
@@ -621,20 +708,18 @@ textures, grid sync and host-pinned memory long after all three worked. A
 roadmap that overstates what is missing misleads as much as one that overstates
 what is done.
 
-- PTX: `wgmma`, TMA (`cp.async.bulk`) and the cluster *memory* model,
-  inline-asm-only instructions. (`mbarrier` is done -- init, inval, arrive,
-  arrive_drop, test_wait, try_wait and pending_count, including the .parity
-  form. Its transaction-counting modifiers, `expect_tx` and `complete_tx`, are
-  refused by name: they exist to pair a barrier with a TMA copy, and with no
-  `cp.async.bulk` to complete those bytes such a barrier would hang.)
-  (Textures, surfaces and grid sync are done. The thread-block cluster
-  scheduling level is done: `%clusterid`, `%nclusterid`, `%cluster_ctaid`,
-  `%cluster_nctaid`, `%cluster_ctarank`, `%cluster_nctarank` and
-  `%is_explicit_cluster` all report, driven by a cluster shape that comes from
-  `.reqnctapercluster` or from `cudaLaunchAttributeClusterDimension`. What is
-  still missing is the part that makes a cluster more than a numbering:
-  distributed shared memory -- `.shared::cluster`, `mapa`, cluster barriers --
-  which is a memory-model change, and stays refused rather than approximated.)
+- PTX: the cluster *memory* model -- distributed shared memory:
+  `.shared::cluster` accesses to another block, `mapa`, a remote mbarrier
+  arrive, and multicast TMA to other blocks of a cluster -- which is a
+  memory-model change and stays refused, by name, rather than approximated.
+  Also refused by name: TMA's im2col mode, gather/scatter, attribute
+  overrides and reports, the NaN out-of-bounds fill (its value is not
+  documented), interleaved layouts and the 128B swizzle with 32B/64B atoms
+  (Blackwell), `cp.reduce.async.bulk`, `tensormap.replace`, the sparse and
+  single-bit `wgmma` forms, and inline-asm-only instructions. (`wgmma`, TMA,
+  the mbarrier transaction counts and `barrier.cluster` are done -- see
+  "Hopper's warpgroup MMA" and "TMA and clusters" above. Textures, surfaces
+  and grid sync are done.)
 - Runtime: async copies. (Managed memory and host-pinned memory are done. The
   virtual memory management API is done: cuMemAddressReserve, cuMemCreate,
   cuMemMap, cuMemSetAccess, cuMemGetAccess, cuMemUnmap, cuMemRelease,
@@ -882,6 +967,5 @@ scripts/run-pantheon-workloads.sh.
    refused: mipmaps, layered and cubemap textures, sRGB, anisotropy, and the
    `.clamp`/`.zero` surface out-of-range policies. See nvidia/docs/textures.md.
 
-   `wgmma` is what is left, and it is not workload-driven yet: nothing in
-   llama.cpp or the pantheon suite uses it, and it needs TMA and mbarrier
-   alongside it to be worth having.
+   `wgmma` and TMA are done now (see "Hopper's warpgroup MMA" and "TMA and
+   clusters"); distributed shared memory is what is left of Hopper.

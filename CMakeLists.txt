@@ -590,6 +590,8 @@ target_compile_definitions(test_exec PRIVATE VGPU_KERNEL_DIR="${CMAKE_SOURCE_DIR
 vgpu_unit_test(test_runtime)
 vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
+# Hopper (sm_90a): the warpgroup MMA, against the ISA's own layout examples.
+vgpu_unit_test(test_hopper)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
@@ -1077,6 +1079,42 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# Checks on the code rather than on behaviour, each guarding a class of bug that
+# shipped once: an entry point that puts work on a stream without knowing about
+# capture (the work goes missing from every replay), and a shim library with a
+# reference nothing can resolve (it cannot be loaded by anything that binds at
+# load time).
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME lint_capture_coverage
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_capture_coverage.py)
+endif()
+add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_symbols.sh)
+set_tests_properties(lint_shim_symbols PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
+
+# Copies and fills with a shape in graphs, and the async copies a capture has to
+# record rather than run; two simulated devices, for the peer copy.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_graph_shapes COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_shapes.sh)
+  set_tests_properties(e2e_graph_shapes PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# Stream capture across streams -- fork, join, and the documented refusals --
+# and host functions, events, allocation, cooperative launches and graph
+# launches on a capturing stream.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_capture_streams COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_capture_streams.sh)
+  set_tests_properties(e2e_capture_streams PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # Streams are distinct -- a capture on one does not take another's work -- and
 # answer for their own flags, priority, device, id and attributes.
 if(TARGET vgpucudart)
@@ -1105,6 +1143,33 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
+endif()
+
+# wgmma: Hopper's warpgroup MMA, checked against CuTe's layouts and descriptors
+# across every swizzle mode and element type. Fetches a pinned CUTLASS release
+# (headers only) into the build directory unless CUTLASS_DIR names one.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_wgmma_cute COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wgmma_cute.sh)
+  set_tests_properties(e2e_wgmma_cute PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 900)
+endif()
+
+# TMA: a CUTLASS-style Hopper GEMM (clusters, a TMA pipeline, wgmma) checked
+# exactly, and CUTLASS's own TMA and bulk-copy unit tests run unmodified.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_tma_gemm_cute COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_tma_gemm_cute.sh)
+  set_tests_properties(e2e_tma_gemm_cute PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 900)
+  add_test(NAME e2e_cutlass_hopper COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_hopper.sh)
+  # Long enough for the four compiles to run one after another on a small runner.
+  set_tests_properties(e2e_cutlass_hopper PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 3000)
 endif()
 
 # stmatrix: where the warp's registers land in shared memory, and that it is the

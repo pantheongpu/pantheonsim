@@ -3714,4 +3714,50 @@ VTEST(malformed_ptx_is_refused_with_a_reason) {
   VCHECK_EQ(e.mem.load_scalar(out, 8), 0x8000000000000000ull);
 }
 
+// __assertfail's line is an `unsigned int`, a 4-byte argument. Reading it as 8
+// bytes took the next lane's copy for the high half, and an assert on line 55
+// in a full warp reported line 236223201335 (55 * 2^32 + 55).
+VTEST(device_assert_reports_its_line_from_a_full_warp) {
+  std::string ptx = std::string(kHeader) + R"(
+.extern .func __assertfail
+(
+    .param .b64 __assertfail_param_0,
+    .param .b64 __assertfail_param_1,
+    .param .b32 __assertfail_param_2,
+    .param .b64 __assertfail_param_3,
+    .param .b64 __assertfail_param_4
+)
+;
+.visible .entry k(.param .u64 text)
+{
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [text];
+    {
+    .param .b64 param0;
+    st.param.b64 [param0], %rd1;
+    .param .b64 param1;
+    st.param.b64 [param1], %rd1;
+    .param .b32 param2;
+    st.param.b32 [param2], 55;
+    .param .b64 param3;
+    st.param.b64 [param3], %rd1;
+    .param .b64 param4;
+    st.param.b64 [param4], 1;
+    call.uni __assertfail, (param0, param1, param2, param3, param4);
+    }
+    trap;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const char text[] = "x.cu";
+  uint64_t t = e.mem.alloc(sizeof text);
+  e.mem.write(t, text, sizeof text);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(t)}, e.mem, e.prof));
+  VCHECK(err.code() == Err::DeviceAssert);
+  VCHECK_CONTAINS(err.message(), "x.cu:55 in x.cu");
+}
+
 VTEST_MAIN
