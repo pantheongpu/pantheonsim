@@ -437,7 +437,7 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   if (nvidia) tool("ncu", "# VirtualGPU session tool.\nexec -a ncu \"" + vgpu + "\" ncu \"$@\"\n");
   tool("rocm-smi", "exec -a rocm-smi \"" + vgpu + "\" smi --rocm \"$@\"\n");
   tool("amd-smi", "exec -a amd-smi \"" + vgpu + "\" smi --amd \"$@\"\n");
-  tool("rocm_agent_enumerator", "exec -a rocm_agent_enumerator \"" + vgpu + "\" smi --agents\n");
+  tool("rocm_agent_enumerator", "exec -a rocm_agent_enumerator \"" + vgpu + "\" smi --agents \"$@\"\n");
   tool("dmesg",
        "# Replays this session's synthetic kernel ring buffer.\n"
        "case \" $* \" in\n"
