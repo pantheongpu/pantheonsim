@@ -13,7 +13,7 @@ build="${VGPU_BUILD_DIR:-build}"
 test_bin="$build/test_amd_gcn"
 [[ -x "$test_bin" ]] || { echo "SKIP: no $test_bin"; exit 0; }
 rocm=""
-for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm "$HOME"/.local/share/rocm-7*/opt/rocm-*; do
+for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm $(ls -d "$HOME"/.local/share/rocm-*/opt/rocm-* 2>/dev/null | sort -rV); do
   [[ -n "$c" && -x "$c/lib/llvm/bin/llvm-objdump" && -x "$c/lib/llvm/bin/clang-offload-bundler" &&
      -d "$c/lib/rocblas/library" ]] && ls "$c"/lib/librocblas.so.* >/dev/null 2>&1 && { rocm=$c; break; }
 done

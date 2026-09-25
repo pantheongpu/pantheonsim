@@ -34,7 +34,7 @@ if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
 fi
 
 rocm=""
-for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm "$HOME"/.local/share/rocm-7*/opt/rocm-*; do
+for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm $(ls -d "$HOME"/.local/share/rocm-*/opt/rocm-* 2>/dev/null | sort -rV); do
   [[ -n "$c" && -x "$c/bin/hipcc" && -x "$c/lib/llvm/bin/llvm-objdump" ]] && { rocm=$c; break; }
 done
 if [[ -z "$rocm" ]]; then

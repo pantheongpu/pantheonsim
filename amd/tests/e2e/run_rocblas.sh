@@ -14,7 +14,7 @@ root="$(cd "$(dirname "$0")/../../.." && pwd)"
 shim="$build/shim"
 [[ -e "$shim/libamdhip64.so.7" ]] || { echo "SKIP: no HIP shim in $shim"; exit 0; }
 rocm=""
-for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm "$HOME"/.local/share/rocm-7*/opt/rocm-*; do
+for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm $(ls -d "$HOME"/.local/share/rocm-*/opt/rocm-* 2>/dev/null | sort -rV); do
   [[ -n "$c" && -x "$c/bin/hipcc" && -e "$c/include/rocblas/rocblas.h" ]] && ls "$c"/lib/librocblas.so.* >/dev/null 2>&1 &&
     { rocm=$c; break; }
 done
