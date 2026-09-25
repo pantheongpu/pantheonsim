@@ -1632,14 +1632,18 @@ struct Machine {
       });
     } else if (op == "v_pk_fma_f32"_op || op == "v_pk_add_f32"_op || op == "v_pk_mul_f32"_op) {
       each([&](uint32_t lane) {
-        // Two floats in a register pair, each its own arithmetic.
+        // Two floats in a register pair, each its own arithmetic -- both
+        // worked out before either is written, since the destination may be
+        // a source whose low register the high result reads.
+        float r[2];
         for (uint32_t half = 0; half < 2; ++half) {
           const float x = packed_float(w, in, 0, half, lane), y = packed_float(w, in, 1, half, lane);
-          const float r = op == "v_pk_add_f32"_op   ? x + y
-                          : op == "v_pk_mul_f32"_op ? x * y
-                                                 : std::fma(x, y, packed_float(w, in, 2, half, lane));
-          set_word(w, in.dst[0], half, lane, as_bits(r));
+          r[half] = op == "v_pk_add_f32"_op   ? x + y
+                    : op == "v_pk_mul_f32"_op ? x * y
+                                           : std::fma(x, y, packed_float(w, in, 2, half, lane));
         }
+        set_word(w, in.dst[0], 0, lane, as_bits(r[0]));
+        set_word(w, in.dst[0], 1, lane, as_bits(r[1]));
       });
     } else if (op == "v_pk_mov_b32"_op) {
       // The low register from the first source and the high from the second,
