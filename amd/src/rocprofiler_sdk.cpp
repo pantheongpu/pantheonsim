@@ -393,10 +393,8 @@ uint32_t gfx_target_version(const std::string& gfx) {
 // The machine's agents as KFD numbers them: the CPU first, then each GPU.
 // What a GPU's profile does not say (its shader engines and arrays, its
 // XCDs, its engines' firmware) is left zero rather than guessed.
-void load_agents(Sdk& s) {
-  if (s.agents_ready) return;
-  s.agents_ready = true;
-  Agents& a = s.agents;
+Agents build_agents() {
+  Agents a;
   auto keep = [&](std::string v) { return a.strings.emplace_back(std::move(v)).c_str(); };
 
   rocprofiler_agent_v0_t cpu{};
@@ -457,6 +455,24 @@ void load_agents(Sdk& s) {
     // An agent's id is its node, from 1: zero is no agent.
     a.list[i].id.handle = i + 1;
   }
+  return a;
+}
+
+// The agents, asked of the HIP runtime once. Never with this library's lock
+// held: the runtime holds its own lock while it reports to this library, so
+// taking the two in the other order here could deadlock two threads. (A
+// deque's elements keep their addresses when it moves, so the names the
+// agents point to survive being moved in.)
+void load_agents(Sdk& s) {
+  {
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    if (s.agents_ready) return;
+  }
+  Agents a = build_agents();
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  if (s.agents_ready) return;
+  s.agents = std::move(a);
+  s.agents_ready = true;
 }
 
 rocprofiler_agent_id_t gpu_agent(Sdk& s, int ordinal) {
@@ -578,6 +594,7 @@ void client_finalize(rocprofiler_client_id_t id) {
 // initializes them, as rocprofiler-sdk does.
 void configure(rocprofiler_configure_func_t forced) {
   Sdk& s = sdk();
+  load_agents(s);
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
   if (s.configured) return;
   s.configured = true;
@@ -604,7 +621,6 @@ void configure(rocprofiler_configure_func_t forced) {
   }
   add(::dlsym(RTLD_DEFAULT, "rocprofiler_configure"));
 
-  load_agents(s);
   char version[64];
   std::snprintf(version, sizeof version, "%u.%u.%u (VirtualGPU)", kVersionMajor, kVersionMinor, kVersionPatch);
   for (size_t i = 0; i < found.size(); ++i) {
@@ -981,9 +997,9 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_query_available_agents(rocprofi
   if (agent_size > sizeof(rocprofiler_agent_v0_t)) return ROCPROFILER_STATUS_ERROR_INCOMPATIBLE_ABI;
   Sdk& s = sdk();
   std::vector<const void*> list;
+  load_agents(s);
   {
     std::lock_guard<std::recursive_mutex> lock(s.mutex);
-    load_agents(s);
     for (const auto& a : s.agents.list) list.push_back(&a);
   }
   return callback(version, list.data(), list.size(), user_data);
@@ -994,9 +1010,9 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_agent_supported_counter
   if (!cb) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
   Sdk& s = sdk();
   const rocprofiler_agent_v0_t* a = nullptr;
+  load_agents(s);
   {
     std::lock_guard<std::recursive_mutex> lock(s.mutex);
-    load_agents(s);
     a = agent(s, agent_id.handle);
   }
   if (!a) return ROCPROFILER_STATUS_ERROR_AGENT_NOT_FOUND;
@@ -1085,8 +1101,8 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_create_counter_config(rocprofil
                                                                        rocprofiler_counter_config_id_t* config_id) {
   if (!config_id || (counters_count && !counters_list)) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
   Sdk& s = sdk();
-  std::lock_guard<std::recursive_mutex> lock(s.mutex);
   load_agents(s);
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
   const rocprofiler_agent_v0_t* a = agent(s, agent_id.handle);
   if (!a || a->type != ROCPROFILER_AGENT_TYPE_GPU) return ROCPROFILER_STATUS_ERROR_AGENT_NOT_FOUND;
   if (!counters_count) return ROCPROFILER_STATUS_ERROR_NO_HARDWARE_COUNTERS;
