@@ -212,10 +212,14 @@ jobs:
       - uses: ./
         with:
           gpu: ${{ matrix.gpu }}
-      - name: Configure, build and ctest, unmodified
+      - name: Configure, build and ctest, unmodified, with no build type and in Release
         run: |
-          # Release, as CI builds usually are. Unoptimized HIP code (-O0, which
-          # is what CMake builds with no build type) does not run yet.
-          cmake -S .github/action-tests/${{ matrix.project }} -B build-test -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-test -v
-          ctest --test-dir build-test --output-on-failure
+          # No build type is what a project gets when it sets none, and for
+          # HIP that means -O0: unoptimized code, with real calls into the
+          # device library. Release is what CI builds usually are.
+          for type in "" Release; do
+            dir="build-test${type:+-$type}"
+            cmake -S .github/action-tests/${{ matrix.project }} -B "$dir" -G Ninja ${type:+-DCMAKE_BUILD_TYPE=$type}
+            cmake --build "$dir" -v
+            ctest --test-dir "$dir" --output-on-failure
+          done
