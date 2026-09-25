@@ -163,14 +163,25 @@ struct Machine {
   // single access; one that is not is its bytes. An atomic still has to be
   // aligned, as the hardware requires, and goes to memory directly.
   uint64_t load(uint64_t addr, uint32_t size) const {
-    if (addr % size == 0) return mem.load_scalar(addr, size);
+    MemoryManager& m = at(addr);
+    if (addr % size == 0) return m.load_scalar(addr, size);
     uint64_t v = 0;
-    for (uint32_t b = 0; b < size; ++b) v |= mem.load_scalar(addr + b, 1) << (8 * b);
+    for (uint32_t b = 0; b < size; ++b) v |= m.load_scalar(addr + b, 1) << (8 * b);
     return v;
   }
   void store(uint64_t addr, uint32_t size, uint64_t v) {
-    if (addr % size == 0) return mem.store_scalar(addr, size, v);
-    for (uint32_t b = 0; b < size; ++b) mem.store_scalar(addr + b, 1, (v >> (8 * b)) & 0xFF);
+    MemoryManager& m = at(addr);
+    if (addr % size == 0) return m.store_scalar(addr, size, v);
+    for (uint32_t b = 0; b < size; ++b) m.store_scalar(addr + b, 1, (v >> (8 * b)) & 0xFF);
+  }
+  // The memory an address is in: the launching device's, or a peer's the
+  // kernel was given access to -- each device's window is where its ordinal
+  // puts it (vgpu/memory.hpp). An address in neither goes to the device's
+  // own memory, which says what is wrong with it.
+  MemoryManager& at(uint64_t addr) const {
+    if (addr - mem.va_base() < kDeviceVaStride || d.peers.empty() || !is_device_va(addr)) return mem;
+    const uint64_t window = (addr - kDeviceVaBase) / kDeviceVaStride;
+    return window < d.peers.size() && d.peers[window] ? *d.peers[window] : mem;
   }
   std::unique_lock<std::mutex> atomic_guard(uint64_t addr) {
     return concurrent ? std::unique_lock<std::mutex>(memory_atomic_lock(addr)) : std::unique_lock<std::mutex>();
@@ -386,6 +397,13 @@ struct Machine {
       write_scalar(w, in.dst[0], a);
     } else if (op == "s_movk_i32"_op) {
       write_scalar(w, in.dst[0], static_cast<uint64_t>(static_cast<int64_t>(in.simm)));
+    } else if (op == "s_addk_i32"_op) {
+      // The destination is also a source, the constant is signed, and SCC
+      // says whether the signed sum overflowed.
+      const int32_t x = static_cast<int32_t>(scalar(w, in.dst[0])), k = static_cast<int32_t>(in.simm);
+      const int32_t sum = static_cast<int32_t>(static_cast<uint32_t>(x) + static_cast<uint32_t>(k));
+      write_scalar(w, in.dst[0], static_cast<uint32_t>(sum));
+      w.scc = ((x >= 0) == (k >= 0)) && ((sum >= 0) != (x >= 0));
     } else if (op == "s_mulk_i32"_op) {
       // The destination is also a source: it is multiplied in place.
       write_scalar(w, in.dst[0], static_cast<uint32_t>(scalar(w, in.dst[0]) * static_cast<uint32_t>(in.simm)));
@@ -551,7 +569,7 @@ struct Machine {
     const uint64_t base = scalar(w, in.src[0]) + static_cast<uint64_t>(in.offset);
     const uint32_t words = in.dst[0].width;
     for (uint32_t i = 0; i < words; ++i)
-      set_sgpr(w, in.dst[0].index + i, static_cast<uint32_t>(mem.load_scalar(base + 4 * i, 4)));
+      set_sgpr(w, in.dst[0].index + i, static_cast<uint32_t>(at(base + 4 * i).load_scalar(base + 4 * i, 4)));
   }
 
   static uint32_t first_active(const Wave& w) {
@@ -1446,7 +1464,10 @@ struct Machine {
   }
 
   void compare(Wave& w, const Inst& in) {
-    const OpName op(in.name);
+    // The sub-dword form compares the parts of its sources it names, as the
+    // short form compares the whole of them.
+    const std::string as_short = in.sdwa ? in.name.substr(0, in.name.size() - 5) + "_e32" : std::string();
+    const OpName op(in.sdwa ? as_short : in.name);
     uint64_t result = 0;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;   // an inactive lane's bit reads 0
@@ -1820,8 +1841,8 @@ struct Machine {
         case Kind::AddX2: {
           // The one that works on a pair; every other atomic here is 32-bit.
           const auto guard = atomic_guard(addr);
-          const uint64_t before = mem.load_scalar(addr, 8);
-          mem.store_scalar(addr, 8, before + lane_src64(w, in.src[1], lane));
+          const uint64_t before = at(addr).load_scalar(addr, 8);
+          at(addr).store_scalar(addr, 8, before + lane_src64(w, in.src[1], lane));
           if (!in.dst.empty()) write_lane64(w, in.dst[0], lane, before);
           break;
         }
@@ -1831,8 +1852,8 @@ struct Machine {
           const uint64_t expected = w.vgpr[in.src[1].index + 2][lane] |
                                     static_cast<uint64_t>(w.vgpr[in.src[1].index + 3][lane]) << 32;
           const auto guard = atomic_guard(addr);
-          const uint64_t before = mem.load_scalar(addr, 8);
-          if (before == expected) mem.store_scalar(addr, 8, value);
+          const uint64_t before = at(addr).load_scalar(addr, 8);
+          if (before == expected) at(addr).store_scalar(addr, 8, value);
           if (!in.dst.empty()) write_lane64(w, in.dst[0], lane, before);
           break;
         }
@@ -1840,8 +1861,8 @@ struct Machine {
           // The pair is the value to write and the one it must find.
           const uint32_t value = lane_src(w, in.src[1], lane), expected = w.vgpr[in.src[1].index + 1][lane];
           const auto guard = atomic_guard(addr);
-          const uint32_t before = static_cast<uint32_t>(mem.load_scalar(addr, 4));
-          if (before == expected) mem.store_scalar(addr, 4, value);
+          const uint32_t before = static_cast<uint32_t>(at(addr).load_scalar(addr, 4));
+          if (before == expected) at(addr).store_scalar(addr, 4, value);
           if (!in.dst.empty()) write_lane(w, in.dst[0], lane, before);
           break;
         }
@@ -1851,7 +1872,7 @@ struct Machine {
           // told what it found. Across work-groups on other threads, the lock.
           const uint32_t v = lane_src(w, in.src[1], lane);
           const auto guard = atomic_guard(addr);
-          const uint32_t before = static_cast<uint32_t>(mem.load_scalar(addr, 4));
+          const uint32_t before = static_cast<uint32_t>(at(addr).load_scalar(addr, 4));
           uint32_t after = 0;
           switch (rmw) {
             case Rmw::Add: after = before + v; break;
@@ -1862,7 +1883,7 @@ struct Machine {
             case Rmw::Swap: after = v; break;
             case Rmw::AddF32: after = as_bits(as_float(before) + as_float(v)); break;
           }
-          mem.store_scalar(addr, 4, after);
+          at(addr).store_scalar(addr, 4, after);
           if (!in.dst.empty()) write_lane(w, in.dst[0], lane, before);
           break;
         }
@@ -2100,7 +2121,10 @@ struct Machine {
       if (w.vcc) w.pc = in.target;
       return true;
     }
-    if (OpName(in.name) == "s_sleep"_op) return true;   // a wait, and nothing here is waiting on anything
+    // A wave waiting for something -- another work-group at a grid barrier,
+    // the host answering a call -- sleeps; here it gives way to the others,
+    // which is what lets a wave that spins on memory see the write it waits for.
+    if (OpName(in.name) == "s_sleep"_op) return false;
     if (OpName(in.name) == "s_sendmsg"_op) {
       // The kernel raised the doorbell of its hostcall buffer and asks the
       // host for attention (MSG_INTERRUPT, the one message decoded): the
@@ -2155,6 +2179,9 @@ void fill_hidden_arguments(const Dispatch& d, const Kernel& k, MemoryManager& me
     else if (kind == "hidden_shared_base") value = kSharedBase;
     else if (kind == "hidden_dynamic_lds_size") value = d.dynamic_lds;
     else if (kind == "hidden_hostcall_buffer") value = d.hostcall ? d.hostcall->buffer() : 0;
+    // What a grid barrier counts on, in a cooperative launch; zero otherwise,
+    // which is how a kernel tells that its grid cannot synchronize.
+    else if (kind == "hidden_multigrid_sync_arg") value = d.grid_sync;
     // Everything else -- the remainders of a grid that divides evenly, the
     // global offsets, a heap for device malloc -- is
     // zero, and a kernel that needs one of those will say so by failing on a
@@ -2212,15 +2239,12 @@ unsigned worker_count(uint64_t groups) {
   return want ? want : 1;
 }
 
-// Runs one work-group to the end: its waves set up as the hardware leaves
-// them, then run until every one has stopped, a wave parked at a barrier
-// waiting for the others to reach it.
-void run_group(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_segment, uint32_t gx, uint32_t gy,
-               uint32_t gz) {
+// A work-group's waves, set up as the hardware leaves them.
+void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_segment, uint32_t gx,
+                  uint32_t gy, uint32_t gz) {
   const Kernel& k = *d.kernel;
   const uint64_t threads = uint64_t{d.group_size[0]} * d.group_size[1] * d.group_size[2];
   const uint32_t waves_per_group = static_cast<uint32_t>((threads + kLanes - 1) / kLanes);
-  Group group;
   group.lds.assign(group_segment, 0);
   // Each work-item's private memory. A kernel that spills says how much
   // it needs; the rest get none.
@@ -2280,27 +2304,39 @@ void run_group(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_se
     m.stats.waves_lt16 += lanes < 16;
   }
 
-  // The group's waves run until every one has stopped. A wave parked at
-  // a barrier waits for the others to reach it, as the hardware makes
-  // it wait.
-  for (bool working = true; working;) {
-    working = false;
-    for (Wave& w : group.waves) {
-      if (w.done || w.at_barrier) continue;
-      working = true;
-      while (m.step(w, group)) {
-      }
+}
+
+// One turn for each of a group's waves: each runs until it stops, parks at a
+// barrier or yields (s_sleep, a wave waiting on something), and a barrier
+// every unfinished wave has reached is released. Says whether every wave has
+// stopped.
+bool run_round(Machine& m, Group& group) {
+  bool runnable = false;
+  for (Wave& w : group.waves) {
+    if (w.done || w.at_barrier) continue;
+    runnable = true;
+    while (m.step(w, group)) {
     }
-    if (!working) {
-      // Every wave is stopped or waiting: release the barrier.
-      bool any = false;
-      for (Wave& w : group.waves)
-        if (w.at_barrier) {
-          w.at_barrier = false;
-          any = working = true;
-        }
-      if (!any) break;
+  }
+  if (runnable) return false;
+  // Every wave is stopped or waiting: release the barrier.
+  bool any = false;
+  for (Wave& w : group.waves)
+    if (w.at_barrier) {
+      w.at_barrier = false;
+      any = true;
     }
+  return !any;
+}
+
+// Runs one work-group to the end: its waves set up as the hardware leaves
+// them, then run until every one has stopped, a wave parked at a barrier
+// waiting for the others to reach it.
+void run_group(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_segment, uint32_t gx, uint32_t gy,
+               uint32_t gz) {
+  Group group;
+  set_up_group(group, m, d, packet, group_segment, gx, gy, gz);
+  while (!run_round(m, group)) {
   }
 }
 
@@ -2341,8 +2377,28 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     *gz = static_cast<uint32_t>(i / d.groups[0] / d.groups[1]);
   };
   DispatchStats total;
-  const unsigned nthreads = worker_count(groups);
-  if (nthreads <= 1) {
+  const unsigned nthreads = d.cooperative ? 1 : worker_count(groups);
+  if (d.cooperative) {
+    // A cooperative launch's work-groups may wait on one another (a grid
+    // barrier), so every one is resident at once, as the runtime promised when
+    // it accepted the launch, and each takes a turn in order until all have
+    // finished -- on one thread, so no group's turn ever waits on another's.
+    Machine m(d, mem);
+    std::vector<Group> all(groups);
+    std::vector<bool> finished(groups, false);
+    for (uint64_t i = 0; i < groups; ++i) {
+      uint32_t gx, gy, gz;
+      group_at(i, &gx, &gy, &gz);
+      set_up_group(all[i], m, d, packet, group_segment, gx, gy, gz);
+    }
+    for (uint64_t left = groups; left;)
+      for (uint64_t i = 0; i < groups; ++i)
+        if (!finished[i] && run_round(m, all[i])) {
+          finished[i] = true;
+          --left;
+        }
+    total = m.stats;
+  } else if (nthreads <= 1) {
     Machine m(d, mem);
     for (uint64_t i = 0; i < groups; ++i) {
       uint32_t gx, gy, gz;

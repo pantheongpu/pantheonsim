@@ -10,8 +10,10 @@
 // from AMD's public documentation); nothing here is AMD's code. What is not
 // implemented is refused by name rather than ignored, because a HIP program
 // that believes a launch happened will compare wrong answers.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -292,7 +294,7 @@ hipError_t build_kernargs(const Kernel& k, void** params, void** extra, std::vec
 // kernarg segment, and the dispatch runs to completion before this returns.
 hipError_t dispatch_kernel(State& s, int ordinal, const Module& module, const Kernel& kernel,
                            vgpu::amd::abi::Dim3 grid, vgpu::amd::abi::Dim3 block, uint32_t shared,
-                           const std::vector<uint8_t>& args, hipStream_t stream) {
+                           const std::vector<uint8_t>& args, hipStream_t stream, bool cooperative = false) {
   vgpu::runtime::Device& d = s.rt->device(ordinal);
   const CodeObject& object = module.object;
   auto& hostcall = s.hostcalls[ordinal];
@@ -318,9 +320,27 @@ hipError_t dispatch_kernel(State& s, int ordinal, const Module& module, const Ke
   vgpu::amd::hipprof::Launch launch;
   void* token = nullptr;
   uint64_t start = 0;
+  uint64_t grid_sync = 0;
   try {
     kernarg = mem.alloc(args.empty() ? 1 : args.size());
     if (!args.empty()) mem.write(kernarg, args.data(), args.size());
+    if (cooperative) {
+      // What the device library's grid barrier counts on (ockl's mg_info): a
+      // grid of one, its work-groups, its work-items, and a counter for a
+      // multi-grid barrier over that one grid, which passes straight through.
+      const uint64_t groups = uint64_t{grid.x} * grid.y * grid.z;
+      const uint64_t items = groups * block.x * block.y * block.z;
+      grid_sync = mem.alloc(64);
+      std::vector<uint8_t> info(64, 0);
+      const uint64_t mgs = grid_sync + 48;
+      std::memcpy(&info[0], &mgs, 8);         // mgs
+      const uint32_t one = 1;
+      std::memcpy(&info[12], &one, 4);        // num_grids; grid_id is 0
+      std::memcpy(&info[24], &items, 8);      // all_sum; prev_sum is 0
+      const uint32_t nwg = static_cast<uint32_t>(groups);
+      std::memcpy(&info[40], &nwg, 4);        // num_wg; the barrier's count at 32 starts at 0
+      mem.write(grid_sync, info.data(), info.size());
+    }
     vgpu::amd::Dispatch dispatch;
     dispatch.object = &object;
     dispatch.kernel = &kernel;
@@ -335,6 +355,13 @@ hipError_t dispatch_kernel(State& s, int ordinal, const Module& module, const Ke
     dispatch.dynamic_lds = shared;   // what the launch adds to the kernel's own LDS
     dispatch.hostcall = hostcall.get();
     dispatch.code_base = module.code_base;
+    dispatch.cooperative = cooperative;
+    dispatch.grid_sync = grid_sync;
+    for (const auto& [from, to] : s.peers)
+      if (from == ordinal) {
+        if (dispatch.peers.size() <= static_cast<size_t>(to)) dispatch.peers.resize(static_cast<size_t>(to) + 1);
+        dispatch.peers[static_cast<size_t>(to)] = &s.rt->device(to).memory();
+      }
     if (prof) {
       launch.device = ordinal;
       launch.kernel_id = kernel_id(module, kernel);
@@ -355,6 +382,7 @@ hipError_t dispatch_kernel(State& s, int ordinal, const Module& module, const Ke
       prof = nullptr;   // told
     }
     mem.free(kernarg);
+    if (grid_sync) mem.free(grid_sync);
     // What the device spent, as telemetry reports a kernel: the instructions
     // a wave retires, at the profile's clock.
     const uint32_t mhz = d.profile().telemetry.sm_clock_max_mhz;
@@ -363,12 +391,13 @@ hipError_t dispatch_kernel(State& s, int ordinal, const Module& module, const Ke
   } catch (const std::exception& e) {
     // A launch that failed counted nothing, and the profiler is told so.
     if (prof && prof->launched && start) prof->launched(launch, nullptr, start, vgpu::amd::hipprof::now_ns(), token);
-    if (kernarg) {
-      try {
-        mem.free(kernarg);
-      } catch (const std::exception&) {
+    for (uint64_t a : {kernarg, grid_sync})
+      if (a) {
+        try {
+          mem.free(a);
+        } catch (const std::exception&) {
+        }
       }
-    }
     return fail(hipErrorLaunchFailure, s.profile_id + ": " + e.what());
   }
   return hipSuccess;
@@ -571,14 +600,19 @@ hipError_t hipFree(void* ptr) {
   if (!ptr) return record(s, hipSuccess);
   vgpu::runtime::Device* d = device(s);
   if (!d) return record(s, hipErrorInvalidDevice);
+  // Freed on the device whose memory it is, whichever is current, as HIP's
+  // unified addresses allow; the current device answers for any other.
+  int owner = s.current;
+  for (int i = 0; i < s.rt->device_count(); ++i)
+    if (s.rt->device(i).memory().owns(reinterpret_cast<uint64_t>(ptr))) owner = i;
   const uint64_t start = vgpu::amd::hipprof::now_ns();
   try {
-    d->memory().free(reinterpret_cast<uint64_t>(ptr));
+    s.rt->device(owner).memory().free(reinterpret_cast<uint64_t>(ptr));
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorInvalidDevicePointer, e.what()));
   }
   if (const auto* p = profiler(); p && p->allocated)
-    p->allocated(s.current, reinterpret_cast<uint64_t>(ptr), 0, true, start, vgpu::amd::hipprof::now_ns());
+    p->allocated(owner, reinterpret_cast<uint64_t>(ptr), 0, true, start, vgpu::amd::hipprof::now_ns());
   return record(s, hipSuccess);
 }
 
@@ -590,15 +624,25 @@ hipError_t hipMemcpy(void* dst, const void* src, size_t bytes, hipMemcpyKind kin
   if (!d) return record(s, hipErrorInvalidDevice);
   if (!bytes) return record(s, hipSuccess);
   if (!dst || !src) return record(s, hipErrorInvalidValue);
-  vgpu::MemoryManager& mem = d->memory();
   const uint64_t dst_va = reinterpret_cast<uint64_t>(dst), src_va = reinterpret_cast<uint64_t>(src);
+  // Addresses are unified: a device pointer says which device's memory it
+  // is, so a device-to-device copy may run between two devices, as HIP's
+  // does. The current device's memory answers for an address no device owns,
+  // and says what is wrong with it.
+  auto owner = [&](uint64_t va) -> vgpu::MemoryManager& {
+    for (int i = 0; i < s.rt->device_count(); ++i)
+      if (s.rt->device(i).memory().owns(va)) return s.rt->device(i).memory();
+    return d->memory();
+  };
+  vgpu::MemoryManager& to = owner(dst_va);
+  vgpu::MemoryManager& from = owner(src_va);
   // hipMemcpyDefault asks the runtime to tell device memory from host memory,
-  // which it does by which addresses the device owns.
+  // which it does by whether a device owns the address.
   bool to_device = kind == hipMemcpyHostToDevice, from_device = kind == hipMemcpyDeviceToHost;
   if (kind == hipMemcpyDeviceToDevice) to_device = from_device = true;
   if (kind == hipMemcpyDefault) {
-    to_device = mem.owns(dst_va);
-    from_device = mem.owns(src_va);
+    to_device = to.owns(dst_va);
+    from_device = from.owns(src_va);
   } else if (kind != hipMemcpyHostToHost && kind != hipMemcpyHostToDevice && kind != hipMemcpyDeviceToHost &&
              kind != hipMemcpyDeviceToDevice) {
     return record(s, hipErrorInvalidMemcpyDirection);
@@ -607,12 +651,12 @@ hipError_t hipMemcpy(void* dst, const void* src, size_t bytes, hipMemcpyKind kin
   try {
     if (to_device && from_device) {
       std::vector<uint8_t> buf(bytes);
-      mem.read(src_va, buf.data(), bytes);
-      mem.write(dst_va, buf.data(), bytes);
+      from.read(src_va, buf.data(), bytes);
+      to.write(dst_va, buf.data(), bytes);
     } else if (to_device) {
-      mem.write(dst_va, src, bytes);
+      to.write(dst_va, src, bytes);
     } else if (from_device) {
-      mem.read(src_va, dst, bytes);
+      from.read(src_va, dst, bytes);
     } else {
       std::memcpy(dst, src, bytes);
     }
@@ -712,19 +756,35 @@ hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!module || !image) return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  const uint8_t* bytes = static_cast<const uint8_t*>(image);
+  vgpu::runtime::Device* d = device(s);
+  if (!d) return record(s, hipErrorInvalidDevice);
+  // An offload bundle -- what hipcc --genco writes -- carries a code object
+  // per target, and the device's is the one loaded.
+  std::map<std::string, std::string> targets;
+  std::string chosen;
+  if (read_bundle(bytes, &targets)) {
+    const std::string& gfx = d->profile().gcn_arch;
+    const auto it = targets.find(gfx);
+    if (it == targets.end()) {
+      std::string built;
+      for (const auto& t : targets) built += (built.empty() ? "" : ", ") + t.first;
+      return record(s, fail(hipErrorNoBinaryForGpu, "the bundle carries code for " + (built.empty() ? "no GPU" : built) +
+                                                        ", and this device is " + gfx));
+    }
+    chosen = std::move(it->second);
+    bytes = reinterpret_cast<const uint8_t*>(chosen.data());
+  }
   // A code object's length is in its own header; the ELF says where its
   // sections end, and the last of them is where the image stops.
-  const uint8_t* bytes = static_cast<const uint8_t*>(image);
   if (std::memcmp(bytes, "\x7F" "ELF", 4) != 0)
-    return record(s, fail(hipErrorInvalidImage, "the image is not an ELF code object"));
+    return record(s, fail(hipErrorInvalidImage, "the image is not an ELF code object or an offload bundle"));
   uint64_t shoff = 0;
   std::memcpy(&shoff, bytes + 0x28, 8);
   uint16_t shentsize = 0, shnum = 0;
   std::memcpy(&shentsize, bytes + 0x3A, 2);
   std::memcpy(&shnum, bytes + 0x3C, 2);
   const uint64_t size = shoff + uint64_t{shentsize} * shnum;
-  vgpu::runtime::Device* d = device(s);
-  if (!d) return record(s, hipErrorInvalidDevice);
   try {
     auto m = std::make_unique<Module>();
     m->object = vgpu::amd::load_code_object(std::string(reinterpret_cast<const char*>(bytes), size), "the image");
@@ -846,6 +906,7 @@ const char* hipGetErrorName(hipError_t e) {
     case hipErrorPeerAccessAlreadyEnabled: return "hipErrorPeerAccessAlreadyEnabled";
     case hipErrorPeerAccessNotEnabled: return "hipErrorPeerAccessNotEnabled";
     case hipErrorLaunchFailure: return "hipErrorLaunchFailure";
+    case hipErrorCooperativeLaunchTooLarge: return "hipErrorCooperativeLaunchTooLarge";
     case hipErrorStreamCaptureUnsupported: return "hipErrorStreamCaptureUnsupported";
     case hipErrorStreamCaptureUnmatched: return "hipErrorStreamCaptureUnmatched";
     case hipErrorUnknown: break;
@@ -879,6 +940,7 @@ const char* hipGetErrorString(hipError_t e) {
     case hipErrorPeerAccessAlreadyEnabled: return "peer access is already enabled";
     case hipErrorPeerAccessNotEnabled: return "peer access has not been enabled";
     case hipErrorLaunchFailure: return "unspecified launch failure";
+    case hipErrorCooperativeLaunchTooLarge: return "too many blocks in cooperative launch";
     case hipErrorStreamCaptureUnsupported: return "operation not permitted when stream is capturing";
     case hipErrorStreamCaptureUnmatched: return "the capture was not initiated in this stream";
     case hipErrorUnknown: break;
@@ -1119,14 +1181,13 @@ hipError_t hipLaunchKernel(const void* host_function, vgpu::amd::abi::Dim3 grid,
 
 // ---- What the device is, in the layout the HIP headers give it ---------------
 
-hipError_t hipGetDevicePropertiesR0600(vgpu::amd::abi::DevicePropR0600* props, int ordinal) {
-  const ApiCall api("hipGetDevicePropertiesR0600");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!props) return record(s, hipErrorInvalidValue);
-  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
-  if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
-  const vgpu::DeviceProfile& p = s.rt->device(ordinal).profile();
+}  // extern "C"
+
+namespace {
+
+// What a device is, in the layout the HIP headers give it: what
+// hipGetDeviceProperties returns and hipDeviceGetAttribute answers from.
+void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0600* props) {
   std::memset(props, 0, sizeof *props);
   std::snprintf(props->name, sizeof props->name, "%s", p.model.c_str());
   std::snprintf(props->gcnArchName, sizeof props->gcnArchName, "%s", p.gcn_arch.c_str());
@@ -1153,8 +1214,120 @@ hipError_t hipGetDevicePropertiesR0600(vgpu::amd::abi::DevicePropR0600* props, i
   props->minor = p.cc_minor;
   props->pciDeviceID = ordinal;
   props->concurrentKernels = 1;
+  props->cooperativeLaunch = 1;
   props->unifiedAddressing = 1;
   props->ECCEnabled = p.telemetry.ecc ? 1 : 0;
+}
+
+}  // namespace
+
+extern "C" {
+
+hipError_t hipGetDevicePropertiesR0600(vgpu::amd::abi::DevicePropR0600* props, int ordinal) {
+  const ApiCall api("hipGetDevicePropertiesR0600");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!props) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
+  fill_properties(s.rt->device(ordinal).profile(), ordinal, props);
+  return record(s, hipSuccess);
+}
+
+// One property of a device, as a number: the same answer
+// hipGetDeviceProperties gives, so the two cannot disagree. Sizes past what an
+// int holds are clamped to the largest int. An attribute that is not a number
+// -- a name, a pointer -- or one not answered here is refused.
+hipError_t hipDeviceGetAttribute(int* value, int attribute, int ordinal) {
+  const ApiCall api("hipDeviceGetAttribute");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!value) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
+  vgpu::amd::abi::DevicePropR0600 p;
+  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p);
+  const auto clamp = [](size_t v) { return v > 0x7fffffff ? 0x7fffffff : static_cast<int>(v); };
+  using A = vgpu::amd::abi::DeviceAttribute;
+  switch (static_cast<A>(attribute)) {
+    case A::kEccEnabled: *value = p.ECCEnabled; break;
+    case A::kAsyncEngineCount: *value = p.asyncEngineCount; break;
+    case A::kCanMapHostMemory: *value = p.canMapHostMemory; break;
+    case A::kCanUseHostPointerForRegisteredMem: *value = p.canUseHostPointerForRegisteredMem; break;
+    case A::kClockRate: *value = p.clockRate; break;
+    case A::kComputeMode: *value = p.computeMode; break;
+    case A::kComputePreemptionSupported: *value = p.computePreemptionSupported; break;
+    case A::kConcurrentKernels: *value = p.concurrentKernels; break;
+    case A::kConcurrentManagedAccess: *value = p.concurrentManagedAccess; break;
+    case A::kCooperativeLaunch: *value = p.cooperativeLaunch; break;
+    case A::kCooperativeMultiDeviceLaunch: *value = p.cooperativeMultiDeviceLaunch; break;
+    case A::kDeviceOverlap: *value = p.deviceOverlap; break;
+    case A::kDirectManagedMemAccessFromHost: *value = p.directManagedMemAccessFromHost; break;
+    case A::kGlobalL1CacheSupported: *value = p.globalL1CacheSupported; break;
+    case A::kHostNativeAtomicSupported: *value = p.hostNativeAtomicSupported; break;
+    case A::kIntegrated: *value = p.integrated; break;
+    case A::kIsMultiGpuBoard: *value = p.isMultiGpuBoard; break;
+    case A::kKernelExecTimeout: *value = p.kernelExecTimeoutEnabled; break;
+    case A::kL2CacheSize: *value = p.l2CacheSize; break;
+    case A::kLocalL1CacheSupported: *value = p.localL1CacheSupported; break;
+    case A::kComputeCapabilityMajor: *value = p.major; break;
+    case A::kManagedMemory: *value = p.managedMemory; break;
+    case A::kMaxBlocksPerMultiProcessor: *value = p.maxBlocksPerMultiProcessor; break;
+    case A::kMaxBlockDimX: *value = p.maxThreadsDim[0]; break;
+    case A::kMaxBlockDimY: *value = p.maxThreadsDim[1]; break;
+    case A::kMaxBlockDimZ: *value = p.maxThreadsDim[2]; break;
+    case A::kMaxGridDimX: *value = p.maxGridSize[0]; break;
+    case A::kMaxGridDimY: *value = p.maxGridSize[1]; break;
+    case A::kMaxGridDimZ: *value = p.maxGridSize[2]; break;
+    case A::kMaxThreadsPerBlock: *value = p.maxThreadsPerBlock; break;
+    case A::kMaxThreadsPerMultiProcessor: *value = p.maxThreadsPerMultiProcessor; break;
+    case A::kMaxPitch: *value = clamp(p.memPitch); break;
+    case A::kMemoryBusWidth: *value = p.memoryBusWidth; break;
+    case A::kMemoryClockRate: *value = p.memoryClockRate; break;
+    case A::kComputeCapabilityMinor: *value = p.minor; break;
+    case A::kMultiGpuBoardGroupID: *value = p.multiGpuBoardGroupID; break;
+    case A::kMultiprocessorCount: *value = p.multiProcessorCount; break;
+    case A::kPageableMemoryAccess: *value = p.pageableMemoryAccess; break;
+    case A::kPageableMemoryAccessUsesHostPageTables: *value = p.pageableMemoryAccessUsesHostPageTables; break;
+    case A::kPciBusId: *value = p.pciBusID; break;
+    case A::kPciDeviceId: *value = p.pciDeviceID; break;
+    case A::kPciDomainID: *value = p.pciDomainID; break;
+    case A::kPersistingL2CacheMaxSize: *value = p.persistingL2CacheMaxSize; break;
+    case A::kMaxRegistersPerBlock: *value = p.regsPerBlock; break;
+    case A::kMaxRegistersPerMultiprocessor: *value = p.regsPerMultiprocessor; break;
+    case A::kReservedSharedMemPerBlock: *value = clamp(p.reservedSharedMemPerBlock); break;
+    case A::kMaxSharedMemoryPerBlock: *value = clamp(p.sharedMemPerBlock); break;
+    case A::kSharedMemPerBlockOptin: *value = clamp(p.sharedMemPerBlockOptin); break;
+    case A::kSharedMemPerMultiprocessor: *value = clamp(p.sharedMemPerMultiprocessor); break;
+    case A::kSingleToDoublePrecisionPerfRatio: *value = p.singleToDoublePrecisionPerfRatio; break;
+    case A::kStreamPrioritiesSupported: *value = p.streamPrioritiesSupported; break;
+    case A::kSurfaceAlignment: *value = clamp(p.surfaceAlignment); break;
+    case A::kTccDriver: *value = p.tccDriver; break;
+    case A::kTextureAlignment: *value = clamp(p.textureAlignment); break;
+    case A::kTexturePitchAlignment: *value = clamp(p.texturePitchAlignment); break;
+    case A::kTotalConstantMemory: *value = clamp(p.totalConstMem); break;
+    case A::kTotalGlobalMem: *value = clamp(p.totalGlobalMem); break;
+    case A::kUnifiedAddressing: *value = p.unifiedAddressing; break;
+    case A::kWarpSize: *value = p.warpSize; break;
+    case A::kMemoryPoolsSupported: *value = p.memoryPoolsSupported; break;
+    case A::kHostRegisterSupported: *value = p.hostRegisterSupported; break;
+    case A::kClockInstructionRate: *value = p.clockInstructionRate; break;
+    case A::kMaxSharedMemoryPerMultiprocessor: *value = clamp(p.maxSharedMemoryPerMultiProcessor); break;
+    case A::kCooperativeMultiDeviceUnmatchedFunc: *value = p.cooperativeMultiDeviceUnmatchedFunc; break;
+    case A::kCooperativeMultiDeviceUnmatchedGridDim: *value = p.cooperativeMultiDeviceUnmatchedGridDim; break;
+    case A::kCooperativeMultiDeviceUnmatchedBlockDim: *value = p.cooperativeMultiDeviceUnmatchedBlockDim; break;
+    case A::kCooperativeMultiDeviceUnmatchedSharedMem: *value = p.cooperativeMultiDeviceUnmatchedSharedMem; break;
+    case A::kIsLargeBar: *value = p.isLargeBar; break;
+    case A::kAsicRevision: *value = p.asicRevision; break;
+    case A::kPhysicalMultiProcessorCount: *value = p.multiProcessorCount; break;
+    // Not here: images and textures (no image instructions yet), a stream
+    // waiting on a value in memory, fine-grained host memory.
+    case A::kImageSupport:
+    case A::kCanUseStreamWaitValue:
+    case A::kFineGrainSupport: *value = 0; break;
+    default:
+      return record(s, fail(hipErrorInvalidValue, "device attribute " + std::to_string(attribute) + " is not answered here"));
+  }
   return record(s, hipSuccess);
 }
 
@@ -1207,6 +1380,16 @@ hipError_t hipDeviceEnablePeerAccess(int peer, unsigned int flags) {
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   if (peer < 0 || peer >= s.rt->device_count() || peer == s.current) return record(s, hipErrorInvalidDevice);
   if (!s.peers.insert({s.current, peer}).second) return record(s, hipErrorPeerAccessAlreadyEnabled);
+  return record(s, hipSuccess);
+}
+
+hipError_t hipDeviceDisablePeerAccess(int peer) {
+  const ApiCall api("hipDeviceDisablePeerAccess");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (peer < 0 || peer >= s.rt->device_count() || peer == s.current) return record(s, hipErrorInvalidDevice);
+  if (!s.peers.erase({s.current, peer})) return record(s, hipErrorPeerAccessNotEnabled);
   return record(s, hipSuccess);
 }
 
@@ -1322,6 +1505,171 @@ hipError_t hipGraphExecDestroy(void* exec) {
       return record(s, hipSuccess);
     }
   return record(s, hipErrorInvalidValue);
+}
+
+// ---- Occupancy: how many work-groups of a kernel a compute unit holds -------
+
+}  // extern "C"
+
+namespace {
+
+// ROCm's runtime works this out from the kernel's registers and LDS and the
+// compute unit's limits (hip_platform.cpp), and this is that arithmetic, with
+// CDNA's limits (LLVM's gfx9 register tables): four SIMDs to a compute unit,
+// at most eight waves on each, 512 vector registers each allocated eight at a
+// time, 800 scalar registers sixteen at a time, and the device's LDS.
+struct Occupancy {
+  int blocks_per_cu = 0;   // of the block size asked about
+  int grid_blocks = 0;     // blocks that fill the device at the best block size
+  int best_block = 0;
+};
+
+hipError_t occupancy(const vgpu::DeviceProfile& p, const Kernel& k, int block, size_t dynamic_lds, bool potential,
+                     Occupancy* out) {
+  if (p.gcn_arch.rfind("gfx9", 0) != 0)
+    return fail(hipErrorNotSupported, "occupancy is worked out for CDNA (gfx9) here, and this device is " + p.gcn_arch);
+  const int max_group = static_cast<int>(p.limits.max_threads_per_block);
+  if (!potential) {
+    if (block <= 0) return hipErrorInvalidValue;
+    if (block > max_group) {
+      *out = {};
+      return hipSuccess;
+    }
+  } else if (block <= 0 || block > max_group) {
+    block = max_group;   // no limit asked for, or past what the hardware allows
+  }
+  const int wave = static_cast<int>(k.wavefront_size ? k.wavefront_size : 64);
+  const auto align_up = [](size_t v, size_t to) { return (v + to - 1) / to * to; };
+  constexpr size_t kMaxWavesPerSimd = 8, kVgprsPerSimd = 512, kVgprGranule = 8, kSgprsPerSimd = 800;
+  constexpr size_t kSimdsPerCu = 4;
+  size_t gpr_waves = kMaxWavesPerSimd;
+  if (k.vgpr_count) gpr_waves = kVgprsPerSimd / align_up(k.vgpr_count, kVgprGranule);
+  if (gpr_waves == 0) return fail(hipErrorUnknown, "the kernel uses more vector registers than a SIMD has");
+  if (k.sgpr_count) gpr_waves = std::min(gpr_waves, kSgprsPerSimd / align_up(k.sgpr_count, 16));
+  const int alu_threads = static_cast<int>(kSimdsPerCu * std::min(kMaxWavesPerSimd, gpr_waves)) * wave;
+  int lds_groups = INT_MAX;
+  if (const size_t lds = k.group_segment + dynamic_lds; lds)
+    lds_groups = static_cast<int>(p.limits.shared_mem_per_sm / lds);
+  out->blocks_per_cu = std::min(alu_threads / static_cast<int>(align_up(block, wave)), lds_groups);
+  out->best_block = std::min(alu_threads, static_cast<int>(align_up(block, wave)));
+  out->grid_blocks = static_cast<int>(p.limits.multiprocessors) * std::min(alu_threads / out->best_block, lds_groups);
+  return hipSuccess;
+}
+
+// The kernel a hipcc-built program's host function stands for, on the current
+// device.
+hipError_t kernel_for(State& s, const void* host_function, const Kernel** k) {
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return e;
+  const auto hf = s.host_functions.find(host_function);
+  if (hf == s.host_functions.end())
+    return fail(hipErrorInvalidDeviceFunction, "no kernel was registered for that function");
+  Module* m = nullptr;
+  if (const hipError_t e = module_on(s, *hf->second.binary, s.current, &m); e != hipSuccess) return e;
+  *k = vgpu::amd::find_kernel(m->object, hf->second.kernel);
+  return *k ? hipSuccess : fail(hipErrorInvalidDeviceFunction, "no kernel named " + hf->second.kernel);
+}
+
+hipError_t blocks_per_cu(const Kernel* k, int* blocks, int block, size_t lds) {
+  State& s = state();
+  if (!blocks || !k) return hipErrorInvalidValue;
+  Occupancy o;
+  if (const hipError_t e = occupancy(s.rt->device(s.current).profile(), *k, block, lds, false, &o); e != hipSuccess)
+    return e;
+  *blocks = o.blocks_per_cu;
+  return hipSuccess;
+}
+
+hipError_t best_block(const Kernel* k, int* grid, int* block, size_t lds, int limit) {
+  State& s = state();
+  if (!grid || !block || !k) return hipErrorInvalidValue;
+  Occupancy o;
+  if (const hipError_t e = occupancy(s.rt->device(s.current).profile(), *k, limit, lds, true, &o); e != hipSuccess)
+    return e;
+  *grid = o.grid_blocks;
+  *block = o.best_block;
+  return hipSuccess;
+}
+
+}  // namespace
+
+extern "C" {
+
+hipError_t hipOccupancyMaxActiveBlocksPerMultiprocessor(int* blocks, const void* f, int block, size_t lds) {
+  const ApiCall api("hipOccupancyMaxActiveBlocksPerMultiprocessor");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  const Kernel* k = nullptr;
+  if (const hipError_t e = kernel_for(s, f, &k); e != hipSuccess) return record(s, e);
+  return record(s, blocks_per_cu(k, blocks, block, lds));
+}
+
+hipError_t hipOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* blocks, const void* f, int block, size_t lds,
+                                                                 unsigned int flags) {
+  const ApiCall api("hipOccupancyMaxActiveBlocksPerMultiprocessorWithFlags");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (flags > 1) return record(s, hipErrorInvalidValue);   // hipOccupancyDefault, or DisableCachingOverride
+  const Kernel* k = nullptr;
+  if (const hipError_t e = kernel_for(s, f, &k); e != hipSuccess) return record(s, e);
+  return record(s, blocks_per_cu(k, blocks, block, lds));
+}
+
+hipError_t hipOccupancyMaxPotentialBlockSize(int* grid, int* block, const void* f, size_t lds, int limit) {
+  const ApiCall api("hipOccupancyMaxPotentialBlockSize");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  const Kernel* k = nullptr;
+  if (const hipError_t e = kernel_for(s, f, &k); e != hipSuccess) return record(s, e);
+  return record(s, best_block(k, grid, block, lds, limit));
+}
+
+hipError_t hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(int* blocks, hipFunction_t f, int block, size_t lds) {
+  const ApiCall api("hipModuleOccupancyMaxActiveBlocksPerMultiprocessor");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!f) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  return record(s, blocks_per_cu(reinterpret_cast<Function*>(f)->kernel, blocks, block, lds));
+}
+
+hipError_t hipModuleOccupancyMaxPotentialBlockSize(int* grid, int* block, hipFunction_t f, size_t lds, int limit) {
+  const ApiCall api("hipModuleOccupancyMaxPotentialBlockSize");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!f) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  return record(s, best_block(reinterpret_cast<Function*>(f)->kernel, grid, block, lds, limit));
+}
+
+// A launch whose work-groups may wait on one another (a grid barrier,
+// cooperative_groups::this_grid().sync()). They all have to be resident at
+// once, so a grid larger than the device holds of this kernel at this block
+// size -- what the occupancy calls say -- is refused, as HIP refuses it.
+hipError_t hipLaunchCooperativeKernel(const void* host_function, vgpu::amd::abi::Dim3 grid,
+                                      vgpu::amd::abi::Dim3 block, void** args, unsigned int shared,
+                                      hipStream_t stream) {
+  const ApiCall api("hipLaunchCooperativeKernel");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!device(s)) return record(s, hipErrorInvalidDevice);
+  const Kernel* k = nullptr;
+  if (const hipError_t e = kernel_for(s, host_function, &k); e != hipSuccess) return record(s, e);
+  Module* m = nullptr;
+  const auto hf = s.host_functions.find(host_function);
+  if (const hipError_t e = module_on(s, *hf->second.binary, s.current, &m); e != hipSuccess) return record(s, e);
+  Occupancy o;
+  const int threads = static_cast<int>(block.x * block.y * block.z);
+  const vgpu::DeviceProfile& p = s.rt->device(s.current).profile();
+  if (const hipError_t e = occupancy(p, *k, threads, shared, false, &o); e != hipSuccess) return record(s, e);
+  const uint64_t resident = uint64_t(o.blocks_per_cu) * p.limits.multiprocessors;
+  if (uint64_t{grid.x} * grid.y * grid.z > resident)
+    return record(s, fail(hipErrorCooperativeLaunchTooLarge,
+                          "a cooperative grid of " + std::to_string(uint64_t{grid.x} * grid.y * grid.z) +
+                              " work-groups is more than the " + std::to_string(resident) +
+                              " this device holds at once at this block size"));
+  std::vector<uint8_t> packed;
+  if (const hipError_t e = build_kernargs(*k, args, nullptr, &packed); e != hipSuccess) return record(s, e);
+  return record(s, dispatch_kernel(s, s.current, *m, *k, grid, block, shared, packed, stream, true));
 }
 
 // ---- A program's own device variables, by their host-side stand-ins ---------

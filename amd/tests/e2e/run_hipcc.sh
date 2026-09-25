@@ -68,6 +68,50 @@ expect "each lane's printf comes out whole, in lane order" \
 expect "and printf returns what it printed" "printf returned what it printed for 3 of 3 lanes" \
   "$(grep -o 'printf returned .*' <<< "$out")"
 
+# A cooperative launch: sixteen work-groups each publish a value, wait at a
+# grid barrier, and sum what all of them published, then wait again before
+# clearing it -- right only if no group got past a barrier early. A grid one
+# work-group larger than the device holds at once is refused.
+out=$(VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/cooperative.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "a cooperative kernel runs to the end" "0" "$status"
+expect "the device says it launches cooperatively, and how many groups a compute unit holds" \
+  "cooperative launch 1, 16 work-groups of 128 a compute unit" "$(grep -o '^cooperative launch .*' <<< "$out")"
+expect "no work-group passes the grid barrier before every one reaches it" \
+  "after the grid barrier, 16 of 16 groups saw every group's value" "$(grep -o '^after the grid barrier.*' <<< "$out")"
+expect "a grid too large to be resident at once is refused" \
+  "a grid too large to be resident at once: hipErrorCooperativeLaunchTooLarge" "$(grep -o '^a grid too large.*' <<< "$out")"
+
+# Occupancy, as ROCm's runtime works it out (clr's hip_platform.cpp) from each
+# kernel's metadata. A gfx942 SIMD holds 8 waves, 512 vector registers in
+# steps of 8, and a compute unit 64 KB of LDS; 4 SIMDs, waves of 64. So:
+#   plain (4 VGPRs), 256 threads:   8 waves x 4 x 64 = 2048 threads, 8 groups
+#   of 65 threads, a group of 2 waves:                  2048 / 128  = 16
+#   with 20000 bytes of LDS:        65536 / 20000                   = 3
+#   tiled (24576 bytes of LDS):     65536 / 24576                   = 2
+#   wide (129 VGPRs, so 136):       512 / 136 = 3 waves, 768 / 256  = 3
+# and the grid that fills the 304 compute units: plain at 1024 threads, 2 a
+# compute unit, 608; wide held to 256 threads, 3 a compute unit, 912.
+out=$(VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/runtime.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "a program asking about its device and kernels runs to the end" "0" "$status"
+expect "work-groups a compute unit holds come from the kernel's registers and LDS" \
+  "work-groups a compute unit holds: plain 8, of 65 threads 16, with 20000 bytes of LDS 3, tiled 2, wide 3" \
+  "$(grep -o '^work-groups a compute unit holds.*' <<< "$out")"
+expect "the block size that fills the device" "filling the device: plain 608 of 1024, wide 912 of 256" \
+  "$(grep -o '^filling the device.*' <<< "$out")"
+expect "each device attribute is the property it names" "30 of 30 attributes agree with the properties" \
+  "$(grep -o '^[0-9]* of [0-9]* attributes agree.*' <<< "$out")"
+expect "an attribute of a device that is not there is refused" "a device that is not there: hipErrorInvalidDevice" \
+  "$(grep -o '^a device that is not there.*' <<< "$out")"
+expect "a kernel reads and writes a peer's memory once peer access is enabled" \
+  "a kernel on device 0 read and wrote device 1's memory right for 256 of 256 elements" \
+  "$(grep -o '^a kernel on device 0.*' <<< "$out")"
+expect "peer access disabled twice says it is not enabled" "disabling it again: hipErrorPeerAccessNotEnabled" \
+  "$(grep -o '^disabling it again.*' <<< "$out")"
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)

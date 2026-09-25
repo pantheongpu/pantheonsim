@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "vgpu/amd_codeobject.hpp"
 #include "vgpu/memory.hpp"
@@ -43,6 +44,16 @@ struct Dispatch {
   // it anywhere: its hidden_hostcall_buffer argument, and what answers when
   // the kernel raises the doorbell.
   Hostcall* hostcall = nullptr;
+  // Other devices' memory the kernel may reach, by device ordinal: those the
+  // program enabled peer access to (hipDeviceEnablePeerAccess), null for the
+  // rest. Empty for none.
+  std::vector<MemoryManager*> peers;
+  // A cooperative launch (hipLaunchCooperativeKernel): every work-group is
+  // resident at once, so they can wait on one another, and grid_sync is where
+  // the device library's grid barrier keeps its count -- ROCm's mg_info, which
+  // the kernel finds through its hidden_multigrid_sync_arg argument.
+  bool cooperative = false;
+  uint64_t grid_sync = 0;
 };
 
 // What the GPU's performance counters would count for a dispatch: every

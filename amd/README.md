@@ -57,6 +57,16 @@ and `.so.7`) and gives each function the symbol version the real one does,
 since a program built by `hipcc` asks for `hipMalloc@hip_4.2`, not just
 `hipMalloc`.
 
+`hipDeviceGetAttribute` answers each attribute with the property of the same
+name, by the numbers ROCm's header gives them (`tests/e2e/run_hip_abi.sh`
+checks every one against the header). The occupancy calls work out how many
+work-groups a compute unit holds the way ROCm's runtime does, from the
+kernel's registers and LDS. A cooperative launch puts every work-group of its
+grid on the device at once, so a grid barrier (`this_grid().sync()`) holds,
+and a grid larger than the device holds at once is refused as HIP refuses it.
+With peer access enabled, a kernel reads and writes another device's memory
+at the address that device gave it.
+
 The instructions implemented are those clang emits for the kernels in
 `tests/data/`.
 
@@ -144,6 +154,8 @@ named byte or half of each source, with its sign or without, and writes its
 result into a named part of the destination with the rest zeroed. That form
 is how the compiler mixes widths and how it packs two values into one
 register; a source of it may be a scalar register rather than a vector one.
+A comparison has a sub-dword form too, writing VCC or the scalar pair it
+names.
 Filling the rest of a destination with the sign instead of zeroes, or leaving
 it as it was, is refused: nothing here has been seen to ask for either.
 

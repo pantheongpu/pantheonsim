@@ -42,3 +42,27 @@ else
   grep -o 'static assertion failed.*' "$tmp/err" | sed 's/^/      /' | head -20
   exit 1
 fi
+
+# hipDeviceGetAttribute is asked by number, so each attribute VirtualGPU
+# answers has to carry the number the header gives it. VirtualGPU names each
+# after the header's own, kFoo for hipDeviceAttributeFoo.
+attrs=$(sed -n '/^enum class DeviceAttribute/,/^};/p' "$root/amd/include/vgpu/hip_abi.hpp" |
+  sed -n 's/^ *k\([A-Za-z0-9]*\) = .*/\1/p')
+{
+  echo '#include <hip/hip_runtime_api.h>'
+  echo '#include "vgpu/hip_abi.hpp"'
+  echo 'using A = vgpu::amd::abi::DeviceAttribute;'
+  for a in $attrs; do
+    echo "static_assert(static_cast<int>(A::k$a) == hipDeviceAttribute$a, \"hipDeviceAttribute$a has another number\");"
+  done
+  echo 'int main() { return 0; }'
+} > "$tmp/attrs.cpp"
+count=$(wc -w <<< "$attrs")
+if "$cxx" -std=c++17 -D__HIP_PLATFORM_AMD__ -I"$rocm/include" -I"$root/amd/include" -c "$tmp/attrs.cpp" \
+     -o "$tmp/attrs.o" 2>"$tmp/err"; then
+  echo "ok    all $count device attributes carry the numbers $rocm's hip_runtime_api.h gives them"
+else
+  echo "FAIL  the device attributes differ from $rocm's hip_runtime_api.h:"
+  grep -oE "static assertion failed.*|error: .*" "$tmp/err" | sed 's/^/      /' | head -20
+  exit 1
+fi
