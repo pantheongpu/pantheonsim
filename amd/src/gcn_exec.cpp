@@ -1571,6 +1571,59 @@ struct Machine {
     return writes;
   }
 
+  // v_mfma_f32_16x16x16_f16: D = A x B + C over the whole wave, with each
+  // matrix spread across the 64 lanes. Lane l holds, for i = l % 16 and
+  // q = l / 16 (which quarter of the wave it is in):
+  //   A: row i, the four halves at k = 4q .. 4q+3, in its two registers;
+  //   B: column i, the same four k, in its two;
+  //   C and D: column i, rows 4q .. 4q+3, one float to a register.
+  // That arrangement is checked, not assumed: rocWMMA -- AMD's library whose
+  // loads and stores put each element where the hardware expects it -- is
+  // run through this and compared with the same product worked out in C.
+  //
+  // The sixteen products and the addend are summed in double and rounded to
+  // a float once. Where every partial sum is exact, as in the tests, any
+  // order of summing gives the same float; where it is not, a card may round
+  // differently. A wave with lanes switched off is refused: the instruction
+  // works on all 64 at once, and what a card does with some of them off is
+  // not something this can check.
+  void matrix_multiply(Wave& w, const Inst& in) {
+    if (w.exec != ~uint64_t{0})
+      throw Error::make(Err::Unsupported, in.name, " with lanes switched off (EXEC ", w.exec,
+                        "), which this does not model");
+    const auto reg = [&](const Operand& o, uint32_t k, uint32_t lane) -> uint32_t {
+      if (o.kind == OperandKind::Agpr) return o.index + k < w.agpr.size() ? w.agpr[o.index + k][lane] : 0;
+      if (o.kind == OperandKind::Vgpr) return w.vgpr[o.index + k][lane];
+      return static_cast<uint32_t>(scalar(w, o));   // an inline constant, the same in every lane and register
+    };
+    const auto half = [](uint32_t word, uint32_t which) {
+      _Float16 h;
+      const uint16_t bits = static_cast<uint16_t>(word >> (16 * which));
+      std::memcpy(&h, &bits, 2);
+      return static_cast<double>(h);
+    };
+    double a[16][16], b[16][16], c[16][16];
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint32_t i = lane % 16, q = lane / 16;
+      for (uint32_t e = 0; e < 4; ++e) {
+        a[i][4 * q + e] = half(reg(in.src[0], e / 2, lane), e % 2);
+        b[4 * q + e][i] = half(reg(in.src[1], e / 2, lane), e % 2);
+        c[4 * q + e][i] = static_cast<double>(as_float(reg(in.src[2], e, lane)));
+      }
+    }
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint32_t j = lane % 16, q = lane / 16;
+      for (uint32_t r = 0; r < 4; ++r) {
+        const uint32_t i = 4 * q + r;
+        double sum = c[i][j];
+        for (uint32_t k = 0; k < 16; ++k) sum += a[i][k] * b[k][j];
+        const uint32_t out = as_bits(static_cast<float>(sum));
+        if (in.dst[0].kind == OperandKind::Agpr) acc(w, in.dst[0].index + r)[lane] = out;
+        else w.vgpr[in.dst[0].index + r][lane] = out;
+      }
+    }
+  }
+
   // Runs one instruction. Returns false when the wave has stopped or parked
   // at a barrier, so the group can run another wave.
   bool step(Wave& w, Group& g) {
@@ -1596,7 +1649,8 @@ struct Machine {
       case gcn::Enc::Vop3p:
         // A comparison in its long form is still a comparison: it writes a
         // mask of the lanes that passed, not a value per lane.
-        if (in.name.rfind("v_cmp_", 0) == 0) compare(w, in);
+        if (in.name.rfind("v_mfma", 0) == 0) matrix_multiply(w, in);
+        else if (in.name.rfind("v_cmp_", 0) == 0) compare(w, in);
         else if (in.dpp) cross_lane_alu(w, in);
         else vector_alu(w, in);
         return true;

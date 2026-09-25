@@ -98,6 +98,16 @@ lanes choosing among their own four, or a group of 32 swapped, reversed or
 broadcast. Both read every lane's value before any lane's result is written,
 since the destination may be the register they read.
 
+The matrix instruction `v_mfma_f32_16x16x16_f16` multiplies two 16x16 matrices
+of halves spread across the wave's 64 lanes and adds a 16x16 block of floats.
+Which element sits in which lane's register is checked rather than assumed: a
+GEMM written with rocWMMA -- AMD's library, whose loads and stores put each
+element where the hardware expects it -- runs through it and matches the same
+product worked out in C, and moving any part of the arrangement makes it fail.
+Its sums are formed in double and rounded once; where a sum is not exact, a
+card may round it differently. Its broadcast modifiers, and a wave with lanes
+switched off, are refused.
+
 A lane can also read another lane's register through the cross-lane form,
 within its row of sixteen: the shifts and the rotate, the two mirrors, the
 broadcasts that carry a row into the next, and the masks that say which lanes
