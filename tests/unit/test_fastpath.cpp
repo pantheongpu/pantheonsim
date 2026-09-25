@@ -101,6 +101,7 @@ std::vector<uint64_t> run(const std::string& body, bool wide, const std::vector<
     .reg .pred %p<8>;
     .reg .pred %q;
     .reg .b32 %r<16>;
+    .reg .b16 %rs<4>;
     .reg .b64 %rd<24>;
     .reg .b32 %a, %b, %c, %d;
     .reg .b64 %A, %B, %C, %D;
@@ -235,6 +236,56 @@ VTEST(fast_float_arithmetic_matches_the_general_path) {
   same("fma.rn.f64 %D, %A, %B, %C;", true, x, y, z);
   same("fma.rn.f64 %D, %A, 0d3FF8000000000000, %C;", true, x, y, z);
   same("fma.rn.f64 %A, %A, %B, %A; mov.b64 %D, %A;", true, x, y, z);
+}
+
+// Half precision: the decode table and the integer rounding of results,
+// over values whose f16 results land everywhere -- normal, subnormal,
+// overflowing to infinity, rounding up into the next exponent, and NaN.
+VTEST(fast_half_precision_matches_the_general_path) {
+  const uint16_t h[] = {0x0000, 0x8000, 0x3C00, 0xBC00, 0x7C00, 0xFC00, 0x7E00, 0x7C01, 0x0001,
+                        0x03FF, 0x0400, 0x7BFF, 0x3555, 0x4248, 0x5A00, 0xC248, 0x3BFF, 0x0401,
+                        0x1400, 0x77FF, 0x6BFF, 0x2E66};
+  std::vector<uint64_t> a;
+  for (int i = 0; i < kThreads; ++i) {
+    const uint16_t lo = h[(i * 7) % (sizeof h / 2)], hi = h[(i * 5 + 3) % (sizeof h / 2)];
+    a.push_back(uint64_t{lo} | (uint64_t{hi} << 16));
+  }
+  const auto b = rotate(a, 5), c = rotate(a, 13);
+  for (const char* op : {"fma.rn.f16x2 %d, %a, %b, %c;", "fma.rn.bf16x2 %d, %a, %b, %c;",
+                         "add.f16x2 %d, %a, %b;", "mul.f16x2 %d, %a, %b;", "sub.rn.f16x2 %d, %a, %b;",
+                         "add.rz.f16x2 %d, %a, %b;", "mul.rm.f16x2 %d, %a, %b;"})
+    same(op, false, a, b, c);
+  // Conversions into f16 from f32 values whose halves over- and underflow.
+  const auto f = f32_values();
+  for (const char* op : {"cvt.rn.f16.f32 %rs1, %a; cvt.u32.u16 %d, %rs1;",
+                         "cvt.rz.f16.f32 %rs1, %a; cvt.u32.u16 %d, %rs1;",
+                         "cvt.f32.f16 %d, %a;"})
+    same(op, false, f, b, c);
+}
+
+// Rounding a double to f16, on the values where rounding is decided: exactly
+// halfway between two halves (ties to even, both parities), a hair either side
+// of halfway, the top of each binade where rounding carries into the
+// exponent, the overflow threshold, the smallest normals, and random bits.
+VTEST(fast_f16_rounding_matches_the_general_path_at_every_tie) {
+  std::vector<uint64_t> vals;
+  uint64_t seed = 0x9E3779B97F4A7C15ull;
+  auto rnd = [&] { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+  for (int e = -16; e <= 16; ++e)
+    for (uint64_t mant10 : {0ull, 1ull, 2ull, 511ull, 1022ull, 1023ull}) {
+      const uint64_t base = (uint64_t(e + 1023) << 52) | (mant10 << 42);
+      for (uint64_t low : {0ull, 1ull << 41, (1ull << 41) - 1, (1ull << 41) + 1, (1ull << 42) - 1})
+        for (uint64_t sign : {0ull, 1ull << 63}) vals.push_back(sign | base | low);
+    }
+  for (double d : {65504.0, 65519.999, 65520.0, 65536.0, 6.103515625e-05, 6.0975e-05, 5.96e-08})
+    vals.push_back(dbits(d));
+  while (vals.size() % kThreads) vals.push_back(dbits(double(int64_t(rnd() % 2000001) - 1000000) / 777.0));
+  for (int i = 0; i < 64; ++i) vals.push_back(rnd());
+  while (vals.size() % kThreads) vals.push_back(rnd());
+  for (size_t at = 0; at < vals.size(); at += kThreads) {
+    const std::vector<uint64_t> a(vals.begin() + at, vals.begin() + at + kThreads);
+    same("cvt.rn.f16.f64 %rs1, %A; cvt.u32.u16 %d, %rs1;", false, a, a, a);
+  }
 }
 
 VTEST_MAIN

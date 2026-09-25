@@ -331,7 +331,7 @@ void refresh_modes() {
 
 // IEEE 754 binary16 <-> double, implemented in software so the engine needs no
 // host f16 support. Round-to-nearest-even, with subnormals and inf/NaN.
-double f16_to_double(uint64_t bits) {
+double f16_to_double_exact(uint64_t bits) {
   // Assembled field by field rather than through ldexp: every binary16 value
   // is exact in a double, so sign, exponent and mantissa carry straight across,
   // and the libm call this replaced was most of an f16 matrix kernel's time.
@@ -355,7 +355,60 @@ double f16_to_double(uint64_t bits) {
   return std::bit_cast<double>(out);
 }
 
+// Every binary16 value's double, computed once by the function above: f16
+// kernels convert every operand of every lane, and a load is cheaper than the
+// field assembly. The same values by construction.
+const std::array<double, 65536> kF16ToDouble = [] {
+  std::array<double, 65536> t{};
+  for (uint32_t h = 0; h < 65536; ++h) t[h] = f16_to_double_exact(h);
+  return t;
+}();
+
+double f16_to_double(uint64_t bits) {
+  if (!g_fast_path.load(std::memory_order_relaxed)) return f16_to_double_exact(bits);
+  return kF16ToDouble[bits & 0xFFFFu];
+}
+
+// How many threads are inside a float instruction with an explicit
+// .rz/.rm/.rp, which sets the host rounding mode around its arithmetic. While
+// it is zero every thread is rounding to nearest, and conversions can round on
+// the bits; otherwise they take the path that follows the host mode. A global
+// count rather than a per-thread flag: a thread_local in this shared library
+// cost a __tls_get_addr call per conversion, and reading MXCSR every time was
+// not much cheaper.
+std::atomic<int> g_directed_rounding{0};
+
+uint64_t double_to_f16_exact(double d);
+
 uint64_t double_to_f16(double d) {
+  // A normal binary16 result under round-to-nearest-even, done on the bits:
+  // keep the top 10 bits of the double's mantissa and round on the 42 below.
+  // The same answer as the frexp/nearbyint form below, which is kept for
+  // everything else -- NaN, overflow, subnormal results, other rounding modes.
+  if (g_directed_rounding.load(std::memory_order_relaxed) == 0 &&
+      g_fast_path.load(std::memory_order_relaxed)) {
+    const uint64_t b = std::bit_cast<uint64_t>(d);
+    const uint64_t mag = b & 0x7FFF'FFFF'FFFF'FFFFull;
+    const int e = static_cast<int>(mag >> 52) - 1023;   // unbiased exponent
+    if (e >= -14 && e <= 15) {                            // a normal half, before rounding
+      const uint32_t sign = static_cast<uint32_t>(b >> 48) & 0x8000u;
+      const uint64_t m = mag & ((1ull << 52) - 1);
+      uint64_t mant = m >> 42;
+      const uint64_t rest = m & ((1ull << 42) - 1), half = 1ull << 41;
+      if (rest > half || (rest == half && (mant & 1))) ++mant;
+      uint32_t e16 = static_cast<uint32_t>(e + 15);
+      if (mant == 1024) {   // rounding carried into the exponent
+        mant = 0;
+        ++e16;
+      }
+      if (e16 >= 31) return sign | 0x7C00;
+      return sign | (e16 << 10) | static_cast<uint32_t>(mant);
+    }
+  }
+  return double_to_f16_exact(d);
+}
+
+uint64_t double_to_f16_exact(double d) {
   if (std::isnan(d)) return 0x7E00;
   uint32_t sign = std::signbit(d) ? 0x8000u : 0u;
   double a = std::fabs(d);
@@ -544,9 +597,13 @@ __attribute__((target("fma"))) void fma_lanes_f64_hw(uint64_t* d, const uint64_t
   });
 }
 const bool g_hw_fma = __builtin_cpu_supports("fma");
+__attribute__((target("fma"))) double fma_hw(double a, double b, double c) { return __builtin_fma(a, b, c); }
 #else
 constexpr bool g_hw_fma = false;
+double fma_hw(double a, double b, double c) { return std::fma(a, b, c); }
 #endif
+// The correctly rounded fused multiply-add, without libm's per-call dispatch.
+inline double host_fma(double a, double b, double c) { return g_hw_fma ? fma_hw(a, b, c) : std::fma(a, b, c); }
 
 uint64_t mask_to_bits(uint64_t v, uint32_t bits) {
   return bits >= 64 ? v : (v & ((1ull << bits) - 1));
@@ -566,7 +623,16 @@ class Interpreter {
         W_(profile.warp_size), all_(all_lanes(profile.warp_size)), symbols_(symbols),
         stats_(stats), progress_(progress) {
     if (progress_) last_progress_ = std::chrono::steady_clock::now();
+    // A host program that set its own rounding mode before launching gets
+    // conversions that follow it, as before; see g_directed_rounding.
+    host_directed_ = std::fegetround() != FE_TONEAREST;
+    if (host_directed_) g_directed_rounding.fetch_add(1, std::memory_order_relaxed);
   }
+  ~Interpreter() {
+    if (host_directed_) g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
+  }
+  Interpreter(const Interpreter&) = delete;
+  Interpreter& operator=(const Interpreter&) = delete;
 
   // The cluster shape this launch runs with, never zero in any dimension. A
   // launch that names no cluster is a launch of 1x1x1 clusters -- one block
@@ -1878,6 +1944,7 @@ class Interpreter {
       case op_index<OpSetp>(): return fast_setp(w, ins, std::get<OpSetp>(ins.op), m);
       case op_index<OpFma>(): return fast_fma(w, ctx, ins, std::get<OpFma>(ins.op), m);
       case op_index<OpFloatBin>(): return fast_float_bin(w, ins, std::get<OpFloatBin>(ins.op), m);
+      case op_index<OpF16x2Fma>(): return fast_f16x2_fma(w, ins, std::get<OpF16x2Fma>(ins.op), m);
       default: return false;
     }
   }
@@ -2049,6 +2116,44 @@ class Interpreter {
     return true;
   }
 
+  // fma on f16 or bf16 halves: the same double-precision fma and rounding as
+  // the general path, with the decode from the table and no widening.
+  bool fast_f16x2_fma(Warp& w, const Instr& ins, const OpF16x2Fma& op, Mask m) {
+    if (op.dst.wide || !narrow_operand(op.a) || !narrow_operand(op.b) || !narrow_operand(op.c))
+      return false;
+    Lanes32 sa, sb, sc;
+    const Lanes32& a = read_narrow(w, ins, op.a, sa);
+    const Lanes32& b = read_narrow(w, ins, op.b, sb);
+    const Lanes32& c = read_narrow(w, ins, op.c, sc);
+    uint32_t* d = w.regs32[op.dst.id].data();
+    const int halves = op.packed ? 2 : 1;
+    if (op.bf16) {
+      for_active(m, W_, [&](uint32_t l) {
+        uint64_t out = 0;
+        for (int h = 0; h < halves; ++h) {
+          const double v = host_fma(bf16_to_double((a[l] >> (16 * h)) & 0xFFFF),
+                                    bf16_to_double((b[l] >> (16 * h)) & 0xFFFF),
+                                    bf16_to_double((c[l] >> (16 * h)) & 0xFFFF));
+          out |= double_to_bf16(v) << (16 * h);
+        }
+        d[l] = static_cast<uint32_t>(out);
+      });
+    } else {
+      for_active(m, W_, [&](uint32_t l) {
+        uint64_t out = 0;
+        for (int h = 0; h < halves; ++h) {
+          const double v = host_fma(kF16ToDouble[(a[l] >> (16 * h)) & 0xFFFF],
+                                    kF16ToDouble[(b[l] >> (16 * h)) & 0xFFFF],
+                                    kF16ToDouble[(c[l] >> (16 * h)) & 0xFFFF]);
+          out |= double_to_f16(v) << (16 * h);
+        }
+        d[l] = static_cast<uint32_t>(out);
+      });
+    }
+    w.written32[op.dst.id] = 1;
+    return true;
+  }
+
   void dispatch(Warp& w, const BlockCtx& ctx, const Instr& ins, Mask m) {
     if (g_fast_path.load(std::memory_order_relaxed) && fast_path(w, ctx, ins, m)) return;
     if (const auto* op = std::get_if<OpMov>(&ins.op)) {
@@ -2135,6 +2240,7 @@ class Interpreter {
       // Only an explicit mode touches the environment: fegetround is a libc call,
       // and round-to-nearest is what nearly every instruction asks for.
       const int prev_round = op->round == FRound::Nearest ? 0 : std::fegetround();
+      if (op->round != FRound::Nearest) g_directed_rounding.fetch_add(1, std::memory_order_relaxed);
       switch (op->round) {
         case FRound::Zero: std::fesetround(FE_TOWARDZERO); break;
         case FRound::MinusInf: std::fesetround(FE_DOWNWARD); break;
@@ -2143,7 +2249,10 @@ class Interpreter {
       }
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) r[lane] = float_bin(op->op, op->ty, a[lane], b[lane], op->nan_propagate);
-      if (op->round != FRound::Nearest) std::fesetround(prev_round);
+      if (op->round != FRound::Nearest) {
+        std::fesetround(prev_round);
+        g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
+      }
       alu_fault(r, m, op->ty.bits);
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
@@ -3241,7 +3350,7 @@ class Interpreter {
             double x = op->bf16 ? bf16_to_double(ax) : f16_to_double(ax);
             double y = op->bf16 ? bf16_to_double(bx) : f16_to_double(bx);
             double z = op->bf16 ? bf16_to_double(cx) : f16_to_double(cx);
-            const double v = std::fma(x, y, z);
+            const double v = host_fma(x, y, z);
             out |= (op->bf16 ? double_to_bf16(v) : double_to_f16(v)) << (16 * h);
           }
           r[lane] = out;
@@ -6008,6 +6117,7 @@ class Interpreter {
   // B of the wgmma being executed, kept across instructions so a 64x256 tile
   // does not allocate on every one. An interpreter runs on one thread.
   std::vector<double> wgmma_b_;
+  bool host_directed_ = false;   // this thread was not rounding to nearest at launch
   // %gridid: a serial number distinguishing this launch from every other one in
   // the process. Assigned once per launch rather than per interpreter, so the
   // workers of one launch agree.
