@@ -146,6 +146,21 @@ struct LaunchStats {
   // for a conflict-free access, 31 for a 32-way conflict.
   uint64_t shared_bank_conflicts = 0;
 
+  // The same counts split by direction, which is how a profiler reports them:
+  // Nsight Compute's l1tex__t_sectors_*_op_ld and _op_st are separate metrics,
+  // and so are its per-direction request and bank-conflict counts. Only plain
+  // ld and st feed these, as only LDG/STG and LDS/STS feed the metrics they
+  // answer; ldmatrix, cp.async and atomics are counted as themselves.
+  uint64_t global_sectors_ld = 0, global_sectors_st = 0;
+  uint64_t global_requests_ld = 0, global_requests_st = 0;
+  uint64_t shared_requests_ld = 0, shared_requests_st = 0;
+  uint64_t shared_bank_conflicts_ld = 0, shared_bank_conflicts_st = 0;
+  // Bytes the lanes of those same plain global loads and stores asked for,
+  // vector width included. global_bytes_read also counts texture, surface and
+  // cp.async traffic, which moves no sector counted here, so a bytes-per-sector
+  // ratio has to use these.
+  uint64_t global_bytes_ld = 0, global_bytes_st = 0;
+
   // Instruction mix, per active lane, so these sum to thread_instructions.
   uint64_t inst_by_class[static_cast<size_t>(InstClass::Count)] = {};
   // Tensor-core issues counted per warp rather than per lane: an mma is one

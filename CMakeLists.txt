@@ -544,7 +544,7 @@ else()
 endif()
 
 # CLI
-add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/test.cpp
+add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/test.cpp src/cli/ncu.cpp
                src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
@@ -1099,6 +1099,16 @@ if(TARGET vgpucudart)
   add_test(NAME e2e_capture_streams COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_capture_streams.sh)
   set_tests_properties(e2e_capture_streams PROPERTIES
     DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# The session's ncu: Nsight Compute's command line answered from the simulator's
+# counters, checked against kernels whose metrics follow from their addresses.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_ncu COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ncu.sh)
+  set_tests_properties(e2e_ncu PROPERTIES
+    DEPENDS "vgpucudart;vgpu_cli"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
 endif()
