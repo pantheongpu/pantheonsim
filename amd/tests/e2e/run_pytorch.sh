@@ -41,7 +41,10 @@ cap=()
 if command -v systemd-run >/dev/null && systemd-run --user --scope -q true 2>/dev/null; then
   cap=(systemd-run --user --scope -q -p "MemoryMax=${VGPU_TORCH_MEMORY_MAX:-10G}" -p MemorySwapMax=0)
 fi
-out=$(cd "$tmp" && VGPU_QUIET=1 VGPU_GPU="$gpu" VGPU_DEVICE_COUNT="$devices" VGPU_MEMORY_RAM_MB="${VGPU_MEMORY_RAM_MB:-4096}" \
+# Triton's and Inductor's caches in the run's own directory, so each run
+# compiles what it runs.
+out=$(cd "$tmp" && TRITON_CACHE_DIR="$tmp/triton" TORCHINDUCTOR_CACHE_DIR="$tmp/inductor" \
+  VGPU_QUIET=1 VGPU_GPU="$gpu" VGPU_DEVICE_COUNT="$devices" VGPU_MEMORY_RAM_MB="${VGPU_MEMORY_RAM_MB:-4096}" \
   PYTHONPATH="$tmp" "${cap[@]}" "$python" "$root/amd/tests/pytorch/$script" 2>&1)
 status=$?
 echo "$out" | grep -E '^(ok|FAIL) ' | sed 's/^/      /'

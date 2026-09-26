@@ -2808,6 +2808,104 @@ hipError_t hipStreamQuery(hipStream_t stream) {
   return record(s, hipSuccess);
 }
 
+// A HIP function by name, as a program that binds HIP at run time asks for
+// it (Triton's HIP driver does, for every call it makes): the library's own
+// export of that name, found the way the dynamic loader would find it.
+namespace {
+void* own_function(const char* symbol) {
+  static void* self = [] {
+    Dl_info info{};
+    dladdr(reinterpret_cast<void*>(&hipGetLastError), &info);
+    return info.dli_fname ? dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD) : nullptr;
+  }();
+  return self && symbol ? dlsym(self, symbol) : nullptr;
+}
+}  // namespace
+
+// A caller built for HIP 6 or later (the version it passes, in either of
+// HIP's forms: 600, or the driver's 60000000) means the functions HIP 6
+// renamed to take its struct layouts -- hipGetDeviceProperties is
+// hipGetDevicePropertiesR0600 to it, as HIP's headers make it.
+hipError_t hipGetProcAddress(const char* symbol, void** pfn, int hip_version, uint64_t, int* status) {
+  const ApiCall api("hipGetProcAddress");
+  if (!symbol || !pfn) return record(state(), hipErrorInvalidValue);
+  *pfn = nullptr;
+  if (hip_version >= 600) *pfn = own_function((std::string(symbol) + "R0600").c_str());
+  if (!*pfn) *pfn = own_function(symbol);
+  if (status) *status = *pfn ? 0 /* SUCCESS */ : 1 /* SYMBOL_NOT_FOUND */;
+  return record(state(), *pfn ? hipSuccess : hipErrorNotFound);
+}
+
+hipError_t hipGetDriverEntryPoint(const char* symbol, void** pfn, unsigned long long, int* status) {
+  const ApiCall api("hipGetDriverEntryPoint");
+  if (!symbol || !pfn) return record(state(), hipErrorInvalidValue);
+  *pfn = own_function(symbol);
+  if (status) *status = *pfn ? 0 /* SUCCESS */ : 1 /* SYMBOL_NOT_FOUND */;
+  return record(state(), *pfn ? hipSuccess : hipErrorNotFound);
+}
+
+// One attribute of a module's kernel (hipFunction_attribute), which Triton
+// reads for every kernel it compiles: its register and scratch use, and the
+// work-group size its metadata allows.
+hipError_t hipFuncGetAttribute(int* value, int attribute, hipFunction_t f) {
+  const ApiCall api("hipFuncGetAttribute");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!value || !f) return record(s, hipErrorInvalidValue);
+  vgpu::runtime::Device* d = device(s);
+  if (!d) return record(s, hipErrorInvalidDevice);
+  const Kernel& k = *reinterpret_cast<Function*>(f)->kernel;
+  const vgpu::DeviceProfile& p = d->profile();
+  switch (attribute) {
+    case 0: *value = static_cast<int>(k.max_flat_workgroup_size ? k.max_flat_workgroup_size : 1024); break;
+    case 1: *value = static_cast<int>(k.group_segment); break;                          // SHARED_SIZE_BYTES
+    case 2: *value = 0; break;                                                          // CONST_SIZE_BYTES
+    case 3: *value = static_cast<int>(k.private_segment); break;                        // LOCAL_SIZE_BYTES
+    case 4: *value = static_cast<int>(k.vgpr_count); break;                             // NUM_REGS
+    case 5:                                                                             // PTX_VERSION
+    case 6: *value = p.cc_major * 10 + p.cc_minor; break;                               // BINARY_VERSION
+    case 7: *value = 0; break;                                                          // CACHE_MODE_CA
+    case 8: *value = static_cast<int>(p.limits.shared_mem_per_block - k.group_segment); break;
+    case 9: *value = -1; break;                                                         // CARVEOUT: none preferred
+    default: return record(s, hipErrorInvalidValue);
+  }
+  return record(s, hipSuccess);
+}
+
+hipError_t hipModuleLaunchCooperativeKernel(hipFunction_t f, unsigned int gx, unsigned int gy, unsigned int gz,
+                                            unsigned int bx, unsigned int by, unsigned int bz, unsigned int shared,
+                                            hipStream_t stream, void** params);
+
+// A module launch described by a configuration and a list of attributes
+// (HIP_LAUNCH_CONFIG): of those, a cooperative launch is what changes how it
+// runs.
+hipError_t hipDrvLaunchKernelEx(const void* config, hipFunction_t f, void** params, void** extra) {
+  const ApiCall api("hipDrvLaunchKernelEx");
+  if (!config || !f) return record(state(), hipErrorInvalidValue);
+  const auto* c = static_cast<const unsigned char*>(config);
+  uint32_t dims[7];
+  std::memcpy(dims, c, sizeof dims);   // grid x, y, z; block x, y, z; dynamic LDS
+  hipStream_t stream;
+  std::memcpy(&stream, c + 32, sizeof stream);
+  const unsigned char* attrs;
+  std::memcpy(&attrs, c + 40, sizeof attrs);
+  uint32_t count;
+  std::memcpy(&count, c + 48, 4);
+  bool cooperative = false;
+  for (uint32_t i = 0; attrs && i < count; ++i) {   // hipLaunchAttribute: an id, then its value at 8; 72 bytes
+    uint32_t id;
+    int v;
+    std::memcpy(&id, attrs + 72 * i, 4);
+    std::memcpy(&v, attrs + 72 * i + 8, 4);
+    if (id == 2 /* hipLaunchAttributeCooperative */) cooperative = v != 0;
+  }
+  if (cooperative)
+    return hipModuleLaunchCooperativeKernel(f, dims[0], dims[1], dims[2], dims[3], dims[4], dims[5], dims[6], stream,
+                                            params);
+  return hipModuleLaunchKernel(f, dims[0], dims[1], dims[2], dims[3], dims[4], dims[5], dims[6], stream, params,
+                               extra);
+}
+
 hipError_t hipExtGetLastError(void) {
   const ApiCall api("hipExtGetLastError");
   return hipGetLastError();
