@@ -47,7 +47,7 @@ vector:
   v_pk_add_f16 v8, v6, v7 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[1,0]
   v_pk_max_f16 v9, v6, v7 neg_hi:[0,1]
   v_pk_fma_f16 v10, v6, v7, v6 op_sel_hi:[1,1,0]
-  v_pk_add_f16 v11, v6, 1.0                   // a constant, the same in both halves
+  v_pk_add_f16 v11, v6, 1.0                   // a constant: 1.0 in the low half, 0 in the high
   // Packed floats: s[8:9] = (2, 5), v[12:13] = (3, 7).
   s_mov_b32 s8, 2.0
   s_mov_b32 s9, 0x40a00000

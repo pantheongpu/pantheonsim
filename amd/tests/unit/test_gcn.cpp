@@ -95,6 +95,8 @@ VTEST(every_instruction_decodes_as_the_assembler_wrote_it) {
     check_against_assembler("memory.gfx942.o", "memory.gfx942.dis");
     check_against_assembler("globals.gfx942.o", "globals.gfx942.dis");
     check_against_assembler("grid.gfx942.o", "grid.gfx942.dis");
+    // What PyTorch's ROCm libraries use beyond a compiler's usual output.
+    check_against_assembler("asm_libs.gfx942.o", "asm_libs.gfx942.dis");
   }
 }
 
