@@ -31,6 +31,29 @@
     }                                                                                \
   } while (0)
 
+// cuTensorMapEncodeIm2col as CUTLASS reaches it: through the runtime's driver
+// entry point, not by linking libcuda. Linking both libraries loaded two
+// copies of the simulator into one process, which AddressSanitizer rightly
+// reports as a one-definition-rule violation.
+using EncodeIm2col = decltype(&::cuTensorMapEncodeIm2col);
+static EncodeIm2col encode_im2col() {
+  void* fn = nullptr;
+#if CUDART_VERSION >= 13000
+  cudaDriverEntryPointQueryResult status{};
+  CK(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeIm2col", &fn, 12000, cudaEnableDefault, &status));
+#elif CUDART_VERSION >= 12050
+  cudaDriverEntryPointQueryResult status{};
+  CK(cudaGetDriverEntryPoint("cuTensorMapEncodeIm2col", &fn, cudaEnableDefault, &status));
+#else
+  CK(cudaGetDriverEntryPoint("cuTensorMapEncodeIm2col", &fn, cudaEnableDefault));
+#endif
+  if (!fn) {
+    std::printf("FAIL: cuTensorMapEncodeIm2col is not a driver entry point\n");
+    std::exit(1);
+  }
+  return reinterpret_cast<EncodeIm2col>(fn);
+}
+
 constexpr int kC = 16;       // channels per pixel: 64 bytes of float
 constexpr int kPixels = 32;  // pixels per column: the tile's rows
 
@@ -122,7 +145,7 @@ bool run(const Conv& cv) {
     upper[1] = cv.pad_h - (cv.r - 1) * cv.dil_h;
     estr[2] = cv.stride_h;
   }
-  CK(cuTensorMapEncodeIm2col(&map, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, rank, d_in, dims, strides, lower,
+  CK(encode_im2col()(&map, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, rank, d_in, dims, strides, lower,
                              upper, kC, kPixels, estr, CU_TENSOR_MAP_INTERLEAVE_NONE,
                              CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
                              CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));

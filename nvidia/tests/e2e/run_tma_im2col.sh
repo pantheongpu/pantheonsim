@@ -22,7 +22,7 @@ fi
 nvcc_host_compiler_fix
 read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
 nvcc -std=c++17 -O1 -cudart shared -arch=compute_90a -code=compute_90a "${san_flags[@]}" \
-     "$root/nvidia/tests/e2e/tma_im2col.cu" -L"$shim" -lcuda -o "$out" \
+     "$root/nvidia/tests/e2e/tma_im2col.cu" -o "$out" \
   || { echo "FAIL: tma_im2col.cu did not build"; exit 1; }
 if ! require_shim_libs "$shim" "$out"; then exit 0; fi
 result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/h100 LD_LIBRARY_PATH="$shim" "$out" 2>&1 || true)"
