@@ -3734,9 +3734,11 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     if (d.grid_items[i] && d.groups[i] != (d.grid_items[i] + d.group_size[i] - 1) / d.group_size[i])
       throw Error::make(Err::InvalidValue, "a grid of ", d.grid_items[i], " work-items is not ", d.groups[i],
                         " work-groups of ", d.group_size[i]);
-  if (k.max_flat_workgroup_size && threads > k.max_flat_workgroup_size)
+  if (d.kernel_limits && k.max_flat_workgroup_size && threads > k.max_flat_workgroup_size)
     throw Error::make(Err::InvalidValue, "a work-group of ", threads, " work-items is past the ",
                       k.max_flat_workgroup_size, " this kernel allows");
+  if (threads > 1024)
+    throw Error::make(Err::InvalidValue, "a work-group of ", threads, " work-items is past the 1024 a CDNA work-group has");
   // What the work-group's LDS comes to: what the kernel reserved, and what
   // the launch added.
   const uint64_t group_segment = uint64_t{k.group_segment} + d.dynamic_lds;
@@ -3746,7 +3748,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
 
   // What the kernel is told about its grid, and the packet it may read it
   // from. Both are written before any wave starts.
-  if (d.kernarg) fill_hidden_arguments(d, k, mem);
+  if (d.kernarg && d.fill_hidden) fill_hidden_arguments(d, k, mem);
   uint64_t packet = 0;
   if (k.dispatch_ptr) packet = write_dispatch_packet(d, k, mem);
 

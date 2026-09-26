@@ -42,12 +42,12 @@ run() {   # run <label> <extra cflags...>
   status=$?
   echo "$out" | grep -E '^(ok|FAIL) ' | sed 's/^/      /'
   local passed; passed=$(grep -c '^ok ' <<< "$out")
-  if [[ $status != 0 ]] || grep -q '^FAIL' <<< "$out" || [[ $passed != 16 ]]; then
-    echo "FAIL  an HSA program built against $label runs: $passed of 16 (exit $status)"
+  if [[ $status != 0 ]] || grep -q '^FAIL' <<< "$out" || [[ $passed != 20 ]]; then
+    echo "FAIL  an HSA program built against $label runs: $passed of 20 (exit $status)"
     echo "$out" | grep -v '^ok ' | tail -5 | sed 's/^/      /'
     fail=1
   else
-    echo "ok    an HSA program built against $label runs: 16 of 16"
+    echo "ok    an HSA program built against $label runs: 20 of 20"
   fi
 }
 

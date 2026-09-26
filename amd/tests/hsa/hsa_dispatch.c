@@ -10,9 +10,12 @@
  * The kernels are amd/tests/data/vector_add.c's: vector_add, 256 work-items
  * a group, and reduce_sum, which reduces each group's 256 elements in LDS.
  * One line a check, "ok <what>" or "FAIL <what>". */
+#define _DEFAULT_SOURCE   /* usleep */
 #ifdef VGPU_REAL_HSA
+#include <hsa/amd_hsa_signal.h>
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
+#include <hsa/hsa_ven_amd_loader.h>
 #else
 #include "vgpu/hsa_abi.h"
 #endif
@@ -58,6 +61,7 @@ static hsa_status_t each_agent(hsa_agent_t a, void* data) {
 typedef struct {
   hsa_amd_memory_pool_t kernarg, coarse;
   int found_kernarg, found_coarse;
+  size_t group_bytes;
 } Pools;
 
 static hsa_status_t each_pool(hsa_amd_memory_pool_t p, void* data) {
@@ -66,6 +70,9 @@ static hsa_status_t each_pool(hsa_amd_memory_pool_t p, void* data) {
   bool alloc = false;
   MUST(hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &flags));
   MUST(hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED, &alloc));
+  hsa_amd_segment_t segment;
+  MUST(hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_SEGMENT, &segment));
+  if (segment == HSA_AMD_SEGMENT_GROUP) MUST(hsa_amd_memory_pool_get_info(p, HSA_AMD_MEMORY_POOL_INFO_SIZE, &pools->group_bytes));
   if (!alloc) return HSA_STATUS_SUCCESS;
   if ((flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT) && !pools->found_kernarg)
     pools->kernarg = p, pools->found_kernarg = 1;
@@ -151,6 +158,15 @@ static hsa_signal_value_t wait_zero(hsa_signal_t s) {
   return hsa_signal_wait_scacquire(s, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX, HSA_WAIT_STATE_BLOCKED);
 }
 
+static int handled;
+static hsa_signal_value_t handled_value;
+static bool on_signal(hsa_signal_value_t value, void* arg) {
+  (void)arg;
+  handled_value = value;
+  __atomic_add_fetch(&handled, 1, __ATOMIC_SEQ_CST);
+  return false;   /* once */
+}
+
 static int queue_errors;
 static hsa_status_t queue_error;
 static void on_queue_error(hsa_status_t status, hsa_queue_t* q, void* data) {
@@ -199,11 +215,12 @@ int main(int argc, char** argv) {
   hsa_agent_iterate_regions(agents.cpu, find_kernarg_region, &kernarg_region);
   check("the CPU has a kernarg pool and a region for kernel arguments",
         cpu_pools.found_kernarg && kernarg_region.handle != 0);
-  check("the GPU has a pool of its own memory", gpu_pools.found_coarse);
+  check("the GPU has a pool of its own memory, and says how much LDS a group has",
+        gpu_pools.found_coarse && gpu_pools.group_bytes == 65536);
   uint32_t access = 99;
   MUST(hsa_amd_agent_memory_pool_get_info(agents.cpu, gpu_pools.coarse, HSA_AMD_AGENT_MEMORY_POOL_INFO_ACCESS,
                                           &access));
-  check("the CPU is not given the GPU's memory by default", access == HSA_AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT);
+  check("the CPU reaches the GPU's memory only by copying", access == HSA_AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED);
 
   /* 3. The code object, loaded from a file into an executable. */
   const int fd = open(argv[1], O_RDONLY);
@@ -333,7 +350,48 @@ int main(int argc, char** argv) {
   check("a signal adds, subtracts, compares and swaps, and a wait times out",
         was == 12 && hsa_signal_load_relaxed(s) == 40 && timed == 40);
 
-  /* 9. Each GPU dispatches on its own queue, when there is more than one. */
+  /* 9. What a runtime built on this one (ROCm's HIP) needs of it: a signal
+   * handle is the address of an amd_signal_t a kernel can ring; a handler
+   * runs when a signal meets its condition; a dispatch says when it ran; an
+   * allocation says what it is; and the loader shows the host a kernel's
+   * descriptor. */
+  hsa_signal_store_relaxed(done, 7);
+  const amd_signal_t* raw = (const amd_signal_t*)(uintptr_t)done.handle;
+  const int laid_out = raw->kind == 1 && raw->value == 7;
+  hsa_signal_store_relaxed(done, 1);
+  MUST(hsa_amd_signal_async_handler(done, HSA_SIGNAL_CONDITION_EQ, 0, on_signal, NULL));
+  MUST(hsa_amd_profiling_set_profiler_enabled(q, 1));
+  dispatch(q, &add, kernarg, N, 256, done);
+  wait_zero(done);
+  for (int spins = 0; spins < 2000 && !__atomic_load_n(&handled, __ATOMIC_SEQ_CST); ++spins) usleep(1000);
+  hsa_amd_profiling_dispatch_time_t when = {0, 0};
+  MUST(hsa_amd_profiling_get_dispatch_time(gpu, done, &when));
+  check("a signal is an amd_signal_t, and its handler runs once it is met",
+        laid_out && handled == 1 && handled_value == 0);
+  check("a dispatch says when it ran", when.start > 0 && when.end >= when.start);
+  hsa_amd_pointer_info_t info;
+  memset(&info, 0, sizeof info);
+  info.size = sizeof info;
+  MUST(hsa_amd_pointer_info((char*)out + 100, &info, NULL, NULL, NULL));
+  hsa_amd_pointer_info_t sys;
+  memset(&sys, 0, sizeof sys);
+  sys.size = sizeof sys;
+  MUST(hsa_amd_pointer_info(a, &sys, NULL, NULL, NULL));
+  check("an allocation says whose it is, where it starts and how large it is",
+        info.type == HSA_EXT_POINTER_TYPE_HSA && info.agentBaseAddress == out &&
+            info.sizeInBytes == N * sizeof(float) && info.agentOwner.handle == gpu.handle &&
+            sys.type == HSA_EXT_POINTER_TYPE_HSA && sys.hostBaseAddress == a && sys.agentOwner.handle == agents.cpu.handle);
+  hsa_ven_amd_loader_1_01_pfn_t loader;
+  memset(&loader, 0, sizeof loader);
+  MUST(hsa_system_get_major_extension_table(HSA_EXTENSION_AMD_LOADER, 1, sizeof loader, &loader));
+  const void* host_kd = NULL;
+  MUST(loader.hsa_ven_amd_loader_query_host_address((const void*)(uintptr_t)sum.object, &host_kd));
+  hsa_executable_t owner = {0};
+  MUST(loader.hsa_ven_amd_loader_query_executable((const void*)(uintptr_t)sum.object, &owner));
+  check("the loader shows the host a kernel's descriptor, and whose it is",
+        host_kd && *(const uint32_t*)host_kd == sum.group_segment && owner.handle == exe.handle);
+
+  /* 10. Each GPU dispatches on its own queue, when there is more than one. */
   if (agents.gpus > 1) {
     hsa_agent_t gpu1 = agents.gpu[1];
     hsa_executable_t exe1;

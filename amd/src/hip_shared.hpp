@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "vgpu/amd_codeobject.hpp"
 #include "vgpu/memory.hpp"
@@ -29,6 +30,9 @@ MemoryManager& memory(int ordinal);
 const Loaded* load(int ordinal, const void* bytes, size_t size, std::string* why);
 void unload(const Loaded* m);
 const CodeObject& object(const Loaded* m);
+// A linked object's image as it was loaded, kept on the host: what ROCm's
+// loader answers hsa_ven_amd_loader_query_host_address with.
+const std::vector<uint8_t>& host_image(const Loaded* m);
 // Where a linked object's image is on its device; a kernel's descriptor is
 // this plus Kernel::descriptor.
 uint64_t code_base(const Loaded* m);
@@ -38,8 +42,17 @@ uint64_t code_base(const Loaded* m);
 // dimension short where the grid does not divide), with arguments the caller
 // has placed at `kernarg` (an address the device reaches). False, and why,
 // if the kernel faulted or could not start.
+// A cooperative dispatch has every work-group resident at once, so they may
+// wait on one another; the kernarg segment is used as the caller wrote it,
+// hidden arguments and all.
 bool run(int ordinal, const Loaded* m, const Kernel& k, const uint32_t grid[3], const uint32_t group_size[3],
-         uint32_t dynamic_lds, uint64_t kernarg, std::string* why);
+         uint32_t dynamic_lds, uint64_t kernarg, bool cooperative, std::string* why);
+
+// Lets device `from`'s kernels reach device `to`'s memory, as
+// hipDeviceEnablePeerAccess does.
+void allow_peer(int from, int to);
+// The device whose memory holds `address`, or -1.
+int owner(uint64_t address);
 
 // Host memory every device's kernels reach at its own address, and no longer.
 void map_host(void* p, size_t n);

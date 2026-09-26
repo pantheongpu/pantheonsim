@@ -262,6 +262,26 @@ against ROCm's `hsa.h` where that is installed, and both builds run
 allows: the last group in a dimension runs short, numbered across its own
 shape, and the kernel's `hidden_remainder` arguments say by how much.
 
+ROCm's own tools and HIP runtime run on it unmodified:
+
+- **`rocminfo`** describes every device.
+- **ROCm's `libamdhip64` (CLR)**, from releases 7.0, 7.1 and 7.2, runs hipcc-built programs with only `libhsa-runtime64` replaced (ctest `amd_hip_on_hsa`). CLR then does all of HIP itself:
+  - its copies and fills are its own kernels in AQL packets;
+  - device `printf` comes back through its hostcall listener;
+  - a cooperative launch goes to a cooperative queue;
+  - peers are granted through `hsa_amd_agents_allow_access`.
+
+That works because the runtime keeps to what ROCm's does where CLR looks:
+
+- **Signals:** a signal handle is the address of an `amd_signal_t` every device maps, so a kernel can ring it, and a host wait sees what a kernel wrote.
+- **Kernel arguments:** a packet's kernarg segment reaches the kernel as the program wrote it, hidden arguments included.
+- **Work-group limit:** a packet is held only to the hardware's work-group limit, not the kernel's metadata.
+- **Host access:** the host is never given a device's memory directly, so CLR copies instead of writing through it.
+- **Supported extras:** AMD's loader extension, barrier-value packets, asynchronous signal handlers, dispatch timestamps and `hsa_amd_pointer_info` all work.
+- **Not modelled:** images, virtual memory, IPC and SVM are refused by name.
+
+`VGPU_TRACE_HSA=1` logs what memory the program allocates, locks and registers.
+
 ## Profiling
 
 AMD's profiler, `rocprofv3`, runs unmodified on a simulated GPU. It is a front

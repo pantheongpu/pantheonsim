@@ -118,7 +118,7 @@ hsa_status_t hsa_system_get_info(hsa_system_info_t attribute, void* value);
 
 typedef enum { HSA_DEVICE_TYPE_CPU = 0, HSA_DEVICE_TYPE_GPU = 1, HSA_DEVICE_TYPE_DSP = 2 } hsa_device_type_t;
 typedef enum { HSA_AGENT_FEATURE_KERNEL_DISPATCH = 1, HSA_AGENT_FEATURE_AGENT_DISPATCH = 2 } hsa_agent_feature_t;
-typedef enum { HSA_QUEUE_TYPE_MULTI = 0, HSA_QUEUE_TYPE_SINGLE = 1 } hsa_queue_type_t;
+typedef enum { HSA_QUEUE_TYPE_MULTI = 0, HSA_QUEUE_TYPE_SINGLE = 1, HSA_QUEUE_TYPE_COOPERATIVE = 2 } hsa_queue_type_t;
 typedef uint32_t hsa_queue_type32_t;
 typedef enum {
   HSA_AGENT_INFO_NAME = 0,
@@ -454,6 +454,65 @@ hsa_status_t hsa_executable_iterate_agent_symbols(
     void* data);
 hsa_status_t hsa_executable_symbol_get_info(hsa_executable_symbol_t symbol, hsa_executable_symbol_info_t attribute,
                                             void* value);
+
+/* ---- AMD's extensions a runtime above this one uses ---------------------- */
+
+/* A signal handle is the address of this, which kernels reach (amd_hsa_signal.h). */
+typedef struct amd_signal_s {
+  int64_t kind;
+  volatile int64_t value;
+  uint64_t event_mailbox_ptr;
+  uint32_t event_id, reserved1;
+  uint64_t start_ts, end_ts;
+  uint64_t reserved2;
+  uint32_t reserved3[2];
+} amd_signal_t;
+
+typedef bool (*hsa_amd_signal_handler)(hsa_signal_value_t value, void* arg);
+hsa_status_t hsa_amd_signal_async_handler(hsa_signal_t signal, hsa_signal_condition_t cond, hsa_signal_value_t value,
+                                          hsa_amd_signal_handler handler, void* arg);
+
+typedef struct hsa_amd_profiling_dispatch_time_s {
+  uint64_t start, end;
+} hsa_amd_profiling_dispatch_time_t;
+hsa_status_t hsa_amd_profiling_set_profiler_enabled(hsa_queue_t* queue, int enable);
+hsa_status_t hsa_amd_profiling_get_dispatch_time(hsa_agent_t agent, hsa_signal_t signal,
+                                                 hsa_amd_profiling_dispatch_time_t* time);
+
+typedef enum {
+  HSA_EXT_POINTER_TYPE_UNKNOWN = 0,
+  HSA_EXT_POINTER_TYPE_HSA = 1,
+  HSA_EXT_POINTER_TYPE_LOCKED = 2
+} hsa_amd_pointer_type_t;
+typedef struct hsa_amd_pointer_info_s {
+  uint32_t size;   /* set by the caller to sizeof(hsa_amd_pointer_info_t) */
+  hsa_amd_pointer_type_t type;
+  void* agentBaseAddress;
+  void* hostBaseAddress;
+  size_t sizeInBytes;
+  void* userData;
+  hsa_agent_t agentOwner;
+  uint32_t global_flags;
+} hsa_amd_pointer_info_t;
+hsa_status_t hsa_amd_pointer_info(const void* ptr, hsa_amd_pointer_info_t* info, void* (*alloc)(size_t),
+                                  uint32_t* num_agents_accessible, hsa_agent_t** accessible);
+
+/* AMD's loader extension (hsa_ven_amd_loader.h), version 1.01's table. */
+enum { HSA_EXTENSION_AMD_LOADER = 0x201 };
+typedef struct hsa_ven_amd_loader_1_01_pfn_s {
+  hsa_status_t (*hsa_ven_amd_loader_query_host_address)(const void* device_address, const void** host_address);
+  hsa_status_t (*hsa_ven_amd_loader_query_segment_descriptors)(void* segment_descriptors,
+                                                               size_t* num_segment_descriptors);
+  hsa_status_t (*hsa_ven_amd_loader_query_executable)(const void* device_address, hsa_executable_t* executable);
+  hsa_status_t (*hsa_ven_amd_loader_executable_iterate_loaded_code_objects)(
+      hsa_executable_t executable,
+      hsa_status_t (*callback)(hsa_executable_t executable, hsa_loaded_code_object_t loaded_code_object, void* data),
+      void* data);
+  hsa_status_t (*hsa_ven_amd_loader_loaded_code_object_get_info)(hsa_loaded_code_object_t loaded_code_object,
+                                                                 int attribute, void* value);
+} hsa_ven_amd_loader_1_01_pfn_t;
+hsa_status_t hsa_system_get_major_extension_table(uint16_t extension, uint16_t version_major, size_t table_length,
+                                                  void* table);
 
 #ifdef __cplusplus
 }

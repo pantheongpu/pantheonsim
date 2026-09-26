@@ -776,6 +776,10 @@ set_tests_properties(amd_pytorch_multi_gpu PROPERTIES DEPENDS vgpuhip RUN_SERIAL
 add_test(NAME amd_hsa COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hsa.sh)
 set_tests_properties(amd_hsa PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# ROCm's own HIP runtime (CLR), unmodified, on the HSA runtime alone.
+add_test(NAME amd_hip_on_hsa COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_on_hsa.sh)
+set_tests_properties(amd_hip_on_hsa PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 add_test(NAME amd_hipcc COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc.sh)
 set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
