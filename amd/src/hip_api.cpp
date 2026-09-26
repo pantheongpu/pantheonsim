@@ -1927,7 +1927,8 @@ hipError_t hipDeviceGetAttribute(int* value, int attribute, int ordinal) {
     case A::kIsLargeBar: *value = p.isLargeBar; break;
     case A::kAsicRevision: *value = p.asicRevision; break;
     case A::kPhysicalMultiProcessorCount: *value = p.multiProcessorCount; break;
-    // Not here: images and textures (no image instructions yet), a stream
+    // Not here: images and textures -- the MI300 family has no texture units,
+    // and hipcc refuses the texture API for gfx94x and gfx950 -- a stream
     // waiting on a value in memory, fine-grained host memory.
     case A::kImageSupport:
     case A::kCanUseStreamWaitValue:
@@ -3556,6 +3557,147 @@ hipError_t hipIpcGetEventHandle(void*, hipEvent_t) {
 hipError_t hipIpcOpenEventHandle(hipEvent_t*, vgpu::amd::abi::IpcMemHandle) {
   return refused("hipIpcOpenEventHandle", "events are not shared between processes");
 }
+
+// ---- Arrays, textures and surfaces -------------------------------------------
+//
+// The GPUs modelled here (the MI300 family, gfx942 and gfx950) have no
+// texture units: hipcc refuses the texture API in their device code
+// (__HIP_NO_IMAGE_SUPPORT), and ROCm's HIP on them says image support is 0
+// and answers every call that would make an array, a texture or a surface
+// with hipErrorNotSupported. These are its answers, found by asking it
+// (ROCm's libamdhip64 on this HSA runtime, amd/tests/hipcc/textures.cpp), so
+// a program or library that calls them is told what it would be told on the
+// card, rather than failing to load for want of the symbol.
+namespace {
+hipError_t no_images(const char* name) {
+  const ApiCall api(name);
+  return record(state(), hipErrorNotSupported);
+}
+hipError_t no_such_array(const char* name) {   // a handle to what cannot exist
+  const ApiCall api(name);
+  return record(state(), hipErrorInvalidHandle);
+}
+hipError_t freeing_nothing(const char* name) {
+  const ApiCall api(name);
+  return record(state(), hipErrorInvalidValue);
+}
+hipError_t destroying(const char* name, uint64_t object) {   // none is ever made, so only 0 is fine
+  const ApiCall api(name);
+  return record(state(), object ? hipErrorInvalidValue : hipSuccess);
+}
+}  // namespace
+
+// hipChannelFormatDesc, which hipCreateChannelDesc returns by value.
+struct ChannelFormatDesc {
+  int x, y, z, w;
+  int f;
+};
+ChannelFormatDesc hipCreateChannelDesc(int x, int y, int z, int w, int f) { return {x, y, z, w, f}; }
+
+hipError_t hipDeviceGetTexture1DLinearMaxWidth(size_t* width, const void*, int device) {
+  const ApiCall api("hipDeviceGetTexture1DLinearMaxWidth");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!width) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (device < 0 || device >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
+  *width = 0;
+  return record(s, hipSuccess);
+}
+
+// What a hipcc-built program registers before main for a texture or surface
+// reference it declares: nothing to keep, since none can be bound.
+void __hipRegisterTexture(void*, void*, char*, const char*, int, int, int) {}
+void __hipRegisterSurface(void*, void*, char*, const char*, int, int) {}
+
+#define VGPU_NO_IMAGES(name) \
+  hipError_t name() { return no_images(#name); }
+#define VGPU_NO_SUCH_ARRAY(name) \
+  hipError_t name() { return no_such_array(#name); }
+#define VGPU_FREEING_NOTHING(name) \
+  hipError_t name() { return freeing_nothing(#name); }
+// Making one, and the texture-reference API, which needs a texture to bind.
+VGPU_NO_IMAGES(hipMallocArray)
+VGPU_NO_IMAGES(hipMalloc3DArray)
+VGPU_NO_IMAGES(hipArrayCreate)
+VGPU_NO_IMAGES(hipArray3DCreate)
+VGPU_NO_IMAGES(hipMallocMipmappedArray)
+VGPU_NO_IMAGES(hipMipmappedArrayCreate)
+VGPU_NO_IMAGES(hipCreateTextureObject)
+VGPU_NO_IMAGES(hipTexObjectCreate)
+VGPU_NO_IMAGES(hipCreateSurfaceObject)
+VGPU_NO_IMAGES(hipGetTextureReference)
+VGPU_NO_IMAGES(hipModuleGetTexRef)
+VGPU_NO_IMAGES(hipBindTexture)
+VGPU_NO_IMAGES(hipBindTexture2D)
+VGPU_NO_IMAGES(hipBindTextureToArray)
+VGPU_NO_IMAGES(hipBindTextureToMipmappedArray)
+VGPU_NO_IMAGES(hipUnbindTexture)
+VGPU_NO_IMAGES(hipGetTextureAlignmentOffset)
+VGPU_NO_IMAGES(hipGetMipmappedArrayLevel)
+VGPU_NO_IMAGES(hipMipmappedArrayGetLevel)
+VGPU_NO_IMAGES(hipMemMapArrayAsync)
+VGPU_NO_IMAGES(hipTexRefGetAddress)
+VGPU_NO_IMAGES(hipTexRefGetAddressMode)
+VGPU_NO_IMAGES(hipTexRefGetArray)
+VGPU_NO_IMAGES(hipTexRefGetBorderColor)
+VGPU_NO_IMAGES(hipTexRefGetFilterMode)
+VGPU_NO_IMAGES(hipTexRefGetFlags)
+VGPU_NO_IMAGES(hipTexRefGetFormat)
+VGPU_NO_IMAGES(hipTexRefGetMaxAnisotropy)
+VGPU_NO_IMAGES(hipTexRefGetMipMappedArray)
+VGPU_NO_IMAGES(hipTexRefGetMipmapFilterMode)
+VGPU_NO_IMAGES(hipTexRefGetMipmapLevelBias)
+VGPU_NO_IMAGES(hipTexRefGetMipmapLevelClamp)
+VGPU_NO_IMAGES(hipTexRefSetAddress)
+VGPU_NO_IMAGES(hipTexRefSetAddress2D)
+VGPU_NO_IMAGES(hipTexRefSetAddressMode)
+VGPU_NO_IMAGES(hipTexRefSetArray)
+VGPU_NO_IMAGES(hipTexRefSetBorderColor)
+VGPU_NO_IMAGES(hipTexRefSetFilterMode)
+VGPU_NO_IMAGES(hipTexRefSetFlags)
+VGPU_NO_IMAGES(hipTexRefSetFormat)
+VGPU_NO_IMAGES(hipTexRefSetMaxAnisotropy)
+VGPU_NO_IMAGES(hipTexRefSetMipmapFilterMode)
+VGPU_NO_IMAGES(hipTexRefSetMipmapLevelBias)
+VGPU_NO_IMAGES(hipTexRefSetMipmapLevelClamp)
+VGPU_NO_IMAGES(hipTexRefSetMipmappedArray)
+// Graphics and external-memory interop, which has no graphics API to share with.
+VGPU_NO_IMAGES(hipGraphicsSubResourceGetMappedArray)
+VGPU_NO_IMAGES(hipImportExternalMemory)
+VGPU_NO_IMAGES(hipImportExternalSemaphore)
+VGPU_NO_IMAGES(hipWaitExternalSemaphoresAsync)
+// Asking about, or copying to or from, an array: there is none to name.
+VGPU_NO_SUCH_ARRAY(hipGetChannelDesc)
+VGPU_NO_SUCH_ARRAY(hipArrayGetDescriptor)
+VGPU_NO_SUCH_ARRAY(hipArray3DGetDescriptor)
+VGPU_NO_SUCH_ARRAY(hipArrayGetInfo)
+VGPU_NO_SUCH_ARRAY(hipMemcpyToArray)
+VGPU_NO_SUCH_ARRAY(hipMemcpyFromArray)
+VGPU_NO_SUCH_ARRAY(hipMemcpyFromArray_spt)
+VGPU_NO_SUCH_ARRAY(hipMemcpy2DToArray)
+VGPU_NO_SUCH_ARRAY(hipMemcpy2DToArray_spt)
+VGPU_NO_SUCH_ARRAY(hipMemcpy2DToArrayAsync)
+VGPU_NO_SUCH_ARRAY(hipMemcpy2DToArrayAsync_spt)
+VGPU_NO_SUCH_ARRAY(hipMemcpy2DFromArray)
+VGPU_NO_SUCH_ARRAY(hipMemcpy2DFromArray_spt)
+VGPU_NO_SUCH_ARRAY(hipMemcpy2DFromArrayAsync)
+VGPU_NO_SUCH_ARRAY(hipMemcpy2DFromArrayAsync_spt)
+VGPU_NO_SUCH_ARRAY(hipMemcpy2DArrayToArray)
+VGPU_NO_SUCH_ARRAY(hipGetTextureObjectResourceDesc)
+VGPU_NO_SUCH_ARRAY(hipGetTextureObjectResourceViewDesc)
+VGPU_NO_SUCH_ARRAY(hipGetTextureObjectTextureDesc)
+VGPU_NO_SUCH_ARRAY(hipTexObjectGetResourceDesc)
+VGPU_NO_SUCH_ARRAY(hipTexObjectGetResourceViewDesc)
+VGPU_NO_SUCH_ARRAY(hipTexObjectGetTextureDesc)
+// Freeing one.
+VGPU_FREEING_NOTHING(hipFreeArray)
+VGPU_FREEING_NOTHING(hipArrayDestroy)
+VGPU_FREEING_NOTHING(hipFreeMipmappedArray)
+VGPU_FREEING_NOTHING(hipMipmappedArrayDestroy)
+hipError_t hipDestroyTextureObject(uint64_t object) { return destroying("hipDestroyTextureObject", object); }
+hipError_t hipTexObjectDestroy(uint64_t object) { return destroying("hipTexObjectDestroy", object); }
+hipError_t hipDestroySurfaceObject(uint64_t object) { return destroying("hipDestroySurfaceObject", object); }
 
 }  // extern "C"
 

@@ -65,6 +65,10 @@ for lib in "${libs[@]}"; do
     "after the grid barrier, 16 of 16 groups saw every group's value" "$(grep -o '^after the grid barrier.*' <<< "$out")"
   out=$(run "$lib" fp8)
   expect "  the 8-bit float conversions are right, all 16 kinds" "16" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out")"
+  out=$(run "$lib" textures)
+  expect "  the texture API's answers are the ones the simulator gives" "same" \
+    "$(diff -q <(echo "$out") "$bin/rocm/textures.expected" >/dev/null && echo same ||
+       diff <(echo "$out") "$bin/rocm/textures.expected" | head -4 | tr '\n' ' ')"
   # The last of streams' checks is a kernel that faults, which ROCm's HIP
   # answers by ending the program, as it does on a card; the six before it
   # are what is checked here.

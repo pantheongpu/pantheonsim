@@ -167,4 +167,10 @@ done
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)
 expect "a device of another target is refused by name" "yes" \
   "$(grep -q 'carries device code for gfx942, and this device is gfx950' <<< "$out" && echo yes || echo no)"
+# The texture API on a GPU with no texture units: what ROCm's HIP answers,
+# line for line (the same file run_hip_on_hsa.sh holds ROCm's HIP to).
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/textures.gfx942" 2>&1)
+expect "the texture API answers as ROCm's HIP does on a GPU without texture units" "same" \
+  "$(diff -q <(echo "$out") "$(dirname "$exe")/rocm/textures.expected" >/dev/null && echo same ||
+     diff <(echo "$out") "$(dirname "$exe")/rocm/textures.expected" | head -4 | tr '\n' ' ')"
 exit $fail
