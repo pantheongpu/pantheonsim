@@ -866,6 +866,38 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // run: what a card rounds their inputs to is not modelled.
       {{Enc::Vop3p, 0x3e}, {"v_mfma_f32_16x16x8_xf32", 4, 3, 2, 2, 4}},
       {{Enc::Vop3p, 0x3f}, {"v_mfma_f32_32x32x4_xf32", 16, 3, 2, 2, 16}},
+      // The sparse matrix instructions: A 2:4 sparse along K, its non-zero
+      // values packed; B dense; the destination the accumulator too; the
+      // third source the register of indices that says where A's values go.
+      {{Enc::Vop3p, 0x62}, {"v_smfmac_f32_16x16x32_f16", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x64}, {"v_smfmac_f32_32x32x16_f16", 16, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x66}, {"v_smfmac_f32_16x16x32_bf16", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x68}, {"v_smfmac_f32_32x32x16_bf16", 16, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x6a}, {"v_smfmac_i32_16x16x64_i8", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x6c}, {"v_smfmac_i32_32x32x32_i8", 16, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x78}, {"v_smfmac_f32_16x16x64_bf8_bf8", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x79}, {"v_smfmac_f32_16x16x64_bf8_fp8", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x7a}, {"v_smfmac_f32_16x16x64_fp8_bf8", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x7b}, {"v_smfmac_f32_16x16x64_fp8_fp8", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x7c}, {"v_smfmac_f32_32x32x32_bf8_bf8", 16, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x7d}, {"v_smfmac_f32_32x32x32_bf8_fp8", 16, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x7e}, {"v_smfmac_f32_32x32x32_fp8_bf8", 16, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x7f}, {"v_smfmac_f32_32x32x32_fp8_fp8", 16, 3, 2, 4, 1}},
+      // gfx950's, with K doubled.
+      {{Enc::Vop3p, 0x5a}, {"v_smfmac_f32_16x16x64_f16", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x5b}, {"v_smfmac_f32_32x32x32_f16", 16, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x39}, {"v_smfmac_f32_16x16x64_bf16", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x46}, {"v_smfmac_f32_32x32x32_bf16", 16, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x3a}, {"v_smfmac_i32_16x16x128_i8", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x47}, {"v_smfmac_i32_32x32x64_i8", 16, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x3b}, {"v_smfmac_f32_16x16x128_bf8_bf8", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x3c}, {"v_smfmac_f32_16x16x128_bf8_fp8", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x3d}, {"v_smfmac_f32_16x16x128_fp8_bf8", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x43}, {"v_smfmac_f32_16x16x128_fp8_fp8", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x4b}, {"v_smfmac_f32_32x32x64_bf8_bf8", 16, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x4e}, {"v_smfmac_f32_32x32x64_bf8_fp8", 16, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x4f}, {"v_smfmac_f32_32x32x64_fp8_bf8", 16, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x53}, {"v_smfmac_f32_32x32x64_fp8_fp8", 16, 3, 4, 8, 1}},
       {{Enc::Vop3p, 0x58}, {"v_accvgpr_read_b32", 1, 1}},
       {{Enc::Vop3p, 0x59}, {"v_accvgpr_write_b32", 1, 1}},
     };
@@ -964,6 +996,11 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table_gfx90a() {
     for (uint32_t op : {0x2d, 0x2e, 0x35, 0x36, 0x37, 0x38, 0x3e, 0x3f, 0x56, 0x57, 0x5d, 0x5e, 0x5f, 0x60, 0x61,
                         0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77})
       m.erase({Enc::Vop3p, op});
+    // Nor are the sparse ones, some of whose numbers gfx90a gives other
+    // instructions (set below).
+    for (auto it = m.begin(); it != m.end();)
+      it = it->first.first == Enc::Vop3p && std::string(it->second.name).rfind("v_smfmac", 0) == 0 ? m.erase(it)
+                                                                                                 : std::next(it);
     // Its int8 forms: K of 8 and 16, four bytes a lane.
     set(Enc::Vop3p, 0x54, {"v_mfma_i32_32x32x8_i8", 16, 3, 1, 1, 16});
     set(Enc::Vop3p, 0x55, {"v_mfma_i32_16x16x16_i8", 4, 3, 1, 1, 4});
@@ -1340,6 +1377,25 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     // their own way: which of the accumulation registers the result and the
     // addend live in, and three ways of broadcasting parts of the sources,
     // which are refused rather than guessed at.
+    if (in.name.rfind("v_smfmac", 0) == 0) {
+      // CBSZ and ABID only choose the set of indices; ACC_CD puts the
+      // destination (and so the accumulator) in the accumulation registers,
+      // and the index register is always an ordinary one.
+      in.clamp = false;
+      const uint32_t cbsz = (w0 >> 8) & 0x7, abid = (w0 >> 11) & 0xF, acc_cd = (w0 >> 15) & 1;
+      const uint32_t acc = (w1 >> 27) & 0x3, blgp = (w1 >> 29) & 0x7;
+      if (blgp) throw Error::make(Err::Unsupported, in.name, " with BLGP ", blgp, ", which it does not have");
+      in.cbsz = static_cast<uint8_t>(cbsz);
+      in.abid = static_cast<uint8_t>(abid);
+      in.dst.push_back(vgpr(w0 & 0xFF, s.dst_width));
+      if (acc_cd) in.dst[0].kind = OperandKind::Agpr;
+      for (uint32_t k = 0; k < 3; ++k) {
+        Operand o = take((w1 >> (9 * k)) & 0x1FF, s.src_width(k));
+        if (k < 2 && ((acc >> k) & 1) && o.kind == OperandKind::Vgpr) o.kind = OperandKind::Agpr;
+        in.src.push_back(o);
+      }
+      return in;
+    }
     if (in.name.rfind("v_mfma", 0) == 0) {
       in.clamp = false;
       const uint32_t cbsz = (w0 >> 8) & 0x7, abid = (w0 >> 11) & 0xF, acc_cd = (w0 >> 15) & 1;
@@ -1770,6 +1826,7 @@ std::string to_text(const Inst& i) {
     s += " op_sel_hi:[" + std::to_string(a >> 1) + "," + std::to_string(b >> 1) + ",0]";
   }
   if (i.cbsz) s += " cbsz:" + std::to_string(i.cbsz);
+  if (i.abid) s += " abid:" + std::to_string(i.abid);
   if (i.blgp) s += " blgp:" + std::to_string(i.blgp);
   if (i.bitop3) {
     char t[24];

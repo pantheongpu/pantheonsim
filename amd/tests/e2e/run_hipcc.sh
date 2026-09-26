@@ -166,6 +166,21 @@ expect "v_prng_b32 steps the ISA's LFSR" "v_prng_b32: 0 of 64 wrong" "$(grep -o 
 expect "v_permlane32_swap_b32 trades the halves of two registers" "v_permlane32_swap_b32: 0 of 128 wrong" \
   "$(grep -o '^v_permlane32_swap_b32:.*' <<< "$out")"
 
+# The sparse matrix instructions (v_smfmac_*): A 2:4 sparse, its indices'
+# set chosen by CBSZ and ABID, against what the CDNA3 and CDNA4 ISA guides
+# say they compute (hipcc/smfmac.cpp) -- gfx942's on an MI300X, gfx950's (and
+# some of gfx942's, with the OCP 8-bit floats) on an MI350X.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/smfmac.gfx942" 2>&1)
+status=$?
+expect "the gfx942 sparse matrix program runs to the end" "0" "$status"
+expect "each gfx942 sparse product is what the ISA says" "12 of 12" \
+  "$(grep -c '^[fi]32_.* cbsz:.*: 0 of [0-9]* wrong$' <<< "$out") of 12"
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/smfmac.gfx950" 2>&1)
+status=$?
+expect "the gfx950 sparse matrix program runs to the end" "0" "$status"
+expect "each gfx950 sparse product is what the ISA says" "22 of 22" \
+  "$(grep -c '^[fi]32_.* cbsz:.*: 0 of [0-9]* wrong$' <<< "$out") of 22"
+
 # Streams that run at once, as a card's do (hipcc/streams.cpp). Each waiting
 # kernel gives up after a bounded time, so a runtime that ran the streams one
 # after another fails these rather than hanging.

@@ -3465,6 +3465,55 @@ struct Machine {
     if (op == "v_mfma_f32_32x32x8_bf16"_op) return &bf16_32x32x8;
     if (op == "v_mfma_i32_32x32x16_i8"_op) return &i8_32x32x16;
     if (op == "v_mfma_i32_16x16x32_i8"_op) return &i8_16x16x32;
+    // The sparse forms, by the dense product each works out: A 2:4 sparse
+    // along the K here, the lanes and output placed as a dense one's.
+    static const MatrixShape f8_16x16x64[4] = {{16, 16, 64, 1, 'g', 'f', 'g'},
+                                               {16, 16, 64, 1, 'g', 'f', 'e'},
+                                               {16, 16, 64, 1, 'e', 'f', 'g'},
+                                               {16, 16, 64, 1, 'e', 'f', 'e'}},
+                             f8_32x32x32[4] = {{32, 32, 32, 1, 'g', 'f', 'g'},
+                                               {32, 32, 32, 1, 'g', 'f', 'e'},
+                                               {32, 32, 32, 1, 'e', 'f', 'g'},
+                                               {32, 32, 32, 1, 'e', 'f', 'e'}},
+                             f8_16x16x128[4] = {{16, 16, 128, 1, 'g', 'f', 'g'},
+                                                {16, 16, 128, 1, 'g', 'f', 'e'},
+                                                {16, 16, 128, 1, 'e', 'f', 'g'},
+                                                {16, 16, 128, 1, 'e', 'f', 'e'}},
+                             f8_32x32x64[4] = {{32, 32, 64, 1, 'g', 'f', 'g'},
+                                               {32, 32, 64, 1, 'g', 'f', 'e'},
+                                               {32, 32, 64, 1, 'e', 'f', 'g'},
+                                               {32, 32, 64, 1, 'e', 'f', 'e'}},
+                             f16_16x16x64{16, 16, 64, 1, 'h', 'f'}, f16_32x32x32{32, 32, 32, 1, 'h', 'f'},
+                             bf16_16x16x64{16, 16, 64, 1, 'b', 'f'}, bf16_32x32x32{32, 32, 32, 1, 'b', 'f'},
+                             i8_16x16x128{16, 16, 128, 1, 'c', 'i'}, i8_32x32x64{32, 32, 64, 1, 'c', 'i'};
+    if (op == "v_smfmac_f32_16x16x32_f16"_op) return &f16_16x16x32;
+    if (op == "v_smfmac_f32_32x32x16_f16"_op) return &f16_32x32x16;
+    if (op == "v_smfmac_f32_16x16x32_bf16"_op) return &bf16_16x16x32;
+    if (op == "v_smfmac_f32_32x32x16_bf16"_op) return &bf16_32x32x16;
+    if (op == "v_smfmac_i32_16x16x64_i8"_op) return &i8_16x16x64;
+    if (op == "v_smfmac_i32_32x32x32_i8"_op) return &i8_32x32x32;
+    if (op == "v_smfmac_f32_16x16x64_bf8_bf8"_op) return &f8_16x16x64[0];
+    if (op == "v_smfmac_f32_16x16x64_bf8_fp8"_op) return &f8_16x16x64[1];
+    if (op == "v_smfmac_f32_16x16x64_fp8_bf8"_op) return &f8_16x16x64[2];
+    if (op == "v_smfmac_f32_16x16x64_fp8_fp8"_op) return &f8_16x16x64[3];
+    if (op == "v_smfmac_f32_32x32x32_bf8_bf8"_op) return &f8_32x32x32[0];
+    if (op == "v_smfmac_f32_32x32x32_bf8_fp8"_op) return &f8_32x32x32[1];
+    if (op == "v_smfmac_f32_32x32x32_fp8_bf8"_op) return &f8_32x32x32[2];
+    if (op == "v_smfmac_f32_32x32x32_fp8_fp8"_op) return &f8_32x32x32[3];
+    if (op == "v_smfmac_f32_16x16x64_f16"_op) return &f16_16x16x64;
+    if (op == "v_smfmac_f32_32x32x32_f16"_op) return &f16_32x32x32;
+    if (op == "v_smfmac_f32_16x16x64_bf16"_op) return &bf16_16x16x64;
+    if (op == "v_smfmac_f32_32x32x32_bf16"_op) return &bf16_32x32x32;
+    if (op == "v_smfmac_i32_16x16x128_i8"_op) return &i8_16x16x128;
+    if (op == "v_smfmac_i32_32x32x64_i8"_op) return &i8_32x32x64;
+    if (op == "v_smfmac_f32_16x16x128_bf8_bf8"_op) return &f8_16x16x128[0];
+    if (op == "v_smfmac_f32_16x16x128_bf8_fp8"_op) return &f8_16x16x128[1];
+    if (op == "v_smfmac_f32_16x16x128_fp8_bf8"_op) return &f8_16x16x128[2];
+    if (op == "v_smfmac_f32_16x16x128_fp8_fp8"_op) return &f8_16x16x128[3];
+    if (op == "v_smfmac_f32_32x32x64_bf8_bf8"_op) return &f8_32x32x64[0];
+    if (op == "v_smfmac_f32_32x32x64_bf8_fp8"_op) return &f8_32x32x64[1];
+    if (op == "v_smfmac_f32_32x32x64_fp8_bf8"_op) return &f8_32x32x64[2];
+    if (op == "v_smfmac_f32_32x32x64_fp8_fp8"_op) return &f8_32x32x64[3];
     if (op == "v_mfma_f32_4x4x4_16b_f16"_op) return &f16_4x4x4_16b;
     if (op == "v_mfma_f32_4x4x4_16b_bf16"_op) return &bf16_4x4x4_16b;
     if (op == "v_mfma_f32_16x16x4_4b_f16"_op) return &f16_16x16x4_4b;
@@ -3496,6 +3545,9 @@ struct Machine {
         matrix_shape(OpName(in.scaled ? "v_mfma_" + in.name.substr(std::string("v_mfma_scale_").size()) : in.name));
     if (!shape) throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
     const MatrixShape& s = *shape;
+    // The sparse forms: the destination is the accumulator too, and the
+    // third source the indices of A's values.
+    const bool sparse = in.name.rfind("v_smfmac", 0) == 0;
     if (w.exec != ~uint64_t{0})
       throw Error::make(Err::Unsupported, in.name, " with lanes switched off (EXEC ", w.exec,
                         "), which this does not model");
@@ -3559,13 +3611,23 @@ struct Machine {
       const double sa = in.scaled ? scale_of(in.src[3], in.scale_sel & 3, lane) : 1.0;
       const double sb = in.scaled ? scale_of(in.src[4], in.scale_sel >> 2, lane) : 1.0;
       for (uint32_t e = 0; e < per_lane; ++e) {
-        A(bl, within % s.m, g * per_lane + e) = value(in.src[0], s.in, e, lane) * sa;
+        if (!sparse) A(bl, within % s.m, g * per_lane + e) = value(in.src[0], s.in, e, lane) * sa;
         B(bl, g * per_lane + e, within % s.n) = value(in.src[1], s.in_b ? s.in_b : s.in, e, lane) * sb;
+      }
+      if (sparse) {
+        // A lane's A holds two values of each four along K, packed; the
+        // index register says, two bits a value, which of the four each is.
+        // A lane's run of K has one bit of indices a value, so a register
+        // holds 32 / per_lane sets of them: CBSZ zero lets ABID pick one.
+        const uint32_t sets = 32 / per_lane, set = (in.cbsz == 0 ? in.abid : 0u) % sets;
+        const uint32_t idx = reg(in.src[2], 0, lane) >> (set * per_lane);
+        for (uint32_t v = 0; v < per_lane / 2; ++v)
+          A(bl, within % s.m, g * per_lane + 4 * (v / 2) + ((idx >> (2 * v)) & 3)) = value(in.src[0], s.in, v, lane);
       }
       for (uint32_t r = 0; r < outs; ++r) {
         uint32_t ob = 0, row = 0;
         out_place(s, lane, r, &ob, &row);
-        C(ob, row, lane % s.n) = value(in.src[2], s.out, r, lane);
+        C(ob, row, lane % s.n) = value(sparse ? in.dst[0] : in.src[2], s.out, r, lane);
       }
     }
     for (uint32_t lane = 0; lane < kLanes; ++lane)
@@ -3638,7 +3700,7 @@ struct Machine {
         const Inst& x = w.gpr_idx ? (indexed = in, index_gprs(w, &indexed), indexed) : in;
         // A comparison in its long form is still a comparison: it writes a
         // mask of the lanes that passed, not a value per lane.
-        if (x.name.rfind("v_mfma", 0) == 0) {
+        if (x.name.rfind("v_mfma", 0) == 0 || x.name.rfind("v_smfmac", 0) == 0) {
           ++n.mfma;
           matrix_multiply(w, x);
         } else if (x.name.rfind("v_cmp", 0) == 0) compare(w, x);

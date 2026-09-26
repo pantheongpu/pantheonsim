@@ -1556,3 +1556,22 @@ D1150071 00010371	v_xor_b32_e64 v113, v113, 1
 D1150007 00007107	v_xor_b32_e64 v7, v7, s56
 2A527CF9 0406062A	v_xor_b32_sdwa v41, v42, v62 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_0
 2A6464F9 0C060615	v_xor_b32_sdwa v50, v21, sext(v50) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_0
+# The sparse matrix instructions, which no library here uses, as LLVM's assembler writes them.
+D3E20014 04060D02	v_smfmac_f32_16x16x32_f16 v[20:23], v[2:3], v[6:9], v1
+D3E29900 14F26528	v_smfmac_f32_16x16x32_f16 a[0:3], v[40:41], a[50:53], v60 cbsz:1 abid:3
+D3E49900 14F26528	v_smfmac_f32_32x32x16_f16 a[0:15], v[40:41], a[50:53], v60 cbsz:1 abid:3
+D3E40808 0C0E1904	v_smfmac_f32_32x32x16_f16 v[8:23], a[4:5], v[12:15], v3 abid:1
+D3E60808 0C0E1904	v_smfmac_f32_16x16x32_bf16 v[8:11], a[4:5], v[12:15], v3 abid:1
+D3E60014 04060D02	v_smfmac_f32_16x16x32_bf16 v[20:23], v[2:3], v[6:9], v1
+D3E80014 04060D02	v_smfmac_f32_32x32x16_bf16 v[20:35], v[2:3], v[6:9], v1
+D3E89900 14F26528	v_smfmac_f32_32x32x16_bf16 a[0:15], v[40:41], a[50:53], v60 cbsz:1 abid:3
+D3EA8900 14F26528	v_smfmac_i32_16x16x64_i8 a[0:3], v[40:41], a[50:53], v60 cbsz:1 abid:1
+D3EC0808 0C0E1904	v_smfmac_i32_32x32x32_i8 v[8:23], a[4:5], v[12:15], v3 abid:1
+D3F80014 04060D02	v_smfmac_f32_16x16x64_bf8_bf8 v[20:23], v[2:3], v[6:9], v1
+D3F98900 14F26528	v_smfmac_f32_16x16x64_bf8_fp8 a[0:3], v[40:41], a[50:53], v60 cbsz:1 abid:1
+D3FA0808 0C0E1904	v_smfmac_f32_16x16x64_fp8_bf8 v[8:11], a[4:5], v[12:15], v3 abid:1
+D3FB0014 04060D02	v_smfmac_f32_16x16x64_fp8_fp8 v[20:23], v[2:3], v[6:9], v1
+D3FC8900 14F26528	v_smfmac_f32_32x32x32_bf8_bf8 a[0:15], v[40:41], a[50:53], v60 cbsz:1 abid:1
+D3FD0808 0C0E1904	v_smfmac_f32_32x32x32_bf8_fp8 v[8:23], a[4:5], v[12:15], v3 abid:1
+D3FE0014 04060D02	v_smfmac_f32_32x32x32_fp8_bf8 v[20:35], v[2:3], v[6:9], v1
+D3FF8900 14F26528	v_smfmac_f32_32x32x32_fp8_fp8 a[0:15], v[40:41], a[50:53], v60 cbsz:1 abid:1
