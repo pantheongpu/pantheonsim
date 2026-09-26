@@ -1054,6 +1054,14 @@ set_tests_properties(e2e_texture_filtering PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
 
+# Layered (1D, 2D) and cubemap (plain and layered) textures, and layered
+# surfaces, compared bit for bit with results recorded on an RTX 3060.
+add_test(NAME e2e_texture_layers COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_layers.sh)
+set_tests_properties(e2e_texture_layers PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
 # A grid-wide barrier through cooperative_groups, unmodified. Checks the
 # barrier holds, that a grid too large to be resident is refused rather than
 # hung, and that the same kernel launched ordinarily fails loudly.

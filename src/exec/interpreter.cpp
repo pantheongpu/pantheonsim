@@ -4663,6 +4663,11 @@ class Interpreter {
       else { *lo = tex_round_half_up(int64_t{total} * (256 - frac), 256); *hi = total - *lo; }
     };
     for (int i = 0; i < 8; ++i) w[i] = 0;
+    if (dims == 1) {
+      w[0] = 256 - f[0];
+      w[1] = f[0];
+      return;
+    }
     const int zslices = dims == 3 ? 2 : 1;
     for (int dz = 0; dz < zslices; ++dz) {
       const int tz = dims == 3 ? (dz ? f[2] : 256 - f[2]) : 256;
@@ -4736,7 +4741,7 @@ class Interpreter {
   }
 
   void tex_linear(const Instr& ins, uint32_t lane, const TextureDesc& d, uint32_t dims,
-                  const float coord[3], uint32_t out[4]) {
+                  const float coord[3], uint32_t out[4], bool true_1d = false) {
     // The formats the measured rules cover.
     const uint32_t bits = d.channel_bits[0];
     const bool is_float = d.kind == ChannelKind::Float && (bits == 32 || bits == 16);
@@ -4756,8 +4761,9 @@ class Interpreter {
         ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
                  "linear filtering of a texture whose channels differ in width");
 
-    // A 1D texture filters as 2D, height 1, at y = 0.
-    const uint32_t fdims = dims == 1 ? 2 : dims;
+    // A 1D texture filters as 2D, height 1, at y = 0 -- all but a layer of a
+    // 1D layered texture, which filters as 1D.
+    const uint32_t fdims = dims == 1 && !true_1d ? 2 : dims;
     const uint32_t size[3] = {d.width, dims == 1 ? 1u : d.height, d.depth};
     int base[3] = {0, 0, 0}, frac[3] = {0, 0, 0};
     for (uint32_t i = 0; i < fdims; ++i) {
@@ -4779,7 +4785,7 @@ class Interpreter {
     const uint64_t plane = row * (d.height ? d.height : 1);
     ExactSum fsum[4];
     int64_t isum[4] = {0, 0, 0, 0};
-    for (int k = 0; k < (fdims == 3 ? 8 : 4); ++k) {
+    for (int k = 0; k < (fdims == 3 ? 8 : fdims == 2 ? 4 : 2); ++k) {
       if (w[k] == 0) continue;
       uint32_t idx[3] = {0, 0, 0};
       bool inside = true;
@@ -4823,45 +4829,104 @@ class Interpreter {
     }
   }
 
+  // The texture a layered or cubemap fetch actually reads: one layer, or one
+  // face, as an ordinary 1D or 2D texture. Measured on an RTX 3060: the layer
+  // (and a layered cubemap's cubemap) index is unsigned and an index past the
+  // end -- a negative one included -- reads the last; a cube direction picks
+  // the face of its largest-magnitude axis, ties going to z, then y, then x,
+  // with the minor axes from the CUDA programming guide's table and (s/m+1)/2
+  // as the face coordinate; and filtering stays inside the face, under the
+  // texture's address mode.
+  static uint64_t tex_slice_bytes(const TextureDesc& d) {
+    const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
+    return row * (d.height ? d.height : 1);
+  }
+
   void exec_tex(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTex& op, Mask m) {
     Lanes _s_obj;
     const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
-    std::array<Lanes, 3> coord;
-    std::array<Lanes, 3> coord_scratch;
-    for (uint32_t i = 0; i < op.dims; ++i)
+    const bool indexed = op.geom == TexGeom::A1D || op.geom == TexGeom::A2D || op.geom == TexGeom::ACube;
+    const bool cube = op.geom == TexGeom::Cube || op.geom == TexGeom::ACube;
+    const uint32_t first = indexed ? 1 : 0;
+    std::array<Lanes, 4> coord;
+    std::array<Lanes, 4> coord_scratch;
+    for (uint32_t i = 0; i < op.dims + first; ++i)
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
 
     std::array<Lanes, 4> out;
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Texture);
-      if (d.filter == TexFilter::Linear) {
+      const bool want_layers = indexed, want_cube = cube;
+      if ((d.layers != 0) != want_layers || d.cubemap != want_cube)
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                 std::string("the fetch's geometry does not match the texture: the texture is ") +
+                     (d.cubemap ? (d.layers ? "a layered cubemap" : "a cubemap")
+                                : (d.layers ? "layered" : "neither layered nor a cubemap")));
+      TextureDesc v = d;
+      uint32_t dims = op.dims;
+      bool true_1d = false;
+      float cf[3] = {0, 0, 0};
+      int64_t ci[3] = {0, 0, 0};
+      for (uint32_t i = 0; i < op.dims; ++i) {
+        cf[i] = f32(coord[first + i][lane]);
+        ci[i] = static_cast<int32_t>(coord[first + i][lane]);
+      }
+      if (indexed) {
+        const uint64_t index = static_cast<uint32_t>(coord[0][lane]);
+        const uint64_t layer = std::min<uint64_t>(index, d.layers - 1);
+        v.base += layer * (cube ? 6 : 1) * tex_slice_bytes(d);
+        v.layers = 0;
+        if (op.geom == TexGeom::A1D) {
+          true_1d = true;   // a layer of a 1D layered texture filters as 1D
+          v.height = 0;
+        }
+      }
+      if (cube) {
+        const float x = cf[0], y = cf[1], z = cf[2];
+        const float ax = std::fabs(x), ay = std::fabs(y), az = std::fabs(z);
+        int face;
+        float sc, tc, ma;
+        if (az >= ax && az >= ay) { face = z >= 0 ? 4 : 5; sc = z >= 0 ? x : -x; tc = -y; ma = az; }
+        else if (ay >= ax) { face = y >= 0 ? 2 : 3; sc = x; tc = y >= 0 ? z : -z; ma = ay; }
+        else { face = x >= 0 ? 0 : 1; sc = x >= 0 ? -z : z; tc = -y; ma = ax; }
+        v.base += static_cast<uint64_t>(face) * tex_slice_bytes(d);
+        v.cubemap = false;
+        v.normalized_coords = true;
+        // Point sampling clamps to the face whatever the address mode; linear
+        // filtering applies the mode inside the face -- wrap takes the texel
+        // from the face's far edge, border blends in zero (measured).
+        if (v.filter != TexFilter::Linear)
+          for (auto& a : v.address) a = TexAddress::Clamp;
+        cf[0] = (sc / ma + 1.0f) * 0.5f;
+        cf[1] = (tc / ma + 1.0f) * 0.5f;
+        dims = 2;
+      }
+      if (v.filter == TexFilter::Linear) {
         if (!op.ctype.is_float())
           ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
                    "linear filtering with integer coordinates");
-        float c[3] = {0, 0, 0};
-        for (uint32_t i = 0; i < op.dims; ++i) c[i] = f32(coord[i][lane]);
         uint32_t r[4];
-        tex_linear(ins, lane, d, op.dims, c, r);
+        tex_linear(ins, lane, v, dims, cf, r, true_1d);
         for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = r[ch];
         continue;
       }
 
-      const uint32_t size[3] = {d.width, d.height, d.depth};
+      const uint32_t size[3] = {v.width, v.height, v.depth};
       bool inside = true;
       uint32_t idx[3] = {0, 0, 0};
-      for (uint32_t i = 0; i < op.dims; ++i) {
+      for (uint32_t i = 0; i < dims; ++i) {
         int64_t c;
         if (op.ctype.is_float()) {
-          float f = f32(coord[i][lane]);
-          if (d.normalized_coords) f *= static_cast<float>(size[i]);
+          float f = cf[i];
+          if (v.normalized_coords) f *= static_cast<float>(size[i]);
           // Point sampling takes the texel the coordinate falls in. CUDA's
           // sampled coordinates are texel-centred, so x+0.5 addresses texel x.
           c = static_cast<int64_t>(std::floor(f));
         } else {
-          c = static_cast<int64_t>(static_cast<int32_t>(coord[i][lane]));
+          c = ci[i];
         }
-        if (!wrap_coord(effective_address(d, i), c, size[i], &idx[i])) { inside = false; break; }
+        if (!wrap_coord(effective_address(v, i), c, size[i], &idx[i])) { inside = false; break; }
       }
 
       if (!inside) {
@@ -4870,11 +4935,11 @@ class Interpreter {
         for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = 0;
         continue;
       }
-      const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
-      const uint64_t plane = row * (d.height ? d.height : 1);
-      const uint64_t addr = d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes;
+      const uint64_t row = v.pitch_bytes ? v.pitch_bytes : uint64_t{v.width} * v.texel_bytes;
+      const uint64_t plane = row * (v.height ? v.height : 1);
+      const uint64_t addr = v.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * v.texel_bytes;
       for (uint32_t ch = 0; ch < 4; ++ch)
-        out[ch][lane] = convert_channel(d, ch, texel_channel_bits(d, addr, ch, ins, lane), op.dtype);
+        out[ch][lane] = convert_channel(v, ch, texel_channel_bits(v, addr, ch, ins, lane), op.dtype);
     }
     count_memory(Space::Global, 4 * 4, popcount_mask(m), /*is_store=*/false);
     for (uint32_t ch = 0; ch < 4 && ch < op.dsts.size(); ++ch)
@@ -4884,10 +4949,38 @@ class Interpreter {
   // suld/sust address a surface in *bytes* along x and in whole rows along y
   // and z, which is why they take no format: they move raw bytes.
   uint64_t surface_address(const Instr& ins, uint32_t lane, const TextureDesc& d,
-                           const std::array<Lanes, 3>& coord, uint32_t dims, uint32_t bytes) {
-    const int64_t x = static_cast<int32_t>(coord[0][lane]);
-    const int64_t y = dims > 1 ? static_cast<int32_t>(coord[1][lane]) : 0;
-    const int64_t z = dims > 2 ? static_cast<int32_t>(coord[2][lane]) : 0;
+                           const std::array<Lanes, 4>& coord, uint32_t dims, uint32_t bytes,
+                           bool layered) {
+    // A layered surface's first coordinate is its layer. A cubemap surface is
+    // read as a layered one, face by face (surfCubemapread compiles to
+    // suld.a2d with the face as the layer), so it has 6 -- or 6 x layers.
+    const uint32_t first = layered ? 1 : 0;
+    const int64_t x = static_cast<int32_t>(coord[first][lane]);
+    const int64_t y = dims > 1 ? static_cast<int32_t>(coord[first + 1][lane]) : 0;
+    const int64_t z = dims > 2 ? static_cast<int32_t>(coord[first + 2][lane]) : 0;
+    uint64_t layer_base = d.base;
+    if (layered) {
+      const uint64_t layers = d.cubemap ? 6 * std::max<uint64_t>(d.layers, 1) : d.layers;
+      if (layers == 0)
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                 "a layered surface access (.a1d/.a2d) on a surface that is not layered");
+      // Reading a 2D layered surface with a 1D layered access (or the other
+      // way round) returns zeros on an RTX 3060, a rule nobody can rely on;
+      // it is refused instead.
+      if ((dims == 1) != (d.height == 0))
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                 std::string("a ") + (dims == 1 ? "1D" : "2D") + " layered access (.a" +
+                     (dims == 1 ? "1d" : "2d") + ") on a " + (d.height ? "2D" : "1D") + " layered surface");
+      const uint64_t layer = static_cast<uint32_t>(coord[0][lane]);
+      if (layer >= layers)
+        ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                 "surface layer " + std::to_string(layer) + " is past the surface's " +
+                     std::to_string(layers) + " layers, and the '.trap' policy faults");
+      layer_base += layer * tex_slice_bytes(d);
+    } else if (d.layers || d.cubemap) {
+      ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+               "a layered or cubemap surface needs a layered access (.a1d/.a2d)");
+    }
     const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
     const uint64_t plane = row * (d.height ? d.height : 1);
     // ".trap" is the out-of-range policy ptxas emits, and it means what it
@@ -4902,22 +4995,22 @@ class Interpreter {
                    " surface (" + std::to_string(row_bytes) +
                    " bytes per row). The instruction's '.trap' policy is what makes this a fault "
                    "rather than a clamp");
-    return d.base + z * plane + y * row + static_cast<uint64_t>(x);
+    return layer_base + z * plane + y * row + static_cast<uint64_t>(x);
   }
 
   void exec_suld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSuld& op, Mask m) {
     Lanes _s_obj;
     const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
-    std::array<Lanes, 3> coord;
-    std::array<Lanes, 3> coord_scratch;
-    for (uint32_t i = 0; i < op.dims; ++i)
+    std::array<Lanes, 4> coord;
+    std::array<Lanes, 4> coord_scratch;
+    for (uint32_t i = 0; i < op.dims + (op.layered ? 1 : 0); ++i)
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
     std::vector<Lanes> out(op.dsts.size());
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Surface);
       const uint64_t base = surface_address(ins, lane, d, coord, op.dims,
-                                            op.bytes * static_cast<uint32_t>(op.dsts.size()));
+                                            op.bytes * static_cast<uint32_t>(op.dsts.size()), op.layered);
       for (size_t c = 0; c < op.dsts.size(); ++c) {
         try {
           out[c][lane] = mem_.load_scalar(base + c * op.bytes, op.bytes);
@@ -4935,9 +5028,9 @@ class Interpreter {
   void exec_sust(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSust& op, Mask m) {
     Lanes _s_obj;
     const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
-    std::array<Lanes, 3> coord;
-    std::array<Lanes, 3> coord_scratch;
-    for (uint32_t i = 0; i < op.dims; ++i)
+    std::array<Lanes, 4> coord;
+    std::array<Lanes, 4> coord_scratch;
+    for (uint32_t i = 0; i < op.dims + (op.layered ? 1 : 0); ++i)
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
     std::vector<Lanes> src(op.srcs.size());
     std::vector<Lanes> src_scratch(op.srcs.size());
@@ -4947,7 +5040,7 @@ class Interpreter {
       if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Surface);
       const uint64_t base = surface_address(ins, lane, d, coord, op.dims,
-                                            op.bytes * static_cast<uint32_t>(op.srcs.size()));
+                                            op.bytes * static_cast<uint32_t>(op.srcs.size()), op.layered);
       for (size_t c = 0; c < op.srcs.size(); ++c) {
         try {
           mem_.store_scalar(base + c * op.bytes, op.bytes, src[c][lane]);

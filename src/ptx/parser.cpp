@@ -3174,32 +3174,40 @@ class Parser {
     } else if (op0 == "tex") {
       // tex.<geom>[.level|.grad].v4.<dtype>.<ctype> {d,d,d,d}, [obj, {c,...}]
       uint32_t dims = 0;
+      TexGeom geom = TexGeom::D1;
       Type dtype{}, ctype{};
       bool have_d = false;
       std::vector<std::string> types;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
-        if (p == "1d") dims = 1;
-        else if (p == "2d") dims = 2;
-        else if (p == "3d") dims = 3;
+        if (p == "1d") { dims = 1; geom = TexGeom::D1; }
+        else if (p == "2d") { dims = 2; geom = TexGeom::D2; }
+        else if (p == "3d") { dims = 3; geom = TexGeom::D3; }
+        else if (p == "a1d") { dims = 1; geom = TexGeom::A1D; }
+        else if (p == "a2d") { dims = 2; geom = TexGeom::A2D; }
+        else if (p == "cube") { dims = 3; geom = TexGeom::Cube; }
+        else if (p == "acube") { dims = 3; geom = TexGeom::ACube; }
         else if (p == "v4") ;
-        else if (p == "a1d" || p == "a2d" || p == "cube" || p == "acube")
-          return unsupported("layered and cubemap textures are not implemented");
+        else if (p == "2dms" || p == "a2dms")
+          return unsupported("multi-sample textures are not implemented");
         else if (p == "level" || p == "grad")
           return unsupported("mipmapped texture fetch ('." + p + "') is not implemented");
         else if (auto t2 = parse_type_token(p)) types.push_back(p);
         else return unsupported("tex modifier '." + p + "'");
       }
-      if (!dims) return unsupported("tex geometry (only .1d/.2d/.3d are implemented)");
+      if (!dims) return unsupported("tex geometry");
       if (types.size() != 2) return unsupported("tex needs a destination and a coordinate type");
       dtype = *parse_type_token(types[0]);
       ctype = *parse_type_token(types[1]);
       have_d = true;
       (void)have_d;
       OpTex op;
+      op.geom = geom;
       op.dims = dims;
       op.dtype = dtype;
       op.ctype = ctype;
+      if ((geom == TexGeom::Cube || geom == TexGeom::ACube) && !ctype.is_float())
+        return unsupported("a cubemap fetch takes float coordinates");
       op.dsts = parse_reg_vector_any();
       if (op.dsts.size() != 4) return unsupported("tex destination arity (ptxas emits .v4)");
       expect_punct(",");
@@ -3207,7 +3215,8 @@ class Parser {
       op.obj = parse_operand();
       expect_punct(",");
       op.coords = parse_operand_vector_any();
-      if (op.coords.size() < dims)
+      const bool indexed = geom == TexGeom::A1D || geom == TexGeom::A2D || geom == TexGeom::ACube;
+      if (op.coords.size() < dims + (indexed ? 1 : 0))
         return unsupported("tex coordinate count does not match its geometry");
       expect_punct("]");
       ins.op = std::move(op);
@@ -3215,6 +3224,7 @@ class Parser {
       // suld.b.<geom>.<type>.<clamp> {d,...}, [obj, {x,y}]
       // sust.b.<geom>.<type>.<clamp> [obj, {x,y}], {s,...}
       uint32_t dims = 0, bytes = 0;
+      bool layered = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "b") ;              // byte-addressed, the only form ptxas emits
@@ -3222,8 +3232,8 @@ class Parser {
         else if (p == "1d") dims = 1;
         else if (p == "2d") dims = 2;
         else if (p == "3d") dims = 3;
-        else if (p == "a1d" || p == "a2d")
-          return unsupported("layered surfaces are not implemented");
+        else if (p == "a1d") { dims = 1; layered = true; }
+        else if (p == "a2d") { dims = 2; layered = true; }
         // Out-of-range policy. ".trap" is what a surface access compiles to by
         // default and is the only one implemented: ".clamp" and ".zero" change
         // the result rather than the diagnostics, so accepting them silently
@@ -3238,11 +3248,12 @@ class Parser {
         else if (p == "b64") bytes = 8;
         else return unsupported(op0 + " modifier '." + p + "'");
       }
-      if (!dims) return unsupported(op0 + " geometry (only .1d/.2d/.3d are implemented)");
+      if (!dims) return unsupported(op0 + " geometry");
       if (!bytes) return unsupported(op0 + " component width");
       if (op0 == "suld") {
         OpSuld op;
         op.dims = dims;
+        op.layered = layered;
         op.bytes = bytes;
         op.dsts = parse_reg_vector_any();
         expect_punct(",");
@@ -3251,11 +3262,12 @@ class Parser {
         expect_punct(",");
         op.coords = parse_operand_vector_any();
         expect_punct("]");
-        if (op.coords.size() < dims) return unsupported("suld coordinate count");
+        if (op.coords.size() < dims + (layered ? 1 : 0)) return unsupported("suld coordinate count");
         ins.op = std::move(op);
       } else {
         OpSust op;
         op.dims = dims;
+        op.layered = layered;
         op.bytes = bytes;
         expect_punct("[");
         op.obj = parse_operand();
@@ -3264,7 +3276,7 @@ class Parser {
         expect_punct("]");
         expect_punct(",");
         op.srcs = parse_operand_vector_any();
-        if (op.coords.size() < dims) return unsupported("sust coordinate count");
+        if (op.coords.size() < dims + (layered ? 1 : 0)) return unsupported("sust coordinate count");
         ins.op = std::move(op);
       }
     } else if (op0 == "membar" || op0 == "fence") {

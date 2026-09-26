@@ -4026,6 +4026,189 @@ VTEST(tex_wrap_and_mirror_clamp_unnormalized_coordinates) {
     }
 }
 
+// Layered and cubemap fetches against a table recorded on an RTX 3060: a 1D
+// layered texture read with layer indices past both ends (a negative index
+// is a huge unsigned one, and both read the last layer) under linear
+// filtering and border addressing, where a layer filters as true 1D -- unlike
+// a plain 1D texture, no half border row -- and a 2x2 cubemap whose texel
+// (face f, i) is 10f + i, at the axis directions, at directions that tie
+// between axes (the face goes to z, then y, then x), and inside faces, point
+// and linear (which stays inside the face).
+VTEST(tex_layered_and_cubemap_fetches_match_hardware) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry a1(.param .u64 t, .param .f32 x, .param .u32 l, .param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f5, [x];
+    ld.param.u32 %r1, [l];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    tex.a1d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%r1, %f5}];
+    st.global.f32 [%rd3], %f1;
+    ret;
+}
+.visible .entry cube(.param .u64 t, .param .f32 x, .param .f32 y, .param .f32 z, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f5, [x];
+    ld.param.f32 %f6, [y];
+    ld.param.f32 %f7, [z];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    tex.cube.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6, %f7, %f7}];
+    st.global.f32 [%rd3], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16);
+  auto argf = [](float f) { std::vector<uint8_t> b(4); std::memcpy(b.data(), &f, 4); return b; };
+  auto argu = [](uint32_t v) { std::vector<uint8_t> b(4); std::memcpy(b.data(), &v, 4); return b; };
+  TextureTable tex;
+  LaunchConfig cfg;
+  cfg.textures = &tex;
+  auto base = [&](const float* data, size_t n, uint32_t w, uint32_t h) {
+    TextureDesc d;
+    d.width = w;
+    d.height = h;
+    d.kind = ChannelKind::Float;
+    d.channel_bits[0] = 32;
+    d.texel_bytes = 4;
+    d.pitch_bytes = w * 4;
+    d.base = e.mem.alloc(n * 4);
+    e.mem.write(d.base, data, n * 4);
+    return d;
+  };
+
+  const float t1[12] = {3, -5, 7, 11, 100, 200, 300, 400, -1, -2, -4, -8};
+  TextureDesc d1 = base(t1, 12, 4, 0);
+  d1.layers = 3;
+  d1.filter = TexFilter::Linear;
+  for (auto& a : d1.address) a = TexAddress::Border;
+  tex[0x51] = d1;
+  const struct { float x; int32_t l; uint32_t want; } c1[] = {
+      {0x1.333334p-2f, 0, 0x4019c000u}, {0x1.b33334p+0f, 1, 0x435bec00u}, {0x1.f33334p+1f, 2, 0xc09a0000u},
+      {0x1.4p+1f, 5, 0xc0800000u}, {0x1.4p+0f, -1, 0xbfe00000u}, {0x1.19999ap+2f, 0, 0x3f8f0000u}};
+  for (const auto& c : c1) {
+    exec::launch(m.entries[0], cfg, {arg_u64(0x51), argf(c.x), argu(static_cast<uint32_t>(c.l)), arg_u64(out)},
+                 e.mem, e.prof);
+    VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{c.want});
+  }
+
+  float tc[24];
+  for (int f = 0; f < 6; ++f)
+    for (int i = 0; i < 4; ++i) tc[f * 4 + i] = 10.f * f + i;
+  const float dirs[12][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1},
+                             {1, 1, 0}, {-1, 1, 1}, {1, -1, -1}, {0x1.ccccccp-1f, 0x1.333334p-2f, -0x1.333334p-1f},
+                             {-0x1.99999ap-3f, -0x1.99999ap-1f, 0x1p-1f}, {0x1p-2f, 0x1.99999ap-4f, 0x1.fae148p-1f}};
+  const uint32_t want[2][12] = {
+      {0x40400000u, 0x41500000u, 0x41b80000u, 0x42040000u, 0x422c0000u, 0x42540000u,
+       0x41b80000u, 0x42200000u, 0x42500000u, 0x3f800000u, 0x41f00000u, 0x42240000u},
+      {0x3fc00000u, 0x41380000u, 0x41ac0000u, 0x41fc0000u, 0x42260000u, 0x424e0000u,
+       0x41b00000u, 0x42200000u, 0x42500000u, 0x3fab0000u, 0x41f20000u, 0x42263400u}};
+  for (int lin = 0; lin < 2; ++lin) {
+    TextureDesc dc = base(tc, 24, 2, 2);
+    dc.cubemap = true;
+    dc.normalized_coords = true;
+    dc.filter = lin ? TexFilter::Linear : TexFilter::Point;
+    tex[0x52] = dc;
+    for (int i = 0; i < 12; ++i) {
+      exec::launch(m.entries[1], cfg,
+                   {arg_u64(0x52), argf(dirs[i][0]), argf(dirs[i][1]), argf(dirs[i][2]), arg_u64(out)},
+                   e.mem, e.prof);
+      VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{want[lin][i]});
+    }
+  }
+  // A layered fetch of a texture that is not layered is named, not guessed at.
+  tex[0x53] = base(t1, 4, 4, 0);
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(0x53), argf(1.f), argu(0), arg_u64(out)},
+                                          e.mem, e.prof));
+  VCHECK_CONTAINS(err.message(), "geometry does not match");
+}
+
+// Layered surfaces: sust/suld .a2d address a layer first, then bytes along x
+// and rows along y; a layer past the end faults under .trap, and a 1D
+// layered access to a 2D layered surface is refused.
+VTEST(layered_surfaces_write_and_read_layers) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 s, .param .u32 layers, .param .u64 out)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [s];
+    ld.param.u32 %r10, [layers];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.u32 %r1, %tid.x;          // layer
+    mov.u32 %r2, %tid.y;          // row
+    mov.u32 %r3, %tid.z;          // column
+    mul.lo.u32 %r4, %r1, 1000;
+    mad.lo.u32 %r4, %r2, 10, %r4;
+    add.u32 %r4, %r4, %r3;
+    shl.b32 %r5, %r3, 2;
+    sust.b.a2d.b32.trap [%rd1, {%r1, %r5, %r2, %r2}], {%r4};
+    bar.sync 0;
+    // read back the neighbouring layer's value at the same place
+    add.u32 %r6, %r1, 1;
+    rem.u32 %r6, %r6, %r10;
+    suld.b.a2d.b32.trap {%r7}, [%rd1, {%r6, %r5, %r2, %r2}];
+    mad.lo.u32 %r8, %r1, 6, 0;
+    mad.lo.u32 %r8, %r2, 3, %r8;
+    add.u32 %r8, %r8, %r3;
+    mul.wide.u32 %rd4, %r8, 4;
+    add.u64 %rd5, %rd3, %rd4;
+    st.global.u32 [%rd5], %r7;
+    ret;
+}
+.visible .entry bad(.param .u64 s)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [s];
+    mov.u32 %r1, 0;
+    suld.b.a1d.b32.trap {%r2}, [%rd1, {%r1, %r1}];
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(64);
+  TextureTable tex;
+  TextureDesc d;
+  d.object = TexKind::Surface;
+  d.width = 3;
+  d.height = 2;
+  d.layers = 2;
+  d.kind = ChannelKind::Float;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.pitch_bytes = 12;
+  d.base = e.mem.alloc(48);
+  tex[0x61] = d;
+  LaunchConfig cfg;
+  cfg.textures = &tex;
+  cfg.block = {2, 2, 3};
+  std::vector<uint8_t> two(4);
+  const uint32_t layers = 2;
+  std::memcpy(two.data(), &layers, 4);
+  exec::launch(m.entries[0], cfg, {arg_u64(0x61), two, arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t l = 0; l < 2; ++l)
+    for (uint32_t y = 0; y < 2; ++y)
+      for (uint32_t x = 0; x < 3; ++x)
+        VCHECK_EQ(e.mem.load_scalar(out + 4 * (l * 6 + y * 3 + x), 4), uint64_t{1000 * ((l + 1) % 2) + 10 * y + x});
+  LaunchConfig one;
+  one.textures = &tex;
+  auto err = VCAPTURE(Error, exec::launch(m.entries[1], one, {arg_u64(0x61)}, e.mem, e.prof));
+  VCHECK_CONTAINS(err.message(), "1D layered access (.a1d) on a 2D layered surface");
+}
+
 VTEST(a_texture_handle_used_as_a_surface_is_refused) {
   // The two have the same shape of handle and are not interchangeable.
   std::string ptx = std::string(kHeader) + R"(
