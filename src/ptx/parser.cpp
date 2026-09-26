@@ -792,6 +792,7 @@ class Parser {
   }
 
   void parse_body(EntryFn& fn) {
+    reg_scopes_.clear();
     // Labels are scoped to the { } block that defines them (PTX ISA 4.x
     // "Statements"), and inline asm relies on it: CUTLASS's barrier waits are
     // each a block with its own LAB_WAIT and DONE, so one kernel holds many.
@@ -810,12 +811,14 @@ class Parser {
       if (peek_punct("{")) {
         next();
         scopes.push_back(next_scope++);
+        reg_scopes_.emplace_back();
         continue;
       }
       if (peek_punct("}")) {
         next();
         if (scopes.size() == 1) break;
         scopes.pop_back();
+        reg_scopes_.pop_back();
         continue;
       }
       if (t.kind == Token::Kind::Word && t.text == ".reg") {
@@ -938,7 +941,35 @@ class Parser {
   // register -- used to change the width and keep the narrow id, so a 64-bit
   // store wrote past the end of the 64-bit register file (and a value written
   // before the declaration read back as 0).
-  void declare_reg(EntryFn& fn, const std::string& nm, Type ty, size_t line) {
+  // The name a register reference resolves to: the innermost open block's
+  // own declaration if it has one, else the name itself.
+  const std::string& scoped(const std::string& name) const {
+    for (auto it = reg_scopes_.rbegin(); it != reg_scopes_.rend(); ++it) {
+      auto f = it->find(name);
+      if (f != it->end()) return f->second;
+    }
+    return name;
+  }
+
+  void declare_reg(EntryFn& fn, const std::string& source_name, Type ty, size_t line) {
+    // Registers are scoped to the { } block that declares them, like labels,
+    // and a declaration inside a block hides an outer one of the same name
+    // until the block closes. CUDA's __syncthreads_and is inline asm that
+    // declares its own %p1 and %p2 in braces; nvcc's code after the block uses
+    // its own %p2, and taking the two as one register sent CUTLASS's split-K
+    // semaphore wait round its loop without ever re-reading the semaphore.
+    // A declaration that hides nothing keeps its name, so a block-local like
+    // CUTLASS's "p" is interned exactly as before.
+    std::string nm = source_name;
+    if (!reg_scopes_.empty()) {
+      auto& inner = reg_scopes_.back();
+      if (auto f = inner.find(source_name); f != inner.end()) {
+        nm = f->second;   // declared again in the same block
+      } else if (fn.reg_decls.count(scoped(source_name))) {
+        nm = source_name + "{" + std::to_string(++shadow_count_) + "}";
+        inner[source_name] = nm;
+      }
+    }
     const bool wide = ty.bits > 32 && ty.kind != Type::Kind::Pred;
     if (fn.reg_ids.count(nm)) {
       auto was = fn.reg_wide.find(nm);
@@ -948,6 +979,7 @@ class Parser {
                        (was_wide ? "declared 64-bit" : "used or declared as a 32-bit register"));
     }
     fn.reg_decls[nm] = ty;
+    declared_regs_.insert(source_name);
     declared_regs_.insert(nm);
     fn.reg_wide[nm] = wide;
     intern(nm);
@@ -1108,7 +1140,8 @@ class Parser {
   // names at run time.
   // Interns a register into the file its declared width selects. Ids are
   // dense within each file, so both can be plain vectors.
-  Reg intern(const std::string& name) {
+  Reg intern(const std::string& source_name) {
+    const std::string& name = scoped(source_name);
     auto wit = cur_fn_->reg_wide.find(name);
     bool wide = wit != cur_fn_->reg_wide.end() && wit->second;
     auto it = cur_fn_->reg_ids.find(name);
@@ -1189,9 +1222,9 @@ class Parser {
     Addr a;
     std::string base = expect_word("address base");
     if (base[0] == '%' || declared_regs_.count(base)) {
-      a.base = base;
       a.base_kind = Addr::Base::Reg;
       Reg r = intern(base);
+      a.base = r.name;
       a.base_id = r.id;
       a.base_wide = r.wide;
     } else if (call_slots_.count(base)) {
@@ -3623,6 +3656,11 @@ class Parser {
   std::string current_kernel_;
   std::set<std::string> call_slots_;
   std::set<std::string> declared_regs_;  // every .reg name in the current kernel
+  // Registers declared inside a nested { } block that shadow an outer
+  // declaration, innermost block last: source name -> the name it is interned
+  // under while the block is open.
+  std::vector<std::unordered_map<std::string, std::string>> reg_scopes_;
+  int shadow_count_ = 0;
   EntryFn* cur_fn_ = nullptr;           // receives interned register ids
 };
 

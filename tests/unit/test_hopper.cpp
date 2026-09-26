@@ -1516,6 +1516,49 @@ VTEST(labels_are_scoped_to_their_block) {
   VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{33});
 }
 
+// Registers are block-scoped too: a .reg inside { } hides an outer one of
+// the same name until the block closes. This is __syncthreads_and's inline
+// asm, which declares its own %p1 and %p2, followed by a branch on the
+// kernel's own %p2 (tid != 0). Taking the two as one register branched on the
+// bar.red result instead, and CUTLASS's semaphore wait never re-read the
+// semaphore.
+VTEST(registers_declared_in_a_block_hide_outer_ones) {
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(64 * 4);
+  run(R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    setp.ne.s32 %p2, %r1, 0;
+    setp.ne.s32 %p1, %r1, %r1;      // false everywhere
+    mov.u32 %r2, 1;
+    {
+    .reg .pred %p1;
+    .reg .pred %p2;
+    setp.ne.u32 %p1, %r2, 0;
+    bar.red.and.pred %p2, 0, %p1;
+    selp.u32 %r3, 1, 0, %p2;
+    }
+    selp.u32 %r4, 7, 9, %p2;
+    selp.u32 %r5, 100, 200, %p1;
+    add.u32 %r6, %r4, %r5;
+    add.u32 %r6, %r6, %r3;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r6;
+    ret;
+}
+)", [] { LaunchConfig c; c.block = {64, 1, 1}; return c; }(), {arg_u64(out)}, mem);
+  // The block's bar.red is true everywhere (1). After it, the outer %p1 is
+  // still false (200) and the outer %p2 is tid != 0: 9 for thread 0, else 7.
+  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{210});
+  for (int i = 1; i < 64; ++i) VCHECK_EQ(mem.load_scalar(out + i * 4, 4), uint64_t{208});
+}
+
 // A lane can reach bar.sync from a higher pc: nvcc puts a rarely taken block
 // after the kernel's ret and branches back from it. The barrier waits for it.
 VTEST(bar_sync_waits_for_lanes_in_code_placed_after_ret) {
