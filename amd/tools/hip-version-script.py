@@ -39,6 +39,15 @@ PRIVATE = '''VGPU_PRIVATE {
 };'''
 
 
+# The HSA runtime's, which the same library carries (amd/src/hsa_api.cpp) and
+# build/shim/libhsa-runtime64.so.1 names: ROCm's libhsa-runtime64 puts every
+# function in ROCR_1.
+HSA = '''ROCR_1 {
+  global:
+    hsa_*;
+};'''
+
+
 def versions(real):
     out = subprocess.run(['readelf', '--dyn-syms', '--wide', real], capture_output=True, text=True).stdout
     found = {}
@@ -81,6 +90,7 @@ def main():
         loc = '  local: *;\n' if k == 'hip_4.2' else ''
         text.append(f'{k} {{\n{glob}{loc}}}' + (f' {prev};' if prev else ';'))
         prev = k
+    text.append(HSA)
     text.append(PRIVATE)
     open(dest, 'w').write('\n'.join(text) + '\n')
 

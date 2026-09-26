@@ -166,7 +166,7 @@ add_custom_command(TARGET vgpucuda POST_BUILD
 # libamdhip64: the HIP runtime API shim. A HIP program links against it the
 # way it links against AMD's, and its kernels run on a simulated AMD GPU.
 # ---------------------------------------------------------------------------
-add_library(vgpuhip SHARED amd/src/hip_api.cpp)
+add_library(vgpuhip SHARED amd/src/hip_api.cpp amd/src/hsa_api.cpp)
 target_link_libraries(vgpuhip PRIVATE vgpu ${CMAKE_DL_LIBS})
 target_include_directories(vgpuhip PRIVATE amd/include)
 # The real runtime's identity: a HIP program records SONAME "libamdhip64.so.6"
@@ -183,7 +183,11 @@ add_custom_command(TARGET vgpuhip POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.6"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.7"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so"
-  COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7)")
+  # The HSA runtime is in the same library, so a program that loads both
+  # (as ROCm's libraries do) gets one copy of it, and one set of devices.
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so.1"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so"
+  COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7, libhsa-runtime64.so.1)")
 # How fast the CDNA interpreter runs a kernel (amd/tools/exec-bench.cpp).
 add_executable(amd_exec_bench amd/tools/exec-bench.cpp)
 target_link_libraries(amd_exec_bench PRIVATE vgpu)
@@ -769,6 +773,14 @@ set_tests_properties(amd_pytorch PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
 # And on two devices: RCCL's collectives and DataParallel between them.
 add_test(NAME amd_pytorch_multi_gpu COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh multi_gpu.py 9 2)
 set_tests_properties(amd_pytorch_multi_gpu PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# An HSA program: agents, pools, executables and AQL queues (amd/tests/hsa).
+add_test(NAME amd_hsa COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hsa.sh)
+set_tests_properties(amd_hsa PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# ROCm's own HIP runtime (CLR), unmodified, on the HSA runtime alone.
+add_test(NAME amd_hip_on_hsa COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_on_hsa.sh)
+set_tests_properties(amd_hip_on_hsa PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 add_test(NAME amd_hipcc COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc.sh)
 set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip

@@ -33,6 +33,21 @@ struct Dispatch {
   uint32_t groups[3] = {1, 1, 1};    // work-groups
   uint32_t group_size[3] = {1, 1, 1};   // work-items in each
   uint32_t wave_size = 64;
+  // The grid in work-items, where it is not a whole number of work-groups
+  // (an HSA dispatch packet may ask for that; HIP never does): the last
+  // work-group in a dimension then has only what is left over. Zero is a
+  // grid of `groups` whole work-groups.
+  uint32_t grid_items[3] = {0, 0, 0};
+  // Whether a work-group larger than the kernel's metadata allows
+  // (max_flat_workgroup_size) is refused, as a HIP runtime refuses the launch.
+  // An AQL packet goes to the hardware as it is, and the hardware knows only
+  // its own limit, 1024 work-items: an HSA runtime turns this off (ROCm's own
+  // copy kernels are launched past what their metadata says).
+  bool kernel_limits = true;
+  // Whether the hidden arguments are written into the kernarg segment, as a
+  // HIP runtime does. An HSA runtime passes the segment to the hardware as the
+  // program wrote it, and the runtime above (ROCm's HIP) fills them itself.
+  bool fill_hidden = true;
   // LDS the launch adds to what the kernel reserves, which is what a HIP
   // program passes as its third launch parameter.
   uint32_t dynamic_lds = 0;

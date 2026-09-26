@@ -172,6 +172,19 @@ VTEST(a_dispatch_a_kernel_cannot_take_is_refused) {
   }
   VCHECK_CONTAINS(what, "this kernel allows");
 
+  // An HSA packet is held only to the hardware's limit: past the kernel's
+  // metadata is run, past the 1024 a work-group has is not.
+  what.clear();
+  try {
+    d.kernel_limits = false;
+    d.group_size[0] = 2048;
+    amd::execute(d, mem);
+  } catch (const std::exception& e) {
+    what = e.what();
+  }
+  VCHECK_CONTAINS(what, "1024 a CDNA work-group has");
+  d.kernel_limits = true;
+
   what.clear();
   try {
     amd::Dispatch none;

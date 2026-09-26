@@ -239,6 +239,49 @@ a lock striped by address, and a fence (`buffer_wbl2`, `buffer_inv`) is a
 fence on the host. `amd_exec_bench` (`tools/exec-bench.cpp`) says how fast a
 kernel runs on the interpreter.
 
+## HSA
+
+The same library is also the HSA runtime (`src/hsa_api.cpp`, declared in
+`include/vgpu/hsa_abi.h` from the HSA Foundation's specification and AMD's
+documented extensions). `build/shim/libhsa-runtime64.so.1` names it, so a
+program that uses HSA and HIP together sees one set of devices and one memory.
+A program finds a CPU agent and one GPU agent per simulated device, allocates
+from their memory pools (or the older regions), loads a code object into an
+executable, and dispatches kernels by writing AQL packets into a queue and
+ringing its doorbell. Each queue has a packet processor on a host thread of
+its own. It runs kernel dispatches in order, holds on barrier-AND and
+barrier-OR packets until their signals reach zero, and decrements each
+packet's completion signal when it is done. `hsa_amd_memory_async_copy` waits
+on its dependency signals the same way. Memory from the CPU's pools
+(fine-grained, and kernarg) is reachable from every device's kernels at its
+own address. Memory from a GPU's pool belongs to that device, and the host
+reaches it by copying. Every function carries ROCm's symbol version
+(`ROCR_1`). `tests/hsa/hsa_dispatch.c` is built against this header, and
+against ROCm's `hsa.h` where that is installed, and both builds run
+(ctest `amd_hsa`). A grid need not be a whole number of work-groups, as HSA
+allows: the last group in a dimension runs short, numbered across its own
+shape, and the kernel's `hidden_remainder` arguments say by how much.
+
+ROCm's own tools and HIP runtime run on it unmodified:
+
+- **`rocminfo`** describes every device.
+- **ROCm's `libamdhip64` (CLR)**, from releases 7.0, 7.1 and 7.2, runs hipcc-built programs with only `libhsa-runtime64` replaced (ctest `amd_hip_on_hsa`). CLR then does all of HIP itself:
+  - its copies and fills are its own kernels in AQL packets;
+  - device `printf` comes back through its hostcall listener;
+  - a cooperative launch goes to a cooperative queue;
+  - peers are granted through `hsa_amd_agents_allow_access`.
+
+That works because the runtime keeps to what ROCm's does where CLR looks:
+
+- **Signals:** a signal handle is the address of an `amd_signal_t` every device maps, so a kernel can ring it, and a host wait sees what a kernel wrote.
+- **Kernel arguments:** a packet's kernarg segment reaches the kernel as the program wrote it, hidden arguments included.
+- **Work-group limit:** a packet is held only to the hardware's work-group limit, not the kernel's metadata.
+- **Host access:** the host is never given a device's memory directly, so CLR copies instead of writing through it.
+- **Supported extras:** AMD's loader extension, barrier-value packets, asynchronous signal handlers, dispatch timestamps and `hsa_amd_pointer_info` all work.
+- **Not modelled:** images, virtual memory, IPC and SVM are refused by name.
+
+`VGPU_TRACE_HSA=1` logs what memory the program allocates, locks and registers.
+
 ## Profiling
 
 AMD's profiler, `rocprofv3`, runs unmodified on a simulated GPU. It is a front

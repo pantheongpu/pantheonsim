@@ -115,6 +115,80 @@ s_nop 0
 s_nop 0
 s_nop 0
 s_nop 0
+s_load_dword s3, s[0:1], 0x18
+s_load_dwordx2 s[4:5], s[0:1], 0x0
+v_lshl_add_u32 v2, s2, 6, v0
+v_mov_b32_e32 v3, 0
+s_waitcnt lgkmcnt(0)
+s_lshr_b32 s0, s3, 16
+s_mulk_i32 s0, 0x3e8
+v_add3_u32 v4, v0, s0, 1
+v_lshl_add_u64 v[0:1], v[2:3], 2, s[4:5]
+global_store_dword v[0:1], v4, off
+s_endpgm
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
 s_nop 0
 s_nop 0
 s_nop 0
