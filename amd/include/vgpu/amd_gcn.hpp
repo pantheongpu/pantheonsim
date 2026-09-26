@@ -45,6 +45,11 @@ struct Operand {
 };
 std::string operand_text(const Operand& o);
 
+// Which processor the code is for. gfx90a (CDNA2) numbers some instructions
+// differently from gfx940 and later -- its matrix instructions above all --
+// and has a few they dropped (v_mad_f32, v_mac_f32); gfx950 adds to gfx942's.
+enum class Target { Gfx942, Gfx90a, Gfx950 };
+
 struct Inst {
   Enc enc = Enc::Unknown;
   uint32_t opcode = 0;
@@ -79,6 +84,9 @@ struct Inst {
   // encoding keeps where the others' broadcast controls are (CBSZ, BLGP):
   // 0 fp8, 1 bf8, 2 fp6 (E2M3), 3 bf6 (E3M2), 4 fp4 (E2M1).
   uint8_t cbsz = 0, blgp = 0;
+  // The processor it was decoded for, which names some instructions and
+  // cache bits otherwise when it is printed (gfx90a's glc, slc and scc).
+  Target arch = Target::Gfx942;
   // SMEM: the offset is the instruction's own and a register's both, which
   // the assembler writes as "offset:" even when the constant is zero.
   bool smem_both_offsets = false;
@@ -121,9 +129,15 @@ struct Inst {
   uint32_t cache = 0;
 };
 
-// Decodes the instruction at `at` in `code`. Throws Err::Unsupported naming
-// the encoding and opcode when it is one this does not know yet.
-Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc);
+// The target a code object's e_flags machine field (EF_AMDGPU_MACH) names.
+inline Target target_of_mach(uint32_t mach) {
+  return mach == 0x3f ? Target::Gfx90a : mach == 0x4f ? Target::Gfx950 : Target::Gfx942;
+}
+
+// Decodes the instruction at `at` in `code`, for `target`. Throws
+// Err::Unsupported naming the encoding and opcode when it is one this does
+// not know yet.
+Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target = Target::Gfx942);
 
 // The instruction as the assembler writes it, for tests and for a
 // disassembly listing.

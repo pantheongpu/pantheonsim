@@ -113,7 +113,7 @@ VTEST(every_instruction_decodes_as_the_assembler_wrote_it) {
 namespace {
 // Decodes every instruction of a corpus (amd/tools/isa-corpus.py) and
 // compares it with llvm-objdump's text for it.
-void check_corpus(const std::string& file) {
+void check_corpus(const std::string& file, amd::gcn::Target target = amd::gcn::Target::Gfx942) {
   const std::vector<std::string> corpus = lines(read(file, false));
   size_t checked = 0;
   std::string wrong;
@@ -130,7 +130,7 @@ void check_corpus(const std::string& file) {
     const std::string want = line.substr(tab + 1);
     std::string got;
     try {
-      got = amd::gcn::to_text(amd::gcn::decode(code, 0, 0));
+      got = amd::gcn::to_text(amd::gcn::decode(code, 0, 0, target));
     } catch (const std::exception& e) {
       got = std::string("(refused: ") + e.what() + ")";
     }
@@ -147,7 +147,15 @@ VTEST(every_instruction_shape_rocms_libraries_use_decodes_as_llvm_prints_it) { c
 
 // The same for gfx950 (MI350X): PyTorch's own kernels, hipBLASLt's and
 // rocBLAS's, as built for it.
-VTEST(every_gfx950_instruction_shape_decodes_as_llvm_prints_it) { check_corpus("isa_corpus_gfx950.txt"); }
+VTEST(every_gfx950_instruction_shape_decodes_as_llvm_prints_it) {
+  check_corpus("isa_corpus_gfx950.txt", amd::gcn::Target::Gfx950);
+}
+
+// And gfx90a (MI250X), which numbers its matrix instructions otherwise and
+// names them and its cache bits as gfx940 no longer does.
+VTEST(every_gfx90a_instruction_shape_decodes_as_llvm_prints_it) {
+  check_corpus("isa_corpus_gfx90a.txt", amd::gcn::Target::Gfx90a);
+}
 
 // The cache every launch of a module shares: an instruction is decoded once,
 // however many threads reach it at the same moment, and all of them get the

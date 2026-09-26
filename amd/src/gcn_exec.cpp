@@ -27,7 +27,7 @@ using gcn::Inst;
 using gcn::Operand;
 using gcn::OperandKind;
 
-constexpr uint32_t kSgprs = 102;      // s0 through s101
+constexpr uint32_t kSgprs = 104;      // s0 through s101, and FLAT_SCRATCH (102, 103)
 constexpr uint32_t kVgprs = 256;
 constexpr uint32_t kLanes = 64;
 
@@ -40,6 +40,10 @@ constexpr uint64_t kSharedSize = 1ull << 20;
 // What a CDNA compute unit's LDS holds: no work-group has more.
 constexpr uint64_t kLdsPerComputeUnit = 64 * 1024;
 // The LDS a work-group may have: 64 KB on gfx942, 160 KB on gfx950 (CDNA4).
+// Where the private segment buffer resource a gfx90a kernel is handed says
+// its scratch is: not a device address, but the mark buffer accesses through
+// it are recognised by, and sent to the work-items' private memory.
+constexpr uint64_t kScratchResourceBase = 0xFFFF00000000ull;
 uint64_t lds_limit(const Dispatch& d) { return d.object && d.object->gfx950() ? 160 * 1024 : kLdsPerComputeUnit; }
 // And a work-item's private memory, which the wave reads the aperture of from
 // src_private_base: an address in it is an offset into the work-item's own.
@@ -218,13 +222,14 @@ struct Machine {
   // dispatch's where the runtime keeps none.
   DecodeCache* decoded = nullptr;
 
+  gcn::Target target() const { return gcn::target_of_mach(d.object->mach); }
   const Inst& fetch(uint64_t pc) {
     const CodeObject& o = *d.object;
     const uint64_t at = pc - d.code_base - o.text_addr;
     const Inst* in = at % 4 == 0 && at < o.text.size()
-                         ? decoded->get(at / 4, [&] { return gcn::decode(o.text, at, pc); })
+                         ? decoded->get(at / 4, [&] { return gcn::decode(o.text, at, pc, target()); })
                          : nullptr;
-    if (!in) return *(scratch_inst = std::make_unique<const Inst>(gcn::decode(o.text, at, pc)));
+    if (!in) return *(scratch_inst = std::make_unique<const Inst>(gcn::decode(o.text, at, pc, target())));
     return *in;
   }
   std::unique_ptr<const Inst> scratch_inst;   // one that is not where an instruction starts
@@ -2170,6 +2175,24 @@ struct Machine {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint32_t>(static_cast<int32_t>(as_double(lane_src64(w, in.src[0], lane)))));
       });
+    } else if (op == "v_mad_f32"_op || op == "v_mad_legacy_f32"_op || op == "v_mac_f32_e32"_op ||
+               op == "v_mac_f32_e64"_op || op == "v_madmk_f32"_op) {
+      // gfx90a's multiply-adds, which gfx940 dropped: the product rounded to
+      // a float before the add, and denormals -- in or out -- flushed to
+      // zero, which is why a compiler picks them only where denormals are
+      // flushed anyway. The legacy form takes zero times anything, infinity
+      // and NaN included, as zero. v_mac adds into its destination, and
+      // v_madmk's middle source is the constant it carries.
+      const bool legacy = op == "v_mad_legacy_f32"_op, mac = op == "v_mac_f32_e32"_op || op == "v_mac_f32_e64"_op,
+                 madmk = op == "v_madmk_f32"_op;
+      const auto ftz = [](float x) { return std::fpclassify(x) == FP_SUBNORMAL ? std::copysign(0.0f, x) : x; };
+      each([&](uint32_t lane) {
+        const float a = ftz(lane_float(w, in.src[0], lane));
+        const float b = ftz(madmk ? as_float(static_cast<uint32_t>(in.src[1].value)) : lane_float(w, in.src[1], lane));
+        const float c = ftz(mac ? as_float(w.vgpr[in.dst[0].index][lane]) : lane_float(w, in.src[2], lane));
+        const float product = legacy && (a == 0.0f || b == 0.0f) ? 0.0f : ftz(a * b);
+        write_float(w, in, lane, ftz(product + c));
+      });
     } else if (op == "v_fmamk_f32"_op) {
       each([&](uint32_t lane) {
         // The middle source is the constant the instruction carries.
@@ -2940,6 +2963,51 @@ struct Machine {
     }
   }
 
+  // A load or a store through the private segment buffer (gfx90a's
+  // scratch). The address the card forms is swizzled: from the resource and
+  // the scalar offset, dword d of lane l's run is at d * 256 + l * 4 (index
+  // stride 64, 4-byte elements, the lane's id added). Unswizzling that byte
+  // address gives the work-item and its offset in its own private memory --
+  // so a scalar offset that is a stack pointer scaled by the wave's size, as
+  // LLVM keeps it, moves every lane's frame alike.
+  void scratch_buffer_access(Wave& w, const Inst& in, Group& g, const Operand& data, const Operand& vaddr,
+                             const Operand& soff) {
+    const std::string_view body = std::string_view(in.name).substr(7);   // past "buffer_"
+    const bool store_op = body.rfind("store", 0) == 0;
+    Narrow n;
+    const bool part = narrow(in.name, &n);
+    Half h;
+    const bool half = half_access(body, &h);
+    if (!store_op && !part && !half && body.rfind("load_dword", 0) != 0)
+      throw Error::make(Err::Unsupported, in.name, " through the private segment buffer, which this does not model");
+    const uint64_t soffset = static_cast<uint32_t>(scalar(w, soff));
+    const uint32_t words = half || part ? 1 : data.width;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      if (!(w.exec >> lane & 1)) continue;
+      const uint64_t offset = uint64_t{in.offen ? word(w, vaddr, 0, lane) : 0} + static_cast<uint32_t>(in.offset);
+      const auto place = [&](uint64_t off, uint32_t bytes) -> uint8_t* {
+        const uint64_t at = soffset + (off / 4) * 256 + lane * 4 + off % 4;
+        const uint32_t who = static_cast<uint32_t>(at % 256 / 4);
+        return scratch_at(g, w, who, at / 256 * 4 + at % 4, bytes);
+      };
+      for (uint32_t k = 0; k < words; ++k) {
+        const uint32_t bytes = half ? h.bytes : part ? n.bytes : 4;
+        uint8_t* p = place(offset + 4 * k, bytes);
+        if (store_op) {
+          const uint32_t v = half ? static_cast<uint32_t>(half_store(lane_src(w, data, lane), h))
+                                  : word(w, data, k, lane);
+          std::memcpy(p, &v, bytes);
+        } else {
+          uint32_t v = 0;
+          std::memcpy(&v, p, bytes);
+          if (half) write_lane(w, data, lane, half_load(v, h));
+          else if (part) write_lane(w, data, lane, widen(v, n));
+          else set_word(w, data, k, lane, v);
+        }
+      }
+    }
+  }
+
   // A load, a store or an atomic through a buffer resource: four scalar
   // registers giving the buffer's base address, the stride of its records and
   // how many there are (bytes, where the stride is zero). An access past the
@@ -2949,7 +3017,7 @@ struct Machine {
   // the offset does: Tensile's DGEMM moves the resource's base back and
   // walks the scalar offset past the end, and gets zeroes there only if it
   // counts. Each register's worth is checked on its own.
-  void buffer_access(Wave& w, const Inst& in) {
+  void buffer_access(Wave& w, const Inst& in, Group& g) {
     if (!w.exec) return;
     const bool reads_data = in.dst.empty();   // a store, or an atomic
     const Operand& data = reads_data ? in.src[0] : in.dst[0];
@@ -2958,6 +3026,7 @@ struct Machine {
     const Operand& soff = in.src[reads_data ? 3 : 2];
     const uint32_t d1 = w.sgpr[rsrc.index + 1], records = w.sgpr[rsrc.index + 2], d3 = w.sgpr[rsrc.index + 3];
     const uint64_t base = w.sgpr[rsrc.index] | static_cast<uint64_t>(d1 & 0xFFFF) << 32;
+    if (base == kScratchResourceBase) return scratch_buffer_access(w, in, g, data, vaddr, soff);
     const uint32_t stride = (d1 >> 16) & 0x3FFF;
     if (d1 >> 31)
       throw Error::make(Err::Unsupported, in.name, " through a swizzled buffer, which this does not model");
@@ -3359,6 +3428,26 @@ struct Machine {
         i8_16x16x64{16, 16, 64, 1, 'c', 'i'}, i8_32x32x32{32, 32, 32, 1, 'c', 'i'},
         // 'x': a small float whose format the instruction's CBSZ or BLGP names.
         f8f6f4_16x16x128{16, 16, 128, 1, 'x', 'f', 'x'}, f8f6f4_32x32x64{32, 32, 64, 1, 'x', 'f', 'x'};
+    // gfx90a's, which gfx940 dropped: int8 with K of 8 and 16, and bfloat16s
+    // two to a lane.
+    static const MatrixShape i8_32x32x8{32, 32, 8, 1, 'c', 'i'}, i8_16x16x16{16, 16, 16, 1, 'c', 'i'},
+        bf16_32x32x2{32, 32, 2, 2, 'b', 'f'}, bf16_16x16x2{16, 16, 2, 4, 'b', 'f'},
+        bf16_4x4x2{4, 4, 2, 16, 'b', 'f'}, bf16_32x32x4{32, 32, 4, 1, 'b', 'f'}, bf16_16x16x8{16, 16, 8, 1, 'b', 'f'},
+        bf16_32x32x4_2b{32, 32, 4, 2, 'b', 'f'};
+    static const MatrixShape f16_32x32x4_2b{32, 32, 4, 2, 'h', 'f'}, i8_32x32x4_2b{32, 32, 4, 2, 'c', 'i'},
+        i8_16x16x4_4b{16, 16, 4, 4, 'c', 'i'}, i8_4x4x4_16b{4, 4, 4, 16, 'c', 'i'};
+    if (op == "v_mfma_f32_32x32x4_2b_f16"_op) return &f16_32x32x4_2b;
+    if (op == "v_mfma_i32_32x32x4_2b_i8"_op) return &i8_32x32x4_2b;
+    if (op == "v_mfma_i32_16x16x4_4b_i8"_op) return &i8_16x16x4_4b;
+    if (op == "v_mfma_i32_4x4x4_16b_i8"_op) return &i8_4x4x4_16b;
+    if (op == "v_mfma_i32_32x32x8_i8"_op) return &i8_32x32x8;
+    if (op == "v_mfma_i32_16x16x16_i8"_op) return &i8_16x16x16;
+    if (op == "v_mfma_f32_32x32x2bf16"_op) return &bf16_32x32x2;
+    if (op == "v_mfma_f32_16x16x2bf16"_op) return &bf16_16x16x2;
+    if (op == "v_mfma_f32_4x4x2bf16"_op) return &bf16_4x4x2;
+    if (op == "v_mfma_f32_32x32x4bf16"_op) return &bf16_32x32x4;
+    if (op == "v_mfma_f32_16x16x8bf16"_op) return &bf16_16x16x8;
+    if (op == "v_mfma_f32_32x32x4_2b_bf16"_op) return &bf16_32x32x4_2b;
     if (op == "v_mfma_i32_16x16x64_i8"_op) return &i8_16x16x64;
     if (op == "v_mfma_i32_32x32x32_i8"_op) return &i8_32x32x32;
     if (op == "v_mfma_f32_16x16x128_f8f6f4"_op) return &f8f6f4_16x16x128;
@@ -3564,11 +3653,13 @@ struct Machine {
         // to write back and nothing stale to drop -- but work-groups on other
         // host threads see this thread's writes in the order a fence
         // promises only if the host is told to keep it.
-        if (OpName(in.name) == "buffer_wbl2"_op || OpName(in.name) == "buffer_inv"_op) {
+        if (OpName(in.name) == "buffer_wbl2"_op || OpName(in.name) == "buffer_inv"_op ||
+            OpName(in.name) == "buffer_wbinvl1"_op || OpName(in.name) == "buffer_wbinvl1_vol"_op ||
+            OpName(in.name) == "buffer_invl2"_op) {
           std::atomic_thread_fence(std::memory_order_seq_cst);
           return true;
         }
-        buffer_access(w, in);
+        buffer_access(w, in, g);
         return true;
       case gcn::Enc::Sopp: break;
       default:
@@ -3786,7 +3877,18 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
     // work-group's id, and each lane's id in v0 (and v1, v2 where the
     // group has those dimensions).
     uint32_t at = 0;
-    if (k.private_segment_buffer) at += 4;
+    if (k.private_segment_buffer) {
+      // gfx90a reaches scratch through a buffer resource the hardware sets
+      // up, swizzled as a card's is: each work-item's dwords interleaved
+      // across the wave's 64 lanes (ADD_TID, index stride 64, 4-byte
+      // elements), from the wave's own offset (which is 0 here; each
+      // work-item has a block of its own). buffer_access unswizzles it.
+      m.set_sgpr(w, at, static_cast<uint32_t>(kScratchResourceBase));
+      m.set_sgpr(w, at + 1, static_cast<uint32_t>(kScratchResourceBase >> 32) | 1u << 31);   // SWIZZLE_EN
+      m.set_sgpr(w, at + 2, 0xFFFFFFFFu);                                                  // num_records
+      m.set_sgpr(w, at + 3, 4u << 15 | 3u << 21 | 1u << 23);   // 32-bit data, index stride 64, ADD_TID
+      at += 4;
+    }
     if (k.dispatch_ptr) {
       m.set_sgpr64(w, at, packet);
       at += 2;
@@ -3805,6 +3907,8 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
     if (k.group_id_x) m.set_sgpr(w, at++, gx);
     if (k.group_id_y) m.set_sgpr(w, at++, gy);
     if (k.group_id_z) m.set_sgpr(w, at++, gz);
+    if (k.group_info) m.set_sgpr(w, at++, 0);
+    if (k.private_wave_offset && m.target() == gcn::Target::Gfx90a) m.set_sgpr(w, at++, 0);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const uint64_t flat = w.first_lane + lane;
       const uint32_t x = static_cast<uint32_t>(flat % size[0]), y = static_cast<uint32_t>(flat / size[0] % size[1]),

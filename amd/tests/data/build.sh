@@ -16,6 +16,11 @@ for src in $sources; do
   echo "wrote $(pwd)/$src.gfx942.o"
 done
 
+# The scratch kernel for gfx90a too, which reaches its private memory through
+# a buffer resource rather than flat scratch (test_amd_gcn_memory).
+"$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx90a -nogpulib -O2 -c memory.c -o memory.gfx90a.o
+echo "wrote $(pwd)/memory.gfx90a.o"
+
 # Kernels written in assembly, for instructions a compiler emits only now and
 # then (test_amd_gcn_asm).
 for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs; do

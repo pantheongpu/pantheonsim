@@ -824,7 +824,13 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x6e}, {"v_mfma_f64_16x16x4_f64", 8, 3, 2, 2, 8}},
       // Halves, bfloat16s and bytes into floats and ints: the forms the half,
       // bfloat16 and int8 GEMMs use.
+      {{Enc::Vop3p, 0x48}, {"v_mfma_f32_32x32x4_2b_f16", 32, 3, 2, 2, 32}},
       {{Enc::Vop3p, 0x49}, {"v_mfma_f32_16x16x4_4b_f16", 16, 3, 2, 2, 16}},
+      // Bytes four to a lane, in blocks side by side.
+      {{Enc::Vop3p, 0x50}, {"v_mfma_i32_32x32x4_2b_i8", 32, 3, 1, 1, 32}},
+      {{Enc::Vop3p, 0x51}, {"v_mfma_i32_16x16x4_4b_i8", 16, 3, 1, 1, 16}},
+      {{Enc::Vop3p, 0x52}, {"v_mfma_i32_4x4x4_16b_i8", 4, 3, 1, 1, 4}},
+      {{Enc::Vop3p, 0x5d}, {"v_mfma_f32_32x32x4_2b_bf16", 32, 3, 2, 2, 32}},
       {{Enc::Vop3p, 0x4a}, {"v_mfma_f32_4x4x4_16b_f16", 4, 3, 2, 2, 4}},
       {{Enc::Vop3p, 0x4c}, {"v_mfma_f32_32x32x8_f16", 16, 3, 2, 2, 16}},
       {{Enc::Vop3p, 0x56}, {"v_mfma_i32_32x32x16_i8", 16, 3, 2, 2, 16}},
@@ -882,7 +888,9 @@ uint32_t word(const std::vector<uint8_t>& code, uint64_t at) {
 Operand operand(uint32_t code, uint32_t width) {
   Operand o;
   o.width = width;
-  if (code <= 101) {
+  if (code <= 103) {
+    // 102 and 103 are FLAT_SCRATCH, which a gfx90a kernel sets up itself for
+    // its flat scratch accesses: kept as the two registers past s101.
     o.kind = OperandKind::Sgpr;
     o.index = code;
   } else if (code == 106) {
@@ -946,8 +954,54 @@ Operand vgpr(uint32_t index, uint32_t width = 1) {
   return o;
 }
 
+// gfx90a's: gfx942's, with what gfx90a numbers otherwise. Found by asking
+// LLVM's disassembler for every opcode of each encoding on both targets.
+const std::map<std::pair<Enc, uint32_t>, Shape>& table_gfx90a() {
+  static const std::map<std::pair<Enc, uint32_t>, Shape> t = [] {
+    std::map<std::pair<Enc, uint32_t>, Shape> m = table();
+    const auto set = [&](Enc e, uint32_t op, Shape sh) { m[{e, op}] = sh; };
+    // The matrix instructions gfx940 added or renumbered are not gfx90a's.
+    for (uint32_t op : {0x2d, 0x2e, 0x35, 0x36, 0x37, 0x38, 0x3e, 0x3f, 0x56, 0x57, 0x5d, 0x5e, 0x5f, 0x60, 0x61,
+                        0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77})
+      m.erase({Enc::Vop3p, op});
+    // Its int8 forms: K of 8 and 16, four bytes a lane.
+    set(Enc::Vop3p, 0x54, {"v_mfma_i32_32x32x8_i8", 16, 3, 1, 1, 16});
+    set(Enc::Vop3p, 0x55, {"v_mfma_i32_16x16x16_i8", 4, 3, 1, 1, 4});
+    // Its bfloat16 forms of four a lane ("_1k"), which gfx940 kept and
+    // renumbered; and the older ones of two a lane, which gfx940 dropped.
+    set(Enc::Vop3p, 0x63, {"v_mfma_f32_32x32x4_2b_bf16", 32, 3, 2, 2, 32});
+    set(Enc::Vop3p, 0x64, {"v_mfma_f32_16x16x4_4b_bf16", 16, 3, 2, 2, 16});
+    set(Enc::Vop3p, 0x65, {"v_mfma_f32_4x4x4_16b_bf16", 4, 3, 2, 2, 4});
+    set(Enc::Vop3p, 0x66, {"v_mfma_f32_32x32x8_bf16", 16, 3, 2, 2, 16});
+    set(Enc::Vop3p, 0x67, {"v_mfma_f32_16x16x16_bf16", 4, 3, 2, 2, 4});
+    set(Enc::Vop3p, 0x68, {"v_mfma_f32_32x32x2bf16", 32, 3, 1, 1, 32});
+    set(Enc::Vop3p, 0x69, {"v_mfma_f32_16x16x2bf16", 16, 3, 1, 1, 16});
+    set(Enc::Vop3p, 0x6b, {"v_mfma_f32_4x4x2bf16", 4, 3, 1, 1, 4});
+    set(Enc::Vop3p, 0x6c, {"v_mfma_f32_32x32x4bf16", 16, 3, 1, 1, 16});
+    set(Enc::Vop3p, 0x6d, {"v_mfma_f32_16x16x8bf16", 4, 3, 1, 1, 4});
+    // The multiply-adds whose product is rounded before the add, which
+    // gfx940 dropped: MIOpen's hand-written convolutions use them.
+    set(Enc::Vop3, 0x1c0, {"v_mad_legacy_f32", 1, 3});
+    set(Enc::Vop3, 0x1c1, {"v_mad_f32", 1, 3});
+    set(Enc::Vop2, 0x016, {"v_mac_f32_e32", 1, 2});
+    Shape mac_e64{"v_mac_f32_e64", 1, 2};
+    mac_e64.promoted = true;
+    set(Enc::Vop3, 0x116, mac_e64);
+    set(Enc::Vop2, 0x017, {"v_madmk_f32", 1, 2});
+    // The first-level cache's write-back and invalidate.
+    set(Enc::Mubuf, 0x29, {"buffer_invl2", 0, 0});
+    set(Enc::Mubuf, 0x3e, {"buffer_wbinvl1", 0, 0});
+    set(Enc::Mubuf, 0x3f, {"buffer_wbinvl1_vol", 0, 0});
+    return m;
+  }();
+  return t;
+}
+
+// The table decode() looks in: the target's, for the instruction being decoded.
+thread_local const std::map<std::pair<Enc, uint32_t>, Shape>* g_table = nullptr;
+
 const Shape& shape(Enc e, uint32_t opcode) {
-  const auto& t = table();
+  const auto& t = g_table ? *g_table : table();
   const auto it = t.find({e, opcode});
   if (it == t.end())
     throw Error::make(Err::Unsupported, enc_name(e), " opcode 0x", [&] {
@@ -1112,7 +1166,22 @@ std::string dpp_control_text(uint32_t ctrl) {
   throw Error::make(Err::Unsupported, "a DPP control this does not decode yet (", ctrl, ")");
 }
 
-Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
+namespace {
+Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc);
+}  // namespace
+
+Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target) {
+  struct Using {
+    explicit Using(Target t) { g_table = t == Target::Gfx90a ? &table_gfx90a() : &table(); }
+    ~Using() { g_table = nullptr; }
+  } using_table(target);
+  Inst in = decode_one(code, at, pc);
+  in.arch = target;
+  return in;
+}
+
+namespace {
+Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
   const uint32_t w0 = word(code, at);
   Inst in;
   in.pc = pc;
@@ -1479,7 +1548,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
     // v_fmamk_f32 carries a constant of its own, which sits between the two
     // sources rather than taking one of their places.
-    if (in.name == "v_fmamk_f32") {
+    if (in.name == "v_fmamk_f32" || in.name == "v_madmk_f32") {
       Operand k;
       k.kind = OperandKind::Literal;
       in.src.push_back(k);
@@ -1513,6 +1582,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
   }
   return in;
 }
+}  // namespace
 
 std::string operand_text(const Operand& o) {
   char b[64];
@@ -1525,7 +1595,10 @@ std::string operand_text(const Operand& o) {
     return std::string(b);
   };
   switch (o.kind) {
-    case OperandKind::Sgpr: return wrap(range("s"));
+    case OperandKind::Sgpr:
+      if (o.index == 102) return wrap(o.width >= 2 ? "flat_scratch" : "flat_scratch_lo");
+      if (o.index == 103) return wrap("flat_scratch_hi");
+      return wrap(range("s"));
     case OperandKind::Vgpr: return wrap(o.sext ? "sext(" + range("v") + ")" : range("v"));
     case OperandKind::Agpr: return wrap(range("a"));
     case OperandKind::Vcc: return wrap(o.width >= 2 ? "vcc" : "vcc_lo");
@@ -1578,8 +1651,34 @@ std::string hwreg_text(uint32_t simm) {
   return out + ")";
 }
 
+// gfx90a's names for the matrix instructions gfx940 renamed: the same
+// instruction, as LLVM's disassembler prints it for gfx90a.
+std::string gfx90a_name(const std::string& name) {
+  static const std::map<std::string, std::string> renamed = {
+      {"v_mfma_f32_32x32x1_2b_f32", "v_mfma_f32_32x32x1f32"}, {"v_mfma_f32_16x16x1_4b_f32", "v_mfma_f32_16x16x1f32"},
+      {"v_mfma_f32_4x4x1_16b_f32", "v_mfma_f32_4x4x1f32"},    {"v_mfma_f32_32x32x2_f32", "v_mfma_f32_32x32x2f32"},
+      {"v_mfma_f32_16x16x4_f32", "v_mfma_f32_16x16x4f32"},    {"v_mfma_f32_32x32x4_2b_f16", "v_mfma_f32_32x32x4f16"},
+      {"v_mfma_f32_16x16x4_4b_f16", "v_mfma_f32_16x16x4f16"}, {"v_mfma_f32_4x4x4_16b_f16", "v_mfma_f32_4x4x4f16"},
+      {"v_mfma_f32_32x32x8_f16", "v_mfma_f32_32x32x8f16"},    {"v_mfma_f32_16x16x16_f16", "v_mfma_f32_16x16x16f16"},
+      {"v_mfma_i32_32x32x4_2b_i8", "v_mfma_i32_32x32x4i8"},   {"v_mfma_i32_16x16x4_4b_i8", "v_mfma_i32_16x16x4i8"},
+      {"v_mfma_i32_4x4x4_16b_i8", "v_mfma_i32_4x4x4i8"},      {"v_mfma_i32_32x32x8_i8", "v_mfma_i32_32x32x8i8"},
+      {"v_mfma_i32_16x16x16_i8", "v_mfma_i32_16x16x16i8"},    {"v_mfma_f64_16x16x4_f64", "v_mfma_f64_16x16x4f64"},
+      {"v_mfma_f64_4x4x4_4b_f64", "v_mfma_f64_4x4x4f64"},
+      {"v_mfma_f32_32x32x4_2b_bf16", "v_mfma_f32_32x32x4bf16_1k"},
+      {"v_mfma_f32_16x16x4_4b_bf16", "v_mfma_f32_16x16x4bf16_1k"},
+      {"v_mfma_f32_4x4x4_16b_bf16", "v_mfma_f32_4x4x4bf16_1k"},
+      {"v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x8bf16_1k"},
+      {"v_mfma_f32_16x16x16_bf16", "v_mfma_f32_16x16x16bf16_1k"},
+  };
+  const auto it = renamed.find(name);
+  return it == renamed.end() ? name : it->second;
+}
+
 std::string to_text(const Inst& i) {
-  std::string s = i.name;
+  std::string s = i.arch == Target::Gfx90a ? gfx90a_name(i.name) : i.name;
+  // gfx90a prints its L2 write-back and invalidate bare, whatever scope bits
+  // they carry.
+  if (i.arch == Target::Gfx90a && (i.name == "buffer_wbl2" || i.name == "buffer_invl2")) return s;
   std::string sep = " ";
   if (i.name == "s_getreg_b32") return s + " " + operand_text(i.dst[0]) + ", " + hwreg_text(static_cast<uint32_t>(i.simm));
   if (i.name == "s_setreg_imm32_b32") {
@@ -1719,9 +1818,9 @@ std::string to_text(const Inst& i) {
       std::snprintf(b, sizeof b, " offset:%d", i.offset);
       s += b;
     }
-    if (i.cache & 1) s += " sc0";
-    if (i.cache & 2) s += " nt";
-    if (i.cache & 4) s += " sc1";
+    if (i.cache & 1) s += i.arch == Target::Gfx90a ? " glc" : " sc0";
+    if (i.cache & 2) s += i.arch == Target::Gfx90a ? " slc" : " nt";
+    if (i.cache & 4) s += i.arch == Target::Gfx90a ? " scc" : " sc1";
   } else if (i.enc == Enc::Mubuf) {
     if (i.idxen) s += " idxen";
     if (i.offen) s += " offen";
@@ -1729,9 +1828,9 @@ std::string to_text(const Inst& i) {
       std::snprintf(b, sizeof b, " offset:%d", i.offset);
       s += b;
     }
-    if (i.cache & 1) s += " sc0";
-    if (i.cache & 2) s += " nt";
-    if (i.cache & 4) s += " sc1";
+    if (i.cache & 1) s += i.arch == Target::Gfx90a ? " glc" : " sc0";
+    if (i.cache & 2) s += i.arch == Target::Gfx90a ? " slc" : " nt";
+    if (i.cache & 4) s += i.arch == Target::Gfx90a ? " scc" : " sc1";
   } else if (i.name == "s_sendmsg") {
     const uint32_t msg = static_cast<uint32_t>(i.simm) & 0xF;
     if (msg != 1 || (static_cast<uint32_t>(i.simm) & 0xFFF0))
