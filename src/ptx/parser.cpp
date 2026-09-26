@@ -1487,6 +1487,33 @@ class Parser {
       expect_punct(",");
       op.src = parse_operand();
       ins.op = op;
+    } else if (op0 == "cvt" && parts.size() > 1 && parts[1] == "pack") {
+      // cvt.pack.sat.{u16,s16}.s32 d, a, b
+      // cvt.pack.sat.{u8,s8,u4,s4,u2,s2}.s32.b32 d, a, b, c
+      if (parts.size() < 5 || parts[2] != "sat" || parts[4] != "s32")
+        return unsupported("cvt.pack form (expected cvt.pack.sat.<type>.s32[.b32])");
+      const std::string& to = parts[3];
+      OpCvtPack op;
+      if (to.size() < 2 || (to[0] != 'u' && to[0] != 's'))
+        return unsupported("cvt.pack to ." + to);
+      op.is_signed = to[0] == 's';
+      op.bits = static_cast<uint32_t>(std::atoi(to.c_str() + 1));
+      if (op.bits != 16 && op.bits != 8 && op.bits != 4 && op.bits != 2)
+        return unsupported("cvt.pack to ." + to);
+      op.has_c = op.bits != 16;
+      if (op.has_c != (parts.size() == 6 && parts[5] == "b32") || parts.size() > 6)
+        return unsupported(op.has_c ? "cvt.pack to 8, 4 or 2 bits takes .b32 and a c operand"
+                                    : "cvt.pack to 16 bits takes no c operand");
+      op.dst = expect_reg_operand("cvt.pack destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      if (op.has_c) {
+        expect_punct(",");
+        op.c = parse_operand();
+      }
+      ins.op = op;
     } else if (op0 == "cvt") {
       // cvt[.round][.sat][.ftz].<dstty>.<srcty>
       std::vector<Type> tys;

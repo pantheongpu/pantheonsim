@@ -1394,6 +1394,7 @@ class Interpreter {
       return InstClass::Integer;
 
     if (std::holds_alternative<OpCvt>(ins.op) || std::holds_alternative<OpCvtF16x2>(ins.op) ||
+        std::holds_alternative<OpCvtPack>(ins.op) ||
         std::holds_alternative<OpCvta>(ins.op) || std::holds_alternative<OpMovPack>(ins.op) ||
         std::holds_alternative<OpMovUnpack>(ins.op))
       return InstClass::BitConvert;
@@ -3224,6 +3225,29 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) r[lane] = acc;
       write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpCvtPack>(&ins.op)) {
+      Lanes _s_a, _s_b, _s_c;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      const Lanes* c = op->has_c ? &read_operand(w, ctx, ins, op->c, _s_c) : nullptr;
+      const uint32_t bits = op->bits;
+      const int64_t lo = op->is_signed ? -(int64_t{1} << (bits - 1)) : 0;
+      const int64_t hi = op->is_signed ? (int64_t{1} << (bits - 1)) - 1 : (int64_t{1} << bits) - 1;
+      const uint32_t field = static_cast<uint32_t>((uint64_t{1} << bits) - 1);
+      auto sat = [&](uint64_t v) {
+        const int64_t x = std::clamp<int64_t>(static_cast<int32_t>(v), lo, hi);
+        return static_cast<uint32_t>(x) & field;
+      };
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
+          uint32_t d = sat(b[lane]) | sat(a[lane]) << bits;
+          if (c) d |= static_cast<uint32_t>((*c)[lane]) << (2 * bits);
+          r[lane] = d;
+        }
+      write_reg(w, op->dst, m, r, 32);
       return;
     }
     if (const auto* op = std::get_if<OpCvtF16x2>(&ins.op)) {

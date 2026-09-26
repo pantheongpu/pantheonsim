@@ -994,6 +994,86 @@ VTEST(cvt_modifiers_match_hardware) {
   }
 }
 
+// cvt.pack.sat in all eight forms, against a table recorded on a real RTX 3060
+// (sm_86) running these instructions: a and b saturated to the narrow type
+// and packed with b in the low field, and for 8, 4 and 2 bits the rest of d
+// taken from the low bits of c. CUTLASS's SM90 s8 GEMM epilogue packs its
+// output this way.
+VTEST(cvt_pack_matches_hardware) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k(.param .u64 p, .param .u32 av, .param .u32 bv, .param .u32 cv)
+{
+  .reg .b32 %r<16>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  ld.param.u32 %r1, [av];
+  ld.param.u32 %r2, [bv];
+  ld.param.u32 %r3, [cv];
+  cvta.to.global.u64 %rd2, %rd1;
+  cvt.pack.sat.s16.s32 %r4, %r1, %r2;
+  cvt.pack.sat.u16.s32 %r5, %r1, %r2;
+  cvt.pack.sat.s8.s32.b32 %r6, %r1, %r2, %r3;
+  cvt.pack.sat.u8.s32.b32 %r7, %r1, %r2, %r3;
+  cvt.pack.sat.s4.s32.b32 %r8, %r1, %r2, %r3;
+  cvt.pack.sat.u4.s32.b32 %r9, %r1, %r2, %r3;
+  cvt.pack.sat.s2.s32.b32 %r10, %r1, %r2, %r3;
+  cvt.pack.sat.u2.s32.b32 %r11, %r1, %r2, %r3;
+  st.global.v4.u32 [%rd2], {%r4, %r5, %r6, %r7};
+  st.global.v4.u32 [%rd2+16], {%r8, %r9, %r10, %r11};
+  ret;
+}
+)";
+  struct Row {
+    uint32_t a, b, c;
+    std::array<uint32_t, 8> want;
+  };
+  const Row rows[] = {
+    {0x00000000, 0x00000000, 0x3e3a2bd2, {0x00000000, 0x00000000, 0x2bd20000, 0x2bd20000, 0x3a2bd200, 0x3a2bd200, 0xe3a2bd20, 0xe3a2bd20}},
+    {0x00000100, 0x00000001, 0x158ad19b, {0x01000001, 0x01000001, 0xd19b7f01, 0xd19bff01, 0x8ad19b71, 0x8ad19bf1, 0x58ad19b5, 0x58ad19bd}},
+    {0x00000007, 0x00000002, 0x1376b7f8, {0x00070002, 0x00070002, 0xb7f80702, 0xb7f80702, 0x76b7f872, 0x76b7f872, 0x376b7f85, 0x376b7f8e}},
+    {0x7fffffff, 0xfffffffe, 0xa1168ff9, {0x7ffffffe, 0xffff0000, 0x8ff97ffe, 0x8ff9ff00, 0x168ff97e, 0x168ff9f0, 0x1168ff96, 0x1168ff9c}},
+    {0xffffff7f, 0xfffffffd, 0x31ae1dee, {0xff7ffffd, 0x00000000, 0x1dee80fd, 0x1dee0000, 0xae1dee8d, 0xae1dee00, 0x1ae1deea, 0x1ae1dee0}},
+    {0x00000003, 0xfffffff8, 0xc2fed267, {0x0003fff8, 0x00030000, 0xd26703f8, 0xd2670300, 0xfed26738, 0xfed26730, 0x2fed2676, 0x2fed267c}},
+    {0x0000ffff, 0x00000008, 0x42a13734, {0x7fff0008, 0xffff0008, 0x37347f08, 0x3734ff08, 0xa1373477, 0xa13734f8, 0x2a137345, 0x2a13734f}},
+    {0x00000080, 0x0000007f, 0x754b4065, {0x0080007f, 0x0080007f, 0x40657f7f, 0x4065807f, 0x4b406577, 0x4b4065ff, 0x54b40655, 0x54b4065f}},
+    {0x00000002, 0xffffff80, 0x4380d14a, {0x0002ff80, 0x00020000, 0xd14a0280, 0xd14a0200, 0x80d14a28, 0x80d14a20, 0x380d14a6, 0x380d14a8}},
+    {0xffff8000, 0xffffff7f, 0xf62c0573, {0x8000ff7f, 0x00000000, 0x05738080, 0x05730000, 0x2c057388, 0x2c057300, 0x62c0573a, 0x62c05730}},
+    {0xfffffff7, 0x00000100, 0x36180db0, {0xfff70100, 0x00000100, 0x0db0f77f, 0x0db000ff, 0x180db087, 0x180db00f, 0x6180db09, 0x6180db03}},
+    {0x00000001, 0x00008000, 0x7767b111, {0x00017fff, 0x00018000, 0xb111017f, 0xb11101ff, 0x67b11117, 0x67b1111f, 0x767b1115, 0x767b1117}},
+    {0x00007fff, 0xffff8000, 0xd053c1e6, {0x7fff8000, 0x7fff0000, 0xc1e67f80, 0xc1e6ff00, 0x53c1e678, 0x53c1e6f0, 0x053c1e66, 0x053c1e6c}},
+    {0xfffffff8, 0x0000ffff, 0x9dca16bf, {0xfff87fff, 0x0000ffff, 0x16bff87f, 0x16bf00ff, 0xca16bf87, 0xca16bf0f, 0xdca16bf9, 0xdca16bf3}},
+    {0x80000000, 0x00010000, 0x11bed76c, {0x80007fff, 0x0000ffff, 0xd76c807f, 0xd76c00ff, 0xbed76c87, 0xbed76c0f, 0x1bed76c9, 0x1bed76c3}},
+    {0x000000ff, 0x80000000, 0xed0c2dfd, {0x00ff8000, 0x00ff0000, 0x2dfd7f80, 0x2dfdff00, 0x0c2dfd78, 0x0c2dfdf0, 0xd0c2dfd6, 0xd0c2dfdc}},
+    {0x0000006a, 0xd9fca11d, 0xb249afd8, {0x006a8000, 0x006a0000, 0xafd86a80, 0xafd86a00, 0x49afd878, 0x49afd8f0, 0x249afd86, 0x249afd8c}},
+    {0xd254f157, 0xffffffce, 0x4426bfa1, {0x8000ffce, 0x00000000, 0xbfa180ce, 0xbfa10000, 0x26bfa188, 0x26bfa100, 0x426bfa1a, 0x426bfa10}},
+    {0x000000b0, 0x2e879b53, 0xcc4fe896, {0x00b07fff, 0x00b0ffff, 0xe8967f7f, 0xe896b0ff, 0x4fe89677, 0x4fe896ff, 0xc4fe8965, 0xc4fe896f}},
+    {0x29cf86fd, 0x3a769c38, 0xb82b3237, {0x7fff7fff, 0xffffffff, 0x32377f7f, 0x3237ffff, 0x2b323777, 0x2b3237ff, 0x82b32375, 0x82b3237f}},
+    {0x00000090, 0xffffffb7, 0x17a18476, {0x0090ffb7, 0x00900000, 0x84767fb7, 0x84769000, 0xa1847678, 0xa18476f0, 0x7a184766, 0x7a18476c}},
+    {0xb9efb15d, 0x805b0318, 0x51a1ab97, {0x80008000, 0x00000000, 0xab978080, 0xab970000, 0xa1ab9788, 0xa1ab9700, 0x1a1ab97a, 0x1a1ab970}},
+  };
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(32);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  auto arg = [](uint32_t v) {
+    std::vector<uint8_t> x(4);
+    std::memcpy(x.data(), &v, 4);
+    return x;
+  };
+  std::vector<uint8_t> pa(8);
+  std::memcpy(pa.data(), &out, 8);
+  for (const Row& row : rows) {
+    exec::launch(m.entries[0], cfg, {pa, arg(row.a), arg(row.b), arg(row.c)}, mem, prof);
+    std::array<uint32_t, 8> got{};
+    mem.read(out, got.data(), 32);
+    for (int j = 0; j < 8; ++j) VCHECK_EQ(got[j], row.want[j]);
+  }
+}
+
 // dp4a is the four-way byte dot product quantized inference is built on, so a
 // wrong answer here corrupts every quantized matmul while still producing
 // plausible-looking output. Concrete values, checked by hand.
