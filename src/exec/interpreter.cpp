@@ -4987,6 +4987,37 @@ class Interpreter {
         cf[1] = (tc / ma + 1.0f) * 0.5f;
         dims = 2;
       }
+      if (op.gather >= 0) {
+        // tld4: the four texels of the bilinear footprint, counter-clockwise
+        // from the lower left -- (i, j+1), (i+1, j+1), (i+1, j), (i, j) -- one
+        // component each. Measured on an RTX 3060: i and j come from the
+        // filter's coordinate (with its 8-bit weight rounding carrying into
+        // them), and the address mode applies to each texel's index -- clamp
+        // clamps the indices, not the coordinate.
+        if (d.mip_levels)
+          ctx_fail(ins, static_cast<int>(lane), Err::Unsupported, "tld4 of a mipmapped texture");
+        const uint32_t size[2] = {v.width, v.height ? v.height : 1};
+        int64_t b[2];
+        for (uint32_t i = 0; i < 2; ++i) {
+          float x = cf[i];
+          if (v.normalized_coords) x *= static_cast<float>(size[i]);
+          const double xb = static_cast<double>(x) - 0.5;
+          double fl = std::floor(xb);
+          if (std::floor((xb - fl) * 256 + 0.5) >= 256) fl += 1;
+          b[i] = static_cast<int64_t>(fl);
+        }
+        const uint64_t row = v.pitch_bytes ? v.pitch_bytes : uint64_t{v.width} * v.texel_bytes;
+        static constexpr int kOrder[4][2] = {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
+        for (int k = 0; k < 4; ++k) {
+          uint32_t ix, iy;
+          const bool inside = wrap_coord(effective_address(v, 0), b[0] + kOrder[k][0], size[0], &ix) &&
+                              wrap_coord(effective_address(v, 1), b[1] + kOrder[k][1], size[1], &iy);
+          const uint32_t ch = static_cast<uint32_t>(op.gather);
+          out[k][lane] = inside ? convert_channel(v, ch, texel_channel_bits(v, v.base + iy * row + uint64_t{ix} * v.texel_bytes, ch, ins, lane), op.dtype)
+                                : 0;
+        }
+        continue;
+      }
       if (d.mip_levels) {
         // A mipmapped texture: pick the level, or blend two (see tex_mip_lod).
         if (indexed || cube)

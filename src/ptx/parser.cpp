@@ -3171,11 +3171,12 @@ class Parser {
       OpTrap op;
       op.breakpoint = true;
       ins.op = op;
-    } else if (op0 == "tex") {
+    } else if (op0 == "tex" || op0 == "tld4") {
       // tex.<geom>[.level|.grad].v4.<dtype>.<ctype> {d,d,d,d}, [obj, {c,...}]
       uint32_t dims = 0;
       TexGeom geom = TexGeom::D1;
       bool level = false;
+      int gather = -1;
       Type dtype{}, ctype{};
       bool have_d = false;
       std::vector<std::string> types;
@@ -3191,6 +3192,8 @@ class Parser {
         else if (p == "v4") ;
         else if (p == "2dms" || p == "a2dms")
           return unsupported("multi-sample textures are not implemented");
+        else if (op0 == "tld4" && p.size() == 1 && std::string("rgba").find(p[0]) != std::string::npos)
+          gather = static_cast<int>(std::string("rgba").find(p[0]));
         else if (p == "level") level = true;
         else if (p == "base") ;
         else if (p == "grad")
@@ -3207,7 +3210,17 @@ class Parser {
       ctype = *parse_type_token(types[1]);
       have_d = true;
       (void)have_d;
+      if (op0 == "tld4") {
+        if (gather < 0) return unsupported("tld4 needs a component (.r, .g, .b or .a)");
+        // The ISA also has .a2d, .cube and .acube, but gather is allowed only
+        // on 2D arrays (a layered or cubemap array with cudaArrayTextureGather
+        // is refused by the runtime), so there is nothing to measure them on.
+        if (geom != TexGeom::D2)
+          return unsupported("tld4 on a layered or cubemap texture (only .2d is implemented)");
+        if (level) return unsupported("tld4 with a level of detail");
+      }
       OpTex op;
+      op.gather = gather;
       op.geom = geom;
       op.dims = dims;
       op.dtype = dtype;

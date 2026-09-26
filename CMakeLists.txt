@@ -1070,6 +1070,14 @@ set_tests_properties(e2e_texture_mipmaps PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
 
+# Texture gather (tld4): the bilinear footprint's four texels, every
+# component, bit for bit with an RTX 3060.
+add_test(NAME e2e_texture_gather COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_gather.sh)
+set_tests_properties(e2e_texture_gather PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
 # A grid-wide barrier through cooperative_groups, unmodified. Checks the
 # barrier holds, that a grid too large to be resident is refused rather than
 # hung, and that the same kernel launched ordinarily fails loudly.

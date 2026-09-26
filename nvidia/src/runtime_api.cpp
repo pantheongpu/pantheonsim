@@ -2877,6 +2877,9 @@ VGPU_EXPORT cudaError_t cudaMalloc3DArray(cudaArray_t* array, const cudaChannelF
     rec.texel_bytes = texel_bytes_of(*desc);
     if (rec.texel_bytes == 0 || extent.width == 0) return cudaErrorInvalidValue;
     const bool layered = flags & cudaArrayLayered, cube = flags & cudaArrayCubemap;
+    // Gather works on 2D arrays only; with a layered or cubemap flag the
+    // hardware's runtime returns cudaErrorInvalidValue, and so does this.
+    if ((flags & cudaArrayTextureGather) && (layered || cube || extent.depth)) return cudaErrorInvalidValue;
     if (cube) {
       if (extent.width != extent.height || extent.depth == 0 || extent.depth % 6 ||
           (!layered && extent.depth != 6))

@@ -4303,6 +4303,59 @@ VTEST(tex_grad_is_refused_by_name) {
   VCHECK_CONTAINS(err.message(), "tex.grad");
 }
 
+// tld4 (texture gather) against a table recorded on an RTX 3060: a 3x3
+// texture of 1..9, the four footprint texels counter-clockwise from the lower
+// left -- (i, j+1), (i+1, j+1), (i+1, j), (i, j) -- where x = 2.4985 carries
+// into the next texel pair (its 8-bit weight rounds to 256), clamp clamps
+// each index rather than the coordinate, and border reads zero outside.
+VTEST(tld4_gathers_the_footprint_like_hardware) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .f32 x, .param .f32 y, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f5, [x];
+    ld.param.f32 %f6, [y];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    tld4.r.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}];
+    st.global.v4.f32 [%rd3], {%f1, %f2, %f3, %f4};
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16), data = e.mem.alloc(36);
+  const float t[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+  e.mem.write(data, t, 36);
+  auto argf = [](float f) { std::vector<uint8_t> b(4); std::memcpy(b.data(), &f, 4); return b; };
+  const struct { int border; float x, y; std::array<float, 4> want; } cases[] = {
+      {0, 0x1.333334p+0f, 0x1.b33334p+0f, {7, 8, 5, 4}}, {0, 0x1.3fcedap+1f, 0x1p+0f, {6, 6, 3, 3}},
+      {0, -0x1.333334p-2f, 0x1.733334p+1f, {7, 7, 7, 7}}, {0, 0x1.ccccccp+1f, -0x1.333334p+0f, {3, 3, 3, 3}},
+      {1, 0x1.333334p+0f, 0x1.b33334p+0f, {7, 8, 5, 4}}, {1, 0x1.3fcedap+1f, 0x1p+0f, {6, 0, 0, 3}},
+      {1, -0x1.333334p-2f, 0x1.733334p+1f, {0, 0, 7, 0}}, {1, 0x1.ccccccp+1f, -0x1.333334p+0f, {0, 0, 0, 0}}};
+  for (const auto& c : cases) {
+    TextureTable tex;
+    TextureDesc d;
+    d.base = data;
+    d.width = 3;
+    d.height = 3;
+    d.pitch_bytes = 12;
+    d.kind = ChannelKind::Float;
+    d.channel_bits[0] = 32;
+    d.texel_bytes = 4;
+    for (auto& a : d.address) a = c.border ? TexAddress::Border : TexAddress::Clamp;
+    tex[0x81] = d;
+    LaunchConfig cfg;
+    cfg.textures = &tex;
+    exec::launch(m.entries[0], cfg, {arg_u64(0x81), argf(c.x), argf(c.y), arg_u64(out)}, e.mem, e.prof);
+    std::array<float, 4> got{};
+    e.mem.read(out, got.data(), 16);
+    VCHECK(got == c.want);
+  }
+}
+
 VTEST(a_texture_handle_used_as_a_surface_is_refused) {
   // The two have the same shape of handle and are not interchangeable.
   std::string ptx = std::string(kHeader) + R"(

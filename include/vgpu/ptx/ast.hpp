@@ -713,6 +713,9 @@ struct OpTex {
   // .level: an explicit level of detail (of .ctype) after the coordinates.
   bool level = false;
   Operand lod;
+  // tld4 (texture gather): the component 0..3 (r, g, b, a) whose four
+  // bilinear-footprint texels are returned, or -1 for an ordinary fetch.
+  int gather = -1;
 };
 struct OpSuld {
   uint32_t dims = 1;
