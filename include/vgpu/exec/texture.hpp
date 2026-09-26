@@ -38,7 +38,12 @@ struct TextureDesc {
   uint64_t base = 0;        // device address of the backing memory
   uint32_t width = 0;       // in texels
   uint32_t height = 0;      // 0 for a 1D object
-  uint32_t depth = 0;       // 0 for 1D and 2D
+  uint32_t depth = 0;       // 0 for 1D and 2D, and for layered and cubemap textures
+  // A layered texture's layer count (0 when not layered), and whether it is a
+  // cubemap. Layers, and a cubemap's six faces per layer, are consecutive
+  // slices of width x height texels.
+  uint32_t layers = 0;
+  bool cubemap = false;
   uint32_t pitch_bytes = 0; // distance between rows; width*texel_bytes if dense
   uint32_t channels = 1;    // 1..4
   uint32_t channel_bits[4] = {32, 0, 0, 0};

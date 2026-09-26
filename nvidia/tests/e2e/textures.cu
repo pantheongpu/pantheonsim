@@ -5,10 +5,9 @@
 // tex2D over a cudaArray with point filtering and clamped addressing, and a
 // surface read-modify-write over that same array.
 //
-// The last check is the one that keeps the rest honest: linear filtering is
-// refused rather than approximated, because hardware computes the interpolation
-// weights in a fixed-point format and a float implementation would differ in
-// the low bits -- exactly what the differential testing here exists to catch.
+// The last check samples the array through a linear filter at texel centres,
+// where the filter must return each texel exactly. (Its behaviour between
+// texels is checked bit for bit against hardware by texture_filtering.cu.)
 #include <cstdio>
 #include <cmath>
 __global__ void k_fetch(cudaTextureObject_t t, float* out, int n) {
@@ -84,23 +83,24 @@ int main() {
     bad = 0; for (int i = 0; i < W*H; ++i) if (back[i] != img[i]*2.0f) ++bad;
     printf("surface wrong: %d\n", bad);
 
-    // Linear filtering must be refused, not approximated.
+    // Linear filtering at texel centres: every weight falls on one texel.
     cudaTextureDesc ltd{};
     ltd.addressMode[0] = cudaAddressModeClamp;
     ltd.addressMode[1] = cudaAddressModeClamp;
     ltd.filterMode = cudaFilterModeLinear;
     ltd.readMode = cudaReadModeElementType;
     cudaTextureObject_t lin_tex = 0;
-    cudaError_t le = cudaCreateTextureObject(&lin_tex, &ard, &ltd, nullptr);
-    if (le == cudaSuccess) {
-        float* lout = nullptr;
-        cudaMalloc(&lout, W * H * sizeof(float));
-        k_tex2d<<<dim3(1, 1), dim3(W, H)>>>(lin_tex, lout, W, H);
-        le = cudaDeviceSynchronize();
-        cudaFree(lout);
-        cudaDestroyTextureObject(lin_tex);
-    }
-    printf("linear filtering refused: %s\n", le == cudaSuccess ? "no" : "yes");
+    CK(cudaCreateTextureObject(&lin_tex, &ard, &ltd, nullptr));
+    float* lout = nullptr;
+    CK(cudaMalloc(&lout, W * H * sizeof(float)));
+    k_tex2d<<<dim3(1, 1), dim3(W, H)>>>(lin_tex, lout, W, H);
+    CK(cudaDeviceSynchronize());
+    float lback[W*H];
+    CK(cudaMemcpy(lback, lout, sizeof lback, cudaMemcpyDeviceToHost));
+    bad = 0; for (int i = 0; i < W*H; ++i) if (lback[i] != img[i]*2.0f) ++bad;
+    printf("linear filtering at texel centres wrong: %d\n", bad);
+    cudaFree(lout);
+    cudaDestroyTextureObject(lin_tex);
     cudaGetLastError();
 
     CK(cudaDestroySurfaceObject(surf));

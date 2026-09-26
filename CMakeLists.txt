@@ -1039,9 +1039,17 @@ if(TARGET vgpucupti)
 endif()
 
 # Texture and surface objects: tex1Dfetch over linear memory, tex2D over a
-# cudaArray, a surface read-modify-write, and the linear-filter refusal.
+# cudaArray, a surface read-modify-write, and linear filtering at texel centres.
 add_test(NAME e2e_textures COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_textures.sh)
 set_tests_properties(e2e_textures PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# Linear filtering in 1D, 2D and 3D, every address mode and the filtered
+# formats, compared bit for bit with results recorded on an RTX 3060.
+add_test(NAME e2e_texture_filtering COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_filtering.sh)
+set_tests_properties(e2e_texture_filtering PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)

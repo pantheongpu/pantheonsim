@@ -20,6 +20,7 @@
 //    barriers or retirement. Blocks run sequentially in a fixed order.
 //    Everything is deterministic by construction.
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -4534,6 +4535,15 @@ class Interpreter {
     return it->second;
   }
 
+  // The address mode a fetch actually uses. Wrap and mirror are defined only
+  // for normalized coordinates; with unnormalized ones a real GPU (measured on
+  // an RTX 3060, point and linear alike) clamps instead.
+  static TexAddress effective_address(const TextureDesc& d, uint32_t axis) {
+    const TexAddress a = d.address[axis];
+    if (!d.normalized_coords && (a == TexAddress::Wrap || a == TexAddress::Mirror)) return TexAddress::Clamp;
+    return a;
+  }
+
   // Applies the addressing mode. Returns false when the texel is outside and
   // the mode says to produce the border colour rather than clamp to an edge.
   static bool wrap_coord(TexAddress mode, int64_t v, uint32_t size, uint32_t* out) {
@@ -4611,6 +4621,208 @@ class Interpreter {
     return static_cast<uint32_t>(sv);
   }
 
+  // ---- linear filtering ----
+  //
+  // The CUDA programming guide gives the formula -- tex(x) = (1-a)T[i] +
+  // aT[i+1] with x_B = x - 0.5, i = floor(x_B), a = frac(x_B) held in 9-bit
+  // fixed point with 8 fractional bits -- and the rest was measured on an RTX
+  // 3060 (sm_86), sample by sample, until every result matched to the bit:
+  //
+  //  - a rounds to the nearest 1/256, halves up; a = 256 carries into i.
+  //  - Normalized coordinates scale by the size in f32 first. In clamp mode
+  //    the coordinate is clamped to [0.5, size - 0.5] before x_B is formed,
+  //    which only shows in 3D, where the weights of two clamped-together
+  //    texels are rounded separately.
+  //  - A 1D texture is a 2D one of height 1 sampled at y = 0, so in border
+  //    mode half of every result comes from the border row.
+  //  - The 8 (or 4) weights are integers summing to 256, split one axis at a
+  //    time -- z, then x, then y -- each split rounding half up. The y split
+  //    rounds the upper part on the x = 1 side and the lower part on the x = 0
+  //    side; in 2D that is w11 = round(a*b/256), w10 = a - w11, w01 = b - w11.
+  //  - The sum of weight x texel is exact, then rounded once: to f32 (or to
+  //    f16 for a half texture), ties away from zero. 8- and 16-bit unsigned
+  //    normalized texels are filtered as 16-bit integers (an 8-bit u is u*257)
+  //    and 16-bit signed ones as themselves, rounded half up and read out as
+  //    K/65535 or K/32767 (clamped to -32767 after the blend).
+  //
+  // Signed 8-bit normalized texels are refused: their result is a function of
+  // the blended sum alone, but not one this could reproduce, and a filter that
+  // is off by one step in a few percent of samples is the difference testing
+  // exists to catch.
+
+  static int tex_round_half_up(int64_t num, int64_t den) {   // floor(num/den + 1/2)
+    const int64_t t = 2 * num + den, d = 2 * den;
+    return static_cast<int>(t >= 0 ? t / d : -((-t + d - 1) / d));
+  }
+
+  // The weight splits, as measured (see above). f[] are the 8-bit fractions
+  // along x, y, z; w[] is indexed x + 2y + 4z.
+  static void tex_weights(uint32_t dims, const int f[3], int w[8]) {
+    auto split = [](int total, int frac, bool round_upper, int* lo, int* hi) {
+      if (round_upper) { *hi = tex_round_half_up(int64_t{total} * frac, 256); *lo = total - *hi; }
+      else { *lo = tex_round_half_up(int64_t{total} * (256 - frac), 256); *hi = total - *lo; }
+    };
+    for (int i = 0; i < 8; ++i) w[i] = 0;
+    const int zslices = dims == 3 ? 2 : 1;
+    for (int dz = 0; dz < zslices; ++dz) {
+      const int tz = dims == 3 ? (dz ? f[2] : 256 - f[2]) : 256;
+      int x0, x1;
+      split(tz, f[0], true, &x0, &x1);
+      for (int dx = 0; dx < 2; ++dx) {
+        int y0, y1;
+        split(dx ? x1 : x0, f[1], dx == 1, &y0, &y1);
+        w[dx + 4 * dz] = y0;
+        w[dx + 2 + 4 * dz] = y1;
+      }
+    }
+  }
+
+  // Exact sum of up to eight (weight x value) terms, as a non-overlapping
+  // expansion (Shewchuk's TwoSum): each product of a 9-bit weight and a float
+  // is exact in a double, and the expansion keeps every bit of their sum.
+  struct ExactSum {
+    std::array<double, 20> e{};
+    int n = 0;
+    void add(double x) {
+      int k = 0;
+      for (int i = 0; i < n; ++i) {
+        const double s = x + e[i], bb = s - x, err = (x - (s - bb)) + (e[i] - bb);
+        x = s;
+        if (err != 0) e[k++] = err;
+      }
+      e[k++] = x;
+      n = k;
+    }
+    // The sign of (sum - v), exactly.
+    int compare(double v) const {
+      ExactSum t = *this;
+      t.add(-v);
+      for (int i = t.n - 1; i >= 0; --i)
+        if (t.e[i] != 0) return t.e[i] > 0 ? 1 : -1;
+      return 0;
+    }
+    double approx() const {
+      double s = 0;
+      for (int i = 0; i < n; ++i) s += e[i];
+      return s;
+    }
+  };
+
+  // Rounds the exact sum to f32, or to f16 when `half`, to nearest with ties
+  // away from zero, and returns the result as a float.
+  static float tex_round_sum(const ExactSum& sum, bool half) {
+    const double a = sum.approx();
+    auto next = [half](double v, int dir) -> double {   // the adjacent value in the format
+      if (half) {
+        const uint64_t hb = double_to_f16(v) & 0xFFFF;
+        const double c = f16_to_double(hb);
+        if (c != v) return c;   // v was not representable: nearest is already a neighbour
+        int64_t mag = hb & 0x7FFF;
+        const bool neg = hb & 0x8000;
+        if (mag == 0) return dir > 0 ? f16_to_double(0x0001) : f16_to_double(0x8001);
+        mag += ((dir > 0) != neg) ? 1 : -1;
+        return f16_to_double(static_cast<uint64_t>(mag) | (neg ? 0x8000u : 0u));
+      }
+      return static_cast<double>(std::nextafter(static_cast<float>(v), dir > 0 ? INFINITY : -INFINITY));
+    };
+    const double c = half ? f16_to_double(double_to_f16(a) & 0xFFFF) : static_cast<double>(static_cast<float>(a));
+    const int s = sum.compare(c);
+    if (s == 0) return static_cast<float>(c);
+    const double lo = s > 0 ? c : next(c, -1), hi = s > 0 ? next(c, +1) : c;
+    const int t = sum.compare(lo + (hi - lo) / 2);   // the midpoint is exact in a double
+    if (t < 0) return static_cast<float>(lo);
+    if (t > 0) return static_cast<float>(hi);
+    return static_cast<float>(std::fabs(lo) > std::fabs(hi) ? lo : hi);
+  }
+
+  void tex_linear(const Instr& ins, uint32_t lane, const TextureDesc& d, uint32_t dims,
+                  const float coord[3], uint32_t out[4]) {
+    // The formats the measured rules cover.
+    const uint32_t bits = d.channel_bits[0];
+    const bool is_float = d.kind == ChannelKind::Float && (bits == 32 || bits == 16);
+    const bool unorm = d.kind == ChannelKind::Unsigned && (bits == 8 || bits == 16) && d.read_as_normalized_float;
+    const bool snorm16 = d.kind == ChannelKind::Signed && bits == 16 && d.read_as_normalized_float;
+    if (!is_float && !unorm && !snorm16)
+      ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+               d.kind == ChannelKind::Signed && bits == 8
+                   ? "linear filtering of signed 8-bit normalized texels is not implemented: "
+                     "measured on hardware, the result is not the rounded weighted sum of the "
+                     "texels' 16-bit forms, and a filter that differs from the device in the last "
+                     "step would hide exactly what differential testing is for"
+                   : "linear filtering needs a float, half, or normalized 8/16-bit texture read as "
+                     "normalized float; this texture's format has no filtered form");
+    for (uint32_t ch = 1; ch < 4; ++ch)
+      if (d.channel_bits[ch] && d.channel_bits[ch] != bits)
+        ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+                 "linear filtering of a texture whose channels differ in width");
+
+    // A 1D texture filters as 2D, height 1, at y = 0.
+    const uint32_t fdims = dims == 1 ? 2 : dims;
+    const uint32_t size[3] = {d.width, dims == 1 ? 1u : d.height, d.depth};
+    int base[3] = {0, 0, 0}, frac[3] = {0, 0, 0};
+    for (uint32_t i = 0; i < fdims; ++i) {
+      float x = i < dims ? coord[i] : 0.0f;
+      if (d.normalized_coords) x *= static_cast<float>(size[i]);
+      double v = x;
+      if (effective_address(d, i) == TexAddress::Clamp) v = std::clamp(v, 0.5, size[i] - 0.5);
+      const double xb = v - 0.5;
+      double fl = std::floor(xb);
+      int f = static_cast<int>(std::floor((xb - fl) * 256 + 0.5));
+      if (f >= 256) { fl += 1; f = 0; }
+      base[i] = static_cast<int>(fl);
+      frac[i] = f;
+    }
+    int w[8];
+    tex_weights(fdims, frac, w);
+
+    const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
+    const uint64_t plane = row * (d.height ? d.height : 1);
+    ExactSum fsum[4];
+    int64_t isum[4] = {0, 0, 0, 0};
+    for (int k = 0; k < (fdims == 3 ? 8 : 4); ++k) {
+      if (w[k] == 0) continue;
+      uint32_t idx[3] = {0, 0, 0};
+      bool inside = true;
+      const int off[3] = {k & 1, (k >> 1) & 1, (k >> 2) & 1};
+      for (uint32_t i = 0; i < fdims; ++i)
+        if (!wrap_coord(effective_address(d, i), int64_t{base[i]} + off[i], size[i], &idx[i])) inside = false;
+      if (!inside) continue;   // the border colour, zero
+      const uint64_t addr = d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes;
+      for (uint32_t ch = 0; ch < 4; ++ch) {
+        if (!d.channel_bits[ch]) continue;
+        const uint64_t raw = texel_channel_bits(d, addr, ch, ins, lane);
+        if (is_float) {
+          const double t = bits == 32 ? static_cast<double>(f32(raw)) : f16_to_double(raw);
+          fsum[ch].add(w[k] * t);
+        } else if (unorm) {
+          isum[ch] += int64_t{w[k]} * static_cast<int64_t>(bits == 8 ? raw * 257 : raw);
+        } else {
+          isum[ch] += int64_t{w[k]} * static_cast<int16_t>(raw);
+        }
+      }
+    }
+    for (uint32_t ch = 0; ch < 4; ++ch) {
+      float r;
+      if (!d.channel_bits[ch]) {
+        r = ch == 3 ? 1.0f : 0.0f;
+      } else if (is_float) {
+        // Scaling by 1/256 is exact, so round the sum of weight x texel and
+        // divide after. A non-finite texel takes the plain arithmetic.
+        ExactSum scaled;
+        bool finite = true;
+        for (int i = 0; i < fsum[ch].n; ++i) {
+          if (!std::isfinite(fsum[ch].e[i])) finite = false;
+          scaled.add(fsum[ch].e[i] / 256);
+        }
+        r = finite ? tex_round_sum(scaled, bits == 16) : static_cast<float>(fsum[ch].approx() / 256);
+      } else {
+        const int K = std::max(tex_round_half_up(isum[ch], 256), unorm ? 0 : -32767);
+        r = static_cast<float>(static_cast<double>(K) / (unorm ? 65535.0 : 32767.0));
+      }
+      out[ch] = static_cast<uint32_t>(f32bits(r));
+    }
+  }
+
   void exec_tex(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTex& op, Mask m) {
     Lanes _s_obj;
     const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
@@ -4623,13 +4835,17 @@ class Interpreter {
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Texture);
-      if (d.filter != TexFilter::Point)
-        ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
-                 "cudaFilterModeLinear is not implemented. Interpolation between texels is a "
-                 "documented weighted average, but hardware computes the weights in a fixed-point "
-                 "format with 8 fractional bits, so a float implementation would differ from the "
-                 "device in the low bits -- which is exactly what differential testing here is "
-                 "meant to catch. Point sampling is exact");
+      if (d.filter == TexFilter::Linear) {
+        if (!op.ctype.is_float())
+          ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+                   "linear filtering with integer coordinates");
+        float c[3] = {0, 0, 0};
+        for (uint32_t i = 0; i < op.dims; ++i) c[i] = f32(coord[i][lane]);
+        uint32_t r[4];
+        tex_linear(ins, lane, d, op.dims, c, r);
+        for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = r[ch];
+        continue;
+      }
 
       const uint32_t size[3] = {d.width, d.height, d.depth};
       bool inside = true;
@@ -4645,7 +4861,7 @@ class Interpreter {
         } else {
           c = static_cast<int64_t>(static_cast<int32_t>(coord[i][lane]));
         }
-        if (!wrap_coord(d.address[i], c, size[i], &idx[i])) { inside = false; break; }
+        if (!wrap_coord(effective_address(d, i), c, size[i], &idx[i])) { inside = false; break; }
       }
 
       if (!inside) {

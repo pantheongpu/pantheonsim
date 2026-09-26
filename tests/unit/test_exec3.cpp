@@ -20,6 +20,7 @@ using vgpu::exec::TextureDesc;
 using vgpu::exec::ChannelKind;
 using vgpu::exec::TexAddress;
 using vgpu::exec::TexKind;
+using vgpu::exec::TexFilter;
 
 namespace {
 const char* kHeader = ".version 8.3\n.target sm_86\n.address_size 64\n";
@@ -3782,6 +3783,247 @@ VTEST(a_surface_access_past_the_edge_faults_rather_than_wrapping) {
   cfg.textures = &tex;
   auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(9)}, e.mem, e.prof));
   VCHECK(err.code() == Err::OutOfBounds);
+}
+
+// Linear filtering against a table recorded on an RTX 3060 (sm_86) running the
+// same fetches on the same textures (the whole rule set is checked bit for bit
+// by e2e_texture_filtering; these are its corners, runnable without nvcc):
+// the 8-bit weight rounding halves up (x = 1 + 127.5/256 and 1 + 128.5/256), a
+// 1D texture is 2D at y = 0 so border mode blends in half a border row, the
+// f32 sum rounds ties away from zero, unorm8 filters as 16-bit (u*257) and
+// half rounds to half, snorm16 clamps -32768 only after the blend, and the
+// trilinear weights -- read directly off a texture whose texels are 1 and 512
+// -- split z, then x, then y, including at the corners where the split is a
+// tie and beyond the far edges, where clamp mode clamps the coordinate first.
+VTEST(tex_linear_filtering_matches_hardware) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry t1(.param .u64 t, .param .f32 x, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f5, [x];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    tex.1d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5}];
+    st.global.v4.f32 [%rd3], {%f1, %f2, %f3, %f4};
+    ret;
+}
+.visible .entry t2(.param .u64 t, .param .f32 x, .param .f32 y, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f5, [x];
+    ld.param.f32 %f6, [y];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    tex.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}];
+    st.global.v4.f32 [%rd3], {%f1, %f2, %f3, %f4};
+    ret;
+}
+.visible .entry t3(.param .u64 t, .param .f32 x, .param .f32 y, .param .f32 z, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f5, [x];
+    ld.param.f32 %f6, [y];
+    ld.param.f32 %f7, [z];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    tex.3d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6, %f7, %f7}];
+    st.global.v4.f32 [%rd3], {%f1, %f2, %f3, %f4};
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16);
+  auto argf = [](float f) {
+    std::vector<uint8_t> b(4);
+    std::memcpy(b.data(), &f, 4);
+    return b;
+  };
+  auto texture = [&](uint32_t w, uint32_t h, uint32_t dpt, ChannelKind kind, uint32_t bits,
+                     uint32_t channels, bool normalized_read, TexAddress mode, const void* data) {
+    TextureDesc d;
+    d.width = w;
+    d.height = h;
+    d.depth = dpt;
+    d.kind = kind;
+    d.channels = channels;
+    for (uint32_t c = 0; c < channels; ++c) d.channel_bits[c] = bits;
+    d.texel_bytes = bits / 8 * channels;
+    d.pitch_bytes = w * d.texel_bytes;
+    d.read_as_normalized_float = normalized_read;
+    d.filter = TexFilter::Linear;
+    for (auto& a : d.address) a = mode;
+    const uint64_t bytes = uint64_t{d.pitch_bytes} * (h ? h : 1) * (dpt ? dpt : 1);
+    d.base = e.mem.alloc(bytes);
+    e.mem.write(d.base, data, bytes);
+    return d;
+  };
+  TextureTable tex;
+  LaunchConfig cfg;
+  cfg.textures = &tex;
+  auto fetch = [&](int entry, const TextureDesc& d, std::vector<float> c) {
+    tex[0x7777] = d;
+    std::vector<std::vector<uint8_t>> args{arg_u64(0x7777)};
+    for (float v : c) args.push_back(argf(v));
+    args.push_back(arg_u64(out));
+    exec::launch(m.entries[entry], cfg, args, e.mem, e.prof);
+    std::array<uint32_t, 4> r{};
+    e.mem.read(out, r.data(), 16);
+    return r;
+  };
+
+  // 1D float [3, -5, 7, 11], clamp and border.
+  const float t1[4] = {3.f, -5.f, 7.f, 11.f};
+  const float xs[] = {0x1p-1f, 0x1.7f8p+0f, 0x1.808p+0f, 0x1.266666p+1f, -0x1.666666p-1f, 0x1.39999ap+2f};
+  const uint32_t want_clamp[] = {0x40400000u, 0xc0a00000u, 0xc09e8000u, 0x40938000u, 0x40400000u, 0x41300000u};
+  const uint32_t want_border[] = {0x3fc00000u, 0xc0200000u, 0xc01d0000u, 0x40150000u, 0x00000000u, 0x00000000u};
+  for (int mode = 0; mode < 2; ++mode) {
+    const TextureDesc d = texture(4, 0, 0, ChannelKind::Float, 32, 1, false,
+                                  mode ? TexAddress::Border : TexAddress::Clamp, t1);
+    for (int i = 0; i < 6; ++i) VCHECK_EQ(fetch(0, d, {xs[i]})[0], (mode ? want_border : want_clamp)[i]);
+  }
+
+  struct Case2 { float x, y; std::array<uint32_t, 4> want; };
+  const uint8_t u8[16] = {0, 255, 17, 200, 91, 3, 128, 64, 250, 5, 77, 1, 33, 190, 222, 100};
+  const Case2 cu8[] = {
+      {0x1.ccccccp-1f, 0x1.4cccccp+0f, {0x3f0a568au, 0x3ebd7cbdu, 0x3ef144f1u, 0x3e77e4f8u}},
+      {0x1.451eb8p+0f, 0x1.3851ecp-1f, {0x3e8e5c8eu, 0x3e8f228fu, 0x3ee0aee1u, 0x3ebc48bcu}},
+      {0x1.8p+0f, 0x1.8p+0f, {0x3e048485u, 0x3f3ebebfu, 0x3f5ededfu, 0x3ec8c8c9u}}};
+  const TextureDesc du8 = texture(2, 2, 0, ChannelKind::Unsigned, 8, 4, true, TexAddress::Clamp, u8);
+  for (const auto& c : cu8) VCHECK(fetch(1, du8, {c.x, c.y}) == c.want);
+
+  const uint16_t h16[16] = {0x3c00, 0xc000, 0x3555, 0x7bff, 0x0001, 0x4248, 0xbc00, 0x3800,
+                            0x5a00, 0x2e66, 0x0400, 0xc248, 0x3bff, 0x1400, 0x77ff, 0x6bff};
+  const Case2 ch[] = {
+      {0x1.ccccccp-1f, 0x1.4cccccp+0f, {0x42b96000u, 0x3d530000u, 0x4623e000u, 0x46106000u}},
+      {0x1.451eb8p+0f, 0x1.3851ecp-1f, {0x40996000u, 0x3fde2000u, 0x452fe000u, 0x46596000u}},
+      {0x1.8a3d7p-1f, 0x1.35c29p+0f, {0x42c84000u, 0xbdfec000u, 0x45c3e000u, 0x46642000u}}};
+  const TextureDesc dh = texture(2, 2, 0, ChannelKind::Float, 16, 4, false, TexAddress::Clamp, h16);
+  for (const auto& c : ch) VCHECK(fetch(1, dh, {c.x, c.y}) == c.want);
+
+  const int16_t s16[16] = {-32768, 32767, -1, 1000, 12345, -32768, -30000, 5,
+                           7, -7, 32000, -32000, -32768, -32768, 100, -100};
+  const Case2 cs[] = {
+      {0x1.ccccccp-1f, 0x1.4cccccp+0f, {0xbed2e1a6u, 0xbe8e0d1cu, 0x3ecc1d98u, 0xbeeed9deu}},
+      {0x1.451eb8p+0f, 0x1.3851ecp-1f, {0xbd112122u, 0xbf100120u, 0xbf1a4b35u, 0xbc890112u}},
+      {0x1.333334p-1f, 0x1.333334p-1f, {0xbf495593u, 0x3f34ff6au, 0x3bb40168u, 0xbd813102u}}};
+  const TextureDesc ds = texture(2, 2, 0, ChannelKind::Signed, 16, 4, true, TexAddress::Clamp, s16);
+  for (const auto& c : cs) VCHECK(fetch(1, ds, {c.x, c.y}) == c.want);
+
+  // Trilinear weights: texel k is 1 or 512 in channel k/2, so each result
+  // channel is (w_even + 512 w_odd) / 256.
+  float w3[32] = {};
+  for (int i = 0; i < 8; ++i) w3[i * 4 + i / 2] = (i % 2) ? 512.f : 1.f;
+  const TextureDesc d3 = texture(2, 2, 2, ChannelKind::Float, 32, 4, false, TexAddress::Clamp, w3);
+  struct Case3 { float x, y, z; std::array<uint32_t, 4> want; };
+  auto at = [](int a, int b, int c) { return std::array<float, 3>{0.5f + a / 256.f, 0.5f + b / 256.f, 0.5f + c / 256.f}; };
+  const std::pair<std::array<int, 3>, std::array<uint32_t, 4>> c3[] = {
+      {{0, 120, 240}, {0x3d100000u, 0x3ce00000u, 0x3f000000u, 0x3ee00000u}},
+      {{120, 0, 240}, {0x41804000u, 0x00000000u, 0x43627f00u, 0x00000000u}},
+      {{15, 240, 120}, {0x3d000000u, 0x4183c000u, 0x3ce00000u, 0x4166a000u}},
+      {{30, 120, 120}, {0x41820000u, 0x4181c000u, 0x41638000u, 0x41632000u}},
+      {{45, 60, 75}, {0x4241c800u, 0x41811800u, 0x41a17800u, 0x40c1e000u}},
+      {{120, 120, 240}, {0x41004000u, 0x41004000u, 0x42f08600u, 0x42d47800u}},
+      {{255, 1, 128}, {0x437e0000u, 0x40000000u, 0x437e0000u, 0x40000000u}}};
+  for (const auto& [abc, want] : c3) {
+    const auto p = at(abc[0], abc[1], abc[2]);
+    VCHECK(fetch(2, d3, {p[0], p[1], p[2]}) == want);
+  }
+  const Case3 far[] = {
+      {0x1.266666p+1f, 0x1.b33334p+0f, 0x1.733334p+1f, {0x00000000u, 0x00000000u, 0x00000000u, 0x44000000u}},
+      {-0x1.99999ap-2f, 0x1.99999ap-1f, 0x1.19999ap+1f, {0x00000000u, 0x00000000u, 0x3f330000u, 0x3e9a0000u}}};
+  for (const auto& c : far) VCHECK(fetch(2, d3, {c.x, c.y, c.z}) == c.want);
+}
+
+// Signed 8-bit normalized texels are refused under a linear filter, by name.
+VTEST(tex_linear_filtering_refuses_signed_8bit_normalized) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.f32 %f5, 0f3FC00000;
+    tex.1d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5}];
+    st.global.f32 [%rd3], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16), data = e.mem.alloc(16);
+  TextureTable tex;
+  TextureDesc d;
+  d.base = data;
+  d.width = 4;
+  d.kind = ChannelKind::Signed;
+  d.channel_bits[0] = 8;
+  d.texel_bytes = 1;
+  d.read_as_normalized_float = true;
+  d.filter = TexFilter::Linear;
+  tex[0x42] = d;
+  LaunchConfig cfg;
+  cfg.textures = &tex;
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(0x42), arg_u64(out)}, e.mem, e.prof));
+  VCHECK_CONTAINS(err.message(), "signed 8-bit normalized");
+}
+
+// Wrap and mirror are defined for normalized coordinates only; with
+// unnormalized ones a real GPU clamps (measured on an RTX 3060: texels
+// [3, -5, 7, 11] give 3, 11, 11, 11, 3 at x = -1.3, 4.6, 5.2, 9.7, -4.1 in
+// both modes, point and linear alike).
+VTEST(tex_wrap_and_mirror_clamp_unnormalized_coordinates) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .f32 x, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f5, [x];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    tex.1d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5}];
+    st.global.f32 [%rd3], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16), data = e.mem.alloc(16);
+  const float t[4] = {3.f, -5.f, 7.f, 11.f};
+  e.mem.write(data, t, 16);
+  const float xs[] = {-1.3f, 4.6f, 5.2f, 9.7f, -4.1f};
+  const float want[] = {3.f, 11.f, 11.f, 11.f, 3.f};
+  for (TexAddress mode : {TexAddress::Wrap, TexAddress::Mirror})
+    for (TexFilter filter : {TexFilter::Point, TexFilter::Linear}) {
+      TextureTable tex;
+      TextureDesc d;
+      d.base = data;
+      d.width = 4;
+      d.pitch_bytes = 16;
+      d.kind = ChannelKind::Float;
+      d.channel_bits[0] = 32;
+      d.texel_bytes = 4;
+      d.filter = filter;
+      for (auto& a : d.address) a = mode;
+      tex[0x43] = d;
+      LaunchConfig cfg;
+      cfg.textures = &tex;
+      for (int i = 0; i < 5; ++i) {
+        std::vector<uint8_t> xa(4);
+        std::memcpy(xa.data(), &xs[i], 4);
+        exec::launch(m.entries[0], cfg, {arg_u64(0x43), xa, arg_u64(out)}, e.mem, e.prof);
+        VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), want[i]);
+      }
+    }
 }
 
 VTEST(a_texture_handle_used_as_a_surface_is_refused) {
