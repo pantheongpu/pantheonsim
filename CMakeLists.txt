@@ -39,6 +39,7 @@ set(VGPU_PROFILES
   nvidia/a10g
   nvidia/l4
   nvidia/l40s
+  amd/mi250x
   amd/mi300x
   amd/mi325x
   amd/mi350x
@@ -773,6 +774,11 @@ set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_pytorch COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh)
 # Alone: it is the heaviest test there is, and the machines are shared.
 set_tests_properties(amd_pytorch PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# And on gfx90a (MI250X, one of its two dies), which numbers its matrix
+# instructions otherwise and keeps a few gfx940 dropped.
+add_test(NAME amd_pytorch_mi250x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/mi250x)
+set_tests_properties(amd_pytorch_mi250x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # And on gfx950 (MI350X), whose kernels are PyTorch's and the libraries' own
 # builds for it.

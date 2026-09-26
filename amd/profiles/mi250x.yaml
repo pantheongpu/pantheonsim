@@ -1,0 +1,51 @@
+# VirtualGPU device profile: AMD Instinct MI250X, one of its two dies.
+# Values from public AMD documentation. verified: false means nothing here has
+# been confirmed by hardware characterization yet -- treat as placeholders.
+#
+# An MI250X is two graphics compute dies (GCDs) in one package, and HIP,
+# rocm-smi and rocminfo each see a GCD as a device of its own: 110 compute
+# units and 64 GB of HBM2e each. So a device here is one GCD, and an MI250X is
+# VGPU_DEVICE_COUNT=2. Kernels built for gfx90a (CDNA2) run on it.
+id: amd/mi250x
+vendor: amd
+model: "AMD Instinct MI250X"
+architecture: cdna2
+# AMD parts have no compute capability; the gfx target is what identifies them.
+gcn_arch: "gfx90a"
+# As HIP names it, with the features it runs with: SRAM ECC on, XNACK off,
+# the settings an Instinct part ships with.
+gcn_arch_full: "gfx90a:sramecc+:xnack-"
+warp_size: 64
+vram_bytes: 68719476736        # 64 GiB of HBM2e a GCD
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 1024]
+  max_grid_dim: [2147483647, 2147483647, 2147483647]
+  shared_mem_per_block_bytes: 65536
+  shared_mem_per_block_optin_bytes: 65536
+  registers_per_block: 65536
+  multiprocessors: 110         # a GCD's; 220 across the package
+  registers_per_sm: 65536
+  max_threads_per_sm: 2048
+  max_blocks_per_sm: 32
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 65536
+  # A GCD's L2, which is what HIP reports: 8 MB (CDNA2 whitepaper).
+  l2_cache_bytes: 8388608
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+telemetry:
+  power_limit_w: 560           # the package's (datasheet): both GCDs together
+  sm_clock_max_mhz: 1700
+  mem_clock_max_mhz: 1600
+  temperature_max_c: 100
+  pci_vendor_id: 4098          # 0x1002 AMD
+  pci_device_id: 29708         # 0x740c Aldebaran [Instinct MI250X/MI250]
+  ecc: true                    # HBM with ECC, always on (AMD datasheet)
+  memory: hbm                  # rows are remapped on failure
+  memory_temperature: true     # rocm-smi reports an HBM sensor; unchecked on a real card
+  pcie_link: "Gen4 x16"        # datasheet; unchecked on a real card

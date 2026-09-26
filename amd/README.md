@@ -259,6 +259,20 @@ modelled:
 - **Decoder check:** `tests/data/isa_corpus_gfx950.txt` holds every instruction shape PyTorch's, hipBLASLt's and rocBLAS's gfx950 code uses. The decoder must print each one as `llvm-objdump` does.
 - **Extracting code objects:** `amd_fatbin_extract` (`tools/fatbin-extract.cpp`) writes out what a library carries for one target, which is how that corpus is gathered.
 
+## gfx90a (MI250X)
+
+`VGPU_GPU=amd/mi250x` is one of an MI250X's two dies, as HIP, rocminfo and rocm-smi each see it: 110 compute units and 64 GB. `VGPU_DEVICE_COUNT=2` gives the whole package. PyTorch's 20 checks pass on it (ctest `amd_pytorch_mi250x`). The fp8 one checks that PyTorch refuses fp8, as it does on the card.
+
+- **Instruction numbering:** gfx90a (CDNA2) numbers some instructions differently from gfx940 and later, so the decoder takes the code object's target (`gcn::Target`, from `e_flags`). The differences were found by asking LLVM's disassembler about every opcode of each encoding on both targets:
+  - int8 matrix instructions with K of 8 and 16
+  - the bfloat16 ones four a lane (`_1k`), renumbered on gfx940
+  - the older bfloat16 ones two a lane
+  - `v_mad_f32`, `v_mad_legacy_f32`, `v_mac_f32` and `v_madmk_f32`: the product rounded before the add, and denormals flushed
+  - `buffer_wbinvl1` and `buffer_invl2`
+  - FLAT_SCRATCH as a register
+- **Scratch:** gfx90a has no flat scratch set up by the hardware. A kernel reaches its private memory through the private segment buffer resource it is handed, with buffer loads and stores the card swizzles across the wave's lanes. The executor hands it that resource and a wave offset, and unswizzles its accesses. This is how rocBLAS's gfx90a kernels spill.
+- **Decoder check:** `tests/data/isa_corpus_gfx90a.txt` holds 1628 instruction shapes from PyTorch's, hipBLASLt's and rocBLAS's gfx90a code. Each decodes, and prints in gfx90a's names (`glc`, `slc`, `v_mfma_f32_32x32x8f16`), as `llvm-objdump` prints it.
+
 ## Textures
 
 The GPUs modelled here, the MI300 family (gfx942 and gfx950), have no texture

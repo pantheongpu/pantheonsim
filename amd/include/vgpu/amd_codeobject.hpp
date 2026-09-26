@@ -58,6 +58,11 @@ struct Kernel {
   // after another, so a kernel that asks for x and z finds z where y would
   // have been.
   bool group_id_x = true, group_id_y = true, group_id_z = true;
+  // And after them, where RSRC2 asks: the work-group's info (bit 10), then
+  // the wave's byte offset into its private segment (bit 0) -- which a
+  // gfx90a kernel adds to its scratch accesses, and gfx940 and later, whose
+  // flat scratch the hardware sets up, are not given.
+  bool group_info = false, private_wave_offset = false;
 };
 
 // A variable the kernels share: a __device__ global. It lives in the module's

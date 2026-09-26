@@ -412,6 +412,8 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     kern.group_id_x = (d.rsrc2 >> 7) & 1;
     kern.group_id_y = (d.rsrc2 >> 8) & 1;
     kern.group_id_z = (d.rsrc2 >> 9) & 1;
+    kern.group_info = (d.rsrc2 >> 10) & 1;
+    kern.private_wave_offset = d.rsrc2 & 1;
     // The user SGPRs the features above take, or the count the descriptor
     // gives (RSRC2's USER_SGPR field) where that is more: a kernel that asks
     // for its first arguments preloaded into SGPRs (gfx942's kernarg
