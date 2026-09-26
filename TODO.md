@@ -11,7 +11,7 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   H2D/D2H/D2D, OOB/UAF/double-free/interior-free/misalignment diagnostics
 - M4 PTX parser: ld/st(param/global), mov, cvta, add/sub/mul/min/max/div/rem,
   and/or/xor/shl/shr, mad.lo, fma, mul.wide, setp, selp, predication (@/@!),
-  bra, bar.sync 0, ret/exit; sregs tid/ntid/ctaid/nctaid/laneid;
+  bra, bar.sync (all sixteen barriers since), ret/exit; sregs tid/ntid/ctaid/nctaid/laneid;
   0f/0d float literals; precise unsupported-PTX errors
 - M5 SIMT interpreter: 32-lane warps, mask divergence + reconvergence stack,
   functional cross-warp bar.sync, deterministic round-robin scheduler,
@@ -792,6 +792,37 @@ narrows what counts as observable, not what the detector looks at.
   helpers in shared memory and in global memory and loads through it,
   exact; it fails on main.
 
+- TMA's im2col mode (sm_90): `cuTensorMapEncodeIm2col` in the driver and
+  through `cudaGetDriverEntryPoint`, with the checks cuda.h documents (the
+  corners' ranges per rank, a non-empty box, channels up to 256, pixels up
+  to 1024), `cp.async.bulk.tensor` `.im2col` loads with their offsets
+  (multicast too), and `.im2col_no_offs` stores and reductions. The ISA
+  shows the walk in figures rather than words, so it is taken from the code
+  that relies on it -- CuTe's im2col traits and CUTLASS's convolution
+  corners: the box runs from the lower corner to dim + upper - 1 along each
+  of W, H and D, stepped by the traversal stride, W fastest, then the batch;
+  a load starts at the instruction's pixel and reads each pixel at its base
+  plus the im2col offsets, zero outside the tensor. Checked by unit tests
+  (the corners at each rank's width, the encoder's refusals, a walk that
+  wraps and runs off the batch, the store side, a map used in the wrong
+  mode), by tma_im2col.cu, which compares every tile of four convolutions
+  (strides, dilation, padding, 1D and 2D) with the im2col matrix worked out
+  from the definition of a convolution, and by CUTLASS's own SM90 conv2d
+  fprop test, whose eight tile and cluster shapes pass against its host
+  reference and fail with the offsets broken.
+
+- The CTA's sixteen barriers (PTX ISA 9.7.15.1): `bar.sync` and
+  `barrier.sync` on any of barriers 0-15, with or without a thread count,
+  `bar.arrive`, register operands, and a guarded barrier the whole warp
+  agrees on. A barrier with a count completes when that many threads have
+  arrived, a warp counting as all its threads (the ISA "marks warps'
+  arrival"); one without is the whole CTA. Warp-specialized kernels hand
+  work between producer and consumer warps this way, so none of CUTLASS's
+  Hopper GEMMs or convolutions loaded before -- found by running its conv
+  test. A block whose warps can only wait on barriers that can no longer
+  complete is reported as a deadlock, naming the barrier and how far it
+  got; before, the block quietly ended with the warp still waiting.
+
 ## Not implemented (fails loudly, never silently)
 
 This list was stale for a while, which is its own kind of wrong: it still named
@@ -799,7 +830,8 @@ textures, grid sync and host-pinned memory long after all three worked. A
 roadmap that overstates what is missing misleads as much as one that overstates
 what is done.
 
-- PTX, refused by name: TMA's im2col mode, gather/scatter, attribute
+- PTX, refused by name: TMA's gather/scatter and `.im2col::w` modes
+  (Blackwell), attribute
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle with 32B/64B atoms
   (Blackwell), the sparse and
@@ -1103,6 +1135,7 @@ scripts/run-pantheon-workloads.sh.
 
    `wgmma`, TMA and distributed shared memory are done now (see "Hopper's
    warpgroup MMA", "TMA and clusters" and "Distributed shared memory"). What
-   is left of Hopper is TMA's im2col and gather modes, refused by name.
-   (`cp.reduce.async.bulk` and `tensormap.replace` are done -- see "TMA
-   reductions" and "Tensor maps changed on the device".)
+   was left of Hopper -- `cp.reduce.async.bulk`, `tensormap.replace` and
+   TMA's im2col mode -- is done too (see "TMA reductions", "Tensor maps
+   changed on the device" and "TMA's im2col mode"). The gather and
+   `.im2col::w` modes are Blackwell's.

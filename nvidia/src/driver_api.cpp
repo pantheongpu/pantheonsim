@@ -1606,14 +1606,25 @@ VGPU_EXPORT CUresult cuTensorMapReplaceAddress(void* tensorMap, void* globalAddr
   });
 }
 
-VGPU_EXPORT CUresult cuTensorMapEncodeIm2col(void*, unsigned int, unsigned int, void*,
-                                             const unsigned long long*, const unsigned long long*,
-                                             const int*, const int*, unsigned int, unsigned int,
-                                             const unsigned int*, unsigned int, unsigned int,
-                                             unsigned int, unsigned int) {
+VGPU_EXPORT CUresult cuTensorMapEncodeIm2col(void* tensorMap, unsigned int dataType, unsigned int rank,
+                                             void* globalAddress, const unsigned long long* globalDim,
+                                             const unsigned long long* globalStrides,
+                                             const int* lowerCorner, const int* upperCorner,
+                                             unsigned int channelsPerPixel, unsigned int pixelsPerColumn,
+                                             const unsigned int* elementStrides, unsigned int interleave,
+                                             unsigned int swizzle, unsigned int l2Promotion,
+                                             unsigned int oobFill) {
   return api("cuTensorMapEncodeIm2col", false, false, [&](ShimState&) -> CUresult {
-    throw vgpu::Error::make(vgpu::Err::Unsupported,
-                            "cuTensorMapEncodeIm2col: TMA's im2col mode is not implemented");
+    std::string why;
+    switch (vgpu::exec::encode_im2col(tensorMap, dataType, rank, globalAddress, globalDim, globalStrides,
+                                      lowerCorner, upperCorner, channelsPerPixel, pixelsPerColumn,
+                                      elementStrides, interleave, swizzle, l2Promotion, oobFill, &why)) {
+      case vgpu::exec::TmapResult::Ok: return CUDA_SUCCESS;
+      case vgpu::exec::TmapResult::Unsupported:
+        throw vgpu::Error::make(vgpu::Err::Unsupported, "cuTensorMapEncodeIm2col: ", why);
+      case vgpu::exec::TmapResult::Invalid: break;
+    }
+    throw vgpu::Error::make(vgpu::Err::InvalidValue, "cuTensorMapEncodeIm2col: ", why);
   });
 }
 

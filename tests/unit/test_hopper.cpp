@@ -1169,6 +1169,192 @@ VTEST(tensormap_replace_refuses_what_no_map_could_hold) {
                   "value is an immediate");
 }
 
+// im2col maps: the corners survive encoding at the width each rank keeps
+// (16, 8 and 5 bits, negative values included), and the encoder refuses what
+// cuda.h says it must.
+VTEST(im2col_map_encoding_and_its_limits) {
+  alignas(64) uint8_t buf[128];
+  const unsigned long long dims[5] = {16, 9, 7, 5, 2}, strides[4] = {64, 576, 4032, 20160};
+  const unsigned es[5] = {1, 2, 1, 1, 1};
+  std::string why;
+  for (unsigned rank = 3; rank <= 5; ++rank) {
+    const int lim = rank == 3 ? 32768 : rank == 4 ? 128 : 16;
+    const int lower[3] = {-lim, -1, -lim}, upper[3] = {lim - 1, -2, 0};
+    VCHECK(exec::encode_im2col(buf, 7, rank, reinterpret_cast<void*>(0x10000), dims, strides, lower, upper,
+                               16, 32, es, 0, 0, 0, 0, &why) == exec::TmapResult::Ok);
+    exec::TensorMap m;
+    VCHECK(m.decode(buf));
+    VCHECK(m.im2col);
+    VCHECK_EQ(m.channels, 16u);
+    VCHECK_EQ(m.pixels, 32u);
+    for (unsigned i = 0; i + 2 < rank; ++i) {
+      VCHECK_EQ(m.lower[i], lower[i]);
+      VCHECK_EQ(m.upper[i], upper[i]);
+    }
+    VCHECK_EQ(m.elem_stride[1], 2u);
+  }
+  const int lo[3] = {0, 0, 0}, far[3] = {200, 0, 0}, empty[3] = {-20, 0, 0};
+  auto refused = [&](unsigned rank, const int* lower, const int* upper, unsigned c, unsigned px) {
+    return exec::encode_im2col(buf, 7, rank, reinterpret_cast<void*>(0x10000), dims, strides, lower, upper, c,
+                               px, es, 0, 0, 0, 0, &why) != exec::TmapResult::Ok;
+  };
+  VCHECK(refused(2, lo, lo, 16, 32));
+  VCHECK_CONTAINS(why, "3, 4 or 5");
+  VCHECK(refused(4, far, lo, 16, 32));
+  VCHECK_CONTAINS(why, "[-128, 127]");
+  VCHECK(refused(3, lo, empty, 16, 32));   // W = 9, upper -20: no pixel left
+  VCHECK_CONTAINS(why, "non-zero area");
+  VCHECK(refused(3, lo, lo, 257, 32));
+  VCHECK_CONTAINS(why, "channelsPerPixel");
+  VCHECK(refused(3, lo, lo, 16, 1025));
+  VCHECK_CONTAINS(why, "pixelsPerColumn");
+}
+
+namespace {
+// A 3D (NWC) f32 activation, W = 5, N = 2, C = 4, element (n, w, c) = 100n + 10w + c + 1.
+exec::TensorMap nwc_map(uint64_t addr) {
+  exec::TensorMap t;
+  t.address = addr;
+  t.rank = 3;
+  t.type = exec::TmapType::F32;
+  t.dim = {4, 5, 2, 1, 1};
+  t.stride = {4, 16, 80, 0, 0};
+  t.elem_stride = {1, 1, 1, 1, 1};
+  t.im2col = true;
+  t.channels = 4;
+  t.pixels = 8;
+  t.lower = {-1, 0, 0};    // padding 1
+  t.upper = {-1, 0, 0};    // 3-tap filter, padding 1: bases -1 .. 3
+  return t;
+}
+}  // namespace
+
+// An im2col load walks its pixels through the box -- W from lower to W + upper
+// - 1, then the next image -- reading each at base + offset, zero outside the
+// image, and zero once the batch has run out.
+VTEST(im2col_load_walks_the_box_and_the_batch) {
+  MemoryManager mem{1 << 20};
+  const uint64_t g = mem.alloc(2 * 5 * 4 * 4), out = mem.alloc(8 * 4 * 4);
+  for (int n = 0; n < 2; ++n)
+    for (int w = 0; w < 5; ++w)
+      for (int c = 0; c < 4; ++c)
+        mem.store_scalar(g + ((n * 5 + w) * 4 + c) * 4, 4, f32_bits(float(100 * n + 10 * w + c + 1)));
+  run(R"(
+.visible .entry k(.param .align 64 .b8 tmap[128], .param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .b16 %rs<2>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    .shared .align 128 .b8 tile[128];
+    .shared .align 8 .b64 bar;
+    mov.b64 %rd1, tmap;
+    cvta.param.u64 %rd2, %rd1;
+    mov.u32 %r1, tile;
+    mov.u32 %r2, bar;
+    mbarrier.init.shared::cta.b64 [%r2], 1;
+    mbarrier.arrive.expect_tx.shared::cta.b64 _, [%r2], 128;
+    mov.u32 %r3, 0;     // c
+    mov.u32 %r4, 1;     // w base: output 2 of a padding-1 conv
+    mov.u32 %r5, 1;     // n
+    mov.b16 %rs1, 2;    // filter tap 2
+    cp.async.bulk.tensor.3d.shared::cluster.global.im2col.mbarrier::complete_tx::bytes [%r1], [%rd2, {%r3, %r4, %r5}], [%r2], {%rs1};
+WAIT:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1, [%r2], 0;
+    @!%p1 bra WAIT;
+    ld.param.u64 %rd3, [out];
+    mov.u32 %r6, 0;
+COPY:
+    add.u32 %r7, %r1, %r6;
+    ld.shared.u32 %r8, [%r7];
+    cvt.u64.u32 %rd4, %r6;
+    add.u64 %rd5, %rd3, %rd4;
+    st.global.u32 [%rd5], %r8;
+    add.u32 %r6, %r6, 4;
+    setp.lt.u32 %p1, %r6, 128;
+    @%p1 bra COPY;
+    ret;
+}
+)", LaunchConfig{}, {tmap_arg(nwc_map(g)), arg_u64(out)}, mem);
+  // Bases walk 1, 2, 3 in image 1, then image 2 does not exist. Reading at
+  // base + 2: w = 3, 4, then 5 (past the edge), then nothing.
+  const int want_w[8] = {3, 4, -1, -1, -1, -1, -1, -1};
+  for (int px = 0; px < 8; ++px)
+    for (int c = 0; c < 4; ++c) {
+      const float want = want_w[px] < 0 ? 0.0f : float(100 + 10 * want_w[px] + c + 1);
+      VCHECK_EQ(mem.load_scalar(out + (px * 4 + c) * 4, 4), uint64_t{f32_bits(want)});
+    }
+}
+
+// The store side, .im2col_no_offs: pixels written back along the same walk,
+// with nothing written outside the tensor.
+VTEST(im2col_store_writes_the_pixels_back) {
+  MemoryManager mem{1 << 20};
+  const uint64_t g = mem.alloc(2 * 5 * 4 * 4);
+  for (int i = 0; i < 40; ++i) mem.store_scalar(g + i * 4, 4, 0xEEEEEEEEu);
+  run(R"(
+.visible .entry k(.param .align 64 .b8 tmap[128])
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<4>;
+    .shared .align 128 .b8 tile[128];
+    mov.b64 %rd1, tmap;
+    cvta.param.u64 %rd2, %rd1;
+    mov.u32 %r1, tile;
+    mov.u32 %r2, %tid.x;
+    shl.b32 %r3, %r2, 2;
+    add.u32 %r4, %r1, %r3;
+    st.shared.u32 [%r4], %r2;
+    bar.sync 0;
+    setp.ne.u32 %p1, %r2, 0;
+    @%p1 bra DONE;
+    mov.u32 %r5, 0;
+    mov.u32 %r6, -1;    // w base -1: the first pixel is in the padding
+    fence.proxy.async.shared::cta;
+    cp.async.bulk.tensor.3d.global.shared::cta.im2col_no_offs.bulk_group [%rd2, {%r5, %r6, %r5}], [%r1];
+    cp.async.bulk.commit_group;
+    cp.async.bulk.wait_group 0;
+DONE:
+    ret;
+}
+)", [] { LaunchConfig c; c.block = {32, 1, 1}; return c; }(), {tmap_arg(nwc_map(g))}, mem);
+  // Pixels -1, 0, 1, 2, 3 of image 0 (the box ends at W + upper - 1 = 3, so
+  // column 4 is never a base), then -1, 0, 1 of image 1; -1 is in the
+  // padding and not written. Pixel p's channels hold 4p .. 4p + 3.
+  for (int n = 0; n < 2; ++n)
+    for (int w = 0; w < 5; ++w)
+      for (int c = 0; c < 4; ++c) {
+        const int px = n == 0 ? (w <= 3 ? w + 1 : -1) : (w <= 1 ? 6 + w : -1);
+        const uint64_t want = px < 0 ? 0xEEEEEEEEu : uint64_t(px * 4 + c);
+        VCHECK_EQ(mem.load_scalar(g + ((n * 5 + w) * 4 + c) * 4, 4), want);
+      }
+}
+
+VTEST(tensor_copies_refuse_a_map_of_the_other_mode) {
+  MemoryManager mem{1 << 20};
+  const uint64_t g = mem.alloc(256);
+  const std::string tile_load = R"(
+.visible .entry k(.param .align 64 .b8 tmap[128])
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    .shared .align 128 .b8 tile[128];
+    .shared .align 8 .b64 bar;
+    mov.b64 %rd1, tmap;
+    cvta.param.u64 %rd2, %rd1;
+    mov.u32 %r1, tile;
+    mov.u32 %r2, bar;
+    mov.u32 %r3, 0;
+    mbarrier.init.shared::cta.b64 [%r2], 1;
+    cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes [%r1], [%rd2, {%r3, %r3, %r3}], [%r2];
+    ret;
+}
+)";
+  auto err = VCAPTURE(Error, run(tile_load, LaunchConfig{}, {tmap_arg(nwc_map(g))}, mem));
+  VCHECK_CONTAINS(err.message(), "made by cuTensorMapEncodeIm2col");
+}
+
 VTEST(tensor_copy_refuses_a_map_nothing_encoded) {
   MemoryManager mem{1 << 20};
   std::vector<uint8_t> junk(128, 0x5A);

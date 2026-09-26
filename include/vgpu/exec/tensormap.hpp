@@ -36,6 +36,19 @@ struct TensorMap {
   std::array<uint64_t, 5> stride{};         // bytes; stride[0] is the element size
   std::array<uint32_t, 5> box{};            // elements traversed per dimension
   std::array<uint32_t, 5> elem_stride{};    // traversal step, 1..8
+  // im2col mode (cuTensorMapEncodeIm2col): the tensor is NWC, NHWC or NDHWC,
+  // dimension 0 the channels and the last the batch. A load walks
+  // `pixels` pixels through the bounding box in W, H, D space -- from
+  // lower[i] to dim + upper[i] - 1 along each, W fastest -- and takes
+  // `channels` channels of each. Index 0 of the corners is W.
+  bool im2col = false;
+  std::array<int32_t, 3> lower{}, upper{};
+  uint32_t channels = 0;                    // 1..256
+  uint32_t pixels = 0;                      // 1..1024
+
+  // Bits per bounding-box corner value, which is what the hardware keeps
+  // (cuTensorMapEncodeIm2col): 16 for a 3D tensor, 8 for 4D, 5 for 5D.
+  static uint32_t corner_bits(uint32_t rank) { return rank == 3 ? 16 : rank == 4 ? 8 : 5; }
 
   static uint32_t type_bytes(TmapType t) {
     switch (t) {
@@ -66,6 +79,16 @@ struct TensorMap {
     for (int i = 0; i < 4; ++i) q[13] |= uint64_t{box[i] & 0xFFFF} << (16 * i);
     q[14] = box[4] & 0xFFFF;
     for (int i = 0; i < 5; ++i) q[14] |= uint64_t{elem_stride[i] & 0xF} << (16 + 4 * i);
+    // The last word: im2col's fields, zero for a tiled map.
+    if (im2col) {
+      q[15] = 1 | (uint64_t{(channels - 1) & 0xFF} << 8) | (uint64_t{(pixels - 1) & 0x3FF} << 16);
+      const uint32_t b = corner_bits(rank), n = rank - 2;
+      const uint64_t mask = (1ull << b) - 1;
+      for (uint32_t i = 0; i < n; ++i) {
+        q[15] |= (static_cast<uint64_t>(lower[i]) & mask) << (32 + b * i);
+        q[15] |= (static_cast<uint64_t>(upper[i]) & mask) << (32 + b * (n + i));
+      }
+    }
     std::memcpy(out, q, sizeof q);
   }
 
@@ -86,6 +109,25 @@ struct TensorMap {
     for (int i = 0; i < 4; ++i) box[i] = static_cast<uint32_t>((q[13] >> (16 * i)) & 0xFFFF);
     box[4] = static_cast<uint32_t>(q[14] & 0xFFFF);
     for (int i = 0; i < 5; ++i) elem_stride[i] = static_cast<uint32_t>((q[14] >> (16 + 4 * i)) & 0xF);
+    im2col = q[15] & 1;
+    lower = upper = {};
+    channels = pixels = 0;
+    if (im2col) {
+      if (rank < 3) return false;
+      channels = static_cast<uint32_t>((q[15] >> 8) & 0xFF) + 1;
+      pixels = static_cast<uint32_t>((q[15] >> 16) & 0x3FF) + 1;
+      const uint32_t b = corner_bits(rank), n = rank - 2;
+      auto field = [&](uint32_t k) {   // a b-bit two's-complement value
+        const uint64_t v = (q[15] >> (32 + b * k)) & ((1ull << b) - 1);
+        int32_t x = static_cast<int32_t>(v);
+        if (v >> (b - 1)) x -= int32_t{1} << b;
+        return x;
+      };
+      for (uint32_t i = 0; i < n; ++i) {
+        lower[i] = field(i);
+        upper[i] = field(n + i);
+      }
+    }
     return rank >= 1 && rank <= 5;
   }
 
@@ -170,6 +212,78 @@ inline TmapResult encode_tiled(void* tensorMap, unsigned dataType, unsigned rank
   if (swz && uint64_t{boxDim[0]} * esize > swz)
     return bad("the box's inner dimension (" + std::to_string(uint64_t{boxDim[0]} * esize) +
                " bytes) is wider than the " + std::to_string(swz) + "-byte swizzle");
+  m.encode(tensorMap);
+  return TmapResult::Ok;
+}
+
+// cuTensorMapEncodeIm2col's checks and encoding, as for encode_tiled. The
+// corners' limits and the other rules are the ones cuda.h documents.
+inline TmapResult encode_im2col(void* tensorMap, unsigned dataType, unsigned rank, void* globalAddress,
+                                const unsigned long long* globalDim, const unsigned long long* globalStrides,
+                                const int* lowerCorner, const int* upperCorner, unsigned channelsPerPixel,
+                                unsigned pixelsPerColumn, const unsigned* elementStrides, unsigned interleave,
+                                unsigned swizzle, unsigned l2Promotion, unsigned oobFill, std::string* why) {
+  auto bad = [&](std::string w) { *why = std::move(w); return TmapResult::Invalid; };
+  auto unsupported = [&](std::string w) { *why = std::move(w) + " is not implemented"; return TmapResult::Unsupported; };
+  if (!tensorMap || !globalDim || !globalStrides || !lowerCorner || !upperCorner || !elementStrides)
+    return bad("a required pointer is null");
+  if (reinterpret_cast<uintptr_t>(tensorMap) % 64) return bad("tensorMap must be 64-byte aligned");
+  if (dataType > 15) return bad("unknown tensorDataType " + std::to_string(dataType));
+  if (rank < 3 || rank > 5) return bad("an im2col tensorRank must be 3, 4 or 5");
+  if (interleave > 2 || swizzle > 6 || l2Promotion > 3 || oobFill > 1)
+    return bad("an enum argument is out of range");
+  const auto type = static_cast<TmapType>(dataType);
+  const uint32_t esize = TensorMap::type_bytes(type);
+  if (esize == 0) return unsupported("the packed sub-byte types (16U4, 16U6)");
+  if (interleave != 0) return unsupported("an interleaved layout (NC/8HWC8, NC/16HWC16)");
+  if (swizzle > 3) return unsupported("the 128B swizzle with 32B or 64B atomicity (Blackwell)");
+  const uint64_t addr = reinterpret_cast<uint64_t>(globalAddress);
+  if (addr % 16) return bad("globalAddress must be 16-byte aligned");
+  TensorMap m;
+  m.address = addr;
+  m.rank = rank;
+  m.type = type;
+  m.swizzle = static_cast<TmapSwizzle>(swizzle);
+  const bool is_float = type == TmapType::F16 || type == TmapType::F32 || type == TmapType::F64 ||
+                        type == TmapType::BF16 || type == TmapType::F32Ftz ||
+                        type == TmapType::TF32 || type == TmapType::TF32Ftz;
+  if (oobFill && !is_float) return bad("the NaN out-of-bounds fill needs a floating-point type");
+  m.oob_nan = static_cast<uint8_t>(oobFill);
+  m.stride[0] = esize;
+  for (unsigned i = 0; i < rank; ++i) {
+    if (globalDim[i] == 0 || globalDim[i] > (1ull << 32))
+      return bad("globalDim[" + std::to_string(i) + "] must be 1 to 2^32");
+    if (elementStrides[i] == 0 || elementStrides[i] > 8)
+      return bad("elementStrides[" + std::to_string(i) + "] must be 1 to 8");
+    m.dim[i] = globalDim[i];
+    m.elem_stride[i] = i == 0 ? 1 : elementStrides[i];
+  }
+  for (unsigned i = 0; i + 1 < rank; ++i) {
+    if (globalStrides[i] % 16 || globalStrides[i] >= (1ull << 40))
+      return bad("globalStrides[" + std::to_string(i) + "] must be a multiple of 16 below 2^40");
+    m.stride[i + 1] = globalStrides[i];
+  }
+  const int bits = static_cast<int>(TensorMap::corner_bits(rank));
+  const int lo = -(1 << (bits - 1)), hi = (1 << (bits - 1)) - 1;
+  for (unsigned i = 0; i + 2 < rank; ++i) {
+    if (lowerCorner[i] < lo || lowerCorner[i] > hi || upperCorner[i] < lo || upperCorner[i] > hi)
+      return bad("a " + std::to_string(rank) + "D tensor's box corners must be within [" +
+                 std::to_string(lo) + ", " + std::to_string(hi) + "]");
+    // The box runs from lower to dim + upper - 1, which must hold a pixel.
+    if (static_cast<int64_t>(globalDim[i + 1]) + upperCorner[i] - lowerCorner[i] <= 0)
+      return bad("the bounding box must have non-zero area");
+    m.lower[i] = lowerCorner[i];
+    m.upper[i] = upperCorner[i];
+  }
+  if (channelsPerPixel == 0 || channelsPerPixel > 256) return bad("channelsPerPixel must be 1 to 256");
+  if (pixelsPerColumn == 0 || pixelsPerColumn > 1024) return bad("pixelsPerColumn must be 1 to 1024");
+  const uint32_t swz = TensorMap::swizzle_bytes(m.swizzle);
+  if (swz && uint64_t{channelsPerPixel} * esize > swz)
+    return bad("channelsPerPixel times the element size (" + std::to_string(uint64_t{channelsPerPixel} * esize) +
+               " bytes) is wider than the " + std::to_string(swz) + "-byte swizzle");
+  m.im2col = true;
+  m.channels = channelsPerPixel;
+  m.pixels = pixelsPerColumn;
   m.encode(tensorMap);
   return TmapResult::Ok;
 }

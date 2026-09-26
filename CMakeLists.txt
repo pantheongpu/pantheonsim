@@ -596,6 +596,8 @@ vgpu_unit_test(test_hopper)
 vgpu_unit_test(test_fastpath)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
+# The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
+vgpu_unit_test(test_barriers)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
@@ -1198,17 +1200,22 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 900)
+  add_test(NAME e2e_tma_im2col COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_tma_im2col.sh)
+  set_tests_properties(e2e_tma_im2col PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
   add_test(NAME e2e_tensormap_replace_cute COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_tensormap_replace_cute.sh)
   set_tests_properties(e2e_tensormap_replace_cute PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 900)
   add_test(NAME e2e_cutlass_hopper COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_hopper.sh)
-  # Long enough for the five compiles to run one after another on a small runner.
+  # Long enough for the six compiles to run one after another on a small runner.
   set_tests_properties(e2e_cutlass_hopper PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    TIMEOUT 3000)
+    TIMEOUT 3600)
 endif()
 
 # Distributed shared memory through cooperative_groups' cluster API.

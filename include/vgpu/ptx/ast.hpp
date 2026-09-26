@@ -397,6 +397,11 @@ struct OpBulkCopy {
   bool reduce = false;
   AtomOp red_op = AtomOp::Add;
   Type red_ty;
+  // A tensor copy's load mode: the box (tile), or im2col's column of pixels.
+  // A load's im2col offsets (one per spatial dimension) are added to the
+  // pixel it starts from; stores and reductions take .im2col_no_offs.
+  bool im2col = false;
+  std::vector<Operand> im2col_offsets;
 };
 // tensormap.replace (sm_90a): one field of a 128-byte tensor map in global or
 // shared memory rewritten in place, as CUTLASS's grouped GEMMs retarget a map
@@ -586,7 +591,17 @@ struct OpNotPred { Reg dst; Reg src; };
 // atomics can easily contain no `atom` at all.
 struct OpAtom { AtomOp op = AtomOp::Add; Space space = Space::Generic; Type ty; Reg dst; Addr addr; Operand b; Operand c; bool discards_result = false; bool packed_half = false; };
 struct OpBra { size_t target = 0; std::string label; };  // target = instruction index
-struct OpBar {};                                     // bar.sync 0
+// bar.sync / barrier.sync / bar.arrive on one of the CTA's sixteen barriers,
+// and bar.warp.sync (`warp`), which only reconverges the warp. With a count,
+// the barrier completes when that many threads -- whole warps -- have
+// arrived; without one, when every thread of the CTA that has not exited has.
+struct OpBar {
+  bool warp = false;
+  bool arrive = false;   // arrive without waiting (bar.arrive)
+  Operand id;            // 0..15
+  bool have_count = false;
+  Operand count;
+};
 // An instruction with nothing to do here: a memory fence, or a backoff hint.
 // Distinct from OpBar because a fence is *not* a barrier -- mapping membar onto
 // bar.sync made every fence wait for the whole block, which a kernel that

@@ -3514,11 +3514,16 @@ int rt_tensor_map_replace_address(void* tensorMap, void* globalAddress) {
   return tmap_result("cuTensorMapReplaceAddress",
                      vgpu::exec::replace_address(tensorMap, globalAddress, &why), why);
 }
-int rt_tensor_map_encode_im2col(void*, unsigned, unsigned, void*, const unsigned long long*,
-                                const unsigned long long*, const int*, const int*, unsigned, unsigned,
-                                const unsigned*, unsigned, unsigned, unsigned, unsigned) {
-  return tmap_result("cuTensorMapEncodeIm2col", vgpu::exec::TmapResult::Unsupported,
-                     "TMA's im2col mode is not implemented");
+int rt_tensor_map_encode_im2col(void* tensorMap, unsigned dataType, unsigned rank, void* globalAddress,
+                                const unsigned long long* globalDim, const unsigned long long* globalStrides,
+                                const int* lowerCorner, const int* upperCorner, unsigned channelsPerPixel,
+                                unsigned pixelsPerColumn, const unsigned* elementStrides, unsigned interleave,
+                                unsigned swizzle, unsigned l2Promotion, unsigned oobFill) {
+  std::string why;
+  const auto r = vgpu::exec::encode_im2col(tensorMap, dataType, rank, globalAddress, globalDim, globalStrides,
+                                           lowerCorner, upperCorner, channelsPerPixel, pixelsPerColumn,
+                                           elementStrides, interleave, swizzle, l2Promotion, oobFill, &why);
+  return tmap_result("cuTensorMapEncodeIm2col", r, why);
 }
 
 using GetProcAddressFn = int (*)(const char*, void**, int, unsigned long long, int*);

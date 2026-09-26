@@ -3157,6 +3157,7 @@ class Parser {
         else if (p == "bulk_group") group_completion = true;
         else if (p == "noftz") noftz = true;
         else if (p == "tile" || p == "relaxed" || inert_mem_modifier(p)) ;
+        else if (p == "im2col_no_offs") op.im2col = true;
         else if (p == "add") { op.red_op = AtomOp::Add; have_op = true; }
         else if (p == "min") { op.red_op = AtomOp::Min; have_op = true; }
         else if (p == "max") { op.red_op = AtomOp::Max; have_op = true; }
@@ -3166,11 +3167,13 @@ class Parser {
         else if (p == "or") { op.red_op = AtomOp::Or; have_op = true; }
         else if (p == "xor") { op.red_op = AtomOp::Xor; have_op = true; }
         else if (auto t = parse_type_token(p); t && !op.tensor) { op.red_ty = *t; have_ty = true; }
-        else return unsupported("cp.reduce.async.bulk modifier '." + p + "' (im2col, overrides and "
-                                "multimem are not implemented)");
+        else return unsupported("cp.reduce.async.bulk modifier '." + p + "' (overrides and multimem "
+                                "are not implemented)");
       }
       if (!have_op) return unsupported("cp.reduce.async.bulk needs a reduction operation");
       if (op.tensor ? !op.dims : !have_ty) return unsupported("cp.reduce.async.bulk form");
+      if (op.im2col && (!op.tensor || op.dims < 3))
+        return unsupported("im2col_no_offs is a mode of 3D to 5D tensor reductions");
       if (spaces.size() != 2 || spaces[1] != "shared")
         return unsupported("cp.reduce.async.bulk reads from .shared::cta");
       const bool to_cluster = spaces[0] == "shared::cluster";
@@ -3268,6 +3271,7 @@ class Parser {
       } else {
         OpBulkCopy op;
         std::vector<std::string> spaces;
+        std::string im2col_mode;
         bool mbar_completion = false, group_completion = false;
         for (size_t i = 3; i < parts.size(); ++i) {
           const std::string& p = parts[i];
@@ -3278,7 +3282,8 @@ class Parser {
           else if (p == "bulk_group") group_completion = true;
           else if (p == "tile" || p == "weak" || p == "b128" || inert_mem_modifier(p)) ;
           else if (p == "multicast::cluster" || p == "multicast::cluster::16b") op.multicast = true;
-          else return unsupported("cp.async.bulk modifier '." + p + "' (im2col, gather/scatter, "
+          else if (p == "im2col" || p == "im2col_no_offs") { op.im2col = true; im2col_mode = p; }
+          else return unsupported("cp.async.bulk modifier '." + p + "' (gather/scatter, im2col::w, "
                                   "masks, overrides and reports are not implemented)");
         }
         if (spaces.size() != 2) return unsupported("cp.async.bulk needs a destination and a source space");
@@ -3292,6 +3297,13 @@ class Parser {
           return unsupported("cp.async.bulk between shared memories is a plain, unicast copy");
         op.to_shared = g2s || s2s;
         op.shared_to_shared = s2s;
+        if (op.im2col) {
+          if (!op.tensor || op.dims < 3)
+            return unsupported("im2col is a mode of 3D to 5D tensor copies");
+          // A load takes the offsets (.im2col); a store has none to take.
+          if (g2s != (im2col_mode == "im2col"))
+            return unsupported("tensor loads take .im2col and stores .im2col_no_offs");
+        }
         if (op.to_shared && !mbar_completion)
           return unsupported("a cp.async.bulk load completes on an mbarrier (.mbarrier::complete_tx::bytes)");
         if (s2g && !group_completion)
@@ -3315,6 +3327,13 @@ class Parser {
           }
           expect_punct(",");
           op.mbar = parse_addr(fn);
+          if (op.im2col) {
+            expect_punct(",");
+            op.im2col_offsets = parse_operand_vector_any();
+            if (op.im2col_offsets.size() != op.dims - 2)
+              return unsupported("an im2col load takes one offset per spatial dimension (" +
+                                 std::to_string(op.dims - 2) + ")");
+          }
           if (op.multicast) {
             expect_punct(",");
             op.cta_mask = parse_operand();
@@ -3419,7 +3438,8 @@ class Parser {
         if (parts[i] != "aligned" && !inert_mem_modifier(parts[i]))
           return unsupported("barrier.cluster modifier '." + parts[i] + "'");
       ins.op = op;
-    } else if ((op0 == "bar" || op0 == "barrier") && parts.size() > 1 && parts[1] == "red") {
+    } else if ((op0 == "bar" || op0 == "barrier") &&
+               std::find(parts.begin(), parts.end(), "red") != parts.end()) {
       // bar.red.<op>.<type> d, 0, [!]p
       std::optional<BarRedOp> rop;
       bool pred_ty = false, u32_ty = false;
@@ -3430,7 +3450,7 @@ class Parser {
         else if (p == "popc") rop = BarRedOp::Popc;
         else if (p == "pred") pred_ty = true;
         else if (p == "u32") u32_ty = true;
-        else if (p == "cta") ;
+        else if (p == "cta" || p == "red" || p == "aligned") ;
         else return unsupported("bar.red modifier '." + p + "'");
       }
       if (!rop) return unsupported("bar.red needs .and, .or or .popc");
@@ -3450,29 +3470,40 @@ class Parser {
       op.src = expect_reg_operand("bar.red source predicate");
       ins.op = op;
     } else if (op0 == "bar" || op0 == "barrier") {
-      bool sync_seen = false, warp_scope = false;
+      bool sync_seen = false, arrive_seen = false, warp_scope = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         if (parts[i] == "sync") sync_seen = true;
-        else if (parts[i] == "cta") ;
+        else if (parts[i] == "arrive") arrive_seen = true;
+        else if (parts[i] == "cta" || parts[i] == "aligned") ;
         else if (parts[i] == "warp") warp_scope = true;
-        else return unsupported("only bar.sync and bar.warp.sync are implemented");
+        else return unsupported("bar modifier '." + parts[i] + "'");
       }
-      if (!sync_seen) return unsupported("only bar.sync is implemented");
+      if (sync_seen == arrive_seen) return unsupported("bar needs one of .sync and .arrive");
+      if (warp_scope && arrive_seen) return unsupported("bar.warp.arrive");
       if (warp_scope) {
         // __syncwarp. A warp executes its lanes in lockstep here and diverged
         // paths reconverge at the earliest common pc, so the lanes named by the
         // mask are already synchronised by the time this is reached. The
         // operand is the member mask, which nothing needs to consume.
         (void)parse_operand();
-        ins.op = OpBar{};
+        OpBar op;
+        op.warp = true;
+        ins.op = op;
         expect_punct(";");
         return ins;
       }
-      Operand which = parse_operand();
-      if (auto* imm = std::get_if<ImmInt>(&which); !imm || imm->value != 0)
-        return unsupported("only barrier 0 (bar.sync 0) is implemented");
-      if (peek_punct(",")) return unsupported("partial barriers (bar.sync 0, N) not implemented");
-      ins.op = OpBar{};
+      OpBar op;
+      op.arrive = arrive_seen;
+      op.id = parse_operand();
+      if (auto* imm = std::get_if<ImmInt>(&op.id); imm && (imm->value < 0 || imm->value > 15))
+        return unsupported("a CTA has barriers 0 to 15");
+      if (peek_punct(",")) {
+        next();
+        op.count = parse_operand();
+        op.have_count = true;
+      }
+      if (op.arrive && !op.have_count) return unsupported("bar.arrive needs a thread count");
+      ins.op = op;
     } else if (op0 == "ret" || op0 == "exit") {
       ins.op = OpRet{};
     } else {
