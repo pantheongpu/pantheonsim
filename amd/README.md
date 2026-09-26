@@ -239,6 +239,18 @@ a lock striped by address, and a fence (`buffer_wbl2`, `buffer_inv`) is a
 fence on the host. `amd_exec_bench` (`tools/exec-bench.cpp`) says how fast a
 kernel runs on the interpreter.
 
+## Textures
+
+The GPUs modelled here, the MI300 family (gfx942 and gfx950), have no texture
+units. hipcc refuses the texture API in their device code
+(`__HIP_NO_IMAGE_SUPPORT`), and ROCm's HIP on them reports image support 0
+and answers every call that would make an array, a texture or a surface with
+`hipErrorNotSupported`. The shim gives the same answers, so a program or
+library that calls them is told what it would be told on the card instead of
+failing to load. `tests/hipcc/textures.cpp` prints each answer; its output must
+match `tests/hipcc/rocm/textures.expected` on the shim, for each release's
+build of it, and on ROCm's own HIP over the HSA runtime.
+
 ## HSA
 
 The same library is also the HSA runtime (`src/hsa_api.cpp`, declared in

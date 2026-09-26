@@ -31,6 +31,8 @@ echo "wrote $(pwd)/printf.gfx942, printf.gfx942.o and its listing ($(wc -l < pri
 # Occupancy, device attributes, and a kernel reaching another device's memory.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 runtime.cpp -o runtime.gfx942
 echo "wrote $(pwd)/runtime.gfx942"
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 textures.cpp -o textures.gfx942
+echo "wrote $(pwd)/textures.gfx942"
 # A cooperative launch, whose work-groups wait for one another at a grid
 # barrier: the program, and its device code with the listing.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 cooperative.cpp -o cooperative.gfx942

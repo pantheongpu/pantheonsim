@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rebuilds the HIP programs in ../ (chevron, printf, runtime, cooperative,
-# pointers)
+# pointers, textures)
 # with every ROCm release installed, one directory each, for
 # amd/tests/e2e/run_rocm_versions.sh to run on the shim. A release is found
 # at ~/.local/share/rocm-<version>/opt/rocm-* or /opt/rocm-<version>*.
@@ -16,7 +16,7 @@ for v in 6.4 7.0 7.1 7.2; do
   export HIP_DEVICE_LIB_PATH=$([[ -d $rocm/amdgcn/bitcode ]] && echo "$rocm/amdgcn/bitcode" ||
                                ls -d "$rocm"/llvm/lib/clang/*/lib/amdgcn/bitcode 2>/dev/null | head -1)
   mkdir -p "$v"
-  for p in chevron printf runtime cooperative pointers; do
+  for p in chevron printf runtime cooperative pointers textures; do
     if "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 "../$p.cpp" -o "$v/$p.gfx942" 2>/dev/null; then
       echo "ROCm $v: built $p"
     else

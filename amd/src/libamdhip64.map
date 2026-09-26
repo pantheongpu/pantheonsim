@@ -15,9 +15,22 @@ hip_4.2 {
     __hipPushCallConfiguration;
     __hipRegisterFatBinary;
     __hipRegisterFunction;
+    __hipRegisterSurface;
+    __hipRegisterTexture;
     __hipRegisterVar;
     __hipUnregisterFatBinary;
+    hipArray3DCreate;
+    hipArrayCreate;
+    hipBindTexture;
+    hipBindTexture2D;
+    hipBindTextureToArray;
+    hipBindTextureToMipmappedArray;
+    hipCreateChannelDesc;
+    hipCreateSurfaceObject;
+    hipCreateTextureObject;
     hipCtxGetCurrent;
+    hipDestroySurfaceObject;
+    hipDestroyTextureObject;
     hipDeviceCanAccessPeer;
     hipDeviceDisablePeerAccess;
     hipDeviceEnablePeerAccess;
@@ -28,6 +41,7 @@ hip_4.2 {
     hipDeviceGetName;
     hipDeviceGetPCIBusId;
     hipDeviceGetStreamPriorityRange;
+    hipDeviceGetTexture1DLinearMaxWidth;
     hipDevicePrimaryCtxGetState;
     hipDeviceReset;
     hipDeviceSetCacheConfig;
@@ -47,8 +61,11 @@ hip_4.2 {
     hipExtStreamCreateWithCUMask;
     hipExtStreamGetCUMask;
     hipFree;
+    hipFreeArray;
+    hipFreeMipmappedArray;
     hipFuncGetAttributes;
     hipFuncSetAttribute;
+    hipGetChannelDesc;
     hipGetDevice;
     hipGetDeviceCount;
     hipGetDeviceProperties;
@@ -56,9 +73,15 @@ hip_4.2 {
     hipGetErrorName;
     hipGetErrorString;
     hipGetLastError;
+    hipGetMipmappedArrayLevel;
     hipGetStreamDeviceId;
     hipGetSymbolAddress;
     hipGetSymbolSize;
+    hipGetTextureAlignmentOffset;
+    hipGetTextureObjectResourceDesc;
+    hipGetTextureObjectResourceViewDesc;
+    hipGetTextureObjectTextureDesc;
+    hipGetTextureReference;
     hipHostFree;
     hipHostGetDevicePointer;
     hipHostMalloc;
@@ -75,25 +98,37 @@ hip_4.2 {
     hipLaunchCooperativeKernel;
     hipLaunchKernel;
     hipMalloc;
+    hipMalloc3DArray;
+    hipMallocArray;
     hipMallocManaged;
+    hipMallocMipmappedArray;
     hipMemGetAddressRange;
     hipMemGetInfo;
     hipMemPtrGetInfo;
     hipMemcpy;
     hipMemcpy2D;
     hipMemcpy2DAsync;
+    hipMemcpy2DFromArray;
+    hipMemcpy2DFromArrayAsync;
+    hipMemcpy2DToArray;
     hipMemcpyAsync;
+    hipMemcpyFromArray;
     hipMemcpyFromSymbol;
     hipMemcpyFromSymbolAsync;
     hipMemcpyPeerAsync;
+    hipMemcpyToArray;
     hipMemcpyToSymbol;
     hipMemcpyToSymbolAsync;
     hipMemcpyWithStream;
     hipMemset;
     hipMemsetAsync;
     hipMemsetD32Async;
+    hipMipmappedArrayCreate;
+    hipMipmappedArrayDestroy;
+    hipMipmappedArrayGetLevel;
     hipModuleGetFunction;
     hipModuleGetGlobal;
+    hipModuleGetTexRef;
     hipModuleLaunchKernel;
     hipModuleLoad;
     hipModuleLoadData;
@@ -119,17 +154,53 @@ hip_4.2 {
     hipStreamQuery;
     hipStreamSynchronize;
     hipStreamWaitEvent;
+    hipTexObjectCreate;
+    hipTexObjectDestroy;
+    hipTexObjectGetResourceDesc;
+    hipTexObjectGetResourceViewDesc;
+    hipTexObjectGetTextureDesc;
+    hipTexRefGetAddress;
+    hipTexRefGetAddressMode;
+    hipTexRefGetArray;
+    hipTexRefGetBorderColor;
+    hipTexRefGetFilterMode;
+    hipTexRefGetFlags;
+    hipTexRefGetFormat;
+    hipTexRefGetMaxAnisotropy;
+    hipTexRefGetMipMappedArray;
+    hipTexRefGetMipmapFilterMode;
+    hipTexRefGetMipmapLevelBias;
+    hipTexRefGetMipmapLevelClamp;
+    hipTexRefSetAddress;
+    hipTexRefSetAddress2D;
+    hipTexRefSetAddressMode;
+    hipTexRefSetArray;
+    hipTexRefSetBorderColor;
+    hipTexRefSetFilterMode;
+    hipTexRefSetFlags;
+    hipTexRefSetFormat;
+    hipTexRefSetMaxAnisotropy;
+    hipTexRefSetMipmapFilterMode;
+    hipTexRefSetMipmapLevelBias;
+    hipTexRefSetMipmapLevelClamp;
+    hipTexRefSetMipmappedArray;
+    hipUnbindTexture;
   local: *;
 };
 hip_4.3 {
   global:
+    hipArrayDestroy;
     hipGraphDestroy;
     hipGraphExecDestroy;
     hipGraphInstantiate;
     hipGraphLaunch;
+    hipImportExternalMemory;
+    hipImportExternalSemaphore;
+    hipMemcpy2DToArrayAsync;
     hipStreamBeginCapture;
     hipStreamEndCapture;
     hipStreamIsCapturing;
+    hipWaitExternalSemaphoresAsync;
 } hip_4.2;
 hip_4.4 {
   global:
@@ -143,6 +214,7 @@ hip_4.5 {
     hipGraphAddHostNode;
     hipGraphInstantiateWithFlags;
     hipGraphNodeGetDependencies;
+    hipGraphicsSubResourceGetMappedArray;
     hipStreamGetCaptureInfo;
     hipStreamGetCaptureInfo_v2;
     hipStreamUpdateCaptureDependencies;
@@ -165,6 +237,7 @@ hip_5.1 {
     hipMemGetAllocationGranularity;
     hipMemImportFromShareableHandle;
     hipMemMap;
+    hipMemMapArrayAsync;
     hipMemPoolCreate;
     hipMemPoolDestroy;
     hipMemPoolGetAttribute;
@@ -176,6 +249,9 @@ hip_5.1 {
     hipMemUnmap;
 } hip_5.0;
 hip_5.2 {
+  global:
+    hipMemcpy2DFromArray_spt;
+    hipMemcpy2DToArray_spt;
 } hip_5.1;
 hip_5.3 {
   global:
@@ -184,6 +260,9 @@ hip_5.3 {
     hipGraphDebugDotPrint;
     hipGraphRetainUserObject;
     hipLaunchHostFunc;
+    hipMemcpy2DFromArrayAsync_spt;
+    hipMemcpy2DToArrayAsync_spt;
+    hipMemcpyFromArray_spt;
     hipUserObjectCreate;
 } hip_5.2;
 hip_5.5 {
@@ -191,6 +270,10 @@ hip_5.5 {
     hipModuleLaunchCooperativeKernel;
 } hip_5.3;
 hip_5.6 {
+  global:
+    hipArray3DGetDescriptor;
+    hipArrayGetDescriptor;
+    hipArrayGetInfo;
 } hip_5.5;
 hip_6.0 {
   global:
@@ -200,6 +283,8 @@ hip_6.0 {
 hip_6.1 {
 } hip_6.0;
 hip_6.2 {
+  global:
+    hipMemcpy2DArrayToArray;
 } hip_6.1;
 hip_6.4 {
 } hip_6.2;
