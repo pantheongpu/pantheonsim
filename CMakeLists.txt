@@ -784,6 +784,10 @@ set_tests_properties(amd_pytorch_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TR
 add_test(NAME amd_pytorch_compile COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 3 1)
 set_tests_properties(amd_pytorch_compile PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# Composable Kernel's GEMMs, which PyTorch runs when told to prefer CK.
+add_test(NAME amd_pytorch_ck COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh ck.py 3 1)
+set_tests_properties(amd_pytorch_ck PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # Two processes, as torchrun runs them: RCCL across processes, and
 # DistributedDataParallel.
 add_test(NAME amd_pytorch_distributed COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch_distributed.sh)

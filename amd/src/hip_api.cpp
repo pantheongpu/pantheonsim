@@ -91,6 +91,14 @@ class ApiCall {
  public:
   explicit ApiCall(const char* name) {
     if (depth()++ != 0) return;
+    // VGPU_TRACE_API=1 names each HIP call a program makes, one line to
+    // stderr: what a library does through HIP, when it does not do what it
+    // should, is otherwise invisible.
+    static const bool trace = [] {
+      const char* t = std::getenv("VGPU_TRACE_API");
+      return t && t[0] == '1';
+    }();
+    if (trace) std::fprintf(stderr, "VirtualGPU HIP: %s\n", name);
     if (const auto* p = profiler(); p && p->api_enter) {
       hooks_ = p;
       token_ = p->api_enter(name);
@@ -1651,12 +1659,14 @@ void __hipUnregisterFatBinary(void** modules) {
 
 hipError_t __hipPushCallConfiguration(vgpu::amd::abi::Dim3 grid, vgpu::amd::abi::Dim3 block, size_t shared,
                                       hipStream_t stream) {
+  const ApiCall api("__hipPushCallConfiguration");
   g_call_configurations.push_back({grid, block, shared, stream});
   return hipSuccess;
 }
 
 hipError_t __hipPopCallConfiguration(vgpu::amd::abi::Dim3* grid, vgpu::amd::abi::Dim3* block, size_t* shared,
                                      hipStream_t* stream) {
+  const ApiCall api("__hipPopCallConfiguration");
   if (g_call_configurations.empty()) return hipErrorInvalidConfiguration;
   const CallConfiguration c = g_call_configurations.back();
   g_call_configurations.pop_back();
