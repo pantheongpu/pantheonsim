@@ -267,8 +267,13 @@ struct State {
 thread_local int State::current = 0;
 thread_local hipError_t State::last = hipSuccess;
 
+// Never destroyed: a library's exit handlers (a fat binary unregistered by
+// the program's module destructor, ROCm's HIP tearing down its programs)
+// still reach the runtime after static destructors would have run. The
+// memory it holds goes with the process; files it spills to are unlinked
+// already.
 State& state() {
-  static State s;
+  static State& s = *new State;
   return s;
 }
 
@@ -303,8 +308,11 @@ vgpu::runtime::Device* device(State& s) {
   return &s.rt->device(s.current);
 }
 
+// What the calling thread's next hipGetLastError says: the last call that
+// failed, as ROCm's HIP keeps it -- a call that succeeds leaves an earlier
+// failure where it is, and hipErrorNotReady (a query's answer) is no failure.
 hipError_t record(State& s, hipError_t e) {
-  s.last = e;
+  if (e != hipSuccess && e != hipErrorNotReady) s.last = e;
   return e;
 }
 
@@ -477,8 +485,10 @@ struct LaunchJob {
   // Arguments the caller has already placed on the device (an HSA dispatch
   // packet's kernarg_address), used where they are rather than copied.
   uint64_t kernarg_at = 0;
-  // A grid in work-items that is not whole work-groups (vgpu/amd_exec.hpp).
+  // A grid in work-items that is not whole work-groups, and whether the
+  // kernel's own work-group limit holds (vgpu/amd_exec.hpp): an HSA packet's.
   uint32_t grid_items[3] = {0, 0, 0};
+  bool kernel_limits = true;
 };
 
 hipError_t prepare_launch(State& s, int ordinal, const Module& module, const Kernel& kernel,
@@ -566,7 +576,7 @@ hipError_t run_launch(const LaunchJob& job) {
       std::copy(args.begin(), args.end(), segment.begin());
       mem.write(kernarg, segment.data(), segment.size());
     }
-    if (cooperative) {
+    if (cooperative && !job.kernarg_at) {
       // What the device library's grid barrier counts on (ockl's mg_info): a
       // grid of one, its work-groups, its work-items, and a counter for a
       // multi-grid barrier over that one grid, which passes straight through.
@@ -594,6 +604,8 @@ hipError_t run_launch(const LaunchJob& job) {
     dispatch.group_size[1] = block.y;
     dispatch.group_size[2] = block.z;
     for (int i = 0; i < 3; ++i) dispatch.grid_items[i] = job.grid_items[i];
+    dispatch.kernel_limits = job.kernel_limits;
+    dispatch.fill_hidden = !job.kernarg_at;   // a packet's segment is the caller's, hidden arguments and all
     dispatch.wave_size = static_cast<uint32_t>(d.profile().warp_size);
     dispatch.dynamic_lds = shared;   // what the launch adds to the kernel's own LDS
     dispatch.hostcall = job.hostcall;
@@ -3551,7 +3563,9 @@ hipError_t hipIpcOpenEventHandle(hipEvent_t*, vgpu::amd::abi::IpcMemHandle) {
 
 namespace vgpu::amd::shared {
 
-struct Loaded : Module {};
+struct Loaded : Module {
+  std::vector<uint8_t> host_image;
+};
 namespace {
 std::vector<std::unique_ptr<Loaded>> g_loaded;   // under State's mutex
 }  // namespace
@@ -3577,6 +3591,7 @@ const Loaded* load(int ordinal, const void* bytes, size_t size, std::string* why
   try {
     auto m = std::make_unique<Loaded>();
     m->object = load_code_object(std::string(static_cast<const char*>(bytes), size), "the code object");
+    m->host_image = m->object.image;   // place() gives up the object's own copy
     vgpu::runtime::Device& d = s.rt->device(ordinal);
     place(*m, d.memory());
     report_loaded(*m, ordinal, bytes, size);
@@ -3606,10 +3621,11 @@ void unload(const Loaded* m) {
 }
 
 const CodeObject& object(const Loaded* m) { return m->object; }
+const std::vector<uint8_t>& host_image(const Loaded* m) { return m->host_image; }
 uint64_t code_base(const Loaded* m) { return m->code_base; }
 
 bool run(int ordinal, const Loaded* m, const Kernel& k, const uint32_t grid[3], const uint32_t group_size[3],
-         uint32_t dynamic_lds, uint64_t kernarg, std::string* why) {
+         uint32_t dynamic_lds, uint64_t kernarg, bool cooperative, std::string* why) {
   State& s = state();
   uint32_t groups[3];
   for (int i = 0; i < 3; ++i) groups[i] = group_size[i] ? (grid[i] + group_size[i] - 1) / group_size[i] : 0;
@@ -3618,7 +3634,7 @@ bool run(int ordinal, const Loaded* m, const Kernel& k, const uint32_t grid[3], 
     std::lock_guard<std::mutex> lock(s.mutex);
     const hipError_t e = prepare_launch(s, ordinal, *m, k, {groups[0], groups[1], groups[2]},
                                         {group_size[0], group_size[1], group_size[2]}, dynamic_lds, {}, nullptr,
-                                        false, &job);
+                                        cooperative, &job);
     if (e != hipSuccess) {
       if (why) *why = hipGetErrorString(e);
       return false;
@@ -3626,9 +3642,21 @@ bool run(int ordinal, const Loaded* m, const Kernel& k, const uint32_t grid[3], 
   }
   job.kernarg_at = kernarg;
   for (int i = 0; i < 3; ++i) job.grid_items[i] = grid[i] % group_size[i] ? grid[i] : 0;
+  job.kernel_limits = false;   // a packet goes to the hardware as it is
   const hipError_t e = run_launch(job);
   if (e != hipSuccess && why) *why = "the kernel " + k.name + " failed";
   return e == hipSuccess;
+}
+
+void allow_peer(int from, int to) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (from != to) s.peers.insert({from, to});
+}
+int owner(uint64_t address) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  return s.rt ? owner_of(s, address) : -1;
 }
 
 void map_host(void* p, size_t n) {

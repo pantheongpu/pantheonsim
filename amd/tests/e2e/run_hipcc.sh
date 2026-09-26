@@ -122,6 +122,9 @@ expect "each device attribute is the property it names" "30 of 30 attributes agr
   "$(grep -o '^[0-9]* of [0-9]* attributes agree.*' <<< "$out")"
 expect "an attribute of a device that is not there is refused" "a device that is not there: hipErrorInvalidDevice" \
   "$(grep -o '^a device that is not there.*' <<< "$out")"
+expect "the last error is kept until it is read, past a call that succeeds" \
+  "the last error outlives a call that succeeds: hipErrorInvalidDevice, hipErrorInvalidDevice, then hipSuccess" \
+  "$(grep -o '^the last error outlives.*' <<< "$out")"
 expect "a kernel reads and writes a peer's memory once peer access is enabled" \
   "a kernel on device 0 read and wrote device 1's memory right for 256 of 256 elements" \
   "$(grep -o '^a kernel on device 0.*' <<< "$out")"
