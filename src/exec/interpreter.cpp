@@ -34,6 +34,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 #include "vgpu/exec/tensormap.hpp"
@@ -67,6 +68,16 @@ constexpr uint64_t kParamVaBase = 0x6ffd'0000'0000ull;
 constexpr uint64_t kParamVaSize = 1ull << 20;
 constexpr uint64_t kSharedVaBase = 0x6ffe'0000'0000ull;
 constexpr uint64_t kSharedVaSize = 1ull << 30;
+// Distributed shared memory: an address in the shared window whose bits from
+// here up are nonzero is in block rank (those bits - 1) of the cluster, and
+// the bits below are the offset in that block's shared memory. Zero means the
+// block issuing the access, so every ordinary shared address is already a
+// valid .shared::cluster address naming its own block, as the ISA requires
+// (the .shared::cta window is contained in the .shared::cluster one). A block
+// has at most 228 KiB of shared memory and a cluster at most 16 blocks, so
+// both fit with room to spare.
+constexpr uint32_t kClusterRankShift = 24;
+constexpr uint64_t kClusterOffsetMask = (1ull << kClusterRankShift) - 1;
 
 // Bit i == lane i active. 64 bits because a CDNA wavefront has 64 lanes; an
 // NVIDIA warp uses the low 32 and leaves the rest clear.
@@ -174,6 +185,9 @@ struct BlockCtx {
   // The thread-block cluster this block belongs to, for barrier.cluster. A
   // launch without clusters still has one per block.
   ClusterState* cluster_state = nullptr;
+  // True once every thread of the block has exited, when its shared memory
+  // is gone and another block of the cluster may no longer reach it.
+  const bool* exited = nullptr;
   // Backs %clock/%clock64/%globaltimer. Advanced once per warp instruction,
   // per block -- see the note at sreg_value() for why this is a counter and
   // not a time.
@@ -297,8 +311,16 @@ struct Warp {
 // because a cluster barrier only completes if every block can reach it.
 struct ClusterState {
   std::vector<std::vector<Warp>*> blocks;
+  // Each block's context by %cluster_ctarank, for distributed shared memory.
+  std::vector<const BlockCtx*> ranks;
   uint32_t phase = 0;
 };
+
+// %cluster_ctarank: x fastest within the cluster.
+uint32_t cluster_rank_of(const BlockCtx& ctx) {
+  return ctx.ctaid[0] % ctx.cluster[0] + ctx.ctaid[1] % ctx.cluster[1] * ctx.cluster[0] +
+         ctx.ctaid[2] % ctx.cluster[2] * ctx.cluster[0] * ctx.cluster[1];
+}
 
 // Strict mode, sampled once per launch: consulting it is a relaxed atomic load
 // rather than a getenv on a hot path, and a process that changes the variable
@@ -796,6 +818,7 @@ class Interpreter {
       for (uint32_t r = 0; r < size; ++r)
         scheds.push_back(make_scheduler(cfg_.scheduler, cfg_.scheduler_seed + (k * size + r) * 0x9E3779B97F4A7C15ull));
       ClusterState cs;
+      cs.ranks.assign(size, nullptr);
       for (uint32_t r = 0; r < size; ++r) {
         BlockState& b = blocks[r];
         b.ctx.ctaid = cluster_member(k, r);
@@ -806,6 +829,7 @@ class Interpreter {
         setup_block(b);
         b.ctx.cluster_state = &cs;
         cs.blocks.push_back(&b.warps);
+        cs.ranks[r] = &b.ctx;
       }
       constexpr uint64_t kSlice = 256;
       size_t live = blocks.size();
@@ -862,8 +886,11 @@ class Interpreter {
       const uint64_t k = (b.ctx.ctaid[0] / c[0]) + (b.ctx.ctaid[1] / c[1]) * ncx +
                          uint64_t{b.ctx.ctaid[2] / c[2]} * ncx * ncy;
       if (k < clusters.size()) {
-        b.ctx.cluster_state = &clusters[static_cast<size_t>(k)];
-        clusters[static_cast<size_t>(k)].blocks.push_back(&b.warps);
+        ClusterState& cs = clusters[static_cast<size_t>(k)];
+        b.ctx.cluster_state = &cs;
+        cs.blocks.push_back(&b.warps);
+        if (cs.ranks.empty()) cs.ranks.assign(size_t{c[0]} * c[1] * c[2], nullptr);
+        cs.ranks[cluster_rank_of(b.ctx)] = &b.ctx;
       }
     }
     // One warp-turn per block per round. Long enough that a block making real
@@ -932,6 +959,7 @@ class Interpreter {
     std::vector<Warp> warps;
     uint64_t clock = 0;
     bool done = false;
+    bool exited = false;   // every warp Done; see BlockCtx::exited
   };
 
   void setup_block(BlockState& b) {
@@ -942,6 +970,7 @@ class Interpreter {
     b.ctx.bar_red = &b.bar_red;
     b.ctx.mbar = &b.mbar;
     b.ctx.clock = &b.clock;
+    b.ctx.exited = &b.exited;
     if (detect_races() && !b.shared.empty()) {
       b.shadow.words.assign(b.shared.size() / 4 + 1, WordShadow{});
       b.ctx.shadow = &b.shadow;
@@ -1014,6 +1043,11 @@ class Interpreter {
     uint64_t turn = slice;
     if (sched_slice && (!turn || sched_slice < turn)) turn = sched_slice;
     run_warp_until_yield(b.warps[picked], b.ctx, turn);
+    if (b.warps[picked].state == Warp::State::Done) {
+      bool all = true;
+      for (const Warp& w : b.warps) all = all && w.state == Warp::State::Done;
+      b.exited = all;
+    }
     return true;
   }
 
@@ -1023,6 +1057,7 @@ class Interpreter {
     setup_block(b);
     ClusterState solo;   // a block with no explicit cluster is a cluster of one
     solo.blocks.push_back(&b.warps);
+    solo.ranks.push_back(&b.ctx);
     b.ctx.cluster_state = &solo;
     while (step_block(b, sched, /*slice=*/0)) {
     }
@@ -1389,10 +1424,7 @@ class Interpreter {
       // The block's linear rank inside its cluster, x fastest. This is the one
       // a real kernel uses most: it indexes the per-block slot in a
       // cluster-wide array.
-      case Sreg::ClusterCtaRank:
-        return uint64_t{ctx.ctaid[0] % ctx.cluster[0]} +
-               uint64_t{ctx.ctaid[1] % ctx.cluster[1]} * ctx.cluster[0] +
-               uint64_t{ctx.ctaid[2] % ctx.cluster[2]} * ctx.cluster[0] * ctx.cluster[1];
+      case Sreg::ClusterCtaRank: return cluster_rank_of(ctx);
       case Sreg::ClusterNCtaRank:
         return uint64_t{ctx.cluster[0]} * ctx.cluster[1] * ctx.cluster[2];
       case Sreg::IsExplicitCluster: return ctx.explicit_cluster ? 1u : 0u;
@@ -1696,6 +1728,63 @@ class Interpreter {
     return addr >= kSharedVaBase && addr < kSharedVaBase + kSharedVaSize;
   }
 
+  // ---- distributed shared memory ----
+
+  // A block of this block's cluster by rank, failing when there is no such
+  // block or it has exited: its shared memory went with it (the CUDA
+  // programming guide's reason for ending a kernel that uses distributed
+  // shared memory with cluster.sync()).
+  const BlockCtx& cluster_block(const BlockCtx& ctx, const Instr& ins, int lane, uint64_t rank) {
+    const ClusterState* cs = ctx.cluster_state;
+    const size_t n = cs ? cs->ranks.size() : 1;
+    if (!cs || rank >= n || !cs->ranks[rank])
+      ctx_fail(ins, lane, Err::OutOfBounds,
+               "a shared::cluster address names block rank " + std::to_string(rank) +
+                   " of a cluster of " + std::to_string(n) + " block" + (n == 1 ? "" : "s"));
+    const BlockCtx& b = *cs->ranks[rank];
+    if (&b != &ctx && b.exited && *b.exited)
+      ctx_fail(ins, lane, Err::OutOfBounds,
+               "block rank " + std::to_string(rank) +
+                   " of the cluster has exited, and its shared memory with it. A block whose "
+                   "shared memory other blocks use must wait for them (barrier.cluster, or "
+                   "cluster.sync()) before it exits");
+    return b;
+  }
+
+  // The block a shared-window address belongs to and the offset in it --
+  // see kClusterRankShift.
+  struct SharedRef {
+    const BlockCtx* owner;
+    uint64_t off;
+  };
+  SharedRef shared_ref(const BlockCtx& ctx, const Instr& ins, int lane, uint64_t addr) {
+    const uint64_t rel = addr - kSharedVaBase;
+    const uint64_t tag = rel >> kClusterRankShift;
+    if (!tag) return {&ctx, rel};
+    return {&cluster_block(ctx, ins, lane, tag - 1), rel & kClusterOffsetMask};
+  }
+  // The same, bounds-checked for `size` bytes.
+  SharedRef shared_at(const BlockCtx& ctx, const Instr& ins, int lane, uint64_t addr, uint64_t size) {
+    const SharedRef r = shared_ref(ctx, ins, lane, addr);
+    const size_t have = r.owner->shared ? r.owner->shared->size() : 0;
+    if (r.off + size > have)
+      ctx_fail(ins, lane, Err::OutOfBounds,
+               "shared memory access at offset " + std::to_string(r.off) + " (+" +
+                   std::to_string(size) + " bytes) exceeds the " + std::to_string(have) +
+                   "-byte shared allocation for " +
+                   (r.owner == &ctx ? std::string("this block")
+                                    : "block rank " + std::to_string(cluster_rank_of(*r.owner)) +
+                                          " of the cluster"));
+    return r;
+  }
+  // A shared::cluster address for `off` in block `rank`, as mapa returns it:
+  // the plain offset when that is the issuing block.
+  static uint64_t cluster_address(const BlockCtx& ctx, uint64_t rank, uint64_t off) {
+    off &= kClusterOffsetMask;
+    if (rank == cluster_rank_of(ctx)) return off;
+    return ((rank + 1) << kClusterRankShift) | off;
+  }
+
   // Race detection, off unless VGPU_RACE=1.
   static bool detect_races() { return g_race.load(std::memory_order_relaxed); }
   static bool races_strict() { return g_race_strict.load(std::memory_order_relaxed); }
@@ -1767,6 +1856,8 @@ class Interpreter {
     }
   }
 
+  // For copies that only ever reach the issuing block's own shared memory
+  // (cp.async): an address naming another block is out of its bounds.
   void check_shared(const BlockCtx& ctx, const Instr& ins, int lane, uint64_t addr, uint32_t size) {
     uint64_t off = addr - kSharedVaBase;
     size_t have = ctx.shared ? ctx.shared->size() : 0;
@@ -1809,12 +1900,14 @@ class Interpreter {
   uint64_t load_routed(Warp& w, const BlockCtx& ctx, const Instr& ins, uint32_t lane, uint64_t addr,
                        uint32_t size) {
     if (is_shared(addr)) {
-      check_shared(ctx, ins, static_cast<int>(lane), addr, size);
-      note_shared_access(ctx, ins, addr, size, /*is_write=*/false);
+      const SharedRef r = shared_at(ctx, ins, static_cast<int>(lane), addr, size);
+      // The race detector orders warps by their own block's barriers, which
+      // say nothing about another block's, so a remote access is not noted.
+      if (r.owner == &ctx) note_shared_access(ctx, ins, kSharedVaBase + r.off, size, /*is_write=*/false);
       uint64_t v = 0;
-      std::memcpy(&v, ctx.shared->data() + (addr - kSharedVaBase), size);
+      std::memcpy(&v, r.owner->shared->data() + r.off, size);
       try {
-        return mem_.shared_loaded(addr - kSharedVaBase, size, v);
+        return mem_.shared_loaded(r.off, size, v);
       } catch (const Error& e) {
         rethrow_with_context(e, ins, static_cast<int>(lane));
       }
@@ -1845,9 +1938,9 @@ class Interpreter {
   void store_routed(Warp& w, const BlockCtx& ctx, const Instr& ins, uint32_t lane, uint64_t addr,
                     uint32_t size, uint64_t value) {
     if (is_shared(addr)) {
-      check_shared(ctx, ins, static_cast<int>(lane), addr, size);
-      note_shared_access(ctx, ins, addr, size, /*is_write=*/true, value);
-      std::memcpy(ctx.shared->data() + (addr - kSharedVaBase), &value, size);
+      const SharedRef r = shared_at(ctx, ins, static_cast<int>(lane), addr, size);
+      if (r.owner == &ctx) note_shared_access(ctx, ins, kSharedVaBase + r.off, size, /*is_write=*/true, value);
+      std::memcpy(r.owner->shared->data() + r.off, &value, size);
       return;
     }
     if (is_local(addr)) {
@@ -3085,7 +3178,13 @@ class Interpreter {
         bool in_space = false;
         switch (op->space) {
           case Space::Shared:
+            // .shared is this block's; .shared::cluster any block's of the cluster.
             in_space = v >= kSharedVaBase && v < kSharedVaBase + kSharedVaSize;
+            if (in_space) {
+              const uint64_t tag = (v - kSharedVaBase) >> kClusterRankShift;
+              const size_t n = ctx.cluster_state ? ctx.cluster_state->ranks.size() : 1;
+              in_space = op->cluster ? tag <= n : (tag == 0 || tag - 1 == cluster_rank_of(ctx));
+            }
             break;
           case Space::Local:
             in_space = v >= kLocalVaBase && v < kLocalVaBase + kLocalVaSize;
@@ -3100,6 +3199,75 @@ class Interpreter {
             break;
         }
         p = in_space ? (p | (Mask{1} << lane)) : (p & ~(Mask{1} << lane));
+      }
+      return;
+    }
+    if (const auto* op = std::get_if<OpMapa>(&ins.op)) {
+      Lanes _s_a, _s_r;
+      const Lanes a = read_operand(w, ctx, ins, op->src, _s_a);
+      const Lanes& rank = read_operand(w, ctx, ins, op->rank, _s_r);
+      Lanes r{};
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        uint64_t v = op->wide ? a[lane] : static_cast<uint32_t>(a[lane]);
+        if (op->generic) {
+          if (!is_shared(v))
+            ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                     "mapa on a generic address that is not in shared memory");
+          v -= kSharedVaBase;
+        }
+        const uint64_t want = static_cast<uint32_t>(rank[lane]);
+        // A rank the cluster has. Whether that block is still running matters
+        // only to an access: mapa computes an address and touches nothing.
+        const size_t n = ctx.cluster_state ? ctx.cluster_state->ranks.size() : 1;
+        if (want >= n)
+          ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                   "mapa names block rank " + std::to_string(want) + " of a cluster of " +
+                       std::to_string(n) + " block" + (n == 1 ? "" : "s"));
+        r[lane] = cluster_address(ctx, want, v) + (op->generic ? kSharedVaBase : 0);
+      }
+      write_reg(w, op->dst, m, r, op->wide ? 64 : 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpGetCtaRank>(&ins.op)) {
+      Lanes _s_a;
+      const Lanes& a = read_operand(w, ctx, ins, op->src, _s_a);
+      Lanes r{};
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        uint64_t v = a[lane];
+        if (op->generic) {
+          if (!is_shared(v))
+            ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                     "getctarank on a generic address that is not in shared memory");
+          v -= kSharedVaBase;
+        }
+        const uint64_t tag = (v & (kSharedVaSize - 1)) >> kClusterRankShift;
+        r[lane] = tag ? tag - 1 : cluster_rank_of(ctx);
+      }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpStAsync>(&ins.op)) {
+      exec_st_async(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpTensormapReplace>(&ins.op)) {
+      exec_tensormap_replace(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpTensormapCopy>(&ins.op)) {
+      // A plain 128-byte copy; the proxy fence it carries orders it before
+      // the tensor-map reads that follow, which here are ordinary loads.
+      Lanes _s_d, _s_s;
+      const Lanes dst = addr_base(w, ctx, ins, op->dst, _s_d);
+      const Lanes src = addr_base(w, ctx, ins, op->src, _s_s);
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        const uint64_t d = dst[lane] + static_cast<uint64_t>(op->dst.offset);
+        const uint64_t sa = kSharedVaBase + src[lane] + static_cast<uint64_t>(op->src.offset);
+        for (uint64_t i = 0; i < 128; i += 8)
+          store_routed(w, ctx, ins, lane, d + i, 8, load_routed(w, ctx, ins, lane, sa + i, 8));
       }
       return;
     }
@@ -5506,6 +5674,267 @@ class Interpreter {
     return m;
   }
 
+  // tensormap.replace: decode the map, change one field, encode it back. A
+  // value the hardware would take but that no map cuTensorMapEncodeTiled
+  // makes could have (a box of 300, a traversal stride of 0) leaves the
+  // behaviour undefined, so it is refused here rather than carried into a
+  // copy that would then do something arbitrary.
+  void exec_tensormap_replace(Warp& w, const BlockCtx& ctx, const Instr& ins,
+                              const OpTensormapReplace& op, Mask m) {
+    Lanes _s_a, _s_v;
+    const Lanes base = addr_base(w, ctx, ins, op.addr, _s_a);
+    const Lanes& val = read_operand(w, ctx, ins, op.value, _s_v);
+    const uint64_t sbase = space_base(op.space);
+    const bool wide = op.field == TmapField::GlobalAddress || op.field == TmapField::GlobalStride;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const int li = static_cast<int>(lane);
+      const uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+      if (addr % 64)
+        ctx_fail(ins, li, Err::MisalignedAccess, "a tensor map must be 64-byte aligned");
+      uint64_t q[16];
+      for (int i = 0; i < 16; ++i) q[i] = load_routed(w, ctx, ins, lane, addr + 8 * i, 8);
+      exec::TensorMap t;
+      if (!t.decode(q))
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "tensormap.replace on 128 bytes that are not a tensor map made by "
+                 "cuTensorMapEncodeTiled (or a copy of one)");
+      const uint64_t v = wide ? val[lane] : static_cast<uint32_t>(val[lane]);
+      auto bad = [&](const std::string& what) {
+        ctx_fail(ins, li, Err::InvalidValue, "tensormap.replace: " + what);
+      };
+      auto refused = [&](const std::string& what) {
+        ctx_fail(ins, li, Err::UnsupportedPtx, "tensormap.replace: " + what);
+      };
+      using exec::TmapType;
+      using exec::TmapSwizzle;
+      switch (op.field) {
+        case TmapField::GlobalAddress:
+          if (v % 16) bad("a tensor's global address must be 16-byte aligned");
+          t.address = v;
+          break;
+        case TmapField::Rank:
+          // Zero-based: the value is the rank less one.
+          if (v > 4) bad("the rank field is the rank less one, 0 to 4; got " + std::to_string(v));
+          t.rank = static_cast<uint32_t>(v) + 1;
+          break;
+        case TmapField::BoxDim:
+          if (v < 1 || v > 256) bad("a box dimension is 1 to 256 elements; got " + std::to_string(v));
+          t.box[op.ord] = static_cast<uint32_t>(v);
+          break;
+        case TmapField::GlobalDim:
+          if (v < 1) bad("a global dimension is at least 1");
+          t.dim[op.ord] = v;
+          break;
+        case TmapField::GlobalStride: {
+          // Ordinal i is the stride of dimension i + 1; dimension 0's is the
+          // element size.
+          if (op.ord > 3) bad("a map has four strides, ordinals 0 to 3");
+          const uint64_t bytes = op.stride_in_16b ? v << 4 : v;
+          if (bytes % 16 || bytes >= (1ull << 40))
+            bad("a global stride is a multiple of 16 bytes below 2^40; got " + std::to_string(bytes));
+          t.stride[op.ord + 1] = bytes;
+          break;
+        }
+        case TmapField::ElementStride:
+          if (v < 1 || v > 8) bad("an element stride is 1 to 8; got " + std::to_string(v));
+          t.elem_stride[op.ord] = static_cast<uint32_t>(v);
+          break;
+        case TmapField::ElemType: {
+          // The ISA's own numbering (Table 36), which is not CUtensorMapDataType's.
+          static const TmapType types[] = {
+              TmapType::U8,  TmapType::U16,    TmapType::U32, TmapType::S32,  TmapType::U64,
+              TmapType::S64, TmapType::F16,    TmapType::F32, TmapType::F32Ftz, TmapType::F64,
+              TmapType::BF16, TmapType::TF32, TmapType::TF32Ftz};
+          if (v >= 13 && v <= 15) refused("the packed 4- and 6-bit element types are Blackwell's");
+          if (v > 15) bad("element type " + std::to_string(v) + " is not in the ISA's table");
+          t.type = types[v];
+          t.stride[0] = exec::TensorMap::type_bytes(t.type);
+          break;
+        }
+        case TmapField::InterleaveLayout:
+          if (v > 2) bad("interleave layout " + std::to_string(v) + " is not in the ISA's table");
+          t.interleave = static_cast<uint8_t>(v);
+          break;
+        case TmapField::SwizzleMode:
+          if (v == 4) refused("the 96-byte swizzle is sm_103a's and sm_107a's");
+          if (v > 4) bad("swizzle mode " + std::to_string(v) + " is not in the ISA's table");
+          t.swizzle = static_cast<TmapSwizzle>(v);   // none, 32B, 64B, 128B, in the same order
+          break;
+        case TmapField::SwizzleAtomicity:
+          // 16 bytes is what sm_90 swizzles at, so it changes nothing there;
+          // the wider atoms are Blackwell's.
+          if (v != 0) refused("swizzle atomicities other than 16 bytes are Blackwell's");
+          break;
+        case TmapField::FillMode:
+          if (v > 1) bad("fill mode " + std::to_string(v) + " is not in the ISA's table");
+          t.oob_nan = static_cast<uint8_t>(v);
+          break;
+      }
+      t.encode(q);
+      for (int i = 0; i < 16; ++i) store_routed(w, ctx, ins, lane, addr + 8 * i, 8, q[i]);
+    }
+  }
+
+  // The mbarrier at a shared::cluster address, which must be initialized.
+  Mbarrier& cluster_mbarrier(const BlockCtx& ctx, const Instr& ins, int lane, uint64_t addr,
+                             const char* what) {
+    const SharedRef r = shared_at(ctx, ins, lane, addr, 8);
+    if (r.off % 8)
+      ctx_fail(ins, lane, Err::MisalignedAccess, "an mbarrier must be 8-byte aligned");
+    auto it = r.owner->mbar->bars.find(kSharedVaBase + r.off);
+    if (it == r.owner->mbar->bars.end() || !it->second.valid)
+      ctx_fail(ins, lane, Err::UnsupportedPtx,
+               std::string(what) + " completes on an mbarrier that has not been initialized");
+    return it->second;
+  }
+
+  // st.async and red.async: the write is made when issued -- one of the
+  // moments the asynchronous proxy allows -- and its bytes are completed on
+  // the barrier at once, so a consumer that waits on the barrier sees it.
+  void exec_st_async(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpStAsync& op, Mask m) {
+    Lanes _s_a, _s_b;
+    const Lanes abase = addr_base(w, ctx, ins, op.addr, _s_a);
+    const Lanes bbase = addr_base(w, ctx, ins, op.mbar, _s_b);
+    std::vector<Lanes> vals(op.srcs.size());
+    for (size_t e = 0; e < op.srcs.size(); ++e) {
+      Lanes _s;
+      vals[e] = read_operand(w, ctx, ins, op.srcs[e], _s);
+    }
+    const uint32_t size = op.ty.bytes();
+    const uint32_t n = static_cast<uint32_t>(op.srcs.size());
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const int li = static_cast<int>(lane);
+      const uint64_t addr = kSharedVaBase + abase[lane] + static_cast<uint64_t>(op.addr.offset);
+      const uint64_t bar = kSharedVaBase + bbase[lane] + static_cast<uint64_t>(op.mbar.offset);
+      if (addr % (size * n))
+        ctx_fail(ins, li, Err::MisalignedAccess,
+                 std::string(op.red ? "red" : "st") + ".async requires " + std::to_string(size * n) +
+                     "-byte alignment");
+      const SharedRef dst = shared_at(ctx, ins, li, addr, size * n);
+      const SharedRef at_bar = shared_ref(ctx, ins, li, bar);
+      if (at_bar.owner != dst.owner)
+        ctx_fail(ins, li, Err::InvalidValue,
+                 std::string(op.red ? "red" : "st") +
+                     ".async's mbarrier must be in the same block as the memory it writes");
+      Mbarrier& b = cluster_mbarrier(ctx, ins, li, bar, op.red ? "red.async" : "st.async");
+      uint8_t* p = dst.owner->shared->data() + dst.off;
+      for (uint32_t e = 0; e < n; ++e) {
+        uint64_t v = vals[e][lane];
+        if (op.red) {
+          uint64_t old = 0;
+          std::memcpy(&old, p, size);
+          v = reduce_value(op.op, op.ty, old, v);
+        }
+        std::memcpy(p + e * size, &v, size);
+      }
+      b.tx -= static_cast<int64_t>(size * n);
+      complete_phase_if_done(b);
+    }
+    count_memory(Space::Shared, size * n, popcount_mask(m), /*is_store=*/true);
+  }
+
+  // One element of red.async or cp.reduce.async.bulk: `old` combined with
+  // `b` by `op`, both of type `ty`. Floating-point add rounds to nearest even
+  // and keeps subnormals (the .noftz the ISA requires or defaults to); min
+  // and max return the other operand when one is NaN, as min and max do.
+  static uint64_t reduce_value(AtomOp op, const Type& ty, uint64_t old, uint64_t b) {
+    const uint64_t mask = ty.bits == 64 ? ~0ull : (1ull << ty.bits) - 1;
+    old &= mask;
+    b &= mask;
+    if (ty.is_real()) {
+      double x, y;
+      if (ty.bits == 16) {
+        x = ty.is_bfloat() ? bf16_to_double(old) : f16_to_double(old);
+        y = ty.is_bfloat() ? bf16_to_double(b) : f16_to_double(b);
+      } else if (ty.bits == 32) {
+        x = std::bit_cast<float>(static_cast<uint32_t>(old));
+        y = std::bit_cast<float>(static_cast<uint32_t>(b));
+      } else {
+        x = std::bit_cast<double>(old);
+        y = std::bit_cast<double>(b);
+      }
+      if (op == AtomOp::Min || op == AtomOp::Max) {
+        if (std::isnan(x)) return b;
+        if (std::isnan(y)) return old;
+        // -0 below +0, so the answer does not depend on operand order.
+        const bool y_less = y < x || (y == x && std::signbit(y) && !std::signbit(x));
+        return (op == AtomOp::Min) == y_less ? b : old;
+      }
+      // Add, in double and then rounded to the element type. A double has
+      // more than twice the precision of a float, a half or a bfloat16, so
+      // rounding twice gives the correctly rounded sum (Figueroa, 1995).
+      if (ty.bits == 16) return ty.is_bfloat() ? double_to_bf16(x + y) : double_to_f16(x + y);
+      if (ty.bits == 32) return std::bit_cast<uint32_t>(static_cast<float>(x + y));
+      return std::bit_cast<uint64_t>(x + y);
+    }
+    const bool s = ty.is_signed();
+    auto sx = [&](uint64_t v) { return ty.bits == 64 ? static_cast<int64_t>(v) : int64_t{static_cast<int32_t>(v)}; };
+    switch (op) {
+      case AtomOp::Add: return (old + b) & mask;
+      case AtomOp::Min: return s ? (sx(b) < sx(old) ? b : old) : std::min(old, b);
+      case AtomOp::Max: return s ? (sx(b) > sx(old) ? b : old) : std::max(old, b);
+      case AtomOp::And: return old & b;
+      case AtomOp::Or: return old | b;
+      case AtomOp::Xor: return old ^ b;
+      case AtomOp::Inc: return old >= b ? 0 : old + 1;
+      case AtomOp::Dec: return (old == 0 || old > b) ? b : old - 1;
+      default: return b;
+    }
+  }
+
+  // cp.reduce.async.bulk into global memory: element by element, each an
+  // atomic read-modify-write, as the ISA makes them (and as they must be
+  // here, where other blocks run on other host threads).
+  void reduce_global(const Instr& ins, int lane, uint64_t addr, const uint8_t* src, uint64_t bytes,
+                     const Type& ty, AtomOp op) {
+    const uint32_t es = ty.bytes();
+    for (uint64_t off = 0; off < bytes; off += es) {
+      uint64_t b = 0;
+      std::memcpy(&b, src + off, es);
+      std::unique_lock<std::mutex> guard;
+      if (concurrent_) guard = std::unique_lock<std::mutex>(atomic_lock_for(addr + off));
+      try {
+        const uint64_t old = mem_.load_scalar(addr + off, es);
+        mem_.store_scalar(addr + off, es, reduce_value(op, ty, old, b));
+      } catch (const Error& e) {
+        rethrow_with_context(e, ins, lane);
+      }
+    }
+    stats_.atomics += bytes / es;
+    stats_.atomic_bytes += bytes;
+  }
+
+  // The element type a tensor map gives cp.reduce.async.bulk.tensor, and
+  // whether the operation has a form for it (the ISA's table in 9.7.10.28.5.4).
+  static std::optional<Type> tensor_reduce_type(exec::TmapType t, AtomOp op) {
+    using K = Type::Kind;
+    using exec::TmapType;
+    Type ty;
+    switch (t) {
+      case TmapType::U32: ty = {K::U, 32}; break;
+      case TmapType::S32: ty = {K::S, 32}; break;
+      case TmapType::U64: ty = {K::U, 64}; break;
+      case TmapType::S64: ty = {K::S, 64}; break;
+      case TmapType::F16: ty = {K::F, 16}; break;
+      case TmapType::BF16: ty = {K::BF, 16}; break;
+      case TmapType::F32: ty = {K::F, 32}; break;
+      default: return std::nullopt;
+    }
+    bool ok = false;
+    switch (op) {
+      case AtomOp::Add: ok = !(ty.kind == K::S && ty.bits == 64); break;
+      case AtomOp::Min:
+      case AtomOp::Max: ok = !(ty.kind == K::F && ty.bits == 32); break;
+      case AtomOp::Inc:
+      case AtomOp::Dec: ok = ty.kind == K::U && ty.bits == 32; break;
+      default: ok = !ty.is_real(); break;
+    }
+    if (!ok) return std::nullopt;
+    return ty;
+  }
+
   void exec_bulk_copy(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpBulkCopy& op, Mask m) {
     // Copies, not references: a 32-bit address register is widened into a
     // small ring of scratch lanes, and the coordinates read below would reuse
@@ -5534,17 +5963,17 @@ class Interpreter {
     const uint64_t shared_size = ctx.shared ? ctx.shared->size() : 0;
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
-      ++stats_.global_loads;
-      if (op.multicast) {
-        // To this block alone it is an ordinary copy; to any other it needs
-        // distributed shared memory.
-        const uint32_t rank = static_cast<uint32_t>(sreg_value(Sreg::ClusterCtaRank, 0, w, ctx, lane));
-        if ((mask_v[lane] & 0xFFFF) != (1u << rank))
-          ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
-                   "a multicast bulk copy to other blocks of the cluster needs distributed shared "
-                   "memory, which is not implemented");
-      }
-      const uint64_t smem = smem_base[lane] + static_cast<uint64_t>(op.smem.offset);
+      const int li = static_cast<int>(lane);
+      if (!op.shared_to_shared) ++stats_.global_loads;
+      // The shared side, which a load may put in another block of the
+      // cluster: `smem` is the offset within whichever block that is.
+      const SharedRef dst = shared_ref(ctx, ins, li, kSharedVaBase + smem_base[lane] +
+                                                         static_cast<uint64_t>(op.smem.offset));
+      if (!op.to_shared && dst.owner != &ctx)
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "a bulk store's source is in another block of the cluster; it must be this "
+                 "block's shared memory (.shared::cta)");
+      const uint64_t smem = dst.off;
       if (smem % 16)
         ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
                  "a bulk copy's shared-memory address must be 16-byte aligned");
@@ -5565,7 +5994,17 @@ class Interpreter {
         if (n % 16 || g % 16)
           ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
                    "a bulk copy's size and global address must be multiples of 16");
-        if (op.to_shared) {
+        if (op.shared_to_shared) {
+          // From this block's shared memory, read now like any bulk load's
+          // source; `g` is a shared::cta address.
+          add_run(smem, static_cast<uint32_t>(n));
+          if (g + n > shared_size)
+            ctx_fail(ins, li, Err::OutOfBounds,
+                     "a bulk copy reads past this block's shared memory");
+          pb.data.assign(ctx.shared->data() + g, ctx.shared->data() + g + n);
+          pb.tx = n;
+          count_memory(Space::Shared, static_cast<uint32_t>(n), 1, /*is_store=*/false);
+        } else if (op.to_shared) {
           add_run(smem, static_cast<uint32_t>(n));
           pb.data.resize(n);
           try {
@@ -5578,10 +6017,14 @@ class Interpreter {
           if (smem + n > shared_size)
             ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
                      "a bulk store reads past the block's shared memory");
-          try {
-            mem_.write(g, ctx.shared->data() + smem, n);
-          } catch (const Error& e) {
-            rethrow_with_context(e, ins, static_cast<int>(lane));
+          if (op.reduce) {
+            reduce_global(ins, li, g, ctx.shared->data() + smem, n, op.red_ty, op.red_op);
+          } else {
+            try {
+              mem_.write(g, ctx.shared->data() + smem, n);
+            } catch (const Error& e) {
+              rethrow_with_context(e, ins, static_cast<int>(lane));
+            }
           }
         }
       } else {
@@ -5592,6 +6035,14 @@ class Interpreter {
                        std::to_string(map.rank) + " tensor map");
         const uint32_t es = static_cast<uint32_t>(map.stride[0]);
         const uint32_t swz = exec::TensorMap::swizzle_bytes(map.swizzle);
+        std::optional<Type> red_ty;
+        if (op.reduce) {
+          red_ty = tensor_reduce_type(map.type, op.red_op);
+          if (!red_ty)
+            ctx_fail(ins, li, Err::UnsupportedPtx,
+                     "cp.reduce.async.bulk.tensor has no form of this operation for the tensor "
+                     "map's element type (9.7.10.28.5.4)");
+        }
         // Elements the box takes along each dimension: box / traversal stride,
         // rounded up.
         std::array<uint64_t, 5> count{1, 1, 1, 1, 1};
@@ -5638,12 +6089,16 @@ class Interpreter {
             if (soff + es > shared_size)
               ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
                        "a bulk tensor store reads past the block's shared memory");
-            uint64_t v = 0;
-            std::memcpy(&v, ctx.shared->data() + soff, es);
-            try {
-              mem_.store_scalar(gaddr, es, v);
-            } catch (const Error& ex) {
-              rethrow_with_context(ex, ins, static_cast<int>(lane));
+            if (op.reduce) {
+              reduce_global(ins, li, gaddr, ctx.shared->data() + soff, es, *red_ty, op.red_op);
+            } else {
+              uint64_t v = 0;
+              std::memcpy(&v, ctx.shared->data() + soff, es);
+              try {
+                mem_.store_scalar(gaddr, es, v);
+              } catch (const Error& ex) {
+                rethrow_with_context(ex, ins, static_cast<int>(lane));
+              }
             }
           }
           for (uint32_t d = 0; d < map.rank; ++d) {
@@ -5655,13 +6110,56 @@ class Interpreter {
         pb.tx = total * es;
       }
       if (!op.to_shared) continue;
-      // The barrier this load completes on, in this block's shared memory.
-      const uint64_t bar = kSharedVaBase + (*mbar_base)[lane] + static_cast<uint64_t>(op.mbar.offset);
-      auto it = ctx.mbar->bars.find(bar);
-      if (it == ctx.mbar->bars.end() || !it->second.valid)
-        ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
-                 "a bulk copy completes on an mbarrier that has not been initialized");
-      it->second.pending.push_back(std::move(pb));
+      // The barrier the load completes on, in the destination block.
+      const SharedRef bar = shared_ref(ctx, ins, li, kSharedVaBase + (*mbar_base)[lane] +
+                                                         static_cast<uint64_t>(op.mbar.offset));
+      if (!op.multicast) {
+        if (bar.owner != dst.owner)
+          ctx_fail(ins, li, Err::InvalidValue,
+                   "a bulk copy's mbarrier must be in the block its data goes to");
+        if (op.reduce) {
+          // A reduction into another block's shared memory is made now, one
+          // of the moments the asynchronous proxy allows, and its bytes are
+          // completed with it, as st.async's are. (A copy's data instead waits
+          // for the barrier to be looked at, see Mbarrier::pending.)
+          Mbarrier& b = cluster_mbarrier(
+              ctx, ins, li, kSharedVaBase + (*mbar_base)[lane] + static_cast<uint64_t>(op.mbar.offset),
+              "cp.reduce.async.bulk");
+          const uint32_t es = op.red_ty.bytes();
+          uint8_t* d = dst.owner->shared->data() + smem;
+          for (uint64_t off = 0; off < pb.data.size(); off += es) {
+            uint64_t old = 0, v = 0;
+            std::memcpy(&old, d + off, es);
+            std::memcpy(&v, pb.data.data() + off, es);
+            v = reduce_value(op.red_op, op.red_ty, old, v);
+            std::memcpy(d + off, &v, es);
+          }
+          b.tx -= static_cast<int64_t>(pb.tx);
+          complete_phase_if_done(b);
+          continue;
+        }
+        cluster_mbarrier(ctx, ins, li, kSharedVaBase + (*mbar_base)[lane] + static_cast<uint64_t>(op.mbar.offset),
+                         "a bulk copy")
+            .pending.push_back(std::move(pb));
+        continue;
+      }
+      // Multicast: the same data, at the same offset, into every block the
+      // mask names, each completing on its own barrier at the barrier's
+      // offset (9.7.9.25.4.1).
+      const uint64_t cta_mask = mask_v[lane] & 0xFFFF;
+      const size_t nranks = ctx.cluster_state ? ctx.cluster_state->ranks.size() : 1;
+      if (!cta_mask || (cta_mask >> nranks))
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "a multicast bulk copy's ctaMask (0x" + [&] {
+                   char b[8];
+                   std::snprintf(b, sizeof b, "%x", static_cast<unsigned>(cta_mask));
+                   return std::string(b);
+                 }() + ") names no block, or a block past the cluster's " + std::to_string(nranks));
+      for (uint64_t r = 0; r < nranks; ++r) {
+        if (!(cta_mask >> r & 1)) continue;
+        const uint64_t at = kSharedVaBase + cluster_address(ctx, r, bar.off);
+        cluster_mbarrier(ctx, ins, li, at, "a multicast bulk copy").pending.push_back(pb);
+      }
     }
   }
 
@@ -5718,7 +6216,14 @@ class Interpreter {
     if (addr % 8 != 0)
       ctx_fail(ins, -1, Err::MisalignedAccess, "an mbarrier must be 8-byte aligned");
 
-    Mbarrier& b = ctx.mbar->bars[addr];
+    // The barrier's block: this one, or with .shared::cluster whichever
+    // block the address names.
+    const SharedRef at = shared_at(ctx, ins, static_cast<int>(lead), addr, 8);
+    if (at.owner != &ctx && !op.cluster)
+      ctx_fail(ins, static_cast<int>(lead), Err::InvalidValue,
+               "an mbarrier address in another block of the cluster, used without "
+               ".shared::cluster");
+    Mbarrier& b = at.owner->mbar->bars[kSharedVaBase + at.off];
     const uint32_t lanes = popcount_mask(m);
 
     auto require_valid = [&]() {

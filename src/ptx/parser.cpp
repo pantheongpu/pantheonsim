@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <optional>
@@ -183,6 +184,7 @@ class Parser {
       if (t.text == ".version") {
         next();
         m.version = expect_word("PTX version");
+        version_ = m.version;
         continue;
       }
       if (t.text == ".target") {
@@ -1219,6 +1221,8 @@ class Parser {
 
   // The module's .target line, for the instructions only one target has.
   std::string target_;
+  // And its .version, for the one instruction whose operand changed meaning.
+  std::string version_;
 
   Instr parse_instruction(const EntryFn& fn, std::vector<std::pair<size_t, std::string>>& bra_fixups) {
     Instr ins;
@@ -1250,7 +1254,48 @@ class Parser {
     ins.opcode_id = intern_opcode(parts[0]);
 
     const std::string& op0 = parts[0];
-    if (op0 == "ld" || op0 == "st") {
+    if ((op0 == "st" || op0 == "red") && parts.size() > 1 && parts[1] == "async") {
+      // st.async{.weak}.shared::cluster.mbarrier::complete_tx::bytes{.v2,.v4}.type [a], b, [mbar]
+      // red.async.relaxed.cluster.shared::cluster.mbarrier::complete_tx::bytes.op.type [a], b, [mbar]
+      OpStAsync op;
+      op.red = op0 == "red";
+      size_t vec = 1;
+      bool have_ty = false, have_op = false, cluster_space = false, mbar = false;
+      for (size_t i = 2; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "shared::cluster") cluster_space = true;
+        else if (p == "mbarrier::complete_tx::bytes") mbar = true;
+        else if (p == "weak" || p == "relaxed" || p == "cluster") ;
+        else if (!op.red && p == "v2") vec = 2;
+        else if (!op.red && p == "v4") vec = 4;
+        else if (op.red && p == "add") { op.op = AtomOp::Add; have_op = true; }
+        else if (op.red && p == "min") { op.op = AtomOp::Min; have_op = true; }
+        else if (op.red && p == "max") { op.op = AtomOp::Max; have_op = true; }
+        else if (op.red && p == "and") { op.op = AtomOp::And; have_op = true; }
+        else if (op.red && p == "or") { op.op = AtomOp::Or; have_op = true; }
+        else if (op.red && p == "xor") { op.op = AtomOp::Xor; have_op = true; }
+        else if (op.red && p == "inc") { op.op = AtomOp::Inc; have_op = true; }
+        else if (op.red && p == "dec") { op.op = AtomOp::Dec; have_op = true; }
+        else if (auto t = parse_type_token(p)) { op.ty = *t; have_ty = true; }
+        else return unsupported(op0 + ".async modifier '." + p + "'");
+      }
+      if (!cluster_space || !mbar)
+        return unsupported(op0 + ".async is implemented for .shared::cluster with "
+                                 ".mbarrier::complete_tx::bytes");
+      if (!have_ty || (op.red && !have_op)) return unsupported(op0 + ".async form");
+      if (op.ty.bits != 32 && op.ty.bits != 64) return unsupported(op0 + ".async of 32- and 64-bit types only");
+      op.addr = parse_addr(fn);
+      expect_punct(",");
+      if (vec == 1) op.srcs.push_back(parse_operand());
+      else op.srcs = parse_operand_vector_any();
+      if (op.srcs.size() != vec) return unsupported("st.async vector arity");
+      expect_punct(",");
+      op.mbar = parse_addr(fn);
+      for (const Addr* a : {&op.addr, &op.mbar})
+        if (a->base_kind == Addr::Base::CallSlot || a->base_kind == Addr::Base::EntryParam)
+          return unsupported(op0 + ".async through a parameter/slot name");
+      ins.op = op;
+    } else if (op0 == "ld" || op0 == "st") {
       Space space = Space::Generic;
       size_t vec = 1;
       Type ty{};
@@ -1267,7 +1312,9 @@ class Parser {
         // read-only-ness is a promise the program makes, not one this engine
         // has to enforce -- a kernel that writes there is already invalid.
         else if (p == "const") space = Space::Global;
-        else if (p == "shared") space = Space::Shared;
+        // A .shared::cluster address names its block itself (see mapa), so
+        // it is a shared access like any other once decoded.
+        else if (p == "shared" || p == "shared::cluster") space = Space::Shared;
         else if (p == "local") space = Space::Local;
         else if (inert_mem_modifier(p)) ;
         else if (p == "v2") vec = 2;
@@ -1392,7 +1439,7 @@ class Parser {
       if (i < parts.size()) {
         if (parts[i] == "global") { space = Space::Global; ++i; }
         else if (parts[i] == "local") { space = Space::Local; ++i; }
-        else if (parts[i] == "shared") { space = Space::Shared; ++i; }
+        else if (parts[i] == "shared" || parts[i] == "shared::cluster") { space = Space::Shared; ++i; }
         else if (parts[i] == "const") { space = Space::Global; ++i; }
         else if (parts[i] == "param") { space = Space::Param; ++i; }
       }
@@ -2199,11 +2246,133 @@ class Parser {
       expect_punct(",");
       op.membermask = parse_operand();
       ins.op = op;
+    } else if (op0 == "tensormap" && parts.size() > 1 && parts[1] == "replace") {
+      // tensormap.replace.tile.<field>{.global|.shared::cta}.b1024.{b32|b64} [addr], {ord,} new_val
+      OpTensormapReplace op;
+      bool tile = false, b1024 = false, have_field = false, b64 = false, have_ty = false;
+      static const std::unordered_map<std::string, TmapField> fields = {
+          {"global_address", TmapField::GlobalAddress}, {"rank", TmapField::Rank},
+          {"box_dim", TmapField::BoxDim}, {"global_dim", TmapField::GlobalDim},
+          {"global_stride", TmapField::GlobalStride}, {"element_stride", TmapField::ElementStride},
+          {"elemtype", TmapField::ElemType}, {"interleave_layout", TmapField::InterleaveLayout},
+          {"swizzle_mode", TmapField::SwizzleMode}, {"swizzle_atomicity", TmapField::SwizzleAtomicity},
+          {"fill_mode", TmapField::FillMode}};
+      for (size_t i = 2; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "tile") tile = true;
+        else if (auto f = fields.find(p); f != fields.end()) { op.field = f->second; have_field = true; }
+        else if (p == "global") op.space = Space::Global;
+        else if (p == "shared") op.space = Space::Shared;
+        else if (p == "b1024") b1024 = true;
+        else if (p == "b32") have_ty = true;
+        else if (p == "b64") { have_ty = true; b64 = true; }
+        else return unsupported("tensormap.replace modifier '." + p + "'");
+      }
+      if (!tile || !have_field || !b1024 || !have_ty)
+        return unsupported("tensormap.replace form (expected tensormap.replace.tile.<field>.b1024.<type>)");
+      // Arch-specific, like wgmma: sm_90a, and the a and f targets after it.
+      {
+        const char last = target_.empty() ? ' ' : target_.back();
+        int sm = 0;
+        std::sscanf(target_.c_str(), "sm_%d", &sm);
+        if (sm < 90 || (last != 'a' && last != 'f'))
+          fail(ins.line, "tensormap.replace requires an arch-specific target (.target sm_90a or "
+                         "later a/f targets); this module targets " + (target_.empty() ? std::string("nothing") : target_));
+      }
+      const bool wide_field = op.field == TmapField::GlobalAddress || op.field == TmapField::GlobalStride;
+      if (b64 != wide_field)
+        return unsupported("tensormap.replace takes .b64 for global_address and global_stride and "
+                           ".b32 for every other field");
+      const bool per_dim = op.field == TmapField::BoxDim || op.field == TmapField::GlobalDim ||
+                           op.field == TmapField::GlobalStride || op.field == TmapField::ElementStride;
+      const bool field3 = op.field >= TmapField::ElemType;
+      op.addr = parse_addr(fn);
+      expect_punct(",");
+      if (per_dim) {
+        auto ord = parse_operand();
+        auto* imm = std::get_if<ImmInt>(&ord);
+        if (!imm || imm->value < 0 || imm->value > 4)
+          return unsupported("tensormap.replace's ordinal is an immediate from 0 to 4");
+        op.ord = static_cast<uint32_t>(imm->value);
+        expect_punct(",");
+      }
+      op.value = parse_operand();
+      if (field3 && !std::holds_alternative<ImmInt>(op.value))
+        return unsupported("tensormap.replace's ." + parts[3] + " value is an immediate");
+      // The ISA does not say what unit global_stride is in, and it changed:
+      // CuTe hands it the stride in bytes when compiled by CUDA 12.5 or later
+      // and the stride shifted right by 4 before that ("4 LSBs are not
+      // included", cute/arch/copy_sm90_desc.hpp). CUDA 12.5 is PTX ISA 8.5,
+      // so the module's .version decides.
+      if (op.field == TmapField::GlobalStride) {
+        int major = 0, minor = 0;
+        std::sscanf(version_.c_str(), "%d.%d", &major, &minor);
+        op.stride_in_16b = major < 8 || (major == 8 && minor < 5);
+      }
+      if (op.addr.base_kind == Addr::Base::CallSlot)
+        return unsupported("tensormap.replace through a call slot");
+      ins.op = op;
+    } else if (op0 == "tensormap" && parts.size() > 1 && parts[1] == "cp_fenceproxy") {
+      // tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.<scope>.sync.aligned [dst], [src], 128
+      bool global = false, shared = false;
+      for (size_t i = 2; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "global") global = true;
+        else if (p == "shared") shared = true;
+        else if (p == "tensormap::generic" || p == "release" || p == "sync" || p == "aligned" ||
+                 inert_mem_modifier(p)) ;
+        else return unsupported("tensormap.cp_fenceproxy modifier '." + p + "'");
+      }
+      if (!global || !shared)
+        return unsupported("tensormap.cp_fenceproxy copies from .shared::cta to .global");
+      OpTensormapCopy op;
+      op.dst = parse_addr(fn);
+      expect_punct(",");
+      op.src = parse_addr(fn);
+      expect_punct(",");
+      auto size = parse_operand();
+      auto* imm = std::get_if<ImmInt>(&size);
+      if (!imm || imm->value != 128)
+        return unsupported("tensormap.cp_fenceproxy copies 128 bytes, the size of a tensor map");
+      for (const Addr* a : {&op.dst, &op.src})
+        if (a->base_kind == Addr::Base::CallSlot)
+          return unsupported("tensormap.cp_fenceproxy through a call slot");
+      ins.op = op;
+    } else if (op0 == "mapa" || op0 == "getctarank") {
+      // mapa{.shared::cluster}.{u32,u64} d, a, rank
+      // getctarank{.shared::cluster}.{u32,u64} d, a
+      bool shared = false, wide = false, have_ty = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        if (parts[i] == "shared::cluster") shared = true;
+        else if (parts[i] == "u32") have_ty = true;
+        else if (parts[i] == "u64") { have_ty = true; wide = true; }
+        else return unsupported(op0 + " modifier '." + parts[i] + "'");
+      }
+      if (!have_ty) return unsupported(op0 + " needs .u32 or .u64");
+      if (op0 == "mapa") {
+        OpMapa op;
+        op.generic = !shared;
+        op.wide = wide;
+        op.dst = expect_reg_operand("mapa destination");
+        expect_punct(",");
+        op.src = parse_operand();
+        expect_punct(",");
+        op.rank = parse_operand();
+        ins.op = op;
+      } else {
+        OpGetCtaRank op;
+        op.generic = !shared;
+        op.dst = expect_reg_operand("getctarank destination");
+        expect_punct(",");
+        op.src = parse_operand();
+        ins.op = op;
+      }
     } else if (op0 == "isspacep") {
       if (parts.size() != 2) return unsupported("isspacep form (expected isspacep.space)");
       OpIsSpacep op;
       if (parts[1] == "global") op.space = Space::Global;
       else if (parts[1] == "shared") op.space = Space::Shared;
+      else if (parts[1] == "shared::cluster") { op.space = Space::Shared; op.cluster = true; }
       else if (parts[1] == "local") op.space = Space::Local;
       else if (parts[1] == "const") op.space = Space::Global;
       else return unsupported("isspacep space '." + parts[1] + "'");
@@ -2233,11 +2402,7 @@ class Parser {
         else if (p2 == "expect_tx") { op.op = MbarOp::ExpectTx; have_op = true; }
         else if (p2 == "complete_tx") { op.op = MbarOp::CompleteTx; have_op = true; }
         else if (p2 == "noComplete") op.no_complete = true;
-        else if (p2 == "shared::cluster")
-          // An mbarrier in another block's shared memory: that is distributed
-          // shared memory, which this does not model yet.
-          return unsupported("mbarrier on .shared::cluster (a barrier in another block of the "
-                             "cluster needs distributed shared memory, which is not implemented)");
+        else if (p2 == "shared::cluster") op.cluster = true;
         else if (p2.rfind("phase_type::", 0) == 0)
           return unsupported("mbarrier ." + p2 + " (the report-carrying phase types)");
         else if (p2 == "inval") { op.op = MbarOp::Inval; have_op = true; }
@@ -2254,11 +2419,23 @@ class Parser {
       }
       if (!have_op) return unsupported("mbarrier form");
       (void)saw_shared;  // an mbarrier is a shared object whether or not it says so
+      // A barrier in another block can be arrived at and have bytes counted
+      // against it; initializing, invalidating and waiting are for its own
+      // block (9.7.13.15).
+      if (op.cluster && op.op != MbarOp::Arrive && op.op != MbarOp::ArriveDrop &&
+          op.op != MbarOp::ExpectTx && op.op != MbarOp::CompleteTx)
+        return unsupported("mbarrier on .shared::cluster is defined for arrive, arrive_drop, "
+                           "expect_tx and complete_tx only");
       // init, inval and the transaction counts take no destination; everything
       // else writes one -- or names the sink, `_`, to discard it.
       if (op.op != MbarOp::Init && op.op != MbarOp::Inval && op.op != MbarOp::ExpectTx &&
           op.op != MbarOp::CompleteTx) {
         if (peek().text == "_") next();
+        else if (op.cluster)
+          // Another block's phase means nothing to this one, so the ISA has
+          // a remote arrive discard its state.
+          return unsupported("mbarrier.arrive on .shared::cluster returns no state; its "
+                             "destination must be the sink `_`");
         else op.dst = expect_reg_operand("mbarrier destination");
         expect_punct(",");
       }
@@ -2482,7 +2659,7 @@ class Parser {
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "global") space = Space::Global;
-        else if (p == "shared") space = Space::Shared;
+        else if (p == "shared" || p == "shared::cluster") space = Space::Shared;
         else if (inert_mem_modifier(p)) ;
         else if (p == "add") aop = AtomOp::Add;
         else if (p == "min") aop = AtomOp::Min;
@@ -2961,6 +3138,110 @@ class Parser {
       expect_punct(",");
       op.src = parse_operand();
       ins.op = op;
+    } else if (op0 == "cp" && parts.size() > 3 && parts[1] == "reduce" && parts[2] == "async" &&
+               parts[3] == "bulk") {
+      // cp.reduce.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes.op.type [d], [s], size, [mbar]
+      // cp.reduce.async.bulk.global.shared::cta.bulk_group.op{.noftz}.type [d], [s], size{, policy}
+      // cp.reduce.async.bulk.tensor.Nd.global.shared::cta.op{.tile}.bulk_group [tmap, {c...}], [s]{, policy}
+      OpBulkCopy op;
+      op.reduce = true;
+      std::vector<std::string> spaces;
+      bool mbar_completion = false, group_completion = false, have_op = false, have_ty = false,
+           noftz = false;
+      for (size_t i = 4; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "tensor") op.tensor = true;
+        else if (p.size() == 2 && p[1] == 'd' && p[0] >= '1' && p[0] <= '5') op.dims = p[0] - '0';
+        else if (p == "shared" || p == "shared::cluster" || p == "global") spaces.push_back(p);
+        else if (p == "mbarrier::complete_tx::bytes") mbar_completion = true;
+        else if (p == "bulk_group") group_completion = true;
+        else if (p == "noftz") noftz = true;
+        else if (p == "tile" || p == "relaxed" || inert_mem_modifier(p)) ;
+        else if (p == "add") { op.red_op = AtomOp::Add; have_op = true; }
+        else if (p == "min") { op.red_op = AtomOp::Min; have_op = true; }
+        else if (p == "max") { op.red_op = AtomOp::Max; have_op = true; }
+        else if (p == "inc") { op.red_op = AtomOp::Inc; have_op = true; }
+        else if (p == "dec") { op.red_op = AtomOp::Dec; have_op = true; }
+        else if (p == "and") { op.red_op = AtomOp::And; have_op = true; }
+        else if (p == "or") { op.red_op = AtomOp::Or; have_op = true; }
+        else if (p == "xor") { op.red_op = AtomOp::Xor; have_op = true; }
+        else if (auto t = parse_type_token(p); t && !op.tensor) { op.red_ty = *t; have_ty = true; }
+        else return unsupported("cp.reduce.async.bulk modifier '." + p + "' (im2col, overrides and "
+                                "multimem are not implemented)");
+      }
+      if (!have_op) return unsupported("cp.reduce.async.bulk needs a reduction operation");
+      if (op.tensor ? !op.dims : !have_ty) return unsupported("cp.reduce.async.bulk form");
+      if (spaces.size() != 2 || spaces[1] != "shared")
+        return unsupported("cp.reduce.async.bulk reads from .shared::cta");
+      const bool to_cluster = spaces[0] == "shared::cluster";
+      if (to_cluster && (op.tensor || !mbar_completion))
+        return unsupported("cp.reduce.async.bulk into .shared::cluster is a plain reduction "
+                           "completing on an mbarrier");
+      if (!to_cluster && !group_completion)
+        return unsupported("cp.reduce.async.bulk into global memory completes in a bulk group");
+      // The combinations the ISA's tables allow (9.7.10.28.4.2); the tensor
+      // form's type comes from its map and is checked when it runs.
+      if (!op.tensor) {
+        const Type t = op.red_ty;
+        const bool i32 = t.bits == 32 && !t.is_real(), i64 = t.bits == 64 && !t.is_real();
+        const bool real = t.is_real();
+        bool ok = false;
+        switch (op.red_op) {
+          case AtomOp::Add:
+            ok = to_cluster ? (i32 && t.kind != Type::Kind::B) || (t.kind == Type::Kind::U && t.bits == 64)
+                            : (t.kind != Type::Kind::B && (i32 || (t.kind == Type::Kind::U && i64))) || real;
+            break;
+          case AtomOp::Min:
+          case AtomOp::Max:
+            ok = to_cluster ? i32 && t.kind != Type::Kind::B
+                            : ((i32 || i64) && t.kind != Type::Kind::B) || (real && t.bits == 16);
+            break;
+          case AtomOp::Inc:
+          case AtomOp::Dec: ok = i32 && t.kind == Type::Kind::U; break;
+          default: ok = to_cluster ? i32 : (i32 || i64); break;   // the bitwise ops
+        }
+        if (!ok)
+          return unsupported("cp.reduce.async.bulk has no " + t.str() + " form of this operation");
+        if (real && t.bits == 16 && op.red_op == AtomOp::Add && !noftz)
+          return unsupported("cp.reduce.async.bulk.add on .f16 and .bf16 requires .noftz");
+      }
+      op.to_shared = to_cluster;
+      op.shared_to_shared = to_cluster;
+      if (op.tensor) {
+        expect_punct("[");
+        op.tmap = parse_operand();
+        expect_punct(",");
+        op.coords = parse_operand_vector_any();
+        expect_punct("]");
+        expect_punct(",");
+        op.smem = parse_addr(fn);
+        if (op.coords.size() != op.dims)
+          return unsupported("cp.reduce.async.bulk.tensor coordinate count does not match ." +
+                             std::to_string(op.dims) + "d");
+      } else {
+        // The destination is the side the reduction writes: global memory
+        // (`gmem`, as a bulk store) or another block's shared memory (`smem`,
+        // with the source in `gmem`, as a shared-to-shared bulk copy).
+        if (to_cluster) op.smem = parse_addr(fn);
+        else op.gmem = parse_addr(fn);
+        expect_punct(",");
+        if (to_cluster) op.gmem = parse_addr(fn);
+        else op.smem = parse_addr(fn);
+        expect_punct(",");
+        op.size = parse_operand();
+        if (to_cluster) {
+          expect_punct(",");
+          op.mbar = parse_addr(fn);
+        }
+      }
+      if (peek_punct(",")) {   // a cache policy
+        next();
+        (void)parse_operand();
+      }
+      for (const Addr* a : {&op.smem, &op.gmem, &op.mbar})
+        if (a->base_kind == Addr::Base::CallSlot)
+          return unsupported("cp.reduce.async.bulk through a call slot");
+      ins.op = op;
     } else if (op0 == "cp" && parts.size() > 2 && parts[1] == "async" && parts[2] == "bulk") {
       // Hopper's bulk copies (TMA). Forms, after cp.async.bulk:
       //   .commit_group / .wait_group[.read] N
@@ -3004,11 +3285,14 @@ class Parser {
         if (op.tensor && !op.dims) return unsupported("cp.async.bulk.tensor needs .1d to .5d");
         const bool g2s = spaces[1] == "global" && spaces[0] != "global";
         const bool s2g = spaces[0] == "global" && spaces[1] == "shared";
-        if (!g2s && !s2g)
-          return unsupported("cp.async.bulk from shared memory to another block's (distributed "
-                             "shared memory is not implemented)");
-        op.to_shared = g2s;
-        if (g2s && !mbar_completion)
+        const bool s2s = spaces[0] == "shared::cluster" && spaces[1] == "shared";
+        if (!g2s && !s2g && !s2s)
+          return unsupported("cp.async.bulk from ." + spaces[1] + " to ." + spaces[0]);
+        if (s2s && (op.tensor || op.multicast))
+          return unsupported("cp.async.bulk between shared memories is a plain, unicast copy");
+        op.to_shared = g2s || s2s;
+        op.shared_to_shared = s2s;
+        if (op.to_shared && !mbar_completion)
           return unsupported("a cp.async.bulk load completes on an mbarrier (.mbarrier::complete_tx::bytes)");
         if (s2g && !group_completion)
           return unsupported("a cp.async.bulk store completes in a bulk group (.bulk_group)");
@@ -3020,7 +3304,7 @@ class Parser {
           op.coords = parse_operand_vector_any();
           expect_punct("]");
         };
-        if (g2s) {
+        if (op.to_shared) {
           op.smem = parse_addr(fn);
           expect_punct(",");
           if (op.tensor) parse_tensor();

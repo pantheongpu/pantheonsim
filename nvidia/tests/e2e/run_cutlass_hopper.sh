@@ -2,17 +2,15 @@
 # CUTLASS's own Hopper unit tests for TMA and bulk copies, unmodified, on a
 # simulated H100: tensor loads and stores in one to five dimensions, every
 # swizzle mode, boxes that cross the tensor's edge, internal-type conversion,
-# and the plain bulk copies. They are NVIDIA's tests of the same instructions
+# the plain bulk copies, and multicast loads into both blocks of a cluster. They are NVIDIA's tests of the same instructions
 # on real hardware, so passing them is agreement with the hardware's layouts
 # rather than with this simulator's reading of the ISA.
 #
-# Two are left out, each for a stated reason:
-#   *Tma_Load_1D (in both files): its testbed copies a 256-element tile into a
-#     128-element buffer. Hardware does not notice, because the write stays in
-#     the allocator's padding; the simulator reports it as the out-of-bounds
-#     access it is, as compute-sanitizer would.
-#   tma_mcast_load: multicast into other blocks of a cluster needs distributed
-#     shared memory, which is not implemented and is refused by name.
+# One is left out, for a stated reason: *Tma_Load_1D (in both files), whose
+# testbed copies a 256-element tile into a 128-element buffer. Hardware does
+# not notice, because the write stays in the allocator's padding; the
+# simulator reports it as the out-of-bounds access it is, as
+# compute-sanitizer would.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -44,10 +42,10 @@ need_gtest=1
 . "$root/nvidia/tests/e2e/cutlass_fetch.sh"
 work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu_cutlass_hopper.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
-tests=(tma_load tma_store bulk_load bulk_store)
+tests=(tma_load tma_store bulk_load bulk_store tma_mcast_load)
 u="$cutlass/test/unit"
 # Each compile instantiates most of CuTe and peaks near 10 GB (9.6 GB measured
-# for tma_load with CUDA 13). All four at once took a 16 GB GitHub runner past
+# for tma_load with CUDA 13). Four at once took a 16 GB GitHub runner past
 # its memory, and the runner was shut down in the middle of the job ("The runner
 # has received a shutdown signal"), three runs out of three. So as many run
 # together as the free memory holds, and never fewer than one.

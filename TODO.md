@@ -719,6 +719,79 @@ narrows what counts as observable, not what the detector looks at.
   `cvta.param` no longer adds the parameter window twice. A step-budget error
   now names the instruction the warp was spinning in.
 
+- Distributed shared memory (sm_90): the blocks of a cluster reach each
+  other's shared memory. `mapa` (generic and `.shared::cluster`, 32- and
+  64-bit), `getctarank`, `isspacep.shared::cluster`, `cvta` to and from
+  `.shared::cluster`, and `ld`, `st`, `atom` and `red` on `.shared::cluster`
+  addresses; `mbarrier.arrive`, `arrive_drop`, `expect_tx` and `complete_tx`
+  on another block's barrier (the ISA allows only those remotely, and a
+  remote arrive must discard its state -- both refused by name otherwise);
+  `st.async` and `red.async`, whose bytes complete on the destination's
+  barrier; multicast TMA (`.multicast::cluster` with a ctaMask, tensor and
+  plain), which lands the same bytes at the same offset in every block the
+  mask names, each completing its own barrier; and
+  `cp.async.bulk.shared::cluster.shared::cta`, one block's shared memory into
+  another's. A shared::cluster address carries its block's rank above the
+  offset, with zero meaning the issuing block, so every ordinary shared
+  address is already a valid shared::cluster address for its own block, as
+  the ISA requires. What hardware leaves undefined is reported instead:
+  reaching a block that has exited ("its shared memory went with it" -- the
+  reason a kernel ends with `cluster.sync()`), a rank past the cluster, and
+  an mbarrier or st.async whose barrier is not in the block it writes. The
+  race detector orders warps by their own block's barriers, so remote
+  accesses are not checked for races. Checked three ways: unit tests
+  (tests/unit/test_dsmem.cpp, each confirmed to fail when the feature it
+  covers is broken); CUTLASS's own `tma_mcast_load` test, unmodified
+  (run_cutlass_hopper.sh), which fails on the previous build and passes on
+  this one; and a CUDA C++ program using cooperative_groups'
+  `map_shared_rank`, `__cluster_query_shared_rank` and `cluster.sync()`,
+  with clusters from `__cluster_dims__` and from `cudaLaunchKernelEx`
+  (nvidia/tests/e2e/dsmem_cluster.cu): a ring exchange and a histogram whose
+  bins are spread across the cluster, both exact.
+
+- TMA reductions (sm_90): `cp.reduce.async.bulk` in all three forms -- a
+  tensor box into global memory (what CuTe's `SM90_TMA_REDUCE_ADD` emits), a
+  plain range into global memory, and a plain range into another block's
+  shared memory completing on its mbarrier -- with every operation and type
+  the ISA's tables allow (9.7.10.28.4.2, 9.7.10.28.5.4) and the others
+  refused by name. Each element is an atomic read-modify-write, as the ISA
+  makes it; floating-point add rounds to nearest even and keeps subnormals
+  (`.noftz`, required for halves and the default for floats); min and max
+  of a NaN give the other operand. The tensor form takes its element type
+  from the map and, like a tensor store, leaves elements past the tensor's
+  edge alone. A reduction is made when issued -- one of the moments the
+  asynchronous proxy allows -- so, as for bulk stores, a kernel that
+  overwrites its source before `wait_group.read` is not caught. Checked by
+  unit tests over the values that separate a right reduction from a
+  plausible one (a wrapping add, a signed min against INT_MIN, half ties to
+  even and subnormals, inc's wrap, a 64-bit xor; each confirmed to fail with
+  the arithmetic broken), and by a CuTe program (tma_reduce_cute.cu) in
+  which several blocks reduce into the same tiles, f32 through a 128B
+  swizzle and f16 unswizzled, exact with one host thread and with eight. It
+  fails on main.
+
+- Tensor maps changed on the device (sm_90a): `tensormap.replace` on a map
+  in global or shared memory, every field the ISA names (address, rank, box
+  and global extents, strides, traversal strides, element type, interleave,
+  swizzle, fill), and `tensormap.cp_fenceproxy`, which publishes a map edited
+  in shared memory. This is how CUTLASS's grouped and pointer-array GEMMs
+  point one descriptor at each group's tensors. Two things the ISA leaves to
+  the reader, settled from evidence: the element type uses the ISA's own
+  numbering (Table 36), which is not the driver's; and `global_stride` is in
+  bytes from PTX ISA 8.5 and in 16-byte units before it -- the ISA does not
+  say, but CuTe passes bytes when compiled by CUDA 12.5 or later and the
+  stride shifted right by 4 before that, so the module's `.version` decides.
+  A value no map from `cuTensorMapEncodeTiled` could hold (a box past 256, a
+  traversal stride of 0) is refused rather than carried into a copy, and
+  the Blackwell-only values (packed 4/6-bit types, the 96B swizzle, wider
+  swizzle atoms) are refused by name. Checked by unit tests (each field read
+  back by the host's decoder; the ISA's 9 is f64 where the driver's 9 is
+  bf16; a retargeted map loaded through under PTX 8.3 and 8.5; each confirmed
+  to fail with the rule it covers broken), and by a CuTe program
+  (tensormap_replace_cute.cu) that retargets a descriptor through CuTe's own
+  helpers in shared memory and in global memory and loads through it,
+  exact; it fails on main.
+
 ## Not implemented (fails loudly, never silently)
 
 This list was stale for a while, which is its own kind of wrong: it still named
@@ -726,18 +799,15 @@ textures, grid sync and host-pinned memory long after all three worked. A
 roadmap that overstates what is missing misleads as much as one that overstates
 what is done.
 
-- PTX: the cluster *memory* model -- distributed shared memory:
-  `.shared::cluster` accesses to another block, `mapa`, a remote mbarrier
-  arrive, and multicast TMA to other blocks of a cluster -- which is a
-  memory-model change and stays refused, by name, rather than approximated.
-  Also refused by name: TMA's im2col mode, gather/scatter, attribute
+- PTX, refused by name: TMA's im2col mode, gather/scatter, attribute
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle with 32B/64B atoms
-  (Blackwell), `cp.reduce.async.bulk`, `tensormap.replace`, the sparse and
+  (Blackwell), the sparse and
   single-bit `wgmma` forms, and inline-asm-only instructions. (`wgmma`, TMA,
-  the mbarrier transaction counts and `barrier.cluster` are done -- see
-  "Hopper's warpgroup MMA" and "TMA and clusters" above. Textures, surfaces
-  and grid sync are done.)
+  the mbarrier transaction counts, `barrier.cluster` and distributed shared
+  memory are done -- see "Hopper's warpgroup MMA", "TMA and clusters" and
+  "Distributed shared memory" above. Textures, surfaces and grid sync are
+  done.)
 - Runtime: async copies. (Managed memory and host-pinned memory are done. The
   virtual memory management API is done: cuMemAddressReserve, cuMemCreate,
   cuMemMap, cuMemSetAccess, cuMemGetAccess, cuMemUnmap, cuMemRelease,
@@ -971,5 +1041,8 @@ scripts/run-pantheon-workloads.sh.
    refused: mipmaps, layered and cubemap textures, sRGB, anisotropy, and the
    `.clamp`/`.zero` surface out-of-range policies. See nvidia/docs/textures.md.
 
-   `wgmma` and TMA are done now (see "Hopper's warpgroup MMA" and "TMA and
-   clusters"); distributed shared memory is what is left of Hopper.
+   `wgmma`, TMA and distributed shared memory are done now (see "Hopper's
+   warpgroup MMA", "TMA and clusters" and "Distributed shared memory"). What
+   is left of Hopper is TMA's im2col and gather modes, refused by name.
+   (`cp.reduce.async.bulk` and `tensormap.replace` are done -- see "TMA
+   reductions" and "Tensor maps changed on the device".)
