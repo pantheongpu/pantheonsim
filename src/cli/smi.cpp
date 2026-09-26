@@ -1032,18 +1032,20 @@ const char* gfx_target(const vgpu::telemetry::DeviceSample& d) {
 }
 
 // rocm_agent_enumerator output: one ISA target per line, CPU agent first.
-// Returns how many GPU agents were listed.
+// `-t GPU` lists only the GPUs and `-t CPU` only the CPU, as ROCm's does;
+// CMake asks with -t GPU for the architecture to build HIP for, and takes the
+// compiler's default (gfx906) when the question fails.
 // Returns the number of AMD GPUs the machine has, listed or not: a lost one
 // is not an agent any more (drop_lost_amd), but it is not a missing profile.
-int print_agents(const vgpu::telemetry::Shared& machine) {
-  std::printf("gfx000\n");  // the host CPU agent, as ROCm reports
+int print_agents(const vgpu::telemetry::Shared& machine, const std::string& type) {
+  if (type != "GPU") std::printf("gfx000\n");  // the host CPU agent, as ROCm reports
   int amd = 0;
   for (uint32_t i = 0; i < machine.device_count; ++i) amd += std::strcmp(machine.devices[i].vendor, "amd") == 0;
   vgpu::telemetry::Shared s = machine;
   vgpu::drop_lost_amd(&s);
   for (uint32_t i = 0; i < s.device_count; ++i) {
     const auto& d = s.devices[i];
-    if (std::strcmp(d.vendor, "amd") != 0) continue;
+    if (std::strcmp(d.vendor, "amd") != 0 || type == "CPU") continue;
     std::printf("%s\n", gfx_target(d));
   }
   return amd;
@@ -1561,6 +1563,7 @@ int cmd_smi(const std::vector<std::string>& args) {
     }
   }
 
+  std::string agent_type = "ALL";   // rocm_agent_enumerator -t
   bool csv = false, explain = false, agents = false, lspci = false, lspci_dump = false,
        verbose = false, details = false, help = false, version = false;
   std::string query_fields, app_fields, id_spec, format, display;
@@ -1675,6 +1678,11 @@ int cmd_smi(const std::vector<std::string>& args) {
       reset_ecc = v == "1" ? 1 : 0;
     } else if (a == "--agents") {
       agents = true;
+    } else if (a == "-t" && agents) {
+      if (i + 1 >= args.size()) return fail("-t needs GPU, CPU or ALL");
+      agent_type = args[++i];
+      if (agent_type != "GPU" && agent_type != "CPU" && agent_type != "ALL")
+        return fail("-t needs GPU, CPU or ALL, not '" + agent_type + "'");
     } else if (a == "--lspci") {
       lspci = true;
     } else if (a == "--lspci-dump") {
@@ -1828,7 +1836,7 @@ int cmd_smi(const std::vector<std::string>& args) {
       // simulator nobody told which GPU to be, so say so where scripts do not
       // read it.
       const char* q = std::getenv("VGPU_QUIET");
-      if (print_agents(snap) == 0 && !(q && q[0] == '1')) {
+      if (print_agents(snap, agent_type) == 0 && !(q && q[0] == '1')) {
         const char* gpu = std::getenv("VGPU_GPU");
         if (gpu && *gpu)
           std::fprintf(stderr,

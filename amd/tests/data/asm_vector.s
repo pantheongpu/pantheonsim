@@ -3,11 +3,11 @@
 // signed 64-bit multiply-add that says when it overflowed, packed halves and
 // packed floats with op_sel choosing which part of each source feeds which
 // result and neg_lo and neg_hi negating them on the way, a packed move, a
-// mixed-precision multiply-add taking the top half of a register, and a
-// comparison of part of a register. Built for gfx942 by build.sh, with
-// clang's assembler.
+// mixed-precision multiply-add taking the top half of a register, a
+// comparison of part of a register, and v_perm_b32's every kind of byte.
+// Built for gfx942 by build.sh, with clang's assembler.
 //
-// vector(int* out, int x, int y) writes 26 words, in the order the test
+// vector(int* out, int x, int y) writes 31 words, in the order the test
 // lists them; x is the number of lanes the first comparison keeps.
   .amdgcn_target "amdgcn-amd-amdhsa--gfx942"
   .text
@@ -47,6 +47,7 @@ vector:
   v_pk_add_f16 v8, v6, v7 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[1,0]
   v_pk_max_f16 v9, v6, v7 neg_hi:[0,1]
   v_pk_fma_f16 v10, v6, v7, v6 op_sel_hi:[1,1,0]
+  v_pk_add_f16 v11, v6, 1.0                   // a constant: 1.0 in the low half, 0 in the high
   // Packed floats: s[8:9] = (2, 5), v[12:13] = (3, 7).
   s_mov_b32 s8, 2.0
   s_mov_b32 s9, 0x40a00000
@@ -55,6 +56,11 @@ vector:
   v_pk_mul_f32 v[14:15], s[8:9], v[12:13] op_sel:[1,0] op_sel_hi:[0,1]
   v_pk_add_f32 v[16:17], v[12:13], s[8:9] neg_hi:[0,1]
   v_pk_mov_b32 v[18:19], v[12:13], s[8:9] op_sel:[1,1]
+  // A packed multiply whose destination is its first source, the high
+  // result reading that source's low register: both halves read their
+  // sources before either is written (rocBLAS's small trsm).
+  v_mov_b64_e32 v[34:35], v[12:13]
+  v_pk_mul_f32 v[34:35], v[34:35], s[8:9] op_sel_hi:[0,1]
   // The top half of v6 as a half, times a float, plus a float.
   v_fma_mix_f32 v20, v6, v12, v13 op_sel:[1,0,0] op_sel_hi:[1,0,0]
   // The high word of v21 against v22, and then its low word.
@@ -110,6 +116,19 @@ vector:
   global_store_dword v0, v1, s[2:3] offset:92
   global_store_dword v0, v28, s[2:3] offset:96
   global_store_dword v0, v29, s[2:3] offset:100
+  global_store_dword v0, v34, s[2:3] offset:104
+  global_store_dword v0, v35, s[2:3] offset:108
+  // Bytes picked out of two registers, and past the eight of them, a byte's
+  // sign spread over a byte, a zero byte and a byte of ones.
+  v_mov_b32_e32 v36, 0x80017f02                // bytes 4 to 7: 02 7f 01 80
+  v_mov_b32_e32 v37, 0x00ff8001                // bytes 0 to 3: 01 80 ff 00
+  v_mov_b32_e32 v38, 0x0b0a0908                // the signs of bytes 1, 3, 5 and 7
+  v_perm_b32 v39, v36, v37, v38
+  v_mov_b32_e32 v38, 0x0d0c0704                // byte 4, byte 7, zero, ones
+  v_perm_b32 v1, v36, v37, v38
+  global_store_dword v0, v39, s[2:3] offset:112
+  global_store_dword v0, v1, s[2:3] offset:116
+  global_store_dword v0, v11, s[2:3] offset:120
   s_endpgm
 .Lvector_end:
   .size vector, .Lvector_end-vector
@@ -118,7 +137,7 @@ vector:
   .p2align 6
   .amdhsa_kernel vector
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
-    .amdhsa_next_free_vgpr 32
+    .amdhsa_next_free_vgpr 40
     .amdhsa_next_free_sgpr 48
     .amdhsa_accum_offset 32
   .end_amdhsa_kernel
@@ -135,7 +154,7 @@ amdhsa.kernels:
     .private_segment_fixed_size: 0
     .wavefront_size: 64
     .sgpr_count: 48
-    .vgpr_count: 32
+    .vgpr_count: 40
     .max_flat_workgroup_size: 64
     .args:
       - .size: 8

@@ -1,0 +1,4 @@
+device AMD Instinct MI300X gfx942:sramecc+:xnack- warp 64 CUs 304 threads/CU 2048 L2 4194304
+chevron launch wrong 0 of 3000
+graph captured 0 replayed 6
+peer can 1, enabling twice says hipErrorPeerAccessAlreadyEnabled, copy intact 1

@@ -23,6 +23,7 @@ if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
   for f in amd/tests/hipcc/ops.hip amd/tests/hipcc/ops.gfx942.o amd/tests/hipcc/ops.gfx942.dis \
            amd/tests/hipcc/wmma.cpp amd/tests/hipcc/wmma.gfx942.o amd/tests/hipcc/wmma.gfx942.dis \
            amd/tests/hipcc/chevron.cpp amd/tests/hipcc/chevron.gfx942 \
+           amd/tests/hipcc/chevron.O0.gfx942 amd/tests/hipcc/chevron.O0.gfx942.o amd/tests/hipcc/chevron.O0.gfx942.dis \
            amd/tests/hipcc/printf.cpp amd/tests/hipcc/printf.gfx942 amd/tests/hipcc/printf.gfx942.o \
            amd/tests/hipcc/printf.gfx942.dis amd/tests/hipcc/cooperative.cpp amd/tests/hipcc/cooperative.gfx942 \
            amd/tests/hipcc/cooperative.gfx942.o amd/tests/hipcc/cooperative.gfx942.dis \
@@ -33,7 +34,7 @@ if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
 fi
 
 rocm=""
-for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm "$HOME"/.local/share/rocm-7*/opt/rocm-*; do
+for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm $(ls -d "$HOME"/.local/share/rocm-*/opt/rocm-* 2>/dev/null | sort -rV); do
   [[ -n "$c" && -x "$c/bin/hipcc" && -x "$c/lib/llvm/bin/llvm-objdump" ]] && { rocm=$c; break; }
 done
 if [[ -z "$rocm" ]]; then

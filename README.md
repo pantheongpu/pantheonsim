@@ -46,7 +46,7 @@ Working today, all CPU-only:
 | Python JIT | Numba runs unmodified (its PTX is assembled through the driver's JIT link API); Triton runs with a one-line hook that stops its pipeline at PTX — see [nvidia/docs/jit.md](nvidia/docs/jit.md) |
 | Discovery | live telemetry + NVML; drop-in `nvidia-smi`, `rocm-smi`, `amd-smi`, `rocm_agent_enumerator`, and `lspci` output — see [docs/telemetry.md](docs/telemetry.md) |
 | Registers | PCI configuration space from a register database: header, PM, MSI, PCI Express and AER, live link and error state, BAR sizing; `vgpu regs list/read/write/dump/log` with an access log; AMD MMIO (engine status, the SMU mailbox) from the amdgpu headers; a C API, `vgpu_regs.h` — see [docs/registers.md](docs/registers.md) |
-| AMD | unmodified hipcc-built programs run on a simulated MI300X: the HIP runtime ABI, CDNA3 (gfx942) code checked instruction by instruction against ROCm's llvm-objdump and executed on every host core, device-side `printf`, and every pantheon workload with `--verify`. AMD's `rocprofv3` runs unmodified, with the counters the interpreter counts exactly. So does rocBLAS: its level-1 kernels and Tensile's float and double GEMMs, checked against a host BLAS — see [amd/README.md](amd/README.md) |
+| AMD | unmodified hipcc-built programs, from ROCm 6.4, 7.0, 7.1 or 7.2, run on a simulated MI300X: the HIP runtime ABI, CDNA3 (gfx942) code checked instruction by instruction against ROCm's llvm-objdump and executed on every host core, device-side `printf`, and every pantheon workload with `--verify`. AMD's `rocprofv3` runs unmodified, with the counters the interpreter counts exactly. So does rocBLAS: its level-1 kernels and Tensile's float and double GEMMs, checked against a host BLAS — see [amd/README.md](amd/README.md) |
 | Profiling | CUPTI's Activity API under its real soname: kernels, copies and runtime API calls, correlated; unmodified nvprof traces a program on the T4 profile. Nsight Systems and Nsight Compute are not supported. See [nvidia/docs/cupti.md](nvidia/docs/cupti.md) |
 | NVENC | `libnvidia-encode.so.1` with a deterministic content-derived encoder, so video-encode SDC tests run |
 | Proof | an nvcc-compiled CUDA program **and** the unmodified pantheon stress kernels run on the CPU; `memory_read` differential-matches a physical RTX 3060 (incl. fault injection + device printf) |
@@ -135,10 +135,10 @@ scripts/run-pantheon-workloads.sh        # builds and runs the whole suite
 
 See [docs/pantheon-workloads.md](docs/pantheon-workloads.md).
 
-### Running CUDA tests in GitHub Actions
+### Running CUDA and HIP tests in GitHub Actions
 
 Hosted runners have no GPU; this repository is also a GitHub Action that gives
-a job simulated ones:
+a job simulated ones, NVIDIA or AMD:
 
 ```yaml
 - uses: pantheongpu/pantheonsim@main
@@ -151,7 +151,9 @@ a job simulated ones:
 ```
 
 It builds the simulator (cached across runs), puts `vgpu`, `nvidia-smi` and the
-`nvcc` wrapper on `PATH`, and sets the GPU for the rest of the job. See
+`nvcc` wrapper on `PATH`, and sets the GPU for the rest of the job. With
+`gpu: amd/mi300x` it installs ROCm's `hipcc` instead, and `cuda-toolkit: '12.6'`
+picks a newer `nvcc` than Ubuntu's. See
 [docs/github-action.md](docs/github-action.md).
 
 ### Running a driver-API program against the virtual GPU
@@ -182,6 +184,7 @@ Environment knobs:
 | `VGPU_VRAM_MB` | virtual VRAM size, overriding the profile | profile |
 | `VGPU_STRICT` | `1` turns on the checks that catch bugs hardware hides but that real compiler output trips over: integer division by zero, and storing a register nothing has written | unset |
 | `VGPU_COUNTERS` | `1` prints exact per-launch performance counters | unset |
+| `VGPU_FASTPATH` | `0` sends every instruction down the interpreter's general path, for ruling out its fast paths when a result looks wrong (they are tested to give the same bits) | unset (on) |
 | `VGPU_RACE` | `1` reports unordered shared-memory access between warps; `2` also reports stores that change nothing | unset |
 
 `VGPU_COUNTERS` reports what a profiler reports, except that every number is

@@ -909,35 +909,13 @@ what is done.
   fault with a diagnostic naming which it was. Exporting a handle to another
   process still refuses: device memory here is this process's own sparse
   backing.)
-- Frontends: cubin/SASS loading, and AMD execution -- HIP runtime and the CDNA
-  ISA. AMD *discovery* exists: `amd/tools/rocminfo-to-profile.py` reads a real
-  MI325X and `amd/profiles/mi325x.yaml` is verified against one. The warp width
-  is no longer the blocker: the interpreter is warp-width parametric, masks are
-  64-bit, and a 64-lane profile launches and executes. The front-end has
-  started: amd/src/codeobject.cpp reads the code object a HIP program hands
-  the driver (kernels, kernarg layout, LDS, registers) and amd/src/gcn_decode.cpp
-  decodes its CDNA instructions, checked against the assembler's own output on
-  a freshly built object. amd/src/gcn_exec.cpp runs them on 64-lane
-  wavefronts with the scalar registers and the EXEC mask the ISA exposes, over
-  LDS and device memory, with barriers: the fixture's kernels -- a vector add
-  and a reduction through LDS -- give the answers their C would. amd/src/hip_api.cpp
-  is libamdhip64 over that: a HIP program written against the documented API
-  (amd/include/vgpu_hip.h) gets devices, memory and the module API, and its
-  kernel runs. The instruction set covers what clang emits for the fixtures --
-  integer and float math including division, double and packed half
-  precision, the transcendentals, conversions, comparisons, loops and both
-  kinds of branch, and the memory a kernel uses: global, LDS and their
-  atomics, private memory for spills, a cross-lane read, flat accesses, and a
-  module's own variables (the relocations that find them, and
-  hipModuleGetGlobal), and the grid's shape as a kernel reads it (the implicit
-  arguments and the dispatch packet) -- each checked against the assembler's
-  output and against what the C means. Not implemented: the matrix
-  instructions (v_mfma_*), which are refused by name -- their register layout
-  cannot be checked against anything here, and a wrong layout would return
-  plausible wrong matrices.
-  Still missing: the fatbin path hipcc compiles (__hipRegisterFatBinary,
-  hipLaunchKernel), streams that are more than handles, and every instruction
-  outside what those kernels use, which is refused by name.
+- Frontends: cubin/SASS loading. (AMD execution is done -- see
+  amd/README.md: unmodified hipcc programs built by ROCm 6.4, 7.0, 7.1 or 7.2
+  run on a simulated MI300X, through the fatbin path, chevron
+  launches, device printf and cooperative launch, and AMD's own rocBLAS runs
+  its level-1 kernels and Tensile's float and double GEMMs, 135,000 of its
+  own quick tests passing. What AMD still lacks is listed under the next
+  milestones.)
 - Tooling: trace record/replay, conformance DB + compat scores. (`vgpu run`,
   `vgpu test --matrix`, shared-memory race detection, the random and
   adversarial schedulers, and fault injection are done.)
@@ -986,7 +964,67 @@ ordinary local traffic, and predicated-off lanes as a first-class number
 
 ## Performance
 
-Two changes moved the needle most recently, both found by profiling rather than
+**2026-09-25: fast paths, measured on the pantheon workloads that hit their
+watchdog at full size.** perf (extracted from Ubuntu's linux-tools package;
+no install needed) put int_virus's time in int_bin, dispatch, read_operand
+and write_reg: every 32-bit operand widened into a 64-lane array of 64-bit
+values, and the operation decoded again for every lane. What changed:
+
+- The instructions kernels live in take a fast path when they need nothing
+  special: 32- and 64-bit integer ops, mad.lo, mov, setp, integer cvt,
+  mul.wide, f32 arithmetic, f32/f64/f16x2 fma, and wmma.mma. It reads the
+  narrow register file in place, decides the operation once per
+  instruction, and is called straight from the warp loop, skipping step()
+  and dispatch(). `VGPU_FASTPATH=0` turns every one of them off, and
+  tests/unit/test_fastpath.cpp runs each form both ways over the values
+  that break arithmetic and requires the same bits.
+- fma uses the host's FMA unit in a lane loop (the baseline x86-64 build
+  made std::fma a libm call per lane); f16 decodes from a table and rounds
+  on the bits; wmma's 16x16x16 multiply-accumulate is AVX2 where available,
+  with contraction off so no build fuses its products into an FMA.
+- Loads and stores no longer allocate on every instruction, and a
+  multi-threaded launch hands out blocks as threads free up.
+
+Single-thread simulated instructions per second, A/B against the previous
+main on the same machine (warp instructions; `VGPU_COUNTERS` over CPU time):
+
+| workload | before | after |
+| --- | --- | --- |
+| int_virus | 7.8 M | 38-60 M |
+| compute_virus | 11.5 M | 35 M |
+| pulse_virus | 17.7 M | 57 M |
+| memory_retention_bake | 11.7 M | 35 M |
+| fp64_virus | 1.8 M | 5-6 M |
+| omni_virus | 4.0 M | 10.5 M |
+| mma_virus | 0.3 M | 1.1 M |
+
+At full size (the default grid, 30 s, --mem 99, a 4 GB A10 profile) all
+seven used to exceed pantheon's 360 s watchdog. On main after the merge,
+on a machine other jobs were also loading (load average 20-30), five
+finish:
+
+| workload | full size |
+| --- | --- |
+| int_virus | 72 s |
+| memory_bank_thrash | 116 s |
+| pulse_virus | 161 s |
+| omni_virus | 175 s |
+| memory_retention_bake | 195 s |
+| fp64_virus | watchdog (360 s) |
+| mma_virus | watchdog (360 s) |
+
+fp64_virus is held back by the subnormal assists below; mma_virus by the
+matrix work itself, which is still about 1 M warp instructions a second.
+
+One limit found and left alone: on Intel cores a subnormal operand or result
+costs every FP operation a microcode assist, and fp64_virus's FMA chains
+decay into that range -- it runs about 3.7x faster with flush-to-zero set.
+Flushing changes the answers, so it is not used; running the FMA unit with
+FTZ/DAZ and recomputing the affected lanes exactly in integer arithmetic was
+built, verified, and measured slower than the assists (it lost the
+vectorization and added a branch per lane), so it was removed.
+
+Earlier: two changes moved the needle, both found by profiling rather than
 by guessing:
 
 - **The grid runs on every core.** Blocks are independent by definition, so
@@ -1054,6 +1092,14 @@ scripts/run-pantheon-workloads.sh.
 
 ## Next milestones (order)
 
+0. **AMD, in this order**: finish rocBLAS (a double trsv path from its
+   sixth work-group on, and the half, bfloat16, int8 and FP8 GEMMs, about 40
+   more instruction forms); the rest of ROCm's libraries, found by running
+   PyTorch for ROCm on a small model (hipBLASLt, MIOpen, rocPRIM/hipCUB,
+   rocRAND, rocFFT, rocSPARSE, rocSOLVER, RCCL, which needs inter-process
+   memory handles); host memory a kernel can reach (pinned and managed) and
+   streams that run asynchronously; the HSA/KFD layer beneath HIP (rocminfo,
+   amdgpu-arch, OpenMP offload); textures and images; gfx950 (MI350X).
 1. **Interpreter speed**: intern register names to dense indices at parse
    time (see Performance above) — the single biggest win available without
    the JIT.

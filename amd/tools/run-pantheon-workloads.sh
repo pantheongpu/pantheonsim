@@ -15,7 +15,7 @@
 # RDNA's matrix instructions, or NVIDIA's encoder) reports SKIP with its own
 # reason, as it would on a card.
 #
-# Needs ROCm's hipcc (set VGPU_ROCM_PATH; /opt/rocm and ~/.local/share/rocm-*
+# Needs ROCm's hipcc (set VGPU_ROCM_PATH; /opt/rocm and the newest ~/.local/share/rocm-*
 # are searched) and a pantheongpu checkout.
 #
 #   amd/tools/run-pantheon-workloads.sh [pantheongpu-repo] [outdir]
@@ -39,7 +39,7 @@ mkdir -p "$bin" "$logs" "$code"
 vram_for() { case "$1" in pcie_bandwidth|p2p_thrasher|all_reduce) echo 1024 ;; *) echo "$VGPU_WL_VRAM_MB" ;; esac; }
 
 rocm=""
-for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm "$HOME"/.local/share/rocm-7*/opt/rocm-*; do
+for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm $(ls -d "$HOME"/.local/share/rocm-*/opt/rocm-* 2>/dev/null | sort -rV); do
   [[ -n "$c" && -x "$c/bin/hipcc" ]] && { rocm=$c; break; }
 done
 [[ -n "$rocm" ]] || { echo "SKIP: no ROCm hipcc found (set VGPU_ROCM_PATH)"; exit 0; }

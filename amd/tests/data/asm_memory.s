@@ -5,11 +5,11 @@
 // to clear registers); a scalar load whose offset is a register; a lane
 // sending its value to another; and a work-item's private memory through
 // its flat aperture, read back as scratch -- once by offset alone, once
-// from a scalar register's offset. Built for gfx942 by build.sh, with
+// from a scalar register's offset; and loads into half a register. Built for gfx942 by build.sh, with
 // clang's assembler.
 //
 // memory(int* buf, int* out): buf holds eight words, of which the resource
-// covers the first four; out gets 15 words, in the order the test lists.
+// covers the first four; out gets 19 words, in the order the test lists.
   .amdgcn_target "amdgcn-amd-amdhsa--gfx942"
   .text
   .globl memory
@@ -101,11 +101,53 @@ memory:
   s_waitcnt vmcnt(0)
   global_store_dword v10, v27, s[6:7] offset:48
   global_store_dword v10, v28, s[6:7] offset:52
+  // Half-register loads, each over a register that held 0xdeadbeef: the
+  // half they load, and the other cleared, as on a card with SRAM ECC.
+  v_mov_b32_e32 v5, 0xdeadbeef
+  v_mov_b32_e32 v6, 0xdeadbeef
+  v_mov_b32_e32 v8, 0xdeadbeef
+  v_mov_b32_e32 v9, 0xdeadbeef
+  v_mov_b32_e32 v4, 4
+  buffer_load_short_d16 v5, v4, s[8:11], 0 offen
+  buffer_load_short_d16_hi v6, v4, s[8:11], 0 offen offset:8
+  buffer_load_short_d16 v9, v4, s[8:11], 0 offen offset:12   // past the end
+  ds_read_u16_d16_hi v8, v13
+  s_waitcnt vmcnt(0) lgkmcnt(0)
+  global_store_dword v10, v5, s[6:7] offset:60
+  global_store_dword v10, v6, s[6:7] offset:64
+  global_store_dword v10, v8, s[6:7] offset:68
+  global_store_dword v10, v9, s[6:7] offset:72
   s_endpgm
 .Lmemory_end:
   .size memory, .Lmemory_end-memory
 
+// kernarg_tail(int* out): a kernel whose arguments are one pointer, 8
+// bytes, that loads 32 bytes of them at once, as the compiler does when it
+// widens a load of the last arguments past the segment's end (rocBLAS's
+// rotmg). A runtime has to give it memory there to read; it writes 1.
+  .globl kernarg_tail
+  .p2align 8
+  .type kernarg_tail,@function
+kernarg_tail:
+  s_load_dwordx8 s[4:11], s[0:1], 0x0
+  s_waitcnt lgkmcnt(0)
+  s_mov_b64 exec, 1
+  v_mov_b32_e32 v0, 0
+  v_mov_b32_e32 v1, 1
+  global_store_dword v0, v1, s[4:5]
+  s_endpgm
+.Lkernarg_tail_end:
+  .size kernarg_tail, .Lkernarg_tail_end-kernarg_tail
+
   .rodata
+  .p2align 6
+  .amdhsa_kernel kernarg_tail
+    .amdhsa_user_sgpr_kernarg_segment_ptr 1
+    .amdhsa_next_free_vgpr 2
+    .amdhsa_next_free_sgpr 16
+    .amdhsa_accum_offset 4
+  .end_amdhsa_kernel
+
   .p2align 6
   .amdhsa_kernel memory
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
@@ -138,6 +180,21 @@ amdhsa.kernels:
         .address_space: global
       - .size: 8
         .offset: 8
+        .value_kind: global_buffer
+        .address_space: global
+  - .name: kernarg_tail
+    .symbol: kernarg_tail.kd
+    .kernarg_segment_size: 8
+    .kernarg_segment_align: 8
+    .group_segment_fixed_size: 0
+    .private_segment_fixed_size: 0
+    .wavefront_size: 64
+    .sgpr_count: 16
+    .vgpr_count: 2
+    .max_flat_workgroup_size: 64
+    .args:
+      - .size: 8
+        .offset: 0
         .value_kind: global_buffer
         .address_space: global
 ...

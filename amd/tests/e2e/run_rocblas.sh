@@ -14,7 +14,7 @@ root="$(cd "$(dirname "$0")/../../.." && pwd)"
 shim="$build/shim"
 [[ -e "$shim/libamdhip64.so.7" ]] || { echo "SKIP: no HIP shim in $shim"; exit 0; }
 rocm=""
-for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm "$HOME"/.local/share/rocm-7*/opt/rocm-*; do
+for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm $(ls -d "$HOME"/.local/share/rocm-*/opt/rocm-* 2>/dev/null | sort -rV); do
   [[ -n "$c" && -x "$c/bin/hipcc" && -e "$c/include/rocblas/rocblas.h" ]] && ls "$c"/lib/librocblas.so.* >/dev/null 2>&1 &&
     { rocm=$c; break; }
 done
@@ -56,4 +56,8 @@ expect "dgemm, through its double ones" "dgemm 96x80x64, A transposed: 7680 of 7
   "$(grep -o '^dgemm .*' <<< "$out")"
 expect "ragged GEMMs, where the kernels count on a buffer's bounds at the edges" \
   "ragged GEMMs, every transpose, float and double: 48 of 48 right" "$(grep -o '^ragged GEMMs.*' <<< "$out")"
+expect "gemm_ex of halves, bfloat16s and bytes, through their matrix instructions and half-register loads" \
+  "gemm_ex, halves, bfloat16s and bytes, every transpose: 100 of 100 right" "$(grep -o '^gemm_ex, .*' <<< "$out")"
+expect "complex GEMMs, float and double, each operand transposed, conjugated or neither" \
+  "complex GEMMs, every transpose and conjugate: 90 of 90 right" "$(grep -o '^complex GEMMs.*' <<< "$out")"
 exit $fail

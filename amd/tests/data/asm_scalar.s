@@ -5,7 +5,7 @@
 // where the last comparison held. Built for gfx942 by build.sh, with clang's
 // assembler.
 //
-// scalar(int* out, int x, int y) writes 26 words, in the order the test
+// scalar(int* out, int x, int y) writes 28 words, in the order the test
 // lists them.
   .amdgcn_target "amdgcn-amd-amdhsa--gfx942"
   .text
@@ -50,6 +50,9 @@ scalar:
   s_cmp_lg_u32 s4, s5
   s_cmov_b32 s30, s4
   s_not_b64 s[32:33], s[4:5]
+  // An inline float constant in a 64-bit move is the double (rocBLAS's
+  // unit-diagonal trsv writes its ones this way).
+  s_mov_b64 s[34:35], 1.0
   v_mov_b32_e32 v0, 0
   v_mov_b32_e32 v1, s6
   global_store_dword v0, v1, s[2:3]
@@ -103,6 +106,10 @@ scalar:
   global_store_dword v0, v1, s[2:3] offset:96
   v_mov_b32_e32 v1, s33
   global_store_dword v0, v1, s[2:3] offset:100
+  v_mov_b32_e32 v1, s34
+  global_store_dword v0, v1, s[2:3] offset:104
+  v_mov_b32_e32 v1, s35
+  global_store_dword v0, v1, s[2:3] offset:108
   s_endpgm
 .Lscalar_end:
   .size scalar, .Lscalar_end-scalar

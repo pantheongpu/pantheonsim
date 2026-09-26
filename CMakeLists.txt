@@ -752,10 +752,19 @@ set_tests_properties(amd_hip PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_rocblas_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas_disasm.sh)
 set_tests_properties(amd_rocblas_disasm PROPERTIES DEPENDS test_amd_gcn
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# Programs built by each current ROCm release (6.4, 7.0, 7.1, 7.2), run on the shim.
+add_test(NAME amd_rocm_versions COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocm_versions.sh)
+set_tests_properties(amd_rocm_versions PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 # AMD's rocBLAS, unmodified, where ROCm with rocBLAS is installed.
 add_test(NAME amd_rocblas COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas.sh)
 set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# PyTorch's ROCm build, unmodified, where a Python with it is installed
+# (VGPU_TORCH_PYTHON, or a venv under ~/.local/share/torch-rocm*).
+add_test(NAME amd_pytorch COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh)
+set_tests_properties(amd_pytorch PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 add_test(NAME amd_hipcc COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc.sh)
 set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
@@ -772,6 +781,11 @@ set_tests_properties(test_amd_hipcc_printf_decode PROPERTIES ENVIRONMENT
 add_test(NAME test_amd_hipcc_cooperative_decode COMMAND test_amd_gcn)
 set_tests_properties(test_amd_hipcc_cooperative_decode PROPERTIES ENVIRONMENT
   "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/cooperative.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/cooperative.gfx942.dis")
+# The same program unoptimized: device library calls, lane spills and the long
+# form of nearly every vector instruction.
+add_test(NAME test_amd_hipcc_O0_decode COMMAND test_amd_gcn)
+set_tests_properties(test_amd_hipcc_O0_decode PROPERTIES ENVIRONMENT
+  "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/chevron.O0.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/chevron.O0.gfx942.dis")
 add_test(NAME test_amd_hipcc_mfma_decode COMMAND test_amd_gcn)
 set_tests_properties(test_amd_hipcc_mfma_decode PROPERTIES ENVIRONMENT
   "VGPU_GCN_OBJECT=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/wmma.gfx942.o;VGPU_GCN_LISTING=${CMAKE_SOURCE_DIR}/amd/tests/hipcc/wmma.gfx942.dis")

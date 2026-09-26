@@ -17,7 +17,7 @@ build="$(cd "${VGPU_BUILD_DIR:-$root/build}" && pwd)"
 vgpu="$build/vgpu"
 [[ -x "$vgpu" && -e "$build/shim/librocprofiler-sdk.so.1" ]] || { echo "SKIP: build vgpu and vgpurocprof first"; exit 0; }
 rocm=""
-for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm "$HOME"/.local/share/rocm-7*/opt/rocm-*; do
+for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm $(ls -d "$HOME"/.local/share/rocm-*/opt/rocm-* 2>/dev/null | sort -rV); do
   [[ -n "$c" && -x "$c/bin/rocprofv3" && -e "$c/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so" ]] && { rocm=$c; break; }
 done
 [[ -n "$rocm" ]] || { echo "SKIP: no ROCm with rocprofiler-sdk found (set VGPU_ROCM_PATH)"; exit 0; }

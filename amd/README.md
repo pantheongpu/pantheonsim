@@ -57,6 +57,18 @@ and `.so.7`) and gives each function the symbol version the real one does,
 since a program built by `hipcc` asks for `hipMalloc@hip_4.2`, not just
 `hipMalloc`.
 
+Programs built by each current ROCm release -- 6.4, 7.0, 7.1 and 7.2 -- run on
+it. The version each function carries is the same in all of them, and each
+later release only adds functions. `hipGetDeviceProperties` without a suffix
+fills the older layout (hipDeviceProp_tR0000) that every release keeps under
+that name for programs built to it; one built with the headers as they are
+calls `hipGetDevicePropertiesR0600`. `tests/hipcc/rocm/` holds five programs
+built by each release -- each with that release's own device library, so its
+printf and grid barrier -- and `tests/e2e/run_rocm_versions.sh` runs them all
+against the same expected output. `tests/e2e/run_hip_abi.sh` checks the
+structures, the attribute numbers and the memory types against the headers
+of each of those releases installed.
+
 `hipDeviceGetAttribute` answers each attribute with the property of the same
 name, by the numbers ROCm's header gives them (`tests/e2e/run_hip_abi.sh`
 checks every one against the header). The occupancy calls work out how many
