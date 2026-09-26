@@ -710,6 +710,9 @@ struct OpTex {
   std::vector<Reg> dsts;         // always four
   Operand obj;                   // the texture object handle
   std::vector<Operand> coords;
+  // .level: an explicit level of detail (of .ctype) after the coordinates.
+  bool level = false;
+  Operand lod;
 };
 struct OpSuld {
   uint32_t dims = 1;

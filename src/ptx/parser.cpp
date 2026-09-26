@@ -3175,6 +3175,7 @@ class Parser {
       // tex.<geom>[.level|.grad].v4.<dtype>.<ctype> {d,d,d,d}, [obj, {c,...}]
       uint32_t dims = 0;
       TexGeom geom = TexGeom::D1;
+      bool level = false;
       Type dtype{}, ctype{};
       bool have_d = false;
       std::vector<std::string> types;
@@ -3190,8 +3191,13 @@ class Parser {
         else if (p == "v4") ;
         else if (p == "2dms" || p == "a2dms")
           return unsupported("multi-sample textures are not implemented");
-        else if (p == "level" || p == "grad")
-          return unsupported("mipmapped texture fetch ('." + p + "') is not implemented");
+        else if (p == "level") level = true;
+        else if (p == "base") ;
+        else if (p == "grad")
+          return unsupported("tex.grad: the level of detail a GPU derives from gradients goes "
+                             "through its approximate log2 and length units, which are not "
+                             "documented, so it is refused rather than approximated (tex.level "
+                             "and plain fetches of mipmapped textures are implemented)");
         else if (auto t2 = parse_type_token(p)) types.push_back(p);
         else return unsupported("tex modifier '." + p + "'");
       }
@@ -3219,6 +3225,11 @@ class Parser {
       if (op.coords.size() < dims + (indexed ? 1 : 0))
         return unsupported("tex coordinate count does not match its geometry");
       expect_punct("]");
+      if (level) {
+        op.level = true;
+        expect_punct(",");
+        op.lod = parse_operand();
+      }
       ins.op = std::move(op);
     } else if (op0 == "suld" || op0 == "sust") {
       // suld.b.<geom>.<type>.<clamp> {d,...}, [obj, {x,y}]

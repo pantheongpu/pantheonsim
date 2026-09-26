@@ -4209,6 +4209,100 @@ VTEST(layered_surfaces_write_and_read_layers) {
   VCHECK_CONTAINS(err.message(), "1D layered access (.a1d) on a 2D layered surface");
 }
 
+// Mipmapped fetches against a table recorded on an RTX 3060: an 8x8 texture,
+// four levels, every texel of level l equal to 1000 l, so a result reads off
+// the level of detail the hardware used. An explicit lod is held in 1/256ths
+// of a level, truncated toward zero (so -0.3 with a +0.61 bias is 80/256 of a
+// level, not 79); the bias is truncated the same way and not applied to a
+// plain fetch; the level clamps come after the bias; point filtering between
+// levels rounds to the nearer level, halves up.
+VTEST(tex_mipmapped_level_of_detail_matches_hardware) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .f32 lod, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f5, [lod];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.f32 %f6, 0f3E99999A;
+    mov.f32 %f7, 0f3F19999A;
+    tex.level.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f6, %f7}], %f5;
+    st.global.f32 [%rd3], %f1;
+    tex.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f6, %f7}];
+    st.global.f32 [%rd3+4], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16);
+  TextureDesc d;
+  d.width = 8;
+  d.height = 8;
+  d.kind = ChannelKind::Float;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.pitch_bytes = 32;
+  d.normalized_coords = true;
+  d.mip_levels = 4;
+  for (uint32_t l = 0; l < 4; ++l) {
+    const uint32_t w = 8 >> l;
+    d.level_base[l] = e.mem.alloc(w * w * 4);
+    std::vector<float> t(w * w, 1000.f * l);
+    e.mem.write(d.level_base[l], t.data(), w * w * 4);
+  }
+  d.base = d.level_base[0];
+  auto q = [](float v) { return static_cast<int32_t>(std::trunc(v * 256)); };
+  const struct { int mipf; float bias, mn, mx, lod; uint32_t want, want_base; } cases[] = {
+      {1, 0x0p+0f, 0x0p+0f, 0x1.9p+6f, 0x1.00fp+0f, 0x447a0000u, 0},
+      {1, 0x0p+0f, 0x0p+0f, 0x1.9p+6f, 0x1.01p+0f, 0x447afa00u, 0},
+      {1, 0x0p+0f, 0x0p+0f, 0x1.9p+6f, 0x1.4p+1f, 0x451c4000u, 0},
+      {1, 0x0p+0f, 0x0p+0f, 0x1.9p+6f, 0x1.2p+3f, 0x453b8000u, 0},
+      {1, 0x1.3851ecp-1f, 0x0p+0f, 0x1.9p+6f, -0x1.333334p-2f, 0x439c4000u, 0},
+      {1, -0x1.333334p-2f, 0x0p+0f, 0x1.9p+6f, 0x1.4p-2f, 0x417a0000u, 0},
+      {1, 0x1.5c28f6p-3f, 0x1.666666p-1f, 0x1.266666p+1f, 0x1.99999ap-4f, 0x442ece00u, 0x442ece00u},
+      {1, 0x1.5c28f6p-3f, 0x1.666666p-1f, 0x1.266666p+1f, 0x1.733334p+1f, 0x450f8e00u, 0x442ece00u},
+      {0, 0x0p+0f, 0x0p+0f, 0x1.9p+6f, 0x1.f5c29p-2f, 0x00000000u, 0},
+      {0, 0x0p+0f, 0x0p+0f, 0x1.9p+6f, 0x1p-1f, 0x447a0000u, 0},
+      {0, 0x1.8p-1f, 0x0p+0f, 0x1.9p+6f, -0x1.0a3d7p-2f, 0x00000000u, 0},
+      {0, 0x0p+0f, 0x0p+0f, 0x1.9p+6f, -0x1.8p+1f, 0x00000000u, 0}};
+  TextureTable tex;
+  LaunchConfig cfg;
+  cfg.textures = &tex;
+  for (const auto& c : cases) {
+    TextureDesc v = d;
+    v.mip_filter = c.mipf ? TexFilter::Linear : TexFilter::Point;
+    v.mip_bias = q(c.bias);
+    v.mip_min = q(c.mn);
+    v.mip_max = q(c.mx);
+    tex[0x71] = v;
+    std::vector<uint8_t> la(4);
+    std::memcpy(la.data(), &c.lod, 4);
+    exec::launch(m.entries[0], cfg, {arg_u64(0x71), la, arg_u64(out)}, e.mem, e.prof);
+    VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{c.want});
+    VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{c.want_base});
+  }
+}
+
+// tex.grad is refused by name: the level of detail comes from the GPU's
+// approximate log2 and length units, which are not documented.
+VTEST(tex_grad_is_refused_by_name) {
+  const std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t)
+{
+    .reg .f32 %f<12>;
+    .reg .b64 %rd<2>;
+    ld.param.u64 %rd1, [t];
+    tex.grad.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}], {%f7, %f8}, {%f9, %f10};
+    ret;
+}
+)";
+  auto err = VCAPTURE(Error, ptx::parse(ptx));
+  VCHECK_CONTAINS(err.message(), "tex.grad");
+}
+
 VTEST(a_texture_handle_used_as_a_surface_is_refused) {
   // The two have the same shape of handle and are not interchangeable.
   std::string ptx = std::string(kHeader) + R"(

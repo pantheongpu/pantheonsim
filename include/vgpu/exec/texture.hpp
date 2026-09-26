@@ -44,6 +44,13 @@ struct TextureDesc {
   // slices of width x height texels.
   uint32_t layers = 0;
   bool cubemap = false;
+  // A mipmapped texture: level l is max(1, size >> l) in each dimension and
+  // starts at level_base[l]. The bias and the level clamps are in 1/256ths of
+  // a level, truncated toward zero, as the hardware holds them (measured).
+  uint32_t mip_levels = 0;   // 0 when not mipmapped
+  uint64_t level_base[17] = {};
+  TexFilter mip_filter = TexFilter::Point;
+  int32_t mip_bias = 0, mip_min = 0, mip_max = 0;
   uint32_t pitch_bytes = 0; // distance between rows; width*texel_bytes if dense
   uint32_t channels = 1;    // 1..4
   uint32_t channel_bits[4] = {32, 0, 0, 0};
