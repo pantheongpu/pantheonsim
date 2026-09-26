@@ -31,6 +31,7 @@
 
 #include "vgpu/amd_bundle.hpp"
 #include "vgpu/amd_codeobject.hpp"
+#include "vgpu/amd_decode_cache.hpp"
 #include "vgpu/amd_exec.hpp"
 #include "vgpu/amd_hostcall.hpp"
 #include "vgpu/error.hpp"
@@ -68,6 +69,8 @@ struct Module {
   // What a profiler knows it and its kernels by (vgpu/hip_profiler.hpp).
   uint64_t code_object_id = 0;
   std::vector<uint64_t> kernel_ids;   // one per kernel, in the object's order
+  // Its code as its launches have decoded it, made once it is placed.
+  std::unique_ptr<vgpu::amd::DecodeCache> decoded;
 };
 
 // ---- What a profiler is told -----------------------------------------------
@@ -582,6 +585,7 @@ hipError_t run_launch(const LaunchJob& job) {
     dispatch.dynamic_lds = shared;   // what the launch adds to the kernel's own LDS
     dispatch.hostcall = job.hostcall;
     dispatch.code_base = module.code_base;
+    dispatch.decoded = module.decoded.get();
     dispatch.cooperative = cooperative;
     dispatch.grid_sync = grid_sync;
     dispatch.peers = job.peers;
@@ -636,6 +640,7 @@ hipError_t launch_in_order(LaunchJob job) {
 // code runs and in which its variables sit; an unlinked one's variables, with
 // its code told where they went.
 void place(Module& m, vgpu::MemoryManager& mem) {
+  m.decoded = std::make_unique<vgpu::amd::DecodeCache>(m.object.text.size());
   if (m.object.linked) {
     m.code_base = mem.alloc(m.object.image.empty() ? 1 : m.object.image.size());
     if (!m.object.image.empty()) mem.write(m.code_base, m.object.image.data(), m.object.image.size());
@@ -1330,7 +1335,7 @@ hipError_t create_stream(hipStream_t* stream, unsigned flags, int priority, std:
   // Handles from 0x100: HIP reserves the small ones (hipStreamPerThread is 2).
   static intptr_t next = 0x100;
   *stream = reinterpret_cast<hipStream_t>(next++);
-  s.streams[*stream] = Stream{s.current, flags, priority, std::move(cu_mask)};
+  s.streams[*stream] = Stream{s.current, flags, priority, std::move(cu_mask), nullptr};
   return record(s, hipSuccess);
 }
 
@@ -1339,7 +1344,7 @@ hipError_t create_stream(hipStream_t* stream, unsigned flags, int priority, std:
 // destroyed, is nullptr.
 const Stream* find_stream(State& s, hipStream_t stream, Stream* null_stream) {
   if (!stream) {
-    *null_stream = Stream{s.current, 0, 0, {}};
+    *null_stream = Stream{s.current, 0, 0, {}, nullptr};
     return null_stream;
   }
   const auto it = s.streams.find(stream);

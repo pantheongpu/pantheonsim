@@ -12,9 +12,12 @@
 #include <iterator>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <atomic>
 #include <vector>
 
 #include "vgpu/amd_codeobject.hpp"
+#include "vgpu/amd_decode_cache.hpp"
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/error.hpp"
 #include "vtest.hpp"
@@ -134,6 +137,42 @@ VTEST(every_instruction_shape_rocms_libraries_use_decodes_as_llvm_prints_it) {
   VCHECK(checked > 1000);
   if (wrong_count)
     throw vtest::Failure(std::to_string(wrong_count) + " of " + std::to_string(checked) + " differ:" + wrong);
+}
+
+// The cache every launch of a module shares: an instruction is decoded once,
+// however many threads reach it at the same moment, and all of them get the
+// same copy; a word past the end of the code is not cached.
+VTEST(the_shared_decode_cache_decodes_each_instruction_once) {
+  std::vector<uint8_t> code;
+  for (int i = 0; i < 3 * 4096 + 5; ++i)   // s_nop 0, across more than one page
+    for (uint8_t b : {0x00, 0x00, 0x80, 0xbf}) code.push_back(b);
+  amd::DecodeCache cache(code.size());
+  std::atomic<int> decodes{0};
+  const auto get = [&](uint64_t word) {
+    return cache.get(word, [&] {
+      ++decodes;
+      return amd::gcn::decode(code, word * 4, 0x1000 + word * 4);
+    });
+  };
+  const amd::gcn::Inst* first = get(4096 + 7);
+  VCHECK(first != nullptr);
+  VCHECK_EQ(first->name, std::string("s_nop"));
+  VCHECK_EQ(first->pc, uint64_t{0x1000 + (4096 + 7) * 4});
+  VCHECK(get(4096 + 7) == first);
+  VCHECK_EQ(decodes.load(), 1);
+  VCHECK(get(code.size() / 4 + 4096) == nullptr);   // past the last page
+
+  // Threads racing for the same words: each word ends up with one copy.
+  std::vector<std::thread> threads;
+  std::vector<const amd::gcn::Inst*> seen(8 * 64);
+  for (int t = 0; t < 8; ++t)
+    threads.emplace_back([&, t] {
+      for (int w = 0; w < 64; ++w) seen[t * 64 + w] = get(uint64_t{2} * 4096 + w);
+    });
+  for (auto& th : threads) th.join();
+  for (int t = 1; t < 8; ++t)
+    for (int w = 0; w < 64; ++w) VCHECK(seen[t * 64 + w] == seen[w]);
+  for (int w = 0; w < 64; ++w) VCHECK_EQ(seen[w]->pc, uint64_t{0x1000} + uint64_t(2 * 4096 + w) * 4);
 }
 
 VTEST(an_instruction_says_where_its_operands_are) {
