@@ -240,10 +240,16 @@ struct State {
   std::deque<Pool> pools;                       // a pool's address is its handle
   std::map<int, Pool*> default_pools;           // by device
   std::map<uint64_t, std::pair<Pool*, uint64_t>> pool_allocations;   // address -> pool, bytes
-  int current = 0;
+  // The device hipSetDevice chose, for the calling host thread alone, as HIP
+  // (and CUDA) documents it: each new thread starts on device 0. RCCL gives
+  // each GPU a thread of its own that sets its device; with one current
+  // device for the process, every thread ended up on the last one set.
+  static thread_local int current;
   hipError_t last = hipSuccess;
   std::string profile_id;
 };
+
+thread_local int State::current = 0;
 
 State& state() {
   static State s;
@@ -1331,7 +1337,12 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
     props->major = std::atoi(digits.substr(0, digits.size() - 2).c_str());
     props->minor = static_cast<int>(std::strtol(digits.substr(digits.size() - 2, 1).c_str(), nullptr, 16));
   }
-  props->pciDeviceID = ordinal;
+  // The PCI address rocm-smi and sysfs give the device (telemetry's
+  // describe_device): a bus of its own, ordinal + 1, device 0. Two devices on
+  // one bus looked to RCCL like one GPU twice.
+  props->pciDomainID = 0;
+  props->pciBusID = ordinal + 1;
+  props->pciDeviceID = 0;
   props->concurrentKernels = 1;
   props->cooperativeLaunch = 1;
   props->unifiedAddressing = 1;
