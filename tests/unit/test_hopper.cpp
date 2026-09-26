@@ -94,6 +94,9 @@ struct Wgmma {
   std::vector<uint32_t> a_words;     // 128 x 4
   std::vector<uint32_t> d_in;        // 128 x d_regs
   uint32_t threads = 128;
+  // After its wait_group, warp 0 zeroes all of shared memory: legal, since a
+  // completed wgmma has read its operands for the whole warpgroup.
+  bool clobber_after = false;
   std::string target = kHeader90a;
   std::string device = "nvidia/h100";
 
@@ -155,7 +158,19 @@ COPIED:
     wgmma.mma_async.sync.aligned.)" + form + " {" + dl + "}, " + a + ", %rd6, " + scale_d + tail + R"(;
     wgmma.commit_group.sync.aligned;
     wgmma.wait_group.sync.aligned 0;
-)" + stores + R"(
+)" + (clobber_after ? R"(
+    setp.ge.u32 %p3, %r1, 32;
+    @%p3 bra CLOBBERED;
+    shl.b32 %r20, %r1, 2;
+CLOBBER:
+    setp.ge.u32 %p3, %r20, 16384;
+    @%p3 bra CLOBBERED;
+    add.u32 %r21, %r2, %r20;
+    st.shared.u32 [%r21], 0;
+    add.u32 %r20, %r20, 128;
+    bra CLOBBER;
+CLOBBERED:
+)" : std::string()) + stores + R"(
     ret;
 }
 )";
@@ -467,6 +482,44 @@ VTEST(wgmma_f16_both_from_shared_with_accumulator_and_negate) {
       float want = C(row, col);
       for (int k = 0; k < 16; ++k) want += A(row, k) * Bneg(k, col);
       const float got = f16_value(static_cast<uint16_t>(out[t * 2 + e / 2] >> (16 * (e % 2))));
+      VCHECK_EQ(got, want);
+    }
+}
+
+// wgmma is one operation of the warpgroup: once any of its warps has waited
+// for it, it has read A and B for all four. The interpreter runs the warps
+// in turn, so warp 0 gets through wgmma, wait_group and the zeroing below
+// before warp 1 issues; when each warp read shared memory as it got there,
+// warps 1-3 multiplied zeros. (CUTLASS's SM90 group GEMM hit this through
+// a cluster peer refilling the stage, and lost one warp's 16 rows a tile.)
+VTEST(wgmma_reads_shared_operands_once_for_the_warpgroup) {
+  auto A = [](int m, int k) { return val(m, k, 21); };
+  auto B = [](int k, int n) { return val(n, k, 22); };
+  Wgmma w;
+  w.form = "m64n8k16.f32.f16.f16";
+  w.a_regs = false;
+  w.tail = ", 1, 1, 0, 0";
+  w.d_regs = 4;
+  w.clobber_after = true;
+  for (int m = 0; m < 64; ++m)
+    for (int k = 0; k < 16; ++k)
+      put_elem(w.smem_a, size_t((m % 8) * 8 + (m / 8) * 64 + (k % 8) + (k / 8) * 512) * 2,
+               f16_bits(A(m, k)));
+  w.desc_a = desc(0, 1024, 128, 0);
+  for (int n = 0; n < 8; ++n)
+    for (int k = 0; k < 16; ++k)
+      put_elem(w.smem_b, size_t(n * 8 + (k % 8) + (k / 8) * 64) * 2, f16_bits(B(k, n)));
+  w.desc_b = desc(0, 128, 1024, 0);
+  w.d_in.assign(128 * 4, 0);
+  const auto out = w.run();
+  for (int t = 0; t < 128; ++t)
+    for (int e = 0; e < 4; ++e) {
+      int row, col;
+      d_pos(t, e, &row, &col);
+      float want = 0;
+      for (int k = 0; k < 16; ++k) want += A(row, k) * B(k, col);
+      float got;
+      std::memcpy(&got, &out[t * 4 + e], 4);
       VCHECK_EQ(got, want);
     }
 }

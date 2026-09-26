@@ -140,6 +140,25 @@ struct MbarrierTable {
   std::unordered_map<uint64_t, Mbarrier> bars;
 };
 
+// wgmma is one operation of the whole warpgroup, and it reads its shared
+// memory operands as one: the first of the four warps to issue its n-th
+// wgmma.mma_async reads A (all 64 rows) and B for all of them, and the
+// others take their share of that copy. The interpreter runs the warps one
+// after another, and when each read its own rows as it got there, a warp that
+// finished early could wait_group, release the stage and let the cluster peer
+// that multicasts A refill it before the last warp had read: CUTLASS's SM90
+// group GEMM got one warp's 16 rows of a tile from the next K block. No warp
+// can release a stage before some warp has issued the wgmma reading it, so
+// the first issue is a safe moment to read.
+struct WgmmaSnapshot {
+  std::vector<double> A;   // 64 x K when A is in shared memory, else empty
+  std::vector<double> B;   // K x N
+  uint8_t taken = 0;       // warp ranks within the group that have used it
+};
+struct WgmmaSnapshots {
+  std::map<std::pair<uint32_t, uint64_t>, WgmmaSnapshot> pending;   // (warpgroup, sequence)
+};
+
 // Shadow state for shared memory, one entry per 4-byte word, used only when
 // race detection is on.
 //
@@ -234,6 +253,7 @@ struct BlockCtx {
   NamedBarriers* bars = nullptr;
   std::vector<Warp>* warps = nullptr;   // the block's, for releasing a named barrier's waiters
   MbarrierTable* mbar = nullptr;
+  WgmmaSnapshots* wgmma = nullptr;
   SharedShadow* shadow = nullptr;   // non-null only when race detection is on
   // The thread-block cluster this block belongs to, for barrier.cluster. A
   // launch without clusters still has one per block.
@@ -303,6 +323,9 @@ struct Warp {
   // phase, and the phase a later wait is waiting to see end.
   Mask cluster_arrived = 0;
   uint32_t cluster_wait_phase = 0;
+  // wgmma.mma_async instructions issued, which pairs this warp's n-th with
+  // the rest of its warpgroup's n-th (see WgmmaSnapshots).
+  uint64_t wgmma_issued = 0;
   // Instructions this warp has issued, for the step budget. Counted per warp
   // rather than per launch: the budget exists to catch a thread that never
   // finishes, and a launch's total grows with its grid -- a 12 GB sweep over
@@ -1030,6 +1053,7 @@ class Interpreter {
     BarrierReduction bar_red;
     NamedBarriers bars;
     MbarrierTable mbar;
+    WgmmaSnapshots wgmma;
     SharedShadow shadow;
     std::vector<Warp> warps;
     uint64_t clock = 0;
@@ -1044,6 +1068,8 @@ class Interpreter {
     b.ctx.shared = &b.shared;
     b.ctx.bar_red = &b.bar_red;
     b.ctx.mbar = &b.mbar;
+    b.wgmma.pending.clear();
+    b.ctx.wgmma = &b.wgmma;
     b.ctx.bars = &b.bars;
     b.ctx.warps = &b.warps;
     b.ctx.clock = &b.clock;
@@ -4906,30 +4932,44 @@ class Interpreter {
                 sa * wgmma_decode(op.a_type, v[lane] >> (8 * ea * e));
         }
       }
-    } else {
-      Lanes _s;
-      const Lanes& dv = read_operand(w, ctx, ins, op.a_desc, _s);
-      const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
-      for (uint32_t r = 0; r < 16; ++r)
-        for (uint32_t k = 0; k < K; ++k) {
-          const uint64_t at = wgmma_smem_offset(d, op.trans_a == 0, ea, row0 + r, k);
-          A[r * K + k] = sa * wgmma_decode(op.a_type, load_routed(w, ctx, ins, 0, kSharedVaBase + at, ea));
-        }
     }
-    // B, all of it: K x N, read as N rows of K.
-    std::vector<double>& B = wgmma_b_;
-    B.assign(size_t{K} * N, 0.0);
-    {
+    // The shared memory operands, read once for the warpgroup.
+    const uint32_t group = warp_index / 4;
+    auto [snap_it, first] = ctx.wgmma->pending.try_emplace({group, w.wgmma_issued++});
+    WgmmaSnapshot& snap = snap_it->second;
+    if (first) {
+      if (!op.a_regs) {
+        Lanes _s;
+        const Lanes& dv = read_operand(w, ctx, ins, op.a_desc, _s);
+        const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
+        snap.A.assign(size_t{64} * K, 0.0);
+        for (uint32_t r = 0; r < 64; ++r)
+          for (uint32_t k = 0; k < K; ++k) {
+            const uint64_t at = wgmma_smem_offset(d, op.trans_a == 0, ea, r, k);
+            snap.A[r * K + k] =
+                sa * wgmma_decode(op.a_type, load_routed(w, ctx, ins, 0, kSharedVaBase + at, ea));
+          }
+      }
+      // B, all of it: K x N, read as N rows of K.
+      snap.B.assign(size_t{K} * N, 0.0);
       Lanes _s;
       const Lanes& dv = read_operand(w, ctx, ins, op.b_desc, _s);
       const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
       for (uint32_t n = 0; n < N; ++n)
         for (uint32_t k = 0; k < K; ++k) {
           const uint64_t at = wgmma_smem_offset(d, op.trans_b == 0, eb, n, k);
-          B[size_t{k} * N + n] =
+          snap.B[size_t{k} * N + n] =
               sb * wgmma_decode(op.b_type, load_routed(w, ctx, ins, 0, kSharedVaBase + at, eb));
         }
     }
+    if (!op.a_regs) {
+      if (snap.A.empty())
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "the warps of a warpgroup disagree on whether this wgmma's A is in registers or "
+                 "shared memory");
+      std::copy_n(snap.A.begin() + size_t{row0} * K, size_t{16} * K, A.begin());
+    }
+    const std::vector<double>& B = snap.B;
     // scale-d: false means D = A*B, per the ISA. Read per lane; a kernel
     // passes a uniform value, and per lane is what that value means for the
     // accumulator elements each lane owns.
@@ -4995,6 +5035,8 @@ class Interpreter {
       if (!int_form) alu_fault(out[reg], m, 32);
       write_reg(w, op.d[reg], m, out[reg], 32);
     }
+    snap.taken |= static_cast<uint8_t>(1u << (warp_index % 4));
+    if (snap.taken == 0xF) ctx.wgmma->pending.erase(snap_it);
   }
 
   // The same fragments as exec_wmma_mma below, read from and written to the
@@ -7546,9 +7588,6 @@ class Interpreter {
   // of variant tests, and the instruction stream is the hottest path there is.
   mutable std::vector<uint8_t> class_by_pc_;
   uint32_t cur_warp_ = 0;     // which warp of the block is running, for race reports
-  // B of the wgmma being executed, kept across instructions so a 64x256 tile
-  // does not allocate on every one. An interpreter runs on one thread.
-  std::vector<double> wgmma_b_;
   bool fast_enabled_ = true;   // VGPU_FASTPATH, sampled at launch
   bool host_directed_ = false;   // this thread was not rounding to nearest at launch
   // %gridid: a serial number distinguishing this launch from every other one in
