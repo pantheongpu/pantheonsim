@@ -70,14 +70,16 @@ constexpr uint64_t kParamVaBase = 0x6ffd'0000'0000ull;
 constexpr uint64_t kParamVaSize = 1ull << 20;
 constexpr uint64_t kSharedVaBase = 0x6ffe'0000'0000ull;
 constexpr uint64_t kSharedVaSize = 1ull << 30;
-// Distributed shared memory: an address in the shared window whose bits from
-// here up are nonzero is in block rank (those bits - 1) of the cluster, and
-// the bits below are the offset in that block's shared memory. Zero means the
-// block issuing the access, so every ordinary shared address is already a
-// valid .shared::cluster address naming its own block, as the ISA requires
-// (the .shared::cta window is contained in the .shared::cluster one). A block
-// has at most 228 KiB of shared memory and a cluster at most 16 blocks, so
-// both fit with room to spare.
+// Distributed shared memory: the bits of a shared-window address from here up
+// are the cluster rank of the block it is in, and the bits below the offset in
+// that block's shared memory. A block's own addresses carry its own rank, so
+// every .shared::cta address is already the .shared::cluster address of the
+// same byte, as the ISA requires (the .shared::cta window is contained in the
+// .shared::cluster one) -- and, as CUTLASS's 2-SM kernels rely on ("Set peer
+// bit to 0 so that the transaction bytes will update CTA0's barrier", cute's
+// copy_sm100_tma.hpp), clearing bit 24 of an odd block's address gives the
+// same offset in its even peer. A block has at most 228 KiB of shared memory
+// and a cluster at most 16 blocks, so both fit with room to spare.
 constexpr uint32_t kClusterRankShift = 24;
 constexpr uint64_t kClusterOffsetMask = (1ull << kClusterRankShift) - 1;
 
@@ -1504,11 +1506,13 @@ class Interpreter {
 
   // ---- symbols / registers / operands ----
 
-  uint64_t resolve_symbol(const Instr& ins, const std::string& name) {
+  uint64_t resolve_symbol(const BlockCtx& ctx, const Instr& ins, const std::string& name) {
     // .local/.shared variables name an offset within their address space, not
     // a generic address; cvta converts when the kernel needs a generic pointer.
+    // A .shared one is in this block's part of the cluster's window.
     if (auto it = cur_->locals.find(name); it != cur_->locals.end()) return it->second.offset;
-    if (auto it = fn_.shared.find(name); it != fn_.shared.end()) return it->second.offset;
+    if (auto it = fn_.shared.find(name); it != fn_.shared.end())
+      return cluster_address(ctx, cluster_rank_of(ctx), it->second.offset);
     if (symbols_) {
       if (auto it = symbols_->find(name); it != symbols_->end()) return it->second;
     }
@@ -1576,7 +1580,7 @@ class Interpreter {
       return scratch;
     }
     if (const auto* sym = std::get_if<SymbolOperand>(&op)) {
-      scratch.fill(resolve_symbol(ins, sym->name));
+      scratch.fill(resolve_symbol(ctx, ins, sym->name));
       return scratch;
     }
     const auto& sr = std::get<SregOperand>(op);
@@ -2012,9 +2016,9 @@ class Interpreter {
   };
   SharedRef shared_ref(const BlockCtx& ctx, const Instr& ins, int lane, uint64_t addr) {
     const uint64_t rel = addr - kSharedVaBase;
-    const uint64_t tag = rel >> kClusterRankShift;
-    if (!tag) return {&ctx, rel};
-    return {&cluster_block(ctx, ins, lane, tag - 1), rel & kClusterOffsetMask};
+    const uint64_t rank = rel >> kClusterRankShift;
+    if (rank == cluster_rank_of(ctx)) return {&ctx, rel & kClusterOffsetMask};
+    return {&cluster_block(ctx, ins, lane, rank), rel & kClusterOffsetMask};
   }
   // The same, bounds-checked for `size` bytes.
   SharedRef shared_at(const BlockCtx& ctx, const Instr& ins, int lane, uint64_t addr, uint64_t size) {
@@ -2033,9 +2037,8 @@ class Interpreter {
   // A shared::cluster address for `off` in block `rank`, as mapa returns it:
   // the plain offset when that is the issuing block.
   static uint64_t cluster_address(const BlockCtx& ctx, uint64_t rank, uint64_t off) {
-    off &= kClusterOffsetMask;
-    if (rank == cluster_rank_of(ctx)) return off;
-    return ((rank + 1) << kClusterRankShift) | off;
+    (void)ctx;
+    return (rank << kClusterRankShift) | (off & kClusterOffsetMask);
   }
 
   // Race detection, off unless VGPU_RACE=1.
@@ -2112,7 +2115,12 @@ class Interpreter {
   // For copies that only ever reach the issuing block's own shared memory
   // (cp.async): an address naming another block is out of its bounds.
   void check_shared(const BlockCtx& ctx, const Instr& ins, int lane, uint64_t addr, uint32_t size) {
-    uint64_t off = addr - kSharedVaBase;
+    const SharedRef r = shared_ref(ctx, ins, lane, addr);
+    if (r.owner != &ctx)
+      ctx_fail(ins, lane, Err::InvalidValue,
+               "a .shared::cta access to another block of the cluster (rank " +
+                   std::to_string(cluster_rank_of(*r.owner)) + ")");
+    uint64_t off = r.off;
     size_t have = ctx.shared ? ctx.shared->size() : 0;
     if (off + size > have)
       ctx_fail(ins, lane, Err::OutOfBounds,
@@ -3608,7 +3616,7 @@ class Interpreter {
             if (in_space) {
               const uint64_t tag = (v - kSharedVaBase) >> kClusterRankShift;
               const size_t n = ctx.cluster_state ? ctx.cluster_state->ranks.size() : 1;
-              in_space = op->cluster ? tag <= n : (tag == 0 || tag - 1 == cluster_rank_of(ctx));
+              in_space = op->cluster ? tag < n : tag == cluster_rank_of(ctx);
             }
             break;
           case Space::Local:
@@ -3668,7 +3676,7 @@ class Interpreter {
           v -= kSharedVaBase;
         }
         const uint64_t tag = (v & (kSharedVaSize - 1)) >> kClusterRankShift;
-        r[lane] = tag ? tag - 1 : cluster_rank_of(ctx);
+        r[lane] = tag;
       }
       write_reg(w, op->dst, m, r, 32);
       return;
@@ -5645,7 +5653,8 @@ class Interpreter {
           for (uint32_t k = 0; k < K; ++k) {
             const uint64_t at = wgmma_smem_offset(d, op.trans_a == 0, ea, r, k);
             snap.A[r * K + k] =
-                sa * wgmma_decode(op.a_type, load_routed(w, ctx, ins, 0, kSharedVaBase + at, ea));
+                sa * wgmma_decode(op.a_type, load_routed(w, ctx, ins, 0,
+                                                         kSharedVaBase + cluster_address(ctx, cluster_rank_of(ctx), at), ea));
           }
       }
       // B, all of it: K x N, read as N rows of K.
@@ -5657,7 +5666,8 @@ class Interpreter {
         for (uint32_t k = 0; k < K; ++k) {
           const uint64_t at = wgmma_smem_offset(d, op.trans_b == 0, eb, n, k);
           snap.B[size_t{k} * N + n] =
-              sb * wgmma_decode(op.b_type, load_routed(w, ctx, ins, 0, kSharedVaBase + at, eb));
+              sb * wgmma_decode(op.b_type, load_routed(w, ctx, ins, 0,
+                                                       kSharedVaBase + cluster_address(ctx, cluster_rank_of(ctx), at), eb));
         }
     }
     if (!op.a_regs) {
@@ -7147,9 +7157,8 @@ class Interpreter {
   // `scratch`.
   const Lanes& addr_base(Warp& w, const BlockCtx& ctx, const Instr& ins, const Addr& a,
                          Lanes& scratch) {
-    (void)ctx;
     if (a.base_kind == Addr::Base::Symbol) {
-      scratch.fill(resolve_symbol(ins, a.base));
+      scratch.fill(resolve_symbol(ctx, ins, a.base));
       return scratch;
     }
     // Address registers are .b64 in 64-bit PTX, but shared/local addressing
@@ -7211,7 +7220,8 @@ class Interpreter {
     (void)w;
     for (const PendingCopy& pc : group) {
       check_shared(ctx, ins, static_cast<int>(lane), pc.dst, pc.bytes);
-      std::memcpy(ctx.shared->data() + (pc.dst - kSharedVaBase), pc.data.data(), pc.bytes);
+      std::memcpy(ctx.shared->data() + shared_ref(ctx, ins, static_cast<int>(lane), pc.dst).off,
+                  pc.data.data(), pc.bytes);
       // The shared write lands here, not where the copy was issued, so this is
       // where it is counted.
       count_memory(Space::Shared, pc.bytes, 1, /*is_store=*/true);
@@ -7823,7 +7833,7 @@ class Interpreter {
           pb.runs.emplace_back(static_cast<uint32_t>(off), len);
       };
       if (!op.tensor) {
-        const uint64_t g = (*gmem_base)[lane] + static_cast<uint64_t>(op.gmem.offset);
+        uint64_t g = (*gmem_base)[lane] + static_cast<uint64_t>(op.gmem.offset);
         const uint64_t n = static_cast<uint32_t>(size_v[lane]);
         if (n % 16 || g % 16)
           ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
@@ -7832,6 +7842,11 @@ class Interpreter {
           // From this block's shared memory, read now like any bulk load's
           // source; `g` is a shared::cta address.
           add_run(smem, static_cast<uint32_t>(n));
+          const SharedRef src = shared_ref(ctx, ins, li, kSharedVaBase + g);
+          if (src.owner != &ctx)
+            ctx_fail(ins, li, Err::InvalidValue,
+                     "a shared-to-shared bulk copy's source must be this block's shared memory");
+          g = src.off;
           if (g + n > shared_size)
             ctx_fail(ins, li, Err::OutOfBounds,
                      "a bulk copy reads past this block's shared memory");
