@@ -97,10 +97,18 @@ struct ParamBuffer {
 // State for bar.red, which needs every warp in the block to arrive before it
 // can produce a value. Held behind a pointer for the same reason shared memory
 // is: the context is passed by const reference.
+// bar.red in rounds. Votes go into the round being gathered; when the block
+// releases, that round's answer is set aside and the next round starts empty,
+// and each warp collects the answer of the round it voted in. A warp released
+// first can loop back and vote again before the others have collected --
+// CUTLASS's semaphore wait is `while (__syncthreads_and(state != k))` -- and
+// with one shared accumulator that vote leaked into the answer they were
+// about to read, and the round after started from a stale value.
 struct BarrierReduction {
-  uint64_t acc = 0;
-  uint32_t arrived = 0;   // warps that have contributed and not yet collected
-  bool complete = false;  // set when the barrier released; cleared when drained
+  uint64_t acc = 0;        // the round being gathered
+  uint32_t arrived = 0;    // warps that have voted in it
+  uint64_t round = 0;      // its number
+  uint64_t result = 0;     // the answer of the last round released
 };
 
 // One mbarrier object. Lives in a side table keyed by its shared-memory
@@ -309,6 +317,7 @@ struct Warp {
   // instruction re-executes when the barrier releases, and this is how it knows
   // to collect rather than contribute a second time.
   bool bar_red_waiting = false;
+  uint64_t bar_red_round = 0;   // the bar.red round this warp voted in
   // At a barrier with a thread count, which that barrier's completion
   // releases; step_block's all-warps release leaves such a warp waiting.
   bool counted_barrier = false;
@@ -1145,8 +1154,13 @@ class Interpreter {
                           "deadlock: every warp of the block that has not exited is waiting at a "
                           "barrier whose thread count can no longer be reached", where);
       }
-      // Every warp has now arrived, so a bar.red in flight has its answer.
-      if (any_waiting) b.bar_red.complete = true;
+      // Every warp has now arrived, so a bar.red round in flight has its
+      // answer: set it aside and start the next.
+      if (any_waiting && b.bar_red.arrived) {
+        b.bar_red.result = b.bar_red.acc;
+        b.bar_red.arrived = 0;
+        ++b.bar_red.round;
+      }
       // ...and the barrier they arrived at orders everything before it
       // against everything after, which is what ends the epoch.
       if (any_waiting && b.ctx.shadow) ++b.ctx.shadow->epoch;
@@ -2109,10 +2123,8 @@ class Interpreter {
         // Contribute and wait. The result is not known until every warp in the
         // block has arrived, so the pc stays put and this re-executes on
         // release rather than advancing now.
-        if (red.arrived == 0) {
-          red.acc = op->op == BarRedOp::And ? ~uint64_t{0} : 0;
-          red.complete = false;
-        }
+        if (red.arrived == 0) red.acc = op->op == BarRedOp::And ? ~uint64_t{0} : 0;
+        w.bar_red_round = red.round;
         Mask p = read_pred(w, ins, op->src);
         if (op->negate_src) p = ~p;
         const Mask voters = p & m;
@@ -2134,17 +2146,22 @@ class Interpreter {
         w.state = Warp::State::AtBarrier;
         return;
       }
-      // Released: collect the block-wide result.
+      // Released: collect the block-wide result of the round this warp voted
+      // in, which the release set aside (the round after it cannot have
+      // completed: it needs this warp's vote).
       w.bar_red_waiting = false;
-      if (red.arrived) --red.arrived;
+      if (w.bar_red_round + 1 != red.round)
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "bar.red released a warp whose round has not completed; were some warps at a "
+                 "bar.sync on the same barrier?");
       if (op->op == BarRedOp::Popc) {
         Lanes r;
         for (uint32_t lane = 0; lane < W_; ++lane)
-          if (m & (Mask{1} << lane)) r[lane] = red.acc;
+          if (m & (Mask{1} << lane)) r[lane] = red.result;
         write_reg(w, op->dst, m, r, 32);
       } else {
         Mask& dp = pred_slot(w, op->dst);
-        dp = (red.acc & 1u) ? (dp | m) : (dp & ~m);
+        dp = (red.result & 1u) ? (dp | m) : (dp & ~m);
       }
       ++w.paths[idx].pc;
       return;

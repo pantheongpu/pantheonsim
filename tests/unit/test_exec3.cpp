@@ -1213,6 +1213,53 @@ VTEST(bar_red_reduces_across_the_block) {
   mem.free(out);
 }
 
+// bar.red in a loop, the shape of CUTLASS's semaphore wait
+// (`while (__syncthreads_and(...))`). The first warp released can come round
+// and vote again before the others have collected; its vote belongs to the
+// next round. Every round here counts all 128 threads, so each thread's sum
+// over four rounds is 512. With one shared accumulator the early vote leaked
+// into the round the other warps were collecting.
+VTEST(bar_red_rounds_do_not_mix_in_a_loop) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry br(.param .u64 p)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<6>;
+  .reg .pred %p<4>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  mov.u32 %r2, 0;     // round
+  mov.u32 %r3, 0;     // sum
+  setp.eq.u32 %p1, %r1, %r1;
+LOOP:
+  bar.red.popc.u32 %r4, 0, %p1;
+  add.u32 %r3, %r3, %r4;
+  add.u32 %r2, %r2, 1;
+  setp.lt.u32 %p2, %r2, 4;
+  @%p2 bra LOOP;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r3;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(128 * 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.block = {128, 1, 1};
+  std::vector<uint8_t> pa(8);
+  std::memcpy(pa.data(), &out, 8);
+  exec::launch(m.entries[0], cfg, {pa}, mem, prof);
+  for (int t = 0; t < 128; ++t) VCHECK_EQ(mem.load_scalar(out + 4 * t, 4), uint64_t{512});
+  mem.free(out);
+}
+
 // ---- cp.async ----
 //
 // The instruction's whole meaning is that the copy is *not* finished when it
