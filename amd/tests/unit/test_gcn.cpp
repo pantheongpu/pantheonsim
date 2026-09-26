@@ -97,7 +97,43 @@ VTEST(every_instruction_decodes_as_the_assembler_wrote_it) {
     check_against_assembler("grid.gfx942.o", "grid.gfx942.dis");
     // What PyTorch's ROCm libraries use beyond a compiler's usual output.
     check_against_assembler("asm_libs.gfx942.o", "asm_libs.gfx942.dis");
+    // And the hand-written kernels the executor's tests run, instruction by
+    // instruction, so a decoder change that misreads one shows up here too.
+    for (const char* name : {"asm_sopk", "asm_scalar", "asm_memory", "asm_vector"})
+      check_against_assembler(std::string(name) + ".gfx942.o", std::string(name) + ".gfx942.dis");
   }
+}
+
+// The corpus drawn from ROCm's libraries (amd/tools/isa-corpus.py): one of
+// every shape of instruction their gfx942 code holds, each decoded from its
+// own bytes and printed as llvm-objdump printed it. Every mismatch is listed.
+VTEST(every_instruction_shape_rocms_libraries_use_decodes_as_llvm_prints_it) {
+  const std::vector<std::string> corpus = lines(read("isa_corpus.txt", false));
+  size_t checked = 0;
+  std::string wrong;
+  int wrong_count = 0;
+  for (const std::string& line : corpus) {
+    if (line[0] == '#') continue;
+    const size_t tab = line.find('\t');
+    std::vector<uint8_t> code;
+    std::istringstream words(line.substr(0, tab));
+    for (std::string w; words >> w;) {
+      const uint32_t v = static_cast<uint32_t>(std::stoul(w, nullptr, 16));
+      for (int b = 0; b < 4; ++b) code.push_back(static_cast<uint8_t>(v >> (8 * b)));
+    }
+    const std::string want = line.substr(tab + 1);
+    std::string got;
+    try {
+      got = amd::gcn::to_text(amd::gcn::decode(code, 0, 0));
+    } catch (const std::exception& e) {
+      got = std::string("(refused: ") + e.what() + ")";
+    }
+    ++checked;
+    if (got != want && wrong_count++ < 10) wrong += "\n  want \"" + want + "\"\n  got  \"" + got + "\"";
+  }
+  VCHECK(checked > 1000);
+  if (wrong_count)
+    throw vtest::Failure(std::to_string(wrong_count) + " of " + std::to_string(checked) + " differ:" + wrong);
 }
 
 VTEST(an_instruction_says_where_its_operands_are) {
