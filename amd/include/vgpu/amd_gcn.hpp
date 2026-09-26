@@ -27,7 +27,7 @@ const char* enc_name(Enc e);
 // Agpr: the accumulation registers, which a kernel with more values than it
 // has vector registers keeps the rest of them in.
 enum class OperandKind {
-  Sgpr, Vgpr, Agpr, Vcc, Exec, ExecLo, ExecHi, M0, SharedBase, PrivateBase, Inline, InlineFloat, Literal, None
+  Sgpr, Vgpr, Agpr, Vcc, VccHi, Exec, ExecLo, ExecHi, M0, SharedBase, PrivateBase, Inline, InlineFloat, Literal, None
 };
 struct Operand {
   OperandKind kind = OperandKind::None;
@@ -68,6 +68,12 @@ struct Inst {
   uint64_t target = 0;
   // VOP3's clamp: a float result is held to [0, 1].
   bool clamp = false;
+  // VOP3's (and SDWA's) output multiplier: 1 doubles a float result, 2
+  // quadruples it, 3 halves it.
+  uint8_t omod = 0;
+  // SMEM: the offset is the instruction's own and a register's both, which
+  // the assembler writes as "offset:" even when the constant is zero.
+  bool smem_both_offsets = false;
   // The VOP3 form of a VOP1 or VOP2 instruction, decoded from the short
   // form's entry: it runs as the short form does.
   bool promoted = false;

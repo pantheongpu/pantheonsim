@@ -1,0 +1,302 @@
+// Instructions PyTorch's ROCm libraries use (MIOpen, rocRAND, rocFFT, RCCL,
+// hipBLASLt, rocSPARSE, rocSOLVER, MAGMA), each once, in one lane: scalar
+// bit scans, packs and a call; VCC's high half as a register of its own; a
+// hardware register read and written; 16-bit and half-precision arithmetic;
+// packed 16-bit integers, with the halves of a constant as the hardware
+// gives them; a dot product; 2/pi for a trig reduction; an accumulation
+// register copied; output multipliers; op_sel on a long form; SDWA keeping
+// the rest of its destination; VGPR indexing; 64-bit and packed atomics in
+// memory and LDS; an 8-bit float conversion into the high half of a
+// register; a buffer resource with no data format, which holds nothing;
+// and scalar atomics. Built for gfx942 by build.sh, with clang's assembler.
+//
+// libs(int* out) writes 64 words, in the order the test lists them.
+  .amdgcn_target "amdgcn-amd-amdhsa--gfx942"
+  .text
+  .globl libs
+  .p2align 8
+  .type libs,@function
+libs:
+  s_load_dwordx2 s[2:3], s[0:1], 0x0
+  s_waitcnt lgkmcnt(0)
+  s_mov_b64 exec, 1                            // one lane
+  v_mov_b32_e32 v0, 0
+  // Scalar: first set bit from the bottom and from the top, the first bit
+  // unlike the sign, a signed field, a shift-and-add, a pack of high halves,
+  // a sign extension.
+  s_mov_b32 s10, 0xf0
+  s_ff1_i32_b32 s11, s10
+  s_flbit_i32_b32 s12, s10
+  s_mov_b32 s13, -8
+  s_flbit_i32 s14, s13
+  s_mov_b32 s16, 0xf00
+  s_bfe_i32 s15, s16, 0x40008
+  s_mov_b32 s18, 5
+  s_lshl2_add_u32 s17, s18, 7
+  s_mov_b32 s20, 0x12345678
+  s_mov_b32 s21, 0x9abcdef0
+  s_pack_hh_b32_b16 s19, s20, s21
+  s_mov_b32 s23, 0xfffe
+  s_sext_i32_i16 s22, s23
+  v_mov_b32_e32 v1, s11
+  global_store_dword v0, v1, s[2:3]
+  v_mov_b32_e32 v1, s12
+  global_store_dword v0, v1, s[2:3] offset:4
+  v_mov_b32_e32 v1, s14
+  global_store_dword v0, v1, s[2:3] offset:8
+  v_mov_b32_e32 v1, s15
+  global_store_dword v0, v1, s[2:3] offset:12
+  v_mov_b32_e32 v1, s17
+  global_store_dword v0, v1, s[2:3] offset:16
+  v_mov_b32_e32 v1, s19
+  global_store_dword v0, v1, s[2:3] offset:20
+  v_mov_b32_e32 v1, s22
+  global_store_dword v0, v1, s[2:3] offset:24
+  // VCC's halves, each written as a register of its own.
+  s_mov_b32 vcc_hi, 0x55
+  s_mov_b32 vcc_lo, 0x66
+  v_mov_b32_e32 v1, vcc_hi
+  global_store_dword v0, v1, s[2:3] offset:28
+  v_mov_b32_e32 v1, vcc_lo
+  global_store_dword v0, v1, s[2:3] offset:32
+  // MODE's IEEE bit, read, cleared, and read again.
+  s_getreg_b32 s24, hwreg(HW_REG_MODE, 9, 1)
+  s_setreg_imm32_b32 hwreg(HW_REG_MODE, 9, 1), 0
+  s_getreg_b32 s25, hwreg(HW_REG_MODE, 9, 1)
+  v_mov_b32_e32 v1, s24
+  global_store_dword v0, v1, s[2:3] offset:36
+  v_mov_b32_e32 v1, s25
+  global_store_dword v0, v1, s[2:3] offset:40
+  // A call to a function that sets s26 and returns.
+  s_call_b64 s[30:31], .Lset
+  v_mov_b32_e32 v1, s26
+  global_store_dword v0, v1, s[2:3] offset:44
+  // Vector: bit scans, half conversions and arithmetic, 16-bit integers.
+  v_mov_b32_e32 v2, 0xfffffff0
+  v_ffbh_i32_e32 v1, v2
+  global_store_dword v0, v1, s[2:3] offset:48
+  v_ffbl_b32_e32 v1, v2
+  global_store_dword v0, v1, s[2:3] offset:52
+  v_mov_b32_e32 v4, 0xfffd
+  v_cvt_f16_i16_e32 v3, v4
+  global_store_dword v0, v3, s[2:3] offset:56
+  v_mov_b32_e32 v6, 0x4d00                     // the half 20
+  v_cvt_u16_f16_e32 v5, v6
+  global_store_dword v0, v5, s[2:3] offset:60
+  v_rcp_f16_e32 v7, v6
+  global_store_dword v0, v7, s[2:3] offset:64
+  v_mov_b32_e32 v9, 5.0
+  v_subrev_f32_e32 v8, 1.0, v9
+  global_store_dword v0, v8, s[2:3] offset:68
+  v_mov_b32_e32 v11, 0xffffff
+  v_mul_hi_u32_u24_e32 v10, v11, v11
+  global_store_dword v0, v10, s[2:3] offset:72
+  v_mov_b32_e32 v14, 0xff80                    // -128 as 16 bits
+  v_ashrrev_i16_e32 v13, 2, v14
+  global_store_dword v0, v13, s[2:3] offset:76
+  v_mov_b32_e32 v16, 5
+  v_max_i16_e32 v15, v14, v16
+  global_store_dword v0, v15, s[2:3] offset:80
+  v_min_i16_e32 v17, v14, v16
+  global_store_dword v0, v17, s[2:3] offset:84
+  v_mov_b32_e32 v19, 0xf0f0f0f0
+  v_mov_b32_e32 v20, 0xff00ff00
+  v_xnor_b32_e32 v18, v19, v20
+  global_store_dword v0, v18, s[2:3] offset:88
+  v_mov_b32_e32 v22, 10
+  v_med3_u32 v21, v22, 3, 7
+  global_store_dword v0, v21, s[2:3] offset:92
+  v_mov_b32_e32 v24, 0x1ffff
+  v_mov_b32_e32 v25, 3
+  v_mov_b32_e32 v26, 100
+  v_mad_u32_u16 v23, v24, v25, v26
+  global_store_dword v0, v23, s[2:3] offset:96
+  v_mov_b32_e32 v28, 0xffff
+  v_max3_i16 v27, v14, v16, v28
+  global_store_dword v0, v27, s[2:3] offset:100
+  v_bfm_b32 v29, 4, 8
+  global_store_dword v0, v29, s[2:3] offset:104
+  v_mov_b32_e32 v31, 70000
+  v_mov_b32_e32 v32, 5
+  v_cvt_pk_u16_u32 v30, v31, v32
+  global_store_dword v0, v30, s[2:3] offset:108
+  v_mov_b32_e32 v34, 0x7fffffff
+  v_mov_b32_e32 v35, 1
+  v_add_i32 v33, v34, v35 clamp
+  global_store_dword v0, v33, s[2:3] offset:112
+  // Packed 16-bit integers; a constant's high half is its sign-extended
+  // top, so -2 gives 0xffff there and 0xfffe below.
+  v_mov_b32_e32 v37, 0x20001
+  v_mov_b32_e32 v38, 0x50004
+  v_pk_add_u16 v36, v37, v38
+  global_store_dword v0, v36, s[2:3] offset:116
+  v_mov_b32_e32 v40, 0xfff80010
+  v_pk_ashrrev_i16 v39, 1, v40 op_sel_hi:[0,1]
+  global_store_dword v0, v39, s[2:3] offset:120
+  v_mov_b32_e32 v42, 0x100010
+  v_pk_sub_u16 v41, v42, -2 op_sel:[0,1] op_sel_hi:[0,0]
+  global_store_dword v0, v41, s[2:3] offset:124
+  // (1, 2) . (3, 4) + 0.5.
+  v_mov_b32_e32 v44, 0x40003c00
+  v_mov_b32_e32 v45, 0x44004200
+  v_mov_b32_e32 v46, 0.5
+  v_dot2_f32_f16 v43, v44, v45, v46
+  global_store_dword v0, v43, s[2:3] offset:128
+  // The first 53 bits of 2/pi, for an argument of 1.0.
+  v_mov_b32_e32 v50, 0
+  v_mov_b32_e32 v51, 0x3ff00000
+  v_trig_preop_f64 v[48:49], v[50:51], 0
+  global_store_dwordx2 v0, v[48:49], s[2:3] offset:132
+  // Two registers trade places; an accumulation register is copied.
+  v_mov_b32_e32 v52, 1
+  v_mov_b32_e32 v53, 2
+  v_swap_b32 v52, v53
+  global_store_dword v0, v52, s[2:3] offset:140
+  global_store_dword v0, v53, s[2:3] offset:144
+  v_accvgpr_write_b32 a0, v52
+  v_accvgpr_mov_b32 a1, a0
+  v_accvgpr_read_b32 v54, a1
+  global_store_dword v0, v54, s[2:3] offset:148
+  // Output multipliers: (3 + 5) / 2 and 3 * 5 * 2.
+  v_mov_b32_e32 v56, 3.0
+  v_mov_b32_e32 v57, 0x40a00000
+  v_add_f32_e64 v55, v56, v57 div:2
+  global_store_dword v0, v55, s[2:3] offset:152
+  v_mul_f32_e64 v58, v56, v57 mul:2
+  global_store_dword v0, v58, s[2:3] offset:156
+  // op_sel: the high halves packed, and a 16-bit maximum into the high
+  // half, the low half kept.
+  v_mov_b32_e32 v60, 0x40003c00
+  v_mov_b32_e32 v61, 0x44004200
+  v_pack_b32_f16 v59, v60, v61 op_sel:[1,1,0]
+  global_store_dword v0, v59, s[2:3] offset:160
+  v_mov_b32_e32 v62, 0x1234abcd
+  v_mov_b32_e32 v63, 5
+  v_mov_b32_e32 v64, 7
+  v_max3_u16 v62, v63, v64, v64 op_sel:[0,0,0,1]
+  global_store_dword v0, v62, s[2:3] offset:164
+  // SDWA into one byte, the rest kept.
+  v_mov_b32_e32 v65, 0x11223344
+  v_mov_b32_e32 v66, 1
+  v_mov_b32_e32 v67, 2
+  v_add_u32_sdwa v65, v66, v67 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:DWORD src1_sel:DWORD
+  global_store_dword v0, v65, s[2:3] offset:168
+  // VGPR indexing: a move to v70 lands in v71.
+  v_mov_b32_e32 v70, 0
+  v_mov_b32_e32 v71, 0
+  s_mov_b32 s27, 1
+  s_set_gpr_idx_on s27, gpr_idx(DST)
+  v_mov_b32_e32 v70, 99
+  s_set_gpr_idx_off
+  global_store_dword v0, v70, s[2:3] offset:172
+  global_store_dword v0, v71, s[2:3] offset:176
+  s_bfm_b32 s28, 3, 4
+  v_mov_b32_e32 v1, s28
+  global_store_dword v0, v1, s[2:3] offset:180
+  // Atomics in memory: a 64-bit signed max, and packed half and bfloat16
+  // adds, each over a value stored first.
+  v_mov_b32_e32 v72, 5
+  v_mov_b32_e32 v73, 0
+  global_store_dwordx2 v0, v[72:73], s[2:3] offset:200
+  v_mov_b32_e32 v80, 0x40003c00                // halves (1, 2)
+  global_store_dword v0, v80, s[2:3] offset:208
+  v_mov_b32_e32 v81, 0x40003f80                // bfloat16s (1, 2)
+  global_store_dword v0, v81, s[2:3] offset:212
+  s_waitcnt vmcnt(0)
+  v_mov_b32_e32 v72, 9
+  global_atomic_smax_x2 v0, v[72:73], s[2:3] offset:200
+  v_mov_b32_e32 v80, 0x34003800                // halves (0.5, 0.25)
+  global_atomic_pk_add_f16 v0, v80, s[2:3] offset:208
+  v_mov_b32_e32 v81, 0x3f803f00                // bfloat16s (0.5, 1)
+  global_atomic_pk_add_bf16 v0, v81, s[2:3] offset:212
+  // Atomics in LDS: a signed minimum, a compare-and-store that hands back
+  // what it found, a 64-bit add.
+  v_mov_b32_e32 v74, 10
+  ds_write_b32 v0, v74
+  v_mov_b32_e32 v75, -3
+  ds_min_i32 v0, v75
+  ds_read_b32 v82, v0
+  v_mov_b32_e32 v78, 42
+  ds_cmpst_rtn_b32 v76, v0, v75, v78
+  ds_read_b32 v83, v0
+  v_mov_b32_e32 v84, 7
+  v_mov_b32_e32 v85, 0
+  ds_write_b64 v0, v[84:85] offset:8
+  v_mov_b32_e32 v84, 5
+  ds_add_u64 v0, v[84:85] offset:8
+  ds_read_b32 v86, v0 offset:8
+  s_waitcnt lgkmcnt(0)
+  global_store_dword v0, v82, s[2:3] offset:216
+  global_store_dword v0, v83, s[2:3] offset:220
+  global_store_dword v0, v76, s[2:3] offset:224
+  global_store_dword v0, v86, s[2:3] offset:228
+  // Two 8-bit floats into the high half of a register, the low half kept.
+  v_mov_b32_e32 v79, 0xbeef
+  v_cvt_pk_fp8_f32 v79, 1.0, 2.0 op_sel:[0,0,1]
+  global_store_dword v0, v79, s[2:3] offset:232
+  // A buffer resource whose data format is 0 holds nothing: a store through
+  // it does not land (the 5 stored first stays), and a load reads 0.
+  v_mov_b32_e32 v1, 5
+  global_store_dword v0, v1, s[2:3] offset:236
+  s_waitcnt vmcnt(0)
+  s_mov_b32 s40, s2
+  s_and_b32 s41, s3, 0xffff
+  s_mov_b32 s42, 0x1000
+  s_mov_b32 s43, 0
+  v_mov_b32_e32 v1, 0x1234
+  buffer_store_dword v1, off, s[40:43], 0 offset:236
+  buffer_load_dword v2, off, s[40:43], 0 offset:236
+  s_waitcnt vmcnt(0)
+  global_store_dword v0, v2, s[2:3] offset:240
+  // Scalar atomics, each handing back what it found: 5 + 3, then a
+  // decrement of 8 (below the limit 10) to 7.
+  v_mov_b32_e32 v1, 5
+  global_store_dword v0, v1, s[2:3] offset:244
+  s_waitcnt vmcnt(0)
+  s_mov_b32 s50, 3
+  s_atomic_add s50, s[2:3], 0xf4 glc
+  s_mov_b32 s51, 10
+  s_atomic_dec s51, s[2:3], 0xf4 glc
+  s_waitcnt lgkmcnt(0)
+  v_mov_b32_e32 v1, s50
+  global_store_dword v0, v1, s[2:3] offset:248
+  v_mov_b32_e32 v1, s51
+  global_store_dword v0, v1, s[2:3] offset:252
+  s_endpgm
+.Lset:
+  s_mov_b32 s26, 77
+  s_setpc_b64 s[30:31]
+.Llibs_end:
+  .size libs, .Llibs_end-libs
+
+  .rodata
+  .p2align 6
+  .amdhsa_kernel libs
+    .amdhsa_user_sgpr_kernarg_segment_ptr 1
+    .amdhsa_group_segment_fixed_size 64
+    .amdhsa_next_free_vgpr 96
+    .amdhsa_next_free_sgpr 56
+    .amdhsa_accum_offset 88
+  .end_amdhsa_kernel
+
+  .amdgpu_metadata
+---
+amdhsa.version: [ 1, 2 ]
+amdhsa.kernels:
+  - .name: libs
+    .symbol: libs.kd
+    .kernarg_segment_size: 8
+    .kernarg_segment_align: 8
+    .group_segment_fixed_size: 64
+    .private_segment_fixed_size: 0
+    .wavefront_size: 64
+    .sgpr_count: 56
+    .vgpr_count: 96
+    .max_flat_workgroup_size: 64
+    .args:
+      - .size: 8
+        .offset: 0
+        .value_kind: global_buffer
+        .address_space: global
+...
+  .end_amdgpu_metadata

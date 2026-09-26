@@ -408,8 +408,14 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     kern.group_id_x = (d.rsrc2 >> 7) & 1;
     kern.group_id_y = (d.rsrc2 >> 8) & 1;
     kern.group_id_z = (d.rsrc2 >> 9) & 1;
+    // The user SGPRs the features above take, or the count the descriptor
+    // gives (RSRC2's USER_SGPR field) where that is more: a kernel that asks
+    // for its first arguments preloaded into SGPRs (gfx942's kernarg
+    // preload, which hipBLASLt's kernels use) has them counted there, and
+    // the work-group ids come after them.
     kern.user_sgpr_count = 2 * kern.private_segment_buffer + 2 * kern.dispatch_ptr + 2 * kern.queue_ptr +
                            2 * kern.kernarg_segment_ptr + 2 * kern.dispatch_id + 2 * kern.flat_scratch_init;
+    kern.user_sgpr_count = std::max(kern.user_sgpr_count, (d.rsrc2 >> 1) & 0x1F);
     out.kernels.push_back(std::move(kern));
   }
   if (out.kernels.empty()) throw Error::make(Err::ProfileParse, origin, ": no kernels");

@@ -4,6 +4,7 @@
 // the same arithmetic done in 64 bits on the host.
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstring>
 #include <cstdint>
 #include <fstream>
@@ -227,7 +228,83 @@ VTEST(vector_comparisons_packed_math_and_mixed_precision_give_what_the_isa_says)
   VCHECK_EQ(r[27], f(3.0f * 5.0f));    // whose high result reads the 3 as it was
   VCHECK_EQ(r[28], 0xff0000ffu);       // the signs of bytes 1 (0x80), 3 (0), 5 (0x7f) and 7 (0x80)
   VCHECK_EQ(r[29], 0xff008002u);       // byte 4, byte 7, a zero byte, a byte of ones
-  VCHECK_EQ(r[30], halves(1.5f + 1.0f, -2.0f + 1.0f));   // 1.0 added to both halves
+  VCHECK_EQ(r[30], halves(1.5f + 1.0f, -2.0f));   // a float constant is the half in the low 16 bits, 0 above
+}
+
+VTEST(what_pytorchs_rocm_libraries_use_gives_what_the_isa_says) {
+  const amd::CodeObject o = object("asm_libs");
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(64 * 4);
+  const std::vector<uint32_t> r = run(o, "libs", mem, out, 64, {out});
+  const auto h = [](float v) {
+    const _Float16 x = static_cast<_Float16>(v);
+    uint16_t b;
+    std::memcpy(&b, &x, 2);
+    return static_cast<uint32_t>(b);
+  };
+  VCHECK_EQ(r[0], 4u);            // s_ff1 of 0xf0
+  VCHECK_EQ(r[1], 24u);           // s_flbit of 0xf0
+  VCHECK_EQ(r[2], 29u);           // the first bit of -8 unlike its sign
+  VCHECK_EQ(r[3], 0xffffffffu);   // bits 8 to 11 of 0xf00, signed: -1
+  VCHECK_EQ(r[4], 27u);           // 5 << 2 + 7
+  VCHECK_EQ(r[5], 0x9abc1234u);   // the two high halves
+  VCHECK_EQ(r[6], 0xfffffffeu);   // 0xfffe sign-extended
+  VCHECK_EQ(r[7], 0x55u);         // vcc_hi, kept when vcc_lo was written after it
+  VCHECK_EQ(r[8], 0x66u);
+  VCHECK_EQ(r[9], 1u);            // MODE's IEEE bit, as a dispatch starts
+  VCHECK_EQ(r[10], 0u);           // and after it was cleared
+  VCHECK_EQ(r[11], 77u);          // what the called function set
+  VCHECK_EQ(r[12], 28u);          // v_ffbh_i32 of 0xfffffff0
+  VCHECK_EQ(r[13], 4u);           // v_ffbl_b32
+  VCHECK_EQ(r[14], h(-3.0f));     // -3 as a half
+  VCHECK_EQ(r[15], 20u);          // the half 20 as an integer
+  VCHECK_EQ(r[16], h(1.0f / 20.0f));
+  VCHECK_EQ(r[17], f(4.0f));      // 5 - 1
+  VCHECK_EQ(r[18], static_cast<uint32_t>((0xffffffull * 0xffffffull) >> 32));
+  VCHECK_EQ(r[19], 0xffe0u);      // -128 >> 2 in 16 bits
+  VCHECK_EQ(r[20], 5u);           // max(-128, 5)
+  VCHECK_EQ(r[21], 0xff80u);      // min(-128, 5)
+  VCHECK_EQ(r[22], 0xf00ff00fu);  // xnor
+  VCHECK_EQ(r[23], 7u);           // the middle of 10, 3 and 7
+  VCHECK_EQ(r[24], 0xffffu * 3u + 100u);
+  VCHECK_EQ(r[25], 5u);           // max(-128, 5, -1)
+  VCHECK_EQ(r[26], 0xf00u);       // four ones, eight up
+  VCHECK_EQ(r[27], 0x0005ffffu);  // 70000 held to 0xffff, and 5
+  VCHECK_EQ(r[28], 0x7fffffffu);  // INT_MAX + 1, clamped
+  VCHECK_EQ(r[29], 0x00070005u);  // (1, 2) + (4, 5)
+  VCHECK_EQ(r[30], 0xfffc0008u);  // (16, -8) >> 1, the constant in both
+  VCHECK_EQ(r[31], 0x00120011u);  // 16 - 0xffff (-2's high half), 16 - 0xfffe
+  VCHECK_EQ(r[32], f(11.5f));     // 1 * 3 + 2 * 4 + 0.5
+  const double two_over_pi = std::ldexp(static_cast<double>(0xa2f9836e4e441529ull >> 11), -53);
+  uint64_t bits;
+  std::memcpy(&bits, &two_over_pi, 8);
+  VCHECK_EQ(r[33], static_cast<uint32_t>(bits));   // 2/pi's first 53 bits
+  VCHECK_EQ(r[34], static_cast<uint32_t>(bits >> 32));
+  VCHECK_EQ(r[35], 2u);           // swapped
+  VCHECK_EQ(r[36], 1u);
+  VCHECK_EQ(r[37], 2u);           // through two accumulation registers
+  VCHECK_EQ(r[38], f(4.0f));      // (3 + 5) / 2
+  VCHECK_EQ(r[39], f(30.0f));     // 3 * 5 * 2
+  VCHECK_EQ(r[40], 0x44004000u);  // the high halves of (1, 2) and (3, 4)
+  VCHECK_EQ(r[41], 0x0007abcdu);  // max(5, 7, 7) into the high half, the low kept
+  VCHECK_EQ(r[42], 0x11220344u);  // 1 + 2 into byte 1, the rest kept
+  VCHECK_EQ(r[43], 0u);           // v70, untouched
+  VCHECK_EQ(r[44], 99u);          // v71, which the indexed move reached
+  VCHECK_EQ(r[45], 0x70u);        // three ones, four up
+  VCHECK_EQ(r[50], 9u);           // max(5, 9) as 64 bits
+  VCHECK_EQ(r[51], 0u);
+  VCHECK_EQ(r[52], halves(1.5f, 2.25f));   // (1, 2) + (0.5, 0.25)
+  VCHECK_EQ(r[53], 0x40403fc0u);  // bfloat16s (1, 2) + (0.5, 1)
+  VCHECK_EQ(r[54], 0xfffffffdu);  // min(10, -3) in LDS
+  VCHECK_EQ(r[55], 42u);          // -3 found, so 42 stored
+  VCHECK_EQ(r[56], 0xfffffffdu);  // and -3 handed back
+  VCHECK_EQ(r[57], 12u);          // 7 + 5 as 64 bits
+  VCHECK_EQ(r[58], 0x4840beefu);  // fp8 1 and 2 into the high half
+  VCHECK_EQ(r[59], 5u);           // a store through a resource with no data format does not land
+  VCHECK_EQ(r[60], 0u);           // and a load through it reads 0
+  VCHECK_EQ(r[61], 7u);           // 5 + 3, then decremented
+  VCHECK_EQ(r[62], 5u);           // what the add found
+  VCHECK_EQ(r[63], 8u);           // and what the decrement found
 }
 
 VTEST_MAIN

@@ -6,7 +6,11 @@ A program built by hipcc binds each call to a version as well as a name, and the
 loader refuses a library that defines the name under any other version, so the
 mapping has to be the real library's. Only names are read from it.
 
-  amd/tools/hip-version-script.py <real libamdhip64.so> <our libamdhip64.so> [out]
+  amd/tools/hip-version-script.py <real libamdhip64.so> <our hip_api.cpp.o> [out]
+
+Give it the object file (build/CMakeFiles/vgpuhip.dir/amd/src/hip_api.cpp.o),
+not the library: a function added since the map was last written is not in
+the library at all, since only what the map exports survives the link.
 """
 import subprocess
 import sys
@@ -46,10 +50,20 @@ def versions(real):
     return found
 
 
-def ours(lib):
-    out = subprocess.run(['nm', '-D', '--defined-only', lib], capture_output=True, text=True).stdout
-    return sorted({f[2].split('@')[0] for f in (l.split() for l in out.splitlines())
-                   if len(f) == 3 and f[1] == 'T' and (f[2].startswith('hip') or f[2].startswith('__hip'))})
+def ours(lib, known):
+    # The whole symbol table, not the dynamic one: a function added since the
+    # map was last written is not exported yet, because the map is what
+    # exports it. Such a function is one the real library defines; a local
+    # symbol it does not (a compiler's .cold part) stays local.
+    out = subprocess.run(['nm', '--defined-only', lib], capture_output=True, text=True).stdout
+    names = set()
+    for f in (l.split() for l in out.splitlines()):
+        if len(f) != 3 or f[1] not in 'Tt':
+            continue
+        name = f[2].split('@')[0]
+        if (name.startswith('hip') or name.startswith('__hip')) and (f[1] == 'T' or name in known):
+            names.add(name)
+    return sorted(names)
 
 
 def main():
@@ -57,7 +71,7 @@ def main():
     dest = sys.argv[3] if len(sys.argv) > 3 else 'amd/src/libamdhip64.map'
     known = versions(real)
     nodes = {k: [] for k in ORDER}
-    for name in ours(lib):
+    for name in ours(lib, known):
         nodes[known.get(name, 'hip_4.2')].append(name)
     text = [HEADER]
     prev = None

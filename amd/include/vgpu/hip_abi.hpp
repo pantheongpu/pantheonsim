@@ -261,7 +261,79 @@ struct PointerAttribute {
   int isManaged;
   unsigned allocationFlags;
 };
-enum MemoryType : int { kMemoryUnregistered = 0, kMemoryHost = 1, kMemoryDevice = 2 };
+enum MemoryType : int { kMemoryUnregistered = 0, kMemoryHost = 1, kMemoryDevice = 2, kMemoryManaged = 3 };
+
+// hipFuncAttributes: what hipFuncGetAttributes says of a kernel.
+struct FuncAttributes {
+  int binaryVersion;
+  int cacheModeCA;
+  size_t constSizeBytes;
+  size_t localSizeBytes;
+  int maxDynamicSharedSizeBytes;
+  int maxThreadsPerBlock;
+  int numRegs;
+  int preferredShmemCarveout;
+  int ptxVersion;
+  size_t sharedSizeBytes;
+};
+
+// hipPointer_attribute: which one fact hipPointerGetAttribute is asked for.
+enum PointerAttributeKind : int {
+  kPointerContext = 1,
+  kPointerMemoryType = 2,
+  kPointerDevicePointer = 3,
+  kPointerHostPointer = 4,
+  kPointerSyncMemops = 6,
+  kPointerBufferId = 7,
+  kPointerIsManaged = 8,
+  kPointerDeviceOrdinal = 9,
+  kPointerRangeStartAddr = 11,
+  kPointerRangeSize = 12,
+  kPointerMapped = 13,
+};
+
+// Virtual memory and pools: a place (a device, by its ordinal), memory made
+// there, a device's access to it, and a pool's properties.
+struct MemLocation {
+  int type;
+  int id;
+};
+struct MemAllocationProp {
+  int type;
+  int requestedHandleType;
+  MemLocation location;
+  void* win32HandleMetaData;
+  unsigned char compressionType, gpuDirectRDMACapable;
+  unsigned short usage;
+};
+struct MemAccessDesc {
+  MemLocation location;
+  int flags;   // hipMemAccessFlags: 0 none, 1 read, 3 read and write
+};
+struct MemPoolProps {
+  int allocType;
+  int handleTypes;
+  MemLocation location;
+  void* win32SecurityAttributes;
+  size_t maxSize;
+  unsigned char reserved[56];
+};
+// hipMemPoolAttr.
+enum MemPoolAttr : int {
+  kPoolReuseFollowEventDependencies = 1,
+  kPoolReuseAllowOpportunistic = 2,
+  kPoolReuseAllowInternalDependencies = 3,
+  kPoolReleaseThreshold = 4,
+  kPoolReservedMemCurrent = 5,
+  kPoolReservedMemHigh = 6,
+  kPoolUsedMemCurrent = 7,
+  kPoolUsedMemHigh = 8,
+};
+
+// hipIpcMemHandle_t: 64 bytes a process hands another.
+struct IpcMemHandle {
+  char reserved[64];
+};
 
 // hipDeviceAttribute_t: what hipDeviceGetAttribute is asked for, by the
 // numbers hip_runtime_api.h gives them (the ones answered here; run_hip_abi.sh

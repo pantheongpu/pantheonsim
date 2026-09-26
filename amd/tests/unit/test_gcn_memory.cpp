@@ -203,7 +203,7 @@ VTEST(a_launch_that_does_not_pay_for_that_lds_is_caught_rather_than_silently_wro
   } catch (const std::exception& e) {
     what = e.what();
   }
-  VCHECK_CONTAINS(what, "past the 0");
+  VCHECK_CONTAINS(what, "given no LDS");
 }
 
 VTEST(more_lds_than_a_work_group_has_is_refused) {
