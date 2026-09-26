@@ -1376,6 +1376,10 @@ D3AE8020 04825158	v_mfma_f32_32x32x64_f8f6f4 a[32:47], v[88:95], v[40:47], a[32:
 D3E08000 0402B566	v_mfma_f32_32x32x8_bf16 a[0:15], v[102:103], v[90:91], a[0:15]
 D3B60000 04021104	v_mfma_i32_16x16x64_i8 v[0:3], v[4:7], v[8:11], v[0:3]
 D3B88000 04022D06	v_mfma_i32_32x32x32_i8 a[0:15], v[6:9], v[22:25], a[0:15]
+D3AC0800 10022B14 D3AD0800 04021904	v_mfma_scale_f32_16x16x128_f8f6f4 v[0:3], v[4:11], v[12:19], v[0:3], v20, v21 op_sel:[1,0,0] op_sel_hi:[0,1,0]
+D3AC0000 00022B14 D3AD0800 04021904	v_mfma_scale_f32_16x16x128_f8f6f4 v[0:3], v[4:11], v[12:19], v[0:3], v20, v21 op_sel_hi:[0,0,0]
+D3AC0000 00022B14 D3AD0C00 44021904	v_mfma_scale_f32_16x16x128_f8f6f4 v[0:3], v[4:7], v[12:17], v[0:3], v20, v21 op_sel_hi:[0,0,0] cbsz:4 blgp:2
+D3AC1000 10024320 D3AE8900 24023110	v_mfma_scale_f32_32x32x64_f8f6f4 a[0:15], v[16:23], v[24:31], a[0:15], v32, v33 op_sel:[0,1,0] op_sel_hi:[0,1,0] cbsz:1 blgp:1
 D1F50000 043E0101	v_min3_i16 v0, v1, v0, v15
 D1D10004 046A4100	v_min3_i32 v4, v0, v32, v26
 D1F60019 042A0900	v_min3_u16 v25, v0, v4, v10
@@ -1557,6 +1561,7 @@ D3814003 18020F03	v_pk_mul_lo_u16 v3, v3, v7
 D3834006 18020680	v_pk_sub_i16 v6, 0, v3
 D38B5017 0001852D	v_pk_sub_u16 v23, v45, -2 op_sel:[0,1] op_sel_hi:[0,0]
 7E00B101	v_prng_b32_e32 v0, v1
+7E0AB107	v_prng_b32_e32 v5, v7
 7E0C7B06	v_rcp_f16_e32 v6, v6
 7E047AF9 00060502	v_rcp_f16_sdwa v2, v2 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD
 7E047AF9 00050502	v_rcp_f16_sdwa v2, v2 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:WORD_1

@@ -154,6 +154,18 @@ expect "every float narrows to the OCP fp8 and bf8 HIP's header gives, every way
 expect "every OCP fp8 and bf8 widens to the float HIP's header gives" "4 of 4 ways right" \
   "$(grep -c '^[bf][fp]8 to floats.*: 0 of 256 wrong$' <<< "$out") of 4 ways right"
 
+# gfx950's block-scaled matrix instructions (fp8, bf8, fp6, bf6 and fp4, each
+# lane's scale byte chosen), v_prng_b32 and v_permlane32_swap_b32, against what
+# the CDNA4 ISA guide says they compute (hipcc/gfx950.cpp).
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/gfx950.gfx950" 2>&1)
+status=$?
+expect "the gfx950 program runs to the end" "0" "$status"
+expect "each block-scaled product, of every format pairing, is what the ISA says" "6 of 6" \
+  "$(grep -c '^[0-9x]* formats .*: 0 of [0-9]* wrong$' <<< "$out") of 6"
+expect "v_prng_b32 steps the ISA's LFSR" "v_prng_b32: 0 of 64 wrong" "$(grep -o '^v_prng_b32:.*' <<< "$out")"
+expect "v_permlane32_swap_b32 trades the halves of two registers" "v_permlane32_swap_b32: 0 of 128 wrong" \
+  "$(grep -o '^v_permlane32_swap_b32:.*' <<< "$out")"
+
 # Streams that run at once, as a card's do (hipcc/streams.cpp). Each waiting
 # kernel gives up after a bounded time, so a runtime that ran the streams one
 # after another fails these rather than hanging.

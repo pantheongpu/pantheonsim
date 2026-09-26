@@ -255,7 +255,7 @@ modelled:
   - the matrix instructions with K doubled (f16, bf16, int8)
   - the `f8f6f4` ones, whose sources are fp8, bf8, fp6, bf6 or fp4, as each one's CBSZ or BLGP says
 - **8-bit floats:** the same fp8 instructions mean the OCP formats on gfx950 (E4M3 and E5M2), where gfx942's are FNUZ. Which one applies is read from the code object's target. `tests/hipcc/fp8.cpp`, built for each, checks every conversion against HIP's own software one.
-- **Not yet modelled:** the scaled matrix instructions (`v_mfma_scale_*`) and `v_prng_b32` are refused.
+- **Block-scaled matrix instructions:** `v_mfma_scale_*_f8f6f4` scales each lane's row and 32 values along K by an E8M0 byte of its scale register, the byte `{OP_SEL_HI, OP_SEL}` names, as the CDNA4 ISA reference guide says. `v_prng_b32` is its LFSR step. `tests/hipcc/gfx950.cpp` checks both, and the lane swaps, against the guide.
 - **Decoder check:** `tests/data/isa_corpus_gfx950.txt` holds every instruction shape PyTorch's, hipBLASLt's and rocBLAS's gfx950 code uses. The decoder must print each one as `llvm-objdump` does.
 - **Extracting code objects:** `amd_fatbin_extract` (`tools/fatbin-extract.cpp`) writes out what a library carries for one target, which is how that corpus is gathered.
 
