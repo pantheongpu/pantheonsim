@@ -83,9 +83,11 @@ int main(int argc, char** argv) {
   printf("a kernel whose LDS the launch paid for %d\n", wrong == 0);
 
   /* And a launch that forgets to pay for it is refused rather than reading
-   * memory no one reserved. */
+   * memory no one reserved: the kernel faults, and, as on a card, the stream
+   * says so when it is synchronized. */
+  const hipError_t queued = hipModuleLaunchKernel(dyn, 1, 1, 1, n, 1, 1, 0, stream, args, NULL);
   printf("a launch that forgets it is refused %d\n",
-         hipModuleLaunchKernel(dyn, 1, 1, 1, n, 1, 1, 0, stream, args, NULL) != hipSuccess);
+         queued != hipSuccess || hipStreamSynchronize(stream) == hipErrorLaunchFailure);
 
   /* Timing what the device did: two events around a launch, and how long
    * there was between them. Nothing here runs behind the program's back, so
@@ -155,7 +157,7 @@ int main(int argc, char** argv) {
     CHECK(hipMalloc((void**)&flag, sizeof(int)));
     CHECK(hipMemset(flag, 0, sizeof(int)));
     void* tail_args[] = {&flag};
-    const hipError_t launched = hipModuleLaunchKernel(tail, 1, 1, 1, 64, 1, 1, 0, stream, tail_args, NULL);
+    const hipError_t launched = hipModuleLaunchKernel(tail, 1, 1, 1, 64, 1, 1, 0, NULL, tail_args, NULL);
     int got = 0;
     CHECK(hipMemcpy(&got, flag, sizeof got, hipMemcpyDeviceToHost));
     printf("a kernel reading past its arguments runs %d\n", launched == hipSuccess && got == 1);

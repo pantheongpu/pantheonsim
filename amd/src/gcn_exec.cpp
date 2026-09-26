@@ -15,6 +15,7 @@
 #include <string_view>
 #include <vector>
 
+#include "vgpu/amd_decode_cache.hpp"
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/amd_hostcall.hpp"
 #include "vgpu/error.hpp"
@@ -168,7 +169,8 @@ struct Group {
 };
 
 struct Machine {
-  Machine(const Dispatch& dispatch, MemoryManager& memory) : d(dispatch), mem(memory) {}
+  Machine(const Dispatch& dispatch, MemoryManager& memory, DecodeCache& cache)
+      : d(dispatch), mem(memory), decoded(&cache) {}
   const Dispatch& d;
   MemoryManager& mem;
   DispatchStats stats;
@@ -208,20 +210,20 @@ struct Machine {
   std::unique_lock<std::mutex> atomic_guard(uint64_t addr) {
     return concurrent ? std::unique_lock<std::mutex>(memory_atomic_lock(addr)) : std::unique_lock<std::mutex>();
   }
-  // Each instruction decoded once, the first time a wave reaches it, by where
-  // it is: every wave of a dispatch runs the same code, and decoding it again
-  // each time cost more than running it.
-  std::vector<std::unique_ptr<const Inst>> decoded;
+  // Each instruction decoded once, the first time any wave reaches it: every
+  // wave of every launch of a module runs the same code, and decoding it again
+  // each time cost more than running it. The cache is the module's, or the
+  // dispatch's where the runtime keeps none.
+  DecodeCache* decoded = nullptr;
 
   const Inst& fetch(uint64_t pc) {
     const CodeObject& o = *d.object;
     const uint64_t at = pc - d.code_base - o.text_addr;
-    if (decoded.empty()) decoded.resize(o.text.size() / 4 + 1);
-    if (at % 4 != 0 || at / 4 >= decoded.size())
-      return *(scratch_inst = std::make_unique<const Inst>(gcn::decode(o.text, at, pc)));
-    auto& slot = decoded[at / 4];
-    if (!slot) slot = std::make_unique<const Inst>(gcn::decode(o.text, at, pc));
-    return *slot;
+    const Inst* in = at % 4 == 0 && at < o.text.size()
+                         ? decoded->get(at / 4, [&] { return gcn::decode(o.text, at, pc); })
+                         : nullptr;
+    if (!in) return *(scratch_inst = std::make_unique<const Inst>(gcn::decode(o.text, at, pc)));
+    return *in;
   }
   std::unique_ptr<const Inst> scratch_inst;   // one that is not where an instruction starts
   // The mask a VOP3b instruction writes to its scalar pair (a carry out, or
@@ -299,6 +301,7 @@ struct Machine {
       case OperandKind::Literal: return static_cast<uint64_t>(o.value);
       case OperandKind::M0: return w.m0;
       case OperandKind::Vgpr:
+      case OperandKind::Agpr:
       case OperandKind::None: break;
     }
     throw Error::make(Err::Internal, "a scalar operand this does not read");
@@ -3732,6 +3735,9 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     *gy = static_cast<uint32_t>(i / d.groups[0] % d.groups[1]);
     *gz = static_cast<uint32_t>(i / d.groups[0] / d.groups[1]);
   };
+  std::unique_ptr<DecodeCache> own;
+  DecodeCache* cache = d.decoded;
+  if (!cache) cache = (own = std::make_unique<DecodeCache>(d.object->text.size())).get();
   DispatchStats total;
   const unsigned nthreads = d.cooperative ? 1 : worker_count(groups);
   if (d.cooperative) {
@@ -3739,7 +3745,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     // barrier), so every one is resident at once, as the runtime promised when
     // it accepted the launch, and each takes a turn in order until all have
     // finished -- on one thread, so no group's turn ever waits on another's.
-    Machine m(d, mem);
+    Machine m(d, mem, *cache);
     std::vector<Group> all(groups);
     std::vector<bool> finished(groups, false);
     for (uint64_t i = 0; i < groups; ++i) {
@@ -3755,7 +3761,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
         }
     total = m.stats;
   } else if (nthreads <= 1) {
-    Machine m(d, mem);
+    Machine m(d, mem, *cache);
     for (uint64_t i = 0; i < groups; ++i) {
       uint32_t gx, gy, gz;
       group_at(i, &gx, &gy, &gz);
@@ -3775,7 +3781,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
       const uint64_t begin = groups * t / nthreads, end = groups * (t + 1) / nthreads;
       threads_.emplace_back([&, t, begin, end] {
         try {
-          Machine m(d, mem);
+          Machine m(d, mem, *cache);
           m.concurrent = true;
           for (uint64_t i = begin; i < end && !failed.load(std::memory_order_relaxed); ++i) {
             uint32_t gx, gy, gz;

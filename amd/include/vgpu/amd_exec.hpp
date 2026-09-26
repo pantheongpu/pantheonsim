@@ -23,6 +23,7 @@
 namespace vgpu::amd {
 
 class Hostcall;
+class DecodeCache;
 
 // A launch, as the packet a HIP runtime writes describes one.
 struct Dispatch {
@@ -40,6 +41,10 @@ struct Dispatch {
   // reaches its own constants and variables. Zero for an object not yet
   // linked, whose code is run where its .text says it is.
   uint64_t code_base = 0;
+  // The object's instructions as already decoded (vgpu/amd_decode_cache.hpp),
+  // for the code where code_base puts it: a runtime keeps one a module, which
+  // every launch of its kernels shares. Null makes each launch decode afresh.
+  DecodeCache* decoded = nullptr;
   // Where the kernel calls the host (device-side printf), if the runtime gave
   // it anywhere: its hidden_hostcall_buffer argument, and what answers when
   // the kernel raises the doorbell.

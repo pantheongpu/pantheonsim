@@ -27,6 +27,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 #include "vgpu/profile.hpp"
@@ -154,6 +155,10 @@ class Publisher {
 
   void begin_update();
   void end_update();
+  // One writer at a time: kernels and copies on different streams finish on
+  // different threads, and each updates the segment's counters and the seqlock
+  // around them. Recursive, since the writers refresh as they go.
+  std::recursive_mutex writers_;
   Shared* shared_ = nullptr;
   int fd_ = -1;
   size_t size_ = 0;

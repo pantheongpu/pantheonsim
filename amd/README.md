@@ -44,9 +44,15 @@ memory a device has and how much is left, several devices each keeping their
 own, streams and the events a program times its work with, and a launch whose
 shared-memory parameter sizes the LDS the kernel did not reserve for itself.
 The time between two events is the simulator's own, not what a card would have
-taken, which this does not claim to know. Nothing runs behind the program's back, so
-the asynchronous calls are the synchronous ones and a stream is done when the
-call returns. A program built by `hipcc` runs unmodified too:
+taken, which this does not claim to know. Streams run at once, as a card's
+do: each stream's work runs in order on a host thread of its own, so a kernel
+on one stream may wait on a flag another stream's kernel sets, an event and a
+stream say `hipErrorNotReady` while their work runs, `hipStreamWaitEvent`
+orders one stream behind another, and the null stream is the legacy default
+stream, ordered against the blocking streams. A kernel's fault is told at the
+next synchronization, as on a card. `VGPU_SYNC_LAUNCHES=1` makes every call
+wait for its own work instead, which rules concurrency out when a program
+misbehaves. A program built by `hipcc` runs unmodified too:
 its device code is registered from inside the executable before `main`, its
 chevron launches go through `hipLaunchKernel`, and it reads the device through
 the real headers' `hipDeviceProp_t`, which is laid out here field for field as

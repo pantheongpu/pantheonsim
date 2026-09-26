@@ -141,6 +141,24 @@ expect "every float narrows to the fp8 and bf8 HIP's header gives, every way" "1
 expect "every fp8 and bf8 widens to the float HIP's header gives" "4 of 4 ways right" \
   "$(grep -c '^[bf][fp]8 to floats.*: 0 of 256 wrong$' <<< "$out") of 4 ways right"
 
+# Streams that run at once, as a card's do (hipcc/streams.cpp). Each waiting
+# kernel gives up after a bounded time, so a runtime that ran the streams one
+# after another fails these rather than hanging.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/streams.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the streams program runs to the end" "0" "$status"
+for line in \
+  "two kernels on two streams run at once 1" \
+  "a stream is busy while its kernel waits, and done after 1" \
+  "a stream waits for another's event 1" \
+  "the null stream waits for the blocking streams, not a non-blocking one 1" \
+  "a host function runs in stream order 1" \
+  "an asynchronous copy takes its bytes when it is called 1" \
+  "a kernel's fault is told at the synchronization after it 1"; do
+  expect "$line" "$line" "$(grep -Fo "$line" <<< "$out")"
+done
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)

@@ -64,6 +64,43 @@ VTEST(a_device_runs_the_code_built_for_its_target_and_features) {
   VCHECK_EQ(chosen("gfx950:sramecc+:xnack-"), std::string("none"));
 }
 
+// Read for a device, a bundle keeps only the code for that device's
+// processor -- a library's carries every target, and RCCL's inflates to 3 GB
+// -- while still saying what else it carries.
+VTEST(a_bundle_read_for_a_device_keeps_only_that_processors_code) {
+  for (const char* name : {"bundle.bin", "bundle_zstd.bin", "bundle_zlib.bin"}) {
+    const std::string raw = file(name);
+    const std::unique_ptr<amd::Bundle> b = amd::read_bundle(bytes(raw), "gfx942:sramecc+:xnack-");
+    VCHECK(b != nullptr);
+    VCHECK_EQ(b->targets.size(), size_t{2});
+    VCHECK(b->targets.count("gfx90a") == 0);
+    VCHECK(*amd::code_for(*b, "gfx942:sramecc+:xnack-") == file("asm_vector.gfx942.o"));
+    VCHECK(*amd::code_for(*b, "gfx942:sramecc+:xnack+") == file("asm_scalar.gfx942.o"));
+    VCHECK_EQ(amd::target_list(*b), std::string("gfx90a, gfx942:xnack+, gfx942:xnack-"));
+    if (std::string(name) != "bundle.bin")   // compressed: only what is kept is held
+      VCHECK_EQ(b->inflated.size(), file("asm_vector.gfx942.o").size() + file("asm_scalar.gfx942.o").size());
+    const std::unique_ptr<amd::Bundle> other = amd::read_bundle(bytes(raw), "gfx950:sramecc+:xnack-");
+    VCHECK(other->targets.empty());
+    VCHECK(amd::code_for(*other, "gfx950:sramecc+:xnack-") == nullptr);
+  }
+}
+
+// A compressed bundle cut short, or one whose header claims more than it
+// inflates to, is refused rather than read as far as it goes.
+VTEST(a_damaged_compressed_bundle_is_refused) {
+  std::string raw = file("bundle_zstd.bin");
+  std::string cut = raw.substr(0, raw.size() / 2);
+  // Keep the header's own sizes: the compressed stream just stops.
+  bool refused = false;
+  try {
+    std::string padded = cut + std::string(raw.size() - cut.size(), '\0');
+    amd::read_bundle(bytes(padded), "gfx942:sramecc+:xnack-");
+  } catch (const std::exception&) {
+    refused = true;
+  }
+  VCHECK(refused);
+}
+
 VTEST(what_is_not_a_bundle_is_not_read_as_one) {
   const std::string elf = file("asm_vector.gfx942.o");
   VCHECK(!amd::is_bundle(bytes(elf)));
