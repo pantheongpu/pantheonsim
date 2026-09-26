@@ -66,6 +66,7 @@ struct Module {
   // Where a linked module's image is (CodeObject::image): its code runs from
   // there, and its variables are in it, so `globals` is the same address.
   uint64_t code_base = 0;
+  uint64_t code_size = 0;   // how much of the device the image takes
   // What a profiler knows it and its kernels by (vgpu/hip_profiler.hpp).
   uint64_t code_object_id = 0;
   std::vector<uint64_t> kernel_ids;   // one per kernel, in the object's order
@@ -130,7 +131,7 @@ void report_loaded(Module& m, int device, const void* image, size_t image_size) 
   o.image = image;
   o.image_size = image_size;
   o.load_base = m.object.linked ? m.code_base : m.object.text_addr;
-  o.load_size = m.object.linked ? m.object.image.size() : m.object.text.size();
+  o.load_size = m.object.linked ? m.code_size : m.object.text.size();
   std::vector<vgpu::amd::hipprof::KernelSymbol> symbols;
   for (size_t i = 0; i < m.object.kernels.size(); ++i) {
     const Kernel& k = m.object.kernels[i];
@@ -234,7 +235,9 @@ struct State {
   std::vector<std::unique_ptr<Function>> functions;
   std::vector<std::unique_ptr<FatBinary>> fat_binaries;
   // Each bundle read, by where it is: a library's binaries can share one.
-  std::map<const uint8_t*, std::unique_ptr<vgpu::amd::Bundle>> bundles;
+  // A program's bundles, read once for each target a device of it runs:
+  // only that target's code is kept (vgpu/amd_bundle.hpp).
+  std::map<std::pair<const uint8_t*, std::string>, std::unique_ptr<vgpu::amd::Bundle>> bundles;
   std::map<const void*, HostFunction> host_functions;
   std::map<const void*, HostVar> host_vars;
   std::set<std::pair<int, int>> peers;           // (device, peer) pairs with access enabled
@@ -642,9 +645,14 @@ hipError_t launch_in_order(LaunchJob job) {
 void place(Module& m, vgpu::MemoryManager& mem) {
   m.decoded = std::make_unique<vgpu::amd::DecodeCache>(m.object.text.size());
   if (m.object.linked) {
+    m.code_size = m.object.image.size();
     m.code_base = mem.alloc(m.object.image.empty() ? 1 : m.object.image.size());
     if (!m.object.image.empty()) mem.write(m.code_base, m.object.image.data(), m.object.image.size());
     m.globals = m.code_base;
+    // The device has the image now, and nothing reads the host's copy again:
+    // for a library's hundreds of megabytes of kernels, that copy was a third
+    // of what loading it cost.
+    std::vector<uint8_t>().swap(m.object.image);
     return;
   }
   if (!m.object.data.empty()) {
@@ -665,9 +673,9 @@ hipError_t module_on(State& s, FatBinary& fb, int ordinal, Module** out) {
   vgpu::runtime::Device& d = s.rt->device(ordinal);
   const std::string& gfx = d.profile().gcn_arch;
   if (!fb.image) return fail(hipErrorInvalidImage, "the program's device code is not a clang offload bundle");
-  auto& bundle = s.bundles[fb.image];
+  auto& bundle = s.bundles[{fb.image, d.profile().gcn_arch_full}];
   try {
-    if (!bundle) bundle = vgpu::amd::read_bundle(fb.image);
+    if (!bundle) bundle = vgpu::amd::read_bundle(fb.image, d.profile().gcn_arch_full);
   } catch (const std::exception& e) {
     return fail(hipErrorInvalidImage, e.what());
   }
@@ -1091,7 +1099,7 @@ hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
   std::unique_ptr<vgpu::amd::Bundle> bundle;
   if (vgpu::amd::is_bundle(bytes)) {
     try {
-      bundle = vgpu::amd::read_bundle(bytes);
+      bundle = vgpu::amd::read_bundle(bytes, d->profile().gcn_arch_full);
     } catch (const std::exception& e) {
       return record(s, fail(hipErrorInvalidImage, e.what()));
     }
