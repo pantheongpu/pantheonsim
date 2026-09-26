@@ -761,7 +761,8 @@ set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip
 # PyTorch's ROCm build, unmodified, where a Python with it is installed
 # (VGPU_TORCH_PYTHON, or a venv under ~/.local/share/torch-rocm*).
 add_test(NAME amd_pytorch COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh)
-set_tests_properties(amd_pytorch PROPERTIES DEPENDS vgpuhip
+# Alone: it is the heaviest test there is, and the machines are shared.
+set_tests_properties(amd_pytorch PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 add_test(NAME amd_hipcc COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc.sh)
 set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
