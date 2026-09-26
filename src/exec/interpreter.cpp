@@ -5739,6 +5739,13 @@ class Interpreter {
         if (op->ftz && s.bits == 32 && !s.is_bfloat() && subnormal32(x)) x = std::copysign(0.0, x);
         if (op->sat) x = x > 1 ? 1.0 : x > 0 ? x : 0.0;   // NaN and -0 become +0
         if (d.is_bfloat()) return double_to_bf16(x);
+        // A NaN from f64 keeps its sign and the top of its payload in f16 on a
+        // real GPU, made quiet, where one from f32 comes out 0x7FFF whatever
+        // it was.
+        if (d.bits == 16 && s.bits == 64 && std::isnan(x)) {
+          const uint64_t b = std::bit_cast<uint64_t>(x);
+          return ((b >> 48) & 0x8000u) | 0x7E00u | ((b >> 42) & 0x3FFu);
+        }
         if (d.bits == 16) return double_to_f16(x);
         if (d.bits == 64) return f64bits(x);
         const float f = static_cast<float>(x);
