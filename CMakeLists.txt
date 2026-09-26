@@ -1206,6 +1206,21 @@ if(TARGET vgpucudart)
     TIMEOUT 3600)
 endif()
 
+# CUTLASS's own GEMM tests, the cases that found interpreter bugs (see the
+# script), and a split-K style semaphore between blocks on several host threads.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_cutlass_gemm COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_gemm.sh)
+  set_tests_properties(e2e_cutlass_gemm PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 3600)
+  add_test(NAME e2e_block_semaphore COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_block_semaphore.sh)
+  set_tests_properties(e2e_block_semaphore PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # Every WMMA shape and element type through mma.h.
 if(TARGET vgpucudart)
   add_test(NAME e2e_wmma_types COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wmma_types.sh)

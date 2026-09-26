@@ -27,21 +27,27 @@ fetch_into() {  # fetch_into <dir> <url> <tar members...>
 mkdir -p "$build/_deps"
 exec {fetch_lock}>"$build/_deps/.fetch.lock"
 flock "$fetch_lock"
-# The conv testbed is the newest thing fetched, so a checkout without it is
-# from before and is fetched again.
-if [[ ! -f "$cutlass/test/unit/conv/device_3x/testbed_conv.hpp" ]]; then
+# The GEMM tests run_cutlass_gemm.sh compiles are the newest things fetched, so
+# a checkout without them is from before and is fetched again.
+if [[ ! -f "$cutlass/test/unit/conv/device_3x/testbed_conv.hpp" ||
+      ! -f "$cutlass/test/unit/gemm/device/sm90_gemm_s8_s8_s8_tensor_op_s32.cu" ]]; then
   if [[ -n "${CUTLASS_DIR:-}" ]]; then
     echo "FAIL: CUTLASS_DIR=$CUTLASS_DIR is not a CUTLASS checkout with its unit tests"; exit 1
   fi
-  # The headers, and the Hopper unit tests with what they include (the conv
-  # tests' testbed includes the GEMM one): the rest of the release is
-  # examples, Python and tools.
+  # The headers, the Hopper unit tests with what they include (the conv
+  # tests' testbed includes the GEMM one), and the GEMM tests
+  # run_cutlass_gemm.sh runs: the rest of the release is examples, Python
+  # and tools.
   if ! fetch_into "$cutlass" "https://github.com/NVIDIA/cutlass/archive/refs/tags/$cutlass_tag.tar.gz" \
        'cutlass-*/include/*' 'cutlass-*/LICENSE.txt' 'cutlass-*/tools/util/include/*' \
        'cutlass-*/test/unit/common/*' 'cutlass-*/test/unit/cute/hopper/*' \
        'cutlass-*/test/unit/conv/cache_testbed_output.h' 'cutlass-*/test/unit/conv/device_3x/*.hpp' \
        'cutlass-*/test/unit/conv/device_3x/fprop/sm90_*' \
        'cutlass-*/test/unit/gemm/device/*.h' 'cutlass-*/test/unit/gemm/device/*.hpp' \
+       'cutlass-*/test/unit/gemm/device/gemm_f16t_f16n_f32t_tensor_op_f32_sparse_sm80.cu' \
+       'cutlass-*/test/unit/gemm/device/sm90_gemm_f16_f16_f16_tensor_op_f32_group_gemm.cu' \
+       'cutlass-*/test/unit/gemm/device/sm90_gemm_f16_f16_f16_tensor_op_f32_cluster_warpspecialized_pingpong.cu' \
+       'cutlass-*/test/unit/gemm/device/sm90_gemm_s8_s8_s8_tensor_op_s32.cu' \
        'cutlass-*/test/unit/test_unit.cpp'; then
     echo "SKIP: could not download CUTLASS $cutlass_tag (set CUTLASS_DIR to a checkout)"; exit 0
   fi
