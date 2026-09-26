@@ -27,10 +27,12 @@ fetch_into() {  # fetch_into <dir> <url> <tar members...>
 mkdir -p "$build/_deps"
 exec {fetch_lock}>"$build/_deps/.fetch.lock"
 flock "$fetch_lock"
-# The GEMM tests run_cutlass_gemm.sh compiles are the newest things fetched, so
-# a checkout without them is from before and is fetched again.
+# The GEMM tests run_cutlass_gemm.sh and run_cutlass_sm100.sh compile are the
+# newest things fetched, so a checkout without them is from before and is
+# fetched again.
 if [[ ! -f "$cutlass/test/unit/conv/device_3x/testbed_conv.hpp" ||
-      ! -f "$cutlass/test/unit/gemm/device/sm90_gemm_s8_s8_s8_tensor_op_s32.cu" ]]; then
+      ! -f "$cutlass/test/unit/gemm/device/sm90_gemm_s8_s8_s8_tensor_op_s32.cu" ||
+      ! -f "$cutlass/test/unit/gemm/device/sm100_tensorop_gemm/f16_f16_void_f32.cu" ]]; then
   if [[ -n "${CUTLASS_DIR:-}" ]]; then
     echo "FAIL: CUTLASS_DIR=$CUTLASS_DIR is not a CUTLASS checkout with its unit tests"; exit 1
   fi
@@ -48,6 +50,7 @@ if [[ ! -f "$cutlass/test/unit/conv/device_3x/testbed_conv.hpp" ||
        'cutlass-*/test/unit/gemm/device/sm90_gemm_f16_f16_f16_tensor_op_f32_group_gemm.cu' \
        'cutlass-*/test/unit/gemm/device/sm90_gemm_f16_f16_f16_tensor_op_f32_cluster_warpspecialized_pingpong.cu' \
        'cutlass-*/test/unit/gemm/device/sm90_gemm_s8_s8_s8_tensor_op_s32.cu' \
+       'cutlass-*/test/unit/gemm/device/sm100_tensorop_gemm/*.cu' \
        'cutlass-*/test/unit/test_unit.cpp'; then
     echo "SKIP: could not download CUTLASS $cutlass_tag (set CUTLASS_DIR to a checkout)"; exit 0
   fi
