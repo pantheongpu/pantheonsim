@@ -162,9 +162,9 @@ VTEST(buffers_lds_and_private_memory_are_reached_as_a_card_reaches_them) {
   const amd::CodeObject o = object("asm_memory");
   MemoryManager mem(16ull << 20);
   const std::vector<uint32_t> init = {100, 101, 102, 103, 104, 105, 106, 107};
-  const uint64_t buf = mem.alloc(8 * 4), out = mem.alloc(15 * 4);
+  const uint64_t buf = mem.alloc(8 * 4), out = mem.alloc(19 * 4);
   mem.write(buf, init.data(), 8 * 4);
-  const std::vector<uint32_t> r = run(o, "memory", mem, out, 15, {buf, out});
+  const std::vector<uint32_t> r = run(o, "memory", mem, out, 19, {buf, out});
   VCHECK_EQ(r[0], 630u);   // lane 0 is sent lane 63's ten times 63
   VCHECK_EQ(r[1], 101u);   // in range
   VCHECK_EQ(r[2], 0u);     // past the end
@@ -180,6 +180,10 @@ VTEST(buffers_lds_and_private_memory_are_reached_as_a_card_reaches_them) {
   VCHECK_EQ(r[11], 0u);    // far past LDS: zero, not what the register held
   VCHECK_EQ(r[12], 0x1234u);   // private memory, by offset alone
   VCHECK_EQ(r[13], 0x1234u);   // and from a scalar register's offset
+  VCHECK_EQ(r[15], 101u);        // a short into the low half, the high one cleared
+  VCHECK_EQ(r[16], 103u << 16);  // one into the high half, the low one cleared
+  VCHECK_EQ(r[17], 0x11u << 16); // and from LDS
+  VCHECK_EQ(r[18], 0u);          // past the end: all of it zero
   std::vector<uint32_t> after(8);
   mem.read(buf, after.data(), 8 * 4);
   VCHECK_EQ(after[2], 0x77u);   // the store in range landed
@@ -189,9 +193,9 @@ VTEST(buffers_lds_and_private_memory_are_reached_as_a_card_reaches_them) {
 VTEST(vector_comparisons_packed_math_and_mixed_precision_give_what_the_isa_says) {
   const amd::CodeObject o = object("asm_vector");
   MemoryManager mem(16ull << 20);
-  const uint64_t out = mem.alloc(28 * 4);
+  const uint64_t out = mem.alloc(31 * 4);
   const int32_t x = 10, y = 7;
-  const std::vector<uint32_t> r = run(o, "vector", mem, out, 28, {out, x, y});
+  const std::vector<uint32_t> r = run(o, "vector", mem, out, 31, {out, x, y});
   VCHECK_EQ(r[0], 10u);    // EXEC narrowed to the lanes below x
   VCHECK_EQ(r[1], 10u);    // and VCC written with it
   VCHECK_EQ(r[2], 1u);     // then to lane 3 alone
@@ -221,6 +225,9 @@ VTEST(vector_comparisons_packed_math_and_mixed_precision_give_what_the_isa_says)
   VCHECK_EQ(r[25], f(4.0f));           // and of a source's absolute value
   VCHECK_EQ(r[26], f(3.0f * 2.0f));    // (3, 7) times (2, 5), written over the (3, 7)
   VCHECK_EQ(r[27], f(3.0f * 5.0f));    // whose high result reads the 3 as it was
+  VCHECK_EQ(r[28], 0xff0000ffu);       // the signs of bytes 1 (0x80), 3 (0), 5 (0x7f) and 7 (0x80)
+  VCHECK_EQ(r[29], 0xff008002u);       // byte 4, byte 7, a zero byte, a byte of ones
+  VCHECK_EQ(r[30], halves(1.5f + 1.0f, -2.0f + 1.0f));   // 1.0 added to both halves
 }
 
 VTEST_MAIN

@@ -73,7 +73,59 @@ scratch_load_dword v28, off, s18 offset:4
 s_waitcnt vmcnt(0)
 global_store_dword v10, v27, s[6:7] offset:48
 global_store_dword v10, v28, s[6:7] offset:52
+v_mov_b32_e32 v5, 0xdeadbeef
+v_mov_b32_e32 v6, 0xdeadbeef
+v_mov_b32_e32 v8, 0xdeadbeef
+v_mov_b32_e32 v9, 0xdeadbeef
+v_mov_b32_e32 v4, 4
+buffer_load_short_d16 v5, v4, s[8:11], 0 offen
+buffer_load_short_d16_hi v6, v4, s[8:11], 0 offen offset:8
+buffer_load_short_d16 v9, v4, s[8:11], 0 offen offset:12
+ds_read_u16_d16_hi v8, v13
+s_waitcnt vmcnt(0) lgkmcnt(0)
+global_store_dword v10, v5, s[6:7] offset:60
+global_store_dword v10, v6, s[6:7] offset:64
+global_store_dword v10, v8, s[6:7] offset:68
+global_store_dword v10, v9, s[6:7] offset:72
 s_endpgm
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
+s_nop 0
 s_nop 0
 s_nop 0
 s_nop 0

@@ -128,6 +128,19 @@ expect "a kernel reads and writes a peer's memory once peer access is enabled" \
 expect "peer access disabled twice says it is not enabled" "disabling it again: hipErrorPeerAccessNotEnabled" \
   "$(grep -o '^disabling it again.*' <<< "$out")"
 
+# gfx942's 8-bit floats (fp8 and bf8, without infinities or a negative zero):
+# floats narrowed by the device's instructions, rounded to nearest and
+# stochastically, and all 256 bytes widened, each checked in the program
+# against HIP's software conversion, which is what AMD says the hardware does.
+out=$(VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/fp8.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the 8-bit float program runs to the end" "0" "$status"
+expect "every float narrows to the fp8 and bf8 HIP's header gives, every way" "12 of 12 ways right" \
+  "$(grep -c '^floats to .*: 0 of 4096 wrong$' <<< "$out") of 12 ways right"
+expect "every fp8 and bf8 widens to the float HIP's header gives" "4 of 4 ways right" \
+  "$(grep -c '^[bf][fp]8 to floats.*: 0 of 256 wrong$' <<< "$out") of 4 ways right"
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)

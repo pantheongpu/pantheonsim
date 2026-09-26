@@ -277,6 +277,12 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x033}, {"v_frexp_exp_i32_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x034}, {"v_frexp_mant_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x038}, {"v_mov_b64_e32", 2, 1, 2}},
+      // An 8-bit float (fp8, or bf8 with a wider exponent) widened to a
+      // float, or two of them to a pair.
+      {{Enc::Vop1, 0x054}, {"v_cvt_f32_fp8_e32", 1, 1}},
+      {{Enc::Vop1, 0x055}, {"v_cvt_f32_bf8_e32", 1, 1}},
+      {{Enc::Vop1, 0x056}, {"v_cvt_pk_f32_fp8_e32", 2, 1}},
+      {{Enc::Vop1, 0x057}, {"v_cvt_pk_f32_bf8_e32", 2, 1}},
       {{Enc::Vop2, 0x006}, {"v_mul_i32_i24_e32", 1, 2}},
       {{Enc::Vop2, 0x008}, {"v_mul_u32_u24_e32", 1, 2}},
       {{Enc::Vop2, 0x00a}, {"v_min_f32_e32", 1, 2}},
@@ -412,6 +418,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x1d1}, {"v_min3_i32", 1, 3}},
       {{Enc::Vop3, 0x1d3}, {"v_max3_f32", 1, 3}},
       {{Enc::Vop3, 0x1d4}, {"v_max3_i32", 1, 3}},
+      {{Enc::Vop3, 0x1d6}, {"v_med3_f32", 1, 3}},
       {{Enc::Vop3, 0x1d7}, {"v_med3_i32", 1, 3}},
       {{Enc::Vop3, 0x1c9}, {"v_bfe_i32", 1, 3}},
       {{Enc::Vop3, 0x1ca}, {"v_bfi_b32", 1, 3}},
@@ -455,6 +462,13 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x290}, {"v_lshrrev_b64", 2, 2, 1, 2}},
       {{Enc::Vop3, 0x291}, {"v_ashrrev_i64", 2, 2, 1, 2}},
       {{Enc::Vop3, 0x2a0}, {"v_pack_b32_f16", 1, 2}},
+      // And floats narrowed to them: two into one half of the destination,
+      // rounded to nearest, or one into one byte, rounded as its second
+      // source's random bits say.
+      {{Enc::Vop3, 0x2a2}, {"v_cvt_pk_fp8_f32", 1, 2}},
+      {{Enc::Vop3, 0x2a3}, {"v_cvt_pk_bf8_f32", 1, 2}},
+      {{Enc::Vop3, 0x2a4}, {"v_cvt_sr_fp8_f32", 1, 2}},
+      {{Enc::Vop3, 0x2a5}, {"v_cvt_sr_bf8_f32", 1, 2}},
       // DS: LDS reads and writes. A read takes the address; a write takes the
       // address and the data.
       {{Enc::Ds, 0x00}, {"ds_add_u32", 0, 2}},
@@ -479,6 +493,16 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Ds, 0x39}, {"ds_read_i8", 1, 1}},
       {{Enc::Ds, 0x3a}, {"ds_read_u8", 1, 1}},
       {{Enc::Ds, 0x3c}, {"ds_read_u16", 1, 1}},
+      // A byte or a short into one half of a register, the other half kept,
+      // and the top half of one stored.
+      {{Enc::Ds, 0x54}, {"ds_write_b8_d16_hi", 0, 2}},
+      {{Enc::Ds, 0x55}, {"ds_write_b16_d16_hi", 0, 2}},
+      {{Enc::Ds, 0x56}, {"ds_read_u8_d16", 1, 1}},
+      {{Enc::Ds, 0x57}, {"ds_read_u8_d16_hi", 1, 1}},
+      {{Enc::Ds, 0x58}, {"ds_read_i8_d16", 1, 1}},
+      {{Enc::Ds, 0x59}, {"ds_read_i8_d16_hi", 1, 1}},
+      {{Enc::Ds, 0x5a}, {"ds_read_u16_d16", 1, 1}},
+      {{Enc::Ds, 0x5b}, {"ds_read_u16_d16_hi", 1, 1}},
       {{Enc::Ds, 0x4d}, {"ds_write_b64", 0, 2, 1, 2}},
       {{Enc::Ds, 0x76}, {"ds_read_b64", 2, 1}},
       {{Enc::Ds, 0xdf}, {"ds_write_b128", 0, 2, 1, 4}},
@@ -507,6 +531,13 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Flat, 0x1a}, {"store_short", 0, 2}},
       // The top half of the register, stored as a short.
       {{Enc::Flat, 0x1b}, {"store_short_d16_hi", 0, 2}},
+      {{Enc::Flat, 0x19}, {"store_byte_d16_hi", 0, 2}},
+      {{Enc::Flat, 0x20}, {"load_ubyte_d16", 1, 1}},
+      {{Enc::Flat, 0x21}, {"load_ubyte_d16_hi", 1, 1}},
+      {{Enc::Flat, 0x22}, {"load_sbyte_d16", 1, 1}},
+      {{Enc::Flat, 0x23}, {"load_sbyte_d16_hi", 1, 1}},
+      {{Enc::Flat, 0x24}, {"load_short_d16", 1, 1}},
+      {{Enc::Flat, 0x25}, {"load_short_d16_hi", 1, 1}},
       {{Enc::Flat, 0x1c}, {"store_dword", 0, 2}},
       {{Enc::Flat, 0x1d}, {"store_dwordx2", 0, 2, 1, 2}},
       {{Enc::Flat, 0x1e}, {"store_dwordx3", 0, 2, 1, 3}},
@@ -543,6 +574,14 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Mubuf, 0x1d}, {"buffer_store_dwordx2", 0, 4, 2}},
       {{Enc::Mubuf, 0x1e}, {"buffer_store_dwordx3", 0, 4, 3}},
       {{Enc::Mubuf, 0x1f}, {"buffer_store_dwordx4", 0, 4, 4}},
+      {{Enc::Mubuf, 0x19}, {"buffer_store_byte_d16_hi", 0, 4, 1}},
+      {{Enc::Mubuf, 0x1b}, {"buffer_store_short_d16_hi", 0, 4, 1}},
+      {{Enc::Mubuf, 0x20}, {"buffer_load_ubyte_d16", 1, 3}},
+      {{Enc::Mubuf, 0x21}, {"buffer_load_ubyte_d16_hi", 1, 3}},
+      {{Enc::Mubuf, 0x22}, {"buffer_load_sbyte_d16", 1, 3}},
+      {{Enc::Mubuf, 0x23}, {"buffer_load_sbyte_d16_hi", 1, 3}},
+      {{Enc::Mubuf, 0x24}, {"buffer_load_short_d16", 1, 3}},
+      {{Enc::Mubuf, 0x25}, {"buffer_load_short_d16_hi", 1, 3}},
       {{Enc::Mubuf, 0x40}, {"buffer_atomic_swap", 0, 4, 1}},
       {{Enc::Mubuf, 0x41}, {"buffer_atomic_cmpswap", 0, 4, 2}},
       {{Enc::Mubuf, 0x42}, {"buffer_atomic_add", 0, 4, 1}},
@@ -557,6 +596,9 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // A multiply-add over sources that may each be a float or a half,
       // rounded to a half and written into one half of the destination.
       {{Enc::Vop3p, 0x20}, {"v_fma_mix_f32", 1, 3}},
+      // Four signed bytes of each source multiplied pairwise and added to the
+      // third, clamped where asked.
+      {{Enc::Vop3p, 0x28}, {"v_dot4_i32_i8", 1, 3}},
       {{Enc::Vop3p, 0x21}, {"v_fma_mixlo_f16", 1, 3}},
       {{Enc::Vop3p, 0x22}, {"v_fma_mixhi_f16", 1, 3}},
       {{Enc::Vop3p, 0x30}, {"v_pk_fma_f32", 2, 3, 2, 2, 2}},
@@ -577,6 +619,26 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x44}, {"v_mfma_f32_32x32x2_f32", 16, 3, 1, 1, 16}},
       {{Enc::Vop3p, 0x45}, {"v_mfma_f32_16x16x4_f32", 4, 3, 1, 1, 4}},
       {{Enc::Vop3p, 0x6e}, {"v_mfma_f64_16x16x4_f64", 8, 3, 2, 2, 8}},
+      // Halves, bfloat16s and bytes into floats and ints: the forms the half,
+      // bfloat16 and int8 GEMMs use.
+      {{Enc::Vop3p, 0x49}, {"v_mfma_f32_16x16x4_4b_f16", 16, 3, 2, 2, 16}},
+      {{Enc::Vop3p, 0x4a}, {"v_mfma_f32_4x4x4_16b_f16", 4, 3, 2, 2, 4}},
+      {{Enc::Vop3p, 0x4c}, {"v_mfma_f32_32x32x8_f16", 16, 3, 2, 2, 16}},
+      {{Enc::Vop3p, 0x56}, {"v_mfma_i32_32x32x16_i8", 16, 3, 2, 2, 16}},
+      {{Enc::Vop3p, 0x57}, {"v_mfma_i32_16x16x32_i8", 4, 3, 2, 2, 4}},
+      {{Enc::Vop3p, 0x5e}, {"v_mfma_f32_16x16x4_4b_bf16", 16, 3, 2, 2, 16}},
+      {{Enc::Vop3p, 0x5f}, {"v_mfma_f32_4x4x4_16b_bf16", 4, 3, 2, 2, 4}},
+      {{Enc::Vop3p, 0x60}, {"v_mfma_f32_32x32x8_bf16", 16, 3, 2, 2, 16}},
+      {{Enc::Vop3p, 0x61}, {"v_mfma_f32_16x16x16_bf16", 4, 3, 2, 2, 4}},
+      // 8-bit floats, A's and B's each fp8 or bf8, eight to a register pair.
+      {{Enc::Vop3p, 0x70}, {"v_mfma_f32_16x16x32_bf8_bf8", 4, 3, 2, 2, 4}},
+      {{Enc::Vop3p, 0x71}, {"v_mfma_f32_16x16x32_bf8_fp8", 4, 3, 2, 2, 4}},
+      {{Enc::Vop3p, 0x72}, {"v_mfma_f32_16x16x32_fp8_bf8", 4, 3, 2, 2, 4}},
+      {{Enc::Vop3p, 0x73}, {"v_mfma_f32_16x16x32_fp8_fp8", 4, 3, 2, 2, 4}},
+      {{Enc::Vop3p, 0x74}, {"v_mfma_f32_32x32x16_bf8_bf8", 16, 3, 2, 2, 16}},
+      {{Enc::Vop3p, 0x75}, {"v_mfma_f32_32x32x16_bf8_fp8", 16, 3, 2, 2, 16}},
+      {{Enc::Vop3p, 0x76}, {"v_mfma_f32_32x32x16_fp8_bf8", 16, 3, 2, 2, 16}},
+      {{Enc::Vop3p, 0x77}, {"v_mfma_f32_32x32x16_fp8_fp8", 16, 3, 2, 2, 16}},
       // The reduced-precision float forms decode, and are refused where they
       // run: what a card rounds their inputs to is not modelled.
       {{Enc::Vop3p, 0x3e}, {"v_mfma_f32_16x16x8_xf32", 4, 3, 2, 2, 4}},
@@ -1010,6 +1072,10 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     // VOP3b also writes a scalar pair: a carry out, or the condition
     // v_div_scale reports.
     if (s.sdst) in.dst.push_back(sgpr((w0 >> 8) & 0x7F, 2));
+    // The 8-bit float conversions say with op_sel which part of the
+    // destination they write: a half (bit 3), or a byte (bits 2 and 3).
+    if (in.name.find("fp8_f32") != std::string::npos || in.name.find("bf8_f32") != std::string::npos)
+      in.op_sel = static_cast<uint8_t>((w0 >> 11) & 0xF);
     const uint32_t neg = (w1 >> 29) & 0x7;
     for (uint32_t k = 0; k < s.srcs; ++k) {
       Operand o = take((w1 >> (9 * k)) & 0x1FF, s.src_width(k));
@@ -1261,6 +1327,15 @@ std::string to_text(const Inst& i) {
     s += " " + dpp_control_text(i.dpp_ctrl) + m;
     if (i.bound_ctrl) s += " bound_ctrl:1";
   }
+  if (i.enc == Enc::Vop3 && i.op_sel) {
+    // A source's bit each, then the destination's (bit 3); the stochastic
+    // conversions print bit 2 in a place of its own, though they have two
+    // sources.
+    const bool byte = i.name.find("_sr_") != std::string::npos;
+    std::string out = " op_sel:[";
+    for (uint32_t k = 0; k < i.src.size() + (byte ? 1 : 0); ++k) out += std::to_string((i.op_sel >> k) & 1) + ",";
+    s += out + std::to_string((i.op_sel >> 3) & 1) + "]";
+  }
   if (i.enc == Enc::Vop3p) {
     // The assembler prints these only where they are not the plain
     // arrangement: every source's low half to the low result, every source's
@@ -1282,7 +1357,10 @@ std::string to_text(const Inst& i) {
   if (i.sdwa) {
     static const char* kParts[8] = {"BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD", "?"};
     static const char* kUnused[4] = {"UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE", "?"};
-    if (i.enc != Enc::Vopc)
+    // A comparison has no destination part to name, and neither has an
+    // 8-bit float widened: the assembler takes none for those.
+    const bool f8 = i.name.find("fp8") != std::string::npos || i.name.find("bf8") != std::string::npos;
+    if (i.enc != Enc::Vopc && !f8)
       s += std::string(" dst_sel:") + kParts[i.dst_sel & 7] + " dst_unused:" + kUnused[i.dst_unused & 3];
     for (size_t k = 0; k < i.src.size(); ++k)
       s += " src" + std::to_string(k) + "_sel:" + kParts[i.src[k].sel & 7];
