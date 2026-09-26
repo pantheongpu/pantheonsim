@@ -40,6 +40,11 @@ echo "wrote $(pwd)/runtime.gfx942"
   sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > cooperative.gfx942.dis
 echo "wrote $(pwd)/cooperative.gfx942, cooperative.gfx942.o and its listing ($(wc -l < cooperative.gfx942.dis) instructions)"
 
+# Streams that run at once: kernels on two streams handing values to each
+# other, events, stream waits, the null stream's ordering, host functions.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 streams.cpp -o streams.gfx942
+echo "wrote $(pwd)/streams.gfx942"
+
 # gfx942's 8-bit floats, converted by the device's instructions and checked
 # against the header's own software conversion on the host.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 fp8.cpp -o fp8.gfx942

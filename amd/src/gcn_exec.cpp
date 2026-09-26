@@ -299,6 +299,7 @@ struct Machine {
       case OperandKind::Literal: return static_cast<uint64_t>(o.value);
       case OperandKind::M0: return w.m0;
       case OperandKind::Vgpr:
+      case OperandKind::Agpr:
       case OperandKind::None: break;
     }
     throw Error::make(Err::Internal, "a scalar operand this does not read");
