@@ -157,6 +157,36 @@ VTEST(a_reduction_through_lds_and_a_barrier_sums_its_group) {
   }
 }
 
+// A work-group's LDS: 64 KB on gfx942, CDNA4's 160 KB on gfx950, as the
+// code object's target says.
+VTEST(a_gfx950_work_group_may_have_160_kb_of_lds_and_a_gfx942_one_64) {
+  amd::CodeObject o = object();
+  const amd::Kernel* k = amd::find_kernel(o, "vector_add");
+  VCHECK(k != nullptr);
+  MemoryManager mem(8ull << 20);
+  const auto run = [&](uint32_t mach, uint32_t lds) -> std::string {
+    o.mach = mach;
+    amd::Dispatch d;
+    d.object = &o;
+    d.kernel = k;
+    d.group_size[0] = 64;
+    d.dynamic_lds = lds;
+    // Arguments all zero: n is 0, and the kernel does nothing.
+    const std::vector<uint8_t> zeros(k->kernarg_size + 64, 0);
+    d.kernarg = mem.alloc(zeros.size());
+    mem.write(d.kernarg, zeros.data(), zeros.size());
+    try {
+      amd::execute(d, mem);
+    } catch (const std::exception& e) {
+      return e.what();
+    }
+    return "ran";
+  };
+  VCHECK_EQ(run(0x4f, 100 * 1024), std::string("ran"));
+  VCHECK_CONTAINS(run(0x4c, 100 * 1024), "past the 65536 a work-group has on gfx942");
+  VCHECK_CONTAINS(run(0x4f, 161 * 1024), "past the 163840 a work-group has on gfx950");
+}
+
 VTEST(a_dispatch_a_kernel_cannot_take_is_refused) {
   const amd::CodeObject o = object();
   amd::Dispatch d;

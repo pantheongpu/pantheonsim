@@ -39,6 +39,8 @@ constexpr uint64_t kSharedBase = 0x1000'0000'0000ull;
 constexpr uint64_t kSharedSize = 1ull << 20;
 // What a CDNA compute unit's LDS holds: no work-group has more.
 constexpr uint64_t kLdsPerComputeUnit = 64 * 1024;
+// The LDS a work-group may have: 64 KB on gfx942, 160 KB on gfx950 (CDNA4).
+uint64_t lds_limit(const Dispatch& d) { return d.object && d.object->gfx950() ? 160 * 1024 : kLdsPerComputeUnit; }
 // And a work-item's private memory, which the wave reads the aperture of from
 // src_private_base: an address in it is an offset into the work-item's own.
 constexpr uint64_t kPrivateBase = 0x1800'0000'0000ull;
@@ -2566,7 +2568,7 @@ struct Machine {
         // rocFFT's real-to-complex kernels count on.
         const uint64_t a = static_cast<uint32_t>(addr + offset);
         if (a + bytes <= g.lds.size()) return &g.lds[a];
-        if (g.lds.empty() && a < kLdsPerComputeUnit)
+        if (g.lds.empty() && a < lds_limit(d))
           throw Error::make(Err::InvalidValue, "an LDS access at ", a, " in a work-group given no LDS: the launch ",
                             "did not pay for the LDS its kernel uses");
         std::memset(outside, 0, sizeof outside);
@@ -3765,7 +3767,7 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
   // A card gives a work-group LDS in 512-byte granules (128 dwords, the
   // unit the descriptor counts it in), so a kernel reading a little past
   // what it asked for still reads its own LDS: rocFFT's kernels do.
-  group.lds.assign(std::min<uint64_t>((group_segment + 511) / 512 * 512, kLdsPerComputeUnit), 0);
+  group.lds.assign(std::min<uint64_t>((group_segment + 511) / 512 * 512, lds_limit(d)), 0);
   // Each work-item's private memory. A kernel that spills says how much
   // it needs; the rest get none.
   group.scratch_per_lane = (k.private_segment + 3) & ~3u;
@@ -3893,9 +3895,9 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   // What the work-group's LDS comes to: what the kernel reserved, and what
   // the launch added.
   const uint64_t group_segment = uint64_t{k.group_segment} + d.dynamic_lds;
-  if (group_segment > (64u << 10))
-    throw Error::make(Err::InvalidValue, "a work-group asking for ", group_segment,
-                      " bytes of LDS is past the 65536 a CDNA work-group has");
+  if (group_segment > lds_limit(d))
+    throw Error::make(Err::InvalidValue, "a work-group asking for ", group_segment, " bytes of LDS is past the ",
+                      lds_limit(d), " a work-group has on ", d.object->gfx950() ? "gfx950" : "gfx942");
 
   // What the kernel is told about its grid, and the packet it may read it
   // from. Both are written before any wave starts.

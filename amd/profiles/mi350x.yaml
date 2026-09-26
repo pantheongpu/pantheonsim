@@ -2,10 +2,9 @@
 # Values from public AMD documentation. verified: false means nothing here has
 # been confirmed by hardware characterization yet -- treat as placeholders.
 #
-# NOTE: AMD execution is NOT implemented. This profile exists for Level 1
-# (discovery) so rocm-smi / rocm_agent_enumerator / lspci report the device.
-# Launching a kernel on it fails with a clear "wavefront size 64 unsupported"
-# error rather than producing wrong answers.
+# Kernels built for gfx950 run on it (amd/README.md, "gfx950"). Its LDS is
+# CDNA4's 160 KB a work-group, the 163840 bytes LLVM's gfx950 target gives
+# as addressable local memory.
 id: amd/mi350x
 vendor: amd
 model: "AMD Instinct MI350X"
@@ -23,15 +22,15 @@ limits:
   max_threads_per_block: 1024
   max_block_dim: [1024, 1024, 1024]
   max_grid_dim: [2147483647, 2147483647, 2147483647]
-  shared_mem_per_block_bytes: 65536
-  shared_mem_per_block_optin_bytes: 65536
+  shared_mem_per_block_bytes: 163840
+  shared_mem_per_block_optin_bytes: 163840
   registers_per_block: 65536
   multiprocessors: 256
   registers_per_sm: 65536
   max_threads_per_sm: 2048
   max_blocks_per_sm: 32
   max_registers_per_thread: 255
-  shared_mem_per_sm: 65536
+  shared_mem_per_sm: 163840
 features:
   fp16: true
   bf16: true
