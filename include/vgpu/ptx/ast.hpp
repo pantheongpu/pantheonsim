@@ -173,7 +173,13 @@ struct OpCvta { Type ty; Space space = Space::Generic; bool to_space = false; Re
 // roundf compile to, so conflating them with the bare modes leaves those
 // intrinsics returning their input.
 enum class Round { None, Rn, Rz, Rm, Rp, Rni, Rzi, Rmi, Rpi };
-struct OpCvt { Type dst_ty; Type src_ty; Round round = Round::None; Reg dst; Operand src; };
+// .sat clamps a float result to [0.0, 1.0] (NaN to +0) and an integer one to
+// the destination's range; .ftz flushes f32 subnormal inputs and results to
+// sign-preserving zero.
+struct OpCvt {
+  Type dst_ty; Type src_ty; Round round = Round::None; Reg dst; Operand src;
+  bool sat = false, ftz = false;
+};
 struct OpNot { Type ty; Reg dst; Operand src; };   // bitwise not
 struct OpNeg { Type ty; Reg dst; Operand src; };   // arithmetic negate (int/float)
 struct OpAbs { Type ty; Reg dst; Operand src; };

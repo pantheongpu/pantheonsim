@@ -457,25 +457,26 @@ double f16_to_double(uint64_t bits) {
 // not much cheaper.
 std::atomic<int> g_directed_rounding{0};
 
-[[gnu::noinline]] uint64_t double_to_f16_exact(double d);
+[[gnu::noinline]] uint64_t double_to_narrow(double d, int man, int ebits);
+
+// NaN in a 16-bit float: what a real GPU writes for every NaN result, whatever
+// the input's payload -- the all-ones pattern below the sign, 0x7FFF for both
+// f16 and bf16 (and 0x7FFFFFFF for f32, which PTX calls canonical).
+inline constexpr uint64_t kCanonicalNaN16 = 0x7FFF;
 
 inline uint64_t double_to_f16(double d) {
   // A normal binary16 result under round-to-nearest-even, done on the bits:
-  // keep the top 10 bits of the double's mantissa and round on the 42 below.
-  // NaN, infinity and overflow are answered the same way the form below
-  // answers them, whatever the rounding mode. That form is kept for what
-  // remains: subnormal results, and anything under a directed mode.
-  if (g_fast_path.load(std::memory_order_relaxed)) {
-    const uint64_t b = std::bit_cast<uint64_t>(d);
-    const uint64_t mag = b & 0x7FFF'FFFF'FFFF'FFFFull;
-    if (mag > 0x7FF0'0000'0000'0000ull) return 0x7E00;             // NaN
-    if (mag >= 0x40EF'FE00'0000'0000ull)                             // >= 65520, or infinity
-      return (static_cast<uint32_t>(b >> 48) & 0x8000u) | 0x7C00;
-  }
+  // keep the top 10 bits of the double's mantissa and round on the 42 below,
+  // with NaN, infinity and overflow answered as the general form answers them.
+  // That form is kept for what remains: subnormal results, and anything under
+  // a directed mode, where overflow can stop at the largest finite value.
   if (g_directed_rounding.load(std::memory_order_relaxed) == 0 &&
       g_fast_path.load(std::memory_order_relaxed)) {
     const uint64_t b = std::bit_cast<uint64_t>(d);
     const uint64_t mag = b & 0x7FFF'FFFF'FFFF'FFFFull;
+    if (mag > 0x7FF0'0000'0000'0000ull) return kCanonicalNaN16;
+    if (mag >= 0x40EF'FE00'0000'0000ull)                             // >= 65520, or infinity
+      return (static_cast<uint32_t>(b >> 48) & 0x8000u) | 0x7C00;
     const int e = static_cast<int>(mag >> 52) - 1023;   // unbiased exponent
     if (e >= -14 && e <= 15) {                            // a normal half, before rounding
       const uint32_t sign = static_cast<uint32_t>(b >> 48) & 0x8000u;
@@ -492,29 +493,42 @@ inline uint64_t double_to_f16(double d) {
       return sign | (e16 << 10) | static_cast<uint32_t>(mant);
     }
   }
-  return double_to_f16_exact(d);
+  return double_to_narrow(d, 10, 5);
 }
 
-[[gnu::noinline]] uint64_t double_to_f16_exact(double d) {
-  if (std::isnan(d)) return 0x7E00;
-  uint32_t sign = std::signbit(d) ? 0x8000u : 0u;
-  double a = std::fabs(d);
-  if (std::isinf(a) || a >= 65520.0) return sign | 0x7C00;  // overflow -> inf
-  if (a < std::ldexp(1.0, -24)) return sign;                // underflow -> zero
+// d rounded to a binary float with `man` stored mantissa bits and `ebits`
+// exponent bits (f16 is 10/5, bf16 7/8), in the host's current rounding mode,
+// subnormals included. The rounding is one nearbyint of d scaled so the
+// result's last place is 1, which is what makes every mode come out right:
+// scaling the magnitude instead rounded -x toward zero under .rm. A value
+// between the smallest subnormal and half of it rounds up to that subnormal;
+// flushing everything below the smallest one to zero lost silu(-20) in f16.
+// Overflow gives infinity only where the mode rounds away from zero; .rz, and
+// .rm/.rp against the sign, stop at the largest finite value.
+[[gnu::noinline]] uint64_t double_to_narrow(double d, int man, int ebits) {
+  const int bias = (1 << (ebits - 1)) - 1;
+  const uint32_t sign = std::signbit(d) ? 1u << (man + ebits) : 0u;
+  const uint32_t inf = ((1u << ebits) - 1) << man;
+  if (std::isnan(d)) return kCanonicalNaN16;
+  if (d == 0) return sign;
+  if (std::isinf(d)) return sign | inf;
   int exp;
-  double frac = std::frexp(a, &exp);  // a = frac * 2^exp, frac in [0.5, 1)
-  int e16 = exp - 1 + 15;             // unbiased exponent + bias
-  if (e16 <= 0) {                     // subnormal
-    uint32_t mant = static_cast<uint32_t>(std::nearbyint(std::ldexp(a, 24)));
-    return sign | (mant & 0x3FF);
+  std::frexp(d, &exp);                          // |d| in [2^(exp-1), 2^exp)
+  int e = std::max(exp - 1, 1 - bias);          // the exponent the result is scaled by
+  uint64_t mant = static_cast<uint64_t>(std::fabs(std::nearbyint(std::ldexp(d, man - e))));
+  if (mant >> (man + 1)) {                      // rounding carried into the next binade
+    mant >>= 1;
+    ++e;
   }
-  uint32_t mant = static_cast<uint32_t>(std::nearbyint((frac * 2.0 - 1.0) * 1024.0));
-  if (mant == 1024) {  // rounding carried into the exponent
-    mant = 0;
-    ++e16;
+  if (e > bias) {
+    const int mode = std::fegetround();
+    const bool to_inf = mode == FE_TONEAREST || (mode == FE_UPWARD && !sign) ||
+                        (mode == FE_DOWNWARD && sign);
+    return sign | (to_inf ? inf : inf - 1);
   }
-  if (e16 >= 31) return sign | 0x7C00;
-  return sign | (static_cast<uint32_t>(e16) << 10) | (mant & 0x3FF);
+  if (mant < (1ull << man)) return sign | static_cast<uint32_t>(mant);  // subnormal
+  return sign | (static_cast<uint32_t>(e + bias) << man) |
+         static_cast<uint32_t>(mant - (1ull << man));
 }
 
 // ---- FP8 -------------------------------------------------------------
@@ -2547,7 +2561,7 @@ class Interpreter {
     const Type& st = op.src_ty;
     const Type& dt = op.dst_ty;
     if (st.is_real() || dt.is_real() || st.kind == Type::Kind::Pred || dt.kind == Type::Kind::Pred ||
-        op.round != Round::None)
+        op.round != Round::None || op.sat || (dt.is_signed() && dt.bits < 32))
       return false;
     Lanes sv;
     const Lanes& v = read_operand(w, ctx, ins, op.src, sv);
@@ -2912,9 +2926,40 @@ class Interpreter {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
+      // .rz/.rm/.rp into a float destination round in that mode, the way
+      // float_bin does it: set the host mode around the conversions. (Into an
+      // integer the mode is applied by round_int instead.)
+      int host_mode = FE_TONEAREST;
+      if (op->dst_ty.is_real())
+        switch (op->round) {
+          case Round::Rz: host_mode = FE_TOWARDZERO; break;
+          case Round::Rm: host_mode = FE_DOWNWARD; break;
+          case Round::Rp: host_mode = FE_UPWARD; break;
+          default: break;
+        }
+      const int prev_round = host_mode == FE_TONEAREST ? 0 : std::fegetround();
+      if (host_mode != FE_TONEAREST) {
+        g_directed_rounding.fetch_add(1, std::memory_order_relaxed);
+        std::fesetround(host_mode);
+      }
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) r[lane] = convert(op, v[lane]);
-      write_reg(w, op->dst, m, r, op->dst_ty.bits);
+      if (host_mode != FE_TONEAREST) {
+        std::fesetround(prev_round);
+        g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
+      }
+      // A signed integer type narrower than the register is sign-extended
+      // into it (PTX's rule for destination operands): cvt.s8.s32 of 0xFF
+      // leaves 0xFFFFFFFF.
+      const Type& dt = op->dst_ty;
+      if (dt.is_signed() && !dt.is_real() && dt.bits < 32) {
+        const uint64_t sign = uint64_t{1} << (dt.bits - 1), mask = (sign << 1) - 1;
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if ((m & (Mask{1} << lane)) && (r[lane] & sign)) r[lane] |= ~mask;
+        write_reg(w, op->dst, m, r, op->dst.wide ? 64 : 32);
+        return;
+      }
+      write_reg(w, op->dst, m, r, dt.bits);
       return;
     }
     if (const auto* op = std::get_if<OpAtom>(&ins.op)) {
@@ -5461,8 +5506,12 @@ class Interpreter {
   }
   static uint64_t double_to_bf16(double x) {
     const float f = static_cast<float>(x);
+    if (std::isnan(f)) return kCanonicalNaN16;
+    // A directed mode, or a double that is not already a float (rounding it to
+    // float first could round twice), takes the general form.
+    if (g_directed_rounding.load(std::memory_order_relaxed) != 0 || static_cast<double>(f) != x)
+      return double_to_narrow(x, 7, 8);
     const uint32_t bits = std::bit_cast<uint32_t>(f);
-    if (std::isnan(f)) return (bits >> 16) | 0x0040u;  // keep it quiet
     // Round to nearest, ties to even, on the 16 bits being dropped.
     const uint32_t lsb = (bits >> 16) & 1u;
     const uint32_t rounded = bits + 0x7fffu + lsb;
@@ -5492,9 +5541,20 @@ class Interpreter {
           default:
             break;
         }
+        const auto subnormal32 = [](double v) {
+          return v != 0 && std::fabs(v) < static_cast<double>(std::numeric_limits<float>::min());
+        };
+        if (op->ftz && s.bits == 32 && !s.is_bfloat() && subnormal32(x)) x = std::copysign(0.0, x);
+        if (op->sat) x = x > 1 ? 1.0 : x > 0 ? x : 0.0;   // NaN and -0 become +0
         if (d.is_bfloat()) return double_to_bf16(x);
         if (d.bits == 16) return double_to_f16(x);
-        return d.bits == 32 ? f32bits(static_cast<float>(x)) : f64bits(x);
+        if (d.bits == 64) return f64bits(x);
+        const float f = static_cast<float>(x);
+        if (op->ftz && subnormal32(f)) return f32bits(std::copysign(0.0f, f));
+        // f32 to f32 goes through the float pipeline, which writes the
+        // canonical NaN; a narrowing cvt.f32.f64 keeps the payload.
+        if (std::isnan(f) && s.bits == 32) return 0x7FFF'FFFFu;
+        return f32bits(f);
       }
       // float -> int: round then clamp to the destination range.
       double rounded = round_int(x, op->round == Round::None ? Round::Rzi : op->round);
@@ -5527,6 +5587,22 @@ class Interpreter {
       if (d.is_bfloat()) return double_to_bf16(x);
       if (d.bits == 16) return double_to_f16(x);
       return d.bits == 32 ? f32bits(static_cast<float>(x)) : f64bits(x);
+    }
+    if (op->sat && d.bits < 64) {
+      // Clamp to the destination's range, reading the source with its own
+      // signedness: cvt.sat.u32.s32 of -1 is 0, cvt.sat.s32.u32 of
+      // 0xFFFFFFFF is INT32_MAX.
+      const bool neg = s.is_signed() && static_cast<int64_t>(sv) < 0;
+      const uint64_t hi = d.is_signed() ? (uint64_t{1} << (d.bits - 1)) - 1 : (uint64_t{1} << d.bits) - 1;
+      if (neg) {
+        const int64_t lo = d.is_signed() ? -(int64_t{1} << (d.bits - 1)) : 0;
+        if (static_cast<int64_t>(sv) < lo) sv = static_cast<uint64_t>(lo);
+      } else if (sv > hi) {
+        sv = hi;
+      }
+    } else if (op->sat && d.bits == 64 && s.is_signed() != d.is_signed()) {
+      if (s.is_signed() && static_cast<int64_t>(sv) < 0) sv = 0;   // s64 -> u64
+      else if (!s.is_signed() && sv >> 63) sv = uint64_t{INT64_MAX};  // u64 -> s64
     }
     return mask_to_bits(sv, d.bits);  // int -> int: truncate/extend
   }

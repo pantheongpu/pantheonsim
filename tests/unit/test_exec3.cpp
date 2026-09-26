@@ -755,6 +755,107 @@ VTEST(dp2a_halves_against_bytes) {
   VCHECK_EQ(r[2], 18);
 }
 
+// cvt's modifiers and edge cases, against a table recorded on a real RTX 3060
+// (sm_86) running this same instruction sequence: fp16/bf16 results that are
+// subnormal, tied, overflowing or NaN; .rz; .sat on float destinations (clamp
+// to [0, 1], NaN and -0 to +0) and on int -> int (clamp to the destination
+// range, by the source's signedness); .ftz; the canonical NaNs (0x7FFF for
+// 16-bit results, 0x7FFFFFFF out of f32 -> f32); and a signed 8-bit result
+// sign-extended into its 32-bit register. CUTLASS's silu epilogue lost
+// silu(-20) to the old flush of tiny f16 results, and its expf leans on
+// cvt.sat.f32.f32, which was passed through unclamped.
+VTEST(cvt_modifiers_match_hardware) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry cv(.param .u64 p, .param .u32 av)
+{
+  .reg .b16 %rs<5>;
+  .reg .b32 %r<24>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  ld.param.u32 %r1, [av];
+  cvta.to.global.u64 %rd2, %rd1;
+  cvt.rn.f16.f32 %rs1, %r1;
+  cvt.u32.u16 %r2, %rs1;
+  st.global.u32 [%rd2], %r2;
+  cvt.rn.bf16.f32 %rs2, %r1;
+  cvt.u32.u16 %r3, %rs2;
+  st.global.u32 [%rd2+4], %r3;
+  cvt.rz.f16.f32 %rs3, %r1;
+  cvt.u32.u16 %r4, %rs3;
+  st.global.u32 [%rd2+8], %r4;
+  cvt.rn.sat.f16.f32 %rs4, %r1;
+  cvt.u32.u16 %r5, %rs4;
+  st.global.u32 [%rd2+12], %r5;
+  cvt.ftz.f32.f32 %r6, %r1;
+  st.global.u32 [%rd2+16], %r6;
+  cvt.sat.f32.f32 %r7, %r1;
+  st.global.u32 [%rd2+20], %r7;
+  cvt.rzi.ftz.sat.f32.f32 %r8, %r1;
+  st.global.u32 [%rd2+24], %r8;
+  cvt.sat.s8.s32 %r9, %r1;
+  st.global.u32 [%rd2+28], %r9;
+  cvt.sat.u8.s32 %r10, %r1;
+  st.global.u32 [%rd2+32], %r10;
+  cvt.sat.s16.u32 %r11, %r1;
+  st.global.u32 [%rd2+36], %r11;
+  cvt.sat.u32.s32 %r12, %r1;
+  st.global.u32 [%rd2+40], %r12;
+  cvt.sat.s32.u32 %r13, %r1;
+  st.global.u32 [%rd2+44], %r13;
+  cvt.s8.s32 %r14, %r1;
+  st.global.u32 [%rd2+48], %r14;
+  ret;
+}
+)";
+  struct Row {
+    uint32_t in;
+    std::array<uint32_t, 13> want;
+  };
+  const Row rows[] = {
+    {0x80000000u, {0x00008000u, 0x00008000u, 0x00008000u, 0x00000000u, 0x80000000u, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u}},
+    {0x3f800001u, {0x00003c00u, 0x00003f80u, 0x00003c00u, 0x00003c00u, 0x3f800001u, 0x3f800000u, 0x3f800000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x3f800001u, 0x3f800001u, 0x00000001u}},
+    {0xbf800000u, {0x0000bc00u, 0x0000bf80u, 0x0000bc00u, 0x00000000u, 0xbf800000u, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u}},
+    {0x7f800000u, {0x00007c00u, 0x00007f80u, 0x00007c00u, 0x00003c00u, 0x7f800000u, 0x3f800000u, 0x3f800000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x7f800000u, 0x7f800000u, 0x00000000u}},
+    {0xffc00001u, {0x00007fffu, 0x00007fffu, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000001u}},
+    {0x33000001u, {0x00000001u, 0x00003300u, 0x00000000u, 0x00000001u, 0x33000001u, 0x33000001u, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x33000001u, 0x33000001u, 0x00000001u}},
+    {0xb3206867u, {0x00008001u, 0x0000b320u, 0x00008000u, 0x00000000u, 0xb3206867u, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000067u}},
+    {0x33000000u, {0x00000000u, 0x00003300u, 0x00000000u, 0x00000000u, 0x33000000u, 0x33000000u, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x33000000u, 0x33000000u, 0x00000000u}},
+    {0x337fffffu, {0x00000001u, 0x00003380u, 0x00000000u, 0x00000001u, 0x337fffffu, 0x337fffffu, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x337fffffu, 0x337fffffu, 0xffffffffu}},
+    {0x3effffffu, {0x00003800u, 0x00003f00u, 0x000037ffu, 0x00003800u, 0x3effffffu, 0x3effffffu, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x3effffffu, 0x3effffffu, 0xffffffffu}},
+    {0x477fe000u, {0x00007bffu, 0x00004780u, 0x00007bffu, 0x00003c00u, 0x477fe000u, 0x3f800000u, 0x3f800000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x477fe000u, 0x477fe000u, 0x00000000u}},
+    {0x477ff000u, {0x00007c00u, 0x00004780u, 0x00007bffu, 0x00003c00u, 0x477ff000u, 0x3f800000u, 0x3f800000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x477ff000u, 0x477ff000u, 0x00000000u}},
+    {0xc7800000u, {0x0000fc00u, 0x0000c780u, 0x0000fbffu, 0x00000000u, 0xc7800000u, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u}},
+    {0xc2200000u, {0x0000d100u, 0x0000c220u, 0x0000d100u, 0x00000000u, 0xc2200000u, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u}},
+    {0x00000001u, {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000001u, 0x00000000u, 0x00000001u, 0x00000001u, 0x00000001u, 0x00000001u, 0x00000001u, 0x00000001u}},
+    {0x807fffffu, {0x00008000u, 0x00008080u, 0x00008000u, 0x00000000u, 0x80000000u, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0xffffffffu}},
+    {0x3f000000u, {0x00003800u, 0x00003f00u, 0x00003800u, 0x00003800u, 0x3f000000u, 0x3f000000u, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x3f000000u, 0x3f000000u, 0x00000000u}},
+    {0x00000080u, {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000080u, 0x00000000u, 0x0000007fu, 0x00000080u, 0x00000080u, 0x00000080u, 0x00000080u, 0xffffff80u}},
+    {0x0000007fu, {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x0000007fu, 0x00000000u, 0x0000007fu, 0x0000007fu, 0x0000007fu, 0x0000007fu, 0x0000007fu, 0x0000007fu}},
+    {0xffffff80u, {0x00007fffu, 0x00007fffu, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0xffffff80u}},
+    {0xffffff7fu, {0x00007fffu, 0x00007fffu, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x0000007fu}},
+    {0x00008000u, {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00008000u, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x00008000u, 0x00008000u, 0x00000000u}},
+    {0x7fffffffu, {0x00007fffu, 0x00007fffu, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x7fffffffu, 0x7fffffffu, 0xffffffffu}},
+    {0x38800000u, {0x00000400u, 0x00003880u, 0x00000400u, 0x00000400u, 0x38800000u, 0x38800000u, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x38800000u, 0x38800000u, 0x00000000u}},
+  };
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(13 * 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  for (const Row& row : rows) {
+    std::vector<uint8_t> pa(8), aa(4);
+    std::memcpy(pa.data(), &out, 8);
+    std::memcpy(aa.data(), &row.in, 4);
+    exec::launch(m.entries[0], cfg, {pa, aa}, mem, prof);
+    std::array<uint32_t, 13> got{};
+    mem.read(out, got.data(), 13 * 4);
+    for (int j = 0; j < 13; ++j) VCHECK_EQ(got[j], row.want[j]);
+  }
+}
+
 // dp4a is the four-way byte dot product quantized inference is built on, so a
 // wrong answer here corrupts every quantized matmul while still producing
 // plausible-looking output. Concrete values, checked by hand.

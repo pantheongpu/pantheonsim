@@ -1459,7 +1459,7 @@ class Parser {
       std::vector<Type> tys;
       std::string packed;  // "f16x2"/"bf16x2": two f32 sources packed into one register
       std::string fp8;     // "e4m3x2"/"e5m2x2": the FP8 side of the conversion
-      bool satfinite = false;
+      bool satfinite = false, sat = false, ftz = false;
       Round round = Round::None;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
@@ -1471,7 +1471,8 @@ class Parser {
         else if (p == "rzi") round = Round::Rzi;
         else if (p == "rmi") round = Round::Rmi;
         else if (p == "rpi") round = Round::Rpi;
-        else if (p == "sat" || p == "ftz") ;  // saturation/flush handled conservatively below
+        else if (p == "sat") sat = true;
+        else if (p == "ftz") ftz = true;
         else if (p == "f16x2" || p == "bf16x2") packed = p;
         else if (p == "e4m3x2" || p == "e5m2x2") fp8 = p;
         else if (p == "satfinite") satfinite = true;
@@ -1528,6 +1529,8 @@ class Parser {
       op.dst_ty = tys[0];
       op.src_ty = tys[1];
       op.round = round;
+      op.sat = sat;
+      op.ftz = ftz;
       op.dst = expect_reg_operand("cvt destination");
       expect_punct(",");
       op.src = parse_operand();
@@ -1719,6 +1722,13 @@ class Parser {
           op.atype = types[1];
           op.btype = types[2];
           op.ctype = types[3];
+        } else if (types.size() == 3) {
+          // .dtype.atype.btype with the accumulator left off, which the parser
+          // has always taken to mean ctype = dtype (every non-f16 form has
+          // them equal anyway).
+          op.dtype = op.ctype = types[0];
+          op.atype = types[1];
+          op.btype = types[2];
         } else {
           return unsupported("wmma.mma types (.dtype.ctype, or .dtype.atype.btype.ctype)");
         }
