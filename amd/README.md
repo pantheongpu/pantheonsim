@@ -239,6 +239,28 @@ a lock striped by address, and a fence (`buffer_wbl2`, `buffer_inv`) is a
 fence on the host. `amd_exec_bench` (`tools/exec-bench.cpp`) says how fast a
 kernel runs on the interpreter.
 
+## HSA
+
+The same library is also the HSA runtime (`src/hsa_api.cpp`, declared in
+`include/vgpu/hsa_abi.h` from the HSA Foundation's specification and AMD's
+documented extensions). `build/shim/libhsa-runtime64.so.1` names it, so a
+program that uses HSA and HIP together sees one set of devices and one memory.
+A program finds a CPU agent and one GPU agent per simulated device, allocates
+from their memory pools (or the older regions), loads a code object into an
+executable, and dispatches kernels by writing AQL packets into a queue and
+ringing its doorbell. Each queue has a packet processor on a host thread of
+its own. It runs kernel dispatches in order, holds on barrier-AND and
+barrier-OR packets until their signals reach zero, and decrements each
+packet's completion signal when it is done. `hsa_amd_memory_async_copy` waits
+on its dependency signals the same way. Memory from the CPU's pools
+(fine-grained, and kernarg) is reachable from every device's kernels at its
+own address. Memory from a GPU's pool belongs to that device, and the host
+reaches it by copying. Every function carries ROCm's symbol version
+(`ROCR_1`). `tests/hsa/hsa_dispatch.c` is built against this header, and
+against ROCm's `hsa.h` where that is installed, and both builds run
+(ctest `amd_hsa`). A grid that is not a whole number of work-groups is not
+run yet: the queue's callback is told.
+
 ## Profiling
 
 AMD's profiler, `rocprofv3`, runs unmodified on a simulated GPU. It is a front

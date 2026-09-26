@@ -35,6 +35,10 @@ struct Kernel {
   std::string name;                       // "vector_add"
   uint64_t entry = 0;                     // where its code starts in the object's .text
   uint64_t size = 0;                      // how long its code is, where the object says
+  // Where its kernel descriptor is: in a linked object, an address from the
+  // image's start, which placed on a device is what HSA calls the kernel
+  // object -- the handle an AQL dispatch packet names the kernel by.
+  uint64_t descriptor = 0;
   uint32_t kernarg_size = 0;
   uint32_t kernarg_align = 8;
   uint32_t group_segment = 0;             // LDS the kernel reserves, bytes

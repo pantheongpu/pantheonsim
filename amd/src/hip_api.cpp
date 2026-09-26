@@ -41,6 +41,7 @@
 #include "vgpu/hip_abi.hpp"
 #include "vgpu/hip_profiler.hpp"
 #include "hip_queue.hpp"
+#include "hip_shared.hpp"
 #include "vgpu_hip.h"
 
 namespace {
@@ -234,7 +235,6 @@ struct State {
   std::vector<std::unique_ptr<Module>> modules;
   std::vector<std::unique_ptr<Function>> functions;
   std::vector<std::unique_ptr<FatBinary>> fat_binaries;
-  // Each bundle read, by where it is: a library's binaries can share one.
   // A program's bundles, read once for each target a device of it runs:
   // only that target's code is kept (vgpu/amd_bundle.hpp).
   std::map<std::pair<const uint8_t*, std::string>, std::unique_ptr<vgpu::amd::Bundle>> bundles;
@@ -474,6 +474,9 @@ struct LaunchJob {
   vgpu::amd::Hostcall* hostcall = nullptr;
   std::vector<vgpu::MemoryManager*> peers;
   std::string profile_id;
+  // Arguments the caller has already placed on the device (an HSA dispatch
+  // packet's kernarg_address), used where they are rather than copied.
+  uint64_t kernarg_at = 0;
 };
 
 hipError_t prepare_launch(State& s, int ordinal, const Module& module, const Kernel& kernel,
@@ -552,11 +555,15 @@ hipError_t run_launch(const LaunchJob& job) {
     // kernarg memory padded well beyond what they declare, and the compiler
     // counts on it, widening a scalar load of the last arguments past the
     // segment's size (rocBLAS's rotmg reads 32 bytes at 0x60 of 124).
-    const size_t padded = (args.size() + 63) / 64 * 64 + 64;
-    kernarg = mem.alloc(padded);
-    std::vector<uint8_t> segment(padded, 0);
-    std::copy(args.begin(), args.end(), segment.begin());
-    mem.write(kernarg, segment.data(), segment.size());
+    if (job.kernarg_at) {
+      kernarg = job.kernarg_at;
+    } else {
+      const size_t padded = (args.size() + 63) / 64 * 64 + 64;
+      kernarg = mem.alloc(padded);
+      std::vector<uint8_t> segment(padded, 0);
+      std::copy(args.begin(), args.end(), segment.begin());
+      mem.write(kernarg, segment.data(), segment.size());
+    }
     if (cooperative) {
       // What the device library's grid barrier counts on (ockl's mg_info): a
       // grid of one, its work-groups, its work-items, and a counter for a
@@ -611,7 +618,7 @@ hipError_t run_launch(const LaunchJob& job) {
       prof->launched(launch, &stats, start, vgpu::amd::hipprof::now_ns(), token);
       prof = nullptr;   // told
     }
-    mem.free(kernarg);
+    if (!job.kernarg_at) mem.free(kernarg);
     if (grid_sync) mem.free(grid_sync);
     // What the device spent, as telemetry reports a kernel: the instructions
     // a wave retires, at the profile's clock.
@@ -621,7 +628,7 @@ hipError_t run_launch(const LaunchJob& job) {
   } catch (const std::exception& e) {
     // A launch that failed counted nothing, and the profiler is told so.
     if (prof && prof->launched && start) prof->launched(launch, nullptr, start, vgpu::amd::hipprof::now_ns(), token);
-    for (uint64_t a : {kernarg, grid_sync})
+    for (uint64_t a : {job.kernarg_at ? 0 : kernarg, grid_sync})
       if (a) {
         try {
           mem.free(a);
@@ -3536,3 +3543,128 @@ hipError_t hipIpcOpenEventHandle(hipEvent_t*, vgpu::amd::abi::IpcMemHandle) {
 }
 
 }  // extern "C"
+
+// ---- What the HSA runtime takes from this one (hip_shared.hpp) -------------
+
+namespace vgpu::amd::shared {
+
+struct Loaded : Module {};
+namespace {
+std::vector<std::unique_ptr<Loaded>> g_loaded;   // under State's mutex
+}  // namespace
+
+bool start(std::string* why) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (ensure_runtime(s) == hipSuccess) return true;
+  if (why) *why = "no AMD GPU to run on (VGPU_GPU names an amd/ profile)";
+  return false;
+}
+int device_count() { return state().rt ? state().rt->device_count() : 0; }
+const DeviceProfile& profile(int ordinal) { return state().rt->device(ordinal).profile(); }
+MemoryManager& memory(int ordinal) { return state().rt->device(ordinal).memory(); }
+
+const Loaded* load(int ordinal, const void* bytes, size_t size, std::string* why) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (ensure_runtime(s) != hipSuccess || ordinal < 0 || ordinal >= s.rt->device_count()) {
+    if (why) *why = "no such device";
+    return nullptr;
+  }
+  try {
+    auto m = std::make_unique<Loaded>();
+    m->object = load_code_object(std::string(static_cast<const char*>(bytes), size), "the code object");
+    vgpu::runtime::Device& d = s.rt->device(ordinal);
+    place(*m, d.memory());
+    report_loaded(*m, ordinal, bytes, size);
+    g_loaded.push_back(std::move(m));
+    return g_loaded.back().get();
+  } catch (const std::exception& e) {
+    if (why) *why = e.what();
+    return nullptr;
+  }
+}
+
+void unload(const Loaded* m) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  for (size_t i = 0; i < g_loaded.size(); ++i)
+    if (g_loaded[i].get() == m) {
+      for (int d = 0; d < s.rt->device_count(); ++d)
+        if (m->globals && s.rt->device(d).memory().owns(m->globals)) {
+          try {
+            s.rt->device(d).memory().free(m->globals);
+          } catch (const std::exception&) {
+          }
+        }
+      g_loaded.erase(g_loaded.begin() + static_cast<long>(i));
+      return;
+    }
+}
+
+const CodeObject& object(const Loaded* m) { return m->object; }
+uint64_t code_base(const Loaded* m) { return m->code_base; }
+
+bool run(int ordinal, const Loaded* m, const Kernel& k, const uint32_t groups[3], const uint32_t group_size[3],
+         uint32_t dynamic_lds, uint64_t kernarg, std::string* why) {
+  State& s = state();
+  LaunchJob job;
+  {
+    std::lock_guard<std::mutex> lock(s.mutex);
+    const hipError_t e = prepare_launch(s, ordinal, *m, k, {groups[0], groups[1], groups[2]},
+                                        {group_size[0], group_size[1], group_size[2]}, dynamic_lds, {}, nullptr,
+                                        false, &job);
+    if (e != hipSuccess) {
+      if (why) *why = hipGetErrorString(e);
+      return false;
+    }
+  }
+  job.kernarg_at = kernarg;
+  const hipError_t e = run_launch(job);
+  if (e != hipSuccess && why) *why = "the kernel " + k.name + " failed";
+  return e == hipSuccess;
+}
+
+void map_host(void* p, size_t n) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (ensure_runtime(s) == hipSuccess) map_host_everywhere(s, p, n);
+}
+void unmap_host(void* p) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (s.rt) unmap_host_everywhere(s, p);
+}
+
+bool copy(void* dst, const void* src, size_t n, std::string* why) {
+  State& s = state();
+  vgpu::MemoryManager *to = nullptr, *from = nullptr;
+  const uint64_t dst_va = reinterpret_cast<uint64_t>(dst), src_va = reinterpret_cast<uint64_t>(src);
+  {
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (ensure_runtime(s) != hipSuccess) return false;
+    for (int i = 0; i < s.rt->device_count(); ++i) {
+      if (s.rt->device(i).memory().owns(dst_va)) to = &s.rt->device(i).memory();
+      if (s.rt->device(i).memory().owns(src_va)) from = &s.rt->device(i).memory();
+    }
+  }
+  try {
+    if (to && from) {
+      std::vector<uint8_t> buf(n);
+      from->read(src_va, buf.data(), n);
+      to->write(dst_va, buf.data(), n);
+    } else if (to) {
+      to->write(dst_va, src, n);
+    } else if (from) {
+      from->read(src_va, dst, n);
+    } else {
+      std::memmove(dst, src, n);
+    }
+  } catch (const std::exception& e) {
+    if (why) *why = e.what();
+    return false;
+  }
+  return true;
+}
+
+}  // namespace vgpu::amd::shared

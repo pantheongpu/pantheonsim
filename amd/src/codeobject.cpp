@@ -164,6 +164,7 @@ struct Descriptor {
   int64_t entry_offset = 0;
   uint32_t rsrc1 = 0, rsrc2 = 0;
   uint16_t properties = 0;
+  uint64_t at = 0;   // the .kd symbol's value: its address, in a linked object
 };
 
 }  // namespace
@@ -292,6 +293,7 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
       d.rsrc1 = r.u32(kd + 48);
       d.rsrc2 = r.u32(kd + 52);
       d.properties = r.u16(kd + 56);
+      d.at = value;
       descriptors[name.substr(0, name.size() - 3)] = d;
     }
   }
@@ -396,6 +398,7 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     }
     if (kern.entry < out.text_addr || kern.entry - out.text_addr > out.text.size())
       throw Error::make(Err::ProfileParse, origin, ": kernel ", kern.name, " starts outside .text");
+    kern.descriptor = d.at;
     if (!kern.kernarg_size) kern.kernarg_size = d.kernarg_size;
     if (!kern.group_segment) kern.group_segment = d.group_segment;
     if (!kern.private_segment) kern.private_segment = d.private_segment;
