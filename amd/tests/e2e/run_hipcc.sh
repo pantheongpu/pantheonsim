@@ -144,6 +144,16 @@ expect "every float narrows to the fp8 and bf8 HIP's header gives, every way" "1
 expect "every fp8 and bf8 widens to the float HIP's header gives" "4 of 4 ways right" \
   "$(grep -c '^[bf][fp]8 to floats.*: 0 of 256 wrong$' <<< "$out") of 4 ways right"
 
+# gfx950's (MI350X), which are the OCP formats: E4M3 with a negative zero and
+# no infinity, E5M2 with both. The same instructions, meaning these.
+out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/fp8.gfx950" 2>&1)
+status=$?
+expect "gfx950's 8-bit float program runs to the end" "0" "$status"
+expect "every float narrows to the OCP fp8 and bf8 HIP's header gives, every way" "12 of 12 ways right" \
+  "$(grep -c '^floats to .*: 0 of 4096 wrong$' <<< "$out") of 12 ways right"
+expect "every OCP fp8 and bf8 widens to the float HIP's header gives" "4 of 4 ways right" \
+  "$(grep -c '^[bf][fp]8 to floats.*: 0 of 256 wrong$' <<< "$out") of 4 ways right"
+
 # Streams that run at once, as a card's do (hipcc/streams.cpp). Each waiting
 # kernel gives up after a bounded time, so a runtime that ran the streams one
 # after another fails these rather than hanging.

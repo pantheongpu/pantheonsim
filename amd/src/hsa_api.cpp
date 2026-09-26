@@ -921,7 +921,8 @@ hsa_status_t hsa_amd_memory_pool_get_info(hsa_amd_memory_pool_t pool, hsa_amd_me
   if (!pool_of(pool.handle, &id)) return HSA_STATUS_ERROR_INVALID_MEMORY_POOL;
   if (!value) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
   const bool device = id.kind == PoolKind::Device, group = id.kind == PoolKind::Group;
-  const uint64_t size = group    ? kLdsBytes
+  const uint64_t lds = shared::profile(gpu_of(id.agent) >= 0 ? gpu_of(id.agent) : 0).limits.shared_mem_per_block;
+  const uint64_t size = group    ? (lds ? lds : kLdsBytes)
                         : device ? shared::profile(gpu_of(id.agent)).vram_bytes
                                  : static_cast<uint64_t>(sysconf(_SC_PHYS_PAGES)) * sysconf(_SC_PAGESIZE);
   switch (attribute) {

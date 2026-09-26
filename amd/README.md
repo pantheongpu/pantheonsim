@@ -239,6 +239,26 @@ a lock striped by address, and a fence (`buffer_wbl2`, `buffer_inv`) is a
 fence on the host. `amd_exec_bench` (`tools/exec-bench.cpp`) says how fast a
 kernel runs on the interpreter.
 
+## gfx950 (MI350X)
+
+`VGPU_GPU=amd/mi350x` runs code built for gfx950. PyTorch's own kernels and
+hipBLASLt's, rocBLAS's and MIOpen's gfx950 builds pass the same 20 PyTorch
+checks as gfx942 (ctest `amd_pytorch_mi350x`). What gfx950 adds is
+modelled:
+
+- **Instructions:**
+  - `v_bitop3` (any function of three inputs, by a truth table)
+  - the packed float-to-half and float-to-bfloat16 conversions
+  - `v_permlane16_swap` and `v_permlane32_swap`
+  - `v_cvt_f32_bf16`
+  - the bfloat16 dot products
+  - the matrix instructions with K doubled (f16, bf16, int8)
+  - the `f8f6f4` ones, whose sources are fp8, bf8, fp6, bf6 or fp4, as each one's CBSZ or BLGP says
+- **8-bit floats:** the same fp8 instructions mean the OCP formats on gfx950 (E4M3 and E5M2), where gfx942's are FNUZ. Which one applies is read from the code object's target. `tests/hipcc/fp8.cpp`, built for each, checks every conversion against HIP's own software one.
+- **Not yet modelled:** the scaled matrix instructions (`v_mfma_scale_*`) and `v_prng_b32` are refused.
+- **Decoder check:** `tests/data/isa_corpus_gfx950.txt` holds every instruction shape PyTorch's, hipBLASLt's and rocBLAS's gfx950 code uses. The decoder must print each one as `llvm-objdump` does.
+- **Extracting code objects:** `amd_fatbin_extract` (`tools/fatbin-extract.cpp`) writes out what a library carries for one target, which is how that corpus is gathered.
+
 ## Textures
 
 The GPUs modelled here, the MI300 family (gfx942 and gfx950), have no texture

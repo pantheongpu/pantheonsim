@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 ORDER = ['hip_4.2', 'hip_4.3', 'hip_4.4', 'hip_4.5', 'hip_5.0', 'hip_5.1', 'hip_5.2', 'hip_5.3', 'hip_5.5',
-         'hip_5.6', 'hip_6.0', 'hip_6.1', 'hip_6.2', 'hip_6.4', 'hip_6.5']
+         'hip_5.6', 'hip_6.0', 'hip_6.1', 'hip_6.2', 'hip_6.4', 'hip_6.5', 'hip_7.1', 'hip_7.2']
 
 HEADER = '''/* The symbol versions libamdhip64 defines, as ROCm 7.1's own library defines them.
  *

@@ -39,6 +39,8 @@ constexpr uint64_t kSharedBase = 0x1000'0000'0000ull;
 constexpr uint64_t kSharedSize = 1ull << 20;
 // What a CDNA compute unit's LDS holds: no work-group has more.
 constexpr uint64_t kLdsPerComputeUnit = 64 * 1024;
+// The LDS a work-group may have: 64 KB on gfx942, 160 KB on gfx950 (CDNA4).
+uint64_t lds_limit(const Dispatch& d) { return d.object && d.object->gfx950() ? 160 * 1024 : kLdsPerComputeUnit; }
 // And a work-item's private memory, which the wave reads the aperture of from
 // src_private_base: an address in it is an offset into the work-item's own.
 constexpr uint64_t kPrivateBase = 0x1800'0000'0000ull;
@@ -388,36 +390,65 @@ struct Machine {
     return bits;
   }
 
-  // The 8-bit floats as gfx942 has them, the forms without infinities or a
-  // negative zero ("FNUZ"): fp8 with four exponent bits (bias 8) and three
-  // of mantissa, bf8 with five (bias 16) and two. 0x80 is the one NaN, and
-  // 0x7f the largest value in each.
+  // The small floats. gfx942's 8-bit ones are the forms without infinities
+  // or a negative zero ("FNUZ"): fp8 with four exponent bits (bias 8) and
+  // three of mantissa, bf8 with five (bias 16) and two; 0x80 is the one NaN,
+  // and 0x7f the largest value. gfx950's are the OCP formats every other
+  // vendor has: E4M3 (bias 7, largest 448; S.1111.111 its NaN, no infinity)
+  // and E5M2 (bias 15, IEEE-like: an all-ones exponent is infinity or NaN).
+  // gfx950's matrix instructions also take 6- and 4-bit floats, all finite:
+  // FP6 E2M3, BF6 E3M2 and FP4 E2M1. The rules are those of HIP's software
+  // conversion (amd_hip_fp8.h), which is how AMD says the hardware rounds.
   struct F8 {
     int mant, bias;
     double max;
+    enum Style { Fnuz, OcpE4M3, OcpE5M2, Finite } style;
+    int bits;
   };
-  static constexpr F8 kFp8{3, 8, 240.0}, kBf8{2, 16, 57344.0};
-  static float f8_to_float(uint32_t byte, const F8& t) {
-    byte &= 0xFF;
-    if (byte == 0x80) return std::numeric_limits<float>::quiet_NaN();
-    const int e = static_cast<int>(byte & 0x7F) >> t.mant, m = static_cast<int>(byte) & ((1 << t.mant) - 1);
-    const float mag = e == 0 ? std::ldexp(static_cast<float>(m), 1 - t.bias - t.mant)
-                             : std::ldexp(static_cast<float>((1 << t.mant) | m), e - t.bias - t.mant);
-    return byte & 0x80 ? -mag : mag;
+  static constexpr F8 kFp8{3, 8, 240.0, F8::Fnuz, 8}, kBf8{2, 16, 57344.0, F8::Fnuz, 8},
+      kOcpFp8{3, 7, 448.0, F8::OcpE4M3, 8}, kOcpBf8{2, 15, 57344.0, F8::OcpE5M2, 8}, kFp6{3, 1, 7.5, F8::Finite, 6},
+      kBf6{2, 3, 28.0, F8::Finite, 6}, kFp4{1, 1, 6.0, F8::Finite, 4};
+  // The 8-bit formats the code's processor has.
+  const F8& fp8() const { return d.object->gfx950() ? kOcpFp8 : kFp8; }
+  const F8& bf8() const { return d.object->gfx950() ? kOcpBf8 : kBf8; }
+  static float f8_to_float(uint32_t v, const F8& t) {
+    const uint32_t sign_bit = 1u << (t.bits - 1);
+    v &= (sign_bit << 1) - 1;
+    const uint32_t mag = v & (sign_bit - 1);
+    if (t.style == F8::Fnuz && v == sign_bit) return std::numeric_limits<float>::quiet_NaN();
+    if (t.style == F8::OcpE4M3 && mag == 0x7F) return std::numeric_limits<float>::quiet_NaN();
+    if (t.style == F8::OcpE5M2 && (mag >> 2) == 0x1F) {
+      if (mag & 3) return std::numeric_limits<float>::quiet_NaN();
+      return v & sign_bit ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
+    }
+    const int e = static_cast<int>(mag) >> t.mant, m = static_cast<int>(mag) & ((1 << t.mant) - 1);
+    const float x = e == 0 ? std::ldexp(static_cast<float>(m), 1 - t.bias - t.mant)
+                           : std::ldexp(static_cast<float>((1 << t.mant) | m), e - t.bias - t.mant);
+    return v & sign_bit ? -x : x;
   }
   // A float narrowed to one, rounded to nearest with ties to even -- or,
   // given random bits, stochastically: the bits the narrowing drops (the
-  // float's 23 - mantissa lowest, counted where an 8-bit float's last
+  // float's 23 - mantissa lowest, counted where the small float's last
   // mantissa bit falls) have the random ones added before they are cut
-  // off. A float past the largest value -- before any rounding, so 241 is
-  // past 240 -- becomes the NaN, or with saturate the largest. An infinity
-  // becomes the NaN either way.
+  // off. A float past the largest value, before any rounding (so 241 is
+  // past FNUZ fp8's 240), becomes the NaN (FNUZ, E4M3) or infinity (E5M2),
+  // or with saturate the largest value. An infinity becomes the NaN, but
+  // stays one in E5M2.
   static uint32_t float_to_f8(float x, const F8& t, bool saturate, const uint32_t* random) {
-    if (std::isnan(x) || std::isinf(x)) return 0x80;
-    const uint32_t sign = std::signbit(x) ? 0x80 : 0;
+    const uint32_t sign_bit = 1u << (t.bits - 1), sign = std::signbit(x) ? sign_bit : 0;
+    const uint32_t top = sign_bit - 1;                                // the largest magnitude's code
+    const uint32_t nan = t.style == F8::Fnuz ? sign_bit : sign | 0x7F;
+    const uint32_t largest = t.style == F8::OcpE4M3 ? 0x7E : t.style == F8::OcpE5M2 ? 0x7B : top;
+    if (t.style == F8::Finite && (std::isnan(x) || std::isinf(x))) return sign | largest;
+    if (std::isnan(x)) return nan;
+    if (std::isinf(x)) return t.style == F8::OcpE5M2 ? sign | 0x7C : nan;
     const double a = std::fabs(static_cast<double>(x));
-    if (a > t.max) return saturate ? sign | 0x7F : 0x80;
-    if (a == 0) return 0;
+    if (a > t.max) {
+      if (saturate || t.style == F8::Finite) return sign | largest;
+      return t.style == F8::OcpE5M2 ? sign | 0x7C : nan;
+    }
+    const uint32_t zero = t.style == F8::Fnuz ? 0 : sign;   // OCP keeps a negative zero
+    if (a == 0) return zero;
     const int emin = 1 - t.bias;
     const int e = std::max(std::ilogb(a), emin);
     const double step = std::ldexp(1.0, e - t.mant);   // between neighbouring values near a
@@ -430,7 +461,7 @@ struct Machine {
       n = std::nearbyint(n);
     }
     const double v = n * step;
-    if (v == 0) return 0;
+    if (v == 0) return zero;
     if (v < std::ldexp(1.0, emin)) return sign | static_cast<uint32_t>(n);   // below the least normal
     const int ve = std::ilogb(v);
     const uint32_t m = static_cast<uint32_t>(std::ldexp(v, t.mant - ve)) - (1u << t.mant);
@@ -985,6 +1016,20 @@ struct Machine {
       return;
     }
     const uint32_t words = in.dst[0].width;
+    if (in.name.rfind("s_buffer_load_", 0) == 0) {
+      // Through a buffer resource: its base (48 bits) and its size in bytes
+      // (num_records); each dword past the end reads 0.
+      const uint32_t r = in.src[0].index;
+      const uint64_t buffer = sgpr(w, r) | uint64_t{sgpr(w, r + 1) & 0xFFFF} << 32;
+      const uint64_t records = sgpr(w, r + 2);
+      const uint64_t offset = static_cast<uint64_t>(in.offset) + (in.has_saddr ? scalar_field(w, in.saddr, false) : 0);
+      for (uint32_t i = 0; i < words; ++i) {
+        const uint64_t off = offset + 4 * i, addr = buffer + off;
+        set_sgpr(w, in.dst[0].index + i,
+                 off + 4 <= records ? static_cast<uint32_t>(at(addr).load_scalar(addr, 4)) : 0);
+      }
+      return;
+    }
     for (uint32_t i = 0; i < words; ++i)
       set_sgpr(w, in.dst[0].index + i, static_cast<uint32_t>(at(base + 4 * i).load_scalar(base + 4 * i, 4)));
   }
@@ -1406,6 +1451,29 @@ struct Machine {
         w.vgpr[in.dst[0].index][lane] = b;
         w.vgpr[in.src[0].index][lane] = a;
       });
+    } else if (op == "v_permlane32_swap_b32_e32"_op || op == "v_permlane32_swap_b32_e64"_op ||
+               op == "v_permlane16_swap_b32_e32"_op || op == "v_permlane16_swap_b32_e64"_op) {
+      // gfx950: the upper 32 lanes of the first register trade places with
+      // the lower 32 of the second; or, 16 lanes to a row, each odd row of
+      // the first with the even row before it in the second. A pair is
+      // swapped where both its lanes are on.
+      const bool rows32 = op.find("permlane32") != std::string::npos;
+      auto& d = w.vgpr[in.dst[0].index];
+      auto& v = w.vgpr[in.src[0].index];
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        const bool first = rows32 ? lane >= 32 : (lane / 16) % 2 == 1;
+        if (!first) continue;
+        const uint32_t other = rows32 ? lane - 32 : lane - 16;
+        if (!(w.exec >> lane & 1) || !(w.exec >> other & 1)) continue;
+        std::swap(d[lane], v[other]);
+      }
+    } else if (op == "v_cvt_f32_bf16_e32"_op || op == "v_cvt_f32_bf16_e64"_op) {
+      // gfx950: a bfloat16 (the low half, or the high one op_sel names) as
+      // the float it is the top half of.
+      each([&](uint32_t lane) {
+        const uint32_t x = lane_src(w, in.src[0], lane) >> (16 * (in.op_sel & 1));
+        write_float(w, in, lane, as_float((x & 0xFFFF) << 16));
+      });
     } else if (op == "v_accvgpr_mov_b32"_op) {
       each([&](uint32_t lane) { set_word(w, in.dst[0], 0, lane, lane_src(w, in.src[0], lane)); });
     } else {
@@ -1696,7 +1764,7 @@ struct Machine {
       // low half -- the part SDWA picked, or the register's bottom.
       if (in.promoted && in.op_sel)
         throw Error::make(Err::Unsupported, in.name, " picks its byte with op_sel, which this does not model");
-      const F8& t = op == "v_cvt_f32_fp8_e32"_op || op == "v_cvt_pk_f32_fp8_e32"_op ? kFp8 : kBf8;
+      const F8& t = op == "v_cvt_f32_fp8_e32"_op || op == "v_cvt_pk_f32_fp8_e32"_op ? fp8() : bf8();
       const bool pair = op == "v_cvt_pk_f32_fp8_e32"_op || op == "v_cvt_pk_f32_bf8_e32"_op;
       each([&](uint32_t lane) {
         const uint32_t v = lane_src(w, in.src[0], lane);
@@ -1706,7 +1774,7 @@ struct Machine {
     } else if (op == "v_cvt_pk_fp8_f32"_op || op == "v_cvt_pk_bf8_f32"_op) {
       // Two floats narrowed into one half of the destination (op_sel's
       // bit 3 says the high one), the other half kept.
-      const F8& t = op == "v_cvt_pk_fp8_f32"_op ? kFp8 : kBf8;
+      const F8& t = op == "v_cvt_pk_fp8_f32"_op ? fp8() : bf8();
       each([&](uint32_t lane) {
         const uint32_t two = float_to_f8(lane_float(w, in.src[0], lane), t, in.clamp, nullptr) |
                              float_to_f8(lane_float(w, in.src[1], lane), t, in.clamp, nullptr) << 8;
@@ -1716,7 +1784,7 @@ struct Machine {
     } else if (op == "v_cvt_sr_fp8_f32"_op || op == "v_cvt_sr_bf8_f32"_op) {
       // One float narrowed, rounded by the second source's random bits,
       // into the byte op_sel's bits 2 and 3 name, the others kept.
-      const F8& t = op == "v_cvt_sr_fp8_f32"_op ? kFp8 : kBf8;
+      const F8& t = op == "v_cvt_sr_fp8_f32"_op ? fp8() : bf8();
       const uint32_t at = 8 * ((in.op_sel >> 2) & 3);
       each([&](uint32_t lane) {
         const uint32_t random = lane_src(w, in.src[1], lane);
@@ -1986,6 +2054,30 @@ struct Machine {
                                        static_cast<int32_t>(static_cast<int8_t>(b >> (8 * k))));
         write_lane(w, in.dst[0], lane, sum);
       });
+    } else if (op == "v_dot2c_f32_bf16_e32"_op || op == "v_dot2_f32_bf16"_op) {
+      // gfx950: two pairs of bfloat16s multiplied and added into a float,
+      // the sum worked out in double and rounded once. The VOP2 form adds
+      // into its destination; the packed one into its third source, with
+      // op_sel choosing halves and neg_lo/neg_hi negating, as v_dot2_f32_f16.
+      const bool into_dst = op == "v_dot2c_f32_bf16_e32"_op;
+      each([&](uint32_t lane) {
+        const auto bf = [](uint32_t bits16) { return static_cast<double>(as_float(bits16 << 16)); };
+        double sum;
+        if (into_dst) {
+          const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
+          sum = bf(a & 0xFFFF) * bf(b & 0xFFFF) + bf(a >> 16) * bf(b >> 16) +
+                static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane]));
+        } else {
+          const float c = lane_float(w, in.src[2], lane);
+          sum = (in.neg_lo >> 2) & 1 ? -double(c) : double(c);
+          for (uint32_t h = 0; h < 2; ++h) {
+            const double a = bf(packed_bits(w, in, 0, h, lane)), b = bf(packed_bits(w, in, 1, h, lane));
+            const uint8_t neg = h ? in.neg_hi : in.neg_lo;
+            sum += (neg & 1 ? -a : a) * (neg & 2 ? -b : b);
+          }
+        }
+        write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(sum)));
+      });
     } else if (op == "v_dot2c_f32_f16_e32"_op) {
       each([&](uint32_t lane) {
         // Two pairs of halves multiplied and added into a float. Each product
@@ -2002,6 +2094,40 @@ struct Machine {
         const double sum = half(a, 0) * half(b, 0) + half(a, 1) * half(b, 1) +
                            static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane]));
         write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(sum)));
+      });
+    } else if (op == "v_bitop3_b32"_op || op == "v_bitop3_b16"_op) {
+      // Each result bit is the truth table's entry for that bit of the three
+      // sources, the first the most significant of the index: 0xF0, 0xCC and
+      // 0xAA as the sources give the table itself. The 16-bit form reads the
+      // half op_sel names of each source, and writes the low half.
+      const bool b16 = op == "v_bitop3_b16"_op;
+      each([&](uint32_t lane) {
+        uint32_t x[3];
+        for (uint32_t k = 0; k < 3; ++k) {
+          x[k] = lane_src(w, in.src[k], lane);
+          if (b16) x[k] = (x[k] >> (16 * ((in.op_sel >> k) & 1))) & 0xFFFF;
+        }
+        uint32_t r = 0;
+        for (uint32_t idx = 0; idx < 8; ++idx)
+          if (in.bitop3 >> idx & 1)
+            r |= (idx & 4 ? x[0] : ~x[0]) & (idx & 2 ? x[1] : ~x[1]) & (idx & 1 ? x[2] : ~x[2]);
+        if (b16) r &= 0xFFFF;
+        write_lane(w, in.dst[0], lane, r);
+      });
+    } else if (op == "v_cvt_pk_f16_f32"_op || op == "v_cvt_pk_bf16_f32"_op) {
+      // Two floats to a packed pair, the first in the low half, each rounded
+      // to nearest even.
+      const bool bf = op == "v_cvt_pk_bf16_f32"_op;
+      each([&](uint32_t lane) {
+        const float a = lane_float(w, in.src[0], lane), b = lane_float(w, in.src[1], lane);
+        const auto narrow = [&](float f) -> uint32_t {
+          if (bf) return to_bf16(f);
+          const _Float16 h = static_cast<_Float16>(f);
+          uint16_t bits;
+          std::memcpy(&bits, &h, 2);
+          return bits;
+        };
+        write_lane(w, in.dst[0], lane, narrow(a) | narrow(b) << 16);
       });
     } else if (op == "v_cvt_pkrtz_f16_f32"_op) {
       each([&](uint32_t lane) {
@@ -2442,7 +2568,7 @@ struct Machine {
         // rocFFT's real-to-complex kernels count on.
         const uint64_t a = static_cast<uint32_t>(addr + offset);
         if (a + bytes <= g.lds.size()) return &g.lds[a];
-        if (g.lds.empty() && a < kLdsPerComputeUnit)
+        if (g.lds.empty() && a < lds_limit(d))
           throw Error::make(Err::InvalidValue, "an LDS access at ", a, " in a work-group given no LDS: the launch ",
                             "did not pay for the LDS its kernel uses");
         std::memset(outside, 0, sizeof outside);
@@ -3227,6 +3353,20 @@ struct Machine {
     if (op == "v_mfma_f32_32x32x1_2b_f32"_op) return &f32_32x32x1_2b;
     if (op == "v_mfma_f64_16x16x4_f64"_op) return &f64_16x16x4;
     if (op == "v_mfma_f32_16x16x16_bf16"_op) return &bf16_16x16x16;
+    // gfx950's, with K doubled.
+    static const MatrixShape f16_16x16x32{16, 16, 32, 1, 'h', 'f'}, f16_32x32x16{32, 32, 16, 1, 'h', 'f'},
+        bf16_16x16x32{16, 16, 32, 1, 'b', 'f'}, bf16_32x32x16{32, 32, 16, 1, 'b', 'f'},
+        i8_16x16x64{16, 16, 64, 1, 'c', 'i'}, i8_32x32x32{32, 32, 32, 1, 'c', 'i'},
+        // 'x': a small float whose format the instruction's CBSZ or BLGP names.
+        f8f6f4_16x16x128{16, 16, 128, 1, 'x', 'f', 'x'}, f8f6f4_32x32x64{32, 32, 64, 1, 'x', 'f', 'x'};
+    if (op == "v_mfma_i32_16x16x64_i8"_op) return &i8_16x16x64;
+    if (op == "v_mfma_i32_32x32x32_i8"_op) return &i8_32x32x32;
+    if (op == "v_mfma_f32_16x16x128_f8f6f4"_op) return &f8f6f4_16x16x128;
+    if (op == "v_mfma_f32_32x32x64_f8f6f4"_op) return &f8f6f4_32x32x64;
+    if (op == "v_mfma_f32_16x16x32_f16"_op) return &f16_16x16x32;
+    if (op == "v_mfma_f32_32x32x16_f16"_op) return &f16_32x32x16;
+    if (op == "v_mfma_f32_16x16x32_bf16"_op) return &bf16_16x16x32;
+    if (op == "v_mfma_f32_32x32x16_bf16"_op) return &bf16_32x32x16;
     if (op == "v_mfma_f32_32x32x8_f16"_op) return &f16_32x32x8;
     if (op == "v_mfma_f32_32x32x8_bf16"_op) return &bf16_32x32x8;
     if (op == "v_mfma_i32_32x32x16_i8"_op) return &i8_32x32x16;
@@ -3275,10 +3415,23 @@ struct Machine {
     // Value e of a source's run in one lane: a half or a bfloat16 (two to a
     // register), a signed byte (four), a float or an int32, or a double (a
     // register pair). A bfloat16 is a float's top half, so it widens exactly.
+    // A small float of `bits` bits, element e of a run packed from the first
+    // register's lowest bit up: a 6-bit one may straddle two registers.
+    const auto packed = [&](const Operand& o, uint32_t bits, uint32_t e, uint32_t lane) -> uint32_t {
+      const uint32_t at = e * bits, word = at / 32, shift = at % 32;
+      uint64_t v = reg(o, word, lane);
+      if (shift + bits > 32 && word + 1 < o.width) v |= static_cast<uint64_t>(reg(o, word + 1, lane)) << 32;
+      return static_cast<uint32_t>(v >> shift) & ((1u << bits) - 1);
+    };
     const auto value = [&](const Operand& o, char type, uint32_t e, uint32_t lane) -> double {
+      if (type == 'x') {   // an f8f6f4 source: its format is CBSZ's (A) or BLGP's (B)
+        const uint32_t f = &o == &in.src[0] ? in.cbsz : in.blgp;
+        const F8& t = f == 0 ? kOcpFp8 : f == 1 ? kOcpBf8 : f == 2 ? kFp6 : f == 3 ? kBf6 : kFp4;
+        return f8_to_float(packed(o, static_cast<uint32_t>(t.bits), e, lane), t);
+      }
       if (type == 'b') return static_cast<double>(as_float((reg(o, e / 2, lane) >> (16 * (e % 2))) << 16));
       if (type == 'c') return static_cast<double>(static_cast<int8_t>(reg(o, e / 4, lane) >> (8 * (e % 4))));
-      if (type == 'e' || type == 'g') return f8_to_float(reg(o, e / 4, lane) >> (8 * (e % 4)), type == 'e' ? kFp8 : kBf8);
+      if (type == 'e' || type == 'g') return f8_to_float(reg(o, e / 4, lane) >> (8 * (e % 4)), type == 'e' ? fp8() : bf8());
       if (type == 'i') return static_cast<double>(static_cast<int32_t>(reg(o, e, lane)));
       if (type == 'h') {
         _Float16 h;
@@ -3614,7 +3767,7 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
   // A card gives a work-group LDS in 512-byte granules (128 dwords, the
   // unit the descriptor counts it in), so a kernel reading a little past
   // what it asked for still reads its own LDS: rocFFT's kernels do.
-  group.lds.assign(std::min<uint64_t>((group_segment + 511) / 512 * 512, kLdsPerComputeUnit), 0);
+  group.lds.assign(std::min<uint64_t>((group_segment + 511) / 512 * 512, lds_limit(d)), 0);
   // Each work-item's private memory. A kernel that spills says how much
   // it needs; the rest get none.
   group.scratch_per_lane = (k.private_segment + 3) & ~3u;
@@ -3742,9 +3895,9 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   // What the work-group's LDS comes to: what the kernel reserved, and what
   // the launch added.
   const uint64_t group_segment = uint64_t{k.group_segment} + d.dynamic_lds;
-  if (group_segment > (64u << 10))
-    throw Error::make(Err::InvalidValue, "a work-group asking for ", group_segment,
-                      " bytes of LDS is past the 65536 a CDNA work-group has");
+  if (group_segment > lds_limit(d))
+    throw Error::make(Err::InvalidValue, "a work-group asking for ", group_segment, " bytes of LDS is past the ",
+                      lds_limit(d), " a work-group has on ", d.object->gfx950() ? "gfx950" : "gfx942");
 
   // What the kernel is told about its grid, and the packet it may read it
   // from. Both are written before any wave starts.

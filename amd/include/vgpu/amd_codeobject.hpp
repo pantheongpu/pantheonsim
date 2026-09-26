@@ -106,6 +106,12 @@ struct CodeObject {
   // to itself. Empty for an object not yet linked, whose variables are `data`.
   bool linked = false;
   std::vector<uint8_t> image;
+  // The processor the code was built for: the ELF header's e_flags machine
+  // field (EF_AMDGPU_MACH), 0x4c for gfx942 and 0x4f for gfx950. Where the
+  // same instruction means different things on the two -- an 8-bit float is
+  // FNUZ on gfx942 and OCP on gfx950 -- this says which.
+  uint32_t mach = 0;
+  bool gfx950() const { return mach == 0x4f; }
 };
 
 // Writes the addresses of the module's globals into its code, for a data
