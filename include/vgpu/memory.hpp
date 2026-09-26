@@ -23,6 +23,7 @@
 //    (these diagnostics are a product feature for CI, not just debug aids).
 #pragma once
 #include <mutex>
+#include "vgpu/brlock.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -451,6 +452,11 @@ class MemoryManager {
   enum class ScalarAt { Chunk, Untouched, Uniform, Unchanged, HostMap };
   ScalarAt scalar_location(uint64_t addr, uint32_t size, const uint64_t* store,
                            const uint8_t** where) const;
+  // Guards the tables below (and the mapping tables above) against a host
+  // thread allocating, freeing or mapping while kernels on other threads
+  // look addresses up in them (vgpu/brlock.hpp). Behind a pointer so the
+  // manager stays movable.
+  std::unique_ptr<BigReaderLock> table_lock_ = std::make_unique<BigReaderLock>();
   std::map<uint64_t, Allocation> live_;        // base -> allocation
   // base -> record, bounded to kQuarantineEntries (oldest evicted first).
   std::map<uint64_t, FreedRecord> freed_;

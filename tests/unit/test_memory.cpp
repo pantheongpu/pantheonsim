@@ -1,6 +1,7 @@
 // Unit tests for the virtual device memory manager.
 #include "vgpu/memory.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -691,6 +692,85 @@ VTEST(stack_and_heap_addresses_are_never_device_addresses) {
   VCHECK(vgpu::is_device_va(vgpu::kDeviceVaEnd - 1));
   VCHECK(!vgpu::is_device_va(vgpu::kDeviceVaEnd));
   last.free(p);
+}
+
+// Kernels read the allocation table on every access, from many threads, and
+// with asynchronous streams the host may allocate, free and map while they
+// do. Readers here hammer allocations that stay put while a writer thread
+// allocates and frees others: every read must see its own bytes, and the
+// ThreadSanitizer job must find nothing.
+VTEST(allocating_and_freeing_while_other_threads_read_is_safe) {
+  MemoryManager mm(256ull << 20);
+  constexpr int kReaders = 6, kFixed = 16;
+  std::vector<uint64_t> fixed(kFixed);
+  for (int i = 0; i < kFixed; ++i) {
+    fixed[i] = mm.alloc(4096);
+    for (uint64_t w = 0; w < 4096; w += 8) mm.store_scalar(fixed[i] + w, 8, (uint64_t{static_cast<unsigned>(i)} << 32) | w);
+  }
+  std::atomic<bool> stop{false};
+  std::atomic<int> wrong{0};
+  std::vector<std::thread> readers;
+  for (int t = 0; t < kReaders; ++t)
+    readers.emplace_back([&, t] {
+      uint64_t n = static_cast<uint64_t>(t);
+      while (!stop.load(std::memory_order_relaxed)) {
+        const int i = static_cast<int>(n % kFixed);
+        const uint64_t w = (n * 8) % 4096;
+        uint64_t base = 0, size = 0;
+        if (mm.load_scalar(fixed[i] + w, 8) != ((uint64_t{static_cast<unsigned>(i)} << 32) | w) ||
+            !mm.find_allocation(fixed[i] + w, &base, &size) || base != fixed[i] || size != 4096)
+          wrong.fetch_add(1);
+        ++n;
+      }
+    });
+  // The writer: allocations of every size come and go, and a reservation is
+  // made, mapped, unmapped and given back, all while the readers run.
+  for (int round = 0; round < 400; ++round) {
+    std::vector<uint64_t> tmp;
+    for (int j = 1; j <= 8; ++j) tmp.push_back(mm.alloc(static_cast<uint64_t>(j) * 1000));
+    for (uint64_t p : tmp) mm.store_scalar(p, 4, 7);
+    for (uint64_t p : tmp) mm.free(p);
+    const uint64_t va = mm.reserve(MemoryManager::kVmmGranularity, 0), h = mm.create_handle(MemoryManager::kVmmGranularity);
+    mm.map(va, MemoryManager::kVmmGranularity, 0, h);
+    mm.unmap(va, MemoryManager::kVmmGranularity);
+    mm.release_handle(h);
+    mm.address_free(va, MemoryManager::kVmmGranularity);
+  }
+  stop = true;
+  for (auto& r : readers) r.join();
+  VCHECK_EQ(wrong.load(), 0);
+}
+
+// The lock under the table: many readers at once, a writer that waits for
+// them and holds them off, and a writer that takes it again and reads under
+// it from its own thread (the table's mutators call one another).
+VTEST(the_big_reader_lock_keeps_writers_and_readers_apart) {
+  vgpu::BigReaderLock lock;
+  int value = 0;          // written only under the writer's lock
+  std::atomic<int> torn{0};
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> readers;
+  for (int t = 0; t < 4; ++t)
+    readers.emplace_back([&] {
+      while (!stop.load(std::memory_order_relaxed)) {
+        vgpu::SharedGuard g(&lock);
+        const int a = value, b = value;   // a writer mid-update would show here
+        if (a != b || a % 2) torn.fetch_add(1);
+      }
+    });
+  for (int i = 0; i < 2000; ++i) {
+    vgpu::ExclusiveGuard g(&lock);
+    ++value;              // odd while the writer holds it
+    {
+      vgpu::ExclusiveGuard again(&lock);   // re-entrant for its owner
+      vgpu::SharedGuard read(&lock);       // and it may read under it
+      ++value;
+    }
+  }
+  stop = true;
+  for (auto& r : readers) r.join();
+  VCHECK_EQ(torn.load(), 0);
+  VCHECK_EQ(value, 4000);
 }
 
 VTEST_MAIN
