@@ -33,6 +33,7 @@
 #include <cerrno>
 #include <limits>
 #include <map>
+#include <set>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -7966,6 +7967,26 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
 
 namespace {
 
+// Whether a kernel can allocate device memory while it runs: malloc/free, or
+// a dynamic-parallelism parameter buffer, in its own code or in a device
+// function it calls (an indirect call counts, since where it lands is not
+// known here). The allocator's table of live allocations is read without a
+// lock by every load and store, so allocating in one block while another
+// block's thread reads it is a data race (ThreadSanitizer found it in the
+// dynamic-parallelism test). Such a grid runs on one host thread.
+bool allocates_while_running(const ptx::EntryFn& fn, std::set<const ptx::EntryFn*>& seen) {
+  if (!seen.insert(&fn).second) return false;
+  for (const ptx::Instr& ins : fn.body) {
+    const auto* op = std::get_if<ptx::OpCall>(&ins.op);
+    if (!op) continue;
+    if (op->indirect || op->callee == "malloc" || op->callee == "free" ||
+        op->callee == "__cudaCDP2GetParameterBufferV2" || op->callee == "cudaGetParameterBufferV2")
+      return true;
+    if (op->target && allocates_while_running(*op->target, seen)) return true;
+  }
+  return false;
+}
+
 // How many host threads to spread the grid over. One thread reproduces the old
 // strictly serial block order exactly, which is what a kernel with a data race
 // needs to stay reproducible; more threads is faster and is what CUDA's own
@@ -8072,7 +8093,12 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
   // A cooperative launch runs on one worker whatever VGPU_THREADS says. Its
   // blocks wait on each other, so they cannot be split into independent ranges
   // -- that is precisely the promise a cooperative launch does not make.
-  const unsigned nthreads = (eff.cooperative || ordered) ? 1 : worker_count(blocks);
+  const unsigned nthreads = [&] {
+    if (eff.cooperative || ordered || blocks <= 1) return 1u;
+    std::set<const ptx::EntryFn*> seen;
+    if (allocates_while_running(fn, seen)) return 1u;
+    return worker_count(blocks);
+  }();
 
   if (nthreads <= 1) {
     LaunchStats stats;
