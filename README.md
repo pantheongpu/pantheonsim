@@ -1,29 +1,38 @@
-# pantheonsim / VirtualGPU
+# PantheonSim
 
-**Functional GPU emulation on CPUs, for development and CI.**
+**Run CUDA and HIP programs, unmodified, on a CPU. No GPU needed.**
 
-VirtualGPU lets software that expects a GPU run on machines that have none: it
-emulates GPU devices, the driver API surface, and (growing) functional kernel
-execution — *"test against a rack of GPUs from your laptop."*
+PantheonSim simulates NVIDIA and AMD GPUs (a T4, an H100, a B200, an MI300X) on
+an ordinary CPU. Programs built with the real `nvcc` or `hipcc` run against it
+unchanged, and `nvidia-smi`, `rocm-smi` and the vendor libraries report the GPUs
+you asked for. Learn GPU programming without a GPU, and test GPU code in CI on
+standard runners.
 
-```
-$ ./build/vgpu info --gpu nvidia/h100        # a virtual H100, no hardware needed
-$ VGPU_GPU=nvidia/b200 ./my_driver_api_app   # same binary, now sees a B200
-```
+[![The PantheonSim playground: nvcc and nvidia-smi on eight simulated H100s](docs/img/playground.png)](https://pantheonsim.com/play/)
 
-**What VirtualGPU is NOT:**
+- **Try it in your browser.** [pantheonsim.com/play](https://pantheonsim.com/play/)
+  gives you a Linux machine with simulated GPUs, an editor, a terminal, and `nvcc`
+  or `hipcc`. No sign-up.
+- **Test GPU code in GitHub Actions.** One step, on the standard runners:
 
-- It does **not** predict performance. No timing, bandwidth, cache, occupancy,
-  or tensor-core modeling — ever. Only functional behavior.
-- Passing on VirtualGPU does **not** replace final validation on physical
-  GPUs. The intended CI model is:
-
+  ```yaml
+  - uses: pantheongpu/setup-pantheonsim@v0
+    with:
+      gpu: nvidia/h100        # or amd/mi300x
+  - run: cmake -S . -B build && cmake --build build && ctest --test-dir build
   ```
-  every commit:        VirtualGPU CPU tests
-  nightly/pre-release: physical GPU integration tests
-  ```
 
-## Status (early — NVIDIA MVP)
+  More at [pantheonsim.com/ci](https://pantheonsim.com/ci/).
+- **Run it on your own machine.** [Build it](#build--test) (C++20, no
+  dependencies), then `vgpu run ./your_program`.
+
+PantheonSim checks what your code does, not how fast it runs: there is no
+performance model, and a run on physical GPUs before a release is still the
+final word. The intended CI model is simulated GPUs on every commit, physical
+ones nightly or before a release. The simulator engine and its CLI are called
+VirtualGPU (`vgpu`).
+
+## Status
 
 The engine is vendor-neutral; NVIDIA and CUDA support lives in [`nvidia/`](nvidia/README.md) and
 AMD and ROCm in [`amd/`](amd/README.md). [ARCHITECTURE.md](ARCHITECTURE.md) has the map.
