@@ -289,8 +289,14 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   through the public API matches a host reference for both B layouts and both
   element types -- and tf32's m16n16k8, whose A is 16x8 and B is 8x16, so its
   load computes the address from the layout directly rather than relying on the
-  cancellation the square shapes get for free. The rectangular m8n32k16 and
-  m32n8k16 variants are still refused by name;
+  cancellation the square shapes get for free. Since 2026-09-25 every other
+  WMMA combination too -- f16 accumulators, the rectangular m8n32k16 and
+  m32n8k16 shapes, s8/u8 (with .satfinite), f64 m8n8k4 with its rounding
+  modes, s4/u4 m8n8k32 and b1 m8n8k128 (.xor.popc and .and.popc), and the
+  optional stride. The fragment layout is unspecified by the ISA, so these
+  use one of their own (the logical matrix, spread in order over lanes and
+  registers); the combinations above keep theirs. wmma_types.cu checks all 21
+  shape/type/layout combinations through mma.h, exactly;
   ldmatrix.m8n8.x{1,2,4}[.trans], mma.sync.m16n8k{8,16,32} over f16/bf16/tf32/
   s8, and movmatrix.m8n8.trans (the register-only transpose).
   stmatrix.m8n8.x{1,2,4}[.trans] is the store counterpart of ldmatrix: the warp
@@ -823,6 +829,41 @@ narrows what counts as observable, not what the detector looks at.
   complete is reported as a deadlock, naming the barrier and how far it
   got; before, the block quietly ended with the warp still waiting.
 
+- Dynamic parallelism (CDP2, 2026-09-25): kernels launch kernels through the
+  device runtime's entry points as the CUDA programming guide documents them
+  for code generators (__cudaCDP2GetParameterBufferV2 and
+  __cudaCDP2LaunchDeviceV2). Kernels have addresses in their own window and
+  the runtime gives every launch a table of them; the parameter buffer is
+  device memory laid out as the child's parameters. A child runs after its
+  parent grid and before the launch returns, in launch order (parent block by
+  parent block, so it is the same with any number of host threads), each
+  complete -- its own children included -- before the next: a schedule CUDA
+  allows for every device-side stream, since it promises no concurrency
+  between parent and child. CUDA's limits apply (2048 pending, 24 deep).
+  Checked by test_dynpar and dynamic_parallelism.cu (built with -rdc: fan-out,
+  nesting, order, the tail and fire-and-forget streams, a struct parameter).
+
+- CUTLASS's SM90 GEMM unit tests, run unmodified (2026-09-25), found: the
+  register estimate ignored launch bounds (.maxntid/.minnctapersm/.maxnreg
+  now cap it, as ptxas does, spilling the rest); an mbarrier instruction whose
+  lanes name different blocks' barriers was refused (lanes are now handled
+  barrier by barrier); cudaFuncAttributeNonPortableClusterSizeAllowed was
+  ignored (clusters of up to 16 now launch once it is set); and dp2a was
+  missing. The cluster warp-specialized cooperative test passes all 22 cases
+  and the pointer-array test its 2.
+  **Known wrong answer, not yet found:** the ping-pong kernel with a 2x4x1
+  cluster (64x128x64 tiles) gets some 16-row A slices wrong in output tiles
+  whose cluster is partly past the matrix's N edge. The bad slices always
+  come from the blocks whose own tile is out of bounds; which ones depends on
+  the warp schedule (the deterministic scheduler fails 488x768x632, the
+  random one 488x8x632), so it is ordering, not arithmetic. Ruled out so far:
+  when TMA data lands (landing at issue fails the same way), the per-lane
+  mbarrier grouping (test_dsmem covers it), duplicated tile assignment (a
+  TMA trace shows the persistent scheduler's assignment is right), and shared
+  memory aliasing between the mainloop and the epilogue. The 1x4, 4x1 and
+  2x2 clusters of the same kernel pass, as does the cooperative kernel at
+  2x4x1.
+
 ## Not implemented (fails loudly, never silently)
 
 This list was stale for a while, which is its own kind of wrong: it still named
@@ -851,11 +892,6 @@ what is done.
   fault with a diagnostic naming which it was. Exporting a handle to another
   process still refuses: device memory here is this process's own sparse
   backing.)
-- Dynamic parallelism (a kernel launching a kernel). Taking a kernel's address
-  in device code now says so by name instead of reporting an unknown symbol,
-  which sent you looking for a typo in a name that was right there. Running it
-  would need a child grid scheduled from inside the parent's instruction
-  stream, which nothing here can do.
 - Frontends: cubin/SASS loading, and AMD execution -- HIP runtime and the CDNA
   ISA. AMD *discovery* exists: `amd/tools/rocminfo-to-profile.py` reads a real
   MI325X and `amd/profiles/mi325x.yaml` is verified against one. The warp width
