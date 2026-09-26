@@ -183,6 +183,7 @@ Environment knobs:
 | `VGPU_VRAM_MB` | virtual VRAM size, overriding the profile | profile |
 | `VGPU_STRICT` | `1` turns on the checks that catch bugs hardware hides but that real compiler output trips over: integer division by zero, and storing a register nothing has written | unset |
 | `VGPU_COUNTERS` | `1` prints exact per-launch performance counters | unset |
+| `VGPU_FASTPATH` | `0` sends every instruction down the interpreter's general path, for ruling out its fast paths when a result looks wrong (they are tested to give the same bits) | unset (on) |
 | `VGPU_RACE` | `1` reports unordered shared-memory access between warps; `2` also reports stores that change nothing | unset |
 
 `VGPU_COUNTERS` reports what a profiler reports, except that every number is
