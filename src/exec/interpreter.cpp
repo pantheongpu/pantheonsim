@@ -4955,7 +4955,7 @@ class Interpreter {
   // The same fragments as exec_wmma_mma below, read from and written to the
   // 32-bit register file in place, with the halves decoded from the table.
   bool fast_wmma_mma(Warp& w, const OpWmmaMma& op, Mask m) {
-    if (op.elem == WmmaElem::TF32 || mem_.alu_fault_armed() || W_ != 32) return false;
+    if (op.generic || op.elem == WmmaElem::TF32 || mem_.alu_fault_armed() || W_ != 32) return false;
     for (const auto* v : {&op.a, &op.b, &op.c, &op.d})
       for (const Reg& r : *v)
         if (r.wide) return false;
@@ -5015,7 +5015,231 @@ class Interpreter {
     return true;
   }
 
+  // ---- WMMA for every shape and type the ISA has (the `generic` ones) ----
+  //
+  // A generic fragment holds the logical matrix: slot (lane, register,
+  // element) is matrix element (lane * per_lane + register * per_reg +
+  // element) mod the matrix's size, row by row. The ISA leaves the
+  // distribution unspecified, so any consistent one is correct; this one
+  // holds whole copies when the register count has room for more than one.
+  static std::pair<uint32_t, uint32_t> wmma_slot(const WmmaGeom& g, uint32_t lane, uint32_t reg, uint32_t e) {
+    const uint32_t per_reg = g.reg_bits / g.bits;
+    const uint64_t linear = uint64_t{lane} * g.regs * per_reg + uint64_t{reg} * per_reg + e;
+    const uint64_t idx = linear % (uint64_t{g.rows} * g.cols);
+    return {static_cast<uint32_t>(idx / g.cols), static_cast<uint32_t>(idx % g.cols)};
+  }
+  static char wmma_frag(OpWmmaLoad::Which w) {
+    return w == OpWmmaLoad::Which::A ? 'a' : w == OpWmmaLoad::Which::B ? 'b' : 'c';
+  }
+  // Element `elem` (counted in elements) of a matrix in memory: sub-byte
+  // elements are packed, low bits first.
+  uint64_t wmma_read(Warp& w, const BlockCtx& ctx, const Instr& ins, uint32_t lane, uint64_t base,
+                     uint64_t elem, uint32_t bits) {
+    if (bits >= 8) return load_routed(w, ctx, ins, lane, base + elem * (bits / 8), bits / 8);
+    const uint64_t bit = elem * bits;
+    return (load_routed(w, ctx, ins, lane, base + bit / 8, 1) >> (bit % 8)) & ((1u << bits) - 1);
+  }
+  // A fragment element as a number: the float types as doubles (exact), the
+  // integers sign- or zero-extended, b1 as 0 or 1.
+  static double wmma_value(WmmaType t, uint64_t bits) {
+    switch (t) {
+      case WmmaType::F16: return f16_to_double(bits & 0xFFFF);
+      case WmmaType::BF16: return bf16_to_double(bits & 0xFFFF);
+      case WmmaType::TF32: case WmmaType::F32: return std::bit_cast<float>(static_cast<uint32_t>(bits));
+      case WmmaType::F64: return std::bit_cast<double>(bits);
+      case WmmaType::S8: return static_cast<int8_t>(bits);
+      case WmmaType::U8: return static_cast<uint8_t>(bits);
+      case WmmaType::S4: return static_cast<int32_t>((bits & 0xF) << 28) >> 28;
+      case WmmaType::U4: return static_cast<double>(bits & 0xF);
+      case WmmaType::B1: return static_cast<double>(bits & 1);
+      case WmmaType::S32: return static_cast<int32_t>(bits);
+    }
+    return 0;
+  }
+
+  void exec_wmma_load_generic(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaLoad& op, Mask m) {
+    Lanes _s_base, _s_stride;
+    const Lanes base = addr_base(w, ctx, ins, op.addr, _s_base);
+    const Lanes& stride = read_operand(w, ctx, ins, op.stride, _s_stride);
+    const uint32_t lead = first_set(m);
+    const uint64_t addr0 = space_base(op.space) + base[lead] + static_cast<uint64_t>(op.addr.offset);
+    const uint64_t ld = stride[lead];
+    const WmmaGeom g = wmma_geom(wmma_frag(op.which), op.shape, op.type);
+    const uint32_t per_reg = g.reg_bits / g.bits;
+    const uint64_t mask = g.bits == 64 ? ~0ull : (1ull << g.bits) - 1;
+    for (uint32_t reg = 0; reg < g.regs; ++reg) {
+      Lanes r{};
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        uint64_t packed = 0;
+        for (uint32_t e = 0; e < per_reg; ++e) {
+          const auto [row, col] = wmma_slot(g, lane, reg, e);
+          const uint64_t elem = op.layout == MatLayout::Row ? uint64_t{row} * ld + col : uint64_t{col} * ld + row;
+          uint64_t v = wmma_read(w, ctx, ins, lane, addr0, elem, g.bits) & mask;
+          if (op.type == WmmaType::TF32) v = f32bits(f32_to_tf32(f32(v)));
+          packed |= v << (e * g.bits);
+        }
+        r[lane] = packed;
+      }
+      write_reg(w, op.dsts[reg], m, r, g.reg_bits);
+    }
+  }
+
+  void exec_wmma_store_generic(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaStore& op, Mask m) {
+    Lanes _s_base, _s_stride;
+    const Lanes base = addr_base(w, ctx, ins, op.addr, _s_base);
+    const Lanes& stride = read_operand(w, ctx, ins, op.stride, _s_stride);
+    const uint32_t lead = first_set(m);
+    const uint64_t addr0 = space_base(op.space) + base[lead] + static_cast<uint64_t>(op.addr.offset);
+    const uint64_t ld = stride[lead];
+    const WmmaGeom g = wmma_geom('d', op.shape, op.type);
+    const uint32_t per_reg = g.reg_bits / g.bits;
+    const uint64_t mask = g.bits == 64 ? ~0ull : (1ull << g.bits) - 1;
+    for (uint32_t reg = 0; reg < g.regs; ++reg) {
+      Lanes _s_v;
+      const Lanes v = read_operand(w, ctx, ins, op.src[reg], _s_v);
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        for (uint32_t e = 0; e < per_reg; ++e) {
+          const auto [row, col] = wmma_slot(g, lane, reg, e);
+          const uint64_t elem = op.layout == MatLayout::Row ? uint64_t{row} * ld + col : uint64_t{col} * ld + row;
+          store_routed(w, ctx, ins, lane, addr0 + elem * (g.bits / 8), g.bits / 8, (v[lane] >> (e * g.bits)) & mask);
+        }
+      }
+    }
+  }
+
+  // Gathers a generic fragment into its logical matrix.
+  void wmma_gather(Warp& w, const BlockCtx& ctx, const Instr& ins, const std::vector<Reg>& regs, char frag,
+                   WmmaShape shape, WmmaType t, std::vector<double>& out) {
+    const WmmaGeom g = wmma_geom(frag, shape, t);
+    const uint32_t per_reg = g.reg_bits / g.bits;
+    const uint64_t mask = g.bits == 64 ? ~0ull : (1ull << g.bits) - 1;
+    out.assign(size_t{g.rows} * g.cols, 0.0);
+    for (uint32_t reg = 0; reg < g.regs; ++reg) {
+      Lanes _s;
+      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{regs[reg]}}, _s);
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        for (uint32_t e = 0; e < per_reg; ++e) {
+          const auto [row, col] = wmma_slot(g, lane, reg, e);
+          out[size_t{row} * g.cols + col] = wmma_value(t, (v[lane] >> (e * g.bits)) & mask);
+        }
+    }
+  }
+  // The f16/bf16 A and B fragments at m16n16k16 keep the layout exec_wmma_mma
+  // reads (memory order, the mma transposing a column-major one), since a load
+  // does not know which accumulator type the mma will use.
+  void wmma_gather_legacy(Warp& w, const BlockCtx& ctx, const Instr& ins, const std::vector<Reg>& regs,
+                          bool bf, MatLayout layout, std::vector<double>& out) {
+    out.assign(size_t{kMmaDim} * kMmaDim, 0.0);
+    for (size_t reg = 0; reg < regs.size(); ++reg) {
+      Lanes _s;
+      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{regs[reg]}}, _s);
+      const uint32_t lanes_used = bf ? W_ : kMmaDim;
+      for (uint32_t lane = 0; lane < lanes_used; ++lane)
+        for (int h = 0; h < 2; ++h) {
+          uint32_t row, col;
+          if (bf) {
+            const uint32_t linear = lane * 8 + static_cast<uint32_t>(reg * 2 + h);
+            row = linear / kMmaDim;
+            col = linear % kMmaDim;
+          } else {
+            row = lane;
+            col = static_cast<uint32_t>(reg * 2 + h);
+          }
+          const uint64_t bits = (v[lane] >> (16 * h)) & 0xFFFF;
+          const double x = bf ? bf16_to_double(bits) : f16_to_double(bits);
+          if (layout == MatLayout::Row) out[size_t{row} * kMmaDim + col] = x;
+          else out[size_t{col} * kMmaDim + row] = x;
+        }
+    }
+  }
+
+  void exec_wmma_mma_generic(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaMma& op, Mask m) {
+    const uint32_t M = op.shape.m, N = op.shape.n, K = op.shape.k;
+    std::vector<double> A, B, C;
+    const bool legacy_ab = op.shape == WmmaShape{16, 16, 16} &&
+                           (op.atype == WmmaType::F16 || op.atype == WmmaType::BF16);
+    if (legacy_ab) {
+      wmma_gather_legacy(w, ctx, ins, op.a, op.atype == WmmaType::BF16, op.alayout, A);
+      wmma_gather_legacy(w, ctx, ins, op.b, op.btype == WmmaType::BF16, op.blayout, B);
+    } else {
+      wmma_gather(w, ctx, ins, op.a, 'a', op.shape, op.atype, A);
+      wmma_gather(w, ctx, ins, op.b, 'b', op.shape, op.btype, B);
+    }
+    wmma_gather(w, ctx, ins, op.c, 'c', op.shape, op.ctype, C);
+    std::vector<uint64_t> D(size_t{M} * N);
+    const WmmaType at = op.atype;
+    if (at == WmmaType::F16 || at == WmmaType::BF16 || at == WmmaType::TF32) {
+      // Products and sums in f32, k in order, as the f32-accumulator path does;
+      // an f16 result is that rounded once.
+      for (uint32_t i = 0; i < M; ++i)
+        for (uint32_t j = 0; j < N; ++j) {
+          float acc = static_cast<float>(C[size_t{i} * N + j]);
+          for (uint32_t k = 0; k < K; ++k) {
+            const float prod = static_cast<float>(A[size_t{i} * K + k]) * static_cast<float>(B[size_t{k} * N + j]);
+            acc = acc + prod;
+          }
+          D[size_t{i} * N + j] = op.dtype == WmmaType::F16 ? double_to_f16(acc) : f32bits(acc);
+        }
+    } else if (at == WmmaType::F64) {
+      const int prev = op.rnd == FRound::Nearest ? 0 : std::fegetround();
+      if (op.rnd != FRound::Nearest) g_directed_rounding.fetch_add(1, std::memory_order_relaxed);
+      switch (op.rnd) {
+        case FRound::Zero: std::fesetround(FE_TOWARDZERO); break;
+        case FRound::MinusInf: std::fesetround(FE_DOWNWARD); break;
+        case FRound::PlusInf: std::fesetround(FE_UPWARD); break;
+        case FRound::Nearest: break;
+      }
+      for (uint32_t i = 0; i < M; ++i)
+        for (uint32_t j = 0; j < N; ++j) {
+          double acc = C[size_t{i} * N + j];
+          for (uint32_t k = 0; k < K; ++k) acc = std::fma(A[size_t{i} * K + k], B[size_t{k} * N + j], acc);
+          D[size_t{i} * N + j] = std::bit_cast<uint64_t>(acc);
+        }
+      if (op.rnd != FRound::Nearest) {
+        std::fesetround(prev);
+        g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
+      }
+    } else {
+      // Integers, exactly; single bits as a population count of the AND or XOR.
+      for (uint32_t i = 0; i < M; ++i)
+        for (uint32_t j = 0; j < N; ++j) {
+          int64_t acc = static_cast<int64_t>(C[size_t{i} * N + j]);
+          for (uint32_t k = 0; k < K; ++k) {
+            const int64_t a = static_cast<int64_t>(A[size_t{i} * K + k]);
+            const int64_t b = static_cast<int64_t>(B[size_t{k} * N + j]);
+            acc += at == WmmaType::B1 ? (op.b1_and ? (a & b) : (a ^ b)) : a * b;
+          }
+          if (op.satfinite)
+            acc = std::clamp<int64_t>(acc, std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max());
+          D[size_t{i} * N + j] = static_cast<uint32_t>(static_cast<int32_t>(acc));
+        }
+    }
+    // Scatter D into its fragment.
+    const WmmaGeom g = wmma_geom('d', op.shape, op.dtype);
+    const uint32_t per_reg = g.reg_bits / g.bits;
+    const uint64_t mask = g.bits == 64 ? ~0ull : (1ull << g.bits) - 1;
+    for (uint32_t reg = 0; reg < g.regs; ++reg) {
+      Lanes r{};
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        uint64_t packed = 0;
+        for (uint32_t e = 0; e < per_reg; ++e) {
+          const auto [row, col] = wmma_slot(g, lane, reg, e);
+          packed |= (D[size_t{row} * N + col] & mask) << (e * g.bits);
+        }
+        r[lane] = packed;
+      }
+      if (op.dtype == WmmaType::F32 || op.dtype == WmmaType::F64) alu_fault(r, m, g.reg_bits);
+      write_reg(w, op.d[reg], m, r, g.reg_bits);
+    }
+  }
+
   void exec_wmma_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaMma& op, Mask m) {
+    if (op.generic) {
+      exec_wmma_mma_generic(w, ctx, ins, op, m);
+      return;
+    }
     // Gather A and B (16x16 f16 each) and C (16x16 f32) from the warp.
     // Held as f32, which every element type here fits exactly (f16 and bf16 are
     // both exact in a float), since the product is accumulated in f32 anyway.
@@ -5111,6 +5335,10 @@ class Interpreter {
   // than reading rows 16-31 of a 16-row matrix, which would be out of bounds.
   void exec_wmma_load(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaLoad& op,
                       Mask m) {
+    if (op.generic) {
+      exec_wmma_load_generic(w, ctx, ins, op, m);
+      return;
+    }
     Lanes _s_base;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     Lanes _s_stride;
@@ -5182,6 +5410,10 @@ class Interpreter {
 
   void exec_wmma_store(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaStore& op,
                        Mask m) {
+    if (op.generic) {
+      exec_wmma_store_generic(w, ctx, ins, op, m);
+      return;
+    }
     Lanes _s_base;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     Lanes _s_stride;

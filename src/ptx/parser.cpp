@@ -1589,55 +1589,169 @@ class Parser {
         }
       }
     } else if (op0 == "wmma") {
-      // wmma.mma.sync.aligned.<alayout>.<blayout>.m16n16k16.f32.f32 {d}, {a}, {b}, {c};
-      // wmma.store.d.sync.aligned.<layout>.m16n16k16[.space].f32 [addr], {d}, stride;
+      // wmma.load.{a,b,c}.sync.aligned.<layout>.<shape>[.space].<type> {r...}, [p] [, stride]
+      // wmma.store.d.sync.aligned.<layout>.<shape>[.space].<type> [p], {r...} [, stride]
+      // wmma.mma[.op.popc].sync.aligned.<alayout>.<blayout>.<shape>[.rnd].<types> {d}, {a}, {b}, {c}
       if (parts.size() < 2) return unsupported("wmma form");
       const std::string& kind = parts[1];
       std::vector<MatLayout> layouts;
       Space space = Space::Generic;
-      bool shape_ok = false;
       char frag = 0;
-      bool saw_f32 = false;
-      WmmaElem elem = WmmaElem::F16;
-      bool k8 = false;
+      WmmaShape shape;
+      bool have_shape = false, satfinite = false, popc = false, b1_and = false, b1_xor = false;
+      FRound rnd = FRound::Nearest;
+      std::vector<WmmaType> types;
+      static const std::unordered_map<std::string, WmmaShape> kShapes = {
+          {"m16n16k16", {16, 16, 16}}, {"m8n32k16", {8, 32, 16}}, {"m32n8k16", {32, 8, 16}},
+          {"m16n16k8", {16, 16, 8}},   {"m8n8k4", {8, 8, 4}},     {"m8n8k32", {8, 8, 32}},
+          {"m8n8k128", {8, 8, 128}}};
+      static const std::unordered_map<std::string, WmmaType> kTypes = {
+          {"f16", WmmaType::F16}, {"bf16", WmmaType::BF16}, {"tf32", WmmaType::TF32},
+          {"f32", WmmaType::F32}, {"f64", WmmaType::F64},   {"s8", WmmaType::S8},
+          {"u8", WmmaType::U8},   {"s4", WmmaType::S4},     {"u4", WmmaType::U4},
+          {"b1", WmmaType::B1},   {"s32", WmmaType::S32}};
       for (size_t i = 2; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "sync" || p == "aligned") ;
         else if (p == "a" || p == "b" || p == "c" || p == "d") frag = p[0];
-        else if (p == "f32") saw_f32 = true;
         else if (p == "row") layouts.push_back(MatLayout::Row);
         else if (p == "col") layouts.push_back(MatLayout::Col);
-        else if (p == "m16n16k16") shape_ok = true;
+        else if (auto sh = kShapes.find(p); sh != kShapes.end()) { shape = sh->second; have_shape = true; }
+        else if (auto ty = kTypes.find(p); ty != kTypes.end()) types.push_back(ty->second);
         else if (p == "global") space = Space::Global;
         else if (p == "shared") space = Space::Shared;
-        else if (p == "f16") ;
-        else if (p == "bf16") elem = WmmaElem::BF16;
-        else if (p == "tf32") { elem = WmmaElem::TF32; }
-        else if (p == "m16n16k8") { shape_ok = true; k8 = true; }
-        else if (p == "m8n32k16" || p == "m32n8k16")
-          // The rectangular m8n32/m32n8 variants of the 16-deep shape. Their
-          // fragments are laid out differently again, and nothing has needed
-          // them yet, so they say so rather than being approximated.
-          return unsupported("wmma shape '." + p + "' (only m16n16k16 and m16n16k8 "
-                             "are implemented)");
-        else return unsupported("wmma modifier '." + p + "' (only m16n16k16 f16/bf16 with an "
-                                "f32 accumulator is implemented)");
+        else if (p == "satfinite") satfinite = true;
+        else if (p == "popc") popc = true;
+        else if (p == "xor") b1_xor = true;
+        else if (p == "and") b1_and = true;
+        else if (p == "rn") rnd = FRound::Nearest;
+        else if (p == "rz") rnd = FRound::Zero;
+        else if (p == "rm") rnd = FRound::MinusInf;
+        else if (p == "rp") rnd = FRound::PlusInf;
+        else return unsupported("wmma modifier '." + p + "'");
       }
-      if (!shape_ok) return unsupported("only the m16n16k16 and m16n16k8 wmma shapes "
-                                        "are implemented");
-      // The implication only runs one way. `.tf32` always means m16n16k8, but
-      // m16n16k8 does not always mention tf32: the accumulator load and the
-      // store carry only `.f32`, because the C and D fragments are f32
-      // whatever the input type was. Requiring both tokens rejected
-      // wmma.load.c.m16n16k8.f32, which is most of a tf32 kernel.
-      if (elem == WmmaElem::TF32 && !k8)
-        return unsupported("wmma .tf32 outside the m16n16k8 shape");
-      if (k8 && (frag == 'a' || frag == 'b')) elem = WmmaElem::TF32;
-      if (kind == "mma") {
+      if (!have_shape) return unsupported("wmma needs a shape");
+      const bool k16 = shape.k == 16 && (shape == WmmaShape{16, 16, 16} || shape == WmmaShape{8, 32, 16} ||
+                                         shape == WmmaShape{32, 8, 16});
+      // Which types a multiplicand or accumulator of this shape may have.
+      auto ab_ok = [&](WmmaType t) {
+        if (k16) return t == WmmaType::F16 || t == WmmaType::BF16 || t == WmmaType::S8 || t == WmmaType::U8;
+        if (shape == WmmaShape{16, 16, 8}) return t == WmmaType::TF32;
+        if (shape == WmmaShape{8, 8, 4}) return t == WmmaType::F64;
+        if (shape == WmmaShape{8, 8, 32}) return t == WmmaType::S4 || t == WmmaType::U4;
+        return t == WmmaType::B1;
+      };
+      auto acc_ok = [&](WmmaType t) {
+        if (k16) return t == WmmaType::F16 || t == WmmaType::F32 || t == WmmaType::S32;
+        if (shape == WmmaShape{16, 16, 8}) return t == WmmaType::F32;
+        if (shape == WmmaShape{8, 8, 4}) return t == WmmaType::F64;
+        return t == WmmaType::S32;
+      };
+      const bool legacy_shape = shape == WmmaShape{16, 16, 16} || shape == WmmaShape{16, 16, 8};
+      auto arity = [&](char f, WmmaType t, size_t have) -> bool { return wmma_geom(f, shape, t).regs == have; };
+      // The stride is optional: the matrix's own leading dimension otherwise.
+      auto stride_or_default = [&](char f, WmmaType t, MatLayout lay) -> Operand {
+        if (peek_punct(",")) {
+          next();
+          return parse_operand();
+        }
+        const WmmaGeom g = wmma_geom(f, shape, t);
+        return Operand{ImmInt{static_cast<int64_t>(lay == MatLayout::Row ? g.cols : g.rows)}};
+      };
+      if (kind == "load") {
+        if (frag != 'a' && frag != 'b' && frag != 'c') return unsupported("wmma.load needs .a, .b or .c");
+        if (types.size() != 1) return unsupported("wmma.load takes one element type");
+        const WmmaType t = types[0];
+        if (frag == 'c' ? !acc_ok(t) : !ab_ok(t)) return unsupported("wmma.load of this type at this shape");
+        OpWmmaLoad op;
+        op.which = frag == 'a' ? OpWmmaLoad::Which::A : frag == 'b' ? OpWmmaLoad::Which::B : OpWmmaLoad::Which::C;
+        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
+        op.space = space;
+        op.shape = shape;
+        op.type = t;
+        if ((t == WmmaType::S4 || t == WmmaType::U4 || t == WmmaType::B1) &&
+            op.layout != (frag == 'a' ? MatLayout::Row : MatLayout::Col))
+          return unsupported("sub-byte and single-bit wmma loads A row-major and B column-major");
+        // The layouts this simulator has always used stay as they were.
+        if (frag == 'c') op.generic = !(legacy_shape && t == WmmaType::F32);
+        else op.generic = !((shape == WmmaShape{16, 16, 16} && (t == WmmaType::F16 || t == WmmaType::BF16)) ||
+                            t == WmmaType::TF32);
+        op.f32 = frag == 'c';
+        op.elem = t == WmmaType::BF16 ? WmmaElem::BF16 : t == WmmaType::TF32 ? WmmaElem::TF32 : WmmaElem::F16;
+        op.dsts = parse_reg_vector_any();
+        if (!arity(frag, t, op.dsts.size()))
+          return unsupported("wmma.load fragment arity (expected " +
+                             std::to_string(wmma_geom(frag, shape, t).regs) + " registers)");
+        expect_punct(",");
+        op.addr = parse_addr(fn);
+        op.stride = stride_or_default(frag, t, op.layout);
+        ins.op = op;
+      } else if (kind == "store") {
+        if (frag != 'd') return unsupported("wmma.store stores .d");
+        if (types.size() != 1 || !acc_ok(types[0])) return unsupported("wmma.store of this type at this shape");
+        OpWmmaStore op;
+        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
+        op.space = space;
+        op.shape = shape;
+        op.type = types[0];
+        op.generic = !(legacy_shape && op.type == WmmaType::F32);
+        op.addr = parse_addr(fn);
+        expect_punct(",");
+        for (auto& r : parse_reg_vector_any()) op.src.push_back(Operand{RegOperand{r}});
+        if (!arity('d', op.type, op.src.size()))
+          return unsupported("wmma.store fragment arity (expected " +
+                             std::to_string(wmma_geom('d', shape, op.type).regs) + " registers)");
+        op.stride = stride_or_default('d', op.type, op.layout);
+        ins.op = op;
+      } else if (kind == "mma") {
         if (layouts.size() != 2) return unsupported("wmma.mma needs both A and B layouts");
         OpWmmaMma op;
         op.alayout = layouts[0];
         op.blayout = layouts[1];
+        op.shape = shape;
+        // f16 multiplicands leave their type implicit: .dtype.ctype only.
+        if (types.size() == 2) {
+          op.dtype = types[0];
+          op.atype = op.btype = WmmaType::F16;
+          op.ctype = types[1];
+        } else if (types.size() == 4) {
+          op.dtype = types[0];
+          op.atype = types[1];
+          op.btype = types[2];
+          op.ctype = types[3];
+        } else {
+          return unsupported("wmma.mma types (.dtype.ctype, or .dtype.atype.btype.ctype)");
+        }
+        const WmmaType at = op.atype;
+        const bool fp16 = at == WmmaType::F16, integer = at == WmmaType::S8 || at == WmmaType::U8 ||
+                                                   at == WmmaType::S4 || at == WmmaType::U4;
+        if (!ab_ok(at) || op.btype != at) return unsupported("wmma.mma: A and B must have the same type, valid for the shape");
+        const bool acc_valid =
+            fp16 ? (op.dtype == WmmaType::F16 || op.dtype == WmmaType::F32) &&
+                       (op.ctype == WmmaType::F16 || op.ctype == WmmaType::F32)
+            : at == WmmaType::F64 ? op.dtype == WmmaType::F64 && op.ctype == WmmaType::F64
+            : (at == WmmaType::BF16 || at == WmmaType::TF32) ? op.dtype == WmmaType::F32 && op.ctype == WmmaType::F32
+                                                             : op.dtype == WmmaType::S32 && op.ctype == WmmaType::S32;
+        if (!acc_valid) return unsupported("wmma.mma accumulator types for these multiplicands");
+        if (satfinite && !integer && at != WmmaType::B1)
+          return unsupported("wmma.mma .satfinite is for integer multiplicands (removed for floating point in PTX 6.5)");
+        if (at == WmmaType::B1) {
+          if (!popc || b1_and == b1_xor) return unsupported("single-bit wmma.mma needs .xor.popc or .and.popc");
+          if (satfinite) return unsupported("single-bit wmma.mma has no .satfinite");
+        } else if (popc || b1_and || b1_xor) {
+          return unsupported(".popc is for single-bit wmma.mma");
+        }
+        if (rnd != FRound::Nearest && at != WmmaType::F64) return unsupported("a rounding mode on a non-f64 wmma.mma");
+        if ((at == WmmaType::S4 || at == WmmaType::U4 || at == WmmaType::B1) &&
+            (op.alayout != MatLayout::Row || op.blayout != MatLayout::Col))
+          return unsupported("sub-byte and single-bit wmma.mma is .row.col");
+        op.satfinite = satfinite;
+        op.b1_and = b1_and;
+        op.rnd = rnd;
+        op.generic = !((shape == WmmaShape{16, 16, 16} && (fp16 || at == WmmaType::BF16) &&
+                        op.ctype == WmmaType::F32 && op.dtype == WmmaType::F32) ||
+                       at == WmmaType::TF32);
+        op.elem = at == WmmaType::BF16 ? WmmaElem::BF16 : at == WmmaType::TF32 ? WmmaElem::TF32 : WmmaElem::F16;
         op.d = parse_reg_vector_any();
         expect_punct(",");
         op.a = parse_reg_vector_any();
@@ -1645,51 +1759,9 @@ class Parser {
         op.b = parse_reg_vector_any();
         expect_punct(",");
         op.c = parse_reg_vector_any();
-        op.elem = elem;
-        // f16 fragments duplicate the matrix across the warp and take 8
-        // registers; bf16 does not and takes 4. The accumulator is 8 either
-        // way, being 16x16 f32 over 32 lanes.
-        const size_t ab = elem == WmmaElem::F16 ? 8u : 4u;
-        if (op.d.size() != 8 || op.c.size() != 8 || op.a.size() != ab || op.b.size() != ab)
-          return unsupported("wmma.mma fragment arity (expected " + std::to_string(ab) +
-                             " A/B registers and 8 accumulator registers)");
-        ins.op = op;
-      } else if (kind == "store") {
-        OpWmmaStore op;
-        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
-        op.space = space;
-        op.addr = parse_addr(fn);
-        expect_punct(",");
-        {
-          std::vector<Reg> regs = parse_reg_vector_any();
-          for (auto& r : regs) op.src.push_back(Operand{RegOperand{r}});
-        }
-        if (op.src.size() != 8) return unsupported("wmma.store fragment arity");
-        expect_punct(",");
-        op.stride = parse_operand();
-        ins.op = op;
-      } else if (kind == "load") {
-        OpWmmaLoad op;
-        if (frag == 'a') op.which = OpWmmaLoad::Which::A;
-        else if (frag == 'b') op.which = OpWmmaLoad::Which::B;
-        else if (frag == 'c') op.which = OpWmmaLoad::Which::C;
-        else return unsupported("wmma.load without an a/b/c fragment selector");
-        op.f32 = saw_f32;
-        if (op.which == OpWmmaLoad::Which::C && !op.f32)
-          return unsupported("wmma.load.c with an f16 accumulator (only .f32 is implemented)");
-        if (op.which != OpWmmaLoad::Which::C && op.f32)
-          return unsupported("wmma.load.a/.b with f32 elements (only .f16 is implemented)");
-        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
-        op.space = space;
-        op.elem = elem;
-        op.dsts = parse_reg_vector_any();
-        const size_t want = (op.which == OpWmmaLoad::Which::C || elem == WmmaElem::F16) ? 8u : 4u;
-        if (op.dsts.size() != want)
-          return unsupported("wmma.load fragment arity (expected " + std::to_string(want) + ")");
-        expect_punct(",");
-        op.addr = parse_addr(fn);
-        expect_punct(",");
-        op.stride = parse_operand();
+        if (!arity('a', op.atype, op.a.size()) || !arity('b', op.btype, op.b.size()) ||
+            !arity('c', op.ctype, op.c.size()) || !arity('d', op.dtype, op.d.size()))
+          return unsupported("wmma.mma fragment arity for this shape and these types");
         ins.op = op;
       } else {
         return unsupported("wmma." + kind + " is not implemented (only .load, .mma and .store.d)");

@@ -1206,6 +1206,15 @@ if(TARGET vgpucudart)
     TIMEOUT 3600)
 endif()
 
+# Every WMMA shape and element type through mma.h.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_wmma_types COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wmma_types.sh)
+  set_tests_properties(e2e_wmma_types PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # Dynamic parallelism: device-side launches, nesting, order, named streams.
 if(TARGET vgpucudart)
   add_test(NAME e2e_dynamic_parallelism COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dynamic_parallelism.sh)

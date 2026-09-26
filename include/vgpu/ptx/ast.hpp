@@ -541,10 +541,54 @@ enum class MatLayout { Row, Col };
 //   tf32  m16n16k8,  4 registers -- A is 16x8 and B is 8x16, so the two
 //         fragments do not even share an index map
 enum class WmmaElem : uint8_t { F16, BF16, TF32 };
+// Every WMMA element type and shape (PTX ISA 9.7.16.4). The combinations
+// above -- f16/bf16 A and B at m16n16k16 with f32 accumulators, and tf32 at
+// m16n16k8 -- keep the layouts they have always had and the fast path; every
+// other one is `generic`: its fragment holds the logical matrix, elements
+// spread across lanes and registers in order, as many whole copies as the
+// ISA's register count holds, with the load applying the memory layout.
+enum class WmmaType : uint8_t { F16, BF16, TF32, F32, F64, S8, U8, S4, U4, B1, S32 };
+struct WmmaShape {
+  uint32_t m = 16, n = 16, k = 16;
+  bool operator==(const WmmaShape&) const = default;
+};
+inline uint32_t wmma_type_bits(WmmaType t) {
+  switch (t) {
+    case WmmaType::F16: case WmmaType::BF16: return 16;
+    case WmmaType::F64: return 64;
+    case WmmaType::S8: case WmmaType::U8: return 8;
+    case WmmaType::S4: case WmmaType::U4: return 4;
+    case WmmaType::B1: return 1;
+    default: return 32;
+  }
+}
+// The matrix a fragment holds ('a' is m x k, 'b' k x n, 'c'/'d' m x n) and the
+// registers the ISA gives it: exactly enough for the matrix, except f16 A and
+// B, which always take eight .f16x2 registers.
+struct WmmaGeom {
+  uint32_t rows = 0, cols = 0, bits = 0, reg_bits = 32, regs = 0;
+};
+inline WmmaGeom wmma_geom(char frag, WmmaShape s, WmmaType t) {
+  WmmaGeom g;
+  g.rows = frag == 'a' ? s.m : frag == 'b' ? s.k : s.m;
+  g.cols = frag == 'a' ? s.k : frag == 'b' ? s.n : s.n;
+  g.bits = wmma_type_bits(t);
+  g.reg_bits = t == WmmaType::F64 ? 64 : 32;
+  const uint64_t total = uint64_t{g.rows} * g.cols * g.bits;
+  g.regs = static_cast<uint32_t>((total + uint64_t{32} * g.reg_bits - 1) / (uint64_t{32} * g.reg_bits));
+  if (t == WmmaType::F16 && (frag == 'a' || frag == 'b')) g.regs = 8;
+  return g;
+}
 struct OpWmmaMma {
   WmmaElem elem = WmmaElem::F16;
   MatLayout alayout, blayout;
   std::vector<Reg> d, a, b, c;
+  bool generic = false;
+  WmmaShape shape;
+  WmmaType atype = WmmaType::F16, btype = WmmaType::F16, ctype = WmmaType::F32, dtype = WmmaType::F32;
+  bool satfinite = false;      // integer: clamp to the s32 range instead of wrapping
+  bool b1_and = false;         // b1: .and.popc rather than .xor.popc
+  FRound rnd = FRound::Nearest;  // f64
 };
 // wmma.load.{a,b,c}.sync.aligned.<layout>.m16n16k16[.space].<type> {d...}, [addr], stride
 //
@@ -558,6 +602,9 @@ struct OpWmmaLoad {
   WmmaElem elem = WmmaElem::F16;
   MatLayout layout = MatLayout::Row;
   Space space = Space::Generic;
+  bool generic = false;
+  WmmaShape shape;
+  WmmaType type = WmmaType::F16;
   bool f32 = false;         // the C fragment is f32; A and B are f16
   Addr addr;
   std::vector<Reg> dsts;
@@ -566,6 +613,9 @@ struct OpWmmaLoad {
 struct OpWmmaStore {
   MatLayout layout;
   Space space = Space::Generic;
+  bool generic = false;
+  WmmaShape shape;
+  WmmaType type = WmmaType::F32;
   Addr addr;
   std::vector<Operand> src;
   Operand stride;
