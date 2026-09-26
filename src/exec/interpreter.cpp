@@ -5969,12 +5969,15 @@ class Interpreter {
       auto& open = w.cp->open[lane];
       auto& groups = w.cp->groups[lane];
       // wait_all is defined as commit_group followed by wait_group 0, so both
-      // it and commit close whatever is open first.
+      // it and commit close whatever is open first -- into a group even when
+      // nothing is open. An empty group is trivially complete but it is still
+      // one of the "N most recent" wait_group N may leave pending: dropping
+      // it left an older, real group pending past the wait, and a CUTLASS
+      // multistage mainloop whose masked-off threads commit empty groups read
+      // stale stages.
       if (op.kind != OpCpAsyncGroup::Kind::WaitGroup) {
-        if (!open.empty()) {
-          groups.push_back(std::move(open));
-          open.clear();
-        }
+        groups.push_back(std::move(open));
+        open.clear();
       }
       if (op.kind == OpCpAsyncGroup::Kind::Commit) continue;
       const size_t keep = op.kind == OpCpAsyncGroup::Kind::WaitAll ? 0 : op.keep;

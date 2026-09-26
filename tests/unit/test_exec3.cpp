@@ -1300,6 +1300,43 @@ VTEST(cp_async_wait_group_keeps_later_groups_pending) {
   VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{0x22222222});  // wait_all drains it
 }
 
+VTEST(cp_async_empty_groups_count_toward_wait_group) {
+  // A commit with nothing issued still makes a group -- empty, and trivially
+  // complete, but one of the "N most recent" that wait_group N may leave
+  // pending. Here the real group is older than one empty group, so
+  // wait_group 1 must land it. Dropping empty groups kept it pending, and a
+  // CUTLASS multistage mainloop whose masked-off threads commit empty groups
+  // read stale stages.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 src, .param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .shared .align 16 .b8 tile[16];
+    ld.param.u64 %rd1, [src];
+    cvta.to.global.u64 %rd2, %rd1;
+    ld.param.u64 %rd3, [out];
+    cvta.to.global.u64 %rd4, %rd3;
+    mov.u32 %r1, tile;
+    mov.u32 %r6, 0xAAAAAAAA;
+    st.shared.u32 [%r1], %r6;
+    cp.async.ca.shared.global [%r1], [%rd2], 4;
+    cp.async.commit_group;
+    cp.async.commit_group;                    // empty
+    cp.async.wait_group 1;
+    ld.shared.u32 %r2, [%r1];
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t src = e.mem.alloc(16), out = e.mem.alloc(16);
+  e.mem.store_scalar(src, 4, 0x11111111u);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(src), arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0x11111111});
+}
+
 VTEST(cp_async_zero_fills_past_the_source_size) {
   // The src-size operand is how a kernel reads a tile that runs off the end of
   // a tensor without branching: the bytes past it read as zero, not as
