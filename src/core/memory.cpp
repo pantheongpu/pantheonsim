@@ -1,5 +1,6 @@
 #include "vgpu/memory.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <fcntl.h>
@@ -81,9 +82,10 @@ uint64_t MemoryManager::alloc(uint64_t size) {
   if (used_ + size > capacity_ || used_ + size < used_)
     throw Error::make(Err::OutOfMemory, "device out of memory: requested ", size, " bytes, ", used_,
                       " of ", capacity_, " bytes already in use");
-  uint64_t base = next_va_;
-  uint64_t padded = (size + kAllocAlign - 1) / kAllocAlign * kAllocAlign;
-  next_va_ += padded;
+  const uint64_t align = std::max(kAllocAlign, page_);
+  uint64_t base = (next_va_ + align - 1) / align * align;
+  uint64_t padded = (size + align - 1) / align * align;
+  next_va_ = base + padded;
   high_water_va_ = next_va_;
   used_ += size;
   Allocation a;
@@ -192,18 +194,22 @@ const MemoryManager::Allocation* MemoryManager::resolve_mapped(uint64_t addr, ui
 }
 
 const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t len, const char* op,
-                                                        uint64_t* base_out, bool writing) const {
+                                                        uint64_t* base_out, bool writing, bool page_slack) const {
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
   if (up != live_.begin()) {
     auto prev = std::prev(up);
     uint64_t base = prev->first;
     const Allocation& a = prev->second;
-    if (addr < base + a.size) {
+    // A kernel's read may run on to the end of the last page (set_page_size),
+    // which never passes the allocation's last chunk: a chunk is a whole
+    // number of pages.
+    const uint64_t extent = page_slack && page_ ? (a.size + page_ - 1) / page_ * page_ : a.size;
+    if (addr < base + extent) {
       // Computed as a remaining-length rather than an end-address: `addr + len`
       // wraps for a length near UINT64_MAX, and a wrapped sum compares *below*
       // the end, so the check passed exactly the accesses it exists to stop.
-      const uint64_t remaining = base + a.size - addr;
+      const uint64_t remaining = base + extent - addr;
       if (len > remaining)
         throw Error::make(Err::OutOfBounds, op, " of ", len, " bytes at ", Hex{addr},
                           " runs past the end of the ", a.size, "-byte allocation at ", Hex{base},
@@ -214,7 +220,8 @@ const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t 
     // The VA range up to the alignment-padded end belongs to this allocation:
     // an access there is an overrun, which deserves a better diagnosis than
     // "unknown pointer".
-    uint64_t padded = (a.size + kAllocAlign - 1) / kAllocAlign * kAllocAlign;
+    const uint64_t align = std::max(kAllocAlign, page_);
+    uint64_t padded = (a.size + align - 1) / align * align;
     if (addr < base + padded)
       throw Error::make(Err::OutOfBounds, op, " at ", Hex{addr}, " is ", addr - (base + a.size),
                         " bytes past the end of the ", a.size, "-byte allocation at ", Hex{base});
@@ -855,8 +862,8 @@ MemoryManager::ScalarAt MemoryManager::scalar_location(uint64_t addr, uint32_t s
     if (find_host_map_locked(addr, size)) return ScalarAt::HostMap;
   }
   uint64_t base = 0;
-  auto& a = const_cast<Allocation&>(resolve(addr, size, create ? "device memory write"
-                                                                 : "device memory read", &base));
+  auto& a = const_cast<Allocation&>(resolve(addr, size, create ? "device memory write" : "device memory read",
+                                            &base, /*writing=*/false, /*page_slack=*/!create));
   const uint64_t off = addr - base;
   const uint64_t chunk_idx = off / kChunkSize;
   uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);

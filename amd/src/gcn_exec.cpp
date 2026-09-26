@@ -3612,7 +3612,13 @@ struct Machine {
       const double sb = in.scaled ? scale_of(in.src[4], in.scale_sel >> 2, lane) : 1.0;
       for (uint32_t e = 0; e < per_lane; ++e) {
         if (!sparse) A(bl, within % s.m, g * per_lane + e) = value(in.src[0], s.in, e, lane) * sa;
-        B(bl, g * per_lane + e, within % s.n) = value(in.src[1], s.in_b ? s.in_b : s.in, e, lane) * sb;
+        // gfx950's sparse forms, whose B is eight registers, split it: the
+        // first four hold the lane group's run of K in the first half, the
+        // last four the same run K/2 on (the CDNA4 guide's layout tables),
+        // where A's run is K's in one piece -- as hipSPARSELt lays both out.
+        const uint32_t half = per_lane / 2;
+        const uint32_t kb = sparse && in.src[1].width == 8 ? e / half * (s.k / 2) + g * half + e % half : g * per_lane + e;
+        B(bl, kb, within % s.n) = value(in.src[1], s.in_b ? s.in_b : s.in, e, lane) * sb;
       }
       if (sparse) {
         // A lane's A holds two values of each four along K, packed; the

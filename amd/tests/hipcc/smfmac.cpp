@@ -148,7 +148,8 @@ void fill(int* words, char type, int n) {
 }
 
 // An M x N (M = N) product with K = 64 * per_lane / M; lane l holds row (or
-// column) l % M and the per_lane values of K block l / M. A lane's A holds
+// column) l % M and per_lane values of K: A's the run of block l / M, B's the
+// same, or on gfx950's forms two half-runs K/2 apart. A lane's A holds
 // per_lane / 2 values, value v the one at 4 * (v / 2) + its index in that run.
 // Output register r of lane l is D[i][l % M], i as every 16- and 32-wide
 // matrix instruction lays it out.
@@ -197,8 +198,17 @@ int check(const char* what, int m, int per_lane, char ta, char tb, bool integer,
         std::memcpy(&f, &c[16 * l + r], 4);
         want = f;
       }
-      for (int g = 0; g < 64 / m; ++g)
-        for (int e = 0; e < per_lane; ++e) want += dense_a(i + m * g, e) * element(&b[8 * (j + m * g)], tb, e);
+      // K value kk of row i is A's lane group kk / per_lane, and of column j
+      // B's: the same where B is four registers; where it is eight (gfx950's
+      // forms) the first four hold a group's run in the first half of K and
+      // the last four the same run K/2 on.
+      const int groups = 64 / m, K = groups * per_lane, half = per_lane / 2;
+      const bool split = per_lane * (ta == 'h' || ta == 'b' ? 2 : 1) == 32;
+      for (int kk = 0; kk < K; ++kk) {
+        const int ga = kk / per_lane, ea = kk % per_lane;
+        const int gb = split ? kk % (K / 2) / half : ga, eb = split ? kk / (K / 2) * half + kk % half : ea;
+        want += dense_a(i + m * ga, ea) * element(&b[8 * (j + m * gb)], tb, eb);
+      }
       double got;
       if (integer) got = d[16 * l + r];
       else {

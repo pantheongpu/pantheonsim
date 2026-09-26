@@ -98,6 +98,15 @@ class MemoryManager {
   // Allocates `size` bytes of virtual device memory. size == 0 is invalid.
   uint64_t alloc(uint64_t size);
 
+  // AMD's HIP hands device memory out a 4 KB page at a time, so a kernel that
+  // reads a little past the end of a buffer reads the rest of its page, and
+  // libraries count on it: hipSPARSELt's sparse GEMMs read a byte past their
+  // compressed matrix. With a page size set, allocations start on a page and
+  // a kernel's read of the rest of the last one is served; a copy or a write
+  // past the end is still refused. 0 -- the default, and NVIDIA's -- keeps
+  // every access to the bytes allocated.
+  void set_page_size(uint64_t bytes) { page_ = bytes; }
+
   // Frees an allocation. `ptr` must be the exact base returned by alloc().
   void free(uint64_t ptr);
 
@@ -353,8 +362,10 @@ class MemoryManager {
 
   // Maps addr to (allocation base, allocation); throws with diagnostics.
   // `writing` picks the diagnostic for a read-only mapping.
+  // `page_slack` lets a read run on into the rest of the allocation's last
+  // page (set_page_size).
   const Allocation& resolve(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
-                            bool writing = false) const;
+                            bool writing = false, bool page_slack = false) const;
   // The mapped-memory half of resolve: a hit returns the handle's allocation,
   // a miss returns null so the caller can carry on with its own diagnostics.
   const Allocation* resolve_mapped(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
@@ -367,6 +378,7 @@ class MemoryManager {
   uint64_t va_base_;
   uint64_t used_ = 0;
   uint64_t next_va_;
+  uint64_t page_ = 0;   // set_page_size
   void notify_usage() const {
     if (usage_observer_) usage_observer_(used_);
   }

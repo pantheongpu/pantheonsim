@@ -527,6 +527,9 @@ class FaultHook final : public MemoryManager::AccessFault {
 Device::Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemetry)
     : profile_(std::move(profile)), ordinal_(ordinal),
       mem_(profile_.vram_bytes, static_cast<uint32_t>(ordinal)), telemetry_(telemetry) {
+  // AMD's HIP allocates device memory by the 4 KB page (MemoryManager::
+  // set_page_size says what that lets a kernel read).
+  if (profile_.vendor == "amd") mem_.set_page_size(4096);
   if (telemetry_) {
     int ord = ordinal_;
     telemetry::Publisher* pub = telemetry_;
