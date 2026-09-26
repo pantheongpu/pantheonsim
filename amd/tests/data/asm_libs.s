@@ -7,10 +7,10 @@
 // register copied; output multipliers; op_sel on a long form; SDWA keeping
 // the rest of its destination; VGPR indexing; 64-bit and packed atomics in
 // memory and LDS; an 8-bit float conversion into the high half of a
-// register; and a buffer resource with no data format, which holds
-// nothing. Built for gfx942 by build.sh, with clang's assembler.
+// register; a buffer resource with no data format, which holds nothing;
+// and scalar atomics. Built for gfx942 by build.sh, with clang's assembler.
 //
-// libs(int* out) writes 61 words, in the order the test lists them.
+// libs(int* out) writes 64 words, in the order the test lists them.
   .amdgcn_target "amdgcn-amd-amdhsa--gfx942"
   .text
   .globl libs
@@ -248,6 +248,20 @@ libs:
   buffer_load_dword v2, off, s[40:43], 0 offset:236
   s_waitcnt vmcnt(0)
   global_store_dword v0, v2, s[2:3] offset:240
+  // Scalar atomics, each handing back what it found: 5 + 3, then a
+  // decrement of 8 (below the limit 10) to 7.
+  v_mov_b32_e32 v1, 5
+  global_store_dword v0, v1, s[2:3] offset:244
+  s_waitcnt vmcnt(0)
+  s_mov_b32 s50, 3
+  s_atomic_add s50, s[2:3], 0xf4 glc
+  s_mov_b32 s51, 10
+  s_atomic_dec s51, s[2:3], 0xf4 glc
+  s_waitcnt lgkmcnt(0)
+  v_mov_b32_e32 v1, s50
+  global_store_dword v0, v1, s[2:3] offset:248
+  v_mov_b32_e32 v1, s51
+  global_store_dword v0, v1, s[2:3] offset:252
   s_endpgm
 .Lset:
   s_mov_b32 s26, 77
@@ -261,7 +275,7 @@ libs:
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
     .amdhsa_group_segment_fixed_size 64
     .amdhsa_next_free_vgpr 96
-    .amdhsa_next_free_sgpr 40
+    .amdhsa_next_free_sgpr 56
     .amdhsa_accum_offset 88
   .end_amdhsa_kernel
 
@@ -276,7 +290,7 @@ amdhsa.kernels:
     .group_segment_fixed_size: 64
     .private_segment_fixed_size: 0
     .wavefront_size: 64
-    .sgpr_count: 40
+    .sgpr_count: 56
     .vgpr_count: 96
     .max_flat_workgroup_size: 64
     .args:

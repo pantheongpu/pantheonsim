@@ -234,8 +234,8 @@ VTEST(vector_comparisons_packed_math_and_mixed_precision_give_what_the_isa_says)
 VTEST(what_pytorchs_rocm_libraries_use_gives_what_the_isa_says) {
   const amd::CodeObject o = object("asm_libs");
   MemoryManager mem(16ull << 20);
-  const uint64_t out = mem.alloc(61 * 4);
-  const std::vector<uint32_t> r = run(o, "libs", mem, out, 61, {out});
+  const uint64_t out = mem.alloc(64 * 4);
+  const std::vector<uint32_t> r = run(o, "libs", mem, out, 64, {out});
   const auto h = [](float v) {
     const _Float16 x = static_cast<_Float16>(v);
     uint16_t b;
@@ -302,6 +302,9 @@ VTEST(what_pytorchs_rocm_libraries_use_gives_what_the_isa_says) {
   VCHECK_EQ(r[58], 0x4840beefu);  // fp8 1 and 2 into the high half
   VCHECK_EQ(r[59], 5u);           // a store through a resource with no data format does not land
   VCHECK_EQ(r[60], 0u);           // and a load through it reads 0
+  VCHECK_EQ(r[61], 7u);           // 5 + 3, then decremented
+  VCHECK_EQ(r[62], 5u);           // what the add found
+  VCHECK_EQ(r[63], 8u);           // and what the decrement found
 }
 
 VTEST_MAIN

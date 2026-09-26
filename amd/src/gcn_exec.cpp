@@ -937,10 +937,50 @@ struct Machine {
       set_sgpr(w, in.dst[0].index + 1, static_cast<uint32_t>(stats.instructions >> 32));
       return;
     }
+    // The scalar cache holds nothing here to write back or drop.
+    if (OpName(in.name) == "s_dcache_wb"_op || OpName(in.name) == "s_dcache_inv"_op) return;
     // The base, the instruction's own offset, and a scalar register's where
     // it names one.
     const uint64_t base = scalar(w, in.src[0]) + static_cast<uint64_t>(in.offset) +
                           (in.has_saddr ? scalar_field(w, in.saddr, false) : 0);
+    if (in.name.rfind("s_store_dword", 0) == 0) {
+      for (uint32_t i = 0; i < in.dst[0].width; ++i)
+        at(base + 4 * i).store_scalar(base + 4 * i, 4, sgpr(w, in.dst[0].index + i));
+      return;
+    }
+    if (in.name.rfind("s_atomic_", 0) == 0) {
+      // One value for the whole wave, read and replaced at once; with glc
+      // the data register gets back what memory held.
+      const bool wide = in.name.size() > 3 && in.name.compare(in.name.size() - 3, 3, "_x2") == 0;
+      const uint32_t bytes = wide ? 8 : 4, r = in.dst[0].index;
+      const std::string what = in.name.substr(9, in.name.size() - 9 - (wide ? 3 : 0));
+      const uint64_t mask = wide ? ~uint64_t{0} : 0xFFFFFFFFull;
+      const uint64_t data = wide ? sgpr64(w, r) : sgpr(w, r);
+      const auto guard = atomic_guard(base);
+      const uint64_t old = at(base).load_scalar(base, bytes);
+      const auto sx = [&](uint64_t v) { return wide ? static_cast<int64_t>(v) : static_cast<int64_t>(static_cast<int32_t>(v)); };
+      uint64_t now;
+      if (what == "swap") now = data;
+      else if (what == "cmpswap") now = old == (wide ? sgpr64(w, r + 2) : sgpr(w, r + 1)) ? data : old;
+      else if (what == "add") now = old + data;
+      else if (what == "sub") now = old - data;
+      else if (what == "smin") now = sx(old) < sx(data) ? old : data;
+      else if (what == "umin") now = std::min(old, data);
+      else if (what == "smax") now = sx(old) > sx(data) ? old : data;
+      else if (what == "umax") now = std::max(old, data);
+      else if (what == "and") now = old & data;
+      else if (what == "or") now = old | data;
+      else if (what == "xor") now = old ^ data;
+      else if (what == "inc") now = old >= data ? 0 : old + 1;
+      else if (what == "dec") now = old == 0 || old > data ? data : old - 1;
+      else throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
+      at(base).store_scalar(base, bytes, now & mask);
+      if (in.cache & 1) {
+        if (wide) set_sgpr64(w, r, old);
+        else set_sgpr(w, r, static_cast<uint32_t>(old));
+      }
+      return;
+    }
     const uint32_t words = in.dst[0].width;
     for (uint32_t i = 0; i < words; ++i)
       set_sgpr(w, in.dst[0].index + i, static_cast<uint32_t>(at(base + 4 * i).load_scalar(base + 4 * i, 4)));

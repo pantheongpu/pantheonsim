@@ -257,6 +257,40 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // A counter the wave reads: no address, and nothing but the pair it
       // writes.
       {{Enc::Smem, 0x24}, {"s_memtime", 2, 0}},
+      // Scalar stores, and the scalar cache's write-back and invalidate.
+      {{Enc::Smem, 0x10}, {"s_store_dword", 1, 1, 2}},
+      {{Enc::Smem, 0x11}, {"s_store_dwordx2", 2, 1, 2}},
+      {{Enc::Smem, 0x12}, {"s_store_dwordx4", 4, 1, 2}},
+      {{Enc::Smem, 0x20}, {"s_dcache_inv", 0, 0}},
+      {{Enc::Smem, 0x21}, {"s_dcache_wb", 0, 0}},
+      // Scalar atomics: the data register is the value, and with glc gets
+      // back what memory held. hipBLASLt's kernels count work-groups with them.
+      {{Enc::Smem, 0x80}, {"s_atomic_swap", 1, 1, 2}},
+      {{Enc::Smem, 0x81}, {"s_atomic_cmpswap", 2, 1, 2}},
+      {{Enc::Smem, 0x82}, {"s_atomic_add", 1, 1, 2}},
+      {{Enc::Smem, 0x83}, {"s_atomic_sub", 1, 1, 2}},
+      {{Enc::Smem, 0x84}, {"s_atomic_smin", 1, 1, 2}},
+      {{Enc::Smem, 0x85}, {"s_atomic_umin", 1, 1, 2}},
+      {{Enc::Smem, 0x86}, {"s_atomic_smax", 1, 1, 2}},
+      {{Enc::Smem, 0x87}, {"s_atomic_umax", 1, 1, 2}},
+      {{Enc::Smem, 0x88}, {"s_atomic_and", 1, 1, 2}},
+      {{Enc::Smem, 0x89}, {"s_atomic_or", 1, 1, 2}},
+      {{Enc::Smem, 0x8a}, {"s_atomic_xor", 1, 1, 2}},
+      {{Enc::Smem, 0x8b}, {"s_atomic_inc", 1, 1, 2}},
+      {{Enc::Smem, 0x8c}, {"s_atomic_dec", 1, 1, 2}},
+      {{Enc::Smem, 0xa0}, {"s_atomic_swap_x2", 2, 1, 2}},
+      {{Enc::Smem, 0xa1}, {"s_atomic_cmpswap_x2", 4, 1, 2}},
+      {{Enc::Smem, 0xa2}, {"s_atomic_add_x2", 2, 1, 2}},
+      {{Enc::Smem, 0xa3}, {"s_atomic_sub_x2", 2, 1, 2}},
+      {{Enc::Smem, 0xa4}, {"s_atomic_smin_x2", 2, 1, 2}},
+      {{Enc::Smem, 0xa5}, {"s_atomic_umin_x2", 2, 1, 2}},
+      {{Enc::Smem, 0xa6}, {"s_atomic_smax_x2", 2, 1, 2}},
+      {{Enc::Smem, 0xa7}, {"s_atomic_umax_x2", 2, 1, 2}},
+      {{Enc::Smem, 0xa8}, {"s_atomic_and_x2", 2, 1, 2}},
+      {{Enc::Smem, 0xa9}, {"s_atomic_or_x2", 2, 1, 2}},
+      {{Enc::Smem, 0xaa}, {"s_atomic_xor_x2", 2, 1, 2}},
+      {{Enc::Smem, 0xab}, {"s_atomic_inc_x2", 2, 1, 2}},
+      {{Enc::Smem, 0xac}, {"s_atomic_dec_x2", 2, 1, 2}},
       {{Enc::Smem, 0x25}, {"s_memrealtime", 2, 0}},
       // VOP1 and VOP2, the vector ALU's short forms.
       {{Enc::Vop1, 0x00}, {"v_nop", 0, 0}},
@@ -1110,7 +1144,8 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.name = s.name;
     in.size = 8;
     const uint32_t w1 = word(code, at + 4);
-    in.dst.push_back(sgpr((w0 >> 6) & 0x7F, s.dst_width));
+    if (s.dst_width) in.dst.push_back(sgpr((w0 >> 6) & 0x7F, s.dst_width));
+    in.cache = (w0 >> 16) & 1;   // glc: an atomic hands back what it found
     if (s.srcs > 0) {
       in.src.push_back(sgpr(((w0 & 0x3F) << 1), s.src_width(0)));   // sbase counts register pairs
       // The offset is the instruction's own (IMM set), a scalar register's
@@ -1596,6 +1631,7 @@ std::string to_text(const Inst& i) {
       std::snprintf(b, sizeof b, ", 0x%x", i.offset);
       s += b;
     }
+    if (i.cache & 1) s += " glc";
   } else if (i.enc == Enc::Ds) {
     const bool two = i.name.find("read2") != std::string::npos || i.name.find("write2") != std::string::npos;
     if (i.name == "ds_swizzle_b32") {

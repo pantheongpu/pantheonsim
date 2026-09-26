@@ -43,7 +43,7 @@ v_mov_b32_e32 v1, s24
 global_store_dword v0, v1, s[2:3] offset:36
 v_mov_b32_e32 v1, s25
 global_store_dword v0, v1, s[2:3] offset:40
-s_call_b64 s[30:31], 272
+s_call_b64 s[30:31], 289
 v_mov_b32_e32 v1, s26
 global_store_dword v0, v1, s[2:3] offset:44
 v_mov_b32_e32 v2, -16
@@ -205,6 +205,18 @@ buffer_store_dword v1, off, s[40:43], 0 offset:236
 buffer_load_dword v2, off, s[40:43], 0 offset:236
 s_waitcnt vmcnt(0)
 global_store_dword v0, v2, s[2:3] offset:240
+v_mov_b32_e32 v1, 5
+global_store_dword v0, v1, s[2:3] offset:244
+s_waitcnt vmcnt(0)
+s_mov_b32 s50, 3
+s_atomic_add s50, s[2:3], 0xf4 glc
+s_mov_b32 s51, 10
+s_atomic_dec s51, s[2:3], 0xf4 glc
+s_waitcnt lgkmcnt(0)
+v_mov_b32_e32 v1, s50
+global_store_dword v0, v1, s[2:3] offset:248
+v_mov_b32_e32 v1, s51
+global_store_dword v0, v1, s[2:3] offset:252
 s_endpgm
 s_mov_b32 s26, 0x4d
 s_setpc_b64 s[30:31]
