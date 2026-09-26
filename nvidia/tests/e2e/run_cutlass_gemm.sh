@@ -55,12 +55,9 @@ tests=(
 )
 u="$cutlass/test/unit"
 # Each compile peaks near 10 GB, as run_cutlass_hopper.sh measured; as many
-# run together as the free memory holds, and never fewer than one.
-per_compile_kb=$((${VGPU_NVCC_COMPILE_MB:-10240} * 1024))
-avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-jobs=$(( avail_kb / per_compile_kb ))
-(( jobs < 1 )) && jobs=1
-(( jobs > ${#tests[@]} )) && jobs=${#tests[@]}
+# run together as the free memory (or the container's limit) holds, and never
+# fewer than one (cutlass_compile_jobs, cutlass_fetch.sh).
+jobs=$(cutlass_compile_jobs ${#tests[@]})
 compile() {
   local name="$1" arch="$2"
   nvcc -std=c++17 -O1 -cudart shared -arch="$arch" -code="$arch" --expt-relaxed-constexpr \

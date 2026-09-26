@@ -65,3 +65,36 @@ if [[ "${need_gtest:-0}" == 1 ]]; then
 fi
 flock -u "$fetch_lock"
 exec {fetch_lock}>&-
+
+# How many CUTLASS compiles to run at once, at most $1: as many as the free
+# memory holds at ${VGPU_NVCC_COMPILE_MB:-10240} MB each (a compile peaks near
+# 10 GB), keeping 2 GB back, and never fewer than one. VGPU_NVCC_JOBS sets it
+# outright. "Free" is the smaller of the machine's MemAvailable and what this
+# process's memory cgroup still allows: inside a container /proc/meminfo
+# reports the host, and sizing to that ran four 10 GB compiles in a 10 GB
+# container on a shared machine, which ended in the out-of-memory killer.
+cutlass_compile_jobs() {
+  local max="$1" jobs
+  if [[ -n "${VGPU_NVCC_JOBS:-}" ]]; then
+    jobs="$VGPU_NVCC_JOBS"
+  else
+    local per_kb=$(( ${VGPU_NVCC_COMPILE_MB:-10240} * 1024 ))
+    local free_kb limit cur cg
+    free_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    cg="$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup 2>/dev/null)"
+    if [[ -n "$cg" && -r "/sys/fs/cgroup$cg/memory.max" ]]; then           # cgroup v2
+      limit="$(cat "/sys/fs/cgroup$cg/memory.max")"
+      cur="$(cat "/sys/fs/cgroup$cg/memory.current" 2>/dev/null || echo 0)"
+    elif [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then          # cgroup v1
+      limit="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)"
+      cur="$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo 0)"
+    fi
+    if [[ "${limit:-max}" =~ ^[0-9]+$ ]] && (( limit / 1024 - cur / 1024 < free_kb )); then
+      free_kb=$(( limit / 1024 - cur / 1024 ))
+    fi
+    jobs=$(( (free_kb - 2 * 1024 * 1024) / per_kb ))
+  fi
+  (( jobs < 1 )) && jobs=1
+  (( jobs > max )) && jobs=$max
+  echo "$jobs"
+}
