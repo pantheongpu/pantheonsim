@@ -51,6 +51,14 @@ u="$cutlass/test/unit"
 # together as the free memory holds, and never fewer than one.
 per_compile_kb=$((${VGPU_NVCC_COMPILE_MB:-10240} * 1024))
 avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+# In a container /proc/meminfo is the host's, and the limit that kills a
+# compile is the container's own (cgroup v2): a self-hosted runner in a 10 GB
+# container on a 16 GB host would otherwise start one compile too many.
+if [[ -r /sys/fs/cgroup/memory.max ]] && read -r max_b < /sys/fs/cgroup/memory.max && [[ "$max_b" =~ ^[0-9]+$ ]]; then
+  cur_b=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0)
+  room_kb=$(( (max_b - cur_b) / 1024 ))
+  (( room_kb < avail_kb )) && avail_kb=$room_kb
+fi
 jobs=$(( avail_kb / per_compile_kb ))
 (( jobs < 1 )) && jobs=1
 (( jobs > ${#tests[@]} )) && jobs=${#tests[@]}
