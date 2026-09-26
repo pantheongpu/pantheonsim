@@ -333,8 +333,10 @@ struct Warp {
   Mask cluster_arrived = 0;
   uint32_t cluster_wait_phase = 0;
   // wgmma.mma_async instructions issued, which pairs this warp's n-th with
-  // the rest of its warpgroup's n-th (see WgmmaSnapshots).
+  // the rest of its warpgroup's n-th (see WgmmaSnapshots), and the count at
+  // each wgmma.commit_group not yet waited for.
   uint64_t wgmma_issued = 0;
+  std::vector<uint64_t> wgmma_commits;
   // Instructions this warp has issued, for the step budget. Counted per warp
   // rather than per launch: the budget exists to catch a thread that never
   // finishes, and a launch's total grows with its grid -- a 12 GB sweep over
@@ -2340,6 +2342,18 @@ class Interpreter {
       return;
     }
 
+    // wgmma.wait_group N: the groups before the N most recent are complete
+    // only once the whole warpgroup has issued their operations -- wgmma is
+    // one operation of all four warps. Until then the warp waits here. A warp
+    // that went on alone could release a stage its warp-mates had not yet
+    // waited for; the refill moved the barrier on two phases and the last
+    // warp's parity wait never finished (CUTLASS's ping-pong GEMM).
+    if (const auto* wop = std::get_if<OpWgmma>(&ins.op);
+        wop && wop->kind == WgmmaKind::Wait && m != 0 && !wgmma_group_caught_up(w, ctx, wop->wait_n)) {
+      w.yield_now = true;
+      return;
+    }
+
     if (m != 0) {
       try {
         dispatch(w, ctx, ins, m);
@@ -2350,6 +2364,21 @@ class Interpreter {
       }
     }
     ++w.paths[idx].pc;
+  }
+
+  // Whether every warp of w's warpgroup has issued the wgmma operations in the
+  // groups a wait_group `keep` waits for, and if so forgets those groups.
+  bool wgmma_group_caught_up(Warp& w, const BlockCtx& ctx, uint32_t keep) {
+    auto& marks = w.wgmma_commits;
+    if (marks.size() <= keep || !ctx.warps) return true;
+    const uint64_t need = marks[marks.size() - keep - 1];
+    const uint32_t linear0 = w.tid_x[0] + w.tid_y[0] * ctx.ntid[0] +
+                             w.tid_z[0] * ctx.ntid[0] * ctx.ntid[1];
+    const size_t first = (linear0 / W_) / 4 * 4;
+    for (size_t r = first; r < first + 4 && r < ctx.warps->size(); ++r)
+      if ((*ctx.warps)[r].wgmma_issued < need) return false;
+    marks.erase(marks.begin(), marks.end() - keep);
+    return true;
   }
 
   // Is there another path that can still run -- one not itself waiting at a
@@ -5001,6 +5030,7 @@ class Interpreter {
       ctx_fail(ins, -1, Err::UnsupportedPtx,
                "wgmma is .sync.aligned: every thread of the warpgroup must execute it, and this "
                "warp reached it with some lanes inactive or predicated off");
+    if (op.kind == WgmmaKind::Commit) w.wgmma_commits.push_back(w.wgmma_issued);
     if (op.kind != WgmmaKind::Mma) return;
 
     const uint32_t N = op.n, K = op.k;

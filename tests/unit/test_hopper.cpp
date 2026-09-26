@@ -97,6 +97,9 @@ struct Wgmma {
   // After its wait_group, warp 0 zeroes all of shared memory: legal, since a
   // completed wgmma has read its operands for the whole warpgroup.
   bool clobber_after = false;
+  // Each warp counts itself in shared memory just before its wgmma, and after
+  // wait_group every thread reads the count into its first D register.
+  bool count_issuers = false;
   std::string target = kHeader90a;
   std::string device = "nvidia/h100";
 
@@ -117,6 +120,7 @@ struct Wgmma {
     .reg .b32 %d<130>;
     .reg .b64 %rd<20>;
     .shared .align 1024 .b8 smem[16384];
+    .shared .align 4 .b32 cnt;
     ld.param.u64 %rd1, [pa];
     ld.param.u64 %rd2, [pb];
     ld.param.u64 %rd3, [pw];
@@ -154,11 +158,19 @@ COPIED:
     add.u64 %rd12, %rd4, %rd9;
 )" + loads + R"(
     setp.ne.u32 %p2, %r1, 999;
+)" + (count_issuers ? R"(
+    and.b32 %r24, %r1, 31;
+    setp.eq.u32 %p3, %r24, 0;
+    @%p3 atom.shared.add.u32 %r23, [cnt], 1;
+)" : "") + R"(
     wgmma.fence.sync.aligned;
     wgmma.mma_async.sync.aligned.)" + form + " {" + dl + "}, " + a + ", %rd6, " + scale_d + tail + R"(;
     wgmma.commit_group.sync.aligned;
     wgmma.wait_group.sync.aligned 0;
-)" + (clobber_after ? R"(
+)" + (count_issuers ? R"(
+    ld.shared.u32 %r22, [cnt];
+    mov.b32 %d0, %r22;
+)" : "") + (clobber_after ? R"(
     setp.ge.u32 %p3, %r1, 32;
     @%p3 bra CLOBBERED;
     shl.b32 %r20, %r1, 2;
@@ -522,6 +534,25 @@ VTEST(wgmma_reads_shared_operands_once_for_the_warpgroup) {
       std::memcpy(&got, &out[t * 4 + e], 4);
       VCHECK_EQ(got, want);
     }
+}
+
+// A warp gets past wgmma.wait_group only once all four warps of its
+// warpgroup have issued the operations it waits for -- the wgmma is theirs
+// together. The interpreter runs warp 0 first; letting it through at once
+// meant it could release a stage its warp-mates had not yet waited for, and in
+// CUTLASS's ping-pong GEMM the last warp then waited on a barrier phase that
+// had already gone by.
+VTEST(wgmma_wait_group_waits_for_the_whole_warpgroup) {
+  Wgmma w;
+  w.form = "m64n8k8.f32.tf32.tf32";
+  w.tail = ", 1, 1";
+  w.d_regs = 4;
+  w.count_issuers = true;
+  w.a_words.assign(128 * 4, 0);
+  w.d_in.assign(128 * 4, 0);
+  w.desc_b = desc(0, 128, 256, 0);
+  const auto out = w.run();
+  for (int t = 0; t < 128; ++t) VCHECK_EQ(out[t * 4], 4u);
 }
 
 // Integers: s8 x u8 with scale-d false (the garbage accumulator is ignored),
