@@ -188,6 +188,10 @@ add_custom_command(TARGET vgpuhip POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so.1"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so"
   COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7, libhsa-runtime64.so.1)")
+# The code objects a library carries for one target (amd/tools/fatbin-extract.cpp).
+add_executable(amd_fatbin_extract amd/tools/fatbin-extract.cpp)
+target_link_libraries(amd_fatbin_extract PRIVATE vgpu ${CMAKE_DL_LIBS})
+target_include_directories(amd_fatbin_extract PRIVATE amd/include)
 # How fast the CDNA interpreter runs a kernel (amd/tools/exec-bench.cpp).
 add_executable(amd_exec_bench amd/tools/exec-bench.cpp)
 target_link_libraries(amd_exec_bench PRIVATE vgpu)

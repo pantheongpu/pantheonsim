@@ -5,7 +5,9 @@ distinct shape -- mnemonic, operand kinds, modifiers -- up to a few of each
 mnemonic. test_amd_gcn decodes every one and compares, so the decoder is
 checked against what ROCm's libraries actually contain, in CI, without ROCm.
 
-  amd/tools/isa-corpus.py <llvm-objdump> <out> <code object>...
+  amd/tools/isa-corpus.py [--mcpu=gfx950] <llvm-objdump> <out> <code object>...
+
+gfx942 unless --mcpu names another target (isa_corpus_gfx950.txt is gfx950's).
 
 Only encodings and their disassembly are kept, never whole kernels.
 """
@@ -13,7 +15,11 @@ import re
 import subprocess
 import sys
 
-objdump, out, objects = sys.argv[1], sys.argv[2], sys.argv[3:]
+args = sys.argv[1:]
+mcpu = 'gfx942'
+if args and args[0].startswith('--mcpu='):
+    mcpu = args.pop(0).split('=', 1)[1]
+objdump, out, objects = args[0], args[1], args[2:]
 PER_MNEMONIC = 6
 line_re = re.compile(r'^\t(\S+)(.*?)\s*// [0-9A-F]+: ((?:[0-9A-F]{8} ?)+)$')
 seen, per = {}, {}
@@ -29,7 +35,7 @@ def shape(mnem, ops):
 
 
 for obj in objects:
-    proc = subprocess.Popen([objdump, '-d', '--mcpu=gfx942', obj], stdout=subprocess.PIPE, text=True,
+    proc = subprocess.Popen([objdump, '-d', '--mcpu=' + mcpu, obj], stdout=subprocess.PIPE, text=True,
                             errors='replace')
     for line in proc.stdout:
         m = line_re.match(line.rstrip('\n'))
@@ -48,7 +54,7 @@ for obj in objects:
     proc.wait()
 
 with open(out, 'w') as f:
-    f.write('# gfx942 instructions from ROCm\'s libraries: the encoding (little-endian 32-bit words)\n'
+    f.write(f'# {mcpu} instructions from ROCm\'s libraries: the encoding (little-endian 32-bit words)\n'
             '# and llvm-objdump\'s text for it. Written by amd/tools/isa-corpus.py.\n')
     for key in sorted(seen, key=lambda k: seen[k][1]):
         words, text = seen[key]

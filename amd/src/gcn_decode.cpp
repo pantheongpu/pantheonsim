@@ -254,6 +254,13 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Smem, 0x02}, {"s_load_dwordx4", 4, 1, 2}},
       {{Enc::Smem, 0x03}, {"s_load_dwordx8", 8, 1, 2}},
       {{Enc::Smem, 0x04}, {"s_load_dwordx16", 16, 1, 2}},
+      // The same through a buffer resource (V#), four registers: what a
+      // kernel reads its constants through when they are in a buffer.
+      {{Enc::Smem, 0x08}, {"s_buffer_load_dword", 1, 1, 4}},
+      {{Enc::Smem, 0x09}, {"s_buffer_load_dwordx2", 2, 1, 4}},
+      {{Enc::Smem, 0x0a}, {"s_buffer_load_dwordx4", 4, 1, 4}},
+      {{Enc::Smem, 0x0b}, {"s_buffer_load_dwordx8", 8, 1, 4}},
+      {{Enc::Smem, 0x0c}, {"s_buffer_load_dwordx16", 16, 1, 4}},
       // A counter the wave reads: no address, and nothing but the pair it
       // writes.
       {{Enc::Smem, 0x24}, {"s_memtime", 2, 0}},
@@ -322,6 +329,12 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x47}, {"v_rndne_f16_e32", 1, 1}},
       // Two registers trade places, lane by lane.
       {{Enc::Vop1, 0x51}, {"v_swap_b32", 1, 1}},
+      // gfx950's: a pseudo-random step, two swaps across halves of the wave
+      // (each writes both registers), and a bfloat16 widened to a float.
+      {{Enc::Vop1, 0x58}, {"v_prng_b32_e32", 1, 1}},
+      {{Enc::Vop1, 0x59}, {"v_permlane16_swap_b32_e32", 1, 1}},
+      {{Enc::Vop1, 0x5a}, {"v_permlane32_swap_b32_e32", 1, 1}},
+      {{Enc::Vop1, 0x5b}, {"v_cvt_f32_bf16_e32", 1, 1}},
       // One accumulation register copied to another.
       {{Enc::Vop1, 0x52}, {"v_accvgpr_mov_b32", 1, 1}},
       {{Enc::Vop1, 0x15}, {"v_cvt_u32_f64_e32", 1, 1, 2}},
@@ -585,6 +598,13 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x28d}, {"v_mbcnt_hi_u32_b32", 1, 2}},
       {{Enc::Vop3, 0x28f}, {"v_lshlrev_b64", 2, 2, 1, 2}},
       {{Enc::Vop3, 0x296}, {"v_cvt_pkrtz_f16_f32", 1, 2}},
+      // gfx950's: any function of three inputs, bit by bit, by its truth
+      // table; and two floats to a packed pair of halves or bfloat16s,
+      // rounded to nearest.
+      {{Enc::Vop3, 0x233}, {"v_bitop3_b16", 1, 3}},
+      {{Enc::Vop3, 0x234}, {"v_bitop3_b32", 1, 3}},
+      {{Enc::Vop3, 0x267}, {"v_cvt_pk_f16_f32", 1, 2}},
+      {{Enc::Vop3, 0x268}, {"v_cvt_pk_bf16_f32", 1, 2}},
       {{Enc::Vop3, 0x290}, {"v_lshrrev_b64", 2, 2, 1, 2}},
       {{Enc::Vop3, 0x291}, {"v_ashrrev_i64", 2, 2, 1, 2}},
       {{Enc::Vop3, 0x2a0}, {"v_pack_b32_f16", 1, 2}},
@@ -812,6 +832,11 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x5f}, {"v_mfma_f32_4x4x4_16b_bf16", 4, 3, 2, 2, 4}},
       {{Enc::Vop3p, 0x60}, {"v_mfma_f32_32x32x8_bf16", 16, 3, 2, 2, 16}},
       {{Enc::Vop3p, 0x61}, {"v_mfma_f32_16x16x16_bf16", 4, 3, 2, 2, 4}},
+      // gfx950's: the same with K doubled, eight halves or bfloat16s a lane.
+      {{Enc::Vop3p, 0x54}, {"v_mfma_f32_16x16x32_f16", 4, 3, 4, 4, 4}},
+      {{Enc::Vop3p, 0x55}, {"v_mfma_f32_32x32x16_f16", 16, 3, 4, 4, 16}},
+      {{Enc::Vop3p, 0x35}, {"v_mfma_f32_16x16x32_bf16", 4, 3, 4, 4, 4}},
+      {{Enc::Vop3p, 0x37}, {"v_mfma_f32_32x32x16_bf16", 16, 3, 4, 4, 16}},
       // 8-bit floats, A's and B's each fp8 or bf8, eight to a register pair.
       {{Enc::Vop3p, 0x70}, {"v_mfma_f32_16x16x32_bf8_bf8", 4, 3, 2, 2, 4}},
       {{Enc::Vop3p, 0x71}, {"v_mfma_f32_16x16x32_bf8_fp8", 4, 3, 2, 2, 4}},
@@ -1286,6 +1311,12 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       o.abs = (abs >> k) & 1;
       in.src.push_back(o);
     }
+    // v_bitop3's truth table is in those modifier bits instead.
+    if (in.name.rfind("v_bitop3_", 0) == 0) {
+      in.bitop3 = static_cast<uint8_t>(neg | abs << 3 | in.omod << 6);
+      in.omod = 0;
+      for (Operand& o : in.src) o.neg = o.abs = false;
+    }
 
   } else if ((w0 >> 26) == 0x36) {    // DS
     in.enc = Enc::Ds;
@@ -1580,6 +1611,11 @@ std::string to_text(const Inst& i) {
     std::snprintf(m, sizeof m, " row_mask:0x%x bank_mask:0x%x", i.row_mask, i.bank_mask);
     s += " " + dpp_control_text(i.dpp_ctrl) + m;
     if (i.bound_ctrl) s += " bound_ctrl:1";
+  }
+  if (i.bitop3) {
+    char t[24];
+    std::snprintf(t, sizeof t, " bitop3:0x%x", i.bitop3);
+    s += t;
   }
   if (i.enc == Enc::Vop3 && i.op_sel) {
     // A source's bit each, then the destination's (bit 3); the stochastic

@@ -985,6 +985,20 @@ struct Machine {
       return;
     }
     const uint32_t words = in.dst[0].width;
+    if (in.name.rfind("s_buffer_load_", 0) == 0) {
+      // Through a buffer resource: its base (48 bits) and its size in bytes
+      // (num_records); each dword past the end reads 0.
+      const uint32_t r = in.src[0].index;
+      const uint64_t buffer = sgpr(w, r) | uint64_t{sgpr(w, r + 1) & 0xFFFF} << 32;
+      const uint64_t records = sgpr(w, r + 2);
+      const uint64_t offset = static_cast<uint64_t>(in.offset) + (in.has_saddr ? scalar_field(w, in.saddr, false) : 0);
+      for (uint32_t i = 0; i < words; ++i) {
+        const uint64_t off = offset + 4 * i, addr = buffer + off;
+        set_sgpr(w, in.dst[0].index + i,
+                 off + 4 <= records ? static_cast<uint32_t>(at(addr).load_scalar(addr, 4)) : 0);
+      }
+      return;
+    }
     for (uint32_t i = 0; i < words; ++i)
       set_sgpr(w, in.dst[0].index + i, static_cast<uint32_t>(at(base + 4 * i).load_scalar(base + 4 * i, 4)));
   }
@@ -1405,6 +1419,29 @@ struct Machine {
         const uint32_t a = w.vgpr[in.dst[0].index][lane], b = w.vgpr[in.src[0].index][lane];
         w.vgpr[in.dst[0].index][lane] = b;
         w.vgpr[in.src[0].index][lane] = a;
+      });
+    } else if (op == "v_permlane32_swap_b32_e32"_op || op == "v_permlane32_swap_b32_e64"_op ||
+               op == "v_permlane16_swap_b32_e32"_op || op == "v_permlane16_swap_b32_e64"_op) {
+      // gfx950: the upper 32 lanes of the first register trade places with
+      // the lower 32 of the second; or, 16 lanes to a row, each odd row of
+      // the first with the even row before it in the second. A pair is
+      // swapped where both its lanes are on.
+      const bool rows32 = op.find("permlane32") != std::string::npos;
+      auto& d = w.vgpr[in.dst[0].index];
+      auto& v = w.vgpr[in.src[0].index];
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        const bool first = rows32 ? lane >= 32 : (lane / 16) % 2 == 1;
+        if (!first) continue;
+        const uint32_t other = rows32 ? lane - 32 : lane - 16;
+        if (!(w.exec >> lane & 1) || !(w.exec >> other & 1)) continue;
+        std::swap(d[lane], v[other]);
+      }
+    } else if (op == "v_cvt_f32_bf16_e32"_op || op == "v_cvt_f32_bf16_e64"_op) {
+      // gfx950: a bfloat16 (the low half, or the high one op_sel names) as
+      // the float it is the top half of.
+      each([&](uint32_t lane) {
+        const uint32_t x = lane_src(w, in.src[0], lane) >> (16 * (in.op_sel & 1));
+        write_float(w, in, lane, as_float((x & 0xFFFF) << 16));
       });
     } else if (op == "v_accvgpr_mov_b32"_op) {
       each([&](uint32_t lane) { set_word(w, in.dst[0], 0, lane, lane_src(w, in.src[0], lane)); });
@@ -2002,6 +2039,40 @@ struct Machine {
         const double sum = half(a, 0) * half(b, 0) + half(a, 1) * half(b, 1) +
                            static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane]));
         write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(sum)));
+      });
+    } else if (op == "v_bitop3_b32"_op || op == "v_bitop3_b16"_op) {
+      // Each result bit is the truth table's entry for that bit of the three
+      // sources, the first the most significant of the index: 0xF0, 0xCC and
+      // 0xAA as the sources give the table itself. The 16-bit form reads the
+      // half op_sel names of each source, and writes the low half.
+      const bool b16 = op == "v_bitop3_b16"_op;
+      each([&](uint32_t lane) {
+        uint32_t x[3];
+        for (uint32_t k = 0; k < 3; ++k) {
+          x[k] = lane_src(w, in.src[k], lane);
+          if (b16) x[k] = (x[k] >> (16 * ((in.op_sel >> k) & 1))) & 0xFFFF;
+        }
+        uint32_t r = 0;
+        for (uint32_t idx = 0; idx < 8; ++idx)
+          if (in.bitop3 >> idx & 1)
+            r |= (idx & 4 ? x[0] : ~x[0]) & (idx & 2 ? x[1] : ~x[1]) & (idx & 1 ? x[2] : ~x[2]);
+        if (b16) r &= 0xFFFF;
+        write_lane(w, in.dst[0], lane, r);
+      });
+    } else if (op == "v_cvt_pk_f16_f32"_op || op == "v_cvt_pk_bf16_f32"_op) {
+      // Two floats to a packed pair, the first in the low half, each rounded
+      // to nearest even.
+      const bool bf = op == "v_cvt_pk_bf16_f32"_op;
+      each([&](uint32_t lane) {
+        const float a = lane_float(w, in.src[0], lane), b = lane_float(w, in.src[1], lane);
+        const auto narrow = [&](float f) -> uint32_t {
+          if (bf) return to_bf16(f);
+          const _Float16 h = static_cast<_Float16>(f);
+          uint16_t bits;
+          std::memcpy(&bits, &h, 2);
+          return bits;
+        };
+        write_lane(w, in.dst[0], lane, narrow(a) | narrow(b) << 16);
       });
     } else if (op == "v_cvt_pkrtz_f16_f32"_op) {
       each([&](uint32_t lane) {
@@ -3227,6 +3298,13 @@ struct Machine {
     if (op == "v_mfma_f32_32x32x1_2b_f32"_op) return &f32_32x32x1_2b;
     if (op == "v_mfma_f64_16x16x4_f64"_op) return &f64_16x16x4;
     if (op == "v_mfma_f32_16x16x16_bf16"_op) return &bf16_16x16x16;
+    // gfx950's, with K doubled.
+    static const MatrixShape f16_16x16x32{16, 16, 32, 1, 'h', 'f'}, f16_32x32x16{32, 32, 16, 1, 'h', 'f'},
+        bf16_16x16x32{16, 16, 32, 1, 'b', 'f'}, bf16_32x32x16{32, 32, 16, 1, 'b', 'f'};
+    if (op == "v_mfma_f32_16x16x32_f16"_op) return &f16_16x16x32;
+    if (op == "v_mfma_f32_32x32x16_f16"_op) return &f16_32x32x16;
+    if (op == "v_mfma_f32_16x16x32_bf16"_op) return &bf16_16x16x32;
+    if (op == "v_mfma_f32_32x32x16_bf16"_op) return &bf16_32x32x16;
     if (op == "v_mfma_f32_32x32x8_f16"_op) return &f16_32x32x8;
     if (op == "v_mfma_f32_32x32x8_bf16"_op) return &bf16_32x32x8;
     if (op == "v_mfma_i32_32x32x16_i8"_op) return &i8_32x32x16;

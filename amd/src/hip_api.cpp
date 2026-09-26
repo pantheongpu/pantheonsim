@@ -1238,10 +1238,25 @@ hipError_t hipModuleGetGlobal(void** dptr, size_t* bytes, hipModule_t module, co
   return record(s, hipSuccess);
 }
 
+namespace {
+// A module launch: `grid_items`, where it is set, is the grid in work-items
+// when it is not a whole number of work-groups (hipExtModuleLaunchKernel).
+hipError_t module_launch(hipFunction_t f, unsigned int gx, unsigned int gy, unsigned int gz, unsigned int bx,
+                         unsigned int by, unsigned int bz, unsigned int shared, hipStream_t stream, void** params,
+                         void** extra, const uint32_t* grid_items);
+}  // namespace
+
 hipError_t hipModuleLaunchKernel(hipFunction_t f, unsigned int gx, unsigned int gy, unsigned int gz,
                                  unsigned int bx, unsigned int by, unsigned int bz, unsigned int shared,
                                  hipStream_t stream, void** params, void** extra) {
   const ApiCall api("hipModuleLaunchKernel");
+  return module_launch(f, gx, gy, gz, bx, by, bz, shared, stream, params, extra, nullptr);
+}
+
+namespace {
+hipError_t module_launch(hipFunction_t f, unsigned int gx, unsigned int gy, unsigned int gz, unsigned int bx,
+                         unsigned int by, unsigned int bz, unsigned int shared, hipStream_t stream, void** params,
+                         void** extra, const uint32_t* grid_items) {
   State& s = state();
   std::unique_lock<std::mutex> lock(s.mutex);
   if (!f) return record(s, hipErrorInvalidValue);
@@ -1258,9 +1273,12 @@ hipError_t hipModuleLaunchKernel(hipFunction_t f, unsigned int gx, unsigned int 
                                           std::move(args), stream, false, &job);
       e != hipSuccess)
     return record(s, e);
+  if (grid_items)
+    for (int i = 0; i < 3; ++i) job.grid_items[i] = grid_items[i];
   lock.unlock();
   return record(s, launch_in_order(std::move(job)));
 }
+}  // namespace
 
 const char* hipGetErrorName(hipError_t e) {
   const ApiCall api("hipGetErrorName");
@@ -2797,23 +2815,18 @@ hipError_t hipExtGetLastError(void) {
 
 // A module launch sized in work-items rather than work-groups, as HSA sizes a
 // dispatch, with events recorded either side of it. A grid that is not a
-// whole number of work-groups leaves its last ones partial, which this does
-// not model, and refuses.
+// whole number of work-groups runs its last ones short (vgpu/amd_exec.hpp),
+// as MIOpen's kernels on gfx950 ask for.
 hipError_t hipExtModuleLaunchKernel(hipFunction_t f, uint32_t gx, uint32_t gy, uint32_t gz, uint32_t lx, uint32_t ly,
                                     uint32_t lz, size_t shared, hipStream_t stream, void** params, void** extra,
                                     hipEvent_t start, hipEvent_t stop, uint32_t) {
   const ApiCall api("hipExtModuleLaunchKernel");
-  if (!lx || !ly || !lz) return record(state(), hipErrorInvalidConfiguration);
-  if (gx % lx || gy % ly || gz % lz)
-    return record(state(), fail(hipErrorNotSupported, "a grid of " + std::to_string(gx) + "x" + std::to_string(gy) +
-                                                          "x" + std::to_string(gz) +
-                                                          " work-items is not a whole number of work-groups of " +
-                                                          std::to_string(lx) + "x" + std::to_string(ly) + "x" +
-                                                          std::to_string(lz) + ", which this does not model"));
+  if (!lx || !ly || !lz || !gx || !gy || !gz) return record(state(), hipErrorInvalidConfiguration);
   if (start)
     if (const hipError_t e = hipEventRecord(start, stream); e != hipSuccess) return e;
-  if (const hipError_t e = hipModuleLaunchKernel(f, gx / lx, gy / ly, gz / lz, lx, ly, lz,
-                                                 static_cast<unsigned>(shared), stream, params, extra);
+  const uint32_t items[3] = {gx % lx ? gx : 0, gy % ly ? gy : 0, gz % lz ? gz : 0};
+  if (const hipError_t e = module_launch(f, (gx + lx - 1) / lx, (gy + ly - 1) / ly, (gz + lz - 1) / lz, lx, ly, lz,
+                                         static_cast<unsigned>(shared), stream, params, extra, items);
       e != hipSuccess)
     return e;
   return stop ? hipEventRecord(stop, stream) : hipSuccess;

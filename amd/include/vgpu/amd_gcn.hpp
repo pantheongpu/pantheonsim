@@ -71,6 +71,10 @@ struct Inst {
   // VOP3's (and SDWA's) output multiplier: 1 doubles a float result, 2
   // quadruples it, 3 halves it.
   uint8_t omod = 0;
+  // gfx950's v_bitop3: the truth table of three inputs, kept in the bits
+  // VOP3 otherwise uses for negation (bits 0-2), absolute value (3-5) and
+  // the output multiplier (6-7).
+  uint8_t bitop3 = 0;
   // SMEM: the offset is the instruction's own and a register's both, which
   // the assembler writes as "offset:" even when the constant is zero.
   bool smem_both_offsets = false;
