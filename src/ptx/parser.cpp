@@ -1937,12 +1937,14 @@ class Parser {
       ins.op = op;
     } else if (op0 == "mma") {
       // mma.sync.aligned.m16n8kK.row.col.<d>.<a>.<b>.<c>
+      // mma.sp[::ordered_metadata].sync.aligned.m16n8kK.row.col.<d>.<a>.<b>.<c> d, a, b, c, e, f
       uint32_t k = 0;
       std::vector<std::string> types;
-      bool row_col = false, saw_row = false;
+      bool row_col = false, saw_row = false, sparse = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "sync" || p == "aligned") ;
+        else if (p == "sp" || p == "sp::ordered_metadata") sparse = true;
         else if (p == "row") saw_row = true;
         else if (p == "col") { if (saw_row) row_col = true; }
         else if (p == "m16n8k8") k = 8;
@@ -1968,6 +1970,10 @@ class Parser {
       if (types[1] != types[2]) return unsupported("mma with mixed A and B types");
       op.acc_f16 = types[0] == "f16";
       op.acc_int = types[0] == "s32";
+      if (sparse && op.ab_type != MmaElem::F16 && op.ab_type != MmaElem::BF16)
+        return unsupported("mma.sp with ." + at + " (only .f16 and .bf16 sparse A are implemented)");
+      if (sparse && k == 8) return unsupported("mma.sp.m16n8k8 (f16/bf16 sparse A is k16 or k32)");
+      op.sparse = sparse;
       op.d = parse_reg_vector_any();
       expect_punct(",");
       op.a = parse_reg_vector_any();
@@ -1975,6 +1981,15 @@ class Parser {
       op.b = parse_reg_vector_any();
       expect_punct(",");
       op.c = parse_reg_vector_any();
+      if (sparse) {
+        expect_punct(",");
+        op.meta = parse_operand();
+        expect_punct(",");
+        op.selector = parse_operand();
+        const auto* sel = std::get_if<ImmInt>(&op.selector);
+        if (!sel || sel->value < 0 || sel->value > 1)
+          return unsupported("mma.sp's sparsity selector is an immediate 0 or 1 for .f16/.bf16");
+      }
       if (op.d.size() != op.c.size()) return unsupported("mma D and C arity differ");
       ins.op = op;
     } else if (op0 == "wgmma") {

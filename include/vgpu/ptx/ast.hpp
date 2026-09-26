@@ -282,6 +282,11 @@ struct OpMma {
   bool acc_f16 = false;     // accumulate in f16x2 registers rather than f32
   bool acc_int = false;     // s32 accumulate
   std::vector<Reg> d, a, b, c;
+  // mma.sp: A is 2:4 structured sparse, holding only its non-zero half; the
+  // metadata operand says where each stored element sits in its 4-wide chunk,
+  // and the selector says which threads of each group of four supply it.
+  bool sparse = false;
+  Operand meta, selector;
 };
 // Hopper's warpgroup MMA (sm_90a): wgmma.fence, .commit_group, .wait_group
 // and .mma_async. Four warps compute one 64xNxK product; A comes from

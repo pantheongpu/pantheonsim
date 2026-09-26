@@ -4740,7 +4740,8 @@ class Interpreter {
     // Elements each lane holds per register: 2 for 16-bit, 4 for 8-bit, 1 for
     // tf32. The register counts follow from the shape.
     const uint32_t per_reg = sixteen_bit ? 2u : (eight_bit ? 4u : 1u);
-    const uint32_t a_regs = (kM * K) / (W_ * per_reg);
+    // A sparse A stores half its elements.
+    const uint32_t a_regs = (kM * K / (op.sparse ? 2 : 1)) / (W_ * per_reg);
     const uint32_t b_regs = (K * kN) / (W_ * per_reg);
     if (op.a.size() != a_regs || op.b.size() != b_regs)
       ctx_fail(ins, -1, Err::UnsupportedPtx, "mma fragment arity does not match the shape");
@@ -4751,6 +4752,36 @@ class Interpreter {
     std::array<double, kM * 32> A{};
     std::array<double, 32 * kN> B{};
     std::array<double, kM * kN> C{};
+    if (op.sparse) {
+      // Sparse A (PTX ISA 9.7.16.6, figures for m16n8k16 and m16n8k32 f16):
+      // register r of lane (group, tid) holds the two stored elements of the
+      // 4-wide chunk tid + 4*(r/2) of row group + 8*(r%2). The metadata for
+      // rows g and g + 8 comes from one lane of group g: 4 bits a chunk,
+      // rows 8-15 in the high half, and within a chunk's 4 bits the low 2
+      // place the first stored element and the high 2 the second. For k32
+      // the selector names a pair of lanes -- 4*g + 2*selector for chunks 0-3
+      // and the next for chunks 4-7 -- and for k16, which needs only one, the
+      // lane 4*g + selector. Each of these was checked against an RTX 3060
+      // (sm_86), element by element and nibble by nibble.
+      Lanes _s_meta;
+      const Lanes meta = read_operand(w, ctx, ins, op.meta, _s_meta);
+      const uint32_t sel = static_cast<uint32_t>(std::get<ImmInt>(op.selector).value);
+      for (uint32_t reg = 0; reg < a_regs; ++reg) {
+        Lanes _s;
+        const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s);
+        for (uint32_t lane = 0; lane < W_; ++lane) {
+          const uint32_t group = lane / 4, tid = lane % 4;
+          const uint32_t row = group + (reg % 2) * 8;
+          const uint32_t chunk = tid + (reg / 2) * 4;
+          const uint32_t src = K == 16 ? 4 * group + sel : 4 * group + 2 * sel + (chunk >= 4 ? 1 : 0);
+          const uint32_t bits = static_cast<uint32_t>(meta[src]) >> ((row >= 8 ? 16 : 0) + (chunk % 4) * 4);
+          for (uint32_t e = 0; e < 2; ++e) {
+            const uint32_t idx = (bits >> (2 * e)) & 3;
+            A[row * K + chunk * 4 + idx] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
+          }
+        }
+      }
+    } else
     // A: lane (groupID, tid) holds rows {groupID, groupID+8} at the column
     // block the register index selects.
     for (uint32_t reg = 0; reg < a_regs; ++reg) {

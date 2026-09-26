@@ -465,6 +465,144 @@ VTEST(f16x2_packed_arithmetic) {
   VCHECK_EQ(half(neg, 1), 0xC200ull);  // -3.0
 }
 
+// mma.sp (2:4 structured sparsity) in its f16 m16n8k32 and m16n8k16 forms
+// with both sparsity selectors, and bf16 m16n8k32, against a table recorded on
+// a real RTX 3060 (sm_86) running these instructions on the same inputs. The
+// inputs are small integers, so every product and sum is exact and the table
+// pins the operand layout and the metadata: which lane's bits and which
+// nibble place each pair of stored A values, which the ISA's figures give and
+// the hardware settles.
+VTEST(mma_sp_matches_hardware) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k(.param .u64 pa, .param .u64 pab, .param .u64 pb, .param .u64 pbb,
+                  .param .u64 pe, .param .u64 pd)
+{
+  .reg .b32 %r<32>;
+  .reg .f32 %f<24>;
+  .reg .b64 %rd<16>;
+  ld.param.u64 %rd1, [pa];
+  ld.param.u64 %rd2, [pab];
+  ld.param.u64 %rd3, [pb];
+  ld.param.u64 %rd4, [pbb];
+  ld.param.u64 %rd5, [pe];
+  ld.param.u64 %rd6, [pd];
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd7, %r1, 16;
+  add.u64 %rd8, %rd1, %rd7;
+  ld.global.v4.u32 {%r2, %r3, %r4, %r5}, [%rd8];
+  add.u64 %rd8, %rd2, %rd7;
+  ld.global.v4.u32 {%r6, %r7, %r8, %r9}, [%rd8];
+  add.u64 %rd8, %rd3, %rd7;
+  ld.global.v4.u32 {%r10, %r11, %r12, %r13}, [%rd8];
+  add.u64 %rd8, %rd4, %rd7;
+  ld.global.v4.u32 {%r14, %r15, %r16, %r17}, [%rd8];
+  mul.wide.u32 %rd9, %r1, 4;
+  add.u64 %rd10, %rd5, %rd9;
+  ld.global.u32 %r18, [%rd10];
+  mov.f32 %f0, 0f00000000;
+  mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32 {%f1, %f2, %f3, %f4}, {%r2, %r3, %r4, %r5}, {%r10, %r11, %r12, %r13}, {%f0, %f0, %f0, %f0}, %r18, 0x0;
+  mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32 {%f5, %f6, %f7, %f8}, {%r2, %r3, %r4, %r5}, {%r10, %r11, %r12, %r13}, {%f0, %f0, %f0, %f0}, %r18, 0x1;
+  mma.sp::ordered_metadata.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%f9, %f10, %f11, %f12}, {%r2, %r3}, {%r10, %r11}, {%f0, %f0, %f0, %f0}, %r18, 0x0;
+  mma.sp::ordered_metadata.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%f13, %f14, %f15, %f16}, {%r2, %r3}, {%r10, %r11}, {%f0, %f0, %f0, %f0}, %r18, 0x1;
+  mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.bf16.bf16.f32 {%f17, %f18, %f19, %f20}, {%r6, %r7, %r8, %r9}, {%r14, %r15, %r16, %r17}, {%f0, %f0, %f0, %f0}, %r18, 0x0;
+  mul.wide.u32 %rd11, %r1, 80;
+  add.u64 %rd12, %rd6, %rd11;
+  st.global.v4.f32 [%rd12], {%f1, %f2, %f3, %f4};
+  st.global.v4.f32 [%rd12+16], {%f5, %f6, %f7, %f8};
+  st.global.v4.f32 [%rd12+32], {%f9, %f10, %f11, %f12};
+  st.global.v4.f32 [%rd12+48], {%f13, %f14, %f15, %f16};
+  st.global.v4.f32 [%rd12+64], {%f17, %f18, %f19, %f20};
+  ret;
+}
+)";
+  // Small integers as f16 and bf16 bits, through their exact f32 form.
+  auto f16_of = [](int v) -> uint32_t {
+    if (v == 0) return 0;
+    const float f = static_cast<float>(v);
+    uint32_t b;
+    std::memcpy(&b, &f, 4);
+    return ((b >> 16) & 0x8000u) | ((((b >> 23) & 0xFF) - 127 + 15) << 10) | ((b >> 13) & 0x3FF);
+  };
+  auto bf16_of = [](int v) -> uint32_t {
+    const float f = static_cast<float>(v);
+    uint32_t b;
+    std::memcpy(&b, &f, 4);
+    return b >> 16;
+  };
+  std::vector<uint32_t> a(128), ab(128), b(128), bb(128), e(32);
+  for (int i = 0; i < 128; ++i) {
+    const int x0 = (i * 7 + 3) % 9 - 4, x1 = (i * 5 + 1) % 7 - 3;
+    const int y0 = (i * 3 + 2) % 5 - 2, y1 = (i * 11 + 4) % 7 - 3;
+    a[i] = f16_of(x0) | f16_of(x1) << 16;
+    ab[i] = bf16_of(x0) | bf16_of(x1) << 16;
+    b[i] = f16_of(y0) | f16_of(y1) << 16;
+    bb[i] = bf16_of(y0) | bf16_of(y1) << 16;
+  }
+  // Each nibble names the two positions of a 4-wide chunk its pair came from.
+  const uint8_t pairs[6] = {0x4, 0x8, 0xC, 0x9, 0xD, 0xE};
+  for (int l = 0; l < 32; ++l)
+    for (int n = 0; n < 8; ++n) e[l] |= uint32_t{pairs[(l * 5 + n * 3) % 6]} << (4 * n);
+  const int want[32][20] = {
+    {-18, 20, 9, -13, -4, 39, 30, -30, -11, 9, 9, 10, -10, 0, 5, -8, -18, 20, 9, -13},
+    {-36, 13, 10, 2, -19, 3, -17, -4, -20, 4, 11, -9, 1, 2, 5, 8, -36, 13, 10, 2},
+    {11, -6, -5, 18, -18, 3, 11, 9, 14, 4, -18, -2, 3, 4, -10, -7, 11, -6, -5, 18},
+    {25, -24, -18, 12, 11, -19, -2, 25, 3, -12, 6, 7, 0, -13, 1, 14, 25, -24, -18, 12},
+    {37, -23, -21, 5, 10, -9, 0, 21, 24, -20, -20, -1, 2, -17, -13, 9, 37, -23, -21, 5},
+    {23, -27, -16, -19, 38, -13, -21, -15, 13, -9, -9, -17, 15, 1, -22, -5, 23, -27, -16, -19},
+    {-9, 22, 15, 3, -2, 9, 1, -8, -4, 14, 20, 7, 12, 18, 6, 8, -9, 22, 15, 3},
+    {-24, 36, 29, -13, -38, 9, 27, -1, -23, 24, 19, -10, -29, -4, 16, -8, -24, 36, 29, -13},
+    {0, 13, 16, -29, -17, 20, 19, -16, -6, 4, 9, -21, -9, -10, 1, -16, 0, 13, 16, -29},
+    {3, -7, -13, 13, 20, 37, -14, 4, 8, 16, -12, 15, -3, 5, -11, 20, 3, -7, -13, 13},
+    {-15, 16, -4, 4, -13, -31, 4, 12, -9, 0, -1, 3, 14, 8, 3, 6, -15, 16, -4, 4},
+    {-13, -2, 1, 24, -15, -22, 5, 14, -11, -7, 1, 10, -14, 0, -4, -6, -13, -2, 1, 24},
+    {-20, -17, -5, 11, -28, -2, -23, 17, -16, -18, -13, 10, 2, 1, -7, 0, -20, -17, -5, 11},
+    {14, 11, -29, -2, 13, 5, 7, 19, 8, 21, -23, 4, 5, -21, -2, 1, 14, 11, -29, -2},
+    {4, 2, 14, 10, 20, -8, -5, 1, 9, -3, 17, 5, 19, -7, 4, 7, 4, 2, 14, 10},
+    {-2, -20, 12, -14, -10, -9, -1, -39, -12, -14, 0, -12, -8, 17, 0, -16, -2, -20, 12, -14},
+    {-17, 14, 28, -16, 9, -13, 23, 0, 9, 1, 13, -11, 12, 7, 18, -7, -17, 14, 28, -16},
+    {-2, 16, 8, -29, 10, 2, 36, -19, -6, 7, -3, -10, -3, 7, 12, -8, -2, 16, 8, -29},
+    {14, -8, 12, 9, -5, 18, -17, -20, -11, -3, 15, 3, -17, -2, -3, -8, 14, -8, 12, 9},
+    {-5, -21, -14, 24, -18, 12, -15, 28, 10, 3, -14, 8, 7, -3, -5, 14, -5, -21, -14, 24},
+    {-20, 11, -1, 36, -21, 5, -8, 18, -7, 11, -6, 7, 9, 20, -9, -7, -20, 11, -1, 36},
+    {-6, -1, -7, 0, -16, -19, 14, 17, -13, -14, 9, 13, -15, -6, -2, 2, -6, -1, -7, 0},
+    {17, 9, -29, 14, 15, 3, -37, -8, 18, 14, -9, 3, -10, 6, 14, 11, 17, 9, -29, 14},
+    {5, -33, 2, -13, 29, -13, 4, -7, 4, -20, -12, -10, 10, -4, -15, -3, 5, -33, 2, -13},
+    {7, 7, -7, -26, 16, -29, -11, 12, 12, 7, 0, -26, 2, -5, 5, 19, 7, 7, -7, -26},
+    {14, 5, 21, -4, -13, 13, 12, -6, 9, -5, 14, 3, 7, 4, -7, -13, 14, 5, 21, -4},
+    {-20, -10, 7, 18, -4, 4, 6, -37, -20, -5, 12, 16, -6, -9, 2, -4, -20, -10, 7, 18},
+    {-3, 11, -15, -10, 1, 24, 14, 7, 11, 6, -24, -5, -2, 17, 10, 5, -3, 11, -15, -10},
+    {-19, 16, -8, -6, -5, 11, -5, -4, -18, 9, 7, 1, -10, -3, 10, 8, -19, 16, -8, -6},
+    {-10, -1, 1, 32, -29, -2, -10, 5, 2, 0, -4, 6, -12, -15, -6, 7, -10, -1, 1, 32},
+    {-2, -7, 8, -3, 14, 10, 16, 7, 3, -4, -10, -5, 18, 5, -14, -1, -2, -7, 8, -3},
+    {21, -19, -22, -15, 12, -14, -13, -5, 9, -12, 10, 5, 5, 3, 4, -3, 21, -19, -22, -15},
+  };
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  auto upload = [&](const std::vector<uint32_t>& v) {
+    const uint64_t at = mem.alloc(v.size() * 4);
+    mem.write(at, v.data(), v.size() * 4);
+    return at;
+  };
+  const uint64_t pa = upload(a), pab = upload(ab), pb = upload(b), pbb = upload(bb), pe = upload(e);
+  const uint64_t pd = mem.alloc(32 * 20 * 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  auto arg = [](uint64_t v) {
+    std::vector<uint8_t> x(8);
+    std::memcpy(x.data(), &v, 8);
+    return x;
+  };
+  exec::launch(m.entries[0], cfg, {arg(pa), arg(pab), arg(pb), arg(pbb), arg(pe), arg(pd)}, mem, prof);
+  std::vector<float> d(32 * 20);
+  mem.read(pd, d.data(), d.size() * 4);
+  for (int l = 0; l < 32; ++l)
+    for (int j = 0; j < 20; ++j) VCHECK_EQ(d[l * 20 + j], static_cast<float>(want[l][j]));
+}
+
 VTEST(wmma_m16n16k16_matmul) {
   // Fill A with 2.0 and B with 3.0 (every element), C with 0. Then every
   // element of D must be sum over k=0..15 of 2*3 = 96. This is the shape
