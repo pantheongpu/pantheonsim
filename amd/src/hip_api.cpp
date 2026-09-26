@@ -91,6 +91,14 @@ class ApiCall {
  public:
   explicit ApiCall(const char* name) {
     if (depth()++ != 0) return;
+    // VGPU_TRACE_API=1 names each HIP call a program makes, one line to
+    // stderr: what a library does through HIP, when it does not do what it
+    // should, is otherwise invisible.
+    static const bool trace = [] {
+      const char* t = std::getenv("VGPU_TRACE_API");
+      return t && t[0] == '1';
+    }();
+    if (trace) std::fprintf(stderr, "VirtualGPU HIP: %s\n", name);
     if (const auto* p = profiler(); p && p->api_enter) {
       hooks_ = p;
       token_ = p->api_enter(name);
@@ -1238,10 +1246,25 @@ hipError_t hipModuleGetGlobal(void** dptr, size_t* bytes, hipModule_t module, co
   return record(s, hipSuccess);
 }
 
+namespace {
+// A module launch: `grid_items`, where it is set, is the grid in work-items
+// when it is not a whole number of work-groups (hipExtModuleLaunchKernel).
+hipError_t module_launch(hipFunction_t f, unsigned int gx, unsigned int gy, unsigned int gz, unsigned int bx,
+                         unsigned int by, unsigned int bz, unsigned int shared, hipStream_t stream, void** params,
+                         void** extra, const uint32_t* grid_items);
+}  // namespace
+
 hipError_t hipModuleLaunchKernel(hipFunction_t f, unsigned int gx, unsigned int gy, unsigned int gz,
                                  unsigned int bx, unsigned int by, unsigned int bz, unsigned int shared,
                                  hipStream_t stream, void** params, void** extra) {
   const ApiCall api("hipModuleLaunchKernel");
+  return module_launch(f, gx, gy, gz, bx, by, bz, shared, stream, params, extra, nullptr);
+}
+
+namespace {
+hipError_t module_launch(hipFunction_t f, unsigned int gx, unsigned int gy, unsigned int gz, unsigned int bx,
+                         unsigned int by, unsigned int bz, unsigned int shared, hipStream_t stream, void** params,
+                         void** extra, const uint32_t* grid_items) {
   State& s = state();
   std::unique_lock<std::mutex> lock(s.mutex);
   if (!f) return record(s, hipErrorInvalidValue);
@@ -1258,9 +1281,12 @@ hipError_t hipModuleLaunchKernel(hipFunction_t f, unsigned int gx, unsigned int 
                                           std::move(args), stream, false, &job);
       e != hipSuccess)
     return record(s, e);
+  if (grid_items)
+    for (int i = 0; i < 3; ++i) job.grid_items[i] = grid_items[i];
   lock.unlock();
   return record(s, launch_in_order(std::move(job)));
 }
+}  // namespace
 
 const char* hipGetErrorName(hipError_t e) {
   const ApiCall api("hipGetErrorName");
@@ -1633,12 +1659,14 @@ void __hipUnregisterFatBinary(void** modules) {
 
 hipError_t __hipPushCallConfiguration(vgpu::amd::abi::Dim3 grid, vgpu::amd::abi::Dim3 block, size_t shared,
                                       hipStream_t stream) {
+  const ApiCall api("__hipPushCallConfiguration");
   g_call_configurations.push_back({grid, block, shared, stream});
   return hipSuccess;
 }
 
 hipError_t __hipPopCallConfiguration(vgpu::amd::abi::Dim3* grid, vgpu::amd::abi::Dim3* block, size_t* shared,
                                      hipStream_t* stream) {
+  const ApiCall api("__hipPopCallConfiguration");
   if (g_call_configurations.empty()) return hipErrorInvalidConfiguration;
   const CallConfiguration c = g_call_configurations.back();
   g_call_configurations.pop_back();
@@ -2790,6 +2818,104 @@ hipError_t hipStreamQuery(hipStream_t stream) {
   return record(s, hipSuccess);
 }
 
+// A HIP function by name, as a program that binds HIP at run time asks for
+// it (Triton's HIP driver does, for every call it makes): the library's own
+// export of that name, found the way the dynamic loader would find it.
+namespace {
+void* own_function(const char* symbol) {
+  static void* self = [] {
+    Dl_info info{};
+    dladdr(reinterpret_cast<void*>(&hipGetLastError), &info);
+    return info.dli_fname ? dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD) : nullptr;
+  }();
+  return self && symbol ? dlsym(self, symbol) : nullptr;
+}
+}  // namespace
+
+// A caller built for HIP 6 or later (the version it passes, in either of
+// HIP's forms: 600, or the driver's 60000000) means the functions HIP 6
+// renamed to take its struct layouts -- hipGetDeviceProperties is
+// hipGetDevicePropertiesR0600 to it, as HIP's headers make it.
+hipError_t hipGetProcAddress(const char* symbol, void** pfn, int hip_version, uint64_t, int* status) {
+  const ApiCall api("hipGetProcAddress");
+  if (!symbol || !pfn) return record(state(), hipErrorInvalidValue);
+  *pfn = nullptr;
+  if (hip_version >= 600) *pfn = own_function((std::string(symbol) + "R0600").c_str());
+  if (!*pfn) *pfn = own_function(symbol);
+  if (status) *status = *pfn ? 0 /* SUCCESS */ : 1 /* SYMBOL_NOT_FOUND */;
+  return record(state(), *pfn ? hipSuccess : hipErrorNotFound);
+}
+
+hipError_t hipGetDriverEntryPoint(const char* symbol, void** pfn, unsigned long long, int* status) {
+  const ApiCall api("hipGetDriverEntryPoint");
+  if (!symbol || !pfn) return record(state(), hipErrorInvalidValue);
+  *pfn = own_function(symbol);
+  if (status) *status = *pfn ? 0 /* SUCCESS */ : 1 /* SYMBOL_NOT_FOUND */;
+  return record(state(), *pfn ? hipSuccess : hipErrorNotFound);
+}
+
+// One attribute of a module's kernel (hipFunction_attribute), which Triton
+// reads for every kernel it compiles: its register and scratch use, and the
+// work-group size its metadata allows.
+hipError_t hipFuncGetAttribute(int* value, int attribute, hipFunction_t f) {
+  const ApiCall api("hipFuncGetAttribute");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!value || !f) return record(s, hipErrorInvalidValue);
+  vgpu::runtime::Device* d = device(s);
+  if (!d) return record(s, hipErrorInvalidDevice);
+  const Kernel& k = *reinterpret_cast<Function*>(f)->kernel;
+  const vgpu::DeviceProfile& p = d->profile();
+  switch (attribute) {
+    case 0: *value = static_cast<int>(k.max_flat_workgroup_size ? k.max_flat_workgroup_size : 1024); break;
+    case 1: *value = static_cast<int>(k.group_segment); break;                          // SHARED_SIZE_BYTES
+    case 2: *value = 0; break;                                                          // CONST_SIZE_BYTES
+    case 3: *value = static_cast<int>(k.private_segment); break;                        // LOCAL_SIZE_BYTES
+    case 4: *value = static_cast<int>(k.vgpr_count); break;                             // NUM_REGS
+    case 5:                                                                             // PTX_VERSION
+    case 6: *value = p.cc_major * 10 + p.cc_minor; break;                               // BINARY_VERSION
+    case 7: *value = 0; break;                                                          // CACHE_MODE_CA
+    case 8: *value = static_cast<int>(p.limits.shared_mem_per_block - k.group_segment); break;
+    case 9: *value = -1; break;                                                         // CARVEOUT: none preferred
+    default: return record(s, hipErrorInvalidValue);
+  }
+  return record(s, hipSuccess);
+}
+
+hipError_t hipModuleLaunchCooperativeKernel(hipFunction_t f, unsigned int gx, unsigned int gy, unsigned int gz,
+                                            unsigned int bx, unsigned int by, unsigned int bz, unsigned int shared,
+                                            hipStream_t stream, void** params);
+
+// A module launch described by a configuration and a list of attributes
+// (HIP_LAUNCH_CONFIG): of those, a cooperative launch is what changes how it
+// runs.
+hipError_t hipDrvLaunchKernelEx(const void* config, hipFunction_t f, void** params, void** extra) {
+  const ApiCall api("hipDrvLaunchKernelEx");
+  if (!config || !f) return record(state(), hipErrorInvalidValue);
+  const auto* c = static_cast<const unsigned char*>(config);
+  uint32_t dims[7];
+  std::memcpy(dims, c, sizeof dims);   // grid x, y, z; block x, y, z; dynamic LDS
+  hipStream_t stream;
+  std::memcpy(&stream, c + 32, sizeof stream);
+  const unsigned char* attrs;
+  std::memcpy(&attrs, c + 40, sizeof attrs);
+  uint32_t count;
+  std::memcpy(&count, c + 48, 4);
+  bool cooperative = false;
+  for (uint32_t i = 0; attrs && i < count; ++i) {   // hipLaunchAttribute: an id, then its value at 8; 72 bytes
+    uint32_t id;
+    int v;
+    std::memcpy(&id, attrs + 72 * i, 4);
+    std::memcpy(&v, attrs + 72 * i + 8, 4);
+    if (id == 2 /* hipLaunchAttributeCooperative */) cooperative = v != 0;
+  }
+  if (cooperative)
+    return hipModuleLaunchCooperativeKernel(f, dims[0], dims[1], dims[2], dims[3], dims[4], dims[5], dims[6], stream,
+                                            params);
+  return hipModuleLaunchKernel(f, dims[0], dims[1], dims[2], dims[3], dims[4], dims[5], dims[6], stream, params,
+                               extra);
+}
+
 hipError_t hipExtGetLastError(void) {
   const ApiCall api("hipExtGetLastError");
   return hipGetLastError();
@@ -2797,23 +2923,18 @@ hipError_t hipExtGetLastError(void) {
 
 // A module launch sized in work-items rather than work-groups, as HSA sizes a
 // dispatch, with events recorded either side of it. A grid that is not a
-// whole number of work-groups leaves its last ones partial, which this does
-// not model, and refuses.
+// whole number of work-groups runs its last ones short (vgpu/amd_exec.hpp),
+// as MIOpen's kernels on gfx950 ask for.
 hipError_t hipExtModuleLaunchKernel(hipFunction_t f, uint32_t gx, uint32_t gy, uint32_t gz, uint32_t lx, uint32_t ly,
                                     uint32_t lz, size_t shared, hipStream_t stream, void** params, void** extra,
                                     hipEvent_t start, hipEvent_t stop, uint32_t) {
   const ApiCall api("hipExtModuleLaunchKernel");
-  if (!lx || !ly || !lz) return record(state(), hipErrorInvalidConfiguration);
-  if (gx % lx || gy % ly || gz % lz)
-    return record(state(), fail(hipErrorNotSupported, "a grid of " + std::to_string(gx) + "x" + std::to_string(gy) +
-                                                          "x" + std::to_string(gz) +
-                                                          " work-items is not a whole number of work-groups of " +
-                                                          std::to_string(lx) + "x" + std::to_string(ly) + "x" +
-                                                          std::to_string(lz) + ", which this does not model"));
+  if (!lx || !ly || !lz || !gx || !gy || !gz) return record(state(), hipErrorInvalidConfiguration);
   if (start)
     if (const hipError_t e = hipEventRecord(start, stream); e != hipSuccess) return e;
-  if (const hipError_t e = hipModuleLaunchKernel(f, gx / lx, gy / ly, gz / lz, lx, ly, lz,
-                                                 static_cast<unsigned>(shared), stream, params, extra);
+  const uint32_t items[3] = {gx % lx ? gx : 0, gy % ly ? gy : 0, gz % lz ? gz : 0};
+  if (const hipError_t e = module_launch(f, (gx + lx - 1) / lx, (gy + ly - 1) / ly, (gz + lz - 1) / lz, lx, ly, lz,
+                                         static_cast<unsigned>(shared), stream, params, extra, items);
       e != hipSuccess)
     return e;
   return stop ? hipEventRecord(stop, stream) : hipSuccess;

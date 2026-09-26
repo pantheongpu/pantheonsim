@@ -63,6 +63,7 @@ hip_4.2 {
     hipFree;
     hipFreeArray;
     hipFreeMipmappedArray;
+    hipFuncGetAttribute;
     hipFuncGetAttributes;
     hipFuncSetAttribute;
     hipGetChannelDesc;
@@ -281,6 +282,8 @@ hip_6.0 {
     hipGetDevicePropertiesR0600;
 } hip_5.6;
 hip_6.1 {
+  global:
+    hipGetProcAddress;
 } hip_6.0;
 hip_6.2 {
   global:
@@ -289,7 +292,15 @@ hip_6.2 {
 hip_6.4 {
 } hip_6.2;
 hip_6.5 {
+  global:
+    hipDrvLaunchKernelEx;
 } hip_6.4;
+hip_7.1 {
+  global:
+    hipGetDriverEntryPoint;
+} hip_6.5;
+hip_7.2 {
+} hip_7.1;
 ROCR_1 {
   global:
     hsa_*;

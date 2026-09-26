@@ -1,4 +1,4 @@
-// gfx942's 8-bit floats, converted on the device by the instructions HIP's
+// The 8-bit floats -- gfx942's, or gfx950's -- converted on the device by the instructions HIP's
 // header uses there, and on the host by the same header's software
 // conversion, which is how AMD says they come out: every float in a sweep
 // narrowed to fp8 and bf8 (rounded to nearest, saturating or not, in pairs,
@@ -12,7 +12,15 @@
 #include <cstring>
 #include <vector>
 
+// gfx942's are FNUZ; gfx950's the OCP formats (built with -DVGPU_FP8_OCP,
+// for --offload-arch=gfx950, as fp8.gfx950).
+#ifdef VGPU_FP8_OCP
+constexpr __hip_fp8_interpretation_t kTypes[2] = {__HIP_E4M3, __HIP_E5M2};
+constexpr bool kFnuz = false;
+#else
 constexpr __hip_fp8_interpretation_t kTypes[2] = {__HIP_E4M3_FNUZ, __HIP_E5M2_FNUZ};
+constexpr bool kFnuz = true;
+#endif
 
 // Per float and type: to nearest, saturating, as the low and the high of a
 // pair, then stochastically, with and without saturating.
@@ -53,7 +61,7 @@ __global__ void widen(float* out) {
 
 static unsigned host_narrow(float x, int t, bool saturate, bool stochastic, unsigned random) {
   const int we = t ? 5 : 4, wm = t ? 2 : 3;
-  return internal::cast_to_f8<float, true>(x, wm, we, saturate, stochastic, random);
+  return internal::cast_to_f8<float, kFnuz>(x, wm, we, saturate, stochastic, random);
 }
 
 static bool same(float a, float b) { return (std::isnan(a) && std::isnan(b)) || std::memcmp(&a, &b, 4) == 0; }
@@ -111,7 +119,7 @@ int main() {
     for (int two = 0; two < 2; ++two) {
       int wrong = 0;
       for (int b = 0; b < 256; ++b) {
-        const float want = internal::cast_from_f8<float, true>(b, t ? 2 : 3, t ? 5 : 4);
+        const float want = internal::cast_from_f8<float, kFnuz>(b, t ? 2 : 3, t ? 5 : 4);
         const float have = wide[two * 512 + t * 256 + b];
         if (!same(have, want) && wrong++ < 3) std::printf("  %s 0x%02x widens to %a, not %a\n", kType[t], b, have, want);
       }

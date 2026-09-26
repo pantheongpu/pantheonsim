@@ -110,8 +110,11 @@ VTEST(every_instruction_decodes_as_the_assembler_wrote_it) {
 // The corpus drawn from ROCm's libraries (amd/tools/isa-corpus.py): one of
 // every shape of instruction their gfx942 code holds, each decoded from its
 // own bytes and printed as llvm-objdump printed it. Every mismatch is listed.
-VTEST(every_instruction_shape_rocms_libraries_use_decodes_as_llvm_prints_it) {
-  const std::vector<std::string> corpus = lines(read("isa_corpus.txt", false));
+namespace {
+// Decodes every instruction of a corpus (amd/tools/isa-corpus.py) and
+// compares it with llvm-objdump's text for it.
+void check_corpus(const std::string& file) {
+  const std::vector<std::string> corpus = lines(read(file, false));
   size_t checked = 0;
   std::string wrong;
   int wrong_count = 0;
@@ -132,12 +135,19 @@ VTEST(every_instruction_shape_rocms_libraries_use_decodes_as_llvm_prints_it) {
       got = std::string("(refused: ") + e.what() + ")";
     }
     ++checked;
-    if (got != want && wrong_count++ < 10) wrong += "\n  want \"" + want + "\"\n  got  \"" + got + "\"";
+    if (got != want && wrong_count++ < 40) wrong += "\n  want \"" + want + "\"\n  got  \"" + got + "\"";
   }
   VCHECK(checked > 1000);
   if (wrong_count)
     throw vtest::Failure(std::to_string(wrong_count) + " of " + std::to_string(checked) + " differ:" + wrong);
 }
+}  // namespace
+
+VTEST(every_instruction_shape_rocms_libraries_use_decodes_as_llvm_prints_it) { check_corpus("isa_corpus.txt"); }
+
+// The same for gfx950 (MI350X): PyTorch's own kernels, hipBLASLt's and
+// rocBLAS's, as built for it.
+VTEST(every_gfx950_instruction_shape_decodes_as_llvm_prints_it) { check_corpus("isa_corpus_gfx950.txt"); }
 
 // The cache every launch of a module shares: an instruction is decoded once,
 // however many threads reach it at the same moment, and all of them get the

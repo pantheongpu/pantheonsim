@@ -223,6 +223,7 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
   // fixed distance). So the whole of it goes on the device as one image, each
   // section at its own address from wherever the image starts.
   out.linked = r.u16(16) != 1 /* ET_REL */;
+  out.mach = r.u32(48) & 0xFF;   // e_flags: EF_AMDGPU_MACH
   if (out.linked) {
     uint64_t end = 0;
     for (const Section& sec : sections)

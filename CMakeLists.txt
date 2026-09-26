@@ -188,6 +188,10 @@ add_custom_command(TARGET vgpuhip POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so.1"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so"
   COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7, libhsa-runtime64.so.1)")
+# The code objects a library carries for one target (amd/tools/fatbin-extract.cpp).
+add_executable(amd_fatbin_extract amd/tools/fatbin-extract.cpp)
+target_link_libraries(amd_fatbin_extract PRIVATE vgpu ${CMAKE_DL_LIBS})
+target_include_directories(amd_fatbin_extract PRIVATE amd/include)
 # How fast the CDNA interpreter runs a kernel (amd/tools/exec-bench.cpp).
 add_executable(amd_exec_bench amd/tools/exec-bench.cpp)
 target_link_libraries(amd_exec_bench PRIVATE vgpu)
@@ -769,6 +773,25 @@ set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_pytorch COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh)
 # Alone: it is the heaviest test there is, and the machines are shared.
 set_tests_properties(amd_pytorch PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# And on gfx950 (MI350X), whose kernels are PyTorch's and the libraries' own
+# builds for it.
+add_test(NAME amd_pytorch_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/mi350x)
+set_tests_properties(amd_pytorch_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# torch.compile's Triton kernels, and one written by hand, compiled and loaded
+# at run time.
+add_test(NAME amd_pytorch_compile COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 3 1)
+set_tests_properties(amd_pytorch_compile PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# Composable Kernel's GEMMs, which PyTorch runs when told to prefer CK.
+add_test(NAME amd_pytorch_ck COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh ck.py 3 1)
+set_tests_properties(amd_pytorch_ck PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# Two processes, as torchrun runs them: RCCL across processes, and
+# DistributedDataParallel.
+add_test(NAME amd_pytorch_distributed COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch_distributed.sh)
+set_tests_properties(amd_pytorch_distributed PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # And on two devices: RCCL's collectives and DataParallel between them.
 add_test(NAME amd_pytorch_multi_gpu COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh multi_gpu.py 9 2)
