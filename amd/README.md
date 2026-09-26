@@ -240,6 +240,17 @@ memory sit at addresses of this model's choosing, which a kernel reads from
 instructions retired by the host thread running it, which is this model's
 cycle, where a card's counts at a fixed rate.
 
+The MODE register's float modes are the kernel's own. A wave starts with
+the round and denormal modes its descriptor gives (COMPUTE_PGM_RSRC1), and
+`s_setreg` changes them. Each vector instruction runs under them, the round
+mode through the host's rounding and the denormal mode through its flush
+controls (x86's DAZ and FTZ). Every kernel in PyTorch's and ROCm's libraries
+asks for the defaults: round to nearest even, denormals kept. Code built with
+`-fgpu-flush-denormals-to-zero` flushes single-precision denormals, as a card
+does. The matrix instructions ignore MODE, as the ISA says. Half-precision
+denormals are always kept, whatever MODE says. `tests/hipcc/numerics.cpp`
+checks all of it, built both ways.
+
 Work-groups run on every host core at once, as a GPU runs them in any order
 and concurrently; `VGPU_THREADS=1` runs them one after another, in order, which
 is what a kernel with a data race needs to give the same answer every time.

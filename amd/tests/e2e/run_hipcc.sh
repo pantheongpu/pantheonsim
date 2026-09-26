@@ -181,6 +181,18 @@ expect "the gfx950 sparse matrix program runs to the end" "0" "$status"
 expect "each gfx950 sparse product is what the ISA says" "22 of 22" \
   "$(grep -c '^[fi]32_.* cbsz:.*: 0 of [0-9]* wrong$' <<< "$out") of 22"
 
+# MODE's floating-point modes (hipcc/numerics.cpp): what a kernel's
+# descriptor starts it with -- denormals kept by default, single-precision
+# ones flushed when built with -fgpu-flush-denormals-to-zero -- and each
+# round mode a kernel sets, against the host's IEEE arithmetic.
+for b in numerics numerics.flush; do
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/$b.gfx942" 2>&1)
+  status=$?
+  expect "the $b program runs to the end" "0" "$status"
+  expect "every $b check holds (MODE, denormals, the four round modes)" "23 of 23" \
+    "$(grep -c '^ok ' <<< "$out") of 23"
+done
+
 # Streams that run at once, as a card's do (hipcc/streams.cpp). Each waiting
 # kernel gives up after a bounded time, so a runtime that ran the streams one
 # after another fails these rather than hanging.
