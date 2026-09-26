@@ -764,6 +764,10 @@ add_test(NAME amd_pytorch COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.
 # Alone: it is the heaviest test there is, and the machines are shared.
 set_tests_properties(amd_pytorch PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# And on two devices: RCCL's collectives and DataParallel between them.
+add_test(NAME amd_pytorch_multi_gpu COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh multi_gpu.py 9 2)
+set_tests_properties(amd_pytorch_multi_gpu PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 add_test(NAME amd_hipcc COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc.sh)
 set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
