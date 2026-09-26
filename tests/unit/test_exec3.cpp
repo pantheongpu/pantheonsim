@@ -1260,6 +1260,60 @@ LOOP:
   mem.free(out);
 }
 
+// The same loop with CUTLASS's semaphore-wait shape: only thread 0 fetches,
+// from a block nvcc places after the ret, while its warp-mates branch straight
+// back to the bar.red. The barrier waits for every live thread, so the warp
+// votes only once thread 0 is back. Voting for the partial warp left thread 0
+// on its higher-pc path for good, and the loop never ended.
+VTEST(bar_red_waits_for_lanes_on_a_higher_pc_path) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry br(.param .u64 p)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<6>;
+  .reg .pred %p<5>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  mov.u32 %r2, 0;     // rounds
+  mov.u32 %r5, 0;     // thread 0's fetches
+LOOP:
+  setp.lt.u32 %p1, %r5, 3;
+  bar.red.and.pred %p2, 0, %p1;
+  @!%p2 bra DONE;
+  add.u32 %r2, %r2, 1;
+  setp.gt.u32 %p3, %r1, 0;
+  @%p3 bra LOOP;
+  bra.uni FETCH;
+DONE:
+  mad.lo.u32 %r6, %r5, 100, %r2;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r6;
+  ret;
+FETCH:
+  add.u32 %r5, %r5, 1;
+  bra.uni LOOP;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(64 * 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  cfg.max_steps = 100000;
+  std::vector<uint8_t> pa(8);
+  std::memcpy(pa.data(), &out, 8);
+  exec::launch(m.entries[0], cfg, {pa}, mem, prof);
+  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{303});
+  for (int t = 1; t < 64; ++t) VCHECK_EQ(mem.load_scalar(out + 4 * t, 4), uint64_t{3});
+  mem.free(out);
+}
+
 // ---- cp.async ----
 //
 // The instruction's whole meaning is that the copy is *not* finished when it

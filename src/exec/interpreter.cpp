@@ -2119,6 +2119,21 @@ class Interpreter {
       if (!ctx.bar_red)
         ctx_fail(ins, -1, Err::UnsupportedPtx, "bar.red outside a block context");
       BarrierReduction& red = *ctx.bar_red;
+      if (!w.bar_red_waiting && w.paths.size() > 1) {
+        // Like bar.sync, bar.red waits for every live thread, so lanes of this
+        // warp still on another path have to get here before the warp votes.
+        // CUTLASS's semaphore wait sends thread 0 round a fetch at a higher pc
+        // while its warp-mates go straight back to the bar.red; voting for the
+        // partial warp here left thread 0 behind for good, and the loop never
+        // saw the semaphore change.
+        if (select_other_runnable(w, idx) != idx) {
+          w.paths[idx].parked = Path::kAtBarrier;
+          return;
+        }
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "bar.red cannot be reached by every lane of the warp: some lanes are on a path "
+                 "that never arrives at this barrier");
+      }
       if (!w.bar_red_waiting) {
         // Contribute and wait. The result is not known until every warp in the
         // block has arrived, so the pc stays put and this re-executes on
