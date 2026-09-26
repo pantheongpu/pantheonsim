@@ -3810,8 +3810,8 @@ class Parser {
           if (g2s != (im2col_mode == "im2col"))
             return unsupported("tensor loads take .im2col and stores .im2col_no_offs");
         }
-        if (op.cta_group == 2 && !mbar_completion)
-          return unsupported(".cta_group goes with the mbarrier completion mechanism only");
+        if (op.cta_group == 2 && (!mbar_completion || !op.tensor))
+          return unsupported(".cta_group is a qualifier of tensor loads that complete on an mbarrier");
         if (op.to_shared && !mbar_completion)
           return unsupported("a cp.async.bulk load completes on an mbarrier (.mbarrier::complete_tx::bytes)");
         if (s2g && !group_completion)

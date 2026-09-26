@@ -8,6 +8,7 @@
 // 9.7.18.10.5 (for M = 128 with a CTA pair, the upper half of N in lanes
 // 64-127). The products are checked against a plain host GEMM.
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -15,6 +16,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
+#include "vgpu/exec/tensormap.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
@@ -1013,6 +1015,172 @@ VTEST(tcgen05_cta_group_2_needs_a_cta_pair) {
   cfg.grid = {2, 1, 1};
   auto err = VCAPTURE(Error, exec::launch(ptx::parse(ptx).entries[0], cfg, {}, mem, load_gpu("nvidia/b200")));
   VCHECK_CONTAINS(err.message(), "has no peer");
+}
+
+// ---- around the tensor core ------------------------------------------------------
+
+// clusterlaunchcontrol: a block that cancels the launch of blocks not yet
+// started does their work instead, and they never run. On one host thread the
+// first block takes every other one.
+VTEST(clusterlaunchcontrol_takes_over_blocks_that_have_not_started) {
+  setenv("VGPU_THREADS", "1", 1);
+  const std::string ptx = std::string(kHeader100a) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .b128 %q;
+    .shared .align 16 .b8 resp[16];
+    .shared .align 8 .b64 bar;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, bar;
+    mov.u32 %r3, resp;
+    mov.u32 %r10, 0;
+    mbarrier.init.shared::cta.b64 [%r2], 1;
+LOOP:
+    mov.u32 %r4, %ctaid.x;
+    add.u32 %r4, %r4, 1;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r4;
+    mbarrier.arrive.expect_tx.shared::cta.b64 _, [%r2], 16;
+    clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.b128 [%r3], [%r2];
+WAIT:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1, [%r2], %r10;
+    @!%p1 bra WAIT;
+    xor.b32 %r10, %r10, 1;
+    ld.shared.b128 %q, [%r3];
+    clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 %p2, %q;
+    @!%p2 bra DONE;
+    clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {%r1, %r5, %r6, _}, %q;
+    bra LOOP;
+DONE:
+    ret;
+}
+)";
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(6 * 4);
+  std::vector<uint32_t> zero(6, 0);
+  mem.write(out, zero.data(), 24);
+  LaunchConfig cfg;
+  cfg.grid = {6, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(out)}, mem, load_gpu("nvidia/b200"));
+  unsetenv("VGPU_THREADS");
+  std::vector<uint32_t> got(6);
+  mem.read(out, got.data(), 24);
+  for (int i = 0; i < 6; ++i) VCHECK_EQ(got[i], 1u);   // every block's work, done by block 0
+}
+
+// .b128 registers: loaded, stored and moved as their two halves.
+VTEST(b128_registers_round_trip_through_memory) {
+  const std::string ptx = std::string(kHeader100a) + R"(
+.visible .entry k(.param .u64 buf)
+{
+    .reg .b64 %rd<4>;
+    .reg .b128 %q<2>;
+    ld.param.u64 %rd1, [buf];
+    ld.global.b128 %q0, [%rd1];
+    st.global.b128 [%rd1+16], %q0;
+    ret;
+}
+)";
+  MemoryManager mem{1 << 20};
+  const uint64_t buf = mem.alloc(32);
+  const uint64_t in[4] = {0x0123456789abcdefull, 0xfedcba9876543210ull, 0, 0};
+  mem.write(buf, in, 32);
+  exec::launch(ptx::parse(ptx).entries[0], LaunchConfig{}, {arg_u64(buf)}, mem, load_gpu("nvidia/b200"));
+  uint64_t got[4];
+  mem.read(buf, got, 32);
+  VCHECK_EQ(got[2], in[0]);
+  VCHECK_EQ(got[3], in[1]);
+}
+
+// TMA's .cta_group::2: each CTA of a pair loads its own half of a tile into
+// its own shared memory, and both complete on the even CTA's barrier, reached
+// the way CUTLASS reaches it -- by clearing bit 24 of the CTA's own barrier
+// address, which holds its rank.
+VTEST(tma_cta_group_2_completes_on_the_even_ctas_barrier) {
+  MemoryManager mem{1 << 20};
+  const uint64_t g = mem.alloc(16 * 8 * 4), out = mem.alloc(2 * 65 * 4);
+  for (int y = 0; y < 16; ++y)
+    for (int x = 0; x < 8; ++x) mem.store_scalar(g + uint64_t(y * 8 + x) * 4, 4, f32_bits(float(y * 100 + x)));
+  exec::TensorMap t;
+  t.address = g;
+  t.rank = 2;
+  t.type = exec::TmapType::F32;
+  t.dim = {8, 16, 1, 1, 1};
+  t.stride = {4, 32, 0, 0, 0};
+  t.box = {8, 8, 1, 1, 1};
+  t.elem_stride = {1, 1, 1, 1, 1};
+  std::vector<uint8_t> map(128);
+  t.encode(map.data());
+  const std::string ptx = std::string(kHeader100a) + R"(
+.visible .entry k(.param .align 64 .b8 tmap[128], .param .u64 out)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .shared .align 128 .b8 tile[256];
+    .shared .align 8 .b64 bar;
+    ld.param.u64 %rd1, [out];
+    mov.b64 %rd2, tmap;
+    cvta.param.u64 %rd3, %rd2;
+    mov.u32 %r1, tile;
+    mov.u32 %r2, bar;
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %cluster_ctarank;
+    setp.eq.u32 %p1, %r3, 0;
+    setp.eq.u32 %p2, %r4, 0;
+    and.pred %p3, %p1, %p2;
+    @%p3 mbarrier.init.shared::cta.b64 [%r2], 1;
+    @%p3 mbarrier.arrive.expect_tx.shared::cta.b64 _, [%r2], 512;
+    barrier.cluster.arrive;
+    barrier.cluster.wait;
+    and.b32 %r5, %r2, 0xFEFFFFFF;
+    mov.u32 %r6, 0;
+    shl.b32 %r7, %r4, 3;
+    @%p1 cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global.mbarrier::complete_tx::bytes [%r1], [%rd3, {%r6, %r7}], [%r5];
+    @!%p2 bra WAITED;
+WAIT:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1, [%r2], 0;
+    @!%p1 bra WAIT;
+WAITED:
+    barrier.cluster.arrive;
+    barrier.cluster.wait;
+    // out[rank*65 + t] = tile word t; out[rank*65 + 64] = tile's address >> 24.
+    shl.b32 %r8, %r3, 2;
+    add.u32 %r9, %r1, %r8;
+    ld.shared.u32 %r10, [%r9];
+    mad.lo.u32 %r11, %r4, 65, %r3;
+    mul.wide.u32 %rd4, %r11, 4;
+    add.u64 %rd5, %rd1, %rd4;
+    st.global.u32 [%rd5], %r10;
+    shr.u32 %r12, %r1, 24;
+    mad.lo.u32 %r13, %r4, 65, 64;
+    mul.wide.u32 %rd6, %r13, 4;
+    add.u64 %rd7, %rd1, %rd6;
+    st.global.u32 [%rd7], %r12;
+    barrier.cluster.arrive;
+    barrier.cluster.wait;
+    ret;
+}
+)";
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  cfg.grid = {2, 1, 1};
+  cfg.cluster = {2, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {map, arg_u64(out)}, mem, load_gpu("nvidia/b200"));
+  std::vector<uint32_t> got(2 * 65);
+  mem.read(out, got.data(), got.size() * 4);
+  for (int r = 0; r < 2; ++r) {
+    for (int i = 0; i < 64; ++i) {
+      const float want = float((r * 8 + i / 8) * 100 + i % 8);
+      VCHECK_EQ(bits_f32(got[r * 65 + i]), want);
+    }
+    VCHECK_EQ(got[r * 65 + 64], uint32_t(r));   // the rank, in bits 24 and up
+  }
 }
 
 VTEST_MAIN
