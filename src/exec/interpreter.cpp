@@ -120,10 +120,14 @@ struct BarrierReduction {
 // work.
 // Bytes a TMA (cp.async.bulk) load has read from global memory and will write
 // into shared memory, as runs of (shared offset, length) over `data`.
+struct BlockCtx;
 struct PendingBulk {
   std::vector<std::pair<uint32_t, uint32_t>> runs;
   std::vector<uint8_t> data;
   uint64_t tx = 0;         // bytes it completes on its barrier
+  // The block whose shared memory the data goes to, when that is not the
+  // barrier's: a .cta_group::2 copy may complete on the peer CTA's barrier.
+  const BlockCtx* dst = nullptr;
 };
 
 struct Mbarrier {
@@ -951,7 +955,13 @@ class Interpreter {
                         cfg_.grid[2], ") is not a whole number of ", c[0], "x", c[1], "x", c[2],
                         " clusters");
     const uint32_t size = c[0] * c[1] * c[2];
-    for (uint64_t k = first; k < last; ++k) {
+    // Clusters are taken from the front of the range, so one that a running
+    // cluster has cancelled (clusterlaunchcontrol.try_cancel) never starts.
+    clc_next_ = first;
+    clc_last_ = last;
+    clc_clusters_ = true;
+    while (clc_next_ < clc_last_) {
+      const uint64_t k = clc_next_++;
       std::vector<BlockState> blocks(size);
       std::vector<std::unique_ptr<Scheduler>> scheds;   // per block, as for a cooperative grid
       for (uint32_t r = 0; r < size; ++r)
@@ -982,6 +992,7 @@ class Interpreter {
         }
       }
     }
+    clc_next_ = clc_last_ = 0;
   }
 
   // A cooperative launch: every block resident at once, interleaved.
@@ -1054,7 +1065,11 @@ class Interpreter {
   void run_block_range(uint64_t first, uint64_t last) {
     auto sched = make_scheduler(cfg_.scheduler, cfg_.scheduler_seed);
     const uint64_t gx = cfg_.grid[0], gy = cfg_.grid[1];
-    for (uint64_t i = first; i < last; ++i) {
+    clc_next_ = first;
+    clc_last_ = last;
+    clc_clusters_ = false;
+    while (clc_next_ < clc_last_) {
+      const uint64_t i = clc_next_++;
       BlockCtx ctx;
       ctx.ctaid = {static_cast<uint32_t>(i % gx), static_cast<uint32_t>((i / gx) % gy),
                    static_cast<uint32_t>(i / (gx * gy))};
@@ -1065,10 +1080,29 @@ class Interpreter {
       run_block(ctx, *sched);
       ++stats_.blocks;
     }
+    clc_next_ = clc_last_ = 0;
   }
 
  private:
   DeviceLaunches* dl_ = nullptr;
+
+  // The units (clusters, or blocks when there are none) of the range this
+  // interpreter is running that have not started yet: [clc_next_, clc_last_).
+  // clusterlaunchcontrol.try_cancel takes the next of them, which then never
+  // launches, and gives its first CTA to the canceller. Empty outside those
+  // two loops -- a cooperative launch has every block running already -- so a
+  // cancellation there fails, as it does on a device with nothing pending.
+  uint64_t clc_next_ = 0, clc_last_ = 0;
+  bool clc_clusters_ = false;
+
+  std::optional<std::array<uint32_t, 3>> clc_take() {
+    if (clc_next_ >= clc_last_) return std::nullopt;
+    const uint64_t u = clc_next_++;
+    if (clc_clusters_) return cluster_member(u, 0);
+    const uint64_t gx = cfg_.grid[0], gy = cfg_.grid[1];
+    return std::array<uint32_t, 3>{static_cast<uint32_t>(u % gx), static_cast<uint32_t>((u / gx) % gy),
+                                   static_cast<uint32_t>(u / (gx * gy))};
+  }
 
   // Re-throws a lower-level error with kernel/instruction context attached.
   [[noreturn]] void rethrow_with_context(const Error& e, const Instr& ins, int lane) {
@@ -3234,6 +3268,10 @@ class Interpreter {
     if (const auto* op = std::get_if<OpTcgen05>(&ins.op)) {
       require_warp32(ins, "tcgen05");
       exec_tcgen05(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpClc>(&ins.op)) {
+      exec_clc(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpMma>(&ins.op)) {
@@ -5480,6 +5518,7 @@ class Interpreter {
   struct WgmmaDesc {
     uint64_t start = 0, lbo = 0, sbo = 0;
     uint32_t swizzle = 0;   // bytes in a swizzled row: 0 (none), 32, 64 or 128
+    uint32_t atom = 16;     // bytes the swizzle moves as one (tcgen05's mode 1: 32)
   };
 
   WgmmaDesc decode_wgmma_desc(const Instr& ins, uint64_t d) {
@@ -5520,7 +5559,7 @@ class Interpreter {
       off = W ? mb % W + (mb / W) * d.lbo + (k % 8) * W + (k / 8) * d.sbo
               : mb % 16 + (mb / 16) * d.sbo + (k % 8) * 16 + (k / 8) * d.lbo;
     }
-    return exec::swizzle_address(d.start + off, static_cast<uint32_t>(W));
+    return exec::swizzle_address(d.start + off, static_cast<uint32_t>(W), d.atom);
   }
 
   static uint32_t wgmma_elem_bytes(WgmmaElem t) {
@@ -5696,6 +5735,68 @@ class Interpreter {
     }
     snap.taken |= static_cast<uint8_t>(1u << (warp_index % 4));
     if (snap.taken == 0xF) ctx.wgmma->pending.erase(snap_it);
+  }
+
+  // clusterlaunchcontrol (9.7.15.18-19). The 16-byte response is this
+  // engine's own encoding -- the ISA calls it opaque and a kernel may only
+  // decode it with query_cancel: bit 0 says whether a cluster was cancelled,
+  // bits 32-127 hold its first CTA's x, y and z.
+  void exec_clc(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpClc& op, Mask m) {
+    if (op.kind != ClcKind::TryCancel) {
+      Lanes _s_lo, _s_hi;
+      const Lanes lo = read_operand(w, ctx, ins, Operand{RegOperand{op.resp_lo}}, _s_lo);
+      const Lanes hi = read_operand(w, ctx, ins, Operand{RegOperand{op.resp_hi}}, _s_hi);
+      if (op.kind == ClcKind::IsCanceled) {
+        Mask& p = pred_slot(w, op.dst[0]);
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) p = (lo[lane] & 1) ? (p | (Mask{1} << lane)) : (p & ~(Mask{1} << lane));
+        return;
+      }
+      auto coord = [&](uint32_t lane, int d) -> uint64_t {
+        return d == 0 ? lo[lane] >> 32 : d == 1 ? hi[lane] & 0xFFFFFFFFu : hi[lane] >> 32;
+      };
+      for (size_t i = 0; i < op.dst.size(); ++i) {
+        if (op.dst[i].id == kNoReg || (op.dim < 0 && i == 3)) continue;   // `_`, or .v4's unspecified 4th
+        Lanes v{};
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) v[lane] = coord(lane, op.dim >= 0 ? op.dim : static_cast<int>(i));
+        write_reg(w, op.dst[i], m, v, 32);
+      }
+      return;
+    }
+    Lanes _s_a, _s_b;
+    const Lanes abase = addr_base(w, ctx, ins, op.addr, _s_a);
+    const Lanes bbase = addr_base(w, ctx, ins, op.mbar, _s_b);
+    const size_t nranks = ctx.cluster_state ? ctx.cluster_state->ranks.size() : 1;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const int li = static_cast<int>(lane);
+      const uint64_t at = shared_window(abase[lane] + static_cast<uint64_t>(op.addr.offset));
+      const uint64_t bar = shared_window(bbase[lane] + static_cast<uint64_t>(op.mbar.offset));
+      if (shared_ref(ctx, ins, li, at).owner != &ctx || shared_ref(ctx, ins, li, bar).owner != &ctx)
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "clusterlaunchcontrol.try_cancel's response and barrier are in this CTA's shared "
+                 "memory (.shared::cta)");
+      if (at % 16) ctx_fail(ins, li, Err::MisalignedAccess,
+                            "clusterlaunchcontrol.try_cancel's response must be 16-byte aligned");
+      const auto got = clc_take();
+      const uint64_t lo = got ? 1u | uint64_t{(*got)[0]} << 32 : 0;
+      const uint64_t hi = got ? (*got)[1] | uint64_t{(*got)[2]} << 32 : 0;
+      // The response lands and its 16 bytes complete on the barrier -- in
+      // this CTA, or with .multicast::cluster::all in every CTA of the
+      // cluster at the same offsets.
+      const uint64_t aoff = at - kSharedVaBase, boff = bar - kSharedVaBase;
+      for (uint64_t r = 0; r < nranks; ++r) {
+        if (!op.multicast && r != cluster_rank_of(ctx)) continue;
+        const uint64_t ra = kSharedVaBase + cluster_address(ctx, r, aoff);
+        store_routed(w, ctx, ins, lane, ra, 8, lo);
+        store_routed(w, ctx, ins, lane, ra + 8, 8, hi);
+        Mbarrier& b = cluster_mbarrier(ctx, ins, li, kSharedVaBase + cluster_address(ctx, r, boff),
+                                       "clusterlaunchcontrol.try_cancel");
+        b.tx -= 16;
+        complete_phase_if_done(b);
+      }
+    }
   }
 
   // ---- Blackwell's fifth-generation tensor core (tcgen05, sm_100a) ----
@@ -5990,10 +6091,10 @@ class Interpreter {
       case 2: out.swizzle = 128; break;
       case 4: out.swizzle = 64; break;
       case 6: out.swizzle = 32; break;
-      case 1:
-        ctx_fail(ins, -1, Err::UnsupportedPtx,
-                 "a tcgen05 matrix descriptor with 128-byte swizzling in 32-byte atoms (mode 1); "
-                 "only the 16-byte-atom swizzles are implemented");
+      // 128 bytes swizzled in 32-byte atoms: the same canonical strides, the
+      // swizzle moving 32-byte chunks (Swizzle<2,5,2>, as TMA's
+      // CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B writes the tile).
+      case 1: out.swizzle = 128; out.atom = 32; break;
       default:
         ctx_fail(ins, -1, Err::InvalidValue,
                  "tcgen05 matrix descriptor swizzle mode " + std::to_string((d >> 61) & 7) +
@@ -7477,13 +7578,23 @@ class Interpreter {
         case TmapField::SwizzleMode:
           if (v == 4) refused("the 96-byte swizzle is sm_103a's and sm_107a's");
           if (v > 4) bad("swizzle mode " + std::to_string(v) + " is not in the ISA's table");
-          t.swizzle = static_cast<TmapSwizzle>(v);   // none, 32B, 64B, 128B, in the same order
+          // None, 32B, 64B, 128B, in the same order; a 128-byte swizzle keeps
+          // the atomicity the map already has.
+          if (!(v == 3 && exec::TensorMap::swizzle_bytes(t.swizzle) == 128))
+            t.swizzle = static_cast<TmapSwizzle>(v);
           break;
-        case TmapField::SwizzleAtomicity:
-          // 16 bytes is what sm_90 swizzles at, so it changes nothing there;
-          // the wider atoms are Blackwell's.
-          if (v != 0) refused("swizzle atomicities other than 16 bytes are Blackwell's");
+        case TmapField::SwizzleAtomicity: {
+          // Table 36: 16B, 32B, 32B with the 8-byte flip, 64B. The wider atoms
+          // are sub-modes of the 128-byte swizzle.
+          if (v > 3) bad("swizzle atomicity " + std::to_string(v) + " is not in the ISA's table");
+          if (v == 2) refused("the 128-byte swizzle's 32-byte atomicity with the 8-byte flip");
+          const bool wide = exec::TensorMap::swizzle_bytes(t.swizzle) == 128;
+          if (v != 0 && !wide)
+            refused("a 32- or 64-byte swizzle atomicity on a map whose swizzle is not 128 bytes");
+          if (wide)
+            t.swizzle = v == 1 ? TmapSwizzle::B128Atom32 : v == 3 ? TmapSwizzle::B128Atom64 : TmapSwizzle::B128;
           break;
+        }
         case TmapField::FillMode:
           if (v > 1) bad("fill mode " + std::to_string(v) + " is not in the ISA's table");
           t.oob_nan = static_cast<uint8_t>(v);
@@ -7818,7 +7929,7 @@ class Interpreter {
           }
           // Shared position: the box packed densely, then swizzled by
           // address the same way wgmma reads it back.
-          const uint64_t soff = exec::swizzle_address(smem + e * es, swz);
+          const uint64_t soff = exec::swizzle_address(smem + e * es, swz, exec::TensorMap::swizzle_atom(map.swizzle));
           if (op.to_shared) {
             uint64_t v = 0;
             if (inside) {
@@ -7877,10 +7988,18 @@ class Interpreter {
       // The barrier the load completes on, in the destination block.
       const SharedRef bar = shared_ref(ctx, ins, li, kSharedVaBase + (*mbar_base)[lane] +
                                                          static_cast<uint64_t>(op.mbar.offset));
+      // .cta_group::2 lets the barrier be in the destination's peer CTA
+      // instead (9.7.9.25.5.1), which CUTLASS's 2-SM kernels use to count both
+      // CTAs' tiles on the leader's barrier.
+      const uint32_t bar_rank = cluster_rank_of(*bar.owner);
       if (!op.multicast) {
-        if (bar.owner != dst.owner)
+        const bool peer_ok = op.cta_group == 2 && (bar_rank ^ 1) == cluster_rank_of(*dst.owner);
+        if (bar.owner != dst.owner && !peer_ok)
           ctx_fail(ins, li, Err::InvalidValue,
-                   "a bulk copy's mbarrier must be in the block its data goes to");
+                   op.cta_group == 2
+                       ? "a .cta_group::2 bulk copy's mbarrier must be in the block its data goes to or that block's peer"
+                       : "a bulk copy's mbarrier must be in the block its data goes to");
+        if (bar.owner != dst.owner) pb.dst = dst.owner;
         if (op.reduce) {
           // A reduction into another block's shared memory is made now, one
           // of the moments the asynchronous proxy allows, and its bytes are
@@ -7921,8 +8040,16 @@ class Interpreter {
                  }() + ") names no block, or a block past the cluster's " + std::to_string(nranks));
       for (uint64_t r = 0; r < nranks; ++r) {
         if (!(cta_mask >> r & 1)) continue;
-        const uint64_t at = kSharedVaBase + cluster_address(ctx, r, bar.off);
-        cluster_mbarrier(ctx, ins, li, at, "a multicast bulk copy").pending.push_back(pb);
+        // .cta_group::2: each destination's signal goes to whichever CTA of
+        // its pair has the barrier's rank parity (9.7.9.25.5.1).
+        const uint64_t br = op.cta_group == 2 ? (r & ~uint64_t{1}) | (bar_rank & 1) : r;
+        if (br >= nranks)
+          ctx_fail(ins, li, Err::InvalidValue,
+                   "a .cta_group::2 multicast bulk copy to CTA " + std::to_string(r) + ", which has no peer");
+        const uint64_t at = kSharedVaBase + cluster_address(ctx, br, bar.off);
+        PendingBulk to = pb;
+        if (br != r) to.dst = ctx.cluster_state->ranks[r];
+        cluster_mbarrier(ctx, ins, li, at, "a multicast bulk copy").pending.push_back(std::move(to));
       }
     }
   }
@@ -7943,9 +8070,10 @@ class Interpreter {
   static void land_bulk_copies(const BlockCtx& ctx, Mbarrier& b) {
     if (b.pending.empty()) return;
     for (const PendingBulk& p : b.pending) {
+      const BlockCtx& to = p.dst ? *p.dst : ctx;
       size_t at = 0;
       for (const auto& [off, len] : p.runs) {
-        std::memcpy(ctx.shared->data() + off, p.data.data() + at, len);
+        std::memcpy(to.shared->data() + off, p.data.data() + at, len);
         at += len;
       }
       b.tx -= static_cast<int64_t>(p.tx);

@@ -79,7 +79,9 @@ float val(int i, int j, int salt) { return static_cast<float>(((i * 7 + j * 13 +
 // written as the ISA gives them in CuTe terms, in elements (T per 16 bytes),
 // then Swizzle<B,4,3> on the bytes. sbo/lbo are in bytes.
 enum class Major { K, MN };
-uint32_t canonical(Major major, int swizzle_bytes, int eb, uint32_t lbo, uint32_t sbo, int mn, int k) {
+// atom = 32 is the 128-byte swizzle in 32-byte atoms: Swizzle<2,5,2>.
+uint32_t canonical(Major major, int swizzle_bytes, int eb, uint32_t lbo, uint32_t sbo, int mn, int k,
+                   int atom = 16) {
   const int T = 16 / eb;
   const uint32_t SBO = sbo / eb, LBO = lbo / eb;
   uint32_t e;
@@ -99,13 +101,14 @@ uint32_t canonical(Major major, int swizzle_bytes, int eb, uint32_t lbo, uint32_
     }
   }
   uint32_t byte = e * eb;
+  if (atom == 32) return byte ^ (((byte >> 7) & 3u) << 5);   // Swizzle<2,5,2>
   const int b = swizzle_bytes == 128 ? 3 : swizzle_bytes == 64 ? 2 : swizzle_bytes == 32 ? 1 : 0;
   return byte ^ (((byte >> 7) & ((1u << b) - 1)) << 4);
 }
 
 // A shared-memory descriptor (Table 49), start relative to the operand buffer.
-uint64_t desc(uint32_t start, uint32_t lbo, uint32_t sbo, int swizzle_bytes) {
-  const uint64_t code = swizzle_bytes == 128 ? 2 : swizzle_bytes == 64 ? 4 : swizzle_bytes == 32 ? 6 : 0;
+uint64_t desc(uint32_t start, uint32_t lbo, uint32_t sbo, int swizzle_bytes, int atom = 16) {
+  const uint64_t code = atom == 32 ? 1 : swizzle_bytes == 128 ? 2 : swizzle_bytes == 64 ? 4 : swizzle_bytes == 32 ? 6 : 0;
   return uint64_t{(start & 0x3FFFF) >> 4} | (uint64_t{(lbo & 0x3FFFF) >> 4} << 16) |
          (uint64_t{(sbo & 0x3FFFF) >> 4} << 32) | (uint64_t{1} << 46) | (code << 61);
 }
@@ -343,17 +346,17 @@ struct Operands {
 Operands images(int group, int M, int N, int K, int eb, Major amaj, Major bmaj, int swz_a, int swz_b,
                 uint32_t lbo_a, uint32_t sbo_a, uint32_t lbo_b, uint32_t sbo_b,
                 const std::function<uint64_t(int, int)>& Abits,
-                const std::function<uint64_t(int, int)>& Bbits) {
+                const std::function<uint64_t(int, int)>& Bbits, int atom = 16) {
   Operands o;
   o.a.resize(group);
   o.b.resize(group);
   for (int v = 0; v < group; ++v) {
     for (int m = 0; m < M / group; ++m)
       for (int k = 0; k < K; ++k)
-        put(o.a[v], canonical(amaj, swz_a, eb, lbo_a, sbo_a, m, k), Abits(v * (M / group) + m, k), eb);
+        put(o.a[v], canonical(amaj, swz_a, eb, lbo_a, sbo_a, m, k, atom), Abits(v * (M / group) + m, k), eb);
     for (int n = 0; n < N / group; ++n)
       for (int k = 0; k < K; ++k)
-        put(o.b[v], canonical(bmaj, swz_b, eb, lbo_b, sbo_b, n, k), Bbits(v * (N / group) + n, k), eb);
+        put(o.b[v], canonical(bmaj, swz_b, eb, lbo_b, sbo_b, n, k, atom), Bbits(v * (N / group) + n, k), eb);
   }
   return o;
 }
@@ -748,6 +751,27 @@ VTEST(tcgen05_mma_128b_swizzle_k_block_inside_the_atom) {
               [&](int k, int n) { return B(k + 16, n); }, nullptr, 0, 32);
 }
 
+// tf32, both MN-major in the 128-byte swizzle with 32-byte atoms (descriptor
+// mode 1), the only swizzle a 32-bit transpose may use (Table 65).
+VTEST(tcgen05_mma_tf32_mn_major_128b_swizzle_32b_atoms) {
+  const int M = 64, N = 32, K = 8;
+  auto A = [](int m, int k) { return val(m, k, 3); };
+  auto B = [](int k, int n) { return val(k, n, 4); };
+  // T = 4 tf32 per 16 bytes, 32 MN per 128-byte row; SBO steps 8 K rows.
+  const Operands o = images(1, M, N, K, 4, Major::MN, Major::MN, 128, 128, 1024, 1024, 1024, 1024,
+                            [&](int m, int k) { return f32_bits(A(m, k)); },
+                            [&](int n, int k) { return f32_bits(B(k, n)); }, 32);
+  Mma x;
+  x.kind = "tf32";
+  x.id = idesc(1, 2, 2, M, N, false, false, true, true);
+  x.desc_a = desc(0, 1024, 1024, 128, 32);
+  x.desc_b = desc(0, 1024, 1024, 128, 32);
+  x.smem_a = o.a;
+  x.smem_b = o.b;
+  x.cols = 32;
+  check_d_f32(x.run(), 1, M, N, K, A, B, nullptr, 0, 32);
+}
+
 // enable-input-d accumulates into what is there, scale-input-d scales it by
 // 2^-s first, and the negate bits flip A and B.
 VTEST(tcgen05_mma_accumulate_scale_and_negate) {
@@ -926,8 +950,8 @@ VTEST(tcgen05_mma_refuses_descriptors_and_shapes_the_isa_rules_out) {
   VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "0b001 in bits 46-48");
   x.desc_b = desc(0, 128, 256, 0) | (uint64_t{2} << 49);
   VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "nonzero base offset");
-  x.desc_b = desc(0, 128, 256, 0) | (uint64_t{1} << 61);
-  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "32-byte atoms");
+  x.desc_b = desc(0, 128, 256, 0) | (uint64_t{3} << 61);
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "swizzle mode 3");
   x.desc_b = desc(0, 128, 256, 0);
   x.id = idesc(1, 3, 3, 128, 16);   // e2m3 is not a .kind::f16 type
   VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "Table 51");

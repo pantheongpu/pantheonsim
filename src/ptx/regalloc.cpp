@@ -104,7 +104,8 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
         }
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpClc>) {
           use_addr(op.mbar);
-          if (op.response.id != kNoReg) uses.push_back(op.response.id);
+          for (const Reg* r : {&op.resp_lo, &op.resp_hi})
+            if (r->id != kNoReg) uses.push_back(r->id);
           for (const auto& r : op.dst)
             if (r.id != kNoReg) defs.push_back(r.id);
         }

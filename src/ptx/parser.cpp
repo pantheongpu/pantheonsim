@@ -986,7 +986,46 @@ class Parser {
   }
 
   void parse_reg_decl(EntryFn& fn) {
+    // .b128 (sm_70+, PTX 8.3): registers here are at most 64 bits, so one
+    // is held as two, `name$lo` and `name$hi`, and the few instructions that
+    // take a .b128 operand -- ld/st and clusterlaunchcontrol.query_cancel --
+    // name the halves (see b128_halves).
+    if (peek().kind == Token::Kind::Word && peek().text == ".b128") {
+      next();
+      const Type half{Type::Kind::B, 64};
+      while (true) {
+        const std::string name = expect_word("register name");
+        const size_t line = peek().line;
+        std::vector<std::string> names;
+        if (peek_punct("<")) {
+          next();
+          const int64_t n = parse_int_literal(expect_word("register count"), line);
+          expect_punct(">");
+          if (n < 1 || n > kMaxRegisterBank)
+            fail(line, "register count must be 1 to " + std::to_string(kMaxRegisterBank));
+          for (int64_t i = 0; i < n; ++i) names.push_back(name + std::to_string(i));
+        } else {
+          names.push_back(name);
+        }
+        for (const std::string& n : names) {
+          declare_reg(fn, n + "$lo", half, line);
+          declare_reg(fn, n + "$hi", half, line);
+        }
+        if (!peek_punct(",")) break;
+        next();
+      }
+      expect_punct(";");
+      return;
+    }
     parse_reg_decl_of_type(fn, expect_type(".reg declaration"));
+  }
+
+  // The two 64-bit halves standing for a .b128 register operand.
+  std::pair<Reg, Reg> b128_halves(const std::string& ctx) {
+    const std::string w = expect_word(ctx);
+    if (!declared_regs_.count(w + "$lo"))
+      fail(peek().line, ctx + " must be a .b128 register, got '" + w + "'");
+    return {intern(w + "$lo"), intern(w + "$hi")};
   }
 
   void parse_reg_decl_of_type(EntryFn& fn, Type ty) {
@@ -1334,7 +1373,7 @@ class Parser {
       size_t vec = 1;
       Type ty{};
       bool have_ty = false;
-      bool acquire = false, release = false;
+      bool acquire = false, release = false, b128 = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "acquire") acquire = true;
@@ -1353,10 +1392,21 @@ class Parser {
         else if (inert_mem_modifier(p)) ;
         else if (p == "v2") vec = 2;
         else if (p == "v4") vec = 4;
-        else if (auto t2 = parse_type_token(p)) {
+        else if (p == "b128") {
+          ty = Type{Type::Kind::B, 64};
+          have_ty = true;
+          b128 = true;
+        } else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
         } else return unsupported("unrecognized ld/st modifier '." + p + "'");
+      }
+      // A .b128 access is the .v2.b64 access of its two halves: the same 16
+      // bytes, with the same 16-byte alignment.
+      if (b128) {
+        if (vec != 1) return unsupported("vector ." + op0 + ".b128");
+        if (space == Space::Param) return unsupported(op0 + ".param.b128");
+        vec = 2;
       }
       if (!have_ty) fail(ins.line, "ld/st missing type: " + opcode);
       storage_bytes(ty, ins.line, opcode);
@@ -1366,7 +1416,10 @@ class Parser {
         // A one-element braced list is legal PTX for a scalar load, and it is
         // what Triton's inline-asm loads look like: "ld.global.b32 { %r1 },
         // [ %rd1 ];". The braces carry no meaning the vector count does not.
-        if (vec == 1 && !peek_punct("{")) {
+        if (b128) {
+          const auto [lo, hi] = b128_halves("ld.b128 destination");
+          dsts = {lo, hi};
+        } else if (vec == 1 && !peek_punct("{")) {
           dsts.push_back(expect_reg_operand("ld destination"));
         } else {
           dsts = parse_reg_vector(vec);
@@ -1395,7 +1448,10 @@ class Parser {
         Addr addr = parse_addr(fn);
         expect_punct(",");
         std::vector<Operand> srcs;
-        if (vec == 1 && !peek_punct("{"))
+        if (b128) {
+          const auto [lo, hi] = b128_halves("st.b128 source");
+          srcs = {RegOperand{lo}, RegOperand{hi}};
+        } else if (vec == 1 && !peek_punct("{"))
           srcs.push_back(parse_operand());
         else
           srcs = parse_operand_vector(vec);
@@ -2161,6 +2217,67 @@ class Parser {
         }
         ins.op = op;
       }
+    } else if (op0 == "clusterlaunchcontrol") {
+      // Cluster launch control (sm_100, PTX ISA 9.7.15.18-19).
+      {
+        int sm = 0;
+        std::sscanf(target_.c_str(), "sm_%d", &sm);
+        if (sm < 100)
+          fail(ins.line, "clusterlaunchcontrol requires sm_100 or later; this module targets " +
+                             (target_.empty() ? std::string("nothing") : target_));
+      }
+      if (parts.size() < 2) return unsupported("clusterlaunchcontrol form");
+      OpClc op;
+      if (parts[1] == "try_cancel") {
+        bool async = false, mbar = false;
+        for (size_t i = 2; i < parts.size(); ++i) {
+          const std::string& p = parts[i];
+          if (p == "async") async = true;
+          else if (p == "shared" || p == "b128") ;
+          else if (p == "mbarrier::complete_tx::bytes") mbar = true;
+          else if (p == "multicast::cluster::all") op.multicast = true;
+          else return unsupported("clusterlaunchcontrol.try_cancel modifier '." + p + "'");
+        }
+        if (!async || !mbar)
+          return unsupported("clusterlaunchcontrol.try_cancel needs .async and "
+                             ".mbarrier::complete_tx::bytes");
+        op.addr = parse_addr(fn);
+        expect_punct(",");
+        op.mbar = parse_addr(fn);
+      } else if (parts[1] == "query_cancel" && parts.size() > 2) {
+        const std::string& q = parts[2];
+        if (q == "is_canceled") {
+          op.kind = ClcKind::IsCanceled;
+          op.dst.push_back(expect_reg_operand("is_canceled destination"));
+        } else if (q == "get_first_ctaid") {
+          op.kind = ClcKind::FirstCtaid;
+          if (!peek_punct("{")) return unsupported("get_first_ctaid without .v4 or ::x/::y/::z");
+          next();
+          for (int i = 0; i < 4; ++i) {
+            if (i) expect_punct(",");
+            if (peek().text == "_") {
+              next();
+              op.dst.push_back(Reg{});
+            } else {
+              op.dst.push_back(expect_reg_operand("get_first_ctaid destination"));
+            }
+          }
+          expect_punct("}");
+        } else if (q == "get_first_ctaid::x" || q == "get_first_ctaid::y" || q == "get_first_ctaid::z") {
+          op.kind = ClcKind::FirstCtaid;
+          op.dim = q.back() - 'x';
+          op.dst.push_back(expect_reg_operand("get_first_ctaid destination"));
+        } else {
+          return unsupported("clusterlaunchcontrol.query_cancel." + q);
+        }
+        expect_punct(",");
+        const auto [lo, hi] = b128_halves("query_cancel's response operand");
+        op.resp_lo = lo;
+        op.resp_hi = hi;
+      } else {
+        return unsupported("clusterlaunchcontrol." + parts[1]);
+      }
+      ins.op = op;
     } else if (op0 == "tcgen05") {
       // Blackwell's tensor core (PTX ISA 9.7.18). Arch-specific: sm_100a to
       // sm_110a, or their family targets; ptxas refuses it on sm_120 (the
@@ -3669,6 +3786,8 @@ class Parser {
           else if (p == "bulk_group") group_completion = true;
           else if (p == "tile" || p == "weak" || p == "b128" || inert_mem_modifier(p)) ;
           else if (p == "multicast::cluster" || p == "multicast::cluster::16b") op.multicast = true;
+          else if (p == "cta_group::1") op.cta_group = 1;
+          else if (p == "cta_group::2") op.cta_group = 2;
           else if (p == "im2col" || p == "im2col_no_offs") { op.im2col = true; im2col_mode = p; }
           else return unsupported("cp.async.bulk modifier '." + p + "' (gather/scatter, im2col::w, "
                                   "masks, overrides and reports are not implemented)");
@@ -3691,6 +3810,8 @@ class Parser {
           if (g2s != (im2col_mode == "im2col"))
             return unsupported("tensor loads take .im2col and stores .im2col_no_offs");
         }
+        if (op.cta_group == 2 && !mbar_completion)
+          return unsupported(".cta_group goes with the mbarrier completion mechanism only");
         if (op.to_shared && !mbar_completion)
           return unsupported("a cp.async.bulk load completes on an mbarrier (.mbarrier::complete_tx::bytes)");
         if (s2g && !group_completion)

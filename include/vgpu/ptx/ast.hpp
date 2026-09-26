@@ -363,7 +363,9 @@ struct OpClc {
   ClcKind kind = ClcKind::TryCancel;
   Addr addr, mbar;             // try_cancel's response slot and barrier
   bool multicast = false;      // .multicast::cluster::all
-  Reg response;                // query_cancel's .b128 operand
+  // query_cancel's .b128 operand. A .b128 register is held as two 64-bit
+  // ones, its low and high halves (see the parser's .reg handling).
+  Reg resp_lo, resp_hi;
   std::vector<Reg> dst;        // is_canceled: one predicate; get_first_ctaid: 1 or 4 (the 4th may be a sink)
   int dim = -1;                // get_first_ctaid::x/y/z, or -1 for .v4
 };
@@ -455,6 +457,7 @@ struct OpBulkCopy {
   Addr mbar;                    // loads: the barrier that counts the bytes
   bool multicast = false;
   Operand cta_mask;
+  uint32_t cta_group = 1;       // .cta_group::2: the barrier may be in the peer CTA
   // shared::cta -> shared::cluster: a block's shared memory into another's,
   // completing on a barrier in the destination block. `gmem` is then the
   // source, a shared::cta address.
