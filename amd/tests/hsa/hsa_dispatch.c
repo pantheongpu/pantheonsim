@@ -302,10 +302,22 @@ int main(int argc, char** argv) {
   for (int i = 0; i < N; ++i) right = right && host_out[i] == 2.0f + 0.5f * (float)i;
   check("a barrier holds the queue, and a copy waits for its signal", right);
 
-  /* 7. What the packet processor refuses goes to the queue's callback: a
-   * grid that is not a whole number of work-groups. */
+  /* 7. A grid that is not a whole number of work-groups: the last group has
+   * only what is left, so exactly the first 1000 elements are written. */
+  MUST(hsa_amd_memory_fill(out, 0, N));
   hsa_signal_store_relaxed(done, 1);
   dispatch(q, &add, kernarg, 1000, 256, done);
+  wait_zero(done);
+  MUST(hsa_memory_copy(host_out, out, N * sizeof(float)));
+  right = queue_errors == 0;
+  for (int i = 0; i < N; ++i) right = right && host_out[i] == (i < 1000 ? 2.0f + 0.5f * (float)i : 0.0f);
+  check("a grid that is not a whole number of work-groups runs its last one short", right);
+
+  /* And what the packet processor refuses goes to the queue's callback: a
+   * kernel object no executable loaded. */
+  const Kernel bogus = {add.object + 4096, add.kernarg_size, 0, 0};
+  hsa_signal_store_relaxed(done, 1);
+  dispatch(q, &bogus, kernarg, N, 256, done);
   wait_zero(done);
   check("a packet the processor refuses is told to the queue's callback",
         queue_errors == 1 && queue_error == HSA_STATUS_ERROR_INVALID_PACKET_FORMAT);

@@ -33,10 +33,12 @@ const CodeObject& object(const Loaded* m);
 // this plus Kernel::descriptor.
 uint64_t code_base(const Loaded* m);
 
-// Runs a kernel of `m` on its device, on the calling thread, with arguments
-// the caller has placed at `kernarg` (an address the device reaches). False,
-// and why, if the kernel faulted or could not start.
-bool run(int ordinal, const Loaded* m, const Kernel& k, const uint32_t groups[3], const uint32_t group_size[3],
+// Runs a kernel of `m` on its device, on the calling thread, over a grid of
+// `grid` work-items in work-groups of `group_size` (the last one in a
+// dimension short where the grid does not divide), with arguments the caller
+// has placed at `kernarg` (an address the device reaches). False, and why,
+// if the kernel faulted or could not start.
+bool run(int ordinal, const Loaded* m, const Kernel& k, const uint32_t grid[3], const uint32_t group_size[3],
          uint32_t dynamic_lds, uint64_t kernarg, std::string* why);
 
 // Host memory every device's kernels reach at its own address, and no longer.

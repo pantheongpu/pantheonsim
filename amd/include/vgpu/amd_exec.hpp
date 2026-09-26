@@ -33,6 +33,11 @@ struct Dispatch {
   uint32_t groups[3] = {1, 1, 1};    // work-groups
   uint32_t group_size[3] = {1, 1, 1};   // work-items in each
   uint32_t wave_size = 64;
+  // The grid in work-items, where it is not a whole number of work-groups
+  // (an HSA dispatch packet may ask for that; HIP never does): the last
+  // work-group in a dimension then has only what is left over. Zero is a
+  // grid of `groups` whole work-groups.
+  uint32_t grid_items[3] = {0, 0, 0};
   // LDS the launch adds to what the kernel reserves, which is what a HIP
   // program passes as its third launch parameter.
   uint32_t dynamic_lds = 0;

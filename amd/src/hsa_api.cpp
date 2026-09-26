@@ -210,9 +210,9 @@ void complete(hsa_signal_t s) {
   if (s.handle) signal_of(s)->update([](int64_t v) { return v - 1; });
 }
 
-// Runs one kernel dispatch packet. The grid is given in work-items; a grid
-// that is not a whole number of work-groups is refused, which this does not
-// model yet.
+// Runs one kernel dispatch packet. The grid is given in work-items, and need
+// not be a whole number of work-groups: the last one in a dimension then has
+// what is left over.
 hsa_status_t dispatch(Queue* q, const hsa_kernel_dispatch_packet_t& p, std::string* why) {
   KernelRef ref;
   {
@@ -231,22 +231,18 @@ hsa_status_t dispatch(Queue* q, const hsa_kernel_dispatch_packet_t& p, std::stri
   const unsigned dims = p.setup & 3;
   const uint32_t wg[3] = {p.workgroup_size_x, dims > 1 ? p.workgroup_size_y : 1u, dims > 2 ? p.workgroup_size_z : 1u};
   const uint32_t grid[3] = {p.grid_size_x, dims > 1 ? p.grid_size_y : 1u, dims > 2 ? p.grid_size_z : 1u};
-  uint32_t groups[3];
-  for (int i = 0; i < 3; ++i) {
+  if (dims < 1 || dims > 3) {
+    *why = "a dispatch of " + std::to_string(dims) + " dimensions";
+    return HSA_STATUS_ERROR_INVALID_PACKET_FORMAT;
+  }
+  for (int i = 0; i < 3; ++i)
     if (!wg[i] || !grid[i]) {
       *why = "a dispatch with a zero grid or work-group size";
       return HSA_STATUS_ERROR_INVALID_PACKET_FORMAT;
     }
-    if (grid[i] % wg[i]) {
-      *why = "a grid of " + std::to_string(grid[i]) + " work-items is not a whole number of work-groups of " +
-             std::to_string(wg[i]) + ", which this does not run yet";
-      return HSA_STATUS_ERROR_INVALID_PACKET_FORMAT;
-    }
-    groups[i] = grid[i] / wg[i];
-  }
   // What the packet asks for beyond the kernel's own LDS is the launch's.
   const uint32_t lds = p.group_segment_size > ref.kernel->group_segment ? p.group_segment_size - ref.kernel->group_segment : 0;
-  if (!shared::run(q->device, ref.loaded, *ref.kernel, groups, wg, lds, reinterpret_cast<uint64_t>(p.kernarg_address),
+  if (!shared::run(q->device, ref.loaded, *ref.kernel, grid, wg, lds, reinterpret_cast<uint64_t>(p.kernarg_address),
                    why))
     return HSA_STATUS_ERROR_EXCEPTION;
   return HSA_STATUS_SUCCESS;

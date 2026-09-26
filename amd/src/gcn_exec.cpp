@@ -3498,14 +3498,24 @@ struct Machine {
 
 namespace {
 
+// The grid's size in work-items in dimension i: what the dispatch says, or
+// its whole work-groups.
+uint64_t grid_items(const Dispatch& d, int i) {
+  return d.grid_items[i] ? d.grid_items[i] : uint64_t{d.groups[i]} * d.group_size[i];
+}
+// How many work-items work-group g has in dimension i: the full size, or in a
+// grid that is not a whole number of groups, what is left for the last one.
+uint32_t items_in_group(const Dispatch& d, int i, uint32_t g) {
+  const uint64_t start = uint64_t{g} * d.group_size[i];
+  return static_cast<uint32_t>(std::min<uint64_t>(d.group_size[i], grid_items(d, i) - start));
+}
+
 // What the runtime tells a kernel about the grid it is part of, written into
 // the kernarg segment after the kernel's own arguments. The names and offsets
 // are the code object's own (its metadata lists them); the values are this
 // dispatch's.
 void fill_hidden_arguments(const Dispatch& d, const Kernel& k, MemoryManager& mem) {
-  const uint64_t threads_x = uint64_t{d.groups[0]} * d.group_size[0];
-  const uint64_t threads_y = uint64_t{d.groups[1]} * d.group_size[1];
-  const uint64_t threads_z = uint64_t{d.groups[2]} * d.group_size[2];
+  const uint64_t threads_x = grid_items(d, 0), threads_y = grid_items(d, 1), threads_z = grid_items(d, 2);
   const uint32_t dims = d.groups[2] > 1 || d.group_size[2] > 1   ? 3
                         : d.groups[1] > 1 || d.group_size[1] > 1 ? 2
                                                                  : 1;
@@ -3527,11 +3537,15 @@ void fill_hidden_arguments(const Dispatch& d, const Kernel& k, MemoryManager& me
     else if (kind == "hidden_private_base") value = kPrivateBase;
     else if (kind == "hidden_dynamic_lds_size") value = d.dynamic_lds;
     else if (kind == "hidden_hostcall_buffer") value = d.hostcall ? d.hostcall->buffer() : 0;
+    // The size of the last work-group in each dimension, where the grid is
+    // not a whole number of them; zero where it is.
+    else if (kind == "hidden_remainder_x") value = threads_x % d.group_size[0];
+    else if (kind == "hidden_remainder_y") value = threads_y % d.group_size[1];
+    else if (kind == "hidden_remainder_z") value = threads_z % d.group_size[2];
     // What a grid barrier counts on, in a cooperative launch; zero otherwise,
     // which is how a kernel tells that its grid cannot synchronize.
     else if (kind == "hidden_multigrid_sync_arg") value = d.grid_sync;
-    // Everything else -- the remainders of a grid that divides evenly, the
-    // global offsets, a heap for device malloc -- is
+    // Everything else -- the global offsets, a heap for device malloc -- is
     // zero, and a kernel that needs one of those will say so by failing on a
     // null pointer rather than reading something made up.
     else continue;
@@ -3557,9 +3571,9 @@ uint64_t write_dispatch_packet(const Dispatch& d, const Kernel& k, MemoryManager
   put16(4, static_cast<uint16_t>(d.group_size[0]));
   put16(6, static_cast<uint16_t>(d.group_size[1]));
   put16(8, static_cast<uint16_t>(d.group_size[2]));
-  put32(12, static_cast<uint32_t>(uint64_t{d.groups[0]} * d.group_size[0]));
-  put32(16, static_cast<uint32_t>(uint64_t{d.groups[1]} * d.group_size[1]));
-  put32(20, static_cast<uint32_t>(uint64_t{d.groups[2]} * d.group_size[2]));
+  put32(12, static_cast<uint32_t>(grid_items(d, 0)));
+  put32(16, static_cast<uint32_t>(grid_items(d, 1)));
+  put32(20, static_cast<uint32_t>(grid_items(d, 2)));
   put32(24, k.private_segment);
   put32(28, k.group_segment);
   put64(32, d.code_base + k.entry);
@@ -3591,7 +3605,11 @@ unsigned worker_count(uint64_t groups) {
 void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_segment, uint32_t gx,
                   uint32_t gy, uint32_t gz) {
   const Kernel& k = *d.kernel;
-  const uint64_t threads = uint64_t{d.group_size[0]} * d.group_size[1] * d.group_size[2];
+  // The work-group's own shape: the dispatch's, or less in the last group of
+  // a grid that is not a whole number of them. Its work-items are numbered
+  // across that shape, as the hardware numbers a partial group's.
+  const uint32_t size[3] = {items_in_group(d, 0, gx), items_in_group(d, 1, gy), items_in_group(d, 2, gz)};
+  const uint64_t threads = uint64_t{size[0]} * size[1] * size[2];
   const uint32_t waves_per_group = static_cast<uint32_t>((threads + kLanes - 1) / kLanes);
   // A card gives a work-group LDS in 512-byte granules (128 dwords, the
   // unit the descriptor counts it in), so a kernel reading a little past
@@ -3636,9 +3654,8 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
     if (k.group_id_z) m.set_sgpr(w, at++, gz);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const uint64_t flat = w.first_lane + lane;
-      const uint32_t x = static_cast<uint32_t>(flat % d.group_size[0]),
-                     y = static_cast<uint32_t>(flat / d.group_size[0] % d.group_size[1]),
-                     z = static_cast<uint32_t>(flat / d.group_size[0] / d.group_size[1]);
+      const uint32_t x = static_cast<uint32_t>(flat % size[0]), y = static_cast<uint32_t>(flat / size[0] % size[1]),
+                     z = static_cast<uint32_t>(flat / size[0] / size[1]);
       // From ABI version 5 a work-item's three ids are packed into v0,
       // ten bits each, and the kernel pulls them out; before it each id
       // had a register of its own.
@@ -3713,6 +3730,10 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     throw Error::make(Err::InvalidValue, "a CDNA wavefront is ", kLanes, " lanes, not ", d.wave_size);
   const uint64_t threads = uint64_t{d.group_size[0]} * d.group_size[1] * d.group_size[2];
   if (!threads) throw Error::make(Err::InvalidValue, "a work-group has no work-items");
+  for (int i = 0; i < 3; ++i)
+    if (d.grid_items[i] && d.groups[i] != (d.grid_items[i] + d.group_size[i] - 1) / d.group_size[i])
+      throw Error::make(Err::InvalidValue, "a grid of ", d.grid_items[i], " work-items is not ", d.groups[i],
+                        " work-groups of ", d.group_size[i]);
   if (k.max_flat_workgroup_size && threads > k.max_flat_workgroup_size)
     throw Error::make(Err::InvalidValue, "a work-group of ", threads, " work-items is past the ",
                       k.max_flat_workgroup_size, " this kernel allows");

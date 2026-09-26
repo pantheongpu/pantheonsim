@@ -258,8 +258,9 @@ own address. Memory from a GPU's pool belongs to that device, and the host
 reaches it by copying. Every function carries ROCm's symbol version
 (`ROCR_1`). `tests/hsa/hsa_dispatch.c` is built against this header, and
 against ROCm's `hsa.h` where that is installed, and both builds run
-(ctest `amd_hsa`). A grid that is not a whole number of work-groups is not
-run yet: the queue's callback is told.
+(ctest `amd_hsa`). A grid need not be a whole number of work-groups, as HSA
+allows: the last group in a dimension runs short, numbered across its own
+shape, and the kernel's `hidden_remainder` arguments say by how much.
 
 ## Profiling
 
