@@ -75,6 +75,10 @@ struct Inst {
   // VOP3 otherwise uses for negation (bits 0-2), absolute value (3-5) and
   // the output multiplier (6-7).
   uint8_t bitop3 = 0;
+  // gfx950's f8f6f4 matrix instructions: A's and B's formats, which the
+  // encoding keeps where the others' broadcast controls are (CBSZ, BLGP):
+  // 0 fp8, 1 bf8, 2 fp6 (E2M3), 3 bf6 (E3M2), 4 fp4 (E2M1).
+  uint8_t cbsz = 0, blgp = 0;
   // SMEM: the offset is the instruction's own and a register's both, which
   // the assembler writes as "offset:" even when the constant is zero.
   bool smem_both_offsets = false;

@@ -449,6 +449,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop2, 0x036}, {"v_subrev_u32_e32", 1, 2}},
       // The dot products, which add into their destination as fmac does.
       {{Enc::Vop2, 0x037}, {"v_dot2c_f32_f16_e32", 1, 2}},
+      {{Enc::Vop2, 0x016}, {"v_dot2c_f32_bf16_e32", 1, 2}},
       {{Enc::Vop2, 0x039}, {"v_dot4c_i32_i8_e32", 1, 2}},
       {{Enc::Vop2, 0x03b}, {"v_fmac_f32_e32", 1, 2}},
       // The float comparisons share their opcodes with the long forms above.
@@ -834,6 +835,15 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x61}, {"v_mfma_f32_16x16x16_bf16", 4, 3, 2, 2, 4}},
       // gfx950's: the same with K doubled, eight halves or bfloat16s a lane.
       {{Enc::Vop3p, 0x54}, {"v_mfma_f32_16x16x32_f16", 4, 3, 4, 4, 4}},
+      {{Enc::Vop3p, 0x36}, {"v_mfma_i32_16x16x64_i8", 4, 3, 4, 4, 4}},
+      {{Enc::Vop3p, 0x38}, {"v_mfma_i32_32x32x32_i8", 16, 3, 4, 4, 16}},
+      // And the small floats, each source of any of five formats its CBSZ or
+      // BLGP names; the widths here are fp8's, a source of fewer bits takes
+      // fewer registers.
+      {{Enc::Vop3p, 0x2d}, {"v_mfma_f32_16x16x128_f8f6f4", 4, 3, 8, 8, 4}},
+      {{Enc::Vop3p, 0x2e}, {"v_mfma_f32_32x32x64_f8f6f4", 16, 3, 8, 8, 16}},
+      // Two pairs of bfloat16s multiplied and added into a float (gfx950).
+      {{Enc::Vop3p, 0x1a}, {"v_dot2_f32_bf16", 1, 3}},
       {{Enc::Vop3p, 0x55}, {"v_mfma_f32_32x32x16_f16", 16, 3, 4, 4, 16}},
       {{Enc::Vop3p, 0x35}, {"v_mfma_f32_16x16x32_bf16", 4, 3, 4, 4, 4}},
       {{Enc::Vop3p, 0x37}, {"v_mfma_f32_32x32x16_bf16", 16, 3, 4, 4, 16}},
@@ -1239,13 +1249,28 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       in.clamp = false;
       const uint32_t cbsz = (w0 >> 8) & 0x7, abid = (w0 >> 11) & 0xF, acc_cd = (w0 >> 15) & 1;
       const uint32_t acc = (w1 >> 27) & 0x3, blgp = (w1 >> 29) & 0x7;
-      if (cbsz || abid || blgp)
+      const bool formats = in.name.find("f8f6f4") != std::string::npos;
+      if (formats && (cbsz > 4 || blgp > 4 || abid))
+        throw Error::make(Err::Unsupported, in.name, " with source formats ", cbsz, " and ", blgp,
+                          ", which are not ones the instruction has");
+      if (!formats && (cbsz || abid || blgp))
         throw Error::make(Err::Unsupported, in.name, " broadcasts part of a source (cbsz ", cbsz, ", abid ", abid,
                           ", blgp ", blgp, "), which this does not model");
+      if (formats) {
+        in.cbsz = static_cast<uint8_t>(cbsz);
+        in.blgp = static_cast<uint8_t>(blgp);
+      }
+      // Registers a source of 32 small floats a lane takes: 8 for 8-bit ones,
+      // 6 for 6-bit, 4 for 4-bit.
+      const auto width = [&](uint32_t k) -> uint32_t {
+        if (!formats || k > 1) return s.src_width(k);
+        const uint32_t f = k == 0 ? cbsz : blgp;
+        return f <= 1 ? 8 : f <= 3 ? 6 : 4;
+      };
       in.dst.push_back(vgpr(w0 & 0xFF, s.dst_width));
       if (acc_cd) in.dst[0].kind = OperandKind::Agpr;
       for (uint32_t k = 0; k < s.srcs; ++k) {
-        Operand o = take((w1 >> (9 * k)) & 0x1FF, s.src_width(k));
+        Operand o = take((w1 >> (9 * k)) & 0x1FF, width(k));
         if (k < 2 && ((acc >> k) & 1) && o.kind == OperandKind::Vgpr) o.kind = OperandKind::Agpr;
         if (k == 2 && acc_cd && o.kind == OperandKind::Vgpr) o.kind = OperandKind::Agpr;
         in.src.push_back(o);
@@ -1612,6 +1637,8 @@ std::string to_text(const Inst& i) {
     s += " " + dpp_control_text(i.dpp_ctrl) + m;
     if (i.bound_ctrl) s += " bound_ctrl:1";
   }
+  if (i.cbsz) s += " cbsz:" + std::to_string(i.cbsz);
+  if (i.blgp) s += " blgp:" + std::to_string(i.blgp);
   if (i.bitop3) {
     char t[24];
     std::snprintf(t, sizeof t, " bitop3:0x%x", i.bitop3);

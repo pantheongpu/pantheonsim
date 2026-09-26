@@ -1,5 +1,7 @@
 # gfx950 instructions from ROCm's libraries: the encoding (little-endian 32-bit words)
 # and llvm-objdump's text for it. Written by amd/tools/isa-corpus.py.
+# A few more from hipBLASLt's gfx950 GEMMs, and the fp6 and fp4 forms (which no library here uses
+# yet) as LLVM's assembler writes them.
 E1341000 800B2F38	buffer_atomic_add_f32 v47, v56, s[44:47], 0 offen
 E1341010 800B3421	buffer_atomic_add_f32 v52, v33, s[44:47], 0 offen offset:16
 E0A4C000 00000000	buffer_inv sc0 sc1
@@ -1099,6 +1101,7 @@ D14A0007 20000107	v_cvt_f16_f32_e64 v7, -v7
 7E0C74F9 00050606	v_cvt_f16_i16_sdwa v6, v6 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1
 7E047302	v_cvt_f16_u16_e32 v2, v2
 7E0672F9 00000602	v_cvt_f16_u16_sdwa v3, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0
+7E00B701	v_cvt_f32_bf16_e32 v0, v1
 7E04AB02	v_cvt_f32_bf8_e32 v2, v2
 7E0A1704	v_cvt_f32_f16_e32 v5, v4
 D14B0114 20000102	v_cvt_f32_f16_e64 v20, -|v2|
@@ -1164,6 +1167,14 @@ D1E10228 03CA40F2	v_div_scale_f64 v[40:41], s[2:3], 1.0, v[32:33], 1.0
 D1E10004 840A0100	v_div_scale_f64 v[4:5], s[0:1], v[0:1], v[0:1], -v[2:3]
 D1E10404 03CA0502	v_div_scale_f64 v[4:5], s[4:5], v[2:3], v[2:3], 1.0
 D1E16A08 03CA04F2	v_div_scale_f64 v[8:9], vcc, 1.0, v[2:3], 1.0
+D39A4000 1C022108	v_dot2_f32_bf16 v0, v8, v16, v0
+D39A4032 1CC8111A	v_dot2_f32_bf16 v50, v26, s8, v50
+D39A4032 1CC8111B	v_dot2_f32_bf16 v50, v27, s8, v50
+D39A4032 1CC8111C	v_dot2_f32_bf16 v50, v28, s8, v50
+2C18DCFF 8000BF80	v_dot2c_f32_bf16_e32 v12, 0x8000bf80, v110
+2C1ADEFF 8000BF80	v_dot2c_f32_bf16_e32 v13, 0x8000bf80, v111
+2C1CDCFF BF800000	v_dot2c_f32_bf16_e32 v14, 0xbf800000, v110
+2C2144FF 8000BF80	v_dot2c_f32_bf16_e32 v16, 0x8000bf80, v162
 D3A8C003 1C0E3317	v_dot4_i32_i8 v3, v23, v25, v3 clamp
 7E064103	v_exp_f32_e32 v3, v3
 7E1C5F05	v_ffbh_i32_e32 v14, v5
@@ -1341,17 +1352,30 @@ D28C0002 00010100	v_mbcnt_lo_u32_b32 v2, v0, 0
 D1D60006 04140701	v_med3_f32 v6, v1, s3, v5
 D1D60007 04290107	v_med3_f32 v7, v7, 0, v10
 D1D70002 04040504	v_med3_i32 v2, v4, s2, v1
+D3AD8100 2402156A	v_mfma_f32_16x16x128_f8f6f4 a[0:3], v[106:113], v[10:17], a[0:3] cbsz:1 blgp:1
+D3AD8100 2402152A	v_mfma_f32_16x16x128_f8f6f4 a[0:3], v[42:49], v[10:17], a[0:3] cbsz:1 blgp:1
+D3AD8104 24121532	v_mfma_f32_16x16x128_f8f6f4 a[4:7], v[50:57], v[10:17], a[4:7] cbsz:1 blgp:1
+D3AD8108 2422153A	v_mfma_f32_16x16x128_f8f6f4 a[8:11], v[58:65], v[10:17], a[8:11] cbsz:1 blgp:1
+D3AD0000 84021904	v_mfma_f32_16x16x128_f8f6f4 v[0:3], v[4:11], v[12:15], v[0:3] blgp:4
+D3AD0400 84021904	v_mfma_f32_16x16x128_f8f6f4 v[0:3], v[4:7], v[12:15], v[0:3] cbsz:4 blgp:4
+D3AD0200 64021904	v_mfma_f32_16x16x128_f8f6f4 v[0:3], v[4:9], v[12:17], v[0:3] cbsz:2 blgp:3
 D3E18000 02023918	v_mfma_f32_16x16x16_bf16 a[0:3], v[24:25], v[28:29], 0
 D3E18000 0402311C	v_mfma_f32_16x16x16_bf16 a[0:3], v[28:29], v[24:25], a[0:3]
 D3B58000 02021D06	v_mfma_f32_16x16x32_bf16 a[0:3], v[6:9], v[14:17], 0
 D3B58000 0402A154	v_mfma_f32_16x16x32_bf16 a[0:3], v[84:87], v[80:83], a[0:3]
+D3D40000 04021104	v_mfma_f32_16x16x32_f16 v[0:3], v[4:7], v[8:11], v[0:3]
 D3B78030 02023D0E	v_mfma_f32_32x32x16_bf16 a[48:63], v[14:17], v[30:33], 0
 D3B78030 04C29D46	v_mfma_f32_32x32x16_bf16 a[48:63], v[70:73], v[78:81], a[48:63]
 D3D50072 05CB4D92	v_mfma_f32_32x32x16_f16 v[114:129], v[146:149], v[166:169], v[114:129]
 D3D50002 02028912	v_mfma_f32_32x32x16_f16 v[2:17], v[18:21], v[68:71], 0
 D3C48070 05C2AF75	v_mfma_f32_32x32x2_f32 a[112:127], v117, v87, a[112:127]
 D3C48050 0202AD52	v_mfma_f32_32x32x2_f32 a[80:95], v82, v86, 0
+D3AE8000 04023158	v_mfma_f32_32x32x64_f8f6f4 a[0:15], v[88:95], v[24:31], a[0:15]
+D3AE8010 04424158	v_mfma_f32_32x32x64_f8f6f4 a[16:31], v[88:95], v[32:39], a[16:31]
+D3AE8020 04825158	v_mfma_f32_32x32x64_f8f6f4 a[32:47], v[88:95], v[40:47], a[32:47]
 D3E08000 0402B566	v_mfma_f32_32x32x8_bf16 a[0:15], v[102:103], v[90:91], a[0:15]
+D3B60000 04021104	v_mfma_i32_16x16x64_i8 v[0:3], v[4:7], v[8:11], v[0:3]
+D3B88000 04022D06	v_mfma_i32_32x32x32_i8 a[0:15], v[6:9], v[22:25], a[0:15]
 D1F50000 043E0101	v_min3_i16 v0, v1, v0, v15
 D1D10004 046A4100	v_min3_i32 v4, v0, v32, v26
 D1F60019 042A0900	v_min3_u16 v25, v0, v4, v10
@@ -1472,6 +1496,8 @@ D1ED000C 04461880	v_perm_b32 v12, 0, v12, v17
 D1ED0004 00190104	v_perm_b32 v4, v4, 0, s6
 D1ED0006 02101501	v_perm_b32 v6, v1, s10, 4
 D1ED0007 002A0F04	v_perm_b32 v7, v4, v7, s10
+7E00B301	v_permlane16_swap_b32_e32 v0, v1
+7E04B503	v_permlane32_swap_b32_e32 v2, v3
 D38F410E 2801E503	v_pk_add_f16 v14, v3, 1.0 op_sel_hi:[1,0] neg_lo:[1,0] neg_hi:[1,0]
 D38F4202 58020D02	v_pk_add_f16 v2, v2, v6 neg_lo:[0,1] neg_hi:[0,1]
 D38F4016 18022F0C	v_pk_add_f16 v22, v12, v23
@@ -1530,6 +1556,7 @@ D3815015 08022115	v_pk_mul_lo_u16 v21, v21, v16 op_sel:[0,1] op_sel_hi:[1,0]
 D3814003 18020F03	v_pk_mul_lo_u16 v3, v3, v7
 D3834006 18020680	v_pk_sub_i16 v6, 0, v3
 D38B5017 0001852D	v_pk_sub_u16 v23, v45, -2 op_sel:[0,1] op_sel_hi:[0,0]
+7E00B101	v_prng_b32_e32 v0, v1
 7E0C7B06	v_rcp_f16_e32 v6, v6
 7E047AF9 00060502	v_rcp_f16_sdwa v2, v2 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD
 7E047AF9 00050502	v_rcp_f16_sdwa v2, v2 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:WORD_1
