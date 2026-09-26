@@ -1044,6 +1044,38 @@ class Interpreter {
                       "\n  GPU profile: ", profile_.id);
   }
 
+  // Where every warp of the block is, for a hang: the warp that ran out of
+  // steps is usually spinning in a wait, and which warp should have released
+  // it -- and what that one is doing instead -- is the rest of the diagnosis.
+  // Warps in the same place are listed together.
+  std::string warp_positions(const BlockCtx& ctx) const {
+    if (!ctx.warps) return {};
+    auto where = [&](const Warp& w) {
+      if (w.state == Warp::State::Done) return std::string("exited");
+      std::string out = w.state == Warp::State::AtBarrier ? "at a barrier" : "running";
+      for (const Path& p : w.paths) {
+        out += p.pc < fn_.body.size()
+                   ? "; PTX line " + std::to_string(fn_.body[p.pc].line) + ": " +
+                         fn_.body[p.pc].text.substr(0, 100)
+                   : std::string("; past the end");
+        if (p.parked) out += " (parked)";
+      }
+      return out;
+    };
+    std::string out = "\n  warps of this block:";
+    const auto& warps = *ctx.warps;
+    for (size_t i = 0; i < warps.size();) {
+      const std::string here = where(warps[i]);
+      size_t j = i + 1;
+      while (j < warps.size() && where(warps[j]) == here) ++j;
+      out += "\n    " + (j - i == 1 ? "warp " + std::to_string(i)
+                                     : "warps " + std::to_string(i) + "-" + std::to_string(j - 1)) +
+             ": " + here;
+      i = j;
+    }
+    return out;
+  }
+
   [[noreturn]] void ctx_fail(const Instr& ins, int lane, Err code, const std::string& msg) {
     try {
       throw Error::make(code, msg);
@@ -1275,7 +1307,8 @@ class Interpreter {
                  "exceeded the step budget (" + std::to_string(cfg_.max_steps) +
                      " instructions in one warp) — possible infinite loop; block (" +
                      std::to_string(ctx.ctaid[0]) + "," + std::to_string(ctx.ctaid[1]) + "," +
-                     std::to_string(ctx.ctaid[2]) + "), warp " + std::to_string(cur_warp_));
+                     std::to_string(ctx.ctaid[2]) + "), warp " + std::to_string(cur_warp_) +
+                     warp_positions(ctx));
       // The fast-path kinds go straight to their handler: no trip through
       // step() and dispatch(), whose frames cost more than the arithmetic.
       // A form the fast path declines falls through to step() as before.
