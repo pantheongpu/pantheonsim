@@ -1169,22 +1169,21 @@ scripts/run-pantheon-workloads.sh.
    refuse a grid too large to be resident, because such a kernel does not run
    slowly, it hangs. See docs/cooperative.md.
 
-   **Textures and surfaces are done for the point-sampled case**, which is what
-   the overwhelming majority of CUDA code uses: `tex.1d`/`tex.2d`/`tex.3d`,
-   `suld`, `sust`, plus `cudaCreateTextureObject`, `cudaCreateSurfaceObject`,
-   `cudaMallocArray` and the array copies. Backing memory can be linear
-   (`tex1Dfetch`, which is how ML code uses textures -- as a cached load),
-   pitched 2D, or a `cudaArray`. All four addressing modes, the integer and
-   float channel kinds, `cudaReadModeNormalizedFloat`, and the
-   absent-channel rule (0 for x/y/z, 1 for w) are implemented.
-
-   Deliberately refused rather than approximated: `cudaFilterModeLinear`.
-   Interpolation between texels is a documented weighted average, but hardware
-   computes the weights in a fixed-point format with 8 fractional bits, so a
-   float implementation would differ from the device in the low bits -- which
-   is precisely what the differential testing here exists to catch. Also
-   refused: mipmaps, layered and cubemap textures, sRGB, anisotropy, and the
-   `.clamp`/`.zero` surface out-of-range policies. See nvidia/docs/textures.md.
+   **Textures and surfaces are done**: point and linear filtering, 1D/2D/3D,
+   layered and cubemap (and layered cubemap) textures, layered surfaces,
+   mipmaps with an explicit level of detail (`tex.level`, and plain fetches
+   of mipmapped textures), and gather (`tld4`), over linear memory, pitched
+   2D, arrays and mipmapped arrays, with every addressing mode and read mode.
+   Linear filtering used to be refused because the guide gives the formula
+   but not the arithmetic; the arithmetic was measured on an RTX 3060 until
+   every sample matched bit for bit (weights in 1/256ths split z, x, y with
+   measured rounding sides, one exact sum rounded ties-away, 1D as 2D at
+   y = 0, the LOD's truncations), and the e2e tests hash tens of thousands
+   of results against the hardware's. Refused by name: `tex.grad` (its LOD
+   comes from undocumented approximate units), linear filtering of signed
+   8-bit normalized texels, mipmapped layered/cubemap textures, `tld4` on
+   layered/cubemap textures, border colours, sRGB, anisotropy, resource views
+   and the `.clamp`/`.zero` surface policies. See nvidia/docs/textures.md.
 
    `wgmma`, TMA and distributed shared memory are done now (see "Hopper's
    warpgroup MMA", "TMA and clusters" and "Distributed shared memory"). What
