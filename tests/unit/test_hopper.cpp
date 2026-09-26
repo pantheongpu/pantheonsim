@@ -1590,6 +1590,44 @@ VTEST(registers_declared_in_a_block_hide_outer_ones) {
   for (int i = 1; i < 64; ++i) VCHECK_EQ(mem.load_scalar(out + i * 4, 4), uint64_t{208});
 }
 
+// Nested blocks, sibling blocks that reuse a name, and an outer register
+// that must come through both untouched.
+VTEST(register_scopes_nest_and_siblings_are_separate) {
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(16);
+  run(R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .b32 x;
+    .reg .b64 %rd<2>;
+    ld.param.u64 %rd1, [out];
+    mov.u32 x, 1;
+    {
+    .reg .b32 x;
+    mov.u32 x, 10;
+    {
+    .reg .b32 x;
+    mov.u32 x, 100;
+    st.global.u32 [%rd1+8], x;
+    }
+    st.global.u32 [%rd1+4], x;
+    }
+    {
+    .reg .b32 x;
+    mov.u32 x, 1000;
+    st.global.u32 [%rd1+12], x;
+    }
+    st.global.u32 [%rd1], x;
+    ret;
+}
+)", LaunchConfig{}, {arg_u64(out)}, mem);
+  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{1});
+  VCHECK_EQ(mem.load_scalar(out + 4, 4), uint64_t{10});
+  VCHECK_EQ(mem.load_scalar(out + 8, 4), uint64_t{100});
+  VCHECK_EQ(mem.load_scalar(out + 12, 4), uint64_t{1000});
+}
+
 // A lane can reach bar.sync from a higher pc: nvcc puts a rarely taken block
 // after the kernel's ret and branches back from it. The barrier waits for it.
 VTEST(bar_sync_waits_for_lanes_in_code_placed_after_ret) {
