@@ -104,6 +104,7 @@ struct RegisteredModule {
 struct KernelInfo {
   RegisteredModule* mod = nullptr;
   std::string entry_name;
+  bool nonportable_cluster = false;   // cudaFuncAttributeNonPortableClusterSizeAllowed
 };
 
 // A __device__ or __constant__ variable. The host handle nvcc passes to
@@ -1018,6 +1019,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
         return cudaErrorCooperativeLaunchTooLarge;
       }
     }
+    cfg.nonportable_cluster = ki.nonportable_cluster;
     dev.launch(*fn, cfg, kargs, dev.symbols(mid));
     if (profiling) {
       vgpu::profiling::Event ev;
@@ -2503,10 +2505,17 @@ VGPU_EXPORT cudaError_t cudaStreamAddCallback(cudaStream_t stream, cudaStreamCal
   return cudaSuccess;
 }
 
-VGPU_EXPORT cudaError_t cudaFuncSetAttribute(const void*, cudaFuncAttribute, int) {
-  // Opting into a larger shared-memory carveout is a hardware tuning knob; the
-  // interpreter honours whatever a launch asks for.
-  return cudaSuccess;
+VGPU_EXPORT cudaError_t cudaFuncSetAttribute(const void* func, cudaFuncAttribute attr, int value) {
+  // Most attributes are tuning knobs (a shared-memory carveout, say) that the
+  // interpreter has no use for. The one that changes what may launch is the
+  // non-portable cluster size, so that one is kept.
+  if (static_cast<int>(attr) != 14) return cudaSuccess;   // cudaFuncAttributeNonPortableClusterSizeAllowed
+  return guard("cudaFuncSetAttribute", [&](State& s) -> cudaError_t {
+    auto it = s.kernels.find(func);
+    if (it == s.kernels.end()) return cudaErrorInvalidDeviceFunction;
+    it->second.nonportable_cluster = value != 0;
+    return cudaSuccess;
+  });
 }
 
 VGPU_EXPORT cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMode* mode) {

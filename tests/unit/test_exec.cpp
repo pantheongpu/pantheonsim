@@ -353,6 +353,46 @@ LOOP:
   VCHECK_CONTAINS(err.what(), "spin");
 }
 
+// A hang names where every warp of the block is, not only the one that ran
+// out of steps: which warp should have released it, and what that one is
+// doing instead, is the rest of the diagnosis.
+VTEST(step_budget_error_lists_every_warp) {
+  const char* ptx = R"(
+.version 8.3
+.target sm_90
+.address_size 64
+.visible .entry stuck()
+{
+    .reg .b32 %r<4>;
+    .reg .pred %p<4>;
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 5;
+    setp.eq.u32 %p1, %r2, 0;
+    @%p1 bra OUT;
+    setp.eq.u32 %p2, %r2, 3;
+    @%p2 bra LOOP;
+    bar.sync 1, 96;
+OUT:
+    ret;
+LOOP:
+    bra LOOP;
+}
+)";
+  ptx::Module m = ptx::parse(ptx);
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/h100");
+  LaunchConfig cfg;
+  cfg.block = {128, 1, 1};
+  cfg.max_steps = 10000;
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, mem, prof));
+  VCHECK(err.code() == Err::ExecLimit);
+  VCHECK_CONTAINS(err.what(), "warps of this block");
+  VCHECK_CONTAINS(err.what(), "warp 0: exited");
+  VCHECK_CONTAINS(err.what(), "warps 1-2: at a barrier");
+  VCHECK_CONTAINS(err.what(), "warp 3: running");
+  VCHECK_CONTAINS(err.what(), "bra LOOP");
+}
+
 VTEST(launch_limits_enforced) {
   ptx::Module m = ptx::parse(read_file(VGPU_KERNEL_DIR "/vector_add.ptx"));
   MemoryManager mem(1 << 20);

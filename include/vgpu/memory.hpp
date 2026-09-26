@@ -53,6 +53,12 @@ inline constexpr uint64_t kDeviceVaBase = 0x2000'0000'0000ull;
 inline constexpr uint64_t kFuncVaBase = 0x6ffb'0000'0000ull;
 inline constexpr uint64_t kFuncVaStride = 8;
 inline constexpr uint64_t kFuncVaSize = 1ull << 20;
+// Kernels get addresses in a window of their own for the same reason: a
+// device-side launch (dynamic parallelism) names its child grid by the
+// kernel's address, which the runtime's kernel table turns back into the
+// kernel. Nothing is loaded from here either.
+inline constexpr uint64_t kKernelVaBase = 0x6ffc'0000'0000ull;
+inline constexpr uint64_t kKernelVaStride = 8;
 // Each device owns a disjoint 1 TiB window above that base. CUDA guarantees
 // unified virtual addressing -- a device pointer is unique process-wide and
 // identifies the device that owns it -- and without separate windows two

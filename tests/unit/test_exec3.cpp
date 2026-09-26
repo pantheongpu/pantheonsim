@@ -465,6 +465,172 @@ VTEST(f16x2_packed_arithmetic) {
   VCHECK_EQ(half(neg, 1), 0xC200ull);  // -3.0
 }
 
+// mma.sp (2:4 structured sparsity) in its f16 m16n8k32 and m16n8k16 forms
+// with both sparsity selectors, and bf16 m16n8k32, against a table recorded on
+// a real RTX 3060 (sm_86) running these instructions on the same inputs. The
+// inputs are small integers, so every product and sum is exact and the table
+// pins the operand layout and the metadata: which lane's bits and which
+// nibble place each pair of stored A values, which the ISA's figures give and
+// the hardware settles.
+VTEST(mma_sp_matches_hardware) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k(.param .u64 pa, .param .u64 pab, .param .u64 pb, .param .u64 pbb,
+                  .param .u64 pe, .param .u64 pd)
+{
+  .reg .b32 %r<32>;
+  .reg .f32 %f<24>;
+  .reg .b64 %rd<16>;
+  ld.param.u64 %rd1, [pa];
+  ld.param.u64 %rd2, [pab];
+  ld.param.u64 %rd3, [pb];
+  ld.param.u64 %rd4, [pbb];
+  ld.param.u64 %rd5, [pe];
+  ld.param.u64 %rd6, [pd];
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd7, %r1, 16;
+  add.u64 %rd8, %rd1, %rd7;
+  ld.global.v4.u32 {%r2, %r3, %r4, %r5}, [%rd8];
+  add.u64 %rd8, %rd2, %rd7;
+  ld.global.v4.u32 {%r6, %r7, %r8, %r9}, [%rd8];
+  add.u64 %rd8, %rd3, %rd7;
+  ld.global.v4.u32 {%r10, %r11, %r12, %r13}, [%rd8];
+  add.u64 %rd8, %rd4, %rd7;
+  ld.global.v4.u32 {%r14, %r15, %r16, %r17}, [%rd8];
+  mul.wide.u32 %rd9, %r1, 4;
+  add.u64 %rd10, %rd5, %rd9;
+  ld.global.u32 %r18, [%rd10];
+  mov.f32 %f0, 0f00000000;
+  mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32 {%f1, %f2, %f3, %f4}, {%r2, %r3, %r4, %r5}, {%r10, %r11, %r12, %r13}, {%f0, %f0, %f0, %f0}, %r18, 0x0;
+  mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32 {%f5, %f6, %f7, %f8}, {%r2, %r3, %r4, %r5}, {%r10, %r11, %r12, %r13}, {%f0, %f0, %f0, %f0}, %r18, 0x1;
+  mma.sp::ordered_metadata.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%f9, %f10, %f11, %f12}, {%r2, %r3}, {%r10, %r11}, {%f0, %f0, %f0, %f0}, %r18, 0x0;
+  mma.sp::ordered_metadata.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%f13, %f14, %f15, %f16}, {%r2, %r3}, {%r10, %r11}, {%f0, %f0, %f0, %f0}, %r18, 0x1;
+  mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.bf16.bf16.f32 {%f17, %f18, %f19, %f20}, {%r6, %r7, %r8, %r9}, {%r14, %r15, %r16, %r17}, {%f0, %f0, %f0, %f0}, %r18, 0x0;
+  mul.wide.u32 %rd11, %r1, 80;
+  add.u64 %rd12, %rd6, %rd11;
+  st.global.v4.f32 [%rd12], {%f1, %f2, %f3, %f4};
+  st.global.v4.f32 [%rd12+16], {%f5, %f6, %f7, %f8};
+  st.global.v4.f32 [%rd12+32], {%f9, %f10, %f11, %f12};
+  st.global.v4.f32 [%rd12+48], {%f13, %f14, %f15, %f16};
+  st.global.v4.f32 [%rd12+64], {%f17, %f18, %f19, %f20};
+  ret;
+}
+)";
+  // Small integers as f16 and bf16 bits, through their exact f32 form.
+  auto f16_of = [](int v) -> uint32_t {
+    if (v == 0) return 0;
+    const float f = static_cast<float>(v);
+    uint32_t b;
+    std::memcpy(&b, &f, 4);
+    return ((b >> 16) & 0x8000u) | ((((b >> 23) & 0xFF) - 127 + 15) << 10) | ((b >> 13) & 0x3FF);
+  };
+  auto bf16_of = [](int v) -> uint32_t {
+    const float f = static_cast<float>(v);
+    uint32_t b;
+    std::memcpy(&b, &f, 4);
+    return b >> 16;
+  };
+  std::vector<uint32_t> a(128), ab(128), b(128), bb(128), e(32);
+  for (int i = 0; i < 128; ++i) {
+    const int x0 = (i * 7 + 3) % 9 - 4, x1 = (i * 5 + 1) % 7 - 3;
+    const int y0 = (i * 3 + 2) % 5 - 2, y1 = (i * 11 + 4) % 7 - 3;
+    a[i] = f16_of(x0) | f16_of(x1) << 16;
+    ab[i] = bf16_of(x0) | bf16_of(x1) << 16;
+    b[i] = f16_of(y0) | f16_of(y1) << 16;
+    bb[i] = bf16_of(y0) | bf16_of(y1) << 16;
+  }
+  // Each nibble names the two positions of a 4-wide chunk its pair came from.
+  const uint8_t pairs[6] = {0x4, 0x8, 0xC, 0x9, 0xD, 0xE};
+  for (int l = 0; l < 32; ++l)
+    for (int n = 0; n < 8; ++n) e[l] |= uint32_t{pairs[(l * 5 + n * 3) % 6]} << (4 * n);
+  const int want[32][20] = {
+    {-18, 20, 9, -13, -4, 39, 30, -30, -11, 9, 9, 10, -10, 0, 5, -8, -18, 20, 9, -13},
+    {-36, 13, 10, 2, -19, 3, -17, -4, -20, 4, 11, -9, 1, 2, 5, 8, -36, 13, 10, 2},
+    {11, -6, -5, 18, -18, 3, 11, 9, 14, 4, -18, -2, 3, 4, -10, -7, 11, -6, -5, 18},
+    {25, -24, -18, 12, 11, -19, -2, 25, 3, -12, 6, 7, 0, -13, 1, 14, 25, -24, -18, 12},
+    {37, -23, -21, 5, 10, -9, 0, 21, 24, -20, -20, -1, 2, -17, -13, 9, 37, -23, -21, 5},
+    {23, -27, -16, -19, 38, -13, -21, -15, 13, -9, -9, -17, 15, 1, -22, -5, 23, -27, -16, -19},
+    {-9, 22, 15, 3, -2, 9, 1, -8, -4, 14, 20, 7, 12, 18, 6, 8, -9, 22, 15, 3},
+    {-24, 36, 29, -13, -38, 9, 27, -1, -23, 24, 19, -10, -29, -4, 16, -8, -24, 36, 29, -13},
+    {0, 13, 16, -29, -17, 20, 19, -16, -6, 4, 9, -21, -9, -10, 1, -16, 0, 13, 16, -29},
+    {3, -7, -13, 13, 20, 37, -14, 4, 8, 16, -12, 15, -3, 5, -11, 20, 3, -7, -13, 13},
+    {-15, 16, -4, 4, -13, -31, 4, 12, -9, 0, -1, 3, 14, 8, 3, 6, -15, 16, -4, 4},
+    {-13, -2, 1, 24, -15, -22, 5, 14, -11, -7, 1, 10, -14, 0, -4, -6, -13, -2, 1, 24},
+    {-20, -17, -5, 11, -28, -2, -23, 17, -16, -18, -13, 10, 2, 1, -7, 0, -20, -17, -5, 11},
+    {14, 11, -29, -2, 13, 5, 7, 19, 8, 21, -23, 4, 5, -21, -2, 1, 14, 11, -29, -2},
+    {4, 2, 14, 10, 20, -8, -5, 1, 9, -3, 17, 5, 19, -7, 4, 7, 4, 2, 14, 10},
+    {-2, -20, 12, -14, -10, -9, -1, -39, -12, -14, 0, -12, -8, 17, 0, -16, -2, -20, 12, -14},
+    {-17, 14, 28, -16, 9, -13, 23, 0, 9, 1, 13, -11, 12, 7, 18, -7, -17, 14, 28, -16},
+    {-2, 16, 8, -29, 10, 2, 36, -19, -6, 7, -3, -10, -3, 7, 12, -8, -2, 16, 8, -29},
+    {14, -8, 12, 9, -5, 18, -17, -20, -11, -3, 15, 3, -17, -2, -3, -8, 14, -8, 12, 9},
+    {-5, -21, -14, 24, -18, 12, -15, 28, 10, 3, -14, 8, 7, -3, -5, 14, -5, -21, -14, 24},
+    {-20, 11, -1, 36, -21, 5, -8, 18, -7, 11, -6, 7, 9, 20, -9, -7, -20, 11, -1, 36},
+    {-6, -1, -7, 0, -16, -19, 14, 17, -13, -14, 9, 13, -15, -6, -2, 2, -6, -1, -7, 0},
+    {17, 9, -29, 14, 15, 3, -37, -8, 18, 14, -9, 3, -10, 6, 14, 11, 17, 9, -29, 14},
+    {5, -33, 2, -13, 29, -13, 4, -7, 4, -20, -12, -10, 10, -4, -15, -3, 5, -33, 2, -13},
+    {7, 7, -7, -26, 16, -29, -11, 12, 12, 7, 0, -26, 2, -5, 5, 19, 7, 7, -7, -26},
+    {14, 5, 21, -4, -13, 13, 12, -6, 9, -5, 14, 3, 7, 4, -7, -13, 14, 5, 21, -4},
+    {-20, -10, 7, 18, -4, 4, 6, -37, -20, -5, 12, 16, -6, -9, 2, -4, -20, -10, 7, 18},
+    {-3, 11, -15, -10, 1, 24, 14, 7, 11, 6, -24, -5, -2, 17, 10, 5, -3, 11, -15, -10},
+    {-19, 16, -8, -6, -5, 11, -5, -4, -18, 9, 7, 1, -10, -3, 10, 8, -19, 16, -8, -6},
+    {-10, -1, 1, 32, -29, -2, -10, 5, 2, 0, -4, 6, -12, -15, -6, 7, -10, -1, 1, 32},
+    {-2, -7, 8, -3, 14, 10, 16, 7, 3, -4, -10, -5, 18, 5, -14, -1, -2, -7, 8, -3},
+    {21, -19, -22, -15, 12, -14, -13, -5, 9, -12, 10, 5, 5, 3, 4, -3, 21, -19, -22, -15},
+  };
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  auto upload = [&](const std::vector<uint32_t>& v) {
+    const uint64_t at = mem.alloc(v.size() * 4);
+    mem.write(at, v.data(), v.size() * 4);
+    return at;
+  };
+  const uint64_t pa = upload(a), pab = upload(ab), pb = upload(b), pbb = upload(bb), pe = upload(e);
+  const uint64_t pd = mem.alloc(32 * 20 * 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  auto arg = [](uint64_t v) {
+    std::vector<uint8_t> x(8);
+    std::memcpy(x.data(), &v, 8);
+    return x;
+  };
+  exec::launch(m.entries[0], cfg, {arg(pa), arg(pab), arg(pb), arg(pbb), arg(pe), arg(pd)}, mem, prof);
+  std::vector<float> d(32 * 20);
+  mem.read(pd, d.data(), d.size() * 4);
+  for (int l = 0; l < 32; ++l)
+    for (int j = 0; j < 20; ++j) VCHECK_EQ(d[l * 20 + j], static_cast<float>(want[l][j]));
+}
+
+// The mma.sp and cvt.pack forms that are not implemented are refused by name
+// at parse time, never run as something else.
+VTEST(sparse_mma_and_cvt_pack_refuse_what_they_do_not_implement) {
+  auto parse_one = [](const std::string& body) {
+    const std::string ptx = std::string(R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k()
+{
+  .reg .b32 %r<20>;
+  .reg .f32 %f<8>;
+)") + body + "\n  ret;\n}\n";
+    return VCAPTURE(Error, ptx::parse(ptx));
+  };
+  VCHECK_CONTAINS(parse_one("mma.sp::ordered_metadata.sync.aligned.m16n8k64.row.col.s32.s8.s8.s32 "
+                            "{%r0,%r1,%r2,%r3}, {%r4,%r5,%r6,%r7}, {%r8,%r9,%r10,%r11}, "
+                            "{%r12,%r13,%r14,%r15}, %r16, 0x0;").message(),
+                  "mma.sp");
+  VCHECK_CONTAINS(parse_one("mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32 "
+                            "{%f0,%f1,%f2,%f3}, {%r4,%r5,%r6,%r7}, {%r8,%r9,%r10,%r11}, "
+                            "{%f4,%f5,%f6,%f7}, %r16, 0x2;").message(),
+                  "selector");
+  VCHECK_CONTAINS(parse_one("cvt.pack.sat.s8.s32 %r0, %r1, %r2;").message(), "cvt.pack");
+  VCHECK_CONTAINS(parse_one("cvt.pack.sat.s16.s32.b32 %r0, %r1, %r2, %r3;").message(), "cvt.pack");
+  VCHECK_CONTAINS(parse_one("cvt.pack.sat.u32.s32.b32 %r0, %r1, %r2, %r3;").message(), "cvt.pack");
+}
+
 VTEST(wmma_m16n16k16_matmul) {
   // Fill A with 2.0 and B with 3.0 (every element), C with 0. Then every
   // element of D must be sum over k=0..15 of 2*3 = 96. This is the shape
@@ -701,6 +867,379 @@ VTEST(mov_pred_from_immediate_and_register) {
   uint32_t got = 0;
   mem.read(out, &got, 4);
   VCHECK_EQ(got, 7u);
+}
+
+// dp2a: a's two 16-bit halves against the low (.lo) or high (.hi) two bytes
+// of b, each sign- or zero-extended by its own type, added to c. nvcc emits
+// it for mixed-width integer arithmetic too, not only for quantized code.
+VTEST(dp2a_halves_against_bytes) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry dp(.param .u64 p, .param .u32 av, .param .u32 bv, .param .u32 cv)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  ld.param.u32 %r1, [av];
+  ld.param.u32 %r2, [bv];
+  ld.param.u32 %r3, [cv];
+  cvta.to.global.u64 %rd2, %rd1;
+  dp2a.lo.u32.u32 %r4, %r1, %r2, %r3;
+  st.global.u32 [%rd2], %r4;
+  dp2a.hi.s32.s32 %r5, %r1, %r2, %r3;
+  st.global.u32 [%rd2+4], %r5;
+  dp2a.lo.s32.u32 %r6, %r1, %r2, %r3;
+  st.global.u32 [%rd2+8], %r6;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(12);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  auto run = [&](uint32_t a, uint32_t b, uint32_t c) {
+    std::vector<uint8_t> pa(8), aa(4), ba(4), ca(4);
+    std::memcpy(pa.data(), &out, 8);
+    std::memcpy(aa.data(), &a, 4);
+    std::memcpy(ba.data(), &b, 4);
+    std::memcpy(ca.data(), &c, 4);
+    exec::launch(m.entries[0], cfg, {pa, aa, ba, ca}, mem, prof);
+    int32_t got[3] = {0, 0, 0};
+    mem.read(out, got, 12);
+    return std::array<int32_t, 3>{got[0], got[1], got[2]};
+  };
+  // a = halves 0xFFFE (low), 0x0003 (high); b = bytes 0x02, 0x05, 0xFF, 0x80.
+  // lo, unsigned: 65534*2 + 3*5 = 131083, plus c = 7.
+  // hi, signed:   -2*(-1) + 3*(-128) = -382, plus 7.
+  // lo, a signed, b unsigned: -2*2 + 3*5 = 11, plus 7.
+  const auto r = run(0x0003FFFEu, 0x80FF0502u, 7);
+  VCHECK_EQ(r[0], 131090);
+  VCHECK_EQ(r[1], -375);
+  VCHECK_EQ(r[2], 18);
+}
+
+// cvt's modifiers and edge cases, against a table recorded on a real RTX 3060
+// (sm_86) running this same instruction sequence: fp16/bf16 results that are
+// subnormal, tied, overflowing or NaN; .rz; .sat on float destinations (clamp
+// to [0, 1], NaN and -0 to +0) and on int -> int (clamp to the destination
+// range, by the source's signedness); .ftz; the canonical NaNs (0x7FFF for
+// 16-bit results, 0x7FFFFFFF out of f32 -> f32); and a signed 8-bit result
+// sign-extended into its 32-bit register. CUTLASS's silu epilogue lost
+// silu(-20) to the old flush of tiny f16 results, and its expf leans on
+// cvt.sat.f32.f32, which was passed through unclamped.
+VTEST(cvt_modifiers_match_hardware) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry cv(.param .u64 p, .param .u32 av)
+{
+  .reg .b16 %rs<5>;
+  .reg .b32 %r<24>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  ld.param.u32 %r1, [av];
+  cvta.to.global.u64 %rd2, %rd1;
+  cvt.rn.f16.f32 %rs1, %r1;
+  cvt.u32.u16 %r2, %rs1;
+  st.global.u32 [%rd2], %r2;
+  cvt.rn.bf16.f32 %rs2, %r1;
+  cvt.u32.u16 %r3, %rs2;
+  st.global.u32 [%rd2+4], %r3;
+  cvt.rz.f16.f32 %rs3, %r1;
+  cvt.u32.u16 %r4, %rs3;
+  st.global.u32 [%rd2+8], %r4;
+  cvt.rn.sat.f16.f32 %rs4, %r1;
+  cvt.u32.u16 %r5, %rs4;
+  st.global.u32 [%rd2+12], %r5;
+  cvt.ftz.f32.f32 %r6, %r1;
+  st.global.u32 [%rd2+16], %r6;
+  cvt.sat.f32.f32 %r7, %r1;
+  st.global.u32 [%rd2+20], %r7;
+  cvt.rzi.ftz.sat.f32.f32 %r8, %r1;
+  st.global.u32 [%rd2+24], %r8;
+  cvt.sat.s8.s32 %r9, %r1;
+  st.global.u32 [%rd2+28], %r9;
+  cvt.sat.u8.s32 %r10, %r1;
+  st.global.u32 [%rd2+32], %r10;
+  cvt.sat.s16.u32 %r11, %r1;
+  st.global.u32 [%rd2+36], %r11;
+  cvt.sat.u32.s32 %r12, %r1;
+  st.global.u32 [%rd2+40], %r12;
+  cvt.sat.s32.u32 %r13, %r1;
+  st.global.u32 [%rd2+44], %r13;
+  cvt.s8.s32 %r14, %r1;
+  st.global.u32 [%rd2+48], %r14;
+  ret;
+}
+)";
+  struct Row {
+    uint32_t in;
+    std::array<uint32_t, 13> want;
+  };
+  const Row rows[] = {
+    {0x80000000u, {0x00008000u, 0x00008000u, 0x00008000u, 0x00000000u, 0x80000000u, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u}},
+    {0x3f800001u, {0x00003c00u, 0x00003f80u, 0x00003c00u, 0x00003c00u, 0x3f800001u, 0x3f800000u, 0x3f800000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x3f800001u, 0x3f800001u, 0x00000001u}},
+    {0xbf800000u, {0x0000bc00u, 0x0000bf80u, 0x0000bc00u, 0x00000000u, 0xbf800000u, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u}},
+    {0x7f800000u, {0x00007c00u, 0x00007f80u, 0x00007c00u, 0x00003c00u, 0x7f800000u, 0x3f800000u, 0x3f800000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x7f800000u, 0x7f800000u, 0x00000000u}},
+    {0xffc00001u, {0x00007fffu, 0x00007fffu, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000001u}},
+    {0x33000001u, {0x00000001u, 0x00003300u, 0x00000000u, 0x00000001u, 0x33000001u, 0x33000001u, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x33000001u, 0x33000001u, 0x00000001u}},
+    {0xb3206867u, {0x00008001u, 0x0000b320u, 0x00008000u, 0x00000000u, 0xb3206867u, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000067u}},
+    {0x33000000u, {0x00000000u, 0x00003300u, 0x00000000u, 0x00000000u, 0x33000000u, 0x33000000u, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x33000000u, 0x33000000u, 0x00000000u}},
+    {0x337fffffu, {0x00000001u, 0x00003380u, 0x00000000u, 0x00000001u, 0x337fffffu, 0x337fffffu, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x337fffffu, 0x337fffffu, 0xffffffffu}},
+    {0x3effffffu, {0x00003800u, 0x00003f00u, 0x000037ffu, 0x00003800u, 0x3effffffu, 0x3effffffu, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x3effffffu, 0x3effffffu, 0xffffffffu}},
+    {0x477fe000u, {0x00007bffu, 0x00004780u, 0x00007bffu, 0x00003c00u, 0x477fe000u, 0x3f800000u, 0x3f800000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x477fe000u, 0x477fe000u, 0x00000000u}},
+    {0x477ff000u, {0x00007c00u, 0x00004780u, 0x00007bffu, 0x00003c00u, 0x477ff000u, 0x3f800000u, 0x3f800000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x477ff000u, 0x477ff000u, 0x00000000u}},
+    {0xc7800000u, {0x0000fc00u, 0x0000c780u, 0x0000fbffu, 0x00000000u, 0xc7800000u, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u}},
+    {0xc2200000u, {0x0000d100u, 0x0000c220u, 0x0000d100u, 0x00000000u, 0xc2200000u, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u}},
+    {0x00000001u, {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000001u, 0x00000000u, 0x00000001u, 0x00000001u, 0x00000001u, 0x00000001u, 0x00000001u, 0x00000001u}},
+    {0x807fffffu, {0x00008000u, 0x00008080u, 0x00008000u, 0x00000000u, 0x80000000u, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0xffffffffu}},
+    {0x3f000000u, {0x00003800u, 0x00003f00u, 0x00003800u, 0x00003800u, 0x3f000000u, 0x3f000000u, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x3f000000u, 0x3f000000u, 0x00000000u}},
+    {0x00000080u, {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000080u, 0x00000000u, 0x0000007fu, 0x00000080u, 0x00000080u, 0x00000080u, 0x00000080u, 0xffffff80u}},
+    {0x0000007fu, {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x0000007fu, 0x00000000u, 0x0000007fu, 0x0000007fu, 0x0000007fu, 0x0000007fu, 0x0000007fu, 0x0000007fu}},
+    {0xffffff80u, {0x00007fffu, 0x00007fffu, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0xffffff80u}},
+    {0xffffff7fu, {0x00007fffu, 0x00007fffu, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u, 0x00000000u, 0xffffff80u, 0x00000000u, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x0000007fu}},
+    {0x00008000u, {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00008000u, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x00008000u, 0x00008000u, 0x00000000u}},
+    {0x7fffffffu, {0x00007fffu, 0x00007fffu, 0x00007fffu, 0x00000000u, 0x7fffffffu, 0x00000000u, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x7fffffffu, 0x7fffffffu, 0xffffffffu}},
+    {0x38800000u, {0x00000400u, 0x00003880u, 0x00000400u, 0x00000400u, 0x38800000u, 0x38800000u, 0x00000000u, 0x0000007fu, 0x000000ffu, 0x00007fffu, 0x38800000u, 0x38800000u, 0x00000000u}},
+  };
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(13 * 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  for (const Row& row : rows) {
+    std::vector<uint8_t> pa(8), aa(4);
+    std::memcpy(pa.data(), &out, 8);
+    std::memcpy(aa.data(), &row.in, 4);
+    exec::launch(m.entries[0], cfg, {pa, aa}, mem, prof);
+    std::array<uint32_t, 13> got{};
+    mem.read(out, got.data(), 13 * 4);
+    for (int j = 0; j < 13; ++j) VCHECK_EQ(got[j], row.want[j]);
+  }
+}
+
+// cvt.pack.sat in all eight forms, against a table recorded on a real RTX 3060
+// (sm_86) running these instructions: a and b saturated to the narrow type
+// and packed with b in the low field, and for 8, 4 and 2 bits the rest of d
+// taken from the low bits of c. CUTLASS's SM90 s8 GEMM epilogue packs its
+// output this way.
+VTEST(cvt_pack_matches_hardware) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k(.param .u64 p, .param .u32 av, .param .u32 bv, .param .u32 cv)
+{
+  .reg .b32 %r<16>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  ld.param.u32 %r1, [av];
+  ld.param.u32 %r2, [bv];
+  ld.param.u32 %r3, [cv];
+  cvta.to.global.u64 %rd2, %rd1;
+  cvt.pack.sat.s16.s32 %r4, %r1, %r2;
+  cvt.pack.sat.u16.s32 %r5, %r1, %r2;
+  cvt.pack.sat.s8.s32.b32 %r6, %r1, %r2, %r3;
+  cvt.pack.sat.u8.s32.b32 %r7, %r1, %r2, %r3;
+  cvt.pack.sat.s4.s32.b32 %r8, %r1, %r2, %r3;
+  cvt.pack.sat.u4.s32.b32 %r9, %r1, %r2, %r3;
+  cvt.pack.sat.s2.s32.b32 %r10, %r1, %r2, %r3;
+  cvt.pack.sat.u2.s32.b32 %r11, %r1, %r2, %r3;
+  st.global.v4.u32 [%rd2], {%r4, %r5, %r6, %r7};
+  st.global.v4.u32 [%rd2+16], {%r8, %r9, %r10, %r11};
+  ret;
+}
+)";
+  struct Row {
+    uint32_t a, b, c;
+    std::array<uint32_t, 8> want;
+  };
+  const Row rows[] = {
+    {0x00000000, 0x00000000, 0x3e3a2bd2, {0x00000000, 0x00000000, 0x2bd20000, 0x2bd20000, 0x3a2bd200, 0x3a2bd200, 0xe3a2bd20, 0xe3a2bd20}},
+    {0x00000100, 0x00000001, 0x158ad19b, {0x01000001, 0x01000001, 0xd19b7f01, 0xd19bff01, 0x8ad19b71, 0x8ad19bf1, 0x58ad19b5, 0x58ad19bd}},
+    {0x00000007, 0x00000002, 0x1376b7f8, {0x00070002, 0x00070002, 0xb7f80702, 0xb7f80702, 0x76b7f872, 0x76b7f872, 0x376b7f85, 0x376b7f8e}},
+    {0x7fffffff, 0xfffffffe, 0xa1168ff9, {0x7ffffffe, 0xffff0000, 0x8ff97ffe, 0x8ff9ff00, 0x168ff97e, 0x168ff9f0, 0x1168ff96, 0x1168ff9c}},
+    {0xffffff7f, 0xfffffffd, 0x31ae1dee, {0xff7ffffd, 0x00000000, 0x1dee80fd, 0x1dee0000, 0xae1dee8d, 0xae1dee00, 0x1ae1deea, 0x1ae1dee0}},
+    {0x00000003, 0xfffffff8, 0xc2fed267, {0x0003fff8, 0x00030000, 0xd26703f8, 0xd2670300, 0xfed26738, 0xfed26730, 0x2fed2676, 0x2fed267c}},
+    {0x0000ffff, 0x00000008, 0x42a13734, {0x7fff0008, 0xffff0008, 0x37347f08, 0x3734ff08, 0xa1373477, 0xa13734f8, 0x2a137345, 0x2a13734f}},
+    {0x00000080, 0x0000007f, 0x754b4065, {0x0080007f, 0x0080007f, 0x40657f7f, 0x4065807f, 0x4b406577, 0x4b4065ff, 0x54b40655, 0x54b4065f}},
+    {0x00000002, 0xffffff80, 0x4380d14a, {0x0002ff80, 0x00020000, 0xd14a0280, 0xd14a0200, 0x80d14a28, 0x80d14a20, 0x380d14a6, 0x380d14a8}},
+    {0xffff8000, 0xffffff7f, 0xf62c0573, {0x8000ff7f, 0x00000000, 0x05738080, 0x05730000, 0x2c057388, 0x2c057300, 0x62c0573a, 0x62c05730}},
+    {0xfffffff7, 0x00000100, 0x36180db0, {0xfff70100, 0x00000100, 0x0db0f77f, 0x0db000ff, 0x180db087, 0x180db00f, 0x6180db09, 0x6180db03}},
+    {0x00000001, 0x00008000, 0x7767b111, {0x00017fff, 0x00018000, 0xb111017f, 0xb11101ff, 0x67b11117, 0x67b1111f, 0x767b1115, 0x767b1117}},
+    {0x00007fff, 0xffff8000, 0xd053c1e6, {0x7fff8000, 0x7fff0000, 0xc1e67f80, 0xc1e6ff00, 0x53c1e678, 0x53c1e6f0, 0x053c1e66, 0x053c1e6c}},
+    {0xfffffff8, 0x0000ffff, 0x9dca16bf, {0xfff87fff, 0x0000ffff, 0x16bff87f, 0x16bf00ff, 0xca16bf87, 0xca16bf0f, 0xdca16bf9, 0xdca16bf3}},
+    {0x80000000, 0x00010000, 0x11bed76c, {0x80007fff, 0x0000ffff, 0xd76c807f, 0xd76c00ff, 0xbed76c87, 0xbed76c0f, 0x1bed76c9, 0x1bed76c3}},
+    {0x000000ff, 0x80000000, 0xed0c2dfd, {0x00ff8000, 0x00ff0000, 0x2dfd7f80, 0x2dfdff00, 0x0c2dfd78, 0x0c2dfdf0, 0xd0c2dfd6, 0xd0c2dfdc}},
+    {0x0000006a, 0xd9fca11d, 0xb249afd8, {0x006a8000, 0x006a0000, 0xafd86a80, 0xafd86a00, 0x49afd878, 0x49afd8f0, 0x249afd86, 0x249afd8c}},
+    {0xd254f157, 0xffffffce, 0x4426bfa1, {0x8000ffce, 0x00000000, 0xbfa180ce, 0xbfa10000, 0x26bfa188, 0x26bfa100, 0x426bfa1a, 0x426bfa10}},
+    {0x000000b0, 0x2e879b53, 0xcc4fe896, {0x00b07fff, 0x00b0ffff, 0xe8967f7f, 0xe896b0ff, 0x4fe89677, 0x4fe896ff, 0xc4fe8965, 0xc4fe896f}},
+    {0x29cf86fd, 0x3a769c38, 0xb82b3237, {0x7fff7fff, 0xffffffff, 0x32377f7f, 0x3237ffff, 0x2b323777, 0x2b3237ff, 0x82b32375, 0x82b3237f}},
+    {0x00000090, 0xffffffb7, 0x17a18476, {0x0090ffb7, 0x00900000, 0x84767fb7, 0x84769000, 0xa1847678, 0xa18476f0, 0x7a184766, 0x7a18476c}},
+    {0xb9efb15d, 0x805b0318, 0x51a1ab97, {0x80008000, 0x00000000, 0xab978080, 0xab970000, 0xa1ab9788, 0xa1ab9700, 0x1a1ab97a, 0x1a1ab970}},
+  };
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(32);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  auto arg = [](uint32_t v) {
+    std::vector<uint8_t> x(4);
+    std::memcpy(x.data(), &v, 4);
+    return x;
+  };
+  std::vector<uint8_t> pa(8);
+  std::memcpy(pa.data(), &out, 8);
+  for (const Row& row : rows) {
+    exec::launch(m.entries[0], cfg, {pa, arg(row.a), arg(row.b), arg(row.c)}, mem, prof);
+    std::array<uint32_t, 8> got{};
+    mem.read(out, got.data(), 32);
+    for (int j = 0; j < 8; ++j) VCHECK_EQ(got[j], row.want[j]);
+  }
+}
+
+// Conversions under all four rounding modes -- f32 and f64 to f16, f64 to f32,
+// and 32- and 64-bit integers to f32 and f16 -- against a table recorded on a
+// real RTX 3060 (sm_86) running these instructions on 4096 inputs (a sample
+// is kept here): inputs near the f16 and f32 edges, integers of every width
+// and both signs, and NaNs, whose f64 -> f16 result keeps the sign and the top
+// of the payload while an f32 NaN becomes 0x7FFF.
+VTEST(cvt_rounding_modes_match_hardware) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k(.param .u64 p, .param .u64 v)
+{
+  .reg .b16 %rs<2>;
+  .reg .b32 %r<4>;
+  .reg .f32 %f<2>;
+  .reg .f64 %fd<2>;
+  .reg .b64 %rd<4>;
+  ld.param.u64 %rd1, [p];
+  ld.param.u64 %rd3, [v];
+  cvta.to.global.u64 %rd2, %rd1;
+  cvt.u32.u64 %r1, %rd3;
+  mov.b64 %fd1, %rd3;
+  cvt.rn.f16.f32 %rs1, %r1;
+  cvt.u32.u16 %r3, %rs1;
+  st.global.u32 [%rd2+0], %r3;
+  cvt.rz.f16.f32 %rs1, %r1;
+  cvt.u32.u16 %r3, %rs1;
+  st.global.u32 [%rd2+4], %r3;
+  cvt.rm.f16.f32 %rs1, %r1;
+  cvt.u32.u16 %r3, %rs1;
+  st.global.u32 [%rd2+8], %r3;
+  cvt.rp.f16.f32 %rs1, %r1;
+  cvt.u32.u16 %r3, %rs1;
+  st.global.u32 [%rd2+12], %r3;
+  cvt.rn.f16.f64 %rs1, %fd1;
+  cvt.u32.u16 %r3, %rs1;
+  st.global.u32 [%rd2+16], %r3;
+  cvt.rz.f16.f64 %rs1, %fd1;
+  cvt.u32.u16 %r3, %rs1;
+  st.global.u32 [%rd2+20], %r3;
+  cvt.rm.f16.f64 %rs1, %fd1;
+  cvt.u32.u16 %r3, %rs1;
+  st.global.u32 [%rd2+24], %r3;
+  cvt.rp.f16.f64 %rs1, %fd1;
+  cvt.u32.u16 %r3, %rs1;
+  st.global.u32 [%rd2+28], %r3;
+  cvt.rn.f32.f64 %f1, %fd1;
+  st.global.f32 [%rd2+32], %f1;
+  cvt.rz.f32.f64 %f1, %fd1;
+  st.global.f32 [%rd2+36], %f1;
+  cvt.rm.f32.f64 %f1, %fd1;
+  st.global.f32 [%rd2+40], %f1;
+  cvt.rp.f32.f64 %f1, %fd1;
+  st.global.f32 [%rd2+44], %f1;
+  cvt.rn.f32.s32 %f1, %r1;
+  st.global.f32 [%rd2+48], %f1;
+  cvt.rz.f32.s32 %f1, %r1;
+  st.global.f32 [%rd2+52], %f1;
+  cvt.rm.f32.s32 %f1, %r1;
+  st.global.f32 [%rd2+56], %f1;
+  cvt.rp.f32.s32 %f1, %r1;
+  st.global.f32 [%rd2+60], %f1;
+  cvt.rn.f32.u64 %f1, %rd3;
+  st.global.f32 [%rd2+64], %f1;
+  cvt.rz.f32.u64 %f1, %rd3;
+  st.global.f32 [%rd2+68], %f1;
+  cvt.rm.f32.u64 %f1, %rd3;
+  st.global.f32 [%rd2+72], %f1;
+  cvt.rp.f32.u64 %f1, %rd3;
+  st.global.f32 [%rd2+76], %f1;
+  cvt.rn.f32.s64 %f1, %rd3;
+  st.global.f32 [%rd2+80], %f1;
+  cvt.rz.f32.s64 %f1, %rd3;
+  st.global.f32 [%rd2+84], %f1;
+  cvt.rm.f32.s64 %f1, %rd3;
+  st.global.f32 [%rd2+88], %f1;
+  cvt.rp.f32.s64 %f1, %rd3;
+  st.global.f32 [%rd2+92], %f1;
+  cvt.rn.f16.s64 %rs1, %rd3;
+  cvt.u32.u16 %r3, %rs1;
+  st.global.u32 [%rd2+96], %r3;
+  cvt.rz.f16.s64 %rs1, %rd3;
+  cvt.u32.u16 %r3, %rs1;
+  st.global.u32 [%rd2+100], %r3;
+  cvt.rm.f16.s64 %rs1, %rd3;
+  cvt.u32.u16 %r3, %rs1;
+  st.global.u32 [%rd2+104], %r3;
+  cvt.rp.f16.s64 %rs1, %rd3;
+  cvt.u32.u16 %r3, %rs1;
+  st.global.u32 [%rd2+108], %r3;
+  ret;
+}
+)";
+  struct Row {
+    uint64_t in;
+    std::array<uint32_t, 28> want;
+  };
+  const Row rows[] = {
+    {0x79690975fbde15b0ull, {0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff, 0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00, 0x7f800000, 0x7f7fffff, 0x7f7fffff, 0x7f800000, 0xcc843d4a, 0xcc843d4a, 0xcc843d4a, 0xcc843d4a, 0x5ef2d213, 0x5ef2d212, 0x5ef2d212, 0x5ef2d213, 0x5ef2d213, 0x5ef2d212, 0x5ef2d212, 0x5ef2d213, 0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00}},
+    {0x61b97bcd4b21c371ull, {0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00, 0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00, 0x7f800000, 0x7f7fffff, 0x7f7fffff, 0x7f800000, 0x4e964387, 0x4e964386, 0x4e964386, 0x4e964387, 0x5ec372f8, 0x5ec372f7, 0x5ec372f7, 0x5ec372f8, 0x5ec372f8, 0x5ec372f7, 0x5ec372f7, 0x5ec372f8, 0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00}},
+    {0xa3a03fe4de4f1c43ull, {0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff, 0x00008000, 0x00008000, 0x00008001, 0x00008000, 0x80000000, 0x80000000, 0x80000001, 0x80000000, 0xce06c38f, 0xce06c38e, 0xce06c38f, 0xce06c38e, 0x5f23a040, 0x5f23a03f, 0x5f23a03f, 0x5f23a040, 0xdeb8bf80, 0xdeb8bf80, 0xdeb8bf81, 0xdeb8bf80, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff}},
+    {0x2e6f66b049cdc80bull, {0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x4e939b90, 0x4e939b90, 0x4e939b90, 0x4e939b91, 0x5e39bd9b, 0x5e39bd9a, 0x5e39bd9a, 0x5e39bd9b, 0x5e39bd9b, 0x5e39bd9a, 0x5e39bd9a, 0x5e39bd9b, 0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00}},
+    {0x3f337357ae2cc59bull, {0x00008000, 0x00008000, 0x00008001, 0x00008000, 0x00000cdd, 0x00000cdc, 0x00000cdc, 0x00000cdd, 0x399b9abd, 0x399b9abd, 0x399b9abd, 0x399b9abe, 0xcea3a675, 0xcea3a674, 0xcea3a675, 0xcea3a674, 0x5e7ccdcd, 0x5e7ccdcd, 0x5e7ccdcd, 0x5e7ccdce, 0x5e7ccdcd, 0x5e7ccdcd, 0x5e7ccdcd, 0x5e7ccdce, 0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00}},
+    {0xbf45105ed8c77cb7ull, {0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff, 0x00009144, 0x00009144, 0x00009145, 0x00009144, 0xba2882f7, 0xba2882f6, 0xba2882f7, 0xba2882f6, 0xce1ce20d, 0xce1ce20d, 0xce1ce20e, 0xce1ce20d, 0x5f3f4510, 0x5f3f4510, 0x5f3f4510, 0x5f3f4511, 0xde8175df, 0xde8175df, 0xde8175e0, 0xde8175df, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff}},
+    {0xc0ded21c82caf2bbull, {0x00008000, 0x00008000, 0x00008001, 0x00008000, 0x0000f7b5, 0x0000f7b4, 0x0000f7b5, 0x0000f7b4, 0xc6f690e4, 0xc6f690e4, 0xc6f690e5, 0xc6f690e4, 0xcefa6a1b, 0xcefa6a1a, 0xcefa6a1b, 0xcefa6a1a, 0x5f40ded2, 0x5f40ded2, 0x5f40ded2, 0x5f40ded3, 0xde7c84b8, 0xde7c84b7, 0xde7c84b8, 0xde7c84b7, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff}},
+    {0xc091db0c819b315bull, {0x00008000, 0x00008000, 0x00008001, 0x00008000, 0x0000e477, 0x0000e476, 0x0000e477, 0x0000e476, 0xc48ed864, 0xc48ed864, 0xc48ed865, 0xc48ed864, 0xcefcc99d, 0xcefcc99d, 0xcefcc99e, 0xcefcc99d, 0x5f4091db, 0x5f4091db, 0x5f4091db, 0x5f4091dc, 0xde7db894, 0xde7db893, 0xde7db894, 0xde7db893, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff}},
+    {0x000000002fef107aull, {0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x4e3fbc42, 0x4e3fbc41, 0x4e3fbc41, 0x4e3fbc42, 0x4e3fbc42, 0x4e3fbc41, 0x4e3fbc41, 0x4e3fbc42, 0x4e3fbc42, 0x4e3fbc41, 0x4e3fbc41, 0x4e3fbc42, 0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00}},
+    {0x039dec82bb108cfeull, {0x00009884, 0x00009884, 0x00009885, 0x00009884, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0xce89dee6, 0xce89dee6, 0xce89dee7, 0xce89dee6, 0x5c677b21, 0x5c677b20, 0x5c677b20, 0x5c677b21, 0x5c677b21, 0x5c677b20, 0x5c677b20, 0x5c677b21, 0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00}},
+    {0x0000000002d2535aull, {0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x4c3494d6, 0x4c3494d6, 0x4c3494d6, 0x4c3494d7, 0x4c3494d6, 0x4c3494d6, 0x4c3494d6, 0x4c3494d7, 0x4c3494d6, 0x4c3494d6, 0x4c3494d6, 0x4c3494d7, 0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00}},
+    {0x000000004a134dabull, {0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x4e94269b, 0x4e94269b, 0x4e94269b, 0x4e94269c, 0x4e94269b, 0x4e94269b, 0x4e94269b, 0x4e94269c, 0x4e94269b, 0x4e94269b, 0x4e94269b, 0x4e94269c, 0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00}},
+    {0xe4093df836aa8be5ull, {0x00000055, 0x00000055, 0x00000055, 0x00000056, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff, 0xff800000, 0xff7fffff, 0xff800000, 0xff7fffff, 0x4e5aaa30, 0x4e5aaa2f, 0x4e5aaa2f, 0x4e5aaa30, 0x5f64093e, 0x5f64093d, 0x5f64093d, 0x5f64093e, 0xdddfb610, 0xdddfb610, 0xdddfb611, 0xdddfb610, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff}},
+    {0xc9ddc8f04a775a71ull, {0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff, 0xff800000, 0xff7fffff, 0xff800000, 0xff7fffff, 0x4e94eeb5, 0x4e94eeb4, 0x4e94eeb4, 0x4e94eeb5, 0x5f49ddc9, 0x5f49ddc8, 0x5f49ddc8, 0x5f49ddc9, 0xde5888dc, 0xde5888dc, 0xde5888dd, 0xde5888dc, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff}},
+    {0x955753b539933f4dull, {0x00000c9a, 0x00000c99, 0x00000c99, 0x00000c9a, 0x00008000, 0x00008000, 0x00008001, 0x00008000, 0x80000000, 0x80000000, 0x80000001, 0x80000000, 0x4e664cfd, 0x4e664cfd, 0x4e664cfd, 0x4e664cfe, 0x5f155754, 0x5f155753, 0x5f155753, 0x5f155754, 0xded55159, 0xded55158, 0xded55159, 0xded55158, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff}},
+    {0xbe1edefcbb3d75daull, {0x000099ec, 0x000099eb, 0x000099ec, 0x000099eb, 0x00008000, 0x00008000, 0x00008001, 0x00008000, 0xb0f6f7e6, 0xb0f6f7e5, 0xb0f6f7e6, 0xb0f6f7e5, 0xce898514, 0xce898514, 0xce898515, 0xce898514, 0x5f3e1edf, 0x5f3e1ede, 0x5f3e1ede, 0x5f3e1edf, 0xde83c242, 0xde83c242, 0xde83c243, 0xde83c242, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff}},
+    {0x3fdd0913271687b2ull, {0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00003742, 0x00003742, 0x00003742, 0x00003743, 0x3ee84899, 0x3ee84899, 0x3ee84899, 0x3ee8489a, 0x4e1c5a1f, 0x4e1c5a1e, 0x4e1c5a1e, 0x4e1c5a1f, 0x5e7f7424, 0x5e7f7424, 0x5e7f7424, 0x5e7f7425, 0x5e7f7424, 0x5e7f7424, 0x5e7f7424, 0x5e7f7425, 0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00}},
+    {0xc05defe9c5610885ull, {0x0000eb08, 0x0000eb08, 0x0000eb09, 0x0000eb08, 0x0000d77c, 0x0000d77b, 0x0000d77c, 0x0000d77b, 0xc2ef7f4e, 0xc2ef7f4e, 0xc2ef7f4f, 0xc2ef7f4e, 0xce6a7bde, 0xce6a7bdd, 0xce6a7bde, 0xce6a7bdd, 0x5f405df0, 0x5f405def, 0x5f405def, 0x5f405df0, 0xde7e8840, 0xde7e8840, 0xde7e8841, 0xde7e8840, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff}},
+    {0x3f239ff2c4a06a73ull, {0x0000e503, 0x0000e503, 0x0000e504, 0x0000e503, 0x000008e8, 0x000008e7, 0x000008e7, 0x000008e8, 0x391cff96, 0x391cff96, 0x391cff96, 0x391cff97, 0xce6d7e56, 0xce6d7e56, 0xce6d7e57, 0xce6d7e56, 0x5e7c8e80, 0x5e7c8e7f, 0x5e7c8e7f, 0x5e7c8e80, 0x5e7c8e80, 0x5e7c8e7f, 0x5e7c8e7f, 0x5e7c8e80, 0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00}},
+    {0xc15ac67471cc39b1ull, {0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff, 0xcad633a4, 0xcad633a3, 0xcad633a4, 0xcad633a3, 0x4ee39873, 0x4ee39873, 0x4ee39873, 0x4ee39874, 0x5f415ac6, 0x5f415ac6, 0x5f415ac6, 0x5f415ac7, 0xde7a94e6, 0xde7a94e6, 0xde7a94e7, 0xde7a94e6, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff}},
+    {0xffffffffffff847bull, {0x00007fff, 0x00007fff, 0x00007fff, 0x00007fff, 0x0000ffff, 0x0000ffff, 0x0000ffff, 0x0000ffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xc6f70a00, 0xc6f70a00, 0xc6f70a00, 0xc6f70a00, 0x5f800000, 0x5f7fffff, 0x5f7fffff, 0x5f800000, 0xc6f70a00, 0xc6f70a00, 0xc6f70a00, 0xc6f70a00, 0x0000f7b8, 0x0000f7b8, 0x0000f7b9, 0x0000f7b8}},
+    {0xffffffffe443ad9aull, {0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff, 0x0000ffff, 0x0000ffff, 0x0000ffff, 0x0000ffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xcddde293, 0xcddde293, 0xcddde294, 0xcddde293, 0x5f800000, 0x5f7fffff, 0x5f7fffff, 0x5f800000, 0xcddde293, 0xcddde293, 0xcddde294, 0xcddde293, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff}},
+    {0xfba0bc5f62ba614dull, {0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff, 0xff800000, 0xff7fffff, 0xff800000, 0xff7fffff, 0x4ec574c3, 0x4ec574c2, 0x4ec574c2, 0x4ec574c3, 0x5f7ba0bc, 0x5f7ba0bc, 0x5f7ba0bc, 0x5f7ba0bd, 0xdc8be874, 0xdc8be874, 0xdc8be875, 0xdc8be874, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff}},
+    {0xfffffff84a6450d5ull, {0x00007c00, 0x00007bff, 0x00007bff, 0x00007c00, 0x0000ffff, 0x0000ffff, 0x0000ffff, 0x0000ffff, 0xffffffc2, 0xffffffc2, 0xffffffc2, 0xffffffc2, 0x4e94c8a2, 0x4e94c8a1, 0x4e94c8a1, 0x4e94c8a2, 0x5f800000, 0x5f7fffff, 0x5f7fffff, 0x5f800000, 0xd0f6b376, 0xd0f6b375, 0xd0f6b376, 0xd0f6b375, 0x0000fc00, 0x0000fbff, 0x0000fc00, 0x0000fbff}},
+  };
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(28 * 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  std::vector<uint8_t> pa(8), va(8);
+  std::memcpy(pa.data(), &out, 8);
+  for (const Row& row : rows) {
+    std::memcpy(va.data(), &row.in, 8);
+    exec::launch(m.entries[0], cfg, {pa, va}, mem, prof);
+    std::array<uint32_t, 28> got{};
+    mem.read(out, got.data(), 28 * 4);
+    for (int j = 0; j < 28; ++j) VCHECK_EQ(got[j], row.want[j]);
+  }
 }
 
 // dp4a is the four-way byte dot product quantized inference is built on, so a
@@ -1060,6 +1599,107 @@ VTEST(bar_red_reduces_across_the_block) {
   mem.free(out);
 }
 
+// bar.red in a loop, the shape of CUTLASS's semaphore wait
+// (`while (__syncthreads_and(...))`). The first warp released can come round
+// and vote again before the others have collected; its vote belongs to the
+// next round. Every round here counts all 128 threads, so each thread's sum
+// over four rounds is 512. With one shared accumulator the early vote leaked
+// into the round the other warps were collecting.
+VTEST(bar_red_rounds_do_not_mix_in_a_loop) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry br(.param .u64 p)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<6>;
+  .reg .pred %p<4>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  mov.u32 %r2, 0;     // round
+  mov.u32 %r3, 0;     // sum
+  setp.eq.u32 %p1, %r1, %r1;
+LOOP:
+  bar.red.popc.u32 %r4, 0, %p1;
+  add.u32 %r3, %r3, %r4;
+  add.u32 %r2, %r2, 1;
+  setp.lt.u32 %p2, %r2, 4;
+  @%p2 bra LOOP;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r3;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(128 * 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.block = {128, 1, 1};
+  std::vector<uint8_t> pa(8);
+  std::memcpy(pa.data(), &out, 8);
+  exec::launch(m.entries[0], cfg, {pa}, mem, prof);
+  for (int t = 0; t < 128; ++t) VCHECK_EQ(mem.load_scalar(out + 4 * t, 4), uint64_t{512});
+  mem.free(out);
+}
+
+// The same loop with CUTLASS's semaphore-wait shape: only thread 0 fetches,
+// from a block nvcc places after the ret, while its warp-mates branch straight
+// back to the bar.red. The barrier waits for every live thread, so the warp
+// votes only once thread 0 is back. Voting for the partial warp left thread 0
+// on its higher-pc path for good, and the loop never ended.
+VTEST(bar_red_waits_for_lanes_on_a_higher_pc_path) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry br(.param .u64 p)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<6>;
+  .reg .pred %p<5>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  mov.u32 %r2, 0;     // rounds
+  mov.u32 %r5, 0;     // thread 0's fetches
+LOOP:
+  setp.lt.u32 %p1, %r5, 3;
+  bar.red.and.pred %p2, 0, %p1;
+  @!%p2 bra DONE;
+  add.u32 %r2, %r2, 1;
+  setp.gt.u32 %p3, %r1, 0;
+  @%p3 bra LOOP;
+  bra.uni FETCH;
+DONE:
+  mad.lo.u32 %r6, %r5, 100, %r2;
+  mul.wide.u32 %rd3, %r1, 4;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r6;
+  ret;
+FETCH:
+  add.u32 %r5, %r5, 1;
+  bra.uni LOOP;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(64 * 4);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  cfg.max_steps = 100000;
+  std::vector<uint8_t> pa(8);
+  std::memcpy(pa.data(), &out, 8);
+  exec::launch(m.entries[0], cfg, {pa}, mem, prof);
+  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{303});
+  for (int t = 1; t < 64; ++t) VCHECK_EQ(mem.load_scalar(out + 4 * t, 4), uint64_t{3});
+  mem.free(out);
+}
+
 // ---- cp.async ----
 //
 // The instruction's whole meaning is that the copy is *not* finished when it
@@ -1145,6 +1785,43 @@ VTEST(cp_async_wait_group_keeps_later_groups_pending) {
   VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0x11111111});      // group 0 landed
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0xBBBBBBBB});  // group 1 pending
   VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{0x22222222});  // wait_all drains it
+}
+
+VTEST(cp_async_empty_groups_count_toward_wait_group) {
+  // A commit with nothing issued still makes a group -- empty, and trivially
+  // complete, but one of the "N most recent" that wait_group N may leave
+  // pending. Here the real group is older than one empty group, so
+  // wait_group 1 must land it. Dropping empty groups kept it pending, and a
+  // CUTLASS multistage mainloop whose masked-off threads commit empty groups
+  // read stale stages.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 src, .param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .shared .align 16 .b8 tile[16];
+    ld.param.u64 %rd1, [src];
+    cvta.to.global.u64 %rd2, %rd1;
+    ld.param.u64 %rd3, [out];
+    cvta.to.global.u64 %rd4, %rd3;
+    mov.u32 %r1, tile;
+    mov.u32 %r6, 0xAAAAAAAA;
+    st.shared.u32 [%r1], %r6;
+    cp.async.ca.shared.global [%r1], [%rd2], 4;
+    cp.async.commit_group;
+    cp.async.commit_group;                    // empty
+    cp.async.wait_group 1;
+    ld.shared.u32 %r2, [%r1];
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t src = e.mem.alloc(16), out = e.mem.alloc(16);
+  e.mem.store_scalar(src, 4, 0x11111111u);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(src), arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0x11111111});
 }
 
 VTEST(cp_async_zero_fills_past_the_source_size) {

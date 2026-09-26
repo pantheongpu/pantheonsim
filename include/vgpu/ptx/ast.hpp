@@ -173,7 +173,13 @@ struct OpCvta { Type ty; Space space = Space::Generic; bool to_space = false; Re
 // roundf compile to, so conflating them with the bare modes leaves those
 // intrinsics returning their input.
 enum class Round { None, Rn, Rz, Rm, Rp, Rni, Rzi, Rmi, Rpi };
-struct OpCvt { Type dst_ty; Type src_ty; Round round = Round::None; Reg dst; Operand src; };
+// .sat clamps a float result to [0.0, 1.0] (NaN to +0) and an integer one to
+// the destination's range; .ftz flushes f32 subnormal inputs and results to
+// sign-preserving zero.
+struct OpCvt {
+  Type dst_ty; Type src_ty; Round round = Round::None; Reg dst; Operand src;
+  bool sat = false, ftz = false;
+};
 struct OpNot { Type ty; Reg dst; Operand src; };   // bitwise not
 struct OpNeg { Type ty; Reg dst; Operand src; };   // arithmetic negate (int/float)
 struct OpAbs { Type ty; Reg dst; Operand src; };
@@ -226,6 +232,10 @@ struct OpRedux { ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand src; };
 // cvt.rn.f16x2.f32 d, a, b -- convert two f32 and pack them into one register,
 // a in the high half and b in the low half.
 struct OpCvtF16x2 { Reg dst; Operand a, b; bool bf16 = false; };
+// cvt.pack.sat.<to>.s32[.b32] d, a, b[, c]: a and b saturated to a 16-, 8-,
+// 4- or 2-bit integer type and packed, b in the low field and a above it;
+// for the narrower types the rest of d comes from the low bits of c.
+struct OpCvtPack { uint32_t bits = 8; bool is_signed = true; bool has_c = false; Reg dst; Operand a, b, c; };
 
 // ldmatrix.sync.aligned.m8n8.xN[.trans].b16 {d...}, [addr]
 // Loads N 8x8 matrices of 16-bit elements from shared memory. Row r of matrix i
@@ -276,6 +286,11 @@ struct OpMma {
   bool acc_f16 = false;     // accumulate in f16x2 registers rather than f32
   bool acc_int = false;     // s32 accumulate
   std::vector<Reg> d, a, b, c;
+  // mma.sp: A is 2:4 structured sparse, holding only its non-zero half; the
+  // metadata operand says where each stored element sits in its 4-wide chunk,
+  // and the selector says which threads of each group of four supply it.
+  bool sparse = false;
+  Operand meta, selector;
 };
 // Hopper's warpgroup MMA (sm_90a): wgmma.fence, .commit_group, .wait_group
 // and .mma_async. Four warps compute one 64xNxK product; A comes from
@@ -470,7 +485,9 @@ struct OpVideoSimd {
 struct OpCopysign { Type ty; Reg dst; Operand a, b; };
 // dp4a.{u32,s32}.{u32,s32} d, a, b, c -- four byte-wise products of a and b
 // accumulated into c. Quantized inference leans on this heavily.
-struct OpDp4a { bool a_signed = false; bool b_signed = false; Reg dst; Operand a, b, c; };
+// dp4a, and dp2a (`two`): two 16-bit elements of a against the low (or,
+// with `hi`, high) two bytes of b.
+struct OpDp4a { bool a_signed = false; bool b_signed = false; bool two = false; bool hi = false; Reg dst; Operand a, b, c; };
 // bmsk.{clamp,wrap}.b32 d, a, b -- a contiguous mask of b bits starting at a.
 struct OpBmsk { bool wrap = false; Reg dst; Operand a, b; };
 // Extended-precision arithmetic. PTX has a single per-thread condition-code
@@ -539,10 +556,54 @@ enum class MatLayout { Row, Col };
 //   tf32  m16n16k8,  4 registers -- A is 16x8 and B is 8x16, so the two
 //         fragments do not even share an index map
 enum class WmmaElem : uint8_t { F16, BF16, TF32 };
+// Every WMMA element type and shape (PTX ISA 9.7.16.4). The combinations
+// above -- f16/bf16 A and B at m16n16k16 with f32 accumulators, and tf32 at
+// m16n16k8 -- keep the layouts they have always had and the fast path; every
+// other one is `generic`: its fragment holds the logical matrix, elements
+// spread across lanes and registers in order, as many whole copies as the
+// ISA's register count holds, with the load applying the memory layout.
+enum class WmmaType : uint8_t { F16, BF16, TF32, F32, F64, S8, U8, S4, U4, B1, S32 };
+struct WmmaShape {
+  uint32_t m = 16, n = 16, k = 16;
+  bool operator==(const WmmaShape&) const = default;
+};
+inline uint32_t wmma_type_bits(WmmaType t) {
+  switch (t) {
+    case WmmaType::F16: case WmmaType::BF16: return 16;
+    case WmmaType::F64: return 64;
+    case WmmaType::S8: case WmmaType::U8: return 8;
+    case WmmaType::S4: case WmmaType::U4: return 4;
+    case WmmaType::B1: return 1;
+    default: return 32;
+  }
+}
+// The matrix a fragment holds ('a' is m x k, 'b' k x n, 'c'/'d' m x n) and the
+// registers the ISA gives it: exactly enough for the matrix, except f16 A and
+// B, which always take eight .f16x2 registers.
+struct WmmaGeom {
+  uint32_t rows = 0, cols = 0, bits = 0, reg_bits = 32, regs = 0;
+};
+inline WmmaGeom wmma_geom(char frag, WmmaShape s, WmmaType t) {
+  WmmaGeom g;
+  g.rows = frag == 'a' ? s.m : frag == 'b' ? s.k : s.m;
+  g.cols = frag == 'a' ? s.k : frag == 'b' ? s.n : s.n;
+  g.bits = wmma_type_bits(t);
+  g.reg_bits = t == WmmaType::F64 ? 64 : 32;
+  const uint64_t total = uint64_t{g.rows} * g.cols * g.bits;
+  g.regs = static_cast<uint32_t>((total + uint64_t{32} * g.reg_bits - 1) / (uint64_t{32} * g.reg_bits));
+  if (t == WmmaType::F16 && (frag == 'a' || frag == 'b')) g.regs = 8;
+  return g;
+}
 struct OpWmmaMma {
   WmmaElem elem = WmmaElem::F16;
   MatLayout alayout, blayout;
   std::vector<Reg> d, a, b, c;
+  bool generic = false;
+  WmmaShape shape;
+  WmmaType atype = WmmaType::F16, btype = WmmaType::F16, ctype = WmmaType::F32, dtype = WmmaType::F32;
+  bool satfinite = false;      // integer: clamp to the s32 range instead of wrapping
+  bool b1_and = false;         // b1: .and.popc rather than .xor.popc
+  FRound rnd = FRound::Nearest;  // f64
 };
 // wmma.load.{a,b,c}.sync.aligned.<layout>.m16n16k16[.space].<type> {d...}, [addr], stride
 //
@@ -556,6 +617,9 @@ struct OpWmmaLoad {
   WmmaElem elem = WmmaElem::F16;
   MatLayout layout = MatLayout::Row;
   Space space = Space::Generic;
+  bool generic = false;
+  WmmaShape shape;
+  WmmaType type = WmmaType::F16;
   bool f32 = false;         // the C fragment is f32; A and B are f16
   Addr addr;
   std::vector<Reg> dsts;
@@ -564,6 +628,9 @@ struct OpWmmaLoad {
 struct OpWmmaStore {
   MatLayout layout;
   Space space = Space::Generic;
+  bool generic = false;
+  WmmaShape shape;
+  WmmaType type = WmmaType::F32;
   Addr addr;
   std::vector<Operand> src;
   Operand stride;
@@ -715,7 +782,7 @@ struct OpCall {
 };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy>;
 
@@ -798,6 +865,7 @@ struct EntryFn {
   std::array<uint32_t, 3> max_ntid{0, 0, 0};
   std::array<uint32_t, 3> req_ntid{0, 0, 0};
   uint32_t min_ctas_per_sm = 0;
+  uint32_t max_nreg = 0;   // .maxnreg: a register ceiling ptxas must meet
   // .reqnctapercluster: the cluster shape in CTAs the kernel was compiled for
   // (__cluster_dims__). Zero means the kernel names no cluster shape.
   // .explicitcluster says the kernel must be launched with one.

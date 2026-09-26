@@ -52,12 +52,9 @@ u="$cutlass/test/unit"
 # for tma_load with CUDA 13). Four at once took a 16 GB GitHub runner past
 # its memory, and the runner was shut down in the middle of the job ("The runner
 # has received a shutdown signal"), three runs out of three. So as many run
-# together as the free memory holds, and never fewer than one.
-per_compile_kb=$((${VGPU_NVCC_COMPILE_MB:-10240} * 1024))
-avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-jobs=$(( avail_kb / per_compile_kb ))
-(( jobs < 1 )) && jobs=1
-(( jobs > ${#tests[@]} )) && jobs=${#tests[@]}
+# together as the free memory holds -- the container's limit, when there is
+# one -- and never fewer than one (cutlass_compile_jobs, cutlass_fetch.sh).
+jobs=$(cutlass_compile_jobs ${#tests[@]})
 # Each takes a test's path under test/unit; the binary is named for its file.
 # CUTLASS's own CMake defines CUTLASS_TARGET_NAME, which the conv testbed uses.
 compile() {

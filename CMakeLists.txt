@@ -598,6 +598,8 @@ vgpu_unit_test(test_fastpath)
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
 vgpu_unit_test(test_barriers)
+# Dynamic parallelism at the PTX level.
+vgpu_unit_test(test_dynpar)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
@@ -1221,6 +1223,39 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 3600)
+endif()
+
+# CUTLASS's own GEMM tests, the cases that found interpreter bugs (see the
+# script), and a split-K style semaphore between blocks on several host threads.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_cutlass_gemm COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_gemm.sh)
+  set_tests_properties(e2e_cutlass_gemm PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 3600)
+  add_test(NAME e2e_block_semaphore COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_block_semaphore.sh)
+  set_tests_properties(e2e_block_semaphore PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# Every WMMA shape and element type through mma.h.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_wmma_types COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wmma_types.sh)
+  set_tests_properties(e2e_wmma_types PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# Dynamic parallelism: device-side launches, nesting, order, named streams.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_dynamic_parallelism COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dynamic_parallelism.sh)
+  set_tests_properties(e2e_dynamic_parallelism PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
 endif()
 
 # Distributed shared memory through cooperative_groups' cluster API.

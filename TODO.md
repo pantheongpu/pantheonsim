@@ -289,17 +289,28 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   through the public API matches a host reference for both B layouts and both
   element types -- and tf32's m16n16k8, whose A is 16x8 and B is 8x16, so its
   load computes the address from the layout directly rather than relying on the
-  cancellation the square shapes get for free. The rectangular m8n32k16 and
-  m32n8k16 variants are still refused by name;
+  cancellation the square shapes get for free. Since 2026-09-25 every other
+  WMMA combination too -- f16 accumulators, the rectangular m8n32k16 and
+  m32n8k16 shapes, s8/u8 (with .satfinite), f64 m8n8k4 with its rounding
+  modes, s4/u4 m8n8k32 and b1 m8n8k128 (.xor.popc and .and.popc), and the
+  optional stride. The fragment layout is unspecified by the ISA, so these
+  use one of their own (the logical matrix, spread in order over lanes and
+  registers); the combinations above keep theirs. wmma_types.cu checks all 21
+  shape/type/layout combinations through mma.h, exactly;
   ldmatrix.m8n8.x{1,2,4}[.trans], mma.sync.m16n8k{8,16,32} over f16/bf16/tf32/
-  s8, and movmatrix.m8n8.trans (the register-only transpose).
+  s8, and movmatrix.m8n8.trans (the register-only transpose). mma.sp (2:4
+  structured sparsity) m16n8k{16,32} with f16/bf16 A and B, both sparsity
+  selectors: its A layout and metadata were read from the ISA's figures and
+  settled nibble by nibble on an RTX 3060, test_exec3 checks five forms
+  against the hardware's own results, and CUTLASS's 19 SM80 sparse GEMM tests
+  pass. Its tf32, integer and FP8 forms are still refused.
   stmatrix.m8n8.x{1,2,4}[.trans] is the store counterpart of ldmatrix: the warp
   writes the 8x8 matrices its registers hold back to shared memory, which is how
   a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
   checks where every element lands and that a fragment stored by one instruction
   and loaded by the other comes back unchanged.
 - Asynchronous copy: cp.async.{ca,cg} with commit_group / wait_group / wait_all
-  and the src-size zero-fill form. The copy is deferred until the wait rather
+  and the src-size zero-fill form; an empty group counts toward wait_group N. The copy is deferred until the wait rather
   than performed on the spot, so a kernel that reads its destination early sees
   what the hardware would, not what a synchronous copy would have hidden.
 - Warp membership: %lanemask_{eq,lt,le,gt,ge}, %warpid, activemask, bar.red,
@@ -683,7 +694,7 @@ narrows what counts as observable, not what the detector looks at.
   e2e test (nvidia/tests/e2e/wgmma_cute.cu) lets CuTe -- NVIDIA's own layout
   code, from a pinned CUTLASS release -- build the tiles, descriptors and
   fragments for seventeen configurations and compares every element exactly.
-  Refused by name: the sparse (`.sp`) and single-bit (`.b1`) forms, a
+  Refused by name: the sparse (`.sp`) and single-bit (`.b1`) `wgmma` forms, a
   descriptor with a nonzero base offset (the ISA does not say how it moves the
   pattern), and `wgmma` under any target but `.target sm_90a`. Loading now
   follows the target suffixes: a fatbin's `sm_90a` PTX is preferred over its
@@ -823,6 +834,53 @@ narrows what counts as observable, not what the detector looks at.
   complete is reported as a deadlock, naming the barrier and how far it
   got; before, the block quietly ended with the warp still waiting.
 
+- Dynamic parallelism (CDP2, 2026-09-25): kernels launch kernels through the
+  device runtime's entry points as the CUDA programming guide documents them
+  for code generators (__cudaCDP2GetParameterBufferV2 and
+  __cudaCDP2LaunchDeviceV2). Kernels have addresses in their own window and
+  the runtime gives every launch a table of them; the parameter buffer is
+  device memory laid out as the child's parameters. A child runs after its
+  parent grid and before the launch returns, in launch order (parent block by
+  parent block, so it is the same with any number of host threads), each
+  complete -- its own children included -- before the next: a schedule CUDA
+  allows for every device-side stream, since it promises no concurrency
+  between parent and child. CUDA's limits apply (2048 pending, 24 deep).
+  Checked by test_dynpar and dynamic_parallelism.cu (built with -rdc: fan-out,
+  nesting, order, the tail and fire-and-forget streams, a struct parameter).
+
+- CUTLASS's SM90 GEMM unit tests, run unmodified (2026-09-25), found: the
+  register estimate ignored launch bounds (.maxntid/.minnctapersm/.maxnreg
+  now cap it, as ptxas does, spilling the rest); an mbarrier instruction whose
+  lanes name different blocks' barriers was refused (lanes are now handled
+  barrier by barrier); cudaFuncAttributeNonPortableClusterSizeAllowed was
+  ignored (clusters of up to 16 now launch once it is set); and dp2a was
+  missing. The cluster warp-specialized cooperative test passes all 22 cases
+  and the pointer-array test its 2.
+  The ping-pong kernel's wrong 16-row A slices at 2x4x1 (and the group
+  GEMM's, at 2x2x1) were one bug: each warp of a warpgroup read its operands
+  of a `wgmma` from shared memory when it got to the instruction, so a warp
+  that finished early could release the stage and let the cluster peer that
+  multicasts A refill it before the last warp had read. The warpgroup now
+  reads them once, at the first warp's issue, and `wgmma.wait_group` holds a
+  warp until all four have issued what it waits for (letting the first warp
+  through alone hung the ping-pong kernel's SIMT-epilogue variant at 2x2x1:
+  the stage it released was refilled past a lagging warp's parity wait).
+  The group GEMM also found
+  `cvt.sat` and `.ftz` ignored and tiny fp16 results flushed to zero (its
+  silu epilogue's expf leans on `cvt.sat.f32.f32`); conversions now match an
+  RTX 3060 bit for bit, NaN encodings included.
+- CUTLASS's SM80 sparse GEMM tests (all 19 pass) found three more: an empty
+  `cp.async` group did not count toward `wait_group N`, so a wait left an
+  older real group pending; `bar.red` voted for a partial warp when some of
+  its lanes were on another path, and let a warp looping back vote into the
+  round the others were still collecting; and a `.reg` declared inside
+  `{ }` did not hide the outer register of the same name, which
+  `__syncthreads_and`'s inline asm relies on. The last two hung CUTLASS's
+  split-K semaphore wait whenever the blocks ran on more than one host
+  thread. `ex2.approx` differs from the hardware's by an ulp in about 30% of
+  inputs (it is approximate, and matching it bit for bit would take the SFU's
+  internals), which moves `expf` by an ulp too.
+
 ## Not implemented (fails loudly, never silently)
 
 This list was stale for a while, which is its own kind of wrong: it still named
@@ -851,11 +909,6 @@ what is done.
   fault with a diagnostic naming which it was. Exporting a handle to another
   process still refuses: device memory here is this process's own sparse
   backing.)
-- Dynamic parallelism (a kernel launching a kernel). Taking a kernel's address
-  in device code now says so by name instead of reporting an unknown symbol,
-  which sent you looking for a typo in a name that was right there. Running it
-  would need a child grid scheduled from inside the parent's instruction
-  stream, which nothing here can do.
 - Frontends: cubin/SASS loading. (AMD execution is done -- see
   amd/README.md: unmodified hipcc programs built by ROCm 6.4, 7.0, 7.1 or 7.2
   run on a simulated MI300X, through the fatbin path, chevron

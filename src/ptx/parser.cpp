@@ -768,6 +768,7 @@ class Parser {
         next();
         uint32_t v = static_cast<uint32_t>(expect_int("directive value"));
         if (d == ".minnctapersm") fn.min_ctas_per_sm = v;
+        if (d == ".maxnreg") fn.max_nreg = v;
       } else if (d == ".noreturn" || d == ".pragma") {
         next();
         while (!at_end() && !peek_punct(";") && !peek_punct("{")) next();
@@ -791,6 +792,7 @@ class Parser {
   }
 
   void parse_body(EntryFn& fn) {
+    reg_scopes_.clear();
     // Labels are scoped to the { } block that defines them (PTX ISA 4.x
     // "Statements"), and inline asm relies on it: CUTLASS's barrier waits are
     // each a block with its own LAB_WAIT and DONE, so one kernel holds many.
@@ -809,12 +811,14 @@ class Parser {
       if (peek_punct("{")) {
         next();
         scopes.push_back(next_scope++);
+        reg_scopes_.emplace_back();
         continue;
       }
       if (peek_punct("}")) {
         next();
         if (scopes.size() == 1) break;
         scopes.pop_back();
+        reg_scopes_.pop_back();
         continue;
       }
       if (t.kind == Token::Kind::Word && t.text == ".reg") {
@@ -937,7 +941,35 @@ class Parser {
   // register -- used to change the width and keep the narrow id, so a 64-bit
   // store wrote past the end of the 64-bit register file (and a value written
   // before the declaration read back as 0).
-  void declare_reg(EntryFn& fn, const std::string& nm, Type ty, size_t line) {
+  // The name a register reference resolves to: the innermost open block's
+  // own declaration if it has one, else the name itself.
+  const std::string& scoped(const std::string& name) const {
+    for (auto it = reg_scopes_.rbegin(); it != reg_scopes_.rend(); ++it) {
+      auto f = it->find(name);
+      if (f != it->end()) return f->second;
+    }
+    return name;
+  }
+
+  void declare_reg(EntryFn& fn, const std::string& source_name, Type ty, size_t line) {
+    // Registers are scoped to the { } block that declares them, like labels,
+    // and a declaration inside a block hides an outer one of the same name
+    // until the block closes. CUDA's __syncthreads_and is inline asm that
+    // declares its own %p1 and %p2 in braces; nvcc's code after the block uses
+    // its own %p2, and taking the two as one register sent CUTLASS's split-K
+    // semaphore wait round its loop without ever re-reading the semaphore.
+    // A declaration that hides nothing keeps its name, so a block-local like
+    // CUTLASS's "p" is interned exactly as before.
+    std::string nm = source_name;
+    if (!reg_scopes_.empty()) {
+      auto& inner = reg_scopes_.back();
+      if (auto f = inner.find(source_name); f != inner.end()) {
+        nm = f->second;   // declared again in the same block
+      } else if (fn.reg_decls.count(scoped(source_name))) {
+        nm = source_name + "{" + std::to_string(++shadow_count_) + "}";
+        inner[source_name] = nm;
+      }
+    }
     const bool wide = ty.bits > 32 && ty.kind != Type::Kind::Pred;
     if (fn.reg_ids.count(nm)) {
       auto was = fn.reg_wide.find(nm);
@@ -947,6 +979,7 @@ class Parser {
                        (was_wide ? "declared 64-bit" : "used or declared as a 32-bit register"));
     }
     fn.reg_decls[nm] = ty;
+    declared_regs_.insert(source_name);
     declared_regs_.insert(nm);
     fn.reg_wide[nm] = wide;
     intern(nm);
@@ -1107,7 +1140,8 @@ class Parser {
   // names at run time.
   // Interns a register into the file its declared width selects. Ids are
   // dense within each file, so both can be plain vectors.
-  Reg intern(const std::string& name) {
+  Reg intern(const std::string& source_name) {
+    const std::string& name = scoped(source_name);
     auto wit = cur_fn_->reg_wide.find(name);
     bool wide = wit != cur_fn_->reg_wide.end() && wit->second;
     auto it = cur_fn_->reg_ids.find(name);
@@ -1188,9 +1222,9 @@ class Parser {
     Addr a;
     std::string base = expect_word("address base");
     if (base[0] == '%' || declared_regs_.count(base)) {
-      a.base = base;
       a.base_kind = Addr::Base::Reg;
       Reg r = intern(base);
+      a.base = r.name;
       a.base_id = r.id;
       a.base_wide = r.wide;
     } else if (call_slots_.count(base)) {
@@ -1453,12 +1487,39 @@ class Parser {
       expect_punct(",");
       op.src = parse_operand();
       ins.op = op;
+    } else if (op0 == "cvt" && parts.size() > 1 && parts[1] == "pack") {
+      // cvt.pack.sat.{u16,s16}.s32 d, a, b
+      // cvt.pack.sat.{u8,s8,u4,s4,u2,s2}.s32.b32 d, a, b, c
+      if (parts.size() < 5 || parts[2] != "sat" || parts[4] != "s32")
+        return unsupported("cvt.pack form (expected cvt.pack.sat.<type>.s32[.b32])");
+      const std::string& to = parts[3];
+      OpCvtPack op;
+      if (to.size() < 2 || (to[0] != 'u' && to[0] != 's'))
+        return unsupported("cvt.pack to ." + to);
+      op.is_signed = to[0] == 's';
+      op.bits = static_cast<uint32_t>(std::atoi(to.c_str() + 1));
+      if (op.bits != 16 && op.bits != 8 && op.bits != 4 && op.bits != 2)
+        return unsupported("cvt.pack to ." + to);
+      op.has_c = op.bits != 16;
+      if (op.has_c != (parts.size() == 6 && parts[5] == "b32") || parts.size() > 6)
+        return unsupported(op.has_c ? "cvt.pack to 8, 4 or 2 bits takes .b32 and a c operand"
+                                    : "cvt.pack to 16 bits takes no c operand");
+      op.dst = expect_reg_operand("cvt.pack destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      if (op.has_c) {
+        expect_punct(",");
+        op.c = parse_operand();
+      }
+      ins.op = op;
     } else if (op0 == "cvt") {
       // cvt[.round][.sat][.ftz].<dstty>.<srcty>
       std::vector<Type> tys;
       std::string packed;  // "f16x2"/"bf16x2": two f32 sources packed into one register
       std::string fp8;     // "e4m3x2"/"e5m2x2": the FP8 side of the conversion
-      bool satfinite = false;
+      bool satfinite = false, sat = false, ftz = false;
       Round round = Round::None;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
@@ -1470,7 +1531,8 @@ class Parser {
         else if (p == "rzi") round = Round::Rzi;
         else if (p == "rmi") round = Round::Rmi;
         else if (p == "rpi") round = Round::Rpi;
-        else if (p == "sat" || p == "ftz") ;  // saturation/flush handled conservatively below
+        else if (p == "sat") sat = true;
+        else if (p == "ftz") ftz = true;
         else if (p == "f16x2" || p == "bf16x2") packed = p;
         else if (p == "e4m3x2" || p == "e5m2x2") fp8 = p;
         else if (p == "satfinite") satfinite = true;
@@ -1527,6 +1589,8 @@ class Parser {
       op.dst_ty = tys[0];
       op.src_ty = tys[1];
       op.round = round;
+      op.sat = sat;
+      op.ftz = ftz;
       op.dst = expect_reg_operand("cvt destination");
       expect_punct(",");
       op.src = parse_operand();
@@ -1588,55 +1652,176 @@ class Parser {
         }
       }
     } else if (op0 == "wmma") {
-      // wmma.mma.sync.aligned.<alayout>.<blayout>.m16n16k16.f32.f32 {d}, {a}, {b}, {c};
-      // wmma.store.d.sync.aligned.<layout>.m16n16k16[.space].f32 [addr], {d}, stride;
+      // wmma.load.{a,b,c}.sync.aligned.<layout>.<shape>[.space].<type> {r...}, [p] [, stride]
+      // wmma.store.d.sync.aligned.<layout>.<shape>[.space].<type> [p], {r...} [, stride]
+      // wmma.mma[.op.popc].sync.aligned.<alayout>.<blayout>.<shape>[.rnd].<types> {d}, {a}, {b}, {c}
       if (parts.size() < 2) return unsupported("wmma form");
       const std::string& kind = parts[1];
       std::vector<MatLayout> layouts;
       Space space = Space::Generic;
-      bool shape_ok = false;
       char frag = 0;
-      bool saw_f32 = false;
-      WmmaElem elem = WmmaElem::F16;
-      bool k8 = false;
+      WmmaShape shape;
+      bool have_shape = false, satfinite = false, popc = false, b1_and = false, b1_xor = false;
+      FRound rnd = FRound::Nearest;
+      std::vector<WmmaType> types;
+      static const std::unordered_map<std::string, WmmaShape> kShapes = {
+          {"m16n16k16", {16, 16, 16}}, {"m8n32k16", {8, 32, 16}}, {"m32n8k16", {32, 8, 16}},
+          {"m16n16k8", {16, 16, 8}},   {"m8n8k4", {8, 8, 4}},     {"m8n8k32", {8, 8, 32}},
+          {"m8n8k128", {8, 8, 128}}};
+      static const std::unordered_map<std::string, WmmaType> kTypes = {
+          {"f16", WmmaType::F16}, {"bf16", WmmaType::BF16}, {"tf32", WmmaType::TF32},
+          {"f32", WmmaType::F32}, {"f64", WmmaType::F64},   {"s8", WmmaType::S8},
+          {"u8", WmmaType::U8},   {"s4", WmmaType::S4},     {"u4", WmmaType::U4},
+          {"b1", WmmaType::B1},   {"s32", WmmaType::S32}};
       for (size_t i = 2; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "sync" || p == "aligned") ;
         else if (p == "a" || p == "b" || p == "c" || p == "d") frag = p[0];
-        else if (p == "f32") saw_f32 = true;
         else if (p == "row") layouts.push_back(MatLayout::Row);
         else if (p == "col") layouts.push_back(MatLayout::Col);
-        else if (p == "m16n16k16") shape_ok = true;
+        else if (auto sh = kShapes.find(p); sh != kShapes.end()) { shape = sh->second; have_shape = true; }
+        else if (auto ty = kTypes.find(p); ty != kTypes.end()) types.push_back(ty->second);
         else if (p == "global") space = Space::Global;
         else if (p == "shared") space = Space::Shared;
-        else if (p == "f16") ;
-        else if (p == "bf16") elem = WmmaElem::BF16;
-        else if (p == "tf32") { elem = WmmaElem::TF32; }
-        else if (p == "m16n16k8") { shape_ok = true; k8 = true; }
-        else if (p == "m8n32k16" || p == "m32n8k16")
-          // The rectangular m8n32/m32n8 variants of the 16-deep shape. Their
-          // fragments are laid out differently again, and nothing has needed
-          // them yet, so they say so rather than being approximated.
-          return unsupported("wmma shape '." + p + "' (only m16n16k16 and m16n16k8 "
-                             "are implemented)");
-        else return unsupported("wmma modifier '." + p + "' (only m16n16k16 f16/bf16 with an "
-                                "f32 accumulator is implemented)");
+        else if (p == "satfinite") satfinite = true;
+        else if (p == "popc") popc = true;
+        else if (p == "xor") b1_xor = true;
+        else if (p == "and") b1_and = true;
+        else if (p == "rn") rnd = FRound::Nearest;
+        else if (p == "rz") rnd = FRound::Zero;
+        else if (p == "rm") rnd = FRound::MinusInf;
+        else if (p == "rp") rnd = FRound::PlusInf;
+        else return unsupported("wmma modifier '." + p + "'");
       }
-      if (!shape_ok) return unsupported("only the m16n16k16 and m16n16k8 wmma shapes "
-                                        "are implemented");
-      // The implication only runs one way. `.tf32` always means m16n16k8, but
-      // m16n16k8 does not always mention tf32: the accumulator load and the
-      // store carry only `.f32`, because the C and D fragments are f32
-      // whatever the input type was. Requiring both tokens rejected
-      // wmma.load.c.m16n16k8.f32, which is most of a tf32 kernel.
-      if (elem == WmmaElem::TF32 && !k8)
-        return unsupported("wmma .tf32 outside the m16n16k8 shape");
-      if (k8 && (frag == 'a' || frag == 'b')) elem = WmmaElem::TF32;
-      if (kind == "mma") {
+      if (!have_shape) return unsupported("wmma needs a shape");
+      const bool k16 = shape.k == 16 && (shape == WmmaShape{16, 16, 16} || shape == WmmaShape{8, 32, 16} ||
+                                         shape == WmmaShape{32, 8, 16});
+      // Which types a multiplicand or accumulator of this shape may have.
+      auto ab_ok = [&](WmmaType t) {
+        if (k16) return t == WmmaType::F16 || t == WmmaType::BF16 || t == WmmaType::S8 || t == WmmaType::U8;
+        if (shape == WmmaShape{16, 16, 8}) return t == WmmaType::TF32;
+        if (shape == WmmaShape{8, 8, 4}) return t == WmmaType::F64;
+        if (shape == WmmaShape{8, 8, 32}) return t == WmmaType::S4 || t == WmmaType::U4;
+        return t == WmmaType::B1;
+      };
+      auto acc_ok = [&](WmmaType t) {
+        if (k16) return t == WmmaType::F16 || t == WmmaType::F32 || t == WmmaType::S32;
+        if (shape == WmmaShape{16, 16, 8}) return t == WmmaType::F32;
+        if (shape == WmmaShape{8, 8, 4}) return t == WmmaType::F64;
+        return t == WmmaType::S32;
+      };
+      const bool legacy_shape = shape == WmmaShape{16, 16, 16} || shape == WmmaShape{16, 16, 8};
+      auto arity = [&](char f, WmmaType t, size_t have) -> bool { return wmma_geom(f, shape, t).regs == have; };
+      // The stride is optional: the matrix's own leading dimension otherwise.
+      auto stride_or_default = [&](char f, WmmaType t, MatLayout lay) -> Operand {
+        if (peek_punct(",")) {
+          next();
+          return parse_operand();
+        }
+        const WmmaGeom g = wmma_geom(f, shape, t);
+        return Operand{ImmInt{static_cast<int64_t>(lay == MatLayout::Row ? g.cols : g.rows)}};
+      };
+      if (kind == "load") {
+        if (frag != 'a' && frag != 'b' && frag != 'c') return unsupported("wmma.load needs .a, .b or .c");
+        if (types.size() != 1) return unsupported("wmma.load takes one element type");
+        const WmmaType t = types[0];
+        if (frag == 'c' ? !acc_ok(t) : !ab_ok(t)) return unsupported("wmma.load of this type at this shape");
+        OpWmmaLoad op;
+        op.which = frag == 'a' ? OpWmmaLoad::Which::A : frag == 'b' ? OpWmmaLoad::Which::B : OpWmmaLoad::Which::C;
+        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
+        op.space = space;
+        op.shape = shape;
+        op.type = t;
+        if ((t == WmmaType::S4 || t == WmmaType::U4 || t == WmmaType::B1) &&
+            op.layout != (frag == 'a' ? MatLayout::Row : MatLayout::Col))
+          return unsupported("sub-byte and single-bit wmma loads A row-major and B column-major");
+        // The layouts this simulator has always used stay as they were.
+        if (frag == 'c') op.generic = !(legacy_shape && t == WmmaType::F32);
+        else op.generic = !((shape == WmmaShape{16, 16, 16} && (t == WmmaType::F16 || t == WmmaType::BF16)) ||
+                            t == WmmaType::TF32);
+        op.f32 = frag == 'c';
+        op.elem = t == WmmaType::BF16 ? WmmaElem::BF16 : t == WmmaType::TF32 ? WmmaElem::TF32 : WmmaElem::F16;
+        op.dsts = parse_reg_vector_any();
+        if (!arity(frag, t, op.dsts.size()))
+          return unsupported("wmma.load fragment arity (expected " +
+                             std::to_string(wmma_geom(frag, shape, t).regs) + " registers)");
+        expect_punct(",");
+        op.addr = parse_addr(fn);
+        op.stride = stride_or_default(frag, t, op.layout);
+        ins.op = op;
+      } else if (kind == "store") {
+        if (frag != 'd') return unsupported("wmma.store stores .d");
+        if (types.size() != 1 || !acc_ok(types[0])) return unsupported("wmma.store of this type at this shape");
+        OpWmmaStore op;
+        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
+        op.space = space;
+        op.shape = shape;
+        op.type = types[0];
+        op.generic = !(legacy_shape && op.type == WmmaType::F32);
+        op.addr = parse_addr(fn);
+        expect_punct(",");
+        for (auto& r : parse_reg_vector_any()) op.src.push_back(Operand{RegOperand{r}});
+        if (!arity('d', op.type, op.src.size()))
+          return unsupported("wmma.store fragment arity (expected " +
+                             std::to_string(wmma_geom('d', shape, op.type).regs) + " registers)");
+        op.stride = stride_or_default('d', op.type, op.layout);
+        ins.op = op;
+      } else if (kind == "mma") {
         if (layouts.size() != 2) return unsupported("wmma.mma needs both A and B layouts");
         OpWmmaMma op;
         op.alayout = layouts[0];
         op.blayout = layouts[1];
+        op.shape = shape;
+        // f16 multiplicands leave their type implicit: .dtype.ctype only.
+        if (types.size() == 2) {
+          op.dtype = types[0];
+          op.atype = op.btype = WmmaType::F16;
+          op.ctype = types[1];
+        } else if (types.size() == 4) {
+          op.dtype = types[0];
+          op.atype = types[1];
+          op.btype = types[2];
+          op.ctype = types[3];
+        } else if (types.size() == 3) {
+          // .dtype.atype.btype with the accumulator left off, which the parser
+          // has always taken to mean ctype = dtype (every non-f16 form has
+          // them equal anyway).
+          op.dtype = op.ctype = types[0];
+          op.atype = types[1];
+          op.btype = types[2];
+        } else {
+          return unsupported("wmma.mma types (.dtype.ctype, or .dtype.atype.btype.ctype)");
+        }
+        const WmmaType at = op.atype;
+        const bool fp16 = at == WmmaType::F16, integer = at == WmmaType::S8 || at == WmmaType::U8 ||
+                                                   at == WmmaType::S4 || at == WmmaType::U4;
+        if (!ab_ok(at) || op.btype != at) return unsupported("wmma.mma: A and B must have the same type, valid for the shape");
+        const bool acc_valid =
+            fp16 ? (op.dtype == WmmaType::F16 || op.dtype == WmmaType::F32) &&
+                       (op.ctype == WmmaType::F16 || op.ctype == WmmaType::F32)
+            : at == WmmaType::F64 ? op.dtype == WmmaType::F64 && op.ctype == WmmaType::F64
+            : (at == WmmaType::BF16 || at == WmmaType::TF32) ? op.dtype == WmmaType::F32 && op.ctype == WmmaType::F32
+                                                             : op.dtype == WmmaType::S32 && op.ctype == WmmaType::S32;
+        if (!acc_valid) return unsupported("wmma.mma accumulator types for these multiplicands");
+        if (satfinite && !integer && at != WmmaType::B1)
+          return unsupported("wmma.mma .satfinite is for integer multiplicands (removed for floating point in PTX 6.5)");
+        if (at == WmmaType::B1) {
+          if (!popc || b1_and == b1_xor) return unsupported("single-bit wmma.mma needs .xor.popc or .and.popc");
+          if (satfinite) return unsupported("single-bit wmma.mma has no .satfinite");
+        } else if (popc || b1_and || b1_xor) {
+          return unsupported(".popc is for single-bit wmma.mma");
+        }
+        if (rnd != FRound::Nearest && at != WmmaType::F64) return unsupported("a rounding mode on a non-f64 wmma.mma");
+        if ((at == WmmaType::S4 || at == WmmaType::U4 || at == WmmaType::B1) &&
+            (op.alayout != MatLayout::Row || op.blayout != MatLayout::Col))
+          return unsupported("sub-byte and single-bit wmma.mma is .row.col");
+        op.satfinite = satfinite;
+        op.b1_and = b1_and;
+        op.rnd = rnd;
+        op.generic = !((shape == WmmaShape{16, 16, 16} && (fp16 || at == WmmaType::BF16) &&
+                        op.ctype == WmmaType::F32 && op.dtype == WmmaType::F32) ||
+                       at == WmmaType::TF32);
+        op.elem = at == WmmaType::BF16 ? WmmaElem::BF16 : at == WmmaType::TF32 ? WmmaElem::TF32 : WmmaElem::F16;
         op.d = parse_reg_vector_any();
         expect_punct(",");
         op.a = parse_reg_vector_any();
@@ -1644,51 +1829,9 @@ class Parser {
         op.b = parse_reg_vector_any();
         expect_punct(",");
         op.c = parse_reg_vector_any();
-        op.elem = elem;
-        // f16 fragments duplicate the matrix across the warp and take 8
-        // registers; bf16 does not and takes 4. The accumulator is 8 either
-        // way, being 16x16 f32 over 32 lanes.
-        const size_t ab = elem == WmmaElem::F16 ? 8u : 4u;
-        if (op.d.size() != 8 || op.c.size() != 8 || op.a.size() != ab || op.b.size() != ab)
-          return unsupported("wmma.mma fragment arity (expected " + std::to_string(ab) +
-                             " A/B registers and 8 accumulator registers)");
-        ins.op = op;
-      } else if (kind == "store") {
-        OpWmmaStore op;
-        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
-        op.space = space;
-        op.addr = parse_addr(fn);
-        expect_punct(",");
-        {
-          std::vector<Reg> regs = parse_reg_vector_any();
-          for (auto& r : regs) op.src.push_back(Operand{RegOperand{r}});
-        }
-        if (op.src.size() != 8) return unsupported("wmma.store fragment arity");
-        expect_punct(",");
-        op.stride = parse_operand();
-        ins.op = op;
-      } else if (kind == "load") {
-        OpWmmaLoad op;
-        if (frag == 'a') op.which = OpWmmaLoad::Which::A;
-        else if (frag == 'b') op.which = OpWmmaLoad::Which::B;
-        else if (frag == 'c') op.which = OpWmmaLoad::Which::C;
-        else return unsupported("wmma.load without an a/b/c fragment selector");
-        op.f32 = saw_f32;
-        if (op.which == OpWmmaLoad::Which::C && !op.f32)
-          return unsupported("wmma.load.c with an f16 accumulator (only .f32 is implemented)");
-        if (op.which != OpWmmaLoad::Which::C && op.f32)
-          return unsupported("wmma.load.a/.b with f32 elements (only .f16 is implemented)");
-        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
-        op.space = space;
-        op.elem = elem;
-        op.dsts = parse_reg_vector_any();
-        const size_t want = (op.which == OpWmmaLoad::Which::C || elem == WmmaElem::F16) ? 8u : 4u;
-        if (op.dsts.size() != want)
-          return unsupported("wmma.load fragment arity (expected " + std::to_string(want) + ")");
-        expect_punct(",");
-        op.addr = parse_addr(fn);
-        expect_punct(",");
-        op.stride = parse_operand();
+        if (!arity('a', op.atype, op.a.size()) || !arity('b', op.btype, op.b.size()) ||
+            !arity('c', op.ctype, op.c.size()) || !arity('d', op.dtype, op.d.size()))
+          return unsupported("wmma.mma fragment arity for this shape and these types");
         ins.op = op;
       } else {
         return unsupported("wmma." + kind + " is not implemented (only .load, .mma and .store.d)");
@@ -1821,12 +1964,14 @@ class Parser {
       ins.op = op;
     } else if (op0 == "mma") {
       // mma.sync.aligned.m16n8kK.row.col.<d>.<a>.<b>.<c>
+      // mma.sp[::ordered_metadata].sync.aligned.m16n8kK.row.col.<d>.<a>.<b>.<c> d, a, b, c, e, f
       uint32_t k = 0;
       std::vector<std::string> types;
-      bool row_col = false, saw_row = false;
+      bool row_col = false, saw_row = false, sparse = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "sync" || p == "aligned") ;
+        else if (p == "sp" || p == "sp::ordered_metadata") sparse = true;
         else if (p == "row") saw_row = true;
         else if (p == "col") { if (saw_row) row_col = true; }
         else if (p == "m16n8k8") k = 8;
@@ -1852,6 +1997,10 @@ class Parser {
       if (types[1] != types[2]) return unsupported("mma with mixed A and B types");
       op.acc_f16 = types[0] == "f16";
       op.acc_int = types[0] == "s32";
+      if (sparse && op.ab_type != MmaElem::F16 && op.ab_type != MmaElem::BF16)
+        return unsupported("mma.sp with ." + at + " (only .f16 and .bf16 sparse A are implemented)");
+      if (sparse && k == 8) return unsupported("mma.sp.m16n8k8 (f16/bf16 sparse A is k16 or k32)");
+      op.sparse = sparse;
       op.d = parse_reg_vector_any();
       expect_punct(",");
       op.a = parse_reg_vector_any();
@@ -1859,6 +2008,15 @@ class Parser {
       op.b = parse_reg_vector_any();
       expect_punct(",");
       op.c = parse_reg_vector_any();
+      if (sparse) {
+        expect_punct(",");
+        op.meta = parse_operand();
+        expect_punct(",");
+        op.selector = parse_operand();
+        const auto* sel = std::get_if<ImmInt>(&op.selector);
+        if (!sel || sel->value < 0 || sel->value > 1)
+          return unsupported("mma.sp's sparsity selector is an immediate 0 or 1 for .f16/.bf16");
+      }
       if (op.d.size() != op.c.size()) return unsupported("mma D and C arity differ");
       ins.op = op;
     } else if (op0 == "wgmma") {
@@ -2042,13 +2200,20 @@ class Parser {
       expect_punct(",");
       op.b = parse_operand();
       ins.op = op;
-    } else if (op0 == "dp4a") {
+    } else if (op0 == "dp4a" || op0 == "dp2a") {
       // dp4a.atype.btype d, a, b, c
-      if (parts.size() != 3) return unsupported("dp4a form");
-      const bool as = parts[1] == "s32", au = parts[1] == "u32";
-      const bool bs = parts[2] == "s32", bu = parts[2] == "u32";
-      if ((!as && !au) || (!bs && !bu)) return unsupported("dp4a operand types");
+      // dp2a.{lo,hi}.atype.btype d, a, b, c
       OpDp4a op;
+      op.two = op0 == "dp2a";
+      const size_t t = op.two ? 2 : 1;
+      if (parts.size() != t + 2) return unsupported(op0 + " form");
+      if (op.two) {
+        if (parts[1] != "lo" && parts[1] != "hi") return unsupported("dp2a needs .lo or .hi");
+        op.hi = parts[1] == "hi";
+      }
+      const bool as = parts[t] == "s32", au = parts[t] == "u32";
+      const bool bs = parts[t + 1] == "s32", bu = parts[t + 1] == "u32";
+      if ((!as && !au) || (!bs && !bu)) return unsupported(op0 + " operand types");
       op.a_signed = as;
       op.b_signed = bs;
       op.dst = expect_reg_operand("dp4a destination");
@@ -3533,6 +3698,11 @@ class Parser {
   std::string current_kernel_;
   std::set<std::string> call_slots_;
   std::set<std::string> declared_regs_;  // every .reg name in the current kernel
+  // Registers declared inside a nested { } block that shadow an outer
+  // declaration, innermost block last: source name -> the name it is interned
+  // under while the block is open.
+  std::vector<std::unordered_map<std::string, std::string>> reg_scopes_;
+  int shadow_count_ = 0;
   EntryFn* cur_fn_ = nullptr;           // receives interned register ids
 };
 
