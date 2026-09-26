@@ -603,6 +603,34 @@ VTEST(mma_sp_matches_hardware) {
     for (int j = 0; j < 20; ++j) VCHECK_EQ(d[l * 20 + j], static_cast<float>(want[l][j]));
 }
 
+// The mma.sp and cvt.pack forms that are not implemented are refused by name
+// at parse time, never run as something else.
+VTEST(sparse_mma_and_cvt_pack_refuse_what_they_do_not_implement) {
+  auto parse_one = [](const std::string& body) {
+    const std::string ptx = std::string(R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k()
+{
+  .reg .b32 %r<20>;
+  .reg .f32 %f<8>;
+)") + body + "\n  ret;\n}\n";
+    return VCAPTURE(Error, ptx::parse(ptx));
+  };
+  VCHECK_CONTAINS(parse_one("mma.sp::ordered_metadata.sync.aligned.m16n8k64.row.col.s32.s8.s8.s32 "
+                            "{%r0,%r1,%r2,%r3}, {%r4,%r5,%r6,%r7}, {%r8,%r9,%r10,%r11}, "
+                            "{%r12,%r13,%r14,%r15}, %r16, 0x0;").message(),
+                  "mma.sp");
+  VCHECK_CONTAINS(parse_one("mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32 "
+                            "{%f0,%f1,%f2,%f3}, {%r4,%r5,%r6,%r7}, {%r8,%r9,%r10,%r11}, "
+                            "{%f4,%f5,%f6,%f7}, %r16, 0x2;").message(),
+                  "selector");
+  VCHECK_CONTAINS(parse_one("cvt.pack.sat.s8.s32 %r0, %r1, %r2;").message(), "cvt.pack");
+  VCHECK_CONTAINS(parse_one("cvt.pack.sat.s16.s32.b32 %r0, %r1, %r2, %r3;").message(), "cvt.pack");
+  VCHECK_CONTAINS(parse_one("cvt.pack.sat.u32.s32.b32 %r0, %r1, %r2, %r3;").message(), "cvt.pack");
+}
+
 VTEST(wmma_m16n16k16_matmul) {
   // Fill A with 2.0 and B with 3.0 (every element), C with 0. Then every
   // element of D must be sum over k=0..15 of 2*3 = 96. This is the shape
