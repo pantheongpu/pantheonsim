@@ -50,6 +50,14 @@ hsa_status_t fail(hsa_status_t status, const std::string& what) {
   return status;
 }
 
+// An attribute this does not answer, named, so a program's failed query says
+// which it was.
+hsa_status_t unknown(const char* call, int attribute) {
+  char hex[16];
+  std::snprintf(hex, sizeof hex, "0x%x", attribute);
+  return fail(HSA_STATUS_ERROR_INVALID_ARGUMENT, std::string(call) + ": attribute " + hex + " is not one this answers");
+}
+
 // ---- Agents -----------------------------------------------------------------
 //
 // Handles: the CPU is agent 1; GPU i is 0x100 + i. A pool or region is its
@@ -411,7 +419,17 @@ hsa_status_t hsa_system_get_info(hsa_system_info_t attribute, void* value) {
     case HSA_SYSTEM_INFO_ENDIANNESS: put<uint32_t>(value, HSA_ENDIANNESS_LITTLE); break;
     case HSA_SYSTEM_INFO_MACHINE_MODEL: put<uint32_t>(value, HSA_MACHINE_MODEL_LARGE); break;
     case HSA_SYSTEM_INFO_EXTENSIONS: std::memset(value, 0, 128); break;
-    default: return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    case HSA_AMD_SYSTEM_INFO_BUILD_VERSION: put<const char*>(value, "VirtualGPU"); break;
+    case HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED:
+    case HSA_AMD_SYSTEM_INFO_SVM_ACCESSIBLE_BY_DEFAULT:
+    case HSA_AMD_SYSTEM_INFO_MWAITX_ENABLED:
+    case HSA_AMD_SYSTEM_INFO_DMABUF_SUPPORTED:
+    case HSA_AMD_SYSTEM_INFO_VIRTUAL_MEM_API_SUPPORTED:
+    case HSA_AMD_SYSTEM_INFO_XNACK_ENABLED: put<bool>(value, false); break;
+    // The version of AMD's extensions this follows: ROCm 7.0's hsa_ext_amd.h.
+    case HSA_AMD_SYSTEM_INFO_EXT_VERSION_MAJOR: put<uint16_t>(value, 1); break;
+    case HSA_AMD_SYSTEM_INFO_EXT_VERSION_MINOR: put<uint16_t>(value, 11); break;
+    default: return unknown("hsa_system_get_info", attribute);
   }
   return HSA_STATUS_SUCCESS;
 }
@@ -507,7 +525,38 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
       put<uint64_t>(value, is_gpu ? shared::profile(gpu).vram_bytes : 0);
       break;
     case HSA_AMD_AGENT_INFO_TIMESTAMP_FREQUENCY: put<uint64_t>(value, 1000000000); break;
-    default: return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    // The rest of what AMD's runtime reports, as an MI300X-class part has it
+    // where the profile does not say: eight compute dies (XCCs) of four
+    // shader engines, HBM3 8192 bits wide at 1300 MHz.
+    case HSA_AMD_AGENT_INFO_MAX_ADDRESS_WATCH_POINTS: put<uint32_t>(value, is_gpu ? 4 : 0); break;
+    case HSA_AMD_AGENT_INFO_MEMORY_WIDTH: put<uint32_t>(value, is_gpu ? 8192 : 0); break;
+    case HSA_AMD_AGENT_INFO_MEMORY_MAX_FREQUENCY: put<uint32_t>(value, is_gpu ? 1300 : 0); break;
+    case HSA_AMD_AGENT_INFO_NUM_SHADER_ENGINES: put<uint32_t>(value, is_gpu ? 32 : 0); break;
+    case HSA_AMD_AGENT_INFO_NUM_SHADER_ARRAYS_PER_SE: put<uint32_t>(value, is_gpu ? 1 : 0); break;
+    case HSA_AMD_AGENT_INFO_HDP_FLUSH: std::memset(value, 0, 2 * sizeof(void*)); break;
+    case HSA_AMD_AGENT_INFO_ASIC_REVISION: put<uint32_t>(value, is_gpu ? 1 : 0); break;
+    case HSA_AMD_AGENT_INFO_COOPERATIVE_COMPUTE_UNIT_COUNT:
+      put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(shared::profile(gpu).limits.multiprocessors) : 0);
+      break;
+    case HSA_AMD_AGENT_INFO_ASIC_FAMILY_ID:
+    case HSA_AMD_AGENT_INFO_UCODE_VERSION:
+    case HSA_AMD_AGENT_INFO_SDMA_UCODE_VERSION:
+    case HSA_AMD_AGENT_INFO_DRIVER_UID: put<uint32_t>(value, 0); break;
+    case HSA_AMD_AGENT_INFO_NUM_SDMA_ENG: put<uint32_t>(value, is_gpu ? 2 : 0); break;
+    case HSA_AMD_AGENT_INFO_NUM_SDMA_XGMI_ENG: put<uint32_t>(value, 0); break;
+    case HSA_AMD_AGENT_INFO_IOMMU_SUPPORT: put<uint32_t>(value, 0); break;   // HSA_IOMMU_SUPPORT_NONE
+    case HSA_AMD_AGENT_INFO_NUM_XCC: put<uint32_t>(value, is_gpu ? 8 : 0); break;
+    case HSA_AMD_AGENT_INFO_NEAREST_CPU: put<hsa_agent_t>(value, {kCpuAgent}); break;
+    case HSA_AMD_AGENT_INFO_MEMORY_PROPERTIES:
+    case HSA_AMD_AGENT_INFO_AQL_EXTENSIONS: std::memset(value, 0, 8); break;
+    case HSA_AMD_AGENT_INFO_SCRATCH_LIMIT_MAX:
+    case HSA_AMD_AGENT_INFO_SCRATCH_LIMIT_CURRENT: put<uint64_t>(value, is_gpu ? uint64_t{1} << 32 : 0); break;
+    case HSA_AMD_AGENT_INFO_CLOCK_COUNTERS: {
+      const uint64_t t = now_ns();
+      put(value, hsa_amd_clock_counters_t{t, t, t, 1000000000});
+      break;
+    }
+    default: return unknown("hsa_agent_get_info", attribute);
   }
   return HSA_STATUS_SUCCESS;
 }
@@ -559,7 +608,7 @@ hsa_status_t hsa_isa_get_info_alt(hsa_isa_t isa, hsa_isa_info_t attribute, void*
     case HSA_ISA_INFO_GRID_MAX_DIM: put(value, hsa_dim3_t{UINT32_MAX, UINT32_MAX, UINT32_MAX}); break;
     case HSA_ISA_INFO_GRID_MAX_SIZE: put<uint64_t>(value, UINT64_MAX); break;
     case HSA_ISA_INFO_FBARRIER_MAX_SIZE: put<uint32_t>(value, 32); break;
-    default: return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    default: return unknown("hsa_isa_get_info_alt", attribute);
   }
   return HSA_STATUS_SUCCESS;
 }
@@ -789,7 +838,7 @@ hsa_status_t hsa_amd_memory_pool_get_info(hsa_amd_memory_pool_t pool, hsa_amd_me
     case HSA_AMD_MEMORY_POOL_INFO_LOCATION:
       put<uint32_t>(value, device ? HSA_AMD_MEMORY_POOL_LOCATION_GPU : HSA_AMD_MEMORY_POOL_LOCATION_CPU);
       break;
-    default: return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    default: return unknown("hsa_amd_memory_pool_get_info", attribute);
   }
   return HSA_STATUS_SUCCESS;
 }
@@ -810,7 +859,7 @@ hsa_status_t hsa_amd_agent_memory_pool_get_info(hsa_agent_t agent, hsa_amd_memor
                                : HSA_AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT);
       break;
     case HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS: put<uint32_t>(value, own ? 0 : 1); break;
-    default: return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    default: return unknown("hsa_amd_agent_memory_pool_get_info", attribute);
   }
   return HSA_STATUS_SUCCESS;
 }
@@ -1182,7 +1231,7 @@ hsa_status_t hsa_executable_symbol_get_info(hsa_executable_symbol_t symbol, hsa_
       if (!kernel) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
       put<bool>(value, false);
       break;
-    default: return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    default: return unknown("hsa_executable_symbol_get_info", attribute);
   }
   return HSA_STATUS_SUCCESS;
 }
