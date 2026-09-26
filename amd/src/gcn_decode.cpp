@@ -997,6 +997,9 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table_gfx90a() {
   return t;
 }
 
+// Whether the instruction being decoded is the product half of a scaled one.
+thread_local bool g_scaled_product = false;
+
 // The table decode() looks in: the target's, for the instruction being decoded.
 thread_local const std::map<std::pair<Enc, uint32_t>, Shape>* g_table = nullptr;
 
@@ -1302,6 +1305,29 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
       in.src.push_back(vgpr((w0 >> 9) & 0xFF, s.src_width(1)));
     }
+  } else if ((w0 >> 23) == 0x1a7 && ((w0 >> 16) & 0x7F) == 0x2c) {
+    // gfx950's scaled matrix instructions: a load-scale prefix -- A's scale in
+    // SRC0, B's in SRC1, {OP_SEL_HI, OP_SEL} choosing a byte of each -- then
+    // the f8f6f4 product as a VOP3P of its own, ABID bit 0 set. One
+    // instruction of 16 bytes.
+    const uint32_t w1 = word(code, at + 4);
+    struct Inner {
+      Inner() { g_scaled_product = true; }
+      ~Inner() { g_scaled_product = false; }
+    } inner;
+    Inst product = decode_one(code, at + 8, pc);
+    if (product.name.find("f8f6f4") == std::string::npos)
+      throw Error::make(Err::Unsupported, "a load-scale prefix before ", product.name, ", which takes no scales");
+    product.name = "v_mfma_scale_" + product.name.substr(std::string("v_mfma_").size());
+    product.src.push_back(take(w1 & 0x1FF, 1));
+    product.src.push_back(take((w1 >> 9) & 0x1FF, 1));
+    const uint32_t op_sel = (w0 >> 11) & 3, op_sel_hi = (w1 >> 27) & 3;
+    product.scale_sel = static_cast<uint8_t>(((op_sel & 1) | (op_sel_hi & 1) << 1) |
+                                             ((op_sel >> 1) | (op_sel_hi >> 1) << 1) << 2);
+    product.scaled = true;
+    product.pc = pc;
+    product.size = 16;
+    return product;
   } else if ((w0 >> 23) == 0x1a7) {   // VOP3P: the packed forms
     in.enc = Enc::Vop3p;
     in.opcode = (w0 >> 16) & 0x7F;
@@ -1319,7 +1345,9 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       const uint32_t cbsz = (w0 >> 8) & 0x7, abid = (w0 >> 11) & 0xF, acc_cd = (w0 >> 15) & 1;
       const uint32_t acc = (w1 >> 27) & 0x3, blgp = (w1 >> 29) & 0x7;
       const bool formats = in.name.find("f8f6f4") != std::string::npos;
-      if (formats && (cbsz > 4 || blgp > 4 || abid))
+      // ABID bit 0 marks the product half of a scaled instruction, and is
+      // only that there.
+      if (formats && (cbsz > 4 || blgp > 4 || abid != (g_scaled_product ? 1u : 0u)))
         throw Error::make(Err::Unsupported, in.name, " with source formats ", cbsz, " and ", blgp,
                           ", which are not ones the instruction has");
       if (!formats && (cbsz || abid || blgp))
@@ -1735,6 +1763,11 @@ std::string to_text(const Inst& i) {
     std::snprintf(m, sizeof m, " row_mask:0x%x bank_mask:0x%x", i.row_mask, i.bank_mask);
     s += " " + dpp_control_text(i.dpp_ctrl) + m;
     if (i.bound_ctrl) s += " bound_ctrl:1";
+  }
+  if (i.scaled) {
+    const uint32_t a = i.scale_sel & 3, b = i.scale_sel >> 2;
+    if ((a & 1) || (b & 1)) s += " op_sel:[" + std::to_string(a & 1) + "," + std::to_string(b & 1) + ",0]";
+    s += " op_sel_hi:[" + std::to_string(a >> 1) + "," + std::to_string(b >> 1) + ",0]";
   }
   if (i.cbsz) s += " cbsz:" + std::to_string(i.cbsz);
   if (i.blgp) s += " blgp:" + std::to_string(i.blgp);

@@ -1462,16 +1462,21 @@ struct Machine {
       // the lower 32 of the second; or, 16 lanes to a row, each odd row of
       // the first with the even row before it in the second. A pair is
       // swapped where both its lanes are on.
+      // Every lane, whatever EXEC says, as the ISA's pseudocode has it.
       const bool rows32 = op.find("permlane32") != std::string::npos;
       auto& d = w.vgpr[in.dst[0].index];
       auto& v = w.vgpr[in.src[0].index];
       for (uint32_t lane = 0; lane < kLanes; ++lane) {
         const bool first = rows32 ? lane >= 32 : (lane / 16) % 2 == 1;
-        if (!first) continue;
-        const uint32_t other = rows32 ? lane - 32 : lane - 16;
-        if (!(w.exec >> lane & 1) || !(w.exec >> other & 1)) continue;
-        std::swap(d[lane], v[other]);
+        if (first) std::swap(d[lane], v[rows32 ? lane - 32 : lane - 16]);
       }
+    } else if (op == "v_prng_b32_e32"_op || op == "v_prng_b32_e64"_op) {
+      // One step of the LFSR the CDNA4 ISA gives: shift left, and where the
+      // top bit fell off, fold in 197.
+      each([&](uint32_t lane) {
+        const uint32_t x = lane_src(w, in.src[0], lane);
+        write_lane(w, in.dst[0], lane, (x << 1) ^ (x >> 31 ? 197u : 0u));
+      });
     } else if (op == "v_cvt_f32_bf16_e32"_op || op == "v_cvt_f32_bf16_e64"_op) {
       // gfx950: a bfloat16 (the low half, or the high one op_sel names) as
       // the float it is the top half of.
@@ -3487,7 +3492,8 @@ struct Machine {
     }
   }
   void matrix_multiply(Wave& w, const Inst& in) {
-    const MatrixShape* shape = matrix_shape(OpName(in.name));
+    const MatrixShape* shape =
+        matrix_shape(OpName(in.scaled ? "v_mfma_" + in.name.substr(std::string("v_mfma_scale_").size()) : in.name));
     if (!shape) throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
     const MatrixShape& s = *shape;
     if (w.exec != ~uint64_t{0})
@@ -3538,11 +3544,23 @@ struct Machine {
     const auto A = [&](uint32_t bl, uint32_t i, uint32_t k) -> double& { return a[(size_t{bl} * s.m + i) * s.k + k]; };
     const auto B = [&](uint32_t bl, uint32_t k, uint32_t j) -> double& { return b[(size_t{bl} * s.k + k) * s.n + j]; };
     const auto C = [&](uint32_t bl, uint32_t i, uint32_t j) -> double& { return c[(size_t{bl} * s.m + i) * s.n + j]; };
+    // gfx950's scaled forms: each lane's A and B values are its one row (or
+    // column) and one block of 32 along K, and are scaled by 2^(e - 127),
+    // e the E8M0 byte of the lane's scale register its selector names -- or
+    // an inline float constant's exponent. 0xFF is the format's NaN.
+    const auto scale_of = [&](const Operand& o, uint32_t sel, uint32_t lane) -> double {
+      const uint32_t e = o.kind == OperandKind::InlineFloat
+                             ? (as_bits(static_cast<float>(o.fvalue)) >> 23) & 0xFF
+                             : (lane_src(w, o, lane) >> (8 * sel)) & 0xFF;
+      return e == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, static_cast<int>(e) - 127);
+    };
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const uint32_t bl = lane / lanes_per_block, within = lane % lanes_per_block, g = within / s.m;
+      const double sa = in.scaled ? scale_of(in.src[3], in.scale_sel & 3, lane) : 1.0;
+      const double sb = in.scaled ? scale_of(in.src[4], in.scale_sel >> 2, lane) : 1.0;
       for (uint32_t e = 0; e < per_lane; ++e) {
-        A(bl, within % s.m, g * per_lane + e) = value(in.src[0], s.in, e, lane);
-        B(bl, g * per_lane + e, within % s.n) = value(in.src[1], s.in_b ? s.in_b : s.in, e, lane);
+        A(bl, within % s.m, g * per_lane + e) = value(in.src[0], s.in, e, lane) * sa;
+        B(bl, g * per_lane + e, within % s.n) = value(in.src[1], s.in_b ? s.in_b : s.in, e, lane) * sb;
       }
       for (uint32_t r = 0; r < outs; ++r) {
         uint32_t ob = 0, row = 0;

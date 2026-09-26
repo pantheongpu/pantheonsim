@@ -53,6 +53,9 @@ echo "wrote $(pwd)/streams.gfx942"
 # The same for gfx950, whose 8-bit floats are the OCP formats.
 "$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_FP8_OCP --offload-arch=gfx950 fp8.cpp -o fp8.gfx950
 echo "wrote $(pwd)/fp8.gfx942 and fp8.gfx950"
+# gfx950's block-scaled matrix instructions, v_prng_b32 and the lane swaps.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx950 gfx950.cpp -o gfx950.gfx950
+echo "wrote $(pwd)/gfx950.gfx950"
 
 # The device code alone, for the decoder and the executor to be checked
 # against, and the listing of it from the same toolchain's llvm-objdump.

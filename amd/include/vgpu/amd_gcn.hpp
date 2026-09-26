@@ -84,6 +84,12 @@ struct Inst {
   // encoding keeps where the others' broadcast controls are (CBSZ, BLGP):
   // 0 fp8, 1 bf8, 2 fp6 (E2M3), 3 bf6 (E3M2), 4 fp4 (E2M1).
   uint8_t cbsz = 0, blgp = 0;
+  // gfx950's scaled matrix instructions (v_mfma_scale_*): 16 bytes, a
+  // load-scale prefix then the product. Sources 3 and 4 are A's and B's E8M0
+  // scales, and scale_sel which byte of each register (bits 0-1 A's, 2-3 B's):
+  // {OP_SEL_HI, OP_SEL} of the prefix, per source.
+  bool scaled = false;
+  uint8_t scale_sel = 0;
   // The processor it was decoded for, which names some instructions and
   // cache bits otherwise when it is printed (gfx90a's glc, slc and scc).
   Target arch = Target::Gfx942;
