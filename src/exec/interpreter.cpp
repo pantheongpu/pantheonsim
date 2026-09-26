@@ -20,6 +20,7 @@
 //    barriers or retirement. Blocks run sequentially in a fixed order.
 //    Everything is deterministic by construction.
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -4534,6 +4535,15 @@ class Interpreter {
     return it->second;
   }
 
+  // The address mode a fetch actually uses. Wrap and mirror are defined only
+  // for normalized coordinates; with unnormalized ones a real GPU (measured on
+  // an RTX 3060, point and linear alike) clamps instead.
+  static TexAddress effective_address(const TextureDesc& d, uint32_t axis) {
+    const TexAddress a = d.address[axis];
+    if (!d.normalized_coords && (a == TexAddress::Wrap || a == TexAddress::Mirror)) return TexAddress::Clamp;
+    return a;
+  }
+
   // Applies the addressing mode. Returns false when the texel is outside and
   // the mode says to produce the border colour rather than clamp to an edge.
   static bool wrap_coord(TexAddress mode, int64_t v, uint32_t size, uint32_t* out) {
@@ -4611,41 +4621,461 @@ class Interpreter {
     return static_cast<uint32_t>(sv);
   }
 
+  // ---- linear filtering ----
+  //
+  // The CUDA programming guide gives the formula -- tex(x) = (1-a)T[i] +
+  // aT[i+1] with x_B = x - 0.5, i = floor(x_B), a = frac(x_B) held in 9-bit
+  // fixed point with 8 fractional bits -- and the rest was measured on an RTX
+  // 3060 (sm_86), sample by sample, until every result matched to the bit:
+  //
+  //  - a rounds to the nearest 1/256, halves up; a = 256 carries into i.
+  //  - Normalized coordinates scale by the size in f32 first. In clamp mode
+  //    the coordinate is clamped to [0.5, size - 0.5] before x_B is formed,
+  //    which only shows in 3D, where the weights of two clamped-together
+  //    texels are rounded separately.
+  //  - A 1D texture is a 2D one of height 1 sampled at y = 0, so in border
+  //    mode half of every result comes from the border row.
+  //  - The 8 (or 4) weights are integers summing to 256, split one axis at a
+  //    time -- z, then x, then y -- each split rounding half up. The y split
+  //    rounds the upper part on the x = 1 side and the lower part on the x = 0
+  //    side; in 2D that is w11 = round(a*b/256), w10 = a - w11, w01 = b - w11.
+  //  - The sum of weight x texel is exact, then rounded once: to f32 (or to
+  //    f16 for a half texture), ties away from zero. 8- and 16-bit unsigned
+  //    normalized texels are filtered as 16-bit integers (an 8-bit u is u*257)
+  //    and 16-bit signed ones as themselves, rounded half up and read out as
+  //    K/65535 or K/32767 (clamped to -32767 after the blend).
+  //
+  // Signed 8-bit normalized texels are refused: their result is a function of
+  // the blended sum alone, but not one this could reproduce, and a filter that
+  // is off by one step in a few percent of samples is the difference testing
+  // exists to catch.
+
+  static int tex_round_half_up(int64_t num, int64_t den) {   // floor(num/den + 1/2)
+    const int64_t t = 2 * num + den, d = 2 * den;
+    return static_cast<int>(t >= 0 ? t / d : -((-t + d - 1) / d));
+  }
+
+  // The weight splits, as measured (see above). f[] are the 8-bit fractions
+  // along x, y, z; w[] is indexed x + 2y + 4z.
+  static void tex_weights(uint32_t dims, const int f[3], int w[8], int total = 256) {
+    auto split = [](int total, int frac, bool round_upper, int* lo, int* hi) {
+      if (round_upper) { *hi = tex_round_half_up(int64_t{total} * frac, 256); *lo = total - *hi; }
+      else { *lo = tex_round_half_up(int64_t{total} * (256 - frac), 256); *hi = total - *lo; }
+    };
+    for (int i = 0; i < 8; ++i) w[i] = 0;
+    if (dims == 1) {
+      split(total, f[0], true, &w[0], &w[1]);
+      return;
+    }
+    // A mip level's share of the weight (total < 256) is split the same way,
+    // z first when there is one, rounding the lower slice's part (measured on
+    // 3D mipmaps; for the full 256 the split is exact either way).
+    int z0 = total, z1 = 0;
+    if (dims == 3) split(total, f[2], false, &z0, &z1);
+    const int zslices = dims == 3 ? 2 : 1;
+    for (int dz = 0; dz < zslices; ++dz) {
+      const int tz = dz ? z1 : z0;
+      int x0, x1;
+      split(tz, f[0], true, &x0, &x1);
+      for (int dx = 0; dx < 2; ++dx) {
+        int y0, y1;
+        split(dx ? x1 : x0, f[1], dx == 1, &y0, &y1);
+        w[dx + 4 * dz] = y0;
+        w[dx + 2 + 4 * dz] = y1;
+      }
+    }
+  }
+
+  // Exact sum of up to eight (weight x value) terms, as a non-overlapping
+  // expansion (Shewchuk's TwoSum): each product of a 9-bit weight and a float
+  // is exact in a double, and the expansion keeps every bit of their sum.
+  struct ExactSum {
+    std::array<double, 20> e{};
+    int n = 0;
+    void add(double x) {
+      int k = 0;
+      for (int i = 0; i < n; ++i) {
+        const double s = x + e[i], bb = s - x, err = (x - (s - bb)) + (e[i] - bb);
+        x = s;
+        if (err != 0) e[k++] = err;
+      }
+      e[k++] = x;
+      n = k;
+    }
+    // The sign of (sum - v), exactly.
+    int compare(double v) const {
+      ExactSum t = *this;
+      t.add(-v);
+      for (int i = t.n - 1; i >= 0; --i)
+        if (t.e[i] != 0) return t.e[i] > 0 ? 1 : -1;
+      return 0;
+    }
+    double approx() const {
+      double s = 0;
+      for (int i = 0; i < n; ++i) s += e[i];
+      return s;
+    }
+  };
+
+  // Rounds the exact sum to f32, or to f16 when `half`, to nearest with ties
+  // away from zero, and returns the result as a float.
+  static float tex_round_sum(const ExactSum& sum, bool half) {
+    const double a = sum.approx();
+    auto next = [half](double v, int dir) -> double {   // the adjacent value in the format
+      if (half) {
+        const uint64_t hb = double_to_f16(v) & 0xFFFF;
+        const double c = f16_to_double(hb);
+        if (c != v) return c;   // v was not representable: nearest is already a neighbour
+        int64_t mag = hb & 0x7FFF;
+        const bool neg = hb & 0x8000;
+        if (mag == 0) return dir > 0 ? f16_to_double(0x0001) : f16_to_double(0x8001);
+        mag += ((dir > 0) != neg) ? 1 : -1;
+        return f16_to_double(static_cast<uint64_t>(mag) | (neg ? 0x8000u : 0u));
+      }
+      return static_cast<double>(std::nextafter(static_cast<float>(v), dir > 0 ? INFINITY : -INFINITY));
+    };
+    const double c = half ? f16_to_double(double_to_f16(a) & 0xFFFF) : static_cast<double>(static_cast<float>(a));
+    const int s = sum.compare(c);
+    if (s == 0) return static_cast<float>(c);
+    const double lo = s > 0 ? c : next(c, -1), hi = s > 0 ? next(c, +1) : c;
+    const int t = sum.compare(lo + (hi - lo) / 2);   // the midpoint is exact in a double
+    if (t < 0) return static_cast<float>(lo);
+    if (t > 0) return static_cast<float>(hi);
+    return static_cast<float>(std::fabs(lo) > std::fabs(hi) ? lo : hi);
+  }
+
+  // One texel's share of a filtered fetch, in 1/256ths: all the terms of a
+  // fetch sum to 256. A border term reads as zero.
+  struct TexTerm {
+    int w = 0;
+    uint64_t addr = 0;
+    bool border = false;
+  };
+
+  void tex_check_filterable(const Instr& ins, uint32_t lane, const TextureDesc& d) {
+    const uint32_t bits = d.channel_bits[0];
+    const bool is_float = d.kind == ChannelKind::Float && (bits == 32 || bits == 16);
+    const bool unorm = d.kind == ChannelKind::Unsigned && (bits == 8 || bits == 16) && d.read_as_normalized_float;
+    const bool snorm16 = d.kind == ChannelKind::Signed && bits == 16 && d.read_as_normalized_float;
+    if (!is_float && !unorm && !snorm16)
+      ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+               d.kind == ChannelKind::Signed && bits == 8
+                   ? "linear filtering of signed 8-bit normalized texels is not implemented: "
+                     "measured on hardware, the result is not the rounded weighted sum of the "
+                     "texels' 16-bit forms, and a filter that differs from the device in the last "
+                     "step would hide exactly what differential testing is for"
+                   : "linear filtering needs a float, half, or normalized 8/16-bit texture read as "
+                     "normalized float; this texture's format has no filtered form");
+    for (uint32_t ch = 1; ch < 4; ++ch)
+      if (d.channel_bits[ch] && d.channel_bits[ch] != bits)
+        ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+                 "linear filtering of a texture whose channels differ in width");
+  }
+
+  // The texels a linear filter reads and their weights, which sum to `total`.
+  int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[3], bool true_1d,
+                           int total, TexTerm* out) {
+    // A 1D texture filters as 2D, height 1, at y = 0 -- all but a layer of a
+    // 1D layered texture, which filters as 1D.
+    const uint32_t fdims = dims == 1 && !true_1d ? 2 : dims;
+    const uint32_t size[3] = {d.width, dims == 1 ? 1u : d.height, d.depth};
+    int base[3] = {0, 0, 0}, frac[3] = {0, 0, 0};
+    for (uint32_t i = 0; i < fdims; ++i) {
+      float x = i < dims ? coord[i] : 0.0f;
+      if (d.normalized_coords) x *= static_cast<float>(size[i]);
+      double v = x;
+      if (effective_address(d, i) == TexAddress::Clamp) v = std::clamp(v, 0.5, size[i] - 0.5);
+      const double xb = v - 0.5;
+      double fl = std::floor(xb);
+      int f = static_cast<int>(std::floor((xb - fl) * 256 + 0.5));
+      if (f >= 256) { fl += 1; f = 0; }
+      base[i] = static_cast<int>(fl);
+      frac[i] = f;
+    }
+    int w[8];
+    tex_weights(fdims, frac, w, total);
+    const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
+    const uint64_t plane = row * (d.height ? d.height : 1);
+    int n = 0;
+    for (int k = 0; k < (fdims == 3 ? 8 : fdims == 2 ? 4 : 2); ++k) {
+      if (w[k] == 0) continue;
+      uint32_t idx[3] = {0, 0, 0};
+      bool inside = true;
+      const int off[3] = {k & 1, (k >> 1) & 1, (k >> 2) & 1};
+      for (uint32_t i = 0; i < fdims; ++i)
+        if (!wrap_coord(effective_address(d, i), int64_t{base[i]} + off[i], size[i], &idx[i])) inside = false;
+      TexTerm& t = out[n++];
+      t.w = w[k];
+      t.border = !inside;
+      if (inside) t.addr = d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes;
+    }
+    return n;
+  }
+
+  // The one texel a point fetch at float coordinates reads, with the whole
+  // `total` weight (for a point-sampled level inside a linear mip blend).
+  int tex_footprint_point(const TextureDesc& d, uint32_t dims, const float coord[3], int total,
+                          TexTerm* out) {
+    const uint32_t size[3] = {d.width, d.height, d.depth};
+    uint32_t idx[3] = {0, 0, 0};
+    bool inside = true;
+    for (uint32_t i = 0; i < dims; ++i) {
+      float f = coord[i];
+      if (d.normalized_coords) f *= static_cast<float>(size[i]);
+      if (!wrap_coord(effective_address(d, i), static_cast<int64_t>(std::floor(f)), size[i], &idx[i])) inside = false;
+    }
+    const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
+    const uint64_t plane = row * (d.height ? d.height : 1);
+    out[0].w = total;
+    out[0].border = !inside;
+    out[0].addr = inside ? d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes : 0;
+    return 1;
+  }
+
+  // Sums weight x texel over the terms and rounds, by the format's rules.
+  void tex_finish(const Instr& ins, uint32_t lane, const TextureDesc& d, const TexTerm* terms, int n,
+                  uint32_t out[4]) {
+    const uint32_t bits = d.channel_bits[0];
+    const bool is_float = d.kind == ChannelKind::Float;
+    const bool unorm = d.kind == ChannelKind::Unsigned;
+    ExactSum fsum[4];
+    int64_t isum[4] = {0, 0, 0, 0};
+    for (int k = 0; k < n; ++k) {
+      if (terms[k].border || terms[k].w == 0) continue;
+      for (uint32_t ch = 0; ch < 4; ++ch) {
+        if (!d.channel_bits[ch]) continue;
+        const uint64_t raw = texel_channel_bits(d, terms[k].addr, ch, ins, lane);
+        if (is_float) {
+          const double t = bits == 32 ? static_cast<double>(f32(raw)) : f16_to_double(raw);
+          fsum[ch].add(terms[k].w * t);
+        } else if (unorm) {
+          isum[ch] += int64_t{terms[k].w} * static_cast<int64_t>(bits == 8 ? raw * 257 : raw);
+        } else {
+          isum[ch] += int64_t{terms[k].w} * static_cast<int16_t>(raw);
+        }
+      }
+    }
+    for (uint32_t ch = 0; ch < 4; ++ch) {
+      float r;
+      if (!d.channel_bits[ch]) {
+        r = ch == 3 ? 1.0f : 0.0f;
+      } else if (is_float) {
+        // Scaling by 1/256 is exact, so round the sum of weight x texel and
+        // divide after. A non-finite texel takes the plain arithmetic.
+        ExactSum scaled;
+        bool finite = true;
+        for (int i = 0; i < fsum[ch].n; ++i) {
+          if (!std::isfinite(fsum[ch].e[i])) finite = false;
+          scaled.add(fsum[ch].e[i] / 256);
+        }
+        r = finite ? tex_round_sum(scaled, bits == 16) : static_cast<float>(fsum[ch].approx() / 256);
+      } else {
+        const int K = std::max(tex_round_half_up(isum[ch], 256), unorm ? 0 : -32767);
+        r = static_cast<float>(static_cast<double>(K) / (unorm ? 65535.0 : 32767.0));
+      }
+      out[ch] = static_cast<uint32_t>(f32bits(r));
+    }
+  }
+
+  void tex_linear(const Instr& ins, uint32_t lane, const TextureDesc& d, uint32_t dims,
+                  const float coord[3], uint32_t out[4], bool true_1d = false) {
+    tex_check_filterable(ins, lane, d);
+    TexTerm terms[8];
+    const int n = tex_footprint_linear(d, dims, coord, true_1d, 256, terms);
+    tex_finish(ins, lane, d, terms, n, out);
+  }
+
+  // A mipmapped fetch's level of detail, in 1/256ths of a level (measured on
+  // an RTX 3060): an explicit lod is truncated toward zero to 1/256 and the
+  // bias added, a plain fetch is level 0 without the bias; then the texture's
+  // level clamps, then the levels that exist.
+  static int32_t tex_mip_lod(const TextureDesc& d, bool explicit_lod, double lod) {
+    int64_t q = 0;
+    if (explicit_lod) {
+      const double scaled = std::trunc(lod * 256);
+      q = static_cast<int64_t>(std::clamp(scaled, -1e9, 1e9)) + d.mip_bias;
+    }
+    q = std::clamp<int64_t>(q, d.mip_min, std::max(d.mip_min, d.mip_max));
+    q = std::clamp<int64_t>(q, 0, int64_t{d.mip_levels - 1} * 256);
+    return static_cast<int32_t>(q);
+  }
+
+  // A mip level of `d` as a texture of its own.
+  static TextureDesc tex_level(const TextureDesc& d, uint32_t level) {
+    TextureDesc v = d;
+    v.base = d.level_base[level];
+    v.width = std::max(1u, d.width >> level);
+    v.height = d.height ? std::max(1u, d.height >> level) : 0;
+    v.depth = d.depth ? std::max(1u, d.depth >> level) : 0;
+    v.pitch_bytes = v.width * d.texel_bytes;
+    v.mip_levels = 0;
+    return v;
+  }
+
+  // The texture a layered or cubemap fetch actually reads: one layer, or one
+  // face, as an ordinary 1D or 2D texture. Measured on an RTX 3060: the layer
+  // (and a layered cubemap's cubemap) index is unsigned and an index past the
+  // end -- a negative one included -- reads the last; a cube direction picks
+  // the face of its largest-magnitude axis, ties going to z, then y, then x,
+  // with the minor axes from the CUDA programming guide's table and (s/m+1)/2
+  // as the face coordinate; and filtering stays inside the face, under the
+  // texture's address mode.
+  static uint64_t tex_slice_bytes(const TextureDesc& d) {
+    const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
+    return row * (d.height ? d.height : 1);
+  }
+
   void exec_tex(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTex& op, Mask m) {
     Lanes _s_obj;
     const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
-    std::array<Lanes, 3> coord;
-    std::array<Lanes, 3> coord_scratch;
-    for (uint32_t i = 0; i < op.dims; ++i)
+    const bool indexed = op.geom == TexGeom::A1D || op.geom == TexGeom::A2D || op.geom == TexGeom::ACube;
+    const bool cube = op.geom == TexGeom::Cube || op.geom == TexGeom::ACube;
+    const uint32_t first = indexed ? 1 : 0;
+    std::array<Lanes, 4> coord;
+    std::array<Lanes, 4> coord_scratch;
+    for (uint32_t i = 0; i < op.dims + first; ++i)
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
+    Lanes _s_lod;
+    const Lanes* lod = op.level ? &read_operand(w, ctx, ins, op.lod, _s_lod) : nullptr;
 
     std::array<Lanes, 4> out;
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Texture);
-      if (d.filter != TexFilter::Point)
-        ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
-                 "cudaFilterModeLinear is not implemented. Interpolation between texels is a "
-                 "documented weighted average, but hardware computes the weights in a fixed-point "
-                 "format with 8 fractional bits, so a float implementation would differ from the "
-                 "device in the low bits -- which is exactly what differential testing here is "
-                 "meant to catch. Point sampling is exact");
+      const bool want_layers = indexed, want_cube = cube;
+      if ((d.layers != 0) != want_layers || d.cubemap != want_cube)
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                 std::string("the fetch's geometry does not match the texture: the texture is ") +
+                     (d.cubemap ? (d.layers ? "a layered cubemap" : "a cubemap")
+                                : (d.layers ? "layered" : "neither layered nor a cubemap")));
+      TextureDesc v = d;
+      uint32_t dims = op.dims;
+      bool true_1d = false;
+      float cf[3] = {0, 0, 0};
+      int64_t ci[3] = {0, 0, 0};
+      for (uint32_t i = 0; i < op.dims; ++i) {
+        cf[i] = f32(coord[first + i][lane]);
+        ci[i] = static_cast<int32_t>(coord[first + i][lane]);
+      }
+      if (indexed) {
+        const uint64_t index = static_cast<uint32_t>(coord[0][lane]);
+        const uint64_t layer = std::min<uint64_t>(index, d.layers - 1);
+        v.base += layer * (cube ? 6 : 1) * tex_slice_bytes(d);
+        v.layers = 0;
+        if (op.geom == TexGeom::A1D) {
+          true_1d = true;   // a layer of a 1D layered texture filters as 1D
+          v.height = 0;
+        }
+      }
+      if (cube) {
+        const float x = cf[0], y = cf[1], z = cf[2];
+        const float ax = std::fabs(x), ay = std::fabs(y), az = std::fabs(z);
+        int face;
+        float sc, tc, ma;
+        if (az >= ax && az >= ay) { face = z >= 0 ? 4 : 5; sc = z >= 0 ? x : -x; tc = -y; ma = az; }
+        else if (ay >= ax) { face = y >= 0 ? 2 : 3; sc = x; tc = y >= 0 ? z : -z; ma = ay; }
+        else { face = x >= 0 ? 0 : 1; sc = x >= 0 ? -z : z; tc = -y; ma = ax; }
+        v.base += static_cast<uint64_t>(face) * tex_slice_bytes(d);
+        v.cubemap = false;
+        v.normalized_coords = true;
+        // Point sampling clamps to the face whatever the address mode; linear
+        // filtering applies the mode inside the face -- wrap takes the texel
+        // from the face's far edge, border blends in zero (measured).
+        if (v.filter != TexFilter::Linear)
+          for (auto& a : v.address) a = TexAddress::Clamp;
+        cf[0] = (sc / ma + 1.0f) * 0.5f;
+        cf[1] = (tc / ma + 1.0f) * 0.5f;
+        dims = 2;
+      }
+      if (op.gather >= 0) {
+        // tld4: the four texels of the bilinear footprint, counter-clockwise
+        // from the lower left -- (i, j+1), (i+1, j+1), (i+1, j), (i, j) -- one
+        // component each. Measured on an RTX 3060: i and j come from the
+        // filter's coordinate (with its 8-bit weight rounding carrying into
+        // them), and the address mode applies to each texel's index -- clamp
+        // clamps the indices, not the coordinate.
+        if (d.mip_levels)
+          ctx_fail(ins, static_cast<int>(lane), Err::Unsupported, "tld4 of a mipmapped texture");
+        const uint32_t size[2] = {v.width, v.height ? v.height : 1};
+        int64_t b[2];
+        for (uint32_t i = 0; i < 2; ++i) {
+          float x = cf[i];
+          if (v.normalized_coords) x *= static_cast<float>(size[i]);
+          const double xb = static_cast<double>(x) - 0.5;
+          double fl = std::floor(xb);
+          if (std::floor((xb - fl) * 256 + 0.5) >= 256) fl += 1;
+          b[i] = static_cast<int64_t>(fl);
+        }
+        const uint64_t row = v.pitch_bytes ? v.pitch_bytes : uint64_t{v.width} * v.texel_bytes;
+        static constexpr int kOrder[4][2] = {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
+        for (int k = 0; k < 4; ++k) {
+          uint32_t ix, iy;
+          const bool inside = wrap_coord(effective_address(v, 0), b[0] + kOrder[k][0], size[0], &ix) &&
+                              wrap_coord(effective_address(v, 1), b[1] + kOrder[k][1], size[1], &iy);
+          const uint32_t ch = static_cast<uint32_t>(op.gather);
+          out[k][lane] = inside ? convert_channel(v, ch, texel_channel_bits(v, v.base + iy * row + uint64_t{ix} * v.texel_bytes, ch, ins, lane), op.dtype)
+                                : 0;
+        }
+        continue;
+      }
+      if (d.mip_levels) {
+        // A mipmapped texture: pick the level, or blend two (see tex_mip_lod).
+        if (indexed || cube)
+          ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+                   "mipmapped layered and cubemap textures are not implemented");
+        const double lodv = lod ? (op.ctype.is_float() ? static_cast<double>(f32((*lod)[lane]))
+                                                       : static_cast<double>(static_cast<int32_t>((*lod)[lane])))
+                                : 0.0;
+        const int32_t q = tex_mip_lod(d, lod != nullptr, lodv);
+        if (d.mip_filter == TexFilter::Linear && (q & 255) != 0) {
+          if (!op.ctype.is_float())
+            ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+                     "blending mip levels with integer coordinates");
+          tex_check_filterable(ins, lane, d);
+          const TextureDesc lo = tex_level(v, static_cast<uint32_t>(q >> 8));
+          const TextureDesc hi = tex_level(v, static_cast<uint32_t>(q >> 8) + 1);
+          TexTerm terms[16];
+          int n = 0;
+          const int wh = q & 255;
+          if (v.filter == TexFilter::Linear) {
+            n += tex_footprint_linear(lo, dims, cf, true_1d, 256 - wh, terms + n);
+            n += tex_footprint_linear(hi, dims, cf, true_1d, wh, terms + n);
+          } else {
+            n += tex_footprint_point(lo, dims, cf, 256 - wh, terms + n);
+            n += tex_footprint_point(hi, dims, cf, wh, terms + n);
+          }
+          uint32_t r[4];
+          tex_finish(ins, lane, d, terms, n, r);
+          for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = r[ch];
+          continue;
+        }
+        v = tex_level(v, static_cast<uint32_t>(d.mip_filter == TexFilter::Linear ? q >> 8 : (q + 128) >> 8));
+      }
+      if (v.filter == TexFilter::Linear) {
+        if (!op.ctype.is_float())
+          ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+                   "linear filtering with integer coordinates");
+        uint32_t r[4];
+        tex_linear(ins, lane, v, dims, cf, r, true_1d);
+        for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = r[ch];
+        continue;
+      }
 
-      const uint32_t size[3] = {d.width, d.height, d.depth};
+      const uint32_t size[3] = {v.width, v.height, v.depth};
       bool inside = true;
       uint32_t idx[3] = {0, 0, 0};
-      for (uint32_t i = 0; i < op.dims; ++i) {
+      for (uint32_t i = 0; i < dims; ++i) {
         int64_t c;
         if (op.ctype.is_float()) {
-          float f = f32(coord[i][lane]);
-          if (d.normalized_coords) f *= static_cast<float>(size[i]);
+          float f = cf[i];
+          if (v.normalized_coords) f *= static_cast<float>(size[i]);
           // Point sampling takes the texel the coordinate falls in. CUDA's
           // sampled coordinates are texel-centred, so x+0.5 addresses texel x.
           c = static_cast<int64_t>(std::floor(f));
         } else {
-          c = static_cast<int64_t>(static_cast<int32_t>(coord[i][lane]));
+          c = ci[i];
         }
-        if (!wrap_coord(d.address[i], c, size[i], &idx[i])) { inside = false; break; }
+        if (!wrap_coord(effective_address(v, i), c, size[i], &idx[i])) { inside = false; break; }
       }
 
       if (!inside) {
@@ -4654,11 +5084,11 @@ class Interpreter {
         for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = 0;
         continue;
       }
-      const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
-      const uint64_t plane = row * (d.height ? d.height : 1);
-      const uint64_t addr = d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes;
+      const uint64_t row = v.pitch_bytes ? v.pitch_bytes : uint64_t{v.width} * v.texel_bytes;
+      const uint64_t plane = row * (v.height ? v.height : 1);
+      const uint64_t addr = v.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * v.texel_bytes;
       for (uint32_t ch = 0; ch < 4; ++ch)
-        out[ch][lane] = convert_channel(d, ch, texel_channel_bits(d, addr, ch, ins, lane), op.dtype);
+        out[ch][lane] = convert_channel(v, ch, texel_channel_bits(v, addr, ch, ins, lane), op.dtype);
     }
     count_memory(Space::Global, 4 * 4, popcount_mask(m), /*is_store=*/false);
     for (uint32_t ch = 0; ch < 4 && ch < op.dsts.size(); ++ch)
@@ -4668,10 +5098,38 @@ class Interpreter {
   // suld/sust address a surface in *bytes* along x and in whole rows along y
   // and z, which is why they take no format: they move raw bytes.
   uint64_t surface_address(const Instr& ins, uint32_t lane, const TextureDesc& d,
-                           const std::array<Lanes, 3>& coord, uint32_t dims, uint32_t bytes) {
-    const int64_t x = static_cast<int32_t>(coord[0][lane]);
-    const int64_t y = dims > 1 ? static_cast<int32_t>(coord[1][lane]) : 0;
-    const int64_t z = dims > 2 ? static_cast<int32_t>(coord[2][lane]) : 0;
+                           const std::array<Lanes, 4>& coord, uint32_t dims, uint32_t bytes,
+                           bool layered) {
+    // A layered surface's first coordinate is its layer. A cubemap surface is
+    // read as a layered one, face by face (surfCubemapread compiles to
+    // suld.a2d with the face as the layer), so it has 6 -- or 6 x layers.
+    const uint32_t first = layered ? 1 : 0;
+    const int64_t x = static_cast<int32_t>(coord[first][lane]);
+    const int64_t y = dims > 1 ? static_cast<int32_t>(coord[first + 1][lane]) : 0;
+    const int64_t z = dims > 2 ? static_cast<int32_t>(coord[first + 2][lane]) : 0;
+    uint64_t layer_base = d.base;
+    if (layered) {
+      const uint64_t layers = d.cubemap ? 6 * std::max<uint64_t>(d.layers, 1) : d.layers;
+      if (layers == 0)
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                 "a layered surface access (.a1d/.a2d) on a surface that is not layered");
+      // Reading a 2D layered surface with a 1D layered access (or the other
+      // way round) returns zeros on an RTX 3060, a rule nobody can rely on;
+      // it is refused instead.
+      if ((dims == 1) != (d.height == 0))
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                 std::string("a ") + (dims == 1 ? "1D" : "2D") + " layered access (.a" +
+                     (dims == 1 ? "1d" : "2d") + ") on a " + (d.height ? "2D" : "1D") + " layered surface");
+      const uint64_t layer = static_cast<uint32_t>(coord[0][lane]);
+      if (layer >= layers)
+        ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                 "surface layer " + std::to_string(layer) + " is past the surface's " +
+                     std::to_string(layers) + " layers, and the '.trap' policy faults");
+      layer_base += layer * tex_slice_bytes(d);
+    } else if (d.layers || d.cubemap) {
+      ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+               "a layered or cubemap surface needs a layered access (.a1d/.a2d)");
+    }
     const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
     const uint64_t plane = row * (d.height ? d.height : 1);
     // ".trap" is the out-of-range policy ptxas emits, and it means what it
@@ -4686,22 +5144,22 @@ class Interpreter {
                    " surface (" + std::to_string(row_bytes) +
                    " bytes per row). The instruction's '.trap' policy is what makes this a fault "
                    "rather than a clamp");
-    return d.base + z * plane + y * row + static_cast<uint64_t>(x);
+    return layer_base + z * plane + y * row + static_cast<uint64_t>(x);
   }
 
   void exec_suld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSuld& op, Mask m) {
     Lanes _s_obj;
     const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
-    std::array<Lanes, 3> coord;
-    std::array<Lanes, 3> coord_scratch;
-    for (uint32_t i = 0; i < op.dims; ++i)
+    std::array<Lanes, 4> coord;
+    std::array<Lanes, 4> coord_scratch;
+    for (uint32_t i = 0; i < op.dims + (op.layered ? 1 : 0); ++i)
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
     std::vector<Lanes> out(op.dsts.size());
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Surface);
       const uint64_t base = surface_address(ins, lane, d, coord, op.dims,
-                                            op.bytes * static_cast<uint32_t>(op.dsts.size()));
+                                            op.bytes * static_cast<uint32_t>(op.dsts.size()), op.layered);
       for (size_t c = 0; c < op.dsts.size(); ++c) {
         try {
           out[c][lane] = mem_.load_scalar(base + c * op.bytes, op.bytes);
@@ -4719,9 +5177,9 @@ class Interpreter {
   void exec_sust(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSust& op, Mask m) {
     Lanes _s_obj;
     const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
-    std::array<Lanes, 3> coord;
-    std::array<Lanes, 3> coord_scratch;
-    for (uint32_t i = 0; i < op.dims; ++i)
+    std::array<Lanes, 4> coord;
+    std::array<Lanes, 4> coord_scratch;
+    for (uint32_t i = 0; i < op.dims + (op.layered ? 1 : 0); ++i)
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
     std::vector<Lanes> src(op.srcs.size());
     std::vector<Lanes> src_scratch(op.srcs.size());
@@ -4731,7 +5189,7 @@ class Interpreter {
       if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Surface);
       const uint64_t base = surface_address(ins, lane, d, coord, op.dims,
-                                            op.bytes * static_cast<uint32_t>(op.srcs.size()));
+                                            op.bytes * static_cast<uint32_t>(op.srcs.size()), op.layered);
       for (size_t c = 0; c < op.srcs.size(); ++c) {
         try {
           mem_.store_scalar(base + c * op.bytes, op.bytes, src[c][lane]);

@@ -1068,9 +1068,41 @@ if(TARGET vgpucupti)
 endif()
 
 # Texture and surface objects: tex1Dfetch over linear memory, tex2D over a
-# cudaArray, a surface read-modify-write, and the linear-filter refusal.
+# cudaArray, a surface read-modify-write, and linear filtering at texel centres.
 add_test(NAME e2e_textures COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_textures.sh)
 set_tests_properties(e2e_textures PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# Linear filtering in 1D, 2D and 3D, every address mode and the filtered
+# formats, compared bit for bit with results recorded on an RTX 3060.
+add_test(NAME e2e_texture_filtering COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_filtering.sh)
+set_tests_properties(e2e_texture_filtering PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# Layered (1D, 2D) and cubemap (plain and layered) textures, and layered
+# surfaces, compared bit for bit with results recorded on an RTX 3060.
+add_test(NAME e2e_texture_layers COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_layers.sh)
+set_tests_properties(e2e_texture_layers PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# Mipmapped textures: explicit level of detail and plain fetches, every
+# filter combination, biases and clamps, bit for bit with an RTX 3060.
+add_test(NAME e2e_texture_mipmaps COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_mipmaps.sh)
+set_tests_properties(e2e_texture_mipmaps PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# Texture gather (tld4): the bilinear footprint's four texels, every
+# component, bit for bit with an RTX 3060.
+add_test(NAME e2e_texture_gather COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_gather.sh)
+set_tests_properties(e2e_texture_gather PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)

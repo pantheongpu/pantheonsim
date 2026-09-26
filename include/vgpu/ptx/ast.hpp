@@ -698,16 +698,28 @@ struct OpTrap { bool breakpoint = false; };
 //
 // tex always writes four components even when the caller wants one -- the
 // widest form is what ptxas emits regardless.
+// A texture's geometry. The layered ones (a1d, a2d, acube) take a layer --
+// or for acube a cubemap -- index as the first coordinate, an unsigned
+// integer; cube and acube take a direction (s, t, r) that picks a face.
+enum class TexGeom { D1, D2, D3, A1D, A2D, Cube, ACube };
 struct OpTex {
-  uint32_t dims = 1;             // 1, 2 or 3
+  TexGeom geom = TexGeom::D1;
+  uint32_t dims = 1;             // spatial coordinates: 1, 2 or 3 (3 for a cube's direction)
   Type dtype;                    // destination component type (f32, s32, u32)
   Type ctype;                    // coordinate type: f32 for sampled, s32 for fetch
   std::vector<Reg> dsts;         // always four
   Operand obj;                   // the texture object handle
   std::vector<Operand> coords;
+  // .level: an explicit level of detail (of .ctype) after the coordinates.
+  bool level = false;
+  Operand lod;
+  // tld4 (texture gather): the component 0..3 (r, g, b, a) whose four
+  // bilinear-footprint texels are returned, or -1 for an ordinary fetch.
+  int gather = -1;
 };
 struct OpSuld {
   uint32_t dims = 1;
+  bool layered = false;          // .a1d/.a2d: coords are {layer, x[, y, ignored]}
   uint32_t bytes = 4;            // per component, from .b8/.b16/.b32/.b64
   std::vector<Reg> dsts;
   Operand obj;
@@ -715,6 +727,7 @@ struct OpSuld {
 };
 struct OpSust {
   uint32_t dims = 1;
+  bool layered = false;
   uint32_t bytes = 4;
   Operand obj;
   std::vector<Operand> coords;
