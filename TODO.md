@@ -298,14 +298,19 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   registers); the combinations above keep theirs. wmma_types.cu checks all 21
   shape/type/layout combinations through mma.h, exactly;
   ldmatrix.m8n8.x{1,2,4}[.trans], mma.sync.m16n8k{8,16,32} over f16/bf16/tf32/
-  s8, and movmatrix.m8n8.trans (the register-only transpose).
+  s8, and movmatrix.m8n8.trans (the register-only transpose). mma.sp (2:4
+  structured sparsity) m16n8k{16,32} with f16/bf16 A and B, both sparsity
+  selectors: its A layout and metadata were read from the ISA's figures and
+  settled nibble by nibble on an RTX 3060, test_exec3 checks five forms
+  against the hardware's own results, and CUTLASS's 19 SM80 sparse GEMM tests
+  pass. Its tf32, integer and FP8 forms are still refused.
   stmatrix.m8n8.x{1,2,4}[.trans] is the store counterpart of ldmatrix: the warp
   writes the 8x8 matrices its registers hold back to shared memory, which is how
   a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
   checks where every element lands and that a fragment stored by one instruction
   and loaded by the other comes back unchanged.
 - Asynchronous copy: cp.async.{ca,cg} with commit_group / wait_group / wait_all
-  and the src-size zero-fill form. The copy is deferred until the wait rather
+  and the src-size zero-fill form; an empty group counts toward wait_group N. The copy is deferred until the wait rather
   than performed on the spot, so a kernel that reads its destination early sees
   what the hardware would, not what a synchronous copy would have hidden.
 - Warp membership: %lanemask_{eq,lt,le,gt,ge}, %warpid, activemask, bar.red,
@@ -689,7 +694,7 @@ narrows what counts as observable, not what the detector looks at.
   e2e test (nvidia/tests/e2e/wgmma_cute.cu) lets CuTe -- NVIDIA's own layout
   code, from a pinned CUTLASS release -- build the tiles, descriptors and
   fragments for seventeen configurations and compares every element exactly.
-  Refused by name: the sparse (`.sp`) and single-bit (`.b1`) forms, a
+  Refused by name: the sparse (`.sp`) and single-bit (`.b1`) `wgmma` forms, a
   descriptor with a nonzero base offset (the ISA does not say how it moves the
   pattern), and `wgmma` under any target but `.target sm_90a`. Loading now
   follows the target suffixes: a fatbin's `sm_90a` PTX is preferred over its
@@ -851,18 +856,30 @@ narrows what counts as observable, not what the detector looks at.
   ignored (clusters of up to 16 now launch once it is set); and dp2a was
   missing. The cluster warp-specialized cooperative test passes all 22 cases
   and the pointer-array test its 2.
-  **Known wrong answer, not yet found:** the ping-pong kernel with a 2x4x1
-  cluster (64x128x64 tiles) gets some 16-row A slices wrong in output tiles
-  whose cluster is partly past the matrix's N edge. The bad slices always
-  come from the blocks whose own tile is out of bounds; which ones depends on
-  the warp schedule (the deterministic scheduler fails 488x768x632, the
-  random one 488x8x632), so it is ordering, not arithmetic. Ruled out so far:
-  when TMA data lands (landing at issue fails the same way), the per-lane
-  mbarrier grouping (test_dsmem covers it), duplicated tile assignment (a
-  TMA trace shows the persistent scheduler's assignment is right), and shared
-  memory aliasing between the mainloop and the epilogue. The 1x4, 4x1 and
-  2x2 clusters of the same kernel pass, as does the cooperative kernel at
-  2x4x1.
+  The ping-pong kernel's wrong 16-row A slices at 2x4x1 (and the group
+  GEMM's, at 2x2x1) were one bug: each warp of a warpgroup read its operands
+  of a `wgmma` from shared memory when it got to the instruction, so a warp
+  that finished early could release the stage and let the cluster peer that
+  multicasts A refill it before the last warp had read. The warpgroup now
+  reads them once, at the first warp's issue, and `wgmma.wait_group` holds a
+  warp until all four have issued what it waits for (letting the first warp
+  through alone hung the ping-pong kernel's SIMT-epilogue variant at 2x2x1:
+  the stage it released was refilled past a lagging warp's parity wait).
+  The group GEMM also found
+  `cvt.sat` and `.ftz` ignored and tiny fp16 results flushed to zero (its
+  silu epilogue's expf leans on `cvt.sat.f32.f32`); conversions now match an
+  RTX 3060 bit for bit, NaN encodings included.
+- CUTLASS's SM80 sparse GEMM tests (all 19 pass) found three more: an empty
+  `cp.async` group did not count toward `wait_group N`, so a wait left an
+  older real group pending; `bar.red` voted for a partial warp when some of
+  its lanes were on another path, and let a warp looping back vote into the
+  round the others were still collecting; and a `.reg` declared inside
+  `{ }` did not hide the outer register of the same name, which
+  `__syncthreads_and`'s inline asm relies on. The last two hung CUTLASS's
+  split-K semaphore wait whenever the blocks ran on more than one host
+  thread. `ex2.approx` differs from the hardware's by an ulp in about 30% of
+  inputs (it is approximate, and matching it bit for bit would take the SFU's
+  internals), which moves `expf` by an ulp too.
 
 ## Not implemented (fails loudly, never silently)
 
