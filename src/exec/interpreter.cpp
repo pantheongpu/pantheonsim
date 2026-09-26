@@ -169,6 +169,36 @@ struct WgmmaSnapshots {
   std::map<std::pair<uint32_t, uint64_t>, WgmmaSnapshot> pending;   // (warpgroup, sequence)
 };
 
+// A CTA's Tensor Memory (sm_100, PTX ISA 9.7.18.1): 128 lanes of 512 32-bit
+// columns, handed out by tcgen05.alloc in power-of-two runs of at least 32
+// columns. The cells are made on the first allocation, so a kernel that never
+// uses it costs nothing. Real contents start undefined; these start zero, as
+// shared memory does here.
+struct TensorMemory {
+  static constexpr uint32_t kLanes = 128, kCols = 512;
+  std::vector<uint32_t> cells;                          // lane-major
+  std::map<uint32_t, uint32_t> live;                    // first column -> columns
+  bool exclusive = false;                               // the live one is .exclusive
+  bool relinquished = false;
+  // cta_group::2 allocations are made by one warp in each CTA of the pair,
+  // together. The first of the two to arrive makes it in both CTAs and leaves
+  // its column here for the other, which takes it instead of allocating again;
+  // deallocation works the same way.
+  std::deque<std::pair<uint32_t, uint32_t>> peer_alloc, peer_dealloc;
+  uint32_t& at(uint32_t lane, uint32_t col) { return cells[size_t{lane} * kCols + col]; }
+  bool allocated(uint32_t col) const {
+    auto it = live.upper_bound(col);
+    if (it == live.begin()) return false;
+    --it;
+    return col < it->first + it->second;
+  }
+  bool free_run(uint32_t col, uint32_t n) const {
+    for (const auto& [c, len] : live)
+      if (c < col + n && col < c + len) return false;
+    return col + n <= kCols;
+  }
+};
+
 // Shadow state for shared memory, one entry per 4-byte word, used only when
 // race detection is on.
 //
@@ -264,6 +294,7 @@ struct BlockCtx {
   std::vector<Warp>* warps = nullptr;   // the block's, for releasing a named barrier's waiters
   MbarrierTable* mbar = nullptr;
   WgmmaSnapshots* wgmma = nullptr;
+  TensorMemory* tmem = nullptr;
   SharedShadow* shadow = nullptr;   // non-null only when race detection is on
   // The thread-block cluster this block belongs to, for barrier.cluster. A
   // launch without clusters still has one per block.
@@ -1099,6 +1130,7 @@ class Interpreter {
     NamedBarriers bars;
     MbarrierTable mbar;
     WgmmaSnapshots wgmma;
+    TensorMemory tmem;
     SharedShadow shadow;
     std::vector<Warp> warps;
     uint64_t clock = 0;
@@ -1115,6 +1147,8 @@ class Interpreter {
     b.ctx.mbar = &b.mbar;
     b.wgmma.pending.clear();
     b.ctx.wgmma = &b.wgmma;
+    b.tmem = TensorMemory{};
+    b.ctx.tmem = &b.tmem;
     b.ctx.bars = &b.bars;
     b.ctx.warps = &b.warps;
     b.ctx.clock = &b.clock;
@@ -1201,6 +1235,16 @@ class Interpreter {
       // against everything after, which is what ends the epoch.
       if (any_waiting && b.ctx.shadow) ++b.ctx.shadow->epoch;
       if (!any_waiting) {
+        // "All of the Tensor Memory that was allocated ... must be explicitly
+        // deallocated using tcgen05.dealloc before the kernel exits."
+        if (!b.tmem.live.empty()) {
+          uint32_t cols = 0;
+          for (const auto& [c, n] : b.tmem.live) cols += n;
+          throw Error::make(Err::LaunchConfig, "block (", b.ctx.ctaid[0], ",", b.ctx.ctaid[1], ",",
+                            b.ctx.ctaid[2], ") exited with ", cols,
+                            " Tensor Memory columns still allocated; every tcgen05.alloc needs a "
+                            "tcgen05.dealloc before the kernel exits");
+        }
         b.done = true;
         return false;  // all Done
       }
@@ -1417,7 +1461,8 @@ class Interpreter {
       return InstClass::Memory;
 
     if (std::holds_alternative<OpMma>(ins.op) || std::holds_alternative<OpWmmaMma>(ins.op) ||
-        std::holds_alternative<OpWgmma>(ins.op) || std::holds_alternative<OpMovMatrix>(ins.op))
+        std::holds_alternative<OpWgmma>(ins.op) || std::holds_alternative<OpTcgen05>(ins.op) ||
+        std::holds_alternative<OpMovMatrix>(ins.op))
       return InstClass::Tensor;
 
     return InstClass::Misc;
@@ -3184,6 +3229,11 @@ class Interpreter {
     if (const auto* op = std::get_if<OpWgmma>(&ins.op)) {
       require_warp32(ins, "wgmma");
       exec_wgmma(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpTcgen05>(&ins.op)) {
+      require_warp32(ins, "tcgen05");
+      exec_tcgen05(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpMma>(&ins.op)) {
@@ -5646,6 +5696,544 @@ class Interpreter {
     }
     snap.taken |= static_cast<uint8_t>(1u << (warp_index % 4));
     if (snap.taken == 0xF) ctx.wgmma->pending.erase(snap_it);
+  }
+
+  // ---- Blackwell's fifth-generation tensor core (tcgen05, sm_100a) ----
+  //
+  // Every tcgen05 operation completes when it is issued. The asynchronous
+  // ones (mma, ld, st) may complete any time up to their tcgen05.commit or
+  // tcgen05.wait, and at once is one of the orders that allows; the fences
+  // and waits then have nothing left to order. A kernel that reads an
+  // accumulator before waiting for it is therefore not caught here.
+
+  // The CTAs an operation of .cta_group::n works on: this one, or the pair
+  // it belongs to, even rank first (9.7.18.5.1).
+  std::vector<const BlockCtx*> tcgen05_ctas(const BlockCtx& ctx, const Instr& ins, uint32_t group) {
+    if (group == 1) return {&ctx};
+    const uint32_t rank = cluster_rank_of(ctx);
+    const size_t n = ctx.cluster_state ? ctx.cluster_state->ranks.size() : 1;
+    if ((rank | 1) >= n || !ctx.cluster_state->ranks[rank ^ 1])
+      ctx_fail(ins, -1, Err::InvalidValue,
+               ".cta_group::2 works on a CTA pair -- two CTAs of a cluster whose %cluster_ctarank "
+               "differs in the last bit -- and this CTA (rank " + std::to_string(rank) + " of a " +
+                   std::to_string(n) + "-CTA cluster) has no peer");
+    const BlockCtx* even = ctx.cluster_state->ranks[rank & ~1u];
+    const BlockCtx* odd = ctx.cluster_state->ranks[rank | 1u];
+    return {even, odd};
+  }
+
+  static TensorMemory& tmem_of(const BlockCtx& c) { return *c.tmem; }
+
+  // A shared-memory address operand as a window address. tcgen05 takes both
+  // .shared::cta/.shared::cluster offsets and, with no state space, generic
+  // addresses, which here are already in the window.
+  static uint64_t shared_window(uint64_t v) { return v >= kSharedVaBase ? v : kSharedVaBase + v; }
+
+  uint32_t tcgen05_uniform(Warp& w, const BlockCtx& ctx, const Instr& ins, const Operand& o, Mask m,
+                           const char* what) {
+    Lanes _s;
+    const Lanes& v = read_operand(w, ctx, ins, o, _s);
+    uint32_t lead = W_;
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) {
+        if (lead == W_) lead = lane;
+        else if (static_cast<uint32_t>(v[lane]) != static_cast<uint32_t>(v[lead]))
+          ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                   std::string("every thread of the warp must give tcgen05 the same ") + what +
+                       "; the ISA leaves the result undefined otherwise");
+      }
+    return static_cast<uint32_t>(v[lead]);
+  }
+
+  void exec_tcgen05(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op, Mask m) {
+    if (!ctx.tmem) ctx_fail(ins, -1, Err::UnsupportedPtx, "tcgen05 outside a block context");
+    const bool collective = op.kind != Tcgen05Kind::Mma && op.kind != Tcgen05Kind::Commit &&
+                            op.kind != Tcgen05Kind::FenceBefore && op.kind != Tcgen05Kind::FenceAfter;
+    if (collective && m != all_)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "this tcgen05 instruction is .sync.aligned: every thread of the warp must execute it, "
+               "and this warp reached it with some lanes inactive or predicated off");
+    switch (op.kind) {
+      case Tcgen05Kind::FenceBefore:
+      case Tcgen05Kind::FenceAfter:
+      case Tcgen05Kind::WaitLd:
+      case Tcgen05Kind::WaitSt:
+        return;
+      case Tcgen05Kind::Relinquish:
+        for (const BlockCtx* c : tcgen05_ctas(ctx, ins, op.cta_group)) tmem_of(*c).relinquished = true;
+        return;
+      case Tcgen05Kind::Alloc:
+      case Tcgen05Kind::Dealloc:
+        exec_tmem_alloc(w, ctx, ins, op, m);
+        return;
+      case Tcgen05Kind::Ld:
+      case Tcgen05Kind::St:
+        exec_tmem_ldst(w, ctx, ins, op, m);
+        return;
+      case Tcgen05Kind::Commit:
+        exec_tcgen05_commit(w, ctx, ins, op, m);
+        return;
+      case Tcgen05Kind::Mma:
+        // Single-thread semantics: every active thread issues a whole MMA.
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) exec_tcgen05_mma(w, ctx, ins, op, lane);
+        return;
+    }
+  }
+
+  // tcgen05.alloc/dealloc (9.7.18.7.1).
+  void exec_tmem_alloc(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op, Mask m) {
+    const uint32_t ncols = tcgen05_uniform(w, ctx, ins, op.ncols, m, "nCols");
+    const bool pow2 = ncols && !(ncols & (ncols - 1));
+    if (ncols < 32 || ncols > TensorMemory::kCols || ncols % 32 || (!op.exclusive && !pow2))
+      ctx_fail(ins, -1, Err::InvalidValue,
+               "tcgen05." + std::string(op.kind == Tcgen05Kind::Alloc ? "alloc" : "dealloc") +
+                   " of " + std::to_string(ncols) + " columns; " +
+                   (op.exclusive ? "an .exclusive allocation takes a multiple of 32 from 32 to 512"
+                                 : "a power of two from 32 to 512"));
+    const std::vector<const BlockCtx*> ctas = tcgen05_ctas(ctx, ins, op.cta_group);
+    TensorMemory& mine = tmem_of(ctx);
+    if (op.kind == Tcgen05Kind::Alloc) {
+      if (mine.relinquished)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "tcgen05.alloc after this CTA ran tcgen05.relinquish_alloc_permit");
+      uint32_t col = 0;
+      if (op.cta_group == 2 && !mine.peer_alloc.empty()) {
+        // The peer CTA's warp got here first and allocated for both.
+        const auto [c, n] = mine.peer_alloc.front();
+        mine.peer_alloc.pop_front();
+        if (n != ncols)
+          ctx_fail(ins, -1, Err::InvalidValue,
+                   "the two CTAs of a pair ask .cta_group::2 tcgen05.alloc for different column "
+                   "counts (" + std::to_string(n) + " and " + std::to_string(ncols) + ")");
+        col = c;
+      } else {
+        // The lowest run aligned to its size that is free in every CTA the
+        // allocation covers. Where the hardware puts it is not documented;
+        // a kernel uses the address it is given.
+        bool found = false;
+        for (col = 0; col + ncols <= TensorMemory::kCols; col += op.exclusive ? 32 : ncols) {
+          bool ok = true;
+          for (const BlockCtx* c : ctas) {
+            const TensorMemory& t = tmem_of(*c);
+            if (!t.free_run(col, ncols) || t.exclusive || (op.exclusive && !t.live.empty())) ok = false;
+          }
+          if (ok) { found = true; break; }
+        }
+        if (!found)
+          ctx_fail(ins, -1, Err::UnsupportedPtx,
+                   "tcgen05.alloc of " + std::to_string(ncols) +
+                       " columns while too few are free; it would block until another warp "
+                       "deallocates, and waiting for that is not implemented");
+        for (const BlockCtx* c : ctas) {
+          TensorMemory& t = tmem_of(*c);
+          if (t.cells.empty()) t.cells.assign(size_t{TensorMemory::kLanes} * TensorMemory::kCols, 0);
+          t.live[col] = ncols;
+          if (op.exclusive) t.exclusive = true;
+          if (c != &ctx) t.peer_alloc.emplace_back(col, ncols);
+        }
+      }
+      // The address -- lane 0, the first column -- goes to shared memory, in
+      // this CTA, as a weak store.
+      Lanes _s;
+      const Lanes& base = addr_base(w, ctx, ins, op.addr, _s);
+      uint32_t lead = 0;
+      while (!(m & (Mask{1} << lead))) ++lead;
+      const uint64_t at = shared_window(base[lead] + static_cast<uint64_t>(op.addr.offset));
+      if (shared_ref(ctx, ins, static_cast<int>(lead), at).owner != &ctx)
+        ctx_fail(ins, static_cast<int>(lead), Err::InvalidValue,
+                 "tcgen05.alloc writes its address into this CTA's shared memory (.shared::cta)");
+      if (at % 4) ctx_fail(ins, static_cast<int>(lead), Err::MisalignedAccess,
+                           "tcgen05.alloc's destination must be 4-byte aligned");
+      store_routed(w, ctx, ins, lead, at, 4, col);
+      return;
+    }
+    const uint32_t taddr = tcgen05_uniform(w, ctx, ins, op.taddr, m, "taddr");
+    const uint32_t col = taddr & 0xFFFF;
+    if (op.cta_group == 2 && !mine.peer_dealloc.empty()) {
+      const auto [c, n] = mine.peer_dealloc.front();
+      mine.peer_dealloc.pop_front();
+      if (c != col || n != ncols)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "the two CTAs of a pair deallocate different Tensor Memory with "
+                 ".cta_group::2 tcgen05.dealloc");
+      return;
+    }
+    for (const BlockCtx* c : ctas) {
+      TensorMemory& t = tmem_of(*c);
+      auto it = t.live.find(col);
+      if ((taddr >> 16) != 0 || it == t.live.end() || it->second != ncols)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "tcgen05.dealloc of " + std::to_string(ncols) + " columns at column " +
+                     std::to_string(col) + " (lane " + std::to_string(taddr >> 16) +
+                     "), which is not an allocation tcgen05.alloc made" +
+                     (c != &ctx ? " in the peer CTA" : ""));
+      if (t.exclusive != op.exclusive)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "Tensor Memory is deallocated with .exclusive if and only if it was allocated "
+                 "with it");
+      t.live.erase(it);
+      t.exclusive = false;
+      if (c != &ctx) t.peer_dealloc.emplace_back(col, ncols);
+    }
+  }
+
+  // Where register j of thread t goes for a tcgen05.ld/st shape: the lane
+  // relative to the address's lane, and the 32-bit column relative to its
+  // column (figures 186-190). .16x32bx2's upper half-warp adds
+  // immHalfSplitoff to the column; the caller does that.
+  static void tmem_fragment(Tcgen05Shape s, uint32_t t, uint32_t j, uint32_t* lane, uint32_t* col) {
+    switch (s) {
+      case Tcgen05Shape::S32x32b: *lane = t; *col = j; return;
+      case Tcgen05Shape::S16x64b: *lane = t / 4 + 8 * (t % 2); *col = 2 * j + (t / 2) % 2; return;
+      case Tcgen05Shape::S16x128b: *lane = t / 4 + 8 * (j % 2); *col = t % 4 + 4 * (j / 2); return;
+      case Tcgen05Shape::S16x256b:
+        *lane = t / 4 + 8 * ((j / 2) % 2);
+        *col = 2 * (t % 4) + j % 2 + 8 * (j / 4);
+        return;
+      case Tcgen05Shape::S16x32bx2: *lane = t % 16; *col = j; return;
+    }
+  }
+
+  // tcgen05.ld/st (9.7.18.8). A warp reaches the 32 lanes of its quarter of
+  // Tensor Memory: warp w of a warpgroup, lanes 32(w%4) to 32(w%4)+31.
+  void exec_tmem_ldst(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op, Mask m) {
+    const uint32_t taddr = tcgen05_uniform(w, ctx, ins, op.taddr, m, "taddr");
+    const uint32_t linear0 = w.tid_x[0] + w.tid_y[0] * ctx.ntid[0] +
+                             w.tid_z[0] * ctx.ntid[0] * ctx.ntid[1];
+    const uint32_t quarter = (linear0 / W_) % 4;
+    TensorMemory& t = tmem_of(ctx);
+    const bool ld = op.kind == Tcgen05Kind::Ld;
+    const char* name = ld ? "tcgen05.ld" : "tcgen05.st";
+    const uint32_t lane0 = taddr >> 16, col0 = taddr & 0xFFFF;
+    const uint32_t width = op.pack16 ? 2 : 1;   // columns per register
+    std::vector<Lanes> vals(op.regs.size());
+    if (!ld)
+      for (size_t j = 0; j < op.regs.size(); ++j) {
+        Lanes _s;
+        vals[j] = read_operand(w, ctx, ins, Operand{RegOperand{op.regs[j]}}, _s);
+      }
+    for (uint32_t j = 0; j < op.regs.size(); ++j)
+      for (uint32_t th = 0; th < W_; ++th) {
+        uint32_t dl, dc;
+        tmem_fragment(op.shape, th, j, &dl, &dc);
+        const uint32_t lane = lane0 + dl;
+        uint32_t col = col0 + dc * width;
+        if (op.shape == Tcgen05Shape::S16x32bx2 && th >= 16) col += op.half_split;
+        if (lane / 32 != quarter || lane >= TensorMemory::kLanes)
+          ctx_fail(ins, static_cast<int>(th), Err::InvalidValue,
+                   std::string(name) + " reaches Tensor Memory lane " + std::to_string(lane) +
+                       ", and warp " + std::to_string(quarter) +
+                       " of its warpgroup may only reach lanes " + std::to_string(32 * quarter) +
+                       "-" + std::to_string(32 * quarter + 31) + " (9.7.18.8.1)");
+        for (uint32_t c = col; c < col + width; ++c)
+          if (c >= TensorMemory::kCols || !t.allocated(c))
+            ctx_fail(ins, static_cast<int>(th), Err::OutOfBounds,
+                     std::string(name) + " reaches Tensor Memory column " + std::to_string(c) +
+                         ", which no tcgen05.alloc of this CTA has allocated");
+        if (ld) {
+          vals[j][th] = op.pack16 ? (t.at(lane, col) & 0xFFFF) | (t.at(lane, col + 1) << 16)
+                                  : t.at(lane, col);
+        } else if (op.pack16) {
+          t.at(lane, col) = static_cast<uint32_t>(vals[j][th] & 0xFFFF);
+          t.at(lane, col + 1) = static_cast<uint32_t>((vals[j][th] >> 16) & 0xFFFF);
+        } else {
+          t.at(lane, col) = static_cast<uint32_t>(vals[j][th]);
+        }
+      }
+    if (ld)
+      for (size_t j = 0; j < op.regs.size(); ++j) write_reg(w, op.regs[j], m, vals[j], 32);
+  }
+
+  // tcgen05.commit: an arrive-on, count 1, on the barrier -- or with
+  // .multicast::cluster, on the barrier at the same offset in every CTA the
+  // mask names -- once this thread's earlier MMAs are done, which here they
+  // already are.
+  void exec_tcgen05_commit(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op,
+                           Mask m) {
+    Lanes _s_a, _s_m;
+    const Lanes base = addr_base(w, ctx, ins, op.addr, _s_a);
+    const Lanes mask = op.multicast ? read_operand(w, ctx, ins, op.cta_mask, _s_m) : Lanes{};
+    const size_t nranks = ctx.cluster_state ? ctx.cluster_state->ranks.size() : 1;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const int li = static_cast<int>(lane);
+      const uint64_t at = shared_window(base[lane] + static_cast<uint64_t>(op.addr.offset));
+      auto arrive = [&](uint64_t addr) {
+        Mbarrier& b = cluster_mbarrier(ctx, ins, li, addr, "tcgen05.commit");
+        b.arrived += 1;
+        complete_phase_if_done(b);
+      };
+      if (!op.multicast) {
+        arrive(at);
+        continue;
+      }
+      const uint64_t cta_mask = mask[lane] & 0xFFFF;
+      if (cta_mask >> nranks)
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "tcgen05.commit's ctaMask names a CTA past the cluster's " + std::to_string(nranks));
+      const uint64_t off = shared_ref(ctx, ins, li, at).off;
+      for (uint64_t r = 0; r < nranks; ++r)
+        if (cta_mask >> r & 1) arrive(kSharedVaBase + cluster_address(ctx, r, off));
+    }
+  }
+
+  // A tcgen05 shared-memory matrix descriptor (9.7.18.4.1). The same
+  // canonical layouts as wgmma's; the swizzle field is three bits wide here.
+  WgmmaDesc decode_tcgen05_desc(const Instr& ins, uint64_t d) {
+    WgmmaDesc out;
+    out.start = (d & 0x3FFF) << 4;
+    out.lbo = ((d >> 16) & 0x3FFF) << 4;
+    out.sbo = ((d >> 32) & 0x3FFF) << 4;
+    switch ((d >> 61) & 7) {
+      case 0: out.swizzle = 0; break;
+      case 2: out.swizzle = 128; break;
+      case 4: out.swizzle = 64; break;
+      case 6: out.swizzle = 32; break;
+      case 1:
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "a tcgen05 matrix descriptor with 128-byte swizzling in 32-byte atoms (mode 1); "
+                 "only the 16-byte-atom swizzles are implemented");
+      default:
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "tcgen05 matrix descriptor swizzle mode " + std::to_string((d >> 61) & 7) +
+                     " (bits 61-63), which the ISA makes invalid");
+    }
+    if (((d >> 46) & 7) != 1)
+      ctx_fail(ins, -1, Err::InvalidValue,
+               "a tcgen05 matrix descriptor needs the fixed value 0b001 in bits 46-48");
+    if (((d >> 49) & 7) != 0)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "a tcgen05 matrix descriptor with a nonzero base offset (bits 49-51); only swizzle "
+               "patterns that start on their repeat boundary are implemented");
+    if ((d >> 52) & 1)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "a tcgen05 matrix descriptor with an absolute leading-dimension address (bit 52, "
+               "sm_103a) is not implemented");
+    return out;
+  }
+
+  // One thread's tcgen05.mma (9.7.18.10.10.1): D = A*B (+ D), M x N x K, on
+  // this CTA's Tensor Memory or the pair's.
+  void exec_tcgen05_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op,
+                        uint32_t lane) {
+    const int li = static_cast<int>(lane);
+    auto value = [&](const Operand& o) {
+      Lanes _s;
+      return read_operand(w, ctx, ins, o, _s)[lane];
+    };
+    auto refuse = [&](const std::string& why) {
+      ctx_fail(ins, li, Err::UnsupportedPtx, "tcgen05.mma: " + why);
+    };
+    const uint32_t id = static_cast<uint32_t>(value(op.idesc));
+    // The instruction descriptor (Table 51).
+    if (id & 4) refuse("the instruction descriptor asks for sparse A (bit 2), which is tcgen05.mma.sp");
+    if ((id & 0x40) || (id & (1u << 23)))
+      ctx_fail(ins, li, Err::InvalidValue, "tcgen05.mma instruction descriptor sets a reserved bit");
+    if (id >> 30) refuse("the instruction descriptor's B-reuse shift (bits 30-31) is for .ws only");
+    const bool sat = id >> 3 & 1;
+    const uint32_t dtype = id >> 4 & 3, atype = id >> 7 & 7, btype = id >> 10 & 7;
+    const bool neg_a = id >> 13 & 1, neg_b = id >> 14 & 1;
+    const bool trans_a = id >> 15 & 1, trans_b = id >> 16 & 1;
+    const uint32_t N = (id >> 17 & 0x3F) << 3, M = (id >> 24 & 0x1F) << 4;
+    const bool k_bit = id >> 29 & 1;
+    // Element types by kind, and K: 256 bits of A's row.
+    WgmmaElem ta{}, tb{};
+    uint32_t bits = 16;
+    bool d_f16 = false, d_int = false;
+    auto bad = [&]() {
+      ctx_fail(ins, li, Err::InvalidValue,
+               "tcgen05.mma instruction descriptor 0x" + [&] {
+                 char b[12];
+                 std::snprintf(b, sizeof b, "%08x", id);
+                 return std::string(b);
+               }() + " has types this .kind does not define (Table 51)");
+    };
+    switch (op.mma_kind) {
+      case Tcgen05MmaKind::F16:
+        if (atype > 1 || btype != atype || dtype > 1 || (dtype == 0 && atype != 0)) bad();
+        ta = tb = atype ? WgmmaElem::BF16 : WgmmaElem::F16;
+        d_f16 = dtype == 0;
+        break;
+      case Tcgen05MmaKind::TF32:
+        if (atype != 2 || btype != 2 || dtype != 1) bad();
+        ta = tb = WgmmaElem::TF32;
+        bits = 32;
+        break;
+      case Tcgen05MmaKind::F8F6F4: {
+        auto el = [&](uint32_t t) {
+          if (t == 0) return WgmmaElem::E4M3;
+          if (t == 1) return WgmmaElem::E5M2;
+          if (t >= 3 && t <= 5)
+            refuse("the 6- and 4-bit types (E2M3, E3M2, E2M1) of .kind::f8f6f4, whose packing is "
+                   "not implemented yet");
+          bad();
+          return WgmmaElem::E4M3;
+        };
+        if (dtype > 1) bad();
+        ta = el(atype);
+        tb = el(btype);
+        d_f16 = dtype == 0;
+        bits = 8;
+        break;
+      }
+      case Tcgen05MmaKind::I8:
+        if (atype > 1 || btype > 1 || dtype != 2) bad();
+        ta = atype ? WgmmaElem::S8 : WgmmaElem::U8;
+        tb = btype ? WgmmaElem::S8 : WgmmaElem::U8;
+        d_int = true;
+        bits = 8;
+        if (neg_a || neg_b) bad();
+        break;
+    }
+    if (sat && !d_int) bad();
+    if (k_bit) refuse("K = 64 for 8-bit types (instruction descriptor bit 29) is sm_107f's");
+    const uint32_t K = 256 / bits;
+    const uint32_t G = op.cta_group;
+    const bool shape_ok =
+        G == 1 ? (M == 64 || M == 128) && N >= 8 && N <= 256 && N % 8 == 0 &&
+                     !(d_int && M == 128 && N % 16)
+               : (M == 128 || M == 256) && N >= 16 && N <= 256 && N % (d_int ? 32 : 16) == 0;
+    if (!shape_ok)
+      ctx_fail(ins, li, Err::InvalidValue,
+               "tcgen05.mma.cta_group::" + std::to_string(G) + " of shape M=" + std::to_string(M) +
+                   " N=" + std::to_string(N) + ", which Table 48 does not define");
+    if (op.a_tmem && trans_a) bad();
+
+    const std::vector<const BlockCtx*> ctas = tcgen05_ctas(ctx, ins, G);
+    const uint32_t Mloc = M / G, Nloc = N / G;
+    const uint32_t d_addr = static_cast<uint32_t>(value(op.d_tmem));
+    const uint32_t d_lane0 = d_addr >> 16, d_col0 = d_addr & 0xFFFF;
+    // Where D element (row m of this CTA's Mloc, column n) lives: the
+    // data-path layouts of 9.7.18.10.5 -- D (M=128), F (M=64, lanes 0-15 or
+    // 16-31 of each warp's quarter), A (M=256 over a pair) and B (M=128 over a
+    // pair, the upper half of N in lanes 64-127).
+    const bool layout_b = G == 2 && M == 128;
+    const bool layout_f = G == 1 && M == 64;
+    auto lane_align_ok = [&](uint32_t l) { return layout_f ? (l == 0 || l == 16) : l == 0; };
+    if (!lane_align_ok(d_lane0))
+      ctx_fail(ins, li, Err::InvalidValue,
+               "tcgen05.mma's D address has lane " + std::to_string(d_lane0) +
+                   "; this shape's data-path layout starts at lane 0" +
+                   (layout_f ? " or 16" : ""));
+    auto d_pos = [&](uint32_t m, uint32_t n, uint32_t lane0, uint32_t* dl, uint32_t* dc) {
+      if (layout_f) { *dl = (m / 16) * 32 + m % 16 + lane0; *dc = n; }
+      else if (layout_b) { *dl = m + 64 * (n / (N / 2)); *dc = n % (N / 2); }
+      else { *dl = m; *dc = n; }
+    };
+    const uint32_t d_cols = layout_b ? N / 2 : N;
+    for (const BlockCtx* c : ctas)
+      for (uint32_t col = d_col0; col < d_col0 + d_cols; ++col)
+        if (col >= TensorMemory::kCols || !tmem_of(*c).allocated(col))
+          ctx_fail(ins, li, Err::OutOfBounds,
+                   "tcgen05.mma writes D to Tensor Memory column " + std::to_string(col) +
+                       ", which no tcgen05.alloc has allocated" + (c != &ctx ? " in the peer CTA" : ""));
+    const double sa = neg_a ? -1.0 : 1.0, sb = neg_b ? -1.0 : 1.0;
+    const uint32_t eb = bits / 8;
+
+    // B: K x N, CTA v supplying columns [v*Nloc, (v+1)*Nloc) from its own
+    // shared memory at the descriptor's offsets (the peer's half of a pair
+    // sits at the same offsets there).
+    std::vector<double> B(size_t{K} * N);
+    {
+      const WgmmaDesc d = decode_tcgen05_desc(ins, value(op.b_desc));
+      for (uint32_t v = 0; v < G; ++v) {
+        const uint32_t rank = cluster_rank_of(*ctas[v]);
+        for (uint32_t n = 0; n < Nloc; ++n)
+          for (uint32_t k = 0; k < K; ++k) {
+            const uint64_t at = wgmma_smem_offset(d, !trans_b, eb, n, k);
+            B[size_t{k} * N + v * Nloc + n] =
+                sb * wgmma_decode(tb, load_routed(w, ctx, ins, lane,
+                                                  kSharedVaBase + cluster_address(ctx, rank, at), eb));
+          }
+      }
+    }
+    // A, by the Tensor Memory lane each D row is written to: from shared
+    // memory, the row that lane holds; from Tensor Memory, whatever that
+    // lane holds, packed 32 bits to a column (9.7.18.10.4) -- so layout B's
+    // duplicated A must really be in both halves, as on the hardware.
+    const uint32_t a_addr = op.a_tmem ? static_cast<uint32_t>(value(op.a)) : 0;
+    if (op.a_tmem && !lane_align_ok(a_addr >> 16))
+      ctx_fail(ins, li, Err::InvalidValue,
+               "tcgen05.mma's A address has lane " + std::to_string(a_addr >> 16) +
+                   ", which must match D's data-path lane alignment");
+    if (op.a_tmem && layout_f && (a_addr >> 16) != d_lane0)
+      ctx_fail(ins, li, Err::InvalidValue,
+               "for M = 64, A and D must use the same Tensor Memory lane alignment (9.7.18.10.5)");
+    const WgmmaDesc a_desc = op.a_tmem ? WgmmaDesc{} : decode_tcgen05_desc(ins, value(op.a));
+    Mask keep = 1;
+    if (const auto* imm = std::get_if<ImmInt>(&op.enable_d)) keep = imm->value != 0;
+    else if (const auto* r = std::get_if<RegOperand>(&op.enable_d)) keep = read_pred(w, ins, r->reg) >> lane & 1;
+    else refuse("enable-input-d must be a predicate or 0/1");
+    const bool accumulate = keep != 0;
+    // disable-output-lane: bit l of the vector leaves D's lane l alone.
+    std::array<uint32_t, 8> off_mask{};
+    for (size_t i = 0; i < op.disable_lanes.size(); ++i)
+      off_mask[i] = static_cast<uint32_t>(value(op.disable_lanes[i]));
+    if (G == 2)
+      for (uint32_t x : off_mask)
+        if (x) refuse("a nonzero disable-output-lane with .cta_group::2; the ISA does not say which "
+                      "CTA's lanes its upper half covers");
+    const double d_scale = op.scale_d > 0 ? std::ldexp(1.0, -op.scale_d) : 1.0;
+
+    std::vector<double> A(K);
+    for (uint32_t v = 0; v < G; ++v) {
+      TensorMemory& t = tmem_of(*ctas[v]);
+      const uint32_t rank = cluster_rank_of(*ctas[v]);
+      // A's rows of this CTA from shared memory, read once.
+      std::vector<double> As;
+      if (!op.a_tmem) {
+        As.resize(size_t{Mloc} * K);
+        for (uint32_t m = 0; m < Mloc; ++m)
+          for (uint32_t k = 0; k < K; ++k) {
+            const uint64_t at = wgmma_smem_offset(a_desc, !trans_a, eb, m, k);
+            As[size_t{m} * K + k] =
+                sa * wgmma_decode(ta, load_routed(w, ctx, ins, lane,
+                                                  kSharedVaBase + cluster_address(ctx, rank, at), eb));
+          }
+      }
+      for (uint32_t m = 0; m < Mloc; ++m)
+        for (uint32_t n = 0; n < N; ++n) {
+          uint32_t dl, dc;
+          d_pos(m, n, d_lane0, &dl, &dc);
+          if (off_mask[dl / 32] >> (dl % 32) & 1) continue;
+          if (op.a_tmem) {
+            const uint32_t al = dl - d_lane0 + (a_addr >> 16), ac0 = a_addr & 0xFFFF;
+            for (uint32_t k = 0; k < K; ++k) {
+              const uint32_t col = ac0 + k * bits / 32;
+              if (col >= TensorMemory::kCols || !t.allocated(col))
+                ctx_fail(ins, li, Err::OutOfBounds,
+                         "tcgen05.mma reads A from Tensor Memory column " + std::to_string(col) +
+                             ", which no tcgen05.alloc has allocated");
+              A[k] = sa * wgmma_decode(ta, t.at(al, col) >> (k * bits % 32));
+            }
+          } else {
+            std::copy_n(As.begin() + size_t{m} * K, K, A.begin());
+          }
+          uint32_t& cell = t.at(dl, d_col0 + dc);
+          if (d_int) {
+            int64_t acc = accumulate ? static_cast<int32_t>(cell) : 0;
+            for (uint32_t k = 0; k < K; ++k)
+              acc += static_cast<int64_t>(A[k]) * static_cast<int64_t>(B[size_t{k} * N + n]);
+            if (sat)
+              acc = std::clamp<int64_t>(acc, std::numeric_limits<int32_t>::min(),
+                                        std::numeric_limits<int32_t>::max());
+            cell = static_cast<uint32_t>(static_cast<int32_t>(acc));
+            continue;
+          }
+          // As wgmma: every product here is exact in f32, and the sum is
+          // kept in f32. An f16 D is one 16-bit value in the low half of its
+          // cell (9.7.18.10.4.1).
+          float acc = 0.0f;
+          if (accumulate) {
+            const double old = d_f16 ? f16_to_double(cell & 0xFFFF) : static_cast<double>(f32(cell));
+            acc = static_cast<float>(old * d_scale);
+          }
+          for (uint32_t k = 0; k < K; ++k)
+            acc += static_cast<float>(A[k]) * static_cast<float>(B[size_t{k} * N + n]);
+          cell = d_f16 ? static_cast<uint32_t>(double_to_f16(acc) & 0xFFFF) : f32bits(acc);
+        }
+    }
   }
 
   // The same fragments as exec_wmma_mma below, read from and written to the

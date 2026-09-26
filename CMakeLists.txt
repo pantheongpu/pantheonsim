@@ -601,6 +601,8 @@ vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
 # Hopper (sm_90a): the warpgroup MMA, against the ISA's own layout examples.
 vgpu_unit_test(test_hopper)
+# Blackwell (sm_100a): Tensor Memory and tcgen05, against the ISA's figures.
+vgpu_unit_test(test_blackwell)
 # The interpreter's fast paths, bit for bit against its general path.
 vgpu_unit_test(test_fastpath)
 # Distributed shared memory: blocks of a cluster reaching each other's.

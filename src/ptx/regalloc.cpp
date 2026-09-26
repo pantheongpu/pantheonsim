@@ -95,6 +95,19 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
           use_operand(op.b_desc);
           use_operand(op.scale_d);
         }
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpTcgen05>) {
+          for (const auto& r : op.regs) (op.kind == Tcgen05Kind::Ld ? defs : uses).push_back(r.id);
+          for (const Operand* o : {&op.taddr, &op.ncols, &op.cta_mask, &op.d_tmem, &op.b_desc,
+                                   &op.idesc, &op.enable_d})
+            use_operand(*o);
+          for (const auto& o : op.disable_lanes) use_operand(o);
+        }
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpClc>) {
+          use_addr(op.mbar);
+          if (op.response.id != kNoReg) uses.push_back(op.response.id);
+          for (const auto& r : op.dst)
+            if (r.id != kNoReg) defs.push_back(r.id);
+        }
       },
       ins.op);
 }
