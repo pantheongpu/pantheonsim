@@ -2795,6 +2795,7 @@ struct Machine {
     if ((d3 >> 23) & 1)
       throw Error::make(Err::Unsupported, in.name, " through a buffer that adds the lane's id, which this does not model");
     const uint64_t soffset = static_cast<uint32_t>(scalar(w, soff));
+    const bool valid_format = ((d3 >> 15) & 0xF) != 0;
     const std::string_view body = std::string_view(in.name).substr(7);   // past "buffer_"
     Narrow n;
     const bool part = narrow(in.name, &n);
@@ -2806,7 +2807,11 @@ struct Machine {
       const uint64_t offset = uint64_t{in.offen ? word(w, vaddr, in.idxen ? 1 : 0, lane) : 0} +
                               static_cast<uint32_t>(in.offset);
       const uint64_t addr = base + soffset + offset + uint64_t{index} * stride;
+      // A resource whose data format is 0 (BUF_DATA_FORMAT_INVALID) holds
+      // nothing: every access is out of range, which MIOpen's hand-written
+      // kernels use to switch a store off.
       const auto fits = [&](uint64_t at, uint64_t bytes) {
+        if (!valid_format) return false;
         return stride ? index < records : soffset + at + bytes <= records;
       };
       if (Half h; half_access(body, &h)) {

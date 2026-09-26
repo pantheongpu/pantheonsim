@@ -6,10 +6,11 @@
 // gives them; a dot product; 2/pi for a trig reduction; an accumulation
 // register copied; output multipliers; op_sel on a long form; SDWA keeping
 // the rest of its destination; VGPR indexing; 64-bit and packed atomics in
-// memory and LDS; and an 8-bit float conversion into the high half of a
-// register. Built for gfx942 by build.sh, with clang's assembler.
+// memory and LDS; an 8-bit float conversion into the high half of a
+// register; and a buffer resource with no data format, which holds
+// nothing. Built for gfx942 by build.sh, with clang's assembler.
 //
-// libs(int* out) writes 59 words, in the order the test lists them.
+// libs(int* out) writes 61 words, in the order the test lists them.
   .amdgcn_target "amdgcn-amd-amdhsa--gfx942"
   .text
   .globl libs
@@ -233,6 +234,20 @@ libs:
   v_mov_b32_e32 v79, 0xbeef
   v_cvt_pk_fp8_f32 v79, 1.0, 2.0 op_sel:[0,0,1]
   global_store_dword v0, v79, s[2:3] offset:232
+  // A buffer resource whose data format is 0 holds nothing: a store through
+  // it does not land (the 5 stored first stays), and a load reads 0.
+  v_mov_b32_e32 v1, 5
+  global_store_dword v0, v1, s[2:3] offset:236
+  s_waitcnt vmcnt(0)
+  s_mov_b32 s40, s2
+  s_and_b32 s41, s3, 0xffff
+  s_mov_b32 s42, 0x1000
+  s_mov_b32 s43, 0
+  v_mov_b32_e32 v1, 0x1234
+  buffer_store_dword v1, off, s[40:43], 0 offset:236
+  buffer_load_dword v2, off, s[40:43], 0 offset:236
+  s_waitcnt vmcnt(0)
+  global_store_dword v0, v2, s[2:3] offset:240
   s_endpgm
 .Lset:
   s_mov_b32 s26, 77
