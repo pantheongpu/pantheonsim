@@ -2208,8 +2208,15 @@ class Parser {
         if (sparse) {
           // All four threads of a group hold its metadata at these shapes, so
           // the selector is 0 (9.7.16.6.1).
+          // CUTLASS braces the metadata register, as it does the scale data.
           expect_punct(",");
-          op.meta = parse_operand();
+          if (peek_punct("{")) {
+            const std::vector<Operand> v = parse_operand_vector_any();
+            if (v.size() != 1) fail(ins.line, "mma.sp's metadata is one register");
+            op.meta = v[0];
+          } else {
+            op.meta = parse_operand();
+          }
           expect_punct(",");
           op.selector = parse_operand();
           const auto* sel = std::get_if<ImmInt>(&op.selector);
