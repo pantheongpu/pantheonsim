@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# PyTorch's CUDA build, unmodified, on a simulated NVIDIA GPU.
+#
+#   run_pytorch.sh <checks.py> <count> [gpu]      (nvidia/rtx5090 by default)
+#
+# <checks.py> prints "ok <name>" or "FAIL <name>: <why>" per check; <count> is
+# how many it has. The Python it runs is one with PyTorch's CUDA 13 build
+# installed: VGPU_TORCH_CUDA_PYTHON, or a venv under ~/.local/share/torch-cu13*.
+# Where there is none, it skips.
+#
+# The GPU is an sm_120 one because that is what PyTorch's wheels carry PTX for
+# (compute_120, beside SASS for older architectures); the simulator runs PTX,
+# and a driver JITs PTX only for a device at least as new.
+#
+# PyTorch finds NVIDIA's libraries through an RPATH into its nvidia-* packages,
+# which LD_LIBRARY_PATH does not override, so VirtualGPU's are preloaded: a
+# library already loaded under a soname is the one every later request for that
+# soname gets. NVIDIA's cuFile, cuSPARSELt and NVSHMEM load as they are; nothing
+# here calls them.
+set -uo pipefail
+script="$1" expected="$2" gpu="${3:-nvidia/rtx5090}"
+root="$(cd "$(dirname "$0")/../../.." && pwd)"
+build="${VGPU_BUILD_DIR:-$root/build}"
+shim="$build/shim"
+[[ -e "$shim/libcudart.so.13" ]] || { echo "SKIP: no CUDA 13 runtime shim in $shim"; exit 0; }
+python=""
+for c in "${VGPU_TORCH_CUDA_PYTHON:-}" $(ls -d "$HOME"/.local/share/torch-cu13*/bin/python 2>/dev/null); do
+  [[ -n "$c" && -x "$c" ]] && "$c" -c 'import torch, sys; sys.exit(0 if (torch.version.cuda or "").startswith("13") else 1)' 2>/dev/null &&
+    { python=$c; break; }
+done
+[[ -n "$python" ]] || { echo "SKIP: no Python with PyTorch for CUDA 13 (set VGPU_TORCH_CUDA_PYTHON)"; exit 0; }
+
+preload=""
+for l in libcuda.so.1 libcudart.so.13 libcublasLt.so.13 libcublas.so.13 libcudnn.so.9 libcufft.so.12 \
+         libcurand.so.10 libcusparse.so.12 libcusolver.so.12 libnccl.so.2 libnvrtc.so.13 libcupti.so.13 \
+         libnvidia-ml.so.1; do
+  [[ -e "$shim/$l" ]] || { echo "SKIP: no $l in $shim"; exit 0; }
+  preload+="${preload:+:}$shim/$l"
+done
+
+# As on AMD: a run held to a memory cap where systemd can hold one, since
+# PyTorch on a simulated device grows to gigabytes and the machines are shared.
+cap=()
+if command -v systemd-run >/dev/null && systemd-run --user --scope -q true 2>/dev/null; then
+  cap=(systemd-run --user --scope -q -p "MemoryMax=${VGPU_TORCH_MEMORY_MAX:-10G}" -p MemorySwapMax=0)
+fi
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+out=$(cd "$tmp" && TRITON_CACHE_DIR="$tmp/triton" TORCHINDUCTOR_CACHE_DIR="$tmp/inductor" \
+  VGPU_QUIET=1 VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" LD_PRELOAD="$preload" \
+  "${cap[@]}" "$python" "$script" 2>&1)
+status=$?
+echo "$out" | grep -E '^(ok|FAIL) ' | sed 's/^/      /'
+fail=0
+[[ $status == 0 ]] || { echo "FAIL  the checks ran to the end (exit $status)"; echo "$out" | tail -5; fail=1; }
+passed=$(grep -c '^ok ' <<< "$out")
+name=$(basename "$script")
+if grep -q '^FAIL ' <<< "$out" || [[ $passed != "$expected" ]]; then
+  echo "FAIL  every PyTorch check in $name matches the CPU on $gpu: $passed of $expected"; fail=1
+else
+  echo "ok    every PyTorch check in $name matches the CPU on $gpu: $expected of $expected"
+fi
+exit $fail

@@ -39,6 +39,7 @@ set(VGPU_PROFILES
   nvidia/a10g
   nvidia/l4
   nvidia/l40s
+  nvidia/rtx5090
   amd/mi250x
   amd/mi300x
   amd/mi325x

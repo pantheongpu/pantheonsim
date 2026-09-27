@@ -16,6 +16,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <memory>
 #include <mutex>
@@ -824,6 +825,17 @@ VGPU_EXPORT CUresult cuModuleLoadData(CUmodule* module, const void* image) {
 // cuModuleLoadData: pull the PTX out and load it.
 VGPU_EXPORT CUresult cuModuleLoadFatBinary(CUmodule* module, const void* fatCubin) {
   return cuModuleLoadData(module, fatCubin);
+}
+
+// A module from a file: its bytes, loaded as cuModuleLoadData loads them.
+// PTX text is terminated, as the driver requires of an image in memory.
+VGPU_EXPORT CUresult cuModuleLoad(CUmodule* module, const char* fname) {
+  if (!module || !fname) return CUDA_ERROR_INVALID_VALUE;
+  std::ifstream f(fname, std::ios::binary);
+  if (!f) return CUDA_ERROR_FILE_NOT_FOUND;
+  std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  if (bytes.size() < 4) return CUDA_ERROR_INVALID_IMAGE;
+  return cuModuleLoadData(module, bytes.c_str());
 }
 
 // Releasing the primary context. Nothing is cached per context here, so this

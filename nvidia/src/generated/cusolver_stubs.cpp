@@ -103,6 +103,10 @@ VGPU_EXPORT int cusolverDnXgesvdjSetTolerance() { vgpu_report_unimplemented("cus
 VGPU_EXPORT int cusolverDnXpotrf() { vgpu_report_unimplemented("cusolverDnXpotrf"); return 31; }
 VGPU_EXPORT int cusolverDnXpotrf_bufferSize() { vgpu_report_unimplemented("cusolverDnXpotrf_bufferSize"); return 31; }
 VGPU_EXPORT int cusolverDnXpotrs() { vgpu_report_unimplemented("cusolverDnXpotrs"); return 31; }
+VGPU_EXPORT int cusolverDnXgeev() { vgpu_report_unimplemented("cusolverDnXgeev"); return 31; }
+VGPU_EXPORT int cusolverDnXgeev_bufferSize() { vgpu_report_unimplemented("cusolverDnXgeev_bufferSize"); return 31; }
+VGPU_EXPORT int cusolverDnXsyevBatched() { vgpu_report_unimplemented("cusolverDnXsyevBatched"); return 31; }
+VGPU_EXPORT int cusolverDnXsyevBatched_bufferSize() { vgpu_report_unimplemented("cusolverDnXsyevBatched_bufferSize"); return 31; }
 VGPU_EXPORT int cusolverDnXsyevd() { vgpu_report_unimplemented("cusolverDnXsyevd"); return 31; }
 VGPU_EXPORT int cusolverDnXsyevd_bufferSize() { vgpu_report_unimplemented("cusolverDnXsyevd_bufferSize"); return 31; }
 VGPU_EXPORT int cusolverDnXsyevjSetSortEig() { vgpu_report_unimplemented("cusolverDnXsyevjSetSortEig"); return 31; }

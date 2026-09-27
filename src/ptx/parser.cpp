@@ -1392,6 +1392,9 @@ class Parser {
         else if (inert_mem_modifier(p)) ;
         else if (p == "v2") vec = 2;
         else if (p == "v4") vec = 4;
+        // 256-bit accesses (PTX ISA 8.8, sm_100 and later): eight 32-bit
+        // elements, or four 64-bit ones, which .v4 already covers.
+        else if (p == "v8") vec = 8;
         else if (p == "b128") {
           ty = Type{Type::Kind::B, 64};
           have_ty = true;
@@ -1410,6 +1413,8 @@ class Parser {
       }
       if (!have_ty) fail(ins.line, "ld/st missing type: " + opcode);
       storage_bytes(ty, ins.line, opcode);
+      if (vec == 8 && (ty.bytes() != 4 || space != Space::Global))
+        return unsupported(".v8 " + op0 + " of other than 32-bit elements in global memory");
       if (op0 == "ld") {
         Addr addr;
         std::vector<Reg> dsts;
