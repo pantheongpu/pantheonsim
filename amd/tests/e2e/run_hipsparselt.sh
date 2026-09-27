@@ -34,11 +34,14 @@ cap=()
 if command -v systemd-run >/dev/null && systemd-run --user --scope -q true 2>/dev/null; then
   cap=(systemd-run --user --scope -q -p "MemoryMax=${VGPU_TORCH_MEMORY_MAX:-10G}" -p MemorySwapMax=0)
 fi
-out=$(VGPU_QUIET=1 VGPU_GPU="$gpu" LD_LIBRARY_PATH="$tmp" "${cap[@]}" "$root/amd/tests/hipsparselt/spmm" 2>&1)
+out=$(VGPU_GPU="$gpu" LD_LIBRARY_PATH="$tmp" "${cap[@]}" "$root/amd/tests/hipsparselt/spmm" 2>&1)
 status=$?
 echo "$out" | sed 's/^/      /'
 fail=0
 [[ $status == 0 ]] || { echo "FAIL  the hipSPARSELt program ran to the end (exit $status)"; fail=1; }
+# A kernel the simulator could not run is reported, not hidden: a product
+# built from whatever was in the buffer must not pass.
+if grep -q 'VirtualGPU error \[' <<< "$out"; then echo "FAIL  the simulator ran every kernel it was given"; fail=1; fi
 right=$(grep -c ': pruned 2:4, 0 runs of four not 2:4, 0 of [0-9]* wrong$' <<< "$out")
 if [[ $right == 6 ]]; then echo "ok    each hipSPARSELt sparse GEMM is the host's product on $gpu: 6 of 6"
 else echo "FAIL  each hipSPARSELt sparse GEMM is the host's product on $gpu: $right of 6"; fail=1; fi
