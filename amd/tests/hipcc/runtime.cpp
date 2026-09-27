@@ -5,6 +5,7 @@
 // device reading and writing another's memory once peer access is enabled.
 #include <hip/hip_runtime.h>
 
+#include <cstdint>
 #include <cstdio>
 
 #define CHECK(x)                                                                    \
@@ -40,6 +41,9 @@ __global__ void __launch_bounds__(256) wide(int* out) {
                "v117", "v118", "v119", "v120", "v121", "v122", "v123", "v124", "v125", "v126", "v127");
   out[blockIdx.x * blockDim.x + threadIdx.x] = 1;
 }
+
+// Reads memory no allocation holds, so the launch fails.
+__global__ void faulting(int* out) { out[threadIdx.x] = *reinterpret_cast<volatile int*>(uintptr_t{0x10}); }
 
 // Runs on device 0 with two of its pointers into device 1.
 __global__ void from_peer(const int* peer_in, int* peer_out, int* local_out) {
@@ -146,5 +150,13 @@ int main() {
   std::printf("a kernel on device 0 read and wrote device 1's memory right for %d of %d elements\n", right, n);
   CHECK(hipDeviceDisablePeerAccess(1));
   std::printf("disabling it again: %s\n", hipGetErrorName(hipDeviceDisablePeerAccess(1)));
+  // A kernel that fails is reported by the blocking copy after it, not
+  // passed over; the copy after that goes through.
+  faulting<<<1, 64>>>(local_out);
+  const hipError_t first = hipMemcpy(local, local_out, sizeof local, hipMemcpyDeviceToHost);
+  const hipError_t second = hipMemcpy(local, local_out, sizeof local, hipMemcpyDeviceToHost);
+  (void)hipGetLastError();
+  std::printf("a failed launch is reported by the copy after it: %s, then %s\n", hipGetErrorName(first),
+              hipGetErrorName(second));
   return 0;
 }
