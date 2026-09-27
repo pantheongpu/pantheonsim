@@ -126,6 +126,7 @@ add_library(vgpu STATIC
   amd/src/codeobject.cpp
   amd/src/gcn_decode.cpp
   amd/src/rdna_decode.cpp
+  amd/src/debugger.cpp
   amd/src/gcn_exec.cpp
   amd/src/hostcall.cpp
   src/core/machine.cpp
@@ -570,7 +571,7 @@ else()
 endif()
 
 # CLI
-add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/test.cpp src/cli/ncu.cpp
+add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/debug.cpp src/cli/test.cpp src/cli/ncu.cpp
                src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
@@ -832,6 +833,10 @@ set_tests_properties(amd_hipsparselt PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_hipsparselt_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipsparselt.sh amd/mi350x)
 set_tests_properties(amd_hipsparselt_mi350x PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# The kernel debugger (vgpu debug), driven by a file of commands.
+add_test(NAME amd_debugger COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_debugger.sh)
+set_tests_properties(amd_debugger PROPERTIES DEPENDS "vgpu_cli;vgpuhip"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 # And on an RDNA3 consumer card (gfx1100, wave32 and wave64 kernels, WMMA).
 add_test(NAME amd_pytorch_rx7900xtx COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/rx7900xtx)
 set_tests_properties(amd_pytorch_rx7900xtx PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE

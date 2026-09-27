@@ -403,6 +403,33 @@ RCCL (PyTorch's collectives on ROCm) runs unmodified across simulated GPUs in on
 - **Wide accesses.** A `global_`, `flat_` or `buffer_` load or store of two to four words moves each aligned pair of words as one 8-byte access, as the hardware does. RCCL's LL protocol puts a word of data and the flag that says it arrived in the same eight bytes, and a reader on another device trusts the data once it sees the flag. When a wide access moved one word at a time, a reader could see the new flag beside the old data, and `broadcast` lost values.
 - **Opened IPC memory.** Memory from another process's `hipIpcGetMemHandle` is mapped where the exporter's device is numbered, and every other device in the process reaches it without `hipDeviceEnablePeerAccess`, as `hipIpcMemLazyEnablePeerAccess` asks. RCCL's kernels write straight into the other process's buffer.
 
+## Debugging
+
+`vgpu debug` runs an AMD program with a kernel debugger:
+
+```
+vgpu debug --gpu amd/mi300x -- ./program            # commands at a (vgpu) prompt
+vgpu debug -x session.txt --gpu amd/mi300x -- ./program   # or from a file
+```
+
+- **Stopping:**
+  - `break KERNEL[+OFFSET]` stops every wave of a kernel that reaches OFFSET, in bytes from its first instruction. The kernel is matched by any part of its name. `tbreak` stops once.
+  - `continue` goes on; `step [N]` runs N instructions of the stopped wave.
+  - `delete [N]` and `info breakpoints` manage breakpoints.
+- **Looking:**
+  - `where` gives the kernel, offset, work-group, wave and EXEC; `disas [N]` lists instructions from there.
+  - `info registers` shows PC, EXEC, VCC, SCC, M0, MODE and the SGPRs.
+  - `print[/x|/d|/f] REG` prints a register for every lane (eight to a row, a switched-off lane marked) or for the lane `lane N` picks.
+  - `x/N ADDR` and `x/N lds:ADDR` show device memory and the work-group's LDS.
+- **Changing:** `set REG[LANE] = VALUE` changes a register; `quit` fails the launch.
+
+While the debugger is on, work-groups run on one host thread. A stopped wave
+stops its dispatch, and everything else runs in a repeatable order.
+`VGPU_DEBUG=/dev/tty` or `VGPU_DEBUG=FILE` turns it on without the command.
+`VGPU_TRACE_WAVE=1` instead prints every instruction a work-group's first wave
+runs, with its results. `amd/tests/e2e/run_debugger.sh` (ctest `amd_debugger`)
+runs a session.
+
 ## Profiling
 
 AMD's profiler, `rocprofv3`, runs unmodified on a simulated GPU. It is a front
@@ -428,7 +455,11 @@ every instruction a wave issues passes through it once: `SQ_WAVES` and the
 waves by how many lanes they start with, the instructions each unit issues
 (`SQ_INSTS_VALU`, `_MFMA`, `_SALU`, `_SMEM`, `_VMEM`, `_FLAT`, `_LDS`,
 `_BRANCH`, `_SENDMSG`, `_GDS`), and the flat reads, writes and atomics the
-texture addresser takes (`TA_FLAT_*`). Each is the device's total, as one
+texture addresser takes (`TA_FLAT_*`). There is also the instruction mix, each
+instruction classed once as it is decoded:
+- `SQ_INSTS_VALU_{ADD,MUL,FMA,TRANS}_{F16,F32,F64}`, `_CVT`, `_INT32` and `_INT64`;
+- matrix work in 512-operation units, `SQ_INSTS_VALU_MFMA_MOPS_{I8,F16,BF16,F32,F64,F8}`, with RDNA's WMMA included;
+- vector memory reads and writes, `SQ_INSTS_VMEM_RD` and `_WR`. Each is the device's total, as one
 instance. A counter of cycles, stalls, cache hits or memory traffic would
 need a model of the hardware's timing, and there is none, so those are not
 offered: rocprofv3 says the device does not have one, as it does for a
