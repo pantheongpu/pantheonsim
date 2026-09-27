@@ -524,12 +524,12 @@ struct Sparse {
 // cells at column `col`, each partition p holding rows 32p.. (16p.. for M =
 // 64, from lane `lane0`).
 void put_meta(std::vector<uint32_t>& cells, int a_cols, int col, int rows, int per_part, int lane0,
-              bool eight_bit, int sel, int K, const Sparse& sp) {
+              bool eight_bit, int sel, int K, const Sparse& sp, int row0 = 0) {
   for (int m = 0; m < rows; ++m)
     for (int c = 0; c < K / sp.w; ++c) {
       const MetaCell mc = meta_cell(eight_bit, m % per_part, c, sel);
       const int lane = 32 * (m / per_part) + lane0 + mc.lane;
-      cells[size_t(lane) * a_cols + col + mc.col] |= sp.field(m, c) << mc.bit;
+      cells[size_t(lane) * a_cols + col + mc.col] |= sp.field(row0 + m, c) << mc.bit;
     }
 }
 
@@ -1412,6 +1412,49 @@ VTEST(tcgen05_mma_sp_mxf4_pairs_four_blocks) {
                [&](int n, int j) { return ue8m0(sb(n, j)); });
 }
 
+// M = 128 over a CTA pair with sparse A is layout C (figures 215-216): 64
+// rows a CTA, sixteen in each warp's quarter as layout F has them, all N
+// columns in the row's lane; each CTA's metadata likewise.
+VTEST(tcgen05_mma_sp_cta_pair_m128_layout_c) {
+  const int M = 128, N = 32, K = 32;
+  const Sparse sp{4};
+  auto S = [](int m, int j) { return val(m, j, 5); };
+  auto A = [&](int m, int k) { return sp.dense(m, k, S); };
+  auto B = [](int k, int n) { return val(k, n, 9); };
+  const Operands o = images(2, M, N, K / 2, 2, Major::K, Major::K, 0, 0, 128, 256, 128, 512,
+                            [&](int m, int j) { return f16_bits(S(m, j)); },
+                            [&](int n, int k) { return f16_bits(B(k, n)); });
+  // images() takes K / 2 for both; B needs all of K.
+  std::vector<std::vector<uint8_t>> b(2);
+  for (int v = 0; v < 2; ++v)
+    for (int n = 0; n < N / 2; ++n)
+      for (int k = 0; k < K; ++k)
+        put(b[v], canonical(Major::K, 0, 2, 128, 512, n, k), f16_bits(B(k, v * (N / 2) + n)), 2);
+  Mma x;
+  x.group = 2;
+  x.sparse = true;
+  x.id = idesc(1, 0, 0, M, N) | 4;
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 512, 0);
+  x.smem_a = o.a;
+  x.smem_b = b;
+  x.cols = 64;
+  x.a_is_tmem = false;
+  x.a_cols = 2;
+  x.a_col = 32;
+  x.meta_col = 32;
+  x.a_tmem.assign(2, std::vector<uint32_t>(128 * 2));
+  for (int v = 0; v < 2; ++v) put_meta(x.a_tmem[v], 2, 0, 64, 16, 0, false, 0, K, sp, 64 * v);
+  const auto out = x.run();
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      float want = 0;
+      for (int k = 0; k < K; ++k) want += A(m, k) * B(k, n);
+      const int cta = m / 64, lane = (m % 64) / 16 * 32 + m % 16;
+      VCHECK_EQ(bits_f32(out[cta][size_t(lane) * 64 + n]), want);
+    }
+}
+
 VTEST(tcgen05_mma_sp_refuses_what_the_isa_rules_out) {
   Mma x;
   x.sparse = true;
@@ -2023,7 +2066,8 @@ VTEST(tma_packed_types_encoder_rules) {
 }
 
 // .b6x16_p32 load with the 128-byte swizzle: each 16 values' 12 packed bytes
-// open a 16-byte slot, the other 4 bytes left as they were.
+// open a 16-byte slot, the other 4 bytes left as they were, and the barrier
+// completes the 12 bytes a group that were copied.
 VTEST(tma_load_b6x16_p32_pads_each_group) {
   MemoryManager mem{1 << 20};
   const int W = 256, H = 4;
@@ -2039,7 +2083,8 @@ VTEST(tma_load_b6x16_p32_pads_each_group) {
   const unsigned box[2] = {128, 2}, es[2] = {1, 1};
   VCHECK(exec::encode_tiled(buf, 15, 2, reinterpret_cast<void*>(g), dims, strides, box, es, 0, 3, 0, 0, &why) ==
          exec::TmapResult::Ok);
-  const auto tile = tma_packed(mem, std::vector<uint8_t>(buf, buf + 128), true, 128, 1, 16 * 16, {});
+  // The barrier expects the packed bytes: twelve for each group.
+  const auto tile = tma_packed(mem, std::vector<uint8_t>(buf, buf + 128), true, 128, 1, 16 * 12, {});
   for (int grp = 0; grp < 16; ++grp) {
     const int y = 1 + grp / 8, x0 = 128 + 16 * (grp % 8);
     std::vector<uint8_t> v(vals.begin() + y * W + x0, vals.begin() + y * W + x0 + 16);

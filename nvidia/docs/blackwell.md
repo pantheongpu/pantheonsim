@@ -167,7 +167,9 @@ before waiting for it is not caught here.
   cuda.h's rules for each. Global memory holds the values packed; a copy
   moves sixteen at a time, into 8 bytes of shared memory for `.b4x16` and a
   16-byte slot for the others -- the packed bytes first, the padding left as
-  it was, as the ISA calls it uninitialized. A store of type 15 is
+  it was, as the ISA calls it uninitialized. The barrier completes the
+  packed bytes (12 a group of fp6, not 16): CUTLASS's block-scaled kernels
+  expect exactly that and never finish otherwise. A store of type 15 is
   `.b6p2x16`: sixteen bytes with the value in bits 0-5, packed into twelve.
   `.b4x16_p64` cannot be stored, the padded types' first coordinate must be
   a multiple of 128, and a `.b4x16` copy that does not start on a group of

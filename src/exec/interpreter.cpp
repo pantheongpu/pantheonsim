@@ -1144,6 +1144,24 @@ class Interpreter {
              ": " + here;
       i = j;
     }
+    // The block's mbarriers whose current phase is still open, by shared
+    // offset: a wait that never ends is usually on one of these.
+    if (ctx.mbar) {
+      std::vector<std::pair<uint64_t, const Mbarrier*>> open;
+      for (const auto& [addr, b] : ctx.mbar->bars)
+        if (b.valid && (b.arrived || b.tx || !b.pending.empty())) open.emplace_back(addr, &b);
+      std::sort(open.begin(), open.end());
+      if (!open.empty()) out += "\n  mbarriers with an open phase (shared offset: phase, arrivals, bytes due):";
+      for (size_t i = 0; i < open.size() && i < 16; ++i) {
+        const Mbarrier& b = *open[i].second;
+        char line[160];
+        std::snprintf(line, sizeof line, "\n    0x%llx: phase %u, %llu of %llu arrived, %lld bytes due%s",
+                      static_cast<unsigned long long>(open[i].first & 0xFFFFFF), b.phase,
+                      static_cast<unsigned long long>(b.arrived), static_cast<unsigned long long>(b.expected),
+                      static_cast<long long>(b.tx), b.pending.empty() ? "" : ", copies not yet landed");
+        out += line;
+      }
+    }
     return out;
   }
 
@@ -6414,8 +6432,10 @@ class Interpreter {
     // data-path layouts of 9.7.18.10.5 -- D (M=128), F (M=64, lanes 0-15 or
     // 16-31 of each warp's quarter), A (M=256 over a pair) and B (M=128 over a
     // pair, the upper half of N in lanes 64-127).
-    const bool layout_b = G == 2 && M == 128;
-    const bool layout_f = G == 1 && M == 64;
+    // Sparse A over a pair with M = 128 is layout C instead of B: 64 rows
+    // a CTA, placed as layout F places its 64 (figures 215-216).
+    const bool layout_b = G == 2 && M == 128 && !sp;
+    const bool layout_f = (G == 1 && M == 64) || (G == 2 && M == 128 && sp);
     auto lane_align_ok = [&](uint32_t l) { return layout_f ? (l == 0 || l == 16) : l == 0; };
     if (!lane_align_ok(d_lane0))
       ctx_fail(ins, li, Err::InvalidValue,
@@ -8368,8 +8388,11 @@ class Interpreter {
             }
           }
         }
-        // The barrier counts every byte of the box, the zero-filled ones too.
-        pb.tx = total * es;
+        // The barrier counts every byte of the box, the zero-filled ones too
+        // -- for the packed types, the packed bytes, not the padded slots
+        // (a 128 x 128 .b6x16_p32 tile completes 12288, as CUTLASS's
+        // block-scaled kernels expect).
+        pb.tx = total * gs;
       }
       if (!op.to_shared) continue;
       // The barrier the load completes on, in the destination block.
