@@ -7,7 +7,8 @@
 # Every result is checked against the same arithmetic done on the host.
 #
 # rocBLAS (with hipBLASLt, which it links) is ROCm's, so this runs wherever
-# ROCm with rocBLAS is installed and skips everywhere else.
+# ROCm with rocBLAS is installed -- or, with the program amd/tests/rocblas/blas
+# built ahead of time, wherever PyTorch's ROCm wheel is -- and skips elsewhere.
 set -uo pipefail
 build="${VGPU_BUILD_DIR:-build}"
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -18,7 +19,20 @@ for c in "${VGPU_ROCM_PATH:-}" "${ROCM_PATH:-}" /opt/rocm $(ls -d "$HOME"/.local
   [[ -n "$c" && -x "$c/bin/hipcc" && -e "$c/include/rocblas/rocblas.h" ]] && ls "$c"/lib/librocblas.so.* >/dev/null 2>&1 &&
     { rocm=$c; break; }
 done
-[[ -n "$rocm" ]] || { echo "SKIP: no ROCm with rocBLAS found (set VGPU_ROCM_PATH)"; exit 0; }
+# Without ROCm (or with VGPU_ROCBLAS_FROM_WHEEL=1), the rocBLAS PyTorch's
+# ROCm wheel ships will do, with the program built ahead of time
+# (amd/tests/rocblas/blas, built by hipcc against it): that is how CI runs
+# this with nothing of ROCm installed.
+[[ "${VGPU_ROCBLAS_FROM_WHEEL:-}" == 1 ]] && rocm=""
+wheel=""
+if [[ -z "$rocm" && -x "$root/amd/tests/rocblas/blas" ]]; then
+  for c in "${VGPU_TORCH_PYTHON:-}" $(ls -d "$HOME"/.local/share/torch-rocm*/bin/python 2>/dev/null); do
+    [[ -n "$c" && -x "$c" ]] || continue
+    d=$("$c" -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))' 2>/dev/null)
+    [[ -n "$d" && -e "$d/librocblas.so" && -d "$d/rocblas/library" ]] && { wheel=$d; break; }
+  done
+fi
+[[ -n "$rocm" || -n "$wheel" ]] || { echo "SKIP: no ROCm with rocBLAS found (set VGPU_ROCM_PATH), and no PyTorch ROCm wheel"; exit 0; }
 fail=0
 expect() {  # expect <name> <expected> <actual>
   if [[ "$3" == "$2" ]]; then echo "ok    $1"; else
@@ -34,15 +48,29 @@ if command -v objdump >/dev/null; then
   preload=$(objdump -p "$shim/libamdhip64.so.7" 2>/dev/null | awk '/NEEDED/ && /lib(asan|tsan)\.so/ {print $2}')
 fi
 
-export ROCM_PATH=$rocm HIP_PATH=$rocm HIP_CLANG_PATH=$rocm/lib/llvm/bin HIP_DEVICE_LIB_PATH=$rocm/amdgcn/bitcode
-if ! "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 "$root/amd/tests/rocblas/blas.cpp" -o "$tmp/blas" \
-     -L"$rocm/lib" -lrocblas 2>"$tmp/err"; then
-  expect "hipcc builds the rocBLAS program" "yes" "no: $(grep -m2 error "$tmp/err")"
-  exit $fail
+if [[ -n "$rocm" ]]; then
+  export ROCM_PATH=$rocm HIP_PATH=$rocm HIP_CLANG_PATH=$rocm/lib/llvm/bin HIP_DEVICE_LIB_PATH=$rocm/amdgcn/bitcode
+  if ! "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 "$root/amd/tests/rocblas/blas.cpp" -o "$tmp/blas" \
+       -L"$rocm/lib" -lrocblas 2>"$tmp/err"; then
+    expect "hipcc builds the rocBLAS program" "yes" "no: $(grep -m2 error "$tmp/err")"
+    exit $fail
+  fi
+  # The shim takes libamdhip64's place; rocBLAS, hipBLASLt and the code
+  # objects rocBLAS loads are ROCm's own.
+  libs="$shim:$rocm/lib"
+else
+  # The wheel's libraries by the names the program asks for, HIP the
+  # simulator's; rocBLAS finds its kernels beside itself, in rocblas/library.
+  echo "      (rocBLAS from the PyTorch wheel at $wheel)"
+  mkdir -p "$tmp/lib"
+  for f in "$wheel"/*; do [[ "$(basename "$f")" == libamdhip64.so ]] || ln -s "$f" "$tmp/lib/"; done
+  ln -s "$wheel/librocblas.so" "$tmp/lib/librocblas.so.5"
+  ln -s "$(readlink -f "$shim/libamdhip64.so.7")" "$tmp/lib/libamdhip64.so"
+  ln -s "$(readlink -f "$shim/libamdhip64.so.7")" "$tmp/lib/libamdhip64.so.7"
+  cp "$root/amd/tests/rocblas/blas" "$tmp/blas"
+  libs="$tmp/lib"
 fi
-# The shim takes libamdhip64's place; rocBLAS, hipBLASLt and the code objects
-# rocBLAS loads are ROCm's own.
-out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_PRELOAD="$preload" LD_LIBRARY_PATH="$shim:$rocm/lib" "$tmp/blas" 2>&1)
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_PRELOAD="$preload" LD_LIBRARY_PATH="$libs" "$tmp/blas" 2>&1)
 status=$?
 echo "$out" | sed 's/^/      /'
 expect "the program runs to the end" "0" "$status"
