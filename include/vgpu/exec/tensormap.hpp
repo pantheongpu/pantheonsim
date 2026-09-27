@@ -132,24 +132,35 @@ struct TensorMap {
   }
 
   // Bytes in a swizzled shared-memory row for the modes implemented here, 0
-  // for none. The 128B atom variants are Blackwell's and are refused.
+  // for none, and the chunk the swizzle moves: 16 bytes, or Blackwell's 32
+  // and 64 (cuda.h: "Swizzle 32B chunks within 128B span"). The FLIP_8B
+  // variant is not implemented and has no span here.
   static uint32_t swizzle_bytes(TmapSwizzle s) {
     switch (s) {
       case TmapSwizzle::B32: return 32;
       case TmapSwizzle::B64: return 64;
-      case TmapSwizzle::B128: return 128;
+      case TmapSwizzle::B128:
+      case TmapSwizzle::B128Atom32:
+      case TmapSwizzle::B128Atom64: return 128;
       default: return 0;
     }
   }
+  static uint32_t swizzle_atom(TmapSwizzle s) {
+    return s == TmapSwizzle::B128Atom32 ? 32 : s == TmapSwizzle::B128Atom64 ? 64 : 16;
+  }
 };
 
-// The shared-memory swizzle TMA and wgmma both use (PTX ISA 5.5.7 and
-// 9.7.17.5.1.2): within each 128-byte line, the 16-byte chunk index is XORed
-// with the line's index modulo the pattern -- bits 4.. XOR bits 7.. of the
-// address, taking one bit for 32B, two for 64B and three for 128B.
-inline uint64_t swizzle_address(uint64_t addr, uint32_t swizzle_bytes) {
+// The shared-memory swizzle TMA, wgmma and tcgen05 use (PTX ISA 5.5.7,
+// 9.7.17.5.1.2 and 9.7.18.10.6): within each 128-byte line, the index of an
+// `atom`-byte chunk is XORed with the line's index modulo the pattern -- for
+// 16-byte chunks bits 4.. XOR bits 7.., one bit for 32B, two for 64B and three
+// for 128B (CuTe's Swizzle<B,4,3>); for Blackwell's 32- and 64-byte chunks
+// in a 128-byte span, bits 5-6 XOR bits 7-8 (Swizzle<2,5,2>) and bit 6 XOR
+// bit 7 (Swizzle<1,6,1>).
+inline uint64_t swizzle_address(uint64_t addr, uint32_t swizzle_bytes, uint32_t atom = 16) {
   if (!swizzle_bytes) return addr;
-  return addr ^ (((addr >> 7) & (swizzle_bytes / 16 - 1)) << 4);
+  const uint32_t shift = atom == 64 ? 6 : atom == 32 ? 5 : 4;
+  return addr ^ (((addr >> 7) & (swizzle_bytes / atom - 1)) << shift);
 }
 
 // cuTensorMapEncodeTiled's checks and encoding, shared by the driver and the
@@ -175,7 +186,7 @@ inline TmapResult encode_tiled(void* tensorMap, unsigned dataType, unsigned rank
   const uint32_t esize = TensorMap::type_bytes(type);
   if (esize == 0) return unsupported("the packed sub-byte types (16U4, 16U6)");
   if (interleave != 0) return unsupported("an interleaved layout (NC/8HWC8, NC/16HWC16)");
-  if (swizzle > 3) return unsupported("the 128B swizzle with 32B or 64B atomicity (Blackwell)");
+  if (swizzle == 5) return unsupported("CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B");
   const uint64_t addr = reinterpret_cast<uint64_t>(globalAddress);
   if (addr % 16) return bad("globalAddress must be 16-byte aligned");
   TensorMap m;
@@ -236,7 +247,7 @@ inline TmapResult encode_im2col(void* tensorMap, unsigned dataType, unsigned ran
   const uint32_t esize = TensorMap::type_bytes(type);
   if (esize == 0) return unsupported("the packed sub-byte types (16U4, 16U6)");
   if (interleave != 0) return unsupported("an interleaved layout (NC/8HWC8, NC/16HWC16)");
-  if (swizzle > 3) return unsupported("the 128B swizzle with 32B or 64B atomicity (Blackwell)");
+  if (swizzle == 5) return unsupported("CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B");
   const uint64_t addr = reinterpret_cast<uint64_t>(globalAddress);
   if (addr % 16) return bad("globalAddress must be 16-byte aligned");
   TensorMap m;

@@ -314,6 +314,61 @@ struct OpWgmma {
   int scale_a = 1, scale_b = 1;   // -1 negates, float forms only
   int trans_a = 0, trans_b = 0;   // 1 selects M-/N-major, 16-bit forms only
 };
+// Blackwell's fifth-generation tensor core (sm_100a/sm_100f and the a/f
+// targets after it, PTX ISA 9.7.18): Tensor Memory -- 128 lanes by 512
+// columns of 32-bit cells per CTA -- allocated by a warp, filled and read by
+// tcgen05.st/ld in fixed warp-wide shapes, and written by tcgen05.mma, which
+// one thread issues for the whole MxNxK product.
+enum class Tcgen05Kind {
+  Alloc, Dealloc, Relinquish, Ld, St, WaitLd, WaitSt, FenceBefore, FenceAfter, Commit, Mma,
+};
+// tcgen05.ld/st data-movement shapes (9.7.18.2.3).
+enum class Tcgen05Shape { S32x32b, S16x64b, S16x128b, S16x256b, S16x32bx2 };
+// tcgen05.mma's .kind: the element family, the exact types coming from the
+// instruction descriptor.
+enum class Tcgen05MmaKind { F16, TF32, F8F6F4, I8 };
+struct OpTcgen05 {
+  Tcgen05Kind kind = Tcgen05Kind::Mma;
+  uint32_t cta_group = 1;          // .cta_group::1 or ::2
+  // alloc/dealloc: .exclusive; `addr` is alloc's destination in shared
+  // memory, `taddr` the Tensor Memory address dealloc frees, `ncols` both.
+  bool exclusive = false;
+  Addr addr;
+  Operand taddr, ncols;
+  // ld/st: shape, repeat (.xN), .pack::16b / .unpack::16b, the registers,
+  // and .16x32bx2's immHalfSplitoff (in columns).
+  Tcgen05Shape shape = Tcgen05Shape::S32x32b;
+  uint32_t num = 1;
+  bool pack16 = false;
+  uint32_t half_split = 0;
+  std::vector<Reg> regs;
+  // commit: the barrier, and .multicast::cluster's ctaMask.
+  bool multicast = false;
+  Operand cta_mask;
+  // mma: D (a Tensor Memory address), A (a descriptor, or a Tensor Memory
+  // address when a_tmem), B's descriptor, the instruction descriptor, the
+  // disable-output-lane vector (empty when absent), enable-input-d and the
+  // optional scale-input-d immediate (-1 when absent).
+  Tcgen05MmaKind mma_kind = Tcgen05MmaKind::F16;
+  Operand d_tmem, a, b_desc, idesc, enable_d;
+  bool a_tmem = false;
+  std::vector<Operand> disable_lanes;
+  int scale_d = -1;
+};
+// clusterlaunchcontrol (sm_100): try_cancel asks to take over a cluster that
+// has not launched yet and writes an opaque 16-byte answer to shared memory;
+// query_cancel decodes that answer from a .b128 register.
+enum class ClcKind { TryCancel, IsCanceled, FirstCtaid };
+struct OpClc {
+  ClcKind kind = ClcKind::TryCancel;
+  Addr addr, mbar;             // try_cancel's response slot and barrier
+  bool multicast = false;      // .multicast::cluster::all
+  // query_cancel's .b128 operand. A .b128 register is held as two 64-bit
+  // ones, its low and high halves (see the parser's .reg handling).
+  Reg resp_lo, resp_hi;
+  std::vector<Reg> dst;        // is_canceled: one predicate; get_first_ctaid: 1 or 4 (the 4th may be a sink)
+  int dim = -1;                // get_first_ctaid::x/y/z, or -1 for .v4
+};
 // mov.pred d, {0|1|%p} -- set a predicate from an immediate or copy another.
 // Predicates live in their own register file, so this cannot go through the
 // ordinary mov path that writes a 32/64-bit value.
@@ -402,6 +457,7 @@ struct OpBulkCopy {
   Addr mbar;                    // loads: the barrier that counts the bytes
   bool multicast = false;
   Operand cta_mask;
+  uint32_t cta_group = 1;       // .cta_group::2: the barrier may be in the peer CTA
   // shared::cta -> shared::cluster: a block's shared memory into another's,
   // completing on a barrier in the destination block. `gmem` is then the
   // source, a shared::cta address.
@@ -795,7 +851,7 @@ struct OpCall {
 };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy>;
 

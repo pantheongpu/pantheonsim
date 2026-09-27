@@ -601,6 +601,8 @@ vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
 # Hopper (sm_90a): the warpgroup MMA, against the ISA's own layout examples.
 vgpu_unit_test(test_hopper)
+# Blackwell (sm_100a): Tensor Memory and tcgen05, against the ISA's figures.
+vgpu_unit_test(test_blackwell)
 # The interpreter's fast paths, bit for bit against its general path.
 vgpu_unit_test(test_fastpath)
 # Distributed shared memory: blocks of a cluster reaching each other's.
@@ -1315,6 +1317,13 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 3600)
+  # CUTLASS's SM100 GEMM tests on a simulated B200: Tensor Memory, tcgen05,
+  # CTA pairs and cluster launch control.
+  add_test(NAME e2e_cutlass_sm100 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_sm100.sh)
+  set_tests_properties(e2e_cutlass_sm100 PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 5400)
   add_test(NAME e2e_block_semaphore COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_block_semaphore.sh)
   set_tests_properties(e2e_block_semaphore PROPERTIES
     DEPENDS vgpucudart

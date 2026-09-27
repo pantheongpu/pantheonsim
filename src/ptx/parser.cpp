@@ -986,7 +986,46 @@ class Parser {
   }
 
   void parse_reg_decl(EntryFn& fn) {
+    // .b128 (sm_70+, PTX 8.3): registers here are at most 64 bits, so one
+    // is held as two, `name$lo` and `name$hi`, and the few instructions that
+    // take a .b128 operand -- ld/st and clusterlaunchcontrol.query_cancel --
+    // name the halves (see b128_halves).
+    if (peek().kind == Token::Kind::Word && peek().text == ".b128") {
+      next();
+      const Type half{Type::Kind::B, 64};
+      while (true) {
+        const std::string name = expect_word("register name");
+        const size_t line = peek().line;
+        std::vector<std::string> names;
+        if (peek_punct("<")) {
+          next();
+          const int64_t n = parse_int_literal(expect_word("register count"), line);
+          expect_punct(">");
+          if (n < 1 || n > kMaxRegisterBank)
+            fail(line, "register count must be 1 to " + std::to_string(kMaxRegisterBank));
+          for (int64_t i = 0; i < n; ++i) names.push_back(name + std::to_string(i));
+        } else {
+          names.push_back(name);
+        }
+        for (const std::string& n : names) {
+          declare_reg(fn, n + "$lo", half, line);
+          declare_reg(fn, n + "$hi", half, line);
+        }
+        if (!peek_punct(",")) break;
+        next();
+      }
+      expect_punct(";");
+      return;
+    }
     parse_reg_decl_of_type(fn, expect_type(".reg declaration"));
+  }
+
+  // The two 64-bit halves standing for a .b128 register operand.
+  std::pair<Reg, Reg> b128_halves(const std::string& ctx) {
+    const std::string w = expect_word(ctx);
+    if (!declared_regs_.count(w + "$lo"))
+      fail(peek().line, ctx + " must be a .b128 register, got '" + w + "'");
+    return {intern(w + "$lo"), intern(w + "$hi")};
   }
 
   void parse_reg_decl_of_type(EntryFn& fn, Type ty) {
@@ -1334,7 +1373,7 @@ class Parser {
       size_t vec = 1;
       Type ty{};
       bool have_ty = false;
-      bool acquire = false, release = false;
+      bool acquire = false, release = false, b128 = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "acquire") acquire = true;
@@ -1353,10 +1392,21 @@ class Parser {
         else if (inert_mem_modifier(p)) ;
         else if (p == "v2") vec = 2;
         else if (p == "v4") vec = 4;
-        else if (auto t2 = parse_type_token(p)) {
+        else if (p == "b128") {
+          ty = Type{Type::Kind::B, 64};
+          have_ty = true;
+          b128 = true;
+        } else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
         } else return unsupported("unrecognized ld/st modifier '." + p + "'");
+      }
+      // A .b128 access is the .v2.b64 access of its two halves: the same 16
+      // bytes, with the same 16-byte alignment.
+      if (b128) {
+        if (vec != 1) return unsupported("vector ." + op0 + ".b128");
+        if (space == Space::Param) return unsupported(op0 + ".param.b128");
+        vec = 2;
       }
       if (!have_ty) fail(ins.line, "ld/st missing type: " + opcode);
       storage_bytes(ty, ins.line, opcode);
@@ -1366,7 +1416,10 @@ class Parser {
         // A one-element braced list is legal PTX for a scalar load, and it is
         // what Triton's inline-asm loads look like: "ld.global.b32 { %r1 },
         // [ %rd1 ];". The braces carry no meaning the vector count does not.
-        if (vec == 1 && !peek_punct("{")) {
+        if (b128) {
+          const auto [lo, hi] = b128_halves("ld.b128 destination");
+          dsts = {lo, hi};
+        } else if (vec == 1 && !peek_punct("{")) {
           dsts.push_back(expect_reg_operand("ld destination"));
         } else {
           dsts = parse_reg_vector(vec);
@@ -1395,7 +1448,10 @@ class Parser {
         Addr addr = parse_addr(fn);
         expect_punct(",");
         std::vector<Operand> srcs;
-        if (vec == 1 && !peek_punct("{"))
+        if (b128) {
+          const auto [lo, hi] = b128_halves("st.b128 source");
+          srcs = {RegOperand{lo}, RegOperand{hi}};
+        } else if (vec == 1 && !peek_punct("{"))
           srcs.push_back(parse_operand());
         else
           srcs = parse_operand_vector(vec);
@@ -2161,6 +2217,253 @@ class Parser {
         }
         ins.op = op;
       }
+    } else if (op0 == "clusterlaunchcontrol") {
+      // Cluster launch control (sm_100, PTX ISA 9.7.15.18-19).
+      {
+        int sm = 0;
+        std::sscanf(target_.c_str(), "sm_%d", &sm);
+        if (sm < 100)
+          fail(ins.line, "clusterlaunchcontrol requires sm_100 or later; this module targets " +
+                             (target_.empty() ? std::string("nothing") : target_));
+      }
+      if (parts.size() < 2) return unsupported("clusterlaunchcontrol form");
+      OpClc op;
+      if (parts[1] == "try_cancel") {
+        bool async = false, mbar = false;
+        for (size_t i = 2; i < parts.size(); ++i) {
+          const std::string& p = parts[i];
+          if (p == "async") async = true;
+          else if (p == "shared" || p == "b128") ;
+          else if (p == "mbarrier::complete_tx::bytes") mbar = true;
+          else if (p == "multicast::cluster::all") op.multicast = true;
+          else return unsupported("clusterlaunchcontrol.try_cancel modifier '." + p + "'");
+        }
+        if (!async || !mbar)
+          return unsupported("clusterlaunchcontrol.try_cancel needs .async and "
+                             ".mbarrier::complete_tx::bytes");
+        op.addr = parse_addr(fn);
+        expect_punct(",");
+        op.mbar = parse_addr(fn);
+      } else if (parts[1] == "query_cancel" && parts.size() > 2) {
+        const std::string& q = parts[2];
+        if (q == "is_canceled") {
+          op.kind = ClcKind::IsCanceled;
+          op.dst.push_back(expect_reg_operand("is_canceled destination"));
+        } else if (q == "get_first_ctaid") {
+          op.kind = ClcKind::FirstCtaid;
+          if (!peek_punct("{")) return unsupported("get_first_ctaid without .v4 or ::x/::y/::z");
+          next();
+          for (int i = 0; i < 4; ++i) {
+            if (i) expect_punct(",");
+            if (peek().text == "_") {
+              next();
+              op.dst.push_back(Reg{});
+            } else {
+              op.dst.push_back(expect_reg_operand("get_first_ctaid destination"));
+            }
+          }
+          expect_punct("}");
+        } else if (q == "get_first_ctaid::x" || q == "get_first_ctaid::y" || q == "get_first_ctaid::z") {
+          op.kind = ClcKind::FirstCtaid;
+          op.dim = q.back() - 'x';
+          op.dst.push_back(expect_reg_operand("get_first_ctaid destination"));
+        } else {
+          return unsupported("clusterlaunchcontrol.query_cancel." + q);
+        }
+        expect_punct(",");
+        const auto [lo, hi] = b128_halves("query_cancel's response operand");
+        op.resp_lo = lo;
+        op.resp_hi = hi;
+      } else {
+        return unsupported("clusterlaunchcontrol." + parts[1]);
+      }
+      ins.op = op;
+    } else if (op0 == "tcgen05") {
+      // Blackwell's tensor core (PTX ISA 9.7.18). Arch-specific: sm_100a to
+      // sm_110a, or their family targets; ptxas refuses it on sm_120 (the
+      // consumer parts have no Tensor Memory) and on any plain target.
+      {
+        int sm = 0;
+        std::sscanf(target_.c_str(), "sm_%d", &sm);
+        const char last = target_.empty() ? ' ' : target_.back();
+        if (sm < 100 || sm >= 120 || (last != 'a' && last != 'f'))
+          fail(ins.line, "tcgen05 requires an sm_100a..sm_110a or sm_100f..sm_110f target; this "
+                         "module targets " + (target_.empty() ? std::string("nothing") : target_));
+      }
+      if (parts.size() < 2) return unsupported("tcgen05 form");
+      OpTcgen05 op;
+      const std::string& what = parts[1];
+      if (what == "alloc") op.kind = Tcgen05Kind::Alloc;
+      else if (what == "dealloc") op.kind = Tcgen05Kind::Dealloc;
+      else if (what == "relinquish_alloc_permit") op.kind = Tcgen05Kind::Relinquish;
+      else if (what == "ld") op.kind = Tcgen05Kind::Ld;
+      else if (what == "st") op.kind = Tcgen05Kind::St;
+      else if (what == "wait::ld") op.kind = Tcgen05Kind::WaitLd;
+      else if (what == "wait::st") op.kind = Tcgen05Kind::WaitSt;
+      else if (what == "fence::before_thread_sync") op.kind = Tcgen05Kind::FenceBefore;
+      else if (what == "fence::after_thread_sync") op.kind = Tcgen05Kind::FenceAfter;
+      else if (what == "commit") op.kind = Tcgen05Kind::Commit;
+      else if (what == "mma") op.kind = Tcgen05Kind::Mma;
+      else if (what == "cp" || what == "shift")
+        return unsupported("tcgen05." + what + " (copies from shared memory into Tensor Memory are "
+                           "not implemented yet)");
+      else return unsupported("tcgen05." + what);
+      bool have_shape = false, have_num = false, have_kind = false, mbar_arrive = false;
+      for (size_t i = 2; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        unsigned num = 0;
+        char tail = 0;
+        if (p == "sync" || p == "aligned" || p == "b32" || p == "b64" || p == "shared" ||
+            p == "shared::cluster") ;
+        else if (p == "cta_group::1") op.cta_group = 1;
+        else if (p == "cta_group::2") op.cta_group = 2;
+        else if (p == "exclusive") op.exclusive = true;
+        else if (p == "32x32b") { op.shape = Tcgen05Shape::S32x32b; have_shape = true; }
+        else if (p == "16x64b") { op.shape = Tcgen05Shape::S16x64b; have_shape = true; }
+        else if (p == "16x128b") { op.shape = Tcgen05Shape::S16x128b; have_shape = true; }
+        else if (p == "16x256b") { op.shape = Tcgen05Shape::S16x256b; have_shape = true; }
+        else if (p == "16x32bx2") { op.shape = Tcgen05Shape::S16x32bx2; have_shape = true; }
+        else if (std::sscanf(p.c_str(), "x%u%c", &num, &tail) == 1 && num && !(num & (num - 1)) &&
+                 num <= 128) {
+          op.num = num;
+          have_num = true;
+        } else if ((p == "pack::16b" && op.kind == Tcgen05Kind::Ld) ||
+                   (p == "unpack::16b" && op.kind == Tcgen05Kind::St))
+          op.pack16 = true;
+        else if (p == "mbarrier::arrive::one") mbar_arrive = true;
+        else if (p == "multicast::cluster" || p == "multicast::cluster::16b") op.multicast = true;
+        else if (p == "kind::f16") { op.mma_kind = Tcgen05MmaKind::F16; have_kind = true; }
+        else if (p == "kind::tf32") { op.mma_kind = Tcgen05MmaKind::TF32; have_kind = true; }
+        else if (p == "kind::f8f6f4") { op.mma_kind = Tcgen05MmaKind::F8F6F4; have_kind = true; }
+        else if (p == "kind::i8") { op.mma_kind = Tcgen05MmaKind::I8; have_kind = true; }
+        // The collector buffer lets the tensor core keep A or B between MMAs
+        // instead of reading it again. Reuse is only ever permission -- the
+        // ISA says the operand may be reloaded anyway and must not change
+        // meanwhile -- so reading it every time is one of the allowed
+        // behaviours.
+        else if (p.rfind("collector::", 0) == 0) ;
+        else if (p == "red")
+          return unsupported("tcgen05.ld.red (sm_103 and sm_110, not the B200's sm_100)");
+        else if (p == "sp")
+          return unsupported("tcgen05.mma.sp (structured-sparse A) is not implemented yet");
+        else if (p == "ws" || p.rfind("ws::", 0) == 0)
+          return unsupported("tcgen05.mma.ws (weight-stationary) is not implemented yet");
+        else if (p == "block_scale" || p.rfind("kind::mx", 0) == 0 || p.rfind("scale_vec", 0) == 0 ||
+                 p == "block16" || p == "block32")
+          return unsupported("block-scaled tcgen05.mma (.kind::mx*) is not implemented yet");
+        else if (p == "ashift")
+          return unsupported("tcgen05.mma.ashift is not implemented yet");
+        else if (p.rfind("decompress", 0) == 0 || p == "kind::ti16")
+          return unsupported("tcgen05.mma." + p + " (sm_107) is not implemented");
+        else if (p.rfind("multicast::cluster::32b", 0) == 0 || p.rfind("sync_restrict", 0) == 0)
+          return unsupported("tcgen05.commit." + p + " (sm_107) is not implemented");
+        else return unsupported("tcgen05 modifier '." + p + "'");
+      }
+      auto bracketed = [&]() {
+        expect_punct("[");
+        Operand o = parse_operand();
+        expect_punct("]");
+        return o;
+      };
+      switch (op.kind) {
+        case Tcgen05Kind::Alloc:
+          op.addr = parse_addr(fn);
+          expect_punct(",");
+          op.ncols = parse_operand();
+          break;
+        case Tcgen05Kind::Dealloc:
+          op.taddr = parse_operand();
+          expect_punct(",");
+          op.ncols = parse_operand();
+          break;
+        case Tcgen05Kind::Ld:
+        case Tcgen05Kind::St: {
+          if (!have_shape || !have_num) return unsupported("tcgen05." + what + " needs a shape and .xN");
+          // Registers per .x1 (Table 59): one for the 32-bit-wide shapes,
+          // two for .16x128b and four for .16x256b; 128 at most.
+          const uint32_t per = op.shape == Tcgen05Shape::S16x128b   ? 2
+                               : op.shape == Tcgen05Shape::S16x256b ? 4 : 1;
+          if (op.num * per > 128)
+            return unsupported("tcgen05." + what + " of more than 128 registers (Table 59)");
+          auto imm_split = [&]() {
+            if (op.shape != Tcgen05Shape::S16x32bx2) return;
+            expect_punct(",");
+            const Operand o = parse_operand();
+            const auto* imm = std::get_if<ImmInt>(&o);
+            if (!imm || imm->value < 0) fail(ins.line, ".16x32bx2 needs an immediate immHalfSplitoff");
+            op.half_split = static_cast<uint32_t>(imm->value);
+          };
+          if (op.kind == Tcgen05Kind::Ld) {
+            op.regs = parse_reg_vector_any();
+            expect_punct(",");
+            op.taddr = bracketed();
+            imm_split();
+          } else {
+            op.taddr = bracketed();
+            imm_split();
+            expect_punct(",");
+            op.regs = parse_reg_vector_any();
+          }
+          if (op.regs.size() != op.num * per)
+            return unsupported("tcgen05." + what + " with " + std::to_string(op.regs.size()) +
+                               " registers; this shape and .x" + std::to_string(op.num) + " take " +
+                               std::to_string(op.num * per));
+          for (const Reg& r : op.regs)
+            if (r.wide) return unsupported("tcgen05." + what + " registers are .b32");
+          break;
+        }
+        case Tcgen05Kind::Commit:
+          if (!mbar_arrive) return unsupported("tcgen05.commit needs .mbarrier::arrive::one");
+          op.addr = parse_addr(fn);
+          if (op.multicast) {
+            expect_punct(",");
+            op.cta_mask = parse_operand();
+          }
+          break;
+        case Tcgen05Kind::Mma: {
+          if (!have_kind) return unsupported("tcgen05.mma needs a .kind");
+          op.d_tmem = bracketed();
+          expect_punct(",");
+          if (peek_punct("[")) {
+            op.a_tmem = true;
+            op.a = bracketed();
+          } else {
+            op.a = parse_operand();
+          }
+          expect_punct(",");
+          op.b_desc = parse_operand();
+          expect_punct(",");
+          op.idesc = parse_operand();
+          expect_punct(",");
+          if (peek_punct("{")) {
+            op.disable_lanes = parse_operand_vector_any();
+            if (op.disable_lanes.size() != 4 * op.cta_group)
+              return unsupported("tcgen05.mma's disable-output-lane vector has " +
+                                 std::to_string(4 * op.cta_group) + " elements for .cta_group::" +
+                                 std::to_string(op.cta_group));
+            expect_punct(",");
+          }
+          op.enable_d = parse_operand();
+          if (peek_punct(",")) {
+            next();
+            const Operand s = parse_operand();
+            const auto* imm = std::get_if<ImmInt>(&s);
+            if (!imm || imm->value < 0 || imm->value > 15)
+              return unsupported("tcgen05.mma's scale-input-d is an immediate from 0 to 15");
+            if (op.mma_kind != Tcgen05MmaKind::F16 && op.mma_kind != Tcgen05MmaKind::TF32)
+              return unsupported("scale-input-d is for .kind::f16 and .kind::tf32 only");
+            op.scale_d = static_cast<int>(imm->value);
+          }
+          // .kind::i8 is sm_100a/sm_101a/sm_110a only, not the family targets.
+          if (op.mma_kind == Tcgen05MmaKind::I8 && !target_.empty() && target_.back() != 'a')
+            fail(ins.line, "tcgen05.mma.kind::i8 requires an sm_100a, sm_101a or sm_110a target; "
+                           "this module targets " + target_);
+          break;
+        }
+        default:
+          break;
+      }
+      ins.op = op;
     } else if (op0 == "redux") {
       // redux.sync.<op>.<type> d, a, membermask
       std::optional<ReduxOp> rop;
@@ -3483,6 +3786,8 @@ class Parser {
           else if (p == "bulk_group") group_completion = true;
           else if (p == "tile" || p == "weak" || p == "b128" || inert_mem_modifier(p)) ;
           else if (p == "multicast::cluster" || p == "multicast::cluster::16b") op.multicast = true;
+          else if (p == "cta_group::1") op.cta_group = 1;
+          else if (p == "cta_group::2") op.cta_group = 2;
           else if (p == "im2col" || p == "im2col_no_offs") { op.im2col = true; im2col_mode = p; }
           else return unsupported("cp.async.bulk modifier '." + p + "' (gather/scatter, im2col::w, "
                                   "masks, overrides and reports are not implemented)");
@@ -3505,6 +3810,8 @@ class Parser {
           if (g2s != (im2col_mode == "im2col"))
             return unsupported("tensor loads take .im2col and stores .im2col_no_offs");
         }
+        if (op.cta_group == 2 && (!mbar_completion || !op.tensor))
+          return unsupported(".cta_group is a qualifier of tensor loads that complete on an mbarrier");
         if (op.to_shared && !mbar_completion)
           return unsupported("a cp.async.bulk load completes on an mbarrier (.mbarrier::complete_tx::bytes)");
         if (s2g && !group_completion)
