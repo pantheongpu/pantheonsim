@@ -2019,43 +2019,118 @@ class Parser {
       if (op.srcs.size() != count) return unsupported("stmatrix source arity");
       ins.op = op;
     } else if (op0 == "mma") {
-      // mma.sync.aligned.m16n8kK.row.col.<d>.<a>.<b>.<c>
-      // mma.sp[::ordered_metadata].sync.aligned.m16n8kK.row.col.<d>.<a>.<b>.<c> d, a, b, c, e, f
-      uint32_t k = 0;
-      std::vector<std::string> types;
-      bool row_col = false, saw_row = false, sparse = false;
+      // mma.sync.aligned.<shape>.<alayout>.<blayout>{.satfinite}.<d>.<a>.<b>.<c>{.xor|.and.popc}{.rn...}
+      // mma.sp[::ordered_metadata].sync.aligned.<shape>.row.col.<d>.<a>.<b>.<c> d, a, b, c, e, f
+      // The forms of PTX ISA 9.7.16.5.14 and 9.7.16.6.3, less the block-scaled
+      // and .kind::f8f6f4 ones (sm_120).
+      unsigned mm = 0, nn = 0, kk = 0;
+      std::vector<std::string> types, layouts;
+      bool sparse = false, have_shape = false, popc = false;
+      OpMma op;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
+        char tail = 0;
         if (p == "sync" || p == "aligned") ;
         else if (p == "sp" || p == "sp::ordered_metadata") sparse = true;
-        else if (p == "row") saw_row = true;
-        else if (p == "col") { if (saw_row) row_col = true; }
-        else if (p == "m16n8k8") k = 8;
-        else if (p == "m16n8k16") k = 16;
-        else if (p == "m16n8k32") k = 32;
-        else if (p == "f32" || p == "f16" || p == "bf16" || p == "tf32" || p == "s32" ||
-                 p == "s8" || p == "u8")
+        else if (p == "row" || p == "col") layouts.push_back(p);
+        else if (std::sscanf(p.c_str(), "m%un%uk%u%c", &mm, &nn, &kk, &tail) == 3) have_shape = true;
+        else if (p == "satfinite") op.satfinite = true;
+        else if (p == "xor") op.b1_and = false;
+        else if (p == "and") op.b1_and = true;
+        else if (p == "popc") popc = true;
+        else if (p == "rn") op.rnd = FRound::Nearest;
+        else if (p == "rz") op.rnd = FRound::Zero;
+        else if (p == "rm") op.rnd = FRound::MinusInf;
+        else if (p == "rp") op.rnd = FRound::PlusInf;
+        else if (p == "f32" || p == "f16" || p == "bf16" || p == "tf32" || p == "s32" || p == "s8" ||
+                 p == "u8" || p == "s4" || p == "u4" || p == "b1" || p == "f64" || p == "e4m3" ||
+                 p == "e5m2")
           types.push_back(p);
-        else return unsupported("mma modifier '." + p + "' (shape or type not implemented)");
+        else if (p.rfind("kind::", 0) == 0 || p == "block_scale" || p.rfind("scale_vec", 0) == 0 ||
+                 p == "e3m2" || p == "e2m3" || p == "e2m1" || p == "ue8m0" || p == "ue4m3")
+          return unsupported("mma's .kind::f8f6f4 and block-scaled forms (sm_120) are not implemented");
+        else return unsupported("mma modifier '." + p + "'");
       }
-      if (!k) return unsupported("only the m16n8k{8,16,32} mma shapes are implemented");
-      if (!row_col) return unsupported("only mma .row.col is implemented");
+      if (!have_shape || nn != 8 || (mm != 8 && mm != 16))
+        return unsupported("mma shape (expected .m16n8kK or .m8n8kK)");
       if (types.size() != 4) return unsupported("mma needs .<dtype>.<atype>.<btype>.<ctype>");
-      OpMma op;
-      op.k = k;
-      const std::string& at = types[1];
-      if (at == "f16") op.ab_type = MmaElem::F16;
-      else if (at == "bf16") op.ab_type = MmaElem::BF16;
-      else if (at == "tf32") op.ab_type = MmaElem::TF32;
-      else if (at == "s8") { op.ab_type = MmaElem::S8; op.ab_signed = true; }
-      else if (at == "u8") { op.ab_type = MmaElem::U8; op.ab_signed = false; }
-      else return unsupported("mma operand type '." + at + "'");
-      if (types[1] != types[2]) return unsupported("mma with mixed A and B types");
-      op.acc_f16 = types[0] == "f16";
-      op.acc_int = types[0] == "s32";
-      if (sparse && op.ab_type != MmaElem::F16 && op.ab_type != MmaElem::BF16)
-        return unsupported("mma.sp with ." + at + " (only .f16 and .bf16 sparse A are implemented)");
-      if (sparse && k == 8) return unsupported("mma.sp.m16n8k8 (f16/bf16 sparse A is k16 or k32)");
+      op.m = mm;
+      op.k = kk;
+      auto elem = [&](const std::string& t, MmaElem* e, bool* sign) {
+        *sign = true;
+        if (t == "f16") *e = MmaElem::F16;
+        else if (t == "bf16") *e = MmaElem::BF16;
+        else if (t == "tf32") *e = MmaElem::TF32;
+        else if (t == "s8") *e = MmaElem::S8;
+        else if (t == "u8") { *e = MmaElem::U8; *sign = false; }
+        else if (t == "s4") *e = MmaElem::S4;
+        else if (t == "u4") { *e = MmaElem::U4; *sign = false; }
+        else if (t == "b1") { *e = MmaElem::B1; *sign = false; }
+        else if (t == "e4m3") *e = MmaElem::E4M3;
+        else if (t == "e5m2") *e = MmaElem::E5M2;
+        else if (t == "f64") *e = MmaElem::F64;
+        else return false;
+        return true;
+      };
+      if (!elem(types[1], &op.ab_type, &op.ab_signed) || !elem(types[2], &op.b_type, &op.b_signed))
+        return unsupported("mma operand types ." + types[1] + "." + types[2]);
+      const std::string &dt = types[0], &ct = types[3];
+      op.acc_f16 = dt == "f16";
+      op.c_f16 = ct == "f16";
+      op.acc_int = dt == "s32";
+      op.acc_f64 = dt == "f64";
+      const MmaElem at = op.ab_type, bt = op.b_type;
+      auto is_int8 = [](MmaElem e) { return e == MmaElem::S8 || e == MmaElem::U8; };
+      auto is_int4 = [](MmaElem e) { return e == MmaElem::S4 || e == MmaElem::U4; };
+      auto is_fp8 = [](MmaElem e) { return e == MmaElem::E4M3 || e == MmaElem::E5M2; };
+      const bool fdc = (dt == "f16" || dt == "f32") && (ct == "f16" || ct == "f32");
+      const bool f32dc = dt == "f32" && ct == "f32";
+      const bool same_dc = dt == ct;
+      const bool intdc = dt == "s32" && ct == "s32";
+      // The shape-and-type table (9.7.16.5.14, and 9.7.16.6.3 for mma.sp).
+      bool ok = false;
+      const std::string shape = "m" + std::to_string(mm) + "n8k" + std::to_string(kk);
+      if (at == MmaElem::F16 && bt == MmaElem::F16) {
+        if (!sparse)
+          ok = (shape == "m8n8k4" && fdc && !(ct == "f32" && dt == "f16")) ||
+               ((shape == "m16n8k8" || shape == "m16n8k16") && fdc && same_dc);
+        else
+          ok = (shape == "m16n8k16" || shape == "m16n8k32") && fdc && same_dc;
+      } else if (at == MmaElem::BF16 && bt == MmaElem::BF16) {
+        ok = f32dc && (sparse ? (shape == "m16n8k16" || shape == "m16n8k32")
+                              : (shape == "m16n8k8" || shape == "m16n8k16"));
+      } else if (at == MmaElem::TF32 && bt == MmaElem::TF32) {
+        ok = f32dc && (sparse ? (shape == "m16n8k8" || shape == "m16n8k16")
+                              : (shape == "m16n8k4" || shape == "m16n8k8"));
+      } else if (at == MmaElem::F64 && bt == MmaElem::F64) {
+        ok = !sparse && dt == "f64" && ct == "f64" &&
+             (shape == "m8n8k4" || shape == "m16n8k4" || shape == "m16n8k8" || shape == "m16n8k16");
+      } else if (is_int8(at) && is_int8(bt)) {
+        ok = intdc && (sparse ? (shape == "m16n8k32" || shape == "m16n8k64")
+                              : (shape == "m8n8k16" || shape == "m16n8k16" || shape == "m16n8k32"));
+      } else if (is_int4(at) && is_int4(bt)) {
+        ok = intdc && (sparse ? (shape == "m16n8k64" || shape == "m16n8k128")
+                              : (shape == "m8n8k32" || shape == "m16n8k32" || shape == "m16n8k64"));
+      } else if (at == MmaElem::B1 && bt == MmaElem::B1) {
+        ok = !sparse && intdc && popc &&
+             (shape == "m8n8k128" || shape == "m16n8k128" || shape == "m16n8k256");
+      } else if (is_fp8(at) && is_fp8(bt)) {
+        ok = fdc && same_dc && (sparse ? shape == "m16n8k64" : (shape == "m16n8k16" || shape == "m16n8k32"));
+      }
+      if (!ok)
+        return unsupported("mma" + std::string(sparse ? ".sp" : "") + "." + shape + "." + dt + "." +
+                           types[1] + "." + types[2] + "." + ct + " is not a form the ISA defines");
+      if (op.satfinite && !op.acc_int) return unsupported("mma .satfinite outside the integer forms");
+      if (op.satfinite && at == MmaElem::B1) return unsupported("mma .satfinite on .b1");
+      if (popc != (at == MmaElem::B1)) return unsupported("mma .xor.popc/.and.popc go with .b1 only");
+      if (op.rnd != FRound::Nearest && !op.acc_f64)
+        return unsupported("mma rounding modifiers are for .f64 only");
+      // Layouts: .row.col everywhere, except m8n8k4 f16, which takes any pair.
+      if (layouts.size() != 2) return unsupported("mma needs .alayout.blayout");
+      op.a_row = layouts[0] == "row";
+      op.b_col = layouts[1] == "col";
+      const bool volta = shape == "m8n8k4" && at == MmaElem::F16;
+      if (!volta && !(op.a_row && op.b_col)) return unsupported("mma ." + shape + " is .row.col only");
       op.sparse = sparse;
       op.d = parse_reg_vector_any();
       expect_punct(",");
@@ -2069,11 +2144,19 @@ class Parser {
         op.meta = parse_operand();
         expect_punct(",");
         op.selector = parse_operand();
+        // The selector's range (9.7.16.6.1): one of four threads when one
+        // thread holds a group's metadata, one of two thread pairs when a
+        // pair does, and 0 when all four do.
+        // Metadata bits per row of A: one per element at 2:4 (two 2-bit
+        // indices per four), two at tf32's 1:2, half a bit at int4's 4:8.
+        const uint32_t row_bits = at == MmaElem::TF32 ? 2 * kk : is_int4(at) ? kk / 2 : kk;
+        const uint32_t holders = 2 * row_bits / 32;   // 1, 2 or 4 threads per group
         const auto* sel = std::get_if<ImmInt>(&op.selector);
-        if (!sel || sel->value < 0 || sel->value > 1)
-          return unsupported("mma.sp's sparsity selector is an immediate 0 or 1 for .f16/.bf16");
+        if (!sel || sel->value < 0 || sel->value >= static_cast<int64_t>(4 / holders))
+          return unsupported("mma.sp's sparsity selector must be an immediate from 0 to " +
+                             std::to_string(4 / holders - 1) + " for this shape and type");
       }
-      if (op.d.size() != op.c.size()) return unsupported("mma D and C arity differ");
+      if (op.d.size() != op.c.size() && !volta) return unsupported("mma D and C arity differ");
       ins.op = op;
     } else if (op0 == "wgmma") {
       // wgmma.fence.sync.aligned;  wgmma.commit_group.sync.aligned;

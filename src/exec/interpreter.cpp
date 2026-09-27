@@ -5354,56 +5354,96 @@ class Interpreter {
     write_reg(w, op.dst, m, r, 32);
   }
 
-  // Decodes one element of an mma A/B fragment from a lane's register.
+  // Bits in one element of an mma A/B fragment.
+  static uint32_t mma_bits(MmaElem t) {
+    switch (t) {
+      case MmaElem::F16:
+      case MmaElem::BF16: return 16;
+      case MmaElem::TF32: return 32;
+      case MmaElem::S4:
+      case MmaElem::U4: return 4;
+      case MmaElem::B1: return 1;
+      case MmaElem::F64: return 64;
+      default: return 8;
+    }
+  }
+
+  // Decodes element `slot` of an mma A/B fragment register.
   double mma_elem(MmaElem t, bool is_signed, uint64_t reg, uint32_t slot) {
     switch (t) {
       case MmaElem::F16: return f16_to_double((reg >> (16 * slot)) & 0xFFFF);
       case MmaElem::BF16: return bf16_to_double((reg >> (16 * slot)) & 0xFFFF);
       case MmaElem::TF32:
-        // tf32 occupies a full 32-bit register; its reduced mantissa is a
-        // hardware precision detail, and computing exactly stays inside it.
-        return static_cast<double>(f32(reg));
+        // tf32 occupies a full 32-bit register, of which the tensor core
+        // reads the top 19 bits: the low 13 mantissa bits are dropped, as an
+        // RTX 3060 (sm_86) does with inputs that have them set.
+        return static_cast<double>(f32(reg & 0xFFFFE000u));
+      case MmaElem::F64: {
+        double d;
+        std::memcpy(&d, &reg, 8);
+        return d;
+      }
+      case MmaElem::E4M3: return fp8_to_double(static_cast<uint32_t>(reg >> (8 * slot)) & 0xFF, kE4M3);
+      case MmaElem::E5M2: return fp8_to_double(static_cast<uint32_t>(reg >> (8 * slot)) & 0xFF, kE5M2);
+      case MmaElem::S4:
+      case MmaElem::U4: {
+        const uint32_t nib = static_cast<uint32_t>(reg >> (4 * slot)) & 0xF;
+        return is_signed ? static_cast<double>(static_cast<int32_t>(nib << 28) >> 28) : static_cast<double>(nib);
+      }
+      case MmaElem::B1: return static_cast<double>((reg >> slot) & 1);
       case MmaElem::S8:
       case MmaElem::U8: {
         const uint8_t byte = static_cast<uint8_t>(reg >> (8 * slot));
-        return is_signed ? static_cast<double>(static_cast<int8_t>(byte))
-                         : static_cast<double>(byte);
+        return is_signed ? static_cast<double>(static_cast<int8_t>(byte)) : static_cast<double>(byte);
       }
     }
     return 0.0;
   }
 
+  // mma.sync (9.7.16.5). A, B, C and D are held as full tiles, filled from
+  // and written back to the fragments by the per-shape formulas of
+  // 9.7.16.5.1-13: for m16n8kK, with p elements to a register, A's register
+  // r of lane (g, t) holds row g + 8(r % 2), columns tp + 4p(r / 2) on; B's
+  // holds rows tp + 4pr on of column g; C/D element i is row g + 8(i / 2),
+  // column 2t + i % 2. The m8n8kK shapes are the same with one register of
+  // A and B and two elements of C. m8n8k4 f16 (Volta's) is four products at
+  // once and has its own layouts.
   void exec_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMma& op, Mask m) {
-    constexpr uint32_t kM = 16, kN = 8;
-    const uint32_t K = op.k;
-    const bool sixteen_bit = op.ab_type == MmaElem::F16 || op.ab_type == MmaElem::BF16;
-    const bool eight_bit = op.ab_type == MmaElem::S8 || op.ab_type == MmaElem::U8;
-    // Elements each lane holds per register: 2 for 16-bit, 4 for 8-bit, 1 for
-    // tf32. The register counts follow from the shape.
-    const uint32_t per_reg = sixteen_bit ? 2u : (eight_bit ? 4u : 1u);
-    // A sparse A stores half its elements.
-    const uint32_t a_regs = (kM * K / (op.sparse ? 2 : 1)) / (W_ * per_reg);
+    if (op.m == 8 && op.ab_type == MmaElem::F16) return exec_mma_m8n8k4(w, ctx, ins, op, m);
+    constexpr uint32_t kN = 8;
+    const uint32_t M = op.m, K = op.k;
+    const uint32_t bits = mma_bits(op.ab_type);
+    const bool wide = op.ab_type == MmaElem::F64;
+    const uint32_t per_reg = wide ? 1u : 32u / bits;
+    const uint32_t a_regs = (M * K / (op.sparse ? 2 : 1)) / (W_ * per_reg);
     const uint32_t b_regs = (K * kN) / (W_ * per_reg);
-    if (op.a.size() != a_regs || op.b.size() != b_regs)
+    const uint32_t c_elems = M * kN / W_;   // per lane: 4 for m16, 2 for m8
+    if (op.a.size() != a_regs || op.b.size() != b_regs ||
+        op.c.size() != (op.c_f16 ? c_elems / 2 : c_elems) || op.d.size() != (op.acc_f16 ? c_elems / 2 : c_elems))
       ctx_fail(ins, -1, Err::UnsupportedPtx, "mma fragment arity does not match the shape");
-
-    // The parser admits k8, k16 and k32 only, so the matrices fit on the stack;
-    // allocating them cost a malloc and free of each on every instruction.
-    if (K > 32) ctx_fail(ins, -1, Err::UnsupportedPtx, "mma k above 32");
-    std::array<double, kM * 32> A{};
-    std::array<double, 32 * kN> B{};
-    std::array<double, kM * kN> C{};
+    // The largest shape is m16n8k256 (.b1): A 16 x 256, B 256 x 8.
+    std::vector<double> A(size_t{M} * K, 0.0), B(size_t{K} * kN, 0.0);
+    std::array<double, 16 * kN> C{};
     if (op.sparse) {
-      // Sparse A (PTX ISA 9.7.16.6, figures for m16n8k16 and m16n8k32 f16):
-      // register r of lane (group, tid) holds the two stored elements of the
-      // 4-wide chunk tid + 4*(r/2) of row group + 8*(r%2). The metadata for
-      // rows g and g + 8 comes from one lane of group g: 4 bits a chunk,
-      // rows 8-15 in the high half, and within a chunk's 4 bits the low 2
-      // place the first stored element and the high 2 the second. For k32
-      // the selector names a pair of lanes -- 4*g + 2*selector for chunks 0-3
-      // and the next for chunks 4-7 -- and for k16, which needs only one, the
-      // lane 4*g + selector. Each of these was checked against an RTX 3060
-      // (sm_86), element by element and nibble by nibble.
+      // Sparse A (PTX ISA 9.7.16.6). Each K-wide row is cut into chunks --
+      // four elements (f16, bf16, 8-bit), two (tf32, 1:2) or eight (int4,
+      // 4:8 in pairs) -- and a chunk's metadata is 4 bits, two 2-bit indices
+      // of "units": an element, half a tf32 element (0b0100 and 0b1110 are
+      // tf32's only values), or a pair of int4 elements. Register r of lane
+      // (g, t) holds the stored units of row g + 8(r % 2), chunks from
+      // t * c + 4c(r / 2), c chunks to a register. The metadata for rows g
+      // and g + 8 comes from the group's H holder lanes -- one, a pair, or all
+      // four, as the ISA lists them; which lane carries which chunk is below.
+      // Each form was checked against an RTX 3060 (sm_86): element by element
+      // and nibble by nibble for f16 and int8, and by hashes of every result
+      // for all of them.
+      const bool tf32 = op.ab_type == MmaElem::TF32;
+      const bool int4 = op.ab_type == MmaElem::S4 || op.ab_type == MmaElem::U4;
+      const uint32_t chunk_elems = tf32 ? 2 : int4 ? 8 : 4;
+      const uint32_t stored = chunk_elems / 2;              // per chunk
+      const uint32_t cpr = per_reg / stored;                // chunks per register
+      const uint32_t row_bits = tf32 ? 2 * K : int4 ? K / 2 : K;
+      const uint32_t holders = 2 * row_bits / 32;
       Lanes _s_meta;
       const Lanes meta = read_operand(w, ctx, ins, op.meta, _s_meta);
       const uint32_t sel = static_cast<uint32_t>(std::get<ImmInt>(op.selector).value);
@@ -5413,18 +5453,30 @@ class Interpreter {
         for (uint32_t lane = 0; lane < W_; ++lane) {
           const uint32_t group = lane / 4, tid = lane % 4;
           const uint32_t row = group + (reg % 2) * 8;
-          const uint32_t chunk = tid + (reg / 2) * 4;
-          const uint32_t src = K == 16 ? 4 * group + sel : 4 * group + 2 * sel + (chunk >= 4 ? 1 : 0);
-          const uint32_t bits = static_cast<uint32_t>(meta[src]) >> ((row >= 8 ? 16 : 0) + (chunk % 4) * 4);
-          for (uint32_t e = 0; e < 2; ++e) {
-            const uint32_t idx = (bits >> (2 * e)) & 3;
-            A[row * K + chunk * 4 + idx] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
+          for (uint32_t e = 0; e < per_reg; ++e) {
+            const uint32_t chunk = tid * cpr + (reg / 2) * 4 * cpr + e / stored;
+            // 16- and 32-bit types: a holder carries four chunks of both
+            // rows, the second row in its high half. 8- and 4-bit types: a
+            // holder carries eight chunks of one row -- row g from lane
+            // 4g + 2 * selector, row g + 8 from the next, chunks 8-15 from
+            // the pair after -- as an RTX 3060 places them.
+            const bool narrow = mma_bits(op.ab_type) <= 8;
+            const uint32_t half = row >= 8 ? 1 : 0;
+            const uint32_t src = narrow ? 4 * group + 2 * sel + half + 2 * (chunk / 8)
+                                        : 4 * group + holders * sel + chunk / 4;
+            const uint32_t shift = narrow ? (chunk % 8) * 4 : half * 16 + (chunk % 4) * 4;
+            const uint32_t nib = static_cast<uint32_t>(meta[src]) >> shift;
+            const uint32_t idx0 = nib & 3, idx1 = (nib >> 2) & 3;
+            const uint32_t k = e % stored;   // which stored element of the chunk
+            uint32_t pos;
+            if (tf32) pos = idx0 / 2;
+            else if (int4) pos = 2 * (k < 2 ? idx0 : idx1) + k % 2;
+            else pos = k == 0 ? idx0 : idx1;
+            A[row * K + chunk * chunk_elems + pos] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
           }
         }
       }
     } else
-    // A: lane (groupID, tid) holds rows {groupID, groupID+8} at the column
-    // block the register index selects.
     for (uint32_t reg = 0; reg < a_regs; ++reg) {
       Lanes _s;
       const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s);
@@ -5436,51 +5488,80 @@ class Interpreter {
           A[row * K + col0 + e] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
       }
     }
-    // B is K x N: the lane's group selects the column, the register and tid
-    // select the rows.
     for (uint32_t reg = 0; reg < b_regs; ++reg) {
       Lanes _s;
       const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.b[reg]}}, _s);
       for (uint32_t lane = 0; lane < W_; ++lane) {
         const uint32_t group = lane / 4, tid = lane % 4;
-        const uint32_t col = group;
         const uint32_t row0 = tid * per_reg + reg * (per_reg * 4);
         for (uint32_t e = 0; e < per_reg; ++e)
-          B[(row0 + e) * kN + col] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
+          B[(row0 + e) * kN + group] = mma_elem(op.b_type, op.b_signed, v[lane], e);
       }
     }
-    // C/D: four values per lane, two rows by two columns.
     auto cd_index = [](uint32_t lane, uint32_t slot) {
       const uint32_t group = lane / 4, tid = lane % 4;
-      const uint32_t row = group + (slot / 2) * 8;
-      const uint32_t col = tid * 2 + (slot % 2);
-      return row * kN + col;
+      return (group + (slot / 2) * 8) * kN + tid * 2 + (slot % 2);
     };
+    auto as_f64 = [](uint64_t v) { double d; std::memcpy(&d, &v, 8); return d; };
     for (uint32_t reg = 0; reg < op.c.size(); ++reg) {
       Lanes _s;
       const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.c[reg]}}, _s);
       for (uint32_t lane = 0; lane < W_; ++lane) {
-        if (op.acc_f16) {
-          // Two halves per register.
+        if (op.c_f16) {
           C[cd_index(lane, reg * 2)] = f16_to_double(v[lane] & 0xFFFF);
           C[cd_index(lane, reg * 2 + 1)] = f16_to_double((v[lane] >> 16) & 0xFFFF);
         } else if (op.acc_int) {
           C[cd_index(lane, reg)] = static_cast<double>(static_cast<int32_t>(v[lane]));
+        } else if (op.acc_f64) {
+          C[cd_index(lane, reg)] = as_f64(v[lane]);
         } else {
           C[cd_index(lane, reg)] = static_cast<double>(f32(v[lane]));
         }
       }
     }
-    // D = A x B + C. Float shapes accumulate in f32 and integer shapes in s32,
-    // matching the accumulate type the instruction names.
-    std::array<double, kM * kN> D{};
-    for (uint32_t i = 0; i < kM; ++i)
+    // D = A x B + C. Float products are exact in f32 for every input type
+    // here and the sum is kept in f32, in K order; f64 is a chain of fused
+    // multiply-adds in the instruction's rounding mode, as the ISA says;
+    // integers accumulate exactly and then wrap or saturate; .b1 counts the
+    // bits of A's row and B's column that .and/.xor leave set.
+    std::array<double, 16 * kN> D{};
+    const int prev_round = std::fegetround();
+    if (op.acc_f64) {
+      switch (op.rnd) {
+        case FRound::Nearest: std::fesetround(FE_TONEAREST); break;
+        case FRound::Zero: std::fesetround(FE_TOWARDZERO); break;
+        case FRound::MinusInf: std::fesetround(FE_DOWNWARD); break;
+        case FRound::PlusInf: std::fesetround(FE_UPWARD); break;
+      }
+    }
+    for (uint32_t i = 0; i < M; ++i)
       for (uint32_t j = 0; j < kN; ++j) {
-        if (op.acc_int) {
+        if (op.ab_type == MmaElem::B1) {
           int64_t acc = static_cast<int64_t>(C[i * kN + j]);
-          for (uint32_t k = 0; k < K; ++k)
-            acc += static_cast<int64_t>(A[i * K + k]) * static_cast<int64_t>(B[k * kN + j]);
+          for (uint32_t k = 0; k < K; ++k) {
+            const bool a = A[i * K + k] != 0, b = B[k * kN + j] != 0;
+            acc += op.b1_and ? (a && b) : (a != b);
+          }
           D[i * kN + j] = static_cast<double>(static_cast<int32_t>(acc));
+        } else if (op.acc_int) {
+          // .satfinite clamps after every 128 bits of K -- 16 int8 or 32
+          // int4 elements -- not once at the end: an RTX 3060 (sm_86) gives
+          // sat(sat(C + first half) + second half) for m16n8k32 int8 and
+          // m16n8k64 int4, and one clamp for the 128-bit shapes.
+          const uint32_t block = op.satfinite ? 128 / bits : K;
+          int64_t acc = static_cast<int64_t>(C[i * kN + j]);
+          for (uint32_t k0 = 0; k0 < K; k0 += block) {
+            for (uint32_t k = k0; k < k0 + block && k < K; ++k)
+              acc += static_cast<int64_t>(A[i * K + k]) * static_cast<int64_t>(B[k * kN + j]);
+            if (op.satfinite)
+              acc = std::clamp<int64_t>(acc, std::numeric_limits<int32_t>::min(),
+                                        std::numeric_limits<int32_t>::max());
+          }
+          D[i * kN + j] = static_cast<double>(static_cast<int32_t>(acc));
+        } else if (op.acc_f64) {
+          double acc = C[i * kN + j];
+          for (uint32_t k = 0; k < K; ++k) acc = std::fma(A[i * K + k], B[k * kN + j], acc);
+          D[i * kN + j] = acc;
         } else {
           float acc = static_cast<float>(C[i * kN + j]);
           for (uint32_t k = 0; k < K; ++k)
@@ -5488,6 +5569,7 @@ class Interpreter {
           D[i * kN + j] = static_cast<double>(acc);
         }
       }
+    if (op.acc_f64) std::fesetround(prev_round);
     for (uint32_t reg = 0; reg < op.d.size(); ++reg) {
       Lanes r;
       for (uint32_t lane = 0; lane < W_; ++lane)
@@ -5498,12 +5580,87 @@ class Interpreter {
             r[lane] = ((hi & 0xFFFF) << 16) | (lo & 0xFFFF);
           } else if (op.acc_int) {
             r[lane] = static_cast<uint32_t>(static_cast<int32_t>(D[cd_index(lane, reg)]));
+          } else if (op.acc_f64) {
+            const double d = D[cd_index(lane, reg)];
+            uint64_t u;
+            std::memcpy(&u, &d, 8);
+            r[lane] = u;
           } else {
             r[lane] = f32bits(static_cast<float>(D[cd_index(lane, reg)]));
           }
         }
-      alu_fault(r, m, 32);
-      write_reg(w, op.d[reg], m, r, 32);
+      if (!op.acc_int) alu_fault(r, m, op.acc_f64 ? 64 : 32);
+      write_reg(w, op.d[reg], m, r, op.acc_f64 ? 64 : 32);
+    }
+  }
+
+  // mma.m8n8k4 with .f16 A and B (9.7.16.5.1): four 8x8x4 products, one per
+  // quad pair -- lanes 4q..4q+3 (the low group) and 4q+16..4q+19 (the high
+  // group) -- each with its own A, B, C and D.
+  void exec_mma_m8n8k4(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMma& op, Mask m) {
+    if (op.a.size() != 2 || op.b.size() != 2 || op.c.size() != (op.c_f16 ? 4u : 8u) ||
+        op.d.size() != (op.acc_f16 ? 4u : 8u))
+      ctx_fail(ins, -1, Err::UnsupportedPtx, "mma.m8n8k4 fragment arity");
+    std::vector<Lanes> av(2), bv(2), cv(op.c.size());
+    for (size_t r = 0; r < 2; ++r) {
+      Lanes _s;
+      av[r] = read_operand(w, ctx, ins, Operand{RegOperand{op.a[r]}}, _s);
+      Lanes _t;
+      bv[r] = read_operand(w, ctx, ins, Operand{RegOperand{op.b[r]}}, _t);
+    }
+    for (size_t r = 0; r < op.c.size(); ++r) {
+      Lanes _s;
+      cv[r] = read_operand(w, ctx, ins, Operand{RegOperand{op.c[r]}}, _s);
+    }
+    // Element i (0-7) of a lane's C/D fragment, as (row, column) of its tile.
+    auto cd_pos = [&](uint32_t lane, uint32_t i, bool f16, uint32_t* row, uint32_t* col) {
+      const uint32_t hi = lane >= 16 ? 4 : 0;
+      if (f16) {
+        *row = lane % 4 + hi;
+        *col = i;
+      } else {
+        *row = (lane & 1) + (i & 2) + hi;
+        *col = (i & 4) + (lane & 2) + (i & 1);
+      }
+    };
+    std::vector<Lanes> out(op.d.size(), Lanes{});
+    for (uint32_t q = 0; q < 4; ++q) {
+      double A[8][4] = {}, B[4][8] = {}, C[8][8] = {};
+      for (uint32_t half = 0; half < 2; ++half)
+        for (uint32_t t = 0; t < 4; ++t) {
+          const uint32_t lane = half * 16 + q * 4 + t;
+          const uint32_t hi = half * 4;
+          for (uint32_t i = 0; i < 4; ++i) {
+            const double a = f16_to_double((av[i / 2][lane] >> (16 * (i % 2))) & 0xFFFF);
+            const double b = f16_to_double((bv[i / 2][lane] >> (16 * (i % 2))) & 0xFFFF);
+            if (op.a_row) A[t + hi][i] = a; else A[i + hi][t] = a;
+            if (op.b_col) B[i][t + hi] = b; else B[t][i + hi] = b;
+          }
+          for (uint32_t i = 0; i < 8; ++i) {
+            uint32_t r, c;
+            cd_pos(lane, i, op.c_f16, &r, &c);
+            C[r][c] = op.c_f16 ? f16_to_double((cv[i / 2][lane] >> (16 * (i % 2))) & 0xFFFF)
+                               : static_cast<double>(f32(cv[i][lane]));
+          }
+        }
+      for (uint32_t half = 0; half < 2; ++half)
+        for (uint32_t t = 0; t < 4; ++t) {
+          const uint32_t lane = half * 16 + q * 4 + t;
+          for (uint32_t i = 0; i < 8; ++i) {
+            uint32_t r, c;
+            cd_pos(lane, i, op.acc_f16, &r, &c);
+            float acc = static_cast<float>(C[r][c]);
+            for (uint32_t k = 0; k < 4; ++k) acc += static_cast<float>(A[r][k]) * static_cast<float>(B[k][c]);
+            if (op.acc_f16)
+              out[i / 2][lane] |= (double_to_f16(acc) & 0xFFFF) << (16 * (i % 2));
+            else
+              out[i][lane] = f32bits(acc);
+          }
+        }
+    }
+    for (size_t r = 0; r < op.d.size(); ++r) {
+      alu_fault(out[r], m, 32);
+      write_reg(w, op.d[r], m, out[r], 32);
     }
   }
 

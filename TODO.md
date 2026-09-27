@@ -297,13 +297,25 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   use one of their own (the logical matrix, spread in order over lanes and
   registers); the combinations above keep theirs. wmma_types.cu checks all 21
   shape/type/layout combinations through mma.h, exactly;
-  ldmatrix.m8n8.x{1,2,4}[.trans], mma.sync.m16n8k{8,16,32} over f16/bf16/tf32/
-  s8, and movmatrix.m8n8.trans (the register-only transpose). mma.sp (2:4
-  structured sparsity) m16n8k{16,32} with f16/bf16 A and B, both sparsity
-  selectors: its A layout and metadata were read from the ISA's figures and
-  settled nibble by nibble on an RTX 3060, test_exec3 checks five forms
-  against the hardware's own results, and CUTLASS's 19 SM80 sparse GEMM tests
-  pass. Its tf32, integer and FP8 forms are still refused.
+  ldmatrix.m8n8.x{1,2,4}[.trans] and movmatrix.m8n8.trans (the
+  register-only transpose). mma.sync in every form the ISA lists except the
+  block-scaled and .kind::f8f6f4 ones (sm_120): Volta's m8n8k4 f16 (four
+  products, any layouts, f16/f32 accumulators), f64 m8n8k4 and m16n8k4/8/16
+  in each rounding mode, tf32, f16/bf16, s8/u8 and s4/u4 (mixed signedness,
+  .satfinite), .b1 .and/.xor.popc, and e4m3/e5m2; and mma.sp in every type,
+  shape and selector (f16/bf16, tf32 1:2, s8/u8, s4/u4 4:8 in pairs, fp8).
+  e2e_mma_forms runs the 123 forms an RTX 3060 has -- each fed fragments,
+  its D hashed -- and compares with the hashes the GPU gave. Three things
+  came out of the hardware rather than the ISA: tf32 inputs lose their low
+  13 mantissa bits; .satfinite clamps after every 128 bits of K (twice in
+  m16n8k32 int8 and m16n8k64 int4), not once at the end; and the 8- and
+  4-bit sparse forms carry metadata a row to a lane (lane 4g + 2 * selector
+  for row g, the next for g + 8, the pair after for chunks 8-15) where
+  f16/bf16/tf32 carry four chunks of both rows. fp8 and the sm_90 f64 shapes,
+  which the 3060 cannot run, are checked against a host GEMM. The
+  accumulation order of a float sum is unspecified and not modelled: with
+  inputs whose products round, m16n8k8 tf32 differs from the GPU in low bits.
+  CUTLASS's 19 SM80 sparse GEMM tests pass.
   stmatrix.m8n8.x{1,2,4}[.trans] is the store counterpart of ldmatrix: the warp
   writes the 8x8 matrices its registers hold back to shared memory, which is how
   a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
