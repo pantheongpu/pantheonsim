@@ -1599,7 +1599,7 @@ WAIT:
   DeviceProfile prof = load_gpu("nvidia/b200");
   auto m = ptx::parse(ptx);
   std::vector<uint8_t> img(4096, 0);
-  std::memcpy(img.data(), image.data(), std::min<size_t>(4096, image.size()));
+  std::copy_n(image.begin(), std::min<size_t>(4096, image.size()), img.begin());
   const uint64_t pimg = mem.alloc(img.size()), pout = mem.alloc(128 * 64);
   mem.write(pimg, img.data(), img.size());
   std::vector<uint32_t> zero(128 * 16, 0);
