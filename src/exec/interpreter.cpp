@@ -7623,14 +7623,14 @@ class Interpreter {
       const uint32_t lead = first_set(m);
       const uint64_t addr =
           space_base(Space::Shared) + base[lead] + static_cast<uint64_t>(op.bar.offset);
-      auto it = ctx.mbar->bars.find(addr);
-      if (it == ctx.mbar->bars.end() || !it->second.valid)
-        ctx_fail(ins, -1, Err::UnsupportedPtx,
-                 "cp.async.mbarrier.arrive on an mbarrier that has not been initialized");
+      // Resolved as every other mbarrier access is: a shared address carries
+      // its CTA's cluster rank, so an odd CTA's own barrier (and the even
+      // CTA's, which CUTLASS's 2-SM blockwise-scaled kernels arrive on) is
+      // found through it rather than by the raw address.
+      Mbarrier& b = cluster_mbarrier(ctx, ins, static_cast<int>(lead), addr, "cp.async.mbarrier.arrive");
       // .noinc completes the copies without contributing an arrival of its
       // own, which is how a thread that already arrived orders its copies.
       if (!op.noinc) {
-        Mbarrier& b = it->second;
         b.arrived += popcount_mask(m);
         if (b.arrived >= b.expected) {
           b.arrived -= b.expected;
