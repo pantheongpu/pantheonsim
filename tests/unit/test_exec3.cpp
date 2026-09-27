@@ -5434,4 +5434,150 @@ VTEST(mma_sm120_refuses_what_table_45_rules_out) {
                   "Table 46");
 }
 
+// ldmatrix's 8-bit shapes (9.7.16.5.15): lane l supplies the row at 32 * l of
+// a patterned shared buffer; each form's registers are checked against
+// figures 108-109 -- lane t holds columns 4(t % 4).. of row t / 4 (and t / 4
+// + 8 in its second register for 16x16, transposed) -- with fp4 and fp6
+// expanded into the low bits of each byte (as CUTLASS's fp4_shift_A says)
+// and .s4 sign-extended.
+VTEST(ldmatrix_8bit_shapes_expand_as_the_figures_show) {
+  struct Form { std::string mods; int R, count, bits; bool trans, s4; };
+  const Form forms[] = {
+      {"m8n16.x2.shared.b8x16.b4x16_p64", 8, 2, 4, false, false},
+      {"m8n16.x4.shared.b8x16.b6x16_p32", 8, 4, 6, false, false},
+      {"m8n16.x1.shared.s8.s4", 8, 1, 4, false, true},
+      {"m16n16.x1.trans.shared.b8", 16, 1, 8, true, false},
+      {"m16n16.x2.trans.shared.b8x16.b4x16_p64", 16, 2, 4, true, false},
+  };
+  auto image = [](int i) { return static_cast<uint8_t>((i * 37 + 11) & 0xFF); };
+  for (const Form& f : forms) {
+    const int nregs = f.count * f.R / 8;
+    std::string regs;
+    for (int i = 0; i < nregs; ++i) regs += (i ? ", %r" : "%r") + std::to_string(10 + i);
+    std::string ptx = R"(.version 8.7
+.target sm_120a
+.address_size 64
+.visible .entry k(.param .u64 pout)
+{
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<4>;
+    .shared .align 16 .b8 buf[1024];
+    ld.param.u64 %rd1, [pout];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, buf;
+    // Fill: byte i = (37 i + 11) mod 256, 32 bytes a lane.
+    shl.b32 %r3, %r1, 5;
+    mov.u32 %r4, 0;
+FILL:
+    add.u32 %r5, %r3, %r4;
+    mad.lo.u32 %r6, %r5, 37, 11;
+    add.u32 %r7, %r2, %r5;
+    st.shared.u8 [%r7], %r6;
+    add.u32 %r4, %r4, 1;
+    setp.lt.u32 %p1, %r4, 32;
+    @%p1 bra FILL;
+    bar.sync 0;
+    add.u32 %r8, %r2, %r3;
+    ldmatrix.sync.aligned.)" + f.mods + " {" + regs + "}, [%r8];\n";
+    // The instruction takes a shared offset with .shared: the buffer's.
+    ptx.replace(ptx.find("add.u32 %r8, %r2, %r3;"), 22, "mov.u32 %r8, %r3;     ");
+    ptx += "    mul.wide.u32 %rd2, %r1, 32;\n    add.u64 %rd3, %rd1, %rd2;\n";
+    for (int i = 0; i < nregs; ++i)
+      ptx += "    st.global.u32 [%rd3+" + std::to_string(4 * i) + "], %r" + std::to_string(10 + i) + ";\n";
+    ptx += "    ret;\n}\n";
+    ptx.insert(ptx.find(".reg .b64"), ".reg .pred %p<2>;\n    ");
+    Env e;
+    e.prof = load_gpu("nvidia/rtx5090");
+    const uint64_t out = e.mem.alloc(32 * 32);
+    LaunchConfig cfg;
+    cfg.block = {32, 1, 1};
+    exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+    std::vector<uint32_t> got(32 * 8);
+    e.mem.read(out, got.data(), got.size() * 4);
+    // Row r of matrix m: the sixteen values at 32 * (m * R + r), expanded.
+    auto elem = [&](int m, int r, int c) -> uint8_t {
+      const int at = 32 * (m * f.R + r);
+      uint32_t v = 0;
+      for (int k = 0; k < f.bits; ++k) v |= ((image(at + (c * f.bits + k) / 8) >> ((c * f.bits + k) % 8)) & 1u) << k;
+      if (f.s4 && (v & 8)) v |= 0xF0;
+      return static_cast<uint8_t>(v);
+    };
+    for (int lane = 0; lane < 32; ++lane)
+      for (int m = 0; m < f.count; ++m)
+        for (int rr = 0; rr < f.R / 8; ++rr) {
+          uint32_t want = 0;
+          for (int j = 0; j < 4; ++j) {
+            const int row = lane / 4 + 8 * rr, col = 4 * (lane % 4) + j;
+            want |= uint32_t{f.trans ? elem(m, col, row) : elem(m, row, col)} << (8 * j);
+          }
+          const uint32_t have = got[lane * 8 + m * (f.R / 8) + rr];
+          if (have != want)
+            VCHECK_EQ(f.mods + " lane " + std::to_string(lane) + ": " + std::to_string(have),
+                      f.mods + " lane " + std::to_string(lane) + ": " + std::to_string(want));
+        }
+  }
+  auto refused = [](const std::string& mods) {
+    return VCAPTURE(Error, ptx::parse(".version 8.7\n.target sm_120a\n.address_size 64\n.visible .entry k()\n{\n"
+                                      " .reg .b32 r<4>;\n ldmatrix.sync.aligned." + mods + " {r0, r1}, [r2];\n ret;\n}\n"))
+        .message();
+  };
+  VCHECK_CONTAINS(refused("m16n16.x1.shared.b8"), "not a form");         // 16x16 needs .trans
+  VCHECK_CONTAINS(refused("m8n16.x1.trans.shared.b8x16.b4x16_p64"), "not a form");
+}
+
+// stmatrix.m16n8.trans.b8 (figure 111): lane t's byte e is element (row, col)
+// = (t / 4 + 8(e / 2), 2(t % 4) + e % 2) of a 16x8 matrix, stored
+// column-major: column c is 16 bytes at the address lane 8m + c gives.
+VTEST(stmatrix_m16n8_trans_b8_stores_columns) {
+  std::string ptx = R"(.version 8.7
+.target sm_120a
+.address_size 64
+.visible .entry k(.param .u64 pout)
+{
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<4>;
+    .shared .align 16 .b8 buf[512];
+    ld.param.u64 %rd1, [pout];
+    mov.u32 %r1, %tid.x;
+    // Lane t, register m: bytes (64m + 4t + e) * 7.
+    shl.b32 %r2, %r1, 2;
+    mul.lo.u32 %r3, %r2, 7;
+    mov.u32 %r10, 0x1C150E07;
+    mul.lo.u32 %r4, %r3, 0x01010101;
+    add.u32 %r10, %r4, %r10;
+    add.u32 %r11, %r10, 0xC0C0C0C0;
+    shl.b32 %r5, %r1, 4;
+    stmatrix.sync.aligned.m16n8.x2.trans.shared.b8 [%r5], {%r10, %r11};
+    bar.sync 0;
+    shl.b32 %r6, %r1, 4;
+    mov.u32 %r7, buf;
+    add.u32 %r7, %r7, %r6;
+    ld.shared.v4.u32 {%r12, %r13, %r14, %r15}, [%r7];
+    mul.wide.u32 %rd2, %r1, 16;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.v4.u32 [%rd3], {%r12, %r13, %r14, %r15};
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/rtx5090");
+  const uint64_t out = e.mem.alloc(32 * 16);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  std::vector<uint8_t> got(32 * 16);
+  e.mem.read(out, got.data(), got.size());
+  // Register values as the kernel builds them: byte e of lane t, register m.
+  auto reg_byte = [](int t, int m, int e) {
+    const uint32_t base = 0x1C150E07u + uint32_t(t * 4 * 7) * 0x01010101u + (m ? 0xC0C0C0C0u : 0u);
+    return static_cast<uint8_t>(base >> (8 * e));
+  };
+  for (int m = 0; m < 2; ++m)
+    for (int c = 0; c < 8; ++c)
+      for (int row = 0; row < 16; ++row) {
+        const int t = 4 * (row % 8) + c / 2, byte = 2 * (row / 8) + c % 2;
+        VCHECK_EQ(int(got[(8 * m + c) * 16 + row]), int(reg_byte(t, m, byte)));
+      }
+}
+
 VTEST_MAIN

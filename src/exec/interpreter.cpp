@@ -4605,15 +4605,60 @@ class Interpreter {
     // instruction names the space itself and the register is a bare offset, so
     // the base has to be applied here instead.
     const uint64_t window = op.shared_space ? space_base(Space::Shared) : 0;
+    auto row_addr = [&](uint32_t src_lane) {
+      if (!(m & (Mask{1} << src_lane)))
+        ctx_fail(ins, static_cast<int>(src_lane), Err::UnsupportedPtx,
+                 "ldmatrix needs every lane that supplies a row address to be active");
+      return window + base[src_lane] + static_cast<uint64_t>(op.addr.offset);
+    };
+    if (op.shape != LdmShape::M8N8) {
+      // Rows of sixteen 8-bit values: from 16 bytes (.b8), from the packed
+      // front of a padded group (.b4x16_p64: 8 bytes, .b6x16_p32: 12), each
+      // value in the low bits of its byte -- CUTLASS shifts e2m1 up by 2
+      // itself before an mma -- or from 8 bytes of .s4, sign-extended.
+      const uint32_t R = op.shape == LdmShape::M16N16 ? 16 : 8;
+      const uint32_t bits = op.fmt == LdmSrc::B6P32 ? 6 : op.fmt == LdmSrc::B8 ? 8 : 4;
+      for (uint32_t mat = 0; mat < op.count; ++mat) {
+        uint8_t tile[16][16] = {};
+        for (uint32_t r = 0; r < R; ++r) {
+          const uint32_t src_lane = mat * R + r;
+          const uint64_t addr = row_addr(src_lane);
+          uint8_t raw[16];
+          for (uint32_t b = 0; b < 16 * bits / 8; ++b)
+            raw[b] = static_cast<uint8_t>(load_routed(w, ctx, ins, src_lane, addr + b, 1));
+          for (uint32_t c = 0; c < 16; ++c) {
+            uint32_t v = 0;
+            for (uint32_t k = 0; k < bits; ++k)
+              v |= ((raw[(c * bits + k) / 8] >> ((c * bits + k) % 8)) & 1u) << k;
+            if (op.fmt == LdmSrc::S4 && (v & 8)) v |= 0xF0;
+            tile[r][c] = static_cast<uint8_t>(v);
+          }
+        }
+        // Figures 108-109: lane t holds four consecutive columns of row t / 4
+        // (and of row t / 4 + 8 in its second register for 16x16), which for
+        // the transposed 16x16 are four stored rows at element t / 4.
+        const uint32_t regs = R / 8;
+        for (uint32_t rr = 0; rr < regs; ++rr) {
+          Lanes out;
+          for (uint32_t lane = 0; lane < W_; ++lane)
+            if (m & (Mask{1} << lane)) {
+              const uint32_t row = lane / 4 + 8 * rr, col0 = 4 * (lane % 4);
+              uint32_t word = 0;
+              for (uint32_t j = 0; j < 4; ++j)
+                word |= uint32_t{op.trans ? tile[col0 + j][row] : tile[row][col0 + j]} << (8 * j);
+              out[lane] = word;
+            }
+          write_reg(w, op.dsts[mat * regs + rr], m, out, 32);
+        }
+      }
+      return;
+    }
     for (uint32_t mat = 0; mat < op.count; ++mat) {
       // Pull the 8x8 matrix in, a row at a time.
       uint16_t tile[8][8] = {};
       for (uint32_t r = 0; r < 8; ++r) {
         const uint32_t src_lane = mat * 8 + r;
-        if (!(m & (Mask{1} << src_lane)))
-          ctx_fail(ins, static_cast<int>(src_lane), Err::UnsupportedPtx,
-                   "ldmatrix needs every lane that supplies a row address to be active");
-        const uint64_t addr = window + base[src_lane] + static_cast<uint64_t>(op.addr.offset);
+        const uint64_t addr = row_addr(src_lane);
         for (uint32_t c = 0; c < 8; ++c)
           tile[r][c] = static_cast<uint16_t>(
               load_routed(w, ctx, ins, src_lane, addr + c * 2, 2));
@@ -4649,6 +4694,31 @@ class Interpreter {
     // Same reasoning as ldmatrix: with ".shared" the register is a bare offset
     // into the window, without it cvta has already made it an address.
     const uint64_t window = op.shared_space ? space_base(Space::Shared) : 0;
+    if (op.m16n8) {
+      // 16x8 of bytes (figure 111): element (row, col) is byte 2(row / 8) +
+      // col % 2 of lane 4(row % 8) + col / 2 -- an mma accumulator's layout.
+      // Stored transposed (.trans is mandatory): memory row c is column c,
+      // 16 bytes, at the address lane 8 * matrix + c supplies.
+      for (uint32_t mat = 0; mat < op.count; ++mat) {
+        Lanes _s_val;
+        const Lanes& val = read_operand(w, ctx, ins, op.srcs[mat], _s_val);
+        for (uint32_t c = 0; c < 8; ++c) {
+          const uint32_t dst_lane = mat * 8 + c;
+          if (!(m & (Mask{1} << dst_lane)))
+            ctx_fail(ins, static_cast<int>(dst_lane), Err::UnsupportedPtx,
+                     "stmatrix needs every lane that supplies a row address to be active");
+          const uint64_t addr = window + base[dst_lane] + static_cast<uint64_t>(op.addr.offset);
+          for (uint32_t row = 0; row < 16; ++row) {
+            const uint32_t lane = 4 * (row % 8) + c / 2, byte = 2 * (row / 8) + c % 2;
+            if (!(m & (Mask{1} << lane)))
+              ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                       "stmatrix needs every lane of the warp active");
+            store_routed(w, ctx, ins, dst_lane, addr + row, 1, (val[lane] >> (8 * byte)) & 0xFF);
+          }
+        }
+      }
+      return;
+    }
     for (uint32_t mat = 0; mat < op.count; ++mat) {
       Lanes _s_val;
       const Lanes& val = read_operand(w, ctx, ins, op.srcs[mat], _s_val);

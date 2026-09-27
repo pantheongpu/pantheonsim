@@ -2016,41 +2016,57 @@ class Parser {
       op.src = parse_operand();
       ins.op = op;
     } else if (op0 == "ldmatrix") {
+      // ldmatrix.sync.aligned.<shape>.<num>{.trans}{.shared}.<type> r, [p]
+      //   m8n8 .b16; m16n16 .trans .b8 or .b8x16.{b6x16_p32,b4x16_p64};
+      //   m8n16 .b8x16.{b6x16_p32,b4x16_p64} or .s8.s4 (9.7.16.5.15)
       uint32_t count = 0;
-      bool trans = false, shape_ok = false, b16 = false, shared_space = false;
+      bool trans = false, shared_space = false, have_shape = false, b8x16 = false, s8 = false;
+      OpLdMatrix op;
+      std::string src;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "sync" || p == "aligned") ;
-        else if (p == "m8n8") shape_ok = true;
+        else if (p == "m8n8") { op.shape = LdmShape::M8N8; have_shape = true; }
+        else if (p == "m8n16") { op.shape = LdmShape::M8N16; have_shape = true; }
+        else if (p == "m16n16") { op.shape = LdmShape::M16N16; have_shape = true; }
         else if (p == "x1") count = 1;
         else if (p == "x2") count = 2;
         else if (p == "x4") count = 4;
         else if (p == "trans") trans = true;
-        else if (p == "b16") b16 = true;
+        else if (p == "b16" || p == "b8" || p == "b6x16_p32" || p == "b4x16_p64" || p == "s4") src = p;
+        else if (p == "b8x16") b8x16 = true;
+        else if (p == "s8") s8 = true;
         else if (p == "shared") shared_space = true;
         else if (p == "cta") ;  // scope qualifier on .shared::cta
         else return unsupported("ldmatrix modifier '." + p + "'");
       }
-      if (!shape_ok || !count || !b16)
-        return unsupported("only ldmatrix.m8n8.x{1,2,4}.b16 is implemented");
-      OpLdMatrix op;
+      op.fmt = src == "b16" ? LdmSrc::B16 : src == "b8" ? LdmSrc::B8 : src == "b6x16_p32" ? LdmSrc::B6P32
+             : src == "b4x16_p64" ? LdmSrc::B4P64 : LdmSrc::S4;
+      const bool sub = src == "b6x16_p32" || src == "b4x16_p64";
+      bool ok = have_shape && count && !src.empty() && b8x16 == sub && s8 == (src == "s4");
+      if (op.shape == LdmShape::M8N8) ok = ok && src == "b16";
+      if (op.shape == LdmShape::M16N16) ok = ok && trans && count <= 2 && (src == "b8" || sub);
+      if (op.shape == LdmShape::M8N16) ok = ok && !trans && (sub || src == "s4");
+      if (!ok) return unsupported("ldmatrix " + opcode.substr(9) + " is not a form the ISA defines");
       op.count = count;
       op.trans = trans;
       op.shared_space = shared_space;
       op.dsts = parse_reg_vector_any();
-      if (op.dsts.size() != count) return unsupported("ldmatrix destination arity");
+      if (op.dsts.size() != count * (op.shape == LdmShape::M16N16 ? 2 : 1))
+        return unsupported("ldmatrix destination arity");
       expect_punct(",");
       op.addr = parse_addr(fn);
       ins.op = op;
     } else if (op0 == "stmatrix") {
-      // The same modifiers as ldmatrix, and the same restriction: the 8x8 b16
-      // shapes, which is what this engine's matrix fragments are.
+      // m8n8 .b16, and m16n8 .trans .b8 (9.7.16.5.16).
       uint32_t count = 0;
-      bool trans = false, shape_ok = false, b16 = false, shared_space = false;
+      bool trans = false, shape_ok = false, b16 = false, b8 = false, shared_space = false, m16n8 = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "sync" || p == "aligned") ;
         else if (p == "m8n8") shape_ok = true;
+        else if (p == "m16n8") shape_ok = m16n8 = true;
+        else if (p == "b8") b8 = true;
         else if (p == "x1") count = 1;
         else if (p == "x2") count = 2;
         else if (p == "x4") count = 4;
@@ -2060,10 +2076,11 @@ class Parser {
         else if (p == "cta") ;  // scope qualifier on .shared::cta
         else return unsupported("stmatrix modifier '." + p + "'");
       }
-      if (!shape_ok || !count || !b16)
-        return unsupported("only stmatrix.m8n8.x{1,2,4}.b16 is implemented");
+      if (!shape_ok || !count || (m16n8 ? !(b8 && trans) : !b16))
+        return unsupported("stmatrix is .m8n8 with .b16, or .m16n8.trans with .b8");
       OpStMatrix op;
       op.count = count;
+      op.m16n8 = m16n8;
       op.trans = trans;
       op.shared_space = shared_space;
       op.addr = parse_addr(fn);

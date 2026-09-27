@@ -252,8 +252,16 @@ struct OpMovMatrix { Reg dst; Operand src; };
 // When ".shared" is named, the address register holds an offset in the shared
 // window; without it the register holds a generic address that cvta has already
 // converted. Both forms occur: llama.cpp cvta's first, Triton does not.
+// The shapes (9.7.16.5.15): 8x8 of 16-bit elements, 8x16 and 16x16 of
+// 8-bit ones -- or of 6-/4-bit ones (.b6x16_p32, .b4x16_p64: sixteen values
+// padded to 16 bytes in shared memory) expanded into the low bits of each
+// byte, or .s4 sign-extended to .s8.
+enum class LdmShape : uint8_t { M8N8, M8N16, M16N16 };
+enum class LdmSrc : uint8_t { B16, B8, B6P32, B4P64, S4 };
 struct OpLdMatrix {
   uint32_t count = 1;
+  LdmShape shape = LdmShape::M8N8;
+  LdmSrc fmt = LdmSrc::B16;
   bool trans = false;
   bool shared_space = false;
   std::vector<Reg> dsts;
@@ -268,6 +276,7 @@ struct OpLdMatrix {
 // does between its two multiplies.
 struct OpStMatrix {
   uint32_t count = 1;
+  bool m16n8 = false;          // 16x8 of 8-bit elements (.trans mandatory)
   bool trans = false;
   bool shared_space = false;
   std::vector<Operand> srcs;   // one 32-bit register per matrix, per lane
