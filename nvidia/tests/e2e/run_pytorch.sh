@@ -24,13 +24,13 @@ root="$(cd "$(dirname "$0")/../../.." && pwd)"
 build="${VGPU_BUILD_DIR:-$root/build}"
 shim="$build/shim"
 [[ -e "$shim/libcudart.so.13" ]] || { echo "SKIP: no CUDA 13 runtime shim in $shim"; exit 0; }
-[[ -e "$script" ]] || { echo "FAIL  no such script of checks: $script"; exit 1; }
 python=""
 for c in "${VGPU_TORCH_CUDA_PYTHON:-}" $(ls -d "$HOME"/.local/share/torch-cu13*/bin/python 2>/dev/null); do
   [[ -n "$c" && -x "$c" ]] && "$c" -c 'import torch, sys; sys.exit(0 if (torch.version.cuda or "").startswith("13") else 1)' 2>/dev/null &&
     { python=$c; break; }
 done
 [[ -n "$python" ]] || { echo "SKIP: no Python with PyTorch for CUDA 13 (set VGPU_TORCH_CUDA_PYTHON)"; exit 0; }
+[[ -e "$script" ]] || { echo "FAIL  no such script of checks: $script"; exit 1; }
 
 vgpu="$build/vgpu"
 [[ -x "$vgpu" ]] || { echo "SKIP: $vgpu not built"; exit 0; }
