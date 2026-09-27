@@ -267,8 +267,11 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
                                           const void* C, cublasLtMatrixLayout_t Cdesc, void* D,
                                           cublasLtMatrixLayout_t Ddesc, const cublasLtMatmulAlgo_t*,
                                           void*, size_t, cudaStream_t) {
-  if (!known(h) || !known(desc) || !known(Adesc) || !known(Bdesc) || !known(Ddesc))
-    return CUBLAS_STATUS_NOT_INITIALIZED;
+  // Any handle will do, not only one cublasLtCreate made: a cuBLAS handle is
+  // a valid cuBLASLt handle, and PyTorch passes its cuBLAS handle here. This
+  // library keeps nothing in a handle.
+  if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!known(desc) || !known(Adesc) || !known(Bdesc) || !known(Ddesc)) return CUBLAS_STATUS_INVALID_VALUE;
   auto* md = reinterpret_cast<MatmulDesc*>(desc);
   auto* la = reinterpret_cast<MatrixLayout*>(Adesc);
   auto* lb = reinterpret_cast<MatrixLayout*>(Bdesc);
