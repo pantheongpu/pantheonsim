@@ -2901,6 +2901,50 @@ VTEST(bfind_elect_and_isspacep) {
   VCHECK_EQ(e.mem.load_scalar(out + 28, 4), uint64_t{1});          // the buffer is global
 }
 
+// Without .noinc, cp.async.mbarrier.arrive adds one to the pending count
+// before its arrive-on -- a net zero for the phase -- so a barrier of one
+// completes only on a real arrival; with .noinc the arrive-on counts
+// (9.7.15.16.18).
+VTEST(cp_async_mbarrier_arrive_counts_only_with_noinc) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<4>;
+    .shared .align 8 .b8 bar[16];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u64 %rd5, bar;
+    add.u64 %rd6, %rd5, 8;
+    mov.u32 %r1, 1;
+    mbarrier.init.shared.b64 [%rd5], %r1;
+    mbarrier.init.shared.b64 [%rd6], %r1;
+    cp.async.mbarrier.arrive.shared.b64 [%rd5];
+    mbarrier.test_wait.parity.shared.b64 %p1, [%rd5], 0;
+    selp.u32 %r2, 1, 0, %p1;
+    mbarrier.arrive.shared.b64 %rd7, [%rd5];
+    mbarrier.test_wait.parity.shared.b64 %p2, [%rd5], 0;
+    selp.u32 %r3, 1, 0, %p2;
+    cp.async.mbarrier.arrive.noinc.shared.b64 [%rd6];
+    mbarrier.test_wait.parity.shared.b64 %p3, [%rd6], 0;
+    selp.u32 %r4, 1, 0, %p3;
+    st.global.u32 [%rd2], %r2;
+    st.global.u32 [%rd2+4], %r3;
+    st.global.u32 [%rd2+8], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16);
+  LaunchConfig cfg;
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0});       // no .noinc: not complete
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{1});   // after a real arrival
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{1});   // .noinc: complete
+}
+
 VTEST(cp_async_mbarrier_arrive_lands_the_copy_before_the_arrival) {
   // The ordering an Ampere pipeline depends on. Warp 0 issues a cp.async into
   // shared memory and signals the barrier with cp.async.mbarrier.arrive; every
@@ -2932,7 +2976,7 @@ INITDONE:
     bar.sync 0;
     @%p0 bra ARRIVE;
     cp.async.ca.shared.global [%rd6], [%rd2], 4;
-    cp.async.mbarrier.arrive.shared.b64 [%rd5];
+    cp.async.mbarrier.arrive.noinc.shared.b64 [%rd5];
     bra WAIT;
 ARRIVE:
     mbarrier.arrive.shared.b64 %rd7, [%rd5];
