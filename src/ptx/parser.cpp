@@ -2079,7 +2079,7 @@ class Parser {
       // The forms of PTX ISA 9.7.16.5.14 and 9.7.16.6.3.
       unsigned mm = 0, nn = 0, kk = 0;
       std::vector<std::string> types, layouts;
-      bool sparse = false, have_shape = false, popc = false;
+      bool sparse = false, have_shape = false, popc = false, ordered_metadata = false;
       std::string kind, stype;
       int scale_vec = 0;
       OpMma op;
@@ -2087,8 +2087,10 @@ class Parser {
         const std::string& p = parts[i];
         char tail = 0;
         if (p == "sync" || p == "aligned") ;
-        else if (p == "sp" || p == "sp::ordered_metadata") sparse = true;
-        else if (p == "row" || p == "col") layouts.push_back(p);
+        else if (p == "sp" || p == "sp::ordered_metadata") {
+          sparse = true;
+          ordered_metadata = p == "sp::ordered_metadata";
+        } else if (p == "row" || p == "col") layouts.push_back(p);
         else if (std::sscanf(p.c_str(), "m%un%uk%u%c", &mm, &nn, &kk, &tail) == 3) have_shape = true;
         else if (p == "satfinite") op.satfinite = true;
         else if (p == "xor") op.b1_and = false;
@@ -2133,13 +2135,16 @@ class Parser {
               (target_.rfind("sm_12", 0) == 0 && target_.size() > 6 && target_.back() == 'f')))
           fail(ins.line, "mma.kind::" + kind + " requires an sm_120a (or sm_12xf) target; this module targets " +
                              (target_.empty() ? std::string("nothing") : target_));
-        if (sparse)
-          return unsupported("mma.sp with ." + ("kind::" + kind) + " (sm_120 sparse) is not implemented");
         const bool f4 = kind == "mxf4" || kind == "mxf4nvf4";
         const bool dc_ok = mx ? types[0] == "f32" && types[3] == "f32"
                               : (types[0] == "f32" || types[0] == "f16") && types[0] == types[3];
         const bool ab_ok = f4 ? types[1] == "e2m1" && types[2] == "e2m1" : narrow(types[1]) && narrow(types[2]);
-        const unsigned want_k = f4 ? 64 : 32;
+        // Sparse A doubles K: f8f6f4 at m16n8k64 (2:4, 8-bit containers, as
+        // sparse int8/fp8 are laid out) and mxf4 at m16n8k128 (4:8 in pairs,
+        // as sparse int4); the kinds take only ::ordered_metadata.
+        const unsigned want_k = (f4 ? 64 : 32) * (sparse ? 2 : 1);
+        if (sparse && !ordered_metadata)
+          return unsupported("mma.sp with .kind::" + kind + " is mma.sp::ordered_metadata only");
         if (mm != 16 || kk != want_k || !dc_ok || !ab_ok)
           return unsupported("mma.kind::" + kind + "." + "m" + std::to_string(mm) + "n8k" + std::to_string(kk) +
                              "." + types[0] + "." + types[1] + "." + types[2] + "." + types[3] +
@@ -2177,6 +2182,18 @@ class Parser {
         op.b = parse_reg_vector_any();
         expect_punct(",");
         op.c = parse_reg_vector_any();
+        op.sparse = sparse;
+        if (sparse) {
+          // All four threads of a group hold its metadata at these shapes, so
+          // the selector is 0 (9.7.16.6.1).
+          expect_punct(",");
+          op.meta = parse_operand();
+          expect_punct(",");
+          op.selector = parse_operand();
+          const auto* sel = std::get_if<ImmInt>(&op.selector);
+          if (!sel || sel->value != 0)
+            return unsupported("mma.sp::ordered_metadata.kind::" + kind + "'s sparsity selector must be 0");
+        }
         if (mx) {
           auto braced_one = [&]() {
             if (!peek_punct("{")) return parse_operand();

@@ -5179,28 +5179,64 @@ struct Sm120Case {
   uint32_t bida = 0, tida = 0, bidb = 0, tidb = 0, sv = 1;
   std::function<uint8_t(int, int)> sfa, sfb;       // (row or column, block) -> byte
   std::function<double(uint8_t)> factor;
+  // Sparse A (K is the dense width): chunk c of row i keeps the positions
+  // keep(i, c) returns -- pairs of 2:4 positions, or two pairs of a 4:8 --
+  // stored in order.
+  bool sparse = false;
 };
+
+// A 2:4 (w = 4) or 4:8-in-pairs (w = 8) pattern and its 4-bit field.
+std::vector<int> sm120_keep(int i, int c, int w) {
+  static const int pairs[6][2] = {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
+  const int h = (i * 5 + c * 3) % 6;
+  if (w == 4) return {pairs[h][0], pairs[h][1]};
+  return {2 * pairs[h][0], 2 * pairs[h][0] + 1, 2 * pairs[h][1], 2 * pairs[h][1] + 1};
+}
+uint32_t sm120_field(int i, int c, int w) {
+  const auto k = sm120_keep(i, c, w);
+  return w == 4 ? uint32_t(k[0]) | uint32_t(k[1]) << 2 : uint32_t(k[0] / 2) | uint32_t(k[2] / 2) << 2;
+}
 
 // A and B from the fragment layouts (9.7.16.5.10-11): with p slots to a
 // register, A's register r of lane (g, t) holds row g + 8(r % 2), columns
 // tp + 4p(r / 2) on; B's register r holds rows tp + 4pr on of column g.
 std::vector<float> run_sm120(const Sm120Case& t, std::function<float(int, int)> A, std::function<float(int, int)> B) {
-  const int p = 32 / t.elem_bits, na = 16 * t.K / (32 * p), nb = t.K * 8 / (32 * p);
-  std::vector<uint32_t> in(32 * 8, 0);
+  const int p = 32 / t.elem_bits, na = 16 * t.K / (t.sparse ? 2 : 1) / (32 * p), nb = t.K * 8 / (32 * p);
+  // Registers: A at 0-3, B at 4-7, scale data at 8-9, metadata at 10.
+  const int w = t.elem_bits == 4 ? 8 : 4, per = w / 2;   // chunk width, stored per chunk
+  std::vector<uint32_t> in(32 * 12, 0);
   for (int lane = 0; lane < 32; ++lane) {
     const int g = lane / 4, tt = lane % 4;
     for (int r = 0; r < na; ++r)
-      for (int e = 0; e < p; ++e)
-        in[lane * 8 + r] |= t.a_code(A(g + 8 * (r % 2), tt * p + 4 * p * (r / 2) + e)) << (t.elem_bits * e);
+      for (int e = 0; e < p; ++e) {
+        const int row = g + 8 * (r % 2);
+        float v;
+        if (t.sparse) {
+          // Register r of lane (g, t) holds the stored values of chunks
+          // t * cpr + 4 * cpr * (r / 2) on (9.7.16.6.2).
+          const int cpr = p / per, chunk = tt * cpr + 4 * cpr * (r / 2) + e / per;
+          v = A(row, chunk * w + sm120_keep(row, chunk, w)[e % per]);
+        } else {
+          v = A(row, tt * p + 4 * p * (r / 2) + e);
+        }
+        in[lane * 12 + r] |= t.a_code(v) << (t.elem_bits * e);
+      }
     for (int r = 0; r < nb; ++r)
-      for (int e = 0; e < p; ++e) in[lane * 8 + 4 + r] |= t.b_code(B(tt * p + 4 * p * r + e, g)) << (t.elem_bits * e);
+      for (int e = 0; e < p; ++e) in[lane * 12 + 4 + r] |= t.b_code(B(tt * p + 4 * p * r + e, g)) << (t.elem_bits * e);
     if (t.scaled) {
       // Figures 46-48: the selected pair of each quad holds rows g (first
       // thread) and g + 8 (second); thread tidb of quad g holds column g.
       if (tt / 2 == int(t.tida))
-        for (uint32_t b = 0; b < t.sv; ++b) in[lane * 8 + 6] |= uint32_t(t.sfa(g + 8 * (tt % 2), b)) << (8 * (t.bida + b));
+        for (uint32_t b = 0; b < t.sv; ++b) in[lane * 12 + 8] |= uint32_t(t.sfa(g + 8 * (tt % 2), b)) << (8 * (t.bida + b));
       if (tt == int(t.tidb))
-        for (uint32_t b = 0; b < t.sv; ++b) in[lane * 8 + 7] |= uint32_t(t.sfb(g, b)) << (8 * (t.bidb + b));
+        for (uint32_t b = 0; b < t.sv; ++b) in[lane * 12 + 9] |= uint32_t(t.sfb(g, b)) << (8 * (t.bidb + b));
+    }
+    if (t.sparse) {
+      // Metadata with all four threads of the group holding it (selector 0):
+      // row g in lane 4g, row g + 8 in 4g + 1, their chunks 8-15 in 4g + 2
+      // and 4g + 3, 4 bits a chunk.
+      const int row = g + 8 * (tt % 2), c0 = 8 * (tt / 2);
+      for (int c = 0; c < 8; ++c) in[lane * 12 + 10] |= sm120_field(row, c0 + c, w) << (4 * c);
     }
   }
   std::string ptx = R"(.version 8.7
@@ -5215,18 +5251,18 @@ std::vector<float> run_sm120(const Sm120Case& t, std::function<float(int, int)> 
     ld.param.u64 %rd1, [pin];
     ld.param.u64 %rd2, [pout];
     mov.u32 %r20, %tid.x;
-    mul.wide.u32 %rd3, %r20, 32;
+    mul.wide.u32 %rd3, %r20, 48;
     add.u64 %rd4, %rd1, %rd3;
     mul.wide.u32 %rd5, %r20, 16;
     add.u64 %rd6, %rd2, %rd5;
 )";
-  for (int i = 0; i < 8; ++i) ptx += "    ld.global.u32 %r" + std::to_string(i) + ", [%rd4+" + std::to_string(4 * i) + "];\n";
+  for (int i = 0; i < 11; ++i) ptx += "    ld.global.u32 %r" + std::to_string(i) + ", [%rd4+" + std::to_string(4 * i) + "];\n";
   ptx += "    mov.f32 %f4, 0f00000000;\n";
   ptx += "    mov.b16 %h0, " + std::to_string(t.bida) + ";\n    mov.b16 %h1, " + std::to_string(t.tida) + ";\n";
   ptx += "    mov.b16 %h2, " + std::to_string(t.bidb) + ";\n    mov.b16 %h3, " + std::to_string(t.tidb) + ";\n";
-  std::string a = "{%r0, %r1, %r2, %r3}", b = "{%r4, %r5}";
+  std::string a = "{%r0, %r1, %r2, %r3}", b = nb == 4 ? "{%r4, %r5, %r6, %r7}" : "{%r4, %r5}";
   ptx += "    " + t.op + " {%f0, %f1, %f2, %f3}, " + a + ", " + b + ", {%f4, %f4, %f4, %f4}" +
-         (t.scaled ? ", {%r6}, {%h0, %h1}, {%r7}, {%h2, %h3}" : "") + ";\n";
+         (t.sparse ? ", %r10, 0" : "") + (t.scaled ? ", {%r8}, {%h0, %h1}, {%r9}, {%h2, %h3}" : "") + ";\n";
   for (int i = 0; i < 4; ++i) ptx += "    st.global.f32 [%rd6+" + std::to_string(4 * i) + "], %f" + std::to_string(i) + ";\n";
   ptx += "    ret;\n}\n";
   Env e;
@@ -5246,7 +5282,16 @@ std::vector<float> run_sm120(const Sm120Case& t, std::function<float(int, int)> 
   return D;
 }
 
-void check_sm120(const Sm120Case& t, std::function<float(int, int)> A, std::function<float(int, int)> B) {
+void check_sm120(const Sm120Case& t, std::function<float(int, int)> A0, std::function<float(int, int)> B) {
+  // Sparse: the dense A is zero where the pattern keeps nothing.
+  const int w = t.elem_bits == 4 ? 8 : 4;
+  std::function<float(int, int)> A = A0;
+  if (t.sparse)
+    A = [&](int i, int k) {
+      for (int x : sm120_keep(i, k / w, w))
+        if (k % w == x) return A0(i, k);
+      return 0.0f;
+    };
   const auto D = run_sm120(t, A, B);
   const int blk = t.K / int(t.sv);
   for (int i = 0; i < 16; ++i)
@@ -5321,6 +5366,41 @@ VTEST(mma_sm120_mxf4nvf4_ue4m3) {
     return v ? std::ldexp(1.0 + (v & 7) / 8.0, int(v >> 3) - 7) : 0.0;
   };
   check_sm120(t, [](int i, int k) { return sm120_val(i, k, 6); }, [](int k, int j) { return sm120_val(k, j, 2); });
+}
+
+// Sparse block-scaled: mxf8f6f4 at m16n8k64 (2:4, e2m3 A in containers, one
+// factor per 64) and mxf4nvf4 at m16n8k128 (4:8 in pairs, four ue4m3
+// factors per 128).
+VTEST(mma_sm120_sparse_mxf8f6f4_k64) {
+  Sm120Case t;
+  t.op = "mma.sp::ordered_metadata.sync.aligned.kind::mxf8f6f4.block_scale.m16n8k64.row.col.f32.e2m3.e4m3.f32.ue8m0";
+  t.K = 64;
+  t.elem_bits = 8;
+  t.sparse = true;
+  t.a_code = [](float f) { return mx_code(f, 2, 3, 1); };
+  t.b_code = [](float f) { return mx_code(f, 4, 3, 7); };
+  t.scaled = true;
+  t.bida = 3; t.tida = 0; t.bidb = 0; t.tidb = 1; t.sv = 1;
+  t.sfa = [](int i, int) { return uint8_t(125 + i % 4); };
+  t.sfb = [](int j, int) { return uint8_t(128 - j % 3); };
+  t.factor = [](uint8_t v) { return std::ldexp(1.0, int(v) - 127); };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 8); }, [](int k, int j) { return sm120_val(k, j, 3); });
+}
+
+VTEST(mma_sm120_sparse_mxf4nvf4_k128) {
+  Sm120Case t;
+  t.op = "mma.sp::ordered_metadata.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k128.row.col.f32.e2m1.e2m1.f32.ue4m3";
+  t.K = 128;
+  t.elem_bits = 4;
+  t.sparse = true;
+  t.a_code = t.b_code = [](float f) { return mx_code(f, 2, 1, 1); };
+  t.scaled = true;
+  t.tida = 1; t.tidb = 0; t.sv = 4;
+  const float steps[] = {0.5f, 1.0f, 1.5f, 2.0f, 0.75f};
+  t.sfa = [steps](int i, int b) { return uint8_t(mx_code(steps[(i + 2 * b) % 5], 4, 3, 7)); };
+  t.sfb = [steps](int j, int b) { return uint8_t(mx_code(steps[(j + b) % 5], 4, 3, 7)); };
+  t.factor = [](uint8_t v) { return v ? std::ldexp(1.0 + (v & 7) / 8.0, int(v >> 3) - 7) : 0.0; };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 5); }, [](int k, int j) { return sm120_val(k, j, 1); });
 }
 
 VTEST(mma_sm120_refuses_what_table_45_rules_out) {

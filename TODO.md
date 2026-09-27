@@ -305,12 +305,15 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   registers); the combinations above keep theirs. wmma_types.cu checks all 21
   shape/type/layout combinations through mma.h, exactly;
   ldmatrix.m8n8.x{1,2,4}[.trans] and movmatrix.m8n8.trans (the
-  register-only transpose). mma.sync in every form the ISA lists except the
-  block-scaled and .kind::f8f6f4 ones (sm_120): Volta's m8n8k4 f16 (four
+  register-only transpose). mma.sync in every form the ISA lists: Volta's m8n8k4 f16 (four
   products, any layouts, f16/f32 accumulators), f64 m8n8k4 and m16n8k4/8/16
   in each rounding mode, tf32, f16/bf16, s8/u8 and s4/u4 (mixed signedness,
-  .satfinite), .b1 .and/.xor.popc, and e4m3/e5m2; and mma.sp in every type,
-  shape and selector (f16/bf16, tf32 1:2, s8/u8, s4/u4 4:8 in pairs, fp8).
+  .satfinite), .b1 .and/.xor.popc, e4m3/e5m2, and sm_120's
+  `.kind::f8f6f4` (fp6/fp4 in 8-bit containers) and block-scaled
+  `.kind::mxf8f6f4`/`mxf4`/`mxf4nvf4` with their scale-data selectors
+  (9.7.16.3, figures 46-48); and mma.sp in every type, shape and selector
+  (f16/bf16, tf32 1:2, s8/u8, s4/u4 4:8 in pairs, fp8, and the sm_120
+  kinds at m16n8k64/k128). A simulated RTX 5090 (nvidia/rtx5090) runs them.
   e2e_mma_forms runs the 123 forms an RTX 3060 has -- each fed fragments,
   its D hashed -- and compares with the hashes the GPU gave. Three things
   came out of the hardware rather than the ISA: tf32 inputs lose their low
@@ -950,8 +953,8 @@ what is done.
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle's 8-byte-flip
   variant (Blackwell); tcgen05's weight-stationary MMAs,
-  `tcgen05.shift` and `tcgen05.cp`'s `.warpx2` and decompression; mma's
-  block-scaled and `.kind::f8f6f4` forms (sm_120); and inline-asm-only instructions. (`wgmma`, TMA,
+  `tcgen05.shift` and `tcgen05.cp`'s `.warpx2` and decompression; and
+  inline-asm-only instructions. (`wgmma`, TMA,
   the mbarrier transaction counts, `barrier.cluster` and distributed shared
   memory are done -- see "Hopper's warpgroup MMA", "TMA and clusters" and
   "Distributed shared memory" above. Textures, surfaces and grid sync are

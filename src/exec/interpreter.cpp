@@ -5580,7 +5580,8 @@ class Interpreter {
       // and nibble by nibble for f16 and int8, and by hashes of every result
       // for all of them.
       const bool tf32 = op.ab_type == MmaElem::TF32;
-      const bool int4 = op.ab_type == MmaElem::S4 || op.ab_type == MmaElem::U4;
+      // 4:8 in pairs for every 4-bit type: int4, and sm_120's packed e2m1.
+      const bool int4 = mma_bits(op.ab_type) == 4;
       const uint32_t chunk_elems = tf32 ? 2 : int4 ? 8 : 4;
       const uint32_t stored = chunk_elems / 2;              // per chunk
       const uint32_t cpr = per_reg / stored;                // chunks per register
