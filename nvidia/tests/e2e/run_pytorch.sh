@@ -12,11 +12,12 @@
 # (compute_120, beside SASS for older architectures); the simulator runs PTX,
 # and a driver JITs PTX only for a device at least as new.
 #
-# PyTorch finds NVIDIA's libraries through an RPATH into its nvidia-* packages,
-# which LD_LIBRARY_PATH does not override, so VirtualGPU's are preloaded: a
-# library already loaded under a soname is the one every later request for that
-# soname gets. NVIDIA's cuFile, cuSPARSELt and NVSHMEM load as they are; nothing
-# here calls them.
+# It runs as a user would, through `vgpu run --preload`: PyTorch finds NVIDIA's
+# libraries through an RPATH into its nvidia-* packages, which LD_LIBRARY_PATH
+# does not override, and python names no CUDA library itself, so every CUDA
+# library the shim carries is preloaded -- a library already loaded under a
+# soname is the one every later request for that soname gets. NVIDIA's
+# cuFile, cuSPARSELt and NVSHMEM load as they are; nothing here calls them.
 set -uo pipefail
 script="$1" expected="$2" gpu="${3:-nvidia/rtx5090}"
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -30,13 +31,8 @@ for c in "${VGPU_TORCH_CUDA_PYTHON:-}" $(ls -d "$HOME"/.local/share/torch-cu13*/
 done
 [[ -n "$python" ]] || { echo "SKIP: no Python with PyTorch for CUDA 13 (set VGPU_TORCH_CUDA_PYTHON)"; exit 0; }
 
-preload=""
-for l in libcuda.so.1 libcudart.so.13 libcublasLt.so.13 libcublas.so.13 libcudnn.so.9 libcufft.so.12 \
-         libcurand.so.10 libcusparse.so.12 libcusolver.so.12 libnccl.so.2 libnvrtc.so.13 libcupti.so.13 \
-         libnvidia-ml.so.1; do
-  [[ -e "$shim/$l" ]] || { echo "SKIP: no $l in $shim"; exit 0; }
-  preload+="${preload:+:}$shim/$l"
-done
+vgpu="$build/vgpu"
+[[ -x "$vgpu" ]] || { echo "SKIP: $vgpu not built"; exit 0; }
 
 # As on AMD: a run held to a memory cap where systemd can hold one, since
 # PyTorch on a simulated device grows to gigabytes and the machines are shared.
@@ -47,8 +43,7 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 out=$(cd "$tmp" && TRITON_CACHE_DIR="$tmp/triton" TORCHINDUCTOR_CACHE_DIR="$tmp/inductor" \
-  VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" LD_PRELOAD="$preload" \
-  "${cap[@]}" "$python" "$script" 2>&1)
+  "${cap[@]}" "$vgpu" run --gpu "$gpu" --preload "$python" "$script" 2>&1)
 status=$?
 echo "$out" | grep -E '^(ok|FAIL) ' | sed 's/^/      /'
 fail=0
