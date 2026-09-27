@@ -522,7 +522,7 @@ if(CUDA_ABI_INCLUDE)
     NO_DEFAULT_PATH)
   if(CUDNN_INCLUDE)
     message(STATUS "cuDNN headers at ${CUDNN_INCLUDE}: building libvgpucudnn")
-    add_library(vgpucudnn SHARED nvidia/src/cudnn_api.cpp nvidia/src/cudnn_backend.cpp
+    add_library(vgpucudnn SHARED nvidia/src/cudnn_api.cpp nvidia/src/cudnn_backend.cpp nvidia/src/cudnn_rnn.cpp
       nvidia/src/generated/cudnn_stubs.cpp)
     target_link_libraries(vgpucudnn PRIVATE vgpu vgpucudart)
     target_include_directories(vgpucudnn PRIVATE ${CUDNN_INCLUDE} ${CUDA_ABI_INCLUDE})
