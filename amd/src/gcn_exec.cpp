@@ -1,5 +1,6 @@
 #include "vgpu/amd_exec.hpp"
 
+#include <cfenv>
 #include <cmath>
 #include <limits>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <atomic>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -19,6 +21,10 @@
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/amd_hostcall.hpp"
 #include "vgpu/error.hpp"
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+#endif
 
 namespace vgpu::amd {
 namespace {
@@ -154,13 +160,68 @@ struct Wave {
   bool done = false;
   bool at_barrier = false;
   uint32_t first_lane = 0;   // this wave's first work-item in the group
-  // The MODE hardware register, as a kernel reads and sets it: round to
-  // nearest, denormals kept, DX10 clamp and IEEE mode on -- what a compute
-  // dispatch starts with.
+  // The MODE hardware register, as a kernel reads and sets it: what its
+  // descriptor asks for (Kernel::mode) to begin with. FloatMode applies it.
   uint32_t mode = 0xF0 | 1u << 8 | 1u << 9;
   // VGPR indexing (s_set_gpr_idx_on): which operands are offset -- source
   // 0, 1, 2 and the destination, a bit each -- by M0's low byte. 0 is off.
   uint8_t gpr_idx = 0;
+};
+
+// The MODE register's round and denormal modes, applied to the host's own
+// floating point for the one instruction that runs under them: the round
+// mode through <cfenv>, and the denormal mode through the host's flush
+// controls -- on x86 MXCSR's DAZ (inputs read as zero) and FTZ (results
+// flushed), which match MODE's two bits exactly; on AArch64 FPCR.FZ, which
+// does both at once, for the mode that flushes both. A float instruction
+// takes MODE's single-precision fields, a double one the 16/64-bit fields.
+// A half's denormals are a float's normal numbers, so the host cannot flush
+// them this way: halves keep their denormals whatever MODE says.
+//
+// Every kernel PyTorch's and ROCm's libraries ship asks for round to nearest
+// even with denormals kept, which the host already does; this costs nothing
+// then, and only code built to flush (-fgpu-flush-denormals-to-zero), or that
+// sets MODE itself, pays for it.
+class FloatMode {
+ public:
+  static constexpr uint32_t kDefault = 0xF0;   // round to nearest even, denormals kept
+  static bool is_default(uint32_t mode) { return (mode & 0xFF) == kDefault; }
+
+  FloatMode(uint32_t mode, bool wide) {
+    const uint32_t round = wide ? (mode >> 2) & 3 : mode & 3, denorm = wide ? (mode >> 6) & 3 : (mode >> 4) & 3;
+    // MODE's round modes: to nearest even, toward +infinity, toward
+    // -infinity, toward zero.
+    static constexpr int kRound[4] = {FE_TONEAREST, FE_UPWARD, FE_DOWNWARD, FE_TOWARDZERO};
+    saved_round_ = std::fegetround();
+    if (round) std::fesetround(kRound[round]);
+    // Denormal mode bit 0 keeps input denormals, bit 1 output ones.
+#if defined(__x86_64__) || defined(__i386__)
+    saved_csr_ = _mm_getcsr();
+    _mm_setcsr((saved_csr_ & ~(1u << 6 | 1u << 15)) | ((denorm & 1) ? 0u : 1u << 6) | ((denorm & 2) ? 0u : 1u << 15));
+#elif defined(__aarch64__)
+    __asm__ volatile("mrs %0, fpcr" : "=r"(saved_fpcr_));
+    const uint64_t fz = uint64_t{1} << 24;
+    __asm__ volatile("msr fpcr, %0" ::"r"(denorm == 0 ? saved_fpcr_ | fz : saved_fpcr_ & ~fz));
+#endif
+  }
+  ~FloatMode() {
+#if defined(__x86_64__) || defined(__i386__)
+    _mm_setcsr(saved_csr_);
+#elif defined(__aarch64__)
+    __asm__ volatile("msr fpcr, %0" ::"r"(saved_fpcr_));
+#endif
+    std::fesetround(saved_round_);
+  }
+  FloatMode(const FloatMode&) = delete;
+  FloatMode& operator=(const FloatMode&) = delete;
+
+ private:
+  int saved_round_ = FE_TONEAREST;
+#if defined(__x86_64__) || defined(__i386__)
+  unsigned saved_csr_ = 0;
+#elif defined(__aarch64__)
+  uint64_t saved_fpcr_ = 0;
+#endif
 };
 
 // The work-group the waves share: its LDS, and how many waves are still to
@@ -3707,17 +3768,26 @@ struct Machine {
         // A comparison in its long form is still a comparison: it writes a
         // mask of the lanes that passed, not a value per lane.
         if (x.name.rfind("v_mfma", 0) == 0 || x.name.rfind("v_smfmac", 0) == 0) {
+          // The matrix instructions ignore MODE: round to nearest even,
+          // denormals kept, always.
           ++n.mfma;
           matrix_multiply(w, x);
-        } else if (x.name.rfind("v_cmp", 0) == 0) compare(w, x);
+          return true;
+        }
+        std::optional<FloatMode> fm;
+        if (!FloatMode::is_default(w.mode)) fm.emplace(w.mode, x.name.find("f64") != std::string::npos);
+        if (x.name.rfind("v_cmp", 0) == 0) compare(w, x);
         else if (x.dpp) cross_lane_alu(w, x);
         else vector_alu(w, x);
         return true;
       }
-      case gcn::Enc::Vopc:
+      case gcn::Enc::Vopc: {
         ++n.valu;
+        std::optional<FloatMode> fm;
+        if (!FloatMode::is_default(w.mode)) fm.emplace(w.mode, in.name.find("f64") != std::string::npos);
         compare(w, in);
         return true;
+      }
       case gcn::Enc::Ds:
         ++n.lds;
         lds_access(w, in, g);
@@ -3953,6 +4023,7 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
   for (uint32_t i = 0; i < waves_per_group; ++i) {
     Wave& w = group.waves[i];
     w.pc = d.code_base + k.entry;
+    w.mode = k.mode;
     w.first_lane = i * kLanes;
     // The lanes this wave has of the work-group, which is short in the
     // last wave when the group is not a multiple of 64.

@@ -60,6 +60,12 @@ echo "wrote $(pwd)/gfx950.gfx950"
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 smfmac.cpp -o smfmac.gfx942
 "$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_GFX950 --offload-arch=gfx950 smfmac.cpp -o smfmac.gfx950
 echo "wrote $(pwd)/smfmac.gfx942 and smfmac.gfx950"
+# MODE's round and denormal modes: as hipcc builds by default, and built to
+# flush single-precision denormals.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 numerics.cpp -o numerics.gfx942
+"$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_FLUSH -fgpu-flush-denormals-to-zero --offload-arch=gfx942 numerics.cpp \
+  -o numerics.flush.gfx942
+echo "wrote $(pwd)/numerics.gfx942 and numerics.flush.gfx942"
 
 # The device code alone, for the decoder and the executor to be checked
 # against, and the listing of it from the same toolchain's llvm-objdump.

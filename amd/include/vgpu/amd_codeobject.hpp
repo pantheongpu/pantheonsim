@@ -63,6 +63,12 @@ struct Kernel {
   // gfx90a kernel adds to its scratch accesses, and gfx940 and later, whose
   // flat scratch the hardware sets up, are not given.
   bool group_info = false, private_wave_offset = false;
+  // The MODE register a wave starts with, from COMPUTE_PGM_RSRC1: the round
+  // modes (bits 3:0), the denormal modes (7:4), DX10_CLAMP (8) and IEEE (9).
+  // Round to nearest even, denormals kept, both on: what every kernel of
+  // PyTorch's and ROCm's libraries asks for, and what a kernel with no
+  // descriptor gets.
+  uint32_t mode = 0xF0 | 1u << 8 | 1u << 9;
 };
 
 // A variable the kernels share: a __device__ global. It lives in the module's
