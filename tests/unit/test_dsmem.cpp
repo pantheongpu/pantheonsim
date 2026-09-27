@@ -519,8 +519,9 @@ END:
   VCHECK_CONTAINS(err.message(), "has exited");
 }
 
-// A rank the cluster does not have is an error at mapa, not an address that
-// fails later; and a launch with no cluster is a cluster of one.
+// A rank the cluster does not have is an error where the address mapa made
+// is used -- mapa itself only computes it -- and a launch with no cluster is
+// a cluster of one.
 VTEST(mapa_checks_the_rank_against_the_cluster) {
   MemoryManager mem{1 << 20};
   const std::string ptx = R"(
@@ -540,7 +541,8 @@ VTEST(mapa_checks_the_rank_against_the_cluster) {
   std::vector<uint8_t> two(4, 0), zero(4, 0);
   two[0] = 2;
   auto err = VCAPTURE(Error, run(ptx, clusters(2, 2, 32), {two}, mem));
-  VCHECK_CONTAINS(err.message(), "mapa names block rank 2 of a cluster of 2 blocks");
+  VCHECK_CONTAINS(err.message(), "a shared::cluster address names block rank 2 of a cluster of 2 blocks");
+  VCHECK_CONTAINS(err.message(), "st.shared::cluster");
   run(ptx, LaunchConfig{}, {zero}, mem);
 }
 

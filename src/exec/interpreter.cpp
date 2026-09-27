@@ -3751,14 +3751,12 @@ class Interpreter {
                      "mapa on a generic address that is not in shared memory");
           v -= kSharedVaBase;
         }
-        const uint64_t want = static_cast<uint32_t>(rank[lane]);
-        // A rank the cluster has. Whether that block is still running matters
-        // only to an access: mapa computes an address and touches nothing.
-        const size_t n = ctx.cluster_state ? ctx.cluster_state->ranks.size() : 1;
-        if (want >= n)
-          ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
-                   "mapa names block rank " + std::to_string(want) + " of a cluster of " +
-                       std::to_string(n) + " block" + (n == 1 ? "" : "s"));
+        // mapa computes an address and touches nothing, so a rank the cluster
+        // does not have is refused where the address is used, not here: the
+        // ISA does not make mapa itself an error, and CUTLASS's SM120
+        // pingpong kernels map every lane's rank in a cluster of one and use
+        // only their own.
+        const uint64_t want = static_cast<uint32_t>(rank[lane]) & ((uint64_t{1} << (32 - kClusterRankShift)) - 1);
         r[lane] = cluster_address(ctx, want, v) + (op->generic ? kSharedVaBase : 0);
       }
       write_reg(w, op->dst, m, r, op->wide ? 64 : 32);
