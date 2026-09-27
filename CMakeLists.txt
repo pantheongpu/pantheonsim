@@ -1434,6 +1434,18 @@ endif()
 # Memory a graph owns: an allocation node, a free node, what the graph-memory
 # attributes report, and a trim that keeps the address it documents as fixed.
 if(TARGET vgpucudart)
+  # PyTorch's CUDA build, unmodified, on a simulated RTX 5090: the whole-model
+  # checks the AMD GPUs run (amd/tests/pytorch/models.py), through
+  # `vgpu run --preload`, where a Python with PyTorch for CUDA 13 is installed
+  # (VGPU_TORCH_CUDA_PYTHON); it skips elsewhere. nvidia/docs/pytorch.md.
+  add_test(NAME e2e_pytorch_models_rtx5090 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
+           ${CMAKE_SOURCE_DIR}/amd/tests/pytorch/models.py 12 nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_models_rtx5090 PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
   # cuDNN's graph API, BatchNorm training and RNNs, and cuBLASLt with a cuBLAS
   # handle -- the paths PyTorch's CUDA build takes -- against host references.
   add_test(NAME e2e_dnn_paths COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dnn_paths.sh)
