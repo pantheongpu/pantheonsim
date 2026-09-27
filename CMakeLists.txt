@@ -214,6 +214,19 @@ add_custom_command(TARGET vgpurocprof POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocprofiler-sdk.so.1.0.0" "${CMAKE_BINARY_DIR}/shim/librocprofiler-sdk.so"
   COMMENT "Creating rocprofiler-sdk shim symlinks (build/shim/librocprofiler-sdk.so.1)")
 
+# librocm_smi64: what RCCL asks ROCm SMI about the GPUs it connects (their
+# count, PCI addresses and links), answered from the HIP shim, so RCCL starts
+# on simulated GPUs on a machine with no AMD kernel driver.
+add_library(vgpursmi SHARED amd/src/rocm_smi.cpp)
+target_link_libraries(vgpursmi PRIVATE vgpuhip)
+target_include_directories(vgpursmi PRIVATE amd/include)
+set_target_properties(vgpursmi PROPERTIES OUTPUT_NAME rocm_smi64 SOVERSION 7 VERSION 7.8.0
+  CXX_VISIBILITY_PRESET hidden)
+add_custom_command(TARGET vgpursmi POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocm_smi64.so.7.8.0" "${CMAKE_BINARY_DIR}/shim/librocm_smi64.so.7"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocm_smi64.so.7.8.0" "${CMAKE_BINARY_DIR}/shim/librocm_smi64.so"
+  COMMENT "Creating ROCm SMI shim symlinks (build/shim/librocm_smi64.so.7)")
 # ---------------------------------------------------------------------------
 # libvgpucudart: the CUDA *runtime* API shim. Lets unmodified nvcc-compiled
 # applications (built against shared cudart) run on VirtualGPU. Requires the
@@ -706,6 +719,14 @@ target_include_directories(test_amd_rocprofiler PRIVATE tests/framework amd/incl
 target_compile_definitions(test_amd_rocprofiler PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME test_amd_rocprofiler COMMAND test_amd_rocprofiler)
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
+# ROCm SMI's answers to RCCL, from RCCL's side, on Instinct and Radeon GPUs.
+add_executable(test_amd_rocm_smi amd/tests/unit/test_rocm_smi.cpp)
+target_link_libraries(test_amd_rocm_smi PRIVATE vgpursmi vgpuhip)
+target_include_directories(test_amd_rocm_smi PRIVATE tests/framework)
+add_test(NAME test_amd_rocm_smi COMMAND test_amd_rocm_smi)
+set_tests_properties(test_amd_rocm_smi PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
+add_test(NAME test_amd_rocm_smi_radeon COMMAND test_amd_rocm_smi)
+set_tests_properties(test_amd_rocm_smi_radeon PROPERTIES ENVIRONMENT "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
 add_test(NAME amd_rocprofiler_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofiler_abi.sh)
 add_test(NAME amd_rocprofv3 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofv3.sh)
 set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"

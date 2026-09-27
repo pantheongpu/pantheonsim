@@ -20,8 +20,14 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/torch/lib"
 for e in "$package"/*; do [[ "$(basename "$e")" == lib ]] || ln -s "$e" "$tmp/torch/"; done
-for f in "$package"/lib/*; do [[ "$(basename "$f")" == libamdhip64.so ]] || ln -s "$f" "$tmp/torch/lib/"; done
+for f in "$package"/lib/*; do
+  case "$(basename "$f")" in libamdhip64.so|librocm_smi64.so) ;; *) ln -s "$f" "$tmp/torch/lib/" ;; esac
+done
 ln -s "$(readlink -f "$shim")" "$tmp/torch/lib/libamdhip64.so"
+# And ROCm SMI's library, which RCCL asks what links the GPUs: VirtualGPU's
+# answers from the HIP runtime, where AMD's would read a kernel driver there
+# is none of.
+ln -s "$(readlink -f "$build/shim/librocm_smi64.so")" "$tmp/torch/lib/librocm_smi64.so"
 cap=()
 if command -v systemd-run >/dev/null && systemd-run --user --scope -q true 2>/dev/null; then
   cap=(systemd-run --user --scope -q -p "MemoryMax=${VGPU_TORCH_MEMORY_MAX:-5G}" -p MemorySwapMax=0)
