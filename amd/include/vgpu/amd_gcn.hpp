@@ -54,6 +54,9 @@ struct Operand {
   bool hi = false;
   bool bits16 = false;   // a 16-bit operand, whatever it is
   bool hidden = false;   // read by the instruction, not written by the assembler (VOPD's vcc_lo)
+  // A literal in a 64-bit float operand: the word is the double's high half,
+  // the low half zero (a 64-bit integer operand's is zero-extended instead).
+  bool literal_high = false;
 };
 std::string operand_text(const Operand& o);
 
@@ -178,7 +181,10 @@ inline Target target_of_mach(uint32_t mach) {
 // Decodes the instruction at `at` in `code`, for `target`. Throws
 // Err::Unsupported naming the encoding and opcode when it is one this does
 // not know yet.
-Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target = Target::Gfx942);
+// `wave64`: RDNA code built for 64-lane waves, whose lane masks (VCC, a
+// comparison's result, a carry) are register pairs rather than one register.
+Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target = Target::Gfx942,
+            bool wave64 = false);
 
 // The instruction as the assembler writes it, for tests and for a
 // disassembly listing.

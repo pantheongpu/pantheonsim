@@ -73,10 +73,10 @@ Known limitations (deliberate, documented):
   content-derived bitstream, so encoder stress and corruption checks run, but
   the output is not a decodable video stream. OptiX (ray tracing) is a separate
   NVIDIA subsystem, not CUDA, and is out of scope.
-- AMD runs gfx942 (MI300X, MI325X), gfx950 (MI350X) and gfx90a (MI250X)
-  code, through its own HIP and HSA runtimes; rocBLAS, hipBLASLt, MIOpen and
-  PyTorch run on it. RDNA (consumer) GPUs are not modelled yet — see
-  [amd/README.md](amd/README.md).
+- AMD runs gfx942 (MI300X, MI325X), gfx950 (MI350X), gfx90a (MI250X) and
+  gfx1100 (Radeon RX 7900 XTX, RDNA3) code, through its own HIP and HSA
+  runtimes; rocBLAS, hipBLASLt, MIOpen and PyTorch run on it. RDNA4 is not
+  modelled yet — see [amd/README.md](amd/README.md).
 
 ## Build & test
 

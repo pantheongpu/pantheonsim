@@ -66,13 +66,14 @@ def fp8(d):
 
 
 ARCH = torch.cuda.get_device_properties(0).gcnArchName
-if ARCH.startswith('gfx90a'):
-    # gfx90a has no 8-bit floats: PyTorch refuses the product, as on the card.
+if ARCH.startswith('gfx90a') or ARCH.startswith('gfx11'):
+    # gfx90a and RDNA3 have no 8-bit floats: PyTorch refuses the product, as on
+    # the card.
     try:
         fp8(GPU)
-        print("FAIL fp8 matmul: gfx90a ran it, and has no 8-bit floats", flush=True)
+        print(f"FAIL fp8 matmul: {ARCH} ran it, and has no 8-bit floats", flush=True)
     except RuntimeError as e:
-        print("ok fp8 matmul (refused on gfx90a, which has none)" if "MI300" in str(e)
+        print(f"ok fp8 matmul (refused on {ARCH.split(':')[0]}, which has none)" if "MI300" in str(e)
               else f"FAIL fp8 matmul: {str(e).splitlines()[0][:200]}", flush=True)
 else:
     check('fp8 matmul', fp8)

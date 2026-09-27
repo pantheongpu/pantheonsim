@@ -193,12 +193,13 @@ Operand vgpr(uint32_t index, uint32_t width) {
 }
 
 // The width, in registers, of an operand of `bits` bits: a lane mask is one
-// register in wave32, whatever the specification's 64 says.
-uint32_t width_of(const Opnd& op, Enc enc) {
+// register in wave32, whatever the specification's 64 says, and a pair in
+// wave64.
+uint32_t width_of(const Opnd& op, Enc enc, bool wave64) {
   const bool valu = enc == Enc::Vop1 || enc == Enc::Vop2 || enc == Enc::Vopc || enc == Enc::Vop3 ||
                     enc == Enc::Vop3p || enc == Enc::Vopd;
   const bool scalar = op.kind == K::Sreg || op.kind == K::Sdst || op.kind == K::Vcc || op.kind == K::Exec;
-  if (valu && scalar && op.bits == 64) return 1;
+  if (valu && scalar && op.bits == 64) return wave64 ? 2 : 1;
   return op.bits <= 32 ? 1 : op.bits / 32;
 }
 
@@ -206,7 +207,7 @@ bool is_half(const Opnd& op) { return op.bits == 16; }
 
 }  // namespace
 
-Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target) {
+Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64) {
   const uint32_t w0 = word(code, at);
   Inst in;
   in.pc = pc;
@@ -425,7 +426,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   const bool vop3_16 = vop3ish;   // VOP3's 16-bit operands pick their half with OP_SEL
   for (const Opnd& op : r.ops) {
     const std::string f = op.field;
-    uint32_t width = width_of(op, in.enc);
+    uint32_t width = width_of(op, in.enc, wave64);
     // A buffer address is an offset or an index, one register, or both, two.
     if ((in.enc == Enc::Mubuf || in.enc == Enc::Mtbuf) && f == "VADDR") width = bits(w, 55, 55) && bits(w, 54, 54) ? 2 : 1;
     // A global access with a scalar base takes a 32-bit offset from its
@@ -619,9 +620,14 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
 
   if (literal) {
     const uint32_t value = word(code, at + in.size);
-    // A 16-bit operand's literal is the low half of the word.
+    // A 16-bit operand's literal is the low half of the word; a double's is
+    // its high half.
+    const bool f64 = std::string(r.name).find("f64") != std::string::npos;
     for (Operand& o : in.src)
-      if (o.kind == OperandKind::Literal) o.value = o.bits16 ? (value & 0xFFFF) : value;
+      if (o.kind == OperandKind::Literal) {
+        o.value = o.bits16 ? (value & 0xFFFF) : value;
+        o.literal_high = f64 && o.width == 2;
+      }
     in.size += 4;
   }
   // A half-register source reads its half as a sub-dword instruction reads

@@ -804,6 +804,10 @@ set_tests_properties(amd_hipsparselt PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_hipsparselt_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipsparselt.sh amd/mi350x)
 set_tests_properties(amd_hipsparselt_mi350x PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# And on an RDNA3 consumer card (gfx1100, wave32 and wave64 kernels, WMMA).
+add_test(NAME amd_pytorch_rx7900xtx COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/rx7900xtx)
+set_tests_properties(amd_pytorch_rx7900xtx PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # torch.compile's Triton kernels, and one written by hand, compiled and loaded
 # at run time.
 add_test(NAME amd_pytorch_compile COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 3 1)

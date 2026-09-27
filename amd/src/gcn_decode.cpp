@@ -1231,8 +1231,8 @@ namespace {
 Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc);
 }  // namespace
 
-Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target) {
-  if (is_rdna(target)) return rdna::decode(code, at, pc, target);
+Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64) {
+  if (is_rdna(target)) return rdna::decode(code, at, pc, target, wave64);
   struct Using {
     explicit Using(Target t) { g_table = t == Target::Gfx90a ? &table_gfx90a() : &table(); }
     ~Using() { g_table = nullptr; }
@@ -1682,8 +1682,12 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     const bool half = in.name.rfind("v_pk_", 0) != 0 &&
                       (in.name.find("_u16") != std::string::npos || in.name.find("_i16") != std::string::npos ||
                        in.name.find("_b16") != std::string::npos || in.name.find("_f16") != std::string::npos);
+    const bool f64 = in.name.find("f64") != std::string::npos;
     for (Operand& o : in.src)
-      if (o.kind == OperandKind::Literal) o.value = half ? (value & 0xFFFF) : value;
+      if (o.kind == OperandKind::Literal) {
+        o.value = half ? (value & 0xFFFF) : value;
+        o.literal_high = f64 && o.width == 2;   // a double's literal is its high half
+      }
     in.size += 4;
   }
   return in;

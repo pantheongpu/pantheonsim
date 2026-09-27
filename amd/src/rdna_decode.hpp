@@ -10,7 +10,7 @@
 
 namespace vgpu::amd::gcn::rdna {
 
-Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target);
+Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64);
 std::string to_text(const Inst& i);
 
 }  // namespace vgpu::amd::gcn::rdna
