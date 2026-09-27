@@ -391,9 +391,17 @@ That works because the runtime keeps to what ROCm's does where CLR looks:
 - **Work-group limit:** a packet is held only to the hardware's work-group limit, not the kernel's metadata.
 - **Host access:** the host is never given a device's memory directly, so CLR copies instead of writing through it.
 - **Supported extras:** AMD's loader extension, barrier-value packets, asynchronous signal handlers, dispatch timestamps and `hsa_amd_pointer_info` all work.
-- **Not modelled:** images, virtual memory, IPC and SVM are refused by name.
+- **Not modelled:** images, virtual memory, HSA's IPC and SVM are refused by name. HIP's IPC is modelled (see RCCL below).
 
 `VGPU_TRACE_HSA=1` logs what memory the program allocates, locks and registers.
+
+## RCCL, and PyTorch across GPUs
+
+RCCL (PyTorch's collectives on ROCm) runs unmodified across simulated GPUs in one process (`tests/pytorch/multi_gpu.py`, ctest `amd_pytorch_multi_gpu`) and across processes (`distributed.py`, ctest `amd_pytorch_distributed`). Three things make that work on any Linux machine:
+
+- **Topology.** RCCL learns how its GPUs are linked from the AMD kernel driver's topology under `/sys/class/kfd`, or from ROCm SMI's library. A machine with no AMD GPU has no `/sys/class/kfd`, and RCCL fails to initialize ("internal error"). WSL is the exception: RCCL skips the question there. So VirtualGPU has its own `librocm_smi64` (`src/rocm_smi.cpp`, `build/shim/librocm_smi64.so.7`). It answers the eight functions RCCL calls from the HIP runtime: the device count, each device's PCI address as HIP reports it, and the link between each pair. That link is XGMI between Instinct GPUs and PCI Express between Radeon ones. Once loaded, the library sets `RCCL_USE_ROCM_SMI_LIB=1` where there is no `/sys/class/kfd`, and leaves the variable alone where there is one or the environment already set it. The PyTorch tests swap it in beside `libamdhip64` (ctests `test_amd_rocm_smi`, `test_amd_rocm_smi_radeon`).
+- **Wide accesses.** A `global_`, `flat_` or `buffer_` load or store of two to four words moves each aligned pair of words as one 8-byte access, as the hardware does. RCCL's LL protocol puts a word of data and the flag that says it arrived in the same eight bytes, and a reader on another device trusts the data once it sees the flag. When a wide access moved one word at a time, a reader could see the new flag beside the old data, and `broadcast` lost values.
+- **Opened IPC memory.** Memory from another process's `hipIpcGetMemHandle` is mapped where the exporter's device is numbered, and every other device in the process reaches it without `hipDeviceEnablePeerAccess`, as `hipIpcMemLazyEnablePeerAccess` asks. RCCL's kernels write straight into the other process's buffer.
 
 ## Profiling
 
