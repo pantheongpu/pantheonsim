@@ -130,11 +130,22 @@ as 0-3 do, 4 columns further on for A and for N <= 128, 8 for N > 128
 
 One thread copies a matrix from shared memory (a descriptor, K-major, no
 swizzle) into Tensor Memory: `.128x256b`, `.4x256b`, `.128x128b` row by row
-from the address's lane, and `.32x128b.warpx4` into all four 32-lane
-quarters. It completes at once, like `mma`. `.64x128b.warpx2::02_13` and
-`::01_23` are refused: the ISA says each warp of a pair receives half of the
-data but not which half. Decompression (`.b8x16.b6x16_p32`, `.b4x16_p64`)
-is refused too.
+from the address's lane, `.32x128b.warpx4` into all four 32-lane quarters,
+and `.64x128b.warpx2` -- `::02_13` puts row r at lanes r and r + 64,
+`::01_23` at 64(r / 32) + r % 32 and 32 lanes on, so each warp of a pair
+holds the same 32 rows. The ISA says only that each warp of a pair receives
+half; the halves are CuTe's, whose UTCCP 2x64dp copy traits lay the
+destination out that way. It completes at once, like `mma`. With
+`.b8x16.b4x16_p64` / `.b6x16_p32` each 16-byte group of packed fp4 / fp6
+is decompressed into sixteen bytes, fp4 in bits 2-5 and fp6 in bits 0-5
+(figures 197-201).
+
+### tcgen05.shift
+
+`tcgen05.shift.down` moves rows 0-30 of the 32 lanes at its (32-aligned)
+address down one row, 256 bits (eight columns) each -- the implicit
+`.31x256b` shape of 9.7.18.2.3; row 0 is left as it was. One thread
+issues it, for its CTA or both of a pair.
 
 ### When things complete
 
@@ -182,8 +193,7 @@ before waiting for it is not caught here.
 
 ## Refused by name
 
-`.ws` (weight-stationary), `.ashift`,
-`tcgen05.cp`'s `.warpx2` shapes and decompression, `tcgen05.shift`, `tcgen05.ld.red`
+`.ws` (weight-stationary), `.ashift`, `tcgen05.ld.red`
 (sm_103/sm_110), the sm_107 additions (`kind::ti16`, `decompress::lut`), and
 TMA's `.im2col::w` modes: the ISA shows their halo walk only in figures that
 leave open where `::w::128`'s halos come from and whether a halo crosses into

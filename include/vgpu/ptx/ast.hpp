@@ -320,7 +320,7 @@ struct OpWgmma {
 // tcgen05.st/ld in fixed warp-wide shapes, and written by tcgen05.mma, which
 // one thread issues for the whole MxNxK product.
 enum class Tcgen05Kind {
-  Alloc, Dealloc, Relinquish, Ld, St, WaitLd, WaitSt, FenceBefore, FenceAfter, Commit, Mma, Cp,
+  Alloc, Dealloc, Relinquish, Ld, St, WaitLd, WaitSt, FenceBefore, FenceAfter, Commit, Mma, Cp, Shift,
 };
 // tcgen05.ld/st data-movement shapes (9.7.18.2.3).
 enum class Tcgen05Shape { S32x32b, S16x64b, S16x128b, S16x256b, S16x32bx2 };
@@ -366,6 +366,7 @@ struct OpTcgen05 {
   // descriptor (in `a`).
   Tcgen05CpShape cp_shape = Tcgen05CpShape::S128x256b;
   int cp_multicast = 0;        // 0 none, 4 .warpx4, 2 .warpx2::02_13, 3 .warpx2::01_23
+  int cp_decompress = 0;       // .b8x16 from .b4x16_p64 (4) or .b6x16_p32 (6)
   Operand d_tmem, a, b_desc, idesc, enable_d;
   bool a_tmem = false;
   std::vector<Operand> disable_lanes;

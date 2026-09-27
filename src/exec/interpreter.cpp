@@ -5961,7 +5961,7 @@ class Interpreter {
   void exec_tcgen05(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op, Mask m) {
     if (!ctx.tmem) ctx_fail(ins, -1, Err::UnsupportedPtx, "tcgen05 outside a block context");
     const bool collective = op.kind != Tcgen05Kind::Mma && op.kind != Tcgen05Kind::Cp &&
-                            op.kind != Tcgen05Kind::Commit &&
+                            op.kind != Tcgen05Kind::Shift && op.kind != Tcgen05Kind::Commit &&
                             op.kind != Tcgen05Kind::FenceBefore && op.kind != Tcgen05Kind::FenceAfter;
     if (collective && m != all_)
       ctx_fail(ins, -1, Err::UnsupportedPtx,
@@ -5995,6 +5995,10 @@ class Interpreter {
       case Tcgen05Kind::Cp:
         for (uint32_t lane = 0; lane < W_; ++lane)
           if (m & (Mask{1} << lane)) exec_tcgen05_cp(w, ctx, ins, op, lane);
+        return;
+      case Tcgen05Kind::Shift:
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) exec_tcgen05_shift(w, ctx, ins, op, lane);
         return;
     }
   }
@@ -6209,10 +6213,6 @@ class Interpreter {
       Lanes _s;
       return read_operand(w, ctx, ins, o, _s)[lane];
     };
-    if (op.cp_multicast == 2 || op.cp_multicast == 3)
-      ctx_fail(ins, li, Err::UnsupportedPtx,
-               "tcgen05.cp.64x128b.warpx2: the ISA says each warp of a pair receives half of the "
-               "data but not which half, so it is not implemented");
     uint32_t rows = 128, bytes = 32;
     switch (op.cp_shape) {
       case Tcgen05CpShape::S128x256b: break;
@@ -6224,21 +6224,44 @@ class Interpreter {
     const uint32_t taddr = static_cast<uint32_t>(value(op.d_tmem));
     const uint32_t lane0 = taddr >> 16, col0 = taddr & 0xFFFF;
     const WgmmaDesc d = decode_tcgen05_desc(ins, value(op.a));
-    const uint32_t copies = op.cp_multicast == 4 ? 4 : 1;
+    // Where source row r lands: .warpx4 in all four 32-lane quarters;
+    // .warpx2::02_13 at lanes r and r + 64, .warpx2::01_23 at 64(r / 32) +
+    // r % 32 and 32 lanes on -- warps 0 and 2 (or 0 and 1) receiving the
+    // same half, as CuTe's UTCCP 2x64dp copy traits lay the destination out.
+    const uint32_t copies = op.cp_multicast == 4 ? 4 : op.cp_multicast ? 2 : 1;
+    auto dst_lane = [&](uint32_t r, uint32_t p) {
+      switch (op.cp_multicast) {
+        case 4: return r + 32 * p;
+        case 2: return r + 64 * p;
+        case 3: return 64 * (r / 32) + r % 32 + 32 * p;
+        default: return r;
+      }
+    };
+    // Decompression (9.7.18.9.1): each 16-byte group of the source holds
+    // sixteen 4-bit values in its first 8 bytes (.b4x16_p64) or sixteen 6-bit
+    // ones in its first 12 (.b6x16_p32), and becomes sixteen bytes -- fp4 in
+    // bits 2-5, fp6 in bits 0-5 (figures 198, 200-201).
+    auto source_byte = [&](uint32_t rank, uint32_t r, uint32_t byte) -> uint32_t {
+      auto raw = [&](uint32_t b) {
+        const uint64_t at = wgmma_smem_offset(d, true, 1, r, b);
+        return static_cast<uint32_t>(load_routed(w, ctx, ins, lane, kSharedVaBase + cluster_address(ctx, rank, at), 1));
+      };
+      if (!op.cp_decompress) return raw(byte);
+      const uint32_t bits = static_cast<uint32_t>(op.cp_decompress), group = byte / 16, j = byte % 16;
+      const uint32_t bit = j * bits;
+      uint32_t v = raw(16 * group + bit / 8) | raw(16 * group + (bit + bits - 1) / 8) << 8;
+      v = (v >> (bit % 8)) & ((1u << bits) - 1);
+      return bits == 4 ? v << 2 : v;
+    };
     for (const BlockCtx* c : tcgen05_ctas(ctx, ins, op.cta_group)) {
       TensorMemory& t = tmem_of(*c);
       const uint32_t rank = cluster_rank_of(*c);
       for (uint32_t r = 0; r < rows; ++r)
         for (uint32_t cw = 0; cw < bytes / 4; ++cw) {
           uint32_t word = 0;
-          for (uint32_t b = 0; b < 4; ++b) {
-            const uint64_t at = wgmma_smem_offset(d, true, 1, r, cw * 4 + b);
-            word |= static_cast<uint32_t>(load_routed(w, ctx, ins, lane,
-                                                      kSharedVaBase + cluster_address(ctx, rank, at), 1))
-                    << (8 * b);
-          }
+          for (uint32_t b = 0; b < 4; ++b) word |= source_byte(rank, r, cw * 4 + b) << (8 * b);
           for (uint32_t p = 0; p < copies; ++p) {
-            const uint32_t l = lane0 + r + 32 * p, col = col0 + cw;
+            const uint32_t l = lane0 + dst_lane(r, p), col = col0 + cw;
             if (l >= TensorMemory::kLanes || col >= TensorMemory::kCols || !t.allocated(col))
               ctx_fail(ins, li, Err::OutOfBounds,
                        "tcgen05.cp writes Tensor Memory lane " + std::to_string(l) + ", column " +
@@ -6246,6 +6269,28 @@ class Interpreter {
             t.at(l, col) = word;
           }
         }
+    }
+  }
+
+  // tcgen05.shift.down (9.7.18.9.3): the implicit .31x256b shape -- rows 0-30
+  // of the 32 lanes at the (32-aligned) address move down one row, 256 bits
+  // (eight columns) each; row 0 is not written. In this CTA, or both of a pair.
+  void exec_tcgen05_shift(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op, uint32_t lane) {
+    const int li = static_cast<int>(lane);
+    Lanes _s;
+    const uint32_t taddr = static_cast<uint32_t>(read_operand(w, ctx, ins, op.d_tmem, _s)[lane]);
+    const uint32_t lane0 = taddr >> 16, col0 = taddr & 0xFFFF;
+    if (lane0 % 32)
+      ctx_fail(ins, li, Err::InvalidValue, "tcgen05.shift's address must have a lane aligned to 32");
+    for (const BlockCtx* c : tcgen05_ctas(ctx, ins, op.cta_group)) {
+      TensorMemory& t = tmem_of(*c);
+      for (uint32_t col = col0; col < col0 + 8; ++col)
+        if (lane0 + 32 > TensorMemory::kLanes || col >= TensorMemory::kCols || !t.allocated(col))
+          ctx_fail(ins, li, Err::OutOfBounds,
+                   "tcgen05.shift touches Tensor Memory column " + std::to_string(col) +
+                       ", which no tcgen05.alloc has allocated");
+      for (uint32_t r = 31; r >= 1; --r)
+        for (uint32_t col = col0; col < col0 + 8; ++col) t.at(lane0 + r, col) = t.at(lane0 + r - 1, col);
     }
   }
 
