@@ -348,7 +348,7 @@ does on the card.
   - glc, slc and dlc sit in other bits, and so does FLAT's segment;
   - it has SDWA (sub-dword reads and writes) and no true16 or VOPD.
 
-  All DECODED_1030 distinct encodings in the wheel's gfx1030 code decode and print as `llvm-objdump` does. `tests/data/isa_corpus_gfx1030.txt` keeps 1,775 of their shapes.
+  All 12,542,606 distinct encodings in the wheel's gfx1030 code decode and print as `llvm-objdump` does. `tests/data/isa_corpus_gfx1030.txt` keeps 1,775 of their shapes.
 - **Execution:** RDNA3's paths, plus:
   - a register per work-item id: gfx10 does not pack them into v0, whatever the code object's ABI;
   - SDWA's three ways of filling the rest of a destination (pad, sign-extend, keep);
