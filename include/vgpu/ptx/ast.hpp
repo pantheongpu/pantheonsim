@@ -531,14 +531,22 @@ struct OpBulkGroup { bool wait = false; uint32_t keep = 0; };
 //   to_fp8   from f32: cvt.rn.satfinite.e4m3x2.f32   d, a, b   (a high, b low)
 //   to_fp8   from f16: cvt.rn.satfinite.e4m3x2.f16x2 d, a
 //   from_fp8 to   f16: cvt.rn.f16x2.e4m3x2           d, a
+// cvt between a pair of narrow values packed in 16 bits (8 for e2m1x2) and two
+// f32 sources or an f16x2/bf16x2 register (PTX ISA 9.7.10.24): fp8, the OCP
+// MX fp6/fp4 types, ue8m0 scale factors and the s2f6 fixed-point type.
+enum class NarrowFmt : uint8_t { E4M3, E5M2, E2M3, E3M2, E2M1, UE8M0, S2F6 };
 struct OpCvtFp8 {
-  bool e5m2 = false;        // which of the two formats
-  bool to_fp8 = true;       // direction
+  NarrowFmt fmt = NarrowFmt::E4M3;
+  bool e5m2 = false;        // fmt == E5M2, kept for the fp8 paths
+  bool to_fp8 = true;       // direction: to the narrow type
   bool src_f32_pair = false;  // the two-source f32 form
   bool bf16 = false;        // the half side is bf16 rather than f16
   bool satfinite = false;
+  bool relu = false;
+  bool rz = false, rp = false;   // otherwise .rn
+  bool scaled = false;      // .scaled::n2::ue8m0 with a scale-factor operand
   Reg dst;
-  Operand a, b;
+  Operand a, b, sf;
 };
 // The SIMD video instructions: vadd4, vsub4, vabsdiff4, vmin4, vmax4, vavrg4
 // and their 2-way halfword counterparts. Each treats a 32-bit register as four

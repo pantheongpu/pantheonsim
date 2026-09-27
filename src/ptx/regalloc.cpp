@@ -87,6 +87,7 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
           use_operand(op.cta_mask);
           for (const auto& c : op.coords) use_operand(c);
         }
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpCvtFp8>) use_operand(op.sf);
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpWgmma>) {
           // The accumulator is read as well as written, and the descriptors
           // and the scale-d predicate are ordinary sources.

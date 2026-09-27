@@ -701,6 +701,33 @@ uint32_t double_to_fp8(double d, const Fp8Format& f, bool satfinite) {
   return sign | (static_cast<uint32_t>(e) << f.man_bits) | (man & man_mask);
 }
 
+// The OCP MX small floats e2m3, e3m2 and e2m1 (PTX ISA 5.2.3): no infinity
+// and no NaN, so cvt's mandatory .satfinite sends a magnitude past the largest
+// normal, and infinity, to that normal with the sign kept. Rounds to nearest
+// even; the caller handles NaN.
+double small_float_value(uint32_t code, int eb, int mb, int bias) {
+  const uint32_t mant = code & ((1u << mb) - 1), exp = (code >> mb) & ((1u << eb) - 1);
+  const double mag = exp ? std::ldexp(1.0 + mant / double(1u << mb), int(exp) - bias)
+                         : std::ldexp(mant / double(1u << mb), 1 - bias);
+  return (code >> (eb + mb)) & 1 ? -mag : mag;
+}
+uint32_t double_to_small_float(double v, int eb, int mb, int bias) {
+  const uint32_t sign = std::signbit(v) ? 1u << (eb + mb) : 0u;
+  const uint32_t max_code = (((1u << eb) - 1) << mb) | ((1u << mb) - 1);
+  const double a = std::fabs(v);
+  if (a >= small_float_value(max_code, eb, mb, bias)) return sign | max_code;
+  int e = 0;
+  std::frexp(a, &e);                                      // a = f * 2^e, f in [0.5, 1)
+  int E = a == 0.0 ? 1 - bias : std::max(e - 1, 1 - bias);   // unbiased, subnormals at 1 - bias
+  uint32_t q = static_cast<uint32_t>(std::nearbyint(std::ldexp(a, mb - E)));
+  if (q == 2u << mb) {   // rounding carried into the next binade
+    q = 1u << mb;
+    ++E;
+  }
+  const uint32_t code = q < (1u << mb) ? q : (static_cast<uint32_t>(E + bias) << mb) | (q - (1u << mb));
+  return sign | std::min(code, max_code);
+}
+
 // tf32 is f32's sign and exponent with the mantissa cut to 10 bits. Round to
 // nearest even rather than truncating: truncation biases every product toward
 // zero, which accumulates over a reduction into a visible error.
@@ -3478,43 +3505,100 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpCvtFp8>(&ins.op)) {
       const Fp8Format& f = op->e5m2 ? kE5M2 : kE4M3;
-      Lanes _s_a;
+      const NarrowFmt fmt = op->fmt;
+      const bool fp8 = fmt == NarrowFmt::E4M3 || fmt == NarrowFmt::E5M2;
+      const uint32_t width = fmt == NarrowFmt::E2M1 ? 4 : 8;   // bits a value takes in the pair
+      Lanes _s_a, _s_b, _s_sf;
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
-      Lanes r;
-      if (op->to_fp8) {
-        if (op->src_f32_pair) {
-          Lanes _s_b;
-          const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
-          for (uint32_t lane = 0; lane < W_; ++lane)
-            if (m & (Mask{1} << lane)) {
-              // a is the high byte and b the low one, matching the f16x2
-              // conversion's operand order.
-              const uint32_t hi = double_to_fp8(f32(a[lane]), f, op->satfinite);
-              const uint32_t lo = double_to_fp8(f32(b[lane]), f, op->satfinite);
-              r[lane] = (hi << 8) | lo;
-            }
-        } else {
-          for (uint32_t lane = 0; lane < W_; ++lane)
-            if (m & (Mask{1} << lane)) {
-              uint32_t out = 0;
-              for (int h = 0; h < 2; ++h) {
-                const uint64_t bits = (a[lane] >> (16 * h)) & 0xFFFF;
-                const double v = op->bf16 ? bf16_to_double(bits) : f16_to_double(bits);
-                out |= double_to_fp8(v, f, op->satfinite) << (8 * h);
-              }
-              r[lane] = out;
-            }
-        }
-      } else {
-        for (uint32_t lane = 0; lane < W_; ++lane)
-          if (m & (Mask{1} << lane)) {
-            uint64_t out = 0;
-            for (int h = 0; h < 2; ++h) {
-              const double v = fp8_to_double((a[lane] >> (8 * h)) & 0xFF, f);
-              out |= (op->bf16 ? double_to_bf16(v) : double_to_f16(v)) << (16 * h);
-            }
-            r[lane] = out;
+      const Lanes& b = op->to_fp8 && op->src_f32_pair ? read_operand(w, ctx, ins, op->b, _s_b) : a;
+      const Lanes* sfl = op->scaled ? &read_operand(w, ctx, ins, op->sf, _s_sf) : nullptr;
+      // The scale factor of value h (1 = the upper one): a ue8m0 byte.
+      auto scale = [&](uint32_t lane, int h) {
+        if (!sfl) return 1.0;
+        const uint32_t byte = ((*sfl)[lane] >> (8 * h)) & 0xFF;
+        return byte == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, int(byte) - 127);
+      };
+      // One value to the narrow type (9.7.10.24's .relu and .satfinite).
+      auto encode = [&](double v, uint32_t lane) -> uint32_t {
+        if (op->relu && v < 0) v = 0.0;
+        switch (fmt) {
+          case NarrowFmt::E4M3:
+          case NarrowFmt::E5M2: return double_to_fp8(v, f, op->satfinite);
+          case NarrowFmt::E2M3:
+          case NarrowFmt::E3M2:
+          case NarrowFmt::E2M1: {
+            // NaN goes to the positive largest normal (.satfinite).
+            const int eb = fmt == NarrowFmt::E3M2 ? 3 : 2, mb = fmt == NarrowFmt::E2M3 ? 3 : fmt == NarrowFmt::E3M2 ? 2 : 1;
+            const int bias = fmt == NarrowFmt::E3M2 ? 3 : 1;
+            if (std::isnan(v)) return (((1u << eb) - 1) << mb) | ((1u << mb) - 1);
+            return double_to_small_float(v, eb, mb, bias);
           }
+          case NarrowFmt::UE8M0: {
+            // 2^(code - 127), 0xFF NaN; .rz takes the power of two at or
+            // below, .rp the one at or above.
+            if (std::isnan(v)) return 0xFF;
+            if (v < 0)
+              ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                       "cvt to ue8m0x2 of a negative value, which the ISA does not define");
+            if (v == 0) return 0;
+            if (std::isinf(v)) return op->satfinite ? 0xFE : 0xFF;
+            int e = std::ilogb(v);
+            if (op->rp && std::ldexp(1.0, e) != v) ++e;
+            if (e + 127 < 0) return 0;
+            if (e + 127 > 254) return op->satfinite ? 0xFE : 0xFF;
+            return static_cast<uint32_t>(e + 127);
+          }
+          case NarrowFmt::S2F6: {
+            // An s8 in units of 2^-6; NaN to the positive largest.
+            if (std::isnan(v)) return 0x7F;
+            const double q = op->rz ? std::trunc(v * 64.0) : std::nearbyint(v * 64.0);
+            return static_cast<uint32_t>(static_cast<int32_t>(std::clamp(q, -128.0, 127.0))) & 0xFF;
+          }
+        }
+        return 0;
+      };
+      auto decode = [&](uint32_t code) -> double {
+        switch (fmt) {
+          case NarrowFmt::E4M3:
+          case NarrowFmt::E5M2: return fp8_to_double(code, f);
+          case NarrowFmt::E2M3: return small_float_value(code & 0x3F, 2, 3, 1);
+          case NarrowFmt::E3M2: return small_float_value(code & 0x3F, 3, 2, 3);
+          case NarrowFmt::E2M1: return small_float_value(code & 0xF, 2, 1, 1);
+          case NarrowFmt::UE8M0:
+            return code == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, int(code) - 127);
+          case NarrowFmt::S2F6: return static_cast<int8_t>(code & 0xFF) / 64.0;
+        }
+        return 0.0;
+      };
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        uint64_t out = 0;
+        for (int h = 0; h < 2; ++h) {   // h = 1 is the upper value
+          if (op->to_fp8) {
+            double v;
+            if (op->src_f32_pair) v = f32(h ? a[lane] : b[lane]);
+            else {
+              const uint64_t bits = (a[lane] >> (16 * h)) & 0xFFFF;
+              v = op->bf16 ? bf16_to_double(bits) : f16_to_double(bits);
+            }
+            if (fmt == NarrowFmt::S2F6) v /= scale(lane, h);
+            out |= uint64_t{encode(v, lane)} << (width * h);
+          } else {
+            double v = decode((a[lane] >> (width * h)) & ((1u << width) - 1)) * scale(lane, h);
+            uint64_t half;
+            if (op->relu && std::isnan(v)) half = 0x7FFF;   // canonical NaN
+            else {
+              if (op->relu && v < 0) v = 0.0;
+              half = op->bf16 ? double_to_bf16(v) : double_to_f16(v);
+              // .satfinite (bf16x2): past the largest finite, the largest.
+              if (op->satfinite && std::isinf(v)) half = (v < 0 ? 0x8000 : 0) | (op->bf16 ? 0x7F7F : 0x7BFF);
+              if (op->satfinite && op->bf16 && (half & 0x7FFF) == 0x7F80) half = (half & 0x8000) | 0x7F7F;
+            }
+            out |= half << (16 * h);
+          }
+        }
+        r[lane] = out;
       }
       write_reg(w, op->dst, m, r, 32);
       return;
