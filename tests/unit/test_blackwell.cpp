@@ -1482,6 +1482,43 @@ VTEST(tcgen05_mma_sp_cta_pair_m128_layout_c) {
     }
 }
 
+// .kind::mxf4nvf4.block16 with sparse K = 128: eight UE4M3 factors a row,
+// the second four 4 columns after the first (figures 255 and 262).
+VTEST(tcgen05_mma_sp_mxf4nvf4_block16_eight_factors) {
+  const int M = 128, N = 16, K = 128;
+  const Sparse sp{8};
+  auto S = [](int m, int j) { return val(m, j, 4); };
+  auto A = [&](int m, int k) { return sp.dense(m, k, S); };
+  auto B = [](int k, int n) { return val(k, n, 6); };
+  const float steps[] = {0.5f, 1.0f, 1.5f, 2.0f, 0.75f};
+  auto sa = [&](int m, int j) { return steps[(m + j) % 5]; };
+  auto sb = [&](int n, int j) { return steps[(3 * n + j) % 5]; };
+  Mma x;
+  x.kind = "mxf4nvf4";
+  x.kind_mods = ".block_scale.block16";
+  x.block_scale = true;
+  x.sparse = true;
+  x.id = idesc_mx(1, 1, M, N, 0, 0, 0) | 4;
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 512, 0);
+  x.smem_a = {packed_k_major(M, K / 2, 4, 32, 128, 256, [&](int m, int j) { return e2m1_bits(S(m, j)); })};
+  x.smem_b = {packed_k_major(N, K, 4, 32, 128, 512, [&](int n, int k) { return e2m1_bits(B(k, n)); })};
+  x.cols = 32;
+  x.a_is_tmem = false;
+  x.a_cols = 16;
+  x.a_col = 16;
+  x.sfa_col = 16;
+  x.sfb_col = 24;
+  x.meta_col = 30;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 16));
+  for (int half = 0; half < 2; ++half) {
+    put_scales(x.a_tmem[0], 16, 4 * half, M, 4, 0, [&](int m, int j) { return e4m3_bits(sa(m, 4 * half + j)); });
+    put_scales(x.a_tmem[0], 16, 8 + 4 * half, N, 4, 0, [&](int n, int j) { return e4m3_bits(sb(n, 4 * half + j)); });
+  }
+  put_meta(x.a_tmem[0], 16, 14, M, 32, 0, true, 0, K, sp);
+  check_scaled(x.run(), M, N, K, 16, 32, A, B, sa, sb);
+}
+
 VTEST(tcgen05_mma_sp_refuses_what_the_isa_rules_out) {
   Mma x;
   x.sparse = true;
