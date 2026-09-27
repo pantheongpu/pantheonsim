@@ -179,6 +179,11 @@ struct Wave {
   // which hipBLASLt's kernels set). Instructions here run one at a time in
   // order either way, so it is kept only to be read back.
   uint32_t sched_mode = 0;
+  // gfx10's FLAT_SCRATCH (hardware registers 20 and 21, low and high): where
+  // the wave's private memory is, which a kernel's prologue sets before it
+  // reaches the stack through flat addresses. Each lane's private memory is
+  // found here without it, so it is kept only to be read back.
+  uint32_t flat_scratch[2] = {0, 0};
   // VGPR indexing (s_set_gpr_idx_on): which operands are offset -- source
   // 0, 1, 2 and the destination, a bit each -- by M0's low byte. 0 is off.
   uint8_t gpr_idx = 0;
@@ -942,20 +947,22 @@ struct Machine {
                      width = ((static_cast<uint32_t>(in.simm) >> 11) & 0x1F) + 1;
       const uint32_t mask = (width >= 32 ? ~0u : (1u << width) - 1) << at;
       const bool sched = id == 26 && in.arch == gcn::Target::Gfx1200;
+      const bool flat_scr = (id == 20 || id == 21) && in.arch == gcn::Target::Gfx1030;
       if (op != "s_getreg_b32"_op) {
-        if (id != 1 && !sched)
+        if (id != 1 && !sched && !flat_scr)
           throw Error::make(Err::Unsupported, op, " of hardware register ", id, ", which this does not model");
         // The immediate form's value is its literal; the register form's is
         // the scalar register the instruction names.
         const uint32_t value = op == "s_setreg_imm32_b32"_op ? static_cast<uint32_t>(in.src[0].value)
                                : !in.src.empty()             ? static_cast<uint32_t>(scalar(w, in.src[0]))
                                                              : static_cast<uint32_t>(scalar(w, in.dst[0]));
-        uint32_t& reg = sched ? w.sched_mode : w.mode;
+        uint32_t& reg = sched ? w.sched_mode : flat_scr ? w.flat_scratch[id - 20] : w.mode;
         reg = (reg & ~mask) | ((value << at) & mask);
       } else {
         uint32_t reg;
         if (id == 1) reg = w.mode;
         else if (sched) reg = w.sched_mode;
+        else if (flat_scr) reg = w.flat_scratch[id - 20];
         else if (id == 4) reg = static_cast<uint32_t>(w.first_lane / w.lanes) & 0xF;   // HW_ID: the wave's slot
         else throw Error::make(Err::Unsupported, "s_getreg_b32 of hardware register ", id, ", which this does not model");
         write_scalar(w, in.dst[0], (reg & mask) >> at);

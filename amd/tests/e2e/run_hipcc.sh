@@ -222,13 +222,14 @@ expect "every RDNA4 check holds (WMMA, scalar floats, split barrier, SCHED_MODE)
 
 # RDNA2 on a simulated Radeon RX 6900 XT (hipcc/rdna2.cpp): SDWA's partial
 # reads and writes, registers indexed through M0, permlane16 and permlanex16,
-# and DPP's row_share and row_xmask -- in wave32 and wave64.
+# DPP's row_share and row_xmask, and the stack reached through a flat pointer
+# (FLAT_SCRATCH set first) -- in wave32 and wave64.
 for w in "" .w64; do
   out=$(VGPU_QUIET=1 VGPU_GPU=amd/rx6900xt LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/rdna2$w.gfx1030" 2>&1)
   status=$?
   expect "the RDNA2${w:+ wave64} program runs to the end" "0" "$status"
-  expect "every RDNA2${w:+ wave64} check holds (SDWA, M0, permlane16, DPP)" "11 of 11" \
-    "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 11"
+  expect "every RDNA2${w:+ wave64} check holds (SDWA, M0, permlane16, DPP, FLAT_SCRATCH)" "12 of 12" \
+    "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 12"
 done
 
 # Streams that run at once, as a card's do (hipcc/streams.cpp). Each waiting

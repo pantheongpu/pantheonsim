@@ -10,6 +10,9 @@
 //   - Registers indexed through M0 (v_movrels, v_movreld), whose number
 //     gfx10 has as gfx9 does and gfx11 gives to null.
 //   - v_permlane16 and v_permlanex16, and DPP's row_share and row_xmask.
+//   - The stack reached through a flat pointer, whose kernel sets FLAT_SCRATCH
+//     first (s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO/HI)), as llama.cpp's
+//     flash-attention kernels do.
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
@@ -91,6 +94,20 @@ __global__ void lanes(const int* in, int* out) {
   // Every lane of a row reads its row's lane 5; then the lane 3 lanes away.
   out[2 * kWave + l] = __builtin_amdgcn_update_dpp(0, x, 0x155, 0xf, 0xf, false);
   out[3 * kWave + l] = __builtin_amdgcn_update_dpp(0, x, 0x163, 0xf, 0xf, false);
+}
+
+// A function that is not inlined, given a pointer into its caller's stack:
+// it reaches the stack by a flat address, so the kernel sets FLAT_SCRATCH.
+__device__ __attribute__((noinline)) int sum_through(const int* p, int n) {
+  int s = 0;
+  for (int i = 0; i < n; ++i) s += p[i] * (i + 1);
+  return s;
+}
+__global__ void stack_by_pointer(const int* in, int* out) {
+  int local[24];
+  const int l = threadIdx.x;
+  for (int i = 0; i < 24; ++i) local[i] = in[(l + i) % kWave] + i;
+  out[l] = sum_through(local, 24 - l % 8);
 }
 
 int wrong = 0;
@@ -197,6 +214,18 @@ int main() {
       bad[3] += out[3 * kWave + i] != in[row + ((i % 16) ^ 3)];
     }
     report("v_permlane16_b32", bad[0], kWave);
+    int* dsum = upload(out, kWave);
+    stack_by_pointer<<<1, kWave>>>(din, dsum);
+    CHECK(hipDeviceSynchronize());
+    int sums[kWave];
+    download(sums, dsum, kWave);
+    int bad_stack = 0;
+    for (int l = 0; l < kWave; ++l) {
+      int want = 0;
+      for (int i = 0; i < 24 - l % 8; ++i) want += (in[(l + i) % kWave] + i) * (i + 1);
+      bad_stack += sums[l] != want;
+    }
+    report("the stack through a flat pointer (FLAT_SCRATCH set first)", bad_stack, kWave);
     report("v_permlanex16_b32", bad[1], kWave);
     report("DPP row_share", bad[2], kWave);
     report("DPP row_xmask", bad[3], kWave);
