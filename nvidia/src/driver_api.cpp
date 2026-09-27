@@ -74,7 +74,9 @@ struct EventRec {
 };
 
 struct ShimState {
-  std::recursive_mutex mu;
+  // One lock for both CUDA libraries, since they share one machine
+  // (shared_runtime.cpp).
+  std::recursive_mutex& mu = vgpu::runtime::shared_api_mutex();
   bool initialized = false;
   vgpu::runtime::Runtime* rt = nullptr;   // the process's machine, not owned (shared_runtime.cpp)
   uintptr_t next_id = 8;

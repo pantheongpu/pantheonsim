@@ -46,7 +46,27 @@ extern "C" __attribute__((visibility("default"))) vgpu::runtime::Runtime* vgpu_s
   return rt.get();
 }
 
+// And one lock for the two libraries' API calls. Each used to lock only its
+// own calls, which was enough while each had its own machine; sharing one, a
+// program calling the runtime on one thread and the driver on another could
+// load modules into the same device, or run kernels whose atomics each
+// library's interpreter serialized with a table of its own, at the same time.
+// Never destroyed: a library's exit handlers may still take it.
+extern "C" __attribute__((visibility("default"))) std::recursive_mutex* vgpu_shared_api_mutex_v1() {
+  static auto* mu = new std::recursive_mutex();
+  return mu;
+}
+
 namespace vgpu::runtime {
+
+std::recursive_mutex& shared_api_mutex() {
+  using Fn = std::recursive_mutex* (*)();
+  static const Fn fn = [] {
+    const auto found = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "vgpu_shared_api_mutex_v1"));
+    return found ? found : &vgpu_shared_api_mutex_v1;
+  }();
+  return *fn();
+}
 
 Runtime* shared_runtime() {
   using Fn = Runtime* (*)();

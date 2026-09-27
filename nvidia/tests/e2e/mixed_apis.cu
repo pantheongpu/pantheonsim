@@ -8,9 +8,14 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
+
+__global__ void count_up(unsigned* c, int reps) {
+  for (int i = 0; i < reps; ++i) atomicAdd(c, 1u);
+}
 
 __global__ void add_one(unsigned* p, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -38,6 +43,23 @@ static const char* kPtx = R"(
   add.u32 %r4, %r3, %r3;
   st.global.u32 [%rd3], %r4;
 done:
+  ret;
+}
+.visible .entry count_up(.param .u64 c, .param .u32 reps)
+{
+  .reg .pred %q;
+  .reg .b32 %r<4>;
+  .reg .b64 %rd<2>;
+  ld.param.u64 %rd1, [c];
+  ld.param.u32 %r1, [reps];
+  mov.u32 %r2, 0;
+loop:
+  setp.ge.u32 %q, %r2, %r1;
+  @%q bra out;
+  atom.global.add.u32 %r3, [%rd1], 1;
+  add.u32 %r2, %r2, 1;
+  bra loop;
+out:
   ret;
 }
 )";
@@ -111,6 +133,47 @@ int main() {
   }
   expect("cudaFree of runtime memory", cudaFree(a) == cudaSuccess);
   expect("cuMemFree of driver memory", cuMemFree(b) == CUDA_SUCCESS);
+
+  // Two threads, one launching through the runtime and one through the
+  // driver, loading and counting on the same word of the one machine: every
+  // increment arrives. (A correctness check of mixed use from two threads.
+  // The libraries also share one API lock -- shared_runtime.cpp -- so their
+  // calls into the machine never overlap; this does not show that on its own,
+  // since kernels on one device do not run at the same time here anyway.)
+  {
+    unsigned* counter = nullptr;
+    cudaMalloc(&counter, sizeof(unsigned));
+    cudaMemset(counter, 0, sizeof(unsigned));
+    const int rounds = 10, blocks = 64, threads = 32, reps = 40;
+    std::thread by_runtime([&] {
+      for (int r = 0; r < rounds; ++r) {
+        count_up<<<blocks, threads>>>(counter, reps);
+        cudaDeviceSynchronize();
+      }
+    });
+    std::thread by_driver([&] {
+      CUcontext ctx = nullptr;
+      cuDevicePrimaryCtxRetain(&ctx, 0);
+      cuCtxSetCurrent(ctx);
+      CUfunction count = nullptr;
+      cuModuleGetFunction(&count, mod, "count_up");
+      CUdeviceptr pc = (CUdeviceptr)counter;
+      int rp = reps;
+      void* cargs[] = {&pc, &rp};
+      for (int r = 0; r < rounds; ++r) {
+        cuLaunchKernel(count, blocks, 1, 1, threads, 1, 1, 0, nullptr, cargs, nullptr);
+        cuCtxSynchronize();
+      }
+      cuDevicePrimaryCtxRelease(0);
+    });
+    by_runtime.join();
+    by_driver.join();
+    unsigned total = 0;
+    cudaMemcpy(&total, counter, sizeof total, cudaMemcpyDeviceToHost);
+    expect("atomics from runtime and driver launches on two threads all arrive",
+           total == 2u * rounds * blocks * threads * reps);
+    cudaFree(counter);
+  }
 
   std::printf(fails ? "FAIL\n" : "PASS\n");
   return fails != 0;

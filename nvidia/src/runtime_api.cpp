@@ -244,7 +244,9 @@ struct MemPool {
 };
 
 struct State {
-  std::recursive_mutex mu;
+  // One lock for both CUDA libraries, since they share one machine
+  // (shared_runtime.cpp).
+  std::recursive_mutex& mu = vgpu::runtime::shared_api_mutex();
   vgpu::runtime::Runtime* rt = nullptr;   // the process's machine, not owned (shared_runtime.cpp)
   std::vector<std::unique_ptr<RegisteredModule>> modules;
   std::unordered_map<const void*, KernelInfo> kernels;  // host stub ptr -> kernel

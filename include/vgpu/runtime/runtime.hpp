@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -115,6 +116,9 @@ class Runtime;
 // VGPU_DEVICE_COUNT) the first time either CUDA library asks, and the same
 // one for both (shared_runtime.cpp).
 Runtime* shared_runtime();
+// The lock both CUDA libraries take around every API call, so that calls into
+// the one machine from either never overlap (shared_runtime.cpp).
+std::recursive_mutex& shared_api_mutex();
 
 class Runtime {
  public:
