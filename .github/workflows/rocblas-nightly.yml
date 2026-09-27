@@ -47,7 +47,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends cmake libgtest-dev libgmock-dev libopenblas-dev \
-            libnuma1 libdrm2 libdrm-amdgpu1 libelf1 zlib1g-dev
+            libnuma1 libdrm2 libdrm-dev libdrm-amdgpu1 libelf1 zlib1g-dev
           amd/tests/rocblas/nightly/fetch-rocm.sh "$HOME/rocm" build
           # Each of the client's translation units wants a few GB: three at a
           # time fit the runner's 16.
