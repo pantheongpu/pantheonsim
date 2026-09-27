@@ -2636,7 +2636,11 @@ class Parser {
           return unsupported("tcgen05.ld.red (sm_103 and sm_110, not the B200's sm_100)");
         else if (p == "sp" && op.kind == Tcgen05Kind::Mma) op.sparse = true;
         else if (p == "ws" || p.rfind("ws::", 0) == 0)
-          return unsupported("tcgen05.mma.ws (weight-stationary) is not implemented yet");
+          return unsupported("tcgen05.mma.ws (weight-stationary): where it writes D is not settled by the "
+                             "ISA -- figures 219 and 223 put the N halves/quarters in warps 2-3, while "
+                             "figures 220 and 224 address them at lanes 0 and 32 -- nor is its "
+                             "zero-column mask, whose examples contradict each other, so it is not "
+                             "implemented");
         else if (p == "kind::mxf8f6f4") { op.mma_kind = Tcgen05MmaKind::MXF8F6F4; have_kind = true; }
         else if (p == "kind::mxf4") { op.mma_kind = Tcgen05MmaKind::MXF4; have_kind = true; }
         else if (p == "kind::mxf4nvf4") { op.mma_kind = Tcgen05MmaKind::MXF4NVF4; have_kind = true; }
@@ -2663,7 +2667,8 @@ class Parser {
         else if (op.kind == Tcgen05Kind::Cp && p == "b4x16_p64") op.cp_decompress = 4;
         else if (op.kind == Tcgen05Kind::Shift && p == "down") ;
         else if (p == "ashift")
-          return unsupported("tcgen05.mma.ashift is not implemented yet");
+          return unsupported("tcgen05.mma.ashift: the ISA says A's rows shift down one \"except for the "
+                             "last row\" without saying what row 0 then holds, so it is not implemented");
         else if (p.rfind("decompress", 0) == 0 || p == "kind::ti16")
           return unsupported("tcgen05.mma." + p + " (sm_107) is not implemented");
         else if (p.rfind("multicast::cluster::32b", 0) == 0 || p.rfind("sync_restrict", 0) == 0)
