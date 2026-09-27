@@ -111,10 +111,15 @@ int main() {
   std::printf("%d of %zu attributes agree with the properties\n", agree, sizeof pairs / sizeof pairs[0]);
   int v = 0;
   std::printf("a device that is not there: %s\n", hipGetErrorName(hipDeviceGetAttribute(&v, hipDeviceAttributeWarpSize, 99)));
-
-  // A kernel on device 0 reaching into device 1.
+  // HIP keeps the last call that failed until hipGetLastError reads it: a
+  // call that succeeds in between does not clear it, and reading it does.
   int count = 0;
   CHECK(hipGetDeviceCount(&count));
+  const hipError_t kept = hipPeekAtLastError(), read = hipGetLastError(), after = hipGetLastError();
+  std::printf("the last error outlives a call that succeeds: %s, %s, then %s\n", hipGetErrorName(kept),
+              hipGetErrorName(read), hipGetErrorName(after));
+
+  // A kernel on device 0 reaching into device 1.
   if (count < 2) {
     std::printf("one device: no peer to reach\n");
     return 0;

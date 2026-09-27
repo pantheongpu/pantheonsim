@@ -11,7 +11,7 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   H2D/D2H/D2D, OOB/UAF/double-free/interior-free/misalignment diagnostics
 - M4 PTX parser: ld/st(param/global), mov, cvta, add/sub/mul/min/max/div/rem,
   and/or/xor/shl/shr, mad.lo, fma, mul.wide, setp, selp, predication (@/@!),
-  bra, bar.sync 0, ret/exit; sregs tid/ntid/ctaid/nctaid/laneid;
+  bra, bar.sync (all sixteen barriers since), ret/exit; sregs tid/ntid/ctaid/nctaid/laneid;
   0f/0d float literals; precise unsupported-PTX errors
 - M5 SIMT interpreter: 32-lane warps, mask divergence + reconvergence stack,
   functional cross-warp bar.sync, deterministic round-robin scheduler,
@@ -289,17 +289,28 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   through the public API matches a host reference for both B layouts and both
   element types -- and tf32's m16n16k8, whose A is 16x8 and B is 8x16, so its
   load computes the address from the layout directly rather than relying on the
-  cancellation the square shapes get for free. The rectangular m8n32k16 and
-  m32n8k16 variants are still refused by name;
+  cancellation the square shapes get for free. Since 2026-09-25 every other
+  WMMA combination too -- f16 accumulators, the rectangular m8n32k16 and
+  m32n8k16 shapes, s8/u8 (with .satfinite), f64 m8n8k4 with its rounding
+  modes, s4/u4 m8n8k32 and b1 m8n8k128 (.xor.popc and .and.popc), and the
+  optional stride. The fragment layout is unspecified by the ISA, so these
+  use one of their own (the logical matrix, spread in order over lanes and
+  registers); the combinations above keep theirs. wmma_types.cu checks all 21
+  shape/type/layout combinations through mma.h, exactly;
   ldmatrix.m8n8.x{1,2,4}[.trans], mma.sync.m16n8k{8,16,32} over f16/bf16/tf32/
-  s8, and movmatrix.m8n8.trans (the register-only transpose).
+  s8, and movmatrix.m8n8.trans (the register-only transpose). mma.sp (2:4
+  structured sparsity) m16n8k{16,32} with f16/bf16 A and B, both sparsity
+  selectors: its A layout and metadata were read from the ISA's figures and
+  settled nibble by nibble on an RTX 3060, test_exec3 checks five forms
+  against the hardware's own results, and CUTLASS's 19 SM80 sparse GEMM tests
+  pass. Its tf32, integer and FP8 forms are still refused.
   stmatrix.m8n8.x{1,2,4}[.trans] is the store counterpart of ldmatrix: the warp
   writes the 8x8 matrices its registers hold back to shared memory, which is how
   a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
   checks where every element lands and that a fragment stored by one instruction
   and loaded by the other comes back unchanged.
 - Asynchronous copy: cp.async.{ca,cg} with commit_group / wait_group / wait_all
-  and the src-size zero-fill form. The copy is deferred until the wait rather
+  and the src-size zero-fill form; an empty group counts toward wait_group N. The copy is deferred until the wait rather
   than performed on the spot, so a kernel that reads its destination early sees
   what the hardware would, not what a synchronous copy would have hidden.
 - Warp membership: %lanemask_{eq,lt,le,gt,ge}, %warpid, activemask, bar.red,
@@ -683,7 +694,7 @@ narrows what counts as observable, not what the detector looks at.
   e2e test (nvidia/tests/e2e/wgmma_cute.cu) lets CuTe -- NVIDIA's own layout
   code, from a pinned CUTLASS release -- build the tiles, descriptors and
   fragments for seventeen configurations and compares every element exactly.
-  Refused by name: the sparse (`.sp`) and single-bit (`.b1`) forms, a
+  Refused by name: the sparse (`.sp`) and single-bit (`.b1`) `wgmma` forms, a
   descriptor with a nonzero base offset (the ISA does not say how it moves the
   pattern), and `wgmma` under any target but `.target sm_90a`. Loading now
   follows the target suffixes: a fatbin's `sm_90a` PTX is preferred over its
@@ -783,14 +794,113 @@ narrows what counts as observable, not what the detector looks at.
   stride shifted right by 4 before that, so the module's `.version` decides.
   A value no map from `cuTensorMapEncodeTiled` could hold (a box past 256, a
   traversal stride of 0) is refused rather than carried into a copy, and
-  the Blackwell-only values (packed 4/6-bit types, the 96B swizzle, wider
-  swizzle atoms) are refused by name. Checked by unit tests (each field read
+  the Blackwell-only values (packed 4/6-bit types, the 96B swizzle, the
+  32B-with-8B-flip atomicity) are refused by name. Checked by unit tests (each field read
   back by the host's decoder; the ISA's 9 is f64 where the driver's 9 is
   bf16; a retargeted map loaded through under PTX 8.3 and 8.5; each confirmed
   to fail with the rule it covers broken), and by a CuTe program
   (tensormap_replace_cute.cu) that retargets a descriptor through CuTe's own
   helpers in shared memory and in global memory and loads through it,
   exact; it fails on main.
+
+- TMA's im2col mode (sm_90): `cuTensorMapEncodeIm2col` in the driver and
+  through `cudaGetDriverEntryPoint`, with the checks cuda.h documents (the
+  corners' ranges per rank, a non-empty box, channels up to 256, pixels up
+  to 1024), `cp.async.bulk.tensor` `.im2col` loads with their offsets
+  (multicast too), and `.im2col_no_offs` stores and reductions. The ISA
+  shows the walk in figures rather than words, so it is taken from the code
+  that relies on it -- CuTe's im2col traits and CUTLASS's convolution
+  corners: the box runs from the lower corner to dim + upper - 1 along each
+  of W, H and D, stepped by the traversal stride, W fastest, then the batch;
+  a load starts at the instruction's pixel and reads each pixel at its base
+  plus the im2col offsets, zero outside the tensor. Checked by unit tests
+  (the corners at each rank's width, the encoder's refusals, a walk that
+  wraps and runs off the batch, the store side, a map used in the wrong
+  mode), by tma_im2col.cu, which compares every tile of four convolutions
+  (strides, dilation, padding, 1D and 2D) with the im2col matrix worked out
+  from the definition of a convolution, and by CUTLASS's own SM90 conv2d
+  fprop test, whose eight tile and cluster shapes pass against its host
+  reference and fail with the offsets broken.
+
+- Blackwell's tensor core (sm_100a/sm_100f, PTX ISA 9.7.18): Tensor Memory
+  (128 lanes x 512 columns per CTA) allocated with `tcgen05.alloc`/`dealloc`
+  -- for a CTA pair with `.cta_group::2` -- and checked for leaks at exit;
+  `tcgen05.ld`/`st` in all five shapes with pack/unpack, each warp kept to
+  its quarter of the lanes; `tcgen05.mma` for `.kind::f16`, `tf32`, the
+  8-bit `f8f6f4` types and `i8`, one CTA (M = 64/128) or a pair (M =
+  128/256), A from shared or Tensor Memory, with the data-path layouts of
+  figures 211-222; `tcgen05.commit` (multicast too), the fences and waits.
+  Around it: cluster launch control (`try_cancel` takes over clusters that
+  have not started, so CUTLASS's persistent loop really loops), `.b128`
+  registers, TMA's `.cta_group::2`, and the 128-byte swizzle in 32- and
+  64-byte atoms for TMA, `tensormap.replace` and the tcgen05 descriptor. A
+  CTA's shared addresses now carry its cluster rank in bits 24 and up, as
+  CUTLASS's 2-SM kernels assume. Checked by unit tests (the ld/st figures as
+  tables, every kind and layout against a host GEMM, the pair layouts, the
+  launch-control takeover, TMA through the peer bit) and by CUTLASS's own
+  SM100 GEMM tests (f16 1-SM, 2-SM and stream-K, f8, s8), unmodified,
+  against its host reference. Sparse, weight-stationary and block-scaled
+  MMAs, `tcgen05.cp`/`shift` and the 4/6-bit types are refused by name.
+  See nvidia/docs/blackwell.md.
+
+- The CTA's sixteen barriers (PTX ISA 9.7.15.1): `bar.sync` and
+  `barrier.sync` on any of barriers 0-15, with or without a thread count,
+  `bar.arrive`, register operands, and a guarded barrier the whole warp
+  agrees on. A barrier with a count completes when that many threads have
+  arrived, a warp counting as all its threads (the ISA "marks warps'
+  arrival"); one without is the whole CTA. Warp-specialized kernels hand
+  work between producer and consumer warps this way, so none of CUTLASS's
+  Hopper GEMMs or convolutions loaded before -- found by running its conv
+  test. A block whose warps can only wait on barriers that can no longer
+  complete is reported as a deadlock, naming the barrier and how far it
+  got; before, the block quietly ended with the warp still waiting.
+
+- Dynamic parallelism (CDP2, 2026-09-25): kernels launch kernels through the
+  device runtime's entry points as the CUDA programming guide documents them
+  for code generators (__cudaCDP2GetParameterBufferV2 and
+  __cudaCDP2LaunchDeviceV2). Kernels have addresses in their own window and
+  the runtime gives every launch a table of them; the parameter buffer is
+  device memory laid out as the child's parameters. A child runs after its
+  parent grid and before the launch returns, in launch order (parent block by
+  parent block, so it is the same with any number of host threads), each
+  complete -- its own children included -- before the next: a schedule CUDA
+  allows for every device-side stream, since it promises no concurrency
+  between parent and child. CUDA's limits apply (2048 pending, 24 deep).
+  Checked by test_dynpar and dynamic_parallelism.cu (built with -rdc: fan-out,
+  nesting, order, the tail and fire-and-forget streams, a struct parameter).
+
+- CUTLASS's SM90 GEMM unit tests, run unmodified (2026-09-25), found: the
+  register estimate ignored launch bounds (.maxntid/.minnctapersm/.maxnreg
+  now cap it, as ptxas does, spilling the rest); an mbarrier instruction whose
+  lanes name different blocks' barriers was refused (lanes are now handled
+  barrier by barrier); cudaFuncAttributeNonPortableClusterSizeAllowed was
+  ignored (clusters of up to 16 now launch once it is set); and dp2a was
+  missing. The cluster warp-specialized cooperative test passes all 22 cases
+  and the pointer-array test its 2.
+  The ping-pong kernel's wrong 16-row A slices at 2x4x1 (and the group
+  GEMM's, at 2x2x1) were one bug: each warp of a warpgroup read its operands
+  of a `wgmma` from shared memory when it got to the instruction, so a warp
+  that finished early could release the stage and let the cluster peer that
+  multicasts A refill it before the last warp had read. The warpgroup now
+  reads them once, at the first warp's issue, and `wgmma.wait_group` holds a
+  warp until all four have issued what it waits for (letting the first warp
+  through alone hung the ping-pong kernel's SIMT-epilogue variant at 2x2x1:
+  the stage it released was refilled past a lagging warp's parity wait).
+  The group GEMM also found
+  `cvt.sat` and `.ftz` ignored and tiny fp16 results flushed to zero (its
+  silu epilogue's expf leans on `cvt.sat.f32.f32`); conversions now match an
+  RTX 3060 bit for bit, NaN encodings included.
+- CUTLASS's SM80 sparse GEMM tests (all 19 pass) found three more: an empty
+  `cp.async` group did not count toward `wait_group N`, so a wait left an
+  older real group pending; `bar.red` voted for a partial warp when some of
+  its lanes were on another path, and let a warp looping back vote into the
+  round the others were still collecting; and a `.reg` declared inside
+  `{ }` did not hide the outer register of the same name, which
+  `__syncthreads_and`'s inline asm relies on. The last two hung CUTLASS's
+  split-K semaphore wait whenever the blocks ran on more than one host
+  thread. `ex2.approx` differs from the hardware's by an ulp in about 30% of
+  inputs (it is approximate, and matching it bit for bit would take the SFU's
+  internals), which moves `expf` by an ulp too.
 
 ## Not implemented (fails loudly, never silently)
 
@@ -799,10 +909,12 @@ textures, grid sync and host-pinned memory long after all three worked. A
 roadmap that overstates what is missing misleads as much as one that overstates
 what is done.
 
-- PTX, refused by name: TMA's im2col mode, gather/scatter, attribute
+- PTX, refused by name: TMA's gather/scatter and `.im2col::w` modes
+  (Blackwell), attribute
   overrides and reports, the NaN out-of-bounds fill (its value is not
-  documented), interleaved layouts and the 128B swizzle with 32B/64B atoms
-  (Blackwell), the sparse and
+  documented), interleaved layouts and the 128B swizzle's 8-byte-flip
+  variant (Blackwell); tcgen05's sparse, weight-stationary and block-scaled
+  MMAs, `tcgen05.cp`/`shift` and its 4/6-bit types; the sparse and
   single-bit `wgmma` forms, and inline-asm-only instructions. (`wgmma`, TMA,
   the mbarrier transaction counts, `barrier.cluster` and distributed shared
   memory are done -- see "Hopper's warpgroup MMA", "TMA and clusters" and
@@ -819,11 +931,6 @@ what is done.
   fault with a diagnostic naming which it was. Exporting a handle to another
   process still refuses: device memory here is this process's own sparse
   backing.)
-- Dynamic parallelism (a kernel launching a kernel). Taking a kernel's address
-  in device code now says so by name instead of reporting an unknown symbol,
-  which sent you looking for a typo in a name that was right there. Running it
-  would need a child grid scheduled from inside the parent's instruction
-  stream, which nothing here can do.
 - Frontends: cubin/SASS loading. (AMD execution is done -- see
   amd/README.md: unmodified hipcc programs built by ROCm 6.4, 7.0, 7.1 or 7.2
   run on a simulated MI300X, through the fatbin path, chevron
@@ -1084,25 +1191,25 @@ scripts/run-pantheon-workloads.sh.
    refuse a grid too large to be resident, because such a kernel does not run
    slowly, it hangs. See docs/cooperative.md.
 
-   **Textures and surfaces are done for the point-sampled case**, which is what
-   the overwhelming majority of CUDA code uses: `tex.1d`/`tex.2d`/`tex.3d`,
-   `suld`, `sust`, plus `cudaCreateTextureObject`, `cudaCreateSurfaceObject`,
-   `cudaMallocArray` and the array copies. Backing memory can be linear
-   (`tex1Dfetch`, which is how ML code uses textures -- as a cached load),
-   pitched 2D, or a `cudaArray`. All four addressing modes, the integer and
-   float channel kinds, `cudaReadModeNormalizedFloat`, and the
-   absent-channel rule (0 for x/y/z, 1 for w) are implemented.
-
-   Deliberately refused rather than approximated: `cudaFilterModeLinear`.
-   Interpolation between texels is a documented weighted average, but hardware
-   computes the weights in a fixed-point format with 8 fractional bits, so a
-   float implementation would differ from the device in the low bits -- which
-   is precisely what the differential testing here exists to catch. Also
-   refused: mipmaps, layered and cubemap textures, sRGB, anisotropy, and the
-   `.clamp`/`.zero` surface out-of-range policies. See nvidia/docs/textures.md.
+   **Textures and surfaces are done**: point and linear filtering, 1D/2D/3D,
+   layered and cubemap (and layered cubemap) textures, layered surfaces,
+   mipmaps with an explicit level of detail (`tex.level`, and plain fetches
+   of mipmapped textures), and gather (`tld4`), over linear memory, pitched
+   2D, arrays and mipmapped arrays, with every addressing mode and read mode.
+   Linear filtering used to be refused because the guide gives the formula
+   but not the arithmetic; the arithmetic was measured on an RTX 3060 until
+   every sample matched bit for bit (weights in 1/256ths split z, x, y with
+   measured rounding sides, one exact sum rounded ties-away, 1D as 2D at
+   y = 0, the LOD's truncations), and the e2e tests hash tens of thousands
+   of results against the hardware's. Refused by name: `tex.grad` (its LOD
+   comes from undocumented approximate units), linear filtering of signed
+   8-bit normalized texels, mipmapped layered/cubemap textures, `tld4` on
+   layered/cubemap textures, border colours, sRGB, anisotropy, resource views
+   and the `.clamp`/`.zero` surface policies. See nvidia/docs/textures.md.
 
    `wgmma`, TMA and distributed shared memory are done now (see "Hopper's
    warpgroup MMA", "TMA and clusters" and "Distributed shared memory"). What
-   is left of Hopper is TMA's im2col and gather modes, refused by name.
-   (`cp.reduce.async.bulk` and `tensormap.replace` are done -- see "TMA
-   reductions" and "Tensor maps changed on the device".)
+   was left of Hopper -- `cp.reduce.async.bulk`, `tensormap.replace` and
+   TMA's im2col mode -- is done too (see "TMA reductions", "Tensor maps
+   changed on the device" and "TMA's im2col mode"). The gather and
+   `.im2col::w` modes are Blackwell's.

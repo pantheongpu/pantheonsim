@@ -12,14 +12,15 @@
 
 #include "vgpu/amd_codeobject.hpp"
 #include "vgpu/amd_exec.hpp"
+#include "vgpu/amd_gcn.hpp"
 #include "vtest.hpp"
 
 using namespace vgpu;
 
 namespace {
 
-amd::CodeObject object() {
-  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/memory.gfx942.o";
+amd::CodeObject object(const std::string& file = "memory.gfx942.o") {
+  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/" + file;
   std::ifstream in(path, std::ios::binary);
   if (!in) throw vtest::Failure("no code object at " + path);
   return amd::load_code_object(std::string((std::istreambuf_iterator<char>(in)), {}), path);
@@ -70,8 +71,8 @@ void run(const amd::CodeObject& o, const char* name, MemoryManager& mem, const s
 
 }  // namespace
 
-VTEST(a_private_array_too_big_for_registers_spills_to_scratch) {
-  const amd::CodeObject o = object();
+namespace {
+void check_scratch(const amd::CodeObject& o) {
   // The kernel keeps 32 floats per work-item and indexes them at run time, so
   // the compiler puts them in the work-item's own memory.
   VCHECK(kernel(o, "scratch").private_segment > 0);
@@ -91,6 +92,21 @@ VTEST(a_private_array_too_big_for_registers_spills_to_scratch) {
       throw vtest::Failure("scratch[" + std::to_string(i) + "] is " + std::to_string(out[i]) + ", not " +
                            std::to_string(want));
   }
+}
+}  // namespace
+
+VTEST(a_private_array_too_big_for_registers_spills_to_scratch) { check_scratch(object()); }
+
+// The same kernel built for gfx90a, which has no scratch of the hardware's
+// own setting up: it reaches its private array through the private segment
+// buffer resource it is handed, with buffer loads and stores the card
+// swizzles across the wave's lanes -- the path rocBLAS's gfx90a kernels spill
+// through.
+VTEST(a_gfx90a_kernel_reaches_scratch_through_its_private_segment_buffer) {
+  const amd::CodeObject o = object("memory.gfx90a.o");
+  VCHECK(amd::gcn::target_of_mach(o.mach) == amd::gcn::Target::Gfx90a);
+  VCHECK(kernel(o, "scratch").private_segment_buffer);
+  check_scratch(o);
 }
 
 VTEST(an_atomic_in_lds_collects_every_lane_that_shares_a_slot) {

@@ -35,6 +35,10 @@ struct Kernel {
   std::string name;                       // "vector_add"
   uint64_t entry = 0;                     // where its code starts in the object's .text
   uint64_t size = 0;                      // how long its code is, where the object says
+  // Where its kernel descriptor is: in a linked object, an address from the
+  // image's start, which placed on a device is what HSA calls the kernel
+  // object -- the handle an AQL dispatch packet names the kernel by.
+  uint64_t descriptor = 0;
   uint32_t kernarg_size = 0;
   uint32_t kernarg_align = 8;
   uint32_t group_segment = 0;             // LDS the kernel reserves, bytes
@@ -54,6 +58,17 @@ struct Kernel {
   // after another, so a kernel that asks for x and z finds z where y would
   // have been.
   bool group_id_x = true, group_id_y = true, group_id_z = true;
+  // And after them, where RSRC2 asks: the work-group's info (bit 10), then
+  // the wave's byte offset into its private segment (bit 0) -- which a
+  // gfx90a kernel adds to its scratch accesses, and gfx940 and later, whose
+  // flat scratch the hardware sets up, are not given.
+  bool group_info = false, private_wave_offset = false;
+  // The MODE register a wave starts with, from COMPUTE_PGM_RSRC1: the round
+  // modes (bits 3:0), the denormal modes (7:4), DX10_CLAMP (8) and IEEE (9).
+  // Round to nearest even, denormals kept, both on: what every kernel of
+  // PyTorch's and ROCm's libraries asks for, and what a kernel with no
+  // descriptor gets.
+  uint32_t mode = 0xF0 | 1u << 8 | 1u << 9;
 };
 
 // A variable the kernels share: a __device__ global. It lives in the module's
@@ -102,6 +117,12 @@ struct CodeObject {
   // to itself. Empty for an object not yet linked, whose variables are `data`.
   bool linked = false;
   std::vector<uint8_t> image;
+  // The processor the code was built for: the ELF header's e_flags machine
+  // field (EF_AMDGPU_MACH), 0x4c for gfx942 and 0x4f for gfx950. Where the
+  // same instruction means different things on the two -- an 8-bit float is
+  // FNUZ on gfx942 and OCP on gfx950 -- this says which.
+  uint32_t mach = 0;
+  bool gfx950() const { return mach == 0x4f; }
 };
 
 // Writes the addresses of the module's globals into its code, for a data

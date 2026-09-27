@@ -23,6 +23,7 @@
 //    (these diagnostics are a product feature for CI, not just debug aids).
 #pragma once
 #include <mutex>
+#include "vgpu/brlock.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -52,6 +53,12 @@ inline constexpr uint64_t kDeviceVaBase = 0x2000'0000'0000ull;
 inline constexpr uint64_t kFuncVaBase = 0x6ffb'0000'0000ull;
 inline constexpr uint64_t kFuncVaStride = 8;
 inline constexpr uint64_t kFuncVaSize = 1ull << 20;
+// Kernels get addresses in a window of their own for the same reason: a
+// device-side launch (dynamic parallelism) names its child grid by the
+// kernel's address, which the runtime's kernel table turns back into the
+// kernel. Nothing is loaded from here either.
+inline constexpr uint64_t kKernelVaBase = 0x6ffc'0000'0000ull;
+inline constexpr uint64_t kKernelVaStride = 8;
 // Each device owns a disjoint 1 TiB window above that base. CUDA guarantees
 // unified virtual addressing -- a device pointer is unique process-wide and
 // identifies the device that owns it -- and without separate windows two
@@ -90,6 +97,15 @@ class MemoryManager {
 
   // Allocates `size` bytes of virtual device memory. size == 0 is invalid.
   uint64_t alloc(uint64_t size);
+
+  // AMD's HIP hands device memory out a 4 KB page at a time, so a kernel that
+  // reads a little past the end of a buffer reads the rest of its page, and
+  // libraries count on it: hipSPARSELt's sparse GEMMs read a byte past their
+  // compressed matrix. With a page size set, allocations start on a page and
+  // a kernel's read of the rest of the last one is served; a copy or a write
+  // past the end is still refused. 0 -- the default, and NVIDIA's -- keeps
+  // every access to the bytes allocated.
+  void set_page_size(uint64_t bytes) { page_ = bytes; }
 
   // Frees an allocation. `ptr` must be the exact base returned by alloc().
   void free(uint64_t ptr);
@@ -346,8 +362,10 @@ class MemoryManager {
 
   // Maps addr to (allocation base, allocation); throws with diagnostics.
   // `writing` picks the diagnostic for a read-only mapping.
+  // `page_slack` lets a read run on into the rest of the allocation's last
+  // page (set_page_size).
   const Allocation& resolve(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
-                            bool writing = false) const;
+                            bool writing = false, bool page_slack = false) const;
   // The mapped-memory half of resolve: a hit returns the handle's allocation,
   // a miss returns null so the caller can carry on with its own diagnostics.
   const Allocation* resolve_mapped(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
@@ -360,6 +378,7 @@ class MemoryManager {
   uint64_t va_base_;
   uint64_t used_ = 0;
   uint64_t next_va_;
+  uint64_t page_ = 0;   // set_page_size
   void notify_usage() const {
     if (usage_observer_) usage_observer_(used_);
   }
@@ -451,6 +470,11 @@ class MemoryManager {
   enum class ScalarAt { Chunk, Untouched, Uniform, Unchanged, HostMap };
   ScalarAt scalar_location(uint64_t addr, uint32_t size, const uint64_t* store,
                            const uint8_t** where) const;
+  // Guards the tables below (and the mapping tables above) against a host
+  // thread allocating, freeing or mapping while kernels on other threads
+  // look addresses up in them (vgpu/brlock.hpp). Behind a pointer so the
+  // manager stays movable.
+  std::unique_ptr<BigReaderLock> table_lock_ = std::make_unique<BigReaderLock>();
   std::map<uint64_t, Allocation> live_;        // base -> allocation
   // base -> record, bounded to kQuarantineEntries (oldest evicted first).
   std::map<uint64_t, FreedRecord> freed_;

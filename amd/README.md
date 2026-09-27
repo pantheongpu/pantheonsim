@@ -44,9 +44,15 @@ memory a device has and how much is left, several devices each keeping their
 own, streams and the events a program times its work with, and a launch whose
 shared-memory parameter sizes the LDS the kernel did not reserve for itself.
 The time between two events is the simulator's own, not what a card would have
-taken, which this does not claim to know. Nothing runs behind the program's back, so
-the asynchronous calls are the synchronous ones and a stream is done when the
-call returns. A program built by `hipcc` runs unmodified too:
+taken, which this does not claim to know. Streams run at once, as a card's
+do: each stream's work runs in order on a host thread of its own, so a kernel
+on one stream may wait on a flag another stream's kernel sets, an event and a
+stream say `hipErrorNotReady` while their work runs, `hipStreamWaitEvent`
+orders one stream behind another, and the null stream is the legacy default
+stream, ordered against the blocking streams. A kernel's fault is told at the
+next synchronization, as on a card. `VGPU_SYNC_LAUNCHES=1` makes every call
+wait for its own work instead, which rules concurrency out when a program
+misbehaves. A program built by `hipcc` runs unmodified too:
 its device code is registered from inside the executable before `main`, its
 chevron launches go through `hipLaunchKernel`, and it reads the device through
 the real headers' `hipDeviceProp_t`, which is laid out here field for field as
@@ -93,9 +99,18 @@ builds a program against rocBLAS and checks its level-1 routines and its
 float and double GEMMs -- ragged sizes, every transpose -- against the same
 arithmetic on the host; both need ROCm with rocBLAS installed and skip
 elsewhere. AMD's own rocBLAS test suite, built from ROCm 7.1's source, runs
-on it as well: of an even 1% sample of its quick float and double tests
-(1,629 of them, each checked against OpenBLAS), 1,435 pass. The half,
-bfloat16, int8 and FP8 GEMMs are not decoded yet.
+on it as well: all 162,807 of its quick float and double tests pass, each
+checked against OpenBLAS, and its half, bfloat16, int8 and FP8 GEMMs run too.
+
+hipSPARSELt, from PyTorch's ROCm wheel, runs its 2:4 structured-sparse GEMMs
+on it: its own kernels prune a matrix, compress it into values and indices,
+and multiply with the sparse matrix instructions (`tests/e2e/
+run_hipsparselt.sh`, ctests `amd_hipsparselt` and `amd_hipsparselt_mi350x`,
+each product checked against the host's). Its kernels read a byte past the
+end of a buffer, which a card allows because HIP hands out device memory by
+the 4 KB page. AMD devices here allocate the same way. A kernel's read of the
+rest of its buffer's last page is served, but a copy or a write past the end
+is still refused.
 
 The instructions implemented are those clang emits for the kernels in
 `tests/data/`, and those rocBLAS's own kernels and Tensile's float and double
@@ -225,6 +240,17 @@ memory sit at addresses of this model's choosing, which a kernel reads from
 instructions retired by the host thread running it, which is this model's
 cycle, where a card's counts at a fixed rate.
 
+The MODE register's float modes are the kernel's own. A wave starts with
+the round and denormal modes its descriptor gives (COMPUTE_PGM_RSRC1), and
+`s_setreg` changes them. Each vector instruction runs under them, the round
+mode through the host's rounding and the denormal mode through its flush
+controls (x86's DAZ and FTZ). Every kernel in PyTorch's and ROCm's libraries
+asks for the defaults: round to nearest even, denormals kept. Code built with
+`-fgpu-flush-denormals-to-zero` flushes single-precision denormals, as a card
+does. The matrix instructions ignore MODE, as the ISA says. Half-precision
+denormals are always kept, whatever MODE says. `tests/hipcc/numerics.cpp`
+checks all of it, built both ways.
+
 Work-groups run on every host core at once, as a GPU runs them in any order
 and concurrently; `VGPU_THREADS=1` runs them one after another, in order, which
 is what a kernel with a data race needs to give the same answer every time.
@@ -232,6 +258,96 @@ Device memory is shared between the threads a word at a time, an atomic takes
 a lock striped by address, and a fence (`buffer_wbl2`, `buffer_inv`) is a
 fence on the host. `amd_exec_bench` (`tools/exec-bench.cpp`) says how fast a
 kernel runs on the interpreter.
+
+## gfx950 (MI350X)
+
+`VGPU_GPU=amd/mi350x` runs code built for gfx950. PyTorch's own kernels and
+hipBLASLt's, rocBLAS's and MIOpen's gfx950 builds pass the same 20 PyTorch
+checks as gfx942 (ctest `amd_pytorch_mi350x`). What gfx950 adds is
+modelled:
+
+- **Instructions:**
+  - `v_bitop3` (any function of three inputs, by a truth table)
+  - the packed float-to-half and float-to-bfloat16 conversions
+  - `v_permlane16_swap` and `v_permlane32_swap`
+  - `v_cvt_f32_bf16`
+  - the bfloat16 dot products
+  - the matrix instructions with K doubled (f16, bf16, int8)
+  - the `f8f6f4` ones, whose sources are fp8, bf8, fp6, bf6 or fp4, as each one's CBSZ or BLGP says
+- **8-bit floats:** the same fp8 instructions mean the OCP formats on gfx950 (E4M3 and E5M2), where gfx942's are FNUZ. Which one applies is read from the code object's target. `tests/hipcc/fp8.cpp`, built for each, checks every conversion against HIP's own software one.
+- **Block-scaled matrix instructions:** `v_mfma_scale_*_f8f6f4` scales each lane's row and 32 values along K by an E8M0 byte of its scale register, the byte `{OP_SEL_HI, OP_SEL}` names, as the CDNA4 ISA reference guide says. `v_prng_b32` is its LFSR step. `tests/hipcc/gfx950.cpp` checks both, and the lane swaps, against the guide.
+- **Sparse matrix instructions:** `v_smfmac_*`, gfx942's and gfx950's (whose K is twice as long), take A 2:4 sparse along K: two values held of each four, and an index register that says which of the four each is. CBSZ and ABID choose a set of indices in that register. On gfx950 their B is eight registers split into two runs of K, K/2 apart, where A's run is in one piece; the guide's B tables show this, and hipSPARSELt's gfx950 kernels are right only with it. `tests/hipcc/smfmac.cpp`, built for each target, checks every form against the guides, and hipSPARSELt checks them in real GEMMs.
+- **Decoder check:** `tests/data/isa_corpus_gfx950.txt` holds every instruction shape PyTorch's, hipBLASLt's and rocBLAS's gfx950 code uses. The decoder must print each one as `llvm-objdump` does.
+- **Extracting code objects:** `amd_fatbin_extract` (`tools/fatbin-extract.cpp`) writes out what a library carries for one target, which is how that corpus is gathered.
+
+## gfx90a (MI250X)
+
+`VGPU_GPU=amd/mi250x` is one of an MI250X's two dies, as HIP, rocminfo and rocm-smi each see it: 110 compute units and 64 GB. `VGPU_DEVICE_COUNT=2` gives the whole package. PyTorch's 20 checks pass on it (ctest `amd_pytorch_mi250x`). The fp8 one checks that PyTorch refuses fp8, as it does on the card.
+
+- **Instruction numbering:** gfx90a (CDNA2) numbers some instructions differently from gfx940 and later, so the decoder takes the code object's target (`gcn::Target`, from `e_flags`). The differences were found by asking LLVM's disassembler about every opcode of each encoding on both targets:
+  - int8 matrix instructions with K of 8 and 16
+  - the bfloat16 ones four a lane (`_1k`), renumbered on gfx940
+  - the older bfloat16 ones two a lane
+  - `v_mad_f32`, `v_mad_legacy_f32`, `v_mac_f32` and `v_madmk_f32`: the product rounded before the add, and denormals flushed
+  - `buffer_wbinvl1` and `buffer_invl2`
+  - FLAT_SCRATCH as a register
+- **Scratch:** gfx90a has no flat scratch set up by the hardware. A kernel reaches its private memory through the private segment buffer resource it is handed, with buffer loads and stores the card swizzles across the wave's lanes. The executor hands it that resource and a wave offset, and unswizzles its accesses. This is how rocBLAS's gfx90a kernels spill.
+- **Decoder check:** `tests/data/isa_corpus_gfx90a.txt` holds 1628 instruction shapes from PyTorch's, hipBLASLt's and rocBLAS's gfx90a code. Each decodes, and prints in gfx90a's names (`glc`, `slc`, `v_mfma_f32_32x32x8f16`), as `llvm-objdump` prints it.
+
+## Textures
+
+The GPUs modelled here, the MI300 family (gfx942 and gfx950), have no texture
+units. hipcc refuses the texture API in their device code
+(`__HIP_NO_IMAGE_SUPPORT`), and ROCm's HIP on them reports image support 0
+and answers every call that would make an array, a texture or a surface with
+`hipErrorNotSupported`. The shim gives the same answers, so a program or
+library that calls them is told what it would be told on the card instead of
+failing to load. `tests/hipcc/textures.cpp` prints each answer; its output must
+match `tests/hipcc/rocm/textures.expected` on the shim, for each release's
+build of it, and on ROCm's own HIP over the HSA runtime.
+
+## HSA
+
+The same library is also the HSA runtime (`src/hsa_api.cpp`, declared in
+`include/vgpu/hsa_abi.h` from the HSA Foundation's specification and AMD's
+documented extensions). `build/shim/libhsa-runtime64.so.1` names it, so a
+program that uses HSA and HIP together sees one set of devices and one memory.
+A program finds a CPU agent and one GPU agent per simulated device, allocates
+from their memory pools (or the older regions), loads a code object into an
+executable, and dispatches kernels by writing AQL packets into a queue and
+ringing its doorbell. Each queue has a packet processor on a host thread of
+its own. It runs kernel dispatches in order, holds on barrier-AND and
+barrier-OR packets until their signals reach zero, and decrements each
+packet's completion signal when it is done. `hsa_amd_memory_async_copy` waits
+on its dependency signals the same way. Memory from the CPU's pools
+(fine-grained, and kernarg) is reachable from every device's kernels at its
+own address. Memory from a GPU's pool belongs to that device, and the host
+reaches it by copying. Every function carries ROCm's symbol version
+(`ROCR_1`). `tests/hsa/hsa_dispatch.c` is built against this header, and
+against ROCm's `hsa.h` where that is installed, and both builds run
+(ctest `amd_hsa`). A grid need not be a whole number of work-groups, as HSA
+allows: the last group in a dimension runs short, numbered across its own
+shape, and the kernel's `hidden_remainder` arguments say by how much.
+
+ROCm's own tools and HIP runtime run on it unmodified:
+
+- **`rocminfo`** describes every device.
+- **ROCm's `libamdhip64` (CLR)**, from releases 7.0, 7.1 and 7.2, runs hipcc-built programs with only `libhsa-runtime64` replaced (ctest `amd_hip_on_hsa`). CLR then does all of HIP itself:
+  - its copies and fills are its own kernels in AQL packets;
+  - device `printf` comes back through its hostcall listener;
+  - a cooperative launch goes to a cooperative queue;
+  - peers are granted through `hsa_amd_agents_allow_access`.
+
+That works because the runtime keeps to what ROCm's does where CLR looks:
+
+- **Signals:** a signal handle is the address of an `amd_signal_t` every device maps, so a kernel can ring it, and a host wait sees what a kernel wrote.
+- **Kernel arguments:** a packet's kernarg segment reaches the kernel as the program wrote it, hidden arguments included.
+- **Work-group limit:** a packet is held only to the hardware's work-group limit, not the kernel's metadata.
+- **Host access:** the host is never given a device's memory directly, so CLR copies instead of writing through it.
+- **Supported extras:** AMD's loader extension, barrier-value packets, asynchronous signal handlers, dispatch timestamps and `hsa_amd_pointer_info` all work.
+- **Not modelled:** images, virtual memory, IPC and SVM are refused by name.
+
+`VGPU_TRACE_HSA=1` logs what memory the program allocates, locks and registers.
 
 ## Profiling
 

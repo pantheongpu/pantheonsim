@@ -164,6 +164,7 @@ struct Descriptor {
   int64_t entry_offset = 0;
   uint32_t rsrc1 = 0, rsrc2 = 0;
   uint16_t properties = 0;
+  uint64_t at = 0;   // the .kd symbol's value: its address, in a linked object
 };
 
 }  // namespace
@@ -222,6 +223,7 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
   // fixed distance). So the whole of it goes on the device as one image, each
   // section at its own address from wherever the image starts.
   out.linked = r.u16(16) != 1 /* ET_REL */;
+  out.mach = r.u32(48) & 0xFF;   // e_flags: EF_AMDGPU_MACH
   if (out.linked) {
     uint64_t end = 0;
     for (const Section& sec : sections)
@@ -292,6 +294,7 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
       d.rsrc1 = r.u32(kd + 48);
       d.rsrc2 = r.u32(kd + 52);
       d.properties = r.u16(kd + 56);
+      d.at = value;
       descriptors[name.substr(0, name.size() - 3)] = d;
     }
   }
@@ -396,6 +399,7 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     }
     if (kern.entry < out.text_addr || kern.entry - out.text_addr > out.text.size())
       throw Error::make(Err::ProfileParse, origin, ": kernel ", kern.name, " starts outside .text");
+    kern.descriptor = d.at;
     if (!kern.kernarg_size) kern.kernarg_size = d.kernarg_size;
     if (!kern.group_segment) kern.group_segment = d.group_segment;
     if (!kern.private_segment) kern.private_segment = d.private_segment;
@@ -408,6 +412,9 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     kern.group_id_x = (d.rsrc2 >> 7) & 1;
     kern.group_id_y = (d.rsrc2 >> 8) & 1;
     kern.group_id_z = (d.rsrc2 >> 9) & 1;
+    kern.group_info = (d.rsrc2 >> 10) & 1;
+    kern.private_wave_offset = d.rsrc2 & 1;
+    kern.mode = ((d.rsrc1 >> 12) & 0xFF) | ((d.rsrc1 >> 21) & 1) << 8 | ((d.rsrc1 >> 23) & 1) << 9;
     // The user SGPRs the features above take, or the count the descriptor
     // gives (RSRC2's USER_SGPR field) where that is more: a kernel that asks
     // for its first arguments preloaded into SGPRs (gfx942's kernarg

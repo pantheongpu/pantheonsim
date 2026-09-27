@@ -254,6 +254,13 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Smem, 0x02}, {"s_load_dwordx4", 4, 1, 2}},
       {{Enc::Smem, 0x03}, {"s_load_dwordx8", 8, 1, 2}},
       {{Enc::Smem, 0x04}, {"s_load_dwordx16", 16, 1, 2}},
+      // The same through a buffer resource (V#), four registers: what a
+      // kernel reads its constants through when they are in a buffer.
+      {{Enc::Smem, 0x08}, {"s_buffer_load_dword", 1, 1, 4}},
+      {{Enc::Smem, 0x09}, {"s_buffer_load_dwordx2", 2, 1, 4}},
+      {{Enc::Smem, 0x0a}, {"s_buffer_load_dwordx4", 4, 1, 4}},
+      {{Enc::Smem, 0x0b}, {"s_buffer_load_dwordx8", 8, 1, 4}},
+      {{Enc::Smem, 0x0c}, {"s_buffer_load_dwordx16", 16, 1, 4}},
       // A counter the wave reads: no address, and nothing but the pair it
       // writes.
       {{Enc::Smem, 0x24}, {"s_memtime", 2, 0}},
@@ -322,6 +329,12 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x47}, {"v_rndne_f16_e32", 1, 1}},
       // Two registers trade places, lane by lane.
       {{Enc::Vop1, 0x51}, {"v_swap_b32", 1, 1}},
+      // gfx950's: a pseudo-random step, two swaps across halves of the wave
+      // (each writes both registers), and a bfloat16 widened to a float.
+      {{Enc::Vop1, 0x58}, {"v_prng_b32_e32", 1, 1}},
+      {{Enc::Vop1, 0x59}, {"v_permlane16_swap_b32_e32", 1, 1}},
+      {{Enc::Vop1, 0x5a}, {"v_permlane32_swap_b32_e32", 1, 1}},
+      {{Enc::Vop1, 0x5b}, {"v_cvt_f32_bf16_e32", 1, 1}},
       // One accumulation register copied to another.
       {{Enc::Vop1, 0x52}, {"v_accvgpr_mov_b32", 1, 1}},
       {{Enc::Vop1, 0x15}, {"v_cvt_u32_f64_e32", 1, 1, 2}},
@@ -436,6 +449,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop2, 0x036}, {"v_subrev_u32_e32", 1, 2}},
       // The dot products, which add into their destination as fmac does.
       {{Enc::Vop2, 0x037}, {"v_dot2c_f32_f16_e32", 1, 2}},
+      {{Enc::Vop2, 0x016}, {"v_dot2c_f32_bf16_e32", 1, 2}},
       {{Enc::Vop2, 0x039}, {"v_dot4c_i32_i8_e32", 1, 2}},
       {{Enc::Vop2, 0x03b}, {"v_fmac_f32_e32", 1, 2}},
       // The float comparisons share their opcodes with the long forms above.
@@ -585,6 +599,13 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x28d}, {"v_mbcnt_hi_u32_b32", 1, 2}},
       {{Enc::Vop3, 0x28f}, {"v_lshlrev_b64", 2, 2, 1, 2}},
       {{Enc::Vop3, 0x296}, {"v_cvt_pkrtz_f16_f32", 1, 2}},
+      // gfx950's: any function of three inputs, bit by bit, by its truth
+      // table; and two floats to a packed pair of halves or bfloat16s,
+      // rounded to nearest.
+      {{Enc::Vop3, 0x233}, {"v_bitop3_b16", 1, 3}},
+      {{Enc::Vop3, 0x234}, {"v_bitop3_b32", 1, 3}},
+      {{Enc::Vop3, 0x267}, {"v_cvt_pk_f16_f32", 1, 2}},
+      {{Enc::Vop3, 0x268}, {"v_cvt_pk_bf16_f32", 1, 2}},
       {{Enc::Vop3, 0x290}, {"v_lshrrev_b64", 2, 2, 1, 2}},
       {{Enc::Vop3, 0x291}, {"v_ashrrev_i64", 2, 2, 1, 2}},
       {{Enc::Vop3, 0x2a0}, {"v_pack_b32_f16", 1, 2}},
@@ -803,7 +824,13 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x6e}, {"v_mfma_f64_16x16x4_f64", 8, 3, 2, 2, 8}},
       // Halves, bfloat16s and bytes into floats and ints: the forms the half,
       // bfloat16 and int8 GEMMs use.
+      {{Enc::Vop3p, 0x48}, {"v_mfma_f32_32x32x4_2b_f16", 32, 3, 2, 2, 32}},
       {{Enc::Vop3p, 0x49}, {"v_mfma_f32_16x16x4_4b_f16", 16, 3, 2, 2, 16}},
+      // Bytes four to a lane, in blocks side by side.
+      {{Enc::Vop3p, 0x50}, {"v_mfma_i32_32x32x4_2b_i8", 32, 3, 1, 1, 32}},
+      {{Enc::Vop3p, 0x51}, {"v_mfma_i32_16x16x4_4b_i8", 16, 3, 1, 1, 16}},
+      {{Enc::Vop3p, 0x52}, {"v_mfma_i32_4x4x4_16b_i8", 4, 3, 1, 1, 4}},
+      {{Enc::Vop3p, 0x5d}, {"v_mfma_f32_32x32x4_2b_bf16", 32, 3, 2, 2, 32}},
       {{Enc::Vop3p, 0x4a}, {"v_mfma_f32_4x4x4_16b_f16", 4, 3, 2, 2, 4}},
       {{Enc::Vop3p, 0x4c}, {"v_mfma_f32_32x32x8_f16", 16, 3, 2, 2, 16}},
       {{Enc::Vop3p, 0x56}, {"v_mfma_i32_32x32x16_i8", 16, 3, 2, 2, 16}},
@@ -812,6 +839,20 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x5f}, {"v_mfma_f32_4x4x4_16b_bf16", 4, 3, 2, 2, 4}},
       {{Enc::Vop3p, 0x60}, {"v_mfma_f32_32x32x8_bf16", 16, 3, 2, 2, 16}},
       {{Enc::Vop3p, 0x61}, {"v_mfma_f32_16x16x16_bf16", 4, 3, 2, 2, 4}},
+      // gfx950's: the same with K doubled, eight halves or bfloat16s a lane.
+      {{Enc::Vop3p, 0x54}, {"v_mfma_f32_16x16x32_f16", 4, 3, 4, 4, 4}},
+      {{Enc::Vop3p, 0x36}, {"v_mfma_i32_16x16x64_i8", 4, 3, 4, 4, 4}},
+      {{Enc::Vop3p, 0x38}, {"v_mfma_i32_32x32x32_i8", 16, 3, 4, 4, 16}},
+      // And the small floats, each source of any of five formats its CBSZ or
+      // BLGP names; the widths here are fp8's, a source of fewer bits takes
+      // fewer registers.
+      {{Enc::Vop3p, 0x2d}, {"v_mfma_f32_16x16x128_f8f6f4", 4, 3, 8, 8, 4}},
+      {{Enc::Vop3p, 0x2e}, {"v_mfma_f32_32x32x64_f8f6f4", 16, 3, 8, 8, 16}},
+      // Two pairs of bfloat16s multiplied and added into a float (gfx950).
+      {{Enc::Vop3p, 0x1a}, {"v_dot2_f32_bf16", 1, 3}},
+      {{Enc::Vop3p, 0x55}, {"v_mfma_f32_32x32x16_f16", 16, 3, 4, 4, 16}},
+      {{Enc::Vop3p, 0x35}, {"v_mfma_f32_16x16x32_bf16", 4, 3, 4, 4, 4}},
+      {{Enc::Vop3p, 0x37}, {"v_mfma_f32_32x32x16_bf16", 16, 3, 4, 4, 16}},
       // 8-bit floats, A's and B's each fp8 or bf8, eight to a register pair.
       {{Enc::Vop3p, 0x70}, {"v_mfma_f32_16x16x32_bf8_bf8", 4, 3, 2, 2, 4}},
       {{Enc::Vop3p, 0x71}, {"v_mfma_f32_16x16x32_bf8_fp8", 4, 3, 2, 2, 4}},
@@ -825,6 +866,38 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // run: what a card rounds their inputs to is not modelled.
       {{Enc::Vop3p, 0x3e}, {"v_mfma_f32_16x16x8_xf32", 4, 3, 2, 2, 4}},
       {{Enc::Vop3p, 0x3f}, {"v_mfma_f32_32x32x4_xf32", 16, 3, 2, 2, 16}},
+      // The sparse matrix instructions: A 2:4 sparse along K, its non-zero
+      // values packed; B dense; the destination the accumulator too; the
+      // third source the register of indices that says where A's values go.
+      {{Enc::Vop3p, 0x62}, {"v_smfmac_f32_16x16x32_f16", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x64}, {"v_smfmac_f32_32x32x16_f16", 16, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x66}, {"v_smfmac_f32_16x16x32_bf16", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x68}, {"v_smfmac_f32_32x32x16_bf16", 16, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x6a}, {"v_smfmac_i32_16x16x64_i8", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x6c}, {"v_smfmac_i32_32x32x32_i8", 16, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x78}, {"v_smfmac_f32_16x16x64_bf8_bf8", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x79}, {"v_smfmac_f32_16x16x64_bf8_fp8", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x7a}, {"v_smfmac_f32_16x16x64_fp8_bf8", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x7b}, {"v_smfmac_f32_16x16x64_fp8_fp8", 4, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x7c}, {"v_smfmac_f32_32x32x32_bf8_bf8", 16, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x7d}, {"v_smfmac_f32_32x32x32_bf8_fp8", 16, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x7e}, {"v_smfmac_f32_32x32x32_fp8_bf8", 16, 3, 2, 4, 1}},
+      {{Enc::Vop3p, 0x7f}, {"v_smfmac_f32_32x32x32_fp8_fp8", 16, 3, 2, 4, 1}},
+      // gfx950's, with K doubled.
+      {{Enc::Vop3p, 0x5a}, {"v_smfmac_f32_16x16x64_f16", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x5b}, {"v_smfmac_f32_32x32x32_f16", 16, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x39}, {"v_smfmac_f32_16x16x64_bf16", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x46}, {"v_smfmac_f32_32x32x32_bf16", 16, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x3a}, {"v_smfmac_i32_16x16x128_i8", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x47}, {"v_smfmac_i32_32x32x64_i8", 16, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x3b}, {"v_smfmac_f32_16x16x128_bf8_bf8", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x3c}, {"v_smfmac_f32_16x16x128_bf8_fp8", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x3d}, {"v_smfmac_f32_16x16x128_fp8_bf8", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x43}, {"v_smfmac_f32_16x16x128_fp8_fp8", 4, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x4b}, {"v_smfmac_f32_32x32x64_bf8_bf8", 16, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x4e}, {"v_smfmac_f32_32x32x64_bf8_fp8", 16, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x4f}, {"v_smfmac_f32_32x32x64_fp8_bf8", 16, 3, 4, 8, 1}},
+      {{Enc::Vop3p, 0x53}, {"v_smfmac_f32_32x32x64_fp8_fp8", 16, 3, 4, 8, 1}},
       {{Enc::Vop3p, 0x58}, {"v_accvgpr_read_b32", 1, 1}},
       {{Enc::Vop3p, 0x59}, {"v_accvgpr_write_b32", 1, 1}},
     };
@@ -847,7 +920,9 @@ uint32_t word(const std::vector<uint8_t>& code, uint64_t at) {
 Operand operand(uint32_t code, uint32_t width) {
   Operand o;
   o.width = width;
-  if (code <= 101) {
+  if (code <= 103) {
+    // 102 and 103 are FLAT_SCRATCH, which a gfx90a kernel sets up itself for
+    // its flat scratch accesses: kept as the two registers past s101.
     o.kind = OperandKind::Sgpr;
     o.index = code;
   } else if (code == 106) {
@@ -911,8 +986,62 @@ Operand vgpr(uint32_t index, uint32_t width = 1) {
   return o;
 }
 
+// gfx90a's: gfx942's, with what gfx90a numbers otherwise. Found by asking
+// LLVM's disassembler for every opcode of each encoding on both targets.
+const std::map<std::pair<Enc, uint32_t>, Shape>& table_gfx90a() {
+  static const std::map<std::pair<Enc, uint32_t>, Shape> t = [] {
+    std::map<std::pair<Enc, uint32_t>, Shape> m = table();
+    const auto set = [&](Enc e, uint32_t op, Shape sh) { m[{e, op}] = sh; };
+    // The matrix instructions gfx940 added or renumbered are not gfx90a's.
+    for (uint32_t op : {0x2d, 0x2e, 0x35, 0x36, 0x37, 0x38, 0x3e, 0x3f, 0x56, 0x57, 0x5d, 0x5e, 0x5f, 0x60, 0x61,
+                        0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77})
+      m.erase({Enc::Vop3p, op});
+    // Nor are the sparse ones, some of whose numbers gfx90a gives other
+    // instructions (set below).
+    for (auto it = m.begin(); it != m.end();)
+      it = it->first.first == Enc::Vop3p && std::string(it->second.name).rfind("v_smfmac", 0) == 0 ? m.erase(it)
+                                                                                                 : std::next(it);
+    // Its int8 forms: K of 8 and 16, four bytes a lane.
+    set(Enc::Vop3p, 0x54, {"v_mfma_i32_32x32x8_i8", 16, 3, 1, 1, 16});
+    set(Enc::Vop3p, 0x55, {"v_mfma_i32_16x16x16_i8", 4, 3, 1, 1, 4});
+    // Its bfloat16 forms of four a lane ("_1k"), which gfx940 kept and
+    // renumbered; and the older ones of two a lane, which gfx940 dropped.
+    set(Enc::Vop3p, 0x63, {"v_mfma_f32_32x32x4_2b_bf16", 32, 3, 2, 2, 32});
+    set(Enc::Vop3p, 0x64, {"v_mfma_f32_16x16x4_4b_bf16", 16, 3, 2, 2, 16});
+    set(Enc::Vop3p, 0x65, {"v_mfma_f32_4x4x4_16b_bf16", 4, 3, 2, 2, 4});
+    set(Enc::Vop3p, 0x66, {"v_mfma_f32_32x32x8_bf16", 16, 3, 2, 2, 16});
+    set(Enc::Vop3p, 0x67, {"v_mfma_f32_16x16x16_bf16", 4, 3, 2, 2, 4});
+    set(Enc::Vop3p, 0x68, {"v_mfma_f32_32x32x2bf16", 32, 3, 1, 1, 32});
+    set(Enc::Vop3p, 0x69, {"v_mfma_f32_16x16x2bf16", 16, 3, 1, 1, 16});
+    set(Enc::Vop3p, 0x6b, {"v_mfma_f32_4x4x2bf16", 4, 3, 1, 1, 4});
+    set(Enc::Vop3p, 0x6c, {"v_mfma_f32_32x32x4bf16", 16, 3, 1, 1, 16});
+    set(Enc::Vop3p, 0x6d, {"v_mfma_f32_16x16x8bf16", 4, 3, 1, 1, 4});
+    // The multiply-adds whose product is rounded before the add, which
+    // gfx940 dropped: MIOpen's hand-written convolutions use them.
+    set(Enc::Vop3, 0x1c0, {"v_mad_legacy_f32", 1, 3});
+    set(Enc::Vop3, 0x1c1, {"v_mad_f32", 1, 3});
+    set(Enc::Vop2, 0x016, {"v_mac_f32_e32", 1, 2});
+    Shape mac_e64{"v_mac_f32_e64", 1, 2};
+    mac_e64.promoted = true;
+    set(Enc::Vop3, 0x116, mac_e64);
+    set(Enc::Vop2, 0x017, {"v_madmk_f32", 1, 2});
+    // The first-level cache's write-back and invalidate.
+    set(Enc::Mubuf, 0x29, {"buffer_invl2", 0, 0});
+    set(Enc::Mubuf, 0x3e, {"buffer_wbinvl1", 0, 0});
+    set(Enc::Mubuf, 0x3f, {"buffer_wbinvl1_vol", 0, 0});
+    return m;
+  }();
+  return t;
+}
+
+// Whether the instruction being decoded is the product half of a scaled one.
+thread_local bool g_scaled_product = false;
+
+// The table decode() looks in: the target's, for the instruction being decoded.
+thread_local const std::map<std::pair<Enc, uint32_t>, Shape>* g_table = nullptr;
+
 const Shape& shape(Enc e, uint32_t opcode) {
-  const auto& t = table();
+  const auto& t = g_table ? *g_table : table();
   const auto it = t.find({e, opcode});
   if (it == t.end())
     throw Error::make(Err::Unsupported, enc_name(e), " opcode 0x", [&] {
@@ -1077,7 +1206,22 @@ std::string dpp_control_text(uint32_t ctrl) {
   throw Error::make(Err::Unsupported, "a DPP control this does not decode yet (", ctrl, ")");
 }
 
-Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
+namespace {
+Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc);
+}  // namespace
+
+Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target) {
+  struct Using {
+    explicit Using(Target t) { g_table = t == Target::Gfx90a ? &table_gfx90a() : &table(); }
+    ~Using() { g_table = nullptr; }
+  } using_table(target);
+  Inst in = decode_one(code, at, pc);
+  in.arch = target;
+  return in;
+}
+
+namespace {
+Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
   const uint32_t w0 = word(code, at);
   Inst in;
   in.pc = pc;
@@ -1198,6 +1342,29 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
       in.src.push_back(vgpr((w0 >> 9) & 0xFF, s.src_width(1)));
     }
+  } else if ((w0 >> 23) == 0x1a7 && ((w0 >> 16) & 0x7F) == 0x2c) {
+    // gfx950's scaled matrix instructions: a load-scale prefix -- A's scale in
+    // SRC0, B's in SRC1, {OP_SEL_HI, OP_SEL} choosing a byte of each -- then
+    // the f8f6f4 product as a VOP3P of its own, ABID bit 0 set. One
+    // instruction of 16 bytes.
+    const uint32_t w1 = word(code, at + 4);
+    struct Inner {
+      Inner() { g_scaled_product = true; }
+      ~Inner() { g_scaled_product = false; }
+    } inner;
+    Inst product = decode_one(code, at + 8, pc);
+    if (product.name.find("f8f6f4") == std::string::npos)
+      throw Error::make(Err::Unsupported, "a load-scale prefix before ", product.name, ", which takes no scales");
+    product.name = "v_mfma_scale_" + product.name.substr(std::string("v_mfma_").size());
+    product.src.push_back(take(w1 & 0x1FF, 1));
+    product.src.push_back(take((w1 >> 9) & 0x1FF, 1));
+    const uint32_t op_sel = (w0 >> 11) & 3, op_sel_hi = (w1 >> 27) & 3;
+    product.scale_sel = static_cast<uint8_t>(((op_sel & 1) | (op_sel_hi & 1) << 1) |
+                                             ((op_sel >> 1) | (op_sel_hi >> 1) << 1) << 2);
+    product.scaled = true;
+    product.pc = pc;
+    product.size = 16;
+    return product;
   } else if ((w0 >> 23) == 0x1a7) {   // VOP3P: the packed forms
     in.enc = Enc::Vop3p;
     in.opcode = (w0 >> 16) & 0x7F;
@@ -1210,17 +1377,53 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     // their own way: which of the accumulation registers the result and the
     // addend live in, and three ways of broadcasting parts of the sources,
     // which are refused rather than guessed at.
+    if (in.name.rfind("v_smfmac", 0) == 0) {
+      // CBSZ and ABID only choose the set of indices; ACC_CD puts the
+      // destination (and so the accumulator) in the accumulation registers,
+      // and the index register is always an ordinary one.
+      in.clamp = false;
+      const uint32_t cbsz = (w0 >> 8) & 0x7, abid = (w0 >> 11) & 0xF, acc_cd = (w0 >> 15) & 1;
+      const uint32_t acc = (w1 >> 27) & 0x3, blgp = (w1 >> 29) & 0x7;
+      if (blgp) throw Error::make(Err::Unsupported, in.name, " with BLGP ", blgp, ", which it does not have");
+      in.cbsz = static_cast<uint8_t>(cbsz);
+      in.abid = static_cast<uint8_t>(abid);
+      in.dst.push_back(vgpr(w0 & 0xFF, s.dst_width));
+      if (acc_cd) in.dst[0].kind = OperandKind::Agpr;
+      for (uint32_t k = 0; k < 3; ++k) {
+        Operand o = take((w1 >> (9 * k)) & 0x1FF, s.src_width(k));
+        if (k < 2 && ((acc >> k) & 1) && o.kind == OperandKind::Vgpr) o.kind = OperandKind::Agpr;
+        in.src.push_back(o);
+      }
+      return in;
+    }
     if (in.name.rfind("v_mfma", 0) == 0) {
       in.clamp = false;
       const uint32_t cbsz = (w0 >> 8) & 0x7, abid = (w0 >> 11) & 0xF, acc_cd = (w0 >> 15) & 1;
       const uint32_t acc = (w1 >> 27) & 0x3, blgp = (w1 >> 29) & 0x7;
-      if (cbsz || abid || blgp)
+      const bool formats = in.name.find("f8f6f4") != std::string::npos;
+      // ABID bit 0 marks the product half of a scaled instruction, and is
+      // only that there.
+      if (formats && (cbsz > 4 || blgp > 4 || abid != (g_scaled_product ? 1u : 0u)))
+        throw Error::make(Err::Unsupported, in.name, " with source formats ", cbsz, " and ", blgp,
+                          ", which are not ones the instruction has");
+      if (!formats && (cbsz || abid || blgp))
         throw Error::make(Err::Unsupported, in.name, " broadcasts part of a source (cbsz ", cbsz, ", abid ", abid,
                           ", blgp ", blgp, "), which this does not model");
+      if (formats) {
+        in.cbsz = static_cast<uint8_t>(cbsz);
+        in.blgp = static_cast<uint8_t>(blgp);
+      }
+      // Registers a source of 32 small floats a lane takes: 8 for 8-bit ones,
+      // 6 for 6-bit, 4 for 4-bit.
+      const auto width = [&](uint32_t k) -> uint32_t {
+        if (!formats || k > 1) return s.src_width(k);
+        const uint32_t f = k == 0 ? cbsz : blgp;
+        return f <= 1 ? 8 : f <= 3 ? 6 : 4;
+      };
       in.dst.push_back(vgpr(w0 & 0xFF, s.dst_width));
       if (acc_cd) in.dst[0].kind = OperandKind::Agpr;
       for (uint32_t k = 0; k < s.srcs; ++k) {
-        Operand o = take((w1 >> (9 * k)) & 0x1FF, s.src_width(k));
+        Operand o = take((w1 >> (9 * k)) & 0x1FF, width(k));
         if (k < 2 && ((acc >> k) & 1) && o.kind == OperandKind::Vgpr) o.kind = OperandKind::Agpr;
         if (k == 2 && acc_cd && o.kind == OperandKind::Vgpr) o.kind = OperandKind::Agpr;
         in.src.push_back(o);
@@ -1285,6 +1488,12 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       o.neg = (neg >> k) & 1;
       o.abs = (abs >> k) & 1;
       in.src.push_back(o);
+    }
+    // v_bitop3's truth table is in those modifier bits instead.
+    if (in.name.rfind("v_bitop3_", 0) == 0) {
+      in.bitop3 = static_cast<uint8_t>(neg | abs << 3 | in.omod << 6);
+      in.omod = 0;
+      for (Operand& o : in.src) o.neg = o.abs = false;
     }
 
   } else if ((w0 >> 26) == 0x36) {    // DS
@@ -1423,7 +1632,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
     // v_fmamk_f32 carries a constant of its own, which sits between the two
     // sources rather than taking one of their places.
-    if (in.name == "v_fmamk_f32") {
+    if (in.name == "v_fmamk_f32" || in.name == "v_madmk_f32") {
       Operand k;
       k.kind = OperandKind::Literal;
       in.src.push_back(k);
@@ -1457,6 +1666,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
   }
   return in;
 }
+}  // namespace
 
 std::string operand_text(const Operand& o) {
   char b[64];
@@ -1469,7 +1679,10 @@ std::string operand_text(const Operand& o) {
     return std::string(b);
   };
   switch (o.kind) {
-    case OperandKind::Sgpr: return wrap(range("s"));
+    case OperandKind::Sgpr:
+      if (o.index == 102) return wrap(o.width >= 2 ? "flat_scratch" : "flat_scratch_lo");
+      if (o.index == 103) return wrap("flat_scratch_hi");
+      return wrap(range("s"));
     case OperandKind::Vgpr: return wrap(o.sext ? "sext(" + range("v") + ")" : range("v"));
     case OperandKind::Agpr: return wrap(range("a"));
     case OperandKind::Vcc: return wrap(o.width >= 2 ? "vcc" : "vcc_lo");
@@ -1522,8 +1735,34 @@ std::string hwreg_text(uint32_t simm) {
   return out + ")";
 }
 
+// gfx90a's names for the matrix instructions gfx940 renamed: the same
+// instruction, as LLVM's disassembler prints it for gfx90a.
+std::string gfx90a_name(const std::string& name) {
+  static const std::map<std::string, std::string> renamed = {
+      {"v_mfma_f32_32x32x1_2b_f32", "v_mfma_f32_32x32x1f32"}, {"v_mfma_f32_16x16x1_4b_f32", "v_mfma_f32_16x16x1f32"},
+      {"v_mfma_f32_4x4x1_16b_f32", "v_mfma_f32_4x4x1f32"},    {"v_mfma_f32_32x32x2_f32", "v_mfma_f32_32x32x2f32"},
+      {"v_mfma_f32_16x16x4_f32", "v_mfma_f32_16x16x4f32"},    {"v_mfma_f32_32x32x4_2b_f16", "v_mfma_f32_32x32x4f16"},
+      {"v_mfma_f32_16x16x4_4b_f16", "v_mfma_f32_16x16x4f16"}, {"v_mfma_f32_4x4x4_16b_f16", "v_mfma_f32_4x4x4f16"},
+      {"v_mfma_f32_32x32x8_f16", "v_mfma_f32_32x32x8f16"},    {"v_mfma_f32_16x16x16_f16", "v_mfma_f32_16x16x16f16"},
+      {"v_mfma_i32_32x32x4_2b_i8", "v_mfma_i32_32x32x4i8"},   {"v_mfma_i32_16x16x4_4b_i8", "v_mfma_i32_16x16x4i8"},
+      {"v_mfma_i32_4x4x4_16b_i8", "v_mfma_i32_4x4x4i8"},      {"v_mfma_i32_32x32x8_i8", "v_mfma_i32_32x32x8i8"},
+      {"v_mfma_i32_16x16x16_i8", "v_mfma_i32_16x16x16i8"},    {"v_mfma_f64_16x16x4_f64", "v_mfma_f64_16x16x4f64"},
+      {"v_mfma_f64_4x4x4_4b_f64", "v_mfma_f64_4x4x4f64"},
+      {"v_mfma_f32_32x32x4_2b_bf16", "v_mfma_f32_32x32x4bf16_1k"},
+      {"v_mfma_f32_16x16x4_4b_bf16", "v_mfma_f32_16x16x4bf16_1k"},
+      {"v_mfma_f32_4x4x4_16b_bf16", "v_mfma_f32_4x4x4bf16_1k"},
+      {"v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x8bf16_1k"},
+      {"v_mfma_f32_16x16x16_bf16", "v_mfma_f32_16x16x16bf16_1k"},
+  };
+  const auto it = renamed.find(name);
+  return it == renamed.end() ? name : it->second;
+}
+
 std::string to_text(const Inst& i) {
-  std::string s = i.name;
+  std::string s = i.arch == Target::Gfx90a ? gfx90a_name(i.name) : i.name;
+  // gfx90a prints its L2 write-back and invalidate bare, whatever scope bits
+  // they carry.
+  if (i.arch == Target::Gfx90a && (i.name == "buffer_wbl2" || i.name == "buffer_invl2")) return s;
   std::string sep = " ";
   if (i.name == "s_getreg_b32") return s + " " + operand_text(i.dst[0]) + ", " + hwreg_text(static_cast<uint32_t>(i.simm));
   if (i.name == "s_setreg_imm32_b32") {
@@ -1580,6 +1819,19 @@ std::string to_text(const Inst& i) {
     std::snprintf(m, sizeof m, " row_mask:0x%x bank_mask:0x%x", i.row_mask, i.bank_mask);
     s += " " + dpp_control_text(i.dpp_ctrl) + m;
     if (i.bound_ctrl) s += " bound_ctrl:1";
+  }
+  if (i.scaled) {
+    const uint32_t a = i.scale_sel & 3, b = i.scale_sel >> 2;
+    if ((a & 1) || (b & 1)) s += " op_sel:[" + std::to_string(a & 1) + "," + std::to_string(b & 1) + ",0]";
+    s += " op_sel_hi:[" + std::to_string(a >> 1) + "," + std::to_string(b >> 1) + ",0]";
+  }
+  if (i.cbsz) s += " cbsz:" + std::to_string(i.cbsz);
+  if (i.abid) s += " abid:" + std::to_string(i.abid);
+  if (i.blgp) s += " blgp:" + std::to_string(i.blgp);
+  if (i.bitop3) {
+    char t[24];
+    std::snprintf(t, sizeof t, " bitop3:0x%x", i.bitop3);
+    s += t;
   }
   if (i.enc == Enc::Vop3 && i.op_sel) {
     // A source's bit each, then the destination's (bit 3); the stochastic
@@ -1656,9 +1908,9 @@ std::string to_text(const Inst& i) {
       std::snprintf(b, sizeof b, " offset:%d", i.offset);
       s += b;
     }
-    if (i.cache & 1) s += " sc0";
-    if (i.cache & 2) s += " nt";
-    if (i.cache & 4) s += " sc1";
+    if (i.cache & 1) s += i.arch == Target::Gfx90a ? " glc" : " sc0";
+    if (i.cache & 2) s += i.arch == Target::Gfx90a ? " slc" : " nt";
+    if (i.cache & 4) s += i.arch == Target::Gfx90a ? " scc" : " sc1";
   } else if (i.enc == Enc::Mubuf) {
     if (i.idxen) s += " idxen";
     if (i.offen) s += " offen";
@@ -1666,9 +1918,9 @@ std::string to_text(const Inst& i) {
       std::snprintf(b, sizeof b, " offset:%d", i.offset);
       s += b;
     }
-    if (i.cache & 1) s += " sc0";
-    if (i.cache & 2) s += " nt";
-    if (i.cache & 4) s += " sc1";
+    if (i.cache & 1) s += i.arch == Target::Gfx90a ? " glc" : " sc0";
+    if (i.cache & 2) s += i.arch == Target::Gfx90a ? " slc" : " nt";
+    if (i.cache & 4) s += i.arch == Target::Gfx90a ? " scc" : " sc1";
   } else if (i.name == "s_sendmsg") {
     const uint32_t msg = static_cast<uint32_t>(i.simm) & 0xF;
     if (msg != 1 || (static_cast<uint32_t>(i.simm) & 0xFFF0))

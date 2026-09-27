@@ -122,6 +122,9 @@ expect "each device attribute is the property it names" "30 of 30 attributes agr
   "$(grep -o '^[0-9]* of [0-9]* attributes agree.*' <<< "$out")"
 expect "an attribute of a device that is not there is refused" "a device that is not there: hipErrorInvalidDevice" \
   "$(grep -o '^a device that is not there.*' <<< "$out")"
+expect "the last error is kept until it is read, past a call that succeeds" \
+  "the last error outlives a call that succeeds: hipErrorInvalidDevice, hipErrorInvalidDevice, then hipSuccess" \
+  "$(grep -o '^the last error outlives.*' <<< "$out")"
 expect "a kernel reads and writes a peer's memory once peer access is enabled" \
   "a kernel on device 0 read and wrote device 1's memory right for 256 of 256 elements" \
   "$(grep -o '^a kernel on device 0.*' <<< "$out")"
@@ -141,9 +144,82 @@ expect "every float narrows to the fp8 and bf8 HIP's header gives, every way" "1
 expect "every fp8 and bf8 widens to the float HIP's header gives" "4 of 4 ways right" \
   "$(grep -c '^[bf][fp]8 to floats.*: 0 of 256 wrong$' <<< "$out") of 4 ways right"
 
+# gfx950's (MI350X), which are the OCP formats: E4M3 with a negative zero and
+# no infinity, E5M2 with both. The same instructions, meaning these.
+out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/fp8.gfx950" 2>&1)
+status=$?
+expect "gfx950's 8-bit float program runs to the end" "0" "$status"
+expect "every float narrows to the OCP fp8 and bf8 HIP's header gives, every way" "12 of 12 ways right" \
+  "$(grep -c '^floats to .*: 0 of 4096 wrong$' <<< "$out") of 12 ways right"
+expect "every OCP fp8 and bf8 widens to the float HIP's header gives" "4 of 4 ways right" \
+  "$(grep -c '^[bf][fp]8 to floats.*: 0 of 256 wrong$' <<< "$out") of 4 ways right"
+
+# gfx950's block-scaled matrix instructions (fp8, bf8, fp6, bf6 and fp4, each
+# lane's scale byte chosen), v_prng_b32 and v_permlane32_swap_b32, against what
+# the CDNA4 ISA guide says they compute (hipcc/gfx950.cpp).
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/gfx950.gfx950" 2>&1)
+status=$?
+expect "the gfx950 program runs to the end" "0" "$status"
+expect "each block-scaled product, of every format pairing, is what the ISA says" "6 of 6" \
+  "$(grep -c '^[0-9x]* formats .*: 0 of [0-9]* wrong$' <<< "$out") of 6"
+expect "v_prng_b32 steps the ISA's LFSR" "v_prng_b32: 0 of 64 wrong" "$(grep -o '^v_prng_b32:.*' <<< "$out")"
+expect "v_permlane32_swap_b32 trades the halves of two registers" "v_permlane32_swap_b32: 0 of 128 wrong" \
+  "$(grep -o '^v_permlane32_swap_b32:.*' <<< "$out")"
+
+# The sparse matrix instructions (v_smfmac_*): A 2:4 sparse, its indices'
+# set chosen by CBSZ and ABID, against what the CDNA3 and CDNA4 ISA guides
+# say they compute (hipcc/smfmac.cpp) -- gfx942's on an MI300X, gfx950's (and
+# some of gfx942's, with the OCP 8-bit floats) on an MI350X.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/smfmac.gfx942" 2>&1)
+status=$?
+expect "the gfx942 sparse matrix program runs to the end" "0" "$status"
+expect "each gfx942 sparse product is what the ISA says" "12 of 12" \
+  "$(grep -c '^[fi]32_.* cbsz:.*: 0 of [0-9]* wrong$' <<< "$out") of 12"
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/smfmac.gfx950" 2>&1)
+status=$?
+expect "the gfx950 sparse matrix program runs to the end" "0" "$status"
+expect "each gfx950 sparse product is what the ISA says" "22 of 22" \
+  "$(grep -c '^[fi]32_.* cbsz:.*: 0 of [0-9]* wrong$' <<< "$out") of 22"
+
+# MODE's floating-point modes (hipcc/numerics.cpp): what a kernel's
+# descriptor starts it with -- denormals kept by default, single-precision
+# ones flushed when built with -fgpu-flush-denormals-to-zero -- and each
+# round mode a kernel sets, against the host's IEEE arithmetic.
+for b in numerics numerics.flush; do
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/$b.gfx942" 2>&1)
+  status=$?
+  expect "the $b program runs to the end" "0" "$status"
+  expect "every $b check holds (MODE, denormals, the four round modes)" "23 of 23" \
+    "$(grep -c '^ok ' <<< "$out") of 23"
+done
+
+# Streams that run at once, as a card's do (hipcc/streams.cpp). Each waiting
+# kernel gives up after a bounded time, so a runtime that ran the streams one
+# after another fails these rather than hanging.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/streams.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the streams program runs to the end" "0" "$status"
+for line in \
+  "two kernels on two streams run at once 1" \
+  "a stream is busy while its kernel waits, and done after 1" \
+  "a stream waits for another's event 1" \
+  "the null stream waits for the blocking streams, not a non-blocking one 1" \
+  "a host function runs in stream order 1" \
+  "an asynchronous copy takes its bytes when it is called 1" \
+  "a kernel's fault is told at the synchronization after it 1"; do
+  expect "$line" "$line" "$(grep -Fo "$line" <<< "$out")"
+done
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)
 expect "a device of another target is refused by name" "yes" \
   "$(grep -q 'carries device code for gfx942, and this device is gfx950' <<< "$out" && echo yes || echo no)"
+# The texture API on a GPU with no texture units: what ROCm's HIP answers,
+# line for line (the same file run_hip_on_hsa.sh holds ROCm's HIP to).
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/textures.gfx942" 2>&1)
+expect "the texture API answers as ROCm's HIP does on a GPU without texture units" "same" \
+  "$(diff -q <(echo "$out") "$(dirname "$exe")/rocm/textures.expected" >/dev/null && echo same ||
+     diff <(echo "$out") "$(dirname "$exe")/rocm/textures.expected" | head -4 | tr '\n' ' ')"
 exit $fail

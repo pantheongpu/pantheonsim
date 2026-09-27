@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 ORDER = ['hip_4.2', 'hip_4.3', 'hip_4.4', 'hip_4.5', 'hip_5.0', 'hip_5.1', 'hip_5.2', 'hip_5.3', 'hip_5.5',
-         'hip_5.6', 'hip_6.0', 'hip_6.1', 'hip_6.2', 'hip_6.4', 'hip_6.5']
+         'hip_5.6', 'hip_6.0', 'hip_6.1', 'hip_6.2', 'hip_6.4', 'hip_6.5', 'hip_7.1', 'hip_7.2']
 
 HEADER = '''/* The symbol versions libamdhip64 defines, as ROCm 7.1's own library defines them.
  *
@@ -36,6 +36,15 @@ PRIVATE = '''VGPU_PRIVATE {
   global:
     vgpu_hip_profiler_attach;
     vgpu_hip_profiler_device;
+};'''
+
+
+# The HSA runtime's, which the same library carries (amd/src/hsa_api.cpp) and
+# build/shim/libhsa-runtime64.so.1 names: ROCm's libhsa-runtime64 puts every
+# function in ROCR_1.
+HSA = '''ROCR_1 {
+  global:
+    hsa_*;
 };'''
 
 
@@ -81,6 +90,7 @@ def main():
         loc = '  local: *;\n' if k == 'hip_4.2' else ''
         text.append(f'{k} {{\n{glob}{loc}}}' + (f' {prev};' if prev else ';'))
         prev = k
+    text.append(HSA)
     text.append(PRIVATE)
     open(dest, 'w').write('\n'.join(text) + '\n')
 

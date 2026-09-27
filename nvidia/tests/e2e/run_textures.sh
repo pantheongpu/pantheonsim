@@ -26,8 +26,8 @@ rc=$?
 sed 's/^/    /' "$log"
 fails=0
 for want in "tex1Dfetch wrong: 0" "tex2D wrong: 0" "surface wrong: 0" \
-            "linear filtering refused: yes"; do
+            "linear filtering at texel centres wrong: 0"; do
   grep -q "$want" "$log" || { echo "FAIL: expected '$want'"; fails=1; }
 done
 (( rc == 0 && fails == 0 )) || { echo "FAIL: texture test"; exit 1; }
-echo "RESULT: tex1Dfetch, tex2D over an array, surfaces, and the linear-filter refusal"
+echo "RESULT: tex1Dfetch, tex2D over an array, surfaces, and linear filtering at texel centres"

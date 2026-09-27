@@ -1,0 +1,17 @@
+image support 0, largest 1D texture 0, 2D 0x0, 3D 0x0x0, texture alignment 0
+channel descriptions: float 32/0/0/0 kind 2, uchar2 8/8/0/0 kind 1
+hipDeviceGetTexture1DLinearMaxWidth(&width, &f, 0): hipSuccess
+widest 1D linear texture 0
+hipMallocArray(&array, &f, 64, 64, 0): hipErrorNotSupported
+hipMalloc3DArray(&cube, &f, make_hipExtent(8, 8, 8), 0): hipErrorNotSupported
+hipMallocMipmappedArray(&mips, &f, make_hipExtent(8, 8, 8), 3, 0): hipErrorNotSupported
+hipArrayCreate(&array, &ad): hipErrorNotSupported
+hipCreateTextureObject(&tex, &r, &t, nullptr): hipErrorNotSupported
+hipCreateSurfaceObject(&surf, &r): hipErrorNotSupported
+hipGetChannelDesc(&got, array): hipErrorInvalidHandle
+hipMemcpy2DToArray(array, 0, 0, linear, 64, 64, 4, hipMemcpyDeviceToDevice): hipErrorInvalidHandle
+hipFreeArray(array): hipErrorInvalidValue
+hipDestroyTextureObject(0): hipSuccess
+hipDestroySurfaceObject(0): hipSuccess
+hipGetLastError(): hipErrorInvalidValue
+hipGetLastError(): hipSuccess

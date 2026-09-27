@@ -39,6 +39,7 @@ set(VGPU_PROFILES
   nvidia/a10g
   nvidia/l4
   nvidia/l40s
+  amd/mi250x
   amd/mi300x
   amd/mi325x
   amd/mi350x
@@ -166,7 +167,7 @@ add_custom_command(TARGET vgpucuda POST_BUILD
 # libamdhip64: the HIP runtime API shim. A HIP program links against it the
 # way it links against AMD's, and its kernels run on a simulated AMD GPU.
 # ---------------------------------------------------------------------------
-add_library(vgpuhip SHARED amd/src/hip_api.cpp)
+add_library(vgpuhip SHARED amd/src/hip_api.cpp amd/src/hsa_api.cpp)
 target_link_libraries(vgpuhip PRIVATE vgpu ${CMAKE_DL_LIBS})
 target_include_directories(vgpuhip PRIVATE amd/include)
 # The real runtime's identity: a HIP program records SONAME "libamdhip64.so.6"
@@ -183,7 +184,15 @@ add_custom_command(TARGET vgpuhip POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.6"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so.7"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libamdhip64.so"
-  COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7)")
+  # The HSA runtime is in the same library, so a program that loads both
+  # (as ROCm's libraries do) gets one copy of it, and one set of devices.
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so.1"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so"
+  COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7, libhsa-runtime64.so.1)")
+# The code objects a library carries for one target (amd/tools/fatbin-extract.cpp).
+add_executable(amd_fatbin_extract amd/tools/fatbin-extract.cpp)
+target_link_libraries(amd_fatbin_extract PRIVATE vgpu ${CMAKE_DL_LIBS})
+target_include_directories(amd_fatbin_extract PRIVATE amd/include)
 # How fast the CDNA interpreter runs a kernel (amd/tools/exec-bench.cpp).
 add_executable(amd_exec_bench amd/tools/exec-bench.cpp)
 target_link_libraries(amd_exec_bench PRIVATE vgpu)
@@ -592,10 +601,16 @@ vgpu_unit_test(test_exec2)
 vgpu_unit_test(test_exec3)
 # Hopper (sm_90a): the warpgroup MMA, against the ISA's own layout examples.
 vgpu_unit_test(test_hopper)
+# Blackwell (sm_100a): Tensor Memory and tcgen05, against the ISA's figures.
+vgpu_unit_test(test_blackwell)
 # The interpreter's fast paths, bit for bit against its general path.
 vgpu_unit_test(test_fastpath)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
+# The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
+vgpu_unit_test(test_barriers)
+# Dynamic parallelism at the PTX level.
+vgpu_unit_test(test_dynpar)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
@@ -759,7 +774,53 @@ set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip
 # PyTorch's ROCm build, unmodified, where a Python with it is installed
 # (VGPU_TORCH_PYTHON, or a venv under ~/.local/share/torch-rocm*).
 add_test(NAME amd_pytorch COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh)
-set_tests_properties(amd_pytorch PROPERTIES DEPENDS vgpuhip
+# Alone: it is the heaviest test there is, and the machines are shared.
+set_tests_properties(amd_pytorch PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# And on gfx90a (MI250X, one of its two dies), which numbers its matrix
+# instructions otherwise and keeps a few gfx940 dropped.
+add_test(NAME amd_pytorch_mi250x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/mi250x)
+set_tests_properties(amd_pytorch_mi250x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# And on gfx950 (MI350X), whose kernels are PyTorch's and the libraries' own
+# builds for it.
+add_test(NAME amd_pytorch_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/mi350x)
+set_tests_properties(amd_pytorch_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# hipSPARSELt's 2:4 sparse GEMMs, from the same wheel: its kernels prune,
+# compress and multiply with the sparse matrix instructions, gfx942's and
+# gfx950's (whose B layout differs), checked against the host's product.
+add_test(NAME amd_hipsparselt COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipsparselt.sh amd/mi300x)
+set_tests_properties(amd_hipsparselt PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+add_test(NAME amd_hipsparselt_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipsparselt.sh amd/mi350x)
+set_tests_properties(amd_hipsparselt_mi350x PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# torch.compile's Triton kernels, and one written by hand, compiled and loaded
+# at run time.
+add_test(NAME amd_pytorch_compile COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 3 1)
+set_tests_properties(amd_pytorch_compile PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# Composable Kernel's GEMMs, which PyTorch runs when told to prefer CK.
+add_test(NAME amd_pytorch_ck COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh ck.py 3 1)
+set_tests_properties(amd_pytorch_ck PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# Two processes, as torchrun runs them: RCCL across processes, and
+# DistributedDataParallel.
+add_test(NAME amd_pytorch_distributed COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch_distributed.sh)
+set_tests_properties(amd_pytorch_distributed PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# And on two devices: RCCL's collectives and DataParallel between them.
+add_test(NAME amd_pytorch_multi_gpu COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh multi_gpu.py 9 2)
+set_tests_properties(amd_pytorch_multi_gpu PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# An HSA program: agents, pools, executables and AQL queues (amd/tests/hsa).
+add_test(NAME amd_hsa COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hsa.sh)
+set_tests_properties(amd_hsa PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# ROCm's own HIP runtime (CLR), unmodified, on the HSA runtime alone.
+add_test(NAME amd_hip_on_hsa COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_on_hsa.sh)
+set_tests_properties(amd_hip_on_hsa PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 add_test(NAME amd_hipcc COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc.sh)
 set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
@@ -1018,9 +1079,41 @@ if(TARGET vgpucupti)
 endif()
 
 # Texture and surface objects: tex1Dfetch over linear memory, tex2D over a
-# cudaArray, a surface read-modify-write, and the linear-filter refusal.
+# cudaArray, a surface read-modify-write, and linear filtering at texel centres.
 add_test(NAME e2e_textures COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_textures.sh)
 set_tests_properties(e2e_textures PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# Linear filtering in 1D, 2D and 3D, every address mode and the filtered
+# formats, compared bit for bit with results recorded on an RTX 3060.
+add_test(NAME e2e_texture_filtering COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_filtering.sh)
+set_tests_properties(e2e_texture_filtering PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# Layered (1D, 2D) and cubemap (plain and layered) textures, and layered
+# surfaces, compared bit for bit with results recorded on an RTX 3060.
+add_test(NAME e2e_texture_layers COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_layers.sh)
+set_tests_properties(e2e_texture_layers PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# Mipmapped textures: explicit level of detail and plain fetches, every
+# filter combination, biases and clamps, bit for bit with an RTX 3060.
+add_test(NAME e2e_texture_mipmaps COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_mipmaps.sh)
+set_tests_properties(e2e_texture_mipmaps PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# Texture gather (tld4): the bilinear footprint's four texels, every
+# component, bit for bit with an RTX 3060.
+add_test(NAME e2e_texture_gather COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_gather.sh)
+set_tests_properties(e2e_texture_gather PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
@@ -1198,17 +1291,62 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 900)
+  add_test(NAME e2e_tma_im2col COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_tma_im2col.sh)
+  set_tests_properties(e2e_tma_im2col PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
   add_test(NAME e2e_tensormap_replace_cute COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_tensormap_replace_cute.sh)
   set_tests_properties(e2e_tensormap_replace_cute PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 900)
   add_test(NAME e2e_cutlass_hopper COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_hopper.sh)
-  # Long enough for the five compiles to run one after another on a small runner.
+  # Long enough for the six compiles to run one after another on a small runner.
   set_tests_properties(e2e_cutlass_hopper PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    TIMEOUT 3000)
+    TIMEOUT 3600)
+endif()
+
+# CUTLASS's own GEMM tests, the cases that found interpreter bugs (see the
+# script), and a split-K style semaphore between blocks on several host threads.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_cutlass_gemm COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_gemm.sh)
+  set_tests_properties(e2e_cutlass_gemm PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 3600)
+  # CUTLASS's SM100 GEMM tests on a simulated B200: Tensor Memory, tcgen05,
+  # CTA pairs and cluster launch control.
+  add_test(NAME e2e_cutlass_sm100 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_sm100.sh)
+  set_tests_properties(e2e_cutlass_sm100 PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 5400)
+  add_test(NAME e2e_block_semaphore COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_block_semaphore.sh)
+  set_tests_properties(e2e_block_semaphore PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# Every WMMA shape and element type through mma.h.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_wmma_types COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_wmma_types.sh)
+  set_tests_properties(e2e_wmma_types PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# Dynamic parallelism: device-side launches, nesting, order, named streams.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_dynamic_parallelism COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dynamic_parallelism.sh)
+  set_tests_properties(e2e_dynamic_parallelism PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
 endif()
 
 # Distributed shared memory through cooperative_groups' cluster API.

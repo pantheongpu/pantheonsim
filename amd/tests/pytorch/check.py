@@ -51,7 +51,11 @@ check('attention', lambda d: F.scaled_dot_product_attention(q.to(d), k.to(d), vv
 
 
 torch.manual_seed(1)
-x8, w8 = (torch.randn(32, 64) * 2).to(torch.float8_e4m3fnuz), (torch.randn(48, 64) * 2).to(torch.float8_e4m3fnuz)
+# The 8-bit float the device's hardware has: gfx942's is FNUZ (no negative
+# zero, one NaN), gfx950's the OCP format every other vendor uses.
+F8 = torch.float8_e4m3fn if torch.cuda.get_device_properties(0).gcnArchName.startswith('gfx950') \
+    else torch.float8_e4m3fnuz
+x8, w8 = (torch.randn(32, 64) * 2).to(F8), (torch.randn(48, 64) * 2).to(F8)
 
 
 def fp8(d):
@@ -61,7 +65,17 @@ def fp8(d):
                             scale_b=torch.tensor(2.0, device=d), out_dtype=torch.float32)
 
 
-check('fp8 matmul', fp8)
+ARCH = torch.cuda.get_device_properties(0).gcnArchName
+if ARCH.startswith('gfx90a'):
+    # gfx90a has no 8-bit floats: PyTorch refuses the product, as on the card.
+    try:
+        fp8(GPU)
+        print("FAIL fp8 matmul: gfx90a ran it, and has no 8-bit floats", flush=True)
+    except RuntimeError as e:
+        print("ok fp8 matmul (refused on gfx90a, which has none)" if "MI300" in str(e)
+              else f"FAIL fp8 matmul: {str(e).splitlines()[0][:200]}", flush=True)
+else:
+    check('fp8 matmul', fp8)
 
 
 def train(model_fn, inputs, loss_fn, steps):

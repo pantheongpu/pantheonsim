@@ -91,12 +91,14 @@ class Device {
   MemoryManager mem_;
   telemetry::Publisher* telemetry_ = nullptr;
   uint64_t next_module_id_ = 1;
+  uint64_t next_kernel_va_ = kKernelVaBase;   // every kernel ever loaded has its own
   exec::TextureTable textures_;
   struct LoadedModule {
     uint64_t id = 0;
     std::shared_ptr<ptx::Module> mod;
     exec::SymbolTable symbols;          // .global variables -> device VAs
     std::vector<uint64_t> global_vas;   // to free on unload
+    std::vector<std::pair<uint64_t, const ptx::EntryFn*>> kernels;   // address -> kernel
   };
   std::vector<LoadedModule> modules_;
 };

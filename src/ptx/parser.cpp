@@ -768,6 +768,7 @@ class Parser {
         next();
         uint32_t v = static_cast<uint32_t>(expect_int("directive value"));
         if (d == ".minnctapersm") fn.min_ctas_per_sm = v;
+        if (d == ".maxnreg") fn.max_nreg = v;
       } else if (d == ".noreturn" || d == ".pragma") {
         next();
         while (!at_end() && !peek_punct(";") && !peek_punct("{")) next();
@@ -791,6 +792,7 @@ class Parser {
   }
 
   void parse_body(EntryFn& fn) {
+    reg_scopes_.clear();
     // Labels are scoped to the { } block that defines them (PTX ISA 4.x
     // "Statements"), and inline asm relies on it: CUTLASS's barrier waits are
     // each a block with its own LAB_WAIT and DONE, so one kernel holds many.
@@ -809,12 +811,14 @@ class Parser {
       if (peek_punct("{")) {
         next();
         scopes.push_back(next_scope++);
+        reg_scopes_.emplace_back();
         continue;
       }
       if (peek_punct("}")) {
         next();
         if (scopes.size() == 1) break;
         scopes.pop_back();
+        reg_scopes_.pop_back();
         continue;
       }
       if (t.kind == Token::Kind::Word && t.text == ".reg") {
@@ -937,7 +941,35 @@ class Parser {
   // register -- used to change the width and keep the narrow id, so a 64-bit
   // store wrote past the end of the 64-bit register file (and a value written
   // before the declaration read back as 0).
-  void declare_reg(EntryFn& fn, const std::string& nm, Type ty, size_t line) {
+  // The name a register reference resolves to: the innermost open block's
+  // own declaration if it has one, else the name itself.
+  const std::string& scoped(const std::string& name) const {
+    for (auto it = reg_scopes_.rbegin(); it != reg_scopes_.rend(); ++it) {
+      auto f = it->find(name);
+      if (f != it->end()) return f->second;
+    }
+    return name;
+  }
+
+  void declare_reg(EntryFn& fn, const std::string& source_name, Type ty, size_t line) {
+    // Registers are scoped to the { } block that declares them, like labels,
+    // and a declaration inside a block hides an outer one of the same name
+    // until the block closes. CUDA's __syncthreads_and is inline asm that
+    // declares its own %p1 and %p2 in braces; nvcc's code after the block uses
+    // its own %p2, and taking the two as one register sent CUTLASS's split-K
+    // semaphore wait round its loop without ever re-reading the semaphore.
+    // A declaration that hides nothing keeps its name, so a block-local like
+    // CUTLASS's "p" is interned exactly as before.
+    std::string nm = source_name;
+    if (!reg_scopes_.empty()) {
+      auto& inner = reg_scopes_.back();
+      if (auto f = inner.find(source_name); f != inner.end()) {
+        nm = f->second;   // declared again in the same block
+      } else if (fn.reg_decls.count(scoped(source_name))) {
+        nm = source_name + "{" + std::to_string(++shadow_count_) + "}";
+        inner[source_name] = nm;
+      }
+    }
     const bool wide = ty.bits > 32 && ty.kind != Type::Kind::Pred;
     if (fn.reg_ids.count(nm)) {
       auto was = fn.reg_wide.find(nm);
@@ -947,13 +979,53 @@ class Parser {
                        (was_wide ? "declared 64-bit" : "used or declared as a 32-bit register"));
     }
     fn.reg_decls[nm] = ty;
+    declared_regs_.insert(source_name);
     declared_regs_.insert(nm);
     fn.reg_wide[nm] = wide;
     intern(nm);
   }
 
   void parse_reg_decl(EntryFn& fn) {
+    // .b128 (sm_70+, PTX 8.3): registers here are at most 64 bits, so one
+    // is held as two, `name$lo` and `name$hi`, and the few instructions that
+    // take a .b128 operand -- ld/st and clusterlaunchcontrol.query_cancel --
+    // name the halves (see b128_halves).
+    if (peek().kind == Token::Kind::Word && peek().text == ".b128") {
+      next();
+      const Type half{Type::Kind::B, 64};
+      while (true) {
+        const std::string name = expect_word("register name");
+        const size_t line = peek().line;
+        std::vector<std::string> names;
+        if (peek_punct("<")) {
+          next();
+          const int64_t n = parse_int_literal(expect_word("register count"), line);
+          expect_punct(">");
+          if (n < 1 || n > kMaxRegisterBank)
+            fail(line, "register count must be 1 to " + std::to_string(kMaxRegisterBank));
+          for (int64_t i = 0; i < n; ++i) names.push_back(name + std::to_string(i));
+        } else {
+          names.push_back(name);
+        }
+        for (const std::string& n : names) {
+          declare_reg(fn, n + "$lo", half, line);
+          declare_reg(fn, n + "$hi", half, line);
+        }
+        if (!peek_punct(",")) break;
+        next();
+      }
+      expect_punct(";");
+      return;
+    }
     parse_reg_decl_of_type(fn, expect_type(".reg declaration"));
+  }
+
+  // The two 64-bit halves standing for a .b128 register operand.
+  std::pair<Reg, Reg> b128_halves(const std::string& ctx) {
+    const std::string w = expect_word(ctx);
+    if (!declared_regs_.count(w + "$lo"))
+      fail(peek().line, ctx + " must be a .b128 register, got '" + w + "'");
+    return {intern(w + "$lo"), intern(w + "$hi")};
   }
 
   void parse_reg_decl_of_type(EntryFn& fn, Type ty) {
@@ -1107,7 +1179,8 @@ class Parser {
   // names at run time.
   // Interns a register into the file its declared width selects. Ids are
   // dense within each file, so both can be plain vectors.
-  Reg intern(const std::string& name) {
+  Reg intern(const std::string& source_name) {
+    const std::string& name = scoped(source_name);
     auto wit = cur_fn_->reg_wide.find(name);
     bool wide = wit != cur_fn_->reg_wide.end() && wit->second;
     auto it = cur_fn_->reg_ids.find(name);
@@ -1188,9 +1261,9 @@ class Parser {
     Addr a;
     std::string base = expect_word("address base");
     if (base[0] == '%' || declared_regs_.count(base)) {
-      a.base = base;
       a.base_kind = Addr::Base::Reg;
       Reg r = intern(base);
+      a.base = r.name;
       a.base_id = r.id;
       a.base_wide = r.wide;
     } else if (call_slots_.count(base)) {
@@ -1300,7 +1373,7 @@ class Parser {
       size_t vec = 1;
       Type ty{};
       bool have_ty = false;
-      bool acquire = false, release = false;
+      bool acquire = false, release = false, b128 = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "acquire") acquire = true;
@@ -1319,10 +1392,21 @@ class Parser {
         else if (inert_mem_modifier(p)) ;
         else if (p == "v2") vec = 2;
         else if (p == "v4") vec = 4;
-        else if (auto t2 = parse_type_token(p)) {
+        else if (p == "b128") {
+          ty = Type{Type::Kind::B, 64};
+          have_ty = true;
+          b128 = true;
+        } else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
         } else return unsupported("unrecognized ld/st modifier '." + p + "'");
+      }
+      // A .b128 access is the .v2.b64 access of its two halves: the same 16
+      // bytes, with the same 16-byte alignment.
+      if (b128) {
+        if (vec != 1) return unsupported("vector ." + op0 + ".b128");
+        if (space == Space::Param) return unsupported(op0 + ".param.b128");
+        vec = 2;
       }
       if (!have_ty) fail(ins.line, "ld/st missing type: " + opcode);
       storage_bytes(ty, ins.line, opcode);
@@ -1332,7 +1416,10 @@ class Parser {
         // A one-element braced list is legal PTX for a scalar load, and it is
         // what Triton's inline-asm loads look like: "ld.global.b32 { %r1 },
         // [ %rd1 ];". The braces carry no meaning the vector count does not.
-        if (vec == 1 && !peek_punct("{")) {
+        if (b128) {
+          const auto [lo, hi] = b128_halves("ld.b128 destination");
+          dsts = {lo, hi};
+        } else if (vec == 1 && !peek_punct("{")) {
           dsts.push_back(expect_reg_operand("ld destination"));
         } else {
           dsts = parse_reg_vector(vec);
@@ -1361,7 +1448,10 @@ class Parser {
         Addr addr = parse_addr(fn);
         expect_punct(",");
         std::vector<Operand> srcs;
-        if (vec == 1 && !peek_punct("{"))
+        if (b128) {
+          const auto [lo, hi] = b128_halves("st.b128 source");
+          srcs = {RegOperand{lo}, RegOperand{hi}};
+        } else if (vec == 1 && !peek_punct("{"))
           srcs.push_back(parse_operand());
         else
           srcs = parse_operand_vector(vec);
@@ -1453,12 +1543,39 @@ class Parser {
       expect_punct(",");
       op.src = parse_operand();
       ins.op = op;
+    } else if (op0 == "cvt" && parts.size() > 1 && parts[1] == "pack") {
+      // cvt.pack.sat.{u16,s16}.s32 d, a, b
+      // cvt.pack.sat.{u8,s8,u4,s4,u2,s2}.s32.b32 d, a, b, c
+      if (parts.size() < 5 || parts[2] != "sat" || parts[4] != "s32")
+        return unsupported("cvt.pack form (expected cvt.pack.sat.<type>.s32[.b32])");
+      const std::string& to = parts[3];
+      OpCvtPack op;
+      if (to.size() < 2 || (to[0] != 'u' && to[0] != 's'))
+        return unsupported("cvt.pack to ." + to);
+      op.is_signed = to[0] == 's';
+      op.bits = static_cast<uint32_t>(std::atoi(to.c_str() + 1));
+      if (op.bits != 16 && op.bits != 8 && op.bits != 4 && op.bits != 2)
+        return unsupported("cvt.pack to ." + to);
+      op.has_c = op.bits != 16;
+      if (op.has_c != (parts.size() == 6 && parts[5] == "b32") || parts.size() > 6)
+        return unsupported(op.has_c ? "cvt.pack to 8, 4 or 2 bits takes .b32 and a c operand"
+                                    : "cvt.pack to 16 bits takes no c operand");
+      op.dst = expect_reg_operand("cvt.pack destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      if (op.has_c) {
+        expect_punct(",");
+        op.c = parse_operand();
+      }
+      ins.op = op;
     } else if (op0 == "cvt") {
       // cvt[.round][.sat][.ftz].<dstty>.<srcty>
       std::vector<Type> tys;
       std::string packed;  // "f16x2"/"bf16x2": two f32 sources packed into one register
       std::string fp8;     // "e4m3x2"/"e5m2x2": the FP8 side of the conversion
-      bool satfinite = false;
+      bool satfinite = false, sat = false, ftz = false;
       Round round = Round::None;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
@@ -1470,7 +1587,8 @@ class Parser {
         else if (p == "rzi") round = Round::Rzi;
         else if (p == "rmi") round = Round::Rmi;
         else if (p == "rpi") round = Round::Rpi;
-        else if (p == "sat" || p == "ftz") ;  // saturation/flush handled conservatively below
+        else if (p == "sat") sat = true;
+        else if (p == "ftz") ftz = true;
         else if (p == "f16x2" || p == "bf16x2") packed = p;
         else if (p == "e4m3x2" || p == "e5m2x2") fp8 = p;
         else if (p == "satfinite") satfinite = true;
@@ -1527,6 +1645,8 @@ class Parser {
       op.dst_ty = tys[0];
       op.src_ty = tys[1];
       op.round = round;
+      op.sat = sat;
+      op.ftz = ftz;
       op.dst = expect_reg_operand("cvt destination");
       expect_punct(",");
       op.src = parse_operand();
@@ -1588,55 +1708,176 @@ class Parser {
         }
       }
     } else if (op0 == "wmma") {
-      // wmma.mma.sync.aligned.<alayout>.<blayout>.m16n16k16.f32.f32 {d}, {a}, {b}, {c};
-      // wmma.store.d.sync.aligned.<layout>.m16n16k16[.space].f32 [addr], {d}, stride;
+      // wmma.load.{a,b,c}.sync.aligned.<layout>.<shape>[.space].<type> {r...}, [p] [, stride]
+      // wmma.store.d.sync.aligned.<layout>.<shape>[.space].<type> [p], {r...} [, stride]
+      // wmma.mma[.op.popc].sync.aligned.<alayout>.<blayout>.<shape>[.rnd].<types> {d}, {a}, {b}, {c}
       if (parts.size() < 2) return unsupported("wmma form");
       const std::string& kind = parts[1];
       std::vector<MatLayout> layouts;
       Space space = Space::Generic;
-      bool shape_ok = false;
       char frag = 0;
-      bool saw_f32 = false;
-      WmmaElem elem = WmmaElem::F16;
-      bool k8 = false;
+      WmmaShape shape;
+      bool have_shape = false, satfinite = false, popc = false, b1_and = false, b1_xor = false;
+      FRound rnd = FRound::Nearest;
+      std::vector<WmmaType> types;
+      static const std::unordered_map<std::string, WmmaShape> kShapes = {
+          {"m16n16k16", {16, 16, 16}}, {"m8n32k16", {8, 32, 16}}, {"m32n8k16", {32, 8, 16}},
+          {"m16n16k8", {16, 16, 8}},   {"m8n8k4", {8, 8, 4}},     {"m8n8k32", {8, 8, 32}},
+          {"m8n8k128", {8, 8, 128}}};
+      static const std::unordered_map<std::string, WmmaType> kTypes = {
+          {"f16", WmmaType::F16}, {"bf16", WmmaType::BF16}, {"tf32", WmmaType::TF32},
+          {"f32", WmmaType::F32}, {"f64", WmmaType::F64},   {"s8", WmmaType::S8},
+          {"u8", WmmaType::U8},   {"s4", WmmaType::S4},     {"u4", WmmaType::U4},
+          {"b1", WmmaType::B1},   {"s32", WmmaType::S32}};
       for (size_t i = 2; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "sync" || p == "aligned") ;
         else if (p == "a" || p == "b" || p == "c" || p == "d") frag = p[0];
-        else if (p == "f32") saw_f32 = true;
         else if (p == "row") layouts.push_back(MatLayout::Row);
         else if (p == "col") layouts.push_back(MatLayout::Col);
-        else if (p == "m16n16k16") shape_ok = true;
+        else if (auto sh = kShapes.find(p); sh != kShapes.end()) { shape = sh->second; have_shape = true; }
+        else if (auto ty = kTypes.find(p); ty != kTypes.end()) types.push_back(ty->second);
         else if (p == "global") space = Space::Global;
         else if (p == "shared") space = Space::Shared;
-        else if (p == "f16") ;
-        else if (p == "bf16") elem = WmmaElem::BF16;
-        else if (p == "tf32") { elem = WmmaElem::TF32; }
-        else if (p == "m16n16k8") { shape_ok = true; k8 = true; }
-        else if (p == "m8n32k16" || p == "m32n8k16")
-          // The rectangular m8n32/m32n8 variants of the 16-deep shape. Their
-          // fragments are laid out differently again, and nothing has needed
-          // them yet, so they say so rather than being approximated.
-          return unsupported("wmma shape '." + p + "' (only m16n16k16 and m16n16k8 "
-                             "are implemented)");
-        else return unsupported("wmma modifier '." + p + "' (only m16n16k16 f16/bf16 with an "
-                                "f32 accumulator is implemented)");
+        else if (p == "satfinite") satfinite = true;
+        else if (p == "popc") popc = true;
+        else if (p == "xor") b1_xor = true;
+        else if (p == "and") b1_and = true;
+        else if (p == "rn") rnd = FRound::Nearest;
+        else if (p == "rz") rnd = FRound::Zero;
+        else if (p == "rm") rnd = FRound::MinusInf;
+        else if (p == "rp") rnd = FRound::PlusInf;
+        else return unsupported("wmma modifier '." + p + "'");
       }
-      if (!shape_ok) return unsupported("only the m16n16k16 and m16n16k8 wmma shapes "
-                                        "are implemented");
-      // The implication only runs one way. `.tf32` always means m16n16k8, but
-      // m16n16k8 does not always mention tf32: the accumulator load and the
-      // store carry only `.f32`, because the C and D fragments are f32
-      // whatever the input type was. Requiring both tokens rejected
-      // wmma.load.c.m16n16k8.f32, which is most of a tf32 kernel.
-      if (elem == WmmaElem::TF32 && !k8)
-        return unsupported("wmma .tf32 outside the m16n16k8 shape");
-      if (k8 && (frag == 'a' || frag == 'b')) elem = WmmaElem::TF32;
-      if (kind == "mma") {
+      if (!have_shape) return unsupported("wmma needs a shape");
+      const bool k16 = shape.k == 16 && (shape == WmmaShape{16, 16, 16} || shape == WmmaShape{8, 32, 16} ||
+                                         shape == WmmaShape{32, 8, 16});
+      // Which types a multiplicand or accumulator of this shape may have.
+      auto ab_ok = [&](WmmaType t) {
+        if (k16) return t == WmmaType::F16 || t == WmmaType::BF16 || t == WmmaType::S8 || t == WmmaType::U8;
+        if (shape == WmmaShape{16, 16, 8}) return t == WmmaType::TF32;
+        if (shape == WmmaShape{8, 8, 4}) return t == WmmaType::F64;
+        if (shape == WmmaShape{8, 8, 32}) return t == WmmaType::S4 || t == WmmaType::U4;
+        return t == WmmaType::B1;
+      };
+      auto acc_ok = [&](WmmaType t) {
+        if (k16) return t == WmmaType::F16 || t == WmmaType::F32 || t == WmmaType::S32;
+        if (shape == WmmaShape{16, 16, 8}) return t == WmmaType::F32;
+        if (shape == WmmaShape{8, 8, 4}) return t == WmmaType::F64;
+        return t == WmmaType::S32;
+      };
+      const bool legacy_shape = shape == WmmaShape{16, 16, 16} || shape == WmmaShape{16, 16, 8};
+      auto arity = [&](char f, WmmaType t, size_t have) -> bool { return wmma_geom(f, shape, t).regs == have; };
+      // The stride is optional: the matrix's own leading dimension otherwise.
+      auto stride_or_default = [&](char f, WmmaType t, MatLayout lay) -> Operand {
+        if (peek_punct(",")) {
+          next();
+          return parse_operand();
+        }
+        const WmmaGeom g = wmma_geom(f, shape, t);
+        return Operand{ImmInt{static_cast<int64_t>(lay == MatLayout::Row ? g.cols : g.rows)}};
+      };
+      if (kind == "load") {
+        if (frag != 'a' && frag != 'b' && frag != 'c') return unsupported("wmma.load needs .a, .b or .c");
+        if (types.size() != 1) return unsupported("wmma.load takes one element type");
+        const WmmaType t = types[0];
+        if (frag == 'c' ? !acc_ok(t) : !ab_ok(t)) return unsupported("wmma.load of this type at this shape");
+        OpWmmaLoad op;
+        op.which = frag == 'a' ? OpWmmaLoad::Which::A : frag == 'b' ? OpWmmaLoad::Which::B : OpWmmaLoad::Which::C;
+        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
+        op.space = space;
+        op.shape = shape;
+        op.type = t;
+        if ((t == WmmaType::S4 || t == WmmaType::U4 || t == WmmaType::B1) &&
+            op.layout != (frag == 'a' ? MatLayout::Row : MatLayout::Col))
+          return unsupported("sub-byte and single-bit wmma loads A row-major and B column-major");
+        // The layouts this simulator has always used stay as they were.
+        if (frag == 'c') op.generic = !(legacy_shape && t == WmmaType::F32);
+        else op.generic = !((shape == WmmaShape{16, 16, 16} && (t == WmmaType::F16 || t == WmmaType::BF16)) ||
+                            t == WmmaType::TF32);
+        op.f32 = frag == 'c';
+        op.elem = t == WmmaType::BF16 ? WmmaElem::BF16 : t == WmmaType::TF32 ? WmmaElem::TF32 : WmmaElem::F16;
+        op.dsts = parse_reg_vector_any();
+        if (!arity(frag, t, op.dsts.size()))
+          return unsupported("wmma.load fragment arity (expected " +
+                             std::to_string(wmma_geom(frag, shape, t).regs) + " registers)");
+        expect_punct(",");
+        op.addr = parse_addr(fn);
+        op.stride = stride_or_default(frag, t, op.layout);
+        ins.op = op;
+      } else if (kind == "store") {
+        if (frag != 'd') return unsupported("wmma.store stores .d");
+        if (types.size() != 1 || !acc_ok(types[0])) return unsupported("wmma.store of this type at this shape");
+        OpWmmaStore op;
+        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
+        op.space = space;
+        op.shape = shape;
+        op.type = types[0];
+        op.generic = !(legacy_shape && op.type == WmmaType::F32);
+        op.addr = parse_addr(fn);
+        expect_punct(",");
+        for (auto& r : parse_reg_vector_any()) op.src.push_back(Operand{RegOperand{r}});
+        if (!arity('d', op.type, op.src.size()))
+          return unsupported("wmma.store fragment arity (expected " +
+                             std::to_string(wmma_geom('d', shape, op.type).regs) + " registers)");
+        op.stride = stride_or_default('d', op.type, op.layout);
+        ins.op = op;
+      } else if (kind == "mma") {
         if (layouts.size() != 2) return unsupported("wmma.mma needs both A and B layouts");
         OpWmmaMma op;
         op.alayout = layouts[0];
         op.blayout = layouts[1];
+        op.shape = shape;
+        // f16 multiplicands leave their type implicit: .dtype.ctype only.
+        if (types.size() == 2) {
+          op.dtype = types[0];
+          op.atype = op.btype = WmmaType::F16;
+          op.ctype = types[1];
+        } else if (types.size() == 4) {
+          op.dtype = types[0];
+          op.atype = types[1];
+          op.btype = types[2];
+          op.ctype = types[3];
+        } else if (types.size() == 3) {
+          // .dtype.atype.btype with the accumulator left off, which the parser
+          // has always taken to mean ctype = dtype (every non-f16 form has
+          // them equal anyway).
+          op.dtype = op.ctype = types[0];
+          op.atype = types[1];
+          op.btype = types[2];
+        } else {
+          return unsupported("wmma.mma types (.dtype.ctype, or .dtype.atype.btype.ctype)");
+        }
+        const WmmaType at = op.atype;
+        const bool fp16 = at == WmmaType::F16, integer = at == WmmaType::S8 || at == WmmaType::U8 ||
+                                                   at == WmmaType::S4 || at == WmmaType::U4;
+        if (!ab_ok(at) || op.btype != at) return unsupported("wmma.mma: A and B must have the same type, valid for the shape");
+        const bool acc_valid =
+            fp16 ? (op.dtype == WmmaType::F16 || op.dtype == WmmaType::F32) &&
+                       (op.ctype == WmmaType::F16 || op.ctype == WmmaType::F32)
+            : at == WmmaType::F64 ? op.dtype == WmmaType::F64 && op.ctype == WmmaType::F64
+            : (at == WmmaType::BF16 || at == WmmaType::TF32) ? op.dtype == WmmaType::F32 && op.ctype == WmmaType::F32
+                                                             : op.dtype == WmmaType::S32 && op.ctype == WmmaType::S32;
+        if (!acc_valid) return unsupported("wmma.mma accumulator types for these multiplicands");
+        if (satfinite && !integer && at != WmmaType::B1)
+          return unsupported("wmma.mma .satfinite is for integer multiplicands (removed for floating point in PTX 6.5)");
+        if (at == WmmaType::B1) {
+          if (!popc || b1_and == b1_xor) return unsupported("single-bit wmma.mma needs .xor.popc or .and.popc");
+          if (satfinite) return unsupported("single-bit wmma.mma has no .satfinite");
+        } else if (popc || b1_and || b1_xor) {
+          return unsupported(".popc is for single-bit wmma.mma");
+        }
+        if (rnd != FRound::Nearest && at != WmmaType::F64) return unsupported("a rounding mode on a non-f64 wmma.mma");
+        if ((at == WmmaType::S4 || at == WmmaType::U4 || at == WmmaType::B1) &&
+            (op.alayout != MatLayout::Row || op.blayout != MatLayout::Col))
+          return unsupported("sub-byte and single-bit wmma.mma is .row.col");
+        op.satfinite = satfinite;
+        op.b1_and = b1_and;
+        op.rnd = rnd;
+        op.generic = !((shape == WmmaShape{16, 16, 16} && (fp16 || at == WmmaType::BF16) &&
+                        op.ctype == WmmaType::F32 && op.dtype == WmmaType::F32) ||
+                       at == WmmaType::TF32);
+        op.elem = at == WmmaType::BF16 ? WmmaElem::BF16 : at == WmmaType::TF32 ? WmmaElem::TF32 : WmmaElem::F16;
         op.d = parse_reg_vector_any();
         expect_punct(",");
         op.a = parse_reg_vector_any();
@@ -1644,51 +1885,9 @@ class Parser {
         op.b = parse_reg_vector_any();
         expect_punct(",");
         op.c = parse_reg_vector_any();
-        op.elem = elem;
-        // f16 fragments duplicate the matrix across the warp and take 8
-        // registers; bf16 does not and takes 4. The accumulator is 8 either
-        // way, being 16x16 f32 over 32 lanes.
-        const size_t ab = elem == WmmaElem::F16 ? 8u : 4u;
-        if (op.d.size() != 8 || op.c.size() != 8 || op.a.size() != ab || op.b.size() != ab)
-          return unsupported("wmma.mma fragment arity (expected " + std::to_string(ab) +
-                             " A/B registers and 8 accumulator registers)");
-        ins.op = op;
-      } else if (kind == "store") {
-        OpWmmaStore op;
-        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
-        op.space = space;
-        op.addr = parse_addr(fn);
-        expect_punct(",");
-        {
-          std::vector<Reg> regs = parse_reg_vector_any();
-          for (auto& r : regs) op.src.push_back(Operand{RegOperand{r}});
-        }
-        if (op.src.size() != 8) return unsupported("wmma.store fragment arity");
-        expect_punct(",");
-        op.stride = parse_operand();
-        ins.op = op;
-      } else if (kind == "load") {
-        OpWmmaLoad op;
-        if (frag == 'a') op.which = OpWmmaLoad::Which::A;
-        else if (frag == 'b') op.which = OpWmmaLoad::Which::B;
-        else if (frag == 'c') op.which = OpWmmaLoad::Which::C;
-        else return unsupported("wmma.load without an a/b/c fragment selector");
-        op.f32 = saw_f32;
-        if (op.which == OpWmmaLoad::Which::C && !op.f32)
-          return unsupported("wmma.load.c with an f16 accumulator (only .f32 is implemented)");
-        if (op.which != OpWmmaLoad::Which::C && op.f32)
-          return unsupported("wmma.load.a/.b with f32 elements (only .f16 is implemented)");
-        op.layout = layouts.empty() ? MatLayout::Row : layouts[0];
-        op.space = space;
-        op.elem = elem;
-        op.dsts = parse_reg_vector_any();
-        const size_t want = (op.which == OpWmmaLoad::Which::C || elem == WmmaElem::F16) ? 8u : 4u;
-        if (op.dsts.size() != want)
-          return unsupported("wmma.load fragment arity (expected " + std::to_string(want) + ")");
-        expect_punct(",");
-        op.addr = parse_addr(fn);
-        expect_punct(",");
-        op.stride = parse_operand();
+        if (!arity('a', op.atype, op.a.size()) || !arity('b', op.btype, op.b.size()) ||
+            !arity('c', op.ctype, op.c.size()) || !arity('d', op.dtype, op.d.size()))
+          return unsupported("wmma.mma fragment arity for this shape and these types");
         ins.op = op;
       } else {
         return unsupported("wmma." + kind + " is not implemented (only .load, .mma and .store.d)");
@@ -1821,12 +2020,14 @@ class Parser {
       ins.op = op;
     } else if (op0 == "mma") {
       // mma.sync.aligned.m16n8kK.row.col.<d>.<a>.<b>.<c>
+      // mma.sp[::ordered_metadata].sync.aligned.m16n8kK.row.col.<d>.<a>.<b>.<c> d, a, b, c, e, f
       uint32_t k = 0;
       std::vector<std::string> types;
-      bool row_col = false, saw_row = false;
+      bool row_col = false, saw_row = false, sparse = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "sync" || p == "aligned") ;
+        else if (p == "sp" || p == "sp::ordered_metadata") sparse = true;
         else if (p == "row") saw_row = true;
         else if (p == "col") { if (saw_row) row_col = true; }
         else if (p == "m16n8k8") k = 8;
@@ -1852,6 +2053,10 @@ class Parser {
       if (types[1] != types[2]) return unsupported("mma with mixed A and B types");
       op.acc_f16 = types[0] == "f16";
       op.acc_int = types[0] == "s32";
+      if (sparse && op.ab_type != MmaElem::F16 && op.ab_type != MmaElem::BF16)
+        return unsupported("mma.sp with ." + at + " (only .f16 and .bf16 sparse A are implemented)");
+      if (sparse && k == 8) return unsupported("mma.sp.m16n8k8 (f16/bf16 sparse A is k16 or k32)");
+      op.sparse = sparse;
       op.d = parse_reg_vector_any();
       expect_punct(",");
       op.a = parse_reg_vector_any();
@@ -1859,6 +2064,15 @@ class Parser {
       op.b = parse_reg_vector_any();
       expect_punct(",");
       op.c = parse_reg_vector_any();
+      if (sparse) {
+        expect_punct(",");
+        op.meta = parse_operand();
+        expect_punct(",");
+        op.selector = parse_operand();
+        const auto* sel = std::get_if<ImmInt>(&op.selector);
+        if (!sel || sel->value < 0 || sel->value > 1)
+          return unsupported("mma.sp's sparsity selector is an immediate 0 or 1 for .f16/.bf16");
+      }
       if (op.d.size() != op.c.size()) return unsupported("mma D and C arity differ");
       ins.op = op;
     } else if (op0 == "wgmma") {
@@ -2003,6 +2217,253 @@ class Parser {
         }
         ins.op = op;
       }
+    } else if (op0 == "clusterlaunchcontrol") {
+      // Cluster launch control (sm_100, PTX ISA 9.7.15.18-19).
+      {
+        int sm = 0;
+        std::sscanf(target_.c_str(), "sm_%d", &sm);
+        if (sm < 100)
+          fail(ins.line, "clusterlaunchcontrol requires sm_100 or later; this module targets " +
+                             (target_.empty() ? std::string("nothing") : target_));
+      }
+      if (parts.size() < 2) return unsupported("clusterlaunchcontrol form");
+      OpClc op;
+      if (parts[1] == "try_cancel") {
+        bool async = false, mbar = false;
+        for (size_t i = 2; i < parts.size(); ++i) {
+          const std::string& p = parts[i];
+          if (p == "async") async = true;
+          else if (p == "shared" || p == "b128") ;
+          else if (p == "mbarrier::complete_tx::bytes") mbar = true;
+          else if (p == "multicast::cluster::all") op.multicast = true;
+          else return unsupported("clusterlaunchcontrol.try_cancel modifier '." + p + "'");
+        }
+        if (!async || !mbar)
+          return unsupported("clusterlaunchcontrol.try_cancel needs .async and "
+                             ".mbarrier::complete_tx::bytes");
+        op.addr = parse_addr(fn);
+        expect_punct(",");
+        op.mbar = parse_addr(fn);
+      } else if (parts[1] == "query_cancel" && parts.size() > 2) {
+        const std::string& q = parts[2];
+        if (q == "is_canceled") {
+          op.kind = ClcKind::IsCanceled;
+          op.dst.push_back(expect_reg_operand("is_canceled destination"));
+        } else if (q == "get_first_ctaid") {
+          op.kind = ClcKind::FirstCtaid;
+          if (!peek_punct("{")) return unsupported("get_first_ctaid without .v4 or ::x/::y/::z");
+          next();
+          for (int i = 0; i < 4; ++i) {
+            if (i) expect_punct(",");
+            if (peek().text == "_") {
+              next();
+              op.dst.push_back(Reg{});
+            } else {
+              op.dst.push_back(expect_reg_operand("get_first_ctaid destination"));
+            }
+          }
+          expect_punct("}");
+        } else if (q == "get_first_ctaid::x" || q == "get_first_ctaid::y" || q == "get_first_ctaid::z") {
+          op.kind = ClcKind::FirstCtaid;
+          op.dim = q.back() - 'x';
+          op.dst.push_back(expect_reg_operand("get_first_ctaid destination"));
+        } else {
+          return unsupported("clusterlaunchcontrol.query_cancel." + q);
+        }
+        expect_punct(",");
+        const auto [lo, hi] = b128_halves("query_cancel's response operand");
+        op.resp_lo = lo;
+        op.resp_hi = hi;
+      } else {
+        return unsupported("clusterlaunchcontrol." + parts[1]);
+      }
+      ins.op = op;
+    } else if (op0 == "tcgen05") {
+      // Blackwell's tensor core (PTX ISA 9.7.18). Arch-specific: sm_100a to
+      // sm_110a, or their family targets; ptxas refuses it on sm_120 (the
+      // consumer parts have no Tensor Memory) and on any plain target.
+      {
+        int sm = 0;
+        std::sscanf(target_.c_str(), "sm_%d", &sm);
+        const char last = target_.empty() ? ' ' : target_.back();
+        if (sm < 100 || sm >= 120 || (last != 'a' && last != 'f'))
+          fail(ins.line, "tcgen05 requires an sm_100a..sm_110a or sm_100f..sm_110f target; this "
+                         "module targets " + (target_.empty() ? std::string("nothing") : target_));
+      }
+      if (parts.size() < 2) return unsupported("tcgen05 form");
+      OpTcgen05 op;
+      const std::string& what = parts[1];
+      if (what == "alloc") op.kind = Tcgen05Kind::Alloc;
+      else if (what == "dealloc") op.kind = Tcgen05Kind::Dealloc;
+      else if (what == "relinquish_alloc_permit") op.kind = Tcgen05Kind::Relinquish;
+      else if (what == "ld") op.kind = Tcgen05Kind::Ld;
+      else if (what == "st") op.kind = Tcgen05Kind::St;
+      else if (what == "wait::ld") op.kind = Tcgen05Kind::WaitLd;
+      else if (what == "wait::st") op.kind = Tcgen05Kind::WaitSt;
+      else if (what == "fence::before_thread_sync") op.kind = Tcgen05Kind::FenceBefore;
+      else if (what == "fence::after_thread_sync") op.kind = Tcgen05Kind::FenceAfter;
+      else if (what == "commit") op.kind = Tcgen05Kind::Commit;
+      else if (what == "mma") op.kind = Tcgen05Kind::Mma;
+      else if (what == "cp" || what == "shift")
+        return unsupported("tcgen05." + what + " (copies from shared memory into Tensor Memory are "
+                           "not implemented yet)");
+      else return unsupported("tcgen05." + what);
+      bool have_shape = false, have_num = false, have_kind = false, mbar_arrive = false;
+      for (size_t i = 2; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        unsigned num = 0;
+        char tail = 0;
+        if (p == "sync" || p == "aligned" || p == "b32" || p == "b64" || p == "shared" ||
+            p == "shared::cluster") ;
+        else if (p == "cta_group::1") op.cta_group = 1;
+        else if (p == "cta_group::2") op.cta_group = 2;
+        else if (p == "exclusive") op.exclusive = true;
+        else if (p == "32x32b") { op.shape = Tcgen05Shape::S32x32b; have_shape = true; }
+        else if (p == "16x64b") { op.shape = Tcgen05Shape::S16x64b; have_shape = true; }
+        else if (p == "16x128b") { op.shape = Tcgen05Shape::S16x128b; have_shape = true; }
+        else if (p == "16x256b") { op.shape = Tcgen05Shape::S16x256b; have_shape = true; }
+        else if (p == "16x32bx2") { op.shape = Tcgen05Shape::S16x32bx2; have_shape = true; }
+        else if (std::sscanf(p.c_str(), "x%u%c", &num, &tail) == 1 && num && !(num & (num - 1)) &&
+                 num <= 128) {
+          op.num = num;
+          have_num = true;
+        } else if ((p == "pack::16b" && op.kind == Tcgen05Kind::Ld) ||
+                   (p == "unpack::16b" && op.kind == Tcgen05Kind::St))
+          op.pack16 = true;
+        else if (p == "mbarrier::arrive::one") mbar_arrive = true;
+        else if (p == "multicast::cluster" || p == "multicast::cluster::16b") op.multicast = true;
+        else if (p == "kind::f16") { op.mma_kind = Tcgen05MmaKind::F16; have_kind = true; }
+        else if (p == "kind::tf32") { op.mma_kind = Tcgen05MmaKind::TF32; have_kind = true; }
+        else if (p == "kind::f8f6f4") { op.mma_kind = Tcgen05MmaKind::F8F6F4; have_kind = true; }
+        else if (p == "kind::i8") { op.mma_kind = Tcgen05MmaKind::I8; have_kind = true; }
+        // The collector buffer lets the tensor core keep A or B between MMAs
+        // instead of reading it again. Reuse is only ever permission -- the
+        // ISA says the operand may be reloaded anyway and must not change
+        // meanwhile -- so reading it every time is one of the allowed
+        // behaviours.
+        else if (p.rfind("collector::", 0) == 0) ;
+        else if (p == "red")
+          return unsupported("tcgen05.ld.red (sm_103 and sm_110, not the B200's sm_100)");
+        else if (p == "sp")
+          return unsupported("tcgen05.mma.sp (structured-sparse A) is not implemented yet");
+        else if (p == "ws" || p.rfind("ws::", 0) == 0)
+          return unsupported("tcgen05.mma.ws (weight-stationary) is not implemented yet");
+        else if (p == "block_scale" || p.rfind("kind::mx", 0) == 0 || p.rfind("scale_vec", 0) == 0 ||
+                 p == "block16" || p == "block32")
+          return unsupported("block-scaled tcgen05.mma (.kind::mx*) is not implemented yet");
+        else if (p == "ashift")
+          return unsupported("tcgen05.mma.ashift is not implemented yet");
+        else if (p.rfind("decompress", 0) == 0 || p == "kind::ti16")
+          return unsupported("tcgen05.mma." + p + " (sm_107) is not implemented");
+        else if (p.rfind("multicast::cluster::32b", 0) == 0 || p.rfind("sync_restrict", 0) == 0)
+          return unsupported("tcgen05.commit." + p + " (sm_107) is not implemented");
+        else return unsupported("tcgen05 modifier '." + p + "'");
+      }
+      auto bracketed = [&]() {
+        expect_punct("[");
+        Operand o = parse_operand();
+        expect_punct("]");
+        return o;
+      };
+      switch (op.kind) {
+        case Tcgen05Kind::Alloc:
+          op.addr = parse_addr(fn);
+          expect_punct(",");
+          op.ncols = parse_operand();
+          break;
+        case Tcgen05Kind::Dealloc:
+          op.taddr = parse_operand();
+          expect_punct(",");
+          op.ncols = parse_operand();
+          break;
+        case Tcgen05Kind::Ld:
+        case Tcgen05Kind::St: {
+          if (!have_shape || !have_num) return unsupported("tcgen05." + what + " needs a shape and .xN");
+          // Registers per .x1 (Table 59): one for the 32-bit-wide shapes,
+          // two for .16x128b and four for .16x256b; 128 at most.
+          const uint32_t per = op.shape == Tcgen05Shape::S16x128b   ? 2
+                               : op.shape == Tcgen05Shape::S16x256b ? 4 : 1;
+          if (op.num * per > 128)
+            return unsupported("tcgen05." + what + " of more than 128 registers (Table 59)");
+          auto imm_split = [&]() {
+            if (op.shape != Tcgen05Shape::S16x32bx2) return;
+            expect_punct(",");
+            const Operand o = parse_operand();
+            const auto* imm = std::get_if<ImmInt>(&o);
+            if (!imm || imm->value < 0) fail(ins.line, ".16x32bx2 needs an immediate immHalfSplitoff");
+            op.half_split = static_cast<uint32_t>(imm->value);
+          };
+          if (op.kind == Tcgen05Kind::Ld) {
+            op.regs = parse_reg_vector_any();
+            expect_punct(",");
+            op.taddr = bracketed();
+            imm_split();
+          } else {
+            op.taddr = bracketed();
+            imm_split();
+            expect_punct(",");
+            op.regs = parse_reg_vector_any();
+          }
+          if (op.regs.size() != op.num * per)
+            return unsupported("tcgen05." + what + " with " + std::to_string(op.regs.size()) +
+                               " registers; this shape and .x" + std::to_string(op.num) + " take " +
+                               std::to_string(op.num * per));
+          for (const Reg& r : op.regs)
+            if (r.wide) return unsupported("tcgen05." + what + " registers are .b32");
+          break;
+        }
+        case Tcgen05Kind::Commit:
+          if (!mbar_arrive) return unsupported("tcgen05.commit needs .mbarrier::arrive::one");
+          op.addr = parse_addr(fn);
+          if (op.multicast) {
+            expect_punct(",");
+            op.cta_mask = parse_operand();
+          }
+          break;
+        case Tcgen05Kind::Mma: {
+          if (!have_kind) return unsupported("tcgen05.mma needs a .kind");
+          op.d_tmem = bracketed();
+          expect_punct(",");
+          if (peek_punct("[")) {
+            op.a_tmem = true;
+            op.a = bracketed();
+          } else {
+            op.a = parse_operand();
+          }
+          expect_punct(",");
+          op.b_desc = parse_operand();
+          expect_punct(",");
+          op.idesc = parse_operand();
+          expect_punct(",");
+          if (peek_punct("{")) {
+            op.disable_lanes = parse_operand_vector_any();
+            if (op.disable_lanes.size() != 4 * op.cta_group)
+              return unsupported("tcgen05.mma's disable-output-lane vector has " +
+                                 std::to_string(4 * op.cta_group) + " elements for .cta_group::" +
+                                 std::to_string(op.cta_group));
+            expect_punct(",");
+          }
+          op.enable_d = parse_operand();
+          if (peek_punct(",")) {
+            next();
+            const Operand s = parse_operand();
+            const auto* imm = std::get_if<ImmInt>(&s);
+            if (!imm || imm->value < 0 || imm->value > 15)
+              return unsupported("tcgen05.mma's scale-input-d is an immediate from 0 to 15");
+            if (op.mma_kind != Tcgen05MmaKind::F16 && op.mma_kind != Tcgen05MmaKind::TF32)
+              return unsupported("scale-input-d is for .kind::f16 and .kind::tf32 only");
+            op.scale_d = static_cast<int>(imm->value);
+          }
+          // .kind::i8 is sm_100a/sm_101a/sm_110a only, not the family targets.
+          if (op.mma_kind == Tcgen05MmaKind::I8 && !target_.empty() && target_.back() != 'a')
+            fail(ins.line, "tcgen05.mma.kind::i8 requires an sm_100a, sm_101a or sm_110a target; "
+                           "this module targets " + target_);
+          break;
+        }
+        default:
+          break;
+      }
+      ins.op = op;
     } else if (op0 == "redux") {
       // redux.sync.<op>.<type> d, a, membermask
       std::optional<ReduxOp> rop;
@@ -2042,13 +2503,20 @@ class Parser {
       expect_punct(",");
       op.b = parse_operand();
       ins.op = op;
-    } else if (op0 == "dp4a") {
+    } else if (op0 == "dp4a" || op0 == "dp2a") {
       // dp4a.atype.btype d, a, b, c
-      if (parts.size() != 3) return unsupported("dp4a form");
-      const bool as = parts[1] == "s32", au = parts[1] == "u32";
-      const bool bs = parts[2] == "s32", bu = parts[2] == "u32";
-      if ((!as && !au) || (!bs && !bu)) return unsupported("dp4a operand types");
+      // dp2a.{lo,hi}.atype.btype d, a, b, c
       OpDp4a op;
+      op.two = op0 == "dp2a";
+      const size_t t = op.two ? 2 : 1;
+      if (parts.size() != t + 2) return unsupported(op0 + " form");
+      if (op.two) {
+        if (parts[1] != "lo" && parts[1] != "hi") return unsupported("dp2a needs .lo or .hi");
+        op.hi = parts[1] == "hi";
+      }
+      const bool as = parts[t] == "s32", au = parts[t] == "u32";
+      const bool bs = parts[t + 1] == "s32", bu = parts[t + 1] == "u32";
+      if ((!as && !au) || (!bs && !bu)) return unsupported(op0 + " operand types");
       op.a_signed = as;
       op.b_signed = bs;
       op.dst = expect_reg_operand("dp4a destination");
@@ -3006,35 +3474,62 @@ class Parser {
       OpTrap op;
       op.breakpoint = true;
       ins.op = op;
-    } else if (op0 == "tex") {
+    } else if (op0 == "tex" || op0 == "tld4") {
       // tex.<geom>[.level|.grad].v4.<dtype>.<ctype> {d,d,d,d}, [obj, {c,...}]
       uint32_t dims = 0;
+      TexGeom geom = TexGeom::D1;
+      bool level = false;
+      int gather = -1;
       Type dtype{}, ctype{};
       bool have_d = false;
       std::vector<std::string> types;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
-        if (p == "1d") dims = 1;
-        else if (p == "2d") dims = 2;
-        else if (p == "3d") dims = 3;
+        if (p == "1d") { dims = 1; geom = TexGeom::D1; }
+        else if (p == "2d") { dims = 2; geom = TexGeom::D2; }
+        else if (p == "3d") { dims = 3; geom = TexGeom::D3; }
+        else if (p == "a1d") { dims = 1; geom = TexGeom::A1D; }
+        else if (p == "a2d") { dims = 2; geom = TexGeom::A2D; }
+        else if (p == "cube") { dims = 3; geom = TexGeom::Cube; }
+        else if (p == "acube") { dims = 3; geom = TexGeom::ACube; }
         else if (p == "v4") ;
-        else if (p == "a1d" || p == "a2d" || p == "cube" || p == "acube")
-          return unsupported("layered and cubemap textures are not implemented");
-        else if (p == "level" || p == "grad")
-          return unsupported("mipmapped texture fetch ('." + p + "') is not implemented");
+        else if (p == "2dms" || p == "a2dms")
+          return unsupported("multi-sample textures are not implemented");
+        else if (op0 == "tld4" && p.size() == 1 && std::string("rgba").find(p[0]) != std::string::npos)
+          gather = static_cast<int>(std::string("rgba").find(p[0]));
+        else if (p == "level") level = true;
+        else if (p == "base") ;
+        else if (p == "grad")
+          return unsupported("tex.grad: the level of detail a GPU derives from gradients goes "
+                             "through its approximate log2 and length units, which are not "
+                             "documented, so it is refused rather than approximated (tex.level "
+                             "and plain fetches of mipmapped textures are implemented)");
         else if (auto t2 = parse_type_token(p)) types.push_back(p);
         else return unsupported("tex modifier '." + p + "'");
       }
-      if (!dims) return unsupported("tex geometry (only .1d/.2d/.3d are implemented)");
+      if (!dims) return unsupported("tex geometry");
       if (types.size() != 2) return unsupported("tex needs a destination and a coordinate type");
       dtype = *parse_type_token(types[0]);
       ctype = *parse_type_token(types[1]);
       have_d = true;
       (void)have_d;
+      if (op0 == "tld4") {
+        if (gather < 0) return unsupported("tld4 needs a component (.r, .g, .b or .a)");
+        // The ISA also has .a2d, .cube and .acube, but gather is allowed only
+        // on 2D arrays (a layered or cubemap array with cudaArrayTextureGather
+        // is refused by the runtime), so there is nothing to measure them on.
+        if (geom != TexGeom::D2)
+          return unsupported("tld4 on a layered or cubemap texture (only .2d is implemented)");
+        if (level) return unsupported("tld4 with a level of detail");
+      }
       OpTex op;
+      op.gather = gather;
+      op.geom = geom;
       op.dims = dims;
       op.dtype = dtype;
       op.ctype = ctype;
+      if ((geom == TexGeom::Cube || geom == TexGeom::ACube) && !ctype.is_float())
+        return unsupported("a cubemap fetch takes float coordinates");
       op.dsts = parse_reg_vector_any();
       if (op.dsts.size() != 4) return unsupported("tex destination arity (ptxas emits .v4)");
       expect_punct(",");
@@ -3042,14 +3537,21 @@ class Parser {
       op.obj = parse_operand();
       expect_punct(",");
       op.coords = parse_operand_vector_any();
-      if (op.coords.size() < dims)
+      const bool indexed = geom == TexGeom::A1D || geom == TexGeom::A2D || geom == TexGeom::ACube;
+      if (op.coords.size() < dims + (indexed ? 1 : 0))
         return unsupported("tex coordinate count does not match its geometry");
       expect_punct("]");
+      if (level) {
+        op.level = true;
+        expect_punct(",");
+        op.lod = parse_operand();
+      }
       ins.op = std::move(op);
     } else if (op0 == "suld" || op0 == "sust") {
       // suld.b.<geom>.<type>.<clamp> {d,...}, [obj, {x,y}]
       // sust.b.<geom>.<type>.<clamp> [obj, {x,y}], {s,...}
       uint32_t dims = 0, bytes = 0;
+      bool layered = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "b") ;              // byte-addressed, the only form ptxas emits
@@ -3057,8 +3559,8 @@ class Parser {
         else if (p == "1d") dims = 1;
         else if (p == "2d") dims = 2;
         else if (p == "3d") dims = 3;
-        else if (p == "a1d" || p == "a2d")
-          return unsupported("layered surfaces are not implemented");
+        else if (p == "a1d") { dims = 1; layered = true; }
+        else if (p == "a2d") { dims = 2; layered = true; }
         // Out-of-range policy. ".trap" is what a surface access compiles to by
         // default and is the only one implemented: ".clamp" and ".zero" change
         // the result rather than the diagnostics, so accepting them silently
@@ -3073,11 +3575,12 @@ class Parser {
         else if (p == "b64") bytes = 8;
         else return unsupported(op0 + " modifier '." + p + "'");
       }
-      if (!dims) return unsupported(op0 + " geometry (only .1d/.2d/.3d are implemented)");
+      if (!dims) return unsupported(op0 + " geometry");
       if (!bytes) return unsupported(op0 + " component width");
       if (op0 == "suld") {
         OpSuld op;
         op.dims = dims;
+        op.layered = layered;
         op.bytes = bytes;
         op.dsts = parse_reg_vector_any();
         expect_punct(",");
@@ -3086,11 +3589,12 @@ class Parser {
         expect_punct(",");
         op.coords = parse_operand_vector_any();
         expect_punct("]");
-        if (op.coords.size() < dims) return unsupported("suld coordinate count");
+        if (op.coords.size() < dims + (layered ? 1 : 0)) return unsupported("suld coordinate count");
         ins.op = std::move(op);
       } else {
         OpSust op;
         op.dims = dims;
+        op.layered = layered;
         op.bytes = bytes;
         expect_punct("[");
         op.obj = parse_operand();
@@ -3099,7 +3603,7 @@ class Parser {
         expect_punct("]");
         expect_punct(",");
         op.srcs = parse_operand_vector_any();
-        if (op.coords.size() < dims) return unsupported("sust coordinate count");
+        if (op.coords.size() < dims + (layered ? 1 : 0)) return unsupported("sust coordinate count");
         ins.op = std::move(op);
       }
     } else if (op0 == "membar" || op0 == "fence") {
@@ -3157,6 +3661,7 @@ class Parser {
         else if (p == "bulk_group") group_completion = true;
         else if (p == "noftz") noftz = true;
         else if (p == "tile" || p == "relaxed" || inert_mem_modifier(p)) ;
+        else if (p == "im2col_no_offs") op.im2col = true;
         else if (p == "add") { op.red_op = AtomOp::Add; have_op = true; }
         else if (p == "min") { op.red_op = AtomOp::Min; have_op = true; }
         else if (p == "max") { op.red_op = AtomOp::Max; have_op = true; }
@@ -3166,11 +3671,13 @@ class Parser {
         else if (p == "or") { op.red_op = AtomOp::Or; have_op = true; }
         else if (p == "xor") { op.red_op = AtomOp::Xor; have_op = true; }
         else if (auto t = parse_type_token(p); t && !op.tensor) { op.red_ty = *t; have_ty = true; }
-        else return unsupported("cp.reduce.async.bulk modifier '." + p + "' (im2col, overrides and "
-                                "multimem are not implemented)");
+        else return unsupported("cp.reduce.async.bulk modifier '." + p + "' (overrides and multimem "
+                                "are not implemented)");
       }
       if (!have_op) return unsupported("cp.reduce.async.bulk needs a reduction operation");
       if (op.tensor ? !op.dims : !have_ty) return unsupported("cp.reduce.async.bulk form");
+      if (op.im2col && (!op.tensor || op.dims < 3))
+        return unsupported("im2col_no_offs is a mode of 3D to 5D tensor reductions");
       if (spaces.size() != 2 || spaces[1] != "shared")
         return unsupported("cp.reduce.async.bulk reads from .shared::cta");
       const bool to_cluster = spaces[0] == "shared::cluster";
@@ -3268,6 +3775,7 @@ class Parser {
       } else {
         OpBulkCopy op;
         std::vector<std::string> spaces;
+        std::string im2col_mode;
         bool mbar_completion = false, group_completion = false;
         for (size_t i = 3; i < parts.size(); ++i) {
           const std::string& p = parts[i];
@@ -3278,7 +3786,10 @@ class Parser {
           else if (p == "bulk_group") group_completion = true;
           else if (p == "tile" || p == "weak" || p == "b128" || inert_mem_modifier(p)) ;
           else if (p == "multicast::cluster" || p == "multicast::cluster::16b") op.multicast = true;
-          else return unsupported("cp.async.bulk modifier '." + p + "' (im2col, gather/scatter, "
+          else if (p == "cta_group::1") op.cta_group = 1;
+          else if (p == "cta_group::2") op.cta_group = 2;
+          else if (p == "im2col" || p == "im2col_no_offs") { op.im2col = true; im2col_mode = p; }
+          else return unsupported("cp.async.bulk modifier '." + p + "' (gather/scatter, im2col::w, "
                                   "masks, overrides and reports are not implemented)");
         }
         if (spaces.size() != 2) return unsupported("cp.async.bulk needs a destination and a source space");
@@ -3292,6 +3803,15 @@ class Parser {
           return unsupported("cp.async.bulk between shared memories is a plain, unicast copy");
         op.to_shared = g2s || s2s;
         op.shared_to_shared = s2s;
+        if (op.im2col) {
+          if (!op.tensor || op.dims < 3)
+            return unsupported("im2col is a mode of 3D to 5D tensor copies");
+          // A load takes the offsets (.im2col); a store has none to take.
+          if (g2s != (im2col_mode == "im2col"))
+            return unsupported("tensor loads take .im2col and stores .im2col_no_offs");
+        }
+        if (op.cta_group == 2 && (!mbar_completion || !op.tensor))
+          return unsupported(".cta_group is a qualifier of tensor loads that complete on an mbarrier");
         if (op.to_shared && !mbar_completion)
           return unsupported("a cp.async.bulk load completes on an mbarrier (.mbarrier::complete_tx::bytes)");
         if (s2g && !group_completion)
@@ -3315,6 +3835,13 @@ class Parser {
           }
           expect_punct(",");
           op.mbar = parse_addr(fn);
+          if (op.im2col) {
+            expect_punct(",");
+            op.im2col_offsets = parse_operand_vector_any();
+            if (op.im2col_offsets.size() != op.dims - 2)
+              return unsupported("an im2col load takes one offset per spatial dimension (" +
+                                 std::to_string(op.dims - 2) + ")");
+          }
           if (op.multicast) {
             expect_punct(",");
             op.cta_mask = parse_operand();
@@ -3419,7 +3946,8 @@ class Parser {
         if (parts[i] != "aligned" && !inert_mem_modifier(parts[i]))
           return unsupported("barrier.cluster modifier '." + parts[i] + "'");
       ins.op = op;
-    } else if ((op0 == "bar" || op0 == "barrier") && parts.size() > 1 && parts[1] == "red") {
+    } else if ((op0 == "bar" || op0 == "barrier") &&
+               std::find(parts.begin(), parts.end(), "red") != parts.end()) {
       // bar.red.<op>.<type> d, 0, [!]p
       std::optional<BarRedOp> rop;
       bool pred_ty = false, u32_ty = false;
@@ -3430,7 +3958,7 @@ class Parser {
         else if (p == "popc") rop = BarRedOp::Popc;
         else if (p == "pred") pred_ty = true;
         else if (p == "u32") u32_ty = true;
-        else if (p == "cta") ;
+        else if (p == "cta" || p == "red" || p == "aligned") ;
         else return unsupported("bar.red modifier '." + p + "'");
       }
       if (!rop) return unsupported("bar.red needs .and, .or or .popc");
@@ -3450,29 +3978,40 @@ class Parser {
       op.src = expect_reg_operand("bar.red source predicate");
       ins.op = op;
     } else if (op0 == "bar" || op0 == "barrier") {
-      bool sync_seen = false, warp_scope = false;
+      bool sync_seen = false, arrive_seen = false, warp_scope = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         if (parts[i] == "sync") sync_seen = true;
-        else if (parts[i] == "cta") ;
+        else if (parts[i] == "arrive") arrive_seen = true;
+        else if (parts[i] == "cta" || parts[i] == "aligned") ;
         else if (parts[i] == "warp") warp_scope = true;
-        else return unsupported("only bar.sync and bar.warp.sync are implemented");
+        else return unsupported("bar modifier '." + parts[i] + "'");
       }
-      if (!sync_seen) return unsupported("only bar.sync is implemented");
+      if (sync_seen == arrive_seen) return unsupported("bar needs one of .sync and .arrive");
+      if (warp_scope && arrive_seen) return unsupported("bar.warp.arrive");
       if (warp_scope) {
         // __syncwarp. A warp executes its lanes in lockstep here and diverged
         // paths reconverge at the earliest common pc, so the lanes named by the
         // mask are already synchronised by the time this is reached. The
         // operand is the member mask, which nothing needs to consume.
         (void)parse_operand();
-        ins.op = OpBar{};
+        OpBar op;
+        op.warp = true;
+        ins.op = op;
         expect_punct(";");
         return ins;
       }
-      Operand which = parse_operand();
-      if (auto* imm = std::get_if<ImmInt>(&which); !imm || imm->value != 0)
-        return unsupported("only barrier 0 (bar.sync 0) is implemented");
-      if (peek_punct(",")) return unsupported("partial barriers (bar.sync 0, N) not implemented");
-      ins.op = OpBar{};
+      OpBar op;
+      op.arrive = arrive_seen;
+      op.id = parse_operand();
+      if (auto* imm = std::get_if<ImmInt>(&op.id); imm && (imm->value < 0 || imm->value > 15))
+        return unsupported("a CTA has barriers 0 to 15");
+      if (peek_punct(",")) {
+        next();
+        op.count = parse_operand();
+        op.have_count = true;
+      }
+      if (op.arrive && !op.have_count) return unsupported("bar.arrive needs a thread count");
+      ins.op = op;
     } else if (op0 == "ret" || op0 == "exit") {
       ins.op = OpRet{};
     } else {
@@ -3502,6 +4041,11 @@ class Parser {
   std::string current_kernel_;
   std::set<std::string> call_slots_;
   std::set<std::string> declared_regs_;  // every .reg name in the current kernel
+  // Registers declared inside a nested { } block that shadow an outer
+  // declaration, innermost block last: source name -> the name it is interned
+  // under while the block is open.
+  std::vector<std::unordered_map<std::string, std::string>> reg_scopes_;
+  int shadow_count_ = 0;
   EntryFn* cur_fn_ = nullptr;           // receives interned register ids
 };
 

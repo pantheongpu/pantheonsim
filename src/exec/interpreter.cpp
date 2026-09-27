@@ -20,6 +20,7 @@
 //    barriers or retirement. Blocks run sequentially in a fixed order.
 //    Everything is deterministic by construction.
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -33,6 +34,7 @@
 #include <cerrno>
 #include <limits>
 #include <map>
+#include <set>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -68,14 +70,16 @@ constexpr uint64_t kParamVaBase = 0x6ffd'0000'0000ull;
 constexpr uint64_t kParamVaSize = 1ull << 20;
 constexpr uint64_t kSharedVaBase = 0x6ffe'0000'0000ull;
 constexpr uint64_t kSharedVaSize = 1ull << 30;
-// Distributed shared memory: an address in the shared window whose bits from
-// here up are nonzero is in block rank (those bits - 1) of the cluster, and
-// the bits below are the offset in that block's shared memory. Zero means the
-// block issuing the access, so every ordinary shared address is already a
-// valid .shared::cluster address naming its own block, as the ISA requires
-// (the .shared::cta window is contained in the .shared::cluster one). A block
-// has at most 228 KiB of shared memory and a cluster at most 16 blocks, so
-// both fit with room to spare.
+// Distributed shared memory: the bits of a shared-window address from here up
+// are the cluster rank of the block it is in, and the bits below the offset in
+// that block's shared memory. A block's own addresses carry its own rank, so
+// every .shared::cta address is already the .shared::cluster address of the
+// same byte, as the ISA requires (the .shared::cta window is contained in the
+// .shared::cluster one) -- and, as CUTLASS's 2-SM kernels rely on ("Set peer
+// bit to 0 so that the transaction bytes will update CTA0's barrier", cute's
+// copy_sm100_tma.hpp), clearing bit 24 of an odd block's address gives the
+// same offset in its even peer. A block has at most 228 KiB of shared memory
+// and a cluster at most 16 blocks, so both fit with room to spare.
 constexpr uint32_t kClusterRankShift = 24;
 constexpr uint64_t kClusterOffsetMask = (1ull << kClusterRankShift) - 1;
 
@@ -97,10 +101,18 @@ struct ParamBuffer {
 // State for bar.red, which needs every warp in the block to arrive before it
 // can produce a value. Held behind a pointer for the same reason shared memory
 // is: the context is passed by const reference.
+// bar.red in rounds. Votes go into the round being gathered; when the block
+// releases, that round's answer is set aside and the next round starts empty,
+// and each warp collects the answer of the round it voted in. A warp released
+// first can loop back and vote again before the others have collected --
+// CUTLASS's semaphore wait is `while (__syncthreads_and(state != k))` -- and
+// with one shared accumulator that vote leaked into the answer they were
+// about to read, and the round after started from a stale value.
 struct BarrierReduction {
-  uint64_t acc = 0;
-  uint32_t arrived = 0;   // warps that have contributed and not yet collected
-  bool complete = false;  // set when the barrier released; cleared when drained
+  uint64_t acc = 0;        // the round being gathered
+  uint32_t arrived = 0;    // warps that have voted in it
+  uint64_t round = 0;      // its number
+  uint64_t result = 0;     // the answer of the last round released
 };
 
 // One mbarrier object. Lives in a side table keyed by its shared-memory
@@ -110,10 +122,14 @@ struct BarrierReduction {
 // work.
 // Bytes a TMA (cp.async.bulk) load has read from global memory and will write
 // into shared memory, as runs of (shared offset, length) over `data`.
+struct BlockCtx;
 struct PendingBulk {
   std::vector<std::pair<uint32_t, uint32_t>> runs;
   std::vector<uint8_t> data;
   uint64_t tx = 0;         // bytes it completes on its barrier
+  // The block whose shared memory the data goes to, when that is not the
+  // barrier's: a .cta_group::2 copy may complete on the peer CTA's barrier.
+  const BlockCtx* dst = nullptr;
 };
 
 struct Mbarrier {
@@ -138,6 +154,55 @@ struct Mbarrier {
 // Every mbarrier a block has initialized, by shared address.
 struct MbarrierTable {
   std::unordered_map<uint64_t, Mbarrier> bars;
+};
+
+// wgmma is one operation of the whole warpgroup, and it reads its shared
+// memory operands as one: the first of the four warps to issue its n-th
+// wgmma.mma_async reads A (all 64 rows) and B for all of them, and the
+// others take their share of that copy. The interpreter runs the warps one
+// after another, and when each read its own rows as it got there, a warp that
+// finished early could wait_group, release the stage and let the cluster peer
+// that multicasts A refill it before the last warp had read: CUTLASS's SM90
+// group GEMM got one warp's 16 rows of a tile from the next K block. No warp
+// can release a stage before some warp has issued the wgmma reading it, so
+// the first issue is a safe moment to read.
+struct WgmmaSnapshot {
+  std::vector<double> A;   // 64 x K when A is in shared memory, else empty
+  std::vector<double> B;   // K x N
+  uint8_t taken = 0;       // warp ranks within the group that have used it
+};
+struct WgmmaSnapshots {
+  std::map<std::pair<uint32_t, uint64_t>, WgmmaSnapshot> pending;   // (warpgroup, sequence)
+};
+
+// A CTA's Tensor Memory (sm_100, PTX ISA 9.7.18.1): 128 lanes of 512 32-bit
+// columns, handed out by tcgen05.alloc in power-of-two runs of at least 32
+// columns. The cells are made on the first allocation, so a kernel that never
+// uses it costs nothing. Real contents start undefined; these start zero, as
+// shared memory does here.
+struct TensorMemory {
+  static constexpr uint32_t kLanes = 128, kCols = 512;
+  std::vector<uint32_t> cells;                          // lane-major
+  std::map<uint32_t, uint32_t> live;                    // first column -> columns
+  bool exclusive = false;                               // the live one is .exclusive
+  bool relinquished = false;
+  // cta_group::2 allocations are made by one warp in each CTA of the pair,
+  // together. The first of the two to arrive makes it in both CTAs and leaves
+  // its column here for the other, which takes it instead of allocating again;
+  // deallocation works the same way.
+  std::deque<std::pair<uint32_t, uint32_t>> peer_alloc, peer_dealloc;
+  uint32_t& at(uint32_t lane, uint32_t col) { return cells[size_t{lane} * kCols + col]; }
+  bool allocated(uint32_t col) const {
+    auto it = live.upper_bound(col);
+    if (it == live.begin()) return false;
+    --it;
+    return col < it->first + it->second;
+  }
+  bool free_run(uint32_t col, uint32_t n) const {
+    for (const auto& [c, len] : live)
+      if (c < col + n && col < c + len) return false;
+    return col + n <= kCols;
+  }
 };
 
 // Shadow state for shared memory, one entry per 4-byte word, used only when
@@ -165,6 +230,57 @@ struct SharedShadow {
 };
 
 struct ClusterState;
+struct Warp;
+
+// Dynamic parallelism: the child grids a launch's kernels ask for. A thread
+// gets a parameter buffer for a kernel, fills it, and launches it; the child
+// runs after the parent grid has finished and before the launch as a whole
+// returns -- a schedule CUDA allows for every device-side stream, since it
+// promises no concurrency between a parent and its children, and one it
+// requires of a tail launch. Children run in the order they were launched,
+// parent block by parent block, which makes the order reproducible when
+// blocks run on several host threads.
+struct ChildLaunch {
+  KernelRef kernel;
+  std::array<uint32_t, 3> grid{}, block{};
+  uint32_t shared = 0;
+  uint64_t buffer = 0;     // the parameter buffer, in device memory
+  uint32_t size = 0;
+  uint64_t order = 0;      // parent block, then issue order within it
+};
+struct DeviceLaunches {
+  std::mutex mu;
+  std::unordered_map<uint64_t, ChildLaunch> by_buffer;   // a buffer handed out, not launched yet
+  std::vector<ChildLaunch> queue;                       // launched, to run after the grid
+  std::unordered_map<uint64_t, uint64_t> per_block;     // launches each parent block has issued
+};
+// cudaLimitDevRuntimePendingLaunchCount's default, and CUDA's nesting limit.
+constexpr size_t kMaxPendingLaunches = 2048;
+constexpr uint32_t kMaxLaunchDepth = 24;
+
+// A kernel's parameter space: each parameter at its alignment, in order --
+// the layout the parent writes a child's arguments in.
+uint32_t param_space_bytes(const EntryFn& fn) {
+  uint32_t end = 0;
+  for (const auto& p : fn.params) {
+    const uint32_t align = p.align ? p.align : (p.size < 8 ? std::max<uint32_t>(p.size, 1) : 8);
+    end = (end + align - 1) / align * align + p.size;
+  }
+  return end;
+}
+
+// The CTA's sixteen barriers as bar.sync with a thread count and bar.arrive
+// use them: arrivals counted in threads, a warp's arrival counting all of
+// its threads (the ISA "marks warps' arrival"), and the warps waiting.
+// A barrier without a count is the whole CTA, which the scheduler releases
+// when every warp that has not exited is waiting (see step_block).
+struct NamedBarrier {
+  uint32_t arrived = 0;
+  uint64_t waiting = 0;   // bit per warp of the block
+};
+struct NamedBarriers {
+  std::array<NamedBarrier, 16> bar{};
+};
 
 struct BlockCtx {
   std::array<uint32_t, 3> ctaid{};
@@ -180,7 +296,11 @@ struct BlockCtx {
   // leaves it undefined, VirtualGPU makes it deterministic (documented).
   std::vector<uint8_t>* shared = nullptr;
   BarrierReduction* bar_red = nullptr;
+  NamedBarriers* bars = nullptr;
+  std::vector<Warp>* warps = nullptr;   // the block's, for releasing a named barrier's waiters
   MbarrierTable* mbar = nullptr;
+  WgmmaSnapshots* wgmma = nullptr;
+  TensorMemory* tmem = nullptr;
   SharedShadow* shadow = nullptr;   // non-null only when race detection is on
   // The thread-block cluster this block belongs to, for barrier.cluster. A
   // launch without clusters still has one per block.
@@ -236,6 +356,11 @@ struct Warp {
   // instruction re-executes when the barrier releases, and this is how it knows
   // to collect rather than contribute a second time.
   bool bar_red_waiting = false;
+  uint64_t bar_red_round = 0;   // the bar.red round this warp voted in
+  // At a barrier with a thread count, which that barrier's completion
+  // releases; step_block's all-warps release leaves such a warp waiting.
+  bool counted_barrier = false;
+  uint8_t barrier_id = 0;
   // Set by an mbarrier wait that came back incomplete. The warp stays Ready --
   // the wait is a predicate and the kernel is free to spin on it -- but it
   // gives up the rest of its turn so the warps it is waiting for can run. With
@@ -246,6 +371,11 @@ struct Warp {
   // phase, and the phase a later wait is waiting to see end.
   Mask cluster_arrived = 0;
   uint32_t cluster_wait_phase = 0;
+  // wgmma.mma_async instructions issued, which pairs this warp's n-th with
+  // the rest of its warpgroup's n-th (see WgmmaSnapshots), and the count at
+  // each wgmma.commit_group not yet waited for.
+  uint64_t wgmma_issued = 0;
+  std::vector<uint64_t> wgmma_commits;
   // Instructions this warp has issued, for the step budget. Counted per warp
   // rather than per launch: the budget exists to catch a thread that never
   // finishes, and a launch's total grows with its grid -- a 12 GB sweep over
@@ -400,25 +530,26 @@ double f16_to_double(uint64_t bits) {
 // not much cheaper.
 std::atomic<int> g_directed_rounding{0};
 
-[[gnu::noinline]] uint64_t double_to_f16_exact(double d);
+[[gnu::noinline]] uint64_t double_to_narrow(double d, int man, int ebits);
+
+// NaN in a 16-bit float: what a real GPU writes for every NaN result, whatever
+// the input's payload -- the all-ones pattern below the sign, 0x7FFF for both
+// f16 and bf16 (and 0x7FFFFFFF for f32, which PTX calls canonical).
+inline constexpr uint64_t kCanonicalNaN16 = 0x7FFF;
 
 inline uint64_t double_to_f16(double d) {
   // A normal binary16 result under round-to-nearest-even, done on the bits:
-  // keep the top 10 bits of the double's mantissa and round on the 42 below.
-  // NaN, infinity and overflow are answered the same way the form below
-  // answers them, whatever the rounding mode. That form is kept for what
-  // remains: subnormal results, and anything under a directed mode.
-  if (g_fast_path.load(std::memory_order_relaxed)) {
-    const uint64_t b = std::bit_cast<uint64_t>(d);
-    const uint64_t mag = b & 0x7FFF'FFFF'FFFF'FFFFull;
-    if (mag > 0x7FF0'0000'0000'0000ull) return 0x7E00;             // NaN
-    if (mag >= 0x40EF'FE00'0000'0000ull)                             // >= 65520, or infinity
-      return (static_cast<uint32_t>(b >> 48) & 0x8000u) | 0x7C00;
-  }
+  // keep the top 10 bits of the double's mantissa and round on the 42 below,
+  // with NaN, infinity and overflow answered as the general form answers them.
+  // That form is kept for what remains: subnormal results, and anything under
+  // a directed mode, where overflow can stop at the largest finite value.
   if (g_directed_rounding.load(std::memory_order_relaxed) == 0 &&
       g_fast_path.load(std::memory_order_relaxed)) {
     const uint64_t b = std::bit_cast<uint64_t>(d);
     const uint64_t mag = b & 0x7FFF'FFFF'FFFF'FFFFull;
+    if (mag > 0x7FF0'0000'0000'0000ull) return kCanonicalNaN16;
+    if (mag >= 0x40EF'FE00'0000'0000ull)                             // >= 65520, or infinity
+      return (static_cast<uint32_t>(b >> 48) & 0x8000u) | 0x7C00;
     const int e = static_cast<int>(mag >> 52) - 1023;   // unbiased exponent
     if (e >= -14 && e <= 15) {                            // a normal half, before rounding
       const uint32_t sign = static_cast<uint32_t>(b >> 48) & 0x8000u;
@@ -435,29 +566,42 @@ inline uint64_t double_to_f16(double d) {
       return sign | (e16 << 10) | static_cast<uint32_t>(mant);
     }
   }
-  return double_to_f16_exact(d);
+  return double_to_narrow(d, 10, 5);
 }
 
-[[gnu::noinline]] uint64_t double_to_f16_exact(double d) {
-  if (std::isnan(d)) return 0x7E00;
-  uint32_t sign = std::signbit(d) ? 0x8000u : 0u;
-  double a = std::fabs(d);
-  if (std::isinf(a) || a >= 65520.0) return sign | 0x7C00;  // overflow -> inf
-  if (a < std::ldexp(1.0, -24)) return sign;                // underflow -> zero
+// d rounded to a binary float with `man` stored mantissa bits and `ebits`
+// exponent bits (f16 is 10/5, bf16 7/8), in the host's current rounding mode,
+// subnormals included. The rounding is one nearbyint of d scaled so the
+// result's last place is 1, which is what makes every mode come out right:
+// scaling the magnitude instead rounded -x toward zero under .rm. A value
+// between the smallest subnormal and half of it rounds up to that subnormal;
+// flushing everything below the smallest one to zero lost silu(-20) in f16.
+// Overflow gives infinity only where the mode rounds away from zero; .rz, and
+// .rm/.rp against the sign, stop at the largest finite value.
+[[gnu::noinline]] uint64_t double_to_narrow(double d, int man, int ebits) {
+  const int bias = (1 << (ebits - 1)) - 1;
+  const uint32_t sign = std::signbit(d) ? 1u << (man + ebits) : 0u;
+  const uint32_t inf = ((1u << ebits) - 1) << man;
+  if (std::isnan(d)) return kCanonicalNaN16;
+  if (d == 0) return sign;
+  if (std::isinf(d)) return sign | inf;
   int exp;
-  double frac = std::frexp(a, &exp);  // a = frac * 2^exp, frac in [0.5, 1)
-  int e16 = exp - 1 + 15;             // unbiased exponent + bias
-  if (e16 <= 0) {                     // subnormal
-    uint32_t mant = static_cast<uint32_t>(std::nearbyint(std::ldexp(a, 24)));
-    return sign | (mant & 0x3FF);
+  std::frexp(d, &exp);                          // |d| in [2^(exp-1), 2^exp)
+  int e = std::max(exp - 1, 1 - bias);          // the exponent the result is scaled by
+  uint64_t mant = static_cast<uint64_t>(std::fabs(std::nearbyint(std::ldexp(d, man - e))));
+  if (mant >> (man + 1)) {                      // rounding carried into the next binade
+    mant >>= 1;
+    ++e;
   }
-  uint32_t mant = static_cast<uint32_t>(std::nearbyint((frac * 2.0 - 1.0) * 1024.0));
-  if (mant == 1024) {  // rounding carried into the exponent
-    mant = 0;
-    ++e16;
+  if (e > bias) {
+    const int mode = std::fegetround();
+    const bool to_inf = mode == FE_TONEAREST || (mode == FE_UPWARD && !sign) ||
+                        (mode == FE_DOWNWARD && sign);
+    return sign | (to_inf ? inf : inf - 1);
   }
-  if (e16 >= 31) return sign | 0x7C00;
-  return sign | (static_cast<uint32_t>(e16) << 10) | (mant & 0x3FF);
+  if (mant < (1ull << man)) return sign | static_cast<uint32_t>(mant);  // subnormal
+  return sign | (static_cast<uint32_t>(e + bias) << man) |
+         static_cast<uint32_t>(mant - (1ull << man));
 }
 
 // ---- FP8 -------------------------------------------------------------
@@ -771,6 +915,7 @@ class Interpreter {
   }
 
   void set_concurrent(bool v) { concurrent_ = v; }
+  void set_device_launches(DeviceLaunches* dl) { dl_ = dl; }
   void set_grid_id(uint64_t v) { grid_id_ = v; }
 
   void run_grid() {
@@ -812,7 +957,13 @@ class Interpreter {
                         cfg_.grid[2], ") is not a whole number of ", c[0], "x", c[1], "x", c[2],
                         " clusters");
     const uint32_t size = c[0] * c[1] * c[2];
-    for (uint64_t k = first; k < last; ++k) {
+    // Clusters are taken from the front of the range, so one that a running
+    // cluster has cancelled (clusterlaunchcontrol.try_cancel) never starts.
+    clc_next_ = first;
+    clc_last_ = last;
+    clc_clusters_ = true;
+    while (clc_next_ < clc_last_) {
+      const uint64_t k = clc_next_++;
       std::vector<BlockState> blocks(size);
       std::vector<std::unique_ptr<Scheduler>> scheds;   // per block, as for a cooperative grid
       for (uint32_t r = 0; r < size; ++r)
@@ -843,6 +994,7 @@ class Interpreter {
         }
       }
     }
+    clc_next_ = clc_last_ = 0;
   }
 
   // A cooperative launch: every block resident at once, interleaved.
@@ -915,7 +1067,11 @@ class Interpreter {
   void run_block_range(uint64_t first, uint64_t last) {
     auto sched = make_scheduler(cfg_.scheduler, cfg_.scheduler_seed);
     const uint64_t gx = cfg_.grid[0], gy = cfg_.grid[1];
-    for (uint64_t i = first; i < last; ++i) {
+    clc_next_ = first;
+    clc_last_ = last;
+    clc_clusters_ = false;
+    while (clc_next_ < clc_last_) {
+      const uint64_t i = clc_next_++;
       BlockCtx ctx;
       ctx.ctaid = {static_cast<uint32_t>(i % gx), static_cast<uint32_t>((i / gx) % gy),
                    static_cast<uint32_t>(i / (gx * gy))};
@@ -926,9 +1082,30 @@ class Interpreter {
       run_block(ctx, *sched);
       ++stats_.blocks;
     }
+    clc_next_ = clc_last_ = 0;
   }
 
  private:
+  DeviceLaunches* dl_ = nullptr;
+
+  // The units (clusters, or blocks when there are none) of the range this
+  // interpreter is running that have not started yet: [clc_next_, clc_last_).
+  // clusterlaunchcontrol.try_cancel takes the next of them, which then never
+  // launches, and gives its first CTA to the canceller. Empty outside those
+  // two loops -- a cooperative launch has every block running already -- so a
+  // cancellation there fails, as it does on a device with nothing pending.
+  uint64_t clc_next_ = 0, clc_last_ = 0;
+  bool clc_clusters_ = false;
+
+  std::optional<std::array<uint32_t, 3>> clc_take() {
+    if (clc_next_ >= clc_last_) return std::nullopt;
+    const uint64_t u = clc_next_++;
+    if (clc_clusters_) return cluster_member(u, 0);
+    const uint64_t gx = cfg_.grid[0], gy = cfg_.grid[1];
+    return std::array<uint32_t, 3>{static_cast<uint32_t>(u % gx), static_cast<uint32_t>((u / gx) % gy),
+                                   static_cast<uint32_t>(u / (gx * gy))};
+  }
+
   // Re-throws a lower-level error with kernel/instruction context attached.
   [[noreturn]] void rethrow_with_context(const Error& e, const Instr& ins, int lane) {
     throw Error::make(e.code(), e.message(), "\n  in ", cur_ == &fn_ ? "kernel '" : "device function '",
@@ -936,6 +1113,38 @@ class Interpreter {
                       lane >= 0 ? "\n  lane " + std::to_string(lane) : "",
                       "\n  instruction: ", ins.text.empty() ? "?" : ins.text,
                       "\n  GPU profile: ", profile_.id);
+  }
+
+  // Where every warp of the block is, for a hang: the warp that ran out of
+  // steps is usually spinning in a wait, and which warp should have released
+  // it -- and what that one is doing instead -- is the rest of the diagnosis.
+  // Warps in the same place are listed together.
+  std::string warp_positions(const BlockCtx& ctx) const {
+    if (!ctx.warps) return {};
+    auto where = [&](const Warp& w) {
+      if (w.state == Warp::State::Done) return std::string("exited");
+      std::string out = w.state == Warp::State::AtBarrier ? "at a barrier" : "running";
+      for (const Path& p : w.paths) {
+        out += p.pc < fn_.body.size()
+                   ? "; PTX line " + std::to_string(fn_.body[p.pc].line) + ": " +
+                         fn_.body[p.pc].text.substr(0, 100)
+                   : std::string("; past the end");
+        if (p.parked) out += " (parked)";
+      }
+      return out;
+    };
+    std::string out = "\n  warps of this block:";
+    const auto& warps = *ctx.warps;
+    for (size_t i = 0; i < warps.size();) {
+      const std::string here = where(warps[i]);
+      size_t j = i + 1;
+      while (j < warps.size() && where(warps[j]) == here) ++j;
+      out += "\n    " + (j - i == 1 ? "warp " + std::to_string(i)
+                                     : "warps " + std::to_string(i) + "-" + std::to_string(j - 1)) +
+             ": " + here;
+      i = j;
+    }
+    return out;
   }
 
   [[noreturn]] void ctx_fail(const Instr& ins, int lane, Err code, const std::string& msg) {
@@ -954,7 +1163,10 @@ class Interpreter {
     BlockCtx ctx;
     std::vector<uint8_t> shared;
     BarrierReduction bar_red;
+    NamedBarriers bars;
     MbarrierTable mbar;
+    WgmmaSnapshots wgmma;
+    TensorMemory tmem;
     SharedShadow shadow;
     std::vector<Warp> warps;
     uint64_t clock = 0;
@@ -969,6 +1181,12 @@ class Interpreter {
     b.ctx.shared = &b.shared;
     b.ctx.bar_red = &b.bar_red;
     b.ctx.mbar = &b.mbar;
+    b.wgmma.pending.clear();
+    b.ctx.wgmma = &b.wgmma;
+    b.tmem = TensorMemory{};
+    b.ctx.tmem = &b.tmem;
+    b.ctx.bars = &b.bars;
+    b.ctx.warps = &b.warps;
     b.ctx.clock = &b.clock;
     b.ctx.exited = &b.exited;
     if (detect_races() && !b.shared.empty()) {
@@ -1016,18 +1234,53 @@ class Interpreter {
     for (size_t i = 0; i < b.warps.size(); ++i)
       if (b.warps[i].state == Warp::State::Ready) runnable.push_back(i);
     if (runnable.empty()) {
-      bool any_waiting = false;
+      // Every warp that has not exited is waiting. Those at a whole-CTA
+      // barrier (bar.sync without a count, bar.red) have all arrived, so it
+      // completes; those at a counted barrier are released by the arrivals
+      // that complete it, and cannot be released here.
+      bool any_waiting = false, any_counted = false;
       for (auto& w : b.warps)
         if (w.state == Warp::State::AtBarrier) {
+          if (w.counted_barrier) {
+            any_counted = true;
+            continue;
+          }
           w.state = Warp::State::Ready;
           any_waiting = true;
         }
-      // Every warp has now arrived, so a bar.red in flight has its answer.
-      if (any_waiting) b.bar_red.complete = true;
+      if (!any_waiting && any_counted) {
+        // Nothing can run and nothing more can arrive: a hang on hardware.
+        std::string where;
+        for (size_t i = 0; i < b.bars.bar.size(); ++i)
+          if (b.bars.bar[i].waiting)
+            where += "\n  barrier " + std::to_string(i) + ": " +
+                     std::to_string(__builtin_popcountll(b.bars.bar[i].waiting)) + " warp(s) waiting, " +
+                     std::to_string(b.bars.bar[i].arrived) + " thread(s) arrived";
+        throw Error::make(Err::LaunchConfig,
+                          "deadlock: every warp of the block that has not exited is waiting at a "
+                          "barrier whose thread count can no longer be reached", where);
+      }
+      // Every warp has now arrived, so a bar.red round in flight has its
+      // answer: set it aside and start the next.
+      if (any_waiting && b.bar_red.arrived) {
+        b.bar_red.result = b.bar_red.acc;
+        b.bar_red.arrived = 0;
+        ++b.bar_red.round;
+      }
       // ...and the barrier they arrived at orders everything before it
       // against everything after, which is what ends the epoch.
       if (any_waiting && b.ctx.shadow) ++b.ctx.shadow->epoch;
       if (!any_waiting) {
+        // "All of the Tensor Memory that was allocated ... must be explicitly
+        // deallocated using tcgen05.dealloc before the kernel exits."
+        if (!b.tmem.live.empty()) {
+          uint32_t cols = 0;
+          for (const auto& [c, n] : b.tmem.live) cols += n;
+          throw Error::make(Err::LaunchConfig, "block (", b.ctx.ctaid[0], ",", b.ctx.ctaid[1], ",",
+                            b.ctx.ctaid[2], ") exited with ", cols,
+                            " Tensor Memory columns still allocated; every tcgen05.alloc needs a "
+                            "tcgen05.dealloc before the kernel exits");
+        }
         b.done = true;
         return false;  // all Done
       }
@@ -1138,7 +1391,8 @@ class Interpreter {
                  "exceeded the step budget (" + std::to_string(cfg_.max_steps) +
                      " instructions in one warp) — possible infinite loop; block (" +
                      std::to_string(ctx.ctaid[0]) + "," + std::to_string(ctx.ctaid[1]) + "," +
-                     std::to_string(ctx.ctaid[2]) + "), warp " + std::to_string(cur_warp_));
+                     std::to_string(ctx.ctaid[2]) + "), warp " + std::to_string(cur_warp_) +
+                     warp_positions(ctx));
       // The fast-path kinds go straight to their handler: no trip through
       // step() and dispatch(), whose frames cost more than the arithmetic.
       // A form the fast path declines falls through to step() as before.
@@ -1222,6 +1476,7 @@ class Interpreter {
       return InstClass::Integer;
 
     if (std::holds_alternative<OpCvt>(ins.op) || std::holds_alternative<OpCvtF16x2>(ins.op) ||
+        std::holds_alternative<OpCvtPack>(ins.op) ||
         std::holds_alternative<OpCvta>(ins.op) || std::holds_alternative<OpMovPack>(ins.op) ||
         std::holds_alternative<OpMovUnpack>(ins.op))
       return InstClass::BitConvert;
@@ -1242,7 +1497,8 @@ class Interpreter {
       return InstClass::Memory;
 
     if (std::holds_alternative<OpMma>(ins.op) || std::holds_alternative<OpWmmaMma>(ins.op) ||
-        std::holds_alternative<OpWgmma>(ins.op) || std::holds_alternative<OpMovMatrix>(ins.op))
+        std::holds_alternative<OpWgmma>(ins.op) || std::holds_alternative<OpTcgen05>(ins.op) ||
+        std::holds_alternative<OpMovMatrix>(ins.op))
       return InstClass::Tensor;
 
     return InstClass::Misc;
@@ -1250,11 +1506,13 @@ class Interpreter {
 
   // ---- symbols / registers / operands ----
 
-  uint64_t resolve_symbol(const Instr& ins, const std::string& name) {
+  uint64_t resolve_symbol(const BlockCtx& ctx, const Instr& ins, const std::string& name) {
     // .local/.shared variables name an offset within their address space, not
     // a generic address; cvta converts when the kernel needs a generic pointer.
+    // A .shared one is in this block's part of the cluster's window.
     if (auto it = cur_->locals.find(name); it != cur_->locals.end()) return it->second.offset;
-    if (auto it = fn_.shared.find(name); it != fn_.shared.end()) return it->second.offset;
+    if (auto it = fn_.shared.find(name); it != fn_.shared.end())
+      return cluster_address(ctx, cluster_rank_of(ctx), it->second.offset);
     if (symbols_) {
       if (auto it = symbols_->find(name); it != symbols_->end()) return it->second;
     }
@@ -1272,10 +1530,9 @@ class Interpreter {
       if (k == name)
         ctx_fail(ins, -1, Err::Unsupported,
                  "kernel '" + name +
-                     "' had its address taken, which in device code means a device-side launch "
-                     "(dynamic parallelism). That is not implemented: a child grid would have to "
-                     "run from inside the parent's instruction stream, and nothing here can "
-                     "schedule one");
+                     "' had its address taken for a device-side launch (dynamic parallelism), "
+                     "but this launch has no symbol table giving kernels addresses; the runtime "
+                     "supplies one");
     ctx_fail(ins, -1, Err::NotFound,
              "unknown symbol '" + name + "' (not a .local depot, module .global variable, "
              "kernel parameter, or device function)");
@@ -1323,7 +1580,7 @@ class Interpreter {
       return scratch;
     }
     if (const auto* sym = std::get_if<SymbolOperand>(&op)) {
-      scratch.fill(resolve_symbol(ins, sym->name));
+      scratch.fill(resolve_symbol(ctx, ins, sym->name));
       return scratch;
     }
     const auto& sr = std::get<SregOperand>(op);
@@ -1759,9 +2016,9 @@ class Interpreter {
   };
   SharedRef shared_ref(const BlockCtx& ctx, const Instr& ins, int lane, uint64_t addr) {
     const uint64_t rel = addr - kSharedVaBase;
-    const uint64_t tag = rel >> kClusterRankShift;
-    if (!tag) return {&ctx, rel};
-    return {&cluster_block(ctx, ins, lane, tag - 1), rel & kClusterOffsetMask};
+    const uint64_t rank = rel >> kClusterRankShift;
+    if (rank == cluster_rank_of(ctx)) return {&ctx, rel & kClusterOffsetMask};
+    return {&cluster_block(ctx, ins, lane, rank), rel & kClusterOffsetMask};
   }
   // The same, bounds-checked for `size` bytes.
   SharedRef shared_at(const BlockCtx& ctx, const Instr& ins, int lane, uint64_t addr, uint64_t size) {
@@ -1780,9 +2037,8 @@ class Interpreter {
   // A shared::cluster address for `off` in block `rank`, as mapa returns it:
   // the plain offset when that is the issuing block.
   static uint64_t cluster_address(const BlockCtx& ctx, uint64_t rank, uint64_t off) {
-    off &= kClusterOffsetMask;
-    if (rank == cluster_rank_of(ctx)) return off;
-    return ((rank + 1) << kClusterRankShift) | off;
+    (void)ctx;
+    return (rank << kClusterRankShift) | (off & kClusterOffsetMask);
   }
 
   // Race detection, off unless VGPU_RACE=1.
@@ -1859,7 +2115,12 @@ class Interpreter {
   // For copies that only ever reach the issuing block's own shared memory
   // (cp.async): an address naming another block is out of its bounds.
   void check_shared(const BlockCtx& ctx, const Instr& ins, int lane, uint64_t addr, uint32_t size) {
-    uint64_t off = addr - kSharedVaBase;
+    const SharedRef r = shared_ref(ctx, ins, lane, addr);
+    if (r.owner != &ctx)
+      ctx_fail(ins, lane, Err::InvalidValue,
+               "a .shared::cta access to another block of the cluster (rank " +
+                   std::to_string(cluster_rank_of(*r.owner)) + ")");
+    uint64_t off = r.off;
     size_t have = ctx.shared ? ctx.shared->size() : 0;
     if (off + size > have)
       ctx_fail(ins, lane, Err::OutOfBounds,
@@ -1983,14 +2244,27 @@ class Interpreter {
       if (!ctx.bar_red)
         ctx_fail(ins, -1, Err::UnsupportedPtx, "bar.red outside a block context");
       BarrierReduction& red = *ctx.bar_red;
+      if (!w.bar_red_waiting && w.paths.size() > 1) {
+        // Like bar.sync, bar.red waits for every live thread, so lanes of this
+        // warp still on another path have to get here before the warp votes.
+        // CUTLASS's semaphore wait sends thread 0 round a fetch at a higher pc
+        // while its warp-mates go straight back to the bar.red; voting for the
+        // partial warp here left thread 0 behind for good, and the loop never
+        // saw the semaphore change.
+        if (select_other_runnable(w, idx) != idx) {
+          w.paths[idx].parked = Path::kAtBarrier;
+          return;
+        }
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "bar.red cannot be reached by every lane of the warp: some lanes are on a path "
+                 "that never arrives at this barrier");
+      }
       if (!w.bar_red_waiting) {
         // Contribute and wait. The result is not known until every warp in the
         // block has arrived, so the pc stays put and this re-executes on
         // release rather than advancing now.
-        if (red.arrived == 0) {
-          red.acc = op->op == BarRedOp::And ? ~uint64_t{0} : 0;
-          red.complete = false;
-        }
+        if (red.arrived == 0) red.acc = op->op == BarRedOp::And ? ~uint64_t{0} : 0;
+        w.bar_red_round = red.round;
         Mask p = read_pred(w, ins, op->src);
         if (op->negate_src) p = ~p;
         const Mask voters = p & m;
@@ -2012,17 +2286,22 @@ class Interpreter {
         w.state = Warp::State::AtBarrier;
         return;
       }
-      // Released: collect the block-wide result.
+      // Released: collect the block-wide result of the round this warp voted
+      // in, which the release set aside (the round after it cannot have
+      // completed: it needs this warp's vote).
       w.bar_red_waiting = false;
-      if (red.arrived) --red.arrived;
+      if (w.bar_red_round + 1 != red.round)
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "bar.red released a warp whose round has not completed; were some warps at a "
+                 "bar.sync on the same barrier?");
       if (op->op == BarRedOp::Popc) {
         Lanes r;
         for (uint32_t lane = 0; lane < W_; ++lane)
-          if (m & (Mask{1} << lane)) r[lane] = red.acc;
+          if (m & (Mask{1} << lane)) r[lane] = red.result;
         write_reg(w, op->dst, m, r, 32);
       } else {
         Mask& dp = pred_slot(w, op->dst);
-        dp = (red.acc & 1u) ? (dp | m) : (dp & ~m);
+        dp = (red.result & 1u) ? (dp | m) : (dp & ~m);
       }
       ++w.paths[idx].pc;
       return;
@@ -2058,8 +2337,24 @@ class Interpreter {
       ++w.paths[idx].pc;
       return;
     }
-    if (std::holds_alternative<OpBar>(ins.op)) {
-      if (ins.has_pred) ctx_fail(ins, -1, Err::UnsupportedPtx, "predicated bar.sync is not supported");
+    if (const auto* bop = std::get_if<OpBar>(&ins.op)) {
+      if (bop->warp) {   // bar.warp.sync: the warp is already reconverged here
+        ++w.paths[idx].pc;
+        return;
+      }
+      if (ins.has_pred) {
+        // A guarded barrier is fine as long as the warp agrees: all of it
+        // takes the barrier or none does. Lanes that disagree leave the
+        // aligned barrier undefined.
+        if (m == 0) {
+          ++w.paths[idx].pc;
+          return;
+        }
+        if (m != active)
+          ctx_fail(ins, -1, Err::UnsupportedPtx,
+                   "a guarded bar.sync that some lanes of the warp take and others skip; the "
+                   "barrier is aligned, so the warp must agree");
+      }
       ++stats_.barriers;
       // Every live lane must arrive before the warp yields. Lanes still on
       // other paths have a higher pc and will merge here first; if any path
@@ -2095,8 +2390,57 @@ class Interpreter {
                  "bar.sync cannot be reached by every lane of the warp: some lanes are on a path "
                  "that never arrives at this barrier" + where);
       }
+      const uint32_t lead = first_set(m);
+      Lanes _s_id;
+      const uint64_t id = read_operand(w, ctx, ins, bop->id, _s_id)[lead];
+      if (id > 15)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "barrier " + std::to_string(id) + ": a CTA has barriers 0 to 15");
       ++w.paths[idx].pc;
-      w.state = Warp::State::AtBarrier;
+      if (!bop->have_count) {
+        w.state = Warp::State::AtBarrier;
+        w.counted_barrier = false;
+        w.barrier_id = static_cast<uint8_t>(id);
+        return;
+      }
+      Lanes _s_c;
+      const uint64_t count = static_cast<uint32_t>(read_operand(w, ctx, ins, bop->count, _s_c)[lead]);
+      if (count == 0 || count % W_)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "a barrier's thread count must be a non-zero multiple of the warp size (" +
+                     std::to_string(W_) + "); got " + std::to_string(count));
+      NamedBarrier& nb = ctx.bars->bar[id];
+      nb.arrived += W_;
+      if (nb.arrived >= count) {
+        // Complete: the waiters go, and the barrier is ready for reuse.
+        for (size_t i = 0; i < ctx.warps->size(); ++i)
+          if (nb.waiting >> i & 1) {
+            Warp& other = (*ctx.warps)[i];
+            other.state = Warp::State::Ready;
+            other.counted_barrier = false;
+          }
+        nb = NamedBarrier{};
+        if (ctx.shadow) ++ctx.shadow->epoch;
+        return;
+      }
+      if (!bop->arrive) {
+        nb.waiting |= uint64_t{1} << cur_warp_;
+        w.state = Warp::State::AtBarrier;
+        w.counted_barrier = true;
+        w.barrier_id = static_cast<uint8_t>(id);
+      }
+      return;
+    }
+
+    // wgmma.wait_group N: the groups before the N most recent are complete
+    // only once the whole warpgroup has issued their operations -- wgmma is
+    // one operation of all four warps. Until then the warp waits here. A warp
+    // that went on alone could release a stage its warp-mates had not yet
+    // waited for; the refill moved the barrier on two phases and the last
+    // warp's parity wait never finished (CUTLASS's ping-pong GEMM).
+    if (const auto* wop = std::get_if<OpWgmma>(&ins.op);
+        wop && wop->kind == WgmmaKind::Wait && m != 0 && !wgmma_group_caught_up(w, ctx, wop->wait_n)) {
+      w.yield_now = true;
       return;
     }
 
@@ -2110,6 +2454,21 @@ class Interpreter {
       }
     }
     ++w.paths[idx].pc;
+  }
+
+  // Whether every warp of w's warpgroup has issued the wgmma operations in the
+  // groups a wait_group `keep` waits for, and if so forgets those groups.
+  bool wgmma_group_caught_up(Warp& w, const BlockCtx& ctx, uint32_t keep) {
+    auto& marks = w.wgmma_commits;
+    if (marks.size() <= keep || !ctx.warps) return true;
+    const uint64_t need = marks[marks.size() - keep - 1];
+    const uint32_t linear0 = w.tid_x[0] + w.tid_y[0] * ctx.ntid[0] +
+                             w.tid_z[0] * ctx.ntid[0] * ctx.ntid[1];
+    const size_t first = (linear0 / W_) / 4 * 4;
+    for (size_t r = first; r < first + 4 && r < ctx.warps->size(); ++r)
+      if ((*ctx.warps)[r].wgmma_issued < need) return false;
+    marks.erase(marks.begin(), marks.end() - keep);
+    return true;
   }
 
   // Is there another path that can still run -- one not itself waiting at a
@@ -2412,7 +2771,7 @@ class Interpreter {
     const Type& st = op.src_ty;
     const Type& dt = op.dst_ty;
     if (st.is_real() || dt.is_real() || st.kind == Type::Kind::Pred || dt.kind == Type::Kind::Pred ||
-        op.round != Round::None)
+        op.round != Round::None || op.sat || (dt.is_signed() && dt.bits < 32))
       return false;
     Lanes sv;
     const Lanes& v = read_operand(w, ctx, ins, op.src, sv);
@@ -2777,9 +3136,40 @@ class Interpreter {
       Lanes _s_v;
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
+      // .rz/.rm/.rp into a float destination round in that mode, the way
+      // float_bin does it: set the host mode around the conversions. (Into an
+      // integer the mode is applied by round_int instead.)
+      int host_mode = FE_TONEAREST;
+      if (op->dst_ty.is_real())
+        switch (op->round) {
+          case Round::Rz: host_mode = FE_TOWARDZERO; break;
+          case Round::Rm: host_mode = FE_DOWNWARD; break;
+          case Round::Rp: host_mode = FE_UPWARD; break;
+          default: break;
+        }
+      const int prev_round = host_mode == FE_TONEAREST ? 0 : std::fegetround();
+      if (host_mode != FE_TONEAREST) {
+        g_directed_rounding.fetch_add(1, std::memory_order_relaxed);
+        std::fesetround(host_mode);
+      }
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) r[lane] = convert(op, v[lane]);
-      write_reg(w, op->dst, m, r, op->dst_ty.bits);
+      if (host_mode != FE_TONEAREST) {
+        std::fesetround(prev_round);
+        g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
+      }
+      // A signed integer type narrower than the register is sign-extended
+      // into it (PTX's rule for destination operands): cvt.s8.s32 of 0xFF
+      // leaves 0xFFFFFFFF.
+      const Type& dt = op->dst_ty;
+      if (dt.is_signed() && !dt.is_real() && dt.bits < 32) {
+        const uint64_t sign = uint64_t{1} << (dt.bits - 1), mask = (sign << 1) - 1;
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if ((m & (Mask{1} << lane)) && (r[lane] & sign)) r[lane] |= ~mask;
+        write_reg(w, op->dst, m, r, op->dst.wide ? 64 : 32);
+        return;
+      }
+      write_reg(w, op->dst, m, r, dt.bits);
       return;
     }
     if (const auto* op = std::get_if<OpAtom>(&ins.op)) {
@@ -2883,6 +3273,15 @@ class Interpreter {
       exec_wgmma(w, ctx, ins, *op, m);
       return;
     }
+    if (const auto* op = std::get_if<OpTcgen05>(&ins.op)) {
+      require_warp32(ins, "tcgen05");
+      exec_tcgen05(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpClc>(&ins.op)) {
+      exec_clc(w, ctx, ins, *op, m);
+      return;
+    }
     if (const auto* op = std::get_if<OpMma>(&ins.op)) {
       require_warp32(ins, "mma.sync");
       exec_mma(w, ctx, ins, *op, m);
@@ -2924,6 +3323,29 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) r[lane] = acc;
       write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpCvtPack>(&ins.op)) {
+      Lanes _s_a, _s_b, _s_c;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      const Lanes* c = op->has_c ? &read_operand(w, ctx, ins, op->c, _s_c) : nullptr;
+      const uint32_t bits = op->bits;
+      const int64_t lo = op->is_signed ? -(int64_t{1} << (bits - 1)) : 0;
+      const int64_t hi = op->is_signed ? (int64_t{1} << (bits - 1)) - 1 : (int64_t{1} << bits) - 1;
+      const uint32_t field = static_cast<uint32_t>((uint64_t{1} << bits) - 1);
+      auto sat = [&](uint64_t v) {
+        const int64_t x = std::clamp<int64_t>(static_cast<int32_t>(v), lo, hi);
+        return static_cast<uint32_t>(x) & field;
+      };
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
+          uint32_t d = sat(b[lane]) | sat(a[lane]) << bits;
+          if (c) d |= static_cast<uint32_t>((*c)[lane]) << (2 * bits);
+          r[lane] = d;
+        }
+      write_reg(w, op->dst, m, r, 32);
       return;
     }
     if (const auto* op = std::get_if<OpCvtF16x2>(&ins.op)) {
@@ -2983,12 +3405,23 @@ class Interpreter {
           int64_t acc = op->a_signed || op->b_signed
                             ? static_cast<int64_t>(static_cast<int32_t>(c[lane]))
                             : static_cast<int64_t>(static_cast<uint32_t>(c[lane]));
-          for (int byte = 0; byte < 4; ++byte) {
-            const uint8_t ab = static_cast<uint8_t>(av >> (byte * 8));
-            const uint8_t bb = static_cast<uint8_t>(bv >> (byte * 8));
-            const int64_t ax = op->a_signed ? static_cast<int8_t>(ab) : static_cast<int64_t>(ab);
-            const int64_t bx = op->b_signed ? static_cast<int8_t>(bb) : static_cast<int64_t>(bb);
-            acc += ax * bx;
+          if (op->two) {
+            // dp2a: a's two halves against b's low or high two bytes.
+            for (int i = 0; i < 2; ++i) {
+              const uint16_t ah = static_cast<uint16_t>(av >> (i * 16));
+              const uint8_t bb = static_cast<uint8_t>(bv >> ((i + (op->hi ? 2 : 0)) * 8));
+              const int64_t ax = op->a_signed ? static_cast<int16_t>(ah) : static_cast<int64_t>(ah);
+              const int64_t bx = op->b_signed ? static_cast<int8_t>(bb) : static_cast<int64_t>(bb);
+              acc += ax * bx;
+            }
+          } else {
+            for (int byte = 0; byte < 4; ++byte) {
+              const uint8_t ab = static_cast<uint8_t>(av >> (byte * 8));
+              const uint8_t bb = static_cast<uint8_t>(bv >> (byte * 8));
+              const int64_t ax = op->a_signed ? static_cast<int8_t>(ab) : static_cast<int64_t>(ab);
+              const int64_t bx = op->b_signed ? static_cast<int8_t>(bb) : static_cast<int64_t>(bb);
+              acc += ax * bx;
+            }
           }
           r[lane] = static_cast<uint32_t>(static_cast<int32_t>(acc));
         }
@@ -3183,7 +3616,7 @@ class Interpreter {
             if (in_space) {
               const uint64_t tag = (v - kSharedVaBase) >> kClusterRankShift;
               const size_t n = ctx.cluster_state ? ctx.cluster_state->ranks.size() : 1;
-              in_space = op->cluster ? tag <= n : (tag == 0 || tag - 1 == cluster_rank_of(ctx));
+              in_space = op->cluster ? tag < n : tag == cluster_rank_of(ctx);
             }
             break;
           case Space::Local:
@@ -3243,7 +3676,7 @@ class Interpreter {
           v -= kSharedVaBase;
         }
         const uint64_t tag = (v & (kSharedVaSize - 1)) >> kClusterRankShift;
-        r[lane] = tag ? tag - 1 : cluster_rank_of(ctx);
+        r[lane] = tag;
       }
       write_reg(w, op->dst, m, r, 32);
       return;
@@ -3872,6 +4305,17 @@ class Interpreter {
         exec_device_heap(w, ctx, ins, *op, m);
         return;
       }
+      // The device runtime's launch entry points, as the CUDA programming
+      // guide documents them for code generators ("Device-side Launch from
+      // PTX"); CUDA 12's CDP2 compiles to the __cudaCDP2 names.
+      if (op->callee == "__cudaCDP2GetParameterBufferV2" || op->callee == "cudaGetParameterBufferV2") {
+        exec_get_parameter_buffer(w, ctx, ins, *op, m);
+        return;
+      }
+      if (op->callee == "__cudaCDP2LaunchDeviceV2" || op->callee == "cudaLaunchDeviceV2") {
+        exec_launch_device(w, ctx, ins, *op, m);
+        return;
+      }
       if (op->indirect) {
         exec_indirect_call(w, ctx, ins, *op, m);
         return;
@@ -4187,6 +4631,15 @@ class Interpreter {
     return it->second;
   }
 
+  // The address mode a fetch actually uses. Wrap and mirror are defined only
+  // for normalized coordinates; with unnormalized ones a real GPU (measured on
+  // an RTX 3060, point and linear alike) clamps instead.
+  static TexAddress effective_address(const TextureDesc& d, uint32_t axis) {
+    const TexAddress a = d.address[axis];
+    if (!d.normalized_coords && (a == TexAddress::Wrap || a == TexAddress::Mirror)) return TexAddress::Clamp;
+    return a;
+  }
+
   // Applies the addressing mode. Returns false when the texel is outside and
   // the mode says to produce the border colour rather than clamp to an edge.
   static bool wrap_coord(TexAddress mode, int64_t v, uint32_t size, uint32_t* out) {
@@ -4264,41 +4717,461 @@ class Interpreter {
     return static_cast<uint32_t>(sv);
   }
 
+  // ---- linear filtering ----
+  //
+  // The CUDA programming guide gives the formula -- tex(x) = (1-a)T[i] +
+  // aT[i+1] with x_B = x - 0.5, i = floor(x_B), a = frac(x_B) held in 9-bit
+  // fixed point with 8 fractional bits -- and the rest was measured on an RTX
+  // 3060 (sm_86), sample by sample, until every result matched to the bit:
+  //
+  //  - a rounds to the nearest 1/256, halves up; a = 256 carries into i.
+  //  - Normalized coordinates scale by the size in f32 first. In clamp mode
+  //    the coordinate is clamped to [0.5, size - 0.5] before x_B is formed,
+  //    which only shows in 3D, where the weights of two clamped-together
+  //    texels are rounded separately.
+  //  - A 1D texture is a 2D one of height 1 sampled at y = 0, so in border
+  //    mode half of every result comes from the border row.
+  //  - The 8 (or 4) weights are integers summing to 256, split one axis at a
+  //    time -- z, then x, then y -- each split rounding half up. The y split
+  //    rounds the upper part on the x = 1 side and the lower part on the x = 0
+  //    side; in 2D that is w11 = round(a*b/256), w10 = a - w11, w01 = b - w11.
+  //  - The sum of weight x texel is exact, then rounded once: to f32 (or to
+  //    f16 for a half texture), ties away from zero. 8- and 16-bit unsigned
+  //    normalized texels are filtered as 16-bit integers (an 8-bit u is u*257)
+  //    and 16-bit signed ones as themselves, rounded half up and read out as
+  //    K/65535 or K/32767 (clamped to -32767 after the blend).
+  //
+  // Signed 8-bit normalized texels are refused: their result is a function of
+  // the blended sum alone, but not one this could reproduce, and a filter that
+  // is off by one step in a few percent of samples is the difference testing
+  // exists to catch.
+
+  static int tex_round_half_up(int64_t num, int64_t den) {   // floor(num/den + 1/2)
+    const int64_t t = 2 * num + den, d = 2 * den;
+    return static_cast<int>(t >= 0 ? t / d : -((-t + d - 1) / d));
+  }
+
+  // The weight splits, as measured (see above). f[] are the 8-bit fractions
+  // along x, y, z; w[] is indexed x + 2y + 4z.
+  static void tex_weights(uint32_t dims, const int f[3], int w[8], int total = 256) {
+    auto split = [](int total, int frac, bool round_upper, int* lo, int* hi) {
+      if (round_upper) { *hi = tex_round_half_up(int64_t{total} * frac, 256); *lo = total - *hi; }
+      else { *lo = tex_round_half_up(int64_t{total} * (256 - frac), 256); *hi = total - *lo; }
+    };
+    for (int i = 0; i < 8; ++i) w[i] = 0;
+    if (dims == 1) {
+      split(total, f[0], true, &w[0], &w[1]);
+      return;
+    }
+    // A mip level's share of the weight (total < 256) is split the same way,
+    // z first when there is one, rounding the lower slice's part (measured on
+    // 3D mipmaps; for the full 256 the split is exact either way).
+    int z0 = total, z1 = 0;
+    if (dims == 3) split(total, f[2], false, &z0, &z1);
+    const int zslices = dims == 3 ? 2 : 1;
+    for (int dz = 0; dz < zslices; ++dz) {
+      const int tz = dz ? z1 : z0;
+      int x0, x1;
+      split(tz, f[0], true, &x0, &x1);
+      for (int dx = 0; dx < 2; ++dx) {
+        int y0, y1;
+        split(dx ? x1 : x0, f[1], dx == 1, &y0, &y1);
+        w[dx + 4 * dz] = y0;
+        w[dx + 2 + 4 * dz] = y1;
+      }
+    }
+  }
+
+  // Exact sum of up to eight (weight x value) terms, as a non-overlapping
+  // expansion (Shewchuk's TwoSum): each product of a 9-bit weight and a float
+  // is exact in a double, and the expansion keeps every bit of their sum.
+  struct ExactSum {
+    std::array<double, 20> e{};
+    int n = 0;
+    void add(double x) {
+      int k = 0;
+      for (int i = 0; i < n; ++i) {
+        const double s = x + e[i], bb = s - x, err = (x - (s - bb)) + (e[i] - bb);
+        x = s;
+        if (err != 0) e[k++] = err;
+      }
+      e[k++] = x;
+      n = k;
+    }
+    // The sign of (sum - v), exactly.
+    int compare(double v) const {
+      ExactSum t = *this;
+      t.add(-v);
+      for (int i = t.n - 1; i >= 0; --i)
+        if (t.e[i] != 0) return t.e[i] > 0 ? 1 : -1;
+      return 0;
+    }
+    double approx() const {
+      double s = 0;
+      for (int i = 0; i < n; ++i) s += e[i];
+      return s;
+    }
+  };
+
+  // Rounds the exact sum to f32, or to f16 when `half`, to nearest with ties
+  // away from zero, and returns the result as a float.
+  static float tex_round_sum(const ExactSum& sum, bool half) {
+    const double a = sum.approx();
+    auto next = [half](double v, int dir) -> double {   // the adjacent value in the format
+      if (half) {
+        const uint64_t hb = double_to_f16(v) & 0xFFFF;
+        const double c = f16_to_double(hb);
+        if (c != v) return c;   // v was not representable: nearest is already a neighbour
+        int64_t mag = hb & 0x7FFF;
+        const bool neg = hb & 0x8000;
+        if (mag == 0) return dir > 0 ? f16_to_double(0x0001) : f16_to_double(0x8001);
+        mag += ((dir > 0) != neg) ? 1 : -1;
+        return f16_to_double(static_cast<uint64_t>(mag) | (neg ? 0x8000u : 0u));
+      }
+      return static_cast<double>(std::nextafter(static_cast<float>(v), dir > 0 ? INFINITY : -INFINITY));
+    };
+    const double c = half ? f16_to_double(double_to_f16(a) & 0xFFFF) : static_cast<double>(static_cast<float>(a));
+    const int s = sum.compare(c);
+    if (s == 0) return static_cast<float>(c);
+    const double lo = s > 0 ? c : next(c, -1), hi = s > 0 ? next(c, +1) : c;
+    const int t = sum.compare(lo + (hi - lo) / 2);   // the midpoint is exact in a double
+    if (t < 0) return static_cast<float>(lo);
+    if (t > 0) return static_cast<float>(hi);
+    return static_cast<float>(std::fabs(lo) > std::fabs(hi) ? lo : hi);
+  }
+
+  // One texel's share of a filtered fetch, in 1/256ths: all the terms of a
+  // fetch sum to 256. A border term reads as zero.
+  struct TexTerm {
+    int w = 0;
+    uint64_t addr = 0;
+    bool border = false;
+  };
+
+  void tex_check_filterable(const Instr& ins, uint32_t lane, const TextureDesc& d) {
+    const uint32_t bits = d.channel_bits[0];
+    const bool is_float = d.kind == ChannelKind::Float && (bits == 32 || bits == 16);
+    const bool unorm = d.kind == ChannelKind::Unsigned && (bits == 8 || bits == 16) && d.read_as_normalized_float;
+    const bool snorm16 = d.kind == ChannelKind::Signed && bits == 16 && d.read_as_normalized_float;
+    if (!is_float && !unorm && !snorm16)
+      ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+               d.kind == ChannelKind::Signed && bits == 8
+                   ? "linear filtering of signed 8-bit normalized texels is not implemented: "
+                     "measured on hardware, the result is not the rounded weighted sum of the "
+                     "texels' 16-bit forms, and a filter that differs from the device in the last "
+                     "step would hide exactly what differential testing is for"
+                   : "linear filtering needs a float, half, or normalized 8/16-bit texture read as "
+                     "normalized float; this texture's format has no filtered form");
+    for (uint32_t ch = 1; ch < 4; ++ch)
+      if (d.channel_bits[ch] && d.channel_bits[ch] != bits)
+        ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+                 "linear filtering of a texture whose channels differ in width");
+  }
+
+  // The texels a linear filter reads and their weights, which sum to `total`.
+  int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[3], bool true_1d,
+                           int total, TexTerm* out) {
+    // A 1D texture filters as 2D, height 1, at y = 0 -- all but a layer of a
+    // 1D layered texture, which filters as 1D.
+    const uint32_t fdims = dims == 1 && !true_1d ? 2 : dims;
+    const uint32_t size[3] = {d.width, dims == 1 ? 1u : d.height, d.depth};
+    int base[3] = {0, 0, 0}, frac[3] = {0, 0, 0};
+    for (uint32_t i = 0; i < fdims; ++i) {
+      float x = i < dims ? coord[i] : 0.0f;
+      if (d.normalized_coords) x *= static_cast<float>(size[i]);
+      double v = x;
+      if (effective_address(d, i) == TexAddress::Clamp) v = std::clamp(v, 0.5, size[i] - 0.5);
+      const double xb = v - 0.5;
+      double fl = std::floor(xb);
+      int f = static_cast<int>(std::floor((xb - fl) * 256 + 0.5));
+      if (f >= 256) { fl += 1; f = 0; }
+      base[i] = static_cast<int>(fl);
+      frac[i] = f;
+    }
+    int w[8];
+    tex_weights(fdims, frac, w, total);
+    const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
+    const uint64_t plane = row * (d.height ? d.height : 1);
+    int n = 0;
+    for (int k = 0; k < (fdims == 3 ? 8 : fdims == 2 ? 4 : 2); ++k) {
+      if (w[k] == 0) continue;
+      uint32_t idx[3] = {0, 0, 0};
+      bool inside = true;
+      const int off[3] = {k & 1, (k >> 1) & 1, (k >> 2) & 1};
+      for (uint32_t i = 0; i < fdims; ++i)
+        if (!wrap_coord(effective_address(d, i), int64_t{base[i]} + off[i], size[i], &idx[i])) inside = false;
+      TexTerm& t = out[n++];
+      t.w = w[k];
+      t.border = !inside;
+      if (inside) t.addr = d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes;
+    }
+    return n;
+  }
+
+  // The one texel a point fetch at float coordinates reads, with the whole
+  // `total` weight (for a point-sampled level inside a linear mip blend).
+  int tex_footprint_point(const TextureDesc& d, uint32_t dims, const float coord[3], int total,
+                          TexTerm* out) {
+    const uint32_t size[3] = {d.width, d.height, d.depth};
+    uint32_t idx[3] = {0, 0, 0};
+    bool inside = true;
+    for (uint32_t i = 0; i < dims; ++i) {
+      float f = coord[i];
+      if (d.normalized_coords) f *= static_cast<float>(size[i]);
+      if (!wrap_coord(effective_address(d, i), static_cast<int64_t>(std::floor(f)), size[i], &idx[i])) inside = false;
+    }
+    const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
+    const uint64_t plane = row * (d.height ? d.height : 1);
+    out[0].w = total;
+    out[0].border = !inside;
+    out[0].addr = inside ? d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes : 0;
+    return 1;
+  }
+
+  // Sums weight x texel over the terms and rounds, by the format's rules.
+  void tex_finish(const Instr& ins, uint32_t lane, const TextureDesc& d, const TexTerm* terms, int n,
+                  uint32_t out[4]) {
+    const uint32_t bits = d.channel_bits[0];
+    const bool is_float = d.kind == ChannelKind::Float;
+    const bool unorm = d.kind == ChannelKind::Unsigned;
+    ExactSum fsum[4];
+    int64_t isum[4] = {0, 0, 0, 0};
+    for (int k = 0; k < n; ++k) {
+      if (terms[k].border || terms[k].w == 0) continue;
+      for (uint32_t ch = 0; ch < 4; ++ch) {
+        if (!d.channel_bits[ch]) continue;
+        const uint64_t raw = texel_channel_bits(d, terms[k].addr, ch, ins, lane);
+        if (is_float) {
+          const double t = bits == 32 ? static_cast<double>(f32(raw)) : f16_to_double(raw);
+          fsum[ch].add(terms[k].w * t);
+        } else if (unorm) {
+          isum[ch] += int64_t{terms[k].w} * static_cast<int64_t>(bits == 8 ? raw * 257 : raw);
+        } else {
+          isum[ch] += int64_t{terms[k].w} * static_cast<int16_t>(raw);
+        }
+      }
+    }
+    for (uint32_t ch = 0; ch < 4; ++ch) {
+      float r;
+      if (!d.channel_bits[ch]) {
+        r = ch == 3 ? 1.0f : 0.0f;
+      } else if (is_float) {
+        // Scaling by 1/256 is exact, so round the sum of weight x texel and
+        // divide after. A non-finite texel takes the plain arithmetic.
+        ExactSum scaled;
+        bool finite = true;
+        for (int i = 0; i < fsum[ch].n; ++i) {
+          if (!std::isfinite(fsum[ch].e[i])) finite = false;
+          scaled.add(fsum[ch].e[i] / 256);
+        }
+        r = finite ? tex_round_sum(scaled, bits == 16) : static_cast<float>(fsum[ch].approx() / 256);
+      } else {
+        const int K = std::max(tex_round_half_up(isum[ch], 256), unorm ? 0 : -32767);
+        r = static_cast<float>(static_cast<double>(K) / (unorm ? 65535.0 : 32767.0));
+      }
+      out[ch] = static_cast<uint32_t>(f32bits(r));
+    }
+  }
+
+  void tex_linear(const Instr& ins, uint32_t lane, const TextureDesc& d, uint32_t dims,
+                  const float coord[3], uint32_t out[4], bool true_1d = false) {
+    tex_check_filterable(ins, lane, d);
+    TexTerm terms[8];
+    const int n = tex_footprint_linear(d, dims, coord, true_1d, 256, terms);
+    tex_finish(ins, lane, d, terms, n, out);
+  }
+
+  // A mipmapped fetch's level of detail, in 1/256ths of a level (measured on
+  // an RTX 3060): an explicit lod is truncated toward zero to 1/256 and the
+  // bias added, a plain fetch is level 0 without the bias; then the texture's
+  // level clamps, then the levels that exist.
+  static int32_t tex_mip_lod(const TextureDesc& d, bool explicit_lod, double lod) {
+    int64_t q = 0;
+    if (explicit_lod) {
+      const double scaled = std::trunc(lod * 256);
+      q = static_cast<int64_t>(std::clamp(scaled, -1e9, 1e9)) + d.mip_bias;
+    }
+    q = std::clamp<int64_t>(q, d.mip_min, std::max(d.mip_min, d.mip_max));
+    q = std::clamp<int64_t>(q, 0, int64_t{d.mip_levels - 1} * 256);
+    return static_cast<int32_t>(q);
+  }
+
+  // A mip level of `d` as a texture of its own.
+  static TextureDesc tex_level(const TextureDesc& d, uint32_t level) {
+    TextureDesc v = d;
+    v.base = d.level_base[level];
+    v.width = std::max(1u, d.width >> level);
+    v.height = d.height ? std::max(1u, d.height >> level) : 0;
+    v.depth = d.depth ? std::max(1u, d.depth >> level) : 0;
+    v.pitch_bytes = v.width * d.texel_bytes;
+    v.mip_levels = 0;
+    return v;
+  }
+
+  // The texture a layered or cubemap fetch actually reads: one layer, or one
+  // face, as an ordinary 1D or 2D texture. Measured on an RTX 3060: the layer
+  // (and a layered cubemap's cubemap) index is unsigned and an index past the
+  // end -- a negative one included -- reads the last; a cube direction picks
+  // the face of its largest-magnitude axis, ties going to z, then y, then x,
+  // with the minor axes from the CUDA programming guide's table and (s/m+1)/2
+  // as the face coordinate; and filtering stays inside the face, under the
+  // texture's address mode.
+  static uint64_t tex_slice_bytes(const TextureDesc& d) {
+    const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
+    return row * (d.height ? d.height : 1);
+  }
+
   void exec_tex(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTex& op, Mask m) {
     Lanes _s_obj;
     const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
-    std::array<Lanes, 3> coord;
-    std::array<Lanes, 3> coord_scratch;
-    for (uint32_t i = 0; i < op.dims; ++i)
+    const bool indexed = op.geom == TexGeom::A1D || op.geom == TexGeom::A2D || op.geom == TexGeom::ACube;
+    const bool cube = op.geom == TexGeom::Cube || op.geom == TexGeom::ACube;
+    const uint32_t first = indexed ? 1 : 0;
+    std::array<Lanes, 4> coord;
+    std::array<Lanes, 4> coord_scratch;
+    for (uint32_t i = 0; i < op.dims + first; ++i)
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
+    Lanes _s_lod;
+    const Lanes* lod = op.level ? &read_operand(w, ctx, ins, op.lod, _s_lod) : nullptr;
 
     std::array<Lanes, 4> out;
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Texture);
-      if (d.filter != TexFilter::Point)
-        ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
-                 "cudaFilterModeLinear is not implemented. Interpolation between texels is a "
-                 "documented weighted average, but hardware computes the weights in a fixed-point "
-                 "format with 8 fractional bits, so a float implementation would differ from the "
-                 "device in the low bits -- which is exactly what differential testing here is "
-                 "meant to catch. Point sampling is exact");
+      const bool want_layers = indexed, want_cube = cube;
+      if ((d.layers != 0) != want_layers || d.cubemap != want_cube)
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                 std::string("the fetch's geometry does not match the texture: the texture is ") +
+                     (d.cubemap ? (d.layers ? "a layered cubemap" : "a cubemap")
+                                : (d.layers ? "layered" : "neither layered nor a cubemap")));
+      TextureDesc v = d;
+      uint32_t dims = op.dims;
+      bool true_1d = false;
+      float cf[3] = {0, 0, 0};
+      int64_t ci[3] = {0, 0, 0};
+      for (uint32_t i = 0; i < op.dims; ++i) {
+        cf[i] = f32(coord[first + i][lane]);
+        ci[i] = static_cast<int32_t>(coord[first + i][lane]);
+      }
+      if (indexed) {
+        const uint64_t index = static_cast<uint32_t>(coord[0][lane]);
+        const uint64_t layer = std::min<uint64_t>(index, d.layers - 1);
+        v.base += layer * (cube ? 6 : 1) * tex_slice_bytes(d);
+        v.layers = 0;
+        if (op.geom == TexGeom::A1D) {
+          true_1d = true;   // a layer of a 1D layered texture filters as 1D
+          v.height = 0;
+        }
+      }
+      if (cube) {
+        const float x = cf[0], y = cf[1], z = cf[2];
+        const float ax = std::fabs(x), ay = std::fabs(y), az = std::fabs(z);
+        int face;
+        float sc, tc, ma;
+        if (az >= ax && az >= ay) { face = z >= 0 ? 4 : 5; sc = z >= 0 ? x : -x; tc = -y; ma = az; }
+        else if (ay >= ax) { face = y >= 0 ? 2 : 3; sc = x; tc = y >= 0 ? z : -z; ma = ay; }
+        else { face = x >= 0 ? 0 : 1; sc = x >= 0 ? -z : z; tc = -y; ma = ax; }
+        v.base += static_cast<uint64_t>(face) * tex_slice_bytes(d);
+        v.cubemap = false;
+        v.normalized_coords = true;
+        // Point sampling clamps to the face whatever the address mode; linear
+        // filtering applies the mode inside the face -- wrap takes the texel
+        // from the face's far edge, border blends in zero (measured).
+        if (v.filter != TexFilter::Linear)
+          for (auto& a : v.address) a = TexAddress::Clamp;
+        cf[0] = (sc / ma + 1.0f) * 0.5f;
+        cf[1] = (tc / ma + 1.0f) * 0.5f;
+        dims = 2;
+      }
+      if (op.gather >= 0) {
+        // tld4: the four texels of the bilinear footprint, counter-clockwise
+        // from the lower left -- (i, j+1), (i+1, j+1), (i+1, j), (i, j) -- one
+        // component each. Measured on an RTX 3060: i and j come from the
+        // filter's coordinate (with its 8-bit weight rounding carrying into
+        // them), and the address mode applies to each texel's index -- clamp
+        // clamps the indices, not the coordinate.
+        if (d.mip_levels)
+          ctx_fail(ins, static_cast<int>(lane), Err::Unsupported, "tld4 of a mipmapped texture");
+        const uint32_t size[2] = {v.width, v.height ? v.height : 1};
+        int64_t b[2];
+        for (uint32_t i = 0; i < 2; ++i) {
+          float x = cf[i];
+          if (v.normalized_coords) x *= static_cast<float>(size[i]);
+          const double xb = static_cast<double>(x) - 0.5;
+          double fl = std::floor(xb);
+          if (std::floor((xb - fl) * 256 + 0.5) >= 256) fl += 1;
+          b[i] = static_cast<int64_t>(fl);
+        }
+        const uint64_t row = v.pitch_bytes ? v.pitch_bytes : uint64_t{v.width} * v.texel_bytes;
+        static constexpr int kOrder[4][2] = {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
+        for (int k = 0; k < 4; ++k) {
+          uint32_t ix, iy;
+          const bool inside = wrap_coord(effective_address(v, 0), b[0] + kOrder[k][0], size[0], &ix) &&
+                              wrap_coord(effective_address(v, 1), b[1] + kOrder[k][1], size[1], &iy);
+          const uint32_t ch = static_cast<uint32_t>(op.gather);
+          out[k][lane] = inside ? convert_channel(v, ch, texel_channel_bits(v, v.base + iy * row + uint64_t{ix} * v.texel_bytes, ch, ins, lane), op.dtype)
+                                : 0;
+        }
+        continue;
+      }
+      if (d.mip_levels) {
+        // A mipmapped texture: pick the level, or blend two (see tex_mip_lod).
+        if (indexed || cube)
+          ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+                   "mipmapped layered and cubemap textures are not implemented");
+        const double lodv = lod ? (op.ctype.is_float() ? static_cast<double>(f32((*lod)[lane]))
+                                                       : static_cast<double>(static_cast<int32_t>((*lod)[lane])))
+                                : 0.0;
+        const int32_t q = tex_mip_lod(d, lod != nullptr, lodv);
+        if (d.mip_filter == TexFilter::Linear && (q & 255) != 0) {
+          if (!op.ctype.is_float())
+            ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+                     "blending mip levels with integer coordinates");
+          tex_check_filterable(ins, lane, d);
+          const TextureDesc lo = tex_level(v, static_cast<uint32_t>(q >> 8));
+          const TextureDesc hi = tex_level(v, static_cast<uint32_t>(q >> 8) + 1);
+          TexTerm terms[16];
+          int n = 0;
+          const int wh = q & 255;
+          if (v.filter == TexFilter::Linear) {
+            n += tex_footprint_linear(lo, dims, cf, true_1d, 256 - wh, terms + n);
+            n += tex_footprint_linear(hi, dims, cf, true_1d, wh, terms + n);
+          } else {
+            n += tex_footprint_point(lo, dims, cf, 256 - wh, terms + n);
+            n += tex_footprint_point(hi, dims, cf, wh, terms + n);
+          }
+          uint32_t r[4];
+          tex_finish(ins, lane, d, terms, n, r);
+          for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = r[ch];
+          continue;
+        }
+        v = tex_level(v, static_cast<uint32_t>(d.mip_filter == TexFilter::Linear ? q >> 8 : (q + 128) >> 8));
+      }
+      if (v.filter == TexFilter::Linear) {
+        if (!op.ctype.is_float())
+          ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
+                   "linear filtering with integer coordinates");
+        uint32_t r[4];
+        tex_linear(ins, lane, v, dims, cf, r, true_1d);
+        for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = r[ch];
+        continue;
+      }
 
-      const uint32_t size[3] = {d.width, d.height, d.depth};
+      const uint32_t size[3] = {v.width, v.height, v.depth};
       bool inside = true;
       uint32_t idx[3] = {0, 0, 0};
-      for (uint32_t i = 0; i < op.dims; ++i) {
+      for (uint32_t i = 0; i < dims; ++i) {
         int64_t c;
         if (op.ctype.is_float()) {
-          float f = f32(coord[i][lane]);
-          if (d.normalized_coords) f *= static_cast<float>(size[i]);
+          float f = cf[i];
+          if (v.normalized_coords) f *= static_cast<float>(size[i]);
           // Point sampling takes the texel the coordinate falls in. CUDA's
           // sampled coordinates are texel-centred, so x+0.5 addresses texel x.
           c = static_cast<int64_t>(std::floor(f));
         } else {
-          c = static_cast<int64_t>(static_cast<int32_t>(coord[i][lane]));
+          c = ci[i];
         }
-        if (!wrap_coord(d.address[i], c, size[i], &idx[i])) { inside = false; break; }
+        if (!wrap_coord(effective_address(v, i), c, size[i], &idx[i])) { inside = false; break; }
       }
 
       if (!inside) {
@@ -4307,11 +5180,11 @@ class Interpreter {
         for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = 0;
         continue;
       }
-      const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
-      const uint64_t plane = row * (d.height ? d.height : 1);
-      const uint64_t addr = d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes;
+      const uint64_t row = v.pitch_bytes ? v.pitch_bytes : uint64_t{v.width} * v.texel_bytes;
+      const uint64_t plane = row * (v.height ? v.height : 1);
+      const uint64_t addr = v.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * v.texel_bytes;
       for (uint32_t ch = 0; ch < 4; ++ch)
-        out[ch][lane] = convert_channel(d, ch, texel_channel_bits(d, addr, ch, ins, lane), op.dtype);
+        out[ch][lane] = convert_channel(v, ch, texel_channel_bits(v, addr, ch, ins, lane), op.dtype);
     }
     count_memory(Space::Global, 4 * 4, popcount_mask(m), /*is_store=*/false);
     for (uint32_t ch = 0; ch < 4 && ch < op.dsts.size(); ++ch)
@@ -4321,10 +5194,38 @@ class Interpreter {
   // suld/sust address a surface in *bytes* along x and in whole rows along y
   // and z, which is why they take no format: they move raw bytes.
   uint64_t surface_address(const Instr& ins, uint32_t lane, const TextureDesc& d,
-                           const std::array<Lanes, 3>& coord, uint32_t dims, uint32_t bytes) {
-    const int64_t x = static_cast<int32_t>(coord[0][lane]);
-    const int64_t y = dims > 1 ? static_cast<int32_t>(coord[1][lane]) : 0;
-    const int64_t z = dims > 2 ? static_cast<int32_t>(coord[2][lane]) : 0;
+                           const std::array<Lanes, 4>& coord, uint32_t dims, uint32_t bytes,
+                           bool layered) {
+    // A layered surface's first coordinate is its layer. A cubemap surface is
+    // read as a layered one, face by face (surfCubemapread compiles to
+    // suld.a2d with the face as the layer), so it has 6 -- or 6 x layers.
+    const uint32_t first = layered ? 1 : 0;
+    const int64_t x = static_cast<int32_t>(coord[first][lane]);
+    const int64_t y = dims > 1 ? static_cast<int32_t>(coord[first + 1][lane]) : 0;
+    const int64_t z = dims > 2 ? static_cast<int32_t>(coord[first + 2][lane]) : 0;
+    uint64_t layer_base = d.base;
+    if (layered) {
+      const uint64_t layers = d.cubemap ? 6 * std::max<uint64_t>(d.layers, 1) : d.layers;
+      if (layers == 0)
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                 "a layered surface access (.a1d/.a2d) on a surface that is not layered");
+      // Reading a 2D layered surface with a 1D layered access (or the other
+      // way round) returns zeros on an RTX 3060, a rule nobody can rely on;
+      // it is refused instead.
+      if ((dims == 1) != (d.height == 0))
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                 std::string("a ") + (dims == 1 ? "1D" : "2D") + " layered access (.a" +
+                     (dims == 1 ? "1d" : "2d") + ") on a " + (d.height ? "2D" : "1D") + " layered surface");
+      const uint64_t layer = static_cast<uint32_t>(coord[0][lane]);
+      if (layer >= layers)
+        ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                 "surface layer " + std::to_string(layer) + " is past the surface's " +
+                     std::to_string(layers) + " layers, and the '.trap' policy faults");
+      layer_base += layer * tex_slice_bytes(d);
+    } else if (d.layers || d.cubemap) {
+      ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+               "a layered or cubemap surface needs a layered access (.a1d/.a2d)");
+    }
     const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
     const uint64_t plane = row * (d.height ? d.height : 1);
     // ".trap" is the out-of-range policy ptxas emits, and it means what it
@@ -4339,22 +5240,22 @@ class Interpreter {
                    " surface (" + std::to_string(row_bytes) +
                    " bytes per row). The instruction's '.trap' policy is what makes this a fault "
                    "rather than a clamp");
-    return d.base + z * plane + y * row + static_cast<uint64_t>(x);
+    return layer_base + z * plane + y * row + static_cast<uint64_t>(x);
   }
 
   void exec_suld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSuld& op, Mask m) {
     Lanes _s_obj;
     const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
-    std::array<Lanes, 3> coord;
-    std::array<Lanes, 3> coord_scratch;
-    for (uint32_t i = 0; i < op.dims; ++i)
+    std::array<Lanes, 4> coord;
+    std::array<Lanes, 4> coord_scratch;
+    for (uint32_t i = 0; i < op.dims + (op.layered ? 1 : 0); ++i)
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
     std::vector<Lanes> out(op.dsts.size());
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Surface);
       const uint64_t base = surface_address(ins, lane, d, coord, op.dims,
-                                            op.bytes * static_cast<uint32_t>(op.dsts.size()));
+                                            op.bytes * static_cast<uint32_t>(op.dsts.size()), op.layered);
       for (size_t c = 0; c < op.dsts.size(); ++c) {
         try {
           out[c][lane] = mem_.load_scalar(base + c * op.bytes, op.bytes);
@@ -4372,9 +5273,9 @@ class Interpreter {
   void exec_sust(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSust& op, Mask m) {
     Lanes _s_obj;
     const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
-    std::array<Lanes, 3> coord;
-    std::array<Lanes, 3> coord_scratch;
-    for (uint32_t i = 0; i < op.dims; ++i)
+    std::array<Lanes, 4> coord;
+    std::array<Lanes, 4> coord_scratch;
+    for (uint32_t i = 0; i < op.dims + (op.layered ? 1 : 0); ++i)
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
     std::vector<Lanes> src(op.srcs.size());
     std::vector<Lanes> src_scratch(op.srcs.size());
@@ -4384,7 +5285,7 @@ class Interpreter {
       if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Surface);
       const uint64_t base = surface_address(ins, lane, d, coord, op.dims,
-                                            op.bytes * static_cast<uint32_t>(op.srcs.size()));
+                                            op.bytes * static_cast<uint32_t>(op.srcs.size()), op.layered);
       for (size_t c = 0; c < op.srcs.size(); ++c) {
         try {
           mem_.store_scalar(base + c * op.bytes, op.bytes, src[c][lane]);
@@ -4480,7 +5381,8 @@ class Interpreter {
     // Elements each lane holds per register: 2 for 16-bit, 4 for 8-bit, 1 for
     // tf32. The register counts follow from the shape.
     const uint32_t per_reg = sixteen_bit ? 2u : (eight_bit ? 4u : 1u);
-    const uint32_t a_regs = (kM * K) / (W_ * per_reg);
+    // A sparse A stores half its elements.
+    const uint32_t a_regs = (kM * K / (op.sparse ? 2 : 1)) / (W_ * per_reg);
     const uint32_t b_regs = (K * kN) / (W_ * per_reg);
     if (op.a.size() != a_regs || op.b.size() != b_regs)
       ctx_fail(ins, -1, Err::UnsupportedPtx, "mma fragment arity does not match the shape");
@@ -4491,6 +5393,36 @@ class Interpreter {
     std::array<double, kM * 32> A{};
     std::array<double, 32 * kN> B{};
     std::array<double, kM * kN> C{};
+    if (op.sparse) {
+      // Sparse A (PTX ISA 9.7.16.6, figures for m16n8k16 and m16n8k32 f16):
+      // register r of lane (group, tid) holds the two stored elements of the
+      // 4-wide chunk tid + 4*(r/2) of row group + 8*(r%2). The metadata for
+      // rows g and g + 8 comes from one lane of group g: 4 bits a chunk,
+      // rows 8-15 in the high half, and within a chunk's 4 bits the low 2
+      // place the first stored element and the high 2 the second. For k32
+      // the selector names a pair of lanes -- 4*g + 2*selector for chunks 0-3
+      // and the next for chunks 4-7 -- and for k16, which needs only one, the
+      // lane 4*g + selector. Each of these was checked against an RTX 3060
+      // (sm_86), element by element and nibble by nibble.
+      Lanes _s_meta;
+      const Lanes meta = read_operand(w, ctx, ins, op.meta, _s_meta);
+      const uint32_t sel = static_cast<uint32_t>(std::get<ImmInt>(op.selector).value);
+      for (uint32_t reg = 0; reg < a_regs; ++reg) {
+        Lanes _s;
+        const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s);
+        for (uint32_t lane = 0; lane < W_; ++lane) {
+          const uint32_t group = lane / 4, tid = lane % 4;
+          const uint32_t row = group + (reg % 2) * 8;
+          const uint32_t chunk = tid + (reg / 2) * 4;
+          const uint32_t src = K == 16 ? 4 * group + sel : 4 * group + 2 * sel + (chunk >= 4 ? 1 : 0);
+          const uint32_t bits = static_cast<uint32_t>(meta[src]) >> ((row >= 8 ? 16 : 0) + (chunk % 4) * 4);
+          for (uint32_t e = 0; e < 2; ++e) {
+            const uint32_t idx = (bits >> (2 * e)) & 3;
+            A[row * K + chunk * 4 + idx] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
+          }
+        }
+      }
+    } else
     // A: lane (groupID, tid) holds rows {groupID, groupID+8} at the column
     // block the register index selects.
     for (uint32_t reg = 0; reg < a_regs; ++reg) {
@@ -4594,6 +5526,7 @@ class Interpreter {
   struct WgmmaDesc {
     uint64_t start = 0, lbo = 0, sbo = 0;
     uint32_t swizzle = 0;   // bytes in a swizzled row: 0 (none), 32, 64 or 128
+    uint32_t atom = 16;     // bytes the swizzle moves as one (tcgen05's mode 1: 32)
   };
 
   WgmmaDesc decode_wgmma_desc(const Instr& ins, uint64_t d) {
@@ -4634,7 +5567,7 @@ class Interpreter {
       off = W ? mb % W + (mb / W) * d.lbo + (k % 8) * W + (k / 8) * d.sbo
               : mb % 16 + (mb / 16) * d.sbo + (k % 8) * 16 + (k / 8) * d.lbo;
     }
-    return exec::swizzle_address(d.start + off, static_cast<uint32_t>(W));
+    return exec::swizzle_address(d.start + off, static_cast<uint32_t>(W), d.atom);
   }
 
   static uint32_t wgmma_elem_bytes(WgmmaElem t) {
@@ -4677,6 +5610,7 @@ class Interpreter {
       ctx_fail(ins, -1, Err::UnsupportedPtx,
                "wgmma is .sync.aligned: every thread of the warpgroup must execute it, and this "
                "warp reached it with some lanes inactive or predicated off");
+    if (op.kind == WgmmaKind::Commit) w.wgmma_commits.push_back(w.wgmma_issued);
     if (op.kind != WgmmaKind::Mma) return;
 
     const uint32_t N = op.n, K = op.k;
@@ -4704,30 +5638,46 @@ class Interpreter {
                 sa * wgmma_decode(op.a_type, v[lane] >> (8 * ea * e));
         }
       }
-    } else {
-      Lanes _s;
-      const Lanes& dv = read_operand(w, ctx, ins, op.a_desc, _s);
-      const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
-      for (uint32_t r = 0; r < 16; ++r)
-        for (uint32_t k = 0; k < K; ++k) {
-          const uint64_t at = wgmma_smem_offset(d, op.trans_a == 0, ea, row0 + r, k);
-          A[r * K + k] = sa * wgmma_decode(op.a_type, load_routed(w, ctx, ins, 0, kSharedVaBase + at, ea));
-        }
     }
-    // B, all of it: K x N, read as N rows of K.
-    std::vector<double>& B = wgmma_b_;
-    B.assign(size_t{K} * N, 0.0);
-    {
+    // The shared memory operands, read once for the warpgroup.
+    const uint32_t group = warp_index / 4;
+    auto [snap_it, first] = ctx.wgmma->pending.try_emplace({group, w.wgmma_issued++});
+    WgmmaSnapshot& snap = snap_it->second;
+    if (first) {
+      if (!op.a_regs) {
+        Lanes _s;
+        const Lanes& dv = read_operand(w, ctx, ins, op.a_desc, _s);
+        const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
+        snap.A.assign(size_t{64} * K, 0.0);
+        for (uint32_t r = 0; r < 64; ++r)
+          for (uint32_t k = 0; k < K; ++k) {
+            const uint64_t at = wgmma_smem_offset(d, op.trans_a == 0, ea, r, k);
+            snap.A[r * K + k] =
+                sa * wgmma_decode(op.a_type, load_routed(w, ctx, ins, 0,
+                                                         kSharedVaBase + cluster_address(ctx, cluster_rank_of(ctx), at), ea));
+          }
+      }
+      // B, all of it: K x N, read as N rows of K.
+      snap.B.assign(size_t{K} * N, 0.0);
       Lanes _s;
       const Lanes& dv = read_operand(w, ctx, ins, op.b_desc, _s);
       const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
       for (uint32_t n = 0; n < N; ++n)
         for (uint32_t k = 0; k < K; ++k) {
           const uint64_t at = wgmma_smem_offset(d, op.trans_b == 0, eb, n, k);
-          B[size_t{k} * N + n] =
-              sb * wgmma_decode(op.b_type, load_routed(w, ctx, ins, 0, kSharedVaBase + at, eb));
+          snap.B[size_t{k} * N + n] =
+              sb * wgmma_decode(op.b_type, load_routed(w, ctx, ins, 0,
+                                                       kSharedVaBase + cluster_address(ctx, cluster_rank_of(ctx), at), eb));
         }
     }
+    if (!op.a_regs) {
+      if (snap.A.empty())
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "the warps of a warpgroup disagree on whether this wgmma's A is in registers or "
+                 "shared memory");
+      std::copy_n(snap.A.begin() + size_t{row0} * K, size_t{16} * K, A.begin());
+    }
+    const std::vector<double>& B = snap.B;
     // scale-d: false means D = A*B, per the ISA. Read per lane; a kernel
     // passes a uniform value, and per lane is what that value means for the
     // accumulator elements each lane owns.
@@ -4793,12 +5743,614 @@ class Interpreter {
       if (!int_form) alu_fault(out[reg], m, 32);
       write_reg(w, op.d[reg], m, out[reg], 32);
     }
+    snap.taken |= static_cast<uint8_t>(1u << (warp_index % 4));
+    if (snap.taken == 0xF) ctx.wgmma->pending.erase(snap_it);
+  }
+
+  // clusterlaunchcontrol (9.7.15.18-19). The 16-byte response is this
+  // engine's own encoding -- the ISA calls it opaque and a kernel may only
+  // decode it with query_cancel: bit 0 says whether a cluster was cancelled,
+  // bits 32-127 hold its first CTA's x, y and z.
+  void exec_clc(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpClc& op, Mask m) {
+    if (op.kind != ClcKind::TryCancel) {
+      Lanes _s_lo, _s_hi;
+      const Lanes lo = read_operand(w, ctx, ins, Operand{RegOperand{op.resp_lo}}, _s_lo);
+      const Lanes hi = read_operand(w, ctx, ins, Operand{RegOperand{op.resp_hi}}, _s_hi);
+      if (op.kind == ClcKind::IsCanceled) {
+        Mask& p = pred_slot(w, op.dst[0]);
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) p = (lo[lane] & 1) ? (p | (Mask{1} << lane)) : (p & ~(Mask{1} << lane));
+        return;
+      }
+      auto coord = [&](uint32_t lane, int d) -> uint64_t {
+        return d == 0 ? lo[lane] >> 32 : d == 1 ? hi[lane] & 0xFFFFFFFFu : hi[lane] >> 32;
+      };
+      for (size_t i = 0; i < op.dst.size(); ++i) {
+        if (op.dst[i].id == kNoReg || (op.dim < 0 && i == 3)) continue;   // `_`, or .v4's unspecified 4th
+        Lanes v{};
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) v[lane] = coord(lane, op.dim >= 0 ? op.dim : static_cast<int>(i));
+        write_reg(w, op.dst[i], m, v, 32);
+      }
+      return;
+    }
+    Lanes _s_a, _s_b;
+    const Lanes abase = addr_base(w, ctx, ins, op.addr, _s_a);
+    const Lanes bbase = addr_base(w, ctx, ins, op.mbar, _s_b);
+    const size_t nranks = ctx.cluster_state ? ctx.cluster_state->ranks.size() : 1;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const int li = static_cast<int>(lane);
+      const uint64_t at = shared_window(abase[lane] + static_cast<uint64_t>(op.addr.offset));
+      const uint64_t bar = shared_window(bbase[lane] + static_cast<uint64_t>(op.mbar.offset));
+      if (shared_ref(ctx, ins, li, at).owner != &ctx || shared_ref(ctx, ins, li, bar).owner != &ctx)
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "clusterlaunchcontrol.try_cancel's response and barrier are in this CTA's shared "
+                 "memory (.shared::cta)");
+      if (at % 16) ctx_fail(ins, li, Err::MisalignedAccess,
+                            "clusterlaunchcontrol.try_cancel's response must be 16-byte aligned");
+      const auto got = clc_take();
+      const uint64_t lo = got ? 1u | uint64_t{(*got)[0]} << 32 : 0;
+      const uint64_t hi = got ? (*got)[1] | uint64_t{(*got)[2]} << 32 : 0;
+      // The response lands and its 16 bytes complete on the barrier -- in
+      // this CTA, or with .multicast::cluster::all in every CTA of the
+      // cluster at the same offsets.
+      const uint64_t aoff = at - kSharedVaBase, boff = bar - kSharedVaBase;
+      for (uint64_t r = 0; r < nranks; ++r) {
+        if (!op.multicast && r != cluster_rank_of(ctx)) continue;
+        const uint64_t ra = kSharedVaBase + cluster_address(ctx, r, aoff);
+        store_routed(w, ctx, ins, lane, ra, 8, lo);
+        store_routed(w, ctx, ins, lane, ra + 8, 8, hi);
+        Mbarrier& b = cluster_mbarrier(ctx, ins, li, kSharedVaBase + cluster_address(ctx, r, boff),
+                                       "clusterlaunchcontrol.try_cancel");
+        b.tx -= 16;
+        complete_phase_if_done(b);
+      }
+    }
+  }
+
+  // ---- Blackwell's fifth-generation tensor core (tcgen05, sm_100a) ----
+  //
+  // Every tcgen05 operation completes when it is issued. The asynchronous
+  // ones (mma, ld, st) may complete any time up to their tcgen05.commit or
+  // tcgen05.wait, and at once is one of the orders that allows; the fences
+  // and waits then have nothing left to order. A kernel that reads an
+  // accumulator before waiting for it is therefore not caught here.
+
+  // The CTAs an operation of .cta_group::n works on: this one, or the pair
+  // it belongs to, even rank first (9.7.18.5.1).
+  std::vector<const BlockCtx*> tcgen05_ctas(const BlockCtx& ctx, const Instr& ins, uint32_t group) {
+    if (group == 1) return {&ctx};
+    const uint32_t rank = cluster_rank_of(ctx);
+    const size_t n = ctx.cluster_state ? ctx.cluster_state->ranks.size() : 1;
+    if ((rank | 1) >= n || !ctx.cluster_state->ranks[rank ^ 1])
+      ctx_fail(ins, -1, Err::InvalidValue,
+               ".cta_group::2 works on a CTA pair -- two CTAs of a cluster whose %cluster_ctarank "
+               "differs in the last bit -- and this CTA (rank " + std::to_string(rank) + " of a " +
+                   std::to_string(n) + "-CTA cluster) has no peer");
+    const BlockCtx* even = ctx.cluster_state->ranks[rank & ~1u];
+    const BlockCtx* odd = ctx.cluster_state->ranks[rank | 1u];
+    return {even, odd};
+  }
+
+  static TensorMemory& tmem_of(const BlockCtx& c) { return *c.tmem; }
+
+  // A shared-memory address operand as a window address. tcgen05 takes both
+  // .shared::cta/.shared::cluster offsets and, with no state space, generic
+  // addresses, which here are already in the window.
+  static uint64_t shared_window(uint64_t v) { return v >= kSharedVaBase ? v : kSharedVaBase + v; }
+
+  uint32_t tcgen05_uniform(Warp& w, const BlockCtx& ctx, const Instr& ins, const Operand& o, Mask m,
+                           const char* what) {
+    Lanes _s;
+    const Lanes& v = read_operand(w, ctx, ins, o, _s);
+    uint32_t lead = W_;
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) {
+        if (lead == W_) lead = lane;
+        else if (static_cast<uint32_t>(v[lane]) != static_cast<uint32_t>(v[lead]))
+          ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                   std::string("every thread of the warp must give tcgen05 the same ") + what +
+                       "; the ISA leaves the result undefined otherwise");
+      }
+    return static_cast<uint32_t>(v[lead]);
+  }
+
+  void exec_tcgen05(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op, Mask m) {
+    if (!ctx.tmem) ctx_fail(ins, -1, Err::UnsupportedPtx, "tcgen05 outside a block context");
+    const bool collective = op.kind != Tcgen05Kind::Mma && op.kind != Tcgen05Kind::Commit &&
+                            op.kind != Tcgen05Kind::FenceBefore && op.kind != Tcgen05Kind::FenceAfter;
+    if (collective && m != all_)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "this tcgen05 instruction is .sync.aligned: every thread of the warp must execute it, "
+               "and this warp reached it with some lanes inactive or predicated off");
+    switch (op.kind) {
+      case Tcgen05Kind::FenceBefore:
+      case Tcgen05Kind::FenceAfter:
+      case Tcgen05Kind::WaitLd:
+      case Tcgen05Kind::WaitSt:
+        return;
+      case Tcgen05Kind::Relinquish:
+        for (const BlockCtx* c : tcgen05_ctas(ctx, ins, op.cta_group)) tmem_of(*c).relinquished = true;
+        return;
+      case Tcgen05Kind::Alloc:
+      case Tcgen05Kind::Dealloc:
+        exec_tmem_alloc(w, ctx, ins, op, m);
+        return;
+      case Tcgen05Kind::Ld:
+      case Tcgen05Kind::St:
+        exec_tmem_ldst(w, ctx, ins, op, m);
+        return;
+      case Tcgen05Kind::Commit:
+        exec_tcgen05_commit(w, ctx, ins, op, m);
+        return;
+      case Tcgen05Kind::Mma:
+        // Single-thread semantics: every active thread issues a whole MMA.
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) exec_tcgen05_mma(w, ctx, ins, op, lane);
+        return;
+    }
+  }
+
+  // tcgen05.alloc/dealloc (9.7.18.7.1).
+  void exec_tmem_alloc(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op, Mask m) {
+    const uint32_t ncols = tcgen05_uniform(w, ctx, ins, op.ncols, m, "nCols");
+    const bool pow2 = ncols && !(ncols & (ncols - 1));
+    if (ncols < 32 || ncols > TensorMemory::kCols || ncols % 32 || (!op.exclusive && !pow2))
+      ctx_fail(ins, -1, Err::InvalidValue,
+               "tcgen05." + std::string(op.kind == Tcgen05Kind::Alloc ? "alloc" : "dealloc") +
+                   " of " + std::to_string(ncols) + " columns; " +
+                   (op.exclusive ? "an .exclusive allocation takes a multiple of 32 from 32 to 512"
+                                 : "a power of two from 32 to 512"));
+    const std::vector<const BlockCtx*> ctas = tcgen05_ctas(ctx, ins, op.cta_group);
+    TensorMemory& mine = tmem_of(ctx);
+    if (op.kind == Tcgen05Kind::Alloc) {
+      if (mine.relinquished)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "tcgen05.alloc after this CTA ran tcgen05.relinquish_alloc_permit");
+      uint32_t col = 0;
+      if (op.cta_group == 2 && !mine.peer_alloc.empty()) {
+        // The peer CTA's warp got here first and allocated for both.
+        const auto [c, n] = mine.peer_alloc.front();
+        mine.peer_alloc.pop_front();
+        if (n != ncols)
+          ctx_fail(ins, -1, Err::InvalidValue,
+                   "the two CTAs of a pair ask .cta_group::2 tcgen05.alloc for different column "
+                   "counts (" + std::to_string(n) + " and " + std::to_string(ncols) + ")");
+        col = c;
+      } else {
+        // The lowest run aligned to its size that is free in every CTA the
+        // allocation covers. Where the hardware puts it is not documented;
+        // a kernel uses the address it is given.
+        bool found = false;
+        for (col = 0; col + ncols <= TensorMemory::kCols; col += op.exclusive ? 32 : ncols) {
+          bool ok = true;
+          for (const BlockCtx* c : ctas) {
+            const TensorMemory& t = tmem_of(*c);
+            if (!t.free_run(col, ncols) || t.exclusive || (op.exclusive && !t.live.empty())) ok = false;
+          }
+          if (ok) { found = true; break; }
+        }
+        if (!found)
+          ctx_fail(ins, -1, Err::UnsupportedPtx,
+                   "tcgen05.alloc of " + std::to_string(ncols) +
+                       " columns while too few are free; it would block until another warp "
+                       "deallocates, and waiting for that is not implemented");
+        for (const BlockCtx* c : ctas) {
+          TensorMemory& t = tmem_of(*c);
+          if (t.cells.empty()) t.cells.assign(size_t{TensorMemory::kLanes} * TensorMemory::kCols, 0);
+          t.live[col] = ncols;
+          if (op.exclusive) t.exclusive = true;
+          if (c != &ctx) t.peer_alloc.emplace_back(col, ncols);
+        }
+      }
+      // The address -- lane 0, the first column -- goes to shared memory, in
+      // this CTA, as a weak store.
+      Lanes _s;
+      const Lanes& base = addr_base(w, ctx, ins, op.addr, _s);
+      uint32_t lead = 0;
+      while (!(m & (Mask{1} << lead))) ++lead;
+      const uint64_t at = shared_window(base[lead] + static_cast<uint64_t>(op.addr.offset));
+      if (shared_ref(ctx, ins, static_cast<int>(lead), at).owner != &ctx)
+        ctx_fail(ins, static_cast<int>(lead), Err::InvalidValue,
+                 "tcgen05.alloc writes its address into this CTA's shared memory (.shared::cta)");
+      if (at % 4) ctx_fail(ins, static_cast<int>(lead), Err::MisalignedAccess,
+                           "tcgen05.alloc's destination must be 4-byte aligned");
+      store_routed(w, ctx, ins, lead, at, 4, col);
+      return;
+    }
+    const uint32_t taddr = tcgen05_uniform(w, ctx, ins, op.taddr, m, "taddr");
+    const uint32_t col = taddr & 0xFFFF;
+    if (op.cta_group == 2 && !mine.peer_dealloc.empty()) {
+      const auto [c, n] = mine.peer_dealloc.front();
+      mine.peer_dealloc.pop_front();
+      if (c != col || n != ncols)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "the two CTAs of a pair deallocate different Tensor Memory with "
+                 ".cta_group::2 tcgen05.dealloc");
+      return;
+    }
+    for (const BlockCtx* c : ctas) {
+      TensorMemory& t = tmem_of(*c);
+      auto it = t.live.find(col);
+      if ((taddr >> 16) != 0 || it == t.live.end() || it->second != ncols)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "tcgen05.dealloc of " + std::to_string(ncols) + " columns at column " +
+                     std::to_string(col) + " (lane " + std::to_string(taddr >> 16) +
+                     "), which is not an allocation tcgen05.alloc made" +
+                     (c != &ctx ? " in the peer CTA" : ""));
+      if (t.exclusive != op.exclusive)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "Tensor Memory is deallocated with .exclusive if and only if it was allocated "
+                 "with it");
+      t.live.erase(it);
+      t.exclusive = false;
+      if (c != &ctx) t.peer_dealloc.emplace_back(col, ncols);
+    }
+  }
+
+  // Where register j of thread t goes for a tcgen05.ld/st shape: the lane
+  // relative to the address's lane, and the 32-bit column relative to its
+  // column (figures 186-190). .16x32bx2's upper half-warp adds
+  // immHalfSplitoff to the column; the caller does that.
+  static void tmem_fragment(Tcgen05Shape s, uint32_t t, uint32_t j, uint32_t* lane, uint32_t* col) {
+    switch (s) {
+      case Tcgen05Shape::S32x32b: *lane = t; *col = j; return;
+      case Tcgen05Shape::S16x64b: *lane = t / 4 + 8 * (t % 2); *col = 2 * j + (t / 2) % 2; return;
+      case Tcgen05Shape::S16x128b: *lane = t / 4 + 8 * (j % 2); *col = t % 4 + 4 * (j / 2); return;
+      case Tcgen05Shape::S16x256b:
+        *lane = t / 4 + 8 * ((j / 2) % 2);
+        *col = 2 * (t % 4) + j % 2 + 8 * (j / 4);
+        return;
+      case Tcgen05Shape::S16x32bx2: *lane = t % 16; *col = j; return;
+    }
+  }
+
+  // tcgen05.ld/st (9.7.18.8). A warp reaches the 32 lanes of its quarter of
+  // Tensor Memory: warp w of a warpgroup, lanes 32(w%4) to 32(w%4)+31.
+  void exec_tmem_ldst(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op, Mask m) {
+    const uint32_t taddr = tcgen05_uniform(w, ctx, ins, op.taddr, m, "taddr");
+    const uint32_t linear0 = w.tid_x[0] + w.tid_y[0] * ctx.ntid[0] +
+                             w.tid_z[0] * ctx.ntid[0] * ctx.ntid[1];
+    const uint32_t quarter = (linear0 / W_) % 4;
+    TensorMemory& t = tmem_of(ctx);
+    const bool ld = op.kind == Tcgen05Kind::Ld;
+    const char* name = ld ? "tcgen05.ld" : "tcgen05.st";
+    const uint32_t lane0 = taddr >> 16, col0 = taddr & 0xFFFF;
+    const uint32_t width = op.pack16 ? 2 : 1;   // columns per register
+    std::vector<Lanes> vals(op.regs.size());
+    if (!ld)
+      for (size_t j = 0; j < op.regs.size(); ++j) {
+        Lanes _s;
+        vals[j] = read_operand(w, ctx, ins, Operand{RegOperand{op.regs[j]}}, _s);
+      }
+    for (uint32_t j = 0; j < op.regs.size(); ++j)
+      for (uint32_t th = 0; th < W_; ++th) {
+        uint32_t dl, dc;
+        tmem_fragment(op.shape, th, j, &dl, &dc);
+        const uint32_t lane = lane0 + dl;
+        uint32_t col = col0 + dc * width;
+        if (op.shape == Tcgen05Shape::S16x32bx2 && th >= 16) col += op.half_split;
+        if (lane / 32 != quarter || lane >= TensorMemory::kLanes)
+          ctx_fail(ins, static_cast<int>(th), Err::InvalidValue,
+                   std::string(name) + " reaches Tensor Memory lane " + std::to_string(lane) +
+                       ", and warp " + std::to_string(quarter) +
+                       " of its warpgroup may only reach lanes " + std::to_string(32 * quarter) +
+                       "-" + std::to_string(32 * quarter + 31) + " (9.7.18.8.1)");
+        for (uint32_t c = col; c < col + width; ++c)
+          if (c >= TensorMemory::kCols || !t.allocated(c))
+            ctx_fail(ins, static_cast<int>(th), Err::OutOfBounds,
+                     std::string(name) + " reaches Tensor Memory column " + std::to_string(c) +
+                         ", which no tcgen05.alloc of this CTA has allocated");
+        if (ld) {
+          vals[j][th] = op.pack16 ? (t.at(lane, col) & 0xFFFF) | (t.at(lane, col + 1) << 16)
+                                  : t.at(lane, col);
+        } else if (op.pack16) {
+          t.at(lane, col) = static_cast<uint32_t>(vals[j][th] & 0xFFFF);
+          t.at(lane, col + 1) = static_cast<uint32_t>((vals[j][th] >> 16) & 0xFFFF);
+        } else {
+          t.at(lane, col) = static_cast<uint32_t>(vals[j][th]);
+        }
+      }
+    if (ld)
+      for (size_t j = 0; j < op.regs.size(); ++j) write_reg(w, op.regs[j], m, vals[j], 32);
+  }
+
+  // tcgen05.commit: an arrive-on, count 1, on the barrier -- or with
+  // .multicast::cluster, on the barrier at the same offset in every CTA the
+  // mask names -- once this thread's earlier MMAs are done, which here they
+  // already are.
+  void exec_tcgen05_commit(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op,
+                           Mask m) {
+    Lanes _s_a, _s_m;
+    const Lanes base = addr_base(w, ctx, ins, op.addr, _s_a);
+    const Lanes mask = op.multicast ? read_operand(w, ctx, ins, op.cta_mask, _s_m) : Lanes{};
+    const size_t nranks = ctx.cluster_state ? ctx.cluster_state->ranks.size() : 1;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const int li = static_cast<int>(lane);
+      const uint64_t at = shared_window(base[lane] + static_cast<uint64_t>(op.addr.offset));
+      auto arrive = [&](uint64_t addr) {
+        Mbarrier& b = cluster_mbarrier(ctx, ins, li, addr, "tcgen05.commit");
+        b.arrived += 1;
+        complete_phase_if_done(b);
+      };
+      if (!op.multicast) {
+        arrive(at);
+        continue;
+      }
+      const uint64_t cta_mask = mask[lane] & 0xFFFF;
+      if (cta_mask >> nranks)
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "tcgen05.commit's ctaMask names a CTA past the cluster's " + std::to_string(nranks));
+      const uint64_t off = shared_ref(ctx, ins, li, at).off;
+      for (uint64_t r = 0; r < nranks; ++r)
+        if (cta_mask >> r & 1) arrive(kSharedVaBase + cluster_address(ctx, r, off));
+    }
+  }
+
+  // A tcgen05 shared-memory matrix descriptor (9.7.18.4.1). The same
+  // canonical layouts as wgmma's; the swizzle field is three bits wide here.
+  WgmmaDesc decode_tcgen05_desc(const Instr& ins, uint64_t d) {
+    WgmmaDesc out;
+    out.start = (d & 0x3FFF) << 4;
+    out.lbo = ((d >> 16) & 0x3FFF) << 4;
+    out.sbo = ((d >> 32) & 0x3FFF) << 4;
+    switch ((d >> 61) & 7) {
+      case 0: out.swizzle = 0; break;
+      case 2: out.swizzle = 128; break;
+      case 4: out.swizzle = 64; break;
+      case 6: out.swizzle = 32; break;
+      // 128 bytes swizzled in 32-byte atoms: the same canonical strides, the
+      // swizzle moving 32-byte chunks (Swizzle<2,5,2>, as TMA's
+      // CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B writes the tile).
+      case 1: out.swizzle = 128; out.atom = 32; break;
+      default:
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "tcgen05 matrix descriptor swizzle mode " + std::to_string((d >> 61) & 7) +
+                     " (bits 61-63), which the ISA makes invalid");
+    }
+    if (((d >> 46) & 7) != 1)
+      ctx_fail(ins, -1, Err::InvalidValue,
+               "a tcgen05 matrix descriptor needs the fixed value 0b001 in bits 46-48");
+    if (((d >> 49) & 7) != 0)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "a tcgen05 matrix descriptor with a nonzero base offset (bits 49-51); only swizzle "
+               "patterns that start on their repeat boundary are implemented");
+    if ((d >> 52) & 1)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "a tcgen05 matrix descriptor with an absolute leading-dimension address (bit 52, "
+               "sm_103a) is not implemented");
+    return out;
+  }
+
+  // One thread's tcgen05.mma (9.7.18.10.10.1): D = A*B (+ D), M x N x K, on
+  // this CTA's Tensor Memory or the pair's.
+  void exec_tcgen05_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op,
+                        uint32_t lane) {
+    const int li = static_cast<int>(lane);
+    auto value = [&](const Operand& o) {
+      Lanes _s;
+      return read_operand(w, ctx, ins, o, _s)[lane];
+    };
+    auto refuse = [&](const std::string& why) {
+      ctx_fail(ins, li, Err::UnsupportedPtx, "tcgen05.mma: " + why);
+    };
+    const uint32_t id = static_cast<uint32_t>(value(op.idesc));
+    // The instruction descriptor (Table 51).
+    if (id & 4) refuse("the instruction descriptor asks for sparse A (bit 2), which is tcgen05.mma.sp");
+    if ((id & 0x40) || (id & (1u << 23)))
+      ctx_fail(ins, li, Err::InvalidValue, "tcgen05.mma instruction descriptor sets a reserved bit");
+    if (id >> 30) refuse("the instruction descriptor's B-reuse shift (bits 30-31) is for .ws only");
+    const bool sat = id >> 3 & 1;
+    const uint32_t dtype = id >> 4 & 3, atype = id >> 7 & 7, btype = id >> 10 & 7;
+    const bool neg_a = id >> 13 & 1, neg_b = id >> 14 & 1;
+    const bool trans_a = id >> 15 & 1, trans_b = id >> 16 & 1;
+    const uint32_t N = (id >> 17 & 0x3F) << 3, M = (id >> 24 & 0x1F) << 4;
+    const bool k_bit = id >> 29 & 1;
+    // Element types by kind, and K: 256 bits of A's row.
+    WgmmaElem ta{}, tb{};
+    uint32_t bits = 16;
+    bool d_f16 = false, d_int = false;
+    auto bad = [&]() {
+      ctx_fail(ins, li, Err::InvalidValue,
+               "tcgen05.mma instruction descriptor 0x" + [&] {
+                 char b[12];
+                 std::snprintf(b, sizeof b, "%08x", id);
+                 return std::string(b);
+               }() + " has types this .kind does not define (Table 51)");
+    };
+    switch (op.mma_kind) {
+      case Tcgen05MmaKind::F16:
+        if (atype > 1 || btype != atype || dtype > 1 || (dtype == 0 && atype != 0)) bad();
+        ta = tb = atype ? WgmmaElem::BF16 : WgmmaElem::F16;
+        d_f16 = dtype == 0;
+        break;
+      case Tcgen05MmaKind::TF32:
+        if (atype != 2 || btype != 2 || dtype != 1) bad();
+        ta = tb = WgmmaElem::TF32;
+        bits = 32;
+        break;
+      case Tcgen05MmaKind::F8F6F4: {
+        auto el = [&](uint32_t t) {
+          if (t == 0) return WgmmaElem::E4M3;
+          if (t == 1) return WgmmaElem::E5M2;
+          if (t >= 3 && t <= 5)
+            refuse("the 6- and 4-bit types (E2M3, E3M2, E2M1) of .kind::f8f6f4, whose packing is "
+                   "not implemented yet");
+          bad();
+          return WgmmaElem::E4M3;
+        };
+        if (dtype > 1) bad();
+        ta = el(atype);
+        tb = el(btype);
+        d_f16 = dtype == 0;
+        bits = 8;
+        break;
+      }
+      case Tcgen05MmaKind::I8:
+        if (atype > 1 || btype > 1 || dtype != 2) bad();
+        ta = atype ? WgmmaElem::S8 : WgmmaElem::U8;
+        tb = btype ? WgmmaElem::S8 : WgmmaElem::U8;
+        d_int = true;
+        bits = 8;
+        if (neg_a || neg_b) bad();
+        break;
+    }
+    if (sat && !d_int) bad();
+    if (k_bit) refuse("K = 64 for 8-bit types (instruction descriptor bit 29) is sm_107f's");
+    const uint32_t K = 256 / bits;
+    const uint32_t G = op.cta_group;
+    const bool shape_ok =
+        G == 1 ? (M == 64 || M == 128) && N >= 8 && N <= 256 && N % 8 == 0 &&
+                     !(d_int && M == 128 && N % 16)
+               : (M == 128 || M == 256) && N >= 16 && N <= 256 && N % (d_int ? 32 : 16) == 0;
+    if (!shape_ok)
+      ctx_fail(ins, li, Err::InvalidValue,
+               "tcgen05.mma.cta_group::" + std::to_string(G) + " of shape M=" + std::to_string(M) +
+                   " N=" + std::to_string(N) + ", which Table 48 does not define");
+    if (op.a_tmem && trans_a) bad();
+
+    const std::vector<const BlockCtx*> ctas = tcgen05_ctas(ctx, ins, G);
+    const uint32_t Mloc = M / G, Nloc = N / G;
+    const uint32_t d_addr = static_cast<uint32_t>(value(op.d_tmem));
+    const uint32_t d_lane0 = d_addr >> 16, d_col0 = d_addr & 0xFFFF;
+    // Where D element (row m of this CTA's Mloc, column n) lives: the
+    // data-path layouts of 9.7.18.10.5 -- D (M=128), F (M=64, lanes 0-15 or
+    // 16-31 of each warp's quarter), A (M=256 over a pair) and B (M=128 over a
+    // pair, the upper half of N in lanes 64-127).
+    const bool layout_b = G == 2 && M == 128;
+    const bool layout_f = G == 1 && M == 64;
+    auto lane_align_ok = [&](uint32_t l) { return layout_f ? (l == 0 || l == 16) : l == 0; };
+    if (!lane_align_ok(d_lane0))
+      ctx_fail(ins, li, Err::InvalidValue,
+               "tcgen05.mma's D address has lane " + std::to_string(d_lane0) +
+                   "; this shape's data-path layout starts at lane 0" +
+                   (layout_f ? " or 16" : ""));
+    auto d_pos = [&](uint32_t m, uint32_t n, uint32_t lane0, uint32_t* dl, uint32_t* dc) {
+      if (layout_f) { *dl = (m / 16) * 32 + m % 16 + lane0; *dc = n; }
+      else if (layout_b) { *dl = m + 64 * (n / (N / 2)); *dc = n % (N / 2); }
+      else { *dl = m; *dc = n; }
+    };
+    const uint32_t d_cols = layout_b ? N / 2 : N;
+    for (const BlockCtx* c : ctas)
+      for (uint32_t col = d_col0; col < d_col0 + d_cols; ++col)
+        if (col >= TensorMemory::kCols || !tmem_of(*c).allocated(col))
+          ctx_fail(ins, li, Err::OutOfBounds,
+                   "tcgen05.mma writes D to Tensor Memory column " + std::to_string(col) +
+                       ", which no tcgen05.alloc has allocated" + (c != &ctx ? " in the peer CTA" : ""));
+    const double sa = neg_a ? -1.0 : 1.0, sb = neg_b ? -1.0 : 1.0;
+    const uint32_t eb = bits / 8;
+
+    // B: K x N, CTA v supplying columns [v*Nloc, (v+1)*Nloc) from its own
+    // shared memory at the descriptor's offsets (the peer's half of a pair
+    // sits at the same offsets there).
+    std::vector<double> B(size_t{K} * N);
+    {
+      const WgmmaDesc d = decode_tcgen05_desc(ins, value(op.b_desc));
+      for (uint32_t v = 0; v < G; ++v) {
+        const uint32_t rank = cluster_rank_of(*ctas[v]);
+        for (uint32_t n = 0; n < Nloc; ++n)
+          for (uint32_t k = 0; k < K; ++k) {
+            const uint64_t at = wgmma_smem_offset(d, !trans_b, eb, n, k);
+            B[size_t{k} * N + v * Nloc + n] =
+                sb * wgmma_decode(tb, load_routed(w, ctx, ins, lane,
+                                                  kSharedVaBase + cluster_address(ctx, rank, at), eb));
+          }
+      }
+    }
+    // A, by the Tensor Memory lane each D row is written to: from shared
+    // memory, the row that lane holds; from Tensor Memory, whatever that
+    // lane holds, packed 32 bits to a column (9.7.18.10.4) -- so layout B's
+    // duplicated A must really be in both halves, as on the hardware.
+    const uint32_t a_addr = op.a_tmem ? static_cast<uint32_t>(value(op.a)) : 0;
+    if (op.a_tmem && !lane_align_ok(a_addr >> 16))
+      ctx_fail(ins, li, Err::InvalidValue,
+               "tcgen05.mma's A address has lane " + std::to_string(a_addr >> 16) +
+                   ", which must match D's data-path lane alignment");
+    if (op.a_tmem && layout_f && (a_addr >> 16) != d_lane0)
+      ctx_fail(ins, li, Err::InvalidValue,
+               "for M = 64, A and D must use the same Tensor Memory lane alignment (9.7.18.10.5)");
+    const WgmmaDesc a_desc = op.a_tmem ? WgmmaDesc{} : decode_tcgen05_desc(ins, value(op.a));
+    Mask keep = 1;
+    if (const auto* imm = std::get_if<ImmInt>(&op.enable_d)) keep = imm->value != 0;
+    else if (const auto* r = std::get_if<RegOperand>(&op.enable_d)) keep = read_pred(w, ins, r->reg) >> lane & 1;
+    else refuse("enable-input-d must be a predicate or 0/1");
+    const bool accumulate = keep != 0;
+    // disable-output-lane: bit l of the vector leaves D's lane l alone.
+    std::array<uint32_t, 8> off_mask{};
+    for (size_t i = 0; i < op.disable_lanes.size(); ++i)
+      off_mask[i] = static_cast<uint32_t>(value(op.disable_lanes[i]));
+    if (G == 2)
+      for (uint32_t x : off_mask)
+        if (x) refuse("a nonzero disable-output-lane with .cta_group::2; the ISA does not say which "
+                      "CTA's lanes its upper half covers");
+    const double d_scale = op.scale_d > 0 ? std::ldexp(1.0, -op.scale_d) : 1.0;
+
+    std::vector<double> A(K);
+    for (uint32_t v = 0; v < G; ++v) {
+      TensorMemory& t = tmem_of(*ctas[v]);
+      const uint32_t rank = cluster_rank_of(*ctas[v]);
+      // A's rows of this CTA from shared memory, read once.
+      std::vector<double> As;
+      if (!op.a_tmem) {
+        As.resize(size_t{Mloc} * K);
+        for (uint32_t m = 0; m < Mloc; ++m)
+          for (uint32_t k = 0; k < K; ++k) {
+            const uint64_t at = wgmma_smem_offset(a_desc, !trans_a, eb, m, k);
+            As[size_t{m} * K + k] =
+                sa * wgmma_decode(ta, load_routed(w, ctx, ins, lane,
+                                                  kSharedVaBase + cluster_address(ctx, rank, at), eb));
+          }
+      }
+      for (uint32_t m = 0; m < Mloc; ++m)
+        for (uint32_t n = 0; n < N; ++n) {
+          uint32_t dl, dc;
+          d_pos(m, n, d_lane0, &dl, &dc);
+          if (off_mask[dl / 32] >> (dl % 32) & 1) continue;
+          if (op.a_tmem) {
+            const uint32_t al = dl - d_lane0 + (a_addr >> 16), ac0 = a_addr & 0xFFFF;
+            for (uint32_t k = 0; k < K; ++k) {
+              const uint32_t col = ac0 + k * bits / 32;
+              if (col >= TensorMemory::kCols || !t.allocated(col))
+                ctx_fail(ins, li, Err::OutOfBounds,
+                         "tcgen05.mma reads A from Tensor Memory column " + std::to_string(col) +
+                             ", which no tcgen05.alloc has allocated");
+              A[k] = sa * wgmma_decode(ta, t.at(al, col) >> (k * bits % 32));
+            }
+          } else {
+            std::copy_n(As.begin() + size_t{m} * K, K, A.begin());
+          }
+          uint32_t& cell = t.at(dl, d_col0 + dc);
+          if (d_int) {
+            int64_t acc = accumulate ? static_cast<int32_t>(cell) : 0;
+            for (uint32_t k = 0; k < K; ++k)
+              acc += static_cast<int64_t>(A[k]) * static_cast<int64_t>(B[size_t{k} * N + n]);
+            if (sat)
+              acc = std::clamp<int64_t>(acc, std::numeric_limits<int32_t>::min(),
+                                        std::numeric_limits<int32_t>::max());
+            cell = static_cast<uint32_t>(static_cast<int32_t>(acc));
+            continue;
+          }
+          // As wgmma: every product here is exact in f32, and the sum is
+          // kept in f32. An f16 D is one 16-bit value in the low half of its
+          // cell (9.7.18.10.4.1).
+          float acc = 0.0f;
+          if (accumulate) {
+            const double old = d_f16 ? f16_to_double(cell & 0xFFFF) : static_cast<double>(f32(cell));
+            acc = static_cast<float>(old * d_scale);
+          }
+          for (uint32_t k = 0; k < K; ++k)
+            acc += static_cast<float>(A[k]) * static_cast<float>(B[size_t{k} * N + n]);
+          cell = d_f16 ? static_cast<uint32_t>(double_to_f16(acc) & 0xFFFF) : f32bits(acc);
+        }
+    }
   }
 
   // The same fragments as exec_wmma_mma below, read from and written to the
   // 32-bit register file in place, with the halves decoded from the table.
   bool fast_wmma_mma(Warp& w, const OpWmmaMma& op, Mask m) {
-    if (op.elem == WmmaElem::TF32 || mem_.alu_fault_armed() || W_ != 32) return false;
+    if (op.generic || op.elem == WmmaElem::TF32 || mem_.alu_fault_armed() || W_ != 32) return false;
     for (const auto* v : {&op.a, &op.b, &op.c, &op.d})
       for (const Reg& r : *v)
         if (r.wide) return false;
@@ -4858,7 +6410,231 @@ class Interpreter {
     return true;
   }
 
+  // ---- WMMA for every shape and type the ISA has (the `generic` ones) ----
+  //
+  // A generic fragment holds the logical matrix: slot (lane, register,
+  // element) is matrix element (lane * per_lane + register * per_reg +
+  // element) mod the matrix's size, row by row. The ISA leaves the
+  // distribution unspecified, so any consistent one is correct; this one
+  // holds whole copies when the register count has room for more than one.
+  static std::pair<uint32_t, uint32_t> wmma_slot(const WmmaGeom& g, uint32_t lane, uint32_t reg, uint32_t e) {
+    const uint32_t per_reg = g.reg_bits / g.bits;
+    const uint64_t linear = uint64_t{lane} * g.regs * per_reg + uint64_t{reg} * per_reg + e;
+    const uint64_t idx = linear % (uint64_t{g.rows} * g.cols);
+    return {static_cast<uint32_t>(idx / g.cols), static_cast<uint32_t>(idx % g.cols)};
+  }
+  static char wmma_frag(OpWmmaLoad::Which w) {
+    return w == OpWmmaLoad::Which::A ? 'a' : w == OpWmmaLoad::Which::B ? 'b' : 'c';
+  }
+  // Element `elem` (counted in elements) of a matrix in memory: sub-byte
+  // elements are packed, low bits first.
+  uint64_t wmma_read(Warp& w, const BlockCtx& ctx, const Instr& ins, uint32_t lane, uint64_t base,
+                     uint64_t elem, uint32_t bits) {
+    if (bits >= 8) return load_routed(w, ctx, ins, lane, base + elem * (bits / 8), bits / 8);
+    const uint64_t bit = elem * bits;
+    return (load_routed(w, ctx, ins, lane, base + bit / 8, 1) >> (bit % 8)) & ((1u << bits) - 1);
+  }
+  // A fragment element as a number: the float types as doubles (exact), the
+  // integers sign- or zero-extended, b1 as 0 or 1.
+  static double wmma_value(WmmaType t, uint64_t bits) {
+    switch (t) {
+      case WmmaType::F16: return f16_to_double(bits & 0xFFFF);
+      case WmmaType::BF16: return bf16_to_double(bits & 0xFFFF);
+      case WmmaType::TF32: case WmmaType::F32: return std::bit_cast<float>(static_cast<uint32_t>(bits));
+      case WmmaType::F64: return std::bit_cast<double>(bits);
+      case WmmaType::S8: return static_cast<int8_t>(bits);
+      case WmmaType::U8: return static_cast<uint8_t>(bits);
+      case WmmaType::S4: return static_cast<int32_t>((bits & 0xF) << 28) >> 28;
+      case WmmaType::U4: return static_cast<double>(bits & 0xF);
+      case WmmaType::B1: return static_cast<double>(bits & 1);
+      case WmmaType::S32: return static_cast<int32_t>(bits);
+    }
+    return 0;
+  }
+
+  void exec_wmma_load_generic(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaLoad& op, Mask m) {
+    Lanes _s_base, _s_stride;
+    const Lanes base = addr_base(w, ctx, ins, op.addr, _s_base);
+    const Lanes& stride = read_operand(w, ctx, ins, op.stride, _s_stride);
+    const uint32_t lead = first_set(m);
+    const uint64_t addr0 = space_base(op.space) + base[lead] + static_cast<uint64_t>(op.addr.offset);
+    const uint64_t ld = stride[lead];
+    const WmmaGeom g = wmma_geom(wmma_frag(op.which), op.shape, op.type);
+    const uint32_t per_reg = g.reg_bits / g.bits;
+    const uint64_t mask = g.bits == 64 ? ~0ull : (1ull << g.bits) - 1;
+    for (uint32_t reg = 0; reg < g.regs; ++reg) {
+      Lanes r{};
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        uint64_t packed = 0;
+        for (uint32_t e = 0; e < per_reg; ++e) {
+          const auto [row, col] = wmma_slot(g, lane, reg, e);
+          const uint64_t elem = op.layout == MatLayout::Row ? uint64_t{row} * ld + col : uint64_t{col} * ld + row;
+          uint64_t v = wmma_read(w, ctx, ins, lane, addr0, elem, g.bits) & mask;
+          if (op.type == WmmaType::TF32) v = f32bits(f32_to_tf32(f32(v)));
+          packed |= v << (e * g.bits);
+        }
+        r[lane] = packed;
+      }
+      write_reg(w, op.dsts[reg], m, r, g.reg_bits);
+    }
+  }
+
+  void exec_wmma_store_generic(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaStore& op, Mask m) {
+    Lanes _s_base, _s_stride;
+    const Lanes base = addr_base(w, ctx, ins, op.addr, _s_base);
+    const Lanes& stride = read_operand(w, ctx, ins, op.stride, _s_stride);
+    const uint32_t lead = first_set(m);
+    const uint64_t addr0 = space_base(op.space) + base[lead] + static_cast<uint64_t>(op.addr.offset);
+    const uint64_t ld = stride[lead];
+    const WmmaGeom g = wmma_geom('d', op.shape, op.type);
+    const uint32_t per_reg = g.reg_bits / g.bits;
+    const uint64_t mask = g.bits == 64 ? ~0ull : (1ull << g.bits) - 1;
+    for (uint32_t reg = 0; reg < g.regs; ++reg) {
+      Lanes _s_v;
+      const Lanes v = read_operand(w, ctx, ins, op.src[reg], _s_v);
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        for (uint32_t e = 0; e < per_reg; ++e) {
+          const auto [row, col] = wmma_slot(g, lane, reg, e);
+          const uint64_t elem = op.layout == MatLayout::Row ? uint64_t{row} * ld + col : uint64_t{col} * ld + row;
+          store_routed(w, ctx, ins, lane, addr0 + elem * (g.bits / 8), g.bits / 8, (v[lane] >> (e * g.bits)) & mask);
+        }
+      }
+    }
+  }
+
+  // Gathers a generic fragment into its logical matrix.
+  void wmma_gather(Warp& w, const BlockCtx& ctx, const Instr& ins, const std::vector<Reg>& regs, char frag,
+                   WmmaShape shape, WmmaType t, std::vector<double>& out) {
+    const WmmaGeom g = wmma_geom(frag, shape, t);
+    const uint32_t per_reg = g.reg_bits / g.bits;
+    const uint64_t mask = g.bits == 64 ? ~0ull : (1ull << g.bits) - 1;
+    out.assign(size_t{g.rows} * g.cols, 0.0);
+    for (uint32_t reg = 0; reg < g.regs; ++reg) {
+      Lanes _s;
+      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{regs[reg]}}, _s);
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        for (uint32_t e = 0; e < per_reg; ++e) {
+          const auto [row, col] = wmma_slot(g, lane, reg, e);
+          out[size_t{row} * g.cols + col] = wmma_value(t, (v[lane] >> (e * g.bits)) & mask);
+        }
+    }
+  }
+  // The f16/bf16 A and B fragments at m16n16k16 keep the layout exec_wmma_mma
+  // reads (memory order, the mma transposing a column-major one), since a load
+  // does not know which accumulator type the mma will use.
+  void wmma_gather_legacy(Warp& w, const BlockCtx& ctx, const Instr& ins, const std::vector<Reg>& regs,
+                          bool bf, MatLayout layout, std::vector<double>& out) {
+    out.assign(size_t{kMmaDim} * kMmaDim, 0.0);
+    for (size_t reg = 0; reg < regs.size(); ++reg) {
+      Lanes _s;
+      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{regs[reg]}}, _s);
+      const uint32_t lanes_used = bf ? W_ : kMmaDim;
+      for (uint32_t lane = 0; lane < lanes_used; ++lane)
+        for (int h = 0; h < 2; ++h) {
+          uint32_t row, col;
+          if (bf) {
+            const uint32_t linear = lane * 8 + static_cast<uint32_t>(reg * 2 + h);
+            row = linear / kMmaDim;
+            col = linear % kMmaDim;
+          } else {
+            row = lane;
+            col = static_cast<uint32_t>(reg * 2 + h);
+          }
+          const uint64_t bits = (v[lane] >> (16 * h)) & 0xFFFF;
+          const double x = bf ? bf16_to_double(bits) : f16_to_double(bits);
+          if (layout == MatLayout::Row) out[size_t{row} * kMmaDim + col] = x;
+          else out[size_t{col} * kMmaDim + row] = x;
+        }
+    }
+  }
+
+  void exec_wmma_mma_generic(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaMma& op, Mask m) {
+    const uint32_t M = op.shape.m, N = op.shape.n, K = op.shape.k;
+    std::vector<double> A, B, C;
+    const bool legacy_ab = op.shape == WmmaShape{16, 16, 16} &&
+                           (op.atype == WmmaType::F16 || op.atype == WmmaType::BF16);
+    if (legacy_ab) {
+      wmma_gather_legacy(w, ctx, ins, op.a, op.atype == WmmaType::BF16, op.alayout, A);
+      wmma_gather_legacy(w, ctx, ins, op.b, op.btype == WmmaType::BF16, op.blayout, B);
+    } else {
+      wmma_gather(w, ctx, ins, op.a, 'a', op.shape, op.atype, A);
+      wmma_gather(w, ctx, ins, op.b, 'b', op.shape, op.btype, B);
+    }
+    wmma_gather(w, ctx, ins, op.c, 'c', op.shape, op.ctype, C);
+    std::vector<uint64_t> D(size_t{M} * N);
+    const WmmaType at = op.atype;
+    if (at == WmmaType::F16 || at == WmmaType::BF16 || at == WmmaType::TF32) {
+      // Products and sums in f32, k in order, as the f32-accumulator path does;
+      // an f16 result is that rounded once.
+      for (uint32_t i = 0; i < M; ++i)
+        for (uint32_t j = 0; j < N; ++j) {
+          float acc = static_cast<float>(C[size_t{i} * N + j]);
+          for (uint32_t k = 0; k < K; ++k) {
+            const float prod = static_cast<float>(A[size_t{i} * K + k]) * static_cast<float>(B[size_t{k} * N + j]);
+            acc = acc + prod;
+          }
+          D[size_t{i} * N + j] = op.dtype == WmmaType::F16 ? double_to_f16(acc) : f32bits(acc);
+        }
+    } else if (at == WmmaType::F64) {
+      const int prev = op.rnd == FRound::Nearest ? 0 : std::fegetround();
+      if (op.rnd != FRound::Nearest) g_directed_rounding.fetch_add(1, std::memory_order_relaxed);
+      switch (op.rnd) {
+        case FRound::Zero: std::fesetround(FE_TOWARDZERO); break;
+        case FRound::MinusInf: std::fesetround(FE_DOWNWARD); break;
+        case FRound::PlusInf: std::fesetround(FE_UPWARD); break;
+        case FRound::Nearest: break;
+      }
+      for (uint32_t i = 0; i < M; ++i)
+        for (uint32_t j = 0; j < N; ++j) {
+          double acc = C[size_t{i} * N + j];
+          for (uint32_t k = 0; k < K; ++k) acc = std::fma(A[size_t{i} * K + k], B[size_t{k} * N + j], acc);
+          D[size_t{i} * N + j] = std::bit_cast<uint64_t>(acc);
+        }
+      if (op.rnd != FRound::Nearest) {
+        std::fesetround(prev);
+        g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
+      }
+    } else {
+      // Integers, exactly; single bits as a population count of the AND or XOR.
+      for (uint32_t i = 0; i < M; ++i)
+        for (uint32_t j = 0; j < N; ++j) {
+          int64_t acc = static_cast<int64_t>(C[size_t{i} * N + j]);
+          for (uint32_t k = 0; k < K; ++k) {
+            const int64_t a = static_cast<int64_t>(A[size_t{i} * K + k]);
+            const int64_t b = static_cast<int64_t>(B[size_t{k} * N + j]);
+            acc += at == WmmaType::B1 ? (op.b1_and ? (a & b) : (a ^ b)) : a * b;
+          }
+          if (op.satfinite)
+            acc = std::clamp<int64_t>(acc, std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max());
+          D[size_t{i} * N + j] = static_cast<uint32_t>(static_cast<int32_t>(acc));
+        }
+    }
+    // Scatter D into its fragment.
+    const WmmaGeom g = wmma_geom('d', op.shape, op.dtype);
+    const uint32_t per_reg = g.reg_bits / g.bits;
+    const uint64_t mask = g.bits == 64 ? ~0ull : (1ull << g.bits) - 1;
+    for (uint32_t reg = 0; reg < g.regs; ++reg) {
+      Lanes r{};
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        uint64_t packed = 0;
+        for (uint32_t e = 0; e < per_reg; ++e) {
+          const auto [row, col] = wmma_slot(g, lane, reg, e);
+          packed |= (D[size_t{row} * N + col] & mask) << (e * g.bits);
+        }
+        r[lane] = packed;
+      }
+      if (op.dtype == WmmaType::F32 || op.dtype == WmmaType::F64) alu_fault(r, m, g.reg_bits);
+      write_reg(w, op.d[reg], m, r, g.reg_bits);
+    }
+  }
+
   void exec_wmma_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaMma& op, Mask m) {
+    if (op.generic) {
+      exec_wmma_mma_generic(w, ctx, ins, op, m);
+      return;
+    }
     // Gather A and B (16x16 f16 each) and C (16x16 f32) from the warp.
     // Held as f32, which every element type here fits exactly (f16 and bf16 are
     // both exact in a float), since the product is accumulated in f32 anyway.
@@ -4954,6 +6730,10 @@ class Interpreter {
   // than reading rows 16-31 of a 16-row matrix, which would be out of bounds.
   void exec_wmma_load(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaLoad& op,
                       Mask m) {
+    if (op.generic) {
+      exec_wmma_load_generic(w, ctx, ins, op, m);
+      return;
+    }
     Lanes _s_base;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     Lanes _s_stride;
@@ -5025,6 +6805,10 @@ class Interpreter {
 
   void exec_wmma_store(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaStore& op,
                        Mask m) {
+    if (op.generic) {
+      exec_wmma_store_generic(w, ctx, ins, op, m);
+      return;
+    }
     Lanes _s_base;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     Lanes _s_stride;
@@ -5072,8 +6856,12 @@ class Interpreter {
   }
   static uint64_t double_to_bf16(double x) {
     const float f = static_cast<float>(x);
+    if (std::isnan(f)) return kCanonicalNaN16;
+    // A directed mode, or a double that is not already a float (rounding it to
+    // float first could round twice), takes the general form.
+    if (g_directed_rounding.load(std::memory_order_relaxed) != 0 || static_cast<double>(f) != x)
+      return double_to_narrow(x, 7, 8);
     const uint32_t bits = std::bit_cast<uint32_t>(f);
-    if (std::isnan(f)) return (bits >> 16) | 0x0040u;  // keep it quiet
     // Round to nearest, ties to even, on the 16 bits being dropped.
     const uint32_t lsb = (bits >> 16) & 1u;
     const uint32_t rounded = bits + 0x7fffu + lsb;
@@ -5103,9 +6891,27 @@ class Interpreter {
           default:
             break;
         }
+        const auto subnormal32 = [](double v) {
+          return v != 0 && std::fabs(v) < static_cast<double>(std::numeric_limits<float>::min());
+        };
+        if (op->ftz && s.bits == 32 && !s.is_bfloat() && subnormal32(x)) x = std::copysign(0.0, x);
+        if (op->sat) x = x > 1 ? 1.0 : x > 0 ? x : 0.0;   // NaN and -0 become +0
         if (d.is_bfloat()) return double_to_bf16(x);
+        // A NaN from f64 keeps its sign and the top of its payload in f16 on a
+        // real GPU, made quiet, where one from f32 comes out 0x7FFF whatever
+        // it was.
+        if (d.bits == 16 && s.bits == 64 && std::isnan(x)) {
+          const uint64_t b = std::bit_cast<uint64_t>(x);
+          return ((b >> 48) & 0x8000u) | 0x7E00u | ((b >> 42) & 0x3FFu);
+        }
         if (d.bits == 16) return double_to_f16(x);
-        return d.bits == 32 ? f32bits(static_cast<float>(x)) : f64bits(x);
+        if (d.bits == 64) return f64bits(x);
+        const float f = static_cast<float>(x);
+        if (op->ftz && subnormal32(f)) return f32bits(std::copysign(0.0f, f));
+        // f32 to f32 goes through the float pipeline, which writes the
+        // canonical NaN; a narrowing cvt.f32.f64 keeps the payload.
+        if (std::isnan(f) && s.bits == 32) return 0x7FFF'FFFFu;
+        return f32bits(f);
       }
       // float -> int: round then clamp to the destination range.
       double rounded = round_int(x, op->round == Round::None ? Round::Rzi : op->round);
@@ -5138,6 +6944,22 @@ class Interpreter {
       if (d.is_bfloat()) return double_to_bf16(x);
       if (d.bits == 16) return double_to_f16(x);
       return d.bits == 32 ? f32bits(static_cast<float>(x)) : f64bits(x);
+    }
+    if (op->sat && d.bits < 64) {
+      // Clamp to the destination's range, reading the source with its own
+      // signedness: cvt.sat.u32.s32 of -1 is 0, cvt.sat.s32.u32 of
+      // 0xFFFFFFFF is INT32_MAX.
+      const bool neg = s.is_signed() && static_cast<int64_t>(sv) < 0;
+      const uint64_t hi = d.is_signed() ? (uint64_t{1} << (d.bits - 1)) - 1 : (uint64_t{1} << d.bits) - 1;
+      if (neg) {
+        const int64_t lo = d.is_signed() ? -(int64_t{1} << (d.bits - 1)) : 0;
+        if (static_cast<int64_t>(sv) < lo) sv = static_cast<uint64_t>(lo);
+      } else if (sv > hi) {
+        sv = hi;
+      }
+    } else if (op->sat && d.bits == 64 && s.is_signed() != d.is_signed()) {
+      if (s.is_signed() && static_cast<int64_t>(sv) < 0) sv = 0;   // s64 -> u64
+      else if (!s.is_signed() && sv >> 63) sv = uint64_t{INT64_MAX};  // u64 -> s64
     }
     return mask_to_bits(sv, d.bits);  // int -> int: truncate/extend
   }
@@ -5335,9 +7157,8 @@ class Interpreter {
   // `scratch`.
   const Lanes& addr_base(Warp& w, const BlockCtx& ctx, const Instr& ins, const Addr& a,
                          Lanes& scratch) {
-    (void)ctx;
     if (a.base_kind == Addr::Base::Symbol) {
-      scratch.fill(resolve_symbol(ins, a.base));
+      scratch.fill(resolve_symbol(ctx, ins, a.base));
       return scratch;
     }
     // Address registers are .b64 in 64-bit PTX, but shared/local addressing
@@ -5399,7 +7220,8 @@ class Interpreter {
     (void)w;
     for (const PendingCopy& pc : group) {
       check_shared(ctx, ins, static_cast<int>(lane), pc.dst, pc.bytes);
-      std::memcpy(ctx.shared->data() + (pc.dst - kSharedVaBase), pc.data.data(), pc.bytes);
+      std::memcpy(ctx.shared->data() + shared_ref(ctx, ins, static_cast<int>(lane), pc.dst).off,
+                  pc.data.data(), pc.bytes);
       // The shared write lands here, not where the copy was issued, so this is
       // where it is counted.
       count_memory(Space::Shared, pc.bytes, 1, /*is_store=*/true);
@@ -5462,12 +7284,15 @@ class Interpreter {
       auto& open = w.cp->open[lane];
       auto& groups = w.cp->groups[lane];
       // wait_all is defined as commit_group followed by wait_group 0, so both
-      // it and commit close whatever is open first.
+      // it and commit close whatever is open first -- into a group even when
+      // nothing is open. An empty group is trivially complete but it is still
+      // one of the "N most recent" wait_group N may leave pending: dropping
+      // it left an older, real group pending past the wait, and a CUTLASS
+      // multistage mainloop whose masked-off threads commit empty groups read
+      // stale stages.
       if (op.kind != OpCpAsyncGroup::Kind::WaitGroup) {
-        if (!open.empty()) {
-          groups.push_back(std::move(open));
-          open.clear();
-        }
+        groups.push_back(std::move(open));
+        open.clear();
       }
       if (op.kind == OpCpAsyncGroup::Kind::Commit) continue;
       const size_t keep = op.kind == OpCpAsyncGroup::Kind::WaitAll ? 0 : op.keep;
@@ -5699,6 +7524,10 @@ class Interpreter {
         ctx_fail(ins, li, Err::InvalidValue,
                  "tensormap.replace on 128 bytes that are not a tensor map made by "
                  "cuTensorMapEncodeTiled (or a copy of one)");
+      if (t.im2col)
+        ctx_fail(ins, li, Err::UnsupportedPtx,
+                 "tensormap.replace.tile on a map made by cuTensorMapEncodeIm2col; the ISA defines "
+                 "only the .tile mode");
       const uint64_t v = wide ? val[lane] : static_cast<uint32_t>(val[lane]);
       auto bad = [&](const std::string& what) {
         ctx_fail(ins, li, Err::InvalidValue, "tensormap.replace: " + what);
@@ -5759,13 +7588,23 @@ class Interpreter {
         case TmapField::SwizzleMode:
           if (v == 4) refused("the 96-byte swizzle is sm_103a's and sm_107a's");
           if (v > 4) bad("swizzle mode " + std::to_string(v) + " is not in the ISA's table");
-          t.swizzle = static_cast<TmapSwizzle>(v);   // none, 32B, 64B, 128B, in the same order
+          // None, 32B, 64B, 128B, in the same order; a 128-byte swizzle keeps
+          // the atomicity the map already has.
+          if (!(v == 3 && exec::TensorMap::swizzle_bytes(t.swizzle) == 128))
+            t.swizzle = static_cast<TmapSwizzle>(v);
           break;
-        case TmapField::SwizzleAtomicity:
-          // 16 bytes is what sm_90 swizzles at, so it changes nothing there;
-          // the wider atoms are Blackwell's.
-          if (v != 0) refused("swizzle atomicities other than 16 bytes are Blackwell's");
+        case TmapField::SwizzleAtomicity: {
+          // Table 36: 16B, 32B, 32B with the 8-byte flip, 64B. The wider atoms
+          // are sub-modes of the 128-byte swizzle.
+          if (v > 3) bad("swizzle atomicity " + std::to_string(v) + " is not in the ISA's table");
+          if (v == 2) refused("the 128-byte swizzle's 32-byte atomicity with the 8-byte flip");
+          const bool wide = exec::TensorMap::swizzle_bytes(t.swizzle) == 128;
+          if (v != 0 && !wide)
+            refused("a 32- or 64-byte swizzle atomicity on a map whose swizzle is not 128 bytes");
+          if (wide)
+            t.swizzle = v == 1 ? TmapSwizzle::B128Atom32 : v == 3 ? TmapSwizzle::B128Atom64 : TmapSwizzle::B128;
           break;
+        }
         case TmapField::FillMode:
           if (v > 1) bad("fill mode " + std::to_string(v) + " is not in the ISA's table");
           t.oob_nan = static_cast<uint8_t>(v);
@@ -5960,6 +7799,11 @@ class Interpreter {
       Lanes _s;
       coords[i] = read_operand(w, ctx, ins, op.coords[i], _s);
     }
+    std::vector<Lanes> im2col_off(op.im2col_offsets.size());
+    for (size_t i = 0; i < op.im2col_offsets.size(); ++i) {
+      Lanes _s;
+      im2col_off[i] = read_operand(w, ctx, ins, op.im2col_offsets[i], _s);
+    }
     const uint64_t shared_size = ctx.shared ? ctx.shared->size() : 0;
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
@@ -5989,7 +7833,7 @@ class Interpreter {
           pb.runs.emplace_back(static_cast<uint32_t>(off), len);
       };
       if (!op.tensor) {
-        const uint64_t g = (*gmem_base)[lane] + static_cast<uint64_t>(op.gmem.offset);
+        uint64_t g = (*gmem_base)[lane] + static_cast<uint64_t>(op.gmem.offset);
         const uint64_t n = static_cast<uint32_t>(size_v[lane]);
         if (n % 16 || g % 16)
           ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
@@ -5998,6 +7842,11 @@ class Interpreter {
           // From this block's shared memory, read now like any bulk load's
           // source; `g` is a shared::cta address.
           add_run(smem, static_cast<uint32_t>(n));
+          const SharedRef src = shared_ref(ctx, ins, li, kSharedVaBase + g);
+          if (src.owner != &ctx)
+            ctx_fail(ins, li, Err::InvalidValue,
+                     "a shared-to-shared bulk copy's source must be this block's shared memory");
+          g = src.off;
           if (g + n > shared_size)
             ctx_fail(ins, li, Err::OutOfBounds,
                      "a bulk copy reads past this block's shared memory");
@@ -6043,31 +7892,59 @@ class Interpreter {
                      "cp.reduce.async.bulk.tensor has no form of this operation for the tensor "
                      "map's element type (9.7.10.28.5.4)");
         }
-        // Elements the box takes along each dimension: box / traversal stride,
-        // rounded up.
+        if (map.im2col != op.im2col)
+          ctx_fail(ins, li, Err::InvalidValue,
+                   map.im2col ? "a tile-mode tensor copy through a map made by cuTensorMapEncodeIm2col"
+                              : "an im2col tensor copy through a map made by cuTensorMapEncodeTiled");
+        // Elements the copy takes, in the order they sit in shared memory, and
+        // where element e is in the tensor. Tile mode: the box, dimension 0
+        // fastest, each dimension's count the box over its traversal stride
+        // rounded up. im2col mode (5.5.4): `pixels` pixels, each `channels`
+        // channels wide, the pixels walked through the bounding box -- W
+        // fastest, each spatial dimension stepping by its traversal stride
+        // from lower to dim + upper - 1 and then starting over from lower
+        // with the next dimension advanced, the batch last -- beginning at the
+        // instruction's coordinates. A load reads each pixel at that position
+        // plus its im2col offsets; outside the tensor it reads zero.
         std::array<uint64_t, 5> count{1, 1, 1, 1, 1};
         uint64_t total = 1;
-        for (uint32_t d = 0; d < map.rank; ++d) {
-          count[d] = (map.box[d] + map.elem_stride[d] - 1) / map.elem_stride[d];
-          total *= count[d];
+        if (map.im2col) {
+          total = uint64_t{map.pixels} * map.channels;
+        } else {
+          for (uint32_t d = 0; d < map.rank; ++d) {
+            count[d] = (map.box[d] + map.elem_stride[d] - 1) / map.elem_stride[d];
+            total *= count[d];
+          }
         }
         std::array<int64_t, 5> start{};
         for (uint32_t d = 0; d < map.rank; ++d)
           start[d] = static_cast<int32_t>(static_cast<uint32_t>(coords[d][lane]));
+        const uint32_t nsp = map.rank >= 2 ? map.rank - 2 : 0;   // im2col's spatial dimensions
+        std::array<int64_t, 3> off{};
+        for (uint32_t i = 0; i < op.im2col_offsets.size() && i < 3; ++i)
+          off[i] = static_cast<uint16_t>(im2col_off[i][lane]);
+        std::array<int64_t, 5> pix = start;   // im2col: the pixel being read, in [1, rank-1]
         if (op.to_shared) pb.data.resize(total * es);
         std::array<uint64_t, 5> j{};
         for (uint64_t e = 0; e < total; ++e) {
-          // Global position of element e of the box, dimension 0 fastest.
           bool inside = true;
           uint64_t gaddr = map.address;
-          for (uint32_t d = 0; d < map.rank; ++d) {
-            const int64_t g = start[d] + static_cast<int64_t>(j[d] * map.elem_stride[d]);
+          auto at = [&](uint32_t d, int64_t g) {
             if (g < 0 || static_cast<uint64_t>(g) >= map.dim[d]) inside = false;
             else gaddr += static_cast<uint64_t>(g) * map.stride[d];
+          };
+          if (map.im2col) {
+            const uint64_t ch = e % map.channels;
+            at(0, start[0] + static_cast<int64_t>(ch));
+            for (uint32_t i = 0; i < nsp; ++i) at(1 + i, pix[1 + i] + off[i]);
+            at(map.rank - 1, pix[map.rank - 1]);
+          } else {
+            for (uint32_t d = 0; d < map.rank; ++d)
+              at(d, start[d] + static_cast<int64_t>(j[d] * map.elem_stride[d]));
           }
           // Shared position: the box packed densely, then swizzled by
           // address the same way wgmma reads it back.
-          const uint64_t soff = exec::swizzle_address(smem + e * es, swz);
+          const uint64_t soff = exec::swizzle_address(smem + e * es, swz, exec::TensorMap::swizzle_atom(map.swizzle));
           if (op.to_shared) {
             uint64_t v = 0;
             if (inside) {
@@ -6101,9 +7978,22 @@ class Interpreter {
               }
             }
           }
-          for (uint32_t d = 0; d < map.rank; ++d) {
-            if (++j[d] < count[d]) break;
-            j[d] = 0;
+          if (map.im2col) {
+            // The next pixel, after the last channel of this one.
+            if ((e + 1) % map.channels == 0) {
+              uint32_t i = 0;
+              for (; i < nsp; ++i) {
+                pix[1 + i] += map.elem_stride[1 + i];
+                if (pix[1 + i] <= static_cast<int64_t>(map.dim[1 + i]) - 1 + map.upper[i]) break;
+                pix[1 + i] = map.lower[i];
+              }
+              if (i == nsp) ++pix[map.rank - 1];
+            }
+          } else {
+            for (uint32_t d = 0; d < map.rank; ++d) {
+              if (++j[d] < count[d]) break;
+              j[d] = 0;
+            }
           }
         }
         // The barrier counts every byte of the box, the zero-filled ones too.
@@ -6113,10 +8003,18 @@ class Interpreter {
       // The barrier the load completes on, in the destination block.
       const SharedRef bar = shared_ref(ctx, ins, li, kSharedVaBase + (*mbar_base)[lane] +
                                                          static_cast<uint64_t>(op.mbar.offset));
+      // .cta_group::2 lets the barrier be in the destination's peer CTA
+      // instead (9.7.9.25.5.1), which CUTLASS's 2-SM kernels use to count both
+      // CTAs' tiles on the leader's barrier.
+      const uint32_t bar_rank = cluster_rank_of(*bar.owner);
       if (!op.multicast) {
-        if (bar.owner != dst.owner)
+        const bool peer_ok = op.cta_group == 2 && (bar_rank ^ 1) == cluster_rank_of(*dst.owner);
+        if (bar.owner != dst.owner && !peer_ok)
           ctx_fail(ins, li, Err::InvalidValue,
-                   "a bulk copy's mbarrier must be in the block its data goes to");
+                   op.cta_group == 2
+                       ? "a .cta_group::2 bulk copy's mbarrier must be in the block its data goes to or that block's peer"
+                       : "a bulk copy's mbarrier must be in the block its data goes to");
+        if (bar.owner != dst.owner) pb.dst = dst.owner;
         if (op.reduce) {
           // A reduction into another block's shared memory is made now, one
           // of the moments the asynchronous proxy allows, and its bytes are
@@ -6157,8 +8055,16 @@ class Interpreter {
                  }() + ") names no block, or a block past the cluster's " + std::to_string(nranks));
       for (uint64_t r = 0; r < nranks; ++r) {
         if (!(cta_mask >> r & 1)) continue;
-        const uint64_t at = kSharedVaBase + cluster_address(ctx, r, bar.off);
-        cluster_mbarrier(ctx, ins, li, at, "a multicast bulk copy").pending.push_back(pb);
+        // .cta_group::2: each destination's signal goes to whichever CTA of
+        // its pair has the barrier's rank parity (9.7.9.25.5.1).
+        const uint64_t br = op.cta_group == 2 ? (r & ~uint64_t{1}) | (bar_rank & 1) : r;
+        if (br >= nranks)
+          ctx_fail(ins, li, Err::InvalidValue,
+                   "a .cta_group::2 multicast bulk copy to CTA " + std::to_string(r) + ", which has no peer");
+        const uint64_t at = kSharedVaBase + cluster_address(ctx, br, bar.off);
+        PendingBulk to = pb;
+        if (br != r) to.dst = ctx.cluster_state->ranks[r];
+        cluster_mbarrier(ctx, ins, li, at, "a multicast bulk copy").pending.push_back(std::move(to));
       }
     }
   }
@@ -6179,9 +8085,10 @@ class Interpreter {
   static void land_bulk_copies(const BlockCtx& ctx, Mbarrier& b) {
     if (b.pending.empty()) return;
     for (const PendingBulk& p : b.pending) {
+      const BlockCtx& to = p.dst ? *p.dst : ctx;
       size_t at = 0;
       for (const auto& [off, len] : p.runs) {
-        std::memcpy(ctx.shared->data() + off, p.data.data() + at, len);
+        std::memcpy(to.shared->data() + off, p.data.data() + at, len);
         at += len;
       }
       b.tx -= static_cast<int64_t>(p.tx);
@@ -6206,13 +8113,18 @@ class Interpreter {
       if (m & (Mask{1} << lane)) { lead = lane; break; }
     if (lead >= W_) return;
     const uint64_t addr = sbase + base[lead] + static_cast<uint64_t>(op.addr.offset);
+    // Lanes may name different barriers -- CUTLASS's cluster pipelines have
+    // each lane arrive on another block's -- and every mbarrier operation is
+    // per thread, so each barrier's lanes are handled as a group of their own.
+    Mask same = 0;
     for (uint32_t lane = 0; lane < W_; ++lane)
-      if (m & (Mask{1} << lane)) {
-        const uint64_t a2 = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
-        if (a2 != addr)
-          ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
-                   "mbarrier with a different address per lane is not supported");
-      }
+      if (m & (Mask{1} << lane) && sbase + base[lane] + static_cast<uint64_t>(op.addr.offset) == addr)
+        same |= Mask{1} << lane;
+    if (same != m) {
+      exec_mbarrier(w, ctx, ins, op, same);
+      exec_mbarrier(w, ctx, ins, op, m & ~same);
+      return;
+    }
     if (addr % 8 != 0)
       ctx_fail(ins, -1, Err::MisalignedAccess, "an mbarrier must be 8-byte aligned");
 
@@ -6718,6 +8630,100 @@ class Interpreter {
   // where on a device it is not -- a permissive difference, so a program that
   // works on hardware works here, but one that copies a device-malloc'd
   // pointer to the host will pass here and fail there.
+  const Warp::Slot& call_slot(const Warp& w, const Instr& ins, const OpCall& op, size_t i) {
+    auto it = w.slots.find(op.param_slots[i]);
+    if (it == w.slots.end())
+      ctx_fail(ins, -1, Err::UninitializedRegister, op.callee + " argument read before it was written");
+    return it->second;
+  }
+  void write_call_result(Warp& w, const OpCall& op, Mask m, const Lanes& r, uint32_t bytes) {
+    if (op.retval_slot.empty()) return;
+    Warp::Slot& out = w.slots[op.retval_slot];
+    if (out.bytes.empty()) out.reset(bytes, W_);
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) out.write(lane, 0, bytes, r[lane]);
+  }
+
+  // cudaGetParameterBufferV2(func, gridDim, blockDim, sharedMem): a buffer, in
+  // device memory, laid out as the kernel's parameters are, for the calling
+  // thread to fill. Null once too many launches are pending, as on hardware.
+  void exec_get_parameter_buffer(Warp& w, const BlockCtx&, const Instr& ins, const OpCall& op, Mask m) {
+    if (op.param_slots.size() != 4)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, op.callee + " takes four arguments");
+    if (!cfg_.kernels || !dl_)
+      ctx_fail(ins, -1, Err::Unsupported,
+               "a device-side launch, with no kernel table to find the child in (the runtime "
+               "supplies one; a bare exec::launch does not)");
+    const Warp::Slot& func = call_slot(w, ins, op, 0);
+    const Warp::Slot& grid = call_slot(w, ins, op, 1);
+    const Warp::Slot& block = call_slot(w, ins, op, 2);
+    const Warp::Slot& shared = call_slot(w, ins, op, 3);
+    Lanes r{};
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint64_t f = func.read(lane, 0, 8);
+      auto k = cfg_.kernels->find(f);
+      if (k == cfg_.kernels->end())
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                 "a device-side launch names 0x" + [&] {
+                   char b[24];
+                   std::snprintf(b, sizeof b, "%llx", static_cast<unsigned long long>(f));
+                   return std::string(b);
+                 }() + ", which is not the address of a kernel loaded on this device");
+      ChildLaunch c;
+      c.kernel = k->second;
+      for (int i = 0; i < 3; ++i) {
+        c.grid[i] = static_cast<uint32_t>(grid.read(lane, 4 * i, 4));
+        c.block[i] = static_cast<uint32_t>(block.read(lane, 4 * i, 4));
+      }
+      c.shared = static_cast<uint32_t>(shared.read(lane, 0, 4));
+      c.size = param_space_bytes(*c.kernel.fn);
+      std::lock_guard<std::mutex> guard(dl_->mu);
+      if (dl_->by_buffer.size() + dl_->queue.size() >= kMaxPendingLaunches) continue;   // null
+      c.buffer = mem_.alloc(std::max<uint64_t>(c.size, 16));
+      r[lane] = c.buffer;
+      dl_->by_buffer.emplace(c.buffer, c);
+    }
+    write_call_result(w, op, m, r, 8);
+  }
+
+  // cudaLaunchDeviceV2(parameterBuffer, stream): the child is queued to run
+  // after this grid. The stream is not needed to order it: every device-side
+  // stream's launches may run then, and children run in the order issued.
+  void exec_launch_device(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
+    if (op.param_slots.size() != 2)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, op.callee + " takes two arguments");
+    if (!dl_)
+      ctx_fail(ins, -1, Err::Unsupported, "a device-side launch outside a launch that can run it");
+    const Warp::Slot& buf = call_slot(w, ins, op, 0);
+    constexpr uint64_t kSuccess = 0, kInvalidValue = 1, kInvalidConfiguration = 9;
+    const uint64_t block_linear =
+        (uint64_t{ctx.ctaid[2]} * ctx.nctaid[1] + ctx.ctaid[1]) * ctx.nctaid[0] + ctx.ctaid[0];
+    Lanes r{};
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint64_t b = buf.read(lane, 0, 8);
+      std::lock_guard<std::mutex> guard(dl_->mu);
+      auto it = dl_->by_buffer.find(b);
+      if (it == dl_->by_buffer.end()) {
+        r[lane] = kInvalidValue;   // not a buffer cudaGetParameterBuffer handed out
+        continue;
+      }
+      ChildLaunch c = it->second;
+      dl_->by_buffer.erase(it);
+      const uint64_t threads = uint64_t{c.block[0]} * c.block[1] * c.block[2];
+      if (!c.grid[0] || !c.grid[1] || !c.grid[2] || !threads || (profile_.limits.max_threads_per_block && threads > profile_.limits.max_threads_per_block)) {
+        mem_.free(c.buffer);
+        r[lane] = kInvalidConfiguration;
+        continue;
+      }
+      c.order = (block_linear << 24) | (dl_->per_block[block_linear]++ & 0xFFFFFF);
+      dl_->queue.push_back(c);
+      r[lane] = kSuccess;
+    }
+    write_call_result(w, op, m, r, 4);
+  }
+
   void exec_device_heap(Warp& w, [[maybe_unused]] const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
     const bool allocating = op.callee == "malloc";
     if (op.param_slots.size() != 1)
@@ -6932,9 +8938,6 @@ class Interpreter {
   // of variant tests, and the instruction stream is the hottest path there is.
   mutable std::vector<uint8_t> class_by_pc_;
   uint32_t cur_warp_ = 0;     // which warp of the block is running, for race reports
-  // B of the wgmma being executed, kept across instructions so a 64x256 tile
-  // does not allocate on every one. An interpreter runs on one thread.
-  std::vector<double> wgmma_b_;
   bool fast_enabled_ = true;   // VGPU_FASTPATH, sampled at launch
   bool host_directed_ = false;   // this thread was not rounding to nearest at launch
   // %gridid: a serial number distinguishing this launch from every other one in
@@ -6994,7 +8997,25 @@ KernelResources kernel_resources(const EntryFn& fn, const DeviceProfile& profile
   // The interpreter has no architectural register file to run out of, so this
   // only corrects what is *reported* -- the occupancy figure and the launch
   // decision, which are exactly the things the number exists to inform.
-  const uint32_t arch_max = profile.limits.max_registers_per_thread;
+  //
+  // The kernel's own bounds lower that ceiling, the same way: .maxnreg names
+  // one, and .maxntid (with .minnctapersm) promises that many threads -- that
+  // many blocks -- fit, which ptxas meets by allocating no more registers per
+  // thread than the block's and the multiprocessor's files allow, in its
+  // allocation unit of 8. CUTLASS's Hopper kernels declare .maxntid 384 and
+  // need more than 170 by this measure; hardware launches them, spilling.
+  uint32_t arch_max = profile.limits.max_registers_per_thread;
+  if (fn.max_nreg && (!arch_max || fn.max_nreg < arch_max)) arch_max = fn.max_nreg;
+  const uint64_t bound_threads = uint64_t{fn.max_ntid[0]} * std::max(1u, fn.max_ntid[1]) *
+                                 std::max(1u, fn.max_ntid[2]);
+  if (fn.max_ntid[0] && bound_threads) {
+    uint64_t cap = profile.limits.registers_per_block / bound_threads;
+    if (profile.limits.registers_per_sm)
+      cap = std::min<uint64_t>(cap, profile.limits.registers_per_sm /
+                                        (bound_threads * std::max(1u, fn.min_ctas_per_sm)));
+    cap = cap / 8 * 8;
+    if (cap && (!arch_max || cap < arch_max)) arch_max = static_cast<uint32_t>(cap);
+  }
   if (arch_max && usage.regs_per_thread > arch_max) {
     const uint32_t spilled = usage.regs_per_thread - arch_max;
     usage.spilled_regs = spilled;
@@ -7049,13 +9070,17 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
                           "dimension ", c);
       ctas *= c;
     }
-    // 8 is the portable maximum CUDA guarantees. Larger clusters exist on some
-    // parts through an opt-in, and this engine does not model the opt-in, so
-    // the portable limit is the one enforced -- a kernel that needs more is
-    // told which number it exceeded.
-    if (ctas > 8)
+    // 8 is the portable maximum CUDA guarantees. A kernel that opts in with
+    // cudaFuncAttributeNonPortableClusterSizeAllowed may have up to 16 on
+    // Hopper and Blackwell, the most those parts schedule.
+    const uint64_t nonportable_max = p.cc_major >= 9 ? 16 : 8;
+    if (ctas > 8 && !(cfg.nonportable_cluster && ctas <= nonportable_max))
       throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': cluster of ", ctas,
-                        " blocks exceeds the portable maximum of 8");
+                        " blocks exceeds ",
+                        cfg.nonportable_cluster
+                            ? "the " + std::to_string(nonportable_max) + " this part can schedule"
+                            : std::string("the portable maximum of 8 (cudaFuncAttributeNonPortable"
+                                          "ClusterSizeAllowed raises it on Hopper and later)"));
   } else if (fn.explicit_cluster) {
     // .explicitcluster means the kernel refuses to run without one.
     throw Error::make(Err::LaunchConfig, "kernel '", fn.name,
@@ -7131,6 +9156,26 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
 
 namespace {
 
+// Whether a kernel can allocate device memory while it runs: malloc/free, or
+// a dynamic-parallelism parameter buffer, in its own code or in a device
+// function it calls (an indirect call counts, since where it lands is not
+// known here). The allocator's table of live allocations is read without a
+// lock by every load and store, so allocating in one block while another
+// block's thread reads it is a data race (ThreadSanitizer found it in the
+// dynamic-parallelism test). Such a grid runs on one host thread.
+bool allocates_while_running(const ptx::EntryFn& fn, std::set<const ptx::EntryFn*>& seen) {
+  if (!seen.insert(&fn).second) return false;
+  for (const ptx::Instr& ins : fn.body) {
+    const auto* op = std::get_if<ptx::OpCall>(&ins.op);
+    if (!op) continue;
+    if (op->indirect || op->callee == "malloc" || op->callee == "free" ||
+        op->callee == "__cudaCDP2GetParameterBufferV2" || op->callee == "cudaGetParameterBufferV2")
+      return true;
+    if (op->target && allocates_while_running(*op->target, seen)) return true;
+  }
+  return false;
+}
+
 // How many host threads to spread the grid over. One thread reproduces the old
 // strictly serial block order exactly, which is what a kernel with a data race
 // needs to stay reproducible; more threads is faster and is what CUDA's own
@@ -7173,11 +9218,13 @@ uint64_t effective_max_steps(uint64_t configured) {
 
 }  // namespace
 
-LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
-                   const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
-                   const DeviceProfile& profile, const SymbolTable* symbols,
-                   const ProgressFn& progress) {
-  refresh_modes();
+namespace {
+
+// One grid, without the child grids it launches: those are left in `dl`.
+LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
+                        const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
+                        const DeviceProfile& profile, const SymbolTable* symbols,
+                        const ProgressFn& progress, DeviceLaunches* dl) {
   LaunchConfig with_cluster = cfg;
   // __cluster_dims__ compiles to .reqnctapercluster and is a property of the
   // kernel, so it applies whether or not the launch asked for a cluster. An
@@ -7235,12 +9282,18 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
   // A cooperative launch runs on one worker whatever VGPU_THREADS says. Its
   // blocks wait on each other, so they cannot be split into independent ranges
   // -- that is precisely the promise a cooperative launch does not make.
-  const unsigned nthreads = (eff.cooperative || ordered) ? 1 : worker_count(blocks);
+  const unsigned nthreads = [&] {
+    if (eff.cooperative || ordered || blocks <= 1) return 1u;
+    std::set<const ptx::EntryFn*> seen;
+    if (allocates_while_running(fn, seen)) return 1u;
+    return worker_count(blocks);
+  }();
 
   if (nthreads <= 1) {
     LaunchStats stats;
     Interpreter interp(fn, eff, pb, mem, profile, symbols, stats, progress);
     interp.set_grid_id(grid_id);
+    interp.set_device_launches(dl);
     interp.run_grid();
     return stats;
   }
@@ -7276,6 +9329,7 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
                            t == 0 ? progress : ProgressFn{});
         interp.set_concurrent(true);
         interp.set_grid_id(grid_id);
+        interp.set_device_launches(dl);
         for (;;) {
           const uint64_t begin = next_unit.fetch_add(chunk, std::memory_order_relaxed);
           if (begin >= units) break;
@@ -7294,6 +9348,73 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
   LaunchStats total;
   for (const auto& s : per_thread) total.add(s);
   return total;
+}
+
+// Runs the child grids `dl` holds, each to completion -- its own children
+// included, since a grid is complete only when they are -- before the next,
+// in the order they were launched.
+void run_children(DeviceLaunches& dl, const LaunchConfig& parent, MemoryManager& mem,
+                  const DeviceProfile& profile, const ProgressFn& progress, LaunchStats& stats,
+                  uint32_t depth) {
+  // Buffers taken and never launched go back.
+  for (auto& [buf, c] : dl.by_buffer) mem.free(buf);
+  dl.by_buffer.clear();
+  std::vector<ChildLaunch> queue = std::move(dl.queue);
+  dl.queue.clear();
+  std::stable_sort(queue.begin(), queue.end(),
+                   [](const ChildLaunch& a, const ChildLaunch& b) { return a.order < b.order; });
+  // Whatever happens, no parameter buffer outlives the launch.
+  struct Buffers {
+    MemoryManager& mem;
+    std::vector<ChildLaunch>& q;
+    ~Buffers() {
+      for (auto& c : q)
+        if (c.buffer) mem.free(c.buffer);
+    }
+  } guard{mem, queue};
+  for (ChildLaunch& c : queue) {
+    if (depth > kMaxLaunchDepth)
+      throw Error::make(Err::LaunchConfig, "kernel '", c.kernel.fn->name,
+                        "' launched at nesting depth ", depth, "; dynamic parallelism allows ",
+                        kMaxLaunchDepth);
+    std::vector<uint8_t> bytes(c.size);
+    if (c.size) mem.read(c.buffer, bytes.data(), c.size);
+    mem.free(c.buffer);
+    c.buffer = 0;
+    // The buffer back into one argument per parameter, at the offsets the
+    // parent wrote them to.
+    std::vector<std::vector<uint8_t>> args;
+    uint32_t off = 0;
+    for (const auto& p : c.kernel.fn->params) {
+      const uint32_t align = p.align ? p.align : (p.size < 8 ? std::max<uint32_t>(p.size, 1) : 8);
+      off = (off + align - 1) / align * align;
+      args.emplace_back(bytes.begin() + off, bytes.begin() + off + p.size);
+      off += p.size;
+    }
+    LaunchConfig cc = parent;
+    cc.grid = c.grid;
+    cc.block = c.block;
+    cc.shared_bytes = c.shared;
+    cc.cluster = {0, 0, 0};
+    cc.cooperative = false;
+    cc.coop_workspace = 0;
+    DeviceLaunches child;
+    stats.add(launch_grid(*c.kernel.fn, cc, args, mem, profile, c.kernel.symbols, progress, &child));
+    run_children(child, cc, mem, profile, progress, stats, depth + 1);
+  }
+}
+
+}  // namespace
+
+LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
+                   const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
+                   const DeviceProfile& profile, const SymbolTable* symbols,
+                   const ProgressFn& progress) {
+  refresh_modes();
+  DeviceLaunches dl;
+  LaunchStats stats = launch_grid(fn, cfg, args, mem, profile, symbols, progress, &dl);
+  run_children(dl, cfg, mem, profile, progress, stats, 1);
+  return stats;
 }
 
 }  // namespace vgpu::exec

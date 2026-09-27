@@ -45,6 +45,11 @@ struct Operand {
 };
 std::string operand_text(const Operand& o);
 
+// Which processor the code is for. gfx90a (CDNA2) numbers some instructions
+// differently from gfx940 and later -- its matrix instructions above all --
+// and has a few they dropped (v_mad_f32, v_mac_f32); gfx950 adds to gfx942's.
+enum class Target { Gfx942, Gfx90a, Gfx950 };
+
 struct Inst {
   Enc enc = Enc::Unknown;
   uint32_t opcode = 0;
@@ -71,6 +76,26 @@ struct Inst {
   // VOP3's (and SDWA's) output multiplier: 1 doubles a float result, 2
   // quadruples it, 3 halves it.
   uint8_t omod = 0;
+  // gfx950's v_bitop3: the truth table of three inputs, kept in the bits
+  // VOP3 otherwise uses for negation (bits 0-2), absolute value (3-5) and
+  // the output multiplier (6-7).
+  uint8_t bitop3 = 0;
+  // gfx950's f8f6f4 matrix instructions: A's and B's formats, which the
+  // encoding keeps where the others' broadcast controls are (CBSZ, BLGP):
+  // 0 fp8, 1 bf8, 2 fp6 (E2M3), 3 bf6 (E3M2), 4 fp4 (E2M1).
+  uint8_t cbsz = 0, blgp = 0;
+  // gfx950's scaled matrix instructions (v_mfma_scale_*): 16 bytes, a
+  // load-scale prefix then the product. Sources 3 and 4 are A's and B's E8M0
+  // scales, and scale_sel which byte of each register (bits 0-1 A's, 2-3 B's):
+  // {OP_SEL_HI, OP_SEL} of the prefix, per source.
+  bool scaled = false;
+  // The sparse matrix instructions (v_smfmac_*): which set of indices in the
+  // index register -- ABID, where CBSZ is 0; the first set otherwise.
+  uint8_t abid = 0;
+  uint8_t scale_sel = 0;
+  // The processor it was decoded for, which names some instructions and
+  // cache bits otherwise when it is printed (gfx90a's glc, slc and scc).
+  Target arch = Target::Gfx942;
   // SMEM: the offset is the instruction's own and a register's both, which
   // the assembler writes as "offset:" even when the constant is zero.
   bool smem_both_offsets = false;
@@ -113,9 +138,15 @@ struct Inst {
   uint32_t cache = 0;
 };
 
-// Decodes the instruction at `at` in `code`. Throws Err::Unsupported naming
-// the encoding and opcode when it is one this does not know yet.
-Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc);
+// The target a code object's e_flags machine field (EF_AMDGPU_MACH) names.
+inline Target target_of_mach(uint32_t mach) {
+  return mach == 0x3f ? Target::Gfx90a : mach == 0x4f ? Target::Gfx950 : Target::Gfx942;
+}
+
+// Decodes the instruction at `at` in `code`, for `target`. Throws
+// Err::Unsupported naming the encoding and opcode when it is one this does
+// not know yet.
+Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target = Target::Gfx942);
 
 // The instruction as the assembler writes it, for tests and for a
 // disassembly listing.

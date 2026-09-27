@@ -173,7 +173,13 @@ struct OpCvta { Type ty; Space space = Space::Generic; bool to_space = false; Re
 // roundf compile to, so conflating them with the bare modes leaves those
 // intrinsics returning their input.
 enum class Round { None, Rn, Rz, Rm, Rp, Rni, Rzi, Rmi, Rpi };
-struct OpCvt { Type dst_ty; Type src_ty; Round round = Round::None; Reg dst; Operand src; };
+// .sat clamps a float result to [0.0, 1.0] (NaN to +0) and an integer one to
+// the destination's range; .ftz flushes f32 subnormal inputs and results to
+// sign-preserving zero.
+struct OpCvt {
+  Type dst_ty; Type src_ty; Round round = Round::None; Reg dst; Operand src;
+  bool sat = false, ftz = false;
+};
 struct OpNot { Type ty; Reg dst; Operand src; };   // bitwise not
 struct OpNeg { Type ty; Reg dst; Operand src; };   // arithmetic negate (int/float)
 struct OpAbs { Type ty; Reg dst; Operand src; };
@@ -226,6 +232,10 @@ struct OpRedux { ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand src; };
 // cvt.rn.f16x2.f32 d, a, b -- convert two f32 and pack them into one register,
 // a in the high half and b in the low half.
 struct OpCvtF16x2 { Reg dst; Operand a, b; bool bf16 = false; };
+// cvt.pack.sat.<to>.s32[.b32] d, a, b[, c]: a and b saturated to a 16-, 8-,
+// 4- or 2-bit integer type and packed, b in the low field and a above it;
+// for the narrower types the rest of d comes from the low bits of c.
+struct OpCvtPack { uint32_t bits = 8; bool is_signed = true; bool has_c = false; Reg dst; Operand a, b, c; };
 
 // ldmatrix.sync.aligned.m8n8.xN[.trans].b16 {d...}, [addr]
 // Loads N 8x8 matrices of 16-bit elements from shared memory. Row r of matrix i
@@ -276,6 +286,11 @@ struct OpMma {
   bool acc_f16 = false;     // accumulate in f16x2 registers rather than f32
   bool acc_int = false;     // s32 accumulate
   std::vector<Reg> d, a, b, c;
+  // mma.sp: A is 2:4 structured sparse, holding only its non-zero half; the
+  // metadata operand says where each stored element sits in its 4-wide chunk,
+  // and the selector says which threads of each group of four supply it.
+  bool sparse = false;
+  Operand meta, selector;
 };
 // Hopper's warpgroup MMA (sm_90a): wgmma.fence, .commit_group, .wait_group
 // and .mma_async. Four warps compute one 64xNxK product; A comes from
@@ -298,6 +313,61 @@ struct OpWgmma {
   Operand scale_d;           // predicate (or 0/1): false means D = A*B
   int scale_a = 1, scale_b = 1;   // -1 negates, float forms only
   int trans_a = 0, trans_b = 0;   // 1 selects M-/N-major, 16-bit forms only
+};
+// Blackwell's fifth-generation tensor core (sm_100a/sm_100f and the a/f
+// targets after it, PTX ISA 9.7.18): Tensor Memory -- 128 lanes by 512
+// columns of 32-bit cells per CTA -- allocated by a warp, filled and read by
+// tcgen05.st/ld in fixed warp-wide shapes, and written by tcgen05.mma, which
+// one thread issues for the whole MxNxK product.
+enum class Tcgen05Kind {
+  Alloc, Dealloc, Relinquish, Ld, St, WaitLd, WaitSt, FenceBefore, FenceAfter, Commit, Mma,
+};
+// tcgen05.ld/st data-movement shapes (9.7.18.2.3).
+enum class Tcgen05Shape { S32x32b, S16x64b, S16x128b, S16x256b, S16x32bx2 };
+// tcgen05.mma's .kind: the element family, the exact types coming from the
+// instruction descriptor.
+enum class Tcgen05MmaKind { F16, TF32, F8F6F4, I8 };
+struct OpTcgen05 {
+  Tcgen05Kind kind = Tcgen05Kind::Mma;
+  uint32_t cta_group = 1;          // .cta_group::1 or ::2
+  // alloc/dealloc: .exclusive; `addr` is alloc's destination in shared
+  // memory, `taddr` the Tensor Memory address dealloc frees, `ncols` both.
+  bool exclusive = false;
+  Addr addr;
+  Operand taddr, ncols;
+  // ld/st: shape, repeat (.xN), .pack::16b / .unpack::16b, the registers,
+  // and .16x32bx2's immHalfSplitoff (in columns).
+  Tcgen05Shape shape = Tcgen05Shape::S32x32b;
+  uint32_t num = 1;
+  bool pack16 = false;
+  uint32_t half_split = 0;
+  std::vector<Reg> regs;
+  // commit: the barrier, and .multicast::cluster's ctaMask.
+  bool multicast = false;
+  Operand cta_mask;
+  // mma: D (a Tensor Memory address), A (a descriptor, or a Tensor Memory
+  // address when a_tmem), B's descriptor, the instruction descriptor, the
+  // disable-output-lane vector (empty when absent), enable-input-d and the
+  // optional scale-input-d immediate (-1 when absent).
+  Tcgen05MmaKind mma_kind = Tcgen05MmaKind::F16;
+  Operand d_tmem, a, b_desc, idesc, enable_d;
+  bool a_tmem = false;
+  std::vector<Operand> disable_lanes;
+  int scale_d = -1;
+};
+// clusterlaunchcontrol (sm_100): try_cancel asks to take over a cluster that
+// has not launched yet and writes an opaque 16-byte answer to shared memory;
+// query_cancel decodes that answer from a .b128 register.
+enum class ClcKind { TryCancel, IsCanceled, FirstCtaid };
+struct OpClc {
+  ClcKind kind = ClcKind::TryCancel;
+  Addr addr, mbar;             // try_cancel's response slot and barrier
+  bool multicast = false;      // .multicast::cluster::all
+  // query_cancel's .b128 operand. A .b128 register is held as two 64-bit
+  // ones, its low and high halves (see the parser's .reg handling).
+  Reg resp_lo, resp_hi;
+  std::vector<Reg> dst;        // is_canceled: one predicate; get_first_ctaid: 1 or 4 (the 4th may be a sink)
+  int dim = -1;                // get_first_ctaid::x/y/z, or -1 for .v4
 };
 // mov.pred d, {0|1|%p} -- set a predicate from an immediate or copy another.
 // Predicates live in their own register file, so this cannot go through the
@@ -387,6 +457,7 @@ struct OpBulkCopy {
   Addr mbar;                    // loads: the barrier that counts the bytes
   bool multicast = false;
   Operand cta_mask;
+  uint32_t cta_group = 1;       // .cta_group::2: the barrier may be in the peer CTA
   // shared::cta -> shared::cluster: a block's shared memory into another's,
   // completing on a barrier in the destination block. `gmem` is then the
   // source, a shared::cta address.
@@ -397,6 +468,11 @@ struct OpBulkCopy {
   bool reduce = false;
   AtomOp red_op = AtomOp::Add;
   Type red_ty;
+  // A tensor copy's load mode: the box (tile), or im2col's column of pixels.
+  // A load's im2col offsets (one per spatial dimension) are added to the
+  // pixel it starts from; stores and reductions take .im2col_no_offs.
+  bool im2col = false;
+  std::vector<Operand> im2col_offsets;
 };
 // tensormap.replace (sm_90a): one field of a 128-byte tensor map in global or
 // shared memory rewritten in place, as CUTLASS's grouped GEMMs retarget a map
@@ -465,7 +541,9 @@ struct OpVideoSimd {
 struct OpCopysign { Type ty; Reg dst; Operand a, b; };
 // dp4a.{u32,s32}.{u32,s32} d, a, b, c -- four byte-wise products of a and b
 // accumulated into c. Quantized inference leans on this heavily.
-struct OpDp4a { bool a_signed = false; bool b_signed = false; Reg dst; Operand a, b, c; };
+// dp4a, and dp2a (`two`): two 16-bit elements of a against the low (or,
+// with `hi`, high) two bytes of b.
+struct OpDp4a { bool a_signed = false; bool b_signed = false; bool two = false; bool hi = false; Reg dst; Operand a, b, c; };
 // bmsk.{clamp,wrap}.b32 d, a, b -- a contiguous mask of b bits starting at a.
 struct OpBmsk { bool wrap = false; Reg dst; Operand a, b; };
 // Extended-precision arithmetic. PTX has a single per-thread condition-code
@@ -534,10 +612,54 @@ enum class MatLayout { Row, Col };
 //   tf32  m16n16k8,  4 registers -- A is 16x8 and B is 8x16, so the two
 //         fragments do not even share an index map
 enum class WmmaElem : uint8_t { F16, BF16, TF32 };
+// Every WMMA element type and shape (PTX ISA 9.7.16.4). The combinations
+// above -- f16/bf16 A and B at m16n16k16 with f32 accumulators, and tf32 at
+// m16n16k8 -- keep the layouts they have always had and the fast path; every
+// other one is `generic`: its fragment holds the logical matrix, elements
+// spread across lanes and registers in order, as many whole copies as the
+// ISA's register count holds, with the load applying the memory layout.
+enum class WmmaType : uint8_t { F16, BF16, TF32, F32, F64, S8, U8, S4, U4, B1, S32 };
+struct WmmaShape {
+  uint32_t m = 16, n = 16, k = 16;
+  bool operator==(const WmmaShape&) const = default;
+};
+inline uint32_t wmma_type_bits(WmmaType t) {
+  switch (t) {
+    case WmmaType::F16: case WmmaType::BF16: return 16;
+    case WmmaType::F64: return 64;
+    case WmmaType::S8: case WmmaType::U8: return 8;
+    case WmmaType::S4: case WmmaType::U4: return 4;
+    case WmmaType::B1: return 1;
+    default: return 32;
+  }
+}
+// The matrix a fragment holds ('a' is m x k, 'b' k x n, 'c'/'d' m x n) and the
+// registers the ISA gives it: exactly enough for the matrix, except f16 A and
+// B, which always take eight .f16x2 registers.
+struct WmmaGeom {
+  uint32_t rows = 0, cols = 0, bits = 0, reg_bits = 32, regs = 0;
+};
+inline WmmaGeom wmma_geom(char frag, WmmaShape s, WmmaType t) {
+  WmmaGeom g;
+  g.rows = frag == 'a' ? s.m : frag == 'b' ? s.k : s.m;
+  g.cols = frag == 'a' ? s.k : frag == 'b' ? s.n : s.n;
+  g.bits = wmma_type_bits(t);
+  g.reg_bits = t == WmmaType::F64 ? 64 : 32;
+  const uint64_t total = uint64_t{g.rows} * g.cols * g.bits;
+  g.regs = static_cast<uint32_t>((total + uint64_t{32} * g.reg_bits - 1) / (uint64_t{32} * g.reg_bits));
+  if (t == WmmaType::F16 && (frag == 'a' || frag == 'b')) g.regs = 8;
+  return g;
+}
 struct OpWmmaMma {
   WmmaElem elem = WmmaElem::F16;
   MatLayout alayout, blayout;
   std::vector<Reg> d, a, b, c;
+  bool generic = false;
+  WmmaShape shape;
+  WmmaType atype = WmmaType::F16, btype = WmmaType::F16, ctype = WmmaType::F32, dtype = WmmaType::F32;
+  bool satfinite = false;      // integer: clamp to the s32 range instead of wrapping
+  bool b1_and = false;         // b1: .and.popc rather than .xor.popc
+  FRound rnd = FRound::Nearest;  // f64
 };
 // wmma.load.{a,b,c}.sync.aligned.<layout>.m16n16k16[.space].<type> {d...}, [addr], stride
 //
@@ -551,6 +673,9 @@ struct OpWmmaLoad {
   WmmaElem elem = WmmaElem::F16;
   MatLayout layout = MatLayout::Row;
   Space space = Space::Generic;
+  bool generic = false;
+  WmmaShape shape;
+  WmmaType type = WmmaType::F16;
   bool f32 = false;         // the C fragment is f32; A and B are f16
   Addr addr;
   std::vector<Reg> dsts;
@@ -559,6 +684,9 @@ struct OpWmmaLoad {
 struct OpWmmaStore {
   MatLayout layout;
   Space space = Space::Generic;
+  bool generic = false;
+  WmmaShape shape;
+  WmmaType type = WmmaType::F32;
   Addr addr;
   std::vector<Operand> src;
   Operand stride;
@@ -586,7 +714,17 @@ struct OpNotPred { Reg dst; Reg src; };
 // atomics can easily contain no `atom` at all.
 struct OpAtom { AtomOp op = AtomOp::Add; Space space = Space::Generic; Type ty; Reg dst; Addr addr; Operand b; Operand c; bool discards_result = false; bool packed_half = false; };
 struct OpBra { size_t target = 0; std::string label; };  // target = instruction index
-struct OpBar {};                                     // bar.sync 0
+// bar.sync / barrier.sync / bar.arrive on one of the CTA's sixteen barriers,
+// and bar.warp.sync (`warp`), which only reconverges the warp. With a count,
+// the barrier completes when that many threads -- whole warps -- have
+// arrived; without one, when every thread of the CTA that has not exited has.
+struct OpBar {
+  bool warp = false;
+  bool arrive = false;   // arrive without waiting (bar.arrive)
+  Operand id;            // 0..15
+  bool have_count = false;
+  Operand count;
+};
 // An instruction with nothing to do here: a memory fence, or a backoff hint.
 // Distinct from OpBar because a fence is *not* a barrier -- mapping membar onto
 // bar.sync made every fence wait for the whole block, which a kernel that
@@ -616,16 +754,28 @@ struct OpTrap { bool breakpoint = false; };
 //
 // tex always writes four components even when the caller wants one -- the
 // widest form is what ptxas emits regardless.
+// A texture's geometry. The layered ones (a1d, a2d, acube) take a layer --
+// or for acube a cubemap -- index as the first coordinate, an unsigned
+// integer; cube and acube take a direction (s, t, r) that picks a face.
+enum class TexGeom { D1, D2, D3, A1D, A2D, Cube, ACube };
 struct OpTex {
-  uint32_t dims = 1;             // 1, 2 or 3
+  TexGeom geom = TexGeom::D1;
+  uint32_t dims = 1;             // spatial coordinates: 1, 2 or 3 (3 for a cube's direction)
   Type dtype;                    // destination component type (f32, s32, u32)
   Type ctype;                    // coordinate type: f32 for sampled, s32 for fetch
   std::vector<Reg> dsts;         // always four
   Operand obj;                   // the texture object handle
   std::vector<Operand> coords;
+  // .level: an explicit level of detail (of .ctype) after the coordinates.
+  bool level = false;
+  Operand lod;
+  // tld4 (texture gather): the component 0..3 (r, g, b, a) whose four
+  // bilinear-footprint texels are returned, or -1 for an ordinary fetch.
+  int gather = -1;
 };
 struct OpSuld {
   uint32_t dims = 1;
+  bool layered = false;          // .a1d/.a2d: coords are {layer, x[, y, ignored]}
   uint32_t bytes = 4;            // per component, from .b8/.b16/.b32/.b64
   std::vector<Reg> dsts;
   Operand obj;
@@ -633,6 +783,7 @@ struct OpSuld {
 };
 struct OpSust {
   uint32_t dims = 1;
+  bool layered = false;
   uint32_t bytes = 4;
   Operand obj;
   std::vector<Operand> coords;
@@ -700,7 +851,7 @@ struct OpCall {
 };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy>;
 
@@ -783,6 +934,7 @@ struct EntryFn {
   std::array<uint32_t, 3> max_ntid{0, 0, 0};
   std::array<uint32_t, 3> req_ntid{0, 0, 0};
   uint32_t min_ctas_per_sm = 0;
+  uint32_t max_nreg = 0;   // .maxnreg: a register ceiling ptxas must meet
   // .reqnctapercluster: the cluster shape in CTAs the kernel was compiled for
   // (__cluster_dims__). Zero means the kernel names no cluster shape.
   // .explicitcluster says the kernel must be launched with one.

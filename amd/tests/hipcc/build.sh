@@ -31,6 +31,8 @@ echo "wrote $(pwd)/printf.gfx942, printf.gfx942.o and its listing ($(wc -l < pri
 # Occupancy, device attributes, and a kernel reaching another device's memory.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 runtime.cpp -o runtime.gfx942
 echo "wrote $(pwd)/runtime.gfx942"
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 textures.cpp -o textures.gfx942
+echo "wrote $(pwd)/textures.gfx942"
 # A cooperative launch, whose work-groups wait for one another at a grid
 # barrier: the program, and its device code with the listing.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 cooperative.cpp -o cooperative.gfx942
@@ -40,10 +42,30 @@ echo "wrote $(pwd)/runtime.gfx942"
   sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > cooperative.gfx942.dis
 echo "wrote $(pwd)/cooperative.gfx942, cooperative.gfx942.o and its listing ($(wc -l < cooperative.gfx942.dis) instructions)"
 
+# Streams that run at once: kernels on two streams handing values to each
+# other, events, stream waits, the null stream's ordering, host functions.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 streams.cpp -o streams.gfx942
+echo "wrote $(pwd)/streams.gfx942"
+
 # gfx942's 8-bit floats, converted by the device's instructions and checked
 # against the header's own software conversion on the host.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 fp8.cpp -o fp8.gfx942
-echo "wrote $(pwd)/fp8.gfx942"
+# The same for gfx950, whose 8-bit floats are the OCP formats.
+"$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_FP8_OCP --offload-arch=gfx950 fp8.cpp -o fp8.gfx950
+echo "wrote $(pwd)/fp8.gfx942 and fp8.gfx950"
+# gfx950's block-scaled matrix instructions, v_prng_b32 and the lane swaps.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx950 gfx950.cpp -o gfx950.gfx950
+echo "wrote $(pwd)/gfx950.gfx950"
+# The sparse matrix instructions: gfx942's, and gfx950's with K doubled.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 smfmac.cpp -o smfmac.gfx942
+"$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_GFX950 --offload-arch=gfx950 smfmac.cpp -o smfmac.gfx950
+echo "wrote $(pwd)/smfmac.gfx942 and smfmac.gfx950"
+# MODE's round and denormal modes: as hipcc builds by default, and built to
+# flush single-precision denormals.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 numerics.cpp -o numerics.gfx942
+"$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_FLUSH -fgpu-flush-denormals-to-zero --offload-arch=gfx942 numerics.cpp \
+  -o numerics.flush.gfx942
+echo "wrote $(pwd)/numerics.gfx942 and numerics.flush.gfx942"
 
 # The device code alone, for the decoder and the executor to be checked
 # against, and the listing of it from the same toolchain's llvm-objdump.

@@ -27,6 +27,7 @@
 #include <vector_types.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
@@ -104,6 +105,7 @@ struct RegisteredModule {
 struct KernelInfo {
   RegisteredModule* mod = nullptr;
   std::string entry_name;
+  bool nonportable_cluster = false;   // cudaFuncAttributeNonPortableClusterSizeAllowed
 };
 
 // A __device__ or __constant__ variable. The host handle nvcc passes to
@@ -1018,6 +1020,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
         return cudaErrorCooperativeLaunchTooLarge;
       }
     }
+    cfg.nonportable_cluster = ki.nonportable_cluster;
     dev.launch(*fn, cfg, kargs, dev.symbols(mid));
     if (profiling) {
       vgpu::profiling::Event ev;
@@ -2503,10 +2506,17 @@ VGPU_EXPORT cudaError_t cudaStreamAddCallback(cudaStream_t stream, cudaStreamCal
   return cudaSuccess;
 }
 
-VGPU_EXPORT cudaError_t cudaFuncSetAttribute(const void*, cudaFuncAttribute, int) {
-  // Opting into a larger shared-memory carveout is a hardware tuning knob; the
-  // interpreter honours whatever a launch asks for.
-  return cudaSuccess;
+VGPU_EXPORT cudaError_t cudaFuncSetAttribute(const void* func, cudaFuncAttribute attr, int value) {
+  // Most attributes are tuning knobs (a shared-memory carveout, say) that the
+  // interpreter has no use for. The one that changes what may launch is the
+  // non-portable cluster size, so that one is kept.
+  if (static_cast<int>(attr) != 14) return cudaSuccess;   // cudaFuncAttributeNonPortableClusterSizeAllowed
+  return guard("cudaFuncSetAttribute", [&](State& s) -> cudaError_t {
+    auto it = s.kernels.find(func);
+    if (it == s.kernels.end()) return cudaErrorInvalidDeviceFunction;
+    it->second.nonportable_cluster = value != 0;
+    return cudaSuccess;
+  });
 }
 
 VGPU_EXPORT cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMode* mode) {
@@ -2664,16 +2674,34 @@ namespace {
 // stores arrays in an opaque, swizzled layout that only the texture units can
 // address; nothing here depends on that layout, so a dense row-major buffer
 // serves, and cudaMemcpy2DToArray is an ordinary strided copy.
+// An array is dense row-major device memory here: row after row, then slice
+// after slice (a 3D array's depth, a layered array's layers, a cubemap's six
+// faces, a layered cubemap's 6 x layers faces), each row width x texel bytes.
 struct ArrayRec {
   uint64_t base = 0;
   uint64_t bytes = 0;
-  uint32_t width = 0, height = 0, depth = 0;
+  uint32_t width = 0, height = 0, depth = 0;   // as allocated: depth counts slices of any kind
   cudaChannelFormatDesc fmt{};
   uint32_t texel_bytes = 0;
+  unsigned int flags = 0;                      // cudaArrayLayered, cudaArrayCubemap, ...
   int device = 0;
+  uint64_t row_bytes() const { return uint64_t{width} * texel_bytes; }
+  uint64_t slice_bytes() const { return row_bytes() * (height ? height : 1); }
+  uint32_t slices() const { return depth ? depth : 1; }
 };
 std::unordered_map<uint64_t, ArrayRec> g_arrays;
 uint64_t g_next_array = 1;
+
+// A mipmapped array is a list of ordinary arrays, one per level, each
+// max(1, size >> level) along every dimension; cudaGetMipmappedArrayLevel
+// hands out the level's array handle.
+struct MipmappedRec {
+  std::vector<uint64_t> levels;   // array handles
+  unsigned int flags = 0;
+  int device = 0;
+};
+std::unordered_map<uint64_t, MipmappedRec> g_mipmapped;
+uint64_t g_next_mipmapped = 1;
 
 uint32_t texel_bytes_of(const cudaChannelFormatDesc& f) {
   return static_cast<uint32_t>((f.x + f.y + f.z + f.w + 7) / 8);
@@ -2750,6 +2778,9 @@ cudaError_t fill_from_resource(const cudaResourceDesc* res, vgpu::exec::TextureD
       d->width = a.width;
       d->height = a.height;
       d->depth = a.depth;
+      d->cubemap = a.flags & cudaArrayCubemap;
+      if (a.flags & cudaArrayLayered) d->layers = d->cubemap ? a.depth / 6 : a.depth;
+      if (d->cubemap || d->layers) d->depth = 0;
       d->pitch_bytes = a.width * a.texel_bytes;
       d->texel_bytes = a.texel_bytes;
       d->channels = channels_of(a.fmt);
@@ -2761,8 +2792,31 @@ cudaError_t fill_from_resource(const cudaResourceDesc* res, vgpu::exec::TextureD
       if (!channel_kind_of(a.fmt, &d->kind)) return cudaErrorNotSupported;
       return cudaSuccess;
     }
+    case cudaResourceTypeMipmappedArray: {
+      auto it = g_mipmapped.find(reinterpret_cast<uint64_t>(res->res.mipmap.mipmap));
+      if (it == g_mipmapped.end()) return cudaErrorInvalidValue;
+      if (it->second.flags & (cudaArrayLayered | cudaArrayCubemap)) return cudaErrorNotSupported;
+      const auto& lv = it->second.levels;
+      if (lv.empty() || lv.size() > 17) return cudaErrorInvalidValue;
+      const ArrayRec& a = g_arrays.at(lv[0]);
+      d->base = a.base;
+      d->width = a.width;
+      d->height = a.height;
+      d->depth = a.depth;
+      d->pitch_bytes = a.width * a.texel_bytes;
+      d->texel_bytes = a.texel_bytes;
+      d->channels = channels_of(a.fmt);
+      d->channel_bits[0] = static_cast<uint32_t>(a.fmt.x);
+      d->channel_bits[1] = static_cast<uint32_t>(a.fmt.y);
+      d->channel_bits[2] = static_cast<uint32_t>(a.fmt.z);
+      d->channel_bits[3] = static_cast<uint32_t>(a.fmt.w);
+      d->from_array = true;
+      d->mip_levels = static_cast<uint32_t>(lv.size());
+      for (size_t l = 0; l < lv.size(); ++l) d->level_base[l] = g_arrays.at(lv[l]).base;
+      if (!channel_kind_of(a.fmt, &d->kind)) return cudaErrorNotSupported;
+      return cudaSuccess;
+    }
     default:
-      // Mipmapped arrays need a level-of-detail selection this does not have.
       return cudaErrorNotSupported;
   }
 }
@@ -2809,6 +2863,167 @@ VGPU_EXPORT cudaError_t cudaMallocArray(cudaArray_t* array, const cudaChannelFor
     *array = reinterpret_cast<cudaArray_t>(handle);
     return cudaSuccess;
   });
+}
+
+// cudaMalloc3DArray: a 1D, 2D or 3D array, or with cudaArrayLayered a 1D or
+// 2D layered one (extent.depth layers), or with cudaArrayCubemap a cubemap
+// (width == height, depth 6) or a layered cubemap (depth 6 x layers).
+VGPU_EXPORT cudaError_t cudaMalloc3DArray(cudaArray_t* array, const cudaChannelFormatDesc* desc,
+                                          cudaExtent extent, unsigned int flags) {
+  return guard("cudaMalloc3DArray", [&](State& s) -> cudaError_t {
+    if (!array || !desc) return cudaErrorInvalidValue;
+    ArrayRec rec;
+    rec.fmt = *desc;
+    rec.texel_bytes = texel_bytes_of(*desc);
+    if (rec.texel_bytes == 0 || extent.width == 0) return cudaErrorInvalidValue;
+    const bool layered = flags & cudaArrayLayered, cube = flags & cudaArrayCubemap;
+    // Gather works on 2D arrays only; with a layered or cubemap flag the
+    // hardware's runtime returns cudaErrorInvalidValue, and so does this.
+    if ((flags & cudaArrayTextureGather) && (layered || cube || extent.depth)) return cudaErrorInvalidValue;
+    if (cube) {
+      if (extent.width != extent.height || extent.depth == 0 || extent.depth % 6 ||
+          (!layered && extent.depth != 6))
+        return cudaErrorInvalidValue;
+    } else if (layered) {
+      if (extent.depth == 0) return cudaErrorInvalidValue;
+    } else if (extent.depth && !extent.height) {
+      return cudaErrorInvalidValue;   // a 3D array has a height
+    }
+    rec.width = static_cast<uint32_t>(extent.width);
+    rec.height = static_cast<uint32_t>(extent.height);
+    rec.depth = static_cast<uint32_t>(extent.depth);
+    rec.flags = flags;
+    rec.bytes = rec.slice_bytes() * rec.slices();
+    rec.device = t_current_device;
+    rec.base = current(s).memory().alloc(rec.bytes);
+    const uint64_t handle = g_next_array++;
+    g_arrays[handle] = rec;
+    *array = reinterpret_cast<cudaArray_t>(handle);
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaMallocMipmappedArray(cudaMipmappedArray_t* out,
+                                                 const cudaChannelFormatDesc* desc, cudaExtent extent,
+                                                 unsigned int numLevels, unsigned int flags) {
+  if (!out || !desc || numLevels == 0 || extent.width == 0) return cudaErrorInvalidValue;
+  // The full chain from the extent is floor(log2(largest)) + 1 levels.
+  const size_t largest = std::max({extent.width, extent.height, extent.depth});
+  unsigned int full = 1;
+  while ((size_t{1} << full) <= largest) ++full;
+  if (numLevels > full) return cudaErrorInvalidValue;
+  MipmappedRec rec;
+  rec.flags = flags;
+  rec.device = t_current_device;
+  for (unsigned int l = 0; l < numLevels; ++l) {
+    const bool layered = flags & (cudaArrayLayered | cudaArrayCubemap);
+    cudaExtent e{std::max<size_t>(1, extent.width >> l),
+                 extent.height ? std::max<size_t>(1, extent.height >> l) : 0,
+                 layered ? extent.depth : (extent.depth ? std::max<size_t>(1, extent.depth >> l) : 0)};
+    cudaArray_t a = nullptr;
+    const cudaError_t err = cudaMalloc3DArray(&a, desc, e, flags);
+    if (err != cudaSuccess) {
+      for (uint64_t h : rec.levels) cudaFreeArray(reinterpret_cast<cudaArray_t>(h));
+      return err;
+    }
+    rec.levels.push_back(reinterpret_cast<uint64_t>(a));
+  }
+  const uint64_t handle = g_next_mipmapped++;
+  g_mipmapped[handle] = std::move(rec);
+  *out = reinterpret_cast<cudaMipmappedArray_t>(handle);
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGetMipmappedArrayLevel(cudaArray_t* level, cudaMipmappedArray_const_t mm,
+                                                   unsigned int l) {
+  auto it = g_mipmapped.find(reinterpret_cast<uint64_t>(mm));
+  if (!level || it == g_mipmapped.end()) return cudaErrorInvalidResourceHandle;
+  if (l >= it->second.levels.size()) return cudaErrorInvalidValue;
+  *level = reinterpret_cast<cudaArray_t>(it->second.levels[l]);
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaFreeMipmappedArray(cudaMipmappedArray_t mm) {
+  auto it = g_mipmapped.find(reinterpret_cast<uint64_t>(mm));
+  if (it == g_mipmapped.end()) return cudaErrorInvalidValue;
+  for (uint64_t h : it->second.levels) cudaFreeArray(reinterpret_cast<cudaArray_t>(h));
+  g_mipmapped.erase(it);
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaArrayGetInfo(cudaChannelFormatDesc* desc, cudaExtent* extent,
+                                         unsigned int* flags, cudaArray_t array) {
+  return guard("cudaArrayGetInfo", [&](State&) -> cudaError_t {
+    auto it = g_arrays.find(reinterpret_cast<uint64_t>(array));
+    if (it == g_arrays.end()) return cudaErrorInvalidResourceHandle;
+    if (desc) *desc = it->second.fmt;
+    if (extent) *extent = cudaExtent{it->second.width, it->second.height, it->second.depth};
+    if (flags) *flags = it->second.flags;
+    return cudaSuccess;
+  });
+}
+
+// cudaMemcpy3D: a box of rows between arrays and pitched memory, in any
+// combination. With an array on either side the extent's width and that side's
+// x position count elements; for pitched memory they count bytes. Each row goes
+// through cudaMemcpy, which resolves host and device memory as for any copy.
+VGPU_EXPORT cudaError_t cudaMemcpy3D(const cudaMemcpy3DParms* p) {
+  if (!p) return cudaErrorInvalidValue;
+  if (p->srcArray && p->srcPtr.ptr) return cudaErrorInvalidValue;
+  if (p->dstArray && p->dstPtr.ptr) return cudaErrorInvalidValue;
+  const ArrayRec* sa = nullptr;
+  const ArrayRec* da = nullptr;
+  if (p->srcArray) {
+    auto it = g_arrays.find(reinterpret_cast<uint64_t>(p->srcArray));
+    if (it == g_arrays.end()) return cudaErrorInvalidResourceHandle;
+    sa = &it->second;
+  }
+  if (p->dstArray) {
+    auto it = g_arrays.find(reinterpret_cast<uint64_t>(p->dstArray));
+    if (it == g_arrays.end()) return cudaErrorInvalidResourceHandle;
+    da = &it->second;
+  }
+  if ((!sa && !p->srcPtr.ptr) || (!da && !p->dstPtr.ptr)) return cudaErrorInvalidValue;
+  if (sa && da && sa->texel_bytes != da->texel_bytes) return cudaErrorInvalidValue;
+  const uint64_t elem = sa ? sa->texel_bytes : (da ? da->texel_bytes : 1);
+  const uint64_t row = p->extent.width * elem;
+  const uint64_t rows = p->extent.height ? p->extent.height : 1;
+  const uint64_t depth = p->extent.depth ? p->extent.depth : 1;
+  if (row == 0) return cudaSuccess;
+  auto in_array = [](const ArrayRec& a, const cudaPos& pos, uint64_t w, uint64_t h, uint64_t d) {
+    return pos.x + w <= a.width && pos.y + h <= (a.height ? a.height : 1) && pos.z + d <= a.slices();
+  };
+  if (sa && !in_array(*sa, p->srcPos, p->extent.width, rows, depth)) return cudaErrorInvalidValue;
+  if (da && !in_array(*da, p->dstPos, p->extent.width, rows, depth)) return cudaErrorInvalidValue;
+  if (!sa && (p->srcPos.x + row > p->srcPtr.pitch)) return cudaErrorInvalidPitchValue;
+  if (!da && (p->dstPos.x + row > p->dstPtr.pitch)) return cudaErrorInvalidPitchValue;
+  auto address = [&](const ArrayRec* a, const cudaPitchedPtr& ptr, const cudaPos& pos, uint64_t y,
+                     uint64_t z) -> char* {
+    if (a)
+      return reinterpret_cast<char*>(a->base + (pos.z + z) * a->slice_bytes() +
+                                     (pos.y + y) * a->row_bytes() + pos.x * a->texel_bytes);
+    const uint64_t ysize = ptr.ysize ? ptr.ysize : rows;
+    return static_cast<char*>(ptr.ptr) + ((pos.z + z) * ysize + pos.y + y) * ptr.pitch + pos.x;
+  };
+  for (uint64_t z = 0; z < depth; ++z)
+    for (uint64_t y = 0; y < rows; ++y) {
+      const cudaError_t e = cudaMemcpy(address(da, p->dstPtr, p->dstPos, y, z),
+                                       address(sa, p->srcPtr, p->srcPos, y, z), row, p->kind);
+      if (e != cudaSuccess) return e;
+    }
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaMemcpy3DAsync(const cudaMemcpy3DParms* p, cudaStream_t stream) {
+  // A copy captured into a graph records its shape; one that names an array
+  // is not recorded, so it is refused rather than left out of every replay.
+  if (p && capture_active(stream)) {
+    if (p->srcArray || p->dstArray) return cudaErrorStreamCaptureUnsupported;
+    cudaError_t rc = cudaSuccess;
+    vgpu_record_copy_if_capturing(*p, stream, &rc);
+    return rc;
+  }
+  return cudaMemcpy3D(p);
 }
 
 VGPU_EXPORT cudaError_t cudaFreeArray(cudaArray_t array) {
@@ -2906,7 +3121,22 @@ VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
       if (tex->filterMode == cudaFilterModeLinear) d.filter = vgpu::exec::TexFilter::Linear;
       if (tex->sRGB) return cudaErrorNotSupported;
       if (tex->maxAnisotropy > 1) return cudaErrorNotSupported;
+      // The border colour is taken as zero, the default. One a program sets
+      // with border addressing is refused rather than quietly replaced.
+      bool border = false;
+      for (int i = 0; i < 3; ++i) border |= tex->addressMode[i] == cudaAddressModeBorder;
+      if (border && (tex->borderColor[0] != 0 || tex->borderColor[1] != 0 ||
+                     tex->borderColor[2] != 0 || tex->borderColor[3] != 0))
+        return cudaErrorNotSupported;
       d.normalized_coords = tex->normalizedCoords != 0;
+      // Mip selection, held as the hardware does in 1/256ths of a level,
+      // truncated toward zero.
+      auto q = [](float v) { return static_cast<int32_t>(std::trunc(std::clamp(v, -1e6f, 1e6f) * 256)); };
+      d.mip_filter = tex->mipmapFilterMode == cudaFilterModeLinear ? vgpu::exec::TexFilter::Linear
+                                                                   : vgpu::exec::TexFilter::Point;
+      d.mip_bias = q(tex->mipmapLevelBias);
+      d.mip_min = q(tex->minMipmapLevelClamp);
+      d.mip_max = q(tex->maxMipmapLevelClamp);
       d.read_as_normalized_float = tex->readMode == cudaReadModeNormalizedFloat;
     }
     const uint64_t handle = g_next_texobj++;
@@ -3514,11 +3744,16 @@ int rt_tensor_map_replace_address(void* tensorMap, void* globalAddress) {
   return tmap_result("cuTensorMapReplaceAddress",
                      vgpu::exec::replace_address(tensorMap, globalAddress, &why), why);
 }
-int rt_tensor_map_encode_im2col(void*, unsigned, unsigned, void*, const unsigned long long*,
-                                const unsigned long long*, const int*, const int*, unsigned, unsigned,
-                                const unsigned*, unsigned, unsigned, unsigned, unsigned) {
-  return tmap_result("cuTensorMapEncodeIm2col", vgpu::exec::TmapResult::Unsupported,
-                     "TMA's im2col mode is not implemented");
+int rt_tensor_map_encode_im2col(void* tensorMap, unsigned dataType, unsigned rank, void* globalAddress,
+                                const unsigned long long* globalDim, const unsigned long long* globalStrides,
+                                const int* lowerCorner, const int* upperCorner, unsigned channelsPerPixel,
+                                unsigned pixelsPerColumn, const unsigned* elementStrides, unsigned interleave,
+                                unsigned swizzle, unsigned l2Promotion, unsigned oobFill) {
+  std::string why;
+  const auto r = vgpu::exec::encode_im2col(tensorMap, dataType, rank, globalAddress, globalDim, globalStrides,
+                                           lowerCorner, upperCorner, channelsPerPixel, pixelsPerColumn,
+                                           elementStrides, interleave, swizzle, l2Promotion, oobFill, &why);
+  return tmap_result("cuTensorMapEncodeIm2col", r, why);
 }
 
 using GetProcAddressFn = int (*)(const char*, void**, int, unsigned long long, int*);

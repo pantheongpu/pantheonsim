@@ -98,7 +98,8 @@ static int run_dyn_lds(hipFunction_t f, const float* in, float* out) {
   int n = N;
   void* args[] = {&in, &out, &n};
   if (hipModuleLaunchKernel(f, 1, 1, 1, N, 1, 1, N * sizeof(float), NULL, args, NULL) != hipSuccess) return 0;
-  return 1;
+  /* Host memory the kernel writes is the host's to read once the device is done. */
+  return hipDeviceSynchronize() == hipSuccess;
 }
 static int right(const float* in, const float* out) {
   for (int t = 0; t < N; ++t)
@@ -196,6 +197,7 @@ int main(int argc, char** argv) {
   CHECK(hipMemPoolGetAttribute(pool, 7, &used));
   int counted = used == (1u << 20);
   CHECK(hipFreeAsync(p, NULL));
+  CHECK(hipStreamSynchronize(NULL));   /* the free happens in stream order */
   CHECK(hipMemPoolGetAttribute(pool, 7, &used));
   CHECK(hipMemPoolGetAttribute(pool, 8, &high_mark));
   int returned = used == 0 && high_mark == (1u << 20);
@@ -265,6 +267,7 @@ int main(int argc, char** argv) {
   /* A host function runs in stream order, and a capture has an id. */
   int flag = 0;
   CHECK(hipLaunchHostFunc(masked, set_flag, &flag));
+  CHECK(hipStreamSynchronize(masked));
   printf("a host function runs in stream order %d\n", flag == 7);
   int status = 0;
   unsigned long long id = 0;

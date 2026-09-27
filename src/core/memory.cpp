@@ -1,5 +1,6 @@
 #include "vgpu/memory.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <fcntl.h>
@@ -76,13 +77,15 @@ std::ostream& operator<<(std::ostream& os, Hex h) {
 }  // namespace
 
 uint64_t MemoryManager::alloc(uint64_t size) {
+  ExclusiveGuard table_guard(table_lock_.get());
   if (size == 0) throw Error::make(Err::InvalidValue, "cudaMalloc-style allocation of 0 bytes is invalid");
   if (used_ + size > capacity_ || used_ + size < used_)
     throw Error::make(Err::OutOfMemory, "device out of memory: requested ", size, " bytes, ", used_,
                       " of ", capacity_, " bytes already in use");
-  uint64_t base = next_va_;
-  uint64_t padded = (size + kAllocAlign - 1) / kAllocAlign * kAllocAlign;
-  next_va_ += padded;
+  const uint64_t align = std::max(kAllocAlign, page_);
+  uint64_t base = (next_va_ + align - 1) / align * align;
+  uint64_t padded = (size + align - 1) / align * align;
+  next_va_ = base + padded;
   high_water_va_ = next_va_;
   used_ += size;
   Allocation a;
@@ -95,6 +98,7 @@ uint64_t MemoryManager::alloc(uint64_t size) {
 }
 
 void MemoryManager::free(uint64_t ptr) {
+  ExclusiveGuard table_guard(table_lock_.get());
   // An allocation that was exported for another process lives in a file now,
   // not in chunks. Freeing it takes the mapping and the file with it, which is
   // what the exporting process owns.
@@ -190,17 +194,22 @@ const MemoryManager::Allocation* MemoryManager::resolve_mapped(uint64_t addr, ui
 }
 
 const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t len, const char* op,
-                                                        uint64_t* base_out, bool writing) const {
+                                                        uint64_t* base_out, bool writing, bool page_slack) const {
+  SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
   if (up != live_.begin()) {
     auto prev = std::prev(up);
     uint64_t base = prev->first;
     const Allocation& a = prev->second;
-    if (addr < base + a.size) {
+    // A kernel's read may run on to the end of the last page (set_page_size),
+    // which never passes the allocation's last chunk: a chunk is a whole
+    // number of pages.
+    const uint64_t extent = page_slack && page_ ? (a.size + page_ - 1) / page_ * page_ : a.size;
+    if (addr < base + extent) {
       // Computed as a remaining-length rather than an end-address: `addr + len`
       // wraps for a length near UINT64_MAX, and a wrapped sum compares *below*
       // the end, so the check passed exactly the accesses it exists to stop.
-      const uint64_t remaining = base + a.size - addr;
+      const uint64_t remaining = base + extent - addr;
       if (len > remaining)
         throw Error::make(Err::OutOfBounds, op, " of ", len, " bytes at ", Hex{addr},
                           " runs past the end of the ", a.size, "-byte allocation at ", Hex{base},
@@ -211,7 +220,8 @@ const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t 
     // The VA range up to the alignment-padded end belongs to this allocation:
     // an access there is an overrun, which deserves a better diagnosis than
     // "unknown pointer".
-    uint64_t padded = (a.size + kAllocAlign - 1) / kAllocAlign * kAllocAlign;
+    const uint64_t align = std::max(kAllocAlign, page_);
+    uint64_t padded = (a.size + align - 1) / align * align;
     if (addr < base + padded)
       throw Error::make(Err::OutOfBounds, op, " at ", Hex{addr}, " is ", addr - (base + a.size),
                         " bytes past the end of the ", a.size, "-byte allocation at ", Hex{base});
@@ -312,6 +322,7 @@ void MemoryManager::fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_
 }
 
 uint64_t MemoryManager::resident_bytes() const {
+  SharedGuard table_guard(table_lock_.get());
   uint64_t chunks = 0;
   for (const auto& [base, a] : live_) {
     (void)base;
@@ -399,6 +410,7 @@ void MemoryManager::unmap_host(uint64_t addr) {
 }
 
 void MemoryManager::free_all() {
+  ExclusiveGuard table_guard(table_lock_.get());
   // A reset takes mapped memory, reservations and handles with it, as it takes
   // allocations: nothing survives it on a real device either.
   maps_.clear();
@@ -430,6 +442,7 @@ uint64_t round_up(uint64_t v, uint64_t to) { return (v + to - 1) / to * to; }
 }  // namespace
 
 uint64_t MemoryManager::reserve(uint64_t size, uint64_t alignment) {
+  ExclusiveGuard table_guard(table_lock_.get());
   if (size == 0 || size % kVmmGranularity)
     throw Error::make(Err::InvalidValue, "reserving ", size,
                       " bytes of address space: the size must be a non-zero multiple of the ",
@@ -452,6 +465,7 @@ uint64_t MemoryManager::reserve(uint64_t size, uint64_t alignment) {
 }
 
 void MemoryManager::address_free(uint64_t va, uint64_t size) {
+  ExclusiveGuard table_guard(table_lock_.get());
   auto it = reserved_.find(va);
   if (it == reserved_.end() || it->second.size != size)
     throw Error::make(Err::InvalidValue, "freeing address space at ", Hex{va}, " of ", size,
@@ -464,6 +478,7 @@ void MemoryManager::address_free(uint64_t va, uint64_t size) {
 }
 
 uint64_t MemoryManager::create_handle(uint64_t size) {
+  ExclusiveGuard table_guard(table_lock_.get());
   if (size == 0 || size % kVmmGranularity)
     throw Error::make(Err::InvalidValue, "creating ", size,
                       " bytes of device memory: the size must be a non-zero multiple of the ",
@@ -484,6 +499,7 @@ uint64_t MemoryManager::create_handle(uint64_t size) {
 }
 
 uint64_t MemoryManager::handle_size(uint64_t handle) const {
+  SharedGuard table_guard(table_lock_.get());
   auto it = handles_.find(handle);
   if (it == handles_.end())
     throw Error::make(Err::InvalidValue, "no such memory handle: ", handle);
@@ -491,6 +507,7 @@ uint64_t MemoryManager::handle_size(uint64_t handle) const {
 }
 
 void MemoryManager::retain_handle(uint64_t handle) {
+  ExclusiveGuard table_guard(table_lock_.get());
   auto it = handles_.find(handle);
   if (it == handles_.end())
     throw Error::make(Err::InvalidValue, "no such memory handle: ", handle);
@@ -498,6 +515,7 @@ void MemoryManager::retain_handle(uint64_t handle) {
 }
 
 uint64_t MemoryManager::retain_handle_at(uint64_t va) {
+  ExclusiveGuard table_guard(table_lock_.get());
   auto mu = maps_.upper_bound(va);
   if (mu == maps_.begin()) return 0;
   auto prev = std::prev(mu);
@@ -508,6 +526,7 @@ uint64_t MemoryManager::retain_handle_at(uint64_t va) {
 }
 
 void MemoryManager::release_handle(uint64_t handle) {
+  ExclusiveGuard table_guard(table_lock_.get());
   auto it = handles_.find(handle);
   if (it == handles_.end())
     throw Error::make(Err::InvalidValue, "releasing memory handle ", handle,
@@ -520,6 +539,7 @@ void MemoryManager::release_handle(uint64_t handle) {
 }
 
 void MemoryManager::collect_handle(uint64_t handle) {
+  ExclusiveGuard table_guard(table_lock_.get());
   auto it = handles_.find(handle);
   if (it == handles_.end() || it->second.refs || it->second.mapped) return;
   used_ -= it->second.size;
@@ -528,6 +548,7 @@ void MemoryManager::collect_handle(uint64_t handle) {
 }
 
 void MemoryManager::map(uint64_t va, uint64_t size, uint64_t offset, uint64_t handle) {
+  ExclusiveGuard table_guard(table_lock_.get());
   if (size == 0 || size % kVmmGranularity || va % kVmmGranularity)
     throw Error::make(Err::InvalidValue, "mapping ", size, " bytes at ", Hex{va},
                       ": the address and size must be multiples of the ", kVmmGranularity,
@@ -568,6 +589,7 @@ void MemoryManager::map(uint64_t va, uint64_t size, uint64_t offset, uint64_t ha
 }
 
 void MemoryManager::unmap(uint64_t va, uint64_t size) {
+  ExclusiveGuard table_guard(table_lock_.get());
   auto it = maps_.find(va);
   if (it == maps_.end() || it->second.size != size)
     throw Error::make(Err::InvalidValue, "unmapping ", size, " bytes at ", Hex{va},
@@ -580,6 +602,7 @@ void MemoryManager::unmap(uint64_t va, uint64_t size) {
 }
 
 void MemoryManager::set_access(uint64_t va, uint64_t size, bool readable, bool writable) {
+  ExclusiveGuard table_guard(table_lock_.get());
   if (size == 0 || size % kVmmGranularity || va % kVmmGranularity)
     throw Error::make(Err::InvalidValue, "granting access to ", size, " bytes at ", Hex{va},
                       ": the address and size must be multiples of the ", kVmmGranularity,
@@ -599,6 +622,7 @@ void MemoryManager::set_access(uint64_t va, uint64_t size, bool readable, bool w
 }
 
 bool MemoryManager::access_at(uint64_t va, bool* readable, bool* writable) const {
+  SharedGuard table_guard(table_lock_.get());
   auto mu = maps_.upper_bound(va);
   if (mu == maps_.begin()) return false;
   auto prev = std::prev(mu);
@@ -611,6 +635,7 @@ bool MemoryManager::access_at(uint64_t va, bool* readable, bool* writable) const
 // ---- memory another process can map -------------------------------------------
 
 uint64_t MemoryManager::share(uint64_t ptr, const std::string& path) {
+  ExclusiveGuard table_guard(table_lock_.get());
   if (const auto it = shared_.find(ptr); it != shared_.end()) return it->second.size;
   const auto live = live_.find(ptr);
   if (live == live_.end())
@@ -644,9 +669,13 @@ uint64_t MemoryManager::share(uint64_t ptr, const std::string& path) {
   return size;
 }
 
-bool MemoryManager::is_shared(uint64_t ptr) const { return shared_.count(ptr) != 0; }
+bool MemoryManager::is_shared(uint64_t ptr) const {
+  SharedGuard table_guard(table_lock_.get());
+  return shared_.count(ptr) != 0;
+}
 
 uint64_t MemoryManager::adopt(const std::string& path, uint64_t size) {
+  ExclusiveGuard table_guard(table_lock_.get());
   const int fd = ::open(path.c_str(), O_RDWR);
   if (fd < 0)
     throw Error::make(Err::InvalidValue, "opening shared device memory ", path, ": ",
@@ -668,6 +697,7 @@ uint64_t MemoryManager::adopt(const std::string& path, uint64_t size) {
 }
 
 void MemoryManager::abandon(uint64_t va) {
+  ExclusiveGuard table_guard(table_lock_.get());
   const auto it = shared_.find(va);
   if (it == shared_.end() || it->second.owner)
     throw Error::make(Err::InvalidPointer, "closing shared device memory at ", Hex{va},
@@ -733,6 +763,7 @@ void MemoryManager::read_chunks(const Allocation& a, uint64_t off, uint8_t* d, u
 }
 
 bool MemoryManager::find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const {
+  SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
   if (up == live_.begin()) return false;
   auto prev = std::prev(up);
@@ -831,8 +862,8 @@ MemoryManager::ScalarAt MemoryManager::scalar_location(uint64_t addr, uint32_t s
     if (find_host_map_locked(addr, size)) return ScalarAt::HostMap;
   }
   uint64_t base = 0;
-  auto& a = const_cast<Allocation&>(resolve(addr, size, create ? "device memory write"
-                                                                 : "device memory read", &base));
+  auto& a = const_cast<Allocation&>(resolve(addr, size, create ? "device memory write" : "device memory read",
+                                            &base, /*writing=*/false, /*page_slack=*/!create));
   const uint64_t off = addr - base;
   const uint64_t chunk_idx = off / kChunkSize;
   uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);

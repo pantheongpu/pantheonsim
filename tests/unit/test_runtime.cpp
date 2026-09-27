@@ -35,14 +35,14 @@ VTEST(module_lifecycle_and_lookup) {
 
 VTEST(unsupported_ptx_error_names_profile) {
   runtime::Runtime rt(load_gpu("nvidia/b200"));
-  // Any instruction outside the implemented subset will do; tcgen05 is
-  // Blackwell's tensor-core family, which this does not implement. cp.async
-  // and then wgmma used to stand here and each had to be replaced once it was
-  // implemented -- an example of something unsupported has to actually still
-  // be unsupported.
+  // Any instruction outside the implemented subset will do; tcgen05.shift
+  // is one of the few tcgen05 forms not implemented. cp.async, then wgmma,
+  // then tcgen05.fence used to stand here and each had to be replaced once it
+  // was implemented -- an example of something unsupported has to actually
+  // still be unsupported.
   auto err = VCAPTURE(Error, rt.device(0).load_module(
                                  ".version 8.7\n.target sm_100a\n.address_size 64\n"
-                                 ".visible .entry k() { tcgen05.fence::before_thread_sync; ret; }\n"));
+                                 ".visible .entry k() { .reg .b32 %r; tcgen05.shift.cta_group::1.down [%r]; ret; }\n"));
   VCHECK(err.code() == Err::UnsupportedPtx);
   VCHECK_CONTAINS(err.what(), "GPU profile: nvidia/b200");
 }

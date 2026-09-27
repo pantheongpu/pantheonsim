@@ -16,6 +16,11 @@ for src in $sources; do
   echo "wrote $(pwd)/$src.gfx942.o"
 done
 
+# The scratch kernel for gfx90a too, which reaches its private memory through
+# a buffer resource rather than flat scratch (test_amd_gcn_memory).
+"$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx90a -nogpulib -O2 -c memory.c -o memory.gfx90a.o
+echo "wrote $(pwd)/memory.gfx90a.o"
+
 # Kernels written in assembly, for instructions a compiler emits only now and
 # then (test_amd_gcn_asm).
 for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs; do
@@ -57,5 +62,8 @@ packed = zlib.compress(raw, 9)
 head = b"CCOB" + struct.pack("<HHII", 2, 0, 24 + len(packed), len(raw)) + hashlib.md5(raw).digest()[:8]
 open("bundle_zlib.bin", "wb").write(head + packed)'
   "$lld" -shared asm_scalar.gfx942.o asm_vector.gfx942.o -o linked.gfx942.hsaco
-  echo "wrote the bundles and linked.gfx942.hsaco"
+  # And the kernels an HSA program loads (amd/tests/hsa), linked as ROCm's
+  # loader wants them.
+  "$lld" -shared vector_add.gfx942.o -o vector_add.gfx942.hsaco
+  echo "wrote the bundles, linked.gfx942.hsaco and vector_add.gfx942.hsaco"
 fi

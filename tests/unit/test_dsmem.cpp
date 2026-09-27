@@ -440,6 +440,55 @@ END:
   for (uint32_t t = 0; t < 4; ++t) VCHECK_EQ(mem.load_scalar(out + t * 4, 4), uint64_t{2 * t + 102});
 }
 
+// One instruction, lanes naming different blocks' barriers: in an 8-block
+// cluster, lane i of block 0's first warp arrives on block i's barrier -- the
+// shape of CUTLASS's cluster pipelines releasing a stage to every block that
+// multicast into it. Each barrier expects two arrivals: block 0 sends two
+// rounds, and every block must see exactly its own, no more.
+VTEST(lanes_of_one_arrive_reach_different_blocks_barriers) {
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(8 * 4);
+  run(R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<6>;
+    .shared .align 8 .b64 bar;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, bar;
+    mov.u32 %r2, %cluster_ctarank;
+    mov.u32 %r3, %tid.x;
+    setp.eq.u32 %p2, %r3, 0;
+    @%p2 mbarrier.init.shared::cta.b64 [%r1], 2;
+    barrier.cluster.arrive.aligned;
+    barrier.cluster.wait.aligned;
+    setp.ne.u32 %p1, %r2, 0;
+    setp.ge.u32 %p3, %r3, 8;
+    or.pred %p4, %p1, %p3;
+    @%p4 bra WAIT;
+    mapa.shared::cluster.u32 %r4, %r1, %r3;
+    mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%r4];
+    mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%r4];
+WAIT:
+    mbarrier.try_wait.parity.shared::cta.b64 %p5, [%r1], 0;
+    @!%p5 bra WAIT;
+    @!%p2 bra END;
+    mbarrier.pending_count.b64 %r5, [%r1];
+    mul.wide.u32 %rd2, %r2, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    add.u32 %r6, %r5, 100;
+    st.global.u32 [%rd3], %r6;
+END:
+    barrier.cluster.arrive.aligned;
+    barrier.cluster.wait.aligned;
+    ret;
+}
+)", clusters(8, 8, 32), {arg_u64(out)}, mem);
+  // Every block's barrier completed its phase with nothing left over.
+  for (uint32_t r = 0; r < 8; ++r) VCHECK_EQ(mem.load_scalar(out + r * 4, 4), uint64_t{100 + 2});
+}
+
 // A block that exits takes its shared memory with it. Reading it afterwards
 // is the bug cluster.sync() at the end of a kernel exists to prevent, and it
 // is reported rather than answered from memory that is gone.
