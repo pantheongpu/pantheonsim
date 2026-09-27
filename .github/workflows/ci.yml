@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      ml_tests:
+        description: "The ml job's tests, as a ctest regular expression (all of them if empty)"
+        required: false
+        default: ''
 
 # A push that lands while an earlier run is still going supersedes it; there is
 # no value in finishing a build of code nobody will look at again.
@@ -220,10 +225,12 @@ jobs:
       - name: PyTorch, rocBLAS and hipSPARSELt
         # A test that skips fails the job: here each has what it needs, so a
         # skip means the runner's image lost it, not that there is nothing to
-        # test.
+        # test. A run started by hand may name fewer.
+        env:
+          ML_TESTS: ${{ inputs.ml_tests }}
         run: |
           set -o pipefail
-          ctest --test-dir build --output-on-failure -R '^(amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$' 2>&1 | tee ml.log
+          ctest --test-dir build --output-on-failure -R "${ML_TESTS:-^(amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$}" 2>&1 | tee ml.log
           if grep -E '\*\*\*Skipped|Not Run' ml.log; then
             echo "::error::an ML test skipped; the runner's image should have what it needs"; exit 1
           fi
