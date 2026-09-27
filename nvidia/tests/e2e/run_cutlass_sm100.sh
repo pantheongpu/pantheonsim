@@ -16,6 +16,11 @@
 #   mxf8_mxf6_*:      .kind::mxf8f6f4.block_scale, e4m3 x e2m3 with UE8M0
 #                     factors copied in by tcgen05.cp, B loaded by TMA as
 #                     .b6x16_p32.
+#   *_blockwise:      fp8 with per-block scales applied on the CUDA cores,
+#                     loaded by cp.async and arriving with .noinc.
+#   *_ptr_array:      grouped fp4 GEMM on a 4x4 cluster, a tensor map per SM
+#                     rewritten by tensormap.replace -- %smid must be distinct
+#                     among the resident blocks.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -56,6 +61,8 @@ tests=(
   "sm100_tensorop_gemm/s8_s8_void_s32|*-*streamK"
   "sm100_sparse_tensorop_gemm/sm100_sp_gemm_f16_f16_f32_f16_f16_hmma|*void*"
   "sm100_blockscaled_tensorop_gemm/mxf8_mxf6_f16_f8_tn_layout|*4x4x1_1sm_auto"
+  "sm100_gemm_f8_f8_f8_tensor_op_f32_blockwise|*2sm*64x4x32*"
+  "sm100_gemm_f4_f4_f32_tensor_op_f32_ptr_array|*2sm*4x4x1*"
 )
 if [[ "${VGPU_CUTLASS_SM100_ALL:-0}" == 1 ]]; then
   tests=("sm100_tensorop_gemm/f16_f16_void_f32|*" "sm100_tensorop_gemm/f8_f8_void_f32|*"
@@ -63,7 +70,9 @@ if [[ "${VGPU_CUTLASS_SM100_ALL:-0}" == 1 ]]; then
   for f in f16_f16_f32_f16_f16_hmma f32_f32_f32_f32_f32_tfmma f8_f8_f32_f32_f32_qmma s8_s8_s32_s8_s8_imma; do
     tests+=("sm100_sparse_tensorop_gemm/sm100_sp_gemm_$f|*")
   done
-  tests+=("sm100_blockscaled_tensorop_gemm/mxf8_mxf6_f16_f8_tn_layout|*")
+  tests+=("sm100_blockscaled_tensorop_gemm/mxf8_mxf6_f16_f8_tn_layout|*"
+          "sm100_gemm_f8_f8_f8_tensor_op_f32_blockwise|*"
+          "sm100_gemm_f4_f4_f32_tensor_op_f32_ptr_array|*")
 fi
 u="$cutlass/test/unit"
 # Each compile peaks near 10 GB; as many run together as the free memory (or
