@@ -94,6 +94,7 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
           use_operand(op.a_desc);
           use_operand(op.b_desc);
           use_operand(op.scale_d);
+          use_operand(op.sp_meta);
         }
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpTcgen05>) {
           for (const auto& r : op.regs) (op.kind == Tcgen05Kind::Ld ? defs : uses).push_back(r.id);

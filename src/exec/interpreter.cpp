@@ -5400,6 +5400,38 @@ class Interpreter {
     return 0.0;
   }
 
+  // Where stored element `k` of chunk `chunk` in row `row` (0-15) of a
+  // structured-sparse A goes, as a column of the K-wide row: the metadata
+  // rule of mma.sp, which wgmma.mma_async.sp follows for each warp's 16 rows.
+  // A chunk is four elements (16- and 8-bit types, 2:4), two (tf32, 1:2) or
+  // eight (int4, 4:8 in pairs), and its metadata is 4 bits, two 2-bit
+  // indices of "units": an element, half a tf32 element (0b0100 and 0b1110
+  // are tf32's only values), or a pair of int4 elements. Which lane of the
+  // group of four carries a chunk's metadata: for 16- and 32-bit types, lane
+  // 4g + H * selector + chunk / 4, four chunks of both rows to a lane, the
+  // second row in the high half; for 8- and 4-bit types, a row to a lane --
+  // row g from lane 4g + 2 * selector, row g + 8 from the next, chunks 8-15
+  // from the pair after. H is the number of lanes holding the group's
+  // metadata. All of it as an RTX 3060 (sm_86) places it.
+  static uint32_t sparse_column(uint32_t bits, uint32_t K, uint32_t sel, const Lanes& meta, uint32_t row,
+                                uint32_t chunk, uint32_t k) {
+    const bool tf32 = bits == 32, int4 = bits == 4, narrow = bits <= 8;
+    const uint32_t chunk_elems = tf32 ? 2 : int4 ? 8 : 4;
+    const uint32_t row_bits = tf32 ? 2 * K : int4 ? K / 2 : K;
+    const uint32_t holders = 2 * row_bits / 32;
+    const uint32_t group = row % 8, half = row / 8;
+    const uint32_t src = narrow ? 4 * group + 2 * sel + half + 2 * (chunk / 8)
+                                : 4 * group + holders * sel + chunk / 4;
+    const uint32_t shift = narrow ? (chunk % 8) * 4 : half * 16 + (chunk % 4) * 4;
+    const uint32_t nib = static_cast<uint32_t>(meta[src]) >> shift;
+    const uint32_t idx0 = nib & 3, idx1 = (nib >> 2) & 3;
+    uint32_t pos;
+    if (tf32) pos = idx0 / 2;
+    else if (int4) pos = 2 * (k < 2 ? idx0 : idx1) + k % 2;
+    else pos = k == 0 ? idx0 : idx1;
+    return chunk * chunk_elems + pos;
+  }
+
   // mma.sync (9.7.16.5). A, B, C and D are held as full tiles, filled from
   // and written back to the fragments by the per-shape formulas of
   // 9.7.16.5.1-13: for m16n8kK, with p elements to a register, A's register
@@ -5442,8 +5474,6 @@ class Interpreter {
       const uint32_t chunk_elems = tf32 ? 2 : int4 ? 8 : 4;
       const uint32_t stored = chunk_elems / 2;              // per chunk
       const uint32_t cpr = per_reg / stored;                // chunks per register
-      const uint32_t row_bits = tf32 ? 2 * K : int4 ? K / 2 : K;
-      const uint32_t holders = 2 * row_bits / 32;
       Lanes _s_meta;
       const Lanes meta = read_operand(w, ctx, ins, op.meta, _s_meta);
       const uint32_t sel = static_cast<uint32_t>(std::get<ImmInt>(op.selector).value);
@@ -5455,24 +5485,8 @@ class Interpreter {
           const uint32_t row = group + (reg % 2) * 8;
           for (uint32_t e = 0; e < per_reg; ++e) {
             const uint32_t chunk = tid * cpr + (reg / 2) * 4 * cpr + e / stored;
-            // 16- and 32-bit types: a holder carries four chunks of both
-            // rows, the second row in its high half. 8- and 4-bit types: a
-            // holder carries eight chunks of one row -- row g from lane
-            // 4g + 2 * selector, row g + 8 from the next, chunks 8-15 from
-            // the pair after -- as an RTX 3060 places them.
-            const bool narrow = mma_bits(op.ab_type) <= 8;
-            const uint32_t half = row >= 8 ? 1 : 0;
-            const uint32_t src = narrow ? 4 * group + 2 * sel + half + 2 * (chunk / 8)
-                                        : 4 * group + holders * sel + chunk / 4;
-            const uint32_t shift = narrow ? (chunk % 8) * 4 : half * 16 + (chunk % 4) * 4;
-            const uint32_t nib = static_cast<uint32_t>(meta[src]) >> shift;
-            const uint32_t idx0 = nib & 3, idx1 = (nib >> 2) & 3;
-            const uint32_t k = e % stored;   // which stored element of the chunk
-            uint32_t pos;
-            if (tf32) pos = idx0 / 2;
-            else if (int4) pos = 2 * (k < 2 ? idx0 : idx1) + k % 2;
-            else pos = k == 0 ? idx0 : idx1;
-            A[row * K + chunk * chunk_elems + pos] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
+            const uint32_t col = sparse_column(mma_bits(op.ab_type), K, sel, meta, row, chunk, e % stored);
+            A[row * K + col] = mma_elem(op.ab_type, op.ab_signed, v[lane], e);
           }
         }
       }
@@ -5747,6 +5761,7 @@ class Interpreter {
       case WgmmaElem::E5M2: return fp8_to_double(bits & 0xFF, kE5M2);
       case WgmmaElem::S8: return static_cast<double>(static_cast<int8_t>(bits & 0xFF));
       case WgmmaElem::U8: return static_cast<double>(bits & 0xFF);
+      case WgmmaElem::B1: return static_cast<double>(bits & 1);
     }
     return 0.0;
   }
@@ -5773,16 +5788,46 @@ class Interpreter {
     const uint32_t N = op.n, K = op.k;
     const uint32_t row0 = (warp_index % 4) * 16;   // this warp's rows of A and D
     const uint32_t ea = wgmma_elem_bytes(op.a_type), eb = wgmma_elem_bytes(op.b_type);
+    const bool b1 = op.a_type == WgmmaElem::B1;
+    const uint32_t abits = b1 ? 1 : 8 * ea;
     const bool int_form = op.d_type == WgmmaAcc::S32;
     const double sa = op.scale_a, sb = op.scale_b;
+    // A sparse A stores half of each row (9.7.17.6): Kp columns, which this
+    // warp expands into its 16 rows with its own metadata, the way mma.sp
+    // does for an m16n8kK -- sparse_column. A chunk is four elements (two
+    // stored) for 16- and 8-bit types and two (one stored) for tf32.
+    const uint32_t Kp = op.sparse ? K / 2 : K;
+    const uint32_t stored = abits == 32 ? 1 : 2;
+    Lanes sp_meta{};
+    uint32_t sp_sel = 0;
+    if (op.sparse) {
+      Lanes _s;
+      sp_meta = read_operand(w, ctx, ins, op.sp_meta, _s);
+      sp_sel = static_cast<uint32_t>(std::get<ImmInt>(op.sp_sel).value);
+    }
+    // One element of shared memory: a byte-addressed read, or for .b1 the
+    // bit it is in (K-major only, eight to a byte).
+    auto smem_elem = [&](const WgmmaDesc& d, bool k_major, WgmmaElem t, uint32_t bytes, uint32_t mn,
+                         uint32_t k) {
+      if (t == WgmmaElem::B1) {
+        const uint64_t at = wgmma_smem_offset(d, true, 1, mn, k / 8);
+        const uint64_t byte =
+            load_routed(w, ctx, ins, 0, kSharedVaBase + cluster_address(ctx, cluster_rank_of(ctx), at), 1);
+        return static_cast<double>((byte >> (k % 8)) & 1);
+      }
+      const uint64_t at = wgmma_smem_offset(d, k_major, bytes, mn, k);
+      return wgmma_decode(t, load_routed(w, ctx, ins, 0,
+                                         kSharedVaBase + cluster_address(ctx, cluster_rank_of(ctx), at), bytes));
+    };
 
     // A, this warp's 16 x K slice.
-    std::array<double, 16 * 32> A{};
+    std::vector<double> A(size_t{16} * K, 0.0);
     if (op.a_regs) {
       // The same fragment an mma.m16n8kK A operand uses (figures 151, 153, 155):
       // lane (g, t) holds rows g and g+8, and the register index picks the row
-      // half and the column block.
-      const uint32_t per_reg = 4 / ea;
+      // half and the column block. Sparse, it is mma.sp's (figures 180-182).
+      const uint32_t per_reg = 32 / abits;
+      const uint32_t cpr = per_reg / stored;   // sparse chunks per register
       for (uint32_t reg = 0; reg < 4; ++reg) {
         Lanes _s;
         const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s);
@@ -5790,9 +5835,13 @@ class Interpreter {
           const uint32_t g = lane / 4, t = lane % 4;
           const uint32_t row = g + (reg % 2) * 8;
           const uint32_t col0 = t * per_reg + (reg / 2) * (per_reg * 4);
-          for (uint32_t e = 0; e < per_reg; ++e)
-            A[row * K + col0 + e] =
-                sa * wgmma_decode(op.a_type, v[lane] >> (8 * ea * e));
+          for (uint32_t e = 0; e < per_reg; ++e) {
+            const uint32_t col =
+                op.sparse ? sparse_column(abits, K, sp_sel, sp_meta, row,
+                                          t * cpr + (reg / 2) * 4 * cpr + e / stored, e % stored)
+                          : col0 + e;
+            A[row * K + col] = sa * wgmma_decode(op.a_type, v[lane] >> (abits * e));
+          }
         }
       }
     }
@@ -5805,14 +5854,12 @@ class Interpreter {
         Lanes _s;
         const Lanes& dv = read_operand(w, ctx, ins, op.a_desc, _s);
         const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
-        snap.A.assign(size_t{64} * K, 0.0);
+        // Sparse: the packed 64 x K/2 matrix, in the canonical layout of its
+        // stored columns.
+        snap.A.assign(size_t{64} * Kp, 0.0);
         for (uint32_t r = 0; r < 64; ++r)
-          for (uint32_t k = 0; k < K; ++k) {
-            const uint64_t at = wgmma_smem_offset(d, op.trans_a == 0, ea, r, k);
-            snap.A[r * K + k] =
-                sa * wgmma_decode(op.a_type, load_routed(w, ctx, ins, 0,
-                                                         kSharedVaBase + cluster_address(ctx, cluster_rank_of(ctx), at), ea));
-          }
+          for (uint32_t k = 0; k < Kp; ++k)
+            snap.A[r * Kp + k] = sa * smem_elem(d, op.trans_a == 0, op.a_type, ea, r, k);
       }
       // B, all of it: K x N, read as N rows of K.
       snap.B.assign(size_t{K} * N, 0.0);
@@ -5820,19 +5867,19 @@ class Interpreter {
       const Lanes& dv = read_operand(w, ctx, ins, op.b_desc, _s);
       const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
       for (uint32_t n = 0; n < N; ++n)
-        for (uint32_t k = 0; k < K; ++k) {
-          const uint64_t at = wgmma_smem_offset(d, op.trans_b == 0, eb, n, k);
-          snap.B[size_t{k} * N + n] =
-              sb * wgmma_decode(op.b_type, load_routed(w, ctx, ins, 0,
-                                                       kSharedVaBase + cluster_address(ctx, cluster_rank_of(ctx), at), eb));
-        }
+        for (uint32_t k = 0; k < K; ++k)
+          snap.B[size_t{k} * N + n] = sb * smem_elem(d, op.trans_b == 0, op.b_type, eb, n, k);
     }
     if (!op.a_regs) {
       if (snap.A.empty())
         ctx_fail(ins, -1, Err::UnsupportedPtx,
                  "the warps of a warpgroup disagree on whether this wgmma's A is in registers or "
                  "shared memory");
-      std::copy_n(snap.A.begin() + size_t{row0} * K, size_t{16} * K, A.begin());
+      for (uint32_t r = 0; r < 16; ++r)
+        for (uint32_t j = 0; j < Kp; ++j) {
+          const uint32_t col = op.sparse ? sparse_column(abits, K, sp_sel, sp_meta, r, j / stored, j % stored) : j;
+          A[r * K + col] = snap.A[size_t{row0 + r} * Kp + j];
+        }
     }
     const std::vector<double>& B = snap.B;
     // scale-d: false means D = A*B, per the ISA. Read per lane; a kernel
@@ -5870,8 +5917,8 @@ class Interpreter {
         if (int_form) {
           int64_t acc = accumulate ? static_cast<int32_t>(slot) : 0;
           for (uint32_t k = 0; k < K; ++k)
-            acc += static_cast<int64_t>(A[row * K + k]) *
-                   static_cast<int64_t>(B[size_t{k} * N + col]);
+            acc += b1 ? int64_t{A[row * K + k] != 0 && B[size_t{k} * N + col] != 0}
+                      : static_cast<int64_t>(A[row * K + k]) * static_cast<int64_t>(B[size_t{k} * N + col]);
           if (op.satfinite)
             acc = std::clamp<int64_t>(acc, std::numeric_limits<int32_t>::min(),
                                       std::numeric_limits<int32_t>::max());

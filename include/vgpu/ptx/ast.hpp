@@ -309,7 +309,7 @@ struct OpMma {
 // registers or, like B always does, from shared memory through a 64-bit
 // matrix descriptor (PTX ISA 9.7.17.5.1.2.2).
 enum class WgmmaKind { Fence, Commit, Wait, Mma };
-enum class WgmmaElem { F16, BF16, TF32, E4M3, E5M2, S8, U8 };
+enum class WgmmaElem { F16, BF16, TF32, E4M3, E5M2, S8, U8, B1 };
 enum class WgmmaAcc { F16, F32, S32 };
 struct OpWgmma {
   WgmmaKind kind = WgmmaKind::Mma;
@@ -325,6 +325,10 @@ struct OpWgmma {
   Operand scale_d;           // predicate (or 0/1): false means D = A*B
   int scale_a = 1, scale_b = 1;   // -1 negates, float forms only
   int trans_a = 0, trans_b = 0;   // 1 selects M-/N-major, 16-bit forms only
+  // wgmma.mma_async.sp: A is structured sparse, M x K/2 stored, the metadata
+  // and selector as for mma.sp (per warp, its 16 rows).
+  bool sparse = false;
+  Operand sp_meta, sp_sel;
 };
 // Blackwell's fifth-generation tensor core (sm_100a/sm_100f and the a/f
 // targets after it, PTX ISA 9.7.18): Tensor Memory -- 128 lanes by 512
