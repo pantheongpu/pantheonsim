@@ -194,7 +194,8 @@ jobs:
 
   ml:
     name: PyTorch, rocBLAS and hipSPARSELt on simulated AMD GPUs
-    # Only on the pantheonsim.com host's runner (SIM_RUNS_ON): its image has
+    # Only on the pantheonsim.com host's runner, named by the repository
+    # variable ML_RUNS_ON (["self-hosted", "pantheonsim-ci"]): its image has
     # PyTorch's ROCm build and ROCm's rocBLAS, which no hosted runner has, and
     # the memory the PyTorch tests take. Unmodified: PyTorch's own kernels and
     # the ROCm libraries it ships (hipBLASLt, MIOpen, rocFFT, rocRAND,
@@ -202,8 +203,11 @@ jobs:
     # kernels, a CNN and a transformer trained a few steps, two GPUs in one
     # process and two processes over torch.distributed, on each simulated
     # Instinct GPU.
-    if: vars.SIM_RUNS_ON != ''
-    runs-on: ${{ fromJSON(vars.SIM_RUNS_ON || '"ubuntu-24.04"') }}
+    # The other jobs stay on GitHub's hosted runners, which there are many of;
+    # this one runner takes this job alone. Where the variable is unset the
+    # job does not run.
+    if: vars.ML_RUNS_ON != ''
+    runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
