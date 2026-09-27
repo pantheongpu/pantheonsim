@@ -51,29 +51,64 @@ const std::vector<Row>& rows_rdna3() {
   };
   return rows;
 }
+const std::vector<Row>& rows_rdna4() {
+  static const std::vector<Row> rows = {
+#include "rdna_ops_rdna4.inc"
+  };
+  return rows;
+}
+
+// Which generation the instruction being decoded or printed is: RDNA3 (gfx11)
+// or RDNA4 (gfx12), whose numbering and memory encodings differ. Set for the
+// length of a decode or a to_text.
+thread_local bool g_rdna4 = false;
+struct Generation {
+  bool saved;
+  explicit Generation(Target t) : saved(g_rdna4) { g_rdna4 = t == Target::Gfx1200; }
+  ~Generation() { g_rdna4 = saved; }
+};
 
 struct Table {
   std::map<std::tuple<Enc, uint8_t, uint32_t>, const Row*> by_opcode;
   std::map<std::string, const Row*> short_forms;   // VOP1, VOP2 and VOPC names
   std::map<std::string, const Row*> long_forms;    // VOP3 names
 };
-const Table& table() {
-  static const Table t = [] {
+Table make_table(const std::vector<Row>& rows) {
     Table t;
-    for (const Row& r : rows_rdna3()) {
+    for (const Row& r : rows) {
       t.by_opcode.emplace(std::make_tuple(r.enc, r.segment, static_cast<uint32_t>(r.opcode)), &r);
       if (r.enc == Enc::Vop1 || r.enc == Enc::Vop2 || r.enc == Enc::Vopc) t.short_forms.emplace(r.name, &r);
       if (r.enc == Enc::Vop3) t.long_forms.emplace(r.name, &r);
     }
     return t;
+}
+// gfx12 keeps gfx11's s_waitcnt (SOPP 9), which its specification leaves
+// out; LLVM decodes it, and a library's code has it.
+const std::vector<Row>& rows_rdna4_extra() {
+  static const std::vector<Row> rows = {{Enc::Sopp, 0, 9, false, "s_waitcnt", {{"SIMM16", K::Waitcnt, 16, false}}}};
+  return rows;
+}
+Table make_table4() {
+  std::vector<Row> rows = rows_rdna4();
+  // (make_table keeps pointers into the vector, so the rows must outlive it.)
+  static std::vector<Row> all = [&] {
+    std::vector<Row> v = rows_rdna4();
+    for (const Row& r : rows_rdna4_extra()) v.push_back(r);
+    return v;
   }();
-  return t;
+  (void)rows;
+  return make_table(all);
+}
+const Table& table() {
+  static const Table t3 = make_table(rows_rdna3()), t4 = make_table4();
+  return g_rdna4 ? t4 : t3;
 }
 const Row& row(Enc e, uint8_t segment, uint32_t opcode) {
   const auto& m = table().by_opcode;
   const auto it = m.find({e, segment, opcode});
   if (it == m.end())
-    throw Error::make(Err::Unsupported, enc_name(e), " opcode ", opcode, " (gfx11) is not decoded yet");
+    throw Error::make(Err::Unsupported, enc_name(e), " opcode ", opcode, g_rdna4 ? " (gfx12)" : " (gfx11)",
+                      " is not decoded yet");
   return *it->second;
 }
 
@@ -84,9 +119,13 @@ const Row& row(Enc e, uint8_t segment, uint32_t opcode) {
 // suffix gfx9 gives its short (_e32) and long (_e64) forms. An instruction gfx9
 // does not have keeps its own name, and the executor knows it by that.
 std::string exec_name(const std::string& name, Enc enc, bool dpp) {
-  static const std::map<std::string, std::vector<std::string>> kAliases = {
+  static const std::map<std::string, std::vector<std::string>> kAliases3 = {
 #include "rdna_ops_rdna3_aliases.inc"
   };
+  static const std::map<std::string, std::vector<std::string>> kAliases4 = {
+#include "rdna_ops_rdna4_aliases.inc"
+  };
+  const auto& kAliases = g_rdna4 ? kAliases4 : kAliases3;
   static const std::map<std::string, std::string> kRenamed = {
       {"v_add_nc_u32", "v_add_u32"},         {"v_sub_nc_u32", "v_sub_u32"},
       {"v_subrev_nc_u32", "v_subrev_u32"},   {"v_add_co_ci_u32", "v_addc_co_u32"},
@@ -208,7 +247,10 @@ bool is_half(const Opnd& op) { return op.bits == 16; }
 }  // namespace
 
 Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64) {
+  const Generation generation(target);
+  const bool r4 = g_rdna4;
   const uint32_t w0 = word(code, at);
+  uint32_t w2 = 0;   // RDNA4's 96-bit memory encodings' third word
   Inst in;
   in.pc = pc;
   in.arch = target;
@@ -249,11 +291,19 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     in.opcode = bits(w0, 29, 23);
   } else if ((w0 >> 26) == 0x3d) {
     in.enc = Enc::Smem;
-    in.opcode = bits(w0, 25, 18);
+    in.opcode = r4 ? bits(w0, 18, 13) : bits(w0, 25, 18);
     second();
+  } else if (r4 && ((w0 >> 26) == 0x31 || (w0 >> 24) == 0xec || (w0 >> 24) == 0xed || (w0 >> 24) == 0xee)) {
+    // RDNA4's buffer (VBUFFER) and flat, scratch and global (VFLAT, VSCRATCH,
+    // VGLOBAL) accesses: three words.
+    in.enc = (w0 >> 26) == 0x31 ? Enc::Mubuf : Enc::Flat;
+    in.opcode = bits(w0, 21, 14);
+    second();
+    w2 = word(code, at + 8);
+    in.size = 12;
   } else if ((w0 >> 25) == 0x3f) {
     in.enc = Enc::Vop1;
-    in.opcode = bits(w0, 16, 9);
+    in.opcode = r4 ? bits(w0, 15, 9) : bits(w0, 16, 9);
   } else if ((w0 >> 25) == 0x3e) {
     in.enc = Enc::Vopc;
     in.opcode = bits(w0, 24, 17);
@@ -353,7 +403,9 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   // included: VOP3 numbers every vector instruction.
   // FLAT's SEG field: 0 flat, 1 scratch, 2 global -- the table keys them
   // 0 flat, 1 global, 2 scratch.
-  const uint32_t seg = in.enc == Enc::Flat ? bits(w, 17, 16) : 0;
+  // (RDNA4 says which by the encoding's top byte: 0xEC flat, 0xED scratch,
+  // 0xEE global.)
+  const uint32_t seg = in.enc != Enc::Flat ? 0 : r4 ? ((w0 >> 24) == 0xed ? 1 : (w0 >> 24) == 0xee ? 2 : 0) : bits(w, 17, 16);
   const uint8_t segment = static_cast<uint8_t>(seg == 1 ? 2 : seg == 2 ? 1 : 0);
   const Row& r = row(in.enc, segment, in.opcode);
   in.name = r.name;
@@ -387,6 +439,18 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
 
   // Each operand, from its field.
   const auto field = [&](const std::string& f) -> uint32_t {
+    if (r4) switch (in.enc) {
+        case Enc::Smem:
+          return f == "SDATA" ? bits(w, 12, 6) : f == "SBASE" ? bits(w, 5, 0) << 1 : bits(w, 63, 57);
+        case Enc::Mubuf:
+          return f == "VDATA" ? bits(w, 39, 32) : f == "VADDR" ? (w2 & 0xFF) : f == "RSRC" ? bits(w, 49, 41)
+                                                                                         : bits(w, 6, 0);
+        case Enc::Flat:
+          return f == "VDST" ? bits(w, 39, 32) : f == "VADDR" ? (w2 & 0xFF) : f == "VSRC" ? bits(w, 62, 55)
+                                                                                           : bits(w, 6, 0);
+        default:
+          break;
+      }
     switch (in.enc) {
       case Enc::Sop1:
         return f == "SDST" ? bits(w, 22, 16) : bits(w, 7, 0);
@@ -428,14 +492,19 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     const std::string f = op.field;
     uint32_t width = width_of(op, in.enc, wave64);
     // A buffer address is an offset or an index, one register, or both, two.
-    if ((in.enc == Enc::Mubuf || in.enc == Enc::Mtbuf) && f == "VADDR") width = bits(w, 55, 55) && bits(w, 54, 54) ? 2 : 1;
+    const bool idxen = r4 ? bits(w, 63, 63) : bits(w, 55, 55), offen = r4 ? bits(w, 62, 62) : bits(w, 54, 54);
+    if ((in.enc == Enc::Mubuf || in.enc == Enc::Mtbuf) && f == "VADDR") width = idxen && offen ? 2 : 1;
     // A global access with a scalar base takes a 32-bit offset from its
     // address register; without one, a whole 64-bit address. Scratch's is
     // always an offset.
-    if (in.enc == Enc::Flat && f == "ADDR" && segment != 0) width = segment == 1 && bits(w, 54, 48) == 124 ? 2 : 1;
-    // An atomic returns the old value only with GLC set.
+    const uint32_t saddr_field = r4 ? bits(w, 6, 0) : bits(w, 54, 48);
+    if (in.enc == Enc::Flat && (f == "ADDR" || f == "VADDR") && segment != 0)
+      width = segment == 1 && saddr_field == 124 ? 2 : 1;
+    // An atomic returns the old value only with GLC set (RDNA4: TH's
+    // return bit).
+    const bool returns = r4 ? bits(w, 52, 52) : bits(w, 14, 14);
     if (op.out && (in.enc == Enc::Flat || in.enc == Enc::Mubuf) && r.name[0] != 'd' &&
-        std::string(r.name).find("_atomic_") != std::string::npos && !bits(w, 14, 14))
+        std::string(r.name).find("_atomic_") != std::string::npos && !returns)
       continue;
     Operand o;
     switch (op.kind) {
@@ -468,6 +537,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
       case K::Simm32: {
         Operand l;
         l.kind = OperandKind::Literal;
+        l.constant_k = true;
         in.src.push_back(l);
         literal = true;
         continue;
@@ -513,7 +583,29 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     (op.out ? in.dst : in.src).push_back(o);
   }
 
-  // The modifiers each encoding carries.
+  // The modifiers each encoding carries -- RDNA4's memory ones first: a
+  // 24-bit offset, and the temporal hint (TH) and scope in place of
+  // glc/slc/dlc, kept in `cache` as TH | SCOPE << 3.
+  if (r4 && (in.enc == Enc::Smem || in.enc == Enc::Mubuf || in.enc == Enc::Flat)) {
+    in.gfx12_cache = true;
+    if (in.enc == Enc::Smem) {
+      in.offset = static_cast<int32_t>(bits(w, 55, 32) << 8) >> 8;
+      in.cache = bits(w, 24, 23) | bits(w, 22, 21) << 3;
+    } else {
+      in.offset = static_cast<int32_t>((w2 >> 8) << 8) >> 8;   // IOFFSET, 24 bits, signed
+      in.cache = bits(w, 54, 52) | bits(w, 51, 50) << 3;
+      if (in.enc == Enc::Mubuf) {
+        in.offen = bits(w, 62, 62);
+        in.idxen = bits(w, 63, 63);
+        in.format = bits(w, 61, 55);
+      } else {
+        const uint32_t saddr = bits(w, 6, 0);
+        in.has_saddr = in.segment != Inst::Segment::Flat && saddr != 124;
+        in.saddr = saddr;
+        in.has_vaddr = in.segment != Inst::Segment::Scratch || bits(w, 49, 49);
+      }
+    }
+  } else
   switch (in.enc) {
     case Enc::Smem:
       in.offset = static_cast<int32_t>(bits(w, 52, 32) << 11) >> 11;   // 21 bits, signed
@@ -548,6 +640,9 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
       // it (bit 3 the destination's) says which half, and the assembler
       // writes that as .l or .h rather than as op_sel.
       if (!r.sdst) {
+        // (gfx12's disassembler writes op_sel out rather than .l/.h, so it is
+        // kept to print there; the executor reads the halves either way.)
+        in.printed_op_sel = in.op_sel;
         for (uint32_t k = 0; k < in.src.size() && k < 3; ++k)
           if (in.src[k].bits16 && in.src[k].kind == OperandKind::Vgpr) {
             in.src[k].half = true;
@@ -559,6 +654,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
           in.dst[0].hi = (in.op_sel >> 3) & 1;
           in.op_sel &= static_cast<uint8_t>(~8u);
         }
+        if (!r4) in.printed_op_sel = in.op_sel;
       }
       if (in.dpp) {
         const uint32_t dneg = bits(dpp_word, 20, 20) | bits(dpp_word, 22, 22) << 1;
@@ -637,6 +733,9 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     if (o.half && o.kind == OperandKind::Vgpr) o.sel = o.hi ? 5 : 4;
   in.asm_name = in.name;
   in.name = exec_name(in.name, in.enc, in.dpp || in.dpp8);
+  // Promoted only where the executor has the short form too (gfx12's
+  // v_add_f64 has one; gfx9's, which it runs as, does not).
+  if (in.promoted && (in.name.size() < 4 || in.name.compare(in.name.size() - 4, 4, "_e64") != 0)) in.promoted = false;
   // The gfx9 instruction's number, which the executor reads a comparison's
   // condition and type from.
   if (const int op9 = gfx9_opcode(in.name); op9 >= 0) in.opcode = static_cast<uint32_t>(op9);
@@ -656,7 +755,15 @@ std::string reg_text(const Operand& o) {
   };
   switch (o.kind) {
     case OperandKind::Sgpr: return range("s");   // s102 and s103 are ordinary registers on gfx11
-    case OperandKind::Vgpr: return range("v") + (o.half ? (o.hi ? ".h" : ".l") : "");
+    // gfx11's disassembler names a 16-bit operand's half (v1.l, v1.h); gfx12's
+    // names the register, the half being in the register number's top bit.
+    case OperandKind::Vgpr:
+      if (o.half && g_rdna4) {
+        char n[16];
+        std::snprintf(n, sizeof n, "v%u", o.index + (o.hi ? 128 : 0));
+        return n;
+      }
+      return range("v") + (o.half ? (o.hi ? ".h" : ".l") : "");
     case OperandKind::Ttmp: return range("ttmp");
     case OperandKind::Null: return "null";
     case OperandKind::Scc: return "src_scc";
@@ -665,8 +772,15 @@ std::string reg_text(const Operand& o) {
     default: return operand_text(o);
   }
 }
+std::string hex(uint32_t v) {
+  char b[16];
+  std::snprintf(b, sizeof b, "0x%x", v);
+  return b;
+}
+
 // An operand with its modifiers: -v1, |s2|, -|v[3:4]|.
 std::string op_text(const Operand& o) {
+  if (o.constant_k) return hex(static_cast<uint32_t>(o.value));
   if (o.kind == OperandKind::Inline || o.kind == OperandKind::InlineFloat || o.kind == OperandKind::Literal) {
     Operand plain = o;
     plain.abs = false;
@@ -679,21 +793,18 @@ std::string op_text(const Operand& o) {
   return o.abs ? neg + "|" + reg_text(plain) + "|" : neg + reg_text(plain);
 }
 
-std::string hex(uint32_t v) {
-  char b[16];
-  std::snprintf(b, sizeof b, "0x%x", v);
-  return b;
-}
 
 std::string hwreg(uint32_t simm) {
   static const std::map<uint32_t, const char*> kNames = {
       {1, "HW_REG_MODE"},        {2, "HW_REG_STATUS"},      {3, "HW_REG_TRAPSTS"},      {5, "HW_REG_GPR_ALLOC"},
       {6, "HW_REG_LDS_ALLOC"},   {7, "HW_REG_IB_STS"},      {15, "HW_REG_SH_MEM_BASES"}, {20, "HW_REG_FLAT_SCR_LO"},
       {21, "HW_REG_FLAT_SCR_HI"}, {23, "HW_REG_HW_ID1"},    {24, "HW_REG_HW_ID2"},       {25, "HW_REG_POPS_PACKER"},
-      {29, "HW_REG_SHADER_CYCLES"}};
+      {29, "HW_REG_SHADER_CYCLES"}, {30, "HW_REG_SHADER_CYCLES_HI"}};
   const uint32_t id = simm & 0x3F, offset = (simm >> 6) & 0x1F, size = ((simm >> 11) & 0x1F) + 1;
   const auto it = kNames.find(id);
-  std::string out = "hwreg(" + (it != kNames.end() ? std::string(it->second) : std::to_string(id));
+  // gfx12 names the cycle counter's two halves.
+  const std::string known = g_rdna4 && id == 29 ? "HW_REG_SHADER_CYCLES_LO" : it != kNames.end() ? it->second : "";
+  std::string out = "hwreg(" + (!known.empty() ? known : std::to_string(id));
   if (offset || size != 32) out += ", " + std::to_string(offset) + ", " + std::to_string(size);
   return out + ")";
 }
@@ -745,6 +856,32 @@ std::string dpp_text(const Inst& i) {
     std::snprintf(b, sizeof b, "dpp_ctrl:0x%x", c);
   }
   return b;
+}
+
+// RDNA4's cache policy as the assembler writes it: the temporal hint by what
+// the access is (TH_LOAD_NT, TH_STORE_HT, TH_ATOMIC_RETURN, ...), then the
+// scope; the defaults (regular, the compute unit) not at all.
+std::string gfx12_cache(const std::string& name, uint32_t cache) {
+  const uint32_t th = cache & 7, scope = (cache >> 3) & 3;
+  std::string s;
+  const bool atomic = name.find("_atomic") != std::string::npos;
+  const bool store = !atomic && (name.find("_store") != std::string::npos);
+  if (th) {
+    if (atomic) {
+      std::string t;
+      if (th & 2) t += "_NT";
+      if (th & 4) t += "_CASCADE";
+      if (th & 1) t += "_RETURN";
+      s += " th:TH_ATOMIC" + t;
+    } else {
+      static const char* kLoad[] = {"RT", "NT", "HT", "LU", "NT_RT", "RT_NT", "NT_HT", "RESERVED"};
+      static const char* kStore[] = {"RT", "NT", "HT", "RT_WB", "NT_RT", "RT_NT", "NT_HT", "NT_WB"};
+      const std::string what = th == 3 && scope == 3 ? "BYPASS" : store ? kStore[th] : kLoad[th];
+      s += std::string(" th:TH_") + (store ? "STORE_" : "LOAD_") + what;
+    }
+  }
+  static const char* kScope[] = {"", " scope:SCOPE_SE", " scope:SCOPE_DEV", " scope:SCOPE_SYS"};
+  return s + kScope[scope];
 }
 
 std::string one(const Inst& i) {
@@ -817,6 +954,12 @@ std::string one(const Inst& i) {
     const uint32_t off = static_cast<uint32_t>(i.offset) & 0x1FFFFF;
     const bool reg = i.src.size() > 1 && i.src[1].kind != OperandKind::Null;
     put(op_text(i.src[0]));
+    const uint32_t off24 = static_cast<uint32_t>(i.offset) & 0xFFFFFF;
+    if (i.gfx12_cache) {
+      if (reg) put(op_text(i.src[1]) + " offset:" + hex(off24));
+      else put(hex(off24));
+      return s + gfx12_cache(name, i.cache);
+    }
     if (reg) put(op_text(i.src[1]) + (off ? " offset:" + hex(off) : ""));
     else put(off ? hex(off) : "null");
     if (i.cache & 1) s += " glc";
@@ -864,6 +1007,10 @@ std::string one(const Inst& i) {
       break;
     case Enc::Flat:
       if (i.offset) s += " offset:" + std::to_string(i.offset);
+      if (i.gfx12_cache) {
+        s += gfx12_cache(name, i.cache);
+        break;
+      }
       if (i.cache & 1) s += " glc";
       if (i.cache & 2) s += " slc";
       if (i.cache & 4) s += " dlc";
@@ -873,16 +1020,20 @@ std::string one(const Inst& i) {
       if (i.idxen) s += " idxen";
       if (i.offen) s += " offen";
       if (i.offset) s += " offset:" + std::to_string(i.offset);
+      if (i.gfx12_cache) {
+        s += gfx12_cache(name, i.cache);
+        break;
+      }
       if (i.cache & 1) s += " glc";
       if (i.cache & 2) s += " slc";
       if (i.cache & 4) s += " dlc";
       break;
     case Enc::Vop3:
-      if (i.op_sel) {
+      if (i.printed_op_sel) {
         const uint32_t n = static_cast<uint32_t>(i.src.size());
         std::string t = " op_sel:[";
-        for (uint32_t k = 0; k < n; ++k) t += std::to_string((i.op_sel >> k) & 1) + ",";
-        t += std::to_string((i.op_sel >> 3) & 1) + "]";
+        for (uint32_t k = 0; k < n; ++k) t += std::to_string((i.printed_op_sel >> k) & 1) + ",";
+        t += std::to_string((i.printed_op_sel >> 3) & 1) + "]";
         s += t;
       }
       if (i.clamp) s += " clamp";
@@ -932,6 +1083,7 @@ std::string one(const Inst& i) {
 }  // namespace
 
 std::string to_text(const Inst& i) {
+  const Generation generation(i.arch);
   if (i.enc == Enc::Vopd && i.dual.size() == 2) return one(i.dual[0]) + " :: " + one(i.dual[1]);
   return one(i);
 }

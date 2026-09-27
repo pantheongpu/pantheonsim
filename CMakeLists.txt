@@ -44,6 +44,7 @@ set(VGPU_PROFILES
   amd/mi325x
   amd/mi350x
   amd/rx7900xtx
+  amd/rx9070xt
 )
 set(_gen_dir "${CMAKE_BINARY_DIR}/generated")
 set(_gen "${_gen_dir}/vgpu/embedded_profiles.hpp")
