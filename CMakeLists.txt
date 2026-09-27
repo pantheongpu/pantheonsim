@@ -1357,6 +1357,13 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 5400)
+  # CUTLASS's SM120 GEMM tests on a simulated RTX 5090: mma.sync's fp4/fp6,
+  # block-scaled and sparse kinds, and ldmatrix's .b8x16 expansion.
+  add_test(NAME e2e_cutlass_sm120 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_sm120.sh)
+  set_tests_properties(e2e_cutlass_sm120 PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 5400)
   add_test(NAME e2e_block_semaphore COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_block_semaphore.sh)
   set_tests_properties(e2e_block_semaphore PROPERTIES
     DEPENDS vgpucudart

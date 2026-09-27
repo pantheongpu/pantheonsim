@@ -34,7 +34,8 @@ if [[ ! -f "$cutlass/test/unit/conv/device_3x/testbed_conv.hpp" ||
       ! -f "$cutlass/test/unit/gemm/device/sm90_gemm_s8_s8_s8_tensor_op_s32.cu" ||
       ! -f "$cutlass/test/unit/gemm/device/sm100_tensorop_gemm/f16_f16_void_f32.cu" ||
       ! -f "$cutlass/test/unit/gemm/device/sm90_sparse_gemm_s8_s8_s32_tensor_op_s32.cu" ||
-      ! -f "$cutlass/test/unit/gemm/device/sm100_blockscaled_tensorop_gemm/mxf8_mxf6_f16_f8_tn_layout.cu" ]]; then
+      ! -f "$cutlass/test/unit/gemm/device/sm100_blockscaled_tensorop_gemm/mxf8_mxf6_f16_f8_tn_layout.cu" ||
+      ! -f "$cutlass/test/unit/gemm/device/sm120_tensorop_gemm/sm120_gemm_f4_f6_f32_tensor_op.cu" ]]; then
   if [[ -n "${CUTLASS_DIR:-}" ]]; then
     echo "FAIL: CUTLASS_DIR=$CUTLASS_DIR is not a CUTLASS checkout with its unit tests"; exit 1
   fi
@@ -55,6 +56,7 @@ if [[ ! -f "$cutlass/test/unit/conv/device_3x/testbed_conv.hpp" ||
        'cutlass-*/test/unit/gemm/device/sm100_tensorop_gemm/*.cu' \
        'cutlass-*/test/unit/gemm/device/sm100_sparse_tensorop_gemm/*.cu' \
        'cutlass-*/test/unit/gemm/device/sm100_blockscaled_tensorop_gemm/*.cu' \
+       'cutlass-*/test/unit/gemm/device/sm120_*/*.cu' \
        'cutlass-*/test/unit/gemm/device/*sparse*.cu' \
        'cutlass-*/test/unit/test_unit.cpp'; then
     echo "SKIP: could not download CUTLASS $cutlass_tag (set CUTLASS_DIR to a checkout)"; exit 0
