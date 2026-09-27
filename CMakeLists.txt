@@ -45,6 +45,7 @@ set(VGPU_PROFILES
   amd/mi350x
   amd/rx7900xtx
   amd/rx9070xt
+  amd/rx6900xt
 )
 set(_gen_dir "${CMAKE_BINARY_DIR}/generated")
 set(_gen "${_gen_dir}/vgpu/embedded_profiles.hpp")
@@ -700,6 +701,10 @@ foreach(_t ops math memory globals grid bytes int64 atomics mixed half calls pac
   # work-group ids in trap registers, scalar floats.
   add_test(NAME test_amd_gcn_${_t}_gfx1201 COMMAND test_amd_gcn_${_t})
   set_tests_properties(test_amd_gcn_${_t}_gfx1201 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1201")
+  # And for gfx1030 (RDNA2): gfx10's encodings, SDWA, M0 and null the other
+  # way round, and a register per work-item id.
+  add_test(NAME test_amd_gcn_${_t}_gfx1030 COMMAND test_amd_gcn_${_t})
+  set_tests_properties(test_amd_gcn_${_t}_gfx1030 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1030")
 endforeach()
 
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
@@ -840,6 +845,11 @@ set_tests_properties(amd_pytorch_rx7900xtx PROPERTIES DEPENDS vgpuhip RUN_SERIAL
 # layout, OCP fp8).
 add_test(NAME amd_pytorch_rx9070xt COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/rx9070xt)
 set_tests_properties(amd_pytorch_rx9070xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# And on an RDNA2 consumer card (gfx1030: gfx10's encodings, no matrix
+# instructions, fp8 refused).
+add_test(NAME amd_pytorch_rx6900xt COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/rx6900xt)
+set_tests_properties(amd_pytorch_rx6900xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # torch.compile's Triton kernels, and one written by hand, compiled and loaded
 # at run time.

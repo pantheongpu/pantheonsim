@@ -336,6 +336,27 @@ with gfx12's OCP fp8 WMMA.
   - OCP 8-bit floats.
 - **Checks:** the executor's unit kernels pass on gfx1201 too (ctests `*_gfx1201`), and `tests/hipcc/rdna4.cpp` checks WMMA, the scalar float unit and the split barrier.
 
+## RDNA2 (Radeon RX 6900 XT)
+
+`VGPU_GPU=amd/rx6900xt` is gfx1030 (RDNA2). PyTorch's 20 checks pass on it
+(ctest `amd_pytorch_rx6900xt`). RDNA2 has no matrix instructions, so its
+matrix products run on the vector units, and PyTorch refuses fp8 on it, as it
+does on the card.
+
+- **Decoder:** the same generator reads AMD's RDNA2 specification into `src/rdna_ops_rdna2.inc`. gfx10 names its instructions as gfx9 does, and differs from gfx11 in a few places:
+  - M0 is operand 124 and null is 125, the other way round from gfx11;
+  - glc, slc and dlc sit in other bits, and so does FLAT's segment;
+  - it has SDWA (sub-dword reads and writes) and no true16 or VOPD.
+
+  All DECODED_1030 distinct encodings in the wheel's gfx1030 code decode and print as `llvm-objdump` does. `tests/data/isa_corpus_gfx1030.txt` keeps 1,775 of their shapes.
+- **Execution:** RDNA3's paths, plus:
+  - a register per work-item id: gfx10 does not pack them into v0, whatever the code object's ABI;
+  - SDWA's three ways of filling the rest of a destination (pad, sign-extend, keep);
+  - `v_permlane16_b32` and `v_permlanex16_b32`, which RDNA3 and RDNA4 have too;
+  - DPP's `row_share` and `row_xmask`, and its FI bit;
+  - occupancy from gfx10.3's register file.
+- **Checks:** the executor's unit kernels pass on gfx1030 (ctests `*_gfx1030`), and `tests/hipcc/rdna2.cpp` checks SDWA, M0-relative registers, the permlanes and the DPP modes, in wave32 and wave64.
+
 `VGPU_TRACE_WAVE=1` prints each instruction a work-group's first wave runs,
 with what its destination holds after it for lane 0 (or the lane
 `VGPU_TRACE_LANE` names). That is how the bugs above were found.

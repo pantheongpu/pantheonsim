@@ -102,7 +102,13 @@ struct CodeObject {
   // finds its id: from version 5 (1.2) the three are packed into v0, and
   // before it each has a register of its own.
   uint32_t abi_major = 1, abi_minor = 0;
-  bool packed_work_item_id() const { return abi_major > 1 || abi_minor >= 2; }
+  // (RDNA2 has a register per id whatever the ABI: gfx1030 to 1036 and
+  // gfx10-3-generic.)
+  bool packed_work_item_id() const {
+    const bool gfx10 = mach == 0x36 || mach == 0x37 || mach == 0x38 || mach == 0x39 || mach == 0x3d ||
+                       mach == 0x3e || mach == 0x45 || mach == 0x53;
+    return !gfx10 && (abi_major > 1 || abi_minor >= 2);
+  }
   std::vector<uint8_t> text;              // the .text section
   uint64_t text_addr = 0;                 // its address, which kernel entries are relative to
   std::vector<Kernel> kernels;
