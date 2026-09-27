@@ -1400,9 +1400,9 @@ VTEST(tcgen05_mma_sp_f16_m64_lane16) {
   check_d_f32(x.run(), 1, M, N, K, A, B, nullptr, 16, 32);
 }
 
-// .kind::mxf4 4:8 in pairs, K = 128: its default .block32 gives four
-// factors a row.
-VTEST(tcgen05_mma_sp_mxf4_pairs_four_blocks) {
+// .kind::mxf4 4:8 in pairs, K = 128: its default .block32 is 2X, two
+// factors a row, each over 64.
+VTEST(tcgen05_mma_sp_mxf4_pairs_two_blocks) {
   const int M = 128, N = 16, K = 128;
   const Sparse sp{8};
   auto S = [](int m, int j) { return val(m, j, 2); };
@@ -1428,11 +1428,11 @@ VTEST(tcgen05_mma_sp_mxf4_pairs_four_blocks) {
   x.sfb_col = 20;
   x.meta_col = 22;
   x.a_tmem.assign(1, std::vector<uint32_t>(128 * 8));
-  put_scales(x.a_tmem[0], 8, 0, M, 4, 0, sa);
-  put_scales(x.a_tmem[0], 8, 4, N, 4, 0, sb);
+  put_scales(x.a_tmem[0], 8, 0, M, 2, 0, sa);
+  put_scales(x.a_tmem[0], 8, 4, N, 2, 0, sb);
   put_meta(x.a_tmem[0], 8, 6, M, 32, 0, true, 0, K, sp);
   auto ue8m0 = [](uint8_t v) { return std::ldexp(1.0f, int(v) - 127); };
-  check_scaled(x.run(), M, N, K, 32, 32, A, B, [&](int m, int j) { return ue8m0(sa(m, j)); },
+  check_scaled(x.run(), M, N, K, 64, 32, A, B, [&](int m, int j) { return ue8m0(sa(m, j)); },
                [&](int n, int j) { return ue8m0(sb(n, j)); });
 }
 
@@ -1479,9 +1479,10 @@ VTEST(tcgen05_mma_sp_cta_pair_m128_layout_c) {
     }
 }
 
-// .kind::mxf4nvf4.block16 with sparse K = 128: eight UE4M3 factors a row,
-// the second four 4 columns after the first (figures 255 and 262).
-VTEST(tcgen05_mma_sp_mxf4nvf4_block16_eight_factors) {
+// .kind::mxf4nvf4.block16 with sparse K = 128: .block16 is 4X there
+// (9.7.18.10.10.1's aliases), four UE4M3 factors a row, each over 32 --
+// what CUTLASS's sparse nvf4 GEMMs feed it.
+VTEST(tcgen05_mma_sp_mxf4nvf4_block16_is_4x) {
   const int M = 128, N = 16, K = 128;
   const Sparse sp{8};
   auto S = [](int m, int j) { return val(m, j, 4); };
@@ -1502,18 +1503,16 @@ VTEST(tcgen05_mma_sp_mxf4nvf4_block16_eight_factors) {
   x.smem_b = {packed_k_major(N, K, 4, 32, 128, 512, [&](int n, int k) { return e2m1_bits(B(k, n)); })};
   x.cols = 32;
   x.a_is_tmem = false;
-  x.a_cols = 16;
+  x.a_cols = 8;
   x.a_col = 16;
   x.sfa_col = 16;
-  x.sfb_col = 24;
-  x.meta_col = 30;
-  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 16));
-  for (int half = 0; half < 2; ++half) {
-    put_scales(x.a_tmem[0], 16, 4 * half, M, 4, 0, [&](int m, int j) { return e4m3_bits(sa(m, 4 * half + j)); });
-    put_scales(x.a_tmem[0], 16, 8 + 4 * half, N, 4, 0, [&](int n, int j) { return e4m3_bits(sb(n, 4 * half + j)); });
-  }
-  put_meta(x.a_tmem[0], 16, 14, M, 32, 0, true, 0, K, sp);
-  check_scaled(x.run(), M, N, K, 16, 32, A, B, sa, sb);
+  x.sfb_col = 20;
+  x.meta_col = 22;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 8));
+  put_scales(x.a_tmem[0], 8, 0, M, 4, 0, [&](int m, int j) { return e4m3_bits(sa(m, j)); });
+  put_scales(x.a_tmem[0], 8, 4, N, 4, 0, [&](int n, int j) { return e4m3_bits(sb(n, j)); });
+  put_meta(x.a_tmem[0], 8, 6, M, 32, 0, true, 0, K, sp);
+  check_scaled(x.run(), M, N, K, 32, 32, A, B, sa, sb);
 }
 
 VTEST(tcgen05_mma_sp_refuses_what_the_isa_rules_out) {

@@ -121,10 +121,11 @@ Tensor Memory at `[sp-meta-tmem]`, laid out as figures 287-292 draw it, each
   selector must be 0 (`i8`, `f8f6f4`) or is taken as 0 (the `mx` kinds).
 
 For M = 64 the metadata starts at D's lane (0 or 16). With block scaling a
-sparse `mxf4` K = 128 has four factors a row under `.block32`, its default,
-and eight under `.block16` ("semantically scale_vec::8X"): factors 4-7 sit
-as 0-3 do, 4 columns further on for A and for N <= 128, 8 for N > 128
-(figures 255 and 262-264).
+sparse `mxf4` K = 128 keeps the counts of its aliases -- `.block32` is 2X
+and `.block16` 4X "when K = 64 or 128" -- so each factor covers 64 or 32
+of K. (Table 68's six- and eight-factor rows are sm_103/107's larger K,
+which is refused; CUTLASS's sparse nvf4 GEMMs issue `.block16` over
+K = 128 with one factor per 32, which is what settled the reading.)
 
 ### tcgen05.cp
 
