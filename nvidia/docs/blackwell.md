@@ -101,6 +101,9 @@ before waiting for it is not caught here.
 - **TMA `.cta_group::2`.** A copy may complete on the barrier in its
   destination's peer CTA, and a multicast one signals, for each destination,
   whichever CTA of its pair has the barrier's rank parity.
+- **TMA `.tile::gather4` / `.tile::scatter4`.** Four rows of a 2D tensor at
+  one x (`{x, row0, row1, row2, row3}`, as CUTLASS issues them), one row-high
+  box each, packed one after another in shared memory.
 - **Swizzle atoms.** Tensor maps accept `CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B`
   and `_ATOM_64B` ("swizzle 32B/64B chunks within 128B span"), and
   `tensormap.replace` their atomicity field. The `_FLIP_8B` variant is refused.
@@ -110,7 +113,10 @@ before waiting for it is not caught here.
 `tcgen05.mma.sp` (sparse A), `.ws` (weight-stationary), block-scaled kinds
 (`.kind::mxf8f6f4`, `mxf4`, `mxf4nvf4`), the 4- and 6-bit types of
 `.kind::f8f6f4`, `.ashift`, `tcgen05.cp`, `tcgen05.shift`, `tcgen05.ld.red`
-(sm_103/sm_110), and the sm_107 additions (`kind::ti16`, `decompress::lut`).
+(sm_103/sm_110), the sm_107 additions (`kind::ti16`, `decompress::lut`), and
+TMA's `.im2col::w` modes: the ISA shows their halo walk only in figures that
+leave open where `::w::128`'s halos come from and whether a halo crosses into
+the next image, and nothing to check against (CUTLASS included) uses them.
 
 ## How it is checked
 
