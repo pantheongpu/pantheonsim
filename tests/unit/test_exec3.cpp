@@ -2598,6 +2598,44 @@ VTEST(smid_is_within_the_devices_multiprocessor_count) {
   }
 }
 
+// A grid larger than the device reuses SMs as blocks finish; the blocks
+// resident at once -- a cluster's, at least -- still have distinct %smid
+// values, since kernels index per-SM workspace by it.
+VTEST(smid_is_distinct_within_a_cluster_of_a_grid_larger_than_the_device) {
+  std::string ptx = std::string(kHeader90) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %smid;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  const uint32_t sms = e.prof.limits.multiprocessors, n = 4 * sms;
+  const uint64_t out = e.mem.alloc(n * 4);
+  LaunchConfig cfg;
+  cfg.grid = {n, 1, 1};
+  cfg.block = {32, 1, 1};
+  cfg.cluster = {4, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  std::vector<uint32_t> smid(n);
+  e.mem.read(out, smid.data(), n * 4);
+  for (uint32_t c = 0; c < n / 4; ++c)
+    for (uint32_t i = 0; i < 4; ++i) {
+      VCHECK(smid[4 * c + i] < sms);
+      for (uint32_t j = 0; j < i; ++j) VCHECK(smid[4 * c + i] != smid[4 * c + j]);
+    }
+}
+
 VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   // %dynamic_smem_size is the launch's dynamic bytes; %total_smem_size adds the
   // module's static declarations. Both are known exactly, so there is no reason

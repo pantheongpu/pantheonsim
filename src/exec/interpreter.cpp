@@ -942,6 +942,8 @@ class Interpreter {
   }
 
   void set_concurrent(bool v) { concurrent_ = v; }
+  // Which of the launch's host threads this is, for %smid.
+  void set_worker(unsigned t) { worker_ = t; }
   void set_device_launches(DeviceLaunches* dl) { dl_ = dl; }
   void set_grid_id(uint64_t v) { grid_id_ = v; }
 
@@ -1781,12 +1783,27 @@ class Interpreter {
       // and they need distinct values far more than they need the exact one
       // hardware would have chosen.
       case Sreg::SmId: {
+        // Distinct among the blocks resident at once, as a CTA's SM is on the
+        // hardware. A grid that fits the device is all resident there, so
+        // its linear order -- distinct across the whole grid, which a
+        // persistent kernel partitioning work by %smid relies on -- and a
+        // cooperative grid likewise. A larger grid reuses SMs as blocks
+        // finish, and kernels index per-SM workspace by %smid (CUTLASS's
+        // grouped GEMMs keep a tensor map per SM, and two resident CTAs that
+        // shared one wrote each other's groups): each host thread runs one
+        // cluster (or block) at a time, so thread t's rank-r block is SM
+        // t * cluster size + r, and the launch caps its threads so that fits.
         const uint32_t sms = profile_.limits.multiprocessors;
         if (!sms) return 0;
         const uint64_t linear = uint64_t{ctx.ctaid[0]} +
                                 uint64_t{ctx.ctaid[1]} * ctx.nctaid[0] +
                                 uint64_t{ctx.ctaid[2]} * ctx.nctaid[0] * ctx.nctaid[1];
-        return static_cast<uint32_t>(linear % sms);
+        const uint64_t blocks = uint64_t{ctx.nctaid[0]} * ctx.nctaid[1] * ctx.nctaid[2];
+        if (cfg_.cooperative || blocks <= sms) return static_cast<uint32_t>(linear % sms);
+        const auto c = cluster_shape();
+        const uint64_t size = uint64_t{c[0]} * c[1] * c[2];
+        const uint64_t rank = ctx.explicit_cluster ? cluster_rank_of(ctx) : 0;
+        return static_cast<uint32_t>((uint64_t{worker_} * size + rank) % sms);
       }
       case Sreg::NSmId: return profile_.limits.multiprocessors;
 
@@ -9810,6 +9827,7 @@ class Interpreter {
   // workers of one launch agree.
   uint64_t grid_id_ = 0;
   bool concurrent_ = false;   // set when the grid is split across threads
+  unsigned worker_ = 0;       // this interpreter's host thread, 0..threads-1
   std::chrono::steady_clock::time_point last_progress_;
 };
 
@@ -10151,7 +10169,13 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
     if (eff.cooperative || ordered || blocks <= 1) return 1u;
     std::set<const ptx::EntryFn*> seen;
     if (allocates_while_running(fn, seen)) return 1u;
-    return worker_count(blocks);
+    // No more threads than the device has SMs for their clusters, so the
+    // blocks resident at once can all have distinct %smid values.
+    uint64_t csize = 1;
+    for (int i = 0; i < 3; ++i) csize *= eff.cluster[i] ? eff.cluster[i] : 1;
+    const uint64_t sms = profile.limits.multiprocessors;
+    const unsigned cap = sms ? static_cast<unsigned>(std::max<uint64_t>(1, sms / csize)) : 1u;
+    return std::min(worker_count(blocks), cap);
   }();
 
   if (nthreads <= 1) {
@@ -10193,6 +10217,7 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
         Interpreter interp(fn, eff, pb, mem, profile, symbols, per_thread[t],
                            t == 0 ? progress : ProgressFn{});
         interp.set_concurrent(true);
+        interp.set_worker(t);
         interp.set_grid_id(grid_id);
         interp.set_device_launches(dl);
         for (;;) {
