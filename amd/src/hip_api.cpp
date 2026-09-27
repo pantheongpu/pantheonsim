@@ -2252,7 +2252,8 @@ struct Occupancy {
 
 hipError_t occupancy(const vgpu::DeviceProfile& p, const Kernel& k, int block, size_t dynamic_lds, bool potential,
                      Occupancy* out) {
-  const bool rdna3 = p.gcn_arch.rfind("gfx11", 0) == 0;
+  // RDNA3 and RDNA4 alike (gfx12's register file and wave limits are gfx11's).
+  const bool rdna3 = p.gcn_arch.rfind("gfx11", 0) == 0 || p.gcn_arch.rfind("gfx12", 0) == 0;
   if (p.gcn_arch.rfind("gfx9", 0) != 0 && !rdna3)
     return fail(hipErrorNotSupported, "occupancy is worked out for CDNA (gfx9) and RDNA3 (gfx11) here, and this device is " + p.gcn_arch);
   const int max_group = static_cast<int>(p.limits.max_threads_per_block);

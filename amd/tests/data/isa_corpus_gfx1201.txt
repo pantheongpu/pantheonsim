@@ -1,0 +1,1810 @@
+# gfx1201 instructions from ROCm's libraries: the encoding (little-endian 32-bit words)
+# and llvm-objdump's text for it. Written by amd/tools/isa-corpus.py.
+C405C07C 4080186C 00001088	buffer_load_b128 v[108:111], v136, s[12:15], null offen offset:16
+C405C07C 4080080A 00000001	buffer_load_b128 v[10:13], v1, s[4:7], null offen
+C405007C 40801002 00000002	buffer_load_b32 v2, v2, s[8:11], null offen
+C405407C 40801003 00000002	buffer_load_b64 v[3:4], v2, s[8:11], null offen
+C404807C 40802801 00000001	buffer_load_u16 v1, v1, s[20:23], null offen
+C404807C 40801057 00000244	buffer_load_u16 v87, v68, s[8:11], null offen offset:2
+C404007C 4080105A 00000101	buffer_load_u8 v90, v1, s[8:11], null offen offset:1
+C404007C 4080105B 00000002	buffer_load_u8 v91, v2, s[8:11], null offen
+C407407C 40801000 00000009	buffer_store_b128 v[0:3], v9, s[8:11], null offen
+C407407C 40800031 00002000	buffer_store_b128 v[49:52], v0, s[0:3], null offen offset:32
+C406407C 4080001A 00000200	buffer_store_b16 v26, v0, s[0:3], null offen offset:2
+C406407C 40803804 00000002	buffer_store_b16 v4, v2, s[28:31], null offen
+C406807C 4080187E 0000047F	buffer_store_b32 v126, v127, s[12:15], null offen offset:4
+C406807C 40800814 00000015	buffer_store_b32 v20, v21, s[4:7], null offen
+C406C07C 40802811 00001019	buffer_store_b64 v[17:18], v25, s[20:23], null offen offset:16
+C406C07C 40801001 00000000	buffer_store_b64 v[1:2], v0, s[8:11], null offen
+C406007C 40802819 00000000	buffer_store_b8 v25, v0, s[20:23], null offen
+C406007C 4080281A 00000121	buffer_store_b8 v26, v33, s[20:23], null offen offset:1
+C407007C 40800071 0000847F	buffer_store_b96 v[113:115], v127, s[0:3], null offen offset:132
+D8540004 00000703	ds_add_f32 v3, v7 offset:4
+D8540000 00000904	ds_add_f32 v4, v9
+D8000000 00000F11	ds_add_u32 v17, v15
+D8000100 00000102	ds_add_u32 v2, v1 offset:256
+D90043E8 00000203	ds_add_u64 v3, v[2:3] offset:17384
+D9000000 00000603	ds_add_u64 v3, v[6:7]
+DACC0014 02000506	ds_bpermute_b32 v2, v6, v5 offset:20
+DACC0000 15002A20	ds_bpermute_b32 v21, v32, v42
+D8C00000 01010203	ds_cmpstore_rtn_b32 v1, v3, v2, v1
+D8C00010 0B0B0A09	ds_cmpstore_rtn_b32 v11, v9, v10, v11 offset:16
+D9C00000 0C010C03	ds_cmpstore_rtn_b64 v[12:13], v3, v[12:13], v[1:2]
+D9C00008 0E050E07	ds_cmpstore_rtn_b64 v[14:15], v7, v[14:15], v[5:6] offset:8
+D8DC0302 0300005B	ds_load_2addr_b32 v[3:4], v91 offset0:2 offset1:3
+D8DC0100 0500000D	ds_load_2addr_b32 v[5:6], v13 offset1:1
+D9DC1000 55000028	ds_load_2addr_b64 v[85:88], v40 offset1:16
+D9DC2907 5900002E	ds_load_2addr_b64 v[89:92], v46 offset0:7 offset1:41
+D8E00302 10000005	ds_load_2addr_stride64_b32 v[16:17], v5 offset0:2 offset1:3
+D8E00100 01000001	ds_load_2addr_stride64_b32 v[1:2], v1 offset1:1
+D9E00302 6E000056	ds_load_2addr_stride64_b64 v[110:113], v86 offset0:2 offset1:3
+D9E00800 09000000	ds_load_2addr_stride64_b64 v[9:12], v0 offset1:8
+DBFC0000 55000015	ds_load_b128 v[85:88], v21
+DBFC0870 59000014	ds_load_b128 v[89:92], v20 offset:2160
+D8D80000 0E00000D	ds_load_b32 v14, v13
+D8D80200 0F000001	ds_load_b32 v15, v1 offset:512
+D9D82000 0D000000	ds_load_b64 v[13:14], v0 offset:8192
+D9D80000 11000029	ds_load_b64 v[17:18], v41
+DBF80000 15000016	ds_load_b96 v[21:23], v22
+DBF85760 05000008	ds_load_b96 v[5:7], v8 offset:22368
+D8EC57E6 01000001	ds_load_i16 v1, v1 offset:22502
+D8EC0000 01000008	ds_load_i16 v1, v8
+D8E456A0 01000001	ds_load_i8 v1, v1 offset:22176
+D8E40000 1000000E	ds_load_i8 v16, v14
+D8F057E4 01000026	ds_load_u16 v1, v38 offset:22500
+D8F00000 11000010	ds_load_u16 v17, v16
+DA9C0000 18000014	ds_load_u16_d16_hi v24, v20
+DA9C0020 1E000010	ds_load_u16_d16_hi v30, v16 offset:32
+D8E80004 7B000000	ds_load_u8 v123, v0 offset:4
+D8E80000 7F000000	ds_load_u8 v127, v0
+D9180708 00000612	ds_max_i64 v18, v[6:7] offset:1800
+D8200000 00000E05	ds_max_u32 v5, v14
+D8140800 0000010E	ds_min_i32 v14, v1 offset:2048
+D91C0800 00000115	ds_min_u64 v21, v[1:2] offset:2048
+D8381000 00020114	ds_store_2addr_b32 v20, v1, v2 offset1:16
+D8383020 00040314	ds_store_2addr_b32 v20, v3, v4 offset0:32 offset1:48
+D9380100 00392329	ds_store_2addr_b64 v41, v[35:36], v[57:58] offset1:1
+D9380302 003D3B29	ds_store_2addr_b64 v41, v[59:60], v[61:62] offset0:2 offset1:3
+D83C0100 0001020B	ds_store_2addr_stride64_b32 v11, v2, v1 offset1:1
+D83C0302 003C3B41	ds_store_2addr_stride64_b32 v65, v59, v60 offset0:2 offset1:3
+D93C0302 00121005	ds_store_2addr_stride64_b64 v5, v[16:17], v[18:19] offset0:2 offset1:3
+D93C0100 000E1405	ds_store_2addr_stride64_b64 v5, v[20:21], v[14:15] offset1:1
+DB7C0000 00002516	ds_store_b128 v22, v[37:40]
+DB7C0110 00002916	ds_store_b128 v22, v[41:44] offset:272
+D87C0020 00000A12	ds_store_b16 v18, v10 offset:32
+D87C0000 00000912	ds_store_b16 v18, v9
+DA840000 00000223	ds_store_b16_d16_hi v35, v2
+DA840080 00004305	ds_store_b16_d16_hi v5, v67 offset:128
+D8340200 0000040B	ds_store_b32 v11, v4 offset:512
+D8340000 0000040C	ds_store_b32 v12, v4
+D9345280 00000301	ds_store_b64 v1, v[3:4] offset:21120
+D9340000 00000002	ds_store_b64 v2, v[0:1]
+D8780000 00001133	ds_store_b8 v51, v17
+D8780010 00001233	ds_store_b8 v51, v18 offset:16
+DA800080 0000430D	ds_store_b8_d16_hi v13, v67 offset:128
+DB780020 00000D00	ds_store_b96 v0, v[13:15] offset:32
+D8D401E0 0B000007	ds_swizzle_b32 v11, v7 offset:swizzle(BROADCAST,32,15)
+EC15807C 05080000 00000008	flat_atomic_add_f32 v[8:9], v10 scope:SCOPE_DEV
+EC0D407C 25140003 00000001	flat_atomic_add_u32 v3, v[1:2], v74 th:TH_ATOMIC_RETURN scope:SCOPE_SE
+EC0D407C 03980005 00000005	flat_atomic_add_u32 v5, v[5:6], v7 th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EC0D407C 00880000 00000015	flat_atomic_add_u32 v[21:22], v1 scope:SCOPE_DEV
+EC10C07C 01840000 00000001	flat_atomic_add_u64 v[1:2], v[3:4] scope:SCOPE_SE
+EC0D007C 009C0005 00000003	flat_atomic_cmpswap_b32 v5, v[3:4], v[1:2] th:TH_ATOMIC_RETURN scope:SCOPE_SYS
+EC10807C 00180000 00000004	flat_atomic_cmpswap_b64 v[0:1], v[4:5], v[0:3] th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EC11C07C 03080000 00003816	flat_atomic_max_i64 v[22:23], v[6:7] offset:56 scope:SCOPE_DEV
+EC05C07C 0000000A 0000000E	flat_load_b128 v[10:13], v[14:15]
+EC05C07C 0010000A 00020022	flat_load_b128 v[10:13], v[34:35] offset:512 th:TH_LOAD_NT
+EC05C07C 00000003 00006007	flat_load_b128 v[3:6], v[7:8] offset:96
+EC05C07C 00100006 00000022	flat_load_b128 v[6:9], v[34:35] th:TH_LOAD_NT
+EC05007C 00000001 00000001	flat_load_b32 v1, v[1:2]
+EC05007C 000C0001 00000001	flat_load_b32 v1, v[1:2] scope:SCOPE_SYS
+EC05007C 0000000A 0002800C	flat_load_b32 v10, v[12:13] offset:640
+EC05007C 000C000F 00000411	flat_load_b32 v15, v[17:18] offset:4 scope:SCOPE_SYS
+EC05007C 00100005 00000001	flat_load_b32 v5, v[1:2] th:TH_LOAD_NT
+EC05007C 0010003C 00000410	flat_load_b32 v60, v[16:17] offset:4 th:TH_LOAD_NT
+EC05407C 0010000B 00010007	flat_load_b64 v[11:12], v[7:8] offset:256 th:TH_LOAD_NT
+EC05407C 00000001 00000001	flat_load_b64 v[1:2], v[1:2]
+EC05407C 00040001 00000001	flat_load_b64 v[1:2], v[1:2] scope:SCOPE_SE
+EC05407C 000C0003 00000003	flat_load_b64 v[3:4], v[3:4] scope:SCOPE_SYS
+EC05407C 00000005 00020003	flat_load_b64 v[5:6], v[3:4] offset:512
+EC05407C 00100009 00000007	flat_load_b64 v[9:10], v[7:8] th:TH_LOAD_NT
+EC05807C 0000000E 00003816	flat_load_b96 v[14:16], v[22:23] offset:56
+EC05807C 00000020 00000066	flat_load_b96 v[32:34], v[102:103]
+EC08007C 0000000B 00000E08	flat_load_d16_b16 v11, v[8:9] offset:14
+EC08007C 0000000E 00000000	flat_load_d16_b16 v14, v[0:1]
+EC08C07C 0000000E 00004000	flat_load_d16_hi_b16 v14, v[0:1] offset:64
+EC08C07C 0010001F FFFF8054	flat_load_d16_hi_b16 v31, v[84:85] offset:-128 th:TH_LOAD_NT
+EC08C07C 00100020 00000054	flat_load_d16_hi_b16 v32, v[84:85] th:TH_LOAD_NT
+EC04C07C 0000000E 0000000F	flat_load_i16 v14, v[15:16]
+EC04407C 00000028 00001024	flat_load_i8 v40, v[36:37] offset:16
+EC04407C 00000029 0000000A	flat_load_i8 v41, v[10:11]
+EC04807C 00000001 00000001	flat_load_u16 v1, v[1:2]
+EC04807C 0000000D 00000802	flat_load_u16 v13, v[2:3] offset:8
+EC04807C 0010001A 00004011	flat_load_u16 v26, v[17:18] offset:64 th:TH_LOAD_NT
+EC04807C 00100007 0000000F	flat_load_u16 v7, v[15:16] th:TH_LOAD_NT
+EC04007C 00000001 00000001	flat_load_u8 v1, v[1:2]
+EC04007C 00100013 0000000F	flat_load_u8 v19, v[15:16] th:TH_LOAD_NT
+EC04007C 00000002 00001D00	flat_load_u8 v2, v[0:1] offset:29
+EC04007C 0010001B 00002011	flat_load_u8 v27, v[17:18] offset:32 th:TH_LOAD_NT
+EC07407C 05100000 00020026	flat_store_b128 v[38:39], v[10:13] offset:512 th:TH_STORE_NT
+EC07407C 03100000 00000026	flat_store_b128 v[38:39], v[6:9] th:TH_STORE_NT
+EC07407C 07800000 00001035	flat_store_b128 v[53:54], v[15:18] offset:16
+EC07407C 05000000 00000056	flat_store_b128 v[86:87], v[10:13]
+EC06407C 0B100000 0000000F	flat_store_b16 v[15:16], v22 th:TH_STORE_NT
+EC06407C 0D100000 0000400F	flat_store_b16 v[15:16], v26 offset:64 th:TH_STORE_NT
+EC06407C 02000000 00000D01	flat_store_b16 v[1:2], v4 offset:13
+EC06407C 25800000 00000035	flat_store_b16 v[53:54], v75
+EC06807C 01800000 00000901	flat_store_b32 v[1:2], v3 offset:9
+EC06807C 03100000 00000001	flat_store_b32 v[1:2], v6 th:TH_STORE_NT
+EC06807C 00800000 00000003	flat_store_b32 v[3:4], v1
+EC06807C 1F8C0000 00000029	flat_store_b32 v[41:42], v63 scope:SCOPE_SYS
+EC06807C 16100000 00008007	flat_store_b32 v[7:8], v44 offset:128 th:TH_STORE_NT
+EC06C07C 04800000 0000000D	flat_store_b64 v[13:14], v[9:10]
+EC06C07C 05900000 0001000F	flat_store_b64 v[15:16], v[11:12] offset:256 th:TH_STORE_NT
+EC06C07C 04900000 0000000F	flat_store_b64 v[15:16], v[9:10] th:TH_STORE_NT
+EC06C07C 01800000 00001001	flat_store_b64 v[1:2], v[3:4] offset:16
+EC06C07C 018C0000 00000001	flat_store_b64 v[1:2], v[3:4] scope:SCOPE_SYS
+EC06C07C 040C0000 00000805	flat_store_b64 v[5:6], v[8:9] offset:8 scope:SCOPE_SYS
+EC06007C 0B100000 0000000F	flat_store_b8 v[15:16], v22 th:TH_STORE_NT
+EC06007C 0D900000 0000200F	flat_store_b8 v[15:16], v27 offset:32 th:TH_STORE_NT
+EC06007C 02800000 00000101	flat_store_b8 v[1:2], v5 offset:1
+EC06007C 25800000 00000001	flat_store_b8 v[1:2], v75
+EC07007C 09800000 0000084A	flat_store_b96 v[74:75], v[19:21] offset:8
+EC09407C 09100000 FFFFFE10	flat_store_d16_hi_b16 v[16:17], v18 offset:-2 th:TH_STORE_NT
+EC09407C 0C800000 00000010	flat_store_d16_hi_b16 v[16:17], v25
+EC09407C 08000000 00000214	flat_store_d16_hi_b16 v[20:21], v16 offset:2
+EC09407C 04100000 00000018	flat_store_d16_hi_b16 v[24:25], v8 th:TH_STORE_NT
+EC09007C 09100000 00000210	flat_store_d16_hi_b8 v[16:17], v18 offset:2 th:TH_STORE_NT
+EC09007C 02000000 00000F01	flat_store_d16_hi_b8 v[1:2], v4 offset:15
+EE15800A 01080000 00000001	global_atomic_add_f32 v1, v2, s[10:11] scope:SCOPE_DEV
+EE158002 00980001 00000C04	global_atomic_add_f32 v1, v4, v1, s[2:3] offset:12 th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EE15800A 03880000 00000406	global_atomic_add_f32 v6, v7, s[10:11] offset:4 scope:SCOPE_DEV
+EE15807C 01880000 00000400	global_atomic_add_f32 v[0:1], v3, off offset:4 scope:SCOPE_DEV
+EE15807C 04080000 00000006	global_atomic_add_f32 v[6:7], v8, off scope:SCOPE_DEV
+EE0D400A 00880000 00000000	global_atomic_add_u32 v0, v1, s[10:11] scope:SCOPE_DEV
+EE0D400E 01180001 00000001	global_atomic_add_u32 v1, v1, v2, s[14:15] th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EE0D407C 01980001 00000006	global_atomic_add_u32 v1, v[6:7], v3, off th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EE0D402C 05880000 00000402	global_atomic_add_u32 v2, v11, s[44:45] offset:4 scope:SCOPE_DEV
+EE0D407C 05880000 00000004	global_atomic_add_u32 v[4:5], v11, off scope:SCOPE_DEV
+EE0D407C 07080000 00000404	global_atomic_add_u32 v[4:5], v14, off offset:4 scope:SCOPE_DEV
+EE10C00E 00080000 00008007	global_atomic_add_u64 v7, v[0:1], s[14:15] offset:128 scope:SCOPE_DEV
+EE10C00E 00080000 00000007	global_atomic_add_u64 v7, v[0:1], s[14:15] scope:SCOPE_DEV
+EE10C07C 01180000 00000000	global_atomic_add_u64 v[0:1], v[0:1], v[2:3], off th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EE10C07C 020C0000 00000001	global_atomic_add_u64 v[1:2], v[4:5], off scope:SCOPE_SYS
+EE10C000 01180002 00000004	global_atomic_add_u64 v[2:3], v4, v[2:3], s[0:1] th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EE10C07C 03880000 00000005	global_atomic_add_u64 v[5:6], v[7:8], off scope:SCOPE_DEV
+EE0D0006 00180000 00000003	global_atomic_cmpswap_b32 v0, v3, v[0:1], s[6:7] th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EE0D007C 03980002 00000005	global_atomic_cmpswap_b32 v2, v[5:6], v[7:8], off th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EE0D000A 01180003 00000401	global_atomic_cmpswap_b32 v3, v1, v[2:3], s[10:11] offset:4 th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EE0D007C 08980007 FFFFFE04	global_atomic_cmpswap_b32 v7, v[4:5], v[17:18], off offset:-2 th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EE108002 05180000 00001806	global_atomic_cmpswap_b64 v[0:1], v6, v[10:13], s[2:3] offset:24 th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EE10807C 001C0000 0000000B	global_atomic_cmpswap_b64 v[0:1], v[11:12], v[0:3], off th:TH_ATOMIC_RETURN scope:SCOPE_SYS
+EE10807C 00180000 0000080D	global_atomic_cmpswap_b64 v[0:1], v[13:14], v[0:3], off offset:8 th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EE10807C 00180000 00000004	global_atomic_cmpswap_b64 v[0:1], v[4:5], v[0:3], off th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EE10800C 00980001 0000000B	global_atomic_cmpswap_b64 v[1:2], v11, v[1:4], s[12:13] th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+EE108002 009C0006 00001800	global_atomic_cmpswap_b64 v[6:7], v0, v[1:4], s[2:3] offset:24 th:TH_ATOMIC_RETURN scope:SCOPE_SYS
+EE0E8000 00880000 00000000	global_atomic_max_i32 v0, v1, s[0:1] scope:SCOPE_DEV
+EE148000 00080000 00000001	global_atomic_max_num_f32 v1, v0, s[0:1] scope:SCOPE_DEV
+EE120000 00080000 00000002	global_atomic_max_u64 v2, v[0:1], s[0:1] scope:SCOPE_DEV
+EE0E0010 00880000 00000000	global_atomic_min_i32 v0, v1, s[16:17] scope:SCOPE_DEV
+EE118006 00080000 00000002	global_atomic_min_u64 v2, v[0:1], s[6:7] scope:SCOPE_DEV
+EE0CC000 00880000 00000000	global_atomic_swap_b32 v0, v1, s[0:1] scope:SCOPE_DEV
+EE0F8024 01880000 00000001	global_atomic_xor_b32 v1, v3, s[36:37] scope:SCOPE_DEV
+EE0AC07C 00080000 00000000	global_inv scope:SCOPE_DEV
+EE0AC07C 00040000 00000000	global_inv scope:SCOPE_SE
+EE0AC07C 000C0000 00000000	global_inv scope:SCOPE_SYS
+EE05C002 00000000 00006005	global_load_b128 v[0:3], v5, s[2:3] offset:96
+EE05C07C 00000000 00000000	global_load_b128 v[0:3], v[0:1], off
+EE05C07C 00000010 FFFFE40D	global_load_b128 v[16:19], v[13:14], off offset:-28
+EE05C07C 00080001 00000001	global_load_b128 v[1:4], v[1:2], off scope:SCOPE_DEV
+EE05C034 00000004 0000000F	global_load_b128 v[4:7], v15, s[52:53]
+EE05C07C 00100005 00000007	global_load_b128 v[5:8], v[7:8], off th:TH_LOAD_NT
+EE050040 00000001 00000000	global_load_b32 v1, v0, s[64:65]
+EE05006A 00000001 00000011	global_load_b32 v1, v17, vcc
+EE05007C 0000000B 00000409	global_load_b32 v11, v[9:10], off offset:4
+EE050006 0000000D 00001004	global_load_b32 v13, v4, s[6:7] offset:16
+EE05007C 00000006 00000001	global_load_b32 v6, v[1:2], off
+EE05007C 00080006 00000008	global_load_b32 v6, v[8:9], off scope:SCOPE_DEV
+EE05407C 00000013 00000811	global_load_b64 v[19:20], v[17:18], off offset:8
+EE05407C 00000015 00000009	global_load_b64 v[21:22], v[9:10], off
+EE05406A 0000001A 00000006	global_load_b64 v[26:27], v6, vcc
+EE054004 00000003 00006801	global_load_b64 v[3:4], v1, s[4:5] offset:104
+EE054006 00080003 00000001	global_load_b64 v[3:4], v1, s[6:7] scope:SCOPE_DEV
+EE05401A 00000005 0000000D	global_load_b64 v[5:6], v13, s[26:27]
+EE05807C 0000000A 00000015	global_load_b96 v[10:12], v[21:22], off
+EE058000 00000001 00000004	global_load_b96 v[1:3], v4, s[0:1]
+EE058002 0000001D 00007021	global_load_b96 v[29:31], v33, s[2:3] offset:112
+EE05807C 00000021 00001414	global_load_b96 v[33:35], v[20:21], off offset:20
+EE08007C 00000001 00000003	global_load_d16_b16 v1, v[3:4], off
+EE08007C 0000000B 00000412	global_load_d16_b16 v11, v[18:19], off offset:4
+EE08000C 00000002 00000006	global_load_d16_b16 v2, v6, s[12:13]
+EE08000C 00000003 00040006	global_load_d16_b16 v3, v6, s[12:13] offset:1024
+EE08C008 00000001 00000004	global_load_d16_hi_b16 v1, v4, s[8:9]
+EE08C07C 00000001 00004003	global_load_d16_hi_b16 v1, v[3:4], off offset:64
+EE08C07C 0000000A 0000000B	global_load_d16_hi_b16 v10, v[11:12], off
+EE08C00C 00000002 00020006	global_load_d16_hi_b16 v2, v6, s[12:13] offset:512
+EE07807C 00000001 00000003	global_load_d16_u8 v1, v[3:4], off
+EE04C000 00000001 00000401	global_load_i16 v1, v1, s[0:1] offset:4
+EE04C006 00000001 00000002	global_load_i16 v1, v2, s[6:7]
+EE04C07C 00000002 00000000	global_load_i16 v2, v[0:1], off
+EE04407C 0000000B 0001000B	global_load_i8 v11, v[11:12], off offset:256
+EE044006 00100002 00000002	global_load_i8 v2, v2, s[6:7] th:TH_LOAD_NT
+EE04407C 00000014 0000000A	global_load_i8 v20, v[10:11], off
+EE04407C 00100003 00010004	global_load_i8 v3, v[4:5], off offset:256 th:TH_LOAD_NT
+EE04407C 00100004 00000007	global_load_i8 v4, v[7:8], off th:TH_LOAD_NT
+EE044000 00000009 00000001	global_load_i8 v9, v1, s[0:1]
+EE048018 00000001 FFFFFE0C	global_load_u16 v1, v12, s[24:25] offset:-2
+EE048006 00080002 00000001	global_load_u16 v2, v1, s[6:7] scope:SCOPE_DEV
+EE04807C 00000021 00002008	global_load_u16 v33, v[8:9], off offset:32
+EE04807C 00080024 00000008	global_load_u16 v36, v[8:9], off scope:SCOPE_DEV
+EE04807C 00000004 00000004	global_load_u16 v4, v[4:5], off
+EE048002 00000009 00000000	global_load_u16 v9, v0, s[2:3]
+EE040004 00080001 00000001	global_load_u8 v1, v1, s[4:5] scope:SCOPE_DEV
+EE040002 00000002 00000001	global_load_u8 v2, v1, s[2:3]
+EE04007C 00000002 00000002	global_load_u8 v2, v[2:3], off
+EE040002 00000004 00000101	global_load_u8 v4, v1, s[2:3] offset:1
+EE04007C 00080033 0000001B	global_load_u8 v51, v[27:28], off scope:SCOPE_DEV
+EE04007C 00000006 00002001	global_load_u8 v6, v[1:2], off offset:32
+EE074006 00000000 FFFFF800	global_store_b128 v0, v[0:3], s[6:7] offset:-8
+EE074002 00100000 00000004	global_store_b128 v4, v[0:3], s[2:3] th:TH_STORE_NT
+EE07402A 00000000 00000004	global_store_b128 v4, v[0:3], s[42:43]
+EE07407C 01000000 FFFFE41D	global_store_b128 v[29:30], v[2:5], off offset:-28
+EE07407C 00880000 00000005	global_store_b128 v[5:6], v[1:4], off scope:SCOPE_DEV
+EE07407C 00000000 00000006	global_store_b128 v[6:7], v[0:3], off
+EE064002 05800000 FFFFFE0C	global_store_b16 v12, v11, s[2:3] offset:-2
+EE06400E 00880000 00004002	global_store_b16 v2, v1, s[14:15] offset:64 scope:SCOPE_DEV
+EE064006 02800000 00000002	global_store_b16 v2, v5, s[6:7]
+EE064006 03880000 00000009	global_store_b16 v9, v7, s[6:7] scope:SCOPE_DEV
+EE06407C 02000000 00000005	global_store_b16 v[5:6], v4, off
+EE06407C 05800000 00002008	global_store_b16 v[8:9], v11, off offset:32
+EE068000 00800000 00000000	global_store_b32 v0, v1, s[0:1]
+EE068018 02800000 00000403	global_store_b32 v3, v5, s[24:25] offset:4
+EE06806A 09000000 00000007	global_store_b32 v7, v18, vcc
+EE06807C 01000000 00000003	global_store_b32 v[3:4], v2, off
+EE06807C 03080000 00000004	global_store_b32 v[4:5], v6, off scope:SCOPE_DEV
+EE06807C 05800000 00000409	global_store_b32 v[9:10], v11, off offset:4
+EE06C06A 03000000 00000001	global_store_b64 v1, v[6:7], vcc
+EE06C000 00000000 00000002	global_store_b64 v2, v[0:1], s[0:1]
+EE06C006 01800000 FFFFFC03	global_store_b64 v3, v[3:4], s[6:7] offset:-4
+EE06C004 02880000 00000008	global_store_b64 v8, v[5:6], s[4:5] scope:SCOPE_DEV
+EE06C07C 09800000 00000811	global_store_b64 v[17:18], v[19:20], off offset:8
+EE06C07C 00000000 00000004	global_store_b64 v[4:5], v[0:1], off
+EE060002 01000000 00000001	global_store_b8 v1, v2, s[2:3]
+EE060002 01000000 00000101	global_store_b8 v1, v2, s[2:3] offset:1
+EE060010 0C880000 0000001B	global_store_b8 v27, v25, s[16:17] scope:SCOPE_DEV
+EE060010 03080000 00002005	global_store_b8 v5, v6, s[16:17] offset:32 scope:SCOPE_DEV
+EE06007C 01000000 00000000	global_store_b8 v[0:1], v2, off
+EE06007C 02000000 00010000	global_store_b8 v[0:1], v4, off offset:256
+EE070000 00800000 00000000	global_store_b96 v0, v[1:3], s[0:1]
+EE07007C 00800000 00000004	global_store_b96 v[4:5], v[1:3], off
+EE07007C 00800000 00000405	global_store_b96 v[5:6], v[1:3], off offset:4
+EE094004 00000000 00000201	global_store_d16_hi_b16 v1, v0, s[4:5] offset:2
+EE094006 03000000 00000002	global_store_d16_hi_b16 v2, v6, s[6:7]
+EE09407C 02000000 00000001	global_store_d16_hi_b16 v[1:2], v4, off
+EE09407C 03800000 00000204	global_store_d16_hi_b16 v[4:5], v7, off offset:2
+EE090004 04800000 0000020A	global_store_d16_hi_b8 v10, v9, s[4:5] offset:2
+EE090004 03000000 00000004	global_store_d16_hi_b8 v4, v6, s[4:5]
+EE09007C 01000000 00000000	global_store_d16_hi_b8 v[0:1], v2, off
+EE09007C 03800000 00020000	global_store_d16_hi_b8 v[0:1], v7, off offset:512
+EE0B007C 000C0000 00000000	global_wb scope:SCOPE_SYS
+BE841505	s_abs_i32 s4, s5
+BE871575	s_abs_i32 s7, ttmp9
+BEEB1501	s_abs_i32 vcc_hi, s1
+8265806A	s_add_co_ci_u32 s101, vcc_lo, 0
+82028003	s_add_co_ci_u32 s2, s3, 0
+82158080	s_add_co_ci_u32 s21, 0, 0
+82160D13	s_add_co_ci_u32 s22, s19, s13
+8236036B	s_add_co_ci_u32 s54, vcc_hi, s3
+81010102	s_add_co_i32 s1, s2, s1
+810AC175	s_add_co_i32 s10, ttmp9, -1
+8127C127	s_add_co_i32 s39, s39, -1
+81636B63	s_add_co_i32 s99, s99, vcc_hi
+816B816B	s_add_co_i32 vcc_hi, vcc_hi, 1
+816B436B	s_add_co_i32 vcc_hi, vcc_hi, s67
+8000FF00 FFFFC55C	s_add_co_u32 s0, s0, 0xffffc55c
+800C6A0C	s_add_co_u32 s12, s12, vcc_lo
+80121612	s_add_co_u32 s18, s18, s22
+8005056A	s_add_co_u32 s5, vcc_lo, s5
+A483F202	s_add_f16 s3, s2, 1.0
+A0020E02	s_add_f32 s2, s2, s14
+A0038003	s_add_f32 s3, s3, 0
+A9800008	s_add_nc_u64 s[0:1], s[8:9], s[0:1]
+A992810E	s_add_nc_u64 s[18:19], s[14:15], 1
+A9CC4C6A	s_add_nc_u64 s[76:77], vcc, s[76:77]
+A9EA4C18	s_add_nc_u64 vcc, s[24:25], s[76:77]
+A9EA6A28	s_add_nc_u64 vcc, s[40:41], vcc
+A9EA666A	s_add_nc_u64 vcc, vcc, s[102:103]
+B790C000	s_addk_co_i32 s16, 0xc000
+8B000304	s_and_b32 s0, s4, s3
+8B15FF05 0000FFFF	s_and_b32 s21, s5, 0xffff
+8B03036A	s_and_b32 s3, vcc_lo, s3
+8B6A0102	s_and_b32 vcc_lo, s2, s1
+8B6A6A02	s_and_b32 vcc_lo, s2, vcc_lo
+8B6A006A	s_and_b32 vcc_lo, vcc_lo, s0
+917E127E	s_and_not1_b32 exec_lo, exec_lo, s18
+917E6B7E	s_and_not1_b32 exec_lo, exec_lo, vcc_hi
+91019F01	s_and_not1_b32 s1, s1, 31
+910E7E0E	s_and_not1_b32 s14, s14, exec_lo
+91092B09	s_and_not1_b32 s9, s9, s43
+916A1B7E	s_and_not1_b32 vcc_lo, exec_lo, s27
+918C100C	s_and_not1_b64 s[12:13], s[12:13], s[16:17]
+BE80306B	s_and_not1_saveexec_b32 s0, vcc_hi
+BE843004	s_and_not1_saveexec_b32 s4, s4
+BE84306A	s_and_not1_saveexec_b32 s4, vcc_lo
+BEEB3000	s_and_not1_saveexec_b32 vcc_hi, s0
+BEEB306B	s_and_not1_saveexec_b32 vcc_hi, vcc_hi
+BEEA306A	s_and_not1_saveexec_b32 vcc_lo, vcc_lo
+BE92206B	s_and_saveexec_b32 s18, vcc_hi
+BE9D2002	s_and_saveexec_b32 s29, s2
+BE83206A	s_and_saveexec_b32 s3, vcc_lo
+BEEB2026	s_and_saveexec_b32 vcc_hi, s38
+BEEB206A	s_and_saveexec_b32 vcc_hi, vcc_lo
+BEEA206A	s_and_saveexec_b32 vcc_lo, vcc_lo
+860F9F73	s_ashr_i32 s15, ttmp7, 31
+860F9F75	s_ashr_i32 s15, ttmp9, 31
+86139F6B	s_ashr_i32 s19, vcc_hi, 31
+86039F03	s_ashr_i32 s3, s3, 31
+866B9F6A	s_ashr_i32 vcc_hi, vcc_lo, 31
+866A9F55	s_ashr_i32 vcc_lo, s85, 31
+868C8C0C	s_ashr_i64 s[12:13], s[12:13], 12
+BE804EC1	s_barrier_signal -1
+BF94FFFF	s_barrier_wait 0xffff
+BE921812	s_bcnt1_i32_b32 s18, s18
+BE84186A	s_bcnt1_i32_b32 s4, vcc_lo
+BE8A1902	s_bcnt1_i32_b64 s10, s[2:3]
+938CFF38 0001001E	s_bfe_i32 s12, s56, 0x1001e
+9482FF04 00100000	s_bfe_i64 s[2:3], s[4:5], 0x100000
+930AFF75 001D0002	s_bfe_u32 s10, ttmp9, 0x1d0002
+930DFF09 00020009	s_bfe_u32 s13, s9, 0x20009
+953A8014	s_bfm_b32 s58, s20, 0
+BF0C8002	s_bitcmp0_b32 s2, 0
+BF0D8001	s_bitcmp1_b32 s1, 0
+BE99109F	s_bitset0_b32 s25, 31
+BEB31287	s_bitset1_b32 s51, 7
+BE8F0481	s_brev_b32 s15, 1
+BE836003	s_ceil_f32 s3, s3
+BF850001	s_clause 0x1
+BE810C05	s_cls_i32 s1, s5
+BE800A80	s_clz_i32_u32 s0, 0
+BE860A06	s_clz_i32_u32 s6, s6
+BE880B08	s_clz_i32_u64 s8, s[8:9]
+BF528001	s_cmp_eq_f16 s1, 0
+BF42F20E	s_cmp_eq_f32 s14, 1.0
+BF060310	s_cmp_eq_u32 s16, s3
+BF068027	s_cmp_eq_u32 s39, 0
+BF067536	s_cmp_eq_u32 s54, ttmp9
+BF068073	s_cmp_eq_u32 ttmp7, 0
+BF060A75	s_cmp_eq_u32 ttmp9, s10
+BF06806B	s_cmp_eq_u32 vcc_hi, 0
+BF100C00	s_cmp_eq_u64 s[0:1], s[12:13]
+BF108004	s_cmp_eq_u64 s[4:5], 0
+BF461716	s_cmp_ge_f32 s22, s23
+BF030908	s_cmp_ge_i32 s8, s9
+BF030D73	s_cmp_ge_i32 ttmp7, s13
+BF030375	s_cmp_ge_i32 ttmp9, s3
+BF090407	s_cmp_ge_u32 s7, s4
+BF091375	s_cmp_ge_u32 ttmp9, s19
+BF548015	s_cmp_gt_f16 s21, 0
+BF44802A	s_cmp_gt_f32 s42, 0
+BF442A2B	s_cmp_gt_f32 s43, s42
+BF02800A	s_cmp_gt_i32 s10, 0
+BF02490C	s_cmp_gt_i32 s12, s73
+BF02C175	s_cmp_gt_i32 ttmp9, -1
+BF088F0B	s_cmp_gt_u32 s11, 15
+BF08010C	s_cmp_gt_u32 s12, s1
+BF531011	s_cmp_le_f16 s17, s16
+BF430300	s_cmp_le_f32 s0, s3
+BF43800F	s_cmp_le_f32 s15, 0
+BF05151B	s_cmp_le_i32 s27, s21
+BF0B100E	s_cmp_le_u32 s14, s16
+BF07800A	s_cmp_lg_u32 s10, 0
+BF070702	s_cmp_lg_u32 s2, s7
+BF078075	s_cmp_lg_u32 ttmp9, 0
+BF073475	s_cmp_lg_u32 ttmp9, s52
+BF07806A	s_cmp_lg_u32 vcc_lo, 0
+BF077E6A	s_cmp_lg_u32 vcc_lo, exec_lo
+BF11800C	s_cmp_lg_u64 s[12:13], 0
+BF11262A	s_cmp_lg_u64 s[42:43], s[38:39]
+BF518009	s_cmp_lt_f16 s9, 0
+BF41801E	s_cmp_lt_f32 s30, 0
+BF411607	s_cmp_lt_f32 s7, s22
+BF04810A	s_cmp_lt_i32 s10, 1
+BF040D03	s_cmp_lt_i32 s3, s13
+BF048575	s_cmp_lt_i32 ttmp9, 5
+BF041375	s_cmp_lt_i32 ttmp9, s19
+BF0A0802	s_cmp_lt_u32 s2, s8
+BF0A9003	s_cmp_lt_u32 s3, 16
+BF0A0973	s_cmp_lt_u32 ttmp7, s9
+BF0A0075	s_cmp_lt_u32 ttmp9, s0
+BF5D8002	s_cmp_neq_f16 s2, 0
+BF4D800E	s_cmp_neq_f32 s14, 0
+BF49803A	s_cmp_nge_f32 s58, 0
+BF490506	s_cmp_nge_f32 s6, s5
+BF4B8010	s_cmp_ngt_f32 s16, 0
+BF4B403F	s_cmp_ngt_f32 s63, s64
+BF4C800C	s_cmp_nle_f32 s12, 0
+BF4C0D04	s_cmp_nle_f32 s4, s13
+BF5EFF0C 0000BC00	s_cmp_nlt_f16 s12, 0xbc00
+BF4E3403	s_cmp_nlt_f32 s3, s52
+BF4E8006	s_cmp_nlt_f32 s6, 0
+BF570909	s_cmp_o_f16 s9, s9
+BF470E0E	s_cmp_o_f32 s14, s14
+BF580C0C	s_cmp_u_f16 s12, s12
+BF480B0B	s_cmp_u_f32 s11, s11
+BF9F0000	s_code_end
+98020208	s_cselect_b32 s2, s8, s2
+981B80C1	s_cselect_b32 s27, -1, 0
+98038003	s_cselect_b32 s3, s3, 0
+98090980	s_cselect_b32 s9, 0, s9
+986B80C1	s_cselect_b32 vcc_hi, -1, 0
+986A80C1	s_cselect_b32 vcc_lo, -1, 0
+BEAB0809	s_ctz_i32_b32 s43, s9
+BEAB086A	s_ctz_i32_b32 s43, vcc_lo
+BE800912	s_ctz_i32_b64 s0, s[18:19]
+BE806800	s_cvt_f16_f32 s0, s0
+BEEB6868	s_cvt_f16_f32 vcc_hi, s104
+BE91690D	s_cvt_f32_f16 s17, s13
+BE826403	s_cvt_f32_i32 s2, s3
+BE826504	s_cvt_f32_u32 s2, s4
+BE89656B	s_cvt_f32_u32 s9, vcc_hi
+BE866A03	s_cvt_hi_f32_f16 s6, s3
+BE886602	s_cvt_i32_f32 s8, s2
+BE826702	s_cvt_u32_f32 s2, s2
+BF870085	s_delay_alu instid0(TRANS32_DEP_1) | instid1(VALU_DEP_1)
+BF870001	s_delay_alu instid0(VALU_DEP_1)
+BF8700C1	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_3) | instid1(VALU_DEP_1)
+BF870112	s_delay_alu instid0(VALU_DEP_2) | instskip(NEXT) | instid1(VALU_DEP_2)
+BFB00000	s_endpgm
+BE866110	s_floor_f32 s6, s16
+A28C0C0C 3F800000	s_fmaak_f32 s12, s12, s12, 0x3f800000
+A3AE302D	s_fmac_f32 s46, s45, s48
+A30D0D0E 4F800000	s_fmamk_f32 s13, s14, 0x4f800000, s13
+A3030380 4F800000	s_fmamk_f32 s3, 0, 0x4f800000, s3
+BE804700	s_getpc_b64 s[0:1]
+B882F81E	s_getreg_b32 s2, hwreg(HW_REG_SHADER_CYCLES_HI)
+B884F81D	s_getreg_b32 s4, hwreg(HW_REG_SHADER_CYCLES_LO)
+BFBC0000	s_icache_inv
+F4004402 00000000	s_load_b128 s[16:19], s[4:5], s0 offset:0x0
+F4004435 F8000024	s_load_b128 s[16:19], vcc, 0x24
+F4004100 F80001E8	s_load_b128 s[4:7], s[0:1], 0x1e8
+F4006935 F8000004	s_load_b256 s[36:43], vcc, 0x4
+F4006100 F80001C8	s_load_b256 s[4:11], s[0:1], 0x1c8
+F4000300 F8000050	s_load_b32 s12, s[0:1], 0x50
+F4000506 04000000	s_load_b32 s20, s[12:13], s2 offset:0x0
+F4001AC0 F800006C	s_load_b32 vcc_hi, s[0:1], 0x6c
+F4001A80 F8000288	s_load_b32 vcc_lo, s[0:1], 0x288
+F4008100 F8000020	s_load_b512 s[4:19], s[0:1], 0x20
+F4002080 F8000008	s_load_b64 s[2:3], s[0:1], 0x8
+F4002081 10000000	s_load_b64 s[2:3], s[2:3], s8 offset:0x0
+F4003A97 F8000068	s_load_b64 vcc, s[46:47], 0x68
+F400A011 000000C8	s_load_b96 s[0:2], s[34:35], s0 offset:0xc8
+F400A300 F8000080	s_load_b96 s[12:14], s[0:1], 0x80
+F4014280 F8000008	s_load_i16 s10, s[0:1], 0x8
+F4010BD8 F8000000	s_load_i8 s47, s[48:49], 0x0
+F4016044 02000000	s_load_u16 s1, s[8:9], s1 offset:0x0
+F4016080 F80001C2	s_load_u16 s2, s[0:1], 0x1c2
+F4012284 F8000000	s_load_u8 s10, s[8:9], 0x0
+F4012200 EA0006E0	s_load_u8 s8, s[0:1], ttmp9 offset:0x6e0
+847D8116	s_lshl_b32 m0, s22, 1
+8416810C	s_lshl_b32 s22, s12, 1
+842B2B81	s_lshl_b32 s43, 1, s43
+844A4A38	s_lshl_b32 s74, s56, s74
+84098875	s_lshl_b32 s9, ttmp9, 8
+846B8356	s_lshl_b32 vcc_hi, s86, 3
+84808202	s_lshl_b64 s[0:1], s[2:3], 2
+84800704	s_lshl_b64 s[0:1], s[4:5], s7
+84862583	s_lshl_b64 s[6:7], 3, s37
+84EA822C	s_lshl_b64 vcc, s[44:45], 2
+84EA826A	s_lshl_b64 vcc, vcc, 2
+8500906A	s_lshr_b32 s0, vcc_lo, 16
+850D0EFF 00000400	s_lshr_b32 s13, 0x400, s14
+8502030A	s_lshr_b32 s2, s10, s3
+85028602	s_lshr_b32 s2, s2, 6
+85029073	s_lshr_b32 s2, ttmp7, 16
+856B8847	s_lshr_b32 vcc_hi, s71, 8
+859A811C	s_lshr_b64 s[26:27], s[28:29], 1
+8A0C1707	s_max_i32 s12, s7, s23
+8A02BF0D	s_max_i32 s2, s13, 63
+A182F202	s_max_num_f32 s2, s2, 1.0
+8A863406	s_max_u32 s6, s6, s52
+8A898103	s_max_u32 s9, s3, 1
+890C100C	s_min_i32 s12, s12, s16
+891C8419	s_min_i32 s28, s25, 4
+898D1118	s_min_u32 s13, s24, s17
+899E9002	s_min_u32 s30, s2, 16
+BE82007E	s_mov_b32 s2, exec_lo
+BE940004	s_mov_b32 s20, s4
+BE9700FF 31004000	s_mov_b32 s23, 0x31004000
+BEEB0080	s_mov_b32 vcc_hi, 0
+BEEB003A	s_mov_b32 vcc_hi, s58
+BEEA0000	s_mov_b32 vcc_lo, s0
+BE8A01EB	s_mov_b64 s[10:11], src_shared_base
+BE8C0106	s_mov_b64 s[12:13], s[6:7]
+BE880180	s_mov_b64 s[8:9], 0
+BEE001ED	s_mov_b64 s[96:97], src_private_base
+BEEA011A	s_mov_b64 vcc, s[26:27]
+B0040100	s_movk_i32 s4, 0x100
+B06B0091	s_movk_i32 vcc_hi, 0x91
+A68DF009	s_mul_f16 s13, s9, 0.5
+A202FF02 4F7FFFFE	s_mul_f32 s2, s2, 0x4f7ffffe
+A2092D30	s_mul_f32 s9, s48, s45
+971BFF14 92492493	s_mul_hi_i32 s27, s20, 0x92492493
+96800075	s_mul_hi_u32 s0, ttmp9, s0
+96830302	s_mul_hi_u32 s3, s2, s3
+9688C108	s_mul_hi_u32 s8, s8, -1
+96EB6700	s_mul_hi_u32 vcc_hi, s0, s103
+96EA6501	s_mul_hi_u32 vcc_lo, s1, s101
+96011C75	s_mul_i32 s1, ttmp9, s28
+96030206	s_mul_i32 s3, s6, s2
+963AFF03 FFFFD000	s_mul_i32 s58, s3, 0xffffd000
+96067510	s_mul_i32 s6, s16, ttmp9
+9653316B	s_mul_i32 s83, vcc_hi, s49
+966B0E37	s_mul_i32 vcc_hi, s55, s14
+AA8AFF08 00000548	s_mul_u64 s[10:11], s[8:9], 0x548
+AA840204	s_mul_u64 s[4:5], s[4:5], s[2:3]
+AAEA162A	s_mul_u64 vcc, s[42:43], s[22:23]
+B8330060	s_mulk_i32 s51, 0x60
+BF800000	s_nop 0
+BEAA1E75	s_not_b32 s42, ttmp9
+BE871E06	s_not_b32 s7, s6
+BE9C1F18	s_not_b64 s[28:29], s[24:25]
+8C7E037E	s_or_b32 exec_lo, exec_lo, s3
+8C0A6A0A	s_or_b32 s10, s10, vcc_lo
+8C11080A	s_or_b32 s17, s10, s8
+8C12126A	s_or_b32 s18, vcc_lo, s18
+8C138513	s_or_b32 s19, s19, 5
+8C227E22	s_or_b32 s34, s34, exec_lo
+8C820804	s_or_b64 s[2:3], s[4:5], s[8:9]
+92317E6A	s_or_not1_b32 s49, vcc_lo, exec_lo
+92057E22	s_or_not1_b32 s5, s34, exec_lo
+926B7E06	s_or_not1_b32 vcc_hi, s6, exec_lo
+926B7E6A	s_or_not1_b32 vcc_hi, vcc_lo, exec_lo
+926A7E59	s_or_not1_b32 vcc_lo, s89, exec_lo
+BE8022C1	s_or_saveexec_b32 s0, -1
+BE80226B	s_or_saveexec_b32 s0, vcc_hi
+BE87220A	s_or_saveexec_b32 s7, s10
+BEEB226B	s_or_saveexec_b32 vcc_hi, vcc_hi
+BEEA2200	s_or_saveexec_b32 vcc_lo, s0
+9A8C0D0D	s_pack_hl_b32_b16 s12, s13, s13
+99820280	s_pack_lh_b32_b16 s2, 0, s2
+99130D0D	s_pack_ll_b32_b16 s19, s13, s13
+99151481	s_pack_ll_b32_b16 s21, 1, s20
+991C802A	s_pack_ll_b32_b16 s28, s42, 0
+BE8163FF 7FC00000	s_rndne_f32 s1, 0x7fc00000
+BFB60003	s_sendmsg sendmsg(MSG_DEALLOC_VGPRS)
+BFB60001	s_sendmsg sendmsg(MSG_INTERRUPT)
+BE864D83	s_sendmsg_rtn_b64 s[6:7], sendmsg(MSG_RTN_GET_REALTIME)
+BE80481E	s_setpc_b64 s[30:31]
+BE810F04	s_sext_i32_i16 s1, s4
+BE8D0E0C	s_sext_i32_i8 s13, s12
+BF830020	s_sleep 32
+82908010	s_sub_co_ci_u32 s16, s16, 0
+82900310	s_sub_co_ci_u32 s16, s16, s3
+82931380	s_sub_co_ci_u32 s19, 0, s19
+8180C000	s_sub_co_i32 s0, s0, 64
+81820275	s_sub_co_i32 s2, ttmp9, s2
+8183030D	s_sub_co_i32 s3, s13, s3
+81A80080	s_sub_co_i32 s40, 0, s0
+81B37561	s_sub_co_i32 s51, s97, ttmp9
+81EB3A80	s_sub_co_i32 vcc_hi, 0, s58
+A0AD3603	s_sub_f32 s45, s3, s54
+A0850EF2	s_sub_f32 s5, 1.0, s14
+AA00000E	s_sub_nc_u64 s[0:1], s[14:15], s[0:1]
+AA100280	s_sub_nc_u64 s[16:17], 0, s[2:3]
+BE9E4900	s_swappc_b64 s[30:31], s[0:1]
+BF900002	s_trap 2
+BE8E620E	s_trunc_f32 s14, s14
+BF88FFFE	s_wait_alu 0xfffe
+BFC30000	s_wait_bvhcnt 0x0
+BFC60000	s_wait_dscnt 0x0
+BFC40000	s_wait_expcnt 0x0
+BFC70000	s_wait_kmcnt 0x0
+BFC00000	s_wait_loadcnt 0x0
+BFC80002	s_wait_loadcnt_dscnt 0x2
+BFC20000	s_wait_samplecnt 0x0
+BFC10000	s_wait_storecnt 0x0
+BFC90000	s_wait_storecnt_dscnt 0x0
+BF8903F7	s_waitcnt vmcnt(0)
+BF890007	s_waitcnt vmcnt(0) lgkmcnt(0)
+BFB40000	s_wakeup
+8D7E077E	s_xor_b32 exec_lo, exec_lo, s7
+8D0EC17E	s_xor_b32 s14, exec_lo, -1
+8D02C10E	s_xor_b32 s2, s14, -1
+8D020302	s_xor_b32 s2, s2, s3
+8D030575	s_xor_b32 s3, ttmp9, s5
+8D040B7E	s_xor_b32 s4, exec_lo, s11
+8D8E0C0E	s_xor_b64 s[14:15], s[14:15], s[12:13]
+BE8024C1	s_xor_saveexec_b32 s0, -1
+ED05C07C 00000000 00000000	scratch_load_b128 v[0:3], off, off
+ED05C07C 00000089 0000A000	scratch_load_b128 v[137:140], off, off offset:160
+ED05C07C 003000C7 00003800	scratch_load_b128 v[199:202], off, off offset:56 th:TH_LOAD_LU
+ED05C036 00000001 00000000	scratch_load_b128 v[1:4], off, s54
+ED05C07C 003000FC 00000000	scratch_load_b128 v[252:255], off, off th:TH_LOAD_LU
+ED05C020 00000003 00002000	scratch_load_b128 v[3:6], off, s32 offset:32
+ED05007C 00000000 00000000	scratch_load_b32 v0, off, off
+ED05007C 00000000 0000D000	scratch_load_b32 v0, off, off offset:208
+ED05007C 0030009B 00000000	scratch_load_b32 v155, off, off th:TH_LOAD_LU
+ED05007C 003000C5 0000C400	scratch_load_b32 v197, off, off offset:196 th:TH_LOAD_LU
+ED050020 00000028 00000000	scratch_load_b32 v40, off, s32
+ED05002C 00020008 00000008	scratch_load_b32 v8, v8, s44
+ED054020 00000000 00000000	scratch_load_b64 v[0:1], off, s32
+ED05407C 00300091 00000000	scratch_load_b64 v[145:146], off, off th:TH_LOAD_LU
+ED05407C 003000E8 00008000	scratch_load_b64 v[232:233], off, off offset:128 th:TH_LOAD_LU
+ED054020 00000003 00004400	scratch_load_b64 v[3:4], off, s32 offset:68
+ED05407C 00000005 00000000	scratch_load_b64 v[5:6], off, off
+ED05407C 00000005 00003000	scratch_load_b64 v[5:6], off, off offset:48
+ED05807C 00000014 00005000	scratch_load_b96 v[20:22], off, off offset:80
+ED05807C 00020014 FFFF5811	scratch_load_b96 v[20:22], v17, off offset:-168
+ED058005 00000015 00000400	scratch_load_b96 v[21:23], off, s5 offset:4
+ED058007 0002001A 00000413	scratch_load_b96 v[26:28], v19, s7 offset:4
+ED05807C 00020009 00000006	scratch_load_b96 v[9:11], v6, off
+ED04807C 0000000E 0000C000	scratch_load_u16 v14, off, off offset:192
+ED04807C 00020008 00000001	scratch_load_u16 v8, v1, off
+ED040011 0000000D 00000000	scratch_load_u8 v13, off, s17
+ED04007C 00020011 0000000C	scratch_load_u8 v17, v12, off
+ED04000B 00020013 0000000C	scratch_load_u8 v19, v12, s11
+ED04007C 00000014 00000000	scratch_load_u8 v20, off, off
+ED040021 000000E1 00000400	scratch_load_u8 v225, off, s33 offset:4
+ED04007C 00000005 00002000	scratch_load_u8 v5, off, off offset:32
+ED07407C 0C800000 00000000	scratch_store_b128 off, v[25:28], off
+ED074020 01800000 00004800	scratch_store_b128 off, v[3:6], s32 offset:72
+ED074020 03800000 00000000	scratch_store_b128 off, v[7:10], s32
+ED07407C 04800000 00003800	scratch_store_b128 off, v[9:12], off offset:56
+ED07407C 02820000 0000000B	scratch_store_b128 v11, v[5:8], off
+ED07407C 00820000 FFFFF009	scratch_store_b128 v9, v[1:4], off offset:-16
+ED06407C 07000000 0000C000	scratch_store_b16 off, v14, off offset:192
+ED06407C 07800000 00000000	scratch_store_b16 off, v15, off
+ED064021 02000000 00002000	scratch_store_b16 off, v4, s33 offset:32
+ED06807C 4D800000 00000000	scratch_store_b32 off, v155, off
+ED068020 14000000 00000000	scratch_store_b32 off, v40, s32
+ED068021 14800000 00000400	scratch_store_b32 off, v41, s33 offset:4
+ED06807C 03800000 00010C00	scratch_store_b32 off, v7, off offset:268
+ED06807C 01820000 FFFFFC01	scratch_store_b32 v1, v3, off offset:-4
+ED06807C 01820000 00000002	scratch_store_b32 v2, v3, off
+ED06C07C 00000000 00000000	scratch_store_b64 off, v[0:1], off
+ED06C020 00000000 00000000	scratch_store_b64 off, v[0:1], s32
+ED06C020 00000000 00001000	scratch_store_b64 off, v[0:1], s32 offset:16
+ED06C07C 64000000 00005800	scratch_store_b64 off, v[200:201], off offset:88
+ED06C07C 01020000 FFFFF801	scratch_store_b64 v1, v[2:3], off offset:-8
+ED06C07C 00820000 00000026	scratch_store_b64 v38, v[1:2], off
+ED060021 07800000 00002C00	scratch_store_b8 off, v15, s33 offset:44
+ED06007C 0A800000 00002000	scratch_store_b8 off, v21, off offset:32
+ED060020 0D000000 00000000	scratch_store_b8 off, v26, s32
+ED06007C 01800000 00000000	scratch_store_b8 off, v3, off
+ED07007C 07000000 00000000	scratch_store_b96 off, v[14:16], off
+ED07007C 00800000 00004C00	scratch_store_b96 off, v[1:3], off offset:76
+ED070021 0A000000 00000000	scratch_store_b96 off, v[20:22], s33
+ED070020 03800000 00002000	scratch_store_b96 off, v[7:9], s32 offset:32
+ED09407C 03000000 00000200	scratch_store_d16_hi_b16 off, v6, off offset:2
+D6550000 02110100	v_add3_u32 v0, v0, 0, 4
+D655000B 03FE0D11 FFFFFFC0	v_add3_u32 v11, v17, v6, 0xffffffc0
+D6550002 040602FF 000052A0	v_add3_u32 v2, 0x52a0, v1, v1
+D6550003 040D8219	v_add3_u32 v3, s25, -1, v3
+D6550007 041D0880	v_add3_u32 v7, 0, 4, v7
+D6550008 041A1024	v_add3_u32 v8, s36, v8, v6
+4006061D	v_add_co_ci_u32_e32 v3, vcc_lo, s29, v3, vcc_lo
+4006026B	v_add_co_ci_u32_e32 v3, vcc_lo, vcc_hi, v1, vcc_lo
+40101080	v_add_co_ci_u32_e32 v8, vcc_lo, 0, v8, vcc_lo
+D520050B 00161613	v_add_co_ci_u32_e64 v11, s5, s19, v11, s5
+D5207C02 00010007	v_add_co_ci_u32_e64 v2, null, s7, 0, s0
+D5207C23 004C1680	v_add_co_ci_u32_e64 v35, null, 0, s11, s19
+D5200005 00020A80	v_add_co_ci_u32_e64 v5, s0, 0, v5, s0
+D5207C06 01A90025	v_add_co_ci_u32_e64 v6, null, s37, 0, vcc_lo
+D5207C49 00110080	v_add_co_ci_u32_e64 v73, null, 0, 0, s4
+D7006A01 000202FF 00000400	v_add_co_u32 v1, vcc_lo, 0x400, v1
+D7006A01 00014901	v_add_co_u32 v1, vcc_lo, v1, 36
+D700050A 0000250A	v_add_co_u32 v10, s5, v10, s18
+D7000411 000222FF 00000080	v_add_co_u32 v17, s4, 0x80, v17
+D7006A02 00003902	v_add_co_u32 v2, vcc_lo, v2, s28
+D7000425 0001033C	v_add_co_u32 v37, s4, v60, 1
+64161080	v_add_f16_e32 v11, 0, v8
+640A2705	v_add_f16_e32 v5, v5, v19
+D5320083 000306F1	v_add_f16_e64 v131, -0.5, v131
+D5320097 00022515	v_add_f16_e64 v151, v21, v18
+06021480	v_add_f32_e32 v1, 0, v10
+06020306	v_add_f32_e32 v1, v6, v1
+D5030201 00020D01	v_add_f32_e64 v1, v1, |v6|
+D503010D 0001E905	v_add_f32_e64 v13, |v5|, 2.0
+D5030302 00020F08	v_add_f32_e64 v2, |v8|, |v7|
+D5030206 00021CFF 46800000	v_add_f32_e64 v6, 0x46800000, |v14|
+D5030140 00028136	v_add_f32_e64 v64, |v54|, v64
+041A1AF3	v_add_f64_e32 v[13:14], -1.0, v[13:14]
+0436366A	v_add_f64_e32 v[27:28], vcc, v[27:28]
+04060F03	v_add_f64_e32 v[3:4], v[3:4], v[7:8]
+D5020000 00002410	v_add_f64_e64 v[0:1], s[16:17], s[18:19]
+D502000D 40021B01	v_add_f64_e64 v[13:14], v[1:2], -v[13:14]
+D5020102 40020504	v_add_f64_e64 v[2:3], |v[4:5]|, -v[2:3]
+D5020003 00010006	v_add_f64_e64 v[3:4], s[6:7], 0
+D5020204 00002D02	v_add_f64_e64 v[4:5], v[2:3], |s[22:23]|
+D502003D 20010109	v_add_f64_e64 v[61:62], -v[9:10], 0
+D6470001 02060302	v_add_lshl_u32 v1, v2, v1, 1
+D6470005 041D0705	v_add_lshl_u32 v5, v5, 3, v7
+D7030000 000200FF FFFFFF80	v_add_nc_u16 v0, 0xff80, v0
+D7030091 00010319	v_add_nc_u16 v145, v25, 1
+D7030014 00022936	v_add_nc_u16 v20, v54, v20
+4ACC906B	v_add_nc_u32_e32 v102, vcc_hi, v72
+4A1A16FF 00000200	v_add_nc_u32_e32 v13, 0x200, v11
+4A0A1D0F	v_add_nc_u32_e32 v5, v15, v14
+4A100275	v_add_nc_u32_e32 v8, ttmp9, v1
+D5250001 000100FF 00005400	v_add_nc_u32_e64 v1, 0x5400, 0
+D5250004 0000EA0A	v_add_nc_u32_e64 v4, s10, ttmp9
+D5250005 000028FF 00000300	v_add_nc_u32_e64 v5, 0x300, s20
+D616000F 0262150B	v_alignbit_b32 v15, v11, v10, 24
+D6160012 046A7B3C	v_alignbit_b32 v18, v60, v61, v26
+3600007E	v_and_b32_e32 v0, exec_lo, v0
+36020C19	v_and_b32_e32 v1, s25, v6
+360A286A	v_and_b32_e32 v5, vcc_lo, v20
+360E00BF	v_and_b32_e32 v7, 63, v0
+D51B0004 00010000	v_and_b32_e64 v4, s0, 0
+D6570076 05DD2176	v_and_or_b32 v118, v118, 16, v119
+D657000F 03FC0100 00001000	v_and_or_b32 v15, v0, s0, 0x1000
+D6570012 03C21CFF 00007F00	v_and_or_b32 v18, 0x7f00, v14, 0.5
+D6570002 001200FF 000000FF	v_and_or_b32 v2, 0xff, v0, s4
+D6570002 03017F00	v_and_or_b32 v2, v0, 63, 64
+D6570007 03FE2A6A 80000000	v_and_or_b32 v7, vcc_lo, v21, 0x80000000
+D73A0004 00020881	v_ashrrev_i16 v4, 1, v4
+3406009F	v_ashrrev_i32_e32 v3, 31, v0
+34060903	v_ashrrev_i32_e32 v3, v3, v4
+D51A0001 00001101	v_ashrrev_i32_e64 v1, v1, s8
+D51A0015 0001009F	v_ashrrev_i32_e64 v21, 31, 0
+D51A0005 0000EA9F	v_ashrrev_i32_e64 v5, 31, ttmp9
+D51A0008 0000209F	v_ashrrev_i32_e64 v8, 31, s16
+D73E0003 00000D01	v_ashrrev_i64 v[3:4], v1, s[6:7]
+D73E0009 0002008A	v_ashrrev_i64 v[9:10], 10, v[0:1]
+D71E0000 00020101	v_bcnt_u32_b32 v0, v1, v0
+D71E0003 00010103	v_bcnt_u32_b32 v3, v3, 0
+D611006A 02050900	v_bfe_i32 v106, v0, 4, 1
+D6100011 00590111	v_bfe_u32 v17, v17, 0, s22
+D6100018 02050900	v_bfe_u32 v24, v0, 4, 1
+D6100008 02221101	v_bfe_u32 v8, v1, v8, 8
+D612000B 0405FE00 3FF00000	v_bfi_b32 v11, s0, 0x3ff00000, v1
+D612000C 043D00FF 7FFFFFFF	v_bfi_b32 v12, 0x7fffffff, 0, v15
+D6120010 044E28FF FF00FF00	v_bfi_b32 v16, 0xff00ff00, v20, v19
+D6120014 0452B960	v_bfi_b32 v20, v96, v92, v20
+D71D0009 00010101	v_bfm_b32 v9, v1, 0
+7E047102	v_bfrev_b32_e32 v2, v2
+7E0870C2	v_bfrev_b32_e32 v4, -2
+7E0AB905	v_ceil_f16_e32 v5, v5
+7E024501	v_ceil_f32_e32 v1, v1
+7E003100	v_ceil_f64_e32 v[0:1], v[0:1]
+7E24770F	v_cls_i32_e32 v18, v15
+7E20730F	v_clz_i32_u32_e32 v16, v15
+7E047280	v_clz_i32_u32_e32 v2, 0
+D47D0029 0001FF1F 00000204	v_cmp_class_f16_e64 s41, v31, 0x204
+D47D006A 0001FF06 000001F8	v_cmp_class_f16_e64 vcc_lo, v6, 0x1f8
+D47E0000 0001FF00 00000204	v_cmp_class_f32_e64 s0, v0, 0x204
+D47E006A 0001FF00 00000260	v_cmp_class_f32_e64 vcc_lo, v0, 0x260
+D47F0000 0001FF00 00000204	v_cmp_class_f64_e64 s0, v[0:1], 0x204
+D47F006A 0001FF0D 00000260	v_cmp_class_f64_e64 vcc_lo, v[13:14], 0x260
+7C044C80	v_cmp_eq_f16_e32 vcc_lo, 0, v38
+7C044521	v_cmp_eq_f16_e32 vcc_lo, v33, v34
+D4020000 00023B19	v_cmp_eq_f16_e64 s0, v25, v29
+D4020002 00020480	v_cmp_eq_f16_e64 s2, 0, v2
+D4020104 0001E506	v_cmp_eq_f16_e64 s4, |v6|, 1.0
+7C246880	v_cmp_eq_f32_e32 vcc_lo, 0, v52
+7C240F02	v_cmp_eq_f32_e32 vcc_lo, v2, v7
+D4120001 00021080	v_cmp_eq_f32_e64 s1, 0, v8
+D4120303 0002010F	v_cmp_eq_f32_e64 s3, |v15|, |v0|
+D4120103 00026932	v_cmp_eq_f32_e64 s3, |v50|, v52
+D4120005 00021D04	v_cmp_eq_f32_e64 s5, v4, v14
+D412036A 00020101	v_cmp_eq_f32_e64 vcc_lo, |v1|, |v0|
+D412016A 00026933	v_cmp_eq_f32_e64 vcc_lo, |v51|, v52
+7C441E80	v_cmp_eq_f64_e32 vcc_lo, 0, v[15:16]
+7C440B01	v_cmp_eq_f64_e32 vcc_lo, v[1:2], v[5:6]
+D4220100 00020114	v_cmp_eq_f64_e64 s0, |v[20:21]|, v[0:1]
+D4220002 0001E404	v_cmp_eq_f64_e64 s2, s[4:5], 1.0
+D4220003 00020F03	v_cmp_eq_f64_e64 s3, v[3:4], v[7:8]
+D4220004 00020C80	v_cmp_eq_f64_e64 s4, 0, v[6:7]
+D422014E 00010108	v_cmp_eq_f64_e64 s78, |v[8:9]|, 0
+D422036A 00000907	v_cmp_eq_f64_e64 vcc_lo, |v[7:8]|, |s[4:5]|
+7C740080	v_cmp_eq_u16_e32 vcc_lo, 0, v0
+7C741F09	v_cmp_eq_u16_e32 vcc_lo, v9, v15
+D43A0000 00021216	v_cmp_eq_u16_e64 s0, s22, v9
+D43A0013 0002F48F	v_cmp_eq_u16_e64 s19, 15, v122
+D43A006A 00030C80	v_cmp_eq_u16_e64 vcc_lo, 0, v134
+D43A006A 00037A32	v_cmp_eq_u16_e64 vcc_lo, s50, v189
+7C944480	v_cmp_eq_u32_e32 vcc_lo, 0, v34
+7C940075	v_cmp_eq_u32_e32 vcc_lo, ttmp9, v0
+7C94231A	v_cmp_eq_u32_e32 vcc_lo, v26, v17
+D44A0002 00020E80	v_cmp_eq_u32_e64 s2, 0, v7
+D44A0006 0002271A	v_cmp_eq_u32_e64 s6, v26, v19
+D44A006B 00020280	v_cmp_eq_u32_e64 vcc_hi, 0, v1
+7CB44A80	v_cmp_eq_u64_e32 vcc_lo, 0, v[37:38]
+7CB4190A	v_cmp_eq_u64_e32 vcc_lo, v[10:11], v[12:13]
+D45A0003 00020E80	v_cmp_eq_u64_e64 s3, 0, v[7:8]
+D45A0003 00024709	v_cmp_eq_u64_e64 s3, v[9:10], v[35:36]
+7C0C0609	v_cmp_ge_f16_e32 vcc_lo, s9, v3
+D4060000 00020609	v_cmp_ge_f16_e64 s0, s9, v3
+D4060002 00022280	v_cmp_ge_f16_e64 s2, 0, v17
+7C2C0EFF 33800000	v_cmp_ge_f32_e32 vcc_lo, 0x33800000, v7
+7C2C022B	v_cmp_ge_f32_e32 vcc_lo, s43, v1
+D4160000 00020880	v_cmp_ge_f32_e64 s0, 0, v4
+D4160000 00020C27	v_cmp_ge_f32_e64 s0, s39, v6
+D4160300 00020717	v_cmp_ge_f32_e64 s0, |v23|, |v3|
+D4160105 00020508	v_cmp_ge_f32_e64 s5, |v8|, v2
+D416016A 00020903	v_cmp_ge_f32_e64 vcc_lo, |v3|, v4
+D416036A 00020103	v_cmp_ge_f32_e64 vcc_lo, |v3|, |v0|
+7C4C1680	v_cmp_ge_f64_e32 vcc_lo, 0, v[11:12]
+7C4C120E	v_cmp_ge_f64_e32 vcc_lo, s[14:15], v[9:10]
+D4260100 0001E113	v_cmp_ge_f64_e64 s0, |v[19:20]|, 0.5
+D4260001 000224FF 3E700000	v_cmp_ge_f64_e64 s1, 0x3e700000, v[18:19]
+D4260006 00000816	v_cmp_ge_f64_e64 s6, s[22:23], s[4:5]
+D4260307 00020B03	v_cmp_ge_f64_e64 s7, |v[3:4]|, |v[5:6]|
+D4260109 00020303	v_cmp_ge_f64_e64 s9, |v[3:4]|, v[1:2]
+D426016A 0001E112	v_cmp_ge_f64_e64 vcc_lo, |v[18:19]|, 0.5
+7C6C0C08	v_cmp_ge_i16_e32 vcc_lo, s8, v6
+D4360003 0002190B	v_cmp_ge_i16_e64 s3, v11, v12
+7C8C0E68	v_cmp_ge_i32_e32 vcc_lo, s104, v7
+D4460007 00021260	v_cmp_ge_i32_e64 s7, s96, v9
+7CAC0D0A	v_cmp_ge_i64_e32 vcc_lo, v[10:11], v[6:7]
+D4560003 00000C0E	v_cmp_ge_i64_e64 s3, s[14:15], s[6:7]
+7C7C0000	v_cmp_ge_u16_e32 vcc_lo, s0, v0
+D43E0003 00021904	v_cmp_ge_u16_e64 s3, v4, v12
+7C9C0304	v_cmp_ge_u32_e32 vcc_lo, v4, v1
+D44E0004 00020415	v_cmp_ge_u32_e64 s4, s21, v2
+7CBC0305	v_cmp_ge_u64_e32 vcc_lo, v[5:6], v[1:2]
+D45E0006 00023114	v_cmp_ge_u64_e64 s6, v[20:21], v[24:25]
+7C087280	v_cmp_gt_f16_e32 vcc_lo, 0, v57
+7C08111C	v_cmp_gt_f16_e32 vcc_lo, v28, v8
+D4040200 00020AFF 00004200	v_cmp_gt_f16_e64 s0, 0x4200, |v5|
+D4040004 00027880	v_cmp_gt_f16_e64 s4, 0, v60
+D4040008 00022918	v_cmp_gt_f16_e64 s8, v24, v20
+D404026A 000202FF 00004200	v_cmp_gt_f16_e64 vcc_lo, 0x4200, |v1|
+7C280880	v_cmp_gt_f32_e32 vcc_lo, 0, v4
+7C28190B	v_cmp_gt_f32_e32 vcc_lo, v11, v12
+D4140200 00021AFF 7F800000	v_cmp_gt_f32_e64 s0, 0x7f800000, |v13|
+D414001A 40004F07	v_cmp_gt_f32_e64 s26, v7, -s39
+D4140003 00020480	v_cmp_gt_f32_e64 s3, 0, v2
+D4140004 00021D04	v_cmp_gt_f32_e64 s4, v4, v14
+D414026A 00021AFF 7F800000	v_cmp_gt_f32_e64 vcc_lo, 0x7f800000, |v13|
+D414036A 00023D22	v_cmp_gt_f32_e64 vcc_lo, |v34|, |v30|
+7C481AFF 10000000	v_cmp_gt_f64_e32 vcc_lo, 0x10000000, v[13:14]
+7C480303	v_cmp_gt_f64_e32 vcc_lo, v[3:4], v[1:2]
+D4240001 00020880	v_cmp_gt_f64_e64 s1, 0, v[4:5]
+D4240003 00020505	v_cmp_gt_f64_e64 s3, v[5:6], v[2:3]
+D4240004 40001108	v_cmp_gt_f64_e64 s4, v[8:9], -s[8:9]
+D424012E 0002231D	v_cmp_gt_f64_e64 s46, |v[29:30]|, v[17:18]
+D4240331 00020506	v_cmp_gt_f64_e64 s49, |v[6:7]|, |v[2:3]|
+D4240008 00010002	v_cmp_gt_f64_e64 s8, s[2:3], 0
+7C682680	v_cmp_gt_i16_e32 vcc_lo, 0, v19
+7C68130A	v_cmp_gt_i16_e32 vcc_lo, v10, v9
+D4340000 0002050F	v_cmp_gt_i16_e64 s0, v15, v2
+D4340007 00023080	v_cmp_gt_i16_e64 s7, 0, v24
+D434006A 00032C80	v_cmp_gt_i16_e64 vcc_lo, 0, v150
+7C881280	v_cmp_gt_i32_e32 vcc_lo, 0, v9
+7C880E13	v_cmp_gt_i32_e32 vcc_lo, s19, v7
+7C88526B	v_cmp_gt_i32_e32 vcc_lo, vcc_hi, v41
+D4440001 00020075	v_cmp_gt_i32_e64 s1, ttmp9, v0
+D444000E 0002066B	v_cmp_gt_i32_e64 s14, vcc_hi, v3
+D4440002 00021012	v_cmp_gt_i32_e64 s2, s18, v8
+D4440003 00024081	v_cmp_gt_i32_e64 s3, 1, v32
+7CA80681	v_cmp_gt_i64_e32 vcc_lo, 1, v[3:4]
+7CA80816	v_cmp_gt_i64_e32 vcc_lo, s[22:23], v[4:5]
+D4540000 00020A90	v_cmp_gt_i64_e64 s0, 16, v[5:6]
+D454001F 00010014	v_cmp_gt_i64_e64 s31, s[20:21], 0
+D454002E 0000580A	v_cmp_gt_i64_e64 s46, s[10:11], s[44:45]
+D454006A 00000808	v_cmp_gt_i64_e64 vcc_lo, s[8:9], s[4:5]
+7C7800FF 000003FF	v_cmp_gt_u16_e32 vcc_lo, 0x3ff, v0
+7C78130A	v_cmp_gt_u16_e32 vcc_lo, v10, v9
+D43C0000 00022511	v_cmp_gt_u16_e64 s0, v17, v18
+D43C0007 0002B4FF 00007C01	v_cmp_gt_u16_e64 s7, 0x7c01, v90
+7C9800FF 00000200	v_cmp_gt_u32_e32 vcc_lo, 0x200, v0
+7C982F19	v_cmp_gt_u32_e32 vcc_lo, v25, v23
+D44C0001 00020406	v_cmp_gt_u32_e64 s1, s6, v2
+D44C0003 000226FF 00000080	v_cmp_gt_u32_e64 s3, 0x80, v19
+D44C006B 00024889	v_cmp_gt_u32_e64 vcc_hi, 9, v36
+D44C006B 0002D61C	v_cmp_gt_u32_e64 vcc_hi, s28, v107
+7CB80682	v_cmp_gt_u64_e32 vcc_lo, 2, v[3:4]
+7CB86936	v_cmp_gt_u64_e32 vcc_lo, v[54:55], v[52:53]
+D45C0000 0002020E	v_cmp_gt_u64_e64 s0, s[14:15], v[1:2]
+D45C0001 000038FF 00000081	v_cmp_gt_u64_e64 s1, 0x81, s[28:29]
+D45C0028 00010C28	v_cmp_gt_u64_e64 s40, s[40:41], 6
+7C062480	v_cmp_le_f16_e32 vcc_lo, 0, v18
+7C060A0A	v_cmp_le_f16_e32 vcc_lo, s10, v5
+D4030002 00021280	v_cmp_le_f16_e64 s2, 0, v9
+7C260081	v_cmp_le_f32_e32 vcc_lo, 1, v0
+7C261B0E	v_cmp_le_f32_e32 vcc_lo, v14, v13
+D4130000 00023316	v_cmp_le_f32_e64 s0, v22, v25
+D4130002 000214FF 4B800000	v_cmp_le_f32_e64 s2, 0x4b800000, v10
+D4130203 00021EFF 5F800000	v_cmp_le_f32_e64 s3, 0x5f800000, |v15|
+D4130105 0002171E	v_cmp_le_f32_e64 s5, |v30|, v11
+7C460081	v_cmp_le_f64_e32 vcc_lo, 1, v[0:1]
+7C460B1A	v_cmp_le_f64_e32 vcc_lo, v[26:27], v[5:6]
+D4230200 000212FF 7B000000	v_cmp_le_f64_e64 s0, 0x7b000000, |v[9:10]|
+D4230000 00020B18	v_cmp_le_f64_e64 s0, v[24:25], v[5:6]
+D423010A 00023F21	v_cmp_le_f64_e64 s10, |v[33:34]|, v[31:32]
+D4230310 0002853E	v_cmp_le_f64_e64 s16, |v[62:63]|, |v[66:67]|
+D4230002 000224FF 41700000	v_cmp_le_f64_e64 s2, 0x41700000, v[18:19]
+D423026A 000204FF 7B000000	v_cmp_le_f64_e64 vcc_lo, 0x7b000000, |v[2:3]|
+7C660B01	v_cmp_le_i16_e32 vcc_lo, v1, v5
+D4330001 00020705	v_cmp_le_i16_e64 s1, v5, v3
+7C86261A	v_cmp_le_i32_e32 vcc_lo, s26, v19
+D4430001 00022244	v_cmp_le_i32_e64 s1, s68, v17
+7CA60404	v_cmp_le_i64_e32 vcc_lo, s[4:5], v[2:3]
+D4530001 00020414	v_cmp_le_i64_e64 s1, s[20:21], v[2:3]
+7C760D04	v_cmp_le_u16_e32 vcc_lo, v4, v6
+D43B0001 00020705	v_cmp_le_u16_e64 s1, v5, v3
+7C961607	v_cmp_le_u32_e32 vcc_lo, s7, v11
+7C96046B	v_cmp_le_u32_e32 vcc_lo, vcc_hi, v2
+D44B0000 00020C6B	v_cmp_le_u32_e64 s0, vcc_hi, v6
+D44B0005 00022554	v_cmp_le_u32_e64 s5, v84, v18
+D44B006B 00030842	v_cmp_le_u32_e64 vcc_hi, s66, v132
+7CB6840C	v_cmp_le_u64_e32 vcc_lo, s[12:13], v[66:67]
+D45B0009 0002800A	v_cmp_le_u64_e64 s9, s[10:11], v[64:65]
+7C0A14FF 00007C00	v_cmp_lg_f16_e32 vcc_lo, 0x7c00, v10
+D4050000 00021CFF 00007C00	v_cmp_lg_f16_e64 s0, 0x7c00, v14
+7C2A1280	v_cmp_lg_f32_e32 vcc_lo, 0, v9
+7C4A24FF 7FF00000	v_cmp_lg_f64_e32 vcc_lo, 0x7ff00000, v[18:19]
+D4250001 00022EFF 7FF00000	v_cmp_lg_f64_e64 s1, 0x7ff00000, v[23:24]
+7C020280	v_cmp_lt_f16_e32 vcc_lo, 0, v1
+7C020A0A	v_cmp_lt_f16_e32 vcc_lo, s10, v5
+D4010000 40001308	v_cmp_lt_f16_e64 s0, v8, -s9
+D4010100 00001302	v_cmp_lt_f16_e64 s0, |v2|, s9
+D4010002 00026480	v_cmp_lt_f16_e64 s2, 0, v50
+D4010002 00021326	v_cmp_lt_f16_e64 s2, v38, v9
+D401006A 40001301	v_cmp_lt_f16_e64 vcc_lo, v1, -s9
+D401016A 00001301	v_cmp_lt_f16_e64 vcc_lo, |v1|, s9
+7C224080	v_cmp_lt_f32_e32 vcc_lo, 0, v32
+7C22210B	v_cmp_lt_f32_e32 vcc_lo, v11, v16
+D4110000 00020A80	v_cmp_lt_f32_e64 s0, 0, v5
+D4110100 00023500	v_cmp_lt_f32_e64 s0, |v0|, v26
+D4110004 00021D04	v_cmp_lt_f32_e64 s4, v4, v14
+D4110305 0002312A	v_cmp_lt_f32_e64 s5, |v42|, |v24|
+D4110234 00022303	v_cmp_lt_f32_e64 s52, v3, |v17|
+D411036A 00020B0B	v_cmp_lt_f32_e64 vcc_lo, |v11|, |v5|
+7C422480	v_cmp_lt_f64_e32 vcc_lo, 0, v[18:19]
+7C420303	v_cmp_lt_f64_e32 vcc_lo, v[3:4], v[1:2]
+D421000E 000252F2	v_cmp_lt_f64_e64 s14, 1.0, v[41:42]
+D4210003 00010034	v_cmp_lt_f64_e64 s3, s[52:53], 0
+D4210003 00020505	v_cmp_lt_f64_e64 s3, v[5:6], v[2:3]
+D421011E 00020500	v_cmp_lt_f64_e64 s30, |v[0:1]|, v[2:3]
+D421026A 00020F02	v_cmp_lt_f64_e64 vcc_lo, v[2:3], |v[7:8]|
+D421036A 00021D05	v_cmp_lt_f64_e64 vcc_lo, |v[5:6]|, |v[14:15]|
+7C620A97	v_cmp_lt_i16_e32 vcc_lo, 23, v5
+7C620201	v_cmp_lt_i16_e32 vcc_lo, s1, v1
+D4310000 0002249A	v_cmp_lt_i16_e64 s0, 26, v18
+D4310000 00020409	v_cmp_lt_i16_e64 s0, s9, v2
+D431006A 000330C1	v_cmp_lt_i16_e64 vcc_lo, -1, v152
+7C82C2C1	v_cmp_lt_i32_e32 vcc_lo, -1, v97
+7C829E1A	v_cmp_lt_i32_e32 vcc_lo, s26, v79
+7C82006B	v_cmp_lt_i32_e32 vcc_lo, vcc_hi, v0
+D441000C 0002CEC1	v_cmp_lt_i32_e64 s12, -1, v103
+D4410003 0002913B	v_cmp_lt_i32_e64 s3, v59, v72
+7CA20680	v_cmp_lt_i64_e32 vcc_lo, 0, v[3:4]
+7CA20103	v_cmp_lt_i64_e32 vcc_lo, v[3:4], v[0:1]
+D4510001 00020082	v_cmp_lt_i64_e64 s1, 2, v[0:1]
+D4510001 0001200A	v_cmp_lt_i64_e64 s1, s[10:11], 16
+D4510003 00002C0A	v_cmp_lt_i64_e64 s3, s[10:11], s[22:23]
+7C72B4FF 00007C00	v_cmp_lt_u16_e32 vcc_lo, 0x7c00, v90
+7C72477E	v_cmp_lt_u16_e32 vcc_lo, v126, v35
+D4390006 0002B2FF 00007C00	v_cmp_lt_u16_e64 s6, 0x7c00, v89
+D4390006 00030999	v_cmp_lt_u16_e64 s6, v153, v132
+D439006A 00030CFF 00007C00	v_cmp_lt_u16_e64 vcc_lo, 0x7c00, v134
+D439006A 0002E18C	v_cmp_lt_u16_e64 vcc_lo, v140, v112
+7C9200FF 000000DF	v_cmp_lt_u32_e32 vcc_lo, 0xdf, v0
+7C920073	v_cmp_lt_u32_e32 vcc_lo, ttmp7, v0
+7C920075	v_cmp_lt_u32_e32 vcc_lo, ttmp9, v0
+7C920305	v_cmp_lt_u32_e32 vcc_lo, v5, v1
+D4490000 000206FF 00000051	v_cmp_lt_u32_e64 s0, 0x51, v3
+D4490002 00021A73	v_cmp_lt_u32_e64 s2, ttmp7, v13
+D4490002 00020875	v_cmp_lt_u32_e64 s2, ttmp9, v4
+D4490008 00022554	v_cmp_lt_u32_e64 s8, v84, v18
+7CB20083	v_cmp_lt_u64_e32 vcc_lo, 3, v[0:1]
+7CB29B51	v_cmp_lt_u64_e32 vcc_lo, v[81:82], v[77:78]
+D4590026 000000FF 00010000	v_cmp_lt_u64_e64 s38, 0x10000, s[0:1]
+D459002B 0001062C	v_cmp_lt_u64_e64 s43, s[44:45], 3
+D4590006 00029F53	v_cmp_lt_u64_e64 s6, v[83:84], v[79:80]
+D459006A 00017206	v_cmp_lt_u64_e64 vcc_lo, s[6:7], 57
+7C7AAA81	v_cmp_ne_u16_e32 vcc_lo, 1, v85
+7C7A0101	v_cmp_ne_u16_e32 vcc_lo, v1, v0
+D43D0000 00021C80	v_cmp_ne_u16_e64 s0, 0, v14
+D43D0000 00021906	v_cmp_ne_u16_e64 s0, v6, v12
+D43D006A 00030281	v_cmp_ne_u16_e64 vcc_lo, 1, v129
+D43D006A 00025181	v_cmp_ne_u16_e64 vcc_lo, v129, v40
+7C9A2A81	v_cmp_ne_u32_e32 vcc_lo, 1, v21
+7C9A0075	v_cmp_ne_u32_e32 vcc_lo, ttmp9, v0
+7C9A231A	v_cmp_ne_u32_e32 vcc_lo, v26, v17
+D44D0002 00020480	v_cmp_ne_u32_e64 s2, 0, v2
+D44D0006 0002271A	v_cmp_ne_u32_e64 s6, v26, v19
+7CBA0680	v_cmp_ne_u64_e32 vcc_lo, 0, v[3:4]
+7CBA0307	v_cmp_ne_u64_e32 vcc_lo, v[7:8], v[1:2]
+D45D0003 0002030B	v_cmp_ne_u64_e64 s3, v[11:12], v[1:2]
+D45D0005 00024A80	v_cmp_ne_u64_e64 s5, 0, v[37:38]
+7C1A0C80	v_cmp_neq_f16_e32 vcc_lo, 0, v6
+7C1A3B19	v_cmp_neq_f16_e32 vcc_lo, v25, v29
+D40D0000 00024521	v_cmp_neq_f16_e64 s0, v33, v34
+D40D0004 00024C80	v_cmp_neq_f16_e64 s4, 0, v38
+D40D006A 0003017B	v_cmp_neq_f16_e64 vcc_lo, v123, v128
+7C3A1680	v_cmp_neq_f32_e32 vcc_lo, 0, v11
+7C3A3125	v_cmp_neq_f32_e32 vcc_lo, v37, v24
+D41D0200 000216FF 7F800000	v_cmp_neq_f32_e64 s0, 0x7f800000, |v11|
+D41D002A 00021880	v_cmp_neq_f32_e64 s42, 0, v12
+D41D0005 0002311B	v_cmp_neq_f32_e64 s5, v27, v24
+D41D0105 0001E509	v_cmp_neq_f32_e64 s5, |v9|, 1.0
+D41D026A 00022AFF 7F800000	v_cmp_neq_f32_e64 vcc_lo, 0x7f800000, |v21|
+D41D016A 0001E50A	v_cmp_neq_f32_e64 vcc_lo, |v10|, 1.0
+7C5A0080	v_cmp_neq_f64_e32 vcc_lo, 0, v[0:1]
+7C5A7502	v_cmp_neq_f64_e32 vcc_lo, v[2:3], v[58:59]
+D42D0013 00010004	v_cmp_neq_f64_e64 s19, s[4:5], 0
+D42D002A 00020480	v_cmp_neq_f64_e64 s42, 0, v[2:3]
+D42D0005 00027500	v_cmp_neq_f64_e64 s5, v[0:1], v[58:59]
+D42D006A 000008FF 7FF00000	v_cmp_neq_f64_e64 vcc_lo, 0x7ff00000, s[4:5]
+D42D026A 000224FF 7FF00000	v_cmp_neq_f64_e64 vcc_lo, 0x7ff00000, |v[18:19]|
+D42D006A 0001001E	v_cmp_neq_f64_e64 vcc_lo, s[30:31], 0
+7C121080	v_cmp_nge_f16_e32 vcc_lo, 0, v8
+7C120209	v_cmp_nge_f16_e32 vcc_lo, s9, v1
+D4090001 00020609	v_cmp_nge_f16_e64 s1, s9, v3
+D4090002 4000130B	v_cmp_nge_f16_e64 s2, v11, -s9
+7C3214FF 33800000	v_cmp_nge_f32_e32 vcc_lo, 0x33800000, v10
+7C320242	v_cmp_nge_f32_e32 vcc_lo, s66, v1
+D4190112 00020508	v_cmp_nge_f32_e64 s18, |v8|, v2
+D419002D 00020503	v_cmp_nge_f32_e64 s45, v3, v2
+D4190008 000216FF 33800000	v_cmp_nge_f32_e64 s8, 0x33800000, v11
+D4190009 40000701	v_cmp_nge_f32_e64 s9, v1, -s3
+7C5224FF 3E700000	v_cmp_nge_f64_e32 vcc_lo, 0x3e700000, v[18:19]
+7C520814	v_cmp_nge_f64_e32 vcc_lo, s[20:21], v[4:5]
+D4290001 0001E424	v_cmp_nge_f64_e64 s1, s[36:37], 1.0
+D429001D 00020705	v_cmp_nge_f64_e64 s29, v[5:6], v[3:4]
+D4290003 40000901	v_cmp_nge_f64_e64 s3, v[1:2], -s[4:5]
+D4290107 00020303	v_cmp_nge_f64_e64 s7, |v[3:4]|, v[1:2]
+D4290008 000228FF 3E700000	v_cmp_nge_f64_e64 s8, 0x3e700000, v[20:21]
+D429016A 00000500	v_cmp_nge_f64_e64 vcc_lo, |v[0:1]|, s[2:3]
+7C162480	v_cmp_ngt_f16_e32 vcc_lo, 0, v18
+7C160B07	v_cmp_ngt_f16_e32 vcc_lo, v7, v5
+D40B0001 000220F3	v_cmp_ngt_f16_e64 s1, -1.0, v16
+D40B0002 0002830A	v_cmp_ngt_f16_e64 s2, v10, v65
+7C360A80	v_cmp_ngt_f32_e32 vcc_lo, 0, v5
+7C360F06	v_cmp_ngt_f32_e32 vcc_lo, v6, v7
+D41B0200 000206FF 3F200000	v_cmp_ngt_f32_e64 s0, 0x3f200000, |v3|
+D41B0000 00021AFF C2CE8ED0	v_cmp_ngt_f32_e64 s0, 0xc2ce8ed0, v13
+D41B0000 00020507	v_cmp_ngt_f32_e64 s0, v7, v2
+D41B0300 00020101	v_cmp_ngt_f32_e64 s0, |v1|, |v0|
+D41B0102 00026933	v_cmp_ngt_f32_e64 s2, |v51|, v52
+D41B026A 00021EFF C2B17218	v_cmp_ngt_f32_e64 vcc_lo, 0xc2b17218, |v15|
+7C560880	v_cmp_ngt_f64_e32 vcc_lo, 0, v[4:5]
+7C560D04	v_cmp_ngt_f64_e32 vcc_lo, v[4:5], v[6:7]
+D42B0201 000204FF 41D00000	v_cmp_ngt_f64_e64 s1, 0x41d00000, |v[2:3]|
+D42B0001 000222FF C090CC00	v_cmp_ngt_f64_e64 s1, 0xc090cc00, v[17:18]
+D42B030C 00020303	v_cmp_ngt_f64_e64 s12, |v[3:4]|, |v[1:2]|
+D42B0012 00010010	v_cmp_ngt_f64_e64 s18, s[16:17], 0
+D42B0003 00020F03	v_cmp_ngt_f64_e64 s3, v[3:4], v[7:8]
+D42B006A 0001E40A	v_cmp_ngt_f64_e64 vcc_lo, s[10:11], 1.0
+7C180601	v_cmp_nle_f16_e32 vcc_lo, s1, v3
+D40C000B 20020209	v_cmp_nle_f16_e64 s11, -s9, v1
+D40C0003 00022D01	v_cmp_nle_f16_e64 s3, v1, v22
+7C381C80	v_cmp_nle_f32_e32 vcc_lo, 0, v14
+7C381F12	v_cmp_nle_f32_e32 vcc_lo, v18, v15
+D41C0001 000216FF 4B800000	v_cmp_nle_f32_e64 s1, 0x4b800000, v11
+D41C0001 00020D07	v_cmp_nle_f32_e64 s1, v7, v6
+D41C0102 0001E50A	v_cmp_nle_f32_e64 s2, |v10|, 1.0
+D41C0104 00026F50	v_cmp_nle_f32_e64 s4, |v80|, v55
+D41C002D 20026429	v_cmp_nle_f32_e64 s45, -s41, v50
+7C5828FF 41700000	v_cmp_nle_f64_e32 vcc_lo, 0x41700000, v[20:21]
+7C584729	v_cmp_nle_f64_e32 vcc_lo, v[41:42], v[35:36]
+D42C0001 00021AFF 41700000	v_cmp_nle_f64_e64 s1, 0x41700000, v[13:14]
+D42C0012 0001E604	v_cmp_nle_f64_e64 s18, s[4:5], -1.0
+D42C0004 00000800	v_cmp_nle_f64_e64 s4, s[0:1], s[4:5]
+D42C0135 0002330B	v_cmp_nle_f64_e64 s53, |v[11:12]|, v[25:26]
+D42C006A 0001001E	v_cmp_nle_f64_e64 vcc_lo, s[30:31], 0
+D42C006A 00000808	v_cmp_nle_f64_e64 vcc_lo, s[8:9], s[4:5]
+D40A0202 000206FF 00007C00	v_cmp_nlg_f16_e64 s2, 0x7c00, |v3|
+7C3402FF 7F800000	v_cmp_nlg_f32_e32 vcc_lo, 0x7f800000, v1
+D41A0000 000204FF 7F800000	v_cmp_nlg_f32_e64 s0, 0x7f800000, v2
+D41A0208 0002AEFF 7F800000	v_cmp_nlg_f32_e64 s8, 0x7f800000, |v87|
+D41A026B 000338FF 7F800000	v_cmp_nlg_f32_e64 vcc_hi, 0x7f800000, |v156|
+D41A026A 0002B8FF 7F800000	v_cmp_nlg_f32_e64 vcc_lo, 0x7f800000, |v92|
+7C5400FF 7FF00000	v_cmp_nlg_f64_e32 vcc_lo, 0x7ff00000, v[0:1]
+D42A0002 000214FF 7FF00000	v_cmp_nlg_f64_e64 s2, 0x7ff00000, v[10:11]
+D42A021E 00020CFF 7FF00000	v_cmp_nlg_f64_e64 s30, 0x7ff00000, |v[6:7]|
+7C1C0880	v_cmp_nlt_f16_e32 vcc_lo, 0, v4
+D40E0000 00021480	v_cmp_nlt_f16_e64 s0, 0, v10
+D40E0000 0002340E	v_cmp_nlt_f16_e64 s0, s14, v26
+D40E010E 0000130A	v_cmp_nlt_f16_e64 s14, |v10|, s9
+D40E0003 40001D0F	v_cmp_nlt_f16_e64 s3, v15, -s14
+7C3C0880	v_cmp_nlt_f32_e32 vcc_lo, 0, v4
+7C3C0307	v_cmp_nlt_f32_e32 vcc_lo, v7, v1
+D41E0000 00021880	v_cmp_nlt_f32_e64 s0, 0, v12
+D41E0200 00021EFF 42CE8ED0	v_cmp_nlt_f32_e64 s0, 0x42ce8ed0, |v15|
+D41E0100 0001E502	v_cmp_nlt_f32_e64 s0, |v2|, 1.0
+D41E0303 00024121	v_cmp_nlt_f32_e64 s3, |v33|, |v32|
+D41E0004 00021F04	v_cmp_nlt_f32_e64 s4, v4, v15
+D41E026A 00021EFF 42CE8ED0	v_cmp_nlt_f32_e64 vcc_lo, 0x42ce8ed0, |v15|
+7C5C0680	v_cmp_nlt_f64_e32 vcc_lo, 0, v[3:4]
+7C5C0C42	v_cmp_nlt_f64_e32 vcc_lo, s[66:67], v[6:7]
+D42E0000 00022C80	v_cmp_nlt_f64_e64 s0, 0, v[22:23]
+D42E0101 00001900	v_cmp_nlt_f64_e64 s1, |v[0:1]|, s[12:13]
+D42E0002 00010004	v_cmp_nlt_f64_e64 s2, s[4:5], 0
+D42E0003 00020F03	v_cmp_nlt_f64_e64 s3, v[3:4], v[7:8]
+D42E0109 0001E51F	v_cmp_nlt_f64_e64 s9, |v[31:32]|, 1.0
+D42E006A 0001001E	v_cmp_nlt_f64_e64 vcc_lo, s[30:31], 0
+7C0E1D0E	v_cmp_o_f16_e32 vcc_lo, v14, v14
+D4070002 00027728	v_cmp_o_f16_e64 s2, v40, v59
+D407006A 00030180	v_cmp_o_f16_e64 vcc_lo, v128, v128
+7C2E0904	v_cmp_o_f32_e32 vcc_lo, v4, v4
+D4170004 00022B15	v_cmp_o_f32_e64 s4, v21, v21
+7C4E1F15	v_cmp_o_f64_e32 vcc_lo, v[21:22], v[15:16]
+D4270002 0002954A	v_cmp_o_f64_e64 s2, v[74:75], v[74:75]
+D4270109 00028544	v_cmp_o_f64_e64 s9, |v[68:69]|, v[66:67]
+D427006A 60020100	v_cmp_o_f64_e64 vcc_lo, -v[0:1], -v[0:1]
+D427016A 00021508	v_cmp_o_f64_e64 vcc_lo, |v[8:9]|, v[10:11]
+7C100D06	v_cmp_u_f16_e32 vcc_lo, v6, v6
+D4080002 00021108	v_cmp_u_f16_e64 s2, v8, v8
+7C30150A	v_cmp_u_f32_e32 vcc_lo, v10, v10
+D4180002 00022311	v_cmp_u_f32_e64 s2, v17, v17
+7C500100	v_cmp_u_f64_e32 vcc_lo, v[0:1], v[0:1]
+D4280000 00020502	v_cmp_u_f64_e64 s0, v[2:3], v[2:3]
+7D042D15	v_cmpx_eq_f16_e32 v21, v22
+7D243080	v_cmpx_eq_f32_e32 0, v24
+7D242D15	v_cmpx_eq_f32_e32 v21, v22
+7D440480	v_cmpx_eq_f64_e32 0, v[2:3]
+7D442F15	v_cmpx_eq_f64_e32 v[21:22], v[23:24]
+7D74AA88	v_cmpx_eq_u16_e32 8, v85
+D4BA007E 00030288	v_cmpx_eq_u16_e64 8, v129
+D4BA007E 00024918	v_cmpx_eq_u16_e64 v24, v36
+7D940080	v_cmpx_eq_u32_e32 0, v0
+D4CA007E 00020E75	v_cmpx_eq_u32_e64 ttmp9, v7
+D4CA007E 00021105	v_cmpx_eq_u32_e64 v5, v8
+7DB42480	v_cmpx_eq_u64_e32 0, v[18:19]
+D4DA007E 00020416	v_cmpx_eq_u64_e64 s[22:23], v[2:3]
+7D0C20FF 00006BD0	v_cmpx_ge_f16_e32 0x6bd0, v16
+7D2C1680	v_cmpx_ge_f32_e32 0, v11
+7D2C0D07	v_cmpx_ge_f32_e32 v7, v6
+D496027E 000202FF 3F666666	v_cmpx_ge_f32_e64 0x3f666666, |v1|
+D496017E 0002090F	v_cmpx_ge_f32_e64 |v15|, v4
+7D4C4480	v_cmpx_ge_f64_e32 0, v[34:35]
+7D4C110C	v_cmpx_ge_f64_e32 v[12:13], v[8:9]
+D4A6017E 00020711	v_cmpx_ge_f64_e64 |v[17:18]|, v[3:4]
+D4C6007E 00020701	v_cmpx_ge_i32_e64 v1, v3
+D4D6007E 00020B07	v_cmpx_ge_i64_e64 v[7:8], v[5:6]
+D4CE007E 00021700	v_cmpx_ge_u32_e64 v0, v11
+D4DE007E 00020709	v_cmpx_ge_u64_e64 v[9:10], v[3:4]
+7D0862FF 00004200	v_cmpx_gt_f16_e32 0x4200, v49
+7D080905	v_cmpx_gt_f16_e32 v5, v4
+7D283C80	v_cmpx_gt_f32_e32 0, v30
+7D280B12	v_cmpx_gt_f32_e32 v18, v5
+7D486080	v_cmpx_gt_f64_e32 0, v[48:49]
+7D482316	v_cmpx_gt_f64_e32 v[22:23], v[17:18]
+7D688E82	v_cmpx_gt_i16_e32 2, v71
+D4B4007E 00023119	v_cmpx_gt_i16_e64 v25, v24
+7D881E82	v_cmpx_gt_i32_e32 2, v15
+D4C4007E 00020033	v_cmpx_gt_i32_e64 s51, v0
+D4C4007E 00022475	v_cmpx_gt_i32_e64 ttmp9, v18
+7DA80890	v_cmpx_gt_i64_e32 16, v[4:5]
+D4D4007E 00020224	v_cmpx_gt_i64_e64 s[36:37], v[1:2]
+7D780E82	v_cmpx_gt_u16_e32 2, v7
+D4BC007E 00023119	v_cmpx_gt_u16_e64 v25, v24
+7D980EA0	v_cmpx_gt_u32_e32 32, v7
+D4CC007E 00020075	v_cmpx_gt_u32_e64 ttmp9, v0
+D4CC007E 00021509	v_cmpx_gt_u32_e64 v9, v10
+7DB812C3	v_cmpx_gt_u64_e32 -3, v[9:10]
+D4DC007E 00026148	v_cmpx_gt_u64_e64 v[72:73], v[48:49]
+7D062080	v_cmpx_le_f16_e32 0, v16
+7D060E60	v_cmpx_le_f16_e32 s96, v7
+7D061E6B	v_cmpx_le_f16_e32 vcc_hi, v15
+7D265480	v_cmpx_le_f32_e32 0, v42
+7D260E56	v_cmpx_le_f32_e32 s86, v7
+D493037E 0002331E	v_cmpx_le_f32_e64 |v30|, |v25|
+7D464C80	v_cmpx_le_f64_e32 0, v[38:39]
+7D461506	v_cmpx_le_f64_e32 v[6:7], v[10:11]
+D4A3037E 00026930	v_cmpx_le_f64_e64 |v[48:49]|, |v[52:53]|
+D4C3007E 00022918	v_cmpx_le_i32_e64 v24, v20
+D4D3007E 00023E36	v_cmpx_le_i64_e64 s[54:55], v[31:32]
+D4CB007E 00020007	v_cmpx_le_u32_e64 s7, v0
+D4DB007E 00020105	v_cmpx_le_u64_e64 v[5:6], v[0:1]
+7D0A3680	v_cmpx_lg_f16_e32 0, v27
+7D2A1080	v_cmpx_lg_f32_e32 0, v8
+7D4A1880	v_cmpx_lg_f64_e32 0, v[12:13]
+7D0218F0	v_cmpx_lt_f16_e32 0.5, v12
+7D021106	v_cmpx_lt_f16_e32 v6, v8
+7D220880	v_cmpx_lt_f32_e32 0, v4
+7D220303	v_cmpx_lt_f32_e32 v3, v1
+D491027E 00020CFF 4B800000	v_cmpx_lt_f32_e64 0x4b800000, |v6|
+D491007E 40025318	v_cmpx_lt_f32_e64 v24, -v41
+D491037E 0002210F	v_cmpx_lt_f32_e64 |v15|, |v16|
+7D420080	v_cmpx_lt_f64_e32 0, v[0:1]
+7D420902	v_cmpx_lt_f64_e32 v[2:3], v[4:5]
+D4A1027E 00021CFF 43300000	v_cmpx_lt_f64_e64 0x43300000, |v[14:15]|
+D4A1007E 40026530	v_cmpx_lt_f64_e64 v[48:49], -v[50:51]
+D4A1037E 0002C71D	v_cmpx_lt_f64_e64 |v[29:30]|, |v[99:100]|
+7D62AA87	v_cmpx_lt_i16_e32 7, v85
+D4B1007E 00030287	v_cmpx_lt_i16_e64 7, v129
+D4B1007E 00023119	v_cmpx_lt_i16_e64 v25, v24
+7D820C81	v_cmpx_lt_i32_e32 1, v6
+D4C1007E 00022475	v_cmpx_lt_i32_e64 ttmp9, v18
+D4C1007E 00020D02	v_cmpx_lt_i32_e64 v2, v6
+7DA20680	v_cmpx_lt_i64_e32 0, v[3:4]
+D4D1007E 00028144	v_cmpx_lt_i64_e64 v[68:69], v[64:65]
+7D720C81	v_cmpx_lt_u16_e32 1, v6
+D4B9007E 00023119	v_cmpx_lt_u16_e64 v25, v24
+7D922882	v_cmpx_lt_u32_e32 2, v20
+D4C9007E 0002130A	v_cmpx_lt_u32_e64 v10, v9
+7DB22484	v_cmpx_lt_u64_e32 4, v[18:19]
+D4D9007E 00020701	v_cmpx_lt_u64_e64 v[1:2], v[3:4]
+7D7A0480	v_cmpx_ne_u16_e32 0, v2
+D4BD007E 0002020C	v_cmpx_ne_u16_e64 s12, v1
+7D9A0A80	v_cmpx_ne_u32_e32 0, v5
+D4CD007E 00023136	v_cmpx_ne_u32_e64 v54, v24
+7DBA0681	v_cmpx_ne_u64_e32 1, v[3:4]
+D4DD007E 00020B0B	v_cmpx_ne_u64_e64 v[11:12], v[5:6]
+7D1A0A80	v_cmpx_neq_f16_e32 0, v5
+7D1A1305	v_cmpx_neq_f16_e32 v5, v9
+D48D027E 00021EFF 00007C00	v_cmpx_neq_f16_e64 0x7c00, |v15|
+D48D007E 00030352	v_cmpx_neq_f16_e64 v82, v129
+7D3A1280	v_cmpx_neq_f32_e32 0, v9
+7D3A171F	v_cmpx_neq_f32_e32 v31, v11
+D49D027E 00020CFF 7F800000	v_cmpx_neq_f32_e64 0x7f800000, |v6|
+7D5A1280	v_cmpx_neq_f64_e32 0, v[9:10]
+7D5A2912	v_cmpx_neq_f64_e32 v[18:19], v[20:21]
+D4AD027E 000202FF 7FF00000	v_cmpx_neq_f64_e64 0x7ff00000, |v[1:2]|
+7D1262FF 0000C200	v_cmpx_nge_f16_e32 0xc200, v49
+7D3200FF C0400000	v_cmpx_nge_f32_e32 0xc0400000, v0
+7D5222FF C0080000	v_cmpx_nge_f64_e32 0xc0080000, v[17:18]
+7D1620FF 00005400	v_cmpx_ngt_f16_e32 0x5400, v16
+7D360080	v_cmpx_ngt_f32_e32 0, v0
+7D362B14	v_cmpx_ngt_f32_e32 v20, v21
+D49B027E 000202FF 3F200000	v_cmpx_ngt_f32_e64 0x3f200000, |v1|
+D49B037E 0002372B	v_cmpx_ngt_f32_e64 |v43|, |v27|
+D49B017E 00026932	v_cmpx_ngt_f32_e64 |v50|, v52
+D49B017E 0001E509	v_cmpx_ngt_f32_e64 |v9|, 1.0
+7D560080	v_cmpx_ngt_f64_e32 0, v[0:1]
+7D560D04	v_cmpx_ngt_f64_e32 v[4:5], v[6:7]
+D4AB027E 000216FF 41D00000	v_cmpx_ngt_f64_e64 0x41d00000, |v[11:12]|
+D4AB017E 0002110A	v_cmpx_ngt_f64_e64 |v[10:11]|, v[8:9]
+D4AB017E 0001E505	v_cmpx_ngt_f64_e64 |v[5:6]|, 1.0
+7D1818F2	v_cmpx_nle_f16_e32 1.0, v12
+7D3818F2	v_cmpx_nle_f32_e32 1.0, v12
+7D381B03	v_cmpx_nle_f32_e32 v3, v13
+D49C017E 00023113	v_cmpx_nle_f32_e64 |v19|, v24
+7D584CF2	v_cmpx_nle_f64_e32 1.0, v[38:39]
+7D581602	v_cmpx_nle_f64_e32 s[2:3], v[11:12]
+D4AC017E 0002C155	v_cmpx_nle_f64_e64 |v[85:86]|, v[96:97]
+7D344923	v_cmpx_nlg_f32_e32 v35, v36
+D49A027E 000214FF 7F800000	v_cmpx_nlg_f32_e64 0x7f800000, |v10|
+7D544B23	v_cmpx_nlg_f64_e32 v[35:36], v[37:38]
+7D1C0280	v_cmpx_nlt_f16_e32 0, v1
+7D1C0209	v_cmpx_nlt_f16_e32 s9, v1
+D48E007E 40001D1A	v_cmpx_nlt_f16_e64 v26, -s14
+7D3C1080	v_cmpx_nlt_f32_e32 0, v8
+7D3C0B07	v_cmpx_nlt_f32_e32 v7, v5
+D49E007E 40001D0E	v_cmpx_nlt_f32_e64 v14, -s14
+D49E017E 0001E501	v_cmpx_nlt_f32_e64 |v1|, 1.0
+7D5C2080	v_cmpx_nlt_f64_e32 0, v[16:17]
+7D5C2B11	v_cmpx_nlt_f64_e32 v[17:18], v[21:22]
+D4AE007E 40000D19	v_cmpx_nlt_f64_e64 v[25:26], -s[6:7]
+D4AE017E 0002110A	v_cmpx_nlt_f64_e64 |v[10:11]|, v[8:9]
+D4AE017E 0001E509	v_cmpx_nlt_f64_e64 |v[9:10]|, 1.0
+7D0E2713	v_cmpx_o_f16_e32 v19, v19
+7D2E0F07	v_cmpx_o_f32_e32 v7, v7
+7D4E2311	v_cmpx_o_f64_e32 v[17:18], v[17:18]
+7D100100	v_cmpx_u_f16_e32 v0, v0
+7D300100	v_cmpx_u_f32_e32 v0, v0
+7D500100	v_cmpx_u_f64_e32 v[0:1], v[0:1]
+02021501	v_cndmask_b32_e32 v1, v1, v10, vcc_lo
+02140280	v_cndmask_b32_e32 v10, 0, v1, vcc_lo
+D5010001 000A0280	v_cndmask_b32_e64 v1, 0, v1, s2
+D5010012 000A210E	v_cndmask_b32_e64 v18, v14, v16, s2
+D5010002 01A90280	v_cndmask_b32_e64 v2, 0, 1, vcc_lo
+D5010004 00090280	v_cndmask_b32_e64 v4, 0, 1, s2
+D5010004 01A80080	v_cndmask_b32_e64 v4, 0, s0, vcc_lo
+D5010007 00010104	v_cndmask_b32_e64 v7, v4, 0, s0
+7E1C6D0E	v_cos_f32_e32 v14, v14
+7E0474C1	v_ctz_i32_b32_e32 v2, -1
+7E067501	v_ctz_i32_b32_e32 v3, v1
+7E081501	v_cvt_f16_f32_e32 v4, v1
+D58A000A 2000010A	v_cvt_f16_f32_e64 v10, -v10
+D58A00A9 00000121	v_cvt_f16_f32_e64 v169, v33
+7E06A303	v_cvt_f16_i16_e32 v3, v3
+7E06A103	v_cvt_f16_u16_e32 v3, v3
+7EC6DB63	v_cvt_f32_bf8_e32 v99, v99
+7E021701	v_cvt_f32_f16_e32 v1, v1
+D58B00B0 00000111	v_cvt_f32_f16_e64 v176, v17
+D58B0021 20000111	v_cvt_f32_f16_e64 v33, -v17
+D58B0130 2000013A	v_cvt_f32_f16_e64 v48, -|v58|
+D58B013F 0000012D	v_cvt_f32_f16_e64 v63, |v45|
+7E2A1F15	v_cvt_f32_f64_e32 v21, v[21:22]
+7EB8D95C	v_cvt_f32_fp8_e32 v92, v92
+7E060B0F	v_cvt_f32_i32_e32 v3, v15
+7E380D0A	v_cvt_f32_u32_e32 v28, v10
+7E1C230A	v_cvt_f32_ubyte0_e32 v14, v10
+7E062280	v_cvt_f32_ubyte0_e32 v3, 0
+7E102502	v_cvt_f32_ubyte1_e32 v8, v2
+7E122702	v_cvt_f32_ubyte2_e32 v9, v2
+7E042902	v_cvt_f32_ubyte3_e32 v2, v2
+7E0E2105	v_cvt_f64_f32_e32 v[7:8], v5
+D5900104 00000100	v_cvt_f64_f32_e64 v[4:5], |v0|
+7E0A0803	v_cvt_f64_i32_e32 v[5:6], s3
+7E042C80	v_cvt_f64_u32_e32 v[2:3], 0
+7E062C09	v_cvt_f64_u32_e32 v[3:4], s9
+7E04A702	v_cvt_i16_f16_e32 v2, v2
+7E021101	v_cvt_i32_f32_e32 v1, v1
+7E0E0707	v_cvt_i32_f64_e32 v7, v[7:8]
+D76A0068 0002CD66	v_cvt_pk_bf8_f32 v104, v102, v102
+D769001B 0002B95C	v_cvt_pk_fp8_f32 v27, v92, v92
+7E08A503	v_cvt_u16_f16_e32 v4, v3
+7E020F01	v_cvt_u32_f32_e32 v1, v1
+7E0C2B05	v_cvt_u32_f64_e32 v6, v[5:6]
+D6540002 04220506	v_div_fixup_f16 v2, v6, v2, v8
+D6540435 04C8C72D	v_div_fixup_f16 v53, v45, s99, |v50|
+D6270000 03CA0102	v_div_fixup_f32 v0, v2, v0, 1.0
+D6270001 447E4101	v_div_fixup_f32 v1, v1, -v32, v31
+D6270001 84823F01	v_div_fixup_f32 v1, v1, v31, -v32
+D627000C 0411010C	v_div_fixup_f32 v12, v12, 0, v4
+D627040F 044E1B0F	v_div_fixup_f32 v15, v15, v13, |v19|
+D6270003 040E1F10	v_div_fixup_f32 v3, v16, v15, v3
+D6280016 04510116	v_div_fixup_f64 v[22:23], v[22:23], 0, v[20:21]
+D6280002 44422502	v_div_fixup_f64 v[2:3], v[2:3], -v[18:19], v[16:17]
+D6280002 844A2102	v_div_fixup_f64 v[2:3], v[2:3], v[16:17], -v[18:19]
+D6280022 04162D1E	v_div_fixup_f64 v[34:35], v[30:31], v[22:23], v[5:6]
+D6280423 04AE3F23	v_div_fixup_f64 v[35:36], v[35:36], v[31:32], |v[43:44]|
+D6280009 03CA130B	v_div_fixup_f64 v[9:10], v[11:12], v[9:10], 1.0
+D6370010 044E2310	v_div_fmas_f32 v16, v16, v17, v19
+D638000B 044E1B0B	v_div_fmas_f64 v[11:12], v[11:12], v[13:14], v[19:20]
+D6FC7C01 647E4120	v_div_scale_f32 v1, null, -v32, -v32, v31
+D6FC7C10 040E1F0F	v_div_scale_f32 v16, null, v15, v15, v3
+D6FC6A12 040E1F03	v_div_scale_f32 v18, vcc_lo, v3, v15, v3
+D6FC7C02 03CA0100	v_div_scale_f32 v2, null, v0, v0, 1.0
+D6FC6A04 03CA00F2	v_div_scale_f32 v4, vcc_lo, 1.0, v0, 1.0
+D6FC0033 04022900	v_div_scale_f32 v51, s0, v0, v20, v0
+D6FD7C0B 03CA1309	v_div_scale_f64 v[11:12], null, v[9:10], v[9:10], 1.0
+D6FD6A0F 03CA12F2	v_div_scale_f64 v[15:16], vcc_lo, 1.0, v[9:10], 1.0
+D6FD7C02 64422512	v_div_scale_f64 v[2:3], null, -v[18:19], -v[18:19], v[16:17]
+D6FD7C1E 04162D16	v_div_scale_f64 v[30:31], null, v[22:23], v[22:23], v[5:6]
+D6FD6A24 04162D05	v_div_scale_f64 v[36:37], vcc_lo, v[5:6], v[22:23], v[5:6]
+D6FD6A4D 44422510	v_div_scale_f64 v[77:78], vcc_lo, v[16:17], -v[18:19], v[16:17]
+CC13400D 1C361F0E	v_dot2_f32_f16 v13, v14, v15, v13
+CC164003 7C0E0B01	v_dot4_i32_iu8 v3, v1, v5, v3 neg_lo:[1,1,0]
+C920870C 0C408282	v_dual_add_f32 v12, v12, v67 :: v_dual_add_nc_u32 v65, 2, v65
+C9103B18 181C0126	v_dual_add_f32 v24, v24, v29 :: v_dual_mov_b32 v29, v38
+C910B358 1B580080	v_dual_add_f32 v27, v88, v89 :: v_dual_mov_b32 v88, 0
+C9000706 03001104	v_dual_add_f32 v3, v6, v3 :: v_dual_fmac_f32 v0, v4, v8
+C9201880 08060A1B	v_dual_add_f32 v8, 0, v12 :: v_dual_add_nc_u32 v7, s27, v5
+C9121880 08040A80	v_dual_add_f32 v8, 0, v12 :: v_dual_cndmask_b32 v5, 0, v5
+CA601501 010C16FF 00000800	v_dual_cndmask_b32 v1, v1, v10 :: v_dual_add_nc_u32 v12, 0x800, v11
+CA500E80 0A060080	v_dual_cndmask_b32 v10, 0, v7 :: v_dual_mov_b32 v7, 0
+CA501503 02020080	v_dual_cndmask_b32 v2, v3, v10 :: v_dual_mov_b32 v3, 0
+CA460480 15120112	v_dual_cndmask_b32 v21, 0, v2 :: v_dual_mul_f32 v18, v18, v0
+CA520906 06040705	v_dual_cndmask_b32 v6, v6, v4 :: v_dual_cndmask_b32 v5, v5, v3
+CA521480 08061A80	v_dual_cndmask_b32 v8, 0, v10 :: v_dual_cndmask_b32 v7, 0, v13
+C852C8FF 6462C765 2F800000	v_dual_fmaak_f32 v100, 0x2f800000, v100, 0x2f800000 :: v_dual_cndmask_b32 v99, v101, v99
+C8621D09 0E060E9E BF000004	v_dual_fmaak_f32 v14, v9, v14, 0xbf000004 :: v_dual_lshlrev_b32 v7, 30, v7
+C8424714 14142B19 3F2AAADA	v_dual_fmaak_f32 v20, v20, v35, 0x3f2aaada :: v_dual_fmaak_f32 v21, v25, v21, 0x3f2aaada
+C8462F1B 170E2D0E 3F2AAADA	v_dual_fmaak_f32 v23, v27, v23, 0x3f2aaada :: v_dual_mul_f32 v14, v14, v22
+C84298FF 4C4C9AFF 2F800000	v_dual_fmaak_f32 v76, 0x2f800000, v76, 0x2f800000 :: v_dual_fmaak_f32 v77, 0x2f800000, v77, 0x2f800000
+C86012FF 090A1CC1 30C90FDB	v_dual_fmaak_f32 v9, 0x30c90fdb, v9, 0x30c90fdb :: v_dual_add_nc_u32 v10, -1, v14
+C8201904 0A0812FF 00000200	v_dual_fmac_f32 v10, v4, v12 :: v_dual_add_nc_u32 v9, 0x200, v9
+C822DAFF 716ED68F B9FD0000	v_dual_fmac_f32 v113, 0xb9fd0000, v109 :: v_dual_lshlrev_b32 v110, 15, v107
+C8100D05 0F08010E	v_dual_fmac_f32 v15, v5, v6 :: v_dual_mov_b32 v8, v14
+C8102303 10100080	v_dual_fmac_f32 v16, v3, v17 :: v_dual_mov_b32 v17, 0
+C80A1AFF 13102910 32A5705F	v_dual_fmac_f32 v19, 0x32a5705f, v13 :: v_dual_sub_f32 v16, v16, v20
+C8001111 08081312	v_dual_fmac_f32 v8, v17, v8 :: v_dual_fmac_f32 v9, v18, v9
+C88A1709 0B0A190A 32A5705F	v_dual_fmamk_f32 v11, v9, 0x32a5705f, v11 :: v_dual_sub_f32 v10, v10, v12
+C884050C 16160F0D BF317218	v_dual_fmamk_f32 v22, v12, 0xbf317218, v2 :: v_dual_fmamk_f32 v23, v13, 0xbf317218, v7
+C8822734 35305E00 40700000	v_dual_fmamk_f32 v53, v52, 0x40700000, v19 :: v_dual_fmaak_f32 v48, s0, v47, 0x40700000
+C890273D 3C780080 40700000	v_dual_fmamk_f32 v60, v61, 0x40700000, v19 :: v_dual_mov_b32 v121, 0
+C880130A 070A1280 80000000	v_dual_fmamk_f32 v7, v10, 0x80000000, v9 :: v_dual_fmac_f32 v10, 0, v9
+CAA50B85 85942EFF 000000FF	v_dual_max_num_f32 v133, v133, v133 :: v_dual_and_b32 v148, 0xff, v23
+CA800C80 19080F03	v_dual_max_num_f32 v25, 0, v6 :: v_dual_fmac_f32 v8, v3, v7
+CA826736 2F30612D BE1160E6	v_dual_max_num_f32 v47, v54, v51 :: v_dual_fmaak_f32 v48, v45, v48, 0xbe1160e6
+CA941108 08122713	v_dual_max_num_f32 v8, v8, v8 :: v_dual_max_num_f32 v19, v19, v19
+CA90B75C 5B5C0080	v_dual_max_num_f32 v91, v92, v91 :: v_dual_mov_b32 v92, 0
+CA90C763 636A0131	v_dual_max_num_f32 v99, v99, v99 :: v_dual_mov_b32 v106, v49
+CAE4CF95 7470E4FF 000000FF	v_dual_min_num_f32 v116, v149, v103 :: v_dual_and_b32 v113, 0xff, v114
+CAC81880 0C1006F2	v_dual_min_num_f32 v12, 0, v12 :: v_dual_add_f32 v17, 1.0, v3
+CAD0DDC6 97960080	v_dual_min_num_f32 v151, v198, v110 :: v_dual_mov_b32 v150, 0
+CAC25D30 2E2C5B32 3D29FB3F	v_dual_min_num_f32 v46, v48, v46 :: v_dual_fmaak_f32 v45, v50, v45, 0x3d29fb3f
+CAD60314 05060515	v_dual_min_num_f32 v5, v20, v1 :: v_dual_min_num_f32 v6, v21, v2
+CACA1080 08020706	v_dual_min_num_f32 v8, 0, v8 :: v_dual_sub_f32 v3, v6, v3
+CA200080 0F0E0B06	v_dual_mov_b32 v15, 0 :: v_dual_add_nc_u32 v14, v6, v5
+CA220080 02040281	v_dual_mov_b32 v2, 0 :: v_dual_lshlrev_b32 v5, 1, v1
+CA200080 03080275	v_dual_mov_b32 v3, 0 :: v_dual_add_nc_u32 v8, ttmp9, v1
+CA100080 03040080	v_dual_mov_b32 v3, 0 :: v_dual_mov_b32 v4, 0
+CA100080 0408010A	v_dual_mov_b32 v4, 0 :: v_dual_mov_b32 v9, v10
+CA10010B 04020107	v_dual_mov_b32 v4, v11 :: v_dual_mov_b32 v3, v7
+C8D00101 0B00010A	v_dual_mul_f32 v11, v1, v0 :: v_dual_mov_b32 v0, v10
+C8C61CFF 0E1810FF 4F7FFFFE	v_dual_mul_f32 v14, 0x4f7ffffe, v14 :: v_dual_mul_f32 v25, 0x4f7ffffe, v8
+C8C01D10 0E041F03	v_dual_mul_f32 v14, v16, v14 :: v_dual_fmac_f32 v5, v3, v15
+C8D232FF 1904091A 4F7FFFFE	v_dual_mul_f32 v25, 0x4f7ffffe, v25 :: v_dual_cndmask_b32 v4, v26, v4
+C8D20121 1E200C80	v_dual_mul_f32 v30, v33, v0 :: v_dual_cndmask_b32 v33, 0, v6
+C8D03F04 1F480080	v_dual_mul_f32 v31, v4, v31 :: v_dual_mov_b32 v72, 0
+C952030A 01040880	v_dual_sub_f32 v1, v10, v1 :: v_dual_cndmask_b32 v4, 0, v4
+C950172E 0B340081	v_dual_sub_f32 v11, v46, v11 :: v_dual_mov_b32 v52, 1
+C9500F14 0C0C0107	v_dual_sub_f32 v12, v20, v7 :: v_dual_mov_b32 v13, v7
+C946151D 1D160116	v_dual_sub_f32 v29, v29, v10 :: v_dual_mul_f32 v22, v22, v0
+C9461A80 3D3C250E	v_dual_sub_f32 v61, 0, v13 :: v_dual_mul_f32 v60, v14, v18
+C9421708 080A1AFF 30C90FDB	v_dual_sub_f32 v8, v8, v11 :: v_dual_fmaak_f32 v11, 0x30c90fdb, v13, 0x30c90fdb
+C9A4020C 0B1020FF FFFF0000	v_dual_subrev_f32 v11, s12, v1 :: v_dual_and_b32 v16, 0xffff0000, v16
+C9902A80 17200114	v_dual_subrev_f32 v23, 0, v21 :: v_dual_mov_b32 v32, v20
+C986080C 180E1F06	v_dual_subrev_f32 v24, s12, v4 :: v_dual_mul_f32 v15, v6, v15
+C990020C 080000FF 7FC00000	v_dual_subrev_f32 v8, s12, v1 :: v_dual_mov_b32 v1, 0x7fc00000
+7E1A4B0D	v_exp_f32_e32 v13, v13
+7E18B708	v_floor_f16_e32 v12, v8
+7E0C4906	v_floor_f32_e32 v6, v6
+7E0E3507	v_floor_f64_e32 v[7:8], v[7:8]
+D648000B 8436170C	v_fma_f16 v11, v12, v11, -v13
+D6480085 044B2186	v_fma_f16 v133, v134, v144, v18
+D6480013 03CA2B13	v_fma_f16 v19, v19, v21, 1.0
+D6480002 23CA2713	v_fma_f16 v2, -v19, v19, 1.0
+D6480006 262F1506	v_fma_f16 v6, -v6, v138, v139
+D6130012 23CA2310	v_fma_f32 v18, -v16, v17, 1.0
+D6130014 244A2710	v_fma_f32 v20, -v16, v19, v18
+D6130003 0202070A	v_fma_f32 v3, v10, v3, 0
+D6130004 04121F05	v_fma_f32 v4, v5, v15, v4
+D6130005 03CD0106	v_fma_f32 v5, v6, 0, -1.0
+D6130008 84560E02	v_fma_f32 v8, s2, v7, -v21
+D6140070 044AE118	v_fma_f64 v[112:113], v[24:25], v[112:113], v[18:19]
+D614000D 03C5E10D	v_fma_f64 v[13:14], v[13:14], 0.5, -0.5
+D6140013 23C2230F	v_fma_f64 v[19:20], -v[15:16], v[17:18], 0.5
+D6140013 24362311	v_fma_f64 v[19:20], -v[17:18], v[17:18], v[13:14]
+D6140005 04160EFF C1F00000	v_fma_f64 v[5:6], 0xc1f00000, v[7:8], v[5:6]
+D6140009 0202130F	v_fma_f64 v[9:10], v[15:16], v[9:10], 0
+CC20000A 942A0206	v_fma_mix_f32 v10, s6, v1, -v10 op_sel_hi:[0,1,0]
+CC20000B 147A6B31	v_fma_mix_f32 v11, v49, v53, v30 op_sel_hi:[0,1,0]
+CC20000E 1202110A	v_fma_mix_f32 v14, v10, v8, 0 op_sel_hi:[0,1,0]
+CC20002B 2CAC3311	v_fma_mix_f32 v43, -v17, s25, v43 op_sel_hi:[1,0,0]
+CC20002B ACC83511	v_fma_mix_f32 v43, -v17, s26, -v50 op_sel_hi:[1,0,0]
+CC201009 1426150F	v_fma_mix_f32 v9, v15, v10, v9 op_sel:[0,1,0] op_sel_hi:[0,1,0]
+CC227000 142E5110	v_fma_mixhi_f16 v0, v16, v40, v11 op_sel:[0,1,1] op_sel_hi:[0,1,1]
+CC22000C 02020713	v_fma_mixhi_f16 v12, v19, v3, 0
+CC22700E 342A1010	v_fma_mixhi_f16 v14, -s16, v8, v10 op_sel:[0,1,1] op_sel_hi:[0,1,1]
+CC22000E 000C070D	v_fma_mixhi_f16 v14, v13, s3, s3
+CC220020 12023941	v_fma_mixhi_f16 v32, v65, v28, 0 op_sel_hi:[0,1,0]
+CC221005 1202080F	v_fma_mixhi_f16 v5, s15, v4, 0 op_sel:[0,1,0] op_sel_hi:[0,1,0]
+CC214000 142E510F	v_fma_mixlo_f16 v0, v15, v40, v11 op_sel_hi:[0,1,1]
+CC210001 04060B04	v_fma_mixlo_f16 v1, v4, v5, v1
+CC21000C 02024C1E	v_fma_mixlo_f16 v12, s30, v38, 0
+CC21000D 12021630	v_fma_mixlo_f16 v13, s48, v11, 0 op_sel_hi:[0,1,0]
+CC211017 1202071C	v_fma_mixlo_f16 v23, v28, v3, 0 op_sel:[0,1,0] op_sel_hi:[0,1,0]
+CC216006 1C220D00	v_fma_mixlo_f16 v6, v0, v6, v8 op_sel:[0,0,1] op_sel_hi:[1,1,1]
+70282616 0000B155	v_fmaak_f16 v20, s22, v19, 0xb155
+5A1A1AFF 2F800000	v_fmaak_f32 v13, 0x2f800000, v13, 0x2f800000
+5A080609 3AB69700	v_fmaak_f32 v4, s9, v3, 0x3ab69700
+6C242B1B	v_fmac_f16_e32 v18, v27, v21
+D53600A1 00022F1B	v_fmac_f16_e64 v161, v27, v23
+561A14F0	v_fmac_f32_e32 v13, 0.5, v10
+56222312	v_fmac_f32_e32 v17, v18, v17
+D52B0005 00005E23	v_fmac_f32_e64 v5, s35, s47
+6E0E2709 00004380	v_fmamk_f16 v7, v9, 0x4380, v19
+5814150B 4F800000	v_fmamk_f32 v10, v11, 0x4f800000, v10
+58060680 4F800000	v_fmamk_f32 v3, 0, 0x4f800000, v3
+7E2A7D1B	v_fract_f64_e32 v[21:22], v[27:28]
+7E087F04	v_frexp_exp_i32_f32_e32 v4, v4
+7E12790F	v_frexp_exp_i32_f64_e32 v9, v[15:16]
+7E068111	v_frexp_mant_f32_e32 v3, v17
+D5C00104 00000100	v_frexp_mant_f32_e64 v4, |v0|
+7E027B0F	v_frexp_mant_f64_e32 v[1:2], v[15:16]
+D5BD0101 00000004	v_frexp_mant_f64_e64 v[1:2], |s[4:5]|
+00000000	v_illegal
+D71C000A 0002170A	v_ldexp_f32 v10, v10, v11
+D71C0002 000204F2	v_ldexp_f32 v2, 1.0, v2
+D71C0014 00010311	v_ldexp_f32 v20, v17, 1
+D71C001A 2002351C	v_ldexp_f32 v26, -v28, v26
+D71C011C 00023709	v_ldexp_f32 v28, |v9|, v27
+D72B000D 20022F0D	v_ldexp_f64 v[13:14], -v[13:14], v23
+D72B000D 00020D0D	v_ldexp_f64 v[13:14], v[13:14], v6
+D72B0003 000206F2	v_ldexp_f64 v[3:4], 1.0, v3
+D72B0003 00014103	v_ldexp_f64 v[3:4], v[3:4], 32
+D72B0103 00000503	v_ldexp_f64 v[3:4], |v[3:4]|, s2
+D72B0163 0001FF3C FFFFFFCD	v_ldexp_f64 v[99:100], |v[60:61]|, 0xffffffcd
+7E1A4F0D	v_log_f32_e32 v13, v13
+D6460001 040D0873	v_lshl_add_u32 v1, ttmp7, 4, v3
+D6460001 00B02904	v_lshl_add_u32 v1, v4, s20, s44
+D6460002 040D0302	v_lshl_add_u32 v2, v2, 1, v3
+D646001B 040E08C1	v_lshl_add_u32 v27, -1, v4, v3
+D6460005 04010E75	v_lshl_add_u32 v5, ttmp9, 7, v0
+D6460035 03FD0335 00000050	v_lshl_add_u32 v53, v53, 1, 0x50
+D6560000 04010C75	v_lshl_or_b32 v0, ttmp9, 6, v0
+D6560001 04010A73	v_lshl_or_b32 v1, ttmp7, 5, v0
+D6560001 03FD0500 00000080	v_lshl_or_b32 v1, v0, 2, 0x80
+D6560010 04421F12	v_lshl_or_b32 v16, v18, v15, v16
+D6560002 040D1C0B	v_lshl_or_b32 v2, s11, 14, v3
+D7380001 00010088	v_lshlrev_b16 v1, 8, 0
+D738005B 0002B688	v_lshlrev_b16 v91, 8, v91
+30140302	v_lshlrev_b32_e32 v10, v2, v1
+30160082	v_lshlrev_b32_e32 v11, 2, v0
+D5180001 00002082	v_lshlrev_b32_e64 v1, 2, s16
+D5180001 00001301	v_lshlrev_b32_e64 v1, v1, s9
+D5180013 00010315	v_lshlrev_b32_e64 v19, v21, 1
+3E1C0001	v_lshlrev_b64_e32 v[14:15], s1, v[0:1]
+3E524696	v_lshlrev_b64_e32 v[41:42], 22, v[35:36]
+D51F000B 00010315	v_lshlrev_b64_e64 v[11:12], v21, 1
+D51F0001 00002883	v_lshlrev_b64_e64 v[1:2], 3, s[20:21]
+D51F0009 00000901	v_lshlrev_b64_e64 v[9:10], v1, s[4:5]
+D7390060 0002C088	v_lshrrev_b16 v96, 8, v96
+32020086	v_lshrrev_b32_e32 v1, 6, v0
+3202020D	v_lshrrev_b32_e32 v1, s13, v1
+D519000D 00000F0A	v_lshrrev_b32_e64 v13, v10, s7
+D5190014 00018302	v_lshrrev_b32_e64 v20, v2, -1
+D5190004 00001E90	v_lshrrev_b32_e64 v4, 16, s15
+D73D0000 00021C10	v_lshrrev_b64 v[0:1], s16, v[14:15]
+D73D0008 00018301	v_lshrrev_b64 v[8:9], v1, -1
+D73D0009 00020A96	v_lshrrev_b64 v[9:10], 22, v[5:6]
+D6FF7C0B 002A12FF 00000048	v_mad_co_i64_i32 v[11:12], null, 0x48, v9, s[10:11]
+D6FF7C0F 04967717	v_mad_co_i64_i32 v[15:16], null, v23, v59, v[37:38]
+D6FF7C0F 02027B17	v_mad_co_i64_i32 v[15:16], null, v23, v61, 0
+D6FF7C39 0425303C	v_mad_co_i64_i32 v[57:58], null, s60, 24, v[9:10]
+D6FE7C00 040A0E13	v_mad_co_u64_u32 v[0:1], null, s19, v7, v[2:3]
+D6FE7C02 0200A102	v_mad_co_u64_u32 v[2:3], null, v2, s80, 0
+D6FE7C28 0492546B	v_mad_co_u64_u32 v[40:41], null, vcc_hi, v42, v[36:37]
+D6FE7C29 05080EFF 00000060	v_mad_co_u64_u32 v[41:42], null, 0x60, s7, v[66:67]
+D6FE7C29 050D6007	v_mad_co_u64_u32 v[41:42], null, s7, 48, v[67:68]
+D6FE7C05 051CD706	v_mad_co_u64_u32 v[5:6], null, v6, vcc_hi, v[71:72]
+D60A000A 00659F00	v_mad_i32_i24 v10, v0, -15, s25
+D60A0005 04163EFF 00000600	v_mad_i32_i24 v5, 0x600, v31, v5
+D60A0005 04160017	v_mad_i32_i24 v5, s23, v0, v5
+D6410044 061B0744	v_mad_u16 v68, v68, v131, v134
+D60B000D 001E060E	v_mad_u32_u24 v13, s14, v3, s7
+D60B0013 03FC2304 000042E8	v_mad_u32_u24 v19, v4, s17, 0x42e8
+D60B0022 02917120	v_mad_u32_u24 v34, v32, 56, 36
+D60B0034 04CA68FF 00000110	v_mad_u32_u24 v52, 0x110, v52, v50
+D60B0038 02024AFF 00000044	v_mad_u32_u24 v56, 0x44, v37, 0
+D60B0006 04292900	v_mad_u32_u24 v6, v0, 20, v10
+D64D0003 04120701	v_max3_i16 v3, v1, v3, v4
+D61D0001 04120701	v_max3_i32 v1, v1, v3, v4
+D61D0008 02020C1F	v_max3_i32 v8, s31, v6, 0
+D62A020D 04361E16	v_max3_num_f32 v13, s22, |v15|, v13
+D62A070D 043E1D0D	v_max3_num_f32 v13, |v13|, |v14|, |v15|
+D62A0602 040E041F	v_max3_num_f32 v2, s31, |v2|, |v3|
+D62A0008 042A1308	v_max3_num_f32 v8, v8, v9, v10
+D64E0002 040A0701	v_max3_u16 v2, v1, v3, v2
+D70A0006 00022506	v_max_i16 v6, v6, v18
+25062412	v_max_i32_e32 v131, s18, v18
+24040480	v_max_i32_e32 v2, 0, v2
+62040100	v_max_num_f16_e32 v2, v0, v0
+620606FF 0000D640	v_max_num_f16_e32 v3, 0xd640, v3
+D531000B 00001008	v_max_num_f16_e64 v11, s8, s8
+2C300880	v_max_num_f32_e32 v24, 0, v4
+2C0A0B05	v_max_num_f32_e32 v5, v5, v5
+D5160000 00000201	v_max_num_f32_e64 v0, s1, s1
+D516030D 00021B0D	v_max_num_f32_e64 v13, |v13|, |v13|
+D516022F 0002752F	v_max_num_f32_e64 v47, v47, |v58|
+D5160005 6002150A	v_max_num_f32_e64 v5, -v10, -v10
+D5160133 00026748	v_max_num_f32_e64 v51, |v72|, v51
+1C061280	v_max_num_f64_e32 v[3:4], 0, v[9:10]
+1C060703	v_max_num_f64_e32 v[3:4], v[3:4], v[3:4]
+D50E0000 00000000	v_max_num_f64_e64 v[0:1], s[0:1], s[0:1]
+D50E000A 60020502	v_max_num_f64_e64 v[10:11], -v[2:3], -v[2:3]
+D50E020A 0002090A	v_max_num_f64_e64 v[10:11], v[10:11], |v[4:5]|
+D50E031F 00023F1F	v_max_num_f64_e64 v[31:32], |v[31:32]|, |v[31:32]|
+D50E0121 0002471F	v_max_num_f64_e64 v[33:34], |v[31:32]|, v[35:36]
+D7090009 0002130C	v_max_u16 v9, v12, v9
+28202081	v_max_u32_e32 v16, 1, v16
+280C0304	v_max_u32_e32 v6, v4, v1
+D664000A 0448150A	v_maxmin_i32 v10, v10, s10, v18
+D669000E 04421D0F	v_maxmin_num_f32 v14, v15, v14, v16
+D6690002 03FD0102 40C00000	v_maxmin_num_f32 v2, v2, 0, 0x40c00000
+D6690002 04110102	v_maxmin_num_f32 v2, v2, 0, v4
+D71F0002 00010012	v_mbcnt_lo_u32_b32 v2, s18, 0
+D71F001C 000100C1	v_mbcnt_lo_u32_b32 v28, -1, 0
+D71F0006 0001007E	v_mbcnt_lo_u32_b32 v6, exec_lo, 0
+D6200001 04460D01	v_med3_i32 v1, v1, v6, v17
+D631006C 03FC515C C3E00000	v_med3_num_f32 v108, v92, s40, 0xc3e00000
+D6310006 03FD0106 40C00000	v_med3_num_f32 v6, v6, 0, 0x40c00000
+D64A0002 04320503	v_min3_i16 v2, v3, v2, v12
+D61A001A 00484F1A	v_min3_i32 v26, v26, s39, s18
+D6290000 03FE0300 7F7FFFFF	v_min3_num_f32 v0, v0, v1, 0x7f7fffff
+D6290092 04BB2580	v_min3_num_f32 v146, v128, v146, v46
+D64B0015 041E1504	v_min3_u16 v21, v4, v10, v7
+D70C0009 0002130C	v_min_i16 v9, v12, v9
+22261F13	v_min_i32_e32 v19, v19, v15
+224814C0	v_min_i32_e32 v36, 64, v10
+604E1D0D	v_min_num_f16_e32 v39, v13, v14
+2A220D12	v_min_num_f32_e32 v17, v18, v6
+2A8E8880	v_min_num_f32_e32 v71, 0, v68
+D515023F 0002752F	v_min_num_f32_e64 v63, v47, |v58|
+D5150142 00026748	v_min_num_f32_e64 v66, |v72|, v51
+1A0808FF 40700000	v_min_num_f64_e32 v[4:5], 0x40700000, v[4:5]
+1A0A0705	v_min_num_f64_e32 v[5:6], v[5:6], v[3:4]
+D50D0123 0002471F	v_min_num_f64_e64 v[35:36], |v[31:32]|, v[35:36]
+D70B0002 00021502	v_min_u16 v2, v2, v10
+26CAA4FF 000001C0	v_min_u32_e32 v101, 0x1c0, v82
+26109019	v_min_u32_e32 v8, s25, v72
+D6650022 0200150A	v_minmax_i32 v34, v10, s10, 0
+7E1802FA FF011107	v_mov_b32_dpp v12, v7 row_shr:1 row_mask:0xf bank_mask:0xf
+7E0402FA FF00B101	v_mov_b32_dpp v2, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+7E0402FA FF012401	v_mov_b32_dpp v2, v1 row_ror:4 row_mask:0xf bank_mask:0xf
+7E00027E	v_mov_b32_e32 v0, exec_lo
+7E1C0280	v_mov_b32_e32 v14, 0
+7E1E026B	v_mov_b32_e32 v15, vcc_hi
+7E040275	v_mov_b32_e32 v2, ttmp9
+7E12030A	v_mov_b32_e32 v9, v10
+7E12851A	v_movreld_b32_e32 v9, v26
+7E368709	v_movrels_b32_e32 v27, v9
+6A1A1AF5	v_mul_f16_e32 v13, -2.0, v13
+6A0A2705	v_mul_f16_e32 v5, v5, v19
+D535000E 2002020D	v_mul_f16_e64 v14, -s13, v1
+D5350097 00022515	v_mul_f16_e64 v151, v21, v18
+D535002F 40020107	v_mul_f16_e64 v47, v7, -v0
+100202FF 4F7FFFFE	v_mul_f32_e32 v1, 0x4f7ffffe, v1
+10262312	v_mul_f32_e32 v19, v18, v17
+D5080212 00020A26	v_mul_f32_e64 v18, s38, |v5|
+D5080112 0001E120	v_mul_f32_e64 v18, |v32|, 0.5
+D5080218 000264FF 4F800000	v_mul_f32_e64 v24, 0x4f800000, |v50|
+D5080123 00023F20	v_mul_f32_e64 v35, |v32|, v31
+D508003C 20027938	v_mul_f32_e64 v60, -v56, v60
+D5080009 40021109	v_mul_f32_e64 v9, v9, -v8
+0C1A8F0D	v_mul_f64_e32 v[13:14], v[13:14], v[71:72]
+0C1E1EF0	v_mul_f64_e32 v[15:16], 0.5, v[15:16]
+D5060102 0002040A	v_mul_f64_e64 v[2:3], |s[10:11]|, v[2:3]
+D5060223 00023EFF 40240000	v_mul_f64_e64 v[35:36], 0x40240000, |v[31:32]|
+D5060005 0000240E	v_mul_f64_e64 v[5:6], s[14:15], s[18:19]
+D5060006 40021B04	v_mul_f64_e64 v[6:7], v[4:5], -v[13:14]
+D5060007 00010012	v_mul_f64_e64 v[7:8], s[18:19], 0
+D5060209 00023B09	v_mul_f64_e64 v[9:10], v[9:10], |v[29:30]|
+D72E0003 000206FF 00000180	v_mul_hi_i32 v3, 0x180, v3
+D72D0000 00020AFF CCCCCCCD	v_mul_hi_u32 v0, 0xcccccccd, v5
+D72D0001 00020E03	v_mul_hi_u32 v1, s3, v7
+D72D0064 0002B26B	v_mul_hi_u32 v100, vcc_hi, v89
+D72D0005 00020C75	v_mul_hi_u32 v5, ttmp9, v6
+D72D0043 0000D741	v_mul_hi_u32 v67, v65, vcc_hi
+D72D0008 00010B00	v_mul_hi_u32 v8, v0, 5
+18020086	v_mul_hi_u32_u24_e32 v1, 6, v0
+180C0202	v_mul_hi_u32_u24_e32 v6, s2, v1
+121A0233	v_mul_i32_i24_e32 v13, s51, v1
+125A02FF FFFFF400	v_mul_i32_i24_e32 v45, 0xfffff400, v1
+D7050002 00010B01	v_mul_lo_u16 v2, v1, 5
+D7050016 00022D30	v_mul_lo_u16 v22, v48, v22
+D7050003 000202FF 00000056	v_mul_lo_u16 v3, 0x56, v1
+D72C0001 000202FF 000001C0	v_mul_lo_u32 v1, 0x1c0, v1
+D72C0001 00021002	v_mul_lo_u32 v1, s2, v8
+D72C001B 00020C6A	v_mul_lo_u32 v27, vcc_lo, v6
+D72C0023 0002446B	v_mul_lo_u32 v35, vcc_hi, v34
+D72C002E 0000D70E	v_mul_lo_u32 v46, v14, vcc_hi
+D72C0050 00017106	v_mul_lo_u32 v80, v6, 56
+16382AFF 00000108	v_mul_u32_u24_e32 v28, 0x108, v21
+16A6B153	v_mul_u32_u24_e32 v83, v83, v88
+D50B0002 00012603	v_mul_u32_u24_e64 v2, s3, 19
+7E000000	v_nop
+7E2E6E9F	v_not_b32_e32 v23, 31
+7E066F21	v_not_b32_e32 v3, v33
+D6580000 04462500	v_or3_b32 v0, v0, v18, v17
+D6580010 04410080	v_or3_b32 v16, 0, 0, v16
+D6580010 02022080	v_or3_b32 v16, 0, v16, 0
+D6580012 04522680	v_or3_b32 v18, 0, v19, v20
+D6580012 04510113	v_or3_b32 v18, v19, 0, v20
+D6580003 03FE060B 00004000	v_or3_b32 v3, s11, v3, 0x4000
+38020075	v_or_b32_e32 v1, ttmp9, v0
+38024A6B	v_or_b32_e32 v1, vcc_hi, v37
+38040402	v_or_b32_e32 v2, s2, v2
+38321EFF 00002000	v_or_b32_e32 v25, 0x2000, v15
+38081873	v_or_b32_e32 v4, ttmp7, v12
+D51C0013 00010012	v_or_b32_e64 v19, s18, 0
+D51C0015 0001006A	v_or_b32_e64 v21, vcc_lo, 0
+D51C0006 00003A80	v_or_b32_e64 v6, 0, s29
+D711000E 00021880	v_pack_b32_f16 v14, 0, v12
+D7110014 00022D14	v_pack_b32_f16 v20, v20, v22
+D6440001 03FE0080 05040100	v_perm_b32 v1, 0, v0, 0x5040100
+D644000D 03FD010D 03020104	v_perm_b32 v13, v13, 0, 0x3020104
+D644001A 03FCD760 05040100	v_perm_b32 v26, v96, vcc_hi, 0x5040100
+D6440035 03FEB35D 05040100	v_perm_b32 v53, v93, v89, 0x5040100
+CC0F4201 58020B01	v_pk_add_f16 v1, v1, v5 neg_lo:[0,1] neg_hi:[0,1]
+CC0F410A 2801E501	v_pk_add_f16 v10, v1, 1.0 op_sel_hi:[1,0] neg_lo:[1,0] neg_hi:[1,0]
+CC0F400C 18021962	v_pk_add_f16 v12, v98, v12
+CC0F5A02 40020504	v_pk_add_f16 v2, v4, v2 op_sel:[1,1] op_sel_hi:[0,0] neg_lo:[0,1] neg_hi:[0,1]
+CC0F4023 1801011D	v_pk_add_f16 v35, v29, 0
+CC0A4001 08001101	v_pk_add_u16 v1, v1, s8 op_sel_hi:[1,0]
+CC0A4001 18021D01	v_pk_add_u16 v1, v1, v14
+CC0A5019 08021319	v_pk_add_u16 v25, v25, v9 op_sel:[0,1] op_sel_hi:[1,0]
+CC064012 1002248F	v_pk_ashrrev_i16 v18, 15, v18 op_sel_hi:[0,1]
+CC0E0101 3BCA0301	v_pk_fma_f16 v1, v1, v1, 1.0 op_sel_hi:[1,1,0] neg_lo:[1,0,0] neg_hi:[1,0,0]
+CC0E4014 0C522D1E	v_pk_fma_f16 v20, v30, v22, v20 op_sel_hi:[1,0,1]
+CC0E5014 1C522D1F	v_pk_fma_f16 v20, v31, v22, v20 op_sel:[0,1,0]
+CC0E4004 1C1A0813	v_pk_fma_f16 v4, s19, v4, v6
+CC044029 10025288	v_pk_lshlrev_b16 v41, 8, v41 op_sel_hi:[0,1]
+CC05400B 10020688	v_pk_lshrrev_b16 v11, 8, v3 op_sel_hi:[0,1]
+CC090001 08241101	v_pk_mad_u16 v1, v1, s8, s9 op_sel_hi:[1,0,0]
+CC094001 1C061305	v_pk_mad_u16 v1, v5, v9, v1
+CC074001 10020208	v_pk_max_i16 v1, s8, v1 op_sel_hi:[0,1]
+CC074001 18020D01	v_pk_max_i16 v1, v1, v6
+CC07501D 08020B1D	v_pk_max_i16 v29, v29, v5 op_sel:[0,1] op_sel_hi:[1,0]
+CC1C4001 18010101	v_pk_max_num_f16 v1, v1, 0
+CC1C4073 1802E773	v_pk_max_num_f16 v115, v115, v115
+CC1C4006 00001008	v_pk_max_num_f16 v6, s8, s8 op_sel_hi:[0,0]
+CC0C4006 1802270B	v_pk_max_u16 v6, v11, v19
+CC084001 10020208	v_pk_min_i16 v1, s8, v1 op_sel_hi:[0,1]
+CC084001 18020B01	v_pk_min_i16 v1, v1, v5
+CC08501D 08020B1D	v_pk_min_i16 v29, v29, v5 op_sel:[0,1] op_sel_hi:[1,0]
+CC1B4073 18029723	v_pk_min_num_f16 v115, v35, v75
+CC1B4023 100246FF 00007C00	v_pk_min_num_f16 v35, 0x7c00, v35 op_sel_hi:[0,1]
+CC10400C 18021962	v_pk_mul_f16 v12, v98, v12
+CC104006 10020D00	v_pk_mul_f16 v6, v0, v6 op_sel_hi:[0,1]
+CC015001 18001901	v_pk_mul_lo_u16 v1, v1, s12 op_sel:[0,1]
+CC014001 08001101	v_pk_mul_lo_u16 v1, v1, s8 op_sel_hi:[1,0]
+CC014001 18020305	v_pk_mul_lo_u16 v1, v5, v1
+CC015018 08020F18	v_pk_mul_lo_u16 v24, v24, v7 op_sel:[0,1] op_sel_hi:[1,0]
+CC034006 18020280	v_pk_sub_i16 v6, 0, v1
+7E24A90F	v_rcp_f16_e32 v18, v15
+7E225510	v_rcp_f32_e32 v17, v16
+D5AA010B 00000101	v_rcp_f32_e64 v11, |v1|
+7E1A5F0B	v_rcp_f64_e32 v[13:14], v[11:12]
+7E045602	v_rcp_iflag_f32_e32 v2, s2
+7E040502	v_readfirstlane_b32 s2, v2
+D7600000 000101C0	v_readlane_b32 s0, v192, 0
+D760002D 0000571B	v_readlane_b32 s45, v27, s43
+D760006B 00010588	v_readlane_b32 vcc_hi, v136, 2
+D760006A 00012DBC	v_readlane_b32 vcc_lo, v188, 22
+7E0ABD05	v_rndne_f16_e32 v5, v5
+7E1E470F	v_rndne_f32_e32 v15, v15
+7E1E3315	v_rndne_f64_e32 v[15:16], v[21:22]
+D5990114 20000112	v_rndne_f64_e64 v[20:21], -|v[18:19]|
+7E145D08	v_rsq_f32_e32 v10, v8
+7E1E630D	v_rsq_f64_e32 v[15:16], v[13:14]
+D6800000 00000000	v_s_exp_f32 s0, s0
+D682000B 00000000	v_s_log_f32 s11, s0
+D684000D 0000000D	v_s_rcp_f32 s13, s13
+D688000B 0000000A	v_s_sqrt_f32 s11, s10
+7E206B0E	v_sin_f32_e32 v16, v14
+7E1AAB0D	v_sqrt_f16_e32 v13, v13
+7E006700	v_sqrt_f32_e32 v0, v0
+42081E80	v_sub_co_ci_u32_e32 v4, vcc_lo, 0, v15, vcc_lo
+420C1011	v_sub_co_ci_u32_e32 v6, vcc_lo, s17, v8, vcc_lo
+D5216AA8 005A0707	v_sub_co_ci_u32_e64 v168, vcc_lo, v7, v3, s22
+D5210013 01AA6513	v_sub_co_ci_u32_e64 v19, s0, v19, v50, vcc_lo
+D5210614 001ACE80	v_sub_co_ci_u32_e64 v20, s6, 0, v103, s6
+D5217C03 00050080	v_sub_co_ci_u32_e64 v3, null, 0, 0, s1
+D5217C04 0039000D	v_sub_co_ci_u32_e64 v4, null, s13, 0, s14
+D5210004 0002080F	v_sub_co_ci_u32_e64 v4, s0, s15, v4, s0
+D7010D01 00002008	v_sub_co_u32 v1, s13, s8, s16
+D7010612 0002CC80	v_sub_co_u32 v18, s6, 0, v102
+D7017C02 00000501	v_sub_co_u32 v2, null, v1, s2
+D7016A03 00002303	v_sub_co_u32 v3, vcc_lo, v3, s17
+D7016A06 00021C80	v_sub_co_u32 v6, vcc_lo, 0, v14
+D7016A07 00010103	v_sub_co_u32 v7, vcc_lo, v3, 0
+66140B01	v_sub_f16_e32 v10, v1, v5
+660426F2	v_sub_f16_e32 v2, 1.0, v19
+D5330083 00030863	v_sub_f16_e64 v131, s99, v132
+080604F2	v_sub_f32_e32 v3, 1.0, v2
+0806030A	v_sub_f32_e32 v3, v10, v1
+D504020B 000214F0	v_sub_f32_e64 v11, 0.5, |v10|
+D5040102 00024F00	v_sub_f32_e64 v2, |v0|, v39
+D5040208 00020107	v_sub_f32_e64 v8, v7, |v0|
+D5040009 2002130C	v_sub_f32_e64 v9, -v12, v9
+D7040013 00022480	v_sub_nc_u16 v19, 0, v18
+D7040005 00020300	v_sub_nc_u16 v5, v0, v1
+4D4D3AFF FFFFFFC1	v_sub_nc_u32_e32 v166, 0xffffffc1, v157
+4C0E1502	v_sub_nc_u32_e32 v7, v2, v10
+D5268002 00020488	v_sub_nc_u32_e64 v2, 8, v2 clamp
+D5268004 00010217	v_sub_nc_u32_e64 v4, s23, 1 clamp
+D5268006 00020D01	v_sub_nc_u32_e64 v6, v1, v6 clamp
+442A181B	v_subrev_co_ci_u32_e32 v21, vcc_lo, s27, v12, vcc_lo
+44080880	v_subrev_co_ci_u32_e32 v4, vcc_lo, 0, v4, vcc_lo
+D5226A11 002A4C80	v_subrev_co_ci_u32_e64 v17, vcc_lo, 0, v38, s10
+D5220516 00162C80	v_subrev_co_ci_u32_e64 v22, s5, 0, v22, s5
+D5220516 01AA2C0F	v_subrev_co_ci_u32_e64 v22, s5, s15, v22, vcc_lo
+D5220009 01AA0680	v_subrev_co_ci_u32_e64 v9, s0, 0, v3, vcc_lo
+D522045C 0012B80F	v_subrev_co_ci_u32_e64 v92, s4, s15, v92, s4
+D5226A62 000EBC0F	v_subrev_co_ci_u32_e64 v98, vcc_lo, s15, v94, s3
+680C0209	v_subrev_f16_e32 v6, s9, v1
+0A020227	v_subrev_f32_e32 v1, s39, v1
+0A182A80	v_subrev_f32_e32 v12, 0, v21
+4E0C12C0	v_subrev_nc_u32_e32 v6, 64, v9
+4E0E1022	v_subrev_nc_u32_e32 v7, s34, v8
+4E10046B	v_subrev_nc_u32_e32 v8, vcc_hi, v2
+D5278018 000200FF 00000080	v_subrev_nc_u32_e64 v24, 0x80, v0 clamp
+7E2ECB0A	v_swap_b32 v23, v10
+D72F0106 00010102	v_trig_preop_f64 v[6:7], |v[2:3]|, 0
+7E02BB01	v_trunc_f16_e32 v1, v1
+7E024301	v_trunc_f32_e32 v1, v1
+7E0A2F05	v_trunc_f64_e32 v[5:6], v[5:6]
+CC414067 1A023997	v_wmma_f32_16x16x16_bf16 v[103:110], v[151:154], v[28:31], 0
+CC414071 1DC78BC9	v_wmma_f32_16x16x16_bf16 v[113:120], v[201:204], v[197:200], v[113:120]
+CC404000 1A021110	v_wmma_f32_16x16x16_f16 v[0:7], v[16:19], v[8:11], 0
+CC404009 1C26B355	v_wmma_f32_16x16x16_f16 v[9:16], v[85:88], v[89:92], v[9:16]
+CC444000 1A021110	v_wmma_i32_16x16x16_iu8 v[0:7], v[16:17], v[8:9], 0
+CC444011 1C464B41	v_wmma_i32_16x16x16_iu8 v[17:24], v[65:66], v[37:38], v[17:24]
+D76100BE 0001246A	v_writelane_b32 v190, vcc_lo, 18
+D76100C0 00010004	v_writelane_b32 v192, s4, 0
+D7610028 0001007E	v_writelane_b32 v40, exec_lo, 0
+D7610037 00010E6B	v_writelane_b32 v55, vcc_hi, 7
+D6450030 04698330	v_xad_u32 v48, v48, -1, v26
+D6450005 01AE0509	v_xad_u32 v5, v9, v2, vcc_hi
+D6450006 01D58314	v_xad_u32 v6, v20, -1, ttmp9
+D6450008 004E0F09	v_xad_u32 v8, v9, v7, s19
+3CC22B3C	v_xnor_b32_e32 v97, v60, v21
+D6400000 044E0110	v_xor3_b32 v0, v16, v0, v19
+D6400003 03FE0408 80000000	v_xor3_b32 v3, s8, v2, 0x80000000
+D6400009 01AE050F	v_xor3_b32 v9, v15, v2, vcc_hi
+D6400060 0451833C	v_xor3_b32 v96, v60, -1, v20
+3A00006A	v_xor_b32_e32 v0, vcc_lo, v0
+3A2E4305	v_xor_b32_e32 v23, v5, v33
+3A34326B	v_xor_b32_e32 v26, vcc_hi, v25
+3A4848FF 80000000	v_xor_b32_e32 v36, 0x80000000, v36

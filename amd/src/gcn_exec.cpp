@@ -151,6 +151,10 @@ bool matches_class_half(_Float16 h, uint32_t mask) {
 // vector registers.
 struct Wave {
   uint32_t sgpr[kSgprs] = {};
+  // The trap handler's registers. RDNA4 gives a kernel its work-group's id in
+  // two of them (TTMP9 x; TTMP7 y and z, a half each) rather than in scalar
+  // registers after the user ones.
+  uint32_t ttmp[16] = {};
   uint32_t vgpr[kVgprs][kLanes] = {};
   // The accumulation registers: a second bank a kernel keeps values in when
   // it has more of them than the vector registers hold.
@@ -380,6 +384,8 @@ struct Machine {
       case OperandKind::Null: return 0;
       case OperandKind::Scc: return w.scc ? 1 : 0;
       case OperandKind::Ttmp:
+        if (o.index + o.width > 16) break;
+        return o.width >= 2 ? w.ttmp[o.index] | static_cast<uint64_t>(w.ttmp[o.index + 1]) << 32 : w.ttmp[o.index];
       case OperandKind::SharedLimit:
       case OperandKind::PrivateLimit:
         throw Error::make(Err::Unsupported, "reading ", operand_text(o), ", which this does not model");
@@ -404,6 +410,11 @@ struct Machine {
       case OperandKind::ExecHi: w.exec = (w.exec & 0xFFFFFFFFull) | (v << 32); return;
       case OperandKind::M0: w.m0 = static_cast<uint32_t>(v); return;
       case OperandKind::Null: return;   // RDNA's null register: the write goes nowhere
+      case OperandKind::Ttmp:
+        if (o.index + o.width > 16) break;
+        w.ttmp[o.index] = static_cast<uint32_t>(v);
+        if (o.width >= 2) w.ttmp[o.index + 1] = static_cast<uint32_t>(v >> 32);
+        return;
       default: break;
     }
     throw Error::make(Err::Internal, "a scalar destination this does not write");
@@ -492,8 +503,10 @@ struct Machine {
       kOcpFp8{3, 7, 448.0, F8::OcpE4M3, 8}, kOcpBf8{2, 15, 57344.0, F8::OcpE5M2, 8}, kFp6{3, 1, 7.5, F8::Finite, 6},
       kBf6{2, 3, 28.0, F8::Finite, 6}, kFp4{1, 1, 6.0, F8::Finite, 4};
   // The 8-bit formats the code's processor has.
-  const F8& fp8() const { return d.object->gfx950() ? kOcpFp8 : kFp8; }
-  const F8& bf8() const { return d.object->gfx950() ? kOcpBf8 : kBf8; }
+  // gfx950 and RDNA4 use the OCP formats; gfx942's are FNUZ.
+  bool ocp8() const { return d.object->gfx950() || target() == gcn::Target::Gfx1200; }
+  const F8& fp8() const { return ocp8() ? kOcpFp8 : kFp8; }
+  const F8& bf8() const { return ocp8() ? kOcpBf8 : kBf8; }
   static float f8_to_float(uint32_t v, const F8& t) {
     const uint32_t sign_bit = 1u << (t.bits - 1);
     v &= (sign_bit << 1) - 1;
@@ -705,6 +718,57 @@ struct Machine {
   }
 
   // ---- The instructions ---------------------------------------------------
+
+  // RDNA's scalar float instructions (gfx11.5 and gfx12): a float or a half
+  // in a scalar register, IEEE arithmetic as the vector unit does it.
+  // Returns whether `op` was one.
+  bool scalar_float(Wave& w, const Inst& in, const OpName& op, uint64_t a, uint64_t b) {
+    const float x = as_float(static_cast<uint32_t>(a)), y = as_float(static_cast<uint32_t>(b));
+    const auto put = [&](float v) { write_scalar(w, in.dst[0], as_bits(v)); };
+    const auto h = [](uint64_t v) {
+      _Float16 r;
+      const uint16_t bits = static_cast<uint16_t>(v);
+      std::memcpy(&r, &bits, 2);
+      return r;
+    };
+    const auto put_h = [&](_Float16 v) {
+      uint16_t bits;
+      std::memcpy(&bits, &v, 2);
+      write_scalar(w, in.dst[0], bits);
+    };
+    if (op == "s_add_f32"_op) put(x + y);
+    else if (op == "s_sub_f32"_op) put(x - y);
+    else if (op == "s_mul_f32"_op) put(x * y);
+    else if (op == "s_min_num_f32"_op || op == "s_min_f32"_op) put(std::fmin(x, y));
+    else if (op == "s_max_num_f32"_op || op == "s_max_f32"_op) put(std::fmax(x, y));
+    else if (op == "s_fmac_f32"_op) put(std::fma(x, y, as_float(static_cast<uint32_t>(scalar(w, in.dst[0])))));
+    else if (op == "s_fmaak_f32"_op) put(std::fma(x, y, as_float(static_cast<uint32_t>(scalar(w, in.src[2])))));
+    else if (op == "s_fmamk_f32"_op) put(std::fma(x, y, as_float(static_cast<uint32_t>(scalar(w, in.src[2])))));
+    else if (op == "s_cvt_f32_i32"_op) put(static_cast<float>(static_cast<int32_t>(a)));
+    else if (op == "s_cvt_f32_u32"_op) put(static_cast<float>(static_cast<uint32_t>(a)));
+    else if (op == "s_cvt_i32_f32"_op)
+      write_scalar(w, in.dst[0], static_cast<uint32_t>(std::isnan(x) ? 0 : x <= -2147483648.0f ? INT32_MIN
+                                                     : x >= 2147483648.0f ? INT32_MAX : static_cast<int32_t>(x)));
+    else if (op == "s_cvt_u32_f32"_op)
+      write_scalar(w, in.dst[0], std::isnan(x) || x <= 0 ? 0u : x >= 4294967296.0f ? 0xFFFFFFFFu : static_cast<uint32_t>(x));
+    else if (op == "s_cvt_f16_f32"_op) put_h(static_cast<_Float16>(x));
+    else if (op == "s_cvt_f32_f16"_op) put(static_cast<float>(h(a)));
+    else if (op == "s_cvt_hi_f32_f16"_op) put(static_cast<float>(h(a >> 16)));
+    else if (op == "s_ceil_f32"_op) put(std::ceil(x));
+    else if (op == "s_floor_f32"_op) put(std::floor(x));
+    else if (op == "s_trunc_f32"_op) put(std::trunc(x));
+    else if (op == "s_rndne_f32"_op) put(std::nearbyint(x));
+    else if (op == "s_add_f16"_op) put_h(h(a) + h(b));
+    else if (op == "s_sub_f16"_op) put_h(h(a) - h(b));
+    else if (op == "s_mul_f16"_op) put_h(h(a) * h(b));
+    else if (op == "s_fmac_f16"_op)
+      put_h(static_cast<_Float16>(std::fma(static_cast<float>(h(a)), static_cast<float>(h(b)),
+                                           static_cast<float>(h(scalar(w, in.dst[0]))))));
+    else if (op == "s_min_num_f16"_op) put_h(h(a) < h(b) || h(b) != h(b) ? h(a) : h(b));
+    else if (op == "s_max_num_f16"_op) put_h(h(a) > h(b) || h(b) != h(b) ? h(a) : h(b));
+    else return false;
+    return true;
+  }
 
   void scalar_alu(Wave& w, const Inst& in) {
     // A comparison against the instruction's own constant -- signed, or for
@@ -1040,6 +1104,14 @@ struct Machine {
                                                        .count()) /
                              10;
       write_scalar(w, in.dst[0], ticks);
+    } else if (scalar_float(w, in, op, a, b)) {
+    } else if (op == "s_add_nc_u64"_op || op == "s_sub_nc_u64"_op || op == "s_mul_u64"_op) {
+      // RDNA4's 64-bit scalar arithmetic, SCC untouched.
+      write_scalar(w, in.dst[0], op == "s_add_nc_u64"_op ? a + b : op == "s_sub_nc_u64"_op ? a - b : a * b);
+    } else if (op == "s_barrier_signal"_op || op == "s_barrier_signal_isfirst"_op) {
+      // RDNA4's split barrier: signalling arrives; s_barrier_wait is where the
+      // wave waits for the rest (and is the barrier here).
+      if (op == "s_barrier_signal_isfirst"_op) w.scc = false;
     } else if (op == "s_waitcnt_vscnt"_op || op == "s_waitcnt_vmcnt"_op || op == "s_waitcnt_expcnt"_op ||
                op == "s_waitcnt_lgkmcnt"_op || op == "s_version"_op) {
       // RDNA's separate counters: nothing is outstanding here to wait for.
@@ -1061,6 +1133,28 @@ struct Machine {
     }
     const uint64_t a = scalar(w, in.src[0]), b = scalar(w, in.src[1]);
     const OpName op(in.name);
+    // RDNA's scalar float comparisons: s_cmp_<test>_f32 and _f16, the vector
+    // comparisons' tests.
+    if (in.name.size() > 10 && in.name.rfind("s_cmp_", 0) == 0 &&
+        (in.name.compare(in.name.size() - 4, 4, "_f32") == 0 || in.name.compare(in.name.size() - 4, 4, "_f16") == 0)) {
+      const bool half = in.name.compare(in.name.size() - 4, 4, "_f16") == 0;
+      const auto value = [&](uint64_t v) -> double {
+        if (!half) return as_float(static_cast<uint32_t>(v));
+        _Float16 h16;
+        const uint16_t bits = static_cast<uint16_t>(v);
+        std::memcpy(&h16, &bits, 2);
+        return static_cast<double>(h16);
+      };
+      const double x = value(a), y = value(b);
+      const std::string t = in.name.substr(6, in.name.size() - 10);
+      const bool unordered = x != x || y != y;
+      w.scc = t == "lt" ? x < y : t == "eq" ? x == y : t == "le" ? x <= y : t == "gt" ? x > y
+              : t == "lg" ? (x < y || x > y) : t == "ge" ? x >= y : t == "o" ? !unordered : t == "u" ? unordered
+              : t == "nge" ? !(x >= y) : t == "nlg" ? !(x < y || x > y) : t == "ngt" ? !(x > y)
+              : t == "nle" ? !(x <= y) : t == "neq" ? !(x == y) : t == "nlt" ? !(x < y)
+              : throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
+      return;
+    }
     if (op == "s_cmp_lt_i32"_op) w.scc = static_cast<int32_t>(a) < static_cast<int32_t>(b);
     else if (op == "s_cmp_eq_u32"_op) w.scc = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
     else if (op == "s_cmp_ge_u32"_op) w.scc = static_cast<uint32_t>(a) >= static_cast<uint32_t>(b);
@@ -1136,6 +1230,18 @@ struct Machine {
         if (wide) set_sgpr64(w, r, old);
         else set_sgpr(w, r, static_cast<uint32_t>(old));
       }
+      return;
+    }
+    // RDNA4's sub-dword scalar loads: a byte or a short, widened with its sign
+    // or without.
+    if (OpName(in.name) == "s_load_u8"_op || OpName(in.name) == "s_load_i8"_op ||
+        OpName(in.name) == "s_load_u16"_op || OpName(in.name) == "s_load_i16"_op) {
+      const uint32_t bytes = in.name.back() == '8' ? 1 : 2;
+      const uint64_t raw = at(base).load_scalar(base, bytes);
+      const bool sign = in.name[7] == 'i';
+      const uint32_t v = bytes == 1 ? (sign ? static_cast<uint32_t>(static_cast<int8_t>(raw)) : static_cast<uint32_t>(raw & 0xFF))
+                                    : (sign ? static_cast<uint32_t>(static_cast<int16_t>(raw)) : static_cast<uint32_t>(raw & 0xFFFF));
+      set_sgpr(w, in.dst[0].index, v);
       return;
     }
     const uint32_t words = in.dst[0].width;
@@ -1428,6 +1534,35 @@ struct Machine {
         }
         write_lane(w, in.dst[0], lane, v);
       });
+    } else if (op.rfind("v_s_", 0) == 0) {
+      // RDNA4's transcendentals on a scalar, into a scalar register: the
+      // vector unit's reciprocal, square root, exponent and logarithm, once.
+      // (A 16-bit one reads and writes the low half.)
+      const bool half = op.rfind("_f16") == op.size() - 4;
+      const uint32_t raw = static_cast<uint32_t>(scalar(w, in.src[0]));
+      double x;
+      if (half) {
+        _Float16 h;
+        const uint16_t b16 = static_cast<uint16_t>(raw);
+        std::memcpy(&h, &b16, 2);
+        x = static_cast<double>(h);
+      } else {
+        x = as_float(raw);
+      }
+      if (in.src[0].neg) x = -x;
+      if (in.src[0].abs) x = std::fabs(x);
+      const std::string f = op.substr(4, op.size() - 8);   // exp, log, rcp, rsq, sqrt
+      const double r = f == "exp" ? std::exp2(x) : f == "log" ? std::log2(x) : f == "rcp" ? 1.0 / x
+                       : f == "rsq" ? 1.0 / std::sqrt(x) : f == "sqrt" ? std::sqrt(x)
+                       : throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
+      if (half) {
+        const _Float16 h = static_cast<_Float16>(r);
+        uint16_t b16;
+        std::memcpy(&b16, &h, 2);
+        write_scalar(w, in.dst[0], b16);
+      } else {
+        write_scalar(w, in.dst[0], as_bits(static_cast<float>(r)));
+      }
     } else if (op.rfind("v_wmma_", 0) == 0) {
       wmma(w, in, op);
     } else if (op == "v_xor3_b32"_op) {
@@ -1448,74 +1583,106 @@ struct Machine {
     return true;
   }
 
-  // RDNA3's matrix instructions (v_wmma_*_16x16x16_*): D = A x B + C for one
-  // 16x16 tile, K 16, across a wave32. As AMD lays it out for gfx11: lane l
-  // holds row l % 16 of A and column l % 16 of B, all sixteen of K (the two
-  // halves of the wave hold the same, and the first is read); register i of
-  // lane l holds D[2i + l / 16][l % 16], C likewise. A 16-bit result goes to
-  // the half of each register OP_SEL's bit 2 names. The integer forms read
-  // their inputs signed where NEG's bit for them is set, and CLAMP saturates.
-  // Each output's products and addend are summed exactly (double) and
-  // rounded once.
+  // RDNA's matrix instructions (v_wmma_*): D = A x B + C for one 16x16 tile
+  // across a wave32, as AMD lays it out.
+  //   gfx11: lane l holds row l % 16 of A and column l % 16 of B, all of K
+  //     (the two halves of the wave hold the same, and the first is read);
+  //     register i of lane l is D[2i + l / 16][l % 16]; a 16-bit result goes
+  //     to the half of each register OP_SEL's bit 2 names.
+  //   gfx12: lane l holds row (column) l % 16 and half of K, the half l / 16;
+  //     element i of lane l is D[i + 8 * (l / 16)][l % 16], 16-bit results
+  //     two to a register.
+  // The integer forms read their inputs signed where NEG's bit for them is
+  // set, and CLAMP saturates; gfx12's 8-bit floats are the OCP formats. Each
+  // output's products and addend are summed exactly (double) and rounded once.
   void wmma(Wave& w, const Inst& in, const OpName& op) {
     if (w.lanes != 32 || static_cast<uint32_t>(w.exec) != 0xFFFFFFFFu)
       throw Error::make(Err::Unsupported, in.name, " with lanes switched off, or in a wave64, which this does not model");
-    const std::string name = op;
-    const std::string out = name.substr(7, name.find('_', 7) - 7);          // f32, f16, bf16, i32
-    const std::string inputs = name.substr(name.rfind('_') + 1);            // f16, bf16, iu8, iu4
+    const bool g12 = in.arch == gcn::Target::Gfx1200;
+    const std::string name = op;   // v_wmma_<out>_16x16x<K>_<a>[_<b>]
+    const std::string out = name.substr(7, name.find('_', 7) - 7);
+    const size_t shape_at = name.find("16x16x");
+    const uint32_t K = static_cast<uint32_t>(std::stoul(name.substr(shape_at + 6)));
+    const std::string types = name.substr(name.find('_', shape_at) + 1);          // "f16", "iu8", "fp8_bf8", ...
+    const std::string ta = types.substr(0, types.find('_')), tb = types.find('_') == std::string::npos ? ta : types.substr(types.find('_') + 1);
     const bool a_signed = in.neg_lo & 1, b_signed = (in.neg_lo >> 1) & 1;
-    const auto element = [&](const Operand& o, uint32_t lane, uint32_t k, bool is_signed) -> double {
-      if (inputs == "f16" || inputs == "bf16") {
-        const uint32_t bits = (word(w, o, k / 2, lane) >> (16 * (k % 2))) & 0xFFFF;
-        if (inputs == "bf16") return static_cast<double>(as_float(bits << 16));
+    const uint32_t per_lane = g12 ? K / 2 : K;
+    const auto element = [&](const Operand& o, const std::string& t, uint32_t lane, uint32_t e, bool is_signed) -> double {
+      if (t == "f16" || t == "bf16") {
+        const uint32_t bits = (word(w, o, e / 2, lane) >> (16 * (e % 2))) & 0xFFFF;
+        if (t == "bf16") return static_cast<double>(as_float(bits << 16));
         _Float16 h;
         const uint16_t b16 = static_cast<uint16_t>(bits);
         std::memcpy(&h, &b16, 2);
         return static_cast<double>(h);
       }
-      if (inputs == "iu8") {
-        const uint32_t byte = (word(w, o, k / 4, lane) >> (8 * (k % 4))) & 0xFF;
+      if (t == "iu8" || t == "fp8" || t == "bf8") {
+        const uint32_t byte = (word(w, o, e / 4, lane) >> (8 * (e % 4))) & 0xFF;
+        if (t == "fp8") return f8_to_float(byte, kOcpFp8);
+        if (t == "bf8") return f8_to_float(byte, kOcpBf8);
         return is_signed ? static_cast<int8_t>(byte) : byte;
       }
-      const uint32_t nib = (word(w, o, k / 8, lane) >> (4 * (k % 8))) & 0xF;   // iu4
+      const uint32_t nib = (word(w, o, e / 8, lane) >> (4 * (e % 8))) & 0xF;   // iu4
       return is_signed ? static_cast<int32_t>(nib << 28) >> 28 : nib;
+    };
+    // Where A[row][k] (B[k][col]) is: which lane, and which of its values.
+    const auto input = [&](const Operand& o, const std::string& t, uint32_t rc, uint32_t k, bool sg) {
+      return g12 ? element(o, t, rc + 16 * (k / per_lane), k % per_lane, sg) : element(o, t, rc, k, sg);
     };
     const bool half_out = out == "f16" || out == "bf16";
     const bool high = (in.op_sel >> 2) & 1;
-    const auto c_value = [&](uint32_t lane, uint32_t i) -> double {
-      const Operand& c = in.src[2];
-      if (c.kind != OperandKind::Vgpr) {
-        if (c.kind == OperandKind::InlineFloat) return c.fvalue;
-        return static_cast<double>(static_cast<int32_t>(scalar(w, c)));
+    // Where D[row][col] is: the lane, and the register and half of it.
+    const auto place = [&](uint32_t row, uint32_t col, uint32_t* lane, uint32_t* reg, uint32_t* half) {
+      if (g12) {
+        *lane = col + 16 * (row / 8);
+        const uint32_t i = row % 8;
+        *reg = half_out ? i / 2 : i;
+        *half = half_out ? i % 2 : 0;
+      } else {
+        *lane = col + 16 * (row % 2);
+        *reg = row / 2;
+        *half = half_out && high ? 1 : 0;
       }
-      const uint32_t v = word(w, c, i, lane);
-      if (out == "f32") return static_cast<double>(as_float(v));
-      if (out == "i32") return static_cast<double>(static_cast<int32_t>(v));
-      const uint32_t bits = high ? v >> 16 : v & 0xFFFF;
+    };
+    const auto from_half = [&](uint32_t bits) -> double {
       if (out == "bf16") return static_cast<double>(as_float(bits << 16));
       _Float16 h;
       const uint16_t b16 = static_cast<uint16_t>(bits);
       std::memcpy(&h, &b16, 2);
       return static_cast<double>(h);
     };
-    // The result, lane by lane, into a copy first: D may be C, or A or B.
+    const auto c_value = [&](uint32_t lane, uint32_t reg, uint32_t half) -> double {
+      const Operand& c = in.src[2];
+      if (c.kind != OperandKind::Vgpr) {
+        if (c.kind == OperandKind::InlineFloat) return c.fvalue;
+        return static_cast<double>(static_cast<int32_t>(scalar(w, c)));
+      }
+      const uint32_t v = word(w, c, reg, lane);
+      if (out == "f32") return static_cast<double>(as_float(v));
+      if (out == "i32") return static_cast<double>(static_cast<int32_t>(v));
+      return from_half(half ? v >> 16 : v & 0xFFFF);
+    };
+    // The result, into a copy first: D may be C, or A or B.
     std::array<std::array<uint32_t, 8>, 32> result{};
     for (uint32_t lane = 0; lane < 32; ++lane)
-      for (uint32_t i = 0; i < 8; ++i) {
-        const uint32_t row = 2 * i + lane / 16, col = lane % 16;
-        double sum = c_value(lane, i);
+      for (uint32_t r = 0; r < 8; ++r) result[lane][r] = word(w, in.dst[0], r, lane);
+    for (uint32_t row = 0; row < 16; ++row)
+      for (uint32_t col = 0; col < 16; ++col) {
+        uint32_t lane, reg, half;
+        place(row, col, &lane, &reg, &half);
+        double sum = c_value(lane, reg, half);
         int64_t isum = static_cast<int64_t>(sum);
-        for (uint32_t k = 0; k < 16; ++k) {
-          const double a = element(in.src[0], row, k, a_signed), b = element(in.src[1], col, k, b_signed);
+        for (uint32_t k = 0; k < K; ++k) {
+          const double a = input(in.src[0], ta, row, k, a_signed), b = input(in.src[1], tb, col, k, b_signed);
           if (out == "i32") isum += static_cast<int64_t>(a) * static_cast<int64_t>(b);
           else sum += a * b;
         }
-        uint32_t v;
+        uint32_t& slot = result[lane][reg];
         if (out == "i32") {
           if (in.clamp) isum = std::clamp<int64_t>(isum, INT32_MIN, INT32_MAX);
-          v = static_cast<uint32_t>(isum);
+          slot = static_cast<uint32_t>(isum);
         } else if (out == "f32") {
-          v = as_bits(static_cast<float>(sum));
+          slot = as_bits(static_cast<float>(sum));
         } else {
           uint32_t bits;
           if (out == "bf16") {
@@ -1527,14 +1694,12 @@ struct Machine {
             std::memcpy(&b16, &h, 2);
             bits = b16;
           }
-          const uint32_t was = word(w, in.dst[0], i, lane);
-          v = high ? (was & 0xFFFF) | bits << 16 : (was & 0xFFFF0000u) | bits;
+          slot = half ? (slot & 0xFFFF) | bits << 16 : (slot & 0xFFFF0000u) | bits;
         }
-        result[lane][i] = v;
       }
-    (void)half_out;
+    const uint32_t regs = in.dst[0].width;
     for (uint32_t lane = 0; lane < 32; ++lane)
-      for (uint32_t i = 0; i < 8; ++i) set_word(w, in.dst[0], i, lane, result[lane][i]);
+      for (uint32_t r = 0; r < regs && r < 8; ++r) set_word(w, in.dst[0], r, lane, result[lane][r]);
   }
 
   // The integer, 16-bit, half-precision and double instructions PyTorch's
@@ -4153,6 +4318,14 @@ struct Machine {
         lds_access(w, in, g);
         return true;
       case gcn::Enc::Flat:
+        // RDNA4's cache write-back and invalidate (global_wb, global_inv,
+        // global_wbinv), which its fences compile to: every access here
+        // reaches memory directly, so they order the host's threads and no more.
+        if (OpName(in.name) == "global_inv"_op || OpName(in.name) == "global_wb"_op ||
+            OpName(in.name) == "global_wbinv"_op) {
+          std::atomic_thread_fence(std::memory_order_seq_cst);
+          return true;
+        }
         ++n.vmem;
         ++n.flat;
         if (in.name.find("_atomic") != std::string::npos) ++n.flat_atomic;
@@ -4196,6 +4369,13 @@ struct Machine {
     if (OpName(in.name) == "s_clause"_op || OpName(in.name) == "s_delay_alu"_op ||
         OpName(in.name) == "s_waitcnt_depctr"_op || OpName(in.name) == "s_set_inst_prefetch_distance"_op)
       return true;
+    // RDNA4's waits, a counter each (loads, stores, LDS, scalar memory, ...).
+    if (in.name.rfind("s_wait_", 0) == 0 && in.name != "s_wait_event") return true;
+    if (OpName(in.name) == "s_barrier_wait"_op) {
+      w.at_barrier = true;
+      ++stats.barriers;
+      return false;
+    }
     // Giving the wave's vector registers back as it ends (RDNA's
     // MSG_DEALLOC_VGPRS), before its s_endpgm.
     if (OpName(in.name) == "s_sendmsg"_op && gcn::is_rdna(in.arch) && in.simm == 3) return true;
@@ -4436,6 +4616,11 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
     // that preloads them loads them itself where the hardware has not (its
     // first 256 bytes do it, and the hardware skips them).
     at = std::max(at, k.user_sgpr_count);
+    // RDNA4 gives the work-group's id in the trap handler's registers.
+    if (m.target() == gcn::Target::Gfx1200) {
+      w.ttmp[9] = gx;
+      w.ttmp[7] = (gy & 0xFFFF) | gz << 16;
+    }
     if (k.group_id_x) m.set_sgpr(w, at++, gx);
     if (k.group_id_y) m.set_sgpr(w, at++, gy);
     if (k.group_id_z) m.set_sgpr(w, at++, gz);

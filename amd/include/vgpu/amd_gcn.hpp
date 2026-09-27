@@ -57,6 +57,7 @@ struct Operand {
   // A literal in a 64-bit float operand: the word is the double's high half,
   // the low half zero (a 64-bit integer operand's is zero-extended instead).
   bool literal_high = false;
+  bool constant_k = false;   // RDNA: an instruction's own constant (v_fmaak_f32's K), always written in hex
 };
 std::string operand_text(const Operand& o);
 
@@ -64,9 +65,9 @@ std::string operand_text(const Operand& o);
 // differently from gfx940 and later -- its matrix instructions above all --
 // and has a few they dropped (v_mad_f32, v_mac_f32); gfx950 adds to gfx942's.
 // gfx1100 stands for RDNA3 (gfx11), whose encodings are its own: every
-// gfx11 GPU decodes alike.
-enum class Target { Gfx942, Gfx90a, Gfx950, Gfx1100 };
-inline bool is_rdna(Target t) { return t == Target::Gfx1100; }
+// gfx11 GPU decodes alike. gfx1200 for RDNA4 (gfx12) likewise.
+enum class Target { Gfx942, Gfx90a, Gfx950, Gfx1100, Gfx1200 };
+inline bool is_rdna(Target t) { return t == Target::Gfx1100 || t == Target::Gfx1200; }
 
 struct Inst {
   Enc enc = Enc::Unknown;
@@ -158,6 +159,8 @@ struct Inst {
   // buffer access's format, and VOPD's two halves.
   bool dpp8 = false;
   bool fi = false;
+  bool gfx12_cache = false;   // RDNA4: `cache` is TH | SCOPE << 3, not glc/slc/dlc
+  uint8_t printed_op_sel = 0;  // RDNA VOP3: the op_sel the assembler writes (gfx11 folds 16-bit halves into v1.h)
   bool gds = false;
   uint32_t format = 0;
   std::vector<Inst> dual;
@@ -174,6 +177,8 @@ inline Target target_of_mach(uint32_t mach) {
     case 0x4f: return Target::Gfx950;
     // gfx1100, 1101, 1102, 1103, 1150, 1151, 1152: RDNA3 and 3.5.
     case 0x41: case 0x46: case 0x47: case 0x44: case 0x43: case 0x4a: case 0x55: return Target::Gfx1100;
+    // gfx1200, 1201: RDNA4.
+    case 0x48: case 0x4e: return Target::Gfx1200;
     default: return Target::Gfx942;
   }
 }

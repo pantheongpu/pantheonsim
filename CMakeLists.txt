@@ -44,6 +44,7 @@ set(VGPU_PROFILES
   amd/mi325x
   amd/mi350x
   amd/rx7900xtx
+  amd/rx9070xt
 )
 set(_gen_dir "${CMAKE_BINARY_DIR}/generated")
 set(_gen "${_gen_dir}/vgpu/embedded_profiles.hpp")
@@ -682,6 +683,10 @@ target_compile_definitions(test_amd_gcn_lds PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOU
 foreach(_t ops math memory globals grid bytes int64 atomics mixed half calls packed spill doubles narrow lds exec)
   add_test(NAME test_amd_gcn_${_t}_gfx1100 COMMAND test_amd_gcn_${_t})
   set_tests_properties(test_amd_gcn_${_t}_gfx1100 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1100")
+  # And for gfx1201 (RDNA4): its memory encodings, split waits and barriers,
+  # work-group ids in trap registers, scalar floats.
+  add_test(NAME test_amd_gcn_${_t}_gfx1201 COMMAND test_amd_gcn_${_t})
+  set_tests_properties(test_amd_gcn_${_t}_gfx1201 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1201")
 endforeach()
 
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
@@ -809,6 +814,11 @@ set_tests_properties(amd_hipsparselt_mi350x PROPERTIES DEPENDS vgpuhip
 # And on an RDNA3 consumer card (gfx1100, wave32 and wave64 kernels, WMMA).
 add_test(NAME amd_pytorch_rx7900xtx COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/rx7900xtx)
 set_tests_properties(amd_pytorch_rx7900xtx PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# And on an RDNA4 consumer card (gfx1201: its own memory encodings, WMMA
+# layout, OCP fp8).
+add_test(NAME amd_pytorch_rx9070xt COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/rx9070xt)
+set_tests_properties(amd_pytorch_rx9070xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # torch.compile's Triton kernels, and one written by hand, compiled and loaded
 # at run time.

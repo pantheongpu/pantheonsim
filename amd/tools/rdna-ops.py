@@ -28,7 +28,7 @@ ENCODINGS = {
     'VOPDXY': 'Vopd',
     # RDNA4's names for the same encodings.
     'ENC_VOP3SD': 'Vop3', 'ENC_VFLAT': 'Flat', 'ENC_VGLOBAL': 'Flat', 'ENC_VSCRATCH': 'Flat',
-    'ENC_VBUFFER': 'Mubuf', 'ENC_VOPD': 'Vopd',
+    'ENC_VBUFFER': 'Mubuf', 'ENC_VOPD': 'Vopd', 'ENC_VDS': 'Ds',
 }
 # Operand kinds, by the XML's operand types.
 KINDS = {
@@ -37,7 +37,11 @@ KINDS = {
     'OPR_SDST_NULL': 'Sdst', 'OPR_SREG_M0_INL': 'Ssrc', 'OPR_SMEM_OFFSET': 'Ssrc', 'OPR_SIMM16': 'Simm16',
     'OPR_SIMM32': 'Simm32', 'OPR_LABEL': 'Label', 'OPR_HWREG': 'Hwreg', 'OPR_SENDMSG': 'Sendmsg',
     'OPR_WAITCNT': 'Waitcnt', 'OPR_WAITCNT_DEPCTR': 'Depctr', 'OPR_DELAY': 'Delay', 'OPR_CLAUSE': 'Simm16',
-    'OPR_VERSION': 'Simm16', 'OPR_VCC': 'Vcc', 'OPR_EXEC': 'Exec',
+    'OPR_VERSION': 'Simm16', 'OPR_SIMM8': 'Simm16', 'OPR_SIMM24': 'Simm16', 'OPR_VCC': 'Vcc', 'OPR_EXEC': 'Exec',
+    # RDNA4's.
+    'OPR_SREG_M0': 'Ssrc', 'OPR_SREG_LITERAL': 'Ssrc', 'OPR_SMEM_OFFSET_NOK': 'Ssrc', 'OPR_SIMM5': 'Simm16',
+    'OPR_SENDMSG_RTN': 'Sendmsg', 'OPR_SSRC_BARRIER_ID': 'Ssrc', 'OPR_WAIT_MEM_DS': 'Waitcnt', 'OPR_SLEEP': 'Simm16',
+    'OPR_WAIT_ALU': 'Depctr', 'OPR_WAIT_EVENT': 'Simm16',
 }
 # Fields the decoder reads itself rather than as operands.
 SKIP_FIELDS = {'LITERAL'}
@@ -58,7 +62,7 @@ for inst in isa.find('Instructions'):
         priority = 0
         if enc_xml.endswith('_INST_LITERAL') and cond == 'default':
             enc_xml, priority = {'VOP2_INST_LITERAL': 'ENC_VOP2', 'VOPDXY_INST_LITERAL': 'VOPDXY',
-                                 'SOPK_INST_LITERAL': 'ENC_SOPK'}.get(enc_xml, enc_xml), 1
+                                 'SOPK_INST_LITERAL': 'ENC_SOPK', 'SOP2_INST_LITERAL': 'ENC_SOP2'}.get(enc_xml, enc_xml), 1
         if enc_xml not in ENCODINGS or not (cond == 'default' or cond.startswith('Nothas')):
             continue
         enc = ENCODINGS[enc_xml]
