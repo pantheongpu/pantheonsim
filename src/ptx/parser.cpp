@@ -1131,10 +1131,41 @@ class Parser {
 
   // ---- operands ----
 
+  // A decimal floating-point literal (4.5.2: "0.5", "1e-3"): always a double,
+  // converted to the operand's size at its use. The size is the opcode's last
+  // floating-point type -- the only one, or cvt's source -- f32 unless .f64.
+  static bool decimal_float(const std::string& w) {
+    if (w.empty() || !isdigit(static_cast<unsigned char>(w[0]))) return false;
+    if (w.size() > 1 && w[0] == '0' && std::strchr("xXfFdDbB", w[1])) return false;
+    return w.find_first_of(".eE") != std::string::npos;
+  }
+  ImmFloatBits decimal_float_operand(const std::string& w, bool negative, size_t line) {
+    size_t used = 0;
+    double d = 0;
+    try {
+      d = std::stod(w, &used);
+    } catch (const std::exception&) {
+      fail(line, "bad floating-point literal '" + w + "'");
+    }
+    if (used != w.size()) fail(line, "bad floating-point literal '" + w + "'");
+    if (negative) d = -d;
+    const size_t f64 = cur_opcode_.rfind(".f64"), f32 = cur_opcode_.rfind(".f32");
+    if (f64 != std::string::npos && (f32 == std::string::npos || f64 > f32)) {
+      uint64_t b;
+      std::memcpy(&b, &d, 8);
+      return ImmFloatBits{b, 64};
+    }
+    const float f = static_cast<float>(d);
+    uint32_t b;
+    std::memcpy(&b, &f, 4);
+    return ImmFloatBits{b, 32};
+  }
+
   Operand parse_operand() {
     const Token& t = next();
     if (t.kind == Token::Kind::Punct && t.text == "-") {
       std::string w = expect_word("number after '-'");
+      if (decimal_float(w)) return decimal_float_operand(w, true, t.line);
       return ImmInt{negate(parse_int_literal(w, t.line))};
     }
     if (t.kind != Token::Kind::Word) fail(t.line, "expected operand, got '" + t.text + "'");
@@ -1166,6 +1197,7 @@ class Parser {
         return ImmFloatBits{parse_float_bits(w, t.line), 32};
       if (w.size() == 18 && w[0] == '0' && (w[1] == 'd' || w[1] == 'D'))
         return ImmFloatBits{parse_float_bits(w, t.line), 64};
+      if (decimal_float(w)) return decimal_float_operand(w, false, t.line);
       return ImmInt{parse_int_literal(w, t.line)};
     }
     // A bare identifier is an inline-asm register local if it was declared as
@@ -1294,6 +1326,7 @@ class Parser {
 
   // The module's .target line, for the instructions only one target has.
   std::string target_;
+  std::string cur_opcode_;   // the instruction being parsed, for literal sizes
   // And its .version, for the one instruction whose operand changed meaning.
   std::string version_;
 
@@ -1313,6 +1346,7 @@ class Parser {
     }
 
     std::string opcode = expect_word("instruction opcode");
+    cur_opcode_ = opcode;
     std::vector<std::string> parts = split_dots(opcode);
     if (parts.empty()) fail(ins.line, "bad opcode '" + opcode + "'");
 

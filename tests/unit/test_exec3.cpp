@@ -5580,4 +5580,47 @@ VTEST(stmatrix_m16n8_trans_b8_stores_columns) {
       }
 }
 
+// Decimal floating-point literals (PTX ISA 4.5.2): doubles, converted to the
+// size of the operand they are used as -- f32 in .f32 instructions, f64 in
+// .f64 ones, and a cvt's source type. CUTLASS's inline asm writes
+// "cvt.rp.satfinite.ue8m0x2.f32 %0, 0.0, %1".
+VTEST(decimal_float_literals_take_the_operands_size) {
+  std::string ptx = std::string(kHeader90) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .f32 %f<6>;
+    .reg .f64 %fd<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.f32 %f1, 0.5;
+    add.f32 %f2, %f1, 1.25e1;
+    mov.f32 %f3, -2.0;
+    mov.f64 %fd1, -2.5;
+    add.f64 %fd2, %fd1, 0.125;
+    cvt.rn.f32.f64 %f4, 0.25;
+    st.global.f32 [%rd2], %f2;
+    st.global.f32 [%rd2+4], %f3;
+    st.global.f64 [%rd2+8], %fd2;
+    st.global.f32 [%rd2+16], %f4;
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  float f[5];
+  double d;
+  e.mem.read(out, f, 8);
+  e.mem.read(out + 8, &d, 8);
+  e.mem.read(out + 16, &f[4], 4);
+  VCHECK_EQ(f[0], 13.0f);
+  VCHECK_EQ(f[1], -2.0f);
+  VCHECK_EQ(d, -2.375);
+  VCHECK_EQ(f[4], 0.25f);
+}
+
 VTEST_MAIN
