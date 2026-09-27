@@ -7908,7 +7908,15 @@ class Interpreter {
         // plus its im2col offsets; outside the tensor it reads zero.
         std::array<uint64_t, 5> count{1, 1, 1, 1, 1};
         uint64_t total = 1;
-        if (map.im2col) {
+        if (op.four_rows) {
+          // .tile::gather4/.tile::scatter4 (5.5.3.4): four boxes one row
+          // high, packed one after another -- as a 4-row box would be.
+          if (map.rank != 2 || map.box[1] != 1)
+            ctx_fail(ins, li, Err::InvalidValue,
+                     ".tile::gather4/.tile::scatter4 need a 2D tensor map whose box is one row high");
+          count[0] = (map.box[0] + map.elem_stride[0] - 1) / map.elem_stride[0];
+          total = 4 * count[0];
+        } else if (map.im2col) {
           total = uint64_t{map.pixels} * map.channels;
         } else {
           for (uint32_t d = 0; d < map.rank; ++d) {
@@ -7933,7 +7941,10 @@ class Interpreter {
             if (g < 0 || static_cast<uint64_t>(g) >= map.dim[d]) inside = false;
             else gaddr += static_cast<uint64_t>(g) * map.stride[d];
           };
-          if (map.im2col) {
+          if (op.four_rows) {
+            at(0, start[0] + static_cast<int64_t>((e % count[0]) * map.elem_stride[0]));
+            at(1, static_cast<int32_t>(static_cast<uint32_t>(coords[1 + e / count[0]][lane])));
+          } else if (map.im2col) {
             const uint64_t ch = e % map.channels;
             at(0, start[0] + static_cast<int64_t>(ch));
             for (uint32_t i = 0; i < nsp; ++i) at(1 + i, pix[1 + i] + off[i]);

@@ -66,6 +66,13 @@ echo "wrote $(pwd)/smfmac.gfx942 and smfmac.gfx950"
 "$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_FLUSH -fgpu-flush-denormals-to-zero --offload-arch=gfx942 numerics.cpp \
   -o numerics.flush.gfx942
 echo "wrote $(pwd)/numerics.gfx942 and numerics.flush.gfx942"
+# RDNA3 (gfx1100): VOPD, WMMA, double literals; and wave64 DPP.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1100 rdna3.cpp -o rdna3.gfx1100
+"$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_W64 -mwavefrontsize64 --offload-arch=gfx1100 rdna3.cpp -o rdna3.w64.gfx1100
+echo "wrote $(pwd)/rdna3.gfx1100 and rdna3.w64.gfx1100"
+# RDNA4 (gfx1201): gfx12's WMMA layout, the scalar float unit, split barriers.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1201 rdna4.cpp -o rdna4.gfx1201
+echo "wrote $(pwd)/rdna4.gfx1201"
 
 # The device code alone, for the decoder and the executor to be checked
 # against, and the listing of it from the same toolchain's llvm-objdump.

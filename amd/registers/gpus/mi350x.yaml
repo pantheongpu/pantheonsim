@@ -14,12 +14,12 @@
 # when this file and what they give differ. docs/registers.md has the details.
 
 profile: amd/mi350x
-pci_device_id: 0x7550
+pci_device_id: 0x75a0
 layout: generic
 
 config:
   vendor_id:                   [0x000, 16, ro, 0x1002]
-  device_id:                   [0x002, 16, ro, 0x7550]
+  device_id:                   [0x002, 16, ro, 0x75a0]
   command:                     [0x004, 16, rw, 0x0406]
   status:                      [0x006, 16, ro, 0x0010]
   revision:                    [0x008, 8, ro, 0x00]
@@ -34,7 +34,7 @@ config:
   bar4:                        [0x020, 32, bar, 0x00000000, bar.4]
   bar5:                        [0x024, 32, bar, 0xe1000000, bar.5]
   subsystem_vendor_id:         [0x02c, 16, ro, 0x1002]
-  subsystem_id:                [0x02e, 16, ro, 0x7550]
+  subsystem_id:                [0x02e, 16, ro, 0x75a0]
   expansion_rom:               [0x030, 32, ro, 0x00000000]
   capabilities_pointer:        [0x034, 8, ro, 0x60]
   interrupt_line:              [0x03c, 8, rw, 0xff]
@@ -69,7 +69,7 @@ config:
   aer_capabilities_control:    [0x118, 32, ro, 0x000000a0]
 
 mmio:
-  nbio_strap0:                 [0x034d8, 32, ro, 0x10007550]
+  nbio_strap0:                 [0x034d8, 32, ro, 0x100075a0]
   nbio_config_memsize:         [0x0378c, 32, ro, 0x00048000, vram.memsize_mb]
   nbio_partition_mem_cap:      [0x03a08, 32, ro, 0x00000003]
   nbio_partition_compute_status: [0x03a0c, 32, ro, 0x00000000]

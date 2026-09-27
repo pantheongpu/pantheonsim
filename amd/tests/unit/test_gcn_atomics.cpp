@@ -26,7 +26,7 @@ using namespace vgpu;
 namespace {
 
 amd::CodeObject object() {
-  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/atomics.gfx942.o";
+  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/atomics." + vtest::amd_target() + ".o";
   std::ifstream in(path, std::ios::binary);
   if (!in) throw vtest::Failure("no code object at " + path);
   return amd::load_code_object(std::string((std::istreambuf_iterator<char>(in)), {}), path);
@@ -153,7 +153,7 @@ VTEST(atomics_from_work_groups_on_many_threads_lose_nothing) {
     const uint64_t per_group = uint64_t{kN} * (kN + 1) / 2;
     VCHECK_EQ(download<uint64_t>(mem, pq, 1)[0], groups * per_group);
     VCHECK_EQ(download<float>(mem, pf, 1)[0], static_cast<float>(groups * per_group));
-    VCHECK_EQ(stats.waves, groups);   // what each thread counted, added up
+    VCHECK_EQ(stats.waves, groups * kN / vtest::amd_wave());   // what each thread counted, added up
   }
   ::unsetenv("VGPU_THREADS");
 }

@@ -16,6 +16,16 @@ for src in $sources; do
   echo "wrote $(pwd)/$src.gfx942.o"
 done
 
+# The executor's kernels for gfx1100 and gfx1201 too (RDNA3 and RDNA4,
+# wave32), which the same tests run with VGPU_TEST_TARGET. builtins, crosslane, idioms and counters
+# use CDNA's own instructions (s_memtime, row broadcasts, sdot4, MFMA) and are
+# not built for it.
+for src in vector_add ops math memory globals grid bytes int64 atomics mixed half calls packed spill doubles narrow lds; do
+  "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx1100 -nogpulib -O2 -c "$src.c" -o "$src.gfx1100.o"
+  "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx1201 -nogpulib -O2 -c "$src.c" -o "$src.gfx1201.o"
+  echo "wrote $(pwd)/$src.gfx1100.o and $src.gfx1201.o"
+done
+
 # The scratch kernel for gfx90a too, which reaches its private memory through
 # a buffer resource rather than flat scratch (test_amd_gcn_memory).
 "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx90a -nogpulib -O2 -c memory.c -o memory.gfx90a.o

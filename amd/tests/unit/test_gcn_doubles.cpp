@@ -25,7 +25,7 @@ using namespace vgpu;
 namespace {
 
 amd::CodeObject object() {
-  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/doubles.gfx942.o";
+  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/doubles." + vtest::amd_target() + ".o";
   std::ifstream in(path, std::ios::binary);
   if (!in) throw vtest::Failure("no code object at " + path);
   return amd::load_code_object(std::string((std::istreambuf_iterator<char>(in)), {}), path);

@@ -193,6 +193,30 @@ for b in numerics numerics.flush; do
     "$(grep -c '^ok ' <<< "$out") of 23"
 done
 
+# RDNA3 on a simulated Radeon RX 7900 XTX (hipcc/rdna3.cpp): VOPD reading
+# both halves' sources first, WMMA in each type against the host, sin() in
+# double (whose reduction takes 64-bit literals), and -- built wave64 -- DPP
+# with bank masks, row mirrors and output modifiers.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/rx7900xtx LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/rdna3.gfx1100" 2>&1)
+status=$?
+expect "the RDNA3 wave32 program runs to the end" "0" "$status"
+expect "every RDNA3 wave32 check holds (VOPD, WMMA, double literals)" "6 of 6" \
+  "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 6"
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/rx7900xtx LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/rdna3.w64.gfx1100" 2>&1)
+status=$?
+expect "the RDNA3 wave64 program runs to the end" "0" "$status"
+expect "every RDNA3 wave64 check holds (DPP, output modifiers, double literals)" "2 of 2" \
+  "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 2"
+
+# RDNA4 on a simulated Radeon RX 9070 XT (hipcc/rdna4.cpp): WMMA in gfx12's
+# layout (f16, bf16, OCP fp8, iu8), the scalar float unit and its
+# transcendentals, and the split barrier.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/rx9070xt LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/rdna4.gfx1201" 2>&1)
+status=$?
+expect "the RDNA4 program runs to the end" "0" "$status"
+expect "every RDNA4 check holds (WMMA, scalar floats, split barrier)" "7 of 7" \
+  "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 7"
+
 # Streams that run at once, as a card's do (hipcc/streams.cpp). Each waiting
 # kernel gives up after a bounded time, so a runtime that ran the streams one
 # after another fails these rather than hanging.

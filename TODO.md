@@ -832,7 +832,8 @@ narrows what counts as observable, not what the detector looks at.
   figures 211-222; `tcgen05.commit` (multicast too), the fences and waits.
   Around it: cluster launch control (`try_cancel` takes over clusters that
   have not started, so CUTLASS's persistent loop really loops), `.b128`
-  registers, TMA's `.cta_group::2`, and the 128-byte swizzle in 32- and
+  registers, TMA's `.cta_group::2` and `.tile::gather4`/`scatter4`, and the
+  128-byte swizzle in 32- and
   64-byte atoms for TMA, `tensormap.replace` and the tcgen05 descriptor. A
   CTA's shared addresses now carry its cluster rank in bits 24 and up, as
   CUTLASS's 2-SM kernels assume. Checked by unit tests (the ld/st figures as
@@ -909,8 +910,8 @@ textures, grid sync and host-pinned memory long after all three worked. A
 roadmap that overstates what is missing misleads as much as one that overstates
 what is done.
 
-- PTX, refused by name: TMA's gather/scatter and `.im2col::w` modes
-  (Blackwell), attribute
+- PTX, refused by name: TMA's `.im2col::w` modes (Blackwell; see
+  nvidia/docs/blackwell.md), attribute
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle's 8-byte-flip
   variant (Blackwell); tcgen05's sparse, weight-stationary and block-scaled
@@ -1211,5 +1212,5 @@ scripts/run-pantheon-workloads.sh.
    warpgroup MMA", "TMA and clusters" and "Distributed shared memory"). What
    was left of Hopper -- `cp.reduce.async.bulk`, `tensormap.replace` and
    TMA's im2col mode -- is done too (see "TMA reductions", "Tensor maps
-   changed on the device" and "TMA's im2col mode"). The gather and
-   `.im2col::w` modes are Blackwell's.
+   changed on the device" and "TMA's im2col mode"). Blackwell's gather and
+   scatter modes are done; `.im2col::w` is refused (nvidia/docs/blackwell.md).
