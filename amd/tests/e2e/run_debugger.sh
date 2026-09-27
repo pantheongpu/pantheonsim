@@ -20,6 +20,13 @@ has() {      # has NAME LINE
   else echo "FAIL  $1: no line [$2]"; fail=1; fi
 }
 
+# A sanitizer-instrumented shim needs its runtime loaded before anything else,
+# and the program was built without it -- so the runtime the shim was linked
+# against is preloaded, by the exact name the shim asks for.
+if command -v objdump >/dev/null; then
+  export LD_PRELOAD=$(objdump -p "$build/shim/libamdhip64.so.7" 2>/dev/null | awk '/NEEDED/ && /lib(asan|tsan)\.so/ {print $2}')
+fi
+
 out=$(LD_LIBRARY_PATH="$build/shim" "$vgpu" debug -x "$root/amd/tests/debugger/session.txt" --gpu amd/mi300x --quiet -- "$exe" 2>&1)
 status=$?
 echo "$out" | sed 's/^/      /' | head -40
