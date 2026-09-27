@@ -25,7 +25,11 @@ expect() {  # expect <name> <expected> <actual>
   if [[ "$3" == "$2" ]]; then echo "ok    $1"; else
     echo "FAIL  $1"; echo "      expected: $2"; echo "      actual:   $3"; fail=1; fi
 }
-sess() { local g=$1; shift; timeout 120 "$vgpu" shell -y --gpu "$g" --count 2 "$@" </dev/null 2>/dev/null; }
+# A session without isolation, which every host can start (GitHub's runners
+# restrict unprivileged user namespaces); isolated() is the isolated form, for
+# the checks that need the session's own /sys.
+sess() { local g=$1; shift; timeout 120 "$vgpu" shell -y --no-isolate --gpu "$g" --count 2 "$@" </dev/null 2>/dev/null; }
+isolated() { local g=$1; shift; timeout 120 "$vgpu" shell -y --gpu "$g" --count 2 "$@" </dev/null 2>/dev/null; }
 
 # --- lspci ---
 expect "a Radeon is a VGA controller, of its chip's revision" \
@@ -39,25 +43,34 @@ expect "a card the host's PCI ID database predates is named" \
   "$(sess amd/rx9070xt -c 'lspci -s 01:00.0')"
 expect "lspci -k names the driver" "Kernel driver in use: amdgpu" \
   "$(sess amd/mi300x -c "$vgpu smi --lspci -k -s 01:00.0" | grep -o 'Kernel driver in use: .*')"
+if command -v lspci >/dev/null && unshare --user --map-root-user true >/dev/null 2>&1; then
+  expect "isolated, the real lspci reads the session's /sys: the bound driver" "Kernel driver in use: amdgpu" \
+    "$(isolated amd/mi300x -c 'lspci -k -s 01:00.0' | grep -o 'Kernel driver in use: .*')"
+else
+  echo "skip  isolated lspci: no lspci, or unprivileged user namespaces are unavailable here"
+fi
 expect "lspci -vmm keeps its record form" "Slot:	01:00.0|Class:	VGA compatible controller|Rev:	c8|ProgIf:	00" \
   "$(sess amd/rx7900xtx -c "$vgpu smi --lspci -vmm -s 01:00.0" | grep -E '^(Slot|Class|Rev|ProgIf):' | paste -sd'|')"
 
 # Form by form, VirtualGPU's lspci against the host's real one on the same
-# machine. The real one names a subsystem from udev's hardware database where
-# it has one, and "Kernel modules" from the host kernel's module aliases; both
-# differ by host, so both are left out of the comparison.
-if command -v lspci >/dev/null; then
+# machine, reading the isolated session's /sys as it would a real machine's
+# (without isolation it reads a dump of config space, which has no BAR sizes,
+# interrupt or driver). The real one names a subsystem from udev's hardware
+# database where it has one, and "Kernel modules" from the host kernel's module
+# aliases; both differ by host, so both are left out of the comparison.
+if command -v lspci >/dev/null && unshare --user --map-root-user true >/dev/null 2>&1; then
   for g in amd/rx7900xtx amd/mi300x; do
-    diffs=$(sess "$g" --count 3 -c '
+    diffs=$(timeout 300 "$vgpu" shell -y --gpu "$g" --count 3 </dev/null 2>/dev/null -c '
       norm() { sed -e "/Kernel modules:/d; /^Module:/d; /Subsystem:/d; /^SDevice:/d" -e "s/\"[^\"]*\"$//"; }
       for f in "" -nn -n -D -mm -mmnn -mmn -k -v -vnn -vn -vmm -vmmk -kmm "-d 1002:" "-d ::0300" "-s 02:00.0" -t -x -xxx -xxxx; do
         a=$(lspci $f 2>&1 | norm); b=$('"$vgpu"' smi --lspci $f 2>&1 | norm)
-        [ "$a" = "$b" ] || echo "lspci $f"
-      done')
-    expect "VirtualGPU's lspci prints what the real one does, every form ($g)" "" "$diffs"
+        # (A filter may rightly match nothing; the plain listing never.)
+        [ "$a" = "$b" ] && { [ -n "$a" ] || [ -n "$f" ]; } || echo "lspci $f"
+      done; echo checked')
+    expect "VirtualGPU's lspci prints what the real one does, every form ($g)" "checked" "$diffs"
   done
 else
-  echo "skip  no lspci on this host to compare against"
+  echo "skip  lspci form by form: no lspci, or unprivileged user namespaces are unavailable here"
 fi
 
 # --- rocm-smi and amd-smi: every command a monitoring or inventory script
@@ -72,9 +85,9 @@ for g in amd/mi300x amd/rx7900xtx; do
              "amd-smi list" "amd-smi static" "amd-smi metric" "amd-smi process" "amd-smi topology" \
              "amd-smi monitor" "amd-smi firmware" "amd-smi partition" "amd-smi bad-pages" "amd-smi xgmi" \
              "amd-smi version" "amd-smi static --json" "amd-smi metric --json" "amd-smi topology --json"; do
-      $c >/dev/null 2>&1 || echo "$c"
-    done')
-  expect "every rocm-smi and amd-smi command answers ($g)" "" "$failed"
+      out=$($c 2>&1) && [ -n "$out" ] || echo "$c"
+    done; echo checked')
+  expect "every rocm-smi and amd-smi command answers ($g)" "checked" "$failed"
 done
 expect "rocm_agent_enumerator names a Radeon's own target" "gfx1100" \
   "$(sess amd/rx7900xtx -c 'rocm_agent_enumerator -t GPU' | sort -u)"
