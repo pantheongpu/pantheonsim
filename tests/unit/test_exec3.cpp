@@ -2598,6 +2598,44 @@ VTEST(smid_is_within_the_devices_multiprocessor_count) {
   }
 }
 
+// A grid larger than the device reuses SMs as blocks finish; the blocks
+// resident at once -- a cluster's, at least -- still have distinct %smid
+// values, since kernels index per-SM workspace by it.
+VTEST(smid_is_distinct_within_a_cluster_of_a_grid_larger_than_the_device) {
+  std::string ptx = std::string(kHeader90) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %smid;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  const uint32_t sms = e.prof.limits.multiprocessors, n = 4 * sms;
+  const uint64_t out = e.mem.alloc(n * 4);
+  LaunchConfig cfg;
+  cfg.grid = {n, 1, 1};
+  cfg.block = {32, 1, 1};
+  cfg.cluster = {4, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  std::vector<uint32_t> smid(n);
+  e.mem.read(out, smid.data(), n * 4);
+  for (uint32_t c = 0; c < n / 4; ++c)
+    for (uint32_t i = 0; i < 4; ++i) {
+      VCHECK(smid[4 * c + i] < sms);
+      for (uint32_t j = 0; j < i; ++j) VCHECK(smid[4 * c + i] != smid[4 * c + j]);
+    }
+}
+
 VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   // %dynamic_smem_size is the launch's dynamic bytes; %total_smem_size adds the
   // module's static declarations. Both are known exactly, so there is no reason
@@ -2872,6 +2910,50 @@ VTEST(bfind_elect_and_isspacep) {
   VCHECK_EQ(e.mem.load_scalar(out + 28, 4), uint64_t{1});          // the buffer is global
 }
 
+// Without .noinc, cp.async.mbarrier.arrive adds one to the pending count
+// before its arrive-on -- a net zero for the phase -- so a barrier of one
+// completes only on a real arrival; with .noinc the arrive-on counts
+// (9.7.15.16.18).
+VTEST(cp_async_mbarrier_arrive_counts_only_with_noinc) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<4>;
+    .shared .align 8 .b8 bar[16];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u64 %rd5, bar;
+    add.u64 %rd6, %rd5, 8;
+    mov.u32 %r1, 1;
+    mbarrier.init.shared.b64 [%rd5], %r1;
+    mbarrier.init.shared.b64 [%rd6], %r1;
+    cp.async.mbarrier.arrive.shared.b64 [%rd5];
+    mbarrier.test_wait.parity.shared.b64 %p1, [%rd5], 0;
+    selp.u32 %r2, 1, 0, %p1;
+    mbarrier.arrive.shared.b64 %rd7, [%rd5];
+    mbarrier.test_wait.parity.shared.b64 %p2, [%rd5], 0;
+    selp.u32 %r3, 1, 0, %p2;
+    cp.async.mbarrier.arrive.noinc.shared.b64 [%rd6];
+    mbarrier.test_wait.parity.shared.b64 %p3, [%rd6], 0;
+    selp.u32 %r4, 1, 0, %p3;
+    st.global.u32 [%rd2], %r2;
+    st.global.u32 [%rd2+4], %r3;
+    st.global.u32 [%rd2+8], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16);
+  LaunchConfig cfg;
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0});       // no .noinc: not complete
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{1});   // after a real arrival
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{1});   // .noinc: complete
+}
+
 VTEST(cp_async_mbarrier_arrive_lands_the_copy_before_the_arrival) {
   // The ordering an Ampere pipeline depends on. Warp 0 issues a cp.async into
   // shared memory and signals the barrier with cp.async.mbarrier.arrive; every
@@ -2903,7 +2985,7 @@ INITDONE:
     bar.sync 0;
     @%p0 bra ARRIVE;
     cp.async.ca.shared.global [%rd6], [%rd2], 4;
-    cp.async.mbarrier.arrive.shared.b64 [%rd5];
+    cp.async.mbarrier.arrive.noinc.shared.b64 [%rd5];
     bra WAIT;
 ARRIVE:
     mbarrier.arrive.shared.b64 %rd7, [%rd5];
@@ -5578,6 +5660,49 @@ VTEST(stmatrix_m16n8_trans_b8_stores_columns) {
         const int t = 4 * (row % 8) + c / 2, byte = 2 * (row / 8) + c % 2;
         VCHECK_EQ(int(got[(8 * m + c) * 16 + row]), int(reg_byte(t, m, byte)));
       }
+}
+
+// Decimal floating-point literals (PTX ISA 4.5.2): doubles, converted to the
+// size of the operand they are used as -- f32 in .f32 instructions, f64 in
+// .f64 ones, and a cvt's source type. CUTLASS's inline asm writes
+// "cvt.rp.satfinite.ue8m0x2.f32 %0, 0.0, %1".
+VTEST(decimal_float_literals_take_the_operands_size) {
+  std::string ptx = std::string(kHeader90) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .f32 %f<6>;
+    .reg .f64 %fd<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.f32 %f1, 0.5;
+    add.f32 %f2, %f1, 1.25e1;
+    mov.f32 %f3, -2.0;
+    mov.f64 %fd1, -2.5;
+    add.f64 %fd2, %fd1, 0.125;
+    cvt.rn.f32.f64 %f4, 0.25;
+    st.global.f32 [%rd2], %f2;
+    st.global.f32 [%rd2+4], %f3;
+    st.global.f64 [%rd2+8], %fd2;
+    st.global.f32 [%rd2+16], %f4;
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  float f[5];
+  double d;
+  e.mem.read(out, f, 8);
+  e.mem.read(out + 8, &d, 8);
+  e.mem.read(out + 16, &f[4], 4);
+  VCHECK_EQ(f[0], 13.0f);
+  VCHECK_EQ(f[1], -2.0f);
+  VCHECK_EQ(d, -2.375);
+  VCHECK_EQ(f[4], 0.25f);
 }
 
 VTEST_MAIN

@@ -556,4 +556,33 @@ VTEST(remote_mbarrier_forms_the_isa_does_not_define_are_refused) {
                   ".mbarrier::complete_tx::bytes");
 }
 
+// cp.async.mbarrier.arrive finds the barrier through the address's cluster
+// rank as every mbarrier access does: in a cluster, an odd CTA's own shared
+// addresses carry its rank, and the raw address found nothing. (.noinc makes
+// each thread's arrive-on count toward the barrier's 32.)
+VTEST(cp_async_mbarrier_arrive_on_an_odd_ctas_own_barrier) {
+  MemoryManager mem{1 << 20};
+  const std::string ptx = R"(
+.visible .entry k()
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .shared .align 8 .b64 bar;
+    mov.u32 %r1, bar;
+    mov.u32 %r2, %tid.x;
+    setp.eq.u32 %p1, %r2, 0;
+    @%p1 mbarrier.init.shared::cta.b64 [%r1], 32;
+    bar.sync 0;
+    cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%r1];
+WAIT:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1, [%r1], 0;
+    @!%p1 bra WAIT;
+    barrier.cluster.arrive.aligned;
+    barrier.cluster.wait.aligned;
+    ret;
+}
+)";
+  run(ptx, clusters(2, 2, 32), {}, mem);
+}
+
 VTEST_MAIN
