@@ -150,6 +150,7 @@ add_library(vgpu STATIC
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
   src/runtime/runtime.cpp
+  src/runtime/shared_runtime.cpp
 )
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 
@@ -1433,6 +1434,13 @@ endif()
 # Memory a graph owns: an allocation node, a free node, what the graph-memory
 # attributes report, and a trim that keeps the address it documents as fixed.
 if(TARGET vgpucudart)
+  # The runtime and driver APIs sharing one simulated machine.
+  add_test(NAME e2e_mixed_apis COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mixed_apis.sh)
+  set_tests_properties(e2e_mixed_apis PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   add_test(NAME e2e_graph_memory COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_memory.sh)
   set_tests_properties(e2e_graph_memory PROPERTIES
     DEPENDS vgpucudart

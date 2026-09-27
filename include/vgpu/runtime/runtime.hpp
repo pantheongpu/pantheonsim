@@ -110,6 +110,12 @@ class Device {
   mutable std::vector<LoadedModule> modules_;   // mutable: a lazy module parses kernels on lookup
 };
 
+class Runtime;
+// The process's simulated machine, made from the environment (VGPU_GPU,
+// VGPU_DEVICE_COUNT) the first time either CUDA library asks, and the same
+// one for both (shared_runtime.cpp).
+Runtime* shared_runtime();
+
 class Runtime {
  public:
   // Creates `device_count` identical virtual devices of the given profile.

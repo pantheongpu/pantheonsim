@@ -245,7 +245,7 @@ struct MemPool {
 
 struct State {
   std::recursive_mutex mu;
-  std::unique_ptr<vgpu::runtime::Runtime> rt;
+  vgpu::runtime::Runtime* rt = nullptr;   // the process's machine, not owned (shared_runtime.cpp)
   std::vector<std::unique_ptr<RegisteredModule>> modules;
   std::unordered_map<const void*, KernelInfo> kernels;  // host stub ptr -> kernel
   std::unordered_map<const void*, VarInfo> vars;        // host shadow ptr -> device symbol
@@ -351,24 +351,13 @@ void init_driver_shim_if_loaded() {
 
 void ensure_init(State& s) {
   if (s.initialized) return;
-  const char* gpu = std::getenv("VGPU_GPU");
-  std::string id = gpu && gpu[0] ? gpu : "nvidia/h100";
-  int count = 1;
-  if (const char* c = std::getenv("VGPU_DEVICE_COUNT"); c && c[0]) count = std::atoi(c);
-  vgpu::DeviceProfile profile = vgpu::load_gpu(id);
-  // Optional: shrink advertised VRAM so VRAM-proportional stress tests run at
-  // laptop scale (their size is a % of device memory). Functional behavior is
-  // unchanged; only the working-set size the app chooses shrinks.
-  vgpu::apply_vram_override(profile);
-  s.rt = std::make_unique<vgpu::runtime::Runtime>(profile, count);
+  // One machine for both CUDA libraries (shared_runtime.cpp).
+  s.rt = vgpu::runtime::shared_runtime();
   s.initialized = true;
   init_driver_shim_if_loaded();
   // A program that only uses the runtime API never reaches cuInit, and a
   // profiler attached to it would otherwise never be invited in.
   vgpu::load_injection_library();
-  if (!quiet())
-    std::fprintf(stderr, "[vgpu] virtual GPU platform initialized: %d x %s (%s)\n", count,
-                 profile.id.c_str(), profile.model.c_str());
 }
 
 // Sticky last error, per the runtime API contract.
@@ -614,6 +603,20 @@ uint64_t module_on_current(State& s, RegisteredModule& m) {
   return mid;
 }
 
+// The driver's context for this thread: the runtime's current device's
+// primary context, as the real runtime leaves it, so a program's own driver
+// calls work alongside runtime ones (vgpu_driver_bind_primary_v1 in
+// driver_api.cpp). Once per thread, and again when it changes device; nothing
+// to do when the driver shim is not loaded.
+void bind_driver_context() {
+  thread_local int bound = -1;
+  if (bound == t_current_device) return;
+  using Bind = int (*)(int);
+  static const Bind fn = reinterpret_cast<Bind>(dlsym(RTLD_DEFAULT, "vgpu_driver_bind_primary_v1"));
+  if (fn) fn(t_current_device);
+  bound = t_current_device;
+}
+
 template <class F>
 cudaError_t guard(const char* api, F&& body) {
   State& s = st();
@@ -624,6 +627,7 @@ cudaError_t guard(const char* api, F&& body) {
   const cudaError_t rc = [&]() -> cudaError_t {
     try {
       ensure_init(s);
+      bind_driver_context();
       if (const cudaError_t sticky = g_sticky_error.load(); sticky != cudaSuccess) {
         g_last_error = sticky;
         return sticky;
@@ -1121,6 +1125,7 @@ VGPU_EXPORT cudaError_t cudaSetDevice(int device) {
   return guard("cudaSetDevice", [&](State& s) {
     if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
     t_current_device = device;
+    bind_driver_context();
     return cudaSuccess;
   });
 }

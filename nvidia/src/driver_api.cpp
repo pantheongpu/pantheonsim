@@ -76,7 +76,7 @@ struct EventRec {
 struct ShimState {
   std::recursive_mutex mu;
   bool initialized = false;
-  std::unique_ptr<vgpu::runtime::Runtime> rt;
+  vgpu::runtime::Runtime* rt = nullptr;   // the process's machine, not owned (shared_runtime.cpp)
   uintptr_t next_id = 8;
 
   std::unordered_map<uintptr_t, int> contexts;         // ctx handle -> device ordinal
@@ -469,18 +469,39 @@ VGPU_EXPORT CUresult cuInit(unsigned int flags) {
   return api("cuInit", false, false, [&](ShimState& s) {
     if (flags != 0) return CUDA_ERROR_INVALID_VALUE;
     if (s.initialized) return CUDA_SUCCESS;
-    const char* gpu = std::getenv("VGPU_GPU");
-    std::string id = gpu && gpu[0] ? gpu : "nvidia/h100";
-    int count = 1;
-    if (const char* c = std::getenv("VGPU_DEVICE_COUNT"); c && c[0]) count = std::atoi(c);
-    vgpu::DeviceProfile profile = vgpu::load_gpu(id);
-    vgpu::apply_vram_override(profile);
-    s.rt = std::make_unique<vgpu::runtime::Runtime>(profile, count);
+    // The machine libcudart may already have made (shared_runtime.cpp).
+    s.rt = vgpu::runtime::shared_runtime();
     s.initialized = true;
-    if (!quiet())
-      std::fprintf(stderr, "[vgpu] virtual GPU platform initialized: %d x %s (%s)\n", count,
-                   profile.id.c_str(), profile.model.c_str());
     vgpu::load_injection_library();
+    return CUDA_SUCCESS;
+  });
+}
+
+// What libcudart does for the driver when a program uses both APIs, as the
+// real runtime does through the real driver: the device's primary context,
+// retained once on the runtime's behalf, made current for the calling thread,
+// so the program's own driver calls find a context there. A context the
+// program made current itself is left alone; a primary one is swapped for the
+// runtime's current device's. Called by the runtime shim, found through the
+// process's global scope (runtime_api.cpp).
+VGPU_EXPORT int vgpu_driver_bind_primary_v1(int dev) {
+  if (cuInit(0) != CUDA_SUCCESS) return CUDA_ERROR_NOT_INITIALIZED;
+  return api("vgpu_driver_bind_primary", true, false, [&](ShimState& s) {
+    check_device(s, dev);
+    auto it = s.primary_ctx.find(dev);
+    if (it == s.primary_ctx.end()) {
+      const uintptr_t h = make_handle(s, kTagCtx);
+      s.contexts[h] = dev;
+      it = s.primary_ctx.emplace(dev, h).first;
+    }
+    static std::set<int> retained;   // the runtime's one reference per device
+    if (retained.insert(dev).second) ++s.primary_refs[dev];
+    auto& stack = ctx_stack();
+    bool primary_current = false;
+    if (!stack.empty())
+      for (const auto& [d, h] : s.primary_ctx) primary_current |= h == stack.back();
+    if (stack.empty()) stack.push_back(it->second);
+    else if (primary_current) stack.back() = it->second;
     return CUDA_SUCCESS;
   });
 }
