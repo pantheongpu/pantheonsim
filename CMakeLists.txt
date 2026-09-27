@@ -43,6 +43,7 @@ set(VGPU_PROFILES
   amd/mi300x
   amd/mi325x
   amd/mi350x
+  amd/rx7900xtx
 )
 set(_gen_dir "${CMAKE_BINARY_DIR}/generated")
 set(_gen "${_gen_dir}/vgpu/embedded_profiles.hpp")
@@ -123,6 +124,7 @@ add_library(vgpu STATIC
   amd/src/bundle.cpp
   amd/src/codeobject.cpp
   amd/src/gcn_decode.cpp
+  amd/src/rdna_decode.cpp
   amd/src/gcn_exec.cpp
   amd/src/hostcall.cpp
   src/core/machine.cpp
@@ -671,6 +673,14 @@ target_compile_definitions(test_amd_gcn_narrow PRIVATE VGPU_SOURCE_DIR="${CMAKE_
 
 vgpu_unit_test(test_amd_gcn_lds amd/tests/unit/test_gcn_lds.cpp)
 target_compile_definitions(test_amd_gcn_lds PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
+# The same kernels built for gfx1100 (RDNA3, wave32), through the same
+# checks: the RDNA decoder and the executor's wave32, 16-bit-half and
+# RDNA-only paths against the same answers.
+foreach(_t ops math memory globals grid bytes int64 atomics mixed half calls packed spill doubles narrow lds exec)
+  add_test(NAME test_amd_gcn_${_t}_gfx1100 COMMAND test_amd_gcn_${_t})
+  set_tests_properties(test_amd_gcn_${_t}_gfx1100 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1100")
+endforeach()
 
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
 target_compile_definitions(test_amd_gcn_idioms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

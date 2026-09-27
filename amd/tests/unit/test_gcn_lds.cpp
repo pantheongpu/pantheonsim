@@ -24,7 +24,7 @@ using namespace vgpu;
 namespace {
 
 amd::CodeObject object() {
-  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/lds.gfx942.o";
+  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/lds." + vtest::amd_target() + ".o";
   std::ifstream in(path, std::ios::binary);
   if (!in) throw vtest::Failure("no code object at " + path);
   return amd::load_code_object(std::string((std::istreambuf_iterator<char>(in)), {}), path);
@@ -169,10 +169,13 @@ VTEST(a_lane_reads_another_into_the_register_it_reads_from) {
   const uint64_t pin = upload(mem, in), pout = mem.alloc(kN * 4);
   run(o, "permute_twice", mem, {pin, pout, static_cast<uint64_t>(kN)});
   // Lane t took lane t+1's value, then lane t+2's copy of what that lane had
-  // taken: in[t + 3], all modulo the wave.
+  // taken: in[t + 3], all modulo the wave (a lane's address picks among its
+  // own wave's lanes, 32 of them on RDNA).
   const std::vector<int32_t> out = download<int32_t>(mem, pout, kN);
+  const int wave = static_cast<int>(vtest::amd_wave());
+  const auto from = [&](int t, int by) { return (t & ~(wave - 1)) + (((t + by) & 63) & (wave - 1)); };
   for (int i = 0; i < kN; ++i)
-    if (out[i] != in[(i + 3) & 63])
+    if (out[i] != in[from(from(i, 2), 1)])
       throw vtest::Failure("permute_twice[" + std::to_string(i) + "] is " + std::to_string(out[i]) + ", not " +
                            std::to_string(in[(i + 3) & 63]));
 }

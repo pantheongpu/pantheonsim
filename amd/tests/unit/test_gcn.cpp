@@ -157,6 +157,13 @@ VTEST(every_gfx90a_instruction_shape_decodes_as_llvm_prints_it) {
   check_corpus("isa_corpus_gfx90a.txt", amd::gcn::Target::Gfx90a);
 }
 
+// And gfx1100 (RDNA3), whose encodings and numbering are all its own: PyTorch's,
+// rocBLAS's, MIOpen's, rocSPARSE's and rocSOLVER's gfx1100 code, VOPD's paired
+// instructions and 16-bit halves (v1.l) included.
+VTEST(every_gfx1100_instruction_shape_decodes_as_llvm_prints_it) {
+  check_corpus("isa_corpus_gfx1100.txt", amd::gcn::Target::Gfx1100);
+}
+
 // The cache every launch of a module shares: an instruction is decoded once,
 // however many threads reach it at the same moment, and all of them get the
 // same copy; a word past the end of the code is not cached.

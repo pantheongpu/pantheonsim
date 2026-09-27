@@ -1,10 +1,12 @@
 #include <cstdio>
 #include <string>
 #include <map>
+#include <set>
 #include <vector>
 
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/error.hpp"
+#include "rdna_decode.hpp"
 
 namespace vgpu::amd::gcn {
 namespace {
@@ -1054,6 +1056,23 @@ const Shape& shape(Enc e, uint32_t opcode) {
 
 }  // namespace
 
+// Whether gfx942's decoder knows an instruction by this exact name ("v_add_f32_e32",
+// "v_fma_f32", "global_load_dword"): the RDNA decoder names what it decodes
+// after the gfx9 instruction that does the same, so the executor runs it as that.
+// Its gfx9 opcode too, which is how the executor tells one comparison (and
+// one s_cmpk) from another.
+int gfx9_opcode(const std::string& name) {
+  static const std::map<std::string, int> names = [] {
+    std::map<std::string, int> n;
+    for (const auto& [key, sh] : table_gfx90a()) n.emplace(sh.name, static_cast<int>(key.second));
+    for (const auto& [key, sh] : table()) n[sh.name] = static_cast<int>(key.second);
+    return n;
+  }();
+  const auto it = names.find(name);
+  return it == names.end() ? -1 : it->second;
+}
+bool known_gfx9_name(const std::string& name) { return gfx9_opcode(name) >= 0; }
+
 const char* enc_name(Enc e) {
   switch (e) {
     case Enc::Sop1: return "SOP1";
@@ -1070,6 +1089,8 @@ const char* enc_name(Enc e) {
     case Enc::Ds: return "DS";
     case Enc::Flat: return "FLAT";
     case Enc::Mubuf: return "MUBUF";
+    case Enc::Mtbuf: return "MTBUF";
+    case Enc::Vopd: return "VOPD";
     case Enc::Unknown: return "unknown";
   }
   return "unknown";
@@ -1211,6 +1232,7 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc);
 }  // namespace
 
 Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target) {
+  if (is_rdna(target)) return rdna::decode(code, at, pc, target);
   struct Using {
     explicit Using(Target t) { g_table = t == Target::Gfx90a ? &table_gfx90a() : &table(); }
     ~Using() { g_table = nullptr; }
@@ -1716,6 +1738,11 @@ std::string operand_text(const Operand& o) {
       else std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(static_cast<uint32_t>(o.value)));
       return neg + b;
     }
+    case OperandKind::Ttmp: return wrap(range("ttmp"));
+    case OperandKind::Null: return wrap("null");
+    case OperandKind::Scc: return wrap("src_scc");
+    case OperandKind::SharedLimit: return wrap("src_shared_limit");
+    case OperandKind::PrivateLimit: return wrap("src_private_limit");
     case OperandKind::None: break;
   }
   return "?";
@@ -1759,6 +1786,7 @@ std::string gfx90a_name(const std::string& name) {
 }
 
 std::string to_text(const Inst& i) {
+  if (is_rdna(i.arch)) return rdna::to_text(i);
   std::string s = i.arch == Target::Gfx90a ? gfx90a_name(i.name) : i.name;
   // gfx90a prints its L2 write-back and invalidate bare, whatever scope bits
   // they carry.

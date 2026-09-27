@@ -19,15 +19,21 @@
 namespace vgpu::amd::gcn {
 
 // The encodings, by the ISA's names for them.
-enum class Enc { Sop1, Sop2, Sopk, Sopc, Sopp, Smem, Vop1, Vop2, Vop3, Vop3p, Vopc, Ds, Flat, Mubuf, Unknown };
+// Mtbuf and Vopd are RDNA's: a typed buffer access, and VOPD, two vector
+// instructions issued as one.
+enum class Enc { Sop1, Sop2, Sopk, Sopc, Sopp, Smem, Vop1, Vop2, Vop3, Vop3p, Vopc, Ds, Flat, Mubuf, Mtbuf, Vopd, Unknown };
 const char* enc_name(Enc e);
 
 // Where an operand lives. The ISA numbers scalar registers, vector registers
 // and the inline constants in one 9-bit space; this splits them apart.
 // Agpr: the accumulation registers, which a kernel with more values than it
 // has vector registers keeps the rest of them in.
+// RDNA adds the trap handler's registers (Ttmp), a null register that reads
+// zero and drops what is written to it, SCC as a vector operand, and the
+// apertures' limits beside their bases.
 enum class OperandKind {
-  Sgpr, Vgpr, Agpr, Vcc, VccHi, Exec, ExecLo, ExecHi, M0, SharedBase, PrivateBase, Inline, InlineFloat, Literal, None
+  Sgpr, Vgpr, Agpr, Vcc, VccHi, Exec, ExecLo, ExecHi, M0, SharedBase, PrivateBase, Inline, InlineFloat, Literal,
+  Ttmp, Null, Scc, SharedLimit, PrivateLimit, None
 };
 struct Operand {
   OperandKind kind = OperandKind::None;
@@ -42,18 +48,30 @@ struct Operand {
   // sign on the way into a 32-bit operation.
   uint8_t sel = 6;
   bool sext = false;
+  // RDNA's 16-bit operands (true16): half a vector register, the high half
+  // where `hi` is set -- v1.h -- and the low one otherwise -- v1.l.
+  bool half = false;
+  bool hi = false;
+  bool bits16 = false;   // a 16-bit operand, whatever it is
+  bool hidden = false;   // read by the instruction, not written by the assembler (VOPD's vcc_lo)
 };
 std::string operand_text(const Operand& o);
 
 // Which processor the code is for. gfx90a (CDNA2) numbers some instructions
 // differently from gfx940 and later -- its matrix instructions above all --
 // and has a few they dropped (v_mad_f32, v_mac_f32); gfx950 adds to gfx942's.
-enum class Target { Gfx942, Gfx90a, Gfx950 };
+// gfx1100 stands for RDNA3 (gfx11), whose encodings are its own: every
+// gfx11 GPU decodes alike.
+enum class Target { Gfx942, Gfx90a, Gfx950, Gfx1100 };
+inline bool is_rdna(Target t) { return t == Target::Gfx1100; }
 
 struct Inst {
   Enc enc = Enc::Unknown;
   uint32_t opcode = 0;
   std::string name;              // "v_add_f32_e32", as the assembler spells it
+  // RDNA: the assembler's name, where `name` is the gfx9 instruction's that
+  // does the same (global_load_b32 runs as global_load_dword).
+  std::string asm_name;
   uint32_t size = 4;             // bytes, this instruction and its literal
   uint64_t pc = 0;               // where it is, in the code object's addresses
 
@@ -132,6 +150,14 @@ struct Inst {
   bool sdwa = false;
   uint8_t dst_sel = 6;
   uint8_t dst_unused = 0;   // 0 pads the rest with zeroes, 1 with the sign, 2 keeps it
+  // RDNA: DPP8 (each of eight lanes picks one of the eight, dpp_ctrl holding
+  // the eight 3-bit choices), DPP's fetch-inactive bit, DS's GDS bit, a typed
+  // buffer access's format, and VOPD's two halves.
+  bool dpp8 = false;
+  bool fi = false;
+  bool gds = false;
+  uint32_t format = 0;
+  std::vector<Inst> dual;
   // A memory instruction's scope bits (global_atomic_*'s sc0/sc1/nt), which
   // say how far a write is published. Every access here is already visible to
   // every wave, so they change nothing and are kept for the listing.
@@ -140,7 +166,13 @@ struct Inst {
 
 // The target a code object's e_flags machine field (EF_AMDGPU_MACH) names.
 inline Target target_of_mach(uint32_t mach) {
-  return mach == 0x3f ? Target::Gfx90a : mach == 0x4f ? Target::Gfx950 : Target::Gfx942;
+  switch (mach) {
+    case 0x3f: return Target::Gfx90a;
+    case 0x4f: return Target::Gfx950;
+    // gfx1100, 1101, 1102, 1103, 1150, 1151, 1152: RDNA3 and 3.5.
+    case 0x41: case 0x46: case 0x47: case 0x44: case 0x43: case 0x4a: case 0x55: return Target::Gfx1100;
+    default: return Target::Gfx942;
+  }
 }
 
 // Decodes the instruction at `at` in `code`, for `target`. Throws

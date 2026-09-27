@@ -21,7 +21,7 @@ VTEST(registry_lists_all_gpus) {
       "nvidia/b200",  "nvidia/rtx3060", "nvidia/rtx3080ti", "nvidia/a100-sxm4-40gb",
       "nvidia/gh200-480gb", "nvidia/h100-pcie", "nvidia/t4", "nvidia/a10g",
       "nvidia/l4", "nvidia/l40s",
-      "amd/mi250x", "amd/mi300x", "amd/mi325x", "amd/mi350x"};
+      "amd/mi250x", "amd/mi300x", "amd/mi325x", "amd/mi350x", "amd/rx7900xtx"};
   VCHECK_EQ(ids.size(), expected.size());
   for (const auto& want : expected)
     VCHECK(std::find(ids.begin(), ids.end(), want) != ids.end());

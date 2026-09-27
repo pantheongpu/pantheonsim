@@ -1,6 +1,7 @@
 // vtest — minimal, dependency-free test framework for VirtualGPU.
 // One executable per test file: use VTEST(name) { ... } and VTEST_MAIN at the end.
 #pragma once
+#include <cstdlib>
 
 #include <cstdio>
 #include <exception>
@@ -10,6 +11,16 @@
 #include <vector>
 
 namespace vtest {
+
+// Which AMD target's build of a test kernel to run: gfx942's unless
+// VGPU_TEST_TARGET names another (gfx1100 runs the same kernels as RDNA3
+// code, wave32).
+inline std::string amd_target() {
+  const char* t = std::getenv("VGPU_TEST_TARGET");
+  return t && *t ? t : "gfx942";
+}
+// The lanes of a wave on that target: 64 on CDNA, 32 on RDNA (built wave32).
+inline unsigned amd_wave() { return amd_target().rfind("gfx1", 0) == 0 ? 32 : 64; }
 
 struct Case {
   const char* name;
