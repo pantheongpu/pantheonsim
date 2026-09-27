@@ -6369,9 +6369,8 @@ class Interpreter {
     }
     const uint32_t Ka = sp ? K / 2 : K;   // A's stored elements a row
     if (sat && !d_int) bad();
-    // Sub-byte elements are read K-major (Table 65 transposes only 8- and
-    // 16-bit ones, and 32-bit in the 32-byte-atom swizzle).
-    if ((ea.bits < 8 && trans_a) || (eb2.bits < 8 && trans_b)) bad();
+    // Table 62: the fp6/fp4 types transpose too, except at the dense K = 64
+    // (sm_107's, refused above); the mxf4 kinds never do.
     // Block scaling: scale factors per row of K, and their type.
     uint32_t sv = 0;          // scale factors per row of A / column of B
     bool ue4m3 = false;
@@ -6458,14 +6457,23 @@ class Interpreter {
 
     // Element (mn, k) of an operand in shared memory. K-major, it is bits at
     // (k % per16) * bits within 16-byte group k / per16 of the row, through
-    // the canonical layout byte by byte; MN-major (8 bits and wider only),
-    // the canonical layout of whole elements.
+    // the canonical layout byte by byte; MN-major, the canonical layout of
+    // whole elements, or for fp6/fp4 the same 16-byte groups running along
+    // MN (as TMA's .b6x16_p32/.b4x16_p64 write an MN-major tile).
     auto smem_raw = [&](const WgmmaDesc& d, bool k_major, const TcElem& e, uint32_t rank, uint32_t mn,
                         uint32_t k) -> uint32_t {
       auto byte_at = [&](uint64_t off) {
         return static_cast<uint32_t>(load_routed(w, ctx, ins, lane,
                                                  kSharedVaBase + cluster_address(ctx, rank, off), 1));
       };
+      if (!k_major && e.bits < 8) {
+        const uint32_t bit = (mn % e.per16) * e.bits;
+        const uint32_t byte = 16 * (mn / e.per16) + bit / 8;
+        uint32_t raw = 0;
+        for (uint32_t i = 0; i < (bit % 8 + e.bits + 7) / 8; ++i)
+          raw |= byte_at(wgmma_smem_offset(d, false, 1, byte + i, k)) << (8 * i);
+        return (raw >> (bit % 8)) & ((1u << e.bits) - 1);
+      }
       if (!k_major) {
         const uint32_t eb = e.bits / 8;
         const uint64_t at = wgmma_smem_offset(d, false, eb, mn, k);

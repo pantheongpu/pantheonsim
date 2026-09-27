@@ -56,8 +56,9 @@ means (CUTLASS elects one).
   `mxf4` and `mxf4nvf4` (below).
 - The 6- and 4-bit types of `.kind::f8f6f4` sit 16 to a 16-byte group in
   shared memory, packed from the group's start with the rest padding (the
-  layouts `tcgen05.cp` calls `.b6x16_p32` and `.b4x16_p64`), and must be
-  K-major. In Tensor Memory each takes an 8-bit container: fp6 in bits 0-5,
+  layouts `tcgen05.cp` calls `.b6x16_p32` and `.b4x16_p64`); MN-major, the
+  same groups run along M or N (Table 62 allows the transpose except at
+  sm_107's dense K = 64, and never for the `mxf4` kinds). In Tensor Memory each takes an 8-bit container: fp6 in bits 0-5,
   fp4 in bits 2-5 (figure 202). Under `.kind::mxf4*`, fp4 is packed two to
   a byte in both. The OCP MX types have no infinities or NaNs.
 - Shapes: `.cta_group::1` with M = 64 or 128, and `.cta_group::2` with M = 128

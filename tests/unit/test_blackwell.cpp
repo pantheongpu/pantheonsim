@@ -1112,6 +1112,32 @@ VTEST(tcgen05_mma_fp4_times_fp6_from_padded_shared_memory) {
   check_d_f32(x.run(), 1, M, N, K, A, B, nullptr, 0, 32);
 }
 
+// e2m1 A MN-major (the transpose bit): sixteen values of a column packed in
+// the first 8 bytes of each 16-byte group along M, the groups in the
+// MN-major canonical layout ((T,1,m),(8,k)):((1,T,SBO),(1T,LBO)) of bytes.
+VTEST(tcgen05_mma_fp4_mn_major_a) {
+  const int M = 128, N = 32, K = 32;
+  auto A = [](int m, int k) { return val(m, k, 5); };
+  auto B = [](int k, int n) { return val(k, n, 7); };
+  std::vector<uint8_t> a;
+  for (int k = 0; k < K; ++k) {
+    std::vector<uint8_t> col(128, 0);   // M / 16 groups of 16 bytes
+    for (int m = 0; m < M; ++m) col[16 * (m / 16) + (m % 16) / 2] |= uint8_t(e2m1_bits(A(m, k)) << (4 * (m % 2)));
+    for (int b = 0; b < 128; ++b) put(a, canonical(Major::MN, 0, 1, 128, 512, b, k), col[b], 1);
+  }
+  const Operands o = images(1, M, N, K, 1, Major::K, Major::K, 0, 0, 128, 256, 128, 256,
+                            [](int, int) { return 0; }, [&](int n, int k) { return e4m3_bits(B(k, n)); });
+  Mma x;
+  x.kind = "f8f6f4";
+  x.id = idesc(1, 5, 0, M, N, false, false, true);
+  x.desc_a = desc(0, 128, 512, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.smem_a = {a};
+  x.smem_b = o.b;
+  x.cols = 32;
+  check_d_f32(x.run(), 1, M, N, K, A, B, nullptr, 0, 32);
+}
+
 // A in Tensor Memory in 8-bit containers: e2m1 in bits 2-5 of each byte
 // (figure 202), four to a column; B e2m3.
 VTEST(tcgen05_mma_fp4_a_from_tensor_memory_containers) {
