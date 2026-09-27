@@ -7645,9 +7645,12 @@ class Interpreter {
       // CTA's, which CUTLASS's 2-SM blockwise-scaled kernels arrive on) is
       // found through it rather than by the raw address.
       Mbarrier& b = cluster_mbarrier(ctx, ins, static_cast<int>(lead), addr, "cp.async.mbarrier.arrive");
-      // .noinc completes the copies without contributing an arrival of its
-      // own, which is how a thread that already arrived orders its copies.
-      if (!op.noinc) {
+      // Without .noinc the pending count goes up by one before the
+      // asynchronous arrive-on, a net zero for the phase -- the arrival only
+      // waits for the copies, which have completed above. With .noinc there
+      // is no increment, so each thread's arrive-on counts toward the phase
+      // and the barrier's initial count must include it (9.7.15.16.18).
+      if (op.noinc) {
         b.arrived += popcount_mask(m);
         if (b.arrived >= b.expected) {
           b.arrived -= b.expected;
