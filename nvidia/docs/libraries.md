@@ -37,7 +37,7 @@ which is the honest meaning of "the same image".
 | cuDNN | `libcudnn.so.9` | convolution, activation, pooling, softmax, batchnorm |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation |
-| cuSPARSE | `libcusparse.so.12` | CSR/COO SpMV and SpMM, format conversion |
+| cuSPARSE | `libcusparse.so.12` | CSR/COO SpMV and SpMM, format conversion, CSR to CSC |
 | cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR, symmetric eigen, SVD |
 | NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
@@ -74,7 +74,8 @@ output. Anything that differs is a bug in this implementation.
 | `lt_and_rand` | cuBLASLt bit-identical; cuRAND matches distribution and reseed semantics |
 | `cudnn_ops` | all 50 reported values bit-identical |
 | `cufft_transforms` | all 14 bit-identical, across composite, prime, 2‑D, 3‑D and both precisions |
-| `cusparse_ops` | all 15 bit-identical |
+| `cusparse_ops` | all 15 bit-identical; CSR to CSC identical in every index and value, both bases, both value types, structure only and with values |
+| `cublas_level1` | single and double `axpy`, `scal`, `dot`, `nrm2`, `i?amax` and `tbmv` agree, every index identical, negative increments included |
 | `cusolver_factorizations` | Cholesky, LU (pivots included), QR and every solve bit-identical; one f32 eigenvalue differs by ~1e‑6 relative |
 | `nccl_collectives` | all 24 bit-identical at two ranks on two physical GPUs |
 | `nvrtc_jit` | identical: compile a kernel at run time, load the PTX, launch it, same numbers |

@@ -40,6 +40,7 @@ a physical GPU and against this implementation, then diffs:
 | `sgemmStridedBatched` | bit-identical |
 | `dgemm` | bit-identical |
 | `sgemv`, `saxpy`, `sscal`, `sdot`, `snrm2` | agree to ~1e-7 relative |
+| `?axpy`, `?scal`, `?dot`, `?nrm2`, `i?amax`, `?tbmv` in single and double, negative increments included (`cublas_level1`) | agree to the harness's tolerance; every index identical |
 
 Every GEMM path is bit-identical to hardware. The level-1 and level-2 routines
 differ in the last digit because reductions do not associate the same way on a
@@ -51,8 +52,11 @@ across architectures either, so the harness compares those with a tolerance
 
 Handles and configuration (`cublasCreate/Destroy`, streams, pointer mode, math
 mode, version/properties), `Sgemm`, `Dgemm`, `SgemmStridedBatched`, `GemmEx`
-for the all-fp32 and all-fp64 forms, `Sgemv`, `Saxpy`, `Sscal`, `Sdot`,
-`Snrm2`.
+for the all-fp32 and all-fp64 forms, `Sgemv`, and in both single and double
+precision `axpy`, `scal`, `dot`, `nrm2`, `i?amax` and the triangular band
+product `tbmv`. A negative increment walks the vector from its far end, as
+BLAS defines it; `scal`, `nrm2` and `i?amax` do nothing (or return 0) for an
+increment that is not positive, which is what the hardware does too.
 
 Not implemented — these return `CUBLAS_STATUS_NOT_SUPPORTED` rather than a
 plausible wrong answer: mixed-precision `GemmEx` (f16/bf16/int8 paths),

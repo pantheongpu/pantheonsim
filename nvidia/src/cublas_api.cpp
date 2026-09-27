@@ -25,6 +25,7 @@
 // under CUDA 12, and this file copies operands with cudaMemcpy.
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -507,79 +508,205 @@ VGPU_EXPORT cublasStatus_t cublasSgemv_v2(cublasHandle_t h, cublasOperation_t tr
   return CUBLAS_STATUS_SUCCESS;
 }
 
-VGPU_EXPORT cublasStatus_t cublasSaxpy_v2(cublasHandle_t h, int n, const float* alpha,
-                                          const float* x, int incx, float* y, int incy) {
+namespace {
+
+// Where element i of an n-element vector with increment inc sits, by BLAS's
+// rule: a negative increment walks the vector from its far end, so element 0
+// is at (n-1)*|inc|. Indexing i*inc directly would read before the buffer.
+inline size_t elem(int i, int n, int inc) {
+  return inc > 0 ? static_cast<size_t>(i) * inc : static_cast<size_t>(n - 1 - i) * -inc;
+}
+inline size_t span(int n, int inc) { return static_cast<size_t>(std::abs(inc)) * (n - 1) + 1; }
+
+// The reductions hand their answer back through a host or device pointer,
+// depending on the handle's pointer mode.
+template <class R>
+void put_result(cublasHandle_t h, R* result, R value) {
+  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE)
+    cudaMemcpy(result, &value, sizeof value, kH2D);
+  else
+    *result = value;
+}
+
+template <class T>
+cublasStatus_t axpy(cublasHandle_t h, int n, const T* alpha, const T* x, int incx, T* y,
+                    int incy) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (n <= 0) return CUBLAS_STATUS_SUCCESS;
-  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(float))] {
-        cublasSaxpy_v2(h, n, static_cast<const float*>(al.get()), x, incx, y, incy);
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(T))] {
+        axpy<T>(h, n, static_cast<const T*>(al.get()), x, incx, y, incy);
       }))
     return CUBLAS_STATUS_SUCCESS;
-  float a = scalar(h, alpha);
-  auto hx = fetch<float>(x, static_cast<size_t>(std::abs(incx)) * (n - 1) + 1);
-  auto hy = fetch<float>(y, static_cast<size_t>(std::abs(incy)) * (n - 1) + 1);
-  for (int i = 0; i < n; ++i) hy[i * incy] += a * hx[i * incx];
+  T a = scalar(h, alpha);
+  auto hx = fetch<T>(x, span(n, incx));
+  auto hy = fetch<T>(y, span(n, incy));
+  for (int i = 0; i < n; ++i) hy[elem(i, n, incy)] += a * hx[elem(i, n, incx)];
   store(y, hy);
   return CUBLAS_STATUS_SUCCESS;
 }
 
-VGPU_EXPORT cublasStatus_t cublasSscal_v2(cublasHandle_t h, int n, const float* alpha, float* x,
-                                          int incx) {
+// Reference BLAS scales nothing when incx is not positive.
+template <class T>
+cublasStatus_t scal(cublasHandle_t h, int n, const T* alpha, T* x, int incx) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (n <= 0) return CUBLAS_STATUS_SUCCESS;
-  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(float))] {
-        cublasSscal_v2(h, n, static_cast<const float*>(al.get()), x, incx);
+  if (n <= 0 || incx <= 0) return CUBLAS_STATUS_SUCCESS;
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(T))] {
+        scal<T>(h, n, static_cast<const T*>(al.get()), x, incx);
       }))
     return CUBLAS_STATUS_SUCCESS;
-  float a = scalar(h, alpha);
-  auto hx = fetch<float>(x, static_cast<size_t>(std::abs(incx)) * (n - 1) + 1);
-  for (int i = 0; i < n; ++i) hx[i * incx] *= a;
+  T a = scalar(h, alpha);
+  auto hx = fetch<T>(x, span(n, incx));
+  for (int i = 0; i < n; ++i) hx[static_cast<size_t>(i) * incx] *= a;
   store(x, hx);
   return CUBLAS_STATUS_SUCCESS;
 }
 
-VGPU_EXPORT cublasStatus_t cublasSdot_v2(cublasHandle_t h, int n, const float* x, int incx,
-                                         const float* y, int incy, float* result) {
+// Accumulated in long double, then rounded once: a GPU sums in a different
+// order, so the last bits can differ, but never by more than that ordering.
+template <class T>
+cublasStatus_t dot(cublasHandle_t h, int n, const T* x, int incx, const T* y, int incy,
+                   T* result) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!result) return CUBLAS_STATUS_INVALID_VALUE;
   if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
-  if (deferred_to_graph(h, [=] { cublasSdot_v2(h, n, x, incx, y, incy, result); }))
+  if (deferred_to_graph(h, [=] { dot<T>(h, n, x, incx, y, incy, result); }))
     return CUBLAS_STATUS_SUCCESS;
-  double acc = 0.0;
+  long double acc = 0.0L;
   if (n > 0) {
-    auto hx = fetch<float>(x, static_cast<size_t>(std::abs(incx)) * (n - 1) + 1);
-    auto hy = fetch<float>(y, static_cast<size_t>(std::abs(incy)) * (n - 1) + 1);
-    for (int i = 0; i < n; ++i) acc += static_cast<double>(hx[i * incx]) * hy[i * incy];
+    auto hx = fetch<T>(x, span(n, incx));
+    auto hy = fetch<T>(y, span(n, incy));
+    for (int i = 0; i < n; ++i)
+      acc += static_cast<long double>(hx[elem(i, n, incx)]) * hy[elem(i, n, incy)];
   }
-  float out = static_cast<float>(acc);
-  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE)
-    cudaMemcpy(result, &out, sizeof out, kH2D);
-  else
-    *result = out;
+  put_result(h, result, static_cast<T>(acc));
   return CUBLAS_STATUS_SUCCESS;
 }
 
-VGPU_EXPORT cublasStatus_t cublasSnrm2_v2(cublasHandle_t h, int n, const float* x, int incx,
-                                          float* result) {
+template <class T>
+cublasStatus_t nrm2(cublasHandle_t h, int n, const T* x, int incx, T* result) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!result) return CUBLAS_STATUS_INVALID_VALUE;
   if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
-  if (deferred_to_graph(h, [=] { cublasSnrm2_v2(h, n, x, incx, result); }))
+  if (deferred_to_graph(h, [=] { nrm2<T>(h, n, x, incx, result); }))
     return CUBLAS_STATUS_SUCCESS;
-  double acc = 0.0;
-  if (n > 0) {
-    auto hx = fetch<float>(x, static_cast<size_t>(std::abs(incx)) * (n - 1) + 1);
+  long double acc = 0.0L;
+  if (n > 0 && incx > 0) {
+    auto hx = fetch<T>(x, span(n, incx));
     for (int i = 0; i < n; ++i) {
-      double v = hx[i * incx];
+      long double v = hx[static_cast<size_t>(i) * incx];
       acc += v * v;
     }
   }
-  float out = static_cast<float>(std::sqrt(acc));
-  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE)
-    cudaMemcpy(result, &out, sizeof out, kH2D);
-  else
-    *result = out;
+  put_result(h, result, static_cast<T>(std::sqrt(acc)));
   return CUBLAS_STATUS_SUCCESS;
+}
+
+// The 1-based index of the first element of largest magnitude; 0 when there is
+// nothing to search, as reference BLAS returns.
+template <class T>
+cublasStatus_t iamax(cublasHandle_t h, int n, const T* x, int incx, int* result) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!result) return CUBLAS_STATUS_INVALID_VALUE;
+  if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (deferred_to_graph(h, [=] { iamax<T>(h, n, x, incx, result); }))
+    return CUBLAS_STATUS_SUCCESS;
+  int best = 0;
+  if (n > 0 && incx > 0) {
+    auto hx = fetch<T>(x, span(n, incx));
+    T top = std::abs(hx[0]);
+    best = 1;
+    for (int i = 1; i < n; ++i) {
+      T v = std::abs(hx[static_cast<size_t>(i) * incx]);
+      if (v > top) { top = v; best = i + 1; }
+    }
+  }
+  put_result(h, result, best);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+// x = op(A) x for a triangular band matrix: n by n with k diagonals beside the
+// main one, stored as LAPACK's band format. Column j of the upper form keeps
+// A(i,j) at row k+i-j of the band; the lower form keeps it at row i-j.
+template <class T>
+cublasStatus_t tbmv(cublasHandle_t h, cublasFillMode_t uplo, cublasOperation_t trans,
+                    cublasDiagType_t diag, int n, int k, const T* A, int lda, T* x, int incx) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (n < 0 || k < 0 || lda < k + 1 || incx == 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (n == 0) return CUBLAS_STATUS_SUCCESS;
+  if (deferred_to_graph(h, [=] { tbmv<T>(h, uplo, trans, diag, n, k, A, lda, x, incx); }))
+    return CUBLAS_STATUS_SUCCESS;
+  const bool upper = uplo == CUBLAS_FILL_MODE_UPPER, unit = diag == CUBLAS_DIAG_UNIT;
+  auto band = fetch<T>(A, extent(lda, n, k + 1));
+  auto hx = fetch<T>(x, span(n, incx));
+  auto a = [&](int i, int j) -> T {  // A(i,j), inside the band
+    if (i == j && unit) return T(1);
+    return band[idx(upper ? k + i - j : i - j, j, lda)];
+  };
+  std::vector<T> in(n), out(n, T(0));
+  for (int i = 0; i < n; ++i) in[i] = hx[elem(i, n, incx)];
+  for (int j = 0; j < n; ++j) {
+    const int lo = upper ? std::max(0, j - k) : j, hi = upper ? j : std::min(n - 1, j + k);
+    for (int i = lo; i <= hi; ++i) {
+      if (trans == CUBLAS_OP_N) out[i] += a(i, j) * in[j];
+      else out[j] += a(i, j) * in[i];
+    }
+  }
+  for (int i = 0; i < n; ++i) hx[elem(i, n, incx)] = out[i];
+  store(x, hx);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasSaxpy_v2(cublasHandle_t h, int n, const float* alpha,
+                                          const float* x, int incx, float* y, int incy) {
+  return axpy(h, n, alpha, x, incx, y, incy);
+}
+VGPU_EXPORT cublasStatus_t cublasDaxpy_v2(cublasHandle_t h, int n, const double* alpha,
+                                          const double* x, int incx, double* y, int incy) {
+  return axpy(h, n, alpha, x, incx, y, incy);
+}
+VGPU_EXPORT cublasStatus_t cublasSscal_v2(cublasHandle_t h, int n, const float* alpha, float* x,
+                                          int incx) {
+  return scal(h, n, alpha, x, incx);
+}
+VGPU_EXPORT cublasStatus_t cublasDscal_v2(cublasHandle_t h, int n, const double* alpha, double* x,
+                                          int incx) {
+  return scal(h, n, alpha, x, incx);
+}
+VGPU_EXPORT cublasStatus_t cublasSdot_v2(cublasHandle_t h, int n, const float* x, int incx,
+                                         const float* y, int incy, float* result) {
+  return dot(h, n, x, incx, y, incy, result);
+}
+VGPU_EXPORT cublasStatus_t cublasDdot_v2(cublasHandle_t h, int n, const double* x, int incx,
+                                         const double* y, int incy, double* result) {
+  return dot(h, n, x, incx, y, incy, result);
+}
+VGPU_EXPORT cublasStatus_t cublasSnrm2_v2(cublasHandle_t h, int n, const float* x, int incx,
+                                          float* result) {
+  return nrm2(h, n, x, incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasDnrm2_v2(cublasHandle_t h, int n, const double* x, int incx,
+                                          double* result) {
+  return nrm2(h, n, x, incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasIsamax_v2(cublasHandle_t h, int n, const float* x, int incx,
+                                           int* result) {
+  return iamax(h, n, x, incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasIdamax_v2(cublasHandle_t h, int n, const double* x, int incx,
+                                           int* result) {
+  return iamax(h, n, x, incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasStbmv_v2(cublasHandle_t h, cublasFillMode_t uplo,
+                                          cublasOperation_t trans, cublasDiagType_t diag, int n,
+                                          int k, const float* A, int lda, float* x, int incx) {
+  return tbmv(h, uplo, trans, diag, n, k, A, lda, x, incx);
+}
+VGPU_EXPORT cublasStatus_t cublasDtbmv_v2(cublasHandle_t h, cublasFillMode_t uplo,
+                                          cublasOperation_t trans, cublasDiagType_t diag, int n,
+                                          int k, const double* A, int lda, double* x, int incx) {
+  return tbmv(h, uplo, trans, diag, n, k, A, lda, x, incx);
 }
 
 /* ---- anything not implemented says so, rather than returning wrong numbers ---- */
