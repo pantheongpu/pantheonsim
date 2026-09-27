@@ -3775,7 +3775,7 @@ class Parser {
       } else {
         OpBulkCopy op;
         std::vector<std::string> spaces;
-        std::string im2col_mode;
+        std::string im2col_mode, four_rows_mode;
         bool mbar_completion = false, group_completion = false;
         for (size_t i = 3; i < parts.size(); ++i) {
           const std::string& p = parts[i];
@@ -3789,8 +3789,9 @@ class Parser {
           else if (p == "cta_group::1") op.cta_group = 1;
           else if (p == "cta_group::2") op.cta_group = 2;
           else if (p == "im2col" || p == "im2col_no_offs") { op.im2col = true; im2col_mode = p; }
-          else return unsupported("cp.async.bulk modifier '." + p + "' (gather/scatter, im2col::w, "
-                                  "masks, overrides and reports are not implemented)");
+          else if (p == "tile::gather4" || p == "tile::scatter4") { op.four_rows = true; four_rows_mode = p; }
+          else return unsupported("cp.async.bulk modifier '." + p + "' (im2col::w, masks, overrides "
+                                  "and reports are not implemented)");
         }
         if (spaces.size() != 2) return unsupported("cp.async.bulk needs a destination and a source space");
         if (op.tensor && !op.dims) return unsupported("cp.async.bulk.tensor needs .1d to .5d");
@@ -3862,7 +3863,16 @@ class Parser {
           next();
           (void)parse_operand();
         }
-        if (op.tensor && op.coords.size() != op.dims)
+        if (op.four_rows) {
+          // Loads gather, stores scatter; both are 2D, one x and four rows.
+          if (!op.tensor || op.dims != 2)
+            return unsupported(".tile::gather4/.tile::scatter4 are modes of 2D tensor copies");
+          if ((four_rows_mode == "tile::gather4") != g2s)
+            return unsupported("tensor loads take .tile::gather4 and stores .tile::scatter4");
+          if (op.reduce) return unsupported("a tensor reduction in .tile::scatter4 mode");
+          if (op.coords.size() != 5)
+            return unsupported(".tile::gather4/.tile::scatter4 take five coordinates: x and four rows");
+        } else if (op.tensor && op.coords.size() != op.dims)
           return unsupported("cp.async.bulk.tensor coordinate count does not match ." +
                              std::to_string(op.dims) + "d");
         for (const Addr* a : {&op.smem, &op.gmem, &op.mbar})
