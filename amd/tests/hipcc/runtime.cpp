@@ -53,6 +53,10 @@ __global__ void from_peer(const int* peer_in, int* peer_out, int* local_out) {
 }
 
 int main() {
+  // Each line out as it is printed: the last check is a kernel that faults,
+  // which ROCm's own HIP answers by ending the program, and a buffer still
+  // held then would take every earlier result with it.
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
   // Work-groups a compute unit holds.
   int plain256 = 0, plain65 = 0, plain_lds = 0, tiled256 = 0, wide256 = 0;
   CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&plain256, plain, 256, 0));
