@@ -851,6 +851,16 @@ set_tests_properties(amd_pytorch_rx9070xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL 
 add_test(NAME amd_pytorch_compile COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 3 1)
 set_tests_properties(amd_pytorch_compile PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# Whole models (amd/tests/pytorch/models.py): a GPT trained with a schedule and
+# generating with a KV cache, a ResNet, an LSTM, a U-Net, a vision transformer,
+# mixture of experts, a recommender, mixed precision, activation checkpointing
+# and a checkpoint read back on the host; on gfx942 and on gfx950.
+add_test(NAME amd_pytorch_models COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh models.py 12 1)
+set_tests_properties(amd_pytorch_models PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+add_test(NAME amd_pytorch_models_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh models.py 12 1 amd/mi350x)
+set_tests_properties(amd_pytorch_models_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
 # Composable Kernel's GEMMs, which PyTorch runs when told to prefer CK.
 add_test(NAME amd_pytorch_ck COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh ck.py 3 1)
 set_tests_properties(amd_pytorch_ck PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE

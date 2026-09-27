@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      ml_tests:
+        description: "The ml job's tests, as a ctest regular expression (all of them if empty)"
+        required: false
+        default: ''
 
 # A push that lands while an earlier run is still going supersedes it; there is
 # no value in finishing a build of code nobody will look at again.
@@ -53,7 +58,9 @@ jobs:
         run: ls build/shim/
 
       - name: Unit and end-to-end tests
-        run: ctest --test-dir build --output-on-failure -E pantheon_workloads
+        # The ML tests are the ml job's: on the runner whose image has PyTorch
+        # and rocBLAS they would run here too, and take an hour.
+        run: ctest --test-dir build --output-on-failure -E '^(pantheon_workloads|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
 
   workloads:
     name: pantheon workloads
@@ -189,6 +196,44 @@ jobs:
           grep -q "amd_gcn_disasm .* Passed" out
           grep -q "amd_hip .* Passed" out
           grep -q "amd_hipcc .* Passed" out
+
+  ml:
+    name: PyTorch, rocBLAS and hipSPARSELt on simulated AMD GPUs
+    # Only on the pantheonsim.com host's runner, named by the repository
+    # variable ML_RUNS_ON (["self-hosted", "pantheonsim-ci"]): its image has
+    # PyTorch's ROCm build and ROCm's rocBLAS, which no hosted runner has, and
+    # the memory the PyTorch tests take. Unmodified: PyTorch's own kernels and
+    # the ROCm libraries it ships (hipBLASLt, MIOpen, rocFFT, rocRAND,
+    # rocSOLVER, Composable Kernel, hipSPARSELt), torch.compile's Triton
+    # kernels, a CNN and a transformer trained a few steps, two GPUs in one
+    # process and two processes over torch.distributed, on each simulated
+    # Instinct GPU.
+    # The other jobs stay on GitHub's hosted runners, which there are many of;
+    # this one runner takes this job alone. Where the variable is unset the
+    # job does not run.
+    if: vars.ML_RUNS_ON != ''
+    runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: PyTorch, rocBLAS and hipSPARSELt
+        # A test that skips fails the job: here each has what it needs, so a
+        # skip means the runner's image lost it, not that there is nothing to
+        # test. A run started by hand may name fewer.
+        env:
+          ML_TESTS: ${{ inputs.ml_tests }}
+        run: |
+          set -o pipefail
+          ctest --test-dir build --output-on-failure -R "${ML_TESTS:-^(amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$}" 2>&1 | tee ml.log
+          if grep -E '\*\*\*Skipped|Not Run' ml.log; then
+            echo "::error::an ML test skipped; the runner's image should have what it needs"; exit 1
+          fi
 
   sanitizers:
     name: ASan + UBSan
