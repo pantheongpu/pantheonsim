@@ -1,4 +1,6 @@
+#include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <map>
 #include <set>
@@ -1231,14 +1233,84 @@ namespace {
 Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc);
 }  // namespace
 
+namespace {
+// What an instruction counts as (Inst::mix, ::mops): by the name the executor
+// knows it by, which is gfx9's for RDNA's too.
+void classify(Inst& in) {
+  std::string n = in.name;
+  for (const char* suffix : {"_e32", "_e64", "_dpp", "_sdwa"})
+    if (n.size() > 4 && n.compare(n.size() - std::strlen(suffix), std::strlen(suffix), suffix) == 0)
+      n.resize(n.size() - std::strlen(suffix));
+  if (n.rfind("v_", 0) != 0) return;
+  const auto starts = [&](const char* p) { return n.rfind(p, 0) == 0; };
+  const auto ends = [&](const char* p) { return n.size() >= std::strlen(p) && n.compare(n.size() - std::strlen(p), std::strlen(p), p) == 0; };
+  // The matrix instructions: their shape, and the type of their inputs.
+  if (starts("v_mfma") || starts("v_smfmac") || starts("v_wmma") || starts("v_swmmac")) {
+    uint32_t m = 0, nn = 0, k = 0, blocks = 1;
+    const size_t x = n.find('x');
+    if (x != std::string::npos) {
+      size_t b = x;
+      while (b > 0 && std::isdigit(static_cast<unsigned char>(n[b - 1]))) --b;
+      if (std::sscanf(n.c_str() + b, "%ux%ux%u", &m, &nn, &k) != 3) m = nn = k = 0;
+      const size_t bl = n.find("b_", x);
+      if (bl != std::string::npos) {
+        size_t s = bl;
+        while (s > 0 && std::isdigit(static_cast<unsigned char>(n[s - 1]))) --s;
+        if (s < bl) blocks = static_cast<uint32_t>(std::stoul(n.substr(s, bl - s)));
+      }
+    }
+    in.mops = static_cast<uint32_t>((2ull * m * nn * k * blocks + 511) / 512);
+    const std::string inputs = n.substr(n.find('x', x == std::string::npos ? 0 : x + 1) + 1);
+    in.mops_type = inputs.find("f64") != std::string::npos ? MopsType::F64
+                   : inputs.find("bf16") != std::string::npos ? MopsType::BF16
+                   : inputs.find("f16") != std::string::npos ? MopsType::F16
+                   : inputs.find("fp8") != std::string::npos || inputs.find("bf8") != std::string::npos ||
+                           inputs.find("f8f6f4") != std::string::npos ? MopsType::F8
+                   : inputs.find("i8") != std::string::npos || inputs.find("iu4") != std::string::npos ? MopsType::I8
+                   : MopsType::F32;
+    return;
+  }
+  if (starts("v_cvt_")) {
+    in.mix = Mix::Cvt;
+    return;
+  }
+  const int t = ends("_f16") ? 0 : ends("_f32") ? 1 : ends("_f64") ? 2 : -1;
+  const auto of = [&](Mix f16, Mix f32, Mix f64) { return t == 0 ? f16 : t == 1 ? f32 : f64; };
+  if (t >= 0) {
+    if (starts("v_add_f") || starts("v_sub_f") || starts("v_subrev_f") || starts("v_pk_add_f")) in.mix = of(Mix::AddF16, Mix::AddF32, Mix::AddF64);
+    else if (starts("v_mul_f") || starts("v_mul_legacy_f") || starts("v_pk_mul_f")) in.mix = of(Mix::MulF16, Mix::MulF32, Mix::MulF64);
+    else if (starts("v_fma") || starts("v_mad_f") || starts("v_mac_f") || starts("v_madak_f") || starts("v_madmk_f") ||
+             starts("v_pk_fma_f"))
+      in.mix = of(Mix::FmaF16, Mix::FmaF32, Mix::FmaF64);
+    else if (starts("v_exp_f") || starts("v_log_f") || starts("v_rcp_f") || starts("v_rcp_iflag_f") || starts("v_rsq_f") ||
+             starts("v_sqrt_f") || starts("v_sin_f") || starts("v_cos_f") || starts("v_s_"))
+      in.mix = of(Mix::TransF16, Mix::TransF32, Mix::TransF64);
+    return;
+  }
+  // Integer arithmetic and logic (moves, selects and cross-lane reads are not
+  // operations on the values).
+  if (starts("v_mov") || starts("v_cndmask") || starts("v_readlane") || starts("v_readfirstlane") || starts("v_writelane") ||
+      starts("v_cmp"))
+    return;
+  if (ends("_u32") || ends("_i32") || ends("_b32") || ends("_u24") || ends("_i24")) in.mix = Mix::Int32;
+  else if (ends("_u64") || ends("_i64") || ends("_b64")) in.mix = Mix::Int64;
+}
+}  // namespace
+
 Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64) {
-  if (is_rdna(target)) return rdna::decode(code, at, pc, target, wave64);
+  if (is_rdna(target)) {
+    Inst in = rdna::decode(code, at, pc, target, wave64);
+    classify(in);
+    for (Inst& half : in.dual) classify(half);
+    return in;
+  }
   struct Using {
     explicit Using(Target t) { g_table = t == Target::Gfx90a ? &table_gfx90a() : &table(); }
     ~Using() { g_table = nullptr; }
   } using_table(target);
   Inst in = decode_one(code, at, pc);
   in.arch = target;
+  classify(in);
   return in;
 }
 

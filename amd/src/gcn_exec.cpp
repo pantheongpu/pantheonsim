@@ -19,6 +19,7 @@
 #include <string_view>
 #include <vector>
 
+#include "vgpu/amd_debug.hpp"
 #include "vgpu/amd_decode_cache.hpp"
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/amd_hostcall.hpp"
@@ -243,6 +244,7 @@ struct Group {
   std::vector<uint8_t> scratch;
   uint32_t scratch_per_lane = 0;
   std::vector<Wave> waves;
+  uint32_t id[3] = {};   // the work-group's id, for the debugger to say
 };
 
 struct Machine {
@@ -4279,8 +4281,54 @@ struct Machine {
     return on;
   }
 
+  // Where the debugger (VGPU_DEBUG) stops a wave, what it sees of it.
+  void debug_stop(Wave& w, Group& g) {
+    debug::WaveView v;
+    v.kernel = d.kernel ? d.kernel->name : std::string("?");
+    v.pc = w.pc;
+    v.offset = w.pc - d.code_base - (d.kernel ? d.kernel->entry : 0);
+    std::copy(std::begin(g.id), std::end(g.id), v.group);
+    v.wave = w.first_lane / w.lanes;
+    v.lanes = w.lanes;
+    v.exec = &w.exec;
+    v.vcc = &w.vcc;
+    v.scc = &w.scc;
+    v.m0 = &w.m0;
+    v.mode = &w.mode;
+    v.sgpr = w.sgpr;
+    v.sgprs = kSgprs;
+    v.vgpr = w.vgpr;
+    v.vgprs = kVgprs;
+    v.lds = &g.lds;
+    v.memory = &mem;
+    v.disassemble = [this](uint64_t pc, uint32_t* size) -> std::string {
+      try {
+        const Inst& in = fetch(pc);
+        *size = in.size;
+        return gcn::to_text(in);
+      } catch (const std::exception& e) {
+        *size = 0;
+        return std::string("(") + e.what() + ")";
+      }
+    };
+    debug::stop(v, &w);
+  }
+
   bool step(Wave& w, Group& g) {
+    if (debug::active() &&
+        debug::should_stop(d.kernel ? d.kernel->name : std::string(), w.pc - d.code_base - (d.kernel ? d.kernel->entry : 0), &w))
+      debug_stop(w, g);
     const Inst& in = fetch(w.pc);
+    // The performance counters' instruction mix, worked out when decoded.
+    {
+      InstructionCounts& c = stats.counts;
+      if (in.dual.empty()) {
+        ++c.mix[static_cast<int>(in.mix)];
+        c.mops[static_cast<int>(in.mops_type)] += in.mops;
+      } else {
+        for (const Inst& half : in.dual) ++c.mix[static_cast<int>(half.mix)];
+      }
+    }
     std::optional<Traced> traced;
     if (tracing() && w.first_lane == 0) traced.emplace(*this, w, in, w.pc);
     w.pc += in.size;
@@ -4377,9 +4425,9 @@ struct Machine {
         }
         ++n.vmem;
         ++n.flat;
-        if (in.name.find("_atomic") != std::string::npos) ++n.flat_atomic;
-        else if (in.name.find("_store") != std::string::npos) ++n.flat_write;
-        else ++n.flat_read;
+        if (in.name.find("_atomic") != std::string::npos) ++n.flat_atomic, ++n.vmem_wr;
+        else if (in.name.find("_store") != std::string::npos) ++n.flat_write, ++n.vmem_wr;
+        else ++n.flat_read, ++n.vmem_rd;
         if (in.segment == Inst::Segment::Scratch) scratch_access(w, in, g);
         else if (in.segment == Inst::Segment::Flat) n.lds += flat_access(w, in, g);
         else global_access(w, in);
@@ -4398,6 +4446,8 @@ struct Machine {
           std::atomic_thread_fence(std::memory_order_seq_cst);
           return true;
         }
+        if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
+        else ++n.vmem_rd;
         buffer_access(w, in, g);
         return true;
       case gcn::Enc::Sopp: break;
@@ -4592,6 +4642,9 @@ uint64_t write_dispatch_packet(const Dispatch& d, const Kernel& k, MemoryManager
 // at once.
 unsigned worker_count(uint64_t groups) {
   unsigned want = 0;
+  // Under the debugger, one thread: a wave stopped at a breakpoint stops the
+  // dispatch, and everything runs in the same order every time.
+  if (debug::active()) return 1;
   if (const char* t = std::getenv("VGPU_THREADS")) {
     const int v = std::atoi(t);
     want = v > 0 ? static_cast<unsigned>(v) : 1;
@@ -4623,6 +4676,9 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
   group.scratch_per_lane = (k.private_segment + 3) & ~3u;
   group.scratch.assign(static_cast<size_t>(group.scratch_per_lane) * threads, 0);
   group.waves.resize(waves_per_group);
+  group.id[0] = gx;
+  group.id[1] = gy;
+  group.id[2] = gz;
   for (uint32_t i = 0; i < waves_per_group; ++i) {
     Wave& w = group.waves[i];
     w.pc = d.code_base + k.entry;

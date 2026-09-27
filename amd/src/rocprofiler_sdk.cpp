@@ -147,6 +147,39 @@ const Counter kCounters[] = {
      "SQ_ACTIVE_INST_EXP_GDS (cycle count for executing instructions) the average latency of EXPORT/GDS instruction "
      "execution can be calculated (SQ_ACTIVE_INST_EXP_GDS / SQ_INSTS_EXP_GDS). This value is returned per-SE "
      "(aggregate of values in SIMDs in the SE)."},
+    // The instruction mix, each counted exactly as the executor runs it. The
+    // names and descriptions are MI200's and MI300's.
+#define VGPU_MIX(NAME, KIND, TEXT)                                                                                 \
+    {NAME, "SQ", "", [](const DispatchStats& s) { return s.counts.mix[static_cast<int>(vgpu::amd::gcn::Mix::KIND)]; }, TEXT}
+    VGPU_MIX("SQ_INSTS_VALU_ADD_F16", AddF16, "Number of VALU ADD/SUB instructions on 16-bit floating point."),
+    VGPU_MIX("SQ_INSTS_VALU_ADD_F32", AddF32, "Number of VALU ADD/SUB instructions on 32-bit floating point."),
+    VGPU_MIX("SQ_INSTS_VALU_ADD_F64", AddF64, "Number of VALU ADD/SUB instructions on 64-bit floating point."),
+    VGPU_MIX("SQ_INSTS_VALU_MUL_F16", MulF16, "Number of VALU MUL instructions on 16-bit floating point."),
+    VGPU_MIX("SQ_INSTS_VALU_MUL_F32", MulF32, "Number of VALU MUL instructions on 32-bit floating point."),
+    VGPU_MIX("SQ_INSTS_VALU_MUL_F64", MulF64, "Number of VALU MUL instructions on 64-bit floating point."),
+    VGPU_MIX("SQ_INSTS_VALU_FMA_F16", FmaF16, "Number of VALU FMA instructions on 16-bit floating point."),
+    VGPU_MIX("SQ_INSTS_VALU_FMA_F32", FmaF32, "Number of VALU FMA instructions on 32-bit floating point."),
+    VGPU_MIX("SQ_INSTS_VALU_FMA_F64", FmaF64, "Number of VALU FMA instructions on 64-bit floating point."),
+    VGPU_MIX("SQ_INSTS_VALU_TRANS_F16", TransF16, "Number of VALU transcendental instructions on 16-bit floating point."),
+    VGPU_MIX("SQ_INSTS_VALU_TRANS_F32", TransF32, "Number of VALU transcendental instructions on 32-bit floating point."),
+    VGPU_MIX("SQ_INSTS_VALU_TRANS_F64", TransF64, "Number of VALU transcendental instructions on 64-bit floating point."),
+    VGPU_MIX("SQ_INSTS_VALU_CVT", Cvt, "Number of VALU conversion instructions."),
+    VGPU_MIX("SQ_INSTS_VALU_INT32", Int32, "Number of VALU operations on 32-bit integers."),
+    VGPU_MIX("SQ_INSTS_VALU_INT64", Int64, "Number of VALU operations on 64-bit integers."),
+#undef VGPU_MIX
+#define VGPU_MOPS(NAME, TYPE, TEXT)                                                                                \
+    {NAME, "SQ", "", [](const DispatchStats& s) { return s.counts.mops[static_cast<int>(vgpu::amd::gcn::MopsType::TYPE)]; }, TEXT}
+    VGPU_MOPS("SQ_INSTS_VALU_MFMA_MOPS_I8", I8, "Number of VALU matrix math operations (add or multiply) on 8-bit integers. Unit: 512 operations."),
+    VGPU_MOPS("SQ_INSTS_VALU_MFMA_MOPS_F16", F16, "Number of VALU matrix math operations (add or multiply) on 16-bit floating point. Unit: 512 FLOP."),
+    VGPU_MOPS("SQ_INSTS_VALU_MFMA_MOPS_BF16", BF16, "Number of VALU matrix math operations (add or multiply) on bfloat16. Unit: 512 FLOP."),
+    VGPU_MOPS("SQ_INSTS_VALU_MFMA_MOPS_F32", F32, "Number of VALU matrix math operations (add or multiply) on 32-bit floating point. Unit: 512 FLOP."),
+    VGPU_MOPS("SQ_INSTS_VALU_MFMA_MOPS_F64", F64, "Number of VALU matrix math operations (add or multiply) on 64-bit floating point. Unit: 512 FLOP."),
+    VGPU_MOPS("SQ_INSTS_VALU_MFMA_MOPS_F8", F8, "Number of VALU matrix math operations (add or multiply) on 8-bit (and smaller) floating point. Unit: 512 FLOP."),
+#undef VGPU_MOPS
+    {"SQ_INSTS_VMEM_RD", "SQ", "", [](const DispatchStats& s) { return s.counts.vmem_rd; },
+     "Number of VMEM read instructions issued (including FLAT)."},
+    {"SQ_INSTS_VMEM_WR", "SQ", "", [](const DispatchStats& s) { return s.counts.vmem_wr; },
+     "Number of VMEM write instructions issued (including FLAT and atomics)."},
     {"TA_FLAT_WAVEFRONTS", "TA", "", [](const DispatchStats& s) { return s.counts.flat; },
      "Number of flat opcode wavfronts processed by the TA."},
     {"TA_FLAT_READ_WAVEFRONTS", "TA", "", [](const DispatchStats& s) { return s.counts.flat_read; },

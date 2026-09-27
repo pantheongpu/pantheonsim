@@ -88,6 +88,17 @@ VTEST(each_count_is_the_listing_times_the_waves) {
   VCHECK_EQ(s.counts.flat_read, e.reads * w);
   VCHECK_EQ(s.counts.flat_write, e.writes * w);
   VCHECK_EQ(s.counts.flat_atomic, e.atomics * w);
+  // The instruction mix: each class the listing has, and matrix work.
+  using amd::gcn::Mix;
+  using amd::gcn::MopsType;
+  VCHECK(e.add_f32 && e.cvt && e.int32 && e.int64 && e.mops_f16);
+  VCHECK_EQ(s.counts.mix[static_cast<int>(Mix::AddF32)], e.add_f32 * w);
+  VCHECK_EQ(s.counts.mix[static_cast<int>(Mix::Cvt)], e.cvt * w);
+  VCHECK_EQ(s.counts.mix[static_cast<int>(Mix::Int32)], e.int32 * w);
+  VCHECK_EQ(s.counts.mix[static_cast<int>(Mix::Int64)], e.int64 * w);
+  VCHECK_EQ(s.counts.mops[static_cast<int>(MopsType::F16)], e.mops_f16 * w);
+  VCHECK_EQ(s.counts.vmem_rd, e.vmem_rd * w);
+  VCHECK_EQ(s.counts.vmem_wr, e.vmem_wr * w);
 }
 
 VTEST(a_flat_access_that_reaches_lds_counts_as_lds_too) {
