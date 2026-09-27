@@ -20,6 +20,7 @@ __global__ void fill(int* d, int n) {
   if (i < n) d[i] = i;
 }
 __global__ void oob(int* d) { d[threadIdx.x + (1 << 20)] = 1; }
+__device__ int table[4];
 
 int main() {
   int n = -1;
@@ -239,6 +240,80 @@ int main() {
   CHECK("sticky: reading it does not clear it", cudaGetLastError() == cudaErrorIllegalAddress &&
                                                    cudaGetLastError() == cudaErrorIllegalAddress, "unexpected");
   CHECK("reset clears it", cudaDeviceReset() == cudaSuccess && cudaMalloc(&after, 16) == cudaSuccess, "unexpected");
+
+  // Copy directions under unified addressing, as an RTX 3060 answers them: a
+  // side the kind calls device memory must be device memory, while a side it
+  // calls host memory may be a device allocation and is copied as one. Symbol
+  // copies follow the same rule. GPUJPEG relies on both.
+  {
+    int *a = nullptr, *b = nullptr;
+    cudaMalloc(&a, 16);
+    cudaMalloc(&b, 16);
+    int src4[4] = {1, 2, 3, 4}, got[4] = {0}, hdst[4] = {0};
+    cudaMemcpy(b, src4, 16, cudaMemcpyHostToDevice);
+    cudaMemset(a, 0, 16);
+    e = cudaMemcpy(a, b, 16, cudaMemcpyHostToDevice);
+    cudaMemcpy(got, a, 16, cudaMemcpyDeviceToHost);
+    CHECK("cudaMemcpy HostToDevice from a device pointer copies", e == cudaSuccess && got[3] == 4, "got %d, value %d", e, got[3]);
+    cudaMemset(a, 0, 16);
+    e = cudaMemcpy(a, b, 16, cudaMemcpyDeviceToHost);
+    cudaMemcpy(got, a, 16, cudaMemcpyDeviceToHost);
+    CHECK("cudaMemcpy DeviceToHost into a device pointer copies", e == cudaSuccess && got[3] == 4, "got %d, value %d", e, got[3]);
+    cudaMemset(a, 0, 16);
+    e = cudaMemcpyAsync(a, b, 16, cudaMemcpyHostToDevice, 0);
+    cudaDeviceSynchronize();
+    cudaMemcpy(got, a, 16, cudaMemcpyDeviceToHost);
+    CHECK("cudaMemcpyAsync HostToDevice from a device pointer copies", e == cudaSuccess && got[3] == 4, "got %d, value %d", e, got[3]);
+    e = cudaMemcpy(hdst, src4, 16, cudaMemcpyDeviceToHost);
+    CHECK("cudaMemcpy DeviceToHost from a host pointer -> invalid value", e == cudaErrorInvalidValue, "got %d %s", e, cudaGetErrorName(e));
+    e = cudaMemcpy(hdst, b, 16, cudaMemcpyHostToDevice);
+    CHECK("cudaMemcpy HostToDevice into a host pointer -> invalid value", e == cudaErrorInvalidValue, "got %d %s", e, cudaGetErrorName(e));
+    e = cudaMemcpy(hdst, src4, 16, cudaMemcpyDeviceToDevice);
+    CHECK("cudaMemcpy DeviceToDevice between host pointers -> invalid value", e == cudaErrorInvalidValue, "got %d %s", e, cudaGetErrorName(e));
+    cudaGetLastError();
+
+    int nines[4] = {9, 9, 9, 9};
+    cudaMemcpyToSymbol(table, nines, 16);
+    e = cudaMemcpyToSymbol(table, b, 16, 0, cudaMemcpyDeviceToDevice);
+    cudaMemcpyFromSymbol(got, table, 16);
+    CHECK("cudaMemcpyToSymbol from device memory", e == cudaSuccess && got[3] == 4, "got %d, value %d", e, got[3]);
+    cudaMemcpyToSymbol(table, nines, 16);
+    e = cudaMemcpyToSymbolAsync(table, b, 16, 0, cudaMemcpyDeviceToDevice, 0);
+    cudaDeviceSynchronize();
+    cudaMemcpyFromSymbol(got, table, 16);
+    CHECK("cudaMemcpyToSymbolAsync from device memory", e == cudaSuccess && got[3] == 4, "got %d, value %d", e, got[3]);
+    cudaMemcpyToSymbol(table, nines, 16);
+    e = cudaMemcpyToSymbol(table, b, 16, 0, cudaMemcpyHostToDevice);
+    cudaMemcpyFromSymbol(got, table, 16);
+    CHECK("cudaMemcpyToSymbol HostToDevice from a device pointer copies", e == cudaSuccess && got[3] == 4, "got %d, value %d", e, got[3]);
+    cudaMemcpyToSymbol(table, src4, 16);
+    cudaMemset(a, 0, 16);
+    e = cudaMemcpyFromSymbol(a, table, 16, 0, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(got, a, 16, cudaMemcpyDeviceToHost);
+    CHECK("cudaMemcpyFromSymbol into device memory", e == cudaSuccess && got[3] == 4, "got %d, value %d", e, got[3]);
+    e = cudaMemcpyToSymbol(table, src4, 16, 0, cudaMemcpyDeviceToDevice);
+    CHECK("cudaMemcpyToSymbol DeviceToDevice from a host pointer -> invalid value", e == cudaErrorInvalidValue, "got %d %s", e, cudaGetErrorName(e));
+    e = cudaMemcpyFromSymbol(hdst, table, 16, 0, cudaMemcpyDeviceToDevice);
+    CHECK("cudaMemcpyFromSymbol DeviceToDevice into a host pointer -> invalid value", e == cudaErrorInvalidValue, "got %d %s", e, cudaGetErrorName(e));
+    cudaGetLastError();
+    cudaFree(a);
+    cudaFree(b);
+  }
+
+  // Cache preferences: accepted for a kernel, refused for anything else, and the
+  // device-wide one reads back.
+  e = cudaFuncSetCacheConfig(fill, cudaFuncCachePreferL1);
+  CHECK("cudaFuncSetCacheConfig on a kernel", e == cudaSuccess, "got %d %s", e, cudaGetErrorName(e));
+  e = cudaFuncSetCacheConfig((const void*)&stack_int, cudaFuncCachePreferL1);
+  CHECK("cudaFuncSetCacheConfig on a non-kernel -> invalid resource handle", e == cudaErrorInvalidResourceHandle, "got %d %s", e, cudaGetErrorName(e));
+  cudaGetLastError();
+  {
+    cudaFuncCache c = cudaFuncCachePreferNone;
+    e = cudaDeviceSetCacheConfig(cudaFuncCachePreferShared);
+    cudaError_t e2 = cudaDeviceGetCacheConfig(&c);
+    CHECK("cudaDeviceSetCacheConfig reads back", e == cudaSuccess && e2 == cudaSuccess && c == cudaFuncCachePreferShared,
+          "got %d %d, reads %d", e, e2, (int)c);
+  }
 
   // A managed buffer freed with another device current is gone from every
   // device. It used to stay mapped on the device that allocated it, and a
