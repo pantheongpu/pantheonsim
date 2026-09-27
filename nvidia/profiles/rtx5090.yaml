@@ -1,26 +1,22 @@
-# VirtualGPU device profile: NVIDIA GeForce RTX 5090 (Blackwell, GB202).
-# Public documentation values (sm_120). verified: false -- nothing here has
-# been read from a card yet; treat every number as a placeholder until one is
-# characterized (nvidia/tools/characterize.cu).
-#
-# Why this card: sm_120 is the architecture prebuilt PyTorch wheels carry PTX
-# for (compute_120, beside SASS for sm_75..sm_120), and the simulator runs
-# PTX. A driver JITs PTX only for a device at least as new as the PTX, so on
-# an sm_120 device PyTorch's own kernels run here unmodified.
+# VirtualGPU device profile: NVIDIA GeForce RTX 5090 (Blackwell, sm_120).
+# Limits from NVIDIA's public documentation for compute capability 12.0 (the
+# CUDA C++ Programming Guide's per-capability table) and the RTX 5090 spec
+# sheet; the framebuffer, power limit and links from the benchmark database.
+# Not characterized on hardware yet. verified: false.
 id: nvidia/rtx5090
 vendor: nvidia
 model: "NVIDIA GeForce RTX 5090"
 architecture: blackwell
 compute_capability: "12.0"
 warp_size: 32
-vram_bytes: 34190458880          # 32 GB GDDR7, less a reserve as on other cards; placeholder
+vram_bytes: 34190917632          # the measured framebuffer, 32607 MiB -- an upper bound (see b200.yaml)
 verified: false
 limits:
   max_threads_per_block: 1024
   max_block_dim: [1024, 1024, 64]
   max_grid_dim: [2147483647, 65535, 65535]
   shared_mem_per_block_bytes: 49152
-  shared_mem_per_block_optin_bytes: 101376   # 99 KiB (sm_120, CUDA programming guide)
+  shared_mem_per_block_optin_bytes: 101376   # 99 KiB (compute capability 12.0)
   registers_per_block: 65536
   multiprocessors: 170
   registers_per_sm: 65536
@@ -28,19 +24,22 @@ limits:
   max_blocks_per_sm: 24
   max_registers_per_thread: 255
   shared_mem_per_sm: 102400
-  l2_cache_bytes: 100663296                  # 96 MB (NVIDIA's RTX Blackwell whitepaper)
 features:
   fp16: true
   bf16: true
   fp64: true
   tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
 telemetry:
-  power_limit_w: 575
-  sm_clock_max_mhz: 2407
-  mem_clock_max_mhz: 14001
+  framebuffer_mb: 32607          # nvidia-smi total on real cards (61 runs in the benchmark database)
+  power_limit_w: 575             # the same 61 runs
+  sm_clock_max_mhz: 2964         # the highest average clock of those runs; the maximum was not read
+  mem_clock_max_mhz: 14001       # GDDR7 at 28 Gbps (spec sheet)
   temperature_max_c: 90
   pci_vendor_id: 4318          # 0x10DE NVIDIA
-  pci_device_id: 11141         # 0x2B85 [GeForce RTX 5090], public listing
+  pci_device_id: 11141         # 0x2B85 [GeForce RTX 5090] -- public PCI id listing
   ecc: false                   # GeForce: no ECC
-  memory: gddr                 # GDDR7
-  pcie_link: "Gen5 x16"        # datasheet
+  memory: gddr
+  pcie_link: "Gen5 x8"         # most common link on real cards (40 of 61 runs in the benchmark database)

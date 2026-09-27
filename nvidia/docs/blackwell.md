@@ -51,8 +51,16 @@ reaches the instruction issues its own, which is what single-thread semantics
 means (CUTLASS elects one).
 
 - Kinds: `.kind::f16` (f16 and bf16 into f16 or f32), `.kind::tf32`,
-  `.kind::f8f6f4` with the 8-bit types (e4m3, e5m2), and `.kind::i8` (s8/u8
-  into s32, with the saturate bit).
+  `.kind::f8f6f4` (e4m3, e5m2, e2m3, e3m2, e2m1), `.kind::i8` (s8/u8 into
+  s32, with the saturate bit), and the block-scaled `.kind::mxf8f6f4`,
+  `mxf4` and `mxf4nvf4` (below).
+- The 6- and 4-bit types of `.kind::f8f6f4` sit 16 to a 16-byte group in
+  shared memory, packed from the group's start with the rest padding (the
+  layouts `tcgen05.cp` calls `.b6x16_p32` and `.b4x16_p64`); MN-major, the
+  same groups run along M or N (Table 62 allows the transpose except at
+  sm_107's dense K = 64, and never for the `mxf4` kinds). In Tensor Memory each takes an 8-bit container: fp6 in bits 0-5,
+  fp4 in bits 2-5 (figure 202). Under `.kind::mxf4*`, fp4 is packed two to
+  a byte in both. The OCP MX types have no infinities or NaNs.
 - Shapes: `.cta_group::1` with M = 64 or 128, and `.cta_group::2` with M = 128
   or 256; N from the instruction descriptor.
 - D's placement is the data-path layout of 9.7.18.10.5: layout D (M = 128,
@@ -75,6 +83,69 @@ means (CUTLASS elects one).
 Numerics are wgmma's: every product of these input types is exact in f32 and
 the sum is kept in f32, in K order. The ISA does not say how tf32 inputs are
 narrowed for tcgen05; they are truncated to tf32 as it says for wgmma.
+
+### Block scaling
+
+`.block_scale` (9.7.18.10.7) multiplies each block of K by a scale factor of
+A's row and one of B's column: `D = sum (A * SA) * (B * SB) (+ D)`, into f32.
+
+- `.kind::mxf8f6f4`: one UE8M0 factor per 32 of K (`.scale_vec::1X`).
+- `.kind::mxf4`: two UE8M0 factors, blocks of 32 (`2X`), K = 64.
+- `.kind::mxf4nvf4`: `2X` with UE8M0, or `4X` (blocks of 16) with UE8M0 or
+  UE4M3. UE8M0 is `2^(v - 127)` (255 is NaN); UE4M3 is e4m3 without a sign.
+- The instruction descriptor is Table 52/53's: SFB_ID in bits 4-5, the scale
+  type from bit 23, M / 128 in bits 27-28, SFA_ID in bits 29-30.
+- Factors come from Tensor Memory at `[scale-A-tmem]` and `[scale-B-tmem]`:
+  row m's j-th in byte `SF_ID + j` of lane `m % 32`, column `address + m /
+  32` (B's column n likewise). The ISA shows them in every 32-lane partition,
+  where `tcgen05.cp .32x128b.warpx4` puts them, and each D row reads the
+  copy in its own partition.
+- Refused by name as sm_107's: UE5M3 factors, UE4M3 with `.block32`, the
+  128-lane scale layout (bit 26) and the larger K of bits 3 and 31.
+
+### Sparse A: tcgen05.mma.sp
+
+`tcgen05.mma.sp` (9.7.18.10.9) doubles K and reads A as M x K/2: each chunk
+of a row keeps half of its elements, placed by a 4-bit metadata field -- 2:4
+(two 2-bit positions, low first) for most kinds, 1:2 for tf32 (0b0100 or
+0b1110), and 4:8 in pairs for `mxf4`/`mxf4nvf4` (sparsity version v0). The
+instruction descriptor's bit 2 must say sparse. The metadata matrix is in
+Tensor Memory at `[sp-meta-tmem]`, laid out as figures 287-292 draw it, each
+32-lane partition holding its own rows:
+
+- `.kind::f16` and `tf32`: rows r and r + 8 share a lane (r's fields in bits
+  0-15), the upper half of K eight lanes further on, and the sparsity
+  selector (0 or 1) picks the column. Selectors 2 and 3 are refused: the
+  figures show only 0 and 1.
+- The 8-bit kinds: row r in lane r, sixteen fields over two columns. The
+  selector must be 0 (`i8`, `f8f6f4`) or is taken as 0 (the `mx` kinds).
+
+For M = 64 the metadata starts at D's lane (0 or 16). With block scaling a
+sparse `mxf4` K = 128 has four factors a row under `.block32`, its default,
+and eight under `.block16` ("semantically scale_vec::8X"): factors 4-7 sit
+as 0-3 do, 4 columns further on for A and for N <= 128, 8 for N > 128
+(figures 255 and 262-264).
+
+### tcgen05.cp
+
+One thread copies a matrix from shared memory (a descriptor, K-major, no
+swizzle) into Tensor Memory: `.128x256b`, `.4x256b`, `.128x128b` row by row
+from the address's lane, `.32x128b.warpx4` into all four 32-lane quarters,
+and `.64x128b.warpx2` -- `::02_13` puts row r at lanes r and r + 64,
+`::01_23` at 64(r / 32) + r % 32 and 32 lanes on, so each warp of a pair
+holds the same 32 rows. The ISA says only that each warp of a pair receives
+half; the halves are CuTe's, whose UTCCP 2x64dp copy traits lay the
+destination out that way. It completes at once, like `mma`. With
+`.b8x16.b4x16_p64` / `.b6x16_p32` each 16-byte group of packed fp4 / fp6
+is decompressed into sixteen bytes, fp4 in bits 2-5 and fp6 in bits 0-5
+(figures 197-201).
+
+### tcgen05.shift
+
+`tcgen05.shift.down` moves rows 0-30 of the 32 lanes at its (32-aligned)
+address down one row, 256 bits (eight columns) each -- the implicit
+`.31x256b` shape of 9.7.18.2.3; row 0 is left as it was. One thread
+issues it, for its CTA or both of a pair.
 
 ### When things complete
 
@@ -104,15 +175,25 @@ before waiting for it is not caught here.
 - **TMA `.tile::gather4` / `.tile::scatter4`.** Four rows of a 2D tensor at
   one x (`{x, row0, row1, row2, row3}`, as CUTLASS issues them), one row-high
   box each, packed one after another in shared memory.
+- **Packed sub-byte tensors.** Maps of `16U4_ALIGN8B`, `16U4_ALIGN16B` and
+  `16U6_ALIGN16B` (the ISA's `.b4x16`, `.b4x16_p64`, `.b6x16_p32`), with
+  cuda.h's rules for each. Global memory holds the values packed; a copy
+  moves sixteen at a time, into 8 bytes of shared memory for `.b4x16` and a
+  16-byte slot for the others -- the packed bytes first, the padding left as
+  it was, as the ISA calls it uninitialized. The barrier completes the
+  packed bytes (12 a group of fp6, not 16): CUTLASS's block-scaled kernels
+  expect exactly that and never finish otherwise. A store of type 15 is
+  `.b6p2x16`: sixteen bytes with the value in bits 0-5, packed into twelve.
+  `.b4x16_p64` cannot be stored, the padded types' first coordinate must be
+  a multiple of 128, and a `.b4x16` copy that does not start on a group of
+  sixteen is refused.
 - **Swizzle atoms.** Tensor maps accept `CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B`
   and `_ATOM_64B` ("swizzle 32B/64B chunks within 128B span"), and
   `tensormap.replace` their atomicity field. The `_FLIP_8B` variant is refused.
 
 ## Refused by name
 
-`tcgen05.mma.sp` (sparse A), `.ws` (weight-stationary), block-scaled kinds
-(`.kind::mxf8f6f4`, `mxf4`, `mxf4nvf4`), the 4- and 6-bit types of
-`.kind::f8f6f4`, `.ashift`, `tcgen05.cp`, `tcgen05.shift`, `tcgen05.ld.red`
+`.ws` (weight-stationary), `.ashift`, `tcgen05.ld.red`
 (sm_103/sm_110), the sm_107 additions (`kind::ti16`, `decompress::lut`), and
 TMA's `.im2col::w` modes: the ISA shows their halo walk only in figures that
 leave open where `::w::128`'s halos come from and whether a halo crosses into

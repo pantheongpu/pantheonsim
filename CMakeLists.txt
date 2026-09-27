@@ -30,6 +30,7 @@ set(VGPU_PROFILES
   nvidia/h100
   nvidia/h200
   nvidia/b200
+  nvidia/rtx5090
   nvidia/rtx3060
   nvidia/rtx3080ti
   nvidia/a100-sxm4-40gb
@@ -39,7 +40,6 @@ set(VGPU_PROFILES
   nvidia/a10g
   nvidia/l4
   nvidia/l40s
-  nvidia/rtx5090
   amd/mi250x
   amd/mi300x
   amd/mi325x
@@ -1004,6 +1004,14 @@ if(TARGET vgpucublas)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
+
+  # Every mma.sync / mma.sp form an RTX 3060 runs, against its hashes.
+  add_test(NAME e2e_mma_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mma_forms.sh)
+  set_tests_properties(e2e_mma_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
 
   # bf16 arithmetic, half2 atomics and labeled_partition, through nvcc. The
   # unit tests feed hand-written PTX; a compiler emits forms a hand-written

@@ -1,6 +1,7 @@
 // Tests for the arithmetic/conversion ops added to run real pantheon kernels:
 // neg, prmt.b32 (byte permute), and the full cvt family (int<->float, rounding).
 #include <cstring>
+#include <functional>
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
@@ -619,10 +620,18 @@ VTEST(sparse_mma_and_cvt_pack_refuse_what_they_do_not_implement) {
 )") + body + "\n  ret;\n}\n";
     return VCAPTURE(Error, ptx::parse(ptx));
   };
+  VCHECK_CONTAINS(parse_one("mma.sync.aligned.m16n8k32.row.col.kind::f8f6f4.f32.e2m1.e2m1.f32 "
+                            "{%f0,%f1,%f2,%f3}, {%r4,%r5,%r6,%r7}, {%r8,%r9}, "
+                            "{%f4,%f5,%f6,%f7};").message(),
+                  "requires an sm_120a");
   VCHECK_CONTAINS(parse_one("mma.sp::ordered_metadata.sync.aligned.m16n8k64.row.col.s32.s8.s8.s32 "
                             "{%r0,%r1,%r2,%r3}, {%r4,%r5,%r6,%r7}, {%r8,%r9,%r10,%r11}, "
-                            "{%r12,%r13,%r14,%r15}, %r16, 0x0;").message(),
-                  "mma.sp");
+                            "{%r12,%r13,%r14,%r15}, %r16, 0x1;").message(),
+                  "selector");
+  VCHECK_CONTAINS(parse_one("mma.sync.aligned.m16n8k16.row.col.f32.tf32.tf32.f32 "
+                            "{%f0,%f1,%f2,%f3}, {%r4,%r5,%r6,%r7}, {%r8,%r9}, "
+                            "{%f4,%f5,%f6,%f7};").message(),
+                  "not a form the ISA defines");
   VCHECK_CONTAINS(parse_one("mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32 "
                             "{%f0,%f1,%f2,%f3}, {%r4,%r5,%r6,%r7}, {%r8,%r9,%r10,%r11}, "
                             "{%f4,%f5,%f6,%f7}, %r16, 0x2;").message(),
@@ -5007,6 +5016,568 @@ VTEST(device_assert_reports_its_line_from_a_full_warp) {
   auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(t)}, e.mem, e.prof));
   VCHECK(err.code() == Err::DeviceAssert);
   VCHECK_CONTAINS(err.message(), "x.cu:55 in x.cu");
+}
+
+// The mma forms an RTX 3060 cannot run -- fp8 (sm_89) and f64 at m16n8k4/8/16
+// (sm_90) -- against a host GEMM. Their fragments follow the formulas the
+// e2e test mma_forms.cu checks on the hardware for the same element widths:
+// 8-bit like s8, and f64 in 64-bit registers like tf32 in 32-bit ones.
+namespace {
+struct MmaCase {
+  std::string op;       // the instruction, up to its operands
+  int K, na, nb, nc;    // registers per lane
+  bool f64 = false;
+};
+// Runs one mma with per-lane registers a/b/c (32 lanes each) and returns D.
+std::vector<uint64_t> run_mma(const MmaCase& t, const std::vector<uint64_t>& a, const std::vector<uint64_t>& b,
+                              const std::vector<uint64_t>& c, const std::string& header) {
+  const std::string R = t.f64 ? "%fd" : "%r";
+  const std::string ty = t.f64 ? "b64" : "b32";
+  const int step = t.f64 ? 8 : 4;
+  auto list = [&](int first, int n) {
+    std::string s;
+    for (int i = 0; i < n; ++i) s += (i ? ", " : "") + R + std::to_string(first + i);
+    return s;
+  };
+  std::string loads, stores;
+  const int nregs = t.na + t.nb + 2 * t.nc;
+  for (int i = 0; i < t.na + t.nb + t.nc; ++i)
+    loads += "    ld.global." + ty + " " + R + std::to_string(i) + ", [%rd3+" + std::to_string(i * step) + "];\n";
+  for (int i = 0; i < t.nc; ++i)
+    stores += "    st.global." + ty + " [%rd4+" + std::to_string(i * step) + "], " + R +
+              std::to_string(t.na + t.nb + t.nc + i) + ";\n";
+  const std::string ptx = header + R"(
+.visible .entry k(.param .u64 in, .param .u64 out)
+{
+    .reg .b32 %r<80>;
+    .reg .b64 %fd<80>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    mov.u32 %r79, %tid.x;
+    mul.wide.u32 %rd5, %r79, )" + std::to_string((t.na + t.nb + t.nc) * step) + R"(;
+    add.u64 %rd3, %rd1, %rd5;
+    mul.wide.u32 %rd6, %r79, )" + std::to_string(t.nc * step) + R"(;
+    add.u64 %rd4, %rd2, %rd6;
+)" + loads + "    " + t.op + " {" + list(t.na + t.nb + t.nc, t.nc) + "}, {" + list(0, t.na) + "}, {" +
+                          list(t.na, t.nb) + "}, {" + list(t.na + t.nb, t.nc) + "};\n" + stores + R"(    ret;
+}
+)";
+  (void)nregs;
+  Env e;
+  const int per = t.na + t.nb + t.nc;
+  std::vector<uint8_t> in(size_t(32) * per * step);
+  for (int l = 0; l < 32; ++l) {
+    auto put = [&](int slot, uint64_t v) { std::memcpy(in.data() + (size_t(l) * per + slot) * step, &v, step); };
+    for (int i = 0; i < t.na; ++i) put(i, a[size_t(l) * t.na + i]);
+    for (int i = 0; i < t.nb; ++i) put(t.na + i, b[size_t(l) * t.nb + i]);
+    for (int i = 0; i < t.nc; ++i) put(t.na + t.nb + i, c[size_t(l) * t.nc + i]);
+  }
+  const uint64_t pin = e.mem.alloc(in.size()), pout = e.mem.alloc(size_t(32) * t.nc * step);
+  e.mem.write(pin, in.data(), in.size());
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(pin), arg_u64(pout)}, e.mem, e.prof);
+  std::vector<uint64_t> d(size_t(32) * t.nc, 0);
+  for (size_t i = 0; i < d.size(); ++i) d[i] = e.mem.load_scalar(pout + i * step, step);
+  return d;
+}
+// E4M3/E5M2 bits for 0 and +-{0.25, 0.5, 0.75, 1, 1.5, 2}: exact in both.
+uint8_t fp8_bits(float v, bool e5m2) {
+  if (v == 0) return 0;
+  int e = 0;
+  const float m = std::frexp(std::fabs(v), &e);        // v = m * 2^e, m in [0.5, 1)
+  const int mbits = e5m2 ? 2 : 3, bias = e5m2 ? 15 : 7;
+  const uint8_t mant = static_cast<uint8_t>((m * 2 - 1) * (1 << mbits));
+  return static_cast<uint8_t>((v < 0 ? 0x80 : 0) | ((e - 1 + bias) << mbits) | mant);
+}
+}  // namespace
+
+VTEST(mma_fp8_m16n8k32_against_a_host_gemm) {
+  const float vals[] = {0, 0.25f, -0.5f, 0.75f, 1, -1.5f, 2, -0.25f};
+  for (int form = 0; form < 2; ++form) {
+    const bool a5 = form == 1, b5 = form == 0;   // e5m2 x e4m3 and e4m3 x e5m2
+    float A[16][32], B[32][8], C[16][8];
+    for (int i = 0; i < 16; ++i) for (int k = 0; k < 32; ++k) A[i][k] = vals[(i * 5 + k * 3) % 8];
+    for (int k = 0; k < 32; ++k) for (int j = 0; j < 8; ++j) B[k][j] = vals[(k * 7 + j) % 8];
+    for (int i = 0; i < 16; ++i) for (int j = 0; j < 8; ++j) C[i][j] = float((i + j) % 5) - 2;
+    std::vector<uint64_t> a(32 * 4), b(32 * 2), c(32 * 4);
+    for (int l = 0; l < 32; ++l) {
+      const int g = l / 4, t = l % 4;
+      for (int r = 0; r < 4; ++r)
+        for (int e = 0; e < 4; ++e)
+          a[l * 4 + r] |= uint64_t{fp8_bits(A[g + 8 * (r % 2)][t * 4 + e + 16 * (r / 2)], a5)} << (8 * e);
+      for (int r = 0; r < 2; ++r)
+        for (int e = 0; e < 4; ++e) b[l * 2 + r] |= uint64_t{fp8_bits(B[t * 4 + e + 16 * r][g], b5)} << (8 * e);
+      for (int i = 0; i < 4; ++i) c[l * 4 + i] = f32_bits(C[g + 8 * (i / 2)][t * 2 + i % 2]);
+    }
+    MmaCase mc{std::string("mma.sync.aligned.m16n8k32.row.col.f32.") + (a5 ? "e5m2" : "e4m3") + "." +
+                   (b5 ? "e5m2" : "e4m3") + ".f32",
+               32, 4, 2, 4};
+    const auto d = run_mma(mc, a, b, c, ".version 8.4\n.target sm_89\n.address_size 64\n");
+    for (int l = 0; l < 32; ++l)
+      for (int i = 0; i < 4; ++i) {
+        const int row = l / 4 + 8 * (i / 2), col = (l % 4) * 2 + i % 2;
+        float want = C[row][col];
+        for (int k = 0; k < 32; ++k) want += A[row][k] * B[k][col];
+        VCHECK_EQ(as_f32(d[l * 4 + i]), want);
+      }
+  }
+}
+
+VTEST(mma_f64_m16n8k_shapes_against_a_host_gemm) {
+  for (int K : {4, 8, 16}) {
+    std::vector<double> A(16 * K), B(K * 8), C(16 * 8);
+    for (int i = 0; i < 16 * K; ++i) A[i] = std::ldexp(double((i * 37) % 23) - 11, -3) + 1.0 / 3;
+    for (int i = 0; i < K * 8; ++i) B[i] = std::ldexp(double((i * 29) % 19) - 9, -2) - 1.0 / 7;
+    for (int i = 0; i < 16 * 8; ++i) C[i] = double(i % 13) / 5;
+    const int na = K / 2, nb = K / 4;
+    std::vector<uint64_t> a(32 * na), b(32 * nb), c(32 * 4);
+    auto bits = [](double v) { uint64_t u; std::memcpy(&u, &v, 8); return u; };
+    for (int l = 0; l < 32; ++l) {
+      const int g = l / 4, t = l % 4;
+      for (int r = 0; r < na; ++r) a[l * na + r] = bits(A[(g + 8 * (r % 2)) * K + t + 4 * (r / 2)]);
+      for (int r = 0; r < nb; ++r) b[l * nb + r] = bits(B[(t + 4 * r) * 8 + g]);
+      for (int i = 0; i < 4; ++i) c[l * 4 + i] = bits(C[(g + 8 * (i / 2)) * 8 + t * 2 + i % 2]);
+    }
+    MmaCase mc{"mma.sync.aligned.m16n8k" + std::to_string(K) + ".row.col.f64.f64.f64.f64", K, na, nb, 4, true};
+    const auto d = run_mma(mc, a, b, c, kHeader90);
+    for (int l = 0; l < 32; ++l)
+      for (int i = 0; i < 4; ++i) {
+        const int row = l / 4 + 8 * (i / 2), col = (l % 4) * 2 + i % 2;
+        // A chain of fused multiply-adds in K order, as f64 mma.m8n8k4 is on
+        // the hardware.
+        double want = C[row * 8 + col];
+        for (int k = 0; k < K; ++k) want = std::fma(A[row * K + k], B[k * 8 + col], want);
+        VCHECK_EQ(bits(want), d[l * 4 + i]);
+      }
+  }
+}
+
+// ---- sm_120's mma kinds -------------------------------------------------------------
+
+namespace {
+// The OCP MX codes for the multiples of 1/2 in [-4, 4] used here.
+uint32_t mx_code(float f, int eb, int mb, int bias) {
+  if (f == 0.0f) return 0;
+  const uint32_t sign = f < 0 ? 1u << (eb + mb) : 0;
+  const float a = std::fabs(f);
+  int e = 0;
+  const float m = std::frexp(a, &e);
+  const int biased = e - 1 + bias;
+  if (biased <= 0) return sign | static_cast<uint32_t>(std::ldexp(a, mb - (1 - bias)));
+  return sign | uint32_t(biased) << mb | static_cast<uint32_t>((m * 2.0f - 1.0f) * float(1 << mb));
+}
+float sm120_val(int i, int j, int salt) { return static_cast<float>(((i * 5 + j * 3 + salt) % 9) - 4) * 0.5f; }
+
+struct Sm120Case {
+  std::string op;              // up to the operands
+  int K;                       // 32 or 64
+  int elem_bits;               // bits a register slot takes: 8 (containers) or 4 (packed e2m1)
+  std::function<uint32_t(float)> a_code, b_code;   // a value's bits in its slot
+  bool scaled = false;
+  uint32_t bida = 0, tida = 0, bidb = 0, tidb = 0, sv = 1;
+  std::function<uint8_t(int, int)> sfa, sfb;       // (row or column, block) -> byte
+  std::function<double(uint8_t)> factor;
+  // Sparse A (K is the dense width): chunk c of row i keeps the positions
+  // keep(i, c) returns -- pairs of 2:4 positions, or two pairs of a 4:8 --
+  // stored in order.
+  bool sparse = false;
+};
+
+// A 2:4 (w = 4) or 4:8-in-pairs (w = 8) pattern and its 4-bit field.
+std::vector<int> sm120_keep(int i, int c, int w) {
+  static const int pairs[6][2] = {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
+  const int h = (i * 5 + c * 3) % 6;
+  if (w == 4) return {pairs[h][0], pairs[h][1]};
+  return {2 * pairs[h][0], 2 * pairs[h][0] + 1, 2 * pairs[h][1], 2 * pairs[h][1] + 1};
+}
+uint32_t sm120_field(int i, int c, int w) {
+  const auto k = sm120_keep(i, c, w);
+  return w == 4 ? uint32_t(k[0]) | uint32_t(k[1]) << 2 : uint32_t(k[0] / 2) | uint32_t(k[2] / 2) << 2;
+}
+
+// A and B from the fragment layouts (9.7.16.5.10-11): with p slots to a
+// register, A's register r of lane (g, t) holds row g + 8(r % 2), columns
+// tp + 4p(r / 2) on; B's register r holds rows tp + 4pr on of column g.
+std::vector<float> run_sm120(const Sm120Case& t, std::function<float(int, int)> A, std::function<float(int, int)> B) {
+  const int p = 32 / t.elem_bits, na = 16 * t.K / (t.sparse ? 2 : 1) / (32 * p), nb = t.K * 8 / (32 * p);
+  // Registers: A at 0-3, B at 4-7, scale data at 8-9, metadata at 10.
+  const int w = t.elem_bits == 4 ? 8 : 4, per = w / 2;   // chunk width, stored per chunk
+  std::vector<uint32_t> in(32 * 12, 0);
+  for (int lane = 0; lane < 32; ++lane) {
+    const int g = lane / 4, tt = lane % 4;
+    for (int r = 0; r < na; ++r)
+      for (int e = 0; e < p; ++e) {
+        const int row = g + 8 * (r % 2);
+        float v;
+        if (t.sparse) {
+          // Register r of lane (g, t) holds the stored values of chunks
+          // t * cpr + 4 * cpr * (r / 2) on (9.7.16.6.2).
+          const int cpr = p / per, chunk = tt * cpr + 4 * cpr * (r / 2) + e / per;
+          v = A(row, chunk * w + sm120_keep(row, chunk, w)[e % per]);
+        } else {
+          v = A(row, tt * p + 4 * p * (r / 2) + e);
+        }
+        in[lane * 12 + r] |= t.a_code(v) << (t.elem_bits * e);
+      }
+    for (int r = 0; r < nb; ++r)
+      for (int e = 0; e < p; ++e) in[lane * 12 + 4 + r] |= t.b_code(B(tt * p + 4 * p * r + e, g)) << (t.elem_bits * e);
+    if (t.scaled) {
+      // Figures 46-48: the selected pair of each quad holds rows g (first
+      // thread) and g + 8 (second); thread tidb of quad g holds column g.
+      if (tt / 2 == int(t.tida))
+        for (uint32_t b = 0; b < t.sv; ++b) in[lane * 12 + 8] |= uint32_t(t.sfa(g + 8 * (tt % 2), b)) << (8 * (t.bida + b));
+      if (tt == int(t.tidb))
+        for (uint32_t b = 0; b < t.sv; ++b) in[lane * 12 + 9] |= uint32_t(t.sfb(g, b)) << (8 * (t.bidb + b));
+    }
+    if (t.sparse) {
+      // Metadata with all four threads of the group holding it (selector 0):
+      // row g in lane 4g, row g + 8 in 4g + 1, their chunks 8-15 in 4g + 2
+      // and 4g + 3, 4 bits a chunk.
+      const int row = g + 8 * (tt % 2), c0 = 8 * (tt / 2);
+      for (int c = 0; c < 8; ++c) in[lane * 12 + 10] |= sm120_field(row, c0 + c, w) << (4 * c);
+    }
+  }
+  std::string ptx = R"(.version 8.7
+.target sm_120a
+.address_size 64
+.visible .entry k(.param .u64 pin, .param .u64 pout)
+{
+    .reg .b32 %r<24>;
+    .reg .f32 %f<8>;
+    .reg .b16 %h<4>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [pin];
+    ld.param.u64 %rd2, [pout];
+    mov.u32 %r20, %tid.x;
+    mul.wide.u32 %rd3, %r20, 48;
+    add.u64 %rd4, %rd1, %rd3;
+    mul.wide.u32 %rd5, %r20, 16;
+    add.u64 %rd6, %rd2, %rd5;
+)";
+  for (int i = 0; i < 11; ++i) ptx += "    ld.global.u32 %r" + std::to_string(i) + ", [%rd4+" + std::to_string(4 * i) + "];\n";
+  ptx += "    mov.f32 %f4, 0f00000000;\n";
+  ptx += "    mov.b16 %h0, " + std::to_string(t.bida) + ";\n    mov.b16 %h1, " + std::to_string(t.tida) + ";\n";
+  ptx += "    mov.b16 %h2, " + std::to_string(t.bidb) + ";\n    mov.b16 %h3, " + std::to_string(t.tidb) + ";\n";
+  std::string a = "{%r0, %r1, %r2, %r3}", b = nb == 4 ? "{%r4, %r5, %r6, %r7}" : "{%r4, %r5}";
+  ptx += "    " + t.op + " {%f0, %f1, %f2, %f3}, " + a + ", " + b + ", {%f4, %f4, %f4, %f4}" +
+         (t.sparse ? ", %r10, 0" : "") + (t.scaled ? ", {%r8}, {%h0, %h1}, {%r9}, {%h2, %h3}" : "") + ";\n";
+  for (int i = 0; i < 4; ++i) ptx += "    st.global.f32 [%rd6+" + std::to_string(4 * i) + "], %f" + std::to_string(i) + ";\n";
+  ptx += "    ret;\n}\n";
+  Env e;
+  e.prof = load_gpu("nvidia/rtx5090");
+  const uint64_t pin = e.mem.alloc(in.size() * 4), pout = e.mem.alloc(32 * 16);
+  e.mem.write(pin, in.data(), in.size() * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(pin), arg_u64(pout)}, e.mem, e.prof);
+  std::vector<float> d(32 * 4);
+  e.mem.read(pout, d.data(), d.size() * 4);
+  // Back to a 16 x 8 tile: D element i of lane (g, t) is row g + 8(i / 2),
+  // column 2t + i % 2.
+  std::vector<float> D(16 * 8);
+  for (int lane = 0; lane < 32; ++lane)
+    for (int i = 0; i < 4; ++i) D[(lane / 4 + 8 * (i / 2)) * 8 + 2 * (lane % 4) + i % 2] = d[lane * 4 + i];
+  return D;
+}
+
+void check_sm120(const Sm120Case& t, std::function<float(int, int)> A0, std::function<float(int, int)> B) {
+  // Sparse: the dense A is zero where the pattern keeps nothing.
+  const int w = t.elem_bits == 4 ? 8 : 4;
+  std::function<float(int, int)> A = A0;
+  if (t.sparse)
+    A = [&](int i, int k) {
+      for (int x : sm120_keep(i, k / w, w))
+        if (k % w == x) return A0(i, k);
+      return 0.0f;
+    };
+  const auto D = run_sm120(t, A, B);
+  const int blk = t.K / int(t.sv);
+  for (int i = 0; i < 16; ++i)
+    for (int j = 0; j < 8; ++j) {
+      double want = 0;
+      for (int k = 0; k < t.K; ++k)
+        want += double(A(i, k)) * B(k, j) *
+                (t.scaled ? t.factor(t.sfa(i, k / blk)) * t.factor(t.sfb(j, k / blk)) : 1.0);
+      if (D[i * 8 + j] != float(want))
+        VCHECK_EQ(std::to_string(i) + "," + std::to_string(j) + ": " + std::to_string(D[i * 8 + j]),
+                  std::to_string(i) + "," + std::to_string(j) + ": " + std::to_string(float(want)));
+    }
+}
+}  // namespace
+
+// .kind::f8f6f4: e2m1 in bits 2-5 of its byte, e3m2 in bits 0-5.
+VTEST(mma_sm120_f8f6f4_e2m1_times_e3m2) {
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e2m1.e3m2.f32";
+  t.K = 32;
+  t.elem_bits = 8;
+  t.a_code = [](float f) { return mx_code(f, 2, 1, 1) << 2; };
+  t.b_code = [](float f) { return mx_code(f, 3, 2, 3); };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 1); }, [](int k, int j) { return sm120_val(k, j, 4); });
+}
+
+// .kind::mxf8f6f4 1X: ue8m0 factors from byte 2 of the upper thread pair (A)
+// and byte 1 of thread 3 (B).
+VTEST(mma_sm120_mxf8f6f4_selectors) {
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m3.f32.ue8m0";
+  t.K = 32;
+  t.elem_bits = 8;
+  t.a_code = [](float f) { return mx_code(f, 4, 3, 7); };
+  t.b_code = [](float f) { return mx_code(f, 2, 3, 1); };
+  t.scaled = true;
+  t.bida = 2; t.tida = 1; t.bidb = 1; t.tidb = 3; t.sv = 1;
+  t.sfa = [](int i, int) { return uint8_t(124 + i % 6); };
+  t.sfb = [](int j, int) { return uint8_t(126 + j % 4); };
+  t.factor = [](uint8_t v) { return std::ldexp(1.0, int(v) - 127); };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 2); }, [](int k, int j) { return sm120_val(k, j, 7); });
+}
+
+// .kind::mxf4 (2X by default): e2m1 packed, two blocks of 32, from bytes 2-3.
+VTEST(mma_sm120_mxf4_two_blocks) {
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::mxf4.block_scale.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0";
+  t.K = 64;
+  t.elem_bits = 4;
+  t.a_code = t.b_code = [](float f) { return mx_code(f, 2, 1, 1); };
+  t.scaled = true;
+  t.bida = 2; t.tida = 0; t.bidb = 2; t.tidb = 1; t.sv = 2;
+  t.sfa = [](int i, int b) { return uint8_t(125 + (i + 3 * b) % 5); };
+  t.sfb = [](int j, int b) { return uint8_t(127 - (j + b) % 3); };
+  t.factor = [](uint8_t v) { return std::ldexp(1.0, int(v) - 127); };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 3); }, [](int k, int j) { return sm120_val(k, j, 5); });
+}
+
+// .kind::mxf4nvf4 4X with ue4m3: four blocks of 16.
+VTEST(mma_sm120_mxf4nvf4_ue4m3) {
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3";
+  t.K = 64;
+  t.elem_bits = 4;
+  t.a_code = t.b_code = [](float f) { return mx_code(f, 2, 1, 1); };
+  t.scaled = true;
+  t.tida = 1; t.tidb = 2; t.sv = 4;
+  const float steps[] = {0.5f, 1.0f, 1.5f, 2.0f, 0.75f};
+  t.sfa = [steps](int i, int b) { return uint8_t(mx_code(steps[(i + b) % 5], 4, 3, 7)); };
+  t.sfb = [steps](int j, int b) { return uint8_t(mx_code(steps[(2 * j + b) % 5], 4, 3, 7)); };
+  t.factor = [](uint8_t v) {
+    return v ? std::ldexp(1.0 + (v & 7) / 8.0, int(v >> 3) - 7) : 0.0;
+  };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 6); }, [](int k, int j) { return sm120_val(k, j, 2); });
+}
+
+// Sparse block-scaled: mxf8f6f4 at m16n8k64 (2:4, e2m3 A in containers, one
+// factor per 64) and mxf4nvf4 at m16n8k128 (4:8 in pairs, four ue4m3
+// factors per 128).
+VTEST(mma_sm120_sparse_mxf8f6f4_k64) {
+  Sm120Case t;
+  t.op = "mma.sp::ordered_metadata.sync.aligned.kind::mxf8f6f4.block_scale.m16n8k64.row.col.f32.e2m3.e4m3.f32.ue8m0";
+  t.K = 64;
+  t.elem_bits = 8;
+  t.sparse = true;
+  t.a_code = [](float f) { return mx_code(f, 2, 3, 1); };
+  t.b_code = [](float f) { return mx_code(f, 4, 3, 7); };
+  t.scaled = true;
+  t.bida = 3; t.tida = 0; t.bidb = 0; t.tidb = 1; t.sv = 1;
+  t.sfa = [](int i, int) { return uint8_t(125 + i % 4); };
+  t.sfb = [](int j, int) { return uint8_t(128 - j % 3); };
+  t.factor = [](uint8_t v) { return std::ldexp(1.0, int(v) - 127); };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 8); }, [](int k, int j) { return sm120_val(k, j, 3); });
+}
+
+VTEST(mma_sm120_sparse_mxf4nvf4_k128) {
+  Sm120Case t;
+  t.op = "mma.sp::ordered_metadata.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k128.row.col.f32.e2m1.e2m1.f32.ue4m3";
+  t.K = 128;
+  t.elem_bits = 4;
+  t.sparse = true;
+  t.a_code = t.b_code = [](float f) { return mx_code(f, 2, 1, 1); };
+  t.scaled = true;
+  t.tida = 1; t.tidb = 0; t.sv = 4;
+  const float steps[] = {0.5f, 1.0f, 1.5f, 2.0f, 0.75f};
+  t.sfa = [steps](int i, int b) { return uint8_t(mx_code(steps[(i + 2 * b) % 5], 4, 3, 7)); };
+  t.sfb = [steps](int j, int b) { return uint8_t(mx_code(steps[(j + b) % 5], 4, 3, 7)); };
+  t.factor = [](uint8_t v) { return v ? std::ldexp(1.0 + (v & 7) / 8.0, int(v >> 3) - 7) : 0.0; };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 5); }, [](int k, int j) { return sm120_val(k, j, 1); });
+}
+
+VTEST(mma_sm120_refuses_what_table_45_rules_out) {
+  auto parse = [](const std::string& ins) {
+    return VCAPTURE(Error, ptx::parse(".version 8.7\n.target sm_120a\n.address_size 64\n.visible .entry k()\n{\n"
+                                      " .reg .b32 a<8>;\n .reg .f32 f<8>;\n .reg .b16 h<4>;\n " + ins + "\n ret;\n}\n"))
+        .message();
+  };
+  VCHECK_CONTAINS(parse("mma.sync.aligned.m16n8k32.row.col.f32.e2m1.e2m1.f32 {f0,f1,f2,f3}, {a0,a1,a2,a3}, {a4,a5}, {f0,f1,f2,f3};"),
+                  "needs .kind::f8f6f4");
+  VCHECK_CONTAINS(parse("mma.sync.aligned.kind::mxf4nvf4.block_scale.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+                        "{f0,f1,f2,f3}, {a0,a1,a2,a3}, {a4,a5}, {f0,f1,f2,f3}, {a6}, {h0,h1}, {a7}, {h2,h3};"),
+                  "needs a .scale_vec");
+  VCHECK_CONTAINS(parse("mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                        "{f0,f1,f2,f3}, {a0,a1,a2,a3}, {a4,a5}, {f0,f1,f2,f3}, {a6}, {h0,h1}, {a7}, {h2,h3};"),
+                  "Table 45");
+  VCHECK_CONTAINS(parse("mma.sync.aligned.kind::f8f6f4.m16n8k64.row.col.f32.e4m3.e4m3.f32 {f0,f1,f2,f3}, "
+                        "{a0,a1,a2,a3}, {a4,a5}, {f0,f1,f2,f3};"),
+                  "not a form");
+  // Table 46: byte-id 1 is not a 2X selector.
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::mxf4.block_scale.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0";
+  t.K = 64;
+  t.elem_bits = 4;
+  t.a_code = t.b_code = [](float f) { return mx_code(f, 2, 1, 1); };
+  t.scaled = true;
+  t.bida = 1; t.sv = 2;
+  t.sfa = t.sfb = [](int, int) { return uint8_t(127); };
+  t.factor = [](uint8_t) { return 1.0; };
+  VCHECK_CONTAINS(VCAPTURE(Error, run_sm120(t, [](int, int) { return 1.0f; }, [](int, int) { return 1.0f; })).message(),
+                  "Table 46");
+}
+
+// ldmatrix's 8-bit shapes (9.7.16.5.15): lane l supplies the row at 32 * l of
+// a patterned shared buffer; each form's registers are checked against
+// figures 108-109 -- lane t holds columns 4(t % 4).. of row t / 4 (and t / 4
+// + 8 in its second register for 16x16, transposed) -- with fp4 and fp6
+// expanded into the low bits of each byte (as CUTLASS's fp4_shift_A says)
+// and .s4 sign-extended.
+VTEST(ldmatrix_8bit_shapes_expand_as_the_figures_show) {
+  struct Form { std::string mods; int R, count, bits; bool trans, s4; };
+  const Form forms[] = {
+      {"m8n16.x2.shared.b8x16.b4x16_p64", 8, 2, 4, false, false},
+      {"m8n16.x4.shared.b8x16.b6x16_p32", 8, 4, 6, false, false},
+      {"m8n16.x1.shared.s8.s4", 8, 1, 4, false, true},
+      {"m16n16.x1.trans.shared.b8", 16, 1, 8, true, false},
+      {"m16n16.x2.trans.shared.b8x16.b4x16_p64", 16, 2, 4, true, false},
+  };
+  auto image = [](int i) { return static_cast<uint8_t>((i * 37 + 11) & 0xFF); };
+  for (const Form& f : forms) {
+    const int nregs = f.count * f.R / 8;
+    std::string regs;
+    for (int i = 0; i < nregs; ++i) regs += (i ? ", %r" : "%r") + std::to_string(10 + i);
+    std::string ptx = R"(.version 8.7
+.target sm_120a
+.address_size 64
+.visible .entry k(.param .u64 pout)
+{
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<4>;
+    .shared .align 16 .b8 buf[1024];
+    ld.param.u64 %rd1, [pout];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, buf;
+    // Fill: byte i = (37 i + 11) mod 256, 32 bytes a lane.
+    shl.b32 %r3, %r1, 5;
+    mov.u32 %r4, 0;
+FILL:
+    add.u32 %r5, %r3, %r4;
+    mad.lo.u32 %r6, %r5, 37, 11;
+    add.u32 %r7, %r2, %r5;
+    st.shared.u8 [%r7], %r6;
+    add.u32 %r4, %r4, 1;
+    setp.lt.u32 %p1, %r4, 32;
+    @%p1 bra FILL;
+    bar.sync 0;
+    add.u32 %r8, %r2, %r3;
+    ldmatrix.sync.aligned.)" + f.mods + " {" + regs + "}, [%r8];\n";
+    // The instruction takes a shared offset with .shared: the buffer's.
+    ptx.replace(ptx.find("add.u32 %r8, %r2, %r3;"), 22, "mov.u32 %r8, %r3;     ");
+    ptx += "    mul.wide.u32 %rd2, %r1, 32;\n    add.u64 %rd3, %rd1, %rd2;\n";
+    for (int i = 0; i < nregs; ++i)
+      ptx += "    st.global.u32 [%rd3+" + std::to_string(4 * i) + "], %r" + std::to_string(10 + i) + ";\n";
+    ptx += "    ret;\n}\n";
+    ptx.insert(ptx.find(".reg .b64"), ".reg .pred %p<2>;\n    ");
+    Env e;
+    e.prof = load_gpu("nvidia/rtx5090");
+    const uint64_t out = e.mem.alloc(32 * 32);
+    LaunchConfig cfg;
+    cfg.block = {32, 1, 1};
+    exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+    std::vector<uint32_t> got(32 * 8);
+    e.mem.read(out, got.data(), got.size() * 4);
+    // Row r of matrix m: the sixteen values at 32 * (m * R + r), expanded.
+    auto elem = [&](int m, int r, int c) -> uint8_t {
+      const int at = 32 * (m * f.R + r);
+      uint32_t v = 0;
+      for (int k = 0; k < f.bits; ++k) v |= ((image(at + (c * f.bits + k) / 8) >> ((c * f.bits + k) % 8)) & 1u) << k;
+      if (f.s4 && (v & 8)) v |= 0xF0;
+      return static_cast<uint8_t>(v);
+    };
+    for (int lane = 0; lane < 32; ++lane)
+      for (int m = 0; m < f.count; ++m)
+        for (int rr = 0; rr < f.R / 8; ++rr) {
+          uint32_t want = 0;
+          for (int j = 0; j < 4; ++j) {
+            const int row = lane / 4 + 8 * rr, col = 4 * (lane % 4) + j;
+            want |= uint32_t{f.trans ? elem(m, col, row) : elem(m, row, col)} << (8 * j);
+          }
+          const uint32_t have = got[lane * 8 + m * (f.R / 8) + rr];
+          if (have != want)
+            VCHECK_EQ(f.mods + " lane " + std::to_string(lane) + ": " + std::to_string(have),
+                      f.mods + " lane " + std::to_string(lane) + ": " + std::to_string(want));
+        }
+  }
+  auto refused = [](const std::string& mods) {
+    return VCAPTURE(Error, ptx::parse(".version 8.7\n.target sm_120a\n.address_size 64\n.visible .entry k()\n{\n"
+                                      " .reg .b32 r<4>;\n ldmatrix.sync.aligned." + mods + " {r0, r1}, [r2];\n ret;\n}\n"))
+        .message();
+  };
+  VCHECK_CONTAINS(refused("m16n16.x1.shared.b8"), "not a form");         // 16x16 needs .trans
+  VCHECK_CONTAINS(refused("m8n16.x1.trans.shared.b8x16.b4x16_p64"), "not a form");
+}
+
+// stmatrix.m16n8.trans.b8 (figure 111): lane t's byte e is element (row, col)
+// = (t / 4 + 8(e / 2), 2(t % 4) + e % 2) of a 16x8 matrix, stored
+// column-major: column c is 16 bytes at the address lane 8m + c gives.
+VTEST(stmatrix_m16n8_trans_b8_stores_columns) {
+  std::string ptx = R"(.version 8.7
+.target sm_120a
+.address_size 64
+.visible .entry k(.param .u64 pout)
+{
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<4>;
+    .shared .align 16 .b8 buf[512];
+    ld.param.u64 %rd1, [pout];
+    mov.u32 %r1, %tid.x;
+    // Lane t, register m: bytes (64m + 4t + e) * 7.
+    shl.b32 %r2, %r1, 2;
+    mul.lo.u32 %r3, %r2, 7;
+    mov.u32 %r10, 0x1C150E07;
+    mul.lo.u32 %r4, %r3, 0x01010101;
+    add.u32 %r10, %r4, %r10;
+    add.u32 %r11, %r10, 0xC0C0C0C0;
+    shl.b32 %r5, %r1, 4;
+    stmatrix.sync.aligned.m16n8.x2.trans.shared.b8 [%r5], {%r10, %r11};
+    bar.sync 0;
+    shl.b32 %r6, %r1, 4;
+    mov.u32 %r7, buf;
+    add.u32 %r7, %r7, %r6;
+    ld.shared.v4.u32 {%r12, %r13, %r14, %r15}, [%r7];
+    mul.wide.u32 %rd2, %r1, 16;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.v4.u32 [%rd3], {%r12, %r13, %r14, %r15};
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/rtx5090");
+  const uint64_t out = e.mem.alloc(32 * 16);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  std::vector<uint8_t> got(32 * 16);
+  e.mem.read(out, got.data(), got.size());
+  // Register values as the kernel builds them: byte e of lane t, register m.
+  auto reg_byte = [](int t, int m, int e) {
+    const uint32_t base = 0x1C150E07u + uint32_t(t * 4 * 7) * 0x01010101u + (m ? 0xC0C0C0C0u : 0u);
+    return static_cast<uint8_t>(base >> (8 * e));
+  };
+  for (int m = 0; m < 2; ++m)
+    for (int c = 0; c < 8; ++c)
+      for (int row = 0; row < 16; ++row) {
+        const int t = 4 * (row % 8) + c / 2, byte = 2 * (row / 8) + c % 2;
+        VCHECK_EQ(int(got[(8 * m + c) * 16 + row]), int(reg_byte(t, m, byte)));
+      }
 }
 
 VTEST_MAIN

@@ -18,7 +18,7 @@ VTEST(registry_lists_all_gpus) {
   auto ids = vgpu::available_gpus();
   const std::vector<std::string> expected = {
       "nvidia/a10",   "nvidia/a100", "nvidia/h100",   "nvidia/h200",
-      "nvidia/b200",  "nvidia/rtx3060", "nvidia/rtx3080ti", "nvidia/a100-sxm4-40gb",
+      "nvidia/b200",  "nvidia/rtx5090", "nvidia/rtx3060", "nvidia/rtx3080ti", "nvidia/a100-sxm4-40gb",
       "nvidia/gh200-480gb", "nvidia/h100-pcie", "nvidia/t4", "nvidia/a10g",
       "nvidia/l4", "nvidia/l40s",
       "amd/mi250x", "amd/mi300x", "amd/mi325x", "amd/mi350x", "amd/rx7900xtx", "amd/rx9070xt"};
