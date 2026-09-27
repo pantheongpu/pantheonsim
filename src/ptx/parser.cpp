@@ -2345,8 +2345,7 @@ class Parser {
         else if (p.rfind("collector::", 0) == 0) ;
         else if (p == "red")
           return unsupported("tcgen05.ld.red (sm_103 and sm_110, not the B200's sm_100)");
-        else if (p == "sp")
-          return unsupported("tcgen05.mma.sp (structured-sparse A) is not implemented yet");
+        else if (p == "sp" && op.kind == Tcgen05Kind::Mma) op.sparse = true;
         else if (p == "ws" || p.rfind("ws::", 0) == 0)
           return unsupported("tcgen05.mma.ws (weight-stationary) is not implemented yet");
         else if (p == "kind::mxf8f6f4") { op.mma_kind = Tcgen05MmaKind::MXF8F6F4; have_kind = true; }
@@ -2471,6 +2470,10 @@ class Parser {
           expect_punct(",");
           op.b_desc = parse_operand();
           expect_punct(",");
+          if (op.sparse) {
+            op.sp_meta = bracketed();
+            expect_punct(",");
+          }
           op.idesc = parse_operand();
           expect_punct(",");
           if (op.block_scale) {

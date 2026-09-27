@@ -102,6 +102,28 @@ A's row and one of B's column: `D = sum (A * SA) * (B * SB) (+ D)`, into f32.
 - Refused by name as sm_107's: UE5M3 factors, UE4M3 with `.block32`, the
   128-lane scale layout (bit 26) and the larger K of bits 3 and 31.
 
+### Sparse A: tcgen05.mma.sp
+
+`tcgen05.mma.sp` (9.7.18.10.9) doubles K and reads A as M x K/2: each chunk
+of a row keeps half of its elements, placed by a 4-bit metadata field -- 2:4
+(two 2-bit positions, low first) for most kinds, 1:2 for tf32 (0b0100 or
+0b1110), and 4:8 in pairs for `mxf4`/`mxf4nvf4` (sparsity version v0). The
+instruction descriptor's bit 2 must say sparse. The metadata matrix is in
+Tensor Memory at `[sp-meta-tmem]`, laid out as figures 287-292 draw it, each
+32-lane partition holding its own rows:
+
+- `.kind::f16` and `tf32`: rows r and r + 8 share a lane (r's fields in bits
+  0-15), the upper half of K eight lanes further on, and the sparsity
+  selector (0 or 1) picks the column. Selectors 2 and 3 are refused: the
+  figures show only 0 and 1.
+- The 8-bit kinds: row r in lane r, sixteen fields over two columns. The
+  selector must be 0 (`i8`, `f8f6f4`) or is taken as 0 (the `mx` kinds).
+
+For M = 64 the metadata starts at D's lane (0 or 16). With block scaling a
+sparse `mxf4` K = 128 has four factors a row under `.block32`, its default;
+`.block16` would have eight, and the ISA does not show where the second four
+go, so it is refused.
+
 ### tcgen05.cp
 
 One thread copies a matrix from shared memory (a descriptor, K-major, no
@@ -156,7 +178,7 @@ before waiting for it is not caught here.
 
 ## Refused by name
 
-`tcgen05.mma.sp` (sparse A), `.ws` (weight-stationary), `.ashift`,
+`.ws` (weight-stationary), `.ashift`,
 `tcgen05.cp`'s `.warpx2` shapes and decompression, `tcgen05.shift`, `tcgen05.ld.red`
 (sm_103/sm_110), the sm_107 additions (`kind::ti16`, `decompress::lut`), and
 TMA's `.im2col::w` modes: the ISA shows their halo walk only in figures that

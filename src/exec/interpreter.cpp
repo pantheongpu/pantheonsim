@@ -6248,7 +6248,13 @@ class Interpreter {
     const bool mx = op.block_scale;
     const bool mxf4 = op.mma_kind == Tcgen05MmaKind::MXF4 || op.mma_kind == Tcgen05MmaKind::MXF4NVF4;
     // The instruction descriptor: Table 51, or 52/53 for the block-scaled kinds.
-    if (id & 4) refuse("the instruction descriptor asks for sparse A (bit 2), which is tcgen05.mma.sp");
+    const bool sp = op.sparse;
+    if (bool(id >> 2 & 1) != sp)
+      ctx_fail(ins, li, Err::InvalidValue,
+               sp ? "tcgen05.mma.sp needs the instruction descriptor's sparsity bit (2) set"
+                  : "the instruction descriptor asks for sparse A (bit 2) on a dense tcgen05.mma; that is "
+                    "tcgen05.mma.sp");
+    const uint32_t sp_sel = sp ? id & 3 : 0;
     const bool sat = !mx && (id >> 3 & 1);
     const uint32_t dtype = mx ? 1 : id >> 4 & 3;
     const uint32_t atype = id >> 7 & 7, btype = mxf4 ? id >> 10 & 3 : id >> 10 & 7;
@@ -6258,7 +6264,7 @@ class Interpreter {
     const uint32_t M = mx ? (id >> 27 & 3) << 7 : (id >> 24 & 0x1F) << 4;
     const uint32_t sfb_id = id >> 4 & 3, sfa_id = id >> 29 & 3;
     if (mx) {
-      if ((id & 3) || (id & 0x40) || (!mxf4 && (id & 8)) || (mxf4 && (id >> 25 & 1)) ||
+      if ((!sp && (id & 3)) || (id & 0x40) || (!mxf4 && (id & 8)) || (mxf4 && (id >> 25 & 1)) ||
           (!mxf4 && (id >> 24 & 3)))
         ctx_fail(ins, li, Err::InvalidValue, "tcgen05.mma instruction descriptor sets a reserved bit");
       if (id >> 26 & 1) refuse("the 128-lane scale-factor A layout (bit 26) is sm_107f's");
@@ -6326,6 +6332,24 @@ class Interpreter {
         if (trans_a || trans_b) bad();   // Table 62: no transpose for mxf4
         break;
     }
+    // Sparse A (9.7.18.10.9): K doubles and A holds half of each row. Each
+    // chunk of sp_w elements keeps half of them, placed by a 4-bit metadata
+    // field: 2:4 for most kinds, 1:2 for tf32 and 4:8 in pairs for mxf4*.
+    // The 8-bit kinds keep a row's metadata in one lane and take no
+    // selector; f16 and tf32 pick the column with it (figures 287-292).
+    const bool meta_rows = op.mma_kind != Tcgen05MmaKind::F16 && op.mma_kind != Tcgen05MmaKind::TF32;
+    uint32_t sp_w = 0;
+    if (sp) {
+      K *= 2;
+      sp_w = op.mma_kind == Tcgen05MmaKind::TF32 ? 2 : mxf4 ? 8 : 4;
+      if (meta_rows && !mx && sp_sel)
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "the sparsity selector must be 0 for .kind::i8 and .kind::f8f6f4 (9.7.18.10.9.4)");
+      if (!meta_rows && sp_sel > 1)
+        refuse("sparsity selector " + std::to_string(sp_sel) +
+               ": the ISA's figures 287-290 place the metadata for selectors 0 and 1 only");
+    }
+    const uint32_t Ka = sp ? K / 2 : K;   // A's stored elements a row
     if (sat && !d_int) bad();
     // Sub-byte elements are read K-major (Table 65 transposes only 8- and
     // 16-bit ones, and 32-bit in the 32-byte-atom swizzle).
@@ -6357,6 +6381,15 @@ class Interpreter {
           break;
         }
       }
+      // .block16/.block32 fix the block, so a sparse K = 128 has twice the
+      // factors (Table 68).
+      // .kind::mxf4 without a size is .block32; .block32 under mxf8f6f4 is
+      // 1X whatever K is.
+      const uint32_t named = op.scale_vec == 0 && op.mma_kind == Tcgen05MmaKind::MXF4 ? 32 : op.scale_vec;
+      if (K == 128 && (named == 16 || named == 32)) sv *= 2;
+      if (sv > 4)
+        refuse("eight scale factors a row (.block16 with K = 128): the ISA does not show where the "
+               "second four are in Tensor Memory");
       // Byte-aligned sub-columns: 1X any byte, 2X a half word, 4X all four.
       if ((sv == 2 && (sfa_id % 2 || sfb_id % 2)) || (sv == 4 && (sfa_id || sfb_id))) bad();
     }
@@ -6490,26 +6523,54 @@ class Interpreter {
       return std::ldexp(1.0, int(byte) - 127);   // UE8M0
     };
 
-    std::vector<double> A(K), SA(4, 1.0), SB(4, 1.0);
+    // The metadata of the row D lane dl holds: its partition's, at the row
+    // that lane's D row has within it.
+    const uint32_t meta_addr = sp ? static_cast<uint32_t>(value(op.sp_meta)) : 0;
+    if (sp && (layout_f ? (meta_addr >> 16) != d_lane0 : (meta_addr >> 16) != 0))
+      ctx_fail(ins, li, Err::InvalidValue,
+               "the sparsity metadata's Tensor Memory lane must match D's data-path lane alignment "
+               "(9.7.18.10.9.5)");
+    auto meta_of = [&](TensorMemory& t, uint32_t dl, uint32_t c) -> uint32_t {
+      const uint32_t r = dl % 32 - (layout_f ? d_lane0 : 0);
+      uint32_t lane, col, bit;
+      if (meta_rows) {   // figures 291-292: row r in lane r, 16 fields over two columns
+        lane = r;
+        col = c / 8;
+        bit = 4 * (c % 8);
+      } else {           // figures 287-290: rows r and r + 8 share a lane, K's upper half 8 lanes on
+        lane = 16 * (r / 16) + r % 8 + 8 * (c / 4);
+        col = sp_sel;
+        bit = 16 * (r % 16 / 8) + 4 * (c % 4);
+      }
+      const uint32_t l = (meta_addr >> 16) + 32 * (dl / 32) + lane, cc = (meta_addr & 0xFFFF) + col;
+      if (l >= TensorMemory::kLanes || cc >= TensorMemory::kCols || !t.allocated(cc))
+        ctx_fail(ins, li, Err::OutOfBounds,
+                 "tcgen05.mma.sp reads metadata from Tensor Memory lane " + std::to_string(l) + ", column " +
+                     std::to_string(cc) + ", which no tcgen05.alloc has allocated");
+      return t.at(l, cc) >> bit & 0xF;
+    };
+
+    std::vector<double> A(K), Ap(Ka), SA(4, 1.0), SB(4, 1.0);
     for (uint32_t v = 0; v < G; ++v) {
       TensorMemory& t = tmem_of(*ctas[v]);
       const uint32_t rank = cluster_rank_of(*ctas[v]);
       // A's rows of this CTA from shared memory, read once.
       std::vector<double> As;
       if (!op.a_tmem) {
-        As.resize(size_t{Mloc} * K);
+        As.resize(size_t{Mloc} * Ka);
         for (uint32_t m = 0; m < Mloc; ++m)
-          for (uint32_t k = 0; k < K; ++k)
-            As[size_t{m} * K + k] = sa * tc_decode(ea.t, smem_raw(a_desc, !trans_a, ea, rank, m, k));
+          for (uint32_t k = 0; k < Ka; ++k)
+            As[size_t{m} * Ka + k] = sa * tc_decode(ea.t, smem_raw(a_desc, !trans_a, ea, rank, m, k));
       }
       for (uint32_t m = 0; m < Mloc; ++m)
         for (uint32_t n = 0; n < N; ++n) {
           uint32_t dl, dc;
           d_pos(m, n, d_lane0, &dl, &dc);
           if (off_mask[dl / 32] >> (dl % 32) & 1) continue;
+          std::vector<double>& Arow = sp ? Ap : A;
           if (op.a_tmem) {
             const uint32_t al = dl - d_lane0 + (a_addr >> 16), ac0 = a_addr & 0xFFFF;
-            for (uint32_t k = 0; k < K; ++k) {
+            for (uint32_t k = 0; k < Ka; ++k) {
               const uint32_t col = ac0 + k * ea.cbits / 32;
               if (col >= TensorMemory::kCols || !t.allocated(col))
                 ctx_fail(ins, li, Err::OutOfBounds,
@@ -6518,10 +6579,28 @@ class Interpreter {
               uint32_t raw = t.at(al, col) >> (k * ea.cbits % 32);
               // fp4 in an 8-bit container sits in bits 2-5 (figure 202).
               if (ea.cbits == 8 && ea.bits == 4) raw >>= 2;
-              A[k] = sa * tc_decode(ea.t, raw);
+              Arow[k] = sa * tc_decode(ea.t, raw);
             }
           } else {
-            std::copy_n(As.begin() + size_t{m} * K, K, A.begin());
+            std::copy_n(As.begin() + size_t{m} * Ka, Ka, Arow.begin());
+          }
+          if (sp) {
+            // 2:4: bits 0-1 and 2-3 place the chunk's two stored elements;
+            // 1:2 (tf32): 0b0100 is position 0 and 0b1110 position 1; 4:8
+            // (mxf4): the two fields place two-element pairs. A field that
+            // places two elements at one position is undefined; both are
+            // added here.
+            std::fill(A.begin(), A.end(), 0.0);
+            const uint32_t per = sp_w / 2;
+            for (uint32_t c = 0; c < K / sp_w; ++c) {
+              const uint32_t f = meta_of(t, dl, c);
+              for (uint32_t s = 0; s < per; ++s) {
+                const uint32_t pos = sp_w == 2 ? (f & 3) / 2
+                                   : sp_w == 4 ? f >> (2 * s) & 3
+                                               : 2 * (f >> (2 * (s / 2)) & 3) + s % 2;
+                A[c * sp_w + pos] += Ap[c * per + s];
+              }
+            }
           }
           if (mx)
             for (uint32_t j = 0; j < sv; ++j) {

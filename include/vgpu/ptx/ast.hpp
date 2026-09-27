@@ -357,6 +357,10 @@ struct OpTcgen05 {
   // (.scale_vec::NX, or .block32/.block16 resolved by kind and K).
   bool block_scale = false;
   Operand scale_a, scale_b;
+  // tcgen05.mma.sp: A is M x K/2, expanded by the metadata matrix in Tensor
+  // Memory at [sp_meta] (9.7.18.10.9).
+  bool sparse = false;
+  Operand sp_meta;
   uint32_t scale_vec = 0;      // 0: the kind's default
   // tcgen05.cp: the shape, its .warpx4/.warpx2 multicast, and the source
   // descriptor (in `a`).

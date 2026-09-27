@@ -829,7 +829,7 @@ narrows what counts as observable, not what the detector looks at.
   its quarter of the lanes; `tcgen05.mma` for `.kind::f16`, `tf32`,
   `f8f6f4` (the 8-, 6- and 4-bit types) and `i8`, and block-scaled
   (`mxf8f6f4`, `mxf4`, `mxf4nvf4`, UE8M0 and UE4M3 factors from Tensor
-  Memory), one CTA (M = 64/128) or a pair (M = 128/256), A from shared or
+  Memory), dense or with sparse A (`tcgen05.mma.sp`), one CTA (M = 64/128) or a pair (M = 128/256), A from shared or
   Tensor Memory, with the data-path layouts of figures 211-222;
   `tcgen05.cp` (the 128- and 32-row shapes, `.warpx4`); `tcgen05.commit`
   (multicast too), the fences and waits.
@@ -843,8 +843,7 @@ narrows what counts as observable, not what the detector looks at.
   tables, every kind and layout against a host GEMM, the pair layouts, the
   launch-control takeover, TMA through the peer bit) and by CUTLASS's own
   SM100 GEMM tests (f16 1-SM, 2-SM and stream-K, f8, s8), unmodified,
-  against its host reference. Sparse and weight-stationary MMAs,
-  `tcgen05.shift`, and `tcgen05.cp`'s `.warpx2` and decompression are
+  against its host reference. Weight-stationary MMAs, `tcgen05.shift`, and `tcgen05.cp`'s `.warpx2` and decompression are
   refused by name.
   See nvidia/docs/blackwell.md.
 
@@ -918,7 +917,7 @@ what is done.
   nvidia/docs/blackwell.md), attribute
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle's 8-byte-flip
-  variant (Blackwell); tcgen05's sparse and weight-stationary MMAs,
+  variant (Blackwell); tcgen05's weight-stationary MMAs,
   `tcgen05.shift` and `tcgen05.cp`'s `.warpx2` and decompression; the sparse and
   single-bit `wgmma` forms, and inline-asm-only instructions. (`wgmma`, TMA,
   the mbarrier transaction counts, `barrier.cluster` and distributed shared
