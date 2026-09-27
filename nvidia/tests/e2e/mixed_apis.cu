@@ -8,6 +8,9 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <unistd.h>
 
 __global__ void add_one(unsigned* p, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -83,6 +86,29 @@ int main() {
   wrong = 0;
   for (unsigned v : h) wrong += v != 1;
   expect("cleared by the runtime, +1 by a runtime kernel: 1", wrong == 0);
+  // cuModuleLoad: the same module from a file, as frameworks cache compiled
+  // kernels on disk.
+  char path[] = "/tmp/vgpu_mixed_apis_XXXXXX";
+  const int fd = mkstemp(path);
+  expect("a temporary file", fd >= 0);
+  if (fd >= 0) {
+    expect("the module written", write(fd, kPtx, std::strlen(kPtx)) == (ssize_t)std::strlen(kPtx));
+    close(fd);
+    CUmodule from_file = nullptr;
+    CUfunction twice = nullptr;
+    expect("cuModuleLoad from a file", cuModuleLoad(&from_file, path) == CUDA_SUCCESS);
+    expect("its kernel", cuModuleGetFunction(&twice, from_file, "twice") == CUDA_SUCCESS);
+    CUdeviceptr pb = b;
+    void* bargs[] = {&pb, &un};
+    expect("launched on driver memory", cuLaunchKernel(twice, 1, 1, 1, n, 1, 1, 0, nullptr, bargs, nullptr) == CUDA_SUCCESS);
+    expect("cudaMemcpy of the result", cudaMemcpy(h, (void*)b, sizeof h, cudaMemcpyDeviceToHost) == cudaSuccess);
+    wrong = 0;
+    for (unsigned v : h) wrong += v != 2;
+    expect("doubled by the kernel cuModuleLoad loaded: 2", wrong == 0);
+    CUmodule missing = nullptr;
+    expect("a file that is not there is CUDA_ERROR_FILE_NOT_FOUND", cuModuleLoad(&missing, "/nonexistent/k.ptx") == CUDA_ERROR_FILE_NOT_FOUND);
+    unlink(path);
+  }
   expect("cudaFree of runtime memory", cudaFree(a) == cudaSuccess);
   expect("cuMemFree of driver memory", cuMemFree(b) == CUDA_SUCCESS);
 
