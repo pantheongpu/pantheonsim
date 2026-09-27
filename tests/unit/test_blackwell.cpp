@@ -1658,4 +1658,217 @@ WAIT:
     }
 }
 
+// ---- TMA's packed sub-byte types --------------------------------------------------
+
+namespace {
+// Values packed contiguously, value i at bit bits * i (5.5.1.1: "packed
+// contiguously in the global memory").
+std::vector<uint8_t> pack_bits(const std::vector<uint8_t>& v, int bits) {
+  std::vector<uint8_t> out((v.size() * bits + 7) / 8, 0);
+  for (size_t i = 0; i < v.size(); ++i)
+    for (int b = 0; b < bits; ++b)
+      if (v[i] >> b & 1) out[(i * bits + b) / 8] |= static_cast<uint8_t>(1u << ((i * bits + b) % 8));
+  return out;
+}
+
+// One 2D tensor load or store through `map` at {x, y}: shared memory (1024
+// bytes, 128-byte swizzle aligned) starts as `smem`, the load expects `tx`
+// bytes, and the tile afterwards is returned.
+std::vector<uint8_t> tma_packed(MemoryManager& mem, const std::vector<uint8_t>& map, bool load, uint32_t x,
+                                uint32_t y, uint32_t tx, const std::vector<uint8_t>& smem) {
+  const uint64_t in = mem.alloc(1024), out = mem.alloc(1024);
+  std::vector<uint8_t> init(1024, 0xEE);
+  std::copy(smem.begin(), smem.end(), init.begin());
+  mem.write(in, init.data(), init.size());
+  const std::string copy =
+      load ? "@%p1 cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%r1], [%rd3, {%r4, %r5}], [%r2];\n"
+             "WAIT:\n    mbarrier.try_wait.parity.shared::cta.b64 %p2, [%r2], 0;\n    @!%p2 bra WAIT;\n"
+           : "fence.proxy.async.shared::cta;\n    bar.sync 0;\n"
+             "    @%p1 cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%rd3, {%r4, %r5}], [%r1];\n"
+             "    @%p1 cp.async.bulk.commit_group;\n    @%p1 cp.async.bulk.wait_group 0;\n";
+  const std::string ptx = std::string(kHeader100a) + R"(
+.visible .entry k(.param .align 64 .b8 m[128], .param .u64 pin, .param .u64 pout, .param .u32 px, .param .u32 py, .param .u32 ptx)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<12>;
+    .shared .align 1024 .b8 tile[1024];
+    .shared .align 8 .b64 bar;
+    ld.param.u64 %rd1, [pin];
+    ld.param.u64 %rd8, [pout];
+    ld.param.u32 %r4, [px];
+    ld.param.u32 %r5, [py];
+    ld.param.u32 %r6, [ptx];
+    mov.b64 %rd2, m;
+    cvta.param.u64 %rd3, %rd2;
+    mov.u32 %r1, tile;
+    mov.u32 %r2, bar;
+    mov.u32 %r3, %tid.x;
+    shl.b32 %r7, %r3, 3;
+    add.u32 %r8, %r1, %r7;
+    cvt.u64.u32 %rd4, %r7;
+    add.u64 %rd5, %rd1, %rd4;
+    ld.global.u64 %rd6, [%rd5];
+    st.shared.u64 [%r8], %rd6;
+    setp.eq.u32 %p1, %r3, 0;
+    @%p1 mbarrier.init.shared::cta.b64 [%r2], 1;
+    bar.sync 0;
+    @%p1 mbarrier.arrive.expect_tx.shared::cta.b64 _, [%r2], %r6;
+    )" + copy + R"(
+    bar.sync 0;
+    ld.shared.u64 %rd6, [%r8];
+    add.u64 %rd9, %rd8, %rd4;
+    st.global.u64 [%rd9], %rd6;
+    ret;
+}
+)";
+  LaunchConfig cfg;
+  cfg.block = {128, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg,
+               {map, arg_u64(in), arg_u64(out), arg_u32(x), arg_u32(y), arg_u32(load ? tx : 0)}, mem,
+               load_gpu("nvidia/b200"));
+  std::vector<uint8_t> tile(1024);
+  mem.read(out, tile.data(), tile.size());
+  return tile;
+}
+
+uint8_t six(int x, int y) { return static_cast<uint8_t>((x * 7 + y * 13 + 5) & 63); }
+}  // namespace
+
+// cuTensorMapEncodeTiled's rules for the packed types, from cuda.h.
+VTEST(tma_packed_types_encoder_rules) {
+  alignas(64) uint8_t buf[128];
+  std::string why;
+  const unsigned long long dims[2] = {256, 4}, strides[1] = {192};
+  const unsigned box[2] = {128, 2}, es[2] = {1, 1};
+  auto enc = [&](unsigned type, uint64_t addr, const unsigned long long* d, const unsigned long long* st,
+                 const unsigned* b, unsigned swizzle) {
+    return exec::encode_tiled(buf, type, 2, reinterpret_cast<void*>(addr), d, st, b, es, 0, swizzle, 0, 0, &why);
+  };
+  VCHECK(enc(15, 0x10000, dims, strides, box, 3) == exec::TmapResult::Ok);
+  exec::TensorMap m;
+  VCHECK(m.decode(buf));
+  VCHECK(m.type == exec::TmapType::U6x16Align16);
+  VCHECK(enc(15, 0x10010, dims, strides, box, 3) == exec::TmapResult::Invalid);
+  VCHECK_CONTAINS(why, "32-byte aligned");
+  const unsigned long long odd_dims[2] = {192, 4};
+  VCHECK(enc(15, 0x10000, odd_dims, strides, box, 3) == exec::TmapResult::Invalid);
+  VCHECK_CONTAINS(why, "multiple of 128");
+  const unsigned small_box[2] = {64, 2};
+  VCHECK(enc(14, 0x10000, dims, strides, small_box, 0) == exec::TmapResult::Invalid);
+  VCHECK_CONTAINS(why, "boxDim[0] must be 128");
+  const unsigned long long stride48[1] = {208};
+  VCHECK(enc(15, 0x10000, dims, stride48, box, 0) == exec::TmapResult::Invalid);
+  VCHECK_CONTAINS(why, "multiples of 32");
+  VCHECK(enc(15, 0x10000, dims, strides, box, 1) == exec::TmapResult::Invalid);   // 32B swizzle
+  VCHECK_CONTAINS(why, "swizzle mode");
+  VCHECK(enc(14, 0x10000, dims, strides, box, 6) == exec::TmapResult::Invalid);   // 16U4_ALIGN16B, ATOM_64B
+  VCHECK(enc(15, 0x10000, dims, strides, box, 6) == exec::TmapResult::Ok);        // 16U6 stores may use it
+  const unsigned long long d13[2] = {63, 4}, s13[1] = {32};
+  const unsigned b13[2] = {32, 1};
+  VCHECK(enc(13, 0x10000, d13, s13, b13, 0) == exec::TmapResult::Invalid);
+  VCHECK_CONTAINS(why, "multiple of 2");
+  const unsigned b13_16[2] = {16, 1};   // eight bytes: not a multiple of 16
+  const unsigned long long d64[2] = {64, 4};
+  VCHECK(enc(13, 0x10000, d64, s13, b13_16, 0) == exec::TmapResult::Invalid);
+  VCHECK_CONTAINS(why, "multiple of 16 bytes");
+  VCHECK(exec::encode_tiled(buf, 15, 2, reinterpret_cast<void*>(0x10000), dims, strides, box, es, 0, 3, 0, 1, &why) ==
+         exec::TmapResult::Invalid);
+  VCHECK_CONTAINS(why, "NaN out-of-bounds fill");
+}
+
+// .b6x16_p32 load with the 128-byte swizzle: each 16 values' 12 packed bytes
+// open a 16-byte slot, the other 4 bytes left as they were.
+VTEST(tma_load_b6x16_p32_pads_each_group) {
+  MemoryManager mem{1 << 20};
+  const int W = 256, H = 4;
+  std::vector<uint8_t> vals(W * H);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) vals[size_t(y) * W + x] = six(x, y);
+  const std::vector<uint8_t> packed = pack_bits(vals, 6);   // 192 bytes a row
+  const uint64_t raw = mem.alloc(packed.size() + 64), g = (raw + 31) / 32 * 32;
+  mem.write(g, packed.data(), packed.size());
+  alignas(64) uint8_t buf[128];
+  std::string why;
+  const unsigned long long dims[2] = {W, H}, strides[1] = {W * 6 / 8};
+  const unsigned box[2] = {128, 2}, es[2] = {1, 1};
+  VCHECK(exec::encode_tiled(buf, 15, 2, reinterpret_cast<void*>(g), dims, strides, box, es, 0, 3, 0, 0, &why) ==
+         exec::TmapResult::Ok);
+  const auto tile = tma_packed(mem, std::vector<uint8_t>(buf, buf + 128), true, 128, 1, 16 * 16, {});
+  for (int grp = 0; grp < 16; ++grp) {
+    const int y = 1 + grp / 8, x0 = 128 + 16 * (grp % 8);
+    std::vector<uint8_t> v(vals.begin() + y * W + x0, vals.begin() + y * W + x0 + 16);
+    const std::vector<uint8_t> want = pack_bits(v, 6);
+    const uint32_t off = grp * 16, at = off ^ (((off >> 7) & 7) << 4);
+    for (int b = 0; b < 16; ++b) VCHECK_EQ(int(tile[at + b]), b < 12 ? int(want[b]) : 0xEE);
+  }
+  for (size_t b = 256; b < tile.size(); ++b) VCHECK_EQ(int(tile[b]), 0xEE);
+}
+
+// .b4x16: sixteen values in eight bytes, copied as they are; a group past the
+// tensor's edge reads as zeros.
+VTEST(tma_load_b4x16_copies_packed_groups) {
+  MemoryManager mem{1 << 20};
+  const int W = 64, H = 2;
+  std::vector<uint8_t> vals(W * H);
+  for (int i = 0; i < W * H; ++i) vals[i] = static_cast<uint8_t>((i * 5 + 3) & 15);
+  const std::vector<uint8_t> packed = pack_bits(vals, 4);   // 32 bytes a row
+  const uint64_t g = mem.alloc(packed.size());
+  mem.write(g, packed.data(), packed.size());
+  alignas(64) uint8_t buf[128];
+  std::string why;
+  const unsigned long long dims[2] = {W, H}, strides[1] = {32};
+  const unsigned box[2] = {32, 2}, es[2] = {1, 1};
+  VCHECK(exec::encode_tiled(buf, 13, 2, reinterpret_cast<void*>(g), dims, strides, box, es, 0, 0, 0, 0, &why) ==
+         exec::TmapResult::Ok);
+  const auto tile = tma_packed(mem, std::vector<uint8_t>(buf, buf + 128), true, 48, 0, 4 * 8, {});
+  for (int grp = 0; grp < 4; ++grp) {
+    const int y = grp / 2, x0 = 48 + 16 * (grp % 2);
+    for (int b = 0; b < 8; ++b) {
+      const int want = x0 >= W ? 0 : packed[size_t(y) * 32 + x0 / 2 + b];
+      VCHECK_EQ(int(tile[grp * 8 + b]), want);
+    }
+  }
+  VCHECK_EQ(int(tile[32]), 0xEE);
+}
+
+// A store of type 15 is .b6p2x16: sixteen bytes, each value in bits 0-5 and
+// bits 6-7 dropped, packed into twelve.
+VTEST(tma_store_b6p2x16_packs_the_low_six_bits) {
+  MemoryManager mem{1 << 20};
+  const int W = 128;
+  const uint64_t raw = mem.alloc(256), g = (raw + 31) / 32 * 32;
+  std::vector<uint8_t> zero(96, 0);
+  mem.write(g, zero.data(), zero.size());
+  alignas(64) uint8_t buf[128];
+  std::string why;
+  const unsigned long long dims[2] = {W, 1}, strides[1] = {96};
+  const unsigned box[2] = {128, 1}, es[2] = {1, 1};
+  VCHECK(exec::encode_tiled(buf, 15, 2, reinterpret_cast<void*>(g), dims, strides, box, es, 0, 0, 0, 0, &why) ==
+         exec::TmapResult::Ok);
+  std::vector<uint8_t> smem(128), vals(128);
+  for (int i = 0; i < 128; ++i) {
+    vals[i] = six(i, 3);
+    smem[i] = static_cast<uint8_t>(vals[i] | ((i % 4) << 6));
+  }
+  tma_packed(mem, std::vector<uint8_t>(buf, buf + 128), false, 0, 0, 0, smem);
+  std::vector<uint8_t> got(96);
+  mem.read(g, got.data(), got.size());
+  VCHECK(got == pack_bits(vals, 6));
+}
+
+VTEST(tma_packed_types_refuse_what_the_isa_rules_out) {
+  MemoryManager mem{1 << 20};
+  const uint64_t raw = mem.alloc(1024), g = (raw + 31) / 32 * 32;
+  alignas(64) uint8_t buf[128];
+  std::string why;
+  const unsigned long long dims[2] = {256, 2}, strides[1] = {128};
+  const unsigned box[2] = {128, 1}, es[2] = {1, 1};
+  VCHECK(exec::encode_tiled(buf, 14, 2, reinterpret_cast<void*>(g), dims, strides, box, es, 0, 0, 0, 0, &why) ==
+         exec::TmapResult::Ok);
+  const std::vector<uint8_t> map(buf, buf + 128);
+  VCHECK_CONTAINS(VCAPTURE(Error, tma_packed(mem, map, true, 64, 0, 128, {})).message(), "multiple of 128");
+  VCHECK_CONTAINS(VCAPTURE(Error, tma_packed(mem, map, false, 0, 0, 0, {})).message(), ".b4x16_p64");
+}
+
 VTEST_MAIN

@@ -794,8 +794,8 @@ narrows what counts as observable, not what the detector looks at.
   stride shifted right by 4 before that, so the module's `.version` decides.
   A value no map from `cuTensorMapEncodeTiled` could hold (a box past 256, a
   traversal stride of 0) is refused rather than carried into a copy, and
-  the Blackwell-only values (packed 4/6-bit types, the 96B swizzle, the
-  32B-with-8B-flip atomicity) are refused by name. Checked by unit tests (each field read
+  the Blackwell-only 96B swizzle and 32B-with-8B-flip atomicity are refused
+  by name. (Blackwell's packed 4/6-bit types are done: nvidia/docs/blackwell.md.) Checked by unit tests (each field read
   back by the host's decoder; the ISA's 9 is f64 where the driver's 9 is
   bf16; a retargeted map loaded through under PTX 8.3 and 8.5; each confirmed
   to fail with the rule it covers broken), and by a CuTe program
@@ -826,10 +826,13 @@ narrows what counts as observable, not what the detector looks at.
   (128 lanes x 512 columns per CTA) allocated with `tcgen05.alloc`/`dealloc`
   -- for a CTA pair with `.cta_group::2` -- and checked for leaks at exit;
   `tcgen05.ld`/`st` in all five shapes with pack/unpack, each warp kept to
-  its quarter of the lanes; `tcgen05.mma` for `.kind::f16`, `tf32`, the
-  8-bit `f8f6f4` types and `i8`, one CTA (M = 64/128) or a pair (M =
-  128/256), A from shared or Tensor Memory, with the data-path layouts of
-  figures 211-222; `tcgen05.commit` (multicast too), the fences and waits.
+  its quarter of the lanes; `tcgen05.mma` for `.kind::f16`, `tf32`,
+  `f8f6f4` (the 8-, 6- and 4-bit types) and `i8`, and block-scaled
+  (`mxf8f6f4`, `mxf4`, `mxf4nvf4`, UE8M0 and UE4M3 factors from Tensor
+  Memory), one CTA (M = 64/128) or a pair (M = 128/256), A from shared or
+  Tensor Memory, with the data-path layouts of figures 211-222;
+  `tcgen05.cp` (the 128- and 32-row shapes, `.warpx4`); `tcgen05.commit`
+  (multicast too), the fences and waits.
   Around it: cluster launch control (`try_cancel` takes over clusters that
   have not started, so CUTLASS's persistent loop really loops), `.b128`
   registers, TMA's `.cta_group::2` and `.tile::gather4`/`scatter4`, and the
@@ -840,8 +843,9 @@ narrows what counts as observable, not what the detector looks at.
   tables, every kind and layout against a host GEMM, the pair layouts, the
   launch-control takeover, TMA through the peer bit) and by CUTLASS's own
   SM100 GEMM tests (f16 1-SM, 2-SM and stream-K, f8, s8), unmodified,
-  against its host reference. Sparse, weight-stationary and block-scaled
-  MMAs, `tcgen05.cp`/`shift` and the 4/6-bit types are refused by name.
+  against its host reference. Sparse and weight-stationary MMAs,
+  `tcgen05.shift`, and `tcgen05.cp`'s `.warpx2` and decompression are
+  refused by name.
   See nvidia/docs/blackwell.md.
 
 - The CTA's sixteen barriers (PTX ISA 9.7.15.1): `bar.sync` and
@@ -914,8 +918,8 @@ what is done.
   nvidia/docs/blackwell.md), attribute
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle's 8-byte-flip
-  variant (Blackwell); tcgen05's sparse, weight-stationary and block-scaled
-  MMAs, `tcgen05.cp`/`shift` and its 4/6-bit types; the sparse and
+  variant (Blackwell); tcgen05's sparse and weight-stationary MMAs,
+  `tcgen05.shift` and `tcgen05.cp`'s `.warpx2` and decompression; the sparse and
   single-bit `wgmma` forms, and inline-asm-only instructions. (`wgmma`, TMA,
   the mbarrier transaction counts, `barrier.cluster` and distributed shared
   memory are done -- see "Hopper's warpgroup MMA", "TMA and clusters" and

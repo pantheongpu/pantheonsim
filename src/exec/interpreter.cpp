@@ -7787,8 +7787,14 @@ class Interpreter {
               TmapType::U8,  TmapType::U16,    TmapType::U32, TmapType::S32,  TmapType::U64,
               TmapType::S64, TmapType::F16,    TmapType::F32, TmapType::F32Ftz, TmapType::F64,
               TmapType::BF16, TmapType::TF32, TmapType::TF32Ftz};
-          if (v >= 13 && v <= 15) refused("the packed 4- and 6-bit element types are Blackwell's");
+          static_assert(sizeof types / sizeof types[0] == 13);
+          // 13-15 are .b4x16, .b4x16_p64 and .b6x16_p32 / .b6p2x16.
           if (v > 15) bad("element type " + std::to_string(v) + " is not in the ISA's table");
+          if (v >= 13) {
+            t.type = v == 13 ? TmapType::U4x16Align8 : v == 14 ? TmapType::U4x16Align16 : TmapType::U6x16Align16;
+            t.stride[0] = 0;
+            break;
+          }
           t.type = types[v];
           t.stride[0] = exec::TensorMap::type_bytes(t.type);
           break;
@@ -8089,12 +8095,47 @@ class Interpreter {
           }
         }
       } else {
-        const exec::TensorMap map = read_tensor_map(w, ctx, ins, lane, tmap_v[lane]);
+        exec::TensorMap map = read_tensor_map(w, ctx, ins, lane, tmap_v[lane]);
         if (map.rank != op.dims)
           ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
                    "a ." + std::to_string(op.dims) + "d tensor copy through a rank-" +
                        std::to_string(map.rank) + " tensor map");
-        const uint32_t es = static_cast<uint32_t>(map.stride[0]);
+        // The packed sub-byte types (5.5.1.1) are copied sixteen values at a
+        // time: `gs` bytes of global memory to an `es`-byte slot of shared
+        // memory, so dimension 0 is counted in groups here. A load leaves a
+        // slot's padding as it was ("un-initialized"); a store of type 15 is
+        // .b6p2x16, sixteen bytes each holding a value in bits 0-5, packed
+        // into twelve.
+        uint32_t gs = 0, packed_es = 0;
+        const bool packed = exec::TensorMap::packed_group(map.type, &gs, &packed_es);
+        if (packed) {
+          const bool padded = packed_es == 16;
+          if (map.im2col)
+            ctx_fail(ins, li, Err::UnsupportedPtx, "an im2col copy of a packed sub-byte type is not implemented");
+          if (op.reduce)
+            ctx_fail(ins, li, Err::InvalidValue,
+                     "cp.reduce.async.bulk does not support the packed sub-byte types (9.7.10.28.5.1)");
+          if (!op.to_shared && map.type == exec::TmapType::U4x16Align16)
+            ctx_fail(ins, li, Err::InvalidValue,
+                     "a tensor store (.global.shared::cta) does not support .b4x16_p64 (9.7.10.28.5.1)");
+          if (op.to_shared && map.swizzle == exec::TmapSwizzle::B128Atom64 && padded)
+            ctx_fail(ins, li, Err::InvalidValue,
+                     "the 128-byte swizzle in 64-byte atoms is for stores only with a padded sub-byte type");
+          const int64_t c0 = static_cast<int32_t>(static_cast<uint32_t>(coords[0][lane]));
+          if (padded ? c0 % 128 : c0 % 16)
+            ctx_fail(ins, li, padded ? Err::InvalidValue : Err::UnsupportedPtx,
+                     padded ? "the first coordinate of a .b4x16_p64 or .b6x16_p32 copy must be a multiple "
+                              "of 128 (9.7.10.28.5.1)"
+                            : "a .b4x16 copy whose first coordinate is not a multiple of 16 is not implemented");
+          if (map.dim[0] % 16 || map.box[0] % 16)
+            ctx_fail(ins, li, Err::UnsupportedPtx,
+                     "a packed sub-byte tensor whose dimension 0 or box is not whole groups of 16 values");
+          map.dim[0] /= 16;
+          map.box[0] /= 16;
+          map.stride[0] = gs;
+        }
+        const uint32_t es = packed ? packed_es : static_cast<uint32_t>(map.stride[0]);
+        if (!packed) gs = es;
         const uint32_t swz = exec::TensorMap::swizzle_bytes(map.swizzle);
         std::optional<Type> red_ty;
         if (op.reduce) {
@@ -8139,12 +8180,13 @@ class Interpreter {
         std::array<int64_t, 5> start{};
         for (uint32_t d = 0; d < map.rank; ++d)
           start[d] = static_cast<int32_t>(static_cast<uint32_t>(coords[d][lane]));
+        if (packed) start[0] /= 16;
         const uint32_t nsp = map.rank >= 2 ? map.rank - 2 : 0;   // im2col's spatial dimensions
         std::array<int64_t, 3> off{};
         for (uint32_t i = 0; i < op.im2col_offsets.size() && i < 3; ++i)
           off[i] = static_cast<uint16_t>(im2col_off[i][lane]);
         std::array<int64_t, 5> pix = start;   // im2col: the pixel being read, in [1, rank-1]
-        if (op.to_shared) pb.data.resize(total * es);
+        if (op.to_shared) pb.data.resize(total * gs);
         std::array<uint64_t, 5> j{};
         for (uint64_t e = 0; e < total; ++e) {
           bool inside = true;
@@ -8168,7 +8210,17 @@ class Interpreter {
           // Shared position: the box packed densely, then swizzled by
           // address the same way wgmma reads it back.
           const uint64_t soff = exec::swizzle_address(smem + e * es, swz, exec::TensorMap::swizzle_atom(map.swizzle));
-          if (op.to_shared) {
+          if (op.to_shared && packed) {
+            // Outside the tensor the group reads as zeros, like any element.
+            if (inside) {
+              try {
+                mem_.read(gaddr, pb.data.data() + e * gs, gs);
+              } catch (const Error& ex) {
+                rethrow_with_context(ex, ins, static_cast<int>(lane));
+              }
+            }
+            add_run(soff, gs);
+          } else if (op.to_shared) {
             uint64_t v = 0;
             if (inside) {
               try {
@@ -8184,6 +8236,24 @@ class Interpreter {
             }
             std::memcpy(pb.data.data() + e * es, &v, es);
             add_run(soff, es);
+          } else if (inside && packed) {
+            if (soff + es > shared_size)
+              ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                       "a bulk tensor store reads past the block's shared memory");
+            const uint8_t* src = ctx.shared->data() + soff;
+            uint8_t out[16] = {};
+            if (map.type == exec::TmapType::U6x16Align16) {
+              for (int i = 0; i < 16; ++i)
+                for (int b = 0; b < 6; ++b)
+                  if (src[i] >> b & 1) out[(6 * i + b) / 8] |= static_cast<uint8_t>(1u << ((6 * i + b) % 8));
+            } else {
+              std::memcpy(out, src, gs);
+            }
+            try {
+              mem_.write(gaddr, out, gs);
+            } catch (const Error& ex) {
+              rethrow_with_context(ex, ins, static_cast<int>(lane));
+            }
           } else if (inside) {
             // A store writes only the elements inside the tensor.
             if (soff + es > shared_size)

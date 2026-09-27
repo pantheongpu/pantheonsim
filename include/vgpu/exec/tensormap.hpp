@@ -145,6 +145,18 @@ struct TensorMap {
       default: return 0;
     }
   }
+  // The packed sub-byte types move sixteen values at a time (PTX ISA
+  // 5.5.1.1, cuda.h): `global` bytes of them packed in global memory, and in
+  // shared memory `shared` bytes -- the same eight for .b4x16, padded to 16
+  // for .b4x16_p64 and .b6x16_p32. False for every other type.
+  static bool packed_group(TmapType t, uint32_t* global, uint32_t* shared) {
+    switch (t) {
+      case TmapType::U4x16Align8: *global = 8; *shared = 8; return true;
+      case TmapType::U4x16Align16: *global = 8; *shared = 16; return true;
+      case TmapType::U6x16Align16: *global = 12; *shared = 16; return true;
+      default: return false;
+    }
+  }
   static uint32_t swizzle_atom(TmapSwizzle s) {
     return s == TmapSwizzle::B128Atom32 ? 32 : s == TmapSwizzle::B128Atom64 ? 64 : 16;
   }
@@ -184,11 +196,32 @@ inline TmapResult encode_tiled(void* tensorMap, unsigned dataType, unsigned rank
     return bad("an enum argument is out of range");
   const auto type = static_cast<TmapType>(dataType);
   const uint32_t esize = TensorMap::type_bytes(type);
-  if (esize == 0) return unsupported("the packed sub-byte types (16U4, 16U6)");
+  uint32_t group_global = 0, group_shared = 0;
+  const bool packed = TensorMap::packed_group(type, &group_global, &group_shared);
+  const bool padded = packed && group_shared == 16;   // 16U4_ALIGN16B, 16U6_ALIGN16B
   if (interleave != 0) return unsupported("an interleaved layout (NC/8HWC8, NC/16HWC16)");
   if (swizzle == 5) return unsupported("CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B");
   const uint64_t addr = reinterpret_cast<uint64_t>(globalAddress);
   if (addr % 16) return bad("globalAddress must be 16-byte aligned");
+  // The packed types' own rules (cuda.h, cuTensorMapEncodeTiled).
+  if (padded) {
+    if (addr % 32) return bad("a 16U4_ALIGN16B or 16U6_ALIGN16B tensor's globalAddress must be 32-byte aligned");
+    if (globalDim[0] % 128) return bad("a 16U4_ALIGN16B or 16U6_ALIGN16B tensor's globalDim[0] must be a multiple of 128");
+    if (boxDim[0] != 128) return bad("a 16U4_ALIGN16B or 16U6_ALIGN16B tensor's boxDim[0] must be 128");
+    for (unsigned i = 0; i + 1 < rank; ++i)
+      if (globalStrides[i] % 32)
+        return bad("a 16U4_ALIGN16B or 16U6_ALIGN16B tensor's strides must be multiples of 32");
+    // 16U6: none, 128B, 128B_ATOM_32B, and 128B_ATOM_64B for stores;
+    // 16U4_ALIGN16B: none, 128B and 128B_ATOM_32B, loads only.
+    const bool ok = swizzle == 0 || swizzle == 3 || swizzle == 4 ||
+                    (type == TmapType::U6x16Align16 && swizzle == 6);
+    if (!ok) return bad("this swizzle mode is not one cuda.h allows for a 16U4_ALIGN16B or 16U6_ALIGN16B tensor");
+  } else if (packed) {
+    if (globalDim[0] % 2) return bad("a 16U4_ALIGN8B tensor's globalDim[0] must be a multiple of 2");
+    // A group of sixteen straddling the tensor's edge is not described.
+    if (globalDim[0] % 16) return unsupported("a 16U4_ALIGN8B tensor whose globalDim[0] is not a multiple of 16");
+  }
+  if (packed && oobFill) return bad("the NaN out-of-bounds fill is not available for the packed types");
   TensorMap m;
   m.address = addr;
   m.rank = rank;
@@ -217,11 +250,18 @@ inline TmapResult encode_tiled(void* tensorMap, unsigned dataType, unsigned rank
       return bad("globalStrides[" + std::to_string(i) + "] must be a multiple of 16 below 2^40");
     m.stride[i + 1] = globalStrides[i];
   }
-  if (uint64_t{boxDim[0]} * esize % 16)
+  // The box's inner dimension in bytes: of global memory for the rule on
+  // 16-byte multiples, of shared memory against the swizzle span. (A
+  // 16U4_ALIGN8B box is sixteen values to eight bytes, and in groups of
+  // sixteen.)
+  if (packed && boxDim[0] % 16) return bad("a packed type's boxDim[0] must be a multiple of 16 values");
+  const uint64_t inner_global = packed ? uint64_t{boxDim[0]} / 16 * group_global : uint64_t{boxDim[0]} * esize;
+  const uint64_t inner_shared = packed ? uint64_t{boxDim[0]} / 16 * group_shared : inner_global;
+  if (!padded && inner_global % 16)
     return bad("boxDim[0] times the element size must be a multiple of 16 bytes");
   const uint32_t swz = TensorMap::swizzle_bytes(m.swizzle);
-  if (swz && uint64_t{boxDim[0]} * esize > swz)
-    return bad("the box's inner dimension (" + std::to_string(uint64_t{boxDim[0]} * esize) +
+  if (swz && inner_shared > swz)
+    return bad("the box's inner dimension (" + std::to_string(inner_shared) +
                " bytes) is wider than the " + std::to_string(swz) + "-byte swizzle");
   m.encode(tensorMap);
   return TmapResult::Ok;
