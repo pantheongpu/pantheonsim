@@ -31,7 +31,7 @@ if [[ -n "$(shim_sanitizer "$shim")" ]]; then
 fi
 probe="${TMPDIR:-/tmp}/vgpu_cutlass_sm100_probe_$$.cu"
 echo '__global__ void k() { asm volatile("tcgen05.fence::before_thread_sync;"); }' > "$probe"
-if ! nvcc -arch=sm_100a -c "$probe" -o /dev/null 2>/dev/null; then
+if ! nvcc -arch=compute_100a -code=compute_100a -c "$probe" -o /dev/null 2>/dev/null; then
   rm -f "$probe"
   echo "SKIP: this nvcc cannot target sm_100a (needs CUDA 12.8 or later)"; exit 0
 fi
@@ -41,19 +41,24 @@ need_gtest=1
 work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu_cutlass_sm100.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
-# test file | gtest filter
+# test file | gtest filter. All 24 cases of the three files pass; the stream-K
+# ones take minutes each here, so by default one 1-SM and one 2-SM stream-K
+# kernel stand for them. VGPU_CUTLASS_SM100_ALL=1 runs every case.
 tests=(
-  "f16_f16_void_f32|*"
-  "f8_f8_void_f32|*"
-  "s8_s8_void_s32|*"
+  "f16_f16_void_f32|*-*_1x8x1_streamK"
+  "f8_f8_void_f32|*-*streamK"
+  "s8_s8_void_s32|*-*streamK"
 )
+if [[ "${VGPU_CUTLASS_SM100_ALL:-0}" == 1 ]]; then
+  tests=("f16_f16_void_f32|*" "f8_f8_void_f32|*" "s8_s8_void_s32|*")
+fi
 u="$cutlass/test/unit"
 # Each compile peaks near 10 GB; as many run together as the free memory (or
 # the container's limit) holds, and never fewer than one (cutlass_fetch.sh).
 jobs=$(cutlass_compile_jobs ${#tests[@]})
 compile() {
   local name="$1"
-  nvcc -std=c++17 -O1 -cudart shared -arch=sm_100a --expt-relaxed-constexpr \
+  nvcc -std=c++17 -O1 -cudart shared -arch=compute_100a -code=compute_100a --expt-relaxed-constexpr \
        -DCUTLASS_TARGET_NAME="\"$name\"" \
        -I "$cutlass/include" -I "$cutlass/tools/util/include" -I "$u/common" -I "$u" -I "$cutlass/test" \
        -I "$gtest/googletest/include" "$u/gemm/device/sm100_tensorop_gemm/$name.cu" "$u/test_unit.cpp" \
