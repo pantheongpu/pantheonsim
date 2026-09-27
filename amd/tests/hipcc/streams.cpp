@@ -56,6 +56,10 @@ __global__ void fault() { *reinterpret_cast<volatile int*>(0x10) = 1; }
 void set_flag(void* p) { *static_cast<int*>(p) = 7; }
 
 int main() {
+  // Each line out as it is printed: the last check is a kernel that faults,
+  // which ROCm's own HIP answers by ending the program, and a buffer still
+  // held then would take every earlier result with it.
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
   int* dev;
   CHECK(hipMalloc(&dev, 64 * sizeof(int)));
   CHECK(hipMemset(dev, 0, 64 * sizeof(int)));
