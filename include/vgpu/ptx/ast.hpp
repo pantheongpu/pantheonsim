@@ -473,6 +473,10 @@ struct OpBulkCopy {
   // pixel it starts from; stores and reductions take .im2col_no_offs.
   bool im2col = false;
   std::vector<Operand> im2col_offsets;
+  // .tile::gather4 (loads) / .tile::scatter4 (stores), sm_100: four rows of
+  // a 2D tensor, at x = coords[0] and y = coords[1..4], packed one after
+  // another in shared memory.
+  bool four_rows = false;
 };
 // tensormap.replace (sm_90a): one field of a 128-byte tensor map in global or
 // shared memory rewritten in place, as CUTLASS's grouped GEMMs retarget a map

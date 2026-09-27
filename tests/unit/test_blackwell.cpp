@@ -1183,4 +1183,93 @@ WAITED:
   }
 }
 
+// .tile::gather4 / .tile::scatter4 (5.5.3.4): four rows of a 2D tensor at one
+// x, packed in shared memory one after another; the store puts them back as
+// four rows elsewhere.
+VTEST(tma_gather4_and_scatter4_move_four_rows) {
+  MemoryManager mem{1 << 20};
+  constexpr int W = 16, H = 10;
+  const uint64_t src = mem.alloc(W * H * 4), dst = mem.alloc(W * H * 4), out = mem.alloc(32 * 4);
+  std::vector<uint32_t> zero(W * H, 0);
+  mem.write(dst, zero.data(), zero.size() * 4);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) mem.store_scalar(src + uint64_t(y * W + x) * 4, 4, uint64_t(y * 100 + x));
+  auto map_of = [](uint64_t a) {
+    exec::TensorMap t;
+    t.address = a;
+    t.rank = 2;
+    t.type = exec::TmapType::U32;
+    t.dim = {W, H, 1, 1, 1};
+    t.stride = {4, W * 4, 0, 0, 0};
+    t.box = {8, 1, 1, 1, 1};
+    t.elem_stride = {1, 1, 1, 1, 1};
+    std::vector<uint8_t> m(128);
+    t.encode(m.data());
+    return m;
+  };
+  const std::string ptx = std::string(kHeader100a) + R"(
+.visible .entry k(.param .align 64 .b8 ms[128], .param .align 64 .b8 md[128], .param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .shared .align 128 .b8 tile[128];
+    .shared .align 8 .b64 bar;
+    ld.param.u64 %rd1, [out];
+    mov.b64 %rd2, ms;
+    cvta.param.u64 %rd3, %rd2;
+    mov.b64 %rd4, md;
+    cvta.param.u64 %rd5, %rd4;
+    mov.u32 %r1, tile;
+    mov.u32 %r2, bar;
+    mov.u32 %r3, %tid.x;
+    setp.eq.u32 %p1, %r3, 0;
+    @%p1 mbarrier.init.shared::cta.b64 [%r2], 1;
+    @%p1 mbarrier.arrive.expect_tx.shared::cta.b64 _, [%r2], 128;
+    mov.u32 %r4, 2;
+    mov.u32 %r5, 3;
+    mov.u32 %r6, 0;
+    mov.u32 %r7, 7;
+    mov.u32 %r8, 5;
+    @%p1 cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4.mbarrier::complete_tx::bytes [%r1], [%rd3, {%r4, %r5, %r6, %r7, %r8}], [%r2];
+WAIT:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1, [%r2], 0;
+    @!%p1 bra WAIT;
+    shl.b32 %r9, %r3, 2;
+    add.u32 %r10, %r1, %r9;
+    ld.shared.u32 %r11, [%r10];
+    mul.wide.u32 %rd6, %r3, 4;
+    add.u64 %rd7, %rd1, %rd6;
+    st.global.u32 [%rd7], %r11;
+    bar.sync 0;
+    setp.eq.u32 %p1, %r3, 0;
+    mov.u32 %r4, 4;
+    mov.u32 %r5, 9;
+    mov.u32 %r6, 1;
+    mov.u32 %r7, 6;
+    mov.u32 %r8, 2;
+    @%p1 cp.async.bulk.tensor.2d.global.shared::cta.tile::scatter4.bulk_group [%rd5, {%r4, %r5, %r6, %r7, %r8}], [%r1];
+    @%p1 cp.async.bulk.commit_group;
+    @%p1 cp.async.bulk.wait_group 0;
+    ret;
+}
+)";
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {map_of(src), map_of(dst), arg_u64(out)}, mem,
+               load_gpu("nvidia/b200"));
+  const int rows[4] = {3, 0, 7, 5}, to[4] = {9, 1, 6, 2};
+  std::vector<uint32_t> got(32), d(W * H);
+  mem.read(out, got.data(), got.size() * 4);
+  mem.read(dst, d.data(), d.size() * 4);
+  for (int i = 0; i < 32; ++i) VCHECK_EQ(got[i], uint32_t(rows[i / 8] * 100 + 2 + i % 8));
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      uint32_t want = 0;
+      for (int r = 0; r < 4; ++r)
+        if (y == to[r] && x >= 4 && x < 12) want = uint32_t(rows[r] * 100 + 2 + (x - 4));
+      VCHECK_EQ(d[size_t(y) * W + x], want);
+    }
+}
+
 VTEST_MAIN
