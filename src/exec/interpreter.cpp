@@ -1889,6 +1889,15 @@ class Interpreter {
     return std::holds_alternative<ImmInt>(o) || std::holds_alternative<ImmFloatBits>(o);
   }
 
+  // A 64-bit register read in place, the common case of an f64 operand; any
+  // other operand takes read_operand.
+  const Lanes& read_wide(Warp& w, const BlockCtx& ctx, const Instr& ins, const Operand& o, Lanes& scratch) {
+    if (const auto* r = std::get_if<RegOperand>(&o);
+        r && r->reg.wide && r->reg.id < w.regs64.size() && w.written64[r->reg.id])
+      return w.regs64[r->reg.id];
+    return read_operand(w, ctx, ins, o, scratch);
+  }
+
   // Reads an operand as 32-bit lanes. Only valid when narrow_operand() holds.
   const Lanes32& read_narrow(Warp& w, const Instr& ins, const Operand& o, Lanes32& scratch) {
     if (const auto* r = std::get_if<RegOperand>(&o)) {
@@ -2816,9 +2825,9 @@ class Interpreter {
     }
     if (op.ty.bits != 64 || !op.dst.wide) return false;
     Lanes sa, sb, sc;
-    const Lanes& a = read_operand(w, ctx, ins, op.a, sa);
-    const Lanes& b = read_operand(w, ctx, ins, op.b, sb);
-    const Lanes& c = read_operand(w, ctx, ins, op.c, sc);
+    const Lanes& a = read_wide(w, ctx, ins, op.a, sa);
+    const Lanes& b = read_wide(w, ctx, ins, op.b, sb);
+    const Lanes& c = read_wide(w, ctx, ins, op.c, sc);
     uint64_t* d = dst64(w, op.dst.id, m);
 #if defined(__x86_64__) && defined(__GNUC__)
     if (g_hw_fma) {
