@@ -174,6 +174,11 @@ struct Wave {
   // The MODE hardware register, as a kernel reads and sets it: what its
   // descriptor asks for (Kernel::mode) to begin with. FloatMode applies it.
   uint32_t mode = 0xF0 | 1u << 8 | 1u << 9;
+  // gfx12's SCHED_MODE (hardware register 26): whether the hardware checks
+  // instruction dependencies or leaves them to the compiler ("expert" mode,
+  // which hipBLASLt's kernels set). Instructions here run one at a time in
+  // order either way, so it is kept only to be read back.
+  uint32_t sched_mode = 0;
   // VGPR indexing (s_set_gpr_idx_on): which operands are offset -- source
   // 0, 1, 2 and the destination, a bit each -- by M0's low byte. 0 is off.
   uint8_t gpr_idx = 0;
@@ -921,21 +926,30 @@ struct Machine {
     } else if (op == "s_ff1_i32_b64"_op) {
       // The first set bit, counting from bit 0, or -1 when there is none.
       write_scalar(w, in.dst[0], a ? static_cast<uint32_t>(__builtin_ctzll(a)) : 0xFFFFFFFFu);
-    } else if (op == "s_getreg_b32"_op || op == "s_setreg_imm32_b32"_op) {
+    } else if (op == "s_getreg_b32"_op || op == "s_setreg_imm32_b32"_op || op == "s_setreg_b32"_op) {
       // A field of a hardware register: the immediate's low six bits say
       // which register, the next five where the field starts, the top five
-      // how wide it is less one. MODE is kept per wave; HW_ID says which
-      // wave of the work-group this is; the rest are refused by name.
+      // how wide it is less one. MODE is kept per wave, and gfx12's SCHED_MODE;
+      // HW_ID says which wave of the work-group this is; the rest are refused
+      // by name.
       const uint32_t id = static_cast<uint32_t>(in.simm) & 0x3F, at = (static_cast<uint32_t>(in.simm) >> 6) & 0x1F,
                      width = ((static_cast<uint32_t>(in.simm) >> 11) & 0x1F) + 1;
       const uint32_t mask = (width >= 32 ? ~0u : (1u << width) - 1) << at;
-      if (op == "s_setreg_imm32_b32"_op) {
-        if (id != 1)
-          throw Error::make(Err::Unsupported, "s_setreg_imm32_b32 of hardware register ", id, ", which this does not model");
-        w.mode = (w.mode & ~mask) | ((static_cast<uint32_t>(in.src[0].value) << at) & mask);
+      const bool sched = id == 26 && in.arch == gcn::Target::Gfx1200;
+      if (op != "s_getreg_b32"_op) {
+        if (id != 1 && !sched)
+          throw Error::make(Err::Unsupported, op, " of hardware register ", id, ", which this does not model");
+        // The immediate form's value is its literal; the register form's is
+        // the scalar register the instruction names.
+        const uint32_t value = op == "s_setreg_imm32_b32"_op ? static_cast<uint32_t>(in.src[0].value)
+                               : !in.src.empty()             ? static_cast<uint32_t>(scalar(w, in.src[0]))
+                                                             : static_cast<uint32_t>(scalar(w, in.dst[0]));
+        uint32_t& reg = sched ? w.sched_mode : w.mode;
+        reg = (reg & ~mask) | ((value << at) & mask);
       } else {
         uint32_t reg;
         if (id == 1) reg = w.mode;
+        else if (sched) reg = w.sched_mode;
         else if (id == 4) reg = static_cast<uint32_t>(w.first_lane / w.lanes) & 0xF;   // HW_ID: the wave's slot
         else throw Error::make(Err::Unsupported, "s_getreg_b32 of hardware register ", id, ", which this does not model");
         write_scalar(w, in.dst[0], (reg & mask) >> at);

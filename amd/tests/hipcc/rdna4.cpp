@@ -9,6 +9,9 @@
 //     transcendentals into scalar registers (v_s_rcp_f32, v_s_sqrt_f32, ...).
 //   - The split barrier (s_barrier_signal / s_barrier_wait): waves hand values
 //     to one another through LDS.
+//   - SCHED_MODE (hardware register 26), which hipBLASLt's half and bfloat16
+//     GEMMs set to leave dependency checks to the compiler: written from an
+//     immediate and from a register, and read back.
 #include <hip/hip_runtime.h>
 
 #include <cmath>
@@ -120,6 +123,18 @@ __global__ void barrier_exchange(int* out) {
   lds[t] = t * 3 + 1;
   __syncthreads();
   out[t] = lds[(t + 96) % 256];
+}
+
+// SCHED_MODE's two bits, set to each value from an immediate and then from a
+// register, read back each time.
+__global__ void sched_mode(unsigned* out) {
+  unsigned v;
+  asm volatile("s_setreg_imm32_b32 hwreg(26, 0, 2), 2\n\ts_getreg_b32 %0, hwreg(26, 0, 2)" : "=s"(v));
+  out[0] = v;
+  asm volatile("s_setreg_b32 hwreg(26, 0, 2), %1\n\ts_getreg_b32 %0, hwreg(26, 0, 2)" : "=s"(v) : "s"(1u));
+  out[1] = v;
+  asm volatile("s_setreg_imm32_b32 hwreg(26, 0, 2), 0\n\ts_getreg_b32 %0, hwreg(26, 0, 2)" : "=s"(v));
+  out[2] = v;
 }
 
 int wrong = 0;
@@ -247,6 +262,14 @@ int main() {
     int bad2 = 0;
     for (int t = 0; t < 256; ++t) bad2 += out[t] != ((t + 96) % 256) * 3 + 1;
     report("the split barrier orders LDS between waves", bad2, 256);
+  }
+  {
+    unsigned out[3] = {9, 9, 9};
+    unsigned* dout = upload(out, 3);
+    sched_mode<<<1, 32>>>(dout);
+    CHECK(hipDeviceSynchronize());
+    download(out, dout, 3);
+    report("SCHED_MODE is set and read back", (out[0] != 2) + (out[1] != 1) + (out[2] != 0), 3);
   }
   std::printf("%s\n", wrong ? "FAIL" : "all RDNA4 checks right");
   return wrong != 0;
