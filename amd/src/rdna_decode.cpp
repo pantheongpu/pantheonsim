@@ -51,6 +51,12 @@ const std::vector<Row>& rows_rdna3() {
   };
   return rows;
 }
+const std::vector<Row>& rows_rdna2() {
+  static const std::vector<Row> rows = {
+#include "rdna_ops_rdna2.inc"
+  };
+  return rows;
+}
 const std::vector<Row>& rows_rdna4() {
   static const std::vector<Row> rows = {
 #include "rdna_ops_rdna4.inc"
@@ -58,15 +64,23 @@ const std::vector<Row>& rows_rdna4() {
   return rows;
 }
 
-// Which generation the instruction being decoded or printed is: RDNA3 (gfx11)
-// or RDNA4 (gfx12), whose numbering and memory encodings differ. Set for the
-// length of a decode or a to_text.
+// Which generation the instruction being decoded or printed is: RDNA2
+// (gfx10.3), RDNA3 (gfx11) or RDNA4 (gfx12), whose numbering and memory
+// encodings differ. Set for the length of a decode or a to_text.
 thread_local bool g_rdna4 = false;
+thread_local bool g_rdna2 = false;
 struct Generation {
-  bool saved;
-  explicit Generation(Target t) : saved(g_rdna4) { g_rdna4 = t == Target::Gfx1200; }
-  ~Generation() { g_rdna4 = saved; }
+  bool saved4, saved2;
+  explicit Generation(Target t) : saved4(g_rdna4), saved2(g_rdna2) {
+    g_rdna4 = t == Target::Gfx1200;
+    g_rdna2 = t == Target::Gfx1030;
+  }
+  ~Generation() {
+    g_rdna4 = saved4;
+    g_rdna2 = saved2;
+  }
 };
+const char* gen_name() { return g_rdna4 ? " (gfx12)" : g_rdna2 ? " (gfx10)" : " (gfx11)"; }
 
 struct Table {
   std::map<std::tuple<Enc, uint8_t, uint32_t>, const Row*> by_opcode;
@@ -100,14 +114,14 @@ Table make_table4() {
   return make_table(all);
 }
 const Table& table() {
-  static const Table t3 = make_table(rows_rdna3()), t4 = make_table4();
-  return g_rdna4 ? t4 : t3;
+  static const Table t2 = make_table(rows_rdna2()), t3 = make_table(rows_rdna3()), t4 = make_table4();
+  return g_rdna4 ? t4 : g_rdna2 ? t2 : t3;
 }
 const Row& row(Enc e, uint8_t segment, uint32_t opcode) {
   const auto& m = table().by_opcode;
   const auto it = m.find({e, segment, opcode});
   if (it == m.end())
-    throw Error::make(Err::Unsupported, enc_name(e), " opcode ", opcode, g_rdna4 ? " (gfx12)" : " (gfx11)",
+    throw Error::make(Err::Unsupported, enc_name(e), " opcode ", opcode, gen_name(),
                       " is not decoded yet");
   return *it->second;
 }
@@ -125,7 +139,25 @@ std::string exec_name(const std::string& name, Enc enc, bool dpp) {
   static const std::map<std::string, std::vector<std::string>> kAliases4 = {
 #include "rdna_ops_rdna4_aliases.inc"
   };
-  const auto& kAliases = g_rdna4 ? kAliases4 : kAliases3;
+  static const std::map<std::string, std::vector<std::string>> kAliases2 = {
+#include "rdna_ops_rdna2_aliases.inc"
+  };
+  const auto& kAliases = g_rdna4 ? kAliases4 : g_rdna2 ? kAliases2 : kAliases3;
+  // gfx10's own names for what gfx9 has only in 64 bits (s_andn2_saveexec_b32)
+  // the executor knows by gfx11's (s_and_not1_saveexec_b32), whose earlier
+  // names they are.
+  if (g_rdna2 && !known_gfx9_name(name) && !known_gfx9_name(name + "_e32")) {
+    static const std::map<std::string, std::string> kLater = [] {
+      std::map<std::string, std::string> m;
+      for (const auto& [later, earlier] : kAliases3)
+        for (const std::string& e : earlier) m.emplace(e, later);
+      return m;
+    }();
+    if (const auto it = kLater.find(name); it != kLater.end() && it->second != name) {
+      const Generation gfx11(Target::Gfx1100);
+      return exec_name(it->second, enc, dpp);
+    }
+  }
   static const std::map<std::string, std::string> kRenamed = {
       {"v_add_nc_u32", "v_add_u32"},         {"v_sub_nc_u32", "v_sub_u32"},
       {"v_subrev_nc_u32", "v_subrev_u32"},   {"v_add_co_ci_u32", "v_addc_co_u32"},
@@ -169,7 +201,8 @@ uint32_t bits(uint64_t v, uint32_t hi, uint32_t lo) { return static_cast<uint32_
 
 // gfx11's operand numbering: scalar registers, the special ones, the inline
 // constants and (256 up) the vector registers. It differs from gfx9's in the
-// middle: 124 is null (reads zero, writes vanish) and 125 is M0.
+// middle: 124 is null (reads zero, writes vanish) and 125 is M0. gfx10's
+// has them the other way round, as gfx9 has M0.
 Operand operand(uint32_t code, uint32_t width) {
   Operand o;
   o.width = width;
@@ -185,9 +218,9 @@ Operand operand(uint32_t code, uint32_t width) {
   } else if (code >= 108 && code <= 123) {
     o.kind = OperandKind::Ttmp;
     o.index = code - 108;
-  } else if (code == 124) {
+  } else if (code == (g_rdna2 ? 125u : 124u)) {
     o.kind = OperandKind::Null;
-  } else if (code == 125) {
+  } else if (code == (g_rdna2 ? 124u : 125u)) {
     o.kind = OperandKind::M0;
     o.width = 1;
   } else if (code == 126) {
@@ -219,7 +252,7 @@ Operand operand(uint32_t code, uint32_t width) {
     o.kind = OperandKind::Vgpr;
     o.index = code - 256;
   } else {
-    throw Error::make(Err::Unsupported, "operand ", code, " (gfx11) is one this does not decode yet");
+    throw Error::make(Err::Unsupported, "operand ", code, gen_name(), " is one this does not decode yet");
   }
   return o;
 }
@@ -244,11 +277,20 @@ uint32_t width_of(const Opnd& op, Enc enc, bool wave64) {
 
 bool is_half(const Opnd& op) { return op.bits == 16; }
 
+// A DS instruction with two addresses, each its own 8-bit offset: gfx11's
+// ds_load_2addr_b32, gfx10's ds_read2_b32 (and st64, and the exchanges).
+bool two_addr(const std::string& name) {
+  for (const char* k : {"2addr", "_read2", "_write2", "xchg2"})
+    if (name.find(k) != std::string::npos) return true;
+  return false;
+}
+
 }  // namespace
 
 Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64) {
   const Generation generation(target);
-  const bool r4 = g_rdna4;
+  const bool r4 = g_rdna4, r2 = g_rdna2;
+  const uint32_t null_code = r2 ? 125 : 124;
   const uint32_t w0 = word(code, at);
   uint32_t w2 = 0;   // RDNA4's 96-bit memory encodings' third word
   Inst in;
@@ -337,8 +379,9 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     in.enc = Enc::Mtbuf;
     in.opcode = bits(w0, 18, 15);
     second();
+    if (r2) in.opcode = bits(w, 18, 16) | bits(w, 53, 53) << 3;
   } else {
-    throw Error::make(Err::Unsupported, "gfx11 instruction word ", w0, " is in an encoding this does not decode yet");
+    throw Error::make(Err::Unsupported, "instruction word ", w0, gen_name(), " is in an encoding this does not decode yet");
   }
 
   // VOPD: two instructions in one, X and Y, each its own opcode.
@@ -405,7 +448,9 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   // 0 flat, 1 global, 2 scratch.
   // (RDNA4 says which by the encoding's top byte: 0xEC flat, 0xED scratch,
   // 0xEE global.)
-  const uint32_t seg = in.enc != Enc::Flat ? 0 : r4 ? ((w0 >> 24) == 0xed ? 1 : (w0 >> 24) == 0xee ? 2 : 0) : bits(w, 17, 16);
+  const uint32_t seg = in.enc != Enc::Flat ? 0
+                     : r4 ? ((w0 >> 24) == 0xed ? 1 : (w0 >> 24) == 0xee ? 2 : 0)
+                          : r2 ? bits(w, 15, 14) : bits(w, 17, 16);
   const uint8_t segment = static_cast<uint8_t>(seg == 1 ? 2 : seg == 2 ? 1 : 0);
   const Row& r = row(in.enc, segment, in.opcode);
   in.name = r.name;
@@ -420,6 +465,14 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   const bool short_form = in.enc == Enc::Vop1 || in.enc == Enc::Vop2 || in.enc == Enc::Vopc;
   const bool vop3ish = in.enc == Enc::Vop3 || in.enc == Enc::Vop3p;
   uint64_t dpp_word = 0;
+  // gfx10's SDWA: a VOP1/VOP2/VOPC instruction whose first source is 0xF9
+  // reads (and writes) part of a register, a second word saying which.
+  uint32_t sdwa_word = 0;
+  if (r2 && short_form && src0_field == 0xF9) {
+    sdwa_word = word(code, at + in.size);
+    in.size += 4;
+    in.sdwa = true;
+  }
   if ((short_form || vop3ish) && (src0_field == 0xFA || src0_field == 0xE9 || src0_field == 0xEA)) {
     dpp_word = word(code, at + in.size);
     in.size += 4;
@@ -492,17 +545,18 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     const std::string f = op.field;
     uint32_t width = width_of(op, in.enc, wave64);
     // A buffer address is an offset or an index, one register, or both, two.
-    const bool idxen = r4 ? bits(w, 63, 63) : bits(w, 55, 55), offen = r4 ? bits(w, 62, 62) : bits(w, 54, 54);
+    const bool idxen = r4 ? bits(w, 63, 63) : r2 ? bits(w, 13, 13) : bits(w, 55, 55);
+    const bool offen = r4 ? bits(w, 62, 62) : r2 ? bits(w, 12, 12) : bits(w, 54, 54);
     if ((in.enc == Enc::Mubuf || in.enc == Enc::Mtbuf) && f == "VADDR") width = idxen && offen ? 2 : 1;
     // A global access with a scalar base takes a 32-bit offset from its
     // address register; without one, a whole 64-bit address. Scratch's is
     // always an offset.
     const uint32_t saddr_field = r4 ? bits(w, 6, 0) : bits(w, 54, 48);
     if (in.enc == Enc::Flat && (f == "ADDR" || f == "VADDR") && segment != 0)
-      width = segment == 1 && saddr_field == 124 ? 2 : 1;
+      width = segment == 1 && saddr_field == null_code ? 2 : 1;
     // An atomic returns the old value only with GLC set (RDNA4: TH's
     // return bit).
-    const bool returns = r4 ? bits(w, 52, 52) : bits(w, 14, 14);
+    const bool returns = r4 ? bits(w, 52, 52) : r2 && in.enc == Enc::Flat ? bits(w, 16, 16) : bits(w, 14, 14);
     if (op.out && (in.enc == Enc::Flat || in.enc == Enc::Mubuf) && r.name[0] != 'd' &&
         std::string(r.name).find("_atomic_") != std::string::npos && !returns)
       continue;
@@ -550,10 +604,13 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
         // A 9-bit source field names a vector register from 256.
         if (f.rfind("SRC", 0) == 0 && (in.enc == Enc::Vop3 || in.enc == Enc::Vop3p)) v -= 256;
         if (f == "SRC0" && short_form) v -= 256;
+        if (f == "SRC0" && in.sdwa) v = bits(sdwa_word, 7, 0);
         o = vgpr(v, width);
+        if (in.sdwa && f == "SRC0" && bits(sdwa_word, 23, 23)) o = take(v, width);
+        if (in.sdwa && f == "VSRC1" && bits(sdwa_word, 31, 31)) o = take(v, width);
         // A 16-bit operand of a short-form instruction is half a register,
         // the field's top bit saying which.
-        if (is_half(op) && short_form) {
+        if (is_half(op) && short_form && !r2) {
           o.index = v & 0x7F;
           o.hi = v & 0x80;
           o.half = true;
@@ -572,8 +629,10 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
         }
         // DPP's first source is the register the second word names.
         if (f == "SRC0" && (in.dpp || in.dpp8)) v = 256 + static_cast<uint32_t>(bits(dpp_word, 7, 0));
+        // SDWA's, the second word's, a scalar register where its S0 bit says.
+        if (f == "SRC0" && in.sdwa) v = bits(sdwa_word, 7, 0) + (bits(sdwa_word, 23, 23) ? 0 : 256);
         o = take(v, width);
-        if (is_half(op) && short_form && o.kind == OperandKind::Vgpr) {
+        if (is_half(op) && short_form && !r2 && o.kind == OperandKind::Vgpr) {
           o.index &= 0x7F;
           o.hi = (v - 256) & 0x80;
           o.half = true;
@@ -612,11 +671,31 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   switch (in.enc) {
     case Enc::Smem:
       in.offset = static_cast<int32_t>(bits(w, 52, 32) << 11) >> 11;   // 21 bits, signed
-      in.cache = bits(w, 14, 14) | bits(w, 13, 13) << 2;                // glc, dlc
+      in.cache = r2 ? bits(w, 16, 16) | bits(w, 14, 14) << 2 : bits(w, 14, 14) | bits(w, 13, 13) << 2;   // glc, dlc
       break;
     case Enc::Vop1:
     case Enc::Vop2:
     case Enc::Vopc:
+      if (in.sdwa) {
+        // Each source's part, sign and modifiers; the destination's part
+        // and what becomes of the rest, or a comparison's scalar result.
+        for (uint32_t k = 0; k < in.src.size() && k < 2; ++k) {
+          const uint32_t b = k == 0 ? bits(sdwa_word, 23, 16) : bits(sdwa_word, 31, 24);
+          if (in.src[k].kind == OperandKind::Vcc) continue;
+          in.src[k].sel = static_cast<uint8_t>(b & 7);
+          in.src[k].sext = (b >> 3) & 1;
+          in.src[k].neg = (b >> 4) & 1;
+          in.src[k].abs = (b >> 5) & 1;
+        }
+        if (in.enc == Enc::Vopc) {
+          if (bits(sdwa_word, 15, 15) && !in.dst.empty()) in.dst[0] = take(bits(sdwa_word, 14, 8), in.dst[0].width);
+        } else {
+          in.dst_sel = static_cast<uint8_t>(bits(sdwa_word, 10, 8));
+          in.dst_unused = static_cast<uint8_t>(bits(sdwa_word, 12, 11));
+          in.clamp = bits(sdwa_word, 13, 13);
+          in.omod = static_cast<uint8_t>(bits(sdwa_word, 15, 14));
+        }
+      }
       if (in.dpp) {
         const uint32_t neg = bits(dpp_word, 20, 20) | bits(dpp_word, 22, 22) << 1;
         const uint32_t abs = bits(dpp_word, 21, 21) | bits(dpp_word, 23, 23) << 1;
@@ -642,7 +721,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
       // A 16-bit vector register operand is half a register: OP_SEL's bit for
       // it (bit 3 the destination's) says which half, and the assembler
       // writes that as .l or .h rather than as op_sel.
-      if (!r.sdst) {
+      if (!r.sdst && !r2) {
         // (gfx12's disassembler writes op_sel out rather than .l/.h, so it is
         // kept to print there; the executor reads the halves either way.)
         in.printed_op_sel = in.op_sel;
@@ -658,6 +737,9 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
           in.op_sel &= static_cast<uint8_t>(~8u);
         }
         if (!r4) in.printed_op_sel = in.op_sel;
+      } else if (!r.sdst) {
+        // gfx10 has no true16: op_sel is gfx9's, which the executor reads.
+        in.printed_op_sel = in.op_sel;
       }
       if (in.dpp) {
         const uint32_t dneg = bits(dpp_word, 20, 20) | bits(dpp_word, 22, 22) << 1;
@@ -686,7 +768,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     case Enc::Ds:
       // Two 8-bit offsets for the two-address forms; one 16-bit one for the
       // rest (ds_swizzle's pattern among them), as gfx9's decoder keeps it.
-      if (std::string(r.name).find("2addr") != std::string::npos) {
+      if (two_addr(r.name)) {
         in.offset = static_cast<int32_t>(bits(w, 7, 0));
         in.offset1 = static_cast<int32_t>(bits(w, 15, 8));
       } else {
@@ -696,21 +778,30 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
       break;
     case Enc::Flat: {
       in.offset = static_cast<int32_t>(bits(w, 12, 0) << 19) >> 19;   // 13 bits, signed
+      if (r2) in.offset = static_cast<int32_t>(bits(w, 11, 0) << 20) >> 20;   // 12
       if (in.segment == Inst::Segment::Flat) in.offset = static_cast<int32_t>(bits(w, 11, 0));
-      in.cache = bits(w, 14, 14) | bits(w, 15, 15) << 1 | bits(w, 13, 13) << 2;   // glc, slc, dlc
+      in.cache = r2 ? bits(w, 16, 16) | bits(w, 17, 17) << 1 | bits(w, 12, 12) << 2
+                    : bits(w, 14, 14) | bits(w, 15, 15) << 1 | bits(w, 13, 13) << 2;   // glc, slc, dlc
       const uint32_t saddr = bits(w, 54, 48);
-      in.has_saddr = in.segment != Inst::Segment::Flat && saddr != 124;
+      in.has_saddr = in.segment != Inst::Segment::Flat && saddr != null_code;
       in.saddr = saddr;
-      // Scratch: SVE says whether the address register is there at all.
-      in.has_vaddr = in.segment != Inst::Segment::Scratch || bits(w, 55, 55);
+      // Scratch: SVE says whether the address register is there at all
+      // (gfx10: it is where there is no scalar one).
+      in.has_vaddr = in.segment != Inst::Segment::Scratch || (r2 ? !in.has_saddr : bits(w, 55, 55));
       break;
     }
     case Enc::Mubuf:
     case Enc::Mtbuf:
       in.offset = static_cast<int32_t>(bits(w, 11, 0));
-      in.offen = bits(w, 54, 54);
-      in.idxen = bits(w, 55, 55);
-      in.cache = bits(w, 14, 14) | bits(w, 12, 12) << 1 | bits(w, 13, 13) << 2;   // glc, slc, dlc
+      if (r2) {
+        in.offen = bits(w, 12, 12);
+        in.idxen = bits(w, 13, 13);
+        in.cache = bits(w, 14, 14) | bits(w, 54, 54) << 1 | bits(w, 15, 15) << 2;   // glc, slc, dlc
+      } else {
+        in.offen = bits(w, 54, 54);
+        in.idxen = bits(w, 55, 55);
+        in.cache = bits(w, 14, 14) | bits(w, 12, 12) << 1 | bits(w, 13, 13) << 2;   // glc, slc, dlc
+      }
       if (in.enc == Enc::Mtbuf) in.format = bits(w, 25, 19);
       break;
     default:
@@ -736,6 +827,9 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     if (o.half && o.kind == OperandKind::Vgpr) o.sel = o.hi ? 5 : 4;
   in.asm_name = in.name;
   in.name = exec_name(in.name, in.enc, in.dpp || in.dpp8);
+  // gfx9 runs a sub-dword instruction by its _sdwa name.
+  if (in.sdwa && in.name.size() > 4 && in.name.compare(in.name.size() - 4, 4, "_e32") == 0)
+    in.name.replace(in.name.size() - 4, 4, "_sdwa");
   // Promoted only where the executor has the short form too (gfx12's
   // v_add_f64 has one; gfx9's, which it runs as, does not).
   if (in.promoted && (in.name.size() < 4 || in.name.compare(in.name.size() - 4, 4, "_e64") != 0)) in.promoted = false;
@@ -793,7 +887,8 @@ std::string op_text(const Operand& o) {
   Operand plain = o;
   plain.neg = plain.abs = false;
   const std::string neg = o.neg ? "-" : "";
-  return o.abs ? neg + "|" + reg_text(plain) + "|" : neg + reg_text(plain);
+  const std::string r = o.sext ? "sext(" + reg_text(plain) + ")" : reg_text(plain);
+  return o.abs ? neg + "|" + r + "|" : neg + r;
 }
 
 
@@ -813,8 +908,14 @@ std::string hwreg(uint32_t simm) {
 }
 
 std::string waitcnt(uint32_t simm) {
-  // gfx11: expcnt bits 2:0, lgkmcnt 9:4, vmcnt 15:10.
-  const uint32_t exp = simm & 7, lgkm = (simm >> 4) & 0x3F, vm = (simm >> 10) & 0x3F;
+  // gfx11: expcnt bits 2:0, lgkmcnt 9:4, vmcnt 15:10. gfx10: vmcnt 3:0 and
+  // 15:14, expcnt 6:4, lgkmcnt 13:8.
+  uint32_t exp = simm & 7, lgkm = (simm >> 4) & 0x3F, vm = (simm >> 10) & 0x3F;
+  if (g_rdna2) {
+    vm = (simm & 0xF) | ((simm >> 14) & 3) << 4;
+    exp = (simm >> 4) & 7;
+    lgkm = (simm >> 8) & 0x3F;
+  }
   std::string s;
   const auto add = [&](const char* n, uint32_t v) { s += (s.empty() ? "" : " ") + std::string(n) + "(" + std::to_string(v) + ")"; };
   if (vm != 0x3F) add("vmcnt", vm);
@@ -894,10 +995,12 @@ std::string one(const Inst& i) {
   // A short form with no long one to tell it from (v_fmaak_f32,
   // v_readfirstlane_b32) has no suffix.
   if (short_form && (i.dpp || i.dpp8)) s += "_dpp";
+  else if (short_form && i.sdwa) s += "_e32";   // (made _sdwa below)
   else if (short_form && table().long_forms.count(name) && name != "v_readfirstlane_b32" && name != "v_nop")
     s += "_e32";
   // The long form of an instruction with a short one says so (_e64); the
   // table says which, whatever the executor runs it as.
+  if (i.sdwa) s.resize(s.size() - 4), s += "_sdwa";   // for the _e32
   const bool promoted = i.enc == Enc::Vop3 && table().short_forms.count(name);
   if (i.enc == Enc::Vop3 && promoted) s += i.dpp || i.dpp8 ? "_e64_dpp" : "_e64";
   if (i.enc == Enc::Vop3 && !promoted && (i.dpp || i.dpp8)) s += "_e64_dpp";
@@ -959,6 +1062,7 @@ std::string one(const Inst& i) {
     // s_load_b32 s0, s[0:1], s2 offset:0x10; with neither, null.
     const uint32_t off = static_cast<uint32_t>(i.offset) & 0x1FFFFF;
     const bool reg = i.src.size() > 1 && i.src[1].kind != OperandKind::Null;
+    if (i.src.empty()) return s;   // s_gl1_inv, s_dcache_inv, s_memtime's result alone
     put(op_text(i.src[0]));
     const uint32_t off24 = static_cast<uint32_t>(i.offset) & 0xFFFFFF;
     if (i.gfx12_cache) {
@@ -1001,7 +1105,7 @@ std::string one(const Inst& i) {
       if (i.cache & 4) s += " dlc";
       break;
     case Enc::Ds:
-      if (name.find("2addr") != std::string::npos) {
+      if (two_addr(name)) {
         if (i.offset) s += " offset0:" + std::to_string(i.offset);
         if (i.offset1) s += " offset1:" + std::to_string(i.offset1);
       } else {
@@ -1076,6 +1180,15 @@ std::string one(const Inst& i) {
     s += m;
     if (i.bound_ctrl) s += " bound_ctrl:1";
     if (i.fi) s += " fi:1";
+  }
+  if (i.sdwa) {
+    static const char* kParts[8] = {"BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD", "?"};
+    static const char* kUnused[4] = {"UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE", "?"};
+    if (i.clamp) s += " clamp";
+    if (i.omod) s += i.omod == 1 ? " mul:2" : i.omod == 2 ? " mul:4" : " div:2";
+    if (i.enc != Enc::Vopc) s += std::string(" dst_sel:") + kParts[i.dst_sel & 7] + " dst_unused:" + kUnused[i.dst_unused & 3];
+    for (size_t k = 0; k < i.src.size() && k < 2; ++k)
+      if (i.src[k].kind != OperandKind::Vcc) s += " src" + std::to_string(k) + "_sel:" + kParts[i.src[k].sel & 7];
   }
   if (i.dpp8) {
     std::string t = " dpp8:[";

@@ -76,8 +76,8 @@ enum class MopsType : uint8_t { None, I8, F16, BF16, F32, F64, F8, Count };
 
 // gfx1100 stands for RDNA3 (gfx11), whose encodings are its own: every
 // gfx11 GPU decodes alike. gfx1200 for RDNA4 (gfx12) likewise.
-enum class Target { Gfx942, Gfx90a, Gfx950, Gfx1100, Gfx1200 };
-inline bool is_rdna(Target t) { return t == Target::Gfx1100 || t == Target::Gfx1200; }
+enum class Target { Gfx942, Gfx90a, Gfx950, Gfx1100, Gfx1200, Gfx1030 };
+inline bool is_rdna(Target t) { return t == Target::Gfx1100 || t == Target::Gfx1200 || t == Target::Gfx1030; }
 
 struct Inst {
   Enc enc = Enc::Unknown;
@@ -195,6 +195,8 @@ inline Target target_of_mach(uint32_t mach) {
     case 0x41: case 0x46: case 0x47: case 0x44: case 0x43: case 0x4a: case 0x55: return Target::Gfx1100;
     // gfx1200, 1201: RDNA4.
     case 0x48: case 0x4e: return Target::Gfx1200;
+    // gfx1030 to 1036 and gfx10-3-generic: RDNA2.
+    case 0x36: case 0x37: case 0x38: case 0x39: case 0x3d: case 0x3e: case 0x45: case 0x53: return Target::Gfx1030;
     default: return Target::Gfx942;
   }
 }

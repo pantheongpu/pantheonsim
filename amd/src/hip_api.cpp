@@ -2260,8 +2260,9 @@ hipError_t occupancy(const vgpu::DeviceProfile& p, const Kernel& k, int block, s
                      Occupancy* out) {
   // RDNA3 and RDNA4 alike (gfx12's register file and wave limits are gfx11's).
   const bool rdna3 = p.gcn_arch.rfind("gfx11", 0) == 0 || p.gcn_arch.rfind("gfx12", 0) == 0;
-  if (p.gcn_arch.rfind("gfx9", 0) != 0 && !rdna3)
-    return fail(hipErrorNotSupported, "occupancy is worked out for CDNA (gfx9) and RDNA3 (gfx11) here, and this device is " + p.gcn_arch);
+  const bool rdna2 = p.gcn_arch.rfind("gfx103", 0) == 0;
+  if (p.gcn_arch.rfind("gfx9", 0) != 0 && !rdna3 && !rdna2)
+    return fail(hipErrorNotSupported, "occupancy is worked out for CDNA (gfx9), RDNA2 (gfx103x) and RDNA3 (gfx11) here, and this device is " + p.gcn_arch);
   const int max_group = static_cast<int>(p.limits.max_threads_per_block);
   if (!potential) {
     if (block <= 0) return hipErrorInvalidValue;
@@ -2278,13 +2279,18 @@ hipError_t occupancy(const vgpu::DeviceProfile& p, const Kernel& k, int block, s
   // gfx1100, 1101, 1151): 16 waves a SIMD, 1536 vector registers a SIMD in
   // wave32 allocated 24 at a time, scalar registers never the limit, and a
   // "compute unit" as HIP counts it is a workgroup processor of four SIMDs.
-  const size_t kMaxWavesPerSimd = rdna3 ? 16 : 8, kVgprsPerSimd = rdna3 ? 1536 : 512,
-               kVgprGranule = rdna3 ? 24 : 8, kSgprsPerSimd = 800;
+  // RDNA2 (gfx10.3): the same but for 1024 vector registers, 8 at a time.
+  // Each has half as many, half as many at a time, in wave64.
+  const bool w64 = k.wavefront_size == 64;
+  const bool rdna = rdna3 || rdna2;
+  const size_t kMaxWavesPerSimd = rdna ? 16 : 8,
+               kVgprsPerSimd = rdna3 ? (w64 ? 768 : 1536) : rdna2 ? (w64 ? 512 : 1024) : 512,
+               kVgprGranule = rdna3 ? (w64 ? 12 : 24) : rdna2 ? (w64 ? 4 : 8) : 8, kSgprsPerSimd = 800;
   constexpr size_t kSimdsPerCu = 4;
   size_t gpr_waves = kMaxWavesPerSimd;
   if (k.vgpr_count) gpr_waves = std::min(gpr_waves, kVgprsPerSimd / align_up(k.vgpr_count, kVgprGranule));
   if (gpr_waves == 0) return fail(hipErrorUnknown, "the kernel uses more vector registers than a SIMD has");
-  if (k.sgpr_count && !rdna3) gpr_waves = std::min(gpr_waves, kSgprsPerSimd / align_up(k.sgpr_count, 16));
+  if (k.sgpr_count && !rdna) gpr_waves = std::min(gpr_waves, kSgprsPerSimd / align_up(k.sgpr_count, 16));
   const int alu_threads = static_cast<int>(kSimdsPerCu * std::min(kMaxWavesPerSimd, gpr_waves)) * wave;
   int lds_groups = INT_MAX;
   if (const size_t lds = k.group_segment + dynamic_lds; lds)

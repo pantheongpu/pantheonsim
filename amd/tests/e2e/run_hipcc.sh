@@ -217,6 +217,17 @@ expect "the RDNA4 program runs to the end" "0" "$status"
 expect "every RDNA4 check holds (WMMA, scalar floats, split barrier)" "7 of 7" \
   "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 7"
 
+# RDNA2 on a simulated Radeon RX 6900 XT (hipcc/rdna2.cpp): SDWA's partial
+# reads and writes, registers indexed through M0, permlane16 and permlanex16,
+# and DPP's row_share and row_xmask -- in wave32 and wave64.
+for w in "" .w64; do
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/rx6900xt LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/rdna2$w.gfx1030" 2>&1)
+  status=$?
+  expect "the RDNA2${w:+ wave64} program runs to the end" "0" "$status"
+  expect "every RDNA2${w:+ wave64} check holds (SDWA, M0, permlane16, DPP)" "11 of 11" \
+    "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 11"
+done
+
 # Streams that run at once, as a card's do (hipcc/streams.cpp). Each waiting
 # kernel gives up after a bounded time, so a runtime that ran the streams one
 # after another fails these rather than hanging.

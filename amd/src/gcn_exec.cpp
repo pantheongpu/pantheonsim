@@ -715,6 +715,7 @@ struct Machine {
   const Operand* narrow_dst = nullptr;
   uint8_t narrow_dst_sel = 6;
   bool narrow_dst_preserve = false;
+  bool narrow_dst_sext = false;
 
   void write_lane(Wave& w, const Operand& o, uint32_t lane, uint32_t v) {
     // Where the instruction named part of the destination, the result's low
@@ -727,7 +728,12 @@ struct Machine {
           : sel == 4 ? v & 0xFFFFu
           : sel == 5 ? (v & 0xFFFFu) << 16
                      : v;
-      // Or the rest of the register is kept, where the instruction says so.
+      // Or the bits above the part take its sign (those below it stay zero),
+      // or the rest of the register is kept, where the instruction says so.
+      if (narrow_dst_sext && sel < 6) {
+        const uint32_t top = mask & ~(mask >> 1);   // the part's highest bit
+        if (v & top) v |= ~(mask | (top - 1));
+      }
       if (narrow_dst_preserve) {
         const uint32_t was = o.kind == OperandKind::Agpr ? acc(w, o.index)[lane] : w.vgpr[o.index][lane];
         v = (was & ~mask) | (v & mask);
@@ -1453,6 +1459,7 @@ struct Machine {
         m.narrow_dst = &in.dst[0];
         m.narrow_dst_sel = in.dst_sel;
         m.narrow_dst_preserve = in.dst_unused == 2;
+        m.narrow_dst_sext = in.dst_unused == 1;
       } else if (in.enc == gcn::Enc::Vop3 && (in.op_sel & 8) && in.name.find("fp8") == std::string::npos &&
                  in.name.find("bf8") == std::string::npos) {
         // A 16-bit instruction told by op_sel to write the high half of its
@@ -1467,6 +1474,7 @@ struct Machine {
       m.narrow_dst = nullptr;
       m.narrow_dst_sel = 6;
       m.narrow_dst_preserve = false;
+      m.narrow_dst_sext = false;
     }
   };
 
@@ -1518,6 +1526,24 @@ struct Machine {
       const uint64_t cond = scalar(w, in.src[2]);
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, lane_bits(w, (cond >> lane) & 1 ? in.src[1] : in.src[0], lane) & 0xFFFF);
+      });
+    } else if (op == "v_permlane16_b32"_op || op == "v_permlanex16_b32"_op) {
+      // Each lane of a row of 16 reads the lane of its row (permlane16) or of
+      // the other row of its pair (permlanex16) that its 4 bits of the
+      // 64-bit selector {src2, src1} name. A source lane that is off is read
+      // anyway where op_sel's first bit (FI) says so; otherwise the lane
+      // gets zero where its second (BOUND_CTRL) says so, and keeps its value
+      // where neither does.
+      const uint64_t sel = (scalar(w, in.src[1]) & 0xFFFFFFFFu) | (scalar(w, in.src[2]) & 0xFFFFFFFFu) << 32;
+      const bool fi = in.op_sel & 1, bound = (in.op_sel >> 1) & 1;
+      const bool cross = op == "v_permlanex16_b32"_op;
+      uint32_t from[kLanes];
+      for (uint32_t lane = 0; lane < kLanes; ++lane) from[lane] = lane_src(w, in.src[0], lane);
+      each([&](uint32_t lane) {
+        const uint32_t row = lane / 16 ^ (cross ? 1 : 0);
+        const uint32_t s = row * 16 + static_cast<uint32_t>((sel >> (4 * (lane % 16))) & 0xF);
+        if (fi || (w.exec >> s & 1)) write_lane(w, in.dst[0], lane, from[s]);
+        else if (bound) write_lane(w, in.dst[0], lane, 0);
       });
     } else if (op == "v_mad_u16"_op || op == "v_mad_i16"_op) {
       each([&](uint32_t lane) {
@@ -2017,13 +2043,9 @@ struct Machine {
                   ? in.name.substr(0, in.name.size() - 4) + "_e32"
                   : std::string();
     const OpName op(as_short.empty() ? in.name : as_short);
-    // A sub-dword instruction may write part of its destination and pad the
-    // rest with zeroes. The other two ways of filling the rest -- carrying
-    // the sign into it, or keeping what was there -- are refused: nothing
-    // here has been seen to emit them.
-    if (in.sdwa && in.dst_unused == 1)
-      throw Error::make(Err::Unsupported, op, " fills the rest of its destination with the result's sign, "
-                                              "which this does not model");
+    // (A sub-dword instruction may write part of its destination and pad the
+    // rest with zeroes, carry the part's sign into it, or keep what was
+    // there: write_lane does each.)
     // op_sel on a 16-bit long form: a source's bit reads its high half,
     // which is the sub-dword selection SDWA makes, so the instruction runs
     // as that. (The 8-bit float conversions and v_pack read their own bits.)
@@ -3905,6 +3927,14 @@ struct Machine {
       *from = (lane & ~31u) - 1;
       return true;
     }
+    if (ctrl >= 0x150 && ctrl <= 0x15F) {   // row_share (gfx90a's row_newbcast): lane n of the row
+      *from = row + (ctrl - 0x150);
+      return true;
+    }
+    if (ctrl >= 0x160 && ctrl <= 0x16F) {   // row_xmask: the lane of the row n away by XOR
+      *from = row + (in_row ^ (ctrl - 0x160));
+      return true;
+    }
     throw Error::make(Err::Unsupported, "a cross-lane instruction reading across the whole wave rather than "
                                         "within a row, which this decodes but does not model");
   }
@@ -3921,7 +3951,8 @@ struct Machine {
       if (!((in.row_mask >> (lane >> 4)) & 1)) continue;
       if (!((in.bank_mask >> ((lane >> 2) & 3)) & 1)) continue;
       uint32_t from = 0;
-      const bool there = dpp_source(in.dpp_ctrl, lane, &from) && ((w.exec >> from) & 1);
+      // (RDNA's FI reads a lane that is off as though it were on.)
+      const bool there = dpp_source(in.dpp_ctrl, lane, &from) && (in.fi || ((w.exec >> from) & 1));
       if (!there && !in.bound_ctrl) continue;   // nothing to read, and nothing written
       values[lane] = there ? w.vgpr[o.index][from] : 0u;
       writes |= uint64_t{1} << lane;
