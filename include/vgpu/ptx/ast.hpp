@@ -278,17 +278,29 @@ struct OpStMatrix {
 // The warp-wide tensor-core multiply-accumulate. Distinct from wmma, which is
 // the older whole-fragment API: this one names the exact shape and the
 // registers each lane holds.
-enum class MmaElem { F16, BF16, TF32, S8, U8 };
+enum class FRound { Nearest, Zero, MinusInf, PlusInf };
+enum class MmaElem { F16, BF16, TF32, S8, U8, S4, U4, B1, E4M3, E5M2, F64 };
+// mma.sync (PTX ISA 9.7.16.5.14): every documented shape except the
+// block-scaled and .kind::f8f6f4 ones. m16n8kK, m8n8kK (the integer, b1 and
+// f64 ones) and Volta's m8n8k4 f16, which is four 8x8x4 products at once.
 struct OpMma {
-  uint32_t k = 16;          // m and n are fixed at 16 and 8 for every shape here
-  MmaElem ab_type = MmaElem::F16;
-  bool ab_signed = true;    // for the integer types
-  bool acc_f16 = false;     // accumulate in f16x2 registers rather than f32
-  bool acc_int = false;     // s32 accumulate
+  uint32_t m = 16, k = 16;   // n is 8 for every shape
+  MmaElem ab_type = MmaElem::F16;   // A's type
+  MmaElem b_type = MmaElem::F16;
+  bool ab_signed = true;     // A's integer signedness
+  bool b_signed = true;
+  bool acc_f16 = false;      // D in f16x2 registers
+  bool c_f16 = false;        // C in f16x2 registers (m8n8k4 may differ from D)
+  bool acc_int = false;      // s32 accumulate
+  bool acc_f64 = false;      // f64 accumulate
+  bool satfinite = false;    // integer: clamp to the s32 range
+  bool b1_and = false;       // b1: .and.popc rather than .xor.popc
+  bool a_row = true, b_col = true;   // m8n8k4 f16's .alayout/.blayout
+  FRound rnd = FRound::Nearest;      // f64
   std::vector<Reg> d, a, b, c;
-  // mma.sp: A is 2:4 structured sparse, holding only its non-zero half; the
-  // metadata operand says where each stored element sits in its 4-wide chunk,
-  // and the selector says which threads of each group of four supply it.
+  // mma.sp: A is structured sparse, holding only its non-zero half; the
+  // metadata operand says where each stored element sits in its chunk, and
+  // the selector says which threads of each group of four supply it.
   bool sparse = false;
   Operand meta, selector;
 };
@@ -297,7 +309,7 @@ struct OpMma {
 // registers or, like B always does, from shared memory through a 64-bit
 // matrix descriptor (PTX ISA 9.7.17.5.1.2.2).
 enum class WgmmaKind { Fence, Commit, Wait, Mma };
-enum class WgmmaElem { F16, BF16, TF32, E4M3, E5M2, S8, U8 };
+enum class WgmmaElem { F16, BF16, TF32, E4M3, E5M2, S8, U8, B1 };
 enum class WgmmaAcc { F16, F32, S32 };
 struct OpWgmma {
   WgmmaKind kind = WgmmaKind::Mma;
@@ -313,6 +325,10 @@ struct OpWgmma {
   Operand scale_d;           // predicate (or 0/1): false means D = A*B
   int scale_a = 1, scale_b = 1;   // -1 negates, float forms only
   int trans_a = 0, trans_b = 0;   // 1 selects M-/N-major, 16-bit forms only
+  // wgmma.mma_async.sp: A is structured sparse, M x K/2 stored, the metadata
+  // and selector as for mma.sp (per warp, its 16 rows).
+  bool sparse = false;
+  Operand sp_meta, sp_sel;
 };
 // Blackwell's fifth-generation tensor core (sm_100a/sm_100f and the a/f
 // targets after it, PTX ISA 9.7.18): Tensor Memory -- 128 lanes by 512
@@ -603,7 +619,6 @@ struct OpShf { bool left = false; bool wrap = false; Reg dst; Operand a, b, c; }
 // PTX names an explicit rounding mode on float arithmetic. Unlike .approx,
 // which only relaxes accuracy, these change the result -- quantization kernels
 // depend on .rz truncating -- so they are carried through and applied.
-enum class FRound { Nearest, Zero, MinusInf, PlusInf };
 // nan_propagate is min.NaN/max.NaN, which returns NaN when either operand is
 // NaN. Plain min/max return the non-NaN operand, which is fmin/fmax's rule --
 // the two disagree on exactly the inputs a numerically fragile kernel cares
