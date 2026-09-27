@@ -1888,6 +1888,8 @@ class Parser {
         if (!arity('a', op.atype, op.a.size()) || !arity('b', op.btype, op.b.size()) ||
             !arity('c', op.ctype, op.c.size()) || !arity('d', op.dtype, op.d.size()))
           return unsupported("wmma.mma fragment arity for this shape and these types");
+        for (const auto* v : {&op.a, &op.b, &op.c, &op.d})
+          for (const Reg& r : *v) op.any_wide |= r.wide;
         ins.op = op;
       } else {
         return unsupported("wmma." + kind + " is not implemented (only .load, .mma and .store.d)");

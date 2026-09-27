@@ -664,6 +664,7 @@ struct OpWmmaMma {
   bool satfinite = false;      // integer: clamp to the s32 range instead of wrapping
   bool b1_and = false;         // b1: .and.popc rather than .xor.popc
   FRound rnd = FRound::Nearest;  // f64
+  bool any_wide = false;       // some fragment register is 64-bit (set by the parser)
 };
 // wmma.load.{a,b,c}.sync.aligned.<layout>.m16n16k16[.space].<type> {d...}, [addr], stride
 //

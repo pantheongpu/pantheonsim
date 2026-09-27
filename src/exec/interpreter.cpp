@@ -20,6 +20,9 @@
 //    barriers or retirement. Blocks run sequentially in a fixed order.
 //    Everything is deterministic by construction.
 #include <algorithm>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include <array>
 #include <atomic>
 #include <bit>
@@ -349,6 +352,23 @@ struct AsyncCopies {
   std::array<std::deque<std::vector<PendingCopy>>, kMaxWarpSize> groups;
 };
 
+// An allocator whose resize() leaves new elements uninitialized, for the
+// register files: a register is never read before the write that sets its
+// `written` flag (reads of unwritten ones answer zero), so zero-filling every
+// declared register of every warp at every block start -- nvcc declares
+// hundreds -- was pure cost: 29% of mma_virus's time.
+template <class T>
+struct UninitAlloc : std::allocator<T> {
+  template <class U> struct rebind { using other = UninitAlloc<U>; };
+  UninitAlloc() = default;
+  template <class U> UninitAlloc(const UninitAlloc<U>&) noexcept {}
+  template <class U> void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }
+  template <class U, class... A> void construct(U* p, A&&... a) {
+    ::new (static_cast<void*>(p)) U(std::forward<A>(a)...);
+  }
+};
+template <class T> using RegFile = std::vector<T, UninitAlloc<T>>;
+
 struct Warp {
   enum class State { Ready, AtBarrier, Done };
   State state = State::Ready;
@@ -394,8 +414,8 @@ struct Warp {
   // Register files indexed by the parser's dense ids: narrow registers live
   // in regs32, 64-bit ones in regs64. `written*` tracks first assignment so a
   // read-before-write is still diagnosed.
-  std::vector<Lanes32> regs32;
-  std::vector<Lanes> regs64;
+  RegFile<Lanes32> regs32;
+  RegFile<Lanes> regs64;
   std::vector<Mask> preds;
   std::vector<uint8_t> written32, written64;
   // Widening a 32-bit register into the 64-bit operand form needs somewhere to
@@ -513,6 +533,14 @@ double f16_to_double_exact(uint64_t bits) {
 const std::array<double, 65536> kF16ToDouble = [] {
   std::array<double, 65536> t{};
   for (uint32_t h = 0; h < 65536; ++h) t[h] = f16_to_double_exact(h);
+  return t;
+}();
+
+// The same values as floats, for the f16 WMMA fast path: half the table, and
+// every binary16 value is exact in f32.
+const std::array<float, 65536> kF16ToFloat = [] {
+  std::array<float, 65536> t{};
+  for (uint32_t h = 0; h < 65536; ++h) t[h] = static_cast<float>(kF16ToDouble[h]);
   return t;
 }();
 
@@ -871,6 +899,92 @@ void wmma_tile(float (&D)[16][16], const float (&A)[16][16], const float (&B)[16
 }
 #pragma GCC pop_options
 
+// Sixteen binary16 values -- eight 32-bit words, low half first -- as floats:
+// one f16 WMMA fragment row. F16C converts eight at a time; it is used only
+// if it gives the table's bits for all 65536 inputs, NaNs included, which is
+// checked once rather than assumed.
+void f16x16_to_float_table(const uint32_t* w8, float* out) {
+  for (int i = 0; i < 8; ++i) {
+    out[2 * i] = kF16ToFloat[w8[i] & 0xFFFF];
+    out[2 * i + 1] = kF16ToFloat[w8[i] >> 16];
+  }
+}
+#if defined(__x86_64__) && defined(__GNUC__)
+__attribute__((target("avx,f16c"))) void f16x16_to_float_f16c(const uint32_t* w8, float* out) {
+  const __m128i lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w8));
+  const __m128i hi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w8 + 4));
+  _mm256_storeu_ps(out, _mm256_cvtph_ps(lo));
+  _mm256_storeu_ps(out + 8, _mm256_cvtph_ps(hi));
+}
+const bool g_f16c = [] {
+  if (!__builtin_cpu_supports("avx") || !__builtin_cpu_supports("f16c")) return false;
+  for (uint32_t h = 0; h < 65536; h += 16) {
+    uint32_t w8[8];
+    for (uint32_t i = 0; i < 8; ++i) w8[i] = (h + 2 * i) | ((h + 2 * i + 1) << 16);
+    float got[16];
+    f16x16_to_float_f16c(w8, got);
+    if (std::memcmp(got, &kF16ToFloat[h], sizeof got) != 0) return false;
+  }
+  return true;
+}();
+#endif
+// 8x8 transposes of 32-bit values, for moving WMMA fragments between the
+// register file (one array of lanes per register) and tiles (one row per
+// element group). Shuffles only: the bits are moved, never interpreted.
+#if defined(__x86_64__) && defined(__GNUC__)
+__attribute__((target("avx2"))) inline void transpose8x8(__m256 r[8]) {
+  const __m256 t0 = _mm256_unpacklo_ps(r[0], r[1]), t1 = _mm256_unpackhi_ps(r[0], r[1]);
+  const __m256 t2 = _mm256_unpacklo_ps(r[2], r[3]), t3 = _mm256_unpackhi_ps(r[2], r[3]);
+  const __m256 t4 = _mm256_unpacklo_ps(r[4], r[5]), t5 = _mm256_unpackhi_ps(r[4], r[5]);
+  const __m256 t6 = _mm256_unpacklo_ps(r[6], r[7]), t7 = _mm256_unpackhi_ps(r[6], r[7]);
+  const __m256 u0 = _mm256_shuffle_ps(t0, t2, 0x44), u1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+  const __m256 u2 = _mm256_shuffle_ps(t1, t3, 0x44), u3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+  const __m256 u4 = _mm256_shuffle_ps(t4, t6, 0x44), u5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+  const __m256 u6 = _mm256_shuffle_ps(t5, t7, 0x44), u7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+  r[0] = _mm256_permute2f128_ps(u0, u4, 0x20);
+  r[1] = _mm256_permute2f128_ps(u1, u5, 0x20);
+  r[2] = _mm256_permute2f128_ps(u2, u6, 0x20);
+  r[3] = _mm256_permute2f128_ps(u3, u7, 0x20);
+  r[4] = _mm256_permute2f128_ps(u0, u4, 0x31);
+  r[5] = _mm256_permute2f128_ps(u1, u5, 0x31);
+  r[6] = _mm256_permute2f128_ps(u2, u6, 0x31);
+  r[7] = _mm256_permute2f128_ps(u3, u7, 0x31);
+}
+// out[l * 8 + k] = rows[k][first + l], for k, l < 8.
+__attribute__((target("avx2"))) void gather8x8(const uint32_t* const rows[8], uint32_t first, void* out) {
+  __m256 r[8];
+  for (int k = 0; k < 8; ++k)
+    r[k] = _mm256_castsi256_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(rows[k] + first)));
+  transpose8x8(r);
+  for (int l = 0; l < 8; ++l) _mm256_storeu_ps(static_cast<float*>(out) + l * 8, r[l]);
+}
+// rows[k][first + l] = in[l * 8 + k], for k, l < 8.
+__attribute__((target("avx2"))) void scatter8x8(const void* in, uint32_t* const rows[8], uint32_t first) {
+  __m256 r[8];
+  for (int l = 0; l < 8; ++l) r[l] = _mm256_loadu_ps(static_cast<const float*>(in) + l * 8);
+  transpose8x8(r);
+  for (int k = 0; k < 8; ++k)
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(rows[k] + first), _mm256_castps_si256(r[k]));
+}
+#else
+// Elsewhere the callers take their scalar paths; these keep the code compiling.
+void gather8x8(const uint32_t* const rows[8], uint32_t first, void* out) {
+  for (int l = 0; l < 8; ++l)
+    for (int k = 0; k < 8; ++k) std::memcpy(static_cast<uint32_t*>(out) + l * 8 + k, rows[k] + first + l, 4);
+}
+void scatter8x8(const void* in, uint32_t* const rows[8], uint32_t first) {
+  for (int l = 0; l < 8; ++l)
+    for (int k = 0; k < 8; ++k) std::memcpy(rows[k] + first + l, static_cast<const uint32_t*>(in) + l * 8 + k, 4);
+}
+#endif
+
+void f16x16_to_float(const uint32_t* w8, float* out) {
+#if defined(__x86_64__) && defined(__GNUC__)
+  if (g_f16c) return f16x16_to_float_f16c(w8, out);
+#endif
+  f16x16_to_float_table(w8, out);
+}
+
 uint64_t mask_to_bits(uint64_t v, uint32_t bits) {
   return bits >= 64 ? v : (v & ((1ull << bits) - 1));
 }
@@ -1200,8 +1314,10 @@ class Interpreter {
     b.warps.resize(nwarps);
     for (size_t w = 0; w < nwarps; ++w) {
       Warp& warp = b.warps[w];
-      warp.regs32.assign(fn_.num_regs32, Lanes32{});
-      warp.regs64.assign(fn_.num_regs64, Lanes{});
+      warp.regs32.clear();
+      warp.regs32.resize(fn_.num_regs32);
+      warp.regs64.clear();
+      warp.regs64.resize(fn_.num_regs64);
       warp.preds.assign(fn_.num_regs32 + fn_.num_regs64, 0);
       warp.written32.assign(fn_.num_regs32, 0);
       warp.written64.assign(fn_.num_regs64, 0);
@@ -1791,34 +1907,53 @@ class Interpreter {
     return scratch;
   }
 
+  // The register a write with mask `m` goes to, marked written. Register
+  // files are not zeroed when a block starts, so a register's first write
+  // zero-fills it when that write does not cover the whole warp: lanes it
+  // leaves alone must read zero afterwards, as they always have, rather
+  // than whatever the memory held.
+  uint32_t* dst32(Warp& w, uint32_t id, Mask m) {
+    Lanes32& r = w.regs32[id];
+    if (!w.written32[id]) {
+      if (m != all_lanes(W_)) r.fill(0);
+      w.written32[id] = 1;
+    }
+    return r.data();
+  }
+  uint64_t* dst64(Warp& w, uint32_t id, Mask m) {
+    Lanes& r = w.regs64[id];
+    if (!w.written64[id]) {
+      if (m != all_lanes(W_)) r.fill(0);
+      w.written64[id] = 1;
+    }
+    return r.data();
+  }
+
   // Writes 32-bit lanes straight into the narrow file -- no widening, and half
   // the memory traffic of the 64-bit path.
   void write_narrow(Warp& w, const Reg& reg, Mask m, const Lanes32& vals) {
-    Lanes32& dst = w.regs32[reg.id];
+    uint32_t* dst = dst32(w, reg.id, m);
     for_active(m, W_, [&](uint32_t l) { dst[l] = vals[l]; });
-    w.written32[reg.id] = 1;
   }
 
   void write_reg(Warp& w, const Reg& reg, Mask m, const Lanes& vals, uint32_t bits) {
     if (reg.wide) {
-      Lanes& dst = w.regs64[reg.id];
+      uint64_t* dst = dst64(w, reg.id, m);
       if (bits >= 64)
         for_active(m, W_, [&](uint32_t l) { dst[l] = vals[l]; });
       else {
         const uint64_t keep = (1ull << bits) - 1;
         for_active(m, W_, [&](uint32_t l) { dst[l] = vals[l] & keep; });
       }
-      w.written64[reg.id] = 1;
       return;
     }
-    Lanes32& dst = w.regs32[reg.id];
+    uint32_t* dst = dst32(w, reg.id, m);
     if (bits >= 32)
       for_active(m, W_, [&](uint32_t l) { dst[l] = static_cast<uint32_t>(vals[l]); });
     else {
       const uint32_t keep = (1u << bits) - 1;
       for_active(m, W_, [&](uint32_t l) { dst[l] = static_cast<uint32_t>(vals[l]) & keep; });
     }
-    w.written32[reg.id] = 1;
   }
 
   // Predicates are declared .pred, so they live in the narrow numbering; the
@@ -2560,7 +2695,7 @@ class Interpreter {
     Lanes32 sa, sb;
     const Lanes32& a = read_narrow(w, ins, op.a, sa);
     const Lanes32& b = read_narrow(w, ins, op.b, sb);
-    uint32_t* d = w.regs32[op.dst.id].data();
+    uint32_t* d = dst32(w, op.dst.id, m);
     const bool sig = op.ty.is_signed();
     auto run = [&](auto f) { for_active(m, W_, [&](uint32_t l) { d[l] = f(a[l], b[l]); }); };
     switch (op.op) {
@@ -2606,7 +2741,7 @@ class Interpreter {
     const Lanes32& a = read_narrow(w, ins, op.a, sa);
     const Lanes32& b = read_narrow(w, ins, op.b, sb);
     const Lanes32& c = read_narrow(w, ins, op.c, sc);
-    uint32_t* d = w.regs32[op.dst.id].data();
+    uint32_t* d = dst32(w, op.dst.id, m);
     for_active(m, W_, [&](uint32_t l) { d[l] = a[l] * b[l] + c[l]; });
     w.written32[op.dst.id] = 1;
     return true;
@@ -2616,7 +2751,7 @@ class Interpreter {
     if (op.ty.bits != 32 || op.dst.wide || !narrow_operand(op.src)) return false;
     Lanes32 ss;
     const Lanes32& v = read_narrow(w, ins, op.src, ss);
-    uint32_t* d = w.regs32[op.dst.id].data();
+    uint32_t* d = dst32(w, op.dst.id, m);
     for_active(m, W_, [&](uint32_t l) { d[l] = v[l]; });
     w.written32[op.dst.id] = 1;
     return true;
@@ -2665,7 +2800,7 @@ class Interpreter {
       const Lanes32& a = read_narrow(w, ins, op.a, sa);
       const Lanes32& b = read_narrow(w, ins, op.b, sb);
       const Lanes32& c = read_narrow(w, ins, op.c, sc);
-      uint32_t* d = w.regs32[op.dst.id].data();
+      uint32_t* d = dst32(w, op.dst.id, m);
 #if defined(__x86_64__) && defined(__GNUC__)
       if (g_hw_fma) {
         fma_lanes_f32_hw(d, a.data(), b.data(), c.data(), m, W_);
@@ -2684,7 +2819,7 @@ class Interpreter {
     const Lanes& a = read_operand(w, ctx, ins, op.a, sa);
     const Lanes& b = read_operand(w, ctx, ins, op.b, sb);
     const Lanes& c = read_operand(w, ctx, ins, op.c, sc);
-    uint64_t* d = w.regs64[op.dst.id].data();
+    uint64_t* d = dst64(w, op.dst.id, m);
 #if defined(__x86_64__) && defined(__GNUC__)
     if (g_hw_fma) {
       fma_lanes_f64_hw(d, a.data(), b.data(), c.data(), m, W_);
@@ -2704,7 +2839,7 @@ class Interpreter {
     Lanes32 sa, sb;
     const Lanes32& a = read_narrow(w, ins, op.a, sa);
     const Lanes32& b = read_narrow(w, ins, op.b, sb);
-    uint32_t* d = w.regs32[op.dst.id].data();
+    uint32_t* d = dst32(w, op.dst.id, m);
     auto run = [&](auto f) {
       for_active(m, W_, [&](uint32_t l) { d[l] = static_cast<uint32_t>(f32bits(f(f32(a[l]), f32(b[l])))); });
     };
@@ -2728,7 +2863,7 @@ class Interpreter {
     Lanes sa, sb;
     const Lanes& a = read_operand(w, ctx, ins, op.a, sa);
     const Lanes& b = read_operand(w, ctx, ins, op.b, sb);
-    uint64_t* d = w.regs64[op.dst.id].data();
+    uint64_t* d = dst64(w, op.dst.id, m);
     const bool sig = op.ty.is_signed();
     auto run = [&](auto f) { for_active(m, W_, [&](uint32_t l) { d[l] = f(a[l], b[l]); }); };
     switch (op.op) {
@@ -2785,12 +2920,12 @@ class Interpreter {
     };
     if (op.dst.wide) {
       const uint64_t keep = dt.bits >= 64 ? ~uint64_t{0} : (uint64_t{1} << dt.bits) - 1;
-      uint64_t* d = w.regs64[op.dst.id].data();
+      uint64_t* d = dst64(w, op.dst.id, m);
       for_active(m, W_, [&](uint32_t l) { d[l] = value(v[l]) & keep; });
       w.written64[op.dst.id] = 1;
     } else {
       const uint32_t keep = dt.bits >= 32 ? ~0u : (1u << dt.bits) - 1;
-      uint32_t* d = w.regs32[op.dst.id].data();
+      uint32_t* d = dst32(w, op.dst.id, m);
       for_active(m, W_, [&](uint32_t l) { d[l] = static_cast<uint32_t>(value(v[l])) & keep; });
       w.written32[op.dst.id] = 1;
     }
@@ -2804,7 +2939,7 @@ class Interpreter {
     Lanes32 sa, sb;
     const Lanes32& a = read_narrow(w, ins, op.a, sa);
     const Lanes32& b = read_narrow(w, ins, op.b, sb);
-    uint64_t* d = w.regs64[op.dst.id].data();
+    uint64_t* d = dst64(w, op.dst.id, m);
     if (op.is_signed)
       for_active(m, W_, [&](uint32_t l) {
         d[l] = static_cast<uint64_t>(int64_t{static_cast<int32_t>(a[l])} * int64_t{static_cast<int32_t>(b[l])});
@@ -2824,7 +2959,7 @@ class Interpreter {
     const Lanes32& a = read_narrow(w, ins, op.a, sa);
     const Lanes32& b = read_narrow(w, ins, op.b, sb);
     const Lanes32& c = read_narrow(w, ins, op.c, sc);
-    uint32_t* d = w.regs32[op.dst.id].data();
+    uint32_t* d = dst32(w, op.dst.id, m);
     const int halves = op.packed ? 2 : 1;
     if (op.bf16) {
       for_active(m, W_, [&](uint32_t l) {
@@ -6350,62 +6485,103 @@ class Interpreter {
   // The same fragments as exec_wmma_mma below, read from and written to the
   // 32-bit register file in place, with the halves decoded from the table.
   bool fast_wmma_mma(Warp& w, const OpWmmaMma& op, Mask m) {
-    if (op.generic || op.elem == WmmaElem::TF32 || mem_.alu_fault_armed() || W_ != 32) return false;
-    for (const auto* v : {&op.a, &op.b, &op.c, &op.d})
-      for (const Reg& r : *v)
-        if (r.wide) return false;
+    if (op.generic || op.elem == WmmaElem::TF32 || op.any_wide || mem_.alu_fault_armed() || W_ != 32)
+      return false;
     const bool bf = op.elem == WmmaElem::BF16;
     const int ab_regs = bf ? 4 : 8;
     if (op.a.size() != size_t(ab_regs) || op.b.size() != size_t(ab_regs) || op.c.size() != 8 ||
         op.d.size() != 8)
       return false;
-    float A[kMmaDim][kMmaDim] = {}, B[kMmaDim][kMmaDim] = {}, C[kMmaDim][kMmaDim] = {};
+#if defined(__x86_64__) && defined(__GNUC__)
+    const bool avx2 = g_avx2;
+#else
+    constexpr bool avx2 = false;
+#endif
+    // Every element of A, B and C is written below, so none is initialized.
+    // The tiles are indexed flat, row * 16 + column.
+    alignas(32) float A[kMmaDim][kMmaDim], B[kMmaDim][kMmaDim], C[kMmaDim][kMmaDim];
+    float* const af = &A[0][0];
+    float* const bff = &B[0][0];
+    float* const cf = &C[0][0];
     // A register nothing has written reads as zero, as read_operand has it.
     static const Lanes32 kZero{};
     auto regs = [&](const Reg& r) -> const Lanes32& {
       return r.id < w.regs32.size() && w.written32[r.id] ? w.regs32[r.id] : kZero;
     };
-    const uint32_t lanes_used = bf ? W_ : kMmaDim;
-    for (int reg = 0; reg < ab_regs; ++reg) {
-      const Lanes32& av = regs(op.a[reg]);
-      const Lanes32& bv = regs(op.b[reg]);
-      for (uint32_t lane = 0; lane < lanes_used; ++lane)
-        for (int h = 0; h < 2; ++h) {
-          uint32_t row, col;
-          if (bf) {
-            const uint32_t linear = lane * 8 + static_cast<uint32_t>(reg * 2 + h);
-            row = linear / kMmaDim;
-            col = linear % kMmaDim;
-          } else {
-            row = lane;
-            col = static_cast<uint32_t>(reg * 2 + h);
-          }
-          const uint32_t abits = (av[lane] >> (16 * h)) & 0xFFFF;
-          const uint32_t bbits = (bv[lane] >> (16 * h)) & 0xFFFF;
-          const float a = static_cast<float>(bf ? bf16_to_double(abits) : kF16ToDouble[abits]);
-          const float b = static_cast<float>(bf ? bf16_to_double(bbits) : kF16ToDouble[bbits]);
-          if (op.alayout == MatLayout::Row) A[row][col] = a; else A[col][row] = a;
-          if (op.blayout == MatLayout::Row) B[row][col] = b; else B[col][row] = b;
+    // Element (lane, register, half) of an A or B fragment is matrix element
+    // `linear` in row-major order, and the fragment's layout says whether that
+    // is (row, column) or (column, row) of the tile: f16 puts lane l's sixteen
+    // halves in row l, bf16 packs eight per lane.
+    auto unpack = [&](const std::vector<Reg>& frag, MatLayout layout, float* t) {
+      const bool row = layout == MatLayout::Row;
+      if (!bf) {
+        // f16: lane l's eight registers are row l of the fragment.
+        const uint32_t* v[8];
+        for (int reg = 0; reg < 8; ++reg) v[reg] = regs(frag[reg]).data();
+        alignas(32) uint32_t w8[kMmaDim][8];
+        if (avx2) {
+          gather8x8(v, 0, w8[0]);
+          gather8x8(v, 8, w8[8]);
+        } else {
+          for (uint32_t lane = 0; lane < kMmaDim; ++lane)
+            for (int reg = 0; reg < 8; ++reg) w8[lane][reg] = v[reg][lane];
         }
-    }
-    for (int reg = 0; reg < 8; ++reg) {
-      const Lanes32& cv = regs(op.c[reg]);
-      for (uint32_t lane = 0; lane < W_; ++lane) {
-        const uint32_t linear = lane * 8 + static_cast<uint32_t>(reg);
-        C[linear / kMmaDim][linear % kMmaDim] = f32(cv[lane]);
+        if (row) {
+          for (uint32_t lane = 0; lane < kMmaDim; ++lane) f16x16_to_float(w8[lane], t + lane * kMmaDim);
+          return;
+        }
+        alignas(32) float r[kMmaDim][kMmaDim];
+        for (uint32_t lane = 0; lane < kMmaDim; ++lane) f16x16_to_float(w8[lane], r[lane]);
+        for (uint32_t i = 0; i < kMmaDim; ++i)
+          for (uint32_t c = 0; c < kMmaDim; ++c) t[c * kMmaDim + i] = r[i][c];
+        return;
+      }
+      for (int reg = 0; reg < ab_regs; ++reg) {
+        const uint32_t* v = regs(frag[reg]).data();
+        const uint32_t lanes = bf ? W_ : kMmaDim;
+        for (uint32_t lane = 0; lane < lanes; ++lane) {
+          const uint32_t word = v[lane];
+          const uint32_t base = bf ? lane * 8 + static_cast<uint32_t>(reg * 2)
+                                   : lane * kMmaDim + static_cast<uint32_t>(reg * 2);
+          for (uint32_t h = 0; h < 2; ++h) {
+            const uint32_t bits = (word >> (16 * h)) & 0xFFFF;
+            const float x = bf ? static_cast<float>(bf16_to_double(bits)) : kF16ToFloat[bits];
+            const uint32_t linear = base + h;
+            t[row ? linear : (linear % kMmaDim) * kMmaDim + linear / kMmaDim] = x;
+          }
+        }
+      }
+    };
+    unpack(op.a, op.alayout, af);
+    unpack(op.b, op.blayout, bff);
+    // C and D: register r of lane l is element l * 8 + r -- an 8 x 32
+    // transpose each way.
+    if (avx2) {
+      const uint32_t* cr[8];
+      for (int reg = 0; reg < 8; ++reg) cr[reg] = regs(op.c[reg]).data();
+      for (uint32_t lane = 0; lane < W_; lane += 8) gather8x8(cr, lane, cf + lane * 8);
+    } else {
+      for (int reg = 0; reg < 8; ++reg) {
+        const uint32_t* v = regs(op.c[reg]).data();
+        for (uint32_t lane = 0; lane < W_; ++lane) cf[lane * 8 + static_cast<uint32_t>(reg)] = f32(v[lane]);
       }
     }
-    float D[kMmaDim][kMmaDim];
+    alignas(32) float D[kMmaDim][kMmaDim];
     wmma_tile(D, A, B, C, kMmaDim);
+    const float* const df = &D[0][0];
     // Every register of D, written after all of A, B and C have been read:
     // D may name the same registers as C.
+    if (avx2 && m == all_lanes(W_)) {
+      uint32_t* dr[8];
+      for (int reg = 0; reg < 8; ++reg) dr[reg] = dst32(w, op.d[reg].id, m);
+      for (uint32_t lane = 0; lane < W_; lane += 8) scatter8x8(df + lane * 8, dr, lane);
+      return true;
+    }
     for (int reg = 0; reg < 8; ++reg) {
-      uint32_t* d = w.regs32[op.d[reg].id].data();
+      uint32_t* d = dst32(w, op.d[reg].id, m);
       for_active(m, W_, [&](uint32_t lane) {
-        const uint32_t linear = lane * 8 + static_cast<uint32_t>(reg);
-        d[lane] = static_cast<uint32_t>(f32bits(D[linear / kMmaDim][linear % kMmaDim]));
+        d[lane] = static_cast<uint32_t>(f32bits(df[lane * 8 + static_cast<uint32_t>(reg)]));
       });
-      w.written32[op.d[reg].id] = 1;
     }
     return true;
   }
@@ -8546,8 +8722,10 @@ class Interpreter {
     cur_ = &callee;
     w.paths.clear();
     w.paths.push_back(Path{0, m});
-    w.regs32.assign(callee.num_regs32, Lanes32{});
-    w.regs64.assign(callee.num_regs64, Lanes{});
+    w.regs32.clear();
+    w.regs32.resize(callee.num_regs32);
+    w.regs64.clear();
+    w.regs64.resize(callee.num_regs64);
     w.preds.assign(callee.num_regs32 + callee.num_regs64, 0);
     w.written32.assign(callee.num_regs32, 0);
     w.written64.assign(callee.num_regs64, 0);
