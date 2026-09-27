@@ -130,6 +130,9 @@ expect "a kernel reads and writes a peer's memory once peer access is enabled" \
   "$(grep -o '^a kernel on device 0.*' <<< "$out")"
 expect "peer access disabled twice says it is not enabled" "disabling it again: hipErrorPeerAccessNotEnabled" \
   "$(grep -o '^disabling it again.*' <<< "$out")"
+expect "a kernel that failed is reported by the blocking copy after it, once" \
+  "a failed launch is reported by the copy after it: hipErrorLaunchFailure, then hipSuccess" \
+  "$(grep -o '^a failed launch is reported.*' <<< "$out")"
 
 # gfx942's 8-bit floats (fp8 and bf8, without infinities or a negative zero):
 # floats narrowed by the device's instructions, rounded to nearest and
@@ -214,8 +217,8 @@ expect "every RDNA3 wave64 check holds (DPP, output modifiers, double literals)"
 out=$(VGPU_QUIET=1 VGPU_GPU=amd/rx9070xt LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/rdna4.gfx1201" 2>&1)
 status=$?
 expect "the RDNA4 program runs to the end" "0" "$status"
-expect "every RDNA4 check holds (WMMA, scalar floats, split barrier)" "7 of 7" \
-  "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 7"
+expect "every RDNA4 check holds (WMMA, scalar floats, split barrier, SCHED_MODE)" "8 of 8" \
+  "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 8"
 
 # RDNA2 on a simulated Radeon RX 6900 XT (hipcc/rdna2.cpp): SDWA's partial
 # reads and writes, registers indexed through M0, permlane16 and permlanex16,

@@ -408,6 +408,12 @@ hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false) {
       },
       std::move(o.after));
   o.queue->wait(seq);
+  // A blocking call also returns a failure the stream's earlier asynchronous
+  // work left (HIP's "may also return error codes from previous,
+  // asynchronous launches"): a copy back after a kernel that failed says so,
+  // rather than handing over whatever the buffer held.
+  if (*result == hipSuccess)
+    if (const hipError_t e = o.queue->take_error(); e != hipSuccess) return e;
   return *result;
 }
 
