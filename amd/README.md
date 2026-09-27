@@ -294,6 +294,33 @@ modelled:
 - **Scratch:** gfx90a has no flat scratch set up by the hardware. A kernel reaches its private memory through the private segment buffer resource it is handed, with buffer loads and stores the card swizzles across the wave's lanes. The executor hands it that resource and a wave offset, and unswizzles its accesses. This is how rocBLAS's gfx90a kernels spill.
 - **Decoder check:** `tests/data/isa_corpus_gfx90a.txt` holds 1628 instruction shapes from PyTorch's, hipBLASLt's and rocBLAS's gfx90a code. Each decodes, and prints in gfx90a's names (`glc`, `slc`, `v_mfma_f32_32x32x8f16`), as `llvm-objdump` prints it.
 
+## RDNA3 (Radeon RX 7900 XTX)
+
+`VGPU_GPU=amd/rx7900xtx` is a consumer card: gfx1100 (RDNA3), whose code is
+built 32 lanes to a wave. PyTorch's ROCm wheel runs on it unmodified, with its
+own gfx1100 kernels and rocBLAS's, hipBLASLt's, MIOpen's and rocFFT's, and
+passes the same 20 checks as the Instinct parts (ctest
+`amd_pytorch_rx7900xtx`). The fp8 matmul check is refused by PyTorch, as on
+the card, because RDNA3 has no 8-bit floats.
+
+- **Decoder:** gfx11 has its own encodings and instruction numbering. They come from AMD's machine-readable ISA specification (MIT), which `tools/rdna-ops.py` turns into `src/rdna_ops_rdna3.inc`. Every one of the 13 million distinct encodings in the wheel's gfx1100 code decodes and prints as `llvm-objdump` does. That includes VOPD pairs, 16-bit register halves (`v1.l`, `v1.h`), DPP8 and the null register. `tests/data/isa_corpus_gfx1100.txt` keeps 1,759 of their shapes for CI.
+- **Execution:** an RDNA instruction runs as the gfx9 instruction that does the same. The decoder names it after that instruction, using the specification's own record of renamings. On top of that, gfx11 adds:
+  - wave32 (and wave64, where a kernel's descriptor asks for it);
+  - VOPD, whose two halves both read their sources before either writes;
+  - `v_cmpx` writing EXEC alone;
+  - the b32 exec operations;
+  - 16-bit halves, and d16 loads that keep the other half (gfx942 with SRAM ECC zeroes it);
+  - RDNA's buffer resource, with a 7-bit format and OOB_SELECT's bounds checks;
+  - SMEM's offset register;
+  - 106 scalar registers;
+  - WMMA;
+  - the scheduling hints (`s_clause`, `s_delay_alu`).
+- **Checks:** the executor's unit kernels are built for gfx1100 too, and pass every check they pass on gfx942 (ctests `*_gfx1100`). `tests/hipcc/rdna3.cpp` checks VOPD, WMMA in each type and 64-bit literals in wave32, and DPP and output modifiers in wave64.
+
+`VGPU_TRACE_WAVE=1` prints each instruction a work-group's first wave runs,
+with what its destination holds after it for lane 0 (or the lane
+`VGPU_TRACE_LANE` names). That is how the bugs above were found.
+
 ## Textures
 
 The GPUs modelled here, the MI300 family (gfx942 and gfx950), have no texture

@@ -22,7 +22,7 @@ using namespace vgpu;
 namespace {
 
 amd::CodeObject object() {
-  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/vector_add.gfx942.o";
+  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/vector_add." + vtest::amd_target() + ".o";
   std::ifstream in(path, std::ios::binary);
   if (!in) throw vtest::Failure("no code object at " + path);
   return amd::load_code_object(std::string((std::istreambuf_iterator<char>(in)), {}), path);
@@ -85,8 +85,8 @@ VTEST(a_kernel_adds_two_vectors_on_the_wavefront) {
   d.group_size[0] = 256;
   const amd::DispatchStats stats = amd::execute(d, mem);
 
-  // Four work-groups of 256 work-items: four waves each.
-  VCHECK_EQ(stats.waves, 16u);
+  // Four work-groups of 256 work-items: four waves each (eight on RDNA's 32).
+  VCHECK_EQ(stats.waves, 4u * 256 / vtest::amd_wave());
   VCHECK(stats.instructions > 100);
   const std::vector<float> out = download(mem, pout, n);
   for (int i = 0; i < n; ++i)
@@ -160,6 +160,7 @@ VTEST(a_reduction_through_lds_and_a_barrier_sums_its_group) {
 // A work-group's LDS: 64 KB on gfx942, CDNA4's 160 KB on gfx950, as the
 // code object's target says.
 VTEST(a_gfx950_work_group_may_have_160_kb_of_lds_and_a_gfx942_one_64) {
+  if (vtest::amd_wave() == 32) return;   // CDNA code relabelled; RDNA code is not that
   amd::CodeObject o = object();
   const amd::Kernel* k = amd::find_kernel(o, "vector_add");
   VCHECK(k != nullptr);

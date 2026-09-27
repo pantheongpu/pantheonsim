@@ -69,6 +69,9 @@ struct Kernel {
   // PyTorch's and ROCm's libraries asks for, and what a kernel with no
   // descriptor gets.
   uint32_t mode = 0xF0 | 1u << 8 | 1u << 9;
+  // RDNA: the kernel runs 32 lanes to a wave (kernel code property bit 10,
+  // ENABLE_WAVEFRONT_SIZE32), as HIP builds for those GPUs; CDNA is always 64.
+  bool wave32 = false;
 };
 
 // A variable the kernels share: a __device__ global. It lives in the module's
