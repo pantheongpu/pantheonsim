@@ -241,13 +241,13 @@ jobs:
         # HSA, hipcc-built programs, ROCm's libraries -- skips in the other
         # jobs, and nothing ran it: two such tests broke on plain Linux
         # unnoticed. This runner has ROCm 7.1, so they run here. The ML tests
-        # ran above; the workloads, ollama and the CUTLASS compiles run in the
+        # ran above; the workloads, every ollama test and the CUTLASS compiles run in the
         # hosted jobs. A skip is allowed here, since some tests need what no
         # machine here has. A run started by hand for chosen tests skips this.
         if: inputs.ml_tests == ''
         run: >-
           ctest --test-dir build --output-on-failure -j2
-          -E '^(pantheon_workloads|e2e_ollama|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
+          -E '^(pantheon_workloads|.*ollama.*|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
 
   sanitizers:
     name: ASan + UBSan
