@@ -71,6 +71,34 @@ VTEST(zero_byte_alloc_rejected) {
   VCHECK(err.code() == Err::InvalidValue);
 }
 
+// AMD's HIP allocates by the 4 KB page: allocations start on one, and a
+// kernel's read runs on to the end of the last (hipSPARSELt reads a byte past
+// its compressed matrix). Copies and writes past the end are still refused,
+// and without a page size a kernel's read past the end is too.
+VTEST(page_size_lets_a_kernel_read_the_rest_of_the_page) {
+  MemoryManager mm(1 << 20);
+  mm.set_page_size(4096);
+  const uint64_t p = mm.alloc(4608), q = mm.alloc(4);
+  VCHECK_EQ(p % 4096, 0ull);
+  VCHECK_EQ(q, p + 8192);
+  mm.store_scalar(p + 4604, 4, 0x11223344);
+  VCHECK_EQ(mm.load_scalar(p + 4604, 4), 0x11223344ull);
+  VCHECK_EQ(mm.load_scalar(p + 4608, 1), 0ull);      // the rest of the page reads
+  VCHECK_EQ(mm.load_scalar(p + 8188, 4), 0ull);
+  VCHECK(VCAPTURE(Error, mm.store_scalar(p + 4608, 1, 7)).code() == Err::OutOfBounds);
+  std::vector<uint8_t> buf(8);
+  VCHECK(VCAPTURE(Error, mm.read(p + 4604, buf.data(), buf.size())).code() == Err::OutOfBounds);
+  mm.free(q);
+  VCHECK(VCAPTURE(Error, mm.load_scalar(q + 8, 4)).code() == Err::UseAfterFree);
+
+  // Without a page size the next allocation starts right after (4608 is a
+  // multiple of 256), and a read past the end is not this allocation's.
+  MemoryManager strict(1 << 20);
+  const uint64_t r = strict.alloc(4608);
+  VCHECK_CONTAINS(VCAPTURE(Error, strict.load_scalar(r + 4608, 1)).what(), "device memory read");
+  VCHECK_EQ(strict.alloc(4), r + 4608);
+}
+
 VTEST(oob_write_detected_with_context) {
   MemoryManager mm(1 << 20);
   uint64_t p = mm.alloc(256);

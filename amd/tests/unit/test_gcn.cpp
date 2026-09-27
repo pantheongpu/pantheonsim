@@ -243,7 +243,7 @@ VTEST(an_instruction_this_does_not_know_is_refused_by_name) {
   std::string what;
   try {
     // VOP3 with an opcode nothing uses.
-    const std::vector<uint8_t> code = {0x00, 0x00, 0xff, 0xd3, 0x00, 0x00, 0x00, 0x00};
+    const std::vector<uint8_t> code = {0x00, 0x00, 0x9b, 0xd3, 0x00, 0x00, 0x00, 0x00};
     amd::gcn::decode(code, 0, 0);
   } catch (const std::exception& e) {
     what = e.what();

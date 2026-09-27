@@ -99,9 +99,18 @@ builds a program against rocBLAS and checks its level-1 routines and its
 float and double GEMMs -- ragged sizes, every transpose -- against the same
 arithmetic on the host; both need ROCm with rocBLAS installed and skip
 elsewhere. AMD's own rocBLAS test suite, built from ROCm 7.1's source, runs
-on it as well: of an even 1% sample of its quick float and double tests
-(1,629 of them, each checked against OpenBLAS), 1,435 pass. The half,
-bfloat16, int8 and FP8 GEMMs are not decoded yet.
+on it as well: all 162,807 of its quick float and double tests pass, each
+checked against OpenBLAS, and its half, bfloat16, int8 and FP8 GEMMs run too.
+
+hipSPARSELt, from PyTorch's ROCm wheel, runs its 2:4 structured-sparse GEMMs
+on it: its own kernels prune a matrix, compress it into values and indices,
+and multiply with the sparse matrix instructions (`tests/e2e/
+run_hipsparselt.sh`, ctests `amd_hipsparselt` and `amd_hipsparselt_mi350x`,
+each product checked against the host's). Its kernels read a byte past the
+end of a buffer, which a card allows because HIP hands out device memory by
+the 4 KB page. AMD devices here allocate the same way. A kernel's read of the
+rest of its buffer's last page is served, but a copy or a write past the end
+is still refused.
 
 The instructions implemented are those clang emits for the kernels in
 `tests/data/`, and those rocBLAS's own kernels and Tensile's float and double
@@ -256,6 +265,7 @@ modelled:
   - the `f8f6f4` ones, whose sources are fp8, bf8, fp6, bf6 or fp4, as each one's CBSZ or BLGP says
 - **8-bit floats:** the same fp8 instructions mean the OCP formats on gfx950 (E4M3 and E5M2), where gfx942's are FNUZ. Which one applies is read from the code object's target. `tests/hipcc/fp8.cpp`, built for each, checks every conversion against HIP's own software one.
 - **Block-scaled matrix instructions:** `v_mfma_scale_*_f8f6f4` scales each lane's row and 32 values along K by an E8M0 byte of its scale register, the byte `{OP_SEL_HI, OP_SEL}` names, as the CDNA4 ISA reference guide says. `v_prng_b32` is its LFSR step. `tests/hipcc/gfx950.cpp` checks both, and the lane swaps, against the guide.
+- **Sparse matrix instructions:** `v_smfmac_*`, gfx942's and gfx950's (whose K is twice as long), take A 2:4 sparse along K: two values held of each four, and an index register that says which of the four each is. CBSZ and ABID choose a set of indices in that register. On gfx950 their B is eight registers split into two runs of K, K/2 apart, where A's run is in one piece; the guide's B tables show this, and hipSPARSELt's gfx950 kernels are right only with it. `tests/hipcc/smfmac.cpp`, built for each target, checks every form against the guides, and hipSPARSELt checks them in real GEMMs.
 - **Decoder check:** `tests/data/isa_corpus_gfx950.txt` holds every instruction shape PyTorch's, hipBLASLt's and rocBLAS's gfx950 code uses. The decoder must print each one as `llvm-objdump` does.
 - **Extracting code objects:** `amd_fatbin_extract` (`tools/fatbin-extract.cpp`) writes out what a library carries for one target, which is how that corpus is gathered.
 

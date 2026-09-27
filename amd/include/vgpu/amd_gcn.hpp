@@ -89,6 +89,9 @@ struct Inst {
   // scales, and scale_sel which byte of each register (bits 0-1 A's, 2-3 B's):
   // {OP_SEL_HI, OP_SEL} of the prefix, per source.
   bool scaled = false;
+  // The sparse matrix instructions (v_smfmac_*): which set of indices in the
+  // index register -- ABID, where CBSZ is 0; the first set otherwise.
+  uint8_t abid = 0;
   uint8_t scale_sel = 0;
   // The processor it was decoded for, which names some instructions and
   // cache bits otherwise when it is printed (gfx90a's glc, slc and scc).
