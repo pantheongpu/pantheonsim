@@ -827,24 +827,29 @@ narrows what counts as observable, not what the detector looks at.
   -- for a CTA pair with `.cta_group::2` -- and checked for leaks at exit;
   `tcgen05.ld`/`st` in all five shapes with pack/unpack, each warp kept to
   its quarter of the lanes; `tcgen05.mma` for `.kind::f16`, `tf32`,
-  `f8f6f4` (the 8-, 6- and 4-bit types) and `i8`, and block-scaled
-  (`mxf8f6f4`, `mxf4`, `mxf4nvf4`, UE8M0 and UE4M3 factors from Tensor
-  Memory), dense or with sparse A (`tcgen05.mma.sp`), one CTA (M = 64/128) or a pair (M = 128/256), A from shared or
-  Tensor Memory, with the data-path layouts of figures 211-222;
-  `tcgen05.cp` (the 128- and 32-row shapes, `.warpx4`); `tcgen05.commit`
-  (multicast too), the fences and waits.
+  `f8f6f4` (the 8-, 6- and 4-bit types, K- or MN-major) and `i8`, and
+  block-scaled (`mxf8f6f4`, `mxf4`, `mxf4nvf4`, UE8M0 and UE4M3 factors
+  from Tensor Memory), dense or with sparse A (`tcgen05.mma.sp`, the
+  metadata as figures 287-292 lay it out), one CTA (M = 64/128) or a pair
+  (M = 128/256), A from shared or Tensor Memory, with the data-path layouts
+  A-D and F of figures 211-222; `tcgen05.cp` (the 128- and 32-row shapes,
+  `.warpx4`); `tcgen05.commit` (multicast too), the fences and waits.
   Around it: cluster launch control (`try_cancel` takes over clusters that
   have not started, so CUTLASS's persistent loop really loops), `.b128`
-  registers, TMA's `.cta_group::2` and `.tile::gather4`/`scatter4`, and the
-  128-byte swizzle in 32- and
-  64-byte atoms for TMA, `tensormap.replace` and the tcgen05 descriptor. A
-  CTA's shared addresses now carry its cluster rank in bits 24 and up, as
-  CUTLASS's 2-SM kernels assume. Checked by unit tests (the ld/st figures as
-  tables, every kind and layout against a host GEMM, the pair layouts, the
-  launch-control takeover, TMA through the peer bit) and by CUTLASS's own
-  SM100 GEMM tests (f16 1-SM, 2-SM and stream-K, f8, s8), unmodified,
-  against its host reference. Weight-stationary MMAs, `tcgen05.shift`, and `tcgen05.cp`'s `.warpx2` and decompression are
-  refused by name.
+  registers, TMA's `.cta_group::2`, `.tile::gather4`/`scatter4` and packed
+  fp4/fp6 tensors, and the 128-byte swizzle in 32- and 64-byte atoms for
+  TMA, `tensormap.replace` and the tcgen05 descriptor. A CTA's shared
+  addresses carry its cluster rank in bits 24 and up, as CUTLASS's 2-SM
+  kernels assume. Checked by unit tests (the ld/st figures as tables, every
+  kind and layout against a host GEMM, the metadata placement, the pair
+  layouts, the launch-control takeover, TMA through the peer bit) and by
+  CUTLASS's own SM100 GEMM tests, unmodified, against its host reference:
+  dense f16 (1-SM, 2-SM, stream-K), f8 and s8 (24 cases); sparse f16, tf32,
+  f8 and s8 (88); block-scaled mxf8f6f4, mxf6, mxf8 x mxf4, mxf4 and nvf4
+  (38 cases in six files). Weight-stationary MMAs (`.ws`: CUTLASS never
+  issues them, and the ISA's zero-column-mask examples contradict each
+  other), `tcgen05.shift`, and `tcgen05.cp`'s `.warpx2` and decompression
+  are refused by name.
   See nvidia/docs/blackwell.md.
 
 - The CTA's sixteen barriers (PTX ISA 9.7.15.1): `bar.sync` and
