@@ -304,7 +304,9 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   use one of their own (the logical matrix, spread in order over lanes and
   registers); the combinations above keep theirs. wmma_types.cu checks all 21
   shape/type/layout combinations through mma.h, exactly;
-  ldmatrix.m8n8.x{1,2,4}[.trans] and movmatrix.m8n8.trans (the
+  ldmatrix.m8n8.x{1,2,4}[.trans], the 8-bit .m8n16 and .m16n16.trans
+  (fp6/fp4 expanded into the low bits of each byte, .s4 to .s8), and
+  movmatrix.m8n8.trans (the
   register-only transpose). mma.sync in every form the ISA lists: Volta's m8n8k4 f16 (four
   products, any layouts, f16/f32 accumulators), f64 m8n8k4 and m16n8k4/8/16
   in each rounding mode, tf32, f16/bf16, s8/u8 and s4/u4 (mixed signedness,
@@ -326,7 +328,7 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   accumulation order of a float sum is unspecified and not modelled: with
   inputs whose products round, m16n8k8 tf32 differs from the GPU in low bits.
   CUTLASS's 19 SM80 sparse GEMM tests pass.
-  stmatrix.m8n8.x{1,2,4}[.trans] is the store counterpart of ldmatrix: the warp
+  stmatrix.m8n8.x{1,2,4}[.trans] (and .m16n8.trans.b8) is the store counterpart of ldmatrix: the warp
   writes the 8x8 matrices its registers hold back to shared memory, which is how
   a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
   checks where every element lands and that a fragment stored by one instruction
