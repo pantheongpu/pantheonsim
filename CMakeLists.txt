@@ -871,6 +871,17 @@ set_tests_properties(amd_pytorch_models PROPERTIES DEPENDS vgpuhip RUN_SERIAL TR
 add_test(NAME amd_pytorch_models_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh models.py 12 1 amd/mi350x)
 set_tests_properties(amd_pytorch_models_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+# And on the other simulated AMD GPUs: gfx90a (CDNA2), and the Radeon cards,
+# whose RDNA3 and RDNA4 run wave32 and their own matrix instructions (WMMA).
+add_test(NAME amd_pytorch_models_mi250x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh models.py 12 1 amd/mi250x)
+set_tests_properties(amd_pytorch_models_mi250x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+add_test(NAME amd_pytorch_models_rx7900xtx COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh models.py 12 1 amd/rx7900xtx)
+set_tests_properties(amd_pytorch_models_rx7900xtx PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+add_test(NAME amd_pytorch_models_rx9070xt COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh models.py 12 1 amd/rx9070xt)
+set_tests_properties(amd_pytorch_models_rx9070xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
 # Composable Kernel's GEMMs, which PyTorch runs when told to prefer CK.
 add_test(NAME amd_pytorch_ck COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh ck.py 3 1)
 set_tests_properties(amd_pytorch_ck PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
