@@ -1,7 +1,12 @@
 // Tests for the runtime facade: devices, modules, function lookup.
 #include "vgpu/runtime/runtime.hpp"
 
+#include <cstdlib>
+#include <cstring>
 #include <string>
+#include <vector>
+
+#include "vgpu/exec/launch.hpp"
 
 #include "vgpu/error.hpp"
 #include "vgpu/registry.hpp"
@@ -98,6 +103,77 @@ VTEST(peer_copy_between_virtual_devices) {
   uint32_t scratch = 0;
   auto err = VCAPTURE(Error, rt.device(1).memory().read(p0 + 4096, &scratch, 4));
   VCHECK(err.code() == Err::InvalidPointer);
+}
+
+// A large module's kernels are parsed one at a time, when first looked up
+// (runtime.cpp, "lazy modules"); VGPU_LAZY_MODULE_BYTES=0 makes even a small
+// one lazy. Its kernels still share the module's globals, reach its device
+// functions, see function addresses in the module's order, and an unsupported
+// instruction in a kernel nothing launches no longer stops the module loading.
+VTEST(large_modules_parse_kernels_when_first_used) {
+  setenv("VGPU_LAZY_MODULE_BYTES", "0", 1);
+  runtime::Runtime rt(load_gpu("nvidia/b200"));
+  auto& dev = rt.device(0);
+  const uint64_t mod = dev.load_module(R"(.version 8.7
+.target sm_100a
+.address_size 64
+.global .align 4 .u32 g;
+.func (.param .b32 r) twice(.param .b32 x)
+{
+  .reg .b32 %a;
+  ld.param.b32 %a, [x];
+  add.s32 %a, %a, %a;
+  st.param.b32 [r], %a;
+  ret;
+}
+.visible .entry set_g()
+{
+  .reg .b64 %p;
+  .reg .b32 %v;
+  mov.u64 %p, g;
+  mov.u32 %v, 21;
+  st.global.u32 [%p], %v;
+  ret;
+}
+.visible .entry unused()
+{
+  .reg .b32 %r<2>;
+  tcgen05.ld.red.sync.aligned.32x32b.x2.max.f32 {%r0, %r1}, %r0, [%r1];
+  ret;
+}
+.visible .entry read_g(.param .u64 out)
+{
+  .reg .b64 %p<3>;
+  .reg .b32 %v<2>;
+  ld.param.u64 %p0, [out];
+  mov.u64 %p1, g;
+  ld.global.u32 %v0, [%p1];
+  {
+  .param .b32 param0;
+  st.param.b32 [param0], %v0;
+  .param .b32 retval0;
+  call.uni (retval0), twice, (param0);
+  ld.param.b32 %v1, [retval0];
+  }
+  st.global.u32 [%p0], %v1;
+  mov.u64 %p2, twice;
+  st.global.u64 [%p0+8], %p2;
+  ret;
+}
+)");
+  unsetenv("VGPU_LAZY_MODULE_BYTES");
+  const uint64_t out = dev.memory().alloc(16);
+  auto arg = [](uint64_t v) {
+    std::vector<uint8_t> b(8);
+    std::memcpy(b.data(), &v, 8);
+    return b;
+  };
+  dev.launch(*dev.get_function(mod, "set_g"), exec::LaunchConfig{}, {}, dev.symbols(mod));
+  dev.launch(*dev.get_function(mod, "read_g"), exec::LaunchConfig{}, {arg(out)}, dev.symbols(mod));
+  VCHECK_EQ(dev.memory().load_scalar(out, 4), 42ull);   // set_g's global, doubled by twice
+  VCHECK_EQ(dev.memory().load_scalar(out + 8, 8), dev.symbols(mod)->at("twice"));
+  auto err = VCAPTURE(Error, dev.get_function(mod, "unused"));
+  VCHECK(err.code() == Err::UnsupportedPtx);
 }
 
 VTEST_MAIN
