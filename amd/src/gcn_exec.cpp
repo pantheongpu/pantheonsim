@@ -503,8 +503,10 @@ struct Machine {
       kOcpFp8{3, 7, 448.0, F8::OcpE4M3, 8}, kOcpBf8{2, 15, 57344.0, F8::OcpE5M2, 8}, kFp6{3, 1, 7.5, F8::Finite, 6},
       kBf6{2, 3, 28.0, F8::Finite, 6}, kFp4{1, 1, 6.0, F8::Finite, 4};
   // The 8-bit formats the code's processor has.
-  const F8& fp8() const { return d.object->gfx950() ? kOcpFp8 : kFp8; }
-  const F8& bf8() const { return d.object->gfx950() ? kOcpBf8 : kBf8; }
+  // gfx950 and RDNA4 use the OCP formats; gfx942's are FNUZ.
+  bool ocp8() const { return d.object->gfx950() || target() == gcn::Target::Gfx1200; }
+  const F8& fp8() const { return ocp8() ? kOcpFp8 : kFp8; }
+  const F8& bf8() const { return ocp8() ? kOcpBf8 : kBf8; }
   static float f8_to_float(uint32_t v, const F8& t) {
     const uint32_t sign_bit = 1u << (t.bits - 1);
     v &= (sign_bit << 1) - 1;
@@ -1532,6 +1534,35 @@ struct Machine {
         }
         write_lane(w, in.dst[0], lane, v);
       });
+    } else if (op.rfind("v_s_", 0) == 0) {
+      // RDNA4's transcendentals on a scalar, into a scalar register: the
+      // vector unit's reciprocal, square root, exponent and logarithm, once.
+      // (A 16-bit one reads and writes the low half.)
+      const bool half = op.rfind("_f16") == op.size() - 4;
+      const uint32_t raw = static_cast<uint32_t>(scalar(w, in.src[0]));
+      double x;
+      if (half) {
+        _Float16 h;
+        const uint16_t b16 = static_cast<uint16_t>(raw);
+        std::memcpy(&h, &b16, 2);
+        x = static_cast<double>(h);
+      } else {
+        x = as_float(raw);
+      }
+      if (in.src[0].neg) x = -x;
+      if (in.src[0].abs) x = std::fabs(x);
+      const std::string f = op.substr(4, op.size() - 8);   // exp, log, rcp, rsq, sqrt
+      const double r = f == "exp" ? std::exp2(x) : f == "log" ? std::log2(x) : f == "rcp" ? 1.0 / x
+                       : f == "rsq" ? 1.0 / std::sqrt(x) : f == "sqrt" ? std::sqrt(x)
+                       : throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
+      if (half) {
+        const _Float16 h = static_cast<_Float16>(r);
+        uint16_t b16;
+        std::memcpy(&b16, &h, 2);
+        write_scalar(w, in.dst[0], b16);
+      } else {
+        write_scalar(w, in.dst[0], as_bits(static_cast<float>(r)));
+      }
     } else if (op.rfind("v_wmma_", 0) == 0) {
       wmma(w, in, op);
     } else if (op == "v_xor3_b32"_op) {
@@ -1552,74 +1583,106 @@ struct Machine {
     return true;
   }
 
-  // RDNA3's matrix instructions (v_wmma_*_16x16x16_*): D = A x B + C for one
-  // 16x16 tile, K 16, across a wave32. As AMD lays it out for gfx11: lane l
-  // holds row l % 16 of A and column l % 16 of B, all sixteen of K (the two
-  // halves of the wave hold the same, and the first is read); register i of
-  // lane l holds D[2i + l / 16][l % 16], C likewise. A 16-bit result goes to
-  // the half of each register OP_SEL's bit 2 names. The integer forms read
-  // their inputs signed where NEG's bit for them is set, and CLAMP saturates.
-  // Each output's products and addend are summed exactly (double) and
-  // rounded once.
+  // RDNA's matrix instructions (v_wmma_*): D = A x B + C for one 16x16 tile
+  // across a wave32, as AMD lays it out.
+  //   gfx11: lane l holds row l % 16 of A and column l % 16 of B, all of K
+  //     (the two halves of the wave hold the same, and the first is read);
+  //     register i of lane l is D[2i + l / 16][l % 16]; a 16-bit result goes
+  //     to the half of each register OP_SEL's bit 2 names.
+  //   gfx12: lane l holds row (column) l % 16 and half of K, the half l / 16;
+  //     element i of lane l is D[i + 8 * (l / 16)][l % 16], 16-bit results
+  //     two to a register.
+  // The integer forms read their inputs signed where NEG's bit for them is
+  // set, and CLAMP saturates; gfx12's 8-bit floats are the OCP formats. Each
+  // output's products and addend are summed exactly (double) and rounded once.
   void wmma(Wave& w, const Inst& in, const OpName& op) {
     if (w.lanes != 32 || static_cast<uint32_t>(w.exec) != 0xFFFFFFFFu)
       throw Error::make(Err::Unsupported, in.name, " with lanes switched off, or in a wave64, which this does not model");
-    const std::string name = op;
-    const std::string out = name.substr(7, name.find('_', 7) - 7);          // f32, f16, bf16, i32
-    const std::string inputs = name.substr(name.rfind('_') + 1);            // f16, bf16, iu8, iu4
+    const bool g12 = in.arch == gcn::Target::Gfx1200;
+    const std::string name = op;   // v_wmma_<out>_16x16x<K>_<a>[_<b>]
+    const std::string out = name.substr(7, name.find('_', 7) - 7);
+    const size_t shape_at = name.find("16x16x");
+    const uint32_t K = static_cast<uint32_t>(std::stoul(name.substr(shape_at + 6)));
+    const std::string types = name.substr(name.find('_', shape_at) + 1);          // "f16", "iu8", "fp8_bf8", ...
+    const std::string ta = types.substr(0, types.find('_')), tb = types.find('_') == std::string::npos ? ta : types.substr(types.find('_') + 1);
     const bool a_signed = in.neg_lo & 1, b_signed = (in.neg_lo >> 1) & 1;
-    const auto element = [&](const Operand& o, uint32_t lane, uint32_t k, bool is_signed) -> double {
-      if (inputs == "f16" || inputs == "bf16") {
-        const uint32_t bits = (word(w, o, k / 2, lane) >> (16 * (k % 2))) & 0xFFFF;
-        if (inputs == "bf16") return static_cast<double>(as_float(bits << 16));
+    const uint32_t per_lane = g12 ? K / 2 : K;
+    const auto element = [&](const Operand& o, const std::string& t, uint32_t lane, uint32_t e, bool is_signed) -> double {
+      if (t == "f16" || t == "bf16") {
+        const uint32_t bits = (word(w, o, e / 2, lane) >> (16 * (e % 2))) & 0xFFFF;
+        if (t == "bf16") return static_cast<double>(as_float(bits << 16));
         _Float16 h;
         const uint16_t b16 = static_cast<uint16_t>(bits);
         std::memcpy(&h, &b16, 2);
         return static_cast<double>(h);
       }
-      if (inputs == "iu8") {
-        const uint32_t byte = (word(w, o, k / 4, lane) >> (8 * (k % 4))) & 0xFF;
+      if (t == "iu8" || t == "fp8" || t == "bf8") {
+        const uint32_t byte = (word(w, o, e / 4, lane) >> (8 * (e % 4))) & 0xFF;
+        if (t == "fp8") return f8_to_float(byte, kOcpFp8);
+        if (t == "bf8") return f8_to_float(byte, kOcpBf8);
         return is_signed ? static_cast<int8_t>(byte) : byte;
       }
-      const uint32_t nib = (word(w, o, k / 8, lane) >> (4 * (k % 8))) & 0xF;   // iu4
+      const uint32_t nib = (word(w, o, e / 8, lane) >> (4 * (e % 8))) & 0xF;   // iu4
       return is_signed ? static_cast<int32_t>(nib << 28) >> 28 : nib;
+    };
+    // Where A[row][k] (B[k][col]) is: which lane, and which of its values.
+    const auto input = [&](const Operand& o, const std::string& t, uint32_t rc, uint32_t k, bool sg) {
+      return g12 ? element(o, t, rc + 16 * (k / per_lane), k % per_lane, sg) : element(o, t, rc, k, sg);
     };
     const bool half_out = out == "f16" || out == "bf16";
     const bool high = (in.op_sel >> 2) & 1;
-    const auto c_value = [&](uint32_t lane, uint32_t i) -> double {
-      const Operand& c = in.src[2];
-      if (c.kind != OperandKind::Vgpr) {
-        if (c.kind == OperandKind::InlineFloat) return c.fvalue;
-        return static_cast<double>(static_cast<int32_t>(scalar(w, c)));
+    // Where D[row][col] is: the lane, and the register and half of it.
+    const auto place = [&](uint32_t row, uint32_t col, uint32_t* lane, uint32_t* reg, uint32_t* half) {
+      if (g12) {
+        *lane = col + 16 * (row / 8);
+        const uint32_t i = row % 8;
+        *reg = half_out ? i / 2 : i;
+        *half = half_out ? i % 2 : 0;
+      } else {
+        *lane = col + 16 * (row % 2);
+        *reg = row / 2;
+        *half = half_out && high ? 1 : 0;
       }
-      const uint32_t v = word(w, c, i, lane);
-      if (out == "f32") return static_cast<double>(as_float(v));
-      if (out == "i32") return static_cast<double>(static_cast<int32_t>(v));
-      const uint32_t bits = high ? v >> 16 : v & 0xFFFF;
+    };
+    const auto from_half = [&](uint32_t bits) -> double {
       if (out == "bf16") return static_cast<double>(as_float(bits << 16));
       _Float16 h;
       const uint16_t b16 = static_cast<uint16_t>(bits);
       std::memcpy(&h, &b16, 2);
       return static_cast<double>(h);
     };
-    // The result, lane by lane, into a copy first: D may be C, or A or B.
+    const auto c_value = [&](uint32_t lane, uint32_t reg, uint32_t half) -> double {
+      const Operand& c = in.src[2];
+      if (c.kind != OperandKind::Vgpr) {
+        if (c.kind == OperandKind::InlineFloat) return c.fvalue;
+        return static_cast<double>(static_cast<int32_t>(scalar(w, c)));
+      }
+      const uint32_t v = word(w, c, reg, lane);
+      if (out == "f32") return static_cast<double>(as_float(v));
+      if (out == "i32") return static_cast<double>(static_cast<int32_t>(v));
+      return from_half(half ? v >> 16 : v & 0xFFFF);
+    };
+    // The result, into a copy first: D may be C, or A or B.
     std::array<std::array<uint32_t, 8>, 32> result{};
     for (uint32_t lane = 0; lane < 32; ++lane)
-      for (uint32_t i = 0; i < 8; ++i) {
-        const uint32_t row = 2 * i + lane / 16, col = lane % 16;
-        double sum = c_value(lane, i);
+      for (uint32_t r = 0; r < 8; ++r) result[lane][r] = word(w, in.dst[0], r, lane);
+    for (uint32_t row = 0; row < 16; ++row)
+      for (uint32_t col = 0; col < 16; ++col) {
+        uint32_t lane, reg, half;
+        place(row, col, &lane, &reg, &half);
+        double sum = c_value(lane, reg, half);
         int64_t isum = static_cast<int64_t>(sum);
-        for (uint32_t k = 0; k < 16; ++k) {
-          const double a = element(in.src[0], row, k, a_signed), b = element(in.src[1], col, k, b_signed);
+        for (uint32_t k = 0; k < K; ++k) {
+          const double a = input(in.src[0], ta, row, k, a_signed), b = input(in.src[1], tb, col, k, b_signed);
           if (out == "i32") isum += static_cast<int64_t>(a) * static_cast<int64_t>(b);
           else sum += a * b;
         }
-        uint32_t v;
+        uint32_t& slot = result[lane][reg];
         if (out == "i32") {
           if (in.clamp) isum = std::clamp<int64_t>(isum, INT32_MIN, INT32_MAX);
-          v = static_cast<uint32_t>(isum);
+          slot = static_cast<uint32_t>(isum);
         } else if (out == "f32") {
-          v = as_bits(static_cast<float>(sum));
+          slot = as_bits(static_cast<float>(sum));
         } else {
           uint32_t bits;
           if (out == "bf16") {
@@ -1631,14 +1694,12 @@ struct Machine {
             std::memcpy(&b16, &h, 2);
             bits = b16;
           }
-          const uint32_t was = word(w, in.dst[0], i, lane);
-          v = high ? (was & 0xFFFF) | bits << 16 : (was & 0xFFFF0000u) | bits;
+          slot = half ? (slot & 0xFFFF) | bits << 16 : (slot & 0xFFFF0000u) | bits;
         }
-        result[lane][i] = v;
       }
-    (void)half_out;
+    const uint32_t regs = in.dst[0].width;
     for (uint32_t lane = 0; lane < 32; ++lane)
-      for (uint32_t i = 0; i < 8; ++i) set_word(w, in.dst[0], i, lane, result[lane][i]);
+      for (uint32_t r = 0; r < regs && r < 8; ++r) set_word(w, in.dst[0], r, lane, result[lane][r]);
   }
 
   // The integer, 16-bit, half-precision and double instructions PyTorch's
@@ -4257,6 +4318,14 @@ struct Machine {
         lds_access(w, in, g);
         return true;
       case gcn::Enc::Flat:
+        // RDNA4's cache write-back and invalidate (global_wb, global_inv,
+        // global_wbinv), which its fences compile to: every access here
+        // reaches memory directly, so they order the host's threads and no more.
+        if (OpName(in.name) == "global_inv"_op || OpName(in.name) == "global_wb"_op ||
+            OpName(in.name) == "global_wbinv"_op) {
+          std::atomic_thread_fence(std::memory_order_seq_cst);
+          return true;
+        }
         ++n.vmem;
         ++n.flat;
         if (in.name.find("_atomic") != std::string::npos) ++n.flat_atomic;

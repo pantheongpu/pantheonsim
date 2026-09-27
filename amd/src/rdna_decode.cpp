@@ -532,6 +532,9 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
       case K::Depctr:
       case K::Delay:
         in.simm = static_cast<int32_t>(field(f));
+        // SOPK's constant is signed (s_movk_i32 s4, 0xffec is -20), as gfx9's
+        // decoder keeps it; the unsigned forms take its low 16 bits.
+        if (in.enc == Enc::Sopk) in.simm = static_cast<int16_t>(in.simm);
         if (op.kind == K::Label) in.target = pc + 4 + 4 * static_cast<int64_t>(static_cast<int16_t>(in.simm));
         continue;
       case K::Simm32: {
@@ -893,8 +896,11 @@ std::string one(const Inst& i) {
   if (short_form && (i.dpp || i.dpp8)) s += "_dpp";
   else if (short_form && table().long_forms.count(name) && name != "v_readfirstlane_b32" && name != "v_nop")
     s += "_e32";
-  if (i.enc == Enc::Vop3 && i.promoted) s += i.dpp || i.dpp8 ? "_e64_dpp" : "_e64";
-  if (i.enc == Enc::Vop3 && !i.promoted && (i.dpp || i.dpp8)) s += "_e64_dpp";
+  // The long form of an instruction with a short one says so (_e64); the
+  // table says which, whatever the executor runs it as.
+  const bool promoted = i.enc == Enc::Vop3 && table().short_forms.count(name);
+  if (i.enc == Enc::Vop3 && promoted) s += i.dpp || i.dpp8 ? "_e64_dpp" : "_e64";
+  if (i.enc == Enc::Vop3 && !promoted && (i.dpp || i.dpp8)) s += "_e64_dpp";
 
   if (i.enc == Enc::Sopp) {
     if (name == "s_waitcnt") return s + " " + waitcnt(static_cast<uint32_t>(i.simm));

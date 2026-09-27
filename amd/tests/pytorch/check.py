@@ -53,7 +53,7 @@ check('attention', lambda d: F.scaled_dot_product_attention(q.to(d), k.to(d), vv
 torch.manual_seed(1)
 # The 8-bit float the device's hardware has: gfx942's is FNUZ (no negative
 # zero, one NaN), gfx950's the OCP format every other vendor uses.
-F8 = torch.float8_e4m3fn if torch.cuda.get_device_properties(0).gcnArchName.startswith('gfx950') \
+F8 = torch.float8_e4m3fn if torch.cuda.get_device_properties(0).gcnArchName.startswith(('gfx950', 'gfx12')) \
     else torch.float8_e4m3fnuz
 x8, w8 = (torch.randn(32, 64) * 2).to(F8), (torch.randn(48, 64) * 2).to(F8)
 

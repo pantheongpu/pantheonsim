@@ -164,6 +164,13 @@ VTEST(every_gfx1100_instruction_shape_decodes_as_llvm_prints_it) {
   check_corpus("isa_corpus_gfx1100.txt", amd::gcn::Target::Gfx1100);
 }
 
+// And gfx1201 (RDNA4): gfx11's scalar and vector encodings, and its own
+// three-word buffer, flat, global and scratch ones, with their TH and SCOPE
+// cache policy.
+VTEST(every_gfx1201_instruction_shape_decodes_as_llvm_prints_it) {
+  check_corpus("isa_corpus_gfx1201.txt", amd::gcn::Target::Gfx1200);
+}
+
 // The cache every launch of a module shares: an instruction is decoded once,
 // however many threads reach it at the same moment, and all of them get the
 // same copy; a word past the end of the code is not cached.
