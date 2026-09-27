@@ -1153,7 +1153,9 @@ void print_smi_usage(FILE* to) {
       "      --csv                   A fixed CSV of the main columns\n"
       "      --rocm [ARGS]           rocm-smi, with rocm-smi's own arguments (--rocm --help)\n"
       "      --agents                rocm_agent_enumerator's output\n"
-      "      --lspci, --lspci-dump   A PCI listing, or config space for `lspci -F`\n"
+      "      --lspci [OPTIONS]       lspci's listing, for a machine without lspci\n"
+      "      --lspci-dump            Config space, for `lspci -F`\n"
+      "      --lspci-ids FILE        A PCI ID database naming the simulated cards, for `lspci -i`\n"
       "\n"
       "Exit status: 0 success, 2 invalid argument, 6 no such device.\n");
 }
@@ -1551,11 +1553,23 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
 
 // amd-smi (amdsmi.cpp).
 int cmd_amd_smi(const std::vector<std::string>& args);
+// lspci, and the PCI ID database a session's lspci names devices from (lspci.cpp).
+int cmd_lspci(const std::vector<std::string>& args);
+int cmd_lspci_ids(const std::string& out_path);
 
 int cmd_smi(const std::vector<std::string>& args) {
   // rocm-smi has arguments of its own, some of which mean something else to
   // nvidia-smi (-i, -d), so it gets its own parser.
   for (size_t k = 0; k < args.size(); ++k) {
+    // lspci's options are lspci's: everything after --lspci is one.
+    if (args[k] == "--lspci") return cmd_lspci(std::vector<std::string>(args.begin() + static_cast<std::ptrdiff_t>(k) + 1, args.end()));
+    if (args[k] == "--lspci-ids") {
+      if (k + 1 >= args.size()) {
+        std::fprintf(stderr, "vgpu smi: --lspci-ids needs a file to write\n");
+        return 2;
+      }
+      return cmd_lspci_ids(args[k + 1]);
+    }
     if (args[k] == "--rocm" || args[k] == "--amd") {
       std::vector<std::string> rest(args.begin(), args.end());
       rest.erase(rest.begin() + static_cast<std::ptrdiff_t>(k));

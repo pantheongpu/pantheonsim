@@ -102,6 +102,29 @@ int gpu_of(hsa_agent_t a) {
 bool valid_agent(hsa_agent_t a) { return a.handle == kCpuAgent || gpu_of(a) >= 0; }
 hsa_agent_t gpu_agent(int i) { return {kGpuAgentBase + static_cast<uint64_t>(i)}; }
 
+// What AMD's runtime reports of a chip beyond the profile: its compute units
+// to each of HIP's multiprocessors (RDNA's workgroup processor is two), SIMDs
+// to a compute unit, shader engines and arrays in each, compute dies, the
+// vector L1 and the last-level (Infinity) cache, and the memory interface.
+// From AMD's published specifications of each part.
+struct Chip {
+  uint32_t cus_per_mp, simds, engines, arrays, xccs, l1_kb, l3_mb, mem_bits, mem_mhz;
+};
+Chip chip(const vgpu::DeviceProfile& p) {
+  const std::string& a = p.gcn_arch;
+  if (a == "gfx950") return {1, 4, 32, 1, 8, 32, 256, 8192, 2000};   // MI350X: 8 XCDs of 4 engines
+  if (a == "gfx942") return {1, 4, 32, 1, 8, 32, 256, 8192, 1300};   // MI300X, MI325X
+  if (a == "gfx90a") return {1, 4, 8, 1, 1, 16, 0, 4096, 1600};      // MI250X, one die
+  if (a == "gfx1100") return {2, 2, 6, 2, 1, 32, 96, 384, 2500};     // RX 7900 XTX, Navi 31
+  if (a == "gfx1201") return {2, 2, 4, 2, 1, 32, 64, 256, 2518};     // RX 9070 XT, Navi 48
+  if (a == "gfx1030") return {2, 2, 4, 2, 1, 16, 128, 256, 2000};    // RX 6900 XT, Navi 21
+  return {1, 4, 32, 1, 8, 32, 256, 8192, 1300};
+}
+uint32_t chip_id(const vgpu::DeviceProfile& p) { return p.telemetry.pci_device_id ? p.telemetry.pci_device_id : 0x74a1; }
+uint32_t compute_units(const vgpu::DeviceProfile& p) {
+  return static_cast<uint32_t>(p.limits.multiprocessors) * chip(p).cus_per_mp;
+}
+
 // The pools each agent has. The CPU's: system memory, fine-grained and the
 // one kernel arguments come from; and system memory, coarse-grained. A GPU's:
 // its own memory, coarse-grained; and its LDS, the group segment, which
@@ -585,7 +608,12 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
     case HSA_AGENT_INFO_DEVICE: put<uint32_t>(value, is_gpu ? HSA_DEVICE_TYPE_GPU : HSA_DEVICE_TYPE_CPU); break;
     case HSA_AGENT_INFO_CACHE_SIZE: {
       uint32_t sizes[4] = {0, 0, 0, 0};
-      if (is_gpu) sizes[0] = 16 * 1024, sizes[1] = static_cast<uint32_t>(shared::profile(gpu).limits.l2_cache_bytes);
+      if (is_gpu) {
+        const auto& p = shared::profile(gpu);
+        sizes[0] = chip(p).l1_kb * 1024;
+        sizes[1] = static_cast<uint32_t>(p.limits.l2_cache_bytes);
+        sizes[2] = chip(p).l3_mb * 1024 * 1024;
+      }
       std::memcpy(value, sizes, sizeof sizes);
       break;
     }
@@ -593,10 +621,10 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
     case HSA_AGENT_INFO_EXTENSIONS: std::memset(value, 0, 128); break;
     case HSA_AGENT_INFO_VERSION_MAJOR: put<uint16_t>(value, 1); break;
     case HSA_AGENT_INFO_VERSION_MINOR: put<uint16_t>(value, 1); break;
-    case HSA_AMD_AGENT_INFO_CHIP_ID: put<uint32_t>(value, is_gpu ? 0x74a1 : 0); break;
+    case HSA_AMD_AGENT_INFO_CHIP_ID: put<uint32_t>(value, is_gpu ? chip_id(shared::profile(gpu)) : 0); break;
     case HSA_AMD_AGENT_INFO_CACHELINE_SIZE: put<uint32_t>(value, is_gpu ? 128 : 64); break;
     case HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT:
-      put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(shared::profile(gpu).limits.multiprocessors) : cpus);
+      put<uint32_t>(value, is_gpu ? compute_units(shared::profile(gpu)) : cpus);
       break;
     case HSA_AMD_AGENT_INFO_MAX_CLOCK_FREQUENCY:
       put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(shared::profile(gpu).telemetry.sm_clock_max_mhz) : 0);
@@ -609,7 +637,7 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
       put_string(value, is_gpu ? shared::profile(gpu).model : "VirtualGPU host CPU", 64);
       break;
     case HSA_AMD_AGENT_INFO_MAX_WAVES_PER_CU: put<uint32_t>(value, is_gpu ? 32 : 0); break;
-    case HSA_AMD_AGENT_INFO_NUM_SIMDS_PER_CU: put<uint32_t>(value, is_gpu ? 4 : 0); break;
+    case HSA_AMD_AGENT_INFO_NUM_SIMDS_PER_CU: put<uint32_t>(value, is_gpu ? chip(shared::profile(gpu)).simds : 0); break;
     case HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES: put<bool>(value, is_gpu); break;
     case HSA_AMD_AGENT_INFO_UUID: {
       char uuid[21];
@@ -623,18 +651,20 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
       put<uint64_t>(value, is_gpu ? shared::profile(gpu).vram_bytes : 0);
       break;
     case HSA_AMD_AGENT_INFO_TIMESTAMP_FREQUENCY: put<uint64_t>(value, 1000000000); break;
-    // The rest of what AMD's runtime reports, as an MI300X-class part has it
-    // where the profile does not say: eight compute dies (XCCs) of four
-    // shader engines, HBM3 8192 bits wide at 1300 MHz.
+    // The rest of what AMD's runtime reports, from the chip (chip() above).
     case HSA_AMD_AGENT_INFO_MAX_ADDRESS_WATCH_POINTS: put<uint32_t>(value, is_gpu ? 4 : 0); break;
-    case HSA_AMD_AGENT_INFO_MEMORY_WIDTH: put<uint32_t>(value, is_gpu ? 8192 : 0); break;
-    case HSA_AMD_AGENT_INFO_MEMORY_MAX_FREQUENCY: put<uint32_t>(value, is_gpu ? 1300 : 0); break;
-    case HSA_AMD_AGENT_INFO_NUM_SHADER_ENGINES: put<uint32_t>(value, is_gpu ? 32 : 0); break;
-    case HSA_AMD_AGENT_INFO_NUM_SHADER_ARRAYS_PER_SE: put<uint32_t>(value, is_gpu ? 1 : 0); break;
+    case HSA_AMD_AGENT_INFO_MEMORY_WIDTH: put<uint32_t>(value, is_gpu ? chip(shared::profile(gpu)).mem_bits : 0); break;
+    case HSA_AMD_AGENT_INFO_MEMORY_MAX_FREQUENCY:
+      put<uint32_t>(value, is_gpu ? chip(shared::profile(gpu)).mem_mhz : 0);
+      break;
+    case HSA_AMD_AGENT_INFO_NUM_SHADER_ENGINES: put<uint32_t>(value, is_gpu ? chip(shared::profile(gpu)).engines : 0); break;
+    case HSA_AMD_AGENT_INFO_NUM_SHADER_ARRAYS_PER_SE:
+      put<uint32_t>(value, is_gpu ? chip(shared::profile(gpu)).arrays : 0);
+      break;
     case HSA_AMD_AGENT_INFO_HDP_FLUSH: std::memset(value, 0, 2 * sizeof(void*)); break;
     case HSA_AMD_AGENT_INFO_ASIC_REVISION: put<uint32_t>(value, is_gpu ? 1 : 0); break;
     case HSA_AMD_AGENT_INFO_COOPERATIVE_COMPUTE_UNIT_COUNT:
-      put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(shared::profile(gpu).limits.multiprocessors) : 0);
+      put<uint32_t>(value, is_gpu ? compute_units(shared::profile(gpu)) : 0);
       break;
     case HSA_AMD_AGENT_INFO_ASIC_FAMILY_ID:
     case HSA_AMD_AGENT_INFO_UCODE_VERSION:
@@ -643,7 +673,7 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
     case HSA_AMD_AGENT_INFO_NUM_SDMA_ENG: put<uint32_t>(value, is_gpu ? 2 : 0); break;
     case HSA_AMD_AGENT_INFO_NUM_SDMA_XGMI_ENG: put<uint32_t>(value, 0); break;
     case HSA_AMD_AGENT_INFO_IOMMU_SUPPORT: put<uint32_t>(value, 0); break;   // HSA_IOMMU_SUPPORT_NONE
-    case HSA_AMD_AGENT_INFO_NUM_XCC: put<uint32_t>(value, is_gpu ? 8 : 0); break;
+    case HSA_AMD_AGENT_INFO_NUM_XCC: put<uint32_t>(value, is_gpu ? chip(shared::profile(gpu)).xccs : 0); break;
     case HSA_AMD_AGENT_INFO_NEAREST_CPU: put<hsa_agent_t>(value, {kCpuAgent}); break;
     case HSA_AMD_AGENT_INFO_MEMORY_PROPERTIES:
     case HSA_AMD_AGENT_INFO_AQL_EXTENSIONS: std::memset(value, 0, 8); break;

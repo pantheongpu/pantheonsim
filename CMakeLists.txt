@@ -194,6 +194,13 @@ add_custom_command(TARGET vgpuhip POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so.1"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so"
   COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7, libhsa-runtime64.so.1)")
+# rocminfo for a machine without ROCm (amd/src/rocminfo.cpp): the HSA system
+# and its agents, from the HSA runtime above. A session runs it as rocminfo
+# where the host has no ROCm rocminfo of its own.
+add_executable(vgpu_rocminfo amd/src/rocminfo.cpp)
+target_link_libraries(vgpu_rocminfo PRIVATE vgpuhip)
+target_include_directories(vgpu_rocminfo PRIVATE amd/include)
+set_target_properties(vgpu_rocminfo PROPERTIES OUTPUT_NAME vgpu-rocminfo)
 # The code objects a library carries for one target (amd/tools/fatbin-extract.cpp).
 add_executable(amd_fatbin_extract amd/tools/fatbin-extract.cpp)
 target_link_libraries(amd_fatbin_extract PRIVATE vgpu ${CMAKE_DL_LIBS})
@@ -573,7 +580,7 @@ endif()
 
 # CLI
 add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/debug.cpp src/cli/test.cpp src/cli/ncu.cpp
-               src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp)
+               src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp src/cli/lspci.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
 # Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /
@@ -884,6 +891,11 @@ set_tests_properties(amd_pytorch_distributed PROPERTIES DEPENDS vgpuhip RUN_SERI
 add_test(NAME amd_pytorch_multi_gpu COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh multi_gpu.py 9 2)
 set_tests_properties(amd_pytorch_multi_gpu PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# lspci and rocminfo on a simulated AMD machine, against the real tools where
+# the host has them.
+add_test(NAME amd_tools COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_amd_tools.sh)
+set_tests_properties(amd_tools PROPERTIES DEPENDS "vgpu_cli;vgpu_rocminfo;vgpuhip"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 # An HSA program: agents, pools, executables and AQL queues (amd/tests/hsa).
 add_test(NAME amd_hsa COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hsa.sh)
 set_tests_properties(amd_hsa PROPERTIES DEPENDS vgpuhip
