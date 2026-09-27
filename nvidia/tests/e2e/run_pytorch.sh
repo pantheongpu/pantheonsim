@@ -47,11 +47,19 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 out=$(cd "$tmp" && TRITON_CACHE_DIR="$tmp/triton" TORCHINDUCTOR_CACHE_DIR="$tmp/inductor" \
-  VGPU_QUIET=1 VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" LD_PRELOAD="$preload" \
+  VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" LD_PRELOAD="$preload" \
   "${cap[@]}" "$python" "$script" 2>&1)
 status=$?
 echo "$out" | grep -E '^(ok|FAIL) ' | sed 's/^/      /'
 fail=0
+# The simulator's errors are left on: a kernel it could not run (an
+# instruction it lacks, a fault) or a library call it refused is reported as
+# "VirtualGPU error [...]", and PyTorch may carry on past it with whatever was
+# in the output buffer, so a check can still print "ok". Any such line fails
+# the test, as on AMD (amd/tests/e2e/run_pytorch.sh).
+if grep -q 'VirtualGPU error \[' <<< "$out"; then
+  echo "FAIL  the simulator ran every kernel it was given"; grep -m5 'VirtualGPU error \[' <<< "$out" | sed 's/^/      /'; fail=1
+fi
 [[ $status == 0 ]] || { echo "FAIL  the checks ran to the end (exit $status)"; echo "$out" | tail -5; fail=1; }
 passed=$(grep -c '^ok ' <<< "$out")
 name=$(basename "$script")
