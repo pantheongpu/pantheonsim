@@ -453,9 +453,11 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   tool("rocm-smi", "exec -a rocm-smi \"" + vgpu + "\" smi --rocm \"$@\"\n");
   tool("amd-smi", "exec -a amd-smi \"" + vgpu + "\" smi --amd \"$@\"\n");
   tool("rocm_agent_enumerator", "exec -a rocm_agent_enumerator \"" + vgpu + "\" smi --agents \"$@\"\n");
-  // rocminfo: ROCm's own where the host has it -- it reads the simulated
-  // agents through the session's HSA runtime -- and otherwise VirtualGPU's,
-  // which prints the same from the same runtime (amd/src/rocminfo.cpp).
+  // rocminfo: ROCm's own where the host has it and it can run -- it reads the
+  // simulated agents through the session's HSA runtime, but first asks for
+  // the amdgpu kernel module (/sys/module/amdgpu/initstate) and stops without
+  // it, except under WSL (/dev/dxg) -- and otherwise VirtualGPU's, which
+  // prints the same from the same runtime (amd/src/rocminfo.cpp).
   {
     std::string real_rocminfo;
     for (const std::string& d : rocm_bin_directories())
@@ -468,7 +470,9 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
     tool("rocminfo",
          "# VirtualGPU session tool: the simulated HSA agents.\n"
          "REAL='" + real_rocminfo + "'\n"
-         "[ -x \"$REAL\" ] && exec \"$REAL\" \"$@\"\n"
+         "if [ -x \"$REAL\" ] && { [ -e /sys/module/amdgpu/initstate ] || [ -e /dev/dxg ]; }; then\n"
+         "  exec \"$REAL\" \"$@\"\n"
+         "fi\n"
          "exec -a rocminfo \"" + ours + "\" \"$@\"\n");
   }
   tool("dmesg",

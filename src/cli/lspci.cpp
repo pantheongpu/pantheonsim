@@ -29,7 +29,10 @@ namespace {
 const char* const kIdsPaths[] = {"/usr/share/misc/pci.ids", "/usr/share/hwdata/pci.ids", "/usr/share/pci.ids",
                                  "/usr/local/share/pci.ids"};
 
+// VGPU_PCI_IDS names another (a path that does not exist: none at all, as on
+// a machine without pciutils).
 std::string host_ids_path() {
+  if (const char* env = std::getenv("VGPU_PCI_IDS"); env) return std::ifstream(env).good() ? env : "";
   for (const char* p : kIdsPaths)
     if (std::ifstream(p).good()) return p;
   return "";
@@ -37,7 +40,8 @@ std::string host_ids_path() {
 
 // The names the database gives: vendors, devices (vendor << 16 | device),
 // subsystems (vendor, device, subvendor, subdevice), classes and subclasses
-// (class << 8 | subclass, and the class alone at subclass 0x100).
+// (class << 8 | subclass, and the class alone at kClassOnly | class).
+constexpr uint32_t kClassOnly = 0x10000;   // above every class << 8 | subclass
 struct Names {
   std::map<uint32_t, std::string> vendor, device, cls;
   std::map<uint32_t, std::string> progif;   // class << 16 | subclass << 8 | prog-if
@@ -58,12 +62,12 @@ const std::map<uint32_t, const char*> kKnownDevices = {
 void add_defaults(Names* n) {
   n->vendor.emplace(0x1002, "Advanced Micro Devices, Inc. [AMD/ATI]");
   n->vendor.emplace(0x10de, "NVIDIA Corporation");
-  n->cls.emplace(0x03 << 8 | 0x100, "Display controller");
+  n->cls.emplace(kClassOnly | 0x03, "Display controller");
   n->cls.emplace(0x0300, "VGA compatible controller");
   n->progif.emplace(0x030000, "VGA controller");
   n->cls.emplace(0x0302, "3D controller");
   n->cls.emplace(0x0380, "Display controller");
-  n->cls.emplace(0x12 << 8 | 0x100, "Processing accelerators");
+  n->cls.emplace(kClassOnly | 0x12, "Processing accelerators");
   n->cls.emplace(0x1200, "Processing accelerators");
 }
 
@@ -85,7 +89,7 @@ Names load_names(const std::string& path) {
     if (line.rfind("C ", 0) == 0 && line.size() > 4) {   // C 03  Display controller
       in_classes = true;
       cls = hex(line, 2, 2);
-      n.cls[cls << 8 | 0x100] = rest(line, 4);
+      n.cls[kClassOnly | cls] = rest(line, 4);
       continue;
     }
     if (in_classes) {
@@ -404,7 +408,7 @@ int cmd_lspci(const std::vector<std::string>& args) {
     };
     std::string cls_name;
     if (auto it = names.cls.find(base << 8 | sub); it != names.cls.end()) cls_name = it->second;
-    else if (auto it2 = names.cls.find(base << 8 | 0x100); it2 != names.cls.end()) cls_name = it2->second;
+    else if (auto it2 = names.cls.find(kClassOnly | base); it2 != names.cls.end()) cls_name = it2->second;
     else {
       char b[32];
       std::snprintf(b, sizeof b, "Class %04x", base << 8 | sub);

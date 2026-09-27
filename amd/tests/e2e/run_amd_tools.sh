@@ -41,6 +41,14 @@ expect "an Instinct card is a processing accelerator" \
 expect "a card the host's PCI ID database predates is named" \
   "01:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon RX 9070/9070 XT/9070 GRE] (rev c0)" \
   "$(sess amd/rx9070xt -c 'lspci -s 01:00.0')"
+# With no PCI ID database at all (a container without pciutils), the names
+# are VirtualGPU's own: the class, the vendor, the card.
+expect "with no PCI ID database, a Radeon is still a VGA controller, named" \
+  "01:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XT/7900 XTX/7900M] (rev c8)" \
+  "$(sess amd/rx7900xtx -c "VGPU_PCI_IDS=/nonexistent $vgpu smi --lspci -s 01:00.0")"
+expect "and an Instinct card a processing accelerator" \
+  "01:00.0 Processing accelerators: Advanced Micro Devices, Inc. [AMD/ATI] Aqua Vanjaram [Instinct MI300X]" \
+  "$(sess amd/mi300x -c "VGPU_PCI_IDS=/nonexistent $vgpu smi --lspci -s 01:00.0")"
 expect "lspci -k names the driver" "Kernel driver in use: amdgpu" \
   "$(sess amd/mi300x -c "$vgpu smi --lspci -k -s 01:00.0" | grep -o 'Kernel driver in use: .*')"
 if command -v lspci >/dev/null && unshare --user --map-root-user true >/dev/null 2>&1; then
@@ -116,7 +124,11 @@ if [[ -x "$ours" ]]; then
       [[ -x "$f" ]] && { real=$f; break; }
     done
   fi
-  if [[ -n "$real" ]]; then
+  # ROCm's rocminfo stops before HSA without the amdgpu kernel module, except
+  # under WSL; there it describes the host, not the simulator.
+  if [[ -n "$real" && ! -e /sys/module/amdgpu/initstate && ! -e /dev/dxg ]]; then
+    echo "skip  ROCm's rocminfo: no amdgpu kernel module here, which it asks for before HSA"
+  elif [[ -n "$real" ]]; then
     for g in amd/mi300x amd/rx7900xtx amd/mi250x; do
       # The first line is what each finds of the host's kernel driver.
       a=$(VGPU_GPU=$g VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$build/shim" timeout 120 "$real" 2>&1 | tail -n +2)
