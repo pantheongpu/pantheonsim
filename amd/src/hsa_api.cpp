@@ -36,6 +36,7 @@
 #include "hip_queue.hpp"
 #include "hip_shared.hpp"
 #include "vgpu/amd_bundle.hpp"
+#include "vgpu/amd_chip.hpp"
 #include "vgpu/hsa_abi.h"
 
 namespace {
@@ -102,24 +103,8 @@ int gpu_of(hsa_agent_t a) {
 bool valid_agent(hsa_agent_t a) { return a.handle == kCpuAgent || gpu_of(a) >= 0; }
 hsa_agent_t gpu_agent(int i) { return {kGpuAgentBase + static_cast<uint64_t>(i)}; }
 
-// What AMD's runtime reports of a chip beyond the profile: its compute units
-// to each of HIP's multiprocessors (RDNA's workgroup processor is two), SIMDs
-// to a compute unit, shader engines and arrays in each, compute dies, the
-// vector L1 and the last-level (Infinity) cache, and the memory interface.
-// From AMD's published specifications of each part.
-struct Chip {
-  uint32_t cus_per_mp, simds, engines, arrays, xccs, l1_kb, l3_mb, mem_bits, mem_mhz;
-};
-Chip chip(const vgpu::DeviceProfile& p) {
-  const std::string& a = p.gcn_arch;
-  if (a == "gfx950") return {1, 4, 32, 1, 8, 32, 256, 8192, 2000};   // MI350X: 8 XCDs of 4 engines
-  if (a == "gfx942") return {1, 4, 32, 1, 8, 32, 256, 8192, 1300};   // MI300X, MI325X
-  if (a == "gfx90a") return {1, 4, 8, 1, 1, 16, 0, 4096, 1600};      // MI250X, one die
-  if (a == "gfx1100") return {2, 2, 6, 2, 1, 32, 96, 384, 2500};     // RX 7900 XTX, Navi 31
-  if (a == "gfx1201") return {2, 2, 4, 2, 1, 32, 64, 256, 2518};     // RX 9070 XT, Navi 48
-  if (a == "gfx1030") return {2, 2, 4, 2, 1, 16, 128, 256, 2000};    // RX 6900 XT, Navi 21
-  return {1, 4, 32, 1, 8, 32, 256, 8192, 1300};
-}
+// The chip's facts beyond the profile (vgpu/amd_chip.hpp).
+vgpu::amd::Chip chip(const vgpu::DeviceProfile& p) { return vgpu::amd::chip(p.architecture.c_str()); }
 uint32_t chip_id(const vgpu::DeviceProfile& p) { return p.telemetry.pci_device_id ? p.telemetry.pci_device_id : 0x74a1; }
 uint32_t compute_units(const vgpu::DeviceProfile& p) {
   return static_cast<uint32_t>(p.limits.multiprocessors) * chip(p).cus_per_mp;

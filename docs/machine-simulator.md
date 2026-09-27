@@ -18,9 +18,9 @@ build/bin/vgpu shell
     nvidia/h100    NVIDIA H100 80GB HBM3        80 GiB
     nvidia/h200    NVIDIA H200                  141 GiB
     nvidia/b200    NVIDIA B200                  192 GiB
-    amd/mi300x     AMD Instinct MI300X          192 GiB   (discovery only: AMD execution unimplemented)
-    amd/mi325x     AMD Instinct MI325X          256 GiB   (discovery only: AMD execution unimplemented)
-    amd/mi350x     AMD Instinct MI350X          288 GiB   (discovery only: AMD execution unimplemented)
+    amd/mi300x     AMD Instinct MI300X          192 GiB
+    amd/mi325x     AMD Instinct MI325X          256 GiB
+    amd/mi350x     AMD Instinct MI350X          288 GiB
 
   GPU model [nvidia/h100]: nvidia/h200
   How many GPUs [1]: 8
@@ -81,9 +81,11 @@ without it, with the session's `PATH` and `LD_LIBRARY_PATH` already set.
 | Command | Behavior |
 | --- | --- |
 | `nvidia-smi` | live table, `-q [-d SECTIONS]`, `-x`, `--query-gpu=... --format=csv`, `-L`, `-i`, `-l`/`-lms`, `topo -m`, `--version`, `-h` |
-| `rocm-smi` | ROCm concise-info table; `-a`, `--showid`, `--showproductname`, `--showmeminfo vram`, `--showtemp`, `--showpower`, `--showuse`, `-d N`, `--json`, `--csv` |
-| `rocm_agent_enumerator` | `gfx000` plus one target per virtual AMD device |
-| `lspci` | the real lspci, fed synthesized PCI config space |
+| `rocm-smi` | ROCm concise-info table; `-a`, `-i`, `--showproductname`, `--showmeminfo`, `-t`, `-P`, `-u`, `-c`, `-s`, `-g`, `-f`, `-v`, `--showbus`, `--showhw`, `--showdriverversion`, `--showpids`, `--showtopo`, `--showmemuse`, `--showperflevel`, `--showvoltage`, `--showenergycounter`, `--showcomputepartition`, `--showmemorypartition`, `--showpagesinfo`, `--showrasinfo`, `--showxgmierr`, `--showfwinfo`, `--showmaxpower`, `--showserial`, `--showuniqueid`, `-d N`, `--json`, `--csv` |
+| `amd-smi` | `list`, `static` (every section), `metric` (usage, power, clock, temperature, PCIe, ECC, fan, memory, ...), `process`, `topology`, `monitor`, `partition`, `xgmi`, `bad-pages`, `firmware`, `ras --cper`, `version`; `--json`, `-g N` |
+| `rocm_agent_enumerator` | `gfx000` plus each AMD device's own target (gfx942, gfx950, gfx90a, gfx1030, gfx1100, gfx1201) |
+| `rocminfo` | ROCm's own where the host has it (it reads the simulated agents through the session's HSA runtime), otherwise VirtualGPU's, which prints the same |
+| `lspci` | the real lspci over the simulated devices' config space (isolated, over the session's `/sys/bus/pci`, so `-k` and `-vv` show the bound driver), naming cards the host's PCI ID database predates; without pciutils, VirtualGPU's own lspci, which prints the same for `-n`/`-nn`, `-D`, `-d`, `-s`, `-k`, `-v`, `-m`/`-mm`, `-vmm`, `-x`..`-xxxx` and `-t` |
 | `dmesg` | synthetic kernel ring buffer: boot, PCI enumeration, driver bring-up |
 | `uname` | the configured kernel and hostname, for any of `-asnrvmpio`, combined (`-sr`) or long (`--kernel-release`) |
 | `hostname` | the configured hostname |
@@ -134,9 +136,10 @@ cleaned up rather than reported as phantom hardware.
 
 - The synthetic power/temperature/clock/voltage columns are a model driven by
   real utilization, not predictions. See [telemetry.md](telemetry.md).
-- AMD devices are **discovery only**: `rocm-smi`, `rocm_agent_enumerator` and
-  `lspci` report them, but launching a kernel fails with a clear
-  "warp size 64 is unsupported" error.
+- What a simulated AMD card has no value for -- VBIOS, serial numbers,
+  firmware versions, energy counters -- `rocm-smi` and `amd-smi` report as
+  N/A rather than invent. There is no `/dev/kfd` or `/dev/dri`: programs
+  reach the GPUs through the session's HIP and HSA runtimes, not the kernel.
 - `dmesg` output is generated for the session, not a real kernel log; there is
   no kernel driver here to log anything.
 - The session simulates a machine's *GPU-facing* surfaces. It is not a

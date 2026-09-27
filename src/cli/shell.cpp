@@ -966,6 +966,7 @@ int cmd_shell(const std::vector<std::string>& args) {
   setenv("VGPU_VRAM_MB", std::to_string(profile.vram_bytes / (1024 * 1024)).c_str(), 1);
   setenv("VGPU_DRIVER_VERSION", c.driver.c_str(), 1);
   setenv("VGPU_CUDA_VERSION", c.cuda.c_str(), 1);
+  setenv("VGPU_ROCM_VERSION", c.rocm.c_str(), 1);   // amd-smi version reports it
   setenv("VGPU_SESSION", s.dir.c_str(), 1);
   // Hold the devices open for the whole session: this is what publishes
   // telemetry that nvidia-smi / rocm-smi read.

@@ -416,6 +416,16 @@ That works because the runtime keeps to what ROCm's does where CLR looks:
 
 `VGPU_TRACE_HSA=1` logs what memory the program allocates, locks and registers.
 
+## System tools
+
+Inside `vgpu shell --gpu amd/...` the tools an AMD machine has answer for
+the simulated GPUs (amd/tests/e2e/run_amd_tools.sh, ctest `amd_tools`):
+
+- **`lspci`**: the host's real lspci over the devices' config space. An isolated session gives it the session's `/sys/bus/pci`, so `-k` and `-vv` show the bound `amdgpu` driver and every capability. Its PCI ID database is the host's, plus the simulated cards it predates (the RX 9070 XT, the MI350X). A host without pciutils gets `vgpu smi --lspci`, which prints the same, form by form. An Instinct card is a processing accelerator; a Radeon card is a VGA controller with its chip's revision (c8 for the RX 7900 XTX).
+- **`rocminfo`**: ROCm's own where the host has it, reading the simulated agents through the session's HSA runtime; otherwise `vgpu-rocminfo`, which asks the same runtime through the public HSA interface and prints what ROCm's prints, line for line. Each agent's chip ID, compute units (an RDNA workgroup processor is two), SIMDs, shader engines and arrays, compute dies, caches (L3 included) and memory interface are the chip's (`include/vgpu/amd_chip.hpp`).
+- **`rocm-smi`** and **`amd-smi`**: the concise table and every `--show*` section, and `amd-smi`'s `list`, `static`, `metric`, `process`, `topology`, `monitor`, `partition`, `xgmi`, `bad-pages`, `firmware`, `ras` and `version`, with `--json`. Values come from the same machine state nvidia-smi reads. What a simulated card has no value for (VBIOS, serials, firmware, energy) is N/A.
+- **`rocm_agent_enumerator`**: each card's own target.
+
 ## RCCL, and PyTorch across GPUs
 
 RCCL (PyTorch's collectives on ROCm) runs unmodified across simulated GPUs in one process (`tests/pytorch/multi_gpu.py`, ctest `amd_pytorch_multi_gpu`) and across processes (`distributed.py`, ctest `amd_pytorch_distributed`). Three things make that work on any Linux machine:

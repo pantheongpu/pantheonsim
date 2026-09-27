@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <map>
 #include <string>
 #include <vector>
@@ -26,6 +27,7 @@
 #include "machine.hpp"
 #include "vgpu/ras.hpp"
 #include "vgpu/regs.hpp"
+#include "vgpu/amd_chip.hpp"
 #include "vgpu/driver_version.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/telemetry.hpp"
@@ -1027,9 +1029,7 @@ void print_rocm(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>& s
 }
 
 // CDNA3 -> gfx942, CDNA4 -> gfx950 (the targets these parts report).
-const char* gfx_target(const vgpu::telemetry::DeviceSample& d) {
-  return std::strcmp(d.architecture, "cdna4") == 0 ? "gfx950" : "gfx942";
-}
+const char* gfx_target(const vgpu::telemetry::DeviceSample& d) { return vgpu::amd::chip(d.architecture).gfx; }
 
 // rocm_agent_enumerator output: one ISA target per line, CPU agent first.
 // `-t GPU` lists only the GPUs and `-t CPU` only the CPU, as ROCm's does;
@@ -1202,6 +1202,21 @@ void print_rocm_usage(FILE* to) {
       "      --showuniqueid        unique ID, stable per device\n"
       "      --showmemvendor       memory vendor (unknown: no profile records it)\n"
       "      --showrasinfo [BLOCK] ECC state and error counts per RAS block\n"
+      "      --showbus             PCI bus address\n"
+      "      --showhw              the concise hardware table\n"
+      "      --showdriverversion   amdgpu's version (the kernel's for an in-tree driver)\n"
+      "      --showpids            processes using a GPU\n"
+      "      --showtopo            weight, hops and link type between GPUs, and NUMA nodes\n"
+      "      --showfwinfo [BLOCK]  firmware versions (none is loaded: N/A)\n"
+      "      --showmemuse          VRAM allocated and memory activity\n"
+      "      --showperflevel       performance level\n"
+      "      --showvoltage         core voltage\n"
+      "      --showenergycounter   energy consumed (not integrated: N/A)\n"
+      "      --showcomputepartition, --showmemorypartition   partition modes (Instinct)\n"
+      "      --showpagesinfo       retired and pending pages\n"
+      "      --showxgmierr         XGMI error count\n"
+      "  -s, --showclkfrq          supported clock levels\n"
+      "  -g, --showgpuclocks       current sclk level\n"
       "      --json                the selected values as JSON\n"
       "      --csv                 the selected values as CSV\n");
 }
@@ -1247,7 +1262,10 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
   bool json = false, csv = false, all = false, show_id = false, show_product = false,
        show_temp = false, show_power = false, show_use = false, show_vbios = false,
        show_clocks = false, show_fan = false, show_maxpower = false, show_serial = false,
-       show_uniqueid = false, show_memvendor = false, show_ras = false;
+       show_uniqueid = false, show_memvendor = false, show_ras = false, show_bus = false, show_hw = false,
+       show_driver = false, show_pids = false, show_topo = false, show_fw = false, show_memuse = false,
+       show_perf = false, show_voltage = false, show_energy = false, show_cpart = false, show_mpart = false,
+       show_pages = false, show_xgmi = false, show_clkfrq = false, show_gpuclocks = false;
   // rocm-smi's RAS block names, in the order its table lists them.
   static const char* const kRasBlocks[] = {"umc", "sdma", "gfx", "mmhub", "athub", "pcie_bif",
                                            "hdp", "xgmi_wafl", "df", "smn", "sem", "mp0", "mp1",
@@ -1291,9 +1309,31 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
     else if (a == "--showserial") show_serial = true;
     else if (a == "--showuniqueid") show_uniqueid = true;
     else if (a == "--showmemvendor") show_memvendor = true;
+    else if (a == "--showbus") show_bus = true;
+    else if (a == "--showhw") show_hw = true;
+    else if (a == "--showdriverversion") show_driver = true;
+    else if (a == "--showpids") show_pids = true;
+    else if (a == "--showtopo" || a == "--showtopoweight" || a == "--showtopohops" || a == "--showtopotype" ||
+             a == "--showtoponuma")
+      show_topo = true;
+    else if (a == "--showfwinfo") {
+      words(i);   // an optional list of firmware blocks: none is modelled
+      show_fw = true;
+    }
+    else if (a == "--showmemuse") show_memuse = true;
+    else if (a == "--showperflevel") show_perf = true;
+    else if (a == "--showvoltage") show_voltage = true;
+    else if (a == "--showenergycounter") show_energy = true;
+    else if (a == "--showcomputepartition") show_cpart = true;
+    else if (a == "--showmemorypartition") show_mpart = true;
+    else if (a == "--showpagesinfo" || a == "--showretiredpages" || a == "--showunreservablepages") show_pages = true;
+    else if (a == "--showxgmierr") show_xgmi = true;
+    else if (a == "-s" || a == "--showclkfrq") show_clkfrq = true;
+    else if (a == "-g" || a == "--showgpuclocks") show_gpuclocks = true;
     else if (a == "--showrasinfo") {
-      // An optional list of blocks; none means every block.
+      // An optional list of blocks; none (or "all") means every block.
       for (const std::string& b : words(i)) {
+        if (b == "all") continue;
         if (std::find_if(std::begin(kRasBlocks), std::end(kRasBlocks),
                          [&](const char* k) { return b == k; }) == std::end(kRasBlocks))
           return error("argument --showrasinfo: invalid choice: '" + b + "'");
@@ -1350,7 +1390,10 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
 
   const bool any_show = all || show_id || show_product || show_temp || show_power || show_use ||
                         show_vbios || show_clocks || show_fan || show_maxpower || show_serial ||
-                        show_uniqueid || show_memvendor || show_ras || !mem_types.empty();
+                        show_uniqueid || show_memvendor || show_ras || !mem_types.empty() || show_bus ||
+                        show_hw || show_driver || show_pids || show_topo || show_fw || show_memuse ||
+                        show_perf || show_voltage || show_energy || show_cpart || show_mpart || show_pages ||
+                        show_xgmi || show_clkfrq || show_gpuclocks;
   if (!any_show && !json && !csv) {
     print_rocm(snap, sel);
     return 0;
@@ -1364,6 +1407,8 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
     show_id = show_product = show_temp = show_power = show_use = true;
     show_vbios = show_clocks = show_fan = show_maxpower = show_serial = show_uniqueid =
         show_memvendor = show_ras = true;
+    show_bus = show_driver = show_pids = show_memuse = show_perf = show_voltage = show_energy = show_cpart =
+        show_mpart = show_pages = show_clkfrq = show_fw = true;
     mem_types = {"vram", "vis_vram", "gtt"};
   }
 
@@ -1506,6 +1551,95 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
                        d.ecc_enabled ? std::to_string(count(block, vgpu::ras::Severity::Uncorrected)) : "N/A");
       }
     });
+  const auto session_file = [&](const Sample& d, const char* name) {
+    // The file amdgpu keeps for the device, as the session publishes it.
+    std::string v;
+    if (const char* sess = std::getenv("VGPU_SESSION"); sess && *sess) {
+      std::ifstream in(std::string(sess) + "/sysfs/" + d.uuid + "/" + name);
+      std::getline(in, v);
+    }
+    return v;
+  };
+  if (show_bus)
+    add("PCI Bus ID", [&](const Sample& d, Values& v) {
+      std::string b = d.bus_id;
+      if (b.size() > 12 && b.compare(0, 4, "0000") == 0) b = b.substr(4);
+      v.emplace_back("PCI Bus", b);
+    });
+  if (show_memuse)
+    add("Current Memory Use", [&](const Sample& d, Values& v) {
+      const uint64_t pct = d.vram_total_bytes ? d.vram_used_bytes * 100 / d.vram_total_bytes : 0;
+      v.emplace_back("GPU Memory Allocated (VRAM%)", std::to_string(pct));
+      v.emplace_back("GPU Memory Read/Write Activity (%)", std::to_string(d.utilization_mem));
+      v.emplace_back("Memory Activity", "N/A");
+      v.emplace_back("Avg. Memory Bandwidth", "0");
+    });
+  if (show_perf)
+    add("Show Performance Level", [&](const Sample&, Values& v) { v.emplace_back("Performance Level", "auto"); });
+  if (show_voltage)
+    add("Current voltage", [&](const Sample& d, Values& v) { v.emplace_back("Voltage (mV)", std::to_string(d.voltage_mv)); });
+  if (show_energy)
+    add("Consumed Energy", [&](const Sample&, Values& v) {
+      // No energy is integrated over time: the power model has no history.
+      v.emplace_back("Energy counter", "N/A");
+      v.emplace_back("Accumulated Energy (uJ)", "N/A");
+    });
+  if (show_cpart)
+    add("Current Compute Partition", [&](const Sample& d, Values& v) {
+      const std::string p = session_file(d, "current_compute_partition");
+      // Only CDNA3 and later can be partitioned.
+      const bool parts = std::strcmp(d.architecture, "cdna3") == 0 || std::strcmp(d.architecture, "cdna4") == 0;
+      v.emplace_back("Compute Partition", parts && !p.empty() ? p : "N/A");
+    });
+  if (show_mpart)
+    add("Current Memory Partition", [&](const Sample& d, Values& v) {
+      const std::string p = session_file(d, "current_memory_partition");
+      const bool parts = std::strcmp(d.architecture, "cdna3") == 0 || std::strcmp(d.architecture, "cdna4") == 0;
+      v.emplace_back("Memory Partition", parts && !p.empty() ? p : "N/A");
+    });
+  if (show_pages)
+    add("Pages Info", [&](const Sample& d, Values& v) {
+      vgpu::ras::Counters c{};
+      try {
+        c = vgpu::ras::read(d.uuid).since_load;
+      } catch (const std::exception&) {
+      }
+      const uint64_t retired = c.retired_sbe + c.retired_dbe;
+      if (!retired && !c.retired_pending) v.emplace_back("Pages", "No bad pages found.");
+      else {
+        v.emplace_back("Retired pages", std::to_string(retired));
+        v.emplace_back("Pending pages", std::to_string(c.retired_pending));
+      }
+    });
+  if (show_xgmi)
+    add("XGMI Error status", [&](const Sample& d, Values& v) {
+      const bool instinct = d.architecture[0] == 'c';
+      v.emplace_back("XGMI Error count", instinct ? "0" : "Not supported on the given system");
+    });
+  if (show_gpuclocks)
+    add("Current clock frequencies", [&](const Sample& d, Values& v) {
+      v.emplace_back("sclk clock level", std::string(d.sm_clock_mhz >= d.sm_clock_max_mhz ? "1" : "0") + ": (" +
+                                             std::to_string(d.sm_clock_mhz) + "Mhz)");
+    });
+  if (show_fw)
+    add("Firmware Information", [&](const Sample&, Values& v) {
+      // No firmware is loaded into a simulated GPU, so none has a version.
+      for (const char* fw : {"ASD", "CE", "DMCU", "MC", "ME", "MEC", "MEC2", "PFP", "RLC", "RLC SRLC", "RLC SRLG",
+                             "RLC SRLS", "SDMA", "SDMA2", "SMC", "SOS", "TA RAS", "TA XGMI", "UVD", "VCE", "VCN"})
+        v.emplace_back(std::string(fw) + " firmware version", "N/A");
+    });
+  if (show_clkfrq)
+    add("Supported clock frequencies", [&](const Sample& d, Values& v) {
+      // Two levels each: idle and the most the card runs at, the current one
+      // starred.
+      const auto levels = [&](const char* clk, uint32_t idle, uint32_t max, uint32_t now) {
+        v.emplace_back(std::string("Supported ") + clk + " frequencies on GPU" + std::to_string(&d - snap.devices), "");
+        v.emplace_back("0", std::to_string(idle) + "Mhz" + (now < max ? " *" : ""));
+        v.emplace_back("1", std::to_string(max) + "Mhz" + (now >= max ? " *" : ""));
+      };
+      levels("mclk", d.mem_clock_max_mhz / 5, d.mem_clock_max_mhz, d.mem_clock_mhz);
+      levels("sclk", d.sm_clock_max_mhz / 6, d.sm_clock_max_mhz, d.sm_clock_mhz);
+    });
 
   if (json) {
     std::printf("{");
@@ -1538,11 +1672,115 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
   }
   std::printf("\n");
   rocm_rule("ROCm System Management Interface");
+  if (show_hw) {
+    // The concise hardware table: node, device id, KFD's GUID, target, the
+    // RAS state of three blocks, VBIOS, bus and partition.
+    rocm_rule("Concise Hardware Info");
+    std::printf("%-5s%-6s%-8s%-7s%-9s%-9s%-10s%-9s%-7s%-14s%s\n", "GPU", "NODE", "DID", "GUID", "GFX VER", "GFX RAS",
+                "SDMA RAS", "UMC RAS", "VBIOS", "BUS", "PARTITION ID");
+    for (uint32_t i : sel) {
+      const Sample& d = snap.devices[i];
+      uint64_t h = 1469598103934665603ull;
+      for (const char* c = d.uuid; *c; ++c) h = (h ^ static_cast<unsigned char>(*c)) * 1099511628211ull;
+      const char* ras = d.ecc_enabled ? "ENABLED" : "DISABLED";
+      std::string b = d.bus_id;
+      if (b.size() > 12 && b.compare(0, 4, "0000") == 0) b = b.substr(4);
+      std::printf("%-5u%-6u%-8s%-7llu%-9s%-9s%-10s%-9s%-7s%-14s%u\n", i, i + 1,
+                  hex4((d.pci_device_id >> 16) & 0xFFFF).c_str(), static_cast<unsigned long long>(h % 65536),
+                  is_amd(d) ? gfx_target(d) : "N/A", ras, ras, ras, "N/A", b.c_str(), 0u);
+    }
+    rocm_rule("");
+  }
+  if (show_driver) {
+    // amdgpu's version where the module gives one, and otherwise the
+    // kernel's, which rocm-smi reports for an in-tree driver.
+    std::string version;
+    if (std::ifstream v("/sys/module/amdgpu/version"); v) std::getline(v, version);
+    if (version.empty())
+      if (FILE* p = ::popen("uname -r 2>/dev/null", "r")) {
+        char buf[128] = {};
+        if (std::fgets(buf, sizeof buf, p)) version = buf;
+        ::pclose(p);
+        while (!version.empty() && (version.back() == '\n' || version.back() == ' ')) version.pop_back();
+      }
+    rocm_rule("Version of System Component");
+    std::printf("Driver version: %s\n", version.empty() ? "N/A" : version.c_str());
+    rocm_rule("");
+  }
+  if (show_pids) {
+    // The processes using a GPU, as KFD lists them.
+    std::map<uint32_t, std::pair<std::string, std::vector<uint32_t>>> pids;
+    std::map<uint32_t, uint64_t> vram;
+    for (uint32_t i : sel)
+      for (uint32_t k = 0; k < snap.devices[i].proc_count && k < vgpu::telemetry::kMaxProcs; ++k) {
+        const auto& pr = snap.devices[i].procs[k];
+        pids[pr.pid].first = pr.name;
+        pids[pr.pid].second.push_back(i);
+        vram[pr.pid] += pr.used_bytes;
+      }
+    rocm_rule("KFD Processes");
+    if (pids.empty()) std::printf("No KFD PIDs currently running\n");
+    else {
+      std::printf("PID\tPROCESS NAME\tGPU(s)\tVRAM USED\tSDMA USED\tCU OCCUPANCY\n");
+      for (const auto& [pid, info] : pids)
+        std::printf("%u\t%s\t%zu\t%llu\t0\t0\n", pid, info.first.c_str(), info.second.size(),
+                    static_cast<unsigned long long>(vram[pid]));
+    }
+    rocm_rule("");
+  }
+  if (show_topo) {
+    // Every pair of Instinct GPUs is one XGMI hop apart, weight 15; Radeon
+    // cards reach each other over PCIe, through the root complex (weight 40,
+    // two hops). Each GPU is on NUMA node 0.
+    const auto link = [&](uint32_t a, uint32_t b) {
+      const bool xgmi = snap.devices[a].architecture[0] == 'c' && snap.devices[b].architecture[0] == 'c';
+      return xgmi;
+    };
+    auto table = [&](const char* title, auto cell) {
+      rocm_rule(title);
+      std::printf("%-7s", "");
+      for (uint32_t j : sel) std::printf("%-13s", ("GPU" + std::to_string(j)).c_str());
+      std::printf("\n");
+      for (uint32_t i : sel) {
+        std::printf("%-7s", ("GPU" + std::to_string(i)).c_str());
+        for (uint32_t j : sel) std::printf("%-13s", cell(i, j).c_str());
+        std::printf("\n");
+      }
+      rocm_rule("");
+    };
+    table("Weight between two GPUs", [&](uint32_t i, uint32_t j) {
+      return i == j ? std::string("0") : std::string(link(i, j) ? "15" : "40");
+    });
+    table("Hops between two GPUs", [&](uint32_t i, uint32_t j) {
+      return i == j ? std::string("0") : std::string(link(i, j) ? "1" : "2");
+    });
+    table("Link Type between two GPUs", [&](uint32_t i, uint32_t j) {
+      return i == j ? std::string("0") : std::string(link(i, j) ? "XGMI" : "PCIE");
+    });
+    rocm_rule("Numa Nodes");
+    for (uint32_t i : sel) {
+      std::printf("GPU[%u]\t\t: (Topology) Numa Node: 0\n", i);
+      std::printf("GPU[%u]\t\t: (Topology) Numa Affinity: 0\n", i);
+    }
+    rocm_rule("");
+  }
   for (const Block& b : blocks) {
     rocm_rule(b.title);
     for (size_t k = 0; k < sel.size(); ++k)
-      for (const auto& [key, val] : b.rows[k])
+      for (const auto& [key, val] : b.rows[k]) {
+        if (b.title == "Supported clock frequencies") {
+          // A heading, then "N: freq" lines, then a blank line after each clock.
+          if (val.empty()) std::printf("GPU[%u]\t\t: %s\n", sel[k], key.c_str());
+          else std::printf("GPU[%u]\t\t: %s: %s\n", sel[k], key.c_str(), val.c_str());
+          if (key == "1") std::printf("GPU[%u]\t\t: \n", sel[k]);
+          continue;
+        }
+        if (b.title == "Pages Info" && key == "Pages") {
+          std::printf("GPU[%u]\t\t: %s\n", sel[k], val.c_str());
+          continue;
+        }
         std::printf("GPU[%u]\t\t: %s: %s\n", sel[k], key.c_str(), val.c_str());
+      }
     rocm_rule("");
   }
   rocm_rule("End of ROCm SMI Log");

@@ -60,6 +60,33 @@ else
   echo "skip  no lspci on this host to compare against"
 fi
 
+# --- rocm-smi and amd-smi: every command a monitoring or inventory script
+# runs answers, on an Instinct and a Radeon card ---
+for g in amd/mi300x amd/rx7900xtx; do
+  failed=$(sess "$g" -c '
+    for c in "rocm-smi" "rocm-smi -a" "rocm-smi --showbus" "rocm-smi --showhw" "rocm-smi --showdriverversion" \
+             "rocm-smi --showpids" "rocm-smi --showtopo" "rocm-smi --showmemuse" "rocm-smi --showperflevel" \
+             "rocm-smi --showvoltage" "rocm-smi --showenergycounter" "rocm-smi --showcomputepartition" \
+             "rocm-smi --showmemorypartition" "rocm-smi --showpagesinfo" "rocm-smi --showxgmierr" "rocm-smi -s" \
+             "rocm-smi --showfwinfo" "rocm-smi --showrasinfo all" "rocm-smi --json" "rocm-smi --csv" \
+             "amd-smi list" "amd-smi static" "amd-smi metric" "amd-smi process" "amd-smi topology" \
+             "amd-smi monitor" "amd-smi firmware" "amd-smi partition" "amd-smi bad-pages" "amd-smi xgmi" \
+             "amd-smi version" "amd-smi static --json" "amd-smi metric --json" "amd-smi topology --json"; do
+      $c >/dev/null 2>&1 || echo "$c"
+    done')
+  expect "every rocm-smi and amd-smi command answers ($g)" "" "$failed"
+done
+expect "rocm_agent_enumerator names a Radeon's own target" "gfx1100" \
+  "$(sess amd/rx7900xtx -c 'rocm_agent_enumerator -t GPU' | sort -u)"
+expect "amd-smi static: a Radeon's compute units, target, memory and slot" "96|gfx1100|PCIE|GDDR6|384" \
+  "$(sess amd/rx7900xtx -c 'amd-smi static -g 0' | awk -F': ' '/NUM_COMPUTE_UNITS|TARGET_GRAPHICS_VERSION|^        TYPE|BIT_WIDTH|SLOT_TYPE/{print $2}' | paste -sd'|')"
+expect "amd-smi static --json is JSON, a unit with each measurement" "750 W" \
+  "$(sess amd/mi300x -c 'amd-smi static -l --json -g 0' | python3 -c 'import json,sys; l=json.load(sys.stdin)[0]["limit"]["max_power"]; print(l["value"], l["unit"])')"
+expect "amd-smi topology: Instinct cards are one XGMI hop apart" "XGMI" \
+  "$(sess amd/mi300x -c 'amd-smi topology' | awk '/LINK TYPE TABLE/{f=1; next} f&&/^0000:01/{print $3; exit}')"
+expect "rocm-smi --showtopo: Radeon cards reach each other over PCIe" "PCIE" \
+  "$(sess amd/rx7900xtx -c 'rocm-smi --showtopo' | awk '/Link Type/{f=1; next} f&&/^GPU0/{print $3; exit}')"
+
 # --- rocminfo ---
 ours="$build/vgpu-rocminfo"
 if [[ -x "$ours" ]]; then
