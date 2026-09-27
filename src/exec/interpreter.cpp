@@ -5463,7 +5463,8 @@ class Interpreter {
       case MmaElem::BF16: return 16;
       case MmaElem::TF32: return 32;
       case MmaElem::S4:
-      case MmaElem::U4: return 4;
+      case MmaElem::U4:
+      case MmaElem::E2M1P: return 4;
       case MmaElem::B1: return 1;
       case MmaElem::F64: return 64;
       default: return 8;
@@ -5493,6 +5494,13 @@ class Interpreter {
         return is_signed ? static_cast<double>(static_cast<int32_t>(nib << 28) >> 28) : static_cast<double>(nib);
       }
       case MmaElem::B1: return static_cast<double>((reg >> slot) & 1);
+      // sm_120's narrow types (9.7.16.5.14): fp6 in the low 6 bits of its
+      // byte, fp4 in the central 4 (bits 2-5); or fp4 packed, for the mxf4
+      // kinds.
+      case MmaElem::E3M2: return small_float_value(static_cast<uint32_t>(reg >> (8 * slot)) & 0x3F, 3, 2, 3);
+      case MmaElem::E2M3: return small_float_value(static_cast<uint32_t>(reg >> (8 * slot)) & 0x3F, 2, 3, 1);
+      case MmaElem::E2M1: return small_float_value(static_cast<uint32_t>(reg >> (8 * slot + 2)) & 0xF, 2, 1, 1);
+      case MmaElem::E2M1P: return small_float_value(static_cast<uint32_t>(reg >> (4 * slot)) & 0xF, 2, 1, 1);
       case MmaElem::S8:
       case MmaElem::U8: {
         const uint8_t byte = static_cast<uint8_t>(reg >> (8 * slot));
@@ -5635,6 +5643,52 @@ class Interpreter {
         }
       }
     }
+    // Block scaling (9.7.16.3): row i of A takes its factors from lane
+    // 4(i % 8) + 2 * thread-id-a + i / 8 -- the selected pair of each quad,
+    // rows 0-7 from the first thread and 8-15 from the second, as figure 46
+    // draws them and CuTe's SFALayout has them -- and column j of B from lane
+    // 4j + thread-id-b (figure 47); factor b of each is byte byte-id + b
+    // (figure 48). ue8m0 is 2^(v - 127), ue4m3 an unsigned e4m3.
+    std::array<std::array<double, 4>, 16> SA{};
+    std::array<std::array<double, 4>, kN> SB{};
+    if (op.block_scale) {
+      auto uniform = [&](const Operand& o, const char* what) {
+        Lanes _s;
+        const Lanes& v = read_operand(w, ctx, ins, o, _s);
+        const uint32_t first = static_cast<uint32_t>(v[static_cast<uint32_t>(std::countr_zero(m))]) & 0xFFFF;
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if ((m >> lane & 1) && (static_cast<uint32_t>(v[lane]) & 0xFFFF) != first)
+            ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                     std::string("mma's ") + what + " differs between the threads of the warp");
+        return first;
+      };
+      const uint32_t bida = uniform(op.sfa_byte, "byte-id-a"), tida = uniform(op.sfa_thread, "thread-id-a");
+      const uint32_t bidb = uniform(op.sfb_byte, "byte-id-b"), tidb = uniform(op.sfb_thread, "thread-id-b");
+      // Table 46.
+      const uint32_t sv = op.scale_vec;
+      const bool ok = sv == 1 ? bida < 4 && tida < 2 && bidb < 4 && tidb < 4
+                    : sv == 2 ? (bida == 0 || bida == 2) && tida < 2 && (bidb == 0 || bidb == 2) && tidb < 4
+                              : bida == 0 && tida < 2 && bidb == 0 && tidb < 4;
+      if (!ok)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "mma's scale selectors {" + std::to_string(bida) + ", " + std::to_string(tida) + "} / {" +
+                     std::to_string(bidb) + ", " + std::to_string(tidb) + "} are not valid for .scale_vec::" +
+                     std::to_string(sv) + "X (Table 46)");
+      Lanes _sa, _sb;
+      const Lanes& sfa = read_operand(w, ctx, ins, op.sfa, _sa);
+      const Lanes& sfb = read_operand(w, ctx, ins, op.sfb, _sb);
+      auto factor = [&](uint32_t byte) {
+        if (op.ue4m3) return fp8_to_double(byte & 0x7F, kE4M3);
+        return byte == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, int(byte) - 127);
+      };
+      for (uint32_t i = 0; i < M; ++i)
+        for (uint32_t b = 0; b < sv; ++b)
+          SA[i][b] = factor((static_cast<uint32_t>(sfa[4 * (i % 8) + 2 * tida + i / 8]) >> (8 * (bida + b))) & 0xFF);
+      for (uint32_t j = 0; j < kN; ++j)
+        for (uint32_t b = 0; b < sv; ++b)
+          SB[j][b] = factor((static_cast<uint32_t>(sfb[4 * j + tidb]) >> (8 * (bidb + b))) & 0xFF);
+    }
+    const uint32_t sblock = op.block_scale ? K / op.scale_vec : K;
     // D = A x B + C. Float products are exact in f32 for every input type
     // here and the sum is kept in f32, in K order; f64 is a chain of fused
     // multiply-adds in the instruction's rounding mode, as the ISA says;
@@ -5680,8 +5734,13 @@ class Interpreter {
           D[i * kN + j] = acc;
         } else {
           float acc = static_cast<float>(C[i * kN + j]);
-          for (uint32_t k = 0; k < K; ++k)
-            acc += static_cast<float>(A[i * K + k]) * static_cast<float>(B[k * kN + j]);
+          if (op.block_scale)
+            for (uint32_t k = 0; k < K; ++k)
+              acc += static_cast<float>(A[i * K + k] * SA[i][k / sblock]) *
+                     static_cast<float>(B[k * kN + j] * SB[j][k / sblock]);
+          else
+            for (uint32_t k = 0; k < K; ++k)
+              acc += static_cast<float>(A[i * K + k]) * static_cast<float>(B[k * kN + j]);
           D[i * kN + j] = static_cast<double>(acc);
         }
       }

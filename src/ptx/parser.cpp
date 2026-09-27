@@ -2074,11 +2074,14 @@ class Parser {
     } else if (op0 == "mma") {
       // mma.sync.aligned.<shape>.<alayout>.<blayout>{.satfinite}.<d>.<a>.<b>.<c>{.xor|.and.popc}{.rn...}
       // mma.sp[::ordered_metadata].sync.aligned.<shape>.row.col.<d>.<a>.<b>.<c> d, a, b, c, e, f
-      // The forms of PTX ISA 9.7.16.5.14 and 9.7.16.6.3, less the block-scaled
-      // and .kind::f8f6f4 ones (sm_120).
+      // mma.sync.aligned.kind::<k>{.block_scale{.scale_vec::NX}}.<shape>.row.col.<d>.<a>.<b>.<c>{.<stype>}
+      //     d, a, b, c{, {sfa}, {byte-id-a, thread-id-a}, {sfb}, {byte-id-b, thread-id-b}}
+      // The forms of PTX ISA 9.7.16.5.14 and 9.7.16.6.3.
       unsigned mm = 0, nn = 0, kk = 0;
       std::vector<std::string> types, layouts;
       bool sparse = false, have_shape = false, popc = false;
+      std::string kind, stype;
+      int scale_vec = 0;
       OpMma op;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
@@ -2097,16 +2100,110 @@ class Parser {
         else if (p == "rp") op.rnd = FRound::PlusInf;
         else if (p == "f32" || p == "f16" || p == "bf16" || p == "tf32" || p == "s32" || p == "s8" ||
                  p == "u8" || p == "s4" || p == "u4" || p == "b1" || p == "f64" || p == "e4m3" ||
-                 p == "e5m2")
+                 p == "e5m2" || p == "e3m2" || p == "e2m3" || p == "e2m1")
           types.push_back(p);
-        else if (p.rfind("kind::", 0) == 0 || p == "block_scale" || p.rfind("scale_vec", 0) == 0 ||
-                 p == "e3m2" || p == "e2m3" || p == "e2m1" || p == "ue8m0" || p == "ue4m3")
-          return unsupported("mma's .kind::f8f6f4 and block-scaled forms (sm_120) are not implemented");
+        else if (p == "kind::f8f6f4" || p == "kind::mxf8f6f4" || p == "kind::mxf4" || p == "kind::mxf4nvf4")
+          kind = p.substr(6);
+        else if (p == "block_scale") op.block_scale = true;
+        else if (p == "scale_vec::1X") scale_vec = 1;
+        else if (p == "scale_vec::2X") scale_vec = 2;
+        else if (p == "scale_vec::4X") scale_vec = 4;
+        else if (p == "ue8m0" || p == "ue4m3") stype = p;
         else return unsupported("mma modifier '." + p + "'");
       }
       if (!have_shape || nn != 8 || (mm != 8 && mm != 16))
         return unsupported("mma shape (expected .m16n8kK or .m8n8kK)");
       if (types.size() != 4) return unsupported("mma needs .<dtype>.<atype>.<btype>.<ctype>");
+      // The sm_120 kinds (9.7.16.5.14, Table 45). f8f6f4's narrow types sit in
+      // 8-bit containers; mxf4's e2m1 is packed two to a byte.
+      const bool mx = kind == "mxf8f6f4" || kind == "mxf4" || kind == "mxf4nvf4";
+      auto narrow = [](const std::string& t) {
+        return t == "e4m3" || t == "e5m2" || t == "e3m2" || t == "e2m3" || t == "e2m1";
+      };
+      if (mx != op.block_scale)
+        return unsupported("mma .block_scale goes with .kind::mxf8f6f4, mxf4 and mxf4nvf4, and only them");
+      if (!mx && (scale_vec || !stype.empty()))
+        return unsupported("mma scale factors without .block_scale");
+      if (kind.empty() && (types[1] == "e3m2" || types[1] == "e2m3" || types[1] == "e2m1" ||
+                           types[2] == "e3m2" || types[2] == "e2m3" || types[2] == "e2m1"))
+        return unsupported("mma with ." + types[1] + "." + types[2] + " needs .kind::f8f6f4");
+      if (!kind.empty()) {
+        // sm_120a, or sm_12xf from PTX ISA 8.8 (the family's own targets).
+        if (!(target_.rfind("sm_120a", 0) == 0 || target_.rfind("sm_121a", 0) == 0 ||
+              (target_.rfind("sm_12", 0) == 0 && target_.size() > 6 && target_.back() == 'f')))
+          fail(ins.line, "mma.kind::" + kind + " requires an sm_120a (or sm_12xf) target; this module targets " +
+                             (target_.empty() ? std::string("nothing") : target_));
+        if (sparse)
+          return unsupported("mma.sp with ." + ("kind::" + kind) + " (sm_120 sparse) is not implemented");
+        const bool f4 = kind == "mxf4" || kind == "mxf4nvf4";
+        const bool dc_ok = mx ? types[0] == "f32" && types[3] == "f32"
+                              : (types[0] == "f32" || types[0] == "f16") && types[0] == types[3];
+        const bool ab_ok = f4 ? types[1] == "e2m1" && types[2] == "e2m1" : narrow(types[1]) && narrow(types[2]);
+        const unsigned want_k = f4 ? 64 : 32;
+        if (mm != 16 || kk != want_k || !dc_ok || !ab_ok)
+          return unsupported("mma.kind::" + kind + "." + "m" + std::to_string(mm) + "n8k" + std::to_string(kk) +
+                             "." + types[0] + "." + types[1] + "." + types[2] + "." + types[3] +
+                             " is not a form the ISA defines");
+        if (mx) {
+          // Table 45: mxf8f6f4 1X ue8m0; mxf4 2X ue8m0; mxf4nvf4 2X ue8m0, or
+          // 4X with ue8m0 or ue4m3 (and a size it must name).
+          if (kind == "mxf4nvf4" && !scale_vec) return unsupported("mma.kind::mxf4nvf4 needs a .scale_vec size");
+          if (!scale_vec) scale_vec = kind == "mxf4" ? 2 : 1;
+          const bool vs_ok = kind == "mxf8f6f4" ? scale_vec == 1
+                           : kind == "mxf4"     ? scale_vec == 2
+                                                : scale_vec == 2 || scale_vec == 4;
+          if (!vs_ok || stype.empty() || (stype == "ue4m3" && !(kind == "mxf4nvf4" && scale_vec == 4)))
+            return unsupported("mma.kind::" + kind + " with this scale vector size and ." +
+                               (stype.empty() ? std::string("<stype>") : stype) + " is not in Table 45");
+          op.scale_vec = static_cast<uint32_t>(scale_vec);
+          op.ue4m3 = stype == "ue4m3";
+        }
+        auto nt = [&](const std::string& t) {
+          return t == "e4m3" ? MmaElem::E4M3 : t == "e5m2" ? MmaElem::E5M2 : t == "e3m2" ? MmaElem::E3M2
+               : t == "e2m3" ? MmaElem::E2M3 : f4 ? MmaElem::E2M1P : MmaElem::E2M1;
+        };
+        op.m = 16;
+        op.k = kk;
+        op.ab_type = nt(types[1]);
+        op.b_type = nt(types[2]);
+        op.acc_f16 = types[0] == "f16";
+        op.c_f16 = types[3] == "f16";
+        if (layouts.size() != 2 || layouts[0] != "row" || layouts[1] != "col")
+          return unsupported("mma.kind::" + kind + " is .row.col only");
+        op.d = parse_reg_vector_any();
+        expect_punct(",");
+        op.a = parse_reg_vector_any();
+        expect_punct(",");
+        op.b = parse_reg_vector_any();
+        expect_punct(",");
+        op.c = parse_reg_vector_any();
+        if (mx) {
+          auto braced_one = [&]() {
+            if (!peek_punct("{")) return parse_operand();
+            const std::vector<Operand> v = parse_operand_vector_any();
+            if (v.size() != 1) fail(ins.line, "mma's scale data is one register");
+            return v[0];
+          };
+          auto pair = [&](Operand* byte, Operand* thread) {
+            const std::vector<Operand> v = parse_operand_vector_any();
+            if (v.size() != 2) fail(ins.line, "mma's scale selector is {byte-id, thread-id}");
+            *byte = v[0];
+            *thread = v[1];
+          };
+          expect_punct(",");
+          op.sfa = braced_one();
+          expect_punct(",");
+          pair(&op.sfa_byte, &op.sfa_thread);
+          expect_punct(",");
+          op.sfb = braced_one();
+          expect_punct(",");
+          pair(&op.sfb_byte, &op.sfb_thread);
+        }
+        if (op.d.size() != op.c.size()) return unsupported("mma D and C arity differ");
+        ins.op = op;
+        expect_punct(";");
+        return ins;
+      }
       op.m = mm;
       op.k = kk;
       auto elem = [&](const std::string& t, MmaElem* e, bool* sign) {

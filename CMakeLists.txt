@@ -30,6 +30,7 @@ set(VGPU_PROFILES
   nvidia/h100
   nvidia/h200
   nvidia/b200
+  nvidia/rtx5090
   nvidia/rtx3060
   nvidia/rtx3080ti
   nvidia/a100-sxm4-40gb

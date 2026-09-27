@@ -279,7 +279,9 @@ struct OpStMatrix {
 // the older whole-fragment API: this one names the exact shape and the
 // registers each lane holds.
 enum class FRound { Nearest, Zero, MinusInf, PlusInf };
-enum class MmaElem { F16, BF16, TF32, S8, U8, S4, U4, B1, E4M3, E5M2, F64 };
+// E3M2/E2M3/E2M1 sit in 8-bit containers (.kind::f8f6f4, .kind::mxf8f6f4);
+// E2M1P is e2m1 packed two to a byte (.kind::mxf4, .kind::mxf4nvf4).
+enum class MmaElem { F16, BF16, TF32, S8, U8, S4, U4, B1, E4M3, E5M2, F64, E3M2, E2M3, E2M1, E2M1P };
 // mma.sync (PTX ISA 9.7.16.5.14): every documented shape except the
 // block-scaled and .kind::f8f6f4 ones. m16n8kK, m8n8kK (the integer, b1 and
 // f64 ones) and Volta's m8n8k4 f16, which is four 8x8x4 products at once.
@@ -303,6 +305,13 @@ struct OpMma {
   // the selector says which threads of each group of four supply it.
   bool sparse = false;
   Operand meta, selector;
+  // sm_120's block scaling (9.7.16.3): D = (A * scale_A) * (B * scale_B) + C,
+  // with `scale_vec` factors a row of A / column of B, ue8m0 or ue4m3, picked
+  // from the scale-a/b-data registers by the {byte-id, thread-id} selectors.
+  bool block_scale = false;
+  uint32_t scale_vec = 1;
+  bool ue4m3 = false;
+  Operand sfa, sfa_byte, sfa_thread, sfb, sfb_byte, sfb_thread;
 };
 // Hopper's warpgroup MMA (sm_90a): wgmma.fence, .commit_group, .wait_group
 // and .mma_async. Four warps compute one 64xNxK product; A comes from

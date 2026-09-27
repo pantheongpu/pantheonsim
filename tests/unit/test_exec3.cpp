@@ -1,6 +1,7 @@
 // Tests for the arithmetic/conversion ops added to run real pantheon kernels:
 // neg, prmt.b32 (byte permute), and the full cvt family (int<->float, rounding).
 #include <cstring>
+#include <functional>
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
@@ -622,7 +623,7 @@ VTEST(sparse_mma_and_cvt_pack_refuse_what_they_do_not_implement) {
   VCHECK_CONTAINS(parse_one("mma.sync.aligned.m16n8k32.row.col.kind::f8f6f4.f32.e2m1.e2m1.f32 "
                             "{%f0,%f1,%f2,%f3}, {%r4,%r5,%r6,%r7}, {%r8,%r9}, "
                             "{%f4,%f5,%f6,%f7};").message(),
-                  "kind::f8f6f4");
+                  "requires an sm_120a");
   VCHECK_CONTAINS(parse_one("mma.sp::ordered_metadata.sync.aligned.m16n8k64.row.col.s32.s8.s8.s32 "
                             "{%r0,%r1,%r2,%r3}, {%r4,%r5,%r6,%r7}, {%r8,%r9,%r10,%r11}, "
                             "{%r12,%r13,%r14,%r15}, %r16, 0x1;").message(),
@@ -5151,6 +5152,206 @@ VTEST(mma_f64_m16n8k_shapes_against_a_host_gemm) {
         VCHECK_EQ(bits(want), d[l * 4 + i]);
       }
   }
+}
+
+// ---- sm_120's mma kinds -------------------------------------------------------------
+
+namespace {
+// The OCP MX codes for the multiples of 1/2 in [-4, 4] used here.
+uint32_t mx_code(float f, int eb, int mb, int bias) {
+  if (f == 0.0f) return 0;
+  const uint32_t sign = f < 0 ? 1u << (eb + mb) : 0;
+  const float a = std::fabs(f);
+  int e = 0;
+  const float m = std::frexp(a, &e);
+  const int biased = e - 1 + bias;
+  if (biased <= 0) return sign | static_cast<uint32_t>(std::ldexp(a, mb - (1 - bias)));
+  return sign | uint32_t(biased) << mb | static_cast<uint32_t>((m * 2.0f - 1.0f) * float(1 << mb));
+}
+float sm120_val(int i, int j, int salt) { return static_cast<float>(((i * 5 + j * 3 + salt) % 9) - 4) * 0.5f; }
+
+struct Sm120Case {
+  std::string op;              // up to the operands
+  int K;                       // 32 or 64
+  int elem_bits;               // bits a register slot takes: 8 (containers) or 4 (packed e2m1)
+  std::function<uint32_t(float)> a_code, b_code;   // a value's bits in its slot
+  bool scaled = false;
+  uint32_t bida = 0, tida = 0, bidb = 0, tidb = 0, sv = 1;
+  std::function<uint8_t(int, int)> sfa, sfb;       // (row or column, block) -> byte
+  std::function<double(uint8_t)> factor;
+};
+
+// A and B from the fragment layouts (9.7.16.5.10-11): with p slots to a
+// register, A's register r of lane (g, t) holds row g + 8(r % 2), columns
+// tp + 4p(r / 2) on; B's register r holds rows tp + 4pr on of column g.
+std::vector<float> run_sm120(const Sm120Case& t, std::function<float(int, int)> A, std::function<float(int, int)> B) {
+  const int p = 32 / t.elem_bits, na = 16 * t.K / (32 * p), nb = t.K * 8 / (32 * p);
+  std::vector<uint32_t> in(32 * 8, 0);
+  for (int lane = 0; lane < 32; ++lane) {
+    const int g = lane / 4, tt = lane % 4;
+    for (int r = 0; r < na; ++r)
+      for (int e = 0; e < p; ++e)
+        in[lane * 8 + r] |= t.a_code(A(g + 8 * (r % 2), tt * p + 4 * p * (r / 2) + e)) << (t.elem_bits * e);
+    for (int r = 0; r < nb; ++r)
+      for (int e = 0; e < p; ++e) in[lane * 8 + 4 + r] |= t.b_code(B(tt * p + 4 * p * r + e, g)) << (t.elem_bits * e);
+    if (t.scaled) {
+      // Figures 46-48: the selected pair of each quad holds rows g (first
+      // thread) and g + 8 (second); thread tidb of quad g holds column g.
+      if (tt / 2 == int(t.tida))
+        for (uint32_t b = 0; b < t.sv; ++b) in[lane * 8 + 6] |= uint32_t(t.sfa(g + 8 * (tt % 2), b)) << (8 * (t.bida + b));
+      if (tt == int(t.tidb))
+        for (uint32_t b = 0; b < t.sv; ++b) in[lane * 8 + 7] |= uint32_t(t.sfb(g, b)) << (8 * (t.bidb + b));
+    }
+  }
+  std::string ptx = R"(.version 8.7
+.target sm_120a
+.address_size 64
+.visible .entry k(.param .u64 pin, .param .u64 pout)
+{
+    .reg .b32 %r<24>;
+    .reg .f32 %f<8>;
+    .reg .b16 %h<4>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [pin];
+    ld.param.u64 %rd2, [pout];
+    mov.u32 %r20, %tid.x;
+    mul.wide.u32 %rd3, %r20, 32;
+    add.u64 %rd4, %rd1, %rd3;
+    mul.wide.u32 %rd5, %r20, 16;
+    add.u64 %rd6, %rd2, %rd5;
+)";
+  for (int i = 0; i < 8; ++i) ptx += "    ld.global.u32 %r" + std::to_string(i) + ", [%rd4+" + std::to_string(4 * i) + "];\n";
+  ptx += "    mov.f32 %f4, 0f00000000;\n";
+  ptx += "    mov.b16 %h0, " + std::to_string(t.bida) + ";\n    mov.b16 %h1, " + std::to_string(t.tida) + ";\n";
+  ptx += "    mov.b16 %h2, " + std::to_string(t.bidb) + ";\n    mov.b16 %h3, " + std::to_string(t.tidb) + ";\n";
+  std::string a = "{%r0, %r1, %r2, %r3}", b = "{%r4, %r5}";
+  ptx += "    " + t.op + " {%f0, %f1, %f2, %f3}, " + a + ", " + b + ", {%f4, %f4, %f4, %f4}" +
+         (t.scaled ? ", {%r6}, {%h0, %h1}, {%r7}, {%h2, %h3}" : "") + ";\n";
+  for (int i = 0; i < 4; ++i) ptx += "    st.global.f32 [%rd6+" + std::to_string(4 * i) + "], %f" + std::to_string(i) + ";\n";
+  ptx += "    ret;\n}\n";
+  Env e;
+  e.prof = load_gpu("nvidia/rtx5090");
+  const uint64_t pin = e.mem.alloc(in.size() * 4), pout = e.mem.alloc(32 * 16);
+  e.mem.write(pin, in.data(), in.size() * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(pin), arg_u64(pout)}, e.mem, e.prof);
+  std::vector<float> d(32 * 4);
+  e.mem.read(pout, d.data(), d.size() * 4);
+  // Back to a 16 x 8 tile: D element i of lane (g, t) is row g + 8(i / 2),
+  // column 2t + i % 2.
+  std::vector<float> D(16 * 8);
+  for (int lane = 0; lane < 32; ++lane)
+    for (int i = 0; i < 4; ++i) D[(lane / 4 + 8 * (i / 2)) * 8 + 2 * (lane % 4) + i % 2] = d[lane * 4 + i];
+  return D;
+}
+
+void check_sm120(const Sm120Case& t, std::function<float(int, int)> A, std::function<float(int, int)> B) {
+  const auto D = run_sm120(t, A, B);
+  const int blk = t.K / int(t.sv);
+  for (int i = 0; i < 16; ++i)
+    for (int j = 0; j < 8; ++j) {
+      double want = 0;
+      for (int k = 0; k < t.K; ++k)
+        want += double(A(i, k)) * B(k, j) *
+                (t.scaled ? t.factor(t.sfa(i, k / blk)) * t.factor(t.sfb(j, k / blk)) : 1.0);
+      if (D[i * 8 + j] != float(want))
+        VCHECK_EQ(std::to_string(i) + "," + std::to_string(j) + ": " + std::to_string(D[i * 8 + j]),
+                  std::to_string(i) + "," + std::to_string(j) + ": " + std::to_string(float(want)));
+    }
+}
+}  // namespace
+
+// .kind::f8f6f4: e2m1 in bits 2-5 of its byte, e3m2 in bits 0-5.
+VTEST(mma_sm120_f8f6f4_e2m1_times_e3m2) {
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e2m1.e3m2.f32";
+  t.K = 32;
+  t.elem_bits = 8;
+  t.a_code = [](float f) { return mx_code(f, 2, 1, 1) << 2; };
+  t.b_code = [](float f) { return mx_code(f, 3, 2, 3); };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 1); }, [](int k, int j) { return sm120_val(k, j, 4); });
+}
+
+// .kind::mxf8f6f4 1X: ue8m0 factors from byte 2 of the upper thread pair (A)
+// and byte 1 of thread 3 (B).
+VTEST(mma_sm120_mxf8f6f4_selectors) {
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m3.f32.ue8m0";
+  t.K = 32;
+  t.elem_bits = 8;
+  t.a_code = [](float f) { return mx_code(f, 4, 3, 7); };
+  t.b_code = [](float f) { return mx_code(f, 2, 3, 1); };
+  t.scaled = true;
+  t.bida = 2; t.tida = 1; t.bidb = 1; t.tidb = 3; t.sv = 1;
+  t.sfa = [](int i, int) { return uint8_t(124 + i % 6); };
+  t.sfb = [](int j, int) { return uint8_t(126 + j % 4); };
+  t.factor = [](uint8_t v) { return std::ldexp(1.0, int(v) - 127); };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 2); }, [](int k, int j) { return sm120_val(k, j, 7); });
+}
+
+// .kind::mxf4 (2X by default): e2m1 packed, two blocks of 32, from bytes 2-3.
+VTEST(mma_sm120_mxf4_two_blocks) {
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::mxf4.block_scale.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0";
+  t.K = 64;
+  t.elem_bits = 4;
+  t.a_code = t.b_code = [](float f) { return mx_code(f, 2, 1, 1); };
+  t.scaled = true;
+  t.bida = 2; t.tida = 0; t.bidb = 2; t.tidb = 1; t.sv = 2;
+  t.sfa = [](int i, int b) { return uint8_t(125 + (i + 3 * b) % 5); };
+  t.sfb = [](int j, int b) { return uint8_t(127 - (j + b) % 3); };
+  t.factor = [](uint8_t v) { return std::ldexp(1.0, int(v) - 127); };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 3); }, [](int k, int j) { return sm120_val(k, j, 5); });
+}
+
+// .kind::mxf4nvf4 4X with ue4m3: four blocks of 16.
+VTEST(mma_sm120_mxf4nvf4_ue4m3) {
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3";
+  t.K = 64;
+  t.elem_bits = 4;
+  t.a_code = t.b_code = [](float f) { return mx_code(f, 2, 1, 1); };
+  t.scaled = true;
+  t.tida = 1; t.tidb = 2; t.sv = 4;
+  const float steps[] = {0.5f, 1.0f, 1.5f, 2.0f, 0.75f};
+  t.sfa = [steps](int i, int b) { return uint8_t(mx_code(steps[(i + b) % 5], 4, 3, 7)); };
+  t.sfb = [steps](int j, int b) { return uint8_t(mx_code(steps[(2 * j + b) % 5], 4, 3, 7)); };
+  t.factor = [](uint8_t v) {
+    return v ? std::ldexp(1.0 + (v & 7) / 8.0, int(v >> 3) - 7) : 0.0;
+  };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 6); }, [](int k, int j) { return sm120_val(k, j, 2); });
+}
+
+VTEST(mma_sm120_refuses_what_table_45_rules_out) {
+  auto parse = [](const std::string& ins) {
+    return VCAPTURE(Error, ptx::parse(".version 8.7\n.target sm_120a\n.address_size 64\n.visible .entry k()\n{\n"
+                                      " .reg .b32 a<8>;\n .reg .f32 f<8>;\n .reg .b16 h<4>;\n " + ins + "\n ret;\n}\n"))
+        .message();
+  };
+  VCHECK_CONTAINS(parse("mma.sync.aligned.m16n8k32.row.col.f32.e2m1.e2m1.f32 {f0,f1,f2,f3}, {a0,a1,a2,a3}, {a4,a5}, {f0,f1,f2,f3};"),
+                  "needs .kind::f8f6f4");
+  VCHECK_CONTAINS(parse("mma.sync.aligned.kind::mxf4nvf4.block_scale.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+                        "{f0,f1,f2,f3}, {a0,a1,a2,a3}, {a4,a5}, {f0,f1,f2,f3}, {a6}, {h0,h1}, {a7}, {h2,h3};"),
+                  "needs a .scale_vec");
+  VCHECK_CONTAINS(parse("mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                        "{f0,f1,f2,f3}, {a0,a1,a2,a3}, {a4,a5}, {f0,f1,f2,f3}, {a6}, {h0,h1}, {a7}, {h2,h3};"),
+                  "Table 45");
+  VCHECK_CONTAINS(parse("mma.sync.aligned.kind::f8f6f4.m16n8k64.row.col.f32.e4m3.e4m3.f32 {f0,f1,f2,f3}, "
+                        "{a0,a1,a2,a3}, {a4,a5}, {f0,f1,f2,f3};"),
+                  "not a form");
+  // Table 46: byte-id 1 is not a 2X selector.
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::mxf4.block_scale.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0";
+  t.K = 64;
+  t.elem_bits = 4;
+  t.a_code = t.b_code = [](float f) { return mx_code(f, 2, 1, 1); };
+  t.scaled = true;
+  t.bida = 1; t.sv = 2;
+  t.sfa = t.sfb = [](int, int) { return uint8_t(127); };
+  t.factor = [](uint8_t) { return 1.0; };
+  VCHECK_CONTAINS(VCAPTURE(Error, run_sm120(t, [](int, int) { return 1.0f; }, [](int, int) { return 1.0f; })).message(),
+                  "Table 46");
 }
 
 VTEST_MAIN

@@ -50,7 +50,9 @@ uint32_t boot_architecture(const telemetry::DeviceSample& d) {
   if (arch == "ampere") return 0x17;       // _GA100
   if (arch == "hopper") return 0x18;       // _GH100
   if (arch == "ada") return 0x19;          // _AD100
-  if (arch == "blackwell") return 0x1a;    // _GB100
+  // Blackwell is two families: GB100 (B200, compute capability 10.x) and
+  // GB200, the GB20x dies of the GeForce RTX 50 series (12.x).
+  if (arch == "blackwell") return d.cc_major >= 12 ? 0x1b : 0x1a;   // _GB200 : _GB100
   return 0;
 }
 
