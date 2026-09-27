@@ -2305,9 +2305,7 @@ class Parser {
       else if (what == "commit") op.kind = Tcgen05Kind::Commit;
       else if (what == "mma") op.kind = Tcgen05Kind::Mma;
       else if (what == "cp") op.kind = Tcgen05Kind::Cp;
-      else if (what == "shift")
-        return unsupported("tcgen05.shift (the ISA does not say which columns a row's 32-byte shift "
-                           "covers) is not implemented");
+      else if (what == "shift") op.kind = Tcgen05Kind::Shift;
       else return unsupported("tcgen05." + what);
       bool have_shape = false, have_num = false, have_kind = false, mbar_arrive = false;
       for (size_t i = 2; i < parts.size(); ++i) {
@@ -2369,8 +2367,10 @@ class Parser {
         else if (op.kind == Tcgen05Kind::Cp && p == "warpx4") op.cp_multicast = 4;
         else if (op.kind == Tcgen05Kind::Cp && p == "warpx2::02_13") op.cp_multicast = 2;
         else if (op.kind == Tcgen05Kind::Cp && p == "warpx2::01_23") op.cp_multicast = 3;
-        else if (op.kind == Tcgen05Kind::Cp && (p == "b8x16" || p == "b6x16_p32" || p == "b4x16_p64"))
-          return unsupported("tcgen05.cp's decompression (." + p + ") is not implemented");
+        else if (op.kind == Tcgen05Kind::Cp && p == "b8x16") ;
+        else if (op.kind == Tcgen05Kind::Cp && p == "b6x16_p32") op.cp_decompress = 6;
+        else if (op.kind == Tcgen05Kind::Cp && p == "b4x16_p64") op.cp_decompress = 4;
+        else if (op.kind == Tcgen05Kind::Shift && p == "down") ;
         else if (p == "ashift")
           return unsupported("tcgen05.mma.ashift is not implemented yet");
         else if (p.rfind("decompress", 0) == 0 || p == "kind::ti16")
@@ -2439,6 +2439,9 @@ class Parser {
             expect_punct(",");
             op.cta_mask = parse_operand();
           }
+          break;
+        case Tcgen05Kind::Shift:
+          op.d_tmem = bracketed();
           break;
         case Tcgen05Kind::Cp: {
           if (!have_shape) return unsupported("tcgen05.cp needs a shape");

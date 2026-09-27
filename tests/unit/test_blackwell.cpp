@@ -588,8 +588,6 @@ VTEST(tcgen05_refuses_what_is_not_implemented_by_name) {
                                       ".visible .entry k()\n{\n .reg .b32 a, b;\n .reg .b64 d;\n .reg .pred p;\n " +
                                       ins + "\n ret;\n}\n"));
   };
-  VCHECK_CONTAINS(parse("tcgen05.shift.cta_group::1.down [a];").message(), "tcgen05.shift");
-  VCHECK_CONTAINS(parse("tcgen05.cp.cta_group::1.128x128b.b8x16.b6x16_p32 [a], d;").message(), "decompression");
   VCHECK_CONTAINS(parse("tcgen05.cp.cta_group::1.32x128b [a], d;").message(), ".warpx4");
   VCHECK_CONTAINS(parse("tcgen05.mma.ws.cta_group::1.kind::f16 [a], d, d, a, p;").message(), "weight-stationary");
   VCHECK_CONTAINS(parse("tcgen05.mma.cta_group::1.kind::f16.block_scale [a], d, d, a, [b], [b], p;").message(),
@@ -1691,9 +1689,99 @@ VTEST(tcgen05_cp_32x128b_warpx4_fills_every_quarter) {
       VCHECK_EQ(out[size_t(l) * 16 + c], c >= 8 && c < 12 ? cp_word(l % 32, c - 8) : 0u);
 }
 
-VTEST(tcgen05_cp_refuses_warpx2) {
-  VCHECK_CONTAINS(VCAPTURE(Error, run_cp("64x128b.warpx2::02_13", desc(0, 1024, 128, 0), {})).message(),
-                  "64x128b.warpx2");
+// .64x128b.warpx2: 64 rows, each warp of a pair holding the same 32 --
+// ::02_13 rows r at lanes r and r + 64, ::01_23 at 64(r / 32) + r % 32 and
+// 32 lanes on (CuTe's UTCCP 2x64dp copy traits).
+VTEST(tcgen05_cp_64x128b_warpx2_pairs) {
+  std::vector<uint8_t> img;
+  for (int r = 0; r < 64; ++r)
+    for (int b = 0; b < 16; ++b) put(img, canonical(Major::K, 0, 1, 1024, 128, r, b), cp_byte(r, b), 1);
+  for (const bool pair0213 : {true, false}) {
+    const auto out = run_cp(pair0213 ? "64x128b.warpx2::02_13" : "64x128b.warpx2::01_23", desc(0, 1024, 128, 0), img);
+    for (int l = 0; l < 128; ++l) {
+      const int r = pair0213 ? l % 64 : 32 * (l / 64) + l % 32;
+      for (int c = 0; c < 16; ++c)
+        VCHECK_EQ(out[size_t(l) * 16 + c], c >= 8 && c < 12 ? cp_word(r, c - 8) : 0u);
+    }
+  }
+}
+
+// Decompression (9.7.18.9.1): each 16-byte group of sixteen packed fp4
+// (first 8 bytes) or fp6 (first 12) values becomes sixteen bytes, fp4 in bits
+// 2-5 and fp6 in bits 0-5 (figures 197-201).
+VTEST(tcgen05_cp_decompresses_fp4_and_fp6) {
+  for (const int bits : {4, 6}) {
+    std::vector<uint8_t> img;
+    auto value = [&](int r, int j) { return uint32_t((r * 5 + j * 3 + bits) & ((1 << bits) - 1)); };
+    for (int r = 0; r < 128; ++r) {
+      uint8_t group[16] = {};
+      for (int j = 0; j < 16; ++j)
+        for (int k = 0; k < bits; ++k)
+          if (value(r, j) >> k & 1) group[(j * bits + k) / 8] |= uint8_t(1u << ((j * bits + k) % 8));
+      for (int b = 0; b < 16; ++b) put(img, canonical(Major::K, 0, 1, 2048, 128, r, b), group[b], 1);
+    }
+    const auto out = run_cp(bits == 4 ? "128x128b.b8x16.b4x16_p64" : "128x128b.b8x16.b6x16_p32",
+                            desc(0, 2048, 128, 0), img);
+    for (int l = 0; l < 128; ++l)
+      for (int w = 0; w < 4; ++w) {
+        uint32_t want = 0;
+        for (int j = 0; j < 4; ++j) want |= (value(l, 4 * w + j) << (bits == 4 ? 2 : 0)) << (8 * j);
+        VCHECK_EQ(out[size_t(l) * 16 + 8 + w], want);
+      }
+  }
+}
+
+// tcgen05.shift.down (the implicit .31x256b): rows 0-30 of the 32 lanes at
+// the address move down one row across eight columns; row 0 keeps its value.
+VTEST(tcgen05_shift_moves_31_rows_down) {
+  const std::string ptx = std::string(kHeader100a) + R"(
+.visible .entry k(.param .u64 pout)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<4>;
+    .shared .align 4 .b32 slot;
+    ld.param.u64 %rd1, [pout];
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 5;
+    setp.eq.u32 %p1, %r2, 0;
+    @%p1 tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [slot], 32;
+    bar.sync 0;
+    ld.shared.u32 %r3, [slot];
+    // Lane l, column c holds 1000 l + c, for the first 16 columns.
+    shl.b32 %r4, %r2, 21;
+    add.u32 %r4, %r4, %r3;
+    mul.lo.u32 %r5, %r1, 1000;
+)";
+  std::string body;
+  std::string regs;
+  for (int c = 0; c < 16; ++c) {
+    body += "    add.u32 %r" + std::to_string(6 + c) + ", %r5, " + std::to_string(c) + ";\n";
+    regs += (c ? ", %r" : "%r") + std::to_string(6 + c);
+  }
+  body += "    tcgen05.st.sync.aligned.32x32b.x16.b32 [%r4], {" + regs + "};\n";
+  body += "    tcgen05.wait::st.sync.aligned;\n    bar.sync 0;\n";
+  body += "    setp.eq.u32 %p1, %r1, 0;\n    add.u32 %r22, %r3, 0x00200004;\n";   // lane 32, column 4
+  body += "    @%p1 tcgen05.shift.cta_group::1.down [%r22];\n    bar.sync 0;\n";
+  body += "    tcgen05.ld.sync.aligned.32x32b.x16.b32 {" + regs + "}, [%r4];\n    tcgen05.wait::ld.sync.aligned;\n";
+  body += "    mul.wide.u32 %rd2, %r1, 64;\n    add.u64 %rd3, %rd1, %rd2;\n";
+  for (int c = 0; c < 16; ++c)
+    body += "    st.global.u32 [%rd3+" + std::to_string(4 * c) + "], %r" + std::to_string(6 + c) + ";\n";
+  body += "    bar.sync 0;\n    setp.eq.u32 %p1, %r2, 0;\n";
+  body += "    @%p1 tcgen05.dealloc.cta_group::1.sync.aligned.b32 %r3, 32;\n";
+  body += "    @%p1 tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;\n    ret;\n}\n";
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(128 * 64);
+  LaunchConfig cfg;
+  cfg.block = {128, 1, 1};
+  exec::launch(ptx::parse(ptx + body).entries[0], cfg, {arg_u64(out)}, mem, load_gpu("nvidia/b200"));
+  std::vector<uint32_t> got(128 * 16);
+  mem.read(out, got.data(), got.size() * 4);
+  for (int l = 0; l < 128; ++l)
+    for (int c = 0; c < 16; ++c) {
+      const bool moved = l >= 33 && l < 64 && c >= 4 && c < 12;
+      VCHECK_EQ(got[size_t(l) * 16 + c], uint32_t(1000 * (moved ? l - 1 : l) + c));
+    }
 }
 
 // ---- tcgen05.mma over a CTA pair ---------------------------------------------------
