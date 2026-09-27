@@ -839,8 +839,9 @@ narrows what counts as observable, not what the detector looks at.
   from Tensor Memory), dense or with sparse A (`tcgen05.mma.sp`, the
   metadata as figures 287-292 lay it out), one CTA (M = 64/128) or a pair
   (M = 128/256), A from shared or Tensor Memory, with the data-path layouts
-  A-D and F of figures 211-222; `tcgen05.cp` (the 128- and 32-row shapes,
-  `.warpx4`); `tcgen05.commit` (multicast too), the fences and waits.
+  A-D and F of figures 211-222; `tcgen05.cp` (every shape, `.warpx4` and
+  `.warpx2`, fp4/fp6 decompression), `tcgen05.shift`; `tcgen05.commit`
+  (multicast too), the fences and waits.
   Around it: cluster launch control (`try_cancel` takes over clusters that
   have not started, so CUTLASS's persistent loop really loops), `.b128`
   registers, TMA's `.cta_group::2`, `.tile::gather4`/`scatter4` and packed
@@ -852,11 +853,11 @@ narrows what counts as observable, not what the detector looks at.
   layouts, the launch-control takeover, TMA through the peer bit) and by
   CUTLASS's own SM100 GEMM tests, unmodified, against its host reference:
   dense f16 (1-SM, 2-SM, stream-K), f8 and s8 (24 cases); sparse f16, tf32,
-  f8 and s8 (88); block-scaled mxf8f6f4, mxf6, mxf8 x mxf4, mxf4 and nvf4
-  (38 cases in six files). Weight-stationary MMAs (`.ws`: CUTLASS never
+  f8 and s8 (88), and fp4/fp6 (16); block-scaled, every combination of
+  mxf4/mxf6/mxf8/nvf4 in TN and NT (102 cases in 20 files); block-scaled
+  sparse mxf8 and mxf6 (18). Weight-stationary MMAs (`.ws`: CUTLASS never
   issues them, and the ISA's zero-column-mask examples contradict each
-  other), `tcgen05.shift`, and `tcgen05.cp`'s `.warpx2` and decompression
-  are refused by name.
+  other) and `.ashift` are refused by name.
   See nvidia/docs/blackwell.md.
 
 - The CTA's sixteen barriers (PTX ISA 9.7.15.1): `bar.sync` and
@@ -929,8 +930,7 @@ what is done.
   nvidia/docs/blackwell.md), attribute
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle's 8-byte-flip
-  variant (Blackwell); tcgen05's weight-stationary MMAs,
-  `tcgen05.shift` and `tcgen05.cp`'s `.warpx2` and decompression; the sparse and
+  variant (Blackwell); tcgen05's weight-stationary MMAs and `.ashift`; the sparse and
   single-bit `wgmma` forms, and inline-asm-only instructions. (`wgmma`, TMA,
   the mbarrier transaction counts, `barrier.cluster` and distributed shared
   memory are done -- see "Hopper's warpgroup MMA", "TMA and clusters" and
