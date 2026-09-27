@@ -31,14 +31,6 @@ void vgpu_report_unimplemented(const char* fn) {
 }
 }  // namespace
 
-VGPU_EXPORT int cudnnBackendCreateDescriptor() { vgpu_report_unimplemented("cudnnBackendCreateDescriptor"); return 9; }
-VGPU_EXPORT int cudnnBackendDestroyDescriptor() { vgpu_report_unimplemented("cudnnBackendDestroyDescriptor"); return 9; }
-VGPU_EXPORT int cudnnBackendExecute() { vgpu_report_unimplemented("cudnnBackendExecute"); return 9; }
-VGPU_EXPORT int cudnnBackendFinalize() { vgpu_report_unimplemented("cudnnBackendFinalize"); return 9; }
-VGPU_EXPORT int cudnnBackendGetAttribute() { vgpu_report_unimplemented("cudnnBackendGetAttribute"); return 9; }
-VGPU_EXPORT int cudnnBackendSetAttribute() { vgpu_report_unimplemented("cudnnBackendSetAttribute"); return 9; }
-VGPU_EXPORT int cudnnBatchNormalizationBackwardEx() { vgpu_report_unimplemented("cudnnBatchNormalizationBackwardEx"); return 9; }
-VGPU_EXPORT int cudnnBatchNormalizationForwardTrainingEx() { vgpu_report_unimplemented("cudnnBatchNormalizationForwardTrainingEx"); return 9; }
 VGPU_EXPORT int cudnnCTCLoss() { vgpu_report_unimplemented("cudnnCTCLoss"); return 9; }
 VGPU_EXPORT int cudnnCTCLoss_v8() { vgpu_report_unimplemented("cudnnCTCLoss_v8"); return 9; }
 VGPU_EXPORT int cudnnConvolutionBackwardData() { vgpu_report_unimplemented("cudnnConvolutionBackwardData"); return 9; }
@@ -58,9 +50,6 @@ VGPU_EXPORT int cudnnDropoutGetStatesSize() { vgpu_report_unimplemented("cudnnDr
 VGPU_EXPORT int cudnnFindConvolutionBackwardDataAlgorithmEx() { vgpu_report_unimplemented("cudnnFindConvolutionBackwardDataAlgorithmEx"); return 9; }
 VGPU_EXPORT int cudnnFindConvolutionBackwardFilterAlgorithmEx() { vgpu_report_unimplemented("cudnnFindConvolutionBackwardFilterAlgorithmEx"); return 9; }
 VGPU_EXPORT int cudnnFindConvolutionForwardAlgorithmEx() { vgpu_report_unimplemented("cudnnFindConvolutionForwardAlgorithmEx"); return 9; }
-VGPU_EXPORT int cudnnGetBatchNormalizationBackwardExWorkspaceSize() { vgpu_report_unimplemented("cudnnGetBatchNormalizationBackwardExWorkspaceSize"); return 9; }
-VGPU_EXPORT int cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize() { vgpu_report_unimplemented("cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize"); return 9; }
-VGPU_EXPORT int cudnnGetBatchNormalizationTrainingExReserveSpaceSize() { vgpu_report_unimplemented("cudnnGetBatchNormalizationTrainingExReserveSpaceSize"); return 9; }
 VGPU_EXPORT int cudnnGetCTCLossWorkspaceSize() { vgpu_report_unimplemented("cudnnGetCTCLossWorkspaceSize"); return 9; }
 VGPU_EXPORT int cudnnGetCTCLossWorkspaceSize_v8() { vgpu_report_unimplemented("cudnnGetCTCLossWorkspaceSize_v8"); return 9; }
 VGPU_EXPORT int cudnnGetConvolutionBackwardDataAlgorithm_v7() { vgpu_report_unimplemented("cudnnGetConvolutionBackwardDataAlgorithm_v7"); return 9; }
@@ -72,7 +61,6 @@ VGPU_EXPORT int cudnnGetLastErrorString() { vgpu_report_unimplemented("cudnnGetL
 VGPU_EXPORT int cudnnGetRNNTempSpaceSizes() { vgpu_report_unimplemented("cudnnGetRNNTempSpaceSizes"); return 9; }
 VGPU_EXPORT int cudnnGetRNNWeightParams() { vgpu_report_unimplemented("cudnnGetRNNWeightParams"); return 9; }
 VGPU_EXPORT int cudnnGetRNNWeightSpaceSize() { vgpu_report_unimplemented("cudnnGetRNNWeightSpaceSize"); return 9; }
-VGPU_EXPORT int cudnnGetTensorNdDescriptor() { vgpu_report_unimplemented("cudnnGetTensorNdDescriptor"); return 9; }
 VGPU_EXPORT int cudnnRNNBackwardData_v8() { vgpu_report_unimplemented("cudnnRNNBackwardData_v8"); return 9; }
 VGPU_EXPORT int cudnnRNNBackwardWeights_v8() { vgpu_report_unimplemented("cudnnRNNBackwardWeights_v8"); return 9; }
 VGPU_EXPORT int cudnnRNNForward() { vgpu_report_unimplemented("cudnnRNNForward"); return 9; }
@@ -85,7 +73,6 @@ VGPU_EXPORT int cudnnSetFilterNdDescriptor() { vgpu_report_unimplemented("cudnnS
 VGPU_EXPORT int cudnnSetRNNDataDescriptor() { vgpu_report_unimplemented("cudnnSetRNNDataDescriptor"); return 9; }
 VGPU_EXPORT int cudnnSetRNNDescriptor_v8() { vgpu_report_unimplemented("cudnnSetRNNDescriptor_v8"); return 9; }
 VGPU_EXPORT int cudnnSetSpatialTransformerNdDescriptor() { vgpu_report_unimplemented("cudnnSetSpatialTransformerNdDescriptor"); return 9; }
-VGPU_EXPORT int cudnnSetTensorNdDescriptor() { vgpu_report_unimplemented("cudnnSetTensorNdDescriptor"); return 9; }
 VGPU_EXPORT int cudnnSpatialTfGridGeneratorBackward() { vgpu_report_unimplemented("cudnnSpatialTfGridGeneratorBackward"); return 9; }
 VGPU_EXPORT int cudnnSpatialTfGridGeneratorForward() { vgpu_report_unimplemented("cudnnSpatialTfGridGeneratorForward"); return 9; }
 VGPU_EXPORT int cudnnSpatialTfSamplerBackward() { vgpu_report_unimplemented("cudnnSpatialTfSamplerBackward"); return 9; }
