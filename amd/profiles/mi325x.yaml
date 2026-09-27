@@ -18,6 +18,9 @@ limits:
   shared_mem_per_block_optin_bytes: 65536
   multiprocessors: 304
   max_threads_per_sm: 2048
+  # One XCD's L2, as HIP reports it: the same die as the MI300X, 4 MB per
+  # XCD (CDNA3 whitepaper). Datasheet, not measured.
+  l2_cache_bytes: 4194304
 features:
   fp16: true
   bf16: true
