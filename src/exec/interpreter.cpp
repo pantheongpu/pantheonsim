@@ -6526,8 +6526,12 @@ class Interpreter {
     // n's for B likewise. Both are duplicated into every 32-lane partition
     // (CUTLASS's tcgen05.cp .32x128b.warpx4 does it), and each D row reads
     // the copies in its own partition.
-    const uint32_t sfa_addr = mx ? static_cast<uint32_t>(value(op.scale_a)) : 0;
-    const uint32_t sfb_addr = mx ? static_cast<uint32_t>(value(op.scale_b)) : 0;
+    // Bits 30-31 of these addresses are not read: CuTe keeps a factor's byte
+    // (the SF_ID it also puts in the instruction descriptor) there in its
+    // Tensor Memory pointers and passes them on as they are, which the
+    // hardware accepts -- no lane is that high.
+    const uint32_t sfa_addr = mx ? static_cast<uint32_t>(value(op.scale_a)) & 0x3FFFFFFFu : 0;
+    const uint32_t sfb_addr = mx ? static_cast<uint32_t>(value(op.scale_b)) & 0x3FFFFFFFu : 0;
     const uint32_t blk = mx ? K / sv : K;
     auto scale_of = [&](TensorMemory& t, uint32_t addr, uint32_t idx, uint32_t part, uint32_t sfid,
                         uint32_t j) -> double {
