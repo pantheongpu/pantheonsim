@@ -393,6 +393,47 @@ LOOP:
   VCHECK_CONTAINS(err.what(), "bra LOOP");
 }
 
+// And the mbarriers whose phase is still open: a wait that never ends is
+// usually on one owed an arrival or transaction bytes.
+VTEST(step_budget_error_lists_open_mbarriers) {
+  const char* ptx = R"(
+.version 8.3
+.target sm_90
+.address_size 64
+.visible .entry stuck()
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<2>;
+    .reg .pred %p<4>;
+    .shared .align 8 .b64 bar[2];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, bar;
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 mbarrier.init.shared::cta.b64 [%r2], 2;
+    add.u32 %r3, %r2, 8;
+    @%p1 mbarrier.init.shared::cta.b64 [%r3], 1;
+    bar.sync 0;
+    @%p1 mbarrier.arrive.shared::cta.b64 %rd1, [%r2];
+    @%p1 mbarrier.arrive.expect_tx.shared::cta.b64 %rd1, [%r3], 64;
+WAIT:
+    mbarrier.try_wait.parity.shared::cta.b64 %p2, [%r2], 0;
+    @!%p2 bra WAIT;
+    ret;
+}
+)";
+  ptx::Module m = ptx::parse(ptx);
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/h100");
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  cfg.max_steps = 10000;
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, mem, prof));
+  VCHECK(err.code() == Err::ExecLimit);
+  VCHECK_CONTAINS(err.what(), "mbarriers with an open phase");
+  VCHECK_CONTAINS(err.what(), "0x0: phase 0, 1 of 2 arrived, 0 bytes due");
+  VCHECK_CONTAINS(err.what(), "0x8: phase 0, 1 of 1 arrived, 64 bytes due");
+}
+
 VTEST(launch_limits_enforced) {
   ptx::Module m = ptx::parse(read_file(VGPU_KERNEL_DIR "/vector_add.ptx"));
   MemoryManager mem(1 << 20);
