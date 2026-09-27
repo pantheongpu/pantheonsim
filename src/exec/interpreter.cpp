@@ -6404,11 +6404,9 @@ class Interpreter {
       // 1X whatever K is.
       const uint32_t named = op.scale_vec == 0 && op.mma_kind == Tcgen05MmaKind::MXF4 ? 32 : op.scale_vec;
       if (K == 128 && (named == 16 || named == 32)) sv *= 2;
-      if (sv > 4)
-        refuse("eight scale factors a row (.block16 with K = 128): the ISA does not show where the "
-               "second four are in Tensor Memory");
-      // Byte-aligned sub-columns: 1X any byte, 2X a half word, 4X all four.
-      if ((sv == 2 && (sfa_id % 2 || sfb_id % 2)) || (sv == 4 && (sfa_id || sfb_id))) bad();
+      // Byte-aligned sub-columns: 1X any byte, 2X a half word, 4X (and 8X)
+      // all four.
+      if ((sv == 2 && (sfa_id % 2 || sfb_id % 2)) || (sv >= 4 && (sfa_id || sfb_id))) bad();
     }
     const uint32_t G = op.cta_group;
     const bool shape_ok =
@@ -6541,10 +6539,15 @@ class Interpreter {
     const uint32_t sfa_addr = mx ? static_cast<uint32_t>(value(op.scale_a)) & 0x3FFFFFFFu : 0;
     const uint32_t sfb_addr = mx ? static_cast<uint32_t>(value(op.scale_b)) & 0x3FFFFFFFu : 0;
     const uint32_t blk = mx ? K / sv : K;
+    // Eight factors (.block16 at K = 128, "semantically scale_vec::8X",
+    // 9.7.18.10.7.2.6 and .3.6): factors 4-7 sit as 0-3 do, a 4X layout's
+    // width further on -- 4 columns for A's 128 rows and for N <= 128, 8 for
+    // N > 128 (figures 255 and 262-264).
     auto scale_of = [&](TensorMemory& t, uint32_t addr, uint32_t idx, uint32_t part, uint32_t sfid,
-                        uint32_t j) -> double {
+                        uint32_t j, uint32_t extent) -> double {
       const uint32_t l = (addr >> 16) + idx % 32 + 32 * part;
-      const uint32_t col = (addr & 0xFFFF) + idx / 32;
+      const uint32_t col = (addr & 0xFFFF) + idx / 32 + (j / 4) * (extent > 128 ? 8 : 4);
+      j %= 4;
       if (l >= TensorMemory::kLanes || col >= TensorMemory::kCols || !t.allocated(col))
         ctx_fail(ins, li, Err::OutOfBounds,
                  "tcgen05.mma reads a scale factor from Tensor Memory lane " + std::to_string(l) +
@@ -6582,7 +6585,7 @@ class Interpreter {
       return t.at(l, cc) >> bit & 0xF;
     };
 
-    std::vector<double> A(K), Ap(Ka), SA(4, 1.0), SB(4, 1.0);
+    std::vector<double> A(K), Ap(Ka), SA(8, 1.0), SB(8, 1.0);
     for (uint32_t v = 0; v < G; ++v) {
       TensorMemory& t = tmem_of(*ctas[v]);
       const uint32_t rank = cluster_rank_of(*ctas[v]);
@@ -6636,8 +6639,8 @@ class Interpreter {
           }
           if (mx)
             for (uint32_t j = 0; j < sv; ++j) {
-              SA[j] = scale_of(t, sfa_addr, m, dl / 32, sfa_id, j);
-              SB[j] = scale_of(t, sfb_addr, n, dl / 32, sfb_id, j);
+              SA[j] = scale_of(t, sfa_addr, m, dl / 32, sfa_id, j, 128);
+              SB[j] = scale_of(t, sfb_addr, n, dl / 32, sfb_id, j, N);
             }
           uint32_t& cell = t.at(dl, d_col0 + dc);
           if (d_int) {
