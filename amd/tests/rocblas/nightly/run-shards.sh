@@ -10,8 +10,9 @@
 # CLIENT (build-client.sh's output). Exits non-zero if any test fails or a
 # shard does not finish.
 set -uo pipefail
-gpu=$1 filter=$2 first=$3 last=$4 total=$5 logs=$6
-mkdir -p "$logs"
+gpu=$1 filter=$2 first=$3 last=$4 total=$5
+# Absolute: the shards run from the client's directory.
+logs=$(mkdir -p "$6" && cd "$6" && pwd)
 case $filter in
   fp) f='*/quick_*f32_r*:*/quick_*f64_r*-*f16*:*bf16*:*_c_*:*f32_c*:*f64_c*:*i8*:*f8*:*bf8*' ;;
   mixed) f='*/quick_*f16_r*:*/quick_*bf16_r*:*/quick_*i8_r*-*_c_*:*f8*:*bf8*' ;;
