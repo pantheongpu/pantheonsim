@@ -130,6 +130,9 @@ expect "a kernel reads and writes a peer's memory once peer access is enabled" \
   "$(grep -o '^a kernel on device 0.*' <<< "$out")"
 expect "peer access disabled twice says it is not enabled" "disabling it again: hipErrorPeerAccessNotEnabled" \
   "$(grep -o '^disabling it again.*' <<< "$out")"
+expect "a kernel that failed is reported by the blocking copy after it, once" \
+  "a failed launch is reported by the copy after it: hipErrorLaunchFailure, then hipSuccess" \
+  "$(grep -o '^a failed launch is reported.*' <<< "$out")"
 
 # gfx942's 8-bit floats (fp8 and bf8, without infinities or a negative zero):
 # floats narrowed by the device's instructions, rounded to nearest and
