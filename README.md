@@ -284,6 +284,13 @@ which real GPUs cannot give you cheaply.
 5. Random/adversarial warp scheduling → race detection
 6. AMD frontend (HIP/ROCm, CDNA3/CDNA4)
 
+## Help, contributing and security
+
+Questions and ideas go in [Discussions](https://github.com/pantheongpu/pantheonsim/discussions),
+bugs in [issues](https://github.com/pantheongpu/pantheonsim/issues). How changes
+are decided is in [GOVERNANCE.md](GOVERNANCE.md), and security problems should be
+reported privately as [SECURITY.md](SECURITY.md) describes.
+
 ## License
 
 Apache-2.0 (see LICENSE). The `vgpu_cuda.h` header is a clean-room subset
