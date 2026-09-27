@@ -153,6 +153,13 @@ struct Mma {
   std::vector<std::vector<uint32_t>> a_tmem;
   int a_cols = 0;
   uint32_t a_col = 0;
+  // Whether a_tmem is A, or only other Tensor Memory contents (scale factors).
+  bool a_is_tmem = true;
+  // .block_scale: the modifiers after the kind (".block_scale.scale_vec::4X"),
+  // and the scale matrices' columns in the allocation.
+  std::string kind_mods;
+  bool block_scale = false;
+  uint32_t sfa_col = 0, sfb_col = 0;
   std::string target = kHeader100a;
 
   std::vector<std::vector<uint32_t>> run() const {
@@ -186,7 +193,7 @@ struct Mma {
         readback += "    st.global.u32 [%rd20+" + std::to_string(4 * (c + i)) + "], %v" + std::to_string(i) + ";\n";
     }
     const std::string g = std::to_string(group);
-    const std::string a_operand = a_tmem.empty() ? "%rd5" : "[%r62]";
+    const std::string a_operand = a_tmem.empty() || !a_is_tmem ? "%rd5" : "[%r62]";
     const std::string lanes_off = group == 2 && mask == "{0, 0, 0, 0}" ? "{0, 0, 0, 0, 0, 0, 0, 0}" : mask;
     const std::string ptx = target + R"(
 .visible .entry k(.param .u64 pa, .param .u64 pb, .param .u64 pd, .param .u64 pdin, .param .u64 painit,
@@ -266,12 +273,15 @@ COPIED:
     add.u64 %rd6, %rd6, 512;
     add.u32 %r61, %r40, )" + std::to_string(d_col | (d_lane << 16)) + R"(;
     add.u32 %r62, %r40, )" + std::to_string(a_col) + R"(;
+    add.u32 %r63, %r40, )" + std::to_string(sfa_col) + R"(;
+    add.u32 %r64, %r40, )" + std::to_string(sfb_col) + R"(;
     setp.ne.u32 %p5, %r50, 0xFFFFFFFF;          // a predicate that is true
     setp.eq.u32 %p6, %r30, 0;
     and.pred %p4, %p3, %p6;                     // thread 0 of the even CTA issues
     setp.)" + (enable_d == "0" ? "ne" : "eq") + R"(.u32 %p7, %r1, %r1;
-    @%p4 tcgen05.mma.cta_group::)" + g + ".kind::" + kind + " [%r61], " + a_operand + ", %rd6, %r50, " +
-                            (lanes_off.empty() ? "" : lanes_off + ", ") + "%p7" + scale_tail + R"(;
+    @%p4 tcgen05.mma.cta_group::)" + g + ".kind::" + kind + kind_mods + " [%r61], " + a_operand + ", %rd6, %r50, " +
+                            (block_scale ? std::string("[%r63], [%r64], ") : lanes_off.empty() ? "" : lanes_off + ", ") +
+                            "%p7" + scale_tail + R"(;
     @%p4 tcgen05.commit.cta_group::)" + g + R"(.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%r7], )" +
                             std::to_string((1 << ctas) - 1) + R"(;
 WAIT:
@@ -378,6 +388,86 @@ void check_d_f32(const std::vector<std::vector<uint32_t>>& out, int group, int M
     }
 }
 
+// The OCP MX small floats (e2m3, e3m2, e2m1: no infinities or NaNs), for the
+// multiples of 1/2 in [-4, 4] used here; subnormal below 2^(1 - bias).
+uint8_t mx_bits(float f, int ebits, int mbits, int bias) {
+  if (f == 0.0f) return 0;
+  const uint8_t sign = static_cast<uint8_t>(f < 0 ? 1u << (ebits + mbits) : 0);
+  const float a = std::fabs(f);
+  int e = 0;
+  const float m = std::frexp(a, &e);   // a = m * 2^e, m in [0.5, 1)
+  const int biased = e - 1 + bias;
+  if (biased <= 0)
+    return sign | static_cast<uint8_t>(std::ldexp(a, mbits - (1 - bias)));
+  return sign | static_cast<uint8_t>(biased << mbits) |
+         static_cast<uint8_t>((m * 2.0f - 1.0f) * float(1 << mbits));
+}
+uint8_t e2m1_bits(float f) { return mx_bits(f, 2, 1, 1); }
+uint8_t e3m2_bits(float f) { return mx_bits(f, 3, 2, 3); }
+uint8_t e2m3_bits(float f) { return mx_bits(f, 2, 3, 1); }
+
+// A K-major operand of sub-byte elements without swizzling (Tables 58-60 and
+// the cp formats .b6x16_p32 / .b4x16_p64): each row is K / per16 groups of 16
+// bytes, element k at bit (k % per16) * bits of group k / per16, little-endian;
+// the rows' bytes then go through the 1-byte canonical layout. per16 = 16
+// leaves a 4-bit group's upper 8 bytes and a 6-bit group's upper 4 as padding;
+// per16 = 32 is the packed fp4 of .kind::mxf4*.
+std::vector<uint8_t> packed_k_major(int rows, int K, int bits, int per16, uint32_t lbo, uint32_t sbo,
+                                    const std::function<uint64_t(int, int)>& elem) {
+  std::vector<uint8_t> img;
+  for (int r = 0; r < rows; ++r) {
+    std::vector<uint8_t> row(size_t(16) * (K / per16), 0);
+    for (int k = 0; k < K; ++k) {
+      const int bit = 128 * (k / per16) + (k % per16) * bits;
+      const uint64_t v = elem(r, k) & ((1u << bits) - 1);
+      for (int b = 0; b < bits; ++b)
+        if (v >> b & 1) row[(bit + b) / 8] |= static_cast<uint8_t>(1u << ((bit + b) % 8));
+    }
+    for (size_t i = 0; i < row.size(); ++i) put(img, canonical(Major::K, 0, 1, lbo, sbo, r, int(i)), row[i], 1);
+  }
+  return img;
+}
+
+// A block-scaled kind's instruction descriptor (Tables 52-53): SFB_ID in bits
+// 4-5, the scale type from bit 23, M / 128 in bits 27-28, SFA_ID in bits 29-30.
+uint32_t idesc_mx(uint32_t atype, uint32_t btype, int M, int N, uint32_t sfa_id, uint32_t sfb_id,
+                  uint32_t scale_type) {
+  return sfb_id << 4 | atype << 7 | btype << 10 | uint32_t(N >> 3) << 17 | scale_type << 23 |
+         uint32_t(M >> 7) << 27 | sfa_id << 29;
+}
+
+// Scale factors in Tensor Memory (9.7.18.10.7.2-3), in the Mma kernel's
+// auxiliary cells (a_tmem with a_is_tmem = false): row m's j-th factor in
+// byte sf_id + j of lane m % 32, column col + m / 32, copied into each of the
+// four 32-lane partitions. Other bytes get junk.
+void put_scales(std::vector<uint32_t>& cells, int a_cols, int col, int rows, int per_row, int sf_id,
+                const std::function<uint8_t(int, int)>& sf) {
+  for (int m = 0; m < rows; ++m)
+    for (int part = 0; part < 4; ++part) {
+      uint32_t& c = cells[size_t(m % 32 + 32 * part) * a_cols + col + m / 32];
+      for (int byte = 0; byte < 4; ++byte)
+        if (byte < sf_id || byte >= sf_id + per_row) c = (c & ~(0xFFu << 8 * byte)) | (0xA5u << 8 * byte);
+      for (int j = 0; j < per_row; ++j)
+        c = (c & ~(0xFFu << 8 * (sf_id + j))) | uint32_t(sf(m, j)) << 8 * (sf_id + j);
+    }
+}
+
+// One block-scaled product checked against the host: D(m, n) = sum over k of
+// A(m, k) * SA(m, k / blk) * B(k, n) * SB(n, k / blk).
+void check_scaled(const std::vector<std::vector<uint32_t>>& out, int M, int N, int K, int blk, int cols,
+                  const std::function<float(int, int)>& A, const std::function<float(int, int)>& B,
+                  const std::function<float(int, int)>& SA, const std::function<float(int, int)>& SB) {
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      double want = 0;
+      for (int k = 0; k < K; ++k) want += double(A(m, k)) * SA(m, k / blk) * B(k, n) * SB(n, k / blk);
+      const float got = bits_f32(out[0][size_t(m) * cols + n]);
+      if (got != float(want))
+        VCHECK_EQ(std::to_string(m) + "," + std::to_string(n) + ": " + std::to_string(got),
+                  std::to_string(m) + "," + std::to_string(n) + ": " + std::to_string(float(want)));
+    }
+}
+
 }  // namespace
 
 // ---- parsing -------------------------------------------------------------------
@@ -433,11 +523,13 @@ VTEST(tcgen05_refuses_what_is_not_implemented_by_name) {
                                       ".visible .entry k()\n{\n .reg .b32 a, b;\n .reg .b64 d;\n .reg .pred p;\n " +
                                       ins + "\n ret;\n}\n"));
   };
-  VCHECK_CONTAINS(parse("tcgen05.cp.cta_group::1.128x256b [a], d;").message(), "tcgen05.cp");
+  VCHECK_CONTAINS(parse("tcgen05.shift.cta_group::1.down [a];").message(), "tcgen05.shift");
+  VCHECK_CONTAINS(parse("tcgen05.cp.cta_group::1.128x128b.b8x16.b6x16_p32 [a], d;").message(), "decompression");
+  VCHECK_CONTAINS(parse("tcgen05.cp.cta_group::1.32x128b [a], d;").message(), ".warpx4");
   VCHECK_CONTAINS(parse("tcgen05.mma.sp.cta_group::1.kind::f16 [a], d, d, [b], a, p;").message(), "sparse");
   VCHECK_CONTAINS(parse("tcgen05.mma.ws.cta_group::1.kind::f16 [a], d, d, a, p;").message(), "weight-stationary");
-  VCHECK_CONTAINS(parse("tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale [a], d, d, a, [b], [b], p;").message(),
-                  "block-scaled");
+  VCHECK_CONTAINS(parse("tcgen05.mma.cta_group::1.kind::f16.block_scale [a], d, d, a, [b], [b], p;").message(),
+                  ".block_scale");
   VCHECK_CONTAINS(parse("tcgen05.ld.red.sync.aligned.32x32b.x2.max.f32 {a, b}, a, [a];").message(), "tcgen05.ld.red");
 }
 
@@ -939,6 +1031,167 @@ VTEST(tcgen05_mma_a_from_tensor_memory) {
     }
 }
 
+// e2m1 x e3m2 -> f32 under .kind::f8f6f4: 16 elements to a 16-byte group of
+// shared memory, the rest of the group padding.
+VTEST(tcgen05_mma_fp4_times_fp6_from_padded_shared_memory) {
+  const int M = 128, N = 32, K = 32;
+  auto A = [](int m, int k) { return val(m, k, 3); };
+  auto B = [](int k, int n) { return val(k, n, 4); };
+  Mma x;
+  x.kind = "f8f6f4";
+  x.id = idesc(1, 5, 4, M, N);
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.smem_a = {packed_k_major(M, K, 4, 16, 128, 256, [&](int m, int k) { return e2m1_bits(A(m, k)); })};
+  x.smem_b = {packed_k_major(N, K, 6, 16, 128, 256, [&](int n, int k) { return e3m2_bits(B(k, n)); })};
+  x.cols = 32;
+  check_d_f32(x.run(), 1, M, N, K, A, B, nullptr, 0, 32);
+}
+
+// A in Tensor Memory in 8-bit containers: e2m1 in bits 2-5 of each byte
+// (figure 202), four to a column; B e2m3.
+VTEST(tcgen05_mma_fp4_a_from_tensor_memory_containers) {
+  const int M = 128, N = 32, K = 32;
+  auto A = [](int m, int k) { return val(m, k, 8); };
+  auto B = [](int k, int n) { return val(k, n, 1); };
+  Mma x;
+  x.kind = "f8f6f4";
+  x.id = idesc(1, 5, 3, M, N);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.smem_b = {packed_k_major(N, K, 6, 16, 128, 256, [&](int n, int k) { return e2m3_bits(B(k, n)); })};
+  x.cols = 64;
+  x.a_cols = 8;
+  x.a_col = 32;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 8));
+  for (int m = 0; m < M; ++m)
+    for (int k = 0; k < K; ++k)
+      x.a_tmem[0][size_t(m) * 8 + k / 4] |= uint32_t(e2m1_bits(A(m, k))) << (2 + 8 * (k % 4));
+  check_d_f32(x.run(), 1, M, N, K, A, B, nullptr, 0, 64);
+}
+
+// .kind::mxf8f6f4.block_scale: e4m3 x e2m3 with one UE8M0 factor per row of A
+// and column of B (block 32), from bytes 1 and 2 of their cells.
+VTEST(tcgen05_mma_mxf8f6f4_ue8m0_scales) {
+  const int M = 128, N = 32, K = 32;
+  auto A = [](int m, int k) { return val(m, k, 2); };
+  auto B = [](int k, int n) { return val(k, n, 6); };
+  auto sa = [](int m, int) { return uint8_t(124 + m % 7); };
+  auto sb = [](int n, int) { return uint8_t(125 + n % 5); };
+  Mma x;
+  x.kind = "mxf8f6f4";
+  x.kind_mods = ".block_scale.scale_vec::1X";
+  x.block_scale = true;
+  x.id = idesc_mx(0, 3, M, N, 1, 2, 1);
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  const Operands o = images(1, M, N, K, 1, Major::K, Major::K, 0, 0, 128, 256, 128, 256,
+                            [&](int m, int k) { return e4m3_bits(A(m, k)); }, [](int, int) { return 0; });
+  x.smem_a = o.a;
+  x.smem_b = {packed_k_major(N, K, 6, 16, 128, 256, [&](int n, int k) { return e2m3_bits(B(k, n)); })};
+  x.cols = 64;
+  x.a_is_tmem = false;
+  x.a_cols = 8;
+  x.a_col = 32;
+  x.sfa_col = 32;
+  x.sfb_col = 36;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 8));
+  put_scales(x.a_tmem[0], 8, 0, M, 1, 1, sa);
+  put_scales(x.a_tmem[0], 8, 4, N, 1, 2, sb);
+  auto ue8m0 = [](uint8_t v) { return std::ldexp(1.0f, int(v) - 127); };
+  check_scaled(x.run(), M, N, K, 32, 64, A, B, [&](int m, int j) { return ue8m0(sa(m, j)); },
+               [&](int n, int j) { return ue8m0(sb(n, j)); });
+}
+
+// .kind::mxf4.block_scale.scale_vec::2X: fp4 packed two to a byte, K = 64 in
+// two blocks of 32, the factors from bytes 2-3 (A) and 0-1 (B).
+VTEST(tcgen05_mma_mxf4_two_blocks) {
+  const int M = 128, N = 64, K = 64;
+  auto A = [](int m, int k) { return val(m, k, 4) * (k >= 32 ? 2.0f : 1.0f); };
+  auto B = [](int k, int n) { return val(k, n, 9); };
+  auto sa = [](int m, int j) { return uint8_t(126 + (m + 3 * j) % 4); };
+  auto sb = [](int n, int j) { return uint8_t(127 - (n + j) % 3); };
+  Mma x;
+  x.kind = "mxf4";
+  x.kind_mods = ".block_scale.scale_vec::2X";
+  x.block_scale = true;
+  x.id = idesc_mx(1, 1, M, N, 2, 0, 1);
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.smem_a = {packed_k_major(M, K, 4, 32, 128, 256, [&](int m, int k) { return e2m1_bits(A(m, k)); })};
+  x.smem_b = {packed_k_major(N, K, 4, 32, 128, 256, [&](int n, int k) { return e2m1_bits(B(k, n)); })};
+  x.cols = 128;
+  x.a_is_tmem = false;
+  x.a_cols = 8;
+  x.a_col = 64;
+  x.sfa_col = 64;
+  x.sfb_col = 68;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 8));
+  put_scales(x.a_tmem[0], 8, 0, M, 2, 2, sa);
+  put_scales(x.a_tmem[0], 8, 4, N, 2, 0, sb);
+  auto ue8m0 = [](uint8_t v) { return std::ldexp(1.0f, int(v) - 127); };
+  check_scaled(x.run(), M, N, K, 32, 128, A, B, [&](int m, int j) { return ue8m0(sa(m, j)); },
+               [&](int n, int j) { return ue8m0(sb(n, j)); });
+}
+
+// .kind::mxf4nvf4.block_scale.scale_vec::4X with UE4M3 factors (scale type
+// 0): four blocks of 16.
+VTEST(tcgen05_mma_mxf4nvf4_ue4m3_block16) {
+  const int M = 128, N = 32, K = 64;
+  auto A = [](int m, int k) { return val(m, k, 7); };
+  auto B = [](int k, int n) { return val(k, n, 2); };
+  const float steps[] = {0.5f, 1.0f, 1.5f, 2.0f, 0.75f};
+  auto sa = [&](int m, int j) { return steps[(m + j) % 5]; };
+  auto sb = [&](int n, int j) { return steps[(2 * n + 3 * j) % 5]; };
+  Mma x;
+  x.kind = "mxf4nvf4";
+  x.kind_mods = ".block_scale.scale_vec::4X";
+  x.block_scale = true;
+  x.id = idesc_mx(1, 1, M, N, 0, 0, 0);
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.smem_a = {packed_k_major(M, K, 4, 32, 128, 256, [&](int m, int k) { return e2m1_bits(A(m, k)); })};
+  x.smem_b = {packed_k_major(N, K, 4, 32, 128, 256, [&](int n, int k) { return e2m1_bits(B(k, n)); })};
+  x.cols = 64;
+  x.a_is_tmem = false;
+  x.a_cols = 8;
+  x.a_col = 32;
+  x.sfa_col = 32;
+  x.sfb_col = 36;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 8));
+  put_scales(x.a_tmem[0], 8, 0, M, 4, 0, [&](int m, int j) { return e4m3_bits(sa(m, j)); });
+  put_scales(x.a_tmem[0], 8, 4, N, 4, 0, [&](int n, int j) { return e4m3_bits(sb(n, j)); });
+  check_scaled(x.run(), M, N, K, 16, 64, A, B, sa, sb);
+}
+
+VTEST(tcgen05_mma_block_scale_refuses_what_the_isa_rules_out) {
+  Mma x;
+  x.kind = "mxf4nvf4";
+  x.kind_mods = ".block_scale.scale_vec::2X";
+  x.block_scale = true;
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.a_is_tmem = false;
+  x.a_cols = 8;
+  x.a_col = 32;
+  x.sfa_col = 32;
+  x.sfb_col = 36;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 8));
+  x.id = idesc_mx(1, 1, 128, 32, 0, 0, 0);   // UE4M3 with 2X
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "sm_107f");
+  x.kind_mods = ".block_scale.scale_vec::4X";
+  x.id = idesc_mx(1, 1, 128, 32, 2, 0, 0);   // 4X needs SFA_ID 0
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "Tables 51-53");
+  x.kind = "mxf8f6f4";
+  x.kind_mods = ".block_scale";
+  x.id = idesc_mx(0, 0, 128, 32, 0, 0, 0);   // mxf8f6f4 scales are UE8M0 only
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "Tables 51-53");
+  x.id = idesc_mx(0, 0, 128, 32, 0, 0, 1) | (1u << 26);
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "sm_107f");
+  x.id = idesc_mx(0, 0, 128, 32, 0, 0, 1);
+  x.sfb_col = 100;   // past the 64 allocated columns
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "scale factor");
+}
+
 VTEST(tcgen05_mma_refuses_descriptors_and_shapes_the_isa_rules_out) {
   Mma x;
   x.id = idesc(1, 0, 0, 192, 16);   // M = 192
@@ -956,7 +1209,140 @@ VTEST(tcgen05_mma_refuses_descriptors_and_shapes_the_isa_rules_out) {
   VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "swizzle mode 3");
   x.desc_b = desc(0, 128, 256, 0);
   x.id = idesc(1, 3, 3, 128, 16);   // e2m3 is not a .kind::f16 type
-  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "Table 51");
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "Tables 51-53");
+}
+
+// ---- tcgen05.cp -----------------------------------------------------------------------
+
+// Copies an image of shared memory into Tensor Memory at column 8 with one
+// tcgen05.cp, then reads the first 16 columns of every lane back with
+// .32x32b: out[lane][col].
+std::vector<uint32_t> run_cp(const std::string& shape, uint64_t sdesc, const std::vector<uint8_t>& image) {
+  const std::string ptx = std::string(kHeader100a) + R"(
+.visible .entry k(.param .u64 pimg, .param .u64 pout, .param .u64 sdesc)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<40>;
+    .reg .b64 %rd<12>;
+    .shared .align 1024 .b8 smem[4096];
+    .shared .align 8 .b64 bar;
+    .shared .align 4 .b32 slot;
+    ld.param.u64 %rd1, [pimg];
+    ld.param.u64 %rd2, [pout];
+    ld.param.u64 %rd3, [sdesc];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, smem;
+    shl.b32 %r3, %r1, 2;
+COPY:
+    setp.ge.u32 %p1, %r3, 4096;
+    @%p1 bra COPIED;
+    cvt.u64.u32 %rd4, %r3;
+    add.u64 %rd5, %rd1, %rd4;
+    ld.global.u32 %r4, [%rd5];
+    add.u32 %r5, %r2, %r3;
+    st.shared.u32 [%r5], %r4;
+    add.u32 %r3, %r3, 512;
+    bra COPY;
+COPIED:
+    shr.u32 %r6, %r1, 5;
+    setp.eq.u32 %p2, %r6, 0;
+    @%p2 tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [slot], 32;
+    setp.eq.u32 %p3, %r1, 0;
+    mov.u32 %r7, bar;
+    @%p3 mbarrier.init.shared::cta.b64 [%r7], 1;
+    fence.proxy.async.shared::cta;
+    bar.sync 0;
+    ld.shared.u32 %r8, [slot];
+    shr.u32 %r9, %r2, 4;
+    cvt.u64.u32 %rd6, %r9;
+    add.u64 %rd3, %rd3, %rd6;
+    tcgen05.fence::after_thread_sync;
+    add.u32 %r10, %r8, 8;
+    @%p3 tcgen05.cp.cta_group::1.)" + shape + R"( [%r10], %rd3;
+    @%p3 tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%r7];
+WAIT:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1, [%r7], 0;
+    @!%p1 bra WAIT;
+    tcgen05.fence::after_thread_sync;
+    shl.b32 %r11, %r6, 21;
+    add.u32 %r11, %r11, %r8;
+    tcgen05.ld.sync.aligned.32x32b.x16.b32 {%r20, %r21, %r22, %r23, %r24, %r25, %r26, %r27, %r28, %r29, %r30, %r31, %r32, %r33, %r34, %r35}, [%r11];
+    tcgen05.wait::ld.sync.aligned;
+    mul.wide.u32 %rd7, %r1, 64;
+    add.u64 %rd8, %rd2, %rd7;
+    st.global.v4.u32 [%rd8], {%r20, %r21, %r22, %r23};
+    st.global.v4.u32 [%rd8+16], {%r24, %r25, %r26, %r27};
+    st.global.v4.u32 [%rd8+32], {%r28, %r29, %r30, %r31};
+    st.global.v4.u32 [%rd8+48], {%r32, %r33, %r34, %r35};
+    tcgen05.fence::before_thread_sync;
+    bar.sync 0;
+    @%p2 tcgen05.dealloc.cta_group::1.sync.aligned.b32 %r8, 32;
+    @%p2 tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;
+    ret;
+}
+)";
+  MemoryManager mem{1 << 20};
+  DeviceProfile prof = load_gpu("nvidia/b200");
+  auto m = ptx::parse(ptx);
+  std::vector<uint8_t> img(4096, 0);
+  std::memcpy(img.data(), image.data(), std::min<size_t>(4096, image.size()));
+  const uint64_t pimg = mem.alloc(img.size()), pout = mem.alloc(128 * 64);
+  mem.write(pimg, img.data(), img.size());
+  std::vector<uint32_t> zero(128 * 16, 0);
+  mem.write(pout, zero.data(), zero.size() * 4);
+  LaunchConfig cfg;
+  cfg.block = {128, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(pimg), arg_u64(pout), arg_u64(sdesc)}, mem, prof);
+  std::vector<uint32_t> out(128 * 16);
+  mem.read(pout, out.data(), out.size() * 4);
+  return out;
+}
+
+// A byte of row r, byte b of a copy's source matrix.
+uint8_t cp_byte(int r, int b) { return static_cast<uint8_t>(r * 31 + b * 7 + 1); }
+uint32_t cp_word(int r, int w) {
+  return uint32_t(cp_byte(r, 4 * w)) | uint32_t(cp_byte(r, 4 * w + 1)) << 8 |
+         uint32_t(cp_byte(r, 4 * w + 2)) << 16 | uint32_t(cp_byte(r, 4 * w + 3)) << 24;
+}
+
+// .128x128b: 128 rows of 16 bytes, K-major in 8-row core matrices (SBO 128),
+// row r to lane r, its 16 bytes to four columns.
+VTEST(tcgen05_cp_128x128b_row_per_lane) {
+  std::vector<uint8_t> img;
+  for (int r = 0; r < 128; ++r)
+    for (int b = 0; b < 16; ++b) put(img, canonical(Major::K, 0, 1, 2048, 128, r, b), cp_byte(r, b), 1);
+  const auto out = run_cp("128x128b", desc(0, 2048, 128, 0), img);
+  for (int l = 0; l < 128; ++l)
+    for (int c = 0; c < 16; ++c)
+      VCHECK_EQ(out[size_t(l) * 16 + c], c >= 8 && c < 12 ? cp_word(l, c - 8) : 0u);
+}
+
+// .4x256b: four rows of 32 bytes, two core matrices along the row (LBO).
+VTEST(tcgen05_cp_4x256b) {
+  std::vector<uint8_t> img;
+  for (int r = 0; r < 4; ++r)
+    for (int b = 0; b < 32; ++b) put(img, canonical(Major::K, 0, 1, 128, 256, r, b), cp_byte(r, b), 1);
+  const auto out = run_cp("4x256b", desc(0, 128, 256, 0), img);
+  for (int l = 0; l < 128; ++l)
+    for (int c = 0; c < 16; ++c)
+      VCHECK_EQ(out[size_t(l) * 16 + c], l < 4 && c >= 8 ? cp_word(l, c - 8) : 0u);
+}
+
+// .32x128b.warpx4: 32 rows, each copied into all four warps' lane quarters --
+// how scale factors reach every partition.
+VTEST(tcgen05_cp_32x128b_warpx4_fills_every_quarter) {
+  std::vector<uint8_t> img;
+  for (int r = 0; r < 32; ++r)
+    for (int b = 0; b < 16; ++b) put(img, canonical(Major::K, 0, 1, 512, 128, r, b), cp_byte(r, b), 1);
+  const auto out = run_cp("32x128b.warpx4", desc(0, 512, 128, 0), img);
+  for (int l = 0; l < 128; ++l)
+    for (int c = 0; c < 16; ++c)
+      VCHECK_EQ(out[size_t(l) * 16 + c], c >= 8 && c < 12 ? cp_word(l % 32, c - 8) : 0u);
+}
+
+VTEST(tcgen05_cp_refuses_warpx2) {
+  VCHECK_CONTAINS(VCAPTURE(Error, run_cp("64x128b.warpx2::02_13", desc(0, 1024, 128, 0), {})).message(),
+                  "64x128b.warpx2");
 }
 
 // ---- tcgen05.mma over a CTA pair ---------------------------------------------------

@@ -320,13 +320,15 @@ struct OpWgmma {
 // tcgen05.st/ld in fixed warp-wide shapes, and written by tcgen05.mma, which
 // one thread issues for the whole MxNxK product.
 enum class Tcgen05Kind {
-  Alloc, Dealloc, Relinquish, Ld, St, WaitLd, WaitSt, FenceBefore, FenceAfter, Commit, Mma,
+  Alloc, Dealloc, Relinquish, Ld, St, WaitLd, WaitSt, FenceBefore, FenceAfter, Commit, Mma, Cp,
 };
 // tcgen05.ld/st data-movement shapes (9.7.18.2.3).
 enum class Tcgen05Shape { S32x32b, S16x64b, S16x128b, S16x256b, S16x32bx2 };
 // tcgen05.mma's .kind: the element family, the exact types coming from the
 // instruction descriptor.
-enum class Tcgen05MmaKind { F16, TF32, F8F6F4, I8 };
+enum class Tcgen05MmaKind { F16, TF32, F8F6F4, I8, MXF8F6F4, MXF4, MXF4NVF4 };
+// tcgen05.cp shapes (9.7.18.9.2): lanes x bits a lane.
+enum class Tcgen05CpShape { S128x256b, S4x256b, S128x128b, S64x128b, S32x128b };
 struct OpTcgen05 {
   Tcgen05Kind kind = Tcgen05Kind::Mma;
   uint32_t cta_group = 1;          // .cta_group::1 or ::2
@@ -350,6 +352,16 @@ struct OpTcgen05 {
   // disable-output-lane vector (empty when absent), enable-input-d and the
   // optional scale-input-d immediate (-1 when absent).
   Tcgen05MmaKind mma_kind = Tcgen05MmaKind::F16;
+  // Block scaling (.block_scale): the scale matrices' Tensor Memory
+  // addresses, and scale factors per 32-bit row of K -- 1, 2 or 4
+  // (.scale_vec::NX, or .block32/.block16 resolved by kind and K).
+  bool block_scale = false;
+  Operand scale_a, scale_b;
+  uint32_t scale_vec = 0;      // 0: the kind's default
+  // tcgen05.cp: the shape, its .warpx4/.warpx2 multicast, and the source
+  // descriptor (in `a`).
+  Tcgen05CpShape cp_shape = Tcgen05CpShape::S128x256b;
+  int cp_multicast = 0;        // 0 none, 4 .warpx4, 2 .warpx2::02_13, 3 .warpx2::01_23
   Operand d_tmem, a, b_desc, idesc, enable_d;
   bool a_tmem = false;
   std::vector<Operand> disable_lanes;

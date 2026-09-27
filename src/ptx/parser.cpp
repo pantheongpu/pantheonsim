@@ -2304,9 +2304,10 @@ class Parser {
       else if (what == "fence::after_thread_sync") op.kind = Tcgen05Kind::FenceAfter;
       else if (what == "commit") op.kind = Tcgen05Kind::Commit;
       else if (what == "mma") op.kind = Tcgen05Kind::Mma;
-      else if (what == "cp" || what == "shift")
-        return unsupported("tcgen05." + what + " (copies from shared memory into Tensor Memory are "
-                           "not implemented yet)");
+      else if (what == "cp") op.kind = Tcgen05Kind::Cp;
+      else if (what == "shift")
+        return unsupported("tcgen05.shift (the ISA does not say which columns a row's 32-byte shift "
+                           "covers) is not implemented");
       else return unsupported("tcgen05." + what);
       bool have_shape = false, have_num = false, have_kind = false, mbar_arrive = false;
       for (size_t i = 2; i < parts.size(); ++i) {
@@ -2348,9 +2349,29 @@ class Parser {
           return unsupported("tcgen05.mma.sp (structured-sparse A) is not implemented yet");
         else if (p == "ws" || p.rfind("ws::", 0) == 0)
           return unsupported("tcgen05.mma.ws (weight-stationary) is not implemented yet");
-        else if (p == "block_scale" || p.rfind("kind::mx", 0) == 0 || p.rfind("scale_vec", 0) == 0 ||
-                 p == "block16" || p == "block32")
-          return unsupported("block-scaled tcgen05.mma (.kind::mx*) is not implemented yet");
+        else if (p == "kind::mxf8f6f4") { op.mma_kind = Tcgen05MmaKind::MXF8F6F4; have_kind = true; }
+        else if (p == "kind::mxf4") { op.mma_kind = Tcgen05MmaKind::MXF4; have_kind = true; }
+        else if (p == "kind::mxf4nvf4") { op.mma_kind = Tcgen05MmaKind::MXF4NVF4; have_kind = true; }
+        else if (p == "block_scale") op.block_scale = true;
+        else if (p == "scale_vec::1X") op.scale_vec = 1;
+        else if (p == "scale_vec::2X") op.scale_vec = 2;
+        else if (p == "scale_vec::4X") op.scale_vec = 4;
+        else if (p == "block32") op.scale_vec = 32;   // resolved below by kind
+        else if (p == "block16") op.scale_vec = 16;
+        else if (op.kind == Tcgen05Kind::Cp && (p == "128x256b" || p == "4x256b" || p == "128x128b" ||
+                                                p == "64x128b" || p == "32x128b")) {
+          op.cp_shape = p == "128x256b" ? Tcgen05CpShape::S128x256b
+                      : p == "4x256b"   ? Tcgen05CpShape::S4x256b
+                      : p == "128x128b" ? Tcgen05CpShape::S128x128b
+                      : p == "64x128b"  ? Tcgen05CpShape::S64x128b
+                                        : Tcgen05CpShape::S32x128b;
+          have_shape = true;
+        }
+        else if (op.kind == Tcgen05Kind::Cp && p == "warpx4") op.cp_multicast = 4;
+        else if (op.kind == Tcgen05Kind::Cp && p == "warpx2::02_13") op.cp_multicast = 2;
+        else if (op.kind == Tcgen05Kind::Cp && p == "warpx2::01_23") op.cp_multicast = 3;
+        else if (op.kind == Tcgen05Kind::Cp && (p == "b8x16" || p == "b6x16_p32" || p == "b4x16_p64"))
+          return unsupported("tcgen05.cp's decompression (." + p + ") is not implemented");
         else if (p == "ashift")
           return unsupported("tcgen05.mma.ashift is not implemented yet");
         else if (p.rfind("decompress", 0) == 0 || p == "kind::ti16")
@@ -2420,8 +2441,25 @@ class Parser {
             op.cta_mask = parse_operand();
           }
           break;
+        case Tcgen05Kind::Cp: {
+          if (!have_shape) return unsupported("tcgen05.cp needs a shape");
+          const bool needs4 = op.cp_shape == Tcgen05CpShape::S32x128b;
+          const bool needs2 = op.cp_shape == Tcgen05CpShape::S64x128b;
+          if (needs4 != (op.cp_multicast == 4) || needs2 != (op.cp_multicast == 2 || op.cp_multicast == 3))
+            return unsupported("tcgen05.cp: .32x128b takes .warpx4 and .64x128b a .warpx2, and no "
+                               "other shape takes either");
+          op.d_tmem = bracketed();
+          expect_punct(",");
+          op.a = parse_operand();
+          break;
+        }
         case Tcgen05Kind::Mma: {
           if (!have_kind) return unsupported("tcgen05.mma needs a .kind");
+          const bool mx = op.mma_kind == Tcgen05MmaKind::MXF8F6F4 || op.mma_kind == Tcgen05MmaKind::MXF4 ||
+                          op.mma_kind == Tcgen05MmaKind::MXF4NVF4;
+          if (mx != op.block_scale)
+            return unsupported("tcgen05.mma: .block_scale goes with the .kind::mx* kinds and only them");
+          if (!mx && op.scale_vec) return unsupported("tcgen05.mma: a scale vector size without .block_scale");
           op.d_tmem = bracketed();
           expect_punct(",");
           if (peek_punct("[")) {
@@ -2435,7 +2473,12 @@ class Parser {
           expect_punct(",");
           op.idesc = parse_operand();
           expect_punct(",");
-          if (peek_punct("{")) {
+          if (op.block_scale) {
+            op.scale_a = bracketed();
+            expect_punct(",");
+            op.scale_b = bracketed();
+            expect_punct(",");
+          } else if (peek_punct("{")) {
             op.disable_lanes = parse_operand_vector_any();
             if (op.disable_lanes.size() != 4 * op.cta_group)
               return unsupported("tcgen05.mma's disable-output-lane vector has " +

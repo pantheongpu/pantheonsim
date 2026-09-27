@@ -5858,7 +5858,8 @@ class Interpreter {
 
   void exec_tcgen05(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op, Mask m) {
     if (!ctx.tmem) ctx_fail(ins, -1, Err::UnsupportedPtx, "tcgen05 outside a block context");
-    const bool collective = op.kind != Tcgen05Kind::Mma && op.kind != Tcgen05Kind::Commit &&
+    const bool collective = op.kind != Tcgen05Kind::Mma && op.kind != Tcgen05Kind::Cp &&
+                            op.kind != Tcgen05Kind::Commit &&
                             op.kind != Tcgen05Kind::FenceBefore && op.kind != Tcgen05Kind::FenceAfter;
     if (collective && m != all_)
       ctx_fail(ins, -1, Err::UnsupportedPtx,
@@ -5888,6 +5889,10 @@ class Interpreter {
         // Single-thread semantics: every active thread issues a whole MMA.
         for (uint32_t lane = 0; lane < W_; ++lane)
           if (m & (Mask{1} << lane)) exec_tcgen05_mma(w, ctx, ins, op, lane);
+        return;
+      case Tcgen05Kind::Cp:
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) exec_tcgen05_cp(w, ctx, ins, op, lane);
         return;
     }
   }
@@ -6089,6 +6094,59 @@ class Interpreter {
     }
   }
 
+  // tcgen05.cp (9.7.18.9.2): rows of the shared-memory matrix the descriptor
+  // describes -- K-major, 16 or 32 bytes a row -- into Tensor Memory lanes,
+  // one row to a lane from the address's lane on, packed into the columns
+  // from its column. .32x128b.warpx4 writes its 32 rows into every 32-lane
+  // partition. With .cta_group::2 each CTA of the pair copies its own shared
+  // memory into its own Tensor Memory. It completes when issued, like the
+  // other asynchronous tcgen05 operations; tcgen05.commit tracks it.
+  void exec_tcgen05_cp(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op, uint32_t lane) {
+    const int li = static_cast<int>(lane);
+    auto value = [&](const Operand& o) {
+      Lanes _s;
+      return read_operand(w, ctx, ins, o, _s)[lane];
+    };
+    if (op.cp_multicast == 2 || op.cp_multicast == 3)
+      ctx_fail(ins, li, Err::UnsupportedPtx,
+               "tcgen05.cp.64x128b.warpx2: the ISA says each warp of a pair receives half of the "
+               "data but not which half, so it is not implemented");
+    uint32_t rows = 128, bytes = 32;
+    switch (op.cp_shape) {
+      case Tcgen05CpShape::S128x256b: break;
+      case Tcgen05CpShape::S4x256b: rows = 4; break;
+      case Tcgen05CpShape::S128x128b: bytes = 16; break;
+      case Tcgen05CpShape::S64x128b: rows = 64; bytes = 16; break;
+      case Tcgen05CpShape::S32x128b: rows = 32; bytes = 16; break;
+    }
+    const uint32_t taddr = static_cast<uint32_t>(value(op.d_tmem));
+    const uint32_t lane0 = taddr >> 16, col0 = taddr & 0xFFFF;
+    const WgmmaDesc d = decode_tcgen05_desc(ins, value(op.a));
+    const uint32_t copies = op.cp_multicast == 4 ? 4 : 1;
+    for (const BlockCtx* c : tcgen05_ctas(ctx, ins, op.cta_group)) {
+      TensorMemory& t = tmem_of(*c);
+      const uint32_t rank = cluster_rank_of(*c);
+      for (uint32_t r = 0; r < rows; ++r)
+        for (uint32_t cw = 0; cw < bytes / 4; ++cw) {
+          uint32_t word = 0;
+          for (uint32_t b = 0; b < 4; ++b) {
+            const uint64_t at = wgmma_smem_offset(d, true, 1, r, cw * 4 + b);
+            word |= static_cast<uint32_t>(load_routed(w, ctx, ins, lane,
+                                                      kSharedVaBase + cluster_address(ctx, rank, at), 1))
+                    << (8 * b);
+          }
+          for (uint32_t p = 0; p < copies; ++p) {
+            const uint32_t l = lane0 + r + 32 * p, col = col0 + cw;
+            if (l >= TensorMemory::kLanes || col >= TensorMemory::kCols || !t.allocated(col))
+              ctx_fail(ins, li, Err::OutOfBounds,
+                       "tcgen05.cp writes Tensor Memory lane " + std::to_string(l) + ", column " +
+                           std::to_string(col) + ", outside what tcgen05.alloc allocated");
+            t.at(l, col) = word;
+          }
+        }
+    }
+  }
+
   // A tcgen05 shared-memory matrix descriptor (9.7.18.4.1). The same
   // canonical layouts as wgmma's; the swizzle field is three bits wide here.
   WgmmaDesc decode_tcgen05_desc(const Instr& ins, uint64_t d) {
@@ -6126,6 +6184,48 @@ class Interpreter {
 
   // One thread's tcgen05.mma (9.7.18.10.10.1): D = A*B (+ D), M x N x K, on
   // this CTA's Tensor Memory or the pair's.
+  // An element type of tcgen05.mma's A and B (9.7.18.10.4): how many bits it
+  // takes in shared memory and in a Tensor Memory container, and its value.
+  // fp8/fp6/fp4 under .kind::f8f6f4 and .kind::mxf8f6f4 sit 16 to a 16-byte
+  // group in shared memory, the 6- and 4-bit ones padded, and in 8-bit
+  // containers in Tensor Memory -- fp6 in bits 0-5, fp4 in bits 2-5; under
+  // .kind::mxf4/mxf4nvf4, fp4 is packed two to a byte in both.
+  enum class TcType { F16, BF16, TF32, E4M3, E5M2, E2M3, E3M2, E2M1, S8, U8 };
+  struct TcElem {
+    TcType t = TcType::F16;
+    uint32_t bits = 16;          // the element's own width
+    uint32_t per16 = 8;          // elements in a 16-byte group of shared memory
+    uint32_t cbits = 16;         // its container in Tensor Memory
+  };
+  static double small_float(uint32_t v, int ebits, int mbits, int bias) {
+    const uint32_t mant = v & ((1u << mbits) - 1);
+    const uint32_t exp = (v >> mbits) & ((1u << ebits) - 1);
+    const bool neg = (v >> (ebits + mbits)) & 1;
+    const double mag = exp ? std::ldexp(1.0 + mant / double(1u << mbits), int(exp) - bias)
+                           : std::ldexp(mant / double(1u << mbits), 1 - bias);
+    return neg ? -mag : mag;
+  }
+  static double tc_decode(TcType t, uint32_t raw) {
+    switch (t) {
+      case TcType::F16: return f16_to_double(raw & 0xFFFF);
+      case TcType::BF16: return bf16_to_double(raw & 0xFFFF);
+      // As for wgmma: the low 13 mantissa bits of a tf32 are not read.
+      case TcType::TF32: return static_cast<double>(f32(raw & 0xFFFFE000u));
+      case TcType::E4M3: return fp8_to_double(raw & 0xFF, kE4M3);
+      case TcType::E5M2: return fp8_to_double(raw & 0xFF, kE5M2);
+      // The OCP MX formats: no infinities or NaNs.
+      case TcType::E2M3: return small_float(raw & 0x3F, 2, 3, 1);
+      case TcType::E3M2: return small_float(raw & 0x3F, 3, 2, 3);
+      case TcType::E2M1: return small_float(raw & 0xF, 2, 1, 1);
+      case TcType::S8: return static_cast<double>(static_cast<int8_t>(raw & 0xFF));
+      case TcType::U8: return static_cast<double>(raw & 0xFF);
+    }
+    return 0.0;
+  }
+
+  // One thread's tcgen05.mma (9.7.18.10.10.1): D = A*B (+ D), M x N x K, on
+  // this CTA's Tensor Memory or the pair's; with .block_scale,
+  // (A * scale_A) * (B * scale_B) + D (9.7.18.10.7).
   void exec_tcgen05_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTcgen05& op,
                         uint32_t lane) {
     const int li = static_cast<int>(lane);
@@ -6137,74 +6237,136 @@ class Interpreter {
       ctx_fail(ins, li, Err::UnsupportedPtx, "tcgen05.mma: " + why);
     };
     const uint32_t id = static_cast<uint32_t>(value(op.idesc));
-    // The instruction descriptor (Table 51).
-    if (id & 4) refuse("the instruction descriptor asks for sparse A (bit 2), which is tcgen05.mma.sp");
-    if ((id & 0x40) || (id & (1u << 23)))
-      ctx_fail(ins, li, Err::InvalidValue, "tcgen05.mma instruction descriptor sets a reserved bit");
-    if (id >> 30) refuse("the instruction descriptor's B-reuse shift (bits 30-31) is for .ws only");
-    const bool sat = id >> 3 & 1;
-    const uint32_t dtype = id >> 4 & 3, atype = id >> 7 & 7, btype = id >> 10 & 7;
-    const bool neg_a = id >> 13 & 1, neg_b = id >> 14 & 1;
-    const bool trans_a = id >> 15 & 1, trans_b = id >> 16 & 1;
-    const uint32_t N = (id >> 17 & 0x3F) << 3, M = (id >> 24 & 0x1F) << 4;
-    const bool k_bit = id >> 29 & 1;
-    // Element types by kind, and K: 256 bits of A's row.
-    WgmmaElem ta{}, tb{};
-    uint32_t bits = 16;
-    bool d_f16 = false, d_int = false;
     auto bad = [&]() {
       ctx_fail(ins, li, Err::InvalidValue,
                "tcgen05.mma instruction descriptor 0x" + [&] {
                  char b[12];
                  std::snprintf(b, sizeof b, "%08x", id);
                  return std::string(b);
-               }() + " has types this .kind does not define (Table 51)");
+               }() + " has fields this .kind does not define (Tables 51-53)");
     };
+    const bool mx = op.block_scale;
+    const bool mxf4 = op.mma_kind == Tcgen05MmaKind::MXF4 || op.mma_kind == Tcgen05MmaKind::MXF4NVF4;
+    // The instruction descriptor: Table 51, or 52/53 for the block-scaled kinds.
+    if (id & 4) refuse("the instruction descriptor asks for sparse A (bit 2), which is tcgen05.mma.sp");
+    const bool sat = !mx && (id >> 3 & 1);
+    const uint32_t dtype = mx ? 1 : id >> 4 & 3;
+    const uint32_t atype = id >> 7 & 7, btype = mxf4 ? id >> 10 & 3 : id >> 10 & 7;
+    const bool neg_a = id >> 13 & 1, neg_b = id >> 14 & 1;
+    const bool trans_a = id >> 15 & 1, trans_b = id >> 16 & 1;
+    const uint32_t N = (id >> 17 & 0x3F) << 3;
+    const uint32_t M = mx ? (id >> 27 & 3) << 7 : (id >> 24 & 0x1F) << 4;
+    const uint32_t sfb_id = id >> 4 & 3, sfa_id = id >> 29 & 3;
+    if (mx) {
+      if ((id & 3) || (id & 0x40) || (!mxf4 && (id & 8)) || (mxf4 && (id >> 25 & 1)) ||
+          (!mxf4 && (id >> 24 & 3)))
+        ctx_fail(ins, li, Err::InvalidValue, "tcgen05.mma instruction descriptor sets a reserved bit");
+      if (id >> 26 & 1) refuse("the 128-lane scale-factor A layout (bit 26) is sm_107f's");
+      if ((id >> 31) || (mxf4 && (id >> 3 & 1))) refuse("the larger K of bits 3 and 31 is sm_107f's");
+      if (mxf4 && (id >> 12 & 1)) refuse("sparsity version v1 (bit 12) is sm_107's");
+    } else {
+      if ((id & 0x40) || (id & (1u << 23)))
+        ctx_fail(ins, li, Err::InvalidValue, "tcgen05.mma instruction descriptor sets a reserved bit");
+      if (id >> 30) refuse("the instruction descriptor's B-reuse shift (bits 30-31) is for .ws only");
+      if (id >> 29 & 1) refuse("K = 64 for 8-bit types (instruction descriptor bit 29) is sm_107f's");
+    }
+    // Element types by kind, and K: 256 bits of an 8-bit-container row.
+    auto f8f6f4_elem = [&](uint32_t t) {
+      TcElem e;
+      switch (t) {
+        case 0: e.t = TcType::E4M3; e.bits = 8; break;
+        case 1: e.t = TcType::E5M2; e.bits = 8; break;
+        case 3: e.t = TcType::E2M3; e.bits = 6; break;
+        case 4: e.t = TcType::E3M2; e.bits = 6; break;
+        case 5: e.t = TcType::E2M1; e.bits = 4; break;
+        default: bad();
+      }
+      e.per16 = 16;
+      e.cbits = 8;
+      return e;
+    };
+    TcElem ea, eb2;
+    uint32_t K = 0;
+    bool d_f16 = false, d_int = false;
     switch (op.mma_kind) {
       case Tcgen05MmaKind::F16:
         if (atype > 1 || btype != atype || dtype > 1 || (dtype == 0 && atype != 0)) bad();
-        ta = tb = atype ? WgmmaElem::BF16 : WgmmaElem::F16;
+        ea.t = atype ? TcType::BF16 : TcType::F16;
+        eb2 = ea;
         d_f16 = dtype == 0;
+        K = 16;
         break;
       case Tcgen05MmaKind::TF32:
         if (atype != 2 || btype != 2 || dtype != 1) bad();
-        ta = tb = WgmmaElem::TF32;
-        bits = 32;
+        ea = TcElem{TcType::TF32, 32, 4, 32};
+        eb2 = ea;
+        K = 8;
         break;
-      case Tcgen05MmaKind::F8F6F4: {
-        auto el = [&](uint32_t t) {
-          if (t == 0) return WgmmaElem::E4M3;
-          if (t == 1) return WgmmaElem::E5M2;
-          if (t >= 3 && t <= 5)
-            refuse("the 6- and 4-bit types (E2M3, E3M2, E2M1) of .kind::f8f6f4, whose packing is "
-                   "not implemented yet");
-          bad();
-          return WgmmaElem::E4M3;
-        };
+      case Tcgen05MmaKind::F8F6F4:
+      case Tcgen05MmaKind::MXF8F6F4:
         if (dtype > 1) bad();
-        ta = el(atype);
-        tb = el(btype);
+        ea = f8f6f4_elem(atype);
+        eb2 = f8f6f4_elem(btype);
         d_f16 = dtype == 0;
-        bits = 8;
+        K = 32;
         break;
-      }
       case Tcgen05MmaKind::I8:
         if (atype > 1 || btype > 1 || dtype != 2) bad();
-        ta = atype ? WgmmaElem::S8 : WgmmaElem::U8;
-        tb = btype ? WgmmaElem::S8 : WgmmaElem::U8;
+        ea = TcElem{atype ? TcType::S8 : TcType::U8, 8, 16, 8};
+        eb2 = TcElem{btype ? TcType::S8 : TcType::U8, 8, 16, 8};
         d_int = true;
-        bits = 8;
+        K = 32;
         if (neg_a || neg_b) bad();
+        break;
+      case Tcgen05MmaKind::MXF4:
+      case Tcgen05MmaKind::MXF4NVF4:
+        if (atype != 1 || btype != 1) bad();
+        ea = eb2 = TcElem{TcType::E2M1, 4, 32, 4};
+        K = 64;
+        if (trans_a || trans_b) bad();   // Table 62: no transpose for mxf4
         break;
     }
     if (sat && !d_int) bad();
-    if (k_bit) refuse("K = 64 for 8-bit types (instruction descriptor bit 29) is sm_107f's");
-    const uint32_t K = 256 / bits;
+    // Sub-byte elements are read K-major (Table 65 transposes only 8- and
+    // 16-bit ones, and 32-bit in the 32-byte-atom swizzle).
+    if ((ea.bits < 8 && trans_a) || (eb2.bits < 8 && trans_b)) bad();
+    // Block scaling: scale factors per row of K, and their type.
+    uint32_t sv = 0;          // scale factors per row of A / column of B
+    bool ue4m3 = false;
+    if (mx) {
+      switch (op.mma_kind) {
+        case Tcgen05MmaKind::MXF8F6F4:
+          if (op.scale_vec != 0 && op.scale_vec != 1 && op.scale_vec != 32) bad();
+          sv = 1;
+          if (!(id >> 23 & 1)) bad();   // UE8M0 is its only scale type
+          break;
+        case Tcgen05MmaKind::MXF4:
+          if (op.scale_vec != 0 && op.scale_vec != 2 && op.scale_vec != 32) bad();
+          sv = 2;
+          if ((id >> 23 & 3) != 1) bad();
+          break;
+        default: {   // mxf4nvf4: the size must be named
+          if (op.scale_vec == 0) refuse(".kind::mxf4nvf4 needs a scale vector size");
+          sv = op.scale_vec == 2 || op.scale_vec == 32 ? 2 : op.scale_vec == 4 || op.scale_vec == 16 ? 4 : 0;
+          if (!sv) bad();
+          const uint32_t st = id >> 23 & 3;
+          if (st == 2) refuse("UE5M3 scale factors are sm_107f's");
+          if (st > 1) bad();
+          ue4m3 = st == 0;
+          if (ue4m3 && sv == 2) refuse("UE4M3 scale factors with .block32 are sm_107f's");
+          break;
+        }
+      }
+      // Byte-aligned sub-columns: 1X any byte, 2X a half word, 4X all four.
+      if ((sv == 2 && (sfa_id % 2 || sfb_id % 2)) || (sv == 4 && (sfa_id || sfb_id))) bad();
+    }
     const uint32_t G = op.cta_group;
     const bool shape_ok =
-        G == 1 ? (M == 64 || M == 128) && N >= 8 && N <= 256 && N % 8 == 0 &&
-                     !(d_int && M == 128 && N % 16)
-               : (M == 128 || M == 256) && N >= 16 && N <= 256 && N % (d_int ? 32 : 16) == 0;
+        mx ? (G == 1 ? M == 128 && N >= 8 && N <= 256 && N % 8 == 0
+                     : (M == 128 || M == 256) && N >= 16 && N <= 256 && N % 16 == 0)
+        : G == 1 ? (M == 64 || M == 128) && N >= 8 && N <= 256 && N % 8 == 0 &&
+                       !(d_int && M == 128 && N % 16)
+                 : (M == 128 || M == 256) && N >= 16 && N <= 256 && N % (d_int ? 32 : 16) == 0;
     if (!shape_ok)
       ctx_fail(ins, li, Err::InvalidValue,
                "tcgen05.mma.cta_group::" + std::to_string(G) + " of shape M=" + std::to_string(M) +
@@ -6240,8 +6402,31 @@ class Interpreter {
                    "tcgen05.mma writes D to Tensor Memory column " + std::to_string(col) +
                        ", which no tcgen05.alloc has allocated" + (c != &ctx ? " in the peer CTA" : ""));
     const double sa = neg_a ? -1.0 : 1.0, sb = neg_b ? -1.0 : 1.0;
-    const uint32_t eb = bits / 8;
 
+    // Element (mn, k) of an operand in shared memory. K-major, it is bits at
+    // (k % per16) * bits within 16-byte group k / per16 of the row, through
+    // the canonical layout byte by byte; MN-major (8 bits and wider only),
+    // the canonical layout of whole elements.
+    auto smem_raw = [&](const WgmmaDesc& d, bool k_major, const TcElem& e, uint32_t rank, uint32_t mn,
+                        uint32_t k) -> uint32_t {
+      auto byte_at = [&](uint64_t off) {
+        return static_cast<uint32_t>(load_routed(w, ctx, ins, lane,
+                                                 kSharedVaBase + cluster_address(ctx, rank, off), 1));
+      };
+      if (!k_major) {
+        const uint32_t eb = e.bits / 8;
+        const uint64_t at = wgmma_smem_offset(d, false, eb, mn, k);
+        return static_cast<uint32_t>(load_routed(w, ctx, ins, lane,
+                                                 kSharedVaBase + cluster_address(ctx, rank, at), eb));
+      }
+      const uint32_t bit = (k % e.per16) * e.bits;
+      const uint32_t byte = 16 * (k / e.per16) + bit / 8;
+      uint32_t raw = 0;
+      const uint32_t nbytes = (bit % 8 + e.bits + 7) / 8;
+      for (uint32_t i = 0; i < nbytes; ++i)
+        raw |= byte_at(wgmma_smem_offset(d, true, 1, mn, byte + i)) << (8 * i);
+      return (raw >> (bit % 8)) & ((e.bits >= 32) ? 0xFFFFFFFFu : ((1u << e.bits) - 1));
+    };
     // B: K x N, CTA v supplying columns [v*Nloc, (v+1)*Nloc) from its own
     // shared memory at the descriptor's offsets (the peer's half of a pair
     // sits at the same offsets there).
@@ -6251,18 +6436,15 @@ class Interpreter {
       for (uint32_t v = 0; v < G; ++v) {
         const uint32_t rank = cluster_rank_of(*ctas[v]);
         for (uint32_t n = 0; n < Nloc; ++n)
-          for (uint32_t k = 0; k < K; ++k) {
-            const uint64_t at = wgmma_smem_offset(d, !trans_b, eb, n, k);
-            B[size_t{k} * N + v * Nloc + n] =
-                sb * wgmma_decode(tb, load_routed(w, ctx, ins, lane,
-                                                  kSharedVaBase + cluster_address(ctx, rank, at), eb));
-          }
+          for (uint32_t k = 0; k < K; ++k)
+            B[size_t{k} * N + v * Nloc + n] = sb * tc_decode(eb2.t, smem_raw(d, !trans_b, eb2, rank, n, k));
       }
     }
     // A, by the Tensor Memory lane each D row is written to: from shared
     // memory, the row that lane holds; from Tensor Memory, whatever that
-    // lane holds, packed 32 bits to a column (9.7.18.10.4) -- so layout B's
-    // duplicated A must really be in both halves, as on the hardware.
+    // lane holds, in its containers packed 32 bits to a column
+    // (9.7.18.10.4) -- so layout B's duplicated A must really be in both
+    // halves, as on the hardware.
     const uint32_t a_addr = op.a_tmem ? static_cast<uint32_t>(value(op.a)) : 0;
     if (op.a_tmem && !lane_align_ok(a_addr >> 16))
       ctx_fail(ins, li, Err::InvalidValue,
@@ -6286,8 +6468,29 @@ class Interpreter {
         if (x) refuse("a nonzero disable-output-lane with .cta_group::2; the ISA does not say which "
                       "CTA's lanes its upper half covers");
     const double d_scale = op.scale_d > 0 ? std::ldexp(1.0, -op.scale_d) : 1.0;
+    // Scale factors (9.7.18.10.7.2-3): row m's j-th for A, in byte SFA_ID + j
+    // of the cell at lane m % 32, column (scale-A address) + m / 32; column
+    // n's for B likewise. Both are duplicated into every 32-lane partition
+    // (CUTLASS's tcgen05.cp .32x128b.warpx4 does it), and each D row reads
+    // the copies in its own partition.
+    const uint32_t sfa_addr = mx ? static_cast<uint32_t>(value(op.scale_a)) : 0;
+    const uint32_t sfb_addr = mx ? static_cast<uint32_t>(value(op.scale_b)) : 0;
+    const uint32_t blk = mx ? K / sv : K;
+    auto scale_of = [&](TensorMemory& t, uint32_t addr, uint32_t idx, uint32_t part, uint32_t sfid,
+                        uint32_t j) -> double {
+      const uint32_t l = (addr >> 16) + idx % 32 + 32 * part;
+      const uint32_t col = (addr & 0xFFFF) + idx / 32;
+      if (l >= TensorMemory::kLanes || col >= TensorMemory::kCols || !t.allocated(col))
+        ctx_fail(ins, li, Err::OutOfBounds,
+                 "tcgen05.mma reads a scale factor from Tensor Memory lane " + std::to_string(l) +
+                     ", column " + std::to_string(col) + ", which no tcgen05.alloc has allocated");
+      const uint32_t byte = (t.at(l, col) >> (8 * (sfid + j))) & 0xFF;
+      if (ue4m3) return fp8_to_double(byte & 0x7F, kE4M3);
+      if (byte == 0xFF) return std::numeric_limits<double>::quiet_NaN();
+      return std::ldexp(1.0, int(byte) - 127);   // UE8M0
+    };
 
-    std::vector<double> A(K);
+    std::vector<double> A(K), SA(4, 1.0), SB(4, 1.0);
     for (uint32_t v = 0; v < G; ++v) {
       TensorMemory& t = tmem_of(*ctas[v]);
       const uint32_t rank = cluster_rank_of(*ctas[v]);
@@ -6296,12 +6499,8 @@ class Interpreter {
       if (!op.a_tmem) {
         As.resize(size_t{Mloc} * K);
         for (uint32_t m = 0; m < Mloc; ++m)
-          for (uint32_t k = 0; k < K; ++k) {
-            const uint64_t at = wgmma_smem_offset(a_desc, !trans_a, eb, m, k);
-            As[size_t{m} * K + k] =
-                sa * wgmma_decode(ta, load_routed(w, ctx, ins, lane,
-                                                  kSharedVaBase + cluster_address(ctx, rank, at), eb));
-          }
+          for (uint32_t k = 0; k < K; ++k)
+            As[size_t{m} * K + k] = sa * tc_decode(ea.t, smem_raw(a_desc, !trans_a, ea, rank, m, k));
       }
       for (uint32_t m = 0; m < Mloc; ++m)
         for (uint32_t n = 0; n < N; ++n) {
@@ -6311,16 +6510,24 @@ class Interpreter {
           if (op.a_tmem) {
             const uint32_t al = dl - d_lane0 + (a_addr >> 16), ac0 = a_addr & 0xFFFF;
             for (uint32_t k = 0; k < K; ++k) {
-              const uint32_t col = ac0 + k * bits / 32;
+              const uint32_t col = ac0 + k * ea.cbits / 32;
               if (col >= TensorMemory::kCols || !t.allocated(col))
                 ctx_fail(ins, li, Err::OutOfBounds,
                          "tcgen05.mma reads A from Tensor Memory column " + std::to_string(col) +
                              ", which no tcgen05.alloc has allocated");
-              A[k] = sa * wgmma_decode(ta, t.at(al, col) >> (k * bits % 32));
+              uint32_t raw = t.at(al, col) >> (k * ea.cbits % 32);
+              // fp4 in an 8-bit container sits in bits 2-5 (figure 202).
+              if (ea.cbits == 8 && ea.bits == 4) raw >>= 2;
+              A[k] = sa * tc_decode(ea.t, raw);
             }
           } else {
             std::copy_n(As.begin() + size_t{m} * K, K, A.begin());
           }
+          if (mx)
+            for (uint32_t j = 0; j < sv; ++j) {
+              SA[j] = scale_of(t, sfa_addr, m, dl / 32, sfa_id, j);
+              SB[j] = scale_of(t, sfb_addr, n, dl / 32, sfb_id, j);
+            }
           uint32_t& cell = t.at(dl, d_col0 + dc);
           if (d_int) {
             int64_t acc = accumulate ? static_cast<int32_t>(cell) : 0;
@@ -6334,14 +6541,19 @@ class Interpreter {
           }
           // As wgmma: every product here is exact in f32, and the sum is
           // kept in f32. An f16 D is one 16-bit value in the low half of its
-          // cell (9.7.18.10.4.1).
+          // cell (9.7.18.10.4.1). Scaled, each operand is multiplied by its
+          // block's factor first -- exact too, for these element and scale
+          // types.
           float acc = 0.0f;
           if (accumulate) {
             const double old = d_f16 ? f16_to_double(cell & 0xFFFF) : static_cast<double>(f32(cell));
             acc = static_cast<float>(old * d_scale);
           }
-          for (uint32_t k = 0; k < K; ++k)
-            acc += static_cast<float>(A[k]) * static_cast<float>(B[size_t{k} * N + n]);
+          for (uint32_t k = 0; k < K; ++k) {
+            const double a = mx ? A[k] * SA[k / blk] : A[k];
+            const double b = mx ? B[size_t{k} * N + n] * SB[k / blk] : B[size_t{k} * N + n];
+            acc += static_cast<float>(a) * static_cast<float>(b);
+          }
           cell = d_f16 ? static_cast<uint32_t>(double_to_f16(acc) & 0xFFFF) : f32bits(acc);
         }
     }
