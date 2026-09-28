@@ -1425,10 +1425,19 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, 
       // host address; see cudaHostGetDevicePointer.
       case cudaDevAttrCanMapHostMemory: *value = 1; break;
       case cudaDevAttrManagedMemory: *value = 1; break;
+      // The host and the device may touch managed memory at the same time, as
+      // on Linux since Pascal (Windows and WSL answer 0): here it is one
+      // host allocation. NanoVDB's DeviceStreamMap filters devices on it.
+      case cudaDevAttrConcurrentManagedAccess: *value = 1; break;
       // Grid-wide sync works under cudaLaunchCooperativeKernel; the
       // multi-device form does not.
       case cudaDevAttrCooperativeLaunch: *value = 1; break;
       case cudaDevAttrComputeMode: *value = 0; break;         // cudaComputeModeDefault
+      // The stream-ordered allocator is implemented: cudaMallocAsync and the
+      // cudaMemPool* API (an RTX 3060 answers 1; NanoVDB checks that the two
+      // agree). No pool can be exported to another process, so no handle types.
+      case cudaDevAttrMemoryPoolsSupported: *value = 1; break;
+      case cudaDevAttrMemoryPoolSupportedHandleTypes: *value = 0; break;
       default:
         // A silent zero here is how a scan came to launch no blocks. An
         // attribute this does not model is reported, so the caller either
@@ -1536,6 +1545,29 @@ VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBl
 VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     int* n, const void* f, int bs, size_t dyn, unsigned int) {
   return cudaOccupancyMaxActiveBlocksPerMultiprocessor(n, f, bs, dyn);
+}
+
+// What one device can do with another's memory. The answers follow
+// cudaDeviceCanAccessPeer: distinct simulated devices reach each other, and
+// atomics on a peer's memory are as atomic as on one's own. A device is not
+// asked about itself: an RTX 3060 answers that, like a device that does not
+// exist, with cudaErrorInvalidDevice. There is no performance to rank.
+VGPU_EXPORT cudaError_t cudaDeviceGetP2PAttribute(int* value, cudaDeviceP2PAttr attr, int srcDevice,
+                                                  int dstDevice) {
+  return guard("cudaDeviceGetP2PAttribute", [&](State& s) {
+    if (!value) return cudaErrorInvalidValue;
+    const int n = s.rt->device_count();
+    if (srcDevice < 0 || srcDevice >= n || dstDevice < 0 || dstDevice >= n || srcDevice == dstDevice)
+      return cudaErrorInvalidDevice;
+    switch (attr) {
+      case cudaDevP2PAttrPerformanceRank: *value = 0; break;
+      case cudaDevP2PAttrAccessSupported: *value = 1; break;
+      case cudaDevP2PAttrNativeAtomicSupported: *value = 1; break;
+      case cudaDevP2PAttrCudaArrayAccessSupported: *value = 0; break;
+      default: return cudaErrorInvalidValue;
+    }
+    return cudaSuccess;
+  });
 }
 
 VGPU_EXPORT cudaError_t cudaDeviceCanAccessPeer(int* can, int device, int peerDevice) {
@@ -1796,6 +1828,20 @@ VGPU_EXPORT cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* 
 
 VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
   return guard("cudaMemset", [&](State& s) {
+    // Managed and pinned memory are filled like device memory, as an RTX 3060
+    // fills them (NanoVDB zeroes a managed grid buffer this way); here they
+    // are host addresses. Pageable and cudaHostRegister'd memory fall through
+    // to the device fill, which refuses them, as CUDA does.
+    if (!is_device_ptr(dst)) {
+      for (auto* ranges : {&s.managed_allocs, &s.host_allocs}) {
+        auto it = find_range(*ranges, dst);
+        if (it == ranges->end()) continue;
+        const size_t off = static_cast<size_t>(static_cast<char*>(dst) - static_cast<char*>(it->first));
+        if (count > it->second.size - off) return cudaErrorInvalidValue;
+        std::memset(dst, value, count);
+        return cudaSuccess;
+      }
+    }
     const uint8_t byte = static_cast<uint8_t>(value);
     owner_memory(s, dst).fill(reinterpret_cast<uint64_t>(dst), &byte, 1, count);
     return cudaSuccess;
@@ -2621,9 +2667,11 @@ VGPU_EXPORT cudaError_t cudaPointerGetAttributes(cudaPointerAttributes* attr, co
       attr->devicePointer = const_cast<void*>(p);
       return cudaSuccess;
     }
-    // Plain host memory CUDA knows nothing about.
+    // Plain host memory CUDA knows nothing about. It belongs to no device,
+    // which CUDA says with cudaInvalidDeviceId (-2), not the current device:
+    // NanoVDB's ptrToDevice tells host pointers from device ones by that.
     attr->type = cudaMemoryTypeUnregistered;
-    attr->device = t_current_device;
+    attr->device = cudaInvalidDeviceId;
     attr->hostPointer = const_cast<void*>(p);
     return cudaSuccess;
   });

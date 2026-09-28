@@ -558,6 +558,8 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   // told about them by every caller. A caller that set them explicitly keeps
   // its own table.
   exec::LaunchConfig cfg = in_cfg;
+  cfg.device_ordinal = ordinal_;
+  cfg.device_count = device_count_;
   if (!cfg.textures && !textures_.empty()) cfg.textures = &textures_;
   // Every kernel loaded on the device, for the child grids a kernel launches.
   exec::KernelTable kernels;
@@ -623,6 +625,7 @@ Runtime::Runtime(const DeviceProfile& profile, int device_count) {
     devices_.push_back(std::make_unique<Device>(profile, i, telemetry_.active() ? &telemetry_ : nullptr));
     publish_identity(profile, i);
   }
+  for (auto& d : devices_) d->set_device_count(device_count);
 }
 
 Device& Runtime::device(int ordinal) {
