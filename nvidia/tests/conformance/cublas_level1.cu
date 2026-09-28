@@ -2,7 +2,8 @@
 // axpy, scal, dot, nrm2 and i?amax in single and double precision, positive and
 // negative increments (BLAS walks a negative-increment vector from its far
 // end), and tbmv over both triangles, both operations, unit and non-unit
-// diagonals and several band widths.
+// diagonals and several band widths; and dgmm (a matrix times a diagonal
+// one) from both sides, over every kind of increment, padded and in place.
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -48,6 +49,32 @@ cublasStatus_t iamax(cublasHandle_t h, int n, const float* x, int ix, int* r) { 
 cublasStatus_t iamax(cublasHandle_t h, int n, const double* x, int ix, int* r) { return cublasIdamax(h, n, x, ix, r); }
 cublasStatus_t tbmv(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t, cublasDiagType_t d, int n, int k, const float* A, int lda, float* x, int ix) { return cublasStbmv(h, u, t, d, n, k, A, lda, x, ix); }
 cublasStatus_t tbmv(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t, cublasDiagType_t d, int n, int k, const double* A, int lda, double* x, int ix) { return cublasDtbmv(h, u, t, d, n, k, A, lda, x, ix); }
+cublasStatus_t dgmm(cublasHandle_t h, cublasSideMode_t s, int m, int n, const float* A, int lda, const float* x, int ix, float* C, int ldc) { return cublasSdgmm(h, s, m, n, A, lda, x, ix, C, ldc); }
+cublasStatus_t dgmm(cublasHandle_t h, cublasSideMode_t s, int m, int n, const double* A, int lda, const double* x, int ix, double* C, int ldc) { return cublasDdgmm(h, s, m, n, A, lda, x, ix, C, ldc); }
+
+template <class T> static void diag(cublasHandle_t h, const char* ty) {
+  const int m = 5, n = 4, lda = 7;   // padded: rows 5 and 6 of each column are not A's
+  for (int left = 0; left <= 1; ++left)
+    for (int inc : {1, 2, -1, 0}) {
+      const int len = left ? m : n;
+      const size_t lx = inc == 0 ? 1 : (size_t)(inc < 0 ? -inc : inc) * (len - 1) + 1;
+      auto hA = values<T>((size_t)lda * n, 6);
+      auto hx = values<T>(lx, 7);
+      T* dA = up(hA);
+      T* dx = up(hx);
+      std::vector<T> zeros((size_t)lda * n, (T)0);
+      T* dC = up(zeros);
+      CB(dgmm(h, left ? CUBLAS_SIDE_LEFT : CUBLAS_SIDE_RIGHT, m, n, dA, lda, dx, inc, dC, lda));
+      char tag[64];
+      snprintf(tag, sizeof tag, "%s dgmm %s inc %d", ty, left ? "L" : "R", inc);
+      print(tag, down(dC, (size_t)lda * n));
+      // In place: C is A.
+      CB(dgmm(h, left ? CUBLAS_SIDE_LEFT : CUBLAS_SIDE_RIGHT, m, n, dA, lda, dx, inc, dA, lda));
+      snprintf(tag, sizeof tag, "%s dgmm %s inc %d in place", ty, left ? "L" : "R", inc);
+      print(tag, down(dA, (size_t)lda * n));
+      cudaFree(dA); cudaFree(dx); cudaFree(dC);
+    }
+}
 
 template <class T> static void level1(cublasHandle_t h, const char* ty) {
   const int n = 7;
@@ -119,6 +146,8 @@ static void run() {
   level1<double>(h, "d");
   band<float>(h, "s");
   band<double>(h, "d");
+  diag<float>(h, "s");
+  diag<double>(h, "d");
   // Results written through a device pointer.
   CB(cublasSetPointerMode(h, CUBLAS_POINTER_MODE_DEVICE));
   auto hx = values<double>(9, 5);
