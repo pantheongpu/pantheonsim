@@ -824,14 +824,14 @@ cublasStatus_t nrm2(cublasHandle_t h, int n, const T* x, int incx, T* result) {
 
 // The 1-based index of the first element of largest magnitude; 0 when there is
 // nothing to search, as reference BLAS returns.
-template <class T>
-cublasStatus_t iamax(cublasHandle_t h, int n, const T* x, int incx, int* result) {
+template <class T, class R = int>
+cublasStatus_t iamax(cublasHandle_t h, int n, const T* x, int incx, R* result) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!result) return CUBLAS_STATUS_INVALID_VALUE;
   if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
-  if (deferred_to_graph(h, [=] { iamax<T>(h, n, x, incx, result); }))
+  if (deferred_to_graph(h, [=] { iamax<T, R>(h, n, x, incx, result); }))
     return CUBLAS_STATUS_SUCCESS;
-  int best = 0;
+  R best = 0;
   if (n > 0 && incx > 0) {
     auto hx = fetch<T>(x, span(n, incx));
     T top = std::abs(hx[0]);
@@ -962,6 +962,64 @@ VGPU_EXPORT cublasStatus_t cublasDtbmv_v2(cublasHandle_t h, cublasFillMode_t upl
                                           cublasOperation_t trans, cublasDiagType_t diag, int n,
                                           int k, const double* A, int lda, double* x, int incx) {
   return tbmv(h, uplo, trans, diag, n, k, A, lda, x, incx);
+}
+
+// The 64-bit-index forms CUDA 12 added (cublasDnrm2_64 and so on; cuPDLPx
+// calls that one). Sizes and strides are int64_t, and i?amax answers in an
+// int64_t. Host-computed vectors that long would not fit in memory anyway, so
+// a size or stride beyond int is refused rather than truncated.
+namespace {
+bool fits_int(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
+}  // namespace
+VGPU_EXPORT cublasStatus_t cublasSaxpy_v2_64(cublasHandle_t h, int64_t n, const float* alpha,
+                                             const float* x, int64_t incx, float* y, int64_t incy) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return axpy(h, (int)n, alpha, x, (int)incx, y, (int)incy);
+}
+VGPU_EXPORT cublasStatus_t cublasDaxpy_v2_64(cublasHandle_t h, int64_t n, const double* alpha,
+                                             const double* x, int64_t incx, double* y, int64_t incy) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return axpy(h, (int)n, alpha, x, (int)incx, y, (int)incy);
+}
+VGPU_EXPORT cublasStatus_t cublasSscal_v2_64(cublasHandle_t h, int64_t n, const float* alpha, float* x,
+                                             int64_t incx) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return scal(h, (int)n, alpha, x, (int)incx);
+}
+VGPU_EXPORT cublasStatus_t cublasDscal_v2_64(cublasHandle_t h, int64_t n, const double* alpha, double* x,
+                                             int64_t incx) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return scal(h, (int)n, alpha, x, (int)incx);
+}
+VGPU_EXPORT cublasStatus_t cublasSdot_v2_64(cublasHandle_t h, int64_t n, const float* x, int64_t incx,
+                                            const float* y, int64_t incy, float* result) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return dot(h, (int)n, x, (int)incx, y, (int)incy, result);
+}
+VGPU_EXPORT cublasStatus_t cublasDdot_v2_64(cublasHandle_t h, int64_t n, const double* x, int64_t incx,
+                                            const double* y, int64_t incy, double* result) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return dot(h, (int)n, x, (int)incx, y, (int)incy, result);
+}
+VGPU_EXPORT cublasStatus_t cublasSnrm2_v2_64(cublasHandle_t h, int64_t n, const float* x, int64_t incx,
+                                             float* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return nrm2(h, (int)n, x, (int)incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasDnrm2_v2_64(cublasHandle_t h, int64_t n, const double* x, int64_t incx,
+                                             double* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return nrm2(h, (int)n, x, (int)incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasIsamax_v2_64(cublasHandle_t h, int64_t n, const float* x, int64_t incx,
+                                              int64_t* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return iamax(h, (int)n, x, (int)incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasIdamax_v2_64(cublasHandle_t h, int64_t n, const double* x, int64_t incx,
+                                              int64_t* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return iamax(h, (int)n, x, (int)incx, result);
 }
 
 /* ---- anything not implemented says so, rather than returning wrong numbers ---- */
