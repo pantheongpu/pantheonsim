@@ -1818,6 +1818,17 @@ class Parser {
       expect_punct(",");
       op.src = parse_operand();
       ins.op = op;
+    } else if (op0 == "cnot") {
+      // cnot.{b16,b32,b64} d, a: 1 when a is zero, else 0 (C's !a).
+      auto ty = parts.size() == 2 ? parse_type_token(parts[1]) : std::nullopt;
+      if (!ty || ty->kind != Type::Kind::B || ty->bits < 16) return unsupported("cnot form (cnot.{b16,b32,b64})");
+      OpNot op;
+      op.ty = *ty;
+      op.logical = true;
+      op.dst = expect_reg_operand("cnot destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
     } else if (op0 == "not") {
       if (parts.size() != 2) return unsupported("not form");
       auto ty = parse_type_token(parts[1]);

@@ -3145,13 +3145,15 @@ class Interpreter {
           });
         else run([](uint64_t x, uint64_t y) { return std::max(x, y); });
         break;
-      case IntBinOp::Shl: run([](uint64_t x, uint64_t y) { return y >= 64 ? 0 : x << y; }); break;
+      // The amount is a .u32, as in the general path.
+      case IntBinOp::Shl: run([](uint64_t x, uint64_t y) { y = static_cast<uint32_t>(y); return y >= 64 ? 0 : x << y; }); break;
       case IntBinOp::Shr:
         if (sig) run([](uint64_t x, uint64_t y) {
             const int64_t v = static_cast<int64_t>(x);
+            y = static_cast<uint32_t>(y);
             return static_cast<uint64_t>(y >= 64 ? (v < 0 ? -1 : 0) : v >> y);
           });
-        else run([](uint64_t x, uint64_t y) { return y >= 64 ? 0 : x >> y; });
+        else run([](uint64_t x, uint64_t y) { y = static_cast<uint32_t>(y); return y >= 64 ? 0 : x >> y; });
         break;
       default: return false;
     }
@@ -3701,7 +3703,8 @@ class Interpreter {
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
       for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane)) r[lane] = ~v[lane];
+        if (m & (Mask{1} << lane))
+          r[lane] = op->logical ? (mask_to_bits(v[lane], op->ty.bits) == 0 ? 1u : 0u) : ~v[lane];
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -4258,8 +4261,10 @@ class Interpreter {
         Mask same = 0;
         for (uint32_t o = 0; o < W_; ++o)
           if ((members & (Mask{1} << o)) && a[o] == a[lane]) same |= (Mask{1} << o);
-        r[lane] = static_cast<uint64_t>(same);
+        // match.all writes the member mask when every member holds the same
+        // value and 0 otherwise; match.any, the members holding this lane's.
         if (same == members) all_agreed |= (Mask{1} << lane);
+        r[lane] = op->all ? (same == members ? static_cast<uint64_t>(members) : 0) : static_cast<uint64_t>(same);
       }
       write_reg(w, op->dst, m, r, 32);
       if (op->all && op->pred_dst.id != kNoReg) {
@@ -5057,9 +5062,13 @@ class Interpreter {
     return (v & sign) ? (v | ~((sign << 1) - 1)) : v;
   }
 
+  // The 32-bit forms take the ISA's 8-bit position and length; the 64-bit
+  // forms the whole 32-bit operands (measured on an RTX 3060: bfe.u64 with
+  // length 0x100 extracts nothing, not 0 bits wrapped to 256).
   static uint64_t bfe(Type ty, uint64_t a, uint64_t bpos, uint64_t clen) {
-    uint32_t pos = static_cast<uint32_t>(bpos) & 0xFF;
-    uint32_t len = static_cast<uint32_t>(clen) & 0xFF;
+    const uint32_t fmask = ty.bits == 64 ? 0xFFFFFFFFu : 0xFFu;
+    uint32_t pos = static_cast<uint32_t>(bpos) & fmask;
+    uint32_t len = static_cast<uint32_t>(clen) & fmask;
     uint32_t bits = ty.bits;
     if (pos >= bits || len == 0) {
       // Signed extract of an empty//out-of-range field replicates the sign bit.
@@ -5069,13 +5078,16 @@ class Interpreter {
     }
     if (len > bits - pos) len = bits - pos;
     uint64_t field = (a >> pos) & ((len >= 64) ? ~0ull : ((1ull << len) - 1));
-    if (ty.is_signed() && (field & (1ull << (len - 1)))) field |= ~((1ull << len) - 1);
+    // (A 64-bit field needs no extension -- and 1 << 64 is undefined, which
+    // on x86 made the whole of a negative value all ones.)
+    if (ty.is_signed() && len < 64 && (field & (1ull << (len - 1)))) field |= ~((1ull << len) - 1);
     return mask_to_bits(field, bits);
   }
 
   static uint64_t bfi(Type ty, uint64_t a, uint64_t b, uint64_t cpos, uint64_t dlen) {
-    uint32_t pos = static_cast<uint32_t>(cpos) & 0xFF;
-    uint32_t len = static_cast<uint32_t>(dlen) & 0xFF;
+    const uint32_t fmask = ty.bits == 64 ? 0xFFFFFFFFu : 0xFFu;
+    uint32_t pos = static_cast<uint32_t>(cpos) & fmask;
+    uint32_t len = static_cast<uint32_t>(dlen) & fmask;
     uint32_t bits = ty.bits;
     if (pos >= bits || len == 0) return mask_to_bits(b, bits);
     if (len > bits - pos) len = bits - pos;
@@ -5106,8 +5118,11 @@ class Interpreter {
       bool pred;
       switch (op.mode) {
         case ShflMode::Up:
+          // The ISA's pval = (j >= maxLane): for .up, c's clamp field is the
+          // lowest source lane (this compared with minLane, which agrees only
+          // when c's clamp bits are 0, as __shfl_up_sync passes them).
           j = lane - bval;
-          pred = static_cast<int32_t>(lane - bval) >= static_cast<int32_t>(min_lane);
+          pred = static_cast<int32_t>(lane - bval) >= static_cast<int32_t>(max_lane);
           break;
         case ShflMode::Down:
           j = lane + bval;
@@ -8683,11 +8698,13 @@ class Interpreter {
       case IntBinOp::Or: return a | b;
       case IntBinOp::Xor: return a ^ b;
       case IntBinOp::Shl: {
-        uint64_t sh = u(b);
+        // The amount is a .u32 whatever the type: a 16-bit shift by 0x10000
+        // shifts everything out (it was once cut to 16 bits, to 0).
+        uint64_t sh = static_cast<uint32_t>(b);
         return sh >= ty.bits ? 0 : a << sh;  // PTX clamps shift amounts
       }
       case IntBinOp::Shr: {
-        uint64_t sh = u(b);
+        uint64_t sh = static_cast<uint32_t>(b);
         if (sig) {
           int64_t v = s(a);
           if (sh >= ty.bits) return static_cast<uint64_t>(v < 0 ? -1 : 0);
@@ -10371,11 +10388,14 @@ class Interpreter {
           // Min/max follow CUDA and use the fmin/fmax ordering rather than <,
           // so a NaN operand yields the other value.
           if (size == 4) {
-            const float x = std::bit_cast<float>(static_cast<uint32_t>(old));
-            const float y = std::bit_cast<float>(static_cast<uint32_t>(b));
+            float x = std::bit_cast<float>(static_cast<uint32_t>(old));
+            float y = std::bit_cast<float>(static_cast<uint32_t>(b));
+            // atom/red.add.f32 flush subnormal inputs and results to signed
+            // zero (the ISA's .ftz, which the card applies).
+            auto ftz = [](float v) { return std::fpclassify(v) == FP_SUBNORMAL ? std::copysign(0.0f, v) : v; };
             float res = x;
             switch (op.op) {
-              case AtomOp::Add: res = x + y; break;
+              case AtomOp::Add: res = ftz(ftz(x) + ftz(y)); break;
               case AtomOp::Exch: res = y; break;
               case AtomOp::Min: res = std::fmin(x, y); break;
               case AtomOp::Max: res = std::fmax(x, y); break;
@@ -10383,7 +10403,10 @@ class Interpreter {
                 ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
                          "this atomic operation has no float form");
             }
-            nv = std::bit_cast<uint32_t>(res);
+            // Exchange stores the bits it was given; an arithmetic result that
+            // is NaN is the canonical one, as f32 arithmetic writes it
+            // (atom.add.f32 onto a NaN stores 0x7fffffff on an RTX 3060).
+            nv = op.op == AtomOp::Exch ? static_cast<uint32_t>(b) : canon32(res);
           } else {
             const double x = std::bit_cast<double>(old);
             const double y = std::bit_cast<double>(b);
