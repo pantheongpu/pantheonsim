@@ -1,0 +1,77 @@
+name: ROCm libraries
+
+# AMD's own libraries, unmodified, on the simulated GPUs: PyTorch's ROCm wheel
+# (its kernels and rocBLAS's, hipBLASLt's, MIOpen's, rocFFT's, hipSPARSELt's)
+# on an MI300X, MI350X, MI250X, Radeon RX 7900 XTX and RX 9070 XT, and
+# rocBLAS and hipSPARSELt called directly. Nothing of ROCm is installed: the
+# wheel carries the libraries, and the programs that call rocBLAS and
+# hipSPARSELt are built ahead of time and checked in.
+#
+# The wheel is some 13 GB installed, so this is a workflow of its own: on
+# changes to the AMD side or to what it is built on, weekly, and by hand.
+
+on:
+  push:
+    branches: [main]
+    paths: ["amd/**", "src/**", "include/**", "CMakeLists.txt", ".github/workflows/rocm-libraries.yml"]
+  pull_request:
+    paths: ["amd/**", "src/**", "include/**", "CMakeLists.txt", ".github/workflows/rocm-libraries.yml"]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The PyTorch every AMD test here was written against.
+  TORCH: "torch==2.10.0+rocm7.0"
+  TORCH_INDEX: https://download.pytorch.org/whl/rocm7.0
+
+jobs:
+  pytorch:
+    name: PyTorch, rocBLAS and hipSPARSELt on simulated AMD GPUs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make room for the wheel
+        # The runner's image keeps SDKs this job has no use for; the wheel
+        # needs the space.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup /usr/share/swift
+          df -h / | tail -1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build python3-venv
+          cmake --version | head -1
+
+      - name: Install PyTorch for ROCm
+        # Where the tests look for it: a venv under ~/.local/share/torch-rocm*.
+        run: |
+          python3 -m venv "$HOME/.local/share/torch-rocm7.0"
+          "$HOME/.local/share/torch-rocm7.0/bin/pip" install --no-cache-dir -q "$TORCH" numpy --index-url "$TORCH_INDEX" \
+            --extra-index-url https://pypi.org/simple
+          "$HOME/.local/share/torch-rocm7.0/bin/python" -c "import torch; print(torch.__version__, torch.version.hip)"
+          df -h / | tail -1
+
+      - name: Build the HIP shim
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)" --target vgpuhip vgpu_cli
+
+      - name: PyTorch on every simulated AMD GPU, and rocBLAS and hipSPARSELt
+        # rocBLAS from the wheel, as nothing of ROCm is installed. A test
+        # missing what it needs skips; here a skip fails the job, so a wheel
+        # that did not install is a red job, not a quietly green one.
+        env:
+          VGPU_ROCBLAS_FROM_WHEEL: "1"
+        run: |
+          ctest --test-dir build --output-on-failure --timeout 1800 \
+            -R '^amd_(pytorch.*|rocblas|hipsparselt.*)$' 2>&1 | tee ctest.log
+          if grep -q 'Skipped' ctest.log; then echo "a test skipped: something it needs is missing"; exit 1; fi

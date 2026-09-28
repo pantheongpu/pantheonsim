@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <list>
 #include <vector>
 
 #include "vgpu/exec/launch.hpp"
@@ -100,7 +101,11 @@ class Device {
     std::vector<uint64_t> global_vas;   // to free on unload
     std::vector<std::pair<uint64_t, const ptx::EntryFn*>> kernels;   // address -> kernel
   };
-  std::vector<LoadedModule> modules_;
+  // A list, not a vector: a function handle keeps a pointer to its module's
+  // symbol table, and a vector moved every module whenever another loaded, so
+  // a kernel launched after that read a freed table (PyTorch's jiterator
+  // loads a module per kernel and launches earlier ones again).
+  std::list<LoadedModule> modules_;
 };
 
 class Runtime {

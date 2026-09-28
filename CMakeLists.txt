@@ -45,6 +45,7 @@ set(VGPU_PROFILES
   amd/mi350x
   amd/rx7900xtx
   amd/rx9070xt
+  amd/rx6900xt
 )
 set(_gen_dir "${CMAKE_BINARY_DIR}/generated")
 set(_gen "${_gen_dir}/vgpu/embedded_profiles.hpp")
@@ -126,6 +127,7 @@ add_library(vgpu STATIC
   amd/src/codeobject.cpp
   amd/src/gcn_decode.cpp
   amd/src/rdna_decode.cpp
+  amd/src/debugger.cpp
   amd/src/gcn_exec.cpp
   amd/src/hostcall.cpp
   src/core/machine.cpp
@@ -192,6 +194,13 @@ add_custom_command(TARGET vgpuhip POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so.1"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamdhip64.so.6.4" "${CMAKE_BINARY_DIR}/shim/libhsa-runtime64.so"
   COMMENT "Creating HIP shim symlinks (build/shim/libamdhip64.so.6 and .so.7, libhsa-runtime64.so.1)")
+# rocminfo for a machine without ROCm (amd/src/rocminfo.cpp): the HSA system
+# and its agents, from the HSA runtime above. A session runs it as rocminfo
+# where the host has no ROCm rocminfo of its own.
+add_executable(vgpu_rocminfo amd/src/rocminfo.cpp)
+target_link_libraries(vgpu_rocminfo PRIVATE vgpuhip)
+target_include_directories(vgpu_rocminfo PRIVATE amd/include)
+set_target_properties(vgpu_rocminfo PROPERTIES OUTPUT_NAME vgpu-rocminfo)
 # The code objects a library carries for one target (amd/tools/fatbin-extract.cpp).
 add_executable(amd_fatbin_extract amd/tools/fatbin-extract.cpp)
 target_link_libraries(amd_fatbin_extract PRIVATE vgpu ${CMAKE_DL_LIBS})
@@ -214,6 +223,19 @@ add_custom_command(TARGET vgpurocprof POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocprofiler-sdk.so.1.0.0" "${CMAKE_BINARY_DIR}/shim/librocprofiler-sdk.so"
   COMMENT "Creating rocprofiler-sdk shim symlinks (build/shim/librocprofiler-sdk.so.1)")
 
+# librocm_smi64: what RCCL asks ROCm SMI about the GPUs it connects (their
+# count, PCI addresses and links), answered from the HIP shim, so RCCL starts
+# on simulated GPUs on a machine with no AMD kernel driver.
+add_library(vgpursmi SHARED amd/src/rocm_smi.cpp)
+target_link_libraries(vgpursmi PRIVATE vgpuhip)
+target_include_directories(vgpursmi PRIVATE amd/include)
+set_target_properties(vgpursmi PROPERTIES OUTPUT_NAME rocm_smi64 SOVERSION 7 VERSION 7.8.0
+  CXX_VISIBILITY_PRESET hidden)
+add_custom_command(TARGET vgpursmi POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocm_smi64.so.7.8.0" "${CMAKE_BINARY_DIR}/shim/librocm_smi64.so.7"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocm_smi64.so.7.8.0" "${CMAKE_BINARY_DIR}/shim/librocm_smi64.so"
+  COMMENT "Creating ROCm SMI shim symlinks (build/shim/librocm_smi64.so.7)")
 # ---------------------------------------------------------------------------
 # libvgpucudart: the CUDA *runtime* API shim. Lets unmodified nvcc-compiled
 # applications (built against shared cudart) run on VirtualGPU. Requires the
@@ -429,7 +451,14 @@ if(CUDA_ABI_INCLUDE)
       set(_extra_src "nvidia/src/generated/${_lower}_stubs.cpp")
     endif()
     add_library(vgpu${_lower} SHARED nvidia/src/${_src}.cpp ${_extra_src})
-    target_link_libraries(vgpu${_lower} PRIVATE vgpu vgpucudart)
+    if(_lower STREQUAL "nvrtc")
+      # A compiler, and nothing else: it touches no device, so it carries no
+      # simulator and no runtime, as NVIDIA's has none. Linking libcudart here
+      # put a second simulator into every driver-API program that uses NVRTC.
+      target_link_libraries(vgpu${_lower} PRIVATE ${CMAKE_DL_LIBS})
+    else()
+      target_link_libraries(vgpu${_lower} PRIVATE vgpu vgpucudart)
+    endif()
     target_include_directories(vgpu${_lower} PRIVATE ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpu${_lower} PROPERTIES
       OUTPUT_NAME ${_lib} SOVERSION ${_ver} VERSION ${_ver}.0)
@@ -557,8 +586,8 @@ else()
 endif()
 
 # CLI
-add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/test.cpp src/cli/ncu.cpp
-               src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp)
+add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/debug.cpp src/cli/test.cpp src/cli/ncu.cpp
+               src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp src/cli/lspci.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
 # Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /
@@ -675,6 +704,9 @@ vgpu_unit_test(test_amd_gcn_narrow amd/tests/unit/test_gcn_narrow.cpp)
 target_compile_definitions(test_amd_gcn_narrow PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 vgpu_unit_test(test_amd_gcn_lds amd/tests/unit/test_gcn_lds.cpp)
+
+# Each AMD profile's chip facts are its own (amd/include/vgpu/amd_chip.hpp).
+vgpu_unit_test(test_amd_chip amd/tests/unit/test_amd_chip.cpp)
 target_compile_definitions(test_amd_gcn_lds PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # The same kernels built for gfx1100 (RDNA3, wave32), through the same
@@ -687,6 +719,10 @@ foreach(_t ops math memory globals grid bytes int64 atomics mixed half calls pac
   # work-group ids in trap registers, scalar floats.
   add_test(NAME test_amd_gcn_${_t}_gfx1201 COMMAND test_amd_gcn_${_t})
   set_tests_properties(test_amd_gcn_${_t}_gfx1201 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1201")
+  # And for gfx1030 (RDNA2): gfx10's encodings, SDWA, M0 and null the other
+  # way round, and a register per work-item id.
+  add_test(NAME test_amd_gcn_${_t}_gfx1030 COMMAND test_amd_gcn_${_t})
+  set_tests_properties(test_amd_gcn_${_t}_gfx1030 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1030")
 endforeach()
 
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
@@ -706,6 +742,14 @@ target_include_directories(test_amd_rocprofiler PRIVATE tests/framework amd/incl
 target_compile_definitions(test_amd_rocprofiler PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME test_amd_rocprofiler COMMAND test_amd_rocprofiler)
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
+# ROCm SMI's answers to RCCL, from RCCL's side, on Instinct and Radeon GPUs.
+add_executable(test_amd_rocm_smi amd/tests/unit/test_rocm_smi.cpp)
+target_link_libraries(test_amd_rocm_smi PRIVATE vgpursmi vgpuhip)
+target_include_directories(test_amd_rocm_smi PRIVATE tests/framework)
+add_test(NAME test_amd_rocm_smi COMMAND test_amd_rocm_smi)
+set_tests_properties(test_amd_rocm_smi PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
+add_test(NAME test_amd_rocm_smi_radeon COMMAND test_amd_rocm_smi)
+set_tests_properties(test_amd_rocm_smi_radeon PROPERTIES ENVIRONMENT "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
 add_test(NAME amd_rocprofiler_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofiler_abi.sh)
 add_test(NAME amd_rocprofv3 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofv3.sh)
 set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
@@ -811,6 +855,10 @@ set_tests_properties(amd_hipsparselt PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_hipsparselt_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipsparselt.sh amd/mi350x)
 set_tests_properties(amd_hipsparselt_mi350x PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# The kernel debugger (vgpu debug), driven by a file of commands.
+add_test(NAME amd_debugger COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_debugger.sh)
+set_tests_properties(amd_debugger PROPERTIES DEPENDS "vgpu_cli;vgpuhip"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 # And on an RDNA3 consumer card (gfx1100, wave32 and wave64 kernels, WMMA).
 add_test(NAME amd_pytorch_rx7900xtx COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/rx7900xtx)
 set_tests_properties(amd_pytorch_rx7900xtx PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
@@ -820,11 +868,37 @@ set_tests_properties(amd_pytorch_rx7900xtx PROPERTIES DEPENDS vgpuhip RUN_SERIAL
 add_test(NAME amd_pytorch_rx9070xt COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/rx9070xt)
 set_tests_properties(amd_pytorch_rx9070xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# And on an RDNA2 consumer card (gfx1030: gfx10's encodings, no matrix
+# instructions, fp8 refused).
+add_test(NAME amd_pytorch_rx6900xt COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/rx6900xt)
+set_tests_properties(amd_pytorch_rx6900xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # torch.compile's Triton kernels, and one written by hand, compiled and loaded
 # at run time.
 add_test(NAME amd_pytorch_compile COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 3 1)
 set_tests_properties(amd_pytorch_compile PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# Whole models (amd/tests/pytorch/models.py): a GPT trained with a schedule and
+# generating with a KV cache, a ResNet, an LSTM, a U-Net, a vision transformer,
+# mixture of experts, a recommender, mixed precision, activation checkpointing
+# and a checkpoint read back on the host; on gfx942 and on gfx950.
+add_test(NAME amd_pytorch_models COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh models.py 12 1)
+set_tests_properties(amd_pytorch_models PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+add_test(NAME amd_pytorch_models_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh models.py 12 1 amd/mi350x)
+set_tests_properties(amd_pytorch_models_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+# And on the other simulated AMD GPUs: gfx90a (CDNA2), and the Radeon cards,
+# whose RDNA3 and RDNA4 run wave32 and their own matrix instructions (WMMA).
+add_test(NAME amd_pytorch_models_mi250x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh models.py 12 1 amd/mi250x)
+set_tests_properties(amd_pytorch_models_mi250x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+add_test(NAME amd_pytorch_models_rx7900xtx COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh models.py 12 1 amd/rx7900xtx)
+set_tests_properties(amd_pytorch_models_rx7900xtx PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+add_test(NAME amd_pytorch_models_rx9070xt COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh models.py 12 1 amd/rx9070xt)
+set_tests_properties(amd_pytorch_models_rx9070xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
 # Composable Kernel's GEMMs, which PyTorch runs when told to prefer CK.
 add_test(NAME amd_pytorch_ck COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh ck.py 3 1)
 set_tests_properties(amd_pytorch_ck PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
@@ -838,6 +912,11 @@ set_tests_properties(amd_pytorch_distributed PROPERTIES DEPENDS vgpuhip RUN_SERI
 add_test(NAME amd_pytorch_multi_gpu COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh multi_gpu.py 9 2)
 set_tests_properties(amd_pytorch_multi_gpu PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# lspci and rocminfo on a simulated AMD machine, against the real tools where
+# the host has them.
+add_test(NAME amd_tools COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_amd_tools.sh)
+set_tests_properties(amd_tools PROPERTIES DEPENDS "vgpu_cli;vgpu_rocminfo;vgpuhip"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 # An HSA program: agents, pools, executables and AQL queues (amd/tests/hsa).
 add_test(NAME amd_hsa COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hsa.sh)
 set_tests_properties(amd_hsa PROPERTIES DEPENDS vgpuhip
@@ -1032,6 +1111,21 @@ if(TARGET vgpucublas)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
+
+  # The library paths PyTorch takes, called directly and checked against a
+  # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
+  # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
+  # cuBLAS's factorizations and batched solves (torch.linalg).
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "nvrtc_paths:nvrtc:cuda")
+    string(REPLACE ":" ";" _parts "${_check}")
+    list(POP_FRONT _parts _name)
+    add_test(NAME e2e_${_name}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh ${_name} ${_parts})
+    set_tests_properties(e2e_${_name} PROPERTIES
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endforeach()
 
   add_test(NAME e2e_rdc_link
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_rdc_link.sh)

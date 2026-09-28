@@ -45,10 +45,14 @@ bool amd_backed(const std::string& k, const Context& c, uint32_t* out) {
   const uint32_t device = d.pci_device_id >> 16;
   // Instinct cards are processing accelerators, a single function, and a
   // bound driver leaves memory and bus mastering on and INTx off for MSI.
-  if (k == "profile.revision") *out = 0x00;
+  // Radeon cards are VGA controllers, each board a revision of its chip: the
+  // RX 7900 XTX is Navi 31's c8 (the XT is cc), the RX 6900 XT and RX 9070 XT
+  // their chips' c0.
+  const bool radeon = std::strncmp(d.architecture, "rdna", 4) == 0;
+  if (k == "profile.revision") *out = !radeon ? 0x00 : device == 0x744c ? 0xc8 : 0xc0;
   else if (k == "profile.command") *out = 0x0406;
   else if (k == "profile.header_type") *out = 0x00;
-  else if (k == "profile.class") *out = 0x120000;
+  else if (k == "profile.class") *out = radeon ? 0x030000 : 0x120000;
   // NBIO: the device ID and revision strapped, with the function enabled; and
   // the memory partition modes it supports -- NPS1 and NPS4 on CDNA3 (GC
   // 9.4.3 and 9.4.4, which amdgpu assumes when the register is not read,

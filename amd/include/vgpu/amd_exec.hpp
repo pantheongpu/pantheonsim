@@ -12,6 +12,10 @@
 // runtime will sit on.
 #pragma once
 
+#include <iterator>
+
+#include "vgpu/amd_gcn.hpp"
+
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -94,6 +98,13 @@ struct InstructionCounts {
   uint64_t sendmsg = 0;
   uint64_t gds = 0;       // never issued: GDS is not modelled, and a kernel using it is refused
   uint64_t flat_read = 0, flat_write = 0, flat_atomic = 0;
+  // The vector instructions by operation and type (gcn::Mix), matrix work
+  // in 512-operation units by input type (gcn::MopsType), and vector memory
+  // instructions that read and that write (an atomic both writes and, where
+  // it returns, reads; it counts as a write).
+  uint64_t mix[static_cast<int>(gcn::Mix::Count)] = {};
+  uint64_t mops[static_cast<int>(gcn::MopsType::Count)] = {};
+  uint64_t vmem_rd = 0, vmem_wr = 0;
 };
 
 // What a dispatch did, which is what a launch reports and what the tests
@@ -117,6 +128,9 @@ struct DispatchStats {
     c.valu += a.valu, c.mfma += a.mfma, c.salu += a.salu, c.smem += a.smem, c.vmem += a.vmem;
     c.flat += a.flat, c.lds += a.lds, c.branch += a.branch, c.sendmsg += a.sendmsg, c.gds += a.gds;
     c.flat_read += a.flat_read, c.flat_write += a.flat_write, c.flat_atomic += a.flat_atomic;
+    for (size_t i = 0; i < std::size(c.mix); ++i) c.mix[i] += a.mix[i];
+    for (size_t i = 0; i < std::size(c.mops); ++i) c.mops[i] += a.mops[i];
+    c.vmem_rd += a.vmem_rd, c.vmem_wr += a.vmem_wr;
     waves_lt16 += o.waves_lt16, waves_lt32 += o.waves_lt32, waves_lt48 += o.waves_lt48;
     waves_lt64 += o.waves_lt64, waves_eq64 += o.waves_eq64;
   }

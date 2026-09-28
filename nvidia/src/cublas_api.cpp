@@ -469,6 +469,227 @@ VGPU_EXPORT cublasStatus_t cublasSgemmBatched(cublasHandle_t h, cublasOperation_
   return CUBLAS_STATUS_SUCCESS;
 }
 
+/* ---- batched LU: getrfBatched and getrsBatched ----
+   What torch.linalg.inv and batched solves call. Each matrix is factored in
+   double on the host (LAPACK's partial pivoting, 1-based pivots) and rounded
+   to the caller's type. getrsBatched's info is a host pointer, as cuBLAS
+   documents it; getrfBatched's is device memory, one per matrix. */
+
+namespace {
+
+// LU with partial pivoting of a column-major n x n matrix; 0 or the 1-based
+// index of the first zero pivot.
+int lu_factor(std::vector<double>& a, int n, int lda, std::vector<int>* ipiv) {
+  auto A = [&](int r, int c) -> double& { return a[(size_t)c * lda + r]; };
+  int info = 0;
+  if (ipiv) ipiv->assign(n, 0);
+  for (int j = 0; j < n; ++j) {
+    int p = j;
+    if (ipiv) {
+      for (int i = j + 1; i < n; ++i)
+        if (std::fabs(A(i, j)) > std::fabs(A(p, j))) p = i;
+      (*ipiv)[j] = p + 1;
+      if (p != j)
+        for (int c = 0; c < n; ++c) std::swap(A(j, c), A(p, c));
+    }
+    if (A(j, j) == 0.0) { if (!info) info = j + 1; continue; }
+    for (int i = j + 1; i < n; ++i) {
+      A(i, j) /= A(j, j);
+      for (int c = j + 1; c < n; ++c) A(i, c) -= A(i, j) * A(j, c);
+    }
+  }
+  return info;
+}
+
+// Solves op(A) X = B with A's LU factors and pivots, X over B.
+void lu_solve(const std::vector<double>& a, int n, int lda, const int* ipiv, bool trans, std::vector<double>& b,
+              int nrhs, int ldb) {
+  auto A = [&](int r, int c) { return a[(size_t)c * lda + r]; };
+  auto B = [&](int r, int c) -> double& { return b[(size_t)c * ldb + r]; };
+  for (int k = 0; k < nrhs; ++k) {
+    if (!trans) {
+      if (ipiv) for (int i = 0; i < n; ++i) if (ipiv[i] - 1 != i) std::swap(B(i, k), B(ipiv[i] - 1, k));
+      for (int i = 0; i < n; ++i) for (int j = 0; j < i; ++j) B(i, k) -= A(i, j) * B(j, k);      // L, unit
+      for (int i = n - 1; i >= 0; --i) {                                                          // U
+        for (int j = i + 1; j < n; ++j) B(i, k) -= A(i, j) * B(j, k);
+        B(i, k) /= A(i, i);
+      }
+    } else {
+      for (int i = 0; i < n; ++i) {                                                               // U^T
+        for (int j = 0; j < i; ++j) B(i, k) -= A(j, i) * B(j, k);
+        B(i, k) /= A(i, i);
+      }
+      for (int i = n - 1; i >= 0; --i) for (int j = i + 1; j < n; ++j) B(i, k) -= A(j, i) * B(j, k);  // L^T
+      if (ipiv) for (int i = n - 1; i >= 0; --i) if (ipiv[i] - 1 != i) std::swap(B(i, k), B(ipiv[i] - 1, k));
+    }
+  }
+}
+
+template <class T>
+cublasStatus_t getrf_batched(cublasHandle_t h, int n, T* const Aarray[], int lda, int* pivots, int* infos, int batch) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (n < 0 || lda < std::max(1, n) || batch < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (deferred_to_graph(h, [=] { getrf_batched<T>(h, n, Aarray, lda, pivots, infos, batch); }))
+    return CUBLAS_STATUS_SUCCESS;
+  const auto ptrs = fetch<T*>(Aarray, (size_t)batch);
+  std::vector<int> all_info(batch, 0);
+  for (int b = 0; b < batch; ++b) {
+    const auto hv = fetch<T>(ptrs[b], (size_t)lda * n);
+    std::vector<double> a(hv.begin(), hv.end());
+    std::vector<int> ipiv;
+    all_info[b] = lu_factor(a, n, lda, pivots ? &ipiv : nullptr);
+    store(ptrs[b], std::vector<T>(a.begin(), a.end()));
+    if (pivots && n) cudaMemcpy(pivots + (size_t)b * n, ipiv.data(), n * sizeof(int), kH2D);
+  }
+  if (infos) store(infos, all_info);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+template <class T>
+cublasStatus_t getrs_batched(cublasHandle_t h, cublasOperation_t trans, int n, int nrhs, const T* const Aarray[],
+                             int lda, const int* pivots, T* const Barray[], int ldb, int* info, int batch) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (info) *info = 0;
+  if (n < 0 || nrhs < 0 || lda < std::max(1, n) || ldb < std::max(1, n) || batch < 0) {
+    if (info) *info = -1;
+    return CUBLAS_STATUS_INVALID_VALUE;
+  }
+  if (trans == CUBLAS_OP_C) return CUBLAS_STATUS_NOT_SUPPORTED;  // real types: C is T
+  if (deferred_to_graph(h, [=] { int ignored; getrs_batched<T>(h, trans, n, nrhs, Aarray, lda, pivots, Barray, ldb, &ignored, batch); }))
+    return CUBLAS_STATUS_SUCCESS;
+  const auto pa = fetch<const T*>(Aarray, (size_t)batch);
+  const auto pb = fetch<T*>(Barray, (size_t)batch);
+  for (int b = 0; b < batch; ++b) {
+    const auto av = fetch<T>(pa[b], (size_t)lda * n);
+    const auto bv = fetch<T>(pb[b], (size_t)ldb * nrhs);
+    std::vector<double> a(av.begin(), av.end()), x(bv.begin(), bv.end());
+    std::vector<int> ipiv;
+    if (pivots) ipiv = fetch<int>(pivots + (size_t)b * n, (size_t)n);
+    lu_solve(a, n, lda, pivots ? ipiv.data() : nullptr, trans != CUBLAS_OP_N, x, nrhs, ldb);
+    store(pb[b], std::vector<T>(x.begin(), x.end()));
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasSgetrfBatched(cublasHandle_t h, int n, float* const A[], int lda, int* P, int* info,
+                                               int batch) {
+  return getrf_batched<float>(h, n, A, lda, P, info, batch);
+}
+VGPU_EXPORT cublasStatus_t cublasDgetrfBatched(cublasHandle_t h, int n, double* const A[], int lda, int* P, int* info,
+                                               int batch) {
+  return getrf_batched<double>(h, n, A, lda, P, info, batch);
+}
+VGPU_EXPORT cublasStatus_t cublasSgetrsBatched(cublasHandle_t h, cublasOperation_t t, int n, int nrhs,
+                                               const float* const A[], int lda, const int* P, float* const B[],
+                                               int ldb, int* info, int batch) {
+  return getrs_batched<float>(h, t, n, nrhs, A, lda, P, B, ldb, info, batch);
+}
+VGPU_EXPORT cublasStatus_t cublasDgetrsBatched(cublasHandle_t h, cublasOperation_t t, int n, int nrhs,
+                                               const double* const A[], int lda, const int* P, double* const B[],
+                                               int ldb, int* info, int batch) {
+  return getrs_batched<double>(h, t, n, nrhs, A, lda, P, B, ldb, info, batch);
+}
+
+/* ---- triangular solves: trsm and trsmBatched ----
+   op(A) X = alpha B (side left) or X op(A) = alpha B (side right), X over B.
+   What torch.linalg.solve_triangular and lstsq call. Only A's `uplo` triangle
+   is read, and with a unit diagonal not even its diagonal. */
+
+namespace {
+
+// Solves M x = x in place, M = A or A^T (`trans`) of the k x k triangle `lower`.
+void tri_solve(const std::vector<double>& a, int k, int lda, bool lower, bool trans, bool unit, double* x,
+               size_t step) {
+  auto M = [&](int i, int j) { return trans ? a[(size_t)i * lda + j] : a[(size_t)j * lda + i]; };
+  auto row = [&](int i, int from, int to) {
+    double s = x[(size_t)i * step];
+    for (int j = from; j < to; ++j) s -= M(i, j) * x[(size_t)j * step];
+    x[(size_t)i * step] = unit ? s : s / M(i, i);
+  };
+  if (lower != trans) for (int i = 0; i < k; ++i) row(i, 0, i);   // M is lower: forward
+  else for (int i = k - 1; i >= 0; --i) row(i, i + 1, k);          // M is upper: back
+}
+
+template <class T>
+cublasStatus_t trsm_one(cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans, cublasDiagType_t diag,
+                        int m, int n, T alpha, const T* A, int lda, T* B, int ldb) {
+  const int k = side == CUBLAS_SIDE_LEFT ? m : n;
+  const auto av = fetch<T>(A, (size_t)lda * k);
+  const auto bv = fetch<T>(B, (size_t)ldb * n);
+  const std::vector<double> a(av.begin(), av.end());
+  std::vector<double> b(bv.begin(), bv.end());
+  const bool lower = uplo == CUBLAS_FILL_MODE_LOWER, t = trans != CUBLAS_OP_N, unit = diag == CUBLAS_DIAG_UNIT;
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) b[(size_t)j * ldb + i] *= (double)alpha;
+  if (side == CUBLAS_SIDE_LEFT)  // each column of B: op(A) x = b
+    for (int j = 0; j < n; ++j) tri_solve(a, k, lda, lower, t, unit, &b[(size_t)j * ldb], 1);
+  else  // each row of B: x op(A) = b, which is op(A)^T x^T = b^T
+    for (int i = 0; i < m; ++i) tri_solve(a, k, lda, lower, !t, unit, &b[(size_t)i], (size_t)ldb);
+  store(B, std::vector<T>(b.begin(), b.end()));
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+template <class T>
+cublasStatus_t trsm_batched(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans,
+                            cublasDiagType_t diag, int m, int n, const T* alpha, const T* const Aarray[], int lda,
+                            T* const Barray[], int ldb, int batch) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  const int k = side == CUBLAS_SIDE_LEFT ? m : n;
+  if (m < 0 || n < 0 || batch < 0 || lda < std::max(1, k) || ldb < std::max(1, m)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (trans == CUBLAS_OP_C) trans = CUBLAS_OP_T;  // real types
+  const T al = scalar(h, alpha);
+  if (deferred_to_graph(h, [=] {
+        const auto pa = fetch<const T*>(Aarray, (size_t)batch);
+        const auto pb = fetch<T*>(Barray, (size_t)batch);
+        for (int b = 0; b < batch; ++b) trsm_one<T>(side, uplo, trans, diag, m, n, al, pa[b], lda, pb[b], ldb);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
+  const auto pa = fetch<const T*>(Aarray, (size_t)batch);
+  const auto pb = fetch<T*>(Barray, (size_t)batch);
+  for (int b = 0; b < batch; ++b) trsm_one<T>(side, uplo, trans, diag, m, n, al, pa[b], lda, pb[b], ldb);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+template <class T>
+cublasStatus_t trsm(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans,
+                    cublasDiagType_t diag, int m, int n, const T* alpha, const T* A, int lda, T* B, int ldb) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  const int k = side == CUBLAS_SIDE_LEFT ? m : n;
+  if (m < 0 || n < 0 || lda < std::max(1, k) || ldb < std::max(1, m)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (trans == CUBLAS_OP_C) trans = CUBLAS_OP_T;
+  const T al = scalar(h, alpha);
+  if (deferred_to_graph(h, [=] { trsm_one<T>(side, uplo, trans, diag, m, n, al, A, lda, B, ldb); }))
+    return CUBLAS_STATUS_SUCCESS;
+  return trsm_one<T>(side, uplo, trans, diag, m, n, al, A, lda, B, ldb);
+}
+
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasStrsm_v2(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo,
+                                          cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
+                                          const float* alpha, const float* A, int lda, float* B, int ldb) {
+  return trsm<float>(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb);
+}
+VGPU_EXPORT cublasStatus_t cublasDtrsm_v2(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo,
+                                          cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
+                                          const double* alpha, const double* A, int lda, double* B, int ldb) {
+  return trsm<double>(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb);
+}
+VGPU_EXPORT cublasStatus_t cublasStrsmBatched(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo,
+                                              cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
+                                              const float* alpha, const float* const A[], int lda,
+                                              float* const B[], int ldb, int batch) {
+  return trsm_batched<float>(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb, batch);
+}
+VGPU_EXPORT cublasStatus_t cublasDtrsmBatched(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo,
+                                              cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
+                                              const double* alpha, const double* const A[], int lda,
+                                              double* const B[], int ldb, int batch) {
+  return trsm_batched<double>(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb, batch);
+}
+
 // A workspace is a scratch buffer the library would use for its own tiling.
 // Nothing here needs one, so accepting it is honest: the caller's buffer simply
 // goes unused, and refusing would stop a program that is doing nothing wrong.

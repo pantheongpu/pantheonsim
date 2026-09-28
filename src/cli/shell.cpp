@@ -256,8 +256,12 @@ std::string dmesg_log(const Config& c, const vgpu::DeviceProfile& p) {
   for (int i = 0; i < c.count; ++i) {
     char bdf[32];
     std::snprintf(bdf, sizeof bdf, "0000:%02x:00.0", i + 1);
-    std::snprintf(buf, sizeof buf, "pci %s: [%04x:%04x] type 00 class 0x030200", bdf,
-                  p.telemetry.pci_vendor_id, p.telemetry.pci_device_id);
+    // The class the card's config space reports: an Instinct card is a
+    // processing accelerator, a Radeon a VGA controller, a data-center NVIDIA
+    // part a 3D controller.
+    const unsigned cls = !amd ? 0x030200u : p.architecture.rfind("rdna", 0) == 0 ? 0x030000u : 0x120000u;
+    std::snprintf(buf, sizeof buf, "pci %s: [%04x:%04x] type 00 class 0x%06x", bdf,
+                  p.telemetry.pci_vendor_id, p.telemetry.pci_device_id, cls);
     line(t += 0.001, buf);
     // No BAR assignment line: config space reports BAR0 as unassigned until
     // BARs are modelled, and a log claiming a mapping that config space denies
@@ -274,9 +278,9 @@ std::string dmesg_log(const Config& c, const vgpu::DeviceProfile& p) {
       line(t += 0.02, std::string("amdgpu ") + bdf + ": amdgpu: " +
                           std::to_string(p.vram_bytes / (1024 * 1024)) + "M of VRAM memory ready");
       line(t += 0.01, std::string("amdgpu ") + bdf + ": amdgpu: ASIC is " + p.model);
-      line(t += 0.01, "kfd kfd: amdgpu: added device " +
-                          std::to_string(p.telemetry.pci_vendor_id) + ":" +
-                          std::to_string(p.telemetry.pci_device_id));
+      char ids[16];
+      std::snprintf(ids, sizeof ids, "%04x:%04x", p.telemetry.pci_vendor_id, p.telemetry.pci_device_id);
+      line(t += 0.01, std::string("kfd kfd: amdgpu: added device ") + ids);
     }
     line(t += 0.10, "amdgpu: HMM registered " +
                         std::to_string(p.vram_bytes / (1024 * 1024)) + "MB device memory");
@@ -387,6 +391,17 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
         std::filesystem::create_symlink(files + b + "_err_count", dev + "/ras/" + std::string(b) + "_err_count", ec);
     }
     std::filesystem::create_symlink(dev, s.root + "/sys/bus/pci/devices/" + bdf, ec);
+    // The driver bound to it, as lspci -k and udev read it: amdgpu or nvidia,
+    // which lists its devices in turn.
+    const std::string driver = s.root + "/sys/bus/pci/drivers/" + (std::strcmp(ds.vendor, "amd") == 0 ? "amdgpu" : "nvidia");
+    make_dirs(driver);
+    // Relative, as the kernel makes it: pciutils resolves the link from the
+    // device's directory.
+    std::filesystem::create_symlink(std::filesystem::relative(driver, dev), dev + "/driver", ec);
+    std::filesystem::create_symlink(dev, driver + "/" + bdf, ec);
+    // Its interrupt, which lspci -v reads: none legacy, as for a device that
+    // uses MSI (its config space routes no INTx line either).
+    write_file(dev + "/irq", "0\n");
     // The bus it sits on, which libsensors and udev read to know it is PCI.
     std::filesystem::create_symlink(s.root + "/sys/bus/pci", dev + "/subsystem", ec);
     const std::string card = s.root + "/sys/class/drm/card" + std::to_string(i);
@@ -438,6 +453,28 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   tool("rocm-smi", "exec -a rocm-smi \"" + vgpu + "\" smi --rocm \"$@\"\n");
   tool("amd-smi", "exec -a amd-smi \"" + vgpu + "\" smi --amd \"$@\"\n");
   tool("rocm_agent_enumerator", "exec -a rocm_agent_enumerator \"" + vgpu + "\" smi --agents \"$@\"\n");
+  // rocminfo: ROCm's own where the host has it and it can run -- it reads the
+  // simulated agents through the session's HSA runtime, but first asks for
+  // the amdgpu kernel module (/sys/module/amdgpu/initstate) and stops without
+  // it, except under WSL (/dev/dxg) -- and otherwise VirtualGPU's, which
+  // prints the same from the same runtime (amd/src/rocminfo.cpp).
+  {
+    std::string real_rocminfo;
+    for (const std::string& d : rocm_bin_directories())
+      if (::access((d + "/rocminfo").c_str(), X_OK) == 0) {
+        real_rocminfo = d + "/rocminfo";
+        break;
+      }
+    if (real_rocminfo.empty()) real_rocminfo = find_program("rocminfo");
+    const std::string ours = shim.substr(0, shim.size() - 5) + "/vgpu-rocminfo";   // beside shim/
+    tool("rocminfo",
+         "# VirtualGPU session tool: the simulated HSA agents.\n"
+         "REAL='" + real_rocminfo + "'\n"
+         "if [ -x \"$REAL\" ] && { [ -e /sys/module/amdgpu/initstate ] || [ -e /dev/dxg ]; }; then\n"
+         "  exec \"$REAL\" \"$@\"\n"
+         "fi\n"
+         "exec -a rocminfo \"" + ours + "\" \"$@\"\n");
+  }
   tool("dmesg",
        "# Replays this session's synthetic kernel ring buffer.\n"
        "case \" $* \" in\n"
@@ -512,11 +549,27 @@ fi
 echo "hostname: no real hostname command to run: hostname $*" >&2
 exit 1
 )SH");
+  // Renders the simulated GPUs through the host's lspci, from their config
+  // space, with the host's PCI ID database plus the simulated cards it is
+  // too old to name. A host without pciutils -- a slim container image --
+  // gets vgpu's own lspci, which prints the same listing.
+  const std::string real_lspci = find_program("lspci");
+  const std::string pci_ids = s.dir + "/pci.ids";
   tool("lspci",
-       "# Renders the simulated GPUs through the real lspci, which resolves their\n"
-       "# names from the host pci.ids like any other device.\n"
-       "\"" + vgpu + "\" smi --lspci-dump > \"" + s.pci_dump + "\" 2>/dev/null\n"
-       "exec /usr/bin/lspci -F \"" + s.pci_dump + "\" \"$@\"\n");
+       "# VirtualGPU session tool: the simulated GPUs, as lspci lists them.\n"
+       "REAL='" + real_lspci + "'\n"
+       "if [ -x \"$REAL\" ]; then\n"
+       "  [ -s \"" + pci_ids + "\" ] || \"" + vgpu + "\" smi --lspci-ids \"" + pci_ids + "\" 2>/dev/null\n"
+       "  # Isolated, /sys/bus/pci is the session's: lspci reads it as on a real\n"
+       "  # machine, bound driver included. Otherwise it reads a config dump.\n"
+       "  first=$(ls /sys/bus/pci/devices 2>/dev/null | head -1)\n"
+       "  case \"$(readlink -f \"/sys/bus/pci/devices/$first\" 2>/dev/null)\" in\n"
+       "    '" + s.root + "'/*) exec \"$REAL\" -A linux-sysfs -i \"" + pci_ids + "\" \"$@\" ;;\n"
+       "  esac\n"
+       "  \"" + vgpu + "\" smi --lspci-dump > \"" + s.pci_dump + "\" 2>/dev/null\n"
+       "  exec \"$REAL\" -F \"" + s.pci_dump + "\" -i \"" + pci_ids + "\" \"$@\"\n"
+       "fi\n"
+       "exec -a lspci \"" + vgpu + "\" smi --lspci \"$@\"\n");
   // The session compiler: the real one with -cudart shared added.
   //
   // nvcc links the CUDA runtime statically by default, and a static cudart is
@@ -917,6 +970,7 @@ int cmd_shell(const std::vector<std::string>& args) {
   setenv("VGPU_VRAM_MB", std::to_string(profile.vram_bytes / (1024 * 1024)).c_str(), 1);
   setenv("VGPU_DRIVER_VERSION", c.driver.c_str(), 1);
   setenv("VGPU_CUDA_VERSION", c.cuda.c_str(), 1);
+  setenv("VGPU_ROCM_VERSION", c.rocm.c_str(), 1);   // amd-smi version reports it
   setenv("VGPU_SESSION", s.dir.c_str(), 1);
   // Hold the devices open for the whole session: this is what publishes
   // telemetry that nvidia-smi / rocm-smi read.

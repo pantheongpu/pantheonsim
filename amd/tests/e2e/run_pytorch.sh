@@ -28,8 +28,14 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/torch/lib"
 for e in "$package"/*; do [[ "$(basename "$e")" == lib ]] || ln -s "$e" "$tmp/torch/"; done
-for f in "$package"/lib/*; do [[ "$(basename "$f")" == libamdhip64.so ]] || ln -s "$f" "$tmp/torch/lib/"; done
+for f in "$package"/lib/*; do
+  case "$(basename "$f")" in libamdhip64.so|librocm_smi64.so) ;; *) ln -s "$f" "$tmp/torch/lib/" ;; esac
+done
 ln -s "$(readlink -f "$shim")" "$tmp/torch/lib/libamdhip64.so"
+# And ROCm SMI's library, which RCCL asks what links the GPUs: VirtualGPU's
+# answers from the HIP runtime, where AMD's would read a kernel driver there
+# is none of.
+ln -s "$(readlink -f "$build/shim/librocm_smi64.so")" "$tmp/torch/lib/librocm_smi64.so"
 
 # PyTorch on a simulated device can grow to many gigabytes of host memory,
 # and the machines this runs on are shared: the simulated device keeps at
@@ -44,11 +50,18 @@ fi
 # Triton's and Inductor's caches in the run's own directory, so each run
 # compiles what it runs.
 out=$(cd "$tmp" && TRITON_CACHE_DIR="$tmp/triton" TORCHINDUCTOR_CACHE_DIR="$tmp/inductor" \
-  VGPU_QUIET=1 VGPU_GPU="$gpu" VGPU_DEVICE_COUNT="$devices" VGPU_MEMORY_RAM_MB="${VGPU_MEMORY_RAM_MB:-4096}" \
+  VGPU_GPU="$gpu" VGPU_DEVICE_COUNT="$devices" VGPU_MEMORY_RAM_MB="${VGPU_MEMORY_RAM_MB:-4096}" \
   PYTHONPATH="$tmp" "${cap[@]}" "$python" "$root/amd/tests/pytorch/$script" 2>&1)
 status=$?
 echo "$out" | grep -E '^(ok|FAIL) ' | sed 's/^/      /'
 fail=0
+# The simulator's own errors are left on: a kernel the simulator could not run
+# (an instruction it lacks, a fault) is reported as "VirtualGPU error [...]",
+# and PyTorch may carry on past it with whatever was in the output buffer, so
+# a check can still print "ok". Any such line fails the test.
+if grep -q 'VirtualGPU error \[' <<< "$out"; then
+  echo "FAIL  the simulator ran every kernel it was given"; grep -m5 'VirtualGPU error \[' <<< "$out" | sed 's/^/      /'; fail=1
+fi
 [[ $status == 0 ]] || { echo "FAIL  the checks ran to the end (exit $status)"; echo "$out" | tail -5; fail=1; }
 passed=$(grep -c '^ok ' <<< "$out")
 if grep -q '^FAIL ' <<< "$out" || [[ $passed != "$expected" ]]; then

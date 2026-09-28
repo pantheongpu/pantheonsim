@@ -2,25 +2,37 @@
 //
 // NVRTC's job is to turn a string of CUDA C++ into PTX at run time. That is a
 // C++ compiler, and there is no honest way to fake one -- so this shim does not
-// try. It writes the program out and invokes `nvcc --ptx`, then hands back the
-// PTX and the compiler's diagnostics as the program log.
+// try. Where the toolkit's own libnvrtc is installed it compiles with that: it
+// is a host library that needs no GPU, and it compiles exactly as NVRTC does,
+// with NVRTC's builtin headers and nothing of the host's. Otherwise it writes
+// the program out and invokes `nvcc --ptx`. Either way the PTX and the
+// compiler's diagnostics come back as the program and its log.
+//
+// The two differ where it matters: nvcc pre-includes cuda_runtime.h, and with
+// it the host's <stdint.h> and <math.h>, so a program that defines int64_t or
+// INFINITY itself -- PyTorch's jiterator does both -- compiles under NVRTC and
+// fails under nvcc. VGPU_NVRTC=nvcc forces the nvcc path; VGPU_NVRTC_LIB names
+// the library to use.
 //
 // The toolkit is a host-side dependency and needs no GPU, so this works on the
-// same CPU-only box everything else here runs on. If nvcc is not on PATH the
-// call fails with a log saying exactly that, rather than a mystery
+// same CPU-only box everything else here runs on. If neither is found the call
+// fails with a log saying exactly that, rather than a mystery
 // NVRTC_ERROR_COMPILATION.
 //
 // This is what makes the JIT frameworks reachable: CuPy, Numba, Triton and
 // PyTorch's inductor all compile kernels through NVRTC and then load the PTX
 // through the driver API -- which VirtualGPU already interprets.
 //
-// Not implemented: CUBIN, LTO-IR and OptiX-IR output (all of which are SASS or
-// vendor bitcode, neither of which VirtualGPU can execute), precompiled
-// headers, and the time-trace files. Those return a clear status.
+// CUBIN for a real architecture comes back as the PTX, which is what
+// VirtualGPU's driver loads (see nvrtcGetCUBIN). Not implemented: LTO-IR and
+// OptiX-IR output (vendor bitcode, which VirtualGPU cannot execute),
+// precompiled headers, and the time-trace files. Those return a clear status.
 #include <nvrtc.h>
 
 #include <cuda.h>  // CUDA_VERSION: the toolkit this shim was built against
 
+#include <dlfcn.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -35,6 +47,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -50,6 +63,7 @@ struct Program {
   std::string ptx;
   std::string log;
   bool compiled = false;
+  bool real_arch = false;  // compiled for an sm_ target, so the caller will ask for CUBIN
 };
 
 std::mutex g_mu;
@@ -117,6 +131,166 @@ std::string shq(const std::string& s) {
 void remove_tree(const std::string& dir) {
   const int rc = std::system(("rm -rf " + shq(dir)).c_str());
   (void)rc;
+}
+
+// ---- the toolkit's NVRTC ----
+
+struct RealNvrtc {
+  void* lib = nullptr;
+  nvrtcResult (*create)(nvrtcProgram*, const char*, const char*, int, const char* const*,
+                        const char* const*) = nullptr;
+  nvrtcResult (*destroy)(nvrtcProgram*) = nullptr;
+  nvrtcResult (*add_name)(nvrtcProgram, const char*) = nullptr;
+  nvrtcResult (*compile)(nvrtcProgram, int, const char* const*) = nullptr;
+  nvrtcResult (*ptx_size)(nvrtcProgram, size_t*) = nullptr;
+  nvrtcResult (*ptx)(nvrtcProgram, char*) = nullptr;
+  nvrtcResult (*log_size)(nvrtcProgram, size_t*) = nullptr;
+  nvrtcResult (*log)(nvrtcProgram, char*) = nullptr;
+  nvrtcResult (*lowered)(nvrtcProgram, const char*, const char**) = nullptr;
+  std::string path;
+};
+
+std::string real_path(const std::string& p) {
+  char buf[PATH_MAX];
+  return ::realpath(p.c_str(), buf) ? std::string(buf) : std::string();
+}
+
+// The library this shim is, so the search below never finds itself.
+std::string own_path() {
+  Dl_info info{};
+  if (!dladdr(reinterpret_cast<void*>(&own_path), &info) || !info.dli_fname) return {};
+  return real_path(info.dli_fname);
+}
+
+// The candidates, most specific first: an explicit path, then the toolkit
+// that owns the nvcc on PATH, then the usual install locations. The major is
+// the one this shim was built for, since that is the ABI it presents.
+std::vector<std::string> real_nvrtc_candidates() {
+  const std::string so = "libnvrtc.so." + std::to_string(CUDA_VERSION / 1000);
+  std::vector<std::string> out;
+  if (const char* e = std::getenv("VGPU_NVRTC_LIB"); e && *e) out.push_back(e);
+  if (FILE* f = popen("command -v nvcc 2>/dev/null", "r")) {
+    char buf[PATH_MAX] = {0};
+    if (fgets(buf, sizeof buf, f)) {
+      std::string nvcc = real_path(std::string(buf).substr(0, std::strcspn(buf, "\n")));
+      const size_t slash = nvcc.find_last_of('/');
+      if (slash != std::string::npos) {
+        const std::string root = nvcc.substr(0, slash) + "/..";
+        out.push_back(root + "/lib64/" + so);
+        out.push_back(root + "/targets/x86_64-linux/lib/" + so);
+        out.push_back(root + "/targets/sbsa-linux/lib/" + so);
+      }
+    }
+    pclose(f);
+  }
+  for (const char* dir : {"/usr/local/cuda/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu"})
+    out.push_back(std::string(dir) + "/" + so);
+  return out;
+}
+
+const RealNvrtc* real_nvrtc() {
+  static const RealNvrtc* found = [] () -> const RealNvrtc* {
+    if (const char* m = std::getenv("VGPU_NVRTC"); m && std::strcmp(m, "nvcc") == 0) return nullptr;
+    const std::string self = own_path();
+    // RTLD_DEEPBIND keeps the real library's calls to its own nvrtc* entry
+    // points inside it, rather than resolving them to this shim's. A sanitizer
+    // runtime refuses the flag; there, the library's own internal binding has
+    // to do.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+    const int flags = RTLD_NOW | RTLD_LOCAL;
+#else
+    const int flags = RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND;
+#endif
+    for (const std::string& c : real_nvrtc_candidates()) {
+      const std::string rp = real_path(c);
+      if (rp.empty() || rp == self) continue;
+      void* lib = dlopen(rp.c_str(), flags);
+      if (!lib) continue;
+      auto* r = new RealNvrtc();
+      r->lib = lib;
+      r->path = rp;
+      bool ok = true;
+      auto sym = [&](auto& fn, const char* name) {
+        fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(dlsym(lib, name));
+        ok = ok && fn;
+      };
+      sym(r->create, "nvrtcCreateProgram");
+      sym(r->destroy, "nvrtcDestroyProgram");
+      sym(r->add_name, "nvrtcAddNameExpression");
+      sym(r->compile, "nvrtcCompileProgram");
+      sym(r->ptx_size, "nvrtcGetPTXSize");
+      sym(r->ptx, "nvrtcGetPTX");
+      sym(r->log_size, "nvrtcGetProgramLogSize");
+      sym(r->log, "nvrtcGetProgramLog");
+      sym(r->lowered, "nvrtcGetLoweredName");
+      if (ok) {
+        if (trace()) std::fprintf(stderr, "[vgpu] nvrtc: compiling with %s\n", rp.c_str());
+        return r;
+      }
+      delete r;
+      dlclose(lib);
+    }
+    return nullptr;
+  }();
+  return found;
+}
+
+// A real architecture becomes its virtual one: VirtualGPU runs PTX, and NVRTC
+// emits PTX only for a compute_ target. The link-time-optimisation flags would
+// ask for LTO-IR in its place, so they go.
+bool real_option(const std::string& opt, std::vector<std::string>* out) {
+  auto starts = [&](const char* p) { return opt.rfind(p, 0) == 0; };
+  if (starts("--gpu-architecture=") || starts("-arch=")) {
+    std::string arch = opt.substr(opt.find('=') + 1);
+    if (arch.rfind("sm_", 0) == 0) arch = "compute_" + arch.substr(3);
+    out->push_back("--gpu-architecture=" + arch);
+    return true;
+  }
+  if (starts("-dlto") || starts("--dlink-time-opt")) return true;
+  out->push_back(opt);
+  return true;
+}
+
+nvrtcResult compile_real(const RealNvrtc& r, Program* p, int num_options, const char* const* options) {
+  std::vector<std::string> opts;
+  for (int i = 0; i < num_options; ++i) {
+    if (!options || !options[i]) return NVRTC_ERROR_INVALID_INPUT;
+    real_option(options[i], &opts);
+  }
+  std::vector<const char*> argv, names, contents;
+  for (const auto& o : opts) argv.push_back(o.c_str());
+  for (const auto& [inc, text] : p->headers) {
+    names.push_back(inc.c_str());
+    contents.push_back(text.c_str());
+  }
+  nvrtcProgram prog = nullptr;
+  nvrtcResult rc = r.create(&prog, p->source.c_str(), p->name.c_str(), (int)names.size(),
+                            contents.data(), names.data());
+  if (rc != NVRTC_SUCCESS) return rc;
+  struct Destroy {
+    const RealNvrtc& r;
+    nvrtcProgram& prog;
+    ~Destroy() { r.destroy(&prog); }
+  } destroy{r, prog};
+  for (const auto& e : p->name_expressions)
+    if ((rc = r.add_name(prog, e.c_str())) != NVRTC_SUCCESS) return rc;
+  rc = r.compile(prog, (int)argv.size(), argv.data());
+  size_t n = 0;
+  if (r.log_size(prog, &n) == NVRTC_SUCCESS && n > 1) {
+    std::string log(n, '\0');
+    if (r.log(prog, log.data()) == NVRTC_SUCCESS) p->log += log.substr(0, n - 1);
+  }
+  if (rc != NVRTC_SUCCESS) return rc;
+  if ((rc = r.ptx_size(prog, &n)) != NVRTC_SUCCESS) return rc;
+  std::string ptx(n, '\0');
+  if ((rc = r.ptx(prog, ptx.data())) != NVRTC_SUCCESS) return rc;
+  p->ptx = ptx.substr(0, n ? n - 1 : 0);
+  for (const auto& e : p->name_expressions) {
+    const char* low = nullptr;
+    if (r.lowered(prog, e.c_str(), &low) != NVRTC_SUCCESS || !low) return NVRTC_ERROR_NAME_EXPRESSION_NOT_VALID;
+    p->lowered.push_back(low);
+  }
+  return NVRTC_SUCCESS;
 }
 
 // Translate the NVRTC option spelling to the nvcc one. Most options are the
@@ -268,6 +442,15 @@ VGPU_EXPORT nvrtcResult nvrtcCompileProgram(nvrtcProgram prog, int num_options,
   p->ptx.clear();
   p->lowered.clear();
   p->compiled = true;   // "compilation was attempted", which is what the API means
+  p->real_arch = false;
+  for (int i = 0; i < num_options; ++i) {
+    const std::string o = options && options[i] ? options[i] : "";
+    const size_t eq = o.find('=');
+    if ((o.rfind("--gpu-architecture=", 0) == 0 || o.rfind("-arch=", 0) == 0) && o.compare(eq + 1, 3, "sm_") == 0)
+      p->real_arch = true;
+  }
+
+  if (const RealNvrtc* r = real_nvrtc()) return compile_real(*r, p, num_options, options);
 
   if (!have_nvcc()) {
     p->log =
@@ -425,12 +608,26 @@ static nvrtcResult unsupported_output(const char* what) {
                what);
   return NVRTC_ERROR_INVALID_PROGRAM;
 }
+// For a real architecture (-arch=sm_XX) the "CUBIN" is the PTX, NUL included.
+// A caller hands CUBIN to cuModuleLoadData, and VirtualGPU's driver loads PTX
+// from there as it loads it from anywhere; PyTorch's jiterator compiles for
+// the device's sm_ and loads what it gets. For a virtual architecture the size
+// is zero, as documented.
 VGPU_EXPORT nvrtcResult nvrtcGetCUBINSize(nvrtcProgram prog, size_t* size) {
-  if (!get(prog)) return NVRTC_ERROR_INVALID_PROGRAM;
-  if (size) *size = 0;   // documented: zero when -arch names a virtual architecture
+  Program* p = get(prog);
+  if (!p) return NVRTC_ERROR_INVALID_PROGRAM;
+  if (!size) return NVRTC_ERROR_INVALID_INPUT;
+  *size = p->real_arch && !p->ptx.empty() ? p->ptx.size() + 1 : 0;
   return NVRTC_SUCCESS;
 }
-VGPU_EXPORT nvrtcResult nvrtcGetCUBIN(nvrtcProgram, char*) { return unsupported_output("CUBIN"); }
+VGPU_EXPORT nvrtcResult nvrtcGetCUBIN(nvrtcProgram prog, char* out) {
+  Program* p = get(prog);
+  if (!p) return NVRTC_ERROR_INVALID_PROGRAM;
+  if (!p->real_arch || p->ptx.empty()) return unsupported_output("CUBIN");
+  if (!out) return NVRTC_ERROR_INVALID_INPUT;
+  std::memcpy(out, p->ptx.c_str(), p->ptx.size() + 1);
+  return NVRTC_SUCCESS;
+}
 VGPU_EXPORT nvrtcResult nvrtcGetLTOIRSize(nvrtcProgram prog, size_t* size) {
   if (!get(prog)) return NVRTC_ERROR_INVALID_PROGRAM;
   if (size) *size = 0;

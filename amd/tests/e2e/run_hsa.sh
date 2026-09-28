@@ -69,7 +69,15 @@ if [[ -z "$rocminfo" ]]; then
     [[ -x "$f" ]] && { rocminfo=$f; break; }
   done
 fi
-if [[ -n "$rocminfo" && -z "${sanitize[*]}" ]]; then
+# ROCm's rocminfo asks the kernel first: without the amdgpu module loaded
+# (/sys/module/amdgpu/initstate) it says "ROCk module is NOT loaded" and stops
+# before it calls HSA at all -- except under WSL (/dev/dxg), where there is no
+# module to ask. So on a Linux machine with no AMD GPU it tests the host, not
+# the simulator, and is not run (vgpu-rocminfo prints the same in its place;
+# amd_tools compares the two where both run).
+if [[ -n "$rocminfo" && ! -e /sys/module/amdgpu/initstate && ! -e /dev/dxg ]]; then
+  echo "skip  ROCm's rocminfo: no amdgpu kernel module here, which it asks for before HSA"
+elif [[ -n "$rocminfo" && -z "${sanitize[*]}" ]]; then
   info=$(VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$(cd "$shim" && pwd)" timeout 120 "$rocminfo" 2>&1)
   status=$?
   gpus=$(grep -c '^  Name: *gfx942 *$' <<< "$info")

@@ -171,6 +171,12 @@ VTEST(every_gfx1201_instruction_shape_decodes_as_llvm_prints_it) {
   check_corpus("isa_corpus_gfx1201.txt", amd::gcn::Target::Gfx1200);
 }
 
+// And gfx1030 (RDNA2): gfx9's names, gfx10's memory bits, M0 and null the
+// other way round from gfx11, and SDWA.
+VTEST(every_gfx1030_instruction_shape_decodes_as_llvm_prints_it) {
+  check_corpus("isa_corpus_gfx1030.txt", amd::gcn::Target::Gfx1030);
+}
+
 // The cache every launch of a module shares: an instruction is decoded once,
 // however many threads reach it at the same moment, and all of them get the
 // same copy; a word past the end of the code is not cached.

@@ -32,13 +32,13 @@ which is the honest meaning of "the same image".
 | CUDA driver | `libcuda.so.1` | contexts, modules, memory, launches |
 | CUDA runtime | `libcudart.so.13` | the nvcc registration ABI, streams, events |
 | NVML | `libnvidia-ml.so.1` | discovery and telemetry (`pynvml`, nvitop) |
-| cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8), GEMV, level‑1 |
-| cuBLASLt | `libcublasLt.so.13` | descriptor matmul with ReLU/bias/GELU epilogues |
+| cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8), GEMV, level‑1, batched LU (`getrfBatched`/`getrsBatched`) |
+| cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8, strided batches, row-major layouts, ReLU/bias/GELU epilogues, FP8 tensor-wise and row-wise scales with amax |
 | cuDNN | `libcudnn.so.9` | convolution, activation, pooling, softmax, batchnorm |
-| cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched |
+| cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation |
-| cuSPARSE | `libcusparse.so.12` | CSR/COO SpMV and SpMM, format conversion, CSR to CSC |
-| cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR, symmetric eigen, SVD |
+| cuSPARSE | `libcusparse.so.12` | CSR/CSC/COO SpMV, SpMM (strided batches, fp16/bf16), SpGEMM, SDDMM, SpSV/SpSM, format conversion, CSR to CSC; legacy coo2csr, sorts and csrgeam2 |
+| cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR, symmetric eigen, SVD; the 64-bit X API, Jacobi (gesvdj, syevj) and batched forms, gesvdaStridedBatched |
 | NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
 | NPP | `libnppc.so.13` and ten siblings | image and signal primitives |
@@ -97,6 +97,29 @@ Some of those numbers came out of the hardware rather than the documentation.
 cuDNN rejects `CUDNN_ACTIVATION_IDENTITY` from `cudnnActivationForward`, and
 cuRAND does *not* rewind its stream when the seed is set again. Both were found
 by differential testing and are matched deliberately.
+
+## Checked in CI without hardware
+
+The paths PyTorch takes through these libraries are also covered by
+self-checking programs in `nvidia/tests/e2e/`, which compare each result with a
+host reference (a direct DFT, a dense product, a residual or reconstruction)
+and so run on every pull request with no GPU. `run_lib_check.sh` builds and
+runs them; each is a ctest of its own.
+
+| test | covers | torch |
+| --- | --- | --- |
+| `e2e_fft_layouts` | cufftXt plans, strided and padded layouts of every rank, 2‑D/3‑D C2R, half | `torch.fft` |
+| `e2e_solver_paths` | cuSOLVER X API, gesvdj/syevj and their batched forms, gesvdaStridedBatched, batched potrf/potrs; cuBLAS batched LU | `torch.linalg` |
+| `e2e_sparse_paths` | coo2csr and the sorts, batched and half SpMM, SpGEMM, csrgeam2, SDDMM, SpSV/SpSM | `torch.sparse` |
+| `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
+
+The programs were also run against NVIDIA's own libraries on an RTX 3060, so
+what they assert is what the real libraries do, not only what these do. Two
+things that run turned up: cuSPARSE 13.0's batched CSR SpMM uses the first
+matrix's row offsets for every member (13.2 follows the stride, as documented
+and as this does), and NVIDIA's SDDMM refuses a NULL buffer even when it asked
+for none. The FP8 matmuls need an sm_89 card to compare against; their output
+encoding is checked against `cuda_fp8.h`'s conversion, bit for bit.
 
 The same suite runs on a rented multi-GPU machine through
 `nvidia/tools/verify-multigpu-cloud.sh`, which builds VirtualGPU there and compares
@@ -217,15 +240,16 @@ Unimplemented entry points return the library's own "not supported" status
 rather than a plausible wrong answer, so a caller's fallback path still works.
 
 - **cuBLAS**: complex types, triangular solves, most of level‑2/3, and the
-  pointer-array batched forms (`cublasSgemmBatched` and friends).
+  pointer-array batched GEMMs (`cublasSgemmBatched` and friends).
+- **cuBLASLt**: the backward epilogues (`BGRADA`/`BGRADB`, `DRELU`, `DGELU`),
+  auxiliary outputs, and the block-scaled FP8/FP4 modes.
 - **cuDNN**: the graph/backend API of cuDNN 8+, non-NCHW layouts, non-float
   types, and every backward pass.
-- **cuFFT**: multi-dimensional advanced layouts, padded embeds, callbacks,
-  cuFFTXt multi-GPU.
-- **cuSPARSE**: SpGEMM, SpSV/SpSM, the legacy `cusparse<t>csrmv` family
-  (removed by NVIDIA in CUDA 12), blocked formats.
+- **cuFFT**: callbacks, cuFFTXt's multi-GPU descriptors.
+- **cuSPARSE**: the legacy `cusparse<t>csrmv` family (removed by NVIDIA in
+  CUDA 12), the blocked (BSR) routines, complex values.
 - **cuSOLVER**: the sparse (`cusolverSp`) and multi-GPU (`cusolverMg`) modules,
-  the 64-bit generic API, the Jacobi and randomized variants.
+  the randomized variants.
 - **NCCL**: the network plugin interface, user-defined reduction operators,
   symmetric memory windows, non-blocking communicators.
 - **NVRTC**: CUBIN, LTO-IR and OptiX-IR output (SASS and vendor bitcode, neither
