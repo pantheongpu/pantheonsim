@@ -5503,7 +5503,9 @@ class Interpreter {
     v.height = d.height ? std::max(1u, d.height >> level) : 0;
     v.depth = d.depth ? std::max(1u, d.depth >> level) : 0;
     v.pitch_bytes = v.width * d.texel_bytes;
+    v.base += uint64_t{d.mip_slice} * tex_slice_bytes(v);
     v.mip_levels = 0;
+    v.mip_slice = 0;
     return v;
   }
 
@@ -5556,6 +5558,7 @@ class Interpreter {
         const uint64_t index = static_cast<uint32_t>(coord[0][lane]);
         const uint64_t layer = std::min<uint64_t>(index, d.layers - 1);
         v.base += layer * (cube ? 6 : 1) * tex_slice_bytes(d);
+        v.mip_slice += static_cast<uint32_t>(layer * (cube ? 6 : 1));
         v.layers = 0;
         if (op.geom == TexGeom::A1D) {
           true_1d = true;   // a layer of a 1D layered texture filters as 1D
@@ -5571,12 +5574,15 @@ class Interpreter {
         else if (ay >= ax) { face = y >= 0 ? 2 : 3; sc = x; tc = y >= 0 ? z : -z; ma = ay; }
         else { face = x >= 0 ? 0 : 1; sc = x >= 0 ? -z : z; tc = -y; ma = ax; }
         v.base += static_cast<uint64_t>(face) * tex_slice_bytes(d);
+        v.mip_slice += static_cast<uint32_t>(face);
         v.cubemap = false;
         v.normalized_coords = true;
-        // Point sampling clamps to the face whatever the address mode; linear
-        // filtering applies the mode inside the face -- wrap takes the texel
-        // from the face's far edge, border blends in zero (measured).
-        if (v.filter != TexFilter::Linear)
+        // Point sampling clamps to the face whatever the address mode --
+        // unless the cubemap is mipmapped, when it applies the mode like
+        // linear filtering does; linear filtering applies the mode inside the
+        // face -- wrap takes the texel from the face's far edge, border blends
+        // in the border colour (measured).
+        if (v.filter != TexFilter::Linear && !d.mip_levels)
           for (auto& a : v.address) a = TexAddress::Clamp;
         cf[0] = (sc / ma + 1.0f) * 0.5f;
         cf[1] = (tc / ma + 1.0f) * 0.5f;
@@ -5641,9 +5647,6 @@ class Interpreter {
             if (a == TexAddress::Wrap || a == TexAddress::Mirror) a = TexAddress::Clamp;
           v.normalized_coords = true;
         }
-        if (indexed || cube)
-          ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
-                   "mipmapped layered and cubemap textures are not implemented");
         const double lodv = lod ? (op.ctype.is_float() ? static_cast<double>(f32((*lod)[lane]))
                                                        : static_cast<double>(static_cast<int32_t>((*lod)[lane])))
                                 : 0.0;

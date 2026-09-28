@@ -5135,6 +5135,115 @@ VTEST(tex_mipmapped_coordinates_are_normalized_regardless) {
   }
 }
 
+// A mipmapped layered texture: every level has all the layers, each of that
+// level's size, so a layer is found afresh in whichever level the fetch
+// lands on.
+VTEST(tex_mipmapped_layered_reads_each_levels_own_layer) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.u32 %r1, 2;
+    mov.f32 %f5, 0f3F400000;
+    mov.f32 %f6, 0f3E800000;
+    mov.f32 %f7, 0f3F800000;
+    tex.level.a2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%r1, %f5, %f6, %f6}], %f7;
+    st.global.f32 [%rd3], %f1;
+    mov.f32 %f7, 0f00000000;
+    tex.level.a2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%r1, %f5, %f6, %f6}], %f7;
+    st.global.f32 [%rd3+4], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(8);
+  TextureDesc d;
+  d.width = 4;
+  d.height = 4;
+  d.layers = 3;
+  d.kind = ChannelKind::Float;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.pitch_bytes = 16;
+  d.normalized_coords = true;
+  d.mip_levels = 2;
+  d.mip_max = 256;
+  for (uint32_t l = 0; l < 2; ++l) {
+    const uint32_t w = 4 >> l;
+    d.level_base[l] = e.mem.alloc(w * w * 3 * 4);
+    std::vector<float> t(w * w * 3);
+    for (uint32_t i = 0; i < t.size(); ++i) t[i] = static_cast<float>(100 * l + 10 * (i / (w * w)) + i % (w * w));
+    e.mem.write(d.level_base[l], t.data(), t.size() * 4);
+  }
+  d.base = d.level_base[0];
+  TextureTable tex;
+  tex[0x95] = d;
+  LaunchConfig cfg;
+  cfg.textures = &tex;
+  exec::launch(m.entries[0], cfg, {arg_u64(0x95), arg_u64(out)}, e.mem, e.prof);
+  // (0.75, 0.25): level 1 (2x2) texel (1, 0); level 0 (4x4) texel (3, 1).
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), 121.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 4, 4)), 27.0f);
+}
+
+// Point sampling a cubemap clamps to the face whatever the address mode --
+// but a mipmapped cubemap applies the mode (measured on an RTX 3060: the
+// direction (1, -1.92, -1.92) lands on the -z face at t = 1.0, and wrap
+// reads row 0 where clamp reads the last row).
+VTEST(tex_mipmapped_cubemap_point_sampling_applies_the_address_mode) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .u64 out)
+{
+    .reg .f32 %f<10>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.f32 %f5, 0f3F800000;
+    mov.f32 %f6, 0fBFF5C290;
+    mov.f32 %f7, 0f00000000;
+    tex.level.cube.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6, %f6, %f6}], %f7;
+    st.global.f32 [%rd3], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(4);
+  TextureDesc d;
+  d.width = 8;
+  d.height = 8;
+  d.cubemap = true;
+  d.kind = ChannelKind::Float;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.pitch_bytes = 32;
+  d.normalized_coords = true;
+  d.mip_levels = 1;
+  d.level_base[0] = e.mem.alloc(8 * 8 * 6 * 4);
+  std::vector<float> t(8 * 8 * 6);
+  for (uint32_t i = 0; i < t.size(); ++i) t[i] = static_cast<float>(i);
+  e.mem.write(d.level_base[0], t.data(), t.size() * 4);
+  d.base = d.level_base[0];
+  // Face 5 (-z), s = (1/1.92 ... ) -> column 1; t = 1.0 -> row 0 wrapped, 7 clamped.
+  for (auto [mode, want] : {std::pair{TexAddress::Wrap, 5 * 64 + 0 * 8 + 1}, {TexAddress::Clamp, 5 * 64 + 7 * 8 + 1}}) {
+    TextureDesc v = d;
+    for (auto& a : v.address) a = mode;
+    TextureTable tex;
+    tex[0x96] = v;
+    LaunchConfig cfg;
+    cfg.textures = &tex;
+    exec::launch(m.entries[0], cfg, {arg_u64(0x96), arg_u64(out)}, e.mem, e.prof);
+    VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), static_cast<float>(want));
+  }
+}
+
 VTEST(a_texture_handle_used_as_a_surface_is_refused) {
   // The two have the same shape of handle and are not interchangeable.
   std::string ptx = std::string(kHeader) + R"(

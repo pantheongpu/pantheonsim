@@ -49,6 +49,10 @@ struct TextureDesc {
   // a level, truncated toward zero, as the hardware holds them (measured).
   uint32_t mip_levels = 0;   // 0 when not mipmapped
   uint64_t level_base[17] = {};
+  // Within one fetch of a mipmapped layered or cubemap texture: the slice
+  // (layer x faces + face) to read in whichever level it lands on. Every
+  // level of such a texture has all the slices, each of that level's size.
+  uint32_t mip_slice = 0;
   TexFilter mip_filter = TexFilter::Point;
   int32_t mip_bias = 0, mip_min = 0, mip_max = 0;
   uint32_t pitch_bytes = 0; // distance between rows; width*texel_bytes if dense

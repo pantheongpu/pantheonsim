@@ -1284,6 +1284,13 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_texture_mip_layers
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_mip_layers.sh)
+  set_tests_properties(e2e_texture_mip_layers PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_modern_dtypes
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_modern_dtypes.sh)
   set_tests_properties(e2e_modern_dtypes PROPERTIES

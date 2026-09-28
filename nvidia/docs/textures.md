@@ -125,7 +125,14 @@ was then measured, sample by sample, until every result matched:
   65 when negative), not `k/127`.
 - **Mipmapped textures** take normalized coordinates whether or not the
   descriptor asks for them; without `normalizedCoords`, wrap and mirror
-  still act as clamp.
+  still act as clamp. Layered and cubemap ones have every layer (and face)
+  in every level, each of that level's size. Point sampling a *mipmapped*
+  cubemap applies the address mode, where a plain cubemap clamps to the
+  face. One thing is not modelled: the card projects a cube direction by
+  multiplying by its approximate reciprocal, which for some magnitudes is an
+  ulp low, so a direction that ties two axes -- a face coordinate of exactly
+  1.0 -- can land inside the face on the card and on its edge here.
+  `e2e_texture_mip_layers` hashes 240 cases against the card.
 - **A half NaN** widens to float bit for bit, payload and all.
 
 ## Border colours
@@ -166,10 +173,12 @@ Each with its own message, rather than a plausible wrong number:
   approximate log2 and length units -- axis-aligned gradients land within
   1/256 of log2, others on no textbook formula -- which are not documented.
 - **Linear filtering of signed 8-bit normalized texels.** The result is a
-  function of the blended sum alone, but not one reproduced here.
-- Mipmapped layered and cubemap textures, and `tld4` on layered or cubemap
-  textures (the runtime refuses a gather array that is layered or a cubemap,
-  so there is nothing to measure them on).
+  function of the blended sum alone, but not one reproduced here. (A later
+  attempt with the texels' measured 16-bit forms, and with fixed-point
+  texels and the border colour's output rounding, peaked at 96.7% of 18,176
+  two-texel blends.)
+- `tld4` on layered or cubemap textures (the runtime refuses a gather array
+  that is layered or a cubemap, so there is nothing to measure them on).
 - Resource views, sRGB and anisotropic filtering.
 
 ## Surfaces out of range: .trap, .clamp and .zero
