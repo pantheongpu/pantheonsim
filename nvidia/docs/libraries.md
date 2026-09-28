@@ -83,6 +83,12 @@ output. Anything that differs is a bug in this implementation.
 | `nvjpeg_codec` | all 24 identical: header parsing exactly, pixels to within the IDCT's own tolerance |
 | `multi_gpu` | all 13 identical to two physical GPUs |
 
+Two of those suites, `cublas_level1` and `cusparse_ops`, also run in CI on
+every pull request: `e2e_library_goldens` compiles them against the simulator
+alone and compares the output with what the RTX 3060 printed
+(`nvidia/tests/conformance/golden/`), so a change that makes a routine disagree
+with the hardware fails on a runner with no GPU.
+
 The library majors in that table are the ones this machine has; the build
 reads each soname off the installed toolkit, so on a CUDA 12 host the same
 shims come out as `libcublas.so.12`, `libcufft.so.11` and so on.
