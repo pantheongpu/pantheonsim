@@ -118,6 +118,41 @@ int main() {
   CHECK("and none of them poisons the context", cudaMalloc(&probe, 16) == cudaSuccess, "unexpected");
   cudaGetLastError();
 
+  // Nothing to copy succeeds whatever the pointers and the kind say: an RTX
+  // 3060 returns cudaSuccess for every one of these, and CUTLASS copies empty
+  // tensors (null pointers) as device-to-device when a vector of them grows.
+  // The kind check refused them for a while, which failed CUTLASS's SM100
+  // ptr-array GEMM tests. A nonzero copy between null pointers still refuses.
+  {
+    cudaStream_t zs;
+    cudaStreamCreate(&zs);
+    const cudaError_t z[] = {
+        cudaMemcpy(nullptr, nullptr, 0, cudaMemcpyDeviceToDevice),
+        cudaMemcpy(nullptr, nullptr, 0, cudaMemcpyHostToDevice),
+        cudaMemcpy(nullptr, nullptr, 0, cudaMemcpyDeviceToHost),
+        cudaMemcpy(nullptr, nullptr, 0, cudaMemcpyDefault),
+        cudaMemcpy(&stack_int, d, 0, cudaMemcpyHostToDevice),  // the wrong kind, but nothing to copy
+        cudaMemcpyAsync(nullptr, nullptr, 0, cudaMemcpyDeviceToDevice, zs),
+        cudaMemcpy2D(nullptr, 64, nullptr, 64, 16, 0, cudaMemcpyDeviceToDevice),
+        cudaMemcpyPeer(nullptr, 1, nullptr, 0, 0),
+        cudaMemcpyToSymbol(table, nullptr, 0),
+        cudaMemcpyFromSymbol(nullptr, table, 0),
+        cudaMemset(nullptr, 0, 0),
+    };
+    int bad = -1;
+    for (int i = 0; i < (int)(sizeof z / sizeof z[0]); ++i)
+      if (z[i] != cudaSuccess && bad < 0) bad = i;
+    CHECK("zero-byte copies and memsets succeed, null pointers and all", bad < 0,
+          "call %d returned %d %s", bad, bad < 0 ? 0 : z[bad], cudaGetErrorName(bad < 0 ? cudaSuccess : z[bad]));
+    e = cudaMemcpy(nullptr, nullptr, 4, cudaMemcpyDeviceToDevice);
+    CHECK("a nonzero copy between null pointers -> invalid value", e == cudaErrorInvalidValue,
+          "got %d %s", e, cudaGetErrorName(e));
+    CHECK("and neither poisons the context", cudaStreamSynchronize(zs) == cudaSuccess &&
+          cudaDeviceSynchronize() == cudaSuccess, "unexpected");
+    cudaStreamDestroy(zs);
+    cudaGetLastError();
+  }
+
   // Synchronization reports failed work, not a refused call.
   cudaMalloc(&big, (size_t)1 << 50);
   e = cudaDeviceSynchronize();
