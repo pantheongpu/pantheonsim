@@ -5378,6 +5378,88 @@ VTEST(tex_mipmapped_cubemap_point_sampling_applies_the_address_mode) {
   }
 }
 
+// sRGB textures, measured on an RTX 3060: an 8-bit unsigned normalized
+// texel's colour channels (x, y and z of four, x of one or two) decode
+// through the texture unit's table, not the sRGB formula (code 1 is
+// 20/65536, 128 is 14144/65536); alpha and other formats are left alone. A
+// linear blend truncates each table value below the block exponent of the
+// largest (code 11 vanishes next to 184) and rounds to a half's precision;
+// a border colour is encoded to the nearest code and decoded like a texel.
+VTEST(tex_srgb_as_the_card_decodes_it) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .f32 x, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f5, [x];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.f32 %f6, 0f3F800000;
+    tex.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}];
+    st.global.v4.f32 [%rd3], {%f1, %f2, %f3, %f4};
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16), data = e.mem.alloc(64);
+  auto argf = [](float f) { std::vector<uint8_t> b(4); std::memcpy(b.data(), &f, 4); return b; };
+  auto run = [&](TextureDesc d, float x) {
+    d.base = data;
+    d.width = 2;
+    d.height = 2;
+    d.srgb = true;
+    TextureTable tex;
+    tex[0x97] = d;
+    LaunchConfig cfg;
+    cfg.textures = &tex;
+    exec::launch(m.entries[0], cfg, {arg_u64(0x97), argf(x), arg_u64(out)}, e.mem, e.prof);
+    std::array<uint32_t, 4> got{};
+    e.mem.read(out, got.data(), 16);
+    return got;
+  };
+  auto texels = [&](std::initializer_list<uint8_t> row) {   // two rows alike
+    std::vector<uint8_t> b(row);
+    b.insert(b.end(), row);
+    e.mem.write(data, b.data(), b.size());
+  };
+  TextureDesc u4;
+  u4.kind = ChannelKind::Unsigned;
+  u4.channels = 4;
+  for (auto& b : u4.channel_bits) b = 8;
+  u4.texel_bytes = 4;
+  u4.pitch_bytes = 8;
+  u4.read_as_normalized_float = true;
+  texels({128, 1, 255, 128, 128, 1, 255, 128});
+  VCHECK(run(u4, 0.5f) == (std::array<uint32_t, 4>{0x3e5d0000, 0x39a00000, 0x3f800000, 0x3f008081}));
+  TextureDesc u2 = u4;
+  u2.channels = 2;
+  u2.channel_bits[2] = u2.channel_bits[3] = 0;
+  u2.texel_bytes = 2;
+  u2.pitch_bytes = 4;
+  texels({128, 128, 128, 128});
+  VCHECK(run(u2, 0.5f) == (std::array<uint32_t, 4>{0x3e5d0000, 0x3f008081, 0, 0}));
+  TextureDesc s4 = u4;
+  s4.kind = ChannelKind::Signed;
+  texels({128, 128, 128, 128, 128, 128, 128, 128});
+  VCHECK(run(s4, 0.5f) == (std::array<uint32_t, 4>{0xbf800000, 0xbf800000, 0xbf800000, 0xbf800000}));
+  // Linear blends at x = 0.5 + a/256: weight a on the second texel.
+  TextureDesc lin = u4;
+  lin.filter = TexFilter::Linear;
+  texels({200, 11, 0, 0, 50, 184, 0, 0});
+  auto got = run(lin, 0.5f + 255 / 256.0f);
+  VCHECK_EQ(got[0], 0x3d08c000u);   // 0.03339, not the table values' exact blend, 0.03412: code 50 counts as 1/32 next to 200
+  got = run(lin, 0.5f + 1 / 256.0f);
+  VCHECK_EQ(got[1], 0x3af60000u);   // code 11 counts as 0 next to 184
+  // The border colour (0.6, 0.3333, 0.99, 0.01) outside the texture.
+  TextureDesc b = u4;
+  for (auto& a : b.address) a = TexAddress::Border;
+  const uint32_t bc[4] = {0x3f19999a, 0x3eaaa64c, 0x3f7d70a4, 0x3c23d70a};
+  std::memcpy(b.border_bits, bc, 16);
+  VCHECK(run(b, -1.0f) == (std::array<uint32_t, 4>{0x3f190000, 0x3eaa0000, 0x3f7e0000, 0x3c008081}));
+}
+
 VTEST(a_texture_handle_used_as_a_surface_is_refused) {
   // The two have the same shape of handle and are not interchangeable.
   std::string ptx = std::string(kHeader) + R"(

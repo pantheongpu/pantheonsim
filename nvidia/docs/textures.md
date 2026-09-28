@@ -135,6 +135,31 @@ was then measured, sample by sample, until every result matched:
   `e2e_texture_mip_layers` hashes 240 cases against the card.
 - **A half NaN** widens to float bit for bit, payload and all.
 
+## sRGB
+
+`cudaTextureDesc::sRGB` decodes an 8-bit unsigned normalized texture read as
+normalized float from sRGB to linear -- x, y and z of a four-channel texture,
+x of a one- or two-channel one. Alpha is left alone, and so is every other
+format (signed, 16-bit, integer-read, float). Measured on an RTX 3060:
+
+- **The decode is a table, not the sRGB formula.** Its 256 entries, in
+  1/65536ths, have at most 8 significant bits, and the low codes run at
+  20/65536 a step where `1/(255 * 12.92)` gives 19.9. The simulator carries
+  the measured table.
+- **A linear blend** blends the table values, but the table holds them in
+  blocks of eight codes sharing an exponent (that of the block's last
+  entry): within each 2x2 footprint every value is truncated to 2^(E - 7),
+  E the largest block exponent among the texels with weight, and the exact
+  sum is rounded once to a half's precision, ties away. So code 11 counts as
+  zero next to code 184, and code 50 as exactly 1/32 next to 200. Fitted to
+  134,316 two-texel blends, all matched.
+- **A border colour** is encoded to an sRGB code by the sRGB formula --
+  rounding a shade early, a fraction of 0.4989 already going up (7,100
+  colours) -- and decoded like a texel.
+
+`e2e_texture_srgb` hashes 228 cases (formats, point, linear, gather, 1D, 3D,
+layered, cubemap, mipmapped, border colours) against the card.
+
 ## Border colours
 
 With border addressing, a fetch outside the texture reads
@@ -179,7 +204,7 @@ Each with its own message, rather than a plausible wrong number:
   two-texel blends.)
 - `tld4` on layered or cubemap textures (the runtime refuses a gather array
   that is layered or a cubemap, so there is nothing to measure them on).
-- Resource views, sRGB and anisotropic filtering.
+- Resource views and anisotropic filtering.
 
 ## Surfaces out of range: .trap, .clamp and .zero
 

@@ -5235,6 +5235,17 @@ class Interpreter {
       return sign | (static_cast<uint32_t>(e + 14) << 10) | (static_cast<uint32_t>(std::floor(std::ldexp(fr, 11))) & 0x3FFu);
     }
     if (!d.read_as_normalized_float) return b & mask;
+    if (tex_srgb(d, ch)) {
+      // An sRGB channel's border colour is encoded to the nearest sRGB code
+      // -- by the sRGB formula, rounding a shade early: a fraction of 0.4989
+      // already rounds up (measured over 7,100 colours) -- and decoded
+      // through the table like a texel.
+      double x = static_cast<double>(f32(b));
+      if (std::isnan(x)) x = 0;
+      x = std::clamp(x, 0.0, 1.0);
+      const double e = x <= 0.0031308 ? x * 12.92 : 1.055 * std::pow(x, 1 / 2.4) - 0.055;
+      return static_cast<uint64_t>(std::clamp(std::floor(e * 255 + 0.50108), 0.0, 255.0));
+    }
     const bool sgn = d.kind == ChannelKind::Signed;
     const uint32_t m = bits - (sgn ? 1 : 0), fb = m + 4;
     double x = static_cast<double>(f32(b));
@@ -5244,6 +5255,42 @@ class Interpreter {
     const uint64_t mag = static_cast<uint64_t>(v < 0 ? -v : v);
     const int64_t k = static_cast<int64_t>((mag * ((1ull << m) - 1) + (1ull << (fb - 1)) - 1) >> fb);
     return static_cast<uint64_t>(v < 0 ? -k : k) & mask;
+  }
+
+  // sRGB decoding, as an RTX 3060's texture unit does it: through a table, not
+  // the sRGB formula -- its entries (in 1/65536ths, measured for every code)
+  // have at most 8 significant bits, and the low codes run at 20/65536 a
+  // step where 1/(255 * 12.92) would give 19.9. It applies to an 8-bit
+  // unsigned normalized texture read as normalized float: x, y and z of a
+  // four-channel texture, x of a one- or two-channel one; alpha, and every
+  // other format, are left alone.
+  static constexpr uint32_t kSrgbTable[256] = {
+      0, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200, 220,
+      240, 264, 288, 312, 340, 368, 396, 428, 460, 492, 524, 560,
+      600, 636, 676, 720, 760, 804, 852, 896, 944, 1000, 1048, 1104,
+      1160, 1216, 1272, 1328, 1392, 1456, 1520, 1584, 1648, 1720, 1792, 1864,
+      1936, 2016, 2096, 2176, 2256, 2336, 2416, 2496, 2592, 2688, 2768, 2864,
+      2960, 3056, 3152, 3264, 3360, 3456, 3584, 3680, 3776, 3904, 4000, 4128,
+      4256, 4352, 4480, 4608, 4736, 4864, 4992, 5120, 5248, 5408, 5536, 5664,
+      5824, 5952, 6112, 6240, 6400, 6560, 6688, 6848, 7008, 7168, 7328, 7488,
+      7680, 7808, 8000, 8192, 8320, 8512, 8704, 8896, 9088, 9280, 9472, 9664,
+      9856, 10048, 10240, 10432, 10624, 10816, 11008, 11264, 11456, 11648, 11904, 12096,
+      12288, 12544, 12736, 12992, 13184, 13440, 13696, 13888, 14144, 14400, 14656, 14848,
+      15104, 15360, 15616, 15872, 16128, 16384, 16640, 16896, 17152, 17408, 17664, 18048,
+      18304, 18560, 18816, 19072, 19456, 19712, 19968, 20224, 20608, 20864, 21120, 21504,
+      21760, 22144, 22400, 22784, 23040, 23296, 23680, 24064, 24320, 24704, 24960, 25344,
+      25600, 25984, 26368, 26752, 27008, 27392, 27776, 28032, 28416, 28800, 29184, 29568,
+      29952, 30336, 30720, 30976, 31488, 31744, 32256, 32512, 33024, 33280, 33792, 34048,
+      34560, 35072, 35328, 35840, 36096, 36608, 37120, 37376, 37888, 38400, 38656, 39168,
+      39680, 39936, 40448, 40960, 41216, 41728, 42240, 42752, 43264, 43520, 44032, 44544,
+      45056, 45568, 45824, 46336, 46848, 47360, 47872, 48384, 48896, 49408, 49920, 50432,
+      50944, 51456, 51968, 52480, 52992, 53504, 54016, 54528, 55040, 55552, 56064, 56576,
+      57088, 57600, 58112, 58624, 59392, 59904, 60416, 60928, 61440, 61952, 62464, 62976,
+      64000, 64512, 65024, 65536,
+  };
+  static bool tex_srgb(const TextureDesc& d, uint32_t ch) {
+    return d.srgb && d.kind == ChannelKind::Unsigned && d.channel_bits[ch] == 8 && d.read_as_normalized_float &&
+           (ch == 0 || (ch < 3 && d.channel_bits[3] != 0));
   }
 
   // Converts one channel to the 32 bits the destination register wants.
@@ -5264,6 +5311,7 @@ class Interpreter {
       }
       return 0;
     }
+    if (tex_srgb(d, ch)) return static_cast<uint32_t>(f32bits(static_cast<float>(kSrgbTable[raw & 0xFF]) / 65536.0f));
     // Integer channels. Sign-extend first, because everything downstream --
     // both the integer result and the normalized float -- depends on it.
     int64_t sv = static_cast<int64_t>(raw);
@@ -5507,6 +5555,7 @@ class Interpreter {
     const bool unorm = d.kind == ChannelKind::Unsigned;
     int64_t isum[4] = {0, 0, 0, 0};
     double fv[4][16];
+    uint32_t codes[4][16] = {};
     for (int k = 0; k < n; ++k) {
       for (uint32_t ch = 0; ch < 4; ++ch) {
         if (!d.channel_bits[ch]) continue;
@@ -5516,6 +5565,8 @@ class Interpreter {
           double t = bits == 32 ? static_cast<double>(f32(raw)) : f16_to_double(raw);
           if (bits == 32 && std::fabs(t) < std::ldexp(1.0, -126)) t = std::copysign(0.0, t);   // flushed
           fv[ch][k] = t;
+        } else if (tex_srgb(d, ch)) {
+          codes[ch][k] = static_cast<uint32_t>(raw & 0xFF);
         } else if (unorm) {
           isum[ch] += int64_t{terms[k].w} * static_cast<int64_t>(bits == 8 ? raw * 257 : raw);
         } else {
@@ -5527,6 +5578,38 @@ class Interpreter {
       float r;
       if (!d.channel_bits[ch]) {
         r = 0.0f;
+      } else if (tex_srgb(d, ch)) {
+        // An sRGB channel blends its table values (measured over 134,316
+        // two-texel blends): the table holds codes in blocks of eight sharing
+        // an exponent -- that of the block's last entry -- and within each
+        // 2x2 footprint (a 3D fetch's z-slice, a mip blend's level) each value
+        // is truncated to 2^(E - 7), E the largest block exponent among the
+        // footprint's texels with weight; the footprints' weighted sums are
+        // added exactly and rounded once to a half's precision, ties away
+        // from zero.
+        int Eg[4] = {INT_MIN, INT_MIN, INT_MIN, INT_MIN};
+        for (int k = 0; k < n; ++k)
+          if (terms[k].w && kSrgbTable[codes[ch][k]])
+            Eg[terms[k].group] = std::max(Eg[terms[k].group], std::ilogb(static_cast<double>(kSrgbTable[codes[ch][k] | 7])) - 16);
+        const int Emax = *std::max_element(Eg, Eg + 4);
+        uint64_t sum = 0;   // in 2^-24ths
+        for (int g = 0; g < 4 && Emax != INT_MIN; ++g) {
+          if (Eg[g] == INT_MIN) continue;
+          const int shift = Eg[g] - 7 + 16;   // the grid, in table units (2^-16)
+          uint64_t sg = 0;
+          for (int k = 0; k < n; ++k) {
+            if (!terms[k].w || terms[k].group != g) continue;
+            const uint64_t t = kSrgbTable[codes[ch][k]];
+            sg += uint64_t(terms[k].w) * (shift > 0 ? (t >> shift) << shift : t);
+          }
+          sum += sg;
+        }
+        if (sum) {
+          const int e = 63 - __builtin_clzll(sum) - 24;          // the value's exponent
+          const int drop = std::max(e, -14) - 10 + 24;           // bits below a half's last
+          if (drop > 0) sum = ((sum >> (drop - 1)) + 1) >> 1 << drop;
+        }
+        r = static_cast<float>(std::ldexp(static_cast<double>(sum), -24));
       } else if (is_float) {
         // As measured on an RTX 3060, the blend is not an exact sum. Within
         // each 2x2 footprint (a 3D fetch's z-slice, a mip blend's level) every

@@ -66,6 +66,9 @@ struct TextureDesc {
   // Integer channels delivered as floats scaled into [0,1] or [-1,1], which is
   // what cudaReadModeNormalizedFloat asks for.
   bool read_as_normalized_float = false;
+  // cudaTextureDesc::sRGB: an 8-bit unsigned normalized texture's colour
+  // channels are decoded from sRGB to linear (see tex_srgb in interpreter.cpp).
+  bool srgb = false;
   TexFilter filter = TexFilter::Point;
   // cudaTextureDesc::borderColor, as the float bits the program set: what
   // border addressing returns outside the texture, converted to the
