@@ -5,6 +5,7 @@
 // device reading and writing another's memory once peer access is enabled.
 #include <hip/hip_runtime.h>
 
+#include <cstdint>
 #include <cstdio>
 
 #define CHECK(x)                                                                    \
@@ -41,6 +42,9 @@ __global__ void __launch_bounds__(256) wide(int* out) {
   out[blockIdx.x * blockDim.x + threadIdx.x] = 1;
 }
 
+// Reads memory no allocation holds, so the launch fails.
+__global__ void faulting(int* out) { out[threadIdx.x] = *reinterpret_cast<volatile int*>(uintptr_t{0x10}); }
+
 // Runs on device 0 with two of its pointers into device 1.
 __global__ void from_peer(const int* peer_in, int* peer_out, int* local_out) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -49,6 +53,10 @@ __global__ void from_peer(const int* peer_in, int* peer_out, int* local_out) {
 }
 
 int main() {
+  // Each line out as it is printed: the last check is a kernel that faults,
+  // which ROCm's own HIP answers by ending the program, and a buffer still
+  // held then would take every earlier result with it.
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
   // Work-groups a compute unit holds.
   int plain256 = 0, plain65 = 0, plain_lds = 0, tiled256 = 0, wide256 = 0;
   CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&plain256, plain, 256, 0));
@@ -146,5 +154,13 @@ int main() {
   std::printf("a kernel on device 0 read and wrote device 1's memory right for %d of %d elements\n", right, n);
   CHECK(hipDeviceDisablePeerAccess(1));
   std::printf("disabling it again: %s\n", hipGetErrorName(hipDeviceDisablePeerAccess(1)));
+  // A kernel that fails is reported by the blocking copy after it, not
+  // passed over; the copy after that goes through.
+  faulting<<<1, 64>>>(local_out);
+  const hipError_t first = hipMemcpy(local, local_out, sizeof local, hipMemcpyDeviceToHost);
+  const hipError_t second = hipMemcpy(local, local_out, sizeof local, hipMemcpyDeviceToHost);
+  (void)hipGetLastError();
+  std::printf("a failed launch is reported by the copy after it: %s, then %s\n", hipGetErrorName(first),
+              hipGetErrorName(second));
   return 0;
 }
