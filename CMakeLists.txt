@@ -1451,7 +1451,7 @@ if(TARGET vgpucudart)
   # cuRAND, cuSOLVER, cuSPARSE -- each SDPA backend, autocast, and the
   # jiterator's NVRTC kernels.
   add_test(NAME e2e_pytorch_ops_rtx5090 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
-           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/ops.py 46 nvidia/rtx5090)
+           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/ops.py 49 nvidia/rtx5090)
   set_tests_properties(e2e_pytorch_ops_rtx5090 PROPERTIES
     DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
