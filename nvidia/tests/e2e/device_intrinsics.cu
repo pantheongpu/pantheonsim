@@ -46,6 +46,10 @@ __global__ void k_h2(float* out, float x) {
     __half2 a = __habs2(__hneg2(v));
     out[1] = __half2float(__low2half(a));
 }
+// warpSize compiles to PTX's predefined WARP_SZ, which the simulator did not
+// know: qulacs's kernels failed to launch on it.
+__global__ void k_warpsize(int* out) { out[0] = warpSize; out[1] = threadIdx.x % warpSize; }
+
 int main() {
     unsigned* d; cudaMalloc(&d, 64 * sizeof(unsigned));
     unsigned zero = 0; cudaMemcpy(d, &zero, 4, cudaMemcpyHostToDevice);
@@ -91,6 +95,12 @@ int main() {
     float hf[2]; cudaMemcpy(hf, df, 8, cudaMemcpyDeviceToHost);
     if (!(hf[0] > 0.13f && hf[0] < 0.14f)) { std::printf("FAIL h2exp(-2): %g\n", hf[0]); ++bad; }
     if (hf[1] != 2.0f) { std::printf("FAIL habs2(hneg2(-2)): %g\n", hf[1]); ++bad; }
+
+    int* dw; cudaMalloc(&dw, 8);
+    k_warpsize<<<1, 37>>>(dw);   // the last thread writes last: 36 % 32 = 4
+    cudaDeviceSynchronize();
+    int hw[2] = {0, 0}; cudaMemcpy(hw, dw, 8, cudaMemcpyDeviceToHost);
+    if (hw[0] != 32) { std::printf("FAIL warpSize: %d want 32\n", hw[0]); ++bad; }
 
     // A failed device assert must report cudaErrorAssert with its message, and
     // the error must survive cudaDeviceSynchronize -- the usual way anyone
