@@ -86,6 +86,17 @@ bool refresh() {
     if (!g_have_profile) return false;
     g_snap = g_idle;
   }
+  // NVML is NVIDIA's driver's: it sees NVIDIA GPUs only. A machine whose GPUs
+  // are all AMD's has no NVIDIA driver, and NVML answers there as it does on
+  // one (DRIVER_NOT_LOADED, from nvmlInit). It counted every simulated GPU,
+  // so a simulated MI300X was an NVIDIA GPU to pynvml too, and vLLM, which
+  // asks both vendors' libraries, found a CUDA and a ROCm machine at once.
+  uint32_t kept = 0;
+  for (uint32_t i = 0; i < g_snap.device_count; ++i)
+    if (std::strcmp(g_snap.devices[i].vendor, "amd") != 0) g_snap.devices[kept++] = g_snap.devices[i];
+  const bool had = g_snap.device_count > 0;
+  g_snap.device_count = kept;
+  if (had && kept == 0) return false;
   // Injected clock-event reasons and the readings they imply, applied once
   // here so every getter agrees with every other, and with nvidia-smi.
   for (uint32_t i = 0; i < g_snap.device_count; ++i) {

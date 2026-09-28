@@ -1430,6 +1430,28 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_callback_tracing_kind_o
   return iterate_operations(kCallbackKinds[kind], [&](int op) { return callback(kind, op, data); });
 }
 
+// Where ROCm's rocprofiler-register hands over a library's API table (HIP's,
+// HSA's, RCCL's, ROCTx's) when the library starts and a rocprofiler-sdk is
+// already loaded: a real SDK wraps the table's entries to trace them. This
+// library traces the simulator's HIP from inside it, so it takes the other
+// libraries' tables as they are and wraps nothing. Without the function,
+// rocprofiler-register stops the program ("rocprofiler_set_api_table not
+// found") as soon as RCCL starts, which is how PyTorch's distributed setup
+// ended under vLLM.
+ROCPROFILER_API int rocprofiler_set_api_table(const char* name, uint64_t, uint64_t, void** tables, uint64_t count) {
+  return name && (tables || count == 0) ? 0 : -1;
+}
+
+// The arguments of the call a callback-tracing record is about, one by one.
+// The records this library delivers carry the operation, not the call's
+// arguments, so there are none to walk: a tool asking is told so, and PyTorch's
+// profiler records the call without them.
+ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_callback_tracing_kind_operation_args(
+    rocprofiler_callback_tracing_record_t, void* callback, int32_t, void*) {
+  if (!callback) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
+  return ROCPROFILER_STATUS_ERROR_NOT_IMPLEMENTED;
+}
+
 ROCPROFILER_API rocprofiler_status_t rocprofiler_query_intercept_table_name(rocprofiler_intercept_table_t kind,
                                                                             const char** name, uint64_t* name_len) {
   const char* n = kind == ROCPROFILER_HSA_TABLE              ? "HSA"

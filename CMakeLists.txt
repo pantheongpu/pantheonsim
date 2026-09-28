@@ -241,6 +241,20 @@ add_custom_command(TARGET vgpursmi POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocm_smi64.so.7.8.0" "${CMAKE_BINARY_DIR}/shim/librocm_smi64.so.1"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocm_smi64.so.7.8.0" "${CMAKE_BINARY_DIR}/shim/librocm_smi64.so"
   COMMENT "Creating ROCm SMI shim symlinks (build/shim/librocm_smi64.so.7)")
+# libamd_smi: AMD SMI's library, which AMD's Python package (amdsmi) loads,
+# and through it vLLM and PyTorch: the GPUs, their identity, memory and links,
+# from the machine's state. Every other function of the library answers
+# NOT_SUPPORTED (amd_smi_stubs.cpp), since the package binds them all.
+add_library(vgpuamdsmi SHARED amd/src/amd_smi.cpp amd/src/amd_smi_stubs.cpp)
+target_link_libraries(vgpuamdsmi PRIVATE vgpu)
+target_include_directories(vgpuamdsmi PRIVATE amd/include)
+set_target_properties(vgpuamdsmi PROPERTIES OUTPUT_NAME amd_smi SOVERSION 26 VERSION 26.2.2
+  CXX_VISIBILITY_PRESET hidden)
+add_custom_command(TARGET vgpuamdsmi POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamd_smi.so.26.2.2" "${CMAKE_BINARY_DIR}/shim/libamd_smi.so.26"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../libamd_smi.so.26.2.2" "${CMAKE_BINARY_DIR}/shim/libamd_smi.so"
+  COMMENT "Creating AMD SMI shim symlinks (build/shim/libamd_smi.so)")
 # ---------------------------------------------------------------------------
 # libvgpucudart: the CUDA *runtime* API shim. Lets unmodified nvcc-compiled
 # applications (built against shared cudart) run on VirtualGPU. Requires the
@@ -762,6 +776,24 @@ set_tests_properties(test_amd_rocm_smi PROPERTIES ENVIRONMENT
 add_test(NAME test_amd_rocm_smi_radeon COMMAND test_amd_rocm_smi)
 set_tests_properties(test_amd_rocm_smi_radeon PROPERTIES ENVIRONMENT
   "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-rocm-smi-radeon")
+add_executable(test_amd_amd_smi amd/tests/unit/test_amd_smi.cpp)
+target_link_libraries(test_amd_amd_smi PRIVATE vgpuamdsmi vgpu)
+target_include_directories(test_amd_amd_smi PRIVATE tests/framework amd/include)
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/telemetry-amd-smi" "${CMAKE_BINARY_DIR}/telemetry-amd-smi-radeon")
+add_test(NAME test_amd_amd_smi COMMAND test_amd_amd_smi)
+set_tests_properties(test_amd_amd_smi PROPERTIES ENVIRONMENT
+  "VGPU_GPU=amd/mi300x;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-amd-smi")
+add_test(NAME test_amd_amd_smi_radeon COMMAND test_amd_amd_smi)
+set_tests_properties(test_amd_amd_smi_radeon PROPERTIES ENVIRONMENT
+  "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-amd-smi-radeon")
+# vLLM, unmodified, generating on a simulated MI300X what the CPU generates
+# (VGPU_VLLM_PYTHON: a Python with vLLM for ROCm; skips without one).
+add_test(NAME amd_vllm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_vllm_amd.sh amd/mi300x)
+set_tests_properties(amd_vllm PROPERTIES DEPENDS "vgpuhip;vgpuamdsmi;vgpursmi" RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 5400)
+add_test(NAME amd_amdsmi_python COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_amdsmi_python.sh)
+set_tests_properties(amd_amdsmi_python PROPERTIES DEPENDS vgpuamdsmi
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 add_test(NAME amd_rocprofiler_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofiler_abi.sh)
 add_test(NAME amd_rocprofv3 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofv3.sh)
 set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"

@@ -1071,6 +1071,26 @@ hipError_t hipMemset(void* dst, int value, size_t bytes) {
 
 // The asynchronous forms: queued on the stream, and returned from at once
 // (but see copy_in_order on host memory the runtime did not pin).
+hipError_t hipMemcpyAsync(void* dst, const void* src, size_t bytes, hipMemcpyKind kind, hipStream_t stream);
+// Copies in a batch, in order on the stream, each as hipMemcpyAsync with the
+// direction worked out from the pointers. The attributes are hints about
+// the source's access order and where the copy may run; they change nothing
+// here. The first copy refused is reported through failIdx.
+hipError_t hipMemcpyBatchAsync(void** dsts, void** srcs, size_t* sizes, size_t count, void* attrs,
+                               size_t* attrs_idxs, size_t num_attrs, size_t* fail_idx, hipStream_t stream) {
+  (void)attrs;
+  (void)attrs_idxs;
+  (void)num_attrs;
+  if (fail_idx) *fail_idx = SIZE_MAX;
+  if (!count) return hipSuccess;
+  if (!dsts || !srcs || !sizes) return hipErrorInvalidValue;
+  for (size_t i = 0; i < count; ++i)
+    if (const hipError_t e = hipMemcpyAsync(dsts[i], srcs[i], sizes[i], hipMemcpyDefault, stream); e != hipSuccess) {
+      if (fail_idx) *fail_idx = i;
+      return e;
+    }
+  return hipSuccess;
+}
 hipError_t hipMemcpyAsync(void* dst, const void* src, size_t bytes, hipMemcpyKind kind, hipStream_t stream) {
   const ApiCall api("hipMemcpyAsync");
   return record(state(), copy_in_order(dst, src, bytes, kind, stream, true));
@@ -1539,6 +1559,18 @@ hipError_t hipEventDestroy(hipEvent_t event) {
   return g_events.erase(event) ? hipSuccess : hipErrorInvalidHandle;
 }
 
+hipError_t hipEventRecord(hipEvent_t event, hipStream_t stream);
+// hipEventRecordExternal (1) matters only inside a graph being captured,
+// where an event records as a node of its own; outside one both record alike.
+hipError_t hipEventRecordWithFlags(hipEvent_t event, hipStream_t stream, unsigned int flags) {
+  if (flags > 1) {
+    const ApiCall api("hipEventRecordWithFlags");
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return record(s, hipErrorInvalidValue);
+  }
+  return hipEventRecord(event, stream);
+}
 hipError_t hipEventRecord(hipEvent_t event, hipStream_t stream) {
   const ApiCall api("hipEventRecord");
   State& s = state();
@@ -3026,9 +3058,13 @@ struct VmmAllocation {
   int device;
   uint64_t handle;
   size_t size;
+  int refs;   // hipMemCreate's, and one for each hipMemRetainAllocationHandle
 };
 std::deque<VmmAllocation> g_vmm;   // under State's mutex; entries are never moved
 std::set<VmmAllocation*> g_vmm_live;
+// Where each allocation is mapped: start -> (size, allocation), for
+// hipMemRetainAllocationHandle, which finds the allocation from an address.
+std::map<uint64_t, std::pair<size_t, VmmAllocation*>> g_vmm_maps;
 
 // An IPC memory handle's payload: which process shared which of its
 // allocations, and the file the bytes now live in.
@@ -3050,14 +3086,40 @@ extern "C" {
 
 // ---- Devices and contexts ----------------------------------------------------
 
-// A context is a device's, and each device has one: its handle is enough.
+// A context is a device's, and each device has one, its primary context:
+// the handle stands for the device.
+static char g_contexts[64];
 hipError_t hipCtxGetCurrent(void** ctx) {
   const ApiCall api("hipCtxGetCurrent");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!ctx) return record(s, hipErrorInvalidValue);
-  static char contexts[64];
-  *ctx = s.current < 64 ? &contexts[s.current] : nullptr;
+  *ctx = s.current < 64 ? &g_contexts[s.current] : nullptr;
+  return record(s, hipSuccess);
+}
+// Making a device's context current makes the device current, as
+// hipSetDevice does; no context (null) leaves the device as it is.
+hipError_t hipCtxSetCurrent(void* ctx) {
+  const ApiCall api("hipCtxSetCurrent");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!ctx) return record(s, hipSuccess);
+  const auto* c = static_cast<char*>(ctx);
+  if (c < g_contexts || c >= g_contexts + 64) return record(s, hipErrorInvalidContext);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  const int d = static_cast<int>(c - g_contexts);
+  if (d >= s.rt->device_count()) return record(s, hipErrorInvalidContext);
+  s.current = d;
+  return record(s, hipSuccess);
+}
+hipError_t hipDevicePrimaryCtxRetain(void** ctx, int ordinal) {
+  const ApiCall api("hipDevicePrimaryCtxRetain");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!ctx) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (ordinal < 0 || ordinal >= s.rt->device_count() || ordinal >= 64) return record(s, hipErrorInvalidDevice);
+  *ctx = &g_contexts[ordinal];
   return record(s, hipSuccess);
 }
 hipError_t hipDevicePrimaryCtxGetState(int ordinal, unsigned int* flags, int* active) {
@@ -3117,6 +3179,13 @@ hipError_t hipDeviceGetStreamPriorityRange(int* least, int* greatest) {
 // on a device without one.
 hipError_t hipDeviceSetCacheConfig(int) {
   const ApiCall api("hipDeviceSetCacheConfig");
+  return record(state(), hipSuccess);
+}
+// The same, for one kernel: a preference between L1 and LDS the simulator's
+// kernels do not have to choose between.
+hipError_t hipFuncSetCacheConfig(const void* function, int config) {
+  const ApiCall api("hipFuncSetCacheConfig");
+  if (!function || config < 0 || config > 3) return record(state(), hipErrorInvalidValue);
   return record(state(), hipSuccess);
 }
 
@@ -3582,7 +3651,7 @@ hipError_t hipMemCreate(void** handle, size_t size, const vgpu::amd::abi::MemAll
   const int d = prop->location.id;
   if (d < 0 || d >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
   try {
-    g_vmm.push_back(VmmAllocation{d, s.rt->device(d).memory().create_handle(size), size});
+    g_vmm.push_back(VmmAllocation{d, s.rt->device(d).memory().create_handle(size), size, 1});
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorOutOfMemory, e.what()));
   }
@@ -3597,7 +3666,9 @@ hipError_t hipMemRelease(void* handle) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   auto* v = static_cast<VmmAllocation*>(handle);
-  if (!g_vmm_live.erase(v)) return record(s, hipErrorInvalidValue);
+  if (!g_vmm_live.count(v)) return record(s, hipErrorInvalidValue);
+  if (--v->refs > 0) return record(s, hipSuccess);
+  g_vmm_live.erase(v);
   try {
     s.rt->device(v->device).memory().release_handle(v->handle);
   } catch (const std::exception& e) {
@@ -3620,6 +3691,7 @@ hipError_t hipMemMap(void* ptr, size_t size, size_t offset, void* handle, unsign
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorInvalidValue, e.what()));
   }
+  g_vmm_maps[reinterpret_cast<uint64_t>(ptr)] = {size, v};
   return record(s, hipSuccess);
 }
 hipError_t hipMemUnmap(void* ptr, size_t size) {
@@ -3634,6 +3706,39 @@ hipError_t hipMemUnmap(void* ptr, size_t size) {
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorInvalidValue, e.what()));
   }
+  // Every mapping inside the range goes with it.
+  const uint64_t lo = reinterpret_cast<uint64_t>(ptr), hi = lo + size;
+  for (auto it = g_vmm_maps.lower_bound(lo); it != g_vmm_maps.end() && it->first < hi;) it = g_vmm_maps.erase(it);
+  return record(s, hipSuccess);
+}
+// The allocation mapped at an address, with a reference of its own that
+// hipMemRelease gives back, as RCCL takes it for memory it is handed.
+hipError_t hipMemRetainAllocationHandle(void** handle, void* addr) {
+  const ApiCall api("hipMemRetainAllocationHandle");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!handle || !addr) return record(s, hipErrorInvalidValue);
+  const uint64_t a = reinterpret_cast<uint64_t>(addr);
+  auto it = g_vmm_maps.upper_bound(a);
+  if (it == g_vmm_maps.begin()) return record(s, hipErrorInvalidValue);
+  --it;
+  if (a >= it->first + it->second.first || !g_vmm_live.count(it->second.second))
+    return record(s, hipErrorInvalidValue);
+  ++it->second.second->refs;
+  *handle = it->second.second;
+  return record(s, hipSuccess);
+}
+// What an allocation was made as: pinned device memory, on its device.
+hipError_t hipMemGetAllocationPropertiesFromHandle(vgpu::amd::abi::MemAllocationProp* prop, void* handle) {
+  const ApiCall api("hipMemGetAllocationPropertiesFromHandle");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  auto* v = static_cast<VmmAllocation*>(handle);
+  if (!prop || !g_vmm_live.count(v)) return record(s, hipErrorInvalidValue);
+  std::memset(prop, 0, sizeof *prop);
+  prop->type = 1;              // hipMemAllocationTypePinned
+  prop->location.type = 1;     // hipMemLocationTypeDevice
+  prop->location.id = v->device;
   return record(s, hipSuccess);
 }
 // Access for the device that holds the mapping is what its kernels are

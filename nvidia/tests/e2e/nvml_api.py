@@ -35,6 +35,12 @@ if len(sys.argv) > 2 and sys.argv[2] == "--undescribed":
     rc = lib.nvmlInit_v2()
     check("no telemetry and no machine described: DRIVER_NOT_LOADED", rc == DRIVER_NOT_LOADED, rc)
     sys.exit(1 if fails else 0)
+# `--amd`: a machine whose GPUs are all AMD's, which has no NVIDIA driver.
+# NVML counted them as NVIDIA GPUs, and vLLM found CUDA and ROCm at once.
+if len(sys.argv) > 2 and sys.argv[2] == "--amd":
+    rc = lib.nvmlInit_v2()
+    check("a machine of AMD GPUs: DRIVER_NOT_LOADED", rc == DRIVER_NOT_LOADED, rc)
+    sys.exit(1 if fails else 0)
 if len(sys.argv) > 2 and sys.argv[2] == "--described":
     rc = lib.nvmlInit_v2()
     check("no telemetry, machine described: init succeeds", rc == SUCCESS, rc)

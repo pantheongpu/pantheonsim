@@ -116,6 +116,10 @@ struct Inst {
   // encoding keeps where the others' broadcast controls are (CBSZ, BLGP):
   // 0 fp8, 1 bf8, 2 fp6 (E2M3), 3 bf6 (E3M2), 4 fp4 (E2M1).
   uint8_t cbsz = 0, blgp = 0;
+  // The other matrix instructions of several blocks: A's broadcast. Each
+  // group of 2^a_bcast_size blocks multiplies with the A of its block
+  // a_bcast_id (the encoding's CBSZ and ABID); 0 is each block its own.
+  uint8_t a_bcast_size = 0, a_bcast_id = 0;
   // gfx950's scaled matrix instructions (v_mfma_scale_*): 16 bytes, a
   // load-scale prefix then the product. Sources 3 and 4 are A's and B's E8M0
   // scales, and scale_sel which byte of each register (bits 0-1 A's, 2-3 B's):
