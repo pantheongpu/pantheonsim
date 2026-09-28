@@ -1054,6 +1054,30 @@ finish:
 fp64_virus is held back by the subnormal assists below; mma_virus by the
 matrix work itself, which is still about 1 M warp instructions a second.
 
+Since then (2026-09-27), profiled with perf again:
+
+- mma_virus's time was the WMMA fast path's bookkeeping, not the multiply.
+  It scanned all 32 fragment operands for a 64-bit register on every
+  execution (now decided once by the parser), converted f16 through a
+  512 KB double table (now F16C, eight halves at a time, used only after it
+  matches the table for all 65536 inputs), moved fragments one element at a
+  time (now AVX2 8x8 transposes) and zero-filled tiles every element of
+  which it then wrote. One host thread, grid 4: 6.4 -> 19.7 GFLOPS. At full
+  size on 20 cores it finishes in 186 s, against 361 s before on the same
+  machine -- inside pantheon's 360 s watchdog now.
+- Register files are no longer zero-filled at every block start (nvcc
+  declared ~1500 registers per warp in mma_virus). A register's first write
+  zero-fills it only when the write leaves lanes out, so those lanes still
+  read zero; a unit test fails without that.
+- The f64 fma fast path reads its register operands in place instead of
+  through read_operand: fp64_virus, one thread, grid 4, 1.67 -> 2.14
+  GFLOPS. At full size that is 99 -> 86 s per launch, and with five warmup
+  launches before the timed one it still exceeds the watchdog: at 10000
+  loops its FMA chains decay into subnormals, where the host's assists
+  dominate. Doing the FMAs four lanes at a time with AVX was measured and
+  was no faster (the assist is not cheaper for a vector), so it was not
+  kept.
+
 One limit found and left alone: on Intel cores a subnormal operand or result
 costs every FP operation a microcode assist, and fp64_virus's FMA chains
 decay into that range -- it runs about 3.7x faster with flush-to-zero set.

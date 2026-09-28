@@ -73,6 +73,11 @@ echo "wrote $(pwd)/rdna3.gfx1100 and rdna3.w64.gfx1100"
 # RDNA4 (gfx1201): gfx12's WMMA layout, the scalar float unit, split barriers.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1201 rdna4.cpp -o rdna4.gfx1201
 echo "wrote $(pwd)/rdna4.gfx1201"
+# RDNA2 (gfx1030): SDWA, M0-relative registers, permlane16 and DPP row_share
+# and row_xmask, in wave32 and wave64.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1030 rdna2.cpp -o rdna2.gfx1030
+"$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_W64 -mwavefrontsize64 --offload-arch=gfx1030 rdna2.cpp -o rdna2.w64.gfx1030
+echo "wrote $(pwd)/rdna2.gfx1030 and rdna2.w64.gfx1030"
 
 # The device code alone, for the decoder and the executor to be checked
 # against, and the listing of it from the same toolchain's llvm-objdump.

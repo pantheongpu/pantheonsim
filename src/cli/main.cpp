@@ -37,6 +37,8 @@ int usage(FILE* to) {
                "                                       which it cannot, with the reason\n"
                "  vgpu ncu [opts] <program> [args...]  Nsight Compute's command line over those\n"
                "                                       counters; `ncu` in a vgpu shell (--help)\n"
+               "  vgpu debug [-x FILE] -- <program>    Run an AMD program with the kernel debugger:\n"
+               "                                       breakpoints, stepping, registers (vgpu debug --help)\n"
                "  vgpu test --matrix <program> [args]  Run a program on every device profile and\n"
                "                                       compare the results (vgpu test --help)\n"
                "  vgpu fault inject|arm|stuck|lose|... Inject faults: ECC, PCIe, hangs, a lost GPU,\n"
@@ -222,6 +224,7 @@ int cmd_regs(const std::vector<std::string>& args);
 int cmd_shell(const std::vector<std::string>& args);
 // Implemented in run.cpp.
 int cmd_run(const std::vector<std::string>& args);
+int cmd_debug(const std::vector<std::string>& args);
 // Implemented in test.cpp.
 int cmd_test(const std::vector<std::string>& args);
 // Implemented in ncu.cpp.
@@ -246,6 +249,7 @@ int main(int argc, char** argv) {
     if (cmd == "regs") return cmd_regs({args.begin() + 1, args.end()});
     if (cmd == "shell") return cmd_shell({args.begin() + 1, args.end()});
     if (cmd == "run") return cmd_run({args.begin() + 1, args.end()});
+    if (cmd == "debug") return cmd_debug({args.begin() + 1, args.end()});
     if (cmd == "test") return cmd_test({args.begin() + 1, args.end()});
     if (cmd == "ncu") return cmd_ncu({args.begin() + 1, args.end()});
     if (cmd == "info") {

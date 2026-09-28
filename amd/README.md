@@ -336,6 +336,27 @@ with gfx12's OCP fp8 WMMA.
   - OCP 8-bit floats.
 - **Checks:** the executor's unit kernels pass on gfx1201 too (ctests `*_gfx1201`), and `tests/hipcc/rdna4.cpp` checks WMMA, the scalar float unit and the split barrier.
 
+## RDNA2 (Radeon RX 6900 XT)
+
+`VGPU_GPU=amd/rx6900xt` is gfx1030 (RDNA2). PyTorch's 20 checks pass on it
+(ctest `amd_pytorch_rx6900xt`). RDNA2 has no matrix instructions, so its
+matrix products run on the vector units, and PyTorch refuses fp8 on it, as it
+does on the card.
+
+- **Decoder:** the same generator reads AMD's RDNA2 specification into `src/rdna_ops_rdna2.inc`. gfx10 names its instructions as gfx9 does, and differs from gfx11 in a few places:
+  - M0 is operand 124 and null is 125, the other way round from gfx11;
+  - glc, slc and dlc sit in other bits, and so does FLAT's segment;
+  - it has SDWA (sub-dword reads and writes) and no true16 or VOPD.
+
+  All 12,542,606 distinct encodings in the wheel's gfx1030 code decode and print as `llvm-objdump` does. `tests/data/isa_corpus_gfx1030.txt` keeps 1,775 of their shapes.
+- **Execution:** RDNA3's paths, plus:
+  - a register per work-item id: gfx10 does not pack them into v0, whatever the code object's ABI;
+  - SDWA's three ways of filling the rest of a destination (pad, sign-extend, keep);
+  - `v_permlane16_b32` and `v_permlanex16_b32`, which RDNA3 and RDNA4 have too;
+  - DPP's `row_share` and `row_xmask`, and its FI bit;
+  - occupancy from gfx10.3's register file.
+- **Checks:** the executor's unit kernels pass on gfx1030 (ctests `*_gfx1030`), and `tests/hipcc/rdna2.cpp` checks SDWA, M0-relative registers, the permlanes and the DPP modes, in wave32 and wave64.
+
 `VGPU_TRACE_WAVE=1` prints each instruction a work-group's first wave runs,
 with what its destination holds after it for lane 0 (or the lane
 `VGPU_TRACE_LANE` names). That is how the bugs above were found.
@@ -391,9 +412,54 @@ That works because the runtime keeps to what ROCm's does where CLR looks:
 - **Work-group limit:** a packet is held only to the hardware's work-group limit, not the kernel's metadata.
 - **Host access:** the host is never given a device's memory directly, so CLR copies instead of writing through it.
 - **Supported extras:** AMD's loader extension, barrier-value packets, asynchronous signal handlers, dispatch timestamps and `hsa_amd_pointer_info` all work.
-- **Not modelled:** images, virtual memory, IPC and SVM are refused by name.
+- **Not modelled:** images, virtual memory, HSA's IPC and SVM are refused by name. HIP's IPC is modelled (see RCCL below).
 
 `VGPU_TRACE_HSA=1` logs what memory the program allocates, locks and registers.
+
+## System tools
+
+Inside `vgpu shell --gpu amd/...` the tools an AMD machine has answer for
+the simulated GPUs (amd/tests/e2e/run_amd_tools.sh, ctest `amd_tools`):
+
+- **`lspci`**: the host's real lspci over the devices' config space. An isolated session gives it the session's `/sys/bus/pci`, so `-k` and `-vv` show the bound `amdgpu` driver and every capability. Its PCI ID database is the host's, plus the simulated cards it predates (the RX 9070 XT, the MI350X). A host without pciutils gets `vgpu smi --lspci`, which prints the same, form by form. An Instinct card is a processing accelerator; a Radeon card is a VGA controller with its chip's revision (c8 for the RX 7900 XTX).
+- **`rocminfo`**: ROCm's own where the host has it, reading the simulated agents through the session's HSA runtime; otherwise `vgpu-rocminfo`, which asks the same runtime through the public HSA interface and prints what ROCm's prints, line for line. Each agent's chip ID, compute units (an RDNA workgroup processor is two), SIMDs, shader engines and arrays, compute dies, caches (L3 included) and memory interface are the chip's (`include/vgpu/amd_chip.hpp`).
+- **`rocm-smi`** and **`amd-smi`**: the concise table and every `--show*` section, and `amd-smi`'s `list`, `static`, `metric`, `process`, `topology`, `monitor`, `partition`, `xgmi`, `bad-pages`, `firmware`, `ras` and `version`, with `--json`. Values come from the same machine state nvidia-smi reads. What a simulated card has no value for (VBIOS, serials, firmware, energy) is N/A.
+- **`rocm_agent_enumerator`**: each card's own target.
+
+## RCCL, and PyTorch across GPUs
+
+RCCL (PyTorch's collectives on ROCm) runs unmodified across simulated GPUs in one process (`tests/pytorch/multi_gpu.py`, ctest `amd_pytorch_multi_gpu`) and across processes (`distributed.py`, ctest `amd_pytorch_distributed`). Three things make that work on any Linux machine:
+
+- **Topology.** RCCL learns how its GPUs are linked from the AMD kernel driver's topology under `/sys/class/kfd`, or from ROCm SMI's library. A machine with no AMD GPU has no `/sys/class/kfd`, and RCCL fails to initialize ("internal error"). WSL is the exception: RCCL skips the question there. So VirtualGPU has its own `librocm_smi64` (`src/rocm_smi.cpp`, `build/shim/librocm_smi64.so.7`). It answers the eight functions RCCL calls from the HIP runtime: the device count, each device's PCI address as HIP reports it, and the link between each pair. That link is XGMI between Instinct GPUs and PCI Express between Radeon ones. Once loaded, the library sets `RCCL_USE_ROCM_SMI_LIB=1` where there is no `/sys/class/kfd`, and leaves the variable alone where there is one or the environment already set it. The PyTorch tests swap it in beside `libamdhip64` (ctests `test_amd_rocm_smi`, `test_amd_rocm_smi_radeon`).
+- **Wide accesses.** A `global_`, `flat_` or `buffer_` load or store of two to four words moves each aligned pair of words as one 8-byte access, as the hardware does. RCCL's LL protocol puts a word of data and the flag that says it arrived in the same eight bytes, and a reader on another device trusts the data once it sees the flag. When a wide access moved one word at a time, a reader could see the new flag beside the old data, and `broadcast` lost values.
+- **Opened IPC memory.** Memory from another process's `hipIpcGetMemHandle` is mapped where the exporter's device is numbered, and every other device in the process reaches it without `hipDeviceEnablePeerAccess`, as `hipIpcMemLazyEnablePeerAccess` asks. RCCL's kernels write straight into the other process's buffer.
+
+## Debugging
+
+`vgpu debug` runs an AMD program with a kernel debugger:
+
+```
+vgpu debug --gpu amd/mi300x -- ./program            # commands at a (vgpu) prompt
+vgpu debug -x session.txt --gpu amd/mi300x -- ./program   # or from a file
+```
+
+- **Stopping:**
+  - `break KERNEL[+OFFSET]` stops every wave of a kernel that reaches OFFSET, in bytes from its first instruction. The kernel is matched by any part of its name. `tbreak` stops once.
+  - `continue` goes on; `step [N]` runs N instructions of the stopped wave.
+  - `delete [N]` and `info breakpoints` manage breakpoints.
+- **Looking:**
+  - `where` gives the kernel, offset, work-group, wave and EXEC; `disas [N]` lists instructions from there.
+  - `info registers` shows PC, EXEC, VCC, SCC, M0, MODE and the SGPRs.
+  - `print[/x|/d|/f] REG` prints a register for every lane (eight to a row, a switched-off lane marked) or for the lane `lane N` picks.
+  - `x/N ADDR` and `x/N lds:ADDR` show device memory and the work-group's LDS.
+- **Changing:** `set REG[LANE] = VALUE` changes a register; `quit` fails the launch.
+
+While the debugger is on, work-groups run on one host thread. A stopped wave
+stops its dispatch, and everything else runs in a repeatable order.
+`VGPU_DEBUG=/dev/tty` or `VGPU_DEBUG=FILE` turns it on without the command.
+`VGPU_TRACE_WAVE=1` instead prints every instruction a work-group's first wave
+runs, with its results. `amd/tests/e2e/run_debugger.sh` (ctest `amd_debugger`)
+runs a session.
 
 ## Profiling
 
@@ -420,7 +486,11 @@ every instruction a wave issues passes through it once: `SQ_WAVES` and the
 waves by how many lanes they start with, the instructions each unit issues
 (`SQ_INSTS_VALU`, `_MFMA`, `_SALU`, `_SMEM`, `_VMEM`, `_FLAT`, `_LDS`,
 `_BRANCH`, `_SENDMSG`, `_GDS`), and the flat reads, writes and atomics the
-texture addresser takes (`TA_FLAT_*`). Each is the device's total, as one
+texture addresser takes (`TA_FLAT_*`). There is also the instruction mix, each
+instruction classed once as it is decoded:
+- `SQ_INSTS_VALU_{ADD,MUL,FMA,TRANS}_{F16,F32,F64}`, `_CVT`, `_INT32` and `_INT64`;
+- matrix work in 512-operation units, `SQ_INSTS_VALU_MFMA_MOPS_{I8,F16,BF16,F32,F64,F8}`, with RDNA's WMMA included;
+- vector memory reads and writes, `SQ_INSTS_VMEM_RD` and `_WR`. Each is the device's total, as one
 instance. A counter of cycles, stalls, cache hits or memory traffic would
 need a model of the hardware's timing, and there is none, so those are not
 offered: rocprofv3 says the device does not have one, as it does for a

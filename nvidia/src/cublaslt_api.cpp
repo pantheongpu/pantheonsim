@@ -6,13 +6,22 @@
 // reuses the same host-side GEMM the cuBLAS shim uses -- see nvidia/docs/cublas.md
 // for why library math runs on the host rather than through the interpreter.
 //
+// Types: fp32, fp64, fp16, bf16 and both fp8 formats, in any mix cuBLASLt
+// defines, accumulated in double and rounded once into D. FP8 follows the
+// documented scaling: D = scaleD * (alpha * scaleA * scaleB * op(A) op(B) +
+// beta * scaleC * C), with the absolute maximum of D before scaleD written to
+// AMAX_D, and scaleA/scaleB either scalars or, in the outer-vector mode
+// torch._scaled_mm uses for rowwise scaling, one per row of op(A) and one per
+// column of op(B).
+//
 // Epilogues (bias, ReLU, GELU) are applied after the matmul, matching the
-// documented semantics. Anything not implemented returns
-// CUBLAS_STATUS_NOT_SUPPORTED so a caller falls back rather than receiving a
-// plausible wrong answer.
+// documented semantics. Anything not implemented -- another epilogue, a
+// block-scaled mode -- returns CUBLAS_STATUS_NOT_SUPPORTED so a caller falls
+// back rather than receiving a plausible wrong answer.
 #include <cublasLt.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,12 +44,24 @@ bool trace() {
 
 struct LtHandle { int dummy = 0; };
 
+// The scale modes arrived in CUDA 12.8's header; hosted CI builds against
+// 12.0, so they are named by value here.
+constexpr int kAScaleMode = 31, kBScaleMode = 32, kCScaleMode = 33, kDScaleMode = 34;
+constexpr int32_t kScaleScalar = 0, kScaleOuterVec = 3;
+
 struct MatmulDesc {
   cublasComputeType_t compute = CUBLAS_COMPUTE_32F;
   cudaDataType scale = CUDA_R_32F;
   cublasOperation_t transa = CUBLAS_OP_N, transb = CUBLAS_OP_N;
   cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_DEFAULT;
   const void* bias = nullptr;
+  int32_t bias_type = -1;  // -1: the default, which depends on D's type
+  int32_t pointer_mode = CUBLASLT_POINTER_MODE_HOST;
+  const void *a_scale = nullptr, *b_scale = nullptr, *c_scale = nullptr, *d_scale = nullptr;
+  void* amax_d = nullptr;
+  int32_t a_scale_mode = kScaleScalar, b_scale_mode = kScaleScalar;
+  int32_t c_scale_mode = kScaleScalar, d_scale_mode = kScaleScalar;
+  int8_t fast_accum = 0;
 };
 
 struct MatrixLayout {
@@ -49,6 +70,7 @@ struct MatrixLayout {
   int64_t ld = 0;
   int32_t batch = 1;
   int64_t batch_stride = 0;
+  int32_t order = CUBLASLT_ORDER_COL;
 };
 
 struct Preference { size_t workspace = 0; };
@@ -157,9 +179,44 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t d
       if (bytes < sizeof(void*)) return CUBLAS_STATUS_INVALID_VALUE;
       std::memcpy(&m->bias, buf, sizeof(void*));
       return CUBLAS_STATUS_SUCCESS;
+    case CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE:
+      if (bytes < sizeof(int32_t)) return CUBLAS_STATUS_INVALID_VALUE;
+      std::memcpy(&m->bias_type, buf, sizeof(int32_t));
+      return CUBLAS_STATUS_SUCCESS;
+    case CUBLASLT_MATMUL_DESC_POINTER_MODE:
+      if (bytes < sizeof(int32_t)) return CUBLAS_STATUS_INVALID_VALUE;
+      std::memcpy(&m->pointer_mode, buf, sizeof(int32_t));
+      return CUBLAS_STATUS_SUCCESS;
+    case CUBLASLT_MATMUL_DESC_FAST_ACCUM:
+      if (bytes < sizeof(int8_t)) return CUBLAS_STATUS_INVALID_VALUE;
+      std::memcpy(&m->fast_accum, buf, sizeof(int8_t));  // accumulation is exact here either way
+      return CUBLAS_STATUS_SUCCESS;
+    case CUBLASLT_MATMUL_DESC_A_SCALE_POINTER:
+    case CUBLASLT_MATMUL_DESC_B_SCALE_POINTER:
+    case CUBLASLT_MATMUL_DESC_C_SCALE_POINTER:
+    case CUBLASLT_MATMUL_DESC_D_SCALE_POINTER:
+    case CUBLASLT_MATMUL_DESC_AMAX_D_POINTER: {
+      if (bytes < sizeof(void*)) return CUBLAS_STATUS_INVALID_VALUE;
+      const void** slot = attr == CUBLASLT_MATMUL_DESC_A_SCALE_POINTER   ? &m->a_scale
+                          : attr == CUBLASLT_MATMUL_DESC_B_SCALE_POINTER ? &m->b_scale
+                          : attr == CUBLASLT_MATMUL_DESC_C_SCALE_POINTER ? &m->c_scale
+                          : attr == CUBLASLT_MATMUL_DESC_D_SCALE_POINTER ? &m->d_scale
+                                                                         : const_cast<const void**>(&m->amax_d);
+      std::memcpy(slot, buf, sizeof(void*));
+      return CUBLAS_STATUS_SUCCESS;
+    }
     default:
-      return CUBLAS_STATUS_SUCCESS;  // attributes we do not model are inert
+      break;
   }
+  if ((int)attr >= kAScaleMode && (int)attr <= kDScaleMode) {
+    if (bytes < sizeof(int32_t)) return CUBLAS_STATUS_INVALID_VALUE;
+    int32_t* slot = (int)attr == kAScaleMode   ? &m->a_scale_mode
+                    : (int)attr == kBScaleMode ? &m->b_scale_mode
+                    : (int)attr == kCScaleMode ? &m->c_scale_mode
+                                               : &m->d_scale_mode;
+    std::memcpy(slot, buf, sizeof(int32_t));
+  }
+  return CUBLAS_STATUS_SUCCESS;  // attributes we do not model are inert
 }
 VGPU_EXPORT cublasStatus_t cublasLtMatmulDescGetAttribute(cublasLtMatmulDesc_t d,
                                                           cublasLtMatmulDescAttributes_t attr,
@@ -214,16 +271,40 @@ VGPU_EXPORT cublasStatus_t cublasLtMatrixLayoutSetAttribute(cublasLtMatrixLayout
   if (attr == CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT) std::memcpy(&m->batch, buf, sizeof(int32_t));
   else if (attr == CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET)
     std::memcpy(&m->batch_stride, buf, sizeof(int64_t));
+  else if (attr == CUBLASLT_MATRIX_LAYOUT_ORDER) {
+    std::memcpy(&m->order, buf, sizeof(int32_t));
+    if (m->order != CUBLASLT_ORDER_COL && m->order != CUBLASLT_ORDER_ROW) return CUBLAS_STATUS_NOT_SUPPORTED;
+  } else if (attr == CUBLASLT_MATRIX_LAYOUT_TYPE) std::memcpy(&m->type, buf, sizeof(int32_t));
+  else if (attr == CUBLASLT_MATRIX_LAYOUT_ROWS) std::memcpy(&m->rows, buf, sizeof(uint64_t));
+  else if (attr == CUBLASLT_MATRIX_LAYOUT_COLS) std::memcpy(&m->cols, buf, sizeof(uint64_t));
+  else if (attr == CUBLASLT_MATRIX_LAYOUT_LD) std::memcpy(&m->ld, buf, sizeof(int64_t));
   return CUBLAS_STATUS_SUCCESS;
 }
+// Every attribute answers for itself; this used to return the batch count
+// whatever was asked.
 VGPU_EXPORT cublasStatus_t cublasLtMatrixLayoutGetAttribute(cublasLtMatrixLayout_t l,
-                                                            cublasLtMatrixLayoutAttribute_t,
-                                                            void* buf, size_t, size_t* written) {
-  if (!known(l) || !buf) return CUBLAS_STATUS_INVALID_VALUE;
-  int32_t v = reinterpret_cast<MatrixLayout*>(l)->batch;
-  std::memcpy(buf, &v, sizeof v);
-  if (written) *written = sizeof v;
-  return CUBLAS_STATUS_SUCCESS;
+                                                            cublasLtMatrixLayoutAttribute_t attr,
+                                                            void* buf, size_t bytes, size_t* written) {
+  if (!known(l)) return CUBLAS_STATUS_INVALID_VALUE;
+  const auto* m = reinterpret_cast<MatrixLayout*>(l);
+  auto give = [&](const void* v, size_t n) {
+    if (written) *written = n;
+    if (!buf) return bytes == 0 ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
+    if (bytes < n) return CUBLAS_STATUS_INVALID_VALUE;
+    std::memcpy(buf, v, n);
+    return CUBLAS_STATUS_SUCCESS;
+  };
+  const int32_t type = m->type;
+  switch (attr) {
+    case CUBLASLT_MATRIX_LAYOUT_TYPE: return give(&type, sizeof type);
+    case CUBLASLT_MATRIX_LAYOUT_ORDER: return give(&m->order, sizeof m->order);
+    case CUBLASLT_MATRIX_LAYOUT_ROWS: return give(&m->rows, sizeof m->rows);
+    case CUBLASLT_MATRIX_LAYOUT_COLS: return give(&m->cols, sizeof m->cols);
+    case CUBLASLT_MATRIX_LAYOUT_LD: return give(&m->ld, sizeof m->ld);
+    case CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT: return give(&m->batch, sizeof m->batch);
+    case CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET: return give(&m->batch_stride, sizeof m->batch_stride);
+    default: return CUBLAS_STATUS_NOT_SUPPORTED;
+  }
 }
 
 VGPU_EXPORT cublasStatus_t cublasLtMatmulPreferenceCreate(cublasLtMatmulPreference_t* p) {
@@ -260,64 +341,277 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulAlgoGetHeuristic(
 
 /* ---- the matmul itself ---- */
 
+namespace {
+
+// Element conversions for every type a cuBLASLt matmul takes, by hand so the
+// library needs no CUDA half or fp8 header on the host side.
+double from_bits_fp8(uint8_t b, bool e4m3) {
+  const int sign = b >> 7;
+  const int ebits = e4m3 ? 4 : 5, mbits = e4m3 ? 3 : 2, bias = e4m3 ? 7 : 15;
+  const int e = (b >> mbits) & ((1 << ebits) - 1), m = b & ((1 << mbits) - 1);
+  double v;
+  if (e4m3 && e == 15 && m == 7) v = NAN;  // E4M3 has no infinity, one NaN
+  else if (!e4m3 && e == 31) v = m ? NAN : INFINITY;
+  else if (e == 0) v = std::ldexp((double)m, 1 - bias - mbits);
+  else v = std::ldexp((double)(m | (1 << mbits)), e - bias - mbits);
+  return sign ? -v : v;
+}
+// Round to nearest even, saturating to the largest finite value as cuBLASLt's
+// FP8 outputs do (448 for E4M3, 57344 for E5M2).
+uint8_t to_bits_fp8(double v, bool e4m3) {
+  const int mbits = e4m3 ? 3 : 2, bias = e4m3 ? 7 : 15;
+  const double maxv = e4m3 ? 448.0 : 57344.0;
+  if (std::isnan(v)) return 0x7f;  // the canonical NaN of both formats
+  const uint8_t sign = std::signbit(v) ? 0x80 : 0;
+  double a = std::fabs(v);
+  if (a >= maxv) return sign | (e4m3 ? 0x7e : 0x7b);
+  int e;
+  std::frexp(a, &e);  // a = f * 2^e, f in [0.5, 1)
+  int exp = e - 1;    // a = 1.x * 2^exp
+  const int emin = 1 - bias;
+  if (exp < emin) exp = emin;  // subnormal range: fixed quantum
+  const double quantum = std::ldexp(1.0, exp - mbits);
+  double q = std::nearbyint(a / quantum);  // default rounding: to nearest even
+  double r = q * quantum;
+  if (r >= maxv) return sign | (e4m3 ? 0x7e : 0x7b);
+  if (r == 0) return sign;
+  int re;
+  std::frexp(r, &re);
+  int rexp = re - 1;
+  if (rexp < emin) {  // subnormal
+    return sign | (uint8_t)(int)(r / std::ldexp(1.0, emin - mbits));
+  }
+  const int mant = (int)(r / std::ldexp(1.0, rexp - mbits)) - (1 << mbits);
+  return sign | (uint8_t)(((rexp + bias) << mbits) | mant);
+}
+double from_half(uint16_t h) {
+  const int e = (h >> 10) & 0x1f, m = h & 0x3ff;
+  double v = e == 0 ? std::ldexp((double)m, -24)
+             : e == 31 ? (m ? NAN : INFINITY)
+                       : std::ldexp((double)(m | 0x400), e - 25);
+  return (h & 0x8000) ? -v : v;
+}
+uint16_t to_half(double d) {
+  const float f = (float)d;
+  uint32_t x;
+  std::memcpy(&x, &f, 4);
+  const uint32_t sign = (x >> 16) & 0x8000;
+  const int e = (int)((x >> 23) & 0xff) - 112;
+  uint32_t m = x & 0x7fffff;
+  if (((x >> 23) & 0xff) == 0xff) return (uint16_t)(sign | 0x7c00 | (m ? 0x200 : 0));
+  if (e >= 31) return (uint16_t)(sign | 0x7c00);
+  if (e <= 0) {
+    if (e < -10) return (uint16_t)sign;
+    m |= 0x800000;
+    const int shift = 14 - e;
+    uint32_t h = m >> shift;
+    const uint32_t rem = m & ((1u << shift) - 1), half = 1u << (shift - 1);
+    if (rem > half || (rem == half && (h & 1))) ++h;
+    return (uint16_t)(sign | h);
+  }
+  uint32_t h = ((uint32_t)e << 10) | (m >> 13);
+  const uint32_t rem = m & 0x1fff;
+  if (rem > 0x1000 || (rem == 0x1000 && (h & 1))) ++h;
+  return (uint16_t)(sign | h);
+}
+double from_bf16(uint16_t b) {
+  const uint32_t x = (uint32_t)b << 16;
+  float f;
+  std::memcpy(&f, &x, 4);
+  return f;
+}
+uint16_t to_bf16(double d) {
+  const float f = (float)d;
+  uint32_t x;
+  std::memcpy(&x, &f, 4);
+  if ((x & 0x7fffffff) > 0x7f800000) return (uint16_t)((x >> 16) | 0x40);
+  x += 0x7fff + ((x >> 16) & 1);
+  return (uint16_t)(x >> 16);
+}
+
+size_t elem_bytes(cudaDataType t) {
+  switch (t) {
+    case CUDA_R_8F_E4M3: case CUDA_R_8F_E5M2: return 1;
+    case CUDA_R_16F: case CUDA_R_16BF: return 2;
+    case CUDA_R_32F: return 4;
+    case CUDA_R_64F: return 8;
+    default: return 0;
+  }
+}
+bool is_fp8(cudaDataType t) { return t == CUDA_R_8F_E4M3 || t == CUDA_R_8F_E5M2; }
+
+// A device buffer of `n` elements of type `t`, as doubles.
+std::vector<double> read_as_double(const void* dev, size_t n, cudaDataType t) {
+  std::vector<double> out(n);
+  if (!n) return out;
+  std::vector<uint8_t> raw(n * elem_bytes(t));
+  cudaMemcpy(raw.data(), dev, raw.size(), cudaMemcpyDeviceToHost);
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t* p = raw.data() + i * elem_bytes(t);
+    switch (t) {
+      case CUDA_R_8F_E4M3: out[i] = from_bits_fp8(*p, true); break;
+      case CUDA_R_8F_E5M2: out[i] = from_bits_fp8(*p, false); break;
+      case CUDA_R_16F: { uint16_t h; std::memcpy(&h, p, 2); out[i] = from_half(h); break; }
+      case CUDA_R_16BF: { uint16_t h; std::memcpy(&h, p, 2); out[i] = from_bf16(h); break; }
+      case CUDA_R_32F: { float f; std::memcpy(&f, p, 4); out[i] = f; break; }
+      default: std::memcpy(&out[i], p, 8); break;
+    }
+  }
+  return out;
+}
+void encode(double v, cudaDataType t, uint8_t* p) {
+  switch (t) {
+    case CUDA_R_8F_E4M3: *p = to_bits_fp8(v, true); break;
+    case CUDA_R_8F_E5M2: *p = to_bits_fp8(v, false); break;
+    case CUDA_R_16F: { const uint16_t h = to_half(v); std::memcpy(p, &h, 2); break; }
+    case CUDA_R_16BF: { const uint16_t h = to_bf16(v); std::memcpy(p, &h, 2); break; }
+    case CUDA_R_32F: { const float f = (float)v; std::memcpy(p, &f, 4); break; }
+    default: std::memcpy(p, &v, 8); break;
+  }
+}
+
+// The span, in elements, a layout's one matrix occupies.
+size_t span(const MatrixLayout& l) {
+  if (!l.rows || !l.cols) return 0;
+  return l.order == CUBLASLT_ORDER_ROW ? (size_t)(l.rows - 1) * l.ld + l.cols
+                                       : (size_t)(l.cols - 1) * l.ld + l.rows;
+}
+size_t at(const MatrixLayout& l, int64_t r, int64_t c) {
+  return l.order == CUBLASLT_ORDER_ROW ? (size_t)r * l.ld + c : (size_t)c * l.ld + r;
+}
+
+// alpha and beta are of the scale type; a scale is always fp32.
+double read_scalar(const void* p, cudaDataType t, bool device) {
+  if (!p) return 0.0;
+  if (device) return read_as_double(p, 1, t)[0];
+  switch (t) {
+    case CUDA_R_64F: return *static_cast<const double*>(p);
+    case CUDA_R_16F: return from_half(*static_cast<const uint16_t*>(p));
+    case CUDA_R_16BF: return from_bf16(*static_cast<const uint16_t*>(p));
+    default: return *static_cast<const float*>(p);
+  }
+}
+
+}  // namespace
+
 VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t desc,
                                           const void* alpha, const void* A,
                                           cublasLtMatrixLayout_t Adesc, const void* B,
                                           cublasLtMatrixLayout_t Bdesc, const void* beta,
                                           const void* C, cublasLtMatrixLayout_t Cdesc, void* D,
                                           cublasLtMatrixLayout_t Ddesc, const cublasLtMatmulAlgo_t*,
-                                          void*, size_t, cudaStream_t) {
-  if (!known(h) || !known(desc) || !known(Adesc) || !known(Bdesc) || !known(Ddesc))
-    return CUBLAS_STATUS_NOT_INITIALIZED;
-  auto* md = reinterpret_cast<MatmulDesc*>(desc);
-  auto* la = reinterpret_cast<MatrixLayout*>(Adesc);
-  auto* lb = reinterpret_cast<MatrixLayout*>(Bdesc);
-  auto* ld_ = reinterpret_cast<MatrixLayout*>(Ddesc);
-  auto* lc = known(Cdesc) ? reinterpret_cast<MatrixLayout*>(Cdesc) : ld_;
+                                          void*, size_t, cudaStream_t stream) {
+  // Any handle will do, not only one cublasLtCreate made: a cuBLAS handle is
+  // a valid cuBLASLt handle, and PyTorch passes its cuBLAS handle here. This
+  // library keeps nothing in a handle.
+  if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!known(desc) || !known(Adesc) || !known(Bdesc) || !known(Ddesc)) return CUBLAS_STATUS_INVALID_VALUE;
+  const auto& md = *reinterpret_cast<MatmulDesc*>(desc);
+  const auto& la = *reinterpret_cast<MatrixLayout*>(Adesc);
+  const auto& lb = *reinterpret_cast<MatrixLayout*>(Bdesc);
+  const auto& ld = *reinterpret_cast<MatrixLayout*>(Ddesc);
+  const auto& lc = known(Cdesc) ? *reinterpret_cast<MatrixLayout*>(Cdesc) : ld;
 
-  if (la->type != CUDA_R_32F || lb->type != CUDA_R_32F || ld_->type != CUDA_R_32F) {
-    if (trace())
-      std::fprintf(stderr, "[vgpu] cublasLtMatmul: only fp32 is implemented (A=%d B=%d D=%d)\n",
-                   (int)la->type, (int)lb->type, (int)ld_->type);
+  auto refuse = [&](const char* why) {
+    if (trace() || !quiet())
+      std::fprintf(stderr, "[vgpu] cublasLtMatmul: %s (A=%d B=%d C=%d D=%d)\n", why, (int)la.type,
+                   (int)lb.type, (int)lc.type, (int)ld.type);
     return CUBLAS_STATUS_NOT_SUPPORTED;
+  };
+  if (!elem_bytes(la.type) || !elem_bytes(lb.type) || !elem_bytes(lc.type) || !elem_bytes(ld.type))
+    return refuse("a matrix type other than fp64, fp32, fp16, bf16 or fp8");
+  const bool ta = md.transa != CUBLAS_OP_N, tb = md.transb != CUBLAS_OP_N;
+  const int64_t m = (int64_t)ld.rows, n = (int64_t)ld.cols;
+  const int64_t k = ta ? (int64_t)la.rows : (int64_t)la.cols;
+  if ((ta ? (int64_t)la.cols : (int64_t)la.rows) != m || (tb ? (int64_t)lb.cols : (int64_t)lb.rows) != k ||
+      (tb ? (int64_t)lb.rows : (int64_t)lb.cols) != n || (int64_t)lc.rows != m || (int64_t)lc.cols != n)
+    return CUBLAS_STATUS_INVALID_VALUE;
+
+  bool relu = false, gelu_ = false, bias = false;
+  switch (md.epilogue) {
+    case CUBLASLT_EPILOGUE_DEFAULT: break;
+    case CUBLASLT_EPILOGUE_RELU: relu = true; break;
+    case CUBLASLT_EPILOGUE_BIAS: bias = true; break;
+    case CUBLASLT_EPILOGUE_RELU_BIAS: relu = bias = true; break;
+    case CUBLASLT_EPILOGUE_GELU: gelu_ = true; break;
+    case CUBLASLT_EPILOGUE_GELU_BIAS: gelu_ = bias = true; break;
+    default: return refuse("an epilogue other than bias, ReLU and GELU");
   }
-  const bool ta = md->transa != CUBLAS_OP_N, tb = md->transb != CUBLAS_OP_N;
-  const int64_t m = static_cast<int64_t>(ld_->rows), n = static_cast<int64_t>(ld_->cols);
-  const int64_t k = ta ? static_cast<int64_t>(la->rows) : static_cast<int64_t>(la->cols);
-  const float al = alpha ? *static_cast<const float*>(alpha) : 1.0f;
-  const float be = beta ? *static_cast<const float*>(beta) : 0.0f;
+  const bool vec_a = md.a_scale_mode == kScaleOuterVec, vec_b = md.b_scale_mode == kScaleOuterVec;
+  if ((md.a_scale_mode != kScaleScalar && !vec_a) || (md.b_scale_mode != kScaleScalar && !vec_b) ||
+      md.c_scale_mode != kScaleScalar || md.d_scale_mode != kScaleScalar)
+    return refuse("a block-scaled mode");
+  const int pm = md.pointer_mode;
+  if (pm < CUBLASLT_POINTER_MODE_HOST || pm > CUBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_HOST)
+    return CUBLAS_STATUS_INVALID_VALUE;
 
-  auto hA = fetch<float>(A, static_cast<size_t>(la->ld) * la->cols);
-  auto hB = fetch<float>(B, static_cast<size_t>(lb->ld) * lb->cols);
-  auto hC = (C && be != 0.0f) ? fetch<float>(C, static_cast<size_t>(lc->ld) * lc->cols)
-                              : std::vector<float>(static_cast<size_t>(lc->ld) * lc->cols, 0.0f);
-  std::vector<float> hD(static_cast<size_t>(ld_->ld) * ld_->cols, 0.0f);
+  // The inputs are complete once the stream has reached this call.
+  cudaStreamSynchronize(stream);
 
-  std::vector<float> hBias;
-  const bool want_bias = md->epilogue == CUBLASLT_EPILOGUE_BIAS ||
-                         md->epilogue == CUBLASLT_EPILOGUE_RELU_BIAS ||
-                         md->epilogue == CUBLASLT_EPILOGUE_GELU_BIAS;
-  if (want_bias && md->bias) hBias = fetch<float>(md->bias, static_cast<size_t>(m));
+  // alpha and beta: scalars on the host or device, or per-row vectors on the device.
+  const bool alpha_vec = pm >= CUBLASLT_POINTER_MODE_DEVICE_VECTOR;
+  const bool beta_vec = pm == CUBLASLT_POINTER_MODE_DEVICE_VECTOR;
+  const bool beta_zero = pm == CUBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_ZERO;
+  const std::vector<double> alphas = alpha_vec ? read_as_double(alpha, (size_t)m, md.scale)
+                                               : std::vector<double>{alpha ? read_scalar(alpha, md.scale, pm == CUBLASLT_POINTER_MODE_DEVICE) : 1.0};
+  const std::vector<double> betas =
+      beta_zero ? std::vector<double>{0.0}
+      : beta_vec ? read_as_double(beta, (size_t)m, md.scale)
+                 : std::vector<double>{beta ? read_scalar(beta, md.scale, pm == CUBLASLT_POINTER_MODE_DEVICE) : 0.0};
+  bool any_beta = false;
+  for (double b : betas) any_beta = any_beta || b != 0.0;
 
-  for (int64_t j = 0; j < n; ++j) {
-    for (int64_t i = 0; i < m; ++i) {
-      float acc = 0.0f;
-      for (int64_t p = 0; p < k; ++p)
-        acc += hA[ta ? idx(p, i, la->ld) : idx(i, p, la->ld)] *
-               hB[tb ? idx(j, p, lb->ld) : idx(p, j, lb->ld)];
-      float v = al * acc;
-      if (be != 0.0f) v += be * hC[idx(i, j, lc->ld)];
-      if (!hBias.empty()) v += hBias[i];
-      switch (md->epilogue) {
-        case CUBLASLT_EPILOGUE_RELU:
-        case CUBLASLT_EPILOGUE_RELU_BIAS: v = v > 0.0f ? v : 0.0f; break;
-        case CUBLASLT_EPILOGUE_GELU:
-        case CUBLASLT_EPILOGUE_GELU_BIAS: v = gelu(v); break;
-        default: break;
+  // FP8 scales (fp32 on the device); a scale left unset is 1. The C and D
+  // scales apply only to fp8 C and D.
+  auto scales = [](const void* p, size_t count) {
+    return p ? read_as_double(p, count, CUDA_R_32F) : std::vector<double>(count, 1.0);
+  };
+  const std::vector<double> sa = scales(md.a_scale, vec_a ? (size_t)m : 1);
+  const std::vector<double> sb = scales(md.b_scale, vec_b ? (size_t)n : 1);
+  const double sc = is_fp8(lc.type) ? scales(md.c_scale, 1)[0] : 1.0;
+  const double sd = is_fp8(ld.type) ? scales(md.d_scale, 1)[0] : 1.0;
+
+  cudaDataType bias_type = (cudaDataType)md.bias_type;
+  if (md.bias_type < 0) bias_type = is_fp8(ld.type) ? CUDA_R_16BF : ld.type;
+  std::vector<double> hbias;
+  if (bias && md.bias) {
+    if (!elem_bytes(bias_type)) return refuse("a bias type it cannot read");
+    hbias = read_as_double(md.bias, (size_t)m, bias_type);
+  }
+
+  const int batch = ld.batch;
+  if ((la.batch != 1 && la.batch != batch) || (lb.batch != 1 && lb.batch != batch)) return CUBLAS_STATUS_INVALID_VALUE;
+  double amax = 0.0;
+  for (int bi = 0; bi < batch; ++bi) {
+    auto base = [&](const void* p, const MatrixLayout& l) {
+      return static_cast<const uint8_t*>(p) + (size_t)bi * (size_t)l.batch_stride * elem_bytes(l.type);
+    };
+    const auto ha = read_as_double(base(A, la), span(la), la.type);
+    const auto hb = read_as_double(base(B, lb), span(lb), lb.type);
+    const auto hc = (C && any_beta) ? read_as_double(base(C, lc), span(lc), lc.type) : std::vector<double>();
+    // D is read too, so the gaps a leading dimension leaves come back untouched.
+    uint8_t* dptr = static_cast<uint8_t*>(D) + (size_t)bi * (size_t)ld.batch_stride * elem_bytes(ld.type);
+    std::vector<uint8_t> hd(span(ld) * elem_bytes(ld.type));
+    if (!hd.empty()) cudaMemcpy(hd.data(), dptr, hd.size(), cudaMemcpyDeviceToHost);
+    for (int64_t j = 0; j < n; ++j)
+      for (int64_t i = 0; i < m; ++i) {
+        double acc = 0.0;
+        for (int64_t p = 0; p < k; ++p)
+          acc += ha[ta ? at(la, p, i) : at(la, i, p)] * hb[tb ? at(lb, j, p) : at(lb, p, j)];
+        const double al = alphas[alpha_vec ? (size_t)i : 0], be = betas[beta_vec ? (size_t)i : 0];
+        double v = al * sa[vec_a ? (size_t)i : 0] * sb[vec_b ? (size_t)j : 0] * acc;
+        if (be != 0.0 && !hc.empty()) v += be * sc * hc[at(lc, i, j)];
+        if (!hbias.empty()) v += hbias[(size_t)i];
+        if (relu) v = v > 0.0 ? v : 0.0;
+        if (gelu_) v = gelu((float)v);
+        amax = std::fmax(amax, std::fabs(v));
+        encode(v * sd, ld.type, hd.data() + at(ld, i, j) * elem_bytes(ld.type));
       }
-      hD[idx(i, j, ld_->ld)] = v;
-    }
+    if (!hd.empty()) cudaMemcpy(dptr, hd.data(), hd.size(), cudaMemcpyHostToDevice);
   }
-  store(D, hD);
+  if (md.amax_d) {
+    const float a = (float)amax;
+    cudaMemcpy(md.amax_d, &a, sizeof a, cudaMemcpyHostToDevice);
+  }
   return CUBLAS_STATUS_SUCCESS;
 }

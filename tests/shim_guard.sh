@@ -19,7 +19,8 @@ require_shim_libs() {
   command -v objdump >/dev/null 2>&1 || return 0
   for need in $(objdump -p "$bin" 2>/dev/null | awk '/NEEDED/ {print $2}'); do
     case "$need" in
-      libcudart.so.*|libcublas.so.*|libcublasLt.so.*|libnccl.so.*|libcuda.so.*|libcudnn.so.*)
+      libcudart.so.*|libcublas.so.*|libcublasLt.so.*|libnccl.so.*|libcuda.so.*|libcudnn.so.*|\
+      libcufft.so.*|libcusolver.so.*|libcusparse.so.*|libcurand.so.*)
         if [[ ! -e "$shim/$need" ]]; then
           echo "SKIP: app needs $need, which $shim does not provide" \
                "(nvcc's toolkit major differs from this build's)"
