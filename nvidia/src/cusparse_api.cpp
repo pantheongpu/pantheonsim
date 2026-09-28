@@ -890,6 +890,8 @@ VGPU_EXPORT cusparseStatus_t cusparseCsr2cscEx2(
   return cudaMemcpy(cscColPtr, colptr.data(), colptr.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess
              ? CUSPARSE_STATUS_SUCCESS
              : CUSPARSE_STATUS_INTERNAL_ERROR;
+}
+
 /* ---- pointer mode, and the attributes a descriptor carries beyond its arrays ---- */
 
 VGPU_EXPORT cusparseStatus_t cusparseSetPointerMode(cusparseHandle_t h, cusparsePointerMode_t mode) {
