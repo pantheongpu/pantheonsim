@@ -1225,7 +1225,9 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
       if (!kernelParams[i])
         throw vgpu::Error::make(vgpu::Err::InvalidValue, "kernelParams[", i, "] is NULL (kernel '",
                                 rec.fn->name, "' takes ", params.size(), " parameters)");
-      uint32_t size = params[i].ty.bytes();
+      // The whole parameter: a struct passed by value is a .b8 array in PTX,
+      // whose element is one byte and whose size is the struct's.
+      uint32_t size = params[i].size;
       args[i].resize(size);
       std::memcpy(args[i].data(), kernelParams[i], size);
     }

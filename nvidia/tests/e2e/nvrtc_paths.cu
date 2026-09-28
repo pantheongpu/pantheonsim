@@ -146,6 +146,35 @@ template <int K> __global__ void times(float* x, int n) {
   check(ran && x[0] == 6.0f && x[7] == 6.0f, "the kernel found by its lowered name runs");
 }
 
+// A struct passed by value, as the jiterator passes its arrays of pointers
+// and its offset calculators: in PTX a .b8 array parameter, launched through
+// the driver API's kernelParams.
+static void struct_parameter() {
+  const char* src = R"(
+struct Pack { float scale[4]; };
+extern "C" __global__ void packed(Pack p, float* x) { x[threadIdx.x] *= p.scale[threadIdx.x % 4]; }
+)";
+  const std::string ptx = compile(src, "packed.cu", {"--gpu-architecture=compute_80"});
+  if (ptx.empty()) { check(false, "a kernel taking a struct by value compiles"); return; }
+  CUmodule mod;
+  CUfunction fn;
+  CK(cuModuleLoadData(&mod, ptx.c_str()));
+  CK(cuModuleGetFunction(&fn, mod, "packed"));
+  struct Pack { float scale[4]; } pack = {{1.0f, 2.0f, 3.0f, 4.0f}};
+  std::vector<float> x(8, 1.0f);
+  CUdeviceptr d;
+  cuMemAlloc(&d, x.size() * sizeof(float));
+  cuMemcpyHtoD(d, x.data(), x.size() * sizeof(float));
+  void* args[] = {&pack, &d};
+  const bool ran = cuLaunchKernel(fn, 1, 1, 1, 8, 1, 1, 0, nullptr, args, nullptr) == CUDA_SUCCESS &&
+                   cuCtxSynchronize() == CUDA_SUCCESS;
+  cuMemcpyDtoH(x.data(), d, x.size() * sizeof(float));
+  check(ran && x[0] == 1.0f && x[3] == 4.0f && x[6] == 3.0f,
+        "a kernel taking a 16-byte struct by value launches through cuLaunchKernel with it intact");
+  cuMemFree(d);
+  cuModuleUnload(mod);
+}
+
 static void compile_error() {
   nvrtcProgram p;
   CK(nvrtcCreateProgram(&p, "__global__ void k() { undeclared_thing(); }", "bad.cu", 0, nullptr, nullptr));
@@ -167,6 +196,7 @@ int main() {
   }
   jiterator_shaped();
   name_expressions_and_headers();
+  struct_parameter();
   compile_error();
   cuDevicePrimaryCtxRelease(dev);
   std::printf(failures ? "FAIL: %d NVRTC checks\n" : "PASS: every NVRTC check\n", failures);
