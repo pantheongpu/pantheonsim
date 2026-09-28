@@ -875,6 +875,10 @@ narrows what counts as observable, not what the detector looks at.
   fprop test, whose eight tile and cluster shapes pass against its host
   reference and fail with the offsets broken.
 
+- Blackwell Ultra (sm_103a, a simulated B300 as nvidia/b300): the fp4 MMAs
+  at K = 96 with three or six scale factors a row, shared-memory descriptors
+  with an absolute leading-dimension address, and `tcgen05.ld.red`. CUTLASS's
+  SM103 fp4 GEMMs run in e2e_cutlass_sm103. See nvidia/docs/blackwell.md.
 - Blackwell's tensor core (sm_100a/sm_100f, PTX ISA 9.7.18): Tensor Memory
   (128 lanes x 512 columns per CTA) allocated with `tcgen05.alloc`/`dealloc`
   -- for a CTA pair with `.cta_group::2` -- and checked for leaks at exit;
