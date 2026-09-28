@@ -1341,6 +1341,10 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, 
       // host address; see cudaHostGetDevicePointer.
       case cudaDevAttrCanMapHostMemory: *value = 1; break;
       case cudaDevAttrManagedMemory: *value = 1; break;
+      // The host and the device may touch managed memory at the same time, as
+      // on Linux since Pascal (Windows and WSL answer 0): here it is one
+      // host allocation. NanoVDB's DeviceStreamMap filters devices on it.
+      case cudaDevAttrConcurrentManagedAccess: *value = 1; break;
       // Grid-wide sync works under cudaLaunchCooperativeKernel; the
       // multi-device form does not.
       case cudaDevAttrCooperativeLaunch: *value = 1; break;
@@ -1740,6 +1744,20 @@ VGPU_EXPORT cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* 
 
 VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
   return guard("cudaMemset", [&](State& s) {
+    // Managed and pinned memory are filled like device memory, as an RTX 3060
+    // fills them (NanoVDB zeroes a managed grid buffer this way); here they
+    // are host addresses. Pageable and cudaHostRegister'd memory fall through
+    // to the device fill, which refuses them, as CUDA does.
+    if (!is_device_ptr(dst)) {
+      for (auto* ranges : {&s.managed_allocs, &s.host_allocs}) {
+        auto it = find_range(*ranges, dst);
+        if (it == ranges->end()) continue;
+        const size_t off = static_cast<size_t>(static_cast<char*>(dst) - static_cast<char*>(it->first));
+        if (count > it->second.size - off) return cudaErrorInvalidValue;
+        std::memset(dst, value, count);
+        return cudaSuccess;
+      }
+    }
     const uint8_t byte = static_cast<uint8_t>(value);
     owner_memory(s, dst).fill(reinterpret_cast<uint64_t>(dst), &byte, 1, count);
     return cudaSuccess;
