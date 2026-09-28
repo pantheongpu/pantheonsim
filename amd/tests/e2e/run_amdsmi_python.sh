@@ -15,6 +15,10 @@ build="$(cd "${VGPU_BUILD_DIR:-$root/build}" && pwd)"
 shim="$build/shim"
 [[ -e "$shim/libamd_smi.so" ]] || { echo "SKIP: no libamd_smi in $shim"; exit 0; }
 command -v python3 >/dev/null || { echo "SKIP: no python3"; exit 0; }
+# ctypes loads the library into python, which a sanitizer runtime refuses.
+. "$root/tests/shim_guard.sh"
+san="$(shim_sanitizer "$shim")"
+[[ -z "$san" ]] || { echo "SKIP: $san library cannot load into python"; exit 0; }
 
 url="https://wheels.vllm.ai/rocm/ced6857afa0ea7b2e3f0846a62e1394e90f15607/amdsmi-26.2.2%2Bc2d9476115-py3-none-any.whl"
 sha=c711cdf0a23684735b258a9410b177e68b1d249e31aa558813efa3ebce5ebb63
