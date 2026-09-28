@@ -803,6 +803,9 @@ struct OpTex {
   // bilinear-footprint texels are returned, or -1 for an ordinary fetch.
   int gather = -1;
 };
+// suld/sust's out-of-range policy: fault, clamp to the nearest location, or
+// read zero / drop the store.
+enum SurfaceOob : uint8_t { kSurfTrap = 0, kSurfClamp = 1, kSurfZero = 2 };
 struct OpSuld {
   uint32_t dims = 1;
   bool layered = false;          // .a1d/.a2d: coords are {layer, x[, y, ignored]}
@@ -810,11 +813,14 @@ struct OpSuld {
   std::vector<Reg> dsts;
   Operand obj;
   std::vector<Operand> coords;   // x is a *byte* offset, y and z are texel rows
+  // Out-of-range policy (.trap, .clamp, .zero), as SurfaceOob below.
+  uint8_t oob = 0;
 };
 struct OpSust {
   uint32_t dims = 1;
   bool layered = false;
   uint32_t bytes = 4;
+  uint8_t oob = 0;
   Operand obj;
   std::vector<Operand> coords;
   std::vector<Operand> srcs;

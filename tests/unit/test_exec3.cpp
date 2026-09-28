@@ -3896,6 +3896,196 @@ VTEST(a_surface_access_past_the_edge_faults_rather_than_wrapping) {
   VCHECK(err.code() == Err::OutOfBounds);
 }
 
+// suld/sust's .clamp and .zero out-of-range policies (9.7.13.1-2), against
+// what an RTX 3060 (sm_86, driver 596.36) returned for the same accesses on
+// the same surfaces. The expected values are the card's output, copied.
+namespace {
+struct SurfCase {
+  int x, y, z, layer;
+};
+// One suld (or sust) per thread at its coordinates, on surface 9. `access`
+// is the instruction up to its operands, e.g. "suld.b.2d.b32.clamp"; loads
+// write their first component to out[thread].
+std::vector<uint32_t> surf_run(const std::string& access, const TextureDesc& d, const std::vector<SurfCase>& cs,
+                               Env& e, uint64_t data) {
+  const bool load = access.rfind("suld", 0) == 0;
+  const bool layered = access.find(".a1d") != std::string::npos || access.find(".a2d") != std::string::npos;
+  const bool v4 = access.find(".v4") != std::string::npos;
+  const int dims = access.find(".3d") != std::string::npos ? 3 : access.find("2d") != std::string::npos ? 2 : 1;
+  std::string coords = layered ? "%r13, %r10" : "%r10";
+  if (dims >= 2) coords += ", %r11";
+  if (dims == 3 || (layered && dims == 2)) coords += ", %r12, %r12";
+  const std::string regs = v4 ? "{%r20, %r21, %r22, %r23}" : "{%r20}";
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 s, .param .u64 c, .param .u64 out)
+{
+    .reg .b32 %r<30>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [s];
+    ld.param.u64 %rd2, [c];
+    ld.param.u64 %rd3, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd4, %r1, 16;
+    add.u64 %rd5, %rd2, %rd4;
+    ld.global.v4.u32 {%r10, %r11, %r12, %r13}, [%rd5];
+    mov.u32 %r20, 0xABCD0000;
+    add.u32 %r20, %r20, %r1;
+    mov.u32 %r21, 0xA1;
+    mov.u32 %r22, 0xA2;
+    mov.u32 %r23, 0xA3;
+)" + (load ? "    " + access + " " + regs + ", [%rd1, {" + coords + "}];\n"
+           : "    " + access + " [%rd1, {" + coords + "}], " + regs + ";\n") + R"(
+    mul.wide.u32 %rd4, %r1, 4;
+    add.u64 %rd6, %rd3, %rd4;
+    st.global.u32 [%rd6], %r20;
+    ret;
+}
+)";
+  auto m = ptx::parse(ptx);
+  std::vector<int32_t> c;
+  for (const SurfCase& k : cs) c.insert(c.end(), {k.x, k.y, k.z, k.layer});
+  const uint64_t pc = e.mem.alloc(c.size() * 4), out = e.mem.alloc(cs.size() * 4);
+  e.mem.write(pc, c.data(), c.size() * 4);
+  TextureTable tex;
+  tex[9] = d;
+  tex[9].base = data;
+  tex[9].object = TexKind::Surface;
+  LaunchConfig cfg;
+  cfg.block = {static_cast<uint32_t>(cs.size()), 1, 1};
+  cfg.textures = &tex;
+  exec::launch(m.entries[0], cfg, {arg_u64(9), arg_u64(pc), arg_u64(out)}, e.mem, e.prof);
+  std::vector<uint32_t> got(cs.size());
+  e.mem.read(out, got.data(), got.size() * 4);
+  return got;
+}
+TextureDesc surf_desc(uint32_t w, uint32_t h, uint32_t depth = 0, uint32_t layers = 0) {
+  TextureDesc d;
+  d.width = w;
+  d.height = h;
+  d.depth = depth;
+  d.layers = layers;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  return d;
+}
+std::string hex_list(const std::vector<uint32_t>& v) {
+  std::string s;
+  char b[12];
+  for (uint32_t x : v) {
+    std::snprintf(b, sizeof b, "%x ", x);
+    s += b;
+  }
+  return s;
+}
+}  // namespace
+
+// 2D, 8 x 4 u32 texels holding 0x1000 * y + x (32 bytes a row).
+VTEST(surface_clamp_and_zero_2d_as_an_rtx_3060_reads_them) {
+  Env e;
+  const uint64_t data = e.mem.alloc(128);
+  for (uint32_t i = 0; i < 32; ++i) e.mem.store_scalar(data + 4 * i, 4, 0x1000u * (i / 8) + i % 8);
+  const TextureDesc d = surf_desc(8, 4);
+  const int xs[] = {-8, -4, 0, 4, 28, 32, 36, 64, 1000}, ys[] = {-2, -1, 0, 3, 4, 9};
+  std::vector<SurfCase> cs;
+  for (int y : ys)
+    for (int x : xs) cs.push_back({x, y, 0, 0});
+  // The card's output, row by row (y = -2, -1, 0, 3, 4, 9).
+  const std::vector<uint32_t> clamp = {
+      0, 0, 0, 1, 7, 7, 7, 7, 7,  0, 0, 0, 1, 7, 7, 7, 7, 7,  0, 0, 0, 1, 7, 7, 7, 7, 7,
+      0x3000, 0x3000, 0x3000, 0x3001, 0x3007, 0x3007, 0x3007, 0x3007, 0x3007,
+      0x3000, 0x3000, 0x3000, 0x3001, 0x3007, 0x3007, 0x3007, 0x3007, 0x3007,
+      0x3000, 0x3000, 0x3000, 0x3001, 0x3007, 0x3007, 0x3007, 0x3007, 0x3007};
+  const std::vector<uint32_t> zero = {
+      0, 0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 1, 7, 0, 0, 0, 0,
+      0, 0, 0x3000, 0x3001, 0x3007, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0, 0};
+  VCHECK_EQ(hex_list(surf_run("suld.b.2d.b32.clamp", d, cs, e, data)), hex_list(clamp));
+  VCHECK_EQ(hex_list(surf_run("suld.b.2d.b32.zero", d, cs, e, data)), hex_list(zero));
+  // 8-bit loads clamp by the byte, not the texel: x = 32 reads byte 31.
+  std::vector<SurfCase> c8;
+  for (int x : {-3, -1, 0, 1, 29, 30, 31, 32, 33, 35, 100}) c8.push_back({x, 1, 0, 0});
+  std::vector<uint32_t> b8 = surf_run("suld.b.2d.b8.clamp", d, c8, e, data);
+  for (uint32_t& v : b8) v &= 0xFF;
+  VCHECK_EQ(hex_list(b8), hex_list({0, 0, 0, 0x10, 0x10, 0, 0, 0, 0, 0, 0}));
+}
+
+// Stores land where a load would read (.clamp) or not at all (.zero).
+VTEST(surface_clamp_and_zero_stores_as_an_rtx_3060_makes_them) {
+  const SurfCase cs[] = {{-4, 1, 0, 0}, {-8, 1, 0, 0}, {32, 1, 0, 0}, {28, 1, 0, 0},
+                         {36, 1, 0, 0}, {100, 1, 0, 0}, {8, -1, 0, 0}, {8, 7, 0, 0}};
+  // The texel each store changed on the card, as (x, y); (-1, -1) for none.
+  const int clamp_at[][2] = {{0, 1}, {0, 1}, {7, 1}, {7, 1}, {7, 1}, {7, 1}, {2, 0}, {2, 3}};
+  const int zero_at[][2] = {{-1, -1}, {-1, -1}, {-1, -1}, {7, 1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}};
+  for (int policy = 0; policy < 2; ++policy)
+    for (int k = 0; k < 8; ++k) {
+      Env e;
+      const uint64_t data = e.mem.alloc(128);
+      for (uint32_t i = 0; i < 32; ++i) e.mem.store_scalar(data + 4 * i, 4, 0x1000u * (i / 8) + i % 8);
+      surf_run(policy ? "sust.b.2d.b32.zero" : "sust.b.2d.b32.clamp", surf_desc(8, 4), {cs[k]}, e, data);
+      const int* at = policy ? zero_at[k] : clamp_at[k];
+      for (uint32_t i = 0; i < 32; ++i) {
+        const bool here = int(i % 8) == at[0] && int(i / 8) == at[1];
+        VCHECK_EQ(e.mem.load_scalar(data + 4 * i, 4), here ? uint64_t{0xABCD0000u} : uint64_t{0x1000u * (i / 8) + i % 8});
+      }
+    }
+}
+
+// A 16-byte .v4 on a 24-byte 1D row: .clamp reads and writes at byte 0 (the
+// last aligned place it fits), and .zero treats the whole access as out of
+// range when part of it is. Then 3D and layered 2D, per coordinate.
+VTEST(surface_clamp_and_zero_vectors_3d_and_layers_as_an_rtx_3060_does) {
+  {
+    Env e;
+    const uint64_t data = e.mem.alloc(64);
+    for (uint32_t i = 0; i < 6; ++i) e.mem.store_scalar(data + 4 * i, 4, i);
+    const TextureDesc d = surf_desc(6, 0);
+    std::vector<SurfCase> cs;
+    for (int x : {-16, 0, 16, 32, 48}) cs.push_back({x, 0, 0, 0});
+    VCHECK_EQ(hex_list(surf_run("suld.b.1d.v4.b32.clamp", d, cs, e, data)), hex_list({0, 0, 0, 0, 0}));
+    VCHECK_EQ(hex_list(surf_run("suld.b.1d.v4.b32.zero", d, cs, e, data)), hex_list({0, 0, 0, 0, 0}));
+    // The first component alone does not show .zero's whole-access rule
+    // (texel 0 is 0), so the store side does: at x = 16 nothing is written.
+    surf_run("sust.b.1d.v4.b32.zero", d, {{16, 0, 0, 0}}, e, data);
+    for (uint32_t i = 0; i < 6; ++i) VCHECK_EQ(e.mem.load_scalar(data + 4 * i, 4), uint64_t{i});
+    surf_run("sust.b.1d.v4.b32.clamp", d, {{16, 0, 0, 0}}, e, data);
+    const uint32_t after[] = {0xABCD0000u, 0xA1, 0xA2, 0xA3, 4, 5};
+    for (uint32_t i = 0; i < 6; ++i) VCHECK_EQ(e.mem.load_scalar(data + 4 * i, 4), uint64_t{after[i]});
+  }
+  {
+    Env e;   // 3D, 4 x 2 x 3, 0x100 z + 0x10 y + x
+    const uint64_t data = e.mem.alloc(128);
+    for (uint32_t z = 0; z < 3; ++z)
+      for (uint32_t y = 0; y < 2; ++y)
+        for (uint32_t x = 0; x < 4; ++x) e.mem.store_scalar(data + 4 * ((z * 2 + y) * 4 + x), 4, 0x100 * z + 0x10 * y + x);
+    const std::vector<SurfCase> cs = {{4, 1, 1, 0}, {16, 1, 1, 0}, {4, 5, 1, 0}, {4, 1, 3, 0}, {4, 1, -1, 0}, {-4, -1, 7, 0}};
+    VCHECK_EQ(hex_list(surf_run("suld.b.3d.b32.clamp", surf_desc(4, 2, 3), cs, e, data)),
+              hex_list({0x111, 0x113, 0x111, 0x211, 0x11, 0x200}));
+    VCHECK_EQ(hex_list(surf_run("suld.b.3d.b32.zero", surf_desc(4, 2, 3), cs, e, data)),
+              hex_list({0x111, 0, 0, 0, 0, 0}));
+  }
+  {
+    Env e;   // layered 2D, 4 x 2, 3 layers, 0x100 layer + 0x10 y + x; -1 is layer 0xFFFFFFFF
+    const uint64_t data = e.mem.alloc(128);
+    for (uint32_t l = 0; l < 3; ++l)
+      for (uint32_t y = 0; y < 2; ++y)
+        for (uint32_t x = 0; x < 4; ++x) e.mem.store_scalar(data + 4 * ((l * 2 + y) * 4 + x), 4, 0x100 * l + 0x10 * y + x);
+    const std::vector<SurfCase> cs = {{4, 1, 0, 1}, {4, 1, 0, 3}, {4, 1, 0, 5}, {4, 1, 0, -1}, {16, 3, 0, 2}};
+    VCHECK_EQ(hex_list(surf_run("suld.b.a2d.b32.clamp", surf_desc(4, 2, 0, 3), cs, e, data)),
+              hex_list({0x111, 0x211, 0x211, 0x211, 0x213}));
+    VCHECK_EQ(hex_list(surf_run("suld.b.a2d.b32.zero", surf_desc(4, 2, 0, 3), cs, e, data)),
+              hex_list({0x111, 0, 0, 0, 0}));
+  }
+}
+
+// Misaligned x faults under every policy, as on the card.
+VTEST(surface_clamp_and_zero_fault_on_a_misaligned_x) {
+  Env e;
+  const uint64_t data = e.mem.alloc(128);
+  for (const char* a : {"suld.b.2d.b32.clamp", "suld.b.2d.b32.zero"}) {
+    auto err = VCAPTURE(Error, surf_run(a, surf_desc(8, 4), {{29, 1, 0, 0}}, e, data));
+    VCHECK(err.code() == Err::MisalignedAccess);
+  }
+}
+
 // Linear filtering against a table recorded on an RTX 3060 (sm_86) running the
 // same fetches on the same textures (the whole rule set is checked bit for bit
 // by e2e_texture_filtering; these are its corners, runnable without nvcc):

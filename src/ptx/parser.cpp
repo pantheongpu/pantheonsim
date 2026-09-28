@@ -3711,6 +3711,7 @@ class Parser {
       // sust.b.<geom>.<type>.<clamp> [obj, {x,y}], {s,...}
       uint32_t dims = 0, bytes = 0;
       bool layered = false;
+      uint8_t oob = kSurfTrap;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "b") ;              // byte-addressed, the only form ptxas emits
@@ -3720,13 +3721,12 @@ class Parser {
         else if (p == "3d") dims = 3;
         else if (p == "a1d") { dims = 1; layered = true; }
         else if (p == "a2d") { dims = 2; layered = true; }
-        // Out-of-range policy. ".trap" is what a surface access compiles to by
-        // default and is the only one implemented: ".clamp" and ".zero" change
-        // the result rather than the diagnostics, so accepting them silently
-        // would answer a different question.
-        else if (p == "trap") ;
-        else if (p == "clamp" || p == "zero")
-          return unsupported("suld/sust '." + p + "' out-of-range policy is not implemented");
+        // Out-of-range policy: .trap (what surf2Dread compiles to by default),
+        // .clamp or .zero (9.7.13.1-2), as the interpreter's surface_address
+        // describes.
+        else if (p == "trap") oob = kSurfTrap;
+        else if (p == "clamp") oob = kSurfClamp;
+        else if (p == "zero") oob = kSurfZero;
         else if (p == "v2" || p == "v4") ;
         else if (p == "b8") bytes = 1;
         else if (p == "b16") bytes = 2;
@@ -3739,6 +3739,7 @@ class Parser {
       if (op0 == "suld") {
         OpSuld op;
         op.dims = dims;
+        op.oob = oob;
         op.layered = layered;
         op.bytes = bytes;
         op.dsts = parse_reg_vector_any();
@@ -3753,6 +3754,7 @@ class Parser {
       } else {
         OpSust op;
         op.dims = dims;
+        op.oob = oob;
         op.layered = layered;
         op.bytes = bytes;
         expect_punct("[");
