@@ -1333,6 +1333,11 @@ set_tests_properties(e2e_surface_oob PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
+add_test(NAME e2e_stack_limit COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_stack_limit.sh)
+set_tests_properties(e2e_stack_limit PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
 add_test(NAME e2e_texture_layers COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_layers.sh)
 set_tests_properties(e2e_texture_layers PROPERTIES
   DEPENDS vgpucudart

@@ -1083,6 +1083,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       lim.heap_used = lim.heap_used || kc->second.heap;
       lim.printf_used = lim.printf_used || kc->second.printf;
       cfg.device_heap_bytes = lim.malloc_heap;
+      cfg.stack_bytes = lim.stack;   // cudaLimitStackSize: each thread's alloca stack
     }
     if (cooperative) {
       // A cooperative launch promises every block is resident, so the grid has
