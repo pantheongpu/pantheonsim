@@ -108,6 +108,39 @@ expect "amd-smi topology: Instinct cards are one XGMI hop apart" "XGMI" \
 expect "rocm-smi --showtopo: Radeon cards reach each other over PCIe" "PCIE" \
   "$(sess amd/rx7900xtx -c 'rocm-smi --showtopo' | awk '/Link Type/{f=1; next} f&&/^GPU0/{print $3; exit}')"
 
+# --- The AMD kernel driver's interface: KFD's topology, /dev/kfd, /dev/dri ---
+# Every session stages KFD's topology; an isolated one shows it at
+# /sys/class/kfd, where tools look for AMD GPUs without a runtime.
+expect "KFD's topology: a CPU node and a node per GPU, each with the GPU's target" "0|90402|90402" \
+  "$(sess amd/mi300x -c 'for n in 0 1 2; do awk "/^gfx_target_version/{print \$2}" $VGPU_SESSION/root/sys/class/kfd/kfd/topology/nodes/$n/properties; done' | paste -sd'|')"
+expect "KFD's topology: Radeon GPUs reach each other through the host" "1|1|2 40" \
+  "$(sess amd/rx7900xtx -c 't=$VGPU_SESSION/root/sys/class/kfd/kfd/topology/nodes/1; awk "/^(io_links_count|p2p_links_count) /{print \$2}" $t/properties; awk "/^(type|weight) /{print \$2}" $t/p2p_links/0/properties | paste -sd" "' | paste -sd'|')"
+enum=$(ls /opt/rocm/bin/rocm_agent_enumerator "$HOME"/.local/share/rocm-*/opt/rocm-*/bin/rocm_agent_enumerator 2>/dev/null | sort -V | tail -1)
+if ! unshare --user --map-root-user true >/dev/null 2>&1; then
+  echo "skip  the isolated kernel-driver checks: unprivileged user namespaces are unavailable here"
+else
+  host_dev=$(ls -A /dev | sort | paste -sd' ')
+  expect "an isolated AMD session has /dev/kfd and a card and render node per GPU" "c|card0 card1 renderD128 renderD129" \
+    "$(isolated amd/mi300x -c '[ -c /dev/kfd ] && echo c; ls /dev/dri | paste -sd" "' | paste -sd'|')"
+  expect "its /dev is still the host's otherwise: process substitution, /dev/shm, ptys" "ok|shm|pts" \
+    "$(isolated amd/mi300x -c 'cat <(echo ok); python3 -c "import multiprocessing as m; m.Lock(); print(\"shm\")"; [ -d /dev/pts ] && echo pts' | paste -sd'|')"
+  expect "its /sys/class is still the host's otherwise" "yes" \
+    "$(isolated amd/mi300x -c '[ -e /sys/class/net/lo ] && [ -e /sys/class/kfd/kfd/topology/nodes/2/properties ] && echo yes')"
+  # The session mounts the host's /dev inside its directory; removing the
+  # directory at the end once deleted through that mount, and as root took
+  # the host's device nodes with it.
+  expect "an isolated session leaves the host's /dev as it found it" "$host_dev" "$(ls -A /dev | sort | paste -sd' ')"
+  if [[ -n "$enum" ]]; then
+    for g in amd/mi300x amd/rx7900xtx amd/mi250x; do
+      want=$(sess "$g" -c 'rocm_agent_enumerator -t GPU' | sort -u)
+      expect "ROCm's rocm_agent_enumerator, unmodified, reads KFD's topology ($g)" "$want $want" \
+        "$(isolated "$g" -c "python3 '$enum'" | paste -sd' ')"
+    done
+  else
+    echo "skip  ROCm's rocm_agent_enumerator: no ROCm here"
+  fi
+fi
+
 # --- ROCm's own rocm-smi, on the simulator's librocm_smi64 ---
 # An isolated session has /sys/module/amdgpu loaded, as an AMD machine does,
 # and points ROCm SMI at the simulator's library, so ROCm's rocm-smi runs
