@@ -598,6 +598,7 @@ add_custom_command(TARGET vgpu_cli POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../vgpu" "${CMAKE_BINARY_DIR}/bin/vgpu"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/nvidia/tools/nvidia-smi" "${CMAKE_BINARY_DIR}/bin/nvidia-smi"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/nvidia/tools/nvcc" "${CMAKE_BINARY_DIR}/bin/nvcc"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/nvidia/tools/vgpu-ptxas" "${CMAKE_BINARY_DIR}/bin/vgpu-ptxas"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/amd/tools/rocm-smi" "${CMAKE_BINARY_DIR}/bin/rocm-smi"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/amd/tools/amd-smi" "${CMAKE_BINARY_DIR}/bin/amd-smi"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/amd/tools/rocm_agent_enumerator" "${CMAKE_BINARY_DIR}/bin/rocm_agent_enumerator"

@@ -8,7 +8,7 @@ different.
 | Framework | Works | How it reaches the interpreter |
 | --- | --- | --- |
 | Numba | yes, unmodified | its own PTX, assembled through the driver's JIT link API |
-| Triton | yes, with `nvidia/tools/vgpu_triton.py` | its own PTX, handed over before `ptxas` runs |
+| Triton (and `torch.compile`) | yes, unmodified under `vgpu run` / `vgpu shell` | its own PTX, passed through `vgpu-ptxas` in place of a cubin |
 | CuPy | no | statically links cudart; never reaches either path |
 
 ## Numba
@@ -44,7 +44,27 @@ builds 64-bit index arithmetic.
 
 ## Triton
 
-Triton needs one line, because it runs `ptxas` itself:
+Triton runs `ptxas` itself and loads the cubin, which VirtualGPU cannot run: it
+has no SASS decoder. Under `vgpu run` and `vgpu shell` nothing needs changing.
+They point Triton's ptxas (`TRITON_PTXAS_PATH`, and
+`TRITON_PTXAS_BLACKWELL_PATH`, which Triton uses for sm_100 and later) at
+`build/bin/vgpu-ptxas`, which writes the PTX, NUL terminated, where the cubin
+would go; `cuModuleLoadData` loads PTX from there as from anywhere. Its
+`--version` answers with the real ptxas's release, which Triton reads to pick
+the PTX version it emits. A ptxas the program's environment names already is
+left alone.
+
+That is what makes `torch.compile` work: Inductor generates Triton kernels, and
+they go through the same path. Checked on the simulated RTX 5090 against the
+CPU: fused pointwise and reduction kernels, softmax, cross entropy, attention,
+RMSNorm, LayerNorm and GELU in an MLP, fp16 and bf16, integer arithmetic,
+`where`/`clamp`, transposes and cumsum/argmax. Triton's Blackwell output
+brought in three PTX forms: packed single precision (`add/sub/mul/fma.f32x2`),
+the cache-policy operand of `.L2::cache_hint` loads and stores, and `_` in an
+unpacking `mov`.
+
+Outside those commands, or with a Triton that should not see a different
+ptxas, the older route still works -- one line in the program:
 
 ```python
 import vgpu_triton; vgpu_triton.install()

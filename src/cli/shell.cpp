@@ -972,6 +972,14 @@ int cmd_shell(const std::vector<std::string>& args) {
   setenv("VGPU_CUDA_VERSION", c.cuda.c_str(), 1);
   setenv("VGPU_ROCM_VERSION", c.rocm.c_str(), 1);   // amd-smi version reports it
   setenv("VGPU_SESSION", s.dir.c_str(), 1);
+  // Triton assembles its PTX with ptxas; vgpu-ptxas hands the PTX through in
+  // place of the cubin, which VirtualGPU cannot run (nvidia/tools/vgpu-ptxas).
+  {
+    const std::string ptxas = shim_dir().substr(0, shim_dir().size() - 5) + "/bin/vgpu-ptxas";   // beside shim/
+    if (::access(ptxas.c_str(), X_OK) == 0)
+      for (const char* k : {"TRITON_PTXAS_PATH", "TRITON_PTXAS_BLACKWELL_PATH"})
+        setenv(k, ptxas.c_str(), 0);
+  }
   // Hold the devices open for the whole session: this is what publishes
   // telemetry that nvidia-smi / rocm-smi read.
   vgpu::runtime::Runtime rt(profile, c.count);

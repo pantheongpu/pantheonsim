@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# A ptxas for programs that assemble their own PTX -- Triton, and so
+# torch.compile -- when they run on VirtualGPU.
+#
+# Triton compiles Python to PTX, runs ptxas to turn the PTX into a cubin, and
+# hands the cubin to cuModuleLoadData. VirtualGPU runs PTX and has no SASS
+# decoder, so the cubin is the one artifact in that pipeline it cannot use; the
+# PTX one step earlier is exactly what it wants. This writes the PTX, NUL
+# terminated, where the cubin would go, and cuModuleLoadData loads PTX from
+# there as it does from anywhere.
+#
+# `vgpu run` and `vgpu shell` point Triton here (TRITON_PTXAS_PATH, and
+# TRITON_PTXAS_BLACKWELL_PATH, which Triton uses for sm_100 and later) unless
+# the program's environment names a ptxas already. It is not called `ptxas`,
+# so it never stands in front of the real one on PATH: nvcc keeps assembling.
+#
+#   --version  prints the real ptxas's version, which Triton reads to decide
+#              the PTX version it emits: the next ptxas on PATH, the toolkit's
+#              under $CUDA_HOME or /usr/local/cuda, or else release 13.0.
+#              VGPU_PTXAS_VERSION=12.8 names one outright.
+#   otherwise  <input.ptx> -o <output>; every other option is accepted and
+#              changes nothing, since there is no machine code to shape.
+set -uo pipefail
+self="$(readlink -f "$0")"
+
+version() {
+  if [[ -n "${VGPU_PTXAS_VERSION:-}" ]]; then
+    printf 'ptxas: NVIDIA (R) Ptx optimizing assembler (VirtualGPU)\nCuda compilation tools, release %s, V%s\n' \
+      "$VGPU_PTXAS_VERSION" "$VGPU_PTXAS_VERSION"
+    return 0
+  fi
+  local cand dir
+  local -a dirs
+  IFS=':' read -ra dirs <<< "${PATH:-}"
+  for dir in "${dirs[@]}" "${CUDA_HOME:-}/bin" /usr/local/cuda/bin; do
+    [[ -n "$dir" && -x "$dir/ptxas" ]] || continue
+    cand="$(readlink -f "$dir/ptxas")"
+    [[ "$cand" == "$self" ]] && continue
+    "$cand" --version && return 0
+  done
+  printf 'ptxas: NVIDIA (R) Ptx optimizing assembler (VirtualGPU)\nCuda compilation tools, release 13.0, V13.0\n'
+}
+
+input="" output=""
+while (( $# )); do
+  case "$1" in
+    --version|-V) version; exit $? ;;
+    -o|--output-file) output="${2:-}"; shift ;;
+    --output-file=*) output="${1#*=}" ;;
+    # Options that take their value as the next word.
+    --gpu-name|-arch|--opt-level|-O|--maxrregcount|-maxrregcount|--def-load-cache|--def-store-cache|\
+    --fmad|--generate-line-info-mode|--position-independent-code|--compile-as-tools-patch|\
+    --suppress-debug-info|--warning-as-error|--options-file|-optf|--entry|-e)
+      shift ;;
+    -*) ;;
+    *) input="$1" ;;
+  esac
+  shift
+done
+[[ -n "$input" && -n "$output" ]] || { echo "vgpu-ptxas: usage: vgpu-ptxas [options] <input.ptx> -o <output>" >&2; exit 2; }
+[[ -r "$input" ]] || { echo "vgpu-ptxas: cannot read $input" >&2; exit 1; }
+{ cat -- "$input"; printf '\0'; } > "$output"
