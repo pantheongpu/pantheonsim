@@ -117,3 +117,21 @@ def fp8(d):
 
 
 check('fp8 matmul (torch._scaled_mm)', fp8, 1e-3)
+
+
+# torch.compile: Inductor's Triton kernels, compiled by Triton and handed to the
+# simulator as PTX (vgpu run points Triton's ptxas at vgpu-ptxas). The CPU side
+# runs the same function eagerly.
+def compiled(f):
+    fast = torch.compile(f)
+    return lambda d, *args: (fast if d != 'cpu' else f)(*[t.to(d) for t in args])
+
+
+mlp = torch.nn.Sequential(torch.nn.Linear(48, 64), torch.nn.GELU(), torch.nn.LayerNorm(64), torch.nn.Linear(64, 8))
+mlp_c = compiled(lambda t: mlp.to(t.device)(t))
+fused = compiled(lambda t: torch.sin(t) * 2 + t.cos().sum())
+attn = compiled(lambda q, k, v: torch.softmax(q @ k.transpose(-1, -2) / 8, -1) @ v)
+q4 = torch.randn(2, 4, 16, 32, generator=g)
+check('torch.compile: fused pointwise and reduction', lambda d: fused(d, v))
+check('torch.compile: MLP with LayerNorm and GELU', lambda d: mlp_c(d, a), 1e-3)
+check('torch.compile: attention', lambda d: attn(d, q4, q4.flip(-1), q4 * 0.5), 1e-3)
