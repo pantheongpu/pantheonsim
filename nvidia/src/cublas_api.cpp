@@ -877,8 +877,42 @@ cublasStatus_t tbmv(cublasHandle_t h, cublasFillMode_t uplo, cublasOperation_t t
   return CUBLAS_STATUS_SUCCESS;
 }
 
+// C = A diag(x) (CUBLAS_SIDE_RIGHT) or diag(x) A (CUBLAS_SIDE_LEFT): each
+// column, or each row, of A scaled by one element of x. x is walked by BLAS's
+// rule for its increment, so a zero increment scales by x[0] throughout. C may
+// be A itself, which is why A is read whole before C is written.
+template <class T>
+cublasStatus_t dgmm(cublasHandle_t h, cublasSideMode_t mode, int m, int n, const T* A, int lda,
+                    const T* x, int incx, T* C, int ldc) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (mode != CUBLAS_SIDE_LEFT && mode != CUBLAS_SIDE_RIGHT) return CUBLAS_STATUS_INVALID_VALUE;
+  if (m < 0 || n < 0 || lda < std::max(1, m) || ldc < std::max(1, m)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (!m || !n) return CUBLAS_STATUS_SUCCESS;
+  if (deferred_to_graph(h, [=] { dgmm<T>(h, mode, m, n, A, lda, x, incx, C, ldc); }))
+    return CUBLAS_STATUS_SUCCESS;
+  const int len = mode == CUBLAS_SIDE_LEFT ? m : n;
+  auto hA = fetch<T>(A, extent(lda, n, m));
+  auto hx = fetch<T>(x, incx == 0 ? 1 : span(len, incx));
+  auto hC = fetch<T>(C, extent(ldc, n, m));
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i)
+      hC[idx(i, j, ldc)] = hA[idx(i, j, lda)] * hx[elem(mode == CUBLAS_SIDE_LEFT ? i : j, len, incx)];
+  store(C, hC);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
 }  // namespace
 
+VGPU_EXPORT cublasStatus_t cublasSdgmm(cublasHandle_t h, cublasSideMode_t mode, int m, int n,
+                                       const float* A, int lda, const float* x, int incx, float* C,
+                                       int ldc) {
+  return dgmm(h, mode, m, n, A, lda, x, incx, C, ldc);
+}
+VGPU_EXPORT cublasStatus_t cublasDdgmm(cublasHandle_t h, cublasSideMode_t mode, int m, int n,
+                                       const double* A, int lda, const double* x, int incx, double* C,
+                                       int ldc) {
+  return dgmm(h, mode, m, n, A, lda, x, incx, C, ldc);
+}
 VGPU_EXPORT cublasStatus_t cublasSaxpy_v2(cublasHandle_t h, int n, const float* alpha,
                                           const float* x, int incx, float* y, int incy) {
   return axpy(h, n, alpha, x, incx, y, incy);

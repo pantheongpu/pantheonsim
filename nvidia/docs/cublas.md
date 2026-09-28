@@ -53,8 +53,8 @@ across architectures either, so the harness compares those with a tolerance
 Handles and configuration (`cublasCreate/Destroy`, streams, pointer mode, math
 mode, version/properties), `Sgemm`, `Dgemm`, `SgemmStridedBatched`, `GemmEx`
 for the all-fp32 and all-fp64 forms, `Sgemv`, and in both single and double
-precision `axpy`, `scal`, `dot`, `nrm2`, `i?amax` and the triangular band
-product `tbmv`. A negative increment walks the vector from its far end, as
+precision `axpy`, `scal`, `dot`, `nrm2`, `i?amax`, the triangular band
+product `tbmv`, and `dgmm` (a matrix times a diagonal one, from either side). A negative increment walks the vector from its far end, as
 BLAS defines it; `scal`, `nrm2` and `i?amax` do nothing (or return 0) for an
 increment that is not positive, which is what the hardware does too.
 

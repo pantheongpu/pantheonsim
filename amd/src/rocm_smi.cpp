@@ -17,7 +17,8 @@
 // library (RCCL_USE_ROCM_SMI_LIB=1). Under WSL it does neither. On any other
 // Linux machine there is no /sys/class/kfd without an AMD GPU, and RCCL's
 // initialization fails ("internal error"), so this library, once loaded,
-// asks RCCL for the second way unless the environment already says which.
+// asks RCCL for the second way unless the environment already says which --
+// as it does in a vgpu session, which has a /sys/class/kfd of its own.
 // RCCL reads that setting when it first initializes, after the libraries it
 // links -- this one among them -- are loaded.
 //
@@ -186,11 +187,15 @@ uint32_t nbio(const Sample& d, const char* name) {
   return r ? mmio.value(*r) : 0;
 }
 
-// Tells RCCL to ask this library rather than read /sys/class/kfd, where
-// there is none to read. An environment that already chose is left alone.
+// Tells RCCL to ask this library rather than read /sys/class/kfd: where
+// there is none to read, and inside a vgpu session, where the topology there
+// is either the session's own copy of what this library says or the host's
+// real GPUs, not the simulated ones. An environment that already chose is
+// left alone.
 __attribute__((constructor)) void prefer_this_library() {
   struct stat st{};
-  if (stat("/sys/class/kfd/kfd/topology/nodes", &st) != 0) setenv("RCCL_USE_ROCM_SMI_LIB", "1", 0);
+  if (std::getenv("VGPU_SESSION") || stat("/sys/class/kfd/kfd/topology/nodes", &st) != 0)
+    setenv("RCCL_USE_ROCM_SMI_LIB", "1", 0);
 }
 
 // Everything that looks a device up: the arguments checked, then the reading.
