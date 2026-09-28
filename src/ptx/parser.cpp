@@ -1574,8 +1574,8 @@ class Parser {
       // cvt[.round][.sat][.ftz].<dstty>.<srcty>
       std::vector<Type> tys;
       std::string packed;  // "f16x2"/"bf16x2": two f32 sources packed into one register
-      std::string fp8;     // "e4m3x2"/"e5m2x2": the FP8 side of the conversion
-      bool satfinite = false, sat = false, ftz = false;
+      std::string fp8;     // the narrow side: e4m3x2, e2m1x2, ue8m0x2, s2f6x2, ...
+      bool satfinite = false, sat = false, ftz = false, relu = false, scaled = false;
       Round round = Round::None;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
@@ -1589,21 +1589,41 @@ class Parser {
         else if (p == "rpi") round = Round::Rpi;
         else if (p == "sat") sat = true;
         else if (p == "ftz") ftz = true;
+        else if (p == "relu") relu = true;
         else if (p == "f16x2" || p == "bf16x2") packed = p;
-        else if (p == "e4m3x2" || p == "e5m2x2") fp8 = p;
+        else if (p == "e4m3x2" || p == "e5m2x2" || p == "e2m3x2" || p == "e3m2x2" || p == "e2m1x2" ||
+                 p == "ue8m0x2" || p == "s2f6x2")
+          fp8 = p;
         else if (p == "satfinite") satfinite = true;
+        else if (p == "scaled::n2::ue8m0") scaled = true;
+        else if (p == "e4m3x4" || p == "e5m2x4" || p == "e2m3x4" || p == "e3m2x4" || p == "e2m1x4" ||
+                 p == "rs")
+          return unsupported("cvt.rs (stochastic rounding): for the x4 types the ISA's figures 41-42 "
+                             "give a and b one shared field of random bits without saying how they "
+                             "split it, so it is not implemented");
+        else if (p == "pzo" || p == "scaled::n1::ue8m0" || p == "ue5m3x2")
+          return unsupported("cvt ." + p + " (sm_107f) is not implemented");
         else if (auto t2 = parse_type_token(p)) tys.push_back(*t2);
         else return unsupported("unrecognized cvt modifier '." + p + "'");
       }
       if (!fp8.empty()) {
         OpCvtFp8 op;
-        op.e5m2 = fp8[1] == '5';
+        op.fmt = fp8 == "e4m3x2"  ? NarrowFmt::E4M3
+               : fp8 == "e5m2x2"  ? NarrowFmt::E5M2
+               : fp8 == "e2m3x2"  ? NarrowFmt::E2M3
+               : fp8 == "e3m2x2"  ? NarrowFmt::E3M2
+               : fp8 == "e2m1x2"  ? NarrowFmt::E2M1
+               : fp8 == "ue8m0x2" ? NarrowFmt::UE8M0
+                                  : NarrowFmt::S2F6;
+        op.e5m2 = op.fmt == NarrowFmt::E5M2;
         op.satfinite = satfinite;
-        // Which side of the dot the fp8 type sat on decides the direction, and
-        // `packed`/`tys` carry whatever the other side was.
-        const size_t fp8_pos = opcode.find(fp8);
-        const size_t other_pos = packed.empty() ? std::string::npos : opcode.find(packed);
-        op.to_fp8 = other_pos == std::string::npos ? !tys.empty() : fp8_pos < other_pos;
+        op.relu = relu;
+        op.scaled = scaled;
+        // Which side of the dot the narrow type sat on decides the direction,
+        // and `packed`/`tys` carry whatever the other side was.
+        const size_t fp8_pos = opcode.find("." + fp8);
+        const size_t other_pos = packed.empty() ? opcode.find(".f32") : opcode.find("." + packed);
+        op.to_fp8 = fp8_pos < other_pos;
         op.bf16 = !packed.empty() && packed[0] == 'b';
         if (!packed.empty()) {
           op.src_f32_pair = false;
@@ -1613,7 +1633,31 @@ class Parser {
           op.src_f32_pair = true;
         }
         if (!op.to_fp8 && op.src_f32_pair)
-          return unsupported("cvt from " + fp8 + " to f32 (PTX unpacks to f16x2)");
+          return unsupported("cvt from " + fp8 + " to f32 (PTX unpacks to f16x2 or bf16x2)");
+        // Rounding: .rn, and .rz for s2f6; ue8m0 is .rz or .rp. (.rz on the
+        // floating-point types is sm_107f's.)
+        const bool ue8m0 = op.fmt == NarrowFmt::UE8M0, s2f6 = op.fmt == NarrowFmt::S2F6;
+        op.rz = round == Round::Rz;
+        op.rp = round == Round::Rp;
+        const bool round_ok = !op.to_fp8     ? round == Round::Rn
+                              : ue8m0        ? (op.rz || op.rp)
+                              : s2f6         ? (round == Round::Rn || op.rz)
+                                             : round == Round::Rn || (round == Round::None && fp8 != "e2m1x2" &&
+                                                                     (op.fmt == NarrowFmt::E4M3 || op.e5m2));
+        if (!round_ok)
+          return round == Round::Rz ? unsupported("cvt.rz to " + fp8 + " (sm_107f) is not implemented")
+                                    : unsupported("cvt with " + fp8 + " takes " +
+                                                  std::string(ue8m0 && op.to_fp8 ? ".rz or .rp" : ".rn"));
+        if (op.to_fp8 && !ue8m0 && !satfinite && op.fmt != NarrowFmt::E4M3 && !op.e5m2)
+          return unsupported("cvt to " + fp8 + " requires .satfinite");
+        if (ue8m0 && (relu || (op.to_fp8 && !packed.empty() && !op.bf16) || (!op.to_fp8 && !op.bf16)))
+          return unsupported("cvt with ue8m0x2 converts from f32 or bf16x2 and to bf16x2, without .relu");
+        if (s2f6 && op.to_fp8 && !packed.empty())
+          return unsupported("cvt.s2f6x2.bf16x2: the ISA's pseudocode converts a[15:8] and a[7:0] where "
+                             "its text converts each bf16 half, so it is not implemented");
+        if (s2f6 && !op.to_fp8 && !op.bf16) return unsupported("cvt from s2f6x2 is to bf16x2 only");
+        if (scaled && !s2f6 && (op.to_fp8 || !op.bf16))
+          return unsupported("cvt .scaled::n2::ue8m0 goes with a bf16x2 destination or s2f6x2");
         op.dst = expect_reg_operand("cvt destination");
         expect_punct(",");
         op.a = parse_operand();
@@ -1621,10 +1665,19 @@ class Parser {
           expect_punct(",");
           op.b = parse_operand();
         }
+        if (scaled && peek_punct(",")) {
+          next();
+          op.sf = parse_operand();
+        } else if (scaled) {
+          op.sf = ImmInt{0x7F7F};   // the default: 1 for both
+        }
         ins.op = op;
         expect_punct(";");
         return ins;
       }
+      if (relu || scaled)
+        return unsupported(std::string("cvt .") + (relu ? "relu" : "scaled::n2::ue8m0") +
+                           " outside the narrow floating-point conversions is not implemented");
       if (!packed.empty()) {
         // cvt.rn.f16x2.f32 d, a, b -- two f32 converted and packed, a high, b low.
         if (tys.size() != 1 || tys[0].bits != 32 || !tys[0].is_float())

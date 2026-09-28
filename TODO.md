@@ -269,7 +269,14 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   value, where an integer destination gets all-ones for true and a float one
   gets 1.0), `atom.inc`/`.dec` (which wrap against the operand rather than
   counting), and `abs` on the half types.
-- FP8: `cvt` between e4m3x2/e5m2x2 and f32/f16x2/bf16x2, with `.satfinite`.
+- Narrow formats: `cvt` between e4m3x2/e5m2x2, the OCP MX e2m3x2/e3m2x2/e2m1x2,
+  ue8m0x2 and s2f6x2 and f32/f16x2/bf16x2 (PTX ISA 9.7.10.24), with
+  `.satfinite` (NaN to +MAX_NORM for the types without one), `.relu`,
+  ue8m0's `.rz`/`.rp`, and the `.scaled::n2::ue8m0` factors of bf16x2 and
+  s2f6x2. Refused by name: `.rs` for the x4 types (figures 41-42 do not
+  say how a and b share their random bits), sm_107f's `.rz`, `.pzo`,
+  `.scaled::n1` and ue5m3x2, and s2f6x2 from bf16x2 (its pseudocode and text
+  disagree).
   The two formats are not one shape with a different bias -- e4m3 spends its
   top exponent on ordinary numbers and has no infinity, so 448 is its largest
   finite value and 1000 saturates to it, while e5m2 is IEEE-shaped and

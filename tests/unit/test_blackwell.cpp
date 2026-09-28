@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -2309,6 +2310,134 @@ VTEST(tma_packed_types_refuse_what_the_isa_rules_out) {
   const std::vector<uint8_t> map(buf, buf + 128);
   VCHECK_CONTAINS(VCAPTURE(Error, tma_packed(mem, map, true, 64, 0, 128, {})).message(), "multiple of 128");
   VCHECK_CONTAINS(VCAPTURE(Error, tma_packed(mem, map, false, 0, 0, 0, {})).message(), ".b4x16_p64");
+}
+
+// ---- cvt with the narrow formats -----------------------------------------------------
+
+namespace {
+// Runs `body` with %r0-%r7 and %f0-%f7 holding in[0..7] (the same bits) and
+// returns %r10-%r17.
+std::vector<uint32_t> run_cvt(const std::string& body, const std::vector<uint32_t>& in) {
+  std::string ptx = std::string(kHeader100a) + R"(
+.visible .entry k(.param .u64 pin, .param .u64 pout)
+{
+    .reg .b32 %r<20>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [pin];
+    ld.param.u64 %rd2, [pout];
+)";
+  for (int i = 0; i < 8; ++i)
+    ptx += "    ld.global.u32 %r" + std::to_string(i) + ", [%rd1+" + std::to_string(4 * i) + "];\n" +
+           "    mov.b32 %f" + std::to_string(i) + ", %r" + std::to_string(i) + ";\n";
+  for (int i = 10; i < 18; ++i) ptx += "    mov.b32 %r" + std::to_string(i) + ", 0;\n";
+  ptx += body;
+  for (int i = 0; i < 8; ++i)
+    ptx += "    st.global.u32 [%rd2+" + std::to_string(4 * i) + "], %r" + std::to_string(10 + i) + ";\n";
+  ptx += "    ret;\n}\n";
+  MemoryManager mem{1 << 20};
+  std::vector<uint32_t> v(in);
+  v.resize(8, 0);
+  const uint64_t pin = mem.alloc(32), pout = mem.alloc(32);
+  mem.write(pin, v.data(), 32);
+  LaunchConfig cfg;
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(pin), arg_u64(pout)}, mem, load_gpu("nvidia/b200"));
+  std::vector<uint32_t> out(8);
+  mem.read(pout, out.data(), 32);
+  return out;
+}
+uint32_t fb(float f) { return f32_bits(f); }
+}  // namespace
+
+// e2m1 (PTX ISA 5.2.3): 0, 0.5, 1, 1.5, 2, 3, 4, 6 are codes 0-7, bit 3 the
+// sign. a goes to the upper nibble. Ties go to the even code, past 6 is 6,
+// NaN is +6.
+VTEST(cvt_e2m1x2_rounds_to_even_and_saturates) {
+  const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
+  const auto out = run_cvt(R"(
+    cvt.rn.satfinite.e2m1x2.f32 %r10, %f0, %f1;
+    cvt.rn.satfinite.e2m1x2.f32 %r11, %f2, %f3;
+    cvt.rn.satfinite.e2m1x2.f32 %r12, %f4, %f5;
+    cvt.rn.satfinite.e2m1x2.f32 %r13, %f6, %f7;
+)", {fb(1.0f), fb(0.5f), fb(2.5f), fb(5.0f), fb(-0.75f), fb(7.0f), fb(nan), fb(-inf)});
+  VCHECK_EQ(out[0], 0x21u);
+  VCHECK_EQ(out[1], 0x46u);   // 2.5 -> 2 and 5 -> 4: the even neighbours
+  VCHECK_EQ(out[2], 0xA7u);   // -0.75 -> -1, 7 -> 6
+  VCHECK_EQ(out[3], 0x7Fu);   // NaN -> +6, -inf -> -6
+  const auto small = run_cvt("    cvt.rn.satfinite.e2m1x2.f32 %r10, %f0, %f1;\n", {fb(0.25f), fb(-0.2f)});
+  VCHECK_EQ(small[0], 0x08u);  // 0.25 ties to 0; -0.2 is -0
+}
+
+// e2m3 (bias 1, 3 mantissa bits, max 7.5) and e3m2 (bias 3, max 28), each in
+// a byte with the top two bits zero; ue8m0 (2^(v-127)) rounds by .rz/.rp.
+VTEST(cvt_fp6_and_ue8m0_encodings) {
+  const auto out = run_cvt(R"(
+    cvt.rn.satfinite.e2m3x2.f32 %r10, %f0, %f1;
+    cvt.rn.satfinite.e3m2x2.f32 %r11, %f0, %f2;
+    cvt.rp.satfinite.ue8m0x2.f32 %r12, %f3, %f4;
+    cvt.rz.satfinite.ue8m0x2.f32 %r13, %f3, %f4;
+    cvt.rn.bf16x2.ue8m0x2 %r14, %r12;
+)", {fb(1.0f), fb(-3.25f), fb(100.0f), fb(3.0f), fb(0.5f)});
+  VCHECK_EQ(out[0], 0x0835u);   // 1.0 = 0x08; -3.25 = -1.625 * 2 = 0x20 | 0x15
+  VCHECK_EQ(out[1], 0x0C1Fu);   // 1.0 = 0x0C; 100 saturates to 28 = 0x1F
+  VCHECK_EQ(out[2], 0x817Eu);   // 3 up to 4 = 2^2; 0.5 = 2^-1
+  VCHECK_EQ(out[3], 0x807Eu);   // 3 down to 2
+  VCHECK_EQ(out[4], 0x40803F00u);   // bf16 4.0 and 0.5
+}
+
+// Back to f16x2/bf16x2, with .relu and bf16x2's ue8m0 scale factors (upper
+// byte for the upper value); and from f16x2/bf16x2 sources.
+VTEST(cvt_from_narrow_types_and_packed_sources) {
+  const auto out = run_cvt(R"(
+    cvt.rn.f16x2.e2m1x2 %r10, %r0;
+    cvt.rn.relu.f16x2.e2m1x2 %r11, %r0;
+    cvt.rn.scaled::n2::ue8m0.bf16x2.e2m1x2 %r12, %r0, %r1;
+    cvt.rn.satfinite.e2m1x2.f16x2 %r13, %r2;
+    cvt.rn.satfinite.e4m3x2.bf16x2 %r14, %r3;
+    cvt.rn.satfinite.relu.e4m3x2.f32 %r15, %f4, %f5;
+    cvt.rn.bf16x2.e3m2x2 %r16, %r6;
+)", {0x2Fu, 0x8180u, 0x4200B800u, 0x40003F80u, fb(-1.0f), fb(1.0f), 0x0C1Fu});
+  VCHECK_EQ(out[0], 0x3C00C600u);   // 1.0 and -6.0
+  VCHECK_EQ(out[1], 0x3C000000u);   // -6 clamped to 0
+  VCHECK_EQ(out[2], 0x4080C140u);   // 1 * 2^2 = 4 and -6 * 2^1 = -12
+  VCHECK_EQ(out[3], 0x59u);         // 3.0 and -0.5
+  VCHECK_EQ(out[4], 0x4038u);       // e4m3 2.0 and 1.0
+  VCHECK_EQ(out[5], 0x0038u);       // -1 clamped to 0
+  VCHECK_EQ(out[6], 0x3F8041E0u);   // bf16 1.0 and 28.0
+}
+
+// s2f6 (5.2.4): an s8 counting 2^-6, saturating at 127 and -128; its scale
+// factors divide on the way in and multiply on the way out.
+VTEST(cvt_s2f6x2) {
+  const auto out = run_cvt(R"(
+    cvt.rn.satfinite.s2f6x2.f32 %r10, %f0, %f1;
+    cvt.rn.satfinite.scaled::n2::ue8m0.s2f6x2.f32 %r11, %f0, %f1, %r2;
+    cvt.rz.satfinite.s2f6x2.f32 %r12, %f3, %f3;
+    cvt.rn.satfinite.s2f6x2.f32 %r13, %f3, %f3;
+    cvt.rn.bf16x2.s2f6x2 %r14, %r10;
+    cvt.rn.scaled::n2::ue8m0.bf16x2.s2f6x2 %r15, %r10, %r2;
+)", {fb(1.5f), fb(-2.5f), 0x8080u, fb(0.01f)});
+  VCHECK_EQ(out[0], 0x6080u);   // 96 and -160 clamped to -128
+  VCHECK_EQ(out[1], 0x30B0u);   // 0.75 = 48 and -1.25 = -80
+  VCHECK_EQ(out[2], 0x0000u);   // 0.64 toward zero
+  VCHECK_EQ(out[3], 0x0101u);   // 0.64 to nearest
+  VCHECK_EQ(out[4], 0x3FC0C000u);   // 1.5 and -2.0
+  VCHECK_EQ(out[5], 0x4040C080u);   // 3.0 and -4.0
+}
+
+VTEST(cvt_narrow_forms_refused_by_name) {
+  auto parse = [](const std::string& ins) {
+    return VCAPTURE(Error, ptx::parse(std::string(kHeader100a) +
+                                      ".visible .entry k()\n{\n .reg .b32 a, b, c;\n .reg .f32 f, g;\n " + ins +
+                                      "\n ret;\n}\n")).message();
+  };
+  VCHECK_CONTAINS(parse("cvt.rs.satfinite.e2m1x4.f32 a, {f, g, f, g}, b;"), "stochastic");
+  VCHECK_CONTAINS(parse("cvt.rz.satfinite.e2m1x2.f32 a, f, g;"), "sm_107f");
+  VCHECK_CONTAINS(parse("cvt.rn.satfinite.pzo.e2m1x2.f32 a, f, g;"), "sm_107f");
+  VCHECK_CONTAINS(parse("cvt.rn.satfinite.s2f6x2.bf16x2 a, b;"), "pseudocode");
+  VCHECK_CONTAINS(parse("cvt.rn.e2m1x2.f32 a, f, g;"), "requires .satfinite");
+  VCHECK_CONTAINS(parse("cvt.rn.ue8m0x2.f32 a, f, g;"), ".rz or .rp");
+  VCHECK_CONTAINS(parse("cvt.rn.relu.f32.f16 f, a;"), ".relu");
 }
 
 VTEST_MAIN
