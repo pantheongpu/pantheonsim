@@ -1511,6 +1511,11 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 5400)
+  add_test(NAME e2e_cutlass_sm100_conv COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_sm100_conv.sh)
+  set_tests_properties(e2e_cutlass_sm100_conv PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 7200)
   add_test(NAME e2e_block_semaphore COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_block_semaphore.sh)
   set_tests_properties(e2e_block_semaphore PROPERTIES
     DEPENDS vgpucudart
