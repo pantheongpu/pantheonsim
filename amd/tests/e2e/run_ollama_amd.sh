@@ -99,8 +99,10 @@ for gpu in $profiles; do
   # Not quiet: a kernel the simulator refuses says so in the log.
   serve "$log" LD_PRELOAD="$preload" VGPU_GPU="$gpu" \
         VGPU_TELEMETRY_PATH="$tmp/run" VGPU_STATE_DIR="$tmp/state"
-  found=$(grep -o 'msg="inference compute".*library=ROCm compute=[a-z0-9]* .*description="[^"]*"' "$log" |
-          sed 's/.*compute=\([a-z0-9]*\) .*description="\([^"]*\)".*/\1 \2/' | head -1)
+  # Ollama quotes the description only where it has a space ("AMD Instinct
+  # MI300X", but MI325X).
+  found=$(grep -o 'msg="inference compute".*library=ROCm compute=[a-z0-9]* .*' "$log" | head -1 |
+          sed -E 's/.*compute=([a-z0-9]*) .*description=("([^"]*)"|([^ ]*)).*/\1 \3\4/')
   expect "$gpu: ollama finds the GPU on its ROCm backend" "$target $name" "$found"
   reply=$(generate)
   read -r size vram < <(resident)
