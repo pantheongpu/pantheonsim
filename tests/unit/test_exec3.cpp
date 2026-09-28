@@ -5009,4 +5009,63 @@ VTEST(device_assert_reports_its_line_from_a_full_warp) {
   VCHECK_CONTAINS(err.message(), "x.cu:55 in x.cu");
 }
 
+// Register files are not zeroed when a block starts. A register's first
+// write zero-fills it when that write leaves lanes out, so those lanes read
+// zero -- even after an earlier block on the same host thread left other
+// values in the memory the register files are recycled from. Each register
+// is written by both blocks, 32- and 64-bit, through the fast and the
+// general paths (mov and cvt).
+VTEST(lanes_a_partial_first_write_skips_read_zero) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    setp.ne.u32 %p1, %r2, 0;
+    @%p1 bra PARTIAL;
+    mov.u32 %r5, 0xdeadbeef;
+    mov.u64 %rd5, 0xdeadbeefdeadbeef;
+    cvt.u16.u32 %r6, %r1;
+    bra STORE;
+PARTIAL:
+    setp.lt.u32 %p1, %r1, 16;
+    @%p1 mov.u32 %r5, %r1;
+    @%p1 cvt.u64.u32 %rd5, %r1;
+    @%p1 cvt.u16.u32 %r6, %r1;
+STORE:
+    mad.lo.u32 %r3, %r2, 32, %r1;
+    mul.wide.u32 %rd2, %r3, 16;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r5;
+    st.global.u32 [%rd3+4], %r6;
+    st.global.u64 [%rd3+8], %rd5;
+    ret;
+}
+)";
+  setenv("VGPU_THREADS", "1", 1);
+  for (int fast = 0; fast < 2; ++fast) {
+    setenv("VGPU_FASTPATH", fast ? "1" : "0", 1);
+    Env e;
+    auto m = ptx::parse(ptx);
+    uint64_t out = e.mem.alloc(2 * 32 * 16);
+    LaunchConfig cfg;
+    cfg.grid = {2, 1, 1};
+    cfg.block = {32, 1, 1};
+    exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+    for (int t = 0; t < 32; ++t) {
+      const uint64_t at = out + uint64_t(32 + t) * 16;
+      const uint64_t want = t < 16 ? uint64_t(t) : 0;
+      VCHECK_EQ(e.mem.load_scalar(at, 4), want);
+      VCHECK_EQ(e.mem.load_scalar(at + 4, 4), want);
+      VCHECK_EQ(e.mem.load_scalar(at + 8, 8), want);
+    }
+  }
+  unsetenv("VGPU_FASTPATH");
+  unsetenv("VGPU_THREADS");
+}
+
 VTEST_MAIN
