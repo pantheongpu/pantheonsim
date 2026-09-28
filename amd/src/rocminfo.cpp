@@ -122,7 +122,9 @@ void print_isa(hsa_isa_t i, int n) {
   hsa_isa_get_info_alt(i, HSA_ISA_INFO_WORKGROUP_MAX_DIM, wg);
   const uint32_t wg32[3] = {wg[0], wg[1], wg[2]};
   dims(6, "Workgroup Max Size per Dimension:", wg32);
-  value(6, "Grid Max Size:", num(isa<uint32_t>(i, HSA_ISA_INFO_GRID_MAX_SIZE)));
+  // An ISA's grid limit is 64 bits (an agent's is 32); rocminfo prints its
+  // low 32.
+  value(6, "Grid Max Size:", num(static_cast<uint32_t>(isa<uint64_t>(i, HSA_ISA_INFO_GRID_MAX_SIZE))));
   const hsa_dim3_t g = isa<hsa_dim3_t>(i, HSA_ISA_INFO_GRID_MAX_DIM);
   const uint32_t g32[3] = {g.x, g.y, g.z};
   dims(6, "Grid Max Size per Dimension:", g32);

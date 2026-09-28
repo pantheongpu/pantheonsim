@@ -128,6 +128,8 @@ if [[ -x "$ours" ]]; then
   # under WSL; there it describes the host, not the simulator.
   if [[ -n "$real" && ! -e /sys/module/amdgpu/initstate && ! -e /dev/dxg ]]; then
     echo "skip  ROCm's rocminfo: no amdgpu kernel module here, which it asks for before HSA"
+  elif [[ -n "$real" ]] && objdump -p "$build/shim/libhsa-runtime64.so.1" 2>/dev/null | grep -q 'NEEDED.*lib[at]san'; then
+    echo "skip  ROCm's rocminfo: a sanitizer build, and ROCm's binary is not built with one"
   elif [[ -n "$real" ]]; then
     for g in amd/mi300x amd/rx7900xtx amd/mi250x; do
       # The first line is what each finds of the host's kernel driver.
