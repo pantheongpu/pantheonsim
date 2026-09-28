@@ -1292,9 +1292,16 @@ scripts/run-pantheon-workloads.sh.
    of results against the hardware's. Refused by name: `tex.grad` (its LOD
    comes from undocumented approximate units), linear filtering of signed
    8-bit normalized texels, mipmapped layered/cubemap textures, `tld4` on
-   layered/cubemap textures, border colours, sRGB, anisotropy and resource
-   views. The `.clamp`/`.zero` surface policies are done, as an RTX 3060 applies
-   them. See nvidia/docs/textures.md.
+   layered/cubemap textures, sRGB, anisotropy and resource views. The
+   `.clamp`/`.zero` surface policies are done, as an RTX 3060 applies them.
+   See nvidia/docs/textures.md. Border
+   colours are done: converted to the texture's format by rules measured over
+   280,000 colours (e2e_border_colour, 705 cases). Measuring them turned up
+   four older mistakes, now fixed: an absent w read 1 (the card reads 0), a
+   mipmapped texture's unnormalized coordinates were taken as unnormalized
+   (the card normalizes them), half NaNs were quieted, and the float filter
+   was an exact sum where the card truncates each value below its
+   footprint's largest.
 
    `wgmma`, TMA and distributed shared memory are done now (see "Hopper's
    warpgroup MMA", "TMA and clusters" and "Distributed shared memory"). What

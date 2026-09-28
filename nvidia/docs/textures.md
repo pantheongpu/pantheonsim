@@ -47,7 +47,7 @@ timing.
 | Instructions | `tex.{1d,2d,3d,a1d,a2d,cube,acube}`, `tex.level`, `tld4.{r,g,b,a}.2d`, `suld.b`/`sust.b` in `.1d`/`.2d`/`.3d`/`.a1d`/`.a2d` |
 | Backing memory | linear (`cudaResourceTypeLinear`), pitched 2D, `cudaArray` (1D/2D/3D, layered, cubemap, layered cubemap), mipmapped arrays |
 | Filtering | point and linear, within and between mip levels |
-| Addressing | clamp, wrap, mirror, border (zero) |
+| Addressing | clamp, wrap, mirror, border (any colour) |
 | Coordinates | unnormalized and normalized, integer and float |
 | Channels | 1–4, signed / unsigned / float, any width the format gives |
 | Read mode | `cudaReadModeElementType`, `cudaReadModeNormalizedFloat` |
@@ -55,9 +55,10 @@ timing.
 
 Two details worth naming because getting them wrong is invisible:
 
-- **An absent channel reads as 0, except `w`, which reads as 1.** A kernel
-  reading `.w` of a one-channel texture expects 1. Returning 0 there produces a
-  black image rather than an error.
+- **An absent channel reads as 0, `w` included.** The graphics APIs return 1
+  for a missing alpha, and this simulator used to; an RTX 3060 returns 0 for
+  every format, read mode, filter and resource type, so a kernel that reads
+  `.w` of a one-channel texture gets 0.
 - **A `cudaArray` is dense row-major here.** Hardware stores arrays in an
   opaque swizzled layout only the texture units can address, and nothing outside
   those units is allowed to depend on it — so a plain buffer serves, and
@@ -82,8 +83,21 @@ was then measured, sample by sample, until every result matched:
   z, then x, then y -- each split rounding half up; the y split rounds the
   upper part on the x = 1 side and the lower part on the x = 0 side (in 2D:
   `w11 = round(a*b/256)`, `w10 = a - w11`, `w01 = b - w11`).
-- **The sum** of weight x texel is exact and rounded once: to f32, ties away
-  from zero, for float texels; to half for half texels. 8- and 16-bit
+- **The sum** of weight x texel is rounded once: to f32, ties away from
+  zero, for float texels; to half for half texels. It is not quite exact.
+  Within each 2x2 footprint (a 3D fetch's z-slice, a mip blend's level) every
+  value is first truncated toward zero to 2^(E - 27) -- 2^(E - 14) for a half
+  -- where E is the exponent of the footprint's largest value with a
+  non-zero weight, so 2.75 at weight 1 blended with 0.1 at weight 255 gives
+  0x3de207ff where the exact sum rounds to 0x3de20800. Each footprint's sum
+  is floored to 2^(Emax - 28) and the footprints added exactly. A subnormal
+  float texel reads as zero, a subnormal result is flushed keeping its sign,
+  an all-(-0) blend gives -0, and a NaN comes out as all ones (0x7fffffff,
+  or 0x7fff for a half). This was found with texels spanning 2^-10..2^11;
+  over 15,360 such trilinear fetches, 20 still differ by 1-4 ulp, all where
+  the two slices' magnitudes differ widely and the result cancels far below
+  both. (The earlier tests' random texels, drawn as lo + x, never carried
+  bits that fine.) 8- and 16-bit
   unsigned normalized texels filter as 16-bit integers (an 8-bit `u` is
   `u*257`) and 16-bit signed ones as themselves, rounded half up, read out
   as `K/65535` or `K/32767` (signed clamped to -32767 after the blend).
@@ -105,7 +119,38 @@ was then measured, sample by sample, until every result matched:
   lower part).
 - **Gather** (`tld4`) returns the footprint's four texels counter-clockwise
   from the lower left -- `(i, j+1), (i+1, j+1), (i+1, j), (i, j)` -- with the
-  weight rounding's carry, and clamp applied to each index.
+  weight rounding's carry, and clamp applied to each index. A NaN comes out
+  as all ones, a subnormal float as zero, and a signed 8-bit normalized
+  texel as its 16-bit form over 32767 (`|k| * 258`, plus one from 64 up --
+  65 when negative), not `k/127`.
+- **Mipmapped textures** take normalized coordinates whether or not the
+  descriptor asks for them; without `normalizedCoords`, wrap and mirror
+  still act as clamp.
+- **A half NaN** widens to float bit for bit, payload and all.
+
+## Border colours
+
+With border addressing, a fetch outside the texture reads
+`cudaTextureDesc::borderColor` -- converted to the texture's format first,
+which is where the rules are (measured over 280,000 colours):
+
+- a 32-bit float channel takes the float as it is, NaN payloads included;
+- a half channel takes it rounded toward zero (65520 gives 65504; a NaN keeps
+  the top of its payload, and stays a NaN);
+- an m-bit (magnitude) normalized channel clamps it to [0, 1] or [-1, 1] (NaN
+  is 0), truncates it toward zero to m + 4 fractional bits, v, and takes
+  `(|v| * (2^m - 1) + 2^(m+3) - 1) >> (m + 4)` with v's sign -- so 0.5 on an
+  8-bit channel is 127/255, and the tie-break drifts with the code rather
+  than sitting at k + 0.5;
+- an integer channel read as an integer takes the float's low bits (1e30,
+  0x7149f2ca, reads as 0xca from an 8-bit unsigned channel, 0xffffffca from
+  a signed one);
+- a channel the format lacks reads 0.
+
+The converted colour then stands in for each outside texel wherever one is
+read: point sampling, the linear blend, gather, 1D (whose filter blends in a
+border row), 3D, layered, cubemap and mipmapped fetches. `e2e_border_colour`
+hashes 705 cases of these against the card's results.
 
 The tests carry this as data from the hardware: `e2e_texture_filtering`,
 `e2e_texture_layers`, `e2e_texture_mipmaps` and `e2e_texture_gather` hash
@@ -125,8 +170,7 @@ Each with its own message, rather than a plausible wrong number:
 - Mipmapped layered and cubemap textures, and `tld4` on layered or cubemap
   textures (the runtime refuses a gather array that is layered or a cubemap,
   so there is nothing to measure them on).
-- A non-zero border colour with border addressing, resource views, sRGB, and
-  anisotropic filtering.
+- Resource views, sRGB and anisotropic filtering.
 
 ## Surfaces out of range: .trap, .clamp and .zero
 
