@@ -32,13 +32,13 @@ which is the honest meaning of "the same image".
 | CUDA driver | `libcuda.so.1` | contexts, modules, memory, launches |
 | CUDA runtime | `libcudart.so.13` | the nvcc registration ABI, streams, events |
 | NVML | `libnvidia-ml.so.1` | discovery and telemetry (`pynvml`, nvitop) |
-| cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8), GEMV, level‑1, batched LU (`getrfBatched`/`getrsBatched`) |
+| cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8 and complex), GEMV, level‑1, triangular solves, batched LU (`getrfBatched`/`getrsBatched`); for complex also rank-1/rank-k updates, Hermitian products, `trmm`/`trmv`/`trsv` |
 | cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8, strided batches, row-major layouts, ReLU/bias/GELU epilogues, FP8 tensor-wise and row-wise scales with amax |
 | cuDNN | `libcudnn.so.9` | convolution, activation, pooling, softmax, batchnorm |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation |
 | cuSPARSE | `libcusparse.so.12` | CSR/CSC/COO SpMV, SpMM (strided batches, fp16/bf16), SpGEMM, SDDMM, SpSV/SpSM, format conversion, CSR to CSC; legacy coo2csr, sorts and csrgeam2 |
-| cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR, symmetric eigen, SVD; the 64-bit X API, Jacobi (gesvdj, syevj) and batched forms, gesvdaStridedBatched |
+| cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR (with `ungqr`/`unmqr` for complex), symmetric and Hermitian eigen, SVD, in real and complex types; the 64-bit X API, Jacobi (gesvdj, syevj, heevj) and batched forms, gesvdaStridedBatched |
 | NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
 | NPP | `libnppc.so.13` and ten siblings | image and signal primitives |
@@ -111,6 +111,7 @@ runs them; each is a ctest of its own.
 | `e2e_fft_layouts` | cufftXt plans, strided and padded layouts of every rank, 2‑D/3‑D C2R, half | `torch.fft` |
 | `e2e_solver_paths` | cuSOLVER X API, gesvdj/syevj and their batched forms, gesvdaStridedBatched, batched potrf/potrs; cuBLAS batched LU | `torch.linalg` |
 | `e2e_sparse_paths` | coo2csr and the sorts, batched and half SpMM, SpGEMM, csrgeam2, SDDMM, SpSV/SpSM | `torch.sparse` |
+| `e2e_complex_paths` | complex cuBLAS (GEMM in every batched form, GEMV, level 1, trsm, batched LU, herk, hemv) and cuSOLVER (LU, Cholesky, QR with ungqr/unmqr, heevd/heevj, gesvd/gesvdj, the X API on complex types) | complex tensors in `torch.linalg`, `@` |
 | `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
 
 The programs were also run against NVIDIA's own libraries on an RTX 3060, so
@@ -239,8 +240,8 @@ both of which appear in ordinary nvcc output and are now handled.
 Unimplemented entry points return the library's own "not supported" status
 rather than a plausible wrong answer, so a caller's fallback path still works.
 
-- **cuBLAS**: complex types, triangular solves, most of level‑2/3, and the
-  pointer-array batched GEMMs (`cublasSgemmBatched` and friends).
+- **cuBLAS**: most of real level‑2/3; for complex types `her`/`her2`/`syr`/`syr2`,
+  `her2k`/`syr2k`, the `rot` family, `geqrfBatched` and `gelsBatched`.
 - **cuBLASLt**: the backward epilogues (`BGRADA`/`BGRADB`, `DRELU`, `DGELU`),
   auxiliary outputs, and the block-scaled FP8/FP4 modes.
 - **cuDNN**: the graph/backend API of cuDNN 8+, non-NCHW layouts, non-float
@@ -249,7 +250,8 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
 - **cuSPARSE**: the legacy `cusparse<t>csrmv` family (removed by NVIDIA in
   CUDA 12), the blocked (BSR) routines, complex values.
 - **cuSOLVER**: the sparse (`cusolverSp`) and multi-GPU (`cusolverMg`) modules,
-  the randomized variants.
+  the randomized variants, `sytrf` (symmetric indefinite), and `Xgeev` on a
+  complex matrix.
 - **NCCL**: the network plugin interface, user-defined reduction operators,
   symmetric memory windows, non-blocking communicators.
 - **NVRTC**: CUBIN, LTO-IR and OptiX-IR output (SASS and vendor bitcode, neither

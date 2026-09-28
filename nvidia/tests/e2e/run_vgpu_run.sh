@@ -157,6 +157,30 @@ else
   echo "SKIP: no nvcc matching this shim's toolkit (compiled-program checks)"
 fi
 
+# Triton (torch.compile) is pointed at vgpu-ptxas, which hands its PTX through
+# in place of a cubin; a ptxas the caller already named is left alone.
+ptxas="$build/bin/vgpu-ptxas"
+if [[ -x "$ptxas" ]]; then
+  check "Triton is pointed at vgpu-ptxas" "TRITON_PTXAS_PATH=$ptxas" -- \
+    "$vgpu" run --gpu nvidia/a10 --print-env /bin/true
+  check "and at it for Blackwell too" "TRITON_PTXAS_BLACKWELL_PATH=$ptxas" -- \
+    "$vgpu" run --gpu nvidia/a10 --print-env /bin/true
+  check "a ptxas the caller named wins" "TRITON_PTXAS_PATH=/opt/mine/ptxas" -- \
+    env TRITON_PTXAS_PATH=/opt/mine/ptxas "$vgpu" run --quiet --gpu nvidia/a10 /bin/sh -c 'echo TRITON_PTXAS_PATH=$TRITON_PTXAS_PATH'
+  check "vgpu-ptxas reports a toolkit release, which Triton parses" "release 12.8" -- \
+    env VGPU_PTXAS_VERSION=12.8 "$ptxas" --version
+  printf '.version 8.0\n.target sm_80\n' > "$work/k.ptx"
+  if "$ptxas" -lineinfo -v --opt-level 3 --gpu-name=sm_120a "$work/k.ptx" -o "$work/k.cubin" &&
+     cmp -s <(cat "$work/k.ptx"; printf '\0') "$work/k.cubin"; then
+    echo "PASS vgpu-ptxas writes the PTX, NUL terminated, where the cubin goes"
+  else
+    echo "FAIL vgpu-ptxas output is not the PTX plus a NUL"
+    fails=$((fails + 1))
+  fi
+else
+  echo "SKIP: $ptxas not built"
+fi
+
 if (( fails )); then
   echo "FAIL: $fails vgpu run checks failed"
   exit 1

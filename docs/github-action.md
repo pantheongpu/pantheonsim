@@ -70,7 +70,7 @@ and 4 when the program did not run at all (`vgpu test --help`).
 | `count` | `1` | How many GPUs |
 | `cuda-toolkit` | `apt` for NVIDIA, `none` for AMD | `apt` installs Ubuntu's toolkit; a version like `12.6` or `13.0` installs that `nvcc` from NVIDIA; `none` uses one the job already installed |
 | `rocm` | `7.1` for AMD, `none` for NVIDIA | The ROCm version whose `hipcc` to install -- `6.4`, `7.0`, `7.1` and `7.2` are the releases whose programs are checked on the simulator; `none` uses one the job already installed |
-| `library-path` | `true` | Puts the simulator's libraries on `LD_LIBRARY_PATH`, so programs run directly (ctest, scripts) as well as under `vgpu run` |
+| `library-path` | `true` | Puts the simulator's libraries on `LD_LIBRARY_PATH`, so programs run directly (ctest, scripts) as well as under `vgpu run`. Set `false` when the build links the toolkit's own vendor libraries (see below) |
 
 ## Outputs
 
@@ -93,6 +93,27 @@ and 4 when the program did not run at all (`vgpu test --help`).
   runtime even where a build asks for the static one (`-cudart static`,
   `-lcudart_static`, CMake's default), because the static runtime cannot talk
   to a simulated driver.
+- A build that links the toolkit's own vendor libraries (`-lcublas`,
+  `-lcusparse`, `-lcufft`, ...) needs `library-path: false`, with its tests run
+  under `vgpu run`. With the default, the simulator's libraries are on
+  `LD_LIBRARY_PATH` while the job builds, and the linker looks there for the
+  real libraries' own dependencies. NVIDIA's `libcublas.so`, for one, needs
+  internal symbols of its `libcublasLt.so` that the simulator's does not have,
+  so the link fails with undefined references such as
+  `cublasLtLegacyGemmSSS`. `vgpu run` puts the simulator's libraries in place
+  for the test run alone:
+
+  ```yaml
+  - uses: pantheongpu/pantheonsim@main
+    with:
+      gpu: nvidia/t4
+      library-path: false
+  - run: make                  # links the toolkit's libcublas
+  - run: vgpu run ./run_tests  # runs against the simulator's
+  ```
+
+  Linking against the simulator's own libraries instead (`-L` the `shim-dir`
+  output) also works.
 - CMake projects get the shared runtime through a toolchain file the action
   names in `CMAKE_TOOLCHAIN_FILE`, since CMake links with the host compiler
   where the `nvcc` wrapper cannot reach. A project that sets its own

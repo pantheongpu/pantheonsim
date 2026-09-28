@@ -317,10 +317,13 @@ std::vector<Node> static_nodes(const vgpu::telemetry::DeviceSample& d, uint32_t 
     // Two levels, idle and the most, as the clock model runs them (the
     // same range rocm-smi -s and the concise table show).
     const uint32_t mclk = d.mem_clock_max_mhz;
-    out.push_back(obj("clock", {obj("sys", {num("current_level", d.sm_clock_mhz >= d.sm_clock_max_mhz ? 1 : 0),
-                                            levels(d.sm_clock_max_mhz / 6, d.sm_clock_max_mhz)}),
+    // (The lower level is the clock it runs at below the most, as rocm-smi
+    // and ROCm SMI's library give it.)
+    const uint32_t sclk = d.sm_clock_max_mhz;
+    out.push_back(obj("clock", {obj("sys", {num("current_level", d.sm_clock_mhz >= sclk ? 1 : 0),
+                                            levels(d.sm_clock_mhz < sclk ? d.sm_clock_mhz : sclk / 6, sclk)}),
                                 obj("mem", {num("current_level", d.mem_clock_mhz >= mclk ? 1 : 0),
-                                            levels(mclk / 5, mclk)})}));
+                                            levels(d.mem_clock_mhz < mclk ? d.mem_clock_mhz : mclk / 5, mclk)})}));
   }
   return out;
 }

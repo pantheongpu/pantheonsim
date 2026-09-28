@@ -424,6 +424,14 @@ int cmd_run(const std::vector<std::string>& args) {
   const char* old_ld = std::getenv("LD_LIBRARY_PATH");
   env.emplace_back("LD_LIBRARY_PATH", shim + (old_ld && old_ld[0] ? ":" + std::string(old_ld) : ""));
 
+  // Triton -- and so torch.compile -- assembles its PTX with ptxas and loads
+  // the cubin, which VirtualGPU cannot run. vgpu-ptxas hands the PTX through
+  // in its place (nvidia/tools/vgpu-ptxas). A ptxas the caller named wins.
+  const std::string ptxas = exe_dir() + "/bin/vgpu-ptxas";
+  if (is_file(ptxas))
+    for (const char* k : {"TRITON_PTXAS_PATH", "TRITON_PTXAS_BLACKWELL_PATH"})
+      if (!std::getenv(k)) env.emplace_back(k, ptxas);
+
   if (o.preload) {
     // Exactly the libraries the program already asked for, and no more. Two
     // reasons to be narrow: preloading the whole shim would pull cuDNN and NCCL
