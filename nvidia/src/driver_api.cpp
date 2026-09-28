@@ -2373,6 +2373,31 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuTensorMapEncodeIm2col),
 };
 
+// A driver function this library exports but the table above does not list:
+// cuMemGetAllocationGranularity and the rest of the virtual memory API, which
+// NanoVDB fetches with cudaGetDriverEntryPoint and calls without checking.
+// Only a name with a single ABI is resolved this way. One that also has a _v2
+// export changed signature between releases, and which one a caller wants
+// depends on the version it asked for, so that stays the table's decision.
+void* exported_proc(const std::string& name) {
+  if (name.rfind("cu", 0) != 0) return nullptr;
+  static void* const self = [] {
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void*>(&exported_proc), &info) || !info.dli_fname) return (void*)nullptr;
+    return dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+  }();
+  if (!self) return nullptr;
+  void* fn = dlsym(self, name.c_str());
+  if (!fn || dlsym(self, (name + "_v2").c_str())) return nullptr;
+  // dlsym searches the library's dependencies too; only this library's own
+  // definition is an answer.
+  Dl_info where{}, mine{};
+  if (!dladdr(fn, &where) || !dladdr(reinterpret_cast<void*>(&exported_proc), &mine) ||
+      where.dli_fbase != mine.dli_fbase)
+    return nullptr;
+  return fn;
+}
+
 // Versioned/suffixed request names resolve to the same synchronous impls:
 // strip _v2/_v3 and _ptsz/_ptds suffixes when looking up.
 void* find_proc(const std::string& request) {
@@ -2392,7 +2417,7 @@ void* find_proc(const std::string& request) {
     }
     if (base == en) return e.fn;
   }
-  return nullptr;
+  return exported_proc(request);
 }
 
 }  // namespace
