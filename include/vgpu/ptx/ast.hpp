@@ -408,6 +408,11 @@ struct OpTcgen05 {
   bool ws = false;
   uint32_t collector_buf = 0;
   Tcgen05Collector collector = Tcgen05Collector::Discard;
+  // The module's target, as the interpreter needs it for the forms only one
+  // architecture has (sm_103a's K = 96 and absolute leading-dimension
+  // addresses): the SM number, and whether it is the arch-specific (a) one.
+  int target_sm = 0;
+  bool target_arch = false;
   bool has_zero_mask = false;
   Operand zero_mask;
   Operand d_tmem, a, b_desc, idesc, enable_d;

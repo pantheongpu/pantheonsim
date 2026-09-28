@@ -2698,6 +2698,11 @@ class Parser {
       }
       if (parts.size() < 2) return unsupported("tcgen05 form");
       OpTcgen05 op;
+      std::sscanf(target_.c_str(), "sm_%d", &op.target_sm);
+      {
+        const std::string arch = target_.substr(0, target_.find(','));
+        op.target_arch = !arch.empty() && arch.back() == 'a';
+      }
       const std::string& what = parts[1];
       if (what == "alloc") op.kind = Tcgen05Kind::Alloc;
       else if (what == "dealloc") op.kind = Tcgen05Kind::Dealloc;

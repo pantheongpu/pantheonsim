@@ -29,6 +29,7 @@ using vgpu::exec::LaunchConfig;
 namespace {
 
 const char* kHeader100a = ".version 8.7\n.target sm_100a\n.address_size 64\n";
+const char* kHeader103a = ".version 8.8\n.target sm_103a\n.address_size 64\n";
 
 std::vector<uint8_t> arg_u64(uint64_t v) {
   std::vector<uint8_t> b(8);
@@ -172,6 +173,9 @@ struct Mma {
   struct Step { std::string collector; uint64_t b_delta = 0; };
   std::vector<Step> steps{{}};
   bool has_zero_mask = false;
+  // Descriptors whose leading-dimension field is an absolute address (bit 52):
+  // it too is relative to the operand buffer here, and made absolute.
+  bool abs_lbo = false;
   uint64_t zero_mask = 0;
 
   std::vector<std::vector<uint32_t>> run() const {
@@ -283,6 +287,12 @@ COPIED:
     add.u64 %rd5, %rd5, %rd12;
     add.u64 %rd6, %rd6, %rd12;
     add.u64 %rd6, %rd6, 512;
+)" + (abs_lbo ? std::string(R"(
+    shl.b64 %rd13, %rd12, 16;
+    add.u64 %rd5, %rd5, %rd13;
+    add.u64 %rd6, %rd6, %rd13;
+    add.u64 %rd6, %rd6, 33554432;          // B's buffer, 512 << 16
+)") : std::string()) + R"(
     add.u32 %r61, %r40, )" + std::to_string(d_col | (d_lane << 16)) + R"(;
     add.u32 %r62, %r40, )" + std::to_string(a_col) + R"(;
     add.u32 %r63, %r40, )" + std::to_string(sfa_col) + R"(;
@@ -2120,6 +2130,148 @@ VTEST(tcgen05_mma_ws_refuses_what_the_isa_rules_out_or_leaves_open) {
   x.meta_col = 32;
   x.id = idesc(1, 0, 0, 64, 64) | 4;
   VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "figures 287-292");
+}
+
+// ---- sm_103a (B300): K = 96 and absolute leading-dimension addresses ----------------
+
+// Where the j-th of a row's K = 96 scale factors sits, as figures 243-275
+// draw it for each SF_ID: (word, byte), word 0 being the row's column
+// (base + row / 32) and word 1 the column `stride` further on -- four, or
+// eight for a B of more than 128 columns.
+struct SfSlot { int word, byte; };
+std::vector<SfSlot> k96_slots(int per_row, int sf_id) {
+  if (per_row == 6)   // .block16 (figures 251-252, 270-275): SF_ID 0 or 2
+    return sf_id == 0 ? std::vector<SfSlot>{{0, 0}, {0, 1}, {0, 2}, {0, 3}, {1, 0}, {1, 1}}
+                      : std::vector<SfSlot>{{0, 2}, {0, 3}, {1, 0}, {1, 1}, {1, 2}, {1, 3}};
+  switch (sf_id) {    // .block32 (figures 243-246, 260-269)
+    case 0: return {{0, 0}, {0, 1}, {0, 2}};
+    case 1: return {{0, 1}, {0, 2}, {0, 3}};
+    case 2: return {{0, 2}, {0, 3}, {1, 0}};
+    default: return {{0, 3}, {1, 0}, {1, 1}};
+  }
+}
+void put_scales96(std::vector<uint32_t>& cells, int a_cols, int col, int rows, int per_row, int sf_id,
+                  int stride, const std::function<uint8_t(int, int)>& sf) {
+  const std::vector<SfSlot> slots = k96_slots(per_row, sf_id);
+  for (int m = 0; m < rows; ++m)
+    for (int part = 0; part < 4; ++part)
+      for (int j = 0; j < per_row; ++j) {
+        uint32_t& c = cells[size_t(m % 32 + 32 * part) * a_cols + col + m / 32 + stride * slots[j].word];
+        c = (c & ~(0xFFu << 8 * slots[j].byte)) | uint32_t(sf(m, j)) << 8 * slots[j].byte;
+      }
+}
+
+// One K = 96 block-scaled MMA on sm_103a: A (M = 128) and B from packed fp4,
+// three K groups of 16 bytes a row (LBO 128, SBO 384), the factors after D.
+struct K96 {
+  int N, per_row, sfa_id, sfb_id;
+  std::string kind, mods;
+  uint32_t scale_type;   // 0 UE4M3, 1 UE8M0
+};
+void run_k96(const K96& c) {
+  const int M = 128, K = 96;
+  auto A = [](int m, int k) { return val(m, k, 3); };
+  auto B = [](int k, int n) { return val(k, n, 5); };
+  const float steps[] = {0.5f, 1.0f, 2.0f, 4.0f, 0.25f};
+  auto sa = [&](int m, int j) { return steps[(m + 2 * j) % 5]; };
+  auto sb = [&](int n, int j) { return steps[(3 * n + j) % 5]; };
+  auto code = [&](float f) { return c.scale_type ? uint8_t(std::ilogb(f) + 127) : e4m3_bits(f); };
+  Mma x;
+  x.target = kHeader103a;
+  x.kind = c.kind;
+  x.kind_mods = c.mods;
+  x.block_scale = true;
+  x.id = idesc_mx(1, 1, M, c.N, c.sfa_id, c.sfb_id, c.scale_type) | 1u << 31;
+  x.desc_a = desc(0, 128, 384, 0);
+  x.desc_b = desc(0, 128, 384, 0);
+  x.smem_a = {packed_k_major(M, K, 4, 32, 128, 384, [&](int m, int k) { return e2m1_bits(A(m, k)); })};
+  x.smem_b = {packed_k_major(c.N, K, 4, 32, 128, 384, [&](int n, int k) { return e2m1_bits(B(k, n)); })};
+  const int stride_b = c.N > 128 ? 8 : 4, d_cols = 256;
+  x.cols = 512;
+  x.a_is_tmem = false;
+  x.a_cols = 32;   // A 8 columns, B 8 or 16; a power of two for the harness's tcgen05.st
+  x.a_col = d_cols;
+  x.sfa_col = d_cols;
+  x.sfb_col = d_cols + 8;
+  x.a_tmem.assign(1, std::vector<uint32_t>(size_t(128) * x.a_cols, 0xA5A5A5A5u));
+  put_scales96(x.a_tmem[0], x.a_cols, 0, M, c.per_row, c.sfa_id, 4, [&](int m, int j) { return code(sa(m, j)); });
+  put_scales96(x.a_tmem[0], x.a_cols, 8, c.N, c.per_row, c.sfb_id, stride_b,
+               [&](int n, int j) { return code(sb(n, j)); });
+  check_scaled(x.run(), M, c.N, K, K / c.per_row, 512, A, B, sa, sb);
+}
+
+VTEST(tcgen05_mma_k96_mxf4nvf4_block16_six_factors) {
+  run_k96({64, 6, 0, 2, "mxf4nvf4", ".block_scale.block16", 0});    // B within 128 columns
+  run_k96({144, 6, 2, 0, "mxf4nvf4", ".block_scale.block16", 0});   // B past 128: words 8 apart
+}
+
+VTEST(tcgen05_mma_k96_mxf4_block32_three_factors) {
+  run_k96({64, 3, 1, 3, "mxf4", ".block_scale.block32", 1});
+  run_k96({144, 3, 2, 0, "mxf4", ".block_scale", 1});   // .block32 is mxf4's default
+  run_k96({64, 3, 3, 2, "mxf4nvf4", ".block_scale.block32", 1});
+}
+
+VTEST(tcgen05_mma_k96_refuses_what_the_isa_rules_out) {
+  Mma x;
+  x.kind = "mxf4nvf4";
+  x.kind_mods = ".block_scale.block16";
+  x.block_scale = true;
+  x.desc_a = desc(0, 128, 384, 0);
+  x.desc_b = desc(0, 128, 384, 0);
+  x.cols = 64;
+  x.a_is_tmem = false;
+  x.a_cols = 16;
+  x.a_col = 32;
+  x.sfa_col = 32;
+  x.sfb_col = 40;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 16));
+  x.id = idesc_mx(1, 1, 128, 32, 0, 0, 0) | 1u << 31;
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "sm_103a");   // an sm_100a module
+  x.target = kHeader103a;
+  x.id = idesc_mx(1, 1, 128, 32, 1, 0, 0) | 1u << 31;             // .block16 from byte 1
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "Tables 51-53");
+  x.kind_mods = ".block_scale.scale_vec::4X";
+  x.id = idesc_mx(1, 1, 128, 32, 0, 0, 0) | 1u << 31;
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "Table 68");
+  x.kind = "mxf8f6f4";
+  x.kind_mods = ".block_scale";
+  x.id = idesc_mx(0, 0, 128, 32, 0, 0, 1) | 1u << 31;
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "sm_107f");
+}
+
+// Bit 52 (sm_103a): a K-major row runs to the end of its swizzle row, then on
+// at the same row of the absolute address -- the way CUTLASS's SM103 kernels
+// have a K block straddle two pipeline buffers. Here f16 with the 32-byte
+// swizzle, M = 64: each row's K = 16 starts halfway along its 32-byte row
+// (element 8) in buffer 0 and ends in buffer 1, 2048 bytes on.
+VTEST(tcgen05_mma_absolute_leading_address_continues_in_the_next_buffer) {
+  const int M = 64, N = 64, K = 16;
+  auto A = [](int m, int k) { return val(m, k, 4); };
+  auto B = [](int k, int n) { return val(k, n, 1); };
+  // Element k of a row is element 8 + k of a 32-wide virtual row: 0-15 in
+  // buffer 0, 16-31 in buffer 1, each laid out as the 32-byte canonical
+  // K-major layout (row stride 32, SBO 256).
+  auto image = [&](int rows, const std::function<uint16_t(int, int)>& v) {
+    std::vector<uint8_t> img(4096, 0);
+    for (int r = 0; r < rows; ++r)
+      for (int k = 0; k < K; ++k) {
+        const int kv = 8 + k;
+        put(img, (kv < 16 ? 0 : 2048) + canonical(Major::K, 32, 2, 0, 256, r, kv % 16), v(r, k), 2);
+      }
+    return img;
+  };
+  const uint64_t abs = uint64_t{1} << 52 | uint64_t{2048 >> 4} << 16;
+  Mma x;
+  x.target = kHeader103a;
+  x.abs_lbo = true;
+  x.id = idesc(1, 0, 0, M, N);
+  x.desc_a = (desc(16, 0, 256, 32) & ~(uint64_t{0x3FFF} << 16)) | abs;
+  x.desc_b = (desc(16, 0, 256, 32) & ~(uint64_t{0x3FFF} << 16)) | abs;
+  x.smem_a = {image(M, [&](int m, int k) { return f16_bits(A(m, k)); })};
+  x.smem_b = {image(N, [&](int n, int k) { return f16_bits(B(k, n)); })};
+  check_d_f32(x.run(), 1, M, N, K, A, B);
+  x.target = kHeader100a;   // bit 52 is sm_103a's
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "sm_103a");
 }
 
 // M = 256 (layout A): each CTA supplies half of A's rows and half of B's

@@ -196,6 +196,38 @@ address down one row, 256 bits (eight columns) each -- the implicit
 `.31x256b` shape of 9.7.18.2.3; row 0 is left as it was. One thread
 issues it, for its CTA or both of a pair.
 
+### Blackwell Ultra (sm_103a, the B300)
+
+A simulated B300 (`VGPU_GPU=nvidia/b300`, compute capability 10.3) runs
+`sm_103a` code as the B200 runs `sm_100a` code, plus what CUTLASS's SM103
+kernels use:
+
+- **K = 96 for `.kind::mxf4` and `.kind::mxf4nvf4`.** Instruction descriptor
+  bit 31, dense only, on an `sm_103a` module (9.7.18.2.1.1).
+  - `.block32` gives three scale factors a row and `.block16` six (Table 68).
+  - A row's factors are one byte stream from byte SF_ID. Byte b is byte b % 4
+    of the row's column, `stride` columns further on for each four bytes. The
+    stride is 4, or 8 for a B of more than 128 columns (figures 243-275).
+    Below four bytes this is every other size's layout.
+  - `.block16` takes SF_ID 0 or 2 there, and the `.scale_vec::NX` spellings
+    name no K = 96 form.
+  - Sparse A with bit 31 (a K of 192) is refused: CuTe's descriptor calls it
+    invalid, and the ISA's note names only K = 96.
+- **The absolute leading-dimension address** (shared-memory descriptor bit
+  52, 9.7.18.4.1).
+  - For a swizzled K-major operand, a row's bytes run to the end of its
+    swizzle row, then continue at the same row of the atom at that address.
+  - CUTLASS's SM103 kernels step K = 96 fp4 blocks (48 bytes) through
+    128-byte buffers, so every third block straddles two buffers. They set
+    the field to the next buffer's start.
+  - Other operand layouts are refused, since the ISA doesn't say what the
+    mode means for them.
+- **What stays refused:** sm_103's `tcgen05.ld.red`, and sm_107's forms.
+
+The profile's SM count (148) is unverified. NVIDIA gives "up to 160 SMs ...
+available SM count varies by SKU". The PCI device (0x3182, "B300 SXM6 AC")
+is from the name table in NVIDIA's open kernel modules.
+
 ### When things complete
 
 The asynchronous operations -- `mma`, `ld`, `st` -- complete when they are
@@ -265,5 +297,7 @@ before waiting for it is not caught here.
   - the ISA's zero-column mask examples 3 and 4 bit for bit;
   - the collector rules;
   - the `.ws` forms, which match what CUDA 13's `ptxas` assembles.
+- `nvidia/tests/e2e/run_cutlass_sm103.sh` (`e2e_cutlass_sm103`): CUTLASS's
+  SM103 fp4 GEMMs, 1-SM and 2-SM, on a simulated B300.
 - `nvidia/tests/e2e/run_cutlass_sm100.sh`: CUTLASS's own SM100 GEMM unit tests,
   unmodified, on a simulated B200, checked against CUTLASS's host reference.

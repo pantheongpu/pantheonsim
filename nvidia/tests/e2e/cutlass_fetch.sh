@@ -46,7 +46,8 @@ if [[ ! -f "$cutlass/test/unit/conv/device_3x/testbed_conv.hpp" ||
       ! -f "$cutlass/test/unit/gemm/device/sm100_gemm_f8_f8_f8_tensor_op_f32_blockwise.cu" ||
       ! -f "$cutlass/test/unit/gemm/device/sm120_tensorop_gemm/sm120_gemm_f4_f6_f32_tensor_op.cu" ||
       ! -f "$cutlass/test/unit/conv/device_3x/fprop/sm100_conv2d_fprop_implicit_gemm_f16_f16_f32_tensorop_f32.cu" ||
-      ! -f "$cutlass/examples/77_blackwell_fmha/77_blackwell_fmha.cu" ]]; then
+      ! -f "$cutlass/examples/77_blackwell_fmha/77_blackwell_fmha.cu" ||
+      ! -f "$cutlass/test/unit/gemm/device/sm103_gemm_f4_f4_f32_tensor_op_f32_1sm.cu" ]]; then
   if [[ -n "${CUTLASS_DIR:-}" ]]; then
     echo "FAIL: CUTLASS_DIR=$CUTLASS_DIR is not a CUTLASS checkout with its unit tests"; exit 1
   fi
@@ -72,6 +73,7 @@ if [[ ! -f "$cutlass/test/unit/conv/device_3x/testbed_conv.hpp" ||
        'cutlass-*/test/unit/gemm/device/sm100_gemm_f8_f8_f8_tensor_op_f32_blockwise.cu' \
        'cutlass-*/test/unit/gemm/device/sm100_gemm_f4_f4_f32_tensor_op_f32_ptr_array.cu' \
        'cutlass-*/test/unit/gemm/device/sm120_*/*.cu' \
+       'cutlass-*/test/unit/gemm/device/sm103_*.cu' \
        'cutlass-*/test/unit/gemm/device/*sparse*.cu' \
        'cutlass-*/test/unit/test_unit.cpp'; then
     echo "SKIP: could not download CUTLASS $cutlass_tag (set CUTLASS_DIR to a checkout)"; exit 0
