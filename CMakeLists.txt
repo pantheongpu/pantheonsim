@@ -1546,3 +1546,9 @@ if(TARGET vgpucublas)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 3600)
 endif()
+# And on every simulated AMD GPU, through Ollama's ROCm backend (llama.cpp's
+# HIP kernels, rocBLAS, hipBLAS). Skips without ollama and its ROCm backend.
+# VGPU_OLLAMA_PROFILES picks GPUs; CI runs one job for each.
+add_test(NAME amd_ollama COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_ollama_amd.sh)
+set_tests_properties(amd_ollama PROPERTIES DEPENDS "vgpuhip;vgpu_cli" RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 10800)
