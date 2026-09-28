@@ -247,11 +247,14 @@ const HipApi kHipApis[] = {
 };
 
 int hip_api_id(const char* name) {
-  static const std::map<std::string, int> ids = [] {
+  // Never destroyed: HIP is called after static destruction has begun (a
+  // library's own static destructor, at exit), and each call looks its name
+  // up here.
+  static const std::map<std::string, int>& ids = *new std::map<std::string, int>([] {
     std::map<std::string, int> m;
     for (const HipApi& a : kHipApis) m.emplace(a.name, a.id);
     return m;
-  }();
+  }());
   const auto it = ids.find(name);
   return it == ids.end() ? -1 : it->second;
 }
@@ -590,9 +593,25 @@ struct ApiFrame {
   int op = -1;
   uint64_t start = 0;
 };
+// A thread's HIP calls in progress. exit() destroys the thread's
+// thread_local objects before it runs the libraries' static destructors, and
+// those still call HIP -- hipBLASLt's unloads its code objects -- so a
+// thread_local vector was written after it was destroyed, and glibc found its
+// heap damaged on the next free (vLLM, on its way out). The vector is kept
+// through a pointer that outlives the thread's destructors: freed when the
+// thread's own reaper runs, and made again, once, for any call after that.
 std::vector<ApiFrame>& frames() {
-  thread_local std::vector<ApiFrame> f;
-  return f;
+  thread_local std::vector<ApiFrame>* f = nullptr;
+  thread_local struct Reaper {
+    std::vector<ApiFrame>** p;
+    ~Reaper() {
+      delete *p;
+      *p = nullptr;
+    }
+  } reaper{&f};
+  (void)reaper;
+  if (!f) f = new std::vector<ApiFrame>;
+  return *f;
 }
 uint64_t current_correlation(Sdk& s) {
   return frames().empty() ? s.next_correlation.fetch_add(1) : frames().back().correlation;

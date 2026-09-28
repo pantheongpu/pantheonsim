@@ -445,7 +445,7 @@ vLLM for ROCm, unmodified, generates on a simulated MI300X what Hugging Face's t
 - vLLM asks AMD SMI whether this is a ROCm machine, and NVML whether it is a CUDA one. NVML answers only for NVIDIA GPUs, and says a machine of AMD GPUs has no NVIDIA driver, as it does on one.
 - Its paged attention for ROCm multiplies with `v_mfma_f32_4x4x4_16b_f16` and CBSZ 4: every block takes block 0's query (A's broadcast, modelled; B's lane patterns, BLGP, are refused by name).
 - The run is eager (no graphs, no `torch.compile`), with one short sequence and a 3 GB device, so the KV cache fits in RAM.
-- Known issue: the process aborts on its way out, after the output, with glibc reporting a damaged heap when hipBLASLt's static destructor unloads its code objects. The simulator's own libraries built with AddressSanitizer report nothing, and the run then exits cleanly. The test counts the exit as a failure until that is found.
+- vLLM's process ended by aborting, after its output, on a damaged heap: exit() destroys a thread's `thread_local` objects, and then the libraries' static destructors, one of which (hipBLASLt's) still calls HIP. The profiler's per-thread call stack and its table of HIP call names were used after they were destroyed. Both now outlive static destruction (ctest `test_amd_hip_at_exit`: HIP from a static destructor, clean under AddressSanitizer).
 
 ## Debugging
 

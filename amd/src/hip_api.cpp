@@ -747,7 +747,22 @@ struct CallConfiguration {
   size_t shared;
   hipStream_t stream;
 };
-thread_local std::vector<CallConfiguration> g_call_configurations;
+// Kept through a pointer that outlives the thread's thread_local
+// destructors, which exit() runs before the static destructors that may
+// still launch (see the profiler's frames(), rocprofiler_sdk.cpp).
+std::vector<CallConfiguration>& call_configurations() {
+  thread_local std::vector<CallConfiguration>* v = nullptr;
+  thread_local struct Reaper {
+    std::vector<CallConfiguration>** p;
+    ~Reaper() {
+      delete *p;
+      *p = nullptr;
+    }
+  } reaper{&v};
+  (void)reaper;
+  if (!v) v = new std::vector<CallConfiguration>;
+  return *v;
+}
 
 // Host memory kernels reach: see hipHostMalloc.
 std::mutex g_host_mutex;
@@ -1704,16 +1719,16 @@ void __hipUnregisterFatBinary(void** modules) {
 hipError_t __hipPushCallConfiguration(vgpu::amd::abi::Dim3 grid, vgpu::amd::abi::Dim3 block, size_t shared,
                                       hipStream_t stream) {
   const ApiCall api("__hipPushCallConfiguration");
-  g_call_configurations.push_back({grid, block, shared, stream});
+  call_configurations().push_back({grid, block, shared, stream});
   return hipSuccess;
 }
 
 hipError_t __hipPopCallConfiguration(vgpu::amd::abi::Dim3* grid, vgpu::amd::abi::Dim3* block, size_t* shared,
                                      hipStream_t* stream) {
   const ApiCall api("__hipPopCallConfiguration");
-  if (g_call_configurations.empty()) return hipErrorInvalidConfiguration;
-  const CallConfiguration c = g_call_configurations.back();
-  g_call_configurations.pop_back();
+  if (call_configurations().empty()) return hipErrorInvalidConfiguration;
+  const CallConfiguration c = call_configurations().back();
+  call_configurations().pop_back();
   if (grid) *grid = c.grid;
   if (block) *block = c.block;
   if (shared) *shared = c.shared;

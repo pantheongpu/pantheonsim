@@ -762,6 +762,14 @@ target_link_libraries(test_amd_rocprofiler PRIVATE vgpurocprof vgpuhip)
 target_include_directories(test_amd_rocprofiler PRIVATE tests/framework amd/include)
 target_compile_definitions(test_amd_rocprofiler PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME test_amd_rocprofiler COMMAND test_amd_rocprofiler)
+# HIP from a static destructor after exit() has destroyed thread_local
+# objects, with the profiler's hooks on, as hipBLASLt does under PyTorch.
+add_executable(test_amd_hip_at_exit amd/tests/unit/test_hip_at_exit.cpp)
+target_link_libraries(test_amd_hip_at_exit PRIVATE vgpurocprof vgpuhip)
+target_include_directories(test_amd_hip_at_exit PRIVATE tests/framework amd/include)
+add_test(NAME test_amd_hip_at_exit COMMAND test_amd_hip_at_exit)
+set_tests_properties(test_amd_hip_at_exit PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "ok HIP from a static destructor" FAIL_REGULAR_EXPRESSION "FAIL|ERROR: AddressSanitizer|malloc|double free|corrupted")
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
 # ROCm SMI's answers to RCCL, from RCCL's side, on Instinct and Radeon GPUs.
 add_executable(test_amd_rocm_smi amd/tests/unit/test_rocm_smi.cpp)
