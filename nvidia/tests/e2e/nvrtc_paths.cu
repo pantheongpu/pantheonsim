@@ -175,6 +175,45 @@ extern "C" __global__ void packed(Pack p, float* x) { x[threadIdx.x] *= p.scale[
   cuModuleUnload(mod);
 }
 
+// A kernel from one module launched again after others have loaded, as the
+// jiterator does: each of its kernels is a module of its own, and a function
+// handle has to stay good while more arrive. The kernel reads a __device__
+// variable, so the launch needs its module's symbol table.
+static void function_outlives_later_modules() {
+  const char* src = R"(
+__device__ float bias = 5.0f;
+extern "C" __global__ void add_bias(float* x, int n) { if (threadIdx.x < n) x[threadIdx.x] += bias; }
+)";
+  const std::string ptx = compile(src, "bias.cu", {"--gpu-architecture=compute_80"});
+  if (ptx.empty()) { check(false, "the first module compiles"); return; }
+  CUmodule first;
+  CUfunction fn;
+  CK(cuModuleLoadData(&first, ptx.c_str()));
+  CK(cuModuleGetFunction(&fn, first, "add_bias"));
+  std::vector<float> x(4, 1.0f);
+  bool ok = run(ptx, "add_bias", x, 4) && x[0] == 6.0f;  // a module of its own, loaded and unloaded
+  std::vector<CUmodule> more;
+  const std::string other = compile("__device__ int k; extern \"C\" __global__ void other(int* p) { *p = k; }",
+                                    "other.cu", {"--gpu-architecture=compute_80"});
+  for (int i = 0; i < 20 && !other.empty(); ++i) {
+    CUmodule m;
+    if (cuModuleLoadData(&m, other.c_str()) == CUDA_SUCCESS) more.push_back(m);
+  }
+  CUdeviceptr d;
+  cuMemAlloc(&d, 4 * sizeof(float));
+  std::vector<float> y(4, 1.0f);
+  cuMemcpyHtoD(d, y.data(), y.size() * sizeof(float));
+  int n = 4;
+  void* args[] = {&d, &n};
+  ok = ok && more.size() == 20 && cuLaunchKernel(fn, 1, 1, 1, 4, 1, 1, 0, nullptr, args, nullptr) == CUDA_SUCCESS &&
+       cuCtxSynchronize() == CUDA_SUCCESS;
+  cuMemcpyDtoH(y.data(), d, y.size() * sizeof(float));
+  check(ok && y[3] == 6.0f, "a function still launches, reading its module's globals, after 20 more modules load");
+  cuMemFree(d);
+  for (CUmodule m : more) cuModuleUnload(m);
+  cuModuleUnload(first);
+}
+
 static void compile_error() {
   nvrtcProgram p;
   CK(nvrtcCreateProgram(&p, "__global__ void k() { undeclared_thing(); }", "bad.cu", 0, nullptr, nullptr));
@@ -197,6 +236,7 @@ int main() {
   jiterator_shaped();
   name_expressions_and_headers();
   struct_parameter();
+  function_outlives_later_modules();
   compile_error();
   cuDevicePrimaryCtxRelease(dev);
   std::printf(failures ? "FAIL: %d NVRTC checks\n" : "PASS: every NVRTC check\n", failures);
