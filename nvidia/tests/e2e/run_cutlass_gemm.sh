@@ -9,6 +9,8 @@
 #   threads): mma.sp; empty cp.async groups counting toward wait_group; the
 #   split-K semaphore wait -- bar.red in a loop with thread 0 on a higher-pc
 #   path, and __syncthreads_and's brace-scoped %p1/%p2.
+#   SM80 sparse GEMMs over tf32, s8 and s4: mma.sp with each type's chunks,
+#   and the 8- and 4-bit metadata a row to a lane.
 #   SM90 group GEMM, identity and silu epilogues (2x2x1 clusters): wgmma
 #   reading its operands once per warpgroup; cvt.sat and tiny fp16 results in
 #   the silu epilogue's expf.
@@ -16,6 +18,9 @@
 #   wgmma operand read, and wgmma.wait_group holding a warp until its whole
 #   warpgroup has issued.
 #   SM90 s8 GEMM: cvt.pack.sat in the epilogue.
+#   SM90 sparse GEMMs, f16/bf16, tf32, fp8 and s8: wgmma.mma_async.sp, its
+#   packed M x K/2 A in shared memory and each warp's metadata (the ping-pong
+#   kernels, which take a minute each here, only for f16).
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -49,9 +54,16 @@ trap 'rm -rf "$work"' EXIT
 # test file | arch | simulated GPU | gtest filter
 tests=(
   "gemm_f16t_f16n_f32t_tensor_op_f32_sparse_sm80|compute_80|nvidia/a100|*"
+  "gemm_f32t_f32n_f32t_tensor_op_f32_sparse_sm80|compute_80|nvidia/a100|*"
+  "gemm_s8t_s8n_s32t_tensor_op_s32_sparse_sm80|compute_80|nvidia/a100|*"
+  "gemm_s4t_s4n_s32t_tensor_op_s32_sparse_sm80|compute_80|nvidia/a100|*"
   "sm90_gemm_f16_f16_f16_tensor_op_f32_group_gemm|compute_90a|nvidia/h100|*.128x128x64_2x2x1:*.128x128x64_2x2x1_silu"
   "sm90_gemm_f16_f16_f16_tensor_op_f32_cluster_warpspecialized_pingpong|compute_90a|nvidia/h100|*f16t_f16t_f32n_tensor_op_gmma_f32_persistent.64x128x64_2x4x1:*f16t_f16n_f16t_tensor_op_gmma_f32_persistent_Epilogue.64x128x64_2x2x1"
   "sm90_gemm_s8_s8_s8_tensor_op_s32|compute_90a|nvidia/h100|*.128x128x128:*cooperative_epilogue*"
+  "sm90_sparse_gemm_f16_f16_f32_tensor_op_f32|compute_90a|nvidia/h100|*"
+  "sm90_sparse_gemm_tf32_tf32_f32_tensor_op_f32|compute_90a|nvidia/h100|*-*pingpong*"
+  "sm90_sparse_gemm_f8_f8_f32_tensor_op_f32|compute_90a|nvidia/h100|*-*pingpong*"
+  "sm90_sparse_gemm_s8_s8_s32_tensor_op_s32|compute_90a|nvidia/h100|*-*pingpong*"
 )
 u="$cutlass/test/unit"
 # Each compile peaks near 10 GB, as run_cutlass_hopper.sh measured; as many

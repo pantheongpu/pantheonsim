@@ -1131,10 +1131,41 @@ class Parser {
 
   // ---- operands ----
 
+  // A decimal floating-point literal (4.5.2: "0.5", "1e-3"): always a double,
+  // converted to the operand's size at its use. The size is the opcode's last
+  // floating-point type -- the only one, or cvt's source -- f32 unless .f64.
+  static bool decimal_float(const std::string& w) {
+    if (w.empty() || !isdigit(static_cast<unsigned char>(w[0]))) return false;
+    if (w.size() > 1 && w[0] == '0' && std::strchr("xXfFdDbB", w[1])) return false;
+    return w.find_first_of(".eE") != std::string::npos;
+  }
+  ImmFloatBits decimal_float_operand(const std::string& w, bool negative, size_t line) {
+    size_t used = 0;
+    double d = 0;
+    try {
+      d = std::stod(w, &used);
+    } catch (const std::exception&) {
+      fail(line, "bad floating-point literal '" + w + "'");
+    }
+    if (used != w.size()) fail(line, "bad floating-point literal '" + w + "'");
+    if (negative) d = -d;
+    const size_t f64 = cur_opcode_.rfind(".f64"), f32 = cur_opcode_.rfind(".f32");
+    if (f64 != std::string::npos && (f32 == std::string::npos || f64 > f32)) {
+      uint64_t b;
+      std::memcpy(&b, &d, 8);
+      return ImmFloatBits{b, 64};
+    }
+    const float f = static_cast<float>(d);
+    uint32_t b;
+    std::memcpy(&b, &f, 4);
+    return ImmFloatBits{b, 32};
+  }
+
   Operand parse_operand() {
     const Token& t = next();
     if (t.kind == Token::Kind::Punct && t.text == "-") {
       std::string w = expect_word("number after '-'");
+      if (decimal_float(w)) return decimal_float_operand(w, true, t.line);
       return ImmInt{negate(parse_int_literal(w, t.line))};
     }
     if (t.kind != Token::Kind::Word) fail(t.line, "expected operand, got '" + t.text + "'");
@@ -1166,6 +1197,7 @@ class Parser {
         return ImmFloatBits{parse_float_bits(w, t.line), 32};
       if (w.size() == 18 && w[0] == '0' && (w[1] == 'd' || w[1] == 'D'))
         return ImmFloatBits{parse_float_bits(w, t.line), 64};
+      if (decimal_float(w)) return decimal_float_operand(w, false, t.line);
       return ImmInt{parse_int_literal(w, t.line)};
     }
     // A bare identifier is an inline-asm register local if it was declared as
@@ -1294,6 +1326,7 @@ class Parser {
 
   // The module's .target line, for the instructions only one target has.
   std::string target_;
+  std::string cur_opcode_;   // the instruction being parsed, for literal sizes
   // And its .version, for the one instruction whose operand changed meaning.
   std::string version_;
 
@@ -1313,6 +1346,7 @@ class Parser {
     }
 
     std::string opcode = expect_word("instruction opcode");
+    cur_opcode_ = opcode;
     std::vector<std::string> parts = split_dots(opcode);
     if (parts.empty()) fail(ins.line, "bad opcode '" + opcode + "'");
 
@@ -1392,6 +1426,9 @@ class Parser {
         else if (inert_mem_modifier(p)) ;
         else if (p == "v2") vec = 2;
         else if (p == "v4") vec = 4;
+        // 256-bit accesses (PTX ISA 8.8, sm_100 and later): eight 32-bit
+        // elements, or four 64-bit ones, which .v4 already covers.
+        else if (p == "v8") vec = 8;
         else if (p == "b128") {
           ty = Type{Type::Kind::B, 64};
           have_ty = true;
@@ -1410,6 +1447,8 @@ class Parser {
       }
       if (!have_ty) fail(ins.line, "ld/st missing type: " + opcode);
       storage_bytes(ty, ins.line, opcode);
+      if (vec == 8 && (ty.bytes() != 4 || space != Space::Global))
+        return unsupported(".v8 " + op0 + " of other than 32-bit elements in global memory");
       if (op0 == "ld") {
         Addr addr;
         std::vector<Reg> dsts;
@@ -2018,41 +2057,57 @@ class Parser {
       op.src = parse_operand();
       ins.op = op;
     } else if (op0 == "ldmatrix") {
+      // ldmatrix.sync.aligned.<shape>.<num>{.trans}{.shared}.<type> r, [p]
+      //   m8n8 .b16; m16n16 .trans .b8 or .b8x16.{b6x16_p32,b4x16_p64};
+      //   m8n16 .b8x16.{b6x16_p32,b4x16_p64} or .s8.s4 (9.7.16.5.15)
       uint32_t count = 0;
-      bool trans = false, shape_ok = false, b16 = false, shared_space = false;
+      bool trans = false, shared_space = false, have_shape = false, b8x16 = false, s8 = false;
+      OpLdMatrix op;
+      std::string src;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "sync" || p == "aligned") ;
-        else if (p == "m8n8") shape_ok = true;
+        else if (p == "m8n8") { op.shape = LdmShape::M8N8; have_shape = true; }
+        else if (p == "m8n16") { op.shape = LdmShape::M8N16; have_shape = true; }
+        else if (p == "m16n16") { op.shape = LdmShape::M16N16; have_shape = true; }
         else if (p == "x1") count = 1;
         else if (p == "x2") count = 2;
         else if (p == "x4") count = 4;
         else if (p == "trans") trans = true;
-        else if (p == "b16") b16 = true;
+        else if (p == "b16" || p == "b8" || p == "b6x16_p32" || p == "b4x16_p64" || p == "s4") src = p;
+        else if (p == "b8x16") b8x16 = true;
+        else if (p == "s8") s8 = true;
         else if (p == "shared") shared_space = true;
         else if (p == "cta") ;  // scope qualifier on .shared::cta
         else return unsupported("ldmatrix modifier '." + p + "'");
       }
-      if (!shape_ok || !count || !b16)
-        return unsupported("only ldmatrix.m8n8.x{1,2,4}.b16 is implemented");
-      OpLdMatrix op;
+      op.fmt = src == "b16" ? LdmSrc::B16 : src == "b8" ? LdmSrc::B8 : src == "b6x16_p32" ? LdmSrc::B6P32
+             : src == "b4x16_p64" ? LdmSrc::B4P64 : LdmSrc::S4;
+      const bool sub = src == "b6x16_p32" || src == "b4x16_p64";
+      bool ok = have_shape && count && !src.empty() && b8x16 == sub && s8 == (src == "s4");
+      if (op.shape == LdmShape::M8N8) ok = ok && src == "b16";
+      if (op.shape == LdmShape::M16N16) ok = ok && trans && count <= 2 && (src == "b8" || sub);
+      if (op.shape == LdmShape::M8N16) ok = ok && !trans && (sub || src == "s4");
+      if (!ok) return unsupported("ldmatrix " + opcode.substr(9) + " is not a form the ISA defines");
       op.count = count;
       op.trans = trans;
       op.shared_space = shared_space;
       op.dsts = parse_reg_vector_any();
-      if (op.dsts.size() != count) return unsupported("ldmatrix destination arity");
+      if (op.dsts.size() != count * (op.shape == LdmShape::M16N16 ? 2 : 1))
+        return unsupported("ldmatrix destination arity");
       expect_punct(",");
       op.addr = parse_addr(fn);
       ins.op = op;
     } else if (op0 == "stmatrix") {
-      // The same modifiers as ldmatrix, and the same restriction: the 8x8 b16
-      // shapes, which is what this engine's matrix fragments are.
+      // m8n8 .b16, and m16n8 .trans .b8 (9.7.16.5.16).
       uint32_t count = 0;
-      bool trans = false, shape_ok = false, b16 = false, shared_space = false;
+      bool trans = false, shape_ok = false, b16 = false, b8 = false, shared_space = false, m16n8 = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "sync" || p == "aligned") ;
         else if (p == "m8n8") shape_ok = true;
+        else if (p == "m16n8") shape_ok = m16n8 = true;
+        else if (p == "b8") b8 = true;
         else if (p == "x1") count = 1;
         else if (p == "x2") count = 2;
         else if (p == "x4") count = 4;
@@ -2062,10 +2117,11 @@ class Parser {
         else if (p == "cta") ;  // scope qualifier on .shared::cta
         else return unsupported("stmatrix modifier '." + p + "'");
       }
-      if (!shape_ok || !count || !b16)
-        return unsupported("only stmatrix.m8n8.x{1,2,4}.b16 is implemented");
+      if (!shape_ok || !count || (m16n8 ? !(b8 && trans) : !b16))
+        return unsupported("stmatrix is .m8n8 with .b16, or .m16n8.trans with .b8");
       OpStMatrix op;
       op.count = count;
+      op.m16n8 = m16n8;
       op.trans = trans;
       op.shared_space = shared_space;
       op.addr = parse_addr(fn);
@@ -2074,43 +2130,239 @@ class Parser {
       if (op.srcs.size() != count) return unsupported("stmatrix source arity");
       ins.op = op;
     } else if (op0 == "mma") {
-      // mma.sync.aligned.m16n8kK.row.col.<d>.<a>.<b>.<c>
-      // mma.sp[::ordered_metadata].sync.aligned.m16n8kK.row.col.<d>.<a>.<b>.<c> d, a, b, c, e, f
-      uint32_t k = 0;
-      std::vector<std::string> types;
-      bool row_col = false, saw_row = false, sparse = false;
+      // mma.sync.aligned.<shape>.<alayout>.<blayout>{.satfinite}.<d>.<a>.<b>.<c>{.xor|.and.popc}{.rn...}
+      // mma.sp[::ordered_metadata].sync.aligned.<shape>.row.col.<d>.<a>.<b>.<c> d, a, b, c, e, f
+      // mma.sync.aligned.kind::<k>{.block_scale{.scale_vec::NX}}.<shape>.row.col.<d>.<a>.<b>.<c>{.<stype>}
+      //     d, a, b, c{, {sfa}, {byte-id-a, thread-id-a}, {sfb}, {byte-id-b, thread-id-b}}
+      // The forms of PTX ISA 9.7.16.5.14 and 9.7.16.6.3.
+      unsigned mm = 0, nn = 0, kk = 0;
+      std::vector<std::string> types, layouts;
+      bool sparse = false, have_shape = false, popc = false, ordered_metadata = false;
+      std::string kind, stype;
+      int scale_vec = 0;
+      OpMma op;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
+        char tail = 0;
         if (p == "sync" || p == "aligned") ;
-        else if (p == "sp" || p == "sp::ordered_metadata") sparse = true;
-        else if (p == "row") saw_row = true;
-        else if (p == "col") { if (saw_row) row_col = true; }
-        else if (p == "m16n8k8") k = 8;
-        else if (p == "m16n8k16") k = 16;
-        else if (p == "m16n8k32") k = 32;
-        else if (p == "f32" || p == "f16" || p == "bf16" || p == "tf32" || p == "s32" ||
-                 p == "s8" || p == "u8")
+        else if (p == "sp" || p == "sp::ordered_metadata") {
+          sparse = true;
+          ordered_metadata = p == "sp::ordered_metadata";
+        } else if (p == "row" || p == "col") layouts.push_back(p);
+        else if (std::sscanf(p.c_str(), "m%un%uk%u%c", &mm, &nn, &kk, &tail) == 3) have_shape = true;
+        else if (p == "satfinite") op.satfinite = true;
+        else if (p == "xor") op.b1_and = false;
+        else if (p == "and") op.b1_and = true;
+        else if (p == "popc") popc = true;
+        else if (p == "rn") op.rnd = FRound::Nearest;
+        else if (p == "rz") op.rnd = FRound::Zero;
+        else if (p == "rm") op.rnd = FRound::MinusInf;
+        else if (p == "rp") op.rnd = FRound::PlusInf;
+        else if (p == "f32" || p == "f16" || p == "bf16" || p == "tf32" || p == "s32" || p == "s8" ||
+                 p == "u8" || p == "s4" || p == "u4" || p == "b1" || p == "f64" || p == "e4m3" ||
+                 p == "e5m2" || p == "e3m2" || p == "e2m3" || p == "e2m1")
           types.push_back(p);
-        else return unsupported("mma modifier '." + p + "' (shape or type not implemented)");
+        else if (p == "kind::f8f6f4" || p == "kind::mxf8f6f4" || p == "kind::mxf4" || p == "kind::mxf4nvf4")
+          kind = p.substr(6);
+        else if (p == "block_scale") op.block_scale = true;
+        else if (p == "scale_vec::1X") scale_vec = 1;
+        else if (p == "scale_vec::2X") scale_vec = 2;
+        else if (p == "scale_vec::4X") scale_vec = 4;
+        else if (p == "ue8m0" || p == "ue4m3") stype = p;
+        else return unsupported("mma modifier '." + p + "'");
       }
-      if (!k) return unsupported("only the m16n8k{8,16,32} mma shapes are implemented");
-      if (!row_col) return unsupported("only mma .row.col is implemented");
+      if (!have_shape || nn != 8 || (mm != 8 && mm != 16))
+        return unsupported("mma shape (expected .m16n8kK or .m8n8kK)");
       if (types.size() != 4) return unsupported("mma needs .<dtype>.<atype>.<btype>.<ctype>");
-      OpMma op;
-      op.k = k;
-      const std::string& at = types[1];
-      if (at == "f16") op.ab_type = MmaElem::F16;
-      else if (at == "bf16") op.ab_type = MmaElem::BF16;
-      else if (at == "tf32") op.ab_type = MmaElem::TF32;
-      else if (at == "s8") { op.ab_type = MmaElem::S8; op.ab_signed = true; }
-      else if (at == "u8") { op.ab_type = MmaElem::U8; op.ab_signed = false; }
-      else return unsupported("mma operand type '." + at + "'");
-      if (types[1] != types[2]) return unsupported("mma with mixed A and B types");
-      op.acc_f16 = types[0] == "f16";
-      op.acc_int = types[0] == "s32";
-      if (sparse && op.ab_type != MmaElem::F16 && op.ab_type != MmaElem::BF16)
-        return unsupported("mma.sp with ." + at + " (only .f16 and .bf16 sparse A are implemented)");
-      if (sparse && k == 8) return unsupported("mma.sp.m16n8k8 (f16/bf16 sparse A is k16 or k32)");
+      // The sm_120 kinds (9.7.16.5.14, Table 45). f8f6f4's narrow types sit in
+      // 8-bit containers; mxf4's e2m1 is packed two to a byte.
+      const bool mx = kind == "mxf8f6f4" || kind == "mxf4" || kind == "mxf4nvf4";
+      auto narrow = [](const std::string& t) {
+        return t == "e4m3" || t == "e5m2" || t == "e3m2" || t == "e2m3" || t == "e2m1";
+      };
+      if (mx != op.block_scale)
+        return unsupported("mma .block_scale goes with .kind::mxf8f6f4, mxf4 and mxf4nvf4, and only them");
+      if (!mx && (scale_vec || !stype.empty()))
+        return unsupported("mma scale factors without .block_scale");
+      if (kind.empty() && (types[1] == "e3m2" || types[1] == "e2m3" || types[1] == "e2m1" ||
+                           types[2] == "e3m2" || types[2] == "e2m3" || types[2] == "e2m1"))
+        return unsupported("mma with ." + types[1] + "." + types[2] + " needs .kind::f8f6f4");
+      if (!kind.empty()) {
+        // sm_120a, or sm_12xf from PTX ISA 8.8 (the family's own targets).
+        if (!(target_.rfind("sm_120a", 0) == 0 || target_.rfind("sm_121a", 0) == 0 ||
+              (target_.rfind("sm_12", 0) == 0 && target_.size() > 6 && target_.back() == 'f')))
+          fail(ins.line, "mma.kind::" + kind + " requires an sm_120a (or sm_12xf) target; this module targets " +
+                             (target_.empty() ? std::string("nothing") : target_));
+        const bool f4 = kind == "mxf4" || kind == "mxf4nvf4";
+        const bool dc_ok = mx ? types[0] == "f32" && types[3] == "f32"
+                              : (types[0] == "f32" || types[0] == "f16") && types[0] == types[3];
+        const bool ab_ok = f4 ? types[1] == "e2m1" && types[2] == "e2m1" : narrow(types[1]) && narrow(types[2]);
+        // Sparse A doubles K: f8f6f4 at m16n8k64 (2:4, 8-bit containers, as
+        // sparse int8/fp8 are laid out) and mxf4 at m16n8k128 (4:8 in pairs,
+        // as sparse int4); the kinds take only ::ordered_metadata.
+        const unsigned want_k = (f4 ? 64 : 32) * (sparse ? 2 : 1);
+        if (sparse && !ordered_metadata)
+          return unsupported("mma.sp with .kind::" + kind + " is mma.sp::ordered_metadata only");
+        if (mm != 16 || kk != want_k || !dc_ok || !ab_ok)
+          return unsupported("mma.kind::" + kind + "." + "m" + std::to_string(mm) + "n8k" + std::to_string(kk) +
+                             "." + types[0] + "." + types[1] + "." + types[2] + "." + types[3] +
+                             " is not a form the ISA defines");
+        if (mx) {
+          // Table 45: mxf8f6f4 1X ue8m0; mxf4 2X ue8m0; mxf4nvf4 2X ue8m0, or
+          // 4X with ue8m0 or ue4m3 (and a size it must name).
+          if (kind == "mxf4nvf4" && !scale_vec) return unsupported("mma.kind::mxf4nvf4 needs a .scale_vec size");
+          if (!scale_vec) scale_vec = kind == "mxf4" ? 2 : 1;
+          const bool vs_ok = kind == "mxf8f6f4" ? scale_vec == 1
+                           : kind == "mxf4"     ? scale_vec == 2
+                                                : scale_vec == 2 || scale_vec == 4;
+          if (!vs_ok || stype.empty() || (stype == "ue4m3" && !(kind == "mxf4nvf4" && scale_vec == 4)))
+            return unsupported("mma.kind::" + kind + " with this scale vector size and ." +
+                               (stype.empty() ? std::string("<stype>") : stype) + " is not in Table 45");
+          op.scale_vec = static_cast<uint32_t>(scale_vec);
+          op.ue4m3 = stype == "ue4m3";
+        }
+        auto nt = [&](const std::string& t) {
+          return t == "e4m3" ? MmaElem::E4M3 : t == "e5m2" ? MmaElem::E5M2 : t == "e3m2" ? MmaElem::E3M2
+               : t == "e2m3" ? MmaElem::E2M3 : f4 ? MmaElem::E2M1P : MmaElem::E2M1;
+        };
+        op.m = 16;
+        op.k = kk;
+        op.ab_type = nt(types[1]);
+        op.b_type = nt(types[2]);
+        op.acc_f16 = types[0] == "f16";
+        op.c_f16 = types[3] == "f16";
+        if (layouts.size() != 2 || layouts[0] != "row" || layouts[1] != "col")
+          return unsupported("mma.kind::" + kind + " is .row.col only");
+        op.d = parse_reg_vector_any();
+        expect_punct(",");
+        op.a = parse_reg_vector_any();
+        expect_punct(",");
+        op.b = parse_reg_vector_any();
+        expect_punct(",");
+        op.c = parse_reg_vector_any();
+        op.sparse = sparse;
+        if (sparse) {
+          // All four threads of a group hold its metadata at these shapes, so
+          // the selector is 0 (9.7.16.6.1).
+          // CUTLASS braces the metadata register, as it does the scale data.
+          expect_punct(",");
+          if (peek_punct("{")) {
+            const std::vector<Operand> v = parse_operand_vector_any();
+            if (v.size() != 1) fail(ins.line, "mma.sp's metadata is one register");
+            op.meta = v[0];
+          } else {
+            op.meta = parse_operand();
+          }
+          expect_punct(",");
+          op.selector = parse_operand();
+          const auto* sel = std::get_if<ImmInt>(&op.selector);
+          if (!sel || sel->value != 0)
+            return unsupported("mma.sp::ordered_metadata.kind::" + kind + "'s sparsity selector must be 0");
+        }
+        if (mx) {
+          auto braced_one = [&]() {
+            if (!peek_punct("{")) return parse_operand();
+            const std::vector<Operand> v = parse_operand_vector_any();
+            if (v.size() != 1) fail(ins.line, "mma's scale data is one register");
+            return v[0];
+          };
+          auto pair = [&](Operand* byte, Operand* thread) {
+            const std::vector<Operand> v = parse_operand_vector_any();
+            if (v.size() != 2) fail(ins.line, "mma's scale selector is {byte-id, thread-id}");
+            *byte = v[0];
+            *thread = v[1];
+          };
+          expect_punct(",");
+          op.sfa = braced_one();
+          expect_punct(",");
+          pair(&op.sfa_byte, &op.sfa_thread);
+          expect_punct(",");
+          op.sfb = braced_one();
+          expect_punct(",");
+          pair(&op.sfb_byte, &op.sfb_thread);
+        }
+        if (op.d.size() != op.c.size()) return unsupported("mma D and C arity differ");
+        ins.op = op;
+        expect_punct(";");
+        return ins;
+      }
+      op.m = mm;
+      op.k = kk;
+      auto elem = [&](const std::string& t, MmaElem* e, bool* sign) {
+        *sign = true;
+        if (t == "f16") *e = MmaElem::F16;
+        else if (t == "bf16") *e = MmaElem::BF16;
+        else if (t == "tf32") *e = MmaElem::TF32;
+        else if (t == "s8") *e = MmaElem::S8;
+        else if (t == "u8") { *e = MmaElem::U8; *sign = false; }
+        else if (t == "s4") *e = MmaElem::S4;
+        else if (t == "u4") { *e = MmaElem::U4; *sign = false; }
+        else if (t == "b1") { *e = MmaElem::B1; *sign = false; }
+        else if (t == "e4m3") *e = MmaElem::E4M3;
+        else if (t == "e5m2") *e = MmaElem::E5M2;
+        else if (t == "f64") *e = MmaElem::F64;
+        else return false;
+        return true;
+      };
+      if (!elem(types[1], &op.ab_type, &op.ab_signed) || !elem(types[2], &op.b_type, &op.b_signed))
+        return unsupported("mma operand types ." + types[1] + "." + types[2]);
+      const std::string &dt = types[0], &ct = types[3];
+      op.acc_f16 = dt == "f16";
+      op.c_f16 = ct == "f16";
+      op.acc_int = dt == "s32";
+      op.acc_f64 = dt == "f64";
+      const MmaElem at = op.ab_type, bt = op.b_type;
+      auto is_int8 = [](MmaElem e) { return e == MmaElem::S8 || e == MmaElem::U8; };
+      auto is_int4 = [](MmaElem e) { return e == MmaElem::S4 || e == MmaElem::U4; };
+      auto is_fp8 = [](MmaElem e) { return e == MmaElem::E4M3 || e == MmaElem::E5M2; };
+      const bool fdc = (dt == "f16" || dt == "f32") && (ct == "f16" || ct == "f32");
+      const bool f32dc = dt == "f32" && ct == "f32";
+      const bool same_dc = dt == ct;
+      const bool intdc = dt == "s32" && ct == "s32";
+      // The shape-and-type table (9.7.16.5.14, and 9.7.16.6.3 for mma.sp).
+      bool ok = false;
+      const std::string shape = "m" + std::to_string(mm) + "n8k" + std::to_string(kk);
+      if (at == MmaElem::F16 && bt == MmaElem::F16) {
+        if (!sparse)
+          ok = (shape == "m8n8k4" && fdc && !(ct == "f32" && dt == "f16")) ||
+               ((shape == "m16n8k8" || shape == "m16n8k16") && fdc && same_dc);
+        else
+          ok = (shape == "m16n8k16" || shape == "m16n8k32") && fdc && same_dc;
+      } else if (at == MmaElem::BF16 && bt == MmaElem::BF16) {
+        ok = f32dc && (sparse ? (shape == "m16n8k16" || shape == "m16n8k32")
+                              : (shape == "m16n8k8" || shape == "m16n8k16"));
+      } else if (at == MmaElem::TF32 && bt == MmaElem::TF32) {
+        ok = f32dc && (sparse ? (shape == "m16n8k8" || shape == "m16n8k16")
+                              : (shape == "m16n8k4" || shape == "m16n8k8"));
+      } else if (at == MmaElem::F64 && bt == MmaElem::F64) {
+        ok = !sparse && dt == "f64" && ct == "f64" &&
+             (shape == "m8n8k4" || shape == "m16n8k4" || shape == "m16n8k8" || shape == "m16n8k16");
+      } else if (is_int8(at) && is_int8(bt)) {
+        ok = intdc && (sparse ? (shape == "m16n8k32" || shape == "m16n8k64")
+                              : (shape == "m8n8k16" || shape == "m16n8k16" || shape == "m16n8k32"));
+      } else if (is_int4(at) && is_int4(bt)) {
+        ok = intdc && (sparse ? (shape == "m16n8k64" || shape == "m16n8k128")
+                              : (shape == "m8n8k32" || shape == "m16n8k32" || shape == "m16n8k64"));
+      } else if (at == MmaElem::B1 && bt == MmaElem::B1) {
+        ok = !sparse && intdc && popc &&
+             (shape == "m8n8k128" || shape == "m16n8k128" || shape == "m16n8k256");
+      } else if (is_fp8(at) && is_fp8(bt)) {
+        ok = fdc && same_dc && (sparse ? shape == "m16n8k64" : (shape == "m16n8k16" || shape == "m16n8k32"));
+      }
+      if (!ok)
+        return unsupported("mma" + std::string(sparse ? ".sp" : "") + "." + shape + "." + dt + "." +
+                           types[1] + "." + types[2] + "." + ct + " is not a form the ISA defines");
+      if (op.satfinite && !op.acc_int) return unsupported("mma .satfinite outside the integer forms");
+      if (op.satfinite && at == MmaElem::B1) return unsupported("mma .satfinite on .b1");
+      if (popc != (at == MmaElem::B1)) return unsupported("mma .xor.popc/.and.popc go with .b1 only");
+      if (op.rnd != FRound::Nearest && !op.acc_f64)
+        return unsupported("mma rounding modifiers are for .f64 only");
+      // Layouts: .row.col everywhere, except m8n8k4 f16, which takes any pair.
+      if (layouts.size() != 2) return unsupported("mma needs .alayout.blayout");
+      op.a_row = layouts[0] == "row";
+      op.b_col = layouts[1] == "col";
+      const bool volta = shape == "m8n8k4" && at == MmaElem::F16;
+      if (!volta && !(op.a_row && op.b_col)) return unsupported("mma ." + shape + " is .row.col only");
       op.sparse = sparse;
       op.d = parse_reg_vector_any();
       expect_punct(",");
@@ -2124,11 +2376,19 @@ class Parser {
         op.meta = parse_operand();
         expect_punct(",");
         op.selector = parse_operand();
+        // The selector's range (9.7.16.6.1): one of four threads when one
+        // thread holds a group's metadata, one of two thread pairs when a
+        // pair does, and 0 when all four do.
+        // Metadata bits per row of A: one per element at 2:4 (two 2-bit
+        // indices per four), two at tf32's 1:2, half a bit at int4's 4:8.
+        const uint32_t row_bits = at == MmaElem::TF32 ? 2 * kk : is_int4(at) ? kk / 2 : kk;
+        const uint32_t holders = 2 * row_bits / 32;   // 1, 2 or 4 threads per group
         const auto* sel = std::get_if<ImmInt>(&op.selector);
-        if (!sel || sel->value < 0 || sel->value > 1)
-          return unsupported("mma.sp's sparsity selector is an immediate 0 or 1 for .f16/.bf16");
+        if (!sel || sel->value < 0 || sel->value >= static_cast<int64_t>(4 / holders))
+          return unsupported("mma.sp's sparsity selector must be an immediate from 0 to " +
+                             std::to_string(4 / holders - 1) + " for this shape and type");
       }
-      if (op.d.size() != op.c.size()) return unsupported("mma D and C arity differ");
+      if (op.d.size() != op.c.size() && !volta) return unsupported("mma D and C arity differ");
       ins.op = op;
     } else if (op0 == "wgmma") {
       // wgmma.fence.sync.aligned;  wgmma.commit_group.sync.aligned;
@@ -2151,13 +2411,15 @@ class Parser {
       else return unsupported("wgmma." + what);
       std::vector<std::string> types;
       bool shape = false;
+      int b1_and_popc = 0;   // bit 0: .and, bit 1: .popc
       for (size_t i = 2; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         unsigned mm = 0, nn = 0, kk = 0;
         char tail = 0;
         if (p == "sync" || p == "aligned") ;
         else if (p == "satfinite") op.satfinite = true;
-        else if (p == "sp") return unsupported("wgmma.mma_async.sp (sparse A)");
+        else if (p == "sp") op.sparse = true;
+        else if (p == "and" || p == "popc") b1_and_popc |= (p == "and" ? 1 : 2);
         else if (std::sscanf(p.c_str(), "m%un%uk%u%c", &mm, &nn, &kk, &tail) == 3) {
           if (mm != 64 || nn == 0 || nn > 256 || nn % 8 != 0)
             return unsupported("wgmma shape '." + p + "'");
@@ -2165,10 +2427,8 @@ class Parser {
           op.k = kk;
           shape = true;
         } else if (p == "f16" || p == "bf16" || p == "tf32" || p == "f32" || p == "s32" ||
-                   p == "e4m3" || p == "e5m2" || p == "s8" || p == "u8")
+                   p == "e4m3" || p == "e5m2" || p == "s8" || p == "u8" || p == "b1")
           types.push_back(p);
-        else if (p == "b1" || p == "and" || p == "popc")
-          return unsupported("wgmma single-bit (.b1) forms");
         else return unsupported("wgmma modifier '." + p + "'");
       }
       if (op.kind == WgmmaKind::Wait) {
@@ -2190,6 +2450,7 @@ class Parser {
           else if (t == "e5m2") *out = WgmmaElem::E5M2;
           else if (t == "s8") *out = WgmmaElem::S8;
           else if (t == "u8") *out = WgmmaElem::U8;
+          else if (t == "b1") *out = WgmmaElem::B1;
           else return false;
           return true;
         };
@@ -2222,11 +2483,21 @@ class Parser {
           want_k = 32;
           // The integer shapes skip some N: 8, 16, 24, 32, then multiples of 16.
           if (op.n > 32 && op.n % 16 != 0) ok = false;
+        } else if (op.a_type == WgmmaElem::B1) {
+          // wgmma.mma_async.sync.aligned.m64nNk256.s32.b1.b1.and.popc: the
+          // integer shapes' N, and .and is the only bit operation.
+          ok = op.b_type == WgmmaElem::B1 && op.d_type == WgmmaAcc::S32 && b1_and_popc == 3 && !op.sparse;
+          want_k = 256;
+          if (op.n > 32 && op.n % 16 != 0) ok = false;
         }
+        if (b1_and_popc && op.a_type != WgmmaElem::B1) ok = false;
+        // A sparse A doubles K: 32 for f16/bf16, 16 for tf32, 64 for 8-bit.
+        if (op.sparse) want_k *= 2;
         if (!ok || op.k != want_k)
           return unsupported("wgmma.mma_async." + types[0] + "." + types[1] + "." + types[2] +
                              " with k" + std::to_string(op.k) + " is not a form the ISA defines");
         if (op.satfinite && !int8) return unsupported("wgmma .satfinite outside the integer forms");
+        const bool b1 = op.a_type == WgmmaElem::B1;
         op.d = parse_reg_vector_any();
         const size_t want_d = op.d_type == WgmmaAcc::F16 ? op.n / 4 : op.n / 2;
         if (op.d.size() != want_d)
@@ -2242,6 +2513,19 @@ class Parser {
         expect_punct(",");
         op.b_desc = parse_operand();
         expect_punct(",");
+        if (op.sparse) {
+          op.sp_meta = parse_operand();
+          expect_punct(",");
+          op.sp_sel = parse_operand();
+          expect_punct(",");
+          const auto* sel = std::get_if<ImmInt>(&op.sp_sel);
+          // A thread pair holds the metadata for f16/bf16/tf32, all four for
+          // the 8-bit types (9.7.17.6.1).
+          const int64_t top = (fp8 || int8) ? 0 : 1;
+          if (!sel || sel->value < 0 || sel->value > top)
+            return unsupported("wgmma.mma_async.sp's sparsity selector must be an immediate from 0 to " +
+                               std::to_string(top) + " for this type");
+        }
         op.scale_d = parse_operand();
         // The immediates that follow depend on the form: floats take the two
         // negate flags, and the 16-bit forms add the transposes -- trans-b only
@@ -2254,11 +2538,11 @@ class Parser {
           if (!imm) return unsupported("wgmma scale/transpose arguments must be immediates");
           imms.push_back(static_cast<int>(imm->value));
         }
-        const size_t want_imms = int8 ? 0u : (is16 ? (op.a_regs ? 3u : 4u) : 2u);
+        const size_t want_imms = (int8 || b1) ? 0u : (is16 ? (op.a_regs ? 3u : 4u) : 2u);
         if (imms.size() != want_imms)
           return unsupported("wgmma.mma_async takes " + std::to_string(want_imms) +
                              " immediate arguments after scale-d in this form");
-        if (!int8) {
+        if (!int8 && !b1) {
           op.scale_a = imms[0];
           op.scale_b = imms[1];
           if ((op.scale_a != 1 && op.scale_a != -1) || (op.scale_b != 1 && op.scale_b != -1))
@@ -2394,17 +2678,28 @@ class Parser {
         // instead of reading it again. Reuse is only ever permission -- the
         // ISA says the operand may be reloaded anyway and must not change
         // meanwhile -- so reading it every time is one of the allowed
-        // behaviours.
+        // behaviours. .ws names one of four B buffers, whose fills and uses
+        // the interpreter checks (a use needs a fill of the same B).
+        else if (op.ws && p.rfind("collector::b", 0) == 0) {
+          const std::string rest = p.substr(12);
+          const char b = rest.empty() ? 0 : rest[0];
+          const std::string what2 = rest.size() > 3 && rest.compare(1, 2, "::") == 0 ? rest.substr(3) : "";
+          if (b < '0' || b > '3' || what2.empty())
+            return unsupported("tcgen05.mma.ws collector '." + p + "' (.collector::b0-b3::fill/use/lastuse/discard)");
+          op.collector_buf = static_cast<uint32_t>(b - '0');
+          if (what2 == "fill") op.collector = Tcgen05Collector::Fill;
+          else if (what2 == "use") op.collector = Tcgen05Collector::Use;
+          else if (what2 == "lastuse") op.collector = Tcgen05Collector::LastUse;
+          else if (what2 == "discard") op.collector = Tcgen05Collector::Discard;
+          else return unsupported("tcgen05.mma.ws collector operation '::" + what2 + "'");
+        }
+        else if (op.ws && p.rfind("collector::", 0) == 0)
+          return unsupported("tcgen05.mma.ws takes a B collector (.collector::b0-b3::op), not '." + p + "'");
         else if (p.rfind("collector::", 0) == 0) ;
         else if (p == "red")
           return unsupported("tcgen05.ld.red (sm_103 and sm_110, not the B200's sm_100)");
         else if (p == "sp" && op.kind == Tcgen05Kind::Mma) op.sparse = true;
-        else if (p == "ws" || p.rfind("ws::", 0) == 0)
-          return unsupported("tcgen05.mma.ws (weight-stationary): where it writes D is not settled by the "
-                             "ISA -- figures 219 and 223 put the N halves/quarters in warps 2-3, while "
-                             "figures 220 and 224 address them at lanes 0 and 32 -- nor is its "
-                             "zero-column mask, whose examples contradict each other, so it is not "
-                             "implemented");
+        else if (p == "ws" && op.kind == Tcgen05Kind::Mma) op.ws = true;
         else if (p == "kind::mxf8f6f4") { op.mma_kind = Tcgen05MmaKind::MXF8F6F4; have_kind = true; }
         else if (p == "kind::mxf4") { op.mma_kind = Tcgen05MmaKind::MXF4; have_kind = true; }
         else if (p == "kind::mxf4nvf4") { op.mma_kind = Tcgen05MmaKind::MXF4NVF4; have_kind = true; }
@@ -2431,8 +2726,10 @@ class Parser {
         else if (op.kind == Tcgen05Kind::Cp && p == "b4x16_p64") op.cp_decompress = 4;
         else if (op.kind == Tcgen05Kind::Shift && p == "down") ;
         else if (p == "ashift")
-          return unsupported("tcgen05.mma.ashift: the ISA says A's rows shift down one \"except for the "
-                             "last row\" without saying what row 0 then holds, so it is not implemented");
+          return unsupported("tcgen05.mma.ashift: the ISA says only that A's rows shift down one \"except "
+                             "for the last row\" -- not whether the MMA reads A before or after the "
+                             "shift, whether rows cross the 32-lane quarters, or what row 0 holds -- "
+                             "and no public code uses it to check against, so it is not implemented");
         else if (p.rfind("decompress", 0) == 0 || p == "kind::ti16")
           return unsupported("tcgen05.mma." + p + " (sm_107) is not implemented");
         else if (p.rfind("multicast::cluster::32b", 0) == 0 || p.rfind("sync_restrict", 0) == 0)
@@ -2522,6 +2819,9 @@ class Parser {
           if (mx != op.block_scale)
             return unsupported("tcgen05.mma: .block_scale goes with the .kind::mx* kinds and only them");
           if (!mx && op.scale_vec) return unsupported("tcgen05.mma: a scale vector size without .block_scale");
+          // Table 48: .ws is .cta_group::1 only, and not for the block-scaled kinds.
+          if (op.ws && op.cta_group != 1) return unsupported("tcgen05.mma.ws is .cta_group::1 only (Table 48)");
+          if (op.ws && mx) return unsupported("tcgen05.mma.ws with a block-scaled kind (Table 48 has none)");
           op.d_tmem = bracketed();
           expect_punct(",");
           if (peek_punct("[")) {
@@ -2545,6 +2845,7 @@ class Parser {
             op.scale_b = bracketed();
             expect_punct(",");
           } else if (peek_punct("{")) {
+            if (op.ws) return unsupported("tcgen05.mma.ws takes no disable-output-lane vector");
             op.disable_lanes = parse_operand_vector_any();
             if (op.disable_lanes.size() != 4 * op.cta_group)
               return unsupported("tcgen05.mma's disable-output-lane vector has " +
@@ -2553,7 +2854,11 @@ class Parser {
             expect_punct(",");
           }
           op.enable_d = parse_operand();
-          if (peek_punct(",")) {
+          if (op.ws && peek_punct(",")) {   // .ws: the zero-column mask descriptor, not scale-input-d
+            next();
+            op.zero_mask = parse_operand();
+            op.has_zero_mask = true;
+          } else if (peek_punct(",")) {
             next();
             const Operand s = parse_operand();
             const auto* imm = std::get_if<ImmInt>(&s);

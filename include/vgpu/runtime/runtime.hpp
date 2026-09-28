@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <list>
 #include <vector>
@@ -86,6 +87,8 @@ class Device {
   void install_fault_hook();
   void run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
                   const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms);
+  struct LoadedModule;
+  const ptx::EntryFn* lazy_function(LoadedModule& lm, const std::string& name) const;
   std::unique_ptr<class FaultHook> fault_;
   DeviceProfile profile_;
   int ordinal_;
@@ -94,19 +97,34 @@ class Device {
   uint64_t next_module_id_ = 1;
   uint64_t next_kernel_va_ = kKernelVaBase;   // every kernel ever loaded has its own
   exec::TextureTable textures_;
+  // A large module is not parsed whole (see load_module): its kernels are
+  // parsed one at a time, the first time each is looked up.
+  struct LazyModule;
   struct LoadedModule {
     uint64_t id = 0;
-    std::shared_ptr<ptx::Module> mod;
+    std::shared_ptr<ptx::Module> mod;   // the whole module, or only its declarations when lazy
     exec::SymbolTable symbols;          // .global variables -> device VAs
     std::vector<uint64_t> global_vas;   // to free on unload
-    std::vector<std::pair<uint64_t, const ptx::EntryFn*>> kernels;   // address -> kernel
+    // address -> kernel; a lazy module's kernels are null until parsed
+    std::vector<std::pair<uint64_t, const ptx::EntryFn*>> kernels;
+    std::shared_ptr<LazyModule> lazy;
   };
   // A list, not a vector: a function handle keeps a pointer to its module's
   // symbol table, and a vector moved every module whenever another loaded, so
   // a kernel launched after that read a freed table (PyTorch's jiterator
   // loads a module per kernel and launches earlier ones again).
-  std::list<LoadedModule> modules_;
+  // mutable: a lazy module parses kernels on lookup.
+  mutable std::list<LoadedModule> modules_;
 };
+
+class Runtime;
+// The process's simulated machine, made from the environment (VGPU_GPU,
+// VGPU_DEVICE_COUNT) the first time either CUDA library asks, and the same
+// one for both (shared_runtime.cpp).
+Runtime* shared_runtime();
+// The lock both CUDA libraries take around every API call, so that calls into
+// the one machine from either never overlap (shared_runtime.cpp).
+std::recursive_mutex& shared_api_mutex();
 
 class Runtime {
  public:

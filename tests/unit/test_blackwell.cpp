@@ -165,6 +165,14 @@ struct Mma {
   bool sparse = false;
   uint32_t meta_col = 0, meta_lane = 0;
   std::string target = kHeader100a;
+  // tcgen05.mma.ws: the MMAs issued in order, each with its collector
+  // qualifier ("" for none) and an offset added to B's descriptor; the last
+  // one's D is read back. And the zero-column mask descriptor, if any.
+  bool ws = false;
+  struct Step { std::string collector; uint64_t b_delta = 0; };
+  std::vector<Step> steps{{}};
+  bool has_zero_mask = false;
+  uint64_t zero_mask = 0;
 
   std::vector<std::vector<uint32_t>> run() const {
     const int ctas = group;
@@ -284,10 +292,20 @@ COPIED:
     setp.eq.u32 %p6, %r30, 0;
     and.pred %p4, %p3, %p6;                     // thread 0 of the even CTA issues
     setp.)" + (enable_d == "0" ? "ne" : "eq") + R"(.u32 %p7, %r1, %r1;
-    @%p4 tcgen05.mma)" + (sparse ? ".sp" : "") + ".cta_group::" + g + ".kind::" + kind + kind_mods + " [%r61], " +
-                            a_operand + ", %rd6, " + (sparse ? "[%r65], " : "") + "%r50, " +
-                            (block_scale ? std::string("[%r63], [%r64], ") : lanes_off.empty() ? "" : lanes_off + ", ") +
-                            "%p7" + scale_tail + R"(;
+    mov.b64 %rd23, )" + std::to_string(zero_mask) + R"(;
+)" + [&] {
+                              std::string t;
+                              for (const Step& st : steps)
+                                t += "    add.u64 %rd19, %rd6, " + std::to_string(st.b_delta) + ";\n"
+                                     "    @%p4 tcgen05.mma" + (ws ? ".ws" : "") + (sparse ? ".sp" : "") +
+                                     ".cta_group::" + g + ".kind::" + kind + kind_mods + st.collector + " [%r61], " +
+                                     a_operand + ", %rd19, " + (sparse ? "[%r65], " : "") + "%r50, " +
+                                     (block_scale ? std::string("[%r63], [%r64], ")
+                                      : lanes_off.empty() || ws ? ""
+                                                              : lanes_off + ", ") +
+                                     "%p7" + scale_tail + (has_zero_mask ? ", %rd23" : "") + ";\n";
+                              return t;
+                            }() + R"(
     @%p4 tcgen05.commit.cta_group::)" + g + R"(.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%r7], )" +
                             std::to_string((1 << ctas) - 1) + R"(;
 WAIT:
@@ -559,6 +577,8 @@ VTEST(tcgen05_parses_the_isa_examples) {
     tcgen05.fence::after_thread_sync;
     tcgen05.mma.cta_group::1.kind::tf32      [taddr0],  adesc,  bdesc, idesc, {m0, m1, m2, m3}, p;
     tcgen05.mma.cta_group::1.kind::f16       [taddr0],  [taddr1],  bdesc, idesc, p, 3;
+    tcgen05.mma.ws.sp.cta_group::1.kind::tf32.collector::b1::fill  [taddr1], [taddr0], bdesc,
+                                                                   [taddr2], idesc, p;
     tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [mbarObj0];
     ret;
 }
@@ -590,7 +610,7 @@ VTEST(tcgen05_refuses_what_is_not_implemented_by_name) {
                                       ins + "\n ret;\n}\n"));
   };
   VCHECK_CONTAINS(parse("tcgen05.cp.cta_group::1.32x128b [a], d;").message(), ".warpx4");
-  VCHECK_CONTAINS(parse("tcgen05.mma.ws.cta_group::1.kind::f16 [a], d, d, a, p;").message(), "weight-stationary");
+  VCHECK_CONTAINS(parse("tcgen05.mma.cta_group::1.kind::f16.ashift [a], [b], d, a, p;").message(), "ashift");
   VCHECK_CONTAINS(parse("tcgen05.mma.cta_group::1.kind::f16.block_scale [a], d, d, a, [b], [b], p;").message(),
                   ".block_scale");
   VCHECK_CONTAINS(parse("tcgen05.ld.red.sync.aligned.32x32b.x2.max.f32 {a, b}, a, [a];").message(), "tcgen05.ld.red");
@@ -1785,6 +1805,322 @@ VTEST(tcgen05_shift_moves_31_rows_down) {
 }
 
 // ---- tcgen05.mma over a CTA pair ---------------------------------------------------
+
+// ---- tcgen05.mma.ws (weight-stationary) ----------------------------------------------
+
+// Where D(m, n) of a .ws MMA lands, from figures 219 and 223 as drawn (warp w
+// reaches lanes 32w-32w+31): M = 32 gives warp q the q-th quarter of N, rows
+// 0-31; M = 64 gives warps 0/1 rows 0-31/32-63 of N's lower half and warps 2/3
+// the same rows of its upper half. M = 128 is layout D.
+Place ws_place(int M, int N, int m, int n) {
+  if (M == 32) return {0, 32 * (n / (N / 4)) + m, n % (N / 4)};
+  if (M == 64) return {0, 32 * (m / 32 + 2 * (n / (N / 2))) + m % 32, n % (N / 2)};
+  return {0, m, n};
+}
+
+// B^T (N x K) K-major f16 without swizzling: 8-row core matrices of 16 bytes
+// a row, LBO 128 along K, SBO 256 down N (K = 16).
+std::vector<uint8_t> b_image_f16(int rows, int K, const std::function<float(int, int)>& B) {
+  std::vector<uint8_t> img;
+  for (int n = 0; n < rows; ++n)
+    for (int k = 0; k < K; ++k) put(img, canonical(Major::K, 0, 2, 128, 256, n, k), f16_bits(B(k, n)), 2);
+  return img;
+}
+
+void check_ws(const std::vector<std::vector<uint32_t>>& out, int M, int N, int K, int cols,
+              const std::function<float(int, int)>& A, const std::function<float(int, int)>& B,
+              const std::function<float(int, int)>& D0 = nullptr) {
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      float want = D0 ? D0(m, n) : 0.0f;
+      for (int k = 0; k < K; ++k) want += A(m, k) * B(k, n);
+      const Place p = ws_place(M, N, m, n);
+      const float got = bits_f32(out[0][size_t(p.lane) * cols + p.col]);
+      if (got != want)
+        VCHECK_EQ(std::to_string(m) + "," + std::to_string(n) + ": " + std::to_string(got),
+                  std::to_string(m) + "," + std::to_string(n) + ": " + std::to_string(want));
+    }
+}
+
+// f16, M = 32 (layout G): N's four quarters in the four warps' lanes.
+VTEST(tcgen05_mma_ws_m32_layout_g) {
+  const int M = 32, N = 128, K = 16;
+  auto A = [](int m, int k) { return val(m, k, 1); };
+  auto B = [](int k, int n) { return val(k, n, 4); };
+  const Operands o = images(1, M, N, K, 2, Major::K, Major::K, 0, 0, 128, 256, 128, 256,
+                            [&](int m, int k) { return f16_bits(A(m, k)); },
+                            [&](int n, int k) { return f16_bits(B(k, n)); });
+  Mma x;
+  x.ws = true;
+  x.mask = "";
+  x.id = idesc(1, 0, 0, M, N);
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.smem_a = o.a;
+  x.smem_b = o.b;
+  x.cols = 32;
+  check_ws(x.run(), M, N, K, 32, A, B);
+}
+
+// bf16, M = 64 (layout E) at N = 256, accumulating: N's halves in lanes 0-63
+// and 64-127 at the same 128 columns.
+VTEST(tcgen05_mma_ws_m64_layout_e_accumulates) {
+  const int M = 64, N = 256, K = 16;
+  auto A = [](int m, int k) { return val(m, k, 2); };
+  auto B = [](int k, int n) { return val(k, n, 6); };
+  auto D0 = [](int m, int n) { return val(m, n, 9); };
+  const Operands o = images(1, M, N, K, 2, Major::K, Major::K, 0, 0, 128, 256, 128, 256,
+                            [&](int m, int k) { return bf16_bits(A(m, k)); },
+                            [&](int n, int k) { return bf16_bits(B(k, n)); });
+  Mma x;
+  x.ws = true;
+  x.mask = "";
+  x.id = idesc(1, 1, 1, M, N);
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.smem_a = o.a;
+  x.smem_b = o.b;
+  x.cols = 128;
+  x.enable_d = "1";
+  x.d_in.assign(1, std::vector<uint32_t>(size_t(128) * 128, 0));
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      const Place p = ws_place(M, N, m, n);
+      x.d_in[0][size_t(p.lane) * 128 + p.col] = f32_bits(D0(m, n));
+    }
+  check_ws(x.run(), M, N, K, 128, A, B, D0);
+}
+
+// i8 at M = 128 (layout D), and f16 with A from Tensor Memory there.
+VTEST(tcgen05_mma_ws_m128_i8_and_a_from_tensor_memory) {
+  {
+    const int M = 128, N = 64, K = 32;
+    auto A = [](int m, int k) { return (m * 5 + k * 3) % 17 - 8; };
+    auto B = [](int k, int n) { return (k * 7 + n) % 13 - 6; };
+    const Operands o = images(1, M, N, K, 1, Major::K, Major::K, 0, 0, 128, 256, 128, 256,
+                              [&](int m, int k) { return uint64_t(uint8_t(A(m, k))); },
+                              [&](int n, int k) { return uint64_t(uint8_t(B(k, n))); });
+    Mma x;
+    x.kind = "i8";
+    x.ws = true;
+    x.mask = "";
+    x.id = idesc(2, 1, 1, M, N);
+    x.desc_a = desc(0, 128, 256, 0);
+    x.desc_b = desc(0, 128, 256, 0);
+    x.smem_a = o.a;
+    x.smem_b = o.b;
+    const auto out = x.run();
+    for (int m = 0; m < M; ++m)
+      for (int n = 0; n < N; ++n) {
+        int want = 0;
+        for (int k = 0; k < K; ++k) want += A(m, k) * B(k, n);
+        VCHECK_EQ(int32_t(out[0][size_t(m) * 64 + n]), want);
+      }
+  }
+  const int M = 128, N = 64, K = 16;
+  auto A = [](int m, int k) { return val(m, k, 3); };
+  auto B = [](int k, int n) { return val(k, n, 2); };
+  Mma x;
+  x.ws = true;
+  x.mask = "";
+  x.id = idesc(1, 0, 0, M, N);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.smem_b = {b_image_f16(N, K, B)};
+  x.cols = 128;
+  x.a_cols = 8;
+  x.a_col = 64;   // D in columns 0-63, A in 64-71
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 8));
+  for (int m = 0; m < M; ++m)
+    for (int c = 0; c < 8; ++c)
+      x.a_tmem[0][size_t(m) * 8 + c] = f16_bits(A(m, 2 * c)) | uint32_t(f16_bits(A(m, 2 * c + 1))) << 16;
+  check_ws(x.run(), M, N, K, 128, A, B);
+}
+
+// The zero-column masks of 9.7.18.4.3's examples 3 (M = 64) and 4 (M = 32,
+// with a shift of 2), their sub-masks written here as the ISA prints them:
+// the first run as printed at the right-hand end, then the repeating 7-bit
+// pattern -- three 1s (Skip Span 2 + 1, zeroed) and four 0s (Use Span 3 + 1).
+std::vector<int> sub_mask(const std::string& first, const std::string& period, int width) {
+  std::vector<int> bits;
+  for (char c : first) bits.push_back(c == '1');
+  while (int(bits.size()) < width)
+    for (char c : period) bits.push_back(c == '1');
+  bits.resize(width);
+  return bits;
+}
+
+VTEST(tcgen05_mma_ws_zero_column_mask_isa_examples) {
+  struct Case {
+    int M, N, shift;
+    uint64_t desc;
+    std::vector<std::pair<std::string, std::string>> subs;   // LSB first
+  };
+  const uint64_t nz = uint64_t{1} << 39, skip2 = uint64_t{2} << 40, use3 = uint64_t{3} << 48;
+  const std::vector<Case> cases = {
+      // Example 3: sc {0, 0}, fs {fs1 0, fs0 1}.
+      {64, 64, 0, nz | skip2 | use3 | uint64_t{1} << 32,
+       {{"111", "0000111"}, {"0000", "1110000"}}},
+      // Example 4: sc {1, 2, 1, 0}, fs {0, 0, 1, 1}, shift 2.
+      {32, 64, 2,
+       nz | skip2 | use3 | uint64_t{2} << 56 | uint64_t{1} << 8 | uint64_t{2} << 16 | uint64_t{1} << 24 |
+           uint64_t{1} << 32 | uint64_t{1} << 33,
+       {{"111", "0000111"}, {"11", "0000111"}, {"00", "1110000"}, {"000", "1110000"}}},
+  };
+  for (const Case& c : cases) {
+    const int K = 16;
+    std::vector<int> zero;
+    for (const auto& [first, period] : c.subs) {
+      const auto b = sub_mask(first, period, c.N / int(c.subs.size()));
+      zero.insert(zero.end(), b.begin(), b.end());
+    }
+    auto A = [](int m, int k) { return val(m, k, 5); };
+    auto Bmem = [](int k, int n) { return val(k, n, 1); };   // B's columns as stored
+    auto B = [&](int k, int n) { return zero[n] ? 0.0f : Bmem(k, n + c.shift); };
+    Mma x;
+    x.ws = true;
+    x.mask = "";
+    x.id = idesc(1, 0, 0, c.M, c.N);
+    x.desc_a = desc(0, 128, 256, 0);
+    x.desc_b = desc(0, 128, 256, 0);
+    x.smem_a = images(1, c.M, 8, K, 2, Major::K, Major::K, 0, 0, 128, 256, 128, 256,
+                      [&](int m, int k) { return f16_bits(A(m, k)); }, [](int, int) { return 0; }).a;
+    x.smem_b = {b_image_f16(c.N + 8, K, Bmem)};
+    x.has_zero_mask = true;
+    x.zero_mask = c.desc;
+    x.cols = 32;
+    check_ws(x.run(), c.M, c.N, K, 32, A, B);
+  }
+}
+
+// The B collector buffers: a fill, uses and a last use of one B pass; a use
+// needs a fill still valid, of the same B.
+VTEST(tcgen05_mma_ws_collector_buffers) {
+  const int M = 128, N = 64, K = 16;
+  auto A = [](int m, int k) { return val(m, k, 7); };
+  auto B = [](int k, int n) { return val(k, n, 3); };
+  Mma x;
+  x.ws = true;
+  x.mask = "";
+  x.id = idesc(1, 0, 0, M, N);
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.smem_a = images(1, M, 8, K, 2, Major::K, Major::K, 0, 0, 128, 256, 128, 256,
+                    [&](int m, int k) { return f16_bits(A(m, k)); }, [](int, int) { return 0; }).a;
+  x.smem_b = {b_image_f16(N, K, B)};
+  x.steps = {{".collector::b1::fill"}, {".collector::b1::use"}, {".collector::b1::lastuse"}};
+  check_ws(x.run(), M, N, K, 64, A, B);
+  x.steps = {{".collector::b2::use"}};
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "no fill of that buffer");
+  // No qualifier is .collector::b0::discard, which ends b0's fill.
+  x.steps = {{".collector::b0::fill"}, {""}, {".collector::b0::use"}};
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "no fill of that buffer");
+  x.steps = {{".collector::b3::fill"}, {".collector::b3::lastuse"}, {".collector::b3::use"}};
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "no fill of that buffer");
+  // Another buffer's discard leaves b1 alone.
+  x.steps = {{".collector::b1::fill"}, {".collector::b2::discard"}, {".collector::b1::use"}};
+  check_ws(x.run(), M, N, K, 64, A, B);
+  x.steps = {{".collector::b1::fill"}, {".collector::b1::use", 16}};
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "different B");
+}
+
+// .ws.sp at M = 128: figure 288's metadata, as without .ws.
+VTEST(tcgen05_mma_ws_sp_f16_m128) {
+  const int M = 128, N = 64, K = 32;
+  const Sparse sp{4};
+  auto S = [](int m, int j) { return val(m, j, 4); };
+  auto A = [&](int m, int k) { return sp.dense(m, k, S); };
+  auto B = [](int k, int n) { return val(k, n, 2); };
+  const Operands o = images(1, M, N, K / 2, 2, Major::K, Major::K, 0, 0, 128, 256, 128, 256,
+                            [&](int m, int j) { return f16_bits(S(m, j)); }, [](int, int) { return 0; });
+  Mma x;
+  x.ws = true;
+  x.mask = "";
+  x.sparse = true;
+  x.id = idesc(1, 0, 0, M, N) | 4 | 1;
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 512, 0);
+  x.smem_a = o.a;
+  x.smem_b = {std::vector<uint8_t>()};
+  for (int n = 0; n < N; ++n)
+    for (int k = 0; k < K; ++k) put(x.smem_b[0], canonical(Major::K, 0, 2, 128, 512, n, k), f16_bits(B(k, n)), 2);
+  x.cols = 128;
+  x.a_is_tmem = false;
+  x.a_cols = 4;
+  x.a_col = 64;
+  x.meta_col = 64;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 4));
+  put_meta(x.a_tmem[0], 4, 0, M, 32, 0, false, 1, K, sp);
+  check_d_f32(x.run(), 1, M, N, K, A, B, nullptr, 0, 128);
+}
+
+// The .ws forms, as CUDA 13.0 and 13.2's ptxas assemble them for sm_100a:
+// collectors, the zero-column mask, A from Tensor Memory, and .sp.
+VTEST(tcgen05_mma_ws_parses_what_ptxas_accepts) {
+  const std::string ptx = std::string(kHeader100a) + R"(
+.visible .entry k()
+{
+    .reg .pred p;
+    .reg .b32 taddr0, taddr1, taddr2, idesc;
+    .reg .b64 adesc, bdesc, zm;
+    tcgen05.mma.ws.cta_group::1.kind::f16 [taddr0], adesc, bdesc, idesc, p;
+    tcgen05.mma.ws.cta_group::1.kind::f16 [taddr0], adesc, bdesc, idesc, p, zm;
+    tcgen05.mma.ws.cta_group::1.kind::tf32.collector::b1::fill [taddr0], adesc, bdesc, idesc, p;
+    tcgen05.mma.ws.cta_group::1.kind::tf32.collector::b1::use [taddr0], adesc, bdesc, idesc, p, zm;
+    tcgen05.mma.ws.cta_group::1.kind::i8.collector::b2::lastuse [taddr0], [taddr1], bdesc, idesc, p;
+    tcgen05.mma.ws.cta_group::1.kind::f8f6f4.collector::b3::discard [taddr0], adesc, bdesc, idesc, p;
+    tcgen05.mma.ws.sp.cta_group::1.kind::tf32.collector::b1::fill [taddr1], [taddr0], bdesc, [taddr2], idesc, p;
+    tcgen05.mma.ws.sp.cta_group::1.kind::f16 [taddr1], adesc, bdesc, [taddr2], idesc, p, zm;
+    ret;
+}
+)";
+  auto m = ptx::parse(ptx);
+  VCHECK_EQ(m.entries.size(), size_t{1});
+}
+
+VTEST(tcgen05_mma_ws_refuses_what_the_isa_rules_out_or_leaves_open) {
+  auto parse = [](const std::string& ins) {
+    return VCAPTURE(Error, ptx::parse(std::string(kHeader100a) +
+                                      ".visible .entry k()\n{\n .reg .b32 a, b;\n .reg .b64 d;\n .reg .pred p;\n " +
+                                      ins + "\n ret;\n}\n"));
+  };
+  VCHECK_CONTAINS(parse("tcgen05.mma.ws.cta_group::2.kind::f16 [a], d, d, a, p;").message(), ".cta_group::1 only");
+  VCHECK_CONTAINS(parse("tcgen05.mma.ws.cta_group::1.kind::mxf4.block_scale [a], d, d, a, [b], [b], p;").message(),
+                  "block-scaled");
+  VCHECK_CONTAINS(parse("tcgen05.mma.ws.cta_group::1.kind::f16 [a], d, d, a, {a, a, a, a}, p;").message(),
+                  "disable-output-lane");
+  VCHECK_CONTAINS(parse("tcgen05.mma.ws.cta_group::1.kind::f16.collector::a::fill [a], d, d, a, p;").message(),
+                  ".collector::b0-b3");
+  VCHECK_CONTAINS(parse("tcgen05.mma.ws.cta_group::1.kind::f16.collector::b4::fill [a], d, d, a, p;").message(),
+                  "collector");
+
+  Mma x;
+  x.ws = true;
+  x.mask = "";
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.id = idesc(1, 0, 0, 128, 32);   // N = 32
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "Table 48");
+  x.id = idesc(1, 0, 0, 64, 64);
+  x.has_zero_mask = true;
+  x.zero_mask = uint64_t{1} << 37;
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "reserved bit");
+  x.id = idesc(1, 0, 0, 32, 64);
+  x.zero_mask = uint64_t{17} << 56;
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "over the 16");
+  x.zero_mask = uint64_t{1} << 39 | uint64_t{4} << 8;   // sub-mask 1 skips its whole 1-column first run
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "start count");
+  x.has_zero_mask = false;
+  x.id = idesc(1, 0, 0, 64, 64);
+  x.a_cols = 8;
+  x.a_col = 32;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 8));
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "A's layout");
+  x.a_is_tmem = false;
+  x.sparse = true;
+  x.meta_col = 32;
+  x.id = idesc(1, 0, 0, 64, 64) | 4;
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "figures 287-292");
+}
 
 // M = 256 (layout A): each CTA supplies half of A's rows and half of B's
 // columns from its own shared memory, and holds its 128 rows of D.

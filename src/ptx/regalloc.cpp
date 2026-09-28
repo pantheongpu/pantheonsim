@@ -88,6 +88,9 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
           for (const auto& c : op.coords) use_operand(c);
         }
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpCvtFp8>) use_operand(op.sf);
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpMma>)
+          for (const Operand* o : {&op.sfa, &op.sfa_byte, &op.sfa_thread, &op.sfb, &op.sfb_byte, &op.sfb_thread})
+            use_operand(*o);
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpWgmma>) {
           // The accumulator is read as well as written, and the descriptors
           // and the scale-d predicate are ordinary sources.
@@ -95,11 +98,13 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
           use_operand(op.a_desc);
           use_operand(op.b_desc);
           use_operand(op.scale_d);
+          use_operand(op.sp_meta);
         }
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpTcgen05>) {
           for (const auto& r : op.regs) (op.kind == Tcgen05Kind::Ld ? defs : uses).push_back(r.id);
           for (const Operand* o : {&op.taddr, &op.ncols, &op.cta_mask, &op.d_tmem, &op.b_desc,
-                                   &op.idesc, &op.enable_d, &op.scale_a, &op.scale_b, &op.sp_meta})
+                                   &op.idesc, &op.enable_d, &op.scale_a, &op.scale_b, &op.sp_meta,
+                                   &op.zero_mask})
             use_operand(*o);
           for (const auto& o : op.disable_lanes) use_operand(o);
         }

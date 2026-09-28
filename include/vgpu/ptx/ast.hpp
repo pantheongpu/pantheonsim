@@ -252,8 +252,16 @@ struct OpMovMatrix { Reg dst; Operand src; };
 // When ".shared" is named, the address register holds an offset in the shared
 // window; without it the register holds a generic address that cvta has already
 // converted. Both forms occur: llama.cpp cvta's first, Triton does not.
+// The shapes (9.7.16.5.15): 8x8 of 16-bit elements, 8x16 and 16x16 of
+// 8-bit ones -- or of 6-/4-bit ones (.b6x16_p32, .b4x16_p64: sixteen values
+// padded to 16 bytes in shared memory) expanded into the low bits of each
+// byte, or .s4 sign-extended to .s8.
+enum class LdmShape : uint8_t { M8N8, M8N16, M16N16 };
+enum class LdmSrc : uint8_t { B16, B8, B6P32, B4P64, S4 };
 struct OpLdMatrix {
   uint32_t count = 1;
+  LdmShape shape = LdmShape::M8N8;
+  LdmSrc fmt = LdmSrc::B16;
   bool trans = false;
   bool shared_space = false;
   std::vector<Reg> dsts;
@@ -268,6 +276,7 @@ struct OpLdMatrix {
 // does between its two multiplies.
 struct OpStMatrix {
   uint32_t count = 1;
+  bool m16n8 = false;          // 16x8 of 8-bit elements (.trans mandatory)
   bool trans = false;
   bool shared_space = false;
   std::vector<Operand> srcs;   // one 32-bit register per matrix, per lane
@@ -278,26 +287,47 @@ struct OpStMatrix {
 // The warp-wide tensor-core multiply-accumulate. Distinct from wmma, which is
 // the older whole-fragment API: this one names the exact shape and the
 // registers each lane holds.
-enum class MmaElem { F16, BF16, TF32, S8, U8 };
+enum class FRound { Nearest, Zero, MinusInf, PlusInf };
+// E3M2/E2M3/E2M1 sit in 8-bit containers (.kind::f8f6f4, .kind::mxf8f6f4);
+// E2M1P is e2m1 packed two to a byte (.kind::mxf4, .kind::mxf4nvf4).
+enum class MmaElem { F16, BF16, TF32, S8, U8, S4, U4, B1, E4M3, E5M2, F64, E3M2, E2M3, E2M1, E2M1P };
+// mma.sync (PTX ISA 9.7.16.5.14): every documented shape except the
+// block-scaled and .kind::f8f6f4 ones. m16n8kK, m8n8kK (the integer, b1 and
+// f64 ones) and Volta's m8n8k4 f16, which is four 8x8x4 products at once.
 struct OpMma {
-  uint32_t k = 16;          // m and n are fixed at 16 and 8 for every shape here
-  MmaElem ab_type = MmaElem::F16;
-  bool ab_signed = true;    // for the integer types
-  bool acc_f16 = false;     // accumulate in f16x2 registers rather than f32
-  bool acc_int = false;     // s32 accumulate
+  uint32_t m = 16, k = 16;   // n is 8 for every shape
+  MmaElem ab_type = MmaElem::F16;   // A's type
+  MmaElem b_type = MmaElem::F16;
+  bool ab_signed = true;     // A's integer signedness
+  bool b_signed = true;
+  bool acc_f16 = false;      // D in f16x2 registers
+  bool c_f16 = false;        // C in f16x2 registers (m8n8k4 may differ from D)
+  bool acc_int = false;      // s32 accumulate
+  bool acc_f64 = false;      // f64 accumulate
+  bool satfinite = false;    // integer: clamp to the s32 range
+  bool b1_and = false;       // b1: .and.popc rather than .xor.popc
+  bool a_row = true, b_col = true;   // m8n8k4 f16's .alayout/.blayout
+  FRound rnd = FRound::Nearest;      // f64
   std::vector<Reg> d, a, b, c;
-  // mma.sp: A is 2:4 structured sparse, holding only its non-zero half; the
-  // metadata operand says where each stored element sits in its 4-wide chunk,
-  // and the selector says which threads of each group of four supply it.
+  // mma.sp: A is structured sparse, holding only its non-zero half; the
+  // metadata operand says where each stored element sits in its chunk, and
+  // the selector says which threads of each group of four supply it.
   bool sparse = false;
   Operand meta, selector;
+  // sm_120's block scaling (9.7.16.3): D = (A * scale_A) * (B * scale_B) + C,
+  // with `scale_vec` factors a row of A / column of B, ue8m0 or ue4m3, picked
+  // from the scale-a/b-data registers by the {byte-id, thread-id} selectors.
+  bool block_scale = false;
+  uint32_t scale_vec = 1;
+  bool ue4m3 = false;
+  Operand sfa, sfa_byte, sfa_thread, sfb, sfb_byte, sfb_thread;
 };
 // Hopper's warpgroup MMA (sm_90a): wgmma.fence, .commit_group, .wait_group
 // and .mma_async. Four warps compute one 64xNxK product; A comes from
 // registers or, like B always does, from shared memory through a 64-bit
 // matrix descriptor (PTX ISA 9.7.17.5.1.2.2).
 enum class WgmmaKind { Fence, Commit, Wait, Mma };
-enum class WgmmaElem { F16, BF16, TF32, E4M3, E5M2, S8, U8 };
+enum class WgmmaElem { F16, BF16, TF32, E4M3, E5M2, S8, U8, B1 };
 enum class WgmmaAcc { F16, F32, S32 };
 struct OpWgmma {
   WgmmaKind kind = WgmmaKind::Mma;
@@ -313,6 +343,10 @@ struct OpWgmma {
   Operand scale_d;           // predicate (or 0/1): false means D = A*B
   int scale_a = 1, scale_b = 1;   // -1 negates, float forms only
   int trans_a = 0, trans_b = 0;   // 1 selects M-/N-major, 16-bit forms only
+  // wgmma.mma_async.sp: A is structured sparse, M x K/2 stored, the metadata
+  // and selector as for mma.sp (per warp, its 16 rows).
+  bool sparse = false;
+  Operand sp_meta, sp_sel;
 };
 // Blackwell's fifth-generation tensor core (sm_100a/sm_100f and the a/f
 // targets after it, PTX ISA 9.7.18): Tensor Memory -- 128 lanes by 512
@@ -329,6 +363,7 @@ enum class Tcgen05Shape { S32x32b, S16x64b, S16x128b, S16x256b, S16x32bx2 };
 enum class Tcgen05MmaKind { F16, TF32, F8F6F4, I8, MXF8F6F4, MXF4, MXF4NVF4 };
 // tcgen05.cp shapes (9.7.18.9.2): lanes x bits a lane.
 enum class Tcgen05CpShape { S128x256b, S4x256b, S128x128b, S64x128b, S32x128b };
+enum class Tcgen05Collector { Fill, Use, LastUse, Discard };
 struct OpTcgen05 {
   Tcgen05Kind kind = Tcgen05Kind::Mma;
   uint32_t cta_group = 1;          // .cta_group::1 or ::2
@@ -367,6 +402,14 @@ struct OpTcgen05 {
   Tcgen05CpShape cp_shape = Tcgen05CpShape::S128x256b;
   int cp_multicast = 0;        // 0 none, 4 .warpx4, 2 .warpx2::02_13, 3 .warpx2::01_23
   int cp_decompress = 0;       // .b8x16 from .b4x16_p64 (4) or .b6x16_p32 (6)
+  // tcgen05.mma.ws (weight-stationary): its B collector buffer (0-3) and what
+  // it does with it -- .collector::bN::fill/use/lastuse/discard, b0::discard
+  // when absent -- and the optional zero-column mask descriptor.
+  bool ws = false;
+  uint32_t collector_buf = 0;
+  Tcgen05Collector collector = Tcgen05Collector::Discard;
+  bool has_zero_mask = false;
+  Operand zero_mask;
   Operand d_tmem, a, b_desc, idesc, enable_d;
   bool a_tmem = false;
   std::vector<Operand> disable_lanes;
@@ -604,7 +647,6 @@ struct OpShf { bool left = false; bool wrap = false; Reg dst; Operand a, b, c; }
 // PTX names an explicit rounding mode on float arithmetic. Unlike .approx,
 // which only relaxes accuracy, these change the result -- quantization kernels
 // depend on .rz truncating -- so they are carried through and applied.
-enum class FRound { Nearest, Zero, MinusInf, PlusInf };
 // nan_propagate is min.NaN/max.NaN, which returns NaN when either operand is
 // NaN. Plain min/max return the non-NaN operand, which is fmin/fmax's rule --
 // the two disagree on exactly the inputs a numerically fragile kernel cares
