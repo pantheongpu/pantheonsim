@@ -135,6 +135,7 @@ add_library(vgpu STATIC
   amd/src/regs.cpp
   amd/src/metrics.cpp
   amd/src/cper.cpp
+  amd/src/kfd.cpp
   nvidia/src/regs.cpp
   src/core/profile.cpp
   src/core/registry.cpp
@@ -712,6 +713,7 @@ vgpu_unit_test(test_amd_gcn_lds amd/tests/unit/test_gcn_lds.cpp)
 
 # Each AMD profile's chip facts are its own (amd/include/vgpu/amd_chip.hpp).
 vgpu_unit_test(test_amd_chip amd/tests/unit/test_amd_chip.cpp)
+vgpu_unit_test(test_amd_kfd amd/tests/unit/test_amd_kfd.cpp)
 target_compile_definitions(test_amd_gcn_lds PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # The same kernels built for gfx1100 (RDNA3, wave32), through the same
