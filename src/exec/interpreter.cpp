@@ -4504,6 +4504,18 @@ class Interpreter {
         exec_launch_device(w, ctx, ins, *op, m);
         return;
       }
+      // Device-side cudaGetDevice and cudaGetDeviceCount: the device runtime
+      // library's wrappers call these driver entry points (CUDA 12's CDP2
+      // names, and CDP1's cnp ones), which write one int and return an error
+      // code. NanoVDB calls cudaGetDevice from a kernel.
+      if (op->callee == "__cuda_syscall_cnpv2GetDevice" || op->callee == "cnpGetDevice") {
+        exec_device_int_query(w, ctx, ins, *op, m, cfg_.device_ordinal);
+        return;
+      }
+      if (op->callee == "__cuda_syscall_cnpv2GetDeviceCount" || op->callee == "cnpGetDeviceCount") {
+        exec_device_int_query(w, ctx, ins, *op, m, cfg_.device_count);
+        return;
+      }
       if (op->indirect) {
         exec_indirect_call(w, ctx, ins, *op, m);
         return;
@@ -9088,6 +9100,27 @@ class Interpreter {
     if (out.bytes.empty()) out.reset(bytes, W_);
     for (uint32_t lane = 0; lane < W_; ++lane)
       if (m & (Mask{1} << lane)) out.write(lane, 0, bytes, r[lane]);
+  }
+
+  // int f(int* out): writes `value` through the pointer and returns success.
+  void exec_device_int_query(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m,
+                             int value) {
+    if (op.param_slots.size() != 1)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, op.callee + " takes one argument");
+    const Warp::Slot& ptr = call_slot(w, ins, op, 0);
+    Lanes r{};   // cudaSuccess
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint64_t addr = ptr.read(lane, 0, 8);
+      if (addr == 0) {
+        r[lane] = 1;   // cudaErrorInvalidValue
+        continue;
+      }
+      // Usually the address of a local variable (int d; cudaGetDevice(&d)),
+      // so it goes wherever a generic store would.
+      store_routed(w, ctx, ins, lane, addr, 4, static_cast<uint32_t>(value));
+    }
+    write_call_result(w, op, m, r, 4);
   }
 
   // cudaGetParameterBufferV2(func, gridDim, blockDim, sharedMem): a buffer, in

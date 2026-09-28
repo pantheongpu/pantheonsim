@@ -1345,6 +1345,11 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, 
       // multi-device form does not.
       case cudaDevAttrCooperativeLaunch: *value = 1; break;
       case cudaDevAttrComputeMode: *value = 0; break;         // cudaComputeModeDefault
+      // The stream-ordered allocator is implemented: cudaMallocAsync and the
+      // cudaMemPool* API (an RTX 3060 answers 1; NanoVDB checks that the two
+      // agree). No pool can be exported to another process, so no handle types.
+      case cudaDevAttrMemoryPoolsSupported: *value = 1; break;
+      case cudaDevAttrMemoryPoolSupportedHandleTypes: *value = 0; break;
       default:
         // A silent zero here is how a scan came to launch no blocks. An
         // attribute this does not model is reported, so the caller either
@@ -1452,6 +1457,29 @@ VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBl
 VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     int* n, const void* f, int bs, size_t dyn, unsigned int) {
   return cudaOccupancyMaxActiveBlocksPerMultiprocessor(n, f, bs, dyn);
+}
+
+// What one device can do with another's memory. The answers follow
+// cudaDeviceCanAccessPeer: distinct simulated devices reach each other, and
+// atomics on a peer's memory are as atomic as on one's own. A device is not
+// asked about itself: an RTX 3060 answers that, like a device that does not
+// exist, with cudaErrorInvalidDevice. There is no performance to rank.
+VGPU_EXPORT cudaError_t cudaDeviceGetP2PAttribute(int* value, cudaDeviceP2PAttr attr, int srcDevice,
+                                                  int dstDevice) {
+  return guard("cudaDeviceGetP2PAttribute", [&](State& s) {
+    if (!value) return cudaErrorInvalidValue;
+    const int n = s.rt->device_count();
+    if (srcDevice < 0 || srcDevice >= n || dstDevice < 0 || dstDevice >= n || srcDevice == dstDevice)
+      return cudaErrorInvalidDevice;
+    switch (attr) {
+      case cudaDevP2PAttrPerformanceRank: *value = 0; break;
+      case cudaDevP2PAttrAccessSupported: *value = 1; break;
+      case cudaDevP2PAttrNativeAtomicSupported: *value = 1; break;
+      case cudaDevP2PAttrCudaArrayAccessSupported: *value = 0; break;
+      default: return cudaErrorInvalidValue;
+    }
+    return cudaSuccess;
+  });
 }
 
 VGPU_EXPORT cudaError_t cudaDeviceCanAccessPeer(int* can, int device, int peerDevice) {

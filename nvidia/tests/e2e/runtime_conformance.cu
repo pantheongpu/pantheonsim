@@ -361,6 +361,26 @@ int main() {
           "got %d %d, reads %d", e, e2, (int)c);
   }
 
+  // The stream-ordered allocator is implemented, so memory pools are reported,
+  // as an RTX 3060 reports them; and what one device can do with another's
+  // memory, where a device asked about itself (or one that does not exist) is
+  // an invalid device, as the card answers.
+  {
+    int v = -1;
+    e = cudaDeviceGetAttribute(&v, cudaDevAttrMemoryPoolsSupported, 0);
+    CHECK("memory pools supported", e == cudaSuccess && v == 1, "got %d %s, value %d", e, cudaGetErrorName(e), v);
+    v = -1;
+    e = cudaDeviceGetP2PAttribute(&v, cudaDevP2PAttrAccessSupported, 0, 1);
+    CHECK("P2P access supported between two devices", e == cudaSuccess && v == 1, "got %d %s, value %d", e, cudaGetErrorName(e), v);
+    e = cudaDeviceGetP2PAttribute(&v, cudaDevP2PAttrPerformanceRank, 1, 0);
+    CHECK("P2P performance rank", e == cudaSuccess && v == 0, "got %d %s, value %d", e, cudaGetErrorName(e), v);
+    e = cudaDeviceGetP2PAttribute(&v, cudaDevP2PAttrAccessSupported, 0, 0);
+    CHECK("P2P attribute of a device with itself -> invalid device", e == cudaErrorInvalidDevice, "got %d %s", e, cudaGetErrorName(e));
+    e = cudaDeviceGetP2PAttribute(&v, cudaDevP2PAttrAccessSupported, 0, 7);
+    CHECK("P2P attribute with no such device -> invalid device", e == cudaErrorInvalidDevice, "got %d %s", e, cudaGetErrorName(e));
+    cudaGetLastError();
+  }
+
   // A managed buffer freed with another device current is gone from every
   // device. It used to stay mapped on the device that allocated it, and a
   // kernel there wrote into memory the allocator had taken back.
