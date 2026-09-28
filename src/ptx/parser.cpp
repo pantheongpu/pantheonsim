@@ -2179,13 +2179,15 @@ class Parser {
       else return unsupported("wgmma." + what);
       std::vector<std::string> types;
       bool shape = false;
+      int b1_and_popc = 0;   // bit 0: .and, bit 1: .popc
       for (size_t i = 2; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         unsigned mm = 0, nn = 0, kk = 0;
         char tail = 0;
         if (p == "sync" || p == "aligned") ;
         else if (p == "satfinite") op.satfinite = true;
-        else if (p == "sp") return unsupported("wgmma.mma_async.sp (sparse A)");
+        else if (p == "sp") op.sparse = true;
+        else if (p == "and" || p == "popc") b1_and_popc |= (p == "and" ? 1 : 2);
         else if (std::sscanf(p.c_str(), "m%un%uk%u%c", &mm, &nn, &kk, &tail) == 3) {
           if (mm != 64 || nn == 0 || nn > 256 || nn % 8 != 0)
             return unsupported("wgmma shape '." + p + "'");
@@ -2193,10 +2195,8 @@ class Parser {
           op.k = kk;
           shape = true;
         } else if (p == "f16" || p == "bf16" || p == "tf32" || p == "f32" || p == "s32" ||
-                   p == "e4m3" || p == "e5m2" || p == "s8" || p == "u8")
+                   p == "e4m3" || p == "e5m2" || p == "s8" || p == "u8" || p == "b1")
           types.push_back(p);
-        else if (p == "b1" || p == "and" || p == "popc")
-          return unsupported("wgmma single-bit (.b1) forms");
         else return unsupported("wgmma modifier '." + p + "'");
       }
       if (op.kind == WgmmaKind::Wait) {
@@ -2218,6 +2218,7 @@ class Parser {
           else if (t == "e5m2") *out = WgmmaElem::E5M2;
           else if (t == "s8") *out = WgmmaElem::S8;
           else if (t == "u8") *out = WgmmaElem::U8;
+          else if (t == "b1") *out = WgmmaElem::B1;
           else return false;
           return true;
         };
@@ -2250,11 +2251,21 @@ class Parser {
           want_k = 32;
           // The integer shapes skip some N: 8, 16, 24, 32, then multiples of 16.
           if (op.n > 32 && op.n % 16 != 0) ok = false;
+        } else if (op.a_type == WgmmaElem::B1) {
+          // wgmma.mma_async.sync.aligned.m64nNk256.s32.b1.b1.and.popc: the
+          // integer shapes' N, and .and is the only bit operation.
+          ok = op.b_type == WgmmaElem::B1 && op.d_type == WgmmaAcc::S32 && b1_and_popc == 3 && !op.sparse;
+          want_k = 256;
+          if (op.n > 32 && op.n % 16 != 0) ok = false;
         }
+        if (b1_and_popc && op.a_type != WgmmaElem::B1) ok = false;
+        // A sparse A doubles K: 32 for f16/bf16, 16 for tf32, 64 for 8-bit.
+        if (op.sparse) want_k *= 2;
         if (!ok || op.k != want_k)
           return unsupported("wgmma.mma_async." + types[0] + "." + types[1] + "." + types[2] +
                              " with k" + std::to_string(op.k) + " is not a form the ISA defines");
         if (op.satfinite && !int8) return unsupported("wgmma .satfinite outside the integer forms");
+        const bool b1 = op.a_type == WgmmaElem::B1;
         op.d = parse_reg_vector_any();
         const size_t want_d = op.d_type == WgmmaAcc::F16 ? op.n / 4 : op.n / 2;
         if (op.d.size() != want_d)
@@ -2270,6 +2281,19 @@ class Parser {
         expect_punct(",");
         op.b_desc = parse_operand();
         expect_punct(",");
+        if (op.sparse) {
+          op.sp_meta = parse_operand();
+          expect_punct(",");
+          op.sp_sel = parse_operand();
+          expect_punct(",");
+          const auto* sel = std::get_if<ImmInt>(&op.sp_sel);
+          // A thread pair holds the metadata for f16/bf16/tf32, all four for
+          // the 8-bit types (9.7.17.6.1).
+          const int64_t top = (fp8 || int8) ? 0 : 1;
+          if (!sel || sel->value < 0 || sel->value > top)
+            return unsupported("wgmma.mma_async.sp's sparsity selector must be an immediate from 0 to " +
+                               std::to_string(top) + " for this type");
+        }
         op.scale_d = parse_operand();
         // The immediates that follow depend on the form: floats take the two
         // negate flags, and the 16-bit forms add the transposes -- trans-b only
@@ -2282,11 +2306,11 @@ class Parser {
           if (!imm) return unsupported("wgmma scale/transpose arguments must be immediates");
           imms.push_back(static_cast<int>(imm->value));
         }
-        const size_t want_imms = int8 ? 0u : (is16 ? (op.a_regs ? 3u : 4u) : 2u);
+        const size_t want_imms = (int8 || b1) ? 0u : (is16 ? (op.a_regs ? 3u : 4u) : 2u);
         if (imms.size() != want_imms)
           return unsupported("wgmma.mma_async takes " + std::to_string(want_imms) +
                              " immediate arguments after scale-d in this form");
-        if (!int8) {
+        if (!int8 && !b1) {
           op.scale_a = imms[0];
           op.scale_b = imms[1];
           if ((op.scale_a != 1 && op.scale_a != -1) || (op.scale_b != 1 && op.scale_b != -1))

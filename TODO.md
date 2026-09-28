@@ -706,9 +706,17 @@ narrows what counts as observable, not what the detector looks at.
   e2e test (nvidia/tests/e2e/wgmma_cute.cu) lets CuTe -- NVIDIA's own layout
   code, from a pinned CUTLASS release -- build the tiles, descriptors and
   fragments for seventeen configurations and compares every element exactly.
-  Refused by name: the sparse (`.sp`) and single-bit (`.b1`) `wgmma` forms, a
-  descriptor with a nonzero base offset (the ISA does not say how it moves the
-  pattern), and `wgmma` under any target but `.target sm_90a`. Loading now
+  Since 2026-09-27 the sparse forms too (`wgmma.mma_async.sp`, f16/bf16,
+  tf32, fp8 and s8/u8): A holds M x K/2 -- in registers as mma.sp's fragment,
+  in shared memory as the packed matrix in the ordinary canonical layout --
+  and each warp expands its 16 rows with its own metadata, by mma.sp's rule
+  for the same type (the ISA's wgmma metadata figures are mma.sp's). And
+  `.b1` (m64nNk256 `.and.popc`), eight bits to a byte in shared memory.
+  CUTLASS's 20 SM90 sparse GEMM tests pass (warp-specialized, cooperative,
+  ping-pong, 2x1 clusters, fp8 fast accumulation); `.b1`, which CUTLASS has
+  no test for, against a host reference. Refused by name: a descriptor with
+  a nonzero base offset (the ISA does not say how it moves the pattern), and
+  `wgmma` under any target but `.target sm_90a`. Loading now
   follows the target suffixes: a fatbin's `sm_90a` PTX is preferred over its
   `sm_90` one on a 9.0 device (nvcc -arch=sm_90a embeds both; only the first
   has the arch-specific instructions), `sm_XYa` code loads only on exactly
@@ -927,8 +935,8 @@ what is done.
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle's 8-byte-flip
   variant (Blackwell); tcgen05's sparse, weight-stationary and block-scaled
-  MMAs, `tcgen05.cp`/`shift` and its 4/6-bit types; the sparse and
-  single-bit `wgmma` forms, and inline-asm-only instructions. (`wgmma`, TMA,
+  MMAs, `tcgen05.cp`/`shift` and its 4/6-bit types; mma's block-scaled and
+  `.kind::f8f6f4` forms (sm_120); and inline-asm-only instructions. (`wgmma`, TMA,
   the mbarrier transaction counts, `barrier.cluster` and distributed shared
   memory are done -- see "Hopper's warpgroup MMA", "TMA and clusters" and
   "Distributed shared memory" above. Textures, surfaces and grid sync are

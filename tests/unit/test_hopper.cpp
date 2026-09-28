@@ -348,13 +348,17 @@ VTEST(wgmma_refuses_forms_the_isa_does_not_define) {
   VCHECK_CONTAINS(parse_one(kHeader90a, "wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 "
                                         "{%r0, %r1, %r2, %r3}, %rd0, %rd1, 1, 1, 1, 0, 2;").message(),
                   "must be 0 or 1");
-  // Sparse and single-bit forms are named, not mistaken for something else.
+  // Sparse: a selector past the ISA's range (a thread pair for f16), and K
+  // not doubled. Single-bit: .xor is not a wgmma form, only .and.
   VCHECK_CONTAINS(parse_one(kHeader90a, "wgmma.mma_async.sp.sync.aligned.m64n8k32.f32.f16.f16 "
+                                        "{%r0, %r1, %r2, %r3}, %rd0, %rd1, %r5, 2, 1, 1, 1, 0, 0;").message(),
+                  "selector");
+  VCHECK_CONTAINS(parse_one(kHeader90a, "wgmma.mma_async.sp.sync.aligned.m64n8k16.f32.f16.f16 "
                                         "{%r0, %r1, %r2, %r3}, %rd0, %rd1, %r5, 0, 1, 1, 1, 0, 0;").message(),
-                  "sparse");
-  VCHECK_CONTAINS(parse_one(kHeader90a, "wgmma.mma_async.sync.aligned.m64n8k256.s32.b1.b1.and.popc "
+                  "not a form the ISA defines");
+  VCHECK_CONTAINS(parse_one(kHeader90a, "wgmma.mma_async.sync.aligned.m64n8k256.s32.b1.b1.xor.popc "
                                         "{%r0, %r1, %r2, %r3}, %rd0, %rd1, 1;").message(),
-                  "single-bit");
+                  "'.xor'");
 }
 
 // ---- shared-memory layouts, from the ISA's own examples ----------------------
@@ -596,6 +600,46 @@ VTEST(wgmma_integer_scale_d_false_and_satfinite) {
   // Starting near INT32_MAX and adding a positive product: clamped, not wrapped.
   const auto sat = run(true, 1);
   for (uint32_t v : sat) VCHECK_EQ(int32_t(v), INT32_MAX);
+}
+
+// .b1 (m64nNk256, .and.popc): D = C + popcount(A's row AND B's column), A and
+// B from shared memory K-major, eight bits to a byte, low bit first -- the
+// canonical layout of 9.7.17.5.1.2 over bytes.
+VTEST(wgmma_b1_and_popc) {
+  Wgmma w;
+  w.form = "m64n8k256.s32.b1.b1.and.popc";
+  w.a_regs = false;
+  w.tail = "";
+  w.d_regs = 4;
+  auto abit = [](int m, int k) { return ((m * 7 + k * 13 + (k * k) % 11) % 3) == 0; };
+  auto bbit = [](int k, int n) { return ((k * 5 + n * 3) % 4) != 1; };
+  // Bytes: 8 rows of 16 per core matrix, LBO 128 across K, SBO 256 down.
+  for (int m = 0; m < 64; ++m)
+    for (int k = 0; k < 256; ++k)
+      if (abit(m, k)) {
+        const size_t at = size_t((m % 8) * 16 + (m / 8) * 256 + (k / 8) % 16 + (k / 128) * 128);
+        if (w.smem_a.size() <= at) w.smem_a.resize(at + 1);
+        w.smem_a[at] |= uint8_t(1u << (k % 8));
+      }
+  for (int n = 0; n < 8; ++n)
+    for (int k = 0; k < 256; ++k)
+      if (bbit(k, n)) {
+        const size_t at = size_t(n * 16 + (k / 8) % 16 + (k / 128) * 128);
+        if (w.smem_b.size() <= at) w.smem_b.resize(at + 1);
+        w.smem_b[at] |= uint8_t(1u << (k % 8));
+      }
+  w.desc_a = desc(0, 128, 256, 0);
+  w.desc_b = desc(0, 128, 256, 0);
+  w.d_in.assign(128 * 4, 7u);
+  const auto got = w.run();
+  for (int t = 0; t < 128; ++t)
+    for (int e = 0; e < 4; ++e) {
+      int row, col;
+      d_pos(t, e, &row, &col);
+      int want = 7;
+      for (int k = 0; k < 256; ++k) want += abit(row, k) && bbit(k, col);
+      VCHECK_EQ(int32_t(got[t * 4 + e]), want);
+    }
 }
 
 // ---- what the instruction demands of its caller ------------------------------
