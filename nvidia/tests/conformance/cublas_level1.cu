@@ -159,7 +159,47 @@ static void run() {
   CB(cublasDnrm2(h, 9, dx, 1, dr));
   CB(cublasIdamax(h, 9, dx, 1, di));
   printf("device-pointer nrm2 = %.6f iamax = %d\n", down(dr, 1)[0], down(di, 1)[0]);
-  cudaFree(dx); cudaFree(dr); cudaFree(di);
+  // The 64-bit-index forms, whose i?amax writes an int64_t; the device-pointer
+  // one catches a result written 4 bytes wide.
+  int64_t* dl = nullptr;
+  cudaMalloc(&dl, sizeof(int64_t));
+  cudaMemset(dl, 0xff, sizeof(int64_t));
+  CB(cublasIdamax_64(h, 9, dx, 1, dl));
+  printf("device-pointer iamax_64 = %lld\n", (long long)down(dl, 1)[0]);
+  CB(cublasSetPointerMode(h, CUBLAS_POINTER_MODE_HOST));
+  {
+    auto hy = values<double>(9, 3);
+    double* dy = up(hy);
+    const double a = -1.5, s = 0.5;
+    double r = 0;
+    int64_t im = -1;
+    CB(cublasDaxpy_64(h, 9, &a, dx, 1, dy, 1));
+    print("d axpy_64", down(dy, 9));
+    CB(cublasDdot_64(h, 9, dx, 1, dy, 1, &r));
+    printf("d dot_64 = %.6f\n", r);
+    CB(cublasDnrm2_64(h, 5, dx, 2, &r));
+    printf("d nrm2_64 inc 2 = %.6f\n", r);
+    CB(cublasIdamax_64(h, 9, dy, 1, &im));
+    printf("d iamax_64 = %lld\n", (long long)im);
+    CB(cublasDscal_64(h, 9, &s, dy, 1));
+    print("d scal_64", down(dy, 9));
+    auto fx = values<float>(9, 5), fy = values<float>(9, 3);
+    float *sx = up(fx), *sy = up(fy);
+    const float fa = -1.5f, fs = 0.5f;
+    float fr = 0;
+    CB(cublasSaxpy_64(h, 9, &fa, sx, 1, sy, 1));
+    print("s axpy_64", down(sy, 9));
+    CB(cublasSdot_64(h, 9, sx, 1, sy, 1, &fr));
+    printf("s dot_64 = %.6f\n", (double)fr);
+    CB(cublasSnrm2_64(h, 9, sx, 1, &fr));
+    printf("s nrm2_64 = %.6f\n", (double)fr);
+    CB(cublasIsamax_64(h, 9, sy, 1, &im));
+    printf("s iamax_64 = %lld\n", (long long)im);
+    CB(cublasSscal_64(h, 9, &fs, sy, 1));
+    print("s scal_64", down(sy, 9));
+    cudaFree(dy); cudaFree(sx); cudaFree(sy);
+  }
+  cudaFree(dx); cudaFree(dr); cudaFree(di); cudaFree(dl);
   cublasDestroy(h);
 }
 

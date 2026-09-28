@@ -57,6 +57,9 @@ precision `axpy`, `scal`, `dot`, `nrm2`, `i?amax`, the triangular band
 product `tbmv`, and `dgmm` (a matrix times a diagonal one, from either side). A negative increment walks the vector from its far end, as
 BLAS defines it; `scal`, `nrm2` and `i?amax` do nothing (or return 0) for an
 increment that is not positive, which is what the hardware does too.
+The level 1 routines also have their 64-bit-index forms (`cublasDnrm2_64` and
+so on, CUDA 12), with `i?amax_64` answering in an `int64_t`; a size or stride
+beyond the range of `int` is refused.
 
 Not implemented — these return `CUBLAS_STATUS_NOT_SUPPORTED` rather than a
 plausible wrong answer: mixed-precision `GemmEx` (f16/bf16/int8 paths),
