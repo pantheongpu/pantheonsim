@@ -1,6 +1,7 @@
 // The CUDA runtime API's documented behaviour at its edges, on a simulated
 // 2 x Tesla T4. Each check was written from the documentation, and the ones
 // marked with a note used to disagree with it.
+#include <cuda.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -356,6 +357,40 @@ int main() {
     cudaFree(managed);
     cudaFreeHost(pinned);
     cudaFree(dev);
+  }
+
+  // A driver function outside the runtime, fetched the way NanoVDB fetches
+  // cuMemGetAllocationGranularity and then calls without checking for null;
+  // and a name the driver does not have, which is not found.
+  {
+    void* fn = nullptr;
+    cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;
+#if CUDART_VERSION >= 12050
+    e = cudaGetDriverEntryPointByVersion("cuMemGetAllocationGranularity", &fn, 12000, cudaEnableDefault, &q);
+#else
+    e = cudaGetDriverEntryPoint("cuMemGetAllocationGranularity", &fn, cudaEnableDefault, &q);
+#endif
+    size_t granularity = 0;
+    if (e == cudaSuccess && fn) {
+      CUmemAllocationProp prop = {};
+      prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+      prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      prop.location.id = 0;
+      using Granularity = CUresult (*)(size_t*, const CUmemAllocationProp*, CUmemAllocationGranularity_flags);
+      reinterpret_cast<Granularity>(fn)(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+    }
+    CHECK("cuMemGetAllocationGranularity through the driver entry point",
+          e == cudaSuccess && q == cudaDriverEntryPointSuccess && granularity > 0,
+          "got %d %s, status %d, granularity %zu", e, cudaGetErrorName(e), (int)q, granularity);
+    fn = &granularity;
+#if CUDART_VERSION >= 12050
+    e = cudaGetDriverEntryPointByVersion("cuNoSuchFunction", &fn, 12000, cudaEnableDefault, &q);
+#else
+    e = cudaGetDriverEntryPoint("cuNoSuchFunction", &fn, cudaEnableDefault, &q);
+#endif
+    CHECK("a driver function that does not exist is not found",
+          e == cudaSuccess && fn == nullptr && q == cudaDriverEntryPointSymbolNotFound,
+          "got %d %s, status %d", e, cudaGetErrorName(e), (int)q);
   }
 
   // Cache preferences: accepted for a kernel, refused for anything else, and the
