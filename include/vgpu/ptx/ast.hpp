@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <ostream>
+#include <set>
 #include <string>
 #include <variant>
 #include <vector>
@@ -1054,6 +1055,10 @@ struct EntryFn {
   uint32_t num_regs32 = 0;
   uint32_t num_regs64 = 0;
   std::map<std::string, LocalDecl> locals;    // .local depots
+  // The names this function's body mentions that are module-scope .shared
+  // variables or functions: what decides which module .shared a kernel is
+  // charged for (see parse()). Filled while parsing, trimmed afterwards.
+  std::set<std::string> words_seen;
   uint32_t local_frame_size = 0;              // total per-thread local bytes
   // Launch bounds from __launch_bounds__. `.maxntid` caps the block size the
   // kernel was compiled for and `.reqntid` fixes it exactly; exceeding either
