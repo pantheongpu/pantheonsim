@@ -1227,6 +1227,13 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_warp_spin_lock
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_warp_spin_lock.sh)
+  set_tests_properties(e2e_warp_spin_lock PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_ordered_vectors
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ordered_vectors.sh)
   set_tests_properties(e2e_ordered_vectors PROPERTIES
