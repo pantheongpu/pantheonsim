@@ -46,6 +46,23 @@ expect() {  # expect <name> <expected> <actual>
     echo "FAIL  $1"; echo "      expected: $2"; echo "      actual:   $3"; fail=1; fi
 }
 
+# The preload hides a gap: a function the simulator's library lacks is found
+# in Ollama's own libamdhip64, loaded beside it, and the test passes. The
+# pantheonsim.com playground puts the simulator's library in place of Ollama's,
+# and there a gap stops the ROCm backend loading at all -- llama.cpp's backend
+# is loaded with every symbol bound up front, and hipMemAdvise was missing. So
+# every HIP and HSA function Ollama's ROCm libraries ask for, at its version,
+# has to be the simulator's own.
+if command -v nm >/dev/null; then
+  have=$(nm -D --defined-only "$tmp/libamdhip64.so.7" | awk '{print $3}' | sed 's/@@/@/' | sort -u)
+  need=$(for f in "$rocm"/*.so*; do
+           case "$(basename "$f")" in libamdhip64.so*|libhsa-runtime64.so*) continue ;; esac
+           [[ -L "$f" ]] || nm -D --undefined-only "$f" 2>/dev/null
+         done | awk '{print $NF}' | grep -E '^_*(hip|hsa)[A-Za-z0-9_]*@(hip_|ROCR_)' | sort -u)
+  expect "the simulator's HIP runtime has every function Ollama's ROCm libraries use" "" \
+    "$(comm -23 <(echo "$need") <(echo "$have") | tr '\n' ' ' | sed 's/ $//')"
+fi
+
 port=$((20000 + RANDOM % 20000))
 api="http://127.0.0.1:$port"
 # serve <log> [env...]: an ollama server with the given environment, ready.

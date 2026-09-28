@@ -49,6 +49,7 @@ hipError_t hipHostMalloc(void**, size_t, unsigned int);
 hipError_t hipHostFree(void*);
 hipError_t hipHostGetDevicePointer(void**, void*, unsigned int);
 hipError_t hipMallocManaged(void**, size_t, unsigned int);
+hipError_t hipMemAdvise(const void*, size_t, int, int);
 hipError_t hipPointerGetAttributes(hipPointerAttribute_t*, const void*);
 hipError_t hipPointerGetAttribute(void*, int, void*);
 hipError_t hipMemPoolCreate(void**, const hipMemPoolProps*);
@@ -180,6 +181,20 @@ int main(int argc, char** argv) {
   CHECK(hipPointerGetAttributes(&attr, mout));
   printf("a kernel reads and writes managed memory, which says it is managed %d\n",
          right(min, mout) && attr.type == 3 && attr.isManaged == 1);
+  /* Advice is taken for memory the device reaches (llama.cpp gives it, and a
+   * library that lacks it is not loaded); HIP's refusals are refused. */
+  const size_t mbytes = N * sizeof(float);
+  int advised = hipMemAdvise(min, mbytes, 1 /* SetReadMostly */, 0) == hipSuccess &&
+                hipMemAdvise(min, mbytes, 100 /* SetCoarseGrain */, 0) == hipSuccess &&
+                hipMemAdvise(min + 1, mbytes - sizeof(float), 3 /* SetPreferredLocation */, 1) == hipSuccess &&
+                hipMemAdvise(min, mbytes, 5 /* SetAccessedBy */, -1 /* hipCpuDeviceId */) == hipSuccess;
+  int refused = hipMemAdvise(NULL, mbytes, 1, 0) == hipErrorInvalidValue &&
+                hipMemAdvise(min, 0, 1, 0) == hipErrorInvalidValue &&
+                hipMemAdvise(min, mbytes, 42, 0) == hipErrorInvalidValue &&
+                hipMemAdvise(min, mbytes + 1, 1, 0) == hipErrorInvalidValue &&
+                hipMemAdvise(min, mbytes, 3, 7) == hipErrorInvalidDevice;
+  (void)hipGetLastError();
+  printf("managed memory takes advice, and what HIP refuses is refused %d\n", advised && refused);
   CHECK(hipFree(min));
   CHECK(hipFree(mout));
 
