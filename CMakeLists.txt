@@ -653,6 +653,11 @@ vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
 target_compile_definitions(test_regs PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_regalloc)
+# How many host threads a grid is spread over: the CPUs the process may use,
+# its cgroup's CPU quota included, not the host's count.
+add_executable(print_host_cpus tests/host_cpus/print_host_cpus.cpp)
+target_include_directories(print_host_cpus PRIVATE include)
+add_test(NAME host_cpus COMMAND ${CMAKE_SOURCE_DIR}/tests/host_cpus/run_host_cpus.sh $<TARGET_FILE:print_host_cpus>)
 # AMD code objects: what a HIP program hands the driver to run.
 vgpu_unit_test(test_amd_codeobject amd/tests/unit/test_codeobject.cpp)
 target_compile_definitions(test_amd_codeobject PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
