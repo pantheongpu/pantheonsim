@@ -768,6 +768,20 @@ set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 600)
 
 vgpu_unit_test(test_amd_hip_abi amd/tests/unit/test_hip_abi.cpp)
+# HIP's grid sizes for every AMD profile, one process each (the runtime takes
+# its GPU from VGPU_GPU once).
+add_executable(test_amd_hip_grid amd/tests/unit/test_hip_grid.cpp)
+target_link_libraries(test_amd_hip_grid PRIVATE vgpuhip vgpu)
+target_include_directories(test_amd_hip_grid PRIVATE tests/framework amd/include)
+foreach(_p IN LISTS VGPU_PROFILES)
+  if(_p MATCHES "^amd/")
+    string(REPLACE "amd/" "" _n "${_p}")
+    add_test(NAME test_amd_hip_grid_${_n} COMMAND test_amd_hip_grid)
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/telemetry-hip-grid-${_n}")
+    set_tests_properties(test_amd_hip_grid_${_n} PROPERTIES ENVIRONMENT
+      "VGPU_GPU=${_p};VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-hip-grid-${_n}")
+  endif()
+endforeach()
 
 vgpu_unit_test(test_amd_hipcc_ops amd/tests/unit/test_hipcc_ops.cpp)
 target_compile_definitions(test_amd_hipcc_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -857,6 +871,10 @@ set_tests_properties(amd_pytorch_mi250x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TR
 # builds for it.
 add_test(NAME amd_pytorch_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/mi350x)
 set_tests_properties(amd_pytorch_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# And on an MI325X: the MI300X's die with more memory, and its own profile.
+add_test(NAME amd_pytorch_mi325x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/mi325x)
+set_tests_properties(amd_pytorch_mi325x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # hipSPARSELt's 2:4 sparse GEMMs, from the same wheel: its kernels prune,
 # compress and multiply with the sparse matrix instructions, gfx942's and

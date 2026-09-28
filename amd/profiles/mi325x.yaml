@@ -16,8 +16,16 @@ limits:
   max_grid_dim: [4294967295, 65535, 65535]
   shared_mem_per_block_bytes: 65536
   shared_mem_per_block_optin_bytes: 65536
+  # Not read from the device, unlike the rest: the capture did not include
+  # them. It is the MI300X's die (CDNA3, gfx942), so these are the MI300X's
+  # per-compute-unit limits: registers, 64 KB of LDS, 32 work-groups.
+  registers_per_block: 65536
   multiprocessors: 304
+  registers_per_sm: 65536
   max_threads_per_sm: 2048
+  max_blocks_per_sm: 32
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 65536
   # One XCD's L2, as HIP reports it: the same die as the MI300X, 4 MB per
   # XCD (CDNA3 whitepaper). Datasheet, not measured.
   l2_cache_bytes: 4194304
