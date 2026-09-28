@@ -379,6 +379,8 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   if (nvidia) make_dirs(s.root + "/proc/driver/nvidia/gpus");
   make_dirs(s.root + "/sys/class/drm");
   make_dirs(s.root + "/sys/bus/pci/devices");
+  // No physical slots: the host's name the host's devices, not these.
+  make_dirs(s.root + "/sys/bus/pci/slots");
   make_dirs(s.root + "/sys/class/hwmon");
   make_dirs(s.root + "/etc");
 
@@ -1017,6 +1019,10 @@ int cmd_shell(const std::vector<std::string>& args) {
       // The session's PCI devices in place of the host's, as lspci and
       // anything walking /sys/bus/pci find them.
       bind(s.root + "/sys/bus/pci/devices", "/sys/bus/pci/devices");
+      // And the host's physical slots out of sight: lspci -v names the slot
+      // whose address matches a device's, and a host's slot at 0000:01:00
+      // (an EC2 instance's) showed as the simulated GPU's.
+      if (::access("/sys/bus/pci/slots", F_OK) == 0) bind(s.root + "/sys/bus/pci/slots", "/sys/bus/pci/slots");
       bind(s.root + "/sys/class/hwmon", "/sys/class/hwmon");
       // sysfs and /dev take no new entries, so a directory the session adds
       // to is overlaid whole: its staged copy under the session root, which
