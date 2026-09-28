@@ -27,7 +27,7 @@ tmp="${TMPDIR:-/tmp}/vgpu_rdc_$$"
 mkdir -p "$tmp"
 trap 'rm -rf "$tmp"' EXIT
 failures=0
-for src in device_functions symbols device_intrinsics; do
+for src in device_functions symbols device_intrinsics rdc_strings; do
   out="$tmp/$src"
   nvcc -std=c++17 -cudart shared -rdc=true -arch=compute_80 -code=compute_80 \
        -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") \
