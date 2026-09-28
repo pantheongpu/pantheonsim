@@ -7813,6 +7813,8 @@ class Interpreter {
         if (addr % va != 0)
           ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
                    "vector load requires " + std::to_string(va) + "-byte alignment");
+        std::unique_lock<std::mutex> whole;
+        if (op.ordered && n > 1) whole = std::unique_lock<std::mutex>(vector_lock(addr));
         for (size_t e = 0; e < n; ++e)
           results[e][lane] = load_routed(w, ctx, ins, lane, addr + e * size, size);
       }
@@ -7877,6 +7879,8 @@ class Interpreter {
         if (addr % va != 0)
           ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
                    "vector store requires " + std::to_string(va) + "-byte alignment");
+        std::unique_lock<std::mutex> whole;
+        if (op.ordered && n > 1) whole = std::unique_lock<std::mutex>(vector_lock(addr));
         for (size_t e = 0; e < n; ++e)
           store_routed(w, ctx, ins, lane, addr + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
       }
@@ -9361,6 +9365,19 @@ class Interpreter {
   static std::mutex& atomic_lock_for(uint64_t addr) {
     static std::array<std::mutex, 251> locks;
     return locks[(addr >> 2) % locks.size()];
+  }
+
+  // A vector access marked .relaxed, .volatile, .acquire or .release is done
+  // element by element, so another block's thread could see half of it. CUB's
+  // decoupled look-back stores a tile's {status, value} with one
+  // st.relaxed.gpu.v2 and polls it with one ld.relaxed.gpu.v2, and a torn read
+  // is a prefix sum from a new status and an old value. Hardware performs an
+  // aligned vector access as one; so does holding this lock, keyed by the
+  // 16-byte line, across all of its elements. Unordered vector accesses -- every
+  // vectorized load in a GEMM -- stay lock-free.
+  static std::mutex& vector_lock(uint64_t addr) {
+    static std::array<std::mutex, 251> locks;
+    return locks[(addr >> 4) % locks.size()];
   }
 
   const EntryFn& fn_;

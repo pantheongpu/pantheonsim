@@ -1373,9 +1373,10 @@ class Parser {
       size_t vec = 1;
       Type ty{};
       bool have_ty = false;
-      bool acquire = false, release = false, b128 = false;
+      bool acquire = false, release = false, b128 = false, ordered = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
+        if (p == "relaxed" || p == "volatile" || p == "acquire" || p == "release") ordered = true;
         if (p == "acquire") acquire = true;
         else if (p == "release") release = true;
         else if (p == "param") space = Space::Param;
@@ -1479,8 +1480,14 @@ class Parser {
         }
       }
       // The ordering the kernel asked for, on whichever op this became.
-      if (auto* l = std::get_if<OpLd>(&ins.op)) l->acquire = acquire;
-      if (auto* st = std::get_if<OpSt>(&ins.op)) st->release = release;
+      if (auto* l = std::get_if<OpLd>(&ins.op)) {
+        l->acquire = acquire;
+        l->ordered = ordered;
+      }
+      if (auto* st = std::get_if<OpSt>(&ins.op)) {
+        st->release = release;
+        st->ordered = ordered;
+      }
     } else if (op0 == "mov") {
       if (parts.size() != 2) return unsupported("mov form");
       auto ty = parse_type_token(parts[1]);
