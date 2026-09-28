@@ -2783,9 +2783,11 @@ VGPU_EXPORT cudaError_t cudaPointerGetAttributes(cudaPointerAttributes* attr, co
       attr->devicePointer = const_cast<void*>(p);
       return cudaSuccess;
     }
-    // Plain host memory CUDA knows nothing about.
+    // Plain host memory CUDA knows nothing about. It belongs to no device,
+    // which CUDA says with cudaInvalidDeviceId (-2), not the current device:
+    // NanoVDB's ptrToDevice tells host pointers from device ones by that.
     attr->type = cudaMemoryTypeUnregistered;
-    attr->device = t_current_device;
+    attr->device = cudaInvalidDeviceId;
     attr->hostPointer = const_cast<void*>(p);
     return cudaSuccess;
   });
