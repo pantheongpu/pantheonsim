@@ -393,6 +393,8 @@ void MemoryManager::map_host(uint64_t addr, void* host, uint64_t len) {
     host_maps_->lo.store(addr, std::memory_order_relaxed);
   if (addr + len > host_maps_->hi.load(std::memory_order_relaxed))
     host_maps_->hi.store(addr + len, std::memory_order_relaxed);
+  if (addr < kDeviceVaEnd && addr + len > kDeviceVaBase)
+    host_maps_->in_device_window.store(true, std::memory_order_relaxed);
 }
 
 void MemoryManager::unmap_host(uint64_t addr) {
@@ -742,6 +744,95 @@ void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
   if (access_fault_ && access_fault_->copy_pending &&
       __atomic_load_n(access_fault_->copy_pending, __ATOMIC_RELAXED))
     access_fault_->on_copy(src, d, len);
+}
+
+namespace {
+// A run's bytes between chunk memory and a buffer, as relaxed atomics: an
+// element (`unit` bytes, aligned) at a time up to an 8-byte boundary, whole
+// words -- which never split an aligned element -- and elements again.
+void run_out(const uint8_t* c, uint8_t* d, uint64_t n, uint32_t unit) {
+  uint64_t i = 0;
+  for (; i < n && reinterpret_cast<uintptr_t>(c + i) % 8; i += unit) {
+    const uint64_t v = load_at(c + i, unit);
+    std::memcpy(d + i, &v, unit);
+  }
+  for (; i + 8 <= n; i += 8) {
+    const uint64_t v = relaxed_load<uint64_t>(c + i);
+    std::memcpy(d + i, &v, 8);
+  }
+  for (; i < n; i += unit) {
+    const uint64_t v = load_at(c + i, unit);
+    std::memcpy(d + i, &v, unit);
+  }
+}
+void run_in(uint8_t* c, const uint8_t* s, uint64_t n, uint32_t unit) {
+  auto one = [&](uint64_t i, uint32_t size) {
+    uint64_t v = 0;
+    std::memcpy(&v, s + i, size);
+    store_at(c + i, size, v);
+  };
+  uint64_t i = 0;
+  for (; i < n && reinterpret_cast<uintptr_t>(c + i) % 8; i += unit) one(i, unit);
+  for (; i + 8 <= n; i += 8) one(i, 8);
+  for (; i < n; i += unit) one(i, unit);
+}
+}  // namespace
+
+// The ordinary allocation holding [addr, addr + len), or null. Mapped
+// (cuMemMap) ranges are not in live_, so they are never found here.
+const MemoryManager::Allocation* MemoryManager::run_allocation(uint64_t addr, uint64_t len, uint32_t unit,
+                                                               uint64_t* base) const {
+  if (unit != 1 && unit != 2 && unit != 4 && unit != 8) return nullptr;
+  if (addr % unit || len % unit || access_fault_ || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
+  SharedGuard table_guard(table_lock_.get());
+  auto up = live_.upper_bound(addr);
+  if (up == live_.begin()) return nullptr;
+  auto prev = std::prev(up);
+  *base = prev->first;
+  if (addr - *base >= prev->second.size || len > prev->second.size - (addr - *base)) return nullptr;
+  return &prev->second;
+}
+
+bool MemoryManager::load_run(uint64_t addr, void* dst, uint64_t len, uint32_t unit) const {
+  if (len == 0) return true;
+  uint64_t base = 0;
+  const Allocation* a = run_allocation(addr, len, unit, &base);
+  if (!a) return false;
+  uint8_t* d = static_cast<uint8_t*>(dst);
+  for (uint64_t off = addr - base; len > 0;) {
+    const uint64_t n = std::min(len, kChunkSize - off % kChunkSize);
+    const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+    if (!chunk) std::memset(d, 0, n);   // untouched: reads zero
+    else if (is_uniform(chunk)) std::memset(d, uniform_byte(chunk), n);
+    else run_out(chunk + off % kChunkSize, d, n, unit);
+    d += n;
+    off += n;
+    len -= n;
+  }
+  return true;
+}
+
+bool MemoryManager::store_run(uint64_t addr, const void* src, uint64_t len, uint32_t unit) {
+  if (len == 0) return true;
+  uint64_t base = 0;
+  auto* a = const_cast<Allocation*>(run_allocation(addr, len, unit, &base));
+  if (!a) return false;
+  const uint8_t* s = static_cast<const uint8_t*>(src);
+  for (uint64_t off = addr - base; len > 0;) {
+    const uint64_t n = std::min(len, kChunkSize - off % kChunkSize);
+    const uint64_t idx = off / kChunkSize;
+    uint8_t* chunk = a->chunks[idx].load(std::memory_order_acquire);
+    // As store_scalar: storing a uniform chunk's own byte changes nothing;
+    // anything else makes the chunk real first.
+    if (!(is_uniform(chunk) && all_bytes(s, n, uniform_byte(chunk)))) {
+      if (!chunk || is_uniform(chunk)) chunk = materialize(*a, idx);
+      run_in(chunk + off % kChunkSize, s, n, unit);
+    }
+    s += n;
+    off += n;
+    len -= n;
+  }
+  return true;
 }
 
 void MemoryManager::read_chunks(const Allocation& a, uint64_t off, uint8_t* d, uint64_t len) const {

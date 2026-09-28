@@ -375,6 +375,80 @@ VTEST(ordinary_device_memory_is_unaffected_by_a_mapping_existing) {
   mem.unmap_host(mapped);
 }
 
+// Host buffers either side of the device windows (a heap one low, an mmap
+// one high) make the mapped range span every device address; device accesses
+// must still reach device memory (and no longer take the host-map lock). A
+// host buffer mapped inside a window, however unlikely, must still be found.
+VTEST(host_maps_around_and_inside_the_device_windows) {
+  MemoryManager mem(1 << 20);
+  std::vector<uint32_t> low(16, 1), high(16, 2), inside(16, 3);
+  mem.map_host(0x10000, low.data(), low.size() * sizeof(uint32_t));
+  const uint64_t hi_addr = 0x7f00'0000'0000ull;
+  mem.map_host(hi_addr, high.data(), high.size() * sizeof(uint32_t));
+  const uint64_t dev = mem.alloc(256);
+  mem.store_scalar(dev + 8, 4, 0x77u);
+  VCHECK_EQ(mem.load_scalar(dev + 8, 4), uint64_t{0x77u});
+  uint32_t v = 0;
+  mem.read(dev + 8, &v, 4);
+  VCHECK_EQ(v, 0x77u);
+  VCHECK_EQ(mem.load_scalar(hi_addr + 4, 4), uint64_t{2u});
+  // The last device window, which this device does not own.
+  const uint64_t in_window = vgpu::kDeviceVaEnd - vgpu::kDeviceVaStride + 0x1000;
+  mem.map_host(in_window, inside.data(), inside.size() * sizeof(uint32_t));
+  VCHECK_EQ(mem.load_scalar(in_window + 8, 4), uint64_t{3u});
+  mem.store_scalar(in_window + 12, 4, 0x99u);
+  VCHECK_EQ(inside[3], 0x99u);
+  VCHECK_EQ(mem.load_scalar(dev + 8, 4), uint64_t{0x77u});
+  mem.free(dev);
+  mem.unmap_host(in_window);
+  mem.unmap_host(hi_addr);
+  mem.unmap_host(0x10000);
+}
+
+// load_run / store_run (TMA's box rows) must do exactly what element-by-
+// element load_scalar / store_scalar do: across a chunk boundary, over
+// untouched and uniform chunks, from any element-aligned start; and decline,
+// doing nothing, whatever they cannot answer that way.
+VTEST(load_run_and_store_run_match_scalar_accesses) {
+  MemoryManager mem(1 << 22);
+  const uint64_t n = 3 * vgpu::kChunkSize;
+  const uint64_t p = mem.alloc(n);
+  const uint8_t b = 0x5A;
+  mem.fill(p + vgpu::kChunkSize, &b, 1, vgpu::kChunkSize);        // chunk 1 uniform, chunk 0 untouched
+  for (uint64_t i = 0; i < 64; i += 2) mem.store_scalar(p + 2 * vgpu::kChunkSize + i, 2, 0x1000 + i);
+  for (uint32_t unit : {1u, 2u, 4u, 8u}) {
+    // From a unit-aligned start 24 bytes before chunk 1 to 40 into chunk 2.
+    const uint64_t at = p + vgpu::kChunkSize - 24, len = vgpu::kChunkSize + 64;
+    std::vector<uint8_t> got(len);
+    VCHECK(mem.load_run(at, got.data(), len, unit));
+    for (uint64_t i = 0; i < len; i += unit) {
+      uint64_t want = mem.load_scalar(at + i, unit), have = 0;
+      std::memcpy(&have, got.data() + i, unit);
+      if (have != want) VCHECK_EQ(have, want);
+    }
+  }
+  // Storing a uniform chunk's own byte leaves it alone.
+  std::vector<uint8_t> same(64, 0x5A);
+  VCHECK(mem.store_run(p + vgpu::kChunkSize, same.data(), same.size(), 8));
+  VCHECK_EQ(mem.load_scalar(p + vgpu::kChunkSize + 8, 8), uint64_t{0x5A5A5A5A5A5A5A5Aull});
+  // Stores: an element-aligned run of 2-byte values across the uniform
+  // chunk's end into the next.
+  std::vector<uint8_t> src(200);
+  for (size_t i = 0; i < src.size(); ++i) src[i] = uint8_t(i * 7 + 1);
+  const uint64_t to = p + 2 * vgpu::kChunkSize - 100;
+  VCHECK(mem.store_run(to, src.data(), src.size(), 2));
+  for (size_t i = 0; i < src.size(); i += 2)
+    VCHECK_EQ(mem.load_scalar(to + i, 2), uint64_t(src[i] | src[i + 1] << 8));
+  VCHECK_EQ(mem.load_scalar(to - 2, 2), uint64_t{0x5A5A});   // the uniform bytes before it kept
+  // Declined: misaligned, past the end, and outside any allocation.
+  uint8_t tmp[16];
+  VCHECK(!mem.load_run(p + 1, tmp, 8, 2));
+  VCHECK(!mem.load_run(p + n - 8, tmp, 16, 8));
+  VCHECK(!mem.store_run(p + n - 8, tmp, 16, 8));
+  VCHECK(!mem.load_run(0x1000, tmp, 8, 8));
+  mem.free(p);
+}
+
 // Blocks run on several host threads and may share global memory: CUB's
 // decoupled look-back publishes a block's prefix for later blocks to spin on.
 // A kernel's aligned scalar access is atomic on a GPU, so it must be here --

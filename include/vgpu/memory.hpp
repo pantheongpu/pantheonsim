@@ -118,6 +118,16 @@ class MemoryManager {
   // Bulk copies (the H2D/D2H/D2D building blocks).
   void write(uint64_t dst, const void* src, uint64_t len);
   void read(uint64_t src, void* dst, uint64_t len) const;
+  // A kernel's run of `unit`-byte loads or stores (TMA's box rows), done at
+  // once: exactly what load_scalar / store_scalar would do element by
+  // element, each element still one relaxed atomic access, for a run wholly
+  // inside one ordinary device allocation. Returns false, having done
+  // nothing, whenever the two could differ -- fault injection attached, a host
+  // mapping possibly in range, a run not inside one allocation, or one not
+  // aligned to `unit` -- and the caller then goes element by element, errors
+  // and all.
+  bool load_run(uint64_t addr, void* dst, uint64_t len, uint32_t unit) const;
+  bool store_run(uint64_t addr, const void* src, uint64_t len, uint32_t unit);
 
   // Fills a range by repeating a 1/2/4-byte pattern, without building a host
   // copy of the range first. Staging a buffer the size of the fill is what
@@ -173,6 +183,12 @@ class MemoryManager {
   }
   uint64_t alu_result(uint64_t value, uint32_t bits) const { return access_fault_->on_alu(value, bits); }
 
+  // Whether a shared-memory load could come back changed; while none is,
+  // shared_loaded returns its value as it is.
+  bool shared_fault_armed() const {
+    return access_fault_ && access_fault_->shared_pending &&
+           __atomic_load_n(access_fault_->shared_pending, __ATOMIC_RELAXED);
+  }
   uint64_t shared_loaded(uint64_t offset, uint32_t size, uint64_t value) const {
     if (access_fault_ && access_fault_->shared_pending &&
         __atomic_load_n(access_fault_->shared_pending, __ATOMIC_RELAXED))
@@ -359,6 +375,7 @@ class MemoryManager {
   // and returns the chunk that won the race; safe to call from several block
   // threads at once.
   static uint8_t* materialize(Allocation& a, uint64_t chunk_idx);
+  const Allocation* run_allocation(uint64_t addr, uint64_t len, uint32_t unit, uint64_t* base) const;
 
   // Maps addr to (allocation base, allocation); throws with diagnostics.
   // `writing` picks the diagnostic for a read-only mapping.
@@ -455,7 +472,17 @@ class MemoryManager {
     // Only ever widened, so a stale read is conservative, never wrong.
     std::atomic<uint64_t> lo{UINT64_MAX};
     std::atomic<uint64_t> hi{0};
+    // The range alone is not enough: a PIE program's heap (0x55...) and the
+    // mmap area (0x7f...) sit either side of the device windows, so a pinned
+    // buffer in each -- PyTorch and CUTLASS's tests both make them -- spans
+    // every device address, and each scalar access a kernel made took the
+    // lock (a third of a CUTLASS blockwise GEMM's time, most of it waiting).
+    // A host buffer inside a device window would need ~95 TiB of mappings
+    // below the mmap base first; if one is ever mapped there, this is set and
+    // device addresses go through the range check again.
+    std::atomic<bool> in_device_window{false};
     bool may_contain(uint64_t addr) const {
+      if (is_device_va(addr) && !in_device_window.load(std::memory_order_relaxed)) return false;
       return addr >= lo.load(std::memory_order_relaxed) &&
              addr < hi.load(std::memory_order_relaxed);
     }

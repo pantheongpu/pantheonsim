@@ -10,6 +10,7 @@
 // same instruction against CuTe's own layouts, including the 128-byte swizzle
 // these examples do not cover.
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -816,6 +817,8 @@ VTEST(tensor_load_swizzles_128b_and_zero_fills_past_the_edge) {
   t.stride = {2, kStride, 0, 0, 0};
   t.box = {64, 8, 1, 1, 1};
   t.elem_stride = {1, 1, 1, 1, 1};
+  for (const char* fp : {"1", "0"}) {   // the fast path's row reads, and element by element
+    setenv("VGPU_FASTPATH", fp, 1);
   run(R"(
 .visible .entry k(.param .align 64 .b8 tmap[128], .param .u64 out)
 {
@@ -862,6 +865,8 @@ WAIT:
       const uint16_t want = (x < W && y < H) ? gval(x, y) : 0;
       VCHECK_EQ(mem.load_scalar(out + at, 2), uint64_t{want});
     }
+  }
+  unsetenv("VGPU_FASTPATH");
 }
 
 // A tensor store writes the part of the box inside the tensor and nothing
@@ -870,6 +875,8 @@ VTEST(tensor_store_writes_only_inside_the_tensor) {
   constexpr int W = 24, H = 6;   // u32; the 16 x 4 box at (16, 4) half hangs off
   MemoryManager mem{1 << 20};
   const uint64_t g = mem.alloc(size_t(W) * H * 4 + 256);
+  for (const char* fp : {"1", "0"}) {   // the fast path's row writes, and element by element
+    setenv("VGPU_FASTPATH", fp, 1);
   for (int i = 0; i < W * H + 64; ++i) mem.store_scalar(g + uint64_t(i) * 4, 4, 0xEEEEEEEEu);
   exec::TensorMap t;
   t.address = g;
@@ -916,6 +923,8 @@ DONE:
     }
   // Past the tensor's end, untouched.
   VCHECK_EQ(mem.load_scalar(g + uint64_t(W) * H * 4, 4), uint64_t{0xEEEEEEEEu});
+  }
+  unsetenv("VGPU_FASTPATH");
 }
 
 // cp.reduce.async.bulk.tensor, as CUTLASS's SM90_TMA_REDUCE_ADD emits it: two
