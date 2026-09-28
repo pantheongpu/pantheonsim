@@ -3262,10 +3262,11 @@ VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
     if (tex) {
       for (int i = 0; i < 3; ++i)
         if (!address_mode_of(tex->addressMode[i], &d.address[i])) return cudaErrorInvalidValue;
-      // Linear filtering is refused rather than approximated -- see the note at
-      // the fetch. sRGB and anisotropy change the result too.
+      // Linear filtering and sRGB decoding are done at the fetch, as the
+      // texture unit does them. Anisotropy changes the result too and is
+      // refused rather than approximated.
       if (tex->filterMode == cudaFilterModeLinear) d.filter = vgpu::exec::TexFilter::Linear;
-      if (tex->sRGB) return cudaErrorNotSupported;
+      d.srgb = tex->sRGB != 0;
       if (tex->maxAnisotropy > 1) return cudaErrorNotSupported;
       // What border addressing returns outside the texture, converted to the
       // texture's format at the fetch.
