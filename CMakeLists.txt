@@ -451,7 +451,14 @@ if(CUDA_ABI_INCLUDE)
       set(_extra_src "nvidia/src/generated/${_lower}_stubs.cpp")
     endif()
     add_library(vgpu${_lower} SHARED nvidia/src/${_src}.cpp ${_extra_src})
-    target_link_libraries(vgpu${_lower} PRIVATE vgpu vgpucudart)
+    if(_lower STREQUAL "nvrtc")
+      # A compiler, and nothing else: it touches no device, so it carries no
+      # simulator and no runtime, as NVIDIA's has none. Linking libcudart here
+      # put a second simulator into every driver-API program that uses NVRTC.
+      target_link_libraries(vgpu${_lower} PRIVATE ${CMAKE_DL_LIBS})
+    else()
+      target_link_libraries(vgpu${_lower} PRIVATE vgpu vgpucudart)
+    endif()
     target_include_directories(vgpu${_lower} PRIVATE ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpu${_lower} PROPERTIES
       OUTPUT_NAME ${_lib} SOVERSION ${_ver} VERSION ${_ver}.0)
@@ -1095,6 +1102,21 @@ if(TARGET vgpucublas)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
+
+  # The library paths PyTorch takes, called directly and checked against a
+  # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
+  # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
+  # cuBLAS's factorizations and batched solves (torch.linalg).
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "nvrtc_paths:nvrtc:cuda")
+    string(REPLACE ":" ";" _parts "${_check}")
+    list(POP_FRONT _parts _name)
+    add_test(NAME e2e_${_name}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh ${_name} ${_parts})
+    set_tests_properties(e2e_${_name} PROPERTIES
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endforeach()
 
   add_test(NAME e2e_rdc_link
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_rdc_link.sh)
