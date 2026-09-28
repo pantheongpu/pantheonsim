@@ -341,6 +341,10 @@ struct Path {
   // the warp's other paths get to run; it is looked at again next turn.
   enum : uint8_t { kRunnable = 0, kAtBarrier = 1, kThisTurn = 2 };
   uint8_t parked = kRunnable;
+  // The warp's step count when this path last issued, and how many more
+  // instructions it is owed after waiting too long (see select_path).
+  uint64_t issued_at = 0;
+  uint32_t boost = 0;
 };
 
 // One cp.async copy that has been issued but not yet awaited.
@@ -1500,6 +1504,7 @@ class Interpreter {
   size_t select_path(Warp& w) {
     if (w.paths.size() == 1) {
       w.paths[0].parked = Path::kRunnable;   // alone: nothing left to wait for
+      w.paths[0].issued_at = w.steps;
       return 0;
     }
     for (size_t i = 0; i < w.paths.size(); ++i) {
@@ -1519,6 +1524,30 @@ class Interpreter {
       if (!w.paths[i].parked && (best == w.paths.size() || w.paths[i].pc < w.paths[best].pc))
         best = i;
     if (best == w.paths.size()) best = 0;   // cannot happen: bar.sync keeps one runnable
+    // Lowest pc first is what reconverges a warp promptly, but on its own it
+    // can starve a path for good: lanes spinning on a lock loop back to a
+    // lower pc than the lane holding it, which then never reaches its
+    // release. Since Volta every thread makes progress regardless of its
+    // warp-mates, so a path that has not issued for kStarvedSteps gets
+    // kBoostSteps instructions in a row. Paths that reconverge normally never
+    // wait that long, so ordinary code runs in the same order as before.
+    constexpr uint64_t kStarvedSteps = 1024;
+    constexpr uint32_t kBoostSteps = 256;
+    size_t pick = w.paths.size();
+    for (size_t i = 0; i < w.paths.size() && pick == w.paths.size(); ++i)
+      if (!w.paths[i].parked && w.paths[i].boost) pick = i;
+    if (pick == w.paths.size()) {
+      for (size_t i = 0; i < w.paths.size(); ++i)
+        if (!w.paths[i].parked && w.steps - w.paths[i].issued_at > kStarvedSteps &&
+            (pick == w.paths.size() || w.paths[i].issued_at < w.paths[pick].issued_at))
+          pick = i;
+      if (pick != w.paths.size()) w.paths[pick].boost = kBoostSteps;
+    }
+    if (pick != w.paths.size()) {
+      best = pick;
+      --w.paths[best].boost;
+    }
+    w.paths[best].issued_at = w.steps;
     return best;
   }
 
@@ -2788,7 +2817,9 @@ class Interpreter {
     size_t fall_pc = w.paths[idx].pc + 1;
     w.paths[idx].pc = op.target;
     w.paths[idx].mask = taken;
-    w.paths.push_back({fall_pc, fallthrough});
+    Path fall{fall_pc, fallthrough};
+    fall.issued_at = w.steps;
+    w.paths.push_back(fall);
   }
 
   void exec_ret(Warp& w, const BlockCtx& ctx, const Instr& ins, size_t idx, Mask m) {
