@@ -74,6 +74,7 @@ compile() {
        -I "$gtest/googletest/include" "$u/gemm/device/$path.cu" "$u/test_unit.cpp" \
        "$u/common/filter_architecture.cpp" "$gtest/libgtest.a" -o "$work/$name" >"$work/$name.log" 2>&1
 }
+compile_start=$SECONDS
 for ((first = 0; first < ${#tests[@]}; first += jobs)); do
   pids=()
   names=()
@@ -88,15 +89,20 @@ for ((first = 0; first < ${#tests[@]}; first += jobs)); do
     fi
   done
 done
+# Compile and run times, and each case's, so a speed change can be read off
+# the log.
+echo "compiled ${#tests[@]} files in $((SECONDS - compile_start)) s"
 fail=0
 for entry in "${tests[@]}"; do
   IFS='|' read -r path filter <<<"$entry"
   name="${path##*/}"
   if ! require_shim_libs "$shim" "$work/$name"; then exit 0; fi
+  run_start=$SECONDS
   result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/rtx5090 LD_LIBRARY_PATH="$shim" \
             "$work/$name" --gtest_filter="$filter" 2>&1 || true)"
   summary="$(grep -E '^\[  (PASSED|FAILED)  \]' <<<"$result" | head -2 | tr '\n' ' ')"
-  echo "$name: $summary"
+  echo "$name: $summary(ran in $((SECONDS - run_start)) s)"
+  grep -E '^\[ +OK \]' <<<"$result" | sed 's/^/    /'
   if ! grep -q '^\[  PASSED  \]' <<<"$result" || grep -q '^\[  FAILED  \]' <<<"$result"; then
     grep -E 'FAILED|Failure|VirtualGPU|timed out' <<<"$result" | head -20
     fail=1
