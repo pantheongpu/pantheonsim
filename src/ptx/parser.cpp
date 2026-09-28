@@ -2671,17 +2671,28 @@ class Parser {
         // instead of reading it again. Reuse is only ever permission -- the
         // ISA says the operand may be reloaded anyway and must not change
         // meanwhile -- so reading it every time is one of the allowed
-        // behaviours.
+        // behaviours. .ws names one of four B buffers, whose fills and uses
+        // the interpreter checks (a use needs a fill of the same B).
+        else if (op.ws && p.rfind("collector::b", 0) == 0) {
+          const std::string rest = p.substr(12);
+          const char b = rest.empty() ? 0 : rest[0];
+          const std::string what2 = rest.size() > 3 && rest.compare(1, 2, "::") == 0 ? rest.substr(3) : "";
+          if (b < '0' || b > '3' || what2.empty())
+            return unsupported("tcgen05.mma.ws collector '." + p + "' (.collector::b0-b3::fill/use/lastuse/discard)");
+          op.collector_buf = static_cast<uint32_t>(b - '0');
+          if (what2 == "fill") op.collector = Tcgen05Collector::Fill;
+          else if (what2 == "use") op.collector = Tcgen05Collector::Use;
+          else if (what2 == "lastuse") op.collector = Tcgen05Collector::LastUse;
+          else if (what2 == "discard") op.collector = Tcgen05Collector::Discard;
+          else return unsupported("tcgen05.mma.ws collector operation '::" + what2 + "'");
+        }
+        else if (op.ws && p.rfind("collector::", 0) == 0)
+          return unsupported("tcgen05.mma.ws takes a B collector (.collector::b0-b3::op), not '." + p + "'");
         else if (p.rfind("collector::", 0) == 0) ;
         else if (p == "red")
           return unsupported("tcgen05.ld.red (sm_103 and sm_110, not the B200's sm_100)");
         else if (p == "sp" && op.kind == Tcgen05Kind::Mma) op.sparse = true;
-        else if (p == "ws" || p.rfind("ws::", 0) == 0)
-          return unsupported("tcgen05.mma.ws (weight-stationary): where it writes D is not settled by the "
-                             "ISA -- figures 219 and 223 put the N halves/quarters in warps 2-3, while "
-                             "figures 220 and 224 address them at lanes 0 and 32 -- nor is its "
-                             "zero-column mask, whose examples contradict each other, so it is not "
-                             "implemented");
+        else if (p == "ws" && op.kind == Tcgen05Kind::Mma) op.ws = true;
         else if (p == "kind::mxf8f6f4") { op.mma_kind = Tcgen05MmaKind::MXF8F6F4; have_kind = true; }
         else if (p == "kind::mxf4") { op.mma_kind = Tcgen05MmaKind::MXF4; have_kind = true; }
         else if (p == "kind::mxf4nvf4") { op.mma_kind = Tcgen05MmaKind::MXF4NVF4; have_kind = true; }
@@ -2708,8 +2719,10 @@ class Parser {
         else if (op.kind == Tcgen05Kind::Cp && p == "b4x16_p64") op.cp_decompress = 4;
         else if (op.kind == Tcgen05Kind::Shift && p == "down") ;
         else if (p == "ashift")
-          return unsupported("tcgen05.mma.ashift: the ISA says A's rows shift down one \"except for the "
-                             "last row\" without saying what row 0 then holds, so it is not implemented");
+          return unsupported("tcgen05.mma.ashift: the ISA says only that A's rows shift down one \"except "
+                             "for the last row\" -- not whether the MMA reads A before or after the "
+                             "shift, whether rows cross the 32-lane quarters, or what row 0 holds -- "
+                             "and no public code uses it to check against, so it is not implemented");
         else if (p.rfind("decompress", 0) == 0 || p == "kind::ti16")
           return unsupported("tcgen05.mma." + p + " (sm_107) is not implemented");
         else if (p.rfind("multicast::cluster::32b", 0) == 0 || p.rfind("sync_restrict", 0) == 0)
@@ -2799,6 +2812,9 @@ class Parser {
           if (mx != op.block_scale)
             return unsupported("tcgen05.mma: .block_scale goes with the .kind::mx* kinds and only them");
           if (!mx && op.scale_vec) return unsupported("tcgen05.mma: a scale vector size without .block_scale");
+          // Table 48: .ws is .cta_group::1 only, and not for the block-scaled kinds.
+          if (op.ws && op.cta_group != 1) return unsupported("tcgen05.mma.ws is .cta_group::1 only (Table 48)");
+          if (op.ws && mx) return unsupported("tcgen05.mma.ws with a block-scaled kind (Table 48 has none)");
           op.d_tmem = bracketed();
           expect_punct(",");
           if (peek_punct("[")) {
@@ -2822,6 +2838,7 @@ class Parser {
             op.scale_b = bracketed();
             expect_punct(",");
           } else if (peek_punct("{")) {
+            if (op.ws) return unsupported("tcgen05.mma.ws takes no disable-output-lane vector");
             op.disable_lanes = parse_operand_vector_any();
             if (op.disable_lanes.size() != 4 * op.cta_group)
               return unsupported("tcgen05.mma's disable-output-lane vector has " +
@@ -2830,7 +2847,11 @@ class Parser {
             expect_punct(",");
           }
           op.enable_d = parse_operand();
-          if (peek_punct(",")) {
+          if (op.ws && peek_punct(",")) {   // .ws: the zero-column mask descriptor, not scale-input-d
+            next();
+            op.zero_mask = parse_operand();
+            op.has_zero_mask = true;
+          } else if (peek_punct(",")) {
             next();
             const Operand s = parse_operand();
             const auto* imm = std::get_if<ImmInt>(&s);

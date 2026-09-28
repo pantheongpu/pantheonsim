@@ -191,6 +191,15 @@ struct TensorMemory {
   // its column here for the other, which takes it instead of allocating again;
   // deallocation works the same way.
   std::deque<std::pair<uint32_t, uint32_t>> peer_alloc, peer_dealloc;
+  // tcgen05.mma.ws's four B collector buffers: whether each holds a fill, and
+  // of which B (its descriptor, and the instruction descriptor's B type,
+  // transpose and N).
+  struct Collector {
+    bool valid = false;
+    uint64_t desc = 0;
+    uint32_t b_fields = 0;
+  };
+  std::array<Collector, 4> collector_b{};
   uint32_t& at(uint32_t lane, uint32_t col) { return cells[size_t{lane} * kCols + col]; }
   bool allocated(uint32_t col) const {
     auto it = live.upper_bound(col);
@@ -3523,7 +3532,6 @@ class Interpreter {
     if (const auto* op = std::get_if<OpCvtFp8>(&ins.op)) {
       const Fp8Format& f = op->e5m2 ? kE5M2 : kE4M3;
       const NarrowFmt fmt = op->fmt;
-      const bool fp8 = fmt == NarrowFmt::E4M3 || fmt == NarrowFmt::E5M2;
       const uint32_t width = fmt == NarrowFmt::E2M1 ? 4 : 8;   // bits a value takes in the pair
       Lanes _s_a, _s_b, _s_sf;
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
@@ -6769,7 +6777,8 @@ class Interpreter {
     } else {
       if ((id & 0x40) || (id & (1u << 23)))
         ctx_fail(ins, li, Err::InvalidValue, "tcgen05.mma instruction descriptor sets a reserved bit");
-      if (id >> 30) refuse("the instruction descriptor's B-reuse shift (bits 30-31) is for .ws only");
+      if ((id >> 30) && !op.ws)
+        refuse("the instruction descriptor's B-reuse shift (bits 30-31) is for .ws only");
       if (id >> 29 & 1) refuse("K = 64 for 8-bit types (instruction descriptor bit 29) is sm_107f's");
     }
     // Element types by kind, and K: 256 bits of an 8-bit-container row.
@@ -6886,8 +6895,11 @@ class Interpreter {
       if ((sv == 2 && (sfa_id % 2 || sfb_id % 2)) || (sv == 4 && (sfa_id || sfb_id))) bad();
     }
     const uint32_t G = op.cta_group;
+    // .ws (Table 48): M = 32, 64 or 128 by N = 64, 128 or 256; sparse, N up
+    // to 128.
     const bool shape_ok =
-        mx ? (G == 1 ? M == 128 && N >= 8 && N <= 256 && N % 8 == 0
+        op.ws ? G == 1 && (M == 32 || M == 64 || M == 128) && (N == 64 || N == 128 || (N == 256 && !sp))
+        : mx ? (G == 1 ? M == 128 && N >= 8 && N <= 256 && N % 8 == 0
                      : (M == 128 || M == 256) && N >= 16 && N <= 256 && N % 16 == 0)
         : G == 1 ? (M == 64 || M == 128) && N >= 8 && N <= 256 && N % 8 == 0 &&
                        !(d_int && M == 128 && N % 16)
@@ -6897,6 +6909,14 @@ class Interpreter {
                "tcgen05.mma.cta_group::" + std::to_string(G) + " of shape M=" + std::to_string(M) +
                    " N=" + std::to_string(N) + ", which Table 48 does not define");
     if (op.a_tmem && trans_a) bad();
+    // Below M = 128 the ISA draws only D's .ws layouts (E and G), not where A
+    // or the sparsity metadata sit in Tensor Memory.
+    if (op.ws && M < 128 && op.a_tmem)
+      refuse(".ws with A in Tensor Memory at M = " + std::to_string(M) +
+             ": the ISA does not draw A's layout for it (layouts E and G are D's)");
+    if (op.ws && M < 128 && sp)
+      refuse(".ws.sp at M = " + std::to_string(M) +
+             ": figures 287-292 place the sparsity metadata for M = 64 without .ws and for M >= 128 only");
 
     const std::vector<const BlockCtx*> ctas = tcgen05_ctas(ctx, ins, G);
     const uint32_t Mloc = M / G, Nloc = N / G;
@@ -6907,9 +6927,17 @@ class Interpreter {
     // 16-31 of each warp's quarter), A (M=256 over a pair) and B (M=128 over a
     // pair, the upper half of N in lanes 64-127).
     // Sparse A over a pair with M = 128 is layout C instead of B: 64 rows
-    // a CTA, placed as layout F places its 64 (figures 215-216).
-    const bool layout_b = G == 2 && M == 128 && !sp;
-    const bool layout_f = (G == 1 && M == 64) || (G == 2 && M == 128 && sp);
+    // a CTA, placed as layout F places its 64 (figures 215-216). .ws spreads
+    // N over the idle lanes instead: layout E (M = 64) puts N's upper half
+    // in lanes 64-127 as B does, and layout G (M = 32) its quarters in each
+    // warp's 32 (figures 219 and 223; CUTLASS's tmem_frg_ws agrees).
+    // Figures 220 and 224 address those regions at lanes 0 and 32 only, but
+    // a warp reaches only its own quarter of the lanes (9.7.18.5), so those
+    // can only be the figures' slip.
+    const bool layout_b = (G == 2 && M == 128 && !sp) || (op.ws && M == 64);
+    const bool layout_g = op.ws && M == 32;
+    const bool layout_f = !op.ws && ((G == 1 && M == 64) || (G == 2 && M == 128 && sp));
+    const uint32_t n_parts = layout_b ? 2 : layout_g ? 4 : 1;
     auto lane_align_ok = [&](uint32_t l) { return layout_f ? (l == 0 || l == 16) : l == 0; };
     if (!lane_align_ok(d_lane0))
       ctx_fail(ins, li, Err::InvalidValue,
@@ -6918,10 +6946,9 @@ class Interpreter {
                    (layout_f ? " or 16" : ""));
     auto d_pos = [&](uint32_t m, uint32_t n, uint32_t lane0, uint32_t* dl, uint32_t* dc) {
       if (layout_f) { *dl = (m / 16) * 32 + m % 16 + lane0; *dc = n; }
-      else if (layout_b) { *dl = m + 64 * (n / (N / 2)); *dc = n % (N / 2); }
-      else { *dl = m; *dc = n; }
+      else { *dl = m + 128 / n_parts * (n / (N / n_parts)); *dc = n % (N / n_parts); }
     };
-    const uint32_t d_cols = layout_b ? N / 2 : N;
+    const uint32_t d_cols = N / n_parts;
     for (const BlockCtx* c : ctas)
       for (uint32_t col = d_col0; col < d_col0 + d_cols; ++col)
         if (col >= TensorMemory::kCols || !tmem_of(*c).allocated(col))
@@ -6966,14 +6993,89 @@ class Interpreter {
     // B: K x N, CTA v supplying columns [v*Nloc, (v+1)*Nloc) from its own
     // shared memory at the descriptor's offsets (the peer's half of a pair
     // sits at the same offsets there).
+    //
+    // .ws's zero-column mask descriptor (9.7.18.4.3) zeroes whole columns of B
+    // and shifts which columns are read: MMA column n reads B's column
+    // n + shift. The mask is one sub-mask per N / 1, 2 or 4 columns as M is
+    // 128, 64 or 32, each a run of fs_i's value, sc_i bits short, then runs
+    // alternating. The ISA's four worked examples make a run of 1s (zeroed
+    // columns) Skip Span + 1 long and a run of 0s Use Span + 1 long -- as the
+    // names say, though Table 54's one-line descriptions have them the other
+    // way round; the examples are what is followed here.
+    std::vector<uint8_t> zero_col(N, 0);
+    uint32_t col_shift = 0;
+    if (op.has_zero_mask) {
+      const uint64_t zm = value(op.zero_mask);
+      if ((zm >> 36 & 7) || (zm >> 62))
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "tcgen05.mma.ws zero-column mask descriptor sets a reserved bit (36-38 or 62-63)");
+      col_shift = zm >> 56 & 0x3F;
+      if (col_shift > (M == 32 ? 16u : 32u))
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "tcgen05.mma.ws column shift " + std::to_string(col_shift) + " is over the " +
+                     (M == 32 ? "16" : "32") + " allowed at M = " + std::to_string(M) + " (Table 54)");
+      if (zm >> 39 & 1) {
+        const uint32_t subs = M == 128 ? 1 : M == 64 ? 2 : 4, width = N / subs;
+        const uint32_t run1 = (zm >> 40 & 0xFF) + 1, run0 = (zm >> 48 & 0xFF) + 1;
+        for (uint32_t i = 0; i < subs; ++i) {
+          bool v = zm >> (32 + i) & 1;
+          const uint32_t sc = zm >> (8 * i) & 0xFF;
+          if (sc >= (v ? run1 : run0))
+            refuse("zero-column sub-mask " + std::to_string(i) + "'s start count " + std::to_string(sc) +
+                   " skips its whole first run; the ISA's examples never do, and do not say what follows");
+          uint32_t left = (v ? run1 : run0) - sc;
+          for (uint32_t b = 0; b < width; ++b) {
+            zero_col[i * width + b] = v;
+            if (--left == 0) {
+              v = !v;
+              left = v ? run1 : run0;
+            }
+          }
+        }
+      }
+    }
+    const uint64_t b_desc_bits = value(op.b_desc);
+    // .ws's collector buffers. Reuse is permission (the tensor core may
+    // reload B anyway), so B is read from memory every time; what is checked
+    // is that a ::use or ::lastuse follows a fill of the same B that no
+    // ::lastuse or ::discard has ended -- otherwise the hardware may
+    // multiply by whatever the buffer holds.
+    if (op.ws) {
+      auto& cb = tmem_of(ctx).collector_b[op.collector_buf];
+      const uint32_t b_fields = (id >> 10 & 7) | (id >> 16 & 1) << 3 | (id >> 17 & 0x3F) << 4;
+      const std::string name = ".collector::b" + std::to_string(op.collector_buf);
+      switch (op.collector) {
+        case Tcgen05Collector::Fill:
+          cb = {true, b_desc_bits, b_fields};
+          break;
+        case Tcgen05Collector::Use:
+        case Tcgen05Collector::LastUse:
+          if (!cb.valid)
+            ctx_fail(ins, li, Err::InvalidValue,
+                     "tcgen05.mma.ws" + name + (op.collector == Tcgen05Collector::Use ? "::use" : "::lastuse") +
+                         " with no fill of that buffer still valid (9.7.18.10.10.3)");
+          if (cb.desc != b_desc_bits || cb.b_fields != b_fields)
+            ctx_fail(ins, li, Err::InvalidValue,
+                     "tcgen05.mma.ws" + name + " reuses a buffer filled from a different B (descriptor, "
+                     "type, transpose or N); the tensor core may multiply by the filled one");
+          if (op.collector == Tcgen05Collector::LastUse) cb.valid = false;
+          break;
+        case Tcgen05Collector::Discard:
+          cb.valid = false;
+          break;
+      }
+    }
     std::vector<double> B(size_t{K} * N);
     {
-      const WgmmaDesc d = decode_tcgen05_desc(ins, value(op.b_desc));
+      const WgmmaDesc d = decode_tcgen05_desc(ins, b_desc_bits);
       for (uint32_t v = 0; v < G; ++v) {
         const uint32_t rank = cluster_rank_of(*ctas[v]);
         for (uint32_t n = 0; n < Nloc; ++n)
           for (uint32_t k = 0; k < K; ++k)
-            B[size_t{k} * N + v * Nloc + n] = sb * tc_decode(eb2.t, smem_raw(d, !trans_b, eb2, rank, n, k));
+            B[size_t{k} * N + v * Nloc + n] =
+                zero_col[v * Nloc + n]
+                    ? 0.0
+                    : sb * tc_decode(eb2.t, smem_raw(d, !trans_b, eb2, rank, n + col_shift, k));
       }
     }
     // A, by the Tensor Memory lane each D row is written to: from shared

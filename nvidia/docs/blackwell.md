@@ -127,6 +127,54 @@ of K. (Table 68's six- and eight-factor rows are sm_103/107's larger K,
 which is refused; CUTLASS's sparse nvf4 GEMMs issue `.block16` over
 K = 128 with one factor per 32, which is what settled the reading.)
 
+### Weight-stationary: tcgen05.mma.ws
+
+`.ws` is `.cta_group::1` only, for `.kind::f16`, `tf32`, `f8f6f4` and `i8`,
+at M = 32, 64 or 128 by N = 64, 128 or 256 (N up to 128 with `.sp`), per
+Table 48.
+
+- **Where D goes.** Below M = 128, `.ws` spreads N over the lanes the rows
+  leave idle:
+  - Layout E (M = 64) puts N's upper half in lanes 64-127, at the same
+    columns.
+  - Layout G (M = 32) puts N's four quarters in the four warps' lanes.
+  - M = 128 is layout D.
+
+  Figures 219 and 223 draw them that way, and so do CUTLASS's `tmem_frg_ws`
+  and tilelang's layouts. Figures 220 and 224 address the regions at lanes 0
+  and 32, but a warp reaches only its own quarter of the lanes, so those
+  addresses can only be a slip in the figures.
+- **The zero-column mask descriptor** (9.7.18.4.3) is the optional last
+  operand.
+  - It zeroes whole columns of B, and MMA column n reads B's column
+    n + shift.
+  - Each sub-mask (one per N/1, N/2 or N/4 columns as M is 128, 64 or 32) is a
+    first run of `fs_i`'s value, `sc_i` bits short, then alternating runs.
+  - The ISA's four worked examples make a run of 1s (zeroed columns) Skip
+    Span + 1 long and a run of 0s Use Span + 1 long, as the names say. Table
+    54's one-line descriptions have the two the other way round; the examples
+    are what is followed here.
+  - A start count that skips a whole first run is refused, because no example
+    shows one. So is a shift over 32 (16 at M = 32).
+- **Collector buffers.** `.collector::b0-b3::fill/use/lastuse/discard`
+  (default `b0::discard`) give the tensor core permission to keep B. Reuse
+  is optional on the hardware, so B is read from shared memory every time,
+  which is one of the allowed behaviours.
+  - What is checked: a `::use` or `::lastuse` must follow a fill of the same
+    B (descriptor, type, transpose, N) that no `::lastuse` or `::discard` has
+    ended.
+  - Otherwise the hardware may multiply by whatever the buffer holds, so this
+    stops with an error.
+  - The instruction descriptor's bits 30-31 (the most shift a reuse may use)
+    are accepted.
+- **Not drawn by the ISA, and refused:**
+  - A from Tensor Memory below M = 128: layouts E and G are D's layouts, not
+    A's.
+  - `.ws.sp` below M = 128: figures 287-292 place the metadata for M = 64
+    without `.ws` and for M >= 128 only.
+
+  Both are allowed at M = 128, where the layouts are the usual ones.
+
 ### tcgen05.cp
 
 One thread copies a matrix from shared memory (a descriptor, K-major, no
@@ -194,11 +242,16 @@ before waiting for it is not caught here.
 
 ## Refused by name
 
-`.ws` (weight-stationary), `.ashift`, `tcgen05.ld.red`
-(sm_103/sm_110), the sm_107 additions (`kind::ti16`, `decompress::lut`), and
-TMA's `.im2col::w` modes: the ISA shows their halo walk only in figures that
-leave open where `::w::128`'s halos come from and whether a halo crosses into
-the next image, and nothing to check against (CUTLASS included) uses them.
+- **`.ashift`.** The ISA says only that A's rows shift down one "except for
+  the last row". It doesn't say whether the MMA reads A before or after the
+  shift, whether rows cross the 32-lane quarters, or what row 0 holds. No
+  public code uses it to check against.
+- **`tcgen05.ld.red`** (sm_103/sm_110).
+- **The sm_107 additions** (`kind::ti16`, `decompress::lut`).
+- **TMA's `.im2col::w` modes.** The ISA shows their halo walk only in
+  figures. They leave open where `::w::128`'s halos come from and whether a
+  halo crosses into the next image. No kernel code uses them to check
+  against: CUTLASS doesn't, and cuda-python only wraps the encode call.
 
 ## How it is checked
 
@@ -207,5 +260,10 @@ the next image, and nothing to check against (CUTLASS included) uses them.
   the ISA's CuTe canonical layouts, for each kind, both majors, the swizzles,
   A from Tensor Memory, the accumulate/scale/negate/mask options, and both
   pair layouts.
+- `.ws`:
+  - layouts E and G, as figures 219 and 223 draw them;
+  - the ISA's zero-column mask examples 3 and 4 bit for bit;
+  - the collector rules;
+  - the `.ws` forms, which match what CUDA 13's `ptxas` assembles.
 - `nvidia/tests/e2e/run_cutlass_sm100.sh`: CUTLASS's own SM100 GEMM unit tests,
   unmodified, on a simulated B200, checked against CUTLASS's host reference.

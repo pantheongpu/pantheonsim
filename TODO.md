@@ -955,8 +955,10 @@ what is done.
   nvidia/docs/blackwell.md), attribute
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle's 8-byte-flip
-  variant (Blackwell); tcgen05's weight-stationary MMAs and `.ashift`; and
-  inline-asm-only instructions. (`wgmma`, TMA,
+  variant (Blackwell); tcgen05's `.ashift`, and `.ws` with A in Tensor Memory
+  or `.sp` below M = 128 (the ISA draws neither layout); and inline-asm-only
+  instructions. (tcgen05's weight-stationary `.ws` MMAs are done -- see
+  nvidia/docs/blackwell.md.) (`wgmma`, TMA,
   the mbarrier transaction counts, `barrier.cluster` and distributed shared
   memory are done -- see "Hopper's warpgroup MMA", "TMA and clusters" and
   "Distributed shared memory" above. Textures, surfaces and grid sync are

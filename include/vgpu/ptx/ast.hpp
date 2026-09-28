@@ -363,6 +363,7 @@ enum class Tcgen05Shape { S32x32b, S16x64b, S16x128b, S16x256b, S16x32bx2 };
 enum class Tcgen05MmaKind { F16, TF32, F8F6F4, I8, MXF8F6F4, MXF4, MXF4NVF4 };
 // tcgen05.cp shapes (9.7.18.9.2): lanes x bits a lane.
 enum class Tcgen05CpShape { S128x256b, S4x256b, S128x128b, S64x128b, S32x128b };
+enum class Tcgen05Collector { Fill, Use, LastUse, Discard };
 struct OpTcgen05 {
   Tcgen05Kind kind = Tcgen05Kind::Mma;
   uint32_t cta_group = 1;          // .cta_group::1 or ::2
@@ -401,6 +402,14 @@ struct OpTcgen05 {
   Tcgen05CpShape cp_shape = Tcgen05CpShape::S128x256b;
   int cp_multicast = 0;        // 0 none, 4 .warpx4, 2 .warpx2::02_13, 3 .warpx2::01_23
   int cp_decompress = 0;       // .b8x16 from .b4x16_p64 (4) or .b6x16_p32 (6)
+  // tcgen05.mma.ws (weight-stationary): its B collector buffer (0-3) and what
+  // it does with it -- .collector::bN::fill/use/lastuse/discard, b0::discard
+  // when absent -- and the optional zero-column mask descriptor.
+  bool ws = false;
+  uint32_t collector_buf = 0;
+  Tcgen05Collector collector = Tcgen05Collector::Discard;
+  bool has_zero_mask = false;
+  Operand zero_mask;
   Operand d_tmem, a, b_desc, idesc, enable_d;
   bool a_tmem = false;
   std::vector<Operand> disable_lanes;
