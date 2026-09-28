@@ -8,14 +8,22 @@ cutlass_tag="v4.8.0"
 gtest_tag="v1.15.2"
 cutlass="${CUTLASS_DIR:-$build/_deps/cutlass-$cutlass_tag}"
 fetch_into() {  # fetch_into <dir> <url> <tar members...>
+  # A download that fails is a SKIP (no network); an extraction that fails is
+  # this script's bug -- tar exits 2 when a member pattern matches nothing,
+  # and treating that as "no network" once turned two e2e tests into silent
+  # SKIPs that ctest counted as passes.
   local dir="$1" url="$2" tmp="$1.tmp.$$"
   shift 2
   mkdir -p "$tmp"
-  if ! curl -fsSL "$url" | tar -xz -C "$tmp" --strip-components=1 --no-wildcards-match-slash \
-       --wildcards "$@" 2>/dev/null; then
-    rm -rf "$tmp"
+  if ! curl -fsSL "$url" -o "$tmp.tar.gz"; then
+    rm -rf "$tmp" "$tmp.tar.gz"
     return 1
   fi
+  if ! tar -xzf "$tmp.tar.gz" -C "$tmp" --strip-components=1 --no-wildcards-match-slash --wildcards "$@"; then
+    rm -rf "$tmp" "$tmp.tar.gz"
+    echo "FAIL: extracting $url failed (a member pattern that matches nothing?)"; exit 1
+  fi
+  rm -f "$tmp.tar.gz"
   rm -rf "$dir"
   mv "$tmp" "$dir"
 }
@@ -53,7 +61,6 @@ if [[ ! -f "$cutlass/test/unit/conv/device_3x/testbed_conv.hpp" ||
        'cutlass-*/test/unit/conv/device_3x/fprop/sm90_*' \
        'cutlass-*/test/unit/conv/device_3x/*/sm100_*' \
        'cutlass-*/examples/common/*' 'cutlass-*/examples/77_blackwell_fmha/*' \
-       'cutlass-*/examples/77_blackwell_fmha/*/*' \
        'cutlass-*/test/unit/gemm/device/*.h' 'cutlass-*/test/unit/gemm/device/*.hpp' \
        'cutlass-*/test/unit/gemm/device/gemm_f16t_f16n_f32t_tensor_op_f32_sparse_sm80.cu' \
        'cutlass-*/test/unit/gemm/device/sm90_gemm_f16_f16_f16_tensor_op_f32_group_gemm.cu' \
