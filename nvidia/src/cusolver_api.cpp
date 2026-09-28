@@ -639,3 +639,447 @@ VGPU_SYEVD(D, double)
   }
 VGPU_GESVD(S, float)
 VGPU_GESVD(D, double)
+
+/* ---- the 64-bit generic API (cusolverDnX*), Jacobi SVD and eigensolvers,
+        batched Cholesky: what PyTorch's torch.linalg calls ----
+   The 64-bit forms take the element type as a cudaDataType; real float and
+   double are supported, and the complex types are refused with
+   CUSOLVER_STATUS_NOT_SUPPORTED. The algorithms are the ones above. Jacobi
+   SVD and eigensolvers return what the one-sided Jacobi and the symmetric
+   solver here compute, which converge to the same decompositions; their
+   tolerance and sweep settings are accepted and have nothing to tune. */
+
+namespace {
+
+struct Params { int dummy = 0; };
+struct JacobiInfo { double tol = 0; int sweeps = 100; int sort = 1; };
+
+// Runs body<T> for a real element type named by a cudaDataType.
+template <class F>
+cusolverStatus_t by_type(cudaDataType t, F&& body) {
+  if (t == CUDA_R_32F) return body(float{});
+  if (t == CUDA_R_64F) return body(double{});
+  return CUSOLVER_STATUS_NOT_SUPPORTED;
+}
+
+// Extends the first k orthonormal columns of the column-major m x m matrix Q
+// to a full orthonormal basis, by Gram-Schmidt against the standard basis --
+// what a full U or V needs past the matrix's rank.
+void complete_basis(std::vector<double>& Q, int m, int k) {
+  int filled = k;
+  for (int e = 0; e < m && filled < m; ++e) {
+    std::vector<double> x(m, 0.0);
+    x[e] = 1.0;
+    for (int pass = 0; pass < 2; ++pass)
+      for (int c = 0; c < filled; ++c) {
+        double d = 0;
+        for (int i = 0; i < m; ++i) d += Q[(size_t)c * m + i] * x[i];
+        for (int i = 0; i < m; ++i) x[i] -= d * Q[(size_t)c * m + i];
+      }
+    double nrm = 0;
+    for (double t : x) nrm += t * t;
+    nrm = std::sqrt(nrm);
+    if (nrm < 1e-8) continue;
+    for (int i = 0; i < m; ++i) Q[(size_t)filled * m + i] = x[i] / nrm;
+    ++filled;
+  }
+}
+
+// The SVD of a column-major m x n matrix of any shape: S (k = min(m, n)
+// values, descending), U (m x ucols) and V (n x vcols), each column-major and
+// packed, with ucols/vcols = k (economy) or m/n (full). A zero singular value's
+// vector, and every column past k, completes an orthonormal basis.
+void svd_any(const Mat& a, int m, int n, bool full, std::vector<double>* S, std::vector<double>* U,
+             std::vector<double>* V) {
+  const bool wide = m < n;
+  const int r = wide ? n : m, c = wide ? m : n;   // factor the tall one: r >= c
+  std::vector<double> t((size_t)r * c), s, v;
+  for (int j = 0; j < c; ++j)
+    for (int i = 0; i < r; ++i) t[(size_t)j * r + i] = wide ? a(j, i) : a(i, j);
+  svd(t, r, c, &s, &v);   // t becomes (left vectors x s), v is c x c
+  std::vector<double> L((size_t)r * r, 0.0), R((size_t)c * c, 0.0);
+  int good = 0;
+  for (int j = 0; j < c; ++j) {
+    if (s[j] <= 1e-300) break;
+    for (int i = 0; i < r; ++i) L[(size_t)j * r + i] = t[(size_t)j * r + i] / s[j];
+    ++good;
+  }
+  complete_basis(L, r, good);
+  R = v;
+  const int k = c;
+  *S = std::vector<double>(s.begin(), s.begin() + k);
+  // For a wide matrix the roles swap: A = R S L^T.
+  const std::vector<double>& Umat = wide ? R : L;
+  const std::vector<double>& Vmat = wide ? L : R;
+  const int ucols = full ? m : k, vcols = full ? n : k;
+  U->assign((size_t)m * ucols, 0.0);
+  V->assign((size_t)n * vcols, 0.0);
+  for (int j = 0; j < ucols; ++j)
+    for (int i = 0; i < m; ++i) (*U)[(size_t)j * m + i] = Umat[(size_t)j * m + i];
+  for (int j = 0; j < vcols; ++j)
+    for (int i = 0; i < n; ++i) (*V)[(size_t)j * n + i] = Vmat[(size_t)j * n + i];
+}
+
+// Writes a packed column-major rows x cols matrix into device memory with a
+// leading dimension.
+template <class T> bool save_ld(void* dev, const std::vector<double>& packed, int rows, int cols, int ld) {
+  std::vector<double> out((size_t)ld * cols, 0.0);
+  if (cols > 0) {
+    // Keep what the caller had between rows and ld.
+    Mat keep;
+    if (!load<T>(dev, (size_t)ld * cols, &keep, ld)) return false;
+    out = keep.v;
+  }
+  for (int j = 0; j < cols; ++j)
+    for (int i = 0; i < rows; ++i) out[(size_t)j * ld + i] = packed[(size_t)j * rows + i];
+  return save<T>(dev, out);
+}
+
+// The symmetric matrix one triangle of A holds, as the solver needs it.
+std::vector<double> symmetric(const Mat& a, int n, cublasFillMode_t uplo) {
+  std::vector<double> full((size_t)n * n);
+  for (int c = 0; c < n; ++c)
+    for (int r = 0; r < n; ++r) {
+      const bool take = uplo == CUBLAS_FILL_MODE_LOWER ? r >= c : r <= c;
+      full[(size_t)c * n + r] = take ? a(r, c) : a(c, r);
+    }
+  return full;
+}
+
+template <class T>
+cusolverStatus_t eig_into(void* A, int64_t n, int64_t lda, void* W, cusolverEigMode_t jobz, cublasFillMode_t uplo,
+                          int* info) {
+  Mat a;
+  if (!load<T>(A, (size_t)lda * n, &a, (int)lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+  std::vector<double> full = symmetric(a, (int)n, uplo), w, v;
+  syev(full, (int)n, &w, &v);
+  set_info(info, 0);
+  if (!save<T>(W, w)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+  if (jobz == CUSOLVER_EIG_MODE_VECTOR) {
+    for (int c = 0; c < n; ++c)
+      for (int r = 0; r < n; ++r) a(r, c) = v[(size_t)c * n + r];
+    if (!save<T>(A, a.v)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+  }
+  return CUSOLVER_STATUS_SUCCESS;
+}
+
+template <class T>
+cusolverStatus_t svd_into(cusolverEigMode_t jobz, bool full, int m, int n, const void* A, int lda, void* S, void* U,
+                          int ldu, void* V, int ldv, int* info) {
+  Mat a;
+  if (!load<T>(A, (size_t)lda * n, &a, lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+  std::vector<double> s, u, v;
+  svd_any(a, m, n, full, &s, &u, &v);
+  set_info(info, 0);
+  if (!save<T>(S, s)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+  if (jobz == CUSOLVER_EIG_MODE_VECTOR) {
+    const int k = std::min(m, n);
+    if (U && !save_ld<T>(U, u, m, full ? m : k, ldu)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+    if (V && !save_ld<T>(V, v, n, full ? n : k, ldv)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+  }
+  return CUSOLVER_STATUS_SUCCESS;
+}
+
+// A device array of device pointers, as the batched forms take.
+template <class T> std::vector<T*> pointers(T* const* dev_array, int count) {
+  std::vector<T*> h(count > 0 ? count : 0);
+  if (count > 0) cudaMemcpy(h.data(), dev_array, count * sizeof(T*), cudaMemcpyDeviceToHost);
+  return h;
+}
+
+}  // namespace
+
+VGPU_EXPORT cusolverStatus_t cusolverDnCreateParams(cusolverDnParams_t* p) {
+  if (!p) return CUSOLVER_STATUS_INVALID_VALUE;
+  *p = reinterpret_cast<cusolverDnParams_t>(track(new Params()));
+  return CUSOLVER_STATUS_SUCCESS;
+}
+VGPU_EXPORT cusolverStatus_t cusolverDnDestroyParams(cusolverDnParams_t p) {
+  if (!known(p)) return CUSOLVER_STATUS_INVALID_VALUE;
+  untrack(p);
+  delete reinterpret_cast<Params*>(p);
+  return CUSOLVER_STATUS_SUCCESS;
+}
+// One algorithm each here, so the choice has nothing to select.
+VGPU_EXPORT cusolverStatus_t cusolverDnSetAdvOptions(cusolverDnParams_t p, cusolverDnFunction_t, cusolverAlgMode_t) {
+  return known(p) ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INVALID_VALUE;
+}
+
+static size_t x_workspace(int64_t n) { return (size_t)std::max<int64_t>(1, n) * 64 * sizeof(double); }
+
+VGPU_EXPORT cusolverStatus_t cusolverDnXpotrf_bufferSize(cusolverDnHandle_t h, cusolverDnParams_t, cublasFillMode_t,
+                                                         int64_t n, cudaDataType, const void*, int64_t, cudaDataType,
+                                                         size_t* dev, size_t* host) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (dev) *dev = x_workspace(n);
+  if (host) *host = 0;
+  return CUSOLVER_STATUS_SUCCESS;
+}
+VGPU_EXPORT cusolverStatus_t cusolverDnXpotrf(cusolverDnHandle_t h, cusolverDnParams_t, cublasFillMode_t uplo,
+                                              int64_t n, cudaDataType type, void* A, int64_t lda, cudaDataType, void*,
+                                              size_t, void*, size_t, int* info) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (n < 0 || lda < std::max<int64_t>(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
+  return by_type(type, [&](auto t) {
+    using T = decltype(t);
+    Mat a;
+    if (!load<T>(A, (size_t)lda * n, &a, (int)lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+    const int rc = potrf(a, (int)n, uplo == CUBLAS_FILL_MODE_LOWER);
+    set_info(info, rc);
+    if (rc == 0 && !save<T>(A, a.v)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+    return CUSOLVER_STATUS_SUCCESS;
+  });
+}
+VGPU_EXPORT cusolverStatus_t cusolverDnXpotrs(cusolverDnHandle_t h, cusolverDnParams_t, cublasFillMode_t uplo,
+                                              int64_t n, int64_t nrhs, cudaDataType ta, const void* A, int64_t lda,
+                                              cudaDataType tb, void* B, int64_t ldb, int* info) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (ta != tb) return CUSOLVER_STATUS_NOT_SUPPORTED;
+  return by_type(ta, [&](auto t) {
+    using T = decltype(t);
+    Mat a, b;
+    if (!load<T>(A, (size_t)lda * n, &a, (int)lda) || !load<T>(B, (size_t)ldb * nrhs, &b, (int)ldb))
+      return CUSOLVER_STATUS_EXECUTION_FAILED;
+    if (uplo == CUBLAS_FILL_MODE_LOWER) {
+      trsm_lower(a, b, (int)n, (int)nrhs, false, false);
+      trsm_lower(a, b, (int)n, (int)nrhs, false, true);
+    } else {
+      trsm_upper(a, b, (int)n, (int)nrhs, false, true);
+      trsm_upper(a, b, (int)n, (int)nrhs, false, false);
+    }
+    set_info(info, 0);
+    return save<T>(B, b.v) ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_EXECUTION_FAILED;
+  });
+}
+
+VGPU_EXPORT cusolverStatus_t cusolverDnXgeqrf_bufferSize(cusolverDnHandle_t h, cusolverDnParams_t, int64_t m,
+                                                         int64_t n, cudaDataType, const void*, int64_t, cudaDataType,
+                                                         const void*, cudaDataType, size_t* dev, size_t* host) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (dev) *dev = x_workspace(std::max(m, n));
+  if (host) *host = 0;
+  return CUSOLVER_STATUS_SUCCESS;
+}
+VGPU_EXPORT cusolverStatus_t cusolverDnXgeqrf(cusolverDnHandle_t h, cusolverDnParams_t, int64_t m, int64_t n,
+                                              cudaDataType ta, void* A, int64_t lda, cudaDataType ttau, void* tau,
+                                              cudaDataType, void*, size_t, void*, size_t, int* info) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (m < 0 || n < 0 || lda < std::max<int64_t>(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (ta != ttau) return CUSOLVER_STATUS_NOT_SUPPORTED;
+  return by_type(ta, [&](auto t) {
+    using T = decltype(t);
+    Mat a;
+    if (!load<T>(A, (size_t)lda * n, &a, (int)lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+    std::vector<double> tv;
+    geqrf(a, (int)m, (int)n, &tv);
+    set_info(info, 0);
+    if (!save<T>(A, a.v) || !save<T>(tau, tv)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+    return CUSOLVER_STATUS_SUCCESS;
+  });
+}
+
+VGPU_EXPORT cusolverStatus_t cusolverDnXsyevd_bufferSize(cusolverDnHandle_t h, cusolverDnParams_t, cusolverEigMode_t,
+                                                         cublasFillMode_t, int64_t n, cudaDataType, const void*,
+                                                         int64_t, cudaDataType, const void*, cudaDataType,
+                                                         size_t* dev, size_t* host) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (dev) *dev = x_workspace(n);
+  if (host) *host = 0;
+  return CUSOLVER_STATUS_SUCCESS;
+}
+VGPU_EXPORT cusolverStatus_t cusolverDnXsyevd(cusolverDnHandle_t h, cusolverDnParams_t, cusolverEigMode_t jobz,
+                                              cublasFillMode_t uplo, int64_t n, cudaDataType ta, void* A, int64_t lda,
+                                              cudaDataType tw, void* W, cudaDataType, void*, size_t, void*, size_t,
+                                              int* info) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (n < 0 || lda < std::max<int64_t>(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (ta != tw) return CUSOLVER_STATUS_NOT_SUPPORTED;
+  return by_type(ta, [&](auto t) { return eig_into<decltype(t)>(A, n, lda, W, jobz, uplo, info); });
+}
+
+/* Jacobi SVD */
+VGPU_EXPORT cusolverStatus_t cusolverDnCreateGesvdjInfo(gesvdjInfo_t* info) {
+  if (!info) return CUSOLVER_STATUS_INVALID_VALUE;
+  *info = reinterpret_cast<gesvdjInfo_t>(track(new JacobiInfo()));
+  return CUSOLVER_STATUS_SUCCESS;
+}
+VGPU_EXPORT cusolverStatus_t cusolverDnDestroyGesvdjInfo(gesvdjInfo_t info) {
+  if (!known(info)) return CUSOLVER_STATUS_INVALID_VALUE;
+  untrack(info);
+  delete reinterpret_cast<JacobiInfo*>(info);
+  return CUSOLVER_STATUS_SUCCESS;
+}
+VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdjSetTolerance(gesvdjInfo_t info, double tol) {
+  if (!known(info)) return CUSOLVER_STATUS_INVALID_VALUE;
+  reinterpret_cast<JacobiInfo*>(info)->tol = tol;
+  return CUSOLVER_STATUS_SUCCESS;
+}
+VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdjSetMaxSweeps(gesvdjInfo_t info, int sweeps) {
+  if (!known(info)) return CUSOLVER_STATUS_INVALID_VALUE;
+  reinterpret_cast<JacobiInfo*>(info)->sweeps = sweeps;
+  return CUSOLVER_STATUS_SUCCESS;
+}
+// Singular values come back sorted, descending, either way.
+VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdjSetSortEig(gesvdjInfo_t info, int sort) {
+  if (!known(info)) return CUSOLVER_STATUS_INVALID_VALUE;
+  reinterpret_cast<JacobiInfo*>(info)->sort = sort;
+  return CUSOLVER_STATUS_SUCCESS;
+}
+
+#define VGPU_JACOBI(P, T)                                                                                            \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdj_bufferSize(cusolverDnHandle_t h, cusolverEigMode_t, int, int m, \
+                                                                int n, const T*, int, const T*, const T*, int,       \
+                                                                const T*, int, int* lwork, gesvdjInfo_t) {           \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
+    if (lwork) *lwork = lwork_hint(std::max(m, n));                                                                  \
+    return CUSOLVER_STATUS_SUCCESS;                                                                                  \
+  }                                                                                                                  \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdj(cusolverDnHandle_t h, cusolverEigMode_t jobz, int econ, int m,  \
+                                                     int n, T* A, int lda, T* S, T* U, int ldu, T* V, int ldv, T*,   \
+                                                     int, int* info, gesvdjInfo_t) {                                 \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
+    if (m < 0 || n < 0 || lda < std::max(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;                                \
+    return svd_into<T>(jobz, !econ, m, n, A, lda, S, U, ldu, V, ldv, info);                                          \
+  }                                                                                                                  \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdjBatched_bufferSize(                                              \
+      cusolverDnHandle_t h, cusolverEigMode_t, int m, int n, const T*, int, const T*, const T*, int, const T*, int,  \
+      int* lwork, gesvdjInfo_t, int) {                                                                               \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
+    if (lwork) *lwork = lwork_hint(std::max(m, n));                                                                  \
+    return CUSOLVER_STATUS_SUCCESS;                                                                                  \
+  }                                                                                                                  \
+  /* Each matrix at A + b * lda * n; full U (m x m) and V (n x n) per matrix, as the batched form computes. */     \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdjBatched(cusolverDnHandle_t h, cusolverEigMode_t jobz, int m,     \
+                                                            int n, T* A, int lda, T* S, T* U, int ldu, T* V, int ldv, \
+                                                            T*, int, int* info, gesvdjInfo_t, int batch) {           \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
+    if (m < 0 || n < 0 || batch < 0 || lda < std::max(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;                   \
+    const int k = std::min(m, n);                                                                                    \
+    for (int b = 0; b < batch; ++b) {                                                                                \
+      const cusolverStatus_t st = svd_into<T>(jobz, true, m, n, A + (size_t)b * lda * n, lda, S + (size_t)b * k,     \
+                                              U ? U + (size_t)b * ldu * m : nullptr, ldu,                            \
+                                              V ? V + (size_t)b * ldv * n : nullptr, ldv, info ? info + b : nullptr);\
+      if (st != CUSOLVER_STATUS_SUCCESS) return st;                                                                  \
+    }                                                                                                                \
+    return CUSOLVER_STATUS_SUCCESS;                                                                                  \
+  }                                                                                                                  \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdaStridedBatched_bufferSize(                                       \
+      cusolverDnHandle_t h, cusolverEigMode_t, int, int m, int n, const T*, int, long long, const T*, long long,     \
+      const T*, int, long long, const T*, int, long long, int* lwork, int) {                                         \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
+    if (lwork) *lwork = lwork_hint(std::max(m, n));                                                                  \
+    return CUSOLVER_STATUS_SUCCESS;                                                                                  \
+  }                                                                                                                  \
+  /* The leading `rank` singular triplets of each tall matrix; the residual's norm is reported as zero, since the   \
+     decomposition here is not approximate. */                                                                      \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdaStridedBatched(                                                  \
+      cusolverDnHandle_t h, cusolverEigMode_t jobz, int rank, int m, int n, const T* A, int lda, long long sA, T* S, \
+      long long sS, T* U, int ldu, long long sU, T* V, int ldv, long long sV, T*, int, int* info, double* nrm,       \
+      int batch) {                                                                                                   \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
+    if (m < n || rank < 1 || rank > n) return CUSOLVER_STATUS_INVALID_VALUE;                                         \
+    for (int b = 0; b < batch; ++b) {                                                                                \
+      Mat a;                                                                                                         \
+      if (!load<T>(A + b * sA, (size_t)lda * n, &a, lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;                   \
+      std::vector<double> s, u, v;                                                                                   \
+      svd_any(a, m, n, false, &s, &u, &v);                                                                           \
+      s.resize(rank);                                                                                                \
+      if (!save<T>(S + b * sS, s)) return CUSOLVER_STATUS_EXECUTION_FAILED;                                          \
+      if (jobz == CUSOLVER_EIG_MODE_VECTOR) {                                                                        \
+        if (!save_ld<T>(U + b * sU, u, m, rank, ldu) || !save_ld<T>(V + b * sV, v, n, rank, ldv))                   \
+          return CUSOLVER_STATUS_EXECUTION_FAILED;                                                                   \
+      }                                                                                                              \
+      if (info) set_info(info + b, 0);                                                                               \
+      if (nrm) nrm[b] = 0.0;                                                                                         \
+    }                                                                                                                \
+    return CUSOLVER_STATUS_SUCCESS;                                                                                  \
+  }                                                                                                                  \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##syevj_bufferSize(cusolverDnHandle_t h, cusolverEigMode_t,              \
+                                                               cublasFillMode_t, int n, const T*, int, const T*,     \
+                                                               int* lwork, syevjInfo_t) {                            \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
+    if (lwork) *lwork = lwork_hint(n);                                                                               \
+    return CUSOLVER_STATUS_SUCCESS;                                                                                  \
+  }                                                                                                                  \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##syevj(cusolverDnHandle_t h, cusolverEigMode_t jobz,                    \
+                                                    cublasFillMode_t uplo, int n, T* A, int lda, T* W, T*, int,      \
+                                                    int* info, syevjInfo_t) {                                        \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
+    if (n < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                                         \
+    return eig_into<T>(A, n, lda, W, jobz, uplo, info);                                                              \
+  }                                                                                                                  \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##syevjBatched_bufferSize(cusolverDnHandle_t h, cusolverEigMode_t,       \
+                                                                      cublasFillMode_t, int n, const T*, int,        \
+                                                                      const T*, int* lwork, syevjInfo_t, int) {      \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
+    if (lwork) *lwork = lwork_hint(n);                                                                               \
+    return CUSOLVER_STATUS_SUCCESS;                                                                                  \
+  }                                                                                                                  \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##syevjBatched(cusolverDnHandle_t h, cusolverEigMode_t jobz,             \
+                                                           cublasFillMode_t uplo, int n, T* A, int lda, T* W, T*,    \
+                                                           int, int* info, syevjInfo_t, int batch) {                 \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
+    if (n < 0 || batch < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                            \
+    for (int b = 0; b < batch; ++b) {                                                                                \
+      const cusolverStatus_t st = eig_into<T>(A + (size_t)b * lda * n, n, lda, W + (size_t)b * n, jobz, uplo,        \
+                                              info ? info + b : nullptr);                                            \
+      if (st != CUSOLVER_STATUS_SUCCESS) return st;                                                                  \
+    }                                                                                                                \
+    return CUSOLVER_STATUS_SUCCESS;                                                                                  \
+  }                                                                                                                  \
+  /* Batched Cholesky: arrays of device pointers, one matrix each. */                                               \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##potrfBatched(cusolverDnHandle_t h, cublasFillMode_t uplo, int n,       \
+                                                           T* Aarray[], int lda, int* infos, int batch) {            \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
+    if (n < 0 || batch < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                            \
+    const auto ptrs = pointers<T>(Aarray, batch);                                                                    \
+    for (int b = 0; b < batch; ++b) {                                                                                \
+      Mat a;                                                                                                         \
+      if (!load<T>(ptrs[b], (size_t)lda * n, &a, lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;                      \
+      const int rc = potrf(a, n, uplo == CUBLAS_FILL_MODE_LOWER);                                                    \
+      set_info(infos + b, rc);                                                                                       \
+      if (rc == 0 && !save<T>(ptrs[b], a.v)) return CUSOLVER_STATUS_EXECUTION_FAILED;                                \
+    }                                                                                                                \
+    return CUSOLVER_STATUS_SUCCESS;                                                                                  \
+  }                                                                                                                  \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##potrsBatched(cusolverDnHandle_t h, cublasFillMode_t uplo, int n,       \
+                                                           int nrhs, T* Aarray[], int lda, T* Barray[], int ldb,     \
+                                                           int* info, int batch) {                                   \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
+    if (nrhs != 1) return CUSOLVER_STATUS_INVALID_VALUE; /* cuSOLVER supports one right-hand side here */           \
+    const auto pa = pointers<T>(Aarray, batch), pb = pointers<T>(Barray, batch);                                     \
+    for (int b = 0; b < batch; ++b) {                                                                                \
+      Mat a, x;                                                                                                      \
+      if (!load<T>(pa[b], (size_t)lda * n, &a, lda) || !load<T>(pb[b], (size_t)ldb * nrhs, &x, ldb))                 \
+        return CUSOLVER_STATUS_EXECUTION_FAILED;                                                                     \
+      if (uplo == CUBLAS_FILL_MODE_LOWER) {                                                                          \
+        trsm_lower(a, x, n, nrhs, false, false);                                                                     \
+        trsm_lower(a, x, n, nrhs, false, true);                                                                      \
+      } else {                                                                                                       \
+        trsm_upper(a, x, n, nrhs, false, true);                                                                      \
+        trsm_upper(a, x, n, nrhs, false, false);                                                                     \
+      }                                                                                                              \
+      if (!save<T>(pb[b], x.v)) return CUSOLVER_STATUS_EXECUTION_FAILED;                                             \
+    }                                                                                                                \
+    set_info(info, 0);                                                                                               \
+    return CUSOLVER_STATUS_SUCCESS;                                                                                  \
+  }
+VGPU_JACOBI(S, float)
+VGPU_JACOBI(D, double)
+
+VGPU_EXPORT cusolverStatus_t cusolverDnCreateSyevjInfo(syevjInfo_t* info) {
+  if (!info) return CUSOLVER_STATUS_INVALID_VALUE;
+  *info = reinterpret_cast<syevjInfo_t>(track(new JacobiInfo()));
+  return CUSOLVER_STATUS_SUCCESS;
+}
+VGPU_EXPORT cusolverStatus_t cusolverDnDestroySyevjInfo(syevjInfo_t info) {
+  if (!known(info)) return CUSOLVER_STATUS_INVALID_VALUE;
+  untrack(info);
+  delete reinterpret_cast<JacobiInfo*>(info);
+  return CUSOLVER_STATUS_SUCCESS;
+}
+VGPU_EXPORT cusolverStatus_t cusolverDnXsyevjSetSortEig(syevjInfo_t info, int sort) {
+  if (!known(info)) return CUSOLVER_STATUS_INVALID_VALUE;
+  reinterpret_cast<JacobiInfo*>(info)->sort = sort;
+  return CUSOLVER_STATUS_SUCCESS;
+}

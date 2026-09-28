@@ -78,8 +78,6 @@ VGPU_EXPORT int cublasDgemmStridedBatched() { vgpu_report_unimplemented("cublasD
 VGPU_EXPORT int cublasDgemv_v2() { vgpu_report_unimplemented("cublasDgemv_v2"); return 15; }
 VGPU_EXPORT int cublasDgeqrfBatched() { vgpu_report_unimplemented("cublasDgeqrfBatched"); return 15; }
 VGPU_EXPORT int cublasDger_v2() { vgpu_report_unimplemented("cublasDger_v2"); return 15; }
-VGPU_EXPORT int cublasDgetrfBatched() { vgpu_report_unimplemented("cublasDgetrfBatched"); return 15; }
-VGPU_EXPORT int cublasDgetrsBatched() { vgpu_report_unimplemented("cublasDgetrsBatched"); return 15; }
 VGPU_EXPORT int cublasDnrm2_v2() { vgpu_report_unimplemented("cublasDnrm2_v2"); return 15; }
 VGPU_EXPORT int cublasDotEx() { vgpu_report_unimplemented("cublasDotEx"); return 15; }
 VGPU_EXPORT int cublasDrot_v2() { vgpu_report_unimplemented("cublasDrot_v2"); return 15; }
@@ -132,8 +130,6 @@ VGPU_EXPORT int cublasSgelsBatched() { vgpu_report_unimplemented("cublasSgelsBat
 VGPU_EXPORT int cublasSgemmEx() { vgpu_report_unimplemented("cublasSgemmEx"); return 15; }
 VGPU_EXPORT int cublasSgeqrfBatched() { vgpu_report_unimplemented("cublasSgeqrfBatched"); return 15; }
 VGPU_EXPORT int cublasSger_v2() { vgpu_report_unimplemented("cublasSger_v2"); return 15; }
-VGPU_EXPORT int cublasSgetrfBatched() { vgpu_report_unimplemented("cublasSgetrfBatched"); return 15; }
-VGPU_EXPORT int cublasSgetrsBatched() { vgpu_report_unimplemented("cublasSgetrsBatched"); return 15; }
 VGPU_EXPORT int cublasSrot_v2() { vgpu_report_unimplemented("cublasSrot_v2"); return 15; }
 VGPU_EXPORT int cublasSrotg_v2() { vgpu_report_unimplemented("cublasSrotg_v2"); return 15; }
 VGPU_EXPORT int cublasSrotm_v2() { vgpu_report_unimplemented("cublasSrotm_v2"); return 15; }

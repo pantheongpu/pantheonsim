@@ -1081,6 +1081,21 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
 
+  # The library paths PyTorch takes, called directly and checked against a
+  # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
+  # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
+  # cuBLAS's factorizations and batched solves (torch.linalg).
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt")
+    string(REPLACE ":" ";" _parts "${_check}")
+    list(POP_FRONT _parts _name)
+    add_test(NAME e2e_${_name}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh ${_name} ${_parts})
+    set_tests_properties(e2e_${_name} PROPERTIES
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endforeach()
+
   add_test(NAME e2e_rdc_link
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_rdc_link.sh)
   set_tests_properties(e2e_rdc_link PROPERTIES
