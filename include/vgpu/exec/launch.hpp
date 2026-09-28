@@ -30,6 +30,10 @@ struct LaunchConfig {
   std::array<uint32_t, 3> grid{1, 1, 1};
   std::array<uint32_t, 3> block{1, 1, 1};
   uint32_t shared_bytes = 0;
+  // Which device this grid runs on, and how many the machine has: what
+  // device-side cudaGetDevice and cudaGetDeviceCount answer.
+  int device_ordinal = 0;
+  int device_count = 1;
   // Thread-block cluster shape in CTAs (cudaLaunchAttributeClusterDimension,
   // or __cluster_dims__ compiled into the kernel). All zeros means no explicit
   // cluster, which PTX defines as behaving like 1x1x1.
