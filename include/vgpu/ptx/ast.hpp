@@ -154,8 +154,10 @@ enum class PredBinOp { And, Or, Xor };
 // Vector loads/stores (v2/v4) carry 2 or 4 registers; scalar ops carry 1.
 // acquire/release are kept, not dropped as inert: blocks run on several host
 // threads, so the ordering a kernel asks for has to be real on the host too.
-struct OpLd { Space space = Space::Generic; Type ty; std::vector<Reg> dsts; Addr addr; bool acquire = false; };
-struct OpSt { Space space = Space::Generic; Type ty; Addr addr; std::vector<Operand> srcs; bool release = false; };
+// `ordered`: .relaxed, .volatile, .acquire or .release -- an access another
+// thread may be racing with on purpose, which a vector form must perform as one.
+struct OpLd { Space space = Space::Generic; Type ty; std::vector<Reg> dsts; Addr addr; bool acquire = false; bool ordered = false; };
+struct OpSt { Space space = Space::Generic; Type ty; Addr addr; std::vector<Operand> srcs; bool release = false; bool ordered = false; };
 struct OpMov { Type ty; Reg dst; Operand src; };
 // Vector forms of mov used by inline asm to pack/unpack sub-word registers:
 //   mov.b32 %r, {%rs1, %rs2};      pack two 16-bit halves into 32 bits
