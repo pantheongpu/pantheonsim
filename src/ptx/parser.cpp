@@ -363,7 +363,16 @@ class Parser {
 
   bool at_end() const { return toks_[pos_].kind == Token::Kind::End; }
   const Token& peek(size_t off = 0) const { return toks_[std::min(pos_ + off, toks_.size() - 1)]; }
-  const Token& next() { return toks_[pos_++]; }
+  const Token& next() {
+    const Token& t = toks_[pos_++];
+    // Every name a function's body mentions, so parse() can tell which
+    // module-scope .shared variables a kernel actually uses. Directives,
+    // registers and numbers are skipped; the rest is trimmed after parsing.
+    if (cur_fn_ && t.kind == Token::Kind::Word && !t.text.empty() && t.text[0] != '.' &&
+        t.text[0] != '%' && !std::isdigit(static_cast<unsigned char>(t.text[0])))
+      cur_fn_->words_seen.insert(t.text);
+    return t;
+  }
 
   bool peek_punct(const std::string& p, size_t off = 0) const {
     return peek(off).kind == Token::Kind::Punct && peek(off).text == p;
@@ -4984,11 +4993,60 @@ Module parse(const std::string& src) {
   // Note: a module with zero kernels is legal (e.g. a translation unit with
   // only host code still registers an empty PTX image).
   Module m = p.parse_module();
-  // Module-scope .shared variables are per-block storage available to every
-  // kernel, so give each entry its own slot in that kernel's shared frame.
+  // Module-scope .shared variables are per-block storage, and a kernel is
+  // given a slot for each one it can reach: named in its own body or in the
+  // body of a device function it calls, directly or through others. That is
+  // what the hardware allocates. Charging every kernel for every one of them
+  // refused real programs: a separately compiled build hoists each device
+  // function's static __shared__ to module scope, and NanoVDB's 37.9 KB of
+  // those plus the device-runtime library's 32.9 KB is more than a T4 holds,
+  // so no kernel could be placed. A kernel that makes an indirect call could
+  // reach any function, so it keeps them all.
+  std::set<std::string> interesting;
+  for (const auto& md : m.module_shared) interesting.insert(md.name);
+  std::unordered_map<std::string, const EntryFn*> funcs_by_name;
+  for (const auto& f : m.funcs) {
+    interesting.insert(f->name);
+    // A prototype and its definition share a name; the definition has the body.
+    auto [it, fresh] = funcs_by_name.emplace(f->name, f.get());
+    if (!fresh && it->second->body.empty()) it->second = f.get();
+  }
+  auto trim = [&](EntryFn& f) {
+    for (auto it = f.words_seen.begin(); it != f.words_seen.end();)
+      it = interesting.count(*it) ? std::next(it) : f.words_seen.erase(it);
+  };
+  for (auto& f : m.funcs) trim(*f);
+  for (auto& e : m.entries) trim(e);
+  auto calls_indirectly = [](const EntryFn& f) {
+    for (const Instr& ins : f.body)
+      if (const auto* c = std::get_if<OpCall>(&ins.op); c && c->indirect) return true;
+    return false;
+  };
+  // The names a kernel can reach, or nothing when it could reach anything.
+  auto reachable = [&](const EntryFn& e) -> std::optional<std::set<std::string>> {
+    if (calls_indirectly(e)) return std::nullopt;
+    std::set<std::string> names = e.words_seen;
+    std::vector<const EntryFn*> todo;
+    std::set<const EntryFn*> done;
+    for (const auto& w : e.words_seen)
+      if (auto it = funcs_by_name.find(w); it != funcs_by_name.end()) todo.push_back(it->second);
+    while (!todo.empty()) {
+      const EntryFn* f = todo.back();
+      todo.pop_back();
+      if (!done.insert(f).second) continue;
+      if (calls_indirectly(*f)) return std::nullopt;
+      for (const auto& w : f->words_seen) {
+        names.insert(w);
+        if (auto it = funcs_by_name.find(w); it != funcs_by_name.end()) todo.push_back(it->second);
+      }
+    }
+    return names;
+  };
   for (auto& fn : m.entries) {
+    const auto reach = m.module_shared.empty() ? std::nullopt : reachable(fn);
     for (const auto& md : m.module_shared) {
       if (fn.shared.count(md.name)) continue;
+      if (reach && !reach->count(md.name)) continue;
       SharedDecl d = md;
       if (d.dynamic) {
         fn.uses_dynamic_shared = true;
