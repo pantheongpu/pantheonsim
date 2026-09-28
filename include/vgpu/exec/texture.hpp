@@ -63,6 +63,11 @@ struct TextureDesc {
   // what cudaReadModeNormalizedFloat asks for.
   bool read_as_normalized_float = false;
   TexFilter filter = TexFilter::Point;
+  // cudaTextureDesc::borderColor, as the float bits the program set: what
+  // border addressing returns outside the texture, converted to the
+  // texture's format by the rules measured on an RTX 3060 (see
+  // tex_border_raw in interpreter.cpp).
+  uint32_t border_bits[4] = {0, 0, 0, 0};
   TexAddress address[3] = {TexAddress::Clamp, TexAddress::Clamp, TexAddress::Clamp};
   // True when the backing store came from cudaMallocArray rather than being a
   // view over linear device memory. The distinction matters for diagnostics

@@ -4007,10 +4007,11 @@ VTEST(tex_clamps_out_of_range_coordinates_to_the_edge) {
   for (uint32_t i = 0; i < 8; ++i) VCHECK_EQ(as_f32(e.mem.load_scalar(out + i * 4, 4)), want[i]);
 }
 
-VTEST(a_missing_channel_reads_as_zero_and_alpha_as_one) {
-  // Hardware returns 0 for absent x/y/z and 1 for absent w. A kernel reading
-  // .w of a one-channel texture expects 1, and getting 0 is the kind of wrong
-  // that looks like a black image rather than an error.
+VTEST(a_missing_channel_reads_as_zero_w_included) {
+  // An RTX 3060 returns 0 for every channel the format lacks, w included --
+  // measured with tex1Dfetch<float4> on a one-channel float texture over
+  // linear memory, as here, and for arrays, pitched memory, both read modes
+  // and both filters. (The graphics APIs' w = 1 is not what CUDA returns.)
   std::string ptx = std::string(kHeader) + R"(
 .visible .entry k(.param .u64 t, .param .u64 out)
 {
@@ -4050,7 +4051,7 @@ VTEST(a_missing_channel_reads_as_zero_and_alpha_as_one) {
   VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), 2.5f);
   VCHECK_EQ(as_f32(e.mem.load_scalar(out + 4, 4)), 0.0f);
   VCHECK_EQ(as_f32(e.mem.load_scalar(out + 8, 4)), 0.0f);
-  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 12, 4)), 1.0f);
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), uint64_t{0});
 }
 
 VTEST(a_surface_write_then_read_round_trips) {
@@ -4881,6 +4882,256 @@ VTEST(tld4_gathers_the_footprint_like_hardware) {
     std::array<float, 4> got{};
     e.mem.read(out, got.data(), 16);
     VCHECK(got == c.want);
+  }
+}
+
+// Border colours, measured on an RTX 3060: a point fetch outside a 4x4
+// texture with border addressing returns cudaTextureDesc::borderColor
+// converted to the texture's format -- floats as they are, halves rounded
+// toward zero, normalized channels through a fixed-point form whose ties go
+// toward zero (0.5 on an 8-bit channel is 127/255), integer channels as the
+// float's low bits -- and 0 in every channel the format lacks.
+VTEST(tex_border_colour_as_the_card_converts_it) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.f32 %f5, 0fBF800000;
+    mov.f32 %f6, 0f3FC00000;
+    tex.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}];
+    st.global.v4.f32 [%rd3], {%f1, %f2, %f3, %f4};
+    tex.2d.v4.u32.f32 {%r1, %r2, %r3, %r4}, [%rd1, {%f5, %f6}];
+    st.global.v4.u32 [%rd3+16], {%r1, %r2, %r3, %r4};
+    tex.2d.v4.s32.f32 {%r1, %r2, %r3, %r4}, [%rd1, {%f5, %f6}];
+    st.global.v4.u32 [%rd3+32], {%r1, %r2, %r3, %r4};
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(48), data = e.mem.alloc(256);
+  const uint32_t b0[4] = {0x3e800000, 0xc0600000, 0x7149f2ca, 0x3f333333};   // 0.25, -3.5, 1e30, 0.7
+  const uint32_t b2[4] = {0x3f000000, 0x3b800000, 0x47c35000, 0xc0000000};   // 0.5, 2^-8, 100000, -2
+  const uint32_t bh[4] = {0x7f800001, 0x477ff000, 0x3effffff, 0xffc00001};   // sNaN, 65520, ..., -NaN
+  const struct {
+    ChannelKind kind;
+    uint32_t bits, channels;
+    bool norm;
+    const uint32_t* border;
+    int out;   // 0 f32, 1 u32, 2 s32
+    std::array<uint32_t, 4> want;
+  } cases[] = {
+      {ChannelKind::Float, 32, 4, false, b0, 0, {0x3e800000, 0xc0600000, 0x7149f2ca, 0x3f333333}},
+      {ChannelKind::Float, 32, 1, false, b0, 0, {0x3e800000, 0, 0, 0}},
+      {ChannelKind::Float, 16, 4, false, bh, 0, {0x7f802000, 0x477fe000, 0x3effe000, 0xffc00000}},
+      {ChannelKind::Unsigned, 8, 4, true, b0, 0, {0x3e808081, 0, 0x3f800000, 0x3f32b2b3}},
+      {ChannelKind::Unsigned, 8, 4, true, b2, 0, {0x3efefeff, 0x3b808081, 0x3f800000, 0}},
+      {ChannelKind::Signed, 8, 4, true, b2, 0, {0x3efdfbf8, 0, 0x3f800000, 0xbf800000}},
+      {ChannelKind::Unsigned, 16, 2, true, b2, 0, {0x3effff00, 0x3b800080, 0, 0}},
+      {ChannelKind::Signed, 16, 2, true, b0, 0, {0x3e800100, 0xbf800000, 0, 0}},
+      {ChannelKind::Unsigned, 8, 4, false, b0, 1, {0, 0, 0xca, 0x33}},
+      {ChannelKind::Signed, 8, 4, false, b0, 2, {0, 0, 0xffffffca, 0x33}},
+      {ChannelKind::Signed, 32, 4, false, b0, 2, {0x3e800000, 0xc0600000, 0x7149f2ca, 0x3f333333}},
+  };
+  for (const auto& c : cases) {
+    TextureTable tex;
+    TextureDesc d;
+    d.base = data;
+    d.width = 4;
+    d.height = 4;
+    d.kind = c.kind;
+    d.channels = c.channels;
+    for (uint32_t i = 0; i < 4; ++i) d.channel_bits[i] = i < c.channels ? c.bits : 0;
+    d.texel_bytes = c.bits / 8 * c.channels;
+    d.pitch_bytes = 4 * d.texel_bytes;
+    d.read_as_normalized_float = c.norm;
+    for (auto& a : d.address) a = TexAddress::Border;
+    std::memcpy(d.border_bits, c.border, 16);
+    tex[0x91] = d;
+    LaunchConfig cfg;
+    cfg.textures = &tex;
+    exec::launch(m.entries[0], cfg, {arg_u64(0x91), arg_u64(out)}, e.mem, e.prof);
+    std::array<uint32_t, 4> got{};
+    e.mem.read(out + 16 * c.out, got.data(), 16);
+    if (got != c.want)
+      std::fprintf(stderr, "  %u-bit x%u: %08x %08x %08x %08x, the card gave %08x %08x %08x %08x\n", c.bits,
+                   c.channels, got[0], got[1], got[2], got[3], c.want[0], c.want[1], c.want[2], c.want[3]);
+    VCHECK(got == c.want);
+  }
+}
+
+// The float blend of a linear fetch, measured on an RTX 3060: not an exact
+// sum -- each value is truncated toward zero to 2^(E - 27), E the largest
+// value's exponent -- and a result below the smallest normal float is
+// flushed, keeping its sign. Texels T at weight a, the border colour B at
+// 256 - a.
+VTEST(tex_linear_blend_as_the_card_rounds_it) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .f32 x, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f5, [x];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.f32 %f6, 0f3FC00000;
+    tex.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}];
+    st.global.f32 [%rd3], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(4), data = e.mem.alloc(64);
+  auto argf = [](float f) { std::vector<uint8_t> b(4); std::memcpy(b.data(), &f, 4); return b; };
+  const struct { uint32_t t, b; int a; uint32_t want; } cases[] = {
+      {0x40304000, 0x3dcccccd, 1, 0x3de207ff},   // 2.75, 0.1: the exact sum rounds to ...800
+      {0x40304000, 0x3dcccccd, 2, 0x3df74332},
+      {0xc1a00000, 0x3f7fffff, 1, 0x3f6afffe},   // -20, 1 - 2^-24
+      {0x00ffffff, 0x80000000, 0, 0x80000000},   // all border, -0
+      {0x80800000, 0x00000000, 1, 0x80000000},   // -2^-126 / 256, flushed
+      {0x3dcccccd, 0x40304000, 255, 0x3de207ff},  // the same with the roles swapped
+  };
+  for (const auto& c : cases) {
+    std::vector<uint32_t> t(16, c.t);
+    e.mem.write(data, t.data(), 64);
+    TextureTable tex;
+    TextureDesc d;
+    d.base = data;
+    d.width = 4;
+    d.height = 4;
+    d.pitch_bytes = 16;
+    d.kind = ChannelKind::Float;
+    d.channel_bits[0] = 32;
+    d.texel_bytes = 4;
+    d.filter = TexFilter::Linear;
+    for (auto& a : d.address) a = TexAddress::Border;
+    d.border_bits[0] = c.b;
+    tex[0x92] = d;
+    LaunchConfig cfg;
+    cfg.textures = &tex;
+    exec::launch(m.entries[0], cfg, {arg_u64(0x92), argf(c.a / 256.0f - 0.5f), arg_u64(out)}, e.mem, e.prof);
+    VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{c.want});
+  }
+}
+
+// tld4 on an RTX 3060: a NaN comes out as 0x7fffffff, a subnormal float as
+// 0, and a signed 8-bit normalized texel as its 16-bit form over 32767 (64 is
+// 16513/32767, -64 is -16512/32767).
+VTEST(tld4_border_nan_subnormal_and_snorm8_as_the_card_gathers) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .f32 x, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    ld.param.f32 %f5, [x];
+    mov.f32 %f6, %f5;
+    tld4.r.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}];
+    st.global.v4.f32 [%rd3], {%f1, %f2, %f3, %f4};
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16), data = e.mem.alloc(64);
+  const int8_t s8[4] = {64, -64, 64, -64};   // (0,0) (1,0) / (0,1) (1,1)
+  e.mem.write(data, s8, 4);
+  auto run = [&](const TextureDesc& d, float x) {
+    TextureTable tex;
+    tex[0x93] = d;
+    LaunchConfig cfg;
+    cfg.textures = &tex;
+    std::vector<uint8_t> xa(4);
+    std::memcpy(xa.data(), &x, 4);
+    exec::launch(m.entries[0], cfg, {arg_u64(0x93), xa, arg_u64(out)}, e.mem, e.prof);
+    std::array<uint32_t, 4> got{};
+    e.mem.read(out, got.data(), 16);
+    return got;
+  };
+  // Far outside a border-addressed float texture: all four taps are border.
+  TextureDesc f;
+  f.base = data;
+  f.width = 1;
+  f.height = 1;
+  f.kind = ChannelKind::Float;
+  f.channel_bits[0] = 32;
+  f.texel_bytes = 4;
+  for (auto& a : f.address) a = TexAddress::Border;
+  f.border_bits[0] = 0x7fc00000;
+  const std::array<uint32_t, 4> nan{0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
+  VCHECK(run(f, -5.0f) == nan);
+  f.border_bits[0] = 0x00000001;
+  VCHECK(run(f, -5.0f) == (std::array<uint32_t, 4>{0, 0, 0, 0}));
+  TextureDesc n;
+  n.base = data;
+  n.width = 2;
+  n.height = 2;
+  n.pitch_bytes = 2;
+  n.kind = ChannelKind::Signed;
+  n.channel_bits[0] = 8;
+  n.texel_bytes = 1;
+  n.read_as_normalized_float = true;
+  // (i, j+1), (i+1, j+1), (i+1, j), (i, j) at x = y = 1: 64, -64, -64, 64.
+  VCHECK(run(n, 1.0f) == (std::array<uint32_t, 4>{0x3f010302, 0xbf010102, 0xbf010102, 0x3f010302}));
+}
+
+// A mipmapped texture's coordinates are normalized even when the descriptor
+// says otherwise, and wrap still acts as clamp (measured: x = 0.25 on an
+// 8-wide level 0 reads texel 2; x = 1.25 reads the last).
+VTEST(tex_mipmapped_coordinates_are_normalized_regardless) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .f32 x, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f6, [x];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.f32 %f5, 0f00000000;
+    mov.f32 %f7, 0f3DCCCCCD;
+    tex.level.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f6, %f7}], %f5;
+    st.global.f32 [%rd3], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(4);
+  TextureDesc d;
+  d.width = 8;
+  d.height = 8;
+  d.kind = ChannelKind::Float;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.pitch_bytes = 32;
+  d.mip_levels = 2;
+  d.address[0] = d.address[1] = TexAddress::Wrap;
+  for (uint32_t l = 0; l < 2; ++l) {
+    const uint32_t w = 8 >> l;
+    d.level_base[l] = e.mem.alloc(w * w * 4);
+    std::vector<float> t(w * w);
+    for (uint32_t i = 0; i < w * w; ++i) t[i] = static_cast<float>(i % w);
+    e.mem.write(d.level_base[l], t.data(), w * w * 4);
+  }
+  d.base = d.level_base[0];
+  TextureTable tex;
+  tex[0x94] = d;
+  LaunchConfig cfg;
+  cfg.textures = &tex;
+  auto argf = [](float f) { std::vector<uint8_t> b(4); std::memcpy(b.data(), &f, 4); return b; };
+  for (auto [x, want] : {std::pair{0.25f, 2.0f}, {0.75f, 6.0f}, {1.25f, 7.0f}}) {
+    exec::launch(m.entries[0], cfg, {arg_u64(0x94), argf(x), arg_u64(out)}, e.mem, e.prof);
+    VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), want);
   }
 }
 

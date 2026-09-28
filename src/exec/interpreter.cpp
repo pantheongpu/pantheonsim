@@ -31,6 +31,7 @@
 #include <deque>
 #include <memory>
 #include <cfenv>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -5091,19 +5092,62 @@ class Interpreter {
     }
   }
 
+  // The border colour's channel `ch` as the raw bits of a texel of this
+  // format -- which is what the card fetches, filters and gathers in place of
+  // a texel outside the texture. Measured on an RTX 3060, over 280,000 border
+  // colours:
+  //  - a 32-bit float channel takes the bits as they are (NaN payloads too);
+  //  - a half channel takes the float rounded toward zero (65520 gives 65504;
+  //    a NaN keeps the top of its payload, and stays a NaN);
+  //  - a normalized channel of m magnitude bits clamps the float to [0, 1] or
+  //    [-1, 1] (NaN is 0), truncates it toward zero to m + 4 fractional bits,
+  //    v, and takes (|v| * (2^m - 1) + 2^(m+3) - 1) >> (m + 4), with v's sign
+  //    -- 0.5 on an 8-bit channel is 127, not 128;
+  //  - an integer channel read as an integer takes the float's low bits.
+  // A channel the format lacks reads 0, w included.
+  static uint64_t tex_border_raw(const TextureDesc& d, uint32_t ch) {
+    const uint32_t bits = d.channel_bits[ch];
+    const uint32_t b = d.border_bits[ch];
+    const uint64_t mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+    if (d.kind == ChannelKind::Float) {
+      if (bits != 16) return b;
+      const uint32_t sign = (b >> 16) & 0x8000u, exp = (b >> 23) & 0xFF, man = b & 0x7FFFFFu;
+      if (exp == 0xFF) return sign | 0x7C00u | (man ? std::max<uint32_t>(man >> 13, 1u) : 0u);
+      const double a = std::fabs(static_cast<double>(f32(b)));
+      if (a >= 65504.0) return sign | 0x7BFFu;
+      if (a < std::ldexp(1.0, -14)) return sign | static_cast<uint32_t>(std::floor(std::ldexp(a, 24)));
+      int e;
+      const double fr = std::frexp(a, &e);   // a = fr * 2^e, fr in [0.5, 1)
+      return sign | (static_cast<uint32_t>(e + 14) << 10) | (static_cast<uint32_t>(std::floor(std::ldexp(fr, 11))) & 0x3FFu);
+    }
+    if (!d.read_as_normalized_float) return b & mask;
+    const bool sgn = d.kind == ChannelKind::Signed;
+    const uint32_t m = bits - (sgn ? 1 : 0), fb = m + 4;
+    double x = static_cast<double>(f32(b));
+    if (std::isnan(x)) x = 0;
+    x = std::clamp(x, sgn ? -1.0 : 0.0, 1.0);
+    const int64_t v = static_cast<int64_t>(std::trunc(std::ldexp(x, static_cast<int>(fb))));
+    const uint64_t mag = static_cast<uint64_t>(v < 0 ? -v : v);
+    const int64_t k = static_cast<int64_t>((mag * ((1ull << m) - 1) + (1ull << (fb - 1)) - 1) >> fb);
+    return static_cast<uint64_t>(v < 0 ? -k : k) & mask;
+  }
+
   // Converts one channel to the 32 bits the destination register wants.
   uint32_t convert_channel(const TextureDesc& d, uint32_t ch, uint64_t raw, Type dtype) {
     const uint32_t bits = d.channel_bits[ch];
-    if (bits == 0) {
-      // A channel the format does not have. Hardware returns 0 for x/y/z and 1
-      // for w; matching that matters because a kernel reading .w of a
-      // single-channel texture expects 1, not 0.
-      if (ch == 3) return dtype.is_float() ? static_cast<uint32_t>(f32bits(1.0f)) : 1u;
-      return 0;
-    }
+    // A channel the format does not have reads 0 -- w too, measured on an RTX
+    // 3060 for every format, read mode, filter and resource type (the
+    // graphics APIs' w = 1 is not what CUDA's fetches return).
+    if (bits == 0) return 0;
     if (d.kind == ChannelKind::Float) {
       if (bits == 32) return static_cast<uint32_t>(raw);
-      if (bits == 16) return static_cast<uint32_t>(f32bits(static_cast<float>(f16_to_double(raw))));
+      if (bits == 16) {
+        // A NaN widens bit for bit, payload and all (a half 0x7c01 reads as
+        // 0x7f802000 on an RTX 3060), rather than quieted.
+        if ((raw & 0x7C00u) == 0x7C00u && (raw & 0x3FFu))
+          return static_cast<uint32_t>(((raw & 0x8000u) << 16) | 0x7F800000u | ((raw & 0x3FFu) << 13));
+        return static_cast<uint32_t>(f32bits(static_cast<float>(f16_to_double(raw))));
+      }
       return 0;
     }
     // Integer channels. Sign-extend first, because everything downstream --
@@ -5249,11 +5293,15 @@ class Interpreter {
   }
 
   // One texel's share of a filtered fetch, in 1/256ths: all the terms of a
-  // fetch sum to 256. A border term reads as zero.
+  // fetch sum to 256. A border term reads the border colour.
   struct TexTerm {
     int w = 0;
     uint64_t addr = 0;
     bool border = false;
+    // Which 2x2 footprint the texel belongs to -- a 3D fetch's z-slice, a mip
+    // blend's level -- since the float blend aligns each on its own (see
+    // tex_finish).
+    int group = 0;
   };
 
   void tex_check_filterable(const Instr& ins, uint32_t lane, const TextureDesc& d) {
@@ -5311,6 +5359,7 @@ class Interpreter {
       TexTerm& t = out[n++];
       t.w = w[k];
       t.border = !inside;
+      t.group = off[2];
       if (inside) t.addr = d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes;
     }
     return n;
@@ -5342,16 +5391,17 @@ class Interpreter {
     const uint32_t bits = d.channel_bits[0];
     const bool is_float = d.kind == ChannelKind::Float;
     const bool unorm = d.kind == ChannelKind::Unsigned;
-    ExactSum fsum[4];
     int64_t isum[4] = {0, 0, 0, 0};
+    double fv[4][16];
     for (int k = 0; k < n; ++k) {
-      if (terms[k].border || terms[k].w == 0) continue;
       for (uint32_t ch = 0; ch < 4; ++ch) {
         if (!d.channel_bits[ch]) continue;
-        const uint64_t raw = texel_channel_bits(d, terms[k].addr, ch, ins, lane);
+        if (terms[k].w == 0) { fv[ch][k] = 0; continue; }
+        const uint64_t raw = terms[k].border ? tex_border_raw(d, ch) : texel_channel_bits(d, terms[k].addr, ch, ins, lane);
         if (is_float) {
-          const double t = bits == 32 ? static_cast<double>(f32(raw)) : f16_to_double(raw);
-          fsum[ch].add(terms[k].w * t);
+          double t = bits == 32 ? static_cast<double>(f32(raw)) : f16_to_double(raw);
+          if (bits == 32 && std::fabs(t) < std::ldexp(1.0, -126)) t = std::copysign(0.0, t);   // flushed
+          fv[ch][k] = t;
         } else if (unorm) {
           isum[ch] += int64_t{terms[k].w} * static_cast<int64_t>(bits == 8 ? raw * 257 : raw);
         } else {
@@ -5362,17 +5412,55 @@ class Interpreter {
     for (uint32_t ch = 0; ch < 4; ++ch) {
       float r;
       if (!d.channel_bits[ch]) {
-        r = ch == 3 ? 1.0f : 0.0f;
+        r = 0.0f;
       } else if (is_float) {
-        // Scaling by 1/256 is exact, so round the sum of weight x texel and
-        // divide after. A non-finite texel takes the plain arithmetic.
-        ExactSum scaled;
-        bool finite = true;
-        for (int i = 0; i < fsum[ch].n; ++i) {
-          if (!std::isfinite(fsum[ch].e[i])) finite = false;
-          scaled.add(fsum[ch].e[i] / 256);
+        // As measured on an RTX 3060, the blend is not an exact sum. Within
+        // each 2x2 footprint (a 3D fetch's z-slice, a mip blend's level) every
+        // value is truncated toward zero to 2^(E - 27) -- 2^(E - 14) for a
+        // half -- where E is the exponent of the footprint's largest value
+        // with a non-zero weight: 2.75 with weight 1 and 0.1 with weight 255
+        // gives 0x3de207ff, not 0x3de20800. Each footprint's weighted sum is
+        // then floored to 2^(Emax - 28), Emax the largest E, the footprints
+        // added exactly, and the total rounded once, ties away from zero.
+        // (Scaling by 1/256 is exact, so the sum of weight x value is rounded
+        // and divided after.) Over 15,360 trilinear fetches of random texels
+        // spanning 2^-10..2^11, 20 still differ, by 1-4 ulp, all where the
+        // slices' magnitudes differ widely and the result cancels to far
+        // below them. A non-finite value takes the plain arithmetic.
+        const int M = bits == 32 ? 27 : 14;
+        int Eg[4] = {INT_MIN, INT_MIN, INT_MIN, INT_MIN};
+        bool finite = true, all_neg_zero = true;
+        for (int k = 0; k < n; ++k) {
+          if (terms[k].w == 0) continue;
+          const double t = fv[ch][k];
+          if (!std::isfinite(t)) finite = false;
+          else if (t != 0) Eg[terms[k].group] = std::max(Eg[terms[k].group], std::ilogb(t));
+          if (!(t == 0 && std::signbit(t))) all_neg_zero = false;
         }
-        r = finite ? tex_round_sum(scaled, bits == 16) : static_cast<float>(fsum[ch].approx() / 256);
+        const int Emax = *std::max_element(Eg, Eg + 4);
+        ExactSum scaled;
+        double plain = 0;
+        for (int k = 0; k < n; ++k)
+          if (terms[k].w) plain += terms[k].w * fv[ch][k];
+        if (finite && Emax != INT_MIN) {
+          const double q2 = std::ldexp(1.0, Emax - (M + 1));
+          for (int g = 0; g < 4; ++g) {
+            if (Eg[g] == INT_MIN) continue;
+            // Exact in a double: at most 8 terms of a 9-bit weight times a
+            // value of at most M + 1 bits, all multiples of q.
+            const double q = std::ldexp(1.0, Eg[g] - M);
+            double sg = 0;
+            for (int k = 0; k < n; ++k)
+              if (terms[k].w && terms[k].group == g) sg += terms[k].w * (std::trunc(fv[ch][k] / q) * q);
+            scaled.add(std::floor(sg / q2) * q2 / 256);
+          }
+        }
+        r = finite ? tex_round_sum(scaled, bits == 16) : static_cast<float>(plain / 256);
+        if (finite && r == 0 && all_neg_zero) r = -0.0f;
+        // A result below the smallest normal float is flushed, keeping its sign.
+        if (bits == 32 && std::fabs(r) < std::ldexp(1.0f, -126)) r = std::copysign(0.0f, r);
+        // A NaN comes out as the filter's own, all ones in the format.
+        if (std::isnan(r)) { out[ch] = bits == 32 ? 0x7FFFFFFFu : 0x7FFFE000u; continue; }
       } else {
         const int K = std::max(tex_round_half_up(isum[ch], 256), unorm ? 0 : -32767);
         r = static_cast<float>(static_cast<double>(K) / (unorm ? 65535.0 : 32767.0));
@@ -5517,13 +5605,39 @@ class Interpreter {
           const bool inside = wrap_coord(effective_address(v, 0), b[0] + kOrder[k][0], size[0], &ix) &&
                               wrap_coord(effective_address(v, 1), b[1] + kOrder[k][1], size[1], &iy);
           const uint32_t ch = static_cast<uint32_t>(op.gather);
-          out[k][lane] = inside ? convert_channel(v, ch, texel_channel_bits(v, v.base + iy * row + uint64_t{ix} * v.texel_bytes, ch, ins, lane), op.dtype)
-                                : 0;
+          const uint64_t raw = inside ? texel_channel_bits(v, v.base + iy * row + uint64_t{ix} * v.texel_bytes, ch, ins, lane)
+                                      : tex_border_raw(v, ch);
+          uint32_t r = convert_channel(v, ch, raw, op.dtype);
+          if (v.kind == ChannelKind::Signed && v.channel_bits[ch] == 8 && v.read_as_normalized_float) {
+            // A signed 8-bit normalized texel is gathered as the 16-bit value
+            // the filter works in, read out over 32767, not as k / 127:
+            // |k| * 258, plus one from |k| = 64 up (65 when negative) --
+            // measured for every code on an RTX 3060.
+            const int k = std::max(static_cast<int>(static_cast<int8_t>(raw)), -127);
+            const int mag = k < 0 ? -k : k;
+            const int k16 = mag * 258 + (mag >= (k < 0 ? 65 : 64) ? 1 : 0);
+            r = static_cast<uint32_t>(f32bits(static_cast<float>(static_cast<double>(k < 0 ? -k16 : k16) / 32767.0)));
+          }
+          // A NaN comes out as the gather's own, all ones in the format, and
+          // a subnormal float as zero (measured).
+          if (v.kind == ChannelKind::Float && v.channel_bits[ch]) {
+            if (std::isnan(f32(r))) r = v.channel_bits[ch] == 32 ? 0x7FFFFFFFu : 0x7FFFE000u;
+            else if ((r & 0x7F800000u) == 0) r &= 0x80000000u;
+          }
+          out[k][lane] = r;
         }
         continue;
       }
       if (d.mip_levels) {
         // A mipmapped texture: pick the level, or blend two (see tex_mip_lod).
+        // Its coordinates are normalized whatever the descriptor says, and
+        // without normalizedCoords wrap and mirror still act as clamp
+        // (measured: x = 0.25 on an 8-wide level 0 reads texel 2).
+        if (!v.normalized_coords) {
+          for (auto& a : v.address)
+            if (a == TexAddress::Wrap || a == TexAddress::Mirror) a = TexAddress::Clamp;
+          v.normalized_coords = true;
+        }
         if (indexed || cube)
           ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
                    "mipmapped layered and cubemap textures are not implemented");
@@ -5543,10 +5657,13 @@ class Interpreter {
           const int wh = q & 255;
           if (v.filter == TexFilter::Linear) {
             n += tex_footprint_linear(lo, dims, cf, true_1d, 256 - wh, terms + n);
+            const int first_hi = n;
             n += tex_footprint_linear(hi, dims, cf, true_1d, wh, terms + n);
+            for (int k = first_hi; k < n; ++k) terms[k].group += 2;
           } else {
             n += tex_footprint_point(lo, dims, cf, 256 - wh, terms + n);
             n += tex_footprint_point(hi, dims, cf, wh, terms + n);
+            terms[n - 1].group = 2;
           }
           uint32_t r[4];
           tex_finish(ins, lane, d, terms, n, r);
@@ -5583,9 +5700,8 @@ class Interpreter {
       }
 
       if (!inside) {
-        // Border addressing outside the extent: all components zero, which is
-        // the default border colour.
-        for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = 0;
+        // Border addressing outside the extent: the border colour.
+        for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = convert_channel(v, ch, tex_border_raw(v, ch), op.dtype);
         continue;
       }
       const uint64_t row = v.pitch_bytes ? v.pitch_bytes : uint64_t{v.width} * v.texel_bytes;
