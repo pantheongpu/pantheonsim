@@ -3647,52 +3647,8 @@ class Interpreter {
       write_reg(w, op->dst, m, r, 32);
       return;
     }
-    if (const auto* op = std::get_if<OpVideoSimd>(&ins.op)) {
-      Lanes _s_a;
-      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
-      Lanes _s_b;
-      const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
-      Lanes r;
-      const uint32_t width = 32u / op->lanes;             // 8 or 16 bits per lane
-      const uint64_t lane_mask = (1ull << width) - 1ull;
-      const int64_t lo = op->d_signed ? -(int64_t{1} << (width - 1)) : 0;
-      const int64_t hi = op->d_signed ? (int64_t{1} << (width - 1)) - 1
-                                      : static_cast<int64_t>(lane_mask);
-      for (uint32_t lane = 0; lane < W_; ++lane) {
-        if (!(m & (Mask{1} << lane))) continue;
-        uint64_t out = 0;
-        for (uint32_t i = 0; i < op->lanes; ++i) {
-          const uint64_t ab = (a[lane] >> (width * i)) & lane_mask;
-          const uint64_t bb = (b[lane] >> (width * i)) & lane_mask;
-          // Sign extension happens per lane, from the lane's own width. Reading
-          // the register as one value and letting a borrow cross a lane
-          // boundary is what makes these instructions worth having.
-          auto ext = [&](uint64_t v, bool sgn) -> int64_t {
-            if (!sgn) return static_cast<int64_t>(v);
-            return (v & (1ull << (width - 1)))
-                       ? static_cast<int64_t>(v | ~lane_mask)
-                       : static_cast<int64_t>(v);
-          };
-          const int64_t x = ext(ab, op->a_signed), y = ext(bb, op->b_signed);
-          int64_t v;
-          switch (op->op) {
-            case VideoOp::Add: v = x + y; break;
-            case VideoOp::Sub: v = x - y; break;
-            case VideoOp::AbsDiff: v = x > y ? x - y : y - x; break;
-            case VideoOp::Min: v = x < y ? x : y; break;
-            case VideoOp::Max: v = x > y ? x : y; break;
-            // vavrg rounds away from zero, which is what the video codecs it
-            // exists for expect; a plain >> 1 rounds toward negative infinity
-            // and is off by one on every odd negative sum.
-            case VideoOp::Avrg: v = (x + y + (x + y >= 0 ? 1 : -1)) / 2; break;
-            default: v = 0; break;
-          }
-          if (op->sat) v = v < lo ? lo : (v > hi ? hi : v);
-          out |= (static_cast<uint64_t>(v) & lane_mask) << (width * i);
-        }
-        r[lane] = out;
-      }
-      write_reg(w, op->dst, m, r, 32);
+    if (const auto* op = std::get_if<OpVideo>(&ins.op)) {
+      exec_video(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpBfind>(&ins.op)) {
@@ -8696,6 +8652,193 @@ class Interpreter {
         return;
       }
     }
+  }
+
+  // The video instructions (PTX ISA 9.7.20), as an RTX 3060 computes them
+  // (nvidia/tests/e2e/video_forms.cu, 652 variants): ptxas emulates them on
+  // sm_70+, and where that departs from the ISA's pseudocode the card is what
+  // programs see. Among the things measured:
+  //  - a four-operand scalar form with neither a secondary operation nor a
+  //    merge ignores c (it is not |a - b| + c);
+  //  - SIMD selectors pick each lane's source from a's then b's half-words or
+  //    bytes, the highest lane's written first (.h10 is a's own two);
+  //  - the SIMD accumulate adds the masked lanes' (signed) results to c.
+  static int64_t video_part(uint32_t x, bool sgn, int sel) {
+    if (sel < 0) return sgn ? static_cast<int64_t>(static_cast<int32_t>(x)) : static_cast<int64_t>(x);
+    if (sel < 4) {
+      const uint32_t v = (x >> (8 * sel)) & 0xFF;
+      return sgn ? static_cast<int64_t>(static_cast<int8_t>(v)) : static_cast<int64_t>(v);
+    }
+    const uint32_t v = (x >> (16 * (sel - 4))) & 0xFFFF;
+    return sgn ? static_cast<int64_t>(static_cast<int16_t>(v)) : static_cast<int64_t>(v);
+  }
+  static bool video_cmp(CmpOp c, int64_t x, int64_t y) {
+    switch (c) {
+      case CmpOp::Eq: return x == y;
+      case CmpOp::Ne: return x != y;
+      case CmpOp::Lt: return x < y;
+      case CmpOp::Le: return x <= y;
+      case CmpOp::Gt: return x > y;
+      default: return x >= y;
+    }
+  }
+  static __int128 video_clamp(__int128 v, bool sgn, int bits) {
+    const __int128 lo = sgn ? -(static_cast<__int128>(1) << (bits - 1)) : 0;
+    const __int128 hi = sgn ? (static_cast<__int128>(1) << (bits - 1)) - 1 : (static_cast<__int128>(1) << bits) - 1;
+    return v < lo ? lo : v > hi ? hi : v;
+  }
+  static uint32_t video_scalar(const OpVideo& op, uint32_t a, uint32_t b, uint32_t c) {
+    const int64_t ta = video_part(a, op.a_signed, op.asel);
+    const bool shift = op.op == VideoOp::Shl || op.op == VideoOp::Shr;
+    int64_t tb = video_part(b, shift ? false : op.b_signed, op.bsel);
+    if (op.op == VideoOp::Mad) {
+      // tmp = ta * tb + c; the negation of the product or of c, or .po, as
+      // one's complement plus a carried-in one; then the scale (arithmetic)
+      // and the saturation. Unlike the ISA's pseudocode, the card takes a
+      // whole 32-bit a or b, and c, as signed whatever their types
+      // (0xffffffff * 0x80000000 + 0x80 is 0x80000080, saturated u32), so
+      // only a byte or half-word selection follows the type.
+      const bool signed_final = op.a_signed || op.b_signed || op.neg_ab || op.neg_c;
+      const int64_t ma = op.asel < 0 ? static_cast<int32_t>(a) : ta;
+      const int64_t mb = op.bsel < 0 ? static_cast<int32_t>(b) : tb;
+      __int128 tmp = static_cast<__int128>(ma) * mb;
+      __int128 cc = static_cast<int32_t>(c);
+      if (op.po) tmp += 1;
+      else if (op.neg_ab) tmp = -tmp;
+      else if (op.neg_c) cc = -cc;
+      tmp += cc;
+      if (op.scale) tmp >>= op.scale;
+      // An unsigned saturation takes a negative result to 0 -- but after a
+      // scale, to 0xffffffff (0 * 0x7fff + 0xffffffff, .shr15, gives
+      // 0xffffffff), as if the shifted value were compared unsigned.
+      if (op.sat) tmp = !signed_final && op.scale && tmp < 0 ? __int128{0xFFFFFFFF} : video_clamp(tmp, signed_final, 32);
+      return static_cast<uint32_t>(tmp);
+    }
+    __int128 tmp = 0;
+    switch (op.op) {
+      case VideoOp::Add: tmp = static_cast<__int128>(ta) + tb; break;
+      case VideoOp::Sub: tmp = static_cast<__int128>(ta) - tb; break;
+      case VideoOp::AbsDiff: tmp = ta > tb ? ta - tb : tb - ta; break;
+      case VideoOp::Min: tmp = std::min(ta, tb); break;
+      case VideoOp::Max: tmp = std::max(ta, tb); break;
+      case VideoOp::Shl:
+      case VideoOp::Shr:
+        if (op.shift_wrap) tb &= 0x1F;
+        else if (tb > 32) tb = 32;
+        tmp = op.op == VideoOp::Shl ? static_cast<__int128>(ta) << tb : static_cast<__int128>(ta) >> tb;
+        // The ISA's .s34 intermediate, wrapping at 34 bits: 0x7fffffff << 31
+        // saturates to 0x80000000 (signed) or 0 (unsigned) on the card.
+        tmp = static_cast<__int128>(static_cast<int64_t>(static_cast<uint64_t>(tmp) << 30) >> 30);
+        break;
+      case VideoOp::Set: tmp = video_cmp(op.cmp, ta, tb) ? 1 : 0; break;
+      default: break;
+    }
+    const bool dsgn = op.op == VideoOp::Set ? false : op.d_signed;
+    uint32_t t = static_cast<uint32_t>(tmp);
+    if (op.sat) {
+      // As the card saturates: a 32-bit signed destination clamps both ways;
+      // a 32-bit unsigned one clamps below at 0 and wraps above
+      // (0xffffffff + 1 gives 0) after vadd, vsub and vabsdiff; a byte or half-word one takes the unsigned
+      // minimum of the 32-bit result and the field's maximum, so a negative
+      // result gives 0x7f/0x7fff (signed) or 0xff/0xffff (unsigned).
+      if (op.dsel < 0) {
+        // vabsdiff too: |-0x55fd0d9d - 0xb3280f47| gives 0x09251ce4.
+        const bool wraps = op.op == VideoOp::Add || op.op == VideoOp::Sub || op.op == VideoOp::AbsDiff;
+        t = dsgn ? static_cast<uint32_t>(video_clamp(tmp, true, 32))
+                 : tmp < 0 ? 0 : wraps ? t : static_cast<uint32_t>(video_clamp(tmp, false, 32));
+      }
+      else t = std::min<uint32_t>(t, (op.dsel < 4 ? 0xFFu : 0xFFFFu) >> (dsgn ? 1 : 0));
+    }
+    // The secondary operation works on the 32-bit result, as the card does.
+    // .min/.max compare it with c signed for a signed destination (for vset,
+    // signed operands); for an unsigned one, unsigned -- except that after
+    // vadd and vsub a result with bit 31 set counts as above every c (the
+    // sum is sign-extended to 34 bits and then compared unsigned).
+    // After vabsdiff and the shifts it is the result's true value
+    // (|0 - -2^31| is 2^31, not negative) unless it was saturated; after vmin
+    // and vmax, the 32-bit result.
+    const bool sec_signed = op.op == VideoOp::Set ? (op.a_signed || op.b_signed) : dsgn;
+    const bool addsub = op.op == VideoOp::Add || op.op == VideoOp::Sub;
+    const __int128 true_t = op.sat ? static_cast<__int128>(sec_signed ? static_cast<int64_t>(static_cast<int32_t>(t))
+                                                                      : static_cast<int64_t>(t))
+                                   : tmp;
+    auto key = [&](uint32_t v, bool is_t) -> __int128 {
+      if (!is_t) return sec_signed ? static_cast<__int128>(static_cast<int32_t>(v)) : static_cast<__int128>(v);
+      if (addsub) {
+        if (sec_signed) return static_cast<int32_t>(v);
+        return (v >> 31) ? (static_cast<__int128>(3) << 32) | v : static_cast<__int128>(v);
+      }
+      if (op.op == VideoOp::Min || op.op == VideoOp::Max)
+        return sec_signed ? static_cast<__int128>(static_cast<int32_t>(v)) : static_cast<__int128>(v);
+      return true_t;
+    };
+    switch (op.sec) {
+      case OpVideo::Sec::Add: t += c; break;
+      case OpVideo::Sec::Min: t = key(t, true) <= key(c, false) ? t : c; break;
+      case OpVideo::Sec::Max: t = key(t, true) >= key(c, false) ? t : c; break;
+      default: break;
+    }
+    // A merge puts the result's low byte or half-word at the selected place
+    // and keeps c's other bits (the ISA's optMerge) -- except .h1, where the
+    // card keeps the result's own upper half, in place.
+    switch (op.dsel) {
+      case 0: case 1: case 2: case 3: {
+        const uint32_t sh = 8u * static_cast<uint32_t>(op.dsel);
+        return ((t & 0xFFu) << sh) | (c & ~(0xFFu << sh));
+      }
+      case 4: return (t & 0xFFFFu) | (c & 0xFFFF0000u);
+      case 5: return (t & 0xFFFF0000u) | (c & 0x0000FFFFu);
+      default: return t;
+    }
+  }
+  static uint32_t video_simd(const OpVideo& op, uint32_t a, uint32_t b, uint32_t c) {
+    const uint32_t n = op.lanes, width = 32 / n;
+    const uint32_t lmask = (1u << width) - 1;
+    auto pool = [&](uint32_t i) { return i < n ? (a >> (width * i)) & lmask : (b >> (width * (i - n))) & lmask; };
+    auto ext = [&](uint32_t v, bool sgn) -> int64_t {
+      return sgn && (v >> (width - 1) & 1) ? static_cast<int64_t>(v) - (int64_t{1} << width) : static_cast<int64_t>(v);
+    };
+    int64_t t[4] = {};
+    for (uint32_t i = 0; i < n; ++i) {
+      const int64_t x = ext(pool(op.asel_v[i]), op.a_signed), y = ext(pool(op.bsel_v[i]), op.b_signed);
+      switch (op.op) {
+        case VideoOp::Add: t[i] = x + y; break;
+        case VideoOp::Sub: t[i] = x - y; break;
+        case VideoOp::Avrg: t[i] = x + y >= 0 ? (x + y + 1) >> 1 : (x + y) >> 1; break;
+        case VideoOp::AbsDiff: t[i] = x > y ? x - y : y - x; break;
+        case VideoOp::Min: t[i] = std::min(x, y); break;
+        case VideoOp::Max: t[i] = std::max(x, y); break;
+        case VideoOp::Set: t[i] = video_cmp(op.cmp, x, y) ? 1 : 0; break;
+        default: break;
+      }
+      if (op.sat) t[i] = static_cast<int64_t>(video_clamp(t[i], op.d_signed, static_cast<int>(width)));
+    }
+    if (op.sec == OpVideo::Sec::Add) {
+      uint64_t d = c;
+      for (uint32_t i = 0; i < n; ++i)
+        if (op.mask >> i & 1) d += static_cast<uint64_t>(t[i]);
+      return static_cast<uint32_t>(d);
+    }
+    uint32_t d = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t v = op.mask >> i & 1 ? static_cast<uint32_t>(t[i]) & lmask : (c >> (width * i)) & lmask;
+      d |= v << (width * i);
+    }
+    return d;
+  }
+  void exec_video(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpVideo& op, Mask m) {
+    Lanes s1, s2, s3;
+    const Lanes& a = read_operand(w, ctx, ins, op.a, s1);
+    const Lanes& b = read_operand(w, ctx, ins, op.b, s2);
+    const Lanes c = op.has_c ? read_operand(w, ctx, ins, op.c, s3) : Lanes{};
+    Lanes r{};
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) {
+        const uint32_t x = static_cast<uint32_t>(a[lane]), y = static_cast<uint32_t>(b[lane]);
+        const uint32_t z = op.has_c ? static_cast<uint32_t>(c[lane]) : 0;
+        r[lane] = op.lanes == 1 ? video_scalar(op, x, y, z) : video_simd(op, x, y, z);
+      }
+    write_reg(w, op.dst, m, r, 32);
   }
 
   void exec_atom(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {

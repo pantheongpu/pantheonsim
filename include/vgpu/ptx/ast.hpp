@@ -548,14 +548,32 @@ struct OpCvtFp8 {
 // vabsdiff4.u32.s32.s32 compares signed bytes and produces unsigned ones, and
 // reading them all as one 32-bit value gets every lane after the first wrong
 // through borrow.
-enum class VideoOp : uint8_t { Add, Sub, AbsDiff, Min, Max, Avrg };
-struct OpVideoSimd {
+enum class VideoOp : uint8_t { Add, Sub, AbsDiff, Min, Max, Avrg, Shl, Shr, Mad, Set };
+// The video instructions (PTX ISA 9.7.20): scalar (lanes = 1) vadd, vsub,
+// vabsdiff, vmin, vmax, vshl, vshr, vmad and vset, and the 2- and 4-way SIMD
+// vadd/vsub/vavrg/vabsdiff/vmin/vmax/vset.
+struct OpVideo {
   VideoOp op = VideoOp::Add;
-  uint32_t lanes = 4;        // 4 bytes or 2 halfwords
+  uint32_t lanes = 1;                  // 1 (scalar), 2 (half-words) or 4 (bytes)
   bool a_signed = false, b_signed = false, d_signed = false;
   bool sat = false;
+  // Scalar: the secondary operation with c (.add/.min/.max), or a merge into
+  // c at `dsel`. SIMD: .add accumulates the masked lanes into c; otherwise
+  // the masked lanes replace c's.
+  enum class Sec : uint8_t { None, Add, Min, Max } sec = Sec::None;
+  CmpOp cmp = CmpOp::Eq;               // vset
+  bool shift_wrap = false;             // vshl/vshr: .wrap (else .clamp)
+  bool po = false, neg_ab = false, neg_c = false;   // vmad
+  uint8_t scale = 0;                   // vmad: 0, 7 (.shr7) or 15 (.shr15)
+  // Scalar selectors: -1 none, 0-3 .b0-.b3, 4-5 .h0-.h1.
+  int8_t asel = -1, bsel = -1, dsel = -1;
+  // SIMD selectors: for each lane, which of a's and b's half-words (0-3) or
+  // bytes (0-7) it reads; and which lanes the result writes (bit i: lane i).
+  std::array<uint8_t, 4> asel_v{}, bsel_v{};
+  uint8_t mask = 0;
   Reg dst;
   Operand a, b, c;
+  bool has_c = false;
 };
 // copysign.f32/f64 d, a, b -- magnitude of b with the sign of a.
 struct OpCopysign { Type ty; Reg dst; Operand a, b; };
@@ -881,7 +899,7 @@ struct OpCall {
 };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy>;
 

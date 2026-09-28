@@ -13,6 +13,7 @@
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "lexer.hpp"
 #include "vgpu/error.hpp"
@@ -127,14 +128,14 @@ std::vector<std::string> split_dots(const std::string& s) {
   return parts;
 }
 
-// Is this a SIMD video mnemonic? The name is v<op><lanes>, so the operation is
-// everything between the leading v and the trailing lane count.
-const char* video_simd_base(const std::string& op0) {
-  static const char* kOps[] = {"add", "sub", "absdiff", "min", "max", "avrg"};
-  const std::string base = op0.substr(1, op0.size() - 2);
-  for (const char* o : kOps)
-    if (base == o) return o;
-  return nullptr;
+// Is this a video instruction (PTX ISA 9.7.20)? The scalar ones and the 2-
+// and 4-way SIMD ones.
+bool is_video_mnemonic(const std::string& op0) {
+  static const std::unordered_set<std::string> k = {
+      "vadd", "vsub", "vabsdiff", "vmin", "vmax", "vshl", "vshr", "vmad", "vset",
+      "vadd2", "vsub2", "vavrg2", "vabsdiff2", "vmin2", "vmax2", "vset2",
+      "vadd4", "vsub4", "vavrg4", "vabsdiff4", "vmin4", "vmax4", "vset4"};
+  return k.count(op0) != 0;
 }
 
 // The comparison suffixes, shared by setp and set.
@@ -372,6 +373,22 @@ class Parser {
     const Token& t = next();
     if (t.kind != Token::Kind::Word) fail(t.line, "expected " + what + ", got '" + t.text + "'");
     return t.text;
+  }
+
+  // A video operand's selector (.b0-.b3/.h0/.h1, or a SIMD .hxy/.bxyzw/mask)
+  // is written onto the register and lexed as part of its word: split it off
+  // the next token and return it ("" when there is none).
+  std::string take_video_selector() {
+    Token& t = toks_[std::min(pos_, toks_.size() - 1)];
+    if (t.kind != Token::Kind::Word) return "";
+    const size_t dot = t.text.find('.', 1);
+    if (dot == std::string::npos) return "";
+    const std::string sel = t.text.substr(dot + 1);
+    if (sel.size() < 2 || (sel[0] != 'b' && sel[0] != 'h')) return "";
+    for (size_t i = 1; i < sel.size(); ++i)
+      if (sel[i] < '0' || sel[i] > '7') return "";
+    t.text.resize(dot);
+    return sel;
   }
 
   Type expect_type(const std::string& ctx) {
@@ -2805,46 +2822,135 @@ class Parser {
       expect_punct(",");
       op.c = parse_operand();
       ins.op = op;
-    } else if (op0.size() > 3 && op0[0] == 'v' &&
-               (op0.back() == '2' || op0.back() == '4') &&
-               video_simd_base(op0) != nullptr) {
-      // vadd4 / vsub4 / vabsdiff4 / vmin4 / vmax4 / vavrg4, and the 2-way forms.
-      OpVideoSimd op;
-      op.lanes = op0.back() == '4' ? 4u : 2u;
-      const std::string base = op0.substr(1, op0.size() - 2);
-      if (base == "add") op.op = VideoOp::Add;
-      else if (base == "sub") op.op = VideoOp::Sub;
-      else if (base == "absdiff") op.op = VideoOp::AbsDiff;
-      else if (base == "min") op.op = VideoOp::Min;
-      else if (base == "max") op.op = VideoOp::Max;
-      else if (base == "avrg") op.op = VideoOp::Avrg;
-      else return unsupported("SIMD video op '" + op0 + "'");
-      std::vector<std::string> tys;
+    } else if (is_video_mnemonic(op0)) {
+      // The video instructions (PTX ISA 9.7.20).
+      OpVideo op;
+      const char last = op0.back();
+      op.lanes = last == '2' ? 2u : last == '4' ? 4u : 1u;
+      const std::string base = op.lanes == 1 ? op0.substr(1) : op0.substr(1, op0.size() - 2);
+      static const std::unordered_map<std::string, VideoOp> kOps = {
+          {"add", VideoOp::Add}, {"sub", VideoOp::Sub}, {"absdiff", VideoOp::AbsDiff}, {"min", VideoOp::Min},
+          {"max", VideoOp::Max}, {"avrg", VideoOp::Avrg}, {"shl", VideoOp::Shl}, {"shr", VideoOp::Shr},
+          {"mad", VideoOp::Mad}, {"set", VideoOp::Set}};
+      op.op = kOps.at(base);
+      const bool set = op.op == VideoOp::Set, shift = op.op == VideoOp::Shl || op.op == VideoOp::Shr;
+      const bool mad = op.op == VideoOp::Mad;
+      std::vector<bool> sgn;
+      bool have_cmp = false, have_mode = false;
       for (size_t i = 1; i < parts.size(); ++i) {
-        if (parts[i] == "sat") { op.sat = true; continue; }
-        // The secondary-operation forms fold the lanes into a scalar with c,
-        // which is a different instruction wearing the same name.
-        if (parts[i] == "add" || parts[i] == "min" || parts[i] == "max")
-          return unsupported(op0 + " with a secondary '." + parts[i] + "' operation");
-        tys.push_back(parts[i]);
+        const std::string& p = parts[i];
+        if (p == "u32" || p == "s32") sgn.push_back(p[0] == 's');
+        else if (p == "sat" && !set) op.sat = true;
+        else if (p == "add" || (op.lanes == 1 && (p == "min" || p == "max"))) {
+          if (mad) return unsupported("vmad takes no secondary operation");
+          op.sec = p == "add" ? OpVideo::Sec::Add : p == "min" ? OpVideo::Sec::Min : OpVideo::Sec::Max;
+        } else if (set && cmp_table().count(p) && cmp_table().at(p) <= CmpOp::Ge && p != "lo" && p != "ls" &&
+                   p != "hi" && p != "hs") {
+          op.cmp = cmp_table().at(p);
+          have_cmp = true;
+        } else if (shift && (p == "clamp" || p == "wrap")) {
+          op.shift_wrap = p == "wrap";
+          have_mode = true;
+        } else if (mad && p == "po") op.po = true;
+        else if (mad && (p == "shr7" || p == "shr15")) op.scale = p == "shr7" ? 7 : 15;
+        else return unsupported(op0 + " modifier '." + p + "'");
       }
-      if (tys.size() != 3) return unsupported(op0 + " form (expected .dtype.atype.btype)");
-      auto sgn = [](const std::string& t) { return !t.empty() && t[0] == 's'; };
-      op.d_signed = sgn(tys[0]);
-      op.a_signed = sgn(tys[1]);
-      op.b_signed = sgn(tys[2]);
+      // Types: dtype.atype.btype, or atype.btype for vset (whose result is
+      // unsigned); a shift's b is .u32.
+      if (sgn.size() != (set ? 2u : 3u)) return unsupported(op0 + " types");
+      if (set) {
+        op.a_signed = sgn[0];
+        op.b_signed = sgn[1];
+      } else {
+        op.d_signed = sgn[0];
+        op.a_signed = sgn[1];
+        op.b_signed = sgn[2];
+        if (shift && op.b_signed) return unsupported(op0 + "'s b type is .u32");
+      }
+      if (set && !have_cmp) return unsupported(op0 + " needs a comparison");
+      if (shift && !have_mode) return unsupported(op0 + " needs .clamp or .wrap");
+      if (op.lanes > 1 && op.sat && op.sec == OpVideo::Sec::Add)
+        return unsupported(op0 + ": .sat and .add together (ptxas refuses the combination)");
+      if (op.lanes > 1 && (shift || mad)) return unsupported(op0);
+      // Selectors. Scalar: .b0-.b3, .h0, .h1. SIMD: .hxy / .bxyzw (the
+      // source half-word or byte of each lane, highest lane first, from a's
+      // then b's), and a destination mask of lanes.
+      auto scalar_sel = [&](const std::string& w, int8_t* out) {
+        if (w.empty()) return true;
+        if (w.size() != 2) return false;
+        if (w[0] == 'b' && w[1] >= '0' && w[1] <= '3') *out = static_cast<int8_t>(w[1] - '0');
+        else if (w[0] == 'h' && w[1] >= '0' && w[1] <= '1') *out = static_cast<int8_t>(4 + w[1] - '0');
+        else return false;
+        return true;
+      };
+      auto simd_sel = [&](const std::string& w, std::array<uint8_t, 4>* out, bool is_a) {
+        const uint32_t n = std::min<uint32_t>(op.lanes, 4);
+        for (uint32_t i = 0; i < n; ++i)   // defaults: a's own lanes, b's own lanes
+          (*out)[i] = static_cast<uint8_t>(i + (is_a ? 0 : n));
+        if (w.empty()) return true;
+        if (w[0] != (n == 2 ? 'h' : 'b') || w.size() != n + 1) return false;
+        for (uint32_t i = 0; i < n; ++i) {
+          const int v = w[n - i] - '0';
+          if (v < 0 || v >= static_cast<int>(2 * n)) return false;
+          (*out)[i] = static_cast<uint8_t>(v);
+        }
+        return true;
+      };
+      const std::string dsel_w = take_video_selector();
       op.dst = expect_reg_operand(op0 + " destination");
+      if (op.lanes == 1) {
+        if (!scalar_sel(dsel_w, &op.dsel)) return unsupported(op0 + " destination selector '." + dsel_w + "'");
+        if (op.dsel >= 0 && mad) return unsupported("vmad takes no destination selector");
+        if (op.dsel >= 0 && op.sec != OpVideo::Sec::None)
+          return unsupported(op0 + ": a merge and a secondary operation together");
+      } else {
+        op.mask = static_cast<uint8_t>((1u << op.lanes) - 1);
+        if (!dsel_w.empty()) {
+          if (dsel_w[0] != (op.lanes == 2 ? 'h' : 'b')) return unsupported(op0 + " mask '." + dsel_w + "'");
+          op.mask = 0;
+          for (size_t i = 1; i < dsel_w.size(); ++i) {
+            const int v = dsel_w[i] - '0';
+            if (v < 0 || v >= static_cast<int>(op.lanes)) return unsupported(op0 + " mask '." + dsel_w + "'");
+            op.mask |= static_cast<uint8_t>(1u << v);
+          }
+        }
+      }
       expect_punct(",");
+      bool neg_a = false, neg_b = false;
+      if (peek_punct("-")) {
+        if (!mad || op.po) return unsupported(op0 + " with a negated operand");
+        next();
+        neg_a = true;
+      }
+      const std::string asel_w = take_video_selector();
       op.a = parse_operand();
-      // The byte/halfword selector forms pick which lane of the source each
-      // lane reads. Nothing emits them here yet, and guessing at the selection
-      // would silently permute the result.
-      if (peek_punct(".")) return unsupported(op0 + " with a lane selector");
       expect_punct(",");
+      if (peek_punct("-")) {
+        if (!mad || op.po) return unsupported(op0 + " with a negated operand");
+        next();
+        neg_b = true;
+      }
+      const std::string bsel_w = take_video_selector();
       op.b = parse_operand();
-      if (peek_punct(".")) return unsupported(op0 + " with a lane selector");
-      expect_punct(",");
-      op.c = parse_operand();
+      op.neg_ab = neg_a != neg_b;
+      if (op.lanes == 1) {
+        if (!scalar_sel(asel_w, &op.asel) || !scalar_sel(bsel_w, &op.bsel))
+          return unsupported(op0 + " operand selector");
+      } else if (!simd_sel(asel_w, &op.asel_v, true) || !simd_sel(bsel_w, &op.bsel_v, false)) {
+        return unsupported(op0 + " operand selector");
+      }
+      if (peek_punct(",")) {
+        next();
+        if (peek_punct("-")) {
+          if (!mad || op.po) return unsupported(op0 + " with a negated operand");
+          next();
+          op.neg_c = true;
+        }
+        op.c = parse_operand();
+        op.has_c = true;
+      }
+      if ((mad || op.lanes > 1 || op.sec != OpVideo::Sec::None || op.dsel >= 0) && !op.has_c)
+        return unsupported(op0 + " needs its c operand here");
       ins.op = op;
     } else if (op0 == "bfind") {
       OpBfind op;
@@ -3151,23 +3257,6 @@ class Parser {
       op.base = parse_operand();
       expect_punct(",");
       op.offset = parse_operand();
-      ins.op = op;
-    } else if (op0 == "vabsdiff") {
-      // The scalar form is |a-b|+c, which is sad's definition, so it shares
-      // the node. The SIMD forms (vabsdiff2/vabsdiff4) split the operands into
-      // halves or bytes and are a different instruction with a similar name.
-      if (parts.size() != 4) return unsupported("vabsdiff form (expected vabsdiff.dtype.atype.btype)");
-      OpSad op;
-      auto vty = parse_type_token(parts[1]);
-      if (!vty) return unsupported("vabsdiff type '." + parts[1] + "'");
-      op.ty = *vty;
-      op.dst = expect_reg_operand("vabsdiff destination");
-      expect_punct(",");
-      op.a = parse_operand();
-      expect_punct(",");
-      op.b = parse_operand();
-      expect_punct(",");
-      op.c = parse_operand();
       ins.op = op;
     } else if (op0 == "lop3") {
       // lop3.b32 d, a, b, c, immLut

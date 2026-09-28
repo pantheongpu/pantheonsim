@@ -4792,6 +4792,89 @@ VTEST(one_warp_reusing_its_own_shared_words_is_not_a_race) {
   VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{12});
 }
 
+// ---- the video instructions, against an RTX 3060 ----
+
+// Each case: the instruction (a in %r1, b in %r2, c in %r3, d in %r4), the
+// operands, and what the card gave. The rules the ISA leaves open or states
+// otherwise -- the 34-bit shift intermediate, vabsdiff's unsigned saturation
+// wrapping, vmad taking whole 32-bit operands as signed -- each have a case;
+// nvidia/tests/e2e/video_forms.cu covers 652 variants.
+VTEST(video_instructions_as_the_card_computes_them) {
+  struct Case { const char* ins; uint32_t a, b, c, want; };
+  const Case cases[] = {
+      {"vshl.u32.u32.u32.sat.clamp %r4, %r1, %r2", 0x7fffffff, 31, 0, 0x00000000},
+      {"vshl.u32.u32.u32.sat.clamp %r4, %r1, %r2", 1, 32, 0, 0xffffffff},
+      {"vshl.s32.s32.u32.sat.clamp %r4, %r1, %r2", 0x7fffffff, 31, 0, 0x80000000},
+      {"vshl.s32.s32.u32.sat.clamp %r4, %r1, %r2", 1, 31, 0, 0x7fffffff},
+      {"vabsdiff.u32.s32.u32.sat %r4, %r1, %r2", 0xaa02f263, 0xb3280f47, 0, 0x09251ce4},
+      {"vabsdiff.u32.u32.u32 %r4, %r1, %r2, %r3", 5, 9, 100, 4},  // c is ignored
+      {"vadd.u32.u32.u32.sat %r4, %r1, %r2", 0xffffffff, 1, 0, 0},
+      {"vsub.s32.s32.s32.sat %r4, %r1, %r2", 0x80000000, 1, 0, 0x80000000},
+      {"vmin.s32.s32.s32.max %r4, %r1.b2, %r2, %r3", 0x00ff0000, 5, 0xfffffff0, 0xffffffff},
+      {"vadd.u32.u32.u32 %r4.h1, %r1, %r2, %r3", 0x00010002, 0x00030004, 0xaaaabbbb, 0x0004bbbb},
+      {"vadd.u32.u32.u32 %r4.b3, %r1, %r2, %r3", 0x12, 0x34, 0x11223344, 0x46223344},
+      {"vmad.u32.u32.u32.sat %r4, %r1, %r2, %r3", 1, 0xffffffff, 0x8000, 0x00007fff},
+      {"vmad.u32.u32.u32.sat %r4, %r1, %r2, %r3", 0x80000000, 0x7f, 0x1f, 0},
+      {"vmad.u32.u32.u32.sat %r4, %r1, %r2, %r3", 0xffffffff, 0x80000000, 0x80, 0x80000080},
+      {"vmad.u32.u32.u32.shr7 %r4, %r1.h0, %r2.h1, %r3", 0x7fffffff, 0x01ff807f, 0x80000000, 0xff03fdfc},
+      {"vmad.s32.u32.s32.sat %r4, %r1, %r2, %r3", 0x80000000, 0x7f, 0x1f, 0x80000000},
+      {"vmad.s32.u32.s32.sat %r4, %r1, %r2, %r3", 0xffffffff, 0x80000000, 0x80, 0x7fffffff},
+      {"vmad.u32.u32.u32.sat.shr15 %r4, %r1, %r2, %r3", 0, 0x7fff, 0xffffffff, 0xffffffff},
+      {"vmad.s32.s32.u32.sat %r4, %r1.h0, -%r2, %r3", 1, 0xffffffff, 0x8000, 0x00008001},
+      {"vmad.u32.u32.u32.po %r4, %r1.b1, %r2.b3, %r3", 0x0300, 0x05000000, 10, 0x1a},
+      {"vadd4.u32.u32.u32.sat %r4, %r1, %r2, %r3", 0xff017f80, 0x01ff0180, 0, 0xffff80ff},
+      {"vadd2.s32.s32.s32.add %r4, %r1, %r2, %r3", 0x00050003, 0xfffe0004, 100, 0x6e},
+      {"vabsdiff4.u32.u32.u32 %r4.b20, %r1.b7250, %r2.b0123, %r3", 0x04030201, 0x40302010, 0xaaaaaaaa,
+       0xaa01aa03},
+      {"vset4.u32.u32.lt %r4, %r1, %r2, %r3", 0x01020304, 0x02020202, 0, 0x01000000},
+      {"vset2.s32.s32.le.add %r4, %r1, %r2, %r3", 0xffff0005, 5, 7, 9},
+      {"vavrg4.s32.s32.s32 %r4, %r1, %r2, %r3", 0x7f80ff01, 0x7f800002, 0, 0x7f80ff02},
+  };
+  constexpr size_t n = sizeof cases / sizeof cases[0];
+  std::string body;
+  for (size_t i = 0; i < n; ++i) {
+    char line[256];
+    std::snprintf(line, sizeof line,
+                  "    mov.u32 %%r1, %u;\n    mov.u32 %%r2, %u;\n    mov.u32 %%r3, %u;\n    %s;\n"
+                  "    st.global.u32 [%%rd2+%zu], %%r4;\n",
+                  cases[i].a, cases[i].b, cases[i].c, cases[i].ins, 4 * i);
+    body += line;
+  }
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+)" + body + "    ret;\n}\n";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4 * n);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  for (size_t i = 0; i < n; ++i) {
+    const auto got = static_cast<uint32_t>(e.mem.load_scalar(out + 4 * i, 4));
+    if (got != cases[i].want)
+      std::fprintf(stderr, "  %s (a=%08x b=%08x c=%08x): %08x, the card gave %08x\n", cases[i].ins, cases[i].a,
+                   cases[i].b, cases[i].c, got, cases[i].want);
+    VCHECK_EQ(got, cases[i].want);
+  }
+}
+
+VTEST(video_instructions_refuse_forms_the_isa_does_not_have) {
+  // vmad takes a negation but the other scalar forms do not; .po excludes it.
+  for (const char* ins : {"vadd.u32.u32.u32 %r4, -%r1, %r2", "vmad.u32.u32.u32.po %r4, -%r1, %r2, %r3"}) {
+    std::string ptx = std::string(kHeader) + R"(
+.visible .entry k()
+{
+    .reg .b32 %r<5>;
+    )" + ins + ";\n    ret;\n}\n";
+    auto err = VCAPTURE(Error, ptx::parse(ptx));
+    VCHECK(err.code() == Err::UnsupportedPtx);
+    VCHECK_CONTAINS(err.what(), "with a negated operand");
+  }
+}
+
 // ---- extended-precision arithmetic (the condition-code carry bit) ----
 //
 // These are what a compiler emits when it synthesises arithmetic wider than the
