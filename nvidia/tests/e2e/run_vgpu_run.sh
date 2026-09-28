@@ -40,6 +40,16 @@ check "a missing program exits 127" "cannot execute" -- \
 check "--print-env shows what would be set" "VGPU_RACE=1" -- \
   "$vgpu" run --gpu nvidia/a10 --race --print-env /bin/true
 
+# A program that names no CUDA library -- an interpreter whose extension
+# modules load CUDA later, like python with PyTorch, whose libraries carry an
+# RPATH to NVIDIA's -- gets every CUDA library the shim carries preloaded.
+pre_env="$("$vgpu" run --gpu nvidia/a10 --preload --print-env /bin/true 2>&1)"
+check "--preload of a program naming no CUDA library preloads the driver" "/libcuda.so.1" -- echo "$pre_env"
+check "... and the runtime" "/libcudart.so." -- echo "$pre_env"
+if [[ -e "$build/shim/libcudnn.so.9" ]]; then
+  check "... and cuDNN" "/libcudnn.so.9" -- echo "$pre_env"
+fi
+
 # An ordinary program is passed through with no advice at all: the checks below
 # must not fire on everything that happens not to link CUDA.
 out="$("$vgpu" run --quiet --gpu nvidia/a10 /bin/sh -c 'exit 42' 2>&1)"

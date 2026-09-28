@@ -425,6 +425,17 @@ VGPU_EXPORT CUptiResult cuptiActivitySetAttribute(CUpti_ActivityAttribute, size_
 }
 VGPU_EXPORT CUptiResult cuptiActivityEnableLatencyTimestamps(uint8_t) { return CUPTI_SUCCESS; }
 VGPU_EXPORT CUptiResult cuptiEnableNonOverlappingMode(void) { return CUPTI_SUCCESS; }
+// Per-function filters on API activity records, a timestamp source of the
+// caller's, and device-side timestamps for CUDA events: none is modelled --
+// every API record is kept, times are the host's, and the simulated device
+// keeps no clock -- so each says so. PyTorch's profiler (Kineto) links all
+// four and carries on when told.
+VGPU_EXPORT CUptiResult cuptiActivityEnableDriverApi(CUpti_CallbackId, uint8_t) { return CUPTI_ERROR_NOT_SUPPORTED; }
+VGPU_EXPORT CUptiResult cuptiActivityEnableRuntimeApi(CUpti_CallbackId, uint8_t) { return CUPTI_ERROR_NOT_SUPPORTED; }
+VGPU_EXPORT CUptiResult cuptiActivityRegisterTimestampCallback(CUpti_TimestampCallbackFunc) {
+  return CUPTI_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUptiResult cuptiActivityEnableCudaEventDeviceTimestamps(uint8_t) { return CUPTI_ERROR_NOT_SUPPORTED; }
 VGPU_EXPORT CUptiResult cuptiDisableNonOverlappingMode(void) { return CUPTI_SUCCESS; }
 
 /* ---- events and metrics ----

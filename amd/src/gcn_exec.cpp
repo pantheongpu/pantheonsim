@@ -275,6 +275,37 @@ struct Machine {
     if (addr % size == 0) return m.store_scalar(addr, size, v);
     for (uint32_t b = 0; b < size; ++b) m.store_scalar(addr + b, 1, (v >> (8 * b)) & 0xFF);
   }
+  // Two to four words, as a wide load or store moves them: each aligned pair
+  // of words as one 8-byte access, the way the hardware moves them. Another
+  // device's kernel, on another host thread, reading while this one writes
+  // sees each pair old or new, never half of each -- which RCCL's LL protocol
+  // counts on: a word of data and the flag that says it has arrived share
+  // eight bytes, and the reader trusts the data once it sees the flag.
+  // Moved a word at a time, it could read the old data, then the new flag.
+  static constexpr uint32_t kMaxWords = 16;
+  void load_words(uint64_t addr, uint32_t n, uint32_t* out) const {
+    for (uint32_t k = 0; k < n;) {
+      if (k + 1 < n && (addr + 4 * k) % 8 == 0) {
+        const uint64_t v = load(addr + 4 * k, 8);
+        out[k] = static_cast<uint32_t>(v), out[k + 1] = static_cast<uint32_t>(v >> 32);
+        k += 2;
+      } else {
+        out[k] = static_cast<uint32_t>(load(addr + 4 * k, 4));
+        k += 1;
+      }
+    }
+  }
+  void store_words(uint64_t addr, uint32_t n, const uint32_t* words) {
+    for (uint32_t k = 0; k < n;) {
+      if (k + 1 < n && (addr + 4 * k) % 8 == 0) {
+        store(addr + 4 * k, 8, words[k] | uint64_t{words[k + 1]} << 32);
+        k += 2;
+      } else {
+        store(addr + 4 * k, 4, words[k]);
+        k += 1;
+      }
+    }
+  }
   // The memory an address is in: the launching device's, or a peer's the
   // kernel was given access to -- each device's window is where its ordinal
   // puts it (vgpu/memory.hpp). An address in neither goes to the device's
@@ -3580,11 +3611,23 @@ struct Machine {
           write_lane(w, data, lane, fits(offset, n.bytes) ? widen(load(addr, n.bytes), n) : 0);
         }
       } else if (body.rfind("load_dword", 0) == 0) {
-        for (uint32_t k = 0; k < data.width; ++k)
-          set_word(w, data, k, lane, fits(offset + 4 * k, 4) ? static_cast<uint32_t>(load(addr + 4 * k, 4)) : 0);
+        if (data.width <= kMaxWords && fits(offset, 4 * data.width)) {
+          uint32_t words[kMaxWords];
+          load_words(addr, data.width, words);
+          for (uint32_t k = 0; k < data.width; ++k) set_word(w, data, k, lane, words[k]);
+        } else {  // partly out of range: the words past the end read zero
+          for (uint32_t k = 0; k < data.width; ++k)
+            set_word(w, data, k, lane, fits(offset + 4 * k, 4) ? static_cast<uint32_t>(load(addr + 4 * k, 4)) : 0);
+        }
       } else if (body.rfind("store_dword", 0) == 0) {
-        for (uint32_t k = 0; k < data.width; ++k)
-          if (fits(offset + 4 * k, 4)) store(addr + 4 * k, 4, word(w, data, k, lane));
+        if (data.width <= kMaxWords && fits(offset, 4 * data.width)) {
+          uint32_t words[kMaxWords];
+          for (uint32_t k = 0; k < data.width; ++k) words[k] = word(w, data, k, lane);
+          store_words(addr, data.width, words);
+        } else {  // partly out of range: the words past the end are dropped
+          for (uint32_t k = 0; k < data.width; ++k)
+            if (fits(offset + 4 * k, 4)) store(addr + 4 * k, 4, word(w, data, k, lane));
+        }
       } else if (atomic) {
         const bool wide = body == "atomic_cmpswap_x2";
         const uint32_t bytes = wide ? 8 : 4;
@@ -3697,15 +3740,21 @@ struct Machine {
           if (narrow_store) store(addr, n.bytes, lane_src(w, in.src[1], lane));
           else write_lane(w, in.dst[0], lane, widen(load(addr, n.bytes), n));
           break;
-        case Kind::Load:
+        case Kind::Load: {
           // One word, or two, or four: a register each, in order.
-          for (uint32_t k = 0; k < in.dst[0].width; ++k)
-            set_word(w, in.dst[0], k, lane, static_cast<uint32_t>(load(addr + 4 * k, 4)));
+          uint32_t words[kMaxWords];
+          if (in.dst[0].width > kMaxWords) throw Error::make(Err::Unsupported, "memory instruction ", op, " moves more than 16 words");
+          load_words(addr, in.dst[0].width, words);
+          for (uint32_t k = 0; k < in.dst[0].width; ++k) set_word(w, in.dst[0], k, lane, words[k]);
           break;
-        case Kind::Store:
-          for (uint32_t k = 0; k < in.src[1].width; ++k)
-            store(addr + 4 * k, 4, word(w, in.src[1], k, lane));
+        }
+        case Kind::Store: {
+          uint32_t words[kMaxWords];
+          if (in.src[1].width > kMaxWords) throw Error::make(Err::Unsupported, "memory instruction ", op, " moves more than 16 words");
+          for (uint32_t k = 0; k < in.src[1].width; ++k) words[k] = word(w, in.src[1], k, lane);
+          store_words(addr, in.src[1].width, words);
           break;
+        }
         case Kind::StoreHi16:
           store(addr, 2, lane_src(w, in.src[1], lane) >> 16);
           break;

@@ -150,6 +150,7 @@ add_library(vgpu STATIC
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
   src/runtime/runtime.cpp
+  src/runtime/shared_runtime.cpp
 )
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 
@@ -215,6 +216,19 @@ add_custom_command(TARGET vgpurocprof POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocprofiler-sdk.so.1.0.0" "${CMAKE_BINARY_DIR}/shim/librocprofiler-sdk.so"
   COMMENT "Creating rocprofiler-sdk shim symlinks (build/shim/librocprofiler-sdk.so.1)")
 
+# librocm_smi64: what RCCL asks ROCm SMI about the GPUs it connects (their
+# count, PCI addresses and links), answered from the HIP shim, so RCCL starts
+# on simulated GPUs on a machine with no AMD kernel driver.
+add_library(vgpursmi SHARED amd/src/rocm_smi.cpp)
+target_link_libraries(vgpursmi PRIVATE vgpuhip)
+target_include_directories(vgpursmi PRIVATE amd/include)
+set_target_properties(vgpursmi PROPERTIES OUTPUT_NAME rocm_smi64 SOVERSION 7 VERSION 7.8.0
+  CXX_VISIBILITY_PRESET hidden)
+add_custom_command(TARGET vgpursmi POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocm_smi64.so.7.8.0" "${CMAKE_BINARY_DIR}/shim/librocm_smi64.so.7"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocm_smi64.so.7.8.0" "${CMAKE_BINARY_DIR}/shim/librocm_smi64.so"
+  COMMENT "Creating ROCm SMI shim symlinks (build/shim/librocm_smi64.so.7)")
 # ---------------------------------------------------------------------------
 # libvgpucudart: the CUDA *runtime* API shim. Lets unmodified nvcc-compiled
 # applications (built against shared cudart) run on VirtualGPU. Requires the
@@ -509,7 +523,8 @@ if(CUDA_ABI_INCLUDE)
     NO_DEFAULT_PATH)
   if(CUDNN_INCLUDE)
     message(STATUS "cuDNN headers at ${CUDNN_INCLUDE}: building libvgpucudnn")
-    add_library(vgpucudnn SHARED nvidia/src/cudnn_api.cpp nvidia/src/generated/cudnn_stubs.cpp)
+    add_library(vgpucudnn SHARED nvidia/src/cudnn_api.cpp nvidia/src/cudnn_backend.cpp nvidia/src/cudnn_rnn.cpp
+      nvidia/src/generated/cudnn_stubs.cpp)
     target_link_libraries(vgpucudnn PRIVATE vgpu vgpucudart)
     target_include_directories(vgpucudnn PRIVATE ${CUDNN_INCLUDE} ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpucudnn PROPERTIES OUTPUT_NAME cudnn SOVERSION 9 VERSION 9.0)
@@ -707,6 +722,14 @@ target_include_directories(test_amd_rocprofiler PRIVATE tests/framework amd/incl
 target_compile_definitions(test_amd_rocprofiler PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME test_amd_rocprofiler COMMAND test_amd_rocprofiler)
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
+# ROCm SMI's answers to RCCL, from RCCL's side, on Instinct and Radeon GPUs.
+add_executable(test_amd_rocm_smi amd/tests/unit/test_rocm_smi.cpp)
+target_link_libraries(test_amd_rocm_smi PRIVATE vgpursmi vgpuhip)
+target_include_directories(test_amd_rocm_smi PRIVATE tests/framework)
+add_test(NAME test_amd_rocm_smi COMMAND test_amd_rocm_smi)
+set_tests_properties(test_amd_rocm_smi PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
+add_test(NAME test_amd_rocm_smi_radeon COMMAND test_amd_rocm_smi)
+set_tests_properties(test_amd_rocm_smi_radeon PROPERTIES ENVIRONMENT "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
 add_test(NAME amd_rocprofiler_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofiler_abi.sh)
 add_test(NAME amd_rocprofv3 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofv3.sh)
 set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
@@ -1411,6 +1434,33 @@ endif()
 # Memory a graph owns: an allocation node, a free node, what the graph-memory
 # attributes report, and a trim that keeps the address it documents as fixed.
 if(TARGET vgpucudart)
+  # PyTorch's CUDA build, unmodified, on a simulated RTX 5090: the whole-model
+  # checks the AMD GPUs run (amd/tests/pytorch/models.py), through
+  # `vgpu run --preload`, where a Python with PyTorch for CUDA 13 is installed
+  # (VGPU_TORCH_CUDA_PYTHON); it skips elsewhere. nvidia/docs/pytorch.md.
+  add_test(NAME e2e_pytorch_models_rtx5090 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
+           ${CMAKE_SOURCE_DIR}/amd/tests/pytorch/models.py 12 nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_models_rtx5090 PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
+  # cuDNN's graph API, BatchNorm training and RNNs, and cuBLASLt with a cuBLAS
+  # handle -- the paths PyTorch's CUDA build takes -- against host references.
+  add_test(NAME e2e_dnn_paths COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dnn_paths.sh)
+  set_tests_properties(e2e_dnn_paths PROPERTIES
+    DEPENDS "vgpucudart;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+  # The runtime and driver APIs sharing one simulated machine.
+  add_test(NAME e2e_mixed_apis COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mixed_apis.sh)
+  set_tests_properties(e2e_mixed_apis PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   add_test(NAME e2e_graph_memory COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_memory.sh)
   set_tests_properties(e2e_graph_memory PROPERTIES
     DEPENDS vgpucudart

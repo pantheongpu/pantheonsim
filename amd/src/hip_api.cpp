@@ -249,6 +249,9 @@ struct State {
   std::map<const void*, HostFunction> host_functions;
   std::map<const void*, HostVar> host_vars;
   std::set<std::pair<int, int>> peers;           // (device, peer) pairs with access enabled
+  // Devices whose memory holds another process's opened IPC allocations:
+  // every other device reaches them, without hipDeviceEnablePeerAccess.
+  std::set<int> ipc_mapped;
   std::map<hipStream_t, Graph> capturing;        // streams recording rather than running
   // Each device's hostcall buffer, made when a kernel is first launched on it:
   // what device-side printf writes through (vgpu/amd_hostcall.hpp).
@@ -531,11 +534,14 @@ hipError_t prepare_launch(State& s, int ordinal, const Module& module, const Ker
   job->stream = stream;
   job->cooperative = cooperative;
   job->hostcall = hostcall.get();
+  const auto reach = [&](int to) {
+    if (job->peers.size() <= static_cast<size_t>(to)) job->peers.resize(static_cast<size_t>(to) + 1);
+    job->peers[static_cast<size_t>(to)] = &s.rt->device(to).memory();
+  };
   for (const auto& [from, to] : s.peers)
-    if (from == ordinal) {
-      if (job->peers.size() <= static_cast<size_t>(to)) job->peers.resize(static_cast<size_t>(to) + 1);
-      job->peers[static_cast<size_t>(to)] = &s.rt->device(to).memory();
-    }
+    if (from == ordinal) reach(to);
+  for (const int to : s.ipc_mapped)
+    if (to != ordinal) reach(to);
   job->profile_id = s.profile_id;
   return hipSuccess;
 }
@@ -3667,6 +3673,12 @@ hipError_t hipIpcOpenMemHandle(void** ptr, vgpu::amd::abi::IpcMemHandle handle, 
     return record(s, fail(hipErrorInvalidValue, e.what()));
   }
   g_ipc_open[*ptr] = d;
+  // hipIpcMemLazyEnablePeerAccess, which RCCL passes, and which is what an
+  // opened handle behaves as on a card anyway: the memory is mapped where
+  // the exporter's device is numbered here, and this process's other devices
+  // reach it without asking. RCCL's kernels on device 0 write straight into
+  // the other process's buffer on device 1.
+  s.ipc_mapped.insert(d);
   return record(s, hipSuccess);
 }
 hipError_t hipIpcCloseMemHandle(void* ptr) {
