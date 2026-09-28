@@ -2936,7 +2936,6 @@ cudaError_t fill_from_resource(const cudaResourceDesc* res, vgpu::exec::TextureD
     case cudaResourceTypeMipmappedArray: {
       auto it = g_mipmapped.find(reinterpret_cast<uint64_t>(res->res.mipmap.mipmap));
       if (it == g_mipmapped.end()) return cudaErrorInvalidValue;
-      if (it->second.flags & (cudaArrayLayered | cudaArrayCubemap)) return cudaErrorNotSupported;
       const auto& lv = it->second.levels;
       if (lv.empty() || lv.size() > 17) return cudaErrorInvalidValue;
       const ArrayRec& a = g_arrays.at(lv[0]);
@@ -2944,6 +2943,12 @@ cudaError_t fill_from_resource(const cudaResourceDesc* res, vgpu::exec::TextureD
       d->width = a.width;
       d->height = a.height;
       d->depth = a.depth;
+      // Layered and cubemap mipmaps: every level has all the layers (and
+      // faces), each of that level's size. Level 0's depth is the slice
+      // count, as cudaMallocMipmappedArray keeps extent.depth for them.
+      d->cubemap = it->second.flags & cudaArrayCubemap;
+      if (it->second.flags & cudaArrayLayered) d->layers = d->cubemap ? a.depth / 6 : a.depth;
+      if (d->cubemap || d->layers) d->depth = 0;
       d->pitch_bytes = a.width * a.texel_bytes;
       d->texel_bytes = a.texel_bytes;
       d->channels = channels_of(a.fmt);
