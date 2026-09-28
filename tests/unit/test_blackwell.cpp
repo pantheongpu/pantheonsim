@@ -623,7 +623,6 @@ VTEST(tcgen05_refuses_what_is_not_implemented_by_name) {
   VCHECK_CONTAINS(parse("tcgen05.mma.cta_group::1.kind::f16.ashift [a], [b], d, a, p;").message(), "ashift");
   VCHECK_CONTAINS(parse("tcgen05.mma.cta_group::1.kind::f16.block_scale [a], d, d, a, [b], [b], p;").message(),
                   ".block_scale");
-  VCHECK_CONTAINS(parse("tcgen05.ld.red.sync.aligned.32x32b.x2.max.f32 {a, b}, a, [a];").message(), "tcgen05.ld.red");
 }
 
 // ---- tcgen05.ld / tcgen05.st ------------------------------------------------------
@@ -771,6 +770,132 @@ VTEST(tcgen05_pack_and_unpack_16b) {
     VCHECK_EQ(g[4], r5);
     VCHECK_EQ(g[5], r6);
   }
+}
+
+// tcgen05.ld.red (sm_103f): the four columns a thread loads, reduced into
+// redval, as min and max define it (9.7.3.11-12): -0.0 below +0.0, a NaN
+// ignored unless .NaN (then the canonical NaN), .abs comparing magnitudes.
+// The loaded registers are the plain load's.
+namespace {
+std::vector<uint32_t> run_ld_red(const std::string& mods, const std::vector<std::array<uint32_t, 4>>& rows,
+                                 const char* header = kHeader103a) {
+  const std::string ptx = std::string(header) + R"(
+.visible .entry k(.param .u64 in, .param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<6>;
+    .shared .align 4 .b32 slot;
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd4, [out];
+    mov.u32 %r1, %tid.x;
+    tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [slot], 32;
+    ld.shared.u32 %r4, [slot];
+    mul.wide.u32 %rd3, %r1, 16;
+    add.u64 %rd2, %rd1, %rd3;
+    ld.global.v4.u32 {%r5, %r6, %r7, %r8}, [%rd2];
+    tcgen05.st.sync.aligned.32x32b.x4.b32 [%r4], {%r5, %r6, %r7, %r8};
+    tcgen05.wait::st.sync.aligned;
+    tcgen05.ld.red.sync.aligned.32x32b.x4)" + mods + R"( {%r9, %r10, %r11, %r12}, %r13, [%r4];
+    tcgen05.wait::ld.sync.aligned;
+    mul.wide.u32 %rd3, %r1, 32;
+    add.u64 %rd5, %rd4, %rd3;
+    st.global.v4.u32 [%rd5], {%r9, %r10, %r11, %r12};
+    st.global.u32 [%rd5+16], %r13;
+    tcgen05.dealloc.cta_group::1.sync.aligned.b32 %r4, 32;
+    ret;
+}
+)";
+  MemoryManager mem{1 << 20};
+  std::vector<uint32_t> in(32 * 4, 0);
+  for (size_t t = 0; t < rows.size(); ++t) std::copy(rows[t].begin(), rows[t].end(), in.begin() + 4 * t);
+  const uint64_t pin = mem.alloc(in.size() * 4), out = mem.alloc(32 * 32);
+  mem.write(pin, in.data(), in.size() * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(pin), arg_u64(out)}, mem, load_gpu("nvidia/b300"));
+  std::vector<uint32_t> got(32 * 8);
+  mem.read(out, got.data(), got.size() * 4);
+  for (size_t t = 0; t < rows.size(); ++t)   // the loaded registers are the plain load's
+    for (int j = 0; j < 4; ++j) VCHECK_EQ(got[t * 8 + j], rows[t][j]);
+  std::vector<uint32_t> red(rows.size());
+  for (size_t t = 0; t < rows.size(); ++t) red[t] = got[t * 8 + 4];
+  return red;
+}
+constexpr uint32_t kPZero = 0x00000000u, kNZero = 0x80000000u, kQNaN = 0x7FC00000u, kCanon = 0x7FFFFFFFu;
+uint32_t fbits(float f) { return f32_bits(f); }
+// Results as hex, so a mismatch prints.
+std::string hexes(const std::vector<uint32_t>& v) {
+  std::string out;
+  char buf[12];
+  for (uint32_t x : v) {
+    std::snprintf(buf, sizeof buf, "%08x ", x);
+    out += buf;
+  }
+  return out;
+}
+}  // namespace
+
+VTEST(tcgen05_ld_red_f32_min_max_abs_nan) {
+  const std::vector<std::array<uint32_t, 4>> rows = {
+      {fbits(1.5f), fbits(-2.0f), fbits(0.25f), fbits(3.0f)},
+      {kPZero, kNZero, kPZero, kPZero},            // signed zeros
+      {fbits(4.0f), kQNaN, fbits(-1.0f), fbits(2.0f)},      // a NaN among numbers
+      {kQNaN, kQNaN, kQNaN, kQNaN},                // nothing but NaN
+      {fbits(-8.0f), fbits(3.0f), fbits(-0.5f), fbits(7.0f)},
+  };
+  auto want = [](std::vector<uint32_t> v) { return hexes(v); };
+  VCHECK_EQ(hexes(run_ld_red(".max.f32", rows)), want({fbits(3.0f), kPZero, fbits(4.0f), kCanon, fbits(7.0f)}));
+  VCHECK_EQ(hexes(run_ld_red(".min.f32", rows)), want({fbits(-2.0f), kNZero, fbits(-1.0f), kCanon, fbits(-8.0f)}));
+  VCHECK_EQ(hexes(run_ld_red(".max.abs.f32", rows)), want({fbits(3.0f), kPZero, fbits(4.0f), kCanon, fbits(8.0f)}));
+  VCHECK_EQ(hexes(run_ld_red(".min.abs.f32", rows)), want({fbits(0.25f), kPZero, fbits(1.0f), kCanon, fbits(0.5f)}));
+  VCHECK_EQ(hexes(run_ld_red(".max.NaN.f32", rows)), want({fbits(3.0f), kPZero, kCanon, kCanon, fbits(7.0f)}));
+}
+
+VTEST(tcgen05_ld_red_integers) {
+  const std::vector<std::array<uint32_t, 4>> rows = {{5u, 0xFFFFFFFFu, 7u, 2u}, {0x80000000u, 1u, 0u, 0x7FFFFFFFu}};
+  VCHECK_EQ(hexes(run_ld_red(".max.u32", rows)), hexes(std::vector<uint32_t>{0xFFFFFFFFu, 0x80000000u}));
+  VCHECK_EQ(hexes(run_ld_red(".min.u32", rows)), hexes(std::vector<uint32_t>{2u, 0u}));
+  VCHECK_EQ(hexes(run_ld_red(".max.s32", rows)), hexes(std::vector<uint32_t>{7u, 0x7FFFFFFFu}));
+  VCHECK_EQ(hexes(run_ld_red(".min.s32", rows)), hexes(std::vector<uint32_t>{0xFFFFFFFFu, 0x80000000u}));
+}
+
+// The forms CUDA 13.2's ptxas assembles for sm_103a.
+VTEST(tcgen05_ld_red_parses_what_ptxas_accepts) {
+  auto m = ptx::parse(std::string(kHeader103a) + R"(
+.visible .entry k()
+{
+    .reg .b32 a, b, c, d, e, t;
+    tcgen05.ld.red.sync.aligned.32x32b.x4.max.f32 {a, b, c, d}, e, [t];
+    tcgen05.ld.red.sync.aligned.32x32b.x4.min.abs.f32 {a, b, c, d}, e, [t];
+    tcgen05.ld.red.sync.aligned.32x32b.x2.max.NaN.f32 {a, b}, e, [t];
+    tcgen05.ld.red.sync.aligned.32x32b.x2.max.abs.NaN.f32 {a, b}, e, [t];
+    tcgen05.ld.red.sync.aligned.32x32b.x2.min.u32 {a, b}, e, [t];
+    tcgen05.ld.red.sync.aligned.32x32b.x2.max.s32 {a, b}, e, [t];
+    tcgen05.ld.red.sync.aligned.16x32bx2.x2.max.f32 {a, b}, e, [t], 16;
+    ret;
+}
+)");
+  VCHECK_EQ(m.entries.size(), size_t{1});
+}
+
+VTEST(tcgen05_ld_red_refuses_what_the_isa_rules_out) {
+  auto parse = [](const char* header, const std::string& ins) {
+    return VCAPTURE(Error, ptx::parse(std::string(header) +
+                                      ".visible .entry k()\n{\n .reg .b32 a, b, c;\n " + ins + "\n ret;\n}\n"));
+  };
+  VCHECK_CONTAINS(parse(kHeader100a, "tcgen05.ld.red.sync.aligned.32x32b.x2.max.f32 {a, b}, c, [a];").message(),
+                  "sm_103f");
+  VCHECK_CONTAINS(parse(kHeader103a, "tcgen05.ld.red.sync.aligned.32x32b.x1.max.f32 {a}, c, [a];").message(), ".x2");
+  VCHECK_CONTAINS(parse(kHeader103a, "tcgen05.ld.red.sync.aligned.16x64b.x2.max.f32 {a, b}, c, [a];").message(),
+                  "shapes");
+  VCHECK_CONTAINS(parse(kHeader103a, "tcgen05.ld.red.sync.aligned.32x32b.x2.max.abs.u32 {a, b}, c, [a];").message(),
+                  ".f32 only");
+  VCHECK_CONTAINS(parse(kHeader103a, "tcgen05.ld.red.sync.aligned.32x32b.x2.f32 {a, b}, c, [a];").message(),
+                  ".min or .max");
+  VCHECK_CONTAINS(
+      parse(kHeader103a, "tcgen05.ld.red.spcompress.sync.aligned.32x32b.x4.max.f32 {a}, {a}, c, [a];")
+          .message(),
+      "sm_107");
 }
 
 // A warp reaches only its quarter of the lanes (9.7.18.8.1), and only

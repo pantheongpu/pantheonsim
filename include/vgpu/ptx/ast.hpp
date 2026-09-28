@@ -413,6 +413,12 @@ struct OpTcgen05 {
   // addresses): the SM number, and whether it is the arch-specific (a) one.
   int target_sm = 0;
   bool target_arch = false;
+  // tcgen05.ld.red (sm_103f): the loaded columns of each thread reduced into
+  // `red_dst` -- min or max, over f32 (optionally of magnitudes, or NaN if
+  // any is) or u32/s32.
+  bool red = false, red_max = false, red_abs = false, red_nan = false;
+  char red_type = 'f';   // 'f' f32, 'u' u32, 's' s32
+  Reg red_dst;
   bool has_zero_mask = false;
   Operand zero_mask;
   Operand d_tmem, a, b_desc, idesc, enable_d;

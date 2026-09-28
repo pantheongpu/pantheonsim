@@ -222,7 +222,15 @@ kernels use:
     the field to the next buffer's start.
   - Other operand layouts are refused, since the ISA doesn't say what the
     mode means for them.
-- **What stays refused:** sm_103's `tcgen05.ld.red`, and sm_107's forms.
+- **`tcgen05.ld.red`** (sm_103f and later in the family, not sm_100).
+  - It loads as `tcgen05.ld` does, at `.32x32b` or `.16x32bx2`, `.x2` or
+    more, and reduces each thread's loaded values into `redval`.
+  - The operation is min or max over f32, or over u32/s32.
+  - f32 follows `min`/`max` (9.7.3.11-12): -0.0 is below +0.0, and a NaN is
+    ignored unless `.NaN`, which gives the canonical NaN. `.abs` compares
+    magnitudes.
+  - `.spcompress` (sm_107) is refused.
+- **What stays refused:** sm_107's forms.
 
 The profile's SM count (148) is unverified. NVIDIA gives "up to 160 SMs ...
 available SM count varies by SKU". The PCI device (0x3182, "B300 SXM6 AC")
@@ -278,7 +286,6 @@ before waiting for it is not caught here.
   the last row". It doesn't say whether the MMA reads A before or after the
   shift, whether rows cross the 32-lane quarters, or what row 0 holds. No
   public code uses it to check against.
-- **`tcgen05.ld.red`** (sm_103/sm_110).
 - **The sm_107 additions** (`kind::ti16`, `decompress::lut`).
 - **TMA's `.im2col::w` modes.** The ISA shows their halo walk only in
   figures. They leave open where `::w::128`'s halos come from and whether a

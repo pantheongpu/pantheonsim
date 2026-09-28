@@ -2719,6 +2719,7 @@ class Parser {
       else if (what == "shift") op.kind = Tcgen05Kind::Shift;
       else return unsupported("tcgen05." + what);
       bool have_shape = false, have_num = false, have_kind = false, mbar_arrive = false;
+      bool have_red_op = false, have_red_ty = false;
       for (size_t i = 2; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         unsigned num = 0;
@@ -2768,8 +2769,13 @@ class Parser {
         else if (op.ws && p.rfind("collector::", 0) == 0)
           return unsupported("tcgen05.mma.ws takes a B collector (.collector::b0-b3::op), not '." + p + "'");
         else if (p.rfind("collector::", 0) == 0) ;
-        else if (p == "red")
-          return unsupported("tcgen05.ld.red (sm_103 and sm_110, not the B200's sm_100)");
+        else if (p == "red" && op.kind == Tcgen05Kind::Ld) op.red = true;
+        else if (op.red && (p == "min" || p == "max")) { op.red_max = p == "max"; have_red_op = true; }
+        else if (op.red && p == "abs") op.red_abs = true;
+        else if (op.red && p == "NaN") op.red_nan = true;
+        else if (op.red && (p == "f32" || p == "u32" || p == "s32")) { op.red_type = p[0]; have_red_ty = true; }
+        else if (p == "spcompress")
+          return unsupported("tcgen05.ld." + p + " (sm_107) is not implemented");
         else if (p == "sp" && op.kind == Tcgen05Kind::Mma) op.sparse = true;
         else if (p == "ws" && op.kind == Tcgen05Kind::Mma) op.ws = true;
         else if (p == "kind::mxf8f6f4") { op.mma_kind = Tcgen05MmaKind::MXF8F6F4; have_kind = true; }
@@ -2842,9 +2848,34 @@ class Parser {
             if (!imm || imm->value < 0) fail(ins.line, ".16x32bx2 needs an immediate immHalfSplitoff");
             op.half_split = static_cast<uint32_t>(imm->value);
           };
+          if (op.red) {
+            // tcgen05.ld.red (9.7.18.8.3): sm_103f and the family targets after
+            // it, and sm_101a/sm_110a -- not the B200's sm_100.
+            const std::string arch = target_.substr(0, target_.find(','));
+            int sm = 0;
+            std::sscanf(arch.c_str(), "sm_%d", &sm);
+            if (!(sm == 101 || sm == 103 || sm == 110))
+              fail(ins.line, "tcgen05.ld.red requires an sm_103f, sm_110f or sm_101a/sm_110a target (not "
+                             "sm_100's); this module targets " + (arch.empty() ? std::string("nothing") : arch));
+            if (!have_red_op || !have_red_ty)
+              return unsupported("tcgen05.ld.red needs .min or .max and a type (.f32, .u32, .s32)");
+            if (op.shape != Tcgen05Shape::S32x32b && op.shape != Tcgen05Shape::S16x32bx2)
+              return unsupported("tcgen05.ld.red takes the .32x32b and .16x32bx2 shapes only");
+            if (op.num < 2) return unsupported("tcgen05.ld.red needs .x2 or more");
+            if (op.pack16) return unsupported("tcgen05.ld.red takes no .pack::16b");
+            if (op.red_type != 'f' && (op.red_abs || op.red_nan))
+              return unsupported("tcgen05.ld.red's .abs and .NaN are for .f32 only");
+          } else if (have_red_op || have_red_ty) {
+            return unsupported("tcgen05." + what + " with a reduction's qualifiers but no .red");
+          }
           if (op.kind == Tcgen05Kind::Ld) {
             op.regs = parse_reg_vector_any();
             expect_punct(",");
+            if (op.red) {
+              op.red_dst = expect_reg_operand("tcgen05.ld.red's redval");
+              if (op.red_dst.wide) return unsupported("tcgen05.ld.red's redval is a 32-bit register");
+              expect_punct(",");
+            }
             op.taddr = bracketed();
             imm_split();
           } else {

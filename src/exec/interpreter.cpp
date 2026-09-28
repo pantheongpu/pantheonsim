@@ -6891,6 +6891,44 @@ class Interpreter {
       }
     if (ld)
       for (size_t j = 0; j < op.regs.size(); ++j) write_reg(w, op.regs[j], m, vals[j], 32);
+    if (op.red) {
+      // .red (9.7.18.8.3): each thread's loaded columns, reduced. f32 as min
+      // and max define it: -0.0 below +0.0, a NaN input ignored unless .NaN
+      // (then the result is the canonical NaN), .abs comparing magnitudes.
+      Lanes out{};
+      for (uint32_t th = 0; th < W_; ++th) {
+        uint32_t acc = 0;
+        bool have = false, nan = false;
+        for (size_t j = 0; j < vals.size(); ++j) {
+          uint32_t v = static_cast<uint32_t>(vals[j][th]);
+          if (op.red_type == 'f') {
+            if (op.red_abs) v &= 0x7FFFFFFFu;
+            if (std::isnan(f32(v))) {
+              nan = true;
+              continue;
+            }
+          }
+          if (!have) {
+            acc = v;
+            have = true;
+            continue;
+          }
+          bool less;   // v < acc
+          if (op.red_type == 'f') {
+            const float a = f32(v), b = f32(acc);
+            less = a < b || (a == b && std::signbit(a) && !std::signbit(b));
+          } else if (op.red_type == 's') {
+            less = static_cast<int32_t>(v) < static_cast<int32_t>(acc);
+          } else {
+            less = v < acc;
+          }
+          if (op.red_max ? (!less && v != acc) : less) acc = v;
+        }
+        if (op.red_type == 'f' && (!have || (nan && op.red_nan))) acc = 0x7FFFFFFFu;
+        out[th] = acc;
+      }
+      write_reg(w, op.red_dst, m, out, 32);
+    }
   }
 
   // tcgen05.commit: an arrive-on, count 1, on the barrier -- or with
