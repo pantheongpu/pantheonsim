@@ -2034,10 +2034,10 @@ VTEST(integer_division_by_zero_follows_the_hardware) {
   auto m = ptx::parse(ptx);
   uint64_t out = e.mem.alloc(8);
   exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
-  // Deterministic, which is more than hardware promises: all-ones for the
-  // quotient, the dividend for the remainder.
+  // What an RTX 3060 gives: all ones for the quotient and the remainder
+  // alike (the remainder was once taken to be the dividend, a guess).
   VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0xFFFFFFFF});
-  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{7});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0xFFFFFFFF});
 }
 
 VTEST(lane_masks_have_the_values_warp_algorithms_depend_on) {
@@ -6225,7 +6225,7 @@ VTEST(cvt_float_to_64bit_int_saturates_at_the_limits) {
   VCHECK_EQ(e.mem.load_scalar(out + 16, 8), 0xffffffffffffffffull);   // +inf -> u64 max
   VCHECK_EQ(e.mem.load_scalar(out + 24, 8), 0xffffffffffffffffull);   // 2^64 -> u64 max
   VCHECK_EQ(e.mem.load_scalar(out + 32, 8), 0x8000000000000000ull);   // -inf -> s64 min
-  VCHECK_EQ(e.mem.load_scalar(out + 40, 8), 0ull);                    // NaN -> 0
+  VCHECK_EQ(e.mem.load_scalar(out + 40, 8), 0x8000000000000000ull);   // NaN -> the sign bit (an RTX 3060)
 }
 
 // Malformed PTX gets a precise parse error, never a crash, a wrong register or

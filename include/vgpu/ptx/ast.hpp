@@ -173,6 +173,7 @@ struct OpCvta { Type ty; Space space = Space::Generic; bool to_space = false; Re
 // roundf compile to, so conflating them with the bare modes leaves those
 // intrinsics returning their input.
 enum class Round { None, Rn, Rz, Rm, Rp, Rni, Rzi, Rmi, Rpi };
+enum class FRound { Nearest, Zero, MinusInf, PlusInf };
 // .sat clamps a float result to [0.0, 1.0] (NaN to +0) and an integer one to
 // the destination's range; .ftz flushes f32 subnormal inputs and results to
 // sign-preserving zero.
@@ -187,8 +188,8 @@ struct OpCvt {
 // (measured on an RTX 3060).
 struct OpCvtTf32 { bool rna = false, rz = false, satfinite = false, relu = false; Reg dst; Operand src; };
 struct OpNot { Type ty; Reg dst; Operand src; };   // bitwise not
-struct OpNeg { Type ty; Reg dst; Operand src; };   // arithmetic negate (int/float)
-struct OpAbs { Type ty; Reg dst; Operand src; };
+struct OpNeg { Type ty; Reg dst; Operand src; bool ftz = false; };   // arithmetic negate (int/float)
+struct OpAbs { Type ty; Reg dst; Operand src; bool ftz = false; };
 
 // Single-operand math: the SFU-approximated transcendentals plus sqrt/rcp.
 // VirtualGPU computes them at full host precision; results are within the
@@ -197,7 +198,9 @@ struct OpAbs { Type ty; Reg dst; Operand src; };
 enum class MathOp { Ex2, Lg2, Sin, Cos, Sqrt, Rsqrt, Rcp, Tanh };
 // packed is the .f16x2/.bf16x2 form: two independent 16-bit results in one
 // 32-bit register. The type carries which of f16/bf16 the halves are.
-struct OpMath { MathOp op; Type ty; bool packed = false; Reg dst; Operand src; };
+// round: sqrt/rcp's .rn/.rz/.rm/.rp (the IEEE forms; .approx is left to
+// host precision). ftz: f32 subnormal inputs and results to signed zero.
+struct OpMath { MathOp op; Type ty; bool packed = false; Reg dst; Operand src; FRound round = FRound::Nearest; bool exact = false; bool ftz = false; };
 
 // Bitfield extract/insert.
 struct OpBfe { Type ty; Reg dst; Operand a, b, c; };        // b=start, c=len
@@ -294,7 +297,6 @@ struct OpStMatrix {
 // The warp-wide tensor-core multiply-accumulate. Distinct from wmma, which is
 // the older whole-fragment API: this one names the exact shape and the
 // registers each lane holds.
-enum class FRound { Nearest, Zero, MinusInf, PlusInf };
 // E3M2/E2M3/E2M1 sit in 8-bit containers (.kind::f8f6f4, .kind::mxf8f6f4);
 // E2M1P is e2m1 packed two to a byte (.kind::mxf4, .kind::mxf4nvf4).
 enum class MmaElem { F16, BF16, TF32, S8, U8, S4, U4, B1, E4M3, E5M2, F64, E3M2, E2M3, E2M1, E2M1P };
@@ -708,7 +710,7 @@ struct OpShf { bool left = false; bool wrap = false; Reg dst; Operand a, b, c; }
 // about, so the modifier cannot be dropped.
 // .sat clamps the result to [0, 1] (a NaN to +0); min/max.xorsign.abs take
 // the smaller/larger magnitude with the sign sign(a) ^ sign(b).
-struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; bool nan_propagate = false; Type ty; Reg dst; Operand a, b; bool sat = false; bool xorsign_abs = false; };
+struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; bool nan_propagate = false; Type ty; Reg dst; Operand a, b; bool sat = false; bool xorsign_abs = false; bool ftz = false; };
 struct OpFma { Type ty; Reg dst; Operand a, b, c; FRound round = FRound::Nearest; bool sat = false; bool ftz = false; };
 // Packed half2 SIMD: one 32-bit register holds two f16 lanes.
 // Half-precision arithmetic. One node covers four shapes, because they differ
@@ -852,6 +854,9 @@ struct OpSetp {
   bool negate_c = false;
   bool has_q = false;
   Reg dst2;
+  // setp.f16x2/.bf16x2: two comparisons, the low halves' into p and the high
+  // halves' into q (measured).
+  bool packed = false;
 };
 // set.<cmp>.<dtype>.<stype> d, a, b -- setp's sibling that writes a value
 // instead of a predicate. The result depends on the destination type, not on
@@ -863,6 +868,9 @@ struct OpSet {
   Type dty;         // destination type: decides true's encoding
   Type sty;         // source type: decides how a and b are compared
   bool packed = false;  // f16x2/bf16x2: two independent comparisons
+  // set.{u32,s32}.f16x2: packed sources, and 0xffff in each half that
+  // compares true (measured).
+  bool packed_int_dst = false;
   Reg dst;
   Operand a, b;
   // set.<cmp>.<bop>...: the comparison combined with a predicate, as setp's.

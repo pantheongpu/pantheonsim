@@ -3025,7 +3025,7 @@ class Interpreter {
 
   bool fast_setp(Warp& w, const Instr& ins, const OpSetp& op, Mask m) {
     if (op.ty.bits != 32 || op.ty.is_bfloat() || !narrow_operand(op.a) || !narrow_operand(op.b) ||
-        op.has_bop || op.has_q)
+        op.has_bop || op.has_q || op.packed)
       return false;
     Lanes32 sa, sb;
     const Lanes32& a = read_narrow(w, ins, op.a, sa);
@@ -3102,7 +3102,7 @@ class Interpreter {
   }
 
   bool fast_float_bin(Warp& w, const Instr& ins, const OpFloatBin& op, Mask m) {
-    if (op.round != FRound::Nearest || op.nan_propagate || op.sat || op.xorsign_abs || op.ty.bits != 32 || !op.ty.is_float() ||
+    if (op.round != FRound::Nearest || op.nan_propagate || op.sat || op.xorsign_abs || op.ftz || op.ty.bits != 32 || !op.ty.is_float() ||
         op.dst.wide || !narrow_operand(op.a) || !narrow_operand(op.b) || mem_.alu_fault_armed())
       return false;
     Lanes32 sa, sb;
@@ -3336,9 +3336,22 @@ class Interpreter {
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
-      Mask t = 0;
-      for (uint32_t lane = 0; lane < W_; ++lane)
-        if ((m & (Mask{1} << lane)) && compare(op->cmp, op->ty, a[lane], b[lane])) t |= Mask{1} << lane;
+      Mask t = 0, thi = 0;
+      if (op->packed) {
+        // f16x2/bf16x2: the low halves decide p, the high halves q.
+        auto half = [&](uint64_t v, int h) {
+          const uint64_t x = (v >> (16 * h)) & 0xFFFF;
+          return op->ty.is_bfloat() ? bf16_to_double(x) : f16_to_double(x);
+        };
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) {
+            if (compare_float(op->cmp, half(a[lane], 0), half(b[lane], 0))) t |= Mask{1} << lane;
+            if (compare_float(op->cmp, half(a[lane], 1), half(b[lane], 1))) thi |= Mask{1} << lane;
+          }
+      } else {
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if ((m & (Mask{1} << lane)) && compare(op->cmp, op->ty, a[lane], b[lane])) t |= Mask{1} << lane;
+      }
       // With a boolean operation: p = t bop c and q = !t bop c. c is read
       // before either destination is written, since it may be one of them.
       Mask pv = t, qv = ~t;
@@ -3349,7 +3362,9 @@ class Interpreter {
           return op->bop == PredBinOp::And ? (x & c) : op->bop == PredBinOp::Or ? (x | c) : (x ^ c);
         };
         pv = combine(t);
-        qv = combine(~t);
+        qv = combine(op->packed ? thi : ~t);
+      } else if (op->packed) {
+        qv = thi;
       }
       Mask& p = pred_slot(w, op->dst);
       p = (p & ~m) | (pv & m);
@@ -3381,17 +3396,23 @@ class Interpreter {
         case FRound::Nearest: break;
       }
       const uint64_t sign = uint64_t{1} << (op->ty.bits - 1);
+      // .ftz (f32): subnormal inputs and results to signed zero.
+      auto flush = [&](uint64_t x) {
+        return op->ftz && (x & 0x7F800000u) == 0 ? (x & 0x80000000u) : x;
+      };
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
+          const uint64_t av = flush(a[lane]), bvv = flush(b[lane]);
           if (op->xorsign_abs) {
             // The smaller/larger magnitude, signed sign(a) ^ sign(b); a NaN
             // operand is ignored as in plain min/max (unless .NaN).
-            uint64_t v = float_bin(op->op, op->ty, a[lane] & ~sign, b[lane] & ~sign, op->nan_propagate);
-            if (!float_is_nan(op->ty, v)) v = (v & ~sign) | ((a[lane] ^ b[lane]) & sign);
+            uint64_t v = float_bin(op->op, op->ty, av & ~sign, bvv & ~sign, op->nan_propagate);
+            if (!float_is_nan(op->ty, v)) v = (v & ~sign) | ((av ^ bvv) & sign);
             r[lane] = v;
           } else {
-            r[lane] = float_bin(op->op, op->ty, a[lane], b[lane], op->nan_propagate);
+            r[lane] = float_bin(op->op, op->ty, av, bvv, op->nan_propagate);
           }
+          r[lane] = flush(r[lane]);
           if (op->sat) r[lane] = float_sat(op->ty, r[lane]);
         }
       if (op->round != FRound::Nearest) {
@@ -3531,7 +3552,9 @@ class Interpreter {
           // destination gets all ones, a float destination gets 1.0. Writing 1
           // into an integer destination is the easy mistake, and it makes
           // every use of the result as a mask select a single bit.
-          if (op->packed) {
+          if (op->packed_int_dst) {
+            out |= (t ? 0xFFFFull : 0ull) << (16 * h);
+          } else if (op->packed) {
             const uint64_t one = op->dty.is_bfloat() ? double_to_bf16(1.0) : double_to_f16(1.0);
             out |= (t ? one : 0ull) << (16 * h);
           } else if (dfloat) {
@@ -3698,7 +3721,7 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
           if (op->ty.kind == Type::Kind::F)
-            r[lane] = op->ty.bits == 32 ? f32bits(-f32(v[lane])) : f64bits(-f64(v[lane]));
+            r[lane] = float_sign_op(op->ty.bits, v[lane], op->ftz, /*negate=*/true);
           else
             r[lane] = static_cast<uint64_t>(-static_cast<int64_t>(v[lane]));
         }
@@ -4323,10 +4346,15 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
           const uint32_t bits = static_cast<uint32_t>(mv[lane]);
-          const uint32_t base = static_cast<uint32_t>(bv[lane]) & 31u;
+          const uint32_t base = static_cast<uint32_t>(bv[lane]);
           const int32_t off = static_cast<int32_t>(static_cast<uint32_t>(ov[lane]));
           uint32_t found = 0xFFFFFFFFu;
-          if (off > 0) {
+          // An offset of INT_MIN gives 0 whatever the mask and base, and a
+          // base past bit 31 otherwise finds nothing (it is not taken modulo
+          // 32) -- both measured on an RTX 3060, over 650 cases.
+          if (off == INT32_MIN) found = 0;
+          else if (base > 31) ;
+          else if (off > 0) {
             int32_t n = off;
             for (int i = static_cast<int>(base); i < 32; ++i)
               if ((bits >> i) & 1u) { if (--n == 0) { found = static_cast<uint32_t>(i); break; } }
@@ -4404,14 +4432,16 @@ class Interpreter {
       Mask& dst = pred_slot(w, op->dst);
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
-          const double v = op->ty.bits == 64 ? f64(a[lane]) : static_cast<double>(f32(a[lane]));
-          const bool nan = std::isnan(v);
-          const bool inf = std::isinf(v);
-          // "Normal" excludes zero, subnormal, infinity and NaN -- and
-          // std::isnormal already means exactly that, including for zero,
-          // which is the case a hand-rolled exponent check usually gets wrong.
-          const bool normal = std::isnormal(v);
-          const bool subnormal = !nan && !inf && v != 0.0 && !normal;
+          // Classified at the operand's own width: an f32 subnormal widened to
+          // a double is a normal double, which made testp.normal.f32 true and
+          // testp.subnormal.f32 false for every f32 subnormal.
+          const int cls = op->ty.bits == 64 ? std::fpclassify(f64(a[lane])) : std::fpclassify(f32(a[lane]));
+          const bool nan = cls == FP_NAN;
+          const bool inf = cls == FP_INFINITE;
+          // Zero counts as normal: finite and not subnormal is what the card
+          // answers (testp.normal of +0 and -0 is true on an RTX 3060).
+          const bool normal = cls == FP_NORMAL || cls == FP_ZERO;
+          const bool subnormal = cls == FP_SUBNORMAL;
           bool t = false;
           switch (op->op) {
             case TestpOp::Finite: t = !nan && !inf; break;
@@ -4509,8 +4539,7 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
           if (op->ty.is_float())
-            r[lane] = op->ty.bits == 32 ? f32bits(std::fabs(f32(v[lane])))
-                                        : f64bits(std::fabs(f64(v[lane])));
+            r[lane] = float_sign_op(op->ty.bits, v[lane], op->ftz, /*negate=*/false);
           else {
             int64_t x = op->ty.bits == 64 ? static_cast<int64_t>(v[lane])
                                           : int64_t{static_cast<int32_t>(v[lane])};
@@ -4556,9 +4585,38 @@ class Interpreter {
             r[lane] = out;
             continue;
           }
+          if (op->exact) {
+            // sqrt/rcp.{rn,rz,rm,rp}: the IEEE operations, correctly rounded in
+            // that mode (the host's own, set for the operation).
+            const bool directed = op->round != FRound::Nearest;
+            const int prev = directed ? std::fegetround() : 0;
+            if (directed) {
+              g_directed_rounding.fetch_add(1, std::memory_order_relaxed);
+              std::fesetround(op->round == FRound::Zero       ? FE_TOWARDZERO
+                              : op->round == FRound::MinusInf ? FE_DOWNWARD
+                                                              : FE_UPWARD);
+            }
+            if (op->ty.bits == 32) {
+              float x = f32(v[lane]);
+              if (op->ftz && std::fpclassify(x) == FP_SUBNORMAL) x = std::copysign(0.0f, x);
+              volatile float one = 1.0f;
+              float y = op->op == MathOp::Sqrt ? std::sqrt(x) : one / x;
+              if (op->ftz && std::fpclassify(y) == FP_SUBNORMAL) y = std::copysign(0.0f, y);
+              r[lane] = canon32(y);
+            } else {
+              const double x = f64(v[lane]);
+              volatile double one = 1.0;
+              r[lane] = f64bits(op->op == MathOp::Sqrt ? std::sqrt(x) : one / x);
+            }
+            if (directed) {
+              std::fesetround(prev);
+              g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
+            }
+            continue;
+          }
           const double x = op->ty.bits == 32 ? static_cast<double>(f32(v[lane])) : f64(v[lane]);
           const double y = apply(x);
-          r[lane] = op->ty.bits == 32 ? f32bits(static_cast<float>(y)) : f64bits(y);
+          r[lane] = op->ty.bits == 32 ? canon32(static_cast<float>(y)) : f64bits(y);
         }
       // A half result still occupies a 32-bit register, packed or not.
       alu_fault(r, m, op->ty.bits == 16 ? 16u : op->ty.bits);
@@ -4817,8 +4875,16 @@ class Interpreter {
           // The sign bit is the top bit of each 16-bit half for both f16 and
           // bf16, so this is one mask either way; only how many halves take
           // part differs. neg flips it, abs clears it.
-          const uint64_t sign = op->packed ? 0x80008000ull : 0x00008000ull;
-          r[lane] = op->absolute ? (v[lane] & ~sign) : (v[lane] ^ sign);
+          // A NaN half comes out as the canonical 0x7fff (an RTX 3060), not
+          // with its sign flipped or cleared.
+          uint64_t out = 0;
+          for (int h = 0; h < (op->packed ? 2 : 1); ++h) {
+            uint64_t x = (v[lane] >> (16 * h)) & 0xFFFF;
+            if (half_nan(x, op->bf16)) x = kCanonicalNaN16;
+            else x = op->absolute ? (x & 0x7FFF) : (x ^ 0x8000);
+            out |= x << (16 * h);
+          }
+          r[lane] = op->packed ? out : (out | (v[lane] & 0xFFFF0000ull));
         }
       write_reg(w, op->dst, m, r, 32);
       return;
@@ -8797,12 +8863,16 @@ class Interpreter {
           return ((b >> 48) & 0x8000u) | 0x7E00u | ((b >> 42) & 0x3FFu);
         }
         if (d.bits == 16) return double_to_f16(x);
+        // With .ftz, an f32 NaN goes through f32 arithmetic first and comes
+        // out as the canonical NaN widened (measured); without, its payload
+        // is kept.
+        if (d.bits == 64 && s.bits == 32 && op->ftz && std::isnan(x)) return 0x7FFF'FFFF'E000'0000ull;
         if (d.bits == 64) return f64bits(x);
         const float f = static_cast<float>(x);
         if (op->ftz && subnormal32(f)) return f32bits(std::copysign(0.0f, f));
         // f32 to f32 goes through the float pipeline, which writes the
         // canonical NaN; a narrowing cvt.f32.f64 keeps the payload.
-        if (std::isnan(f) && s.bits == 32) return 0x7FFF'FFFFu;
+        if (std::isnan(f) && (s.bits == 32 || s.bits == 16)) return 0x7FFF'FFFFu;
         return f32bits(f);
       }
       // float -> int: round then clamp to the destination range.
@@ -8812,7 +8882,12 @@ class Interpreter {
       // converting 2^63 back was undefined: +inf and 2^63 came out as INT64_MIN
       // for s64, and as 0 for u64. The 32-bit limits are exact doubles, which is
       // why only the 64-bit conversions were wrong.
-      if (std::isnan(rounded)) return 0;
+      // NaN: 0 from an f32 or f16 into 32 bits or fewer; the destination's
+      // sign bit alone from an f64 into any width, or from an f32 into 64
+      // (an RTX 3060: cvt.rzi.s16.f64 of NaN is 0x8000, .s32.f64 and .u32.f64
+      // 0x80000000, cvt.rzi.s64.f32 and .u64.f32 0x8000000000000000).
+      if (std::isnan(rounded))
+        return (s.bits == 64 || d.bits == 64) ? uint64_t{1} << (d.bits - 1) : 0;
       if (d.is_signed()) {
         const double limit = std::ldexp(1.0, static_cast<int>(d.bits) - 1);
         const uint64_t max = (uint64_t{1} << (d.bits - 1)) - 1;
@@ -8909,7 +8984,10 @@ class Interpreter {
           // bugs -- it just cannot be the default.
           if (strict())
             ctx_fail(ins, -1, Err::InvalidValue, "integer division by zero");
-          return op == IntBinOp::Div ? narrow_u(~uint64_t{0}, ty.bits) : u(a);
+          // All ones for the quotient and the remainder alike, signed or not
+          // (an RTX 3060; the remainder was once taken to be the dividend).
+          (void)a;
+          return narrow_u(~uint64_t{0}, ty.bits);
         }
         // The one signed quotient that does not fit: INT64_MIN / -1 is a
         // SIGFPE on x86, and it is data, not a malformed kernel. It wraps, as
@@ -8968,6 +9046,21 @@ class Interpreter {
     if (std::isnan(y)) return a;
     if (x == y) return a & b & 0x80000000u ? a : (a & 0x7FFFFFFFu);   // zeros: +0 wins
     return x > y ? a : b;
+  }
+  // neg/abs on a float, as an RTX 3060 does them: an f32 NaN becomes the
+  // canonical NaN and .ftz flushes a subnormal to (signed) zero first; an f64
+  // NaN is left exactly as it is, sign included. Otherwise the sign is flipped
+  // or cleared.
+  static uint64_t float_sign_op(uint32_t bits, uint64_t v, bool ftz, bool negate) {
+    if (bits == 32) {
+      uint32_t x = static_cast<uint32_t>(v);
+      if ((x & 0x7F800000u) == 0x7F800000u && (x & 0x7FFFFFu)) return 0x7FFFFFFFu;
+      if (ftz && (x & 0x7F800000u) == 0) x &= 0x80000000u;
+      return negate ? x ^ 0x80000000u : x & 0x7FFFFFFFu;
+    }
+    const uint64_t sign = 0x8000'0000'0000'0000ull;
+    if (std::isnan(f64(v))) return v;
+    return negate ? v ^ sign : v & ~sign;
   }
   static bool float_is_nan(Type ty, uint64_t v) {
     if (ty.bits == 64) return std::isnan(f64(v));
