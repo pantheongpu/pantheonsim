@@ -179,7 +179,13 @@ enum class Round { None, Rn, Rz, Rm, Rp, Rni, Rzi, Rmi, Rpi };
 struct OpCvt {
   Type dst_ty; Type src_ty; Round round = Round::None; Reg dst; Operand src;
   bool sat = false, ftz = false;
+  bool relu = false;   // cvt.rn.relu.{f16,bf16}.f32: a negative result to +0, NaN to canonical
 };
+// cvt.{rna,rn,rz}[.satfinite][.relu].tf32.f32 d, a: a rounded to tf32, which
+// keeps f32's layout with the low 13 mantissa bits zero. .rna rounds ties
+// away, on the bits (add 0x1000, clear 13); a NaN is truncated, not rounded
+// (measured on an RTX 3060).
+struct OpCvtTf32 { bool rna = false, rz = false, satfinite = false, relu = false; Reg dst; Operand src; };
 struct OpNot { Type ty; Reg dst; Operand src; };   // bitwise not
 struct OpNeg { Type ty; Reg dst; Operand src; };   // arithmetic negate (int/float)
 struct OpAbs { Type ty; Reg dst; Operand src; };
@@ -231,7 +237,8 @@ enum class ReduxOp { Add, Min, Max, And, Or, Xor };
 struct OpRedux { ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand src; };
 // cvt.rn.f16x2.f32 d, a, b -- convert two f32 and pack them into one register,
 // a in the high half and b in the low half.
-struct OpCvtF16x2 { Reg dst; Operand a, b; bool bf16 = false; };
+// cvt.{rn,rz}[.relu][.satfinite].{f16x2,bf16x2}.f32 d, a, b.
+struct OpCvtF16x2 { Reg dst; Operand a, b; bool bf16 = false; bool rz = false, relu = false, satfinite = false; };
 // cvt.pack.sat.<to>.s32[.b32] d, a, b[, c]: a and b saturated to a 16-, 8-,
 // 4- or 2-bit integer type and packed, b in the low field and a above it;
 // for the narrower types the rest of d comes from the low bits of c.
@@ -442,7 +449,13 @@ struct OpStack {
   uint32_t align = 8;         // alloca's immAlign (8, the guaranteed minimum)
 };
 struct OpMovPred { Reg dst; Operand src; };
-struct OpPrmt { Reg dst; Operand a, b, c; };       // byte permute (default mode)
+// prmt.b32[.mode] d, a, b, c: byte permute. The default mode takes a
+// selector nibble per byte of d; the others take c's low two bits: f4e/b4e
+// read four bytes forward/backward through {b, a}, rc8 replicates byte s,
+// ecl/ecr clamp the byte index at s from the left/right, rc16 replicates
+// half-word s.
+enum class PrmtMode : uint8_t { Generic, F4e, B4e, Rc8, Ecl, Ecr, Rc16 };
+struct OpPrmt { Reg dst; Operand a, b, c; PrmtMode mode = PrmtMode::Generic; };
 // lop3.b32 d, a, b, c, immLut -- an arbitrary three-input boolean function,
 // selected by an 8-bit lookup table. ptxas fuses chains of and/or/xor/not into
 // these, so optimized PTX is full of them: any kernel doing bit manipulation,
@@ -475,7 +488,10 @@ struct OpMatch { bool all = false; Reg dst; Reg pred_dst; Operand a; Operand mem
 // instruction rather than a mul with a mask: the hi form takes bits 47:24 of
 // the 48-bit product, which masking the inputs of a 32-bit multiply cannot
 // produce.
-struct OpMul24 { bool hi = false; bool is_signed = false; Reg dst; Operand a, b; };
+// mul24/mad24.{lo,hi}[.sat].{u32,s32} d, a, b[, c]: the 48-bit product of a
+// and b's low 24 bits; .lo takes bits 31:0, .hi bits 47:16; mad24 adds c, and
+// .sat (mad24.hi.s32 only) clamps that sum to the s32 range.
+struct OpMul24 { bool hi = false; bool is_signed = false; Reg dst; Operand a, b; bool mad = false; bool sat = false; Operand c; };
 // szext.{clamp,wrap}.{u32,s32} d, a, b -- sign- or zero-extend a from bit b.
 struct OpSzext { bool wrap = false; bool is_signed = false; Reg dst; Operand a, b; };
 // fns.b32 d, mask, base, offset -- the position of the n-th set bit of mask,
@@ -656,6 +672,7 @@ struct OpIntBin {
   Operand a, b;
   bool carry_in = false;   // addc/subc: add the carry bit into the result
   bool carry_out = false;  // .cc: leave the carry-out in the condition code
+  bool sat = false;        // add/sub.sat.s32: clamp to the s32 range
 };
 struct OpMadLo {
   Type ty;
@@ -669,7 +686,7 @@ struct OpMadWide { bool is_signed = false; Reg dst; Operand a, b, c; };  // 32x3
 // High half of a same-width multiply. Compilers emit these to turn integer
 // division by a constant into a multiply, so they show up in ordinary code.
 struct OpMulHi { Type ty; Reg dst; Operand a, b; };
-struct OpMadHi { Type ty; Reg dst; Operand a, b, c; bool carry_in = false; bool carry_out = false; };
+struct OpMadHi { Type ty; Reg dst; Operand a, b, c; bool carry_in = false; bool carry_out = false; bool sat = false; };  // .sat: mad.hi.sat.s32 clamps the true sum
 struct OpShf { bool left = false; bool wrap = false; Reg dst; Operand a, b, c; };  // funnel shift b:a
 // PTX names an explicit rounding mode on float arithmetic. Unlike .approx,
 // which only relaxes accuracy, these change the result -- quantization kernels
@@ -678,16 +695,27 @@ struct OpShf { bool left = false; bool wrap = false; Reg dst; Operand a, b, c; }
 // NaN. Plain min/max return the non-NaN operand, which is fmin/fmax's rule --
 // the two disagree on exactly the inputs a numerically fragile kernel cares
 // about, so the modifier cannot be dropped.
-struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; bool nan_propagate = false; Type ty; Reg dst; Operand a, b; };
-struct OpFma { Type ty; Reg dst; Operand a, b, c; };
+// .sat clamps the result to [0, 1] (a NaN to +0); min/max.xorsign.abs take
+// the smaller/larger magnitude with the sign sign(a) ^ sign(b).
+struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; bool nan_propagate = false; Type ty; Reg dst; Operand a, b; bool sat = false; bool xorsign_abs = false; };
+struct OpFma { Type ty; Reg dst; Operand a, b, c; FRound round = FRound::Nearest; bool sat = false; bool ftz = false; };
 // Packed half2 SIMD: one 32-bit register holds two f16 lanes.
 // Half-precision arithmetic. One node covers four shapes, because they differ
 // only in how many 16-bit values a 32-bit register holds and how those bits
 // decode: f16 and bf16 scalars occupy the low half, f16x2 and bf16x2 pack two.
 // bf16 is not an f16 with a different bias -- it has f32's exponent range and
 // a 7-bit mantissa -- so the flag selects a different decode, not a scale.
-struct OpF16x2Bin { FloatBinOp op = FloatBinOp::Add; bool bf16 = false; bool packed = true; Reg dst; Operand a, b; };
-struct OpF16x2Fma { bool bf16 = false; bool packed = true; Reg dst; Operand a, b, c; };
+// The modifiers change results, so they are carried: the rounding mode, .ftz
+// (subnormal f16 inputs and results to signed zero), .sat (clamp to [0, 1], a
+// NaN to +0), .relu (a negative result to +0), and for min/max .NaN and
+// .xorsign.abs.
+struct HalfMods {
+  FRound round = FRound::Nearest;
+  bool ftz = false, sat = false, relu = false, nan_propagate = false, xorsign_abs = false;
+  bool any() const { return round != FRound::Nearest || ftz || sat || relu || nan_propagate || xorsign_abs; }
+};
+struct OpF16x2Bin { FloatBinOp op = FloatBinOp::Add; bool bf16 = false; bool packed = true; Reg dst; Operand a, b; HalfMods mods{}; };
+struct OpF16x2Fma { bool bf16 = false; bool packed = true; Reg dst; Operand a, b, c; HalfMods mods{}; };
 // neg and abs on half types: both are a mask over the sign bits, which sits in
 // the top bit of each 16-bit half for f16 and bf16 alike.
 struct OpF16x2Neg { bool bf16 = false; bool packed = true; bool absolute = false; Reg dst; Operand src; };
@@ -800,7 +828,20 @@ struct OpWmmaStore {
   std::vector<Operand> src;
   Operand stride;
 };
-struct OpSetp { CmpOp cmp = CmpOp::Eq; Type ty; Reg dst; Operand a, b; };
+// setp.<cmp>[.<bop>].<type> p[|q], a, b[, [!]c]: with a boolean operation,
+// p = (a cmp b) bop c, and the optional q = !(a cmp b) bop c.
+struct OpSetp {
+  CmpOp cmp = CmpOp::Eq;
+  Type ty;
+  Reg dst;
+  Operand a, b;
+  bool has_bop = false;
+  PredBinOp bop = PredBinOp::And;
+  Reg c;
+  bool negate_c = false;
+  bool has_q = false;
+  Reg dst2;
+};
 // set.<cmp>.<dtype>.<stype> d, a, b -- setp's sibling that writes a value
 // instead of a predicate. The result depends on the destination type, not on
 // the comparison: an integer d gets all-ones for true, a float d gets 1.0.
@@ -813,6 +854,11 @@ struct OpSet {
   bool packed = false;  // f16x2/bf16x2: two independent comparisons
   Reg dst;
   Operand a, b;
+  // set.<cmp>.<bop>...: the comparison combined with a predicate, as setp's.
+  bool has_bop = false;
+  PredBinOp bop = PredBinOp::And;
+  Reg c;
+  bool negate_c = false;
 };
 struct OpSelp { Type ty; Reg dst; Operand a, b; Reg pred; };
 struct OpPredBin { PredBinOp op = PredBinOp::And; Reg dst; Reg a, b; };
@@ -978,7 +1024,7 @@ struct OpCall {
 };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf, OpStack,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtTf32, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf, OpStack,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy>;
 

@@ -3339,7 +3339,8 @@ VTEST(mul24_szext_and_fns) {
   exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
   const uint64_t prod = uint64_t{0xFFFFFFu} * 0xFFFFFFu;   // 48 bits wide
   VCHECK_EQ(e.mem.load_scalar(out, 4), prod & 0xFFFFFFFFull);
-  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), (prod >> 24) & 0xFFFFFFFFull);
+  // .hi is bits 47:16 (the ISA's; an RTX 3060 gives 0xfffffe00 here).
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), (prod >> 16) & 0xFFFFFFFFull);
   VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{0xFFFFFFFFu});  // -1
   VCHECK_EQ(e.mem.load_scalar(out + 12, 4), uint64_t{255});
   VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{5});
@@ -3390,6 +3391,108 @@ VTEST(atom_cas_compares_with_b_and_stores_c) {
   VCHECK_EQ(e.mem.load_scalar(buf + 24, 8), uint64_t{5});
   VCHECK_EQ(e.mem.load_scalar(buf + 32, 4), uint64_t{5});   // shared: old
   VCHECK_EQ(e.mem.load_scalar(buf + 36, 4), uint64_t{7});   // and the store
+}
+
+// PTX forms a differential probe against an RTX 3060 found missing or wrong:
+// each case is an instruction (inputs in %r1, %r2, %r3, result in %r4) and
+// what the card gave for it.
+VTEST(ptx_forms_as_the_card_computes_them) {
+  struct Case { const char* ins; uint32_t a, b, c, want; };
+  const Case cases[] = {
+      // prmt's modes: f4e/b4e walk {b, a}; rc8/ecl/ecr/rc16 use c's low bits.
+      {"prmt.b32.f4e %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 1, 0xf0123456},
+      {"prmt.b32.b4e %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 0, 0xdebc9a78},
+      {"prmt.b32.rc8 %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 2, 0x34343434},
+      {"prmt.b32.ecl %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 1, 0x12345656},
+      {"prmt.b32.ecr %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 1, 0x56565678},
+      {"prmt.b32.rc16 %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 1, 0x12341234},
+      // setp/set with a boolean operation, and setp's second destination.
+      {"{ .reg .pred p, q; setp.ne.u32 q, %r3, 0; setp.lt.and.u32 p, %r1, %r2, q; selp.u32 %r4, 1, 0, p; }",
+       0x12345678, 0x9abcdef0, 0x0f1e2d3c, 1},
+      {"{ .reg .pred p, q; setp.lt.u32 p|q, %r1, %r2; selp.u32 %r4, 1, 2, q; }", 0x12345678, 0x9abcdef0, 0, 2},
+      {"{ .reg .pred p, q, r; setp.ne.u32 r, %r3, 0; setp.gt.xor.s32 p|q, %r1, %r2, !r; selp.u32 %r4, 1, 2, q; }",
+       0x12345678, 0x9abcdef0, 0x0f1e2d3c, 2},
+      {"{ .reg .pred r; setp.ne.u32 r, %r3, 0; set.lt.or.u32.u32 %r4, %r1, %r2, r; }", 0x12345678, 0x9abcdef0, 0x0f1e2d3c,
+       0xffffffff},
+      // mul24/mad24: .hi is bits 47:16; mad24.hi.sat clamps the true sum.
+      {"mul24.hi.u32 %r4, %r1, %r2", 0xffffff, 0xffffff, 0, 0xfffffe00},
+      {"mad24.lo.u32 %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 0x1234abcd, 0x2661cc4d},
+      {"mad24.hi.sat.s32 %r4, %r1, %r2, %r3", 0x7fffff, 0x7fffff, 0x7fffffff, 0x7fffffff},
+      {"mad24.hi.sat.s32 %r4, %r1, %r2, %r3", 0x800000, 0x7fffff, 0x80000000, 0x80000000},
+      {"mad24.hi.sat.s32 %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 0x1234abcd, 0x047b47fa},
+      // add/sub.sat.s32.
+      {"add.sat.s32 %r4, %r1, %r2", 0x7fffffff, 1, 0, 0x7fffffff},
+      {"add.sat.s32 %r4, %r1, %r2", 0x80000000, 0xffffffff, 0, 0x80000000},
+      {"sub.sat.s32 %r4, %r1, %r2", 0x80000000, 1, 0, 0x80000000},
+      {"sub.sat.s32 %r4, %r1, %r2", 0x7fffffff, 0xffffffff, 0, 0x7fffffff},
+      // f32: fma's rounding mode and .sat, add.sat, mul.rm, max.xorsign.abs.
+      {"{ .reg .f32 a,b,c; mov.b32 a, %r1; mov.b32 b, %r2; mov.b32 c, %r3; fma.rz.f32 a, a, b, c; mov.b32 %r4, a; }",
+       0x3f800001, 0x3f800001, 0x33800000, 0x3f800002},
+      {"{ .reg .f32 a,b,c; mov.b32 a, %r1; mov.b32 b, %r2; mov.b32 c, %r3; fma.rz.f32 a, a, b, c; mov.b32 %r4, a; }",
+       0x3f800001, 0xbf800001, 0xb3800000, 0xbf800002},
+      {"{ .reg .f32 a,b,c; mov.b32 a, %r1; mov.b32 b, %r2; mov.b32 c, %r3; fma.rn.sat.f32 a, a, b, c; mov.b32 %r4, a; }",
+       0x40000000, 0x40000000, 0, 0x3f800000},
+      {"{ .reg .f32 a,b,c; mov.b32 a, %r1; mov.b32 b, %r2; mov.b32 c, %r3; fma.rn.sat.f32 a, a, b, c; mov.b32 %r4, a; }",
+       0x7fc00000, 0x3f800000, 0, 0},
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; add.sat.f32 a, a, b; mov.b32 %r4, a; }", 0x3f400000, 0x3f400000,
+       0, 0x3f800000},
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; add.sat.f32 a, a, b; mov.b32 %r4, a; }", 0xbf800000, 0x3f000000,
+       0, 0},
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; mul.rm.f32 a, a, b; mov.b32 %r4, a; }", 0x3dcccccd, 0x40400000,
+       0, 0x3e999999},
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; max.xorsign.abs.f32 a, a, b; mov.b32 %r4, a; }", 0x3f800000,
+       0xc0000000, 0, 0xc0000000},
+      // Half precision: the modifiers once accepted and dropped.
+      {"max.xorsign.abs.f16x2 %r4, %r1, %r2", 0x3c00bc00, 0xc0004000, 0, 0xc000c000},
+      {"add.sat.f16x2 %r4, %r1, %r2", 0x3c00bc00, 0x38003400, 0, 0x3c000000},
+      {"add.ftz.f16x2 %r4, %r1, %r2", 0x00010001, 0x00020000, 0, 0},
+      {"max.NaN.f16x2 %r4, %r1, %r2", 0x7e003c00, 0x3c007e00, 0, 0x7fff7fff},
+      {"fma.rn.relu.f16x2 %r4, %r1, %r2, %r3", 0x3c00bc00, 0x3c003c00, 0, 0x3c000000},
+      // cvt: the packed form's .rz and .relu, and tf32.
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; cvt.rz.f16x2.f32 %r4, a, b; }", 0x3f800fff, 0xbf800fff, 0,
+       0x3c00bc00},
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; cvt.rn.relu.f16x2.f32 %r4, a, b; }", 0x7fc00000, 0x80000000, 0,
+       0x7fff0000},
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; cvt.rn.relu.f16x2.f32 %r4, a, b; }", 0xbf800000, 0x3f800000, 0,
+       0x00003c00},
+      {"{ .reg .f32 a; mov.b32 a, %r1; cvt.rna.tf32.f32 %r4, a; }", 0x3f801000, 0, 0, 0x3f802000},
+      {"{ .reg .f32 a; mov.b32 a, %r1; cvt.rna.tf32.f32 %r4, a; }", 0xff801fff, 0, 0, 0xff800000},
+      // isspacep.global: every generic address outside shared and local, null too.
+      {"{ .reg .pred p; .reg .u64 a; mov.b64 a, {%r1, %r2}; isspacep.global p, a; selp.u32 %r4, 1, 0, p; }", 0, 0, 0, 1},
+      // An immediate moved into an .f16x2 register.
+      {"{ .reg .f16x2 h; mov.b32 h, 0x3c00bc00; mov.b32 %r4, h; }", 0, 0, 0, 0x3c00bc00},
+      // pmevent does nothing a kernel can see.
+      {"{ pmevent 1; mov.u32 %r4, %r1; }", 7, 0, 0, 7},
+  };
+  constexpr size_t n = sizeof cases / sizeof cases[0];
+  std::string body;
+  for (size_t i = 0; i < n; ++i) {
+    char line[512];
+    std::snprintf(line, sizeof line,
+                  "    mov.u32 %%r1, %u;\n    mov.u32 %%r2, %u;\n    mov.u32 %%r3, %u;\n    %s%s\n"
+                  "    st.global.u32 [%%rd2+%zu], %%r4;\n",
+                  cases[i].a, cases[i].b, cases[i].c, cases[i].ins, cases[i].ins[0] == '{' ? "" : ";", 4 * i);
+    body += line;
+  }
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+)" + body + "    ret;\n}\n";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4 * n);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  for (size_t i = 0; i < n; ++i) {
+    const auto got = static_cast<uint32_t>(e.mem.load_scalar(out + 4 * i, 4));
+    if (got != cases[i].want)
+      std::fprintf(stderr, "  %s (a=%08x b=%08x c=%08x): %08x, the card gave %08x\n", cases[i].ins, cases[i].a,
+                   cases[i].b, cases[i].c, got, cases[i].want);
+    VCHECK_EQ(got, cases[i].want);
+  }
 }
 
 VTEST(lop3_computes_the_truth_table_it_is_given) {
