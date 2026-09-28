@@ -3262,13 +3262,10 @@ VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
       if (tex->filterMode == cudaFilterModeLinear) d.filter = vgpu::exec::TexFilter::Linear;
       if (tex->sRGB) return cudaErrorNotSupported;
       if (tex->maxAnisotropy > 1) return cudaErrorNotSupported;
-      // The border colour is taken as zero, the default. One a program sets
-      // with border addressing is refused rather than quietly replaced.
-      bool border = false;
-      for (int i = 0; i < 3; ++i) border |= tex->addressMode[i] == cudaAddressModeBorder;
-      if (border && (tex->borderColor[0] != 0 || tex->borderColor[1] != 0 ||
-                     tex->borderColor[2] != 0 || tex->borderColor[3] != 0))
-        return cudaErrorNotSupported;
+      // What border addressing returns outside the texture, converted to the
+      // texture's format at the fetch.
+      static_assert(sizeof d.border_bits == sizeof tex->borderColor);
+      std::memcpy(d.border_bits, tex->borderColor, sizeof d.border_bits);
       d.normalized_coords = tex->normalizedCoords != 0;
       // Mip selection, held as the hardware does in 1/256ths of a level,
       // truncated toward zero.
