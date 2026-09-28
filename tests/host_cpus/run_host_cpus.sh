@@ -18,7 +18,10 @@ if (( got >= 1 && got <= visible )); then echo "ok    as is: $got, within the $v
 else echo "FAIL  as is: $got, outside 1..$visible"; fail=1; fi
 
 if command -v taskset >/dev/null; then
-  check "pinned to one CPU" 1 "$(taskset -c 0 "$bin")"
+  # The first CPU this process may use, which need not be CPU 0: a CI runner
+  # confined to CPUs 4-7 cannot pin anything to 0.
+  first=$(taskset -cp $$ | sed 's/.*: *//; s/[^0-9].*//')
+  check "pinned to one CPU ($first)" 1 "$(taskset -c "$first" "$bin")"
 else
   echo "SKIP  pinned to one CPU: no taskset"
 fi
