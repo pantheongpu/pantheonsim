@@ -237,6 +237,19 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   and `sin.approx` of tiny inputs follow the documented error bounds, not the
   card's bits; ptxas miscompiles `szext` with a register width on sm_86 (the
   card extends from 0 bits), so the ISA's meaning is kept.
+- A second sweep, 378 variants of the everyday instructions (integer and bit
+  operations, f32/f64 with every rounding mode and .ftz, comparisons,
+  conversions between every integer and float width, half precision),
+  e2e_ptx_sweep. Fixed from it: sqrt/rcp.{rn,rz,rm,rp} ignored the rounding
+  mode (and .ftz); f32 add/sub/mul/div/min/max ignored .ftz; testp classified
+  f32 values as doubles (an f32 subnormal came out normal) and the card calls
+  zero normal; neg/abs give the canonical NaN (f32 and halves) and leave an
+  f64 NaN untouched; rem by zero is all ones, not the dividend; fns finds
+  nothing from a base past 31 and returns 0 for an offset of INT_MIN; a NaN
+  converted to an integer is 0 from f32/f16 into 32 bits or fewer and the
+  destination's sign bit otherwise; cvt.f32.f16 of a NaN is 0x7fffffff and
+  cvt.ftz.f64.f32 widens the canonical NaN; setp/set on f16x2 with p|q and
+  with an integer destination.
 - Half precision beyond f16x2: f16, bf16, f16x2 and bf16x2 arithmetic
   (add/sub/mul/fma/neg/min/max), the same four types on every transcendental,
   and atom/red.add on all of them. bf16 is a different decode, not a scaled

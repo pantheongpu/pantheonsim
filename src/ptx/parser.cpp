@@ -2113,6 +2113,7 @@ class Parser {
       if (!ty) fail(ins.line, "abs missing type");
       OpAbs op;
       op.ty = *ty;
+      op.ftz = std::find(parts.begin(), parts.end(), "ftz") != parts.end();
       op.dst = expect_reg_operand("abs destination");
       expect_punct(",");
       op.src = parse_operand();
@@ -2126,13 +2127,19 @@ class Parser {
       Type ty{};
       bool have_ty = false;
       bool packed_half = false;
+      FRound mround = FRound::Nearest;
+      bool exact = false, mftz = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
-        // approx/rn/rz/ftz/full select precision on hardware; VirtualGPU always
-        // computes at host precision (documented divergence).
-        if (p == "approx" || p == "rn" || p == "rz" || p == "rm" || p == "rp" || p == "ftz" ||
-            p == "full")
-          ;
+        // .approx/.full select a hardware approximation, computed here at host
+        // precision (documented divergence). .rn/.rz/.rm/.rp on sqrt and rcp
+        // are the IEEE forms: correctly rounded in that mode, so applied.
+        if (p == "approx" || p == "full") ;
+        else if (p == "ftz") mftz = true;
+        else if (p == "rn" || p == "rz" || p == "rm" || p == "rp") {
+          exact = true;
+          mround = p == "rz" ? FRound::Zero : p == "rm" ? FRound::MinusInf : p == "rp" ? FRound::PlusInf : FRound::Nearest;
+        }
         else if (p == "f16x2") { ty = Type{Type::Kind::F, 16}; have_ty = true; packed_half = true; }
         else if (p == "bf16x2") { ty = Type{Type::Kind::BF, 16}; have_ty = true; packed_half = true; }
         else if (auto t2 = parse_type_token(p)) {
@@ -2147,6 +2154,9 @@ class Parser {
       op.op = mops.at(op0);
       op.ty = ty;
       op.packed = packed_half;
+      op.round = mround;
+      op.exact = exact && (op.op == MathOp::Sqrt || op.op == MathOp::Rcp) && ty.bits >= 32;
+      op.ftz = mftz && ty.bits == 32;
       op.dst = expect_reg_operand("destination");
       expect_punct(",");
       op.src = parse_operand();
@@ -3206,6 +3216,7 @@ class Parser {
       if (!ty) fail(ins.line, "neg missing type");
       OpNeg op;
       op.ty = *ty;
+      op.ftz = std::find(parts.begin(), parts.end(), "ftz") != parts.end();
       op.dst = expect_reg_operand("neg destination");
       expect_punct(",");
       op.src = parse_operand();
@@ -3867,7 +3878,7 @@ class Parser {
       const std::string base_op = carry_in ? op0.substr(0, 3) : op0;
       bool carry_out = false;
       bool nan_propagate = false;
-      bool sat = false, xorsign_abs = false;
+      bool sat = false, xorsign_abs = false, ftz = false;
       bool wide = false, lo = false, hi = false;
       FRound frnd = FRound::Nearest;
       Type ty{};
@@ -3878,7 +3889,8 @@ class Parser {
         else if (p == "lo") lo = true;
         else if (p == "hi") hi = true;
         else if (p == "cc") carry_out = true;
-        else if (p == "rn" || p == "ftz") ;
+        else if (p == "rn") ;
+        else if (p == "ftz") ftz = true;
         else if (p == "rz") frnd = FRound::Zero;
         else if (p == "rm") frnd = FRound::MinusInf;
         else if (p == "rp") frnd = FRound::PlusInf;
@@ -3955,6 +3967,7 @@ class Parser {
         op.nan_propagate = nan_propagate;
         op.sat = sat;
         op.xorsign_abs = xorsign_abs;
+        op.ftz = ftz && ty.bits == 32;
         op.ty = ty;
         op.dst = expect_reg_operand("destination");
         expect_punct(",");
@@ -4085,11 +4098,13 @@ class Parser {
       if (!dt || !st) return unsupported("set types '." + ps[2] + "." + ps[3] + "'");
       const bool dpack = ps[2] == "f16x2" || ps[2] == "bf16x2";
       const bool spack = ps[3] == "f16x2" || ps[3] == "bf16x2";
-      if (dpack != spack)
+      const bool int_dst = !dt->is_real() && dt->bits == 32;
+      if (dpack != spack && !(spack && int_dst))
         return unsupported("set with only one side packed ('." + ps[2] + "." + ps[3] + "')");
       op.dty = *dt;
       op.sty = *st;
-      op.packed = dpack;
+      op.packed = spack;
+      op.packed_int_dst = spack && !dpack;
       op.dst = expect_reg_operand("set destination");
       expect_punct(",");
       op.a = parse_operand();
@@ -4118,11 +4133,14 @@ class Parser {
       if (parts.size() != 3) return unsupported("setp form (setp.<cmp>[.<bop>].<type>)");
       auto it = cmp_table().find(parts[1]);
       if (it == cmp_table().end()) return unsupported("comparison '." + parts[1] + "'");
-      auto ty = parse_type_token(parts[2]);
+      const bool spacked = parts[2] == "f16x2" || parts[2] == "bf16x2";
+      auto ty = spacked ? std::optional<Type>{Type{parts[2][0] == 'b' ? Type::Kind::BF : Type::Kind::F, 16}}
+                        : parse_type_token(parts[2]);
       if (!ty) fail(ins.line, "setp missing type");
       OpSetp op;
       op.cmp = it->second;
       op.ty = *ty;
+      op.packed = spacked;
       op.dst = expect_reg_operand("predicate destination");
       if (peek_punct("|")) {
         next();
