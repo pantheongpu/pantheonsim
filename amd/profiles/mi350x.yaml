@@ -31,6 +31,9 @@ limits:
   max_blocks_per_sm: 32
   max_registers_per_thread: 255
   shared_mem_per_sm: 163840
+  # One XCD's L2, as HIP reports it: 4 MB per XCD (CDNA4 whitepaper).
+  # Datasheet, not measured.
+  l2_cache_bytes: 4194304
 features:
   fp16: true
   bf16: true
