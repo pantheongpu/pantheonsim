@@ -66,8 +66,12 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
         }
         if constexpr (requires { op.c; }) {
           if constexpr (std::is_same_v<std::decay_t<decltype(op.c)>, Operand>) use_operand(op.c);
-          else for (const auto& r : op.c) uses.push_back(r.id);
+          else if constexpr (std::is_same_v<std::decay_t<decltype(op.c)>, Reg>) {
+            if (op.c.id != kNoReg) uses.push_back(op.c.id);   // setp/set's predicate operand
+          } else for (const auto& r : op.c) uses.push_back(r.id);
         }
+        if constexpr (requires { op.dst2; })
+          if (op.dst2.id != kNoReg) defs.push_back(op.dst2.id);
         if constexpr (requires { op.d; }) {
           if constexpr (std::is_same_v<std::decay_t<decltype(op.d)>, Operand>) use_operand(op.d);
           else for (const auto& r : op.d) defs.push_back(r.id);

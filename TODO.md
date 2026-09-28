@@ -217,6 +217,26 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   `createpolicy`, `applypriority`, `discard`) and the scheduling directives
   `griddepcontrol` and `setmaxnreg` are accepted and do nothing, each for a
   stated reason rather than a shrug.
+- PTX found by a differential probe -- 95 instruction forms run on an RTX 3060
+  and on the simulator, the results compared -- which turned up both gaps
+  and silent errors. Now implemented: `prmt`'s six modes; `setp`/`set` with
+  `.and/.or/.xor` and setp's `p|q`; `mad24` (and `mul24.hi`, which took bits
+  47:24 instead of 47:16); `add/sub.sat.s32`; `.sat` on f32 add/sub/mul/fma;
+  `min/max.xorsign.abs`; `cvt` with `.relu`, `.rz`/`.satfinite` on the
+  packed forms, and to tf32; `.f16x2` register declarations; `pmevent`.
+  Fixed, having been accepted and ignored: fma/mad's `.rz/.rm/.rp`, `.sat`
+  and `.ftz`; every half-precision modifier (`.sat`, `.ftz`, `.NaN`,
+  `.xorsign.abs`, `.relu`, the rounding modes); the packed cvt's rounding
+  mode. Also as the card does: f32 NaN results are 0x7fffffff; min/max take
+  the other operand for a signalling NaN too and order -0 below +0; `.sat`
+  sends -0 to +0; bf16 fma rounds once (a double-rounding tie went to even);
+  `isspacep.global` is true for any address outside shared and local memory.
+  e2e_ptx_forms hashes 127 variants against the card, and two held-out input
+  sets match too. Left as they are, and why: `ex2.approx.f16x2`,
+  `rcp.approx.ftz.f64` (the card returns only a 32-bit-accurate high word)
+  and `sin.approx` of tiny inputs follow the documented error bounds, not the
+  card's bits; ptxas miscompiles `szext` with a register width on sm_86 (the
+  card extends from 0 bits), so the ISA's meaning is kept.
 - Half precision beyond f16x2: f16, bf16, f16x2 and bf16x2 arithmetic
   (add/sub/mul/fma/neg/min/max), the same four types on every transcendental,
   and atom/red.add on all of them. bf16 is a different decode, not a scaled
