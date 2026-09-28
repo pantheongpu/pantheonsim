@@ -1114,6 +1114,15 @@ if(TARGET vgpucublas)
   # temporary storage, decoupled look-back scan and warp primitives throughout
   # -- so running them end to end exercises far more than a hand-written kernel
   # does, and the answer is checked rather than the launch's return code.
+  # cuBLAS and cuSPARSE conformance programs against output an RTX 3060 printed,
+  # so a routine that stops agreeing with the hardware fails without a GPU.
+  add_test(NAME e2e_library_goldens
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_library_goldens.sh)
+  set_tests_properties(e2e_library_goldens PROPERTIES
+    DEPENDS "vgpucudart;vgpucublas;vgpucusparse"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
   add_test(NAME e2e_libraries
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_libraries.sh)
   set_tests_properties(e2e_libraries PROPERTIES

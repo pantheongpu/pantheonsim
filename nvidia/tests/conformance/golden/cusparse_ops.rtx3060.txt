@@ -1,0 +1,34 @@
+spmv csr base0                     n=5 sum=30.7500 abs=55.2500 first=-3.5000 last=22.1250
+spmv csr base1                     n=5 sum=30.7500 abs=55.2500 first=-3.5000 last=22.1250
+spmv coo base0                     n=5 sum=30.7500 abs=55.2500 first=-3.5000 last=22.1250
+spmv coo base1                     n=5 sum=30.7500 abs=55.2500 first=-3.5000 last=22.1250
+spmv csr alpha2 beta0.5            n=5 sum=81.5000 abs=113.5000 first=-2.0000 last=47.2500
+spmv csr transpose                 n=6 sum=27.8750 abs=51.3750 first=-1.0000 last=18.7500
+spmv coo transpose beta1           n=6 sum=72.8750 abs=80.3750 first=9.0000 last=23.7500
+spmm col-major k=3                 n=15 sum=46.7500 abs=71.2500 first=-1.7500 last=10.6250
+spmm row-major k=3                 n=15 sum=43.1250 abs=77.6250 first=-1.2500 last=10.0000
+spmm col-major beta0.5             n=20 sum=155.5000 abs=203.5000 first=-3.0000 last=16.1250
+spmm transposeA col                n=12 sum=27.5625 abs=51.5625 first=-0.5000 last=7.0000
+sparse->dense                      n=30 sum=12.0000 abs=27.0000 first=1.5000 last=6.0000
+dense->sparse analysis             rows=5 cols=6 nnz=11
+dense->sparse values               n=11 sum=12.0000 abs=27.0000 first=1.5000 last=6.0000
+csr2csc base0 f32 symbolic colptr 0 2 4 6 8 9 11
+  rowind 0 2 1 4 2 4 0 3 2 1 4
+csr2csc base0 f32 numeric colptr 0 2 4 6 8 9 11
+  rowind 0 2 1 4 2 4 0 3 2 1 4
+  values 1.5000 -1.2500 3.2500 1.7500 4.0000 -0.7500 -2.0000 -3.5000 2.5000 0.5000 6.0000
+csr2csc base0 f64 symbolic colptr 0 2 4 6 8 9 11
+  rowind 0 2 1 4 2 4 0 3 2 1 4
+csr2csc base0 f64 numeric colptr 0 2 4 6 8 9 11
+  rowind 0 2 1 4 2 4 0 3 2 1 4
+  values 1.5000 -1.2500 3.2500 1.7500 4.0000 -0.7500 -2.0000 -3.5000 2.5000 0.5000 6.0000
+csr2csc base1 f32 symbolic colptr 1 3 5 7 9 10 12
+  rowind 1 3 2 5 3 5 1 4 3 2 5
+csr2csc base1 f32 numeric colptr 1 3 5 7 9 10 12
+  rowind 1 3 2 5 3 5 1 4 3 2 5
+  values 1.5000 -1.2500 3.2500 1.7500 4.0000 -0.7500 -2.0000 -3.5000 2.5000 0.5000 6.0000
+csr2csc base1 f64 symbolic colptr 1 3 5 7 9 10 12
+  rowind 1 3 2 5 3 5 1 4 3 2 5
+csr2csc base1 f64 numeric colptr 1 3 5 7 9 10 12
+  rowind 1 3 2 5 3 5 1 4 3 2 5
+  values 1.5000 -1.2500 3.2500 1.7500 4.0000 -0.7500 -2.0000 -3.5000 2.5000 0.5000 6.0000

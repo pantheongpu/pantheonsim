@@ -4,7 +4,8 @@
 // and matrices, strided batches of them, SpMV, SpMM, SpGEMM, SDDMM, triangular
 // solves (SpSV, SpSM) and conversion in both directions. Of the legacy API, what
 // CUDA 12 still ships and PyTorch calls: matrix descriptors, coo2csr, the COO
-// and CSR sorts, and csrgeam2 (C = alpha A + beta B). The BSR routines are not
+// and CSR sorts, and csrgeam2 (C = alpha A + beta B); and the CSR transpose,
+// csr2cscEx2, which SCS calls. The BSR routines are not
 // implemented.
 //
 // Like the other vendor libraries the arithmetic runs on the host, in double,
@@ -800,6 +801,95 @@ VGPU_EXPORT cusparseStatus_t cusparseDenseToSparse_convert(cusparseHandle_t h,
       put_indices(B.rows_ptr, B.format == CUSPARSE_FORMAT_CSR ? offsets : rows, B.row_type) &&
       put_indices(B.cols_ptr, cols, B.col_type) && store_values(B.values, vals, B.value_type);
   return ok ? CUSPARSE_STATUS_SUCCESS : CUSPARSE_STATUS_INTERNAL_ERROR;
+}
+
+/* ---- CSR to CSC ----
+   The transpose of the index structure: CSC of A is CSR of A's transpose. The
+   values are moved, never computed on, so every value type works and moves bit
+   for bit; only the element size matters. Rows within each column come out in
+   ascending order, which is what a stable pass over the rows gives. */
+
+namespace {
+
+size_t element_bytes(cudaDataType t) {
+  switch (t) {
+    case CUDA_R_8I: case CUDA_R_8U: return 1;
+    case CUDA_R_16F: case CUDA_R_16BF: return 2;
+    case CUDA_R_32F: case CUDA_R_32I: case CUDA_C_16F: case CUDA_C_16BF: return 4;
+    case CUDA_R_64F: case CUDA_C_32F: return 8;
+    case CUDA_C_64F: return 16;
+    default: return 0;
+  }
+}
+
+}  // namespace
+
+VGPU_EXPORT cusparseStatus_t cusparseCsr2cscEx2_bufferSize(
+    cusparseHandle_t h, int, int, int, const void*, const int*, const int*, void*, int*, int*,
+    cudaDataType valType, cusparseAction_t copyValues, cusparseIndexBase_t,
+    cusparseCsr2CscAlg_t, size_t* bufferSize) {
+  if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
+  if (!bufferSize) return CUSPARSE_STATUS_INVALID_VALUE;
+  if (copyValues == CUSPARSE_ACTION_NUMERIC && !element_bytes(valType))
+    return CUSPARSE_STATUS_NOT_SUPPORTED;
+  *bufferSize = 0;  // the work happens on the host
+  return CUSPARSE_STATUS_SUCCESS;
+}
+
+VGPU_EXPORT cusparseStatus_t cusparseCsr2cscEx2(
+    cusparseHandle_t h, int m, int n, int nnz, const void* csrVal, const int* csrRowPtr,
+    const int* csrColInd, void* cscVal, int* cscColPtr, int* cscRowInd, cudaDataType valType,
+    cusparseAction_t copyValues, cusparseIndexBase_t idxBase, cusparseCsr2CscAlg_t, void*) {
+  if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
+  if (m < 0 || n < 0 || nnz < 0) return CUSPARSE_STATUS_INVALID_VALUE;
+  if (idxBase != CUSPARSE_INDEX_BASE_ZERO && idxBase != CUSPARSE_INDEX_BASE_ONE)
+    return CUSPARSE_STATUS_INVALID_VALUE;
+  const bool numeric = copyValues == CUSPARSE_ACTION_NUMERIC;
+  if (!numeric && copyValues != CUSPARSE_ACTION_SYMBOLIC) return CUSPARSE_STATUS_INVALID_VALUE;
+  const size_t vb = element_bytes(valType);
+  if (numeric && !vb) return CUSPARSE_STATUS_NOT_SUPPORTED;
+  if (n == 0) return CUSPARSE_STATUS_SUCCESS;
+  if (!cscColPtr) return CUSPARSE_STATUS_INVALID_VALUE;
+  const int base = idxBase == CUSPARSE_INDEX_BASE_ONE ? 1 : 0;
+  std::vector<int> colptr((size_t)n + 1, base);
+  if (m > 0 && nnz > 0) {
+    if (!csrRowPtr || !csrColInd || !cscRowInd) return CUSPARSE_STATUS_INVALID_VALUE;
+    if (numeric && (!csrVal || !cscVal)) return CUSPARSE_STATUS_INVALID_VALUE;
+    std::vector<int> rowptr((size_t)m + 1), colind((size_t)nnz);
+    if (cudaMemcpy(rowptr.data(), csrRowPtr, rowptr.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(colind.data(), csrColInd, colind.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+      return CUSPARSE_STATUS_INTERNAL_ERROR;
+    // A malformed matrix is refused rather than transposed into nonsense.
+    if (rowptr[0] != base || rowptr[m] != nnz + base) return CUSPARSE_STATUS_INVALID_VALUE;
+    for (int r = 0; r < m; ++r)
+      if (rowptr[r + 1] < rowptr[r]) return CUSPARSE_STATUS_INVALID_VALUE;
+    std::vector<int> count((size_t)n, 0);
+    for (int c : colind) {
+      if (c - base < 0 || c - base >= n) return CUSPARSE_STATUS_INVALID_VALUE;
+      ++count[(size_t)(c - base)];
+    }
+    for (int c = 0; c < n; ++c) colptr[(size_t)c + 1] = colptr[(size_t)c] + count[(size_t)c];
+    std::vector<unsigned char> in, out;
+    if (numeric) {
+      in.resize((size_t)nnz * vb);
+      out.resize(in.size());
+      if (cudaMemcpy(in.data(), csrVal, in.size(), cudaMemcpyDeviceToHost) != cudaSuccess)
+        return CUSPARSE_STATUS_INTERNAL_ERROR;
+    }
+    std::vector<int> next(colptr.begin(), colptr.end() - 1), rowind((size_t)nnz);
+    for (int r = 0; r < m; ++r)
+      for (int e = rowptr[r] - base; e < rowptr[r + 1] - base; ++e) {
+        const int dst = next[(size_t)(colind[(size_t)e] - base)]++ - base;
+        rowind[(size_t)dst] = r + base;
+        if (numeric) std::memcpy(&out[(size_t)dst * vb], &in[(size_t)e * vb], vb);
+      }
+    if (cudaMemcpy(cscRowInd, rowind.data(), rowind.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess ||
+        (numeric && cudaMemcpy(cscVal, out.data(), out.size(), cudaMemcpyHostToDevice) != cudaSuccess))
+      return CUSPARSE_STATUS_INTERNAL_ERROR;
+  }
+  return cudaMemcpy(cscColPtr, colptr.data(), colptr.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess
+             ? CUSPARSE_STATUS_SUCCESS
+             : CUSPARSE_STATUS_INTERNAL_ERROR;
 }
 
 /* ---- pointer mode, and the attributes a descriptor carries beyond its arrays ---- */
