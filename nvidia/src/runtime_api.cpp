@@ -745,6 +745,7 @@ VGPU_EXPORT cudaError_t cudaMemcpyToSymbol(const void* symbol, const void* src, 
     const cudaError_t e = symbol_address(s, symbol, &addr, &size);
     if (e != cudaSuccess) return e;
     if (offset + count > size) return cudaErrorInvalidValue;
+    if (count == 0) return cudaSuccess;  // whatever the other pointer is, as on hardware
     bool device = false;
     if (const cudaError_t k = symbol_peer(kind, cudaMemcpyHostToDevice, src, &device);
         k != cudaSuccess)
@@ -768,6 +769,7 @@ VGPU_EXPORT cudaError_t cudaMemcpyFromSymbol(void* dst, const void* symbol, size
     const cudaError_t e = symbol_address(s, symbol, &addr, &size);
     if (e != cudaSuccess) return e;
     if (offset + count > size) return cudaErrorInvalidValue;
+    if (count == 0) return cudaSuccess;  // whatever the other pointer is, as on hardware
     bool device = false;
     if (const cudaError_t k = symbol_peer(kind, cudaMemcpyDeviceToHost, dst, &device);
         k != cudaSuccess)
@@ -1569,6 +1571,12 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
                              "This is injected, not a real failure\n");
       return cudaErrorInvalidValue;
     }
+    // Nothing to copy is a success whatever the pointers and the kind say --
+    // null, host, device, or the wrong direction: an RTX 3060 returns
+    // cudaSuccess for every zero-byte cudaMemcpy. CUTLASS relies on it, copying
+    // empty tensors (null pointers) as device-to-device when a
+    // std::vector<HostTensor> reallocates.
+    if (count == 0) return cudaSuccess;
     auto _t0 = std::chrono::steady_clock::now();
     bool dd = is_device_ptr(dst), sd = is_device_ptr(src);
     // Under unified addressing a device pointer names its own device, so each
@@ -1698,6 +1706,7 @@ VGPU_EXPORT cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* 
 
 VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
   return guard("cudaMemset", [&](State& s) {
+    if (count == 0) return cudaSuccess;  // even for a null pointer, as on hardware
     const uint8_t byte = static_cast<uint8_t>(value);
     owner_memory(s, dst).fill(reinterpret_cast<uint64_t>(dst), &byte, 1, count);
     return cudaSuccess;
