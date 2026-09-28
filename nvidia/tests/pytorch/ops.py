@@ -119,6 +119,27 @@ def fp8(d):
 check('fp8 matmul (torch._scaled_mm)', fp8, 1e-3)
 
 
+# Complex tensors: cuBLAS's and cuSOLVER's C/Z entry points.
+ca = torch.complex(a[:16, :16], a[16:32, :16]); cb = torch.complex(b[:16, :8], b[16:32, :8])
+cs = ca + 8 * torch.eye(16)
+ch = ca @ ca.mH + 16 * torch.eye(16)
+R = torch.view_as_real
+check('complex matmul', lambda d: R(ca.to(d) @ cb.to(d)), 1e-4)
+check('complex bmm', lambda d: R(torch.bmm(ca.expand(3, 16, 16).to(d), cb.expand(3, 16, 8).to(d))), 1e-4)
+check('complex double matmul', lambda d: R(ca.cdouble().to(d) @ cb.cdouble().to(d)), 1e-10)
+check('complex inverse', lambda d: R(torch.linalg.inv(cs.to(d))), 1e-4)
+check('complex solve', lambda d: R(torch.linalg.solve(cs.to(d), cb.to(d))), 1e-4)
+check('complex det', lambda d: R(torch.linalg.det(cs.to(d) / 8).reshape(1)), 1e-4)
+check('complex cholesky', lambda d: R(torch.linalg.cholesky(ch.to(d))), 1e-4)
+check('complex qr (|R|)', lambda d: torch.linalg.qr(ca.to(d)).R.abs(), 1e-3)
+check('complex svdvals', lambda d: torch.linalg.svdvals(ca.to(d)), 1e-3)
+check('complex eigvalsh', lambda d: torch.linalg.eigvalsh(ch.to(d)), 1e-2)
+check('complex lstsq', lambda d: R(torch.linalg.lstsq(torch.complex(a[:20, :6], a[20:40, :6]).to(d), cb[:, :2].repeat(2, 1)[:20].to(d)).solution), 1e-3)
+check('complex pinv', lambda d: R(torch.linalg.pinv(ca[:10, :6].to(d))), 1e-3)
+check('complex batched inverse', lambda d: R(torch.linalg.inv(cs.expand(3, 16, 16).to(d))), 1e-4)
+check('complex solve_triangular', lambda d: R(torch.linalg.solve_triangular(torch.tril(cs).to(d), cb.to(d), upper=False)), 1e-4)
+check('complex fft round trip', lambda d: R(torch.fft.ifft(torch.fft.fft(ca.to(d)))), 1e-5)
+
 # torch.compile: Inductor's Triton kernels, compiled by Triton and handed to the
 # simulator as PTX (vgpu run points Triton's ptxas at vgpu-ptxas). The CPU side
 # runs the same function eagerly.
