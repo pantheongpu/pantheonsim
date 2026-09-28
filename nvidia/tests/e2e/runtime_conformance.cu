@@ -60,6 +60,8 @@ int main() {
   std::memset(&a, 0xff, sizeof a);
   CHECK("attributes: malloc is unregistered", cudaPointerGetAttributes(&a, host) == cudaSuccess &&
                                                  a.type == cudaMemoryTypeUnregistered, "type %d", (int)a.type);
+  CHECK("attributes: malloc belongs to no device", a.device == cudaInvalidDeviceId && a.devicePointer == nullptr &&
+                                                      a.hostPointer == host, "device %d", a.device);
   int* pinned = nullptr;
   cudaHostAlloc(&pinned, 64 * sizeof(int), 0);
   std::memset(&a, 0xff, sizeof a);
