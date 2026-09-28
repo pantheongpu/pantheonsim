@@ -584,8 +584,7 @@ VGPU_EXPORT void** __cudaRegisterFatBinary(void* fatCubin) {
         // Module-scope declarations start in column 0; a function's own
         // .shared or .local is indented and stays where it is.
         const bool func = starts(line, ".func");
-        if (!func && !starts(line, ".global") && !starts(line, ".const") && !starts(line, ".shared"))
-          continue;
+        if (!func && !starts(line, ".global") && !starts(line, ".const")) continue;
         std::string name;
         size_t i = func ? 5 : 0;
         if (func) {
