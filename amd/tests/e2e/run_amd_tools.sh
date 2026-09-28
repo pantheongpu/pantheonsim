@@ -65,11 +65,13 @@ expect "lspci -vmm keeps its record form" "Slot:	01:00.0|Class:	VGA compatible c
 # (without isolation it reads a dump of config space, which has no BAR sizes,
 # interrupt or driver). The real one names a subsystem from udev's hardware
 # database where it has one, and "Kernel modules" from the host kernel's module
-# aliases; both differ by host, so both are left out of the comparison.
+# aliases; both differ by host, so both are left out of the comparison -- as
+# is the warning it prints where the host has no module files to read (a
+# container's "Unable to load libkmod resources").
 if command -v lspci >/dev/null && unshare --user --map-root-user true >/dev/null 2>&1; then
   for g in amd/rx7900xtx amd/mi300x; do
     diffs=$(timeout 300 "$vgpu" shell -y --gpu "$g" --count 3 </dev/null 2>/dev/null -c '
-      norm() { sed -e "/Kernel modules:/d; /^Module:/d; /Subsystem:/d; /^SDevice:/d" -e "s/\"[^\"]*\"$//"; }
+      norm() { sed -e "/Kernel modules:/d; /^Module:/d; /Subsystem:/d; /^SDevice:/d; /Unable to load libkmod resources/d" -e "s/\"[^\"]*\"$//"; }
       for f in "" -nn -n -D -mm -mmnn -mmn -k -v -vnn -vn -vmm -vmmk -kmm "-d 1002:" "-d ::0300" "-s 02:00.0" -t -x -xxx -xxxx; do
         a=$(lspci $f 2>&1 | norm); b=$('"$vgpu"' smi --lspci $f 2>&1 | norm)
         # (A filter may rightly match nothing; the plain listing never.)
@@ -120,6 +122,8 @@ if ! unshare --user --map-root-user true >/dev/null 2>&1; then
   echo "skip  the isolated kernel-driver checks: unprivileged user namespaces are unavailable here"
 else
   host_dev=$(ls -A /dev | sort | paste -sd' ')
+  expect "an isolated session has no physical slots of the host's" "0" \
+    "$(isolated amd/mi300x -c 'ls /sys/bus/pci/slots 2>/dev/null | wc -l')"
   expect "an isolated AMD session has /dev/kfd and a card and render node per GPU" "c|card0 card1 renderD128 renderD129" \
     "$(isolated amd/mi300x -c '[ -c /dev/kfd ] && echo c; ls /dev/dri | paste -sd" "' | paste -sd'|')"
   expect "its /dev is still the host's otherwise: process substitution, /dev/shm, ptys" "ok|shm|pts" \
