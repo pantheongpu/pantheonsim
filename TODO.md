@@ -297,13 +297,25 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   use one of their own (the logical matrix, spread in order over lanes and
   registers); the combinations above keep theirs. wmma_types.cu checks all 21
   shape/type/layout combinations through mma.h, exactly;
-  ldmatrix.m8n8.x{1,2,4}[.trans], mma.sync.m16n8k{8,16,32} over f16/bf16/tf32/
-  s8, and movmatrix.m8n8.trans (the register-only transpose). mma.sp (2:4
-  structured sparsity) m16n8k{16,32} with f16/bf16 A and B, both sparsity
-  selectors: its A layout and metadata were read from the ISA's figures and
-  settled nibble by nibble on an RTX 3060, test_exec3 checks five forms
-  against the hardware's own results, and CUTLASS's 19 SM80 sparse GEMM tests
-  pass. Its tf32, integer and FP8 forms are still refused.
+  ldmatrix.m8n8.x{1,2,4}[.trans] and movmatrix.m8n8.trans (the
+  register-only transpose). mma.sync in every form the ISA lists except the
+  block-scaled and .kind::f8f6f4 ones (sm_120): Volta's m8n8k4 f16 (four
+  products, any layouts, f16/f32 accumulators), f64 m8n8k4 and m16n8k4/8/16
+  in each rounding mode, tf32, f16/bf16, s8/u8 and s4/u4 (mixed signedness,
+  .satfinite), .b1 .and/.xor.popc, and e4m3/e5m2; and mma.sp in every type,
+  shape and selector (f16/bf16, tf32 1:2, s8/u8, s4/u4 4:8 in pairs, fp8).
+  e2e_mma_forms runs the 123 forms an RTX 3060 has -- each fed fragments,
+  its D hashed -- and compares with the hashes the GPU gave. Three things
+  came out of the hardware rather than the ISA: tf32 inputs lose their low
+  13 mantissa bits; .satfinite clamps after every 128 bits of K (twice in
+  m16n8k32 int8 and m16n8k64 int4), not once at the end; and the 8- and
+  4-bit sparse forms carry metadata a row to a lane (lane 4g + 2 * selector
+  for row g, the next for g + 8, the pair after for chunks 8-15) where
+  f16/bf16/tf32 carry four chunks of both rows. fp8 and the sm_90 f64 shapes,
+  which the 3060 cannot run, are checked against a host GEMM. The
+  accumulation order of a float sum is unspecified and not modelled: with
+  inputs whose products round, m16n8k8 tf32 differs from the GPU in low bits.
+  CUTLASS's 19 SM80 sparse GEMM tests pass.
   stmatrix.m8n8.x{1,2,4}[.trans] is the store counterpart of ldmatrix: the warp
   writes the 8x8 matrices its registers hold back to shared memory, which is how
   a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
@@ -694,9 +706,17 @@ narrows what counts as observable, not what the detector looks at.
   e2e test (nvidia/tests/e2e/wgmma_cute.cu) lets CuTe -- NVIDIA's own layout
   code, from a pinned CUTLASS release -- build the tiles, descriptors and
   fragments for seventeen configurations and compares every element exactly.
-  Refused by name: the sparse (`.sp`) and single-bit (`.b1`) `wgmma` forms, a
-  descriptor with a nonzero base offset (the ISA does not say how it moves the
-  pattern), and `wgmma` under any target but `.target sm_90a`. Loading now
+  Since 2026-09-27 the sparse forms too (`wgmma.mma_async.sp`, f16/bf16,
+  tf32, fp8 and s8/u8): A holds M x K/2 -- in registers as mma.sp's fragment,
+  in shared memory as the packed matrix in the ordinary canonical layout --
+  and each warp expands its 16 rows with its own metadata, by mma.sp's rule
+  for the same type (the ISA's wgmma metadata figures are mma.sp's). And
+  `.b1` (m64nNk256 `.and.popc`), eight bits to a byte in shared memory.
+  CUTLASS's 20 SM90 sparse GEMM tests pass (warp-specialized, cooperative,
+  ping-pong, 2x1 clusters, fp8 fast accumulation); `.b1`, which CUTLASS has
+  no test for, against a host reference. Refused by name: a descriptor with
+  a nonzero base offset (the ISA does not say how it moves the pattern), and
+  `wgmma` under any target but `.target sm_90a`. Loading now
   follows the target suffixes: a fatbin's `sm_90a` PTX is preferred over its
   `sm_90` one on a 9.0 device (nvcc -arch=sm_90a embeds both; only the first
   has the arch-specific instructions), `sm_XYa` code loads only on exactly
@@ -915,8 +935,8 @@ what is done.
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle's 8-byte-flip
   variant (Blackwell); tcgen05's sparse, weight-stationary and block-scaled
-  MMAs, `tcgen05.cp`/`shift` and its 4/6-bit types; the sparse and
-  single-bit `wgmma` forms, and inline-asm-only instructions. (`wgmma`, TMA,
+  MMAs, `tcgen05.cp`/`shift` and its 4/6-bit types; mma's block-scaled and
+  `.kind::f8f6f4` forms (sm_120); and inline-asm-only instructions. (`wgmma`, TMA,
   the mbarrier transaction counts, `barrier.cluster` and distributed shared
   memory are done -- see "Hopper's warpgroup MMA", "TMA and clusters" and
   "Distributed shared memory" above. Textures, surfaces and grid sync are

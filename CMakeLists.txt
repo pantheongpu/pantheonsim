@@ -1072,6 +1072,14 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # Every mma.sync / mma.sp form an RTX 3060 runs, against its hashes.
+  add_test(NAME e2e_mma_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mma_forms.sh)
+  set_tests_properties(e2e_mma_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
   # bf16 arithmetic, half2 atomics and labeled_partition, through nvcc. The
   # unit tests feed hand-written PTX; a compiler emits forms a hand-written
   # test never thinks to write, and this is what catches the difference. It

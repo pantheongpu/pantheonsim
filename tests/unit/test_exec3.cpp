@@ -619,10 +619,18 @@ VTEST(sparse_mma_and_cvt_pack_refuse_what_they_do_not_implement) {
 )") + body + "\n  ret;\n}\n";
     return VCAPTURE(Error, ptx::parse(ptx));
   };
+  VCHECK_CONTAINS(parse_one("mma.sync.aligned.m16n8k32.row.col.kind::f8f6f4.f32.e2m1.e2m1.f32 "
+                            "{%f0,%f1,%f2,%f3}, {%r4,%r5,%r6,%r7}, {%r8,%r9}, "
+                            "{%f4,%f5,%f6,%f7};").message(),
+                  "kind::f8f6f4");
   VCHECK_CONTAINS(parse_one("mma.sp::ordered_metadata.sync.aligned.m16n8k64.row.col.s32.s8.s8.s32 "
                             "{%r0,%r1,%r2,%r3}, {%r4,%r5,%r6,%r7}, {%r8,%r9,%r10,%r11}, "
-                            "{%r12,%r13,%r14,%r15}, %r16, 0x0;").message(),
-                  "mma.sp");
+                            "{%r12,%r13,%r14,%r15}, %r16, 0x1;").message(),
+                  "selector");
+  VCHECK_CONTAINS(parse_one("mma.sync.aligned.m16n8k16.row.col.f32.tf32.tf32.f32 "
+                            "{%f0,%f1,%f2,%f3}, {%r4,%r5,%r6,%r7}, {%r8,%r9}, "
+                            "{%f4,%f5,%f6,%f7};").message(),
+                  "not a form the ISA defines");
   VCHECK_CONTAINS(parse_one("mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32 "
                             "{%f0,%f1,%f2,%f3}, {%r4,%r5,%r6,%r7}, {%r8,%r9,%r10,%r11}, "
                             "{%f4,%f5,%f6,%f7}, %r16, 0x2;").message(),
@@ -5110,6 +5118,142 @@ VTEST(device_assert_reports_its_line_from_a_full_warp) {
   auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(t)}, e.mem, e.prof));
   VCHECK(err.code() == Err::DeviceAssert);
   VCHECK_CONTAINS(err.message(), "x.cu:55 in x.cu");
+}
+
+// The mma forms an RTX 3060 cannot run -- fp8 (sm_89) and f64 at m16n8k4/8/16
+// (sm_90) -- against a host GEMM. Their fragments follow the formulas the
+// e2e test mma_forms.cu checks on the hardware for the same element widths:
+// 8-bit like s8, and f64 in 64-bit registers like tf32 in 32-bit ones.
+namespace {
+struct MmaCase {
+  std::string op;       // the instruction, up to its operands
+  int K, na, nb, nc;    // registers per lane
+  bool f64 = false;
+};
+// Runs one mma with per-lane registers a/b/c (32 lanes each) and returns D.
+std::vector<uint64_t> run_mma(const MmaCase& t, const std::vector<uint64_t>& a, const std::vector<uint64_t>& b,
+                              const std::vector<uint64_t>& c, const std::string& header) {
+  const std::string R = t.f64 ? "%fd" : "%r";
+  const std::string ty = t.f64 ? "b64" : "b32";
+  const int step = t.f64 ? 8 : 4;
+  auto list = [&](int first, int n) {
+    std::string s;
+    for (int i = 0; i < n; ++i) s += (i ? ", " : "") + R + std::to_string(first + i);
+    return s;
+  };
+  std::string loads, stores;
+  const int nregs = t.na + t.nb + 2 * t.nc;
+  for (int i = 0; i < t.na + t.nb + t.nc; ++i)
+    loads += "    ld.global." + ty + " " + R + std::to_string(i) + ", [%rd3+" + std::to_string(i * step) + "];\n";
+  for (int i = 0; i < t.nc; ++i)
+    stores += "    st.global." + ty + " [%rd4+" + std::to_string(i * step) + "], " + R +
+              std::to_string(t.na + t.nb + t.nc + i) + ";\n";
+  const std::string ptx = header + R"(
+.visible .entry k(.param .u64 in, .param .u64 out)
+{
+    .reg .b32 %r<80>;
+    .reg .b64 %fd<80>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    mov.u32 %r79, %tid.x;
+    mul.wide.u32 %rd5, %r79, )" + std::to_string((t.na + t.nb + t.nc) * step) + R"(;
+    add.u64 %rd3, %rd1, %rd5;
+    mul.wide.u32 %rd6, %r79, )" + std::to_string(t.nc * step) + R"(;
+    add.u64 %rd4, %rd2, %rd6;
+)" + loads + "    " + t.op + " {" + list(t.na + t.nb + t.nc, t.nc) + "}, {" + list(0, t.na) + "}, {" +
+                          list(t.na, t.nb) + "}, {" + list(t.na + t.nb, t.nc) + "};\n" + stores + R"(    ret;
+}
+)";
+  (void)nregs;
+  Env e;
+  const int per = t.na + t.nb + t.nc;
+  std::vector<uint8_t> in(size_t(32) * per * step);
+  for (int l = 0; l < 32; ++l) {
+    auto put = [&](int slot, uint64_t v) { std::memcpy(in.data() + (size_t(l) * per + slot) * step, &v, step); };
+    for (int i = 0; i < t.na; ++i) put(i, a[size_t(l) * t.na + i]);
+    for (int i = 0; i < t.nb; ++i) put(t.na + i, b[size_t(l) * t.nb + i]);
+    for (int i = 0; i < t.nc; ++i) put(t.na + t.nb + i, c[size_t(l) * t.nc + i]);
+  }
+  const uint64_t pin = e.mem.alloc(in.size()), pout = e.mem.alloc(size_t(32) * t.nc * step);
+  e.mem.write(pin, in.data(), in.size());
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(pin), arg_u64(pout)}, e.mem, e.prof);
+  std::vector<uint64_t> d(size_t(32) * t.nc, 0);
+  for (size_t i = 0; i < d.size(); ++i) d[i] = e.mem.load_scalar(pout + i * step, step);
+  return d;
+}
+// E4M3/E5M2 bits for 0 and +-{0.25, 0.5, 0.75, 1, 1.5, 2}: exact in both.
+uint8_t fp8_bits(float v, bool e5m2) {
+  if (v == 0) return 0;
+  int e = 0;
+  const float m = std::frexp(std::fabs(v), &e);        // v = m * 2^e, m in [0.5, 1)
+  const int mbits = e5m2 ? 2 : 3, bias = e5m2 ? 15 : 7;
+  const uint8_t mant = static_cast<uint8_t>((m * 2 - 1) * (1 << mbits));
+  return static_cast<uint8_t>((v < 0 ? 0x80 : 0) | ((e - 1 + bias) << mbits) | mant);
+}
+}  // namespace
+
+VTEST(mma_fp8_m16n8k32_against_a_host_gemm) {
+  const float vals[] = {0, 0.25f, -0.5f, 0.75f, 1, -1.5f, 2, -0.25f};
+  for (int form = 0; form < 2; ++form) {
+    const bool a5 = form == 1, b5 = form == 0;   // e5m2 x e4m3 and e4m3 x e5m2
+    float A[16][32], B[32][8], C[16][8];
+    for (int i = 0; i < 16; ++i) for (int k = 0; k < 32; ++k) A[i][k] = vals[(i * 5 + k * 3) % 8];
+    for (int k = 0; k < 32; ++k) for (int j = 0; j < 8; ++j) B[k][j] = vals[(k * 7 + j) % 8];
+    for (int i = 0; i < 16; ++i) for (int j = 0; j < 8; ++j) C[i][j] = float((i + j) % 5) - 2;
+    std::vector<uint64_t> a(32 * 4), b(32 * 2), c(32 * 4);
+    for (int l = 0; l < 32; ++l) {
+      const int g = l / 4, t = l % 4;
+      for (int r = 0; r < 4; ++r)
+        for (int e = 0; e < 4; ++e)
+          a[l * 4 + r] |= uint64_t{fp8_bits(A[g + 8 * (r % 2)][t * 4 + e + 16 * (r / 2)], a5)} << (8 * e);
+      for (int r = 0; r < 2; ++r)
+        for (int e = 0; e < 4; ++e) b[l * 2 + r] |= uint64_t{fp8_bits(B[t * 4 + e + 16 * r][g], b5)} << (8 * e);
+      for (int i = 0; i < 4; ++i) c[l * 4 + i] = f32_bits(C[g + 8 * (i / 2)][t * 2 + i % 2]);
+    }
+    MmaCase mc{std::string("mma.sync.aligned.m16n8k32.row.col.f32.") + (a5 ? "e5m2" : "e4m3") + "." +
+                   (b5 ? "e5m2" : "e4m3") + ".f32",
+               32, 4, 2, 4};
+    const auto d = run_mma(mc, a, b, c, ".version 8.4\n.target sm_89\n.address_size 64\n");
+    for (int l = 0; l < 32; ++l)
+      for (int i = 0; i < 4; ++i) {
+        const int row = l / 4 + 8 * (i / 2), col = (l % 4) * 2 + i % 2;
+        float want = C[row][col];
+        for (int k = 0; k < 32; ++k) want += A[row][k] * B[k][col];
+        VCHECK_EQ(as_f32(d[l * 4 + i]), want);
+      }
+  }
+}
+
+VTEST(mma_f64_m16n8k_shapes_against_a_host_gemm) {
+  for (int K : {4, 8, 16}) {
+    std::vector<double> A(16 * K), B(K * 8), C(16 * 8);
+    for (int i = 0; i < 16 * K; ++i) A[i] = std::ldexp(double((i * 37) % 23) - 11, -3) + 1.0 / 3;
+    for (int i = 0; i < K * 8; ++i) B[i] = std::ldexp(double((i * 29) % 19) - 9, -2) - 1.0 / 7;
+    for (int i = 0; i < 16 * 8; ++i) C[i] = double(i % 13) / 5;
+    const int na = K / 2, nb = K / 4;
+    std::vector<uint64_t> a(32 * na), b(32 * nb), c(32 * 4);
+    auto bits = [](double v) { uint64_t u; std::memcpy(&u, &v, 8); return u; };
+    for (int l = 0; l < 32; ++l) {
+      const int g = l / 4, t = l % 4;
+      for (int r = 0; r < na; ++r) a[l * na + r] = bits(A[(g + 8 * (r % 2)) * K + t + 4 * (r / 2)]);
+      for (int r = 0; r < nb; ++r) b[l * nb + r] = bits(B[(t + 4 * r) * 8 + g]);
+      for (int i = 0; i < 4; ++i) c[l * 4 + i] = bits(C[(g + 8 * (i / 2)) * 8 + t * 2 + i % 2]);
+    }
+    MmaCase mc{"mma.sync.aligned.m16n8k" + std::to_string(K) + ".row.col.f64.f64.f64.f64", K, na, nb, 4, true};
+    const auto d = run_mma(mc, a, b, c, kHeader90);
+    for (int l = 0; l < 32; ++l)
+      for (int i = 0; i < 4; ++i) {
+        const int row = l / 4 + 8 * (i / 2), col = (l % 4) * 2 + i % 2;
+        // A chain of fused multiply-adds in K order, as f64 mma.m8n8k4 is on
+        // the hardware.
+        double want = C[row * 8 + col];
+        for (int k = 0; k < K; ++k) want = std::fma(A[row * K + k], B[k * 8 + col], want);
+        VCHECK_EQ(bits(want), d[l * 4 + i]);
+      }
+  }
 }
 
 // Register files are not zeroed when a block starts. A register's first
