@@ -4675,7 +4675,9 @@ Module parse(const std::string& src) {
     return false;
   };
   // The names a kernel can reach, or nothing when it could reach anything.
-  auto reachable = [&](const EntryFn& e) -> std::optional<std::set<std::string>> {
+  // `called` collects the device functions on the way.
+  auto reachable = [&](const EntryFn& e, std::vector<const EntryFn*>& called)
+      -> std::optional<std::set<std::string>> {
     if (calls_indirectly(e)) return std::nullopt;
     std::set<std::string> names = e.words_seen;
     std::vector<const EntryFn*> todo;
@@ -4687,6 +4689,7 @@ Module parse(const std::string& src) {
       todo.pop_back();
       if (!done.insert(f).second) continue;
       if (calls_indirectly(*f)) return std::nullopt;
+      called.push_back(f);
       for (const auto& w : f->words_seen) {
         names.insert(w);
         if (auto it = funcs_by_name.find(w); it != funcs_by_name.end()) todo.push_back(it->second);
@@ -4695,7 +4698,32 @@ Module parse(const std::string& src) {
     return names;
   };
   for (auto& fn : m.entries) {
-    const auto reach = m.module_shared.empty() ? std::nullopt : reachable(fn);
+    std::vector<const EntryFn*> called;
+    const auto reach = reachable(fn, called);
+    // A device function's own .shared (declared inside its body, as a
+    // separately compiled build emits a function's static __shared__) is
+    // resolved in the running kernel's frame, so the kernel needs a slot for
+    // it. It used to have none: the callee's first access was "unknown
+    // symbol". With an indirect call in reach, every function counts.
+    if (!reach) {
+      called.clear();
+      for (const auto& f : m.funcs) called.push_back(f.get());
+    }
+    for (const EntryFn* f : called) {
+      for (const auto& [name, fd] : f->shared) {
+        if (fn.shared.count(name)) continue;
+        SharedDecl d = fd;
+        if (d.dynamic) {
+          fn.uses_dynamic_shared = true;
+          d.offset = fn.static_shared_size;
+        } else {
+          const uint32_t off = (fn.static_shared_size + d.align - 1) / d.align * d.align;
+          d.offset = off;
+          fn.static_shared_size = off + d.size;
+        }
+        fn.shared.emplace(name, d);
+      }
+    }
     for (const auto& md : m.module_shared) {
       if (fn.shared.count(md.name)) continue;
       if (reach && !reach->count(md.name)) continue;
