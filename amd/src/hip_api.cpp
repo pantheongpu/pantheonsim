@@ -2083,6 +2083,33 @@ hipError_t hipMallocManaged(void** ptr, size_t size, unsigned int flags) {
   return host_alloc(ptr, size, g_managed);
 }
 
+// Advice about where memory should live and who reads it. There is one memory
+// here, not a host copy and a device copy, so no advice changes where anything
+// is and there is nothing to record; what HIP refuses is refused the same way:
+// no address, no bytes, advice it does not know, a device that is not there,
+// or a range running past the allocation it starts in. llama.cpp's HIP backend
+// (Ollama's) links against it, and a library without it is not loaded at all.
+hipError_t hipMemAdvise(const void* ptr, size_t count, int advice, int device) {
+  const ApiCall api("hipMemAdvise");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!ptr || !count) return record(s, hipErrorInvalidValue);
+  // hipMemAdviseSet/UnsetReadMostly, PreferredLocation, AccessedBy are 1-6;
+  // AMD's Set/UnsetCoarseGrain are 100 and 101.
+  if (!((advice >= 1 && advice <= 6) || advice == 100 || advice == 101)) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  const bool names_device = advice >= 3 && advice <= 6;
+  if (names_device && device != -1 /* hipCpuDeviceId */ && (device < 0 || device >= s.rt->device_count()))
+    return record(s, hipErrorInvalidDevice);
+  const uint64_t lo = reinterpret_cast<uint64_t>(ptr);
+  std::lock_guard<std::mutex> host_lock(g_host_mutex);
+  for (const auto* m : {&g_managed, &g_host_allocations, &g_host_registered}) {
+    const auto it = find_range(*m, lo);
+    if (it != m->end() && count > it->first + it->second - lo) return record(s, hipErrorInvalidValue);
+  }
+  return record(s, hipSuccess);
+}
+
 // ---- One device reaching another --------------------------------------------
 
 hipError_t hipDeviceCanAccessPeer(int* can, int ordinal, int peer) {

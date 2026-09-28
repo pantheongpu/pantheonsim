@@ -111,6 +111,7 @@ if [[ -x "$tmp/libraries_hip" ]]; then
     "and unregistering what is not registered 1" \
     "a kernel reads and writes pinned host memory 1" \
     "a kernel reads and writes managed memory, which says it is managed 1" \
+    "managed memory takes advice, and what HIP refuses is refused 1" \
     "a pool counts what is in use and its high mark 1" \
     "virtual memory mapped by hand is written and read back 1" \
     "an address knows its allocation and its device 1" \

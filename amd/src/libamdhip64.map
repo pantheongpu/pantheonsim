@@ -103,6 +103,7 @@ hip_4.2 {
     hipMallocArray;
     hipMallocManaged;
     hipMallocMipmappedArray;
+    hipMemAdvise;
     hipMemGetAddressRange;
     hipMemGetInfo;
     hipMemPtrGetInfo;
