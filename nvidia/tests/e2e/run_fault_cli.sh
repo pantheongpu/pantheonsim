@@ -87,7 +87,7 @@ expect "amd-smi ras --cper lists the records as text, as it does even under --js
 expect "and filters them by severity" "1" \
   "$(amd smi --amd ras --cper --severity nonfatal-corrected | awk 'NR > 2' | wc -l | tr -d ' ')"
 t4 smi --amd list >/dev/null; expect "amd-smi on an NVIDIA machine finds no AMD GPU" "1" "$?"
-amd smi --amd metric -p >/dev/null; expect "amd-smi refuses a metric it does not model" "2" "$?"
+amd smi --amd metric -C >/dev/null 2>&1; expect "amd-smi refuses a metric it does not model (the voltage curve)" "2" "$?"
 
 # Inside a session the driver and the kernel log what happened, in their forms.
 sess="$tmp/session"

@@ -34,7 +34,7 @@ if command -v systemd-run >/dev/null && systemd-run --user --scope -q true 2>/de
 fi
 port=$((29500 + RANDOM % 1000))
 for r in 0 1; do
-  (cd "$tmp" && VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 VGPU_MEMORY_RAM_MB="${VGPU_MEMORY_RAM_MB:-2048}" \
+  (cd "$tmp" && VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 VGPU_MEMORY_RAM_MB="${VGPU_MEMORY_RAM_MB:-2048}" \
      PYTHONPATH="$tmp" MASTER_ADDR=127.0.0.1 MASTER_PORT=$port RANK=$r WORLD_SIZE=2 NCCL_DEBUG=ERROR \
      timeout 900 "${cap[@]}" "$python" "$root/amd/tests/pytorch/distributed.py" > "$tmp/rank$r.log" 2>&1
    echo "exit $?" >> "$tmp/rank$r.log") &
@@ -43,6 +43,13 @@ wait
 out=$(cat "$tmp"/rank0.log "$tmp"/rank1.log)
 echo "$out" | grep -E '^(ok|FAIL) ' | sed 's/^/      /'
 fail=0
+# The simulator's own errors are left on: a kernel the simulator could not run
+# (an instruction it lacks, a fault) is reported as "VirtualGPU error [...]",
+# and PyTorch may carry on past it with whatever was in the output buffer, so
+# a check can still print "ok". Any such line fails the test.
+if grep -q 'VirtualGPU error \[' <<< "$out"; then
+  echo "FAIL  the simulator ran every kernel it was given"; grep -m5 'VirtualGPU error \[' <<< "$out" | sed 's/^/      /'; fail=1
+fi
 for r in 0 1; do
   st=$(grep -o '^exit [0-9]*' "$tmp/rank$r.log" | tail -1)
   [[ "$st" == "exit 0" ]] || { echo "FAIL  rank $r ran to the end ($st)"; tail -5 "$tmp/rank$r.log" | sed 's/^/      /'; fail=1; }

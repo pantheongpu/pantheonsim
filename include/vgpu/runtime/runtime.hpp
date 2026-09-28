@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <list>
 #include <vector>
 
 #include "vgpu/exec/launch.hpp"
@@ -108,7 +109,12 @@ class Device {
     std::vector<std::pair<uint64_t, const ptx::EntryFn*>> kernels;
     std::shared_ptr<LazyModule> lazy;
   };
-  mutable std::vector<LoadedModule> modules_;   // mutable: a lazy module parses kernels on lookup
+  // A list, not a vector: a function handle keeps a pointer to its module's
+  // symbol table, and a vector moved every module whenever another loaded, so
+  // a kernel launched after that read a freed table (PyTorch's jiterator
+  // loads a module per kernel and launches earlier ones again).
+  // mutable: a lazy module parses kernels on lookup.
+  mutable std::list<LoadedModule> modules_;
 };
 
 class Runtime;

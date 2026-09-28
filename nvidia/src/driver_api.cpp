@@ -1260,7 +1260,9 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
       if (!kernelParams[i])
         throw vgpu::Error::make(vgpu::Err::InvalidValue, "kernelParams[", i, "] is NULL (kernel '",
                                 rec.fn->name, "' takes ", params.size(), " parameters)");
-      uint32_t size = params[i].ty.bytes();
+      // The whole parameter: a struct passed by value is a .b8 array in PTX,
+      // whose element is one byte and whose size is the struct's.
+      uint32_t size = params[i].size;
       args[i].resize(size);
       std::memcpy(args[i].data(), kernelParams[i], size);
     }
@@ -1973,6 +1975,14 @@ constexpr unsigned char kUuidToolsHooks[16] = {0xa0, 0x94, 0x79, 0x8c, 0x2e, 0x7
 // uuid c693336e-1121-df11-a8c3-68f355d89593 — context-local storage
 constexpr unsigned char kUuidCtxStorage[16] = {0xc6, 0x93, 0x33, 0x6e, 0x11, 0x21, 0xdf, 0x11,
                                                0xa8, 0xc3, 0x68, 0xf3, 0x55, 0xd8, 0x95, 0x93};
+// Asked for by NVIDIA's NVRTC (13.0) when it finds a driver loaded. Refused,
+// NVRTC compiles exactly as it does on a machine with no driver; given the
+// generic stub table it returns success with an empty PTX. The NVRTC shim
+// compiles through NVIDIA's NVRTC where it is installed, so this is the one
+// table refused by name.
+constexpr unsigned char kUuidNvrtcProbe[16] = {0xda, 0x91, 0x51, 0xd3, 0x3a, 0xe6, 0xcc, 0x41,
+                                               0xa5, 0xc0, 0x4f, 0x26, 0xd5, 0x33, 0xe3, 0x28};
+
 // Other internal tables (semantics unknown): cudart refuses to initialize
 // unless every table it asks for exists, so unknown UUIDs are served generic
 // logging-stub tables, assigned on demand and grown empirically (VGPU_TRACE).
@@ -2099,6 +2109,7 @@ bool dark_denied(const unsigned char* uuid) {
 
 const void* dark_table_for(const unsigned char* uuid) {
   if (dark_denied(uuid)) return nullptr;
+  if (std::memcmp(uuid, kUuidNvrtcProbe, 16) == 0) return nullptr;
   static bool init = false;
   if (!init) {
     init = true;
@@ -2280,8 +2291,10 @@ VGPU_EXPORT CUresult cuGetExportTable(const void** table, const void* uuid) {
   // the program as "integrity checks failed" on its first CUDA call and
   // explains nothing. Say what is happening once, while there is still time
   // for it to be useful.
+  // NVRTC's probe is expected and refused; it is no sign of a static runtime.
+  const bool nvrtc_probe = std::memcmp(uuid, kUuidNvrtcProbe, 16) == 0;
   static std::once_flag warned;
-  std::call_once(warned, [] {
+  if (!nvrtc_probe) std::call_once(warned, [] {
     if (std::getenv("VGPU_QUIET") && std::getenv("VGPU_QUIET")[0] == '1') return;
     // Two very different callers reach here, and telling someone to rebuild
     // their program when it was a profiler asking sends them somewhere useless.

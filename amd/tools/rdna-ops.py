@@ -28,7 +28,7 @@ ENCODINGS = {
     'VOPDXY': 'Vopd',
     # RDNA4's names for the same encodings.
     'ENC_VOP3SD': 'Vop3', 'ENC_VFLAT': 'Flat', 'ENC_VGLOBAL': 'Flat', 'ENC_VSCRATCH': 'Flat',
-    'ENC_VBUFFER': 'Mubuf', 'ENC_VOPD': 'Vopd', 'ENC_VDS': 'Ds',
+    'ENC_VBUFFER': 'Mubuf', 'ENC_VOPD': 'Vopd', 'ENC_VDS': 'Ds', 'ENC_FLAT_GLBL': 'Flat',
 }
 # Operand kinds, by the XML's operand types.
 KINDS = {
@@ -42,6 +42,9 @@ KINDS = {
     'OPR_SREG_M0': 'Ssrc', 'OPR_SREG_LITERAL': 'Ssrc', 'OPR_SMEM_OFFSET_NOK': 'Ssrc', 'OPR_SIMM5': 'Simm16',
     'OPR_SENDMSG_RTN': 'Sendmsg', 'OPR_SSRC_BARRIER_ID': 'Ssrc', 'OPR_WAIT_MEM_DS': 'Waitcnt', 'OPR_SLEEP': 'Simm16',
     'OPR_WAIT_ALU': 'Depctr', 'OPR_WAIT_EVENT': 'Simm16',
+    # RDNA2's.
+    'OPR_SREG_NONULL': 'Sreg', 'OPR_SRC_NOLDS': 'Src', 'OPR_SSRC_NOLDS': 'Ssrc', 'OPR_VGPR_OR_LDS': 'Src',
+    'OPR_ATTR': 'Simm16', 'OPR_PARAM': 'Simm16',
 }
 # Fields the decoder reads itself rather than as operands.
 SKIP_FIELDS = {'LITERAL'}
@@ -67,7 +70,7 @@ for inst in isa.find('Instructions'):
             continue
         enc = ENCODINGS[enc_xml]
         opcode = int(ie.find('Opcode').text, int(ie.find('Opcode').get('Radix', '10')))
-        segment = {'ENC_FLAT_GLOBAL': 1, 'ENC_VGLOBAL': 1, 'ENC_FLAT_SCRATCH': 2, 'ENC_VSCRATCH': 2}.get(enc_xml, 0)
+        segment = {'ENC_FLAT_GLOBAL': 1, 'ENC_FLAT_GLBL': 1, 'ENC_VGLOBAL': 1, 'ENC_FLAT_SCRATCH': 2, 'ENC_VSCRATCH': 2}.get(enc_xml, 0)
         ops = []
         operands = ie.find('Operands')
         for o in sorted(operands if operands is not None else [], key=lambda o: int(o.get('Order'))):

@@ -757,28 +757,64 @@ cudaError_t symbol_address(State& s, const void* symbol, uint64_t* addr, size_t*
 }
 }  // namespace
 
+// The side of a symbol copy that is not the symbol: cudaMemcpyDeviceToDevice
+// says it is device memory and it must be; cudaMemcpyHostToDevice (or
+// ToHost) says host, but a device allocation there is still copied as one,
+// as with cudaMemcpy. GPUJPEG's inverse DCT fills its constant table from
+// device memory this way.
+namespace {
+cudaError_t symbol_peer(cudaMemcpyKind kind, cudaMemcpyKind host_kind, const void* p,
+                        bool* device) {
+  if (kind != host_kind && kind != cudaMemcpyDeviceToDevice && kind != cudaMemcpyDefault)
+    return cudaErrorInvalidValue;
+  *device = is_device_ptr(p);
+  if (kind == cudaMemcpyDeviceToDevice && !*device) return cudaErrorInvalidValue;
+  return cudaSuccess;
+}
+}  // namespace
+
 VGPU_EXPORT cudaError_t cudaMemcpyToSymbol(const void* symbol, const void* src, size_t count,
-                                           size_t offset, cudaMemcpyKind /*kind*/) {
+                                           size_t offset, cudaMemcpyKind kind) {
   return guard("cudaMemcpyToSymbol", [&](State& s) -> cudaError_t {
     uint64_t addr = 0;
     size_t size = 0;
     const cudaError_t e = symbol_address(s, symbol, &addr, &size);
     if (e != cudaSuccess) return e;
     if (offset + count > size) return cudaErrorInvalidValue;
-    current(s).memory().write(addr + offset, src, count);
+    bool device = false;
+    if (const cudaError_t k = symbol_peer(kind, cudaMemcpyHostToDevice, src, &device);
+        k != cudaSuccess)
+      return k;
+    if (!device) {
+      current(s).memory().write(addr + offset, src, count);
+      return cudaSuccess;
+    }
+    std::vector<uint8_t> tmp(count);
+    owner_memory(s, src).read(reinterpret_cast<uint64_t>(src), tmp.data(), count);
+    current(s).memory().write(addr + offset, tmp.data(), count);
     return cudaSuccess;
   });
 }
 
 VGPU_EXPORT cudaError_t cudaMemcpyFromSymbol(void* dst, const void* symbol, size_t count,
-                                             size_t offset, cudaMemcpyKind /*kind*/) {
+                                             size_t offset, cudaMemcpyKind kind) {
   return guard("cudaMemcpyFromSymbol", [&](State& s) -> cudaError_t {
     uint64_t addr = 0;
     size_t size = 0;
     const cudaError_t e = symbol_address(s, symbol, &addr, &size);
     if (e != cudaSuccess) return e;
     if (offset + count > size) return cudaErrorInvalidValue;
-    current(s).memory().read(addr + offset, dst, count);
+    bool device = false;
+    if (const cudaError_t k = symbol_peer(kind, cudaMemcpyDeviceToHost, dst, &device);
+        k != cudaSuccess)
+      return k;
+    if (!device) {
+      current(s).memory().read(addr + offset, dst, count);
+      return cudaSuccess;
+    }
+    std::vector<uint8_t> tmp(count);
+    current(s).memory().read(addr + offset, tmp.data(), count);
+    owner_memory(s, dst).write(reinterpret_cast<uint64_t>(dst), tmp.data(), count);
     return cudaSuccess;
   });
 }
@@ -1579,6 +1615,20 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
     // memory at the same numeric address -- silently, and with the wrong bytes.
     vgpu::MemoryManager& dmm = dd ? owner_memory(s, dst) : current(s).memory();
     vgpu::MemoryManager& smm = sd ? owner_memory(s, src) : current(s).memory();
+    // Under unified addressing the kind is checked, then the pointers decide.
+    // A side the kind calls device memory must be device memory, or the copy
+    // is refused; a side it calls host memory may turn out to be a device
+    // allocation, and is then copied as one. That is what the hardware does
+    // (an RTX 3060: cudaMemcpyHostToDevice from a device pointer copies the
+    // right bytes; cudaMemcpyDeviceToHost from a host pointer is an invalid
+    // value). GPUJPEG's encoder passes device memory as "host" on purpose.
+    if (kind == cudaMemcpyHostToDevice || kind == cudaMemcpyDeviceToHost ||
+        kind == cudaMemcpyDeviceToDevice || kind == cudaMemcpyHostToHost) {
+      const bool dst_device = kind == cudaMemcpyHostToDevice || kind == cudaMemcpyDeviceToDevice;
+      const bool src_device = kind == cudaMemcpyDeviceToHost || kind == cudaMemcpyDeviceToDevice;
+      if ((dst_device && !dd) || (src_device && !sd)) return cudaErrorInvalidValue;
+      kind = cudaMemcpyDefault;
+    }
     if (kind == cudaMemcpyDefault) kind = dd && sd ? cudaMemcpyDeviceToDevice
                                           : dd      ? cudaMemcpyHostToDevice
                                           : sd      ? cudaMemcpyDeviceToHost
@@ -2554,6 +2604,37 @@ VGPU_EXPORT cudaError_t cudaFuncSetAttribute(const void* func, cudaFuncAttribute
     it->second.nonportable_cluster = value != 0;
     return cudaSuccess;
   });
+}
+
+// An L1-versus-shared-memory preference is a tuning hint with nothing to tune
+// here, but it is checked the way the hardware checks it (an RTX 3060: a kernel
+// is accepted, anything else is cudaErrorInvalidResourceHandle) and the
+// device-wide one reads back what was set.
+VGPU_EXPORT cudaError_t cudaFuncSetCacheConfig(const void* func, cudaFuncCache config) {
+  if (static_cast<int>(config) < 0 || static_cast<int>(config) > 3) return cudaErrorInvalidValue;
+  return guard("cudaFuncSetCacheConfig", [&](State& s) -> cudaError_t {
+    return s.kernels.count(func) ? cudaSuccess : cudaErrorInvalidResourceHandle;
+  });
+}
+
+namespace {
+std::mutex g_cache_config_mu;
+std::map<int, cudaFuncCache> g_cache_config;  // per device; unset means PreferNone
+}  // namespace
+
+VGPU_EXPORT cudaError_t cudaDeviceSetCacheConfig(cudaFuncCache config) {
+  if (static_cast<int>(config) < 0 || static_cast<int>(config) > 3) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_cache_config_mu);
+  g_cache_config[t_current_device] = config;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaDeviceGetCacheConfig(cudaFuncCache* config) {
+  if (!config) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_cache_config_mu);
+  auto it = g_cache_config.find(t_current_device);
+  *config = it == g_cache_config.end() ? cudaFuncCachePreferNone : it->second;
+  return cudaSuccess;
 }
 
 VGPU_EXPORT cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMode* mode) {

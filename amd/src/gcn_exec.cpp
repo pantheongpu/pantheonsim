@@ -19,6 +19,7 @@
 #include <string_view>
 #include <vector>
 
+#include "vgpu/amd_debug.hpp"
 #include "vgpu/amd_decode_cache.hpp"
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/amd_hostcall.hpp"
@@ -173,6 +174,16 @@ struct Wave {
   // The MODE hardware register, as a kernel reads and sets it: what its
   // descriptor asks for (Kernel::mode) to begin with. FloatMode applies it.
   uint32_t mode = 0xF0 | 1u << 8 | 1u << 9;
+  // gfx12's SCHED_MODE (hardware register 26): whether the hardware checks
+  // instruction dependencies or leaves them to the compiler ("expert" mode,
+  // which hipBLASLt's kernels set). Instructions here run one at a time in
+  // order either way, so it is kept only to be read back.
+  uint32_t sched_mode = 0;
+  // gfx10's FLAT_SCRATCH (hardware registers 20 and 21, low and high): where
+  // the wave's private memory is, which a kernel's prologue sets before it
+  // reaches the stack through flat addresses. Each lane's private memory is
+  // found here without it, so it is kept only to be read back.
+  uint32_t flat_scratch[2] = {0, 0};
   // VGPR indexing (s_set_gpr_idx_on): which operands are offset -- source
   // 0, 1, 2 and the destination, a bit each -- by M0's low byte. 0 is off.
   uint8_t gpr_idx = 0;
@@ -243,6 +254,7 @@ struct Group {
   std::vector<uint8_t> scratch;
   uint32_t scratch_per_lane = 0;
   std::vector<Wave> waves;
+  uint32_t id[3] = {};   // the work-group's id, for the debugger to say
 };
 
 struct Machine {
@@ -713,6 +725,7 @@ struct Machine {
   const Operand* narrow_dst = nullptr;
   uint8_t narrow_dst_sel = 6;
   bool narrow_dst_preserve = false;
+  bool narrow_dst_sext = false;
 
   void write_lane(Wave& w, const Operand& o, uint32_t lane, uint32_t v) {
     // Where the instruction named part of the destination, the result's low
@@ -725,7 +738,12 @@ struct Machine {
           : sel == 4 ? v & 0xFFFFu
           : sel == 5 ? (v & 0xFFFFu) << 16
                      : v;
-      // Or the rest of the register is kept, where the instruction says so.
+      // Or the bits above the part take its sign (those below it stay zero),
+      // or the rest of the register is kept, where the instruction says so.
+      if (narrow_dst_sext && sel < 6) {
+        const uint32_t top = mask & ~(mask >> 1);   // the part's highest bit
+        if (v & top) v |= ~(mask | (top - 1));
+      }
       if (narrow_dst_preserve) {
         const uint32_t was = o.kind == OperandKind::Agpr ? acc(w, o.index)[lane] : w.vgpr[o.index][lane];
         v = (was & ~mask) | (v & mask);
@@ -919,21 +937,32 @@ struct Machine {
     } else if (op == "s_ff1_i32_b64"_op) {
       // The first set bit, counting from bit 0, or -1 when there is none.
       write_scalar(w, in.dst[0], a ? static_cast<uint32_t>(__builtin_ctzll(a)) : 0xFFFFFFFFu);
-    } else if (op == "s_getreg_b32"_op || op == "s_setreg_imm32_b32"_op) {
+    } else if (op == "s_getreg_b32"_op || op == "s_setreg_imm32_b32"_op || op == "s_setreg_b32"_op) {
       // A field of a hardware register: the immediate's low six bits say
       // which register, the next five where the field starts, the top five
-      // how wide it is less one. MODE is kept per wave; HW_ID says which
-      // wave of the work-group this is; the rest are refused by name.
+      // how wide it is less one. MODE is kept per wave, and gfx12's SCHED_MODE;
+      // HW_ID says which wave of the work-group this is; the rest are refused
+      // by name.
       const uint32_t id = static_cast<uint32_t>(in.simm) & 0x3F, at = (static_cast<uint32_t>(in.simm) >> 6) & 0x1F,
                      width = ((static_cast<uint32_t>(in.simm) >> 11) & 0x1F) + 1;
       const uint32_t mask = (width >= 32 ? ~0u : (1u << width) - 1) << at;
-      if (op == "s_setreg_imm32_b32"_op) {
-        if (id != 1)
-          throw Error::make(Err::Unsupported, "s_setreg_imm32_b32 of hardware register ", id, ", which this does not model");
-        w.mode = (w.mode & ~mask) | ((static_cast<uint32_t>(in.src[0].value) << at) & mask);
+      const bool sched = id == 26 && in.arch == gcn::Target::Gfx1200;
+      const bool flat_scr = (id == 20 || id == 21) && in.arch == gcn::Target::Gfx1030;
+      if (op != "s_getreg_b32"_op) {
+        if (id != 1 && !sched && !flat_scr)
+          throw Error::make(Err::Unsupported, op, " of hardware register ", id, ", which this does not model");
+        // The immediate form's value is its literal; the register form's is
+        // the scalar register the instruction names.
+        const uint32_t value = op == "s_setreg_imm32_b32"_op ? static_cast<uint32_t>(in.src[0].value)
+                               : !in.src.empty()             ? static_cast<uint32_t>(scalar(w, in.src[0]))
+                                                             : static_cast<uint32_t>(scalar(w, in.dst[0]));
+        uint32_t& reg = sched ? w.sched_mode : flat_scr ? w.flat_scratch[id - 20] : w.mode;
+        reg = (reg & ~mask) | ((value << at) & mask);
       } else {
         uint32_t reg;
         if (id == 1) reg = w.mode;
+        else if (sched) reg = w.sched_mode;
+        else if (flat_scr) reg = w.flat_scratch[id - 20];
         else if (id == 4) reg = static_cast<uint32_t>(w.first_lane / w.lanes) & 0xF;   // HW_ID: the wave's slot
         else throw Error::make(Err::Unsupported, "s_getreg_b32 of hardware register ", id, ", which this does not model");
         write_scalar(w, in.dst[0], (reg & mask) >> at);
@@ -1451,6 +1480,7 @@ struct Machine {
         m.narrow_dst = &in.dst[0];
         m.narrow_dst_sel = in.dst_sel;
         m.narrow_dst_preserve = in.dst_unused == 2;
+        m.narrow_dst_sext = in.dst_unused == 1;
       } else if (in.enc == gcn::Enc::Vop3 && (in.op_sel & 8) && in.name.find("fp8") == std::string::npos &&
                  in.name.find("bf8") == std::string::npos) {
         // A 16-bit instruction told by op_sel to write the high half of its
@@ -1465,6 +1495,7 @@ struct Machine {
       m.narrow_dst = nullptr;
       m.narrow_dst_sel = 6;
       m.narrow_dst_preserve = false;
+      m.narrow_dst_sext = false;
     }
   };
 
@@ -1516,6 +1547,24 @@ struct Machine {
       const uint64_t cond = scalar(w, in.src[2]);
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, lane_bits(w, (cond >> lane) & 1 ? in.src[1] : in.src[0], lane) & 0xFFFF);
+      });
+    } else if (op == "v_permlane16_b32"_op || op == "v_permlanex16_b32"_op) {
+      // Each lane of a row of 16 reads the lane of its row (permlane16) or of
+      // the other row of its pair (permlanex16) that its 4 bits of the
+      // 64-bit selector {src2, src1} name. A source lane that is off is read
+      // anyway where op_sel's first bit (FI) says so; otherwise the lane
+      // gets zero where its second (BOUND_CTRL) says so, and keeps its value
+      // where neither does.
+      const uint64_t sel = (scalar(w, in.src[1]) & 0xFFFFFFFFu) | (scalar(w, in.src[2]) & 0xFFFFFFFFu) << 32;
+      const bool fi = in.op_sel & 1, bound = (in.op_sel >> 1) & 1;
+      const bool cross = op == "v_permlanex16_b32"_op;
+      uint32_t from[kLanes];
+      for (uint32_t lane = 0; lane < kLanes; ++lane) from[lane] = lane_src(w, in.src[0], lane);
+      each([&](uint32_t lane) {
+        const uint32_t row = lane / 16 ^ (cross ? 1 : 0);
+        const uint32_t s = row * 16 + static_cast<uint32_t>((sel >> (4 * (lane % 16))) & 0xF);
+        if (fi || (w.exec >> s & 1)) write_lane(w, in.dst[0], lane, from[s]);
+        else if (bound) write_lane(w, in.dst[0], lane, 0);
       });
     } else if (op == "v_mad_u16"_op || op == "v_mad_i16"_op) {
       each([&](uint32_t lane) {
@@ -2015,13 +2064,9 @@ struct Machine {
                   ? in.name.substr(0, in.name.size() - 4) + "_e32"
                   : std::string();
     const OpName op(as_short.empty() ? in.name : as_short);
-    // A sub-dword instruction may write part of its destination and pad the
-    // rest with zeroes. The other two ways of filling the rest -- carrying
-    // the sign into it, or keeping what was there -- are refused: nothing
-    // here has been seen to emit them.
-    if (in.sdwa && in.dst_unused == 1)
-      throw Error::make(Err::Unsupported, op, " fills the rest of its destination with the result's sign, "
-                                              "which this does not model");
+    // (A sub-dword instruction may write part of its destination and pad the
+    // rest with zeroes, carry the part's sign into it, or keep what was
+    // there: write_lane does each.)
     // op_sel on a 16-bit long form: a source's bit reads its high half,
     // which is the sub-dword selection SDWA makes, so the instruction runs
     // as that. (The 8-bit float conversions and v_pack read their own bits.)
@@ -3903,6 +3948,14 @@ struct Machine {
       *from = (lane & ~31u) - 1;
       return true;
     }
+    if (ctrl >= 0x150 && ctrl <= 0x15F) {   // row_share (gfx90a's row_newbcast): lane n of the row
+      *from = row + (ctrl - 0x150);
+      return true;
+    }
+    if (ctrl >= 0x160 && ctrl <= 0x16F) {   // row_xmask: the lane of the row n away by XOR
+      *from = row + (in_row ^ (ctrl - 0x160));
+      return true;
+    }
     throw Error::make(Err::Unsupported, "a cross-lane instruction reading across the whole wave rather than "
                                         "within a row, which this decodes but does not model");
   }
@@ -3919,7 +3972,8 @@ struct Machine {
       if (!((in.row_mask >> (lane >> 4)) & 1)) continue;
       if (!((in.bank_mask >> ((lane >> 2) & 3)) & 1)) continue;
       uint32_t from = 0;
-      const bool there = dpp_source(in.dpp_ctrl, lane, &from) && ((w.exec >> from) & 1);
+      // (RDNA's FI reads a lane that is off as though it were on.)
+      const bool there = dpp_source(in.dpp_ctrl, lane, &from) && (in.fi || ((w.exec >> from) & 1));
       if (!there && !in.bound_ctrl) continue;   // nothing to read, and nothing written
       values[lane] = there ? w.vgpr[o.index][from] : 0u;
       writes |= uint64_t{1} << lane;
@@ -4279,8 +4333,54 @@ struct Machine {
     return on;
   }
 
+  // Where the debugger (VGPU_DEBUG) stops a wave, what it sees of it.
+  void debug_stop(Wave& w, Group& g) {
+    debug::WaveView v;
+    v.kernel = d.kernel ? d.kernel->name : std::string("?");
+    v.pc = w.pc;
+    v.offset = w.pc - d.code_base - (d.kernel ? d.kernel->entry : 0);
+    std::copy(std::begin(g.id), std::end(g.id), v.group);
+    v.wave = w.first_lane / w.lanes;
+    v.lanes = w.lanes;
+    v.exec = &w.exec;
+    v.vcc = &w.vcc;
+    v.scc = &w.scc;
+    v.m0 = &w.m0;
+    v.mode = &w.mode;
+    v.sgpr = w.sgpr;
+    v.sgprs = kSgprs;
+    v.vgpr = w.vgpr;
+    v.vgprs = kVgprs;
+    v.lds = &g.lds;
+    v.memory = &mem;
+    v.disassemble = [this](uint64_t pc, uint32_t* size) -> std::string {
+      try {
+        const Inst& in = fetch(pc);
+        *size = in.size;
+        return gcn::to_text(in);
+      } catch (const std::exception& e) {
+        *size = 0;
+        return std::string("(") + e.what() + ")";
+      }
+    };
+    debug::stop(v, &w);
+  }
+
   bool step(Wave& w, Group& g) {
+    if (debug::active() &&
+        debug::should_stop(d.kernel ? d.kernel->name : std::string(), w.pc - d.code_base - (d.kernel ? d.kernel->entry : 0), &w))
+      debug_stop(w, g);
     const Inst& in = fetch(w.pc);
+    // The performance counters' instruction mix, worked out when decoded.
+    {
+      InstructionCounts& c = stats.counts;
+      if (in.dual.empty()) {
+        ++c.mix[static_cast<int>(in.mix)];
+        c.mops[static_cast<int>(in.mops_type)] += in.mops;
+      } else {
+        for (const Inst& half : in.dual) ++c.mix[static_cast<int>(half.mix)];
+      }
+    }
     std::optional<Traced> traced;
     if (tracing() && w.first_lane == 0) traced.emplace(*this, w, in, w.pc);
     w.pc += in.size;
@@ -4377,9 +4477,9 @@ struct Machine {
         }
         ++n.vmem;
         ++n.flat;
-        if (in.name.find("_atomic") != std::string::npos) ++n.flat_atomic;
-        else if (in.name.find("_store") != std::string::npos) ++n.flat_write;
-        else ++n.flat_read;
+        if (in.name.find("_atomic") != std::string::npos) ++n.flat_atomic, ++n.vmem_wr;
+        else if (in.name.find("_store") != std::string::npos) ++n.flat_write, ++n.vmem_wr;
+        else ++n.flat_read, ++n.vmem_rd;
         if (in.segment == Inst::Segment::Scratch) scratch_access(w, in, g);
         else if (in.segment == Inst::Segment::Flat) n.lds += flat_access(w, in, g);
         else global_access(w, in);
@@ -4398,6 +4498,8 @@ struct Machine {
           std::atomic_thread_fence(std::memory_order_seq_cst);
           return true;
         }
+        if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
+        else ++n.vmem_rd;
         buffer_access(w, in, g);
         return true;
       case gcn::Enc::Sopp: break;
@@ -4592,6 +4694,9 @@ uint64_t write_dispatch_packet(const Dispatch& d, const Kernel& k, MemoryManager
 // at once.
 unsigned worker_count(uint64_t groups) {
   unsigned want = 0;
+  // Under the debugger, one thread: a wave stopped at a breakpoint stops the
+  // dispatch, and everything runs in the same order every time.
+  if (debug::active()) return 1;
   if (const char* t = std::getenv("VGPU_THREADS")) {
     const int v = std::atoi(t);
     want = v > 0 ? static_cast<unsigned>(v) : 1;
@@ -4623,6 +4728,9 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
   group.scratch_per_lane = (k.private_segment + 3) & ~3u;
   group.scratch.assign(static_cast<size_t>(group.scratch_per_lane) * threads, 0);
   group.waves.resize(waves_per_group);
+  group.id[0] = gx;
+  group.id[1] = gy;
+  group.id[2] = gz;
   for (uint32_t i = 0; i < waves_per_group; ++i) {
     Wave& w = group.waves[i];
     w.pc = d.code_base + k.entry;

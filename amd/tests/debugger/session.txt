@@ -1,0 +1,15 @@
+# A debugger session over hipcc/chevron.gfx942's scale_add, for run_debugger.sh.
+break scale_add+0x20
+info breakpoints
+continue
+disas 3
+lane 3
+print/d v0
+lane all
+step 2
+set v200[5] = 0x2a
+lane 5
+print/d v200
+info registers
+delete
+continue

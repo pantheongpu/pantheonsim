@@ -84,8 +84,8 @@ Known limitations (deliberate, documented):
   the output is not a decodable video stream. OptiX (ray tracing) is a separate
   NVIDIA subsystem, not CUDA, and is out of scope.
 - AMD runs gfx942 (MI300X, MI325X), gfx950 (MI350X), gfx90a (MI250X),
-  gfx1100 (Radeon RX 7900 XTX, RDNA3) and gfx1201 (Radeon RX 9070 XT, RDNA4)
-  code, through its own HIP and HSA runtimes; rocBLAS, hipBLASLt, MIOpen and
+  gfx1030 (Radeon RX 6900 XT, RDNA2), gfx1100 (Radeon RX 7900 XTX, RDNA3) and
+  gfx1201 (Radeon RX 9070 XT, RDNA4) code, through its own HIP and HSA runtimes; rocBLAS, hipBLASLt, MIOpen and
   PyTorch run on it — see [amd/README.md](amd/README.md).
 
 ## Build & test
@@ -284,6 +284,13 @@ which real GPUs cannot give you cheaply.
    (oracle machines) → verified profiles, conformance database, compat scores
 5. Random/adversarial warp scheduling → race detection
 6. AMD frontend (HIP/ROCm, CDNA3/CDNA4)
+
+## Help, contributing and security
+
+Questions and ideas go in [Discussions](https://github.com/pantheongpu/pantheonsim/discussions),
+bugs in [issues](https://github.com/pantheongpu/pantheonsim/issues). How changes
+are decided is in [GOVERNANCE.md](GOVERNANCE.md), and security problems should be
+reported privately as [SECURITY.md](SECURITY.md) describes.
 
 ## License
 
