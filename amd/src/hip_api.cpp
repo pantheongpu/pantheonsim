@@ -1746,7 +1746,11 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   props->maxThreadsPerBlock = static_cast<int>(p.limits.max_threads_per_block);
   for (int i = 0; i < 3; ++i) {
     props->maxThreadsDim[i] = static_cast<int>(p.limits.max_block_dim[i]);
-    props->maxGridSize[i] = static_cast<int>(p.limits.max_grid_dim[i]);
+    // HIP's grid sizes are ints, and AMD's runtime caps them there. A
+    // profile read from a card's HSA agent (MI325X's) has the agent's
+    // 4294967295, which as an int is -1: every grid PyTorch sized against
+    // it was too big ("M should be less than maximum CUDA grid size").
+    props->maxGridSize[i] = static_cast<int>(std::min<uint64_t>(p.limits.max_grid_dim[i], INT32_MAX));
   }
   props->clockRate = static_cast<int>(p.telemetry.sm_clock_max_mhz) * 1000;
   props->memoryClockRate = static_cast<int>(p.telemetry.mem_clock_max_mhz) * 1000;
