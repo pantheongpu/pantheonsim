@@ -591,6 +591,104 @@ VGPU_EXPORT cublasStatus_t cublasDgetrsBatched(cublasHandle_t h, cublasOperation
   return getrs_batched<double>(h, t, n, nrhs, A, lda, P, B, ldb, info, batch);
 }
 
+/* ---- triangular solves: trsm and trsmBatched ----
+   op(A) X = alpha B (side left) or X op(A) = alpha B (side right), X over B.
+   What torch.linalg.solve_triangular and lstsq call. Only A's `uplo` triangle
+   is read, and with a unit diagonal not even its diagonal. */
+
+namespace {
+
+// Solves M x = x in place, M = A or A^T (`trans`) of the k x k triangle `lower`.
+void tri_solve(const std::vector<double>& a, int k, int lda, bool lower, bool trans, bool unit, double* x,
+               size_t step) {
+  auto M = [&](int i, int j) { return trans ? a[(size_t)i * lda + j] : a[(size_t)j * lda + i]; };
+  auto row = [&](int i, int from, int to) {
+    double s = x[(size_t)i * step];
+    for (int j = from; j < to; ++j) s -= M(i, j) * x[(size_t)j * step];
+    x[(size_t)i * step] = unit ? s : s / M(i, i);
+  };
+  if (lower != trans) for (int i = 0; i < k; ++i) row(i, 0, i);   // M is lower: forward
+  else for (int i = k - 1; i >= 0; --i) row(i, i + 1, k);          // M is upper: back
+}
+
+template <class T>
+cublasStatus_t trsm_one(cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans, cublasDiagType_t diag,
+                        int m, int n, T alpha, const T* A, int lda, T* B, int ldb) {
+  const int k = side == CUBLAS_SIDE_LEFT ? m : n;
+  const auto av = fetch<T>(A, (size_t)lda * k);
+  const auto bv = fetch<T>(B, (size_t)ldb * n);
+  const std::vector<double> a(av.begin(), av.end());
+  std::vector<double> b(bv.begin(), bv.end());
+  const bool lower = uplo == CUBLAS_FILL_MODE_LOWER, t = trans != CUBLAS_OP_N, unit = diag == CUBLAS_DIAG_UNIT;
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) b[(size_t)j * ldb + i] *= (double)alpha;
+  if (side == CUBLAS_SIDE_LEFT)  // each column of B: op(A) x = b
+    for (int j = 0; j < n; ++j) tri_solve(a, k, lda, lower, t, unit, &b[(size_t)j * ldb], 1);
+  else  // each row of B: x op(A) = b, which is op(A)^T x^T = b^T
+    for (int i = 0; i < m; ++i) tri_solve(a, k, lda, lower, !t, unit, &b[(size_t)i], (size_t)ldb);
+  store(B, std::vector<T>(b.begin(), b.end()));
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+template <class T>
+cublasStatus_t trsm_batched(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans,
+                            cublasDiagType_t diag, int m, int n, const T* alpha, const T* const Aarray[], int lda,
+                            T* const Barray[], int ldb, int batch) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  const int k = side == CUBLAS_SIDE_LEFT ? m : n;
+  if (m < 0 || n < 0 || batch < 0 || lda < std::max(1, k) || ldb < std::max(1, m)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (trans == CUBLAS_OP_C) trans = CUBLAS_OP_T;  // real types
+  const T al = scalar(h, alpha);
+  if (deferred_to_graph(h, [=] {
+        const auto pa = fetch<const T*>(Aarray, (size_t)batch);
+        const auto pb = fetch<T*>(Barray, (size_t)batch);
+        for (int b = 0; b < batch; ++b) trsm_one<T>(side, uplo, trans, diag, m, n, al, pa[b], lda, pb[b], ldb);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
+  const auto pa = fetch<const T*>(Aarray, (size_t)batch);
+  const auto pb = fetch<T*>(Barray, (size_t)batch);
+  for (int b = 0; b < batch; ++b) trsm_one<T>(side, uplo, trans, diag, m, n, al, pa[b], lda, pb[b], ldb);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+template <class T>
+cublasStatus_t trsm(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans,
+                    cublasDiagType_t diag, int m, int n, const T* alpha, const T* A, int lda, T* B, int ldb) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  const int k = side == CUBLAS_SIDE_LEFT ? m : n;
+  if (m < 0 || n < 0 || lda < std::max(1, k) || ldb < std::max(1, m)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (trans == CUBLAS_OP_C) trans = CUBLAS_OP_T;
+  const T al = scalar(h, alpha);
+  if (deferred_to_graph(h, [=] { trsm_one<T>(side, uplo, trans, diag, m, n, al, A, lda, B, ldb); }))
+    return CUBLAS_STATUS_SUCCESS;
+  return trsm_one<T>(side, uplo, trans, diag, m, n, al, A, lda, B, ldb);
+}
+
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasStrsm_v2(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo,
+                                          cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
+                                          const float* alpha, const float* A, int lda, float* B, int ldb) {
+  return trsm<float>(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb);
+}
+VGPU_EXPORT cublasStatus_t cublasDtrsm_v2(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo,
+                                          cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
+                                          const double* alpha, const double* A, int lda, double* B, int ldb) {
+  return trsm<double>(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb);
+}
+VGPU_EXPORT cublasStatus_t cublasStrsmBatched(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo,
+                                              cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
+                                              const float* alpha, const float* const A[], int lda,
+                                              float* const B[], int ldb, int batch) {
+  return trsm_batched<float>(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb, batch);
+}
+VGPU_EXPORT cublasStatus_t cublasDtrsmBatched(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo,
+                                              cublasOperation_t trans, cublasDiagType_t diag, int m, int n,
+                                              const double* alpha, const double* const A[], int lda,
+                                              double* const B[], int ldb, int batch) {
+  return trsm_batched<double>(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb, batch);
+}
+
 // A workspace is a scratch buffer the library would use for its own tiling.
 // Nothing here needs one, so accepting it is honest: the caller's buffer simply
 // goes unused, and refusing would stop a program that is doing nothing wrong.

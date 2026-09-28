@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1082,4 +1083,459 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXsyevjSetSortEig(syevjInfo_t info, int so
   if (!known(info)) return CUSOLVER_STATUS_INVALID_VALUE;
   reinterpret_cast<JacobiInfo*>(info)->sort = sort;
   return CUSOLVER_STATUS_SUCCESS;
+}
+
+/* ---- batched symmetric eigen, the 64-bit API: torch.linalg.eigh on a batch ---- */
+
+VGPU_EXPORT cusolverStatus_t cusolverDnXsyevBatched_bufferSize(cusolverDnHandle_t h, cusolverDnParams_t,
+                                                               cusolverEigMode_t, cublasFillMode_t, int64_t n,
+                                                               cudaDataType, const void*, int64_t, cudaDataType,
+                                                               const void*, cudaDataType, size_t* dev, size_t* host,
+                                                               int64_t) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (dev) *dev = x_workspace(n);
+  if (host) *host = 0;
+  return CUSOLVER_STATUS_SUCCESS;
+}
+VGPU_EXPORT cusolverStatus_t cusolverDnXsyevBatched(cusolverDnHandle_t h, cusolverDnParams_t, cusolverEigMode_t jobz,
+                                                    cublasFillMode_t uplo, int64_t n, cudaDataType ta, void* A,
+                                                    int64_t lda, cudaDataType tw, void* W, cudaDataType, void*,
+                                                    size_t, void*, size_t, int* info, int64_t batch) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (n < 0 || batch < 0 || lda < std::max<int64_t>(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (ta != tw) return CUSOLVER_STATUS_NOT_SUPPORTED;
+  return by_type(ta, [&](auto t) {
+    using T = decltype(t);
+    for (int64_t b = 0; b < batch; ++b) {
+      const cusolverStatus_t st = eig_into<T>(static_cast<T*>(A) + (size_t)(b * lda * n), n, lda,
+                                              static_cast<T*>(W) + (size_t)(b * n), jobz, uplo, info ? info + b : nullptr);
+      if (st != CUSOLVER_STATUS_SUCCESS) return st;
+    }
+    return CUSOLVER_STATUS_SUCCESS;
+  });
+}
+
+/* ---- general (nonsymmetric) eigen: torch.linalg.eig ----
+   Hessenberg reduction by Householder similarities, then Francis double-shift
+   QR to real Schur form with the transformations accumulated, then back
+   substitution for the eigenvectors: the EISPACK orthes/hqr2 algorithm, in
+   the public-domain form JAMA gives it. Computed in double.
+
+   Output follows LAPACK's geev, which cuSOLVER's does: W complex; VR, for a
+   real A, real, with a complex pair's vector stored as two columns (real
+   part, then imaginary part) at the first eigenvalue of the pair, the one
+   with positive imaginary part; each vector scaled to unit 2-norm with its
+   largest component real. Left eigenvectors are not computed. */
+
+namespace {
+
+struct Geev {
+  int n;
+  std::vector<double> H, V, d, e;  // row-major n x n for the algorithm's indexing
+  double& h(int i, int j) { return H[(size_t)i * n + j]; }
+  double& v(int i, int j) { return V[(size_t)i * n + j]; }
+};
+
+void orthes(Geev& g) {
+  const int n = g.n, low = 0, high = n - 1;
+  std::vector<double> ort(n, 0.0);
+  for (int m = low + 1; m <= high - 1; ++m) {
+    double scale = 0.0;
+    for (int i = m; i <= high; ++i) scale += std::fabs(g.h(i, m - 1));
+    if (scale == 0.0) continue;
+    double hh = 0.0;
+    for (int i = high; i >= m; --i) {
+      ort[i] = g.h(i, m - 1) / scale;
+      hh += ort[i] * ort[i];
+    }
+    double gg = std::sqrt(hh);
+    if (ort[m] > 0) gg = -gg;
+    hh -= ort[m] * gg;
+    ort[m] -= gg;
+    for (int j = m; j < n; ++j) {
+      double f = 0.0;
+      for (int i = high; i >= m; --i) f += ort[i] * g.h(i, j);
+      f /= hh;
+      for (int i = m; i <= high; ++i) g.h(i, j) -= f * ort[i];
+    }
+    for (int i = 0; i <= high; ++i) {
+      double f = 0.0;
+      for (int j = high; j >= m; --j) f += ort[j] * g.h(i, j);
+      f /= hh;
+      for (int j = m; j <= high; ++j) g.h(i, j) -= f * ort[j];
+    }
+    ort[m] *= scale;
+    g.h(m, m - 1) = scale * gg;
+  }
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) g.v(i, j) = i == j ? 1.0 : 0.0;
+  for (int m = high - 1; m >= low + 1; --m) {
+    if (g.h(m, m - 1) == 0.0) continue;
+    for (int i = m + 1; i <= high; ++i) ort[i] = g.h(i, m - 1);
+    for (int j = m; j <= high; ++j) {
+      double gg = 0.0;
+      for (int i = m; i <= high; ++i) gg += ort[i] * g.v(i, j);
+      gg = (gg / ort[m]) / g.h(m, m - 1);  // two divisions avoid underflow
+      for (int i = m; i <= high; ++i) g.v(i, j) += gg * ort[i];
+    }
+  }
+}
+
+std::complex<double> cdiv(double xr, double xi, double yr, double yi) {
+  return std::complex<double>(xr, xi) / std::complex<double>(yr, yi);
+}
+
+// Returns 0, or n when the QR iteration failed to converge.
+int hqr2(Geev& g) {
+  const int nn = g.n, low = 0, high = nn - 1;
+  int n = nn - 1;
+  const double eps = std::ldexp(1.0, -52);
+  double exshift = 0.0, p = 0, q = 0, r = 0, s = 0, z = 0, t, w, x, y;
+  double norm = 0.0;
+  for (int i = 0; i < nn; ++i)
+    for (int j = std::max(i - 1, 0); j < nn; ++j) norm += std::fabs(g.h(i, j));
+  int iter = 0, total = 0;
+  while (n >= low) {
+    int l = n;
+    while (l > low) {
+      s = std::fabs(g.h(l - 1, l - 1)) + std::fabs(g.h(l, l));
+      if (s == 0.0) s = norm;
+      if (std::fabs(g.h(l, l - 1)) < eps * s) break;
+      --l;
+    }
+    if (l == n) {  // one root
+      g.h(n, n) += exshift;
+      g.d[n] = g.h(n, n);
+      g.e[n] = 0.0;
+      --n;
+      iter = 0;
+    } else if (l == n - 1) {  // two roots
+      w = g.h(n, n - 1) * g.h(n - 1, n);
+      p = (g.h(n - 1, n - 1) - g.h(n, n)) / 2.0;
+      q = p * p + w;
+      z = std::sqrt(std::fabs(q));
+      g.h(n, n) += exshift;
+      g.h(n - 1, n - 1) += exshift;
+      x = g.h(n, n);
+      if (q >= 0) {  // a real pair
+        z = p >= 0 ? p + z : p - z;
+        g.d[n - 1] = x + z;
+        g.d[n] = z != 0.0 ? x - w / z : g.d[n - 1];
+        g.e[n - 1] = g.e[n] = 0.0;
+        x = g.h(n, n - 1);
+        s = std::fabs(x) + std::fabs(z);
+        p = x / s;
+        q = z / s;
+        r = std::sqrt(p * p + q * q);
+        p /= r;
+        q /= r;
+        for (int j = n - 1; j < nn; ++j) {
+          z = g.h(n - 1, j);
+          g.h(n - 1, j) = q * z + p * g.h(n, j);
+          g.h(n, j) = q * g.h(n, j) - p * z;
+        }
+        for (int i = 0; i <= n; ++i) {
+          z = g.h(i, n - 1);
+          g.h(i, n - 1) = q * z + p * g.h(i, n);
+          g.h(i, n) = q * g.h(i, n) - p * z;
+        }
+        for (int i = low; i <= high; ++i) {
+          z = g.v(i, n - 1);
+          g.v(i, n - 1) = q * z + p * g.v(i, n);
+          g.v(i, n) = q * g.v(i, n) - p * z;
+        }
+      } else {  // a complex pair
+        g.d[n - 1] = g.d[n] = x + p;
+        g.e[n - 1] = z;
+        g.e[n] = -z;
+      }
+      n -= 2;
+      iter = 0;
+    } else {  // not converged yet: a double QR step
+      if (++total > 60 * nn + 100) return nn;
+      x = g.h(n, n);
+      y = w = 0.0;
+      if (l < n) {
+        y = g.h(n - 1, n - 1);
+        w = g.h(n, n - 1) * g.h(n - 1, n);
+      }
+      if (iter == 10) {  // Wilkinson's exceptional shift
+        exshift += x;
+        for (int i = low; i <= n; ++i) g.h(i, i) -= x;
+        s = std::fabs(g.h(n, n - 1)) + std::fabs(g.h(n - 1, n - 2));
+        x = y = 0.75 * s;
+        w = -0.4375 * s * s;
+      }
+      if (iter == 30) {  // MATLAB's exceptional shift
+        s = (y - x) / 2.0;
+        s = s * s + w;
+        if (s > 0) {
+          s = std::sqrt(s);
+          if (y < x) s = -s;
+          s = x - w / ((y - x) / 2.0 + s);
+          for (int i = low; i <= n; ++i) g.h(i, i) -= s;
+          exshift += s;
+          x = y = w = 0.964;
+        }
+      }
+      ++iter;
+      int m = n - 2;
+      while (m >= l) {
+        z = g.h(m, m);
+        r = x - z;
+        s = y - z;
+        p = (r * s - w) / g.h(m + 1, m) + g.h(m, m + 1);
+        q = g.h(m + 1, m + 1) - z - r - s;
+        r = g.h(m + 2, m + 1);
+        s = std::fabs(p) + std::fabs(q) + std::fabs(r);
+        p /= s;
+        q /= s;
+        r /= s;
+        if (m == l) break;
+        if (std::fabs(g.h(m, m - 1)) * (std::fabs(q) + std::fabs(r)) <
+            eps * (std::fabs(p) * (std::fabs(g.h(m - 1, m - 1)) + std::fabs(z) + std::fabs(g.h(m + 1, m + 1)))))
+          break;
+        --m;
+      }
+      for (int i = m + 2; i <= n; ++i) {
+        g.h(i, i - 2) = 0.0;
+        if (i > m + 2) g.h(i, i - 3) = 0.0;
+      }
+      for (int k = m; k <= n - 1; ++k) {
+        const bool notlast = k != n - 1;
+        if (k != m) {
+          p = g.h(k, k - 1);
+          q = g.h(k + 1, k - 1);
+          r = notlast ? g.h(k + 2, k - 1) : 0.0;
+          x = std::fabs(p) + std::fabs(q) + std::fabs(r);
+          if (x == 0.0) continue;
+          p /= x;
+          q /= x;
+          r /= x;
+        }
+        s = std::sqrt(p * p + q * q + r * r);
+        if (p < 0) s = -s;
+        if (s == 0) continue;
+        if (k != m) g.h(k, k - 1) = -s * x;
+        else if (l != m) g.h(k, k - 1) = -g.h(k, k - 1);
+        p += s;
+        x = p / s;
+        y = q / s;
+        z = r / s;
+        q /= p;
+        r /= p;
+        for (int j = k; j < nn; ++j) {
+          p = g.h(k, j) + q * g.h(k + 1, j);
+          if (notlast) {
+            p += r * g.h(k + 2, j);
+            g.h(k + 2, j) -= p * z;
+          }
+          g.h(k, j) -= p * x;
+          g.h(k + 1, j) -= p * y;
+        }
+        for (int i = 0; i <= std::min(n, k + 3); ++i) {
+          p = x * g.h(i, k) + y * g.h(i, k + 1);
+          if (notlast) {
+            p += z * g.h(i, k + 2);
+            g.h(i, k + 2) -= p * r;
+          }
+          g.h(i, k) -= p;
+          g.h(i, k + 1) -= p * q;
+        }
+        for (int i = low; i <= high; ++i) {
+          p = x * g.v(i, k) + y * g.v(i, k + 1);
+          if (notlast) {
+            p += z * g.v(i, k + 2);
+            g.v(i, k + 2) -= p * r;
+          }
+          g.v(i, k) -= p;
+          g.v(i, k + 1) -= p * q;
+        }
+      }
+    }
+  }
+  if (norm == 0.0) return 0;
+  // Back substitution for the eigenvectors of the quasi-triangular form.
+  for (n = nn - 1; n >= 0; --n) {
+    p = g.d[n];
+    q = g.e[n];
+    if (q == 0) {  // a real vector
+      int l = n;
+      g.h(n, n) = 1.0;
+      for (int i = n - 1; i >= 0; --i) {
+        w = g.h(i, i) - p;
+        r = 0.0;
+        for (int j = l; j <= n; ++j) r += g.h(i, j) * g.h(j, n);
+        if (g.e[i] < 0.0) {
+          z = w;
+          s = r;
+        } else {
+          l = i;
+          if (g.e[i] == 0.0) {
+            g.h(i, n) = w != 0.0 ? -r / w : -r / (eps * norm);
+          } else {
+            x = g.h(i, i + 1);
+            y = g.h(i + 1, i);
+            q = (g.d[i] - p) * (g.d[i] - p) + g.e[i] * g.e[i];
+            t = (x * s - z * r) / q;
+            g.h(i, n) = t;
+            g.h(i + 1, n) = std::fabs(x) > std::fabs(z) ? (-r - w * t) / x : (-s - y * t) / z;
+          }
+          t = std::fabs(g.h(i, n));
+          if ((eps * t) * t > 1)
+            for (int j = i; j <= n; ++j) g.h(j, n) /= t;
+        }
+      }
+    } else if (q < 0) {  // a complex vector, at the second of the pair
+      int l = n - 1;
+      if (std::fabs(g.h(n, n - 1)) > std::fabs(g.h(n - 1, n))) {
+        g.h(n - 1, n - 1) = q / g.h(n, n - 1);
+        g.h(n - 1, n) = -(g.h(n, n) - p) / g.h(n, n - 1);
+      } else {
+        const auto c = cdiv(0.0, -g.h(n - 1, n), g.h(n - 1, n - 1) - p, q);
+        g.h(n - 1, n - 1) = c.real();
+        g.h(n - 1, n) = c.imag();
+      }
+      g.h(n, n - 1) = 0.0;
+      g.h(n, n) = 1.0;
+      for (int i = n - 2; i >= 0; --i) {
+        double ra = 0.0, sa = 0.0, vr, vi;
+        for (int j = l; j <= n; ++j) {
+          ra += g.h(i, j) * g.h(j, n - 1);
+          sa += g.h(i, j) * g.h(j, n);
+        }
+        w = g.h(i, i) - p;
+        if (g.e[i] < 0.0) {
+          z = w;
+          r = ra;
+          s = sa;
+        } else {
+          l = i;
+          if (g.e[i] == 0) {
+            const auto c = cdiv(-ra, -sa, w, q);
+            g.h(i, n - 1) = c.real();
+            g.h(i, n) = c.imag();
+          } else {
+            x = g.h(i, i + 1);
+            y = g.h(i + 1, i);
+            vr = (g.d[i] - p) * (g.d[i] - p) + g.e[i] * g.e[i] - q * q;
+            vi = (g.d[i] - p) * 2.0 * q;
+            if (vr == 0.0 && vi == 0.0)
+              vr = eps * norm * (std::fabs(w) + std::fabs(q) + std::fabs(x) + std::fabs(y) + std::fabs(z));
+            const auto c = cdiv(x * r - z * ra + q * sa, x * s - z * sa - q * ra, vr, vi);
+            g.h(i, n - 1) = c.real();
+            g.h(i, n) = c.imag();
+            if (std::fabs(x) > std::fabs(z) + std::fabs(q)) {
+              g.h(i + 1, n - 1) = (-ra - w * g.h(i, n - 1) + q * g.h(i, n)) / x;
+              g.h(i + 1, n) = (-sa - w * g.h(i, n) - q * g.h(i, n - 1)) / x;
+            } else {
+              const auto c2 = cdiv(-r - y * g.h(i, n - 1), -s - y * g.h(i, n), z, q);
+              g.h(i + 1, n - 1) = c2.real();
+              g.h(i + 1, n) = c2.imag();
+            }
+          }
+          t = std::max(std::fabs(g.h(i, n - 1)), std::fabs(g.h(i, n)));
+          if ((eps * t) * t > 1)
+            for (int j = i; j <= n; ++j) {
+              g.h(j, n - 1) /= t;
+              g.h(j, n) /= t;
+            }
+        }
+      }
+    }
+  }
+  // Back to the eigenvectors of the original matrix.
+  for (int j = nn - 1; j >= low; --j)
+    for (int i = low; i <= high; ++i) {
+      z = 0.0;
+      for (int k = low; k <= std::min(j, high); ++k) z += g.v(i, k) * g.h(k, j);
+      g.v(i, j) = z;
+    }
+  return 0;
+}
+
+}  // namespace
+
+VGPU_EXPORT cusolverStatus_t cusolverDnXgeev_bufferSize(cusolverDnHandle_t h, cusolverDnParams_t, cusolverEigMode_t,
+                                                        cusolverEigMode_t, int64_t n, cudaDataType, const void*,
+                                                        int64_t, cudaDataType, const void*, cudaDataType, const void*,
+                                                        int64_t, cudaDataType, const void*, int64_t, cudaDataType,
+                                                        size_t* dev, size_t* host) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (dev) *dev = x_workspace(n);
+  if (host) *host = x_workspace(n);
+  return CUSOLVER_STATUS_SUCCESS;
+}
+VGPU_EXPORT cusolverStatus_t cusolverDnXgeev(cusolverDnHandle_t h, cusolverDnParams_t, cusolverEigMode_t jobvl,
+                                             cusolverEigMode_t jobvr, int64_t n, cudaDataType ta, void* A, int64_t lda,
+                                             cudaDataType tw, void* W, cudaDataType, void*, int64_t,
+                                             cudaDataType tvr, void* VR, int64_t ldvr, cudaDataType, void*, size_t,
+                                             void*, size_t, int* info) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (n < 0 || lda < std::max<int64_t>(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (jobvl == CUSOLVER_EIG_MODE_VECTOR) return CUSOLVER_STATUS_NOT_SUPPORTED;  // left vectors: not implemented
+  const bool vectors = jobvr == CUSOLVER_EIG_MODE_VECTOR;
+  if (vectors && ldvr < std::max<int64_t>(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
+  const bool dbl = ta == CUDA_R_64F;
+  if ((ta != CUDA_R_32F && !dbl) || tw != (dbl ? CUDA_C_64F : CUDA_C_32F)) return CUSOLVER_STATUS_NOT_SUPPORTED;
+  const bool vr_complex = tvr == (dbl ? CUDA_C_64F : CUDA_C_32F);
+  if (vectors && !vr_complex && tvr != ta) return CUSOLVER_STATUS_NOT_SUPPORTED;
+  return by_type(ta, [&](auto tag) {
+    using T = decltype(tag);
+    const int N = (int)n;
+    Mat a;
+    if (!load<T>(A, (size_t)lda * n, &a, (int)lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+    Geev g{N, std::vector<double>((size_t)N * N), std::vector<double>((size_t)N * N), std::vector<double>(N),
+           std::vector<double>(N)};
+    for (int i = 0; i < N; ++i)
+      for (int j = 0; j < N; ++j) g.h(i, j) = a(i, j);
+    const int rc = N ? (orthes(g), hqr2(g)) : 0;
+    set_info(info, rc);
+    std::vector<T> w((size_t)2 * N);
+    for (int i = 0; i < N; ++i) {
+      w[2 * i] = (T)g.d[i];
+      w[2 * i + 1] = (T)g.e[i];
+    }
+    if (N && cudaMemcpy(W, w.data(), w.size() * sizeof(T), cudaMemcpyHostToDevice) != cudaSuccess)
+      return CUSOLVER_STATUS_EXECUTION_FAILED;
+    if (!vectors || rc) return CUSOLVER_STATUS_SUCCESS;
+    // Each vector to unit 2-norm with its largest component real, as LAPACK leaves them.
+    std::vector<std::vector<std::complex<double>>> vecs(N, std::vector<std::complex<double>>(N));
+    for (int j = 0; j < N; ++j) {
+      auto& vj = vecs[j];
+      if (g.e[j] == 0.0) for (int i = 0; i < N; ++i) vj[i] = g.v(i, j);
+      else if (g.e[j] > 0.0) for (int i = 0; i < N; ++i) vj[i] = {g.v(i, j), g.v(i, j + 1)};
+      else for (int i = 0; i < N; ++i) vj[i] = std::conj(vecs[j - 1][i]);
+      if (g.e[j] < 0.0) continue;  // the conjugate of a vector already scaled
+      double nrm = 0.0;
+      int big = 0;
+      for (int i = 0; i < N; ++i) {
+        nrm += std::norm(vj[i]);
+        if (std::abs(vj[i]) > std::abs(vj[big])) big = i;
+      }
+      nrm = std::sqrt(nrm);
+      std::complex<double> scale = nrm > 0 ? 1.0 / nrm : 1.0;
+      if (g.e[j] > 0.0 && std::abs(vj[big]) > 0) scale *= std::conj(vj[big]) / std::abs(vj[big]);
+      for (auto& x : vj) x *= scale;
+    }
+    std::vector<T> out;
+    if (vr_complex) {
+      out.assign((size_t)2 * ldvr * N, T(0));
+      for (int j = 0; j < N; ++j)
+        for (int i = 0; i < N; ++i) {
+          out[2 * ((size_t)j * ldvr + i)] = (T)vecs[j][i].real();
+          out[2 * ((size_t)j * ldvr + i) + 1] = (T)vecs[j][i].imag();
+        }
+    } else {  // LAPACK's packing: (re, im) columns at the pair's first eigenvalue
+      out.assign((size_t)ldvr * N, T(0));
+      for (int j = 0; j < N; ++j)
+        for (int i = 0; i < N; ++i) {
+          const auto& src = g.e[j] < 0.0 ? vecs[j - 1][i] : vecs[j][i];
+          out[(size_t)j * ldvr + i] = (T)(g.e[j] < 0.0 ? src.imag() : src.real());
+        }
+    }
+    if (cudaMemcpy(VR, out.data(), out.size() * sizeof(T), cudaMemcpyHostToDevice) != cudaSuccess)
+      return CUSOLVER_STATUS_EXECUTION_FAILED;
+    return CUSOLVER_STATUS_SUCCESS;
+  });
 }

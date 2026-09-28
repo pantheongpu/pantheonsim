@@ -5,9 +5,11 @@
 //
 //   cholesky, cholesky_solve   cusolverDnXpotrf/Xpotrs, potrfBatched/potrsBatched
 //   qr                         cusolverDnXgeqrf
-//   eigh                       cusolverDnXsyevd, syevj, syevjBatched
+//   eigh                       cusolverDnXsyevd, syevj, syevjBatched, XsyevBatched
+//   eig                        cusolverDnXgeev
 //   svd                        gesvdj, gesvdjBatched, gesvdaStridedBatched
 //   inv, solve (batched)       cublasgetrfBatched, cublasgetrsBatched
+//   solve_triangular, lstsq    cublastrsm, cublastrsmBatched
 //
 // Every matrix is column-major, as both libraries take it.
 #include <cublas_v2.h>
@@ -15,6 +17,7 @@
 #include <cusolverDn.h>
 
 #include <algorithm>
+#include <complex>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -473,6 +476,187 @@ static void lu_batched() {
   cudaFree(dinfo);
 }
 
+// op(A) X = alpha B or X op(A) = alpha B, A triangular: the residual of each
+// form, with the other triangle of A filled with values that must be ignored.
+static void triangular() {
+  const int m = 5, n = 3;
+  struct Case { cublasSideMode_t side; cublasFillMode_t uplo; cublasOperation_t op; cublasDiagType_t diag; const char* what; };
+  const Case cases[] = {
+      {CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, "trsm left, lower: A X = alpha B"},
+      {CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_T, CUBLAS_DIAG_UNIT, "trsm left, upper, transposed, unit: A^T X = alpha B"},
+      {CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, "trsm right, upper: X A = alpha B"},
+      {CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT, "trsm right, lower, transposed: X A^T = alpha B"},
+  };
+  const double alpha = 0.5;
+  for (const Case& c : cases) {
+    const int k = c.side == CUBLAS_SIDE_LEFT ? m : n;
+    auto a = general<double>(k, k, 80);
+    for (int i = 0; i < k; ++i) a[i + (size_t)i * k] = 3.0 + i;  // well conditioned
+    const auto b = general<double>(m, n, 81);
+    double* da = upload(a);
+    double* db = upload(b);
+    CK(cublasDtrsm(bh, c.side, c.uplo, c.op, c.diag, m, n, &alpha, da, k, db, m));
+    const auto x = download(db, b.size());
+    // The effective op(A), from the named triangle only.
+    auto M = [&](int i, int j) {
+      const int r = c.op == CUBLAS_OP_N ? i : j, col = c.op == CUBLAS_OP_N ? j : i;
+      const bool in = c.uplo == CUBLAS_FILL_MODE_LOWER ? col <= r : col >= r;
+      if (r == col && c.diag == CUBLAS_DIAG_UNIT) return 1.0;
+      return in ? a[r + (size_t)col * k] : 0.0;
+    };
+    double err = 0, scale = 1e-30;
+    for (int i = 0; i < m; ++i)
+      for (int j = 0; j < n; ++j) {
+        double s = 0;
+        if (c.side == CUBLAS_SIDE_LEFT) for (int t = 0; t < m; ++t) s += M(i, t) * x[t + (size_t)j * m];
+        else for (int t = 0; t < n; ++t) s += x[i + (size_t)t * m] * M(t, j);
+        err = std::fmax(err, std::fabs(s - alpha * b[i + (size_t)j * m]));
+        scale = std::fmax(scale, std::fabs(alpha * b[i + (size_t)j * m]));
+      }
+    check(err / scale < 1e-12, c.what, err / scale);
+    cudaFree(da);
+    cudaFree(db);
+  }
+  {  // Batched, single precision, alpha from device memory.
+    const int batch = 3;
+    M<float*> pa(batch), pb(batch);
+    M<M<float>> as, bs;
+    for (int t = 0; t < batch; ++t) {
+      auto a = general<float>(m, m, 90 + t);
+      for (int i = 0; i < m; ++i) a[i + (size_t)i * m] = 4.0f;
+      as.push_back(a);
+      bs.push_back(general<float>(m, n, 95 + t));
+      pa[t] = upload(as[t]);
+      pb[t] = upload(bs[t]);
+    }
+    float** dpa = upload(pa);
+    float** dpb = upload(pb);
+    float* dalpha = upload(M<float>{2.0f});
+    CK(cublasSetPointerMode(bh, CUBLAS_POINTER_MODE_DEVICE));
+    const cublasStatus_t st = cublasStrsmBatched(bh, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
+                                                 CUBLAS_DIAG_NON_UNIT, m, n, dalpha, dpa, m, dpb, m, batch);
+    CK(cublasSetPointerMode(bh, CUBLAS_POINTER_MODE_HOST));
+    CK(st);
+    double err = 0;
+    for (int t = 0; t < batch; ++t) {
+      const auto x = download(pb[t], (size_t)m * n);
+      for (int i = 0; i < m; ++i)
+        for (int j = 0; j < n; ++j) {
+          double s = 0;
+          for (int q = i; q < m; ++q) s += (double)as[t][i + (size_t)q * m] * x[q + (size_t)j * m];
+          err = std::fmax(err, std::fabs(s - 2.0 * bs[t][i + (size_t)j * m]));
+        }
+    }
+    check(err < 1e-4, "trsmBatched (device alpha): each A X = alpha B", err);
+    for (int t = 0; t < batch; ++t) { cudaFree(pa[t]); cudaFree(pb[t]); }
+    cudaFree(dpa);
+    cudaFree(dpb);
+    cudaFree(dalpha);
+  }
+}
+
+// XsyevBatched and Xgeev arrived in CUDA 12.6 and 12.8; the headers before
+// them do not declare them, so this part is built only where they exist.
+#if CUDART_VERSION >= 13000
+static void eig_64bit() {
+  {  // XsyevBatched: a batch of symmetric matrices, vectors in place.
+    const int n = 5, batch = 3;
+    M<double> a;
+    for (int b = 0; b < batch; ++b) {
+      const auto one = symmetric<double>(n, 60 + b);
+      a.insert(a.end(), one.begin(), one.end());
+    }
+    double* da = upload(a);
+    double* dw = upload(M<double>((size_t)n * batch));
+    int* dinfo = upload(M<int>(batch, 7));
+    size_t dev = 0, host = 0;
+    CK(cusolverDnXsyevBatched_bufferSize(sh, params, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, n,
+                                         CUDA_R_64F, da, n, CUDA_R_64F, dw, CUDA_R_64F, &dev, &host, batch));
+    void* work = nullptr;
+    cudaMalloc(&work, std::max<size_t>(dev, 1));
+    M<char> hwork(std::max<size_t>(host, 1));
+    CK(cusolverDnXsyevBatched(sh, params, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, n, CUDA_R_64F, da, n,
+                              CUDA_R_64F, dw, CUDA_R_64F, work, dev, hwork.data(), host, dinfo, batch));
+    const auto v = download(da, a.size());
+    const auto w = download(dw, (size_t)n * batch);
+    double e = 0;
+    bool all_asc = true;
+    for (int b = 0; b < batch; ++b) {
+      bool asc;
+      const M<double> ab(a.begin() + (size_t)b * n * n, a.begin() + (size_t)(b + 1) * n * n);
+      e = std::fmax(e, eig_error(ab, n, v.data() + (size_t)b * n * n, w.data() + (size_t)b * n, &asc));
+      all_asc = all_asc && asc;
+    }
+    check(e < 1e-10 && all_asc, "XsyevBatched eigenpairs satisfy A v = w v for each matrix", e);
+    cudaFree(work);
+    cudaFree(da);
+    cudaFree(dw);
+    cudaFree(dinfo);
+  }
+  {  // Xgeev: a real matrix with a complex pair, right vectors in LAPACK's packing.
+    const int n = 6;
+    auto a = general<double>(n, n, 70);
+    a[0 + 1 * n] = 3.0;  // a strong rotation between the first two coordinates
+    a[1 + 0 * n] = -3.0;
+    double* da = upload(a);
+    std::complex<double>* dw = upload(M<std::complex<double>>(n));
+    double* dvr = upload(M<double>((size_t)n * n));
+    int* dinfo = upload(M<int>{7});
+    size_t dev = 0, host = 0;
+    CK(cusolverDnXgeev_bufferSize(sh, params, CUSOLVER_EIG_MODE_NOVECTOR, CUSOLVER_EIG_MODE_VECTOR, n, CUDA_R_64F, da,
+                                  n, CUDA_C_64F, dw, CUDA_R_64F, nullptr, n, CUDA_R_64F, dvr, n, CUDA_R_64F, &dev,
+                                  &host));
+    void* work = nullptr;
+    cudaMalloc(&work, std::max<size_t>(dev, 1));
+    M<char> hwork(std::max<size_t>(host, 1));
+    CK(cusolverDnXgeev(sh, params, CUSOLVER_EIG_MODE_NOVECTOR, CUSOLVER_EIG_MODE_VECTOR, n, CUDA_R_64F, da, n,
+                       CUDA_C_64F, dw, CUDA_R_64F, nullptr, n, CUDA_R_64F, dvr, n, CUDA_R_64F, work, dev,
+                       hwork.data(), host, dinfo));
+    const auto w = download(dw, n);
+    const auto vr = download(dvr, (size_t)n * n);
+    const int info = download(dinfo, 1)[0];
+    // Unpack: a pair (w[j], w[j+1] = conj) shares columns j (real) and j+1 (imaginary).
+    double err = 0, scale = 1e-30;
+    int pairs = 0;
+    bool unit = true, packing = true;
+    for (int j = 0; j < n; ++j) {
+      M<std::complex<double>> x(n);
+      if (w[j].imag() == 0) {
+        for (int i = 0; i < n; ++i) x[i] = vr[i + (size_t)j * n];
+      } else {
+        const bool first = w[j].imag() > 0;
+        if (first) {
+          ++pairs;
+          packing = packing && j + 1 < n && w[j + 1] == std::conj(w[j]);
+        }
+        const int c = first ? j : j - 1;
+        for (int i = 0; i < n; ++i)
+          x[i] = std::complex<double>(vr[i + (size_t)c * n], (first ? 1.0 : -1.0) * vr[i + (size_t)(c + 1) * n]);
+      }
+      double nrm = 0;
+      for (int i = 0; i < n; ++i) {
+        std::complex<double> s = 0;
+        for (int k = 0; k < n; ++k) s += a[i + (size_t)k * n] * x[k];
+        err = std::fmax(err, std::abs(s - w[j] * x[i]));
+        nrm += std::norm(x[i]);
+      }
+      unit = unit && std::fabs(std::sqrt(nrm) - 1.0) < 1e-10;
+      scale = std::fmax(scale, std::abs(w[j]));
+    }
+    check(info == 0 && err / scale < 1e-10 && pairs >= 1 && packing && unit,
+          "Xgeev: A v = w v for every eigenpair, conjugate pairs packed as LAPACK packs them, unit vectors",
+          err / scale);
+    cudaFree(work);
+    cudaFree(da);
+    cudaFree(dw);
+    cudaFree(dvr);
+    cudaFree(dinfo);
+  }
+}
+#else
+static void eig_64bit() { std::printf("ok   XsyevBatched and Xgeev: not in this toolkit's headers, skipped\n"); }
+#endif
+
 int main() {
   if (cusolverDnCreate(&sh) || cusolverDnCreateParams(&params) || cublasCreate(&bh)) {
     std::printf("FAIL: could not create the library handles\n");
@@ -484,6 +668,8 @@ int main() {
   eigh();
   svd();
   lu_batched();
+  triangular();
+  eig_64bit();
   cublasDestroy(bh);
   cusolverDnDestroyParams(params);
   cusolverDnDestroy(sh);
