@@ -1599,3 +1599,14 @@ endif()
 add_test(NAME amd_ollama COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_ollama_amd.sh)
 set_tests_properties(amd_ollama PROPERTIES DEPENDS "vgpuhip;vgpu_cli" RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 10800)
+
+# A test that prints a line starting "SKIP:" did not run, or not all of it:
+# ctest reports it as skipped rather than passed, so a job that is meant to
+# run everything -- the pantheonsim.com runner's -- can tell. (Scripts print
+# SKIP and exit 0 so they pass where the toolkit is absent; counted as passes,
+# two CUTLASS tests once "passed" on the runner in five seconds each without
+# compiling anything.)
+get_property(_vgpu_all_tests DIRECTORY PROPERTY TESTS)
+if(_vgpu_all_tests)
+  set_tests_properties(${_vgpu_all_tests} PROPERTIES SKIP_REGULAR_EXPRESSION "(^|\n)SKIP:")
+endif()

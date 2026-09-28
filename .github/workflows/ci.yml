@@ -282,12 +282,26 @@ jobs:
         # jobs, and nothing ran it: two such tests broke on plain Linux
         # unnoticed. This runner has ROCm 7.1, so they run here. The ML tests
         # ran above; the workloads, every ollama test and the CUTLASS compiles run in the
-        # hosted jobs. A skip is allowed here, since some tests need what no
-        # machine here has. A run started by hand for chosen tests skips this.
+        # hosted jobs. A run started by hand for chosen tests skips this.
+        #
+        # A skip fails the job too, unless the test is named in RUNNER_SKIPS_OK
+        # with the reason it cannot run on this machine: a skip that nobody
+        # chose is a test that silently stopped running.
         if: inputs.ml_tests == ''
-        run: >-
-          ctest --test-dir build --output-on-failure -j2
-          -E '^(pantheon_workloads|.*ollama.*|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
+        env:
+          RUNNER_SKIPS_OK: '^$'
+        run: |
+          set -o pipefail
+          ctest --test-dir build --output-on-failure -j2 \
+            -E '^(pantheon_workloads|.*ollama.*|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$' \
+            2>&1 | tee rest.log
+          skipped=$(grep -oE 'Test +#[0-9]+: [A-Za-z0-9_]+ \.+\*\*\*(Skipped|Not Run)' rest.log \
+                    | sed -E 's/Test +#[0-9]+: ([A-Za-z0-9_]+).*/\1/' || true)
+          unexpected=$(grep -vE "$RUNNER_SKIPS_OK" <<<"$skipped" | grep . || true)
+          if [[ -n "$unexpected" ]]; then
+            echo "::error::tests skipped on the runner, which should run them: $(tr '\n' ' ' <<<"$unexpected")"
+            exit 1
+          fi
 
   sanitizers:
     name: ASan + UBSan
