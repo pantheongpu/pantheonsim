@@ -1,0 +1,577 @@
+// The complex (C and Z) half of cuBLAS: included at the end of cublas_api.cpp,
+// whose helpers (valid, fetch, store, hold, deferred_to_graph) it uses.
+//
+// The arithmetic is complex_linalg.hpp's, in std::complex<double>, rounded to
+// the caller's precision on the way out. CUBLAS_OP_C conjugates as it
+// transposes. What PyTorch's complex tensors reach: GEMM in every batched
+// form, GEMV, the level-1 routines, rank-1 and rank-k updates, triangular
+// multiplies and solves, Hermitian/symmetric products, and batched LU.
+//
+// Not implemented (still stubs): her/her2/syr/syr2, her2k/syr2k, the rot
+// family, geqrfBatched and gelsBatched.
+
+#include "complex_linalg.hpp"
+
+namespace {
+
+using vgpu_la::cd;
+using vgpu_la::CMat;
+
+inline cd to_cd(const cuComplex& v) { return {v.x, v.y}; }
+inline cd to_cd(const cuDoubleComplex& v) { return {v.x, v.y}; }
+template <class T> T from_cd(cd v);
+template <> inline cuComplex from_cd<cuComplex>(cd v) { return make_cuComplex((float)v.real(), (float)v.imag()); }
+template <> inline cuDoubleComplex from_cd<cuDoubleComplex>(cd v) { return make_cuDoubleComplex(v.real(), v.imag()); }
+template <class T> using Real = std::conditional_t<std::is_same_v<T, cuComplex>, float, double>;
+
+template <class T> std::vector<cd> load_c(const T* dev, size_t n) {
+  const auto raw = fetch<T>(dev, n);
+  std::vector<cd> out(n);
+  for (size_t i = 0; i < n; ++i) out[i] = to_cd(raw[i]);
+  return out;
+}
+template <class T> void store_c(T* dev, const std::vector<cd>& v) {
+  std::vector<T> raw(v.size());
+  for (size_t i = 0; i < v.size(); ++i) raw[i] = from_cd<T>(v[i]);
+  store(dev, raw);
+}
+template <class T> CMat load_mat(const T* dev, int ld, int cols, int rows) {
+  CMat m{load_c(dev, extent(ld, cols, rows)), ld};
+  m.v.resize((size_t)ld * std::max(cols, 0));  // room for the padding after the last column
+  return m;
+}
+template <class T> void store_mat(T* dev, const CMat& m, int cols, int rows) {
+  std::vector<cd> v(m.v.begin(), m.v.begin() + extent(m.ld, cols, rows));
+  store_c(dev, v);
+}
+template <class T> cd cscalar(cublasHandle_t h, const T* p) { return p ? to_cd(scalar(h, p)) : cd(0); }
+
+vgpu_la::Op to_op(cublasOperation_t t) {
+  return t == CUBLAS_OP_N ? vgpu_la::Op::N : t == CUBLAS_OP_T ? vgpu_la::Op::T : vgpu_la::Op::C;
+}
+// element (i, j) of op(A)
+inline cd opel(const CMat& a, vgpu_la::Op op, int i, int j) {
+  return op == vgpu_la::Op::N ? a(i, j) : vgpu_la::apply_op(a(j, i), op);
+}
+
+// Runs `body` now, or records it when the handle's stream is capturing. The
+// scalars are held (copied, in host pointer mode) so a replay sees the values
+// of the call, not of whatever the caller's variables hold later.
+template <class Body>
+cublasStatus_t run_c(cublasHandle_t h, const void* alpha, const void* beta, size_t bytes, Body body) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (deferred_to_graph(h, [=, a = hold(h, alpha, bytes), b = hold(h, beta, bytes)] { body(a.get(), b.get()); }))
+    return CUBLAS_STATUS_SUCCESS;
+  return body(alpha, beta);
+}
+
+// Strided vectors, as BLAS walks them: a negative increment starts at the end.
+template <class T> std::vector<cd> load_vec(const T* x, int n, int inc) {
+  const int a = std::abs(inc);
+  auto raw = load_c(x, n > 0 ? (size_t)(n - 1) * a + 1 : 0);
+  std::vector<cd> out(std::max(n, 0));
+  for (int i = 0; i < n; ++i) out[i] = raw[(size_t)(inc > 0 ? i : n - 1 - i) * a];
+  return out;
+}
+template <class T> void store_vec(T* x, int n, int inc, const std::vector<cd>& v) {
+  const int a = std::abs(inc);
+  auto raw = load_c(x, n > 0 ? (size_t)(n - 1) * a + 1 : 0);  // keep what lies between
+  for (int i = 0; i < n; ++i) raw[(size_t)(inc > 0 ? i : n - 1 - i) * a] = v[i];
+  store_c(x, raw);
+}
+
+template <class T>
+cublasStatus_t cgemm(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                     const T* alpha, const T* A, int lda, const T* B, int ldb, const T* beta, T* C, int ldc) {
+  if (m < 0 || n < 0 || k < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {
+    const cd a_ = cscalar(h, static_cast<const T*>(al)), b_ = cscalar(h, static_cast<const T*>(be));
+    const auto oa = to_op(ta), ob = to_op(tb);
+    const CMat a = load_mat(A, lda, oa == vgpu_la::Op::N ? k : m, oa == vgpu_la::Op::N ? m : k);
+    const CMat b = load_mat(B, ldb, ob == vgpu_la::Op::N ? n : k, ob == vgpu_la::Op::N ? k : n);
+    // C is read even when beta is 0, so the padding between its columns is
+    // written back as it was; its old values are then never used.
+    CMat c = load_mat(C, ldc, n, m);
+    for (int j = 0; j < n; ++j)
+      for (int i = 0; i < m; ++i) {
+        cd s = 0;
+        for (int p = 0; p < k; ++p) s += opel(a, oa, i, p) * opel(b, ob, p, j);
+        c(i, j) = b_ == cd(0) ? a_ * s : a_ * s + b_ * c(i, j);
+      }
+    store_mat(C, c, n, m);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+template <class T>
+cublasStatus_t cgemv(cublasHandle_t h, cublasOperation_t t, int m, int n, const T* alpha, const T* A, int lda,
+                     const T* x, int incx, const T* beta, T* y, int incy) {
+  if (m < 0 || n < 0 || incx == 0 || incy == 0) return CUBLAS_STATUS_INVALID_VALUE;
+  return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {
+    const cd a_ = cscalar(h, static_cast<const T*>(al)), b_ = cscalar(h, static_cast<const T*>(be));
+    const auto op = to_op(t);
+    const int rows = op == vgpu_la::Op::N ? m : n, cols = op == vgpu_la::Op::N ? n : m;
+    const CMat a = load_mat(A, lda, n, m);
+    const auto xv = load_vec(x, cols, incx);
+    auto yv = b_ == cd(0) ? std::vector<cd>(rows, 0) : load_vec(y, rows, incy);
+    for (int i = 0; i < rows; ++i) {
+      cd s = 0;
+      for (int j = 0; j < cols; ++j) s += opel(a, op, i, j) * xv[j];
+      yv[i] = b_ == cd(0) ? a_ * s : a_ * s + b_ * yv[i];
+    }
+    store_vec(y, rows, incy, yv);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+// A rank-1 update A += alpha x y^T (geru) or x y^H (gerc).
+template <class T>
+cublasStatus_t cger(cublasHandle_t h, bool conj, int m, int n, const T* alpha, const T* x, int incx, const T* y,
+                    int incy, T* A, int lda) {
+  if (m < 0 || n < 0 || incx == 0 || incy == 0) return CUBLAS_STATUS_INVALID_VALUE;
+  return run_c(h, alpha, nullptr, sizeof(T), [=](const void* al, const void*) {
+    const cd a_ = cscalar(h, static_cast<const T*>(al));
+    const auto xv = load_vec(x, m, incx), yv = load_vec(y, n, incy);
+    CMat a = load_mat(A, lda, n, m);
+    for (int j = 0; j < n; ++j)
+      for (int i = 0; i < m; ++i) a(i, j) += a_ * xv[i] * (conj ? std::conj(yv[j]) : yv[j]);
+    store_mat(A, a, n, m);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+// The full n x n matrix a Hermitian (or symmetric) triangle stands for.
+CMat expand(const CMat& a, int n, bool lower, bool hermitian) {
+  CMat f{std::vector<cd>((size_t)n * n), n};
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < n; ++i) {
+      const bool stored = lower ? i >= j : i <= j;
+      f(i, j) = stored ? a(i, j) : (hermitian ? std::conj(a(j, i)) : a(j, i));
+      if (hermitian && i == j) f(i, j) = f(i, j).real();
+    }
+  return f;
+}
+
+// C = alpha A B + beta C (left) or alpha B A + beta C, A Hermitian or symmetric.
+template <class T>
+cublasStatus_t chemm(cublasHandle_t h, bool hermitian, cublasSideMode_t side, cublasFillMode_t uplo, int m, int n,
+                     const T* alpha, const T* A, int lda, const T* B, int ldb, const T* beta, T* C, int ldc) {
+  if (m < 0 || n < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {
+    const cd a_ = cscalar(h, static_cast<const T*>(al)), b_ = cscalar(h, static_cast<const T*>(be));
+    const bool left = side == CUBLAS_SIDE_LEFT;
+    const int ka = left ? m : n;
+    const CMat a = expand(load_mat(A, lda, ka, ka), ka, uplo == CUBLAS_FILL_MODE_LOWER, hermitian);
+    const CMat b = load_mat(B, ldb, n, m);
+    // C is read even when beta is 0, so the padding between its columns is
+    // written back as it was; its old values are then never used.
+    CMat c = load_mat(C, ldc, n, m);
+    for (int j = 0; j < n; ++j)
+      for (int i = 0; i < m; ++i) {
+        cd s = 0;
+        if (left) for (int p = 0; p < m; ++p) s += a(i, p) * b(p, j);
+        else for (int p = 0; p < n; ++p) s += b(i, p) * a(p, j);
+        c(i, j) = b_ == cd(0) ? a_ * s : a_ * s + b_ * c(i, j);
+      }
+    store_mat(C, c, n, m);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+// y = alpha A x + beta y, A Hermitian or symmetric.
+template <class T>
+cublasStatus_t chemv(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, int n, const T* alpha, const T* A,
+                     int lda, const T* x, int incx, const T* beta, T* y, int incy) {
+  if (n < 0 || incx == 0 || incy == 0) return CUBLAS_STATUS_INVALID_VALUE;
+  return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {
+    const cd a_ = cscalar(h, static_cast<const T*>(al)), b_ = cscalar(h, static_cast<const T*>(be));
+    const CMat a = expand(load_mat(A, lda, n, n), n, uplo == CUBLAS_FILL_MODE_LOWER, hermitian);
+    const auto xv = load_vec(x, n, incx);
+    auto yv = b_ == cd(0) ? std::vector<cd>(n, 0) : load_vec(y, n, incy);
+    for (int i = 0; i < n; ++i) {
+      cd s = 0;
+      for (int j = 0; j < n; ++j) s += a(i, j) * xv[j];
+      yv[i] = b_ == cd(0) ? a_ * s : a_ * s + b_ * yv[i];
+    }
+    store_vec(y, n, incy, yv);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+// C = alpha op(A) op(A)^H + beta C (herk: alpha, beta real, C Hermitian) or
+// alpha op(A) op(A)^T + beta C (syrk). Only C's `uplo` triangle is written.
+template <class T, class S>
+cublasStatus_t cherk(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, cublasOperation_t t, int n, int k,
+                     const S* alpha, const T* A, int lda, const S* beta, T* C, int ldc) {
+  if (n < 0 || k < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  return run_c(h, alpha, beta, sizeof(S), [=](const void* al, const void* be) {
+    auto sc = [&](const void* p) -> cd {
+      if constexpr (std::is_same_v<S, T>) return cscalar(h, static_cast<const T*>(p));
+      else return p ? cd(scalar(h, static_cast<const S*>(p))) : cd(0);
+    };
+    const cd a_ = sc(al), b_ = sc(be);
+    const bool trans = t != CUBLAS_OP_N;
+    const CMat a = load_mat(A, lda, trans ? n : k, trans ? k : n);
+    CMat c = load_mat(C, ldc, n, n);
+    const bool lower = uplo == CUBLAS_FILL_MODE_LOWER;
+    for (int j = 0; j < n; ++j)
+      for (int i = lower ? j : 0; i < (lower ? n : j + 1); ++i) {
+        cd s = 0;
+        for (int p = 0; p < k; ++p) {
+          const cd x = trans ? (hermitian ? std::conj(a(p, i)) : a(p, i)) : a(i, p);
+          const cd y = trans ? a(p, j) : (hermitian ? std::conj(a(j, p)) : a(j, p));
+          s += x * y;
+        }
+        c(i, j) = b_ == cd(0) ? a_ * s : a_ * s + b_ * c(i, j);
+        if (hermitian && i == j) c(i, j) = c(i, j).real();
+      }
+    store_mat(C, c, n, n);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+// op(A) X = alpha B / X op(A) = alpha B, X over B (trsm); C = alpha op(A) B or
+// alpha B op(A) (trmm, which writes C).
+template <class T>
+cublasStatus_t ctrsm_one(cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t t, cublasDiagType_t diag,
+                         int m, int n, cd alpha, const T* A, int lda, T* B, int ldb) {
+  const bool left = side == CUBLAS_SIDE_LEFT;
+  const int ka = left ? m : n;
+  const CMat a = load_mat(A, lda, ka, ka);
+  CMat b = load_mat(B, ldb, n, m);
+  vgpu_la::trsm(left, uplo == CUBLAS_FILL_MODE_LOWER, to_op(t), diag == CUBLAS_DIAG_UNIT, m, n, alpha, a, b);
+  store_mat(B, b, n, m);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+template <class T>
+cublasStatus_t ctrsm(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t t,
+                     cublasDiagType_t diag, int m, int n, const T* alpha, const T* A, int lda, T* B, int ldb) {
+  if (m < 0 || n < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  return run_c(h, alpha, nullptr, sizeof(T), [=](const void* al, const void*) {
+    return ctrsm_one(side, uplo, t, diag, m, n, cscalar(h, static_cast<const T*>(al)), A, lda, B, ldb);
+  });
+}
+
+template <class T>
+cublasStatus_t ctrsm_batched(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t t,
+                             cublasDiagType_t diag, int m, int n, const T* alpha, const T* const Aarray[], int lda,
+                             T* const Barray[], int ldb, int batch) {
+  if (m < 0 || n < 0 || batch < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  return run_c(h, alpha, nullptr, sizeof(T), [=](const void* al, const void*) {
+    const cd a_ = cscalar(h, static_cast<const T*>(al));
+    const auto pa = fetch<const T*>(Aarray, (size_t)batch);
+    const auto pb = fetch<T*>(Barray, (size_t)batch);
+    for (int i = 0; i < batch; ++i) ctrsm_one(side, uplo, t, diag, m, n, a_, pa[i], lda, pb[i], ldb);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+template <class T>
+cublasStatus_t ctrmm(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t t,
+                     cublasDiagType_t diag, int m, int n, const T* alpha, const T* A, int lda, const T* B, int ldb,
+                     T* C, int ldc) {
+  if (m < 0 || n < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  return run_c(h, alpha, nullptr, sizeof(T), [=](const void* al, const void*) {
+    const cd a_ = cscalar(h, static_cast<const T*>(al));
+    const bool left = side == CUBLAS_SIDE_LEFT, lower = uplo == CUBLAS_FILL_MODE_LOWER;
+    const int ka = left ? m : n;
+    const CMat a = load_mat(A, lda, ka, ka);
+    const CMat b = load_mat(B, ldb, n, m);
+    const auto op = to_op(t);
+    auto tri = [&](int i, int j) -> cd {  // op(A)(i, j) from the named triangle
+      const int r = op == vgpu_la::Op::N ? i : j, c = op == vgpu_la::Op::N ? j : i;
+      if (r == c && diag == CUBLAS_DIAG_UNIT) return 1;
+      if (lower ? c > r : c < r) return 0;
+      return vgpu_la::apply_op(a(r, c), op);
+    };
+    CMat c = load_mat(C, ldc, n, m);  // for the padding between columns
+    for (int j = 0; j < n; ++j)
+      for (int i = 0; i < m; ++i) {
+        cd s = 0;
+        if (left) for (int p = 0; p < m; ++p) s += tri(i, p) * b(p, j);
+        else for (int p = 0; p < n; ++p) s += b(i, p) * tri(p, j);
+        c(i, j) = a_ * s;
+      }
+    store_mat(C, c, n, m);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+// x = op(A) x (trmv) or op(A) x = b (trsv), A triangular.
+template <class T>
+cublasStatus_t ctrmv(cublasHandle_t h, bool solve, cublasFillMode_t uplo, cublasOperation_t t, cublasDiagType_t diag,
+                     int n, const T* A, int lda, T* x, int incx) {
+  if (n < 0 || incx == 0) return CUBLAS_STATUS_INVALID_VALUE;
+  return run_c(h, nullptr, nullptr, 0, [=](const void*, const void*) {
+    const CMat a = load_mat(A, lda, n, n);
+    auto xv = load_vec(x, n, incx);
+    const bool lower = uplo == CUBLAS_FILL_MODE_LOWER, unit = diag == CUBLAS_DIAG_UNIT;
+    if (solve) {
+      vgpu_la::tri_solve(a, n, lower, to_op(t), unit, xv.data(), 1);
+    } else {
+      const auto op = to_op(t);
+      std::vector<cd> out(n, 0);
+      for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j) {
+          const int r = op == vgpu_la::Op::N ? i : j, c = op == vgpu_la::Op::N ? j : i;
+          if (lower ? c > r : c < r) continue;
+          out[i] += (r == c && unit) ? xv[j] : vgpu_la::apply_op(a(r, c), op) * xv[j];
+        }
+      xv = out;
+    }
+    store_vec(x, n, incx, xv);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+template <class T>
+cublasStatus_t cgetrf_batched(cublasHandle_t h, int n, T* const Aarray[], int lda, int* pivots, int* infos, int batch) {
+  if (n < 0 || lda < std::max(1, n) || batch < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  return run_c(h, nullptr, nullptr, 0, [=](const void*, const void*) {
+    const auto ptrs = fetch<T*>(Aarray, (size_t)batch);
+    std::vector<int> all(batch, 0);
+    for (int b = 0; b < batch; ++b) {
+      CMat a = load_mat(ptrs[b], lda, n, n);
+      std::vector<int> ipiv;
+      all[b] = vgpu_la::lu(a, n, n, pivots ? &ipiv : nullptr);
+      store_mat(ptrs[b], a, n, n);
+      if (pivots && n) cudaMemcpy(pivots + (size_t)b * n, ipiv.data(), n * sizeof(int), kH2D);
+    }
+    if (infos) store(infos, all);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+template <class T>
+cublasStatus_t cgetrs_batched(cublasHandle_t h, cublasOperation_t t, int n, int nrhs, const T* const Aarray[], int lda,
+                              const int* pivots, T* const Barray[], int ldb, int* info, int batch) {
+  if (info) *info = 0;
+  if (n < 0 || nrhs < 0 || lda < std::max(1, n) || ldb < std::max(1, n) || batch < 0) {
+    if (info) *info = -1;
+    return CUBLAS_STATUS_INVALID_VALUE;
+  }
+  return run_c(h, nullptr, nullptr, 0, [=](const void*, const void*) {
+    const auto pa = fetch<const T*>(Aarray, (size_t)batch);
+    const auto pb = fetch<T*>(Barray, (size_t)batch);
+    for (int b = 0; b < batch; ++b) {
+      const CMat a = load_mat(pa[b], lda, n, n);
+      CMat x = load_mat(pb[b], ldb, nrhs, n);
+      std::vector<int> ipiv;
+      if (pivots) ipiv = fetch<int>(pivots + (size_t)b * n, (size_t)n);
+      vgpu_la::lu_solve(a, n, pivots ? ipiv.data() : nullptr, to_op(t), x, nrhs);
+      store_mat(pb[b], x, nrhs, n);
+    }
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+// A reduction's result goes where the pointer mode says: host or device.
+template <class T> void put_result(cublasHandle_t h, T* result, cd v) {
+  if (!result) return;
+  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE) store(result, std::vector<T>{from_cd<T>(v)});
+  else *result = from_cd<T>(v);
+}
+
+}  // namespace
+
+#define VGPU_COMPLEX_BLAS(P, T, R)                                                                                \
+  VGPU_EXPORT cublasStatus_t cublas##P##gemm_v2(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb,     \
+                                                int m, int n, int k, const T* alpha, const T* A, int lda,         \
+                                                const T* B, int ldb, const T* beta, T* C, int ldc) {              \
+    return cgemm<T>(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);                                     \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##gemmStridedBatched(                                                       \
+      cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, const T* alpha,          \
+      const T* A, int lda, long long sA, const T* B, int ldb, long long sB, const T* beta, T* C, int ldc,         \
+      long long sC, int batch) {                                                                                  \
+    for (int i = 0; i < batch; ++i) {                                                                             \
+      const cublasStatus_t s =                                                                                    \
+          cgemm<T>(h, ta, tb, m, n, k, alpha, A + i * sA, lda, B + i * sB, ldb, beta, C + i * sC, ldc);           \
+      if (s != CUBLAS_STATUS_SUCCESS) return s;                                                                   \
+    }                                                                                                             \
+    return CUBLAS_STATUS_SUCCESS;                                                                                 \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##gemmBatched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, \
+                                                    int m, int n, int k, const T* alpha, const T* const A[],      \
+                                                    int lda, const T* const B[], int ldb, const T* beta,          \
+                                                    T* const C[], int ldc, int batch) {                           \
+    if (batch < 0) return CUBLAS_STATUS_INVALID_VALUE;                                                            \
+    return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {                                 \
+      const auto a = fetch<const T*>(A, (size_t)batch);                                                           \
+      const auto b = fetch<const T*>(B, (size_t)batch);                                                           \
+      const auto c = fetch<T*>(C, (size_t)batch);                                                                 \
+      for (int i = 0; i < batch; ++i) {                                                                           \
+        const cublasStatus_t s = cgemm<T>(h, ta, tb, m, n, k, static_cast<const T*>(al), a[i], lda, b[i], ldb,    \
+                                          static_cast<const T*>(be), c[i], ldc);                                  \
+        if (s != CUBLAS_STATUS_SUCCESS) return s;                                                                 \
+      }                                                                                                           \
+      return CUBLAS_STATUS_SUCCESS;                                                                               \
+    });                                                                                                           \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##gemv_v2(cublasHandle_t h, cublasOperation_t t, int m, int n,              \
+                                                const T* alpha, const T* A, int lda, const T* x, int incx,        \
+                                                const T* beta, T* y, int incy) {                                  \
+    return cgemv<T>(h, t, m, n, alpha, A, lda, x, incx, beta, y, incy);                                           \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##geru_v2(cublasHandle_t h, int m, int n, const T* alpha, const T* x,       \
+                                                int incx, const T* y, int incy, T* A, int lda) {                  \
+    return cger<T>(h, false, m, n, alpha, x, incx, y, incy, A, lda);                                              \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##gerc_v2(cublasHandle_t h, int m, int n, const T* alpha, const T* x,       \
+                                                int incx, const T* y, int incy, T* A, int lda) {                  \
+    return cger<T>(h, true, m, n, alpha, x, incx, y, incy, A, lda);                                               \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##hemm_v2(cublasHandle_t h, cublasSideMode_t s, cublasFillMode_t u, int m,  \
+                                                int n, const T* alpha, const T* A, int lda, const T* B, int ldb,  \
+                                                const T* beta, T* C, int ldc) {                                   \
+    return chemm<T>(h, true, s, u, m, n, alpha, A, lda, B, ldb, beta, C, ldc);                                    \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##symm_v2(cublasHandle_t h, cublasSideMode_t s, cublasFillMode_t u, int m,  \
+                                                int n, const T* alpha, const T* A, int lda, const T* B, int ldb,  \
+                                                const T* beta, T* C, int ldc) {                                   \
+    return chemm<T>(h, false, s, u, m, n, alpha, A, lda, B, ldb, beta, C, ldc);                                   \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##hemv_v2(cublasHandle_t h, cublasFillMode_t u, int n, const T* alpha,      \
+                                                const T* A, int lda, const T* x, int incx, const T* beta, T* y,   \
+                                                int incy) {                                                       \
+    return chemv<T>(h, true, u, n, alpha, A, lda, x, incx, beta, y, incy);                                        \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##symv_v2(cublasHandle_t h, cublasFillMode_t u, int n, const T* alpha,      \
+                                                const T* A, int lda, const T* x, int incx, const T* beta, T* y,   \
+                                                int incy) {                                                       \
+    return chemv<T>(h, false, u, n, alpha, A, lda, x, incx, beta, y, incy);                                       \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##herk_v2(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t, int n, \
+                                                int k, const R* alpha, const T* A, int lda, const R* beta, T* C,  \
+                                                int ldc) {                                                        \
+    return cherk<T, R>(h, true, u, t, n, k, alpha, A, lda, beta, C, ldc);                                         \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##syrk_v2(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t, int n, \
+                                                int k, const T* alpha, const T* A, int lda, const T* beta, T* C,  \
+                                                int ldc) {                                                        \
+    return cherk<T, T>(h, false, u, t, n, k, alpha, A, lda, beta, C, ldc);                                        \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##trsm_v2(cublasHandle_t h, cublasSideMode_t s, cublasFillMode_t u,         \
+                                                cublasOperation_t t, cublasDiagType_t d, int m, int n,            \
+                                                const T* alpha, const T* A, int lda, T* B, int ldb) {             \
+    return ctrsm<T>(h, s, u, t, d, m, n, alpha, A, lda, B, ldb);                                                  \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##trsmBatched(cublasHandle_t h, cublasSideMode_t s, cublasFillMode_t u,     \
+                                                    cublasOperation_t t, cublasDiagType_t d, int m, int n,        \
+                                                    const T* alpha, const T* const A[], int lda, T* const B[],    \
+                                                    int ldb, int batch) {                                         \
+    return ctrsm_batched<T>(h, s, u, t, d, m, n, alpha, A, lda, B, ldb, batch);                                   \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##trmm_v2(cublasHandle_t h, cublasSideMode_t s, cublasFillMode_t u,         \
+                                                cublasOperation_t t, cublasDiagType_t d, int m, int n,            \
+                                                const T* alpha, const T* A, int lda, const T* B, int ldb, T* C,   \
+                                                int ldc) {                                                        \
+    return ctrmm<T>(h, s, u, t, d, m, n, alpha, A, lda, B, ldb, C, ldc);                                          \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##trmv_v2(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t,        \
+                                                cublasDiagType_t d, int n, const T* A, int lda, T* x, int incx) { \
+    return ctrmv<T>(h, false, u, t, d, n, A, lda, x, incx);                                                       \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##trsv_v2(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t,        \
+                                                cublasDiagType_t d, int n, const T* A, int lda, T* x, int incx) { \
+    return ctrmv<T>(h, true, u, t, d, n, A, lda, x, incx);                                                        \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##getrfBatched(cublasHandle_t h, int n, T* const A[], int lda, int* P,      \
+                                                     int* info, int batch) {                                      \
+    return cgetrf_batched<T>(h, n, A, lda, P, info, batch);                                                       \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##getrsBatched(cublasHandle_t h, cublasOperation_t t, int n, int nrhs,      \
+                                                     const T* const A[], int lda, const int* P, T* const B[],     \
+                                                     int ldb, int* info, int batch) {                             \
+    return cgetrs_batched<T>(h, t, n, nrhs, A, lda, P, B, ldb, info, batch);                                      \
+  }                                                                                                               \
+  /* level 1 */                                                                                                   \
+  VGPU_EXPORT cublasStatus_t cublas##P##axpy_v2(cublasHandle_t h, int n, const T* alpha, const T* x, int incx,    \
+                                                T* y, int incy) {                                                 \
+    if (n < 0 || incx == 0 || incy == 0) return CUBLAS_STATUS_INVALID_VALUE;                                      \
+    return run_c(h, alpha, nullptr, sizeof(T), [=](const void* al, const void*) {                                 \
+      const cd a_ = cscalar(h, static_cast<const T*>(al));                                                        \
+      const auto xv = load_vec(x, n, incx);                                                                       \
+      auto yv = load_vec(y, n, incy);                                                                             \
+      for (int i = 0; i < n; ++i) yv[i] += a_ * xv[i];                                                            \
+      store_vec(y, n, incy, yv);                                                                                  \
+      return CUBLAS_STATUS_SUCCESS;                                                                               \
+    });                                                                                                           \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##scal_v2(cublasHandle_t h, int n, const T* alpha, T* x, int incx) {        \
+    if (n < 0 || incx <= 0) return n < 0 ? CUBLAS_STATUS_INVALID_VALUE : CUBLAS_STATUS_SUCCESS;                   \
+    return run_c(h, alpha, nullptr, sizeof(T), [=](const void* al, const void*) {                                 \
+      const cd a_ = cscalar(h, static_cast<const T*>(al));                                                        \
+      auto xv = load_vec(x, n, incx);                                                                             \
+      for (auto& v : xv) v *= a_;                                                                                 \
+      store_vec(x, n, incx, xv);                                                                                  \
+      return CUBLAS_STATUS_SUCCESS;                                                                               \
+    });                                                                                                           \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##copy_v2(cublasHandle_t h, int n, const T* x, int incx, T* y, int incy) {  \
+    if (n < 0) return CUBLAS_STATUS_INVALID_VALUE;                                                                \
+    return run_c(h, nullptr, nullptr, 0, [=](const void*, const void*) {                                          \
+      store_vec(y, n, incy, load_vec(x, n, incx));                                                                \
+      return CUBLAS_STATUS_SUCCESS;                                                                               \
+    });                                                                                                           \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##swap_v2(cublasHandle_t h, int n, T* x, int incx, T* y, int incy) {        \
+    if (n < 0) return CUBLAS_STATUS_INVALID_VALUE;                                                                \
+    return run_c(h, nullptr, nullptr, 0, [=](const void*, const void*) {                                          \
+      const auto xv = load_vec(x, n, incx), yv = load_vec(y, n, incy);                                            \
+      store_vec(x, n, incx, yv);                                                                                  \
+      store_vec(y, n, incy, xv);                                                                                  \
+      return CUBLAS_STATUS_SUCCESS;                                                                               \
+    });                                                                                                           \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##dotu_v2(cublasHandle_t h, int n, const T* x, int incx, const T* y,        \
+                                                int incy, T* result) {                                            \
+    if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;                                                          \
+    if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;                                         \
+    return run_c(h, nullptr, nullptr, 0, [=](const void*, const void*) {                                          \
+      const auto xv = load_vec(x, n, incx), yv = load_vec(y, n, incy);                                            \
+      cd s = 0;                                                                                                   \
+      for (int i = 0; i < n; ++i) s += xv[i] * yv[i];                                                             \
+      put_result(h, result, s);                                                                                   \
+      return CUBLAS_STATUS_SUCCESS;                                                                               \
+    });                                                                                                           \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##dotc_v2(cublasHandle_t h, int n, const T* x, int incx, const T* y,        \
+                                                int incy, T* result) {                                            \
+    if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;                                                          \
+    if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;                                         \
+    return run_c(h, nullptr, nullptr, 0, [=](const void*, const void*) {                                          \
+      const auto xv = load_vec(x, n, incx), yv = load_vec(y, n, incy);                                            \
+      cd s = 0;                                                                                                   \
+      for (int i = 0; i < n; ++i) s += std::conj(xv[i]) * yv[i];                                                  \
+      put_result(h, result, s);                                                                                   \
+      return CUBLAS_STATUS_SUCCESS;                                                                               \
+    });                                                                                                           \
+  }
+VGPU_COMPLEX_BLAS(C, cuComplex, float)
+VGPU_COMPLEX_BLAS(Z, cuDoubleComplex, double)
+#undef VGPU_COMPLEX_BLAS
+
+// Scaling a complex vector by a real scalar.
+VGPU_EXPORT cublasStatus_t cublasCsscal_v2(cublasHandle_t h, int n, const float* alpha, cuComplex* x, int incx) {
+  if (n < 0 || incx <= 0) return n < 0 ? CUBLAS_STATUS_INVALID_VALUE : CUBLAS_STATUS_SUCCESS;
+  return run_c(h, alpha, nullptr, sizeof(float), [=](const void* al, const void*) {
+    const double a_ = scalar(h, static_cast<const float*>(al));
+    auto xv = load_vec(x, n, incx);
+    for (auto& v : xv) v *= a_;
+    store_vec(x, n, incx, xv);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+VGPU_EXPORT cublasStatus_t cublasZdscal_v2(cublasHandle_t h, int n, const double* alpha, cuDoubleComplex* x,
+                                           int incx) {
+  if (n < 0 || incx <= 0) return n < 0 ? CUBLAS_STATUS_INVALID_VALUE : CUBLAS_STATUS_SUCCESS;
+  return run_c(h, alpha, nullptr, sizeof(double), [=](const void* al, const void*) {
+    const double a_ = scalar(h, static_cast<const double*>(al));
+    auto xv = load_vec(x, n, incx);
+    for (auto& v : xv) v *= a_;
+    store_vec(x, n, incx, xv);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}

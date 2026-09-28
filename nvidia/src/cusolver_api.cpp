@@ -790,6 +790,8 @@ template <class T> std::vector<T*> pointers(T* const* dev_array, int count) {
 
 }  // namespace
 
+#include "cusolver_complex.inc"
+
 VGPU_EXPORT cusolverStatus_t cusolverDnCreateParams(cusolverDnParams_t* p) {
   if (!p) return CUSOLVER_STATUS_INVALID_VALUE;
   *p = reinterpret_cast<cusolverDnParams_t>(track(new Params()));
@@ -821,6 +823,10 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXpotrf(cusolverDnHandle_t h, cusolverDnPa
                                               size_t, void*, size_t, int* info) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   if (n < 0 || lda < std::max<int64_t>(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (is_complex(type))
+    return by_ctype(type, [&](auto t) {
+      return c_potrf<decltype(t)>(A, (int)n, (int)lda, uplo == CUBLAS_FILL_MODE_LOWER, info);
+    });
   return by_type(type, [&](auto t) {
     using T = decltype(t);
     Mat a;
@@ -836,6 +842,10 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXpotrs(cusolverDnHandle_t h, cusolverDnPa
                                               cudaDataType tb, void* B, int64_t ldb, int* info) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   if (ta != tb) return CUSOLVER_STATUS_NOT_SUPPORTED;
+  if (is_complex(ta))
+    return by_ctype(ta, [&](auto t) {
+      return c_potrs<decltype(t)>(A, (int)n, (int)lda, uplo == CUBLAS_FILL_MODE_LOWER, B, (int)nrhs, (int)ldb, info);
+    });
   return by_type(ta, [&](auto t) {
     using T = decltype(t);
     Mat a, b;
@@ -867,6 +877,8 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgeqrf(cusolverDnHandle_t h, cusolverDnPa
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   if (m < 0 || n < 0 || lda < std::max<int64_t>(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;
   if (ta != ttau) return CUSOLVER_STATUS_NOT_SUPPORTED;
+  if (is_complex(ta))
+    return by_ctype(ta, [&](auto t) { return c_geqrf<decltype(t)>(A, (int)m, (int)n, (int)lda, tau, info); });
   return by_type(ta, [&](auto t) {
     using T = decltype(t);
     Mat a;
@@ -894,6 +906,11 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXsyevd(cusolverDnHandle_t h, cusolverDnPa
                                               int* info) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   if (n < 0 || lda < std::max<int64_t>(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
+  // A complex (Hermitian) matrix has real eigenvalues, of its precision.
+  if (is_complex(ta)) {
+    if (tw != (ta == CUDA_C_32F ? CUDA_R_32F : CUDA_R_64F)) return CUSOLVER_STATUS_NOT_SUPPORTED;
+    return by_ctype(ta, [&](auto t) { return c_heev<decltype(t)>(A, (int)n, (int)lda, W, jobz, uplo, info); });
+  }
   if (ta != tw) return CUSOLVER_STATUS_NOT_SUPPORTED;
   return by_type(ta, [&](auto t) { return eig_into<decltype(t)>(A, n, lda, W, jobz, uplo, info); });
 }
@@ -1103,6 +1120,20 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXsyevBatched(cusolverDnHandle_t h, cusolv
                                                     size_t, void*, size_t, int* info, int64_t batch) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   if (n < 0 || batch < 0 || lda < std::max<int64_t>(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (is_complex(ta)) {
+    if (tw != (ta == CUDA_C_32F ? CUDA_R_32F : CUDA_R_64F)) return CUSOLVER_STATUS_NOT_SUPPORTED;
+    return by_ctype(ta, [&](auto t) {
+      using T = decltype(t);
+      using R = SolReal<T>;
+      for (int64_t b = 0; b < batch; ++b) {
+        const cusolverStatus_t st = c_heev<T>(static_cast<T*>(A) + (size_t)(b * lda * n), (int)n, (int)lda,
+                                              static_cast<R*>(W) + (size_t)(b * n), jobz, uplo,
+                                              info ? info + b : nullptr);
+        if (st != CUSOLVER_STATUS_SUCCESS) return st;
+      }
+      return CUSOLVER_STATUS_SUCCESS;
+    });
+  }
   if (ta != tw) return CUSOLVER_STATUS_NOT_SUPPORTED;
   return by_type(ta, [&](auto t) {
     using T = decltype(t);
