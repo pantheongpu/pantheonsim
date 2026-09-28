@@ -1120,6 +1120,15 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # cuSPARSE calls in a captured graph run at each launch, over what the
+  # graph's kernels produced (HiGHS's HiPDLP captures its SpMV iterations).
+  add_test(NAME e2e_graph_cusparse
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_cusparse.sh)
+  set_tests_properties(e2e_graph_cusparse PROPERTIES
+    DEPENDS vgpucusparse
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   # A leading dimension pads between columns, not after the last one. Operands
   # allocated to exactly their extent make an over-read fault instead of
   # quietly picking up whatever followed them.
