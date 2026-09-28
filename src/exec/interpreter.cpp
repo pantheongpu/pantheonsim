@@ -9794,7 +9794,11 @@ class Interpreter {
                                         std::max(static_cast<int32_t>(old), static_cast<int32_t>(b)))))
                      : std::max(old, b);
             break;
-          case AtomOp::Cas: nv = (old == mask_to_bits(cv[lane], op.ty.bits)) ? b : old; break;
+          // atom.cas d, [a], b, c: store c where memory holds b. These were
+          // the other way round -- compared with c, stored b -- so a CAS loop
+          // took its failure for success and never stored: stdgpu's
+          // atomicCAS sum came out 0 and its hash-map inserts spun forever.
+          case AtomOp::Cas: nv = (old == b) ? mask_to_bits(cv[lane], size * 8u) : old; break;
           // The wrapping forms. atomicInc counts up to b and then rolls to
           // zero, which is what makes it a ring-buffer index rather than a
           // counter; atomicDec counts down and rolls to b. Implementing them
