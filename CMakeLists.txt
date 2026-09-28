@@ -444,7 +444,14 @@ if(CUDA_ABI_INCLUDE)
       set(_extra_src "nvidia/src/generated/${_lower}_stubs.cpp")
     endif()
     add_library(vgpu${_lower} SHARED nvidia/src/${_src}.cpp ${_extra_src})
-    target_link_libraries(vgpu${_lower} PRIVATE vgpu vgpucudart)
+    if(_lower STREQUAL "nvrtc")
+      # A compiler, and nothing else: it touches no device, so it carries no
+      # simulator and no runtime, as NVIDIA's has none. Linking libcudart here
+      # put a second simulator into every driver-API program that uses NVRTC.
+      target_link_libraries(vgpu${_lower} PRIVATE ${CMAKE_DL_LIBS})
+    else()
+      target_link_libraries(vgpu${_lower} PRIVATE vgpu vgpucudart)
+    endif()
     target_include_directories(vgpu${_lower} PRIVATE ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpu${_lower} PROPERTIES
       OUTPUT_NAME ${_lib} SOVERSION ${_ver} VERSION ${_ver}.0)
