@@ -321,6 +321,13 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
   checks where every element lands and that a fragment stored by one instruction
   and loaded by the other comes back unchanged.
+- The per-thread stack (PTX ISA 9.7.19): `alloca`, `stacksave` and
+  `stackrestore`, which nvcc emits for `alloca()` in device code. Each thread
+  has a stack of `LaunchConfig::stack_bytes` (cudaLimitStackSize, 1 KiB by
+  default) that alloca carves down from. A device function's allocas are freed
+  when it returns. Overflow, touching memory below the stack pointer (never
+  allocated, or freed by stackrestore) and restoring to anything but a saved
+  pointer are reported. e2e_alloca_stack matches an RTX 3060's results.
 - Asynchronous copy: cp.async.{ca,cg} with commit_group / wait_group / wait_all
   and the src-size zero-fill form; an empty group counts toward wait_group N. The copy is deferred until the wait rather
   than performed on the spot, so a kernel that reads its destination early sees

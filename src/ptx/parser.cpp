@@ -2651,6 +2651,48 @@ class Parser {
       expect_punct(",");
       (void)parse_operand();  // membermask; the active mask already carries it
       ins.op = op;
+    } else if (op0 == "stacksave" || op0 == "stackrestore" || op0 == "alloca") {
+      // The per-thread stack (PTX ISA 9.7.19, sm_52 and later). The type is
+      // .u32 or .u64; the ISA's own alloca example leaves it out, so it may be
+      // taken from the register instead.
+      OpStack op;
+      op.kind = op0 == "stacksave" ? OpStack::Kind::Save
+              : op0 == "stackrestore" ? OpStack::Kind::Restore : OpStack::Kind::Alloca;
+      int typed = -1;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        if (parts[i] == "u32") typed = 0;
+        else if (parts[i] == "u64") typed = 1;
+        else return unsupported(op0 + " modifier '." + parts[i] + "'");
+      }
+      auto width_of = [&](const Reg& r) {
+        if (typed >= 0 && r.wide != (typed == 1))
+          return false;
+        op.wide = typed >= 0 ? typed == 1 : r.wide;
+        return true;
+      };
+      if (op.kind == OpStack::Kind::Restore) {
+        op.src = parse_operand();
+        const auto* r = std::get_if<RegOperand>(&op.src);
+        if (!r) return unsupported("stackrestore takes a register (what stacksave wrote)");
+        if (!width_of(r->reg)) return unsupported("stackrestore's register is not its type's width");
+      } else {
+        op.src = ImmInt{0};   // stacksave reads nothing; alloca sets its size below
+        op.dst = expect_reg_operand(op0 + " destination");
+        if (!width_of(op.dst)) return unsupported(op0 + "'s destination is not its type's width");
+        if (op.kind == OpStack::Kind::Alloca) {
+          expect_punct(",");
+          op.src = parse_operand();
+          if (peek_punct(",")) {
+            next();
+            const Operand a = parse_operand();
+            const auto* imm = std::get_if<ImmInt>(&a);
+            if (!imm || imm->value <= 0 || (imm->value & (imm->value - 1)) || imm->value > (1 << 23))
+              return unsupported("alloca's immAlign is a power of two up to 2^23");
+            op.align = std::max<uint32_t>(8, static_cast<uint32_t>(imm->value));
+          }
+        }
+      }
+      ins.op = op;
     } else if (op0 == "copysign") {
       auto ty = parse_type_token(parts.back());
       if (!ty || !ty->is_float()) return unsupported("copysign form (float types only)");

@@ -64,6 +64,10 @@ constexpr uint32_t kMaxWarpSize = 64;
 // globals. Addresses here are lane-relative (each lane sees its own frame).
 constexpr uint64_t kLocalVaBase = 0x6fff'0000'0000ull;
 constexpr uint64_t kLocalVaSize = 1ull << 30;
+// Where each thread's alloca stack sits in its local space: far above any
+// function's static .local frame, cudaLimitStackSize bytes below this
+// offset's top, growing down.
+constexpr uint64_t kStackOffset = 0x1000'0000ull;
 // Per-block .shared window, likewise distinct from host and device-global VAs.
 // Kernel parameters get an address window of their own so a kernel can take a
 // parameter's address and load through it -- CUB's segmented sort does exactly
@@ -448,6 +452,12 @@ struct Warp {
   };
   std::unordered_map<std::string, Slot> slots;
   std::vector<std::vector<uint8_t>> local;       // per-lane .local frames (lazy)
+  // The alloca stack: each lane's bytes, and its stack pointer (a local-space
+  // offset, from kStackOffset up to kStackOffset + the stack size); unset
+  // until the warp first touches the stack.
+  std::vector<std::vector<uint8_t>> stack;
+  std::array<uint64_t, kMaxWarpSize> sp{};
+  bool sp_valid = false;
   std::array<uint32_t, kMaxWarpSize> tid_x{}, tid_y{}, tid_z{};
   // PTX's condition-code carry bit, one per lane. Written by ".cc" arithmetic
   // and read by addc/subc/madc; nothing else in the ISA touches it.
@@ -2281,6 +2291,71 @@ class Interpreter {
     return buf;
   }
 
+  // A lane's alloca stack (PTX ISA 9.7.19): its pointer starts at the top and
+  // alloca moves it down. Memory below the pointer is not allocated -- never
+  // yet, or freed again by stackrestore -- and touching it is reported, as is
+  // anything past the top.
+  uint64_t stack_top() const { return kStackOffset + cfg_.stack_bytes; }
+  uint64_t& stack_ptr(Warp& w, uint32_t lane) {
+    if (!w.sp_valid) {
+      w.sp.fill(stack_top());
+      w.sp_valid = true;
+    }
+    return w.sp[lane];
+  }
+  uint8_t* stack_bytes_at(Warp& w, const Instr& ins, uint32_t lane, uint64_t off, uint32_t size, bool store) {
+    const uint64_t sp = stack_ptr(w, lane), top = stack_top();
+    if (off < sp || off + size > top)
+      ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+               std::string("local ") + (store ? "store to" : "load from") + " stack offset " +
+                   std::to_string(off - kStackOffset) + " (+" + std::to_string(size) + " bytes), " +
+                   (off + size > top ? "past the top of the thread's " + std::to_string(cfg_.stack_bytes) +
+                                           "-byte stack (cudaLimitStackSize)"
+                                     : "below the stack pointer at " + std::to_string(sp - kStackOffset) +
+                                           ": memory no alloca holds, or one stackrestore has freed"));
+    if (w.stack.size() < W_) w.stack.resize(W_);
+    std::vector<uint8_t>& buf = w.stack[lane];
+    if (buf.size() < cfg_.stack_bytes) buf.resize(cfg_.stack_bytes, 0);
+    return buf.data() + (off - kStackOffset);
+  }
+
+  void exec_stack(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpStack& op, Mask m) {
+    Lanes _s;
+    const Lanes& src = read_operand(w, ctx, ins, op.src, _s);
+    Lanes out{};
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      uint64_t& sp = stack_ptr(w, lane);
+      const uint64_t v = op.wide ? src[lane] : (src[lane] & 0xFFFFFFFFu);
+      switch (op.kind) {
+        case OpStack::Kind::Save:
+          out[lane] = sp;
+          break;
+        case OpStack::Kind::Restore:
+          if (v < kStackOffset || v > stack_top())
+            ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
+                     "stackrestore to " + std::to_string(v) +
+                         ", which is not a stack pointer stacksave or alloca gave (9.7.19.2)");
+          sp = v;
+          break;
+        case OpStack::Kind::Alloca: {
+          // Down by size, then down to the alignment (the ISA's
+          // alloc_stack_mem): the result is the block's lowest address.
+          if (v > sp - kStackOffset || ((sp - v) & ~uint64_t{op.align - 1}) < kStackOffset)
+            ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                     "alloca of " + std::to_string(v) + " bytes overflows the thread's " +
+                         std::to_string(cfg_.stack_bytes) + "-byte stack (" +
+                         std::to_string(stack_top() - sp) +
+                         " in use); cudaDeviceSetLimit(cudaLimitStackSize) raises it");
+          sp = (sp - v) & ~uint64_t{op.align - 1};
+          out[lane] = sp;
+          break;
+        }
+      }
+    }
+    if (op.kind != OpStack::Kind::Restore) write_reg(w, op.dst, m, out, op.wide ? 64 : 32);
+  }
+
   void check_local(const Instr& ins, int lane, uint64_t addr, uint32_t size) {
     uint64_t off = addr - kLocalVaBase;
     if (off + size > cur_->local_frame_size)
@@ -2319,8 +2394,12 @@ class Interpreter {
       }
     }
     if (is_local(addr)) {
-      check_local(ins, static_cast<int>(lane), addr, size);
       uint64_t v = 0;
+      if (addr - kLocalVaBase >= kStackOffset) {
+        std::memcpy(&v, stack_bytes_at(w, ins, lane, addr - kLocalVaBase, size, false), size);
+        return v;
+      }
+      check_local(ins, static_cast<int>(lane), addr, size);
       std::memcpy(&v, lane_local(w, lane).data() + (addr - kLocalVaBase), size);
       return v;
     }
@@ -2350,6 +2429,10 @@ class Interpreter {
       return;
     }
     if (is_local(addr)) {
+      if (addr - kLocalVaBase >= kStackOffset) {
+        std::memcpy(stack_bytes_at(w, ins, lane, addr - kLocalVaBase, size, true), &value, size);
+        return;
+      }
       check_local(ins, static_cast<int>(lane), addr, size);
       std::memcpy(lane_local(w, lane).data() + (addr - kLocalVaBase), &value, size);
       return;
@@ -4530,6 +4613,10 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpSuld>(&ins.op)) {
       exec_suld(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpStack>(&ins.op)) {
+      exec_stack(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpSust>(&ins.op)) {
@@ -8975,6 +9062,9 @@ class Interpreter {
     auto saved_w64 = std::move(w.written64);
     auto saved_slots = std::move(w.slots);
     const auto saved_state = w.state;
+    // What the callee allocas is freed when it returns (9.7.19.3).
+    const auto saved_sp = w.sp;
+    const bool saved_sp_valid = w.sp_valid;
 
     cur_ = &callee;
     w.paths.clear();
@@ -8998,6 +9088,8 @@ class Interpreter {
       w.written32 = std::move(saved_w32);
       w.written64 = std::move(saved_w64);
       w.state = saved_state;
+      w.sp = saved_sp;
+      w.sp_valid = saved_sp_valid;
       --call_depth_;
     };
 
