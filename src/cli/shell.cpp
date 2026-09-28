@@ -18,6 +18,7 @@
 //     simulated machine.
 #include <algorithm>
 #include <dirent.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -30,12 +31,14 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "args.hpp"
 #include "vgpu/driver_version.hpp"
+#include "vgpu/amd_kfd.hpp"
 #include "vgpu/amd_metrics.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/ras.hpp"
@@ -163,6 +166,53 @@ void write_file(const std::string& path, const std::string& contents, bool execu
   f << contents;
   f.close();
   if (executable) ::chmod(path.c_str(), 0755);
+}
+
+// Removes a session directory without reaching past it. The isolated
+// session mounts the host's /dev, /sys/class and /sys/module inside it (the
+// overlays' "-host" copies) and files over its placeholders, and removing
+// through such a mount deletes the host's own files: as root, /dev's device
+// nodes. So every mount under the directory is detached first, deepest
+// first, and the walk that follows still never descends into another
+// filesystem, in case one could not be. Links are removed, never followed.
+void remove_tree(const std::string& path, dev_t dev) {
+  struct stat st{};
+  if (::lstat(path.c_str(), &st) != 0) return;
+  if (S_ISDIR(st.st_mode)) {
+    if (st.st_dev != dev) return;
+    if (DIR* dir = ::opendir(path.c_str())) {
+      std::vector<std::string> names;
+      while (const dirent* e = ::readdir(dir))
+        if (std::strcmp(e->d_name, ".") != 0 && std::strcmp(e->d_name, "..") != 0) names.push_back(e->d_name);
+      ::closedir(dir);
+      for (const std::string& n : names) remove_tree(path + "/" + n, dev);
+    }
+    ::rmdir(path.c_str());
+  } else if (st.st_dev == dev || S_ISLNK(st.st_mode)) {
+    ::unlink(path.c_str());
+  }
+}
+// The real directories an isolated session overlaid (/dev, /sys/class,
+// /sys/module), in its own mount namespace only.
+std::vector<std::string> g_overlaid;
+
+void remove_session_dir(const std::string& dir) {
+  // The overlays first: a file mounted on in them is mounted on at its
+  // staged path too, and a mount point anywhere cannot be removed. They are
+  // the session namespace's own, and it is ending.
+  for (auto it = g_overlaid.rbegin(); it != g_overlaid.rend(); ++it) ::umount2(it->c_str(), MNT_DETACH);
+  std::vector<std::string> mounts;
+  std::ifstream info("/proc/self/mountinfo");
+  for (std::string line; std::getline(info, line);) {
+    std::istringstream fields(line);
+    std::string id, parent, devno, root, point;
+    fields >> id >> parent >> devno >> root >> point;
+    if (point.rfind(dir + "/", 0) == 0) mounts.push_back(point);
+  }
+  std::sort(mounts.begin(), mounts.end(), [](const std::string& a, const std::string& b) { return a.size() > b.size(); });
+  for (const std::string& m : mounts) ::umount2(m.c_str(), MNT_DETACH);
+  struct stat st{};
+  if (::lstat(dir.c_str(), &st) == 0) remove_tree(dir, st.st_dev);
 }
 
 void make_dirs(const std::string& path) {
@@ -407,6 +457,33 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
     const std::string card = s.root + "/sys/class/drm/card" + std::to_string(i);
     make_dirs(card);
     std::filesystem::create_symlink(dev, card + "/device", ec);
+    if (!nvidia) {
+      // amdgpu's render node beside the card, which ROCm opens and KFD names
+      // (drm_render_minor); each with the device number /dev gives it.
+      const std::string render = s.root + "/sys/class/drm/renderD" + std::to_string(128 + i);
+      make_dirs(render);
+      std::filesystem::create_symlink(dev, render + "/device", ec);
+      write_file(card + "/dev", "226:" + std::to_string(i) + "\n");
+      write_file(render + "/dev", "226:" + std::to_string(128 + i) + "\n");
+      // Their device files, and KFD's: placeholders the isolated session
+      // backs with /dev/null, so they exist and open as on an AMD machine.
+      make_dirs(s.root + "/dev/dri");
+      write_file(s.root + "/dev/dri/card" + std::to_string(i), "");
+      write_file(s.root + "/dev/dri/renderD" + std::to_string(128 + i), "");
+    }
+  }
+  // The AMD kernel driver's topology, which tools read to find AMD GPUs
+  // without a runtime (vgpu/amd_kfd.hpp).
+  if (!nvidia) {
+    const std::string topology = s.root + "/sys/class/kfd/kfd/topology/";
+    const long pages = ::sysconf(_SC_PHYS_PAGES), page = ::sysconf(_SC_PAGE_SIZE);
+    const uint64_t memory = pages > 0 && page > 0 ? uint64_t(pages) * uint64_t(page) : 0;
+    for (const auto& f : vgpu::amd::kfd_topology(p, c.count, std::max(1u, std::thread::hardware_concurrency()), memory)) {
+      make_dirs(std::filesystem::path(topology + f.path).parent_path().string());
+      write_file(topology + f.path, f.contents);
+    }
+    make_dirs(s.root + "/dev");
+    write_file(s.root + "/dev/kfd", "");
   }
 
   // Resolves a program to an absolute path using PATH as it stands now, which
@@ -941,28 +1018,65 @@ int cmd_shell(const std::vector<std::string>& args) {
       // anything walking /sys/bus/pci find them.
       bind(s.root + "/sys/bus/pci/devices", "/sys/bus/pci/devices");
       bind(s.root + "/sys/class/hwmon", "/sys/class/hwmon");
-      // The amdgpu kernel module, loaded, as an AMD machine has it: ROCm's
-      // rocminfo and rocm-smi look for /sys/module/amdgpu/initstate ("live")
-      // before anything else and stop without it. sysfs takes no new entries,
-      // so /sys/module is overlaid with a directory linking every module the
-      // host has, plus amdgpu. A host with the module keeps its own.
-      if (profile.vendor == "amd" && ::access("/sys/module/amdgpu", F_OK) != 0) {
-        const std::string host = s.root + "/sys/module-host", mods = s.root + "/sys/module";
-        make_dirs(host);
-        make_dirs(mods + "/amdgpu");
-        if (bind("/sys/module", host)) {
-          if (DIR* dir = ::opendir(host.c_str())) {
-            while (const dirent* e = ::readdir(dir)) {
-              const std::string name = e->d_name;
-              if (name == "." || name == ".." || name == "amdgpu") continue;
-              std::error_code ec;
-              std::filesystem::create_symlink(host + "/" + name, mods + "/" + name, ec);
-            }
-            ::closedir(dir);
+      // sysfs and /dev take no new entries, so a directory the session adds
+      // to is overlaid whole: its staged copy under the session root, which
+      // holds what the session adds, gains a link to everything else the
+      // host has there, and is mounted over the real one. The staged entries
+      // win over the host's. The host's are reached through a copy of the
+      // host's whole /sys (or /dev) mounted in the session directory, so that
+      // the relative links inside them (/sys/class/net/lo is
+      // ../../devices/virtual/net/lo) still lead where they do on the host; a
+      // link of the host's own keeps its target (/dev/fd is /proc/self/fd).
+      // Recursive, so /dev/pts and /dev/shm stay mounted.
+      auto host_copy = [&](const std::string& real) -> std::string {
+        const std::string copy = s.root + "/host" + real;
+        if (::access((copy + "/.").c_str(), F_OK) == 0 && !std::filesystem::is_empty(copy)) return copy;
+        make_dirs(copy);
+        return std::system(("mount --rbind '" + real + "' '" + copy + "' 2>/dev/null").c_str()) == 0 ? copy : std::string();
+      };
+      auto overlay = [&](const std::string& real, const std::string& staged) {
+        const std::string top = real.rfind("/sys/", 0) == 0 ? "/sys" : real;
+        std::string host = host_copy(top);
+        if (host.empty()) return false;
+        host += real.substr(top.size());
+        make_dirs(staged);
+        if (DIR* dir = ::opendir(host.c_str())) {
+          while (const dirent* e = ::readdir(dir)) {
+            const std::string name = e->d_name;
+            if (name == "." || name == "..") continue;
+            const std::string at = staged + "/" + name;
+            std::error_code ec;
+            if (std::filesystem::symlink_status(at, ec).type() != std::filesystem::file_type::not_found) continue;
+            std::filesystem::path target = host + "/" + name;
+            if (std::filesystem::is_symlink(target, ec)) target = std::filesystem::read_symlink(target, ec);
+            std::filesystem::create_symlink(target, at, ec);
           }
-          write_file(mods + "/amdgpu/initstate", "live\n");
-          bind(mods, "/sys/module");
+          ::closedir(dir);
         }
+        if (std::system(("mount --rbind '" + staged + "' '" + real + "' 2>/dev/null").c_str()) != 0) return false;
+        g_overlaid.push_back(real);
+        return true;
+      };
+      if (profile.vendor == "amd") {
+        // The amdgpu kernel module, loaded, as an AMD machine has it: ROCm's
+        // rocminfo and rocm-smi look for /sys/module/amdgpu/initstate
+        // ("live") before anything else and stop without it. A host with the
+        // module keeps its own.
+        if (::access("/sys/module/amdgpu", F_OK) != 0) {
+          make_dirs(s.root + "/sys/module/amdgpu");
+          write_file(s.root + "/sys/module/amdgpu/initstate", "live\n");
+          overlay("/sys/module", s.root + "/sys/module");
+        }
+        // KFD's topology, the session's in place of any the host has, beside
+        // the session's drm and hwmon classes (bound above, and staged here too).
+        overlay("/sys/class", s.root + "/sys/class");
+        // /dev/kfd and /dev/dri/{card,renderD}N, opening as /dev/null does: a
+        // program that looks for them finds an AMD machine; one that asks the
+        // kernel driver something (an ioctl) is refused, as a machine without
+        // the driver refuses it. The simulated runtime asks it nothing.
+        for (const auto& e : std::filesystem::recursive_directory_iterator(s.root + "/dev"))
+          if (e.is_regular_file()) bind("/dev/null", e.path().string());
+        overlay("/dev", s.root + "/dev");
       }
       // An AMD machine has no NVIDIA driver, so no nvidia-smi: the host's is
       // covered by an empty file that is not executable, which a PATH search
@@ -1141,10 +1255,7 @@ int cmd_shell(const std::vector<std::string>& args) {
   // tools and system files behind in /tmp.
   // No shell: the path is ours and the prefix check stays, but removing a
   // directory does not need /bin/sh, quoting, or a return value to ignore.
-  if (s.dir.rfind("/tmp/vgpu-session-", 0) == 0) {
-    std::error_code ec;
-    std::filesystem::remove_all(s.dir, ec);
-  }
+  if (s.dir.rfind("/tmp/vgpu-session-", 0) == 0) remove_session_dir(s.dir);
   if (!c.has_command)
     std::printf("\n  Session ended. Simulated %d x %s.\n", c.count, profile.model.c_str());
   // A shell killed by a signal reports 128+N, as every shell and `vgpu run`
