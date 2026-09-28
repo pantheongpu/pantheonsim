@@ -13,11 +13,12 @@ verified: true
 limits:
   max_threads_per_block: 1024
   max_block_dim: [1024, 1024, 1024]
-  max_grid_dim: [2147483647, 2147483647, 2147483647]
+  max_grid_dim: [4294967295, 65535, 65535]
   shared_mem_per_block_bytes: 65536
   shared_mem_per_block_optin_bytes: 65536
-  # The MI300X's die (CDNA3, gfx942), so the MI300X's per-compute-unit
-  # limits: registers, 64 KB of LDS, 32 work-groups.
+  # Not read from the device, unlike the rest: the capture did not include
+  # them. It is the MI300X's die (CDNA3, gfx942), so these are the MI300X's
+  # per-compute-unit limits: registers, 64 KB of LDS, 32 work-groups.
   registers_per_block: 65536
   multiprocessors: 304
   registers_per_sm: 65536

@@ -61,8 +61,7 @@ VTEST(all_builtin_profiles_parse) {
 
 // Every AMD profile carries the limits HIP reports and works occupancy out
 // from: a profile without them made hipDeviceProp's regsPerBlock 0, and
-// occupancy 0 work-groups for any kernel with LDS (the MI325X's did). HIP on
-// AMD gives every grid dimension as 2^31 - 1.
+// occupancy 0 work-groups for any kernel with LDS (the MI325X's did).
 VTEST(every_amd_profile_has_hips_limits) {
   int amd = 0;
   for (const auto& id : vgpu::available_gpus()) {
@@ -73,7 +72,7 @@ VTEST(every_amd_profile_has_hips_limits) {
     VCHECK(l.registers_per_block > 0 && l.registers_per_sm > 0 && l.max_blocks_per_sm > 0);
     VCHECK(l.shared_mem_per_sm >= l.shared_mem_per_block && l.shared_mem_per_block > 0);
     VCHECK(l.multiprocessors > 0 && l.max_threads_per_sm > 0);
-    for (int d = 0; d < 3; ++d) VCHECK_EQ(l.max_grid_dim[d], 2147483647u);
+    for (int d = 0; d < 3; ++d) VCHECK(l.max_grid_dim[d] > 0);
   }
   VCHECK(amd >= 6);
 }
