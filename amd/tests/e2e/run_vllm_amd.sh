@@ -18,7 +18,10 @@ model="${2:-facebook/opt-125m}"
 prompt="${3:-The capital of France is}"
 python="${VGPU_VLLM_PYTHON:-}"
 [[ -n "$python" && -x "$python" ]] || { echo "SKIP: no Python with vLLM for ROCm (set VGPU_VLLM_PYTHON)"; exit 0; }
-"$python" -c 'import vllm' 2>/dev/null || { echo "SKIP: $python has no vllm"; exit 0; }
+# Found, not imported: its PyTorch loads only with the simulator's libraries
+# in front (below).
+"$python" -c 'import importlib.util as u, sys; sys.exit(u.find_spec("vllm") is None)' 2>/dev/null ||
+  { echo "SKIP: $python has no vllm"; exit 0; }
 [[ -e "$build/shim/libamdhip64.so.7" ]] || { echo "SKIP: no HIP shim in $build/shim"; exit 0; }
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/vgpu_vllm.XXXXXX")"
