@@ -37,7 +37,8 @@ if [[ ! -f "$cutlass/test/unit/conv/device_3x/testbed_conv.hpp" ||
       ! -f "$cutlass/test/unit/gemm/device/sm100_blockscaled_tensorop_gemm/mxf8_mxf6_f16_f8_tn_layout.cu" ||
       ! -f "$cutlass/test/unit/gemm/device/sm100_gemm_f8_f8_f8_tensor_op_f32_blockwise.cu" ||
       ! -f "$cutlass/test/unit/gemm/device/sm120_tensorop_gemm/sm120_gemm_f4_f6_f32_tensor_op.cu" ||
-      ! -f "$cutlass/test/unit/conv/device_3x/fprop/sm100_conv2d_fprop_implicit_gemm_f16_f16_f32_tensorop_f32.cu" ]]; then
+      ! -f "$cutlass/test/unit/conv/device_3x/fprop/sm100_conv2d_fprop_implicit_gemm_f16_f16_f32_tensorop_f32.cu" ||
+      ! -f "$cutlass/examples/77_blackwell_fmha/77_blackwell_fmha.cu" ]]; then
   if [[ -n "${CUTLASS_DIR:-}" ]]; then
     echo "FAIL: CUTLASS_DIR=$CUTLASS_DIR is not a CUTLASS checkout with its unit tests"; exit 1
   fi
@@ -51,6 +52,8 @@ if [[ ! -f "$cutlass/test/unit/conv/device_3x/testbed_conv.hpp" ||
        'cutlass-*/test/unit/conv/cache_testbed_output.h' 'cutlass-*/test/unit/conv/device_3x/*.hpp' \
        'cutlass-*/test/unit/conv/device_3x/fprop/sm90_*' \
        'cutlass-*/test/unit/conv/device_3x/*/sm100_*' \
+       'cutlass-*/examples/common/*' 'cutlass-*/examples/77_blackwell_fmha/*' \
+       'cutlass-*/examples/77_blackwell_fmha/*/*' \
        'cutlass-*/test/unit/gemm/device/*.h' 'cutlass-*/test/unit/gemm/device/*.hpp' \
        'cutlass-*/test/unit/gemm/device/gemm_f16t_f16n_f32t_tensor_op_f32_sparse_sm80.cu' \
        'cutlass-*/test/unit/gemm/device/sm90_gemm_f16_f16_f16_tensor_op_f32_group_gemm.cu' \
