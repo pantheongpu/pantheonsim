@@ -1633,6 +1633,9 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
       // Two levels each: idle and the most the card runs at, the current one
       // starred.
       const auto levels = [&](const char* clk, uint32_t idle, uint32_t max, uint32_t now) {
+        // The lower level is the clock it runs at below the most, so the
+        // starred level is the clock the concise table shows.
+        if (now < max) idle = now;
         v.emplace_back(std::string("Supported ") + clk + " frequencies on GPU" + std::to_string(&d - snap.devices), "");
         v.emplace_back("0", std::to_string(idle) + "Mhz" + (now < max ? " *" : ""));
         v.emplace_back("1", std::to_string(max) + "Mhz" + (now >= max ? " *" : ""));
