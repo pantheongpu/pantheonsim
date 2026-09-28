@@ -1627,7 +1627,7 @@ class Interpreter {
     // .local/.shared variables name an offset within their address space, not
     // a generic address; cvta converts when the kernel needs a generic pointer.
     // A .shared one is in this block's part of the cluster's window.
-    if (auto it = cur_->locals.find(name); it != cur_->locals.end()) return it->second.offset;
+    if (auto it = cur_->locals.find(name); it != cur_->locals.end()) return local_base_ + it->second.offset;
     if (auto it = fn_.shared.find(name); it != fn_.shared.end())
       return cluster_address(ctx, cluster_rank_of(ctx), it->second.offset);
     if (symbols_) {
@@ -2277,18 +2277,23 @@ class Interpreter {
   std::vector<uint8_t>& lane_local(Warp& w, uint32_t lane) {
     if (w.local.empty()) w.local.resize(W_);
     auto& buf = w.local[lane];
-    if (buf.size() < cur_->local_frame_size) buf.resize(cur_->local_frame_size, 0);
+    const uint64_t top = local_top();
+    if (buf.size() < top) buf.resize(top, 0);
     return buf;
   }
 
   void check_local(const Instr& ins, int lane, uint64_t addr, uint32_t size) {
     uint64_t off = addr - kLocalVaBase;
-    if (off + size > cur_->local_frame_size)
+    if (off + size > local_top())
       ctx_fail(ins, lane, Err::OutOfBounds,
                "local memory access at frame offset " + std::to_string(off) + " (+" +
                    std::to_string(size) + " bytes) exceeds the " +
-                   std::to_string(cur_->local_frame_size) + "-byte .local frame");
+                   std::to_string(local_top()) + "-byte .local frame");
   }
+
+  // The end of the current function's .local frame, which is also the end of
+  // every frame below it: a callee may be handed a pointer into its caller's.
+  uint64_t local_top() const { return local_base_ + cur_->local_frame_size; }
 
   // A bit flip armed on arithmetic results (`vgpu fault arm --bitflip --on
   // alu`) corrupts one lane's result -- the lowest active one -- of the next
@@ -8967,6 +8972,7 @@ class Interpreter {
 
     // Swap in the callee's world.
     const EntryFn* saved_fn = cur_;
+    const uint64_t saved_local_base = local_base_;
     auto saved_paths = std::move(w.paths);
     auto saved_r32 = std::move(w.regs32);
     auto saved_r64 = std::move(w.regs64);
@@ -8977,6 +8983,7 @@ class Interpreter {
     const auto saved_state = w.state;
 
     cur_ = &callee;
+    local_base_ = (saved_local_base + saved_fn->local_frame_size + 15) / 16 * 16;
     w.paths.clear();
     w.paths.push_back(Path{0, m});
     w.regs32.clear();
@@ -8991,6 +8998,7 @@ class Interpreter {
 
     auto restore = [&]() {
       cur_ = saved_fn;
+      local_base_ = saved_local_base;
       w.paths = std::move(saved_paths);
       w.regs32 = std::move(saved_r32);
       w.regs64 = std::move(saved_r64);
@@ -9368,6 +9376,12 @@ class Interpreter {
   // device function is in flight, when everything that reads a body, a
   // register count or a .local frame must follow the callee instead.
   const EntryFn* cur_ = &fn_;
+  // Where cur_'s .local frame starts in each lane's local buffer: 0 in the
+  // kernel, and above its caller's frame in a device function, the way a
+  // stack grows. With every frame at 0, a callee's locals overwrote its
+  // caller's, and a pointer into the caller's frame (NanoVDB's device-side
+  // cudaGetDevice(&dev)) was out of bounds in a callee with no frame of its own.
+  uint64_t local_base_ = 0;
   const LaunchConfig& cfg_;
   const ParamBuffer& params_;
   MemoryManager& mem_;
