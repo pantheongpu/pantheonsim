@@ -856,6 +856,10 @@ set_tests_properties(amd_pytorch_mi250x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TR
 add_test(NAME amd_pytorch_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/mi350x)
 set_tests_properties(amd_pytorch_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# And on an MI325X: the MI300X's die with more memory, and its own profile.
+add_test(NAME amd_pytorch_mi325x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/mi325x)
+set_tests_properties(amd_pytorch_mi325x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # hipSPARSELt's 2:4 sparse GEMMs, from the same wheel: its kernels prune,
 # compress and multiply with the sparse matrix instructions, gfx942's and
 # gfx950's (whose B layout differs), checked against the host's product.
