@@ -439,7 +439,7 @@ RCCL (PyTorch's collectives on ROCm) runs unmodified across simulated GPUs in on
 
 ## vLLM
 
-vLLM for ROCm, unmodified, generates on a simulated MI300X what Hugging Face's transformers generates on the CPU: `facebook/opt-125m`, greedy, "The capital of France is" continued as " the capital of the French Republic." in about two minutes (`tests/e2e/run_vllm_amd.sh`, ctest `amd_vllm`).
+vLLM for ROCm, unmodified, generates on a simulated MI300X what Hugging Face's transformers generates on the CPU: `facebook/opt-125m`, greedy, "The capital of France is" continued as " the capital of the French Republic." in about two minutes (`tests/e2e/run_vllm_amd.sh`, ctest `amd_vllm`). It runs every night on a GitHub-hosted runner (`.github/workflows/vllm-nightly.yml`), with ROCm's libraries and vLLM's wheels installed by `tests/vllm/install.sh`.
 
 - vLLM's ROCm wheels (`wheels.vllm.ai/rocm`) bring a PyTorch that is linked against a ROCm installed on the machine: its RUNPATH names `/opt/rocm-7.2.3/lib`. The machine needs that ROCm's libraries (hipBLAS, hipBLASLt, MIOpen, RCCL, rocprofiler-sdk and the rest) and OpenMPI. The simulator's HIP runtime, ROCm SMI and AMD SMI go in front of them on the library path.
 - vLLM asks AMD SMI whether this is a ROCm machine, and NVML whether it is a CUDA one. NVML answers only for NVIDIA GPUs, and says a machine of AMD GPUs has no NVIDIA driver, as it does on one.
