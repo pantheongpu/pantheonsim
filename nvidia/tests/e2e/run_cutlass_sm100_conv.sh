@@ -89,7 +89,7 @@ for entry in "${tests[@]}"; do
   summary="$(grep -E '^\[  (PASSED|FAILED)  \]' <<<"$result" | head -2 | tr '\n' ' ')"
   echo "$name: $summary"
   if ! grep -q '^\[  PASSED  \]' <<<"$result" || grep -q '^\[  FAILED  \]' <<<"$result"; then
-    grep -E 'FAILED|Failure|VirtualGPU|timed out' <<<"$result" | head -20
+    grep -E 'FAILED|Failure|VirtualGPU|timed out|exception|thrown|Error|error:' <<<"$result" | head -30
     fail=1
   fi
 done
