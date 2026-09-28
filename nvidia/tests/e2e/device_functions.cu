@@ -11,6 +11,10 @@
 //                          path stack while the caller's is set aside
 //   fact                   recursion, which is what proves the frame is real
 //                          rather than an inlining trick
+//   fill / own_locals /    .local frames: a callee writing through a pointer
+//   rlocal                 into its caller's array, a callee with an array of
+//                          its own that must not land on the caller's, and
+//                          recursion with an array in every frame
 #include <cstdio>
 __device__ __noinline__ int slow_add(int a, int b) { return a + b; }
 __device__ __noinline__ float slow_scale(float x, float s) { return x * s + 1.0f; }
@@ -49,6 +53,32 @@ __global__ void k(int* out, float* fout, int which) {
     fout[32 + t] = b.a + b.b + b.c + b.d;
     fout[64 + t] = consume(b);
 }
+// A pointer to the caller's array, written by a callee with no .local frame of
+// its own (NanoVDB's device-side cudaGetDevice(&dev) is this shape).
+__device__ __noinline__ void fill(int* p, int n, int v) { for (int i = 0; i < n; ++i) p[i] = v + i; }
+// An array indexed at run time stays in .local, so its frame is real.
+__device__ __noinline__ int own_locals(int t, int k) {
+    int b[8];
+    for (int i = 0; i < 8; ++i) b[i] = 1000 + t * i;
+    return b[k & 7];
+}
+__device__ __noinline__ int rlocal(int n, int k) {
+    int c[4];
+    for (int i = 0; i < 4; ++i) c[i] = n * 10 + i;
+    const int below = n > 0 ? rlocal(n - 1, k) : 0;
+    return c[k & 3] + below;
+}
+
+__global__ void frames(int* out, int which) {
+    const int t = threadIdx.x;
+    int a[8];
+    fill(a, 8, t * 100);
+    const int own = own_locals(t, t + which);
+    out[t] = a[(t + which) & 7];   // still the caller's values after own_locals
+    out[32 + t] = own;
+    out[64 + t] = rlocal(3, t + which);
+}
+
 int main() {
     int* d; float* f;
     cudaMalloc(&d, 128 * sizeof(int));
@@ -75,6 +105,23 @@ int main() {
         if (hf[64+t] != con) { std::printf("FAIL struct arg[%d]=%g want %g\n", t, hf[64+t], con); ++bad; }
         if (h[96+t] != (t + 2) * 3) {
             std::printf("FAIL funcptr[%d]=%d want %d\n", t, h[96+t], (t+2)*3); ++bad;
+        }
+    }
+    frames<<<1, 32>>>(d, 1);
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        std::printf("cuda error: %s\n", cudaGetErrorString(cudaGetLastError())); return 1;
+    }
+    cudaMemcpy(h, d, 96 * sizeof(int), cudaMemcpyDeviceToHost);
+    for (int t = 0; t < 32; ++t) {
+        const int k = t + 1;
+        if (h[t] != t * 100 + (k & 7)) {
+            std::printf("FAIL caller array[%d]=%d want %d\n", t, h[t], t * 100 + (k & 7)); ++bad;
+        }
+        if (h[32+t] != 1000 + t * (k & 7)) {
+            std::printf("FAIL callee array[%d]=%d want %d\n", t, h[32+t], 1000 + t * (k & 7)); ++bad;
+        }
+        if (h[64+t] != 60 + 4 * (k & 3)) {
+            std::printf("FAIL recursive arrays[%d]=%d want %d\n", t, h[64+t], 60 + 4 * (k & 3)); ++bad;
         }
     }
     std::printf(bad ? "FAILED\n" : "PASS\n");
