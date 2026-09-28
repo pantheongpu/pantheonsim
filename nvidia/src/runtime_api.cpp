@@ -530,6 +530,17 @@ bool is_device_ptr(const void* p) {
   return vgpu::is_device_va(reinterpret_cast<uint64_t>(p));
 }
 
+// Memory a copy may call device memory: a device allocation, or host memory
+// CUDA allocated itself -- managed (cudaMallocManaged) and pinned
+// (cudaMallocHost, cudaHostAlloc). An RTX 3060 accepts those as the device side
+// of cudaMemcpy in every direction, and refuses pageable memory there, and
+// memory pinned after the fact with cudaHostRegister. NanoVDB copies from a
+// managed buffer with cudaMemcpyDeviceToHost.
+bool copyable_as_device(State& s, const void* p) {
+  return is_device_ptr(p) || find_range(s.managed_allocs, p) != s.managed_allocs.end() ||
+         find_range(s.host_allocs, p) != s.host_allocs.end();
+}
+
 // Pending chevron launch configuration, pushed by __cudaPushCallConfiguration
 // and consumed by __cudaPopCallConfiguration inside the generated launch stub.
 struct PendingConfig {
@@ -727,12 +738,12 @@ cudaError_t symbol_address(State& s, const void* symbol, uint64_t* addr, size_t*
 // as with cudaMemcpy. GPUJPEG's inverse DCT fills its constant table from
 // device memory this way.
 namespace {
-cudaError_t symbol_peer(cudaMemcpyKind kind, cudaMemcpyKind host_kind, const void* p,
+cudaError_t symbol_peer(State& s, cudaMemcpyKind kind, cudaMemcpyKind host_kind, const void* p,
                         bool* device) {
   if (kind != host_kind && kind != cudaMemcpyDeviceToDevice && kind != cudaMemcpyDefault)
     return cudaErrorInvalidValue;
   *device = is_device_ptr(p);
-  if (kind == cudaMemcpyDeviceToDevice && !*device) return cudaErrorInvalidValue;
+  if (kind == cudaMemcpyDeviceToDevice && !copyable_as_device(s, p)) return cudaErrorInvalidValue;
   return cudaSuccess;
 }
 }  // namespace
@@ -746,7 +757,7 @@ VGPU_EXPORT cudaError_t cudaMemcpyToSymbol(const void* symbol, const void* src, 
     if (e != cudaSuccess) return e;
     if (offset + count > size) return cudaErrorInvalidValue;
     bool device = false;
-    if (const cudaError_t k = symbol_peer(kind, cudaMemcpyHostToDevice, src, &device);
+    if (const cudaError_t k = symbol_peer(s, kind, cudaMemcpyHostToDevice, src, &device);
         k != cudaSuccess)
       return k;
     if (!device) {
@@ -769,7 +780,7 @@ VGPU_EXPORT cudaError_t cudaMemcpyFromSymbol(void* dst, const void* symbol, size
     if (e != cudaSuccess) return e;
     if (offset + count > size) return cudaErrorInvalidValue;
     bool device = false;
-    if (const cudaError_t k = symbol_peer(kind, cudaMemcpyDeviceToHost, dst, &device);
+    if (const cudaError_t k = symbol_peer(s, kind, cudaMemcpyDeviceToHost, dst, &device);
         k != cudaSuccess)
       return k;
     if (!device) {
@@ -1579,8 +1590,9 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
     vgpu::MemoryManager& dmm = dd ? owner_memory(s, dst) : current(s).memory();
     vgpu::MemoryManager& smm = sd ? owner_memory(s, src) : current(s).memory();
     // Under unified addressing the kind is checked, then the pointers decide.
-    // A side the kind calls device memory must be device memory, or the copy
-    // is refused; a side it calls host memory may turn out to be a device
+    // A side the kind calls device memory must be memory CUDA owns (a device,
+    // managed or pinned allocation), or the copy is refused; a side it calls
+    // host memory may turn out to be a device
     // allocation, and is then copied as one. That is what the hardware does
     // (an RTX 3060: cudaMemcpyHostToDevice from a device pointer copies the
     // right bytes; cudaMemcpyDeviceToHost from a host pointer is an invalid
@@ -1589,7 +1601,9 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
         kind == cudaMemcpyDeviceToDevice || kind == cudaMemcpyHostToHost) {
       const bool dst_device = kind == cudaMemcpyHostToDevice || kind == cudaMemcpyDeviceToDevice;
       const bool src_device = kind == cudaMemcpyDeviceToHost || kind == cudaMemcpyDeviceToDevice;
-      if ((dst_device && !dd) || (src_device && !sd)) return cudaErrorInvalidValue;
+      if ((dst_device && !copyable_as_device(s, dst)) ||
+          (src_device && !copyable_as_device(s, src)))
+        return cudaErrorInvalidValue;
       kind = cudaMemcpyDefault;
     }
     if (kind == cudaMemcpyDefault) kind = dd && sd ? cudaMemcpyDeviceToDevice

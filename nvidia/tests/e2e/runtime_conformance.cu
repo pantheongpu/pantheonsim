@@ -300,6 +300,52 @@ int main() {
     cudaFree(b);
   }
 
+  // Memory CUDA allocated on the host counts as device memory for a copy:
+  // managed and pinned buffers are accepted as the device side in every
+  // direction, as an RTX 3060 accepts them; pageable memory, and memory pinned
+  // afterwards with cudaHostRegister, are refused there. NanoVDB copies from a
+  // managed buffer with cudaMemcpyDeviceToHost.
+  {
+    const int four[4] = {1, 2, 3, 4};
+    int *managed = nullptr, *pinned = nullptr, *dev = nullptr, got[4] = {0};
+    cudaMallocManaged(&managed, 16);
+    cudaMallocHost(&pinned, 16);
+    cudaMalloc(&dev, 16);
+    int* regd = static_cast<int*>(std::aligned_alloc(4096, 4096));
+    cudaHostRegister(regd, 4096, cudaHostRegisterDefault);
+    std::memcpy(managed, four, 16);
+    std::memcpy(pinned, four, 16);
+    e = cudaMemcpy(got, managed, 16, cudaMemcpyDeviceToHost);
+    CHECK("cudaMemcpy DeviceToHost from managed memory", e == cudaSuccess && got[3] == 4, "got %d %s, value %d", e, cudaGetErrorName(e), got[3]);
+    got[3] = 0;
+    e = cudaMemcpyAsync(got, pinned, 16, cudaMemcpyDeviceToHost, 0);
+    cudaStreamSynchronize(0);
+    CHECK("cudaMemcpyAsync DeviceToHost from pinned memory", e == cudaSuccess && got[3] == 4, "got %d %s, value %d", e, cudaGetErrorName(e), got[3]);
+    std::memset(managed, 0, 16);
+    e = cudaMemcpy(managed, four, 16, cudaMemcpyHostToDevice);
+    CHECK("cudaMemcpy HostToDevice into managed memory", e == cudaSuccess && managed[3] == 4, "got %d %s", e, cudaGetErrorName(e));
+    cudaMemset(dev, 0, 16);
+    e = cudaMemcpy(dev, pinned, 16, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(got, dev, 16, cudaMemcpyDeviceToHost);
+    CHECK("cudaMemcpy DeviceToDevice from pinned to device memory", e == cudaSuccess && got[3] == 4, "got %d %s, value %d", e, cudaGetErrorName(e), got[3]);
+    std::memset(managed, 0, 16);
+    e = cudaMemcpy(managed, dev, 16, cudaMemcpyDeviceToDevice);
+    CHECK("cudaMemcpy DeviceToDevice from device to managed memory", e == cudaSuccess && managed[3] == 4, "got %d %s", e, cudaGetErrorName(e));
+    e = cudaMemcpy(got, regd, 16, cudaMemcpyDeviceToHost);
+    CHECK("cudaMemcpy DeviceToHost from cudaHostRegister'd memory -> invalid value", e == cudaErrorInvalidValue, "got %d %s", e, cudaGetErrorName(e));
+    cudaGetLastError();
+    int nines[4] = {9, 9, 9, 9};
+    cudaMemcpyToSymbol(table, nines, 16);
+    e = cudaMemcpyToSymbol(table, managed, 16, 0, cudaMemcpyDeviceToDevice);
+    cudaMemcpyFromSymbol(got, table, 16);
+    CHECK("cudaMemcpyToSymbol DeviceToDevice from managed memory", e == cudaSuccess && got[3] == 4, "got %d %s, value %d", e, cudaGetErrorName(e), got[3]);
+    cudaHostUnregister(regd);
+    std::free(regd);
+    cudaFree(managed);
+    cudaFreeHost(pinned);
+    cudaFree(dev);
+  }
+
   // Cache preferences: accepted for a kernel, refused for anything else, and the
   // device-wide one reads back.
   e = cudaFuncSetCacheConfig(fill, cudaFuncCachePreferL1);
