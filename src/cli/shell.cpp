@@ -941,6 +941,29 @@ int cmd_shell(const std::vector<std::string>& args) {
       // anything walking /sys/bus/pci find them.
       bind(s.root + "/sys/bus/pci/devices", "/sys/bus/pci/devices");
       bind(s.root + "/sys/class/hwmon", "/sys/class/hwmon");
+      // The amdgpu kernel module, loaded, as an AMD machine has it: ROCm's
+      // rocminfo and rocm-smi look for /sys/module/amdgpu/initstate ("live")
+      // before anything else and stop without it. sysfs takes no new entries,
+      // so /sys/module is overlaid with a directory linking every module the
+      // host has, plus amdgpu. A host with the module keeps its own.
+      if (profile.vendor == "amd" && ::access("/sys/module/amdgpu", F_OK) != 0) {
+        const std::string host = s.root + "/sys/module-host", mods = s.root + "/sys/module";
+        make_dirs(host);
+        make_dirs(mods + "/amdgpu");
+        if (bind("/sys/module", host)) {
+          if (DIR* dir = ::opendir(host.c_str())) {
+            while (const dirent* e = ::readdir(dir)) {
+              const std::string name = e->d_name;
+              if (name == "." || name == ".." || name == "amdgpu") continue;
+              std::error_code ec;
+              std::filesystem::create_symlink(host + "/" + name, mods + "/" + name, ec);
+            }
+            ::closedir(dir);
+          }
+          write_file(mods + "/amdgpu/initstate", "live\n");
+          bind(mods, "/sys/module");
+        }
+      }
       // An AMD machine has no NVIDIA driver, so no nvidia-smi: the host's is
       // covered by an empty file that is not executable, which a PATH search
       // (execvp, which, Python's shutil.which) passes over as it would a
@@ -971,6 +994,9 @@ int cmd_shell(const std::vector<std::string>& args) {
   setenv("VGPU_DRIVER_VERSION", c.driver.c_str(), 1);
   setenv("VGPU_CUDA_VERSION", c.cuda.c_str(), 1);
   setenv("VGPU_ROCM_VERSION", c.rocm.c_str(), 1);   // amd-smi version reports it
+  // ROCm's rocm-smi loads librocm_smi64 from beside itself unless told where:
+  // here, the simulator's, which answers for these GPUs.
+  if (profile.vendor == "amd") setenv("ROCM_SMI_LIB_PATH", (shim_dir() + "/librocm_smi64.so.1").c_str(), 1);
   setenv("VGPU_SESSION", s.dir.c_str(), 1);
   // Hold the devices open for the whole session: this is what publishes
   // telemetry that nvidia-smi / rocm-smi read.
