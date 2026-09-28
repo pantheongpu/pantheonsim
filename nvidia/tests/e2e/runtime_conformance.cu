@@ -376,6 +376,16 @@ int main() {
     e = cudaMemcpyToSymbol(table, managed, 16, 0, cudaMemcpyDeviceToDevice);
     cudaMemcpyFromSymbol(got, table, 16);
     CHECK("cudaMemcpyToSymbol DeviceToDevice from managed memory", e == cudaSuccess && got[3] == 4, "got %d %s, value %d", e, cudaGetErrorName(e), got[3]);
+    // cudaMemset follows the same rule.
+    e = cudaMemset(managed, 7, 16);
+    CHECK("cudaMemset on managed memory", e == cudaSuccess && managed[3] == 0x07070707, "got %d %s", e, cudaGetErrorName(e));
+    e = cudaMemsetAsync(pinned + 1, 0, 8, 0);
+    cudaStreamSynchronize(0);
+    CHECK("cudaMemsetAsync on pinned memory", e == cudaSuccess && pinned[0] == 1 && pinned[2] == 0 && pinned[3] == 4,
+          "got %d %s", e, cudaGetErrorName(e));
+    e = cudaMemset(regd, 0, 16);
+    CHECK("cudaMemset on cudaHostRegister'd memory -> invalid value", e == cudaErrorInvalidValue, "got %d %s", e, cudaGetErrorName(e));
+    cudaGetLastError();
     cudaHostUnregister(regd);
     std::free(regd);
     cudaFree(managed);
@@ -406,6 +416,11 @@ int main() {
     int v = -1;
     e = cudaDeviceGetAttribute(&v, cudaDevAttrMemoryPoolsSupported, 0);
     CHECK("memory pools supported", e == cudaSuccess && v == 1, "got %d %s, value %d", e, cudaGetErrorName(e), v);
+    // Concurrent managed access is answered (1 on Linux, 0 on Windows and WSL,
+    // so only the answer is checked); NanoVDB filters devices on it.
+    v = -1;
+    e = cudaDeviceGetAttribute(&v, cudaDevAttrConcurrentManagedAccess, 0);
+    CHECK("concurrent managed access is answered", e == cudaSuccess && (v == 0 || v == 1), "got %d %s, value %d", e, cudaGetErrorName(e), v);
     v = -1;
     e = cudaDeviceGetP2PAttribute(&v, cudaDevP2PAttrAccessSupported, 0, 1);
     CHECK("P2P access supported between two devices", e == cudaSuccess && v == 1, "got %d %s, value %d", e, cudaGetErrorName(e), v);
