@@ -98,6 +98,22 @@ extern "C" __global__ void jit_kernel(float* x, int n) {
 }
 )";
   const std::string ptx = compile(src, "default_program", {"--std=c++17", "--gpu-architecture=sm_80", "-default-device"});
+  {  // What PyTorch loads for an sm_ target: the CUBIN, which here is the PTX.
+    nvrtcProgram p;
+    nvrtcCreateProgram(&p, src, "default_program", 0, nullptr, nullptr);
+    const char* opts[] = {"--std=c++17", "--gpu-architecture=sm_80", "-default-device"};
+    size_t n = 0;
+    const bool ok = nvrtcCompileProgram(p, 3, opts) == NVRTC_SUCCESS && nvrtcGetCUBINSize(p, &n) == NVRTC_SUCCESS && n > 0;
+    std::string cubin(n, '\0');
+    CUmodule mod;
+    CUfunction fn;
+    const bool loads = ok && nvrtcGetCUBIN(p, &cubin[0]) == NVRTC_SUCCESS &&
+                       cuModuleLoadData(&mod, cubin.data()) == CUDA_SUCCESS &&
+                       cuModuleGetFunction(&fn, mod, "jit_kernel") == CUDA_SUCCESS;
+    check(loads, "for sm_80 it hands back a CUBIN that cuModuleLoadData loads");
+    if (loads) cuModuleUnload(mod);
+    nvrtcDestroyProgram(&p);
+  }
   check(!ptx.empty(), "a jiterator-shaped program (its own int64_t, INFINITY, NAN) compiles for sm_80");
   if (ptx.empty()) return;
   check(ptx.find(".target sm_80") != std::string::npos, "the PTX targets the virtual architecture of sm_80");

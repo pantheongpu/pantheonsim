@@ -646,6 +646,18 @@ static void eig_64bit() {
     check(info == 0 && err / scale < 1e-10 && pairs >= 1 && packing && unit,
           "Xgeev: A v = w v for every eigenpair, conjugate pairs packed as LAPACK packs them, unit vectors",
           err / scale);
+    // W typed real, as PyTorch passes it: the real parts, then the imaginary parts.
+    double* dwr = upload(M<double>((size_t)2 * n, -99.0));
+    double* da2 = upload(a);
+    CK(cusolverDnXgeev(sh, params, CUSOLVER_EIG_MODE_NOVECTOR, CUSOLVER_EIG_MODE_NOVECTOR, n, CUDA_R_64F, da2, n,
+                       CUDA_R_64F, dwr, CUDA_R_64F, nullptr, n, CUDA_R_64F, nullptr, n, CUDA_R_64F, work, dev,
+                       hwork.data(), host, dinfo));
+    const auto wr = download(dwr, (size_t)2 * n);
+    double werr = 0;
+    for (int j = 0; j < n; ++j) werr = std::fmax(werr, std::abs(std::complex<double>(wr[j], wr[n + j]) - w[j]));
+    check(werr / scale < 1e-12, "Xgeev with W typed real returns WR then WI, as LAPACK's geev does", werr / scale);
+    cudaFree(dwr);
+    cudaFree(da2);
     cudaFree(work);
     cudaFree(da);
     cudaFree(dw);

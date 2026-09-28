@@ -23,9 +23,10 @@
 // PyTorch's inductor all compile kernels through NVRTC and then load the PTX
 // through the driver API -- which VirtualGPU already interprets.
 //
-// Not implemented: CUBIN, LTO-IR and OptiX-IR output (all of which are SASS or
-// vendor bitcode, neither of which VirtualGPU can execute), precompiled
-// headers, and the time-trace files. Those return a clear status.
+// CUBIN for a real architecture comes back as the PTX, which is what
+// VirtualGPU's driver loads (see nvrtcGetCUBIN). Not implemented: LTO-IR and
+// OptiX-IR output (vendor bitcode, which VirtualGPU cannot execute),
+// precompiled headers, and the time-trace files. Those return a clear status.
 #include <nvrtc.h>
 
 #include <cuda.h>  // CUDA_VERSION: the toolkit this shim was built against
@@ -62,6 +63,7 @@ struct Program {
   std::string ptx;
   std::string log;
   bool compiled = false;
+  bool real_arch = false;  // compiled for an sm_ target, so the caller will ask for CUBIN
 };
 
 std::mutex g_mu;
@@ -440,6 +442,13 @@ VGPU_EXPORT nvrtcResult nvrtcCompileProgram(nvrtcProgram prog, int num_options,
   p->ptx.clear();
   p->lowered.clear();
   p->compiled = true;   // "compilation was attempted", which is what the API means
+  p->real_arch = false;
+  for (int i = 0; i < num_options; ++i) {
+    const std::string o = options && options[i] ? options[i] : "";
+    const size_t eq = o.find('=');
+    if ((o.rfind("--gpu-architecture=", 0) == 0 || o.rfind("-arch=", 0) == 0) && o.compare(eq + 1, 3, "sm_") == 0)
+      p->real_arch = true;
+  }
 
   if (const RealNvrtc* r = real_nvrtc()) return compile_real(*r, p, num_options, options);
 
@@ -599,12 +608,26 @@ static nvrtcResult unsupported_output(const char* what) {
                what);
   return NVRTC_ERROR_INVALID_PROGRAM;
 }
+// For a real architecture (-arch=sm_XX) the "CUBIN" is the PTX, NUL included.
+// A caller hands CUBIN to cuModuleLoadData, and VirtualGPU's driver loads PTX
+// from there as it loads it from anywhere; PyTorch's jiterator compiles for
+// the device's sm_ and loads what it gets. For a virtual architecture the size
+// is zero, as documented.
 VGPU_EXPORT nvrtcResult nvrtcGetCUBINSize(nvrtcProgram prog, size_t* size) {
-  if (!get(prog)) return NVRTC_ERROR_INVALID_PROGRAM;
-  if (size) *size = 0;   // documented: zero when -arch names a virtual architecture
+  Program* p = get(prog);
+  if (!p) return NVRTC_ERROR_INVALID_PROGRAM;
+  if (!size) return NVRTC_ERROR_INVALID_INPUT;
+  *size = p->real_arch && !p->ptx.empty() ? p->ptx.size() + 1 : 0;
   return NVRTC_SUCCESS;
 }
-VGPU_EXPORT nvrtcResult nvrtcGetCUBIN(nvrtcProgram, char*) { return unsupported_output("CUBIN"); }
+VGPU_EXPORT nvrtcResult nvrtcGetCUBIN(nvrtcProgram prog, char* out) {
+  Program* p = get(prog);
+  if (!p) return NVRTC_ERROR_INVALID_PROGRAM;
+  if (!p->real_arch || p->ptx.empty()) return unsupported_output("CUBIN");
+  if (!out) return NVRTC_ERROR_INVALID_INPUT;
+  std::memcpy(out, p->ptx.c_str(), p->ptx.size() + 1);
+  return NVRTC_SUCCESS;
+}
 VGPU_EXPORT nvrtcResult nvrtcGetLTOIRSize(nvrtcProgram prog, size_t* size) {
   if (!get(prog)) return NVRTC_ERROR_INVALID_PROGRAM;
   if (size) *size = 0;

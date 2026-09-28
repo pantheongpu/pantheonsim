@@ -1121,7 +1121,9 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXsyevBatched(cusolverDnHandle_t h, cusolv
    substitution for the eigenvectors: the EISPACK orthes/hqr2 algorithm, in
    the public-domain form JAMA gives it. Computed in double.
 
-   Output follows LAPACK's geev, which cuSOLVER's does: W complex; VR, for a
+   Output follows LAPACK's geev, which cuSOLVER's does: W complex, or, typed
+   real (as PyTorch passes it), 2n reals -- the n real parts, then the n
+   imaginary parts, as LAPACK's WR and WI; VR, for a
    real A, real, with a complex pair's vector stored as two columns (real
    part, then imaginary part) at the first eigenvalue of the pair, the one
    with positive imaginary part; each vector scaled to unit 2-norm with its
@@ -1477,7 +1479,9 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgeev(cusolverDnHandle_t h, cusolverDnPar
   const bool vectors = jobvr == CUSOLVER_EIG_MODE_VECTOR;
   if (vectors && ldvr < std::max<int64_t>(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
   const bool dbl = ta == CUDA_R_64F;
-  if ((ta != CUDA_R_32F && !dbl) || tw != (dbl ? CUDA_C_64F : CUDA_C_32F)) return CUSOLVER_STATUS_NOT_SUPPORTED;
+  const bool w_real = tw == ta;
+  if ((ta != CUDA_R_32F && !dbl) || (!w_real && tw != (dbl ? CUDA_C_64F : CUDA_C_32F)))
+    return CUSOLVER_STATUS_NOT_SUPPORTED;
   const bool vr_complex = tvr == (dbl ? CUDA_C_64F : CUDA_C_32F);
   if (vectors && !vr_complex && tvr != ta) return CUSOLVER_STATUS_NOT_SUPPORTED;
   return by_type(ta, [&](auto tag) {
@@ -1493,8 +1497,8 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgeev(cusolverDnHandle_t h, cusolverDnPar
     set_info(info, rc);
     std::vector<T> w((size_t)2 * N);
     for (int i = 0; i < N; ++i) {
-      w[2 * i] = (T)g.d[i];
-      w[2 * i + 1] = (T)g.e[i];
+      w[w_real ? i : 2 * i] = (T)g.d[i];
+      w[w_real ? N + i : 2 * i + 1] = (T)g.e[i];
     }
     if (N && cudaMemcpy(W, w.data(), w.size() * sizeof(T), cudaMemcpyHostToDevice) != cudaSuccess)
       return CUSOLVER_STATUS_EXECUTION_FAILED;
