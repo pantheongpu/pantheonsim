@@ -108,6 +108,48 @@ expect "amd-smi topology: Instinct cards are one XGMI hop apart" "XGMI" \
 expect "rocm-smi --showtopo: Radeon cards reach each other over PCIe" "PCIE" \
   "$(sess amd/rx7900xtx -c 'rocm-smi --showtopo' | awk '/Link Type/{f=1; next} f&&/^GPU0/{print $3; exit}')"
 
+# --- ROCm's own rocm-smi, on the simulator's librocm_smi64 ---
+# An isolated session has /sys/module/amdgpu loaded, as an AMD machine does,
+# and points ROCm SMI at the simulator's library, so ROCm's rocm-smi runs
+# unmodified and must say what VirtualGPU's own rocm-smi says.
+rsmi=""
+for f in /opt/rocm/libexec/rocm_smi/rocm_smi.py $(ls "$HOME"/.local/share/*/root/opt/rocm-*/libexec/rocm_smi/rocm_smi.py \
+         "$HOME"/.local/share/rocm-*/opt/rocm-*/libexec/rocm_smi/rocm_smi.py 2>/dev/null | sort -V | tail -1); do
+  [[ -f "$f" ]] && { rsmi=$f; break; }
+done
+# One line per GPU and reading, as either tool prints it.
+readings() {
+  sed -nE 's/^(GPU\[[0-9]+\]).*Card Series:[[:space:]]*(.*)$/\1 series \2/p
+            s/^(GPU\[[0-9]+\]).*VRAM Total Memory \(B\):[[:space:]]*([0-9]+)$/\1 vram \2/p
+            s/^(GPU\[[0-9]+\]).*(mclk|sclk) clock .*\(([0-9]+)Mhz\)$/\1 \2 \3/p' | sort
+}
+if [[ -z "$rsmi" ]]; then
+  echo "skip  ROCm's rocm-smi: no ROCm here"
+elif ! unshare --user --map-root-user true >/dev/null 2>&1; then
+  echo "skip  ROCm's rocm-smi: unprivileged user namespaces are unavailable here"
+elif objdump -p "$build/shim/librocm_smi64.so.1" 2>/dev/null | grep -q 'NEEDED.*lib[at]san'; then
+  echo "skip  ROCm's rocm-smi: a sanitizer build, loaded by a Python that is not built with one"
+else
+  expect "an isolated AMD session has the amdgpu kernel module loaded" "live" \
+    "$(isolated amd/mi300x -c 'cat /sys/module/amdgpu/initstate')"
+  expect "the session's other kernel modules are still there" "yes" \
+    "$(isolated amd/mi300x -c '[ $(ls /sys/module | wc -l) -gt 1 ] && echo yes')"
+  for g in amd/mi300x amd/rx7900xtx amd/rx6900xt; do
+    out=$(isolated "$g" -c "python3 '$rsmi' --showproductname --showmeminfo vram --showclocks; echo ====; rocm-smi --showproductname --showmeminfo vram --showclocks")
+    theirs=$(sed '/^====$/,$d' <<<"$out" | readings)
+    mine=$(sed '1,/^====$/d' <<<"$out" | readings)
+    expect "ROCm's rocm-smi reads every card's name, memory and clocks ($g)" "8" "$(grep -c . <<<"$theirs")"
+    expect "ROCm's rocm-smi says what VirtualGPU's does ($g)" "$mine" "$theirs"
+  done
+  expect "ROCm's rocm-smi summary: a row per card" "2" \
+    "$(isolated amd/mi300x -c "python3 '$rsmi'" | grep -cE '^[01] +[12] +0x74a1')"
+  real_ri=$(ls /opt/rocm/bin/rocminfo "$HOME"/.local/share/rocm-*/opt/rocm-*/bin/rocminfo 2>/dev/null | sort -V | tail -1)
+  if [[ -n "$real_ri" ]]; then
+    expect "ROCm's rocminfo, unmodified, in an isolated session: both cards" "2" \
+      "$(isolated amd/mi300x -c "'$real_ri'" | grep -c '^  Marketing Name: *AMD Instinct MI300X')"
+  fi
+fi
+
 # --- rocminfo ---
 ours="$build/vgpu-rocminfo"
 if [[ -x "$ours" ]]; then

@@ -1,6 +1,6 @@
 name: PantheonSim
 description: Run CUDA and HIP programs and tests on simulated NVIDIA and AMD GPUs, on a runner that has no GPU.
-author: PantheonGPU
+author: PantheonSim
 branding:
   icon: cpu
   color: green
@@ -34,7 +34,10 @@ inputs:
       `true` puts the simulator's libraries on LD_LIBRARY_PATH for the rest of
       the job, so programs run directly (from ctest, a test script, python) as
       well as under `vgpu run`. `false` leaves LD_LIBRARY_PATH alone, and only
-      `vgpu run` reaches the simulated GPUs.
+      `vgpu run` reaches the simulated GPUs. Use `false` when the job links
+      against the toolkit's own cuBLAS, cuSPARSE, cuFFT and so on: with `true`
+      the linker resolves their dependencies to the simulator's libraries and
+      the link fails.
     default: 'true'
 
 outputs:

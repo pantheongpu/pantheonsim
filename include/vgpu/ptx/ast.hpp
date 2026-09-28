@@ -664,6 +664,16 @@ struct OpF16x2Fma { bool bf16 = false; bool packed = true; Reg dst; Operand a, b
 // neg and abs on half types: both are a mask over the sign bits, which sits in
 // the top bit of each 16-bit half for f16 and bf16 alike.
 struct OpF16x2Neg { bool bf16 = false; bool packed = true; bool absolute = false; Reg dst; Operand src; };
+// Packed single precision (sm_100+): add/sub/mul/fma.f32x2 on 64-bit registers
+// holding two f32 lanes, the first in the low half. Each lane is an ordinary
+// f32 operation, rounded as .rn/.rz/.rm/.rp asks, with .ftz applied.
+struct OpF32x2 {
+  FloatBinOp op = FloatBinOp::Add;
+  bool fma = false, ftz = false;
+  FRound round = FRound::Nearest;
+  Reg dst;
+  Operand a, b, c;
+};
 
 // Tensor-core MMA (m16n16k16, f16 inputs, f32 accumulate). A warp-collective
 // operation: the 32 lanes jointly hold the matrices.
@@ -924,7 +934,7 @@ struct OpCall {
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideoSimd, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
-                        OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
+                        OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy>;
 
 struct Instr {

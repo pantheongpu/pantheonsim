@@ -3383,6 +3383,109 @@ VTEST(cache_hints_are_accepted_and_do_nothing) {
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0});  // a policy nothing consults
 }
 
+VTEST(loads_and_stores_take_a_cache_policy_operand) {
+  // .L2::cache_hint adds a 64-bit cache-policy operand after the address of a
+  // load and after the value of a store. Triton emits it for every load it
+  // marks evict_last/evict_first (torch.compile's kernels are full of them).
+  // It is a hint: the load returns and the store writes what they would
+  // without it.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    createpolicy.fractional.L2::evict_last.b64 %rd6, 1.0;
+    mov.u32 %r1, 7;
+    mov.u32 %r2, 8;
+    st.global.L2::cache_hint.v2.u32 [%rd2], {%r1, %r2}, %rd6;
+    setp.eq.u32 %p1, %r1, 7;
+    mov.u32 %r3, 0x0;
+    @%p1 ld.global.L1::evict_last.L2::cache_hint.b32 { %r3 }, [ %rd2 + 0 ], %rd6;
+    mov.u32 %r4, 0;
+    mov.u32 %r5, 0;
+    ld.global.L2::cache_hint.v2.b32 { %r4, %r5 }, [ %rd2 + 0 ], %rd6;
+    add.u32 %r6, %r3, %r5;
+    st.global.L1::no_allocate.L2::cache_hint.b32 [ %rd2 + 8 ], %r6, %rd6;
+    st.global.u32 [%rd2+12], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{7});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{8});
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{15});   // 7 + 8
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), uint64_t{7});
+}
+
+VTEST(packed_f32x2_arithmetic) {
+  // add/sub/mul/fma.f32x2 (sm_100+) work on two f32 lanes packed in a 64-bit
+  // register, the first in the low half. Triton emits them on Blackwell. The
+  // expected values are worked out by hand, including a directed rounding and
+  // a flushed subnormal. Every form here is one ptxas accepts for sm_100a.
+  std::string ptx = std::string(".version 8.7\n.target sm_100a\n.address_size 64\n") + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.b32 %r1, 0f3FC00000;          // 1.5
+    mov.b32 %r2, 0fC0200000;          // -2.5
+    mov.b64 %rd3, {%r1, %r2};         // a = (1.5, -2.5)
+    mov.b32 %r3, 0f40000000;          // 2.0
+    mov.b32 %r4, 0f3E800000;          // 0.25
+    mov.b64 %rd4, {%r3, %r4};         // b = (2.0, 0.25)
+    add.rn.f32x2 %rd5, %rd3, %rd4;    // (3.5, -2.25)
+    sub.f32x2 %rd6, %rd3, %rd4;       // (-0.5, -2.75)
+    mul.rn.f32x2 %rd7, %rd3, %rd4;    // (3.0, -0.625)
+    fma.rn.f32x2 %rd8, %rd3, %rd4, %rd4;   // (5.0, -0.375)
+    mov.b32 %r5, 0f3F800000;          // 1.0
+    mov.b32 %r6, 0f33800000;          // 2^-24
+    mov.b64 %rd9, {%r5, %r5};
+    mov.b64 %rd10, {%r6, %r6};
+    add.rz.f32x2 %rd11, %rd9, %rd10;  // 1 + 2^-24 truncates to 1.0 in both
+    mov.b32 %r7, 0f00400000;          // a subnormal
+    mov.b64 %rd12, {%r7, %r3};
+    mul.ftz.f32x2 %rd13, %rd12, %rd4;  // (flushed to 0, 0.5)
+    st.global.v2.u64 [%rd2], {%rd5, %rd6};
+    st.global.v2.u64 [%rd2+16], {%rd7, %rd8};
+    st.global.v2.u64 [%rd2+32], {%rd11, %rd13};
+    mov.b32 %r8, 0;
+    mov.b64 {_, %r8}, %rd7;               // the high lane only, as LLVM unpacks one
+    st.global.u32 [%rd2+48], %r8;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(52);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  auto at = [&](int i) { return as_f32(e.mem.load_scalar(out + 4 * i, 4)); };
+  VCHECK_EQ(at(0), 3.5f);
+  VCHECK_EQ(at(1), -2.25f);
+  VCHECK_EQ(at(2), -0.5f);
+  VCHECK_EQ(at(3), -2.75f);
+  VCHECK_EQ(at(4), 3.0f);
+  VCHECK_EQ(at(5), -0.625f);
+  VCHECK_EQ(at(6), 5.0f);
+  VCHECK_EQ(at(7), -0.375f);
+  VCHECK_EQ(at(8), 1.0f);
+  VCHECK_EQ(at(9), 1.0f);
+  VCHECK_EQ(at(10), 0.0f);
+  VCHECK_EQ(at(11), 0.5f);
+  VCHECK_EQ(at(12), -0.625f);   // mov.b64 {_, %r8}: the high lane of the mul
+}
+
 VTEST(cluster_registers_tile_the_grid) {
   // A 2x2 cluster over a 4x2 grid is two clusters side by side. Every block
   // writes where it thinks it is, and the check is against the tiling worked

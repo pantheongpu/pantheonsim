@@ -7,8 +7,8 @@
 #
 # Needs `ollama` and the model (default smollm2:135m, VGPU_OLLAMA_MODEL);
 # VGPU_OLLAMA_PULL=1 pulls it. Without either, it skips. VGPU_OLLAMA_PROFILES
-# narrows the profiles (space-separated). AMD profiles are not run: Ollama's
-# ROCm backend needs HIP kernels to execute, and the simulator runs CUDA only.
+# narrows the profiles (space-separated). AMD profiles run through Ollama's
+# ROCm backend in amd/tests/e2e/run_ollama_amd.sh (ctest amd_ollama).
 #
 # Ollama bundles its own libcudart and libcublas and puts its library directory
 # first for the runner it starts, so the simulator's are preloaded: a library

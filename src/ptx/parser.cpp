@@ -1465,6 +1465,12 @@ class Parser {
         }
         expect_punct(",");
         addr = parse_addr(fn);
+        // A trailing cache policy (.L2::cache_hint, which the splitter drops):
+        // a hint, read by nothing. Triton marks most of its loads this way.
+        if (peek_punct(",")) {
+          next();
+          (void)parse_operand();
+        }
         if (space == Space::Param) {
           // A register base is a parameter's address, taken with
           // "mov.b64 %rd, kernel_param_N". Parameters have addresses of their
@@ -1494,6 +1500,12 @@ class Parser {
           srcs.push_back(parse_operand());
         else
           srcs = parse_operand_vector(vec);
+        // A trailing cache policy (.L2::cache_hint, which the splitter drops):
+        // a hint, read by nothing. Triton marks most of its loads this way.
+        if (peek_punct(",")) {
+          next();
+          (void)parse_operand();
+        }
         if (space == Space::Param) {
           if (addr.base_kind != Addr::Base::CallSlot)
             return unsupported("st.param outside a call sequence");
@@ -1525,7 +1537,14 @@ class Parser {
         op.ty = *ty;
         next();
         while (!peek_punct("}")) {
-          op.dsts.push_back(expect_reg_operand("mov destination element"));
+          // `_` discards its piece: "mov.b64 {_, %r2}, %rd1" keeps the high
+          // half only. LLVM (and so Triton) writes it for f32x2 results.
+          if (peek().text == "_") {
+            next();
+            op.dsts.push_back(Reg{});
+          } else {
+            op.dsts.push_back(expect_reg_operand("mov destination element"));
+          }
           if (peek_punct(",")) next();
         }
         next();
@@ -1761,6 +1780,37 @@ class Parser {
         op.src = parse_operand();
         ins.op = op;
       }
+    } else if ((op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "fma") &&
+               opcode.find("f32x2") != std::string::npos) {
+      // Packed single precision, sm_100 and later; Triton emits it for
+      // elementwise math on Blackwell. d, a, b (and c) are 64-bit registers.
+      OpF32x2 op;
+      op.fma = op0 == "fma";
+      op.op = op0 == "add" ? FloatBinOp::Add : op0 == "sub" ? FloatBinOp::Sub : FloatBinOp::Mul;
+      bool saw_ty = false, saw_round = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p2 = parts[i];
+        if (p2 == "f32x2") saw_ty = true;
+        else if (p2 == "rn") { op.round = FRound::Nearest; saw_round = true; }
+        else if (p2 == "rz") { op.round = FRound::Zero; saw_round = true; }
+        else if (p2 == "rm") { op.round = FRound::MinusInf; saw_round = true; }
+        else if (p2 == "rp") { op.round = FRound::PlusInf; saw_round = true; }
+        else if (p2 == "ftz") op.ftz = true;
+        // No .sat: ptxas refuses it on every f32x2 form.
+        else return unsupported("f32x2 modifier '." + p2 + "'");
+      }
+      if (!saw_ty) return unsupported("f32x2 form");
+      if (op.fma && !saw_round) return unsupported("fma.f32x2 without a rounding modifier (ptxas requires one)");
+      op.dst = expect_reg_operand("destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      if (op.fma) {
+        expect_punct(",");
+        op.c = parse_operand();
+      }
+      ins.op = op;
     } else if ((op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "fma" || op0 == "neg" ||
                 op0 == "abs" || op0 == "min" || op0 == "max") &&
                (opcode.find("f16") != std::string::npos ||

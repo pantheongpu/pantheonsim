@@ -229,13 +229,17 @@ add_custom_command(TARGET vgpurocprof POST_BUILD
 # count, PCI addresses and links), answered from the HIP shim, so RCCL starts
 # on simulated GPUs on a machine with no AMD kernel driver.
 add_library(vgpursmi SHARED amd/src/rocm_smi.cpp)
-target_link_libraries(vgpursmi PRIVATE vgpuhip)
+# The machine's telemetry, RAS counters and registers (vgpu), and the devices
+# as the HIP runtime has them (vgpuhip).
+target_link_libraries(vgpursmi PRIVATE vgpuhip vgpu)
 target_include_directories(vgpursmi PRIVATE amd/include)
 set_target_properties(vgpursmi PROPERTIES OUTPUT_NAME rocm_smi64 SOVERSION 7 VERSION 7.8.0
   CXX_VISIBILITY_PRESET hidden)
 add_custom_command(TARGET vgpursmi POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocm_smi64.so.7.8.0" "${CMAKE_BINARY_DIR}/shim/librocm_smi64.so.7"
+  # ROCm 7.1's name for it, which its rocm-smi and AMD's test clients load.
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocm_smi64.so.7.8.0" "${CMAKE_BINARY_DIR}/shim/librocm_smi64.so.1"
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../librocm_smi64.so.7.8.0" "${CMAKE_BINARY_DIR}/shim/librocm_smi64.so"
   COMMENT "Creating ROCm SMI shim symlinks (build/shim/librocm_smi64.so.7)")
 # ---------------------------------------------------------------------------
@@ -601,6 +605,7 @@ add_custom_command(TARGET vgpu_cli POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E create_symlink "../vgpu" "${CMAKE_BINARY_DIR}/bin/vgpu"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/nvidia/tools/nvidia-smi" "${CMAKE_BINARY_DIR}/bin/nvidia-smi"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/nvidia/tools/nvcc" "${CMAKE_BINARY_DIR}/bin/nvcc"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/nvidia/tools/vgpu-ptxas" "${CMAKE_BINARY_DIR}/bin/vgpu-ptxas"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/amd/tools/rocm-smi" "${CMAKE_BINARY_DIR}/bin/rocm-smi"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/amd/tools/amd-smi" "${CMAKE_BINARY_DIR}/bin/amd-smi"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/amd/tools/rocm_agent_enumerator" "${CMAKE_BINARY_DIR}/bin/rocm_agent_enumerator"
@@ -750,9 +755,14 @@ add_executable(test_amd_rocm_smi amd/tests/unit/test_rocm_smi.cpp)
 target_link_libraries(test_amd_rocm_smi PRIVATE vgpursmi vgpuhip)
 target_include_directories(test_amd_rocm_smi PRIVATE tests/framework)
 add_test(NAME test_amd_rocm_smi COMMAND test_amd_rocm_smi)
-set_tests_properties(test_amd_rocm_smi PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
+# Each with a machine of its own: the library reads the machine's telemetry,
+# which another process's simulated GPUs would join.
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/telemetry-rocm-smi" "${CMAKE_BINARY_DIR}/telemetry-rocm-smi-radeon")
+set_tests_properties(test_amd_rocm_smi PROPERTIES ENVIRONMENT
+  "VGPU_GPU=amd/mi300x;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-rocm-smi")
 add_test(NAME test_amd_rocm_smi_radeon COMMAND test_amd_rocm_smi)
-set_tests_properties(test_amd_rocm_smi_radeon PROPERTIES ENVIRONMENT "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
+set_tests_properties(test_amd_rocm_smi_radeon PROPERTIES ENVIRONMENT
+  "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-rocm-smi-radeon")
 add_test(NAME amd_rocprofiler_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofiler_abi.sh)
 add_test(NAME amd_rocprofv3 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofv3.sh)
 set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
@@ -1118,7 +1128,7 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "nvrtc_paths:nvrtc:cuda")
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -1591,3 +1601,9 @@ if(TARGET vgpucublas)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 3600)
 endif()
+# And on every simulated AMD GPU, through Ollama's ROCm backend (llama.cpp's
+# HIP kernels, rocBLAS, hipBLAS). Skips without ollama and its ROCm backend.
+# VGPU_OLLAMA_PROFILES picks GPUs; CI runs one job for each.
+add_test(NAME amd_ollama COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_ollama_amd.sh)
+set_tests_properties(amd_ollama PROPERTIES DEPENDS "vgpuhip;vgpu_cli" RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 10800)

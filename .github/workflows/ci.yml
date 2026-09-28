@@ -150,6 +150,46 @@ jobs:
         env:
           VGPU_OLLAMA_PULL: '1'
         run: ctest --test-dir build --output-on-failure -R '^e2e_ollama$'
+  ollama-amd:
+    name: ollama on ${{ matrix.gpu }}
+    runs-on: ubuntu-24.04
+    # A simulated GPU takes some 3 to 17 minutes to load a model and generate
+    # three tokens, so each GPU has a job of its own.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu: [amd/mi300x, amd/mi325x, amd/mi350x, amd/mi250x, amd/rx6900xt, amd/rx7900xtx, amd/rx9070xt]
+    env:
+      OLLAMA_VERSION: v0.21.0
+      OLLAMA_MODELS: ${{ github.workspace }}/ollama-models
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ollama and its ROCm backend
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates zstd
+          mkdir -p "$RUNNER_TEMP/ollama"
+          for t in ollama-linux-amd64.tar.zst ollama-linux-amd64-rocm.tar.zst; do
+            wget -qO- "https://github.com/ollama/ollama/releases/download/$OLLAMA_VERSION/$t" |
+              zstd -d | tar -x -C "$RUNNER_TEMP/ollama"
+          done
+          # Its CUDA backends are not needed here.
+          rm -rf "$RUNNER_TEMP"/ollama/lib/ollama/cuda_* "$RUNNER_TEMP"/ollama/lib/ollama/mlx_*
+          echo "$RUNNER_TEMP/ollama/bin" >> "$GITHUB_PATH"
+
+      - name: Build VirtualGPU's HIP runtime
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target vgpuhip vgpu_cli
+
+      - name: A model on the simulated GPU
+        env:
+          VGPU_OLLAMA_PULL: '1'
+          VGPU_OLLAMA_PROFILES: ${{ matrix.gpu }}
+        run: ctest --test-dir build --output-on-failure -R '^amd_ollama$'
+
   amd-code-objects:
     name: AMD code objects and CDNA decoding
     # GitHub's hosted runner unless the repository variable SIM_RUNS_ON names
