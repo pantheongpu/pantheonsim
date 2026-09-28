@@ -250,6 +250,17 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   destination's sign bit otherwise; cvt.f32.f16 of a NaN is 0x7fffffff and
   cvt.ftz.f64.f32 widens the canonical NaN; setp/set on f16x2 with p|q and
   with an integer destination.
+- A third sweep, 153 variants of warp instructions (shfl in every mode and
+  clamp, vote, match, redux, the lane masks, bar.red), atomics and reductions
+  on global and shared memory (the value returned and the memory left),
+  sub-word and vector memory, and 16/64-bit integer arithmetic:
+  e2e_ptx_warp_mem. Fixed from it: atom.cas compared with c and stored b, so
+  a matching CAS stored nothing (also its own PR against main); shfl.up
+  bounded by c's clamp field as the ISA's maxLane, not minLane; match.all
+  writes the member mask or 0; atom.add.f32 flushes subnormals and writes
+  the canonical NaN; a 16-bit shift's amount is a whole .u32; bfe/bfi.64 take
+  the whole position and length; bfe.s64 of all 64 bits kept (1 << 64 was
+  undefined); cnot.
 - Half precision beyond f16x2: f16, bf16, f16x2 and bf16x2 arithmetic
   (add/sub/mul/fma/neg/min/max), the same four types on every transcendental,
   and atom/red.add on all of them. bf16 is a different decode, not a scaled

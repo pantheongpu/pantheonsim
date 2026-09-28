@@ -3495,6 +3495,59 @@ VTEST(ptx_forms_as_the_card_computes_them) {
   }
 }
 
+// Integer forms the third card-vs-simulator sweep found wrong, with an RTX
+// 3060's values: a 16-bit shift's amount is a whole .u32 (0xbf800000 shifts
+// everything out); rem.u16 by zero is all ones; bfe/bfi.64 take the whole
+// position and length, not their low 8 bits; bfe.s64 of the whole value keeps
+// it (1 << 64 was undefined); cnot.
+VTEST(integer_forms_from_the_third_sweep) {
+  struct Case { const char* ins; uint32_t a, b, c, want; };
+  const Case cases[] = {
+      {"{ .reg .b16 x; cvt.u16.u32 x, %r1; shl.b16 x, x, %r2; cvt.u32.u16 %r4, x; }", 0x09ce, 0xbf800000, 0, 0},
+      {"{ .reg .s16 x; cvt.s16.u32 x, %r1; shr.s16 x, x, %r2; cvt.u32.u16 %r4, x; }", 0x8000, 0x10000, 0, 0xffff},
+      {"{ .reg .s16 x; cvt.s16.u32 x, %r1; shr.s16 x, x, %r2; cvt.u32.u16 %r4, x; }", 0x8000, 3, 0, 0xf000},
+      {"{ .reg .u16 x, y; cvt.u16.u32 x, %r1; cvt.u16.u32 y, %r2; rem.u16 x, x, y; cvt.u32.u16 %r4, x; }", 1234, 0, 0,
+       0xffff},
+      {"{ .reg .s64 x; mov.b64 x, {%r1, %r2}; bfe.s64 x, x, 0, %r3; mov.b64 {%r4, _}, x; }", 0xd8c3f538, 0xe88c3cd2,
+       0xd8c3f538, 0xd8c3f538},
+      {"{ .reg .u64 x; mov.b64 x, {%r1, %r2}; bfe.u64 x, x, 3, %r3; mov.b64 {%r4, _}, x; }", 0x49428d8e, 0xb8e8ab15,
+       0x100, 0xa92851b1},
+      {"{ .reg .u64 x; mov.b64 x, {%r1, %r2}; bfe.u64 x, x, %r3, 8; mov.b64 {%r4, _}, x; }", 0x49428d8e, 0xb8e8ab15,
+       0x103, 0},
+      {"cnot.b32 %r4, %r1", 0, 0, 0, 1},
+      {"cnot.b32 %r4, %r1", 5, 0, 0, 0},
+      {"{ .reg .b16 x; cvt.u16.u32 x, %r1; cnot.b16 x, x; cvt.u32.u16 %r4, x; }", 0x10000, 0, 0, 1},
+  };
+  constexpr size_t n = sizeof cases / sizeof cases[0];
+  std::string body;
+  for (size_t i = 0; i < n; ++i) {
+    char line[512];
+    std::snprintf(line, sizeof line,
+                  "    mov.u32 %%r1, %u;\n    mov.u32 %%r2, %u;\n    mov.u32 %%r3, %u;\n    %s%s\n"
+                  "    st.global.u32 [%%rd2+%zu], %%r4;\n",
+                  cases[i].a, cases[i].b, cases[i].c, cases[i].ins, cases[i].ins[0] == '{' ? "" : ";", 4 * i);
+    body += line;
+  }
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+)" + body + "    ret;\n}\n";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4 * n);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  for (size_t i = 0; i < n; ++i) {
+    const auto got = static_cast<uint32_t>(e.mem.load_scalar(out + 4 * i, 4));
+    if (got != cases[i].want)
+      std::fprintf(stderr, "  %s: %08x, the card gave %08x\n", cases[i].ins, got, cases[i].want);
+    VCHECK_EQ(got, cases[i].want);
+  }
+}
+
 VTEST(lop3_computes_the_truth_table_it_is_given) {
   // ptxas fuses bitwise chains into lop3, so optimized PTX is full of these
   // and a wrong truth table is a wrong mask rather than a crash. The immLut

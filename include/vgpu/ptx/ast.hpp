@@ -187,7 +187,7 @@ struct OpCvt {
 // away, on the bits (add 0x1000, clear 13); a NaN is truncated, not rounded
 // (measured on an RTX 3060).
 struct OpCvtTf32 { bool rna = false, rz = false, satfinite = false, relu = false; Reg dst; Operand src; };
-struct OpNot { Type ty; Reg dst; Operand src; };   // bitwise not
+struct OpNot { Type ty; Reg dst; Operand src; bool logical = false; };   // bitwise not; cnot when logical (d = a == 0)
 struct OpNeg { Type ty; Reg dst; Operand src; bool ftz = false; };   // arithmetic negate (int/float)
 struct OpAbs { Type ty; Reg dst; Operand src; bool ftz = false; };
 
