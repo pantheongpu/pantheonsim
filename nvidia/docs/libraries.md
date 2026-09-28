@@ -37,7 +37,7 @@ which is the honest meaning of "the same image".
 | cuDNN | `libcudnn.so.9` | convolution, activation, pooling, softmax, batchnorm |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation |
-| cuSPARSE | `libcusparse.so.12` | CSR/CSC/COO SpMV, SpMM (strided batches, fp16/bf16), SpGEMM, SDDMM, SpSV/SpSM, format conversion, CSR to CSC; legacy coo2csr, sorts and csrgeam2 |
+| cuSPARSE | `libcusparse.so.12` | CSR/CSC/COO SpMV, SpMM (strided batches, fp16/bf16), SpGEMM, SDDMM, SpSV/SpSM, format conversion, CSR to CSC; legacy coo2csr, sorts and csrgeam2. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
 | cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR (with `ungqr`/`unmqr` for complex), symmetric and Hermitian eigen, SVD, in real and complex types; the 64-bit X API, Jacobi (gesvdj, syevj, heevj) and batched forms, gesvdaStridedBatched |
 | NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
