@@ -8,8 +8,8 @@
 // the other knew. Now both ask for the machine through
 // vgpu_shared_runtime_v1, looked up in the process's global scope: the loader
 // gives both libraries the same definition -- the first one loaded -- and so
-// the same Runtime. A library loaded privately (RTLD_LOCAL) finds only its
-// own, as before.
+// the same Runtime. A library loaded privately (RTLD_LOCAL) is found by name
+// instead (owner(), below).
 #include <dlfcn.h>
 
 #include <cstdio>
@@ -22,12 +22,22 @@
 #include "vgpu/runtime/runtime.hpp"
 #include "vgpu/telemetry.hpp"
 
+namespace {
+std::mutex g_rt_mu;
+// Owned here, in the library whose definition the loader chose, and
+// destroyed with it at exit -- which is when its telemetry segment goes.
+std::unique_ptr<vgpu::runtime::Runtime> g_rt;
+}  // namespace
+
+// This copy's machine, if it has made one, without making one.
+extern "C" __attribute__((visibility("default"))) vgpu::runtime::Runtime* vgpu_shared_runtime_peek_v1() {
+  std::lock_guard<std::mutex> lock(g_rt_mu);
+  return g_rt.get();
+}
+
 extern "C" __attribute__((visibility("default"))) vgpu::runtime::Runtime* vgpu_shared_runtime_v1() {
-  static std::mutex mu;
-  // Owned here, in the library whose definition the loader chose, and
-  // destroyed with it at exit -- which is when its telemetry segment goes.
-  static std::unique_ptr<vgpu::runtime::Runtime> rt;
-  std::lock_guard<std::mutex> lock(mu);
+  auto& rt = g_rt;
+  std::lock_guard<std::mutex> lock(g_rt_mu);
   if (!rt) {
     const char* gpu = std::getenv("VGPU_GPU");
     const std::string id = gpu && gpu[0] ? gpu : "nvidia/h100";
@@ -59,22 +69,47 @@ extern "C" __attribute__((visibility("default"))) std::recursive_mutex* vgpu_sha
 
 namespace vgpu::runtime {
 
-std::recursive_mutex& shared_api_mutex() {
-  using Fn = std::recursive_mutex* (*)();
-  static const Fn fn = [] {
-    const auto found = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "vgpu_shared_api_mutex_v1"));
-    return found ? found : &vgpu_shared_api_mutex_v1;
+namespace {
+// The copy of the core whose machine and lock this one uses, chosen once.
+//
+// First, a copy that has already made the machine, among the two libraries
+// that carry the core, found by name if loaded. That is for a library loaded
+// privately (RTLD_LOCAL), which the global lookup cannot see: dlsym's default
+// search from inside it finds its own definition first. Rust's libloading
+// loads that way, and cudarc loads libcuda first and libcudart (under
+// libcurand) later, so each made a machine of its own and cuRAND wrote to an
+// address only libcuda had allocated. A loaded NVIDIA libcuda has none of
+// these symbols and is passed over.
+//
+// Otherwise the global definition -- the first library loaded, for libraries
+// loaded globally -- or this copy's own.
+struct Owner {
+  Runtime* (*rt)();
+  std::recursive_mutex* (*mu)();
+};
+const Owner& owner() {
+  static const Owner o = [] {
+    using Peek = Runtime* (*)();
+    for (const char* lib : {"libcuda.so.1", "libcudart.so.12", "libcudart.so.13"}) {
+      void* h = dlopen(lib, RTLD_LAZY | RTLD_NOLOAD);
+      if (!h) continue;
+      const auto peek = reinterpret_cast<Peek>(dlsym(h, "vgpu_shared_runtime_peek_v1"));
+      const auto rt = reinterpret_cast<Runtime* (*)()>(dlsym(h, "vgpu_shared_runtime_v1"));
+      const auto mu = reinterpret_cast<std::recursive_mutex* (*)()>(dlsym(h, "vgpu_shared_api_mutex_v1"));
+      dlclose(h);   // NOLOAD took a reference; the library stays loaded
+      if (peek && rt && mu && peek()) return Owner{rt, mu};
+    }
+    const auto rt = reinterpret_cast<Runtime* (*)()>(dlsym(RTLD_DEFAULT, "vgpu_shared_runtime_v1"));
+    const auto mu = reinterpret_cast<std::recursive_mutex* (*)()>(dlsym(RTLD_DEFAULT, "vgpu_shared_api_mutex_v1"));
+    if (rt && mu) return Owner{rt, mu};
+    return Owner{&vgpu_shared_runtime_v1, &vgpu_shared_api_mutex_v1};
   }();
-  return *fn();
+  return o;
 }
+}  // namespace
 
-Runtime* shared_runtime() {
-  using Fn = Runtime* (*)();
-  static const Fn fn = [] {
-    const auto found = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "vgpu_shared_runtime_v1"));
-    return found ? found : &vgpu_shared_runtime_v1;
-  }();
-  return fn();
-}
+std::recursive_mutex& shared_api_mutex() { return *owner().mu(); }
+
+Runtime* shared_runtime() { return owner().rt(); }
 
 }  // namespace vgpu::runtime
