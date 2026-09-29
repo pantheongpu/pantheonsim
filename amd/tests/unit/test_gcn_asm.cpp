@@ -288,6 +288,70 @@ VTEST(transposing_lds_reads_hand_each_lane_its_column) {
   VCHECK_EQ(wrong, 0);
 }
 
+VTEST(the_instructions_hip_tests_device_library_runs_compute_what_the_isa_says) {
+  const amd::CodeObject o = object("asm_isa_gaps");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> in(64 * 4), counters(64 * 2);
+  uint32_t seed = 2024;
+  const auto next = [&] {
+    seed = seed * 1103515245u + 12345u;
+    return seed;
+  };
+  for (uint32_t l = 0; l < 64; ++l) {
+    in[4 * l + 0] = l < 8 ? 0xFFFFFFF0u + l : next();   // some sums that saturate
+    in[4 * l + 1] = l < 8 ? 0x40u : next() >> (l & 7);
+    in[4 * l + 2] = f(static_cast<float>(l) * 0.37f - 7.0f);
+    in[4 * l + 3] = next();
+    counters[2 * l] = l % 5;         // at, below and past the limit
+    counters[2 * l + 1] = l % 3 == 0 ? 0 : next() % 200;
+  }
+  const uint64_t in_d = mem.alloc(in.size() * 4), out = mem.alloc(64 * 20 * 4), cnt = mem.alloc(counters.size() * 4);
+  mem.write(in_d, in.data(), in.size() * 4);
+  mem.write(cnt, counters.data(), counters.size() * 4);
+  const std::vector<uint32_t> r = run(o, "gaps", mem, out, 64 * 20, {in_d, out, cnt});
+  std::vector<uint32_t> after(counters.size());
+  mem.read(cnt, after.data(), after.size() * 4);
+  const auto s16 = [](uint32_t x, int h) { return static_cast<int64_t>(static_cast<int16_t>(x >> (16 * h))); };
+  const auto s4 = [](uint32_t x, int k) {
+    int64_t v = (x >> (4 * k)) & 15;
+    return v & 8 ? v - 16 : v;
+  };
+  int wrong = 0;
+  for (uint32_t l = 0; l < 64; ++l) {
+    const uint32_t a = in[4 * l], b = in[4 * l + 1], c = in[4 * l + 2], d = in[4 * l + 3];
+    const uint32_t* got = &r[20 * l];
+    float cf;
+    std::memcpy(&cf, &c, 4);
+    int64_t dot2i = static_cast<int32_t>(d), dot2u = d, dot4u = d, dot8i = static_cast<int32_t>(d), dot8u = d;
+    for (int h = 0; h < 2; ++h) {
+      dot2i += s16(a, h) * s16(b, h);
+      dot2u += int64_t{(a >> (16 * h)) & 0xFFFF} * ((b >> (16 * h)) & 0xFFFF);
+    }
+    for (int k = 0; k < 4; ++k) dot4u += int64_t{(a >> (8 * k)) & 0xFF} * ((b >> (8 * k)) & 0xFF);
+    for (int k = 0; k < 8; ++k) {
+      dot8i += s4(a, k) * s4(b, k);
+      dot8u += int64_t{(a >> (4 * k)) & 15} * ((b >> (4 * k)) & 15);
+    }
+    const uint32_t inc_after = counters[2 * l] >= b ? 0 : counters[2 * l] + 1;
+    const uint32_t dec_before = counters[2 * l + 1];
+    const uint32_t dec_after = dec_before == 0 || dec_before > b ? b : dec_before - 1;
+    const uint32_t lds_inc = a >= b ? 0 : a + 1;
+    const uint32_t want[20] = {
+        uint64_t{a} + b > UINT32_MAX ? UINT32_MAX : a + b,
+        b > a ? 0u : a - b,
+        f(cf - std::floor(cf)),
+        u(dot2i), u(dot2u), u(dot4u), u(dot8i), u(dot8u),
+        u(dot2i), u(dot8i),   // the VOP2 forms add into d the same way (no clamp, no overflow here)
+        l == 63 ? 0xFFFFu : l + 1, l == 0 ? 0xFFFFu : l - 1, (l + 1) % 64, (l + 63) % 64,
+        counters[2 * l], dec_before,
+        a, lds_inc, c, 0};
+    for (int i = 0; i < 20; ++i) wrong += got[i] != want[i];
+    wrong += after[2 * l] != inc_after;
+    wrong += after[2 * l + 1] != dec_after;
+  }
+  VCHECK_EQ(wrong, 0);
+}
+
 VTEST(a_work_group_waiting_for_another_on_the_same_thread_is_released) {
   // One host thread, two groups, group 0 first and waiting for group 1.
   setenv("VGPU_THREADS", "1", 1);
