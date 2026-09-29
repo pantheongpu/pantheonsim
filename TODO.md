@@ -392,6 +392,11 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
   checks where every element lands and that a fragment stored by one instruction
   and loaded by the other comes back unchanged.
+- `atom.{exch,cas}.b128` (sm_90): 16 aligned bytes, the operands `.b128`
+  register pairs, under the atomics' striped lock. `st.bulk` (sm_100): zeroes
+  shared memory, a multiple of 8 bytes up to 16 MiB. `istypep`: false for every
+  handle, as an RTX 3060 answers for texture and surface objects; there are no
+  `.texref` variables since CUDA 12.
 - The per-thread stack (PTX ISA 9.7.19): `alloca`, `stacksave` and
   `stackrestore`, which nvcc emits for `alloca()` in device code. Each thread
   has a stack of `LaunchConfig::stack_bytes` (cudaLimitStackSize, 1 KiB by

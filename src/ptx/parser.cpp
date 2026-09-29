@@ -1426,6 +1426,29 @@ class Parser {
         if (a->base_kind == Addr::Base::CallSlot || a->base_kind == Addr::Base::EntryParam)
           return unsupported(op0 + ".async through a parameter/slot name");
       ins.op = op;
+    } else if (op0 == "st" && parts.size() > 1 && parts[1] == "bulk") {
+      // st.bulk{.weak}{.shared::cta} [a], size, initval (PTX ISA 9.7.10.14,
+      // sm_100): zero `size` bytes of shared memory from a.
+      OpStBulk op;
+      for (size_t i = 2; i < parts.size(); ++i) {
+        if (parts[i] == "weak") ;
+        else if (parts[i] == "shared::cta" || parts[i] == "shared") op.shared = true;   // the splitter drops ::cta
+        else return unsupported("st.bulk modifier '." + parts[i] + "'");
+      }
+      const std::string arch = target_.substr(0, target_.find(','));
+      int sm = 0;
+      std::sscanf(arch.c_str(), "sm_%d", &sm);
+      if (sm < 100)
+        fail(ins.line, "st.bulk requires sm_100 or later; this module targets " +
+                           (arch.empty() ? std::string("nothing") : arch));
+      op.addr = parse_addr(fn);
+      expect_punct(",");
+      op.size = parse_operand();
+      expect_punct(",");
+      const Operand init = parse_operand();
+      const auto* imm = std::get_if<ImmInt>(&init);
+      if (!imm || imm->value != 0) return unsupported("st.bulk's initval must be the constant 0");
+      ins.op = op;
     } else if (op0 == "ld" || op0 == "st") {
       Space space = Space::Generic;
       size_t vec = 1;
@@ -3084,6 +3107,15 @@ class Parser {
       expect_punct(",");
       (void)parse_operand();  // membermask; the active mask already carries it
       ins.op = op;
+    } else if (op0 == "istypep") {
+      // istypep.<texref|samplerref|surfref> p, a (9.7.12.6).
+      if (parts.size() != 2 || (parts[1] != "texref" && parts[1] != "samplerref" && parts[1] != "surfref"))
+        return unsupported("istypep form (.texref, .samplerref or .surfref)");
+      OpIsTypep op;
+      op.dst = expect_reg_operand("istypep destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
     } else if (op0 == "stacksave" || op0 == "stackrestore" || op0 == "alloca") {
       // The per-thread stack (PTX ISA 9.7.19, sm_52 and later). The type is
       // .u32 or .u64; the ISA's own alloca example leaves it out, so it may be
@@ -3863,7 +3895,7 @@ class Parser {
       std::optional<AtomOp> aop;
       Type ty{};
       bool have_ty = false;
-      bool packed_half = false;
+      bool packed_half = false, b128 = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "global") space = Space::Global;
@@ -3881,12 +3913,25 @@ class Parser {
         else if (p == "dec") aop = AtomOp::Dec;
         else if (p == "f16x2") { ty = Type{Type::Kind::F, 16}; have_ty = true; packed_half = true; }
         else if (p == "bf16x2") { ty = Type{Type::Kind::BF, 16}; have_ty = true; packed_half = true; }
+        else if (p == "b128") { ty = Type{Type::Kind::B, 64}; have_ty = true; b128 = true; }
         else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
         } else return unsupported("atom operation '." + p + "'");
       }
       if (!aop || !have_ty) return unsupported("atom form");
+      if (b128) {
+        // .b128 (PTX ISA 8.3, sm_90): .exch and .cas only.
+        if (*aop != AtomOp::Exch && *aop != AtomOp::Cas)
+          return unsupported("atom.b128 is defined for .exch and .cas only");
+        if (discards) return unsupported(op0 + ".b128");
+        const std::string arch = target_.substr(0, target_.find(','));
+        int sm = 0;
+        std::sscanf(arch.c_str(), "sm_%d", &sm);
+        if (sm < 90)
+          fail(ins.line, "atom.b128 requires sm_90 or later; this module targets " +
+                             (arch.empty() ? std::string("nothing") : arch));
+      }
       // Float atomics are what a reduction, a gradient accumulation, or an
       // embedding backward pass is built out of, so they are not optional for
       // ML work. CUDA exposes add/exch/min/max on float and double; the
@@ -3914,18 +3959,39 @@ class Parser {
       op.space = space;
       op.discards_result = discards;
       op.packed_half = packed_half;
-      if (!discards) {
-        op.dst = expect_reg_operand("atom destination");
+      op.b128 = b128;
+      if (b128) {
+        const auto [lo, hi] = b128_halves("atom.b128 destination");
+        op.dst = lo;
+        op.dst_hi = hi;
         expect_punct(",");
-      }
-      op.addr = parse_addr(fn);
-      if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
-        return unsupported("atom through a parameter/slot name");
-      expect_punct(",");
-      op.b = parse_operand();
-      if (*aop == AtomOp::Cas) {
+        op.addr = parse_addr(fn);
+        if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
+          return unsupported("atom through a parameter/slot name");
         expect_punct(",");
-        op.c = parse_operand();
+        const auto [blo, bhi] = b128_halves("atom.b128 operand b");
+        op.b = RegOperand{blo};
+        op.b_hi = RegOperand{bhi};
+        if (*aop == AtomOp::Cas) {
+          expect_punct(",");
+          const auto [clo, chi] = b128_halves("atom.b128 operand c");
+          op.c = RegOperand{clo};
+          op.c_hi = RegOperand{chi};
+        }
+      } else {
+        if (!discards) {
+          op.dst = expect_reg_operand("atom destination");
+          expect_punct(",");
+        }
+        op.addr = parse_addr(fn);
+        if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
+          return unsupported("atom through a parameter/slot name");
+        expect_punct(",");
+        op.b = parse_operand();
+        if (*aop == AtomOp::Cas) {
+          expect_punct(",");
+          op.c = parse_operand();
+        }
       }
       ins.op = op;
     } else if (op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "min" || op0 == "max" ||

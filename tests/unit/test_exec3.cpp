@@ -4470,6 +4470,159 @@ VTEST(alloca_overflow_freed_memory_and_bad_restores_are_reported) {
   VCHECK_CONTAINS(err.message(), "power of two");
 }
 
+// ---- atom.b128, st.bulk, istypep ----
+
+// The forms CUDA 13.2's ptxas assembles for sm_100a.
+VTEST(b128_atomics_st_bulk_and_istypep_parse_as_ptxas_takes_them) {
+  auto m = ptx::parse(R"(.version 8.7
+.target sm_100a
+.address_size 64
+.visible .entry k(.param .u64 p, .param .u64 h)
+{
+    .reg .pred %p<2>;
+    .reg .b128 %q<4>;
+    .reg .b64 %rd<4>;
+    .reg .b32 %r<4>;
+    .shared .align 16 .b8 sm[256];
+    ld.param.u64 %rd1, [p];
+    ld.param.u64 %rd2, [h];
+    atom.global.cas.b128 %q0, [%rd1], %q1, %q2;
+    atom.exch.b128 %q3, [%rd1], %q1;
+    atom.relaxed.gpu.global.exch.b128 %q3, [%rd1+16], %q2;
+    atom.shared.cas.b128 %q0, [sm], %q1, %q2;
+    istypep.texref %p0, %rd2;
+    istypep.surfref %p1, %rd2;
+    istypep.samplerref %p1, %rd2;
+    mov.u32 %r1, sm;
+    st.bulk.weak.shared::cta [%r1], 64, 0;
+    st.bulk [%rd1], 256, 0;
+    st.bulk.shared::cta [%r1+64], %rd2, 0;
+    ret;
+}
+)");
+  VCHECK_EQ(m.entries.size(), size_t{1});
+}
+
+namespace {
+const char* kHeader100 = ".version 8.7\n.target sm_100\n.address_size 64\n";
+}  // namespace
+
+// atom.cas.b128 swaps all 16 bytes when both halves match, and returns the old
+// value either way; atom.exch.b128 always swaps.
+VTEST(atom_b128_cas_and_exch) {
+  const std::string ptx = std::string(kHeader90) + R"(
+.visible .entry k(.param .u64 p)
+{
+    .reg .b128 %q<4>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [p];
+    ld.global.b128 %q1, [%rd1+16];        // b: the new value
+    ld.global.b128 %q2, [%rd1+32];        // c: what is expected
+    atom.global.cas.b128 %q0, [%rd1], %q2, %q1;
+    st.global.b128 [%rd1+48], %q0;        // old
+    atom.global.cas.b128 %q3, [%rd1], %q2, %q1;
+    st.global.b128 [%rd1+64], %q3;        // no longer matches: unchanged
+    atom.global.exch.b128 %q3, [%rd1+80], %q2;
+    st.global.b128 [%rd1+96], %q3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t p = e.mem.alloc(128);
+  const uint64_t init[] = {0x1111, 0x2222,  0xAAAA, 0xBBBB,  0x1111, 0x2222,  0, 0,  0, 0,  0x5555, 0x6666};
+  e.mem.write(p, init, sizeof init);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(p)}, e.mem, e.prof);
+  uint64_t got[14];
+  e.mem.read(p, got, sizeof got);
+  // cas compares with b (%q2) and stores c (%q1); exch stores b.
+  VCHECK_EQ(got[6], uint64_t{0x1111});   // first cas returned the old value
+  VCHECK_EQ(got[7], uint64_t{0x2222});
+  VCHECK_EQ(got[0], uint64_t{0xAAAA});   // and stored b = %q1
+  VCHECK_EQ(got[1], uint64_t{0xBBBB});
+  VCHECK_EQ(got[8], uint64_t{0xAAAA});   // the second saw b, not c: no swap
+  VCHECK_EQ(got[9], uint64_t{0xBBBB});
+  VCHECK_EQ(got[10], uint64_t{0x1111});  // exch stored %q2
+  VCHECK_EQ(got[11], uint64_t{0x2222});
+  VCHECK_EQ(got[12], uint64_t{0x5555});  // and returned the old value
+  VCHECK_EQ(got[13], uint64_t{0x6666});
+}
+
+VTEST(atom_b128_refuses_what_the_isa_rules_out) {
+  auto parse = [](const char* header, const std::string& ins) {
+    return VCAPTURE(Error, ptx::parse(std::string(header) + ".visible .entry k() { .reg .b128 %q<3>; .reg .b64 %rd<2>; " +
+                                      ins + " ret; }\n"));
+  };
+  VCHECK_CONTAINS(parse(kHeader90, "atom.global.add.b128 %q0, [%rd1], %q1;").message(), ".exch and .cas only");
+  VCHECK_CONTAINS(parse(".version 8.3\n.target sm_86\n.address_size 64\n", "atom.global.exch.b128 %q0, [%rd1], %q1;")
+                      .message(),
+                  "sm_90");
+  const std::string ptx = std::string(kHeader90) +
+                          ".visible .entry k(.param .u64 p) { .reg .b128 %q<2>; .reg .b64 %rd<2>; ld.param.u64 %rd1, [p]; "
+                          "atom.global.exch.b128 %q0, [%rd1+8], %q1; ret; }\n";
+  Env e;
+  const uint64_t p = e.mem.alloc(64);
+  LaunchConfig cfg;
+  auto err = VCAPTURE(Error, exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(p)}, e.mem, e.prof));
+  VCHECK(err.code() == Err::MisalignedAccess);
+}
+
+// st.bulk zeroes exactly its bytes of shared memory; istypep is false for
+// every handle (as on an RTX 3060, for texture and surface objects alike).
+VTEST(st_bulk_zeroes_shared_memory_and_istypep_is_false) {
+  const std::string ptx = std::string(kHeader100) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .shared .align 16 .b8 sm[128];
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, sm;
+    mov.u32 %r2, 0;
+FILL:
+    add.u32 %r3, %r1, %r2;
+    st.shared.u32 [%r3], 0xEEEEEEEE;
+    add.u32 %r2, %r2, 4;
+    setp.lt.u32 %p1, %r2, 128;
+    @%p1 bra FILL;
+    add.u32 %r4, %r1, 16;
+    st.bulk.weak.shared::cta [%r4], 64, 0;
+    mov.u32 %r2, 0;
+COPY:
+    add.u32 %r3, %r1, %r2;
+    ld.shared.u32 %r5, [%r3];
+    cvt.u64.u32 %rd2, %r2;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r5;
+    add.u32 %r2, %r2, 4;
+    setp.lt.u32 %p1, %r2, 128;
+    @%p1 bra COPY;
+    istypep.texref %p0, %rd1;
+    selp.u32 %r6, 1, 0, %p0;
+    st.global.u32 [%rd1+128], %r6;
+    ret;
+}
+)";
+  Env e;
+  const uint64_t out = e.mem.alloc(132);
+  LaunchConfig cfg;
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t i = 0; i < 32; ++i)
+    VCHECK_EQ(e.mem.load_scalar(out + 4 * i, 4), uint64_t{i >= 4 && i < 20 ? 0u : 0xEEEEEEEEu});
+  VCHECK_EQ(e.mem.load_scalar(out + 128, 4), uint64_t{0});
+  auto run_bad = [&](const std::string& ins) {
+    const std::string bad = std::string(kHeader100) + ".visible .entry k(.param .u64 g) { .reg .b64 %rd<2>; "
+                            ".shared .align 16 .b8 sm[64]; .reg .b32 %r<2>; mov.u32 %r1, sm; ld.param.u64 %rd1, [g]; " +
+                            ins + " ret; }\n";
+    return VCAPTURE(Error, exec::launch(ptx::parse(bad).entries[0], cfg, {arg_u64(out)}, e.mem, e.prof));
+  };
+  VCHECK_CONTAINS(run_bad("st.bulk.shared::cta [%r1], 12, 0;").message(), "multiple of 8");
+  VCHECK_CONTAINS(run_bad("st.bulk [%rd1], 16, 0;").message(), "outside shared memory");
+}
+
 // suld/sust's .clamp and .zero out-of-range policies (9.7.13.1-2), against
 // what an RTX 3060 (sm_86, driver 596.36) returned for the same accesses on
 // the same surfaces. The expected values are the card's output, copied.

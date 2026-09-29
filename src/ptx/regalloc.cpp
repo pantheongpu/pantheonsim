@@ -82,6 +82,14 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
         if constexpr (requires { op.member_mask; }) use_operand(op.member_mask);
         if constexpr (requires { op.stride; }) use_operand(op.stride);
         if constexpr (requires { op.addr; }) use_addr(op.addr);
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpAtom>) {
+          if (op.b128) {
+            if (op.dst_hi.id != kNoReg) defs.push_back(op.dst_hi.id);
+            use_operand(op.b_hi);
+            if (op.op == AtomOp::Cas) use_operand(op.c_hi);
+          }
+        }
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpStBulk>) use_operand(op.size);
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpBar> ||
                       std::is_same_v<std::decay_t<decltype(op)>, OpBarRed>) {
           use_operand(op.id);

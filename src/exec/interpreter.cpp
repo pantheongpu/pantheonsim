@@ -3660,6 +3660,19 @@ class Interpreter {
       write_reg(w, op->dst, m, r, dt.bits);
       return;
     }
+    if (const auto* op = std::get_if<OpIsTypep>(&ins.op)) {
+      // istypep (9.7.12.6): no handle here is a .texref/.samplerref/.surfref
+      // variable -- those went with CUDA 12's texture references -- and on an
+      // RTX 3060 it is false for texture and surface objects and any other
+      // value alike, so it is false.
+      Mask& p = pred_slot(w, op->dst);
+      p &= ~m;
+      return;
+    }
+    if (const auto* op = std::get_if<OpStBulk>(&ins.op)) {
+      exec_st_bulk(w, ctx, ins, *op, m);
+      return;
+    }
     if (const auto* op = std::get_if<OpAtom>(&ins.op)) {
       exec_atom(w, ctx, ins, *op, m);
       return;
@@ -10465,6 +10478,73 @@ class Interpreter {
     }
   }
 
+  // st.bulk (9.7.10.14, sm_100): each thread zeroes its `size` bytes of
+  // shared memory, a multiple of 8 and at most 16 MiB. Outside the shared
+  // window, or with any other size, the ISA leaves it undefined; here it is
+  // reported.
+  void exec_st_bulk(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpStBulk& op, Mask m) {
+    Lanes _s_base, _s_size;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
+    const Lanes& size = read_operand(w, ctx, ins, op.size, _s_size);
+    const uint64_t sbase = op.shared ? kSharedVaBase : 0;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const int li = static_cast<int>(lane);
+      const uint64_t at = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+      const uint64_t n = size[lane];
+      if (n % 8 || n > (uint64_t{1} << 24))
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "st.bulk of " + std::to_string(n) + " bytes; the size must be a multiple of 8 up to 16 MiB");
+      if (!is_shared(at) || (n && !is_shared(at + n - 1)))
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "st.bulk outside shared memory, which the ISA leaves undefined");
+      if (at % 8)
+        ctx_fail(ins, li, Err::MisalignedAccess, "st.bulk at an address not aligned to 8 bytes");
+      for (uint64_t off = 0; off < n; off += 8) store_routed(w, ctx, ins, lane, at + off, 8, 0);
+    }
+  }
+
+  // atom.{exch,cas}.b128 (sm_90): 16 aligned bytes read, and replaced by b
+  // (exch), or by c if they equal b (cas), under the same striped lock the
+  // other atomics take -- 16-byte atomicity is promised against other atomics.
+  void exec_atom128(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    Lanes _s_base, s1, s2, s3, s4;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
+    const Lanes& blo = read_operand(w, ctx, ins, op.b, s1);
+    const Lanes& bhi = read_operand(w, ctx, ins, op.b_hi, s2);
+    const bool cas = op.op == AtomOp::Cas;
+    Lanes clo{}, chi{};
+    if (cas) {
+      clo = read_operand(w, ctx, ins, op.c, s3);
+      chi = read_operand(w, ctx, ins, op.c_hi, s4);
+    }
+    const uint64_t sbase = space_base(op.space);
+    const bool lock_needed = concurrent_ && op.space != Space::Shared && op.space != Space::Local;
+    Lanes lo{}, hi{};
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+      if (addr % 16)
+        ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
+                 "atom.b128 at an address not aligned to 16 bytes");
+      std::unique_lock<std::mutex> guard;
+      if (lock_needed) guard = std::unique_lock<std::mutex>(atomic_lock_for(addr));
+      ++stats_.atomics;
+      stats_.atomic_bytes += 16;
+      lo[lane] = load_routed(w, ctx, ins, lane, addr, 8);
+      hi[lane] = load_routed(w, ctx, ins, lane, addr + 8, 8);
+      if (!cas) {
+        store_routed(w, ctx, ins, lane, addr, 8, blo[lane]);
+        store_routed(w, ctx, ins, lane, addr + 8, 8, bhi[lane]);
+      } else if (lo[lane] == blo[lane] && hi[lane] == bhi[lane]) {
+        store_routed(w, ctx, ins, lane, addr, 8, clo[lane]);
+        store_routed(w, ctx, ins, lane, addr + 8, 8, chi[lane]);
+      }
+    }
+    write_reg(w, op.dst, m, lo, 64);
+    write_reg(w, op.dst_hi, m, hi, 64);
+  }
+
   // The video instructions (PTX ISA 9.7.20), as an RTX 3060 computes them
   // (nvidia/tests/e2e/video_forms.cu, 652 variants): ptxas emulates them on
   // sm_70+, and where that departs from the ISA's pseudocode the card is what
@@ -10653,6 +10733,10 @@ class Interpreter {
   }
 
   void exec_atom(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    if (op.b128) {
+      exec_atom128(w, ctx, ins, op, m);
+      return;
+    }
     // The access width is not the element width for the half forms: an
     // f16x2 atomic reads and writes a whole 32-bit word, and a scalar f16 one
     // touches 2 bytes. Taking the width from the element type alone is what

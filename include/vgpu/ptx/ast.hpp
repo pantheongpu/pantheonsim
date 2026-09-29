@@ -886,7 +886,21 @@ struct OpNotPred { Reg dst; Reg src; };
 // old value. nvcc emits it whenever the result of an atomicAdd() is unused,
 // which in a reduction or a histogram is every call, so a kernel full of
 // atomics can easily contain no `atom` at all.
-struct OpAtom { AtomOp op = AtomOp::Add; Space space = Space::Generic; Type ty; Reg dst; Addr addr; Operand b; Operand c; bool discards_result = false; bool packed_half = false; };
+struct OpAtom {
+  AtomOp op = AtomOp::Add; Space space = Space::Generic; Type ty; Reg dst; Addr addr; Operand b; Operand c;
+  bool discards_result = false; bool packed_half = false;
+  // .b128 (sm_90, exch and cas only): each 128-bit operand is a .b128
+  // register's two 64-bit halves -- dst/b/c the low ones, these the high.
+  bool b128 = false;
+  Reg dst_hi;
+  Operand b_hi, c_hi;
+};
+// istypep.<texref|samplerref|surfref> p, a: whether a is an opaque variable of
+// that type.
+struct OpIsTypep { Reg dst; Operand src; };
+// st.bulk{.weak}{.shared::cta} [a], size, 0 (sm_100): zero `size` bytes of
+// shared memory.
+struct OpStBulk { Addr addr; Operand size; bool shared = false; };
 struct OpBra { size_t target = 0; std::string label; };  // target = instruction index
 // bar.sync / barrier.sync / bar.arrive on one of the CTA's sixteen barriers,
 // and bar.warp.sync (`warp`), which only reconverges the warp. With a count,
@@ -1043,7 +1057,7 @@ struct OpCall {
 };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtTf32, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf, OpStack,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtTf32, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf, OpIsTypep, OpStBulk, OpStack,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy>;
 
