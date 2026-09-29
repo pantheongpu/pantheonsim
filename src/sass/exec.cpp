@@ -30,6 +30,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tma.hpp"
+#include "vgpu/exec/tcgen05.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #if __has_include("vgpu/host_cpus.hpp")
 #include "vgpu/host_cpus.hpp"
@@ -137,6 +138,7 @@ struct Block {
     bool arrived_all = false;
   };
   std::unordered_map<uint32_t, MbarSide> mbar;
+  exec::TensorMemory tmem;      // sm_100's Tensor Memory (tcgen05)
   exec::LaunchStats st;   // this block's counts, folded into the launch's
 };
 
@@ -239,6 +241,7 @@ class Runner {
   uint64_t mbar_arrive(Block& blk, uint32_t off, uint32_t arrivals, int64_t tx, bool drop);
   uint64_t mbar_arrive80(Block& blk, uint32_t off);
   void exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex);   // TMA and bulk copies
+  void exec_tcgen05(Block& blk, Warp& w, const Instr& ins, Mask ex);   // sm_100's tensor core
   Block& shared_block(Block& blk, uint64_t addr, uint32_t* off);
   Block& cluster_block(Block& blk, uint32_t rank);
   void run_cluster(uint64_t k);                          // one cluster's blocks, together
@@ -627,6 +630,7 @@ void Runner::init_block(Block& blk, uint64_t linear) {
   for (Block::Barrier& b : blk.bars) b = Block::Barrier{};
   blk.mbar.clear();
   blk.gmma.clear();
+  blk.tmem = exec::TensorMemory{};
 }
 
 exec::LaunchStats Runner::run() {
