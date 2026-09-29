@@ -77,6 +77,26 @@ VTEST(every_amd_profile_has_hips_limits) {
   VCHECK(amd >= 6);
 }
 
+// The driver keeps 1 KiB of every block's shared memory from compute
+// capability 8.0, and that is exactly what separates each measured card's
+// per-SM shared memory from its per-block opt-in; before 8.0 the two agree.
+// cudaDevAttrReservedSharedMemoryPerBlock and occupancy arithmetic rely on it.
+VTEST(every_nvidia_profile_reserves_what_separates_sm_from_block_shared_memory) {
+  int nvidia = 0;
+  for (const auto& id : vgpu::available_gpus()) {
+    const DeviceProfile p = vgpu::load_gpu(id);
+    if (p.vendor != "nvidia") continue;
+    ++nvidia;
+    VCHECK_EQ(p.reserved_smem_per_block(), p.cc_major >= 8 ? 1024u : 0u);
+    VCHECK_EQ(p.limits.shared_mem_per_sm - p.limits.shared_mem_per_block_optin, p.reserved_smem_per_block());
+  }
+  VCHECK(nvidia >= 10);
+  for (const auto& id : vgpu::available_gpus()) {
+    const DeviceProfile p = vgpu::load_gpu(id);
+    if (p.vendor == "amd") VCHECK_EQ(p.reserved_smem_per_block(), 0u);
+  }
+}
+
 VTEST(h100_profile_values) {
   DeviceProfile p = vgpu::load_gpu("nvidia/h100");
   VCHECK_EQ(p.architecture, "hopper");

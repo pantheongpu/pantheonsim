@@ -1299,7 +1299,11 @@ VGPU_EXPORT cudaError_t cudaGetDeviceProperties(cudaDeviceProp* prop, int device
     prop->maxBlocksPerMultiProcessor = static_cast<int>(p.limits.max_blocks_per_sm);
     prop->sharedMemPerBlock = p.limits.shared_mem_per_block;
     prop->sharedMemPerBlockOptin = p.limits.shared_mem_per_block_optin;
-    prop->sharedMemPerMultiprocessor = p.limits.shared_mem_per_block_optin;
+    // The SM's whole shared memory, not the per-block opt-in: the two differ
+    // by the reserved 1 KiB from compute capability 8.0, and occupancy
+    // arithmetic that adds the reservation to a full-size block needs it.
+    prop->sharedMemPerMultiprocessor = p.limits.shared_mem_per_sm;
+    prop->reservedSharedMemPerBlock = p.reserved_smem_per_block();
     prop->regsPerBlock = static_cast<int>(p.limits.registers_per_block);
     prop->maxThreadsDim[0] = static_cast<int>(p.limits.max_block_dim[0]);
     prop->maxThreadsDim[1] = static_cast<int>(p.limits.max_block_dim[1]);
@@ -1356,6 +1360,7 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, 
       case cudaDevAttrMaxSharedMemoryPerBlock: *value = static_cast<int>(p.limits.shared_mem_per_block); break;
       case cudaDevAttrMaxSharedMemoryPerBlockOptin: *value = static_cast<int>(p.limits.shared_mem_per_block_optin); break;
       case cudaDevAttrMaxSharedMemoryPerMultiprocessor: *value = static_cast<int>(p.limits.shared_mem_per_sm); break;
+      case cudaDevAttrReservedSharedMemoryPerBlock: *value = static_cast<int>(p.reserved_smem_per_block()); break;
       case cudaDevAttrMaxRegistersPerBlock: *value = static_cast<int>(p.limits.registers_per_block); break;
       case cudaDevAttrMaxRegistersPerMultiprocessor: *value = static_cast<int>(p.limits.registers_per_sm); break;
       case cudaDevAttrMaxThreadsPerMultiProcessor: *value = static_cast<int>(p.limits.max_threads_per_sm); break;
