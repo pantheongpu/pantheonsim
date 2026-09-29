@@ -48,6 +48,11 @@ echo "wrote $(pwd)/cooperative.gfx942, cooperative.gfx942.o and its listing ($(w
 "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 api.cpp -o api.gfx942
 echo "wrote $(pwd)/api.gfx942"
 
+# HIP's copies, fills and allocations of every shape, and managed memory's
+# advice.
+"$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 memory.cpp -o memory.gfx942
+echo "wrote $(pwd)/memory.gfx942"
+
 # Streams that run at once: kernels on two streams handing values to each
 # other, events, stream waits, the null stream's ordering, host functions.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 streams.cpp -o streams.gfx942

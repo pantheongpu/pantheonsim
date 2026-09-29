@@ -261,6 +261,18 @@ echo "$out" | sed 's/^/      /'
 expect "the API program runs to the end" "0" "$status"
 expect "every one of its checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# HIP's copies, fills and allocations of every shape (hipcc/memory.cpp):
+# pitched memory, 2D and 3D copies with offsets, the driver API's forms,
+# memsets of each width, who waits for what, peer copies, managed memory's
+# advice, pools (exported and imported through a file descriptor), virtual
+# memory at page granularity and graph memory's counters.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$shim" timeout 300 \
+      "$(dirname "$exe")/memory.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the memory program runs to the end" "0" "$status"
+expect "every one of its checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)

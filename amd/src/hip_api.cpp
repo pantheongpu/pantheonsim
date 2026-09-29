@@ -15,6 +15,7 @@
 #include <chrono>
 #include <thread>
 #include <climits>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,8 @@
 #include <mutex>
 #include <string>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
 
@@ -234,6 +237,9 @@ struct Stream {
   // hipStreamSetAttribute's values, by attribute, kept as set: none changes
   // how the stream runs here. The synchronization policy starts at Auto.
   std::map<int, vgpu::amd::abi::LaunchAttributeValue> attrs;
+  // How far into each other queue this stream has waited (hipStreamWaitEvent):
+  // memory freed there before that point is the stream's to reuse.
+  std::map<const Queue*, uint64_t> waited;
 
   static unsigned long long next_stream_id() {
     static std::atomic<unsigned long long> next{1};
@@ -241,15 +247,68 @@ struct Stream {
   }
 };
 
-// A stream-ordered memory pool. Nothing freed to it is held back, so what it
-// has reserved is what is in use, and its attributes are what was set.
+// What graphs' allocation nodes have taken from a device.
+struct GraphMemory {
+  uint64_t used = 0, used_high = 0;
+};
+
+// A stream-ordered memory pool. What is freed to it is kept for reuse until
+// a synchronization finds more kept than the release threshold, or a trim
+// asks for less: a block freed in a stream is the next allocation's in that
+// stream at once (the stream's order keeps the two apart), and another
+// stream's where it waited past the free, or once the free has run, as the
+// reuse attributes allow. What it holds in use and kept is what it has
+// reserved; its attributes are what was set.
 struct Pool {
   int device = 0;
   bool destroyed = false;
+  std::map<int, int> access;   // other devices' hipMemAccessFlags, as granted
   uint64_t release_threshold = 0;
+  uint64_t max_size = 0;       // 0: as much as the device has
   int reuse[4] = {0, 1, 1, 1};   // by hipMemPoolAttr 1 to 3
-  uint64_t used = 0, used_high = 0;
+  int handle_types = 0;          // hipMemAllocationHandleType it may be exported as
+  // A pool exported to other processes, or imported from one, reads and
+  // writes its grants through this file (PoolShare, below); -1 if neither.
+  int share_fd = -1;
+  bool imported = false;
+  uint64_t used = 0, used_high = 0, reserved_high = 0;
+  struct Kept {
+    uint64_t va = 0, size = 0;
+    std::shared_ptr<Queue> queue;   // where it was freed, and at which item
+    uint64_t seq = 0;
+  };
+  std::vector<Kept> kept;
+  uint64_t reserved() const {
+    uint64_t r = used;
+    for (const Kept& k : kept) r += k.size;
+    return r;
+  }
 };
+
+// A shared pool's file: who made the pool, on which device, and what each
+// device has been granted, which both processes read as it changes.
+struct PoolShare {
+  uint32_t magic, version, pid;
+  int32_t device;
+  int32_t access[64];   // hipMemAccessFlags by device; the pool's own is read-write
+};
+constexpr uint32_t kPoolShareMagic = 0x48505348;   // "HPSH"
+void publish_pool_access(const Pool& p) {
+  if (p.share_fd < 0) return;
+  int32_t access[64] = {};
+  for (const auto& [dev, flags] : p.access)
+    if (dev >= 0 && dev < 64) access[dev] = flags;
+  (void)!::pwrite(p.share_fd, access, sizeof access, offsetof(PoolShare, access));
+}
+void refresh_pool_access(Pool& p) {
+  if (p.share_fd < 0 || !p.imported) return;
+  int32_t access[64];
+  if (::pread(p.share_fd, access, sizeof access, offsetof(PoolShare, access)) != sizeof access) return;
+  p.access.clear();
+  for (int dev = 0; dev < 64; ++dev)
+    if (access[dev] && dev != p.device) p.access[dev] = access[dev];
+}
+std::map<void*, int> g_pool_imports;   // imported pool pointer -> the device it was mapped on
 
 struct State {
   std::mutex mutex;
@@ -292,6 +351,13 @@ struct State {
   std::map<int, unsigned> device_flags;
   // Each device's scratch limit, as last set (shared::scratch_limit).
   std::map<int, size_t> scratch_limit;
+  // The pool hipMallocAsync takes from, by device, where a program set one.
+  std::map<int, Pool*> current_pools;
+  // Virtual memory another device was granted: by mapped range, each
+  // device's hipMemAccessFlags.
+  std::map<std::pair<uint64_t, uint64_t>, std::map<int, int>> vmm_access;
+  // What graphs have allocated on each device, now and at most.
+  std::map<int, struct GraphMemory> graph_memory;
   // Device allocations, by where they start, whose copies are always
   // synchronous (HIP_POINTER_ATTRIBUTE_SYNC_MEMOPS, set by
   // hipPointerSetAttribute).
@@ -518,6 +584,10 @@ PerThreadStreams::~PerThreadStreams() {
   }
   for (const auto& q : qs) q->drain();
 }
+
+// At a synchronization, the stream-ordered pools give back what they keep
+// beyond their release thresholds (see Pool).
+void release_to_thresholds(State& s);
 
 hipError_t drain_device(int device, bool blocking_only = false) {
   State& s = state();
@@ -884,11 +954,26 @@ char g_contexts[64];
 // Host memory kernels reach: see hipHostMalloc.
 std::mutex g_host_mutex;
 std::map<uint64_t, size_t> g_host_allocations;   // hipHostMalloc
-std::map<uint64_t, size_t> g_host_registered;    // hipHostRegister
+// hipHostRegister: each registration as made, by address, which may overlap
+// (ROCm's HIP refuses none), and the ranges they cover together -- what the
+// devices map, and what lookups by address go by.
+std::map<uint64_t, size_t> g_host_registrations;
+std::map<uint64_t, size_t> g_host_registered;
 std::map<uint64_t, size_t> g_managed;            // hipMallocManaged
 // The flags each pinned allocation was made with, which hipHostGetFlags
 // gives back as they were given.
 std::map<uint64_t, unsigned> g_host_flags;
+int owner_of(State& s, uint64_t va);
+
+// The advice managed memory was given, page by page (see hipMemAdvise).
+struct PageAdvice {
+  bool read_mostly = false;
+  int preferred = -2;          // a device, hipCpuDeviceId (-1), or hipInvalidDeviceId (-2): none
+  int last_prefetch = -2;
+  bool coarse = false;         // hipMemAdviseSetCoarseGrain
+  std::set<int> accessed_by;   // devices, and hipCpuDeviceId
+};
+std::map<uint64_t, std::vector<PageAdvice>> g_advice;   // by managed allocation, under g_host_mutex
 
 void map_host_everywhere(State& s, void* p, size_t n) {
   for (int d = 0; d < s.rt->device_count(); ++d)
@@ -896,6 +981,30 @@ void map_host_everywhere(State& s, void* p, size_t n) {
 }
 void unmap_host_everywhere(State& s, void* p) {
   for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(reinterpret_cast<uint64_t>(p));
+}
+// Brings the devices' mappings of registered memory, and g_host_registered,
+// to the union of the registrations: ranges no longer covered are unmapped
+// and new ones mapped. Under g_host_mutex.
+void remap_registered(State& s) {
+  std::map<uint64_t, size_t> merged;
+  for (const auto& [lo, n] : g_host_registrations) {
+    const uint64_t hi = lo + n;
+    if (!merged.empty()) {
+      auto& [last_lo, last_n] = *std::prev(merged.end());
+      if (lo <= last_lo + last_n) {
+        last_n = std::max<uint64_t>(last_lo + last_n, hi) - last_lo;
+        continue;
+      }
+    }
+    merged[lo] = n;
+  }
+  for (const auto& [lo, n] : g_host_registered)
+    if (const auto it = merged.find(lo); it == merged.end() || it->second != n)
+      unmap_host_everywhere(s, reinterpret_cast<void*>(lo));
+  for (const auto& [lo, n] : merged)
+    if (const auto it = g_host_registered.find(lo); it == g_host_registered.end() || it->second != n)
+      map_host_everywhere(s, reinterpret_cast<void*>(lo), n);
+  g_host_registered = std::move(merged);
 }
 // The range of m holding va, or m.end().
 std::map<uint64_t, size_t>::const_iterator find_range(const std::map<uint64_t, size_t>& m, uint64_t va) {
@@ -935,163 +1044,238 @@ bool host_free(State& s, void* ptr, std::map<uint64_t, size_t>& m) {
   if (s.rt) unmap_host_everywhere(s, ptr);
   m.erase(it);
   g_host_flags.erase(reinterpret_cast<uint64_t>(ptr));
+  g_advice.erase(reinterpret_cast<uint64_t>(ptr));
   std::free(ptr);
   return true;
 }
 
 
-// Whether host memory is the runtime's own -- pinned, registered or managed
-// -- which a stream may read or write after the call that named it returned.
-bool pinned(const void* p) {
+// ---- Copies and fills of every shape ------------------------------------------
+//
+// A region is `depth` slices of `rows` rows of `width` bytes, the rows `pitch`
+// bytes apart and the slices `slice` bytes apart: one row for a plain copy, a
+// plane for a 2D one, a box for a 3D one. Every copy and fill HIP has is one
+// region (a copy has one on each side, of the same shape), queued as one piece
+// of its stream's work.
+struct Region {
+  uint64_t width = 0, rows = 1, depth = 1, pitch = 0, slice = 0;
+  bool empty() const { return !width || !rows || !depth; }
+  // How far the region reaches from its start, or false where that does not
+  // fit in 64 bits (and so reaches past any allocation).
+  bool reach(uint64_t* bytes) const {
+    uint64_t a = 0, b = 0;
+    if (__builtin_mul_overflow(depth - 1, slice, &a) || __builtin_mul_overflow(rows - 1, pitch, &b) ||
+        __builtin_add_overflow(a, b, &a) || __builtin_add_overflow(a, width, &a))
+      return false;
+    *bytes = a;
+    return true;
+  }
+  uint64_t bytes() const { return width * rows * depth; }
+};
+
+// Where an address is: in a device's memory (`mem` set, `device` true), host
+// memory the runtime keeps mapped for every device (pinned, registered or
+// managed: `mem` set, `device` false), or the program's own pageable memory
+// (`mem` null). Device memory has to be inside what was allocated, or
+// mapped, for all of the region -- checked now, so the call that asked is
+// the one refused. The caller holds s.mutex.
+struct Side {
+  vgpu::MemoryManager* mem = nullptr;
+  bool device = false;
+  int ordinal = -1;   // the device whose memory it is, where it is a device's
+};
+hipError_t locate(State& s, const void* p, const Region& r, Side* side) {
   const uint64_t va = reinterpret_cast<uint64_t>(p);
-  std::lock_guard<std::mutex> host_lock(g_host_mutex);
-  return find_range(g_host_allocations, va) != g_host_allocations.end() ||
-         find_range(g_host_registered, va) != g_host_registered.end() || find_range(g_managed, va) != g_managed.end();
+  for (int i = 0; i < s.rt->device_count(); ++i) {
+    vgpu::MemoryManager& m = s.rt->device(i).memory();
+    if (!m.owns(va)) continue;
+    side->mem = &m;
+    side->ordinal = i;
+    uint64_t base = 0, size = 0, reach = 0;
+    if (m.is_host_mapped(va)) {   // pinned, registered or managed host memory: inside what was allocated
+      std::lock_guard<std::mutex> host_lock(g_host_mutex);
+      for (const auto* hm : {&g_host_allocations, &g_host_registered, &g_managed})
+        if (const auto it = find_range(*hm, va); it != hm->end()) {
+          if (!r.reach(&reach) || reach > it->second - (va - it->first))
+            return fail(hipErrorInvalidValue, "the region runs past the end of the host memory it starts in");
+          return hipSuccess;
+        }
+      return hipSuccess;
+    }
+    side->device = true;
+    bool readable = false, writable = false;
+    if (m.find_allocation(va, &base, &size)) {
+      if (!r.reach(&reach) || reach > size - (va - base))
+        return fail(hipErrorInvalidValue, "the region runs past the end of the allocation it starts in");
+      return hipSuccess;
+    }
+    if (m.access_at(va, &readable, &writable)) return hipSuccess;   // virtual memory, mapped
+    return fail(hipErrorInvalidValue, "that address is not in any allocation");
+  }
+  return hipSuccess;   // the program's own host memory
 }
 
-// A copy in `stream`'s order. Addresses are unified: a device pointer says
-// which device's memory it is, so a device-to-device copy may run between
-// two devices, as HIP's does, and whether a device owns an address is what
-// tells device memory from host memory, for every kind. An asynchronous copy from host
-// memory the runtime did not pin takes its bytes now, since the program may
-// change them once the call returns, and one into such memory is waited for
-// -- both as HIP does them. `async` false is a synchronous copy, on the null
-// stream when `stream` is. `rows` rows of `bytes` each, `dpitch` and
-// `spitch` apart, make a 2D copy: one piece of the stream's work, as HIP's is.
-hipError_t copy_in_order(void* dst, const void* src, size_t bytes, hipMemcpyKind kind, hipStream_t stream,
-                         bool async, size_t rows = 1, size_t dpitch = 0, size_t spitch = 0) {
+// A copy between two regions of one shape, in `stream`'s order. Addresses
+// are unified: where each side is comes from its address, whatever the kind
+// says, as ROCm's HIP finds each pointer's allocation -- a "host to host"
+// copy into device memory is a copy into device memory -- and a copy may run
+// between two devices. The kind only has to be one HIP knows (1024, device
+// to device without compute units, is one).
+//
+// When the caller waits is ROCm's HIP's: a synchronous copy until it is done
+// -- except one from device memory to device memory, which is queued and
+// returned from at once (still in the stream's order, so what reads the
+// result after it sees it) unless either allocation asked for synchronous
+// copies (hipPointerSetAttribute); an asynchronous one not at all, except
+// into the program's own pageable memory, which it must have when the call
+// returns, and from host memory to host memory, which is a plain memcpy. An
+// asynchronous copy from pageable memory takes its bytes when it is called.
+hipError_t copy_region(void* dst, const Region& dr, const void* src, const Region& sr, hipMemcpyKind kind,
+                       hipStream_t stream, bool async) {
   State& s = state();
-  vgpu::MemoryManager *to = nullptr, *from = nullptr;
+  Side to, from;
   vgpu::runtime::Device* d = nullptr;
-  bool to_device = false, from_device = false, to_host = false, from_host = false;
   int ordinal = 0;
   const uint64_t dst_va = reinterpret_cast<uint64_t>(dst), src_va = reinterpret_cast<uint64_t>(src);
   {
     std::lock_guard<std::mutex> lock(s.mutex);
     d = device(s);
     if (!d) return hipErrorInvalidDevice;
-    if (!bytes || !rows) return hipSuccess;
-    if (!dst || !src) return hipErrorInvalidValue;
-    // A 2D copy's rows fit its pitches, however many rows it has.
-    if ((rows > 1 || dpitch || spitch) && (bytes > dpitch || bytes > spitch)) return hipErrorInvalidPitchValue;
-    ordinal = s.current;
-    // The current device's memory answers for an address no device owns, and
-    // says what is wrong with it.
-    auto owner = [&](uint64_t va) -> vgpu::MemoryManager* {
-      for (int i = 0; i < s.rt->device_count(); ++i)
-        if (s.rt->device(i).memory().owns(va)) return &s.rt->device(i).memory();
-      return &d->memory();
-    };
-    to = owner(dst_va);
-    from = owner(src_va);
-    // Where each side is comes from the address, whatever the kind says, as
-    // ROCm's HIP finds each pointer's allocation: a "host to host" copy into
-    // device memory is still a copy into device memory. The kind only has to
-    // be one HIP knows.
     if (kind != hipMemcpyDefault && kind != hipMemcpyHostToHost && kind != hipMemcpyHostToDevice &&
-        kind != hipMemcpyDeviceToHost && kind != hipMemcpyDeviceToDevice)
+        kind != hipMemcpyDeviceToHost && kind != hipMemcpyDeviceToDevice && kind != 1024 /* NoCU */)
       return hipErrorInvalidMemcpyDirection;
-    to_device = to->owns(dst_va);
-    from_device = from->owns(src_va);
-    // Pinned, registered and managed host memory is reached through every
-    // device's memory too, but it is host memory: a copy from it is a copy
-    // from the host, as a profiler is told and as it waits.
-    to_host = to_device && to->is_host_mapped(dst_va);
-    from_host = from_device && from->is_host_mapped(src_va);
-    // A synchronous copy from device memory to device memory is, in ROCm's
-    // HIP, queued and returned from at once -- still in the stream's order,
-    // so whatever reads the result after it sees it -- unless either side's
-    // allocation asked for synchronous copies (hipPointerSetAttribute).
-    // Its ranges are checked now, so a copy past an allocation's end is
-    // still refused by the call that asked for it.
-    if (!async && to_device && from_device && !to_host && !from_host) {
-      uint64_t dbase = 0, dsize = 0, sbase = 0, ssize = 0;
-      const bool found = to->find_allocation(dst_va, &dbase, &dsize) && from->find_allocation(src_va, &sbase, &ssize);
-      const uint64_t dspan = (rows - 1) * (rows > 1 ? dpitch : 0) + bytes,
-                     sspan = (rows - 1) * (rows > 1 ? spitch : 0) + bytes;
-      if (found && !s.sync_memops.count(dbase) && !s.sync_memops.count(sbase)) {
-        if (dst_va - dbase + dspan > dsize || src_va - sbase + sspan > ssize)
-          return fail(hipErrorInvalidValue, "the copy runs past the end of an allocation");
-        async = true;
-      }
+    if (dr.empty()) return hipSuccess;
+    if (!dst || !src) return hipErrorInvalidValue;
+    ordinal = s.current;
+    if (const hipError_t e = locate(s, dst, dr, &to); e != hipSuccess) return e;
+    if (const hipError_t e = locate(s, src, sr, &from); e != hipSuccess) return e;
+    if (!async && to.device && from.device) {
+      uint64_t dbase = 0, sbase = 0, size = 0;
+      const bool dsync = to.mem->find_allocation(dst_va, &dbase, &size) && s.sync_memops.count(dbase);
+      const bool ssync = from.mem->find_allocation(src_va, &sbase, &size) && s.sync_memops.count(sbase);
+      if (!dsync && !ssync) async = true;
     }
   }
-  if (rows == 1) dpitch = spitch = bytes;
+  // Each side is reached through a device's memory where the runtime has it
+  // (device memory, and host memory it maps), and directly otherwise.
+  const bool to_device = to.mem != nullptr, from_device = from.mem != nullptr;
+  // A synchronous copy of another device's memory also comes after what that
+  // device's blocking streams were given: it is ordered on the device the
+  // memory is on, as ROCm's HIP orders it, as well as the current one.
+  if (!async)
+    for (const Side* side : {&to, &from})
+      if (side->device && side->ordinal != ordinal) drain_device(side->ordinal, true);
   bool wait = !async;
-  // An asynchronous copy's unpinned source is taken now, row after row,
-  // packed.
+  if (async && (!to.mem || (!to.device && !from.device))) wait = true;
+  const uint64_t w = dr.width, rows = dr.rows, depth = dr.depth;
+  // An asynchronous copy's unpinned source is taken now, packed.
   std::shared_ptr<std::vector<uint8_t>> staged;
-  if (async && !from_device && !pinned(src)) {
-    staged = std::make_shared<std::vector<uint8_t>>(bytes * rows);
-    for (size_t r = 0; r < rows; ++r)
-      std::memcpy(staged->data() + r * bytes, static_cast<const uint8_t*>(src) + r * spitch, bytes);
+  if (!wait && !from.mem) {
+    staged = std::make_shared<std::vector<uint8_t>>(dr.bytes());
+    for (uint64_t z = 0; z < depth; ++z)
+      for (uint64_t y = 0; y < rows; ++y)
+        std::memcpy(staged->data() + (z * rows + y) * w, static_cast<const uint8_t*>(src) + z * sr.slice + y * sr.pitch,
+                    w);
   }
-  if (async && !to_device && !pinned(dst)) wait = true;
+  vgpu::MemoryManager *tm = to.mem, *fm = from.mem;
   auto work = [=] {
     const uint64_t start = vgpu::amd::hipprof::now_ns();
     try {
-      std::vector<uint8_t> buf(to_device && from_device ? bytes : 0);
-      for (size_t r = 0; r < rows; ++r) {
-        const uint64_t dva = dst_va + r * dpitch, sva = src_va + r * spitch;
-        const void* source = staged ? static_cast<const void*>(staged->data() + r * bytes)
-                                    : reinterpret_cast<const void*>(sva);
-        if (to_device && from_device) {
-          from->read(sva, buf.data(), bytes);
-          to->write(dva, buf.data(), bytes);
-        } else if (to_device) {
-          to->write(dva, source, bytes);
-        } else if (from_device) {
-          from->read(sva, reinterpret_cast<void*>(dva), bytes);
-        } else {
-          std::memcpy(reinterpret_cast<void*>(dva), source, bytes);
+      std::vector<uint8_t> buf(to_device && from_device ? w : 0);
+      for (uint64_t z = 0; z < depth; ++z)
+        for (uint64_t y = 0; y < rows; ++y) {
+          const uint64_t dva = dst_va + z * dr.slice + y * dr.pitch, sva = src_va + z * sr.slice + y * sr.pitch;
+          const void* source = staged ? static_cast<const void*>(staged->data() + (z * rows + y) * w)
+                                      : reinterpret_cast<const void*>(sva);
+          if (to_device && from_device) {
+            fm->read(sva, buf.data(), w);
+            tm->write(dva, buf.data(), w);
+          } else if (to_device) {
+            tm->write(dva, source, w);
+          } else if (from_device) {
+            fm->read(sva, reinterpret_cast<void*>(dva), w);
+          } else {
+            std::memmove(reinterpret_cast<void*>(dva), source, w);
+          }
         }
-      }
     } catch (const std::exception& e) {
       return fail(hipErrorInvalidValue, e.what());
     }
-    d->note_transfer(bytes * rows, 0.0);
+    d->note_transfer(dr.bytes(), 0.0);
     if (const auto* p = profiler(); p && p->copied) {
+      // Pinned, registered and managed memory is the host's, as a profiler
+      // is told.
       using vgpu::amd::hipprof::Copy;
-      const bool into = to_device && !to_host, out_of = from_device && !from_host;
-      const Copy k = into && out_of ? Copy::DeviceToDevice
-                     : into         ? Copy::HostToDevice
-                     : out_of       ? Copy::DeviceToHost
-                                    : Copy::HostToHost;
-      p->copied(k, ordinal, ordinal, bytes * rows, dst_va, src_va, start, vgpu::amd::hipprof::now_ns());
+      const Copy k = to.device && from.device ? Copy::DeviceToDevice
+                     : to.device             ? Copy::HostToDevice
+                     : from.device           ? Copy::DeviceToHost
+                                             : Copy::HostToHost;
+      p->copied(k, ordinal, ordinal, dr.bytes(), dst_va, src_va, start, vgpu::amd::hipprof::now_ns());
     }
     return hipSuccess;
   };
   return in_order(stream, work, wait);
 }
 
-// `bytes` bytes of a repeating pattern, in `stream`'s order.
-hipError_t fill_in_order(void* dst, const uint8_t* pattern, uint32_t pattern_len, uint64_t bytes, hipStream_t stream,
-                         bool async) {
+// A copy of `bytes`, or of `rows` rows of them `dpitch` and `spitch` apart.
+// A 2D copy's rows have to fit its pitches.
+hipError_t copy_in_order(void* dst, const void* src, size_t bytes, hipMemcpyKind kind, hipStream_t stream,
+                         bool async, size_t rows = 1, size_t dpitch = 0, size_t spitch = 0) {
+  const bool two_d = rows > 1 || dpitch || spitch;
+  if (two_d && bytes && rows && (bytes > dpitch || bytes > spitch)) return hipErrorInvalidPitchValue;
+  if (!two_d) dpitch = spitch = bytes;
+  return copy_region(dst, Region{bytes, rows, 1, dpitch, 0}, src, Region{bytes, rows, 1, spitch, 0}, kind, stream,
+                     async);
+}
+
+// A region filled with a pattern of 1, 2 or 4 bytes, repeated from each row's
+// start, in `stream`'s order. The memory has to be the runtime's: device
+// memory, or host memory it pinned, registered or manages. A synchronous
+// fill of device memory is queued and returned from at once, as ROCm's HIP's
+// is; one of host memory is waited for.
+hipError_t fill_region(void* dst, const Region& r, const uint8_t* pattern, uint32_t pattern_len, hipStream_t stream,
+                       bool async) {
   State& s = state();
-  vgpu::MemoryManager* mem = nullptr;
+  Side side;
   {
     std::lock_guard<std::mutex> lock(s.mutex);
-    if (!bytes) return hipSuccess;
-    if (!dst) return hipErrorInvalidValue;
     if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return e;
-    vgpu::runtime::Device* d = device(s);
-    if (!d) return hipErrorInvalidDevice;
-    mem = &d->memory();
-    for (int i = 0; i < s.rt->device_count(); ++i)
-      if (s.rt->device(i).memory().owns(reinterpret_cast<uint64_t>(dst))) mem = &s.rt->device(i).memory();
+    if (!device(s)) return hipErrorInvalidDevice;
+    if (r.empty()) return hipSuccess;
+    if (!dst) return hipErrorInvalidValue;
+    if (const hipError_t e = locate(s, dst, r, &side); e != hipSuccess) return e;
+    if (!side.mem) return fail(hipErrorInvalidValue, "that is host memory the runtime did not allocate or register");
   }
   const std::vector<uint8_t> p(pattern, pattern + pattern_len);
+  vgpu::MemoryManager* mem = side.mem;
+  const bool on_device = side.device;
+  const uint64_t base = reinterpret_cast<uint64_t>(dst);
   return in_order(
       stream,
       [=] {
         try {
-          mem->fill(reinterpret_cast<uint64_t>(dst), p.data(), static_cast<uint32_t>(p.size()), bytes);
+          for (uint64_t z = 0; z < r.depth; ++z)
+            for (uint64_t y = 0; y < r.rows; ++y) {
+              const uint64_t at = base + z * r.slice + y * r.pitch;
+              if (on_device) {
+                mem->fill(at, p.data(), static_cast<uint32_t>(p.size()), r.width);
+              } else {
+                // Host memory the runtime maps is filled where it is.
+                auto* row = reinterpret_cast<uint8_t*>(at);
+                for (uint64_t i = 0; i < r.width; ++i) row[i] = p[i % p.size()];
+              }
+            }
         } catch (const std::exception& e) {
           return fail(hipErrorInvalidValue, e.what());
         }
         return hipSuccess;
       },
-      !async);
+      !async && !side.device);
+}
+// `bytes` bytes of a pattern.
+hipError_t fill_in_order(void* dst, const uint8_t* pattern, uint32_t pattern_len, uint64_t bytes, hipStream_t stream,
+                         bool async) {
+  return fill_region(dst, Region{bytes, 1, 1, bytes, 0}, pattern, pattern_len, stream, async);
 }
 }  // namespace
 
@@ -1146,8 +1330,12 @@ hipError_t hipDeviceSynchronize(void) {
     ordinal = s.current;
   }
   // Everything queued on the device, on every stream, and the first failure
-  // any of it had: where an asynchronous error comes out.
-  return record(s, drain_device(ordinal));
+  // any of it had: where an asynchronous error comes out. The pools then
+  // keep no more than their release thresholds.
+  const hipError_t e = drain_device(ordinal);
+  std::lock_guard<std::mutex> lock(s.mutex);
+  release_to_thresholds(s);
+  return record(s, e);
 }
 
 hipError_t hipDeviceReset(void) {
@@ -1198,6 +1386,16 @@ hipError_t free_now(void* ptr) {
   if (!ptr) return hipSuccess;
   // Managed memory, and pinned host memory, which ROCm's HIP frees here too.
   if (host_free(s, ptr, g_managed) || host_free(s, ptr, g_host_allocations)) return hipSuccess;
+  // Another process's pool memory, imported: this process's mapping goes.
+  if (const auto im = g_pool_imports.find(ptr); im != g_pool_imports.end()) {
+    try {
+      s.rt->device(im->second).memory().abandon(reinterpret_cast<uint64_t>(ptr));
+    } catch (const std::exception& e) {
+      return fail(hipErrorInvalidValue, e.what());
+    }
+    g_pool_imports.erase(im);
+    return hipSuccess;
+  }
   vgpu::runtime::Device* d = device(s);
   if (!d) return (hipErrorInvalidDevice);
   if (const auto pa = s.pool_allocations.find(reinterpret_cast<uint64_t>(ptr)); pa != s.pool_allocations.end()) {
@@ -1210,10 +1408,12 @@ hipError_t free_now(void* ptr) {
   for (int i = 0; i < s.rt->device_count(); ++i)
     if (s.rt->device(i).memory().owns(reinterpret_cast<uint64_t>(ptr))) owner = i;
   const uint64_t start = vgpu::amd::hipprof::now_ns();
+  // What was never allocated, or was freed already, is the wrong value, as
+  // ROCm's HIP has it.
   try {
     s.rt->device(owner).memory().free(reinterpret_cast<uint64_t>(ptr));
   } catch (const std::exception& e) {
-    return (fail(hipErrorInvalidDevicePointer, e.what()));
+    return (fail(hipErrorInvalidValue, e.what()));
   }
   if (const auto* p = profiler(); p && p->allocated)
     p->allocated(owner, reinterpret_cast<uint64_t>(ptr), 0, true, start, vgpu::amd::hipprof::now_ns());
@@ -1262,8 +1462,7 @@ hipError_t hipMemcpyBatchAsync(void** dsts, void** srcs, size_t* sizes, size_t c
   (void)attrs_idxs;
   (void)num_attrs;
   if (fail_idx) *fail_idx = SIZE_MAX;
-  if (!count) return hipSuccess;
-  if (!dsts || !srcs || !sizes) return hipErrorInvalidValue;
+  if (!count || !dsts || !srcs || !sizes) return hipErrorInvalidValue;
   for (size_t i = 0; i < count; ++i)
     if (const hipError_t e = hipMemcpyAsync(dsts[i], srcs[i], sizes[i], hipMemcpyDefault, stream); e != hipSuccess) {
       if (fail_idx) *fail_idx = i;
@@ -1647,7 +1846,10 @@ hipError_t hipStreamSynchronize(hipStream_t stream) {
       if (it->second.queue) qs.push_back(it->second.queue);
     }
   }
-  return record(s, drain(qs));
+  const hipError_t e = drain(qs);
+  std::lock_guard<std::mutex> lock(s.mutex);
+  release_to_thresholds(s);
+  return record(s, e);
 }
 
 // Events: a program records one behind the work on a stream and asks when
@@ -1777,7 +1979,11 @@ hipError_t hipEventSynchronize(hipEvent_t event) {
   Queue::Marker m;
   bool exists = false;
   if (event_marker(event, &m, nullptr, &exists)) m.queue->wait(m.seq);
-  return exists ? hipSuccess : record(state(), hipErrorInvalidHandle);
+  if (!exists) return record(state(), hipErrorInvalidHandle);
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  release_to_thresholds(s);
+  return hipSuccess;
 }
 
 hipError_t hipEventQuery(hipEvent_t event) {
@@ -1958,9 +2164,17 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   // device's kernels (see hipHostMalloc), and allocations come from pools.
   props->canMapHostMemory = 1;
   props->managedMemory = 1;
+  // Managed memory is host memory every device reaches at once: the host and
+  // the devices may use it at the same time, and the host directly.
+  props->concurrentManagedAccess = 1;
+  props->directManagedMemAccessFromHost = 1;
   props->hostRegisterSupported = 1;
   props->memoryPoolsSupported = 1;
   props->ECCEnabled = p.telemetry.ecc ? 1 : 0;
+  // The widest row a 2D or 3D copy takes (the attribute, an int, caps it
+  // there). The texture alignments stay 0, as ROCm's HIP gives them for a
+  // device without image support.
+  props->memPitch = static_cast<size_t>(std::min<uint64_t>(p.vram_bytes, INT32_MAX));
   // What ROCm's HIP gives as a device's UUID: the sixteen characters after
   // "GPU-" in its HSA agent's UUID (hsa_api.cpp), which rocminfo prints.
   char uuid[17];
@@ -2262,23 +2476,34 @@ hipError_t hipHostFree(void* ptr) {
 }
 
 // The caller's own memory, made reachable from kernels where it is. Any
-// overlap with memory already registered, pinned or managed is refused, as
-// HIP refuses it.
-hipError_t hipHostRegister(void* ptr, size_t size, unsigned int) {
+// overlap with memory pinned or managed is refused; registered memory may be
+// registered again, as ROCm's HIP allows.
+// The flags there are: portable, mapped, I/O memory, read-only, and AMD's
+// uncached. Memory that cannot be there -- more than the host has -- is the
+// wrong value too.
+hipError_t hipHostRegister(void* ptr, size_t size, unsigned int flags) {
   const ApiCall api("hipHostRegister");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!ptr || !size) return record(s, hipErrorInvalidValue);
+  if (!ptr || !size || (flags & ~(0xFu | 0x80000000u))) return record(s, hipErrorInvalidValue);
+  // Every page of it has to be the process's: msync says which are not.
+  const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+  const uintptr_t first = reinterpret_cast<uintptr_t>(ptr) & ~(page - 1);
+  const uintptr_t end = reinterpret_cast<uintptr_t>(ptr) + size;
+  if (end < first || msync(reinterpret_cast<void*>(first), (end - first + page - 1) & ~(page - 1), MS_ASYNC) != 0)
+    return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   const uint64_t lo = reinterpret_cast<uint64_t>(ptr), hi = lo + size;
   std::lock_guard<std::mutex> host_lock(g_host_mutex);
-  for (const auto* m : {&g_host_registered, &g_host_allocations, &g_managed}) {
+  for (const auto* m : {&g_host_allocations, &g_managed}) {
     auto it = m->lower_bound(hi);
     if (it != m->begin() && std::prev(it)->first + std::prev(it)->second > lo)
       return record(s, hipErrorHostMemoryAlreadyRegistered);
   }
-  map_host_everywhere(s, ptr, size);
-  g_host_registered[lo] = size;
+  // Registered memory registered again, in part or whole, is accepted as
+  // ROCm's HIP accepts it; the same address again takes the new size.
+  g_host_registrations[lo] = size;
+  remap_registered(s);
   return record(s, hipSuccess);
 }
 
@@ -2288,10 +2513,10 @@ hipError_t hipHostUnregister(void* ptr) {
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!ptr) return record(s, hipErrorInvalidValue);
   std::lock_guard<std::mutex> host_lock(g_host_mutex);
-  const auto it = g_host_registered.find(reinterpret_cast<uint64_t>(ptr));
-  if (it == g_host_registered.end()) return record(s, hipErrorHostMemoryNotRegistered);
-  if (s.rt) unmap_host_everywhere(s, ptr);
-  g_host_registered.erase(it);
+  const auto it = g_host_registrations.find(reinterpret_cast<uint64_t>(ptr));
+  if (it == g_host_registrations.end()) return record(s, hipErrorHostMemoryNotRegistered);
+  g_host_registrations.erase(it);
+  if (s.rt) remap_registered(s);
   return record(s, hipSuccess);
 }
 
@@ -2315,37 +2540,237 @@ hipError_t hipHostGetDevicePointer(void** device_ptr, void* host_ptr, unsigned i
 // mapped for kernels, freed with hipFree.
 hipError_t hipMallocManaged(void** ptr, size_t size, unsigned int flags) {
   const ApiCall api("hipMallocManaged");
-  if (flags && flags != 1 /* hipMemAttachGlobal */ && flags != 2 /* hipMemAttachHost */)
+  if (flags != 1 /* hipMemAttachGlobal */ && flags != 2 /* hipMemAttachHost */)
     return record(state(), hipErrorInvalidValue);
   if (!size) return record(state(), hipErrorInvalidValue);
   return host_alloc(ptr, size, g_managed);
 }
 
-// Advice about where memory should live and who reads it. There is one memory
-// here, not a host copy and a device copy, so no advice changes where anything
-// is and there is nothing to record; what HIP refuses is refused the same way:
-// no address, no bytes, advice it does not know, a device that is not there,
-// or a range running past the allocation it starts in. llama.cpp's HIP backend
-// (Ollama's) links against it, and a library without it is not loaded at all.
+// Advice about where managed memory should live and who reads it, and where
+// it was last prefetched to. There is one memory here, not a host copy and a
+// device copy, so none of it moves anything; it is kept, page by page (4 KiB,
+// the range a call names rounded out to whole pages), and read back by
+// hipMemRangeGetAttribute(s) as ROCm's HIP reads it. What HIP refuses is
+// refused the same way: no address, no bytes, advice it does not know, a
+// device that is not there, memory that is not managed, or a range running
+// past the allocation it starts in. llama.cpp's HIP backend (Ollama's) links
+// against hipMemAdvise, and a library without it is not loaded at all.
+}  // extern "C"
+namespace {
+constexpr uint64_t kAdvicePage = 4096;
+
+// The managed allocation `[ptr, ptr + count)` lies in, and the pages it
+// covers. The caller holds g_host_mutex.
+hipError_t managed_pages(const void* ptr, size_t count, std::vector<PageAdvice>** pages, size_t* first,
+                         size_t* last) {
+  const uint64_t va = reinterpret_cast<uint64_t>(ptr);
+  const auto it = find_range(g_managed, va);
+  if (it == g_managed.end()) return hipErrorInvalidValue;
+  if (count > it->second - (va - it->first)) return hipErrorInvalidValue;
+  auto& v = g_advice[it->first];
+  if (v.empty()) v.resize((it->second + kAdvicePage - 1) / kAdvicePage);
+  *pages = &v;
+  *first = (va - it->first) / kAdvicePage;
+  *last = (va - it->first + count + kAdvicePage - 1) / kAdvicePage;
+  return hipSuccess;
+}
+
+hipError_t advise(State& s, const void* ptr, size_t count, int advice, int device) {   // holds s.mutex
+  if (!ptr || !count) return hipErrorInvalidValue;
+  // hipMemAdviseSet/UnsetReadMostly, PreferredLocation, AccessedBy are 1-6;
+  // AMD's Set/UnsetCoarseGrain are 100 and 101.
+  if (!((advice >= 1 && advice <= 6) || advice == 100 || advice == 101)) return hipErrorInvalidValue;
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return e;
+  const bool names_device = advice >= 3 && advice <= 6;
+  if (names_device && device != -1 /* hipCpuDeviceId */ && (device < 0 || device >= s.rt->device_count()))
+    return hipErrorInvalidDevice;
+  std::lock_guard<std::mutex> host_lock(g_host_mutex);
+  std::vector<PageAdvice>* pages = nullptr;
+  size_t first = 0, last = 0;
+  if (const hipError_t e = managed_pages(ptr, count, &pages, &first, &last); e != hipSuccess) {
+    // Pinned and registered memory takes advice too, and keeps none of it.
+    const uint64_t va = reinterpret_cast<uint64_t>(ptr);
+    for (const auto* m : {&g_host_allocations, &g_host_registered})
+      if (const auto it = find_range(*m, va); it != m->end())
+        return count > it->second - (va - it->first) ? hipErrorInvalidValue : hipSuccess;
+    return e;
+  }
+  for (size_t p = first; p < last; ++p) {
+    PageAdvice& a = (*pages)[p];
+    switch (advice) {
+      case 1: a.read_mostly = true; break;
+      case 2: a.read_mostly = false; break;
+      case 3: a.preferred = device; break;
+      case 4: a.preferred = -2; break;
+      case 5: a.accessed_by.insert(device); break;
+      case 6: a.accessed_by.erase(device); break;
+      case 100: a.coarse = true; break;
+      case 101: a.coarse = false; break;
+    }
+  }
+  return hipSuccess;
+}
+// A hipMemLocation, as the device a v1 call would name: a device by its id,
+// the host (any node) as hipCpuDeviceId. Its type has to be one there is.
+hipError_t location_device(State& s, const vgpu::amd::abi::MemLocation& loc, int* device) {   // holds s.mutex
+  switch (loc.type) {
+    case 1:   // hipMemLocationTypeDevice
+      if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return e;
+      if (loc.id < 0 || loc.id >= s.rt->device_count()) return hipErrorInvalidDevice;
+      *device = loc.id;
+      return hipSuccess;
+    case 2:   // Host
+    case 3:   // HostNuma
+    case 4:   // HostNumaCurrent
+      *device = -1;
+      return hipSuccess;
+    default: return hipErrorInvalidValue;
+  }
+}
+hipError_t prefetch(hipStream_t stream, const void* ptr, size_t count, int device) {
+  {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!ptr || !count) return hipErrorInvalidValue;
+    if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return e;
+    std::lock_guard<std::mutex> host_lock(g_host_mutex);
+    std::vector<PageAdvice>* pages = nullptr;
+    size_t first = 0, last = 0;
+    if (const hipError_t e = managed_pages(ptr, count, &pages, &first, &last); e != hipSuccess) return e;
+    if (device != -1 && (device < 0 || device >= s.rt->device_count())) return hipErrorInvalidDevice;
+    // Where it was last sent is known as soon as it is asked for.
+    for (size_t p = first; p < last; ++p) (*pages)[p].last_prefetch = device;
+  }
+  // Nothing moves; the prefetch still takes its place in the stream.
+  return in_order(stream, [] { return hipSuccess; });
+}
+// One attribute over the pages of a range: the same value on every page, or
+// none. `size` is the bytes the caller gave for it.
+hipError_t range_attribute(void* data, size_t size, int attr, const void* ptr, size_t count) {
+  if (!data || !size) return hipErrorInvalidValue;
+  if (attr == 3 /* AccessedBy */ ? size % 4 != 0 : size != 4) return hipErrorInvalidValue;
+  if (attr != 1 && attr != 2 && attr != 3 && attr != 4 && attr != 100) return hipErrorInvalidValue;
+  if (!ptr || !count) return hipErrorInvalidValue;
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return e;
+  std::lock_guard<std::mutex> host_lock(g_host_mutex);
+  std::vector<PageAdvice>* pages = nullptr;
+  size_t first = 0, last = 0;
+  if (const hipError_t e = managed_pages(ptr, count, &pages, &first, &last); e != hipSuccess) {
+    // Device memory is coarse-grained, and says so; it has no other advice.
+    if (attr == 100 && owner_of(s, reinterpret_cast<uint64_t>(ptr)) >= 0) {
+      *static_cast<int*>(data) = 1;   // hipMemRangeCoherencyModeCoarseGrain
+      return hipSuccess;
+    }
+    return e;
+  }
+  const auto same = [&](auto get, int none) {
+    const int v = get((*pages)[first]);
+    for (size_t p = first + 1; p < last; ++p)
+      if (get((*pages)[p]) != v) return none;
+    return v;
+  };
+  auto* out = static_cast<int*>(data);
+  switch (attr) {
+    case 1: *out = same([](const PageAdvice& a) { return a.read_mostly ? 1 : 0; }, 0); break;
+    case 2: *out = same([](const PageAdvice& a) { return a.preferred; }, -2); break;
+    case 4: *out = same([](const PageAdvice& a) { return a.last_prefetch; }, -2); break;
+    case 100: *out = same([](const PageAdvice& a) { return a.coarse ? 1 : 0; }, 2); break;
+    case 3: {
+      // The devices every page is accessed by: GPUs in order, then the host,
+      // then hipInvalidDeviceId in the slots left.
+      std::set<int> all = (*pages)[first].accessed_by;
+      for (size_t p = first + 1; p < last; ++p) {
+        std::set<int> both;
+        for (int d : all)
+          if ((*pages)[p].accessed_by.count(d)) both.insert(d);
+        all.swap(both);
+      }
+      std::vector<int> order;
+      for (int d : all)
+        if (d >= 0) order.push_back(d);
+      if (all.count(-1)) order.push_back(-1);
+      const size_t slots = size / 4;
+      for (size_t i = 0; i < slots; ++i) out[i] = i < order.size() ? order[i] : -2;
+      break;
+    }
+  }
+  return hipSuccess;
+}
+}  // namespace
+extern "C" {
+
 hipError_t hipMemAdvise(const void* ptr, size_t count, int advice, int device) {
   const ApiCall api("hipMemAdvise");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
+  return record(s, advise(s, ptr, count, advice, device));
+}
+hipError_t hipMemAdvise_v2(const void* ptr, size_t count, int advice, vgpu::amd::abi::MemLocation location) {
+  const ApiCall api("hipMemAdvise_v2");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
   if (!ptr || !count) return record(s, hipErrorInvalidValue);
-  // hipMemAdviseSet/UnsetReadMostly, PreferredLocation, AccessedBy are 1-6;
-  // AMD's Set/UnsetCoarseGrain are 100 and 101.
-  if (!((advice >= 1 && advice <= 6) || advice == 100 || advice == 101)) return record(s, hipErrorInvalidValue);
-  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
-  const bool names_device = advice >= 3 && advice <= 6;
-  if (names_device && device != -1 /* hipCpuDeviceId */ && (device < 0 || device >= s.rt->device_count()))
-    return record(s, hipErrorInvalidDevice);
-  const uint64_t lo = reinterpret_cast<uint64_t>(ptr);
-  std::lock_guard<std::mutex> host_lock(g_host_mutex);
-  for (const auto* m : {&g_managed, &g_host_allocations, &g_host_registered}) {
-    const auto it = find_range(*m, lo);
-    if (it != m->end() && count > it->first + it->second - lo) return record(s, hipErrorInvalidValue);
+  int device = 0;
+  if (const hipError_t e = location_device(s, location, &device); e != hipSuccess) return record(s, e);
+  return record(s, advise(s, ptr, count, advice, device));
+}
+hipError_t hipMemPrefetchAsync(const void* ptr, size_t count, int device, hipStream_t stream) {
+  const ApiCall api("hipMemPrefetchAsync");
+  return record(state(), prefetch(stream, ptr, count, device));
+}
+hipError_t hipMemPrefetchAsync_v2(const void* ptr, size_t count, vgpu::amd::abi::MemLocation location,
+                                  unsigned int flags, hipStream_t stream) {
+  const ApiCall api("hipMemPrefetchAsync_v2");
+  int device = 0;
+  {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!ptr || !count || flags) return record(s, hipErrorInvalidValue);
+    {
+      std::lock_guard<std::mutex> host_lock(g_host_mutex);
+      std::vector<PageAdvice>* pages = nullptr;
+      size_t first = 0, last = 0;
+      if (const hipError_t e = managed_pages(ptr, count, &pages, &first, &last); e != hipSuccess) return record(s, e);
+    }
+    if (const hipError_t e = location_device(s, location, &device); e != hipSuccess) return record(s, e);
   }
-  return record(s, hipSuccess);
+  return record(state(), prefetch(stream, ptr, count, device));
+}
+hipError_t hipMemRangeGetAttribute(void* data, size_t size, int attr, const void* ptr, size_t count) {
+  const ApiCall api("hipMemRangeGetAttribute");
+  return record(state(), range_attribute(data, size, attr, ptr, count));
+}
+hipError_t hipMemRangeGetAttributes(void** data, size_t* sizes, int* attrs, size_t n, const void* ptr, size_t count) {
+  const ApiCall api("hipMemRangeGetAttributes");
+  if (!data || !sizes || !attrs || !n) return record(state(), hipErrorInvalidValue);
+  for (size_t i = 0; i < n; ++i)
+    if (!data[i]) return record(state(), hipErrorInvalidValue);
+  for (size_t i = 0; i < n; ++i)
+    if (const hipError_t e = range_attribute(data[i], sizes[i], attrs[i], ptr, count); e != hipSuccess)
+      return record(state(), e);
+  return record(state(), hipSuccess);
+}
+// Which streams may reach managed memory: every device reaches all of it at
+// once here (concurrent managed access), so the attachment is kept to its
+// stream's order and changes nothing. The whole allocation (length 0, or
+// all of it) is attached, with one of the three flags, and a single stream's
+// attachment needs a stream.
+hipError_t hipStreamAttachMemAsync(hipStream_t stream, void* ptr, size_t length, unsigned int flags) {
+  const ApiCall api("hipStreamAttachMemAsync");
+  {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!ptr || (flags != 1 && flags != 2 && flags != 4)) return record(s, hipErrorInvalidValue);
+    if (flags == 4 /* hipMemAttachSingle */ && !stream) return record(s, hipErrorInvalidValue);
+    std::lock_guard<std::mutex> host_lock(g_host_mutex);
+    const uint64_t va = reinterpret_cast<uint64_t>(ptr);
+    const auto it = find_range(g_managed, va);
+    if (it == g_managed.end() || it->first != va) return record(s, hipErrorInvalidValue);
+    if (length && length != it->second) return record(s, hipErrorInvalidValue);
+  }
+  return record(state(), in_order(stream, [] { return hipSuccess; }));
 }
 
 // ---- One device reaching another --------------------------------------------
@@ -2385,41 +2810,16 @@ hipError_t hipDeviceDisablePeerAccess(int peer) {
 
 // A copy from one device's memory to another's. The address says which device
 // owns it, and the device numbers the program gave have to agree.
+}  // extern "C"
+namespace {
+hipError_t peer_copy(void* dst, int dst_device, const void* src, int src_device, size_t bytes, hipStream_t stream,
+                     bool async);
+}  // namespace
+extern "C" {
 hipError_t hipMemcpyPeerAsync(void* dst, int dst_device, const void* src, int src_device, size_t bytes,
                               hipStream_t stream) {
   const ApiCall api("hipMemcpyPeerAsync");
-  State& s = state();
-  vgpu::MemoryManager *to = nullptr, *from = nullptr;
-  vgpu::runtime::Device* source_device = nullptr;
-  const uint64_t dst_va = reinterpret_cast<uint64_t>(dst), src_va = reinterpret_cast<uint64_t>(src);
-  {
-    std::lock_guard<std::mutex> lock(s.mutex);
-    if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
-    const int n = s.rt->device_count();
-    if (dst_device < 0 || dst_device >= n || src_device < 0 || src_device >= n) return record(s, hipErrorInvalidDevice);
-    if (!bytes) return record(s, hipSuccess);
-    if (!dst || !src) return record(s, hipErrorInvalidValue);
-    to = &s.rt->device(dst_device).memory();
-    from = &s.rt->device(src_device).memory();
-    source_device = &s.rt->device(src_device);
-    if (!to->owns(dst_va) || !from->owns(src_va))
-      return record(s, fail(hipErrorInvalidValue, "a peer copy's addresses are not on the devices it names"));
-  }
-  return record(s, in_order(stream, [=] {
-    const uint64_t start = vgpu::amd::hipprof::now_ns();
-    try {
-      std::vector<uint8_t> buf(bytes);
-      from->read(src_va, buf.data(), bytes);
-      to->write(dst_va, buf.data(), bytes);
-    } catch (const std::exception& e) {
-      return fail(hipErrorInvalidValue, e.what());
-    }
-    source_device->note_transfer(bytes, 0.0);
-    if (const auto* p = profiler(); p && p->copied)
-      p->copied(vgpu::amd::hipprof::Copy::DeviceToDevice, src_device, dst_device, bytes, dst_va, src_va, start,
-                vgpu::amd::hipprof::now_ns());
-    return hipSuccess;
-  }));
+  return record(state(), peer_copy(dst, dst_device, src, src_device, bytes, stream, true));
 }
 
 // ---- Graphs a stream is recorded into ----------------------------------------
@@ -2765,6 +3165,10 @@ hipError_t copy_symbol(bool to_symbol, const void* symbol, void* host, size_t by
       return record(s, fail(hipErrorInvalidValue, "the copy runs past the end of the variable"));
   }
   if (kind == hipMemcpyDefault) kind = to_symbol ? hipMemcpyHostToDevice : hipMemcpyDeviceToHost;
+  // A copy to a variable comes from the host or a device, and one from a
+  // variable goes to either: the other directions are the wrong way round.
+  if (kind == hipMemcpyHostToHost || kind == (to_symbol ? hipMemcpyDeviceToHost : hipMemcpyHostToDevice))
+    return record(s, hipErrorInvalidMemcpyDirection);
   void* device = reinterpret_cast<void*>(address + offset);
   return record(s, to_symbol ? copy_in_order(device, host, bytes, kind, stream, async)
                              : copy_in_order(host, device, bytes, kind, stream, async));
@@ -2917,13 +3321,66 @@ Pool* find_pool(State& s, void* handle) {
     if (&p == handle && !p.destroyed) return &p;
   return nullptr;
 }
+Pool* current_pool(State& s, int ordinal) {
+  const auto it = s.current_pools.find(ordinal);
+  return it != s.current_pools.end() ? it->second : default_pool(s, ordinal);
+}
 // An allocation from `pool`, on the pool's device. The caller holds the lock.
-hipError_t pool_alloc(State& s, Pool* pool, void** ptr, size_t size) {
+// Gives back to the device what the pool keeps and no stream still has
+// ahead of it, until it keeps no more than `keep` bytes reserved. The caller
+// holds s.mutex.
+void release_kept(State& s, Pool* pool, uint64_t keep) {
+  for (size_t i = 0; i < pool->kept.size() && pool->reserved() > keep;) {
+    const Pool::Kept& k = pool->kept[i];
+    if (!k.queue->done(k.seq)) {
+      ++i;
+      continue;
+    }
+    try {
+      s.rt->device(pool->device).memory().free(k.va);
+    } catch (const std::exception&) {
+    }
+    pool->kept.erase(pool->kept.begin() + static_cast<std::ptrdiff_t>(i));
+  }
+}
+// At a synchronization, every pool keeps no more than its release threshold.
+void release_to_thresholds(State& s) {   // the caller holds s.mutex
+  for (Pool& p : s.pools)
+    if (!p.destroyed) release_kept(s, &p, p.release_threshold);
+}
+// An allocation from `pool`, on the pool's device, in `stream`'s order: a
+// block the pool keeps where the reuse rules allow, or new memory as far as
+// the pool's maximum. The caller holds the lock.
+hipError_t pool_alloc(State& s, Pool* pool, void** ptr, size_t size, hipStream_t stream) {
   if (!ptr) return hipErrorInvalidValue;
   if (!size) {
     *ptr = nullptr;
     return hipSuccess;
   }
+  Order o;
+  if (const hipError_t e = order_for(s, stream, &o); e != hipSuccess) return e;
+  const hipStream_t r = resolve(s, stream);
+  const Stream* st = r ? &s.streams.at(r) : nullptr;
+  for (size_t i = 0; i < pool->kept.size(); ++i) {
+    const Pool::Kept& k = pool->kept[i];
+    if (k.size != size) continue;
+    bool reusable = k.queue == o.queue;   // freed earlier in this stream
+    if (!reusable && pool->reuse[1] && st)
+      if (const auto w = st->waited.find(k.queue.get()); w != st->waited.end() && w->second >= k.seq) reusable = true;
+    if (!reusable && pool->reuse[2] && k.queue->done(k.seq)) reusable = true;
+    if (!reusable) continue;
+    *ptr = reinterpret_cast<void*>(k.va);
+    pool->kept.erase(pool->kept.begin() + static_cast<std::ptrdiff_t>(i));
+    s.pool_allocations[reinterpret_cast<uint64_t>(*ptr)] = {pool, size};
+    pool->used += size;
+    pool->used_high = std::max(pool->used_high, pool->used);
+    return hipSuccess;
+  }
+  // ROCm's HIP holds a pool's maximum against the most it has reserved,
+  // which trimming does not bring down (hip-tests' hipGetProcAddress pool
+  // checks): new memory past it is refused.
+  if (pool->max_size && std::max(pool->reserved_high, pool->reserved()) + size > pool->max_size)
+    return fail(hipErrorOutOfMemory, "the pool is at its maximum size");
   try {
     *ptr = reinterpret_cast<void*>(s.rt->device(pool->device).memory().alloc(size));
   } catch (const std::exception& e) {
@@ -2932,6 +3389,7 @@ hipError_t pool_alloc(State& s, Pool* pool, void** ptr, size_t size) {
   s.pool_allocations[reinterpret_cast<uint64_t>(*ptr)] = {pool, size};
   pool->used += size;
   pool->used_high = std::max(pool->used_high, pool->used);
+  pool->reserved_high = std::max(pool->reserved_high, pool->reserved());
   return hipSuccess;
 }
 
@@ -2939,26 +3397,60 @@ hipError_t pool_alloc(State& s, Pool* pool, void** ptr, size_t size) {
 
 extern "C" {
 
-hipError_t hipMallocFromPoolAsync(void** ptr, size_t size, void* pool, hipStream_t) {
+hipError_t hipMallocFromPoolAsync(void** ptr, size_t size, void* pool, hipStream_t stream) {
   const ApiCall api("hipMallocFromPoolAsync");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   Pool* p = find_pool(s, pool);
   if (!p) return record(s, hipErrorInvalidValue);
-  return record(s, pool_alloc(s, p, ptr, size));
+  return record(s, pool_alloc(s, p, ptr, size, stream));
 }
-hipError_t hipMallocAsync(void** ptr, size_t size, hipStream_t) {
+hipError_t hipMallocAsync(void** ptr, size_t size, hipStream_t stream) {
   const ApiCall api("hipMallocAsync");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!device(s)) return record(s, hipErrorInvalidDevice);
-  return record(s, pool_alloc(s, default_pool(s, s.current), ptr, size));
+  return record(s, pool_alloc(s, current_pool(s, s.current), ptr, size, stream));
 }
 // Freed in the stream's order, once the work before it on the stream is done.
+// Memory from a pool goes back to the pool now, marked with where in the
+// stream its free falls (see Pool).
 hipError_t hipFreeAsync(void* ptr, hipStream_t stream) {
   const ApiCall api("hipFreeAsync");
-  if (!ptr) return record(state(), hipSuccess);
+  if (!ptr) return record(state(), hipErrorInvalidValue);
+  {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    // Memory a pool keeps was freed already.
+    for (const Pool& p : s.pools)
+      for (const Pool::Kept& k : p.kept)
+        if (k.va == reinterpret_cast<uint64_t>(ptr)) return record(s, hipErrorInvalidValue);
+    const auto pa = s.pool_allocations.find(reinterpret_cast<uint64_t>(ptr));
+    if (pa != s.pool_allocations.end() && !pa->second.first->destroyed) {
+      Order o;
+      if (const hipError_t e = order_for(s, stream, &o); e != hipSuccess) return record(s, e);
+      Pool* p = pa->second.first;
+      const uint64_t size = pa->second.second;
+      const uint64_t seq = o.queue->submit([] { return hipSuccess; }, std::move(o.after));
+      p->kept.push_back({pa->first, size, o.queue, seq});
+      p->used -= size;
+      s.pool_allocations.erase(pa);
+      return record(s, hipSuccess);
+    }
+    // Anything else is the start of an allocation that is still there.
+    const uint64_t va = reinterpret_cast<uint64_t>(ptr);
+    bool live = false;
+    {
+      std::lock_guard<std::mutex> host_lock(g_host_mutex);
+      live = g_host_allocations.count(va) || g_managed.count(va);
+    }
+    uint64_t b = 0, n = 0;
+    if (!live && s.rt)
+      for (int d = 0; d < s.rt->device_count() && !live; ++d)
+        live = s.rt->device(d).memory().find_allocation(va, &b, &n) && b == va;
+    if (!live) return record(s, hipErrorInvalidValue);
+  }
   return record(state(), in_order(stream, [ptr] { return free_now(ptr); }));
 }
 
@@ -2972,12 +3464,16 @@ hipError_t hipDeviceGetDefaultMemPool(void** pool, int ordinal) {
   *pool = default_pool(s, ordinal);
   return record(s, hipSuccess);
 }
-// A pool holds nothing back, so trimming it has nothing to give back.
-hipError_t hipMemPoolTrimTo(void* pool, size_t) {
+// What a pool keeps goes back to the device until it keeps `keep` bytes or
+// fewer -- all but what a stream still has ahead of it.
+hipError_t hipMemPoolTrimTo(void* pool, size_t keep) {
   const ApiCall api("hipMemPoolTrimTo");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  return record(s, find_pool(s, pool) ? hipSuccess : hipErrorInvalidValue);
+  Pool* p = find_pool(s, pool);
+  if (!p) return record(s, hipErrorInvalidValue);
+  release_kept(s, p, keep);
+  return record(s, hipSuccess);
 }
 hipError_t hipMemPoolCreate(void** pool, const vgpu::amd::abi::MemPoolProps* props) {
   const ApiCall api("hipMemPoolCreate");
@@ -2985,9 +3481,14 @@ hipError_t hipMemPoolCreate(void** pool, const vgpu::amd::abi::MemPoolProps* pro
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!pool || !props) return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
-  if (props->location.id < 0 || props->location.id >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
+  // Pinned device memory, on a device there is.
+  if (props->allocType != 1 || props->location.type != 1 || props->location.id < 0 ||
+      props->location.id >= s.rt->device_count())
+    return record(s, hipErrorInvalidValue);
   s.pools.push_back(Pool{});
   s.pools.back().device = props->location.id;
+  s.pools.back().max_size = props->maxSize;
+  s.pools.back().handle_types = props->handleTypes;
   *pool = &s.pools.back();
   return record(s, hipSuccess);
 }
@@ -3000,7 +3501,13 @@ hipError_t hipMemPoolDestroy(void* pool) {
   if (!p) return record(s, hipErrorInvalidValue);
   for (const auto& d : s.default_pools)
     if (d.second == p) return record(s, hipErrorInvalidValue);
+  release_kept(s, p, 0);
   p->destroyed = true;
+  if (p->share_fd >= 0) ::close(p->share_fd);
+  p->share_fd = -1;
+  // A device whose current pool it was goes back to its default.
+  for (auto it = s.current_pools.begin(); it != s.current_pools.end();)
+    it = it->second == p ? s.current_pools.erase(it) : std::next(it);
   return record(s, hipSuccess);
 }
 // The reuse flags are ints, the rest 64-bit counts. Of the counts, only the
@@ -3018,9 +3525,9 @@ hipError_t hipMemPoolGetAttribute(void* pool, int attr, void* value) {
     case A::kPoolReuseAllowOpportunistic:
     case A::kPoolReuseAllowInternalDependencies: *static_cast<int*>(value) = p->reuse[attr]; break;
     case A::kPoolReleaseThreshold: *static_cast<uint64_t*>(value) = p->release_threshold; break;
-    case A::kPoolReservedMemCurrent:
+    case A::kPoolReservedMemCurrent: *static_cast<uint64_t*>(value) = p->reserved(); break;
     case A::kPoolUsedMemCurrent: *static_cast<uint64_t*>(value) = p->used; break;
-    case A::kPoolReservedMemHigh:
+    case A::kPoolReservedMemHigh: *static_cast<uint64_t*>(value) = p->reserved_high; break;
     case A::kPoolUsedMemHigh: *static_cast<uint64_t*>(value) = p->used_high; break;
     default: return record(s, hipErrorInvalidValue);
   }
@@ -3038,24 +3545,42 @@ hipError_t hipMemPoolSetAttribute(void* pool, int attr, void* value) {
     case A::kPoolReuseAllowOpportunistic:
     case A::kPoolReuseAllowInternalDependencies: p->reuse[attr] = *static_cast<int*>(value) ? 1 : 0; break;
     case A::kPoolReleaseThreshold: p->release_threshold = *static_cast<uint64_t*>(value); break;
+    // Set back to zero, not to what is in use now, as ROCm's HIP does.
     case A::kPoolReservedMemHigh:
+      if (*static_cast<uint64_t*>(value)) return record(s, hipErrorInvalidValue);
+      p->reserved_high = 0;
+      break;
     case A::kPoolUsedMemHigh:
       if (*static_cast<uint64_t*>(value)) return record(s, hipErrorInvalidValue);
-      p->used_high = p->used;
+      p->used_high = 0;
       break;
     default: return record(s, hipErrorInvalidValue);
   }
   return record(s, hipSuccess);
 }
-// Every device reaches every pool's memory already.
+// Every device reaches every pool's memory already; what each was granted is
+// kept for hipMemPoolGetAccess. A pool's own device cannot lose its access.
 hipError_t hipMemPoolSetAccess(void* pool, const vgpu::amd::abi::MemAccessDesc* desc, size_t count) {
   const ApiCall api("hipMemPoolSetAccess");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!find_pool(s, pool) || (count && !desc)) return record(s, hipErrorInvalidValue);
+  Pool* p = find_pool(s, pool);
+  if (!p || (count && !desc)) return record(s, hipErrorInvalidValue);
+  if (count > static_cast<size_t>(s.rt->device_count())) return record(s, hipErrorInvalidDevice);
+  for (size_t i = 0; i < count; ++i) {
+    const auto& d = desc[i];
+    if (d.location.type != 1) return record(s, hipErrorInvalidValue);
+    if (d.location.id < 0 || d.location.id >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
+    if (d.flags != 0 && d.flags != 1 && d.flags != 3) return record(s, hipErrorInvalidValue);
+    if (d.location.id == p->device && d.flags != 3) return record(s, hipErrorInvalidDevice);
+  }
+  // A device granted access has its kernels reach the pool's device.
   for (size_t i = 0; i < count; ++i)
-    if (desc[i].location.id < 0 || desc[i].location.id >= s.rt->device_count())
-      return record(s, hipErrorInvalidDevice);
+    if (desc[i].location.id != p->device) {
+      p->access[desc[i].location.id] = desc[i].flags;
+      if (desc[i].flags) s.peers.insert({desc[i].location.id, p->device});
+    }
+  publish_pool_access(*p);
   return record(s, hipSuccess);
 }
 
@@ -3097,13 +3622,18 @@ hipError_t hipPointerGetAttributes(vgpu::amd::abi::PointerAttribute* out, const 
       return record(s, hipSuccess);
     }
   }
-  for (int i = 0; i < s.rt->device_count(); ++i)
-    if (s.rt->device(i).memory().owns(va)) {
+  // A device's memory while it is allocated or mapped; an address in its
+  // range that was freed, or never given out, is no one's.
+  for (int i = 0; i < s.rt->device_count(); ++i) {
+    const vgpu::MemoryManager& m = s.rt->device(i).memory();
+    bool readable = false, writable = false;
+    if (m.owns(va) && (m.find_allocation(va, nullptr, nullptr) || m.access_at(va, &readable, &writable))) {
       out->type = vgpu::amd::abi::kMemoryDevice;
       out->device = i;
       out->devicePointer = const_cast<void*>(ptr);
       return record(s, hipSuccess);
     }
+  }
   out->type = vgpu::amd::abi::kMemoryUnregistered;
   return record(s, hipSuccess);
 }
@@ -3294,6 +3824,7 @@ struct VmmAllocation {
   int device;
   uint64_t handle;
   size_t size;
+  int type;   // hipMemAllocationTypePinned or Uncached, as made
   int refs;   // hipMemCreate's, and one for each hipMemRetainAllocationHandle
 };
 std::deque<VmmAllocation> g_vmm;   // under State's mutex; entries are never moved
@@ -3313,6 +3844,8 @@ static_assert(sizeof(IpcPayload) <= sizeof(vgpu::amd::abi::IpcMemHandle), "an IP
 constexpr uint32_t kIpcMagic = 0x48495043;   // "HIPC"
 std::string ipc_path(const char* id) { return vgpu::telemetry::default_path() + "/ipc-hip-" + id; }
 std::map<void*, int> g_ipc_open;   // pointer -> the device it was mapped on
+static_assert(sizeof(IpcPayload) <= 64, "an IPC payload fits hipMemPoolPtrExportData");
+std::map<uint64_t, IpcPayload> g_pool_exports;   // pool allocation -> how it was exported
 
 thread_local int t_capture_mode = 0;   // hipStreamCaptureMode, per thread as HIP keeps it
 
@@ -3872,6 +4405,10 @@ hipError_t hipStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned int
   std::lock_guard<std::mutex> lock(s.mutex);
   Order o;
   if (const hipError_t e = order_for(s, stream, &o); e != hipSuccess) return record(s, e);
+  if (const hipStream_t r = resolve(s, stream); r) {
+    uint64_t& w = s.streams.at(r).waited[m.queue.get()];
+    w = std::max(w, m.seq);
+  }
   o.after.push_back(m);
   o.queue->submit([] { return hipSuccess; }, std::move(o.after));
   return record(s, hipSuccess);
@@ -3981,11 +4518,14 @@ hipError_t hipGraphRetainUserObject(void*, void*, unsigned int, unsigned int) {
 // host reads the signal directly; it is freed with hipFree.
 hipError_t hipExtMallocWithFlags(void** ptr, size_t size, unsigned int flags) {
   const ApiCall api("hipExtMallocWithFlags");
-  if (flags > 4) return record(state(), hipErrorInvalidValue);
-  if (flags == 2) {
-    if (!size) return record(state(), hipErrorInvalidValue);
-    return host_alloc(ptr, size, g_host_allocations, 2);   // hipHostMallocMapped
+  if (!ptr || flags > 4) return record(state(), hipErrorInvalidValue);
+  // Signal memory is one 64-bit signal, and nothing else.
+  if (flags == 2 && size != 8) return record(state(), hipErrorInvalidValue);
+  if (!size) {
+    *ptr = nullptr;
+    return record(state(), hipSuccess);
   }
+  if (flags == 2) return host_alloc(ptr, size, g_host_allocations, 2);   // hipHostMallocMapped
   return hipMalloc(ptr, size);
 }
 // A copy in the stream's order that the caller waits for.
@@ -4011,20 +4551,37 @@ hipError_t hipMemGetAddressRange(void** base, size_t* size, void* ptr) {
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   const uint64_t va = reinterpret_cast<uint64_t>(ptr);
   uint64_t b = 0, n = 0;
-  const int d = owner_of(s, va);
-  if (d < 0 || !s.rt->device(d).memory().find_allocation(va, &b, &n)) return record(s, hipErrorNotFound);
+  // Host memory the devices map is an allocation of its own too.
+  {
+    std::lock_guard<std::mutex> host_lock(g_host_mutex);
+    for (const auto* m : {&g_host_allocations, &g_host_registered, &g_managed})
+      if (const auto it = find_range(*m, va); it != m->end()) {
+        b = it->first;
+        n = it->second;
+      }
+  }
+  const int d = n ? -1 : owner_of(s, va);
+  if (!n && (d < 0 || !s.rt->device(d).memory().find_allocation(va, &b, &n))) return record(s, hipErrorNotFound);
   if (base) *base = reinterpret_cast<void*>(b);
   if (size) *size = static_cast<size_t>(n);
   return record(s, hipSuccess);
 }
 hipError_t hipMemPtrGetInfo(void* ptr, size_t* size) {
   const ApiCall api("hipMemPtrGetInfo");
-  if (!ptr || !size) return record(state(), hipErrorInvalidValue);
-  return hipMemGetAddressRange(nullptr, size, ptr);
+  if (!size) return record(state(), hipErrorInvalidValue);
+  // What a zero-byte hipMalloc gives back holds nothing.
+  if (!ptr) {
+    *size = 0;
+    return record(state(), hipSuccess);
+  }
+  const hipError_t e = hipMemGetAddressRange(nullptr, size, ptr);
+  return e == hipErrorNotFound ? record(state(), hipErrorInvalidValue) : e;
 }
 
 // One fact about an address, of those hipPointerGetAttributes gives and the
 // allocation it falls in.
+// The three yes-or-no attributes are one byte, and the buffer id and range
+// size 32 bits, as ROCm's HIP writes them.
 hipError_t hipPointerGetAttribute(void* data, int attribute, void* ptr) {
   const ApiCall api("hipPointerGetAttribute");
   if (!data || !ptr) return record(state(), hipErrorInvalidValue);
@@ -4039,16 +4596,22 @@ hipError_t hipPointerGetAttribute(void* data, int attribute, void* ptr) {
     case K::kPointerContext: *static_cast<void**>(data) = a.device >= 0 ? &g_contexts[a.device % 64] : nullptr; break;
     case K::kPointerMemoryType: *static_cast<unsigned*>(data) = static_cast<unsigned>(a.type); break;
     case K::kPointerDevicePointer: *static_cast<void**>(data) = a.devicePointer; break;
-    case K::kPointerHostPointer: *static_cast<void**>(data) = a.hostPointer; break;
-    case K::kPointerSyncMemops: *static_cast<int*>(data) = s.sync_memops.count(base) ? 1 : 0; break;
-    case K::kPointerBufferId: *static_cast<uint64_t*>(data) = base; break;
-    case K::kPointerIsManaged: *static_cast<int*>(data) = a.isManaged; break;
+    case K::kPointerHostPointer:
+      if (!a.hostPointer) return record(s, hipErrorInvalidValue);   // device memory has none
+      *static_cast<void**>(data) = a.hostPointer;
+      break;
+    case K::kPointerSyncMemops: *static_cast<bool*>(data) = s.sync_memops.count(base) != 0; break;
+    case K::kPointerBufferId: *static_cast<uint32_t*>(data) = static_cast<uint32_t>((base >> 8) ^ (base >> 40)); break;
+    case K::kPointerIsManaged: *static_cast<bool*>(data) = a.isManaged != 0; break;
     case K::kPointerDeviceOrdinal: *static_cast<int*>(data) = a.device; break;
     case K::kPointerRangeStartAddr: *static_cast<void**>(data) = reinterpret_cast<void*>(base); break;
-    case K::kPointerRangeSize: *static_cast<size_t*>(data) = static_cast<size_t>(size); break;
-    case K::kPointerMapped: *static_cast<int*>(data) = a.type != vgpu::amd::abi::kMemoryUnregistered; break;
-    default: return record(s, fail(hipErrorNotSupported, "pointer attribute " + std::to_string(attribute) +
-                                                            " is not modelled"));
+    case K::kPointerRangeSize: *static_cast<uint32_t*>(data) = static_cast<uint32_t>(size); break;
+    case K::kPointerMapped: *static_cast<bool*>(data) = a.type != vgpu::amd::abi::kMemoryUnregistered; break;
+    // P2P tokens, legacy IPC, handle types, GPUDirect RDMA and the pool:
+    // attributes HIP names but does not answer.
+    case 16: *static_cast<int*>(data) = 3; break;   // ACCESS_FLAGS: the device reads and writes it
+    case 5: case 10: case 14: case 15: case 17: return record(s, hipErrorNotSupported);
+    default: return record(s, hipErrorInvalidValue);
   }
   if (a.type == vgpu::amd::abi::kMemoryUnregistered && attribute != K::kPointerMemoryType &&
       attribute != K::kPointerMapped)
@@ -4062,22 +4625,41 @@ hipError_t hipPointerGetAttribute(void* data, int attribute, void* ptr) {
 // documents it: reserved address space with nothing behind it, memory with
 // no address, a mapping of one into the other, and access granted before it
 // can be used (vgpu/memory.hpp).
+//
+// HIP's minimum granularity is the 4 KiB page, and its recommended one is
+// larger; the manager works in 64 KiB chunks, so a size HIP accepts is
+// rounded up to whole chunks underneath it.
 
-hipError_t hipMemGetAllocationGranularity(size_t* granularity, const vgpu::amd::abi::MemAllocationProp* prop, int) {
+constexpr size_t kVmmPage = 4096;
+constexpr size_t kVmmRecommended = static_cast<size_t>(vgpu::MemoryManager::kVmmGranularity);
+uint64_t vmm_chunks(size_t size) {
+  return (size + kVmmRecommended - 1) / kVmmRecommended * kVmmRecommended;
+}
+bool vmm_prop_ok(const vgpu::amd::abi::MemAllocationProp* prop) {
+  return prop && (prop->type == 1 || prop->type == 0x40000000) && prop->location.type == 1;
+}
+
+hipError_t hipMemGetAllocationGranularity(size_t* granularity, const vgpu::amd::abi::MemAllocationProp* prop,
+                                          int option) {
   const ApiCall api("hipMemGetAllocationGranularity");
-  if (!granularity || !prop) return record(state(), hipErrorInvalidValue);
-  *granularity = static_cast<size_t>(vgpu::MemoryManager::kVmmGranularity);
-  return record(state(), hipSuccess);
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!granularity || !vmm_prop_ok(prop) || (option != 0 && option != 1)) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (prop->location.id < 0 || prop->location.id >= s.rt->device_count()) return record(s, hipErrorInvalidValue);
+  *granularity = option == 0 ? kVmmPage : kVmmRecommended;
+  return record(s, hipSuccess);
 }
 hipError_t hipMemAddressReserve(void** ptr, size_t size, size_t alignment, void*, unsigned long long) {
   const ApiCall api("hipMemAddressReserve");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!ptr || !size) return record(s, hipErrorInvalidValue);
+  if (!ptr || !size || size % kVmmPage || (alignment & (alignment - 1))) return record(s, hipErrorInvalidValue);
   vgpu::runtime::Device* d = device(s);
   if (!d) return record(s, hipErrorInvalidDevice);
   try {
-    *ptr = reinterpret_cast<void*>(d->memory().reserve(size, alignment));
+    *ptr = reinterpret_cast<void*>(
+        d->memory().reserve(vmm_chunks(size), alignment > kVmmRecommended ? alignment : 0));
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorInvalidValue, e.what()));
   }
@@ -4087,11 +4669,11 @@ hipError_t hipMemAddressFree(void* ptr, size_t size) {
   const ApiCall api("hipMemAddressFree");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!ptr || !size || !s.rt) return record(s, hipErrorInvalidValue);
+  if (!ptr || !size || size % kVmmPage || !s.rt) return record(s, hipErrorInvalidValue);
   const int d = owner_of(s, reinterpret_cast<uint64_t>(ptr));
   if (d < 0) return record(s, hipErrorInvalidValue);
   try {
-    s.rt->device(d).memory().address_free(reinterpret_cast<uint64_t>(ptr), size);
+    s.rt->device(d).memory().address_free(reinterpret_cast<uint64_t>(ptr), vmm_chunks(size));
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorInvalidValue, e.what()));
   }
@@ -4102,12 +4684,12 @@ hipError_t hipMemCreate(void** handle, size_t size, const vgpu::amd::abi::MemAll
   const ApiCall api("hipMemCreate");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!handle || !prop || !size) return record(s, hipErrorInvalidValue);
+  if (!handle || !vmm_prop_ok(prop) || !size || size % kVmmPage) return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   const int d = prop->location.id;
   if (d < 0 || d >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
   try {
-    g_vmm.push_back(VmmAllocation{d, s.rt->device(d).memory().create_handle(size), size, 1});
+    g_vmm.push_back(VmmAllocation{d, s.rt->device(d).memory().create_handle(vmm_chunks(size)), size, prop->type, 1});
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorOutOfMemory, e.what()));
   }
@@ -4139,11 +4721,12 @@ hipError_t hipMemMap(void* ptr, size_t size, size_t offset, void* handle, unsign
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   auto* v = static_cast<VmmAllocation*>(handle);
-  if (!ptr || !size || !g_vmm_live.count(v)) return record(s, hipErrorInvalidValue);
+  if (!ptr || !size || size % kVmmPage || offset % kVmmPage || !g_vmm_live.count(v))
+    return record(s, hipErrorInvalidValue);
   if (owner_of(s, reinterpret_cast<uint64_t>(ptr)) != v->device)
     return record(s, fail(hipErrorInvalidValue, "memory made on one device mapped into another's reservation"));
   try {
-    s.rt->device(v->device).memory().map(reinterpret_cast<uint64_t>(ptr), size, offset, v->handle);
+    s.rt->device(v->device).memory().map(reinterpret_cast<uint64_t>(ptr), vmm_chunks(size), offset, v->handle);
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorInvalidValue, e.what()));
   }
@@ -4154,11 +4737,11 @@ hipError_t hipMemUnmap(void* ptr, size_t size) {
   const ApiCall api("hipMemUnmap");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!ptr || !size || !s.rt) return record(s, hipErrorInvalidValue);
+  if (!ptr || !size || size % kVmmPage || !s.rt) return record(s, hipErrorInvalidValue);
   const int d = owner_of(s, reinterpret_cast<uint64_t>(ptr));
   if (d < 0) return record(s, hipErrorInvalidValue);
   try {
-    s.rt->device(d).memory().unmap(reinterpret_cast<uint64_t>(ptr), size);
+    s.rt->device(d).memory().unmap(reinterpret_cast<uint64_t>(ptr), vmm_chunks(size));
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorInvalidValue, e.what()));
   }
@@ -4192,7 +4775,7 @@ hipError_t hipMemGetAllocationPropertiesFromHandle(vgpu::amd::abi::MemAllocation
   auto* v = static_cast<VmmAllocation*>(handle);
   if (!prop || !g_vmm_live.count(v)) return record(s, hipErrorInvalidValue);
   std::memset(prop, 0, sizeof *prop);
-  prop->type = 1;              // hipMemAllocationTypePinned
+  prop->type = v->type;
   prop->location.type = 1;     // hipMemLocationTypeDevice
   prop->location.id = v->device;
   return record(s, hipSuccess);
@@ -4204,7 +4787,7 @@ hipError_t hipMemSetAccess(void* ptr, size_t size, const vgpu::amd::abi::MemAcce
   const ApiCall api("hipMemSetAccess");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!ptr || !size || !desc || !count || !s.rt) return record(s, hipErrorInvalidValue);
+  if (!ptr || !size || size % kVmmPage || !desc || !count || !s.rt) return record(s, hipErrorInvalidValue);
   const int d = owner_of(s, reinterpret_cast<uint64_t>(ptr));
   if (d < 0) return record(s, hipErrorInvalidValue);
   try {
@@ -4212,8 +4795,10 @@ hipError_t hipMemSetAccess(void* ptr, size_t size, const vgpu::amd::abi::MemAcce
       if (desc[i].location.id < 0 || desc[i].location.id >= s.rt->device_count())
         return record(s, hipErrorInvalidDevice);
       if (desc[i].location.id == d)
-        s.rt->device(d).memory().set_access(reinterpret_cast<uint64_t>(ptr), size, desc[i].flags & 1,
+        s.rt->device(d).memory().set_access(reinterpret_cast<uint64_t>(ptr), vmm_chunks(size), desc[i].flags & 1,
                                             (desc[i].flags & 2) != 0);
+      else
+        s.vmm_access[{reinterpret_cast<uint64_t>(ptr), size}][desc[i].location.id] = desc[i].flags;
     }
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorInvalidValue, e.what()));
@@ -4295,6 +4880,117 @@ hipError_t hipIpcCloseMemHandle(void* ptr) {
   g_ipc_open.erase(it);
   return record(s, hipSuccess);
 }
+
+// ---- Pools another process uses ----------------------------------------------------
+//
+// A pool made for export is a file descriptor, sent the way the program
+// sends descriptors (a Unix socket), carrying who made the pool and its
+// grants. Each allocation in it is exported on its own, as an IPC memory
+// handle is: the bytes move into a file at the same address, and the
+// importing process maps that file.
+
+hipError_t hipMemPoolExportToShareableHandle(void* handle, void* pool, int type, unsigned long long flags) {
+  const ApiCall api("hipMemPoolExportToShareableHandle");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  Pool* p = find_pool(s, pool);
+  if (!handle || !p || flags || type != 1 || !(p->handle_types & 1)) return record(s, hipErrorInvalidValue);
+  if (p->share_fd < 0) {
+    const int fd = ::memfd_create("hip-mempool", MFD_CLOEXEC);
+    if (fd < 0) return record(s, fail(hipErrorOutOfMemory, std::string("memfd_create: ") + std::strerror(errno)));
+    PoolShare share{};
+    share.magic = kPoolShareMagic;
+    share.version = 1;
+    share.pid = static_cast<uint32_t>(::getpid());
+    share.device = p->device;
+    if (::pwrite(fd, &share, sizeof share, 0) != static_cast<ssize_t>(sizeof share)) {
+      ::close(fd);
+      return record(s, fail(hipErrorOutOfMemory, "writing the pool's shared description"));
+    }
+    p->share_fd = fd;
+    publish_pool_access(*p);
+  }
+  // The caller's descriptor is its own to send and close.
+  const int out = ::fcntl(p->share_fd, F_DUPFD_CLOEXEC, 0);
+  if (out < 0) return record(s, fail(hipErrorOutOfMemory, std::string("dup: ") + std::strerror(errno)));
+  *static_cast<void**>(handle) = reinterpret_cast<void*>(static_cast<intptr_t>(out));
+  return record(s, hipSuccess);
+}
+hipError_t hipMemPoolImportFromShareableHandle(void** pool, void* handle, int type, unsigned long long flags) {
+  const ApiCall api("hipMemPoolImportFromShareableHandle");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!pool || !handle || type != 1 || flags) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  const int fd = static_cast<int>(reinterpret_cast<intptr_t>(handle));
+  PoolShare share{};
+  if (::pread(fd, &share, sizeof share, 0) != static_cast<ssize_t>(sizeof share) || share.magic != kPoolShareMagic ||
+      share.version != 1)
+    return record(s, fail(hipErrorInvalidValue, "the handle is not an exported memory pool"));
+  const int mine = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+  if (mine < 0) return record(s, fail(hipErrorOutOfMemory, std::string("dup: ") + std::strerror(errno)));
+  s.pools.push_back(Pool{});
+  Pool& p = s.pools.back();
+  p.device = share.device >= 0 && share.device < s.rt->device_count() ? share.device : s.current;
+  p.handle_types = 1;
+  p.share_fd = mine;
+  p.imported = true;
+  refresh_pool_access(p);
+  *pool = &p;
+  return record(s, hipSuccess);
+}
+hipError_t hipMemPoolExportPointer(void* data, void* ptr) {
+  const ApiCall api("hipMemPoolExportPointer");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!data || !ptr) return record(s, hipErrorInvalidValue);
+  const auto pa = s.pool_allocations.find(reinterpret_cast<uint64_t>(ptr));
+  if (pa == s.pool_allocations.end() || !(pa->second.first->handle_types & 1))
+    return record(s, fail(hipErrorInvalidValue, "not the start of an allocation from a pool made for export"));
+  const int d = pa->second.first->device;
+  IpcPayload p{};
+  p.magic = kIpcMagic;
+  p.version = 1;
+  p.device = static_cast<uint32_t>(d);
+  p.pid = static_cast<uint32_t>(::getpid());
+  static std::atomic<uint32_t> counter{0};
+  std::snprintf(p.id, sizeof p.id, "%x-p%x", p.pid, counter.fetch_add(1) + 1);
+  vgpu::MemoryManager& m = s.rt->device(d).memory();
+  try {
+    // Exported once; each later export names the same file.
+    if (const auto it = g_pool_exports.find(reinterpret_cast<uint64_t>(ptr));
+        it != g_pool_exports.end() && m.is_shared(reinterpret_cast<uint64_t>(ptr)))
+      p = it->second;
+    else
+      p.size = m.share(reinterpret_cast<uint64_t>(ptr), ipc_path(p.id));
+  } catch (const std::exception& e) {
+    return record(s, fail(hipErrorInvalidValue, e.what()));
+  }
+  g_pool_exports[reinterpret_cast<uint64_t>(ptr)] = p;
+  std::memset(data, 0, 64);
+  std::memcpy(data, &p, sizeof p);
+  return record(s, hipSuccess);
+}
+hipError_t hipMemPoolImportPointer(void** ptr, void* pool, void* data) {
+  const ApiCall api("hipMemPoolImportPointer");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  Pool* pl = find_pool(s, pool);
+  if (!ptr || !pl || !data) return record(s, hipErrorInvalidValue);
+  IpcPayload p{};
+  std::memcpy(&p, data, sizeof p);
+  if (p.magic != kIpcMagic || p.version != 1 || !p.size) return record(s, hipErrorInvalidValue);
+  try {
+    *ptr = reinterpret_cast<void*>(s.rt->device(pl->device).memory().adopt(ipc_path(p.id), p.size));
+  } catch (const std::exception& e) {
+    return record(s, fail(hipErrorInvalidValue, e.what()));
+  }
+  g_pool_imports[*ptr] = pl->device;
+  // Its kernels reach the exporting process's memory as that process's do.
+  s.ipc_mapped.insert(pl->device);
+  return record(s, hipSuccess);
+}
+
 hipError_t hipIpcGetEventHandle(void*, hipEvent_t) {
   return refused("hipIpcGetEventHandle", "events are not shared between processes");
 }
@@ -4408,9 +5104,6 @@ VGPU_NO_IMAGES(hipTexRefSetMipmapLevelClamp)
 VGPU_NO_IMAGES(hipTexRefSetMipmappedArray)
 // Graphics and external-memory interop, which has no graphics API to share with.
 VGPU_NO_IMAGES(hipGraphicsSubResourceGetMappedArray)
-VGPU_NO_IMAGES(hipImportExternalMemory)
-VGPU_NO_IMAGES(hipImportExternalSemaphore)
-VGPU_NO_IMAGES(hipWaitExternalSemaphoresAsync)
 // Asking about, or copying to or from, an array: there is none to name.
 VGPU_NO_SUCH_ARRAY(hipGetChannelDesc)
 VGPU_NO_SUCH_ARRAY(hipArrayGetDescriptor)
@@ -5034,8 +5727,8 @@ hipError_t hipPointerSetAttribute(const void* value, int attribute, void* ptr) {
   using K = vgpu::amd::abi::PointerAttributeKind;
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  // HIP_POINTER_ATTRIBUTE_CONTEXT (1) to _MEMPOOL_HANDLE (19) are the ones there are.
-  if (!value || !ptr || attribute < 1 || attribute > 19) return record(s, hipErrorInvalidValue);
+  // HIP_POINTER_ATTRIBUTE_CONTEXT (1) to _MEMPOOL_HANDLE (17) are the ones there are.
+  if (!value || !ptr || attribute < 1 || attribute > 17) return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   uint64_t base = 0, size = 0;
   bool found = false;
@@ -5050,9 +5743,593 @@ hipError_t hipPointerSetAttribute(const void* value, int attribute, void* ptr) {
 hipError_t hipDrvPointerGetAttributes(unsigned int count, int* attributes, void** data, void* ptr) {
   const ApiCall api("hipDrvPointerGetAttributes");
   if (!count || !attributes || !data || !ptr) return record(state(), hipErrorInvalidValue);
-  for (unsigned i = 0; i < count; ++i)
-    if (const hipError_t e = hipPointerGetAttribute(data[i], attributes[i], ptr); e != hipSuccess) return e;
+  for (unsigned i = 0; i < count; ++i) {
+    const hipError_t e = hipPointerGetAttribute(data[i], attributes[i], ptr);
+    // Device memory's host pointer is null here, where on its own it is an error.
+    if (e == hipErrorInvalidValue && attributes[i] == vgpu::amd::abi::PointerAttributeKind::kPointerHostPointer) {
+      *static_cast<void**>(data[i]) = nullptr;
+      (void)hipGetLastError();
+      continue;
+    }
+    if (e != hipSuccess) return e;
+  }
   return record(state(), hipSuccess);
+}
+
+// ---- Copies, fills and allocations of every shape -------------------------------
+//
+// The driver API's forms, the 2D and 3D ones, pitched allocations and the
+// memsets of each width: all of them regions (see "Copies and fills of every
+// shape"), answered as ROCm's HIP answers them -- AMD's hip-tests are the
+// reference for each error. This device has no image units, so a copy to or
+// from an array is refused as not supported, once its arguments are checked.
+
+hipError_t hipMemcpyHtoD(void* dst, const void* src, size_t bytes) {
+  const ApiCall api("hipMemcpyHtoD");
+  return record(state(), copy_in_order(dst, src, bytes, hipMemcpyHostToDevice, nullptr, false));
+}
+hipError_t hipMemcpyDtoH(void* dst, const void* src, size_t bytes) {
+  const ApiCall api("hipMemcpyDtoH");
+  return record(state(), copy_in_order(dst, src, bytes, hipMemcpyDeviceToHost, nullptr, false));
+}
+hipError_t hipMemcpyDtoD(void* dst, const void* src, size_t bytes) {
+  const ApiCall api("hipMemcpyDtoD");
+  return record(state(), copy_in_order(dst, src, bytes, hipMemcpyDeviceToDevice, nullptr, false));
+}
+hipError_t hipMemcpyHtoDAsync(void* dst, const void* src, size_t bytes, hipStream_t stream) {
+  const ApiCall api("hipMemcpyHtoDAsync");
+  return record(state(), copy_in_order(dst, src, bytes, hipMemcpyHostToDevice, stream, true));
+}
+hipError_t hipMemcpyDtoHAsync(void* dst, const void* src, size_t bytes, hipStream_t stream) {
+  const ApiCall api("hipMemcpyDtoHAsync");
+  return record(state(), copy_in_order(dst, src, bytes, hipMemcpyDeviceToHost, stream, true));
+}
+hipError_t hipMemcpyDtoDAsync(void* dst, const void* src, size_t bytes, hipStream_t stream) {
+  const ApiCall api("hipMemcpyDtoDAsync");
+  return record(state(), copy_in_order(dst, src, bytes, hipMemcpyDeviceToDevice, stream, true));
+}
+
+// A copy between devices. The devices have to be devices; where the bytes
+// are is what the addresses say, as ROCm's HIP copies them (a program may
+// name a device the memory is not on). No peer access is needed: every
+// device reaches every other's memory here.
+}  // extern "C"
+namespace {
+hipError_t peer_copy(void* dst, int dst_device, const void* src, int src_device, size_t bytes, hipStream_t stream,
+                     bool async) {
+  {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return e;
+    const int n = s.rt->device_count();
+    if (dst_device < 0 || dst_device >= n || src_device < 0 || src_device >= n) return hipErrorInvalidDevice;
+  }
+  return copy_in_order(dst, src, bytes, hipMemcpyDeviceToDevice, stream, async);
+}
+
+// The widest row a 2D or 3D copy takes: hipDeviceAttributeMaxPitch.
+constexpr size_t kMaxPitch = INT32_MAX;
+
+// The pointer a driver-style copy's side names: its memory type says which
+// field. An array is refused -- there are no image units -- unless it is
+// null, which is the wrong value.
+hipError_t side_pointer(int type, const void* host, void* dev, void* array, const void** out) {
+  using namespace vgpu::amd::abi;
+  switch (type) {
+    case kMemTypeHost: *out = host; break;
+    case kMemTypeDevice:
+    case kMemTypeManaged:
+    case kMemTypeUnified: *out = dev; break;
+    case kMemTypeArray: return array ? hipErrorNotSupported : hipErrorInvalidValue;
+    default: return hipErrorInvalidValue;
+  }
+  return *out ? hipSuccess : hipErrorInvalidValue;
+}
+// A row's pitch: none is as wide as the row; narrower than the row, or wider
+// than any row may be, is the wrong value.
+hipError_t row_pitch(size_t pitch, size_t width, size_t* out) {
+  if (!pitch) pitch = width;
+  if (pitch < width || pitch >= kMaxPitch) return hipErrorInvalidValue;
+  *out = pitch;
+  return hipSuccess;
+}
+
+// hipMemcpyParam2D and its kin.
+hipError_t param_2d(const vgpu::amd::abi::Memcpy2D* p, hipStream_t stream, bool async) {
+  if (!p) return hipErrorInvalidValue;
+  const void *src = nullptr, *dst = nullptr;
+  if (const hipError_t e = side_pointer(p->srcMemoryType, p->srcHost, p->srcDevice, p->srcArray, &src); e != hipSuccess)
+    return e;
+  if (const hipError_t e = side_pointer(p->dstMemoryType, p->dstHost, p->dstDevice, p->dstArray, &dst); e != hipSuccess)
+    return e;
+  size_t spitch = 0, dpitch = 0;
+  if (const hipError_t e = row_pitch(p->srcPitch, p->WidthInBytes, &spitch); e != hipSuccess) return e;
+  if (const hipError_t e = row_pitch(p->dstPitch, p->WidthInBytes, &dpitch); e != hipSuccess) return e;
+  if (!p->WidthInBytes || !p->Height) return hipSuccess;
+  const auto* s0 = static_cast<const uint8_t*>(src) + p->srcY * spitch + p->srcXInBytes;
+  auto* d0 = const_cast<uint8_t*>(static_cast<const uint8_t*>(dst)) + p->dstY * dpitch + p->dstXInBytes;
+  return copy_region(d0, Region{p->WidthInBytes, p->Height, 1, dpitch, 0}, s0,
+                     Region{p->WidthInBytes, p->Height, 1, spitch, 0}, hipMemcpyDefault, stream, async);
+}
+
+// hipMemcpy3D and its kin: each side an array or a pitched pointer, one of
+// the two. A slice is the pointer's ysize rows (the extent's height where it
+// says none).
+hipError_t copy_3d(const vgpu::amd::abi::Memcpy3DParms* p, hipStream_t stream, bool async) {
+  if (!p) return hipErrorInvalidValue;
+  const bool sarr = p->srcArray != nullptr, darr = p->dstArray != nullptr;
+  const bool sptr = p->srcPtr.ptr != nullptr, dptr = p->dstPtr.ptr != nullptr;
+  if (sarr == sptr || darr == dptr) return hipErrorInvalidValue;
+  const int kind = p->kind;
+  if (kind != hipMemcpyDefault && kind != hipMemcpyHostToHost && kind != hipMemcpyHostToDevice &&
+      kind != hipMemcpyDeviceToHost && kind != hipMemcpyDeviceToDevice)
+    return hipErrorInvalidMemcpyDirection;
+  if (sarr || darr) return hipErrorNotSupported;
+  const auto& e = p->extent;
+  size_t spitch = 0, dpitch = 0;
+  if (p->srcPtr.pitch >= kMaxPitch || p->dstPtr.pitch >= kMaxPitch) return hipErrorInvalidValue;
+  spitch = p->srcPtr.pitch ? p->srcPtr.pitch : e.width;
+  dpitch = p->dstPtr.pitch ? p->dstPtr.pitch : e.width;
+  if (!e.width || !e.height || !e.depth) return hipSuccess;
+  const uint64_t sslice = spitch * (p->srcPtr.ysize ? p->srcPtr.ysize : e.height);
+  const uint64_t dslice = dpitch * (p->dstPtr.ysize ? p->dstPtr.ysize : e.height);
+  const auto* s0 = static_cast<const uint8_t*>(p->srcPtr.ptr) + p->srcPos.z * sslice + p->srcPos.y * spitch + p->srcPos.x;
+  auto* d0 = static_cast<uint8_t*>(p->dstPtr.ptr) + p->dstPos.z * dslice + p->dstPos.y * dpitch + p->dstPos.x;
+  return copy_region(d0, Region{e.width, e.height, e.depth, dpitch, dslice}, s0,
+                     Region{e.width, e.height, e.depth, spitch, sslice}, static_cast<hipMemcpyKind>(kind), stream,
+                     async);
+}
+
+// hipDrvMemcpy3D and its kin: the driver API's 3D copy, whose sides are
+// named by memory type, and whose slice is Height rows unless a side says.
+hipError_t drv_3d(const vgpu::amd::abi::Memcpy3D* p, hipStream_t stream, bool async) {
+  if (!p) return hipErrorInvalidValue;
+  const void *src = nullptr, *dst = nullptr;
+  if (const hipError_t e = side_pointer(p->srcMemoryType, p->srcHost, p->srcDevice, p->srcArray, &src); e != hipSuccess)
+    return e;
+  if (const hipError_t e = side_pointer(p->dstMemoryType, p->dstHost, p->dstDevice, p->dstArray, &dst); e != hipSuccess)
+    return e;
+  size_t spitch = 0, dpitch = 0;
+  if (const hipError_t e = row_pitch(p->srcPitch, p->WidthInBytes, &spitch); e != hipSuccess) return e;
+  if (const hipError_t e = row_pitch(p->dstPitch, p->WidthInBytes, &dpitch); e != hipSuccess) return e;
+  if (!p->WidthInBytes || !p->Height || !p->Depth) return hipSuccess;
+  const uint64_t sslice = spitch * (p->srcHeight ? p->srcHeight : p->Height);
+  const uint64_t dslice = dpitch * (p->dstHeight ? p->dstHeight : p->Height);
+  const auto* s0 = static_cast<const uint8_t*>(src) + p->srcZ * sslice + p->srcY * spitch + p->srcXInBytes;
+  auto* d0 = const_cast<uint8_t*>(static_cast<const uint8_t*>(dst)) + p->dstZ * dslice + p->dstY * dpitch +
+             p->dstXInBytes;
+  return copy_region(d0, Region{p->WidthInBytes, p->Height, p->Depth, dpitch, dslice}, s0,
+                     Region{p->WidthInBytes, p->Height, p->Depth, spitch, sslice}, hipMemcpyDefault, stream, async);
+}
+
+// hipMemcpy3DPeer: the same, with a device for each side.
+hipError_t peer_3d(const vgpu::amd::abi::Memcpy3DPeerParms* p, hipStream_t stream, bool async) {
+  if (!p) return hipErrorInvalidValue;
+  {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return e;
+    const int n = s.rt->device_count();
+    if (p->srcDevice < 0 || p->srcDevice >= n || p->dstDevice < 0 || p->dstDevice >= n) return hipErrorInvalidDevice;
+  }
+  vgpu::amd::abi::Memcpy3DParms q{};
+  q.srcArray = p->srcArray;
+  q.srcPos = p->srcPos;
+  q.srcPtr = p->srcPtr;
+  q.dstArray = p->dstArray;
+  q.dstPos = p->dstPos;
+  q.dstPtr = p->dstPtr;
+  q.extent = p->extent;
+  q.kind = hipMemcpyDefault;
+  return copy_3d(&q, stream, async);
+}
+
+// Memory whose rows are `pitch` bytes apart: each row rounded up to 256
+// bytes, as ROCm's HIP rounds it, and the allocation exactly pitch * height
+// * depth. None at all (a zero dimension) is no allocation.
+hipError_t pitched_alloc(void** ptr, size_t* pitch, size_t width, size_t height, size_t depth) {
+  if (!ptr || !pitch) return hipErrorInvalidValue;
+  if (!width || !height || !depth) {
+    *ptr = nullptr;
+    *pitch = 0;
+    return hipSuccess;
+  }
+  if (width > SIZE_MAX - 255) return hipErrorOutOfMemory;
+  const size_t p = (width + 255) / 256 * 256;
+  size_t bytes = 0;
+  if (__builtin_mul_overflow(p, height, &bytes) || __builtin_mul_overflow(bytes, depth, &bytes))
+    return hipErrorOutOfMemory;
+  if (const hipError_t e = hipMalloc(ptr, bytes); e != hipSuccess) return e;
+  *pitch = p;
+  return hipSuccess;
+}
+
+// A memset of `rows` rows (and `depth` slices) of `width` bytes, with a
+// pattern of 1, 2 or 4 bytes.
+hipError_t set_2d(void* dst, size_t pitch, const void* pattern, uint32_t pattern_len, size_t width, size_t height,
+                  hipStream_t stream, bool async) {
+  if (!width || !height) return hipSuccess;
+  if (!dst || pitch < width) return hipErrorInvalidValue;
+  return fill_region(dst, Region{width, height, 1, pitch, 0}, static_cast<const uint8_t*>(pattern), pattern_len,
+                     stream, async);
+}
+hipError_t set_3d(const vgpu::amd::abi::PitchedPtr& p, int value, const vgpu::amd::abi::Extent& e, hipStream_t stream,
+                  bool async) {
+  if (!e.width || !e.height || !e.depth) return hipSuccess;
+  if (!p.ptr || p.pitch < e.width) return hipErrorInvalidValue;
+  uint64_t slice = 0;
+  if (__builtin_mul_overflow(p.pitch, p.ysize ? p.ysize : e.height, &slice)) return hipErrorInvalidValue;
+  const uint8_t byte = static_cast<uint8_t>(value);
+  return fill_region(p.ptr, Region{e.width, e.height, e.depth, p.pitch, slice}, &byte, 1, stream, async);
+}
+// The driver API's 2D memsets: `width` is elements of the pattern's size,
+// and the pitch has to be at least that many. A row is written up to its
+// pitch at most -- what a card writes past it lands in the next row, with
+// the same pattern -- so the last row never runs past the allocation.
+hipError_t set_d2d(void* dst, size_t pitch, const void* pattern, uint32_t size, size_t width, size_t height,
+                   hipStream_t stream, bool async) {
+  if (!dst) return hipErrorInvalidValue;
+  if (!width || !height) return hipSuccess;
+  if (pitch < width) return hipErrorInvalidValue;
+  const size_t bytes = width > pitch / size ? pitch / size * size : width * size;
+  return fill_region(dst, Region{bytes, height, 1, pitch, 0}, static_cast<const uint8_t*>(pattern), size, stream,
+                     async);
+}
+}  // namespace
+extern "C" {
+
+hipError_t hipMemcpyPeer(void* dst, int dst_device, const void* src, int src_device, size_t bytes) {
+  const ApiCall api("hipMemcpyPeer");
+  return record(state(), peer_copy(dst, dst_device, src, src_device, bytes, nullptr, false));
+}
+hipError_t hipMemcpyParam2D(const vgpu::amd::abi::Memcpy2D* p) {
+  const ApiCall api("hipMemcpyParam2D");
+  return record(state(), param_2d(p, nullptr, false));
+}
+hipError_t hipMemcpyParam2DAsync(const vgpu::amd::abi::Memcpy2D* p, hipStream_t stream) {
+  const ApiCall api("hipMemcpyParam2DAsync");
+  return record(state(), param_2d(p, stream, true));
+}
+hipError_t hipDrvMemcpy2DUnaligned(const vgpu::amd::abi::Memcpy2D* p) {
+  const ApiCall api("hipDrvMemcpy2DUnaligned");
+  return record(state(), param_2d(p, nullptr, false));
+}
+hipError_t hipMemcpy3D(const vgpu::amd::abi::Memcpy3DParms* p) {
+  const ApiCall api("hipMemcpy3D");
+  return record(state(), copy_3d(p, nullptr, false));
+}
+hipError_t hipMemcpy3DAsync(const vgpu::amd::abi::Memcpy3DParms* p, hipStream_t stream) {
+  const ApiCall api("hipMemcpy3DAsync");
+  return record(state(), copy_3d(p, stream, true));
+}
+hipError_t hipDrvMemcpy3D(const vgpu::amd::abi::Memcpy3D* p) {
+  const ApiCall api("hipDrvMemcpy3D");
+  return record(state(), drv_3d(p, nullptr, false));
+}
+hipError_t hipDrvMemcpy3DAsync(const vgpu::amd::abi::Memcpy3D* p, hipStream_t stream) {
+  const ApiCall api("hipDrvMemcpy3DAsync");
+  return record(state(), drv_3d(p, stream, true));
+}
+hipError_t hipMemcpy3DPeer(vgpu::amd::abi::Memcpy3DPeerParms* p) {
+  const ApiCall api("hipMemcpy3DPeer");
+  return record(state(), peer_3d(p, nullptr, false));
+}
+hipError_t hipMemcpy3DPeerAsync(vgpu::amd::abi::Memcpy3DPeerParms* p, hipStream_t stream) {
+  const ApiCall api("hipMemcpy3DPeerAsync");
+  return record(state(), peer_3d(p, stream, true));
+}
+// Several 3D copies, in order on the stream, each operand a pointer with its
+// row length (bytes) and slice height. The flags must be zero.
+hipError_t hipMemcpy3DBatchAsync(size_t count, vgpu::amd::abi::Memcpy3DBatchOp* ops, size_t* fail_idx,
+                                 unsigned long long flags, hipStream_t stream) {
+  const ApiCall api("hipMemcpy3DBatchAsync");
+  if (!count || !ops || flags) return record(state(), hipErrorInvalidValue);
+  for (size_t i = 0; i < count; ++i) {
+    const auto& op = ops[i];
+    hipError_t e = hipSuccess;
+    if (op.src.type != 1 || op.dst.type != 1) {
+      e = op.src.type == 2 || op.dst.type == 2 ? hipErrorNotSupported : hipErrorInvalidValue;
+    } else {
+      const auto& x = op.extent;
+      const uint64_t sp = op.src.op.ptr.rowLength ? op.src.op.ptr.rowLength : x.width;
+      const uint64_t dp = op.dst.op.ptr.rowLength ? op.dst.op.ptr.rowLength : x.width;
+      const uint64_t ss = sp * (op.src.op.ptr.layerHeight ? op.src.op.ptr.layerHeight : x.height);
+      const uint64_t ds = dp * (op.dst.op.ptr.layerHeight ? op.dst.op.ptr.layerHeight : x.height);
+      e = copy_region(op.dst.op.ptr.ptr, Region{x.width, x.height, x.depth, dp, ds}, op.src.op.ptr.ptr,
+                      Region{x.width, x.height, x.depth, sp, ss}, hipMemcpyDefault, stream, true);
+    }
+    if (e != hipSuccess) {
+      if (fail_idx) *fail_idx = i;
+      return record(state(), e);
+    }
+  }
+  return record(state(), hipSuccess);
+}
+
+hipError_t hipMallocPitch(void** ptr, size_t* pitch, size_t width, size_t height) {
+  const ApiCall api("hipMallocPitch");
+  return record(state(), pitched_alloc(ptr, pitch, width, height, 1));
+}
+hipError_t hipMemAllocPitch(void** ptr, size_t* pitch, size_t width, size_t height, unsigned int) {
+  const ApiCall api("hipMemAllocPitch");
+  return record(state(), pitched_alloc(ptr, pitch, width, height, 1));
+}
+hipError_t hipMalloc3D(vgpu::amd::abi::PitchedPtr* p, vgpu::amd::abi::Extent e) {
+  const ApiCall api("hipMalloc3D");
+  if (!p) return record(state(), hipErrorInvalidValue);
+  void* ptr = nullptr;
+  size_t pitch = 0;
+  if (const hipError_t err = pitched_alloc(&ptr, &pitch, e.width, e.height, e.depth); err != hipSuccess)
+    return record(state(), err);
+  *p = {ptr, pitch, e.width, e.height};
+  return record(state(), hipSuccess);
+}
+
+// The memsets by element width: bytes, 16-bit and 32-bit words.
+hipError_t hipMemsetD8(void* dst, unsigned char value, size_t count) {
+  const ApiCall api("hipMemsetD8");
+  return record(state(), fill_in_order(dst, &value, 1, count, nullptr, false));
+}
+hipError_t hipMemsetD8Async(void* dst, unsigned char value, size_t count, hipStream_t stream) {
+  const ApiCall api("hipMemsetD8Async");
+  return record(state(), fill_in_order(dst, &value, 1, count, stream, true));
+}
+hipError_t hipMemsetD16(void* dst, unsigned short value, size_t count) {
+  const ApiCall api("hipMemsetD16");
+  return record(state(), fill_in_order(dst, reinterpret_cast<const uint8_t*>(&value), 2, count * 2, nullptr, false));
+}
+hipError_t hipMemsetD16Async(void* dst, unsigned short value, size_t count, hipStream_t stream) {
+  const ApiCall api("hipMemsetD16Async");
+  return record(state(), fill_in_order(dst, reinterpret_cast<const uint8_t*>(&value), 2, count * 2, stream, true));
+}
+hipError_t hipMemsetD32(void* dst, int value, size_t count) {
+  const ApiCall api("hipMemsetD32");
+  return record(state(), fill_in_order(dst, reinterpret_cast<const uint8_t*>(&value), 4, count * 4, nullptr, false));
+}
+hipError_t hipMemset2D(void* dst, size_t pitch, int value, size_t width, size_t height) {
+  const ApiCall api("hipMemset2D");
+  const uint8_t byte = static_cast<uint8_t>(value);
+  return record(state(), set_2d(dst, pitch, &byte, 1, width, height, nullptr, false));
+}
+hipError_t hipMemset2DAsync(void* dst, size_t pitch, int value, size_t width, size_t height, hipStream_t stream) {
+  const ApiCall api("hipMemset2DAsync");
+  const uint8_t byte = static_cast<uint8_t>(value);
+  return record(state(), set_2d(dst, pitch, &byte, 1, width, height, stream, true));
+}
+hipError_t hipMemset3D(vgpu::amd::abi::PitchedPtr p, int value, vgpu::amd::abi::Extent e) {
+  const ApiCall api("hipMemset3D");
+  return record(state(), set_3d(p, value, e, nullptr, false));
+}
+hipError_t hipMemset3DAsync(vgpu::amd::abi::PitchedPtr p, int value, vgpu::amd::abi::Extent e, hipStream_t stream) {
+  const ApiCall api("hipMemset3DAsync");
+  return record(state(), set_3d(p, value, e, stream, true));
+}
+hipError_t hipMemsetD2D8(void* dst, size_t pitch, unsigned char value, size_t width, size_t height) {
+  const ApiCall api("hipMemsetD2D8");
+  return record(state(), set_d2d(dst, pitch, &value, 1, width, height, nullptr, false));
+}
+hipError_t hipMemsetD2D8Async(void* dst, size_t pitch, unsigned char value, size_t width, size_t height,
+                              hipStream_t stream) {
+  const ApiCall api("hipMemsetD2D8Async");
+  return record(state(), set_d2d(dst, pitch, &value, 1, width, height, stream, true));
+}
+hipError_t hipMemsetD2D16(void* dst, size_t pitch, unsigned short value, size_t width, size_t height) {
+  const ApiCall api("hipMemsetD2D16");
+  return record(state(), set_d2d(dst, pitch, &value, 2, width, height, nullptr, false));
+}
+hipError_t hipMemsetD2D16Async(void* dst, size_t pitch, unsigned short value, size_t width, size_t height,
+                               hipStream_t stream) {
+  const ApiCall api("hipMemsetD2D16Async");
+  return record(state(), set_d2d(dst, pitch, &value, 2, width, height, stream, true));
+}
+hipError_t hipMemsetD2D32(void* dst, size_t pitch, unsigned int value, size_t width, size_t height) {
+  const ApiCall api("hipMemsetD2D32");
+  return record(state(), set_d2d(dst, pitch, &value, 4, width, height, nullptr, false));
+}
+hipError_t hipMemsetD2D32Async(void* dst, size_t pitch, unsigned int value, size_t width, size_t height,
+                               hipStream_t stream) {
+  const ApiCall api("hipMemsetD2D32Async");
+  return record(state(), set_d2d(dst, pitch, &value, 4, width, height, stream, true));
+}
+
+// Copies to and from arrays: there are none on this device.
+hipError_t hipMemcpyAtoA(void* dst, size_t, void* src, size_t, size_t) {
+  const ApiCall api("hipMemcpyAtoA");
+  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+}
+hipError_t hipMemcpyAtoD(void* dst, void* src, size_t, size_t) {
+  const ApiCall api("hipMemcpyAtoD");
+  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+}
+hipError_t hipMemcpyAtoH(void* dst, void* src, size_t, size_t) {
+  const ApiCall api("hipMemcpyAtoH");
+  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+}
+hipError_t hipMemcpyAtoHAsync(void* dst, void* src, size_t, size_t, hipStream_t) {
+  const ApiCall api("hipMemcpyAtoHAsync");
+  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+}
+hipError_t hipMemcpyDtoA(void* dst, size_t, void* src, size_t) {
+  const ApiCall api("hipMemcpyDtoA");
+  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+}
+hipError_t hipMemcpyHtoA(void* dst, size_t, const void* src, size_t) {
+  const ApiCall api("hipMemcpyHtoA");
+  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+}
+hipError_t hipMemcpyHtoAAsync(void* dst, size_t, const void* src, size_t, hipStream_t) {
+  const ApiCall api("hipMemcpyHtoAAsync");
+  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+}
+
+// The per-thread default stream's forms of the 3D copy and the 2D and 3D
+// memsets (see "The per-thread default stream's forms").
+hipError_t hipMemcpy3D_spt(const vgpu::amd::abi::Memcpy3DParms* p) {
+  const ApiCall api("hipMemcpy3D_spt");
+  return record(state(), copy_3d(p, spt(nullptr), false));
+}
+hipError_t hipMemcpy3DAsync_spt(const vgpu::amd::abi::Memcpy3DParms* p, hipStream_t stream) {
+  return hipMemcpy3DAsync(p, spt(stream));
+}
+hipError_t hipMemset2D_spt(void* dst, size_t pitch, int value, size_t width, size_t height) {
+  const ApiCall api("hipMemset2D_spt");
+  const uint8_t byte = static_cast<uint8_t>(value);
+  return record(state(), set_2d(dst, pitch, &byte, 1, width, height, spt(nullptr), false));
+}
+hipError_t hipMemset2DAsync_spt(void* dst, size_t pitch, int value, size_t width, size_t height, hipStream_t stream) {
+  return hipMemset2DAsync(dst, pitch, value, width, height, spt(stream));
+}
+hipError_t hipMemset3D_spt(vgpu::amd::abi::PitchedPtr p, int value, vgpu::amd::abi::Extent e) {
+  const ApiCall api("hipMemset3D_spt");
+  return record(state(), set_3d(p, value, e, spt(nullptr), false));
+}
+hipError_t hipMemset3DAsync_spt(vgpu::amd::abi::PitchedPtr p, int value, vgpu::amd::abi::Extent e,
+                                hipStream_t stream) {
+  return hipMemset3DAsync(p, value, e, spt(stream));
+}
+
+// ---- Pools a device allocates from, and who reaches them ---------------------
+
+// The pool hipMallocAsync takes from, for each device: its default pool until
+// a program sets another, which every thread then sees, and the default
+// again once the one set is destroyed. Wrong arguments are the wrong value
+// here, the device included.
+hipError_t hipDeviceGetMemPool(void** pool, int ordinal) {
+  const ApiCall api("hipDeviceGetMemPool");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!pool || !valid_device(s, ordinal)) return record(s, hipErrorInvalidValue);
+  *pool = current_pool(s, ordinal);
+  return record(s, hipSuccess);
+}
+hipError_t hipDeviceSetMemPool(int ordinal, void* pool) {
+  const ApiCall api("hipDeviceSetMemPool");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!pool || !valid_device(s, ordinal)) return record(s, hipErrorInvalidValue);
+  Pool* p = find_pool(s, pool);
+  if (!p) return record(s, hipErrorInvalidValue);
+  s.current_pools[ordinal] = p;
+  return record(s, hipSuccess);
+}
+// A pool's own device reads and writes it always; another device as it was
+// last granted (none until it is).
+hipError_t hipMemPoolGetAccess(int* flags, void* pool, vgpu::amd::abi::MemLocation* location) {
+  const ApiCall api("hipMemPoolGetAccess");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  Pool* p = find_pool(s, pool);
+  if (!p || !flags || !location || location->type != 1 || !valid_device(s, location->id))
+    return record(s, hipErrorInvalidValue);
+  refresh_pool_access(*p);
+  if (location->id == p->device) *flags = 3;   // hipMemAccessFlagsProtReadWrite
+  else if (const auto it = p->access.find(location->id); it != p->access.end()) *flags = it->second;
+  else *flags = 0;
+  return record(s, hipSuccess);
+}
+
+// Virtual memory's access, by device: the owning device's as the memory
+// manager keeps it, another's as it was granted.
+hipError_t hipMemGetAccess(unsigned long long* flags, const vgpu::amd::abi::MemLocation* location, void* ptr) {
+  const ApiCall api("hipMemGetAccess");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!flags || !location || !ptr || location->type != 1 || !valid_device(s, location->id))
+    return record(s, hipErrorInvalidValue);
+  const uint64_t va = reinterpret_cast<uint64_t>(ptr);
+  const int owner = owner_of(s, va);
+  bool readable = false, writable = false;
+  if (owner < 0 || !s.rt->device(owner).memory().access_at(va, &readable, &writable))
+    return record(s, hipErrorInvalidValue);
+  if (location->id == owner) {
+    *flags = writable ? 3 : readable ? 1 : 0;
+    return record(s, hipSuccess);
+  }
+  *flags = 0;
+  for (const auto& [range, grants] : s.vmm_access)
+    if (va >= range.first && va < range.first + range.second)
+      if (const auto it = grants.find(location->id); it != grants.end()) *flags = static_cast<unsigned>(it->second);
+  return record(s, hipSuccess);
+}
+
+// ---- Graph memory's counters ---------------------------------------------------
+
+// What graphs have allocated on a device: in use now and at most, reserved
+// now and at most. Only the two high-water marks may be set, and only back
+// to zero, where they start again from what is in use.
+hipError_t hipDeviceGetGraphMemAttribute(int ordinal, int attr, void* value) {
+  const ApiCall api("hipDeviceGetGraphMemAttribute");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!valid_device(s, ordinal)) return record(s, hipErrorInvalidDevice);
+  if (attr < 0 || attr > 3 || !value) return record(s, hipErrorInvalidValue);
+  const GraphMemory& g = s.graph_memory[ordinal];
+  const uint64_t v[4] = {g.used, g.used_high, g.used, g.used_high};
+  *static_cast<uint64_t*>(value) = v[attr];
+  return record(s, hipSuccess);
+}
+hipError_t hipDeviceSetGraphMemAttribute(int ordinal, int attr, void* value) {
+  const ApiCall api("hipDeviceSetGraphMemAttribute");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!valid_device(s, ordinal)) return record(s, hipErrorInvalidDevice);
+  if ((attr != 1 && attr != 3) || !value || *static_cast<const uint64_t*>(value))
+    return record(s, hipErrorInvalidValue);
+  GraphMemory& g = s.graph_memory[ordinal];
+  g.used_high = g.used;
+  return record(s, hipSuccess);
+}
+// Graph memory is freed when it is, so there is none held back to give back.
+hipError_t hipDeviceGraphMemTrim(int ordinal) {
+  const ApiCall api("hipDeviceGraphMemTrim");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  return record(s, valid_device(s, ordinal) ? hipSuccess : hipErrorInvalidDevice);
+}
+
+// ---- Memory and semaphores another API made (Vulkan interop) -------------------
+//
+// Nothing here can import another API's memory or semaphores; what a call
+// gets wrong about its arguments is still refused as ROCm's HIP refuses it,
+// before that.
+hipError_t hipImportExternalMemory(void** out, const void* desc) {
+  const ApiCall api("hipImportExternalMemory");
+  if (!out || !desc) return record(state(), hipErrorInvalidValue);
+  const int type = *static_cast<const int*>(desc);
+  const auto size = *reinterpret_cast<const unsigned long long*>(static_cast<const uint8_t*>(desc) + 24);
+  const auto flags = *reinterpret_cast<const unsigned*>(static_cast<const uint8_t*>(desc) + 32);
+  if (type < 1 || type > 8 || !size || flags > 1) return record(state(), hipErrorInvalidValue);
+  return record(state(), hipErrorNotSupported);
+}
+hipError_t hipExternalMemoryGetMappedBuffer(void** ptr, void* mem, const void* desc) {
+  const ApiCall api("hipExternalMemoryGetMappedBuffer");
+  (void)ptr, (void)mem, (void)desc;
+  return record(state(), hipErrorInvalidValue);   // there is no external memory to map
+}
+hipError_t hipDestroyExternalMemory(void*) {
+  const ApiCall api("hipDestroyExternalMemory");
+  return record(state(), hipErrorInvalidValue);
+}
+hipError_t hipImportExternalSemaphore(void** out, const void* desc) {
+  const ApiCall api("hipImportExternalSemaphore");
+  if (!out || !desc) return record(state(), hipErrorInvalidValue);
+  const int type = *static_cast<const int*>(desc);
+  if (type < 1 || type > 10) return record(state(), hipErrorInvalidValue);
+  return record(state(), hipErrorNotSupported);
+}
+hipError_t hipSignalExternalSemaphoresAsync(const void* sems, const void* params, unsigned int, hipStream_t) {
+  const ApiCall api("hipSignalExternalSemaphoresAsync");
+  (void)sems, (void)params;   // no semaphore can have been imported: any array is the wrong value
+  return record(state(), hipErrorInvalidValue);
+}
+hipError_t hipWaitExternalSemaphoresAsync(const void* sems, const void* params, unsigned int, hipStream_t) {
+  const ApiCall api("hipWaitExternalSemaphoresAsync");
+  (void)sems, (void)params;   // no semaphore can have been imported: any array is the wrong value
+  return record(state(), hipErrorInvalidValue);
+}
+hipError_t hipDestroyExternalSemaphore(void*) {
+  const ApiCall api("hipDestroyExternalSemaphore");
+  return record(state(), hipErrorInvalidValue);
 }
 
 // ---- The per-thread default stream's forms (_spt) -----------------------------
