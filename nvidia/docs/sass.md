@@ -87,8 +87,7 @@ Every generation from Turing to Blackwell runs, sm_75 through sm_120a:
 | sm_120 | RTX 5090 | sm_120's integer and float forms, block-scaled MMA |
 
 Instructions the executor does not run, and so leave a kernel to its PTX:
-`R2UR.OR` (nothing seen shows what it computes), `LDGMC` (multimem; the PTX
-engine has no multicast memory either), TMA's `im2col::w` modes (nor does the
+`LDGMC` (multimem; the PTX engine has no multicast memory either), TMA's `im2col::w` modes (nor does the
 PTX engine), and the texture forms with a LOD clamp, a LOD bias, offsets or a
 depth compare. A `WARPSYNC.COLLECTIVE` reached from different code paths of
 one warp is refused when it happens.

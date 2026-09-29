@@ -68,9 +68,7 @@ bool executes(const Instr& ins) {
     case Op::WARPSYNC: case Op::ENDCOLLECTIVE: case Op::UCGABAR:
       return true;
     case Op::R2UR:
-      // Not .OR: nothing seen here uses it in a way that shows what it
-      // computes, so a kernel with it runs on its PTX.
-      return !(ins.w.bit(84));
+      return true;
     default:
       return false;
   }
@@ -749,17 +747,22 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       return;
     case Op::R2UR:
       // R2UR [Pd,] URd, Ra: the value of the first active lane into a
-      // uniform register -- and Pd whether every active lane holds that
-      // value, the test ptxas makes before a *_sync intrinsic with a mask
-      // it cannot prove uniform (REDUX.OR, R2UR Pd, @!Pd BRA.DIV).
+      // uniform register, and in each active lane's Pd whether its own value
+      // differs from it (.OR: or'd into Pd). ptxas's "waterfall" for a
+      // uniform-only instruction fed per-lane values (a TMA store's
+      // coordinates): R2UR, then R2UR.OR for each further value, runs the
+      // instruction once, and goes round again while any lane's Pd is set --
+      // which ends only if Pd marks the lanes still to do.
       if (ex) {
         const unsigned l = static_cast<unsigned>(std::countr_zero(ex));
         const uint32_t v = read32(w, ins.src[0], l);
         write32(w, ins.dst.back(), l, v);
         if (ins.f[0]) {
-          bool same = true;
-          each_lane(ex, [&](unsigned k) { same = same && read32(w, ins.src[0], k) == v; });
-          each_lane(ex, [&](unsigned k) { set_pred(w, ins.dst[0], k, same); });
+          const bool accumulate = ins.w.bit(84);
+          each_lane(ex, [&](unsigned k) {
+            const bool differs = read32(w, ins.src[0], k) != v;
+            set_pred(w, ins.dst[0], k, differs || (accumulate && pred(w, ins.dst[0], k)));
+          });
         }
       }
       return;

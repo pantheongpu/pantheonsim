@@ -27,8 +27,8 @@ bool runs_instr(const Instr& ins);   // src/sass/exec.cpp
 namespace {
 
 // What the executor refuses on purpose, leaving a kernel to its PTX
-// (nvidia/docs/sass.md): multimem's LDGMC, TMA's im2col::w modes, R2UR.OR,
-// and the texture forms it does not implement. Anything else refused is a
+// (nvidia/docs/sass.md): multimem's LDGMC, TMA's im2col::w modes, and the
+// texture forms it does not implement. Anything else refused is a
 // mistake -- twice a case inserted into executes() fell through and turned
 // away most instructions, which only showed as kernels quietly running on
 // PTX.
@@ -39,8 +39,7 @@ bool refused_on_purpose(const sass::Instr& ins) {
     return false;
   };
   return ins.mnemonic == "LDGMC" || (ins.mnemonic == "UTMALDG" && (has("W") || has("W128"))) ||
-         (ins.mnemonic == "R2UR" && has("OR")) || ins.mnemonic == "TEX" || ins.mnemonic == "TLD" ||
-         ins.mnemonic == "TLD4";
+         ins.mnemonic == "TEX" || ins.mnemonic == "TLD" || ins.mnemonic == "TLD4";
 }
 
 struct Tally {

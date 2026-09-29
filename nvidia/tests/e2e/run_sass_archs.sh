@@ -37,7 +37,7 @@ archs=(${VGPU_SASS_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_90a sm_100 sm_100a sm
 # [:last one it runs on (runtime_conformance checks a T4's properties)].
 progs=(${VGPU_SASS_PROGRAMS:-sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
        runtime_conformance:75:75 symbols:75 surface_oob:75 textures:75 texture_filtering:75 texture_gather:75
-       texture_layers:75 texture_mipmaps:75 block_semaphore:75 cooperative_grid:75 alloca_stack:75 mma_forms:80
+       texture_layers:75 texture_mipmaps:75 block_semaphore:75 cooperative_grid:75 alloca_stack:75 waterfall:90 mma_forms:80
        mma_fragment_layout:80 modern_dtypes:80 wmma_gemm:80 wmma_types:80 dsmem_cluster:90
        wgmma_cute:90a tma_gemm_cute:90a tma_reduce_cute:90a tma_im2col:90a tensormap_replace_cute:90a
        stmatrix:90a tcgen05_gemm:100a})
