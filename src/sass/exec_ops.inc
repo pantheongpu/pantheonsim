@@ -45,7 +45,8 @@ bool executes(const Instr& ins) {
     case Op::USEL: case Op::USHF: case Op::VABSDIFF4: case Op::VIADD: case Op::VIMNMX: case Op::VIADDMNMX:
     case Op::VIMNMX3: case Op::IADD: case Op::UP2UR: case Op::ELECT: case Op::USETMAXREG: case Op::WARPGROUP:
     case Op::FMNMX3: case Op::STSM: case Op::RPCMOV: case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
-    case Op::SYNCS: case Op::ARRIVES:
+    case Op::SYNCS: case Op::ARRIVES: case Op::UTMALDG: case Op::UTMASTG: case Op::UTMAREDG: case Op::UBLKCP:
+    case Op::UBLKRED:
     case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2FP: case Op::F2I:
     case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL:
     case Op::FSET: case Op::FSETP: case Op::HADD2: case Op::HFMA2: case Op::HMUL2: case Op::HSET2: case Op::HSETP2:
@@ -145,6 +146,9 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
         break;
       case Op::SYNCS: case Op::ARRIVES:
         exec_syncs(blk, w, ins, ex);
+        break;
+      case Op::UTMALDG: case Op::UTMASTG: case Op::UTMAREDG: case Op::UBLKCP: case Op::UBLKRED:
+        exec_tma(blk, w, ins, ex);
         break;
       case Op::FADD: case Op::FMUL: case Op::FFMA: case Op::FMNMX: case Op::FSETP: case Op::FSET:
       case Op::FSEL: case Op::FCHK: case Op::MUFU: case Op::DADD: case Op::DMUL: case Op::DFMA:
@@ -2879,5 +2883,235 @@ void Runner::exec_syncs(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       return;
     default:
       throw Fault("SYNCS form not implemented");
+  }
+}
+
+// ---- the tensor memory accelerator (UTMALDG, UTMASTG, UTMAREDG, UBLKCP, UBLKRED) --
+//
+// Each is issued once for the warp (its operands are uniform registers, and
+// ptxas elects one thread to issue it). A copy happens when issued: a load's
+// data is in shared memory and its bytes complete on its mbarrier right
+// away, which a kernel that waits on the barrier cannot tell from later; a
+// store or reduction has reached global memory before the kernel's bulk-group
+// wait (DEPBAR.LE SB0) looks. The element walk is the PTX engine's
+// (exec/tma.hpp). Operands, from decode.cpp: [URa] at 32 -- a load's shared
+// destination, its mbarrier at URa+1 and the coordinates from URa+2; a store's
+// shared source and the coordinates from URa+1 -- and [URb] at 24, the tensor
+// map's address. The uniform register at 64 holds the im2col offsets (low 16
+// bits: one 16-bit offset in 3D, two 8-bit ones in 4D, three 5-bit ones in
+// 5D) and the multicast CTA mask (high 16 bits).
+namespace {
+ptx::AtomOp sass_atom_op(uint32_t op) {
+  static const ptx::AtomOp ops[] = {ptx::AtomOp::Add, ptx::AtomOp::Min, ptx::AtomOp::Max, ptx::AtomOp::Inc,
+                                    ptx::AtomOp::Dec, ptx::AtomOp::And, ptx::AtomOp::Or,  ptx::AtomOp::Xor};
+  return ops[op & 7];
+}
+}  // namespace
+
+// The shared memory a cluster-wide shared address names: the rank in bits
+// 24 up, the offset below.
+Block& Runner::shared_block(Block& blk, uint32_t addr, uint32_t* off) {
+  *off = addr & 0xffffff;
+  if ((addr >> 24) != 0) throw Fault("shared memory of another block of a cluster (a cluster launch runs on PTX)");
+  return blk;
+}
+
+void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
+  if (!ex) return;
+  const Word& word = ins.w;
+  const unsigned ub = m_.sm >= 100 ? 8 : 6, urz = m_.sm >= 100 ? 255u : 63u;
+  const auto urv = [&](unsigned u) -> uint32_t { return u >= urz ? 0 : w.ur[u]; };
+  const auto ur64 = [&](unsigned u) -> uint64_t { return urv(u) | (static_cast<uint64_t>(urv(u + 1)) << 32); };
+  const unsigned ura = static_cast<unsigned>(word.field(32, ub)), urb = static_cast<unsigned>(word.field(24, ub)),
+                 urc = static_cast<unsigned>(word.field(64, ub));
+  const unsigned lane = static_cast<unsigned>(std::countr_zero(ex));
+  const auto gread = [&](uint64_t a, void* out, uint32_t n) { mem_read(blk, w, lane, Space::Global, a, out, n); };
+  const auto gwrite = [&](uint64_t a, const void* in, uint32_t n) { mem_write(blk, w, lane, Space::Global, a, in, n); };
+  const auto greduce = [&](uint64_t a, const uint8_t* src, uint32_t es, const ptx::Type& ty, ptx::AtomOp op) {
+    uint64_t b = 0;
+    std::memcpy(&b, src, es);
+    std::lock_guard<std::mutex> g(atomic_lock(a));
+    const uint64_t old = mem_.load_scalar(a, es);
+    mem_.store_scalar(a, es, exec::reduce_value(op, ty, old, b));
+    ++blk.st.atomics;
+    blk.st.atomic_bytes += es;
+  };
+  const auto shared_range = [&](Block& b, uint32_t off, uint64_t n, const char* what) {
+    if (off + n > b.shared.size())
+      throw Fault(std::string(what) + " reaches shared offset " + std::to_string(off + n) + ", past the block's " +
+                  std::to_string(b.shared.size()) + " bytes");
+  };
+
+  if (ins.op == Op::UBLKCP || ins.op == Op::UBLKRED) {
+    const unsigned dir = ins.f[0];   // 1 .S.G, 2 .G.S, 3 .S.S
+    const uint32_t n = urv(urc);
+    if (n % 16) throw Fault("a bulk copy's size must be a multiple of 16");
+    std::vector<uint8_t> data(n);
+    if (dir == 1) {
+      const uint64_t g = ur64(urb);
+      if (g % 16) throw Fault("a bulk copy's global address must be 16-byte aligned");
+      gread(g, data.data(), n);
+      blk.st.global_loads += 1;
+      blk.st.global_bytes_read += n;
+    } else {
+      uint32_t off;
+      Block& src = shared_block(blk, urv(urb), &off);
+      if (&src != &blk) throw Fault("a bulk copy's source must be this block's shared memory");
+      shared_range(src, off, n, "a bulk copy's source");
+      std::memcpy(data.data(), &src.shared[off], n);
+    }
+    if (dir == 2) {   // to global
+      const uint64_t g = ur64(ura);
+      if (g % 16) throw Fault("a bulk copy's global address must be 16-byte aligned");
+      if (ins.op == Op::UBLKCP) {
+        gwrite(g, data.data(), n);
+        blk.st.global_stores += 1;
+        blk.st.global_bytes_written += n;
+      } else {
+        static const ptx::Type types[16] = {{ptx::Type::Kind::U, 32}, {ptx::Type::Kind::S, 32}, {ptx::Type::Kind::U, 64},
+                                            {ptx::Type::Kind::S, 64}, {ptx::Type::Kind::F, 16}, {ptx::Type::Kind::F, 32},
+                                            {},                       {ptx::Type::Kind::F, 64}, {ptx::Type::Kind::BF, 16}};
+        const ptx::Type& ty = types[ins.f[3] & 15];
+        if (!ty.bits) throw Fault("UBLKRED type " + std::to_string(ins.f[3]) + " is not known");
+        for (uint32_t o = 0; o < n; o += ty.bytes()) greduce(g + o, data.data() + o, ty.bytes(), ty, sass_atom_op(ins.f[2]));
+      }
+      return;
+    }
+    // Into shared memory, completing on the destination's mbarrier.
+    const uint32_t dst_addr = urv(ura), bar_addr = urv(ura + 1);
+    const uint32_t mask = ins.f[1] ? (urv(urc + 1) & 0xffff) : 0;
+    const auto deliver = [&](Block& to, uint32_t off, uint32_t bar_off) {
+      shared_range(to, off, n, "a bulk copy");
+      if (ins.op == Op::UBLKRED) {   // .S.S: an integer reduction into shared memory
+        static const ptx::Type types[3] = {{ptx::Type::Kind::U, 32}, {ptx::Type::Kind::S, 32}, {ptx::Type::Kind::U, 64}};
+        if (ins.f[3] > 2) throw Fault("UBLKRED.S.S type " + std::to_string(ins.f[3]) + " is not known");
+        const ptx::Type& ty = types[ins.f[3]];
+        for (uint32_t o = 0; o < n; o += ty.bytes()) {
+          uint64_t old = 0, b = 0;
+          std::memcpy(&old, &to.shared[off + o], ty.bytes());
+          std::memcpy(&b, &data[o], ty.bytes());
+          const uint64_t r = exec::reduce_value(sass_atom_op(ins.f[2]), ty, old, b);
+          std::memcpy(&to.shared[off + o], &r, ty.bytes());
+        }
+      } else {
+        std::memcpy(&to.shared[off], data.data(), n);
+      }
+      mbar_arrive(to, bar_off, 0, -static_cast<int64_t>(n), false);
+    };
+    uint32_t off, bar_off;
+    Block& to = shared_block(blk, dst_addr, &off);
+    Block& bar = shared_block(blk, bar_addr, &bar_off);
+    if (&bar != &to) throw Fault("a bulk copy's mbarrier must be in the block its data goes to");
+    if (off % 16) throw Fault("a bulk copy's shared address must be 16-byte aligned");
+    if (!ins.f[1]) {
+      deliver(to, off, bar_off);
+    } else {
+      if (mask & ~1u) throw Fault("a multicast bulk copy to other blocks of a cluster (a cluster launch runs on PTX)");
+      if (mask & 1u) deliver(to, off, bar_off);
+    }
+    return;
+  }
+
+  // Tensor copies.
+  const bool load = ins.op == Op::UTMALDG, reduce = ins.op == Op::UTMAREDG;
+  const uint32_t dims = ins.f[0];
+  const bool im2col = ins.f[1], multicast = ins.f[2];
+  const uint64_t tmap_at = ur64(urb);
+  if (tmap_at % 64) throw Error(Err::MisalignedAccess, "a tensor map must be 64-byte aligned");
+  uint64_t q[16];
+  {
+    uint64_t off;
+    const Space sp = classify(tmap_at, &off);
+    if (sp != Space::Global && sp != Space::Param) throw Fault("a tensor map in shared or local memory");
+    mem_read(blk, w, lane, sp, off, q, sizeof q);
+  }
+  exec::TensorMap map;
+  if (!map.decode(q))
+    throw Error(Err::InvalidValue,
+                "the tensor map this copy names was not made by cuTensorMapEncodeTiled (or was overwritten); its first "
+                "bytes are not the encoder's");
+  int64_t coords[5] = {};
+  const unsigned first = load ? ura + 2 : ura + 1;
+  for (uint32_t d = 0; d < dims && d < 5; ++d) coords[d] = static_cast<int32_t>(urv(first + d));
+  exec::TmaBox box;
+  if (auto bad = exec::tma_box(map, dims, coords, false, im2col, load, reduce, &box)) throw Error(bad->code, bad->what);
+  const uint32_t extra = (im2col || multicast) ? urv(urc) : 0;
+  std::array<int64_t, 3> offsets{};
+  if (im2col) {
+    const uint32_t bits = exec::TensorMap::corner_bits(map.rank);
+    for (uint32_t i = 0; i + 2 < map.rank && i < 3; ++i) offsets[i] = (extra >> (bits * i)) & ((1u << bits) - 1);
+  }
+  const uint32_t swz = exec::TensorMap::swizzle_bytes(map.swizzle), atom = exec::TensorMap::swizzle_atom(map.swizzle);
+  uint32_t smem;
+  Block& home = shared_block(blk, urv(ura), &smem);
+  if (smem % 16) throw Error(Err::MisalignedAccess, "a bulk copy's shared-memory address must be 16-byte aligned");
+  if (load) {
+    // The box, read from global memory into its shared-memory layout.
+    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> runs;   // (shared offset, bytes)
+    runs.reserve(box.total);
+    exec::tma_walk(map, box, nullptr, offsets, false, [&](uint64_t e, uint64_t gaddr, bool inside) {
+      const uint32_t soff = static_cast<uint32_t>(exec::swizzle_address(smem + e * box.es, swz, atom));
+      std::vector<uint8_t> v(box.packed ? box.gs : box.es, 0);
+      if (inside) gread(gaddr, v.data(), static_cast<uint32_t>(v.size()));
+      else if (map.oob_nan && !box.packed)
+        throw Error(Err::UnsupportedPtx,
+                    "the box crosses the tensor's edge and the map asks for the NaN out-of-bounds fill, whose value is "
+                    "not documented; only zero fill is implemented");
+      runs.emplace_back(soff, std::move(v));
+    });
+    blk.st.global_loads += 1;
+    blk.st.global_bytes_read += box.total * box.gs;
+    // The barrier counts every byte of the box, the zero-filled ones too (for
+    // the packed types, the packed bytes).
+    const uint32_t mask = multicast ? extra >> 16 : 1u;
+    if (mask & ~1u) throw Fault("a multicast tensor copy to other blocks of a cluster (a cluster launch runs on PTX)");
+    if (mask & 1u) {
+      uint32_t bar_off;
+      Block& bar = shared_block(blk, urv(ura + 1), &bar_off);
+      if (&bar != &home) throw Fault("a tensor copy's mbarrier must be in the block its data goes to");
+      for (const auto& [soff, v] : runs) {
+        shared_range(home, soff, v.size(), "a tensor copy");
+        std::memcpy(&home.shared[soff], v.data(), v.size());
+      }
+      mbar_arrive(bar, bar_off, 0, -static_cast<int64_t>(box.total * box.gs), false);
+    }
+    return;
+  }
+  // A store or reduction: the elements inside the tensor, from this block's
+  // shared memory.
+  if (&home != &blk) throw Fault("a tensor store's source must be this block's shared memory");
+  std::optional<ptx::Type> red_ty;
+  if (reduce) {
+    red_ty = exec::tensor_reduce_type(map.type, sass_atom_op(ins.f[3]));
+    if (!red_ty)
+      throw Error(Err::UnsupportedPtx,
+                  "a tensor reduction with no form of this operation for the tensor map's element type (9.7.10.28.5.4)");
+  }
+  uint64_t stored = 0;
+  exec::tma_walk(map, box, nullptr, offsets, false, [&](uint64_t e, uint64_t gaddr, bool inside) {
+    if (!inside) return;
+    const uint32_t soff = static_cast<uint32_t>(exec::swizzle_address(smem + e * box.es, swz, atom));
+    shared_range(blk, soff, box.es, "a tensor store");
+    const uint8_t* src = &blk.shared[soff];
+    if (box.packed) {
+      uint8_t out[16] = {};
+      if (map.type == exec::TmapType::U6x16Align16) {
+        for (int i = 0; i < 16; ++i)
+          for (int b = 0; b < 6; ++b)
+            if (src[i] >> b & 1) out[(6 * i + b) / 8] |= static_cast<uint8_t>(1u << ((6 * i + b) % 8));
+      } else {
+        std::memcpy(out, src, box.gs);
+      }
+      gwrite(gaddr, out, box.gs);
+    } else if (reduce) {
+      greduce(gaddr, src, box.es, *red_ty, sass_atom_op(ins.f[3]));
+    } else {
+      gwrite(gaddr, src, box.es);
+    }
+    stored += box.gs;
+  });
+  if (!reduce) {
+    blk.st.global_stores += 1;
+    blk.st.global_bytes_written += stored;
   }
 }

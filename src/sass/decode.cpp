@@ -2702,13 +2702,14 @@ void dec_tma(Instr& ins, const Word& w, Op op, const char* name) {
   ins.mnemonic = name;
   const unsigned dims = static_cast<unsigned>(w.field(79, 3)) + 1;
   ins.mods.push_back(std::to_string(dims) + "D");
-  if (op == Op::UTMAREDG) ins.mods.push_back("ADD");
+  if (op == Op::UTMAREDG) ins.mods.push_back(kAtomOp[w.field(87, 3)]);   // 87-89: ADD MIN MAX INC DEC AND OR XOR
   if (w.bit(82)) ins.mods.push_back("IM2COL");
   if (w.bit(75)) ins.mods.push_back("MULTICAST");
   if (ins.sm >= 100 && w.bit(85)) ins.mods.push_back("2CTA");   // a CTA pair's shared memory
   ins.f[0] = dims;
   ins.f[1] = w.bit(82);
   ins.f[2] = w.bit(75);
+  ins.f[3] = static_cast<uint32_t>(w.field(87, 3));   // UTMAREDG's op
   const int ub = static_cast<int>(ureg_bits(ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(32, ub)), 0, ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, ub)), 0, ins.sm));
@@ -2716,21 +2717,57 @@ void dec_tma(Instr& ins, const Word& w, Op op, const char* name) {
   if (w.bit(76)) ins.src.push_back(Txt("desc[UR" + std::to_string(w.field(40, ub)) + "]"));
 }
 
-// UBLKCP.S.G / .G.S (cp.async.bulk): shared <- global (73) or global <-
-// shared (74). [URa] at 32 the destination (a shared one's mbarrier at
+// UBLKCP (cp.async.bulk) and UBLKRED (cp.reduce.async.bulk): 73-74 the
+// direction -- 1 .S.G (shared <- global), 2 .G.S, 3 .S.S (to another CTA's
+// shared memory) -- and 75 .MULTICAST (the CTA mask in the uniform register
+// after the count). [URa] at 32 the destination (a shared one's mbarrier at
 // URa+1), [URb] at 24 the source, the byte count in the uniform register at
-// 64.
-void dec_ublkcp(Instr& ins, const Word& w) {
-  ins.op = Op::UBLKCP;
-  ins.mnemonic = "UBLKCP";
-  const bool to_global = w.bit(74);
-  ins.mods.push_back(to_global ? "G" : "S");
-  ins.mods.push_back(to_global ? "S" : "G");
-  ins.f[0] = to_global;
+// 64. UBLKRED: 87-89 the op, 81-84 the type (0 U32, 1 S32, 2 U64, 3 S64,
+// 4 F16.RN, 5 F32.RN, 7 F64.RN, 8 BF16.RN).
+void dec_ublk(Instr& ins, const Word& w, bool red) {
+  ins.op = red ? Op::UBLKRED : Op::UBLKCP;
+  ins.mnemonic = red ? "UBLKRED" : "UBLKCP";
+  const unsigned dir = static_cast<unsigned>(w.field(73, 2));
+  ins.mods.push_back(dir == 1 ? "S" : dir == 2 ? "G" : "S");
+  ins.mods.push_back(dir == 1 ? "G" : "S");
+  if (w.bit(75)) ins.mods.push_back("MULTICAST");
+  ins.f[0] = dir;
+  ins.f[1] = w.bit(75);
+  if (red) {
+    static const char* const types[] = {"",   "S32",  "U64",     "S64",  "F16.RN", "F32.RN", "(6)",  "F64.RN",
+                                        "BF16.RN", "(9)", "(10)", "(11)", "(12)", "(13)", "(14)", "(15)"};
+    const unsigned t = static_cast<unsigned>(w.field(81, 4));
+    ins.mods.push_back(kAtomOp[w.field(87, 3)]);
+    if (*types[t]) ins.mods.push_back(types[t]);
+    ins.f[2] = static_cast<uint32_t>(w.field(87, 3));
+    ins.f[3] = t;
+  }
   const int ub = static_cast<int>(ureg_bits(ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(32, ub)), 0, ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, ub)), 0, ins.sm));
   ins.src.push_back(UR(static_cast<unsigned>(w.field(64, ub)), ins.sm));
+}
+
+// UBLKPF.L2 [URa], URb (cp.async.bulk.prefetch.L2) and UTMAPF.L2.nD [URa],
+// [URb] (its tensor form: the coordinates' registers at 32, the tensor map
+// at 24): hints, with nothing to do here.
+void dec_ublkpf(Instr& ins, const Word& w) {
+  ins.op = Op::NOP;
+  ins.mnemonic = "UBLKPF";
+  ins.mods.push_back("L2");
+  const int ub = static_cast<int>(ureg_bits(ins.sm));
+  ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, ub)), 0, ins.sm));
+  ins.src.push_back(UR(static_cast<unsigned>(w.field(64, ub)), ins.sm));
+}
+
+void dec_utmapf(Instr& ins, const Word& w) {
+  ins.op = Op::NOP;
+  ins.mnemonic = "UTMAPF";
+  ins.mods.push_back("L2");
+  ins.mods.push_back(std::to_string(w.field(79, 3) + 1) + "D");
+  const int ub = static_cast<int>(ureg_bits(ins.sm));
+  ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(32, ub)), 0, ins.sm));
+  ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, ub)), 0, ins.sm));
 }
 
 // ---- Blackwell ------------------------------------------------------------------
@@ -3344,7 +3381,9 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
       {0x3b4, [](Instr& i, const Word& w) { dec_tma(i, w, Op::UTMALDG, "UTMALDG"); }},
       {0x3b5, [](Instr& i, const Word& w) { dec_tma(i, w, Op::UTMASTG, "UTMASTG"); }},
       {0x3b6, [](Instr& i, const Word& w) { dec_tma(i, w, Op::UTMAREDG, "UTMAREDG"); }},
-      {0x3ba, dec_ublkcp},
+      {0x3ba, [](Instr& i, const Word& w) { dec_ublk(i, w, false); }},
+      {0x3bb, [](Instr& i, const Word& w) { dec_ublk(i, w, true); }},
+      {0x3bc, dec_ublkpf}, {0x5b8, dec_utmapf},
       {0x9c7, [](Instr& i, const Word&) { dec_plain(i, Op::UCGABAR, "UCGABAR_ARV"); }},   // barrier.cluster.arrive
       {0xdc7, [](Instr& i, const Word&) {                                                // barrier.cluster.wait
          dec_plain(i, Op::UCGABAR, "UCGABAR_WAIT");
@@ -3390,7 +3429,7 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
     it->second(ins, w);
     // The uniform datapath's own ops take a UP guard.
     if (opc == 0x9c3 || opc == 0xab9 || opc == 0xabb || opc == 0x89c || opc == 0x5b2 || opc == 0x5b4 || opc == 0x3b4 ||
-        opc == 0x3b5 || opc == 0x3b6 || opc == 0x3ba || opc == 0x7ac || opc == 0x883 || opc == 0x8cb ||
+        opc == 0x3b5 || opc == 0x3b6 || opc == 0x3ba || opc == 0x3bb || opc == 0x3bc || opc == 0x5b8 || opc == 0x7ac || opc == 0x883 || opc == 0x8cb ||
         opc == 0x9b9)
       ins.guard_uniform = true;
     return ins;

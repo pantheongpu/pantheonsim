@@ -60,67 +60,140 @@ struct TensorMap {
     }
   }
 
-  // 16 qwords: magic, a reserved word, address, a packed word of the small
-  // fields, dims[5], strides[4] (the element size is implied by the type),
-  // box[0..3], and box[4] with the element strides packed 4 bits each.
-  //
-  // Opaque does not mean untouched. CuTe clears bit 21 of the second qword
-  // of a map whose global prefix is not contiguous -- a flag in NVIDIA's own
-  // layout -- so that word carries nothing here. Putting the address there
-  // lost bit 21 of it, and a TMA store landed 2 MiB away, in freed memory.
-  void encode(void* out) const {
-    uint64_t q[16] = {};
-    q[0] = kMagic;
-    q[2] = address;
-    q[3] = uint64_t{rank} | (uint64_t{static_cast<uint8_t>(type)} << 8) | (uint64_t{interleave} << 16) |
-           (uint64_t{static_cast<uint8_t>(swizzle)} << 24) | (uint64_t{oob_nan} << 32);
-    for (int i = 0; i < 5; ++i) q[4 + i] = dim[i];
-    for (int i = 0; i < 4; ++i) q[9 + i] = stride[i + 1];
-    for (int i = 0; i < 4; ++i) q[13] |= uint64_t{box[i] & 0xFFFF} << (16 * i);
-    q[14] = box[4] & 0xFFFF;
-    for (int i = 0; i < 5; ++i) q[14] |= uint64_t{elem_stride[i] & 0xF} << (16 + 4 * i);
-    // The last word: im2col's fields, zero for a tiled map.
-    if (im2col) {
-      q[15] = 1 | (uint64_t{(channels - 1) & 0xFF} << 8) | (uint64_t{(pixels - 1) & 0x3FF} << 16);
-      const uint32_t b = corner_bits(rank), n = rank - 2;
-      const uint64_t mask = (1ull << b) - 1;
-      for (uint32_t i = 0; i < n; ++i) {
-        q[15] |= (static_cast<uint64_t>(lower[i]) & mask) << (32 + b * i);
-        q[15] |= (static_cast<uint64_t>(upper[i]) & mask) << (32 + b * (n + i));
-      }
+  // The layout. The tile-mode fields sit where NVIDIA's descriptor has them
+  // -- tensormap.replace compiles to plain stores into it, so SASS that
+  // rewrites a map in place must find each field where ptxas puts it (probed
+  // with ptxas, one field and ordinal at a time):
+  //   0x00       the global address
+  //   0x08       bits 4-6 rank - 1, 7-10 the element type (the ISA's
+  //              tensormap.replace numbering; tf32 is f32 or f32.ftz with
+  //              bit 16), 11-12 the interleave, 13-14 the swizzle (none, 32,
+  //              64, 128 bytes), 15 the NaN fill, 19-21 the 128-byte
+  //              swizzle's atomicity (16, 32, 32 with the 8-byte flip, 64)
+  //   0x0c+4i    the stride of dimension i + 1 in 16-byte units, low 32 bits;
+  //              0x1c holds bits 32-35 of each, a nibble apiece
+  //   0x20+4i    dimension i's extent - 1
+  //   0x34       bits 3i..3i+2 dimension i's element stride (8 as 0), 24-31
+  //              the box's extent in dimension 0 - 1
+  //   0x38       byte i: the box's extent in dimension i + 1 - 1
+  // What no replace reaches is this simulator's own: the im2col fields at
+  // 0x70 and, at 0x78, a magic value, so a map nothing encoded (an
+  // uninitialized __grid_constant__, a pointer to the wrong buffer) is
+  // reported as that. CuTe clears bit 21 at 0x08 for a map whose global
+  // prefix is not contiguous; nothing here keeps anything there.
+  static uint32_t type_code(TmapType t, bool* tf32) {
+    static const uint8_t codes[] = {0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 8, 7, 8, 11, 12, 13};
+    *tf32 = t == TmapType::TF32 || t == TmapType::TF32Ftz;
+    return codes[static_cast<uint8_t>(t) & 15];
+  }
+  static bool type_of_code(uint32_t code, bool tf32, TmapType* t) {
+    static const TmapType types[] = {TmapType::U8,  TmapType::U16,    TmapType::U32,         TmapType::S32,
+                                     TmapType::U64, TmapType::S64,    TmapType::F16,         TmapType::F32,
+                                     TmapType::F32Ftz, TmapType::F64, TmapType::BF16,        TmapType::U4x16Align8,
+                                     TmapType::U4x16Align16, TmapType::U6x16Align16};
+    if (code > 13) return false;
+    *t = types[code];
+    if (tf32) {
+      if (code != 7 && code != 8) return false;
+      *t = code == 7 ? TmapType::TF32 : TmapType::TF32Ftz;
     }
-    std::memcpy(out, q, sizeof q);
+    return true;
   }
 
-  // False when the bytes were not written by encode().
+  void encode(void* out) const {
+    uint8_t b[128] = {};
+    const auto put32 = [&](unsigned at, uint32_t v) { std::memcpy(b + at, &v, 4); };
+    const auto put64 = [&](unsigned at, uint64_t v) { std::memcpy(b + at, &v, 8); };
+    put64(0x00, address);
+    bool tf32 = false;
+    const uint32_t code = type_code(type, &tf32);
+    static const uint8_t swz_mode[] = {0, 1, 2, 3, 3, 3, 3}, swz_atom[] = {0, 0, 0, 0, 1, 2, 3};
+    const uint8_t sw = static_cast<uint8_t>(swizzle) % 7;
+    put32(0x08, ((rank - 1) & 7) << 4 | code << 7 | (uint32_t{interleave} & 3) << 11 | uint32_t{swz_mode[sw]} << 13 |
+                    (uint32_t{oob_nan} & 1) << 15 | (tf32 ? 1u << 16 : 0) | uint32_t{swz_atom[sw]} << 19);
+    uint32_t hi = 0;
+    for (int i = 0; i < 4; ++i) {
+      put32(0x0c + 4 * i, static_cast<uint32_t>(stride[i + 1] >> 4));
+      hi |= static_cast<uint32_t>((stride[i + 1] >> 36) & 0xF) << (4 * i);
+    }
+    put32(0x1c, hi);
+    // Dimensions past the rank hold an extent, box and stride of 1.
+    const auto less_one = [](uint64_t v) { return static_cast<uint32_t>(v ? v - 1 : 0); };
+    for (int i = 0; i < 5; ++i) put32(0x20 + 4 * i, less_one(dim[i]));
+    uint32_t w34 = (less_one(box[0]) & 0xFF) << 24;
+    for (int i = 0; i < 5; ++i) w34 |= ((elem_stride[i] ? elem_stride[i] : 1) & 7) << (3 * i);
+    put32(0x34, w34);
+    uint32_t w38 = 0;
+    for (int i = 1; i < 5; ++i) w38 |= (less_one(box[i]) & 0xFF) << (8 * (i - 1));
+    put32(0x38, w38);
+    // im2col's fields, zero for a tiled map.
+    if (im2col) {
+      uint64_t q = 1 | (uint64_t{(channels - 1) & 0xFF} << 8) | (uint64_t{(pixels - 1) & 0x3FF} << 16);
+      const uint32_t bits = corner_bits(rank), n = rank - 2;
+      const uint64_t mask = (1ull << bits) - 1;
+      for (uint32_t i = 0; i < n; ++i) {
+        q |= (static_cast<uint64_t>(lower[i]) & mask) << (32 + bits * i);
+        q |= (static_cast<uint64_t>(upper[i]) & mask) << (32 + bits * (n + i));
+      }
+      put64(0x70, q);
+    }
+    put64(0x78, kMagic);
+    std::memcpy(out, b, sizeof b);
+  }
+
+  // False when the bytes were not written by encode() (or were rewritten
+  // into something no map is).
   bool decode(const void* in) {
-    uint64_t q[16];
-    std::memcpy(q, in, sizeof q);
-    if (q[0] != kMagic) return false;
-    address = q[2];
-    rank = static_cast<uint32_t>(q[3] & 0xFF);
-    type = static_cast<TmapType>((q[3] >> 8) & 0xFF);
-    interleave = static_cast<uint8_t>((q[3] >> 16) & 0xFF);
-    swizzle = static_cast<TmapSwizzle>((q[3] >> 24) & 0xFF);
-    oob_nan = static_cast<uint8_t>((q[3] >> 32) & 0xFF);
-    for (int i = 0; i < 5; ++i) dim[i] = q[4 + i];
+    uint8_t b[128];
+    std::memcpy(b, in, sizeof b);
+    const auto get32 = [&](unsigned at) {
+      uint32_t v;
+      std::memcpy(&v, b + at, 4);
+      return v;
+    };
+    const auto get64 = [&](unsigned at) {
+      uint64_t v;
+      std::memcpy(&v, b + at, 8);
+      return v;
+    };
+    if (get64(0x78) != kMagic) return false;
+    address = get64(0x00);
+    const uint32_t w8 = get32(0x08);
+    rank = ((w8 >> 4) & 7) + 1;
+    if (!type_of_code((w8 >> 7) & 15, (w8 >> 16) & 1, &type)) return false;
+    interleave = static_cast<uint8_t>((w8 >> 11) & 3);
+    const uint32_t mode = (w8 >> 13) & 3, atom = (w8 >> 19) & 3;
+    swizzle = mode < 3 ? static_cast<TmapSwizzle>(mode)
+                       : atom == 0   ? TmapSwizzle::B128
+                       : atom == 1 ? TmapSwizzle::B128Atom32
+                       : atom == 2 ? TmapSwizzle::B128Atom32Flip8
+                                   : TmapSwizzle::B128Atom64;
+    oob_nan = static_cast<uint8_t>((w8 >> 15) & 1);
+    const uint32_t hi = get32(0x1c);
     stride[0] = type_bytes(type);
-    for (int i = 0; i < 4; ++i) stride[i + 1] = q[9 + i];
-    for (int i = 0; i < 4; ++i) box[i] = static_cast<uint32_t>((q[13] >> (16 * i)) & 0xFFFF);
-    box[4] = static_cast<uint32_t>(q[14] & 0xFFFF);
-    for (int i = 0; i < 5; ++i) elem_stride[i] = static_cast<uint32_t>((q[14] >> (16 + 4 * i)) & 0xF);
-    im2col = q[15] & 1;
+    for (int i = 0; i < 4; ++i)
+      stride[i + 1] = (uint64_t{get32(0x0c + 4 * i)} | (uint64_t{(hi >> (4 * i)) & 0xF} << 32)) << 4;
+    for (int i = 0; i < 5; ++i) dim[i] = uint64_t{get32(0x20 + 4 * i)} + 1;
+    const uint32_t w34 = get32(0x34), w38 = get32(0x38);
+    box[0] = (w34 >> 24) + 1;
+    for (int i = 1; i < 5; ++i) box[i] = ((w38 >> (8 * (i - 1))) & 0xFF) + 1;
+    for (int i = 0; i < 5; ++i) {
+      elem_stride[i] = (w34 >> (3 * i)) & 7;
+      if (!elem_stride[i]) elem_stride[i] = 8;
+    }
+    const uint64_t q = get64(0x70);
+    im2col = q & 1;
     lower = upper = {};
     channels = pixels = 0;
     if (im2col) {
       if (rank < 3) return false;
-      channels = static_cast<uint32_t>((q[15] >> 8) & 0xFF) + 1;
-      pixels = static_cast<uint32_t>((q[15] >> 16) & 0x3FF) + 1;
-      const uint32_t b = corner_bits(rank), n = rank - 2;
-      auto field = [&](uint32_t k) {   // a b-bit two's-complement value
-        const uint64_t v = (q[15] >> (32 + b * k)) & ((1ull << b) - 1);
+      channels = static_cast<uint32_t>((q >> 8) & 0xFF) + 1;
+      pixels = static_cast<uint32_t>((q >> 16) & 0x3FF) + 1;
+      const uint32_t bits = corner_bits(rank), n = rank - 2;
+      auto field = [&](uint32_t k) {   // a bits-wide two's-complement value
+        const uint64_t v = (q >> (32 + bits * k)) & ((1ull << bits) - 1);
         int32_t x = static_cast<int32_t>(v);
-        if (v >> (b - 1)) x -= int32_t{1} << b;
+        if (v >> (bits - 1)) x -= int32_t{1} << bits;
         return x;
       };
       for (uint32_t i = 0; i < n; ++i) {
@@ -128,7 +201,7 @@ struct TensorMap {
         upper[i] = field(n + i);
       }
     }
-    return rank >= 1 && rank <= 5;
+    return true;
   }
 
   // Bytes in a swizzled shared-memory row for the modes implemented here, 0
