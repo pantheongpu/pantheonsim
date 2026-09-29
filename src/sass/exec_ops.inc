@@ -47,7 +47,7 @@ bool executes(const Instr& ins) {
     case Op::FMNMX3: case Op::STSM: case Op::RPCMOV: case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
     case Op::SYNCS: case Op::ARRIVES: case Op::UTMALDG: case Op::UTMASTG: case Op::UTMAREDG: case Op::UBLKCP:
     case Op::UBLKRED: case Op::LDTM: case Op::STTM: case Op::UTCMMA: case Op::UTCBAR: case Op::UTCCP:
-    case Op::UTCSHIFT: case Op::UTCATOMSWS:
+    case Op::UTCSHIFT: case Op::UTCATOMSWS: case Op::STAS: case Op::REDAS: case Op::UGETNEXTWORKID:
     case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2FP: case Op::F2I:
     case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL:
     case Op::FSET: case Op::FSETP: case Op::HADD2: case Op::HFMA2: case Op::HMUL2: case Op::HSET2: case Op::HSETP2:
@@ -65,7 +65,9 @@ bool executes(const Instr& ins) {
     case Op::WARPSYNC: case Op::ENDCOLLECTIVE: case Op::UCGABAR:
       return true;
     case Op::R2UR:
-      return ins.f[0] == 0;   // not the forms reporting a non-uniform value yet
+      // Not .OR: nothing seen here uses it in a way that shows what it
+      // computes, so a kernel with it runs on its PTX.
+      return !(ins.w.bit(84));
     default:
       return false;
   }
@@ -154,6 +156,12 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
       case Op::LDTM: case Op::STTM: case Op::UTCMMA: case Op::UTCBAR: case Op::UTCCP: case Op::UTCSHIFT:
       case Op::UTCATOMSWS:
         exec_tcgen05(blk, w, ins, ex);
+        break;
+      case Op::STAS: case Op::REDAS:
+        exec_async_store(blk, w, ins, ex);
+        break;
+      case Op::UGETNEXTWORKID:
+        exec_clc(blk, w, ins, ex);
         break;
       case Op::FADD: case Op::FMUL: case Op::FFMA: case Op::FMNMX: case Op::FSETP: case Op::FSET:
       case Op::FSEL: case Op::FCHK: case Op::MUFU: case Op::DADD: case Op::DMUL: case Op::DFMA:
@@ -728,9 +736,19 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       });
       return;
     case Op::R2UR:
+      // R2UR [Pd,] URd, Ra: the value of the first active lane into a
+      // uniform register -- and Pd whether every active lane holds that
+      // value, the test ptxas makes before a *_sync intrinsic with a mask
+      // it cannot prove uniform (REDUX.OR, R2UR Pd, @!Pd BRA.DIV).
       if (ex) {
         const unsigned l = static_cast<unsigned>(std::countr_zero(ex));
-        write32(w, ins.dst.back(), l, read32(w, ins.src[0], l));
+        const uint32_t v = read32(w, ins.src[0], l);
+        write32(w, ins.dst.back(), l, v);
+        if (ins.f[0]) {
+          bool same = true;
+          each_lane(ex, [&](unsigned k) { same = same && read32(w, ins.src[0], k) == v; });
+          each_lane(ex, [&](unsigned k) { set_pred(w, ins.dst[0], k, same); });
+        }
       }
       return;
     case Op::ULDC: {
@@ -3424,4 +3442,89 @@ void Runner::exec_tcgen05(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     default:
       throw Fault("tcgen05 form not implemented");
   }
+}
+
+// ---- stores into another block that complete on its mbarrier; cluster launch control --
+
+// STAS / REDAS [Ra.64], Rb (st.async, red.async): Ra is the shared::cluster
+// address, Ra+1 its mbarrier's -- which must be in the same block -- and the
+// store's (or reduction's) bytes complete on that barrier.
+void Runner::exec_async_store(Block& blk, Warp& w, const Instr& ins, Mask ex) {
+  const bool red = ins.op == Op::REDAS;
+  const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8)), rb = ins.src[1].reg;
+  const int64_t off = ins.w.sfield(40, 24);
+  const uint32_t t = ins.f[0];
+  const uint32_t bytes = red ? (t == 2 ? 8 : 4) : (t == 0 ? 4 : t == 1 ? 8 : 16);
+  each_lane(ex, [&](unsigned l) {
+    const uint32_t at = w.reg(ra, l) + static_cast<uint32_t>(off), bar = w.reg(ra + 1, l);
+    uint32_t doff, boff;
+    Block& to = shared_block(blk, at, &doff);
+    Block& owner = shared_block(blk, bar, &boff);
+    if (&owner != &to) throw Fault("st.async's mbarrier must be in the block its data goes to");
+    if (doff % bytes) throw Error(Err::MisalignedAccess, "st.async to a misaligned shared address");
+    if (uint64_t{doff} + bytes > to.shared.size()) throw Fault("st.async past the block's shared memory");
+    uint32_t v[4] = {};
+    for (uint32_t i = 0; i < bytes / 4; ++i) v[i] = rb == kRZ ? 0 : w.reg(rb + i, l);
+    if (red) {
+      static const ptx::Type types[3] = {{ptx::Type::Kind::U, 32}, {ptx::Type::Kind::S, 32}, {ptx::Type::Kind::U, 64}};
+      if (t > 2) throw Fault("REDAS type " + std::to_string(t));
+      static const ptx::AtomOp ops[] = {ptx::AtomOp::Add, ptx::AtomOp::Min, ptx::AtomOp::Max, ptx::AtomOp::Inc,
+                                        ptx::AtomOp::Dec, ptx::AtomOp::And, ptx::AtomOp::Or,  ptx::AtomOp::Xor};
+      uint64_t old = 0, b = 0;
+      std::memcpy(&old, &to.shared[doff], bytes);
+      std::memcpy(&b, v, bytes);
+      const uint64_t r = exec::reduce_value(ops[ins.f[1] & 7], types[t], old, b);
+      std::memcpy(&to.shared[doff], &r, bytes);
+    } else {
+      std::memcpy(&to.shared[doff], v, bytes);
+    }
+    mbar_arrive(owner, boff, 0, -static_cast<int64_t>(bytes), false);
+  });
+}
+
+// UGETNEXTWORKID.SELFCAST/.BROADCAST [URa], [URa+1]
+// (clusterlaunchcontrol.try_cancel): take the next block (or cluster) that has
+// not started -- it then never runs -- and answer with its first CTA, in the
+// 16 bytes ptxas's query_cancel reads: x in word 0, y and z in word 1's
+// halves, and word 2's bit 0 set when a unit was taken. The answer lands at
+// the same offsets in this block, or with .BROADCAST in every block of the
+// cluster, completing 16 bytes on the barrier beside it.
+void Runner::exec_clc(Block& blk, Warp& w, const Instr& ins, Mask ex) {
+  if (!ex) return;
+  const unsigned ura = static_cast<unsigned>(ins.w.field(24, 8));
+  const auto urv = [&](unsigned u) -> uint32_t { return u >= 255 ? 0 : w.ur[u]; };
+  uint32_t aoff, boff;
+  Block& at = shared_block(blk, urv(ura), &aoff);
+  Block& bar = shared_block(blk, urv(ura + 1), &boff);
+  if (&at != &blk || &bar != &blk)
+    throw Fault("clusterlaunchcontrol.try_cancel's response and barrier are in this CTA's shared memory");
+  if (aoff % 16) throw Error(Err::MisalignedAccess, "clusterlaunchcontrol.try_cancel's response must be 16-byte aligned");
+  uint32_t resp[4] = {};
+  uint64_t u = next_unit_.load();
+  while (u < units_ && !next_unit_.compare_exchange_weak(u, u + 1)) {
+  }
+  if (u < units_) {
+    uint64_t x, y, z;
+    if (clustered_) {
+      const uint64_t ncx = cfg_.grid[0] / cshape_[0], ncy = cfg_.grid[1] / cshape_[1];
+      x = (u % ncx) * cshape_[0];
+      y = ((u / ncx) % ncy) * cshape_[1];
+      z = (u / (ncx * ncy)) * cshape_[2];
+    } else {
+      x = u % cfg_.grid[0];
+      y = (u / cfg_.grid[0]) % cfg_.grid[1];
+      z = u / (uint64_t{cfg_.grid[0]} * cfg_.grid[1]);
+    }
+    resp[0] = static_cast<uint32_t>(x);
+    resp[1] = static_cast<uint32_t>(y & 0xFFFF) | static_cast<uint32_t>(z << 16);
+    resp[2] = 1;
+  }
+  const auto deliver = [&](Block& to) {
+    if (uint64_t{aoff} + 16 > to.shared.size()) throw Fault("clusterlaunchcontrol's response past shared memory");
+    std::memcpy(&to.shared[aoff], resp, 16);
+    mbar_arrive(to, boff, 0, -16, false);
+  };
+  if (!ins.f[0]) deliver(blk);
+  else
+    for (Block* b : blk.cluster->blocks) deliver(*b);
 }

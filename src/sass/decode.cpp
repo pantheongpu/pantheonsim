@@ -3162,13 +3162,29 @@ void dec_utcatomsws(Instr& ins, const Word& w, bool find) {
   ins.src.push_back(UR(static_cast<unsigned>(w.field(32, 8)), ins.sm));
 }
 
-// STAS [Ra.64], Rb (st.async: a store to another CTA's shared memory that
-// completes on its mbarrier).
-void dec_stas(Instr& ins, const Word& w) {
-  ins.op = Op::STAS;
-  ins.mnemonic = "STAS";
+// STAS[.64/.128] [Ra.64], Rb (st.async) and REDAS.op[.type] [Ra.64], Rb
+// (red.async): a store or reduction into another block's shared memory that
+// completes on its mbarrier. Ra holds the address, Ra+1 the mbarrier's; the
+// offset at 40-63; the data at 32. STAS's size at 73-74 (32, 64, 128 bits);
+// REDAS's op at 87-89 (ADD MIN MAX INC DEC AND OR XOR) and type at 73-74
+// (U32, S32, U64).
+void dec_stas(Instr& ins, const Word& w, bool red) {
+  ins.op = red ? Op::REDAS : Op::STAS;
+  ins.mnemonic = red ? "REDAS" : "STAS";
+  const unsigned t = static_cast<unsigned>(w.field(73, 2));
+  if (red) {
+    ins.mods.push_back(kAtomOp[w.field(87, 3)]);
+    if (t == 1) ins.mods.push_back("S32");
+    if (t == 2) ins.mods.push_back("64");
+    ins.f[1] = static_cast<uint32_t>(w.field(87, 3));
+  } else {
+    if (t == 1) ins.mods.push_back("64");
+    if (t == 2) ins.mods.push_back("128");
+  }
+  ins.f[0] = t;
   ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), true, "", -1, w.sfield(40, 24), ins.sm));
-  ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8))));
+  const unsigned width = red ? (t == 2 ? 2 : 1) : (t == 0 ? 1 : t == 1 ? 2 : 4);
+  ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8)), width));
 }
 
 // UVIRTCOUNT.DEALLOC.SMPOOL n and UGETNEXTWORKID.BROADCAST [URa], [URa+1]
@@ -3183,7 +3199,8 @@ void dec_uvirtcount(Instr& ins, const Word& w) {
 void dec_ugetnextworkid(Instr& ins, const Word& w) {
   ins.op = Op::UGETNEXTWORKID;
   ins.mnemonic = "UGETNEXTWORKID";
-  if (w.bit(72)) ins.mods.push_back("BROADCAST");
+  ins.mods.push_back(w.bit(72) ? "BROADCAST" : "SELFCAST");
+  ins.f[0] = w.bit(72);
   const int ur = static_cast<int>(w.field(24, 8));
   ins.src.push_back(mem_addr(kRZ, false, "", ur, 0, ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", ur + 1, 0, ins.sm));
@@ -3475,7 +3492,9 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
       {0x5ea, dec_utcmma}, {0x9ea, dec_utcmma}, {0xdea, dec_utcmma}, {0x9e6, dec_utcshift}, {0x3e9, dec_utcbar}, {0x9e7, dec_utccp},
       {0x5e3, [](Instr& i, const Word& w) { dec_utcatomsws(i, w, true); }},
       {0x9e3, [](Instr& i, const Word& w) { dec_utcatomsws(i, w, false); }},
-      {0xdbd, dec_stas}, {0x84c, dec_uvirtcount}, {0x3ca, dec_ugetnextworkid},
+      {0xdbd, [](Instr& i, const Word& w) { dec_stas(i, w, false); }},
+      {0xdbe, [](Instr& i, const Word& w) { dec_stas(i, w, true); }},
+      {0x84c, dec_uvirtcount}, {0x3ca, dec_ugetnextworkid},
       {0x356, dec_bmov}, {0x355, dec_bmov_r}, {0x958, dec_brxu}, {0xfae, dec_ldgsts}, {0x83b, dec_ldsm}, {0x9af, dec_ldgdepbar},
       {0xabb, dec_uldc_idx},
       {0x23c, dec_hmma}, {0x27a, dec_qmma}, {0x237, dec_imma}, {0x23d, dec_bmma}, {0x23f, dec_dmma}, {0x23a, dec_movm},

@@ -242,6 +242,8 @@ class Runner {
   uint64_t mbar_arrive80(Block& blk, uint32_t off);
   void exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex);   // TMA and bulk copies
   void exec_tcgen05(Block& blk, Warp& w, const Instr& ins, Mask ex);   // sm_100's tensor core
+  void exec_async_store(Block& blk, Warp& w, const Instr& ins, Mask ex);   // STAS, REDAS
+  void exec_clc(Block& blk, Warp& w, const Instr& ins, Mask ex);           // UGETNEXTWORKID
   Block& shared_block(Block& blk, uint64_t addr, uint32_t* off);
   Block& cluster_block(Block& blk, uint32_t rank);
   void run_cluster(uint64_t k);                          // one cluster's blocks, together
@@ -267,6 +269,11 @@ class Runner {
   std::array<uint32_t, 3> cshape_{1, 1, 1};
   uint32_t csize_ = 1;
   bool clustered_ = false;
+  // The launch's units of work -- blocks, or clusters -- handed out in order;
+  // cluster launch control's try_cancel takes the next one, which then never
+  // runs.
+  std::atomic<uint64_t> next_unit_{0};
+  uint64_t units_ = 0;
   exec::LaunchStats stats_;
   std::mutex stats_mu_;
   // The heap malloc() draws from, shared by every launch on the device.
@@ -643,7 +650,8 @@ exec::LaunchStats Runner::run() {
   // The unit of work: a block, or with clusters a cluster, whose blocks must
   // be resident together.
   const uint64_t units = clustered_ ? blocks / csize_ : blocks;
-  std::atomic<uint64_t> next{0};
+  units_ = cfg_.cooperative ? 0 : units;   // a cooperative launch has every block running already
+  std::atomic<uint64_t>& next = next_unit_;
   std::exception_ptr failure;
   std::mutex fail_mu;
   const auto worker = [&] {
