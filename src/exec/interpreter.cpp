@@ -10297,6 +10297,17 @@ class Interpreter {
                      Mask m) {
     if (!ctx.mbar)
       ctx_fail(ins, -1, Err::UnsupportedPtx, "mbarrier outside a block context");
+    if (op.op == MbarOp::PendingCount && op.have_state) {
+      // The count an arrival's state token carries (see the arrive); no
+      // barrier is touched.
+      Lanes _s_st;
+      const Lanes& st = read_operand(w, ctx, ins, op.state, _s_st);
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = static_cast<uint32_t>(st[lane] >> 1);
+      write_reg(w, op.dst, m, r, 32);
+      return;
+    }
     Lanes _s_base;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     const uint64_t sbase = space_base(Space::Shared);
@@ -10378,8 +10389,12 @@ class Interpreter {
           inc = lanes;
         }
         // The token names the phase this arrival belongs to, which is the
-        // phase a later test_wait asks about. Captured before any flip.
-        const uint64_t token = b.phase & 1u;
+        // phase a later test_wait asks about (bit 0), captured before any
+        // flip; above it, the arrivals still pending before this instruction,
+        // which is what mbarrier.pending_count reads from a state (an RTX
+        // 3060: 64 on a fresh barrier of 64, 54 after ten arrivals).
+        const uint64_t pending_before = b.expected > b.arrived ? b.expected - b.arrived : 0;
+        const uint64_t token = (b.phase & 1u) | (pending_before << 1);
         b.arrived += inc;
         const uint32_t before = b.phase;
         complete_phase_if_done(b);
@@ -10438,9 +10453,9 @@ class Interpreter {
         return;
       }
       case MbarOp::PendingCount: {
+        Lanes r;
         require_valid();
         land_bulk_copies(ctx, b);
-        Lanes r;
         const uint64_t pending = b.expected > b.arrived ? b.expected - b.arrived : 0;
         for (uint32_t lane = 0; lane < W_; ++lane)
           if (m & (Mask{1} << lane)) r[lane] = pending;

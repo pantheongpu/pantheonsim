@@ -261,6 +261,14 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   the canonical NaN; a 16-bit shift's amount is a whole .u32; bfe/bfi.64 take
   the whole position and length; bfe.s64 of all 64 bits kept (1 << 64 was
   undefined); cnot.
+- A fourth sweep, 90 variants of the memory forms compilers emit (ld/st with
+  every cache operator, .volatile and the ordering qualifiers and scopes,
+  atomics with their semantics and scopes, fences and membar, generic
+  addressing and cvta, isspacep, mbarrier, cp.async with its zero fill,
+  ldmatrix, movmatrix): e2e_ptx_memory_forms. All matched but one:
+  mbarrier.pending_count.b64 takes an arrival's state token (the ISA's form),
+  which carries the count pending before that arrive; it was parsed as
+  taking the barrier's address.
 - Half precision beyond f16x2: f16, bf16, f16x2 and bf16x2 arithmetic
   (add/sub/mul/fma/neg/min/max), the same four types on every transcendental,
   and atom/red.add on all of them. bf16 is a different decode, not a scaled
