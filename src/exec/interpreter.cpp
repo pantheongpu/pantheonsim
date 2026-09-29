@@ -9695,7 +9695,7 @@ class Interpreter {
             results[e][lane] = v;
           }
         }
-      for (size_t e = 0; e < n; ++e) write_reg(w, op.dsts[e], m, results[e], op.ty.bits);
+      for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, results[e], op.ty);
       return;
     }
     if (op.space == Space::Param) {
@@ -9712,7 +9712,7 @@ class Interpreter {
         std::memcpy(&v, params_.bytes.data() + at, size);
         Lanes r;  // written for every active lane below
         r.fill(v);
-        write_reg(w, op.dsts[e], m, r, op.ty.bits);
+        write_loaded(w, op.dsts[e], m, r, op.ty);
       }
       return;
     }
@@ -9740,28 +9740,32 @@ class Interpreter {
         for (size_t e = 0; e < n; ++e)
           results[e][lane] = load_routed(w, ctx, ins, lane, addr + e * size, size);
       }
-    // A signed narrow load sign-extends into the destination register: PTX says
-    // ld.s8 delivers the byte's value, not its bit pattern. Masking to the type
-    // width instead turns -1 into 255, and the cvt that follows reads the
-    // positive number -- which is how a quantized weight of -1 became +255 and
-    // corrupted every dequantized tensor while still looking like a plain copy.
-    for (size_t e = 0; e < n; ++e) {
-      const uint32_t dst_bits = op.dsts[e].wide ? 64u : 32u;
-      if (op.ty.is_signed() && op.ty.bits < dst_bits) {
-        Lanes ext = results[e];
-        const uint64_t sign_bit = 1ull << (op.ty.bits - 1);
-        const uint64_t value_mask = (sign_bit << 1) - 1;
-        for (uint32_t lane = 0; lane < W_; ++lane)
-          if (m & (Mask{1} << lane)) {
-            uint64_t v = ext[lane] & value_mask;
-            if (v & sign_bit) v |= ~value_mask;
-            ext[lane] = v;
-          }
-        write_reg(w, op.dsts[e], m, ext, dst_bits);
-      } else {
-        write_reg(w, op.dsts[e], m, results[e], op.ty.bits);
-      }
+    for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, results[e], op.ty);
+  }
+
+  // A signed narrow load sign-extends into the destination register: PTX says
+  // ld.s8 delivers the byte's value, not its bit pattern. Masking to the type
+  // width instead turns -1 into 255, and the cvt that follows reads the
+  // positive number -- which is how a quantized weight of -1 became +255 and
+  // corrupted every dequantized tensor while still looking like a plain copy.
+  // Parameters too: a kernel taking a signed char or short reads it with
+  // ld.param.s8 or .s16, and -128 arrived as 128.
+  void write_loaded(Warp& w, const Reg& dst, Mask m, const Lanes& vals, const Type& ty) {
+    const uint32_t dst_bits = dst.wide ? 64u : 32u;
+    if (!(ty.is_signed() && ty.bits < dst_bits)) {
+      write_reg(w, dst, m, vals, ty.bits);
+      return;
     }
+    Lanes ext = vals;
+    const uint64_t sign_bit = 1ull << (ty.bits - 1);
+    const uint64_t value_mask = (sign_bit << 1) - 1;
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) {
+        uint64_t v = ext[lane] & value_mask;
+        if (v & sign_bit) v |= ~value_mask;
+        ext[lane] = v;
+      }
+    write_reg(w, dst, m, ext, dst_bits);
   }
 
   void exec_st(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSt& op, Mask m) {

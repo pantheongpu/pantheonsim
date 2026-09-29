@@ -224,6 +224,48 @@ VTEST(aggregate_byte_array_param) {
   VCHECK_EQ(e.mem.load_scalar(buf, 4), uint64_t{0xC0FFEE});
 }
 
+VTEST(signed_narrow_params_sign_extend) {
+  // A kernel taking signed char and short, as nvcc compiles it: ld.param.s8
+  // into a 16-bit register and ld.param.s16 straight into a 32-bit one. Both
+  // deliver the value (-128, -32768), not the bit pattern (128, 32768), by
+  // name and through a register holding the parameter's address. The
+  // unsigned load of the same byte is the control.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out, .param .u8 a, .param .u8 b, .param .u16 c)
+{
+    .reg .b16 %rs<2>;
+    .reg .b32 %r<7>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    ld.param.s8 %rs1, [a];
+    cvt.s32.s16 %r1, %rs1;
+    st.global.u32 [%rd2], %r1;
+    ld.param.s16 %r2, [c];
+    st.global.u32 [%rd2+4], %r2;
+    ld.param.s8 %r3, [b];
+    st.global.u32 [%rd2+8], %r3;
+    ld.param.u8 %r4, [a];
+    st.global.u32 [%rd2+12], %r4;
+    mov.u64 %rd3, c;
+    ld.param.s16 %r5, [%rd3];
+    st.global.u32 [%rd2+16], %r5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(20);
+  std::vector<uint8_t> o(8);
+  std::memcpy(o.data(), &out, 8);
+  exec::launch(m.entries[0], LaunchConfig{}, {o, {0x80}, {0x05}, {0x00, 0x80}}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out + 0, 4), uint64_t{0xFFFFFF80});   // -128
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0xFFFF8000});   // -32768
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), 5ull);
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), 128ull);
+  VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{0xFFFF8000});  // through a register
+}
+
 VTEST(module_global_string_and_symbols) {
   // "AB" + zero padding, read through a symbol address.
   std::string ptx = std::string(kHeader) + R"(
