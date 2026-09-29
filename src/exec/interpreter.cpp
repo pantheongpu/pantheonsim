@@ -5226,6 +5226,20 @@ class Interpreter {
         exec_device_int_query(w, ctx, ins, *op, m, cfg_.device_count);
         return;
       }
+      // Device-side streams and events (CUDA Samples' cdpSimpleQuicksort
+      // launches each child into a stream of its own). Child grids run here
+      // one after another in launch order, which every ordering these can
+      // ask for already satisfies: creation hands back a distinct handle,
+      // and destroying, recording and waiting have nothing left to do.
+      if (op->callee == "__cuda_syscall_cnpv2StreamCreate" || op->callee == "__cuda_syscall_cnpv2EventCreate") {
+        exec_device_handle(w, ctx, ins, *op, m);
+        return;
+      }
+      if (op->callee == "__cuda_syscall_cnpv2StreamDestroy" || op->callee == "__cuda_syscall_cnpv2EventDestroy" ||
+          op->callee == "__cuda_syscall_cnpv2EventRecord" || op->callee == "__cuda_syscall_cnpv2StreamWaitEvent") {
+        write_call_result(w, *op, m, Lanes{}, 4);   // cudaSuccess
+        return;
+      }
       if (op->indirect) {
         exec_indirect_call(w, ctx, ins, *op, m);
         return;
@@ -11468,6 +11482,29 @@ class Interpreter {
     }
     write_call_result(w, op, m, r, 4);
   }
+
+  // cudaStreamCreateWithFlags / cudaEventCreateWithFlags on the device: a
+  // non-null handle, distinct per call, written where the first argument
+  // points; the flags are accepted as they come.
+  void exec_device_handle(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
+    if (op.param_slots.size() != 2)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, op.callee + " takes two arguments");
+    const Warp::Slot& ptr = call_slot(w, ins, op, 0);
+    Lanes r{};
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint64_t addr = ptr.read(lane, 0, 8);
+      if (addr == 0) {
+        r[lane] = 1;   // cudaErrorInvalidValue
+        continue;
+      }
+      const uint64_t handle = kDeviceHandleBase + device_handles_.fetch_add(1, std::memory_order_relaxed);
+      store_routed(w, ctx, ins, lane, addr, 8, handle);
+    }
+    write_call_result(w, op, m, r, 4);
+  }
+  static constexpr uint64_t kDeviceHandleBase = 0x5654'4750'0000'0000ull;   // "VTGP": never a device address
+  static inline std::atomic<uint64_t> device_handles_{1};
 
   // cudaGetParameterBufferV2(func, gridDim, blockDim, sharedMem): a buffer, in
   // device memory, laid out as the kernel's parameters are, for the calling
