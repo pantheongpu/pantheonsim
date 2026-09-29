@@ -1364,8 +1364,9 @@ class Interpreter {
   }
   // The driver's reserved shared memory per block: 1 KiB from Ampere on
   // (cudaDevAttrReservedSharedMemoryPerBlock; cuda_occupancy.h adds it to
-  // every block from compute capability 8.0), none before.
-  uint32_t reserved_smem_bytes() const { return profile_.cc_major >= 8 ? 1024 : 0; }
+  // every block from compute capability 8.0), none before. The profile holds
+  // the rule, so the driver, the runtime and this agree.
+  uint32_t reserved_smem_bytes() const { return profile_.reserved_smem_per_block(); }
   static constexpr uint32_t kReservedSmemUsed = 0x120;
   uint32_t reserved_smem_base() const {
     if (reserved_smem_bytes() == 0)

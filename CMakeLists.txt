@@ -1273,6 +1273,9 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_bar_red_named
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_bar_red_named.sh)
   set_tests_properties(e2e_bar_red_named PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
 
   add_test(NAME e2e_cg_multi_warp_tiles
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cg_multi_warp_tiles.sh)
