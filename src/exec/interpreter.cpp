@@ -42,6 +42,7 @@
 #include <optional>
 #include <unordered_map>
 
+#include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tensormap.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/faults.hpp"
@@ -11187,5 +11188,10 @@ void texture_fetch(const MemoryManager& mem, const TextureDesc& d, const TexFetc
 }
 
 std::optional<uint64_t> surface_address(const TextureDesc& d, const SurfaceAccess& a) { return surface_at(d, a); }
+
+// ---- FP8, for the SASS executor (vgpu/exec/numerics.hpp) ----
+
+double fp8_value(uint32_t byte, bool e5m2) { return fp8_to_double(byte & 0xFF, e5m2 ? kE5M2 : kE4M3); }
+uint32_t fp8_bits(double v, bool e5m2, bool satfinite) { return double_to_fp8(v, e5m2 ? kE5M2 : kE4M3, satfinite); }
 
 }  // namespace vgpu::exec

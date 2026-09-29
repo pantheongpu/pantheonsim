@@ -36,6 +36,11 @@ void check_corpus(const std::string& file, int sm) {
   const char* over = std::getenv("VGPU_SASS_CORPUS");
   const std::string path =
       over && *over ? std::string(over) : std::string(VGPU_SOURCE_DIR) + "/nvidia/tests/data/sass/" + file;
+  if (over && *over) {
+    // The architecture from the file's name: .../sm_90a.txt is sm_90.
+    const size_t at = path.rfind("sm_");
+    if (at != std::string::npos) sm = std::atoi(path.c_str() + at + 3);
+  }
   std::ifstream in(path);
   if (!in) throw vtest::Failure("no corpus at " + path);
   std::map<std::string, Tally> by_op;
@@ -81,7 +86,7 @@ void check_corpus(const std::string& file, int sm) {
       table += "\n  " + op + ": " + std::to_string(t.ok) + " ok, " + std::to_string(t.wrong) + " wrong, " +
                std::to_string(t.unknown) + " unknown" + (t.wrong ? t.first : "");
     }
-    std::fprintf(stderr, "%s (sm_%d): %zu of %zu match%s\n", file.c_str(), sm, checked - bad, checked,
+    std::fprintf(stderr, "%s (sm_%d): %zu of %zu match%s\n", path.substr(path.rfind('/') + 1).c_str(), sm, checked - bad, checked,
                  table.c_str());
   }
   VCHECK(checked > 1000);

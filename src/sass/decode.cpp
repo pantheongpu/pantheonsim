@@ -117,6 +117,17 @@ enum ImmStyle { kSigned, kUnsigned, kFloat };
 // A 32-bit float immediate as nvdisasm prints it: its exact value to twenty
 // significant digits (0.25, 1, 1.4426950216293334961), infinities and NaNs
 // by name.
+// A float or double as nvdisasm prints it: twenty significant digits, and
+// from 2^24 up in exponent form with twenty after the point.
+std::string float_text(double d) {
+  char b[48];
+  if (d == __builtin_inf() || d == -__builtin_inf()) return d < 0 ? "-INF" : "+INF";
+  if (d == 0 && std::signbit(d)) return "-0.0";
+  if (std::fabs(d) >= 16777216.0) std::snprintf(b, sizeof b, "%.20e", d);
+  else std::snprintf(b, sizeof b, "%.20g", d);
+  return b;
+}
+
 Operand FImm32(uint32_t bits) {
   Operand o;
   o.kind = Kind::FImm;
@@ -124,15 +135,8 @@ Operand FImm32(uint32_t bits) {
   o.fwidth = 32;
   float f;
   std::memcpy(&f, &bits, 4);
-  char b[48];
-  if (f != f) {
-    std::snprintf(b, sizeof b, "%sNAN", (bits >> 31) ? "-" : "+");
-  } else if (f == __builtin_inff() || f == -__builtin_inff()) {
-    std::snprintf(b, sizeof b, "%sINF", (bits >> 31) ? "-" : "+");
-  } else {
-    std::snprintf(b, sizeof b, "%.20g", static_cast<double>(f));
-  }
-  o.text = b;
+  if (f != f) o.text = std::string((bits >> 31) ? "-" : "+") + "QNAN";   // nvdisasm's word for any NaN
+  else o.text = float_text(f);
   return o;
 }
 
@@ -295,18 +299,19 @@ void dec_imad(Instr& ins, const Word& w, bool uniform) {
     if (!uniform && a_rz && b_rz && !x && !c_uniform) {
       ins.mods.push_back("MOV");
       if (!is_signed) ins.mods.push_back("U32");
-    } else if (!uniform && b.kind == Kind::Imm && b.imm == 1 && !x && is_signed) {
+    } else if (!uniform && b.kind == Kind::Imm && b.imm == 1 && !x) {
       ins.mods.push_back("IADD");
+      if (!is_signed) ins.mods.push_back("U32");
     } else if (!uniform && b.kind == Kind::Imm && c_rz && !is_signed && !x && b.imm > 0 &&
                b.imm < 0x10000 && (b.imm & (b.imm - 1)) == 0) {
       ins.mods.push_back("SHL");
       ins.mods.push_back("U32");
-    } else if (!is_signed && !x) {
+    } else if (!is_signed) {
       ins.mods.push_back("U32");
     }
   }
   if (x) ins.mods.push_back("X");
-  if (pdst != kPT) ins.dst.push_back(P(pdst));
+  if (pdst != kPT) ins.dst.push_back(uniform ? UP(pdst) : P(pdst));
   if (x) ins.src.push_back(pred_src(w, 87, 90, uniform));
 }
 
@@ -317,10 +322,9 @@ void dec_iadd3(Instr& ins, const Word& w, bool uniform) {
   if (x) ins.mods.push_back("X");
   ins.dst.push_back(dst_reg(w, uniform, ins.sm));
   const unsigned p0 = static_cast<unsigned>(w.field(81, 3)), p1 = static_cast<unsigned>(w.field(84, 3));
-  if (!x) {
-    if (p0 != kPT || p1 != kPT) ins.dst.push_back(uniform ? UP(p0) : P(p0));
-    if (p1 != kPT) ins.dst.push_back(uniform ? UP(p1) : P(p1));
-  }
+  // The carry-outs, when not PT (with .X too: a chained wider add).
+  if (p0 != kPT || p1 != kPT) ins.dst.push_back(uniform ? UP(p0) : P(p0));
+  if (p1 != kPT) ins.dst.push_back(uniform ? UP(p1) : P(p1));
   alu3(ins, w, kSigned, uniform);
   for (Operand& o : ins.src) {
     int_neg(o, w);
@@ -458,7 +462,7 @@ void dec_mov(Instr& ins, const Word& w, bool uniform) {
   ins.dst.push_back(dst_reg(w, uniform, ins.sm));
   const AluForm f = alu_form(static_cast<unsigned>(w.field(9, 3)));
   ins.src.push_back(alu_src(w, f.s1 == Slot::R64 ? f.s2 : f.s1, ins.sm, kUnsigned, uniform));
-  mark_reuse(ins, w);
+  if (ins.src[0].kind == Kind::Reg) ins.src[0].reuse = reuse(w, 1);   // it is operand b
   const unsigned lanes = static_cast<unsigned>(w.field(72, 4));
   if (!uniform && lanes != 0xf) ins.src.push_back(Imm(lanes));
   ins.f[0] = lanes;
@@ -502,6 +506,12 @@ void dec_ffma(Instr& ins, const Word& w) {
 void dec_fmul(Instr& ins, const Word& w) {
   ins.op = Op::FMUL;
   ins.mnemonic = "FMUL";
+  // 84-86: the product times 2^(field - 4): 4 is none, 1-3 .D8 .D4 .D2
+  // (seen), 5-7 .M2 .M4 .M8 by symmetry.
+  static const char* const scales[] = {"(0)", "D8", "D4", "D2", "", "M2", "M4", "M8"};
+  const unsigned scale = static_cast<unsigned>(w.field(84, 3));
+  if (scale != 4) ins.mods.push_back(scales[scale]);
+  ins.f[4] = scale;
   float_mods(ins, w, true);
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   alu2(ins, w, kFloat);
@@ -519,6 +529,8 @@ void dec_fadd(Instr& ins, const Word& w) {
   ins.src.push_back(alu_src(w, Slot::R24, ins.sm, kFloat));
   ins.src.push_back(alu_src(w, f.s1 == Slot::R64 ? f.s2 : f.s1, ins.sm, kFloat));
   mark_reuse(ins, w);
+  // FADD is a*1 + b: its second register reuses as operand c.
+  if (ins.src[1].kind == Kind::Reg) ins.src[1].reuse = reuse(w, 2);
   float_srcs(ins, w);
 }
 
@@ -545,6 +557,7 @@ void dec_bra(Instr& ins, const Word& w) {
   // when the warp is (not) converged, per the uniform register at 24-29
   // (bit 30 inverts it).
   const unsigned mode = static_cast<unsigned>(w.field(32, 2));
+  if (mode == 1) ins.mods.push_back("U");   // the warp is known to agree
   if (mode == 2) ins.mods.push_back("DIV");
   if (mode == 3) ins.mods.push_back("CONV");
   const unsigned cond = static_cast<unsigned>(w.field(87, 3));
@@ -722,7 +735,7 @@ Operand mem_addr(unsigned ra, bool ra64, const std::string& ra_suffix, int ur, i
     t += static_cast<unsigned>(ur) == urz(sm) ? "URZ" : "UR" + std::to_string(ur);
   }
   if (off != 0 || t.empty()) {
-    if (t.empty()) t = signed_hex(off);
+    if (t.empty()) t = off == 0 && ra == kRZ ? "RZ" : signed_hex(off);
     else t += "+" + signed_hex(off);   // nvdisasm writes a negative one as +-0x80
   }
   o.text = "[" + t + "]";
@@ -738,9 +751,12 @@ void dec_gmem(Instr& ins, const Word& w, Op op, const char* name, bool store) {
   const bool e = w.bit(72);
   const unsigned size = static_cast<unsigned>(w.field(73, 3));
   if (e) ins.mods.push_back("E");
+  evict_mods(ins, w);
+  // 68-69: an L2 prefetch of the surrounding 64, 128 or 256 bytes.
+  static const char* const ltc[] = {"", "LTC64B", "LTC128B", "LTC256B"};
+  if (!store && w.field(68, 2)) ins.mods.push_back(ltc[w.field(68, 2)]);
   if (*kMemSize[size]) ins.mods.push_back(kMemSize[size]);
   mem_order_mods(ins, w);
-  evict_mods(ins, w);
   ins.f[0] = size;
   const unsigned ra = static_cast<unsigned>(w.field(24, 8));
   const bool ra64 = w.bit(90);
@@ -764,8 +780,8 @@ void dec_smem(Instr& ins, const Word& w, Op op, const char* name, bool store, bo
   ins.op = op;
   ins.mnemonic = name;
   const unsigned size = static_cast<unsigned>(w.field(73, 3));
-  if (*kMemSize[size]) ins.mods.push_back(kMemSize[size]);
   if (!shared) evict_mods(ins, w);
+  if (*kMemSize[size]) ins.mods.push_back(kMemSize[size]);
   ins.f[0] = size;
   const unsigned ra = static_cast<unsigned>(w.field(24, 8));
   static const char* const strides[] = {"", ".X4", ".X8", ".X16"};
@@ -823,14 +839,13 @@ std::string half_text(uint16_t h) {
   const unsigned sign = h >> 15, exp = (h >> 10) & 0x1f, man = h & 0x3ff;
   char b[48];
   if (exp == 0x1f) {
-    std::snprintf(b, sizeof b, "%s%s", sign ? "-" : "+", man ? "NAN" : "INF");
+    std::snprintf(b, sizeof b, "%s%s", sign ? "-" : "+", man ? "QNAN" : "INF");
     return b;
   }
   double v = exp ? (1.0 + man / 1024.0) * std::ldexp(1.0, static_cast<int>(exp) - 15)
                  : man / 1024.0 * std::ldexp(1.0, -14);
   if (sign) v = -v;
-  std::snprintf(b, sizeof b, "%.20g", v);
-  return b;
+  return float_text(v);
 }
 
 const char* const kSwz[] = {"", "F32", "H0_H0", "H1_H1"};
@@ -865,9 +880,8 @@ std::string bf16_text(uint16_t h) {
   float f;
   std::memcpy(&f, &bits, 4);
   char b[48];
-  if (f != f) std::snprintf(b, sizeof b, "%sNAN", (h >> 15) ? "-" : "+");
-  else if (f == __builtin_inff() || f == -__builtin_inff()) std::snprintf(b, sizeof b, "%sINF", (h >> 15) ? "-" : "+");
-  else std::snprintf(b, sizeof b, "%.20g", static_cast<double>(f));
+  if (f != f) std::snprintf(b, sizeof b, "%sQNAN", (h >> 15) ? "-" : "+");
+  else return float_text(f);
   return b;
 }
 
@@ -941,14 +955,18 @@ const char* const kFloatCmp[] = {"F",  "LT",  "EQ",  "LE",  "GT",  "NE",  "GE", 
                                  "NAN", "LTU", "EQU", "LEU", "GTU", "NEU", "GEU", "T"};
 
 void dec_hset2(Instr& ins, const Word& w, bool setp) {
-  ins.op = setp ? Op::HSETP2 : Op::HSETP2;
+  ins.op = setp ? Op::HSETP2 : Op::HSET2;
   ins.mnemonic = setp ? "HSETP2" : "HSET2";
   if (w.bit(65)) ins.mods.push_back("BF16_V2");
   if (!setp && w.bit(71)) ins.mods.push_back("BF");
   ins.mods.push_back(kFloatCmp[w.field(76, 4)]);
   if (w.bit(80)) ins.mods.push_back("FTZ");
-  ins.mods.push_back(kBoolOp[w.field(setp ? 74 : 69, 2)]);
+  ins.mods.push_back(kBoolOp[w.field(69, 2)]);
   ins.f[0] = static_cast<uint32_t>(w.field(76, 4));
+  ins.f[1] = static_cast<uint32_t>(w.field(69, 2));
+  ins.f[2] = !setp && w.bit(71);   // .BF: 1.0 for true, else a mask of ones
+  ins.f[3] = w.bit(65);            // bfloat16 pairs
+  ins.f[4] = w.bit(80);
   if (setp) {
     ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
     ins.dst.push_back(P(static_cast<unsigned>(w.field(84, 3))));
@@ -956,6 +974,8 @@ void dec_hset2(Instr& ins, const Word& w, bool setp) {
     ins.dst.push_back(dst_reg(w, false, ins.sm));
   }
   alu2(ins, w, kUnsigned);
+  // Like HADD2, the second register reuses as operand c.
+  if (ins.src[1].kind == Kind::Reg) ins.src[1].reuse = reuse(w, 2);
   half_src_mods(ins, w);
   split_half_imm(ins, w.bit(85));
   ins.src.push_back(pred_src(w, 87, 90));
@@ -970,12 +990,9 @@ void double_imm(Instr& ins) {
     const uint64_t bits = static_cast<uint64_t>(o.kind == Kind::FImm ? o.fbits : static_cast<uint32_t>(o.imm)) << 32;
     double d;
     std::memcpy(&d, &bits, 8);
-    char b[48];
-    if (d != d) std::snprintf(b, sizeof b, "%sNAN", (bits >> 63) ? "-" : "+");
-    else if (d == __builtin_inf() || d == -__builtin_inf()) std::snprintf(b, sizeof b, "%sINF", (bits >> 63) ? "-" : "+");
-    else std::snprintf(b, sizeof b, "%.20g", d);
     o.kind = Kind::FImm;
-    o.text = b;
+    if (d != d) o.text = std::string((bits >> 63) ? "-" : "+") + "QNAN";
+    else o.text = float_text(d);
     o.fwidth = 64;
   }
 }
@@ -989,11 +1006,15 @@ void dec_dop(Instr& ins, const Word& w, Op op, const char* name, int nsrc) {
   ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), 2));
   if (nsrc == 3) alu3(ins, w, kFloat);
   else if (op == Op::DADD) {
+    // DADD is a + c: a register second source is in the third slot (Mesa
+    // NAK encodes it so, and nvdisasm agrees).
     const AluForm f = alu_form(static_cast<unsigned>(w.field(9, 3)));
     ins.src.push_back(alu_src(w, Slot::R24, ins.sm, kFloat));
-    ins.src.push_back(alu_src(w, f.s1 == Slot::R64 ? f.s2 : f.s1, ins.sm, kFloat));
+    ins.src.push_back(alu_src(w, f.s1 == Slot::R32 || f.s1 == Slot::R64 ? f.s2 : f.s1, ins.sm, kFloat));
     mark_reuse(ins, w);
   } else alu2(ins, w, kFloat);
+  // DADD is a + c: its second register reuses as operand c.
+  if (op == Op::DADD && ins.src[1].kind == Kind::Reg) ins.src[1].reuse = reuse(w, 2);
   float_srcs(ins, w);
   double_imm(ins);
 }
@@ -1001,16 +1022,98 @@ void dec_dop(Instr& ins, const Word& w, Op op, const char* name, int nsrc) {
 void dec_dsetp(Instr& ins, const Word& w) {
   ins.op = Op::DSETP;
   ins.mnemonic = "DSETP";
-  ins.mods.push_back(kFloatCmp[w.field(76, 4)]);
+  // Comparisons 0 and 15 (never, always) are MIN and MAX here: the first
+  // predicate picks a over b, the second says both are NaN.
+  const unsigned cmp = static_cast<unsigned>(w.field(76, 4));
+  ins.mods.push_back(cmp == 0 ? "MIN" : cmp == 15 ? "MAX" : kFloatCmp[cmp]);
   ins.mods.push_back(kBoolOp[w.field(74, 2)]);
   ins.f[0] = static_cast<uint32_t>(w.field(76, 4));
   ins.f[1] = static_cast<uint32_t>(w.field(74, 2));
   ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
   ins.dst.push_back(P(static_cast<unsigned>(w.field(84, 3))));
   alu2(ins, w, kFloat);
+  if (ins.src[1].kind == Kind::Reg) ins.src[1].reuse = reuse(w, 2);   // as DADD
   float_srcs(ins, w);
   double_imm(ins);
   ins.src.push_back(pred_src(w, 87, 90));
+}
+
+void dec_fsetp(Instr& ins, const Word& w) {
+  ins.op = Op::FSETP;
+  ins.mnemonic = "FSETP";
+  ins.mods.push_back(kFloatCmp[w.field(76, 4)]);
+  if (w.bit(80)) ins.mods.push_back("FTZ");
+  ins.mods.push_back(kBoolOp[w.field(74, 2)]);
+  ins.f[0] = static_cast<uint32_t>(w.field(76, 4));
+  ins.f[1] = static_cast<uint32_t>(w.field(74, 2));
+  ins.f[2] = w.bit(80);
+  ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
+  ins.dst.push_back(P(static_cast<unsigned>(w.field(84, 3))));
+  alu2(ins, w, kFloat);
+  float_srcs(ins, w);
+  ins.src.push_back(pred_src(w, 87, 90));
+}
+
+// FSET: 1.0 or 0.0 (.BF, the only form ptxas emits) from a comparison.
+void dec_fset(Instr& ins, const Word& w) {
+  ins.op = Op::FSET;
+  ins.mnemonic = "FSET";
+  ins.mods.push_back("BF");
+  ins.mods.push_back(kFloatCmp[w.field(76, 4)]);
+  if (w.bit(80)) ins.mods.push_back("FTZ");
+  ins.mods.push_back(kBoolOp[w.field(74, 2)]);
+  ins.f[0] = static_cast<uint32_t>(w.field(76, 4));
+  ins.f[1] = static_cast<uint32_t>(w.field(74, 2));
+  ins.f[2] = w.bit(80);
+  ins.dst.push_back(dst_reg(w, false, ins.sm));
+  alu2(ins, w, kFloat);
+  float_srcs(ins, w);
+  ins.src.push_back(pred_src(w, 87, 90));
+}
+
+void dec_fsel(Instr& ins, const Word& w) {
+  ins.op = Op::FSEL;
+  ins.mnemonic = "FSEL";
+  ins.dst.push_back(dst_reg(w, false, ins.sm));
+  alu2(ins, w, kFloat);
+  float_srcs(ins, w);
+  ins.src.push_back(pred_src(w, 87, 90));
+}
+
+// FRND (0x107, 32-bit; 0x113 with a 64-bit side): round to an integral
+// value. 78-79 the rounding (none: to nearest even), 75-76 the result's
+// size and 84-85 the source's (log2 bytes), 80 FTZ.
+void dec_frnd(Instr& ins, const Word& w) {
+  ins.op = Op::FRND;
+  ins.mnemonic = "FRND";
+  const unsigned dsz = static_cast<unsigned>(w.field(75, 2)), ssz = static_cast<unsigned>(w.field(84, 2));
+  if (dsz == 3 && ssz == 3) ins.mods.push_back("F64");
+  else if (dsz != 2 || ssz != 2) {
+    ins.mods.push_back(dsz == 3 ? "F64" : dsz == 1 ? "F16" : "F32");
+    ins.mods.push_back(ssz == 3 ? "F64" : ssz == 1 ? "F16" : "F32");
+  }
+  static const char* const rnd[] = {"", "FLOOR", "CEIL", "TRUNC"};
+  const unsigned r = static_cast<unsigned>(w.field(78, 2));
+  if (w.bit(80)) ins.mods.push_back("FTZ");
+  if (r) ins.mods.push_back(rnd[r]);
+  ins.f[0] = r;
+  ins.f[1] = w.bit(80);
+  ins.f[2] = dsz;
+  ins.f[3] = ssz;
+  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), dsz == 3 ? 2 : 1));
+  one_src(ins, w, kFloat, false);
+  if (ssz == 3 && ins.src[0].kind == Kind::Reg) ins.src[0].width = 2;
+  src_neg_abs(ins.src[0], w, true);
+  if (ssz == 3) double_imm(ins);
+}
+
+// FCHK: whether a / b needs the division's slow path.
+void dec_fchk(Instr& ins, const Word& w) {
+  ins.op = Op::FCHK;
+  ins.mnemonic = "FCHK";
+  ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
+  alu2(ins, w, kFloat);
+  float_srcs(ins, w);
 }
 
 // ---- conversions -----------------------------------------------------------------
@@ -1043,6 +1146,10 @@ void dec_i2f(Instr& ins, const Word& w) {
   ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), dsize == 3 ? 2 : 1));
   one_src(ins, w, kUnsigned, false);
   if (ssize == 3) ins.src[0].width = 2;
+  // A narrow source's part of the register, 60-61: .H1, or .B1-.B3.
+  const unsigned part = static_cast<unsigned>(w.field(60, 2));
+  if (part && ins.src[0].kind == Kind::Reg) ins.src[0].suffix = (ssize == 1 ? ".H" : ".B") + std::to_string(part);
+  ins.f[4] = part;
 }
 
 // F2I: float (84-85) to integer (75-76 size, 72 signed); 78-79 the rounding
@@ -1076,11 +1183,13 @@ void dec_f2f(Instr& ins, const Word& w) {
   ins.mnemonic = "F2F";
   const unsigned dsize = static_cast<unsigned>(w.field(75, 2)), ssize = static_cast<unsigned>(w.field(84, 2));
   if (w.bit(80)) ins.mods.push_back("FTZ");
-  ins.mods.push_back(float_type(dsize));
+  // The result's type is three bits, 75-77: 4 is BF16.
+  const bool bf16 = w.field(75, 3) == 4;
+  ins.mods.push_back(bf16 ? "BF16" : float_type(dsize));
   ins.mods.push_back(float_type(ssize));
   const unsigned rnd = static_cast<unsigned>(w.field(78, 2));
   if (rnd) ins.mods.push_back(kRnd[rnd]);
-  ins.f[0] = dsize;
+  ins.f[0] = bf16 ? 4 : dsize;
   ins.f[1] = ssize;
   ins.f[3] = rnd;
   ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), dsize == 3 ? 2 : 1));
@@ -1103,18 +1212,44 @@ void dec_i2i(Instr& ins, const Word& w) {
   one_src(ins, w, kUnsigned, false);
 }
 
-// F2FP: two floats packed into one register as two halves (or bf16s).
+// F2FP: two floats packed into one register, or (sm_89) FP8 pairs packed
+// and unpacked. 76-78 the result's type (0 F16, 1 BF16, 6 E5M2, 7 E4M3),
+// 73-74 the source's (0 F32, 2 E5M2, 3 E4M3), 87-89 the form (0 PACK_AB,
+// 1 PACK_AB_MERGE_C: the pair into c's low half, 4 UNPACK_B: b's two bytes
+// to two halves), 75 .RELU, 79-80 the rounding, 90 .SATFINITE. From sm_89
+// nvdisasm names both types.
 void dec_f2fp(Instr& ins, const Word& w) {
   ins.op = Op::F2FP;
   ins.mnemonic = "F2FP";
-  if (w.bit(76) || w.field(75, 2) == 2) ins.mods.push_back("BF16");
-  ins.mods.push_back("PACK_AB");
+  static const char* const dts[] = {"F16", "BF16", "(2)", "(3)", "(4)", "(5)", "E5M2", "E4M3"};
+  static const char* const sts[] = {"F32", "(1)", "E5M2", "E4M3"};
+  const unsigned dt = static_cast<unsigned>(w.field(76, 3)), st = static_cast<unsigned>(w.field(73, 2));
+  const unsigned mode = static_cast<unsigned>(w.field(87, 3));
+  if (w.bit(75)) ins.mods.push_back("RELU");   // negatives become zero
+  if (w.bit(90)) ins.mods.push_back("SATFINITE");
+  if (ins.sm >= 89) {
+    ins.mods.push_back(dts[dt]);
+    ins.mods.push_back(sts[st]);
+  } else if (dt != 0) {
+    ins.mods.push_back(dts[dt]);
+  }
+  ins.mods.push_back(mode == 4 ? "UNPACK_B" : mode == 1 ? "PACK_AB_MERGE_C" : "PACK_AB");
   const unsigned rnd = static_cast<unsigned>(w.field(79, 2));
   if (rnd) ins.mods.push_back(kRnd[rnd]);
-  ins.f[0] = w.bit(76);
+  ins.f[0] = dt == 1;
   ins.f[1] = rnd;
+  ins.f[2] = w.bit(75);
+  ins.f[3] = dt;
+  ins.f[4] = st;
+  ins.f[5] = mode;
+  ins.f[6] = w.bit(90);
   ins.dst.push_back(dst_reg(w, false, ins.sm));
-  alu2(ins, w, kFloat);
+  if (mode == 4) {
+    one_src(ins, w, kUnsigned, false);
+  } else {
+    alu2(ins, w, kFloat);
+    if (mode == 1) ins.src.push_back(R(static_cast<unsigned>(w.field(64, 8))));
+  }
 }
 
 // ---- tensor cores ------------------------------------------------------------------
@@ -1124,6 +1259,7 @@ void dec_f2fp(Instr& ins, const Word& w) {
 void sparse_meta(Instr& ins, const Word& w, bool sp) {
   if (!sp) return;
   ins.src.push_back(R(static_cast<unsigned>(w.field(40, 8))));
+  ins.src.back().reuse = w.bit(50);
   ins.src.push_back(Imm(w.field(48, 2)));
   ins.f[7] = static_cast<uint32_t>(w.field(48, 2));
 }
@@ -1185,6 +1321,21 @@ void dec_imma(Instr& ins, const Word& w) {
   ins.f[6] = w.bit(82);
   mma_regs(ins, w, ".ROW", ".COL");
   sparse_meta(ins, w, sp);
+}
+
+// QMMA (sm_89): FP8 A and B. 77 an F32 accumulator (else F16), 78 and 79
+// A and B are E5M2 (else E4M3).
+void dec_qmma(Instr& ins, const Word& w) {
+  ins.op = Op::QMMA;
+  ins.mnemonic = "QMMA";
+  ins.mods.push_back(w.field(74, 2) == 3 ? "16832" : "(shape " + std::to_string(w.field(74, 2)) + ")");
+  ins.mods.push_back(w.bit(77) ? "F32" : "F16");
+  ins.mods.push_back(w.bit(78) ? "E5M2" : "E4M3");
+  ins.mods.push_back(w.bit(79) ? "E5M2" : "E4M3");
+  ins.f[0] = w.bit(77);
+  ins.f[1] = w.bit(78);
+  ins.f[2] = w.bit(79);
+  mma_regs(ins, w, ".ROW", ".COL");
 }
 
 // BMMA: 1-bit matrices; 76 .AND (else .XOR), shape from 75 and 85-86.
@@ -1385,13 +1536,16 @@ void dec_mufu(Instr& ins, const Word& w) {
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   one_src(ins, w, kFloat, false);
   src_neg_abs(ins.src[0], w, true);
+  if (op == 6 || op == 7) double_imm(ins);   // an immediate is a double's high word
 }
 
 void dec_fmnmx(Instr& ins, const Word& w) {
   ins.op = Op::FMNMX;
   ins.mnemonic = "FMNMX";
   if (w.bit(80)) ins.mods.push_back("FTZ");
+  if (w.bit(81)) ins.mods.push_back("NAN");   // a NaN operand gives NaN
   ins.f[0] = w.bit(80);
+  ins.f[1] = w.bit(81);
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   alu2(ins, w, kFloat);
   float_srcs(ins, w);
@@ -1442,10 +1596,15 @@ void dec_bar(Instr& ins, const Word& w) {
   if (w.bit(80)) ins.mods.push_back("DEFER_BLOCKING");
   ins.f[0] = mode;
   ins.f[1] = red;
-  // The barrier: an immediate at 54-57 unless bit 90 says it is a register.
-  if (w.bit(90)) ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
+  // The barrier: an immediate at 54-57 unless bit 90 says it is a register
+  // (for .RED, bit 90 is the predicate's not).
+  const bool breg = mode != 2 && w.bit(90);
+  if (breg) ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
   else ins.src.push_back(Imm(w.field(54, 4)));
-  // A thread count, when there is one (bit 91: register at 32; bit 89? imm).
+  // A thread count at 42-53 (.ARV always has one).
+  const unsigned count = static_cast<unsigned>(w.field(42, 12));
+  if (mode == 1 || count) ins.src.push_back(Imm(count));
+  ins.f[2] = count;
   if (mode == 2) ins.src.push_back(pred_src(w, 87, 90));
 }
 
@@ -1514,9 +1673,20 @@ void dec_membar(Instr& ins, const Word& w) {
 void dec_depbar(Instr& ins, const Word& w) {
   ins.op = Op::DEPBAR;
   ins.mnemonic = "DEPBAR";
-  if (w.bit(47)) ins.mods.push_back("LE");
-  ins.src.push_back(Txt("SB" + std::to_string(w.field(44, 3))));
-  ins.src.push_back(Imm(w.field(38, 6)));
+  // .LE SBn, count: wait until scoreboard n is at most count. 32-37: more
+  // scoreboards to wait for entirely, printed as a list.
+  if (w.bit(47)) {
+    ins.mods.push_back("LE");
+    ins.src.push_back(Txt("SB" + std::to_string(w.field(44, 3))));
+    ins.src.push_back(Imm(w.field(38, 6)));
+  }
+  const unsigned list = static_cast<unsigned>(w.field(32, 6));
+  if (list) {
+    std::string t = "{";
+    for (int i = 5; i >= 0; --i)
+      if (list >> i & 1) t += (t.size() > 1 ? "," : "") + std::to_string(i);
+    ins.src.push_back(Txt(t + "}"));
+  }
 }
 
 void dec_cs2r(Instr& ins, const Word& w) {
@@ -1739,6 +1909,165 @@ void dec_sust(Instr& ins, const Word& w) {
 
 // ---- the rest ------------------------------------------------------------------
 
+// ATOMG.CAS (0x3a9) and ATOM.CAS (0x38b, generic): compare with the
+// register at 32, store the one at 64 (register pairs for .64). The
+// predicate (81-83) says the hardware did it: a generic CAS of a shared
+// address leaves it false and the code takes a software path.
+void dec_atom_cas(Instr& ins, const Word& w, Op op, const char* name) {
+  ins.op = op;
+  ins.mnemonic = name;
+  if (w.bit(72)) ins.mods.push_back("E");
+  ins.mods.push_back("CAS");
+  atom_type_mods(ins, w);
+  mem_order_mods(ins, w);
+  evict_mods(ins, w);
+  ins.f[5] = 1;   // CAS
+  const unsigned t = static_cast<unsigned>(w.field(73, 3));
+  const unsigned width = t == 2 || t == 5 || t == 6 ? 2 : 1;
+  ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
+  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), width));
+  const int ur = w.bit(91) && !w.bit(72) ? static_cast<int>(w.field(64, ureg_bits(ins.sm))) : -1;
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), w.bit(90), "", ur, w.sfield(40, 24), ins.sm));
+  ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8)), width));
+  ins.src.push_back(R(static_cast<unsigned>(w.field(64, 8)), width));
+}
+
+// BMOV.32 Bn, R: set a convergence barrier's thread mask.
+void dec_bmov(Instr& ins, const Word& w) {
+  ins.op = Op::BMOV;
+  ins.mnemonic = "BMOV";
+  ins.mods.push_back("32");
+  Operand b;
+  b.kind = Kind::Bar;
+  b.reg = static_cast<unsigned>(w.field(24, 4));
+  ins.dst.push_back(b);
+  const AluForm f = alu_form(static_cast<unsigned>(w.field(9, 3)));
+  ins.src.push_back(alu_src(w, f.s1 == Slot::R64 ? f.s2 : f.s1, ins.sm, kUnsigned));
+}
+
+// BMOV.32(.CLEAR) R, Bn: read a convergence barrier's mask (84: and clear it).
+void dec_bmov_r(Instr& ins, const Word& w) {
+  ins.op = Op::BMOV;
+  ins.mnemonic = "BMOV";
+  ins.mods.push_back("32");
+  if (w.bit(84)) ins.mods.push_back("CLEAR");
+  ins.f[0] = 1;   // to a register
+  ins.f[1] = w.bit(84);
+  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
+  Operand b;
+  b.kind = Kind::Bar;
+  b.reg = static_cast<unsigned>(w.field(24, 4));
+  ins.src.push_back(b);
+}
+
+// BRXU URn offset: BRX with the index in a uniform register.
+void dec_brxu(Instr& ins, const Word& w) {
+  ins.op = Op::BRX;
+  ins.mnemonic = "BRXU";
+  const unsigned r = static_cast<unsigned>(w.field(24, ureg_bits(ins.sm)));
+  const int64_t off = w.sfield(34, 48) * 4;
+  ins.src.push_back(Txt("UR" + std::to_string(r) + " " + signed_hex(off)));
+  ins.src.back().reg = r;
+  ins.src.back().imm = off;
+  ins.f[0] = 1;   // uniform index
+}
+
+// LDGSTS [shared], [global]: an asynchronous copy of 4, 8 or 16 bytes from
+// global to shared memory. 16-23 the shared address and 44-63 its offset,
+// 24-31 the global one (64-bit with .E) and 32-43 its offset. 81 clear is
+// .BYPASS (not kept in L1), 72 .LTC128B, 82 .ZFILL (the global address's
+// low bits count the bytes to zero-fill at the end); 87-90 a predicate,
+// false to zero-fill it all.
+void dec_ldgsts(Instr& ins, const Word& w) {
+  ins.op = Op::LDGSTS;
+  ins.mnemonic = "LDGSTS";
+  ins.mods.push_back("E");
+  if (!w.bit(81)) ins.mods.push_back("BYPASS");
+  if (w.bit(72)) ins.mods.push_back("LTC128B");
+  const unsigned size = static_cast<unsigned>(w.field(73, 3));
+  if (*kMemSize[size]) ins.mods.push_back(kMemSize[size]);
+  if (w.bit(82)) ins.mods.push_back("ZFILL");
+  ins.f[0] = size;
+  ins.f[1] = w.bit(82);
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(16, 8)), false, "", -1,
+                             static_cast<int64_t>(w.field(44, 20)), ins.sm));
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), true, "", -1, w.sfield(32, 12), ins.sm));
+  const unsigned p = static_cast<unsigned>(w.field(87, 3));
+  if (p != kPT || w.bit(90)) ins.src.push_back(pred_src(w, 87, 90));
+}
+
+// LDSM.16.M88(.2/.4) (ldmatrix): 72-73 the matrix count, 78 .MT88
+// (transposed); the address as for LDS.
+void dec_ldsm(Instr& ins, const Word& w) {
+  ins.op = Op::LDSM;
+  ins.mnemonic = "LDSM";
+  ins.mods.push_back("16");
+  ins.mods.push_back(w.bit(78) ? "MT88" : "M88");
+  const unsigned n = static_cast<unsigned>(w.field(72, 2));
+  if (n == 1) ins.mods.push_back("2");
+  if (n == 2) ins.mods.push_back("4");
+  ins.f[0] = 1u << n;
+  ins.f[1] = w.bit(78);
+  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), 1u << n));
+  const int ur = w.bit(91) ? static_cast<int>(w.field(32, ureg_bits(ins.sm))) : -1;
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), false, "", ur, w.sfield(40, 24), ins.sm));
+}
+
+// SGXT(.U32) d, a, n: the low n bits of a, sign- (or zero-) extended.
+void dec_sgxt(Instr& ins, const Word& w, bool uniform) {
+  ins.op = Op::SGXT;
+  ins.mnemonic = uniform ? "USGXT" : "SGXT";
+  if (w.bit(75)) ins.mods.push_back("W");
+  if (!w.bit(73)) ins.mods.push_back("U32");
+  ins.f[0] = w.bit(73);
+  ins.f[1] = w.bit(75);
+  ins.dst.push_back(dst_reg(w, uniform, ins.sm));
+  alu2(ins, w, kUnsigned, uniform);
+}
+
+// I2IP (cvt.pack.sat): b and a saturated to 8 (or 16) bits, packed low to
+// high, over c. 76-77 the type as I2I's.
+void dec_i2ip(Instr& ins, const Word& w) {
+  ins.op = Op::I2IP;
+  ins.mnemonic = "I2IP";
+  static const char* const types[] = {"U8", "S8", "U16", "S16"};
+  const unsigned t = static_cast<unsigned>(w.field(76, 2));
+  ins.mods.push_back(types[t]);
+  ins.mods.push_back("S32");
+  ins.mods.push_back("SAT");
+  ins.f[0] = t;
+  ins.dst.push_back(dst_reg(w, false, ins.sm));
+  alu3(ins, w, kUnsigned);
+}
+
+void dec_ubmsk(Instr& ins, const Word& w, bool uniform) {
+  ins.op = Op::BMSK;
+  ins.mnemonic = uniform ? "UBMSK" : "BMSK";
+  if (w.bit(75)) ins.mods.push_back("W");
+  ins.f[0] = w.bit(75);
+  ins.dst.push_back(dst_reg(w, uniform, ins.sm));
+  alu2(ins, w, kUnsigned, uniform);
+}
+
+void dec_ldgdepbar(Instr& ins, const Word&) {
+  ins.op = Op::LDGDEPBAR;
+  ins.mnemonic = "LDGDEPBAR";
+}
+
+// ULDC URd, c[bank][URa + offset]: the constant bank indexed by a uniform
+// register.
+void dec_uldc_idx(Instr& ins, const Word& w) {
+  dec_uldc(ins, w);
+  const unsigned ur = static_cast<unsigned>(w.field(24, ureg_bits(ins.sm)));
+  const unsigned bank = static_cast<unsigned>(w.field(54, 5)), off = static_cast<unsigned>(w.field(38, 16));
+  Operand c = Txt("c[" + hex(bank) + "][UR" + std::to_string(ur) + (off ? "+" + hex(off) : "") + "]");
+  c.reg = ur;
+  c.imm = off;
+  ins.src[0] = c;
+  ins.f[1] = 1;   // indexed
+  ins.f[2] = bank;
+}
+
 void dec_vabsdiff4(Instr& ins, const Word& w) {
   ins.op = Op::VABSDIFF4;
   ins.mnemonic = "VABSDIFF4";
@@ -1787,6 +2116,7 @@ void dec_lepc(Instr& ins, const Word& w) {
 void dec_cctl(Instr& ins, const Word& w) {
   ins.op = Op::CCTL;
   ins.mnemonic = "CCTL";
+  if (w.bit(72)) ins.mods.push_back("E");
   static const char* const ops[] = {"PF1", "PF2", "WB", "IV", "IVALL", "RS", "IVALLP", "WBALL"};
   ins.mods.push_back(ops[w.field(87, 3)]);
   ins.f[0] = static_cast<uint32_t>(w.field(87, 3));
@@ -1851,7 +2181,7 @@ const std::unordered_map<unsigned, AluDec>& alu_table() {
   static const std::unordered_map<unsigned, AluDec> t = {
       {0x02, dec_mov},   {0x07, dec_sel},   {0x0c, dec_isetp}, {0x10, dec_iadd3}, {0x11, dec_lea},
       {0x12, dec_lop3},  {0x16, dec_prmt},  {0x17, dec_imnmx}, {0x19, dec_shf},   {0x24, dec_imad},
-      {0x25, dec_imad},  {0x27, dec_imad},
+      {0x25, dec_imad},  {0x27, dec_imad},  {0x1a, dec_sgxt},  {0x1b, dec_ubmsk},
   };
   return t;
 }
@@ -1872,6 +2202,10 @@ const std::unordered_map<unsigned, Dec>& float_table() {
       {0x101, [](Instr& i, const Word& w) { dec_brev(i, w, false); }},
       {0x30, dec_hadd2},
       {0x31, dec_hfma2},
+      {0x35, [](Instr& i, const Word& w) {   // HFMA2 on the tensor pipe
+         dec_hfma2(i, w);
+         i.mods.insert(i.mods.begin(), "MMA");
+       }},
       {0x32, dec_hmul2},
       {0x33, [](Instr& i, const Word& w) { dec_hset2(i, w, false); }},
       {0x34, [](Instr& i, const Word& w) { dec_hset2(i, w, true); }},
@@ -1879,6 +2213,11 @@ const std::unordered_map<unsigned, Dec>& float_table() {
       {0x29, [](Instr& i, const Word& w) { dec_dop(i, w, Op::DADD, "DADD", 2); }},
       {0x2b, [](Instr& i, const Word& w) { dec_dop(i, w, Op::DFMA, "DFMA", 3); }},
       {0x2a, dec_dsetp},
+      {0x0b, dec_fsetp},
+      {0x0a, dec_fset},
+      {0x08, dec_fsel},
+      {0x107, dec_frnd}, {0x113, dec_frnd},
+      {0x102, dec_fchk},
       {0x106, dec_i2f}, {0x112, dec_i2f},
       {0x105, dec_f2i}, {0x111, dec_f2i},
       {0x104, dec_f2f}, {0x110, dec_f2f},
@@ -1887,6 +2226,7 @@ const std::unordered_map<unsigned, Dec>& float_table() {
       {0x15, dec_vabsdiff4},
       {0x26, dec_idp},
       {0x1b, dec_bmsk},
+      {0x39, dec_i2ip},
       {0x0be, [](Instr& i, const Word& w) { dec_brev(i, w, true); }},
   };
   return t;
@@ -1934,7 +2274,13 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
       {0xb60, dec_tex}, {0xb66, dec_tld}, {0xb63, dec_tld4}, {0xb99, dec_suld}, {0xb9d, dec_sust},
       {0x34e, dec_lepc}, {0x98f, dec_cctl}, {0x31c, dec_b2r}, {0x3aa, dec_qspc}, {0x9ab, dec_errbar},
       {0x942, dec_break}, {0x95c, dec_bpt},
-      {0x23c, dec_hmma}, {0x237, dec_imma}, {0x23d, dec_bmma}, {0x23f, dec_dmma}, {0x23a, dec_movm},
+      {0x3a9, [](Instr& i, const Word& w) { dec_atom_cas(i, w, Op::ATOMG, "ATOMG"); }},
+      {0x9a9, [](Instr& i, const Word& w) { dec_atom_cas(i, w, Op::ATOMG, "ATOMG"); }},
+      {0x38b, [](Instr& i, const Word& w) { dec_atom_cas(i, w, Op::ATOM, "ATOM"); }},
+      {0x98b, [](Instr& i, const Word& w) { dec_atom_cas(i, w, Op::ATOM, "ATOM"); }},
+      {0x356, dec_bmov}, {0x355, dec_bmov_r}, {0x958, dec_brxu}, {0xfae, dec_ldgsts}, {0x83b, dec_ldsm}, {0x9af, dec_ldgdepbar},
+      {0xabb, dec_uldc_idx},
+      {0x23c, dec_hmma}, {0x27a, dec_qmma}, {0x237, dec_imma}, {0x23d, dec_bmma}, {0x23f, dec_dmma}, {0x23a, dec_movm},
       // The same without the uniform-register field.
       {0x380, [](Instr& i, const Word& w) { dec_gmem(i, w, Op::LD, "LD", false); }},
       {0x381, [](Instr& i, const Word& w) { dec_gmem(i, w, Op::LDG, "LDG", false); }},
@@ -1960,6 +2306,8 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
   const unsigned opc = static_cast<unsigned>(w.field(0, 12));
   if (const auto it = fixed_table().find(opc); it != fixed_table().end()) {
     it->second(ins, w);
+    // The uniform datapath's own ops take a UP guard.
+    if (opc == 0x9c3 || opc == 0xab9 || opc == 0xabb || opc == 0x89c) ins.guard_uniform = true;
     return ins;
   }
   const unsigned low9 = opc & 0x1ff;
@@ -2020,14 +2368,16 @@ std::string operand_text(const Operand& o, int sm) {
     case Kind::Reg:
     case Kind::UReg:
       s = reg_text(o, sm);
-      if (o.reuse) s += ".reuse";
       break;
     case Kind::Pred:
     case Kind::UPred:
       return (o.neg ? "!" : "") + reg_text(o, sm) + o.suffix;
     case Kind::Imm: s = imm_text(o.imm); break;
     case Kind::FImm: s = o.text; break;
-    case Kind::CBank: s = "c[" + imm_text(o.reg) + "][" + imm_text(o.imm) + "]"; break;
+    case Kind::CBank:
+      // With a swizzle after it nvdisasm puts a space inside: c[0x0] [0x390].H0_H0
+      s = "c[" + imm_text(o.reg) + "]" + (o.suffix.empty() ? "" : " ") + "[" + imm_text(o.imm) + "]";
+      break;
     case Kind::UCBank: s = "cx[UR" + std::to_string(o.reg) + "][" + imm_text(o.imm) + "]"; break;
     case Kind::Label: s = imm_text(o.imm); break;
     case Kind::Bar: s = "B" + std::to_string(o.reg); break;
@@ -2036,7 +2386,8 @@ std::string operand_text(const Operand& o, int sm) {
     case Kind::Text: s = o.text; break;
   }
   if (o.abs) s = "|" + s + "|";
-  s += o.suffix;   // after the bars: |R4|.H0_H0
+  if (o.reuse) s += ".reuse";   // after the bars: |R4|.reuse
+  s += o.suffix;                // then the swizzle: R4.reuse.H0_H0
   if (o.neg && o.kind != Kind::Pred && o.kind != Kind::UPred) s = "-" + s;
   if (o.bnot) s = "~" + s;
   return s;
@@ -2059,8 +2410,14 @@ std::string to_text(const Instr& ins) {
     for (const Operand& o : *list) {
       s += first ? " " : ", ";
       first = false;
-      s += operand_text(o, ins.sm);
+      std::string t = operand_text(o, ins.sm);
+      // nvdisasm writes an infinity with a space after it ("+INF , PT").
+      if (o.kind == Kind::FImm && t.size() >= 3 &&
+          (t.compare(t.size() - 3, 3, "INF") == 0 || t.compare(t.size() - 3, 3, "NAN") == 0 || t == "-0.0"))
+        t += ' ';
+      s += t;
     }
+  while (!s.empty() && s.back() == ' ') s.pop_back();
   return s;
 }
 
