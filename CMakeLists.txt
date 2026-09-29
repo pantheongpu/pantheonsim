@@ -1671,6 +1671,14 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # The two libraries loaded privately (RTLD_LOCAL), as Rust's libloading
+  # does, still share one machine. Needs only a C++ compiler.
+  add_test(NAME e2e_private_loads COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_private_loads.sh)
+  set_tests_properties(e2e_private_loads PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
   add_test(NAME e2e_graph_memory COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_memory.sh)
   set_tests_properties(e2e_graph_memory PROPERTIES
     DEPENDS vgpucudart
