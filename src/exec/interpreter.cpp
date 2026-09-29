@@ -1028,6 +1028,30 @@ void f16x16_to_float(const uint32_t* w8, float* out) {
   f16x16_to_float_table(w8, out);
 }
 
+// tcgen05.mma's rows: acc[i] += a[k] * b[k * ldb + i] for k = 0..K-1 in order,
+// i < n -- each sum in k order, the product and the sum each rounded to f32,
+// as a one-element-at-a-time loop does; contraction off, as above, so no
+// build fuses them. The integer form is exact in any order.
+#pragma GCC push_options
+#pragma GCC optimize("fp-contract=off")
+void tc_rows_f32(float* __restrict acc, const float* __restrict a, const float* __restrict b, uint32_t K,
+                 uint32_t n, size_t ldb) {
+  for (uint32_t k = 0; k < K; ++k) {
+    const float ak = a[k];
+    const float* __restrict bk = b + k * ldb;
+    for (uint32_t i = 0; i < n; ++i) acc[i] += ak * bk[i];
+  }
+}
+#pragma GCC pop_options
+void tc_rows_i64(int64_t* __restrict acc, const int64_t* __restrict a, const int64_t* __restrict b, uint32_t K,
+                 uint32_t n, size_t ldb) {
+  for (uint32_t k = 0; k < K; ++k) {
+    const int64_t ak = a[k];
+    const int64_t* __restrict bk = b + k * ldb;
+    for (uint32_t i = 0; i < n; ++i) acc[i] += ak * bk[i];
+  }
+}
+
 uint64_t mask_to_bits(uint64_t v, uint32_t bits) {
   return bits >= 64 ? v : (v & ((1ull << bits) - 1));
 }
@@ -7211,9 +7235,20 @@ class Interpreter {
     // the canonical layout byte by byte; MN-major, the canonical layout of
     // whole elements, or for fp6/fp4 the same 16-byte groups running along
     // MN (as TMA's .b6x16_p32/.b4x16_p64 write an MN-major tile).
+    // The operands' bytes come straight from each CTA's shared memory, found
+    // once per rank, unless something must see each load -- the race
+    // detector, a shared-memory fault -- or a byte is out of bounds; those
+    // take load_routed, which reports as any load does.
+    const bool direct_smem = fast_enabled_ && !detect_races() && !mem_.shared_fault_armed();
+    std::array<const std::vector<uint8_t>*, 16> smem_of{};
     auto smem_raw = [&](const WgmmaDesc& d, bool k_major, const TcElem& e, uint32_t rank, uint32_t mn,
                         uint32_t k) -> uint32_t {
       auto byte_at = [&](uint64_t off) {
+        if (direct_smem && rank < smem_of.size()) {
+          const std::vector<uint8_t>*& sm = smem_of[rank];
+          if (!sm) sm = shared_ref(ctx, ins, li, kSharedVaBase + cluster_address(ctx, rank, 0)).owner->shared;
+          if (sm && off < sm->size()) return static_cast<uint32_t>((*sm)[off]);
+        }
         return static_cast<uint32_t>(load_routed(w, ctx, ins, lane,
                                                  kSharedVaBase + cluster_address(ctx, rank, off), 1));
       };
@@ -7409,6 +7444,26 @@ class Interpreter {
     };
 
     std::vector<double> A(K), Ap(Ka), SA(4, 1.0), SB(4, 1.0);
+    // Without block scaling, D is computed a row at a time: for each k, every
+    // column's product is added to its sum (tc_rows_*), so each element still
+    // sums its products in k order in f32 -- the same roundings as one
+    // element at a time -- while B is read along its rows. B once, in the
+    // arithmetic's own type.
+    std::vector<float> Bf, Af, accf;
+    std::vector<int64_t> Bi, Ai, acci;
+    if (!mx) {
+      if (d_int) {
+        Bi.resize(B.size());
+        for (size_t i = 0; i < B.size(); ++i) Bi[i] = static_cast<int64_t>(B[i]);
+        Ai.resize(K);
+        acci.resize(N);
+      } else {
+        Bf.resize(B.size());
+        for (size_t i = 0; i < B.size(); ++i) Bf[i] = static_cast<float>(B[i]);
+        Af.resize(K);
+        accf.resize(N);
+      }
+    }
     for (uint32_t v = 0; v < G; ++v) {
       TensorMemory& t = tmem_of(*ctas[v]);
       const uint32_t rank = cluster_rank_of(*ctas[v]);
@@ -7420,79 +7475,118 @@ class Interpreter {
           for (uint32_t k = 0; k < Ka; ++k)
             As[size_t{m} * Ka + k] = sa * tc_decode(ea.t, smem_raw(a_desc, !trans_a, ea, rank, m, k));
       }
-      for (uint32_t m = 0; m < Mloc; ++m)
+      // Row m of A as D lane dl sees it, into A: its own row from shared
+      // memory, or whatever that lane holds in Tensor Memory; expanded by the
+      // lane's metadata when sparse.
+      auto load_a = [&](uint32_t m, uint32_t dl) {
+        std::vector<double>& Arow = sp ? Ap : A;
+        if (op.a_tmem) {
+          const uint32_t al = dl - d_lane0 + (a_addr >> 16), ac0 = a_addr & 0xFFFF;
+          for (uint32_t k = 0; k < Ka; ++k) {
+            const uint32_t col = ac0 + k * ea.cbits / 32;
+            if (col >= TensorMemory::kCols || !t.allocated(col))
+              ctx_fail(ins, li, Err::OutOfBounds,
+                       "tcgen05.mma reads A from Tensor Memory column " + std::to_string(col) +
+                           ", which no tcgen05.alloc has allocated");
+            uint32_t raw = t.at(al, col) >> (k * ea.cbits % 32);
+            // fp4 in an 8-bit container sits in bits 2-5 (figure 202).
+            if (ea.cbits == 8 && ea.bits == 4) raw >>= 2;
+            Arow[k] = sa * tc_decode(ea.t, raw);
+          }
+        } else {
+          std::copy_n(As.begin() + size_t{m} * Ka, Ka, Arow.begin());
+        }
+        if (sp) {
+          // 2:4: bits 0-1 and 2-3 place the chunk's two stored elements;
+          // 1:2 (tf32): 0b0100 is position 0 and 0b1110 position 1; 4:8
+          // (mxf4): the two fields place two-element pairs. A field that
+          // places two elements at one position is undefined; both are
+          // added here.
+          std::fill(A.begin(), A.end(), 0.0);
+          const uint32_t per = sp_w / 2;
+          for (uint32_t c = 0; c < K / sp_w; ++c) {
+            const uint32_t f = meta_of(t, dl, c);
+            for (uint32_t s = 0; s < per; ++s) {
+              const uint32_t pos = sp_w == 2 ? (f & 3) / 2
+                                 : sp_w == 4 ? f >> (2 * s) & 3
+                                             : 2 * (f >> (2 * (s / 2)) & 3) + s % 2;
+              A[c * sp_w + pos] += Ap[c * per + s];
+            }
+          }
+        }
+      };
+      for (uint32_t m = 0; m < Mloc; ++m) {
+        if (!mx) {
+          // A D row's columns sit in one lane for each of the layout's
+          // parts of N (one part except layouts B, E and G).
+          const uint32_t w = N / n_parts;
+          for (uint32_t p = 0; p < n_parts; ++p) {
+            uint32_t dl, dc0;
+            d_pos(m, p * w, d_lane0, &dl, &dc0);
+            if (off_mask[dl / 32] >> (dl % 32) & 1) continue;
+            load_a(m, dl);
+            uint32_t* cells = &t.at(dl, d_col0 + dc0);
+            if (d_int) {
+              for (uint32_t k = 0; k < K; ++k) Ai[k] = static_cast<int64_t>(A[k]);
+              for (uint32_t i = 0; i < w; ++i) acci[i] = accumulate ? static_cast<int32_t>(cells[i]) : 0;
+              tc_rows_i64(acci.data(), Ai.data(), Bi.data() + p * w, K, w, N);
+              for (uint32_t i = 0; i < w; ++i) {
+                int64_t acc = acci[i];
+                if (sat)
+                  acc = std::clamp<int64_t>(acc, std::numeric_limits<int32_t>::min(),
+                                            std::numeric_limits<int32_t>::max());
+                cells[i] = static_cast<uint32_t>(static_cast<int32_t>(acc));
+              }
+              continue;
+            }
+            // As wgmma: every product here is exact in f32, and the sum is
+            // kept in f32. An f16 D is one 16-bit value in the low half of
+            // its cell (9.7.18.10.4.1).
+            for (uint32_t k = 0; k < K; ++k) Af[k] = static_cast<float>(A[k]);
+            for (uint32_t i = 0; i < w; ++i) {
+              float acc = 0.0f;
+              if (accumulate) {
+                const double old = d_f16 ? f16_to_double(cells[i] & 0xFFFF) : static_cast<double>(f32(cells[i]));
+                acc = static_cast<float>(old * d_scale);
+              }
+              accf[i] = acc;
+            }
+            tc_rows_f32(accf.data(), Af.data(), Bf.data() + p * w, K, w, N);
+            for (uint32_t i = 0; i < w; ++i)
+              cells[i] = d_f16 ? static_cast<uint32_t>(double_to_f16(accf[i]) & 0xFFFF) : f32bits(accf[i]);
+          }
+          continue;
+        }
+        // Block-scaled: element by element, each operand multiplied by its
+        // block's factor first -- exact too, for these element and scale
+        // types. A is loaded again only when the lane changes.
+        uint32_t a_lane = UINT32_MAX;
         for (uint32_t n = 0; n < N; ++n) {
           uint32_t dl, dc;
           d_pos(m, n, d_lane0, &dl, &dc);
           if (off_mask[dl / 32] >> (dl % 32) & 1) continue;
-          std::vector<double>& Arow = sp ? Ap : A;
-          if (op.a_tmem) {
-            const uint32_t al = dl - d_lane0 + (a_addr >> 16), ac0 = a_addr & 0xFFFF;
-            for (uint32_t k = 0; k < Ka; ++k) {
-              const uint32_t col = ac0 + k * ea.cbits / 32;
-              if (col >= TensorMemory::kCols || !t.allocated(col))
-                ctx_fail(ins, li, Err::OutOfBounds,
-                         "tcgen05.mma reads A from Tensor Memory column " + std::to_string(col) +
-                             ", which no tcgen05.alloc has allocated");
-              uint32_t raw = t.at(al, col) >> (k * ea.cbits % 32);
-              // fp4 in an 8-bit container sits in bits 2-5 (figure 202).
-              if (ea.cbits == 8 && ea.bits == 4) raw >>= 2;
-              Arow[k] = sa * tc_decode(ea.t, raw);
-            }
-          } else {
-            std::copy_n(As.begin() + size_t{m} * Ka, Ka, Arow.begin());
+          if (dl != a_lane) {
+            load_a(m, dl);
+            a_lane = dl;
           }
-          if (sp) {
-            // 2:4: bits 0-1 and 2-3 place the chunk's two stored elements;
-            // 1:2 (tf32): 0b0100 is position 0 and 0b1110 position 1; 4:8
-            // (mxf4): the two fields place two-element pairs. A field that
-            // places two elements at one position is undefined; both are
-            // added here.
-            std::fill(A.begin(), A.end(), 0.0);
-            const uint32_t per = sp_w / 2;
-            for (uint32_t c = 0; c < K / sp_w; ++c) {
-              const uint32_t f = meta_of(t, dl, c);
-              for (uint32_t s = 0; s < per; ++s) {
-                const uint32_t pos = sp_w == 2 ? (f & 3) / 2
-                                   : sp_w == 4 ? f >> (2 * s) & 3
-                                               : 2 * (f >> (2 * (s / 2)) & 3) + s % 2;
-                A[c * sp_w + pos] += Ap[c * per + s];
-              }
-            }
+          for (uint32_t j = 0; j < sv; ++j) {
+            SA[j] = scale_of(t, sfa_addr, m, dl / 32, sfa_id, j);
+            SB[j] = scale_of(t, sfb_addr, n, dl / 32, sfb_id, j);
           }
-          if (mx)
-            for (uint32_t j = 0; j < sv; ++j) {
-              SA[j] = scale_of(t, sfa_addr, m, dl / 32, sfa_id, j);
-              SB[j] = scale_of(t, sfb_addr, n, dl / 32, sfb_id, j);
-            }
           uint32_t& cell = t.at(dl, d_col0 + dc);
-          if (d_int) {
-            int64_t acc = accumulate ? static_cast<int32_t>(cell) : 0;
-            for (uint32_t k = 0; k < K; ++k)
-              acc += static_cast<int64_t>(A[k]) * static_cast<int64_t>(B[size_t{k} * N + n]);
-            if (sat)
-              acc = std::clamp<int64_t>(acc, std::numeric_limits<int32_t>::min(),
-                                        std::numeric_limits<int32_t>::max());
-            cell = static_cast<uint32_t>(static_cast<int32_t>(acc));
-            continue;
-          }
-          // As wgmma: every product here is exact in f32, and the sum is
-          // kept in f32. An f16 D is one 16-bit value in the low half of its
-          // cell (9.7.18.10.4.1). Scaled, each operand is multiplied by its
-          // block's factor first -- exact too, for these element and scale
-          // types.
           float acc = 0.0f;
           if (accumulate) {
             const double old = d_f16 ? f16_to_double(cell & 0xFFFF) : static_cast<double>(f32(cell));
             acc = static_cast<float>(old * d_scale);
           }
           for (uint32_t k = 0; k < K; ++k) {
-            const double a = mx ? A[k] * SA[k / blk] : A[k];
-            const double b = mx ? B[size_t{k} * N + n] * SB[k / blk] : B[size_t{k} * N + n];
+            const double a = A[k] * SA[k / blk];
+            const double b = B[size_t{k} * N + n] * SB[k / blk];
             acc += static_cast<float>(a) * static_cast<float>(b);
           }
           cell = d_f16 ? static_cast<uint32_t>(double_to_f16(acc) & 0xFFFF) : f32bits(acc);
         }
+      }
     }
   }
 
@@ -9169,7 +9263,74 @@ class Interpreter {
         std::array<int64_t, 5> pix = start;   // im2col: the pixel being read, in [1, rank-1]
         if (op.to_shared) pb.data.resize(total * gs);
         std::array<uint64_t, 5> j{};
+        // A tile-mode load takes a box row at a time when it can: dimension 0
+        // is contiguous in global memory, so the row's in-tensor part is one
+        // bulk read rather than an allocation lookup per element. load_run
+        // declines what it cannot answer exactly (and a NaN fill must fail at
+        // its element), and those rows go element by element below.
+        // A store's row likewise: its in-tensor elements gathered out of
+        // (swizzled) shared memory, then one bulk write.
+        const bool row_path = fast_enabled_ && !packed && !op.four_rows && !map.im2col && map.elem_stride[0] == 1 &&
+                              (op.to_shared || !op.reduce);
+        std::vector<uint8_t> row_buf;
         for (uint64_t e = 0; e < total; ++e) {
+          if (row_path && !op.to_shared && j[0] == 0) {
+            bool rows_inside = true;
+            uint64_t row_addr = map.address;
+            for (uint32_t d = 1; d < map.rank; ++d) {
+              const int64_t g = start[d] + static_cast<int64_t>(j[d] * map.elem_stride[d]);
+              if (g < 0 || static_cast<uint64_t>(g) >= map.dim[d]) rows_inside = false;
+              else row_addr += static_cast<uint64_t>(g) * map.stride[d];
+            }
+            const int64_t n0 = static_cast<int64_t>(count[0]), dim0 = static_cast<int64_t>(map.dim[0]);
+            const int64_t lo = rows_inside ? std::clamp<int64_t>(-start[0], 0, n0) : n0;
+            const int64_t hi = rows_inside ? std::clamp<int64_t>(dim0 - start[0], lo, n0) : n0;
+            bool ok = true;
+            row_buf.resize(static_cast<size_t>(hi - lo) * es);
+            for (int64_t k = lo; k < hi && ok; ++k) {
+              const uint64_t soff = exec::swizzle_address(smem + (e + static_cast<uint64_t>(k)) * es, swz,
+                                                          exec::TensorMap::swizzle_atom(map.swizzle));
+              if (soff + es > shared_size) ok = false;
+              else std::memcpy(row_buf.data() + (k - lo) * es, ctx.shared->data() + soff, es);
+            }
+            if (ok && mem_.store_run(row_addr + static_cast<uint64_t>(start[0] + lo) * es, row_buf.data(),
+                                     row_buf.size(), es)) {
+              e += count[0] - 1;
+              for (uint32_t d = 1; d < map.rank; ++d) {
+                if (++j[d] < count[d]) break;
+                j[d] = 0;
+              }
+              continue;
+            }
+          }
+          if (row_path && op.to_shared && j[0] == 0) {
+            bool rows_inside = true;
+            uint64_t row_addr = map.address;
+            for (uint32_t d = 1; d < map.rank; ++d) {
+              const int64_t g = start[d] + static_cast<int64_t>(j[d] * map.elem_stride[d]);
+              if (g < 0 || static_cast<uint64_t>(g) >= map.dim[d]) rows_inside = false;
+              else row_addr += static_cast<uint64_t>(g) * map.stride[d];
+            }
+            const int64_t n0 = static_cast<int64_t>(count[0]), dim0 = static_cast<int64_t>(map.dim[0]);
+            const int64_t lo = rows_inside ? std::clamp<int64_t>(-start[0], 0, n0) : n0;
+            const int64_t hi = rows_inside ? std::clamp<int64_t>(dim0 - start[0], lo, n0) : n0;
+            uint8_t* row = pb.data.data() + e * es;
+            if ((!map.oob_nan || (lo == 0 && hi == n0)) &&
+                mem_.load_run(row_addr + static_cast<uint64_t>(start[0] + lo) * es, row + lo * es,
+                              static_cast<uint64_t>(hi - lo) * es, es)) {
+              std::memset(row, 0, static_cast<size_t>(lo) * es);
+              std::memset(row + hi * es, 0, static_cast<size_t>(n0 - hi) * es);
+              for (uint64_t k = 0; k < count[0]; ++k)
+                add_run(exec::swizzle_address(smem + (e + k) * es, swz, exec::TensorMap::swizzle_atom(map.swizzle)), es);
+              e += count[0] - 1;
+              j[0] = 0;
+              for (uint32_t d = 1; d < map.rank; ++d) {
+                if (++j[d] < count[d]) break;
+                j[d] = 0;
+              }
+              continue;
+            }
+          }
           bool inside = true;
           uint64_t gaddr = map.address;
           auto at = [&](uint32_t d, int64_t g) {
