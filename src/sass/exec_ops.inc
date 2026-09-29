@@ -35,10 +35,11 @@ bool executes(const Instr& ins) {
     }
     case Op::BMSK: case Op::BREV: case Op::CS2R: case Op::FLO: case Op::IABS: case Op::IADD3: case Op::IDP:
     case Op::IMAD: case Op::IMNMX: case Op::ISETP: case Op::LEA: case Op::LOP3: case Op::MOV: case Op::P2R:
-    case Op::PLOP3: case Op::POPC: case Op::PRMT: case Op::R2P: case Op::R2UR: case Op::S2R: case Op::S2UR:
+    case Op::PLOP3: case Op::POPC: case Op::PRMT: case Op::R2P: case Op::S2R: case Op::S2UR:
     case Op::SEL: case Op::SGXT: case Op::SHF: case Op::UFLO: case Op::UIADD3: case Op::UIMAD: case Op::UISETP:
     case Op::ULDC: case Op::ULEA: case Op::ULOP3: case Op::UMOV: case Op::UPLOP3: case Op::UPOPC: case Op::UPRMT:
-    case Op::USEL: case Op::USHF: case Op::VABSDIFF4:
+    case Op::USEL: case Op::USHF: case Op::VABSDIFF4: case Op::VIADD: case Op::VIMNMX: case Op::VIADDMNMX:
+    case Op::VIMNMX3:
     case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2FP: case Op::F2I:
     case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL:
     case Op::FSET: case Op::FSETP: case Op::HADD2: case Op::HFMA2: case Op::HMUL2: case Op::HSET2: case Op::HSETP2:
@@ -50,8 +51,12 @@ bool executes(const Instr& ins) {
     case Op::BMMA: case Op::DMMA: case Op::QMMA: case Op::MOVM: case Op::SULD: case Op::SUST:
     case Op::BAR: case Op::BMOV: case Op::BPT: case Op::BRA: case Op::BREAK: case Op::BRX: case Op::BSSY:
     case Op::BSYNC: case Op::CALL: case Op::CCTL: case Op::DEPBAR: case Op::ERRBAR: case Op::EXIT: case Op::MEMBAR:
-    case Op::NANOSLEEP: case Op::NOP: case Op::RET: case Op::WARPSYNC: case Op::YIELD:
+    case Op::NANOSLEEP: case Op::NOP: case Op::RET: case Op::YIELD:
       return true;
+    case Op::WARPSYNC:
+      return ins.f[1] == 0;   // not .COLLECTIVE yet
+    case Op::R2UR:
+      return ins.f[0] == 0;   // not the forms reporting a non-uniform value yet
     default:
       return false;
   }
@@ -78,6 +83,7 @@ exec::InstClass inst_class(Op op) {
       return C::Memory;
     case Op::HMMA: case Op::IMMA: case Op::BMMA: case Op::DMMA: case Op::QMMA: case Op::MOVM: return C::Tensor;
     case Op::IMAD: case Op::IADD3: case Op::LOP3: case Op::SHF: case Op::LEA: case Op::IMNMX: case Op::IABS:
+    case Op::VIADD: case Op::VIMNMX: case Op::VIADDMNMX: case Op::VIMNMX3:
     case Op::POPC: case Op::FLO: case Op::BREV: case Op::BMSK: case Op::SGXT: case Op::IDP: case Op::VABSDIFF4: case Op::ISETP:
     case Op::UIMAD: case Op::UIADD3: case Op::ULOP3: case Op::USHF: case Op::ULEA: case Op::UISETP:
     case Op::UPOPC: case Op::UFLO:
@@ -467,6 +473,45 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       });
       return;
     }
+    case Op::VIADD:
+      each_lane(ex, [&](unsigned l) { write32(w, ins.dst[0], l, read32(w, ins.src[0], l) + ival(w, ins.src[1], l)); });
+      return;
+    case Op::VIMNMX: case Op::VIADDMNMX: case Op::VIMNMX3: {
+      const bool sgn = ins.f[0], s16x2 = ins.f[1];
+      const unsigned n = ins.op == Op::VIMNMX ? 2 : 3;
+      const auto pick = [&](uint32_t x, uint32_t y, bool mn) -> uint32_t {
+        if (sgn) {
+          const int32_t a = static_cast<int32_t>(x), b = static_cast<int32_t>(y);
+          return static_cast<uint32_t>(mn ? std::min(a, b) : std::max(a, b));
+        }
+        return mn ? std::min(x, y) : std::max(x, y);
+      };
+      each_lane(ex, [&](unsigned l) {
+        const bool mn = pred(w, ins.src[n], l);
+        uint32_t a = read32(w, ins.src[0], l);
+        const uint32_t b = ival(w, ins.src[1], l);
+        const auto relu = [&](uint32_t r) { return ins.f[2] && static_cast<int32_t>(r) < 0 ? 0u : r; };
+        if (ins.op == Op::VIADDMNMX) {
+          write32(w, ins.dst[0], l, relu(pick(a + b, read32(w, ins.src[2], l), mn)));
+        } else if (!s16x2) {
+          const uint32_t r = pick(a, b, mn);
+          write32(w, ins.dst[0], l, relu(ins.op == Op::VIMNMX ? r : pick(r, read32(w, ins.src[2], l), mn)));
+        } else {   // per 16-bit half, signed or not
+          const uint32_t c = ins.op == Op::VIMNMX3 ? read32(w, ins.src[2], l) : b;
+          uint32_t r = 0;
+          for (int h = 0; h < 2; ++h) {
+            const auto half = [&](uint32_t v) {
+              const uint32_t u = (v >> (16 * h)) & 0xffff;
+              return sgn ? static_cast<int32_t>(static_cast<int16_t>(u)) : static_cast<int32_t>(u);
+            };
+            const int32_t m = mn ? std::min({half(a), half(b), half(c)}) : std::max({half(a), half(b), half(c)});
+            r |= (static_cast<uint32_t>(m) & 0xffff) << (16 * h);
+          }
+          write32(w, ins.dst[0], l, r);
+        }
+      });
+      return;
+    }
     case Op::SGXT:
       each_lane(ex, [&](unsigned l) {
         const uint32_t a = read32(w, ins.src[0], l), b = read32(w, ins.src[1], l);
@@ -489,7 +534,8 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       return;
     case Op::PLOP3: case Op::UPLOP3:
       each_lane(ex, [&](unsigned l) {
-        const bool a = pred(w, ins.src[0], l), b = pred(w, ins.src[1], l), c = pred(w, ins.src[2], l);
+        const auto in = [&](const Operand& o) { return ins.f[2] ? (read32(w, o, l) >> 31) != 0 : pred(w, o, l); };
+        const bool a = in(ins.src[0]), b = in(ins.src[1]), c = in(ins.src[2]);
         const unsigned idx = (a << 2) | (b << 1) | static_cast<unsigned>(c);
         set_pred(w, ins.dst[0], l, (ins.f[0] >> idx) & 1);
         set_pred(w, ins.dst[1], l, (ins.f[1] >> idx) & 1);
@@ -1129,6 +1175,18 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   // offset. Operand::text holds the printed form; its parts are re-read here.
   const auto address = [&](const Operand& a, unsigned l, bool wide, bool with_ur, unsigned ur_pos, unsigned stride) {
     uint64_t v = 0;
+    // Turing's global forms (a register beside a 64-bit uniform base).
+    if (m_.sm < 80 && !stride && ins.w.bit(72) && ins.op != Op::LDS && ins.op != Op::STS && ins.op != Op::LDL &&
+        ins.op != Op::STL && ins.op != Op::ATOMS) {
+      const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
+      if (ra != kRZ) v = ins.w.bit(90) || !ins.w.bit(91) ? (w.reg(ra, l) | (static_cast<uint64_t>(w.reg(ra + 1, l)) << 32))
+                                                         : w.reg(ra, l);
+      if (ins.w.bit(91)) {
+        const unsigned u = static_cast<unsigned>(ins.w.field(ur_pos, 6));
+        if (u != 63) v += w.ur[u] | (static_cast<uint64_t>(w.ur[u + 1]) << 32);
+      }
+      return v + static_cast<uint64_t>(a.imm);
+    }
     const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
     if (ra != kRZ) v = wide ? (w.reg(ra, l) | (static_cast<uint64_t>(w.reg(ra + 1, l)) << 32)) : w.reg(ra, l);
     if (stride) v *= stride;
@@ -1328,6 +1386,10 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
               else if (type == 4) {
                 const uint16_t lo = f32_to_half(half_to_f32(static_cast<uint16_t>(old)) + half_to_f32(static_cast<uint16_t>(v)));
                 const uint16_t hi = f32_to_half(half_to_f32(static_cast<uint16_t>(old >> 16)) + half_to_f32(static_cast<uint16_t>(v >> 16)));
+                nw = lo | (static_cast<uint32_t>(hi) << 16);
+              } else if (type == 7) {   // BF16x2
+                const uint16_t lo = f32_to_bf16(bf16_to_f32(static_cast<uint16_t>(old)) + bf16_to_f32(static_cast<uint16_t>(v)));
+                const uint16_t hi = f32_to_bf16(bf16_to_f32(static_cast<uint16_t>(old >> 16)) + bf16_to_f32(static_cast<uint16_t>(v >> 16)));
                 nw = lo | (static_cast<uint32_t>(hi) << 16);
               } else nw = old + v;
               break;
@@ -1531,9 +1593,14 @@ double mma_elem(MmaT t, uint64_t v, unsigned e) {
 // mode (59-60) is .IGN (PTX .zero), the default (.clamp) or .TRAP.
 void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const Word& word = ins.w;
-  const unsigned bank = static_cast<unsigned>(word.field(54, 5));
-  const uint64_t hoff = 4 * word.field(40, 14);
-  const uint64_t handle = cbank32(bank, hoff) | (static_cast<uint64_t>(cbank32(bank, hoff + 4)) << 32);
+  uint64_t handle;
+  if (ins.f[6]) {   // a uniform register: the handle's low word (the high one is zero)
+    handle = w.ur[ins.f[7]];
+  } else {
+    const unsigned bank = static_cast<unsigned>(word.field(54, 5));
+    const uint64_t hoff = 4 * word.field(40, 14);
+    handle = cbank32(bank, hoff) | (static_cast<uint64_t>(cbank32(bank, hoff + 4)) << 32);
+  }
   const bool surface = ins.op == Op::SULD || ins.op == Op::SUST;
   const exec::TextureDesc& d =
       exec::texture_lookup(cfg_.textures, handle, surface ? exec::TexKind::Surface : exec::TexKind::Texture);
@@ -1995,7 +2062,13 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
         if ((ex >> l) & 1) {
           w.waiting |= Mask{1} << l;
           w.wait_kind[l] = Wait::WarpSync;
-          w.wait_arg[l] = read32(w, ins.src.back(), l);
+          // The mask: .ALL, or the first value operand (after a
+          // predicate, before a .COLLECTIVE target).
+          const Operand* m = nullptr;
+          for (const Operand& o : ins.src)
+            if (!m && (o.kind == Kind::Reg || o.kind == Kind::UReg || o.kind == Kind::Imm || o.kind == Kind::CBank))
+              m = &o;
+          w.wait_arg[l] = ins.f[0] || !m ? ~Mask{0} : read32(w, *m, l);
         } else {
           w.pc[l] += 16;
         }
