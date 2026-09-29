@@ -54,6 +54,14 @@ if (( ${rmaj:-0} * 100 + ${rmin:-0} < 1208 )); then
   for a in "${archs[@]}"; do [[ $a == sm_90a ]] || kept+=("$a"); done
   archs=("${kept[@]}")
 fi
+# mma_forms' sparse forms are more than CUDA 12.0's ptxas assembles; CUDA 13's
+# does.
+if (( ${rmaj:-0} < 13 )); then
+  echo "SKIP mma_forms: its SASS needs CUDA 13's ptxas (this nvcc is $rmaj.$rmin)"
+  kept=()
+  for p in "${progs[@]}"; do [[ ${p%%:*} == mma_forms ]] || kept+=("$p"); done
+  progs=("${kept[@]}")
+fi
 read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
 jobs=()
 for arch in "${archs[@]}"; do
