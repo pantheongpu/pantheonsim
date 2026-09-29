@@ -128,7 +128,7 @@ runs:
           "cuda-nvcc-$v" "cuda-cudart-dev-$v" "cuda-crt-$v" "$nvvm" \
           "cuda-nvml-dev-$v" "cuda-cupti-dev-$v" "cuda-nvrtc-dev-$v" "libcublas-dev-$v" \
           "libcufft-dev-$v" "libcurand-dev-$v" "libcusparse-dev-$v" "libnvjpeg-dev-$v" \
-          "libcusolver-dev-$v" "libnpp-dev-$v" "libnvjitlink-dev-$v" \
+          "libcusolver-dev-$v" "libnpp-dev-$v" "libnvjitlink-dev-$v" "cuda-profiler-api-$v" \
           || { echo "::error::could not install CUDA $TOOLKIT from NVIDIA's repository for Ubuntu $VERSION_ID"; exit 1; }
         echo "/usr/local/cuda-$TOOLKIT/bin" >> "$GITHUB_PATH"
 

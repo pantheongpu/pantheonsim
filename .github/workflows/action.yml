@@ -158,6 +158,18 @@ jobs:
           vgpu run ./hello | tee out.txt
           grep -q 'H100' out.txt
 
+      # The profiler headers come in a package of their own. hypre includes
+      # cuda_profiler_api.h everywhere, and rust-cuda's driver bindings are
+      # generated from cudaProfiler.h; both failed to build without them.
+      - name: Compile against the profiler headers
+        run: |
+          cat > prof.cu <<'CU'
+          #include <cudaProfiler.h>
+          #include <cuda_profiler_api.h>
+          int main() { return 0; }
+          CU
+          nvcc -c prof.cu -o prof.o
+
       # Linking the toolkit's own cuSPARSE needs its libnvJitLink, which NVIDIA's
       # packages do not pull in; cuPDLPx's link failed without it. The link runs
       # without the simulator's libraries on the path, as library-path: false
