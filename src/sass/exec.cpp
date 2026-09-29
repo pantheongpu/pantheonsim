@@ -170,6 +170,12 @@ class Runner {
       csize_ *= cshape_[d];
       clustered_ = clustered_ || cshape_[d] > 1;
     }
+    // Each thread's local window: the kernel's frame, or the stack the
+    // device gives every thread (cudaLimitStackSize), which alloca grows
+    // into below the frame, whichever is larger.
+    local_size_ = std::max<uint32_t>({k.min_stack, k.frame_size, 16,
+                                      static_cast<uint32_t>(std::min<uint64_t>(cfg.stack_bytes, 1u << 24))});
+    local_size_ = (local_size_ + 15) & ~15u;
     build_bank0(args);
     for (const auto& [name, va] : m.bank_va) {
       // ".nv.constant<N>" for the module; ".nv.constant<N>.<kernel>" for ours.
@@ -181,8 +187,6 @@ class Runner {
     }
     const auto it = m.code_index.find(k.text_section);
     entry_ = m.code[it->second].base;
-    local_size_ = std::max<uint32_t>({k.min_stack, k.frame_size, 16});
-    local_size_ = (local_size_ + 15) & ~15u;
     shared_size_ = static_cast<uint64_t>(k.shared_bytes) + cfg.shared_bytes;
   }
 
@@ -323,8 +327,7 @@ void Runner::build_bank0(const std::vector<std::vector<uint8_t>>& args) {
     put64(sm >= 100 ? 0x348 : 0x198, kParamWindow + k_.param_base);
   }
   put64(local, kLocalWindow);
-  const uint32_t stack = std::max<uint32_t>({k_.min_stack, k_.frame_size, 16});
-  put32(stackf, (stack + 15) & ~15u);
+  put32(stackf, local_size_);
   put64(sm >= 100 ? 0x358 : sm >= 90 ? 0x208 : 0x118, 0);   // the descriptor's bits are a cache policy
   // The cluster's shape (sm_90+), which ptxas reads to compute %cluster_*
   // and %clusterid -- dividing by multiplying with the shape's reciprocals,
@@ -550,6 +553,7 @@ void Runner::mem_read(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, v
       if (a + n > w.local_size)
         throw Fault("local read of " + std::to_string(n) + " bytes at 0x" + [&] { char b[24]; std::snprintf(b, sizeof b, "%llx", (unsigned long long)a); return std::string(b); }() +
                     ", past the thread's " + std::to_string(w.local_size) + " bytes");
+      if (w.local.empty()) w.local.assign(size_t{w.local_size} * 32, 0);
       std::memcpy(out, &w.local[lane * w.local_size + a], n);
       return;
     case Space::Global:
@@ -582,6 +586,7 @@ void Runner::mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, 
     case Space::Local:
       if (a + n > w.local_size)
         throw Fault("local write of " + std::to_string(n) + " bytes past the thread's " + std::to_string(w.local_size) + " bytes");
+      if (w.local.empty()) w.local.assign(size_t{w.local_size} * 32, 0);
       std::memcpy(&w.local[lane * w.local_size + a], in, n);
       return;
     case Space::Global:
@@ -632,7 +637,7 @@ void Runner::init_block(Block& blk, uint64_t linear) {
     w.alive = n == 32 ? kAll : ((Mask{1} << n) - 1);
     for (unsigned l = 0; l < 32; ++l) w.pc[l] = entry_;
     w.local_size = local_size_;
-    w.local.assign(static_cast<size_t>(local_size_) * 32, 0);
+    w.local.clear();   // made on the warp's first local access
   }
   for (Block::Barrier& b : blk.bars) b = Block::Barrier{};
   blk.mbar.clear();
