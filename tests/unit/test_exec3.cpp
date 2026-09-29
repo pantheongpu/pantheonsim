@@ -3964,7 +3964,10 @@ VTEST(an_unknown_texture_handle_is_named_rather_than_read) {
 
 VTEST(tex_clamps_out_of_range_coordinates_to_the_edge) {
   // cudaAddressModeClamp: the default, and the one that hides bugs if it is
-  // wrong, because an off-by-one only shows at the boundary.
+  // wrong, because an off-by-one only shows at the boundary. It applies to
+  // float coordinates; an integer coordinate outside the extent reads zero
+  // instead, whatever the address mode (an RTX 3060;
+  // e2e_texture_int_coords).
   std::string ptx = std::string(kHeader) + R"(
 .visible .entry k(.param .u64 t, .param .u64 out)
 {
@@ -3979,9 +3982,13 @@ VTEST(tex_clamps_out_of_range_coordinates_to_the_edge) {
     // the high one.
     sub.s32 %r2, %r1, 2;
     tex.1d.v4.f32.s32 {%f1, %f2, %f3, %f4}, [%rd1, {%r2}];
+    cvt.rn.f32.s32 %f5, %r2;
+    add.f32 %f5, %f5, 0f3F000000;   // the texel's centre
+    tex.1d.v4.f32.f32 {%f6, %f2, %f3, %f4}, [%rd1, {%f5}];
     mul.wide.u32 %rd4, %r1, 4;
     add.s64 %rd5, %rd3, %rd4;
-    st.global.f32 [%rd5], %f1;
+    st.global.f32 [%rd5], %f6;
+    st.global.f32 [%rd5+32], %f1;
     ret;
 }
 )";
@@ -4004,7 +4011,11 @@ VTEST(tex_clamps_out_of_range_coordinates_to_the_edge) {
   cfg.textures = &tex;
   exec::launch(m.entries[0], cfg, {arg_u64(7), arg_u64(out)}, e.mem, e.prof);
   const float want[8] = {10, 10, 10, 11, 12, 13, 13, 13};
-  for (uint32_t i = 0; i < 8; ++i) VCHECK_EQ(as_f32(e.mem.load_scalar(out + i * 4, 4)), want[i]);
+  const float want_int[8] = {0, 0, 10, 11, 12, 13, 0, 0};
+  for (uint32_t i = 0; i < 8; ++i) {
+    VCHECK_EQ(as_f32(e.mem.load_scalar(out + i * 4, 4)), want[i]);
+    VCHECK_EQ(as_f32(e.mem.load_scalar(out + 32 + i * 4, 4)), want_int[i]);
+  }
 }
 
 VTEST(a_missing_channel_reads_as_zero_w_included) {

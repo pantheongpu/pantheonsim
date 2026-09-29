@@ -190,6 +190,24 @@ tens of thousands of results against the hashes the same programs produced
 on the RTX 3060 (and pass there too), and test_exec3 has a hardware table
 for each rule's corners.
 
+## Integer coordinates
+
+A fetch with integer coordinates (`tex1Dfetch`, and `tex.*.s32` on an array)
+names a texel, and an RTX 3060 takes that texel whatever the texture's
+settings say:
+
+- the filter mode does not apply: a texture set up for linear filtering is
+  point-sampled (CUDA Samples' convolutionFFT2D binds linear memory that way
+  and fetches it with `tex1Dfetch`);
+- outside the extent the result is zero in every channel, under clamp and
+  border addressing alike and whatever the border colour (a colour of 7
+  still gives 0), while float coordinates on the same texture clamp or take
+  the border colour as usual.
+
+This used to be refused ("linear filtering with integer coordinates"), and
+out-of-range integer coordinates were clamped. e2e_texture_int_coords checks
+both against the card.
+
 ## Refused, and why
 
 Each with its own message, rather than a plausible wrong number:

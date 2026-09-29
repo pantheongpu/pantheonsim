@@ -5872,10 +5872,12 @@ class Interpreter {
         }
         v = tex_level(v, static_cast<uint32_t>(d.mip_filter == TexFilter::Linear ? q >> 8 : (q + 128) >> 8));
       }
-      if (v.filter == TexFilter::Linear) {
-        if (!op.ctype.is_float())
-          ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
-                   "linear filtering with integer coordinates");
+      // Integer coordinates name a texel, and the filter mode does not apply:
+      // an RTX 3060 point-samples them even from a texture set up for linear
+      // filtering (tex1Dfetch from linear memory, and tex.2d.*.s32 on an
+      // array alike). CUDA Samples' convolutionFFT2D binds its buffers that
+      // way.
+      if (v.filter == TexFilter::Linear && op.ctype.is_float()) {
         uint32_t r[4];
         tex_linear(ins, lane, v, dims, cf, r, true_1d);
         for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = r[ch];
@@ -5883,7 +5885,7 @@ class Interpreter {
       }
 
       const uint32_t size[3] = {v.width, v.height, v.depth};
-      bool inside = true;
+      bool inside = true, int_outside = false;
       uint32_t idx[3] = {0, 0, 0};
       for (uint32_t i = 0; i < dims; ++i) {
         int64_t c;
@@ -5894,11 +5896,22 @@ class Interpreter {
           // sampled coordinates are texel-centred, so x+0.5 addresses texel x.
           c = static_cast<int64_t>(std::floor(f));
         } else {
+          // An integer coordinate names a texel directly, and outside the
+          // extent reads zero: an RTX 3060 applies neither the address mode
+          // nor the border colour to it (clamp and border alike, with a
+          // border colour of 7, give 0).
           c = ci[i];
+          if (c < 0 || c >= static_cast<int64_t>(size[i])) { inside = false; int_outside = true; break; }
+          idx[i] = static_cast<uint32_t>(c);
+          continue;
         }
         if (!wrap_coord(effective_address(v, i), c, size[i], &idx[i])) { inside = false; break; }
       }
 
+      if (int_outside) {
+        for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = 0;
+        continue;
+      }
       if (!inside) {
         // Border addressing outside the extent: the border colour.
         for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = convert_channel(v, ch, tex_border_raw(v, ch), op.dtype);
