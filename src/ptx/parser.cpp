@@ -4017,6 +4017,7 @@ class Parser {
       bool wide = false, lo = false, hi = false;
       FRound frnd = FRound::Nearest;
       bool frnd_explicit = false;
+      bool div_approx = false;
       Type ty{};
       bool have_ty = false;
       for (size_t i = 1; i < parts.size(); ++i) {
@@ -4032,11 +4033,12 @@ class Parser {
         else if (p == "rp") { frnd = FRound::PlusInf; frnd_explicit = true; }
         // .approx and .full ask for a faster, less accurate result -- div.approx
         // is what __fdividef compiles to, and ML kernels use it constantly.
-        // Both have a documented error bound, and the exact IEEE result falls
-        // inside it, so computing exactly satisfies the contract. This is the
-        // same policy the SFU transcendentals already follow: correct to better
-        // than hardware, never bit-identical to it.
-        else if (p == "approx" || p == "full") ;
+        // div.full has a documented error bound that the exact IEEE result
+        // falls inside, so it computes exactly. div.approx is documented as a
+        // formula, a * (1/b), with its own rule for a huge divisor; it is
+        // carried to execution, which follows both.
+        else if (p == "approx") div_approx = true;
+        else if (p == "full") ;
         // min.NaN/max.NaN propagate a NaN operand instead of returning the
         // other one. That is exactly what fmin/fmax do NOT do, so it cannot be
         // dropped -- it is handled at execution, and recorded here.
@@ -4111,6 +4113,7 @@ class Parser {
         op.sat = sat;
         op.xorsign_abs = xorsign_abs;
         op.ftz = ftz && ty.bits == 32;
+        op.approx = div_approx && op.op == FloatBinOp::Div && ty.bits == 32;
         op.ty = ty;
         op.dst = expect_reg_operand("destination");
         expect_punct(",");

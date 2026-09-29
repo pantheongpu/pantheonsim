@@ -3759,6 +3759,77 @@ VTEST(half_precision_rules_from_the_fifth_sweep) {
   }
 }
 
+// div.approx.f32 is the documented a * (1/b) with rcp.approx's reciprocal,
+// and 0 (NaN for an infinite a) when 2^126 < |b| < 2^128; .ftz on the
+// approximate math flushes subnormal inputs and results. Every expected value
+// is an RTX 3060's.
+VTEST(approximate_division_and_ftz_as_documented) {
+  struct Case { const char* ins; uint32_t a, b, want; };
+  const Case cases[] = {
+      // a * rcp(b), rounded twice: one ulp from the quotient, where the
+      // card's reciprocal is the correctly rounded one.
+      {"div.approx.f32 %r4, %r1, %r2", 0x4003729a, 0xc23da946, 0xbd316cbe},
+      {"div.approx.f32 %r4, %r1, %r2", 0x3cae08fc, 0x41e66e7d, 0x3a415888},
+      {"div.approx.ftz.f32 %r4, %r1, %r2", 0xbdbe23cc, 0xc0585d1d, 0x3ce0f8db},
+      {"div.approx.f32 %r4, %r1, %r2", 0xbc8141ad, 0x439d254c, 0xb852911f},
+      {"div.full.f32 %r4, %r1, %r2", 0x3cae08fc, 0x41e66e7d, 0x3a415887},
+      // 2^126 < |b| < 2^128: a zero signed as the quotient, NaN for an infinite a.
+      {"div.approx.f32 %r4, %r1, %r2", 0x3f800000, 0x7ec00000, 0},
+      {"div.approx.f32 %r4, %r1, %r2", 0x3f800000, 0xff000000, 0x80000000},
+      {"div.approx.f32 %r4, %r1, %r2", 0xc0400000, 0xff000000, 0},
+      {"div.approx.f32 %r4, %r1, %r2", 0x7149f2ca, 0x7f7fffff, 0},
+      {"div.approx.f32 %r4, %r1, %r2", 0x7f800000, 0x7e800001, 0x7fffffff},
+      {"div.approx.ftz.f32 %r4, %r1, %r2", 0xc0400000, 0x7ec00000, 0x80000000},
+      // 2^126 itself is in range; a subnormal b gives the quotient (0, not 0 * inf).
+      {"div.approx.f32 %r4, %r1, %r2", 0x3f800000, 0x7e800000, 0x00800000},
+      {"div.approx.f32 %r4, %r1, %r2", 0, 0x00200000, 0},
+      {"div.approx.f32 %r4, %r1, %r2", 0x3f800000, 0x00200000, 0x7f800000},
+      // .ftz: subnormal inputs are signed zeros, subnormal results flush.
+      {"rcp.approx.ftz.f32 %r4, %r2", 0, 0x7ec00000, 0},
+      {"rcp.approx.ftz.f32 %r4, %r2", 0, 0xff000000, 0x80000000},
+      {"sqrt.approx.ftz.f32 %r4, %r2", 0, 0x00200000, 0},
+      {"sqrt.approx.ftz.f32 %r4, %r2", 0, 0x80080000, 0x80000000},
+      {"sqrt.approx.f32 %r4, %r2", 0, 0x00200000, 0x1f800000},
+      {"rsqrt.approx.ftz.f32 %r4, %r2", 0, 0x00200000, 0x7f800000},
+      {"rsqrt.approx.ftz.f32 %r4, %r2", 0, 0x80080000, 0xff800000},
+      {"ex2.approx.ftz.f32 %r4, %r2", 0, 0xc3040000, 0},
+      {"ex2.approx.f32 %r4, %r2", 0, 0xc3040000, 0x00020000},
+      {"lg2.approx.ftz.f32 %r4, %r2", 0, 0x00000001, 0xff800000},
+      {"lg2.approx.ftz.f32 %r4, %r2", 0, 0x80080000, 0xff800000},
+      {"sin.approx.ftz.f32 %r4, %r2", 0, 0x00200000, 0},
+      {"sin.approx.ftz.f32 %r4, %r2", 0, 0x80080000, 0x80000000},
+  };
+  constexpr size_t n = sizeof cases / sizeof cases[0];
+  std::string body;
+  for (size_t i = 0; i < n; ++i) {
+    char line[512];
+    std::snprintf(line, sizeof line,
+                  "    mov.u32 %%r1, %u;\n    mov.u32 %%r2, %u;\n    %s;\n"
+                  "    st.global.u32 [%%rd2+%zu], %%r4;\n",
+                  cases[i].a, cases[i].b, cases[i].ins, 4 * i);
+    body += line;
+  }
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+)" + body + "    ret;\n}\n";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4 * n);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  for (size_t i = 0; i < n; ++i) {
+    const auto got = static_cast<uint32_t>(e.mem.load_scalar(out + 4 * i, 4));
+    if (got != cases[i].want)
+      std::fprintf(stderr, "  %s (a=%08x b=%08x): %08x, the card gave %08x\n", cases[i].ins, cases[i].a, cases[i].b,
+                   got, cases[i].want);
+    VCHECK_EQ(got, cases[i].want);
+  }
+}
+
 VTEST(ptx_forms_as_the_card_computes_them) {
   struct Case { const char* ins; uint32_t a, b, c, want; };
   const Case cases[] = {

@@ -717,7 +717,10 @@ struct OpShf { bool left = false; bool wrap = false; Reg dst; Operand a, b, c; }
 // the smaller/larger magnitude with the sign sign(a) ^ sign(b).
 // round_explicit: a rounding modifier was written (.rn included), which rules
 // out contracting the instruction into an fma (see contract.hpp).
-struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; bool nan_propagate = false; Type ty; Reg dst; Operand a, b; bool sat = false; bool xorsign_abs = false; bool ftz = false; bool round_explicit = false; };
+// approx: div.approx.f32, documented as a * (1/b) -- the reciprocal the
+// approximate one rcp.approx gives -- for |b| in [2^-126, 2^126], and 0 (NaN
+// for an infinite a) for 2^126 < |b| < 2^128.
+struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; bool nan_propagate = false; Type ty; Reg dst; Operand a, b; bool sat = false; bool xorsign_abs = false; bool ftz = false; bool round_explicit = false; bool approx = false; };
 // neg_ab / neg_c negate the product / the addend: what a contracted sub
 // becomes (c - a*b is fma(-a, b, c); a*b - c is fma(a, b, -c)).
 struct OpFma { Type ty; Reg dst; Operand a, b, c; FRound round = FRound::Nearest; bool sat = false; bool ftz = false; bool neg_ab = false, neg_c = false; };

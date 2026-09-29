@@ -3164,7 +3164,7 @@ class Interpreter {
   }
 
   bool fast_float_bin(Warp& w, const Instr& ins, const OpFloatBin& op, Mask m) {
-    if (op.round != FRound::Nearest || op.nan_propagate || op.sat || op.xorsign_abs || op.ftz || op.ty.bits != 32 || !op.ty.is_float() ||
+    if (op.round != FRound::Nearest || op.nan_propagate || op.sat || op.xorsign_abs || op.ftz || op.approx || op.ty.bits != 32 || !op.ty.is_float() ||
         op.dst.wide || !narrow_operand(op.a) || !narrow_operand(op.b) || mem_.alu_fault_armed())
       return false;
     Lanes32 sa, sb;
@@ -3476,6 +3476,8 @@ class Interpreter {
             uint64_t v = float_bin(op->op, op->ty, av & ~sign, bvv & ~sign, op->nan_propagate);
             if (!float_is_nan(op->ty, v)) v = (v & ~sign) | ((av ^ bvv) & sign);
             r[lane] = v;
+          } else if (op->approx) {
+            r[lane] = div_approx32(static_cast<uint32_t>(av), static_cast<uint32_t>(bvv));
           } else {
             r[lane] = float_bin(op->op, op->ty, av, bvv, op->nan_propagate);
           }
@@ -4703,9 +4705,19 @@ class Interpreter {
             }
             continue;
           }
-          const double x = op->ty.bits == 32 ? static_cast<double>(f32(v[lane])) : f64(v[lane]);
-          const double y = apply(x);
-          r[lane] = op->ty.bits == 32 ? canon32(static_cast<float>(y)) : f64bits(y);
+          if (op->ty.bits == 32) {
+            // .ftz: subnormal inputs and results to signed zero, as the
+            // rounded forms above -- so sqrt.approx.ftz of a negative
+            // subnormal is -0, rsqrt's and lg2's are infinite, and a
+            // reciprocal or ex2 too small to be normal is 0 (an RTX 3060's).
+            float x = f32(v[lane]);
+            if (op->ftz && std::fpclassify(x) == FP_SUBNORMAL) x = std::copysign(0.0f, x);
+            float y = static_cast<float>(apply(static_cast<double>(x)));
+            if (op->ftz && std::fpclassify(y) == FP_SUBNORMAL) y = std::copysign(0.0f, y);
+            r[lane] = canon32(y);
+            continue;
+          }
+          r[lane] = f64bits(apply(f64(v[lane])));
         }
       // A half result still occupies a 32-bit register, packed or not.
       alu_fault(r, m, op->ty.bits == 16 ? 16u : op->ty.bits);
@@ -9203,6 +9215,26 @@ class Interpreter {
     const double x = f64(v);
     return f64bits(std::isnan(x) || x <= 0.0 ? 0.0 : std::min(x, 1.0));
   }
+
+  // div.approx.f32, as the ISA documents it: a * (1/b) with the reciprocal
+  // rcp.approx gives, for |b| in [2^-126, 2^126]; for 2^126 < |b| < 2^128, 0
+  // -- signed as a quotient is -- or NaN when a is infinite. An RTX 3060
+  // follows both to the bit (its a * rcp.approx(b) and a mul.rn of the two
+  // agree on a million random pairs). Outside the documented range -- a
+  // subnormal, zero or infinite b -- it gives the quotient (0 / 2^-128 is 0,
+  // not 0 * inf), and so does this. The reciprocal is rcp.approx's here, at
+  // host precision (the documented divergence), so the result is the card's
+  // wherever the card's reciprocal is correctly rounded. .ftz is the
+  // caller's: the operands arrive flushed and the result is flushed after.
+  static uint64_t div_approx32(uint32_t a, uint32_t b) {
+    const float x = f32(a), y = f32(b), ay = std::fabs(y);
+    if (ay > 0x1p126f && ay <= std::numeric_limits<float>::max())
+      return std::isfinite(x) ? (a ^ b) & 0x80000000u : 0x7FFFFFFFu;
+    if (!(ay >= 0x1p-126f) || std::isinf(y)) return canon32(x / y);
+    return canon32(x * rcp_approx32(y));
+  }
+  // rcp.approx.f32 at host precision: the correctly rounded reciprocal.
+  static float rcp_approx32(float x) { return static_cast<float>(1.0 / static_cast<double>(x)); }
 
   uint64_t float_bin(FloatBinOp op, Type ty, uint64_t a, uint64_t b,
                      bool nan_propagate = false) {
