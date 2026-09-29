@@ -7,7 +7,8 @@
 # Both runs must pass and print the same.
 #
 # Hopper's own programs -- warpgroup MMA, TMA, tensor maps rewritten in place,
-# stmatrix -- are built for sm_90a and run on the H100 the same way; the ones
+# stmatrix -- are built for sm_90a and run on the H100 the same way, and
+# Blackwell's tensor core (tcgen05_gemm) for sm_100a on the B200; the ones
 # written with CuTe need CUTLASS's headers (cutlass_fetch.sh), and skip,
 # saying so, without them.
 #
@@ -29,8 +30,9 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-sass-archs.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
 declare -A gpu=([sm_75]=nvidia/t4 [sm_80]=nvidia/a100 [sm_86]=nvidia/rtx3060 [sm_89]=nvidia/l4
-                [sm_90]=nvidia/h100 [sm_90a]=nvidia/h100 [sm_100]=nvidia/b200 [sm_120]=nvidia/rtx5090)
-archs=(${VGPU_SASS_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_90a sm_100 sm_120})
+                [sm_90]=nvidia/h100 [sm_90a]=nvidia/h100 [sm_100]=nvidia/b200 [sm_100a]=nvidia/b200
+                [sm_120]=nvidia/rtx5090)
+archs=(${VGPU_SASS_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_90a sm_100 sm_100a sm_120})
 # program:first architecture it builds for (the MMA programs need sm_80)
 # [:last one it runs on (runtime_conformance checks a T4's properties)].
 progs=(${VGPU_SASS_PROGRAMS:-sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
@@ -38,7 +40,7 @@ progs=(${VGPU_SASS_PROGRAMS:-sass_archs:75 vector_add:75 device_functions:75 dev
        texture_layers:75 texture_mipmaps:75 block_semaphore:75 cooperative_grid:75 mma_forms:80
        mma_fragment_layout:80 modern_dtypes:80 wmma_gemm:80 wmma_types:80 dsmem_cluster:90
        wgmma_cute:90a tma_gemm_cute:90a tma_reduce_cute:90a tma_im2col:90a tensormap_replace_cute:90a
-       stmatrix:90a})
+       stmatrix:90a tcgen05_gemm:100a})
 cute=" wgmma_cute tma_gemm_cute tma_reduce_cute tensormap_replace_cute "
 
 supported="$("$nvcc_bin" --list-gpu-code 2>/dev/null)"

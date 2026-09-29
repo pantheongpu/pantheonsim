@@ -46,7 +46,8 @@ bool executes(const Instr& ins) {
     case Op::VIMNMX3: case Op::IADD: case Op::UP2UR: case Op::ELECT: case Op::USETMAXREG: case Op::WARPGROUP:
     case Op::FMNMX3: case Op::STSM: case Op::RPCMOV: case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
     case Op::SYNCS: case Op::ARRIVES: case Op::UTMALDG: case Op::UTMASTG: case Op::UTMAREDG: case Op::UBLKCP:
-    case Op::UBLKRED:
+    case Op::UBLKRED: case Op::LDTM: case Op::STTM: case Op::UTCMMA: case Op::UTCBAR: case Op::UTCCP:
+    case Op::UTCSHIFT: case Op::UTCATOMSWS:
     case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2FP: case Op::F2I:
     case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL:
     case Op::FSET: case Op::FSETP: case Op::HADD2: case Op::HFMA2: case Op::HMUL2: case Op::HSET2: case Op::HSETP2:
@@ -149,6 +150,10 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
         break;
       case Op::UTMALDG: case Op::UTMASTG: case Op::UTMAREDG: case Op::UBLKCP: case Op::UBLKRED:
         exec_tma(blk, w, ins, ex);
+        break;
+      case Op::LDTM: case Op::STTM: case Op::UTCMMA: case Op::UTCBAR: case Op::UTCCP: case Op::UTCSHIFT:
+      case Op::UTCATOMSWS:
+        exec_tcgen05(blk, w, ins, ex);
         break;
       case Op::FADD: case Op::FMUL: case Op::FFMA: case Op::FMNMX: case Op::FSETP: case Op::FSET:
       case Op::FSEL: case Op::FCHK: case Op::MUFU: case Op::DADD: case Op::DMUL: case Op::DFMA:
@@ -3173,5 +3178,250 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   if (!reduce) {
     blk.st.global_stores += 1;
     blk.st.global_bytes_written += stored;
+  }
+}
+
+// ---- Blackwell's tensor core (tcgen05: LDTM, STTM, UTC*) ------------------------
+//
+// The operations themselves are the PTX engine's (exec/tcgen05.hpp); this
+// reads their operands from the uniform registers and gives them the CTAs
+// they work on -- this one, or with .2CTA the pair of the cluster whose
+// ranks differ in the last bit, even first. The UTC* instructions are the
+// uniform datapath's: issued once for the warp, however many lanes are
+// active (for one per thread, ptxas loops over the threads with ELECT).
+namespace {
+class SassTcHost final : public exec::Tcgen05Host {
+ public:
+  SassTcHost(std::vector<Block*> cs, Block* me) : cs_(std::move(cs)) {
+    for (uint32_t i = 0; i < cs_.size(); ++i)
+      if (cs_[i] == me) me_ = i;
+  }
+  uint32_t ctas() const override { return static_cast<uint32_t>(cs_.size()); }
+  uint32_t self() const override { return me_; }
+  exec::TensorMemory& tmem(uint32_t c) override { return cs_[c]->tmem; }
+  uint64_t smem_load(uint32_t c, uint64_t off, uint32_t bytes) override {
+    const std::vector<uint8_t>& sh = cs_[c]->shared;
+    if (off + bytes > sh.size())
+      throw Fault("a tensor-core operand reaches shared offset " + std::to_string(off + bytes) + ", past the block's " +
+                  std::to_string(sh.size()) + " bytes");
+    uint64_t v = 0;
+    std::memcpy(&v, &sh[off], bytes);
+    return v;
+  }
+  [[noreturn]] void fail(Err code, const std::string& why) override { throw Error(code, why); }
+
+ private:
+  std::vector<Block*> cs_;
+  uint32_t me_ = 0;
+};
+}  // namespace
+
+void Runner::exec_tcgen05(Block& blk, Warp& w, const Instr& ins, Mask ex) {
+  if (!ex) return;
+  const Word& word = ins.w;
+  const unsigned urz = 255;
+  const auto urv = [&](unsigned u) -> uint32_t { return u >= urz ? 0 : w.ur[u]; };
+  const auto ur64 = [&](unsigned u) -> uint64_t { return urv(u) | (static_cast<uint64_t>(urv(u + 1)) << 32); };
+  const auto u = [&](unsigned pos) { return static_cast<unsigned>(word.field(pos, 8)); };
+  // The CTAs of an operation of .cta_group::n.
+  const auto group = [&](bool two) -> std::vector<Block*> {
+    if (!two) return {&blk};
+    const Cluster& cl = *blk.cluster;
+    if ((blk.rank | 1) >= cl.blocks.size())
+      throw Error(Err::InvalidValue, ".2CTA works on a CTA pair -- two CTAs of a cluster whose ranks differ in the "
+                                     "last bit -- and this CTA (rank " + std::to_string(blk.rank) + " of a " +
+                                         std::to_string(cl.blocks.size()) + "-CTA cluster) has no peer");
+    return {cl.blocks[blk.rank & ~1u], cl.blocks[blk.rank | 1u]};
+  };
+  switch (ins.op) {
+    case Op::UTCATOMSWS: {
+      // tcgen05.alloc/dealloc's allocator: a map of 16 granules of 32
+      // columns. FIND_AND_SET.ALIGN UPd, URd, URb claims the lowest run of
+      // URb granules aligned to its size that is free in every CTA of the
+      // operation, and puts its first granule in URd (the kernel stores
+      // granule * 32 as the address); AND URd, URb keeps only the granules
+      // URb names. With .2CTA the first warp of the pair to get there acts
+      // for both, as in the PTX engine.
+      const bool find = ins.f[0], two = word.bit(85);
+      std::vector<Block*> cs = group(two);
+      exec::TensorMemory& mine = blk.tmem;
+      if (find) {
+        const uint32_t n = urv(u(32)), cols = n * 32;
+        const unsigned up = ins.dst[0].reg, d = ins.dst[1].reg;
+        if (!n || n > 16 || (n & (n - 1))) throw Error(Err::InvalidValue, "UTCATOMSWS.FIND_AND_SET of " + std::to_string(n) + " granules");
+        uint32_t col = 0;
+        bool ok = false;
+        if (two && !mine.peer_alloc.empty()) {
+          col = mine.peer_alloc.front().first;
+          mine.peer_alloc.pop_front();
+          ok = true;
+        } else {
+          for (col = 0; col + cols <= exec::TensorMemory::kCols; col += cols) {
+            ok = true;
+            for (Block* b : cs) ok = ok && b->tmem.free_run(col, cols);
+            if (ok) break;
+          }
+          if (ok)
+            for (Block* b : cs) {
+              if (b->tmem.cells.empty()) b->tmem.cells.assign(size_t{exec::TensorMemory::kLanes} * exec::TensorMemory::kCols, 0);
+              b->tmem.live[col] = cols;
+              if (b != &blk) b->tmem.peer_alloc.emplace_back(col, cols);
+            }
+        }
+        if (up < 7) w.up[up] = ok;
+        if (d < urz) w.ur[d] = ok ? col / 32 : 0;
+        if (!ok) w.yield = true;   // it retries until a peer warp deallocates
+        return;
+      }
+      const uint32_t keep = urv(u(32));
+      if (two && !mine.peer_dealloc.empty()) {
+        mine.peer_dealloc.pop_front();
+        return;
+      }
+      for (Block* b : cs) {
+        for (auto it = b->tmem.live.begin(); it != b->tmem.live.end();) {
+          const uint32_t g0 = it->first / 32, gn = it->second / 32;
+          const uint32_t bits = ((1u << gn) - 1) << g0;
+          if (!(keep & bits)) it = b->tmem.live.erase(it);
+          else ++it;
+        }
+        if (two && b != &blk) b->tmem.peer_dealloc.emplace_back(0, 0);
+      }
+      return;
+    }
+    case Op::LDTM: case Op::STTM: {
+      // tcgen05.ld/st: warp w of a warpgroup reaches lanes 32(w%4)-32(w%4)+31.
+      static const ptx::Tcgen05Shape shapes[] = {ptx::Tcgen05Shape::S16x128b, ptx::Tcgen05Shape::S16x256b,
+                                                 ptx::Tcgen05Shape::S32x32b, ptx::Tcgen05Shape::S16x64b,
+                                                 ptx::Tcgen05Shape::S16x32bx2, ptx::Tcgen05Shape::S16x32bx2};
+      static const uint32_t per_x1[] = {2, 4, 1, 1, 1, 1};
+      const uint32_t shape = ins.f[0], nregs = per_x1[shape] * ins.f[1], width = ins.f[2] ? 2 : 1;
+      const bool ld = ins.op == Op::LDTM;
+      const Operand& tm = ld ? ins.src[0] : ins.src[0];
+      const uint32_t taddr = urv(tm.reg) + static_cast<uint32_t>(tm.imm);
+      const uint32_t lane0 = taddr >> 16, col0 = taddr & 0xFFFF, quarter = w.index % 4;
+      const unsigned r0 = ld ? ins.dst[0].reg : ins.src[1].reg;
+      exec::TensorMemory& t = blk.tmem;
+      for (uint32_t j = 0; j < nregs; ++j)
+        each_lane(ex, [&](unsigned th) {
+          if (shape >= 4 && (th / 16) != shape - 4) return;   // this half of 16x32bx2's threads
+          uint32_t dl, dc;
+          exec::tmem_fragment(shapes[shape], th, j, &dl, &dc);
+          const uint32_t lane = lane0 + dl, col = col0 + dc * width;
+          if (lane / 32 != quarter || lane >= exec::TensorMemory::kLanes)
+            throw Error(Err::InvalidValue, std::string(ld ? "LDTM" : "STTM") + " reaches Tensor Memory lane " +
+                                               std::to_string(lane) + ", and warp " + std::to_string(quarter) +
+                                               " of its warpgroup may only reach lanes " + std::to_string(32 * quarter) +
+                                               "-" + std::to_string(32 * quarter + 31));
+          for (uint32_t c = col; c < col + width; ++c)
+            if (c >= exec::TensorMemory::kCols || !t.allocated(c))
+              throw Error(Err::OutOfBounds, std::string(ld ? "LDTM" : "STTM") + " reaches Tensor Memory column " +
+                                                std::to_string(c) + ", which this CTA has not allocated");
+          if (ld) {
+            if (r0 + j == kRZ) return;
+            w.reg(r0 + j, th) = width == 2 ? (t.at(lane, col) & 0xFFFF) | (t.at(lane, col + 1) << 16) : t.at(lane, col);
+          } else {
+            const uint32_t v = r0 == kRZ ? 0 : w.reg(r0 + j, th);
+            if (width == 2) {
+              t.at(lane, col) = v & 0xFFFF;
+              t.at(lane, col + 1) = v >> 16;
+            } else {
+              t.at(lane, col) = v;
+            }
+          }
+        });
+      return;
+    }
+    case Op::UTCBAR: {
+      // tcgen05.commit: an arrive, count 1, on the barrier -- or with
+      // .MULTICAST on the barrier at the same offset in every CTA the mask
+      // names -- once the MMAs before it are done, which they are.
+      const uint32_t at = urv(u(24));
+      uint32_t off;
+      Block& owner = shared_block(blk, at, &off);
+      if (!ins.f[0]) {
+        mbar_arrive(owner, off, 1, 0, false);
+        return;
+      }
+      const uint32_t mask = urv(u(64)) & 0xFFFF;
+      for (uint32_t r = 0; r < 16; ++r)
+        if (mask >> r & 1) mbar_arrive(cluster_block(blk, r), off, 1, 0, false);
+      return;
+    }
+    case Op::UTCCP: {
+      static const ptx::Tcgen05CpShape shapes[] = {ptx::Tcgen05CpShape::S128x256b, ptx::Tcgen05CpShape::S128x256b,
+                                                   ptx::Tcgen05CpShape::S4x256b,   ptx::Tcgen05CpShape::S128x128b,
+                                                   ptx::Tcgen05CpShape::S64x128b,  ptx::Tcgen05CpShape::S64x128b,
+                                                   ptx::Tcgen05CpShape::S32x128b,  ptx::Tcgen05CpShape::S32x128b};
+      static const int multicast[] = {0, 0, 0, 0, 2, 3, 4, 4};
+      const uint32_t shape = ins.f[0] & 7;
+      if (shape == 1 || shape == 7) throw Error(Err::UnsupportedPtx, "UTCCP shape " + std::to_string(shape));
+      exec::Tcgen05Cp cp;
+      cp.shape = shapes[shape];
+      cp.multicast = multicast[shape];
+      cp.decompress = ins.f[2] == 1 ? 4 : ins.f[2] == 2 ? 6 : 0;
+      cp.taddr = urv(ins.src[0].reg) + static_cast<uint32_t>(ins.src[0].imm);
+      cp.desc = ur64(ins.src[1].reg);
+      SassTcHost h(group(ins.f[1]), &blk);
+      exec::tcgen05_cp(cp, h);
+      return;
+    }
+    case Op::UTCSHIFT: {
+      const uint32_t taddr = urv(ins.src[0].reg) + static_cast<uint32_t>(ins.src[0].imm);
+      SassTcHost h(group(ins.f[1]), &blk);
+      exec::tcgen05_shift(taddr, h);
+      return;
+    }
+    case Op::UTCMMA: {
+      exec::Tcgen05Mma m;
+      const uint32_t p = u(40), x = u(48);
+      m.idesc = urv(p + 1);
+      m.cta_group = ins.f[1] ? 2 : 1;
+      m.a_tmem = ins.f[2];
+      m.ws = ins.f[4];
+      m.sparse = m.idesc >> 2 & 1;
+      switch (ins.f[0]) {
+        case 0: m.kind = (m.idesc >> 7 & 7) == 2 ? ptx::Tcgen05MmaKind::TF32 : ptx::Tcgen05MmaKind::F16; break;
+        case 1: m.kind = ins.f[3] ? ptx::Tcgen05MmaKind::MXF8F6F4 : ptx::Tcgen05MmaKind::F8F6F4; break;
+        case 2: m.kind = ptx::Tcgen05MmaKind::I8; break;
+        default: m.kind = ptx::Tcgen05MmaKind::MXF4NVF4; break;
+      }
+      m.block_scale = ins.f[3];
+      m.scale_vec = ins.f[0] == 3 ? (ins.f[7] ? 4 : 2) : ins.f[3] ? 1 : 0;
+      m.a = m.a_tmem ? urv(u(24)) : ur64(u(24));
+      m.b = ur64(u(32));
+      m.d = urv(u(64));
+      if (m.sparse) m.sp_meta = urv(p);
+      if (ins.f[3]) {
+        m.scale_a = urv(x);
+        m.scale_b = urv(x + 1);
+      } else if (x != urz) {
+        if (m.ws) {
+          m.has_zero_mask = true;
+          m.zero_mask = ur64(x);
+        } else {
+          for (uint32_t i = 0; i < (m.cta_group == 2 ? 8u : 4u); ++i) m.disable_lanes[i] = urv(x + i);
+        }
+      }
+      const unsigned upi = static_cast<unsigned>(word.field(87, 3));
+      m.accumulate = (upi == 7 ? true : w.up[upi]) != word.bit(90);
+      m.scale_d = ins.f[5] ? static_cast<int>(ins.f[5]) : -1;
+      if (m.ws) {
+        // B's collector: 79-80 the buffer, 81 keep, 82 reuse -- fill, use,
+        // lastuse and discard.
+        const uint32_t c = ins.f[6];
+        m.collector_buf = c & 3;
+        const bool keep = c >> 2 & 1, reuse = c >> 3 & 1;
+        m.collector = keep && !reuse   ? ptx::Tcgen05Collector::Fill
+                      : keep && reuse  ? ptx::Tcgen05Collector::Use
+                      : reuse          ? ptx::Tcgen05Collector::LastUse
+                                       : ptx::Tcgen05Collector::Discard;
+      }
+      SassTcHost h(group(ins.f[1]), &blk);
+      exec::tcgen05_mma(m, h);
+      return;
+    }
+    default:
+      throw Fault("tcgen05 form not implemented");
   }
 }

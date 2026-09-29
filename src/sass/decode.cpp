@@ -3129,8 +3129,8 @@ void dec_utccp(Instr& ins, const Word& w) {
   ins.src.back().reg = static_cast<unsigned>(w.field(32, 8));
 }
 
-// UTCSHIFT[.2CTA].DOWN tmem[URa] (tcgen05.shift.down): each row of the 32
-// lanes' region down one lane.
+// UTCSHIFT[.2CTA].DOWN tmem[URa + offset] (tcgen05.shift.down): each row of
+// the 32 lanes' region down one lane; the offset at 40-55.
 void dec_utcshift(Instr& ins, const Word& w) {
   ins.op = Op::UTCSHIFT;
   ins.mnemonic = "UTCSHIFT";
@@ -3138,8 +3138,10 @@ void dec_utcshift(Instr& ins, const Word& w) {
   ins.mods.push_back(w.bit(80) ? "DOWN" : "(up)");
   ins.f[1] = w.bit(85);
   const unsigned ur = static_cast<unsigned>(w.field(24, 8));
-  ins.src.push_back(Txt(tmem_text(ur, 0, ins.sm)));
+  const int64_t off = static_cast<int64_t>(w.field(40, 16));
+  ins.src.push_back(Txt(tmem_text(ur, off, ins.sm)));
   ins.src.back().reg = ur;
+  ins.src.back().imm = off;
 }
 
 // UTCATOMSWS (tcgen05.alloc's allocator): 0x5e3 .FIND_AND_SET.ALIGN UPd,
@@ -3504,7 +3506,9 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
     it->second(ins, w);
     // The uniform datapath's own ops take a UP guard.
     if (opc == 0x9c3 || opc == 0xab9 || opc == 0xabb || opc == 0x89c || opc == 0x5b2 || opc == 0x5b4 || opc == 0x3b4 ||
-        opc == 0x3b5 || opc == 0x3b6 || opc == 0x3ba || opc == 0x3bb || opc == 0x3bc || opc == 0x5b8 || opc == 0x7ac || opc == 0x883 || opc == 0x8cb ||
+        opc == 0x3b5 || opc == 0x3b6 || opc == 0x3ba || opc == 0x3bb || opc == 0x3bc || opc == 0x5b8 ||
+        opc == 0x5ea || opc == 0x9ea || opc == 0xdea || opc == 0x9e7 || opc == 0x9e6 || opc == 0x3e9 ||
+        opc == 0x5e3 || opc == 0x9e3 || opc == 0x7ac || opc == 0x883 || opc == 0x8cb ||
         opc == 0x9b9)
       ins.guard_uniform = true;
     return ins;
