@@ -290,6 +290,10 @@ uint32_t param_space_bytes(const EntryFn& fn) {
 struct NamedBarrier {
   uint32_t arrived = 0;
   uint64_t waiting = 0;   // bit per warp of the block
+  // A bar.red with a thread count gathers its answer here; the warps it
+  // releases each carry the answer away (Warp::bar_red_result), since the
+  // barrier is reusable the moment it completes.
+  uint64_t acc = 0;
 };
 struct NamedBarriers {
   std::array<NamedBarrier, 16> bar{};
@@ -387,6 +391,8 @@ struct Warp {
   // to collect rather than contribute a second time.
   bool bar_red_waiting = false;
   uint64_t bar_red_round = 0;   // the bar.red round this warp voted in
+  // A bar.red with a thread count: the answer its completion handed this warp.
+  uint64_t bar_red_result = 0;
   // At a barrier with a thread count, which that barrier's completion
   // releases; step_block's all-warps release leaves such a warp waiting.
   bool counted_barrier = false;
@@ -2456,8 +2462,18 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpBarRed>(&ins.op)) {
-      if (ins.has_pred)
-        ctx_fail(ins, -1, Err::UnsupportedPtx, "predicated bar.red is not supported");
+      if (ins.has_pred && !w.bar_red_waiting) {
+        // As with bar.sync: the barrier is aligned, so a guard must be the
+        // same for the whole warp. A warp that skips it does not arrive.
+        if (m == 0) {
+          ++w.paths[idx].pc;
+          return;
+        }
+        if (m != active)
+          ctx_fail(ins, -1, Err::UnsupportedPtx,
+                   "a guarded bar.red that some lanes of the warp take and others skip; the "
+                   "barrier is aligned, so the warp must agree");
+      }
       if (!ctx.bar_red)
         ctx_fail(ins, -1, Err::UnsupportedPtx, "bar.red outside a block context");
       BarrierReduction& red = *ctx.bar_red;
@@ -2476,27 +2492,88 @@ class Interpreter {
                  "bar.red cannot be reached by every lane of the warp: some lanes are on a path "
                  "that never arrives at this barrier");
       }
-      if (!w.bar_red_waiting) {
-        // Contribute and wait. The result is not known until every warp in the
-        // block has arrived, so the pc stays put and this re-executes on
-        // release rather than advancing now.
-        if (red.arrived == 0) red.acc = op->op == BarRedOp::And ? ~uint64_t{0} : 0;
-        w.bar_red_round = red.round;
+      // Folds this warp's votes into an accumulator; `first` starts it.
+      auto vote = [&](uint64_t& acc, bool first) {
+        if (first) acc = op->op == BarRedOp::And ? ~uint64_t{0} : 0;
         Mask p = read_pred(w, ins, op->src);
         if (op->negate_src) p = ~p;
         const Mask voters = p & m;
         switch (op->op) {
           case BarRedOp::And:
             // True only if every participating lane of every warp voted true.
-            red.acc &= (voters == m) ? 1u : 0u;
+            acc &= (voters == m) ? 1u : 0u;
             break;
           case BarRedOp::Or:
-            red.acc |= (voters != 0) ? 1u : 0u;
+            acc |= (voters != 0) ? 1u : 0u;
             break;
           case BarRedOp::Popc:
-            red.acc += static_cast<uint64_t>(popcount_mask(voters));
+            acc += static_cast<uint64_t>(popcount_mask(voters));
             break;
         }
+      };
+      auto deliver = [&](uint64_t result) {
+        if (op->op == BarRedOp::Popc) {
+          Lanes r;
+          for (uint32_t lane = 0; lane < W_; ++lane)
+            if (m & (Mask{1} << lane)) r[lane] = result;
+          write_reg(w, op->dst, m, r, 32);
+        } else {
+          Mask& dp = pred_slot(w, op->dst);
+          dp = (result & 1u) ? (dp | m) : (dp & ~m);
+        }
+        ++w.paths[idx].pc;
+      };
+      const uint32_t lead = first_set(m);
+      Lanes _s_id;
+      const uint64_t id = read_operand(w, ctx, ins, op->id, _s_id)[lead];
+      if (id > 15)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "barrier " + std::to_string(id) + ": a CTA has barriers 0 to 15");
+      if (op->have_count) {
+        // A barrier with a thread count: only the warps that arrive at it take
+        // part, and its completion hands each of them the answer.
+        if (w.bar_red_waiting) {
+          w.bar_red_waiting = false;
+          deliver(w.bar_red_result);
+          return;
+        }
+        Lanes _s_c;
+        const uint64_t count = static_cast<uint32_t>(read_operand(w, ctx, ins, op->count, _s_c)[lead]);
+        if (count == 0 || count % W_)
+          ctx_fail(ins, -1, Err::InvalidValue,
+                   "a barrier's thread count must be a non-zero multiple of the warp size (" +
+                       std::to_string(W_) + "); got " + std::to_string(count));
+        NamedBarrier& nb = ctx.bars->bar[id];
+        vote(nb.acc, nb.arrived == 0);
+        nb.arrived += W_;
+        ++stats_.barriers;
+        if (nb.arrived >= count) {
+          const uint64_t result = nb.acc;
+          for (size_t i = 0; i < ctx.warps->size(); ++i)
+            if (nb.waiting >> i & 1) {
+              Warp& other = (*ctx.warps)[i];
+              other.state = Warp::State::Ready;
+              other.counted_barrier = false;
+              other.bar_red_result = result;
+            }
+          nb = NamedBarrier{};
+          if (ctx.shadow) ++ctx.shadow->epoch;
+          deliver(result);
+          return;
+        }
+        nb.waiting |= uint64_t{1} << cur_warp_;
+        w.state = Warp::State::AtBarrier;
+        w.counted_barrier = true;
+        w.barrier_id = static_cast<uint8_t>(id);
+        w.bar_red_waiting = true;
+        return;
+      }
+      if (!w.bar_red_waiting) {
+        // Contribute and wait. The result is not known until every warp in the
+        // block has arrived, so the pc stays put and this re-executes on
+        // release rather than advancing now.
+        w.bar_red_round = red.round;
+        vote(red.acc, red.arrived == 0);
         ++red.arrived;
         ++stats_.barriers;
         w.bar_red_waiting = true;
@@ -2511,16 +2588,7 @@ class Interpreter {
         ctx_fail(ins, -1, Err::UnsupportedPtx,
                  "bar.red released a warp whose round has not completed; were some warps at a "
                  "bar.sync on the same barrier?");
-      if (op->op == BarRedOp::Popc) {
-        Lanes r;
-        for (uint32_t lane = 0; lane < W_; ++lane)
-          if (m & (Mask{1} << lane)) r[lane] = red.result;
-        write_reg(w, op->dst, m, r, 32);
-      } else {
-        Mask& dp = pred_slot(w, op->dst);
-        dp = (red.result & 1u) ? (dp | m) : (dp & ~m);
-      }
-      ++w.paths[idx].pc;
+      deliver(red.result);
       return;
     }
     if (const auto* op = std::get_if<OpClusterBarrier>(&ins.op)) {

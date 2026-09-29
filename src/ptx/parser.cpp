@@ -4533,14 +4533,29 @@ class Parser {
       op.op = *rop;
       op.dst = expect_reg_operand("bar.red destination");
       expect_punct(",");
-      {
-        Operand which = parse_operand();
-        if (auto* imm = std::get_if<ImmInt>(&which); !imm || imm->value != 0)
-          return unsupported("only barrier 0 is implemented");
-      }
+      // d, a{, b}, {!}c: the barrier, an optional thread count, the predicate.
+      op.id = parse_operand();
+      if (auto* imm = std::get_if<ImmInt>(&op.id); imm && (imm->value < 0 || imm->value > 15))
+        return unsupported("a CTA has barriers 0 to 15");
       expect_punct(",");
-      if (peek_punct("!")) { next(); op.negate_src = true; }
-      op.src = expect_reg_operand("bar.red source predicate");
+      if (peek_punct("!")) {
+        next();
+        op.negate_src = true;
+        op.src = expect_reg_operand("bar.red source predicate");
+      } else {
+        Operand second = parse_operand();
+        if (peek_punct(",")) {
+          next();
+          op.count = second;
+          op.have_count = true;
+          if (peek_punct("!")) { next(); op.negate_src = true; }
+          op.src = expect_reg_operand("bar.red source predicate");
+        } else if (auto* r = std::get_if<RegOperand>(&second)) {
+          op.src = r->reg;
+        } else {
+          return unsupported("bar.red needs a source predicate");
+        }
+      }
       ins.op = op;
     } else if (op0 == "bar" || op0 == "barrier") {
       bool sync_seen = false, arrive_seen = false, warp_scope = false;
