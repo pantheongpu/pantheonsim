@@ -24,6 +24,7 @@
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/amd_hostcall.hpp"
 #include "vgpu/error.hpp"
+#include "vgpu/host_cpus.hpp"
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
@@ -4701,7 +4702,7 @@ unsigned worker_count(uint64_t groups) {
     const int v = std::atoi(t);
     want = v > 0 ? static_cast<unsigned>(v) : 1;
   } else {
-    want = std::thread::hardware_concurrency();
+    want = vgpu::host_cpus();  // the CPUs this process may use, quota included
   }
   if (want == 0) want = 1;
   if (want > groups) want = static_cast<unsigned>(groups);

@@ -45,6 +45,7 @@
 #include "vgpu/exec/tensormap.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/faults.hpp"
+#include "vgpu/host_cpus.hpp"
 #include "vgpu/exec/launch.hpp"
 
 namespace vgpu::exec {
@@ -10588,8 +10589,8 @@ unsigned worker_count(uint64_t blocks) {
     const int v = std::atoi(t);
     want = v > 0 ? static_cast<unsigned>(v) : 1;
   } else {
-    want = std::thread::hardware_concurrency();
-    if (want == 0) want = 1;
+    // The CPUs this process may use, quota included, not the host's count.
+    want = vgpu::host_cpus();
   }
   if (want > blocks) want = static_cast<unsigned>(blocks);
   return want ? want : 1;
