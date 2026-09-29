@@ -125,11 +125,10 @@ Each with its own message, rather than a plausible wrong number:
 - Mipmapped layered and cubemap textures, and `tld4` on layered or cubemap
   textures (the runtime refuses a gather array that is layered or a cubemap,
   so there is nothing to measure them on).
-- A non-zero border colour with border addressing, resource views, sRGB,
-  anisotropic filtering, and the `.clamp` / `.zero` out-of-range policies on
-  `suld`/`sust`.
+- A non-zero border colour with border addressing, resource views, sRGB, and
+  anisotropic filtering.
 
-## Surfaces fault rather than clamp
+## Surfaces out of range: .trap, .clamp and .zero
 
 `suld` and `sust` carry a `.trap` out-of-range policy, which is what a surface
 access compiles to by default, and it means what it says:
@@ -141,6 +140,25 @@ access compiles to by default, and it means what it says:
 ```
 
 Clamping instead would turn an indexing bug into a plausible picture.
+
+The other two policies do what an RTX 3060 does with them. The ISA's
+descriptions ("the nearest surface location, sized appropriately") left
+open how, so these were measured (`nvidia/tests/e2e/surface_oob.cu`, which
+compares 245 results with the card's):
+
+- **`.clamp`** moves each coordinate to the nearest place in the surface:
+  - x to the last position, aligned to the access, where the whole access
+    fits. That is by the byte, not the texel: an 8-bit load at x = 32 on a
+    32-byte row reads byte 31, and a 16-byte `.v4` on a 24-byte row reads
+    from byte 0, not 8.
+  - y and z into their range, and the layer to the last layer (the index is
+    unsigned, so -1 is past the end).
+  - A store lands where a load would read.
+- **`.zero`**: if any byte of the access is out of range, a load reads zero
+  and a store is dropped, the whole access even when only part of a vector
+  is outside.
+- **A misaligned x** faults under every policy, as it does on the card; the
+  ISA leaves it undefined.
 
 ## Handles are not interchangeable
 

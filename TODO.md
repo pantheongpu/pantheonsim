@@ -1256,8 +1256,9 @@ scripts/run-pantheon-workloads.sh.
    of results against the hardware's. Refused by name: `tex.grad` (its LOD
    comes from undocumented approximate units), linear filtering of signed
    8-bit normalized texels, mipmapped layered/cubemap textures, `tld4` on
-   layered/cubemap textures, border colours, sRGB, anisotropy, resource views
-   and the `.clamp`/`.zero` surface policies. See nvidia/docs/textures.md.
+   layered/cubemap textures, border colours, sRGB, anisotropy and resource
+   views. The `.clamp`/`.zero` surface policies are done, as an RTX 3060 applies
+   them. See nvidia/docs/textures.md.
 
    `wgmma`, TMA and distributed shared memory are done now (see "Hopper's
    warpgroup MMA", "TMA and clusters" and "Distributed shared memory"). What

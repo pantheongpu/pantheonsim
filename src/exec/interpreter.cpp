@@ -5337,16 +5337,32 @@ class Interpreter {
 
   // suld/sust address a surface in *bytes* along x and in whole rows along y
   // and z, which is why they take no format: they move raw bytes.
-  uint64_t surface_address(const Instr& ins, uint32_t lane, const TextureDesc& d,
-                           const std::array<Lanes, 4>& coord, uint32_t dims, uint32_t bytes,
-                           bool layered) {
+  //
+  // The out-of-range policy (9.7.13.1-2), as an RTX 3060 applies it:
+  //   .trap   faults;
+  //   .clamp  moves each coordinate to the nearest place in the surface: x to
+  //           the last position, aligned to the access, at which the whole
+  //           access fits (a 16-byte .v4 on a 24-byte row reads from 0, not
+  //           8), y and z into their range, and the layer to the last one;
+  //   .zero   reads zero and drops the store if any byte of the access is
+  //           out of range -- the whole access, not only its outside part.
+  // Null for a .zero access out of range. An x not aligned to the access
+  // faults under every policy, as it does on the card (the ISA leaves it
+  // undefined).
+  std::optional<uint64_t> surface_address(const Instr& ins, uint32_t lane, const TextureDesc& d,
+                                          const std::array<Lanes, 4>& coord, uint32_t dims, uint32_t bytes,
+                                          bool layered, uint8_t oob = kSurfTrap) {
     // A layered surface's first coordinate is its layer. A cubemap surface is
     // read as a layered one, face by face (surfCubemapread compiles to
     // suld.a2d with the face as the layer), so it has 6 -- or 6 x layers.
     const uint32_t first = layered ? 1 : 0;
-    const int64_t x = static_cast<int32_t>(coord[first][lane]);
-    const int64_t y = dims > 1 ? static_cast<int32_t>(coord[first + 1][lane]) : 0;
-    const int64_t z = dims > 2 ? static_cast<int32_t>(coord[first + 2][lane]) : 0;
+    int64_t x = static_cast<int32_t>(coord[first][lane]);
+    int64_t y = dims > 1 ? static_cast<int32_t>(coord[first + 1][lane]) : 0;
+    int64_t z = dims > 2 ? static_cast<int32_t>(coord[first + 2][lane]) : 0;
+    if (oob != kSurfTrap && x % static_cast<int64_t>(bytes) != 0)
+      ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
+               "surface access at byte x=" + std::to_string(x) + " is not aligned to its " +
+                   std::to_string(bytes) + "-byte size (an RTX 3060 faults; the ISA leaves it undefined)");
     uint64_t layer_base = d.base;
     if (layered) {
       const uint64_t layers = d.cubemap ? 6 * std::max<uint64_t>(d.layers, 1) : d.layers;
@@ -5360,7 +5376,9 @@ class Interpreter {
         ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
                  std::string("a ") + (dims == 1 ? "1D" : "2D") + " layered access (.a" +
                      (dims == 1 ? "1d" : "2d") + ") on a " + (d.height ? "2D" : "1D") + " layered surface");
-      const uint64_t layer = static_cast<uint32_t>(coord[0][lane]);
+      uint64_t layer = static_cast<uint32_t>(coord[0][lane]);
+      if (layer >= layers && oob == kSurfZero) return std::nullopt;
+      if (layer >= layers && oob == kSurfClamp) layer = layers - 1;
       if (layer >= layers)
         ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
                  "surface layer " + std::to_string(layer) + " is past the surface's " +
@@ -5375,6 +5393,19 @@ class Interpreter {
     // ".trap" is the out-of-range policy ptxas emits, and it means what it
     // says: the access faults rather than being clamped or dropped.
     const int64_t row_bytes = static_cast<int64_t>(uint64_t{d.width} * d.texel_bytes);
+    const int64_t size = bytes;
+    const bool out = x < 0 || x + size > row_bytes || (d.height && (y < 0 || y >= static_cast<int64_t>(d.height))) ||
+                     (d.depth && (z < 0 || z >= static_cast<int64_t>(d.depth)));
+    if (out && oob == kSurfZero) return std::nullopt;
+    if (out && oob == kSurfClamp) {
+      if (row_bytes < size)
+        ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                 "a .clamp surface access of " + std::to_string(size) + " bytes on a row of " +
+                     std::to_string(row_bytes) + ": no position holds it, and what the card does was not measured");
+      x = std::clamp<int64_t>(x, 0, (row_bytes - size) / size * size);
+      if (d.height) y = std::clamp<int64_t>(y, 0, static_cast<int64_t>(d.height) - 1);
+      if (d.depth) z = std::clamp<int64_t>(z, 0, static_cast<int64_t>(d.depth) - 1);
+    }
     if (x < 0 || x + static_cast<int64_t>(bytes) > row_bytes ||
         (d.height && (y < 0 || y >= static_cast<int64_t>(d.height))) ||
         (d.depth && (z < 0 || z >= static_cast<int64_t>(d.depth))))
@@ -5398,11 +5429,15 @@ class Interpreter {
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Surface);
-      const uint64_t base = surface_address(ins, lane, d, coord, op.dims,
-                                            op.bytes * static_cast<uint32_t>(op.dsts.size()), op.layered);
+      const std::optional<uint64_t> base = surface_address(
+          ins, lane, d, coord, op.dims, op.bytes * static_cast<uint32_t>(op.dsts.size()), op.layered, op.oob);
       for (size_t c = 0; c < op.dsts.size(); ++c) {
+        if (!base) {   // .zero, out of range
+          out[c][lane] = 0;
+          continue;
+        }
         try {
-          out[c][lane] = mem_.load_scalar(base + c * op.bytes, op.bytes);
+          out[c][lane] = mem_.load_scalar(*base + c * op.bytes, op.bytes);
         } catch (const Error& e) {
           rethrow_with_context(e, ins, static_cast<int>(lane));
         }
@@ -5428,11 +5463,12 @@ class Interpreter {
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, obj[lane], TexKind::Surface);
-      const uint64_t base = surface_address(ins, lane, d, coord, op.dims,
-                                            op.bytes * static_cast<uint32_t>(op.srcs.size()), op.layered);
+      const std::optional<uint64_t> base = surface_address(
+          ins, lane, d, coord, op.dims, op.bytes * static_cast<uint32_t>(op.srcs.size()), op.layered, op.oob);
+      if (!base) continue;   // .zero, out of range: the store is dropped
       for (size_t c = 0; c < op.srcs.size(); ++c) {
         try {
-          mem_.store_scalar(base + c * op.bytes, op.bytes, src[c][lane]);
+          mem_.store_scalar(*base + c * op.bytes, op.bytes, src[c][lane]);
         } catch (const Error& e) {
           rethrow_with_context(e, ins, static_cast<int>(lane));
         }
