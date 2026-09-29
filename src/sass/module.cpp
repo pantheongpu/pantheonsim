@@ -231,14 +231,22 @@ std::string unsupported(const uint8_t* image, size_t size) {
 
 std::vector<std::string> reachable(const Module& m, const std::string& kernel) {
   std::vector<std::string> out, todo{kernel};
+  const auto add = [&](const std::string& callee) {
+    if (callee == kernel || std::find(out.begin(), out.end(), callee) != out.end()) return;
+    out.push_back(callee);
+    todo.push_back(callee);
+  };
   while (!todo.empty()) {
     const std::string f = todo.back();
     todo.pop_back();
     for (const auto& [caller, callee] : m.cubin.calls)
-      if (caller == f && std::find(out.begin(), out.end(), callee) == out.end()) {
-        out.push_back(callee);
-        todo.push_back(callee);
-      }
+      if (caller == f) add(callee);
+    // CUDA 12.0's cubins name a call to malloc, free or vprintf only in the
+    // relocation of its CALL.ABS.NOINC, not in the call graph.
+    for (const CubinSection& s : m.cubin.sections)
+      if (s.name == ".text." + f)
+        for (const CubinReloc& r : s.relocs)
+          if (r.type == 58 || r.type == 75) add(r.symbol);
   }
   return out;
 }

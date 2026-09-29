@@ -45,7 +45,11 @@ int main() {
     const int b = i / 128 * 128, t = i % 128;
     const float v = hx[b + (t + 1) % 128] * 2.0f + 1.0f;
     const float want_y = v > 10.0f ? std::sqrt(v) : v * v;
-    const int want_z = (hk[i] << 3) ^ (hk[i] >> 1) + __builtin_popcount(hk[i]) + hk[i ^ 1];
+    // In unsigned arithmetic, as the device wraps (a negative int's left
+    // shift and overflowing sum are undefined in C++); >> stays arithmetic.
+    const unsigned u = static_cast<unsigned>(hk[i]);
+    const int want_z = static_cast<int>(
+        (u << 3) ^ (static_cast<unsigned>(hk[i] >> 1) + __builtin_popcount(u) + static_cast<unsigned>(hk[i ^ 1])));
     if (hy[i] != want_y || hz[i] != want_z) ++bad;
   }
   std::printf("wrong: %d\n", bad);
