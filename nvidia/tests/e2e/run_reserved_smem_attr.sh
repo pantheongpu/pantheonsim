@@ -20,6 +20,9 @@ read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
 "$nvcc_bin" -std=c++17 -arch=sm_75 -cudart shared -Wno-deprecated-gpu-targets "${san_flags[@]}" \
      "$root/nvidia/tests/e2e/reserved_smem_attr.cu" -L"$shim" -lcuda -o "$out" || { echo "FAIL: does not compile"; exit 1; }
 if ! require_shim_libs "$shim" "$out"; then exit 0; fi
+# Both libraries carry the simulator's core, which a sanitizer build reports as
+# an ODR violation when one program loads the two (as run_mixed_apis.sh skips).
+if [[ -n "$(shim_sanitizer "$shim")" ]]; then echo "SKIP: a sanitizer build loads two copies of the core"; exit 0; fi
 fail=0
 check() {  # check <gpu> <expected line>
   local got

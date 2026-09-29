@@ -10937,7 +10937,14 @@ class Interpreter {
             const double y = std::bit_cast<double>(b);
             double res = x;
             switch (op.op) {
-              case AtomOp::Add: res = x + y; break;
+              // A NaN comes through as it is, signalling or not: the one
+              // added if that is a NaN, else the one in memory (an RTX 3060).
+              // Left to the host's +, which NaN survived depended on the
+              // operand order the compiler chose, and a sanitizer build chose
+              // differently.
+              case AtomOp::Add:
+                res = std::isnan(y) ? y : std::isnan(x) ? x : x + y;
+                break;
               case AtomOp::Exch: res = y; break;
               case AtomOp::Min: res = std::fmin(x, y); break;
               case AtomOp::Max: res = std::fmax(x, y); break;

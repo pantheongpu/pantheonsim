@@ -3538,6 +3538,43 @@ VTEST(atom_cas_compares_with_b_and_stores_c) {
 // rounded product is 1 and the sum 0; fused, the result is -2^-46. What the
 // card measurably leaves alone stays unfused: an explicit .rn, and a product
 // also used some other way.
+// atom.add.f64 with a NaN keeps the NaN as it is, signalling or not: the
+// value added if it is a NaN, otherwise the one in memory (an RTX 3060).
+VTEST(atom_add_f64_passes_a_nan_through_unchanged) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 g, .param .u64 x)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<8>;
+    .reg .f64 %fd<4>;
+    ld.param.u64 %rd1, [g];
+    ld.param.u64 %rd2, [x];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 8;
+    add.u64 %rd4, %rd1, %rd3;
+    add.u64 %rd5, %rd2, %rd3;
+    ld.global.f64 %fd1, [%rd5];
+    atom.global.add.f64 %fd2, [%rd4], %fd1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t qa = 0x7ff8000000000123ull, qb = 0xfff8000000000456ull, sa = 0x7ff0000000000789ull,
+                 one = 0x3ff0000000000000ull;
+  const uint64_t old[8] = {qa, one, qa, qb, sa, one, qb, sa}, add[8] = {one, qa, qb, qa, one, sa, sa, qb};
+  const uint64_t want[8] = {qa, qa, qb, qa, sa, sa, sa, qb};
+  const uint64_t g = e.mem.alloc(64), x = e.mem.alloc(64);
+  e.mem.write(g, old, 64);
+  e.mem.write(x, add, 64);
+  LaunchConfig cfg;
+  cfg.block = {8, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(g), arg_u64(x)}, e.mem, e.prof);
+  for (int i = 0; i < 8; ++i) VCHECK_EQ(e.mem.load_scalar(g + 8 * i, 8), want[i]);
+}
+
 VTEST(mul_add_contract_as_the_code_generator_fuses_them) {
   std::string ptx = std::string(kHeader) + R"(
 .visible .entry k(.param .u64 out)
