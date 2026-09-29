@@ -10,6 +10,7 @@
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
+#include "vgpu/runtime/runtime.hpp"
 #include <array>
 #include <cmath>
 #include "vtest.hpp"
@@ -1921,6 +1922,84 @@ SKIP:
   cfg.block = {32, 1, 1};
   auto err = VCAPTURE(Error, exec::launch(*k, cfg, {}, mem, prof));
   VCHECK_CONTAINS(err.what(), "needs lanes that did not make the call");
+}
+
+// An indirect call whose lanes hold different targets: each target runs for
+// its own lanes, each lane gets its own return value back in the one slot,
+// and the warp carries on together.
+VTEST(an_indirect_call_with_a_target_per_lane_runs_each_target) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.func (.param .b32 r) twice(.param .b32 a)
+{
+  .reg .b32 %r<3>;
+  ld.param.b32 %r1, [a];
+  shl.b32 %r2, %r1, 1;
+  st.param.b32 [r], %r2;
+  ret;
+}
+.func (.param .b32 r) plus100(.param .b32 a)
+{
+  .reg .b32 %r<3>;
+  ld.param.b32 %r1, [a];
+  add.u32 %r2, %r1, 100;
+  st.param.b32 [r], %r2;
+  ret;
+}
+.func (.param .b32 r) negate(.param .b32 a)
+{
+  .reg .b32 %r<3>;
+  ld.param.b32 %r1, [a];
+  neg.s32 %r2, %r1;
+  st.param.b32 [r], %r2;
+  ret;
+}
+.global .align 8 .u64 table[3] = {twice, plus100, negate};
+.visible .entry k(.param .u64 p)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<10>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  rem.u32 %r2, %r1, 3;
+  mov.u64 %rd3, table;
+  mul.wide.u32 %rd4, %r2, 8;
+  add.u64 %rd5, %rd3, %rd4;
+  ld.global.u64 %rd6, [%rd5];
+  {
+  .param .b32 a0;
+  st.param.b32 [a0], %r1;
+  .param .b32 r0;
+  proto: .callprototype (.param .b32 _) _ (.param .b32 _);
+  call (r0), %rd6, (a0), proto;
+  ld.param.b32 %r3, [r0];
+  }
+  activemask.b32 %r4;
+  mul.wide.u32 %rd7, %r1, 8;
+  add.u64 %rd8, %rd2, %rd7;
+  st.global.u32 [%rd8], %r3;
+  st.global.u32 [%rd8+4], %r4;
+  ret;
+}
+)";
+  // Through the runtime, which places the module's globals: the table's
+  // initialiser is a list of function addresses.
+  runtime::Runtime rt(load_gpu("nvidia/a10"));
+  auto& dev = rt.device(0);
+  uint64_t mod = dev.load_module(kPtx);
+  const ptx::EntryFn* fn = dev.get_function(mod, "k");
+  uint64_t out = dev.memory().alloc(32 * 8);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  dev.launch(*fn, cfg, {arg_u64(out)}, dev.symbols(mod));
+  for (uint32_t t = 0; t < 32; ++t) {
+    const uint32_t want = t % 3 == 0 ? 2 * t : t % 3 == 1 ? t + 100 : static_cast<uint32_t>(-static_cast<int32_t>(t));
+    VCHECK_EQ(dev.memory().load_scalar(out + 8 * t, 4), uint64_t{want});
+    VCHECK_EQ(dev.memory().load_scalar(out + 8 * t + 4, 4), uint64_t{0xffffffffu});
+  }
 }
 
 // ---- cp.async ----

@@ -260,9 +260,13 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   [param0+8]` lands where it should. Indirect calls work too: device functions
   have addresses in a window of their own, an array global can be initialised
   with a list of symbols (`= {f, g, h}` -- a function-pointer table), and a
-  call through a register resolves the address back to the function. All
-  participating lanes must agree on the target; a divergent function pointer
-  is refused rather than picking one body and running it for everyone.
+  call through a register resolves the address back to the function. Lanes
+  may call different targets -- a virtual call over objects of different
+  types: the lanes that share the first lane's target make the call, the
+  rest split off at the call and take the next target, and the paths merge
+  after it, each lane with its own return value
+  (e2e_divergent_indirect_calls, virtual methods and a per-lane
+  function-pointer table at -O3 and -G; an RTX 3060 passes both).
 - Builtins a kernel can call: `vprintf`, `__assertfail` (a failed `assert()`
   reports its message and source location, and `cudaErrorAssert`), and the
   device heap -- `malloc`/`free` from inside a kernel, backed by the same

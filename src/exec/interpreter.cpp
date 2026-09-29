@@ -10021,10 +10021,11 @@ class Interpreter {
   // module's function table, so decoding one is arithmetic rather than a
   // lookup that could go stale.
   //
-  // Every participating lane must agree on the target. Divergent function
-  // pointers are legal PTX and would need the call split per target with the
-  // mask narrowed each time; nothing has produced that yet, and guessing which
-  // callee "wins" would run the wrong body for some lanes silently.
+  // Lanes may hold different targets -- a virtual call over objects of
+  // different types. The lanes that share the first lane's target make the
+  // call; the others split off as a path of their own still at the call, which
+  // runs next time round with the next target, and the paths merge after it
+  // as any diverged paths do.
   void exec_indirect_call(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op,
                           Mask m) {
     Lanes _s_t;
@@ -10034,10 +10035,9 @@ class Interpreter {
       if (m & (Mask{1} << lane)) { lead = lane; break; }
     if (lead >= W_) return;
     const uint64_t addr = target[lead];
+    Mask same = 0;
     for (uint32_t lane = 0; lane < W_; ++lane)
-      if ((m & (Mask{1} << lane)) && target[lane] != addr)
-        ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
-                 "indirect call with a different target per lane is not supported");
+      if ((m & (Mask{1} << lane)) && target[lane] == addr) same |= Mask{1} << lane;
     if (addr < kFuncVaBase || addr >= kFuncVaBase + kFuncVaSize ||
         (addr - kFuncVaBase) % kFuncVaStride != 0)
       ctx_fail(ins, static_cast<int>(lead), Err::InvalidPointer,
@@ -10047,10 +10047,16 @@ class Interpreter {
       ctx_fail(ins, static_cast<int>(lead), Err::InvalidPointer,
                "indirect call to function index " + std::to_string(index) +
                    ", which this module does not define");
+    if (same != m) {
+      Path rest = w.paths[step_idx_];
+      rest.mask &= ~same;
+      w.paths[step_idx_].mask = same;
+      w.paths.push_back(rest);
+    }
     OpCall resolved = op;
     resolved.target = fn_.module_funcs[static_cast<size_t>(index)];
     resolved.indirect = false;
-    exec_user_call(w, ctx, ins, resolved, m);
+    exec_user_call(w, ctx, ins, resolved, same);
   }
 
   // ---- calls to device functions ----
