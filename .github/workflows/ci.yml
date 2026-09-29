@@ -117,9 +117,11 @@ jobs:
     # job builds against CUDA 13 and runs the SASS tests: the decoder against
     # nvdisasm's corpora, which code a binary runs, and programs built for
     # each generation's SASS run on that generation's GPU and checked against
-    # their PTX (nvidia/tests/e2e/run_sass_archs.sh).
+    # their PTX (nvidia/tests/e2e/run_sass_archs.sh). A run started by hand
+    # with cutlass_sass also builds the CUTLASS tests' SASS (sm_90a, sm_100a,
+    # sm_120a) and requires it to run, which takes a few hours.
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: ${{ inputs.cutlass_sass && 330 || 60 }}
     env:
       NVCC_PREPEND_FLAGS: ''
     steps:
@@ -151,6 +153,17 @@ jobs:
           ctest --test-dir build --verbose -R '^(test_sass_decode|e2e_sass_path|e2e_sass_archs)$' 2>&1 | tee sass.log
           if grep -E '\*\*\*Skipped|SKIP' sass.log; then
             echo "::error::a SASS test skipped; this job installs what they need"; exit 1
+          fi
+
+      - name: CUTLASS on SASS
+        if: inputs.cutlass_sass
+        env:
+          VGPU_CUTLASS_SASS: '1'
+        run: |
+          set -o pipefail
+          ctest --test-dir build --output-on-failure -R '^e2e_cutlass_(hopper|gemm|sm100|sm120)$' 2>&1 | tee cutlass.log
+          if grep -E '\*\*\*Skipped' cutlass.log; then
+            echo "::error::a CUTLASS test skipped; this job installs what they need"; exit 1
           fi
 
   ollama:
@@ -302,8 +315,6 @@ jobs:
     if: vars.ML_RUNS_ON != ''
     runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: 240
-    env:
-      VGPU_CUTLASS_SASS: ${{ inputs.cutlass_sass && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
 
