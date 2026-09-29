@@ -3527,6 +3527,40 @@ VTEST(atom_cas_compares_with_b_and_stores_c) {
 // keeping a NaN's sign and payload.
 // and/or/xor.pred with an immediate source, which nvcc emits for a negation
 // (CUDA Samples' cdpAdvancedQuicksort: `xor.pred %p212, %p260, -1`).
+// A 32-bit shared address is register plus offset in 32 bits. nvcc leaves a
+// "negative" base in the register and brings it back with the offset --
+// Rodinia's needle computes %r4 = temp - 64 for a thread of the second row
+// and loads [%r4+68]. Adding in 64 bits carried the address out of the
+// shared window altogether.
+VTEST(a_32_bit_address_wraps_register_plus_offset) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    .shared .align 4 .b8 buf[64];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, buf;
+    st.shared.u32 [%r1+4], 1234;
+    st.shared.u32 [%r1+60], 5678;
+    sub.u32 %r2, %r1, 64;          // below the window's start in 32 bits
+    ld.shared.u32 %r3, [%r2+68];   // buf + 4
+    sub.u32 %r4, %r1, 1000;
+    ld.shared.u32 %r5, [%r4+1060]; // buf + 60
+    st.global.u32 [%rd2], %r3;
+    st.global.u32 [%rd2+4], %r5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(8);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{1234});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{5678});
+}
+
 VTEST(predicate_logic_takes_an_immediate) {
   std::string ptx = std::string(kHeader) + R"(
 .visible .entry k(.param .u64 out)

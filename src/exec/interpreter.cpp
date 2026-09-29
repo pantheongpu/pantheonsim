@@ -9318,7 +9318,17 @@ class Interpreter {
     if (a.base_id >= w.regs32.size() || !w.written32[a.base_id])
       ctx_fail(ins, -1, Err::UninitializedRegister,
                "address register " + a.base + " read before any write");
-    return widen(w, w.regs32[a.base_id]);
+    if (a.offset == 0) return widen(w, w.regs32[a.base_id]);
+    // A 32-bit address is register plus offset in 32 bits: nvcc leaves a
+    // "negative" base in the register and brings it back with the offset
+    // (Rodinia's needle: [%r4+68] with %r4 = temp - 64 for a thread of the
+    // second row). Every caller adds the offset to what this returns, so the
+    // base comes back as the wrapped sum less the offset.
+    const auto& r = w.regs32[a.base_id];
+    const uint64_t off = static_cast<uint64_t>(a.offset);
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      scratch[lane] = uint64_t{static_cast<uint32_t>(r[lane] + static_cast<uint32_t>(off))} - off;
+    return scratch;
   }
 
   // ---- cp.async ----
