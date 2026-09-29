@@ -127,6 +127,7 @@ add_library(vgpu STATIC
   amd/src/bundle.cpp
   amd/src/codeobject.cpp
   amd/src/gcn_decode.cpp
+  src/sass/decode.cpp
   amd/src/rdna_decode.cpp
   amd/src/debugger.cpp
   amd/src/gcn_exec.cpp
@@ -680,6 +681,8 @@ add_test(NAME host_cpus COMMAND ${CMAKE_SOURCE_DIR}/tests/host_cpus/run_host_cpu
 vgpu_unit_test(test_amd_codeobject amd/tests/unit/test_codeobject.cpp)
 target_compile_definitions(test_amd_codeobject PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # CDNA machine code, decoded and checked against what the assembler wrote.
+vgpu_unit_test(test_sass_decode nvidia/tests/unit/test_sass_decode.cpp)
+target_compile_definitions(test_sass_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn amd/tests/unit/test_gcn.cpp)
 target_compile_definitions(test_amd_gcn PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # And run: a wavefront over that machine code, against device memory.
