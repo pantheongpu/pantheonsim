@@ -4,8 +4,12 @@
 # rounding and .xorsign.abs modifiers, the half-precision modifiers, and the
 # cvt forms with .relu, .rz and tf32 -- each over the same 256 operand triples.
 import os
-V = []   # (tag, asm using %0=d %1=a %2=b %3=c)
-def add(tag, asm): V.append((tag, asm))
+V = []   # (tag, asm using %0=d %1=a %2=b %3=c, oldest CUDA whose ptxas takes it)
+# The needs value is major*10+minor. Variants a toolkit's ptxas does not know
+# are compiled out there and reported as not built, not as passing: CI's
+# hosted jobs use Ubuntu's CUDA 12.0, and cvt's .satfinite on f16x2/bf16x2
+# came with PTX ISA 8.1 (CUDA 12.1).
+def add(tag, asm, needs=0): V.append((tag, asm, needs))
 for m in ('f4e', 'b4e', 'rc8', 'ecl', 'ecr', 'rc16'):
     add('prmt.' + m, 'prmt.b32.' + m + ' %0, %1, %2, %3;')
 for bop in ('and', 'or', 'xor'):
@@ -52,7 +56,8 @@ add('fma.rn.relu.bf16x2', 'fma.rn.relu.bf16x2 %0, %1, %2, %3;')
 P = '{ .reg .f32 a,b; mov.b32 a, %1; mov.b32 b, %2; OP; }'
 for t in ('f16x2', 'bf16x2'):
     for mod in ('rn', 'rz', 'rn.relu', 'rz.relu', 'rn.satfinite', 'rz.relu.satfinite'):
-        add('cvt.%s.%s.f32' % (mod, t), P.replace('OP', 'cvt.%s.%s.f32 %%0, a, b' % (mod, t)))
+        add('cvt.%s.%s.f32' % (mod, t), P.replace('OP', 'cvt.%s.%s.f32 %%0, a, b' % (mod, t)),
+            121 if 'satfinite' in mod else 0)
 for t in ('f16', 'bf16'):
     add('cvt.rn.relu.%s.f32' % t, '{ .reg .f32 a; .reg .b16 h; mov.b32 a, %1; cvt.rn.relu.' + t + '.f32 h, a; mov.b32 %0, {h, h}; }')
 add('cvt.rna.tf32.f32', '{ .reg .f32 a; mov.b32 a, %1; cvt.rna.tf32.f32 %0, a; }')
@@ -72,20 +77,25 @@ static const Expected kExpected[] = {
 #include "ptx_forms_expected.inc"
 };
 constexpr int kN = 256;
+#define CUDA_VER (__CUDACC_VER_MAJOR__ * 10 + __CUDACC_VER_MINOR__)
 __global__ void k(int v, const unsigned* in, unsigned* out) {
   const int i = threadIdx.x;
   const unsigned a = in[3 * i], b = in[3 * i + 1], c = in[3 * i + 2];
   unsigned d = 0;
   switch (v) {''']
-for n, (tag, asm) in enumerate(V):
-    out.append('    case %d: asm volatile("%s" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;' % (n, asm.replace('"', '\\"')))
+for n, (tag, asm, needs) in enumerate(V):
+    line = '    case %d: asm volatile("%s" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;' % (n, asm.replace('"', '\\"'))
+    if needs:
+        line = '#if CUDA_VER >= %d\n%s\n#endif' % (needs, line)
+    out.append(line)
 out.append('''  }
   out[i] = d;
 }
 static const char* kTags[] = {''')
-for tag, asm in V:
+for tag, asm, needs in V:
     out.append('  "%s",' % tag)
 out.append('''};
+static const int kNeeds[] = {''' + ', '.join(str(n) for _, _, n in V) + '''};
 int main(int argc, char** argv) {
   const bool print = argc > 1 && std::strcmp(argv[1], "--print") == 0;
   const int dump = argc > 2 && std::strcmp(argv[1], "--dump") == 0 ? atoi(argv[2]) : -1;
@@ -108,8 +118,14 @@ int main(int argc, char** argv) {
   cudaMalloc(&din, sizeof h);
   cudaMalloc(&dout, kN * 4);
   cudaMemcpy(din, h, sizeof h, cudaMemcpyHostToDevice);
-  int bad = 0;
+  int bad = 0, unbuilt = 0;
   for (int v = 0; v < nv; ++v) {
+    if (kNeeds[v] > CUDA_VER) {
+      if (print) { printf("    {\\"%s\\", 0x0ull},  // not built by this toolkit\\n", kTags[v]); continue; }
+      printf("%s: not built (needs CUDA %d.%d)\\n", kTags[v], kNeeds[v] / 10, kNeeds[v] % 10);
+      ++unbuilt;
+      continue;
+    }
     k<<<1, kN>>>(v, din, dout);
     if (cudaDeviceSynchronize() != cudaSuccess) { printf("variant %d (%s) failed to run\\n", v, kTags[v]); return 1; }
     unsigned o[kN];
@@ -129,7 +145,8 @@ int main(int argc, char** argv) {
   }
   if (print) return 0;
   const int ne = sizeof kExpected / sizeof kExpected[0];
-  printf("%d PTX forms, %d differ\\n%s\\n", nv, bad, bad || ne != nv ? "FAIL" : "PASS");
+  printf("%d PTX forms, %d differ, %d not built by this toolkit\\n%s\\n", nv, bad, unbuilt,
+         bad || ne != nv ? "FAIL" : "PASS");
   return bad ? 1 : 0;
 }''')
 open(os.path.join(os.path.dirname(__file__) or '.', 'ptx_forms.cu'), 'w').write('\n'.join(out) + '\n')
