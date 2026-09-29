@@ -488,6 +488,86 @@ vgpu::MemoryManager& owner_memory(State& s, const void* p) {
   return current(s).memory();
 }
 
+// A linked-in piece's file-scope names -- module variables and functions
+// not declared .visible, .extern or .weak -- belong to that piece alone,
+// the way an object file's local symbols do. Pasted together they did
+// not: every translation unit names its first string literal $str, and
+// CUDA's device-runtime library, always one of the pieces, has a $str of
+// its own ("cudaSuccess"). Its definition won, so a program's string
+// literal read as the library's (NanoVDB's device strcmp returned 17 for
+// two equal strings: 't' - 'c'). Renaming each linked-in piece's locals
+// keeps them apart. nvcc's __nv_static_ names are already unique, and the
+// host registers them by name, so they are left alone.
+void localize_ptx(std::string& text, size_t piece) {
+  auto id_char = [](char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+  };
+  auto starts = [](const std::string& line, const char* word) {
+    return line.compare(0, std::strlen(word), word) == 0;
+  };
+  std::set<std::string> locals;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t eol = text.find('\n', pos);
+    if (eol == std::string::npos) eol = text.size();
+    const std::string line = text.substr(pos, eol - pos);
+    pos = eol + 1;
+    // Module-scope declarations start in column 0; a function's own
+    // .shared or .local is indented and stays where it is.
+    const bool func = starts(line, ".func");
+    if (!func && !starts(line, ".global") && !starts(line, ".const")) continue;
+    std::string name;
+    size_t i = func ? 5 : 0;
+    if (func) {
+      while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+      if (i < line.size() && line[i] == '(') {  // the return parameter list
+        const size_t close = line.find(')', i);
+        if (close == std::string::npos) continue;
+        i = close + 1;
+      }
+      while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+      size_t j = i;
+      while (j < line.size() && id_char(line[j])) ++j;
+      name = line.substr(i, j - i);
+    } else {
+      // ".global .align 8 .u64 name[8] = {...};": the first token that is
+      // neither a directive nor a number.
+      std::istringstream toks(line);
+      std::string tok;
+      while (toks >> tok) {
+        if (tok[0] == '.' || std::isdigit(static_cast<unsigned char>(tok[0]))) continue;
+        size_t j = 0;
+        while (j < tok.size() && id_char(tok[j])) ++j;
+        name = tok.substr(0, j);
+        break;
+      }
+    }
+    if (!name.empty() && name.compare(0, 12, "__nv_static_") != 0) locals.insert(name);
+  }
+  if (locals.empty()) return;
+  const std::string suffix = "$vgpu" + std::to_string(piece);
+  std::string out;
+  out.reserve(text.size() + locals.size() * 16);
+  for (size_t k = 0; k < text.size();) {
+    const char c = text[k];
+    // An identifier starts with a letter, '_' or '$'; a register (after
+    // '%') or a number is copied through untouched.
+    if ((std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$') &&
+        (k == 0 || (!id_char(text[k - 1]) && text[k - 1] != '%'))) {
+      size_t j = k;
+      while (j < text.size() && id_char(text[j])) ++j;
+      const std::string word = text.substr(k, j - k);
+      out += word;
+      if (locals.count(word)) out += suffix;
+      k = j;
+    } else {
+      out += c;
+      ++k;
+    }
+  }
+  text = std::move(out);
+}
+
 // The PTX a registered fatbin holds for this machine's devices: the image the
 // driver would JIT (pick_ptx), or, for a separately compiled (-rdc) build,
 // its relocatable pieces put together. Empty where there is none.
@@ -562,7 +642,10 @@ std::string extract_registered_ptx(State& s, const void* fatCubin) {
         // module built for sm_80 claim to target sm_121 and be refused on an
         // A100 -- with an error about the *device* being too old, which is
         // the opposite of what had happened.
-        if (pieces > 0) text = strip_ptx_header(text);
+        if (pieces > 0) {
+          text = strip_ptx_header(text);
+          localize_ptx(text, pieces);
+        }
         linked += text;
         linked += "\n";
         ++pieces;
@@ -691,176 +774,6 @@ VGPU_EXPORT void** __cudaRegisterFatBinary(void* fatCubin) {
     ensure_init(s);
     auto rm = std::make_unique<RegisteredModule>();
     rm->fatbin = fatCubin;
-    // fatCubin is a __fatBinC_Wrapper_t*; extract the best PTX image.
-    // A linked-in piece's file-scope names -- module variables and functions
-    // not declared .visible, .extern or .weak -- belong to that piece alone,
-    // the way an object file's local symbols do. Pasted together they did
-    // not: every translation unit names its first string literal $str, and
-    // CUDA's device-runtime library, always one of the pieces, has a $str of
-    // its own ("cudaSuccess"). Its definition won, so a program's string
-    // literal read as the library's (NanoVDB's device strcmp returned 17 for
-    // two equal strings: 't' - 'c'). Renaming each linked-in piece's locals
-    // keeps them apart. nvcc's __nv_static_ names are already unique, and the
-    // host registers them by name, so they are left alone.
-    auto localize_ptx = [](std::string& text, size_t piece) {
-      auto id_char = [](char c) {
-        return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
-      };
-      auto starts = [](const std::string& line, const char* word) {
-        return line.compare(0, std::strlen(word), word) == 0;
-      };
-      std::set<std::string> locals;
-      size_t pos = 0;
-      while (pos < text.size()) {
-        size_t eol = text.find('\n', pos);
-        if (eol == std::string::npos) eol = text.size();
-        const std::string line = text.substr(pos, eol - pos);
-        pos = eol + 1;
-        // Module-scope declarations start in column 0; a function's own
-        // .shared or .local is indented and stays where it is.
-        const bool func = starts(line, ".func");
-        if (!func && !starts(line, ".global") && !starts(line, ".const")) continue;
-        std::string name;
-        size_t i = func ? 5 : 0;
-        if (func) {
-          while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
-          if (i < line.size() && line[i] == '(') {  // the return parameter list
-            const size_t close = line.find(')', i);
-            if (close == std::string::npos) continue;
-            i = close + 1;
-          }
-          while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
-          size_t j = i;
-          while (j < line.size() && id_char(line[j])) ++j;
-          name = line.substr(i, j - i);
-        } else {
-          // ".global .align 8 .u64 name[8] = {...};": the first token that is
-          // neither a directive nor a number.
-          std::istringstream toks(line);
-          std::string tok;
-          while (toks >> tok) {
-            if (tok[0] == '.' || std::isdigit(static_cast<unsigned char>(tok[0]))) continue;
-            size_t j = 0;
-            while (j < tok.size() && id_char(tok[j])) ++j;
-            name = tok.substr(0, j);
-            break;
-          }
-        }
-        if (!name.empty() && name.compare(0, 12, "__nv_static_") != 0) locals.insert(name);
-      }
-      if (locals.empty()) return;
-      const std::string suffix = "$vgpu" + std::to_string(piece);
-      std::string out;
-      out.reserve(text.size() + locals.size() * 16);
-      for (size_t k = 0; k < text.size();) {
-        const char c = text[k];
-        // An identifier starts with a letter, '_' or '$'; a register (after
-        // '%') or a number is copied through untouched.
-        if ((std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$') &&
-            (k == 0 || (!id_char(text[k - 1]) && text[k - 1] != '%'))) {
-          size_t j = k;
-          while (j < text.size() && id_char(text[j])) ++j;
-          const std::string word = text.substr(k, j - k);
-          out += word;
-          if (locals.count(word)) out += suffix;
-          k = j;
-        } else {
-          out += c;
-          ++k;
-        }
-      }
-      text = std::move(out);
-    };
-    // Drops the leading .version/.target/.address_size directives from a
-    // linked-in piece, so the first piece's header describes the whole module.
-    auto strip_ptx_header = [](const std::string& text) {
-      size_t pos = 0;
-      while (pos < text.size()) {
-        const size_t eol = text.find('\n', pos);
-        const size_t len = (eol == std::string::npos ? text.size() : eol) - pos;
-        std::string line = text.substr(pos, len);
-        size_t a = line.find_first_not_of(" \t");
-        const bool blank = a == std::string::npos;
-        const bool header = !blank && (line.compare(a, 8, ".version") == 0 ||
-                                       line.compare(a, 7, ".target") == 0 ||
-                                       line.compare(a, 13, ".address_size") == 0 ||
-                                       line.compare(a, 2, "//") == 0);
-        if (!blank && !header) break;
-        if (eol == std::string::npos) return std::string{};
-        pos = eol + 1;
-      }
-      return text.substr(pos);
-    };
-    // The PTX the driver would JIT for this device -- see pick_ptx for the
-    // rule. (Every device of a simulated machine has one profile.)
-    const vgpu::DeviceProfile& dev = s.rt->device(0).profile();
-    const uint32_t cc = static_cast<uint32_t>(dev.cc_major * 10 + dev.cc_minor);
-    auto pick_best = [cc](std::vector<vgpu::cuda::FatbinPtx>& v) -> std::string {
-      if (v.empty()) return {};
-      return std::move(v[vgpu::cuda::pick_ptx(v, cc)].text);
-    };
-    auto ptxs = vgpu::cuda::extract_ptx(fatCubin);
-    rm->ptx = pick_best(ptxs);
-    if (rm->ptx.empty()) {
-      // A separately compiled build (-rdc=true) leaves the primary fatbin
-      // empty -- 16 bytes, just a header -- and puts the real device code in a
-      // list of *relocatable* fatbins hanging off the wrapper's fourth field.
-      // Device linking would normally consume them; with a PTX-only -code
-      // there is nothing for nvlink to link, so the pieces arrive here still
-      // separate and the runtime is expected to put them together.
-      //
-      // The wrapper is
-      //   { int magic; int version; const void* data; void* filename_or_fatbins; }
-      // and that last field is a filename in version 1 and a NULL-terminated
-      // array of fatbin pointers in version 2 -- so the version has to be
-      // checked before it is walked, or a char* gets dereferenced as an array.
-      int version = 0;
-      const void* const* relocatable = nullptr;
-      const uint8_t* wp = static_cast<const uint8_t*>(fatCubin);
-      if (wp) {
-        std::memcpy(&version, wp + 4, 4);
-        if (version >= 2) std::memcpy(&relocatable, wp + 16, 8);
-      }
-      std::string linked;
-      size_t pieces = 0;
-      for (size_t i = 0; relocatable && relocatable[i] && i < 64; ++i) {
-        try {
-          auto part = vgpu::cuda::extract_ptx(relocatable[i]);
-          std::string text = pick_best(part);
-          if (text.empty()) continue;
-          // Concatenated rather than merged: cross-piece references resolve
-          // by name, exactly as they would after a link.
-          //
-          // Every piece carries its own .version/.target/.address_size header,
-          // and only the first one's counts. The first relocatable fatbin is
-          // the translation unit being registered; the rest are libraries
-          // linked into it, compiled for whatever the toolkit's default
-          // architecture happened to be. Letting the last header win made a
-          // module built for sm_80 claim to target sm_121 and be refused on an
-          // A100 -- with an error about the *device* being too old, which is
-          // the opposite of what had happened.
-          if (pieces > 0) {
-            text = strip_ptx_header(text);
-            localize_ptx(text, pieces);
-          }
-          linked += text;
-          linked += "\n";
-          ++pieces;
-        } catch (const std::exception&) {
-          // A piece that will not parse is skipped rather than failing the
-          // whole registration: the others may still hold the kernel.
-        }
-      }
-      rm->ptx = std::move(linked);
-      if (trace() && pieces)
-        std::fprintf(stderr, "[vgpu][trace] linked %zu relocatable PTX pieces (-rdc build)\n",
-                     pieces);
-      if (rm->ptx.empty() && !quiet())
-        std::fprintf(stderr,
-                     "[vgpu] __cudaRegisterFatBinary: no PTX in fatbin (SASS-only build); rebuild "
-                     "with an -arch that embeds PTX\n");
-      // Return a handle anyway; the failure surfaces at launch with context.
-    }
     RegisteredModule* raw = rm.get();
     s.modules.push_back(std::move(rm));
     if (trace()) std::fprintf(stderr, "[vgpu][trace] __cudaRegisterFatBinary -> %p\n", (void*)raw);
