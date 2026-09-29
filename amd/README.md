@@ -66,7 +66,10 @@ driver API's forms, peer copies) with ROCm's rules for who waits, managed
 memory's advice and prefetch, stream-ordered pools that keep freed memory for
 reuse by the rules each pool is set to, pools and their pointers shared with
 another process through a file descriptor, and virtual memory at HIP's 4 KiB
-page granularity. Graphs are the whole of HIP's graph API
+page granularity: memory the simulator keeps on the host (a file where it may
+be shared), mapped in place at the address a reservation set aside on any
+device, exported and imported as a file descriptor, with device memory handed
+out as one where ROCm hands out a dma-buf. Graphs are the whole of HIP's graph API
 (`src/hip_graph.inc`, checked by `tests/hipcc/graphs.cpp`): every node type
 built by hand or captured from streams -- across streams joined by events, in
 each capture mode, with the calls a capture refuses refused as ROCm refuses
