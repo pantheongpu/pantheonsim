@@ -18,8 +18,8 @@ nvcc="${CUDA_HOME:-/usr/local/cuda}/bin/nvcc"
 for arch in sm_75 sm_80 sm_86 sm_89 sm_90 sm_90a sm_100 sm_100a sm_103a sm_120 sm_120a; do
   inputs=()
   [[ -n "$full" && -f "$full/$arch.txt" ]] && inputs+=("$full/$arch.txt")
-  for p in "$data"/probes/*.cu; do
-    out="$tmp/$arch.$(basename "$p" .cu).cubin"
+  for p in "$data"/probes/*.cu "$data"/probes/*.ptx; do
+    out="$tmp/$arch.$(basename "$p").cubin"
     # A probe an architecture cannot compile (wgmma below sm_90a) is skipped.
     "$nvcc" -std=c++17 -arch="$arch" -cubin -w -o "$out" "$p" 2>/dev/null && inputs+=("$out") || true
   done

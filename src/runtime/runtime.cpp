@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cstdio>
 
 #include "vgpu/error.hpp"
@@ -151,6 +152,54 @@ bool split_pieces(const std::string& t, std::vector<Piece>* out) {
     if (braces != 0) return false;
     const Piece::Kind kind = body ? (is_entry ? Piece::Entry : Piece::Func) : Piece::Decl;
     out->push_back({kind, begin, i, body ? name : std::string()});
+  }
+}
+
+// VGPU_KERNEL_DIGEST=<file>: after every launch, a line with the kernel's
+// name and a hash of each allocation its arguments point into (any 8-byte
+// argument word that is a device address). Two runs of one program -- on
+// PTX (VGPU_SASS=0) and on SASS, say -- diverge first at the kernel that
+// wrote something different, which `diff` then names. Run with
+// VGPU_THREADS=1: blocks racing on atomics can otherwise differ run to run.
+void digest_launch(const MemoryManager& mem, const std::string& name, const std::vector<std::vector<uint8_t>>& args) {
+  static const char* const path = std::getenv("VGPU_KERNEL_DIGEST");
+  if (!path || !*path) return;
+  static std::mutex mu;
+  static uint64_t seq = 0;
+  std::map<uint64_t, uint64_t> allocs;   // base -> size
+  for (const std::vector<uint8_t>& a : args)
+    for (size_t i = 0; i + 8 <= a.size(); i += 8) {
+      uint64_t v, base, size;
+      std::memcpy(&v, &a[i], 8);
+      if (v && mem.find_allocation(v, &base, &size)) allocs[base] = size;
+    }
+  std::string line;
+  std::vector<uint8_t> buf;
+  for (const auto& [base, size] : allocs) {
+    uint64_t h = 0xcbf29ce484222325ull;   // FNV-1a
+    uint64_t nans = 0, infs = 0;          // aligned words that are f32 NaNs and infinities: where one first appears
+    for (uint64_t at = 0; at < size;) {
+      const uint64_t n = std::min<uint64_t>(size - at, uint64_t{1} << 20);
+      buf.resize(n);
+      mem.read(base + at, buf.data(), n);
+      for (uint8_t c : buf) h = (h ^ c) * 0x100000001b3ull;
+      for (uint64_t i = 0; i + 4 <= n; i += 4) {
+        uint32_t v;
+        std::memcpy(&v, &buf[i], 4);
+        nans += (v & 0x7f800000u) == 0x7f800000u && (v & 0x7fffffu);
+        infs += (v & 0x7fffffffu) == 0x7f800000u;
+      }
+      at += n;
+    }
+    char b[96];
+    std::snprintf(b, sizeof b, " %llx:%016llx:nan%llu:inf%llu", static_cast<unsigned long long>(base),
+                  static_cast<unsigned long long>(h), static_cast<unsigned long long>(nans), static_cast<unsigned long long>(infs));
+    line += b;
+  }
+  std::lock_guard<std::mutex> g(mu);
+  if (FILE* f = std::fopen(path, "a")) {
+    std::fprintf(f, "%llu %s%s\n", static_cast<unsigned long long>(seq++), name.c_str(), line.c_str());
+    std::fclose(f);
   }
 }
 
@@ -869,6 +918,7 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   }
   try {
     run_kernel(fn, cfg, args, syms);
+    digest_launch(mem_, fn.name, args);
   } catch (const Error& e) {
     if (fault_) {
       try {

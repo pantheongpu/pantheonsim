@@ -1,0 +1,786 @@
+// Decoder probe: wgmma's N, type and sparse encodings, one kernel per form
+// (every N the integer forms take, a spread of the others; every signedness
+// and .satfinite; A in registers; sparse). sm_90a only.
+.version 8.5
+.target sm_90a
+.address_size 64
+.visible .entry k0(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<4>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n8k32.s32.s8.s8 {%r0,%r1,%r2,%r3}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r3;
+ ret;
+}
+.visible .entry k1(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<4>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n8k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r3;
+ ret;
+}
+.visible .entry k2(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<8>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n16k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r7;
+ ret;
+}
+.visible .entry k3(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<8>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n16k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r7;
+ ret;
+}
+.visible .entry k4(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<12>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n24k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r11;
+ ret;
+}
+.visible .entry k5(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<12>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n24k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r11;
+ ret;
+}
+.visible .entry k6(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<16>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n32k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r15;
+ ret;
+}
+.visible .entry k7(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<16>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n32k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r15;
+ ret;
+}
+.visible .entry k8(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<24>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n48k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r23;
+ ret;
+}
+.visible .entry k9(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<24>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n48k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r23;
+ ret;
+}
+.visible .entry k10(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<32>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n64k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r31;
+ ret;
+}
+.visible .entry k11(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<32>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n64k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r31;
+ ret;
+}
+.visible .entry k12(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<40>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n80k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r39;
+ ret;
+}
+.visible .entry k13(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<40>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n80k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r39;
+ ret;
+}
+.visible .entry k14(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<48>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n96k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r47;
+ ret;
+}
+.visible .entry k15(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<48>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n96k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r47;
+ ret;
+}
+.visible .entry k16(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<56>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n112k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r55;
+ ret;
+}
+.visible .entry k17(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<56>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n112k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r55;
+ ret;
+}
+.visible .entry k18(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<64>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n128k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r63;
+ ret;
+}
+.visible .entry k19(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<64>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n128k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r63;
+ ret;
+}
+.visible .entry k20(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<72>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n144k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r71;
+ ret;
+}
+.visible .entry k21(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<72>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n144k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r71;
+ ret;
+}
+.visible .entry k22(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<80>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n160k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r79;
+ ret;
+}
+.visible .entry k23(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<80>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n160k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r79;
+ ret;
+}
+.visible .entry k24(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<88>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n176k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r87;
+ ret;
+}
+.visible .entry k25(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<88>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n176k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r87;
+ ret;
+}
+.visible .entry k26(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<96>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n192k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r95;
+ ret;
+}
+.visible .entry k27(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<96>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n192k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r95;
+ ret;
+}
+.visible .entry k28(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<104>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n208k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95,%r96,%r97,%r98,%r99,%r100,%r101,%r102,%r103}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r103;
+ ret;
+}
+.visible .entry k29(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<104>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n208k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95,%r96,%r97,%r98,%r99,%r100,%r101,%r102,%r103}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r103;
+ ret;
+}
+.visible .entry k30(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<112>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n224k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95,%r96,%r97,%r98,%r99,%r100,%r101,%r102,%r103,%r104,%r105,%r106,%r107,%r108,%r109,%r110,%r111}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r111;
+ ret;
+}
+.visible .entry k31(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<112>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n224k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95,%r96,%r97,%r98,%r99,%r100,%r101,%r102,%r103,%r104,%r105,%r106,%r107,%r108,%r109,%r110,%r111}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r111;
+ ret;
+}
+.visible .entry k32(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<120>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n240k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95,%r96,%r97,%r98,%r99,%r100,%r101,%r102,%r103,%r104,%r105,%r106,%r107,%r108,%r109,%r110,%r111,%r112,%r113,%r114,%r115,%r116,%r117,%r118,%r119}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r119;
+ ret;
+}
+.visible .entry k33(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<120>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n240k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95,%r96,%r97,%r98,%r99,%r100,%r101,%r102,%r103,%r104,%r105,%r106,%r107,%r108,%r109,%r110,%r111,%r112,%r113,%r114,%r115,%r116,%r117,%r118,%r119}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r119;
+ ret;
+}
+.visible .entry k34(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<128>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n256k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95,%r96,%r97,%r98,%r99,%r100,%r101,%r102,%r103,%r104,%r105,%r106,%r107,%r108,%r109,%r110,%r111,%r112,%r113,%r114,%r115,%r116,%r117,%r118,%r119,%r120,%r121,%r122,%r123,%r124,%r125,%r126,%r127}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r127;
+ ret;
+}
+.visible .entry k35(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<128>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n256k256.s32.b1.b1.and.popc {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95,%r96,%r97,%r98,%r99,%r100,%r101,%r102,%r103,%r104,%r105,%r106,%r107,%r108,%r109,%r110,%r111,%r112,%r113,%r114,%r115,%r116,%r117,%r118,%r119,%r120,%r121,%r122,%r123,%r124,%r125,%r126,%r127}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r127;
+ ret;
+}
+.visible .entry k36(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<4>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%r0,%r1,%r2,%r3}, %d0, %d1, 1, 1, 1, 0, 0;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r3;
+ ret;
+}
+.visible .entry k37(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<4>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n8k32.f32.e4m3.e5m2 {%r0,%r1,%r2,%r3}, %d0, %d1, 1, 1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r3;
+ ret;
+}
+.visible .entry k38(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<8>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7}, %d0, %d1, 1, 1, 1, 0, 0;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r7;
+ ret;
+}
+.visible .entry k39(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<8>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n16k32.f32.e4m3.e5m2 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7}, %d0, %d1, 1, 1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r7;
+ ret;
+}
+.visible .entry k40(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<20>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n40k16.f32.f16.f16 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19}, %d0, %d1, 1, 1, 1, 0, 0;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r19;
+ ret;
+}
+.visible .entry k41(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<20>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n40k32.f32.e4m3.e5m2 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19}, %d0, %d1, 1, 1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r19;
+ ret;
+}
+.visible .entry k42(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<32>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31}, %d0, %d1, 1, 1, 1, 0, 0;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r31;
+ ret;
+}
+.visible .entry k43(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<32>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e5m2 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31}, %d0, %d1, 1, 1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r31;
+ ret;
+}
+.visible .entry k44(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<60>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n120k16.f32.f16.f16 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59}, %d0, %d1, 1, 1, 1, 0, 0;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r59;
+ ret;
+}
+.visible .entry k45(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<60>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n120k32.f32.e4m3.e5m2 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59}, %d0, %d1, 1, 1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r59;
+ ret;
+}
+.visible .entry k46(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<64>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63}, %d0, %d1, 1, 1, 1, 0, 0;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r63;
+ ret;
+}
+.visible .entry k47(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<64>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e5m2 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63}, %d0, %d1, 1, 1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r63;
+ ret;
+}
+.visible .entry k48(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<100>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n200k16.f32.f16.f16 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95,%r96,%r97,%r98,%r99}, %d0, %d1, 1, 1, 1, 0, 0;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r99;
+ ret;
+}
+.visible .entry k49(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<100>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n200k32.f32.e4m3.e5m2 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95,%r96,%r97,%r98,%r99}, %d0, %d1, 1, 1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r99;
+ ret;
+}
+.visible .entry k50(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<128>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95,%r96,%r97,%r98,%r99,%r100,%r101,%r102,%r103,%r104,%r105,%r106,%r107,%r108,%r109,%r110,%r111,%r112,%r113,%r114,%r115,%r116,%r117,%r118,%r119,%r120,%r121,%r122,%r123,%r124,%r125,%r126,%r127}, %d0, %d1, 1, 1, 1, 0, 0;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r127;
+ ret;
+}
+.visible .entry k51(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<128>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n256k32.f32.e4m3.e5m2 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95,%r96,%r97,%r98,%r99,%r100,%r101,%r102,%r103,%r104,%r105,%r106,%r107,%r108,%r109,%r110,%r111,%r112,%r113,%r114,%r115,%r116,%r117,%r118,%r119,%r120,%r121,%r122,%r123,%r124,%r125,%r126,%r127}, %d0, %d1, 1, 1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r127;
+ ret;
+}
+.visible .entry k52(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<12>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n24k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r11;
+ ret;
+}
+.visible .entry k53(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<12>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n24k32.s32.s8.s8.satfinite {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r11;
+ ret;
+}
+.visible .entry k54(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<24>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n48k64.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23}, %d0, %d1, %a0, 0, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r23;
+ ret;
+}
+.visible .entry k55(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<16>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n32k32.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15}, {%a0,%a1,%a2,%a3}, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r15;
+ ret;
+}
+.visible .entry k56(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<40>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n80k64.s32.s8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39}, {%a0,%a1,%a2,%a3}, %d1, %a0, 0, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r39;
+ ret;
+}
+.visible .entry k57(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<12>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n24k32.s32.s8.u8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r11;
+ ret;
+}
+.visible .entry k58(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<12>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n24k32.s32.s8.u8.satfinite {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r11;
+ ret;
+}
+.visible .entry k59(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<24>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n48k64.s32.s8.u8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23}, %d0, %d1, %a0, 0, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r23;
+ ret;
+}
+.visible .entry k60(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<16>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n32k32.s32.s8.u8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15}, {%a0,%a1,%a2,%a3}, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r15;
+ ret;
+}
+.visible .entry k61(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<40>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n80k64.s32.s8.u8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39}, {%a0,%a1,%a2,%a3}, %d1, %a0, 0, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r39;
+ ret;
+}
+.visible .entry k62(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<12>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n24k32.s32.u8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r11;
+ ret;
+}
+.visible .entry k63(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<12>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n24k32.s32.u8.s8.satfinite {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r11;
+ ret;
+}
+.visible .entry k64(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<24>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n48k64.s32.u8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23}, %d0, %d1, %a0, 0, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r23;
+ ret;
+}
+.visible .entry k65(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<16>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n32k32.s32.u8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15}, {%a0,%a1,%a2,%a3}, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r15;
+ ret;
+}
+.visible .entry k66(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<40>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n80k64.s32.u8.s8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39}, {%a0,%a1,%a2,%a3}, %d1, %a0, 0, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r39;
+ ret;
+}
+.visible .entry k67(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<12>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n24k32.s32.u8.u8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r11;
+ ret;
+}
+.visible .entry k68(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<12>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n24k32.s32.u8.u8.satfinite {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11}, %d0, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r11;
+ ret;
+}
+.visible .entry k69(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<24>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n48k64.s32.u8.u8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23}, %d0, %d1, %a0, 0, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r23;
+ ret;
+}
+.visible .entry k70(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<16>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sync.aligned.m64n32k32.s32.u8.u8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15}, {%a0,%a1,%a2,%a3}, %d1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r15;
+ ret;
+}
+.visible .entry k71(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<40>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n80k64.s32.u8.u8 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39}, {%a0,%a1,%a2,%a3}, %d1, %a0, 0, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r39;
+ ret;
+}
+.visible .entry k72(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<4>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n8k32.f32.f16.f16 {%r0,%r1,%r2,%r3}, %d0, %d1, %a0, 0, 1, 1, 1, 0, 0;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r3;
+ ret;
+}
+.visible .entry k73(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<2>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n8k64.f16.e5m2.e4m3 {%r0,%r1}, %d0, %d1, %a0, 0, 1, 1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r1;
+ ret;
+}
+.visible .entry k74(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<32>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n64k32.f32.f16.f16 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31}, %d0, %d1, %a0, 0, 1, 1, 1, 0, 0;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r31;
+ ret;
+}
+.visible .entry k75(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<16>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n64k64.f16.e5m2.e4m3 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15}, %d0, %d1, %a0, 0, 1, 1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r15;
+ ret;
+}
+.visible .entry k76(.param .u64 p, .param .u64 q) {
+ .reg .f32 %r<128>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n256k32.f32.f16.f16 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63,%r64,%r65,%r66,%r67,%r68,%r69,%r70,%r71,%r72,%r73,%r74,%r75,%r76,%r77,%r78,%r79,%r80,%r81,%r82,%r83,%r84,%r85,%r86,%r87,%r88,%r89,%r90,%r91,%r92,%r93,%r94,%r95,%r96,%r97,%r98,%r99,%r100,%r101,%r102,%r103,%r104,%r105,%r106,%r107,%r108,%r109,%r110,%r111,%r112,%r113,%r114,%r115,%r116,%r117,%r118,%r119,%r120,%r121,%r122,%r123,%r124,%r125,%r126,%r127}, %d0, %d1, %a0, 0, 1, 1, 1, 0, 0;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.f32 [%d0], %r127;
+ ret;
+}
+.visible .entry k77(.param .u64 p, .param .u64 q) {
+ .reg .b32 %r<64>; .reg .b32 %a<4>; .reg .b64 %d<2>;
+ ld.param.u64 %d0, [p]; ld.param.u64 %d1, [q]; cvt.u32.u64 %a0, %d0; mov.b32 %a1, %a0; mov.b32 %a2, %a0; mov.b32 %a3, %a0;
+ wgmma.fence.sync.aligned;
+ wgmma.mma_async.sp.sync.aligned.m64n256k64.f16.e5m2.e4m3 {%r0,%r1,%r2,%r3,%r4,%r5,%r6,%r7,%r8,%r9,%r10,%r11,%r12,%r13,%r14,%r15,%r16,%r17,%r18,%r19,%r20,%r21,%r22,%r23,%r24,%r25,%r26,%r27,%r28,%r29,%r30,%r31,%r32,%r33,%r34,%r35,%r36,%r37,%r38,%r39,%r40,%r41,%r42,%r43,%r44,%r45,%r46,%r47,%r48,%r49,%r50,%r51,%r52,%r53,%r54,%r55,%r56,%r57,%r58,%r59,%r60,%r61,%r62,%r63}, %d0, %d1, %a0, 0, 1, 1, 1;
+ wgmma.commit_group.sync.aligned;
+ wgmma.wait_group.sync.aligned 0;
+ st.global.b32 [%d0], %r63;
+ ret;
+}

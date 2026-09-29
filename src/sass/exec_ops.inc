@@ -44,7 +44,7 @@ bool executes(const Instr& ins) {
     case Op::ULDC: case Op::ULEA: case Op::ULOP3: case Op::UMOV: case Op::UPLOP3: case Op::UPOPC: case Op::UPRMT:
     case Op::USEL: case Op::USHF: case Op::VABSDIFF4: case Op::VIADD: case Op::VIMNMX: case Op::VIADDMNMX:
     case Op::VIMNMX3: case Op::IADD: case Op::UP2UR: case Op::ELECT: case Op::USETMAXREG: case Op::WARPGROUP:
-    case Op::FMNMX3: case Op::STSM: case Op::RPCMOV:
+    case Op::FMNMX3: case Op::STSM: case Op::RPCMOV: case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
     case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2FP: case Op::F2I:
     case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL:
     case Op::FSET: case Op::FSETP: case Op::HADD2: case Op::HFMA2: case Op::HMUL2: case Op::HSET2: case Op::HSETP2:
@@ -53,6 +53,7 @@ bool executes(const Instr& ins) {
     case Op::LDGSTS: case Op::LDL: case Op::LDS: case Op::LDSM: case Op::RED: case Op::ST: case Op::STG:
     case Op::STL: case Op::STS:
     case Op::MATCH: case Op::REDUX: case Op::SHFL: case Op::VOTE: case Op::VOTEU:
+      return true;
     case Op::MOVM:
       return ins.f[0] == 0;   // not sm_100's U4TO8.M832: its layout is unpublished and unmeasured here
     case Op::BMMA: case Op::DMMA: case Op::QMMA: case Op::SULD: case Op::SUST:
@@ -88,7 +89,9 @@ exec::InstClass inst_class(Op op) {
     case Op::LDC: case Op::ATOM: case Op::ATOMG: case Op::ATOMS: case Op::RED: case Op::LDGSTS: case Op::LDSM:
     case Op::SULD: case Op::SUST: case Op::TEX: case Op::TLD: case Op::TLD4: case Op::MEMBAR: case Op::CCTL:
       return C::Memory;
-    case Op::HMMA: case Op::IMMA: case Op::BMMA: case Op::DMMA: case Op::QMMA: case Op::MOVM: return C::Tensor;
+    case Op::HMMA: case Op::IMMA: case Op::BMMA: case Op::DMMA: case Op::QMMA: case Op::MOVM:
+    case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
+      return C::Tensor;
     case Op::IMAD: case Op::IADD3: case Op::LOP3: case Op::SHF: case Op::LEA: case Op::IMNMX: case Op::IABS:
     case Op::VIADD: case Op::VIMNMX: case Op::VIADDMNMX: case Op::VIMNMX3:
     case Op::POPC: case Op::FLO: case Op::BREV: case Op::BMSK: case Op::SGXT: case Op::IDP: case Op::VABSDIFF4: case Op::ISETP:
@@ -107,7 +110,8 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
     ++st.instructions;
     st.thread_instructions += lanes;
     st.inst_by_class[static_cast<size_t>(inst_class(ins.op))] += lanes;
-    if (ins.op == Op::HMMA || ins.op == Op::IMMA || ins.op == Op::BMMA || ins.op == Op::DMMA || ins.op == Op::QMMA)
+    if (ins.op == Op::HMMA || ins.op == Op::IMMA || ins.op == Op::BMMA || ins.op == Op::DMMA || ins.op == Op::QMMA ||
+        ins.op == Op::HGMMA || ins.op == Op::IGMMA || ins.op == Op::BGMMA || ins.op == Op::QGMMA)
       ++st.tensor_instructions;
     if (ins.op == Op::BAR && ins.mnemonic == "BAR" && ex) ++st.barriers;
     if (ins.op == Op::BRA && ex && ex != group) ++st.divergent_branches;
@@ -137,6 +141,9 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
       case Op::HMMA: case Op::IMMA: case Op::BMMA: case Op::DMMA: case Op::QMMA: case Op::MOVM:
         exec_mma(blk, w, ins, ex);
         break;
+      case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
+        exec_gmma(blk, w, ins, ex);
+        break;
       case Op::FADD: case Op::FMUL: case Op::FFMA: case Op::FMNMX: case Op::FSETP: case Op::FSET:
       case Op::FSEL: case Op::FCHK: case Op::MUFU: case Op::DADD: case Op::DMUL: case Op::DFMA:
       case Op::DSETP: case Op::HADD2: case Op::HMUL2: case Op::HFMA2: case Op::HSETP2: case Op::HMNMX2:
@@ -150,6 +157,8 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
     }
   } catch (const Fault& f) {
     fault(w, ins, static_cast<unsigned>(std::countr_zero(group ? group : 1u)), f.what());
+  } catch (const std::out_of_range& f) {   // a register past the warp's file
+    fault(w, ins, static_cast<unsigned>(std::countr_zero(group ? group : 1u)), f.what(), Err::Internal);
   } catch (const Error& e) {
     // An error from the device (an address out of bounds, a trap), kept as
     // what it is with the instruction's place added (once).
@@ -157,20 +166,26 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
     fault(w, ins, static_cast<unsigned>(std::countr_zero(group ? group : 1u)), e.message(), e.code());
   }
   if (!pcs_set) each_lane(group, [&](unsigned l) { w.pc[l] += 16; });
-  // VGPU_SASS_TRACE=<warp>: every instruction that warp runs, with the lane
-  // group and the first active lane's results.
+  // VGPU_SASS_TRACE=<warp>: every instruction that warp of block (0,0,0)
+  // runs, with the lane group and the first active lane's results;
+  // VGPU_SASS_TRACE_KERNEL=<text> keeps it to kernels whose name holds it.
   static const int trace = [] { const char* v = std::getenv("VGPU_SASS_TRACE"); return v && *v ? std::atoi(v) : -1; }();
-  if (trace >= 0 && static_cast<int>(w.index) == trace && blk.ctaid[0] == 0 && blk.ctaid[1] == 0 && blk.ctaid[2] == 0) {
+  static const char* const trace_kernel = std::getenv("VGPU_SASS_TRACE_KERNEL");
+  if (trace >= 0 && static_cast<int>(w.index) == trace && blk.ctaid[0] == 0 && blk.ctaid[1] == 0 && blk.ctaid[2] == 0 &&
+      (!trace_kernel || !*trace_kernel || k_.name.find(trace_kernel) != std::string::npos)) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(ex ? ex : group));
+    const unsigned urz = m_.sm >= 100 ? 255u : 63u;
     std::string vals;
-    for (const Operand& d : ins.dst) {
-      char b[48];
-      if (d.kind == Kind::Reg && d.reg != kRZ) std::snprintf(b, sizeof b, " R%u=%08x", d.reg, w.reg(d.reg, l));
-      else if (d.kind == Kind::UReg && d.reg < 63) std::snprintf(b, sizeof b, " UR%u=%08x", d.reg, w.ur[d.reg]);
-      else if (d.kind == Kind::Pred && d.reg != kPT) std::snprintf(b, sizeof b, " P%u=%d", d.reg, (w.p[d.reg] >> l) & 1);
-      else b[0] = 0;
-      vals += b;
-    }
+    for (const Operand& d : ins.dst)
+      for (unsigned i = 0; i < std::max(1u, static_cast<unsigned>(d.width)); ++i) {
+        char b[48];
+        const unsigned n = d.reg + i;
+        if (d.kind == Kind::Reg && d.reg != kRZ && n < w.nregs) std::snprintf(b, sizeof b, " R%u=%08x", n, w.reg(n, l));
+        else if (d.kind == Kind::UReg && n < urz) std::snprintf(b, sizeof b, " UR%u=%08x", n, w.ur[n]);
+        else if (d.kind == Kind::Pred && d.reg != kPT && i == 0) std::snprintf(b, sizeof b, " P%u=%d", d.reg, (w.p[d.reg] >> l) & 1);
+        else b[0] = 0;
+        vals += b;
+      }
     std::fprintf(stderr, "  [%08x %08x] %04llx  %-50s%s\n", group, ex, static_cast<unsigned long long>(ins.pc),
                  to_text(ins).c_str(), vals.c_str());
   }
@@ -419,7 +434,11 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         }
         const size_t pidx = (hi && !sx32) ? 4 : 3;
         const bool cin = x && pred(w, ins.src[pidx], l);
-        const uint64_t sum = static_cast<uint64_t>(shifted) + b + cin;
+        uint64_t sum = static_cast<uint64_t>(shifted) + b + cin;
+        // LEA Rd, P, -Ra, Rb: the adder takes ~(Ra << s) + 1, so negating 0
+        // carries out -- the carry ptxas feeds a 64-bit negate's high word.
+        if (!hi && ins.src[0].neg)
+          sum = static_cast<uint64_t>(static_cast<uint32_t>(~(s >= 32 ? 0 : a << s))) + 1 + b + cin;
         write32(w, ins.dst[0], l, static_cast<uint32_t>(sum));
         if (has_p) set_pred(w, ins.dst[1], l, (sum >> 32) != 0);
       });
@@ -1921,6 +1940,169 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   blk.st.global_bytes_read += n * 16;
 }
 
+// ---- warpgroup MMA (HGMMA, IGMMA, QGMMA, BGMMA) ----------------------------------
+//
+// The PTX engine's wgmma, on SASS operands. Four consecutive warps form a
+// warpgroup computing a 64xNxK product; warp r of the group holds rows
+// 16r..16r+15 of A (when in registers) and D, and all of B, so each warp
+// computes its rows when it reaches the instruction. The shared-memory
+// operands are read once for the group, by the first warp to issue its n-th
+// MMA -- a warp that ran ahead could otherwise release a stage and see it
+// refilled before its peers read it -- and the others take their share.
+void Runner::exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
+  if (ex != (w.alive & ~w.exited))
+    fault(w, ins, 0, "a warpgroup MMA runs on the whole warp (.sync.aligned), and some threads are off",
+          Err::UnsupportedPtx);
+  if ((w.index / 4 + 1) * 4 > blk.warps.size())
+    fault(w, ins, 0, "a warpgroup MMA needs four whole warps", Err::UnsupportedPtx);
+  const uint32_t N = ins.f[0], K = ins.f[1], tb = ins.f[2], flags = ins.f[5];
+  const bool reg_a = ins.f[3], sparse = ins.f[4], sat = flags & 16;
+  enum class T { F16, BF16, TF32, E4M3, E5M2, S8, U8, B1 };
+  T at, bt;
+  bool acc32 = true, int_form = false, b1_and = false;
+  switch (ins.op) {
+    case Op::HGMMA:
+      at = bt = (tb & 0x20) ? T::TF32 : (tb & 0x10) ? T::BF16 : T::F16;
+      acc32 = tb & 0x08;
+      break;
+    case Op::IGMMA:
+      at = (tb & 0x10) ? T::S8 : T::U8;
+      bt = (tb & 0x400) ? T::S8 : T::U8;   // bit 82
+      int_form = true;
+      break;
+    case Op::QGMMA:
+      at = (tb & 0x10) ? T::E5M2 : T::E4M3;
+      bt = (tb & 0x20) ? T::E5M2 : T::E4M3;
+      acc32 = tb & 0x08;
+      break;
+    default:   // BGMMA
+      at = bt = T::B1;
+      int_form = true;
+      b1_and = tb & 0x40;
+      break;
+  }
+  const auto bytes = [](T t) { return t == T::TF32 ? 4u : (t == T::F16 || t == T::BF16) ? 2u : 1u; };
+  const auto value = [](T t, uint64_t bits) -> double {
+    switch (t) {
+      case T::F16: return half_to_f32(static_cast<uint16_t>(bits));
+      case T::BF16: return bf16_to_f32(static_cast<uint16_t>(bits));
+      case T::TF32: return as_f32(static_cast<uint32_t>(bits) & 0xffffe000u);
+      case T::E4M3: return exec::fp8_value(static_cast<uint32_t>(bits) & 0xff, false);
+      case T::E5M2: return exec::fp8_value(static_cast<uint32_t>(bits) & 0xff, true);
+      case T::S8: return static_cast<int8_t>(bits);
+      case T::U8: return static_cast<double>(bits & 0xff);
+      case T::B1: return static_cast<double>(bits & 1);
+    }
+    return 0;
+  };
+  const uint32_t ea = bytes(at), eb = bytes(bt), abits = at == T::B1 ? 1 : 8 * ea;
+  const double sa = (flags & 4) ? -1 : 1, sb = (flags & 8) ? -1 : 1;
+  const bool a_kmajor = !(flags & 1), b_kmajor = !(flags & 2);
+  const uint32_t Kp = sparse ? K / 2 : K;
+  const uint32_t stored = abits == 32 ? 1 : 2;
+  uint32_t meta[32] = {};
+  const unsigned sel = ins.f[7] >> 8;
+  if (sparse) {
+    const unsigned mr = ins.f[7] & 0xff;
+    for (unsigned l = 0; l < 32; ++l) meta[l] = mr == kRZ ? 0 : w.reg(mr, l);
+  }
+  const unsigned desc_ur = ins.src[reg_a ? 1 : 0].reg;
+  const auto desc = [&](unsigned u) {
+    return exec::decode_wgmma_desc(w.ur[u] | (static_cast<uint64_t>(w.ur[u + 1]) << 32));
+  };
+  const auto smem = [&](const exec::WgmmaDesc& d, bool k_major, T t, uint32_t eb_, uint32_t mn, uint32_t k) {
+    if (t == T::B1) {   // K-major only, eight to a byte
+      const uint64_t at_ = exec::wgmma_smem_offset(d, true, 1, mn, k / 8);
+      if (at_ >= blk.shared.size()) throw Fault("a warpgroup MMA reads past the block's shared memory");
+      return static_cast<double>((blk.shared[at_] >> (k % 8)) & 1);
+    }
+    const uint64_t at_ = exec::wgmma_smem_offset(d, k_major, eb_, mn, k) & 0xffffff;
+    if (at_ + eb_ > blk.shared.size()) throw Fault("a warpgroup MMA reads past the block's shared memory");
+    uint64_t v = 0;
+    std::memcpy(&v, &blk.shared[at_], eb_);
+    return value(t, v);
+  };
+  const uint32_t row0 = (w.index % 4) * 16;
+  // This warp's 16 x K slice of A.
+  std::vector<double> A(size_t{16} * K, 0.0);
+  if (reg_a) {
+    // mma.m16n8kK's A fragment (mma.sp's, sparse).
+    const unsigned ra = ins.src[0].reg, per_reg = 32 / abits, cpr = per_reg / stored;
+    for (unsigned r = 0; r < 4; ++r)
+      for (unsigned l = 0; l < 32; ++l) {
+        const unsigned g = l / 4, t = l % 4, row = g + (r % 2) * 8, col0 = t * per_reg + (r / 2) * (per_reg * 4);
+        const uint32_t v = ra == kRZ ? 0 : w.reg(ra + r, l);
+        for (unsigned e = 0; e < per_reg; ++e) {
+          const unsigned col = sparse ? exec::mma_sparse_column(abits, K, sel, meta, row,
+                                                                t * cpr + (r / 2) * 4 * cpr + e / stored, e % stored)
+                                      : col0 + e;
+          if (col < K) A[row * K + col] = sa * value(at, v >> (abits * e));
+        }
+      }
+  }
+  // The shared-memory operands, read once for the warpgroup.
+  auto [it, first] = blk.gmma.try_emplace({w.index / 4, w.gmma_issued++});
+  GmmaSnapshot& snap = it->second;
+  if (first) {
+    if (!reg_a) {
+      const exec::WgmmaDesc d = desc(desc_ur);
+      snap.A.assign(size_t{64} * Kp, 0.0);
+      for (uint32_t r = 0; r < 64; ++r)
+        for (uint32_t k = 0; k < Kp; ++k) snap.A[r * Kp + k] = sa * smem(d, a_kmajor, at, ea, r, k);
+    }
+    const exec::WgmmaDesc d = desc(desc_ur + 2);
+    snap.B.assign(size_t{K} * N, 0.0);
+    for (uint32_t n = 0; n < N; ++n)
+      for (uint32_t k = 0; k < K; ++k) snap.B[size_t{k} * N + n] = sb * smem(d, b_kmajor, bt, eb, n, k);
+  }
+  if (!reg_a) {
+    if (snap.A.empty()) fault(w, ins, 0, "the warps of a warpgroup disagree on where A is", Err::UnsupportedPtx);
+    for (uint32_t r = 0; r < 16; ++r)
+      for (uint32_t j = 0; j < Kp; ++j) {
+        const uint32_t col = sparse ? exec::mma_sparse_column(abits, K, sel, meta, r, j / stored, j % stored) : j;
+        if (col < K) A[r * K + col] = snap.A[size_t{row0 + r} * Kp + j];
+      }
+  }
+  const std::vector<double>& B = snap.B;
+  // scale-d: stored as 7 - UPn (and a not); false means D = A*B.
+  const unsigned up = ins.f[6] & 7;
+  const bool keep = (up == 7 ? true : w.up[up]) != ((ins.f[6] & 8) != 0);
+  const unsigned rd = ins.dst[0].reg, rc = ins.src[reg_a ? 2 : 1].reg;
+  const bool accumulate = keep && rc != kRZ;
+  const uint32_t elems = N / 2;   // accumulator elements per lane
+  each_lane(ex, [&](unsigned l) {
+    std::vector<uint32_t> out(acc32 || int_form ? elems : (elems + 1) / 2);
+    for (size_t i = 0; i < out.size(); ++i) out[i] = rc == kRZ ? 0 : w.reg(rc + static_cast<unsigned>(i), l);
+    for (uint32_t e = 0; e < elems; ++e) {
+      const uint32_t g = l / 4, t = l % 4, j = e / 4, s = e % 4;
+      const uint32_t row = g + 8 * (s / 2), col = 8 * j + 2 * t + (s % 2);
+      if (int_form) {
+        int64_t acc = accumulate ? static_cast<int32_t>(out[e]) : 0;
+        for (uint32_t k = 0; k < K; ++k)
+          acc += at == T::B1 ? int64_t{b1_and ? (A[row * K + k] != 0 && B[size_t{k} * N + col] != 0)
+                                              : ((A[row * K + k] != 0) != (B[size_t{k} * N + col] != 0))}
+                             : static_cast<int64_t>(A[row * K + k]) * static_cast<int64_t>(B[size_t{k} * N + col]);
+        if (sat) acc = std::clamp<int64_t>(acc, INT32_MIN, INT32_MAX);
+        out[e] = static_cast<uint32_t>(static_cast<int32_t>(acc));
+        continue;
+      }
+      // Products exact in f32, summed in f32 in K order, as the PTX engine does.
+      const uint32_t shift = acc32 ? 0 : 16 * (e % 2);
+      uint32_t& slot = out[acc32 ? e : e / 2];
+      float acc = 0.0f;
+      if (accumulate) acc = acc32 ? as_f32(slot) : half_to_f32(static_cast<uint16_t>(slot >> shift));
+      for (uint32_t k = 0; k < K; ++k)
+        acc += static_cast<float>(A[row * K + k]) * static_cast<float>(B[size_t{k} * N + col]);
+      if (acc32) slot = f32_bits(acc);
+      else slot = (slot & ~(0xffffu << shift)) | (static_cast<uint32_t>(f64_to_half(acc)) << shift);
+    }
+    for (size_t i = 0; i < out.size(); ++i)
+      if (rd != kRZ) w.reg(rd + static_cast<unsigned>(i), l) = out[i];
+  });
+  snap.taken |= static_cast<uint8_t>(1u << (w.index % 4));
+  if (snap.taken == 0xF) blk.gmma.erase(it);
+}
+
 void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
   if (ins.op == Op::MOVM) {
     if (ins.f[0]) fault(w, ins, 0, "MOVM.U4TO8.M832 is not implemented", Err::UnsupportedPtx);
@@ -2113,6 +2295,16 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
 
 bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask group) {
   const auto base_of = [&](unsigned l) { return w.pc[l] - ins.pc; };   // the section's code address
+  // A condition predicate beside the guard (sm_90's BRA Pn and EXIT Pn,
+  // BREAK Pn, sm_100's BRA.U UPn): the lanes where both hold.
+  const auto with_condition = [&](Mask m) {
+    for (const Operand& o : ins.src)
+      if (o.kind == Kind::Pred || o.kind == Kind::UPred)
+        each_lane(m, [&](unsigned l) {
+          if (!pred(w, o, l)) m &= ~(Mask{1} << l);
+        });
+    return m;
+  };
   const auto release_bsync = [&](unsigned x) {
     const Mask members = w.b[x] & w.alive & ~w.exited;
     Mask arrived = 0;
@@ -2184,14 +2376,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       if (ex) throw Error(Err::Trap, "SASS kernel " + k_.name + " executed BPT.TRAP (a trap)");
       return false;
     case Op::BRA: {
-      Mask take = ex;
-      // A condition predicate beside the guard (sm_90's BRA Pn, sm_100's
-      // BRA.U UPn): both must hold.
-      for (const Operand& o : ins.src)
-        if (o.kind == Kind::Pred || o.kind == Kind::UPred)
-          each_lane(take, [&](unsigned l) {
-            if (!pred(w, o, l)) take &= ~(Mask{1} << l);
-          });
+      Mask take = with_condition(ex);
       if (ins.f[1] && take) take = group;   // .U.ANY: all of them when any
       if (ins.f[0] >= 2) {
         // .DIV/.CONV: branch when the warp is (not) converged on the mask the
@@ -2268,9 +2453,10 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
         else w.pc[l] += 16;
       });
       return true;
-    case Op::EXIT:
+    case Op::EXIT: {
+      const Mask go = with_condition(ex);   // EXIT Pn: the lanes where both hold
       each_lane(group, [&](unsigned l) {
-        if ((ex >> l) & 1) w.exited |= Mask{1} << l;
+        if ((go >> l) & 1) w.exited |= Mask{1} << l;
         else w.pc[l] += 16;
       });
       // Lanes that exit no longer hold anything up.
@@ -2279,11 +2465,12 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       for (unsigned id = 0; id < 16; ++id)
         if (blk.bars[id].arrived) release_bar(id);
       return true;
+    }
     case Op::BSSY:
       if (ex) w.b[ins.dst[0].reg] = ex | (w.b[ins.dst[0].reg] & 0);
       return false;
-    case Op::BREAK:
-      w.b[ins.src.back().reg] &= ~ex;
+    case Op::BREAK:   // BREAK Pn, Bx: the lanes where both hold leave Bx
+      w.b[ins.src.back().reg] &= ~with_condition(ex);
       release_bsync(ins.src.back().reg);
       return false;
     case Op::BSYNC: {

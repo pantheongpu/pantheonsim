@@ -43,6 +43,7 @@
 #include <unordered_map>
 
 #include "vgpu/exec/numerics.hpp"
+#include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/faults.hpp"
@@ -6142,52 +6143,12 @@ class Interpreter {
   // reads its accumulator before waiting is not caught here. fence,
   // commit_group and wait_group have nothing left to order.
 
-  // A shared-memory matrix descriptor (PTX ISA 9.7.17.5.1.2.2).
-  struct WgmmaDesc {
-    uint64_t start = 0, lbo = 0, sbo = 0;
-    uint32_t swizzle = 0;   // bytes in a swizzled row: 0 (none), 32, 64 or 128
-    uint32_t atom = 16;     // bytes the swizzle moves as one (tcgen05's mode 1: 32)
-  };
-
   WgmmaDesc decode_wgmma_desc(const Instr& ins, uint64_t d) {
-    WgmmaDesc out;
-    out.start = (d & 0x3FFF) << 4;
-    out.lbo = ((d >> 16) & 0x3FFF) << 4;
-    out.sbo = ((d >> 32) & 0x3FFF) << 4;
-    static constexpr uint32_t kSwizzle[4] = {0, 128, 64, 32};
-    out.swizzle = kSwizzle[(d >> 62) & 3];
-    // The base offset says where a swizzle pattern starts when that is not
-    // the boundary the pattern repeats on. CUTLASS always leaves it zero and
-    // aligns its buffers instead, and the ISA does not say how a nonzero value
-    // moves the pattern; guessing would read plausible wrong matrices.
-    if (((d >> 49) & 7) != 0)
-      ctx_fail(ins, -1, Err::UnsupportedPtx,
-               "a wgmma matrix descriptor with a nonzero base offset (bits 51-49); only "
-               "swizzle patterns that start on their repeat boundary are implemented");
-    return out;
-  }
-
-  // Shared-window offset of element (mn, k) of a matrix a descriptor
-  // describes: A is M x K and B is N x K, so `mn` is the row of A or the
-  // column of B. The strides are the canonical layouts of 9.7.17.5.1.2.1.3,
-  // written in bytes: a core matrix is 8 rows of 16 bytes, LBO and SBO step
-  // between core matrices, and a swizzled layout XORs address bits 4-6 with
-  // bits 7-9 (Swizzle<3,4,3> for 128B; 64B and 32B keep fewer of them), the
-  // same function of the address a TMA copy applies when it writes the tile.
-  static uint64_t wgmma_smem_offset(const WgmmaDesc& d, bool k_major, uint32_t eb, uint32_t mn,
-                                    uint32_t k) {
-    const uint64_t W = d.swizzle;
-    uint64_t off;
-    if (k_major) {
-      const uint64_t kb = uint64_t{k} * eb;
-      off = W ? (mn % 8) * W + (mn / 8) * d.sbo + kb
-              : (mn % 8) * 16 + (mn / 8) * d.sbo + kb % 16 + (kb / 16) * d.lbo;
-    } else {
-      const uint64_t mb = uint64_t{mn} * eb;
-      off = W ? mb % W + (mb / W) * d.lbo + (k % 8) * W + (k / 8) * d.sbo
-              : mb % 16 + (mb / 16) * d.sbo + (k % 8) * 16 + (k / 8) * d.lbo;
+    try {
+      return exec::decode_wgmma_desc(d);
+    } catch (const Error& e) {
+      rethrow_with_context(e, ins, -1);
     }
-    return exec::swizzle_address(d.start + off, static_cast<uint32_t>(W), d.atom);
   }
 
   static uint32_t wgmma_elem_bytes(WgmmaElem t) {
@@ -10878,6 +10839,39 @@ uint32_t mma_sparse_column(uint32_t bits, uint32_t K, uint32_t sel, const uint32
   Lanes m{};
   for (int i = 0; i < 32; ++i) m[i] = meta[i];
   return sparse_column(bits, K, sel, m, row, chunk, k);
+}
+
+WgmmaDesc decode_wgmma_desc(uint64_t d) {
+  WgmmaDesc out;
+  out.start = (d & 0x3FFF) << 4;
+  out.lbo = ((d >> 16) & 0x3FFF) << 4;
+  out.sbo = ((d >> 32) & 0x3FFF) << 4;
+  static constexpr uint32_t kSwizzle[4] = {0, 128, 64, 32};
+  out.swizzle = kSwizzle[(d >> 62) & 3];
+  // The base offset says where a swizzle pattern starts when that is not the
+  // boundary the pattern repeats on. CUTLASS always leaves it zero and
+  // aligns its buffers instead, and the ISA does not say how a nonzero value
+  // moves the pattern; guessing would read plausible wrong matrices.
+  if (((d >> 49) & 7) != 0)
+    throw Error(Err::UnsupportedPtx,
+                "a wgmma matrix descriptor with a nonzero base offset (bits 51-49); only swizzle "
+                "patterns that start on their repeat boundary are implemented");
+  return out;
+}
+
+uint64_t wgmma_smem_offset(const WgmmaDesc& d, bool k_major, uint32_t eb, uint32_t mn, uint32_t k) {
+  const uint64_t W = d.swizzle;
+  uint64_t off;
+  if (k_major) {
+    const uint64_t kb = uint64_t{k} * eb;
+    off = W ? (mn % 8) * W + (mn / 8) * d.sbo + kb
+            : (mn % 8) * 16 + (mn / 8) * d.sbo + kb % 16 + (kb / 16) * d.lbo;
+  } else {
+    const uint64_t mb = uint64_t{mn} * eb;
+    off = W ? mb % W + (mb / W) * d.lbo + (k % 8) * W + (k / 8) * d.sbo
+            : mb % 16 + (mb / 16) * d.sbo + (k % 8) * 16 + (k / 8) * d.lbo;
+  }
+  return swizzle_address(d.start + off, static_cast<uint32_t>(W), d.atom);
 }
 
 }  // namespace vgpu::exec
