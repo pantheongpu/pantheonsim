@@ -264,8 +264,15 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   out-of-bounds and use-after-free checking. Capped at CUDA's default 8 MiB;
   memory allocated there is reachable from the host here and is not on a
   device, which is a permissive difference and recorded as one.
-- The SIMD video instructions (`vadd4`, `vsub4`, `vabsdiff4`, `vmin4`,
-  `vmax4`, `vavrg4` and the 2-way forms), `set` (setp's sibling that writes a
+- The video instructions, all of them: the scalar `vadd`, `vsub`,
+  `vabsdiff`, `vmin`, `vmax`, `vshl`, `vshr`, `vmad` and `vset` with operand
+  selectors, `.sat`, the secondary `.add`/`.min`/`.max` and the destination
+  merge, and the SIMD `vadd2/4`, `vsub2/4`, `vavrg2/4`, `vabsdiff2/4`,
+  `vmin2/4`, `vmax2/4` and `vset2/4` with lane selectors, masks and `.add`.
+  On sm_70+ ptxas emulates them, and the card departs from the ISA's
+  pseudocode in places (vmad takes whole 32-bit operands as signed; the
+  shifts wrap their intermediate at 34 bits), so the simulator does what an
+  RTX 3060 does, over 652 variants (e2e_video_forms). `set` (setp's sibling that writes a
   value, where an integer destination gets all-ones for true and a float one
   gets 1.0), `atom.inc`/`.dec` (which wrap against the operand rather than
   counting), and `abs` on the half types.
