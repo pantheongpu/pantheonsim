@@ -538,9 +538,15 @@ void dec_fadd(Instr& ins, const Word& w) {
 
 // A relative branch target: a signed offset in bytes from the next
 // instruction, held in bits 34-81 (the low two bits are always zero).
-uint64_t branch_target(const Word& w, uint64_t pc) {
-  const int64_t off = w.sfield(34, 48) * 4;
-  return static_cast<uint64_t>(static_cast<int64_t>(pc) + 16 + off);
+// A branch offset in bytes. From sm_90 its low eight bits (in words of
+// four bytes) moved to 16-23, below the rest at 34-81.
+int64_t branch_offset(const Word& w, int sm) {
+  if (sm >= 90) return static_cast<int64_t>(static_cast<uint64_t>(w.sfield(34, 48)) << 8 | w.field(16, 8)) * 4;
+  return w.sfield(34, 48) * 4;
+}
+
+uint64_t branch_target(const Word& w, uint64_t pc, int sm) {
+  return static_cast<uint64_t>(static_cast<int64_t>(pc) + 16 + branch_offset(w, sm));
 }
 
 Operand label(uint64_t target) {
@@ -567,7 +573,7 @@ void dec_bra(Instr& ins, const Word& w) {
     u.bnot = w.bit(30);
     ins.src.push_back(u);
   }
-  ins.src.push_back(label(branch_target(w, ins.pc)));
+  ins.src.push_back(label(branch_target(w, ins.pc, ins.sm)));
   ins.f[0] = mode;
 }
 
@@ -585,7 +591,7 @@ void dec_bssy(Instr& ins, const Word& w) {
   b.kind = Kind::Bar;
   b.reg = static_cast<unsigned>(w.field(16, 4));
   ins.dst.push_back(b);
-  ins.src.push_back(label(branch_target(w, ins.pc)));
+  ins.src.push_back(label(branch_target(w, ins.pc, 0)));
 }
 
 void dec_bsync(Instr& ins, const Word& w) {
@@ -1619,12 +1625,12 @@ void dec_call(Instr& ins, const Word& w, bool abs, bool reg_rel = false) {
     ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
   } else if (reg_rel) {
     const unsigned r = static_cast<unsigned>(w.field(24, 8));
-    const int64_t target = static_cast<int64_t>(branch_target(w, ins.pc));
+    const int64_t target = static_cast<int64_t>(branch_target(w, ins.pc, ins.sm));
     ins.src.push_back(Txt("R" + std::to_string(r) + " " + signed_hex(target)));
     ins.src.back().reg = r;
     ins.src.back().imm = target;
   } else {
-    ins.src.push_back(label(branch_target(w, ins.pc)));
+    ins.src.push_back(label(branch_target(w, ins.pc, ins.sm)));
   }
   ins.f[0] = abs;
   ins.f[1] = reg_rel;
@@ -1638,9 +1644,9 @@ void dec_ret(Instr& ins, const Word& w) {
   ins.mods.push_back("REL");
   ins.mods.push_back("NODEC");
   const unsigned r = static_cast<unsigned>(w.field(24, 8));
-  ins.src.push_back(Txt("R" + std::to_string(r) + " " + signed_hex(static_cast<int64_t>(branch_target(w, ins.pc)))));
+  ins.src.push_back(Txt("R" + std::to_string(r) + " " + signed_hex(static_cast<int64_t>(branch_target(w, ins.pc, ins.sm)))));
   ins.src.back().reg = r;
-  ins.src.back().imm = static_cast<int64_t>(branch_target(w, ins.pc));
+  ins.src.back().imm = static_cast<int64_t>(branch_target(w, ins.pc, ins.sm));
 }
 
 // BRX jumps to the next instruction's address plus the register plus the
@@ -1649,7 +1655,7 @@ void dec_brx(Instr& ins, const Word& w) {
   ins.op = Op::BRX;
   ins.mnemonic = "BRX";
   const unsigned r = static_cast<unsigned>(w.field(24, 8));
-  const int64_t off = w.sfield(34, 48) * 4;
+  const int64_t off = branch_offset(w, ins.sm);
   ins.src.push_back(Txt("R" + std::to_string(r) + " " + signed_hex(off)));
   ins.src.back().reg = r;
   ins.src.back().imm = off;
@@ -1965,7 +1971,7 @@ void dec_brxu(Instr& ins, const Word& w) {
   ins.op = Op::BRX;
   ins.mnemonic = "BRXU";
   const unsigned r = static_cast<unsigned>(w.field(24, ureg_bits(ins.sm)));
-  const int64_t off = w.sfield(34, 48) * 4;
+  const int64_t off = branch_offset(w, ins.sm);
   ins.src.push_back(Txt("UR" + std::to_string(r) + " " + signed_hex(off)));
   ins.src.back().reg = r;
   ins.src.back().imm = off;

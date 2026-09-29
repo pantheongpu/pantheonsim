@@ -597,6 +597,9 @@ Mask guard_mask(const Warp& w, const Instr& ins, Mask group) {
 
 }  // namespace
 
+// For sass::unsupported (module.cpp).
+bool runs_instr(const Instr& ins) { return executes(ins); }
+
 exec::LaunchStats launch(const Module& m, const std::string& kernel, const exec::LaunchConfig& cfg,
                          const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
                          const DeviceProfile& profile) {

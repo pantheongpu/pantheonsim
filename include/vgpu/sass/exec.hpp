@@ -71,6 +71,11 @@ bool runs_on(int cubin_sm, bool arch_specific, int device_sm);
 // externs such as vprintf and malloc included.
 std::vector<std::string> reachable(const Module& m, const std::string& kernel);
 
+// The first instruction in a cubin's code that this executor cannot run
+// (one it does not decode, or an op or form it does not implement yet),
+// described; empty when it runs all of it. Decodes only: no device needed.
+std::string unsupported(const uint8_t* image, size_t size);
+
 // Runs one kernel of a loaded module over the grid.
 exec::LaunchStats launch(const Module& m, const std::string& kernel, const exec::LaunchConfig& cfg,
                          const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,

@@ -1304,6 +1304,15 @@ set_tests_properties(e2e_texture_gather PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
 
+# SASS by default, PTX the fallback: which code a binary runs, by what it
+# carries, what the SASS executor runs, and VGPU_SASS's overrides.
+add_test(NAME e2e_sass_path
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_path.sh)
+set_tests_properties(e2e_sass_path PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
 # A grid-wide barrier through cooperative_groups, unmodified. Checks the
 # barrier holds, that a grid too large to be resident is refused rather than
 # hung, and that the same kernel launched ordinarily fails loudly.

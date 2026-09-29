@@ -21,6 +21,42 @@ uint32_t Runner::ival(Warp& w, const Operand& o, unsigned lane) {
 // ---- dispatch ------------------------------------------------------------------
 
 // The profiler's instruction classes, by SASS op.
+// Whether the executor runs an instruction: what a cubin must hold for the
+// runtime to prefer it over the fatbin's PTX (sass::unsupported).
+bool executes(const Instr& ins) {
+  switch (ins.op) {
+    case Op::HMMA: case Op::IMMA:
+      return ins.f[3] == 0;   // not the sparse forms yet
+    case Op::TEX: case Op::TLD: case Op::TLD4: {
+      const Word& w = ins.w;
+      const unsigned lod = ins.op == Op::TLD4 ? 0 : static_cast<unsigned>(w.field(87, 3));
+      if (lod == 4 || lod == 5 || (ins.op == Op::TEX && lod == 2)) return false;   // LOD clamps, bias
+      return !w.bit(76) && !(ins.op == Op::TLD4 && w.bit(77)) && !w.bit(78);        // offsets, depth compare
+    }
+    case Op::BMSK: case Op::BREV: case Op::CS2R: case Op::FLO: case Op::IABS: case Op::IADD3: case Op::IDP:
+    case Op::IMAD: case Op::IMNMX: case Op::ISETP: case Op::LEA: case Op::LOP3: case Op::MOV: case Op::P2R:
+    case Op::PLOP3: case Op::POPC: case Op::PRMT: case Op::R2P: case Op::R2UR: case Op::S2R: case Op::S2UR:
+    case Op::SEL: case Op::SGXT: case Op::SHF: case Op::UFLO: case Op::UIADD3: case Op::UIMAD: case Op::UISETP:
+    case Op::ULDC: case Op::ULEA: case Op::ULOP3: case Op::UMOV: case Op::UPLOP3: case Op::UPOPC: case Op::UPRMT:
+    case Op::USEL: case Op::USHF: case Op::VABSDIFF4:
+    case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2FP: case Op::F2I:
+    case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL:
+    case Op::FSET: case Op::FSETP: case Op::HADD2: case Op::HFMA2: case Op::HMUL2: case Op::HSET2: case Op::HSETP2:
+    case Op::I2F: case Op::I2FP: case Op::I2I: case Op::I2IP: case Op::MUFU:
+    case Op::ATOM: case Op::ATOMG: case Op::ATOMS: case Op::LD: case Op::LDC: case Op::LDG: case Op::LDGDEPBAR:
+    case Op::LDGSTS: case Op::LDL: case Op::LDS: case Op::LDSM: case Op::RED: case Op::ST: case Op::STG:
+    case Op::STL: case Op::STS:
+    case Op::MATCH: case Op::REDUX: case Op::SHFL: case Op::VOTE: case Op::VOTEU:
+    case Op::BMMA: case Op::DMMA: case Op::QMMA: case Op::MOVM: case Op::SULD: case Op::SUST:
+    case Op::BAR: case Op::BMOV: case Op::BPT: case Op::BRA: case Op::BREAK: case Op::BRX: case Op::BSSY:
+    case Op::BSYNC: case Op::CALL: case Op::CCTL: case Op::DEPBAR: case Op::ERRBAR: case Op::EXIT: case Op::MEMBAR:
+    case Op::NANOSLEEP: case Op::NOP: case Op::RET: case Op::WARPSYNC: case Op::YIELD:
+      return true;
+    default:
+      return false;
+  }
+}
+
 exec::InstClass inst_class(Op op) {
   using C = exec::InstClass;
   switch (op) {
