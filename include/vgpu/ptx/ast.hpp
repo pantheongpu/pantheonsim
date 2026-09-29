@@ -715,8 +715,12 @@ struct OpShf { bool left = false; bool wrap = false; Reg dst; Operand a, b, c; }
 // about, so the modifier cannot be dropped.
 // .sat clamps the result to [0, 1] (a NaN to +0); min/max.xorsign.abs take
 // the smaller/larger magnitude with the sign sign(a) ^ sign(b).
-struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; bool nan_propagate = false; Type ty; Reg dst; Operand a, b; bool sat = false; bool xorsign_abs = false; bool ftz = false; };
-struct OpFma { Type ty; Reg dst; Operand a, b, c; FRound round = FRound::Nearest; bool sat = false; bool ftz = false; };
+// round_explicit: a rounding modifier was written (.rn included), which rules
+// out contracting the instruction into an fma (see contract.hpp).
+struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; bool nan_propagate = false; Type ty; Reg dst; Operand a, b; bool sat = false; bool xorsign_abs = false; bool ftz = false; bool round_explicit = false; };
+// neg_ab / neg_c negate the product / the addend: what a contracted sub
+// becomes (c - a*b is fma(-a, b, c); a*b - c is fma(a, b, -c)).
+struct OpFma { Type ty; Reg dst; Operand a, b, c; FRound round = FRound::Nearest; bool sat = false; bool ftz = false; bool neg_ab = false, neg_c = false; };
 // Packed half2 SIMD: one 32-bit register holds two f16 lanes.
 // Half-precision arithmetic. One node covers four shapes, because they differ
 // only in how many 16-bit values a 32-bit register holds and how those bits

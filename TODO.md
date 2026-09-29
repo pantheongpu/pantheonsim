@@ -269,6 +269,16 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   mbarrier.pending_count.b64 takes an arrival's state token (the ISA's form),
   which carries the count pending before that arrive; it was parsed as
   taking the barrier's address.
+- Multiply-add contraction as the code generator performs it: a mul and the
+  add or sub consuming its product, neither with a rounding modifier, run as
+  one fma (src/ptx/contract.cpp). The PTX ISA allows it, ptxas does it, and
+  an RTX 3060's results show when: f32 and f64, .ftz forms too, either
+  operand order and both directions of sub; a product used only by adds and
+  subs fuses into each of them, one used any other way into none; the first
+  operand's product when both are; never across a branch. Found by
+  PolyBench's ADI, whose `x - y*a` came out one ulp off in a third of its
+  output and now matches the card bit for bit. VGPU_PTX_CONTRACT=0 turns it
+  off.
 - A fifth sweep, half precision: every f16, f16x2, bf16 and bf16x2 form of
   add/sub/mul/fma/min/max/neg/abs with every modifier, setp and set with
   every comparison (and f32's, with and without .ftz), and cvt between the

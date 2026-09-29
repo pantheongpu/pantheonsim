@@ -3,6 +3,7 @@
 // Anything outside the subset throws Err::UnsupportedPtx naming the exact
 // instruction, source line, and kernel — never a silent wrong answer.
 #include "vgpu/ptx/parser.hpp"
+#include "vgpu/ptx/contract.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -807,6 +808,7 @@ class Parser {
     }
     expect_punct("{");
     parse_body(fn);
+    contract_mul_add(fn);
     place_dynamic_shared(fn);
     current_kernel_.clear();
     cur_fn_ = nullptr;
@@ -4014,6 +4016,7 @@ class Parser {
       bool sat = false, xorsign_abs = false, ftz = false;
       bool wide = false, lo = false, hi = false;
       FRound frnd = FRound::Nearest;
+      bool frnd_explicit = false;
       Type ty{};
       bool have_ty = false;
       for (size_t i = 1; i < parts.size(); ++i) {
@@ -4022,11 +4025,11 @@ class Parser {
         else if (p == "lo") lo = true;
         else if (p == "hi") hi = true;
         else if (p == "cc") carry_out = true;
-        else if (p == "rn") ;
+        else if (p == "rn") frnd_explicit = true;
         else if (p == "ftz") ftz = true;
-        else if (p == "rz") frnd = FRound::Zero;
-        else if (p == "rm") frnd = FRound::MinusInf;
-        else if (p == "rp") frnd = FRound::PlusInf;
+        else if (p == "rz") { frnd = FRound::Zero; frnd_explicit = true; }
+        else if (p == "rm") { frnd = FRound::MinusInf; frnd_explicit = true; }
+        else if (p == "rp") { frnd = FRound::PlusInf; frnd_explicit = true; }
         // .approx and .full ask for a faster, less accurate result -- div.approx
         // is what __fdividef compiles to, and ML kernels use it constantly.
         // Both have a documented error bound, and the exact IEEE result falls
@@ -4102,6 +4105,7 @@ class Parser {
         if (it == fops.end()) return unsupported("float op '" + base_op + "'");
         OpFloatBin op;
         op.round = frnd;
+        op.round_explicit = frnd_explicit;
         op.op = it->second;
         op.nan_propagate = nan_propagate;
         op.sat = sat;

@@ -43,6 +43,11 @@ struct RegisterUsage {
 // Computes the register footprint of a kernel. Deterministic.
 RegisterUsage analyze_registers(const EntryFn& fn);
 
+// The registers an instruction writes and reads, each as id * 2 + wide (the
+// 32- and 64-bit files number their registers separately, so an id alone
+// does not name one).
+void instr_registers(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t>& uses);
+
 // Resident warps and blocks per SM for a given block size, given a device's
 // register file and warp/block ceilings -- the standard occupancy calculation.
 struct Occupancy {

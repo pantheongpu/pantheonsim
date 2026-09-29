@@ -3120,7 +3120,8 @@ class Interpreter {
   }
 
   bool fast_fma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpFma& op, Mask m) {
-    if (mem_.alu_fault_armed() || op.round != FRound::Nearest || op.sat || op.ftz) return false;
+    if (mem_.alu_fault_armed() || op.round != FRound::Nearest || op.sat || op.ftz || op.neg_ab || op.neg_c)
+      return false;
     if (op.ty.bits == 32) {
       if (op.dst.wide || !narrow_operand(op.a) || !narrow_operand(op.b) || !narrow_operand(op.c))
         return false;
@@ -3529,10 +3530,15 @@ class Interpreter {
       }
       // .ftz: subnormal f32 inputs and results to signed zero.
       auto ftz = [&](float v) { return op->ftz && std::fpclassify(v) == FP_SUBNORMAL ? std::copysign(0.0f, v) : v; };
+      // A contracted sub negates the product or the addend.
+      const double sa = op->neg_ab ? -1.0 : 1.0, sc = op->neg_c ? -1.0 : 1.0;
       if (op->ty.bits == 32)
-        for_active(m, W_, [&](uint32_t l) { r[l] = canon32(ftz(std::fma(ftz(f32(a[l])), ftz(f32(b[l])), ftz(f32(c[l]))))); });
+        for_active(m, W_, [&](uint32_t l) {
+          const float av = op->neg_ab ? -f32(a[l]) : f32(a[l]), cv = op->neg_c ? -f32(c[l]) : f32(c[l]);
+          r[l] = canon32(ftz(std::fma(ftz(av), ftz(f32(b[l])), ftz(cv))));
+        });
       else
-        for_active(m, W_, [&](uint32_t l) { r[l] = f64bits(std::fma(f64(a[l]), f64(b[l]), f64(c[l]))); });
+        for_active(m, W_, [&](uint32_t l) { r[l] = f64bits(std::fma(sa * f64(a[l]), f64(b[l]), sc * f64(c[l]))); });
       if (op->round != FRound::Nearest) {
         std::fesetround(prev_round);
         g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);

@@ -3532,6 +3532,74 @@ VTEST(atom_cas_compares_with_b_and_stores_c) {
 // Rodinia's needle computes %r4 = temp - 64 for a thread of the second row
 // and loads [%r4+68]. Adding in 64 bits carried the address out of the
 // shared window altogether.
+// A mul and the add or sub consuming its product, neither with a rounding
+// modifier, run as one fma, as ptxas contracts them on an RTX 3060 (see
+// src/ptx/contract.cpp). With a = 1+2^-23, b = 1-2^-23 and c = -1 the
+// rounded product is 1 and the sum 0; fused, the result is -2^-46. What the
+// card measurably leaves alone stays unfused: an explicit .rn, and a product
+// also used some other way.
+VTEST(mul_add_contract_as_the_code_generator_fuses_them) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .f32 %f<24>;
+    .reg .f64 %fd<8>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.b32 %f1, 0f3F800001;          // 1 + 2^-23
+    mov.b32 %f2, 0f3F7FFFFE;          // 1 - 2^-23
+    mov.b32 %f3, 0fBF800000;          // -1
+    mov.b32 %f4, 0f3F800000;          // 1
+    mul.f32 %f5, %f1, %f2;            // fused into the add
+    add.f32 %f6, %f5, %f3;
+    st.global.f32 [%rd2], %f6;
+    mul.f32 %f7, %f1, %f2;            // c - a*b
+    sub.f32 %f8, %f4, %f7;
+    st.global.f32 [%rd2+4], %f8;
+    mul.f32 %f9, %f1, %f2;            // a*b - c
+    sub.f32 %f10, %f9, %f4;
+    st.global.f32 [%rd2+8], %f10;
+    mul.rn.f32 %f11, %f1, %f2;        // explicit .rn: not fused
+    add.f32 %f12, %f11, %f3;
+    st.global.f32 [%rd2+12], %f12;
+    mul.f32 %f13, %f1, %f2;           // product also stored: not fused
+    add.f32 %f14, %f13, %f3;
+    st.global.f32 [%rd2+16], %f14;
+    st.global.f32 [%rd2+20], %f13;
+    mul.f32 %f15, %f1, %f2;           // two adds: both fused
+    add.f32 %f16, %f15, %f3;
+    add.f32 %f17, %f3, %f15;
+    st.global.f32 [%rd2+24], %f16;
+    st.global.f32 [%rd2+28], %f17;
+    mov.b64 %fd1, 0d3FF0000000000001; // f64: 1 + 2^-52
+    mov.b64 %fd2, 0d3FEFFFFFFFFFFFFE; // 1 - 2^-52
+    mov.b64 %fd3, 0dBFF0000000000000;
+    mul.f64 %fd4, %fd1, %fd2;
+    add.f64 %fd5, %fd4, %fd3;
+    st.global.f64 [%rd2+32], %fd5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(40);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  const float fused = -std::ldexp(1.0f, -46);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), fused);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 4, 4)), -fused);    // 1 - (1 - 2^-46)
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 8, 4)), fused);     // (1 - 2^-46) - 1
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 12, 4)), 0.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 16, 4)), 0.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 20, 4)), 1.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 24, 4)), fused);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 28, 4)), fused);
+  double d;
+  const uint64_t bits = e.mem.load_scalar(out + 32, 8);
+  std::memcpy(&d, &bits, 8);
+  VCHECK_EQ(d, -std::ldexp(1.0, -104));
+}
+
 VTEST(a_32_bit_address_wraps_register_plus_offset) {
   std::string ptx = std::string(kHeader) + R"(
 .visible .entry k(.param .u64 out)
