@@ -56,6 +56,9 @@ class Device {
   // Loads a PTX module; returns a module handle valid for this device.
   // PTX errors are augmented with the device's profile id.
   uint64_t load_module(const std::string& ptx_src);
+  // Loads a cubin (the SASS a fatbin carries for this architecture). Its
+  // kernels are looked up and launched like a PTX module's.
+  uint64_t load_cubin(const uint8_t* image, size_t size);
   void unload_module(uint64_t module_id);
 
   // Looks up a kernel. The returned pointer lives as long as the module.
@@ -108,6 +111,7 @@ class Device {
     // address -> kernel; a lazy module's kernels are null until parsed
     std::vector<std::pair<uint64_t, const ptx::EntryFn*>> kernels;
     std::shared_ptr<LazyModule> lazy;
+    std::shared_ptr<sass::Module> sass;   // a cubin's: its code, banks and variables
   };
   // A list, not a vector: a function handle keeps a pointer to its module's
   // symbol table, and a vector moved every module whenever another loaded, so

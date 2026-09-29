@@ -29,6 +29,7 @@
 
 #include "error_names.hpp"
 #include "fatbin.hpp"
+#include "vgpu/sass/cubin.hpp"
 #include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/exec/tensormap.hpp"
@@ -826,17 +827,34 @@ VGPU_EXPORT CUresult cuModuleLoadData(CUmodule* module, const void* image) {
     std::string extracted;
     uint32_t magic = 0;
     std::memcpy(&magic, image, 4);
-    if (magic == 0x466243B1u || magic == 0xBA55ED50u) {
-      // A fatbin (wrapper or container): pull out the PTX image.
-      extracted = best_ptx(image);
-      text = extracted.c_str();
-    } else if (text[0] == 0x7f) {
-      throw vgpu::Error::make(vgpu::Err::Unsupported,
-                              "cuModuleLoadData received a bare cubin/ELF image; VirtualGPU loads "
-                              "PTX (embedded PTX text or a fatbin containing PTX)");
-    }
     int dev = current_device(s);
-    uint64_t mid = s.rt->device(dev).load_module(text);
+    uint64_t mid = 0;
+    const vgpu::DeviceProfile& prof = s.rt->device(dev).profile();
+    const uint32_t cc = static_cast<uint32_t>(prof.cc_major * 10 + prof.cc_minor);
+    if (magic == 0x466243B1u || magic == 0xBA55ED50u) {
+      // A fatbin (wrapper or container): its SASS for this GPU if it has
+      // some, as the real driver runs; else its PTX.
+      const std::string cubin = vgpu::cuda::pick_cubin(image, cc);
+      if (!cubin.empty()) {
+        mid = s.rt->device(dev).load_cubin(reinterpret_cast<const uint8_t*>(cubin.data()), cubin.size());
+      } else {
+        extracted = best_ptx(image);
+        text = extracted.c_str();
+        mid = s.rt->device(dev).load_module(text);
+      }
+    } else if (vgpu::sass::is_cubin(image, 64)) {
+      // A bare cubin: its size is in its own headers (the section table ends it).
+      const auto* b = static_cast<const uint8_t*>(image);
+      uint64_t shoff;
+      uint16_t shentsize, shnum;
+      std::memcpy(&shoff, b + 0x28, 8);
+      std::memcpy(&shentsize, b + 0x3a, 2);
+      std::memcpy(&shnum, b + 0x3c, 2);
+      const uint64_t size = shoff + static_cast<uint64_t>(shentsize) * shnum;
+      mid = s.rt->device(dev).load_cubin(b, size);
+    } else {
+      mid = s.rt->device(dev).load_module(text);
+    }
     uintptr_t h = make_handle(s, kTagModule);
     s.modules[h] = {dev, mid};
     *module = reinterpret_cast<CUmodule>(h);

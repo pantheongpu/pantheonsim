@@ -15,6 +15,10 @@
 #include <variant>
 #include <vector>
 
+namespace vgpu::sass {
+struct Module;
+}
+
 namespace vgpu::ptx {
 
 // Scalar type of an operand/instruction, e.g. ".s32" -> {Kind::S, 32}.
@@ -1060,6 +1064,9 @@ struct EntryFn {
   // rounded up to the largest alignment an extern .shared declaration asks
   // for. Equal to static_shared_size when nothing asks for more.
   uint32_t dynamic_shared_offset = 0;
+  // A kernel loaded from a cubin rather than PTX: its SASS, which the launch
+  // runs instead of `body` (empty then). See nvidia/docs/sass.md.
+  std::shared_ptr<const sass::Module> sass;
 };
 
 // A module-scope .global/.const variable, materialized into device memory at

@@ -128,6 +128,9 @@ add_library(vgpu STATIC
   amd/src/codeobject.cpp
   amd/src/gcn_decode.cpp
   src/sass/decode.cpp
+  src/sass/cubin.cpp
+  src/sass/module.cpp
+  src/sass/exec.cpp
   amd/src/rdna_decode.cpp
   amd/src/debugger.cpp
   amd/src/gcn_exec.cpp

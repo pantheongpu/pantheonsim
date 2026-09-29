@@ -16,6 +16,7 @@
 #include <cctype>
 
 #include "vgpu/ptx/parser.hpp"
+#include "vgpu/sass/exec.hpp"
 
 #include <map>
 #include <set>
@@ -305,6 +306,46 @@ uint64_t Device::load_module(const std::string& ptx_src) {
   }
 }
 
+uint64_t Device::load_cubin(const uint8_t* image, size_t size) {
+  std::shared_ptr<sass::Module> sm = sass::load(image, size, mem_, profile_);
+  auto mod = std::make_shared<ptx::Module>();
+  mod->target = "sm_" + std::to_string(sm->sm);
+  for (const sass::CubinKernel& k : sm->cubin.kernels) {
+    ptx::EntryFn e;
+    e.name = k.name;
+    for (const sass::CubinParam& p : k.params) {
+      ptx::ParamDecl d;
+      d.name = k.name + "_param_" + std::to_string(p.ordinal);
+      d.size = p.size;
+      d.align = p.size >= 8 ? 8 : p.size >= 4 ? 4 : 1;
+      e.params.push_back(d);
+    }
+    e.static_shared_size = static_cast<uint32_t>(k.shared_bytes);
+    e.dynamic_shared_offset = e.static_shared_size;
+    e.local_frame_size = std::max(k.frame_size, k.min_stack);
+    if (k.max_threads) e.max_ntid = {k.max_threads, 1, 1};
+    // The register count is ptxas's, not an estimate from PTX.
+    e.regs_analyzed = true;
+    e.cached_regs_per_thread = k.regs;
+    e.sass = sm;
+    mod->entries.push_back(std::move(e));
+  }
+  LoadedModule lm;
+  lm.id = next_module_id_++;
+  for (const auto& [name, va] : sm->symbol_va) lm.symbols[name] = va;
+  for (const auto& e : mod->entries) {
+    const uint64_t va = next_kernel_va_;
+    next_kernel_va_ += kKernelVaStride;
+    lm.symbols[e.name] = va;
+    lm.kernels.emplace_back(va, &e);
+  }
+  lm.mod = std::move(mod);
+  lm.sass = std::move(sm);
+  const uint64_t id = lm.id;
+  modules_.push_back(std::move(lm));
+  return id;
+}
+
 void Device::reset() {
   // Modules first: their globals are allocations, and unloading frees them by
   // handle. Whatever is left afterwards -- cudaMalloc, arrays, pitched
@@ -318,6 +359,7 @@ void Device::unload_module(uint64_t module_id) {
   for (auto it = modules_.begin(); it != modules_.end(); ++it) {
     if (it->id == module_id) {
       for (uint64_t va : it->global_vas) mem_.free(va);
+      if (it->sass) sass::unload(*it->sass, mem_);
       modules_.erase(it);
       return;
     }
@@ -841,6 +883,12 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
 
 void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
                         const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms) {
+  if (fn.sass) {
+    // SASS: the executor for machine code (nvidia/docs/sass.md).
+    report_counters(ordinal_, fn.name, cfg, sass::launch(*fn.sass, fn.name, cfg, args, mem_, profile_));
+    if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(ordinal_), 0.0);
+    return;
+  }
   if (!telemetry_) {
     report_counters(ordinal_, fn.name, cfg, exec::launch(fn, cfg, args, mem_, profile_, syms));
     return;
