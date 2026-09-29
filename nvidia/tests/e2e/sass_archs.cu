@@ -193,8 +193,10 @@ __global__ void cluster_ids(unsigned* out) {
 // into the next one's shared memory, and adds into rank 0's, completing on
 // that block's mbarrier; each block waits for its own. out: per block, the
 // stored pair and (rank 0) the sum.
+// st.async and red.async are PTX 8.1 (CUDA 12.1).
+#define HAVE_ST_ASYNC (__CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 1))
 __global__ void async_stores(unsigned* out) {
-#if __CUDA_ARCH__ >= 900
+#if __CUDA_ARCH__ >= 900 && HAVE_ST_ASYNC
   __shared__ __align__(8) uint64_t bar;
   __shared__ __align__(16) uint32_t slot[4];
   __shared__ uint32_t sum;
@@ -238,8 +240,10 @@ __global__ void async_stores(unsigned* out) {
 // Cluster launch control (sm_100+): each block does its own block's work,
 // then keeps cancelling blocks that have not started and doing theirs. Every
 // block's work must be done exactly once, whoever does it.
+// Cluster launch control is PTX 8.6 (CUDA 12.8).
+#define HAVE_CLC (__CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 8))
 __global__ void work_steal(unsigned* done, unsigned* stolen) {
-#if __CUDA_ARCH__ >= 1000
+#if __CUDA_ARCH__ >= 1000 && HAVE_CLC
   __shared__ __align__(16) uint32_t resp[4];
   __shared__ __align__(8) uint64_t bar;
   __shared__ unsigned next_id, have;
@@ -455,7 +459,7 @@ int main() {
   {
     int major = 0;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
-    if (major >= 9) {
+    if (major >= 9 && HAVE_ST_ASYNC) {
       unsigned* da;
       cudaMalloc(&da, 12 * sizeof(unsigned));
       cudaMemset(da, 0, 12 * sizeof(unsigned));
@@ -478,7 +482,7 @@ int main() {
       }
       CHECK(ha[2] == 1 + 2 + 3 + 4, "red.async sum %u, want 10", ha[2]);
     }
-    if (major >= 10) {
+    if (major >= 10 && HAVE_CLC) {
       const int nb = 64;
       unsigned *dd, *ds;
       cudaMalloc(&dd, nb * sizeof(unsigned));
