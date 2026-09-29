@@ -240,6 +240,14 @@ Cubin parse_cubin(const uint8_t* data, size_t size) {
       }
     }
   }
+  // The call graph: pairs of symbol indices (caller, callee); negative ones
+  // are markers.
+  if (const CubinSection* cg = c.section(".nv.callgraph")) {
+    for (size_t o = 0; o + 8 <= cg->bytes.size(); o += 8) {
+      const uint32_t a = u32(&cg->bytes[o]), b = u32(&cg->bytes[o + 4]);
+      if (a < sym_names.size() && b < sym_names.size() && a != 0) c.calls.emplace_back(sym_names[a], sym_names[b]);
+    }
+  }
   // A function the module calls but does not define is an undefined symbol.
   for (const CubinSymbol& sym : c.symbols)
     if (sym.section.empty() && !sym.name.empty() &&

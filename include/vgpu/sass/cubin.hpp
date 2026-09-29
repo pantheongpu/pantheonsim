@@ -81,6 +81,8 @@ struct Cubin {
   std::vector<CubinSymbol> symbols;
   std::vector<CubinKernel> kernels;
   std::vector<std::string> externs;   // functions the module calls but does not define (vprintf, malloc)
+  // .nv.callgraph: who calls whom, by symbol name (externs included).
+  std::vector<std::pair<std::string, std::string>> calls;
 
   const CubinSection* section(const std::string& name) const {
     const auto it = section_index.find(name);

@@ -67,6 +67,10 @@ void unload(Module& m, MemoryManager& mem);
 // 'a' image.
 bool runs_on(int cubin_sm, bool arch_specific, int device_sm);
 
+// Every function a kernel can reach through calls, from the call graph --
+// externs such as vprintf and malloc included.
+std::vector<std::string> reachable(const Module& m, const std::string& kernel);
+
 // Runs one kernel of a loaded module over the grid.
 exec::LaunchStats launch(const Module& m, const std::string& kernel, const exec::LaunchConfig& cfg,
                          const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,

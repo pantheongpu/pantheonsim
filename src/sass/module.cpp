@@ -159,6 +159,20 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
   return m;
 }
 
+std::vector<std::string> reachable(const Module& m, const std::string& kernel) {
+  std::vector<std::string> out, todo{kernel};
+  while (!todo.empty()) {
+    const std::string f = todo.back();
+    todo.pop_back();
+    for (const auto& [caller, callee] : m.cubin.calls)
+      if (caller == f && std::find(out.begin(), out.end(), callee) == out.end()) {
+        out.push_back(callee);
+        todo.push_back(callee);
+      }
+  }
+  return out;
+}
+
 void unload(Module& m, MemoryManager& mem) {
   for (uint64_t va : m.allocations) {
     try {

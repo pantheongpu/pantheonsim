@@ -20,8 +20,48 @@ uint32_t Runner::ival(Warp& w, const Operand& o, unsigned lane) {
 
 // ---- dispatch ------------------------------------------------------------------
 
+// The profiler's instruction classes, by SASS op.
+exec::InstClass inst_class(Op op) {
+  using C = exec::InstClass;
+  switch (op) {
+    case Op::FADD: case Op::FMUL: case Op::FFMA: case Op::FMNMX: case Op::FSETP: case Op::FSET: case Op::FSEL:
+    case Op::FCHK: case Op::MUFU:
+      return C::Fp32;
+    case Op::DADD: case Op::DMUL: case Op::DFMA: case Op::DSETP: return C::Fp64;
+    case Op::HADD2: case Op::HMUL2: case Op::HFMA2: case Op::HSETP2: case Op::HMNMX2: return C::Fp16;
+    case Op::I2F: case Op::I2FP: case Op::F2I: case Op::F2IP: case Op::F2F: case Op::F2FP: case Op::FRND:
+    case Op::I2I: case Op::I2IP: case Op::PRMT: case Op::UPRMT:
+      return C::BitConvert;
+    case Op::BRA: case Op::BRX: case Op::JMP: case Op::CALL: case Op::RET: case Op::EXIT: case Op::BSSY:
+    case Op::BSYNC: case Op::BREAK: case Op::WARPSYNC: case Op::BAR: case Op::BPT: case Op::YIELD:
+    case Op::NANOSLEEP:
+      return C::Control;
+    case Op::LDG: case Op::STG: case Op::LDS: case Op::STS: case Op::LDL: case Op::STL: case Op::LD: case Op::ST:
+    case Op::LDC: case Op::ATOM: case Op::ATOMG: case Op::ATOMS: case Op::RED: case Op::LDGSTS: case Op::LDSM:
+    case Op::SULD: case Op::SUST: case Op::TEX: case Op::TLD: case Op::TLD4: case Op::MEMBAR: case Op::CCTL:
+      return C::Memory;
+    case Op::HMMA: case Op::IMMA: case Op::BMMA: case Op::DMMA: case Op::MOVM: return C::Tensor;
+    case Op::IMAD: case Op::IADD3: case Op::LOP3: case Op::SHF: case Op::LEA: case Op::IMNMX: case Op::IABS:
+    case Op::POPC: case Op::FLO: case Op::BREV: case Op::BMSK: case Op::SGXT: case Op::IDP: case Op::VABSDIFF4: case Op::ISETP:
+    case Op::UIMAD: case Op::UIADD3: case Op::ULOP3: case Op::USHF: case Op::ULEA: case Op::UISETP:
+    case Op::UPOPC: case Op::UFLO:
+      return C::Integer;
+    default: return C::Misc;
+  }
+}
+
 void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
   const Mask ex = guard_mask(w, ins, group);
+  {
+    exec::LaunchStats& st = blk.st;
+    const uint64_t lanes = static_cast<uint64_t>(std::popcount(ex));
+    ++st.instructions;
+    st.thread_instructions += lanes;
+    st.inst_by_class[static_cast<size_t>(inst_class(ins.op))] += lanes;
+    if (ins.op == Op::HMMA || ins.op == Op::IMMA || ins.op == Op::BMMA || ins.op == Op::DMMA) ++st.tensor_instructions;
+    if (ins.op == Op::BAR && ins.mnemonic == "BAR" && ex) ++st.barriers;
+    if (ins.op == Op::BRA && ex && ex != group) ++st.divergent_branches;
+  }
   bool pcs_set = false;
   try {
     switch (ins.op) {
@@ -35,9 +75,11 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
         break;
       case Op::LDG: case Op::STG: case Op::LDS: case Op::STS: case Op::LDL: case Op::STL:
       case Op::LD: case Op::ST: case Op::LDC: case Op::ATOM: case Op::ATOMG: case Op::ATOMS:
-      case Op::RED: case Op::LDGSTS: case Op::LDGDEPBAR: case Op::LDSM: case Op::SULD: case Op::SUST:
-      case Op::TEX: case Op::TLD:
+      case Op::RED: case Op::LDGSTS: case Op::LDGDEPBAR: case Op::LDSM:
         exec_mem(blk, w, ins, ex);
+        break;
+      case Op::TEX: case Op::TLD: case Op::TLD4: case Op::SULD: case Op::SUST:
+        exec_tex(blk, w, ins, ex);
         break;
       case Op::SHFL: case Op::VOTE: case Op::VOTEU: case Op::MATCH: case Op::REDUX:
         exec_warp(blk, w, ins, ex, group);
@@ -59,8 +101,10 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
   } catch (const Fault& f) {
     fault(w, ins, static_cast<unsigned>(std::countr_zero(group ? group : 1u)), f.what());
   } catch (const Error& e) {
-    // A memory error from the device (an address out of bounds, freed).
-    fault(w, ins, static_cast<unsigned>(std::countr_zero(group ? group : 1u)), e.what());
+    // An error from the device (an address out of bounds, a trap), kept as
+    // what it is with the instruction's place added (once).
+    if (e.message().rfind("SASS kernel ", 0) == 0) throw;
+    fault(w, ins, static_cast<unsigned>(std::countr_zero(group ? group : 1u)), e.message(), e.code());
   }
   if (!pcs_set) each_lane(group, [&](unsigned l) { w.pc[l] += 16; });
   // VGPU_SASS_TRACE=<warp>: every instruction that warp runs, with the lane
@@ -346,6 +390,48 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         write32(w, ins.dst[0], l, r);
       });
       return;
+    case Op::IDP: {
+      const bool two = ins.f[0], sa = ins.f[1], sb = ins.f[2], hi = ins.f[3];
+      each_lane(ex, [&](unsigned l) {
+        const uint32_t a = read32(w, ins.src[0], l), b = read32(w, ins.src[1], l);
+        uint32_t acc = read32(w, ins.src[2], l);
+        const auto byte = [](uint32_t v, unsigned i, bool s) {
+          const uint32_t x = (v >> (8 * i)) & 0xff;
+          return s ? static_cast<int32_t>(static_cast<int8_t>(x)) : static_cast<int32_t>(x);
+        };
+        for (unsigned i = 0; i < (two ? 2u : 4u); ++i) {
+          int32_t x;
+          if (two) {
+            const uint32_t h = (a >> (16 * i)) & 0xffff;
+            x = sa ? static_cast<int32_t>(static_cast<int16_t>(h)) : static_cast<int32_t>(h);
+          } else {
+            x = byte(a, i, sa);
+          }
+          acc += static_cast<uint32_t>(x) * static_cast<uint32_t>(byte(b, i + (two && hi ? 2 : 0), sb));
+        }
+        write32(w, ins.dst[0], l, acc);
+      });
+      return;
+    }
+    case Op::VABSDIFF4: {
+      const bool accum = ins.f[0], sgn = ins.f[1];
+      each_lane(ex, [&](unsigned l) {
+        const uint32_t a = read32(w, ins.src[0], l), b = read32(w, ins.src[1], l), c = read32(w, ins.src[2], l);
+        uint32_t packed = 0, sum = 0;
+        for (unsigned i = 0; i < 4; ++i) {
+          int32_t x = (a >> (8 * i)) & 0xff, y = (b >> (8 * i)) & 0xff;
+          if (sgn) {
+            x = static_cast<int8_t>(x);
+            y = static_cast<int8_t>(y);
+          }
+          const uint32_t d = static_cast<uint32_t>(x > y ? x - y : y - x);
+          packed |= (d & 0xff) << (8 * i);
+          sum += d;
+        }
+        write32(w, ins.dst[0], l, accum ? sum + c : packed);
+      });
+      return;
+    }
     case Op::BMSK:
       each_lane(ex, [&](unsigned l) {
         const uint32_t pos = read32(w, ins.src[0], l), width = read32(w, ins.src[1], l);
@@ -423,7 +509,7 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       return;
     }
     default:
-      fault(w, ins, 0, std::string("SASS: ") + op_name(ins.op) + " is not implemented yet");
+      fault(w, ins, 0, std::string("SASS: ") + op_name(ins.op) + " is not implemented yet", Err::UnsupportedPtx);
   }
 }
 
@@ -717,11 +803,62 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
       return;
     }
     default:
-      fault(w, ins, 0, std::string("SASS: ") + op_name(ins.op) + " is not implemented yet");
+      fault(w, ins, 0, std::string("SASS: ") + op_name(ins.op) + " is not implemented yet", Err::UnsupportedPtx);
   }
 }
 
 // ---- memory ------------------------------------------------------------------
+
+// Counts one warp-level access: per-lane operations and bytes, the 32-byte
+// sectors the lanes' addresses touch, and shared-memory bank conflicts.
+void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 local */, bool store,
+                  const uint64_t* addr, Mask lanes, uint32_t bytes) {
+  const uint64_t n = static_cast<uint64_t>(std::popcount(lanes));
+  if (!n) return;
+  std::vector<uint64_t> sectors;
+  each_lane(lanes, [&](unsigned l) {
+    for (uint64_t s = addr[l] / 32; s <= (addr[l] + bytes - 1) / 32; ++s) sectors.push_back(s);
+  });
+  std::sort(sectors.begin(), sectors.end());
+  const uint64_t distinct = static_cast<uint64_t>(std::unique(sectors.begin(), sectors.end()) - sectors.begin());
+  switch (space) {
+    case 0:
+      (store ? st.global_stores : st.global_loads) += n;
+      (store ? st.global_bytes_written : st.global_bytes_read) += n * bytes;
+      st.global_sectors += distinct;
+      ++st.global_requests;
+      (store ? st.global_sectors_st : st.global_sectors_ld) += distinct;
+      ++(store ? st.global_requests_st : st.global_requests_ld);
+      (store ? st.global_bytes_st : st.global_bytes_ld) += n * bytes;
+      break;
+    case 1: {
+      (store ? st.shared_stores : st.shared_loads) += n;
+      (store ? st.shared_bytes_written : st.shared_bytes_read) += n * bytes;
+      ++st.shared_requests;
+      ++(store ? st.shared_requests_st : st.shared_requests_ld);
+      // 32 banks of 4 bytes: lanes on different words of one bank take a
+      // pass each; lanes on the same word share one.
+      std::vector<uint64_t> words[32];
+      each_lane(lanes, [&](unsigned l) {
+        for (uint64_t a = addr[l] & ~3ull; a < addr[l] + bytes; a += 4) words[(a / 4) % 32].push_back(a / 4);
+      });
+      uint64_t passes = 1;
+      for (auto& v : words) {
+        std::sort(v.begin(), v.end());
+        passes = std::max<uint64_t>(passes, static_cast<uint64_t>(std::unique(v.begin(), v.end()) - v.begin()));
+      }
+      st.shared_bank_conflicts += passes - 1;
+      (store ? st.shared_bank_conflicts_st : st.shared_bank_conflicts_ld) += passes - 1;
+      break;
+    }
+    default:
+      (store ? st.local_stores : st.local_loads) += n;
+      (store ? st.local_bytes_written : st.local_bytes_read) += n * bytes;
+      st.local_sectors += distinct;
+      ++st.local_requests;
+      break;
+  }
+}
 
 void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const unsigned size = ins.f[0];
@@ -757,10 +894,14 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       const bool wide = e || ins.w.bit(90);
       const bool ur = ins.w.bit(91) && !e;
       const Operand& a = ins.src[0];   // the address (a store's data is src[1])
+      uint64_t addrs[32] = {};
+      int space = 0;
       each_lane(ex, [&](unsigned l) {
         const uint64_t g = address(a, l, wide, ur, store ? 64 : 32, 0);
         uint64_t off;
         const Space sp = generic ? classify(g, &off) : (off = g, Space::Global);
+        addrs[l] = off;
+        space = sp == Space::Global ? 0 : sp == Space::Shared ? 1 : 2;
         if (store) {
           const Operand& d = ins.src[1];
           if (bytes <= 4) {
@@ -785,6 +926,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           }
         }
       });
+      count_access(blk.st, space, store, addrs, ex, bytes);
       return;
     }
     case Op::LDS: case Op::STS: case Op::LDL: case Op::STL: {
@@ -794,8 +936,10 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       const unsigned stride = shared ? strides[ins.f[3]] : 0;
       const bool ur = ins.w.bit(91);
       const Operand& a = ins.src[0];   // the address (a store's data is src[1])
+      uint64_t addrs[32] = {};
       each_lane(ex, [&](unsigned l) {
         const uint64_t off = static_cast<uint32_t>(address(a, l, false, ur, store ? 64 : 32, stride));
+        addrs[l] = off;
         const Space sp = shared ? Space::Shared : Space::Local;
         if (store) {
           const Operand& d = ins.src[1];
@@ -811,6 +955,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             for (unsigned i = 0; i < bytes / 4; ++i) w.reg(d.reg + i, l) = v[i];
         }
       });
+      count_access(blk.st, shared ? 1 : 2, store, addrs, ex, bytes);
       return;
     }
     case Op::LDC: {
@@ -888,6 +1033,8 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         }
         if (!is64) nw &= 0xffffffff;
         mem_write(blk, w, l, sp, addr, &nw, n);
+        ++blk.st.atomics;
+        blk.st.atomic_bytes += n;
         if (!red) {
           const Operand& d = ins.op == Op::ATOMS ? ins.dst[0] : ins.dst[1];
           if (is64) write64(w, d, l, old);
@@ -898,7 +1045,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       return;
     }
     default:
-      fault(w, ins, 0, std::string("SASS: ") + op_name(ins.op) + " is not implemented yet");
+      fault(w, ins, 0, std::string("SASS: ") + op_name(ins.op) + " is not implemented yet", Err::UnsupportedPtx);
   }
 }
 
@@ -995,14 +1142,339 @@ void Runner::exec_warp(Block&, Warp& w, const Instr& ins, Mask ex, Mask) {
       return;
     }
     default:
-      fault(w, ins, 0, std::string("SASS: ") + op_name(ins.op) + " is not implemented yet");
+      fault(w, ins, 0, std::string("SASS: ") + op_name(ins.op) + " is not implemented yet", Err::UnsupportedPtx);
   }
 }
 
 // ---- tensor cores --------------------------------------------------------------
 
-void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask) {
-  fault(w, ins, 0, std::string("SASS: ") + op_name(ins.op) + " is not implemented yet");
+// The warp-wide matrix multiply-accumulates. They are PTX's mma.sync, and
+// read their registers in the fragment layouts the PTX ISA documents (9.7.16):
+// lane = 4 * group + tid; A register r holds row group + 8(r % 2), columns
+// from tid * per_reg + (r / 2) * 4 * per_reg; B register r rows tid * per_reg
+// + 4 * per_reg * r, column group; C/D element s at row group + 8(s / 2),
+// column 2 tid + s % 2. The numerics are the PTX interpreter's, which were
+// checked against an RTX 3060: float products exact, summed in f32 in K
+// order; f64 a chain of fused multiply-adds; integers exact, .SAT clamping
+// after every 128 bits of K; 1-bit ones counting .AND/.XOR bits.
+namespace {
+enum class MmaT { F16, BF16, TF32, S8, U8, S4, U4, B1, F64 };
+unsigned mma_bits(MmaT t) {
+  switch (t) {
+    case MmaT::F16: case MmaT::BF16: return 16;
+    case MmaT::S8: case MmaT::U8: return 8;
+    case MmaT::S4: case MmaT::U4: return 4;
+    case MmaT::B1: return 1;
+    case MmaT::F64: return 64;
+    default: return 32;
+  }
+}
+double mma_elem(MmaT t, uint64_t v, unsigned e) {
+  switch (t) {
+    case MmaT::F16: return half_to_f32(static_cast<uint16_t>(v >> (16 * e)));
+    case MmaT::BF16: return bf16_to_f32(static_cast<uint16_t>(v >> (16 * e)));
+    case MmaT::TF32: {
+      // tf32: the top 19 bits of an f32; the rest are ignored.
+      return as_f32(static_cast<uint32_t>(v) & 0xffffe000u);
+    }
+    case MmaT::S8: return static_cast<int8_t>(v >> (8 * e));
+    case MmaT::U8: return static_cast<uint8_t>(v >> (8 * e));
+    case MmaT::S4: return static_cast<int8_t>(static_cast<uint8_t>(((v >> (4 * e)) & 0xf) << 4)) >> 4;
+    case MmaT::U4: return static_cast<double>((v >> (4 * e)) & 0xf);
+    case MmaT::B1: return static_cast<double>((v >> e) & 1);
+    case MmaT::F64: return as_f64(v);
+  }
+  return 0;
+}
+}  // namespace
+
+// ---- textures and surfaces ---------------------------------------------------------
+//
+// The object is named by a constant-bank word (the header index, 40-53, in
+// the bank at 54-58): the 64-bit handle the host created, which the shared
+// sampler (vgpu/exec/texture.hpp) looks up as the PTX interpreter does.
+//
+// A fetch's operands are two register vectors, from Mesa NAK's encoder (MIT)
+// and checked against ptxas's output: the first holds the layer index, if
+// any, then the coordinates; the second the LOD or bias, the packed offsets
+// (bit 76), the depth reference (bit 78). The .SCR form (bit 60) splits the
+// whole list of up to four between them, two and two (1+1 for two, 2+1 for
+// three). The enabled components (the mask, 72-75) come back in order, the
+// first two in the register pair at 16 and the rest in the pair at 64.
+//
+// Surfaces take the coordinates -- x in bytes, then y, then the layer or z --
+// in consecutive registers from 24; SUST's data from 32. The out-of-range
+// mode (59-60) is .IGN (PTX .zero), the default (.clamp) or .TRAP.
+void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
+  const Word& word = ins.w;
+  const unsigned bank = static_cast<unsigned>(word.field(54, 5));
+  const uint64_t hoff = 4 * word.field(40, 14);
+  const uint64_t handle = cbank32(bank, hoff) | (static_cast<uint64_t>(cbank32(bank, hoff + 4)) << 32);
+  const bool surface = ins.op == Op::SULD || ins.op == Op::SUST;
+  const exec::TextureDesc& d =
+      exec::texture_lookup(cfg_.textures, handle, surface ? exec::TexKind::Surface : exec::TexKind::Texture);
+  const auto rd = [&](unsigned r, unsigned l) -> uint32_t { return r == kRZ ? 0u : w.reg(r, l); };
+  const auto wr = [&](unsigned r, unsigned l, uint32_t v) {
+    if (r != kRZ) w.reg(r, l) = v;
+  };
+  const uint64_t n = static_cast<uint64_t>(std::popcount(ex));
+
+  if (surface) {
+    const unsigned dim = static_cast<unsigned>(word.field(61, 3));   // 1D, 1D_BUFFER, 1D_ARRAY, 2D, 2D_ARRAY, 3D
+    const unsigned size = static_cast<unsigned>(word.field(73, 3));  // U8, S8, U16, S16, 32, 64, 128
+    if (dim > 5 || size > 6) fault(w, ins, 0, "surface access form not known");
+    const uint32_t bytes = size <= 1 ? 1 : size <= 3 ? 2 : size == 4 ? 4 : size == 5 ? 8 : 16;
+    static const uint8_t kOob[4] = {exec::kSurfaceZero, exec::kSurfaceClamp, exec::kSurfaceTrap, exec::kSurfaceTrap};
+    const unsigned cr = static_cast<unsigned>(word.field(24, 8));
+    const unsigned dr = ins.op == Op::SULD ? static_cast<unsigned>(word.field(16, 8))
+                                           : static_cast<unsigned>(word.field(32, 8));
+    const unsigned words = (bytes + 3) / 4;
+    each_lane(ex, [&](unsigned l) {
+      exec::SurfaceAccess a;
+      a.layered = dim == 2 || dim == 4;
+      a.dims = dim == 5 ? 3 : dim >= 3 ? 2 : 1;
+      a.x = static_cast<int32_t>(rd(cr, l));
+      if (a.dims > 1) a.y = static_cast<int32_t>(rd(cr + 1, l));
+      if (a.dims > 2) a.z = static_cast<int32_t>(rd(cr + 2, l));
+      if (a.layered) a.layer = rd(cr + a.dims, l);
+      a.bytes = bytes;
+      a.oob = kOob[word.field(59, 2)];
+      const std::optional<uint64_t> at = exec::surface_address(d, a);
+      if (ins.op == Op::SULD) {
+        for (unsigned i = 0; i < words; ++i) {
+          uint32_t v = 0;
+          if (at) v = static_cast<uint32_t>(mem_.load_scalar(*at + 4 * i, std::min(bytes, 4u)));
+          if (size == 1) v = static_cast<uint32_t>(static_cast<int8_t>(v));
+          if (size == 3) v = static_cast<uint32_t>(static_cast<int16_t>(v));
+          wr(dr + i, l, v);
+        }
+      } else if (at) {
+        for (unsigned i = 0; i < words; ++i) mem_.store_scalar(*at + 4 * i, std::min(bytes, 4u), rd(dr + i, l));
+      }
+    });
+    (ins.op == Op::SUST ? blk.st.global_stores : blk.st.global_loads) += n;
+    (ins.op == Op::SUST ? blk.st.global_bytes_written : blk.st.global_bytes_read) += n * bytes;
+    return;
+  }
+
+  // dim: 1D, 2D, 3D, CUBE, ARRAY_1D, ARRAY_2D, -, ARRAY_CUBE
+  const unsigned dim = ins.f[0];
+  if (dim == 6) fault(w, ins, 0, "texture dimension 6 is not known");
+  const bool layered = dim >= 4, cube = dim == 3 || dim == 7;
+  const uint32_t dims = cube ? 3 : (dim & 3) + 1;
+  const unsigned lod_mode = ins.op == Op::TLD4 ? 0 : static_cast<unsigned>(word.field(87, 3));
+  const bool has_lod = lod_mode == 2 || lod_mode == 3 || lod_mode == 5;
+  if (lod_mode == 4 || lod_mode == 5)
+    fault(w, ins, 0, "texture fetches with a LOD clamp are not implemented yet", Err::UnsupportedPtx);
+  if (word.bit(76) || (ins.op == Op::TLD4 && word.bit(77)))
+    fault(w, ins, 0, "texture fetches with offsets are not implemented yet", Err::UnsupportedPtx);
+  if (word.bit(78)) fault(w, ins, 0, "depth-compare texture fetches are not implemented yet", Err::UnsupportedPtx);
+  if (ins.op == Op::TEX && lod_mode == 2)
+    fault(w, ins, 0, "texture fetches with a LOD bias are not implemented yet", Err::UnsupportedPtx);
+  const unsigned n0 = (layered ? 1 : 0) + dims, n1 = has_lod ? 1 : 0;
+  const unsigned total = n0 + n1;
+  unsigned in0 = n0;   // components in the first vector
+  if (word.bit(60)) {
+    if (total > 4) fault(w, ins, 0, "a .SCR texture fetch of more than four components");
+    in0 = total == 1 ? 1 : total == 2 ? 1 : 2;
+  }
+  const unsigned r0 = static_cast<unsigned>(word.field(24, 8)), r1 = static_cast<unsigned>(word.field(32, 8));
+  const unsigned d0 = static_cast<unsigned>(word.field(16, 8)), d1 = static_cast<unsigned>(word.field(64, 8));
+  const unsigned mask = static_cast<unsigned>(word.field(72, 4));
+  const bool int_coords = ins.op == Op::TLD;
+  each_lane(ex, [&](unsigned l) {
+    uint32_t comp[4] = {};
+    for (unsigned i = 0; i < total; ++i) comp[i] = i < in0 ? rd(r0 + i, l) : rd(r1 + (i - in0), l);
+    exec::TexFetch f;
+    // ptxas fetches a 1D texture as a 2D one at y = 0, which is what the
+    // hardware makes of it (a 2D texture of height 1); the sampler's 1D
+    // fetch is that already.
+    f.dims = dims == 2 && !layered && d.height == 0 && d.depth == 0 ? 1 : dims;
+    f.layered = layered;
+    f.cube = cube;
+    unsigned k = 0;
+    if (layered) f.layer = comp[k++];
+    for (unsigned i = 0; i < dims; ++i) f.coord[i] = comp[k++];
+    f.float_coords = !int_coords;
+    // The result's type is the texture's (its format and read mode), not
+    // the instruction's: SASS has one TEX for every PTX destination type.
+    f.float_result = d.kind == exec::ChannelKind::Float || d.read_as_normalized_float;
+    if (has_lod) {
+      f.explicit_lod = true;
+      f.lod = int_coords ? static_cast<double>(static_cast<int32_t>(comp[k])) : static_cast<double>(std::bit_cast<float>(comp[k]));
+    }
+    if (ins.op == Op::TLD4) f.gather = static_cast<int>(ins.f[2]);
+    uint32_t out[4];
+    exec::texture_fetch(mem_, d, f, out);
+    unsigned j = 0;
+    for (unsigned c = 0; c < 4; ++c) {
+      if (!(mask >> c & 1)) continue;
+      wr(j < 2 ? d0 + j : d1 + (j - 2), l, out[c]);
+      ++j;
+    }
+  });
+  blk.st.global_loads += n;
+  blk.st.global_bytes_read += n * 16;
+}
+
+void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
+  if (ins.op == Op::MOVM) {
+    // MOVM.16.MT88: transpose an 8x8 matrix of 16-bit elements across the
+    // warp (movmatrix): lane 4g+t holds row g, columns 2t, 2t+1.
+    uint16_t m[8][8];
+    for (unsigned l = 0; l < 32; ++l) {
+      const uint32_t v = read32(w, ins.src[0], l);
+      m[l / 4][2 * (l % 4)] = static_cast<uint16_t>(v);
+      m[l / 4][2 * (l % 4) + 1] = static_cast<uint16_t>(v >> 16);
+    }
+    each_lane(ex, [&](unsigned l) {
+      const unsigned g = l / 4, t = l % 4;
+      write32(w, ins.dst[0], l, m[2 * t][g] | (static_cast<uint32_t>(m[2 * t + 1][g]) << 16));
+    });
+    return;
+  }
+  unsigned M = 16, K = 8;
+  MmaT at = MmaT::F16, bt = MmaT::F16;
+  enum { AccF32, AccF16, AccS32, AccF64 } acc = AccF32;
+  bool sat = false, b1_and = false;
+  unsigned rnd = 0;
+  switch (ins.op) {
+    case Op::HMMA: {
+      if (ins.f[3]) fault(w, ins, 0, "sparse HMMA is not implemented yet");
+      static const unsigned ks[] = {8, 16, 4, 0};
+      K = ks[ins.f[0]];
+      at = bt = ins.f[2] == 1 ? MmaT::BF16 : ins.f[2] == 2 ? MmaT::TF32 : MmaT::F16;
+      if (at == MmaT::TF32 && ins.f[0] == 0) K = 8;
+      acc = ins.f[1] ? AccF32 : AccF16;
+      break;
+    }
+    case Op::IMMA: {
+      if (ins.f[3]) fault(w, ins, 0, "sparse IMMA is not implemented yet");
+      const unsigned shape = ins.f[0];
+      M = shape < 4 ? 8 : 16;
+      const bool a4 = ins.f[4], b4 = ins.f[5];
+      at = a4 ? (ins.f[1] ? MmaT::S4 : MmaT::U4) : (ins.f[1] ? MmaT::S8 : MmaT::U8);
+      bt = b4 ? (ins.f[2] ? MmaT::S4 : MmaT::U4) : (ins.f[2] ? MmaT::S8 : MmaT::U8);
+      static const unsigned ks[] = {16, 0, 32, 0, 16, 32, 64, 128};
+      K = ks[shape];
+      acc = AccS32;
+      sat = ins.f[6];
+      break;
+    }
+    case Op::DMMA:
+      M = 8;
+      K = 4;
+      at = bt = MmaT::F64;
+      acc = AccF64;
+      rnd = ins.f[0];
+      break;
+    case Op::BMMA: {
+      static const unsigned ms[] = {8, 16, 16, 0}, ks[] = {128, 128, 256, 0};
+      M = ms[ins.f[0]];
+      K = ks[ins.f[0]];
+      at = bt = MmaT::B1;
+      acc = AccS32;
+      b1_and = ins.f[1];
+      break;
+    }
+    default: break;
+  }
+  constexpr unsigned kN = 8;
+  const unsigned bits = mma_bits(at);
+  const bool wide = at == MmaT::F64;
+  const unsigned per_reg = wide ? 1 : 32 / bits;
+  const unsigned a_regs = M * K / (32 * per_reg), b_regs = K * kN / (32 * per_reg);
+  const unsigned c_elems = M * kN / 32;
+  const unsigned rw = wide ? 2 : 1;   // registers per element register
+  const unsigned ra = ins.src[0].reg, rb = ins.src[1].reg, rc = ins.src[2].reg, rd = ins.dst[0].reg;
+  const auto reg = [&](unsigned base, unsigned i, unsigned l) -> uint64_t {
+    if (base == kRZ) return 0;
+    const uint64_t lo = w.reg(base + i * rw, l);
+    return wide ? lo | (static_cast<uint64_t>(w.reg(base + i * rw + 1, l)) << 32) : lo;
+  };
+  std::vector<double> A(M * K, 0.0), B(K * kN, 0.0);
+  double C[16 * kN] = {};
+  for (unsigned r = 0; r < a_regs; ++r)
+    for (unsigned l = 0; l < 32; ++l) {
+      const unsigned g = l / 4, t = l % 4, row = g + (r % 2) * 8, col0 = t * per_reg + (r / 2) * (per_reg * 4);
+      const uint64_t v = reg(ra, r, l);
+      for (unsigned e = 0; e < per_reg; ++e) A[row * K + col0 + e] = mma_elem(at, v, e);
+    }
+  for (unsigned r = 0; r < b_regs; ++r)
+    for (unsigned l = 0; l < 32; ++l) {
+      const unsigned g = l / 4, t = l % 4, row0 = t * per_reg + r * (per_reg * 4);
+      const uint64_t v = reg(rb, r, l);
+      for (unsigned e = 0; e < per_reg; ++e) B[(row0 + e) * kN + g] = mma_elem(bt, v, e);
+    }
+  const auto cd = [&](unsigned l, unsigned slot) { return (l / 4 + (slot / 2) * 8) * kN + (l % 4) * 2 + slot % 2; };
+  for (unsigned l = 0; l < 32; ++l)
+    for (unsigned s = 0; s < c_elems; ++s) {
+      double v;
+      if (acc == AccF16) {
+        const uint32_t word = rc == kRZ ? 0 : w.reg(rc + s / 2, l);
+        v = half_to_f32(static_cast<uint16_t>(word >> (16 * (s % 2))));
+      } else if (acc == AccF64) {
+        v = as_f64(rc == kRZ ? 0 : (w.reg(rc + 2 * s, l) | (static_cast<uint64_t>(w.reg(rc + 2 * s + 1, l)) << 32)));
+      } else if (acc == AccS32) {
+        v = static_cast<int32_t>(rc == kRZ ? 0 : w.reg(rc + s, l));
+      } else {
+        v = as_f32(rc == kRZ ? 0 : w.reg(rc + s, l));
+      }
+      C[cd(l, s)] = v;
+    }
+  double D[16 * kN] = {};
+  for (unsigned i = 0; i < M; ++i)
+    for (unsigned j = 0; j < kN; ++j) {
+      if (at == MmaT::B1) {
+        int64_t a = static_cast<int64_t>(C[i * kN + j]);
+        for (unsigned k = 0; k < K; ++k) {
+          const bool x = A[i * K + k] != 0, y = B[k * kN + j] != 0;
+          a += b1_and ? (x && y) : (x != y);
+        }
+        D[i * kN + j] = static_cast<int32_t>(a);
+      } else if (acc == AccS32) {
+        const unsigned block = sat ? 128 / bits : K;
+        int64_t a = static_cast<int64_t>(C[i * kN + j]);
+        for (unsigned k0 = 0; k0 < K; k0 += block) {
+          for (unsigned k = k0; k < k0 + block && k < K; ++k)
+            a += static_cast<int64_t>(A[i * K + k]) * static_cast<int64_t>(B[k * kN + j]);
+          if (sat) a = std::clamp<int64_t>(a, INT32_MIN, INT32_MAX);
+        }
+        D[i * kN + j] = static_cast<int32_t>(a);
+      } else if (acc == AccF64) {
+        D[i * kN + j] = rounded(rnd, [&] {
+          double a = C[i * kN + j];
+          for (unsigned k = 0; k < K; ++k) a = std::fma(A[i * K + k], B[k * kN + j], a);
+          return a;
+        });
+      } else {
+        float a = static_cast<float>(C[i * kN + j]);
+        for (unsigned k = 0; k < K; ++k) {
+          const float prod = static_cast<float>(A[i * K + k]) * static_cast<float>(B[k * kN + j]);
+          a = a + prod;
+        }
+        D[i * kN + j] = a;
+      }
+    }
+  each_lane(ex, [&](unsigned l) {
+    if (rd == kRZ) return;
+    for (unsigned s = 0; s < c_elems; ++s) {
+      const double v = D[cd(l, s)];
+      if (acc == AccF16) {
+        uint32_t& word = w.reg(rd + s / 2, l);
+        const uint16_t h = f64_to_half(v);
+        word = (s % 2) ? (word & 0xffff) | (static_cast<uint32_t>(h) << 16) : (word & 0xffff0000u) | h;
+      } else if (acc == AccF64) {
+        const uint64_t b = f64_bits(v);
+        w.reg(rd + 2 * s, l) = static_cast<uint32_t>(b);
+        w.reg(rd + 2 * s + 1, l) = static_cast<uint32_t>(b >> 32);
+      } else if (acc == AccS32) {
+        w.reg(rd + s, l) = static_cast<uint32_t>(static_cast<int32_t>(v));
+      } else {
+        w.reg(rd + s, l) = f32_bits(static_cast<float>(v));
+      }
+    }
+  });
 }
 
 // ---- control -------------------------------------------------------------------
@@ -1227,7 +1699,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       return true;
     }
     default:
-      fault(w, ins, 0, std::string("SASS: ") + op_name(ins.op) + " is not implemented yet");
+      fault(w, ins, 0, std::string("SASS: ") + op_name(ins.op) + " is not implemented yet", Err::UnsupportedPtx);
   }
 }
 
