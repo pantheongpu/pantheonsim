@@ -42,6 +42,10 @@ struct TensorDesc {
   cudnnDataType_t type = CUDNN_DATA_FLOAT;
   int n = 0, c = 0, h = 0, w = 0;
   int sn = 0, sc = 0, sh = 0, sw = 0;  // strides, in elements
+  // As cudnnSetTensorNdDescriptor was given them, for GetTensorNdDescriptor;
+  // nb == 0 for a descriptor set as 4-D.
+  int nb = 0;
+  int dims[CUDNN_DIM_MAX] = {}, strides[CUDNN_DIM_MAX] = {};
 };
 
 struct FilterDesc {
@@ -121,9 +125,12 @@ VGPU_EXPORT cudnnStatus_t cudnnGetStream(cudnnHandle_t h, cudaStream_t* s) {
 VGPU_EXPORT cudnnStatus_t cudnnGetProperty(libraryPropertyType type, int* value) {
   if (!value) return CUDNN_STATUS_BAD_PARAM;
   switch (type) {
-    case MAJOR_VERSION: *value = 9; break;
-    case MINOR_VERSION: *value = 1; break;
-    case PATCH_LEVEL: *value = 0; break;
+    // The release whose headers this is built against, as cudnnGetVersion
+    // reports it: PyTorch refuses a runtime older than the one it was built
+    // with, and compares these.
+    case MAJOR_VERSION: *value = CUDNN_MAJOR; break;
+    case MINOR_VERSION: *value = CUDNN_MINOR; break;
+    case PATCH_LEVEL: *value = CUDNN_PATCHLEVEL; break;
     default: return CUDNN_STATUS_BAD_PARAM;
   }
   return CUDNN_STATUS_SUCCESS;
@@ -753,4 +760,186 @@ VGPU_EXPORT cudnnStatus_t cudnnTransformTensor(cudnnHandle_t h, const void* alph
         }
   store(y, hy);
   return CUDNN_STATUS_SUCCESS;
+}
+
+/* ---- N-dimensional tensors and batch normalization's training forms ---- */
+
+// An N-D descriptor (3 to 5 dimensions, NC first) is kept in the 4-D form the
+// rest of this file computes on: a 3-D tensor as N, C, L, 1; a 5-D one with
+// its depth and height folded together, which needs the height packed inside
+// the depth -- anything else is refused rather than walked wrongly.
+VGPU_EXPORT cudnnStatus_t cudnnSetTensorNdDescriptor(cudnnTensorDescriptor_t d, cudnnDataType_t type,
+                                                     int nb, const int dims[], const int strides[]) {
+  if (!known(d) || !dims || !strides || nb < 3 || nb > CUDNN_DIM_MAX) return CUDNN_STATUS_BAD_PARAM;
+  if (type != CUDNN_DATA_FLOAT) return CUDNN_STATUS_NOT_SUPPORTED;
+  TensorDesc t;
+  t.type = type;
+  t.n = dims[0], t.c = dims[1], t.sn = strides[0], t.sc = strides[1];
+  if (nb == 3) {
+    t.h = dims[2], t.sh = strides[2], t.w = 1, t.sw = 1;
+  } else if (nb == 4) {
+    t.h = dims[2], t.w = dims[3], t.sh = strides[2], t.sw = strides[3];
+  } else if (nb == 5) {
+    if (strides[2] != dims[3] * strides[3]) return CUDNN_STATUS_NOT_SUPPORTED;
+    t.h = dims[2] * dims[3], t.sh = strides[3], t.w = dims[4], t.sw = strides[4];
+  } else {
+    return CUDNN_STATUS_NOT_SUPPORTED;
+  }
+  t.nb = nb;
+  for (int i = 0; i < nb; ++i) t.dims[i] = dims[i], t.strides[i] = strides[i];
+  *reinterpret_cast<TensorDesc*>(d) = t;
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnGetTensorNdDescriptor(const cudnnTensorDescriptor_t d, int requested,
+                                                     cudnnDataType_t* type, int* nb, int dims[], int strides[]) {
+  if (!known(d)) return CUDNN_STATUS_BAD_PARAM;
+  const auto* t = reinterpret_cast<const TensorDesc*>(d);
+  const int four_d[4] = {t->n, t->c, t->h, t->w}, four_s[4] = {t->sn, t->sc, t->sh, t->sw};
+  const int count = t->nb ? t->nb : 4;
+  if (type) *type = t->type;
+  if (nb) *nb = count;
+  for (int i = 0; i < std::min(requested, count); ++i) {
+    if (dims) dims[i] = t->nb ? t->dims[i] : four_d[i];
+    if (strides) strides[i] = t->nb ? t->strides[i] : four_s[i];
+  }
+  return CUDNN_STATUS_SUCCESS;
+}
+
+namespace {
+// The elements from a tensor's first to one past its last, as its strides lay
+// them out: what has to be copied to reach every one.
+size_t span(const TensorDesc& t) {
+  if (!t.n || !t.c || !t.h || !t.w) return 0;
+  return (size_t)(t.n - 1) * t.sn + (size_t)(t.c - 1) * t.sc + (size_t)(t.h - 1) * t.sh + (size_t)(t.w - 1) * t.sw + 1;
+}
+}  // namespace
+
+// Workspace and reserve space: none, since the work is done on the host.
+VGPU_EXPORT cudnnStatus_t cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize(
+    cudnnHandle_t, cudnnBatchNormMode_t, cudnnBatchNormOps_t, const cudnnTensorDescriptor_t,
+    const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t,
+    const cudnnActivationDescriptor_t, size_t* size) {
+  if (size) *size = 0;
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnGetBatchNormalizationBackwardExWorkspaceSize(
+    cudnnHandle_t, cudnnBatchNormMode_t, cudnnBatchNormOps_t, const cudnnTensorDescriptor_t,
+    const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t,
+    const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t, const cudnnActivationDescriptor_t, size_t* size) {
+  if (size) *size = 0;
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnGetBatchNormalizationTrainingExReserveSpaceSize(
+    cudnnHandle_t, cudnnBatchNormMode_t, cudnnBatchNormOps_t, const cudnnActivationDescriptor_t,
+    const cudnnTensorDescriptor_t, size_t* size) {
+  if (size) *size = 0;
+  return CUDNN_STATUS_SUCCESS;
+}
+
+// The Ex form without its fusions (an added tensor, an activation) is the
+// plain one; with them it is refused by name.
+VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationForwardTrainingEx(
+    cudnnHandle_t h, cudnnBatchNormMode_t mode, cudnnBatchNormOps_t ops, const void* alpha, const void* beta,
+    const cudnnTensorDescriptor_t xd, const void* x, const cudnnTensorDescriptor_t, const void*,
+    const cudnnTensorDescriptor_t yd, void* y, const cudnnTensorDescriptor_t bnd, const void* scale,
+    const void* bias, double factor, void* running_mean, void* running_var, double eps, void* save_mean,
+    void* save_inv_var, cudnnActivationDescriptor_t, void*, size_t, void*, size_t) {
+  if (ops != CUDNN_BATCHNORM_OPS_BN) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] cudnnBatchNormalizationForwardTrainingEx: only CUDNN_BATCHNORM_OPS_BN (no fused add or activation) is supported\n");
+    return CUDNN_STATUS_NOT_SUPPORTED;
+  }
+  return cudnnBatchNormalizationForwardTraining(h, mode, alpha, beta, xd, x, yd, y, bnd, scale, bias, factor,
+                                                running_mean, running_var, eps, save_mean, save_inv_var);
+}
+
+// The gradient of y = scale * (x - mean) * inv + bias, per channel (spatial)
+// or per activation:
+//   dbias  = sum dy
+//   dscale = sum dy * xhat
+//   dx     = scale * inv / m * (m * dy - dbias - xhat * dscale)
+// with the saved mean and inverse deviation when given, else recomputed.
+VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationBackward(
+    cudnnHandle_t h, cudnnBatchNormMode_t mode, const void* alpha_data, const void* beta_data,
+    const void* alpha_param, const void* beta_param, const cudnnTensorDescriptor_t xd, const void* x,
+    const cudnnTensorDescriptor_t dyd, const void* dy, const cudnnTensorDescriptor_t dxd, void* dx,
+    const cudnnTensorDescriptor_t bnd, const void* scale, void* dscale_out, void* dbias_out, double eps,
+    const void* saved_mean, const void* saved_inv) {
+  if (!known(h) || !known(xd) || !known(dyd) || !known(dxd) || !known(bnd)) return CUDNN_STATUS_NOT_INITIALIZED;
+  auto* X = reinterpret_cast<TensorDesc*>(xd);
+  auto* DY = reinterpret_cast<TensorDesc*>(dyd);
+  auto* DX = reinterpret_cast<TensorDesc*>(dxd);
+  auto* B = reinterpret_cast<TensorDesc*>(bnd);
+  const float ad = alpha_of(alpha_data), bd = alpha_of(beta_data);
+  const float ap = alpha_of(alpha_param), bp = alpha_of(beta_param);
+  const bool spatial = mode == CUDNN_BATCHNORM_SPATIAL || mode == CUDNN_BATCHNORM_SPATIAL_PERSISTENT;
+  cudaStream_t stream = reinterpret_cast<Handle*>(h)->stream;
+  cudaStreamSynchronize(stream);
+  const size_t np = elems(*B);
+  auto hx = fetch(x, span(*X)), hdy = fetch(dy, span(*DY));
+  auto hdx = fetch(dx, span(*DX));
+  auto hs = fetch(scale, np);
+  auto slot = [&](int c, int i, int j) { return spatial ? (size_t)c : at(*B, 0, c, i, j); };
+
+  std::vector<double> mean(np, 0.0), inv(np, 0.0), cnt(np, 0.0);
+  if (saved_mean && saved_inv) {
+    auto m = fetch(saved_mean, np), v = fetch(saved_inv, np);
+    for (size_t p = 0; p < np; ++p) mean[p] = m[p], inv[p] = v[p];
+    for (int n = 0; n < X->n; ++n) for (int c = 0; c < X->c; ++c)
+      for (int i = 0; i < X->h; ++i) for (int j = 0; j < X->w; ++j) cnt[slot(c, i, j)] += 1;
+  } else {
+    std::vector<double> sum(np, 0.0), sq(np, 0.0);
+    for (int n = 0; n < X->n; ++n) for (int c = 0; c < X->c; ++c)
+      for (int i = 0; i < X->h; ++i) for (int j = 0; j < X->w; ++j) {
+        const size_t p = slot(c, i, j);
+        const double v = hx[at(*X, n, c, i, j)];
+        sum[p] += v, sq[p] += v * v, cnt[p] += 1;
+      }
+    for (size_t p = 0; p < np; ++p) {
+      mean[p] = cnt[p] ? sum[p] / cnt[p] : 0.0;
+      const double var = cnt[p] ? sq[p] / cnt[p] - mean[p] * mean[p] : 0.0;
+      inv[p] = 1.0 / std::sqrt(var + eps);
+    }
+  }
+  std::vector<double> dbias(np, 0.0), dscale(np, 0.0);
+  for (int n = 0; n < X->n; ++n) for (int c = 0; c < X->c; ++c)
+    for (int i = 0; i < X->h; ++i) for (int j = 0; j < X->w; ++j) {
+      const size_t p = slot(c, i, j);
+      const double g = hdy[at(*DY, n, c, i, j)];
+      const double xhat = (hx[at(*X, n, c, i, j)] - mean[p]) * inv[p];
+      dbias[p] += g, dscale[p] += g * xhat;
+    }
+  for (int n = 0; n < X->n; ++n) for (int c = 0; c < X->c; ++c)
+    for (int i = 0; i < X->h; ++i) for (int j = 0; j < X->w; ++j) {
+      const size_t p = slot(c, i, j);
+      const double xhat = (hx[at(*X, n, c, i, j)] - mean[p]) * inv[p];
+      const double g = hdy[at(*DY, n, c, i, j)];
+      const double r = hs[p] * inv[p] / cnt[p] * (cnt[p] * g - dbias[p] - xhat * dscale[p]);
+      float& out = hdx[at(*DX, n, c, i, j)];
+      out = static_cast<float>(bd == 0.0f ? ad * r : ad * r + bd * out);
+    }
+  store(dx, hdx);
+  auto blend = [&](void* dst, const std::vector<double>& v) {
+    if (!dst) return;
+    auto cur = bp != 0.0f ? fetch(dst, np) : std::vector<float>(np, 0.0f);
+    for (size_t p = 0; p < np; ++p) cur[p] = static_cast<float>(ap * v[p] + (bp != 0.0f ? bp * cur[p] : 0.0));
+    store(dst, cur);
+  };
+  blend(dscale_out, dscale);
+  blend(dbias_out, dbias);
+  return CUDNN_STATUS_SUCCESS;
+}
+
+VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationBackwardEx(
+    cudnnHandle_t h, cudnnBatchNormMode_t mode, cudnnBatchNormOps_t ops, const void* alpha_data,
+    const void* beta_data, const void* alpha_param, const void* beta_param, const cudnnTensorDescriptor_t xd,
+    const void* x, const cudnnTensorDescriptor_t, const void*, const cudnnTensorDescriptor_t dyd, const void* dy,
+    const cudnnTensorDescriptor_t, void*, const cudnnTensorDescriptor_t dxd, void* dx,
+    const cudnnTensorDescriptor_t bnd, const void* scale, const void*, void* dscale, void* dbias, double eps,
+    const void* saved_mean, const void* saved_inv, cudnnActivationDescriptor_t, void*, size_t, void*, size_t) {
+  if (ops != CUDNN_BATCHNORM_OPS_BN) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] cudnnBatchNormalizationBackwardEx: only CUDNN_BATCHNORM_OPS_BN (no fused add or activation) is supported\n");
+    return CUDNN_STATUS_NOT_SUPPORTED;
+  }
+  return cudnnBatchNormalizationBackward(h, mode, alpha_data, beta_data, alpha_param, beta_param, xd, x, dyd, dy,
+                                         dxd, dx, bnd, scale, dscale, dbias, eps, saved_mean, saved_inv);
 }

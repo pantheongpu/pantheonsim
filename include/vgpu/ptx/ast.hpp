@@ -252,8 +252,16 @@ struct OpMovMatrix { Reg dst; Operand src; };
 // When ".shared" is named, the address register holds an offset in the shared
 // window; without it the register holds a generic address that cvta has already
 // converted. Both forms occur: llama.cpp cvta's first, Triton does not.
+// The shapes (9.7.16.5.15): 8x8 of 16-bit elements, 8x16 and 16x16 of
+// 8-bit ones -- or of 6-/4-bit ones (.b6x16_p32, .b4x16_p64: sixteen values
+// padded to 16 bytes in shared memory) expanded into the low bits of each
+// byte, or .s4 sign-extended to .s8.
+enum class LdmShape : uint8_t { M8N8, M8N16, M16N16 };
+enum class LdmSrc : uint8_t { B16, B8, B6P32, B4P64, S4 };
 struct OpLdMatrix {
   uint32_t count = 1;
+  LdmShape shape = LdmShape::M8N8;
+  LdmSrc fmt = LdmSrc::B16;
   bool trans = false;
   bool shared_space = false;
   std::vector<Reg> dsts;
@@ -268,6 +276,7 @@ struct OpLdMatrix {
 // does between its two multiplies.
 struct OpStMatrix {
   uint32_t count = 1;
+  bool m16n8 = false;          // 16x8 of 8-bit elements (.trans mandatory)
   bool trans = false;
   bool shared_space = false;
   std::vector<Operand> srcs;   // one 32-bit register per matrix, per lane
@@ -279,7 +288,9 @@ struct OpStMatrix {
 // the older whole-fragment API: this one names the exact shape and the
 // registers each lane holds.
 enum class FRound { Nearest, Zero, MinusInf, PlusInf };
-enum class MmaElem { F16, BF16, TF32, S8, U8, S4, U4, B1, E4M3, E5M2, F64 };
+// E3M2/E2M3/E2M1 sit in 8-bit containers (.kind::f8f6f4, .kind::mxf8f6f4);
+// E2M1P is e2m1 packed two to a byte (.kind::mxf4, .kind::mxf4nvf4).
+enum class MmaElem { F16, BF16, TF32, S8, U8, S4, U4, B1, E4M3, E5M2, F64, E3M2, E2M3, E2M1, E2M1P };
 // mma.sync (PTX ISA 9.7.16.5.14): every documented shape except the
 // block-scaled and .kind::f8f6f4 ones. m16n8kK, m8n8kK (the integer, b1 and
 // f64 ones) and Volta's m8n8k4 f16, which is four 8x8x4 products at once.
@@ -303,6 +314,13 @@ struct OpMma {
   // the selector says which threads of each group of four supply it.
   bool sparse = false;
   Operand meta, selector;
+  // sm_120's block scaling (9.7.16.3): D = (A * scale_A) * (B * scale_B) + C,
+  // with `scale_vec` factors a row of A / column of B, ue8m0 or ue4m3, picked
+  // from the scale-a/b-data registers by the {byte-id, thread-id} selectors.
+  bool block_scale = false;
+  uint32_t scale_vec = 1;
+  bool ue4m3 = false;
+  Operand sfa, sfa_byte, sfa_thread, sfb, sfb_byte, sfb_thread;
 };
 // Hopper's warpgroup MMA (sm_90a): wgmma.fence, .commit_group, .wait_group
 // and .mma_async. Four warps compute one 64xNxK product; A comes from
@@ -336,13 +354,16 @@ struct OpWgmma {
 // tcgen05.st/ld in fixed warp-wide shapes, and written by tcgen05.mma, which
 // one thread issues for the whole MxNxK product.
 enum class Tcgen05Kind {
-  Alloc, Dealloc, Relinquish, Ld, St, WaitLd, WaitSt, FenceBefore, FenceAfter, Commit, Mma,
+  Alloc, Dealloc, Relinquish, Ld, St, WaitLd, WaitSt, FenceBefore, FenceAfter, Commit, Mma, Cp, Shift,
 };
 // tcgen05.ld/st data-movement shapes (9.7.18.2.3).
 enum class Tcgen05Shape { S32x32b, S16x64b, S16x128b, S16x256b, S16x32bx2 };
 // tcgen05.mma's .kind: the element family, the exact types coming from the
 // instruction descriptor.
-enum class Tcgen05MmaKind { F16, TF32, F8F6F4, I8 };
+enum class Tcgen05MmaKind { F16, TF32, F8F6F4, I8, MXF8F6F4, MXF4, MXF4NVF4 };
+// tcgen05.cp shapes (9.7.18.9.2): lanes x bits a lane.
+enum class Tcgen05CpShape { S128x256b, S4x256b, S128x128b, S64x128b, S32x128b };
+enum class Tcgen05Collector { Fill, Use, LastUse, Discard };
 struct OpTcgen05 {
   Tcgen05Kind kind = Tcgen05Kind::Mma;
   uint32_t cta_group = 1;          // .cta_group::1 or ::2
@@ -366,6 +387,29 @@ struct OpTcgen05 {
   // disable-output-lane vector (empty when absent), enable-input-d and the
   // optional scale-input-d immediate (-1 when absent).
   Tcgen05MmaKind mma_kind = Tcgen05MmaKind::F16;
+  // Block scaling (.block_scale): the scale matrices' Tensor Memory
+  // addresses, and scale factors per 32-bit row of K -- 1, 2 or 4
+  // (.scale_vec::NX, or .block32/.block16 resolved by kind and K).
+  bool block_scale = false;
+  Operand scale_a, scale_b;
+  // tcgen05.mma.sp: A is M x K/2, expanded by the metadata matrix in Tensor
+  // Memory at [sp_meta] (9.7.18.10.9).
+  bool sparse = false;
+  Operand sp_meta;
+  uint32_t scale_vec = 0;      // 0: the kind's default
+  // tcgen05.cp: the shape, its .warpx4/.warpx2 multicast, and the source
+  // descriptor (in `a`).
+  Tcgen05CpShape cp_shape = Tcgen05CpShape::S128x256b;
+  int cp_multicast = 0;        // 0 none, 4 .warpx4, 2 .warpx2::02_13, 3 .warpx2::01_23
+  int cp_decompress = 0;       // .b8x16 from .b4x16_p64 (4) or .b6x16_p32 (6)
+  // tcgen05.mma.ws (weight-stationary): its B collector buffer (0-3) and what
+  // it does with it -- .collector::bN::fill/use/lastuse/discard, b0::discard
+  // when absent -- and the optional zero-column mask descriptor.
+  bool ws = false;
+  uint32_t collector_buf = 0;
+  Tcgen05Collector collector = Tcgen05Collector::Discard;
+  bool has_zero_mask = false;
+  Operand zero_mask;
   Operand d_tmem, a, b_desc, idesc, enable_d;
   bool a_tmem = false;
   std::vector<Operand> disable_lanes;
@@ -531,14 +575,22 @@ struct OpBulkGroup { bool wait = false; uint32_t keep = 0; };
 //   to_fp8   from f32: cvt.rn.satfinite.e4m3x2.f32   d, a, b   (a high, b low)
 //   to_fp8   from f16: cvt.rn.satfinite.e4m3x2.f16x2 d, a
 //   from_fp8 to   f16: cvt.rn.f16x2.e4m3x2           d, a
+// cvt between a pair of narrow values packed in 16 bits (8 for e2m1x2) and two
+// f32 sources or an f16x2/bf16x2 register (PTX ISA 9.7.10.24): fp8, the OCP
+// MX fp6/fp4 types, ue8m0 scale factors and the s2f6 fixed-point type.
+enum class NarrowFmt : uint8_t { E4M3, E5M2, E2M3, E3M2, E2M1, UE8M0, S2F6 };
 struct OpCvtFp8 {
-  bool e5m2 = false;        // which of the two formats
-  bool to_fp8 = true;       // direction
+  NarrowFmt fmt = NarrowFmt::E4M3;
+  bool e5m2 = false;        // fmt == E5M2, kept for the fp8 paths
+  bool to_fp8 = true;       // direction: to the narrow type
   bool src_f32_pair = false;  // the two-source f32 form
   bool bf16 = false;        // the half side is bf16 rather than f16
   bool satfinite = false;
+  bool relu = false;
+  bool rz = false, rp = false;   // otherwise .rn
+  bool scaled = false;      // .scaled::n2::ue8m0 with a scale-factor operand
   Reg dst;
-  Operand a, b;
+  Operand a, b, sf;
 };
 // The SIMD video instructions: vadd4, vsub4, vabsdiff4, vmin4, vmax4, vavrg4
 // and their 2-way halfword counterparts. Each treats a 32-bit register as four

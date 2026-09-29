@@ -255,6 +255,9 @@ int usage(FILE* to) {
                "  --preload             Also LD_PRELOAD the shim. Needed when the program\n"
                "                        carries a RUNPATH, which the loader consults before\n"
                "                        LD_LIBRARY_PATH. 'vgpu run' says so when it applies.\n"
+               "                        For an interpreter (python with PyTorch), which names\n"
+               "                        no CUDA library itself, every CUDA library the shim\n"
+               "                        carries is preloaded.\n"
                "  --print-env           Print the environment and command, then exit\n");
   return to == stdout ? 0 : 2;
 }
@@ -433,18 +436,35 @@ int cmd_run(const std::vector<std::string>& args) {
       if (!std::getenv(k)) env.emplace_back(k, ptxas);
 
   if (o.preload) {
-    // Exactly the libraries the program already asked for, and no more. Two
-    // reasons to be narrow: preloading the whole shim would pull cuDNN and NCCL
-    // into every child process, and -- more importantly -- each shim library
-    // carries its own copy of the simulator core rather than sharing one
-    // through libcuda, so preloading a library the program never names would
-    // stand up a second, disjoint set of virtual devices beside the real one.
+    // The libraries the program asked for, when it names any: preloading the
+    // whole shim would pull cuDNN and NCCL into every child process.
     std::string pre;
     for (const auto& n : cuda_needs)
       if (is_file(shim + "/" + n)) pre += (pre.empty() ? "" : " ") + shim + "/" + n;
-    // Nothing named statically: the program must be dlopen-ing the driver,
-    // which is the one case where there is no DT_NEEDED to go by.
-    if (pre.empty()) pre = shim + "/libcuda.so.1";
+    // Nothing named: an interpreter whose extension modules load CUDA later --
+    // PyTorch, whose libraries carry an RPATH to NVIDIA's -- or a program that
+    // dlopens the driver. Then every CUDA library the shim carries, so each
+    // later request for one of those sonames gets VirtualGPU's. The runtime
+    // and the driver share one simulated machine (shared_runtime.cpp), so
+    // loading both stands up no second set of devices.
+    if (pre.empty()) {
+      static const char* kCuda[] = {"libcuda.so.1", "libcudart.so", "libcublasLt.so", "libcublas.so",
+                                    "libcudnn.so", "libcufft.so", "libcurand.so", "libcusparse.so",
+                                    "libcusolver.so", "libnccl.so", "libnvrtc.so", "libcupti.so",
+                                    "libnvidia-ml.so.1"};
+      for (const char* stem : kCuda) {
+        std::string found;
+        if (std::string(stem).find(".so.") != std::string::npos) {
+          if (is_file(shim + "/" + stem)) found = stem;
+        } else {
+          // The shim's soname for it: libcudart.so.13, libcudnn.so.9, ...
+          for (int major = 0; major < 32 && found.empty(); ++major)
+            if (is_file(shim + "/" + stem + "." + std::to_string(major)))
+              found = std::string(stem) + "." + std::to_string(major);
+        }
+        if (!found.empty()) pre += (pre.empty() ? "" : " ") + shim + "/" + found;
+      }
+    }
     const char* old_pre = std::getenv("LD_PRELOAD");
     env.emplace_back("LD_PRELOAD", pre + (old_pre && old_pre[0] ? " " + std::string(old_pre) : ""));
   }

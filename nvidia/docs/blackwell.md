@@ -51,8 +51,16 @@ reaches the instruction issues its own, which is what single-thread semantics
 means (CUTLASS elects one).
 
 - Kinds: `.kind::f16` (f16 and bf16 into f16 or f32), `.kind::tf32`,
-  `.kind::f8f6f4` with the 8-bit types (e4m3, e5m2), and `.kind::i8` (s8/u8
-  into s32, with the saturate bit).
+  `.kind::f8f6f4` (e4m3, e5m2, e2m3, e3m2, e2m1), `.kind::i8` (s8/u8 into
+  s32, with the saturate bit), and the block-scaled `.kind::mxf8f6f4`,
+  `mxf4` and `mxf4nvf4` (below).
+- The 6- and 4-bit types of `.kind::f8f6f4` sit 16 to a 16-byte group in
+  shared memory, packed from the group's start with the rest padding (the
+  layouts `tcgen05.cp` calls `.b6x16_p32` and `.b4x16_p64`); MN-major, the
+  same groups run along M or N (Table 62 allows the transpose except at
+  sm_107's dense K = 64, and never for the `mxf4` kinds). In Tensor Memory each takes an 8-bit container: fp6 in bits 0-5,
+  fp4 in bits 2-5 (figure 202). Under `.kind::mxf4*`, fp4 is packed two to
+  a byte in both. The OCP MX types have no infinities or NaNs.
 - Shapes: `.cta_group::1` with M = 64 or 128, and `.cta_group::2` with M = 128
   or 256; N from the instruction descriptor.
 - D's placement is the data-path layout of 9.7.18.10.5: layout D (M = 128,
@@ -75,6 +83,118 @@ means (CUTLASS elects one).
 Numerics are wgmma's: every product of these input types is exact in f32 and
 the sum is kept in f32, in K order. The ISA does not say how tf32 inputs are
 narrowed for tcgen05; they are truncated to tf32 as it says for wgmma.
+
+### Block scaling
+
+`.block_scale` (9.7.18.10.7) multiplies each block of K by a scale factor of
+A's row and one of B's column: `D = sum (A * SA) * (B * SB) (+ D)`, into f32.
+
+- `.kind::mxf8f6f4`: one UE8M0 factor per 32 of K (`.scale_vec::1X`).
+- `.kind::mxf4`: two UE8M0 factors, blocks of 32 (`2X`), K = 64.
+- `.kind::mxf4nvf4`: `2X` with UE8M0, or `4X` (blocks of 16) with UE8M0 or
+  UE4M3. UE8M0 is `2^(v - 127)` (255 is NaN); UE4M3 is e4m3 without a sign.
+- The instruction descriptor is Table 52/53's: SFB_ID in bits 4-5, the scale
+  type from bit 23, M / 128 in bits 27-28, SFA_ID in bits 29-30.
+- Factors come from Tensor Memory at `[scale-A-tmem]` and `[scale-B-tmem]`:
+  row m's j-th in byte `SF_ID + j` of lane `m % 32`, column `address + m /
+  32` (B's column n likewise). The ISA shows them in every 32-lane partition,
+  where `tcgen05.cp .32x128b.warpx4` puts them, and each D row reads the
+  copy in its own partition.
+- Refused by name as sm_107's: UE5M3 factors, UE4M3 with `.block32`, the
+  128-lane scale layout (bit 26) and the larger K of bits 3 and 31.
+
+### Sparse A: tcgen05.mma.sp
+
+`tcgen05.mma.sp` (9.7.18.10.9) doubles K and reads A as M x K/2: each chunk
+of a row keeps half of its elements, placed by a 4-bit metadata field -- 2:4
+(two 2-bit positions, low first) for most kinds, 1:2 for tf32 (0b0100 or
+0b1110), and 4:8 in pairs for `mxf4`/`mxf4nvf4` (sparsity version v0). The
+instruction descriptor's bit 2 must say sparse. The metadata matrix is in
+Tensor Memory at `[sp-meta-tmem]`, laid out as figures 287-292 draw it, each
+32-lane partition holding its own rows:
+
+- `.kind::f16` and `tf32`: rows r and r + 8 share a lane (r's fields in bits
+  0-15), the upper half of K eight lanes further on, and the sparsity
+  selector (0 or 1) picks the column. Selectors 2 and 3 are refused: the
+  figures show only 0 and 1.
+- The 8-bit kinds: row r in lane r, sixteen fields over two columns. The
+  selector must be 0 (`i8`, `f8f6f4`) or is taken as 0 (the `mx` kinds).
+
+For M = 64 the metadata starts at D's lane (0 or 16). With block scaling a
+sparse `mxf4` K = 128 keeps the counts of its aliases -- `.block32` is 2X
+and `.block16` 4X "when K = 64 or 128" -- so each factor covers 64 or 32
+of K. (Table 68's six- and eight-factor rows are sm_103/107's larger K,
+which is refused; CUTLASS's sparse nvf4 GEMMs issue `.block16` over
+K = 128 with one factor per 32, which is what settled the reading.)
+
+### Weight-stationary: tcgen05.mma.ws
+
+`.ws` is `.cta_group::1` only, for `.kind::f16`, `tf32`, `f8f6f4` and `i8`,
+at M = 32, 64 or 128 by N = 64, 128 or 256 (N up to 128 with `.sp`), per
+Table 48.
+
+- **Where D goes.** Below M = 128, `.ws` spreads N over the lanes the rows
+  leave idle:
+  - Layout E (M = 64) puts N's upper half in lanes 64-127, at the same
+    columns.
+  - Layout G (M = 32) puts N's four quarters in the four warps' lanes.
+  - M = 128 is layout D.
+
+  Figures 219 and 223 draw them that way, and so do CUTLASS's `tmem_frg_ws`
+  and tilelang's layouts. Figures 220 and 224 address the regions at lanes 0
+  and 32, but a warp reaches only its own quarter of the lanes, so those
+  addresses can only be a slip in the figures.
+- **The zero-column mask descriptor** (9.7.18.4.3) is the optional last
+  operand.
+  - It zeroes whole columns of B, and MMA column n reads B's column
+    n + shift.
+  - Each sub-mask (one per N/1, N/2 or N/4 columns as M is 128, 64 or 32) is a
+    first run of `fs_i`'s value, `sc_i` bits short, then alternating runs.
+  - The ISA's four worked examples make a run of 1s (zeroed columns) Skip
+    Span + 1 long and a run of 0s Use Span + 1 long, as the names say. Table
+    54's one-line descriptions have the two the other way round; the examples
+    are what is followed here.
+  - A start count that skips a whole first run is refused, because no example
+    shows one. So is a shift over 32 (16 at M = 32).
+- **Collector buffers.** `.collector::b0-b3::fill/use/lastuse/discard`
+  (default `b0::discard`) give the tensor core permission to keep B. Reuse
+  is optional on the hardware, so B is read from shared memory every time,
+  which is one of the allowed behaviours.
+  - What is checked: a `::use` or `::lastuse` must follow a fill of the same
+    B (descriptor, type, transpose, N) that no `::lastuse` or `::discard` has
+    ended.
+  - Otherwise the hardware may multiply by whatever the buffer holds, so this
+    stops with an error.
+  - The instruction descriptor's bits 30-31 (the most shift a reuse may use)
+    are accepted.
+- **Not drawn by the ISA, and refused:**
+  - A from Tensor Memory below M = 128: layouts E and G are D's layouts, not
+    A's.
+  - `.ws.sp` below M = 128: figures 287-292 place the metadata for M = 64
+    without `.ws` and for M >= 128 only.
+
+  Both are allowed at M = 128, where the layouts are the usual ones.
+
+### tcgen05.cp
+
+One thread copies a matrix from shared memory (a descriptor, K-major, no
+swizzle) into Tensor Memory: `.128x256b`, `.4x256b`, `.128x128b` row by row
+from the address's lane, `.32x128b.warpx4` into all four 32-lane quarters,
+and `.64x128b.warpx2` -- `::02_13` puts row r at lanes r and r + 64,
+`::01_23` at 64(r / 32) + r % 32 and 32 lanes on, so each warp of a pair
+holds the same 32 rows. The ISA says only that each warp of a pair receives
+half; the halves are CuTe's, whose UTCCP 2x64dp copy traits lay the
+destination out that way. It completes at once, like `mma`. With
+`.b8x16.b4x16_p64` / `.b6x16_p32` each 16-byte group of packed fp4 / fp6
+is decompressed into sixteen bytes, fp4 in bits 2-5 and fp6 in bits 0-5
+(figures 197-201).
+
+### tcgen05.shift
+
+`tcgen05.shift.down` moves rows 0-30 of the 32 lanes at its (32-aligned)
+address down one row, 256 bits (eight columns) each -- the implicit
+`.31x256b` shape of 9.7.18.2.3; row 0 is left as it was. One thread
+issues it, for its CTA or both of a pair.
 
 ### When things complete
 
@@ -104,19 +224,34 @@ before waiting for it is not caught here.
 - **TMA `.tile::gather4` / `.tile::scatter4`.** Four rows of a 2D tensor at
   one x (`{x, row0, row1, row2, row3}`, as CUTLASS issues them), one row-high
   box each, packed one after another in shared memory.
+- **Packed sub-byte tensors.** Maps of `16U4_ALIGN8B`, `16U4_ALIGN16B` and
+  `16U6_ALIGN16B` (the ISA's `.b4x16`, `.b4x16_p64`, `.b6x16_p32`), with
+  cuda.h's rules for each. Global memory holds the values packed; a copy
+  moves sixteen at a time, into 8 bytes of shared memory for `.b4x16` and a
+  16-byte slot for the others -- the packed bytes first, the padding left as
+  it was, as the ISA calls it uninitialized. The barrier completes the
+  packed bytes (12 a group of fp6, not 16): CUTLASS's block-scaled kernels
+  expect exactly that and never finish otherwise. A store of type 15 is
+  `.b6p2x16`: sixteen bytes with the value in bits 0-5, packed into twelve.
+  `.b4x16_p64` cannot be stored, the padded types' first coordinate must be
+  a multiple of 128, and a `.b4x16` copy that does not start on a group of
+  sixteen is refused.
 - **Swizzle atoms.** Tensor maps accept `CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B`
   and `_ATOM_64B` ("swizzle 32B/64B chunks within 128B span"), and
   `tensormap.replace` their atomicity field. The `_FLIP_8B` variant is refused.
 
 ## Refused by name
 
-`tcgen05.mma.sp` (sparse A), `.ws` (weight-stationary), block-scaled kinds
-(`.kind::mxf8f6f4`, `mxf4`, `mxf4nvf4`), the 4- and 6-bit types of
-`.kind::f8f6f4`, `.ashift`, `tcgen05.cp`, `tcgen05.shift`, `tcgen05.ld.red`
-(sm_103/sm_110), the sm_107 additions (`kind::ti16`, `decompress::lut`), and
-TMA's `.im2col::w` modes: the ISA shows their halo walk only in figures that
-leave open where `::w::128`'s halos come from and whether a halo crosses into
-the next image, and nothing to check against (CUTLASS included) uses them.
+- **`.ashift`.** The ISA says only that A's rows shift down one "except for
+  the last row". It doesn't say whether the MMA reads A before or after the
+  shift, whether rows cross the 32-lane quarters, or what row 0 holds. No
+  public code uses it to check against.
+- **`tcgen05.ld.red`** (sm_103/sm_110).
+- **The sm_107 additions** (`kind::ti16`, `decompress::lut`).
+- **TMA's `.im2col::w` modes.** The ISA shows their halo walk only in
+  figures. They leave open where `::w::128`'s halos come from and whether a
+  halo crosses into the next image. No kernel code uses them to check
+  against: CUTLASS doesn't, and cuda-python only wraps the encode call.
 
 ## How it is checked
 
@@ -125,5 +260,10 @@ the next image, and nothing to check against (CUTLASS included) uses them.
   the ISA's CuTe canonical layouts, for each kind, both majors, the swizzles,
   A from Tensor Memory, the accumulate/scale/negate/mask options, and both
   pair layouts.
+- `.ws`:
+  - layouts E and G, as figures 219 and 223 draw them;
+  - the ISA's zero-column mask examples 3 and 4 bit for bit;
+  - the collector rules;
+  - the `.ws` forms, which match what CUDA 13's `ptxas` assembles.
 - `nvidia/tests/e2e/run_cutlass_sm100.sh`: CUTLASS's own SM100 GEMM unit tests,
   unmodified, on a simulated B200, checked against CUTLASS's host reference.

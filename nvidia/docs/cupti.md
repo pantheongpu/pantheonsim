@@ -63,9 +63,11 @@ T4.
 ## PyTorch's profiler
 
 libtorch links CUPTI by soname, so with the shims preloaded it loads this one
-and finds the simulated GPU. Its kernels do not run: prebuilt PyTorch wheels
-carry SASS only, and the simulator executes PTX. Profiling PyTorch here needs a
-PyTorch built with PTX for the profile's architecture.
+and finds the simulated GPU. PyTorch's CUDA 13 wheels carry PTX for
+compute_120 only, so its kernels run on `nvidia/rtx5090`
+([pytorch.md](pytorch.md)); on older profiles they do not. The activity
+controls Kineto calls per API function, its timestamp callback and device-side
+event timestamps are not supported, and say so.
 
 ## Nsight Systems
 

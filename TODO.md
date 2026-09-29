@@ -276,7 +276,14 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   value, where an integer destination gets all-ones for true and a float one
   gets 1.0), `atom.inc`/`.dec` (which wrap against the operand rather than
   counting), and `abs` on the half types.
-- FP8: `cvt` between e4m3x2/e5m2x2 and f32/f16x2/bf16x2, with `.satfinite`.
+- Narrow formats: `cvt` between e4m3x2/e5m2x2, the OCP MX e2m3x2/e3m2x2/e2m1x2,
+  ue8m0x2 and s2f6x2 and f32/f16x2/bf16x2 (PTX ISA 9.7.10.24), with
+  `.satfinite` (NaN to +MAX_NORM for the types without one), `.relu`,
+  ue8m0's `.rz`/`.rp`, and the `.scaled::n2::ue8m0` factors of bf16x2 and
+  s2f6x2. Refused by name: `.rs` for the x4 types (figures 41-42 do not
+  say how a and b share their random bits), sm_107f's `.rz`, `.pzo`,
+  `.scaled::n1` and ue5m3x2, and s2f6x2 from bf16x2 (its pseudocode and text
+  disagree).
   The two formats are not one shape with a different bias -- e4m3 spends its
   top exponent on ordinary numbers and has no infinity, so 448 is its largest
   finite value and 1000 saturates to it, while e5m2 is IEEE-shaped and
@@ -304,13 +311,18 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   use one of their own (the logical matrix, spread in order over lanes and
   registers); the combinations above keep theirs. wmma_types.cu checks all 21
   shape/type/layout combinations through mma.h, exactly;
-  ldmatrix.m8n8.x{1,2,4}[.trans] and movmatrix.m8n8.trans (the
-  register-only transpose). mma.sync in every form the ISA lists except the
-  block-scaled and .kind::f8f6f4 ones (sm_120): Volta's m8n8k4 f16 (four
+  ldmatrix.m8n8.x{1,2,4}[.trans], the 8-bit .m8n16 and .m16n16.trans
+  (fp6/fp4 expanded into the low bits of each byte, .s4 to .s8), and
+  movmatrix.m8n8.trans (the
+  register-only transpose). mma.sync in every form the ISA lists: Volta's m8n8k4 f16 (four
   products, any layouts, f16/f32 accumulators), f64 m8n8k4 and m16n8k4/8/16
   in each rounding mode, tf32, f16/bf16, s8/u8 and s4/u4 (mixed signedness,
-  .satfinite), .b1 .and/.xor.popc, and e4m3/e5m2; and mma.sp in every type,
-  shape and selector (f16/bf16, tf32 1:2, s8/u8, s4/u4 4:8 in pairs, fp8).
+  .satfinite), .b1 .and/.xor.popc, e4m3/e5m2, and sm_120's
+  `.kind::f8f6f4` (fp6/fp4 in 8-bit containers) and block-scaled
+  `.kind::mxf8f6f4`/`mxf4`/`mxf4nvf4` with their scale-data selectors
+  (9.7.16.3, figures 46-48); and mma.sp in every type, shape and selector
+  (f16/bf16, tf32 1:2, s8/u8, s4/u4 4:8 in pairs, fp8, and the sm_120
+  kinds at m16n8k64/k128). A simulated RTX 5090 (nvidia/rtx5090) runs them.
   e2e_mma_forms runs the 123 forms an RTX 3060 has -- each fed fragments,
   its D hashed -- and compares with the hashes the GPU gave. Three things
   came out of the hardware rather than the ISA: tf32 inputs lose their low
@@ -323,7 +335,7 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   accumulation order of a float sum is unspecified and not modelled: with
   inputs whose products round, m16n8k8 tf32 differs from the GPU in low bits.
   CUTLASS's 19 SM80 sparse GEMM tests pass.
-  stmatrix.m8n8.x{1,2,4}[.trans] is the store counterpart of ldmatrix: the warp
+  stmatrix.m8n8.x{1,2,4}[.trans] (and .m16n8.trans.b8) is the store counterpart of ldmatrix: the warp
   writes the 8x8 matrices its registers hold back to shared memory, which is how
   a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
   checks where every element lands and that a fragment stored by one instruction
@@ -821,8 +833,8 @@ narrows what counts as observable, not what the detector looks at.
   stride shifted right by 4 before that, so the module's `.version` decides.
   A value no map from `cuTensorMapEncodeTiled` could hold (a box past 256, a
   traversal stride of 0) is refused rather than carried into a copy, and
-  the Blackwell-only values (packed 4/6-bit types, the 96B swizzle, the
-  32B-with-8B-flip atomicity) are refused by name. Checked by unit tests (each field read
+  the Blackwell-only 96B swizzle and 32B-with-8B-flip atomicity are refused
+  by name. (Blackwell's packed 4/6-bit types are done: nvidia/docs/blackwell.md.) Checked by unit tests (each field read
   back by the host's decoder; the ISA's 9 is f64 where the driver's 9 is
   bf16; a retargeted map loaded through under PTX 8.3 and 8.5; each confirmed
   to fail with the rule it covers broken), and by a CuTe program
@@ -853,22 +865,31 @@ narrows what counts as observable, not what the detector looks at.
   (128 lanes x 512 columns per CTA) allocated with `tcgen05.alloc`/`dealloc`
   -- for a CTA pair with `.cta_group::2` -- and checked for leaks at exit;
   `tcgen05.ld`/`st` in all five shapes with pack/unpack, each warp kept to
-  its quarter of the lanes; `tcgen05.mma` for `.kind::f16`, `tf32`, the
-  8-bit `f8f6f4` types and `i8`, one CTA (M = 64/128) or a pair (M =
-  128/256), A from shared or Tensor Memory, with the data-path layouts of
-  figures 211-222; `tcgen05.commit` (multicast too), the fences and waits.
+  its quarter of the lanes; `tcgen05.mma` for `.kind::f16`, `tf32`,
+  `f8f6f4` (the 8-, 6- and 4-bit types, K- or MN-major) and `i8`, and
+  block-scaled (`mxf8f6f4`, `mxf4`, `mxf4nvf4`, UE8M0 and UE4M3 factors
+  from Tensor Memory), dense or with sparse A (`tcgen05.mma.sp`, the
+  metadata as figures 287-292 lay it out), one CTA (M = 64/128) or a pair
+  (M = 128/256), A from shared or Tensor Memory, with the data-path layouts
+  A-D and F of figures 211-222; `tcgen05.cp` (every shape, `.warpx4` and
+  `.warpx2`, fp4/fp6 decompression), `tcgen05.shift`; `tcgen05.commit`
+  (multicast too), the fences and waits.
   Around it: cluster launch control (`try_cancel` takes over clusters that
   have not started, so CUTLASS's persistent loop really loops), `.b128`
-  registers, TMA's `.cta_group::2` and `.tile::gather4`/`scatter4`, and the
-  128-byte swizzle in 32- and
-  64-byte atoms for TMA, `tensormap.replace` and the tcgen05 descriptor. A
-  CTA's shared addresses now carry its cluster rank in bits 24 and up, as
-  CUTLASS's 2-SM kernels assume. Checked by unit tests (the ld/st figures as
-  tables, every kind and layout against a host GEMM, the pair layouts, the
-  launch-control takeover, TMA through the peer bit) and by CUTLASS's own
-  SM100 GEMM tests (f16 1-SM, 2-SM and stream-K, f8, s8), unmodified,
-  against its host reference. Sparse, weight-stationary and block-scaled
-  MMAs, `tcgen05.cp`/`shift` and the 4/6-bit types are refused by name.
+  registers, TMA's `.cta_group::2`, `.tile::gather4`/`scatter4` and packed
+  fp4/fp6 tensors, and the 128-byte swizzle in 32- and 64-byte atoms for
+  TMA, `tensormap.replace` and the tcgen05 descriptor. A CTA's shared
+  addresses carry its cluster rank in bits 24 and up, as CUTLASS's 2-SM
+  kernels assume. Checked by unit tests (the ld/st figures as tables, every
+  kind and layout against a host GEMM, the metadata placement, the pair
+  layouts, the launch-control takeover, TMA through the peer bit) and by
+  CUTLASS's own SM100 GEMM tests, unmodified, against its host reference:
+  dense f16 (1-SM, 2-SM, stream-K), f8 and s8 (24 cases); sparse f16, tf32,
+  f8 and s8 (88), and fp4/fp6 (16); block-scaled, every combination of
+  mxf4/mxf6/mxf8/nvf4 in TN and NT (102 cases in 20 files); block-scaled
+  sparse mxf8 and mxf6 (18). Weight-stationary MMAs (`.ws`: CUTLASS never
+  issues them, and the ISA's zero-column-mask examples contradict each
+  other) and `.ashift` are refused by name.
   See nvidia/docs/blackwell.md.
 
 - The CTA's sixteen barriers (PTX ISA 9.7.15.1): `bar.sync` and
@@ -941,9 +962,10 @@ what is done.
   nvidia/docs/blackwell.md), attribute
   overrides and reports, the NaN out-of-bounds fill (its value is not
   documented), interleaved layouts and the 128B swizzle's 8-byte-flip
-  variant (Blackwell); tcgen05's sparse, weight-stationary and block-scaled
-  MMAs, `tcgen05.cp`/`shift` and its 4/6-bit types; mma's block-scaled and
-  `.kind::f8f6f4` forms (sm_120); and inline-asm-only instructions. (`wgmma`, TMA,
+  variant (Blackwell); tcgen05's `.ashift`, and `.ws` with A in Tensor Memory
+  or `.sp` below M = 128 (the ISA draws neither layout); and inline-asm-only
+  instructions. (tcgen05's weight-stationary `.ws` MMAs are done -- see
+  nvidia/docs/blackwell.md.) (`wgmma`, TMA,
   the mbarrier transaction counts, `barrier.cluster` and distributed shared
   memory are done -- see "Hopper's warpgroup MMA", "TMA and clusters" and
   "Distributed shared memory" above. Textures, surfaces and grid sync are

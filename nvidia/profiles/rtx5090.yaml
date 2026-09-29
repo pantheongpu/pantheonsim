@@ -1,0 +1,45 @@
+# VirtualGPU device profile: NVIDIA GeForce RTX 5090 (Blackwell, sm_120).
+# Limits from NVIDIA's public documentation for compute capability 12.0 (the
+# CUDA C++ Programming Guide's per-capability table) and the RTX 5090 spec
+# sheet; the framebuffer, power limit and links from the benchmark database.
+# Not characterized on hardware yet. verified: false.
+id: nvidia/rtx5090
+vendor: nvidia
+model: "NVIDIA GeForce RTX 5090"
+architecture: blackwell
+compute_capability: "12.0"
+warp_size: 32
+vram_bytes: 34190917632          # the measured framebuffer, 32607 MiB -- an upper bound (see b200.yaml)
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 101376   # 99 KiB (compute capability 12.0)
+  registers_per_block: 65536
+  multiprocessors: 170
+  registers_per_sm: 65536
+  max_threads_per_sm: 1536
+  max_blocks_per_sm: 24
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 102400
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 32607          # nvidia-smi total on real cards (61 runs in the benchmark database)
+  power_limit_w: 575             # the same 61 runs
+  sm_clock_max_mhz: 2964         # the highest average clock of those runs; the maximum was not read
+  mem_clock_max_mhz: 14001       # GDDR7 at 28 Gbps (spec sheet)
+  temperature_max_c: 90
+  pci_vendor_id: 4318          # 0x10DE NVIDIA
+  pci_device_id: 11141         # 0x2B85 [GeForce RTX 5090] -- public PCI id listing
+  ecc: false                   # GeForce: no ECC
+  memory: gddr
+  pcie_link: "Gen5 x8"         # most common link on real cards (40 of 61 runs in the benchmark database)
