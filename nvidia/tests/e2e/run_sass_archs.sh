@@ -6,6 +6,11 @@
 # default, where the log must say its SASS ran, and on its PTX (VGPU_SASS=0).
 # Both runs must pass and print the same.
 #
+# Hopper's own programs -- warpgroup MMA, TMA, tensor maps rewritten in place,
+# stmatrix -- are built for sm_90a and run on the H100 the same way; the ones
+# written with CuTe need CUTLASS's headers (cutlass_fetch.sh), and skip,
+# saying so, without them.
+#
 # An nvcc too old for an architecture (sm_100 and sm_120 need CUDA 12.8) skips
 # it and says so. VGPU_SASS_ARCHS and VGPU_SASS_PROGRAMS narrow the lists;
 # VGPU_SASS_JOBS caps the builds run at once (default: one per CPU).
@@ -24,32 +29,56 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-sass-archs.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
 declare -A gpu=([sm_75]=nvidia/t4 [sm_80]=nvidia/a100 [sm_86]=nvidia/rtx3060 [sm_89]=nvidia/l4
-                [sm_90]=nvidia/h100 [sm_100]=nvidia/b200 [sm_120]=nvidia/rtx5090)
-archs=(${VGPU_SASS_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_100 sm_120})
+                [sm_90]=nvidia/h100 [sm_90a]=nvidia/h100 [sm_100]=nvidia/b200 [sm_120]=nvidia/rtx5090)
+archs=(${VGPU_SASS_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_90a sm_100 sm_120})
 # program:first architecture it builds for (the MMA programs need sm_80)
 # [:last one it runs on (runtime_conformance checks a T4's properties)].
 progs=(${VGPU_SASS_PROGRAMS:-sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
        runtime_conformance:75:75 symbols:75 surface_oob:75 textures:75 texture_filtering:75 texture_gather:75
        texture_layers:75 texture_mipmaps:75 block_semaphore:75 cooperative_grid:75 mma_forms:80
-       mma_fragment_layout:80 modern_dtypes:80 wmma_gemm:80 wmma_types:80})
+       mma_fragment_layout:80 modern_dtypes:80 wmma_gemm:80 wmma_types:80 dsmem_cluster:90
+       wgmma_cute:90a tma_gemm_cute:90a tma_reduce_cute:90a tma_im2col:90a tensormap_replace_cute:90a
+       stmatrix:90a})
+cute=" wgmma_cute tma_gemm_cute tma_reduce_cute tensormap_replace_cute "
 
 supported="$("$nvcc_bin" --list-gpu-code 2>/dev/null)"
 read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
 jobs=()
 for arch in "${archs[@]}"; do
-  if ! grep -qx "$arch" <<< "$supported"; then echo "SKIP $arch: this nvcc cannot target it"; continue; fi
+  if ! grep -qx "${arch%a}" <<< "$supported"; then echo "SKIP $arch: this nvcc cannot target it"; continue; fi
   for p in "${progs[@]}"; do
     IFS=: read -r name first last <<< "$p"
-    (( ${arch#sm_} >= first && ${arch#sm_} <= ${last:-999} )) && jobs+=("$name $arch")
+    # "90a": that architecture's own image only; otherwise a range.
+    if [[ $first == *a || $arch == *a ]]; then
+      [[ $first == "${arch#sm_}" ]] && jobs+=("$name $arch")
+    elif (( ${arch#sm_} >= first && ${arch#sm_} <= ${last:-999} )); then
+      jobs+=("$name $arch")
+    fi
   done
 done
 (( ${#jobs[@]} )) || { echo "SKIP: no architecture this nvcc can target"; exit 0; }
 
+# CUTLASS's headers, for the CuTe programs: fetched (once) when one is listed.
+cutlass=""
+for j in "${jobs[@]}"; do
+  if [[ $cute == *" ${j%% *} "* ]]; then
+    cutlass="$(build="${VGPU_BUILD_DIR:-$root/build}"; . "$root/nvidia/tests/e2e/cutlass_fetch.sh" >/dev/null 2>&1; echo "$cutlass")"
+    [[ -d "$cutlass/include" ]] || { echo "SKIP the CuTe programs: CUTLASS could not be fetched"; cutlass=""; }
+    break
+  fi
+done
+if [[ -z $cutlass ]]; then
+  kept=()
+  for j in "${jobs[@]}"; do [[ $cute == *" ${j%% *} "* ]] || kept+=("$j"); done
+  jobs=("${kept[@]}")
+fi
+
 # Builds, several at once.
-export nvcc_bin root work
+export nvcc_bin root work cutlass
 export san="${san_flags[*]}"
 printf '%s\n' "${jobs[@]}" | xargs -P "${VGPU_SASS_JOBS:-$(nproc)}" -L 1 bash -c '
   "$nvcc_bin" -std=c++17 -arch="$1" -cudart shared -w -Wno-deprecated-gpu-targets $san \
+    ${cutlass:+-O1 --expt-relaxed-constexpr -I"$cutlass/include"} \
     -I"$root/nvidia/tests/e2e" "$root/nvidia/tests/e2e/$0.cu" -o "$work/$0.$1" -lcuda 2> "$work/$0.$1.build" ||
     echo "build failed" >> "$work/$0.$1.build"'
 

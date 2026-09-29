@@ -5,7 +5,9 @@
 //   - a 64-bit negate whose low word is zero (LEA Rd, P, -Ra: the carry),
 //   - a return taken by some lanes of a reduction (EXIT Pn),
 //   - float and integer block reductions ending in one thread's store,
-//   - an mbarrier pipeline between warps (SYNCS from sm_90).
+//   - an mbarrier pipeline between warps (SYNCS from sm_90),
+//   - thread-block clusters: their special registers, barrier and
+//     distributed shared memory (sm_90+).
 #include <cstdint>
 #include <cstdio>
 #include <cuda_runtime.h>
@@ -153,6 +155,39 @@ __global__ void mbar_pipeline(int* out, int rounds) {
 #endif
 }
 
+// Thread-block clusters (sm_90+): every cluster special register, and a value
+// passed around the cluster through distributed shared memory. Launched as a
+// 2x2x1 cluster over a 4x4 grid. Each block writes 13 words.
+__global__ void cluster_ids(unsigned* out) {
+#if __CUDA_ARCH__ >= 900
+  __shared__ unsigned mine;
+  unsigned v[12];
+  asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(v[0]));
+  asm volatile("mov.u32 %0, %%cluster_nctarank;" : "=r"(v[1]));
+  asm volatile("mov.u32 %0, %%cluster_ctaid.x;" : "=r"(v[2]));
+  asm volatile("mov.u32 %0, %%cluster_ctaid.y;" : "=r"(v[3]));
+  asm volatile("mov.u32 %0, %%cluster_nctaid.x;" : "=r"(v[4]));
+  asm volatile("mov.u32 %0, %%cluster_nctaid.y;" : "=r"(v[5]));
+  asm volatile("mov.u32 %0, %%clusterid.x;" : "=r"(v[6]));
+  asm volatile("mov.u32 %0, %%clusterid.y;" : "=r"(v[7]));
+  asm volatile("mov.u32 %0, %%nclusterid.x;" : "=r"(v[8]));
+  asm volatile("mov.u32 %0, %%nclusterid.y;" : "=r"(v[9]));
+  asm volatile("{ .reg .pred p; mov.pred p, %%is_explicit_cluster; selp.u32 %0, 1, 0, p; }" : "=r"(v[10]));
+  if (threadIdx.x == 0) mine = 100 * (blockIdx.y * gridDim.x + blockIdx.x) + v[0];
+  asm volatile("barrier.cluster.arrive.aligned; barrier.cluster.wait.aligned;" ::: "memory");
+  // The next rank's value, read through its shared memory.
+  unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(&mine)), r;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"((v[0] + 1) % v[1]));
+  asm volatile("ld.shared::cluster.u32 %0, [%1];" : "=r"(v[11]) : "r"(r));
+  asm volatile("barrier.cluster.arrive.aligned; barrier.cluster.wait.aligned;" ::: "memory");
+  if (threadIdx.x == 0) {
+    unsigned* o = out + 13 * (blockIdx.y * gridDim.x + blockIdx.x);
+    for (int i = 0; i < 12; ++i) o[i] = v[i];
+    o[12] = 1;
+  }
+#endif
+}
+
 static int g_fail = 0;
 #define CHECK(c, ...)                        \
   do {                                       \
@@ -292,6 +327,41 @@ int main() {
       }
       CHECK(hm[rounds] == 32, "mbarrier pending count after init = %d, want 32", hm[rounds]);
       CHECK(hm[rounds + 1] == 0, "a test_wait before the phase ended said it had");
+    }
+  }
+
+  // Clusters.
+  {
+    int major = 0;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+    if (major >= 9) {
+      unsigned* dc;
+      const int nb = 16;
+      cudaMalloc(&dc, 13 * nb * sizeof(unsigned));
+      cudaMemset(dc, 0, 13 * nb * sizeof(unsigned));
+      cudaLaunchConfig_t cfg = {};
+      cfg.gridDim = dim3(4, 4, 1);
+      cfg.blockDim = dim3(64, 1, 1);
+      cudaLaunchAttribute attr[1];
+      attr[0].id = cudaLaunchAttributeClusterDimension;
+      attr[0].val.clusterDim.x = 2;
+      attr[0].val.clusterDim.y = 2;
+      attr[0].val.clusterDim.z = 1;
+      cfg.attrs = attr;
+      cfg.numAttrs = 1;
+      CHECK(cudaLaunchKernelEx(&cfg, cluster_ids, dc) == cudaSuccess, "cluster launch: %s", cudaGetErrorString(cudaGetLastError()));
+      unsigned hc[13 * nb];
+      cudaMemcpy(hc, dc, sizeof hc, cudaMemcpyDeviceToHost);
+      for (int by = 0; by < 4; ++by)
+        for (int bx = 0; bx < 4; ++bx) {
+          const unsigned* o = hc + 13 * (by * 4 + bx);
+          const unsigned cx = bx % 2, cy = by % 2, rank = cx + 2 * cy;
+          const unsigned next = (rank + 1) % 4;
+          const unsigned nbx = bx - cx + next % 2, nby = by - cy + next / 2;
+          const unsigned want[13] = {rank, 4, cx, cy, 2, 2, bx / 2u, by / 2u, 2, 2, 1, 100 * (nby * 4 + nbx) + next, 1};
+          for (int i = 0; i < 13; ++i)
+            CHECK(o[i] == want[i], "cluster block (%d,%d) word %d = %u, want %u", bx, by, i, o[i], want[i]);
+        }
     }
   }
 

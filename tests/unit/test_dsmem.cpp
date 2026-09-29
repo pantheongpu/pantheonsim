@@ -164,6 +164,37 @@ END:
   VCHECK_EQ(mem.load_scalar(out + 4, 4), uint64_t{3 * 128});
 }
 
+// %is_explicit_cluster is a predicate, and cooperative groups reads it with
+// mov.pred: set in a cluster launch, clear in one without.
+VTEST(is_explicit_cluster_moves_into_a_predicate) {
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(2 * 4);
+  const char* ptx = R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    mov.pred %p1, %is_explicit_cluster;
+    selp.u32 %r1, 1, 0, %p1;
+    mov.u32 %r2, %ctaid.x;
+    mul.wide.u32 %rd2, %r2, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r1;
+    ret;
+}
+)";
+  run(ptx, clusters(2, 2, 32), {arg_u64(out)}, mem);
+  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{1});
+  VCHECK_EQ(mem.load_scalar(out + 4, 4), uint64_t{1});
+  LaunchConfig plain;
+  plain.grid = {2, 1, 1};
+  plain.block = {32, 1, 1};
+  run(ptx, plain, {arg_u64(out)}, mem);
+  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{0});
+}
+
 // CUTLASS's ClusterBarrier::arrive(cta_id): the other blocks publish a value
 // and arrive on rank 0's barrier; rank 0 waits on it and then sees all three.
 VTEST(remote_mbarrier_arrive_releases_the_owner) {

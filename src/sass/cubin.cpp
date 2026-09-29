@@ -52,6 +52,8 @@ enum Attr : uint8_t {
   kCbankParamSize = 0x19,
   kExitInstrOffsets = 0x1c,
   kRegcount = 0x2f,
+  kCtaPerCluster = 0x3d,     // __cluster_dims__: x, y, z
+  kExplicitCluster = 0x3e,   // launched with a cluster, or refused
   kNumBarriers = 0x4c,
 };
 
@@ -206,6 +208,11 @@ Cubin parse_cubin(const uint8_t* data, size_t size) {
           for (uint16_t o = 0; o + 4 <= rec.size; o += 4) k.exit_offsets.push_back(u32(rec.payload + o));
           break;
         case kNumBarriers: k.barriers = rec.payload[0]; break;
+        case kCtaPerCluster:
+          if (rec.size >= 12)
+            for (int i = 0; i < 3; ++i) k.cluster[i] = u32(rec.payload + 4 * i);
+          break;
+        case kExplicitCluster: k.explicit_cluster = true; break;
         default: break;
       }
     }

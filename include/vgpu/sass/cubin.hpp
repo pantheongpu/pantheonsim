@@ -22,6 +22,7 @@
 // many bytes of payload.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -71,6 +72,8 @@ struct CubinKernel {
   uint32_t barriers = 0;
   uint64_t shared_bytes = 0;    // static shared memory
   std::vector<uint32_t> exit_offsets;
+  std::array<uint32_t, 3> cluster{0, 0, 0};   // __cluster_dims__, zeros when none
+  bool explicit_cluster = false;              // must be launched with a cluster
 };
 
 struct Cubin {

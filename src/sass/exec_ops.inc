@@ -61,7 +61,7 @@ bool executes(const Instr& ins) {
     case Op::BSYNC: case Op::CALL: case Op::CCTL: case Op::DEPBAR: case Op::ERRBAR: case Op::EXIT: case Op::MEMBAR:
     case Op::NANOSLEEP: case Op::NOP: case Op::RET: case Op::YIELD:
       return true;
-    case Op::WARPSYNC: case Op::ENDCOLLECTIVE:
+    case Op::WARPSYNC: case Op::ENDCOLLECTIVE: case Op::UCGABAR:
       return true;
     case Op::R2UR:
       return ins.f[0] == 0;   // not the forms reporting a non-uniform value yet
@@ -124,7 +124,7 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
       case Op::BRA: case Op::BRX: case Op::JMP: case Op::CALL: case Op::RET: case Op::EXIT:
       case Op::BSSY: case Op::BSYNC: case Op::BREAK: case Op::WARPSYNC: case Op::BAR:
       case Op::NOP: case Op::YIELD: case Op::NANOSLEEP: case Op::BPT: case Op::DEPBAR:
-      case Op::MEMBAR: case Op::ERRBAR: case Op::CCTL: case Op::BMOV: case Op::ENDCOLLECTIVE:
+      case Op::MEMBAR: case Op::ERRBAR: case Op::CCTL: case Op::BMOV: case Op::ENDCOLLECTIVE: case Op::UCGABAR:
         pcs_set = exec_control(blk, w, ins, ex, group);
         break;
       case Op::LDG: case Op::STG: case Op::LDS: case Op::STS: case Op::LDL: case Op::STL:
@@ -2511,6 +2511,25 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       release_warpsync();
       for (unsigned id = 0; id < 16; ++id)
         if (blk.bars[id].arrived) release_bar(id);
+      cluster_barrier_check(blk);
+      return true;
+    }
+    case Op::UCGABAR: {   // barrier.cluster: UCGABAR_ARV arrives, UCGABAR_WAIT waits for the phase
+      Cluster& cl = *blk.cluster;
+      if (ins.f[0] == 0) {
+        each_lane(ex, [&](unsigned l) { w.cga_target[l] = cl.phase + 1; });
+        w.cga_arrived |= ex;
+        cluster_barrier_check(blk);
+        return false;
+      }
+      each_lane(group, [&](unsigned l) {
+        if ((ex >> l & 1) && cl.phase < w.cga_target[l]) {
+          w.waiting |= Mask{1} << l;
+          w.wait_kind[l] = Wait::Cluster;
+        } else {
+          w.pc[l] += 16;
+        }
+      });
       return true;
     }
     case Op::BSSY:
@@ -2722,6 +2741,31 @@ void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const 
   fault(w, ins, 0, "call to " + name + ", which is not available");
 }
 
+// The cluster barrier completes its phase when every thread of the cluster
+// that has not exited has arrived (barrier.cluster; exited threads count as
+// arrived), and releases the lanes waiting for it.
+void Runner::cluster_barrier_check(Block& blk) {
+  Cluster& cl = *blk.cluster;
+  bool any = false;
+  for (Block* b : cl.blocks)
+    for (const Warp& w : b->warps) {
+      if ((w.alive & ~w.exited) & ~w.cga_arrived) return;
+      any = any || w.cga_arrived;
+    }
+  if (!any) return;
+  ++cl.phase;
+  for (Block* b : cl.blocks)
+    for (Warp& w : b->warps) {
+      w.cga_arrived = 0;
+      for (unsigned l = 0; l < 32; ++l)
+        if ((w.waiting >> l & 1) && w.wait_kind[l] == Wait::Cluster && w.cga_target[l] <= cl.phase) {
+          w.waiting &= ~(Mask{1} << l);
+          w.wait_kind[l] = Wait::None;
+          w.pc[l] += 16;
+        }
+    }
+}
+
 // ---- mbarriers (SYNCS, ATOMS.ARRIVE, ARRIVES) ----------------------------------
 //
 // From sm_90 the mbarrier is the 64-bit word ptxas lays out for SYNCS
@@ -2736,7 +2780,7 @@ void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const 
 // The barrier's shared offset from a lane's [Ra + URb + offset] (Ra at 24,
 // URb at `ur_at`) or, with ra_at < 0, [URa + offset] (URa at 24). The CTA's
 // rank in its cluster rides in bits 24 up.
-uint32_t Runner::mbar_offset(Block& blk, Warp& w, const Instr& ins, unsigned l, bool ur_only) {
+uint32_t Runner::mbar_offset(Block& blk, Warp& w, const Instr& ins, unsigned l, bool ur_only, Block** owner) {
   const Word& word = ins.w;
   const unsigned ub = m_.sm >= 100 ? 8 : 6, urz = m_.sm >= 100 ? 255u : 63u;
   const auto ureg = [&](unsigned u) -> uint64_t { return u >= urz ? 0 : w.ur[u]; };
@@ -2748,11 +2792,15 @@ uint32_t Runner::mbar_offset(Block& blk, Warp& w, const Instr& ins, unsigned l, 
     a = (ra == kRZ ? 0 : w.reg(ra, l)) + ureg(static_cast<unsigned>(word.field(64, ub)));
   }
   a += static_cast<uint64_t>(word.sfield(40, 24));
-  const uint32_t off = static_cast<uint32_t>(a) & 0xffffff;
-  if ((static_cast<uint32_t>(a) >> 24) != 0)
-    throw Fault("an mbarrier in another block of a cluster (a cluster launch runs on PTX)");
+  uint32_t off;
+  Block& b = shared_block(blk, static_cast<uint32_t>(a), &off);
+  // Arrivals may be on another block's barrier (mbarrier.arrive's
+  // .shared::cluster); initializing, waiting and invalidating are for a
+  // block's own.
+  if (!owner && &b != &blk) throw Fault("an mbarrier of another block of the cluster, used by other than an arrive");
+  if (owner) *owner = &b;
   if (off % 8) throw Fault("an mbarrier must be 8-byte aligned");
-  if (off + 8 > blk.shared.size()) throw Fault("an mbarrier past the block's shared memory");
+  if (off + 8 > b.shared.size()) throw Fault("an mbarrier past the block's shared memory");
   return off;
 }
 
@@ -2811,12 +2859,12 @@ void Runner::exec_syncs(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     w.reg(rd + 1, l) = static_cast<uint32_t>(v >> 32);
   };
   if (ins.op == Op::ATOMS) {   // ATOMS.ARRIVE.64 Rd, [addr]: sm_80's arrive
-    each_lane(ex, [&](unsigned l) { put_pair(ins.dst[0].reg, l, mbar_arrive80(blk, mbar_offset(blk, w, ins, l, false))); });
+    each_lane(ex, [&](unsigned l) { put_pair(ins.dst[0].reg, l, mbar_arrive80(blk, mbar_offset(blk, w, ins, l, false, nullptr))); });
     return;
   }
   if (ins.op == Op::ARRIVES) {   // cp.async's arrive; the copies have landed already (LDGSTS)
     each_lane(ex, [&](unsigned l) {
-      const uint32_t off = mbar_offset(blk, w, ins, l, false);
+      const uint32_t off = mbar_offset(blk, w, ins, l, false, nullptr);
       if (ins.f[0] == 0) mbar_arrive80(blk, off);
       else if (ins.f[0] == 1) mbar_arrive(blk, off, 0, -1, false);   // .TRANSCNT: A0T1's transaction
       else mbar_arrive(blk, off, 1, 0, false);                        // .ARVCNT
@@ -2827,7 +2875,7 @@ void Runner::exec_syncs(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     case 0: {   // EXCH.64 URd, [URa + offset], URb: mbarrier.init
       if (!ex) return;
       const unsigned d = ins.dst[0].reg, b = ins.src[1].reg;
-      const uint32_t off = mbar_offset(blk, w, ins, static_cast<unsigned>(std::countr_zero(ex)), true);
+      const uint32_t off = mbar_offset(blk, w, ins, static_cast<unsigned>(std::countr_zero(ex)), true, nullptr);
       uint64_t old;
       std::memcpy(&old, &blk.shared[off], 8);
       const uint64_t v = ureg(b) | (ureg(b + 1) << 32);
@@ -2856,7 +2904,9 @@ void Runner::exec_syncs(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           case 5: arrivals = b; break;                      // .ART0: arrive b times
           default: throw Fault("SYNCS.ARRIVE mode " + std::to_string(mode) + " is not implemented");
         }
-        put_pair(ins.dst[0].reg, l, mbar_arrive(blk, mbar_offset(blk, w, ins, l, false), arrivals, tx, drop));
+        Block* at = nullptr;
+        const uint32_t off = mbar_offset(blk, w, ins, l, false, &at);
+        put_pair(ins.dst[0].reg, l, mbar_arrive(*at, off, arrivals, tx, drop));
       });
       return;
     }
@@ -2864,7 +2914,7 @@ void Runner::exec_syncs(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       const unsigned rb = ins.src[1].reg;
       bool all = true;
       each_lane(ex, [&](unsigned l) {
-        const uint32_t off = mbar_offset(blk, w, ins, l, false);
+        const uint32_t off = mbar_offset(blk, w, ins, l, false, nullptr);
         uint64_t v;
         std::memcpy(&v, &blk.shared[off], 8);
         const bool done = static_cast<uint32_t>(v >> 63) != ((rb == kRZ ? 0 : w.reg(rb, l)) >> 31);
@@ -2878,7 +2928,7 @@ void Runner::exec_syncs(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       if (ins.src.empty()) {
         if (ex) blk.mbar.clear();
       } else {
-        each_lane(ex, [&](unsigned l) { blk.mbar.erase(mbar_offset(blk, w, ins, l, false)); });
+        each_lane(ex, [&](unsigned l) { blk.mbar.erase(mbar_offset(blk, w, ins, l, false, nullptr)); });
       }
       return;
     default:
@@ -2908,12 +2958,11 @@ ptx::AtomOp sass_atom_op(uint32_t op) {
 }
 }  // namespace
 
-// The shared memory a cluster-wide shared address names: the rank in bits
-// 24 up, the offset below.
-Block& Runner::shared_block(Block& blk, uint32_t addr, uint32_t* off) {
-  *off = addr & 0xffffff;
-  if ((addr >> 24) != 0) throw Fault("shared memory of another block of a cluster (a cluster launch runs on PTX)");
-  return blk;
+
+// Block `rank` of blk's cluster.
+Block& Runner::cluster_block(Block& blk, uint32_t rank) {
+  uint32_t off;
+  return shared_block(blk, uint64_t{rank} << 24, &off);
 }
 
 void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
@@ -3006,8 +3055,11 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     if (!ins.f[1]) {
       deliver(to, off, bar_off);
     } else {
-      if (mask & ~1u) throw Fault("a multicast bulk copy to other blocks of a cluster (a cluster launch runs on PTX)");
-      if (mask & 1u) deliver(to, off, bar_off);
+      // Multicast: the same data at the same offset into every block the
+      // mask names, each completing on its own barrier at the barrier's
+      // offset.
+      for (uint32_t r = 0; r < 16; ++r)
+        if (mask >> r & 1) deliver(cluster_block(blk, r), off, bar_off);
     }
     return;
   }
@@ -3063,17 +3115,25 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     blk.st.global_bytes_read += box.total * box.gs;
     // The barrier counts every byte of the box, the zero-filled ones too (for
     // the packed types, the packed bytes).
-    const uint32_t mask = multicast ? extra >> 16 : 1u;
-    if (mask & ~1u) throw Fault("a multicast tensor copy to other blocks of a cluster (a cluster launch runs on PTX)");
-    if (mask & 1u) {
-      uint32_t bar_off;
-      Block& bar = shared_block(blk, urv(ura + 1), &bar_off);
-      if (&bar != &home) throw Fault("a tensor copy's mbarrier must be in the block its data goes to");
+    uint32_t bar_off;
+    Block& bar = shared_block(blk, urv(ura + 1), &bar_off);
+    if (&bar != &home) throw Fault("a tensor copy's mbarrier must be in the block its data goes to");
+    const auto deliver = [&](Block& to) {
       for (const auto& [soff, v] : runs) {
-        shared_range(home, soff, v.size(), "a tensor copy");
-        std::memcpy(&home.shared[soff], v.data(), v.size());
+        shared_range(to, soff, v.size(), "a tensor copy");
+        std::memcpy(&to.shared[soff], v.data(), v.size());
       }
-      mbar_arrive(bar, bar_off, 0, -static_cast<int64_t>(box.total * box.gs), false);
+      mbar_arrive(to, bar_off, 0, -static_cast<int64_t>(box.total * box.gs), false);
+    };
+    if (!multicast) {
+      deliver(home);
+    } else {
+      // The same box at the same offset into every block the mask names,
+      // each completing on its own barrier at the barrier's offset.
+      const uint32_t mask = extra >> 16;
+      if (!mask) throw Error(Err::InvalidValue, "a multicast tensor copy whose CTA mask names no block");
+      for (uint32_t r = 0; r < 16; ++r)
+        if (mask >> r & 1) deliver(cluster_block(blk, r));
     }
     return;
   }
