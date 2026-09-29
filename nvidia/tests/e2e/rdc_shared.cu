@@ -4,20 +4,20 @@
 // needs 40 KB, the two together 80 KB, more than a multiprocessor holds.
 // Charging every kernel for every module-scope array refused both launches
 // (NanoVDB's tests, with the device-runtime library's arrays on top, could
-// launch nothing). Each thread reads back its own element, so no barrier is
-// needed inside the functions (the simulator does not yet run barriers in a
-// non-inlined device function). Built normally, this is just a correct program.
+// launch nothing). Built normally, this is just a correct program.
 #include <cstdio>
 
 __device__ __noinline__ int stage_a(int i) {
     __shared__ int buf[10000];
     buf[i] = i + 1;
-    return buf[i];
+    __syncthreads();
+    return buf[(i + 1) % blockDim.x];
 }
 __device__ __noinline__ int stage_b(int i) {
     __shared__ int buf[10000];
     buf[i] = 2 * i;
-    return buf[i];
+    __syncthreads();
+    return buf[(i + 1) % blockDim.x];
 }
 __global__ void kernel_a(int* out) { out[threadIdx.x] = stage_a(threadIdx.x); }
 __global__ void kernel_b(int* out) { out[32 + threadIdx.x] = stage_b(threadIdx.x); }
@@ -35,8 +35,9 @@ int main() {
     if (ea != cudaSuccess) { std::printf("FAIL kernel_a: %s\n", cudaGetErrorString(ea)); ++bad; }
     if (eb != cudaSuccess) { std::printf("FAIL kernel_b: %s\n", cudaGetErrorString(eb)); ++bad; }
     for (int t = 0; t < 32 && !bad; ++t) {
-        if (h[t] != t + 1) { std::printf("FAIL kernel_a[%d]=%d want %d\n", t, h[t], t + 1); ++bad; }
-        if (h[32 + t] != 2 * t) { std::printf("FAIL kernel_b[%d]=%d want %d\n", t, h[32 + t], 2 * t); ++bad; }
+        const int n = (t + 1) % 32;
+        if (h[t] != n + 1) { std::printf("FAIL kernel_a[%d]=%d want %d\n", t, h[t], n + 1); ++bad; }
+        if (h[32 + t] != 2 * n) { std::printf("FAIL kernel_b[%d]=%d want %d\n", t, h[32 + t], 2 * n); ++bad; }
     }
     std::printf(bad ? "FAILED\n" : "PASS\n");
     return bad ? 1 : 0;
