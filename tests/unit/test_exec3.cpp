@@ -3080,7 +3080,8 @@ VTEST(mbarrier_counts_threads_not_warps) {
   // A barrier initialized to blockDim.x completes only if every *thread*
   // counts as an arrival. Counting one per warp is the mistake that makes it
   // never complete -- and it would show up as a hang, not a wrong number, so
-  // pending_count is checked directly instead.
+  // pending_count is checked directly instead: thread 0 arrives once more,
+  // and its state holds the count from before that arrival.
   std::string ptx = std::string(kHeader) + R"(
 .visible .entry k(.param .u64 out)
 {
@@ -3101,7 +3102,8 @@ INITDONE:
     mbarrier.arrive.shared.b64 %rd5, [%rd3];
     bar.sync 0;
     @%p0 bra DONE;
-    mbarrier.pending_count.shared.b64 %r6, [%rd3];
+    mbarrier.arrive.shared.b64 %rd6, [%rd3];
+    mbarrier.pending_count.b64 %r6, %rd6;
     st.global.u32 [%rd2], %r6;
 DONE:
     ret;

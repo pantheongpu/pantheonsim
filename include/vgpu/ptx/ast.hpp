@@ -908,7 +908,9 @@ struct OpBarRed { BarRedOp op = BarRedOp::And; Reg dst; Reg src; bool negate_src
 struct OpRet {};
 // Call-sequence machinery (currently only the vprintf builtin is callable).
 struct OpDeclSlot { std::string name; uint32_t size = 0; };            // ".param .b64 param0;" in body
-struct OpStSlot { std::string slot; int64_t offset = 0; Type ty; Operand src; };
+// A vector store (st.param.v2/.v4 of a call's argument or return value) puts
+// `rest` after `src`, each one element further on.
+struct OpStSlot { std::string slot; int64_t offset = 0; Type ty; Operand src; std::vector<Operand> rest; };
 // cp.async.{ca,cg}.shared.global [dst], [src], cp-size{, src-size};
 //
 // A copy from global to shared that the *thread* does not wait on: it is
@@ -942,7 +944,8 @@ struct OpCpAsyncGroup {
   bool noinc = false;                  // .noinc: do not add an arrival of our own
 };
 
-struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; };
+// As OpStSlot: a vector load's further elements go to `rest`.
+struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; std::vector<Reg> rest; };
 // A call. `callee` names either a builtin (vprintf, __assertfail, malloc,
 // free) or a device function defined in the same module, in which case
 // `target` points at it. Held by shared_ptr so a resolved call stays valid

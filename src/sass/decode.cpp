@@ -1515,7 +1515,7 @@ void dec_movm(Instr& ins, const Word& w) {
     ins.mods.push_back("16");
     ins.mods.push_back("MT88");
   }
-  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
+  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), ins.f[0] ? 2 : 1));
   ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
 }
 
@@ -2070,9 +2070,21 @@ void dec_atoms(Instr& ins, const Word& w, bool cas) {
 
 // ATOMS.POPC.INC: each active thread's increment of one shared word, summed
 // across the warp (a warp-aggregated atomic). It returns the old value.
+// 87-90 = 9 is instead ATOMS.ARRIVE.64 Rd, [addr]: sm_80's mbarrier.arrive
+// (exec_ops.inc, exec_arrive80), returning the word before.
 void dec_atoms_popc(Instr& ins, const Word& w) {
   ins.op = Op::ATOMS;
   ins.mnemonic = "ATOMS";
+  if (w.field(87, 4) == 9) {
+    ins.mods = {"ARRIVE", "64"};
+    ins.f[0] = 9;
+    ins.f[2] = 2;   // the arrive form
+    const unsigned rd = static_cast<unsigned>(w.field(16, 8));
+    ins.dst.push_back(R(rd, rd == kRZ ? 1 : 2));
+    const int ur = static_cast<int>(w.field(64, ureg_bits(ins.sm)));
+    ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), false, "", ur, w.sfield(40, 24), ins.sm, true));
+    return;
+  }
   ins.mods.push_back("POPC");
   ins.mods.push_back("INC");
   ins.mods.push_back("32");
@@ -2421,7 +2433,8 @@ void dec_syncs_arrive(Instr& ins, const Word& w) {
   ins.mods.push_back("TRANS64");
   if (w.bit(74)) ins.mods.push_back("RED");
   if (w.bit(75)) ins.mods.push_back("OPTOUT");
-  static const char* const modes[] = {"", "A1T0", "(2)", "A0TR", "A0TX", "ART0", "(6)", "(7)"};
+  if (w.bit(73)) ins.mods.push_back("TMASK");   // arrive.noComplete
+  static const char* const modes[] = {"", "A1T0", "A0T1", "A0TR", "A0TX", "ART0", "(6)", "(7)"};
   const unsigned mode = static_cast<unsigned>(w.field(84, 3));
   if (mode) ins.mods.push_back(modes[mode]);
   ins.f[0] = 1;   // ARRIVE
@@ -2459,6 +2472,24 @@ void dec_syncs_cctl(Instr& ins, const Word& w) {
   }
   ins.mods.push_back("IV");
   ins.src.push_back(syncs_addr(w, ins.sm));
+}
+
+// ARRIVES.LDGSTSBAR.64[.TRANSCNT/.ARVCNT] [Ra + URb + offset]: cp.async's
+// mbarrier arrive, taken when the thread's earlier cp.asyncs land. Plain
+// before sm_90 (an arrival, sm_80's layout); from sm_90 .TRANSCNT completes
+// the transaction A0T1 declared and .ARVCNT arrives (the .noinc form); at
+// 71/70 on sm_90, 77/76 from sm_100.
+void dec_arrives(Instr& ins, const Word& w) {
+  ins.op = Op::ARRIVES;
+  ins.mnemonic = "ARRIVES";
+  ins.mods = {"LDGSTSBAR", "64"};
+  const bool bw = ins.sm >= 100;
+  const bool trans = w.bit(bw ? 77 : 71), arv = w.bit(bw ? 76 : 70);
+  if (trans) ins.mods.push_back("TRANSCNT");
+  if (arv) ins.mods.push_back("ARVCNT");
+  ins.f[0] = trans ? 1 : arv ? 2 : 0;
+  const int ur = static_cast<int>(w.field(64, ureg_bits(ins.sm)));
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), false, "", ur, w.sfield(40, 24), ins.sm, true));
 }
 
 // STSM.16.M88(.2/.4) (stmatrix): LDSM's layout, stored: 72-73 the count,
@@ -2798,17 +2829,20 @@ void dec_credux(Instr& ins, const Word& w) {
   ins.src.back().reuse = reuse(w, 0);
 }
 
-// RPCMOV.32 Rpc.LO, Ra / Ra, Rpc.LO (sm_100): the return address register.
+// RPCMOV.32 Rpc.LO, Ra / Ra, Rpc.LO (sm_90+): the return address register,
+// a half at a time (31: .HI).
 void dec_rpcmov(Instr& ins, const Word& w, bool to_reg) {
   ins.op = Op::RPCMOV;
   ins.mnemonic = "RPCMOV";
   ins.mods.push_back("32");
   ins.f[0] = to_reg;
+  ins.f[1] = w.bit(31);   // the high word
+  const char* half = w.bit(31) ? "Rpc.HI" : "Rpc.LO";
   if (to_reg) {
     ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
-    ins.src.push_back(Txt("Rpc.LO"));
+    ins.src.push_back(Txt(half));
   } else {
-    ins.dst.push_back(Txt("Rpc.LO"));
+    ins.dst.push_back(Txt(half));
     ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8))));
   }
 }
@@ -3291,7 +3325,7 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
       {0x9a3, [](Instr& i, const Word& w) { dec_atom_f(i, w, Op::ATOMG, "ATOMG"); }},
       {0x9a6, [](Instr& i, const Word& w) { dec_atom_f(i, w, Op::RED, "REDG"); }},
       {0x21f, dec_plop3_sign}, {0x2ca, dec_r2ur},
-      {0x5b2, dec_syncs_exch}, {0x9a7, dec_syncs_arrive}, {0x5a7, dec_syncs_phasechk}, {0x9b1, dec_syncs_cctl},
+      {0x5b2, dec_syncs_exch}, {0x9a7, dec_syncs_arrive}, {0x5a7, dec_syncs_phasechk}, {0x9b1, dec_syncs_cctl}, {0x9b0, dec_arrives},
       {0x844, dec_stsm}, {0x94e, dec_lepc_target}, {0x82f, dec_elect}, {0x3c6, dec_fence}, {0x9b9, dec_utmacctl},
       {0x9c8, dec_usetmaxreg}, {0x9c5, dec_warpgroup}, {0x9a5, dec_ldgmc},
       {0x5ab, [](Instr& i, const Word&) { dec_plain(i, Op::ERRBAR, "CGAERRBAR"); }},

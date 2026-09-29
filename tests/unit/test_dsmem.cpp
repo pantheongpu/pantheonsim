@@ -474,7 +474,8 @@ WAIT:
     mbarrier.try_wait.parity.shared::cta.b64 %p5, [%r1], 0;
     @!%p5 bra WAIT;
     @!%p2 bra END;
-    mbarrier.pending_count.b64 %r5, [%r1];
+    mbarrier.arrive.shared::cta.b64 %rd4, [%r1];   // the state: the count before this arrival
+    mbarrier.pending_count.b64 %r5, %rd4;
     mul.wide.u32 %rd2, %r2, 4;
     add.u64 %rd3, %rd1, %rd2;
     add.u32 %r6, %r5, 100;

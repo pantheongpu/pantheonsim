@@ -5173,13 +5173,11 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpStSlot>(&ins.op)) {
-      Lanes _s_v;
-      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Warp::Slot& slot = w.slots[op->slot];
       const uint32_t nbytes = op->ty.bytes() ? op->ty.bytes() : 4u;
       // A slot written before it was declared (or wider than declared) grows
       // to fit rather than dropping the write silently.
-      const uint32_t need = static_cast<uint32_t>(op->offset) + nbytes;
+      const uint32_t need = static_cast<uint32_t>(op->offset) + nbytes * static_cast<uint32_t>(1 + op->rest.size());
       if (slot.bytes.empty() || slot.size < need) {
         Warp::Slot grown;
         grown.reset(slot.size < need ? need : slot.size, W_);
@@ -5188,10 +5186,14 @@ class Interpreter {
                       slot.bytes.data() + static_cast<size_t>(lane) * slot.size, slot.size);
         slot = std::move(grown);
       }
-      for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane))
-          slot.write(lane, static_cast<uint32_t>(op->offset), nbytes,
-                     mask_to_bits(v[lane], op->ty.bits));
+      for (size_t e = 0; e <= op->rest.size(); ++e) {
+        Lanes _s_v;
+        const Lanes& v = read_operand(w, ctx, ins, e ? op->rest[e - 1] : op->src, _s_v);
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane))
+            slot.write(lane, static_cast<uint32_t>(op->offset + e * nbytes), nbytes,
+                       mask_to_bits(v[lane], op->ty.bits));
+      }
       return;
     }
     if (const auto* op = std::get_if<OpLdSlot>(&ins.op)) {
@@ -5199,11 +5201,15 @@ class Interpreter {
       if (it == w.slots.end())
         ctx_fail(ins, -1, Err::UninitializedRegister, "call slot '" + op->slot + "' read before write");
       const uint32_t nbytes = op->ty.bytes() ? op->ty.bytes() : 4u;
-      Lanes r{};
-      for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane))
-          r[lane] = it->second.read(lane, static_cast<uint32_t>(op->offset), nbytes);
-      write_reg(w, op->dst, m, r, op->ty.bits);
+      for (size_t e = 0; e <= op->rest.size(); ++e) {
+        const Reg& d = e ? op->rest[e - 1] : op->dst;
+        if (d.id == kNoReg) continue;   // `_`
+        Lanes r{};
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane))
+            r[lane] = it->second.read(lane, static_cast<uint32_t>(op->offset + e * nbytes), nbytes);
+        write_reg(w, d, m, r, op->ty.bits);
+      }
       return;
     }
     if (const auto* op = std::get_if<OpCall>(&ins.op)) {
@@ -9284,6 +9290,18 @@ class Interpreter {
                      Mask m) {
     if (!ctx.mbar)
       ctx_fail(ins, -1, Err::UnsupportedPtx, "mbarrier outside a block context");
+    if (op.op == MbarOp::PendingCount) {
+      // From the state an arrive returned: the count it saw, before its own
+      // arrival (the ISA's state is the barrier's "prior to the arrive-on
+      // operation"), kept in the token's high word.
+      Lanes _s_st;
+      const Lanes& st = read_operand(w, ctx, ins, op.state, _s_st);
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = st[lane] >> 32;
+      write_reg(w, op.dst, m, r, 32);
+      return;
+    }
     Lanes _s_base;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     const uint64_t sbase = space_base(Space::Shared);
@@ -9365,8 +9383,9 @@ class Interpreter {
           inc = lanes;
         }
         // The token names the phase this arrival belongs to, which is the
-        // phase a later test_wait asks about. Captured before any flip.
-        const uint64_t token = b.phase & 1u;
+        // phase a later test_wait asks about, and (high word) the arrivals
+        // the phase still needed, for pending_count. Captured before any flip.
+        const uint64_t token = (b.phase & 1u) | ((b.expected > b.arrived ? b.expected - b.arrived : 0) << 32);
         b.arrived += inc;
         const uint32_t before = b.phase;
         complete_phase_if_done(b);
@@ -9424,16 +9443,8 @@ class Interpreter {
         }
         return;
       }
-      case MbarOp::PendingCount: {
-        require_valid();
-        land_bulk_copies(ctx, b);
-        Lanes r;
-        const uint64_t pending = b.expected > b.arrived ? b.expected - b.arrived : 0;
-        for (uint32_t lane = 0; lane < W_; ++lane)
-          if (m & (Mask{1} << lane)) r[lane] = pending;
-        write_reg(w, op.dst, m, r, 32);
-        return;
-      }
+      case MbarOp::PendingCount:
+        return;   // handled above
     }
   }
 
