@@ -3,6 +3,9 @@
 // one and compares the SASS run against the PTX one):
 //   - a 64-bit compare against a negative constant (ISETP.GT.S64 R, -0x1),
 //   - a 64-bit negate whose low word is zero (LEA Rd, P, -Ra: the carry),
+//   - 64-bit division by constants, whose IMAD.WIDE chain carries through a
+//     predicate that an earlier compare left set (PyTorch's embedding
+//     backward, krn_partials_per_segment),
 //   - a return taken by some lanes of a reduction (EXIT Pn),
 //   - float and integer block reductions ending in one thread's store,
 //   - an mbarrier pipeline between warps (SYNCS from sm_90),
@@ -26,6 +29,18 @@ __global__ void negate64(long long base, long long* out, int n) {
   if (i >= n) return;
   const long long x = base + i;
   out[i] = -(x * 8);
+}
+
+// Each segment's size, from its start and the next one's (the last runs to
+// `total`), divided by constants as krn_partials_per_segment does.
+__global__ void divide64(const long long* starts, long long total, long long* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const long long end = i == n - 1 ? total : starts[i + 1];
+  const long long size = end - starts[i];
+  out[3 * i] = (size + 9) / 10;
+  out[3 * i + 1] = size / 7;
+  out[3 * i + 2] = size % 1000003;
 }
 
 template <class T>
@@ -315,6 +330,25 @@ int main() {
     cudaMemcpy(hneg, dneg, sizeof hneg, cudaMemcpyDeviceToHost);
     for (int i = 0; i < n; ++i)
       CHECK(hneg[i] == -((base + i) * 8), "negate64(%lld + %d) = %lld", base, i, hneg[i]);
+  }
+
+  // 64-bit division by constants, of sizes small, large and negative.
+  {
+    const int m = 64;
+    long long hs[m], hq[3 * m];
+    for (int i = 0; i < m; ++i) hs[i] = i * 3 + (i % 5 == 0 ? -(1LL << 40) : 0) + (i % 7 == 3 ? 12345678901LL : 0);
+    const long long total = hs[m - 1] + 17;
+    long long *ds, *dq;
+    cudaMalloc(&ds, sizeof hs);
+    cudaMalloc(&dq, sizeof hq);
+    cudaMemcpy(ds, hs, sizeof hs, cudaMemcpyHostToDevice);
+    divide64<<<2, 32>>>(ds, total, dq, m);
+    cudaMemcpy(hq, dq, sizeof hq, cudaMemcpyDeviceToHost);
+    for (int i = 0; i < m; ++i) {
+      const long long size = (i == m - 1 ? total : hs[i + 1]) - hs[i];
+      CHECK(hq[3 * i] == (size + 9) / 10 && hq[3 * i + 1] == size / 7 && hq[3 * i + 2] == size % 1000003,
+            "divide64(%lld) = %lld %lld %lld", size, hq[3 * i], hq[3 * i + 1], hq[3 * i + 2]);
+    }
   }
 
   // Block reductions: every block's result is written by its thread 0 alone.

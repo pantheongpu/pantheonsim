@@ -318,7 +318,11 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           uint64_t c = read64(w, ins.src[2], l);
           if (ins.src[2].neg) c = 0 - c;
           if (ins.src[2].bnot) c = ~c;
-          write64(w, ins.dst[0], l, prod + c + cin);
+          const unsigned __int128 full = static_cast<unsigned __int128>(prod) + c + cin;
+          write64(w, ins.dst[0], l, static_cast<uint64_t>(full));
+          // The carry out of the 64-bit sum, which the next IMAD.WIDE.X of a
+          // 64-bit multiply (ptxas's division by a constant) adds in.
+          if (ins.dst.size() > 1) set_pred(w, ins.dst[1], l, (full >> 64) != 0);
         } else if (kind == 0x27) {
           // HI: the high word of the product plus a 64-bit addend -- c is a
           // register pair (ptxas's division by a constant puts n in the high
@@ -331,7 +335,9 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
                            : static_cast<uint64_t>(sgn ? static_cast<int64_t>(static_cast<int32_t>(ival(w, ins.src[2], l)))
                                                        : ival(w, ins.src[2], l));
           if (ins.src[2].neg && (ins.src[2].kind == Kind::Reg || ins.src[2].kind == Kind::UReg)) c = 0 - c;
-          write32(w, ins.dst[0], l, static_cast<uint32_t>((prod + c) >> 32) + cin);
+          const unsigned __int128 full = ((static_cast<unsigned __int128>(prod) + c) >> 32) + cin;
+          write32(w, ins.dst[0], l, static_cast<uint32_t>(full));
+          if (ins.dst.size() > 1) set_pred(w, ins.dst[1], l, (full >> 32) != 0);
         } else {
           const uint32_t c = ival(w, ins.src[2], l);
           const uint64_t full = static_cast<uint64_t>(a * b) + c + cin;
