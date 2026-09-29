@@ -288,6 +288,17 @@ echo "$out" | sed 's/^/      /'
 expect "the graphs program runs to the end" "0" "$status"
 expect "every one of its graph checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# The rest of what ROCm's library exports (hipcc/exports.cpp): __managed__
+# variables, a code object loaded as a library, a fat binary and a link's
+# input, HCC's launch by its C and C++ names, half conversions, and what a
+# device with no OpenGL and no dma-bufs answers.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$shim" timeout 300 \
+      "$(dirname "$exe")/exports.gfx942" "$(dirname "$exe")/exports_kernel.gfx942.co" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the exports program runs to the end" "0" "$status"
+expect "every one of its export checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)

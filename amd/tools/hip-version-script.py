@@ -6,10 +6,10 @@ A program built by hipcc binds each call to a version as well as a name, and the
 loader refuses a library that defines the name under any other version, so the
 mapping has to be the real library's. Only names are read from it.
 
-  amd/tools/hip-version-script.py <real libamdhip64.so> <our hip_api.cpp.o> [out]
+  amd/tools/hip-version-script.py <real libamdhip64.so> <our object files...> [out.map]
 
-Give it the object file (build/CMakeFiles/vgpuhip.dir/amd/src/hip_api.cpp.o),
-not the library: a function added since the map was last written is not in
+Give it the object files (build/CMakeFiles/vgpuhip.dir/amd/src/hip_api.cpp.o and
+hip_cxx.cpp.o), not the library: a function added since the map was last written is not in
 the library at all, since only what the map exports survives the link.
 """
 import subprocess
@@ -59,28 +59,33 @@ def versions(real):
     return found
 
 
-def ours(lib, known):
+def ours(objects, known):
     # The whole symbol table, not the dynamic one: a function added since the
     # map was last written is not exported yet, because the map is what
     # exports it. Such a function is one the real library defines; a local
     # symbol it does not (a compiler's .cold part) stays local.
-    out = subprocess.run(['nm', '--defined-only', lib], capture_output=True, text=True).stdout
+    # Besides HIP's own names, whatever else the real library exports and
+    # these define: its C++ overloads, compiler-rt's half conversions, the
+    # debugger's queries.
     names = set()
-    for f in (l.split() for l in out.splitlines()):
-        if len(f) != 3 or f[1] not in 'Tt':
-            continue
-        name = f[2].split('@')[0]
-        if (name.startswith('hip') or name.startswith('__hip')) and (f[1] == 'T' or name in known):
-            names.add(name)
+    for obj in objects:
+        out = subprocess.run(['nm', '--defined-only', obj], capture_output=True, text=True).stdout
+        for f in (l.split() for l in out.splitlines()):
+            if len(f) != 3 or f[1] not in 'Tt':
+                continue
+            name = f[2].split('@')[0]
+            ours_by_name = name.startswith('hip') or name.startswith('__hip')
+            if (ours_by_name and f[1] == 'T') or name in known:
+                names.add(name)
     return sorted(names)
 
 
 def main():
-    real, lib = sys.argv[1], sys.argv[2]
-    dest = sys.argv[3] if len(sys.argv) > 3 else 'amd/src/libamdhip64.map'
+    real, objects = sys.argv[1], sys.argv[2:]
+    dest = objects.pop() if objects and objects[-1].endswith('.map') else 'amd/src/libamdhip64.map'
     known = versions(real)
     nodes = {k: [] for k in ORDER}
-    for name in ours(lib, known):
+    for name in ours(objects, known):
         nodes[known.get(name, 'hip_4.2')].append(name)
     text = [HEADER]
     prev = None
