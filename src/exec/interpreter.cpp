@@ -400,6 +400,10 @@ struct Warp {
   // the deterministic scheduler a turn otherwise lasts until the warp blocks,
   // and a spin never blocks, so the first waiter would hold the block forever.
   bool yield_now = false;
+  // Whether the warp has done an ordered load (.acquire, .relaxed, .volatile)
+  // or an atomic since its last backward branch: a loop around one is a spin
+  // waiting for another warp, which gives up the warp's turn (see exec_bra).
+  bool saw_ordered = false;
   // barrier.cluster: the lanes that have arrived in the cluster's current
   // phase, and the phase a later wait is waiting to see end.
   Mask cluster_arrived = 0;
@@ -1980,10 +1984,10 @@ class Interpreter {
   // are in use (%reserved_smem_offset_end). Both offsets are its start.
   // Cooperative groups syncs and reduces a tile wider than a warp there.
   static constexpr uint64_t kReservedSmemBytes = 1024, kReservedSmemUsed = 288;
-  uint64_t reserved_smem_begin() const {
-    const uint64_t user = std::max<uint64_t>(fn_.static_shared_size, fn_.dynamic_shared_offset) + cfg_.shared_bytes;
-    return (user + 127) / 128 * 128;
+  uint64_t user_smem_bytes() const {
+    return std::max<uint64_t>(fn_.static_shared_size, fn_.dynamic_shared_offset) + cfg_.shared_bytes;
   }
+  uint64_t reserved_smem_begin() const { return (user_smem_bytes() + 127) / 128 * 128; }
 
   // Widens a 32-bit register into the 64-bit operand form. A small rotating
   // set of buffers keeps several operands of one instruction alive at once.
@@ -2281,14 +2285,20 @@ class Interpreter {
     if (rank == cluster_rank_of(ctx)) return {&ctx, rel & kClusterOffsetMask};
     return {&cluster_block(ctx, ins, lane, rank), rel & kClusterOffsetMask};
   }
+  // Whether [off, off + size) is the block's own shared memory or its reserved
+  // 1 KiB -- but not the padding between them, so an overrun of the kernel's
+  // own arrays is still caught rather than landing in bytes nobody declared.
+  bool shared_in_bounds(uint64_t off, uint64_t size, size_t have) const {
+    return off + size <= user_smem_bytes() || (off >= reserved_smem_begin() && off + size <= have);
+  }
   // The same, bounds-checked for `size` bytes.
   SharedRef shared_at(const BlockCtx& ctx, const Instr& ins, int lane, uint64_t addr, uint64_t size) {
     const SharedRef r = shared_ref(ctx, ins, lane, addr);
     const size_t have = r.owner->shared ? r.owner->shared->size() : 0;
-    if (r.off + size > have)
+    if (!shared_in_bounds(r.off, size, have))
       ctx_fail(ins, lane, Err::OutOfBounds,
                "shared memory access at offset " + std::to_string(r.off) + " (+" +
-                   std::to_string(size) + " bytes) exceeds the " + std::to_string(have) +
+                   std::to_string(size) + " bytes) exceeds the " + std::to_string(user_smem_bytes()) +
                    "-byte shared allocation for " +
                    (r.owner == &ctx ? std::string("this block")
                                     : "block rank " + std::to_string(cluster_rank_of(*r.owner)) +
@@ -2383,10 +2393,10 @@ class Interpreter {
                    std::to_string(cluster_rank_of(*r.owner)) + ")");
     uint64_t off = r.off;
     size_t have = ctx.shared ? ctx.shared->size() : 0;
-    if (off + size > have)
+    if (!shared_in_bounds(off, size, have))
       ctx_fail(ins, lane, Err::OutOfBounds,
                "shared memory access at offset " + std::to_string(off) + " (+" +
-                   std::to_string(size) + " bytes) exceeds the " + std::to_string(have) +
+                   std::to_string(size) + " bytes) exceeds the " + std::to_string(user_smem_bytes()) +
                    "-byte shared allocation for this block");
   }
 
@@ -2751,6 +2761,16 @@ class Interpreter {
     if (taken == 0) {
       ++w.paths[idx].pc;
       return;
+    }
+    // A loop back over an ordered load or an atomic is a spin waiting for
+    // another warp -- cooperative groups' barrier for a tile wider than a
+    // warp polls its arrival bits this way -- so it gives up the warp's turn.
+    // Under the deterministic scheduler a turn otherwise lasts until a
+    // barrier, and the warps it waits for would never run. Ordinary loops do
+    // no ordered loads, so they keep their turn and their order.
+    if (w.saw_ordered && op.target <= w.paths[idx].pc) {
+      w.saw_ordered = false;
+      w.yield_now = true;
     }
     if (fallthrough == 0) {
       w.paths[idx].pc = op.target;
@@ -8507,6 +8527,7 @@ class Interpreter {
   }
 
   void exec_ld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLd& op, Mask m) {
+    if (op.ordered) w.saw_ordered = true;
     uint32_t size = op.ty.bytes();
     size_t n = op.dsts.size();
     if (op.space == Space::Param && op.addr.base_kind == Addr::Base::Reg) {
@@ -9718,6 +9739,7 @@ class Interpreter {
   }
 
   void exec_atom(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    w.saw_ordered = true;
     // The access width is not the element width for the half forms: an
     // f16x2 atomic reads and writes a whole 32-bit word, and a scalar f16 one
     // touches 2 bytes. Taking the width from the element type alone is what

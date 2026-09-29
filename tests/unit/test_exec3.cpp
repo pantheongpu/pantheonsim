@@ -6140,4 +6140,42 @@ STORE:
   unsetenv("VGPU_THREADS");
 }
 
+// One warp spinning on a flag another warp of its block sets. Under the
+// deterministic scheduler a warp's turn lasted until a barrier, and a spin never
+// reaches one, so the waiter (warp 0, which runs first) held the block forever:
+// cooperative groups' barrier for a tile wider than a warp is such a spin. A
+// loop back over an ordered load now gives up the turn.
+VTEST(a_warp_spinning_on_a_flag_lets_the_warp_that_sets_it_run) {
+  const std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .shared .align 4 .b32 flag;
+    .reg .pred %p<3>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<2>;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    setp.lt.u32 %p1, %r1, 32;
+    @%p1 bra $L_wait;
+    mov.u32 %r2, 7;
+    st.volatile.shared.u32 [flag], %r2;
+    ret;
+$L_wait:
+    ld.volatile.shared.u32 %r3, [flag];
+    setp.eq.u32 %p2, %r3, 0;
+    @%p2 bra $L_wait;
+    st.global.u32 [%rd1], %r3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(4);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  cfg.max_steps = 1 << 16;   // fails fast, rather than spinning for a billion steps
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{7});
+}
+
 VTEST_MAIN
