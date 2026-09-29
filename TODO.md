@@ -321,10 +321,16 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   file, `.local` frame and path stack, so divergence inside a callee and
   recursion both work. Parameters and the return value travel as call slots
   rather than a parameter buffer, because each lane passes its own arguments.
-  The callee runs to completion inside the caller's instruction, which is what
-  makes recursion fall out of the host stack -- and means a warp does not yield
-  mid-call, so a barrier inside a device function is refused by name rather
-  than silently skipping the rest of the body. Structs and arrays pass and
+  A call pushes a frame onto the warp -- the caller's paths, registers and
+  slots -- and the callee's last `ret` pops it, so a warp can stop in the
+  middle of a device function and let the others run: `__syncthreads()`,
+  `__syncthreads_count()` and named barriers inside functions nvcc did not
+  inline work, which every `-G` build needs (e2e_device_function_barriers,
+  built at -O3 with `__noinline__` and with -G; an RTX 3060 passes both).
+  This used to run the callee to completion inside the call instruction and
+  refuse a barrier there. A barrier inside a call that only some of the warp's
+  lanes made is still refused: the others wait in the caller, so it could
+  never complete. Structs and arrays pass and
   return by value: a call slot is a per-lane byte buffer, so `st.param
   [param0+8]` lands where it should. Indirect calls work too: device functions
   have addresses in a window of their own, an array global can be initialised
