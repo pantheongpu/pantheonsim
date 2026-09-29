@@ -1779,9 +1779,10 @@ class Parser {
         expect_punct(";");
         return ins;
       }
-      if (relu || scaled)
-        return unsupported(std::string("cvt .") + (relu ? "relu" : "scaled::n2::ue8m0") +
-                           " outside the narrow floating-point conversions is not implemented");
+      // .relu on the f16/bf16 forms is checked below with the forms themselves.
+      if (scaled)
+        return unsupported("cvt .scaled::n2::ue8m0 outside the narrow floating-point conversions "
+                           "is not implemented");
       if (!packed.empty()) {
         // cvt.rn.f16x2.f32 d, a, b -- two f32 converted and packed, a high, b low.
         if (tys.size() != 1 || tys[0].bits != 32 || !tys[0].is_float())
