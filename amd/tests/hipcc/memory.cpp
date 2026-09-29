@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
 #include <string>
 #include <vector>
 
@@ -282,6 +283,58 @@ int main() {
   (void)hipMemUnmap(va, 4096);
   (void)hipMemRelease(page);
   EXPECT(hipMemAddressFree(va, 4096), hipSuccess, "and the address space freed");
+
+  // ---- Virtual memory shared through a file descriptor, and device memory as one
+  vprop.requestedHandleTypes = hipMemHandleTypePosixFileDescriptor;
+  hipMemGenericAllocationHandle_t shared_mem{}, imported_mem{};
+  EXPECT(hipMemCreate(&shared_mem, recommended, &vprop, 0), hipSuccess, "memory made to be exported");
+  int shared_fd = -1;
+  EXPECT(hipMemExportToShareableHandle(&shared_fd, shared_mem, hipMemHandleTypeWin32, 0), hipErrorInvalidValue,
+         "exported as a file descriptor, not a Windows handle");
+  EXPECT(hipMemExportToShareableHandle(&shared_fd, shared_mem, hipMemHandleTypePosixFileDescriptor, 0), hipSuccess,
+         "exports as a file descriptor");
+  EXPECT(hipMemImportFromShareableHandle(&imported_mem, reinterpret_cast<void*>(static_cast<uintptr_t>(shared_fd)),
+                                         hipMemHandleTypePosixFileDescriptor),
+         hipSuccess, "which imports as memory of its own");
+  void *va1 = nullptr, *va2 = nullptr;
+  (void)hipMemAddressReserve(&va1, recommended, 0, nullptr, 0);
+  (void)hipMemAddressReserve(&va2, recommended, 0, nullptr, 0);
+  EXPECT(hipMemMap(va1, recommended, 0, shared_mem, 0), hipSuccess, "the exported memory maps");
+  EXPECT(hipMemMap(va2, recommended, 0, imported_mem, 0), hipSuccess, "and so does the imported");
+  (void)hipMemSetAccess(va1, recommended, &rw, 1);
+  (void)hipMemSetAccess(va2, recommended, &rw, 1);
+  unsigned long long got_access = 0;
+  (void)hipMemGetAccess(&got_access, &rw.location, va2);
+  check(got_access == hipMemAccessFlagsProtReadWrite, "with the access it was given");
+  (void)hipMemcpy(va1, pattern.data(), 4096, hipMemcpyHostToDevice);
+  std::fill(readback.begin(), readback.end(), 0);
+  (void)hipMemcpy(readback.data(), va2, 4096, hipMemcpyDeviceToHost);
+  check(readback == pattern, "both are the same bytes");
+  EXPECT(hipMemUnmap(va1, recommended), hipSuccess, "unmapped");
+  (void)hipMemUnmap(va2, recommended);
+  (void)hipMemAddressFree(va1, recommended);
+  (void)hipMemAddressFree(va2, recommended);
+  EXPECT(hipMemRelease(shared_mem), hipSuccess, "and released");
+  (void)hipMemRelease(imported_mem);
+  close(shared_fd);
+  uint32_t* dmabuf_src = nullptr;
+  (void)hipMalloc(&dmabuf_src, 4096);
+  (void)hipMemcpy(dmabuf_src, pattern.data(), 4096, hipMemcpyHostToDevice);
+  int dmabuf = -1;
+  EXPECT(hipMemGetHandleForAddressRange(&dmabuf, dmabuf_src, 4096, hipMemRangeHandleTypeDmaBufFd, 0), hipSuccess,
+         "device memory as a file descriptor (a dma-buf on a card)");
+  (void)hipMemImportFromShareableHandle(&imported_mem, reinterpret_cast<void*>(static_cast<uintptr_t>(dmabuf)),
+                                        hipMemHandleTypePosixFileDescriptor);
+  (void)hipMemAddressReserve(&va1, recommended, 0, nullptr, 0);
+  (void)hipMemMap(va1, recommended, 0, imported_mem, 0);
+  std::fill(readback.begin(), readback.end(), 0);
+  (void)hipMemcpy(readback.data(), va1, 4096, hipMemcpyDeviceToHost);
+  check(readback == pattern, "which imports as memory holding its bytes");
+  (void)hipMemUnmap(va1, recommended);
+  (void)hipMemAddressFree(va1, recommended);
+  (void)hipMemRelease(imported_mem);
+  close(dmabuf);
+  (void)hipFree(dmabuf_src);
 
   // ---- Edge sizes
   void* ext = reinterpret_cast<void*>(1);

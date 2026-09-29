@@ -30,6 +30,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -1109,6 +1110,7 @@ struct Side {
   bool device = false;
   int ordinal = -1;   // the device whose memory it is, where it is a device's
 };
+bool vmm_range(uint64_t va, uint64_t* base, uint64_t* size);
 hipError_t locate(State& s, const void* p, const Region& r, Side* side) {
   const uint64_t va = reinterpret_cast<uint64_t>(p);
   for (int i = 0; i < s.rt->device_count(); ++i) {
@@ -1117,6 +1119,13 @@ hipError_t locate(State& s, const void* p, const Region& r, Side* side) {
     side->mem = &m;
     side->ordinal = i;
     uint64_t base = 0, size = 0, reach = 0;
+    // Virtual memory, mapped: device memory, however it is kept.
+    if (uint64_t vbase = 0, vsize = 0; vmm_range(va, &vbase, &vsize)) {
+      side->device = true;
+      if (!r.reach(&reach) || reach > vsize - (va - vbase))
+        return fail(hipErrorInvalidValue, "the region runs past the end of the mapping it starts in");
+      return hipSuccess;
+    }
     if (m.is_host_mapped(va)) {   // pinned, registered or managed host memory: inside what was allocated
       std::lock_guard<std::mutex> host_lock(g_host_mutex);
       for (const auto* hm : {&g_host_allocations, &g_host_registered, &g_managed})
@@ -3891,20 +3900,52 @@ int owner_of(State& s, uint64_t va) {
   return -1;
 }
 
-// Physical memory a program made with hipMemCreate: which device's, and the
-// manager's own handle for it. Its address is the handle HIP hands out.
+// Physical memory a program made with hipMemCreate (or imported): host
+// memory the simulator keeps -- a file, where it may be shared with another
+// process -- which a mapping puts in place at an address a reservation set
+// aside, on any device. Its address is the handle HIP hands out.
 struct VmmAllocation {
-  int device;
-  uint64_t handle;
+  int device;            // where it was made: a device, or -1 for the host
+  uint64_t handle;       // the device's count of what it holds (MemoryManager::create_handle), or 0
   size_t size;
-  int type;   // hipMemAllocationTypePinned or Uncached, as made
-  int refs;   // hipMemCreate's, and one for each hipMemRetainAllocationHandle
+  int type;              // hipMemAllocationTypePinned or Uncached, as made
+  int refs;              // hipMemCreate's, and one for each hipMemRetainAllocationHandle
+  int fd = -1;           // its file, where it is one
+  uint8_t* host = nullptr;
+  uint64_t bytes = 0;    // how much is mapped here: size, in whole granules
+  int maps = 0;          // its mappings still there
+  int handle_types = 0;  // hipMemAllocationHandleType it was made to be exported as
 };
 std::deque<VmmAllocation> g_vmm;   // under State's mutex; entries are never moved
 std::set<VmmAllocation*> g_vmm_live;
-// Where each allocation is mapped: start -> (size, allocation), for
-// hipMemRetainAllocationHandle, which finds the allocation from an address.
+// Where each allocation is mapped: start -> (size, allocation), and the
+// offset into it each mapping starts at.
 std::map<uint64_t, std::pair<size_t, VmmAllocation*>> g_vmm_maps;
+std::map<uint64_t, uint64_t> g_vmm_offsets;
+// The mapping an address is in, if any.
+std::map<uint64_t, std::pair<size_t, VmmAllocation*>>::iterator vmm_mapping(uint64_t va) {
+  auto it = g_vmm_maps.upper_bound(va);
+  if (it == g_vmm_maps.begin()) return g_vmm_maps.end();
+  --it;
+  return va < it->first + it->second.first ? it : g_vmm_maps.end();
+}
+// The mapped run an address is in: its mapping, and those placed end to end
+// after it.
+bool vmm_range(uint64_t va, uint64_t* base, uint64_t* size) {
+  auto it = vmm_mapping(va);
+  if (it == g_vmm_maps.end()) return false;
+  *base = it->first;
+  uint64_t end = it->first + it->second.first;
+  for (++it; it != g_vmm_maps.end() && it->first == end; ++it) end += it->second.first;
+  *size = end - *base;
+  return true;
+}
+// Host-located memory the CPU was given access to: mapped at its device
+// address in this process too, by address, with its length.
+std::map<uint64_t, uint64_t> g_vmm_cpu_maps;
+// Device allocations handed out as files (hipMemGetHandleForAddressRange):
+// each one's file, by where it starts.
+std::map<uint64_t, std::pair<std::string, uint64_t>> g_dmabuf_paths;   // start -> (file, size)
 
 // An IPC memory handle's payload: which process shared which of its
 // allocations, and the file the bytes now live in.
@@ -4641,8 +4682,9 @@ constexpr size_t kVmmRecommended = static_cast<size_t>(vgpu::MemoryManager::kVmm
 uint64_t vmm_chunks(size_t size) {
   return (size + kVmmRecommended - 1) / kVmmRecommended * kVmmRecommended;
 }
+// Pinned or uncached memory, on a device or the host.
 bool vmm_prop_ok(const vgpu::amd::abi::MemAllocationProp* prop) {
-  return prop && (prop->type == 1 || prop->type == 0x40000000) && prop->location.type == 1;
+  return prop && (prop->type == 1 || prop->type == 0x40000000) && (prop->location.type == 1 || prop->location.type == 2);
 }
 
 hipError_t hipMemGetAllocationGranularity(size_t* granularity, const vgpu::amd::abi::MemAllocationProp* prop,
@@ -4652,7 +4694,8 @@ hipError_t hipMemGetAllocationGranularity(size_t* granularity, const vgpu::amd::
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!granularity || !vmm_prop_ok(prop) || (option != 0 && option != 1)) return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
-  if (prop->location.id < 0 || prop->location.id >= s.rt->device_count()) return record(s, hipErrorInvalidValue);
+  if (prop->location.type == 1 && (prop->location.id < 0 || prop->location.id >= s.rt->device_count()))
+    return record(s, hipErrorInvalidValue);
   *granularity = option == 0 ? kVmmPage : kVmmRecommended;
   return record(s, hipSuccess);
 }
@@ -4678,6 +4721,10 @@ hipError_t hipMemAddressFree(void* ptr, size_t size) {
   if (!ptr || !size || size % kVmmPage || !s.rt) return record(s, hipErrorInvalidValue);
   const int d = owner_of(s, reinterpret_cast<uint64_t>(ptr));
   if (d < 0) return record(s, hipErrorInvalidValue);
+  // Address space still mapped is not free to go.
+  const uint64_t lo = reinterpret_cast<uint64_t>(ptr);
+  if (const auto m = g_vmm_maps.lower_bound(lo); m != g_vmm_maps.end() && m->first < lo + size)
+    return record(s, fail(hipErrorInvalidValue, "freeing address space that is still mapped (hipMemUnmap first)"));
   try {
     s.rt->device(d).memory().address_free(reinterpret_cast<uint64_t>(ptr), vmm_chunks(size));
   } catch (const std::exception& e) {
@@ -4685,20 +4732,119 @@ hipError_t hipMemAddressFree(void* ptr, size_t size) {
   }
   return record(s, hipSuccess);
 }
+}  // extern "C"
+namespace {
+// Host memory for a VMM allocation of `bytes`: a file (memfd), where it may
+// be shared, or plain shared anonymous memory.
+hipError_t vmm_memory(uint64_t bytes, bool as_file, VmmAllocation* v) {
+  int fd = -1;
+  void* host = MAP_FAILED;
+  if (as_file) {
+    fd = ::memfd_create("hip-vmm", MFD_CLOEXEC);
+    if (fd >= 0 && ::ftruncate(fd, static_cast<off_t>(bytes)) == 0)
+      host = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  } else {
+    host = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  }
+  if (host == MAP_FAILED) {
+    if (fd >= 0) ::close(fd);
+    return fail(hipErrorOutOfMemory, std::string("virtual memory's backing: ") + std::strerror(errno));
+  }
+  v->fd = fd;
+  v->host = static_cast<uint8_t*>(host);
+  v->bytes = bytes;
+  return hipSuccess;
+}
+// An allocation goes once nothing holds it: no reference and no mapping.
+void drop_vmm(State& s, VmmAllocation* v) {
+  if (v->refs > 0 || v->maps > 0 || !v->host) return;
+  ::munmap(v->host, v->bytes);
+  if (v->fd >= 0) ::close(v->fd);
+  if (v->handle && v->device >= 0) {
+    try {
+      s.rt->device(v->device).memory().release_handle(v->handle);
+    } catch (const std::exception&) {
+    }
+  }
+  v->fd = -1;
+  v->host = nullptr;
+}
+// Where memory that was not made to be shared is asked for as a file: its
+// bytes move into one, mapped at the same host address, so every mapping of
+// it goes on reaching them.
+hipError_t vmm_as_file(VmmAllocation* v) {
+  if (v->fd >= 0) return hipSuccess;
+  const int fd = ::memfd_create("hip-vmm", MFD_CLOEXEC);
+  if (fd < 0 || ::ftruncate(fd, static_cast<off_t>(v->bytes)) != 0 ||
+      ::pwrite(fd, v->host, v->bytes, 0) != static_cast<ssize_t>(v->bytes) ||
+      ::mmap(v->host, v->bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) {
+    if (fd >= 0) ::close(fd);
+    return fail(hipErrorOutOfMemory, std::string("moving virtual memory into a file: ") + std::strerror(errno));
+  }
+  v->fd = fd;
+  return hipSuccess;
+}
+// Memory from a file descriptor: the file, mapped here, as an allocation of
+// the current device's. A file shorter than whole pages is lengthened to
+// them, so a mapping never runs past its end.
+hipError_t vmm_from_fd(State& s, int fd, void** handle) {
+  struct stat st{};
+  if (fd < 0 || ::fstat(fd, &st) != 0 || st.st_size <= 0) return hipErrorInvalidValue;
+  const uint64_t bytes = vmm_chunks(static_cast<size_t>(st.st_size));
+  if (static_cast<uint64_t>(st.st_size) < bytes) (void)!::ftruncate(fd, static_cast<off_t>(bytes));
+  const int mine = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+  void* host = mine < 0 ? MAP_FAILED : ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, mine, 0);
+  if (host == MAP_FAILED) {
+    if (mine >= 0) ::close(mine);
+    return fail(hipErrorInvalidValue, std::string("mapping shared memory: ") + std::strerror(errno));
+  }
+  g_vmm.push_back(VmmAllocation{s.current, 0, static_cast<size_t>(st.st_size), 1, 1});
+  VmmAllocation& v = g_vmm.back();
+  v.fd = mine;
+  v.host = static_cast<uint8_t*>(host);
+  v.bytes = bytes;
+  v.handle_types = 1;
+  g_vmm_live.insert(&v);
+  *handle = &v;
+  return hipSuccess;
+}
+}  // namespace
+extern "C" {
+
+// Memory on a device, or pinned host memory (hipMemLocationTypeHost), in
+// whole pages. Memory made to be exported as a file descriptor is a file
+// from the start. A device's memory is counted against it.
 hipError_t hipMemCreate(void** handle, size_t size, const vgpu::amd::abi::MemAllocationProp* prop,
-                        unsigned long long) {
+                        unsigned long long flags) {
   const ApiCall api("hipMemCreate");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!handle || !vmm_prop_ok(prop) || !size || size % kVmmPage) return record(s, hipErrorInvalidValue);
+  constexpr int kLocationDevice = 1, kLocationHost = 2;
+  if (!handle || !prop || (prop->type != 1 && prop->type != 0x40000000) || !size || size % kVmmPage || flags)
+    return record(s, hipErrorInvalidValue);
+  if (prop->location.type != kLocationDevice && prop->location.type != kLocationHost)
+    return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
-  const int d = prop->location.id;
-  if (d < 0 || d >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
-  try {
-    g_vmm.push_back(VmmAllocation{d, s.rt->device(d).memory().create_handle(vmm_chunks(size)), size, prop->type, 1});
-  } catch (const std::exception& e) {
-    return record(s, fail(hipErrorOutOfMemory, e.what()));
+  const bool on_host = prop->location.type == kLocationHost;
+  const int d = on_host ? -1 : prop->location.id;
+  if (!on_host && (d < 0 || d >= s.rt->device_count())) return record(s, hipErrorInvalidDevice);
+  const uint64_t bytes = vmm_chunks(size);
+  uint64_t counted = 0;
+  if (!on_host) {
+    try {
+      counted = s.rt->device(d).memory().create_handle(bytes);
+    } catch (const std::exception& e) {
+      return record(s, fail(hipErrorOutOfMemory, e.what()));
+    }
   }
+  VmmAllocation v{d, counted, size, prop->type, 1};
+  v.handle_types = prop->requestedHandleType;
+  // Host memory is a file too, which the CPU may be given at its address.
+  if (const hipError_t e = vmm_memory(bytes, (prop->requestedHandleType & 1) || on_host, &v); e != hipSuccess) {
+    if (counted) s.rt->device(d).memory().release_handle(counted);
+    return record(s, e);
+  }
+  g_vmm.push_back(v);
   g_vmm_live.insert(&g_vmm.back());
   *handle = &g_vmm.back();
   return record(s, hipSuccess);
@@ -4713,47 +4859,60 @@ hipError_t hipMemRelease(void* handle) {
   if (!g_vmm_live.count(v)) return record(s, hipErrorInvalidValue);
   if (--v->refs > 0) return record(s, hipSuccess);
   g_vmm_live.erase(v);
-  try {
-    s.rt->device(v->device).memory().release_handle(v->handle);
-  } catch (const std::exception& e) {
-    return record(s, fail(hipErrorInvalidValue, e.what()));
-  }
+  drop_vmm(s, v);
   return record(s, hipSuccess);
 }
-// Memory made on one device goes into that device's address space: a
-// reservation on another is refused, since each manager maps its own.
-hipError_t hipMemMap(void* ptr, size_t size, size_t offset, void* handle, unsigned long long) {
+// Into address space some reservation set aside, on any device, where
+// nothing is mapped yet: `size` bytes of the memory from `offset`.
+hipError_t hipMemMap(void* ptr, size_t size, size_t offset, void* handle, unsigned long long flags) {
   const ApiCall api("hipMemMap");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   auto* v = static_cast<VmmAllocation*>(handle);
-  if (!ptr || !size || size % kVmmPage || offset % kVmmPage || !g_vmm_live.count(v))
+  if (!ptr || !size || size % kVmmPage || offset % kVmmPage || flags || !g_vmm_live.count(v))
     return record(s, hipErrorInvalidValue);
-  if (owner_of(s, reinterpret_cast<uint64_t>(ptr)) != v->device)
-    return record(s, fail(hipErrorInvalidValue, "memory made on one device mapped into another's reservation"));
-  try {
-    s.rt->device(v->device).memory().map(reinterpret_cast<uint64_t>(ptr), vmm_chunks(size), offset, v->handle);
-  } catch (const std::exception& e) {
-    return record(s, fail(hipErrorInvalidValue, e.what()));
-  }
-  g_vmm_maps[reinterpret_cast<uint64_t>(ptr)] = {size, v};
+  if (offset > v->bytes || size > v->bytes - offset) return record(s, hipErrorInvalidValue);
+  const uint64_t lo = reinterpret_cast<uint64_t>(ptr), hi = lo + size;
+  const int owner = owner_of(s, lo);
+  if (owner < 0 || owner_of(s, hi - 1) != owner) return record(s, hipErrorInvalidValue);
+  if (const auto next = g_vmm_maps.lower_bound(lo); next != g_vmm_maps.end() && next->first < hi)
+    return record(s, fail(hipErrorInvalidValue, "that address space is already mapped"));
+  if (vmm_mapping(lo) != g_vmm_maps.end()) return record(s, fail(hipErrorInvalidValue, "that address space is already mapped"));
+  s.rt->device(owner).memory().map_host(lo, v->host + offset, size);
+  ++v->maps;
+  g_vmm_maps[lo] = {size, v};
+  g_vmm_offsets[lo] = offset;
   return record(s, hipSuccess);
 }
+// Every mapping inside the range goes; the range has to hold one.
 hipError_t hipMemUnmap(void* ptr, size_t size) {
   const ApiCall api("hipMemUnmap");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!ptr || !size || size % kVmmPage || !s.rt) return record(s, hipErrorInvalidValue);
-  const int d = owner_of(s, reinterpret_cast<uint64_t>(ptr));
-  if (d < 0) return record(s, hipErrorInvalidValue);
-  try {
-    s.rt->device(d).memory().unmap(reinterpret_cast<uint64_t>(ptr), vmm_chunks(size));
-  } catch (const std::exception& e) {
-    return record(s, fail(hipErrorInvalidValue, e.what()));
-  }
-  // Every mapping inside the range goes with it.
   const uint64_t lo = reinterpret_cast<uint64_t>(ptr), hi = lo + size;
-  for (auto it = g_vmm_maps.lower_bound(lo); it != g_vmm_maps.end() && it->first < hi;) it = g_vmm_maps.erase(it);
+  const auto first = g_vmm_maps.find(lo);
+  if (first == g_vmm_maps.end() || first->second.first > size) return record(s, hipErrorInvalidValue);
+  const int d = owner_of(s, lo);
+  for (auto it = g_vmm_maps.lower_bound(lo); it != g_vmm_maps.end() && it->first < hi;) {
+    if (it->first + it->second.first > hi) return record(s, hipErrorInvalidValue);
+    ++it;
+  }
+  for (auto it = g_vmm_maps.lower_bound(lo); it != g_vmm_maps.end() && it->first < hi;) {
+    VmmAllocation* v = it->second.second;
+    s.rt->device(d).memory().unmap_host(it->first);
+    if (const auto cpu = g_vmm_cpu_maps.find(it->first); cpu != g_vmm_cpu_maps.end()) {
+      ::munmap(reinterpret_cast<void*>(cpu->first), cpu->second);
+      g_vmm_cpu_maps.erase(cpu);
+    }
+    --v->maps;
+    if (!g_vmm_live.count(v)) drop_vmm(s, v);
+    for (auto a = s.vmm_access.begin(); a != s.vmm_access.end();)
+      a = a->first.first >= it->first && a->first.first < it->first + it->second.first ? s.vmm_access.erase(a)
+                                                                                        : std::next(a);
+    g_vmm_offsets.erase(it->first);
+    it = g_vmm_maps.erase(it);
+  }
   return record(s, hipSuccess);
 }
 // The allocation mapped at an address, with a reference of its own that
@@ -4763,17 +4922,13 @@ hipError_t hipMemRetainAllocationHandle(void** handle, void* addr) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!handle || !addr) return record(s, hipErrorInvalidValue);
-  const uint64_t a = reinterpret_cast<uint64_t>(addr);
-  auto it = g_vmm_maps.upper_bound(a);
-  if (it == g_vmm_maps.begin()) return record(s, hipErrorInvalidValue);
-  --it;
-  if (a >= it->first + it->second.first || !g_vmm_live.count(it->second.second))
-    return record(s, hipErrorInvalidValue);
+  const auto it = vmm_mapping(reinterpret_cast<uint64_t>(addr));
+  if (it == g_vmm_maps.end() || !g_vmm_live.count(it->second.second)) return record(s, hipErrorInvalidValue);
   ++it->second.second->refs;
   *handle = it->second.second;
   return record(s, hipSuccess);
 }
-// What an allocation was made as: pinned device memory, on its device.
+// What an allocation was made as.
 hipError_t hipMemGetAllocationPropertiesFromHandle(vgpu::amd::abi::MemAllocationProp* prop, void* handle) {
   const ApiCall api("hipMemGetAllocationPropertiesFromHandle");
   State& s = state();
@@ -4782,40 +4937,85 @@ hipError_t hipMemGetAllocationPropertiesFromHandle(vgpu::amd::abi::MemAllocation
   if (!prop || !g_vmm_live.count(v)) return record(s, hipErrorInvalidValue);
   std::memset(prop, 0, sizeof *prop);
   prop->type = v->type;
-  prop->location.type = 1;     // hipMemLocationTypeDevice
-  prop->location.id = v->device;
+  prop->location.type = v->device < 0 ? 2 : 1;   // hipMemLocationTypeHost or Device
+  prop->location.id = v->device < 0 ? 0 : v->device;
+  prop->requestedHandleType = v->handle_types;
   return record(s, hipSuccess);
 }
-// Access for the device that holds the mapping is what its kernels are
-// checked against. Every device reaches every other's memory here, so a
-// grant to another device changes nothing.
+// Access for devices to mapped memory: all of the range mapped, each grant
+// for a device. Every device reaches the memory here; one granted access to
+// another's also has its kernels reach that device's address space.
 hipError_t hipMemSetAccess(void* ptr, size_t size, const vgpu::amd::abi::MemAccessDesc* desc, size_t count) {
   const ApiCall api("hipMemSetAccess");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!ptr || !size || size % kVmmPage || !desc || !count || !s.rt) return record(s, hipErrorInvalidValue);
-  const int d = owner_of(s, reinterpret_cast<uint64_t>(ptr));
-  if (d < 0) return record(s, hipErrorInvalidValue);
-  try {
-    for (size_t i = 0; i < count; ++i) {
-      if (desc[i].location.id < 0 || desc[i].location.id >= s.rt->device_count())
-        return record(s, hipErrorInvalidDevice);
-      if (desc[i].location.id == d)
-        s.rt->device(d).memory().set_access(reinterpret_cast<uint64_t>(ptr), vmm_chunks(size), desc[i].flags & 1,
-                                            (desc[i].flags & 2) != 0);
-      else
-        s.vmm_access[{reinterpret_cast<uint64_t>(ptr), size}][desc[i].location.id] = desc[i].flags;
+  const uint64_t lo = reinterpret_cast<uint64_t>(ptr), hi = lo + size;
+  // Mapped all the way, one mapping after another.
+  for (uint64_t at = lo; at < hi;) {
+    const auto it = g_vmm_maps.find(at);
+    if (it == g_vmm_maps.end() || it->first + it->second.first > hi) return record(s, hipErrorInvalidValue);
+    at += it->second.first;
+  }
+  // The host may be given host memory only.
+  bool all_host = true;
+  for (auto it = g_vmm_maps.find(lo); it != g_vmm_maps.end() && it->first < hi; ++it)
+    all_host = all_host && it->second.second->device < 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (desc[i].location.type == 2) {
+      if (!all_host) return record(s, hipErrorInvalidValue);
+    } else if (desc[i].location.type != 1 || desc[i].location.id < 0 ||
+               desc[i].location.id >= s.rt->device_count()) {
+      return record(s, hipErrorInvalidValue);
     }
-  } catch (const std::exception& e) {
-    return record(s, fail(hipErrorInvalidValue, e.what()));
+    if (desc[i].flags != 0 && desc[i].flags != 1 && desc[i].flags != 3) return record(s, hipErrorInvalidValue);
+  }
+  const int owner = owner_of(s, lo);
+  for (size_t i = 0; i < count; ++i) {
+    if (desc[i].location.type == 2) {
+      // The CPU reaches it at its device address: the file mapped there.
+      for (auto it = g_vmm_maps.find(lo); it != g_vmm_maps.end() && it->first < hi; ++it) {
+        if (g_vmm_cpu_maps.count(it->first) || !desc[i].flags) continue;
+        void* at = ::mmap(reinterpret_cast<void*>(it->first), it->second.first, PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_FIXED_NOREPLACE, it->second.second->fd,
+                          static_cast<off_t>(g_vmm_offsets[it->first]));
+        if (at == MAP_FAILED || at != reinterpret_cast<void*>(it->first)) {
+          if (at != MAP_FAILED) ::munmap(at, it->second.first);
+          return record(s, fail(hipErrorOutOfMemory, "the host's own memory is at that address"));
+        }
+        g_vmm_cpu_maps[it->first] = it->second.first;
+      }
+      continue;
+    }
+    s.vmm_access[{lo, size}][desc[i].location.id] = desc[i].flags;
+    if (desc[i].flags && desc[i].location.id != owner) s.peers.insert({desc[i].location.id, owner});
   }
   return record(s, hipSuccess);
 }
-hipError_t hipMemExportToShareableHandle(void*, void*, int, unsigned long long) {
-  return refused("hipMemExportToShareableHandle", "memory made with hipMemCreate is not shared between processes");
+
+// Memory made to be shared (hipMemHandleTypePosixFileDescriptor) is handed
+// out as a file descriptor of its file, which another process -- or this
+// one -- imports as memory of its own that maps the same bytes.
+hipError_t hipMemExportToShareableHandle(void* out, void* handle, int type, unsigned long long flags) {
+  const ApiCall api("hipMemExportToShareableHandle");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  auto* v = static_cast<VmmAllocation*>(handle);
+  if (!out || !g_vmm_live.count(v) || type != 1 || flags) return record(s, hipErrorInvalidValue);
+  if (v->fd < 0 || !(v->handle_types & 1))
+    return record(s, fail(hipErrorInvalidValue, "the memory was not made to be exported as a file descriptor"));
+  const int fd = ::fcntl(v->fd, F_DUPFD_CLOEXEC, 0);
+  if (fd < 0) return record(s, fail(hipErrorOutOfMemory, std::string("dup: ") + std::strerror(errno)));
+  *static_cast<int*>(out) = fd;
+  return record(s, hipSuccess);
 }
-hipError_t hipMemImportFromShareableHandle(void**, void*, int) {
-  return refused("hipMemImportFromShareableHandle", "memory made with hipMemCreate is not shared between processes");
+hipError_t hipMemImportFromShareableHandle(void** handle, void* os_handle, int type) {
+  const ApiCall api("hipMemImportFromShareableHandle");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!handle || !os_handle || type != 1) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  return record(s, vmm_from_fd(s, static_cast<int>(reinterpret_cast<uintptr_t>(os_handle)), handle));
 }
 
 // ---- Memory another process maps (IPC) ---------------------------------------------
@@ -6255,8 +6455,7 @@ hipError_t hipMemPoolGetAccess(int* flags, void* pool, vgpu::amd::abi::MemLocati
   return record(s, hipSuccess);
 }
 
-// Virtual memory's access, by device: the owning device's as the memory
-// manager keeps it, another's as it was granted.
+// Virtual memory's access, by device, as it was granted: none until then.
 hipError_t hipMemGetAccess(unsigned long long* flags, const vgpu::amd::abi::MemLocation* location, void* ptr) {
   const ApiCall api("hipMemGetAccess");
   State& s = state();
@@ -6264,14 +6463,7 @@ hipError_t hipMemGetAccess(unsigned long long* flags, const vgpu::amd::abi::MemL
   if (!flags || !location || !ptr || location->type != 1 || !valid_device(s, location->id))
     return record(s, hipErrorInvalidValue);
   const uint64_t va = reinterpret_cast<uint64_t>(ptr);
-  const int owner = owner_of(s, va);
-  bool readable = false, writable = false;
-  if (owner < 0 || !s.rt->device(owner).memory().access_at(va, &readable, &writable))
-    return record(s, hipErrorInvalidValue);
-  if (location->id == owner) {
-    *flags = writable ? 3 : readable ? 1 : 0;
-    return record(s, hipSuccess);
-  }
+  if (vmm_mapping(va) == g_vmm_maps.end()) return record(s, hipErrorInvalidValue);
   *flags = 0;
   for (const auto& [range, grants] : s.vmm_access)
     if (va >= range.first && va < range.first + range.second)
@@ -6433,13 +6625,15 @@ hipError_t hipGraphicsUnregisterResource(void*) {
   return record(state(), hipErrorInvalidValue);
 }
 
-// ---- A dma-buf for a range of device memory ---------------------------------------------
+// ---- A file descriptor for a range of device memory ------------------------------------------
 //
-// Device memory here is host memory the simulator keeps, not memory a
-// dma-buf could describe. The range is checked as ROCm's HIP checks it --
-// device memory, mapped, of the size asked for -- and then refused.
+// What ROCm hands out as a dma-buf: here, the file the memory's bytes are
+// in. An allocation of the device's moves into a file of its own for it (as
+// an IPC handle's does, keeping its address); shared virtual memory is one
+// already. Either imports as memory of its own (hipMemImportFromShareableHandle).
 hipError_t hipMemGetHandleForAddressRange(void* handle, void* ptr, size_t size, int type, unsigned long long flags) {
   const ApiCall api("hipMemGetHandleForAddressRange");
+  settle_before_sharing(ptr);   // a device allocation may move into a file
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   constexpr int kDmaBufFd = 1;
@@ -6447,12 +6641,45 @@ hipError_t hipMemGetHandleForAddressRange(void* handle, void* ptr, size_t size, 
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   const uint64_t va = reinterpret_cast<uint64_t>(ptr);
   const int d = owner_of(s, va);
-  uint64_t base = 0, bytes = 0;
-  bool readable = false, writable = false;
-  if (d < 0 || (!s.rt->device(d).memory().find_allocation(va, &base, &bytes) &&
-                !s.rt->device(d).memory().access_at(va, &readable, &writable)))
-    return record(s, hipErrorInvalidValue);
-  return record(s, fail(hipErrorNotSupported, "simulated device memory cannot be exported as a dma-buf"));
+  if (d < 0) return record(s, hipErrorInvalidValue);
+  int fd = -1;
+  if (const auto m = vmm_mapping(va); m != g_vmm_maps.end()) {
+    VmmAllocation* v = m->second.second;
+    if (size > m->second.first - (va - m->first)) return record(s, hipErrorInvalidValue);
+    if (const hipError_t e = vmm_as_file(v); e != hipSuccess) return record(s, e);
+    fd = ::fcntl(v->fd, F_DUPFD_CLOEXEC, 0);
+  } else {
+    uint64_t base = 0, bytes = 0;
+    vgpu::MemoryManager& mem = s.rt->device(d).memory();
+    // Moved into a file once; each later handle opens that file again.
+    auto path = g_dmabuf_paths.upper_bound(va);
+    if (path != g_dmabuf_paths.begin() && va < std::prev(path)->first + std::prev(path)->second.second &&
+        mem.is_shared(std::prev(path)->first)) {
+      --path;
+      base = path->first;
+      bytes = path->second.second;
+    } else {
+      path = g_dmabuf_paths.end();
+      if (!mem.find_allocation(va, &base, &bytes)) return record(s, hipErrorInvalidValue);
+    }
+    if (size > bytes - (va - base)) return record(s, hipErrorInvalidValue);
+    if (path == g_dmabuf_paths.end()) {
+      static std::atomic<uint32_t> counter{0};
+      char id[40];
+      std::snprintf(id, sizeof id, "%x-d%x", static_cast<unsigned>(::getpid()), counter.fetch_add(1) + 1);
+      if (mem.is_shared(base)) return record(s, fail(hipErrorInvalidValue, "that memory is already shared another way"));
+      try {
+        mem.share(base, ipc_path(id));
+      } catch (const std::exception& e) {
+        return record(s, fail(hipErrorInvalidValue, e.what()));
+      }
+      path = g_dmabuf_paths.insert_or_assign(base, std::make_pair(ipc_path(id), bytes)).first;
+    }
+    fd = ::open(path->second.first.c_str(), O_RDWR | O_CLOEXEC);
+  }
+  if (fd < 0) return record(s, fail(hipErrorInvalidValue, std::string("opening the memory's file: ") + std::strerror(errno)));
+  *static_cast<int*>(handle) = fd;
+  return record(s, hipSuccess);
 }
 
 // ---- What ROCm's own tools reach into -------------------------------------------------------
