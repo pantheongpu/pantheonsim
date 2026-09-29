@@ -61,6 +61,7 @@ struct Warp {
   Wait wait_kind[32] = {};
   uint32_t wait_arg[32] = {};         // the barrier a lane waits on
   Mask b[16] = {};                    // convergence barriers
+  uint32_t rpc[32] = {};              // the return-address register (RPCMOV)
   std::vector<uint8_t> local;         // per-lane local memory, local_size bytes each
   uint32_t local_size = 0;
   uint64_t steps = 0;
@@ -215,23 +216,35 @@ void Runner::build_bank0(const std::vector<std::vector<uint8_t>>& args) {
   if (tmpl && !tmpl->bytes.empty()) std::memcpy(bank0_.data(), tmpl->bytes.data(), tmpl->bytes.size());
   const auto put32 = [&](size_t off, uint32_t v) { std::memcpy(&bank0_[off], &v, 4); };
   const auto put64 = [&](size_t off, uint64_t v) { std::memcpy(&bank0_[off], &v, 8); };
-  put32(0x00, cfg_.block[0]);
-  put32(0x04, cfg_.block[1]);
-  put32(0x08, cfg_.block[2]);
-  put32(0x0c, cfg_.grid[0]);
-  put32(0x10, cfg_.grid[1]);
-  put32(0x14, cfg_.grid[2]);
-  put64(0x18, kSharedWindow);
-  put64(0x20, kLocalWindow);
+  // The driver's fields, where each generation keeps them (read from what
+  // ptxas emits for blockDim, gridDim, the windows, the stack, the memory
+  // descriptor and %envreg1/2):
+  //                      ntid   nctaid  shared  local   stack  window-lo  desc   envreg1/2
+  //   sm_75-sm_89        0x0    0xc     0x18    0x20    0x28   -          0x118  0x8c/0x90
+  //   sm_90              0x0    0xc     SWINHI  0x20    0x28   0xd0       0x208  0x44/0x48
+  //   sm_100, sm_120     0x360  0x370   SWINHI  0x2f8   0x37c  0x120      0x358  0x254/0x258
+  // (SWINHI: the shared window's high word comes from a special register.)
+  const int sm = m_.sm;
+  const size_t ntid = sm >= 100 ? 0x360 : 0x0, nctaid = sm >= 100 ? 0x370 : 0xc;
+  const size_t local = sm >= 100 ? 0x2f8 : 0x20, stackf = sm >= 100 ? 0x37c : 0x28;
+  if (bank0_.size() < 0x400) bank0_.resize(std::max<size_t>(bank0_.size(), sm >= 100 ? 0x380 : 0x220), 0);
+  for (int i = 0; i < 3; ++i) {
+    put32(ntid + 4 * i, cfg_.block[i]);
+    put32(nctaid + 4 * i, cfg_.grid[i]);
+  }
+  if (sm < 90) put64(0x18, kSharedWindow);
+  if (sm >= 90) put64(sm >= 100 ? 0x120 : 0xd0, std::min(kSharedWindow, kLocalWindow));   // where the non-global windows start
+  put64(local, kLocalWindow);
   const uint32_t stack = std::max<uint32_t>({k_.min_stack, k_.frame_size, 16});
-  put32(0x28, (stack + 15) & ~15u);
-  put64(0x118, 0);   // the descriptor's bits are a cache policy: nothing here reads them
-  // PTX's %envreg1/%envreg2 (0x8c, 0x90): a cooperative launch's grid
-  // barrier workspace, high word first. cg::this_grid().sync() traps when it
-  // is zero, which is what an ordinary launch of a grid-sync kernel gets.
+  put32(stackf, (stack + 15) & ~15u);
+  put64(sm >= 100 ? 0x358 : sm >= 90 ? 0x208 : 0x118, 0);   // the descriptor's bits are a cache policy
+  // PTX's %envreg1/%envreg2: a cooperative launch's grid barrier workspace,
+  // high word first. cg::this_grid().sync() traps when it is zero, which is
+  // what an ordinary launch of a grid-sync kernel gets.
   const uint64_t ws = coop_ws_ ? coop_ws_ : cfg_.coop_workspace;
-  put32(0x8c, static_cast<uint32_t>(ws >> 32));
-  put32(0x90, static_cast<uint32_t>(ws));
+  const size_t env1 = sm >= 100 ? 0x254 : sm >= 90 ? 0x44 : 0x8c;
+  put32(env1, static_cast<uint32_t>(ws >> 32));
+  put32(env1 + 4, static_cast<uint32_t>(ws));
   if (args.size() != k_.params.size())
     throw Error(Err::InvalidValue, "kernel " + k_.name + " takes " + std::to_string(k_.params.size()) +
                                        " parameters, the launch passed " + std::to_string(args.size()));
@@ -361,6 +374,9 @@ uint32_t Runner::sreg(const Block& blk, const Warp& w, unsigned idx, unsigned la
       return (idx == 0x51 || idx == 0x53) ? static_cast<uint32_t>(t >> 32) : static_cast<uint32_t>(t);
     }
     case 0x32: return static_cast<uint32_t>(shared_size_);              // SR_SMEMSZ
+    case 0x2f: return static_cast<uint32_t>(kSharedWindow >> 32);       // SR_SWINHI
+    case 0x88: return 0;                                                // SR_CgaCtaId: one block per cluster
+    case 0x8a: return 0;                                                // SR_CgaSize (bank 0's envregs at +0)
     case 0x28: return block_threads_;                                   // SR_NTID
     default: return 0;
   }

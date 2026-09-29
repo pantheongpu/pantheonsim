@@ -39,7 +39,8 @@ bool executes(const Instr& ins) {
     case Op::SEL: case Op::SGXT: case Op::SHF: case Op::UFLO: case Op::UIADD3: case Op::UIMAD: case Op::UISETP:
     case Op::ULDC: case Op::ULEA: case Op::ULOP3: case Op::UMOV: case Op::UPLOP3: case Op::UPOPC: case Op::UPRMT:
     case Op::USEL: case Op::USHF: case Op::VABSDIFF4: case Op::VIADD: case Op::VIMNMX: case Op::VIADDMNMX:
-    case Op::VIMNMX3:
+    case Op::VIMNMX3: case Op::IADD: case Op::UP2UR: case Op::ELECT: case Op::USETMAXREG: case Op::WARPGROUP:
+    case Op::FMNMX3: case Op::STSM: case Op::RPCMOV:
     case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2FP: case Op::F2I:
     case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL:
     case Op::FSET: case Op::FSETP: case Op::HADD2: case Op::HFMA2: case Op::HMUL2: case Op::HSET2: case Op::HSETP2:
@@ -118,7 +119,7 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
         break;
       case Op::LDG: case Op::STG: case Op::LDS: case Op::STS: case Op::LDL: case Op::STL:
       case Op::LD: case Op::ST: case Op::LDC: case Op::ATOM: case Op::ATOMG: case Op::ATOMS:
-      case Op::RED: case Op::LDGSTS: case Op::LDGDEPBAR: case Op::LDSM:
+      case Op::RED: case Op::LDGSTS: case Op::LDGDEPBAR: case Op::LDSM: case Op::STSM:
         exec_mem(blk, w, ins, ex);
         break;
       case Op::TEX: case Op::TLD: case Op::TLD4: case Op::SULD: case Op::SUST:
@@ -134,7 +135,7 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
       case Op::FSEL: case Op::FCHK: case Op::MUFU: case Op::DADD: case Op::DMUL: case Op::DFMA:
       case Op::DSETP: case Op::HADD2: case Op::HMUL2: case Op::HFMA2: case Op::HSETP2: case Op::HMNMX2:
       case Op::I2F: case Op::I2FP: case Op::F2I: case Op::F2IP: case Op::F2F: case Op::F2FP:
-      case Op::FRND: case Op::I2I: case Op::I2IP: case Op::HSET2:
+      case Op::FRND: case Op::I2I: case Op::I2IP: case Op::HSET2: case Op::FMNMX3:
         exec_float(blk, w, ins, ex);
         break;
       default:
@@ -178,7 +179,8 @@ uint32_t lop3(uint32_t a, uint32_t b, uint32_t c, uint32_t lut) {
     if ((lut >> i) & 1) r |= ((i & 4) ? a : ~a) & ((i & 2) ? b : ~b) & ((i & 1) ? c : ~c);
   return r;
 }
-bool int_cmp(unsigned cmp, int64_t a, int64_t b) {
+template <class T>
+bool int_cmp(unsigned cmp, T a, T b) {
   switch (cmp) {
     case 0: return false;
     case 1: return a < b;
@@ -254,6 +256,10 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         each_lane(ex, [&](unsigned l) { write64(w, ins.dst[0], l, w.pc[l]); });
         return;
       }
+      if (ins.f[1]) {   // MOV.64
+        each_lane(ex, [&](unsigned l) { write64(w, ins.dst[0], l, read64(w, ins.src[0], l)); });
+        return;
+      }
       each_lane(ex, [&](unsigned l) { write32(w, ins.dst[0], l, read32(w, ins.src[0], l)); });
       return;
     case Op::IMAD: case Op::UIMAD: {
@@ -270,12 +276,19 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           if (ins.src[2].neg) c = 0 - c;
           if (ins.src[2].bnot) c = ~c;
           write64(w, ins.dst[0], l, prod + c + cin);
-        } else if (kind == 0x27) {   // HI: the product's high word plus the addend
+        } else if (kind == 0x27) {
+          // HI: the high word of the product plus a 64-bit addend -- c is a
+          // register pair (ptxas's division by a constant puts n in the high
+          // half to add it there).
           const uint64_t prod = sgn ? static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(a)) *
                                                             static_cast<int32_t>(b))
                                     : static_cast<uint64_t>(a) * b;
-          const uint32_t c = ival(w, ins.src[2], l);
-          write32(w, ins.dst[0], l, static_cast<uint32_t>(prod >> 32) + c + cin);
+          uint64_t c = ins.src[2].kind == Kind::Reg || ins.src[2].kind == Kind::UReg
+                           ? read64(w, ins.src[2], l)
+                           : static_cast<uint64_t>(sgn ? static_cast<int64_t>(static_cast<int32_t>(ival(w, ins.src[2], l)))
+                                                       : ival(w, ins.src[2], l));
+          if (ins.src[2].neg && (ins.src[2].kind == Kind::Reg || ins.src[2].kind == Kind::UReg)) c = 0 - c;
+          write32(w, ins.dst[0], l, static_cast<uint32_t>((prod + c) >> 32) + cin);
         } else {
           const uint32_t c = ival(w, ins.src[2], l);
           const uint64_t full = static_cast<uint64_t>(a * b) + c + cin;
@@ -287,6 +300,19 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     }
     case Op::IADD3: case Op::UIADD3: {
       const bool x = ins.f[0];
+      if (ins.f[1]) {   // UIADD3.64
+        each_lane(ex, [&](unsigned l) {
+          uint64_t sum = 0;
+          for (int i = 0; i < 3; ++i) {
+            uint64_t v = read64(w, ins.src[i], l);
+            if (ins.src[i].neg) v = 0 - v;
+            if (ins.src[i].bnot) v = ~v;
+            sum += v;
+          }
+          write64(w, ins.dst[0], l, sum);
+        });
+        return;
+      }
       each_lane(ex, [&](unsigned l) {
         // Each operand is added as its bits, a negated one as its complement
         // plus one: that is what makes the carries come out right.
@@ -339,6 +365,16 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     case Op::ISETP: case Op::UISETP: {
       const unsigned cmp = ins.f[0], bop = ins.f[2];
       const bool sgn = ins.f[1], exf = ins.f[3];
+      if (ins.f[4]) {   // sm_120's 64-bit compare
+        each_lane(ex, [&](unsigned l) {
+          const uint64_t a = read64(w, ins.src[0], l), b = read64(w, ins.src[1], l);
+          const bool acc = pred(w, ins.src[2], l);
+          const bool r = sgn ? int_cmp(cmp, static_cast<int64_t>(a), static_cast<int64_t>(b)) : int_cmp(cmp, a, b);
+          set_pred(w, ins.dst[0], l, bool_op(bop, r, acc));
+          set_pred(w, ins.dst[1], l, bool_op(bop, !r, acc));
+        });
+        return;
+      }
       each_lane(ex, [&](unsigned l) {
         const uint32_t a = read32(w, ins.src[0], l), b = read32(w, ins.src[1], l);
         const bool acc = pred(w, ins.src[2], l);
@@ -390,10 +426,27 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       return;
     case Op::SEL: case Op::USEL:
       each_lane(ex, [&](unsigned l) {
-        write32(w, ins.dst[0], l, pred(w, ins.src[2], l) ? read32(w, ins.src[0], l) : read32(w, ins.src[1], l));
+        const bool p = pred(w, ins.src[2], l);
+        if (ins.f[0]) write64(w, ins.dst[0], l, p ? read64(w, ins.src[0], l) : read64(w, ins.src[1], l));   // SEL.64
+        else write32(w, ins.dst[0], l, p ? read32(w, ins.src[0], l) : read32(w, ins.src[1], l));
       });
       return;
     case Op::IMNMX:
+      if (ins.f[1]) {   // sm_120's 64-bit form: preds out, the register third
+        each_lane(ex, [&](unsigned l) {
+          const uint64_t a = read64(w, ins.src[0], l), b = read64(w, ins.src[1], l);
+          const bool mn = pred(w, ins.src[2], l);
+          uint64_t r;
+          if (ins.f[0]) {
+            const int64_t x = static_cast<int64_t>(a), y = static_cast<int64_t>(b);
+            r = static_cast<uint64_t>(mn ? std::min(x, y) : std::max(x, y));
+          } else {
+            r = mn ? std::min(a, b) : std::max(a, b);
+          }
+          write64(w, ins.dst[2], l, r);
+        });
+        return;
+      }
       each_lane(ex, [&](unsigned l) {
         const uint32_t a = read32(w, ins.src[0], l), b = read32(w, ins.src[1], l);
         const bool mn = pred(w, ins.src[2], l);
@@ -474,7 +527,39 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       return;
     }
     case Op::VIADD:
-      each_lane(ex, [&](unsigned l) { write32(w, ins.dst[0], l, read32(w, ins.src[0], l) + ival(w, ins.src[1], l)); });
+      each_lane(ex, [&](unsigned l) {
+        const uint32_t a = read32(w, ins.src[0], l), b = ival(w, ins.src[1], l);
+        uint32_t r;
+        if (ins.f[0] == 1 && ins.f[1]) {   // .S32.ISAT: saturating
+          r = static_cast<uint32_t>(std::clamp<int64_t>(int64_t{static_cast<int32_t>(a)} + static_cast<int32_t>(b), INT32_MIN, INT32_MAX));
+        } else if (ins.f[0] == 2) {   // per byte, wrapping
+          r = 0;
+          for (int k = 0; k < 4; ++k) r |= ((((a >> (8 * k)) & 0xff) + ((b >> (8 * k)) & 0xff)) & 0xff) << (8 * k);
+        } else {
+          r = a + b;
+        }
+        write32(w, ins.dst[0], l, r);
+      });
+      return;
+    case Op::IADD:   // sm_120: a + b, 32 or 64 bits
+      each_lane(ex, [&](unsigned l) {
+        if (ins.f[0]) {
+          uint64_t a = read64(w, ins.src[0], l), b = read64(w, ins.src[1], l);
+          if (ins.src[0].neg) a = 0 - a;
+          if (ins.src[1].neg) b = 0 - b;
+          write64(w, ins.dst[0], l, a + b);
+        } else {
+          write32(w, ins.dst[0], l, ival(w, ins.src[0], l) + ival(w, ins.src[1], l));
+        }
+      });
+      return;
+    case Op::UP2UR:   // the uniform predicates (masked) into a register
+      if (ex) {
+        uint32_t bits = 0;
+        for (unsigned i = 0; i < 7; ++i) bits |= (w.up[i] ? 1u : 0u) << i;
+        const uint32_t mask = static_cast<uint32_t>(ins.src[2].imm);
+        write32(w, ins.dst[0], 0, (read32(w, ins.src[1], 0) & ~mask) | (bits & mask));
+      }
       return;
     case Op::VIMNMX: case Op::VIADDMNMX: case Op::VIMNMX3: {
       const bool sgn = ins.f[0], s16x2 = ins.f[1];
@@ -514,6 +599,27 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       });
       return;
     }
+    case Op::ELECT: {   // elect.sync: the lowest thread with the predicate leads
+      Mask cand = 0;
+      each_lane(ex, [&](unsigned l) {
+        if (pred(w, ins.src[0], l)) cand |= Mask{1} << l;
+      });
+      const unsigned leader = cand ? static_cast<unsigned>(std::countr_zero(cand)) : 32;
+      each_lane(ex, [&](unsigned l) { set_pred(w, ins.dst[0], l, l == leader); });
+      if (ex && leader < 32) write32(w, ins.dst[1], static_cast<unsigned>(std::countr_zero(ex)), leader);
+      return;
+    }
+    case Op::USETMAXREG:   // no register file to reallocate: an allocation always succeeds
+      if (!ins.dst.empty() && ex) set_pred(w, ins.dst[0], static_cast<unsigned>(std::countr_zero(ex)), true);
+      return;
+    case Op::WARPGROUP:   // the warpgroup MMAs complete as they issue: nothing to fence or wait for
+      return;
+    case Op::RPCMOV:   // RPCMOV.32 to or from the return-address register
+      each_lane(ex, [&](unsigned l) {
+        if (ins.f[0]) write32(w, ins.dst[0], l, w.rpc[l]);
+        else w.rpc[l] = read32(w, ins.src[0], l);
+      });
+      return;
     case Op::SGXT:
       each_lane(ex, [&](unsigned l) {
         const uint32_t a = read32(w, ins.src[0], l), b = read32(w, ins.src[1], l);
@@ -573,6 +679,8 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           const uint32_t v = idx == 0xff ? 0 : sreg(blk, w, idx, l);
           if (ins.dst[0].width == 2) write64(w, ins.dst[0], l, idx == 0xff ? 0 : sreg(blk, w, idx, l) | (static_cast<uint64_t>(sreg(blk, w, idx + 1, l)) << 32));
           else write32(w, ins.dst[0], l, v);
+        } else if (ins.mnemonic == "CS2UR" && ins.f[3]) {   // a 64-bit special register
+          write64(w, ins.dst[0], l, sreg(blk, w, idx, l) | (static_cast<uint64_t>(sreg(blk, w, idx + 1, l)) << 32));
         } else {
           write32(w, ins.dst[0], l, sreg(blk, w, idx, l));
         }
@@ -588,10 +696,24 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       if (!ex) return;
       const unsigned size = ins.f[0];
       const Operand& c = ins.src[0];
-      if (ins.f[1]) {   // c[bank][URa + offset]
-        const uint64_t o = w.ur[c.reg] + static_cast<uint64_t>(c.imm);
-        if (size == 5) write64(w, ins.dst[0], 0, cbank32(ins.f[2], o) | (static_cast<uint64_t>(cbank32(ins.f[2], o + 4)) << 32));
-        else write32(w, ins.dst[0], 0, cbank32(ins.f[2], o));
+      if (ins.f[1]) {   // c[bank][URa + offset] (ULDC's indexed form; LDCU)
+        const uint64_t o = (c.reg == static_cast<unsigned>(m_.sm >= 100 ? 255 : 63) ? 0 : w.ur[c.reg]) +
+                           static_cast<uint64_t>(c.imm);
+        const unsigned words = size == 6 ? 4 : size == 5 ? 2 : 1;
+        if (words > 1) {
+          Operand d = ins.dst[0];
+          for (unsigned i = 0; i < words; ++i, ++d.reg) write32(w, d, 0, cbank32(ins.f[2], o + 4 * i));
+          return;
+        }
+        uint32_t v = cbank32(ins.f[2], o & ~3ull) >> (8 * (o & 3));
+        switch (size) {
+          case 0: v &= 0xff; break;
+          case 1: v = static_cast<uint32_t>(static_cast<int8_t>(v)); break;
+          case 2: v &= 0xffff; break;
+          case 3: v = static_cast<uint32_t>(static_cast<int16_t>(v)); break;
+          default: break;
+        }
+        write32(w, ins.dst[0], 0, v);
         return;
       }
       if (size == 5) {
@@ -800,6 +922,7 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
         } else {
           const float f = rounded(rnd, [&] { return u64 ? static_cast<float>(v) : static_cast<float>(sv); });
           if (dsize == 1) write32(w, ins.dst[0], l, f32_to_half(f));
+          else if (dsize == 4) write32(w, ins.dst[0], l, f32_to_bf16(f));
           else write32(w, ins.dst[0], l, f32_bits(f));
         }
       });
@@ -849,11 +972,19 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
       return;
     }
     case Op::F2FP:
+      if (ins.f[5] == 4 && ins.f[4] == 0) {   // PACK_B: F32 to TF32 (to nearest, ties away)
+        each_lane(ex, [&](unsigned l) {
+          uint32_t v = read32(w, ins.src[0], l);
+          if ((v & 0x7f800000u) != 0x7f800000u) v = (v + 0x1000u) & 0xffffe000u;
+          write32(w, ins.dst[0], l, v);
+        });
+        return;
+      }
       if (ins.f[3] >= 6 || ins.f[5] == 4) {   // the FP8 forms
         const bool unpack = ins.f[5] == 4, sat = ins.f[6];
         each_lane(ex, [&](unsigned l) {
-          if (unpack) {   // b's two bytes (low first) to two halves
-            const uint32_t v = read32(w, ins.src[0], l);
+          if (unpack) {   // b's two bytes (low first, or its upper half's) to two halves
+            const uint32_t v = read32(w, ins.src[0], l) >> (ins.f[7] ? 16 : 0);
             const bool e5 = ins.f[4] == 2;
             const uint16_t lo = f64_to_half(exec::fp8_value(v & 0xff, e5));
             const uint16_t hi = f64_to_half(exec::fp8_value((v >> 8) & 0xff, e5));
@@ -977,6 +1108,22 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
       });
       return;
     }
+    case Op::FMNMX3:   // the min (p) or max of three, NaN losing unless .NAN
+      each_lane(ex, [&](unsigned l) {
+        const bool fz = ins.f[0], mn = pred(w, ins.src[3], l);
+        float r = f32src(ins.src[0], l, fz);
+        bool nan = r != r;
+        for (int i = 1; i < 3; ++i) {
+          const float b = f32src(ins.src[i], l, fz);
+          nan = nan || b != b;
+          if (r != r) r = b;
+          else if (b != b) continue;
+          else if (r == 0 && b == 0) r = mn ? (std::signbit(r) ? r : b) : (std::signbit(r) ? b : r);
+          else r = mn ? std::min(r, b) : std::max(r, b);
+        }
+        write32(w, ins.dst[0], l, ins.f[1] && nan ? 0x7fffffffu : f32_bits(r));
+      });
+      return;
     case Op::FSETP: case Op::FSET: {
       const unsigned cmp = ins.f[0], bop = ins.f[1];
       const bool fz = ins.f[2];
@@ -1162,7 +1309,7 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
 
 void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const unsigned size = ins.f[0];
-  const uint32_t bytes = size <= 1 ? 1 : size <= 3 ? 2 : size == 4 ? 4 : size == 5 ? 8 : 16;
+  const uint32_t bytes = size <= 1 ? 1 : size <= 3 ? 2 : size == 4 ? 4 : size == 5 ? 8 : size == 8 ? 32 : 16;
   const auto extend = [&](uint32_t v) -> uint32_t {
     switch (size) {
       case 0: return v & 0xff;
@@ -1214,14 +1361,20 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         const Space sp = generic ? classify(g, &off) : (off = g, Space::Global);
         addrs[l] = off;
         space = sp == Space::Global ? 0 : sp == Space::Shared ? 1 : 2;
+        // A 32-byte access (ENL2.256) moves two register quads.
+        const auto quad = [&](const Operand& d, unsigned i) { return i < 4 ? d.reg + i : 0; };
         if (store) {
           const Operand& d = ins.src[1];
           if (bytes <= 4) {
             const uint32_t v = read32(w, d, l);
             mem_write(blk, w, l, sp, off, &v, bytes);
           } else {
-            uint32_t v[4];
-            for (unsigned i = 0; i < bytes / 4; ++i) v[i] = d.reg == kRZ ? 0 : w.reg(d.reg + i, l);
+            uint32_t v[8];
+            for (unsigned i = 0; i < bytes / 4; ++i) {
+              const Operand& q = i < 4 ? d : ins.src[2];
+              const unsigned r = quad(q, i % 4);
+              v[i] = q.reg == kRZ ? 0 : w.reg(r, l);
+            }
             mem_write(blk, w, l, sp, off, v, bytes);
           }
         } else {
@@ -1231,10 +1384,12 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             mem_read(blk, w, l, sp, off, &v, bytes);
             write32(w, d, l, extend(v));
           } else {
-            uint32_t v[4];
+            uint32_t v[8];
             mem_read(blk, w, l, sp, off, v, bytes);
-            if (d.reg != kRZ)
-              for (unsigned i = 0; i < bytes / 4; ++i) w.reg(d.reg + i, l) = v[i];
+            for (unsigned i = 0; i < bytes / 4; ++i) {
+              const Operand& q = i < 4 ? d : ins.dst[1];
+              if (q.reg != kRZ) w.reg(quad(q, i % 4), l) = v[i];
+            }
           }
         }
       });
@@ -1337,6 +1492,39 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       blk.st.shared_bytes_read += static_cast<uint64_t>(std::popcount(ex)) * 4 * nmat;
       return;
     }
+    case Op::STSM: {
+      // stmatrix: LDSM's layout stored -- matrix i's rows at the addresses
+      // lanes 8i..8i+7 hold, lane t's register i the row t/4's word t%4
+      // (.MT88: column t/4 of rows 2(t%4) and 2(t%4)+1).
+      const unsigned nmat = ins.f[0];
+      const bool trans = ins.f[1];
+      uint64_t rows[32] = {};
+      Mask have = 0;
+      each_lane(ex, [&](unsigned l) {
+        rows[l] = static_cast<uint32_t>(address(ins.src[0], l, false, ins.w.bit(91), 64, 0));
+        have |= Mask{1} << l;
+      });
+      const auto row = [&](unsigned r) {
+        if (!(have >> r & 1)) fault(w, ins, r, "STSM: the lane holding a row address is not active");
+        return rows[r];
+      };
+      const unsigned d = ins.src[1].reg;
+      each_lane(ex, [&](unsigned t) {
+        for (unsigned i = 0; i < nmat; ++i) {
+          const uint32_t v = d == kRZ ? 0 : w.reg(d + i, t);
+          if (!trans) {
+            mem_write(blk, w, t, Space::Shared, row(8 * i + t / 4) + 4 * (t % 4), &v, 4);
+          } else {
+            const uint16_t lo = static_cast<uint16_t>(v), hi = static_cast<uint16_t>(v >> 16);
+            mem_write(blk, w, t, Space::Shared, row(8 * i + 2 * (t % 4)) + 2 * (t / 4), &lo, 2);
+            mem_write(blk, w, t, Space::Shared, row(8 * i + 2 * (t % 4) + 1) + 2 * (t / 4), &hi, 2);
+          }
+        }
+      });
+      blk.st.shared_stores += static_cast<uint64_t>(std::popcount(ex));
+      blk.st.shared_bytes_written += static_cast<uint64_t>(std::popcount(ex)) * 4 * nmat;
+      return;
+    }
     case Op::LDC: {
       const unsigned bank = ins.f[4];
       const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
@@ -1426,7 +1614,10 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           if (is64) write64(w, d, l, old);
           else write32(w, d, l, static_cast<uint32_t>(old));
           // CAST.SPIN: whether it stored (ATOMS keeps the mode in f[1], ATOM in f[6]).
-          if (cas && (ins.op == Op::ATOMS ? ins.f[1] == 3 : ins.f[6] != 0)) write32(w, d, l, old == v ? 1 : 0);
+          if (cas && (ins.op == Op::ATOMS ? ins.f[1] == 3 : ins.f[6] != 0)) {
+            if (d.kind == Kind::Pred) set_pred(w, d, l, old == v);   // sm_100's ATOMS.CAST.SPIN P
+            else write32(w, d, l, old == v ? 1 : 0);
+          }
         }
       });
       return;
@@ -1525,7 +1716,7 @@ void Runner::exec_warp(Block&, Warp& w, const Instr& ins, Mask ex, Mask) {
         first = false;
       });
       const uint32_t r = (op >= 4 && sgn) ? static_cast<uint32_t>(sacc) : static_cast<uint32_t>(acc);
-      if (ins.dst[0].reg < 63) w.ur[ins.dst[0].reg] = r;
+      if (ex) write32(w, ins.dst[0], static_cast<unsigned>(std::countr_zero(ex)), r);
       return;
     }
     default:
