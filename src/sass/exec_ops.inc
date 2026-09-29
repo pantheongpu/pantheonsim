@@ -1943,7 +1943,7 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const unsigned mask = static_cast<unsigned>(word.field(72, 4));
   const bool int_coords = ins.op == Op::TLD;
   each_lane(ex, [&](unsigned l) {
-    uint32_t comp[4] = {};
+    uint32_t comp[5] = {};   // a cube array's layer, x, y, z and LOD
     for (unsigned i = 0; i < total; ++i) comp[i] = i < in0 ? rd(r0 + i, l) : rd(r1 + (i - in0), l);
     exec::TexFetch f;
     // ptxas fetches a 1D texture as a 2D one at y = 0, which is what the
@@ -2453,10 +2453,14 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       if (ins.f[1] && take) take = group;   // .U.ANY: all of them when any
       if (ins.f[0] >= 2) {
         // .DIV/.CONV: branch when the warp is (not) converged on the mask the
-        // uniform register gives (~URZ: every lane).
-        const Operand& u = ins.src[ins.src.size() - 2];
-        uint32_t want = u.reg >= (m_.sm >= 100 ? 255u : 63u) ? 0 : w.ur[u.reg];
-        if (u.bnot) want = ~want;
+        // uniform register gives (~URZ: every lane). Turing's carry none and
+        // mean every lane.
+        uint32_t want = ~0u;
+        if (ins.src.size() >= 2 && ins.src[ins.src.size() - 2].kind == Kind::UReg) {
+          const Operand& u = ins.src[ins.src.size() - 2];
+          want = u.reg >= (m_.sm >= 100 ? 255u : 63u) ? 0 : w.ur[u.reg];
+          if (u.bnot) want = ~want;
+        }
         const Mask full = want & w.alive & ~w.exited;
         const bool converged = group == full;
         take = (ins.f[0] == 2 ? !converged : converged) ? ex : 0;

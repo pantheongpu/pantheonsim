@@ -85,11 +85,12 @@ if [[ -z $cutlass ]]; then
   jobs=("${kept[@]}")
 fi
 
-# Builds, several at once.
+# Builds, several at once. --as-needed keeps libcuda out of the programs that
+# never call the driver API, so a sanitizer build can still run them (below).
 export nvcc_bin root work cutlass
 export san="${san_flags[*]}"
 printf '%s\n' "${jobs[@]}" | xargs -P "${VGPU_SASS_JOBS:-$(nproc)}" -L 1 bash -c '
-  "$nvcc_bin" -std=c++17 -arch="$1" -cudart shared -w -Wno-deprecated-gpu-targets $san \
+  "$nvcc_bin" -std=c++17 -arch="$1" -cudart shared -w -Wno-deprecated-gpu-targets -Xlinker --as-needed $san \
     ${cutlass:+-O1 --expt-relaxed-constexpr -I"$cutlass/include"} \
     -I"$root/nvidia/tests/e2e" "$root/nvidia/tests/e2e/$0.cu" -o "$work/$0.$1" -lcuda 2> "$work/$0.$1.build" ||
     echo "build failed" >> "$work/$0.$1.build"'
@@ -101,6 +102,11 @@ check() {
     echo "FAIL $arch $p: does not build"; sed 's/^/    /' "$bin.build" | tail -5; fails=1; return
   fi
   require_shim_libs "$shim" "$bin" >/dev/null || return
+  # Both shims carry the simulator's core, which a sanitizer build reports as an
+  # ODR violation when one program loads the two (as run_mixed_apis.sh skips).
+  if [[ -n ${san_flags[*]} ]] && readelf -d "$bin" | grep -q 'NEEDED.*libcuda\.so'; then
+    echo "SKIP $arch $p: a sanitizer build loads two copies of the core"; return
+  fi
   local env=(VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} LD_LIBRARY_PATH="$shim")
   [[ $p == runtime_conformance ]] && env+=(VGPU_DEVICE_COUNT=2)   # as run_runtime_conformance.sh runs it
   sass="$(cd "$work" && env "${env[@]}" VGPU_SASS_LOG=1 timeout 600 "$bin" 2>&1)"; rs=$?
