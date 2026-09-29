@@ -3,11 +3,13 @@
 // prefetches and advice, the pointer attributes, and a kernel and the host
 // reading and writing the same bytes. The expected answers are what an RTX
 // 3080 Ti's driver gives. Also cuLaunchHostFunc, which runs the function
-// once the work queued before it is done.
+// once the work queued before it is done, and cuEventElapsedTime's refusals
+// (as an RTX 3060 gives them).
 #include <cuda.h>
 
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 static int failures = 0;
 
@@ -136,6 +138,24 @@ int main() {
   IS(cuLaunchHostFunc(s, on_host, &by), CUDA_SUCCESS);
   IS(cuStreamSynchronize(s), CUDA_SUCCESS);
   check(host_calls == 3, "cuLaunchHostFunc ran the function once");
+
+  // Elapsed time needs two recorded events that keep timing.
+  CUevent nt, e1, e2, never;
+  float ms = 0;
+  IS(cuEventCreate(&nt, CU_EVENT_DISABLE_TIMING), CUDA_SUCCESS);
+  IS(cuEventCreate(&e1, 0), CUDA_SUCCESS);
+  IS(cuEventCreate(&e2, 0), CUDA_SUCCESS);
+  IS(cuEventCreate(&never, 0), CUDA_SUCCESS);
+  IS(cuEventRecord(nt, s), CUDA_SUCCESS);
+  IS(cuEventRecord(e1, s), CUDA_SUCCESS);
+  IS(cuEventRecord(e2, s), CUDA_SUCCESS);
+  IS(cuEventSynchronize(e2), CUDA_SUCCESS);
+  IS(cuEventElapsedTime(&ms, e1, e2), CUDA_SUCCESS);
+  IS(cuEventElapsedTime(&ms, nt, e2), CUDA_ERROR_INVALID_HANDLE);
+  IS(cuEventElapsedTime(&ms, e1, nt), CUDA_ERROR_INVALID_HANDLE);
+  IS(cuEventElapsedTime(&ms, never, e2), CUDA_ERROR_INVALID_HANDLE);
+  IS(cuEventElapsedTime(nullptr, e1, e2), CUDA_ERROR_INVALID_VALUE);
+  for (CUevent e : {nt, e1, e2, never}) cuEventDestroy(e);
 
   IS(cuMemFree(b), CUDA_SUCCESS);
   IS(cuMemFree(a), CUDA_SUCCESS);

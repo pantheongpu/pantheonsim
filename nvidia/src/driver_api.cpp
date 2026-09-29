@@ -71,6 +71,7 @@ struct KernelRec {
 
 struct EventRec {
   bool recorded = false;
+  bool timing = true;   // false for CU_EVENT_DISABLE_TIMING
   struct timespec when {};
 };
 
@@ -2214,11 +2215,12 @@ VGPU_EXPORT CUresult cuStreamIsCapturing(CUstream, int* status) {
   return CUDA_SUCCESS;
 }
 
-VGPU_EXPORT CUresult cuEventCreate(void** ev, unsigned int) {
+VGPU_EXPORT CUresult cuEventCreate(void** ev, unsigned int flags) {
   return api("cuEventCreate", true, false, [&](ShimState& s) {
     if (!ev) return CUDA_ERROR_INVALID_VALUE;
     uintptr_t h = make_handle(s, kTagEvent);
     s.events[h] = {};
+    s.events[h].timing = !(flags & 0x2);   // CU_EVENT_DISABLE_TIMING
     *ev = reinterpret_cast<void*>(h);
     return CUDA_SUCCESS;
   });
@@ -2245,9 +2247,12 @@ VGPU_EXPORT CUresult cuEventElapsedTime(float* ms, void* start, void* end) {
   return api("cuEventElapsedTime", true, false, [&](ShimState& s) {
     auto a = s.events.find(reinterpret_cast<uintptr_t>(start));
     auto b = s.events.find(reinterpret_cast<uintptr_t>(end));
-    if (!ms || a == s.events.end() || b == s.events.end() || !a->second.recorded ||
-        !b->second.recorded)
-      return CUDA_ERROR_INVALID_VALUE;
+    // As the card answers: an event never recorded, or made with
+    // CU_EVENT_DISABLE_TIMING, is an invalid handle here, not a bad value.
+    if (!ms) return CUDA_ERROR_INVALID_VALUE;
+    if (a == s.events.end() || b == s.events.end() || !a->second.recorded || !b->second.recorded ||
+        !a->second.timing || !b->second.timing)
+      return CUDA_ERROR_INVALID_HANDLE;
     double ns = (b->second.when.tv_sec - a->second.when.tv_sec) * 1e9 +
                 (b->second.when.tv_nsec - a->second.when.tv_nsec);
     *ms = static_cast<float>(ns / 1e6);
