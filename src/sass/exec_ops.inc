@@ -933,17 +933,19 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
     case Op::MUFU: {
       const unsigned op = ins.f[0];
       each_lane(ex, [&](unsigned l) {
-        const float x = ftz(f32src(ins.src[0], l, true));
+        // Computed in double and rounded once, as the PTX engine computes
+        // the .approx functions, so the two engines agree to the bit.
+        const double x = ftz(f32src(ins.src[0], l, true));
         float r;
         switch (op) {
-          case 0: r = std::cos(x * 6.28318530717958647692f); break;   // the argument is in turns
-          case 1: r = std::sin(x * 6.28318530717958647692f); break;
-          case 2: r = std::exp2(x); break;
-          case 3: r = std::log2(x); break;
-          case 4: r = 1.0f / x; break;
-          case 5: r = 1.0f / std::sqrt(x); break;
-          case 8: r = std::sqrt(x); break;
-          case 9: r = std::tanh(x); break;
+          case 0: r = static_cast<float>(std::cos(x * 6.28318530717958647692)); break;   // the argument is in turns
+          case 1: r = static_cast<float>(std::sin(x * 6.28318530717958647692)); break;
+          case 2: r = static_cast<float>(std::exp2(x)); break;
+          case 3: r = static_cast<float>(std::log2(x)); break;
+          case 4: r = static_cast<float>(1.0 / x); break;
+          case 5: r = static_cast<float>(1.0 / std::sqrt(x)); break;
+          case 8: r = static_cast<float>(std::sqrt(x)); break;
+          case 9: r = static_cast<float>(std::tanh(x)); break;
           case 6: case 7: {
             // RCP64H/RSQ64H: the high word of a double's reciprocal (root).
             const double d = as_f64(static_cast<uint64_t>(read32(w, ins.src[0], l)) << 32);

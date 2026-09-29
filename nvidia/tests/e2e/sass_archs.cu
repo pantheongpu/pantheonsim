@@ -6,6 +6,8 @@
 //   - 64-bit division by constants, whose IMAD.WIDE chain carries through a
 //     predicate that an earlier compare left set (PyTorch's embedding
 //     backward, krn_partials_per_segment),
+//   - the approximate functions (MUFU), which must round as the PTX
+//     engine's do: the run prints a hash of their bits for the comparison,
 //   - a return taken by some lanes of a reduction (EXIT Pn),
 //   - float and integer block reductions ending in one thread's store,
 //   - an mbarrier pipeline between warps (SYNCS from sm_90),
@@ -41,6 +43,20 @@ __global__ void divide64(const long long* starts, long long total, long long* ou
   out[3 * i] = (size + 9) / 10;
   out[3 * i + 1] = size / 7;
   out[3 * i + 2] = size % 1000003;
+}
+
+// rsqrtf, __expf and __log2f over a spread of inputs, their bits folded into
+// one word per thread. Not __fdividef: its SASS is MUFU.RCP and an FMUL,
+// rounded twice as the hardware rounds, where the PTX engine divides exactly
+// (src/ptx/parser.cpp, on .approx).
+__global__ void approx_bits(unsigned* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float x = 1.0e-3f + static_cast<float>(i) * 0.7310585f;
+  unsigned h = 0;
+  const float r[3] = {rsqrtf(x), __expf(x * 0.01f - 3.0f), __log2f(x)};
+  for (float v : r) h = h * 0x9e3779b1u ^ __float_as_uint(v);
+  out[i] = h;
 }
 
 template <class T>
@@ -349,6 +365,19 @@ int main() {
       CHECK(hq[3 * i] == (size + 9) / 10 && hq[3 * i + 1] == size / 7 && hq[3 * i + 2] == size % 1000003,
             "divide64(%lld) = %lld %lld %lld", size, hq[3 * i], hq[3 * i + 1], hq[3 * i + 2]);
     }
+  }
+
+  // The approximate functions: printed, for the SASS run to match the PTX one.
+  {
+    const int m = 4096;
+    unsigned* dh;
+    cudaMalloc(&dh, m * sizeof(unsigned));
+    approx_bits<<<m / 128, 128>>>(dh, m);
+    static unsigned hh[m];
+    cudaMemcpy(hh, dh, sizeof hh, cudaMemcpyDeviceToHost);
+    unsigned long long fold = 1469598103934665603ULL;
+    for (int i = 0; i < m; ++i) fold = (fold ^ hh[i]) * 1099511628211ULL;
+    std::printf("approx functions: %016llx\n", fold);
   }
 
   // Block reductions: every block's result is written by its thread 0 alone.
