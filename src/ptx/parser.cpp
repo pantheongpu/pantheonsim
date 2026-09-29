@@ -1946,7 +1946,7 @@ class Parser {
       expect_punct(",");
       Operand a = parse_operand();
       if (op0 == "neg" || op0 == "abs") {
-        ins.op = OpF16x2Neg{is_bf, is_packed, op0 == "abs", dst, a};
+        ins.op = OpF16x2Neg{is_bf, is_packed, op0 == "abs", dst, a, mods.ftz && !is_bf};
       } else {
         expect_punct(",");
         Operand b = parse_operand();
@@ -4209,8 +4209,12 @@ class Parser {
       std::vector<std::string> ps = parts;
       bool has_bop = false;
       PredBinOp bop = PredBinOp::And;
+      bool set_ftz = false;
       for (size_t i = 2; i < ps.size();) {
-        if (ps[i] == "ftz") ps.erase(ps.begin() + i);
+        if (ps[i] == "ftz") {
+          set_ftz = true;
+          ps.erase(ps.begin() + i);
+        }
         else if (ps[i] == "and" || ps[i] == "or" || ps[i] == "xor") {
           has_bop = true;
           bop = ps[i] == "and" ? PredBinOp::And : ps[i] == "or" ? PredBinOp::Or : PredBinOp::Xor;
@@ -4222,6 +4226,7 @@ class Parser {
       if (it == cmp_table().end()) return unsupported("comparison '." + ps[1] + "'");
       OpSet op;
       op.cmp = it->second;
+      op.ftz = set_ftz;
       auto dt = ps[2] == "f16x2"  ? std::optional<Type>{Type{Type::Kind::F, 16}}
               : ps[2] == "bf16x2" ? std::optional<Type>{Type{Type::Kind::BF, 16}}
                                   : parse_type_token(ps[2]);
@@ -4253,11 +4258,13 @@ class Parser {
       ins.op = op;
     } else if (op0 == "setp") {
       // setp.<cmp>[.<bop>][.ftz].<type> p[|q], a, b[, [!]c]
-      bool has_bop = false;
+      bool has_bop = false, setp_ftz = false;
       PredBinOp bop = PredBinOp::And;
       for (size_t i = 2; i < parts.size();) {
-        if (parts[i] == "ftz") parts.erase(parts.begin() + i);
-        else if (parts[i] == "and" || parts[i] == "or" || parts[i] == "xor") {
+        if (parts[i] == "ftz") {
+          setp_ftz = true;
+          parts.erase(parts.begin() + i);
+        } else if (parts[i] == "and" || parts[i] == "or" || parts[i] == "xor") {
           has_bop = true;
           bop = parts[i] == "and" ? PredBinOp::And : parts[i] == "or" ? PredBinOp::Or : PredBinOp::Xor;
           parts.erase(parts.begin() + i);
@@ -4274,6 +4281,7 @@ class Parser {
       op.cmp = it->second;
       op.ty = *ty;
       op.packed = spacked;
+      op.ftz = setp_ftz;
       op.dst = expect_reg_operand("predicate destination");
       if (peek_punct("|")) {
         next();

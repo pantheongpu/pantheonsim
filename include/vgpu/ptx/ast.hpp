@@ -736,7 +736,7 @@ struct OpF16x2Bin { FloatBinOp op = FloatBinOp::Add; bool bf16 = false; bool pac
 struct OpF16x2Fma { bool bf16 = false; bool packed = true; Reg dst; Operand a, b, c; HalfMods mods{}; };
 // neg and abs on half types: both are a mask over the sign bits, which sits in
 // the top bit of each 16-bit half for f16 and bf16 alike.
-struct OpF16x2Neg { bool bf16 = false; bool packed = true; bool absolute = false; Reg dst; Operand src; };
+struct OpF16x2Neg { bool bf16 = false; bool packed = true; bool absolute = false; Reg dst; Operand src; bool ftz = false; };
 // Packed single precision (sm_100+): add/sub/mul/fma.f32x2 on 64-bit registers
 // holding two f32 lanes, the first in the low half. Each lane is an ordinary
 // f32 operation, rounded as .rn/.rz/.rm/.rp asks, with .ftz applied.
@@ -862,6 +862,7 @@ struct OpSetp {
   // setp.f16x2/.bf16x2: two comparisons, the low halves' into p and the high
   // halves' into q (measured).
   bool packed = false;
+  bool ftz = false;   // f32 and f16: subnormal operands compare as signed zero
 };
 // set.<cmp>.<dtype>.<stype> d, a, b -- setp's sibling that writes a value
 // instead of a predicate. The result depends on the destination type, not on
@@ -876,6 +877,7 @@ struct OpSet {
   // set.{u32,s32}.f16x2: packed sources, and 0xffff in each half that
   // compares true (measured).
   bool packed_int_dst = false;
+  bool ftz = false;   // as setp's
   Reg dst;
   Operand a, b;
   // set.<cmp>.<bop>...: the comparison combined with a predicate, as setp's.

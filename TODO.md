@@ -269,6 +269,19 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   mbarrier.pending_count.b64 takes an arrival's state token (the ISA's form),
   which carries the count pending before that arrive; it was parsed as
   taking the barrier's address.
+- A fifth sweep, half precision: every f16, f16x2, bf16 and bf16x2 form of
+  add/sub/mul/fma/min/max/neg/abs with every modifier, setp and set with
+  every comparison (and f32's, with and without .ftz), and cvt between the
+  half types and every integer width with each rounding mode and .sat --
+  600 candidates, of which sm_86's ptxas takes 324, plus 56 f32 comparisons:
+  e2e_ptx_half_forms, 380 variants, also matching on two held-out input
+  sets. Found: .ftz on setp and set was dropped for every type, and on half
+  neg/abs, so subnormal operands were compared and negated as themselves;
+  half min/max left the sign of min(+0, -0) to std::fmin (the card orders
+  -0 below +0, as for f32, which .ftz makes of every negative subnormal);
+  cvt.f32.bf16 gave NaNs the canonical NaN where the card shifts the bits
+  (a signalling NaN stays signalling); and cvt.f64.f16 dropped a NaN's sign
+  and payload, which the card keeps, made quiet.
 - Half precision beyond f16x2: f16, bf16, f16x2 and bf16x2 arithmetic
   (add/sub/mul/fma/neg/min/max), the same four types on every transcendental,
   and atom/red.add on all of them. bf16 is a different decode, not a scaled

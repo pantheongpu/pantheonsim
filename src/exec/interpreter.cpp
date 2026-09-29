@@ -3086,7 +3086,7 @@ class Interpreter {
 
   bool fast_setp(Warp& w, const Instr& ins, const OpSetp& op, Mask m) {
     if (op.ty.bits != 32 || op.ty.is_bfloat() || !narrow_operand(op.a) || !narrow_operand(op.b) ||
-        op.has_bop || op.has_q || op.packed)
+        op.has_bop || op.has_q || op.packed || op.ftz)
       return false;
     Lanes32 sa, sb;
     const Lanes32& a = read_narrow(w, ins, op.a, sa);
@@ -3403,7 +3403,8 @@ class Interpreter {
       if (op->packed) {
         // f16x2/bf16x2: the low halves decide p, the high halves q.
         auto half = [&](uint64_t v, int h) {
-          const uint64_t x = (v >> (16 * h)) & 0xFFFF;
+          uint64_t x = (v >> (16 * h)) & 0xFFFF;
+          if (op->ftz && !op->ty.is_bfloat()) x = half_ftz(x);
           return op->ty.is_bfloat() ? bf16_to_double(x) : f16_to_double(x);
         };
         for (uint32_t lane = 0; lane < W_; ++lane)
@@ -3413,7 +3414,9 @@ class Interpreter {
           }
       } else {
         for (uint32_t lane = 0; lane < W_; ++lane)
-          if ((m & (Mask{1} << lane)) && compare(op->cmp, op->ty, a[lane], b[lane])) t |= Mask{1} << lane;
+          if ((m & (Mask{1} << lane)) &&
+              compare(op->cmp, op->ty, cmp_ftz(op->ftz, op->ty, a[lane]), cmp_ftz(op->ftz, op->ty, b[lane])))
+            t |= Mask{1} << lane;
       }
       // With a boolean operation: p = t bop c and q = !t bop c. c is read
       // before either destination is written, since it may be one of them.
@@ -3584,8 +3587,9 @@ class Interpreter {
         for (int h = 0; h < halves; ++h) {
           double x, y;
           if (op->packed) {
-            const uint64_t ax = (a[lane] >> (16 * h)) & 0xFFFF;
-            const uint64_t bx = (b[lane] >> (16 * h)) & 0xFFFF;
+            uint64_t ax = (a[lane] >> (16 * h)) & 0xFFFF;
+            uint64_t bx = (b[lane] >> (16 * h)) & 0xFFFF;
+            if (op->ftz && !sbf) { ax = half_ftz(ax); bx = half_ftz(bx); }
             x = sbf ? bf16_to_double(ax) : f16_to_double(ax);
             y = sbf ? bf16_to_double(bx) : f16_to_double(bx);
           } else if (op->sty.is_real()) {
@@ -3606,7 +3610,7 @@ class Interpreter {
           } else {
             // The scalar path reuses setp's comparator, which already handles
             // the signed/unsigned and NaN-aware cases from the source type.
-            t = compare(op->cmp, op->sty, a[lane], b[lane]);
+            t = compare(op->cmp, op->sty, cmp_ftz(op->ftz, op->sty, a[lane]), cmp_ftz(op->ftz, op->sty, b[lane]));
           }
           (void)x; (void)y;
           if (op->has_bop)
@@ -4860,8 +4864,15 @@ class Interpreter {
               // PTX min/max return the non-NaN operand when exactly one is
               // NaN, which is std::fmin/fmax's rule and not what < gives --
               // unless .NaN asks for the NaN.
-              case FloatBinOp::Min: v = std::fmin(x, y); break;
-              case FloatBinOp::Max: v = std::fmax(x, y); break;
+              // -0 orders below +0, as for f32 (measured on an RTX 3060:
+              // min(+0, -0) is -0, which .ftz makes of every negative
+              // subnormal).
+              case FloatBinOp::Min:
+                v = x == 0 && y == 0 ? (std::signbit(x) || std::signbit(y) ? -0.0 : 0.0) : std::fmin(x, y);
+                break;
+              case FloatBinOp::Max:
+                v = x == 0 && y == 0 ? (std::signbit(x) && std::signbit(y) ? -0.0 : 0.0) : std::fmax(x, y);
+                break;
               default: v = x * y; break;
             }
             if (md.nan_propagate && (std::isnan(x) || std::isnan(y))) v = std::numeric_limits<double>::quiet_NaN();
@@ -4959,6 +4970,7 @@ class Interpreter {
           uint64_t out = 0;
           for (int h = 0; h < (op->packed ? 2 : 1); ++h) {
             uint64_t x = (v[lane] >> (16 * h)) & 0xFFFF;
+            if (op->ftz) x = half_ftz(x);   // a subnormal is a signed zero first
             if (half_nan(x, op->bf16)) x = kCanonicalNaN16;
             else x = op->absolute ? (x & 0x7FFF) : (x ^ 0x8000);
             out |= x << (16 * h);
@@ -8853,6 +8865,13 @@ class Interpreter {
   static bool half_nan(uint64_t h, bool bf16) { return bf16 ? (h & 0x7FFF) > 0x7F80 : half_is_nan(h); }
   // .ftz on an f16: a subnormal to signed zero.
   static uint64_t half_ftz(uint64_t h) { return (h & 0x7C00) == 0 ? (h & 0x8000) : h; }
+  // A comparison's .ftz: an f32 or f16 subnormal operand as its signed zero.
+  static uint64_t cmp_ftz(bool ftz, Type ty, uint64_t v) {
+    if (!ftz || !ty.is_float() || ty.is_bfloat()) return v;
+    if (ty.bits == 32) return (v & 0x7F800000u) == 0 ? (v & 0x80000000u) : v;
+    if (ty.bits == 16) return half_ftz(v & 0xFFFF);
+    return v;
+  }
   // The modifiers applied to a half result: .ftz, .relu, .sat.
   static uint64_t half_post(uint64_t h, bool bf16, const HalfMods& md) {
     const bool nan = half_nan(h, bf16);
@@ -8915,6 +8934,12 @@ class Interpreter {
     const Type& d = op->dst_ty;
     // Read the source as a real number (float src) or integer (int src).
     if (s.is_real()) {
+      // bf16 is the top half of an f32, and cvt.f32.bf16 is that shift on an
+      // RTX 3060 for every input, NaNs included: 0xffff becomes 0xffff0000
+      // and a signalling 0xff81 stays signalling.
+      if (s.is_bfloat() && d.bits == 32 && !d.is_bfloat() && d.is_real() && !op->sat && !op->relu &&
+          !op->ftz && (op->round == Round::None || op->round == Round::Rn))
+        return (in & 0xFFFFu) << 16;
       double x = s.is_bfloat()  ? bf16_to_double(in)
                  : s.bits == 16 ? f16_to_double(in)
                  : s.bits == 32 ? static_cast<double>(f32(in))
@@ -8956,6 +8981,11 @@ class Interpreter {
         // out as the canonical NaN widened (measured); without, its payload
         // is kept.
         if (d.bits == 64 && s.bits == 32 && op->ftz && std::isnan(x)) return 0x7FFF'FFFF'E000'0000ull;
+        // An f16 NaN widened to f64 keeps its sign and its payload, at the top
+        // of the f64's, and is made quiet (an RTX 3060: 0x7d55 becomes
+        // 0x7ffd540000000000, 0xffff 0xfffffc0000000000).
+        if (d.bits == 64 && s.bits == 16 && !s.is_bfloat() && std::isnan(x))
+          return (uint64_t{(in >> 15) & 1} << 63) | 0x7FF8'0000'0000'0000ull | (uint64_t{in & 0x3FFu} << 42);
         if (d.bits == 64) return f64bits(x);
         const float f = static_cast<float>(x);
         if (op->ftz && subnormal32(f)) return f32bits(std::copysign(0.0f, f));

@@ -3520,6 +3520,70 @@ VTEST(atom_cas_compares_with_b_and_stores_c) {
 // PTX forms a differential probe against an RTX 3060 found missing or wrong:
 // each case is an instruction (inputs in %r1, %r2, %r3, result in %r4) and
 // what the card gave for it.
+// Half-precision rules the fifth card-vs-simulator sweep found
+// (ptx_half_forms.cu), with an RTX 3060's values: .ftz on setp/set and on
+// half neg/abs (it was dropped, for f32 comparisons too), -0 below +0 in half
+// min/max, cvt.f32.bf16 as a plain shift even for NaNs, and cvt.f64.f16
+// keeping a NaN's sign and payload.
+VTEST(half_precision_rules_from_the_fifth_sweep) {
+  struct Case { const char* ins; uint32_t a, b, c, want; };
+  const Case cases[] = {
+      // Two f32 subnormals: 1 < 2 unless .ftz makes both zero.
+      {"{ .reg .pred p; setp.lt.f32 p, %r1, %r2; selp.u32 %r4, 1, 0, p; }", 1, 2, 0, 1},
+      {"{ .reg .pred p; setp.lt.ftz.f32 p, %r1, %r2; selp.u32 %r4, 1, 0, p; }", 1, 2, 0, 0},
+      {"{ .reg .b16 x, y; .reg .pred p; mov.b32 {x, _}, %r1; mov.b32 {y, _}, %r2; setp.lt.ftz.f16 p, x, y; "
+       "selp.u32 %r4, 1, 0, p; }", 1, 2, 0, 0},
+      {"set.eq.u32.f16x2 %r4, %r1, %r2", 0x00010002, 0x80028001, 0, 0},
+      {"set.eq.ftz.u32.f16x2 %r4, %r1, %r2", 0x00010002, 0x80028001, 0, 0xffffffff},
+      // .ftz before the sign change: a positive subnormal negates to -0, a
+      // negative one to +0.
+      {"{ .reg .b16 x, r; mov.b32 {x, _}, %r1; neg.ftz.f16 r, x; mov.b32 %r4, {r, r}; }", 3, 0, 0, 0x80008000},
+      {"{ .reg .b16 x, r; mov.b32 {x, _}, %r1; neg.ftz.f16 r, x; mov.b32 %r4, {r, r}; }", 0x8137, 0, 0, 0},
+      {"{ .reg .b16 x, r; mov.b32 {x, _}, %r1; neg.f16 r, x; mov.b32 %r4, {r, r}; }", 3, 0, 0, 0x80038003},
+      // -0 orders below +0.
+      {"min.f16x2 %r4, %r1, %r2", 0x00000000, 0x80008000, 0, 0x80008000},
+      {"max.f16x2 %r4, %r1, %r2", 0x00000000, 0x80008000, 0, 0},
+      {"{ .reg .b16 x, y, r; mov.b32 {x, _}, %r1; mov.b32 {y, _}, %r2; min.ftz.f16 r, x, y; mov.b32 %r4, {r, r}; }",
+       0x3f800000, 0xe6ec81aa, 0, 0x80008000},
+      {"max.ftz.f16x2 %r4, %r1, %r2", 1, 0x8553843f, 0, 0},
+      // cvt.f32.bf16 shifts; cvt.f64.f16 widens a NaN's payload, made quiet.
+      {"{ .reg .b16 h; .reg .f32 d; mov.b32 {h, _}, %r1; cvt.f32.bf16 d, h; mov.b32 %r4, d; }", 0xffff, 0, 0, 0xffff0000},
+      {"{ .reg .b16 h; .reg .f32 d; mov.b32 {h, _}, %r1; cvt.f32.bf16 d, h; mov.b32 %r4, d; }", 0xff81, 0, 0, 0xff810000},
+      {"{ .reg .b16 h; .reg .f64 d; mov.b32 {h, _}, %r1; cvt.f64.f16 d, h; mov.b64 {_, %r4}, d; }", 0x7d55, 0, 0, 0x7ffd5400},
+      {"{ .reg .b16 h; .reg .f64 d; mov.b32 {h, _}, %r1; cvt.f64.f16 d, h; mov.b64 {_, %r4}, d; }", 0xffff, 0, 0, 0xfffffc00},
+      {"{ .reg .b16 h; .reg .f64 d; mov.b32 {h, _}, %r1; cvt.f64.f16 d, h; mov.b64 {_, %r4}, d; }", 0x7c01, 0, 0, 0x7ff80400},
+  };
+  constexpr size_t n = sizeof cases / sizeof cases[0];
+  std::string body;
+  for (size_t i = 0; i < n; ++i) {
+    char line[512];
+    std::snprintf(line, sizeof line,
+                  "    mov.u32 %%r1, %u;\n    mov.u32 %%r2, %u;\n    mov.u32 %%r3, %u;\n    %s%s\n"
+                  "    st.global.u32 [%%rd2+%zu], %%r4;\n",
+                  cases[i].a, cases[i].b, cases[i].c, cases[i].ins, cases[i].ins[0] == '{' ? "" : ";", 4 * i);
+    body += line;
+  }
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+)" + body + "    ret;\n}\n";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4 * n);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  for (size_t i = 0; i < n; ++i) {
+    const auto got = static_cast<uint32_t>(e.mem.load_scalar(out + 4 * i, 4));
+    if (got != cases[i].want)
+      std::fprintf(stderr, "  %s (a=%08x b=%08x): %08x, the card gave %08x\n", cases[i].ins, cases[i].a, cases[i].b,
+                   got, cases[i].want);
+    VCHECK_EQ(got, cases[i].want);
+  }
+}
+
 VTEST(ptx_forms_as_the_card_computes_them) {
   struct Case { const char* ins; uint32_t a, b, c, want; };
   const Case cases[] = {
