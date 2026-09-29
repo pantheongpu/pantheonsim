@@ -1,6 +1,6 @@
 // Differential conformance for the cuSPARSE shim: SpMV and SpMM over CSR and
 // COO, both index bases, transposed and not, both storage orders for the dense
-// operands, alpha/beta blending, and conversion in both directions.
+// operands, alpha/beta blending, conversion in both directions, and CSR to CSC.
 #include <cusparse.h>
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -191,6 +191,60 @@ static void run() {
     cusparseDestroyDnMat(D); cusparseDestroySpMat(A); cusparseDestroySpMat(B);
     cudaFree(d_off); cudaFree(d_col); cudaFree(d_val); cudaFree(d_dense);
     cudaFree(d_off2); cudaFree(d_col2); cudaFree(d_val2);
+  }
+
+  // CSR to CSC: the transpose of the structure, values moved with it. Every
+  // array is printed whole, since an index off by one is exactly the bug this
+  // is for. Both bases, both value types, and the structure-only action.
+  for (int base = 0; base <= 1; ++base) {
+    for (int dbl = 0; dbl <= 1; ++dbl) {
+      for (int numeric = 0; numeric <= 1; ++numeric) {
+        std::vector<int> off = csr_offsets(base), colv(kC, kC + kNnz);
+        for (int& c : colv) c += base;
+        std::vector<double> dv(kV, kV + kNnz);
+        std::vector<float> fv(kV, kV + kNnz);
+        int* d_off = up(off);
+        int* d_col = up(colv);
+        void* d_val = dbl ? (void*)up(dv) : (void*)up(fv);
+        std::vector<int> cptr(kCols + 1, -7), rind(kNnz, -7);
+        int* d_cptr = up(cptr);
+        int* d_rind = up(rind);
+        std::vector<double> zd(kNnz, 0.0);
+        std::vector<float> zf(kNnz, 0.0f);
+        void* d_cval = dbl ? (void*)up(zd) : (void*)up(zf);
+        const cudaDataType t = dbl ? CUDA_R_64F : CUDA_R_32F;
+        const cusparseAction_t act = numeric ? CUSPARSE_ACTION_NUMERIC : CUSPARSE_ACTION_SYMBOLIC;
+        const cusparseIndexBase_t ib = base ? CUSPARSE_INDEX_BASE_ONE : CUSPARSE_INDEX_BASE_ZERO;
+        size_t bytes = 0;
+        CS(cusparseCsr2cscEx2_bufferSize(h, kRows, kCols, kNnz, d_val, d_off, d_col, d_cval, d_cptr,
+                                         d_rind, t, act, ib, CUSPARSE_CSR2CSC_ALG1, &bytes));
+        void* buf = nullptr;
+        cudaMalloc(&buf, bytes ? bytes : 1);
+        CS(cusparseCsr2cscEx2(h, kRows, kCols, kNnz, d_val, d_off, d_col, d_cval, d_cptr, d_rind, t,
+                              act, ib, CUSPARSE_CSR2CSC_ALG1, buf));
+        cudaDeviceSynchronize();
+        cudaMemcpy(cptr.data(), d_cptr, cptr.size() * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(rind.data(), d_rind, rind.size() * sizeof(int), cudaMemcpyDeviceToHost);
+        printf("csr2csc base%d %s %s colptr", base, dbl ? "f64" : "f32", numeric ? "numeric" : "symbolic");
+        for (int v : cptr) printf(" %d", v);
+        printf("\n  rowind");
+        for (int v : rind) printf(" %d", v);
+        printf("\n");
+        if (numeric) {
+          printf("  values");
+          if (dbl) {
+            cudaMemcpy(zd.data(), d_cval, zd.size() * sizeof(double), cudaMemcpyDeviceToHost);
+            for (double v : zd) printf(" %.4f", v);
+          } else {
+            cudaMemcpy(zf.data(), d_cval, zf.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            for (float v : zf) printf(" %.4f", v);
+          }
+          printf("\n");
+        }
+        cudaFree(buf); cudaFree(d_off); cudaFree(d_col); cudaFree(d_val);
+        cudaFree(d_cptr); cudaFree(d_rind); cudaFree(d_cval);
+      }
+    }
   }
 
   int major = 0;

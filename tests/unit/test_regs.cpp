@@ -357,7 +357,8 @@ VTEST(every_nvidia_card_reports_its_architecture_in_bar0) {
                         Want{"nvidia/gh200-480gb", 0x18},
                         Want{"nvidia/l4", 0x19},            // AD100: Ada
                         Want{"nvidia/l40s", 0x19},
-                        Want{"nvidia/b200", 0x1a}}) {       // GB100: Blackwell
+                        Want{"nvidia/b200", 0x1a},          // GB100: Blackwell
+                        Want{"nvidia/rtx5090", 0x1b}}) {    // GB200: the GB20x dies
     regs::RegisterSpace bar0(regs::Space::AmdMmio, device(w.gpu));
     const uint32_t v = bar0.read(0x0, 4);
     if (((v >> 24) & 0x1F) != w.architecture)

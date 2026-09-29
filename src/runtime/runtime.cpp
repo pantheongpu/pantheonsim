@@ -17,6 +17,10 @@
 
 #include "vgpu/ptx/parser.hpp"
 
+#include <map>
+#include <set>
+#include <unordered_map>
+
 namespace vgpu::runtime {
 
 namespace {
@@ -32,11 +36,188 @@ int target_arch(const std::string& target) {
   return v;
 }
 
+// ---- lazy modules -------------------------------------------------------------
+//
+// A module's PTX is parsed into instructions only as far as a launch needs.
+// PyTorch's libtorch_cuda has fatbins whose PTX is 20-30 MB, a thousand
+// kernels each; parsing one whole to launch a single kernel cost up to 1.4 GB.
+// So a large module is split into its top-level pieces first -- cheaply, by
+// scanning braces, parentheses, comments and strings -- and each kernel is
+// parsed, with the device functions it can reach, the first time it is
+// looked up. The module's declarations (globals, .shared, prototypes) are
+// parsed once, so its globals exist once, whichever kernels run.
+constexpr size_t kLazyModuleBytes = 2u << 20;   // below this, parse whole
+
+struct Piece {
+  enum Kind { Header, Decl, Entry, Func } kind;
+  size_t begin, end;   // [begin, end) in the text
+  std::string name;    // for Entry and Func
+};
+
+bool ident_char(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$' || c == '%'; }
+
+// Splits PTX into its top-level pieces; false where the text holds something
+// this scanner does not recognise, and the module is then parsed whole.
+bool split_pieces(const std::string& t, std::vector<Piece>* out) {
+  const size_t n = t.size();
+  size_t i = 0;
+  auto skip_space = [&]() {
+    for (;;) {
+      while (i < n && std::isspace(static_cast<unsigned char>(t[i]))) ++i;
+      if (i + 1 < n && t[i] == '/' && t[i + 1] == '/') {
+        while (i < n && t[i] != '\n') ++i;
+      } else if (i + 1 < n && t[i] == '/' && t[i + 1] == '*') {
+        const size_t e = t.find("*/", i + 2);
+        i = e == std::string::npos ? n : e + 2;
+      } else {
+        return;
+      }
+    }
+  };
+  // Moves i past the end of a string literal starting at i.
+  auto skip_string = [&]() {
+    ++i;
+    while (i < n && t[i] != '"') i += t[i] == '\\' ? 2 : 1;
+    ++i;
+  };
+  auto word_at = [&](size_t at) {
+    size_t e = at;
+    while (e < n && (ident_char(t[e]) || t[e] == '.')) ++e;
+    return t.substr(at, e - at);
+  };
+  for (;;) {
+    skip_space();
+    if (i >= n) return true;
+    const size_t begin = i;
+    const std::string first = word_at(i);
+    if (first.empty()) return false;
+    if (first == ".version" || first == ".target" || first == ".address_size" || first == ".file") {
+      while (i < n && t[i] != '\n') {
+        if (t[i] == '"') skip_string(); else ++i;
+      }
+      out->push_back({Piece::Header, begin, i, {}});
+      continue;
+    }
+    // Scan to the end of this item: a ';' at depth zero, or the '}' closing a
+    // body opened at depth zero. Note whether it is a function, and its name.
+    bool is_entry = false, is_func = false;
+    std::string name;
+    int braces = 0, parens = 0;
+    bool body = false;
+    while (i < n) {
+      const char c = t[i];
+      if (c == '"') { skip_string(); continue; }
+      if (c == '/' && i + 1 < n && (t[i + 1] == '/' || t[i + 1] == '*')) { skip_space(); continue; }
+      if (braces == 0 && parens == 0 && c == '.' && !is_entry && !is_func) {
+        const std::string w = word_at(i);
+        if (w == ".entry" || w == ".func") {
+          (w == ".entry" ? is_entry : is_func) = true;
+          i += w.size();
+          skip_space();
+          if (i < n && t[i] == '(') {  // a .func's return parameters
+            int d = 0;
+            do {
+              if (t[i] == '(') ++d;
+              else if (t[i] == ')') --d;
+              ++i;
+            } while (i < n && d > 0);
+            skip_space();
+          }
+          size_t e = i;
+          while (e < n && ident_char(t[e])) ++e;
+          name = t.substr(i, e - i);
+          if (name.empty()) return false;
+          i = e;
+          continue;
+        }
+        i += w.size() ? w.size() : 1;
+        continue;
+      }
+      if (c == '(') ++parens;
+      else if (c == ')') --parens;
+      else if (c == '{') {
+        if (braces == 0 && parens == 0 && (is_entry || is_func)) body = true;
+        ++braces;
+      } else if (c == '}') {
+        if (--braces < 0) return false;
+        if (braces == 0 && body) { ++i; break; }
+      } else if (c == ';' && braces == 0 && parens == 0) {
+        ++i;
+        break;
+      }
+      ++i;
+    }
+    if (braces != 0) return false;
+    const Piece::Kind kind = body ? (is_entry ? Piece::Entry : Piece::Func) : Piece::Decl;
+    out->push_back({kind, begin, i, body ? name : std::string()});
+  }
+}
+
+}  // namespace
+
+struct Device::LazyModule {
+  std::string text;
+  std::vector<Piece> pieces;
+  std::string decls;                                    // header and declarations, in order
+  std::vector<std::string> func_order, entry_order;     // definitions, in the module's order
+  std::unordered_map<std::string, size_t> func_piece, entry_piece;   // name -> index into pieces
+  std::vector<std::string> global_func_refs;            // functions global initialisers name
+  std::map<std::string, std::shared_ptr<ptx::Module>> parsed;   // kernel -> the module it was parsed in
+  std::recursive_mutex mu;   // recursive: parsing a kernel parses the kernels it launches
+};
+
+namespace {
+
+// The identifiers a piece of PTX names that are device functions of the
+// module: what it calls, or takes the address of.
+void functions_named(const std::string& text, size_t b, size_t e,
+                     const std::unordered_map<std::string, size_t>& funcs, std::vector<std::string>* out) {
+  size_t i = b;
+  while (i < e) {
+    if (!(std::isalpha(static_cast<unsigned char>(text[i])) || text[i] == '_' || text[i] == '$')) { ++i; continue; }
+    const size_t s = i;
+    while (i < e && ident_char(text[i])) ++i;
+    if (s > b && (text[s - 1] == '.' || text[s - 1] == '%')) continue;  // a directive or register
+    const std::string w = text.substr(s, i - s);
+    if (funcs.count(w)) out->push_back(w);
+  }
+}
+
 }  // namespace
 
 uint64_t Device::load_module(const std::string& ptx_src) {
   try {
-    auto mod = std::make_shared<ptx::Module>(ptx::parse(ptx_src));
+    std::shared_ptr<LazyModule> lazy;
+    std::vector<Piece> pieces;
+    // VGPU_LAZY_MODULE_BYTES moves the threshold (0 makes every module lazy,
+    // which is how the test suite exercises this path); VGPU_PARSE_WHOLE=1
+    // turns it off.
+    const char* lazy_env = std::getenv("VGPU_LAZY_MODULE_BYTES");
+    const size_t lazy_bytes = lazy_env ? std::strtoull(lazy_env, nullptr, 10) : kLazyModuleBytes;
+    if (ptx_src.size() >= lazy_bytes && std::getenv("VGPU_PARSE_WHOLE") == nullptr &&
+        split_pieces(ptx_src, &pieces)) {
+      lazy = std::make_shared<LazyModule>();
+      lazy->pieces = std::move(pieces);
+      for (size_t i = 0; i < lazy->pieces.size(); ++i) {
+        const Piece& pc = lazy->pieces[i];
+        if (pc.kind == Piece::Func) {
+          lazy->func_piece.emplace(pc.name, i);
+          lazy->func_order.push_back(pc.name);
+        } else if (pc.kind == Piece::Entry) {
+          lazy->entry_piece.emplace(pc.name, i);
+          lazy->entry_order.push_back(pc.name);
+        } else {
+          lazy->decls.append(ptx_src, pc.begin, pc.end - pc.begin).push_back('\n');
+        }
+      }
+    }
+    auto mod = std::make_shared<ptx::Module>(ptx::parse(lazy ? lazy->decls : ptx_src));
+    if (lazy) {
+      lazy->text = ptx_src;
+      for (const auto& g : mod->globals)
+        for (const auto& si : g.init_symbols)
+          if (lazy->func_piece.count(si.name)) lazy->global_func_refs.push_back(si.name);
+    }
     // PTX is forward compatible but not backward: a module built for a newer
     // architecture than the device is rejected by the real driver with
     // CUDA_ERROR_INVALID_PTX, and a simulator that loaded it anyway would let
@@ -78,6 +259,9 @@ uint64_t Device::load_module(const std::string& ptx_src) {
     // an indirect call decodes to find the function again.
     for (size_t i = 0; i < mod->funcs.size(); ++i)
       lm.symbols[mod->funcs[i]->name] = kFuncVaBase + i * kFuncVaStride;
+    if (lazy)  // the same addresses, from the definitions' order in the text
+      for (size_t i = 0; i < lazy->func_order.size(); ++i)
+        lm.symbols[lazy->func_order[i]] = kFuncVaBase + i * kFuncVaStride;
     // Kernels too, which is what a device-side launch names its child by.
     // Addresses are never reused, so a stale one cannot name another kernel.
     for (const auto& e : mod->entries) {
@@ -86,6 +270,13 @@ uint64_t Device::load_module(const std::string& ptx_src) {
       lm.symbols[e.name] = va;
       lm.kernels.emplace_back(va, &e);
     }
+    if (lazy)
+      for (const std::string& name : lazy->entry_order) {
+        const uint64_t va = next_kernel_va_;
+        next_kernel_va_ += kKernelVaStride;
+        lm.symbols[name] = va;
+        lm.kernels.emplace_back(va, nullptr);
+      }
     // Second pass: a global initialised with another symbol's address can only
     // be filled in once every global has one. A kernel's address is its
     // entry in the kernel window; PTX that only uses it to carry a mangled
@@ -103,6 +294,7 @@ uint64_t Device::load_module(const std::string& ptx_src) {
       }
     }
     lm.mod = std::move(mod);
+    lm.lazy = std::move(lazy);
     uint64_t id = lm.id;
     modules_.push_back(std::move(lm));
     return id;
@@ -148,8 +340,9 @@ int Device::module_arch(uint64_t module_id) const {
 }
 
 const ptx::EntryFn* Device::get_function(uint64_t module_id, const std::string& name) const {
-  for (const auto& lm : modules_) {
+  for (auto& lm : modules_) {
     if (lm.id != module_id) continue;
+    if (lm.lazy) return lazy_function(lm, name);
     const ptx::EntryFn* fn = lm.mod->find_entry(name);
     if (!fn) {
       std::string names;
@@ -159,6 +352,67 @@ const ptx::EntryFn* Device::get_function(uint64_t module_id, const std::string& 
     return fn;
   }
   throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
+}
+
+// A lazy module's kernel, parsed the first time it is asked for: the
+// module's declarations, the device functions it can reach, and the kernel.
+const ptx::EntryFn* Device::lazy_function(LoadedModule& lm, const std::string& name) const {
+  LazyModule& lz = *lm.lazy;
+  std::lock_guard<std::recursive_mutex> lock(lz.mu);
+  if (auto it = lz.parsed.find(name); it != lz.parsed.end()) return &it->second->entries.front();
+  auto ep = lz.entry_piece.find(name);
+  if (ep == lz.entry_piece.end()) {
+    std::string names;
+    for (const auto& e : lz.entry_order) names += "\n  " + e;
+    throw Error::make(Err::NotFound, "no kernel named '", name, "' in module. Kernels present:", names);
+  }
+  // The functions reachable from the kernel, and any a global's initialiser
+  // names (a table of function pointers).
+  std::set<size_t> want;
+  std::vector<std::string> todo = lz.global_func_refs;
+  const Piece& entry = lz.pieces[ep->second];
+  functions_named(lz.text, entry.begin, entry.end, lz.func_piece, &todo);
+  while (!todo.empty()) {
+    const std::string f = std::move(todo.back());
+    todo.pop_back();
+    const size_t at = lz.func_piece.at(f);
+    if (!want.insert(at).second) continue;
+    functions_named(lz.text, lz.pieces[at].begin, lz.pieces[at].end, lz.func_piece, &todo);
+  }
+  std::string src = lz.decls;
+  for (size_t at : want)   // in the module's order, as the whole module has them
+    src.append(lz.text, lz.pieces[at].begin, lz.pieces[at].end - lz.pieces[at].begin).push_back('\n');
+  src.append(lz.text, entry.begin, entry.end - entry.begin).push_back('\n');
+  std::shared_ptr<ptx::Module> part;
+  try {
+    part = std::make_shared<ptx::Module>(ptx::parse(src));
+  } catch (const Error& e) {
+    if (e.code() == Err::UnsupportedPtx)
+      throw Error::make(e.code(), e.message(), "\n  GPU profile: ", profile_.id);
+    throw;
+  }
+  if (part->entries.size() != 1) throw Error::make(Err::Internal, "kernel '", name, "' parsed to ", part->entries.size(), " entries");
+  // Function pointers are indexes into the whole module's functions (see
+  // load_module), so the kernel's table is laid out that way too; a function
+  // it cannot reach stays empty, and a call through it says so.
+  ptx::EntryFn& fn = part->entries.front();
+  std::unordered_map<std::string, std::shared_ptr<const ptx::EntryFn>> by_name;
+  for (const auto& f : part->funcs) by_name[f->name] = f;
+  fn.module_funcs.assign(lz.func_order.size(), nullptr);
+  for (size_t i = 0; i < lz.func_order.size(); ++i)
+    if (auto it = by_name.find(lz.func_order[i]); it != by_name.end()) fn.module_funcs[i] = it->second;
+  fn.module_entry_names = lz.entry_order;
+  for (auto& [va, k] : lm.kernels)
+    if (!k && va == lm.symbols.at(name)) k = &fn;
+  lz.parsed.emplace(name, part);
+  // The kernels this one launches from the device (dynamic parallelism) have
+  // to be in the launch's kernel table, so they are parsed now too.
+  std::vector<std::string> children;
+  functions_named(lz.text, entry.begin, entry.end, lz.entry_piece, &children);
+  for (size_t at : want) functions_named(lz.text, lz.pieces[at].begin, lz.pieces[at].end, lz.entry_piece, &children);
+  for (const std::string& child : children)
+    if (!lz.parsed.count(child)) lazy_function(lm, child);
+  return &fn;
 }
 
 const exec::SymbolTable* Device::symbols(uint64_t module_id) const {
@@ -563,7 +817,8 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   exec::KernelTable kernels;
   if (!cfg.kernels) {
     for (const auto& lm : modules_)
-      for (const auto& [va, fn] : lm.kernels) kernels[va] = exec::KernelRef{fn, &lm.symbols};
+      for (const auto& [va, fn] : lm.kernels)
+        if (fn) kernels[va] = exec::KernelRef{fn, &lm.symbols};
     cfg.kernels = &kernels;
   }
   if (fault_) {

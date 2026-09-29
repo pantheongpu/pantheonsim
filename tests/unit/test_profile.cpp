@@ -18,7 +18,7 @@ VTEST(registry_lists_all_gpus) {
   auto ids = vgpu::available_gpus();
   const std::vector<std::string> expected = {
       "nvidia/a10",   "nvidia/a100", "nvidia/h100",   "nvidia/h200",
-      "nvidia/b200",  "nvidia/rtx3060", "nvidia/rtx3080ti", "nvidia/a100-sxm4-40gb",
+      "nvidia/b200",  "nvidia/rtx5090", "nvidia/rtx3060", "nvidia/rtx3080ti", "nvidia/a100-sxm4-40gb",
       "nvidia/gh200-480gb", "nvidia/h100-pcie", "nvidia/t4", "nvidia/a10g",
       "nvidia/l4", "nvidia/l40s",
       "amd/mi250x", "amd/mi300x", "amd/mi325x", "amd/mi350x", "amd/rx7900xtx", "amd/rx9070xt",
@@ -57,6 +57,24 @@ VTEST(all_builtin_profiles_parse) {
       VCHECK(p.cc_major > 0);
     }
   }
+}
+
+// Every AMD profile carries the limits HIP reports and works occupancy out
+// from: a profile without them made hipDeviceProp's regsPerBlock 0, and
+// occupancy 0 work-groups for any kernel with LDS (the MI325X's did).
+VTEST(every_amd_profile_has_hips_limits) {
+  int amd = 0;
+  for (const auto& id : vgpu::available_gpus()) {
+    const DeviceProfile p = vgpu::load_gpu(id);
+    if (p.vendor != "amd") continue;
+    ++amd;
+    const auto& l = p.limits;
+    VCHECK(l.registers_per_block > 0 && l.registers_per_sm > 0 && l.max_blocks_per_sm > 0);
+    VCHECK(l.shared_mem_per_sm >= l.shared_mem_per_block && l.shared_mem_per_block > 0);
+    VCHECK(l.multiprocessors > 0 && l.max_threads_per_sm > 0);
+    for (int d = 0; d < 3; ++d) VCHECK(l.max_grid_dim[d] > 0);
+  }
+  VCHECK(amd >= 6);
 }
 
 VTEST(h100_profile_values) {

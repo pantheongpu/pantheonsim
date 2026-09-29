@@ -1,6 +1,7 @@
 // Tests for the arithmetic/conversion ops added to run real pantheon kernels:
 // neg, prmt.b32 (byte permute), and the full cvt family (int<->float, rounding).
 #include <cstring>
+#include <functional>
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
@@ -622,7 +623,7 @@ VTEST(sparse_mma_and_cvt_pack_refuse_what_they_do_not_implement) {
   VCHECK_CONTAINS(parse_one("mma.sync.aligned.m16n8k32.row.col.kind::f8f6f4.f32.e2m1.e2m1.f32 "
                             "{%f0,%f1,%f2,%f3}, {%r4,%r5,%r6,%r7}, {%r8,%r9}, "
                             "{%f4,%f5,%f6,%f7};").message(),
-                  "kind::f8f6f4");
+                  "requires an sm_120a");
   VCHECK_CONTAINS(parse_one("mma.sp::ordered_metadata.sync.aligned.m16n8k64.row.col.s32.s8.s8.s32 "
                             "{%r0,%r1,%r2,%r3}, {%r4,%r5,%r6,%r7}, {%r8,%r9,%r10,%r11}, "
                             "{%r12,%r13,%r14,%r15}, %r16, 0x1;").message(),
@@ -2597,6 +2598,44 @@ VTEST(smid_is_within_the_devices_multiprocessor_count) {
   }
 }
 
+// A grid larger than the device reuses SMs as blocks finish; the blocks
+// resident at once -- a cluster's, at least -- still have distinct %smid
+// values, since kernels index per-SM workspace by it.
+VTEST(smid_is_distinct_within_a_cluster_of_a_grid_larger_than_the_device) {
+  std::string ptx = std::string(kHeader90) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %smid;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  const uint32_t sms = e.prof.limits.multiprocessors, n = 4 * sms;
+  const uint64_t out = e.mem.alloc(n * 4);
+  LaunchConfig cfg;
+  cfg.grid = {n, 1, 1};
+  cfg.block = {32, 1, 1};
+  cfg.cluster = {4, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  std::vector<uint32_t> smid(n);
+  e.mem.read(out, smid.data(), n * 4);
+  for (uint32_t c = 0; c < n / 4; ++c)
+    for (uint32_t i = 0; i < 4; ++i) {
+      VCHECK(smid[4 * c + i] < sms);
+      for (uint32_t j = 0; j < i; ++j) VCHECK(smid[4 * c + i] != smid[4 * c + j]);
+    }
+}
+
 VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   // %dynamic_smem_size is the launch's dynamic bytes; %total_smem_size adds the
   // module's static declarations. Both are known exactly, so there is no reason
@@ -2871,6 +2910,50 @@ VTEST(bfind_elect_and_isspacep) {
   VCHECK_EQ(e.mem.load_scalar(out + 28, 4), uint64_t{1});          // the buffer is global
 }
 
+// Without .noinc, cp.async.mbarrier.arrive adds one to the pending count
+// before its arrive-on -- a net zero for the phase -- so a barrier of one
+// completes only on a real arrival; with .noinc the arrive-on counts
+// (9.7.15.16.18).
+VTEST(cp_async_mbarrier_arrive_counts_only_with_noinc) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<4>;
+    .shared .align 8 .b8 bar[16];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u64 %rd5, bar;
+    add.u64 %rd6, %rd5, 8;
+    mov.u32 %r1, 1;
+    mbarrier.init.shared.b64 [%rd5], %r1;
+    mbarrier.init.shared.b64 [%rd6], %r1;
+    cp.async.mbarrier.arrive.shared.b64 [%rd5];
+    mbarrier.test_wait.parity.shared.b64 %p1, [%rd5], 0;
+    selp.u32 %r2, 1, 0, %p1;
+    mbarrier.arrive.shared.b64 %rd7, [%rd5];
+    mbarrier.test_wait.parity.shared.b64 %p2, [%rd5], 0;
+    selp.u32 %r3, 1, 0, %p2;
+    cp.async.mbarrier.arrive.noinc.shared.b64 [%rd6];
+    mbarrier.test_wait.parity.shared.b64 %p3, [%rd6], 0;
+    selp.u32 %r4, 1, 0, %p3;
+    st.global.u32 [%rd2], %r2;
+    st.global.u32 [%rd2+4], %r3;
+    st.global.u32 [%rd2+8], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16);
+  LaunchConfig cfg;
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0});       // no .noinc: not complete
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{1});   // after a real arrival
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{1});   // .noinc: complete
+}
+
 VTEST(cp_async_mbarrier_arrive_lands_the_copy_before_the_arrival) {
   // The ordering an Ampere pipeline depends on. Warp 0 issues a cp.async into
   // shared memory and signals the barrier with cp.async.mbarrier.arrive; every
@@ -2902,7 +2985,7 @@ INITDONE:
     bar.sync 0;
     @%p0 bra ARRIVE;
     cp.async.ca.shared.global [%rd6], [%rd2], 4;
-    cp.async.mbarrier.arrive.shared.b64 [%rd5];
+    cp.async.mbarrier.arrive.noinc.shared.b64 [%rd5];
     bra WAIT;
 ARRIVE:
     mbarrier.arrive.shared.b64 %rd7, [%rd5];
@@ -4030,6 +4113,196 @@ VTEST(alloca_overflow_freed_memory_and_bad_restores_are_reported) {
   VCHECK_CONTAINS(err.message(), "power of two");
 }
 
+// suld/sust's .clamp and .zero out-of-range policies (9.7.13.1-2), against
+// what an RTX 3060 (sm_86, driver 596.36) returned for the same accesses on
+// the same surfaces. The expected values are the card's output, copied.
+namespace {
+struct SurfCase {
+  int x, y, z, layer;
+};
+// One suld (or sust) per thread at its coordinates, on surface 9. `access`
+// is the instruction up to its operands, e.g. "suld.b.2d.b32.clamp"; loads
+// write their first component to out[thread].
+std::vector<uint32_t> surf_run(const std::string& access, const TextureDesc& d, const std::vector<SurfCase>& cs,
+                               Env& e, uint64_t data) {
+  const bool load = access.rfind("suld", 0) == 0;
+  const bool layered = access.find(".a1d") != std::string::npos || access.find(".a2d") != std::string::npos;
+  const bool v4 = access.find(".v4") != std::string::npos;
+  const int dims = access.find(".3d") != std::string::npos ? 3 : access.find("2d") != std::string::npos ? 2 : 1;
+  std::string coords = layered ? "%r13, %r10" : "%r10";
+  if (dims >= 2) coords += ", %r11";
+  if (dims == 3 || (layered && dims == 2)) coords += ", %r12, %r12";
+  const std::string regs = v4 ? "{%r20, %r21, %r22, %r23}" : "{%r20}";
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 s, .param .u64 c, .param .u64 out)
+{
+    .reg .b32 %r<30>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [s];
+    ld.param.u64 %rd2, [c];
+    ld.param.u64 %rd3, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd4, %r1, 16;
+    add.u64 %rd5, %rd2, %rd4;
+    ld.global.v4.u32 {%r10, %r11, %r12, %r13}, [%rd5];
+    mov.u32 %r20, 0xABCD0000;
+    add.u32 %r20, %r20, %r1;
+    mov.u32 %r21, 0xA1;
+    mov.u32 %r22, 0xA2;
+    mov.u32 %r23, 0xA3;
+)" + (load ? "    " + access + " " + regs + ", [%rd1, {" + coords + "}];\n"
+           : "    " + access + " [%rd1, {" + coords + "}], " + regs + ";\n") + R"(
+    mul.wide.u32 %rd4, %r1, 4;
+    add.u64 %rd6, %rd3, %rd4;
+    st.global.u32 [%rd6], %r20;
+    ret;
+}
+)";
+  auto m = ptx::parse(ptx);
+  std::vector<int32_t> c;
+  for (const SurfCase& k : cs) c.insert(c.end(), {k.x, k.y, k.z, k.layer});
+  const uint64_t pc = e.mem.alloc(c.size() * 4), out = e.mem.alloc(cs.size() * 4);
+  e.mem.write(pc, c.data(), c.size() * 4);
+  TextureTable tex;
+  tex[9] = d;
+  tex[9].base = data;
+  tex[9].object = TexKind::Surface;
+  LaunchConfig cfg;
+  cfg.block = {static_cast<uint32_t>(cs.size()), 1, 1};
+  cfg.textures = &tex;
+  exec::launch(m.entries[0], cfg, {arg_u64(9), arg_u64(pc), arg_u64(out)}, e.mem, e.prof);
+  std::vector<uint32_t> got(cs.size());
+  e.mem.read(out, got.data(), got.size() * 4);
+  return got;
+}
+TextureDesc surf_desc(uint32_t w, uint32_t h, uint32_t depth = 0, uint32_t layers = 0) {
+  TextureDesc d;
+  d.width = w;
+  d.height = h;
+  d.depth = depth;
+  d.layers = layers;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  return d;
+}
+std::string hex_list(const std::vector<uint32_t>& v) {
+  std::string s;
+  char b[12];
+  for (uint32_t x : v) {
+    std::snprintf(b, sizeof b, "%x ", x);
+    s += b;
+  }
+  return s;
+}
+}  // namespace
+
+// 2D, 8 x 4 u32 texels holding 0x1000 * y + x (32 bytes a row).
+VTEST(surface_clamp_and_zero_2d_as_an_rtx_3060_reads_them) {
+  Env e;
+  const uint64_t data = e.mem.alloc(128);
+  for (uint32_t i = 0; i < 32; ++i) e.mem.store_scalar(data + 4 * i, 4, 0x1000u * (i / 8) + i % 8);
+  const TextureDesc d = surf_desc(8, 4);
+  const int xs[] = {-8, -4, 0, 4, 28, 32, 36, 64, 1000}, ys[] = {-2, -1, 0, 3, 4, 9};
+  std::vector<SurfCase> cs;
+  for (int y : ys)
+    for (int x : xs) cs.push_back({x, y, 0, 0});
+  // The card's output, row by row (y = -2, -1, 0, 3, 4, 9).
+  const std::vector<uint32_t> clamp = {
+      0, 0, 0, 1, 7, 7, 7, 7, 7,  0, 0, 0, 1, 7, 7, 7, 7, 7,  0, 0, 0, 1, 7, 7, 7, 7, 7,
+      0x3000, 0x3000, 0x3000, 0x3001, 0x3007, 0x3007, 0x3007, 0x3007, 0x3007,
+      0x3000, 0x3000, 0x3000, 0x3001, 0x3007, 0x3007, 0x3007, 0x3007, 0x3007,
+      0x3000, 0x3000, 0x3000, 0x3001, 0x3007, 0x3007, 0x3007, 0x3007, 0x3007};
+  const std::vector<uint32_t> zero = {
+      0, 0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 1, 7, 0, 0, 0, 0,
+      0, 0, 0x3000, 0x3001, 0x3007, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0, 0};
+  VCHECK_EQ(hex_list(surf_run("suld.b.2d.b32.clamp", d, cs, e, data)), hex_list(clamp));
+  VCHECK_EQ(hex_list(surf_run("suld.b.2d.b32.zero", d, cs, e, data)), hex_list(zero));
+  // 8-bit loads clamp by the byte, not the texel: x = 32 reads byte 31.
+  std::vector<SurfCase> c8;
+  for (int x : {-3, -1, 0, 1, 29, 30, 31, 32, 33, 35, 100}) c8.push_back({x, 1, 0, 0});
+  std::vector<uint32_t> b8 = surf_run("suld.b.2d.b8.clamp", d, c8, e, data);
+  for (uint32_t& v : b8) v &= 0xFF;
+  VCHECK_EQ(hex_list(b8), hex_list({0, 0, 0, 0x10, 0x10, 0, 0, 0, 0, 0, 0}));
+}
+
+// Stores land where a load would read (.clamp) or not at all (.zero).
+VTEST(surface_clamp_and_zero_stores_as_an_rtx_3060_makes_them) {
+  const SurfCase cs[] = {{-4, 1, 0, 0}, {-8, 1, 0, 0}, {32, 1, 0, 0}, {28, 1, 0, 0},
+                         {36, 1, 0, 0}, {100, 1, 0, 0}, {8, -1, 0, 0}, {8, 7, 0, 0}};
+  // The texel each store changed on the card, as (x, y); (-1, -1) for none.
+  const int clamp_at[][2] = {{0, 1}, {0, 1}, {7, 1}, {7, 1}, {7, 1}, {7, 1}, {2, 0}, {2, 3}};
+  const int zero_at[][2] = {{-1, -1}, {-1, -1}, {-1, -1}, {7, 1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}};
+  for (int policy = 0; policy < 2; ++policy)
+    for (int k = 0; k < 8; ++k) {
+      Env e;
+      const uint64_t data = e.mem.alloc(128);
+      for (uint32_t i = 0; i < 32; ++i) e.mem.store_scalar(data + 4 * i, 4, 0x1000u * (i / 8) + i % 8);
+      surf_run(policy ? "sust.b.2d.b32.zero" : "sust.b.2d.b32.clamp", surf_desc(8, 4), {cs[k]}, e, data);
+      const int* at = policy ? zero_at[k] : clamp_at[k];
+      for (uint32_t i = 0; i < 32; ++i) {
+        const bool here = int(i % 8) == at[0] && int(i / 8) == at[1];
+        VCHECK_EQ(e.mem.load_scalar(data + 4 * i, 4), here ? uint64_t{0xABCD0000u} : uint64_t{0x1000u * (i / 8) + i % 8});
+      }
+    }
+}
+
+// A 16-byte .v4 on a 24-byte 1D row: .clamp reads and writes at byte 0 (the
+// last aligned place it fits), and .zero treats the whole access as out of
+// range when part of it is. Then 3D and layered 2D, per coordinate.
+VTEST(surface_clamp_and_zero_vectors_3d_and_layers_as_an_rtx_3060_does) {
+  {
+    Env e;
+    const uint64_t data = e.mem.alloc(64);
+    for (uint32_t i = 0; i < 6; ++i) e.mem.store_scalar(data + 4 * i, 4, i);
+    const TextureDesc d = surf_desc(6, 0);
+    std::vector<SurfCase> cs;
+    for (int x : {-16, 0, 16, 32, 48}) cs.push_back({x, 0, 0, 0});
+    VCHECK_EQ(hex_list(surf_run("suld.b.1d.v4.b32.clamp", d, cs, e, data)), hex_list({0, 0, 0, 0, 0}));
+    VCHECK_EQ(hex_list(surf_run("suld.b.1d.v4.b32.zero", d, cs, e, data)), hex_list({0, 0, 0, 0, 0}));
+    // The first component alone does not show .zero's whole-access rule
+    // (texel 0 is 0), so the store side does: at x = 16 nothing is written.
+    surf_run("sust.b.1d.v4.b32.zero", d, {{16, 0, 0, 0}}, e, data);
+    for (uint32_t i = 0; i < 6; ++i) VCHECK_EQ(e.mem.load_scalar(data + 4 * i, 4), uint64_t{i});
+    surf_run("sust.b.1d.v4.b32.clamp", d, {{16, 0, 0, 0}}, e, data);
+    const uint32_t after[] = {0xABCD0000u, 0xA1, 0xA2, 0xA3, 4, 5};
+    for (uint32_t i = 0; i < 6; ++i) VCHECK_EQ(e.mem.load_scalar(data + 4 * i, 4), uint64_t{after[i]});
+  }
+  {
+    Env e;   // 3D, 4 x 2 x 3, 0x100 z + 0x10 y + x
+    const uint64_t data = e.mem.alloc(128);
+    for (uint32_t z = 0; z < 3; ++z)
+      for (uint32_t y = 0; y < 2; ++y)
+        for (uint32_t x = 0; x < 4; ++x) e.mem.store_scalar(data + 4 * ((z * 2 + y) * 4 + x), 4, 0x100 * z + 0x10 * y + x);
+    const std::vector<SurfCase> cs = {{4, 1, 1, 0}, {16, 1, 1, 0}, {4, 5, 1, 0}, {4, 1, 3, 0}, {4, 1, -1, 0}, {-4, -1, 7, 0}};
+    VCHECK_EQ(hex_list(surf_run("suld.b.3d.b32.clamp", surf_desc(4, 2, 3), cs, e, data)),
+              hex_list({0x111, 0x113, 0x111, 0x211, 0x11, 0x200}));
+    VCHECK_EQ(hex_list(surf_run("suld.b.3d.b32.zero", surf_desc(4, 2, 3), cs, e, data)),
+              hex_list({0x111, 0, 0, 0, 0, 0}));
+  }
+  {
+    Env e;   // layered 2D, 4 x 2, 3 layers, 0x100 layer + 0x10 y + x; -1 is layer 0xFFFFFFFF
+    const uint64_t data = e.mem.alloc(128);
+    for (uint32_t l = 0; l < 3; ++l)
+      for (uint32_t y = 0; y < 2; ++y)
+        for (uint32_t x = 0; x < 4; ++x) e.mem.store_scalar(data + 4 * ((l * 2 + y) * 4 + x), 4, 0x100 * l + 0x10 * y + x);
+    const std::vector<SurfCase> cs = {{4, 1, 0, 1}, {4, 1, 0, 3}, {4, 1, 0, 5}, {4, 1, 0, -1}, {16, 3, 0, 2}};
+    VCHECK_EQ(hex_list(surf_run("suld.b.a2d.b32.clamp", surf_desc(4, 2, 0, 3), cs, e, data)),
+              hex_list({0x111, 0x211, 0x211, 0x211, 0x213}));
+    VCHECK_EQ(hex_list(surf_run("suld.b.a2d.b32.zero", surf_desc(4, 2, 0, 3), cs, e, data)),
+              hex_list({0x111, 0, 0, 0, 0}));
+  }
+}
+
+// Misaligned x faults under every policy, as on the card.
+VTEST(surface_clamp_and_zero_fault_on_a_misaligned_x) {
+  Env e;
+  const uint64_t data = e.mem.alloc(128);
+  for (const char* a : {"suld.b.2d.b32.clamp", "suld.b.2d.b32.zero"}) {
+    auto err = VCAPTURE(Error, surf_run(a, surf_desc(8, 4), {{29, 1, 0, 0}}, e, data));
+    VCHECK(err.code() == Err::MisalignedAccess);
+  }
+}
+
 // Linear filtering against a table recorded on an RTX 3060 (sm_86) running the
 // same fetches on the same textures (the whole rule set is checked bit for bit
 // by e2e_texture_filtering; these are its corners, runnable without nvcc):
@@ -4926,6 +5199,89 @@ VTEST(one_warp_reusing_its_own_shared_words_is_not_a_race) {
   VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{12});
 }
 
+// ---- the video instructions, against an RTX 3060 ----
+
+// Each case: the instruction (a in %r1, b in %r2, c in %r3, d in %r4), the
+// operands, and what the card gave. The rules the ISA leaves open or states
+// otherwise -- the 34-bit shift intermediate, vabsdiff's unsigned saturation
+// wrapping, vmad taking whole 32-bit operands as signed -- each have a case;
+// nvidia/tests/e2e/video_forms.cu covers 652 variants.
+VTEST(video_instructions_as_the_card_computes_them) {
+  struct Case { const char* ins; uint32_t a, b, c, want; };
+  const Case cases[] = {
+      {"vshl.u32.u32.u32.sat.clamp %r4, %r1, %r2", 0x7fffffff, 31, 0, 0x00000000},
+      {"vshl.u32.u32.u32.sat.clamp %r4, %r1, %r2", 1, 32, 0, 0xffffffff},
+      {"vshl.s32.s32.u32.sat.clamp %r4, %r1, %r2", 0x7fffffff, 31, 0, 0x80000000},
+      {"vshl.s32.s32.u32.sat.clamp %r4, %r1, %r2", 1, 31, 0, 0x7fffffff},
+      {"vabsdiff.u32.s32.u32.sat %r4, %r1, %r2", 0xaa02f263, 0xb3280f47, 0, 0x09251ce4},
+      {"vabsdiff.u32.u32.u32 %r4, %r1, %r2, %r3", 5, 9, 100, 4},  // c is ignored
+      {"vadd.u32.u32.u32.sat %r4, %r1, %r2", 0xffffffff, 1, 0, 0},
+      {"vsub.s32.s32.s32.sat %r4, %r1, %r2", 0x80000000, 1, 0, 0x80000000},
+      {"vmin.s32.s32.s32.max %r4, %r1.b2, %r2, %r3", 0x00ff0000, 5, 0xfffffff0, 0xffffffff},
+      {"vadd.u32.u32.u32 %r4.h1, %r1, %r2, %r3", 0x00010002, 0x00030004, 0xaaaabbbb, 0x0004bbbb},
+      {"vadd.u32.u32.u32 %r4.b3, %r1, %r2, %r3", 0x12, 0x34, 0x11223344, 0x46223344},
+      {"vmad.u32.u32.u32.sat %r4, %r1, %r2, %r3", 1, 0xffffffff, 0x8000, 0x00007fff},
+      {"vmad.u32.u32.u32.sat %r4, %r1, %r2, %r3", 0x80000000, 0x7f, 0x1f, 0},
+      {"vmad.u32.u32.u32.sat %r4, %r1, %r2, %r3", 0xffffffff, 0x80000000, 0x80, 0x80000080},
+      {"vmad.u32.u32.u32.shr7 %r4, %r1.h0, %r2.h1, %r3", 0x7fffffff, 0x01ff807f, 0x80000000, 0xff03fdfc},
+      {"vmad.s32.u32.s32.sat %r4, %r1, %r2, %r3", 0x80000000, 0x7f, 0x1f, 0x80000000},
+      {"vmad.s32.u32.s32.sat %r4, %r1, %r2, %r3", 0xffffffff, 0x80000000, 0x80, 0x7fffffff},
+      {"vmad.u32.u32.u32.sat.shr15 %r4, %r1, %r2, %r3", 0, 0x7fff, 0xffffffff, 0xffffffff},
+      {"vmad.s32.s32.u32.sat %r4, %r1.h0, -%r2, %r3", 1, 0xffffffff, 0x8000, 0x00008001},
+      {"vmad.u32.u32.u32.po %r4, %r1.b1, %r2.b3, %r3", 0x0300, 0x05000000, 10, 0x1a},
+      {"vadd4.u32.u32.u32.sat %r4, %r1, %r2, %r3", 0xff017f80, 0x01ff0180, 0, 0xffff80ff},
+      {"vadd2.s32.s32.s32.add %r4, %r1, %r2, %r3", 0x00050003, 0xfffe0004, 100, 0x6e},
+      {"vabsdiff4.u32.u32.u32 %r4.b20, %r1.b7250, %r2.b0123, %r3", 0x04030201, 0x40302010, 0xaaaaaaaa,
+       0xaa01aa03},
+      {"vset4.u32.u32.lt %r4, %r1, %r2, %r3", 0x01020304, 0x02020202, 0, 0x01000000},
+      {"vset2.s32.s32.le.add %r4, %r1, %r2, %r3", 0xffff0005, 5, 7, 9},
+      {"vavrg4.s32.s32.s32 %r4, %r1, %r2, %r3", 0x7f80ff01, 0x7f800002, 0, 0x7f80ff02},
+  };
+  constexpr size_t n = sizeof cases / sizeof cases[0];
+  std::string body;
+  for (size_t i = 0; i < n; ++i) {
+    char line[256];
+    std::snprintf(line, sizeof line,
+                  "    mov.u32 %%r1, %u;\n    mov.u32 %%r2, %u;\n    mov.u32 %%r3, %u;\n    %s;\n"
+                  "    st.global.u32 [%%rd2+%zu], %%r4;\n",
+                  cases[i].a, cases[i].b, cases[i].c, cases[i].ins, 4 * i);
+    body += line;
+  }
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+)" + body + "    ret;\n}\n";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4 * n);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  for (size_t i = 0; i < n; ++i) {
+    const auto got = static_cast<uint32_t>(e.mem.load_scalar(out + 4 * i, 4));
+    if (got != cases[i].want)
+      std::fprintf(stderr, "  %s (a=%08x b=%08x c=%08x): %08x, the card gave %08x\n", cases[i].ins, cases[i].a,
+                   cases[i].b, cases[i].c, got, cases[i].want);
+    VCHECK_EQ(got, cases[i].want);
+  }
+}
+
+VTEST(video_instructions_refuse_forms_the_isa_does_not_have) {
+  // vmad takes a negation but the other scalar forms do not; .po excludes it.
+  for (const char* ins : {"vadd.u32.u32.u32 %r4, -%r1, %r2", "vmad.u32.u32.u32.po %r4, -%r1, %r2, %r3"}) {
+    std::string ptx = std::string(kHeader) + R"(
+.visible .entry k()
+{
+    .reg .b32 %r<5>;
+    )" + ins + ";\n    ret;\n}\n";
+    auto err = VCAPTURE(Error, ptx::parse(ptx));
+    VCHECK(err.code() == Err::UnsupportedPtx);
+    VCHECK_CONTAINS(err.what(), "with a negated operand");
+  }
+}
+
 // ---- extended-precision arithmetic (the condition-code carry bit) ----
 //
 // These are what a compiler emits when it synthesises arithmetic wider than the
@@ -5388,6 +5744,475 @@ VTEST(mma_f64_m16n8k_shapes_against_a_host_gemm) {
         VCHECK_EQ(bits(want), d[l * 4 + i]);
       }
   }
+}
+
+// ---- sm_120's mma kinds -------------------------------------------------------------
+
+namespace {
+// The OCP MX codes for the multiples of 1/2 in [-4, 4] used here.
+uint32_t mx_code(float f, int eb, int mb, int bias) {
+  if (f == 0.0f) return 0;
+  const uint32_t sign = f < 0 ? 1u << (eb + mb) : 0;
+  const float a = std::fabs(f);
+  int e = 0;
+  const float m = std::frexp(a, &e);
+  const int biased = e - 1 + bias;
+  if (biased <= 0) return sign | static_cast<uint32_t>(std::ldexp(a, mb - (1 - bias)));
+  return sign | uint32_t(biased) << mb | static_cast<uint32_t>((m * 2.0f - 1.0f) * float(1 << mb));
+}
+float sm120_val(int i, int j, int salt) { return static_cast<float>(((i * 5 + j * 3 + salt) % 9) - 4) * 0.5f; }
+
+struct Sm120Case {
+  std::string op;              // up to the operands
+  int K;                       // 32 or 64
+  int elem_bits;               // bits a register slot takes: 8 (containers) or 4 (packed e2m1)
+  std::function<uint32_t(float)> a_code, b_code;   // a value's bits in its slot
+  bool scaled = false;
+  uint32_t bida = 0, tida = 0, bidb = 0, tidb = 0, sv = 1;
+  std::function<uint8_t(int, int)> sfa, sfb;       // (row or column, block) -> byte
+  std::function<double(uint8_t)> factor;
+  // Sparse A (K is the dense width): chunk c of row i keeps the positions
+  // keep(i, c) returns -- pairs of 2:4 positions, or two pairs of a 4:8 --
+  // stored in order.
+  bool sparse = false;
+};
+
+// A 2:4 (w = 4) or 4:8-in-pairs (w = 8) pattern and its 4-bit field.
+std::vector<int> sm120_keep(int i, int c, int w) {
+  static const int pairs[6][2] = {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
+  const int h = (i * 5 + c * 3) % 6;
+  if (w == 4) return {pairs[h][0], pairs[h][1]};
+  return {2 * pairs[h][0], 2 * pairs[h][0] + 1, 2 * pairs[h][1], 2 * pairs[h][1] + 1};
+}
+uint32_t sm120_field(int i, int c, int w) {
+  const auto k = sm120_keep(i, c, w);
+  return w == 4 ? uint32_t(k[0]) | uint32_t(k[1]) << 2 : uint32_t(k[0] / 2) | uint32_t(k[2] / 2) << 2;
+}
+
+// A and B from the fragment layouts (9.7.16.5.10-11): with p slots to a
+// register, A's register r of lane (g, t) holds row g + 8(r % 2), columns
+// tp + 4p(r / 2) on; B's register r holds rows tp + 4pr on of column g.
+std::vector<float> run_sm120(const Sm120Case& t, std::function<float(int, int)> A, std::function<float(int, int)> B) {
+  const int p = 32 / t.elem_bits, na = 16 * t.K / (t.sparse ? 2 : 1) / (32 * p), nb = t.K * 8 / (32 * p);
+  // Registers: A at 0-3, B at 4-7, scale data at 8-9, metadata at 10.
+  const int w = t.elem_bits == 4 ? 8 : 4, per = w / 2;   // chunk width, stored per chunk
+  std::vector<uint32_t> in(32 * 12, 0);
+  for (int lane = 0; lane < 32; ++lane) {
+    const int g = lane / 4, tt = lane % 4;
+    for (int r = 0; r < na; ++r)
+      for (int e = 0; e < p; ++e) {
+        const int row = g + 8 * (r % 2);
+        float v;
+        if (t.sparse) {
+          // Register r of lane (g, t) holds the stored values of chunks
+          // t * cpr + 4 * cpr * (r / 2) on (9.7.16.6.2).
+          const int cpr = p / per, chunk = tt * cpr + 4 * cpr * (r / 2) + e / per;
+          v = A(row, chunk * w + sm120_keep(row, chunk, w)[e % per]);
+        } else {
+          v = A(row, tt * p + 4 * p * (r / 2) + e);
+        }
+        in[lane * 12 + r] |= t.a_code(v) << (t.elem_bits * e);
+      }
+    for (int r = 0; r < nb; ++r)
+      for (int e = 0; e < p; ++e) in[lane * 12 + 4 + r] |= t.b_code(B(tt * p + 4 * p * r + e, g)) << (t.elem_bits * e);
+    if (t.scaled) {
+      // Figures 46-48: the selected pair of each quad holds rows g (first
+      // thread) and g + 8 (second); thread tidb of quad g holds column g.
+      if (tt / 2 == int(t.tida))
+        for (uint32_t b = 0; b < t.sv; ++b) in[lane * 12 + 8] |= uint32_t(t.sfa(g + 8 * (tt % 2), b)) << (8 * (t.bida + b));
+      if (tt == int(t.tidb))
+        for (uint32_t b = 0; b < t.sv; ++b) in[lane * 12 + 9] |= uint32_t(t.sfb(g, b)) << (8 * (t.bidb + b));
+    }
+    if (t.sparse) {
+      // Metadata with all four threads of the group holding it (selector 0):
+      // row g in lane 4g, row g + 8 in 4g + 1, their chunks 8-15 in 4g + 2
+      // and 4g + 3, 4 bits a chunk.
+      const int row = g + 8 * (tt % 2), c0 = 8 * (tt / 2);
+      for (int c = 0; c < 8; ++c) in[lane * 12 + 10] |= sm120_field(row, c0 + c, w) << (4 * c);
+    }
+  }
+  std::string ptx = R"(.version 8.7
+.target sm_120a
+.address_size 64
+.visible .entry k(.param .u64 pin, .param .u64 pout)
+{
+    .reg .b32 %r<24>;
+    .reg .f32 %f<8>;
+    .reg .b16 %h<4>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [pin];
+    ld.param.u64 %rd2, [pout];
+    mov.u32 %r20, %tid.x;
+    mul.wide.u32 %rd3, %r20, 48;
+    add.u64 %rd4, %rd1, %rd3;
+    mul.wide.u32 %rd5, %r20, 16;
+    add.u64 %rd6, %rd2, %rd5;
+)";
+  for (int i = 0; i < 11; ++i) ptx += "    ld.global.u32 %r" + std::to_string(i) + ", [%rd4+" + std::to_string(4 * i) + "];\n";
+  ptx += "    mov.f32 %f4, 0f00000000;\n";
+  ptx += "    mov.b16 %h0, " + std::to_string(t.bida) + ";\n    mov.b16 %h1, " + std::to_string(t.tida) + ";\n";
+  ptx += "    mov.b16 %h2, " + std::to_string(t.bidb) + ";\n    mov.b16 %h3, " + std::to_string(t.tidb) + ";\n";
+  std::string a = "{%r0, %r1, %r2, %r3}", b = nb == 4 ? "{%r4, %r5, %r6, %r7}" : "{%r4, %r5}";
+  ptx += "    " + t.op + " {%f0, %f1, %f2, %f3}, " + a + ", " + b + ", {%f4, %f4, %f4, %f4}" +
+         (t.sparse ? ", %r10, 0" : "") + (t.scaled ? ", {%r8}, {%h0, %h1}, {%r9}, {%h2, %h3}" : "") + ";\n";
+  for (int i = 0; i < 4; ++i) ptx += "    st.global.f32 [%rd6+" + std::to_string(4 * i) + "], %f" + std::to_string(i) + ";\n";
+  ptx += "    ret;\n}\n";
+  Env e;
+  e.prof = load_gpu("nvidia/rtx5090");
+  const uint64_t pin = e.mem.alloc(in.size() * 4), pout = e.mem.alloc(32 * 16);
+  e.mem.write(pin, in.data(), in.size() * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(pin), arg_u64(pout)}, e.mem, e.prof);
+  std::vector<float> d(32 * 4);
+  e.mem.read(pout, d.data(), d.size() * 4);
+  // Back to a 16 x 8 tile: D element i of lane (g, t) is row g + 8(i / 2),
+  // column 2t + i % 2.
+  std::vector<float> D(16 * 8);
+  for (int lane = 0; lane < 32; ++lane)
+    for (int i = 0; i < 4; ++i) D[(lane / 4 + 8 * (i / 2)) * 8 + 2 * (lane % 4) + i % 2] = d[lane * 4 + i];
+  return D;
+}
+
+void check_sm120(const Sm120Case& t, std::function<float(int, int)> A0, std::function<float(int, int)> B) {
+  // Sparse: the dense A is zero where the pattern keeps nothing.
+  const int w = t.elem_bits == 4 ? 8 : 4;
+  std::function<float(int, int)> A = A0;
+  if (t.sparse)
+    A = [&](int i, int k) {
+      for (int x : sm120_keep(i, k / w, w))
+        if (k % w == x) return A0(i, k);
+      return 0.0f;
+    };
+  const auto D = run_sm120(t, A, B);
+  const int blk = t.K / int(t.sv);
+  for (int i = 0; i < 16; ++i)
+    for (int j = 0; j < 8; ++j) {
+      double want = 0;
+      for (int k = 0; k < t.K; ++k)
+        want += double(A(i, k)) * B(k, j) *
+                (t.scaled ? t.factor(t.sfa(i, k / blk)) * t.factor(t.sfb(j, k / blk)) : 1.0);
+      if (D[i * 8 + j] != float(want))
+        VCHECK_EQ(std::to_string(i) + "," + std::to_string(j) + ": " + std::to_string(D[i * 8 + j]),
+                  std::to_string(i) + "," + std::to_string(j) + ": " + std::to_string(float(want)));
+    }
+}
+}  // namespace
+
+// .kind::f8f6f4: e2m1 in bits 2-5 of its byte, e3m2 in bits 0-5.
+VTEST(mma_sm120_f8f6f4_e2m1_times_e3m2) {
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e2m1.e3m2.f32";
+  t.K = 32;
+  t.elem_bits = 8;
+  t.a_code = [](float f) { return mx_code(f, 2, 1, 1) << 2; };
+  t.b_code = [](float f) { return mx_code(f, 3, 2, 3); };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 1); }, [](int k, int j) { return sm120_val(k, j, 4); });
+}
+
+// .kind::mxf8f6f4 1X: ue8m0 factors from byte 2 of the upper thread pair (A)
+// and byte 1 of thread 3 (B).
+VTEST(mma_sm120_mxf8f6f4_selectors) {
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m3.f32.ue8m0";
+  t.K = 32;
+  t.elem_bits = 8;
+  t.a_code = [](float f) { return mx_code(f, 4, 3, 7); };
+  t.b_code = [](float f) { return mx_code(f, 2, 3, 1); };
+  t.scaled = true;
+  t.bida = 2; t.tida = 1; t.bidb = 1; t.tidb = 3; t.sv = 1;
+  t.sfa = [](int i, int) { return uint8_t(124 + i % 6); };
+  t.sfb = [](int j, int) { return uint8_t(126 + j % 4); };
+  t.factor = [](uint8_t v) { return std::ldexp(1.0, int(v) - 127); };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 2); }, [](int k, int j) { return sm120_val(k, j, 7); });
+}
+
+// .kind::mxf4 (2X by default): e2m1 packed, two blocks of 32, from bytes 2-3.
+VTEST(mma_sm120_mxf4_two_blocks) {
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::mxf4.block_scale.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0";
+  t.K = 64;
+  t.elem_bits = 4;
+  t.a_code = t.b_code = [](float f) { return mx_code(f, 2, 1, 1); };
+  t.scaled = true;
+  t.bida = 2; t.tida = 0; t.bidb = 2; t.tidb = 1; t.sv = 2;
+  t.sfa = [](int i, int b) { return uint8_t(125 + (i + 3 * b) % 5); };
+  t.sfb = [](int j, int b) { return uint8_t(127 - (j + b) % 3); };
+  t.factor = [](uint8_t v) { return std::ldexp(1.0, int(v) - 127); };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 3); }, [](int k, int j) { return sm120_val(k, j, 5); });
+}
+
+// .kind::mxf4nvf4 4X with ue4m3: four blocks of 16.
+VTEST(mma_sm120_mxf4nvf4_ue4m3) {
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3";
+  t.K = 64;
+  t.elem_bits = 4;
+  t.a_code = t.b_code = [](float f) { return mx_code(f, 2, 1, 1); };
+  t.scaled = true;
+  t.tida = 1; t.tidb = 2; t.sv = 4;
+  const float steps[] = {0.5f, 1.0f, 1.5f, 2.0f, 0.75f};
+  t.sfa = [steps](int i, int b) { return uint8_t(mx_code(steps[(i + b) % 5], 4, 3, 7)); };
+  t.sfb = [steps](int j, int b) { return uint8_t(mx_code(steps[(2 * j + b) % 5], 4, 3, 7)); };
+  t.factor = [](uint8_t v) {
+    return v ? std::ldexp(1.0 + (v & 7) / 8.0, int(v >> 3) - 7) : 0.0;
+  };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 6); }, [](int k, int j) { return sm120_val(k, j, 2); });
+}
+
+// Sparse block-scaled: mxf8f6f4 at m16n8k64 (2:4, e2m3 A in containers, one
+// factor per 64) and mxf4nvf4 at m16n8k128 (4:8 in pairs, four ue4m3
+// factors per 128).
+VTEST(mma_sm120_sparse_mxf8f6f4_k64) {
+  Sm120Case t;
+  t.op = "mma.sp::ordered_metadata.sync.aligned.kind::mxf8f6f4.block_scale.m16n8k64.row.col.f32.e2m3.e4m3.f32.ue8m0";
+  t.K = 64;
+  t.elem_bits = 8;
+  t.sparse = true;
+  t.a_code = [](float f) { return mx_code(f, 2, 3, 1); };
+  t.b_code = [](float f) { return mx_code(f, 4, 3, 7); };
+  t.scaled = true;
+  t.bida = 3; t.tida = 0; t.bidb = 0; t.tidb = 1; t.sv = 1;
+  t.sfa = [](int i, int) { return uint8_t(125 + i % 4); };
+  t.sfb = [](int j, int) { return uint8_t(128 - j % 3); };
+  t.factor = [](uint8_t v) { return std::ldexp(1.0, int(v) - 127); };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 8); }, [](int k, int j) { return sm120_val(k, j, 3); });
+}
+
+VTEST(mma_sm120_sparse_mxf4nvf4_k128) {
+  Sm120Case t;
+  t.op = "mma.sp::ordered_metadata.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k128.row.col.f32.e2m1.e2m1.f32.ue4m3";
+  t.K = 128;
+  t.elem_bits = 4;
+  t.sparse = true;
+  t.a_code = t.b_code = [](float f) { return mx_code(f, 2, 1, 1); };
+  t.scaled = true;
+  t.tida = 1; t.tidb = 0; t.sv = 4;
+  const float steps[] = {0.5f, 1.0f, 1.5f, 2.0f, 0.75f};
+  t.sfa = [steps](int i, int b) { return uint8_t(mx_code(steps[(i + 2 * b) % 5], 4, 3, 7)); };
+  t.sfb = [steps](int j, int b) { return uint8_t(mx_code(steps[(j + b) % 5], 4, 3, 7)); };
+  t.factor = [](uint8_t v) { return v ? std::ldexp(1.0 + (v & 7) / 8.0, int(v >> 3) - 7) : 0.0; };
+  check_sm120(t, [](int i, int k) { return sm120_val(i, k, 5); }, [](int k, int j) { return sm120_val(k, j, 1); });
+}
+
+VTEST(mma_sm120_refuses_what_table_45_rules_out) {
+  auto parse = [](const std::string& ins) {
+    return VCAPTURE(Error, ptx::parse(".version 8.7\n.target sm_120a\n.address_size 64\n.visible .entry k()\n{\n"
+                                      " .reg .b32 a<8>;\n .reg .f32 f<8>;\n .reg .b16 h<4>;\n " + ins + "\n ret;\n}\n"))
+        .message();
+  };
+  VCHECK_CONTAINS(parse("mma.sync.aligned.m16n8k32.row.col.f32.e2m1.e2m1.f32 {f0,f1,f2,f3}, {a0,a1,a2,a3}, {a4,a5}, {f0,f1,f2,f3};"),
+                  "needs .kind::f8f6f4");
+  VCHECK_CONTAINS(parse("mma.sync.aligned.kind::mxf4nvf4.block_scale.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+                        "{f0,f1,f2,f3}, {a0,a1,a2,a3}, {a4,a5}, {f0,f1,f2,f3}, {a6}, {h0,h1}, {a7}, {h2,h3};"),
+                  "needs a .scale_vec");
+  VCHECK_CONTAINS(parse("mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                        "{f0,f1,f2,f3}, {a0,a1,a2,a3}, {a4,a5}, {f0,f1,f2,f3}, {a6}, {h0,h1}, {a7}, {h2,h3};"),
+                  "Table 45");
+  VCHECK_CONTAINS(parse("mma.sync.aligned.kind::f8f6f4.m16n8k64.row.col.f32.e4m3.e4m3.f32 {f0,f1,f2,f3}, "
+                        "{a0,a1,a2,a3}, {a4,a5}, {f0,f1,f2,f3};"),
+                  "not a form");
+  // Table 46: byte-id 1 is not a 2X selector.
+  Sm120Case t;
+  t.op = "mma.sync.aligned.kind::mxf4.block_scale.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0";
+  t.K = 64;
+  t.elem_bits = 4;
+  t.a_code = t.b_code = [](float f) { return mx_code(f, 2, 1, 1); };
+  t.scaled = true;
+  t.bida = 1; t.sv = 2;
+  t.sfa = t.sfb = [](int, int) { return uint8_t(127); };
+  t.factor = [](uint8_t) { return 1.0; };
+  VCHECK_CONTAINS(VCAPTURE(Error, run_sm120(t, [](int, int) { return 1.0f; }, [](int, int) { return 1.0f; })).message(),
+                  "Table 46");
+}
+
+// ldmatrix's 8-bit shapes (9.7.16.5.15): lane l supplies the row at 32 * l of
+// a patterned shared buffer; each form's registers are checked against
+// figures 108-109 -- lane t holds columns 4(t % 4).. of row t / 4 (and t / 4
+// + 8 in its second register for 16x16, transposed) -- with fp4 and fp6
+// expanded into the low bits of each byte (as CUTLASS's fp4_shift_A says)
+// and .s4 sign-extended.
+VTEST(ldmatrix_8bit_shapes_expand_as_the_figures_show) {
+  struct Form { std::string mods; int R, count, bits; bool trans, s4; };
+  const Form forms[] = {
+      {"m8n16.x2.shared.b8x16.b4x16_p64", 8, 2, 4, false, false},
+      {"m8n16.x4.shared.b8x16.b6x16_p32", 8, 4, 6, false, false},
+      {"m8n16.x1.shared.s8.s4", 8, 1, 4, false, true},
+      {"m16n16.x1.trans.shared.b8", 16, 1, 8, true, false},
+      {"m16n16.x2.trans.shared.b8x16.b4x16_p64", 16, 2, 4, true, false},
+  };
+  auto image = [](int i) { return static_cast<uint8_t>((i * 37 + 11) & 0xFF); };
+  for (const Form& f : forms) {
+    const int nregs = f.count * f.R / 8;
+    std::string regs;
+    for (int i = 0; i < nregs; ++i) regs += (i ? ", %r" : "%r") + std::to_string(10 + i);
+    std::string ptx = R"(.version 8.7
+.target sm_120a
+.address_size 64
+.visible .entry k(.param .u64 pout)
+{
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<4>;
+    .shared .align 16 .b8 buf[1024];
+    ld.param.u64 %rd1, [pout];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, buf;
+    // Fill: byte i = (37 i + 11) mod 256, 32 bytes a lane.
+    shl.b32 %r3, %r1, 5;
+    mov.u32 %r4, 0;
+FILL:
+    add.u32 %r5, %r3, %r4;
+    mad.lo.u32 %r6, %r5, 37, 11;
+    add.u32 %r7, %r2, %r5;
+    st.shared.u8 [%r7], %r6;
+    add.u32 %r4, %r4, 1;
+    setp.lt.u32 %p1, %r4, 32;
+    @%p1 bra FILL;
+    bar.sync 0;
+    add.u32 %r8, %r2, %r3;
+    ldmatrix.sync.aligned.)" + f.mods + " {" + regs + "}, [%r8];\n";
+    // The instruction takes a shared offset with .shared: the buffer's.
+    ptx.replace(ptx.find("add.u32 %r8, %r2, %r3;"), 22, "mov.u32 %r8, %r3;     ");
+    ptx += "    mul.wide.u32 %rd2, %r1, 32;\n    add.u64 %rd3, %rd1, %rd2;\n";
+    for (int i = 0; i < nregs; ++i)
+      ptx += "    st.global.u32 [%rd3+" + std::to_string(4 * i) + "], %r" + std::to_string(10 + i) + ";\n";
+    ptx += "    ret;\n}\n";
+    ptx.insert(ptx.find(".reg .b64"), ".reg .pred %p<2>;\n    ");
+    Env e;
+    e.prof = load_gpu("nvidia/rtx5090");
+    const uint64_t out = e.mem.alloc(32 * 32);
+    LaunchConfig cfg;
+    cfg.block = {32, 1, 1};
+    exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+    std::vector<uint32_t> got(32 * 8);
+    e.mem.read(out, got.data(), got.size() * 4);
+    // Row r of matrix m: the sixteen values at 32 * (m * R + r), expanded.
+    auto elem = [&](int m, int r, int c) -> uint8_t {
+      const int at = 32 * (m * f.R + r);
+      uint32_t v = 0;
+      for (int k = 0; k < f.bits; ++k) v |= ((image(at + (c * f.bits + k) / 8) >> ((c * f.bits + k) % 8)) & 1u) << k;
+      if (f.s4 && (v & 8)) v |= 0xF0;
+      return static_cast<uint8_t>(v);
+    };
+    for (int lane = 0; lane < 32; ++lane)
+      for (int m = 0; m < f.count; ++m)
+        for (int rr = 0; rr < f.R / 8; ++rr) {
+          uint32_t want = 0;
+          for (int j = 0; j < 4; ++j) {
+            const int row = lane / 4 + 8 * rr, col = 4 * (lane % 4) + j;
+            want |= uint32_t{f.trans ? elem(m, col, row) : elem(m, row, col)} << (8 * j);
+          }
+          const uint32_t have = got[lane * 8 + m * (f.R / 8) + rr];
+          if (have != want)
+            VCHECK_EQ(f.mods + " lane " + std::to_string(lane) + ": " + std::to_string(have),
+                      f.mods + " lane " + std::to_string(lane) + ": " + std::to_string(want));
+        }
+  }
+  auto refused = [](const std::string& mods) {
+    return VCAPTURE(Error, ptx::parse(".version 8.7\n.target sm_120a\n.address_size 64\n.visible .entry k()\n{\n"
+                                      " .reg .b32 r<4>;\n ldmatrix.sync.aligned." + mods + " {r0, r1}, [r2];\n ret;\n}\n"))
+        .message();
+  };
+  VCHECK_CONTAINS(refused("m16n16.x1.shared.b8"), "not a form");         // 16x16 needs .trans
+  VCHECK_CONTAINS(refused("m8n16.x1.trans.shared.b8x16.b4x16_p64"), "not a form");
+}
+
+// stmatrix.m16n8.trans.b8 (figure 111): lane t's byte e is element (row, col)
+// = (t / 4 + 8(e / 2), 2(t % 4) + e % 2) of a 16x8 matrix, stored
+// column-major: column c is 16 bytes at the address lane 8m + c gives.
+VTEST(stmatrix_m16n8_trans_b8_stores_columns) {
+  std::string ptx = R"(.version 8.7
+.target sm_120a
+.address_size 64
+.visible .entry k(.param .u64 pout)
+{
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<4>;
+    .shared .align 16 .b8 buf[512];
+    ld.param.u64 %rd1, [pout];
+    mov.u32 %r1, %tid.x;
+    // Lane t, register m: bytes (64m + 4t + e) * 7.
+    shl.b32 %r2, %r1, 2;
+    mul.lo.u32 %r3, %r2, 7;
+    mov.u32 %r10, 0x1C150E07;
+    mul.lo.u32 %r4, %r3, 0x01010101;
+    add.u32 %r10, %r4, %r10;
+    add.u32 %r11, %r10, 0xC0C0C0C0;
+    shl.b32 %r5, %r1, 4;
+    stmatrix.sync.aligned.m16n8.x2.trans.shared.b8 [%r5], {%r10, %r11};
+    bar.sync 0;
+    shl.b32 %r6, %r1, 4;
+    mov.u32 %r7, buf;
+    add.u32 %r7, %r7, %r6;
+    ld.shared.v4.u32 {%r12, %r13, %r14, %r15}, [%r7];
+    mul.wide.u32 %rd2, %r1, 16;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.v4.u32 [%rd3], {%r12, %r13, %r14, %r15};
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/rtx5090");
+  const uint64_t out = e.mem.alloc(32 * 16);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  std::vector<uint8_t> got(32 * 16);
+  e.mem.read(out, got.data(), got.size());
+  // Register values as the kernel builds them: byte e of lane t, register m.
+  auto reg_byte = [](int t, int m, int e) {
+    const uint32_t base = 0x1C150E07u + uint32_t(t * 4 * 7) * 0x01010101u + (m ? 0xC0C0C0C0u : 0u);
+    return static_cast<uint8_t>(base >> (8 * e));
+  };
+  for (int m = 0; m < 2; ++m)
+    for (int c = 0; c < 8; ++c)
+      for (int row = 0; row < 16; ++row) {
+        const int t = 4 * (row % 8) + c / 2, byte = 2 * (row / 8) + c % 2;
+        VCHECK_EQ(int(got[(8 * m + c) * 16 + row]), int(reg_byte(t, m, byte)));
+      }
+}
+
+// Decimal floating-point literals (PTX ISA 4.5.2): doubles, converted to the
+// size of the operand they are used as -- f32 in .f32 instructions, f64 in
+// .f64 ones, and a cvt's source type. CUTLASS's inline asm writes
+// "cvt.rp.satfinite.ue8m0x2.f32 %0, 0.0, %1".
+VTEST(decimal_float_literals_take_the_operands_size) {
+  std::string ptx = std::string(kHeader90) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .f32 %f<6>;
+    .reg .f64 %fd<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.f32 %f1, 0.5;
+    add.f32 %f2, %f1, 1.25e1;
+    mov.f32 %f3, -2.0;
+    mov.f64 %fd1, -2.5;
+    add.f64 %fd2, %fd1, 0.125;
+    cvt.rn.f32.f64 %f4, 0.25;
+    st.global.f32 [%rd2], %f2;
+    st.global.f32 [%rd2+4], %f3;
+    st.global.f64 [%rd2+8], %fd2;
+    st.global.f32 [%rd2+16], %f4;
+    ret;
+}
+)";
+  Env e;
+  e.prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  float f[5];
+  double d;
+  e.mem.read(out, f, 8);
+  e.mem.read(out + 8, &d, 8);
+  e.mem.read(out + 16, &f[4], 4);
+  VCHECK_EQ(f[0], 13.0f);
+  VCHECK_EQ(f[1], -2.0f);
+  VCHECK_EQ(d, -2.375);
+  VCHECK_EQ(f[4], 0.25f);
 }
 
 // Register files are not zeroed when a block starts. A register's first

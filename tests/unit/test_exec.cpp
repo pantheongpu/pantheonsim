@@ -393,6 +393,47 @@ LOOP:
   VCHECK_CONTAINS(err.what(), "bra LOOP");
 }
 
+// And the mbarriers whose phase is still open: a wait that never ends is
+// usually on one owed an arrival or transaction bytes.
+VTEST(step_budget_error_lists_open_mbarriers) {
+  const char* ptx = R"(
+.version 8.3
+.target sm_90
+.address_size 64
+.visible .entry stuck()
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<2>;
+    .reg .pred %p<4>;
+    .shared .align 8 .b64 bar[2];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, bar;
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 mbarrier.init.shared::cta.b64 [%r2], 2;
+    add.u32 %r3, %r2, 8;
+    @%p1 mbarrier.init.shared::cta.b64 [%r3], 1;
+    bar.sync 0;
+    @%p1 mbarrier.arrive.shared::cta.b64 %rd1, [%r2];
+    @%p1 mbarrier.arrive.expect_tx.shared::cta.b64 %rd1, [%r3], 64;
+WAIT:
+    mbarrier.try_wait.parity.shared::cta.b64 %p2, [%r2], 0;
+    @!%p2 bra WAIT;
+    ret;
+}
+)";
+  ptx::Module m = ptx::parse(ptx);
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/h100");
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  cfg.max_steps = 10000;
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, mem, prof));
+  VCHECK(err.code() == Err::ExecLimit);
+  VCHECK_CONTAINS(err.what(), "mbarriers with an open phase");
+  VCHECK_CONTAINS(err.what(), "0x0: phase 0, 1 of 2 arrived, 0 bytes due");
+  VCHECK_CONTAINS(err.what(), "0x8: phase 0, 1 of 1 arrived, 64 bytes due");
+}
+
 VTEST(launch_limits_enforced) {
   ptx::Module m = ptx::parse(read_file(VGPU_KERNEL_DIR "/vector_add.ptx"));
   MemoryManager mem(1 << 20);
@@ -648,6 +689,75 @@ VTEST(vector_accesses_count_every_element_they_move) {
   VCHECK_EQ(st.global_sectors_ld, 16ull);   // 512 contiguous bytes
   VCHECK_EQ(st.global_sectors_st, 16ull);
 }
+// 256-bit accesses (PTX 8.8, sm_100 and later): ld/st .v8 of 32-bit elements
+// in global memory, which PyTorch's vectorized elementwise kernels use. Every
+// element moves, the access needs 32-byte alignment, and the forms PTX does
+// not define -- 64-bit elements, other state spaces -- are refused by name.
+VTEST(v8_accesses_move_thirty_two_bytes_a_lane) {
+  const char* kPtx = R"(
+.version 8.8
+.target sm_100
+.address_size 64
+.visible .entry v8(.param .u64 src, .param .u64 dst, .param .u32 skew)
+{
+  .reg .b32 %r<3>;
+  .reg .f32 %f<17>;
+  .reg .b64 %rd<8>;
+  ld.param.u64 %rd1, [src];
+  ld.param.u64 %rd2, [dst];
+  ld.param.u32 %r2, [skew];
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd3, %r1, 32;
+  cvt.u64.u32 %rd7, %r2;
+  add.s64 %rd4, %rd1, %rd3;
+  add.s64 %rd4, %rd4, %rd7;
+  add.s64 %rd5, %rd2, %rd3;
+  ld.global.v8.f32 {%f1, %f2, %f3, %f4, %f5, %f6, %f7, %f8}, [%rd4];
+  add.f32 %f9, %f1, 0f3F800000;
+  add.f32 %f10, %f2, 0f3F800000;
+  add.f32 %f11, %f3, 0f3F800000;
+  add.f32 %f12, %f4, 0f3F800000;
+  add.f32 %f13, %f5, 0f3F800000;
+  add.f32 %f14, %f6, 0f3F800000;
+  add.f32 %f15, %f7, 0f3F800000;
+  add.f32 %f16, %f8, 0f3F800000;
+  st.global.v8.f32 [%rd5], {%f9, %f10, %f11, %f12, %f13, %f14, %f15, %f16};
+  ret;
+}
+)";
+  ptx::Module m = ptx::parse(kPtx);
+  MemoryManager mem(1 << 20);
+  const uint64_t src = mem.alloc(32 * 32 + 16), dst = mem.alloc(32 * 32);
+  std::vector<float> in(32 * 8 + 4);
+  for (size_t i = 0; i < in.size(); ++i) in[i] = static_cast<float>(i);
+  mem.write(src, in.data(), in.size() * 4);
+  DeviceProfile prof = load_gpu("nvidia/b200");
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  auto arg64 = [](uint64_t v) { std::vector<uint8_t> a(8); std::memcpy(a.data(), &v, 8); return a; };
+  auto arg32 = [](uint32_t v) { std::vector<uint8_t> a(4); std::memcpy(a.data(), &v, 4); return a; };
+  auto st = exec::launch(m.entries[0], cfg, {arg64(src), arg64(dst), arg32(0)}, mem, prof);
+  std::vector<float> out(32 * 8);
+  mem.read(dst, out.data(), out.size() * 4);
+  bool all = true;
+  for (size_t i = 0; i < out.size(); ++i) all &= out[i] == in[i] + 1.0f;
+  VCHECK(all);
+  VCHECK_EQ(st.global_bytes_ld, 32ull * 32);
+  VCHECK_EQ(st.global_bytes_st, 32ull * 32);
+  // Sixteen bytes past a 32-byte boundary: aligned for .v4, not for .v8.
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg64(src), arg64(dst), arg32(16)}, mem, prof));
+  VCHECK(err.code() == Err::MisalignedAccess);
+  const std::string head = ".version 8.8\n.target sm_100\n.address_size 64\n";
+  auto wide = VCAPTURE(Error, ptx::parse(head + ".visible .entry k(.param .u64 p) { .reg .f64 %d<9>; .reg .b64 %a; "
+                                         "ld.param.u64 %a, [p]; ld.global.v8.f64 {%d1,%d2,%d3,%d4,%d5,%d6,%d7,%d8}, [%a]; ret; }\n"));
+  VCHECK(wide.code() == Err::UnsupportedPtx);
+  auto shared = VCAPTURE(Error, ptx::parse(head + ".visible .entry k() { .reg .f32 %f<9>; .reg .b32 %a; "
+                                           "ld.shared.v8.f32 {%f1,%f2,%f3,%f4,%f5,%f6,%f7,%f8}, [%a]; ret; }\n"));
+  VCHECK(shared.code() == Err::UnsupportedPtx);
+  mem.free(src);
+  mem.free(dst);
+}
+
 VTEST(divergence_is_counted_only_when_lanes_disagree) {
   // Half the warp takes the branch, so it diverges exactly once per warp.
   const char* kPtx = R"(

@@ -97,8 +97,16 @@ bool trace() {
 
 // A fatbin registered by the host boilerplate. PTX is parsed into a runtime
 // module lazily on first use for the active device.
+// A fatbin nvcc's host code registered. Its PTX is taken out the first time
+// something needs it, not at registration: a program like PyTorch registers
+// hundreds of fatbins -- 1.3 GB of PTX in libtorch_cuda alone -- at load, and
+// launches kernels from a few of them. The text is dropped again once the
+// module is loaded; a second device reads it out of the fatbin once more.
 struct RegisteredModule {
-  std::string ptx;
+  const void* fatbin = nullptr;   // nvcc's wrapper, in the program's own image
+  bool resolved = false;          // whether the fatbin has been looked at yet
+  bool has_ptx = false;           // whether it holds PTX this device can use
+  std::string ptx;                // the PTX, while it is being loaded
   std::unordered_map<int, uint64_t> module_per_device;  // device -> runtime module id
 };
 
@@ -236,8 +244,10 @@ struct MemPool {
 };
 
 struct State {
-  std::recursive_mutex mu;
-  std::unique_ptr<vgpu::runtime::Runtime> rt;
+  // One lock for both CUDA libraries, since they share one machine
+  // (shared_runtime.cpp).
+  std::recursive_mutex& mu = vgpu::runtime::shared_api_mutex();
+  vgpu::runtime::Runtime* rt = nullptr;   // the process's machine, not owned (shared_runtime.cpp)
   std::vector<std::unique_ptr<RegisteredModule>> modules;
   std::unordered_map<const void*, KernelInfo> kernels;  // host stub ptr -> kernel
   std::unordered_map<const void*, VarInfo> vars;        // host shadow ptr -> device symbol
@@ -343,24 +353,13 @@ void init_driver_shim_if_loaded() {
 
 void ensure_init(State& s) {
   if (s.initialized) return;
-  const char* gpu = std::getenv("VGPU_GPU");
-  std::string id = gpu && gpu[0] ? gpu : "nvidia/h100";
-  int count = 1;
-  if (const char* c = std::getenv("VGPU_DEVICE_COUNT"); c && c[0]) count = std::atoi(c);
-  vgpu::DeviceProfile profile = vgpu::load_gpu(id);
-  // Optional: shrink advertised VRAM so VRAM-proportional stress tests run at
-  // laptop scale (their size is a % of device memory). Functional behavior is
-  // unchanged; only the working-set size the app chooses shrinks.
-  vgpu::apply_vram_override(profile);
-  s.rt = std::make_unique<vgpu::runtime::Runtime>(profile, count);
+  // One machine for both CUDA libraries (shared_runtime.cpp).
+  s.rt = vgpu::runtime::shared_runtime();
   s.initialized = true;
   init_driver_shim_if_loaded();
   // A program that only uses the runtime API never reaches cuInit, and a
   // profiler attached to it would otherwise never be invited in.
   vgpu::load_injection_library();
-  if (!quiet())
-    std::fprintf(stderr, "[vgpu] virtual GPU platform initialized: %d x %s (%s)\n", count,
-                 profile.id.c_str(), profile.model.c_str());
 }
 
 // Sticky last error, per the runtime API contract.
@@ -487,14 +486,137 @@ vgpu::MemoryManager& owner_memory(State& s, const void* p) {
   return current(s).memory();
 }
 
+// The PTX a registered fatbin holds for this machine's devices: the image the
+// driver would JIT (pick_ptx), or, for a separately compiled (-rdc) build,
+// its relocatable pieces put together. Empty where there is none.
+std::string extract_registered_ptx(State& s, const void* fatCubin) {
+  std::string out;
+  // fatCubin is a __fatBinC_Wrapper_t*; extract the best PTX image.
+  // Drops the leading .version/.target/.address_size directives from a
+  // linked-in piece, so the first piece's header describes the whole module.
+  auto strip_ptx_header = [](const std::string& text) {
+    size_t pos = 0;
+    while (pos < text.size()) {
+      const size_t eol = text.find('\n', pos);
+      const size_t len = (eol == std::string::npos ? text.size() : eol) - pos;
+      std::string line = text.substr(pos, len);
+      size_t a = line.find_first_not_of(" \t");
+      const bool blank = a == std::string::npos;
+      const bool header = !blank && (line.compare(a, 8, ".version") == 0 ||
+                                     line.compare(a, 7, ".target") == 0 ||
+                                     line.compare(a, 13, ".address_size") == 0 ||
+                                     line.compare(a, 2, "//") == 0);
+      if (!blank && !header) break;
+      if (eol == std::string::npos) return std::string{};
+      pos = eol + 1;
+    }
+    return text.substr(pos);
+  };
+  // The PTX the driver would JIT for this device -- see pick_ptx for the
+  // rule. (Every device of a simulated machine has one profile.)
+  const vgpu::DeviceProfile& dev = s.rt->device(0).profile();
+  const uint32_t cc = static_cast<uint32_t>(dev.cc_major * 10 + dev.cc_minor);
+  auto pick_best = [cc](std::vector<vgpu::cuda::FatbinPtx>& v) -> std::string {
+    if (v.empty()) return {};
+    return std::move(v[vgpu::cuda::pick_ptx(v, cc)].text);
+  };
+  auto ptxs = vgpu::cuda::extract_ptx(fatCubin);
+  out = pick_best(ptxs);
+  if (out.empty()) {
+    // A separately compiled build (-rdc=true) leaves the primary fatbin
+    // empty -- 16 bytes, just a header -- and puts the real device code in a
+    // list of *relocatable* fatbins hanging off the wrapper's fourth field.
+    // Device linking would normally consume them; with a PTX-only -code
+    // there is nothing for nvlink to link, so the pieces arrive here still
+    // separate and the runtime is expected to put them together.
+    //
+    // The wrapper is
+    //   { int magic; int version; const void* data; void* filename_or_fatbins; }
+    // and that last field is a filename in version 1 and a NULL-terminated
+    // array of fatbin pointers in version 2 -- so the version has to be
+    // checked before it is walked, or a char* gets dereferenced as an array.
+    int version = 0;
+    const void* const* relocatable = nullptr;
+    const uint8_t* wp = static_cast<const uint8_t*>(fatCubin);
+    if (wp) {
+      std::memcpy(&version, wp + 4, 4);
+      if (version >= 2) std::memcpy(&relocatable, wp + 16, 8);
+    }
+    std::string linked;
+    size_t pieces = 0;
+    for (size_t i = 0; relocatable && relocatable[i] && i < 64; ++i) {
+      try {
+        auto part = vgpu::cuda::extract_ptx(relocatable[i]);
+        std::string text = pick_best(part);
+        if (text.empty()) continue;
+        // Concatenated rather than merged: cross-piece references resolve
+        // by name, exactly as they would after a link.
+        //
+        // Every piece carries its own .version/.target/.address_size header,
+        // and only the first one's counts. The first relocatable fatbin is
+        // the translation unit being registered; the rest are libraries
+        // linked into it, compiled for whatever the toolkit's default
+        // architecture happened to be. Letting the last header win made a
+        // module built for sm_80 claim to target sm_121 and be refused on an
+        // A100 -- with an error about the *device* being too old, which is
+        // the opposite of what had happened.
+        if (pieces > 0) text = strip_ptx_header(text);
+        linked += text;
+        linked += "\n";
+        ++pieces;
+      } catch (const std::exception&) {
+        // A piece that will not parse is skipped rather than failing the
+        // whole registration: the others may still hold the kernel.
+      }
+    }
+    out = std::move(linked);
+    if (trace() && pieces)
+      std::fprintf(stderr, "[vgpu][trace] linked %zu relocatable PTX pieces (-rdc build)\n",
+                   pieces);
+    if (out.empty() && !quiet())
+      std::fprintf(stderr,
+                   "[vgpu] __cudaRegisterFatBinary: no PTX in fatbin (SASS-only build); rebuild "
+                   "with an -arch that embeds PTX\n");
+    // Return a handle anyway; the failure surfaces at launch with context.
+  }
+  return out;
+}
+
+// Whether a registered fatbin has PTX to run, looking the first time asked.
+bool registered_ptx(State& s, RegisteredModule& m) {
+  if (!m.resolved) {
+    m.ptx = extract_registered_ptx(s, m.fatbin);
+    m.has_ptx = !m.ptx.empty();
+    m.resolved = true;
+  }
+  return m.has_ptx;
+}
+
 // Loads (once) the runtime module for a registered fatbin on the current device.
 uint64_t module_on_current(State& s, RegisteredModule& m) {
   int dev = t_current_device;
   auto it = m.module_per_device.find(dev);
   if (it != m.module_per_device.end()) return it->second;
+  if (!registered_ptx(s, m)) throw vgpu::Error::make(vgpu::Err::UnsupportedPtx, "no PTX in this fatbin");
+  if (m.ptx.empty()) m.ptx = extract_registered_ptx(s, m.fatbin);
   uint64_t mid = s.rt->device(dev).load_module(m.ptx);
   m.module_per_device[dev] = mid;
+  std::string().swap(m.ptx);
   return mid;
+}
+
+// The driver's context for this thread: the runtime's current device's
+// primary context, as the real runtime leaves it, so a program's own driver
+// calls work alongside runtime ones (vgpu_driver_bind_primary_v1 in
+// driver_api.cpp). Once per thread, and again when it changes device; nothing
+// to do when the driver shim is not loaded.
+void bind_driver_context() {
+  thread_local int bound = -1;
+  if (bound == t_current_device) return;
+  using Bind = int (*)(int);
+  static const Bind fn = reinterpret_cast<Bind>(dlsym(RTLD_DEFAULT, "vgpu_driver_bind_primary_v1"));
+  if (fn) fn(t_current_device);
+  bound = t_current_device;
 }
 
 template <class F>
@@ -507,6 +629,7 @@ cudaError_t guard(const char* api, F&& body) {
   const cudaError_t rc = [&]() -> cudaError_t {
     try {
       ensure_init(s);
+      bind_driver_context();
       if (const cudaError_t sticky = g_sticky_error.load(); sticky != cudaSuccess) {
         g_last_error = sticky;
         return sticky;
@@ -528,6 +651,17 @@ cudaError_t guard(const char* api, F&& body) {
 
 bool is_device_ptr(const void* p) {
   return vgpu::is_device_va(reinterpret_cast<uint64_t>(p));
+}
+
+// Memory a copy may call device memory: a device allocation, or host memory
+// CUDA allocated itself -- managed (cudaMallocManaged) and pinned
+// (cudaMallocHost, cudaHostAlloc). An RTX 3060 accepts those as the device side
+// of cudaMemcpy in every direction, and refuses pageable memory there, and
+// memory pinned after the fact with cudaHostRegister. NanoVDB copies from a
+// managed buffer with cudaMemcpyDeviceToHost.
+bool copyable_as_device(State& s, const void* p) {
+  return is_device_ptr(p) || find_range(s.managed_allocs, p) != s.managed_allocs.end() ||
+         find_range(s.host_allocs, p) != s.host_allocs.end();
 }
 
 // Pending chevron launch configuration, pushed by __cudaPushCallConfiguration
@@ -554,94 +688,7 @@ VGPU_EXPORT void** __cudaRegisterFatBinary(void* fatCubin) {
   try {
     ensure_init(s);
     auto rm = std::make_unique<RegisteredModule>();
-    // fatCubin is a __fatBinC_Wrapper_t*; extract the best PTX image.
-    // Drops the leading .version/.target/.address_size directives from a
-    // linked-in piece, so the first piece's header describes the whole module.
-    auto strip_ptx_header = [](const std::string& text) {
-      size_t pos = 0;
-      while (pos < text.size()) {
-        const size_t eol = text.find('\n', pos);
-        const size_t len = (eol == std::string::npos ? text.size() : eol) - pos;
-        std::string line = text.substr(pos, len);
-        size_t a = line.find_first_not_of(" \t");
-        const bool blank = a == std::string::npos;
-        const bool header = !blank && (line.compare(a, 8, ".version") == 0 ||
-                                       line.compare(a, 7, ".target") == 0 ||
-                                       line.compare(a, 13, ".address_size") == 0 ||
-                                       line.compare(a, 2, "//") == 0);
-        if (!blank && !header) break;
-        if (eol == std::string::npos) return std::string{};
-        pos = eol + 1;
-      }
-      return text.substr(pos);
-    };
-    // The PTX the driver would JIT for this device -- see pick_ptx for the
-    // rule. (Every device of a simulated machine has one profile.)
-    const vgpu::DeviceProfile& dev = s.rt->device(0).profile();
-    const uint32_t cc = static_cast<uint32_t>(dev.cc_major * 10 + dev.cc_minor);
-    auto pick_best = [cc](std::vector<vgpu::cuda::FatbinPtx>& v) -> std::string {
-      if (v.empty()) return {};
-      return std::move(v[vgpu::cuda::pick_ptx(v, cc)].text);
-    };
-    auto ptxs = vgpu::cuda::extract_ptx(fatCubin);
-    rm->ptx = pick_best(ptxs);
-    if (rm->ptx.empty()) {
-      // A separately compiled build (-rdc=true) leaves the primary fatbin
-      // empty -- 16 bytes, just a header -- and puts the real device code in a
-      // list of *relocatable* fatbins hanging off the wrapper's fourth field.
-      // Device linking would normally consume them; with a PTX-only -code
-      // there is nothing for nvlink to link, so the pieces arrive here still
-      // separate and the runtime is expected to put them together.
-      //
-      // The wrapper is
-      //   { int magic; int version; const void* data; void* filename_or_fatbins; }
-      // and that last field is a filename in version 1 and a NULL-terminated
-      // array of fatbin pointers in version 2 -- so the version has to be
-      // checked before it is walked, or a char* gets dereferenced as an array.
-      int version = 0;
-      const void* const* relocatable = nullptr;
-      const uint8_t* wp = static_cast<const uint8_t*>(fatCubin);
-      if (wp) {
-        std::memcpy(&version, wp + 4, 4);
-        if (version >= 2) std::memcpy(&relocatable, wp + 16, 8);
-      }
-      std::string linked;
-      size_t pieces = 0;
-      for (size_t i = 0; relocatable && relocatable[i] && i < 64; ++i) {
-        try {
-          auto part = vgpu::cuda::extract_ptx(relocatable[i]);
-          std::string text = pick_best(part);
-          if (text.empty()) continue;
-          // Concatenated rather than merged: cross-piece references resolve
-          // by name, exactly as they would after a link.
-          //
-          // Every piece carries its own .version/.target/.address_size header,
-          // and only the first one's counts. The first relocatable fatbin is
-          // the translation unit being registered; the rest are libraries
-          // linked into it, compiled for whatever the toolkit's default
-          // architecture happened to be. Letting the last header win made a
-          // module built for sm_80 claim to target sm_121 and be refused on an
-          // A100 -- with an error about the *device* being too old, which is
-          // the opposite of what had happened.
-          if (pieces > 0) text = strip_ptx_header(text);
-          linked += text;
-          linked += "\n";
-          ++pieces;
-        } catch (const std::exception&) {
-          // A piece that will not parse is skipped rather than failing the
-          // whole registration: the others may still hold the kernel.
-        }
-      }
-      rm->ptx = std::move(linked);
-      if (trace() && pieces)
-        std::fprintf(stderr, "[vgpu][trace] linked %zu relocatable PTX pieces (-rdc build)\n",
-                     pieces);
-      if (rm->ptx.empty() && !quiet())
-        std::fprintf(stderr,
-                     "[vgpu] __cudaRegisterFatBinary: no PTX in fatbin (SASS-only build); rebuild "
-                     "with an -arch that embeds PTX\n");
-      // Return a handle anyway; the failure surfaces at launch with context.
-    }
+    rm->fatbin = fatCubin;
     RegisteredModule* raw = rm.get();
     s.modules.push_back(std::move(rm));
     if (trace()) std::fprintf(stderr, "[vgpu][trace] __cudaRegisterFatBinary -> %p\n", (void*)raw);
@@ -704,7 +751,7 @@ cudaError_t symbol_address(State& s, const void* symbol, uint64_t* addr, size_t*
     return cudaErrorInvalidSymbol;
   }
   VarInfo& v = it->second;
-  if (!v.mod || v.mod->ptx.empty()) return cudaErrorInvalidSymbol;
+  if (!v.mod || !registered_ptx(s, *v.mod)) return cudaErrorInvalidSymbol;
   const uint64_t mid = module_on_current(s, *v.mod);
   const vgpu::exec::SymbolTable* syms = current(s).symbols(mid);
   if (!syms) return cudaErrorInvalidSymbol;
@@ -727,12 +774,12 @@ cudaError_t symbol_address(State& s, const void* symbol, uint64_t* addr, size_t*
 // as with cudaMemcpy. GPUJPEG's inverse DCT fills its constant table from
 // device memory this way.
 namespace {
-cudaError_t symbol_peer(cudaMemcpyKind kind, cudaMemcpyKind host_kind, const void* p,
+cudaError_t symbol_peer(State& s, cudaMemcpyKind kind, cudaMemcpyKind host_kind, const void* p,
                         bool* device) {
   if (kind != host_kind && kind != cudaMemcpyDeviceToDevice && kind != cudaMemcpyDefault)
     return cudaErrorInvalidValue;
   *device = is_device_ptr(p);
-  if (kind == cudaMemcpyDeviceToDevice && !*device) return cudaErrorInvalidValue;
+  if (kind == cudaMemcpyDeviceToDevice && !copyable_as_device(s, p)) return cudaErrorInvalidValue;
   return cudaSuccess;
 }
 }  // namespace
@@ -745,8 +792,9 @@ VGPU_EXPORT cudaError_t cudaMemcpyToSymbol(const void* symbol, const void* src, 
     const cudaError_t e = symbol_address(s, symbol, &addr, &size);
     if (e != cudaSuccess) return e;
     if (offset + count > size) return cudaErrorInvalidValue;
+    if (count == 0) return cudaSuccess;  // whatever the other pointer is, as on hardware
     bool device = false;
-    if (const cudaError_t k = symbol_peer(kind, cudaMemcpyHostToDevice, src, &device);
+    if (const cudaError_t k = symbol_peer(s, kind, cudaMemcpyHostToDevice, src, &device);
         k != cudaSuccess)
       return k;
     if (!device) {
@@ -768,8 +816,9 @@ VGPU_EXPORT cudaError_t cudaMemcpyFromSymbol(void* dst, const void* symbol, size
     const cudaError_t e = symbol_address(s, symbol, &addr, &size);
     if (e != cudaSuccess) return e;
     if (offset + count > size) return cudaErrorInvalidValue;
+    if (count == 0) return cudaSuccess;  // whatever the other pointer is, as on hardware
     bool device = false;
-    if (const cudaError_t k = symbol_peer(kind, cudaMemcpyDeviceToHost, dst, &device);
+    if (const cudaError_t k = symbol_peer(s, kind, cudaMemcpyDeviceToHost, dst, &device);
         k != cudaSuccess)
       return k;
     if (!device) {
@@ -965,7 +1014,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       std::fprintf(stderr, "[vgpu][trace] launch %s grid %ux%ux%u block %ux%ux%u shared %zu\n",
                    ki.entry_name.c_str(), gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y,
                    blockDim.z, sharedMem);
-    if (!ki.mod || ki.mod->ptx.empty())
+    if (!ki.mod || !registered_ptx(s, *ki.mod))
       throw vgpu::Error::make(vgpu::Err::Unsupported,
                               "kernel '" + ki.entry_name +
                                   "' has no PTX (SASS-only fatbin); rebuild with embedded PTX");
@@ -1127,6 +1176,7 @@ VGPU_EXPORT cudaError_t cudaSetDevice(int device) {
   return guard("cudaSetDevice", [&](State& s) {
     if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
     t_current_device = device;
+    bind_driver_context();
     return cudaSuccess;
   });
 }
@@ -1373,7 +1423,7 @@ VGPU_EXPORT cudaError_t cudaFuncGetAttributes(cudaFuncAttributes* attr, const vo
       return cudaErrorInvalidDeviceFunction;
     }
     KernelInfo& ki = it->second;
-    if (!ki.mod || ki.mod->ptx.empty()) {
+    if (!ki.mod || !registered_ptx(s, *ki.mod)) {
       if (!quiet())
         std::fprintf(stderr,
                      "[vgpu] cudaFuncGetAttributes: kernel '%s' has no PTX in its fatbin\n",
@@ -1420,7 +1470,7 @@ VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBl
       return cudaErrorInvalidDeviceFunction;
     }
     KernelInfo& ki = it->second;
-    if (!ki.mod || ki.mod->ptx.empty()) {
+    if (!ki.mod || !registered_ptx(s, *ki.mod)) {
       if (!quiet())
         std::fprintf(stderr,
                      "[vgpu] cudaOccupancyMaxActiveBlocksPerMultiprocessor: kernel '%s' has no "
@@ -1569,6 +1619,12 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
                              "This is injected, not a real failure\n");
       return cudaErrorInvalidValue;
     }
+    // Nothing to copy is a success whatever the pointers and the kind say --
+    // null, host, device, or the wrong direction: an RTX 3060 returns
+    // cudaSuccess for every zero-byte cudaMemcpy. CUTLASS relies on it, copying
+    // empty tensors (null pointers) as device-to-device when a
+    // std::vector<HostTensor> reallocates.
+    if (count == 0) return cudaSuccess;
     auto _t0 = std::chrono::steady_clock::now();
     bool dd = is_device_ptr(dst), sd = is_device_ptr(src);
     // Under unified addressing a device pointer names its own device, so each
@@ -1579,8 +1635,9 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
     vgpu::MemoryManager& dmm = dd ? owner_memory(s, dst) : current(s).memory();
     vgpu::MemoryManager& smm = sd ? owner_memory(s, src) : current(s).memory();
     // Under unified addressing the kind is checked, then the pointers decide.
-    // A side the kind calls device memory must be device memory, or the copy
-    // is refused; a side it calls host memory may turn out to be a device
+    // A side the kind calls device memory must be memory CUDA owns (a device,
+    // managed or pinned allocation), or the copy is refused; a side it calls
+    // host memory may turn out to be a device
     // allocation, and is then copied as one. That is what the hardware does
     // (an RTX 3060: cudaMemcpyHostToDevice from a device pointer copies the
     // right bytes; cudaMemcpyDeviceToHost from a host pointer is an invalid
@@ -1589,7 +1646,9 @@ VGPU_EXPORT cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cud
         kind == cudaMemcpyDeviceToDevice || kind == cudaMemcpyHostToHost) {
       const bool dst_device = kind == cudaMemcpyHostToDevice || kind == cudaMemcpyDeviceToDevice;
       const bool src_device = kind == cudaMemcpyDeviceToHost || kind == cudaMemcpyDeviceToDevice;
-      if ((dst_device && !dd) || (src_device && !sd)) return cudaErrorInvalidValue;
+      if ((dst_device && !copyable_as_device(s, dst)) ||
+          (src_device && !copyable_as_device(s, src)))
+        return cudaErrorInvalidValue;
       kind = cudaMemcpyDefault;
     }
     if (kind == cudaMemcpyDefault) kind = dd && sd ? cudaMemcpyDeviceToDevice
@@ -1698,6 +1757,7 @@ VGPU_EXPORT cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* 
 
 VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
   return guard("cudaMemset", [&](State& s) {
+    if (count == 0) return cudaSuccess;  // even for a null pointer, as on hardware
     const uint8_t byte = static_cast<uint8_t>(value);
     owner_memory(s, dst).fill(reinterpret_cast<uint64_t>(dst), &byte, 1, count);
     return cudaSuccess;
@@ -4612,7 +4672,7 @@ bool kernel_param_sizes(const void* func, std::vector<uint32_t>* out) {
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   if (!s.rt) return false;
   auto it = s.kernels.find(func);
-  if (it == s.kernels.end() || !it->second.mod || it->second.mod->ptx.empty()) return false;
+  if (it == s.kernels.end() || !it->second.mod || !registered_ptx(s, *it->second.mod)) return false;
   const uint64_t mid = module_on_current(s, *it->second.mod);
   const vgpu::ptx::EntryFn* fn = current(s).get_function(mid, it->second.entry_name);
   if (!fn) return false;

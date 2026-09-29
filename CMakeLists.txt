@@ -30,6 +30,7 @@ set(VGPU_PROFILES
   nvidia/h100
   nvidia/h200
   nvidia/b200
+  nvidia/rtx5090
   nvidia/rtx3060
   nvidia/rtx3080ti
   nvidia/a100-sxm4-40gb
@@ -135,6 +136,7 @@ add_library(vgpu STATIC
   amd/src/regs.cpp
   amd/src/metrics.cpp
   amd/src/cper.cpp
+  amd/src/kfd.cpp
   nvidia/src/regs.cpp
   src/core/profile.cpp
   src/core/registry.cpp
@@ -151,6 +153,7 @@ add_library(vgpu STATIC
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
   src/runtime/runtime.cpp
+  src/runtime/shared_runtime.cpp
 )
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 
@@ -541,7 +544,8 @@ if(CUDA_ABI_INCLUDE)
     NO_DEFAULT_PATH)
   if(CUDNN_INCLUDE)
     message(STATUS "cuDNN headers at ${CUDNN_INCLUDE}: building libvgpucudnn")
-    add_library(vgpucudnn SHARED nvidia/src/cudnn_api.cpp nvidia/src/generated/cudnn_stubs.cpp)
+    add_library(vgpucudnn SHARED nvidia/src/cudnn_api.cpp nvidia/src/cudnn_backend.cpp nvidia/src/cudnn_rnn.cpp
+      nvidia/src/generated/cudnn_stubs.cpp)
     target_link_libraries(vgpucudnn PRIVATE vgpu vgpucudart)
     target_include_directories(vgpucudnn PRIVATE ${CUDNN_INCLUDE} ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpucudnn PROPERTIES OUTPUT_NAME cudnn SOVERSION 9 VERSION 9.0)
@@ -712,6 +716,7 @@ vgpu_unit_test(test_amd_gcn_lds amd/tests/unit/test_gcn_lds.cpp)
 
 # Each AMD profile's chip facts are its own (amd/include/vgpu/amd_chip.hpp).
 vgpu_unit_test(test_amd_chip amd/tests/unit/test_amd_chip.cpp)
+vgpu_unit_test(test_amd_kfd amd/tests/unit/test_amd_kfd.cpp)
 target_compile_definitions(test_amd_gcn_lds PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # The same kernels built for gfx1100 (RDNA3, wave32), through the same
@@ -766,6 +771,20 @@ set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 600)
 
 vgpu_unit_test(test_amd_hip_abi amd/tests/unit/test_hip_abi.cpp)
+# HIP's grid sizes for every AMD profile, one process each (the runtime takes
+# its GPU from VGPU_GPU once).
+add_executable(test_amd_hip_grid amd/tests/unit/test_hip_grid.cpp)
+target_link_libraries(test_amd_hip_grid PRIVATE vgpuhip vgpu)
+target_include_directories(test_amd_hip_grid PRIVATE tests/framework amd/include)
+foreach(_p IN LISTS VGPU_PROFILES)
+  if(_p MATCHES "^amd/")
+    string(REPLACE "amd/" "" _n "${_p}")
+    add_test(NAME test_amd_hip_grid_${_n} COMMAND test_amd_hip_grid)
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/telemetry-hip-grid-${_n}")
+    set_tests_properties(test_amd_hip_grid_${_n} PROPERTIES ENVIRONMENT
+      "VGPU_GPU=${_p};VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-hip-grid-${_n}")
+  endif()
+endforeach()
 
 vgpu_unit_test(test_amd_hipcc_ops amd/tests/unit/test_hipcc_ops.cpp)
 target_compile_definitions(test_amd_hipcc_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -855,6 +874,10 @@ set_tests_properties(amd_pytorch_mi250x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TR
 # builds for it.
 add_test(NAME amd_pytorch_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/mi350x)
 set_tests_properties(amd_pytorch_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# And on an MI325X: the MI300X's die with more memory, and its own profile.
+add_test(NAME amd_pytorch_mi325x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/mi325x)
+set_tests_properties(amd_pytorch_mi325x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # hipSPARSELt's 2:4 sparse GEMMs, from the same wheel: its kernels prune,
 # compress and multiply with the sparse matrix instructions, gfx942's and
@@ -1114,6 +1137,15 @@ if(TARGET vgpucublas)
   # temporary storage, decoupled look-back scan and warp primitives throughout
   # -- so running them end to end exercises far more than a hand-written kernel
   # does, and the answer is checked rather than the launch's return code.
+  # cuBLAS and cuSPARSE conformance programs against output an RTX 3060 printed,
+  # so a routine that stops agreeing with the hardware fails without a GPU.
+  add_test(NAME e2e_library_goldens
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_library_goldens.sh)
+  set_tests_properties(e2e_library_goldens PROPERTIES
+    DEPENDS "vgpucudart;vgpucublas;vgpucusparse"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
   add_test(NAME e2e_libraries
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_libraries.sh)
   set_tests_properties(e2e_libraries PROPERTIES
@@ -1186,6 +1218,13 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_video_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_video_forms.sh)
+  set_tests_properties(e2e_video_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_modern_dtypes
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_modern_dtypes.sh)
   set_tests_properties(e2e_modern_dtypes PROPERTIES
@@ -1234,6 +1273,11 @@ set_tests_properties(e2e_texture_filtering PROPERTIES
 # surfaces, compared bit for bit with results recorded on an RTX 3060.
 add_test(NAME e2e_alloca_stack COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_alloca_stack.sh)
 set_tests_properties(e2e_alloca_stack PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+add_test(NAME e2e_surface_oob COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_surface_oob.sh)
+set_tests_properties(e2e_surface_oob PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
@@ -1465,6 +1509,13 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 5400)
+  # CUTLASS's SM120 GEMM tests on a simulated RTX 5090: mma.sync's fp4/fp6,
+  # block-scaled and sparse kinds, and ldmatrix's .b8x16 expansion.
+  add_test(NAME e2e_cutlass_sm120 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_sm120.sh)
+  set_tests_properties(e2e_cutlass_sm120 PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 5400)
   add_test(NAME e2e_block_semaphore COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_block_semaphore.sh)
   set_tests_properties(e2e_block_semaphore PROPERTIES
     DEPENDS vgpucudart
@@ -1512,6 +1563,33 @@ endif()
 # Memory a graph owns: an allocation node, a free node, what the graph-memory
 # attributes report, and a trim that keeps the address it documents as fixed.
 if(TARGET vgpucudart)
+  # PyTorch's CUDA build, unmodified, on a simulated RTX 5090: the whole-model
+  # checks the AMD GPUs run (amd/tests/pytorch/models.py), through
+  # `vgpu run --preload`, where a Python with PyTorch for CUDA 13 is installed
+  # (VGPU_TORCH_CUDA_PYTHON); it skips elsewhere. nvidia/docs/pytorch.md.
+  add_test(NAME e2e_pytorch_models_rtx5090 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
+           ${CMAKE_SOURCE_DIR}/amd/tests/pytorch/models.py 12 nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_models_rtx5090 PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
+  # cuDNN's graph API, BatchNorm training and RNNs, and cuBLASLt with a cuBLAS
+  # handle -- the paths PyTorch's CUDA build takes -- against host references.
+  add_test(NAME e2e_dnn_paths COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dnn_paths.sh)
+  set_tests_properties(e2e_dnn_paths PROPERTIES
+    DEPENDS "vgpucudart;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+  # The runtime and driver APIs sharing one simulated machine.
+  add_test(NAME e2e_mixed_apis COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mixed_apis.sh)
+  set_tests_properties(e2e_mixed_apis PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   add_test(NAME e2e_graph_memory COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_memory.sh)
   set_tests_properties(e2e_graph_memory PROPERTIES
     DEPENDS vgpucudart

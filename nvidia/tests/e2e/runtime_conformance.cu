@@ -118,6 +118,41 @@ int main() {
   CHECK("and none of them poisons the context", cudaMalloc(&probe, 16) == cudaSuccess, "unexpected");
   cudaGetLastError();
 
+  // Nothing to copy succeeds whatever the pointers and the kind say: an RTX
+  // 3060 returns cudaSuccess for every one of these, and CUTLASS copies empty
+  // tensors (null pointers) as device-to-device when a vector of them grows.
+  // The kind check refused them for a while, which failed CUTLASS's SM100
+  // ptr-array GEMM tests. A nonzero copy between null pointers still refuses.
+  {
+    cudaStream_t zs;
+    cudaStreamCreate(&zs);
+    const cudaError_t z[] = {
+        cudaMemcpy(nullptr, nullptr, 0, cudaMemcpyDeviceToDevice),
+        cudaMemcpy(nullptr, nullptr, 0, cudaMemcpyHostToDevice),
+        cudaMemcpy(nullptr, nullptr, 0, cudaMemcpyDeviceToHost),
+        cudaMemcpy(nullptr, nullptr, 0, cudaMemcpyDefault),
+        cudaMemcpy(&stack_int, d, 0, cudaMemcpyHostToDevice),  // the wrong kind, but nothing to copy
+        cudaMemcpyAsync(nullptr, nullptr, 0, cudaMemcpyDeviceToDevice, zs),
+        cudaMemcpy2D(nullptr, 64, nullptr, 64, 16, 0, cudaMemcpyDeviceToDevice),
+        cudaMemcpyPeer(nullptr, 1, nullptr, 0, 0),
+        cudaMemcpyToSymbol(table, nullptr, 0),
+        cudaMemcpyFromSymbol(nullptr, table, 0),
+        cudaMemset(nullptr, 0, 0),
+    };
+    int bad = -1;
+    for (int i = 0; i < (int)(sizeof z / sizeof z[0]); ++i)
+      if (z[i] != cudaSuccess && bad < 0) bad = i;
+    CHECK("zero-byte copies and memsets succeed, null pointers and all", bad < 0,
+          "call %d returned %d %s", bad, bad < 0 ? 0 : z[bad], cudaGetErrorName(bad < 0 ? cudaSuccess : z[bad]));
+    e = cudaMemcpy(nullptr, nullptr, 4, cudaMemcpyDeviceToDevice);
+    CHECK("a nonzero copy between null pointers -> invalid value", e == cudaErrorInvalidValue,
+          "got %d %s", e, cudaGetErrorName(e));
+    CHECK("and neither poisons the context", cudaStreamSynchronize(zs) == cudaSuccess &&
+          cudaDeviceSynchronize() == cudaSuccess, "unexpected");
+    cudaStreamDestroy(zs);
+    cudaGetLastError();
+  }
+
   // Synchronization reports failed work, not a refused call.
   cudaMalloc(&big, (size_t)1 << 50);
   e = cudaDeviceSynchronize();
@@ -298,6 +333,52 @@ int main() {
     cudaGetLastError();
     cudaFree(a);
     cudaFree(b);
+  }
+
+  // Memory CUDA allocated on the host counts as device memory for a copy:
+  // managed and pinned buffers are accepted as the device side in every
+  // direction, as an RTX 3060 accepts them; pageable memory, and memory pinned
+  // afterwards with cudaHostRegister, are refused there. NanoVDB copies from a
+  // managed buffer with cudaMemcpyDeviceToHost.
+  {
+    const int four[4] = {1, 2, 3, 4};
+    int *managed = nullptr, *pinned = nullptr, *dev = nullptr, got[4] = {0};
+    cudaMallocManaged(&managed, 16);
+    cudaMallocHost(&pinned, 16);
+    cudaMalloc(&dev, 16);
+    int* regd = static_cast<int*>(std::aligned_alloc(4096, 4096));
+    cudaHostRegister(regd, 4096, cudaHostRegisterDefault);
+    std::memcpy(managed, four, 16);
+    std::memcpy(pinned, four, 16);
+    e = cudaMemcpy(got, managed, 16, cudaMemcpyDeviceToHost);
+    CHECK("cudaMemcpy DeviceToHost from managed memory", e == cudaSuccess && got[3] == 4, "got %d %s, value %d", e, cudaGetErrorName(e), got[3]);
+    got[3] = 0;
+    e = cudaMemcpyAsync(got, pinned, 16, cudaMemcpyDeviceToHost, 0);
+    cudaStreamSynchronize(0);
+    CHECK("cudaMemcpyAsync DeviceToHost from pinned memory", e == cudaSuccess && got[3] == 4, "got %d %s, value %d", e, cudaGetErrorName(e), got[3]);
+    std::memset(managed, 0, 16);
+    e = cudaMemcpy(managed, four, 16, cudaMemcpyHostToDevice);
+    CHECK("cudaMemcpy HostToDevice into managed memory", e == cudaSuccess && managed[3] == 4, "got %d %s", e, cudaGetErrorName(e));
+    cudaMemset(dev, 0, 16);
+    e = cudaMemcpy(dev, pinned, 16, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(got, dev, 16, cudaMemcpyDeviceToHost);
+    CHECK("cudaMemcpy DeviceToDevice from pinned to device memory", e == cudaSuccess && got[3] == 4, "got %d %s, value %d", e, cudaGetErrorName(e), got[3]);
+    std::memset(managed, 0, 16);
+    e = cudaMemcpy(managed, dev, 16, cudaMemcpyDeviceToDevice);
+    CHECK("cudaMemcpy DeviceToDevice from device to managed memory", e == cudaSuccess && managed[3] == 4, "got %d %s", e, cudaGetErrorName(e));
+    e = cudaMemcpy(got, regd, 16, cudaMemcpyDeviceToHost);
+    CHECK("cudaMemcpy DeviceToHost from cudaHostRegister'd memory -> invalid value", e == cudaErrorInvalidValue, "got %d %s", e, cudaGetErrorName(e));
+    cudaGetLastError();
+    int nines[4] = {9, 9, 9, 9};
+    cudaMemcpyToSymbol(table, nines, 16);
+    e = cudaMemcpyToSymbol(table, managed, 16, 0, cudaMemcpyDeviceToDevice);
+    cudaMemcpyFromSymbol(got, table, 16);
+    CHECK("cudaMemcpyToSymbol DeviceToDevice from managed memory", e == cudaSuccess && got[3] == 4, "got %d %s, value %d", e, cudaGetErrorName(e), got[3]);
+    cudaHostUnregister(regd);
+    std::free(regd);
+    cudaFree(managed);
+    cudaFreeHost(pinned);
+    cudaFree(dev);
   }
 
   // Cache preferences: accepted for a kernel, refused for anything else, and the
