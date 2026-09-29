@@ -45,7 +45,9 @@ bool executes(const Instr& ins) {
     case Op::USEL: case Op::USHF: case Op::VABSDIFF4: case Op::VIADD: case Op::VIMNMX: case Op::VIADDMNMX:
     case Op::VIMNMX3: case Op::IADD: case Op::UP2UR: case Op::ELECT: case Op::USETMAXREG: case Op::WARPGROUP:
     case Op::FMNMX3: case Op::STSM: case Op::RPCMOV: case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
-    case Op::SYNCS: case Op::ARRIVES: case Op::UTMALDG: case Op::UTMASTG: case Op::UTMAREDG: case Op::UBLKCP:
+    case Op::UTMALDG:
+      return !ins.f[6];   // not im2col::w or ::w::128, which the PTX engine does not run either
+    case Op::SYNCS: case Op::ARRIVES: case Op::UTMASTG: case Op::UTMAREDG: case Op::UBLKCP:
     case Op::UBLKRED: case Op::LDTM: case Op::STTM: case Op::UTCMMA: case Op::UTCBAR: case Op::UTCCP:
     case Op::UTCSHIFT: case Op::UTCATOMSWS: case Op::STAS: case Op::REDAS: case Op::UGETNEXTWORKID:
     case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2FP: case Op::F2I:
@@ -3090,7 +3092,8 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   // Tensor copies.
   const bool load = ins.op == Op::UTMALDG, reduce = ins.op == Op::UTMAREDG;
   const uint32_t dims = ins.f[0];
-  const bool im2col = ins.f[1], multicast = ins.f[2];
+  const bool im2col = ins.f[1], multicast = ins.f[2], four_rows = ins.f[4], pair = ins.f[5];
+  if (ins.f[6]) throw Error(Err::UnsupportedPtx, "im2col::w tensor copies are not implemented");
   const uint64_t tmap_at = ur64(urb);
   if (tmap_at % 64) throw Error(Err::MisalignedAccess, "a tensor map must be 64-byte aligned");
   uint64_t q[16];
@@ -3105,11 +3108,12 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     throw Error(Err::InvalidValue,
                 "the tensor map this copy names was not made by cuTensorMapEncodeTiled (or was overwritten); its first "
                 "bytes are not the encoder's");
+  // The coordinates; .tile::gather4/scatter4's are the column and four rows.
   int64_t coords[5] = {};
   const unsigned first = load ? ura + 2 : ura + 1;
-  for (uint32_t d = 0; d < dims && d < 5; ++d) coords[d] = static_cast<int32_t>(urv(first + d));
+  for (uint32_t d = 0; d < (four_rows ? 5u : dims) && d < 5; ++d) coords[d] = static_cast<int32_t>(urv(first + d));
   exec::TmaBox box;
-  if (auto bad = exec::tma_box(map, dims, coords, false, im2col, load, reduce, &box)) throw Error(bad->code, bad->what);
+  if (auto bad = exec::tma_box(map, dims, coords, four_rows, im2col, load, reduce, &box)) throw Error(bad->code, bad->what);
   const uint32_t extra = (im2col || multicast) ? urv(urc) : 0;
   std::array<int64_t, 3> offsets{};
   if (im2col) {
@@ -3124,7 +3128,7 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     // The box, read from global memory into its shared-memory layout.
     std::vector<std::pair<uint32_t, std::vector<uint8_t>>> runs;   // (shared offset, bytes)
     runs.reserve(box.total);
-    exec::tma_walk(map, box, nullptr, offsets, false, [&](uint64_t e, uint64_t gaddr, bool inside) {
+    exec::tma_walk(map, box, coords + 1, offsets, four_rows, [&](uint64_t e, uint64_t gaddr, bool inside) {
       const uint32_t soff = static_cast<uint32_t>(exec::swizzle_address(smem + e * box.es, swz, atom));
       std::vector<uint8_t> v(box.packed ? box.gs : box.es, 0);
       if (inside) gread(gaddr, v.data(), static_cast<uint32_t>(v.size()));
@@ -3140,13 +3144,20 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     // the packed types, the packed bytes).
     uint32_t bar_off;
     Block& bar = shared_block(blk, urv(ura + 1), &bar_off);
-    if (&bar != &home) throw Fault("a tensor copy's mbarrier must be in the block its data goes to");
+    // .2CTA lets the barrier be in the destination's peer CTA instead, which
+    // CUTLASS's 2-SM kernels use to count both CTAs' tiles on the leader's.
+    if (&bar != &home && !(pair && (bar.rank ^ 1) == home.rank))
+      throw Fault(pair ? "a .2CTA tensor copy's mbarrier must be in the block its data goes to or that block's peer"
+                       : "a tensor copy's mbarrier must be in the block its data goes to");
     const auto deliver = [&](Block& to) {
       for (const auto& [soff, v] : runs) {
         shared_range(to, soff, v.size(), "a tensor copy");
         std::memcpy(&to.shared[soff], v.data(), v.size());
       }
-      mbar_arrive(to, bar_off, 0, -static_cast<int64_t>(box.total * box.gs), false);
+      // Each destination's signal goes to its own barrier, or with .2CTA to
+      // whichever CTA of its pair has the barrier's rank parity.
+      Block& b = pair ? cluster_block(blk, (to.rank & ~1u) | (bar.rank & 1u)) : to;
+      mbar_arrive(b, bar_off, 0, -static_cast<int64_t>(box.total * box.gs), false);
     };
     if (!multicast) {
       deliver(home);
@@ -3171,7 +3182,7 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
                   "a tensor reduction with no form of this operation for the tensor map's element type (9.7.10.28.5.4)");
   }
   uint64_t stored = 0;
-  exec::tma_walk(map, box, nullptr, offsets, false, [&](uint64_t e, uint64_t gaddr, bool inside) {
+  exec::tma_walk(map, box, coords + 1, offsets, four_rows, [&](uint64_t e, uint64_t gaddr, bool inside) {
     if (!inside) return;
     const uint32_t soff = static_cast<uint32_t>(exec::swizzle_address(smem + e * box.es, swz, atom));
     shared_range(blk, soff, box.es, "a tensor store");
