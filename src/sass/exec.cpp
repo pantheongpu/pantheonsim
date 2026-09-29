@@ -49,7 +49,7 @@ double as_f64(uint64_t b) { double d; std::memcpy(&d, &b, 8); return d; }
 uint64_t f64_bits(double d) { uint64_t b; std::memcpy(&b, &d, 8); return b; }
 
 // Why a lane is not runnable.
-enum class Wait : uint8_t { None, BSync, WarpSync, Bar };
+enum class Wait : uint8_t { None, BSync, WarpSync, Bar, Cluster };
 
 struct Warp {
   uint32_t index = 0;                 // within the block
@@ -79,6 +79,10 @@ struct Warp {
   // Set by a wait that came back unsatisfied (an mbarrier phase check): the
   // warp's turn ends there, so the warps it waits on get to run.
   bool yield = false;
+  // The cluster barrier (UCGABAR): lanes that have arrived in its current
+  // phase, and the phase each lane's wait waits for.
+  Mask cga_arrived = 0;
+  uint64_t cga_target[32] = {};
 
   Mask runnable() const { return alive & ~exited & ~waiting; }
   uint32_t& reg(unsigned n, unsigned lane) {
@@ -94,8 +98,22 @@ struct GmmaSnapshot {
   uint8_t taken = 0;   // the warps that have used it
 };
 
+struct Block;
+
+// The blocks of one thread-block cluster, resident and run together, by
+// rank; and its barrier (barrier.cluster), whose phase advances when every
+// thread of every block that has not exited has arrived. A launch without
+// clusters gives each block a cluster of its own.
+struct Cluster {
+  std::vector<Block*> blocks;
+  uint64_t phase = 0;
+};
+
 struct Block {
   uint32_t ctaid[3] = {};
+  uint32_t rank = 0;            // in its cluster (SR_CgaCtaId)
+  Cluster* cluster = nullptr;
+  Cluster own;                  // the cluster when the launch has none
   std::vector<Warp> warps;
   std::vector<uint8_t> shared;
   std::map<std::pair<uint32_t, uint64_t>, GmmaSnapshot> gmma;   // (warpgroup, n-th MMA)
@@ -144,6 +162,11 @@ class Runner {
       coop_ws_ = mem.alloc(64);
       const uint8_t zero = 0;
       mem.fill(coop_ws_, &zero, 1, 64);
+    }
+    for (int d = 0; d < 3; ++d) {
+      cshape_[d] = cfg.cluster[d] ? cfg.cluster[d] : 1;
+      csize_ *= cshape_[d];
+      clustered_ = clustered_ || cshape_[d] > 1;
     }
     build_bank0(args);
     for (const auto& [name, va] : m.bank_va) {
@@ -212,11 +235,14 @@ class Runner {
   void exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex);   // warpgroup MMA
   void exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex);   // textures and surfaces
   void exec_syncs(Block& blk, Warp& w, const Instr& ins, Mask ex);   // mbarriers
-  uint32_t mbar_offset(Block& blk, Warp& w, const Instr& ins, unsigned lane, bool ur_only);
+  uint32_t mbar_offset(Block& blk, Warp& w, const Instr& ins, unsigned lane, bool ur_only, Block** owner);
   uint64_t mbar_arrive(Block& blk, uint32_t off, uint32_t arrivals, int64_t tx, bool drop);
   uint64_t mbar_arrive80(Block& blk, uint32_t off);
   void exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex);   // TMA and bulk copies
-  Block& shared_block(Block& blk, uint32_t addr, uint32_t* off);
+  Block& shared_block(Block& blk, uint64_t addr, uint32_t* off);
+  Block& cluster_block(Block& blk, uint32_t rank);
+  void run_cluster(uint64_t k);                          // one cluster's blocks, together
+  void cluster_barrier_check(Block& blk);                // UCGABAR: complete the phase if all are in
   void builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name);
   uint32_t ival(Warp& w, const Operand& o, unsigned lane);   // with -/~ applied
 
@@ -232,6 +258,12 @@ class Runner {
   uint32_t local_size_ = 0;
   uint64_t shared_size_ = 0;
   uint32_t block_threads_ = 0;
+  // Thread-block clusters: the shape (1x1x1 without one), its size, and
+  // whether the launch has clusters at all (any dimension over 1, as the PTX
+  // engine counts %is_explicit_cluster).
+  std::array<uint32_t, 3> cshape_{1, 1, 1};
+  uint32_t csize_ = 1;
+  bool clustered_ = false;
   exec::LaunchStats stats_;
   std::mutex stats_mu_;
   // The heap malloc() draws from, shared by every launch on the device.
@@ -284,6 +316,28 @@ void Runner::build_bank0(const std::vector<std::vector<uint8_t>>& args) {
   const uint32_t stack = std::max<uint32_t>({k_.min_stack, k_.frame_size, 16});
   put32(stackf, (stack + 15) & ~15u);
   put64(sm >= 100 ? 0x358 : sm >= 90 ? 0x208 : 0x118, 0);   // the descriptor's bits are a cache policy
+  // The cluster's shape (sm_90+), which ptxas reads to compute %cluster_*
+  // and %clusterid -- dividing by multiplying with the shape's reciprocals,
+  // as floats rounded up so that the truncated products are exact:
+  //                  explicit  shape  1/shape  clusters  CTAs
+  //   sm_90          0x140     0x144  0x150    0x15c     0x188
+  //   sm_100, 120    0x36c     0x2a0  0x2b0    0x2c0     0x2cc
+  // (sm_100 indexes the table by SR_CgaSize, which is 0 here.) explicit is
+  // 1 with a cluster: %is_explicit_cluster, and cluster.sync()'s choice
+  // between the cluster barrier and a block barrier, test it for 1.
+  if (sm >= 90) {
+    const size_t shape = sm >= 100 ? 0x2a0 : 0x144, recip = sm >= 100 ? 0x2b0 : 0x150;
+    const size_t count = sm >= 100 ? 0x2c0 : 0x15c, ctas = sm >= 100 ? 0x2cc : 0x188;
+    put32(sm >= 100 ? 0x36c : 0x140, clustered_ ? 1 : 0);
+    for (int i = 0; i < 3; ++i) {
+      put32(shape + 4 * i, cshape_[i]);
+      float r = static_cast<float>(1.0 / cshape_[i]);
+      if (static_cast<double>(r) < 1.0 / cshape_[i]) r = std::nextafter(r, 2.0f);
+      std::memcpy(&bank0_[recip + 4 * i], &r, 4);
+      put32(count + 4 * i, cfg_.grid[i] / cshape_[i]);
+    }
+    put32(ctas, csize_);
+  }
   // PTX's %envreg1/%envreg2: a cooperative launch's grid barrier workspace,
   // high word first. cg::this_grid().sync() traps when it is zero, which is
   // what an ordinary launch of a grid-sync kernel gets.
@@ -422,7 +476,7 @@ uint32_t Runner::sreg(const Block& blk, const Warp& w, unsigned idx, unsigned la
     }
     case 0x32: return static_cast<uint32_t>(shared_size_);              // SR_SMEMSZ
     case 0x2f: return static_cast<uint32_t>(kSharedWindow >> 32);       // SR_SWINHI
-    case 0x88: return 0;                                                // SR_CgaCtaId: one block per cluster
+    case 0x88: return blk.rank;                                         // SR_CgaCtaId: the rank in the cluster
     case 0x8a: return 0;                                                // SR_CgaSize (bank 0's envregs at +0)
     case 0x28: return block_threads_;                                   // SR_NTID
     default: return 0;
@@ -448,14 +502,40 @@ Runner::Space Runner::classify(uint64_t g, uint64_t* off) const {
   return Space::Global;
 }
 
+// The block whose shared memory a shared address names: ptxas keeps the
+// block's rank in its cluster in bits 24 up of every shared address (its
+// own included: shared::cta addresses are SR_CgaCtaId << 24 | offset, and
+// mapa swaps the rank), and the offset below.
+Block& Runner::shared_block(Block& blk, uint64_t addr, uint32_t* off) {
+  *off = static_cast<uint32_t>(addr) & 0xffffff;
+  const uint32_t rank = static_cast<uint32_t>(addr >> 24);
+  if (rank == blk.rank) return blk;
+  if (!blk.cluster || rank >= blk.cluster->blocks.size()) {
+    char b[160];
+    std::snprintf(b, sizeof b, "a shared address (0x%llx) naming block %u of a cluster of %zu",
+                  static_cast<unsigned long long>(addr), rank, blk.cluster ? blk.cluster->blocks.size() : size_t{1});
+    throw Fault(b);
+  }
+  Block& to = *blk.cluster->blocks[rank];
+  bool live = false;
+  for (const Warp& w : to.warps) live = live || (w.alive & ~w.exited);
+  // A block that exits takes its shared memory with it: cluster.sync()
+  // before exiting is what keeps a peer's reads valid.
+  if (!live) throw Fault("shared memory of block " + std::to_string(rank) + " of the cluster, which has exited");
+  return to;
+}
+
 void Runner::mem_read(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, void* out, uint32_t n) {
   switch (s) {
-    case Space::Shared:
-      if (a + n > blk.shared.size())
-        throw Fault("shared read of " + std::to_string(n) + " bytes at 0x" + [&] { char b[24]; std::snprintf(b, sizeof b, "%llx", (unsigned long long)a); return std::string(b); }() +
-                    ", past the block's " + std::to_string(blk.shared.size()) + " bytes");
-      std::memcpy(out, &blk.shared[a], n);
+    case Space::Shared: {
+      uint32_t off;
+      Block& b = shared_block(blk, a, &off);
+      if (uint64_t{off} + n > b.shared.size())
+        throw Fault("shared read of " + std::to_string(n) + " bytes at 0x" + [&] { char t[24]; std::snprintf(t, sizeof t, "%llx", (unsigned long long)a); return std::string(t); }() +
+                    ", past the block's " + std::to_string(b.shared.size()) + " bytes");
+      std::memcpy(out, &b.shared[off], n);
       return;
+    }
     case Space::Local:
       if (a + n > w.local_size)
         throw Fault("local read of " + std::to_string(n) + " bytes at 0x" + [&] { char b[24]; std::snprintf(b, sizeof b, "%llx", (unsigned long long)a); return std::string(b); }() +
@@ -481,11 +561,14 @@ void Runner::mem_read(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, v
 
 void Runner::mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, const void* in, uint32_t n) {
   switch (s) {
-    case Space::Shared:
-      if (a + n > blk.shared.size())
-        throw Fault("shared write of " + std::to_string(n) + " bytes past the block's " + std::to_string(blk.shared.size()) + " bytes");
-      std::memcpy(&blk.shared[a], in, n);
+    case Space::Shared: {
+      uint32_t off;
+      Block& b = shared_block(blk, a, &off);
+      if (uint64_t{off} + n > b.shared.size())
+        throw Fault("shared write of " + std::to_string(n) + " bytes past the block's " + std::to_string(b.shared.size()) + " bytes");
+      std::memcpy(&b.shared[off], in, n);
       return;
+    }
     case Space::Local:
       if (a + n > w.local_size)
         throw Fault("local write of " + std::to_string(n) + " bytes past the thread's " + std::to_string(w.local_size) + " bytes");
@@ -515,6 +598,10 @@ void Runner::mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, 
 // ---- the grid ------------------------------------------------------------------
 
 void Runner::init_block(Block& blk, uint64_t linear) {
+  blk.rank = 0;
+  blk.own.blocks.assign(1, &blk);
+  blk.own.phase = 0;
+  blk.cluster = &blk.own;
   blk.ctaid[0] = static_cast<uint32_t>(linear % cfg_.grid[0]);
   blk.ctaid[1] = static_cast<uint32_t>((linear / cfg_.grid[0]) % cfg_.grid[1]);
   blk.ctaid[2] = static_cast<uint32_t>(linear / (static_cast<uint64_t>(cfg_.grid[0]) * cfg_.grid[1]));
@@ -547,6 +634,11 @@ exec::LaunchStats Runner::run() {
   if (block_threads_ == 0 || block_threads_ > 1024)
     throw Error(Err::LaunchConfig, "block of " + std::to_string(block_threads_) + " threads");
   const uint64_t blocks = static_cast<uint64_t>(cfg_.grid[0]) * cfg_.grid[1] * cfg_.grid[2];
+  if (clustered_ && cfg_.cooperative)
+    throw Error(Err::UnsupportedPtx, "SASS kernel " + k_.name + ": a cooperative launch with clusters is not implemented");
+  // The unit of work: a block, or with clusters a cluster, whose blocks must
+  // be resident together.
+  const uint64_t units = clustered_ ? blocks / csize_ : blocks;
   std::atomic<uint64_t> next{0};
   std::exception_ptr failure;
   std::mutex fail_mu;
@@ -554,12 +646,16 @@ exec::LaunchStats Runner::run() {
     Block blk;
     for (;;) {
       const uint64_t i = next.fetch_add(1);
-      if (i >= blocks) return;
+      if (i >= units) return;
       {
         std::lock_guard<std::mutex> g(fail_mu);
         if (failure) return;
       }
       try {
+        if (clustered_) {
+          run_cluster(i);
+          continue;
+        }
         init_block(blk, i);
         run_block(blk);
         std::lock_guard<std::mutex> g(stats_mu_);
@@ -581,7 +677,7 @@ exec::LaunchStats Runner::run() {
       threads = std::max(1u, std::thread::hardware_concurrency());
 #endif
     }
-    threads = static_cast<unsigned>(std::min<uint64_t>(threads, blocks));
+    threads = static_cast<unsigned>(std::min<uint64_t>(threads, units));
     // A kernel that can allocate while it runs (malloc/free) runs on one
     // host thread: the allocator's table is read unlocked by every access, so
     // an allocation in one block beside a load in another is a data race.
@@ -645,6 +741,46 @@ void Runner::run_block(Block& blk) {
                                     ", " + std::to_string(blk.ctaid[1]) + ", " + std::to_string(blk.ctaid[2]) +
                                     ") is waiting (a barrier some threads never reach)");
   }
+}
+
+// Cluster k's blocks, resident together and taking turns as a block's warps
+// do, so that one may wait on another (barrier.cluster, a peer's mbarrier,
+// its shared memory). Ranks run x fastest, as %cluster_ctarank numbers them;
+// clusters tile the grid x fastest.
+void Runner::run_cluster(uint64_t k) {
+  const uint64_t ncx = cfg_.grid[0] / cshape_[0], ncy = cfg_.grid[1] / cshape_[1];
+  const uint64_t kx = k % ncx, ky = (k / ncx) % ncy, kz = k / (ncx * ncy);
+  std::vector<Block> blocks(csize_);
+  Cluster cl;
+  for (uint32_t r = 0; r < csize_; ++r) {
+    const uint64_t x = kx * cshape_[0] + r % cshape_[0], y = ky * cshape_[1] + (r / cshape_[0]) % cshape_[1],
+                   z = kz * cshape_[2] + r / (cshape_[0] * cshape_[1]);
+    init_block(blocks[r], x + y * cfg_.grid[0] + z * uint64_t{cfg_.grid[0]} * cfg_.grid[1]);
+    blocks[r].rank = r;
+    blocks[r].cluster = &cl;
+    cl.blocks.push_back(&blocks[r]);
+  }
+  for (;;) {
+    bool live = false, progress = false;
+    for (Block& blk : blocks)
+      for (Warp& w : blk.warps) {
+        if (!(w.alive & ~w.exited)) continue;
+        live = true;
+        for (int n = 0; n < 4096; ++n) {
+          if (!(w.alive & ~w.exited)) break;
+          if (!step_warp(blk, w)) break;
+          progress = true;
+          if (w.yield) break;
+        }
+        w.yield = false;
+      }
+    if (!live) break;
+    if (!progress)
+      throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": every warp of cluster " + std::to_string(k) +
+                                    " is waiting (a barrier some threads never reach)");
+  }
+  std::lock_guard<std::mutex> g(stats_mu_);
+  for (Block& blk : blocks) stats_.add(blk.st);
 }
 
 // One instruction for one group of lanes. False when no lane can run.

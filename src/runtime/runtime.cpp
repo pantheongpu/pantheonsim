@@ -373,6 +373,8 @@ uint64_t Device::load_cubin(const uint8_t* image, size_t size) {
     e.dynamic_shared_offset = e.static_shared_size;
     e.local_frame_size = std::max(k.frame_size, k.min_stack);
     if (k.max_threads) e.max_ntid = {k.max_threads, 1, 1};
+    e.req_cluster = k.cluster;
+    e.explicit_cluster = k.explicit_cluster;
     // The register count is ptxas's, not an estimate from PTX.
     e.regs_analyzed = true;
     e.cached_regs_per_thread = k.regs;
@@ -935,9 +937,12 @@ void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
                         const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms) {
   if (fn.sass) {
     // SASS: the executor for machine code (nvidia/docs/sass.md), after the
-    // launch checks both engines make.
-    exec::validate_launch(fn, cfg, profile_);
-    report_counters(ordinal_, fn.name, cfg, sass::launch(*fn.sass, fn.name, cfg, args, mem_, profile_));
+    // launch checks both engines make. __cluster_dims__ applies whether or
+    // not the launch names a cluster, as in the PTX engine.
+    exec::LaunchConfig c = cfg;
+    if (c.cluster == std::array<uint32_t, 3>{0, 0, 0}) c.cluster = fn.req_cluster;
+    exec::validate_launch(fn, c, profile_);
+    report_counters(ordinal_, fn.name, c, sass::launch(*fn.sass, fn.name, c, args, mem_, profile_));
     if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(ordinal_), 0.0);
     return;
   }

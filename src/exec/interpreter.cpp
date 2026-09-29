@@ -4307,9 +4307,15 @@ class Interpreter {
       } else if (const auto* r = std::get_if<RegOperand>(&op->src)) {
         const Mask src = w.preds[pred_index(r->reg)];
         p = (p & ~m) | (src & m);
+      } else if (std::holds_alternative<SregOperand>(op->src)) {
+        // A predicate special register (%is_explicit_cluster).
+        Lanes _s_v;
+        const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) p = v[lane] ? (p | (Mask{1} << lane)) : (p & ~(Mask{1} << lane));
       } else {
         ctx_fail(ins, -1, Err::UnsupportedPtx,
-                 "mov.pred source must be an immediate or a predicate register");
+                 "mov.pred source must be an immediate, a predicate register or a predicate special register");
       }
       return;
     }
