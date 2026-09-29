@@ -95,6 +95,21 @@ int main(int argc, char** argv) {
       {"barriers 256", (const void*)k_barriers, 256, 0},
   };
   int bad = 0;
+  // A calculator older than the device has no rules for it (CUDA 12.0's knows
+  // nothing past compute capability 9.0): nothing to compare with, which is
+  // not a mismatch.
+  {
+    cudaFuncAttributes attr;
+    cudaFuncGetAttributes(&attr, (const void*)k_small);
+    cudaOccFuncAttributes occ_attr(attr);
+    cudaOccResult res;
+    if (cudaOccMaxActiveBlocksPerMultiprocessor(&res, &occ_prop, &occ_attr, &state, 32, 0) ==
+        CUDA_OCC_ERROR_UNKNOWN_DEVICE) {
+      std::printf("%s: compute capability %d.%d is newer than this toolkit's cuda_occupancy.h; not checked\nPASS\n",
+                  prop.name, prop.major, prop.minor);
+      return 0;
+    }
+  }
   for (const Case& c : cases) {
     cudaFuncAttributes attr;
     cudaFuncGetAttributes(&attr, c.fn);
