@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #include <cuda_runtime.h>
 
 constexpr int kCases = 11;
@@ -43,7 +44,7 @@ static unsigned long long dbits(double x) { unsigned long long u; std::memcpy(&u
 
 int main() {
   const int n = 4096;
-  double* h = (double*)std::malloc(3 * n * sizeof(double));
+  std::vector<double> h(3 * n);
   std::srand(5);
   for (int i = 0; i < 3 * n; ++i)
     h[i] = ((std::rand() / (double)RAND_MAX) - 0.5) * std::ldexp(1.0, (std::rand() % 20) - 10) *
@@ -52,11 +53,11 @@ int main() {
   unsigned long long* o;
   cudaMalloc(&d, 3 * n * sizeof(double));
   cudaMalloc(&o, kStride * n * sizeof(unsigned long long));
-  cudaMemcpy(d, h, 3 * n * sizeof(double), cudaMemcpyHostToDevice);
+  cudaMemcpy(d, h.data(), 3 * n * sizeof(double), cudaMemcpyHostToDevice);
   k<<<n / 128, 128>>>(d, o);
   if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("kernel failed\nFAIL\n"); return 1; }
-  unsigned long long* ho = (unsigned long long*)std::malloc(kStride * n * sizeof(unsigned long long));
-  cudaMemcpy(ho, o, kStride * n * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+  std::vector<unsigned long long> ho(kStride * n);
+  cudaMemcpy(ho.data(), o, kStride * n * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
   const char* names[kCases + 1] = {"t + c", "c - t", "t used by an add and a mov", "mul.rn", "add.rn",
                                    "instructions between", ".ftz", "c + t", "t - c", "two adds: first",
                                    "two adds: second", "f64 t + c"};
@@ -94,6 +95,8 @@ int main() {
     std::printf("%-28s fused %4d unfused %4d%s\n", names[j], fused, unfused, ok ? "" : "  <-- the card does otherwise");
     bad += !ok;
   }
+  cudaFree(d);
+  cudaFree(o);
   std::printf("%s\n", bad ? "FAIL" : "PASS");
   return bad ? 1 : 0;
 }
