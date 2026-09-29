@@ -60,6 +60,7 @@ typedef struct CUctx_st* CUcontext;
 typedef struct CUmod_st* CUmodule;
 typedef struct CUfunc_st* CUfunction;
 typedef struct CUstream_st* CUstream;
+typedef void (*CUhostFn)(void* userData);
 typedef struct CUevent_st* CUevent;
 
 typedef enum CUdevice_attribute_enum {
@@ -131,7 +132,10 @@ typedef unsigned long long CUmemGenericAllocationHandle;
 typedef enum CUmemAllocationType_enum { CU_MEM_ALLOCATION_TYPE_INVALID = 0x0,
                                         CU_MEM_ALLOCATION_TYPE_PINNED = 0x1 } CUmemAllocationType;
 typedef enum CUmemLocationType_enum { CU_MEM_LOCATION_TYPE_INVALID = 0x0,
-                                      CU_MEM_LOCATION_TYPE_DEVICE = 0x1 } CUmemLocationType;
+                                      CU_MEM_LOCATION_TYPE_DEVICE = 0x1,
+                                      CU_MEM_LOCATION_TYPE_HOST = 0x2,
+                                      CU_MEM_LOCATION_TYPE_HOST_NUMA = 0x3,
+                                      CU_MEM_LOCATION_TYPE_HOST_NUMA_CURRENT = 0x4 } CUmemLocationType;
 typedef enum CUmemAccess_flags_enum { CU_MEM_ACCESS_FLAGS_PROT_NONE = 0x0,
                                       CU_MEM_ACCESS_FLAGS_PROT_READ = 0x1,
                                       CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 0x3 } CUmemAccess_flags;
