@@ -30,6 +30,7 @@ set(VGPU_PROFILES
   nvidia/h100
   nvidia/h200
   nvidia/b200
+  nvidia/b300
   nvidia/rtx5090
   nvidia/rtx3060
   nvidia/rtx3080ti
@@ -1575,6 +1576,12 @@ if(TARGET vgpucudart)
     TIMEOUT 7200)
   add_test(NAME e2e_cutlass_fmha COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_fmha.sh)
   set_tests_properties(e2e_cutlass_fmha PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 5400)
+
+  add_test(NAME e2e_cutlass_sm103 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_sm103.sh)
+  set_tests_properties(e2e_cutlass_sm103 PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 5400)

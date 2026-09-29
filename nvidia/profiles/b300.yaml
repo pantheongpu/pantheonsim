@@ -1,0 +1,53 @@
+# VirtualGPU device profile: NVIDIA B300 (Blackwell Ultra, sm_103).
+# Public values; verified: false -- nothing here has been measured on a card.
+#   - compute capability 10.3: the PTX ISA's sm_103 targets (9.7.18, 12.1),
+#     which CUTLASS's SM103 kernels are built for.
+#   - SMs: NVIDIA gives "up to 160 SMs ... Available SM count and HBM capacity
+#     varies by SKU" (Inside NVIDIA Blackwell Ultra, developer blog). 148 is
+#     one public listing's figure for the B300 (gputps.com, unattributed) and
+#     matches its 592 Tensor Cores at four an SM; unverified.
+#   - PCI device 0x3182, "NVIDIA B300 SXM6 AC", from the name table in
+#     NVIDIA's open GPU kernel modules (g_nv_name_released.h).
+#   - Per-SM limits are sm_100's: the same Tensor Memory (256 KB) and, as far
+#     as the published figures go, the same shared memory and registers.
+id: nvidia/b300
+vendor: nvidia
+model: "NVIDIA B300 SXM6 AC"
+architecture: blackwell
+compute_capability: "10.3"
+warp_size: 32
+vram_bytes: 287999787008         # "288 GB of HBM3e", rounded down to whole MiB (274658); an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 232448   # 227 KiB (sm_10x)
+  registers_per_block: 65536
+  multiprocessors: 148
+  registers_per_sm: 65536
+  max_threads_per_sm: 2048
+  max_blocks_per_sm: 32
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 233472
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 274658          # 288 GB in MiB; not measured on a card
+  power_limit_w: 1100             # HGX B300; GB300 boards go to 1400 W (NVIDIA: "up to 1,400W")
+  sm_clock_max_mhz: 1965          # unpublished; the B200's until measured
+  mem_clock_max_mhz: 4000         # unpublished; the B200's until measured
+  temperature_max_c: 90
+  pci_vendor_id: 4318             # 0x10DE NVIDIA
+  pci_device_id: 12674            # 0x3182 [B300 SXM6 AC]
+  ecc: true
+  memory: hbm
+  memory_temperature: true
+  pcie_link: "Gen6 x16"           # NVIDIA: "PCIe Gen6 x 16 lanes"

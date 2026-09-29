@@ -40,15 +40,15 @@ VTEST(module_lifecycle_and_lookup) {
 
 VTEST(unsupported_ptx_error_names_profile) {
   runtime::Runtime rt(load_gpu("nvidia/b200"));
-  // Any instruction outside the implemented subset will do; tcgen05.ld.red
-  // is sm_103's, not the B200's. cp.async, then wgmma, then tcgen05.fence,
-  // then tcgen05.shift used to stand here and each had to be replaced once it
-  // was implemented -- an example of something unsupported has to actually
-  // still be unsupported.
+  // Any instruction outside the implemented subset will do; tcgen05.mma's
+  // .ashift is refused because the ISA leaves it undefined. cp.async, then
+  // wgmma, then tcgen05.fence, then tcgen05.shift, then tcgen05.ld.red used to
+  // stand here and each had to be replaced once it was implemented -- an
+  // example of something unsupported has to actually still be unsupported.
   auto err = VCAPTURE(Error, rt.device(0).load_module(
                                  ".version 8.7\n.target sm_100a\n.address_size 64\n"
                                  ".visible .entry k() { .reg .b32 %r<2>; "
-                                 "tcgen05.ld.red.sync.aligned.32x32b.x2.max.f32 {%r0, %r1}, %r0, [%r1]; ret; }\n"));
+                                 "tcgen05.mma.cta_group::1.kind::f16.ashift [%r0], [%r1], %r0, %r0, %r0; ret; }\n"));
   VCHECK(err.code() == Err::UnsupportedPtx);
   VCHECK_CONTAINS(err.what(), "GPU profile: nvidia/b200");
 }
@@ -138,7 +138,7 @@ VTEST(large_modules_parse_kernels_when_first_used) {
 .visible .entry unused()
 {
   .reg .b32 %r<2>;
-  tcgen05.ld.red.sync.aligned.32x32b.x2.max.f32 {%r0, %r1}, %r0, [%r1];
+  tcgen05.mma.cta_group::1.kind::f16.ashift [%r0], [%r1], %r0, %r0, %r0;
   ret;
 }
 .visible .entry read_g(.param .u64 out)

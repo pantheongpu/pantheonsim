@@ -29,6 +29,7 @@ using vgpu::exec::LaunchConfig;
 namespace {
 
 const char* kHeader100a = ".version 8.7\n.target sm_100a\n.address_size 64\n";
+const char* kHeader103a = ".version 8.8\n.target sm_103a\n.address_size 64\n";
 
 std::vector<uint8_t> arg_u64(uint64_t v) {
   std::vector<uint8_t> b(8);
@@ -172,6 +173,9 @@ struct Mma {
   struct Step { std::string collector; uint64_t b_delta = 0; };
   std::vector<Step> steps{{}};
   bool has_zero_mask = false;
+  // Descriptors whose leading-dimension field is an absolute address (bit 52):
+  // it too is relative to the operand buffer here, and made absolute.
+  bool abs_lbo = false;
   uint64_t zero_mask = 0;
 
   std::vector<std::vector<uint32_t>> run() const {
@@ -283,6 +287,12 @@ COPIED:
     add.u64 %rd5, %rd5, %rd12;
     add.u64 %rd6, %rd6, %rd12;
     add.u64 %rd6, %rd6, 512;
+)" + (abs_lbo ? std::string(R"(
+    shl.b64 %rd13, %rd12, 16;
+    add.u64 %rd5, %rd5, %rd13;
+    add.u64 %rd6, %rd6, %rd13;
+    add.u64 %rd6, %rd6, 33554432;          // B's buffer, 512 << 16
+)") : std::string()) + R"(
     add.u32 %r61, %r40, )" + std::to_string(d_col | (d_lane << 16)) + R"(;
     add.u32 %r62, %r40, )" + std::to_string(a_col) + R"(;
     add.u32 %r63, %r40, )" + std::to_string(sfa_col) + R"(;
@@ -613,7 +623,6 @@ VTEST(tcgen05_refuses_what_is_not_implemented_by_name) {
   VCHECK_CONTAINS(parse("tcgen05.mma.cta_group::1.kind::f16.ashift [a], [b], d, a, p;").message(), "ashift");
   VCHECK_CONTAINS(parse("tcgen05.mma.cta_group::1.kind::f16.block_scale [a], d, d, a, [b], [b], p;").message(),
                   ".block_scale");
-  VCHECK_CONTAINS(parse("tcgen05.ld.red.sync.aligned.32x32b.x2.max.f32 {a, b}, a, [a];").message(), "tcgen05.ld.red");
 }
 
 // ---- tcgen05.ld / tcgen05.st ------------------------------------------------------
@@ -715,6 +724,75 @@ VTEST(tcgen05_st_places_registers_as_the_figures_show) {
   }
 }
 
+// tcgen05.alloc blocks until enough columns are free (9.7.18.7.1). Warp 0
+// takes all 512, and waits on an mbarrier; warp 1 arrives on it and then asks
+// for 256, which cannot be had yet, so it waits. Warp 0, released, frees its
+// 512, and warp 1's allocation goes through at column 0.
+VTEST(tcgen05_alloc_waits_for_a_dealloc) {
+  const std::string ptx = std::string(kHeader100a) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<6>;
+    .shared .align 8 .b64 bar;
+    .shared .align 4 .b32 slot0;
+    .shared .align 4 .b32 slot1;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 5;
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 mbarrier.init.shared.b64 [bar], 32;
+    bar.sync 0;
+    setp.eq.u32 %p2, %r2, 0;
+    @!%p2 bra WARP1;
+    tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [slot0], 512;
+    ld.shared.u32 %r3, [slot0];
+WAIT:
+    mbarrier.try_wait.parity.shared.b64 %p3, [bar], 0;
+    @!%p3 bra WAIT;
+    tcgen05.dealloc.cta_group::1.sync.aligned.b32 %r3, 512;
+    ret;
+WARP1:
+    mbarrier.arrive.shared.b64 %rd2, [bar];
+    tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [slot1], 256;
+    ld.shared.u32 %r4, [slot1];
+    @%p1 st.global.u32 [%rd1], %r4;
+    setp.eq.u32 %p1, %r1, 32;
+    @%p1 st.global.u32 [%rd1], %r4;
+    tcgen05.dealloc.cta_group::1.sync.aligned.b32 %r4, 256;
+    ret;
+}
+)";
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(4);
+  mem.store_scalar(out, 4, 0xdead);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(out)}, mem, load_gpu("nvidia/b200"));
+  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{0});
+}
+
+// With no other warp left to free columns, the wait could never end; that is
+// reported rather than spun on.
+VTEST(tcgen05_alloc_that_can_never_be_met_is_a_deadlock) {
+  const std::string ptx = std::string(kHeader100a) + R"(
+.visible .entry k()
+{
+    .shared .align 4 .b32 slot0;
+    .shared .align 4 .b32 slot1;
+    tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [slot0], 512;
+    tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [slot1], 32;
+    ret;
+}
+)";
+  MemoryManager mem{1 << 20};
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  auto err = VCAPTURE(Error, exec::launch(ptx::parse(ptx).entries[0], cfg, {}, mem, load_gpu("nvidia/b200")));
+  VCHECK_CONTAINS(err.what(), "no other warp of the CTA can free");
+}
+
 // .unpack::16b splits each register over two columns, low half first, and
 // .pack::16b puts them back together (figure 196).
 VTEST(tcgen05_pack_and_unpack_16b) {
@@ -761,6 +839,132 @@ VTEST(tcgen05_pack_and_unpack_16b) {
     VCHECK_EQ(g[4], r5);
     VCHECK_EQ(g[5], r6);
   }
+}
+
+// tcgen05.ld.red (sm_103f): the four columns a thread loads, reduced into
+// redval, as min and max define it (9.7.3.11-12): -0.0 below +0.0, a NaN
+// ignored unless .NaN (then the canonical NaN), .abs comparing magnitudes.
+// The loaded registers are the plain load's.
+namespace {
+std::vector<uint32_t> run_ld_red(const std::string& mods, const std::vector<std::array<uint32_t, 4>>& rows,
+                                 const char* header = kHeader103a) {
+  const std::string ptx = std::string(header) + R"(
+.visible .entry k(.param .u64 in, .param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<6>;
+    .shared .align 4 .b32 slot;
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd4, [out];
+    mov.u32 %r1, %tid.x;
+    tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [slot], 32;
+    ld.shared.u32 %r4, [slot];
+    mul.wide.u32 %rd3, %r1, 16;
+    add.u64 %rd2, %rd1, %rd3;
+    ld.global.v4.u32 {%r5, %r6, %r7, %r8}, [%rd2];
+    tcgen05.st.sync.aligned.32x32b.x4.b32 [%r4], {%r5, %r6, %r7, %r8};
+    tcgen05.wait::st.sync.aligned;
+    tcgen05.ld.red.sync.aligned.32x32b.x4)" + mods + R"( {%r9, %r10, %r11, %r12}, %r13, [%r4];
+    tcgen05.wait::ld.sync.aligned;
+    mul.wide.u32 %rd3, %r1, 32;
+    add.u64 %rd5, %rd4, %rd3;
+    st.global.v4.u32 [%rd5], {%r9, %r10, %r11, %r12};
+    st.global.u32 [%rd5+16], %r13;
+    tcgen05.dealloc.cta_group::1.sync.aligned.b32 %r4, 32;
+    ret;
+}
+)";
+  MemoryManager mem{1 << 20};
+  std::vector<uint32_t> in(32 * 4, 0);
+  for (size_t t = 0; t < rows.size(); ++t) std::copy(rows[t].begin(), rows[t].end(), in.begin() + 4 * t);
+  const uint64_t pin = mem.alloc(in.size() * 4), out = mem.alloc(32 * 32);
+  mem.write(pin, in.data(), in.size() * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(pin), arg_u64(out)}, mem, load_gpu("nvidia/b300"));
+  std::vector<uint32_t> got(32 * 8);
+  mem.read(out, got.data(), got.size() * 4);
+  for (size_t t = 0; t < rows.size(); ++t)   // the loaded registers are the plain load's
+    for (int j = 0; j < 4; ++j) VCHECK_EQ(got[t * 8 + j], rows[t][j]);
+  std::vector<uint32_t> red(rows.size());
+  for (size_t t = 0; t < rows.size(); ++t) red[t] = got[t * 8 + 4];
+  return red;
+}
+constexpr uint32_t kPZero = 0x00000000u, kNZero = 0x80000000u, kQNaN = 0x7FC00000u, kCanon = 0x7FFFFFFFu;
+uint32_t fbits(float f) { return f32_bits(f); }
+// Results as hex, so a mismatch prints.
+std::string hexes(const std::vector<uint32_t>& v) {
+  std::string out;
+  char buf[12];
+  for (uint32_t x : v) {
+    std::snprintf(buf, sizeof buf, "%08x ", x);
+    out += buf;
+  }
+  return out;
+}
+}  // namespace
+
+VTEST(tcgen05_ld_red_f32_min_max_abs_nan) {
+  const std::vector<std::array<uint32_t, 4>> rows = {
+      {fbits(1.5f), fbits(-2.0f), fbits(0.25f), fbits(3.0f)},
+      {kPZero, kNZero, kPZero, kPZero},            // signed zeros
+      {fbits(4.0f), kQNaN, fbits(-1.0f), fbits(2.0f)},      // a NaN among numbers
+      {kQNaN, kQNaN, kQNaN, kQNaN},                // nothing but NaN
+      {fbits(-8.0f), fbits(3.0f), fbits(-0.5f), fbits(7.0f)},
+  };
+  auto want = [](std::vector<uint32_t> v) { return hexes(v); };
+  VCHECK_EQ(hexes(run_ld_red(".max.f32", rows)), want({fbits(3.0f), kPZero, fbits(4.0f), kCanon, fbits(7.0f)}));
+  VCHECK_EQ(hexes(run_ld_red(".min.f32", rows)), want({fbits(-2.0f), kNZero, fbits(-1.0f), kCanon, fbits(-8.0f)}));
+  VCHECK_EQ(hexes(run_ld_red(".max.abs.f32", rows)), want({fbits(3.0f), kPZero, fbits(4.0f), kCanon, fbits(8.0f)}));
+  VCHECK_EQ(hexes(run_ld_red(".min.abs.f32", rows)), want({fbits(0.25f), kPZero, fbits(1.0f), kCanon, fbits(0.5f)}));
+  VCHECK_EQ(hexes(run_ld_red(".max.NaN.f32", rows)), want({fbits(3.0f), kPZero, kCanon, kCanon, fbits(7.0f)}));
+}
+
+VTEST(tcgen05_ld_red_integers) {
+  const std::vector<std::array<uint32_t, 4>> rows = {{5u, 0xFFFFFFFFu, 7u, 2u}, {0x80000000u, 1u, 0u, 0x7FFFFFFFu}};
+  VCHECK_EQ(hexes(run_ld_red(".max.u32", rows)), hexes(std::vector<uint32_t>{0xFFFFFFFFu, 0x80000000u}));
+  VCHECK_EQ(hexes(run_ld_red(".min.u32", rows)), hexes(std::vector<uint32_t>{2u, 0u}));
+  VCHECK_EQ(hexes(run_ld_red(".max.s32", rows)), hexes(std::vector<uint32_t>{7u, 0x7FFFFFFFu}));
+  VCHECK_EQ(hexes(run_ld_red(".min.s32", rows)), hexes(std::vector<uint32_t>{0xFFFFFFFFu, 0x80000000u}));
+}
+
+// The forms CUDA 13.2's ptxas assembles for sm_103a.
+VTEST(tcgen05_ld_red_parses_what_ptxas_accepts) {
+  auto m = ptx::parse(std::string(kHeader103a) + R"(
+.visible .entry k()
+{
+    .reg .b32 a, b, c, d, e, t;
+    tcgen05.ld.red.sync.aligned.32x32b.x4.max.f32 {a, b, c, d}, e, [t];
+    tcgen05.ld.red.sync.aligned.32x32b.x4.min.abs.f32 {a, b, c, d}, e, [t];
+    tcgen05.ld.red.sync.aligned.32x32b.x2.max.NaN.f32 {a, b}, e, [t];
+    tcgen05.ld.red.sync.aligned.32x32b.x2.max.abs.NaN.f32 {a, b}, e, [t];
+    tcgen05.ld.red.sync.aligned.32x32b.x2.min.u32 {a, b}, e, [t];
+    tcgen05.ld.red.sync.aligned.32x32b.x2.max.s32 {a, b}, e, [t];
+    tcgen05.ld.red.sync.aligned.16x32bx2.x2.max.f32 {a, b}, e, [t], 16;
+    ret;
+}
+)");
+  VCHECK_EQ(m.entries.size(), size_t{1});
+}
+
+VTEST(tcgen05_ld_red_refuses_what_the_isa_rules_out) {
+  auto parse = [](const char* header, const std::string& ins) {
+    return VCAPTURE(Error, ptx::parse(std::string(header) +
+                                      ".visible .entry k()\n{\n .reg .b32 a, b, c;\n " + ins + "\n ret;\n}\n"));
+  };
+  VCHECK_CONTAINS(parse(kHeader100a, "tcgen05.ld.red.sync.aligned.32x32b.x2.max.f32 {a, b}, c, [a];").message(),
+                  "sm_103f");
+  VCHECK_CONTAINS(parse(kHeader103a, "tcgen05.ld.red.sync.aligned.32x32b.x1.max.f32 {a}, c, [a];").message(), ".x2");
+  VCHECK_CONTAINS(parse(kHeader103a, "tcgen05.ld.red.sync.aligned.16x64b.x2.max.f32 {a, b}, c, [a];").message(),
+                  "shapes");
+  VCHECK_CONTAINS(parse(kHeader103a, "tcgen05.ld.red.sync.aligned.32x32b.x2.max.abs.u32 {a, b}, c, [a];").message(),
+                  ".f32 only");
+  VCHECK_CONTAINS(parse(kHeader103a, "tcgen05.ld.red.sync.aligned.32x32b.x2.f32 {a, b}, c, [a];").message(),
+                  ".min or .max");
+  VCHECK_CONTAINS(
+      parse(kHeader103a, "tcgen05.ld.red.spcompress.sync.aligned.32x32b.x4.max.f32 {a}, {a}, c, [a];")
+          .message(),
+      "sm_107");
 }
 
 // A warp reaches only its quarter of the lanes (9.7.18.8.1), and only
@@ -2120,6 +2324,148 @@ VTEST(tcgen05_mma_ws_refuses_what_the_isa_rules_out_or_leaves_open) {
   x.meta_col = 32;
   x.id = idesc(1, 0, 0, 64, 64) | 4;
   VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "figures 287-292");
+}
+
+// ---- sm_103a (B300): K = 96 and absolute leading-dimension addresses ----------------
+
+// Where the j-th of a row's K = 96 scale factors sits, as figures 243-275
+// draw it for each SF_ID: (word, byte), word 0 being the row's column
+// (base + row / 32) and word 1 the column `stride` further on -- four, or
+// eight for a B of more than 128 columns.
+struct SfSlot { int word, byte; };
+std::vector<SfSlot> k96_slots(int per_row, int sf_id) {
+  if (per_row == 6)   // .block16 (figures 251-252, 270-275): SF_ID 0 or 2
+    return sf_id == 0 ? std::vector<SfSlot>{{0, 0}, {0, 1}, {0, 2}, {0, 3}, {1, 0}, {1, 1}}
+                      : std::vector<SfSlot>{{0, 2}, {0, 3}, {1, 0}, {1, 1}, {1, 2}, {1, 3}};
+  switch (sf_id) {    // .block32 (figures 243-246, 260-269)
+    case 0: return {{0, 0}, {0, 1}, {0, 2}};
+    case 1: return {{0, 1}, {0, 2}, {0, 3}};
+    case 2: return {{0, 2}, {0, 3}, {1, 0}};
+    default: return {{0, 3}, {1, 0}, {1, 1}};
+  }
+}
+void put_scales96(std::vector<uint32_t>& cells, int a_cols, int col, int rows, int per_row, int sf_id,
+                  int stride, const std::function<uint8_t(int, int)>& sf) {
+  const std::vector<SfSlot> slots = k96_slots(per_row, sf_id);
+  for (int m = 0; m < rows; ++m)
+    for (int part = 0; part < 4; ++part)
+      for (int j = 0; j < per_row; ++j) {
+        uint32_t& c = cells[size_t(m % 32 + 32 * part) * a_cols + col + m / 32 + stride * slots[j].word];
+        c = (c & ~(0xFFu << 8 * slots[j].byte)) | uint32_t(sf(m, j)) << 8 * slots[j].byte;
+      }
+}
+
+// One K = 96 block-scaled MMA on sm_103a: A (M = 128) and B from packed fp4,
+// three K groups of 16 bytes a row (LBO 128, SBO 384), the factors after D.
+struct K96 {
+  int N, per_row, sfa_id, sfb_id;
+  std::string kind, mods;
+  uint32_t scale_type;   // 0 UE4M3, 1 UE8M0
+};
+void run_k96(const K96& c) {
+  const int M = 128, K = 96;
+  auto A = [](int m, int k) { return val(m, k, 3); };
+  auto B = [](int k, int n) { return val(k, n, 5); };
+  const float steps[] = {0.5f, 1.0f, 2.0f, 4.0f, 0.25f};
+  auto sa = [&](int m, int j) { return steps[(m + 2 * j) % 5]; };
+  auto sb = [&](int n, int j) { return steps[(3 * n + j) % 5]; };
+  auto code = [&](float f) { return c.scale_type ? uint8_t(std::ilogb(f) + 127) : e4m3_bits(f); };
+  Mma x;
+  x.target = kHeader103a;
+  x.kind = c.kind;
+  x.kind_mods = c.mods;
+  x.block_scale = true;
+  x.id = idesc_mx(1, 1, M, c.N, c.sfa_id, c.sfb_id, c.scale_type) | 1u << 31;
+  x.desc_a = desc(0, 128, 384, 0);
+  x.desc_b = desc(0, 128, 384, 0);
+  x.smem_a = {packed_k_major(M, K, 4, 32, 128, 384, [&](int m, int k) { return e2m1_bits(A(m, k)); })};
+  x.smem_b = {packed_k_major(c.N, K, 4, 32, 128, 384, [&](int n, int k) { return e2m1_bits(B(k, n)); })};
+  const int stride_b = c.N > 128 ? 8 : 4, d_cols = 256;
+  x.cols = 512;
+  x.a_is_tmem = false;
+  x.a_cols = 32;   // A 8 columns, B 8 or 16; a power of two for the harness's tcgen05.st
+  x.a_col = d_cols;
+  x.sfa_col = d_cols;
+  x.sfb_col = d_cols + 8;
+  x.a_tmem.assign(1, std::vector<uint32_t>(size_t(128) * x.a_cols, 0xA5A5A5A5u));
+  put_scales96(x.a_tmem[0], x.a_cols, 0, M, c.per_row, c.sfa_id, 4, [&](int m, int j) { return code(sa(m, j)); });
+  put_scales96(x.a_tmem[0], x.a_cols, 8, c.N, c.per_row, c.sfb_id, stride_b,
+               [&](int n, int j) { return code(sb(n, j)); });
+  check_scaled(x.run(), M, c.N, K, K / c.per_row, 512, A, B, sa, sb);
+}
+
+VTEST(tcgen05_mma_k96_mxf4nvf4_block16_six_factors) {
+  run_k96({64, 6, 0, 2, "mxf4nvf4", ".block_scale.block16", 0});    // B within 128 columns
+  run_k96({144, 6, 2, 0, "mxf4nvf4", ".block_scale.block16", 0});   // B past 128: words 8 apart
+}
+
+VTEST(tcgen05_mma_k96_mxf4_block32_three_factors) {
+  run_k96({64, 3, 1, 3, "mxf4", ".block_scale.block32", 1});
+  run_k96({144, 3, 2, 0, "mxf4", ".block_scale", 1});   // .block32 is mxf4's default
+  run_k96({64, 3, 3, 2, "mxf4nvf4", ".block_scale.block32", 1});
+}
+
+VTEST(tcgen05_mma_k96_refuses_what_the_isa_rules_out) {
+  Mma x;
+  x.kind = "mxf4nvf4";
+  x.kind_mods = ".block_scale.block16";
+  x.block_scale = true;
+  x.desc_a = desc(0, 128, 384, 0);
+  x.desc_b = desc(0, 128, 384, 0);
+  x.cols = 64;
+  x.a_is_tmem = false;
+  x.a_cols = 16;
+  x.a_col = 32;
+  x.sfa_col = 32;
+  x.sfb_col = 40;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 16));
+  x.id = idesc_mx(1, 1, 128, 32, 0, 0, 0) | 1u << 31;
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "sm_103a");   // an sm_100a module
+  x.target = kHeader103a;
+  x.id = idesc_mx(1, 1, 128, 32, 1, 0, 0) | 1u << 31;             // .block16 from byte 1
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "Tables 51-53");
+  x.kind_mods = ".block_scale.scale_vec::4X";
+  x.id = idesc_mx(1, 1, 128, 32, 0, 0, 0) | 1u << 31;
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "Table 68");
+  x.kind = "mxf8f6f4";
+  x.kind_mods = ".block_scale";
+  x.id = idesc_mx(0, 0, 128, 32, 0, 0, 1) | 1u << 31;
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "sm_107f");
+}
+
+// Bit 52 (sm_103a): a K-major row runs to the end of its swizzle row, then on
+// at the same row of the absolute address -- the way CUTLASS's SM103 kernels
+// have a K block straddle two pipeline buffers. Here f16 with the 32-byte
+// swizzle, M = 64: each row's K = 16 starts halfway along its 32-byte row
+// (element 8) in buffer 0 and ends in buffer 1, 2048 bytes on.
+VTEST(tcgen05_mma_absolute_leading_address_continues_in_the_next_buffer) {
+  const int M = 64, N = 64, K = 16;
+  auto A = [](int m, int k) { return val(m, k, 4); };
+  auto B = [](int k, int n) { return val(k, n, 1); };
+  // Element k of a row is element 8 + k of a 32-wide virtual row: 0-15 in
+  // buffer 0, 16-31 in buffer 1, each laid out as the 32-byte canonical
+  // K-major layout (row stride 32, SBO 256).
+  auto image = [&](int rows, const std::function<uint16_t(int, int)>& v) {
+    std::vector<uint8_t> img(4096, 0);
+    for (int r = 0; r < rows; ++r)
+      for (int k = 0; k < K; ++k) {
+        const int kv = 8 + k;
+        put(img, (kv < 16 ? 0 : 2048) + canonical(Major::K, 32, 2, 0, 256, r, kv % 16), v(r, k), 2);
+      }
+    return img;
+  };
+  const uint64_t abs = uint64_t{1} << 52 | uint64_t{2048 >> 4} << 16;
+  Mma x;
+  x.target = kHeader103a;
+  x.abs_lbo = true;
+  x.id = idesc(1, 0, 0, M, N);
+  x.desc_a = (desc(16, 0, 256, 32) & ~(uint64_t{0x3FFF} << 16)) | abs;
+  x.desc_b = (desc(16, 0, 256, 32) & ~(uint64_t{0x3FFF} << 16)) | abs;
+  x.smem_a = {image(M, [&](int m, int k) { return f16_bits(A(m, k)); })};
+  x.smem_b = {image(N, [&](int n, int k) { return f16_bits(B(k, n)); })};
+  check_d_f32(x.run(), 1, M, N, K, A, B);
+  x.target = kHeader100a;   // bit 52 is sm_103a's
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "sm_103a");
 }
 
 // M = 256 (layout A): each CTA supplies half of A's rows and half of B's

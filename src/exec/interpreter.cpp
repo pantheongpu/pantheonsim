@@ -407,6 +407,10 @@ struct Warp {
   // the deterministic scheduler a turn otherwise lasts until the warp blocks,
   // and a spin never blocks, so the first waiter would hold the block forever.
   bool yield_now = false;
+  // Set by an instruction that must run again rather than advance: a
+  // tcgen05.alloc that found too few columns free waits by retrying, giving
+  // up its turn each time so the warp that will free them can run.
+  bool retry = false;
   // barrier.cluster: the lanes that have arrived in the cluster's current
   // phase, and the phase a later wait is waiting to see end.
   Mask cluster_arrived = 0;
@@ -2844,6 +2848,10 @@ class Interpreter {
           rethrow_with_context(e, ins, -1);
         throw;
       }
+    }
+    if (w.retry) {
+      w.retry = false;
+      return;
     }
     ++w.paths[idx].pc;
   }
@@ -6313,6 +6321,9 @@ class Interpreter {
     uint64_t start = 0, lbo = 0, sbo = 0;
     uint32_t swizzle = 0;   // bytes in a swizzled row: 0 (none), 32, 64 or 128
     uint32_t atom = 16;     // bytes the swizzle moves as one (tcgen05's mode 1: 32)
+    // tcgen05, sm_103a: `lbo` is the absolute address where a K-major row
+    // continues past the end of its swizzle row (bit 52).
+    bool lbo_abs = false;
   };
 
   WgmmaDesc decode_wgmma_desc(const Instr& ins, uint64_t d) {
@@ -6346,6 +6357,12 @@ class Interpreter {
     uint64_t off;
     if (k_major) {
       const uint64_t kb = uint64_t{k} * eb;
+      // Absolute mode (sm_103a): a row's bytes run to the end of its swizzle
+      // row, then on at the same row of the atom at `lbo` -- how CUTLASS's
+      // SM103 kernels have a K = 96 fp4 block straddle two pipeline buffers.
+      if (d.lbo_abs && W && d.start % W + kb >= W)
+        return exec::swizzle_address(d.lbo + (mn % 8) * W + (mn / 8) * d.sbo + (d.start % W + kb - W),
+                                     static_cast<uint32_t>(W), d.atom);
       off = W ? (mn % 8) * W + (mn / 8) * d.sbo + kb
               : (mn % 8) * 16 + (mn / 8) * d.sbo + kb % 16 + (kb / 16) * d.lbo;
     } else {
@@ -6759,11 +6776,26 @@ class Interpreter {
           }
           if (ok) { found = true; break; }
         }
-        if (!found)
-          ctx_fail(ins, -1, Err::UnsupportedPtx,
-                   "tcgen05.alloc of " + std::to_string(ncols) +
-                       " columns while too few are free; it would block until another warp "
-                       "deallocates, and waiting for that is not implemented");
+        if (!found) {
+          // "tcgen05.alloc is a potentially blocking instruction": it waits
+          // until another warp's tcgen05.dealloc frees enough. Only a warp of
+          // a CTA the allocation covers that can still run could do that; with
+          // none, the columns will never be freed, and on hardware this warp
+          // would hang.
+          bool someone_can_free = false;
+          for (const BlockCtx* c : ctas)
+            if (c->warps)
+              for (const Warp& other : *c->warps)
+                if (&other != &w && other.state == Warp::State::Ready) someone_can_free = true;
+          if (!someone_can_free)
+            ctx_fail(ins, -1, Err::LaunchConfig,
+                     "deadlock: tcgen05.alloc of " + std::to_string(ncols) +
+                         " columns waits for Tensor Memory that no other warp of the CTA can "
+                         "free (none is still running)");
+          w.retry = true;
+          w.yield_now = true;
+          return;
+        }
         for (const BlockCtx* c : ctas) {
           TensorMemory& t = tmem_of(*c);
           if (t.cells.empty()) t.cells.assign(size_t{TensorMemory::kLanes} * TensorMemory::kCols, 0);
@@ -6882,6 +6914,44 @@ class Interpreter {
       }
     if (ld)
       for (size_t j = 0; j < op.regs.size(); ++j) write_reg(w, op.regs[j], m, vals[j], 32);
+    if (op.red) {
+      // .red (9.7.18.8.3): each thread's loaded columns, reduced. f32 as min
+      // and max define it: -0.0 below +0.0, a NaN input ignored unless .NaN
+      // (then the result is the canonical NaN), .abs comparing magnitudes.
+      Lanes out{};
+      for (uint32_t th = 0; th < W_; ++th) {
+        uint32_t acc = 0;
+        bool have = false, nan = false;
+        for (size_t j = 0; j < vals.size(); ++j) {
+          uint32_t v = static_cast<uint32_t>(vals[j][th]);
+          if (op.red_type == 'f') {
+            if (op.red_abs) v &= 0x7FFFFFFFu;
+            if (std::isnan(f32(v))) {
+              nan = true;
+              continue;
+            }
+          }
+          if (!have) {
+            acc = v;
+            have = true;
+            continue;
+          }
+          bool less;   // v < acc
+          if (op.red_type == 'f') {
+            const float a = f32(v), b = f32(acc);
+            less = a < b || (a == b && std::signbit(a) && !std::signbit(b));
+          } else if (op.red_type == 's') {
+            less = static_cast<int32_t>(v) < static_cast<int32_t>(acc);
+          } else {
+            less = v < acc;
+          }
+          if (op.red_max ? (!less && v != acc) : less) acc = v;
+        }
+        if (op.red_type == 'f' && (!have || (nan && op.red_nan))) acc = 0x7FFFFFFFu;
+        out[th] = acc;
+      }
+      write_reg(w, op.red_dst, m, out, 32);
+    }
   }
 
   // tcgen05.commit: an arrive-on, count 1, on the barrier -- or with
@@ -7013,7 +7083,7 @@ class Interpreter {
 
   // A tcgen05 shared-memory matrix descriptor (9.7.18.4.1). The same
   // canonical layouts as wgmma's; the swizzle field is three bits wide here.
-  WgmmaDesc decode_tcgen05_desc(const Instr& ins, uint64_t d) {
+  WgmmaDesc decode_tcgen05_desc(const Instr& ins, uint64_t d, bool lbo_abs_ok = false) {
     WgmmaDesc out;
     out.start = (d & 0x3FFF) << 4;
     out.lbo = ((d >> 16) & 0x3FFF) << 4;
@@ -7039,10 +7109,13 @@ class Interpreter {
       ctx_fail(ins, -1, Err::UnsupportedPtx,
                "a tcgen05 matrix descriptor with a nonzero base offset (bits 49-51); only swizzle "
                "patterns that start on their repeat boundary are implemented");
-    if ((d >> 52) & 1)
-      ctx_fail(ins, -1, Err::UnsupportedPtx,
-               "a tcgen05 matrix descriptor with an absolute leading-dimension address (bit 52, "
-               "sm_103a) is not implemented");
+    if ((d >> 52) & 1) {
+      if (!lbo_abs_ok)
+        ctx_fail(ins, -1, Err::InvalidValue,
+                 "a tcgen05 matrix descriptor with an absolute leading-dimension address (bit 52) "
+                 "needs an sm_103a target (9.7.18.4.1.1)");
+      out.lbo_abs = true;
+    }
     return out;
   }
 
@@ -7110,6 +7183,7 @@ class Interpreter {
                }() + " has fields this .kind does not define (Tables 51-53)");
     };
     const bool mx = op.block_scale;
+    const bool sm103a = op.target_sm == 103 && op.target_arch;
     const bool mxf4 = op.mma_kind == Tcgen05MmaKind::MXF4 || op.mma_kind == Tcgen05MmaKind::MXF4NVF4;
     // The instruction descriptor: Table 51, or 52/53 for the block-scaled kinds.
     const bool sp = op.sparse;
@@ -7132,7 +7206,16 @@ class Interpreter {
           (!mxf4 && (id >> 24 & 3)))
         ctx_fail(ins, li, Err::InvalidValue, "tcgen05.mma instruction descriptor sets a reserved bit");
       if (id >> 26 & 1) refuse("the 128-lane scale-factor A layout (bit 26) is sm_107f's");
-      if ((id >> 31) || (mxf4 && (id >> 3 & 1))) refuse("the larger K of bits 3 and 31 is sm_107f's");
+      if ((!mxf4 && (id >> 31)) || (mxf4 && (id >> 3 & 1))) refuse("the larger K of bits 3 and 31 is sm_107f's");
+      // .kind::mxf4/mxf4nvf4 with bit 31: K = 96, dense, sm_103a (9.7.18.2.1.1;
+      // sm_107a's is not implemented). CuTe's descriptor calls the sparse
+      // K = 192 invalid, and the ISA's target note names only K = 96.
+      if (mxf4 && (id >> 31)) {
+        if (sp) refuse("sparse A with the K = 96 bit (31): a K of 192, which the ISA does not define");
+        if (op.target_sm != 103 || !op.target_arch)
+          refuse("K = 96 (instruction descriptor bit 31) needs an sm_103a target; this module targets sm_" +
+                 std::to_string(op.target_sm) + (op.target_arch ? "a" : ""));
+      }
       if (mxf4 && (id >> 12 & 1)) refuse("sparsity version v1 (bit 12) is sm_107's");
     } else {
       if ((id & 0x40) || (id & (1u << 23)))
@@ -7193,7 +7276,7 @@ class Interpreter {
       case Tcgen05MmaKind::MXF4NVF4:
         if (atype != 1 || btype != 1) bad();
         ea = eb2 = TcElem{TcType::E2M1, 4, 32, 4};
-        K = 64;
+        K = id >> 31 ? 96 : 64;
         if (trans_a || trans_b) bad();   // Table 62: no transpose for mxf4
         break;
     }
@@ -7245,6 +7328,17 @@ class Interpreter {
           break;
         }
       }
+      // K = 96 (Table 68): .block32 is three factors a row, .block16 six; the
+      // .scale_vec::NX spellings name no K = 96 form.
+      if (K == 96) {
+        if (op.scale_vec != 0 && op.scale_vec != 16 && op.scale_vec != 32)
+          refuse(".scale_vec::" + std::to_string(op.scale_vec) + "X with K = 96; Table 68 gives K = 96 "
+                 ".block16 and .block32 only");
+        sv = op.scale_vec == 16 ? 6 : 3;
+        // Figures 243-275: .block32's factors start at any byte of the word,
+        // .block16's at byte 0 or 2.
+        if (sv == 6 && (sfa_id % 2 || sfb_id % 2)) bad();
+      }
       // .block16/.block32 are aliases of 4X/2X at K = 64 and 128 -- a sparse
       // K = 128 included (9.7.18.10.10.1's "Aliased .scale_vectorsize
       // variants") -- so the factors stay four or two, each covering K/4 or
@@ -7252,7 +7346,7 @@ class Interpreter {
       // refused above; CUTLASS's sparse nvf4 GEMMs issue .block16 over
       // K = 128 with a factor per 32.
       // Byte-aligned sub-columns: 1X any byte, 2X a half word, 4X all four.
-      if ((sv == 2 && (sfa_id % 2 || sfb_id % 2)) || (sv == 4 && (sfa_id || sfb_id))) bad();
+      if (K != 96 && ((sv == 2 && (sfa_id % 2 || sfb_id % 2)) || (sv == 4 && (sfa_id || sfb_id)))) bad();
     }
     const uint32_t G = op.cta_group;
     // .ws (Table 48): M = 32, 64 or 128 by N = 64, 128 or 256; sparse, N up
@@ -7438,7 +7532,7 @@ class Interpreter {
     }
     std::vector<double> B(size_t{K} * N);
     {
-      const WgmmaDesc d = decode_tcgen05_desc(ins, b_desc_bits);
+      const WgmmaDesc d = decode_tcgen05_desc(ins, b_desc_bits, sm103a);
       for (uint32_t v = 0; v < G; ++v) {
         const uint32_t rank = cluster_rank_of(*ctas[v]);
         for (uint32_t n = 0; n < Nloc; ++n)
@@ -7462,7 +7556,7 @@ class Interpreter {
     if (op.a_tmem && layout_f && (a_addr >> 16) != d_lane0)
       ctx_fail(ins, li, Err::InvalidValue,
                "for M = 64, A and D must use the same Tensor Memory lane alignment (9.7.18.10.5)");
-    const WgmmaDesc a_desc = op.a_tmem ? WgmmaDesc{} : decode_tcgen05_desc(ins, value(op.a));
+    const WgmmaDesc a_desc = op.a_tmem ? WgmmaDesc{} : decode_tcgen05_desc(ins, value(op.a), sm103a);
     Mask keep = 1;
     if (const auto* imm = std::get_if<ImmInt>(&op.enable_d)) keep = imm->value != 0;
     else if (const auto* r = std::get_if<RegOperand>(&op.enable_d)) keep = read_pred(w, ins, r->reg) >> lane & 1;
@@ -7489,15 +7583,22 @@ class Interpreter {
     const uint32_t sfa_addr = mx ? static_cast<uint32_t>(value(op.scale_a)) & 0x3FFFFFFFu : 0;
     const uint32_t sfb_addr = mx ? static_cast<uint32_t>(value(op.scale_b)) & 0x3FFFFFFFu : 0;
     const uint32_t blk = mx ? K / sv : K;
+    // At K = 96 a row's factors are one byte stream from byte SF_ID: byte b
+    // of it in byte b % 4 of the word `stride` columns on per four bytes --
+    // four columns on, or eight for a B of more than 128 columns, past the
+    // columns the rows' first words take (figures 243-275). Below four bytes
+    // that is every other size's layout.
+    const uint32_t sfb_stride = N > 128 ? 8 : 4;
     auto scale_of = [&](TensorMemory& t, uint32_t addr, uint32_t idx, uint32_t part, uint32_t sfid,
-                        uint32_t j) -> double {
+                        uint32_t j, uint32_t stride = 4) -> double {
+      const uint32_t b = sfid + j;
       const uint32_t l = (addr >> 16) + idx % 32 + 32 * part;
-      const uint32_t col = (addr & 0xFFFF) + idx / 32;
+      const uint32_t col = (addr & 0xFFFF) + idx / 32 + stride * (b / 4);
       if (l >= TensorMemory::kLanes || col >= TensorMemory::kCols || !t.allocated(col))
         ctx_fail(ins, li, Err::OutOfBounds,
                  "tcgen05.mma reads a scale factor from Tensor Memory lane " + std::to_string(l) +
                      ", column " + std::to_string(col) + ", which no tcgen05.alloc has allocated");
-      const uint32_t byte = (t.at(l, col) >> (8 * (sfid + j))) & 0xFF;
+      const uint32_t byte = (t.at(l, col) >> (8 * (b % 4))) & 0xFF;
       if (ue4m3) return fp8_to_double(byte & 0x7F, kE4M3);
       if (byte == 0xFF) return std::numeric_limits<double>::quiet_NaN();
       return std::ldexp(1.0, int(byte) - 127);   // UE8M0
@@ -7530,7 +7631,7 @@ class Interpreter {
       return t.at(l, cc) >> bit & 0xF;
     };
 
-    std::vector<double> A(K), Ap(Ka), SA(4, 1.0), SB(4, 1.0);
+    std::vector<double> A(K), Ap(Ka), SA(8, 1.0), SB(8, 1.0);
     // Without block scaling, D is computed a row at a time: for each k, every
     // column's product is added to its sum (tc_rows_*), so each element still
     // sums its products in k order in f32 -- the same roundings as one
@@ -7658,7 +7759,7 @@ class Interpreter {
           }
           for (uint32_t j = 0; j < sv; ++j) {
             SA[j] = scale_of(t, sfa_addr, m, dl / 32, sfa_id, j);
-            SB[j] = scale_of(t, sfb_addr, n, dl / 32, sfb_id, j);
+            SB[j] = scale_of(t, sfb_addr, n, dl / 32, sfb_id, j, sfb_stride);
           }
           uint32_t& cell = t.at(dl, d_col0 + dc);
           float acc = 0.0f;
