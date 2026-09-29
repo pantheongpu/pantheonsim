@@ -347,6 +347,13 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
 - Warp membership: %lanemask_{eq,lt,le,gt,ge}, %warpid, activemask, bar.red,
   redux.sync. An undeclared %name is now reported as a special register this
   engine does not have rather than treated as a register nothing has written.
+- `bar.red` on all sixteen barriers, with or without a thread count, with the
+  barrier and count in registers, and guarded (the warp must agree, as for
+  `bar.sync`). With a count, only the warps that arrive share the answer, so
+  two groups can reduce on barriers of their own at once. An RTX 3060 runs
+  the same test (e2e_bar_red_named). Writing it, the simulator caught a race
+  in the test itself: one barrier reused by two groups of warps that were not
+  ordered against each other, which the card had passed by timing luck.
 - The rest of the special-register set a kernel is likely to read: %smid and
   %nsmid (blocks are placed round robin over the profile's SM count -- a real
   placement, and what a persistent kernel needs to partition work), %gridid,

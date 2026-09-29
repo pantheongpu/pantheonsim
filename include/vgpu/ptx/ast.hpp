@@ -900,7 +900,19 @@ struct OpSust {
 // gives all of them the result. Unlike bar.sync it produces a value, so it
 // cannot complete until every warp has arrived.
 enum class BarRedOp { And, Or, Popc };
-struct OpBarRed { BarRedOp op = BarRedOp::And; Reg dst; Reg src; bool negate_src = false; };
+// bar.red on barrier `id` (0..15). Without a count every thread of the CTA
+// takes part, as __syncthreads_count/and/or do; with one, the barrier
+// completes when that many threads -- whole warps -- have arrived, and only
+// they share the answer.
+struct OpBarRed {
+  BarRedOp op = BarRedOp::And;
+  Reg dst;
+  Operand id;
+  bool have_count = false;
+  Operand count;
+  Reg src;
+  bool negate_src = false;
+};
 struct OpRet {};
 // Call-sequence machinery (currently only the vprintf builtin is callable).
 struct OpDeclSlot { std::string name; uint32_t size = 0; };            // ".param .b64 param0;" in body

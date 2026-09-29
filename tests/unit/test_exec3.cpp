@@ -1710,6 +1710,103 @@ FETCH:
   mem.free(out);
 }
 
+// bar.red on the other fifteen barriers, with a thread count: two pairs of
+// warps reduce on barriers of their own at the same time, the barrier comes
+// from a register, and each pair sees only its own threads' votes. Then a
+// guarded one that the last warp skips, completed by the other three.
+VTEST(bar_red_on_named_barriers_with_a_thread_count) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry br(.param .u64 p)
+{
+  .reg .b32 %r<12>;
+  .reg .b64 %rd<6>;
+  .reg .pred %p<8>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  shr.u32 %r2, %r1, 6;          // 0 for warps 0-1, 1 for warps 2-3
+  add.u32 %r3, %r2, 3;          // barrier 3 or 4
+  setp.lt.u32 %p1, %r1, 40;     // 40 of warps 0-1's threads
+  setp.ge.u32 %p2, %r1, 100;    // 28 of warps 2-3's
+  or.pred %p3, %p1, %p2;
+  bar.red.popc.u32 %r4, %r3, 64, %p3;
+  shr.u32 %r5, %r1, 5;
+  setp.lt.u32 %p4, %r5, 3;      // warps 0-2 take the guarded one
+  setp.lt.u32 %p5, %r1, 96;
+  mov.u32 %r6, 7;
+  @%p4 bar.red.and.pred %p6, 5, 96, %p5;
+  @%p4 selp.u32 %r6, 1, 0, %p6;
+  @%p4 bar.red.or.pred %p7, 6, 96, !%p5;
+  @%p4 selp.u32 %r7, 1, 0, %p7;
+  @!%p4 mov.u32 %r7, 7;
+  mul.wide.u32 %rd3, %r1, 12;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r4;
+  st.global.u32 [%rd4+4], %r6;
+  st.global.u32 [%rd4+8], %r7;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(128 * 12);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.block = {128, 1, 1};
+  std::vector<uint8_t> pa(8);
+  std::memcpy(pa.data(), &out, 8);
+  exec::launch(m.entries[0], cfg, {pa}, mem, prof);
+  for (uint64_t t = 0; t < 128; ++t) {
+    VCHECK_EQ(mem.load_scalar(out + 12 * t, 4), uint64_t{t < 64 ? 40u : 28u});
+    VCHECK_EQ(mem.load_scalar(out + 12 * t + 4, 4), uint64_t{t < 96 ? 1u : 7u});
+    VCHECK_EQ(mem.load_scalar(out + 12 * t + 8, 4), uint64_t{t < 96 ? 0u : 7u});
+  }
+  mem.free(out);
+}
+
+// What the ISA leaves undefined is refused rather than guessed: a guard that
+// splits a warp, a count that is not whole warps, a barrier past 15.
+VTEST(bar_red_refuses_what_the_isa_leaves_undefined) {
+  auto kernel = [](const std::string& body) {
+    return std::string(kHeader) + R"(
+.visible .entry k()
+{
+  .reg .b32 %r<4>;
+  .reg .pred %p<4>;
+  mov.u32 %r1, %tid.x;
+  setp.lt.u32 %p1, %r1, 16;
+)" + body + R"(
+  ret;
+}
+)";
+  };
+  {
+    auto m = ptx::parse(kernel("  @%p1 bar.red.popc.u32 %r2, 1, 32, %p1;"));
+    MemoryManager mem{1 << 20};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    LaunchConfig cfg;
+    cfg.block = {32, 1, 1};
+    auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, mem, prof));
+    VCHECK_CONTAINS(err.what(), "the warp must agree");
+  }
+  {
+    auto m = ptx::parse(kernel("  bar.red.popc.u32 %r2, 1, 48, %p1;"));
+    MemoryManager mem{1 << 20};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    LaunchConfig cfg;
+    cfg.block = {64, 1, 1};
+    auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, mem, prof));
+    VCHECK_CONTAINS(err.what(), "multiple of the warp size");
+  }
+  {
+    auto err = VCAPTURE(Error, ptx::parse(kernel("  bar.red.popc.u32 %r2, 16, %p1;")));
+    VCHECK_CONTAINS(err.what(), "barriers 0 to 15");
+  }
+}
+
 // ---- cp.async ----
 //
 // The instruction's whole meaning is that the copy is *not* finished when it
