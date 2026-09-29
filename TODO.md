@@ -418,6 +418,23 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   the same test (e2e_bar_red_named). Writing it, the simulator caught a race
   in the test itself: one barrier reused by two groups of warps that were not
   ordered against each other, which the card had passed by timing luck.
+
+- The driver's reserved shared memory (sm_80 and later) and the
+  `%reserved_smem_offset_{begin,end,cap,0,1}` registers that locate it.
+  cooperative_groups keeps the barriers and exchange slots of tiles of more
+  than one warp (`tiled_partition<64>` and up) there. The layout is the one an
+  RTX 3060 reports for kernels from none to 48 KiB of shared memory: the
+  region starts at `%total_smem_size` (the kernel's own shared memory in
+  128-byte allocation units, as cuda_occupancy.h gives them; the register now
+  reports it rounded, as the card does), `end` is 288 bytes on and `cap` 1 KiB
+  on. Only a module that reads the registers gets the region backed, so every
+  other kernel's shared overruns are still caught. Before compute capability
+  8.0 the registers are refused. Along the way: a warp that spins on a flag
+  another warp of its block sets (which is how those tiles synchronise) spun
+  forever under the deterministic scheduler, whose turns ended only at
+  barriers; a turn longer than 65,536 instructions now ends at the next
+  backward branch. e2e_cg_multi_warp_tiles passes on the card and on the
+  simulator under all three schedulers.
 - The rest of the special-register set a kernel is likely to read: %smid and
   %nsmid (blocks are placed round robin over the profile's SM count -- a real
   placement, and what a persistent kernel needs to partition work), %gridid,

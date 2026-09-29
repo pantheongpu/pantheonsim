@@ -65,8 +65,13 @@ enum class Sreg : uint8_t {
   // Which multiprocessor this block landed on, and how many the device has.
   SmId, NSmId,
   // Shared memory available to the block: the launch's dynamic bytes, and that
-  // plus the module's static declarations.
+  // plus the module's static declarations, in the allocation unit's steps.
   DynamicSmemSize, TotalSmemSize,
+  // Where the driver's reserved shared memory lies (sm_80 and later), as
+  // offsets in the block's shared window: it starts where the kernel's own
+  // shared memory ends, and cooperative_groups keeps the scratch for tiles of
+  // more than one warp at %reserved_smem_offset_1.
+  ReservedSmemBegin, ReservedSmemEnd, ReservedSmemCap, ReservedSmemOffset0, ReservedSmemOffset1,
   // A serial number for the launch, distinct from every other launch in the
   // process.
   GridId,
@@ -1156,6 +1161,9 @@ struct EntryFn {
   std::map<std::string, SharedDecl> shared;   // .shared variables (per block)
   uint32_t static_shared_size = 0;            // statically declared shared bytes
   bool uses_dynamic_shared = false;
+  // Reads a %reserved_smem_offset_* register, so the block needs the driver's
+  // reserved shared memory behind its own.
+  bool reads_reserved_smem = false;
   // Where dynamic shared memory begins: above the static allocations,
   // rounded up to the largest alignment an extern .shared declaration asks
   // for. Equal to static_shared_size when nothing asks for more.

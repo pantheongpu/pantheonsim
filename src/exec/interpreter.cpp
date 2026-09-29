@@ -1390,10 +1390,48 @@ class Interpreter {
     bool exited = false;   // every warp Done; see BlockCtx::exited
   };
 
+  // The kernel's own shared memory as the hardware allocates it: static
+  // declarations, then the dynamic bytes, rounded up to the allocation unit
+  // (128 bytes from compute capability 8.0, 256 before; cuda_occupancy.h).
+  // An RTX 3060 reports this as %total_smem_size -- 128 for a kernel with one
+  // byte -- and puts its reserved shared memory straight after it.
+  uint32_t kernel_shared_bytes() const {
+    const uint64_t used = uint64_t{std::max(fn_.static_shared_size, fn_.dynamic_shared_offset)} +
+                          cfg_.shared_bytes;
+    const uint64_t unit = profile_.cc_major >= 8 ? 128 : 256;
+    return static_cast<uint32_t>((used + unit - 1) / unit * unit);
+  }
+  // The driver's reserved shared memory per block: 1 KiB from Ampere on
+  // (cudaDevAttrReservedSharedMemoryPerBlock; cuda_occupancy.h adds it to
+  // every block from compute capability 8.0), none before.
+  uint32_t reserved_smem_bytes() const { return profile_.cc_major >= 8 ? 1024 : 0; }
+  static constexpr uint32_t kReservedSmemUsed = 0x120;
+  uint32_t reserved_smem_base() const {
+    if (reserved_smem_bytes() == 0)
+      throw Error::make(Err::UnsupportedPtx, "%reserved_smem_offset_* on ", profile_.id,
+                        ": reserved shared memory exists from compute capability 8.0");
+    return kernel_shared_bytes();
+  }
+  // Whether the kernel or any device function in its module reads a
+  // %reserved_smem_offset_* register. Only then is the reserved region
+  // backed: every other kernel keeps its shared window at exactly what it
+  // declared, so an overrun past it is still caught rather than landing in
+  // bytes no kernel of its own should touch.
+  bool module_reads_reserved_smem() const {
+    if (fn_.reads_reserved_smem) return true;
+    for (const auto& f : fn_.module_funcs)
+      if (f && f->reads_reserved_smem) return true;
+    return false;
+  }
+
   void setup_block(BlockState& b) {
     // Fresh, zeroed shared memory per block (static declarations + the
-    // launch's dynamic bytes).
-    b.shared.assign(std::max(fn_.static_shared_size, fn_.dynamic_shared_offset) + cfg_.shared_bytes, 0);
+    // launch's dynamic bytes), and the reserved region behind them when the
+    // kernel asks where it is.
+    if (module_reads_reserved_smem() && reserved_smem_bytes())
+      b.shared.assign(size_t{kernel_shared_bytes()} + reserved_smem_bytes(), 0);
+    else
+      b.shared.assign(std::max(fn_.static_shared_size, fn_.dynamic_shared_offset) + cfg_.shared_bytes, 0);
     b.ctx.shared = &b.shared;
     b.ctx.bar_red = &b.bar_red;
     b.ctx.mbar = &b.mbar;
@@ -1565,6 +1603,7 @@ class Interpreter {
   // non-zero -- that many instructions. Zero means no bound.
   void run_warp_until_yield(Warp& w, const BlockCtx& ctx, uint64_t slice = 0) {
     uint64_t issued = 0;
+    turn_start_ = w.steps;
     for (Path& p : w.paths)
       if (p.parked == Path::kThisTurn) p.parked = Path::kRunnable;
     while (w.state == Warp::State::Ready) {
@@ -1980,7 +2019,18 @@ class Interpreter {
       case Sreg::NSmId: return profile_.limits.multiprocessors;
 
       case Sreg::DynamicSmemSize: return cfg_.shared_bytes;
-      case Sreg::TotalSmemSize: return fn_.static_shared_size + cfg_.shared_bytes;
+      case Sreg::TotalSmemSize: return kernel_shared_bytes();
+      // Measured on an RTX 3060, for kernels from none to 48 KiB of shared
+      // memory: begin, offset 0 and offset 1 are %total_smem_size; end is 288
+      // bytes on (the space cooperative_groups' memory.h says it can expect);
+      // cap is the reserved amount on (1 KiB, cudaDevAttrReservedSharedMemory-
+      // PerBlock).
+      case Sreg::ReservedSmemBegin:
+      case Sreg::ReservedSmemOffset0:
+      case Sreg::ReservedSmemOffset1:
+        return reserved_smem_base();
+      case Sreg::ReservedSmemEnd: return reserved_smem_base() + kReservedSmemUsed;
+      case Sreg::ReservedSmemCap: return reserved_smem_base() + reserved_smem_bytes();
       case Sreg::GridId: return grid_id_;
     }
     return 0;
@@ -2881,6 +2931,16 @@ class Interpreter {
   }
 
   void exec_bra(Warp& w, size_t idx, const OpBra& op, Mask m) {
+    // A warp that has run a long turn gives it up at its next backward
+    // branch. Warps of a block make progress independently on the hardware,
+    // so one may spin on a flag another warp sets -- cooperative_groups' tiles
+    // of more than one warp synchronise that way, through plain loads and
+    // atomics in shared memory -- and a turn that only ended at a barrier
+    // never let the other warp run. Yielding only at a loop edge, and only
+    // after this many instructions, keeps straight-line code and short loops
+    // in one turn, so the deterministic order stays what it was for them.
+    if (m != 0 && op.target <= w.paths[idx].pc && w.steps - turn_start_ >= kLongTurn)
+      w.yield_now = true;
     Mask taken = m;
     Mask fallthrough = w.paths[idx].mask & ~taken;
     if (taken == 0) {
@@ -11111,6 +11171,9 @@ class Interpreter {
   }
 
   static constexpr uint32_t kMaxCallDepth = 256;
+  // The step count at which the running warp's turn began (see exec_bra).
+  uint64_t turn_start_ = 0;
+  static constexpr uint64_t kLongTurn = uint64_t{1} << 16;
   uint32_t call_depth_ = 0;
 
   // ---- the device heap: malloc() and free() called from a kernel ----
