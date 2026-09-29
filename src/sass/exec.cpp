@@ -22,11 +22,13 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <thread>
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/numerics.hpp"
+#include "vgpu/exec/wgmma.hpp"
 #if __has_include("vgpu/host_cpus.hpp")
 #include "vgpu/host_cpus.hpp"
 #define VGPU_HAVE_HOST_CPUS 1
@@ -62,6 +64,7 @@ struct Warp {
   uint32_t wait_arg[32] = {};         // the barrier a lane waits on
   Mask b[16] = {};                    // convergence barriers
   uint32_t rpc[32] = {};              // the return-address register (RPCMOV)
+  uint64_t gmma_issued = 0;           // warpgroup MMAs this warp has issued
   std::vector<uint8_t> local;         // per-lane local memory, local_size bytes each
   uint32_t local_size = 0;
   uint64_t steps = 0;
@@ -73,13 +76,24 @@ struct Warp {
   bool b2r_pred = false;
 
   Mask runnable() const { return alive & ~exited & ~waiting; }
-  uint32_t& reg(unsigned n, unsigned lane) { return r[n * 32 + lane]; }
+  uint32_t& reg(unsigned n, unsigned lane) {
+    if (n >= nregs) throw std::out_of_range("register R" + std::to_string(n) + " past the warp's " + std::to_string(nregs));
+    return r[n * 32 + lane];
+  }
+};
+
+// A warpgroup MMA's shared-memory operands, read by the first of its four
+// warps (exec_gmma).
+struct GmmaSnapshot {
+  std::vector<double> A, B;
+  uint8_t taken = 0;   // the warps that have used it
 };
 
 struct Block {
   uint32_t ctaid[3] = {};
   std::vector<Warp> warps;
   std::vector<uint8_t> shared;
+  std::map<std::pair<uint32_t, uint64_t>, GmmaSnapshot> gmma;   // (warpgroup, n-th MMA)
   // A block barrier (BAR) in progress: threads arrived, the count it waits
   // for, and the reduction it computes.
   struct Barrier {
@@ -180,6 +194,7 @@ class Runner {
   void exec_warp(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask group);
   bool exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask group);   // true: it set the pcs
   void exec_mma(Block& blk, Warp& w, const Instr& ins, Mask ex);
+  void exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex);   // warpgroup MMA
   void exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex);   // textures and surfaces
   void builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name);
   uint32_t ival(Warp& w, const Operand& o, unsigned lane);   // with -/~ applied
@@ -319,9 +334,10 @@ uint64_t Runner::read64(Warp& w, const Operand& o, unsigned lane) {
       return cbank32(o.reg, static_cast<uint64_t>(o.imm)) |
              (static_cast<uint64_t>(cbank32(o.reg, static_cast<uint64_t>(o.imm) + 4)) << 32);
     case Kind::Imm:
-      // A 64-bit immediate (sm_120's MOV.64, SEL.64); others zero-extend.
-      if (o.fwidth == 64) return static_cast<uint64_t>(o.imm);
-      return static_cast<uint64_t>(read32(w, o, lane));
+      // A 64-bit immediate (sm_120's MOV.64, SEL.64), or a 32-bit one
+      // extended as the op's signedness decoded it: nvdisasm prints
+      // ISETP.GT.S64's -0x1, and the compare is against -1, not 0xffffffff.
+      return static_cast<uint64_t>(o.imm);
     default: return static_cast<uint64_t>(read32(w, o, lane));
   }
 }
@@ -470,10 +486,9 @@ void Runner::mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, 
 
 [[noreturn]] void Runner::fault(const Warp& w, const Instr& ins, unsigned lane, const std::string& why,
                                 Err code) const {
-  char b[160];
-  std::snprintf(b, sizeof b, "SASS kernel %s, warp %u lane %u, at 0x%llx (%s): ", k_.name.c_str(), w.index, lane,
-                static_cast<unsigned long long>(ins.pc), to_text(ins).c_str());
-  throw Error(code, b + why);
+  char at[64];
+  std::snprintf(at, sizeof at, ", warp %u lane %u, at 0x%llx (", w.index, lane, static_cast<unsigned long long>(ins.pc));
+  throw Error(code, "SASS kernel " + k_.name + at + to_text(ins) + "): " + why);
 }
 
 // ---- the grid ------------------------------------------------------------------

@@ -2575,10 +2575,17 @@ void dec_ldgmc(Instr& ins, const Word& w) {
 // [HIQB]GMMA (wgmma.mma_async; 0x9f0-0x9f3, 0xdf0 with A in registers):
 //   16 D, 24 A's registers or the descriptors' uniform registers (gdesc:
 //   A's then B's 64-bit smem descriptors), 32 the descriptors when A is in
-//   registers, 64 C (RZ: none), 53-57 N/8 - 1, 61/62 A/B transposed, 72/63
-//   A/B negated, 73 sparse (metadata register at 40, selector at 48),
-//   72-79 the types (below), 82 .SAT, 84-86 the scoreboard (0 gsb0, 7
-//   none), 87-89 the scale-d predicate stored as 7 - UPn, 90 its not.
+//   registers, 64 C (RZ: none), 53-58 N (below), 61/62 A/B transposed,
+//   72/63 A/B negated, 73 sparse (metadata register at 40, selector at 48),
+//   72-82 the types (below), 84-86 the scoreboard (0 gsb0, 7 none), 87-89
+//   the scale-d predicate stored as 7 - UPn, 90 its not.
+//
+// N: HGMMA and QGMMA take any multiple of 8 and hold N/8 - 1 at 53-57;
+// the integer forms take 8, 16, 24 and then multiples of 16, and hold the
+// place in that list -- BGMMA at 53-57, IGMMA three times it (plus one
+// when sparse) at 53-58.
+unsigned gmma_int_n(unsigned idx) { return idx < 4 ? (idx + 1) * 8 : 32 + 16 * (idx - 3); }
+
 enum GmmaKind { kGmmaH, kGmmaI, kGmmaB, kGmmaQ };
 
 void dec_gmma(Instr& ins, const Word& w, GmmaKind kind) {
@@ -2587,7 +2594,9 @@ void dec_gmma(Instr& ins, const Word& w, GmmaKind kind) {
   ins.op = ops[kind];
   ins.mnemonic = names[kind];
   const bool reg_a = w.bit(10), sp = w.bit(73);
-  const unsigned n = (static_cast<unsigned>(w.field(53, 5)) + 1) * 8;
+  const unsigned n = kind == kGmmaI   ? gmma_int_n(static_cast<unsigned>(w.field(53, 6)) / 3)
+                     : kind == kGmmaB ? gmma_int_n(static_cast<unsigned>(w.field(53, 5)))
+                                      : (static_cast<unsigned>(w.field(53, 5)) + 1) * 8;
   unsigned k = 0;
   std::vector<std::string> types;
   switch (kind) {
@@ -2599,9 +2608,9 @@ void dec_gmma(Instr& ins, const Word& w, GmmaKind kind) {
       break;
     case kGmmaI:
       k = 32;
-      types.push_back(w.bit(76) ? "S8" : "U8");
-      types.push_back(w.bit(75) ? "S8" : "U8");
-      if (w.bit(82)) types.push_back("SAT");
+      types.push_back(w.bit(76) ? "S8" : "U8");   // A signed
+      types.push_back(w.bit(82) ? "S8" : "U8");   // B signed
+      if (w.bit(75)) types.push_back("SAT");
       break;
     case kGmmaB:
       k = 256;
@@ -2623,11 +2632,12 @@ void dec_gmma(Instr& ins, const Word& w, GmmaKind kind) {
   for (const std::string& t : types) ins.mods.push_back(t);
   ins.f[0] = n;
   ins.f[1] = k;
-  ins.f[2] = static_cast<uint32_t>(w.field(72, 8));   // the type bits, as above
+  ins.f[2] = static_cast<uint32_t>(w.field(72, 11));   // the type bits, as above
   ins.f[3] = reg_a;
   ins.f[4] = sp;
   ins.f[5] = (w.bit(61) ? 1u : 0u) | (w.bit(62) ? 2u : 0u) | (w.bit(72) && kind == kGmmaH ? 4u : 0u) |
-             (w.bit(63) ? 8u : 0u);   // tnspA, tnspB, negA, negB
+             (w.bit(63) ? 8u : 0u) | (kind == kGmmaI && w.bit(75) ? 16u : 0u);   // tnspA, tnspB, negA, negB, SAT
+  ins.f[7] = sp ? static_cast<uint32_t>(w.field(40, 8) | (kind == kGmmaH ? w.field(48, 2) << 8 : 0)) : 0;   // metadata, selector
   ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
   const unsigned desc_at = reg_a ? 32 : 24;
   if (reg_a) ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
@@ -2643,9 +2653,9 @@ void dec_gmma(Instr& ins, const Word& w, GmmaKind kind) {
   const unsigned up = 7 - static_cast<unsigned>(w.field(87, 3));
   ins.f[6] = up | (w.bit(90) ? 8u : 0u);
   if (up != kPT || w.bit(90)) ins.src.push_back(UP(up, w.bit(90)));
-  if (sp) {
+  if (sp) {   // the metadata, and for 16-bit types the selector (8-bit ones have none)
     ins.src.push_back(R(static_cast<unsigned>(w.field(40, 8))));
-    ins.src.push_back(Imm(w.field(48, 2)));
+    if (kind == kGmmaH) ins.src.push_back(Imm(w.field(48, 2)));
   }
   if (w.field(84, 3) == 0) ins.src.push_back(Txt("gsb0"));
 }
