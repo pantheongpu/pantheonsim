@@ -105,8 +105,9 @@ bool trace() {
 struct RegisteredModule {
   const void* fatbin = nullptr;   // nvcc's wrapper, in the program's own image
   bool resolved = false;          // whether the fatbin has been looked at yet
-  bool has_ptx = false;           // whether it holds PTX this device can use
+  bool has_ptx = false;           // whether it holds code this device can use (SASS or PTX)
   std::string ptx;                // the PTX, while it is being loaded
+  std::string cubin;              // the SASS this device runs, when the fatbin has it
   std::unordered_map<int, uint64_t> module_per_device;  // device -> runtime module id
 };
 
@@ -583,10 +584,18 @@ std::string extract_registered_ptx(State& s, const void* fatCubin) {
 }
 
 // Whether a registered fatbin has PTX to run, looking the first time asked.
+// SASS for this device's architecture wins, as on the real driver
+// (nvidia/docs/sass.md); PTX is the fallback.
 bool registered_ptx(State& s, RegisteredModule& m) {
   if (!m.resolved) {
-    m.ptx = extract_registered_ptx(s, m.fatbin);
-    m.has_ptx = !m.ptx.empty();
+    uint32_t cc = ~0u;
+    if (s.rt && s.rt->device_count() > 0) {
+      const vgpu::DeviceProfile& p = s.rt->device(0).profile();
+      cc = static_cast<uint32_t>(p.cc_major * 10 + p.cc_minor);
+    }
+    m.cubin = vgpu::cuda::pick_cubin(m.fatbin, cc);
+    if (m.cubin.empty()) m.ptx = extract_registered_ptx(s, m.fatbin);
+    m.has_ptx = !m.cubin.empty() || !m.ptx.empty();
     m.resolved = true;
   }
   return m.has_ptx;
@@ -597,7 +606,12 @@ uint64_t module_on_current(State& s, RegisteredModule& m) {
   int dev = t_current_device;
   auto it = m.module_per_device.find(dev);
   if (it != m.module_per_device.end()) return it->second;
-  if (!registered_ptx(s, m)) throw vgpu::Error::make(vgpu::Err::UnsupportedPtx, "no PTX in this fatbin");
+  if (!registered_ptx(s, m)) throw vgpu::Error::make(vgpu::Err::UnsupportedPtx, "no SASS or PTX in this fatbin");
+  if (!m.cubin.empty()) {
+    const uint64_t mid = s.rt->device(dev).load_cubin(reinterpret_cast<const uint8_t*>(m.cubin.data()), m.cubin.size());
+    m.module_per_device[dev] = mid;
+    return mid;
+  }
   if (m.ptx.empty()) m.ptx = extract_registered_ptx(s, m.fatbin);
   uint64_t mid = s.rt->device(dev).load_module(m.ptx);
   m.module_per_device[dev] = mid;
@@ -1017,7 +1031,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     if (!ki.mod || !registered_ptx(s, *ki.mod))
       throw vgpu::Error::make(vgpu::Err::Unsupported,
                               "kernel '" + ki.entry_name +
-                                  "' has no PTX (SASS-only fatbin); rebuild with embedded PTX");
+                                  "' has neither SASS this GPU runs nor PTX to fall back on");
     uint64_t mid = module_on_current(s, *ki.mod);
     vgpu::runtime::Device& dev = current(s);
     const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
