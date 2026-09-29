@@ -9,7 +9,9 @@
 //     f64 alike, .ftz forms too;
 //   - the product's every use is such an add or sub: then each one fuses,
 //     the multiply duplicated where there are several; a product also used
-//     any other way is fused nowhere;
+//     any other way is fused nowhere (a use that is dead code, such as a copy
+//     nothing reads, ptxas removes first; this pass does not, so such a pair
+//     stays unfused here where the card would fuse it);
 //   - either operand order, and both directions of sub: c - a*b is
 //     fma(-a, b, c), a*b - c is fma(a, b, -c);
 //   - with a product on both sides, the first operand's is fused;
