@@ -1437,7 +1437,8 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         const Space sp = generic ? classify(g, &off) : (off = g, Space::Global);
         addrs[l] = off;
         space = sp == Space::Global || sp == Space::Param ? 0 : sp == Space::Shared ? 1 : 2;
-        // A 32-byte access (ENL2.256) moves two register quads.
+        // A 32-byte access (ENL2.256) moves two register quads: a store's low
+        // 16 bytes from the first printed, a load's into the second.
         const auto quad = [&](const Operand& d, unsigned i) { return i < 4 ? d.reg + i : 0; };
         if (store) {
           const Operand& d = ins.src[1];
@@ -1463,7 +1464,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             uint32_t v[8];
             mem_read(blk, w, l, sp, off, v, bytes);
             for (unsigned i = 0; i < bytes / 4; ++i) {
-              const Operand& q = i < 4 ? d : ins.dst[1];
+              const Operand& q = bytes == 32 ? (i < 4 ? ins.dst[1] : d) : d;
               if (q.reg != kRZ) w.reg(quad(q, i % 4), l) = v[i];
             }
           }

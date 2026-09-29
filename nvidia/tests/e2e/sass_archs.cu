@@ -9,6 +9,8 @@
 //   - a block-strided loop over a 64-bit count, whose trip count sm_100's
 //     ptxas computes as a - b - c with both IADD3 carries set (PyTorch's
 //     group norm, RowwiseMomentsCUDAKernel),
+//   - 32-byte vector loads and stores (LDG/STG.E.ENL2.256 from sm_100)
+//     against 16-byte ones, as PyTorch's float/half copies do them,
 //   - the approximate functions (MUFU), which must round as the PTX
 //     engine's do: the run prints a hash of their bits for the comparison,
 //   - a return taken by some lanes of a reduction (EXIT Pn),
@@ -19,6 +21,7 @@
 //     another block (sm_90+), and cluster launch control (sm_100+).
 #include <cstdint>
 #include <cstdio>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 __global__ void compare64(const long long* in, int* out, int n) {
@@ -46,6 +49,27 @@ __global__ void divide64(const long long* starts, long long total, long long* ou
   out[3 * i] = (size + 9) / 10;
   out[3 * i + 1] = size / 7;
   out[3 * i + 2] = size % 1000003;
+}
+
+struct alignas(32) Float8 { float v[8]; };
+struct alignas(16) Half8 { __half v[8]; };
+
+__global__ void to_half8(const Float8* in, Half8* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const Float8 a = in[i];
+  Half8 b;
+  for (int k = 0; k < 8; ++k) b.v[k] = __float2half(a.v[k]);
+  out[i] = b;
+}
+
+__global__ void to_float8(const Half8* in, Float8* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const Half8 a = in[i];
+  Float8 b;
+  for (int k = 0; k < 8; ++k) b.v[k] = __half2float(a.v[k]) + static_cast<float>(k);
+  out[i] = b;
 }
 
 __global__ void row_sums(const float* x, float* out, long long n) {
@@ -397,6 +421,31 @@ int main() {
     cudaFree(dx);
     cudaFree(dout);
     delete[] hx;
+  }
+
+  // Eight floats to eight halves and back: element k of each vector is 8i+k.
+  {
+    const int m = 96;
+    static Float8 hf8[m], hback[m];
+    static Half8 hh8[m];
+    for (int i = 0; i < m; ++i)
+      for (int k = 0; k < 8; ++k) hf8[i].v[k] = static_cast<float>(8 * i + k);
+    Float8 *df8, *dback;
+    Half8* dh8;
+    cudaMalloc(&df8, sizeof hf8);
+    cudaMalloc(&dback, sizeof hback);
+    cudaMalloc(&dh8, sizeof hh8);
+    cudaMemcpy(df8, hf8, sizeof hf8, cudaMemcpyHostToDevice);
+    to_half8<<<3, 32>>>(df8, dh8, m);
+    to_float8<<<3, 32>>>(dh8, dback, m);
+    cudaMemcpy(hh8, dh8, sizeof hh8, cudaMemcpyDeviceToHost);
+    cudaMemcpy(hback, dback, sizeof hback, cudaMemcpyDeviceToHost);
+    for (int i = 0; i < m; ++i)
+      for (int k = 0; k < 8; ++k) {
+        CHECK(__half2float(hh8[i].v[k]) == static_cast<float>(8 * i + k), "to_half8[%d][%d] = %g", i, k,
+              __half2float(hh8[i].v[k]));
+        CHECK(hback[i].v[k] == static_cast<float>(8 * i + 2 * k), "to_float8[%d][%d] = %g", i, k, hback[i].v[k]);
+      }
   }
 
   // The approximate functions: printed, for the SASS run to match the PTX one.

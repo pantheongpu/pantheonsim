@@ -2920,8 +2920,9 @@ void dec_cs2ur(Instr& ins, const Word& w) {
 }
 
 // LDG/STG.E.ENL2.256: 32 bytes in two register quads (sm_100): the first
-// quad at 64, the second at 16 (a load's destinations, a store's data with
-// the first at 32); the offset at 40-55.
+// printed at 64 (a store's at 32), the second at 16. A load's low 16 bytes
+// go to the second, a store's come from the first (both as ptxas uses
+// them, checked against the PTX engine); the offset at 40-55.
 void dec_gmem256(Instr& ins, const Word& w, bool store) {
   ins.op = store ? Op::STG : Op::LDG;
   ins.mnemonic = store ? "STG" : "LDG";
