@@ -68,7 +68,7 @@ u="$cutlass/test/unit"
 jobs=$(cutlass_compile_jobs ${#tests[@]})
 compile() {
   local path="$1" name="${1##*/}"
-  nvcc -std=c++17 -O1 -cudart shared -arch=compute_120a -code=compute_120a --expt-relaxed-constexpr \
+  nvcc -std=c++17 -O1 -cudart shared -arch=compute_120a -code="$(cutlass_code compute_120a)" --expt-relaxed-constexpr \
        -DCUTLASS_TARGET_NAME="\"$name\"" \
        -I "$cutlass/include" -I "$cutlass/tools/util/include" -I "$u/common" -I "$u" -I "$cutlass/test" \
        -I "$gtest/googletest/include" "$u/gemm/device/$path.cu" "$u/test_unit.cpp" \
@@ -93,7 +93,7 @@ for entry in "${tests[@]}"; do
   IFS='|' read -r path filter <<<"$entry"
   name="${path##*/}"
   if ! require_shim_libs "$shim" "$work/$name"; then exit 0; fi
-  result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/rtx5090 LD_LIBRARY_PATH="$shim" \
+  result="$(VGPU_QUIET=1 VGPU_SASS_LOG=1 VGPU_GPU=nvidia/rtx5090 LD_LIBRARY_PATH="$shim" \
             "$work/$name" --gtest_filter="$filter" 2>&1 || true)"
   summary="$(grep -E '^\[  (PASSED|FAILED)  \]' <<<"$result" | head -2 | tr '\n' ' ')"
   echo "$name: $summary"
@@ -101,5 +101,6 @@ for entry in "${tests[@]}"; do
     grep -E 'FAILED|Failure|VirtualGPU|timed out' <<<"$result" | head -20
     fail=1
   fi
+  cutlass_sass_check "$name" "$result" || fail=1
 done
 exit $fail
