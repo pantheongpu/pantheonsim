@@ -54,26 +54,63 @@ fatbin -> cubin (ELF) loader -> decoder (per-arch tables) -> SASS warp executor
   stall counts in the control bits are timing, which VirtualGPU does not model;
   every instruction completes before the next.
 
-## Coverage plan
+## Selection and fallback
 
-One family of 128-bit encodings covers Volta onward; each generation adds
-instructions over it. Every generation is done before this ships:
+A binary's fatbin is searched for an ELF image the GPU can run (above). The
+SASS executor then checks every instruction of it: an image with one the
+executor does not run is passed over for the fatbin's PTX when there is PTX,
+so a program keeps working while the SASS path grows; with no PTX the image
+runs and the kernel reports the instruction it stopped at. A binary with SASS
+only for another architecture and no PTX gets `cudaErrorNoKernelImageForDevice`,
+as on the hardware.
 
-| Target | Profiles | Adds |
+| Variable | Effect |
+| --- | --- |
+| `VGPU_SASS=0` | PTX whenever the binary has it |
+| `VGPU_SASS=1` | the SASS even where the executor lacks something (to find what) |
+| `VGPU_SASS_LOG=1` | say which code each module runs, and why a fallback happened |
+| `VGPU_SASS_REFUSE=<op>` | treat an op as unsupported (tests the fallback) |
+| `VGPU_SASS_TRACE=<warp>` | every instruction that warp of block (0,0,0) runs, with its results |
+| `VGPU_SASS_TRACE_KERNEL=<text>` | only in kernels whose name holds the text |
+| `VGPU_KERNEL_DIGEST=<file>` | per launch, hashes (and NaN/Inf counts) of the memory its arguments reach: run once with `VGPU_SASS=0` and once without, and `diff` names the first kernel that differs |
+
+## Coverage
+
+Every generation from Turing to Blackwell runs, sm_75 through sm_120a:
+
+| Target | Profiles | What its SASS adds, and runs here |
 | --- | --- | --- |
-| sm_75 | T4 | the base: integer/float ALU, memory, control, HMMA/IMMA |
-| sm_80, sm_86, sm_89 | A100, A10, RTX 3060/3080 Ti, L4, L40S | LDGSTS, LDSM, bf16/tf32 MMA, REDUX |
-| sm_90 | H100, H200, GH200 | clusters, TMA (UTMA*), wgmma (HGMMA etc.), setmaxnreg |
-| sm_100, sm_103 | B200, B300 | tcgen05 (UTC*), tensor memory |
-| sm_120 | RTX 5090 | sm_120's MMA kinds |
+| sm_75 | T4 | the base: integer/float ALU, memory, control, textures and surfaces, HMMA/IMMA |
+| sm_80, sm_86, sm_89 | A100, A10, RTX 3060/3080 Ti, L4, L40S | LDGSTS, LDSM, REDUX, bf16/tf32/fp8/sparse MMA, sm_80's mbarriers (ATOMS.ARRIVE) |
+| sm_90 | H100, H200, GH200 | clusters (UCGABAR, distributed shared memory, st.async, red.async), mbarriers (SYNCS), TMA (UTMA*, UBLK*: tile, im2col, multicast, reductions), warpgroup MMA (HGMMA/IGMMA/QGMMA/BGMMA), stmatrix, setmaxnreg, collectives |
+| sm_100, sm_103 | B200, B300 | the uniform float datapath, tcgen05 (LDTM/STTM, UTC*MMA of every kind, UTCCP, UTCSHIFT, the Tensor Memory allocator), TMA gather4/scatter4 and CTA pairs, cluster launch control |
+| sm_120 | RTX 5090 | sm_120's integer and float forms, block-scaled MMA |
+
+Instructions the executor does not run, and so leave a kernel to its PTX:
+`R2UR.OR` (nothing seen shows what it computes), `LDGMC` (multimem; the PTX
+engine has no multicast memory either), TMA's `im2col::w` modes (nor does the
+PTX engine), and the texture forms with a LOD clamp, a LOD bias, offsets or a
+depth compare. A `WARPSYNC.COLLECTIVE` reached from different code paths of
+one warp is refused when it happens.
+
+The tensor map (`cuTensorMapEncodeTiled`) keeps its tile-mode fields where
+NVIDIA's descriptor has them -- found with ptxas, one `tensormap.replace` field
+at a time -- because SASS rewrites a map in place with plain stores.
 
 ## Tests
 
-- `sass_decode_<arch>`: every instruction in `nvidia/tests/data/sass/<arch>.txt`
-  (encoding and nvdisasm's text, gathered by `nvidia/tools/sass-corpus.py` from
-  this repository's CUDA sources, CUTLASS and PyTorch's CUDA wheel) decodes and
-  prints back exactly as nvdisasm printed it.
-- Every existing CUDA end-to-end test runs on SASS, and again forced to PTX; the
-  two must agree, and on sm_86 both must match the RTX 3060.
-- Instruction semantics: `nvidia/tests/sass/` kernels checked against hashes
-  taken on the RTX 3060.
+- `test_sass_decode`: every instruction in `nvidia/tests/data/sass/<arch>.txt`
+  (sm_75 to sm_120a; encoding and nvdisasm's text, gathered by
+  `nvidia/tools/sass-corpora.sh` from this repository's CUDA sources,
+  PyTorch's CUDA code and the probes in `nvidia/tests/data/sass/probes`, which
+  cover each instruction family's forms) decodes and prints back exactly as
+  nvdisasm printed it.
+- `e2e_sass_path`: which code a binary runs -- SASS by default, PTX as the
+  fallback, the overrides -- and that both give the right answer.
+- `e2e_sass_archs`: twenty programs built for each generation's SASS, sm_75 to
+  sm_120, plus Hopper's (wgmma, TMA, tensor maps, stmatrix) for sm_90a and
+  Blackwell's tensor core for sm_100a, each run by default -- checked to be
+  running its SASS -- and on its PTX; the two must agree.
+  `nvidia/tests/e2e/sass_archs.cu` keeps the forms that once ran wrong.
+- Every other CUDA end-to-end test runs on SASS wherever its binary carries
+  it, which is the default now.
