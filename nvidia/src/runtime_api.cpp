@@ -2940,7 +2940,6 @@ cudaError_t fill_from_resource(const cudaResourceDesc* res, vgpu::exec::TextureD
     case cudaResourceTypeMipmappedArray: {
       auto it = g_mipmapped.find(reinterpret_cast<uint64_t>(res->res.mipmap.mipmap));
       if (it == g_mipmapped.end()) return cudaErrorInvalidValue;
-      if (it->second.flags & (cudaArrayLayered | cudaArrayCubemap)) return cudaErrorNotSupported;
       const auto& lv = it->second.levels;
       if (lv.empty() || lv.size() > 17) return cudaErrorInvalidValue;
       const ArrayRec& a = g_arrays.at(lv[0]);
@@ -2948,6 +2947,12 @@ cudaError_t fill_from_resource(const cudaResourceDesc* res, vgpu::exec::TextureD
       d->width = a.width;
       d->height = a.height;
       d->depth = a.depth;
+      // Layered and cubemap mipmaps: every level has all the layers (and
+      // faces), each of that level's size. Level 0's depth is the slice
+      // count, as cudaMallocMipmappedArray keeps extent.depth for them.
+      d->cubemap = it->second.flags & cudaArrayCubemap;
+      if (it->second.flags & cudaArrayLayered) d->layers = d->cubemap ? a.depth / 6 : a.depth;
+      if (d->cubemap || d->layers) d->depth = 0;
       d->pitch_bytes = a.width * a.texel_bytes;
       d->texel_bytes = a.texel_bytes;
       d->channels = channels_of(a.fmt);
@@ -3261,18 +3266,16 @@ VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
     if (tex) {
       for (int i = 0; i < 3; ++i)
         if (!address_mode_of(tex->addressMode[i], &d.address[i])) return cudaErrorInvalidValue;
-      // Linear filtering is refused rather than approximated -- see the note at
-      // the fetch. sRGB and anisotropy change the result too.
+      // Linear filtering and sRGB decoding are done at the fetch, as the
+      // texture unit does them. Anisotropy changes the result too and is
+      // refused rather than approximated.
       if (tex->filterMode == cudaFilterModeLinear) d.filter = vgpu::exec::TexFilter::Linear;
-      if (tex->sRGB) return cudaErrorNotSupported;
+      d.srgb = tex->sRGB != 0;
       if (tex->maxAnisotropy > 1) return cudaErrorNotSupported;
-      // The border colour is taken as zero, the default. One a program sets
-      // with border addressing is refused rather than quietly replaced.
-      bool border = false;
-      for (int i = 0; i < 3; ++i) border |= tex->addressMode[i] == cudaAddressModeBorder;
-      if (border && (tex->borderColor[0] != 0 || tex->borderColor[1] != 0 ||
-                     tex->borderColor[2] != 0 || tex->borderColor[3] != 0))
-        return cudaErrorNotSupported;
+      // What border addressing returns outside the texture, converted to the
+      // texture's format at the fetch.
+      static_assert(sizeof d.border_bits == sizeof tex->borderColor);
+      std::memcpy(d.border_bits, tex->borderColor, sizeof d.border_bits);
       d.normalized_coords = tex->normalizedCoords != 0;
       // Mip selection, held as the hardware does in 1/256ths of a level,
       // truncated toward zero.

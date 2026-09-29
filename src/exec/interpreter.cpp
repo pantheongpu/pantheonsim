@@ -31,6 +31,7 @@
 #include <deque>
 #include <memory>
 #include <cfenv>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -5210,21 +5211,115 @@ class Interpreter {
     }
   }
 
+  // The border colour's channel `ch` as the raw bits of a texel of this
+  // format -- which is what the card fetches, filters and gathers in place of
+  // a texel outside the texture. Measured on an RTX 3060, over 280,000 border
+  // colours:
+  //  - a 32-bit float channel takes the bits as they are (NaN payloads too);
+  //  - a half channel takes the float rounded toward zero (65520 gives 65504;
+  //    a NaN keeps the top of its payload, and stays a NaN);
+  //  - a normalized channel of m magnitude bits clamps the float to [0, 1] or
+  //    [-1, 1] (NaN is 0), truncates it toward zero to m + 4 fractional bits,
+  //    v, and takes (|v| * (2^m - 1) + 2^(m+3) - 1) >> (m + 4), with v's sign
+  //    -- 0.5 on an 8-bit channel is 127, not 128;
+  //  - an integer channel read as an integer takes the float's low bits.
+  // A channel the format lacks reads 0, w included.
+  static uint64_t tex_border_raw(const TextureDesc& d, uint32_t ch) {
+    const uint32_t bits = d.channel_bits[ch];
+    // An absent channel is 0 whatever the colour -- and must return before
+    // the signed width below, which would wrap to 2^32-1 bits.
+    if (bits == 0) return 0;
+    const uint32_t b = d.border_bits[ch];
+    const uint64_t mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+    if (d.kind == ChannelKind::Float) {
+      if (bits != 16) return b;
+      const uint32_t sign = (b >> 16) & 0x8000u, exp = (b >> 23) & 0xFF, man = b & 0x7FFFFFu;
+      if (exp == 0xFF) return sign | 0x7C00u | (man ? std::max<uint32_t>(man >> 13, 1u) : 0u);
+      const double a = std::fabs(static_cast<double>(f32(b)));
+      if (a >= 65504.0) return sign | 0x7BFFu;
+      if (a < std::ldexp(1.0, -14)) return sign | static_cast<uint32_t>(std::floor(std::ldexp(a, 24)));
+      int e;
+      const double fr = std::frexp(a, &e);   // a = fr * 2^e, fr in [0.5, 1)
+      return sign | (static_cast<uint32_t>(e + 14) << 10) | (static_cast<uint32_t>(std::floor(std::ldexp(fr, 11))) & 0x3FFu);
+    }
+    if (!d.read_as_normalized_float) return b & mask;
+    if (tex_srgb(d, ch)) {
+      // An sRGB channel's border colour is encoded to the nearest sRGB code
+      // -- by the sRGB formula, rounding a shade early: a fraction of 0.4989
+      // already rounds up (measured over 7,100 colours) -- and decoded
+      // through the table like a texel.
+      double x = static_cast<double>(f32(b));
+      if (std::isnan(x)) x = 0;
+      x = std::clamp(x, 0.0, 1.0);
+      const double e = x <= 0.0031308 ? x * 12.92 : 1.055 * std::pow(x, 1 / 2.4) - 0.055;
+      return static_cast<uint64_t>(std::clamp(std::floor(e * 255 + 0.50108), 0.0, 255.0));
+    }
+    const bool sgn = d.kind == ChannelKind::Signed;
+    const uint32_t m = bits - (sgn ? 1 : 0), fb = m + 4;
+    double x = static_cast<double>(f32(b));
+    if (std::isnan(x)) x = 0;
+    x = std::clamp(x, sgn ? -1.0 : 0.0, 1.0);
+    const int64_t v = static_cast<int64_t>(std::trunc(std::ldexp(x, static_cast<int>(fb))));
+    const uint64_t mag = static_cast<uint64_t>(v < 0 ? -v : v);
+    const int64_t k = static_cast<int64_t>((mag * ((1ull << m) - 1) + (1ull << (fb - 1)) - 1) >> fb);
+    return static_cast<uint64_t>(v < 0 ? -k : k) & mask;
+  }
+
+  // sRGB decoding, as an RTX 3060's texture unit does it: through a table, not
+  // the sRGB formula -- its entries (in 1/65536ths, measured for every code)
+  // have at most 8 significant bits, and the low codes run at 20/65536 a
+  // step where 1/(255 * 12.92) would give 19.9. It applies to an 8-bit
+  // unsigned normalized texture read as normalized float: x, y and z of a
+  // four-channel texture, x of a one- or two-channel one; alpha, and every
+  // other format, are left alone.
+  static constexpr uint32_t kSrgbTable[256] = {
+      0, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200, 220,
+      240, 264, 288, 312, 340, 368, 396, 428, 460, 492, 524, 560,
+      600, 636, 676, 720, 760, 804, 852, 896, 944, 1000, 1048, 1104,
+      1160, 1216, 1272, 1328, 1392, 1456, 1520, 1584, 1648, 1720, 1792, 1864,
+      1936, 2016, 2096, 2176, 2256, 2336, 2416, 2496, 2592, 2688, 2768, 2864,
+      2960, 3056, 3152, 3264, 3360, 3456, 3584, 3680, 3776, 3904, 4000, 4128,
+      4256, 4352, 4480, 4608, 4736, 4864, 4992, 5120, 5248, 5408, 5536, 5664,
+      5824, 5952, 6112, 6240, 6400, 6560, 6688, 6848, 7008, 7168, 7328, 7488,
+      7680, 7808, 8000, 8192, 8320, 8512, 8704, 8896, 9088, 9280, 9472, 9664,
+      9856, 10048, 10240, 10432, 10624, 10816, 11008, 11264, 11456, 11648, 11904, 12096,
+      12288, 12544, 12736, 12992, 13184, 13440, 13696, 13888, 14144, 14400, 14656, 14848,
+      15104, 15360, 15616, 15872, 16128, 16384, 16640, 16896, 17152, 17408, 17664, 18048,
+      18304, 18560, 18816, 19072, 19456, 19712, 19968, 20224, 20608, 20864, 21120, 21504,
+      21760, 22144, 22400, 22784, 23040, 23296, 23680, 24064, 24320, 24704, 24960, 25344,
+      25600, 25984, 26368, 26752, 27008, 27392, 27776, 28032, 28416, 28800, 29184, 29568,
+      29952, 30336, 30720, 30976, 31488, 31744, 32256, 32512, 33024, 33280, 33792, 34048,
+      34560, 35072, 35328, 35840, 36096, 36608, 37120, 37376, 37888, 38400, 38656, 39168,
+      39680, 39936, 40448, 40960, 41216, 41728, 42240, 42752, 43264, 43520, 44032, 44544,
+      45056, 45568, 45824, 46336, 46848, 47360, 47872, 48384, 48896, 49408, 49920, 50432,
+      50944, 51456, 51968, 52480, 52992, 53504, 54016, 54528, 55040, 55552, 56064, 56576,
+      57088, 57600, 58112, 58624, 59392, 59904, 60416, 60928, 61440, 61952, 62464, 62976,
+      64000, 64512, 65024, 65536,
+  };
+  static bool tex_srgb(const TextureDesc& d, uint32_t ch) {
+    return d.srgb && d.kind == ChannelKind::Unsigned && d.channel_bits[ch] == 8 && d.read_as_normalized_float &&
+           (ch == 0 || (ch < 3 && d.channel_bits[3] != 0));
+  }
+
   // Converts one channel to the 32 bits the destination register wants.
   uint32_t convert_channel(const TextureDesc& d, uint32_t ch, uint64_t raw, Type dtype) {
     const uint32_t bits = d.channel_bits[ch];
-    if (bits == 0) {
-      // A channel the format does not have. Hardware returns 0 for x/y/z and 1
-      // for w; matching that matters because a kernel reading .w of a
-      // single-channel texture expects 1, not 0.
-      if (ch == 3) return dtype.is_float() ? static_cast<uint32_t>(f32bits(1.0f)) : 1u;
-      return 0;
-    }
+    // A channel the format does not have reads 0 -- w too, measured on an RTX
+    // 3060 for every format, read mode, filter and resource type (the
+    // graphics APIs' w = 1 is not what CUDA's fetches return).
+    if (bits == 0) return 0;
     if (d.kind == ChannelKind::Float) {
       if (bits == 32) return static_cast<uint32_t>(raw);
-      if (bits == 16) return static_cast<uint32_t>(f32bits(static_cast<float>(f16_to_double(raw))));
+      if (bits == 16) {
+        // A NaN widens bit for bit, payload and all (a half 0x7c01 reads as
+        // 0x7f802000 on an RTX 3060), rather than quieted.
+        if ((raw & 0x7C00u) == 0x7C00u && (raw & 0x3FFu))
+          return static_cast<uint32_t>(((raw & 0x8000u) << 16) | 0x7F800000u | ((raw & 0x3FFu) << 13));
+        return static_cast<uint32_t>(f32bits(static_cast<float>(f16_to_double(raw))));
+      }
       return 0;
     }
+    if (tex_srgb(d, ch)) return static_cast<uint32_t>(f32bits(static_cast<float>(kSrgbTable[raw & 0xFF]) / 65536.0f));
     // Integer channels. Sign-extend first, because everything downstream --
     // both the integer result and the normalized float -- depends on it.
     int64_t sv = static_cast<int64_t>(raw);
@@ -5368,11 +5463,15 @@ class Interpreter {
   }
 
   // One texel's share of a filtered fetch, in 1/256ths: all the terms of a
-  // fetch sum to 256. A border term reads as zero.
+  // fetch sum to 256. A border term reads the border colour.
   struct TexTerm {
     int w = 0;
     uint64_t addr = 0;
     bool border = false;
+    // Which 2x2 footprint the texel belongs to -- a 3D fetch's z-slice, a mip
+    // blend's level -- since the float blend aligns each on its own (see
+    // tex_finish).
+    int group = 0;
   };
 
   void tex_check_filterable(const Instr& ins, uint32_t lane, const TextureDesc& d) {
@@ -5430,6 +5529,7 @@ class Interpreter {
       TexTerm& t = out[n++];
       t.w = w[k];
       t.border = !inside;
+      t.group = off[2];
       if (inside) t.addr = d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes;
     }
     return n;
@@ -5461,16 +5561,20 @@ class Interpreter {
     const uint32_t bits = d.channel_bits[0];
     const bool is_float = d.kind == ChannelKind::Float;
     const bool unorm = d.kind == ChannelKind::Unsigned;
-    ExactSum fsum[4];
     int64_t isum[4] = {0, 0, 0, 0};
+    double fv[4][16];
+    uint32_t codes[4][16] = {};
     for (int k = 0; k < n; ++k) {
-      if (terms[k].border || terms[k].w == 0) continue;
       for (uint32_t ch = 0; ch < 4; ++ch) {
         if (!d.channel_bits[ch]) continue;
-        const uint64_t raw = texel_channel_bits(d, terms[k].addr, ch, ins, lane);
+        if (terms[k].w == 0) { fv[ch][k] = 0; continue; }
+        const uint64_t raw = terms[k].border ? tex_border_raw(d, ch) : texel_channel_bits(d, terms[k].addr, ch, ins, lane);
         if (is_float) {
-          const double t = bits == 32 ? static_cast<double>(f32(raw)) : f16_to_double(raw);
-          fsum[ch].add(terms[k].w * t);
+          double t = bits == 32 ? static_cast<double>(f32(raw)) : f16_to_double(raw);
+          if (bits == 32 && std::fabs(t) < std::ldexp(1.0, -126)) t = std::copysign(0.0, t);   // flushed
+          fv[ch][k] = t;
+        } else if (tex_srgb(d, ch)) {
+          codes[ch][k] = static_cast<uint32_t>(raw & 0xFF);
         } else if (unorm) {
           isum[ch] += int64_t{terms[k].w} * static_cast<int64_t>(bits == 8 ? raw * 257 : raw);
         } else {
@@ -5481,17 +5585,87 @@ class Interpreter {
     for (uint32_t ch = 0; ch < 4; ++ch) {
       float r;
       if (!d.channel_bits[ch]) {
-        r = ch == 3 ? 1.0f : 0.0f;
-      } else if (is_float) {
-        // Scaling by 1/256 is exact, so round the sum of weight x texel and
-        // divide after. A non-finite texel takes the plain arithmetic.
-        ExactSum scaled;
-        bool finite = true;
-        for (int i = 0; i < fsum[ch].n; ++i) {
-          if (!std::isfinite(fsum[ch].e[i])) finite = false;
-          scaled.add(fsum[ch].e[i] / 256);
+        r = 0.0f;
+      } else if (tex_srgb(d, ch)) {
+        // An sRGB channel blends its table values (measured over 134,316
+        // two-texel blends): the table holds codes in blocks of eight sharing
+        // an exponent -- that of the block's last entry -- and within each
+        // 2x2 footprint (a 3D fetch's z-slice, a mip blend's level) each value
+        // is truncated to 2^(E - 7), E the largest block exponent among the
+        // footprint's texels with weight; the footprints' weighted sums are
+        // added exactly and rounded once to a half's precision, ties away
+        // from zero.
+        int Eg[4] = {INT_MIN, INT_MIN, INT_MIN, INT_MIN};
+        for (int k = 0; k < n; ++k)
+          if (terms[k].w && kSrgbTable[codes[ch][k]])
+            Eg[terms[k].group] = std::max(Eg[terms[k].group], std::ilogb(static_cast<double>(kSrgbTable[codes[ch][k] | 7])) - 16);
+        const int Emax = *std::max_element(Eg, Eg + 4);
+        uint64_t sum = 0;   // in 2^-24ths
+        for (int g = 0; g < 4 && Emax != INT_MIN; ++g) {
+          if (Eg[g] == INT_MIN) continue;
+          const int shift = Eg[g] - 7 + 16;   // the grid, in table units (2^-16)
+          uint64_t sg = 0;
+          for (int k = 0; k < n; ++k) {
+            if (!terms[k].w || terms[k].group != g) continue;
+            const uint64_t t = kSrgbTable[codes[ch][k]];
+            sg += uint64_t(terms[k].w) * (shift > 0 ? (t >> shift) << shift : t);
+          }
+          sum += sg;
         }
-        r = finite ? tex_round_sum(scaled, bits == 16) : static_cast<float>(fsum[ch].approx() / 256);
+        if (sum) {
+          const int e = 63 - __builtin_clzll(sum) - 24;          // the value's exponent
+          const int drop = std::max(e, -14) - 10 + 24;           // bits below a half's last
+          if (drop > 0) sum = ((sum >> (drop - 1)) + 1) >> 1 << drop;
+        }
+        r = static_cast<float>(std::ldexp(static_cast<double>(sum), -24));
+      } else if (is_float) {
+        // As measured on an RTX 3060, the blend is not an exact sum. Within
+        // each 2x2 footprint (a 3D fetch's z-slice, a mip blend's level) every
+        // value is truncated toward zero to 2^(E - 27) -- 2^(E - 14) for a
+        // half -- where E is the exponent of the footprint's largest value
+        // with a non-zero weight: 2.75 with weight 1 and 0.1 with weight 255
+        // gives 0x3de207ff, not 0x3de20800. Each footprint's weighted sum is
+        // then floored to 2^(Emax - 28), Emax the largest E, the footprints
+        // added exactly, and the total rounded once, ties away from zero.
+        // (Scaling by 1/256 is exact, so the sum of weight x value is rounded
+        // and divided after.) Over 15,360 trilinear fetches of random texels
+        // spanning 2^-10..2^11, 20 still differ, by 1-4 ulp, all where the
+        // slices' magnitudes differ widely and the result cancels to far
+        // below them. A non-finite value takes the plain arithmetic.
+        const int M = bits == 32 ? 27 : 14;
+        int Eg[4] = {INT_MIN, INT_MIN, INT_MIN, INT_MIN};
+        bool finite = true, all_neg_zero = true;
+        for (int k = 0; k < n; ++k) {
+          if (terms[k].w == 0) continue;
+          const double t = fv[ch][k];
+          if (!std::isfinite(t)) finite = false;
+          else if (t != 0) Eg[terms[k].group] = std::max(Eg[terms[k].group], std::ilogb(t));
+          if (!(t == 0 && std::signbit(t))) all_neg_zero = false;
+        }
+        const int Emax = *std::max_element(Eg, Eg + 4);
+        ExactSum scaled;
+        double plain = 0;
+        for (int k = 0; k < n; ++k)
+          if (terms[k].w) plain += terms[k].w * fv[ch][k];
+        if (finite && Emax != INT_MIN) {
+          const double q2 = std::ldexp(1.0, Emax - (M + 1));
+          for (int g = 0; g < 4; ++g) {
+            if (Eg[g] == INT_MIN) continue;
+            // Exact in a double: at most 8 terms of a 9-bit weight times a
+            // value of at most M + 1 bits, all multiples of q.
+            const double q = std::ldexp(1.0, Eg[g] - M);
+            double sg = 0;
+            for (int k = 0; k < n; ++k)
+              if (terms[k].w && terms[k].group == g) sg += terms[k].w * (std::trunc(fv[ch][k] / q) * q);
+            scaled.add(std::floor(sg / q2) * q2 / 256);
+          }
+        }
+        r = finite ? tex_round_sum(scaled, bits == 16) : static_cast<float>(plain / 256);
+        if (finite && r == 0 && all_neg_zero) r = -0.0f;
+        // A result below the smallest normal float is flushed, keeping its sign.
+        if (bits == 32 && std::fabs(r) < std::ldexp(1.0f, -126)) r = std::copysign(0.0f, r);
+        // A NaN comes out as the filter's own, all ones in the format.
+        if (std::isnan(r)) { out[ch] = bits == 32 ? 0x7FFFFFFFu : 0x7FFFE000u; continue; }
       } else {
         const int K = std::max(tex_round_half_up(isum[ch], 256), unorm ? 0 : -32767);
         r = static_cast<float>(static_cast<double>(K) / (unorm ? 65535.0 : 32767.0));
@@ -5531,7 +5705,9 @@ class Interpreter {
     v.height = d.height ? std::max(1u, d.height >> level) : 0;
     v.depth = d.depth ? std::max(1u, d.depth >> level) : 0;
     v.pitch_bytes = v.width * d.texel_bytes;
+    v.base += uint64_t{d.mip_slice} * tex_slice_bytes(v);
     v.mip_levels = 0;
+    v.mip_slice = 0;
     return v;
   }
 
@@ -5584,6 +5760,7 @@ class Interpreter {
         const uint64_t index = static_cast<uint32_t>(coord[0][lane]);
         const uint64_t layer = std::min<uint64_t>(index, d.layers - 1);
         v.base += layer * (cube ? 6 : 1) * tex_slice_bytes(d);
+        v.mip_slice += static_cast<uint32_t>(layer * (cube ? 6 : 1));
         v.layers = 0;
         if (op.geom == TexGeom::A1D) {
           true_1d = true;   // a layer of a 1D layered texture filters as 1D
@@ -5599,12 +5776,15 @@ class Interpreter {
         else if (ay >= ax) { face = y >= 0 ? 2 : 3; sc = x; tc = y >= 0 ? z : -z; ma = ay; }
         else { face = x >= 0 ? 0 : 1; sc = x >= 0 ? -z : z; tc = -y; ma = ax; }
         v.base += static_cast<uint64_t>(face) * tex_slice_bytes(d);
+        v.mip_slice += static_cast<uint32_t>(face);
         v.cubemap = false;
         v.normalized_coords = true;
-        // Point sampling clamps to the face whatever the address mode; linear
-        // filtering applies the mode inside the face -- wrap takes the texel
-        // from the face's far edge, border blends in zero (measured).
-        if (v.filter != TexFilter::Linear)
+        // Point sampling clamps to the face whatever the address mode --
+        // unless the cubemap is mipmapped, when it applies the mode like
+        // linear filtering does; linear filtering applies the mode inside the
+        // face -- wrap takes the texel from the face's far edge, border blends
+        // in the border colour (measured).
+        if (v.filter != TexFilter::Linear && !d.mip_levels)
           for (auto& a : v.address) a = TexAddress::Clamp;
         cf[0] = (sc / ma + 1.0f) * 0.5f;
         cf[1] = (tc / ma + 1.0f) * 0.5f;
@@ -5636,16 +5816,39 @@ class Interpreter {
           const bool inside = wrap_coord(effective_address(v, 0), b[0] + kOrder[k][0], size[0], &ix) &&
                               wrap_coord(effective_address(v, 1), b[1] + kOrder[k][1], size[1], &iy);
           const uint32_t ch = static_cast<uint32_t>(op.gather);
-          out[k][lane] = inside ? convert_channel(v, ch, texel_channel_bits(v, v.base + iy * row + uint64_t{ix} * v.texel_bytes, ch, ins, lane), op.dtype)
-                                : 0;
+          const uint64_t raw = inside ? texel_channel_bits(v, v.base + iy * row + uint64_t{ix} * v.texel_bytes, ch, ins, lane)
+                                      : tex_border_raw(v, ch);
+          uint32_t r = convert_channel(v, ch, raw, op.dtype);
+          if (v.kind == ChannelKind::Signed && v.channel_bits[ch] == 8 && v.read_as_normalized_float) {
+            // A signed 8-bit normalized texel is gathered as the 16-bit value
+            // the filter works in, read out over 32767, not as k / 127:
+            // |k| * 258, plus one from |k| = 64 up (65 when negative) --
+            // measured for every code on an RTX 3060.
+            const int k = std::max(static_cast<int>(static_cast<int8_t>(raw)), -127);
+            const int mag = k < 0 ? -k : k;
+            const int k16 = mag * 258 + (mag >= (k < 0 ? 65 : 64) ? 1 : 0);
+            r = static_cast<uint32_t>(f32bits(static_cast<float>(static_cast<double>(k < 0 ? -k16 : k16) / 32767.0)));
+          }
+          // A NaN comes out as the gather's own, all ones in the format, and
+          // a subnormal float as zero (measured).
+          if (v.kind == ChannelKind::Float && v.channel_bits[ch]) {
+            if (std::isnan(f32(r))) r = v.channel_bits[ch] == 32 ? 0x7FFFFFFFu : 0x7FFFE000u;
+            else if ((r & 0x7F800000u) == 0) r &= 0x80000000u;
+          }
+          out[k][lane] = r;
         }
         continue;
       }
       if (d.mip_levels) {
         // A mipmapped texture: pick the level, or blend two (see tex_mip_lod).
-        if (indexed || cube)
-          ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
-                   "mipmapped layered and cubemap textures are not implemented");
+        // Its coordinates are normalized whatever the descriptor says, and
+        // without normalizedCoords wrap and mirror still act as clamp
+        // (measured: x = 0.25 on an 8-wide level 0 reads texel 2).
+        if (!v.normalized_coords) {
+          for (auto& a : v.address)
+            if (a == TexAddress::Wrap || a == TexAddress::Mirror) a = TexAddress::Clamp;
+          v.normalized_coords = true;
+        }
         const double lodv = lod ? (op.ctype.is_float() ? static_cast<double>(f32((*lod)[lane]))
                                                        : static_cast<double>(static_cast<int32_t>((*lod)[lane])))
                                 : 0.0;
@@ -5662,10 +5865,13 @@ class Interpreter {
           const int wh = q & 255;
           if (v.filter == TexFilter::Linear) {
             n += tex_footprint_linear(lo, dims, cf, true_1d, 256 - wh, terms + n);
+            const int first_hi = n;
             n += tex_footprint_linear(hi, dims, cf, true_1d, wh, terms + n);
+            for (int k = first_hi; k < n; ++k) terms[k].group += 2;
           } else {
             n += tex_footprint_point(lo, dims, cf, 256 - wh, terms + n);
             n += tex_footprint_point(hi, dims, cf, wh, terms + n);
+            terms[n - 1].group = 2;
           }
           uint32_t r[4];
           tex_finish(ins, lane, d, terms, n, r);
@@ -5674,10 +5880,12 @@ class Interpreter {
         }
         v = tex_level(v, static_cast<uint32_t>(d.mip_filter == TexFilter::Linear ? q >> 8 : (q + 128) >> 8));
       }
-      if (v.filter == TexFilter::Linear) {
-        if (!op.ctype.is_float())
-          ctx_fail(ins, static_cast<int>(lane), Err::Unsupported,
-                   "linear filtering with integer coordinates");
+      // Integer coordinates name a texel, and the filter mode does not apply:
+      // an RTX 3060 point-samples them even from a texture set up for linear
+      // filtering (tex1Dfetch from linear memory, and tex.2d.*.s32 on an
+      // array alike). CUDA Samples' convolutionFFT2D binds its buffers that
+      // way.
+      if (v.filter == TexFilter::Linear && op.ctype.is_float()) {
         uint32_t r[4];
         tex_linear(ins, lane, v, dims, cf, r, true_1d);
         for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = r[ch];
@@ -5685,7 +5893,7 @@ class Interpreter {
       }
 
       const uint32_t size[3] = {v.width, v.height, v.depth};
-      bool inside = true;
+      bool inside = true, int_outside = false;
       uint32_t idx[3] = {0, 0, 0};
       for (uint32_t i = 0; i < dims; ++i) {
         int64_t c;
@@ -5696,15 +5904,25 @@ class Interpreter {
           // sampled coordinates are texel-centred, so x+0.5 addresses texel x.
           c = static_cast<int64_t>(std::floor(f));
         } else {
+          // An integer coordinate names a texel directly, and outside the
+          // extent reads zero: an RTX 3060 applies neither the address mode
+          // nor the border colour to it (clamp and border alike, with a
+          // border colour of 7, give 0).
           c = ci[i];
+          if (c < 0 || c >= static_cast<int64_t>(size[i])) { inside = false; int_outside = true; break; }
+          idx[i] = static_cast<uint32_t>(c);
+          continue;
         }
         if (!wrap_coord(effective_address(v, i), c, size[i], &idx[i])) { inside = false; break; }
       }
 
-      if (!inside) {
-        // Border addressing outside the extent: all components zero, which is
-        // the default border colour.
+      if (int_outside) {
         for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = 0;
+        continue;
+      }
+      if (!inside) {
+        // Border addressing outside the extent: the border colour.
+        for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = convert_channel(v, ch, tex_border_raw(v, ch), op.dtype);
         continue;
       }
       const uint64_t row = v.pitch_bytes ? v.pitch_bytes : uint64_t{v.width} * v.texel_bytes;
