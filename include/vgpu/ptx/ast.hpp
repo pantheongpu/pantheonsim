@@ -68,6 +68,10 @@ enum class Sreg : uint8_t {
   // Shared memory available to the block: the launch's dynamic bytes, and that
   // plus the module's static declarations.
   DynamicSmemSize, TotalSmemSize,
+  // The block's reserved shared memory (sm_80 and later): its start, end and
+  // capacity, and two offsets in it. Cooperative groups keeps a large tile's
+  // barrier word and per-warp scratch at %reserved_smem_offset_1.
+  ReservedSmemBegin, ReservedSmemEnd, ReservedSmemCap, ReservedSmemOffset0, ReservedSmemOffset1,
   // A serial number for the launch, distinct from every other launch in the
   // process.
   GridId,

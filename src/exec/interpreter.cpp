@@ -1351,7 +1351,7 @@ class Interpreter {
   void setup_block(BlockState& b) {
     // Fresh, zeroed shared memory per block (static declarations + the
     // launch's dynamic bytes).
-    b.shared.assign(std::max(fn_.static_shared_size, fn_.dynamic_shared_offset) + cfg_.shared_bytes, 0);
+    b.shared.assign(reserved_smem_begin() + kReservedSmemBytes, 0);
     b.ctx.shared = &b.shared;
     b.ctx.bar_red = &b.bar_red;
     b.ctx.mbar = &b.mbar;
@@ -1964,9 +1964,25 @@ class Interpreter {
 
       case Sreg::DynamicSmemSize: return cfg_.shared_bytes;
       case Sreg::TotalSmemSize: return fn_.static_shared_size + cfg_.shared_bytes;
+      case Sreg::ReservedSmemBegin:
+      case Sreg::ReservedSmemOffset0:
+      case Sreg::ReservedSmemOffset1: return reserved_smem_begin();
+      case Sreg::ReservedSmemEnd: return reserved_smem_begin() + kReservedSmemUsed;
+      case Sreg::ReservedSmemCap: return reserved_smem_begin() + kReservedSmemBytes;
       case Sreg::GridId: return grid_id_;
     }
     return 0;
+  }
+
+  // The block's reserved shared memory, as an RTX 3060 lays it out: after the
+  // static and dynamic shared memory, 128-byte aligned, 1 KiB of it
+  // (cudaDevAttrReservedSharedMemoryPerBlock), of which the first 288 bytes
+  // are in use (%reserved_smem_offset_end). Both offsets are its start.
+  // Cooperative groups syncs and reduces a tile wider than a warp there.
+  static constexpr uint64_t kReservedSmemBytes = 1024, kReservedSmemUsed = 288;
+  uint64_t reserved_smem_begin() const {
+    const uint64_t user = std::max<uint64_t>(fn_.static_shared_size, fn_.dynamic_shared_offset) + cfg_.shared_bytes;
+    return (user + 127) / 128 * 128;
   }
 
   // Widens a 32-bit register into the 64-bit operand form. A small rotating

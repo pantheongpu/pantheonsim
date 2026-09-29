@@ -1241,6 +1241,13 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_reserved_smem
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_reserved_smem.sh)
+  set_tests_properties(e2e_reserved_smem PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_device_intrinsics
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_intrinsics.sh)
   set_tests_properties(e2e_device_intrinsics PROPERTIES
