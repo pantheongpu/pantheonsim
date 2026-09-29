@@ -477,6 +477,34 @@ struct Warp {
     }
   };
   std::unordered_map<std::string, Slot> slots;
+  // The device functions this warp is inside, innermost last. Each frame is
+  // what its caller was doing: the paths (the calling one already past the
+  // call), registers and slots it resumes with when the callee's last path
+  // returns. A call is a frame rather than a nested run of the interpreter so
+  // that a warp can stop in the middle of a device function -- at a bar.sync,
+  // a bar.red, an mbarrier wait -- and let the other warps run, which is what
+  // __syncthreads() in a function nvcc did not inline needs (every -G build).
+  struct Frame {
+    const EntryFn* fn = nullptr;
+    uint64_t local_base = 0;
+    std::vector<Path> paths;
+    RegFile<Lanes32> regs32;
+    RegFile<Lanes> regs64;
+    std::vector<Mask> preds;
+    std::vector<uint8_t> written32, written64;
+    std::unordered_map<std::string, Slot> slots;
+    std::string retval_from, retval_to;   // callee's return slot -> caller's
+    Mask lanes = 0;                        // the lanes that made the call
+  };
+  std::vector<Frame> frames;
+  // The function this warp is executing (null: the kernel) and where its
+  // .local frame starts; the interpreter's cur_ and local_base_ follow the
+  // warp it is running.
+  const EntryFn* fn = nullptr;
+  uint64_t local_base = 0;
+  // Set by a call that pushed a frame, so the caller's pc is not advanced a
+  // second time: the frame already holds it past the call.
+  bool entered_call = false;
   std::vector<std::vector<uint8_t>> local;       // per-lane .local frames (lazy)
   std::array<uint32_t, kMaxWarpSize> tid_x{}, tid_y{}, tid_z{};
   // PTX's condition-code carry bit, one per lane. Written by ".cc" arithmetic
@@ -1297,10 +1325,12 @@ class Interpreter {
     auto where = [&](const Warp& w) {
       if (w.state == Warp::State::Done) return std::string("exited");
       std::string out = w.state == Warp::State::AtBarrier ? "at a barrier" : "running";
+      const EntryFn& f = w.fn ? *w.fn : fn_;
+      if (w.fn) out += " in device function '" + f.name + "'";
       for (const Path& p : w.paths) {
-        out += p.pc < fn_.body.size()
-                   ? "; PTX line " + std::to_string(fn_.body[p.pc].line) + ": " +
-                         fn_.body[p.pc].text.substr(0, 100)
+        out += p.pc < f.body.size()
+                   ? "; PTX line " + std::to_string(f.body[p.pc].line) + ": " +
+                         f.body[p.pc].text.substr(0, 100)
                    : std::string("; past the end");
         if (p.parked) out += " (parked)";
       }
@@ -1564,6 +1594,8 @@ class Interpreter {
   // Runs one warp until it yields: a barrier, a return, or -- when `slice` is
   // non-zero -- that many instructions. Zero means no bound.
   void run_warp_until_yield(Warp& w, const BlockCtx& ctx, uint64_t slice = 0) {
+    cur_ = w.fn ? w.fn : &fn_;
+    local_base_ = w.local_base;
     uint64_t issued = 0;
     for (Path& p : w.paths)
       if (p.parked == Path::kThisTurn) p.parked = Path::kRunnable;
@@ -2489,6 +2521,7 @@ class Interpreter {
   // ---- the dispatcher ----
 
   void step(Warp& w, const BlockCtx& ctx, size_t idx, const Instr& ins) {
+    step_idx_ = idx;
     Mask active = w.paths[idx].mask;
     Mask m = active;
     if (ins.has_pred) {
@@ -2536,6 +2569,8 @@ class Interpreter {
                  "bar.red cannot be reached by every lane of the warp: some lanes are on a path "
                  "that never arrives at this barrier");
       }
+      if (!w.bar_red_waiting && !w.frames.empty())
+        refuse_barrier_outside_the_call(w, ins, "bar.red");
       // Folds this warp's votes into an accumulator; `first` starts it.
       auto vote = [&](uint64_t& acc, bool first) {
         if (first) acc = op->op == BarRedOp::And ? ~uint64_t{0} : 0;
@@ -2719,6 +2754,7 @@ class Interpreter {
                  "bar.sync cannot be reached by every lane of the warp: some lanes are on a path "
                  "that never arrives at this barrier" + where);
       }
+      if (!w.frames.empty()) refuse_barrier_outside_the_call(w, ins, "bar.sync");
       const uint32_t lead = first_set(m);
       Lanes _s_id;
       const uint64_t id = read_operand(w, ctx, ins, bop->id, _s_id)[lead];
@@ -2782,6 +2818,10 @@ class Interpreter {
         throw;
       }
     }
+    if (w.entered_call) {
+      w.entered_call = false;
+      return;
+    }
     ++w.paths[idx].pc;
   }
 
@@ -2838,7 +2878,7 @@ class Interpreter {
     // ended the whole thread at the first call that returned -- and because
     // the caller then resumed with its own saved state, the damage showed up
     // later as a warp that had silently stopped executing.
-    const bool in_call = call_depth_ > 0;
+    const bool in_call = !w.frames.empty();
     if (!in_call) w.exited |= m;
     Mask survivors = w.paths[idx].mask & ~m;
     if (survivors == 0) {
@@ -2852,6 +2892,7 @@ class Interpreter {
       w.state = Warp::State::Done;
       drain_async_copies(w, ctx, ins);
     }
+    if (w.paths.empty() && in_call) return_to_caller(w);
   }
 
   // ---- fast paths ----
@@ -10014,61 +10055,70 @@ class Interpreter {
 
   // ---- calls to device functions ----
   //
-  // Runs the callee to completion inside the caller's instruction, rather than
-  // pushing a frame the outer scheduler walks. That keeps the path stack, the
-  // register files and the pc of the caller untouched and makes recursion fall
-  // out of the host stack -- at the cost that a warp does not yield in the
-  // middle of a device function, so a spin-wait inside one would not let other
-  // warps run. Nothing emits that shape, and the step budget still catches it.
+  // A call pushes a frame (Warp::Frame) holding the caller's paths, registers
+  // and slots, and the warp carries on in the callee's body with a single path
+  // of the calling lanes. The scheduler runs it like any other code: it can
+  // diverge, wait at a barrier and yield, and its last path's ret pops the
+  // frame (return_to_caller). Running the callee to completion inside the
+  // call instruction, as this used to, could not yield, so a __syncthreads()
+  // in a function nvcc had not inlined was refused.
   //
   // Parameters and the return value travel as call slots, not as a parameter
   // buffer: each lane passes its own arguments, so there is no single set of
   // bytes to read them from. The caller has already written its slots with
   // st.param; this binds them to the names the callee's body reads.
   void exec_user_call(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
+    (void)ctx;
     const EntryFn& callee = *op.target;
     if (op.param_slots.size() != callee.param_slot_names.size())
       ctx_fail(ins, -1, Err::UnsupportedPtx,
                "call to '" + callee.name + "' passes " + std::to_string(op.param_slots.size()) +
                    " arguments; it takes " + std::to_string(callee.param_slot_names.size()));
-    if (++call_depth_ > kMaxCallDepth) {
-      --call_depth_;
+    if (w.frames.size() >= kMaxCallDepth)
       ctx_fail(ins, -1, Err::ExecLimit,
                "device call nested more than " + std::to_string(kMaxCallDepth) +
                    " deep in '" + callee.name + "' (runaway recursion?)");
-    }
 
     // Bind arguments before anything is swapped out: they live in the caller's
     // slot map and are read per lane.
     std::unordered_map<std::string, Warp::Slot> args;
     for (size_t i = 0; i < op.param_slots.size(); ++i) {
       auto it = w.slots.find(op.param_slots[i]);
-      if (it == w.slots.end()) {
-        --call_depth_;
+      if (it == w.slots.end())
         ctx_fail(ins, -1, Err::UninitializedRegister,
                  "argument slot '" + op.param_slots[i] + "' read before write");
-      }
       // Copied whole, bytes and all: a struct argument is as much a slot as a
       // scalar one, and only the name changes across the call boundary.
       args[callee.param_slot_names[i]] = it->second;
     }
 
-    // Swap in the callee's world.
-    const EntryFn* saved_fn = cur_;
-    const uint64_t saved_local_base = local_base_;
-    auto saved_paths = std::move(w.paths);
-    auto saved_r32 = std::move(w.regs32);
-    auto saved_r64 = std::move(w.regs64);
-    auto saved_pred = std::move(w.preds);
-    auto saved_w32 = std::move(w.written32);
-    auto saved_w64 = std::move(w.written64);
-    auto saved_slots = std::move(w.slots);
-    const auto saved_state = w.state;
+    // The caller resumes after the call, so its path is saved already past it.
+    ++w.paths[step_idx_].pc;
+    Warp::Frame f;
+    f.fn = w.fn;
+    f.local_base = w.local_base;
+    f.paths = std::move(w.paths);
+    f.regs32 = std::move(w.regs32);
+    f.regs64 = std::move(w.regs64);
+    f.preds = std::move(w.preds);
+    f.written32 = std::move(w.written32);
+    f.written64 = std::move(w.written64);
+    f.slots = std::move(w.slots);
+    f.retval_from = callee.retval_slot_name;
+    f.retval_to = op.retval_slot;
+    f.lanes = m;
+    w.frames.push_back(std::move(f));
 
+    // The callee's .local frame sits above its caller's, the way a stack
+    // grows, so a pointer into the caller's frame stays valid in the callee.
+    w.local_base = (local_base_ + cur_->local_frame_size + 15) / 16 * 16;
+    w.fn = &callee;
     cur_ = &callee;
-    local_base_ = (saved_local_base + saved_fn->local_frame_size + 15) / 16 * 16;
+    local_base_ = w.local_base;
     w.paths.clear();
-    w.paths.push_back(Path{0, m});
+    Path entry{0, m};
+    entry.issued_at = w.steps;
+    w.paths.push_back(entry);
     w.regs32.clear();
     w.regs32.resize(callee.num_regs32);
     w.regs64.clear();
@@ -10077,88 +10127,73 @@ class Interpreter {
     w.written32.assign(callee.num_regs32, 0);
     w.written64.assign(callee.num_regs64, 0);
     w.slots = std::move(args);
-    w.state = Warp::State::Ready;
+    w.entered_call = true;
+  }
 
-    auto restore = [&]() {
-      cur_ = saved_fn;
-      local_base_ = saved_local_base;
-      w.paths = std::move(saved_paths);
-      w.regs32 = std::move(saved_r32);
-      w.regs64 = std::move(saved_r64);
-      w.preds = std::move(saved_pred);
-      w.written32 = std::move(saved_w32);
-      w.written64 = std::move(saved_w64);
-      w.state = saved_state;
-      --call_depth_;
-    };
-
+  // The callee's last path has returned: the caller's world comes back, with
+  // the return value, if the callee set one, in the caller's slot.
+  void return_to_caller(Warp& w) {
+    Warp::Frame f = std::move(w.frames.back());
+    w.frames.pop_back();
     Warp::Slot retval;
     bool have_ret = false;
-    try {
-      // The callee's own divergence is handled by the same path machinery; it
-      // is finished when every path has returned.
-      while (w.state == Warp::State::Ready && !w.paths.empty()) {
-        if (w.paths[0].pc >= callee.body.size())
-          ctx_fail(ins, -1, Err::PtxParse,
-                   "control fell off the end of device function '" + callee.name + "'");
-        const size_t idx = select_path(w);
-        const Instr& inner = callee.body[w.paths[idx].pc];
-        ++stats_.instructions;
-        if (++w.steps > cfg_.max_steps)
-          throw Error::make(Err::ExecLimit, "kernel '", fn_.name,
-                            "' exceeded the step budget (", cfg_.max_steps,
-                            " instructions in one warp) — possible infinite loop");
-        const uint64_t lanes = static_cast<uint64_t>(popcount_mask(w.paths[idx].mask));
-        stats_.thread_instructions += lanes;
-        const InstClass cls = class_of_pc(w.paths[idx].pc);
-        stats_.inst_by_class[static_cast<size_t>(cls)] += lanes;
-        if (cls == InstClass::Tensor) ++stats_.tensor_instructions;
-        if (inner.opcode_id) {
-          if (inner.opcode_id >= stats_.inst_by_opcode.size())
-            stats_.inst_by_opcode.resize(inner.opcode_id + 1, 0);
-          ++stats_.inst_by_opcode[inner.opcode_id];
-        }
-        if (ctx.clock) ++*ctx.clock;
-        step(w, ctx, idx, inner);
+    if (!f.retval_from.empty()) {
+      auto it = w.slots.find(f.retval_from);
+      if (it != w.slots.end()) {
+        retval = std::move(it->second);
+        have_ret = true;
       }
-      // The nested loop ends when every path has returned. Ending any other
-      // way means the callee blocked -- a bar.sync or an mbarrier wait inside
-      // a device function -- and this executor cannot yield from there, so the
-      // rest of the function would be skipped and the caller would carry on
-      // with a half-computed result. Refuse instead.
-      if (w.state != Warp::State::Ready && !w.paths.empty())
-        throw Error::make(Err::UnsupportedPtx, "device function '", callee.name,
-                          "' blocked on a barrier; barriers inside a non-inlined device "
-                          "function are not supported (the call runs to completion without "
-                          "yielding to other warps)");
-      if (!callee.retval_slot_name.empty()) {
-        auto it = w.slots.find(callee.retval_slot_name);
-        if (it != w.slots.end()) {
-          retval = it->second;
-          have_ret = true;
-        }
-      }
-    } catch (...) {
-      restore();
-      w.slots = std::move(saved_slots);
-      throw;
     }
-    restore();
-    w.slots = std::move(saved_slots);
+    w.fn = f.fn;
+    w.local_base = f.local_base;
+    cur_ = w.fn ? w.fn : &fn_;
+    local_base_ = w.local_base;
+    w.paths = std::move(f.paths);
+    w.regs32 = std::move(f.regs32);
+    w.regs64 = std::move(f.regs64);
+    w.preds = std::move(f.preds);
+    w.written32 = std::move(f.written32);
+    w.written64 = std::move(f.written64);
+    w.slots = std::move(f.slots);
     // Only the calling lanes' return values: another path's lanes may have a
     // result in the same-named slot that they have not loaded yet.
-    if (have_ret && !op.retval_slot.empty()) {
-      Warp::Slot& out = w.slots[op.retval_slot];
+    if (have_ret && !f.retval_to.empty()) {
+      Warp::Slot& out = w.slots[f.retval_to];
       out.fit(retval.size, W_);
       for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane))
+        if (f.lanes & (Mask{1} << lane))
           std::memcpy(out.bytes.data() + static_cast<size_t>(lane) * out.size,
                       retval.bytes.data() + static_cast<size_t>(lane) * retval.size, retval.size);
     }
   }
 
+  // Lanes of the warp that are live but outside the function it is running:
+  // on the caller's other paths, frozen in a frame until the call returns. A
+  // barrier inside the call cannot wait for them -- they will not move until
+  // it completes -- so a barrier that needs them is refused, not deadlocked.
+  Mask lanes_outside_the_call(const Warp& w) const {
+    Mask in_call = 0, all = 0;
+    for (const Path& p : w.paths) in_call |= p.mask;
+    for (const auto& f : w.frames)
+      for (const Path& p : f.paths) all |= p.mask;
+    return all & ~in_call;
+  }
+
+  void refuse_barrier_outside_the_call(const Warp& w, const Instr& ins, const char* what) {
+    if (const Mask out = lanes_outside_the_call(w))
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               std::string(what) + " inside device function '" + cur_->name +
+                   "' needs lanes that did not make the call (0x" + [&] {
+                     char buf[32];
+                     std::snprintf(buf, sizeof buf, "%llx", static_cast<unsigned long long>(out));
+                     return std::string(buf);
+                   }() + "); they wait in the caller until it returns, so the barrier can never "
+                         "complete for this warp");
+  }
+
   static constexpr uint32_t kMaxCallDepth = 256;
-  uint32_t call_depth_ = 0;
+  // The path step() is executing, for a call that has to save it.
+  size_t step_idx_ = 0;
 
   // ---- the device heap: malloc() and free() called from a kernel ----
   //

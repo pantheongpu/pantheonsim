@@ -1807,6 +1807,122 @@ VTEST(bar_red_refuses_what_the_isa_leaves_undefined) {
   }
 }
 
+// A bar.sync inside a device function that was not inlined: the warp stops
+// in the middle of the callee and the other warps run until they arrive.
+// Each thread writes shared memory, the callee's barrier orders the writes
+// before the reads, and a thread in another warp reads it back. The callee
+// returns a value, and the caller carries on with its own registers intact.
+VTEST(bar_sync_inside_a_device_function_yields_to_other_warps) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.shared .align 4 .b8 buf[512];
+.func (.param .b32 ret) exchange(.param .b32 v)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<4>;
+  ld.param.b32 %r1, [v];
+  mov.u32 %r2, %tid.x;
+  mov.u32 %r7, buf;
+  mad.lo.u32 %r3, %r2, 4, %r7;
+  st.shared.u32 [%r3], %r1;
+  bar.sync 0;
+  xor.b32 %r4, %r2, 64;         // a thread two warps away
+  mad.lo.u32 %r5, %r4, 4, %r7;
+  ld.shared.u32 %r6, [%r5];
+  bar.sync 0;
+  st.param.b32 [ret], %r6;
+  ret;
+}
+.visible .entry k(.param .u64 p)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<6>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  mul.lo.u32 %r2, %r1, 3;
+  add.u32 %r7, %r1, 1000;       // live across the call
+  {
+  .param .b32 a0;
+  st.param.b32 [a0], %r2;
+  .param .b32 r0;
+  call.uni (r0), exchange, (a0);
+  ld.param.b32 %r3, [r0];
+  }
+  {
+  .param .b32 a1;
+  st.param.b32 [a1], %r3;
+  .param .b32 r1;
+  call.uni (r1), exchange, (a1);
+  ld.param.b32 %r4, [r1];
+  }
+  mul.wide.u32 %rd3, %r1, 8;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r3;
+  st.global.u32 [%rd4+4], %r7;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  const ptx::EntryFn* k = nullptr;
+  for (const auto& e : m.entries)
+    if (e.name == "k") k = &e;
+  VCHECK(k != nullptr);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(128 * 8);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.block = {128, 1, 1};
+  std::vector<uint8_t> pa(8);
+  std::memcpy(pa.data(), &out, 8);
+  exec::launch(*k, cfg, {pa}, mem, prof);
+  for (uint64_t t = 0; t < 128; ++t) {
+    VCHECK_EQ(mem.load_scalar(out + 8 * t, 4), (t ^ 64) * 3);
+    VCHECK_EQ(mem.load_scalar(out + 8 * t + 4, 4), t + 1000);
+  }
+  mem.free(out);
+}
+
+// A barrier inside a call that only some of the warp's lanes made can never
+// complete for that warp: the others wait in the caller until it returns. The
+// ISA leaves it undefined, and it is refused by name rather than hung on.
+VTEST(bar_sync_in_a_call_some_lanes_skipped_is_refused) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.func sync_here()
+{
+  bar.sync 0;
+  ret;
+}
+.visible .entry k()
+{
+  .reg .b32 %r<4>;
+  .reg .pred %p<2>;
+  mov.u32 %r1, %tid.x;
+  setp.lt.u32 %p1, %r1, 16;
+  @!%p1 bra SKIP;
+  call.uni sync_here, ();
+SKIP:
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  const ptx::EntryFn* k = nullptr;
+  for (const auto& e : m.entries)
+    if (e.name == "k") k = &e;
+  VCHECK(k != nullptr);
+  MemoryManager mem{1 << 20};
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  auto err = VCAPTURE(Error, exec::launch(*k, cfg, {}, mem, prof));
+  VCHECK_CONTAINS(err.what(), "needs lanes that did not make the call");
+}
+
 // ---- cp.async ----
 //
 // The instruction's whole meaning is that the copy is *not* finished when it
