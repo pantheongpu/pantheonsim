@@ -2,12 +2,25 @@
 // them (rust-cuda's cust): which shapes cuArray3DCreate takes and refuses,
 // the descriptors read back, copies into and out of 1D arrays, and 2D and 3D
 // copies between host, device and array memory, sub-rectangles and bounds
-// included. Also cuMemAllocAsync and cuMemFreeAsync. The expected answers are
-// what an RTX 3060's and an RTX 3080 Ti's drivers give (they agree).
+// included. Also cuMemAllocAsync and cuMemFreeAsync, and the rest of what cust
+// calls: pitched allocation, a module's globals by name, the cache and shared
+// memory configurations, and stream callbacks. The expected answers are what
+// an RTX 3060's and an RTX 3080 Ti's drivers give (they agree).
 #include <cuda.h>
 
 #include <cstdio>
 #include <cstring>
+
+static const char* kGlobals = R"(
+.version 7.0
+.target sm_80
+.address_size 64
+.visible .global .align 4 .u32 counter;
+.visible .global .align 8 .b8 table[24];
+.visible .entry k() { ret; }
+)";
+
+static void CUDA_CB on_done(CUstream, CUresult status, void* user) { *static_cast<int*>(user) = 100 + (int)status; }
 
 static int failures = 0;
 
@@ -150,6 +163,65 @@ int main() {
   IS(cuStreamSynchronize(s), CUDA_SUCCESS);
   check(byte == 7, "cuMemAllocAsync memory is usable on its stream");
   IS(cuStreamDestroy(s), CUDA_SUCCESS);
+
+  // Pitched allocation: rows padded to 512 bytes, elements of 4, 8 or 16.
+  CUdeviceptr pd = 0;
+  size_t pitch = 0;
+  IS(cuMemAllocPitch(&pd, &pitch, 100, 3, 4), CUDA_SUCCESS);
+  check(pitch == 512, "a 100-byte row pitched to 512");
+  IS(cuMemFree(pd), CUDA_SUCCESS);
+  IS(cuMemAllocPitch(&pd, &pitch, 513, 3, 16), CUDA_SUCCESS);
+  check(pitch == 1024, "a 513-byte row pitched to 1024");
+  IS(cuMemFree(pd), CUDA_SUCCESS);
+  IS(cuMemAllocPitch(&pd, &pitch, 100, 3, 2), CUDA_ERROR_INVALID_VALUE);
+  IS(cuMemAllocPitch(&pd, &pitch, 0, 3, 4), CUDA_ERROR_INVALID_VALUE);
+  IS(cuMemAllocPitch(&pd, &pitch, 100, 0, 4), CUDA_ERROR_INVALID_VALUE);
+
+  // A module's globals, by name.
+  CUmodule mod;
+  IS(cuModuleLoadData(&mod, kGlobals), CUDA_SUCCESS);
+  CUdeviceptr g = 0;
+  size_t bytes = 0;
+  IS(cuModuleGetGlobal(&g, &bytes, mod, "counter"), CUDA_SUCCESS);
+  check(g != 0 && bytes == 4, "a u32 global is 4 bytes");
+  unsigned v = 42;
+  IS(cuMemcpyHtoD(g, &v, 4), CUDA_SUCCESS);
+  v = 0;
+  IS(cuMemcpyDtoH(&v, g, 4), CUDA_SUCCESS);
+  check(v == 42, "a global written and read back");
+  bytes = 0;
+  IS(cuModuleGetGlobal(nullptr, &bytes, mod, "table"), CUDA_SUCCESS);
+  check(bytes == 24, "an array global's size, with no address asked for");
+  IS(cuModuleGetGlobal(&g, nullptr, mod, "table"), CUDA_SUCCESS);
+  IS(cuModuleGetGlobal(nullptr, nullptr, mod, "table"), CUDA_ERROR_INVALID_VALUE);
+  IS(cuModuleGetGlobal(&g, &bytes, mod, "nope"), CUDA_ERROR_NOT_FOUND);
+  IS(cuModuleGetGlobal(&g, &bytes, mod, "k"), CUDA_ERROR_INVALID_VALUE);
+  IS(cuModuleUnload(mod), CUDA_SUCCESS);
+
+  // The cache preference reads back; shared memory banks stay four bytes.
+  CUfunc_cache cc = (CUfunc_cache)77;
+  IS(cuCtxGetCacheConfig(&cc), CUDA_SUCCESS);
+  check(cc == CU_FUNC_CACHE_PREFER_NONE, "no cache preference to start with");
+  IS(cuCtxSetCacheConfig(CU_FUNC_CACHE_PREFER_EQUAL), CUDA_SUCCESS);
+  IS(cuCtxGetCacheConfig(&cc), CUDA_SUCCESS);
+  check(cc == CU_FUNC_CACHE_PREFER_EQUAL, "the cache preference set is read back");
+  IS(cuCtxSetCacheConfig((CUfunc_cache)4), CUDA_ERROR_INVALID_VALUE);
+  IS(cuCtxSetCacheConfig(CU_FUNC_CACHE_PREFER_NONE), CUDA_SUCCESS);
+  CUsharedconfig sc = (CUsharedconfig)77;
+  IS(cuCtxSetSharedMemConfig(CU_SHARED_MEM_CONFIG_EIGHT_BYTE_BANK_SIZE), CUDA_SUCCESS);
+  IS(cuCtxGetSharedMemConfig(&sc), CUDA_SUCCESS);
+  check(sc == CU_SHARED_MEM_CONFIG_FOUR_BYTE_BANK_SIZE, "shared memory banks stay four bytes");
+  IS(cuCtxSetSharedMemConfig((CUsharedconfig)3), CUDA_ERROR_INVALID_VALUE);
+
+  // A stream callback runs, told the stream succeeded; flags must be 0.
+  CUstream cs;
+  IS(cuStreamCreate(&cs, 0), CUDA_SUCCESS);
+  int told = 0;
+  IS(cuStreamAddCallback(cs, on_done, &told, 0), CUDA_SUCCESS);
+  IS(cuStreamSynchronize(cs), CUDA_SUCCESS);
+  check(told == 100, "the callback ran with CUDA_SUCCESS");
+  IS(cuStreamAddCallback(cs, on_done, &told, 1), CUDA_ERROR_INVALID_VALUE);
+  IS(cuStreamDestroy(cs), CUDA_SUCCESS);
 
   std::printf(failures ? "FAIL: %d array checks\n" : "PASS: every array check\n", failures);
   return failures ? 1 : 0;

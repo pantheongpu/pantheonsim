@@ -63,6 +63,7 @@ typedef struct CUfunc_st* CUfunction;
 typedef struct CUstream_st* CUstream;
 typedef void (*CUhostFn)(void* userData);
 typedef struct CUarray_st* CUarray;
+typedef void (*CUstreamCallback)(CUstream hStream, int status, void* userData);
 
 /* CUDA arrays and 2D/3D copies. The enumerator values and struct layouts are
  * the documented ones, so a program compiled against NVIDIA's cuda.h passes

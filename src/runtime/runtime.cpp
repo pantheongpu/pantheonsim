@@ -421,6 +421,37 @@ const exec::SymbolTable* Device::symbols(uint64_t module_id) const {
   throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
 }
 
+bool Device::global(uint64_t module_id, const std::string& name, uint64_t* addr, uint64_t* size) const {
+  for (const auto& lm : modules_) {
+    if (lm.id != module_id) continue;
+    const auto it = lm.symbols.find(name);
+    if (it == lm.symbols.end() || !lm.mod) return false;
+    for (const auto& g : lm.mod->globals)
+      if (g.name == name) {
+        if (addr) *addr = it->second;
+        if (size) *size = g.size;
+        return true;
+      }
+    return false;
+  }
+  throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
+}
+
+bool Device::has_kernel(uint64_t module_id, const std::string& name) const {
+  for (const auto& lm : modules_) {
+    if (lm.id != module_id || !lm.mod) continue;
+    for (const auto& e : lm.mod->entries)
+      if (e.name == name) return true;
+    if (!lm.lazy) return false;
+    try {  // a lazy module parses the kernel on lookup, and says when there is none
+      return get_function(module_id, name) != nullptr;
+    } catch (const Error&) {
+      return false;
+    }
+  }
+  return false;
+}
+
 namespace {
 
 // VGPU_COUNTERS=1 prints the per-launch counters. These are exact counts of

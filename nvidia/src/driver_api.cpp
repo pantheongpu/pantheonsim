@@ -110,6 +110,7 @@ struct ShimState {
   std::set<void*> host_allocs;      // cuMemHostAlloc results
   std::map<uintptr_t, size_t> managed;  // cuMemAllocManaged results: base -> bytes
   std::unordered_map<uintptr_t, ArrayRec> arrays;  // cuArray3DCreate results
+  int cache_config = 0;   // cuCtxSetCacheConfig: CU_FUNC_CACHE_PREFER_NONE until set
 };
 
 ShimState& state() {
@@ -2165,6 +2166,86 @@ VGPU_EXPORT CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream) {
   return cuMemFree_v2(dptr);
 }
 
+/* ---- pitched memory, module globals, context configuration ----
+ * Each answers as an RTX 3060's and an RTX 3080 Ti's drivers do (they agree). */
+
+// Rows padded to 512 bytes; the element size must be 4, 8 or 16 and neither
+// dimension 0.
+VGPU_EXPORT CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pitch, size_t width, size_t height,
+                                        unsigned int elem) {
+  return api("cuMemAllocPitch", true, false, [&](ShimState& s) {
+    if (!dptr || !pitch || width == 0 || height == 0 || (elem != 4 && elem != 8 && elem != 16))
+      return CUDA_ERROR_INVALID_VALUE;
+    *pitch = (width + 511) / 512 * 512;
+    *dptr = current(s).memory().alloc(*pitch * height);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemAllocPitch(CUdeviceptr* dptr, size_t* pitch, size_t width, size_t height,
+                                     unsigned int elem) {
+  return cuMemAllocPitch_v2(dptr, pitch, width, height, elem);
+}
+
+// A module's __device__ variable: its address and size, either of which may be
+// omitted but not both. A name the module does not declare is NOT_FOUND; a
+// kernel's name is INVALID_VALUE, as on the card.
+VGPU_EXPORT CUresult cuModuleGetGlobal_v2(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name) {
+  return api("cuModuleGetGlobal", true, false, [&](ShimState& s) {
+    if ((!dptr && !bytes) || !name) return CUDA_ERROR_INVALID_VALUE;
+    auto it = s.modules.find(reinterpret_cast<uintptr_t>(hmod));
+    if (it == s.modules.end()) return CUDA_ERROR_INVALID_HANDLE;
+    const auto [dev, mid] = it->second;
+    uint64_t addr = 0, size = 0;
+    if (!s.rt->device(dev).global(mid, name, &addr, &size))
+      return s.rt->device(dev).has_kernel(mid, name) ? CUDA_ERROR_INVALID_VALUE : CUDA_ERROR_NOT_FOUND;
+    if (dptr) *dptr = addr;
+    if (bytes) *bytes = static_cast<size_t>(size);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuModuleGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name) {
+  return cuModuleGetGlobal_v2(dptr, bytes, hmod, name);
+}
+
+// The L1/shared split is a preference the simulator has no cache to apply to;
+// it is kept and read back, as the card reads it back.
+VGPU_EXPORT CUresult cuCtxSetCacheConfig(int config) {
+  return api("cuCtxSetCacheConfig", true, false, [&](ShimState& s) {
+    if (config < 0 || config > 3) return CUDA_ERROR_INVALID_VALUE;
+    s.cache_config = config;
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuCtxGetCacheConfig(int* config) {
+  return api("cuCtxGetCacheConfig", true, false, [&](ShimState& s) {
+    if (!config) return CUDA_ERROR_INVALID_VALUE;
+    *config = s.cache_config;
+    return CUDA_SUCCESS;
+  });
+}
+// Shared memory banks are four bytes wide on every GPU this simulates: a
+// configuration is accepted and has no effect, and the answer stays
+// CU_SHARED_MEM_CONFIG_FOUR_BYTE_BANK_SIZE, as the card's does.
+VGPU_EXPORT CUresult cuCtxSetSharedMemConfig(int config) {
+  return config >= 0 && config <= 2 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+VGPU_EXPORT CUresult cuCtxGetSharedMemConfig(int* config) {
+  if (!config) return CUDA_ERROR_INVALID_VALUE;
+  *config = 1;
+  return CUDA_SUCCESS;
+}
+VGPU_EXPORT CUresult cuFuncSetSharedMemConfig(CUfunction, int config) {
+  return config >= 0 && config <= 2 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+// A stream callback runs at once: the stream is synchronous, so the work
+// queued before it is done. It is told the stream succeeded. Flags must be 0.
+VGPU_EXPORT CUresult cuStreamAddCallback(CUstream stream, CUstreamCallback cb, void* user, unsigned int flags) {
+  if (!cb || flags != 0) return CUDA_ERROR_INVALID_VALUE;
+  cb(stream, CUDA_SUCCESS, user);
+  return CUDA_SUCCESS;
+}
+
 /* ---- streams (all synchronous) and events (wall-clock timestamps) ---- */
 
 VGPU_EXPORT CUresult cuStreamCreate(CUstream* s_out, unsigned int) {
@@ -2832,6 +2913,10 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuMemcpy2DUnaligned_v2), VGPU_PROC(cuMemcpy2DAsync), VGPU_PROC(cuMemcpy2DAsync_v2),
     VGPU_PROC(cuMemcpy3D), VGPU_PROC(cuMemcpy3D_v2), VGPU_PROC(cuMemcpy3DAsync), VGPU_PROC(cuMemcpy3DAsync_v2),
     VGPU_PROC(cuMemAllocAsync), VGPU_PROC(cuMemFreeAsync),
+    VGPU_PROC(cuMemAllocPitch), VGPU_PROC(cuMemAllocPitch_v2), VGPU_PROC(cuModuleGetGlobal),
+    VGPU_PROC(cuModuleGetGlobal_v2), VGPU_PROC(cuCtxSetCacheConfig), VGPU_PROC(cuCtxGetCacheConfig),
+    VGPU_PROC(cuCtxSetSharedMemConfig), VGPU_PROC(cuCtxGetSharedMemConfig),
+    VGPU_PROC(cuFuncSetSharedMemConfig), VGPU_PROC(cuStreamAddCallback),
     VGPU_PROC(cuPointerGetAttribute),
     VGPU_PROC(cuModuleLoadData), VGPU_PROC(cuModuleLoadDataEx), VGPU_PROC(cuModuleUnload),
     VGPU_PROC(cuModuleGetFunction), VGPU_PROC(cuModuleGetLoadingMode),
