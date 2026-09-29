@@ -29,6 +29,10 @@ inline constexpr uint64_t kLocalWindow = 0x6fff'0000'0000ull;
 // Where the module's code sits for function pointers and CALL.ABS, and the
 // addresses of the functions the executor provides.
 inline constexpr uint64_t kCodeBase = 0x6ffb'0000'0000ull;
+// Constant bank 0 of the running kernel, read-only: what a pointer to a
+// __grid_constant__ parameter points into (bank 0 holds the window's
+// address for the kernel to add a parameter's offset to).
+inline constexpr uint64_t kParamWindow = 0x6ffd'0000'0000ull;
 inline constexpr uint64_t kBuiltinBase = 0x6ffa'0000'0000ull;
 
 // One .text section: a kernel's code, or a device function's.

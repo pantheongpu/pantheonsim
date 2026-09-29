@@ -249,4 +249,10 @@ LaunchStats launch(const ptx::EntryFn& fn, const LaunchConfig& cfg,
                    const DeviceProfile& profile, const SymbolTable* symbols = nullptr,
                    const ProgressFn& progress = nullptr);
 
+// The checks a launch makes before anything runs -- grid, block, cluster
+// and launch-bound limits, registers, shared memory -- throwing
+// Err::LaunchConfig as the driver refuses them. launch() makes them; the
+// SASS executor's launches make them too, through this.
+void validate_launch(const ptx::EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& profile);
+
 }  // namespace vgpu::exec
