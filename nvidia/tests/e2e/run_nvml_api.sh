@@ -22,4 +22,8 @@ VGPU_TELEMETRY_PATH="$empty" VGPU_GPU=nvidia/t4 VGPU_DEVICE_COUNT=2 \
   python3 "$root/nvidia/tests/e2e/nvml_api.py" "$build/shim" --described || rc=1
 env -u VGPU_GPU -u VGPU_DEVICE_COUNT VGPU_TELEMETRY_PATH="$empty" \
   python3 "$root/nvidia/tests/e2e/nvml_api.py" "$build/shim" --undescribed || rc=1
+VGPU_TELEMETRY_PATH="$empty" VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 \
+  python3 "$root/nvidia/tests/e2e/nvml_api.py" "$build/shim" --amd || rc=1
+VGPU_QUIET=1 "$build/vgpu" shell -y --gpu amd/mi300x --count 2 --no-isolate \
+  -c "python3 '$root/nvidia/tests/e2e/nvml_api.py' '$build/shim' --amd" || rc=1
 exit $rc

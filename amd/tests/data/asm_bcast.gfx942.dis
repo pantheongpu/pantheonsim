@@ -1,0 +1,22 @@
+s_load_dwordx8 s[4:11], s[0:1], 0x0
+s_load_dwordx2 s[12:13], s[0:1], 0x20
+s_waitcnt lgkmcnt(0)
+v_and_b32_e32 v0, 63, v0
+v_lshlrev_b32_e32 v1, 3, v0
+global_load_dwordx2 v[2:3], v1, s[4:5]
+global_load_dwordx2 v[4:5], v1, s[6:7]
+global_load_dwordx2 v[6:7], v1, s[8:9]
+global_load_dwordx2 v[8:9], v1, s[10:11]
+s_waitcnt vmcnt(0)
+v_mfma_f32_4x4x4_16b_f16 v[14:17], v[2:3], v[8:9], 0 cbsz:4
+v_mfma_f32_4x4x4_16b_f16 v[18:21], v[2:3], v[8:9], 0 cbsz:2 abid:1
+v_mfma_f32_4x4x4_16b_f16 v[22:25], v[4:5], v[8:9], 0
+v_mfma_f32_4x4x4_16b_f16 v[26:29], v[6:7], v[8:9], 0
+s_nop 7
+s_nop 7
+v_lshlrev_b32_e32 v1, 4, v0
+global_store_dwordx4 v1, v[14:17], s[12:13]
+global_store_dwordx4 v1, v[18:21], s[12:13] offset:1024
+global_store_dwordx4 v1, v[22:25], s[12:13] offset:2048
+global_store_dwordx4 v1, v[26:29], s[12:13] offset:3072
+s_endpgm

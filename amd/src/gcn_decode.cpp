@@ -152,7 +152,14 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop2, 0x11}, {"s_xor_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x12}, {"s_andn2_b32", 1, 2}},
       {{Enc::Sop2, 0x13}, {"s_andn2_b64", 2, 2, 2, 2}},
+      {{Enc::Sop2, 0x14}, {"s_orn2_b32", 1, 2}},
       {{Enc::Sop2, 0x15}, {"s_orn2_b64", 2, 2, 2, 2}},
+      {{Enc::Sop2, 0x16}, {"s_nand_b32", 1, 2}},
+      {{Enc::Sop2, 0x17}, {"s_nand_b64", 2, 2, 2, 2}},
+      {{Enc::Sop2, 0x18}, {"s_nor_b32", 1, 2}},
+      {{Enc::Sop2, 0x19}, {"s_nor_b64", 2, 2, 2, 2}},
+      {{Enc::Sop2, 0x1a}, {"s_xnor_b32", 1, 2}},
+      {{Enc::Sop2, 0x1b}, {"s_xnor_b64", 2, 2, 2, 2}},
       {{Enc::Sop2, 0x1c}, {"s_lshl_b32", 1, 2}},
       {{Enc::Sop2, 0x1d}, {"s_lshl_b64", 2, 2, 2, 1}},
       {{Enc::Sop2, 0x1e}, {"s_lshr_b32", 1, 2}},
@@ -162,9 +169,13 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // A bit field: the second source's low bits say where it starts, its
       // bits 16 and up how wide it is.
       {{Enc::Sop2, 0x22}, {"s_bfm_b32", 1, 2}},
+      {{Enc::Sop2, 0x23}, {"s_bfm_b64", 2, 2, 1, 1}},
       {{Enc::Sop2, 0x25}, {"s_bfe_u32", 1, 2}},
       {{Enc::Sop2, 0x26}, {"s_bfe_i32", 1, 2}},
+      {{Enc::Sop2, 0x27}, {"s_bfe_u64", 2, 2, 2, 1}},
       {{Enc::Sop2, 0x28}, {"s_bfe_i64", 2, 2, 2, 1}},
+      // The difference of two signed values, without its sign.
+      {{Enc::Sop2, 0x2a}, {"s_absdiff_i32", 1, 2}},
       {{Enc::Sop2, 0x24}, {"s_mul_i32", 1, 2}},
       {{Enc::Sop2, 0x2c}, {"s_mul_hi_u32", 1, 2}},
       {{Enc::Sop2, 0x2d}, {"s_mul_hi_i32", 1, 2}},
@@ -773,6 +784,16 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Mubuf, 0x40}, {"buffer_atomic_swap", 0, 4, 1}},
       {{Enc::Mubuf, 0x41}, {"buffer_atomic_cmpswap", 0, 4, 2}},
       {{Enc::Mubuf, 0x42}, {"buffer_atomic_add", 0, 4, 1}},
+      {{Enc::Mubuf, 0x43}, {"buffer_atomic_sub", 0, 4, 1}},
+      {{Enc::Mubuf, 0x44}, {"buffer_atomic_smin", 0, 4, 1}},
+      {{Enc::Mubuf, 0x45}, {"buffer_atomic_umin", 0, 4, 1}},
+      {{Enc::Mubuf, 0x46}, {"buffer_atomic_smax", 0, 4, 1}},
+      {{Enc::Mubuf, 0x47}, {"buffer_atomic_umax", 0, 4, 1}},
+      {{Enc::Mubuf, 0x48}, {"buffer_atomic_and", 0, 4, 1}},
+      {{Enc::Mubuf, 0x49}, {"buffer_atomic_or", 0, 4, 1}},
+      {{Enc::Mubuf, 0x4a}, {"buffer_atomic_xor", 0, 4, 1}},
+      {{Enc::Mubuf, 0x4b}, {"buffer_atomic_inc", 0, 4, 1}},
+      {{Enc::Mubuf, 0x4c}, {"buffer_atomic_dec", 0, 4, 1}},
       {{Enc::Mubuf, 0x4d}, {"buffer_atomic_add_f32", 0, 4, 1}},
       {{Enc::Mubuf, 0x4e}, {"buffer_atomic_pk_add_f16", 0, 4, 1}},
       {{Enc::Mubuf, 0x61}, {"buffer_atomic_cmpswap_x2", 0, 4, 4}},
@@ -1500,9 +1521,17 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       if (formats && (cbsz > 4 || blgp > 4 || abid != (g_scaled_product ? 1u : 0u)))
         throw Error::make(Err::Unsupported, in.name, " with source formats ", cbsz, " and ", blgp,
                           ", which are not ones the instruction has");
-      if (!formats && (cbsz || abid || blgp))
-        throw Error::make(Err::Unsupported, in.name, " broadcasts part of a source (cbsz ", cbsz, ", abid ", abid,
-                          ", blgp ", blgp, "), which this does not model");
+      // A's broadcast (CBSZ, ABID) is modelled; B's lane patterns (BLGP)
+      // are not yet, and are refused by name.
+      if (!formats && blgp)
+        throw Error::make(Err::Unsupported, in.name, " rearranges B's lanes (blgp ", blgp, "), which this does not model");
+      if (!formats && abid >= (1u << cbsz))
+        throw Error::make(Err::Unsupported, in.name, " broadcasts block ", abid, " of groups of ", 1u << cbsz,
+                          ", which a group does not have");
+      if (!formats) {
+        in.a_bcast_size = static_cast<uint8_t>(cbsz);
+        in.a_bcast_id = static_cast<uint8_t>(abid);
+      }
       if (formats) {
         in.cbsz = static_cast<uint8_t>(cbsz);
         in.blgp = static_cast<uint8_t>(blgp);
@@ -1929,8 +1958,10 @@ std::string to_text(const Inst& i) {
     if ((a & 1) || (b & 1)) s += " op_sel:[" + std::to_string(a & 1) + "," + std::to_string(b & 1) + ",0]";
     s += " op_sel_hi:[" + std::to_string(a >> 1) + "," + std::to_string(b >> 1) + ",0]";
   }
-  if (i.cbsz) s += " cbsz:" + std::to_string(i.cbsz);
-  if (i.abid) s += " abid:" + std::to_string(i.abid);
+  // CBSZ and ABID: the f8f6f4 formats and the sparse index set, or A's
+  // broadcast on the other matrix instructions.
+  if (i.cbsz || i.a_bcast_size) s += " cbsz:" + std::to_string(i.cbsz ? i.cbsz : i.a_bcast_size);
+  if (i.abid || i.a_bcast_id) s += " abid:" + std::to_string(i.abid ? i.abid : i.a_bcast_id);
   if (i.blgp) s += " blgp:" + std::to_string(i.blgp);
   if (i.bitop3) {
     char t[24];

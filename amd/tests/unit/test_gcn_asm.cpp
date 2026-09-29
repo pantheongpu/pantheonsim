@@ -133,6 +133,107 @@ VTEST(scalar_bit_fields_shifts_and_comparisons_give_what_the_isa_says) {
   }
 }
 
+VTEST(the_rest_of_the_scalar_bitwise_family_gives_what_the_isa_says) {
+  const amd::CodeObject o = object("asm_logic");
+  const std::vector<std::pair<uint64_t, uint64_t>> cases = {
+      {0x123456789abcdef0ull, 0x0f0f0f0f00ff00ffull},
+      {~0ull, ~0ull},                                 // nand and xnor give no bits: SCC clear
+      {0, 0},                                         // nor gives every bit
+      {0xffffffff80000000ull, 0x0000000000000001ull},  // the most negative low half, less one
+      {0x00000000deadbe05ull, 0x00000000000c0008ull}}; // a 12-bit field from bit 8; an 8-bit mask at bit 5
+  for (auto [a, b] : cases) {
+    MemoryManager mem(16ull << 20);
+    const uint64_t out = mem.alloc(24 * 4);
+    const std::vector<uint32_t> r = run(o, "logic", mem, out, 24, {out, a, b});
+    const uint32_t x = static_cast<uint32_t>(a), y = static_cast<uint32_t>(b);
+    const uint64_t nand = ~(a & b), nor = ~(a | b), xnor = ~(a ^ b);
+    const uint64_t bfm = ((uint64_t{1} << (y & 63)) - 1) << (x & 63);
+    const uint32_t start = y & 63, width = (y >> 16) & 0x7F;
+    const uint64_t bfe = width == 0 ? 0 : width >= 64 ? a >> start : (a >> start) & ((uint64_t{1} << width) - 1);
+    const int64_t d = int64_t{static_cast<int32_t>(x)} - static_cast<int32_t>(y);
+    const uint32_t absdiff = static_cast<uint32_t>(d < 0 ? -d : d);
+    const std::vector<uint32_t> want = {
+        x | ~y, (x | ~y) != 0,
+        ~(x & y), ~(x & y) != 0,
+        u(nand), u(nand >> 32), nand != 0,
+        ~(x | y), ~(x | y) != 0,
+        u(nor), u(nor >> 32), nor != 0,
+        ~(x ^ y), ~(x ^ y) != 0,
+        u(xnor), u(xnor >> 32), xnor != 0,
+        u(bfm), u(bfm >> 32),
+        u(bfe), u(bfe >> 32), bfe != 0,
+        absdiff, absdiff != 0};
+    for (size_t i = 0; i < want.size(); ++i) VCHECK_EQ(r[i], want[i]);
+  }
+}
+
+VTEST(buffer_atomics_change_the_word_and_return_what_it_was) {
+  const amd::CodeObject o = object("asm_atomics");
+  const std::vector<std::pair<uint32_t, uint32_t>> cases = {  // (every word before, x)
+      {100, 7}, {7, 100}, {0, 5}, {0xFFFFFFF0u, 3}, {5, 5}, {0x80000000u, 0x7FFFFFFFu}};
+  for (auto [before, x] : cases) {
+    MemoryManager mem(16ull << 20);
+    const uint64_t buf = mem.alloc(10 * 4), out = mem.alloc(10 * 4);
+    const std::vector<uint32_t> init(10, before);
+    mem.write(buf, init.data(), 10 * 4);
+    const std::vector<uint32_t> old = run(o, "atomics", mem, out, 10, {buf, out, x});
+    std::vector<uint32_t> now(10);
+    mem.read(buf, now.data(), 10 * 4);
+    const int32_t sb = static_cast<int32_t>(before), sx = static_cast<int32_t>(x);
+    const std::vector<uint32_t> want = {
+        before - x,
+        u(std::min(sb, sx)), std::min(before, x),
+        u(std::max(sb, sx)), std::max(before, x),
+        before & x, before | x, before ^ x,
+        before >= x ? 0u : before + 1,
+        before == 0 || before > x ? x : before - 1};
+    for (size_t i = 0; i < want.size(); ++i) {
+      VCHECK_EQ(old[i], before);
+      VCHECK_EQ(now[i], want[i]);
+    }
+  }
+}
+
+VTEST(a_matrix_instruction_broadcasts_a_blocks_a_to_its_group) {
+  // v_mfma_f32_4x4x4_16b_f16: sixteen blocks, four lanes each; a lane's A
+  // is two words, four halves. With CBSZ 4 every block takes block 0's A;
+  // with CBSZ 2 and ABID 1, each group of four blocks takes its second's.
+  // The same products without broadcast, from A as the broadcast should
+  // have read it, must agree bit for bit.
+  const amd::CodeObject o = object("asm_bcast");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> a(128), a4(128), a2(128), b(128);
+  uint32_t seed = 12345;
+  const auto half = [&]() -> uint32_t {   // a small float16, to keep sums exact
+    seed = seed * 1103515245u + 12345u;
+    return 0x3c00u + ((seed >> 16) & 0x3FF);   // in [1, 2)
+  };
+  for (auto* v : {&a, &b})
+    for (auto& x : *v) x = half() | half() << 16;
+  for (uint32_t lane = 0; lane < 64; ++lane)
+    for (uint32_t k = 0; k < 2; ++k) {
+      a4[lane * 2 + k] = a[(lane % 4) * 2 + k];
+      a2[lane * 2 + k] = a[((lane / 16) * 16 + 4 + lane % 4) * 2 + k];
+    }
+  uint64_t in[4];
+  const std::vector<uint32_t>* src[4] = {&a, &a4, &a2, &b};
+  for (int i = 0; i < 4; ++i) {
+    in[i] = mem.alloc(128 * 4);
+    mem.write(in[i], src[i]->data(), 128 * 4);
+  }
+  const uint64_t out = mem.alloc(4 * 256 * 4);
+  const std::vector<uint32_t> r = run(o, "bcast", mem, out, 4 * 256, {in[0], in[1], in[2], in[3], out});
+  int differ4 = 0, differ2 = 0, changed = 0;
+  for (uint32_t i = 0; i < 256; ++i) {
+    differ4 += r[i] != r[512 + i];
+    differ2 += r[256 + i] != r[768 + i];
+    changed += r[i] != r[256 + i];
+  }
+  VCHECK_EQ(differ4, 0);
+  VCHECK_EQ(differ2, 0);
+  VCHECK(changed > 0);   // the two broadcasts took different blocks' A
+}
+
 VTEST(a_kernel_finds_only_the_group_ids_it_asked_for_one_after_another) {
   const amd::CodeObject o = object("asm_scalar");
   const amd::Kernel* k = amd::find_kernel(o, "group_z");

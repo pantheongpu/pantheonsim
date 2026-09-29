@@ -247,11 +247,14 @@ const HipApi kHipApis[] = {
 };
 
 int hip_api_id(const char* name) {
-  static const std::map<std::string, int> ids = [] {
+  // Never destroyed: HIP is called after static destruction has begun (a
+  // library's own static destructor, at exit), and each call looks its name
+  // up here.
+  static const std::map<std::string, int>& ids = *new std::map<std::string, int>([] {
     std::map<std::string, int> m;
     for (const HipApi& a : kHipApis) m.emplace(a.name, a.id);
     return m;
-  }();
+  }());
   const auto it = ids.find(name);
   return it == ids.end() ? -1 : it->second;
 }
@@ -590,9 +593,25 @@ struct ApiFrame {
   int op = -1;
   uint64_t start = 0;
 };
+// A thread's HIP calls in progress. exit() destroys the thread's
+// thread_local objects before it runs the libraries' static destructors, and
+// those still call HIP -- hipBLASLt's unloads its code objects -- so a
+// thread_local vector was written after it was destroyed, and glibc found its
+// heap damaged on the next free (vLLM, on its way out). The vector is kept
+// through a pointer that outlives the thread's destructors: freed when the
+// thread's own reaper runs, and made again, once, for any call after that.
 std::vector<ApiFrame>& frames() {
-  thread_local std::vector<ApiFrame> f;
-  return f;
+  thread_local std::vector<ApiFrame>* f = nullptr;
+  thread_local struct Reaper {
+    std::vector<ApiFrame>** p;
+    ~Reaper() {
+      delete *p;
+      *p = nullptr;
+    }
+  } reaper{&f};
+  (void)reaper;
+  if (!f) f = new std::vector<ApiFrame>;
+  return *f;
 }
 uint64_t current_correlation(Sdk& s) {
   return frames().empty() ? s.next_correlation.fetch_add(1) : frames().back().correlation;
@@ -1428,6 +1447,28 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_callback_tracing_kind_o
   if (!callback) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
   if (kind <= 0 || kind >= ROCPROFILER_CALLBACK_TRACING_LAST) return ROCPROFILER_STATUS_ERROR_KIND_NOT_FOUND;
   return iterate_operations(kCallbackKinds[kind], [&](int op) { return callback(kind, op, data); });
+}
+
+// Where ROCm's rocprofiler-register hands over a library's API table (HIP's,
+// HSA's, RCCL's, ROCTx's) when the library starts and a rocprofiler-sdk is
+// already loaded: a real SDK wraps the table's entries to trace them. This
+// library traces the simulator's HIP from inside it, so it takes the other
+// libraries' tables as they are and wraps nothing. Without the function,
+// rocprofiler-register stops the program ("rocprofiler_set_api_table not
+// found") as soon as RCCL starts, which is how PyTorch's distributed setup
+// ended under vLLM.
+ROCPROFILER_API int rocprofiler_set_api_table(const char* name, uint64_t, uint64_t, void** tables, uint64_t count) {
+  return name && (tables || count == 0) ? 0 : -1;
+}
+
+// The arguments of the call a callback-tracing record is about, one by one.
+// The records this library delivers carry the operation, not the call's
+// arguments, so there are none to walk: a tool asking is told so, and PyTorch's
+// profiler records the call without them.
+ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_callback_tracing_kind_operation_args(
+    rocprofiler_callback_tracing_record_t, void* callback, int32_t, void*) {
+  if (!callback) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
+  return ROCPROFILER_STATUS_ERROR_NOT_IMPLEMENTED;
 }
 
 ROCPROFILER_API rocprofiler_status_t rocprofiler_query_intercept_table_name(rocprofiler_intercept_table_t kind,

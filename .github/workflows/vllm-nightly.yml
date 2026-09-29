@@ -1,0 +1,46 @@
+name: vLLM nightly
+
+# vLLM for ROCm (0.30, its own PyTorch on ROCm 7.2.3), unmodified, generating
+# on a simulated MI300X what transformers generates on the CPU
+# (amd/tests/e2e/run_vllm_amd.sh). ROCm's libraries are AMD's 7.2.3 release;
+# the HIP and HSA runtimes and the ROCm SMI and AMD SMI libraries are the
+# simulator's. Nightly, as it takes ROCm's libraries and vLLM's wheels, some
+# 30 GB, on every run.
+
+on:
+  schedule:
+    - cron: "41 7 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths: [".github/workflows/vllm-nightly.yml", "amd/tests/vllm/**", "amd/tests/e2e/run_vllm_amd.sh"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vllm:
+    name: vLLM on amd/mi300x
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make room for ROCm and vLLM
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup /usr/share/swift
+          df -h / | tail -1
+      - name: Install ROCm 7.2.3's libraries and vLLM
+        run: amd/tests/vllm/install.sh "$HOME/vllm-venv"
+      - name: Build the simulator's libraries
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends ninja-build
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)" --target vgpuhip vgpursmi vgpuamdsmi vgpurocprof
+      - name: vLLM generates what the CPU does
+        run: |
+          set -o pipefail
+          export VGPU_VLLM_PYTHON="$HOME/vllm-venv/bin/python"
+          VGPU_BUILD_DIR=build amd/tests/e2e/run_vllm_amd.sh amd/mi300x | tee vllm.log
+          # A skip means the job lost what it installed: here that is a failure.
+          if grep -q '^SKIP' vllm.log; then echo "::error::the vLLM test skipped"; exit 1; fi

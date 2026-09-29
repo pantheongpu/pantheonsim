@@ -886,6 +886,38 @@ struct Machine {
       const uint64_t r = a | ~b;
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
+    } else if (op == "s_orn2_b32"_op || op == "s_nand_b32"_op || op == "s_nor_b32"_op || op == "s_xnor_b32"_op) {
+      // The rest of the bitwise family: or with the second inverted, and the
+      // inverses of and, or and xor. SCC says whether any bit is set.
+      const uint32_t x = static_cast<uint32_t>(a), y = static_cast<uint32_t>(b);
+      const uint32_t r = op == "s_orn2_b32"_op  ? x | ~y
+                         : op == "s_nand_b32"_op ? ~(x & y)
+                         : op == "s_nor_b32"_op  ? ~(x | y)
+                                                 : ~(x ^ y);
+      write_scalar(w, in.dst[0], r);
+      w.scc = r != 0;
+    } else if (op == "s_nand_b64"_op || op == "s_nor_b64"_op || op == "s_xnor_b64"_op) {
+      const uint64_t r = op == "s_nand_b64"_op ? ~(a & b) : op == "s_nor_b64"_op ? ~(a | b) : ~(a ^ b);
+      write_scalar(w, in.dst[0], r);
+      w.scc = r != 0;
+    } else if (op == "s_bfm_b64"_op) {
+      // A mask of the first source's low six bits' worth of ones, shifted up
+      // by the second's. SCC is left alone.
+      const uint32_t width = static_cast<uint32_t>(a) & 63, shift = static_cast<uint32_t>(b) & 63;
+      write_scalar(w, in.dst[0], ((uint64_t{1} << width) - 1) << shift);
+    } else if (op == "s_bfe_u64"_op) {
+      // A field of the 64-bit first source: the second source's low six bits
+      // say where it starts, bits 16 to 22 how wide it is.
+      const uint32_t start = static_cast<uint32_t>(b) & 63, width = (static_cast<uint32_t>(b) >> 16) & 0x7F;
+      const uint64_t shifted = a >> start;
+      const uint64_t r = width == 0 ? 0 : width >= 64 ? shifted : shifted & ((uint64_t{1} << width) - 1);
+      write_scalar(w, in.dst[0], r);
+      w.scc = r != 0;
+    } else if (op == "s_absdiff_i32"_op) {
+      const int64_t d = int64_t{static_cast<int32_t>(a)} - static_cast<int32_t>(b);
+      const uint32_t r = static_cast<uint32_t>(d < 0 ? -d : d);
+      write_scalar(w, in.dst[0], r);
+      w.scc = r != 0;
     } else if (op == "s_bcnt1_i32_b64"_op) {
       // The set bits of a 64-bit mask: how many lanes are active, which is
       // how a wave that adds one value for all its lanes knows how many.
@@ -3696,6 +3728,29 @@ struct Machine {
             after = as_bits(as_float(static_cast<uint32_t>(before)) + as_float(word(w, data, 0, lane)));
           } else if (body == "atomic_pk_add_f16") {
             after = packed_add(static_cast<uint32_t>(before), word(w, data, 0, lane), false);
+          } else if (const uint32_t old = static_cast<uint32_t>(before), v = word(w, data, 0, lane);
+                     body == "atomic_sub") {
+            after = old - v;
+          } else if (body == "atomic_smin" || body == "atomic_smax") {
+            const int32_t a = static_cast<int32_t>(old), b = static_cast<int32_t>(v);
+            after = static_cast<uint32_t>(body == "atomic_smin" ? std::min(a, b) : std::max(a, b));
+          } else if (body == "atomic_umin") {
+            after = std::min(old, v);
+          } else if (body == "atomic_umax") {
+            after = std::max(old, v);
+          } else if (body == "atomic_and") {
+            after = old & v;
+          } else if (body == "atomic_or") {
+            after = old | v;
+          } else if (body == "atomic_xor") {
+            after = old ^ v;
+          } else if (body == "atomic_inc") {
+            // Counts up to the data, then wraps to zero.
+            after = old >= v ? 0 : old + 1;
+          } else if (body == "atomic_dec") {
+            // Counts down to zero, then wraps to the data (as does anything
+            // above it).
+            after = old == 0 || old > v ? v : old - 1;
           } else {
             throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
           }
@@ -4222,10 +4277,14 @@ struct Machine {
     };
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const uint32_t bl = lane / lanes_per_block, within = lane % lanes_per_block, g = within / s.m;
+      // With CBSZ, a block takes its A from block ABID of its group of 2^CBSZ:
+      // the same place in that block's lanes.
+      const uint32_t a_block = in.a_bcast_size ? (bl >> in.a_bcast_size << in.a_bcast_size) + in.a_bcast_id : bl;
+      const uint32_t a_lane = a_block < s.blocks ? a_block * lanes_per_block + within : lane;
       const double sa = in.scaled ? scale_of(in.src[3], in.scale_sel & 3, lane) : 1.0;
       const double sb = in.scaled ? scale_of(in.src[4], in.scale_sel >> 2, lane) : 1.0;
       for (uint32_t e = 0; e < per_lane; ++e) {
-        if (!sparse) A(bl, within % s.m, g * per_lane + e) = value(in.src[0], s.in, e, lane) * sa;
+        if (!sparse) A(bl, within % s.m, g * per_lane + e) = value(in.src[0], s.in, e, a_lane) * sa;
         // gfx950's sparse forms, whose B is eight registers, split it: the
         // first four hold the lane group's run of K in the first half, the
         // last four the same run K/2 on (the CDNA4 guide's layout tables),

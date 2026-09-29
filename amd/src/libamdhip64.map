@@ -29,6 +29,7 @@ hip_4.2 {
     hipCreateSurfaceObject;
     hipCreateTextureObject;
     hipCtxGetCurrent;
+    hipCtxSetCurrent;
     hipDestroySurfaceObject;
     hipDestroyTextureObject;
     hipDeviceCanAccessPeer;
@@ -43,6 +44,7 @@ hip_4.2 {
     hipDeviceGetStreamPriorityRange;
     hipDeviceGetTexture1DLinearMaxWidth;
     hipDevicePrimaryCtxGetState;
+    hipDevicePrimaryCtxRetain;
     hipDeviceReset;
     hipDeviceSetCacheConfig;
     hipDeviceSynchronize;
@@ -66,6 +68,7 @@ hip_4.2 {
     hipFuncGetAttribute;
     hipFuncGetAttributes;
     hipFuncSetAttribute;
+    hipFuncSetCacheConfig;
     hipGetChannelDesc;
     hipGetDevice;
     hipGetDeviceCount;
@@ -237,6 +240,7 @@ hip_5.1 {
     hipMemCreate;
     hipMemExportToShareableHandle;
     hipMemGetAllocationGranularity;
+    hipMemGetAllocationPropertiesFromHandle;
     hipMemImportFromShareableHandle;
     hipMemMap;
     hipMemMapArrayAsync;
@@ -247,6 +251,7 @@ hip_5.1 {
     hipMemPoolSetAttribute;
     hipMemPoolTrimTo;
     hipMemRelease;
+    hipMemRetainAllocationHandle;
     hipMemSetAccess;
     hipMemUnmap;
 } hip_5.0;
@@ -291,6 +296,8 @@ hip_6.2 {
     hipMemcpy2DArrayToArray;
 } hip_6.1;
 hip_6.4 {
+  global:
+    hipEventRecordWithFlags;
 } hip_6.2;
 hip_6.5 {
   global:
@@ -299,6 +306,7 @@ hip_6.5 {
 hip_7.1 {
   global:
     hipGetDriverEntryPoint;
+    hipMemcpyBatchAsync;
 } hip_6.5;
 hip_7.2 {
 } hip_7.1;
