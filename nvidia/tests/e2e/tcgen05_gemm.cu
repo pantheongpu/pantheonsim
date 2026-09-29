@@ -4,12 +4,14 @@
 // kinds accumulated over K and committed to an mbarrier, the accumulator read
 // back with tcgen05.ld and checked exactly against the host; then A taken
 // from Tensor Memory (tcgen05.cp), a store/load round trip in other shapes,
-// and tcgen05.shift. run_sass_archs.sh builds it for sm_100a and checks the
-// SASS run against the PTX one. Prints PASS on the last line.
+// and tcgen05.shift; and Blackwell's TMA forms (.tile::gather4/scatter4, a
+// CTA pair loading onto one barrier). run_sass_archs.sh builds it for sm_100a
+// and checks the SASS run against the PTX one. Prints PASS on the last line.
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 constexpr int M = 128, N = 64, KSTEPS = 4;
@@ -161,7 +163,120 @@ __global__ void moves(uint32_t* out) {
 #endif
 }
 
+// Blackwell's TMA forms: four rows gathered from a tensor (.tile::gather4)
+// and scattered back in reverse order (.tile::scatter4); then a CTA pair
+// (.cta_group::2) each loading a tile that completes on the leader's barrier.
+// The tensor is 16 rows of 64 floats; the box is 32 floats by 1 row.
+__global__ void gather_scatter(const __grid_constant__ CUtensorMap src, const __grid_constant__ CUtensorMap dst,
+                               int col, int r0, int r1, int r2, int r3) {
+#if defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM103_ALL)
+  __shared__ __align__(128) float buf[4 * 32];
+  __shared__ __align__(8) uint64_t bar;
+  const unsigned sb = smem_addr(buf), b = smem_addr(&bar);
+  if (threadIdx.x == 0) {
+    asm volatile("mbarrier.init.shared.b64 [%0], 1;" :: "r"(b));
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" :: "r"(b), "r"(4 * 32 * 4));
+    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
+                 :: "r"(sb), "l"(&src), "r"(col), "r"(r0), "r"(r1), "r"(r2), "r"(r3), "r"(b) : "memory");
+    unsigned done = 0;
+    while (!done)
+      asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], 0; selp.u32 %0, 1, 0, p; }"
+                   : "=r"(done) : "r"(b) : "memory");
+    asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.tile::scatter4.bulk_group [%0, {%1, %2, %3, %4, %5}], [%6];"
+                 :: "l"(&dst), "r"(col), "r"(r3), "r"(r2), "r"(r1), "r"(r0), "r"(sb) : "memory");
+    asm volatile("cp.async.bulk.commit_group;");
+    asm volatile("cp.async.bulk.wait_group 0;");
+  }
+#endif
+}
+
+__global__ void __cluster_dims__(2, 1, 1) pair_load(const __grid_constant__ CUtensorMap src, float* out) {
+#if defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM103_ALL)
+  __shared__ __align__(128) float buf[32];
+  __shared__ __align__(8) uint64_t bar;
+  unsigned rank;
+  asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(rank));
+  const unsigned b = smem_addr(&bar);
+  if (threadIdx.x == 0 && rank == 0) {
+    asm volatile("mbarrier.init.shared.b64 [%0], 1;" :: "r"(b));
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" :: "r"(b), "r"(2 * 32 * 4));
+  }
+  asm volatile("barrier.cluster.arrive.aligned; barrier.cluster.wait.aligned;" ::: "memory");
+  if (threadIdx.x == 0) {
+    unsigned leader_bar;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, 0;" : "=r"(leader_bar) : "r"(b));
+    // Each CTA loads row `rank` + 3 into its own buffer; both complete on rank 0's barrier.
+    asm volatile("cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+                 :: "r"(smem_addr(buf)), "l"(&src), "r"(0), "r"(static_cast<int>(rank) + 3), "r"(leader_bar) : "memory");
+  }
+  if (rank == 0) {
+    unsigned done = 0;
+    while (!done)
+      asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], 0; selp.u32 %0, 1, 0, p; }"
+                   : "=r"(done) : "r"(b) : "memory");
+  }
+  asm volatile("barrier.cluster.arrive.aligned; barrier.cluster.wait.aligned;" ::: "memory");
+  out[rank * 32 + threadIdx.x] = buf[threadIdx.x];
+  asm volatile("barrier.cluster.arrive.aligned; barrier.cluster.wait.aligned;" ::: "memory");
+#endif
+}
+
 static int g_fail = 0;
+
+// A 2D float tensor map: 16 rows of 64, box 32 x 1.
+static bool tensor_map(CUtensorMap* m, float* base) {
+  const cuuint64_t dims[2] = {64, 16}, strides[1] = {64 * sizeof(float)};
+  const cuuint32_t box[2] = {32, 1}, elem[2] = {1, 1};
+  return cuTensorMapEncodeTiled(m, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 2, base, dims, strides, box, elem,
+                                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                                CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+}
+
+static void run_tma() {
+  std::vector<float> h(16 * 64);
+  for (int i = 0; i < 16 * 64; ++i) h[i] = float(i);
+  float *dsrc, *ddst, *dout;
+  cudaMalloc(&dsrc, h.size() * 4);
+  cudaMalloc(&ddst, h.size() * 4);
+  cudaMalloc(&dout, 64 * 4);
+  cudaMemcpy(dsrc, h.data(), h.size() * 4, cudaMemcpyHostToDevice);
+  cudaMemset(ddst, 0, h.size() * 4);
+  CUtensorMap ms, md;
+  if (!tensor_map(&ms, dsrc) || !tensor_map(&md, ddst)) {
+    std::printf("FAIL: cuTensorMapEncodeTiled\n");
+    ++g_fail;
+    return;
+  }
+  gather_scatter<<<1, 32>>>(ms, md, 32, 1, 5, 9, 14);
+  cudaError_t e = cudaDeviceSynchronize();
+  std::vector<float> d(h.size());
+  cudaMemcpy(d.data(), ddst, d.size() * 4, cudaMemcpyDeviceToHost);
+  int bad = 0;
+  const int rows[4] = {1, 5, 9, 14};
+  for (int r = 0; r < 16; ++r)
+    for (int c = 0; c < 64; ++c) {
+      float want = 0;
+      for (int i = 0; i < 4; ++i)
+        if (r == rows[3 - i] && c >= 32) want = h[rows[i] * 64 + c];
+      bad += d[r * 64 + c] != want;
+    }
+  std::printf("%-28s %s, %d of %d wrong\n", "gather4 then scatter4", cudaGetErrorString(e), bad, 16 * 64);
+  g_fail += bad || e != cudaSuccess;
+  pair_load<<<2, 32>>>(ms, dout);
+  e = cudaDeviceSynchronize();
+  std::vector<float> o(64);
+  cudaMemcpy(o.data(), dout, o.size() * 4, cudaMemcpyDeviceToHost);
+  bad = 0;
+  for (int r = 0; r < 2; ++r)
+    for (int c = 0; c < 32; ++c) bad += o[r * 32 + c] != h[(r + 3) * 64 + c];
+  std::printf("%-28s %s, %d of 64 wrong\n", "CTA-pair load", cudaGetErrorString(e), bad);
+  g_fail += bad || e != cudaSuccess;
+  cudaFree(dsrc);
+  cudaFree(ddst);
+  cudaFree(dout);
+}
 
 static float half_to_float(uint16_t h) {
   const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
@@ -257,6 +372,7 @@ int main() {
   run_gemm<1>("tf32 x tf32 -> f32", 4, 8, (2u << 7) | (2u << 10), 1);
   run_gemm<2>("s8 x s8 -> s32", 1, 32, (1u << 7) | (1u << 10), 2);
   run_gemm<3>("e4m3 x e4m3 -> f32", 1, 32, 0, 1);
+  run_tma();
 
   uint32_t* dm;
   cudaMalloc(&dm, 128 * 16 * 4);

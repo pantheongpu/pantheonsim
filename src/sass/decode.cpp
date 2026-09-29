@@ -2701,19 +2701,30 @@ void dec_tma(Instr& ins, const Word& w, Op op, const char* name) {
   ins.op = op;
   ins.mnemonic = name;
   const unsigned dims = static_cast<unsigned>(w.field(79, 3)) + 1;
+  const bool store = op != Op::UTMALDG;
   ins.mods.push_back(std::to_string(dims) + "D");
   if (op == Op::UTMAREDG) ins.mods.push_back(kAtomOp[w.field(87, 3)]);   // 87-89: ADD MIN MAX INC DEC AND OR XOR
-  if (w.bit(82)) ins.mods.push_back("IM2COL");
+  // A load's mode at 82-83 (1 im2col, 3 im2col::w, 2 im2col::w::128; 80 with
+  // the ::w ones) and 84 .tile::gather4; a store's 83 .tile::scatter4.
+  const unsigned mode = store ? 0 : static_cast<unsigned>(w.field(82, 2));
+  if (mode == 1) ins.mods.push_back("IM2COL");
+  if (mode == 3) ins.mods.push_back("W");
+  if (mode == 2) ins.mods.push_back("W128");
+  const bool four = store ? w.bit(83) : w.bit(84);
+  if (four) ins.mods.push_back(store ? "SCATTER4" : "GATHER4");
   if (w.bit(75)) ins.mods.push_back("MULTICAST");
-  if (ins.sm >= 100 && w.bit(85)) ins.mods.push_back("2CTA");   // a CTA pair's shared memory
+  if (w.bit(85)) ins.mods.push_back("2CTA");
   ins.f[0] = dims;
-  ins.f[1] = w.bit(82);
+  ins.f[1] = mode == 1;
   ins.f[2] = w.bit(75);
   ins.f[3] = static_cast<uint32_t>(w.field(87, 3));   // UTMAREDG's op
+  ins.f[4] = four;
+  ins.f[5] = w.bit(85);
+  ins.f[6] = mode >= 2;   // im2col::w, ::w::128
   const int ub = static_cast<int>(ureg_bits(ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(32, ub)), 0, ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, ub)), 0, ins.sm));
-  if (w.bit(82) || w.bit(75)) ins.src.push_back(UR(static_cast<unsigned>(w.field(64, ub)), ins.sm));
+  if (mode || w.bit(75)) ins.src.push_back(UR(static_cast<unsigned>(w.field(64, ub)), ins.sm));
   if (w.bit(76)) ins.src.push_back(Txt("desc[UR" + std::to_string(w.field(40, ub)) + "]"));
 }
 
@@ -2765,6 +2776,7 @@ void dec_utmapf(Instr& ins, const Word& w) {
   ins.mnemonic = "UTMAPF";
   ins.mods.push_back("L2");
   ins.mods.push_back(std::to_string(w.field(79, 3) + 1) + "D");
+  if (w.bit(84)) ins.mods.push_back("GATHER4");
   const int ub = static_cast<int>(ureg_bits(ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(32, ub)), 0, ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, ub)), 0, ins.sm));
