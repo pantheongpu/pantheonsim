@@ -4123,6 +4123,140 @@ VTEST(a_surface_access_past_the_edge_faults_rather_than_wrapping) {
   VCHECK(err.code() == Err::OutOfBounds);
 }
 
+// ---- the alloca stack (PTX ISA 9.7.19) ----
+namespace {
+// Runs `body` in a one-thread kernel whose results go to out[0..3]
+// (%rd10-%rd13); returns them.
+std::vector<uint64_t> stack_run(const std::string& body, uint64_t stack_bytes = 1024, const std::string& funcs = "") {
+  const std::string ptx = std::string(kHeader) + funcs + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<24>;
+    ld.param.u64 %rd1, [out];
+    mov.u64 %rd10, 0;
+    mov.u64 %rd11, 0;
+    mov.u64 %rd12, 0;
+    mov.u64 %rd13, 0;
+)" + body + R"(
+    st.global.u64 [%rd1], %rd10;
+    st.global.u64 [%rd1+8], %rd11;
+    st.global.u64 [%rd1+16], %rd12;
+    st.global.u64 [%rd1+24], %rd13;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  cfg.stack_bytes = stack_bytes;
+  exec::launch(m.entries.back(), cfg, {arg_u64(out)}, e.mem, e.prof);
+  std::vector<uint64_t> got(4);
+  e.mem.read(out, got.data(), 32);
+  return got;
+}
+}  // namespace
+
+// alloca moves the pointer down by the size, then down to the alignment,
+// and returns it; stacksave reads it and stackrestore puts it back, so the
+// next alloca gets the same memory again. The memory holds what is stored.
+VTEST(alloca_stacksave_stackrestore) {
+  const auto got = stack_run(R"(
+    stacksave.u64 %rd2;
+    alloca.u64 %rd3, 24, 64;          // 24 bytes, 64-aligned
+    alloca.u64 %rd4, 8;               // the default alignment, 8
+    mov.u64 %rd5, 0x1122334455667788;
+    st.local.u64 [%rd3+16], %rd5;
+    st.local.u64 [%rd4], %rd2;
+    ld.local.u64 %rd10, [%rd3+16];
+    sub.u64 %rd11, %rd2, %rd3;        // how far the first alloca moved it
+    sub.u64 %rd12, %rd3, %rd4;
+    stackrestore.u64 %rd2;
+    alloca.u64 %rd6, 24, 64;
+    sub.u64 %rd13, %rd6, %rd3;        // the same block again
+)");
+  VCHECK_EQ(got[0], uint64_t{0x1122334455667788ull});
+  VCHECK_EQ(got[1] % 64, uint64_t{0});
+  VCHECK(got[1] >= 24 && got[1] < 24 + 64);
+  VCHECK_EQ(got[2], uint64_t{8});
+  VCHECK_EQ(got[3], uint64_t{0});
+}
+
+// The .u32 forms, and a pointer converted to a generic one and back (what
+// nvcc emits around alloca()).
+VTEST(alloca_u32_and_generic_pointers) {
+  const auto got = stack_run(R"(
+    alloca.u32 %r1, 16;
+    mov.u32 %r2, 77;
+    st.local.u32 [%r1+12], %r2;
+    cvt.u64.u32 %rd2, %r1;
+    cvta.local.u64 %rd3, %rd2;
+    ld.u32 %r3, [%rd3+12];
+    cvt.u64.u32 %rd10, %r3;
+    stacksave.u32 %r4;
+    sub.u32 %r5, %r4, %r1;
+    cvt.u64.u32 %rd11, %r5;
+)");
+  VCHECK_EQ(got[0], uint64_t{77});
+  VCHECK_EQ(got[1], uint64_t{0});   // the pointer is the block's lowest address
+}
+
+// What a device function allocas is freed when it returns (9.7.19.3): 100
+// calls of 100 bytes each fit in a 1 KiB stack only if so.
+VTEST(alloca_in_a_device_function_is_freed_when_it_returns) {
+  const std::string f = R"(
+.func (.param .u64 r) take100()
+{
+    .reg .b64 %q<4>;
+    alloca.u64 %q1, 100;
+    stacksave.u64 %q2;
+    st.param.u64 [r], %q2;
+    ret;
+}
+)";
+  const auto got = stack_run(R"(
+    stacksave.u64 %rd2;
+    mov.u32 %r1, 0;
+LOOP:
+    {
+      .param .u64 r;
+      call (r), take100, ();
+      ld.param.u64 %rd3, [r];
+    }
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p1, %r1, 100;
+    @%p1 bra LOOP;
+    stacksave.u64 %rd4;
+    sub.u64 %rd10, %rd2, %rd4;        // the caller's pointer is back where it was
+    sub.u64 %rd11, %rd2, %rd3;        // and the callee's was 104 below it
+)", 1024, f);
+  VCHECK_EQ(got[0], uint64_t{0});
+  VCHECK_EQ(got[1], uint64_t{104});
+}
+
+VTEST(alloca_overflow_freed_memory_and_bad_restores_are_reported) {
+  auto err = VCAPTURE(Error, stack_run("    alloca.u64 %rd3, 2000;\n"));
+  VCHECK(err.code() == Err::OutOfBounds);
+  VCHECK_CONTAINS(err.message(), "cudaLimitStackSize");
+  VCHECK_EQ(stack_run("    alloca.u64 %rd3, 2000;\n    mov.u64 %rd10, 1;\n", 4096)[0], uint64_t{1});
+  err = VCAPTURE(Error, stack_run(R"(
+    stacksave.u64 %rd2;
+    alloca.u64 %rd3, 16;
+    stackrestore.u64 %rd2;
+    ld.local.u64 %rd10, [%rd3];     // freed
+)"));
+  VCHECK(err.code() == Err::OutOfBounds);
+  VCHECK_CONTAINS(err.message(), "stackrestore has freed");
+  err = VCAPTURE(Error, stack_run("    mov.u64 %rd2, 12;\n    stackrestore.u64 %rd2;\n"));
+  VCHECK(err.code() == Err::InvalidValue);
+  err = VCAPTURE(Error, ptx::parse(std::string(kHeader) +
+                                   ".visible .entry k() { .reg .b64 %rd<2>; alloca.u64 %rd1, 8, 3; ret; }\n"));
+  VCHECK_CONTAINS(err.message(), "power of two");
+}
+
 // suld/sust's .clamp and .zero out-of-range policies (9.7.13.1-2), against
 // what an RTX 3060 (sm_86, driver 596.36) returned for the same accesses on
 // the same surfaces. The expected values are the card's output, copied.

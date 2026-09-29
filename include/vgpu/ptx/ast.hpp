@@ -432,6 +432,15 @@ struct OpClc {
 // mov.pred d, {0|1|%p} -- set a predicate from an immediate or copy another.
 // Predicates live in their own register file, so this cannot go through the
 // ordinary mov path that writes a 32/64-bit value.
+// stacksave / stackrestore / alloca (PTX ISA 9.7.19): the per-thread stack
+// that alloca carves memory out of, and saving and restoring its pointer.
+struct OpStack {
+  enum class Kind { Save, Restore, Alloca } kind = Kind::Save;
+  bool wide = false;          // .u64 (else .u32)
+  Reg dst;                    // stacksave's and alloca's result
+  Operand src;                // stackrestore's value, alloca's size
+  uint32_t align = 8;         // alloca's immAlign (8, the guaranteed minimum)
+};
 struct OpMovPred { Reg dst; Operand src; };
 struct OpPrmt { Reg dst; Operand a, b, c; };       // byte permute (default mode)
 // lop3.b32 d, a, b, c, immLut -- an arbitrary three-input boolean function,
@@ -969,7 +978,7 @@ struct OpCall {
 };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf, OpStack,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy>;
 

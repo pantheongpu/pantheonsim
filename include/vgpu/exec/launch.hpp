@@ -54,6 +54,9 @@ struct LaunchConfig {
   // Size of the device heap malloc() and free() in a kernel draw from:
   // cudaLimitMallocHeapSize for the device, 8 MiB unless a program set it.
   uint64_t device_heap_bytes = 8ull << 20;
+  // Each thread's stack for alloca (cudaLimitStackSize): 1 KiB unless a
+  // program set it, as on the device.
+  uint64_t stack_bytes = 1024;
   // Texture and surface objects visible to this launch. The handle a kernel
   // receives is only a number; this is what it means. Null when the kernel uses
   // no textures, which is the overwhelming majority.
