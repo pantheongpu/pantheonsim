@@ -379,8 +379,11 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         }
         if (x) sum += pred(w, ins.src[3], l) + pred(w, ins.src[4], l);
         write32(w, ins.dst[0], l, static_cast<uint32_t>(sum));
-        if (ins.dst.size() > 1) set_pred(w, ins.dst[1], l, (sum >> 32) & 1);
-        if (ins.dst.size() > 2) set_pred(w, ins.dst[2], l, (sum >> 33) & 1);
+        // The two carry-outs count the overflow (0 to 2) between them, each
+        // worth one to the IADD3.X that adds both: a - b - c overflows twice.
+        const uint64_t over = sum >> 32;
+        if (ins.dst.size() > 1) set_pred(w, ins.dst[1], l, over >= 1);
+        if (ins.dst.size() > 2) set_pred(w, ins.dst[2], l, over >= 2);
       });
       return;
     }

@@ -6,6 +6,9 @@
 //   - 64-bit division by constants, whose IMAD.WIDE chain carries through a
 //     predicate that an earlier compare left set (PyTorch's embedding
 //     backward, krn_partials_per_segment),
+//   - a block-strided loop over a 64-bit count, whose trip count sm_100's
+//     ptxas computes as a - b - c with both IADD3 carries set (PyTorch's
+//     group norm, RowwiseMomentsCUDAKernel),
 //   - the approximate functions (MUFU), which must round as the PTX
 //     engine's do: the run prints a hash of their bits for the comparison,
 //   - a return taken by some lanes of a reduction (EXIT Pn),
@@ -43,6 +46,12 @@ __global__ void divide64(const long long* starts, long long total, long long* ou
   out[3 * i] = (size + 9) / 10;
   out[3 * i + 1] = size / 7;
   out[3 * i + 2] = size % 1000003;
+}
+
+__global__ void row_sums(const float* x, float* out, long long n) {
+  float s = 0;
+  for (long long j = threadIdx.x; j < n; j += blockDim.x) s += x[blockIdx.x * n + j];
+  out[blockIdx.x * blockDim.x + threadIdx.x] = s;
 }
 
 // rsqrtf, __expf and __log2f over a spread of inputs, their bits folded into
@@ -365,6 +374,29 @@ int main() {
       CHECK(hq[3 * i] == (size + 9) / 10 && hq[3 * i + 1] == size / 7 && hq[3 * i + 2] == size % 1000003,
             "divide64(%lld) = %lld %lld %lld", size, hq[3 * i], hq[3 * i + 1], hq[3 * i + 2]);
     }
+  }
+
+  // Block-strided sums over rows of several lengths, the last one shorter
+  // than the block.
+  for (long long len : {1000LL, 256LL, 37LL}) {
+    const int rows = 3, bt = 64;
+    float* hx = new float[rows * len];
+    for (long long i = 0; i < rows * len; ++i) hx[i] = static_cast<float>(i % 13);
+    float *dx, *dout, hout[rows * bt];
+    cudaMalloc(&dx, rows * len * sizeof(float));
+    cudaMalloc(&dout, sizeof hout);
+    cudaMemcpy(dx, hx, rows * len * sizeof(float), cudaMemcpyHostToDevice);
+    row_sums<<<rows, bt>>>(dx, dout, len);
+    cudaMemcpy(hout, dout, sizeof hout, cudaMemcpyDeviceToHost);
+    for (int r = 0; r < rows; ++r)
+      for (int t = 0; t < bt; ++t) {
+        float want = 0;
+        for (long long j = t; j < len; j += bt) want += hx[r * len + j];
+        CHECK(hout[r * bt + t] == want, "row_sums(%lld) row %d thread %d = %g, want %g", len, r, t, hout[r * bt + t], want);
+      }
+    cudaFree(dx);
+    cudaFree(dout);
+    delete[] hx;
   }
 
   // The approximate functions: printed, for the SASS run to match the PTX one.
