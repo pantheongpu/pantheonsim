@@ -1431,6 +1431,11 @@ set_tests_properties(e2e_cooperative_grid PROPERTIES
 # is written against a clean-room header, so nothing else in the build compares
 # the two. It existed unregistered for a while, which is how ten device
 # attributes came to be filed under the wrong numbers.
+add_test(NAME e2e_reserved_smem_attr COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_reserved_smem_attr.sh)
+set_tests_properties(e2e_reserved_smem_attr PROPERTIES
+  DEPENDS "vgpucuda;vgpucudart"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
 add_test(NAME e2e_driver_abi COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_driver_abi.sh)
 set_tests_properties(e2e_driver_abi PROPERTIES
   DEPENDS vgpucuda

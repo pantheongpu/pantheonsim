@@ -361,7 +361,7 @@ int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
     case 106: return static_cast<int>(p.limits.max_blocks_per_sm);
     case 107: return 0;                              // GENERIC_COMPRESSION_SUPPORTED
     case 110: return 0;                              // GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED
-    case 111: return 0;                              // RESERVED_SHARED_MEMORY_PER_BLOCK
+    case 111: return static_cast<int>(p.reserved_smem_per_block());  // RESERVED_SHARED_MEMORY_PER_BLOCK
 
     // ---- capabilities this deliberately does not implement ----
     // Zero is the true answer for each, and saying so explicitly keeps them out
