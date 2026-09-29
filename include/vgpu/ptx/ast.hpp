@@ -1024,7 +1024,9 @@ struct OpBarRed {
 struct OpRet {};
 // Call-sequence machinery (currently only the vprintf builtin is callable).
 struct OpDeclSlot { std::string name; uint32_t size = 0; };            // ".param .b64 param0;" in body
-struct OpStSlot { std::string slot; int64_t offset = 0; Type ty; Operand src; };
+// A store into a call slot: one value, or a vector (st.param.v2/.v4) whose
+// elements go to consecutive offsets.
+struct OpStSlot { std::string slot; int64_t offset = 0; Type ty; std::vector<Operand> srcs; };
 // cp.async.{ca,cg}.shared.global [dst], [src], cp-size{, src-size};
 //
 // A copy from global to shared that the *thread* does not wait on: it is
@@ -1058,7 +1060,8 @@ struct OpCpAsyncGroup {
   bool noinc = false;                  // .noinc: do not add an arrival of our own
 };
 
-struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; };
+// A load from a call slot, one register or a vector of them.
+struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; std::vector<Reg> dsts; };
 // A call. `callee` names either a builtin (vprintf, __assertfail, malloc,
 // free) or a device function defined in the same module, in which case
 // `target` points at it. Not owning: a recursive function calls itself, and a

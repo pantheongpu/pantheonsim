@@ -266,6 +266,63 @@ VTEST(signed_narrow_params_sign_extend) {
   VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{0xFFFF8000});  // through a register
 }
 
+VTEST(vector_param_accesses_through_call_slots) {
+  // A struct passed to and returned from a device function, as nvcc writes
+  // it: st.param.v4.b8 into the argument, ld.param.v4.u8 and a signed byte
+  // (ld.param.s8) out of it in the callee, and the result back through a
+  // .v2 return slot. Boost.Math's quantile finders pass their arguments so.
+  // An RTX 3060 runs this PTX to ffffff80 and 1 + 2*10 + 3*100 + 200*1000.
+  std::string ptx = std::string(kHeader) + R"(
+.func (.param .align 8 .b8 r[8]) pack(.param .align 4 .b8 p[8])
+{
+    .reg .b16 %rs<5>;
+    .reg .b32 %r<4>;
+    ld.param.v4.u8 {%rs1, %rs2, %rs3, %rs4}, [p];
+    ld.param.s8 %r1, [p+4];
+    cvt.u32.u16 %r2, %rs1;
+    cvt.u32.u16 %r3, %rs2;
+    mad.lo.u32 %r2, %r3, 10, %r2;
+    cvt.u32.u16 %r3, %rs3;
+    mad.lo.u32 %r2, %r3, 100, %r2;
+    cvt.u32.u16 %r3, %rs4;
+    mad.lo.u32 %r2, %r3, 1000, %r2;
+    st.param.v2.b32 [r], {%r1, %r2};
+    ret;
+}
+.visible .entry k(.param .u64 out)
+{
+    .reg .b16 %rs<6>;
+    .reg .b32 %r<3>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u16 %rs1, 1;
+    mov.u16 %rs2, 2;
+    mov.u16 %rs3, 3;
+    mov.u16 %rs4, 200;
+    mov.u16 %rs5, 128;
+    {
+    .param .align 4 .b8 param0[8];
+    st.param.v4.b8 [param0], {%rs1, %rs2, %rs3, %rs4};
+    st.param.b8 [param0+4], %rs5;
+    .param .align 8 .b8 retval0[8];
+    call.uni (retval0), pack, (param0);
+    ld.param.v2.b32 {%r1, %r2}, [retval0];
+    }
+    st.global.v2.u32 [%rd2], {%r1, %r2};
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(8);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0xFFFFFF80});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), 200321ull);
+}
+
 VTEST(module_global_string_and_symbols) {
   // "AB" + zero padding, read through a symbol address.
   std::string ptx = std::string(kHeader) + R"(

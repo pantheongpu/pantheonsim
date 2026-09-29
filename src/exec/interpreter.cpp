@@ -5172,17 +5172,18 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpStSlot>(&ins.op)) {
-      Lanes _s_v;
-      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Warp::Slot& slot = w.slots[op->slot];
       const uint32_t nbytes = op->ty.bytes() ? op->ty.bytes() : 4u;
       // A slot written before it was declared (or wider than declared) grows
       // to fit rather than dropping the write silently.
-      slot.fit(static_cast<uint32_t>(op->offset) + nbytes, W_);
-      for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane))
-          slot.write(lane, static_cast<uint32_t>(op->offset), nbytes,
-                     mask_to_bits(v[lane], op->ty.bits));
+      slot.fit(static_cast<uint32_t>(op->offset) + nbytes * static_cast<uint32_t>(op->srcs.size()), W_);
+      for (size_t e = 0; e < op->srcs.size(); ++e) {
+        Lanes _s_v;
+        const Lanes& v = read_operand(w, ctx, ins, op->srcs[e], _s_v);
+        const uint32_t at = static_cast<uint32_t>(op->offset) + nbytes * static_cast<uint32_t>(e);
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) slot.write(lane, at, nbytes, mask_to_bits(v[lane], op->ty.bits));
+      }
       return;
     }
     if (const auto* op = std::get_if<OpLdSlot>(&ins.op)) {
@@ -5190,11 +5191,13 @@ class Interpreter {
       if (it == w.slots.end())
         ctx_fail(ins, -1, Err::UninitializedRegister, "call slot '" + op->slot + "' read before write");
       const uint32_t nbytes = op->ty.bytes() ? op->ty.bytes() : 4u;
-      Lanes r{};
-      for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane))
-          r[lane] = it->second.read(lane, static_cast<uint32_t>(op->offset), nbytes);
-      write_reg(w, op->dst, m, r, op->ty.bits);
+      for (size_t e = 0; e < op->dsts.size(); ++e) {
+        const uint32_t at = static_cast<uint32_t>(op->offset) + nbytes * static_cast<uint32_t>(e);
+        Lanes r{};
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) r[lane] = it->second.read(lane, at, nbytes);
+        write_loaded(w, op->dsts[e], m, r, op->ty);
+      }
       return;
     }
     if (const auto* op = std::get_if<OpCall>(&ins.op)) {
