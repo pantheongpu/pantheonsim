@@ -56,6 +56,12 @@ echo "wrote $(pwd)/memory.gfx942"
 # changes them, capture across streams and its modes, graph memory.
 "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 graphs.cpp -o graphs.gfx942
 echo "wrote $(pwd)/graphs.gfx942"
+# The rest of ROCm's exports: __managed__ variables, libraries, fat
+# binaries, the run-time linker and HCC's launch, which load a code object
+# built on its own.
+"$rocm/bin/hipcc" -O2 --genco --offload-arch=gfx942 exports_kernel.cpp -o exports_kernel.gfx942.co
+"$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 exports.cpp -o exports.gfx942
+echo "wrote $(pwd)/exports.gfx942 and exports_kernel.gfx942.co"
 
 # Streams that run at once: kernels on two streams handing values to each
 # other, events, stream waits, the null stream's ordering, host functions.

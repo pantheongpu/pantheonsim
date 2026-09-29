@@ -73,7 +73,12 @@ each capture mode, with the calls a capture refuses refused as ROCm refuses
 them -- executable graphs and everything that changes one, child graphs,
 clones, allocation nodes whose memory outlives the graph, user objects, and a
 drawing in Graphviz's dot. A launch is one piece of its stream's work, its
-nodes run in an order their edges allow. A kernel's fault is told at the
+nodes run in an order their edges allow. Every function ROCm 7.1's `libamdhip64`
+exports is here, down to `__managed__` variables, modules loaded as CUDA 12's
+libraries or as fat binaries, the run-time linker for code objects (linking
+LLVM bitcode needs AMD's compiler library, and is refused), HCC's launch by
+its C and C++ names, and what a device with no OpenGL and no dma-bufs answers
+(`tests/hipcc/exports.cpp`). A kernel's fault is told at the
 next synchronization, as on a card. `VGPU_SYNC_LAUNCHES=1` makes every call
 wait for its own work instead, which rules concurrency out when a program
 misbehaves. A program built by `hipcc` runs unmodified too:
