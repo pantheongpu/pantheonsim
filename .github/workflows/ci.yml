@@ -286,10 +286,15 @@ jobs:
         #
         # A skip fails the job too, unless the test is named in RUNNER_SKIPS_OK
         # with the reason it cannot run on this machine: a skip that nobody
-        # chose is a test that silently stopped running.
+        # chose is a test that silently stopped running. Allowed now:
+        #   e2e_nvprof           nvprof ships only up to CUDA 12; this shim is 13.
+        #   amd_rocprofiler_abi, amd_rocprofv3
+        #                        the image's ROCm has no rocprofiler-sdk (yet).
+        #   e2e_jit_frameworks   numba and triton are not in the image (yet).
+        # The last two are the image's to fix; drop them here when it is.
         if: inputs.ml_tests == ''
         env:
-          RUNNER_SKIPS_OK: '^$'
+          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks)$'
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j2 \
