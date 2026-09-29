@@ -298,6 +298,11 @@ jobs:
           skipped=$(grep -oE 'Test +#[0-9]+: [A-Za-z0-9_]+ \.+\*\*\*(Skipped|Not Run)' rest.log \
                     | sed -E 's/Test +#[0-9]+: ([A-Za-z0-9_]+).*/\1/' || true)
           unexpected=$(grep -vE "$RUNNER_SKIPS_OK" <<<"$skipped" | grep . || true)
+          if [[ -n "$skipped" ]]; then
+            # ctest hides a skipped test's output; the reason is its SKIP line.
+            echo "Skipped tests and why:"
+            ctest --test-dir build -V -R "^($(grep . <<<"$skipped" | paste -sd'|'))$" 2>&1 | grep -E '^[0-9]+: SKIP:' | sed 's/^/  /' || true
+          fi
           if [[ -n "$unexpected" ]]; then
             echo "::error::tests skipped on the runner, which should run them: $(tr '\n' ' ' <<<"$unexpected")"
             exit 1
