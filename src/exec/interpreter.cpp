@@ -5218,6 +5218,9 @@ class Interpreter {
   // A channel the format lacks reads 0, w included.
   static uint64_t tex_border_raw(const TextureDesc& d, uint32_t ch) {
     const uint32_t bits = d.channel_bits[ch];
+    // An absent channel is 0 whatever the colour -- and must return before
+    // the signed width below, which would wrap to 2^32-1 bits.
+    if (bits == 0) return 0;
     const uint32_t b = d.border_bits[ch];
     const uint64_t mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
     if (d.kind == ChannelKind::Float) {
