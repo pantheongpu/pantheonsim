@@ -724,6 +724,75 @@ VTEST(tcgen05_st_places_registers_as_the_figures_show) {
   }
 }
 
+// tcgen05.alloc blocks until enough columns are free (9.7.18.7.1). Warp 0
+// takes all 512, and waits on an mbarrier; warp 1 arrives on it and then asks
+// for 256, which cannot be had yet, so it waits. Warp 0, released, frees its
+// 512, and warp 1's allocation goes through at column 0.
+VTEST(tcgen05_alloc_waits_for_a_dealloc) {
+  const std::string ptx = std::string(kHeader100a) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<6>;
+    .shared .align 8 .b64 bar;
+    .shared .align 4 .b32 slot0;
+    .shared .align 4 .b32 slot1;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 5;
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 mbarrier.init.shared.b64 [bar], 32;
+    bar.sync 0;
+    setp.eq.u32 %p2, %r2, 0;
+    @!%p2 bra WARP1;
+    tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [slot0], 512;
+    ld.shared.u32 %r3, [slot0];
+WAIT:
+    mbarrier.try_wait.parity.shared.b64 %p3, [bar], 0;
+    @!%p3 bra WAIT;
+    tcgen05.dealloc.cta_group::1.sync.aligned.b32 %r3, 512;
+    ret;
+WARP1:
+    mbarrier.arrive.shared.b64 %rd2, [bar];
+    tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [slot1], 256;
+    ld.shared.u32 %r4, [slot1];
+    @%p1 st.global.u32 [%rd1], %r4;
+    setp.eq.u32 %p1, %r1, 32;
+    @%p1 st.global.u32 [%rd1], %r4;
+    tcgen05.dealloc.cta_group::1.sync.aligned.b32 %r4, 256;
+    ret;
+}
+)";
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(4);
+  mem.store_scalar(out, 4, 0xdead);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(out)}, mem, load_gpu("nvidia/b200"));
+  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{0});
+}
+
+// With no other warp left to free columns, the wait could never end; that is
+// reported rather than spun on.
+VTEST(tcgen05_alloc_that_can_never_be_met_is_a_deadlock) {
+  const std::string ptx = std::string(kHeader100a) + R"(
+.visible .entry k()
+{
+    .shared .align 4 .b32 slot0;
+    .shared .align 4 .b32 slot1;
+    tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [slot0], 512;
+    tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [slot1], 32;
+    ret;
+}
+)";
+  MemoryManager mem{1 << 20};
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  auto err = VCAPTURE(Error, exec::launch(ptx::parse(ptx).entries[0], cfg, {}, mem, load_gpu("nvidia/b200")));
+  VCHECK_CONTAINS(err.what(), "no other warp of the CTA can free");
+}
+
 // .unpack::16b splits each register over two columns, low half first, and
 // .pack::16b puts them back together (figure 196).
 VTEST(tcgen05_pack_and_unpack_16b) {

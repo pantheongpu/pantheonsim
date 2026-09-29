@@ -881,7 +881,10 @@ narrows what counts as observable, not what the detector looks at.
   SM103 fp4 GEMMs run in e2e_cutlass_sm103. See nvidia/docs/blackwell.md.
 - Blackwell's tensor core (sm_100a/sm_100f, PTX ISA 9.7.18): Tensor Memory
   (128 lanes x 512 columns per CTA) allocated with `tcgen05.alloc`/`dealloc`
-  -- for a CTA pair with `.cta_group::2` -- and checked for leaks at exit;
+  -- for a CTA pair with `.cta_group::2` -- and checked for leaks at exit; an
+  allocation larger than what is free waits for another warp's dealloc, as
+  the ISA's blocking alloc does (and is reported as a deadlock when no other
+  warp of the CTA is left to free anything);
   `tcgen05.ld`/`st` in all five shapes with pack/unpack, each warp kept to
   its quarter of the lanes; `tcgen05.mma` for `.kind::f16`, `tf32`,
   `f8f6f4` (the 8-, 6- and 4-bit types, K- or MN-major) and `i8`, and

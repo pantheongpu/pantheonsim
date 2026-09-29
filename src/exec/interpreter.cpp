@@ -407,6 +407,10 @@ struct Warp {
   // the deterministic scheduler a turn otherwise lasts until the warp blocks,
   // and a spin never blocks, so the first waiter would hold the block forever.
   bool yield_now = false;
+  // Set by an instruction that must run again rather than advance: a
+  // tcgen05.alloc that found too few columns free waits by retrying, giving
+  // up its turn each time so the warp that will free them can run.
+  bool retry = false;
   // barrier.cluster: the lanes that have arrived in the cluster's current
   // phase, and the phase a later wait is waiting to see end.
   Mask cluster_arrived = 0;
@@ -2844,6 +2848,10 @@ class Interpreter {
           rethrow_with_context(e, ins, -1);
         throw;
       }
+    }
+    if (w.retry) {
+      w.retry = false;
+      return;
     }
     ++w.paths[idx].pc;
   }
@@ -6768,11 +6776,26 @@ class Interpreter {
           }
           if (ok) { found = true; break; }
         }
-        if (!found)
-          ctx_fail(ins, -1, Err::UnsupportedPtx,
-                   "tcgen05.alloc of " + std::to_string(ncols) +
-                       " columns while too few are free; it would block until another warp "
-                       "deallocates, and waiting for that is not implemented");
+        if (!found) {
+          // "tcgen05.alloc is a potentially blocking instruction": it waits
+          // until another warp's tcgen05.dealloc frees enough. Only a warp of
+          // a CTA the allocation covers that can still run could do that; with
+          // none, the columns will never be freed, and on hardware this warp
+          // would hang.
+          bool someone_can_free = false;
+          for (const BlockCtx* c : ctas)
+            if (c->warps)
+              for (const Warp& other : *c->warps)
+                if (&other != &w && other.state == Warp::State::Ready) someone_can_free = true;
+          if (!someone_can_free)
+            ctx_fail(ins, -1, Err::LaunchConfig,
+                     "deadlock: tcgen05.alloc of " + std::to_string(ncols) +
+                         " columns waits for Tensor Memory that no other warp of the CTA can "
+                         "free (none is still running)");
+          w.retry = true;
+          w.yield_now = true;
+          return;
+        }
         for (const BlockCtx* c : ctas) {
           TensorMemory& t = tmem_of(*c);
           if (t.cells.empty()) t.cells.assign(size_t{TensorMemory::kLanes} * TensorMemory::kCols, 0);
