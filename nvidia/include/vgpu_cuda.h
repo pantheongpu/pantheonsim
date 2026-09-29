@@ -61,6 +61,92 @@ typedef struct CUmod_st* CUmodule;
 typedef struct CUfunc_st* CUfunction;
 typedef struct CUstream_st* CUstream;
 typedef void (*CUhostFn)(void* userData);
+typedef struct CUarray_st* CUarray;
+
+/* CUDA arrays and 2D/3D copies. The enumerator values and struct layouts are
+ * the documented ones, so a program compiled against NVIDIA's cuda.h passes
+ * the same bytes. */
+typedef enum CUarray_format_enum {
+  CU_AD_FORMAT_UNSIGNED_INT8 = 0x01,
+  CU_AD_FORMAT_UNSIGNED_INT16 = 0x02,
+  CU_AD_FORMAT_UNSIGNED_INT32 = 0x03,
+  CU_AD_FORMAT_SIGNED_INT8 = 0x08,
+  CU_AD_FORMAT_SIGNED_INT16 = 0x09,
+  CU_AD_FORMAT_SIGNED_INT32 = 0x0a,
+  CU_AD_FORMAT_HALF = 0x10,
+  CU_AD_FORMAT_FLOAT = 0x20
+} CUarray_format;
+enum {
+  CUDA_ARRAY3D_LAYERED = 0x01,
+  CUDA_ARRAY3D_SURFACE_LDST = 0x02,
+  CUDA_ARRAY3D_CUBEMAP = 0x04,
+  CUDA_ARRAY3D_TEXTURE_GATHER = 0x08
+};
+typedef struct CUDA_ARRAY_DESCRIPTOR_st {
+  size_t Width;
+  size_t Height;
+  CUarray_format Format;
+  unsigned int NumChannels;
+} CUDA_ARRAY_DESCRIPTOR;
+typedef struct CUDA_ARRAY3D_DESCRIPTOR_st {
+  size_t Width;
+  size_t Height;
+  size_t Depth;
+  CUarray_format Format;
+  unsigned int NumChannels;
+  unsigned int Flags;
+} CUDA_ARRAY3D_DESCRIPTOR;
+typedef enum CUmemorytype_enum {
+  CU_MEMORYTYPE_HOST = 0x01,
+  CU_MEMORYTYPE_DEVICE = 0x02,
+  CU_MEMORYTYPE_ARRAY = 0x03,
+  CU_MEMORYTYPE_UNIFIED = 0x04
+} CUmemorytype;
+typedef struct CUDA_MEMCPY2D_st {
+  size_t srcXInBytes;
+  size_t srcY;
+  CUmemorytype srcMemoryType;
+  const void* srcHost;
+  CUdeviceptr srcDevice;
+  CUarray srcArray;
+  size_t srcPitch;
+  size_t dstXInBytes;
+  size_t dstY;
+  CUmemorytype dstMemoryType;
+  void* dstHost;
+  CUdeviceptr dstDevice;
+  CUarray dstArray;
+  size_t dstPitch;
+  size_t WidthInBytes;
+  size_t Height;
+} CUDA_MEMCPY2D;
+typedef struct CUDA_MEMCPY3D_st {
+  size_t srcXInBytes;
+  size_t srcY;
+  size_t srcZ;
+  size_t srcLOD;
+  CUmemorytype srcMemoryType;
+  const void* srcHost;
+  CUdeviceptr srcDevice;
+  CUarray srcArray;
+  void* reserved0;
+  size_t srcPitch;
+  size_t srcHeight;
+  size_t dstXInBytes;
+  size_t dstY;
+  size_t dstZ;
+  size_t dstLOD;
+  CUmemorytype dstMemoryType;
+  void* dstHost;
+  CUdeviceptr dstDevice;
+  CUarray dstArray;
+  void* reserved1;
+  size_t dstPitch;
+  size_t dstHeight;
+  size_t WidthInBytes;
+  size_t Height;
+  size_t Depth;
+} CUDA_MEMCPY3D;
 typedef struct CUevent_st* CUevent;
 
 typedef enum CUdevice_attribute_enum {

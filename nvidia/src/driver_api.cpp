@@ -74,6 +74,18 @@ struct EventRec {
   struct timespec when {};
 };
 
+// A CUDA array: its descriptor and the device memory behind it, laid out row
+// by row (Width elements of NumChannels, then Height rows, then Depth slices;
+// a zero Height or Depth counts as one).
+struct ArrayRec {
+  CUDA_ARRAY3D_DESCRIPTOR desc{};
+  size_t elem = 0;       // bytes an element takes, all channels
+  size_t row = 0;        // bytes a row takes
+  size_t rows = 1, slices = 1;
+  int device = 0;
+  CUdeviceptr mem = 0;
+};
+
 struct ShimState {
   // One lock for both CUDA libraries, since they share one machine
   // (shared_runtime.cpp).
@@ -96,6 +108,7 @@ struct ShimState {
   std::set<uintptr_t> streams;      // explicitly created streams (all synchronous)
   std::set<void*> host_allocs;      // cuMemHostAlloc results
   std::map<uintptr_t, size_t> managed;  // cuMemAllocManaged results: base -> bytes
+  std::unordered_map<uintptr_t, ArrayRec> arrays;  // cuArray3DCreate results
 };
 
 ShimState& state() {
@@ -1851,6 +1864,306 @@ VGPU_EXPORT CUresult cuMemAdvise(CUdeviceptr dptr, size_t count, int advice, CUd
   return cuMemAdvise_v2(dptr, count, advice, location_of(device));
 }
 
+/* ---- CUDA arrays and 2D/3D copies ----
+ * An array is device memory with a shape. The rules for creating one are the
+ * ones an RTX 3060's and an RTX 3080 Ti's drivers enforce (they agree):
+ * Width is never 0; a Depth needs a Height unless the array is layered, and a
+ * layered one needs at least one layer; a cubemap is square with a Depth of 6,
+ * or a multiple of 6 when layered; 1, 2 or 4 channels; a known format and
+ * known flag bits. The formats are the classic eight; the newer packed and
+ * block-compressed ones are refused here. */
+
+namespace {
+constexpr uintptr_t kTagArray = 0;
+
+size_t format_bytes(CUarray_format f) {
+  switch (f) {
+    case CU_AD_FORMAT_UNSIGNED_INT8: case CU_AD_FORMAT_SIGNED_INT8: return 1;
+    case CU_AD_FORMAT_UNSIGNED_INT16: case CU_AD_FORMAT_SIGNED_INT16: case CU_AD_FORMAT_HALF: return 2;
+    case CU_AD_FORMAT_UNSIGNED_INT32: case CU_AD_FORMAT_SIGNED_INT32: case CU_AD_FORMAT_FLOAT: return 4;
+  }
+  return 0;
+}
+
+bool valid_array(const CUDA_ARRAY3D_DESCRIPTOR& d) {
+  const unsigned known = CUDA_ARRAY3D_LAYERED | CUDA_ARRAY3D_SURFACE_LDST | CUDA_ARRAY3D_CUBEMAP |
+                         CUDA_ARRAY3D_TEXTURE_GATHER;
+  if (d.Flags & ~known) return false;
+  if (!format_bytes(d.Format)) return false;
+  if (d.NumChannels != 1 && d.NumChannels != 2 && d.NumChannels != 4) return false;
+  if (d.Width == 0) return false;
+  const bool layered = d.Flags & CUDA_ARRAY3D_LAYERED, cube = d.Flags & CUDA_ARRAY3D_CUBEMAP;
+  if (cube) {
+    if (d.Width != d.Height) return false;
+    if (layered ? (d.Depth == 0 || d.Depth % 6 != 0) : d.Depth != 6) return false;
+    return true;
+  }
+  if (layered) return d.Depth != 0;
+  if (d.Height == 0 && d.Depth != 0) return false;
+  return true;
+}
+
+ArrayRec* array_rec(ShimState& s, CUarray a) {
+  auto it = s.arrays.find(reinterpret_cast<uintptr_t>(a));
+  return it == s.arrays.end() ? nullptr : &it->second;
+}
+
+// One side of a 2D or 3D copy, resolved to where its bytes are.
+struct Side {
+  bool host = false;        // host memory, reached with memcpy
+  const char* hsrc = nullptr;
+  char* hdst = nullptr;
+  CUdeviceptr dev = 0;      // device, managed or array memory
+  size_t pitch = 0, height = 0;
+};
+
+CUresult resolve(ShimState& s, CUmemorytype t, const void* h_in, void* h_out, CUdeviceptr d, CUarray a,
+                 size_t pitch, size_t height, size_t x, size_t y, size_t z, size_t w, size_t rows,
+                 size_t depth, Side* out) {
+  switch (t) {
+    case CU_MEMORYTYPE_HOST:
+      if (!h_in && !h_out) return CUDA_ERROR_INVALID_VALUE;
+      out->host = true;
+      out->hsrc = static_cast<const char*>(h_in);
+      out->hdst = static_cast<char*>(h_out);
+      out->pitch = pitch;
+      out->height = height;
+      break;
+    case CU_MEMORYTYPE_DEVICE:
+    case CU_MEMORYTYPE_UNIFIED:
+      out->dev = d;
+      out->pitch = pitch;
+      out->height = height;
+      break;
+    case CU_MEMORYTYPE_ARRAY: {
+      const ArrayRec* r = array_rec(s, a);
+      if (!r) return CUDA_ERROR_INVALID_VALUE;
+      // The region stays inside the array: its rows, rows and slices.
+      if (x + w > r->row || y + rows > r->rows || z + depth > r->slices) return CUDA_ERROR_INVALID_VALUE;
+      out->dev = r->mem;
+      out->pitch = r->row;
+      out->height = r->rows;
+      break;
+    }
+    default:
+      return CUDA_ERROR_INVALID_VALUE;
+  }
+  // A pitched host or device region must hold a row.
+  if (t != CU_MEMORYTYPE_ARRAY && rows > 1 && out->pitch < w) return CUDA_ERROR_INVALID_VALUE;
+  if (!out->host) out->dev += z * out->pitch * out->height + y * out->pitch + x;
+  else if (out->hsrc) out->hsrc += z * out->pitch * out->height + y * out->pitch + x;
+  else out->hdst += z * out->pitch * out->height + y * out->pitch + x;
+  return CUDA_SUCCESS;
+}
+
+CUresult copy_rows(ShimState& s, const Side& src, const Side& dst, size_t w, size_t rows, size_t depth) {
+  std::vector<uint8_t> tmp(w);
+  for (size_t z = 0; z < depth; ++z)
+    for (size_t y = 0; y < rows; ++y) {
+      const size_t so = z * src.pitch * src.height + y * src.pitch;
+      const size_t d_o = z * dst.pitch * dst.height + y * dst.pitch;
+      if (src.host) std::memcpy(tmp.data(), src.hsrc + so, w);
+      else dev_read(s, tmp.data(), src.dev + so, w);
+      if (dst.host) std::memcpy(dst.hdst + d_o, tmp.data(), w);
+      else dev_write(s, dst.dev + d_o, tmp.data(), w);
+    }
+  return CUDA_SUCCESS;
+}
+
+CUresult copy3d(ShimState& s, const CUDA_MEMCPY3D& p) {
+  if (p.WidthInBytes == 0 || p.Height == 0 || p.Depth == 0) return CUDA_SUCCESS;
+  if (p.srcLOD || p.dstLOD) return CUDA_ERROR_INVALID_VALUE;
+  Side src, dst;
+  if (CUresult r = resolve(s, p.srcMemoryType, p.srcHost, nullptr, p.srcDevice, p.srcArray, p.srcPitch,
+                           p.srcHeight, p.srcXInBytes, p.srcY, p.srcZ, p.WidthInBytes, p.Height, p.Depth,
+                           &src))
+    return r;
+  if (CUresult r = resolve(s, p.dstMemoryType, nullptr, p.dstHost, p.dstDevice, p.dstArray, p.dstPitch,
+                           p.dstHeight, p.dstXInBytes, p.dstY, p.dstZ, p.WidthInBytes, p.Height, p.Depth,
+                           &dst))
+    return r;
+  if (p.Depth > 1 && ((!src.host && src.height < p.Height && p.srcMemoryType != CU_MEMORYTYPE_ARRAY) ||
+                      (src.host && src.height < p.Height) || (dst.host && dst.height < p.Height) ||
+                      (!dst.host && dst.height < p.Height && p.dstMemoryType != CU_MEMORYTYPE_ARRAY)))
+    return CUDA_ERROR_INVALID_VALUE;  // slices would overlap
+  return copy_rows(s, src, dst, p.WidthInBytes, p.Height, p.Depth);
+}
+
+CUDA_MEMCPY3D as3d(const CUDA_MEMCPY2D& c) {
+  CUDA_MEMCPY3D p{};
+  p.srcXInBytes = c.srcXInBytes; p.srcY = c.srcY; p.srcMemoryType = c.srcMemoryType;
+  p.srcHost = c.srcHost; p.srcDevice = c.srcDevice; p.srcArray = c.srcArray; p.srcPitch = c.srcPitch;
+  p.dstXInBytes = c.dstXInBytes; p.dstY = c.dstY; p.dstMemoryType = c.dstMemoryType;
+  p.dstHost = c.dstHost; p.dstDevice = c.dstDevice; p.dstArray = c.dstArray; p.dstPitch = c.dstPitch;
+  p.WidthInBytes = c.WidthInBytes; p.Height = c.Height; p.Depth = 1;
+  return p;
+}
+
+// Bytes [off, off + n) of an array's first row, for cuMemcpyHtoA and the
+// rest: the card takes them for an array of any shape, within that row.
+CUresult linear_part(ShimState& s, CUarray a, size_t off, size_t n, CUdeviceptr* at) {
+  const ArrayRec* r = array_rec(s, a);
+  if (!r) return CUDA_ERROR_INVALID_VALUE;
+  if (off > r->row || n > r->row - off) return CUDA_ERROR_INVALID_VALUE;
+  *at = r->mem + off;
+  return CUDA_SUCCESS;
+}
+}  // namespace
+
+VGPU_EXPORT CUresult cuArray3DCreate_v2(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc) {
+  return api("cuArray3DCreate", true, false, [&](ShimState& s) {
+    if (!out || !desc || !valid_array(*desc)) return CUDA_ERROR_INVALID_VALUE;
+    ArrayRec r;
+    r.desc = *desc;
+    r.elem = format_bytes(desc->Format) * desc->NumChannels;
+    r.row = desc->Width * r.elem;
+    r.rows = desc->Height ? desc->Height : 1;
+    r.slices = desc->Depth ? desc->Depth : 1;
+    r.device = current_device(s);
+    r.mem = current(s).memory().alloc(r.row * r.rows * r.slices);
+    const uintptr_t h = make_handle(s, kTagArray);
+    s.arrays[h] = r;
+    *out = reinterpret_cast<CUarray>(h);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuArray3DCreate(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc) {
+  return cuArray3DCreate_v2(out, desc);
+}
+VGPU_EXPORT CUresult cuArrayCreate_v2(CUarray* out, const CUDA_ARRAY_DESCRIPTOR* desc) {
+  if (!desc) return CUDA_ERROR_INVALID_VALUE;
+  CUDA_ARRAY3D_DESCRIPTOR d{};
+  d.Width = desc->Width;
+  d.Height = desc->Height;
+  d.Format = desc->Format;
+  d.NumChannels = desc->NumChannels;
+  return cuArray3DCreate_v2(out, &d);
+}
+VGPU_EXPORT CUresult cuArrayCreate(CUarray* out, const CUDA_ARRAY_DESCRIPTOR* desc) {
+  return cuArrayCreate_v2(out, desc);
+}
+VGPU_EXPORT CUresult cuArray3DGetDescriptor_v2(CUDA_ARRAY3D_DESCRIPTOR* desc, CUarray a) {
+  return api("cuArray3DGetDescriptor", true, false, [&](ShimState& s) {
+    const ArrayRec* r = array_rec(s, a);
+    if (!desc || !r) return CUDA_ERROR_INVALID_VALUE;
+    *desc = r->desc;
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuArray3DGetDescriptor(CUDA_ARRAY3D_DESCRIPTOR* desc, CUarray a) {
+  return cuArray3DGetDescriptor_v2(desc, a);
+}
+// The 2D descriptor of any array, a 3D one included (the card answers for both).
+VGPU_EXPORT CUresult cuArrayGetDescriptor_v2(CUDA_ARRAY_DESCRIPTOR* desc, CUarray a) {
+  CUDA_ARRAY3D_DESCRIPTOR d{};
+  if (!desc) return CUDA_ERROR_INVALID_VALUE;
+  if (CUresult r = cuArray3DGetDescriptor_v2(&d, a)) return r;
+  desc->Width = d.Width;
+  desc->Height = d.Height;
+  desc->Format = d.Format;
+  desc->NumChannels = d.NumChannels;
+  return CUDA_SUCCESS;
+}
+VGPU_EXPORT CUresult cuArrayGetDescriptor(CUDA_ARRAY_DESCRIPTOR* desc, CUarray a) {
+  return cuArrayGetDescriptor_v2(desc, a);
+}
+VGPU_EXPORT CUresult cuArrayDestroy(CUarray a) {
+  return api("cuArrayDestroy", true, false, [&](ShimState& s) {
+    auto it = s.arrays.find(reinterpret_cast<uintptr_t>(a));
+    if (it == s.arrays.end()) return CUDA_ERROR_INVALID_VALUE;
+    s.rt->device(it->second.device).memory().free(it->second.mem);
+    s.arrays.erase(it);
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuMemcpyHtoA_v2(CUarray dst, size_t off, const void* src, size_t n) {
+  return api("cuMemcpyHtoA", true, false, [&](ShimState& s) {
+    CUdeviceptr at = 0;
+    if (!src && n) return CUDA_ERROR_INVALID_VALUE;
+    if (CUresult r = linear_part(s, dst, off, n, &at)) return r;
+    dev_write(s, at, src, n);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemcpyHtoA(CUarray d, size_t off, const void* src, size_t n) {
+  return cuMemcpyHtoA_v2(d, off, src, n);
+}
+VGPU_EXPORT CUresult cuMemcpyAtoH_v2(void* dst, CUarray src, size_t off, size_t n) {
+  return api("cuMemcpyAtoH", true, false, [&](ShimState& s) {
+    CUdeviceptr at = 0;
+    if (!dst && n) return CUDA_ERROR_INVALID_VALUE;
+    if (CUresult r = linear_part(s, src, off, n, &at)) return r;
+    dev_read(s, dst, at, n);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemcpyAtoH(void* dst, CUarray src, size_t off, size_t n) {
+  return cuMemcpyAtoH_v2(dst, src, off, n);
+}
+VGPU_EXPORT CUresult cuMemcpyDtoA_v2(CUarray dst, size_t off, CUdeviceptr src, size_t n) {
+  return api("cuMemcpyDtoA", true, false, [&](ShimState& s) {
+    CUdeviceptr at = 0;
+    if (CUresult r = linear_part(s, dst, off, n, &at)) return r;
+    std::vector<uint8_t> tmp(n);
+    dev_read(s, tmp.data(), src, n);
+    dev_write(s, at, tmp.data(), n);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemcpyDtoA(CUarray d, size_t off, CUdeviceptr src, size_t n) {
+  return cuMemcpyDtoA_v2(d, off, src, n);
+}
+VGPU_EXPORT CUresult cuMemcpyAtoD_v2(CUdeviceptr dst, CUarray src, size_t off, size_t n) {
+  return api("cuMemcpyAtoD", true, false, [&](ShimState& s) {
+    CUdeviceptr at = 0;
+    if (CUresult r = linear_part(s, src, off, n, &at)) return r;
+    std::vector<uint8_t> tmp(n);
+    dev_read(s, tmp.data(), at, n);
+    dev_write(s, dst, tmp.data(), n);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemcpyAtoD(CUdeviceptr d, CUarray src, size_t off, size_t n) {
+  return cuMemcpyAtoD_v2(d, src, off, n);
+}
+
+VGPU_EXPORT CUresult cuMemcpy3D_v2(const CUDA_MEMCPY3D* p) {
+  return api("cuMemcpy3D", true, false, [&](ShimState& s) {
+    if (!p) return CUDA_ERROR_INVALID_VALUE;
+    return copy3d(s, *p);
+  });
+}
+VGPU_EXPORT CUresult cuMemcpy3D(const CUDA_MEMCPY3D* p) { return cuMemcpy3D_v2(p); }
+VGPU_EXPORT CUresult cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D* p, CUstream) { return cuMemcpy3D_v2(p); }
+VGPU_EXPORT CUresult cuMemcpy3DAsync(const CUDA_MEMCPY3D* p, CUstream st) { return cuMemcpy3DAsync_v2(p, st); }
+VGPU_EXPORT CUresult cuMemcpy2D_v2(const CUDA_MEMCPY2D* c) {
+  return api("cuMemcpy2D", true, false, [&](ShimState& s) {
+    if (!c) return CUDA_ERROR_INVALID_VALUE;
+    return copy3d(s, as3d(*c));
+  });
+}
+VGPU_EXPORT CUresult cuMemcpy2D(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
+VGPU_EXPORT CUresult cuMemcpy2DUnaligned_v2(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
+VGPU_EXPORT CUresult cuMemcpy2DUnaligned(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
+VGPU_EXPORT CUresult cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D* c, CUstream) { return cuMemcpy2D_v2(c); }
+VGPU_EXPORT CUresult cuMemcpy2DAsync(const CUDA_MEMCPY2D* c, CUstream st) { return cuMemcpy2DAsync_v2(c, st); }
+
+// Stream-ordered allocation: the stream is synchronous, so the memory is
+// ready at once. A request for 0 bytes succeeds, as the card's does.
+VGPU_EXPORT CUresult cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstream) {
+  if (!dptr) return CUDA_ERROR_INVALID_VALUE;
+  if (bytesize == 0) {
+    *dptr = 0;
+    return CUDA_SUCCESS;
+  }
+  return cuMemAlloc_v2(dptr, bytesize);
+}
+VGPU_EXPORT CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream) {
+  if (dptr == 0) return CUDA_SUCCESS;
+  return cuMemFree_v2(dptr);
+}
+
 /* ---- streams (all synchronous) and events (wall-clock timestamps) ---- */
 
 VGPU_EXPORT CUresult cuStreamCreate(CUstream* s_out, unsigned int) {
@@ -2505,6 +2818,15 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuMemAllocManaged), VGPU_PROC(cuStreamAttachMemAsync), VGPU_PROC(cuMemPrefetchAsync),
     VGPU_PROC(cuMemPrefetchAsync_v2), VGPU_PROC(cuMemAdvise), VGPU_PROC(cuMemAdvise_v2),
     VGPU_PROC(cuLaunchHostFunc),
+    VGPU_PROC(cuArray3DCreate), VGPU_PROC(cuArray3DCreate_v2), VGPU_PROC(cuArrayCreate),
+    VGPU_PROC(cuArrayCreate_v2), VGPU_PROC(cuArray3DGetDescriptor), VGPU_PROC(cuArray3DGetDescriptor_v2),
+    VGPU_PROC(cuArrayGetDescriptor), VGPU_PROC(cuArrayGetDescriptor_v2), VGPU_PROC(cuArrayDestroy),
+    VGPU_PROC(cuMemcpyHtoA), VGPU_PROC(cuMemcpyHtoA_v2), VGPU_PROC(cuMemcpyAtoH), VGPU_PROC(cuMemcpyAtoH_v2),
+    VGPU_PROC(cuMemcpyDtoA), VGPU_PROC(cuMemcpyDtoA_v2), VGPU_PROC(cuMemcpyAtoD), VGPU_PROC(cuMemcpyAtoD_v2),
+    VGPU_PROC(cuMemcpy2D), VGPU_PROC(cuMemcpy2D_v2), VGPU_PROC(cuMemcpy2DUnaligned),
+    VGPU_PROC(cuMemcpy2DUnaligned_v2), VGPU_PROC(cuMemcpy2DAsync), VGPU_PROC(cuMemcpy2DAsync_v2),
+    VGPU_PROC(cuMemcpy3D), VGPU_PROC(cuMemcpy3D_v2), VGPU_PROC(cuMemcpy3DAsync), VGPU_PROC(cuMemcpy3DAsync_v2),
+    VGPU_PROC(cuMemAllocAsync), VGPU_PROC(cuMemFreeAsync),
     VGPU_PROC(cuPointerGetAttribute),
     VGPU_PROC(cuModuleLoadData), VGPU_PROC(cuModuleLoadDataEx), VGPU_PROC(cuModuleUnload),
     VGPU_PROC(cuModuleGetFunction), VGPU_PROC(cuModuleGetLoadingMode),
