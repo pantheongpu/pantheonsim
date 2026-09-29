@@ -46,7 +46,6 @@ VGPU_EXPORT int cublasDcopy_v2() { vgpu_report_unimplemented("cublasDcopy_v2"); 
 VGPU_EXPORT int cublasDgelsBatched() { vgpu_report_unimplemented("cublasDgelsBatched"); return 15; }
 VGPU_EXPORT int cublasDgemmBatched() { vgpu_report_unimplemented("cublasDgemmBatched"); return 15; }
 VGPU_EXPORT int cublasDgemmStridedBatched() { vgpu_report_unimplemented("cublasDgemmStridedBatched"); return 15; }
-VGPU_EXPORT int cublasDgemv_v2() { vgpu_report_unimplemented("cublasDgemv_v2"); return 15; }
 VGPU_EXPORT int cublasDgeqrfBatched() { vgpu_report_unimplemented("cublasDgeqrfBatched"); return 15; }
 VGPU_EXPORT int cublasDger_v2() { vgpu_report_unimplemented("cublasDger_v2"); return 15; }
 VGPU_EXPORT int cublasDotEx() { vgpu_report_unimplemented("cublasDotEx"); return 15; }

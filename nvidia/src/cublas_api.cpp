@@ -761,36 +761,6 @@ VGPU_EXPORT cublasStatus_t cublasSetWorkspace_v2(cublasHandle_t h, void*, size_t
 
 /* ---- level 2 and level 1 ---- */
 
-VGPU_EXPORT cublasStatus_t cublasSgemv_v2(cublasHandle_t h, cublasOperation_t trans, int m, int n,
-                                          const float* alpha, const float* A, int lda,
-                                          const float* x, int incx, const float* beta, float* y,
-                                          int incy) {
-  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (m < 0 || n < 0 || lda < 1 || incx == 0 || incy == 0) return CUBLAS_STATUS_INVALID_VALUE;
-  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(float)),
-                            be = hold(h, beta, sizeof(float))] {
-        cublasSgemv_v2(h, trans, m, n, static_cast<const float*>(al.get()), A, lda, x, incx,
-                       static_cast<const float*>(be.get()), y, incy);
-      }))
-    return CUBLAS_STATUS_SUCCESS;
-  float a = scalar(h, alpha), b = scalar(h, beta);
-  const int xlen = trans == CUBLAS_OP_N ? n : m;
-  const int ylen = trans == CUBLAS_OP_N ? m : n;
-  if (!m || !n) return CUBLAS_STATUS_SUCCESS;
-  auto hA = fetch<float>(A, extent(lda, n, m));
-  auto hx = fetch<float>(x, static_cast<size_t>(std::abs(incx)) * (xlen - 1) + 1);
-  auto hy = fetch<float>(y, static_cast<size_t>(std::abs(incy)) * (ylen - 1) + 1);
-  for (int i = 0; i < ylen; ++i) {
-    float acc = 0.0f;
-    for (int j = 0; j < xlen; ++j)
-      acc += hA[trans == CUBLAS_OP_N ? idx(i, j, lda) : idx(j, i, lda)] * hx[j * incx];
-    float& yi = hy[i * incy];
-    yi = b == 0.0f ? a * acc : a * acc + b * yi;
-  }
-  store(y, hy);
-  return CUBLAS_STATUS_SUCCESS;
-}
-
 namespace {
 
 // Where element i of an n-element vector with increment inc sits, by BLAS's
@@ -800,6 +770,39 @@ inline size_t elem(int i, int n, int inc) {
   return inc > 0 ? static_cast<size_t>(i) * inc : static_cast<size_t>(n - 1 - i) * -inc;
 }
 inline size_t span(int n, int inc) { return static_cast<size_t>(std::abs(inc)) * (n - 1) + 1; }
+
+// y = alpha op(A) x + beta y. Increments follow BLAS's rule (a negative one
+// walks its vector from the far end), and a leading dimension shorter than a
+// column is refused, as it is by cuBLAS. beta 0 overwrites y without reading
+// it, so NaN in y stays out of the answer.
+template <class T>
+cublasStatus_t gemv(cublasHandle_t h, cublasOperation_t trans, int m, int n, const T* alpha,
+                    const T* A, int lda, const T* x, int incx, const T* beta, T* y, int incy) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (m < 0 || n < 0 || lda < std::max(1, m) || incx == 0 || incy == 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (trans == CUBLAS_OP_C) trans = CUBLAS_OP_T;  // real types
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(T)), be = hold(h, beta, sizeof(T))] {
+        gemv<T>(h, trans, m, n, static_cast<const T*>(al.get()), A, lda, x, incx,
+                static_cast<const T*>(be.get()), y, incy);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
+  const T a = scalar(h, alpha), b = scalar(h, beta);
+  const int xlen = trans == CUBLAS_OP_N ? n : m;
+  const int ylen = trans == CUBLAS_OP_N ? m : n;
+  if (!m || !n) return CUBLAS_STATUS_SUCCESS;
+  auto hA = fetch<T>(A, extent(lda, n, m));
+  auto hx = fetch<T>(x, span(xlen, incx));
+  auto hy = fetch<T>(y, span(ylen, incy));
+  for (int i = 0; i < ylen; ++i) {
+    T acc = 0;
+    for (int j = 0; j < xlen; ++j)
+      acc += hA[trans == CUBLAS_OP_N ? idx(i, j, lda) : idx(j, i, lda)] * hx[elem(j, xlen, incx)];
+    T& yi = hy[elem(i, ylen, incy)];
+    yi = b == T(0) ? a * acc : a * acc + b * yi;
+  }
+  store(y, hy);
+  return CUBLAS_STATUS_SUCCESS;
+}
 
 // The reductions hand their answer back through a host or device pointer,
 // depending on the handle's pointer mode.
@@ -1008,6 +1011,18 @@ VGPU_EXPORT cublasStatus_t cublasSscal_v2(cublasHandle_t h, int n, const float* 
 VGPU_EXPORT cublasStatus_t cublasDscal_v2(cublasHandle_t h, int n, const double* alpha, double* x,
                                           int incx) {
   return scal(h, n, alpha, x, incx);
+}
+VGPU_EXPORT cublasStatus_t cublasSgemv_v2(cublasHandle_t h, cublasOperation_t trans, int m, int n,
+                                          const float* alpha, const float* A, int lda,
+                                          const float* x, int incx, const float* beta, float* y,
+                                          int incy) {
+  return gemv(h, trans, m, n, alpha, A, lda, x, incx, beta, y, incy);
+}
+VGPU_EXPORT cublasStatus_t cublasDgemv_v2(cublasHandle_t h, cublasOperation_t trans, int m, int n,
+                                          const double* alpha, const double* A, int lda,
+                                          const double* x, int incx, const double* beta, double* y,
+                                          int incy) {
+  return gemv(h, trans, m, n, alpha, A, lda, x, incx, beta, y, incy);
 }
 VGPU_EXPORT cublasStatus_t cublasSdot_v2(cublasHandle_t h, int n, const float* x, int incx,
                                          const float* y, int incy, float* result) {

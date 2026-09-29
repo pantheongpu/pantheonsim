@@ -2,7 +2,8 @@
 // axpy, scal, dot, nrm2, asum and i?amax in single and double precision, positive and
 // negative increments (BLAS walks a negative-increment vector from its far
 // end), and tbmv over both triangles, both operations, unit and non-unit
-// diagonals and several band widths; and dgmm (a matrix times a diagonal
+// diagonals and several band widths; gemv over both operations, negative
+// increments and beta zero or not; and dgmm (a matrix times a diagonal
 // one) from both sides, over every kind of increment, padded and in place.
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -53,6 +54,35 @@ cublasStatus_t tbmv(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t, c
 cublasStatus_t tbmv(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t, cublasDiagType_t d, int n, int k, const double* A, int lda, double* x, int ix) { return cublasDtbmv(h, u, t, d, n, k, A, lda, x, ix); }
 cublasStatus_t dgmm(cublasHandle_t h, cublasSideMode_t s, int m, int n, const float* A, int lda, const float* x, int ix, float* C, int ldc) { return cublasSdgmm(h, s, m, n, A, lda, x, ix, C, ldc); }
 cublasStatus_t dgmm(cublasHandle_t h, cublasSideMode_t s, int m, int n, const double* A, int lda, const double* x, int ix, double* C, int ldc) { return cublasDdgmm(h, s, m, n, A, lda, x, ix, C, ldc); }
+
+cublasStatus_t gemv(cublasHandle_t h, cublasOperation_t t, int m, int n, const float* a, const float* A, int lda, const float* x, int ix, const float* b, float* y, int iy) { return cublasSgemv(h, t, m, n, a, A, lda, x, ix, b, y, iy); }
+cublasStatus_t gemv(cublasHandle_t h, cublasOperation_t t, int m, int n, const double* a, const double* A, int lda, const double* x, int ix, const double* b, double* y, int iy) { return cublasDgemv(h, t, m, n, a, A, lda, x, ix, b, y, iy); }
+
+template <class T> static void matvec(cublasHandle_t h, const char* ty) {
+  const int m = 5, n = 3, lda = 6;  // padded: row 5 of each column is not A's
+  auto hA = values<T>((size_t)lda * n, 8);
+  T* dA = up(hA);
+  for (int trans = 0; trans <= 1; ++trans)
+    for (int inc : {1, -2})
+      for (int zero_beta = 0; zero_beta <= 1; ++zero_beta) {
+        const int xlen = trans ? m : n, ylen = trans ? n : m;
+        const size_t lx = (size_t)(inc < 0 ? -inc : inc) * (xlen - 1) + 1;
+        const size_t ly = (size_t)(inc < 0 ? -inc : inc) * (ylen - 1) + 1;
+        auto hx = values<T>(lx, 9), hy = values<T>(ly, 10);
+        T* dx = up(hx);
+        T* dy = up(hy);
+        const T alpha = (T)1.25, beta = zero_beta ? (T)0 : (T)-0.5;
+        CB(gemv(h, trans ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, &alpha, dA, lda, dx, inc, &beta, dy, inc));
+        char tag[64];
+        snprintf(tag, sizeof tag, "%s gemv %s inc %d beta %s", ty, trans ? "T" : "N", inc, zero_beta ? "0" : "-0.5");
+        print(tag, down(dy, ly));
+        cudaFree(dx); cudaFree(dy);
+      }
+  // A leading dimension shorter than a column.
+  const T one = 1;
+  printf("%s gemv lda < m -> %d\n", ty, (int)gemv(h, CUBLAS_OP_N, m, n, &one, dA, m - 1, dA, 1, &one, dA, 1));
+  cudaFree(dA);
+}
 
 template <class T> static void diag(cublasHandle_t h, const char* ty) {
   const int m = 5, n = 4, lda = 7;   // padded: rows 5 and 6 of each column are not A's
@@ -152,6 +182,8 @@ static void run() {
   band<double>(h, "d");
   diag<float>(h, "s");
   diag<double>(h, "d");
+  matvec<float>(h, "s");
+  matvec<double>(h, "d");
   // Results written through a device pointer.
   CB(cublasSetPointerMode(h, CUBLAS_POINTER_MODE_DEVICE));
   auto hx = values<double>(9, 5);
