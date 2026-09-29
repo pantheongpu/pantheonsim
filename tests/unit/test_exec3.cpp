@@ -6284,4 +6284,78 @@ STORE:
   unsetenv("VGPU_THREADS");
 }
 
+// Diverged paths that each make a device call through the same slot names
+// (param0, retval0). Lane 1 loops through a call; lane 0 waits at a higher pc
+// until the starvation boost runs it for 256 instructions, after `pad` others.
+// Across these pads the boost ends between lane 0's st.param and its call, and
+// between its call and its ld.param. A declaration used to clear the slot for
+// the whole warp, and a return to overwrite it for the whole warp, so lane 0's
+// argument or lane 1's pending result was lost. An RTX 3060 runs every pad to
+// 42 and 3998000 (the sum of 2*i for i below 2000).
+VTEST(diverged_calls_keep_each_lanes_call_slots) {
+  for (int pad = 248; pad <= 260; ++pad) {
+    std::string padding;
+    for (int i = 0; i < pad; ++i) padding += "    add.u32 %r9, %r9, 1;\n";
+    std::string ptx = std::string(kHeader) + R"(
+.func (.param .b32 r) twice(.param .b32 v)
+{
+    .reg .b32 %t<3>;
+    ld.param.b32 %t1, [v];
+    shl.b32 %t2, %t1, 1;
+    st.param.b32 [r], %t2;
+    ret;
+}
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd2, %rd2, %rd3;
+    mov.u32 %r9, 0;
+    mov.u32 %r7, 0;
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 bra XPATH;
+    mov.u32 %r5, 0;
+YLOOP:
+    {
+    .param .b32 param0;
+    st.param.b32 [param0], %r5;
+    .param .b32 retval0;
+    call.uni (retval0), twice, (param0);
+    ld.param.b32 %r6, [retval0];
+    }
+    add.u32 %r7, %r7, %r6;
+    add.u32 %r5, %r5, 1;
+    setp.lt.u32 %p2, %r5, 2000;
+    @%p2 bra YLOOP;
+    bra.uni DONE;
+XPATH:
+)" + padding + R"(
+    {
+    .param .b32 param0;
+    st.param.b32 [param0], 21;
+    .param .b32 retval0;
+    call.uni (retval0), twice, (param0);
+    ld.param.b32 %r7, [retval0];
+    }
+DONE:
+    st.global.u32 [%rd2], %r7;
+    ret;
+}
+)";
+    Env e;
+    auto m = ptx::parse(ptx);
+    uint64_t out = e.mem.alloc(8);
+    LaunchConfig cfg;
+    cfg.block = {2, 1, 1};
+    exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+    VCHECK_EQ(e.mem.load_scalar(out, 4), 42ull);
+    VCHECK_EQ(e.mem.load_scalar(out + 4, 4), 3998000ull);
+  }
+}
+
 VTEST_MAIN
