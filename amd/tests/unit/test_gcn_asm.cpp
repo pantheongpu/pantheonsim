@@ -3,6 +3,7 @@
 // C fixture could not be counted on to contain them. Each is checked against
 // the same arithmetic done in 64 bits on the host.
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
@@ -527,6 +528,33 @@ VTEST(what_pytorchs_rocm_libraries_use_gives_what_the_isa_says) {
   VCHECK_EQ(r[61], 7u);           // 5 + 3, then decremented
   VCHECK_EQ(r[62], 5u);           // what the add found
   VCHECK_EQ(r[63], 8u);           // and what the decrement found
+}
+
+// s_memrealtime is the real-time clock at 100 MHz, the rate the runtime
+// reports as hipDeviceAttributeWallClockRate: a kernel that spins on
+// wall_clock64() for some milliseconds, as hip-tests' delay kernels do, has to
+// see time pass at that rate. It read the instruction count before, which
+// ran far slower than the rate said. s_memtime stays the instruction count,
+// this model's shader clock.
+VTEST(the_real_time_clock_counts_at_the_wall_clock_rate) {
+  const amd::CodeObject o = object("asm_realtime");
+  const auto now = [] {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count()) /
+           10;
+  };
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(4 * 4);
+  const uint64_t before = now();
+  const std::vector<uint32_t> r = run(o, "realtime", mem, out, 4, {out});
+  const uint64_t after = now();
+  const uint64_t realtime = r[0] | uint64_t{r[1]} << 32, shader = r[2] | uint64_t{r[3]} << 32;
+  VCHECK(realtime >= before);
+  VCHECK(realtime <= after);
+  // The instructions the thread running the wave has retired: a count far
+  // below a clock that has been going since the host started.
+  VCHECK(shader < realtime / 1000);
 }
 
 VTEST_MAIN

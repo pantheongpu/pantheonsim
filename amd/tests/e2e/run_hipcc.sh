@@ -250,6 +250,17 @@ for line in \
   expect "$line" "$line" "$(grep -Fo "$line" <<< "$out")"
 done
 
+# HIP's calls beyond the everyday ones (hipcc/api.cpp): device flags and
+# UUIDs, contexts, the legacy and per-thread default streams, callbacks,
+# waiting on memory in a stream, every launch form. Each is held to what
+# ROCm's HIP answers, and the program counts the checks that did not hold.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$shim" timeout 300 \
+      "$(dirname "$exe")/api.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the API program runs to the end" "0" "$status"
+expect "every one of its checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)

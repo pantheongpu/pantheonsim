@@ -144,6 +144,9 @@ std::map<uintptr_t, size_t>& g_locked = *new std::map<uintptr_t, size_t>;   // u
 // What a program attached to an allocation (hsa_amd_pointer_info_set_userdata).
 std::map<uintptr_t, void*>& g_userdata = *new std::map<uintptr_t, void*>;   // under g_mutex
 
+// A GPU's clock: 100 MHz, a tick every 10 ns.
+constexpr uint64_t kGpuClockHz = 100000000, kGpuTickNs = 10;
+
 uint64_t now_ns() {
   return static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -635,7 +638,10 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
     case HSA_AMD_AGENT_INFO_MEMORY_AVAIL:
       put<uint64_t>(value, is_gpu ? shared::profile(gpu).vram_bytes : 0);
       break;
-    case HSA_AMD_AGENT_INFO_TIMESTAMP_FREQUENCY: put<uint64_t>(value, 1000000000); break;
+    // A GPU's own clock runs at 100 MHz -- the one s_memrealtime reads, and
+    // what ROCm's HIP reports as the wall clock rate; the system's (and the
+    // host's) is in nanoseconds.
+    case HSA_AMD_AGENT_INFO_TIMESTAMP_FREQUENCY: put<uint64_t>(value, is_gpu ? kGpuClockHz : 1000000000); break;
     // The rest of what AMD's runtime reports, from the chip (chip() above).
     case HSA_AMD_AGENT_INFO_MAX_ADDRESS_WATCH_POINTS: put<uint32_t>(value, is_gpu ? 4 : 0); break;
     case HSA_AMD_AGENT_INFO_MEMORY_WIDTH: put<uint32_t>(value, is_gpu ? chip(shared::profile(gpu)).mem_bits : 0); break;
@@ -662,11 +668,13 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
     case HSA_AMD_AGENT_INFO_NEAREST_CPU: put<hsa_agent_t>(value, {kCpuAgent}); break;
     case HSA_AMD_AGENT_INFO_MEMORY_PROPERTIES:
     case HSA_AMD_AGENT_INFO_AQL_EXTENSIONS: std::memset(value, 0, 8); break;
-    case HSA_AMD_AGENT_INFO_SCRATCH_LIMIT_MAX:
-    case HSA_AMD_AGENT_INFO_SCRATCH_LIMIT_CURRENT: put<uint64_t>(value, is_gpu ? uint64_t{1} << 32 : 0); break;
+    case HSA_AMD_AGENT_INFO_SCRATCH_LIMIT_MAX: put<uint64_t>(value, is_gpu ? shared::kScratchLimitMax : 0); break;
+    case HSA_AMD_AGENT_INFO_SCRATCH_LIMIT_CURRENT: put<uint64_t>(value, is_gpu ? shared::scratch_limit(gpu) : 0); break;
     case HSA_AMD_AGENT_INFO_CLOCK_COUNTERS: {
+      // The GPU's counter in its own ticks, the CPU's and the system's in
+      // nanoseconds, all read at once.
       const uint64_t t = now_ns();
-      put(value, hsa_amd_clock_counters_t{t, t, t, 1000000000});
+      put(value, hsa_amd_clock_counters_t{is_gpu ? t / kGpuTickNs : t, t, t, 1000000000});
       break;
     }
     default: return unknown("hsa_agent_get_info", attribute);
@@ -1764,7 +1772,9 @@ hsa_status_t hsa_amd_profiling_convert_tick_to_system_domain(hsa_agent_t agent, 
   if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
   if (!valid_agent(agent)) return HSA_STATUS_ERROR_INVALID_AGENT;
   if (!system_tick) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-  *system_tick = agent_tick;   // one clock for all
+  // A GPU's 100 MHz ticks, and the system's nanoseconds, count from the same
+  // moment.
+  *system_tick = gpu_of(agent) >= 0 ? agent_tick * kGpuTickNs : agent_tick;
   return HSA_STATUS_SUCCESS;
 }
 
@@ -1840,9 +1850,13 @@ hsa_status_t hsa_amd_memory_async_copy_rect(const void* dst_ptr, const hsa_dim3_
   return HSA_STATUS_SUCCESS;
 }
 
-// What AMD's runtime lets a program tune, which has nothing to tune here.
-hsa_status_t hsa_amd_agent_set_async_scratch_limit(hsa_agent_t agent, size_t) {
-  return valid_agent(agent) ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR_INVALID_AGENT;
+// The scratch limit is kept as set (shared::scratch_limit): nothing here runs
+// short of scratch, but a program reads back what it asked for.
+hsa_status_t hsa_amd_agent_set_async_scratch_limit(hsa_agent_t agent, size_t bytes) {
+  if (!valid_agent(agent)) return HSA_STATUS_ERROR_INVALID_AGENT;
+  const int gpu = gpu_of(agent);
+  if (gpu < 0) return HSA_STATUS_ERROR_INVALID_AGENT;
+  return shared::set_scratch_limit(gpu, bytes) ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR_INVALID_ARGUMENT;
 }
 hsa_status_t hsa_amd_coherency_set_type(hsa_agent_t agent, int) {
   return valid_agent(agent) ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR_INVALID_AGENT;

@@ -42,6 +42,12 @@ echo "wrote $(pwd)/textures.gfx942"
   sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > cooperative.gfx942.dis
 echo "wrote $(pwd)/cooperative.gfx942, cooperative.gfx942.o and its listing ($(wc -l < cooperative.gfx942.dis) instructions)"
 
+# HIP's calls beyond the everyday ones -- device flags and UUIDs, contexts, the
+# reserved stream handles, callbacks, waiting on memory, every launch form --
+# checked against what ROCm's HIP answers.
+"$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 api.cpp -o api.gfx942
+echo "wrote $(pwd)/api.gfx942"
+
 # Streams that run at once: kernels on two streams handing values to each
 # other, events, stream waits, the null stream's ordering, host functions.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 streams.cpp -o streams.gfx942

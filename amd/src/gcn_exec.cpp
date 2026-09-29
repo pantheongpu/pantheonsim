@@ -42,6 +42,16 @@ constexpr uint32_t kSgprs = 106;      // s0 through s101 and FLAT_SCRATCH (102, 
 constexpr uint32_t kVgprs = 256;
 constexpr uint32_t kLanes = 64;
 
+// The GPU's real-time clock: a counter at a constant 100 MHz, which is what
+// the runtime reports as the wall clock rate. Taken from the host's steady
+// clock, so a kernel that waits on it for a stretch of time waits that long.
+uint64_t realtime_ticks() {
+  return static_cast<uint64_t>(
+             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                 .count()) /
+         10;
+}
+
 // Where LDS sits in the one address space a flat access uses. The hardware
 // puts it in an aperture the wave reads from src_shared_base; this model puts
 // it below every device allocation (vgpu/memory.hpp starts those at
@@ -1189,15 +1199,11 @@ struct Machine {
     } else if (op == "s_pack_hl_b32_b16"_op) {
       write_scalar(w, in.dst[0], static_cast<uint32_t>(a) >> 16 | static_cast<uint32_t>(b) << 16);
     } else if (op == "s_sendmsg_rtn_b32"_op || op == "s_sendmsg_rtn_b64"_op) {
-      // A message that answers. The one compute code asks is the time: a
-      // counter at 100 MHz, from the host's steady clock.
+      // A message that answers. The one compute code asks is the time
+      // (realtime_ticks).
       if (in.simm != 131)
         throw Error::make(Err::Unsupported, "s_sendmsg_rtn of message ", in.simm, ", which this does not answer");
-      const uint64_t ticks = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                       std::chrono::steady_clock::now().time_since_epoch())
-                                                       .count()) /
-                             10;
-      write_scalar(w, in.dst[0], ticks);
+      write_scalar(w, in.dst[0], realtime_ticks());
     } else if (scalar_float(w, in, op, a, b)) {
     } else if (op == "s_add_nc_u64"_op || op == "s_sub_nc_u64"_op || op == "s_mul_u64"_op) {
       // RDNA4's 64-bit scalar arithmetic, SCC untouched.
@@ -1269,14 +1275,18 @@ struct Machine {
   }
 
   void scalar_load(Wave& w, const Inst& in) {
-    // A counter, rather than a load. What a card returns is a clock at a
-    // fixed rate; what this returns is the instructions retired so far by the
-    // host thread running the wave, which is this model's cycle count. A wave
-    // stays on one thread, so for it the count only ever goes up, which is
-    // what a program timing a stretch of its own code depends on.
+    // Counters, rather than loads. s_memtime is the shader clock, which on a
+    // card runs with the core clock; here it is the instructions retired so
+    // far by the host thread running the wave, which is this model's cycle
+    // count. A wave stays on one thread, so for it the count only ever goes
+    // up, which is what a program timing a stretch of its own code depends
+    // on. s_memrealtime is the real-time clock (realtime_ticks), at the rate
+    // the runtime reports: a kernel waiting on it for some milliseconds, as
+    // wall_clock64() loops do, waits that long.
     if (OpName(in.name) == "s_memtime"_op || OpName(in.name) == "s_memrealtime"_op) {
-      set_sgpr(w, in.dst[0].index, static_cast<uint32_t>(stats.instructions));
-      set_sgpr(w, in.dst[0].index + 1, static_cast<uint32_t>(stats.instructions >> 32));
+      const uint64_t t = OpName(in.name) == "s_memtime"_op ? stats.instructions : realtime_ticks();
+      set_sgpr(w, in.dst[0].index, static_cast<uint32_t>(t));
+      set_sgpr(w, in.dst[0].index + 1, static_cast<uint32_t>(t >> 32));
       return;
     }
     // The scalar cache holds nothing here to write back or drop.
