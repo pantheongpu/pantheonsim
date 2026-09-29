@@ -45,6 +45,11 @@ const std::unordered_map<std::string, Sreg>& sreg_table() {
       {"%nsmid", Sreg::NSmId},
       {"%dynamic_smem_size", Sreg::DynamicSmemSize},
       {"%total_smem_size", Sreg::TotalSmemSize},
+      {"%reserved_smem_offset_begin", Sreg::ReservedSmemBegin},
+      {"%reserved_smem_offset_end", Sreg::ReservedSmemEnd},
+      {"%reserved_smem_offset_cap", Sreg::ReservedSmemCap},
+      {"%reserved_smem_offset_0", Sreg::ReservedSmemOffset0},
+      {"%reserved_smem_offset_1", Sreg::ReservedSmemOffset1},
       {"%gridid", Sreg::GridId},
       {"%clusterid.x", Sreg::ClusterIdX},
       {"%clusterid.y", Sreg::ClusterIdY},
@@ -1189,7 +1194,11 @@ class Parser {
     const std::string& w = t.text;
     if (w[0] == '%') {
       auto it = sreg_table().find(w);
-      if (it != sreg_table().end()) return SregOperand{it->second};
+      if (it != sreg_table().end()) {
+        if (cur_fn_ && it->second >= Sreg::ReservedSmemBegin && it->second <= Sreg::ReservedSmemOffset1)
+          cur_fn_->reads_reserved_smem = true;
+        return SregOperand{it->second};
+      }
       // %envreg0 .. %envreg31 all read as zero; they are only distinguished by
       // number for a driver that sets them, and this one does not.
       // %envreg0..31 is a bank the driver fills in before the launch. Which

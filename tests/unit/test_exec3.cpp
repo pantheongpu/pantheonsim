@@ -2763,6 +2763,130 @@ VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{512 + 256});
 }
 
+// The driver's reserved shared memory, where cooperative_groups keeps the
+// scratch for tiles of more than one warp. An RTX 3060 puts it straight after
+// the kernel's own shared memory, counted in 128-byte allocation units:
+// 400 static bytes and 1024 dynamic ones are 1536, so the region starts
+// there, runs 288 bytes to its end and 1 KiB to its cap. It is real memory:
+// a store through %reserved_smem_offset_1 reads back.
+VTEST(reserved_shared_memory_follows_the_kernels_own) {
+  std::string ptx = std::string(kHeader) + R"(
+.extern .shared .align 16 .b8 dyn[];
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    .shared .align 4 .b8 tile[400];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %reserved_smem_offset_begin;
+    mov.u32 %r2, %reserved_smem_offset_end;
+    mov.u32 %r3, %reserved_smem_offset_cap;
+    mov.u32 %r4, %reserved_smem_offset_0;
+    mov.u32 %r5, %reserved_smem_offset_1;
+    mov.u32 %r6, %total_smem_size;
+    add.u32 %r7, %r5, 1020;          // the last word of the reserved KiB
+    st.shared.u32 [%r7], 77;
+    ld.shared.u32 %r8, [%r7];
+    st.global.u32 [%rd2], %r1;
+    st.global.u32 [%rd2+4], %r2;
+    st.global.u32 [%rd2+8], %r3;
+    st.global.u32 [%rd2+12], %r4;
+    st.global.u32 [%rd2+16], %r5;
+    st.global.u32 [%rd2+20], %r6;
+    st.global.u32 [%rd2+24], %r8;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  cfg.shared_bytes = 1024;
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  const uint64_t want[7] = {1536, 1536 + 0x120, 1536 + 0x400, 1536, 1536, 1536, 77};
+  for (int i = 0; i < 7; ++i) VCHECK_EQ(e.mem.load_scalar(out + 4 * i, 4), want[i]);
+}
+
+// A kernel that never asks where the reserved region is keeps its shared
+// window at exactly what it declared, so an overrun is still an overrun.
+VTEST(without_the_registers_a_shared_overrun_is_still_caught) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k()
+{
+    .reg .b32 %r<4>;
+    .shared .align 4 .b8 tile[400];
+    mov.u32 %r1, tile;
+    st.shared.u32 [%r1+400], 1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], LaunchConfig{}, {}, e.mem, e.prof));
+  VCHECK(err.code() == Err::OutOfBounds);
+}
+
+// Before Ampere there is no reserved shared memory, and the registers are
+// refused rather than given made-up values.
+VTEST(reserved_shared_memory_is_refused_before_ampere) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k()
+{
+    .reg .b32 %r<4>;
+    mov.u32 %r1, %reserved_smem_offset_1;
+    ret;
+}
+)";
+  auto m = ptx::parse(ptx);
+  MemoryManager mem{1 << 20};
+  DeviceProfile prof = load_gpu("nvidia/t4");
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], LaunchConfig{}, {}, mem, prof));
+  VCHECK_CONTAINS(err.what(), "compute capability 8.0");
+}
+
+// Warp 0 spins on a shared flag only warp 1 sets. The warps of a block make
+// progress independently, so this finishes on hardware; under the
+// deterministic scheduler a turn used to end only at a barrier, and warp 0
+// spun until the step budget ran out. A long turn now ends at a loop edge.
+VTEST(a_warp_spinning_on_another_warps_flag_lets_it_run) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    .reg .pred %p<4>;
+    .shared .align 4 .b32 flag;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    setp.lt.u32 %p1, %r1, 32;
+    @!%p1 bra SET;
+    mov.u32 %r3, 0;
+SPIN:
+    add.u32 %r3, %r3, 1;
+    ld.volatile.shared.u32 %r2, [flag];
+    setp.eq.u32 %p2, %r2, 0;
+    @%p2 bra SPIN;
+    setp.eq.u32 %p3, %r1, 0;
+    @%p3 st.global.u32 [%rd2], %r2;
+    ret;
+SET:
+    setp.eq.u32 %p3, %r1, 32;
+    @%p3 st.volatile.shared.u32 [flag], 42;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{42});
+}
+
 VTEST(fp8_e4m3_and_e5m2_are_different_formats) {
   // The two FP8 formats are not one shape with a different bias. e4m3 spends
   // its top exponent on ordinary numbers -- it has NO infinity -- so its
