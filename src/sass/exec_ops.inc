@@ -45,6 +45,7 @@ bool executes(const Instr& ins) {
     case Op::USEL: case Op::USHF: case Op::VABSDIFF4: case Op::VIADD: case Op::VIMNMX: case Op::VIADDMNMX:
     case Op::VIMNMX3: case Op::IADD: case Op::UP2UR: case Op::ELECT: case Op::USETMAXREG: case Op::WARPGROUP:
     case Op::FMNMX3: case Op::STSM: case Op::RPCMOV: case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
+      return true;
     case Op::UTMALDG:
       return !ins.f[6];   // not im2col::w or ::w::128, which the PTX engine does not run either
     case Op::SYNCS: case Op::ARRIVES: case Op::UTMASTG: case Op::UTMAREDG: case Op::UBLKCP:
