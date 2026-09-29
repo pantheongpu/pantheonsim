@@ -2503,22 +2503,23 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       return true;
     }
     case Op::CALL: {
-      const bool abs = ins.f[0], reg_rel = ins.f[1];
+      const bool abs = ins.f[0], reg_rel = ins.f[1], abs_imm = ins.f[2];
       bool handled = false;
+      const auto target_of = [&](unsigned l) -> uint64_t {
+        if (abs_imm) return static_cast<uint64_t>(ins.src[0].imm);
+        if (abs) {
+          const unsigned r = ins.src[0].reg;
+          return w.reg(r, l) | (static_cast<uint64_t>(w.reg(r + 1, l)) << 32);
+        }
+        if (reg_rel) return base_of(l) + static_cast<uint64_t>(ins.src[0].imm) + w.reg(ins.src[0].reg, l);
+        return base_of(l) + static_cast<uint64_t>(ins.src[0].imm);
+      };
       each_lane(group, [&](unsigned l) {
         if (!((ex >> l) & 1)) {
           w.pc[l] += 16;
           return;
         }
-        uint64_t target;
-        if (abs) {
-          const unsigned r = ins.src[0].reg;
-          target = w.reg(r, l) | (static_cast<uint64_t>(w.reg(r + 1, l)) << 32);
-        } else if (reg_rel) {
-          target = base_of(l) + static_cast<uint64_t>(ins.src[0].imm) + w.reg(ins.src[0].reg, l);
-        } else {
-          target = base_of(l) + static_cast<uint64_t>(ins.src[0].imm);
-        }
+        const uint64_t target = target_of(l);
         if (const auto b = m_.builtins.find(target); b != m_.builtins.end()) {
           handled = true;
           return;   // run once for the lanes below
@@ -2529,9 +2530,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
         // A call into a function VirtualGPU provides: run it for the calling
         // lanes, then carry on after the call.
         const unsigned l0 = static_cast<unsigned>(std::countr_zero(ex));
-        const unsigned r = ins.src[0].reg;
-        const uint64_t target = w.reg(r, l0) | (static_cast<uint64_t>(w.reg(r + 1, l0)) << 32);
-        builtin_call(blk, w, ins, ex, m_.builtins.at(target));
+        builtin_call(blk, w, ins, ex, m_.builtins.at(target_of(l0)));
         each_lane(ex, [&](unsigned l) { w.pc[l] += 16; });
       }
       return true;

@@ -127,42 +127,73 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
     for (size_t i = 0; i < sizeof kBuiltins / sizeof *kBuiltins; ++i)
       m->builtins[kBuiltinBase + 16 * i] = kBuiltins[i];
 
-    // Relocations into device memory. R_CUDA_64 is the only kind cubins built
-    // by the toolkits checked here carry in data; one in code, or of another
-    // kind, is refused by name rather than left unpatched.
-    for (const CubinSection& s : c.sections) {
+    // A relocation's symbol: a variable, a function VirtualGPU provides, a
+    // function's code, or a section. *in_code is set for code, whose offset
+    // in its section is *code_off.
+    const auto resolve = [&](const std::string& name, bool* in_code, uint64_t* code_off) -> uint64_t {
+      *in_code = false;
+      if (const auto v = m->symbol_va.find(name); v != m->symbol_va.end()) return v->second;
+      for (const auto& [addr, b] : m->builtins)
+        if (b == name) return addr;
+      for (const CubinSymbol& sym : c.symbols) {
+        if (sym.name != name || sym.section.empty()) continue;
+        if (const auto code = m->code_index.find(sym.section); code != m->code_index.end()) {
+          *in_code = true;
+          *code_off = sym.value;
+          return m->code[code->second].base + sym.value;
+        }
+        if (const auto sec = section_va.find(sym.section); sec != section_va.end()) return sec->second + sym.value;
+      }
+      throw Error(Err::NotFound, "cubin: relocation against unknown symbol " + name);
+    };
+
+    // Relocations. In data, R_CUDA_64 (2): an address. In code, which CUDA
+    // 12.0's ptxas writes for addresses CUDA 13's loads from bank 4: the low
+    // (56) or high (57) half of one in a MOV's 32-bit immediate, and a
+    // CALL.ABS.NOINC's target, 49 bits at 32 (58), or from sm_90 in 4-byte
+    // units at 16-23 and 34-80 (75). A function's own code is
+    // addressed relative to its section (nvdisasm's @srel), as RET takes its
+    // return address. Any other kind is refused by name rather than left
+    // unpatched.
+    for (CubinSection& s : m->cubin.sections) {
       if (s.relocs.empty() || s.name == ".debug_frame") continue;
+      const bool code = m->code_index.count(s.name) != 0;
       const auto dst = section_va.find(s.name);
-      if (dst == section_va.end())
+      if (!code && dst == section_va.end())
         throw Error(Err::UnsupportedPtx, "cubin: relocations in " + s.name + " are not supported yet");
       for (const CubinReloc& r : s.relocs) {
-        if (r.type != 2)
+        const bool known = code ? (r.type == 56 || r.type == 57 || r.type == 58 || r.type == 75) : r.type == 2;
+        if (!known)
           throw Error(Err::UnsupportedPtx,
                       "cubin: relocation type " + std::to_string(r.type) + " in " + s.name + " is not supported yet");
-        uint64_t target = 0;
-        if (const auto v = m->symbol_va.find(r.symbol); v != m->symbol_va.end()) {
-          target = v->second;
-        } else {
-          bool found = false;
-          for (const auto& [addr, name] : m->builtins)
-            if (name == r.symbol) {
-              target = addr;
-              found = true;
-            }
-          for (const CubinSymbol& sym : c.symbols)
-            if (!found && sym.name == r.symbol && !sym.section.empty()) {
-              if (const auto code = m->code_index.find(sym.section); code != m->code_index.end()) {
-                target = m->code[code->second].base + sym.value;
-                found = true;
-              } else if (const auto sec = section_va.find(sym.section); sec != section_va.end()) {
-                target = sec->second + sym.value;
-                found = true;
-              }
-            }
-          if (!found) throw Error(Err::NotFound, "cubin: relocation against unknown symbol " + r.symbol);
+        bool in_code = false;
+        uint64_t code_off = 0;
+        const uint64_t target = resolve(r.symbol, &in_code, &code_off);
+        if (!code) {
+          const uint64_t value = target + static_cast<uint64_t>(r.addend);
+          mem.write(dst->second + r.offset, &value, 8);
+          continue;
         }
-        const uint64_t value = target + static_cast<uint64_t>(r.addend);
-        mem.write(dst->second + r.offset, &value, 8);
+        if (r.offset + 16 > s.bytes.size())
+          throw Error(Err::InvalidValue, "cubin: a relocation past the end of " + s.name);
+        uint64_t hi, lo;
+        std::memcpy(&lo, &s.bytes[r.offset], 8);
+        std::memcpy(&hi, &s.bytes[r.offset + 8], 8);
+        const bool call = r.type == 58 || r.type == 75;
+        const uint64_t value = (in_code && !call ? code_off : target) + static_cast<uint64_t>(r.addend);
+        if (r.type == 58) {          // bits 32-80
+          lo = (lo & 0xffffffffull) | (value << 32);
+          hi = (hi & ~uint64_t{0x1ffff}) | ((value >> 32) & 0x1ffff);
+        } else if (r.type == 75) {   // words: the low eight bits at 16-23, the rest at 34-80
+          const uint64_t words = value >> 2;
+          lo = (lo & ~(uint64_t{0xff} << 16) & 0x3ffffffffull) | ((words & 0xff) << 16) | ((words >> 8) << 34);
+          hi = (hi & ~uint64_t{0x1ffff}) | ((words >> 8 >> 30) & 0x1ffff);
+        } else {                     // bits 32-63
+          const uint64_t half = r.type == 56 ? (value & 0xffffffffull) : (value >> 32);
+          lo = (lo & 0xffffffffull) | (half << 32);
+        }
+        std::memcpy(&s.bytes[r.offset], &lo, 8);
+        std::memcpy(&s.bytes[r.offset + 8], &hi, 8);
       }
     }
   } catch (...) {

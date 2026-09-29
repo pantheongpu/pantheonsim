@@ -1842,13 +1842,19 @@ void dec_bar(Instr& ins, const Word& w) {
 }
 
 // CALL.ABS R: to the address in a register; CALL.REL: to a relative target,
-// or (0x344) to the target plus a register, printed "R2 0x3d40" like RET.
-void dec_call(Instr& ins, const Word& w, bool abs, bool reg_rel = false) {
+// or (0x344) to the target plus a register, printed "R2 0x3d40" like RET;
+// CALL.ABS with an immediate (0x943): to the address in bits 32-80, or from
+// sm_90 in 4-byte units with its low eight bits at 16-23 and the rest at
+// 34-80, which CUDA 12.0's ptxas leaves to a relocation (a call to malloc,
+// vprintf...).
+void dec_call(Instr& ins, const Word& w, bool abs, bool reg_rel = false, bool abs_imm = false) {
   ins.op = Op::CALL;
   ins.mnemonic = "CALL";
-  ins.mods.push_back(abs ? "ABS" : "REL");
+  ins.mods.push_back(abs || abs_imm ? "ABS" : "REL");
   ins.mods.push_back("NOINC");
-  if (abs) {
+  if (abs_imm) {
+    ins.src.push_back(label(ins.sm >= 90 ? (w.field(34, 47) << 8 | w.field(16, 8)) * 4 : w.field(32, 49)));
+  } else if (abs) {
     ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
   } else if (reg_rel) {
     const unsigned r = static_cast<unsigned>(w.field(24, 8));
@@ -1859,8 +1865,9 @@ void dec_call(Instr& ins, const Word& w, bool abs, bool reg_rel = false) {
   } else {
     ins.src.push_back(label(branch_target(w, ins.pc, ins.sm)));
   }
-  ins.f[0] = abs;
+  ins.f[0] = abs || abs_imm;
   ins.f[1] = reg_rel;
+  ins.f[2] = abs_imm;
 }
 
 // RET and BRX print their register and target separated by a space, not a
@@ -3440,6 +3447,7 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
       {0x803, dec_p2r}, {0x804, dec_r2p},
       {0x948, dec_warpsync}, {0x95d, dec_nanosleep}, {0xb1d, dec_bar},
       {0x343, [](Instr& i, const Word& w) { dec_call(i, w, true); }},
+      {0x943, [](Instr& i, const Word& w) { dec_call(i, w, false, false, true); }},
       {0x944, [](Instr& i, const Word& w) { dec_call(i, w, false); }},
       {0x344, [](Instr& i, const Word& w) { dec_call(i, w, false, true); }},
       {0x348, dec_warpsync},
