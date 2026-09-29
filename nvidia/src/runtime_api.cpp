@@ -544,7 +544,11 @@ std::string extract_registered_ptx(State& s, const void* fatCubin) {
     }
     std::string linked;
     size_t pieces = 0;
-    for (size_t i = 0; relocatable && relocatable[i] && i < 64; ++i) {
+    // The bound only guards against a list that is not terminated. It was 64,
+    // and a device-linked program has a piece per translation unit: AMReX's
+    // have about 320, so every kernel past the 64th unit was "no kernel named"
+    // (and cudaGetLastError's "invalid device function").
+    for (size_t i = 0; relocatable && relocatable[i] && i < 4096; ++i) {
       try {
         auto part = vgpu::cuda::extract_ptx(relocatable[i]);
         std::string text = pick_best(part);

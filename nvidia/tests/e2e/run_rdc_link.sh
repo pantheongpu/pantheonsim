@@ -57,4 +57,35 @@ if require_shim_libs "$shim" "$tmp/multitu"; then
   [[ "$result" == *PASS* ]] || failures=$((failures + 1))
 fi
 
+# More translation units than the runtime used to link: it stopped at 64
+# pieces, so a kernel in the 65th unit or later was missing. AMReX's programs
+# have about 320. Each unit holds one kernel and its launcher.
+many="$tmp/many"
+mkdir -p "$many"
+for i in $(seq 0 69); do
+  printf '__global__ void k%d(int* o) { o[%d] = %d; }\nvoid launch%d(int* o) { k%d<<<1, 1>>>(o); }\n' \
+    "$i" "$i" "$((i * 3 + 1))" "$i" "$i" > "$many/u$i.cu"
+done
+{
+  echo '#include <cstdio>'
+  for i in $(seq 0 69); do echo "void launch$i(int*);"; done
+  echo 'int main() {'
+  echo '  int* d; cudaMalloc(&d, 70 * sizeof(int)); cudaMemset(d, 0, 70 * sizeof(int));'
+  for i in $(seq 0 69); do echo "  launch$i(d);"; done
+  echo '  int h[70]; cudaMemcpy(h, d, sizeof h, cudaMemcpyDeviceToHost);'
+  echo '  int bad = cudaGetLastError() != cudaSuccess;'
+  echo '  for (int i = 0; i < 70; ++i) if (h[i] != i * 3 + 1) { std::printf("FAIL unit %d: %d\n", i, h[i]); ++bad; }'
+  echo '  std::printf(bad ? "FAILED\n" : "PASS\n"); return bad; }'
+} > "$many/main.cu"
+ls "$many"/u*.cu "$many/main.cu" | xargs -P 4 -I{} sh -c \
+  'nvcc -std=c++17 -cudart shared -rdc=true -arch=compute_80 -code=compute_80 -Wno-deprecated-gpu-targets '"$(shim_sanitizer_nvcc_flags "$shim")"' -c "$1" -o "${1%.cu}.o"' _ {}
+nvcc -std=c++17 -cudart shared -rdc=true -arch=compute_80 -code=compute_80 \
+     -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") \
+     "$many"/*.o -o "$many/prog"
+if require_shim_libs "$shim" "$many/prog"; then
+  result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/a100 LD_LIBRARY_PATH="$shim" "$many/prog" 2>&1)" || true
+  echo "rdc 71 translation units: $(printf '%s' "$result" | tail -1)"
+  [[ "$result" == *PASS* ]] || failures=$((failures + 1))
+fi
+
 exit $failures
