@@ -337,7 +337,7 @@ class Parser {
         // nobody calls had no body. Execution reports it if it is ever
         // reached, which is the point at which it actually matters.
         auto it = by_name.find(call->callee);
-        if (it != by_name.end()) call->target = it->second;
+        if (it != by_name.end()) call->target = it->second.get();
       }
     };
     for (auto& e : m.entries) fix(e, /*with_tables=*/true);
