@@ -323,6 +323,67 @@ VTEST(vector_param_accesses_through_call_slots) {
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), 200321ull);
 }
 
+VTEST(running_off_the_end_of_a_function_returns) {
+  // A kernel and a .func whose last block ends without ret. Lanes that run
+  // off the end of the .func return to the caller with the value they stored
+  // (lane 3), and lanes that run off the end of the kernel exit. An RTX 3060
+  // runs this PTX to 0 2 104 106. nvcc emits kernels like this after a call
+  // whose result nothing uses (Boost.Math's inverse Gaussian quantile).
+  std::string ptx = std::string(kHeader) + R"(
+.func (.param .b32 r) f(.param .b32 v)
+{
+    .reg .pred %q;
+    .reg .b32 %t<3>;
+    ld.param.b32 %t1, [v];
+    shl.b32 %t2, %t1, 1;
+    st.param.b32 [r], %t2;
+    setp.eq.u32 %q, %t1, 3;
+    @%q bra FEND;
+    ret;
+FEND:
+}
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd2, %rd2, %rd3;
+    {
+    .param .b32 param0;
+    st.param.b32 [param0], %r1;
+    .param .b32 retval0;
+    call.uni (retval0), f, (param0);
+    ld.param.b32 %r2, [retval0];
+    }
+    st.global.u32 [%rd2], %r2;
+    setp.lt.u32 %p1, %r1, 2;
+    @%p1 bra DONE;
+    add.u32 %r3, %r2, 100;
+    st.global.u32 [%rd2], %r3;
+    bra.uni END;
+DONE:
+    ret;
+END:
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  std::vector<uint8_t> zero(16, 0);
+  e.mem.write(out, zero.data(), 16);
+  LaunchConfig cfg;
+  cfg.block = {4, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), 0ull);
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), 2ull);
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), 104ull);
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), 106ull);
+}
+
 VTEST(module_global_string_and_symbols) {
   // "AB" + zero padding, read through a symbol address.
   std::string ptx = std::string(kHeader) + R"(

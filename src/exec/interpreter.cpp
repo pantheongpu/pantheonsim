@@ -1693,9 +1693,10 @@ class Interpreter {
         return;
       }
       size_t idx = select_path(w);
-      if (w.paths[idx].pc >= cur_->body.size())
-        throw Error::make(Err::PtxParse, "control fell off the end of '", cur_->name,
-                          "' (missing ret)");
+      if (w.paths[idx].pc >= cur_->body.size()) {
+        exec_ret(w, ctx, implicit_ret(), idx, w.paths[idx].mask);
+        continue;
+      }
       const Instr& ins = cur_->body[w.paths[idx].pc];
       if (progress_ && (stats_.instructions & 0xFFFFF) == 0) report_progress();
       // Warp-level issue count, plus the per-lane total: their ratio is the
@@ -11307,6 +11308,19 @@ class Interpreter {
   // buffer: each lane passes its own arguments, so there is no single set of
   // bytes to read them from. The caller has already written its slots with
   // st.param; this binds them to the names the callee's body reads.
+  // Running off the end of a function is a return. nvcc emits kernels whose
+  // last block ends without one, after a call whose result nothing uses
+  // (Boost.Math's inverse Gaussian quantile), and a .func can end the same
+  // way; an RTX 3060 returns from both, the .func with its return value.
+  static const Instr& implicit_ret() {
+    static const Instr r = [] {
+      Instr i;
+      i.op = OpRet{};
+      return i;
+    }();
+    return r;
+  }
+
   void exec_user_call(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
     (void)ctx;
     const EntryFn& callee = *op.target;
