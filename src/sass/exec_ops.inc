@@ -1820,12 +1820,15 @@ void Runner::exec_warp(Block&, Warp& w, const Instr& ins, Mask ex, Mask) {
 // order; f64 a chain of fused multiply-adds; integers exact, .SAT clamping
 // after every 128 bits of K; 1-bit ones counting .AND/.XOR bits.
 namespace {
-enum class MmaT { F16, BF16, TF32, S8, U8, S4, U4, B1, F64, E4M3, E5M2 };
+// E3M2, E2M3 and E2M1 each in a byte (QMMA, mma.sync .kind::f8f6f4: the
+// FP6 in bits 0-5, FP4 in 2-5); E2M1P packed two to a byte (OMMA).
+enum class MmaT { F16, BF16, TF32, S8, U8, S4, U4, B1, F64, E4M3, E5M2, E3M2, E2M3, E2M1, E2M1P };
 unsigned mma_bits(MmaT t) {
   switch (t) {
     case MmaT::F16: case MmaT::BF16: return 16;
     case MmaT::S8: case MmaT::U8: case MmaT::E4M3: case MmaT::E5M2: return 8;
-    case MmaT::S4: case MmaT::U4: return 4;
+    case MmaT::E3M2: case MmaT::E2M3: case MmaT::E2M1: return 8;
+    case MmaT::S4: case MmaT::U4: case MmaT::E2M1P: return 4;
     case MmaT::B1: return 1;
     case MmaT::F64: return 64;
     default: return 32;
@@ -1842,6 +1845,10 @@ double mma_elem(MmaT t, uint64_t v, unsigned e) {
     case MmaT::S8: return static_cast<int8_t>(v >> (8 * e));
     case MmaT::E4M3: return exec::fp8_value(static_cast<uint32_t>(v >> (8 * e)), false);
     case MmaT::E5M2: return exec::fp8_value(static_cast<uint32_t>(v >> (8 * e)), true);
+    case MmaT::E3M2: return exec::mx_float_value(static_cast<uint32_t>(v >> (8 * e)) & 0x3F, 3, 2, 3);
+    case MmaT::E2M3: return exec::mx_float_value(static_cast<uint32_t>(v >> (8 * e)) & 0x3F, 2, 3, 1);
+    case MmaT::E2M1: return exec::mx_float_value(static_cast<uint32_t>(v >> (8 * e + 2)) & 0xF, 2, 1, 1);
+    case MmaT::E2M1P: return exec::mx_float_value(static_cast<uint32_t>(v >> (4 * e)) & 0xF, 2, 1, 1);
     case MmaT::U8: return static_cast<uint8_t>(v >> (8 * e));
     case MmaT::S4: return static_cast<int8_t>(static_cast<uint8_t>(((v >> (4 * e)) & 0xf) << 4)) >> 4;
     case MmaT::U4: return static_cast<double>((v >> (4 * e)) & 0xf);
@@ -2215,12 +2222,16 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
       sat = ins.f[6];
       break;
     }
-    case Op::QMMA:   // m16n8k32, FP8 A and B, products and sums in f32
-      K = 32;
-      at = ins.f[1] ? MmaT::E5M2 : MmaT::E4M3;
-      bt = ins.f[2] ? MmaT::E5M2 : MmaT::E4M3;
+    case Op::QMMA: {   // m16n8k32 (OMMA and .SP: k64), products and sums in f32
+      static const MmaT types[] = {MmaT::E4M3, MmaT::E5M2, MmaT::E4M3, MmaT::E3M2, MmaT::E2M3,
+                                   MmaT::E2M1, MmaT::E4M3, MmaT::E4M3, MmaT::E2M1P};
+      const bool scaled = ins.mnemonic == "OMMA" || (ins.mods.size() && ins.mods[0] == "SF");
+      K = scaled && (ins.f[3] || ins.f[4]) ? 64 : 32;
+      at = types[std::min(ins.f[1], 8u)];
+      bt = types[std::min(ins.f[2], 8u)];
       acc = ins.f[0] ? AccF32 : AccF16;
       break;
+    }
     case Op::DMMA:
       M = 8;
       K = 4;
@@ -2254,7 +2265,33 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
   };
   std::vector<double> A(M * K, 0.0), B(K * kN, 0.0);
   double C[16 * kN] = {};
-  const bool sparse = (ins.op == Op::HMMA || ins.op == Op::IMMA) && ins.f[3];
+  // The block-scaled forms (QMMA.SF, OMMA.SF): one factor per row of A and
+  // column of B for each K/vec block, picked as the PTX engine picks them
+  // (row i of A from lane 4(i % 8) + 2 tid-a + i / 8, column j of B from
+  // lane 4j + tid-b, byte bid + block), UE8M0 2^(v - 127) or unsigned UE4M3.
+  const bool block_scaled = ins.op == Op::QMMA && !ins.mods.empty() && ins.mods[0] == "SF";
+  unsigned scale_vec = 1;
+  double SA[16][4] = {}, SB[8][4] = {};
+  if (block_scaled) {
+    const bool sp_form = ins.f[3];
+    scale_vec = ins.f[5];
+    const Operand& sel_op = ins.src[5];
+    const uint32_t sel = sel_op.reg >= (m_.sm >= 100 ? 255u : 63u) ? 0 : w.ur[sel_op.reg];
+    const unsigned bida = sel & 3, tida = sel >> 2 & 1, bidb = sel >> 3 & 3, tidb = sel >> 5 & 3;
+    const unsigned rsa = ins.src[3].reg + (sp_form ? 1 : 0), rsb = ins.src[4].reg;
+    const auto factor = [&](uint32_t byte) {
+      if (ins.f[6]) return exec::fp8_value(byte & 0x7F, false);
+      return byte == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, static_cast<int>(byte) - 127);
+    };
+    const auto lane_reg = [&](unsigned r, unsigned l) -> uint32_t { return r == kRZ ? 0 : w.reg(r, l); };
+    for (unsigned i = 0; i < 16; ++i)
+      for (unsigned b = 0; b < scale_vec; ++b)
+        SA[i][b] = factor(lane_reg(rsa, 4 * (i % 8) + 2 * tida + i / 8) >> (8 * (bida + b)) & 0xFF);
+    for (unsigned j = 0; j < 8; ++j)
+      for (unsigned b = 0; b < scale_vec; ++b)
+        SB[j][b] = factor(lane_reg(rsb, 4 * j + tidb) >> (8 * (bidb + b)) & 0xFF);
+  }
+  const bool sparse = (ins.op == Op::HMMA || ins.op == Op::IMMA || block_scaled) && ins.f[3];
   if (sparse) {
     // Structured-sparse A (mma.sp): each row holds half its K columns, in
     // chunks placed by the metadata register's nibbles -- the PTX engine's
@@ -2331,8 +2368,11 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
         });
       } else {
         float a = static_cast<float>(C[i * kN + j]);
+        const unsigned sblock = K / scale_vec;
         for (unsigned k = 0; k < K; ++k) {
-          const float prod = static_cast<float>(A[i * K + k]) * static_cast<float>(B[k * kN + j]);
+          const float prod = block_scaled ? static_cast<float>(A[i * K + k] * SA[i][k / sblock]) *
+                                                static_cast<float>(B[k * kN + j] * SB[j][k / sblock])
+                                          : static_cast<float>(A[i * K + k]) * static_cast<float>(B[k * kN + j]);
           a = a + prod;
         }
         D[i * kN + j] = a;

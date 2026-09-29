@@ -1462,20 +1462,66 @@ void dec_imma(Instr& ins, const Word& w) {
   sparse_meta(ins, w, sp);
 }
 
-// QMMA (sm_89): FP8 A and B. 77 an F32 accumulator (else F16), 78 and 79
-// A and B are E5M2 (else E4M3).
+// QMMA's element types (sm_89 FP8; sm_120 adds FP6 and FP4, each in a byte):
+// A's code is 78 + 2x82 + 4x83, B's 79 + 2x84 + 4x85.
+const char* const kQmmaType[] = {"E4M3", "E5M2", "(2)", "E3M2", "E2M3", "E2M1", "(6)", "(7)"};
+unsigned qmma_a_type(const Word& w) { return static_cast<unsigned>(w.bit(78) | w.bit(82) << 1 | w.bit(83) << 2); }
+unsigned qmma_b_type(const Word& w) { return static_cast<unsigned>(w.bit(79) | w.bit(84) << 1 | w.bit(85) << 2); }
+
+// QMMA (sm_89): FP8 A and B (FP6 and FP4 too from sm_120). 77 an F32
+// accumulator (else F16).
 void dec_qmma(Instr& ins, const Word& w) {
   ins.op = Op::QMMA;
   ins.mnemonic = "QMMA";
   ins.mods.push_back(w.field(74, 2) == 3 ? "16832" : "(shape " + std::to_string(w.field(74, 2)) + ")");
   ins.mods.push_back(w.bit(77) ? "F32" : "F16");
-  ins.mods.push_back(w.bit(78) ? "E5M2" : "E4M3");
-  ins.mods.push_back(w.bit(79) ? "E5M2" : "E4M3");
+  ins.mods.push_back(kQmmaType[qmma_a_type(w)]);
+  ins.mods.push_back(kQmmaType[qmma_b_type(w)]);
   ins.f[0] = w.bit(77);
-  ins.f[1] = w.bit(78);
-  ins.f[2] = w.bit(79);
+  ins.f[1] = qmma_a_type(w);
+  ins.f[2] = qmma_b_type(w);
   if (ins.sm >= 120) mma_regs(ins, w);   // sm_120 prints no layouts
   else mma_regs(ins, w, ".ROW", ".COL");
+}
+
+// QMMA.SF and OMMA.SF (sm_120, 0x47a and 0x47f): block-scaled MMA
+// (mma.sync ... .block_scale). QMMA.SF is m16n8k32 over the QMMA types with
+// a UE8M0 factor per row of A and column of B; OMMA.SF m16n8k64 over packed
+// E2M1, 82-83 its factors (2 UE8M0 per row or column, 1 UE4M3 four). 80
+// .SP: A is structured-sparse (m16n8k64), its metadata the register at 40
+// and A's factors the next one. A's factors at 40 (else), B's at 52; the
+// uniform register at 60-62 + 73-77 holds the selectors: byte-id-a in bits
+// 0-1, thread-id-a 2, byte-id-b 3-4, thread-id-b 5-6. 48-49 .SP's selector.
+void dec_mma_sf(Instr& ins, const Word& w, bool omma) {
+  ins.op = Op::QMMA;
+  ins.mnemonic = omma ? "OMMA" : "QMMA";
+  const bool sp = w.bit(80);
+  const unsigned sf = omma ? static_cast<unsigned>(w.field(82, 2)) : 0;
+  ins.mods.push_back("SF");
+  if (sp) ins.mods.push_back("SP");
+  ins.mods.push_back(omma || sp ? "16864" : "16832");
+  ins.mods.push_back("F32");
+  ins.mods.push_back(omma ? "E2M1" : kQmmaType[qmma_a_type(w)]);
+  ins.mods.push_back(omma ? "E2M1" : kQmmaType[qmma_b_type(w)]);
+  if (sf == 1) {
+    ins.mods.push_back("UE4M3");
+    ins.mods.push_back("4X");
+  } else {
+    ins.mods.push_back("E8");
+  }
+  mma_regs(ins, w);
+  ins.src.push_back(R(static_cast<unsigned>(w.field(40, 8))));
+  ins.src.push_back(R(static_cast<unsigned>(w.field(52, 8))));
+  ins.src.push_back(UR(static_cast<unsigned>(w.field(60, 3) | w.field(73, 5) << 3), ins.sm));
+  if (sp) ins.src.push_back(Imm(w.field(48, 2)));
+  ins.f[0] = 1;
+  ins.f[1] = omma ? 8 : qmma_a_type(w);   // 8: packed E2M1
+  ins.f[2] = omma ? 8 : qmma_b_type(w);
+  ins.f[3] = sp;
+  ins.f[4] = omma;
+  ins.f[5] = omma ? (sf == 1 ? 4 : 2) : 1;   // factors per row of A / column of B
+  ins.f[6] = sf == 1;                         // UE4M3 factors (else UE8M0)
+  ins.f[7] = static_cast<uint32_t>(w.field(48, 2));
 }
 
 // BMMA: 1-bit matrices; 76 .AND (else .XOR), shape from 75 and 85-86.
@@ -3517,7 +3563,9 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
       {0x84c, dec_uvirtcount}, {0x3ca, dec_ugetnextworkid},
       {0x356, dec_bmov}, {0x355, dec_bmov_r}, {0x958, dec_brxu}, {0xfae, dec_ldgsts}, {0x83b, dec_ldsm}, {0x9af, dec_ldgdepbar},
       {0xabb, dec_uldc_idx},
-      {0x23c, dec_hmma}, {0x27a, dec_qmma}, {0x237, dec_imma}, {0x23d, dec_bmma}, {0x23f, dec_dmma}, {0x23a, dec_movm},
+      {0x23c, dec_hmma}, {0x27a, dec_qmma},
+      {0x47a, [](Instr& i, const Word& w) { dec_mma_sf(i, w, false); }},
+      {0x47f, [](Instr& i, const Word& w) { dec_mma_sf(i, w, true); }}, {0x237, dec_imma}, {0x23d, dec_bmma}, {0x23f, dec_dmma}, {0x23a, dec_movm},
       // The same without the uniform-register field.
       {0x380, [](Instr& i, const Word& w) { dec_gmem(i, w, Op::LD, "LD", false); }},
       {0x381, [](Instr& i, const Word& w) { dec_gmem(i, w, Op::LDG, "LDG", false); }},

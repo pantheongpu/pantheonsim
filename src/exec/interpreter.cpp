@@ -11072,6 +11072,7 @@ std::optional<uint64_t> surface_address(const TextureDesc& d, const SurfaceAcces
 // ---- FP8, for the SASS executor (vgpu/exec/numerics.hpp) ----
 
 double fp8_value(uint32_t byte, bool e5m2) { return fp8_to_double(byte & 0xFF, e5m2 ? kE5M2 : kE4M3); }
+double mx_float_value(uint32_t code, int eb, int mb, int bias) { return small_float_value(code, eb, mb, bias); }
 uint32_t fp8_bits(double v, bool e5m2, bool satfinite) { return double_to_fp8(v, e5m2 ? kE5M2 : kE4M3, satfinite); }
 
 void validate_launch(const ptx::EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& profile) {

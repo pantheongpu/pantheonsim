@@ -23,6 +23,9 @@ std::optional<ptx::Type> tensor_reduce_type(TmapType t, ptx::AtomOp op);
 
 // FP8: e4m3 (no infinity, max 448) or e5m2 (IEEE-shaped, max 57344).
 double fp8_value(uint32_t byte, bool e5m2);
+// The OCP MX small floats (e2m3, e3m2, e2m1): `eb` exponent and `mb`
+// mantissa bits under `bias`, the sign above them; no infinity or NaN.
+double mx_float_value(uint32_t code, int eb, int mb, int bias);
 // Round to nearest even; .satfinite clamps to the largest finite value
 // instead of giving infinity or NaN.
 uint32_t fp8_bits(double v, bool e5m2, bool satfinite);
