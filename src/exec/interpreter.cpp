@@ -462,6 +462,16 @@ struct Warp {
       size = sz ? sz : 8;
       bytes.assign(static_cast<size_t>(size) * lanes, 0);
     }
+    // At least `need` bytes a lane, keeping what every lane already holds.
+    void fit(uint32_t need, uint32_t lanes) {
+      if (!bytes.empty() && size >= need) return;
+      Slot grown;
+      grown.reset(bytes.empty() || size < need ? need : size, lanes);
+      for (uint32_t lane = 0; lane < lanes && !bytes.empty(); ++lane)
+        std::memcpy(grown.bytes.data() + static_cast<size_t>(lane) * grown.size,
+                    bytes.data() + static_cast<size_t>(lane) * size, size);
+      *this = std::move(grown);
+    }
     uint64_t read(uint32_t lane, uint32_t off, uint32_t nbytes) const {
       uint64_t v = 0;
       const size_t base = static_cast<size_t>(lane) * size + off;
@@ -5063,8 +5073,18 @@ class Interpreter {
       p = (p & ~m) | (~s & m);
       return;
     }
+    // A .param declaration belongs to the lanes that run it. Every call site
+    // names its slots param0, retval0 and so on, and a warp's diverged paths
+    // can interleave: a path starved long enough is boosted, and the boost can
+    // end between its st.param and its call. Clearing the slot for the whole
+    // warp there wiped the waiting lanes' arguments (Boost.Math's ibetac, with
+    // lanes of one warp in different series).
     if (const auto* op = std::get_if<OpDeclSlot>(&ins.op)) {
-      w.slots[op->name].reset(op->size, W_);
+      Warp::Slot& slot = w.slots[op->name];
+      slot.fit(op->size ? op->size : 8u, W_);
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane))
+          std::memset(slot.bytes.data() + static_cast<size_t>(lane) * slot.size, 0, slot.size);
       return;
     }
     if (const auto* op = std::get_if<OpStSlot>(&ins.op)) {
@@ -5074,15 +5094,7 @@ class Interpreter {
       const uint32_t nbytes = op->ty.bytes() ? op->ty.bytes() : 4u;
       // A slot written before it was declared (or wider than declared) grows
       // to fit rather than dropping the write silently.
-      const uint32_t need = static_cast<uint32_t>(op->offset) + nbytes;
-      if (slot.bytes.empty() || slot.size < need) {
-        Warp::Slot grown;
-        grown.reset(slot.size < need ? need : slot.size, W_);
-        for (uint32_t lane = 0; lane < W_ && !slot.bytes.empty(); ++lane)
-          std::memcpy(grown.bytes.data() + static_cast<size_t>(lane) * grown.size,
-                      slot.bytes.data() + static_cast<size_t>(lane) * slot.size, slot.size);
-        slot = std::move(grown);
-      }
+      slot.fit(static_cast<uint32_t>(op->offset) + nbytes, W_);
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane))
           slot.write(lane, static_cast<uint32_t>(op->offset), nbytes,
@@ -11308,7 +11320,16 @@ class Interpreter {
     }
     restore();
     w.slots = std::move(saved_slots);
-    if (have_ret && !op.retval_slot.empty()) w.slots[op.retval_slot] = retval;
+    // Only the calling lanes' return values: another path's lanes may have a
+    // result in the same-named slot that they have not loaded yet.
+    if (have_ret && !op.retval_slot.empty()) {
+      Warp::Slot& out = w.slots[op.retval_slot];
+      out.fit(retval.size, W_);
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane))
+          std::memcpy(out.bytes.data() + static_cast<size_t>(lane) * out.size,
+                      retval.bytes.data() + static_cast<size_t>(lane) * retval.size, retval.size);
+    }
   }
 
   static constexpr uint32_t kMaxCallDepth = 256;
