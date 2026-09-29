@@ -12,6 +12,7 @@ static const Expected kExpected[] = {
 #include "ptx_forms_expected.inc"
 };
 constexpr int kN = 256;
+#define CUDA_VER (__CUDACC_VER_MAJOR__ * 10 + __CUDACC_VER_MINOR__)
 __global__ void k(int v, const unsigned* in, unsigned* out) {
   const int i = threadIdx.x;
   const unsigned a = in[3 * i], b = in[3 * i + 1], c = in[3 * i + 2];
@@ -132,14 +133,22 @@ __global__ void k(int v, const unsigned* in, unsigned* out) {
     case 112: asm volatile("{ .reg .f32 a,b; mov.b32 a, %1; mov.b32 b, %2; cvt.rz.f16x2.f32 %0, a, b; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
     case 113: asm volatile("{ .reg .f32 a,b; mov.b32 a, %1; mov.b32 b, %2; cvt.rn.relu.f16x2.f32 %0, a, b; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
     case 114: asm volatile("{ .reg .f32 a,b; mov.b32 a, %1; mov.b32 b, %2; cvt.rz.relu.f16x2.f32 %0, a, b; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
+#if CUDA_VER >= 121
     case 115: asm volatile("{ .reg .f32 a,b; mov.b32 a, %1; mov.b32 b, %2; cvt.rn.satfinite.f16x2.f32 %0, a, b; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
+#endif
+#if CUDA_VER >= 121
     case 116: asm volatile("{ .reg .f32 a,b; mov.b32 a, %1; mov.b32 b, %2; cvt.rz.relu.satfinite.f16x2.f32 %0, a, b; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
+#endif
     case 117: asm volatile("{ .reg .f32 a,b; mov.b32 a, %1; mov.b32 b, %2; cvt.rn.bf16x2.f32 %0, a, b; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
     case 118: asm volatile("{ .reg .f32 a,b; mov.b32 a, %1; mov.b32 b, %2; cvt.rz.bf16x2.f32 %0, a, b; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
     case 119: asm volatile("{ .reg .f32 a,b; mov.b32 a, %1; mov.b32 b, %2; cvt.rn.relu.bf16x2.f32 %0, a, b; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
     case 120: asm volatile("{ .reg .f32 a,b; mov.b32 a, %1; mov.b32 b, %2; cvt.rz.relu.bf16x2.f32 %0, a, b; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
+#if CUDA_VER >= 121
     case 121: asm volatile("{ .reg .f32 a,b; mov.b32 a, %1; mov.b32 b, %2; cvt.rn.satfinite.bf16x2.f32 %0, a, b; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
+#endif
+#if CUDA_VER >= 121
     case 122: asm volatile("{ .reg .f32 a,b; mov.b32 a, %1; mov.b32 b, %2; cvt.rz.relu.satfinite.bf16x2.f32 %0, a, b; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
+#endif
     case 123: asm volatile("{ .reg .f32 a; .reg .b16 h; mov.b32 a, %1; cvt.rn.relu.f16.f32 h, a; mov.b32 %0, {h, h}; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
     case 124: asm volatile("{ .reg .f32 a; .reg .b16 h; mov.b32 a, %1; cvt.rn.relu.bf16.f32 h, a; mov.b32 %0, {h, h}; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
     case 125: asm volatile("{ .reg .f32 a; mov.b32 a, %1; cvt.rna.tf32.f32 %0, a; }" : "=r"(d) : "r"(a), "r"(b), "r"(c)); break;
@@ -276,6 +285,7 @@ static const char* kTags[] = {
   "cvt.rna.tf32.f32",
   "mov.b32 f16x2",
 };
+static const int kNeeds[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 121, 121, 0, 0, 0, 0, 121, 121, 0, 0, 0, 0};
 int main(int argc, char** argv) {
   const bool print = argc > 1 && std::strcmp(argv[1], "--print") == 0;
   const int dump = argc > 2 && std::strcmp(argv[1], "--dump") == 0 ? atoi(argv[2]) : -1;
@@ -298,8 +308,14 @@ int main(int argc, char** argv) {
   cudaMalloc(&din, sizeof h);
   cudaMalloc(&dout, kN * 4);
   cudaMemcpy(din, h, sizeof h, cudaMemcpyHostToDevice);
-  int bad = 0;
+  int bad = 0, unbuilt = 0;
   for (int v = 0; v < nv; ++v) {
+    if (kNeeds[v] > CUDA_VER) {
+      if (print) { printf("    {\"%s\", 0x0ull},  // not built by this toolkit\n", kTags[v]); continue; }
+      printf("%s: not built (needs CUDA %d.%d)\n", kTags[v], kNeeds[v] / 10, kNeeds[v] % 10);
+      ++unbuilt;
+      continue;
+    }
     k<<<1, kN>>>(v, din, dout);
     if (cudaDeviceSynchronize() != cudaSuccess) { printf("variant %d (%s) failed to run\n", v, kTags[v]); return 1; }
     unsigned o[kN];
@@ -319,6 +335,7 @@ int main(int argc, char** argv) {
   }
   if (print) return 0;
   const int ne = sizeof kExpected / sizeof kExpected[0];
-  printf("%d PTX forms, %d differ\n%s\n", nv, bad, bad || ne != nv ? "FAIL" : "PASS");
+  printf("%d PTX forms, %d differ, %d not built by this toolkit\n%s\n", nv, bad, unbuilt,
+         bad || ne != nv ? "FAIL" : "PASS");
   return bad ? 1 : 0;
 }
