@@ -72,7 +72,7 @@ u="$cutlass/test/unit"
 jobs=$(cutlass_compile_jobs ${#tests[@]})
 compile() {
   local name="$1" arch="$2"
-  nvcc -std=c++17 -O1 -cudart shared -arch="$arch" -code="$arch" --expt-relaxed-constexpr \
+  nvcc -std=c++17 -O1 -cudart shared -arch="$arch" -code="$(cutlass_code "$arch")" --expt-relaxed-constexpr \
        -DCUTLASS_TARGET_NAME="\"$name\"" \
        -I "$cutlass/include" -I "$cutlass/tools/util/include" -I "$u/common" -I "$u" -I "$cutlass/test" \
        -I "$gtest/googletest/include" "$u/gemm/device/$name.cu" "$u/test_unit.cpp" \
@@ -98,7 +98,7 @@ for entry in "${tests[@]}"; do
   if ! require_shim_libs "$shim" "$work/$name"; then exit 0; fi
   # Four host threads whatever the machine has, so blocks that wait on each
   # other (the split-K semaphore) really do run at the same time.
-  result="$(VGPU_QUIET=1 VGPU_THREADS=4 VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" \
+  result="$(VGPU_QUIET=1 VGPU_SASS_LOG=1 VGPU_THREADS=4 VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" \
             "$work/$name" --gtest_filter="$filter" 2>&1 || true)"
   summary="$(grep -E '^\[  (PASSED|FAILED)  \]' <<<"$result" | head -2 | tr '\n' ' ')"
   echo "$name: $summary"
@@ -106,5 +106,6 @@ for entry in "${tests[@]}"; do
     grep -E 'FAILED|Failure|VirtualGPU|timed out' <<<"$result" | head -20
     fail=1
   fi
+  cutlass_sass_check "$name" "$result" || fail=1
 done
 exit $fail

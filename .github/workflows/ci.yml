@@ -10,6 +10,11 @@ on:
         description: "The ml job's tests, as a ctest regular expression (all of them if empty)"
         required: false
         default: ''
+      cutlass_sass:
+        description: "Build the CUTLASS tests' SASS as well as their PTX, and require the SASS to run (VGPU_CUTLASS_SASS)"
+        type: boolean
+        required: false
+        default: false
 
 # A push that lands while an earlier run is still going supersedes it; there is
 # no value in finishing a build of code nobody will look at again.
@@ -297,6 +302,8 @@ jobs:
     if: vars.ML_RUNS_ON != ''
     runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: 240
+    env:
+      VGPU_CUTLASS_SASS: ${{ inputs.cutlass_sass && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
 
