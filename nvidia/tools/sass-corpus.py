@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Gathers a SASS corpus: encodings and NVIDIA's own disassembly of them.
 
-  sass-corpus.py <arch> <out.txt> <input>...
+  sass-corpus.py [--per-shape N] <arch> <out.txt> <input>...
 
-Each input is a cubin (ELF) or anything carrying a fatbin -- an executable, a
-shared library such as PyTorch's libtorch_cuda.so. The ELF images for <arch>
+Each input is a cubin (ELF), anything carrying a fatbin -- an executable, a
+shared library such as PyTorch's libtorch_cuda.so -- or another corpus file
+(.txt), whose encodings are taken again: the way to cut a small corpus from a
+large one. The ELF images for <arch>
 (sm_86, sm_90a, ...) are extracted with cuobjdump, disassembled with nvdisasm,
 and every instruction is written as
 
@@ -119,9 +121,14 @@ def elfs_for(path, arch, tmp):
 
 
 def main():
-    if len(sys.argv) < 4:
+    global PER_SHAPE
+    args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == '--per-shape':
+        PER_SHAPE = int(args[1])
+        args = args[2:]
+    if len(args) < 3:
         sys.exit(__doc__)
-    arch, out_path, inputs = sys.argv[1], sys.argv[2], sys.argv[3:]
+    arch, out_path, inputs = args[0], args[1], args[2:]
     lines, seen, per_shape = [], set(), {}
     if os.path.exists(out_path):
         for line in open(out_path):
@@ -131,6 +138,17 @@ def main():
             per_shape[shape(text)] = per_shape.get(shape(text), 0) + 1
     added = 0
     for path in inputs:
+        if path.endswith('.txt'):
+            for line in open(path):
+                enc, _, text = line.rstrip('\n').split('\t', 2)
+                k = shape(text)
+                if enc in seen or per_shape.get(k, 0) >= PER_SHAPE:
+                    continue
+                seen.add(enc)
+                per_shape[k] = per_shape.get(k, 0) + 1
+                lines.append(f'{enc}\t0\t{text}')
+                added += 1
+            continue
         with tempfile.TemporaryDirectory() as tmp:
             for elf in elfs_for(path, arch, tmp):
                 for enc, addr, text in disassemble(elf):

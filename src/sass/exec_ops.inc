@@ -1425,7 +1425,8 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           if (ins.op != Op::ATOMS) set_pred(w, ins.dst[0], l, true);
           if (is64) write64(w, d, l, old);
           else write32(w, d, l, static_cast<uint32_t>(old));
-          if (cas && ins.f[1] == 3) write32(w, d, l, old == v ? 1 : 0);   // CAST.SPIN: whether it stored
+          // CAST.SPIN: whether it stored (ATOMS keeps the mode in f[1], ATOM in f[6]).
+          if (cas && (ins.op == Op::ATOMS ? ins.f[1] == 3 : ins.f[6] != 0)) write32(w, d, l, old == v ? 1 : 0);
         }
       });
       return;

@@ -892,13 +892,13 @@ void dec_gmem(Instr& ins, const Word& w, Op op, const char* name, bool store) {
   const int ur = w.bit(91) ? static_cast<int>(w.field(store ? 64 : 32, ureg_bits(ins.sm))) : -1;
   // Turing's generic LD/ST keep the offset at 32 unless a uniform register
   // is there (91), and a store's data at 64.
-  const bool t_generic = ins.sm < 80 && (op == Op::LD || op == Op::ST);
+  const bool t_generic = op == Op::LD || op == Op::ST;   // generic LD/ST, every architecture
   const int64_t off = t_generic && !w.bit(91) ? w.sfield(32, 24) : w.sfield(40, 24);
   // With .E the uniform register is the descriptor, not part of the address.
   const bool t_moved = t_generic && !w.bit(91);   // offset at 32, data at 64
   Operand addr = ins.sm < 80 ? sm75_gaddr(w, store ? 64 : 32, off, ins.sm)
                              : mem_addr(ra, ra64, "", e ? -1 : ur, off, ins.sm);
-  if (e) add_desc(addr, w, store ? 64 : 32, ins.sm);
+  if (e && w.bit(91)) add_desc(addr, w, store ? 64 : 32, ins.sm);
   if (store) {
     ins.src.push_back(addr);
     ins.src.push_back(R(static_cast<unsigned>(w.field(t_moved ? 64 : 32, 8)), mem_regs(size)));
@@ -1359,7 +1359,8 @@ void dec_f2fp(Instr& ins, const Word& w) {
   static const char* const dts[] = {"F16", "BF16", "(2)", "(3)", "(4)", "TF32", "E5M2", "E4M3"};
   static const char* const sts[] = {"F32", "(1)", "E5M2", "E4M3"};
   const unsigned dt = static_cast<unsigned>(w.field(76, 3)), st = static_cast<unsigned>(w.field(73, 2));
-  const unsigned mode = static_cast<unsigned>(w.field(87, 3));
+  // 89: the one-operand forms (88: its source's upper half), 87: MERGE_C.
+  const unsigned mode = w.bit(89) ? 4 : w.bit(87) ? 1 : 0;
   if (w.bit(75)) ins.mods.push_back("RELU");   // negatives become zero
   if (w.bit(90)) ins.mods.push_back("SATFINITE");
   if (ins.sm >= 89) {
@@ -1382,6 +1383,8 @@ void dec_f2fp(Instr& ins, const Word& w) {
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   if (mode == 4) {
     one_src(ins, w, kUnsigned, false);
+    if (w.bit(88)) ins.src[0].suffix = ".H1";
+    ins.f[7] = w.bit(88);
   } else {
     alu2(ins, w, kFloat);
     if (mode == 1) ins.src.push_back(R(static_cast<unsigned>(w.field(64, 8))));
@@ -1629,7 +1632,7 @@ void dec_viadd(Instr& ins, const Word& w) {
   // sm_120: 74-75 the lanes (1 S32, 2 U8x4), 80 saturating (.ISAT).
   const unsigned lanes = static_cast<unsigned>(w.field(74, 2));
   if (lanes == 1) ins.mods.push_back("S32");
-  if (lanes == 2) ins.mods.push_back("U8x4");
+  if (lanes == 2) ins.mods.push_back(w.bit(73) ? "S8x4" : "U8x4");
   if (w.bit(80)) ins.mods.push_back("ISAT");
   ins.f[0] = lanes;
   ins.f[1] = w.bit(80);
@@ -2219,7 +2222,14 @@ void dec_atom_cas(Instr& ins, const Word& w, Op op, const char* name) {
   ins.op = op;
   ins.mnemonic = name;
   if (w.bit(72)) ins.mods.push_back("E");
-  ins.mods.push_back("CAS");
+  const bool cast = w.field(87, 2) == 3;   // CAST.SPIN: reports whether it stored
+  if (cast) {
+    ins.mods.push_back("CAST");
+    ins.mods.push_back("SPIN");
+  } else {
+    ins.mods.push_back("CAS");
+  }
+  ins.f[6] = cast;
   atom_type_mods(ins, w);
   mem_order_mods(ins, w);
   evict_mods(ins, w);
@@ -2775,6 +2785,7 @@ void dec_credux(Instr& ins, const Word& w) {
   ins.f[1] = w.bit(73);
   ins.dst.push_back(UR(static_cast<unsigned>(w.field(16, 8)), ins.sm));
   ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
+  ins.src.back().reuse = reuse(w, 0);
 }
 
 // RPCMOV.32 Rpc.LO, Ra / Ra, Rpc.LO (sm_100): the return address register.
@@ -3092,11 +3103,13 @@ void dec_qspc(Instr& ins, const Word& w) {
   ins.mnemonic = "QSPC";
   ins.f[7] = 0xaa;
   if (w.bit(72)) ins.mods.push_back("E");
-  static const char* const spaces[] = {"G", "L", "S", "(3)"};
+  static const char* const spaces[] = {"G", "L", "S", "D"};   // D: a cluster's shared memory (sm_90)
   ins.mods.push_back(spaces[w.field(73, 2)]);
+  ins.f[0] = static_cast<uint32_t>(w.field(73, 2));
   ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
   ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
-  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), false, "", -1, w.sfield(40, 24), ins.sm));
+  const int ur = w.bit(11) ? static_cast<int>(w.field(32, ureg_bits(ins.sm))) : -1;   // the 0x9aa form
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), false, "", ur, w.sfield(40, 24), ins.sm));
 }
 
 void dec_errbar(Instr& ins, const Word&) {
@@ -3258,7 +3271,7 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
       {0xf8c, dec_atoms_popc},
       {0xb60, dec_tex}, {0xb66, dec_tld}, {0xb63, dec_tld4}, {0xb99, dec_suld}, {0xb9d, dec_sust},
       {0xf60, dec_tex}, {0xf66, dec_tld}, {0xf63, dec_tld4}, {0xf99, dec_suld}, {0xf9d, dec_sust},
-      {0x34e, dec_lepc}, {0x98f, dec_cctl}, {0x31c, dec_b2r}, {0x3aa, dec_qspc}, {0x9ab, dec_errbar},
+      {0x34e, dec_lepc}, {0x98f, dec_cctl}, {0x31c, dec_b2r}, {0x3aa, dec_qspc}, {0x9aa, dec_qspc}, {0x9ab, dec_errbar},
       {0x942, dec_break}, {0x95c, dec_bpt},
       {0x3a9, [](Instr& i, const Word& w) { dec_atom_cas(i, w, Op::ATOMG, "ATOMG"); }},
       {0x9a9, [](Instr& i, const Word& w) { dec_atom_cas(i, w, Op::ATOMG, "ATOMG"); }},

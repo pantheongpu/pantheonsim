@@ -4,7 +4,8 @@
 // printed it. Every mismatch is counted by opcode and the first few listed.
 //
 // VGPU_SASS_REPORT=1 prints the per-opcode counts even when all is well;
-// VGPU_SASS_CORPUS=<file> checks one file instead (a full local corpus);
+// VGPU_SASS_CORPUS=<file> checks that file in every test (a full local
+// corpus; its name gives the architecture);
 // VGPU_SASS_OP=<opcode> lists every mismatch of that opcode.
 #include <cstdlib>
 #include <fstream>
@@ -89,14 +90,27 @@ void check_corpus(const std::string& file, int sm) {
     std::fprintf(stderr, "%s (sm_%d): %zu of %zu match%s\n", path.substr(path.rfind('/') + 1).c_str(), sm, checked - bad, checked,
                  table.c_str());
   }
-  VCHECK(checked > 1000);
+  VCHECK(checked > 500);
   if (bad)
     throw vtest::Failure(std::to_string(bad) + " of " + std::to_string(checked) + " differ" + listed);
 }
 
 }  // namespace
 
+// One corpus per architecture (nvidia/tools/sass-corpora.sh): an instance of
+// every instruction shape PyTorch's cubins, this repo's tests and the probes
+// hold. The 'a' variants decode as their base architecture.
+VTEST(sm_75_decodes_as_nvdisasm_prints_it) { check_corpus("sm_75.txt", 75); }
+VTEST(sm_80_decodes_as_nvdisasm_prints_it) { check_corpus("sm_80.txt", 80); }
 VTEST(sm_86_decodes_as_nvdisasm_prints_it) { check_corpus("sm_86.txt", 86); }
+VTEST(sm_89_decodes_as_nvdisasm_prints_it) { check_corpus("sm_89.txt", 89); }
+VTEST(sm_90_decodes_as_nvdisasm_prints_it) { check_corpus("sm_90.txt", 90); }
+VTEST(sm_90a_decodes_as_nvdisasm_prints_it) { check_corpus("sm_90a.txt", 90); }
+VTEST(sm_100_decodes_as_nvdisasm_prints_it) { check_corpus("sm_100.txt", 100); }
+VTEST(sm_100a_decodes_as_nvdisasm_prints_it) { check_corpus("sm_100a.txt", 100); }
+VTEST(sm_103a_decodes_as_nvdisasm_prints_it) { check_corpus("sm_103a.txt", 103); }
+VTEST(sm_120_decodes_as_nvdisasm_prints_it) { check_corpus("sm_120.txt", 120); }
+VTEST(sm_120a_decodes_as_nvdisasm_prints_it) { check_corpus("sm_120a.txt", 120); }
 
 VTEST(fields_straddle_the_two_words) {
   sass::Word w;
