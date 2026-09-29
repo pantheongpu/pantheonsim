@@ -20,7 +20,28 @@
 
 using namespace vgpu;
 
+namespace vgpu::sass {
+bool runs_instr(const Instr& ins);   // src/sass/exec.cpp
+}
+
 namespace {
+
+// What the executor refuses on purpose, leaving a kernel to its PTX
+// (nvidia/docs/sass.md): multimem's LDGMC, TMA's im2col::w modes, R2UR.OR,
+// and the texture forms it does not implement. Anything else refused is a
+// mistake -- twice a case inserted into executes() fell through and turned
+// away most instructions, which only showed as kernels quietly running on
+// PTX.
+bool refused_on_purpose(const sass::Instr& ins) {
+  const auto has = [&](const char* m) {
+    for (const std::string& x : ins.mods)
+      if (x == m) return true;
+    return false;
+  };
+  return ins.mnemonic == "LDGMC" || (ins.mnemonic == "UTMALDG" && (has("W") || has("W128"))) ||
+         (ins.mnemonic == "R2UR" && has("OR")) || ins.mnemonic == "TEX" || ins.mnemonic == "TLD" ||
+         ins.mnemonic == "TLD4";
+}
 
 struct Tally {
   size_t ok = 0, wrong = 0, unknown = 0;
@@ -46,6 +67,8 @@ void check_corpus(const std::string& file, int sm) {
   if (!in) throw vtest::Failure("no corpus at " + path);
   std::map<std::string, Tally> by_op;
   size_t checked = 0, bad = 0;
+  std::string unexpected;   // instructions the executor refuses by mistake
+  int n_unexpected = 0;
   std::string listed;
   int shown = 0;
   for (std::string line; std::getline(in, line);) {
@@ -62,7 +85,10 @@ void check_corpus(const std::string& file, int sm) {
     std::string got;
     bool unknown = false;
     try {
-      got = sass::to_text(sass::decode(w, pc, sm));
+      const sass::Instr ins = sass::decode(w, pc, sm);
+      got = sass::to_text(ins);
+      if (!sass::runs_instr(ins) && !refused_on_purpose(ins) && n_unexpected++ < 10)
+        unexpected += "\n  refused: " + got;
     } catch (const std::exception& e) {
       got = std::string("(refused: ") + e.what() + ")";
       unknown = true;
@@ -91,6 +117,8 @@ void check_corpus(const std::string& file, int sm) {
                  table.c_str());
   }
   VCHECK(checked > 500);
+  if (n_unexpected)
+    throw vtest::Failure(std::to_string(n_unexpected) + " instructions the executor refuses by mistake" + unexpected);
   if (bad)
     throw vtest::Failure(std::to_string(bad) + " of " + std::to_string(checked) + " differ" + listed);
 }
