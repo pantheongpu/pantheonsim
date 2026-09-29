@@ -164,7 +164,7 @@ class Runner {
   uint32_t sreg(const Block& blk, const Warp& w, unsigned idx, unsigned lane) const;
 
   // ---- memory ----
-  enum class Space { Global, Shared, Local };
+  enum class Space { Global, Shared, Local, Param };
   Space classify(uint64_t generic, uint64_t* offset) const;
   void mem_read(Block& blk, Warp& w, unsigned lane, Space s, uint64_t addr, void* out, uint32_t n);
   void mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t addr, const void* in, uint32_t n);
@@ -233,7 +233,17 @@ void Runner::build_bank0(const std::vector<std::vector<uint8_t>>& args) {
     put32(nctaid + 4 * i, cfg_.grid[i]);
   }
   if (sm < 90) put64(0x18, kSharedWindow);
-  if (sm >= 90) put64(sm >= 100 ? 0x120 : 0xd0, std::min(kSharedWindow, kLocalWindow));   // where the non-global windows start
+  // Where the non-global windows start (a pointer at or past it is not
+  // global), and the parameter window: bank 0's own address before sm_90,
+  // the parameters' from it.
+  const uint64_t bound = std::min({kSharedWindow, kLocalWindow, kParamWindow});
+  if (sm >= 90) put64(sm >= 100 ? 0x120 : 0xd0, bound);
+  if (sm < 90) {
+    put64(0x40, kParamWindow);
+    put64(0x50, bound);
+  } else {
+    put64(sm >= 100 ? 0x348 : 0x198, kParamWindow + k_.param_base);
+  }
   put64(local, kLocalWindow);
   const uint32_t stack = std::max<uint32_t>({k_.min_stack, k_.frame_size, 16});
   put32(stackf, (stack + 15) & ~15u);
@@ -393,6 +403,10 @@ Runner::Space Runner::classify(uint64_t g, uint64_t* off) const {
     *off = g - kLocalWindow;
     return Space::Local;
   }
+  if (g >= kParamWindow && g < kParamWindow + (uint64_t{1} << 32)) {
+    *off = g - kParamWindow;
+    return Space::Param;
+  }
   *off = g;
   return Space::Global;
 }
@@ -419,6 +433,12 @@ void Runner::mem_read(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, v
         mem_.read(a, out, n);
       }
       return;
+    case Space::Param:
+      if (a + n > bank0_.size())
+        throw Fault("parameter read of " + std::to_string(n) + " bytes past the kernel's " +
+                    std::to_string(bank0_.size()) + "-byte constant bank");
+      std::memcpy(out, &bank0_[a], n);
+      return;
   }
 }
 
@@ -443,6 +463,8 @@ void Runner::mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, 
         mem_.write(a, in, n);
       }
       return;
+    case Space::Param:
+      throw Fault("a store into the kernel's parameters (constant memory)");
   }
 }
 
@@ -485,7 +507,7 @@ void Runner::init_block(Block& blk, uint64_t linear) {
 exec::LaunchStats Runner::run() {
   block_threads_ = cfg_.block[0] * cfg_.block[1] * cfg_.block[2];
   if (block_threads_ == 0 || block_threads_ > 1024)
-    throw Error(Err::InvalidValue, "block of " + std::to_string(block_threads_) + " threads");
+    throw Error(Err::LaunchConfig, "block of " + std::to_string(block_threads_) + " threads");
   const uint64_t blocks = static_cast<uint64_t>(cfg_.grid[0]) * cfg_.grid[1] * cfg_.grid[2];
   std::atomic<uint64_t> next{0};
   std::exception_ptr failure;
@@ -522,6 +544,11 @@ exec::LaunchStats Runner::run() {
 #endif
     }
     threads = static_cast<unsigned>(std::min<uint64_t>(threads, blocks));
+    // A kernel that can allocate while it runs (malloc/free) runs on one
+    // host thread: the allocator's table is read unlocked by every access, so
+    // an allocation in one block beside a load in another is a data race.
+    for (const std::string& e : m_.cubin.externs)
+      if (e == "malloc" || e == "free") threads = 1;
   }
   if (cfg_.cooperative) {
     // Every block resident at once, taking turns, so one may wait on another.

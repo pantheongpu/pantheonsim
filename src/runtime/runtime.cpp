@@ -884,7 +884,9 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
 void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
                         const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms) {
   if (fn.sass) {
-    // SASS: the executor for machine code (nvidia/docs/sass.md).
+    // SASS: the executor for machine code (nvidia/docs/sass.md), after the
+    // launch checks both engines make.
+    exec::validate_launch(fn, cfg, profile_);
     report_counters(ordinal_, fn.name, cfg, sass::launch(*fn.sass, fn.name, cfg, args, mem_, profile_));
     if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(ordinal_), 0.0);
     return;

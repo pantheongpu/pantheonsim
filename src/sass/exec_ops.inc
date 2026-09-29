@@ -26,12 +26,16 @@ uint32_t Runner::ival(Warp& w, const Operand& o, unsigned lane) {
 bool executes(const Instr& ins) {
   switch (ins.op) {
     case Op::HMMA: case Op::IMMA:
-      return ins.f[3] == 0;   // not the sparse forms yet
+      return true;
     case Op::TEX: case Op::TLD: case Op::TLD4: {
       const Word& w = ins.w;
-      const unsigned lod = ins.op == Op::TLD4 ? 0 : static_cast<unsigned>(w.field(87, 3));
+      const bool bw = ins.sm >= 100;   // Blackwell moves the LOD's low bit to 59 and the offsets to 56-57
+      const unsigned lod = ins.op == Op::TLD4 ? 0
+                           : bw               ? static_cast<unsigned>(w.field(59, 1) | (w.field(87, 2) << 1))
+                                              : static_cast<unsigned>(w.field(87, 3));
       if (lod == 4 || lod == 5 || (ins.op == Op::TEX && lod == 2)) return false;   // LOD clamps, bias
-      return !w.bit(76) && !(ins.op == Op::TLD4 && w.bit(77)) && !w.bit(78);        // offsets, depth compare
+      const bool offsets = bw ? w.field(56, 2) != 0 : (w.bit(76) || (ins.op == Op::TLD4 && w.bit(77)));
+      return !offsets && !w.bit(78);   // offsets, depth compare
     }
     case Op::BMSK: case Op::BREV: case Op::CS2R: case Op::FLO: case Op::IABS: case Op::IADD3: case Op::IDP:
     case Op::IMAD: case Op::IMNMX: case Op::ISETP: case Op::LEA: case Op::LOP3: case Op::MOV: case Op::P2R:
@@ -49,7 +53,9 @@ bool executes(const Instr& ins) {
     case Op::LDGSTS: case Op::LDL: case Op::LDS: case Op::LDSM: case Op::RED: case Op::ST: case Op::STG:
     case Op::STL: case Op::STS:
     case Op::MATCH: case Op::REDUX: case Op::SHFL: case Op::VOTE: case Op::VOTEU:
-    case Op::BMMA: case Op::DMMA: case Op::QMMA: case Op::MOVM: case Op::SULD: case Op::SUST:
+    case Op::MOVM:
+      return ins.f[0] == 0;   // not sm_100's U4TO8.M832: its layout is unpublished and unmeasured here
+    case Op::BMMA: case Op::DMMA: case Op::QMMA: case Op::SULD: case Op::SUST:
     case Op::BAR: case Op::BMOV: case Op::BPT: case Op::BRA: case Op::BREAK: case Op::BRX: case Op::BSSY:
     case Op::BSYNC: case Op::CALL: case Op::CCTL: case Op::DEPBAR: case Op::ERRBAR: case Op::EXIT: case Op::MEMBAR:
     case Op::NANOSLEEP: case Op::NOP: case Op::RET: case Op::YIELD:
@@ -532,9 +538,13 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         uint32_t r;
         if (ins.f[0] == 1 && ins.f[1]) {   // .S32.ISAT: saturating
           r = static_cast<uint32_t>(std::clamp<int64_t>(int64_t{static_cast<int32_t>(a)} + static_cast<int32_t>(b), INT32_MIN, INT32_MAX));
-        } else if (ins.f[0] == 2) {   // per byte, wrapping
+        } else if (ins.f[0] == 2) {   // per byte, wrapping; a negated b is negated byte by byte
+          const uint32_t braw = read32(w, ins.src[1], l);
           r = 0;
-          for (int k = 0; k < 4; ++k) r |= ((((a >> (8 * k)) & 0xff) + ((b >> (8 * k)) & 0xff)) & 0xff) << (8 * k);
+          for (int k = 0; k < 4; ++k) {
+            const uint32_t bk = (braw >> (8 * k)) & 0xff;
+            r |= ((((a >> (8 * k)) & 0xff) + (ins.src[1].neg ? 0u - bk : bk)) & 0xff) << (8 * k);
+          }
         } else {
           r = a + b;
         }
@@ -803,6 +813,9 @@ uint16_t f64_to_bf16(double d) {
 }  // namespace
 
 void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
+  // sm_120's uniform float ops compute once for the warp: on one lane, or
+  // one in place (UI2FP UR4, UR4) would convert its own result again.
+  if (ins.guard_uniform && ex) ex = Mask{1} << std::countr_zero(ex);
   const auto f32src = [&](const Operand& o, unsigned l, bool flush) {
     float f = as_f32(read32(w, o, l));
     if (flush) f = ftz(f);
@@ -1360,7 +1373,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         uint64_t off;
         const Space sp = generic ? classify(g, &off) : (off = g, Space::Global);
         addrs[l] = off;
-        space = sp == Space::Global ? 0 : sp == Space::Shared ? 1 : 2;
+        space = sp == Space::Global || sp == Space::Param ? 0 : sp == Space::Shared ? 1 : 2;
         // A 32-byte access (ENL2.256) moves two register quads.
         const auto quad = [&](const Operand& d, unsigned i) { return i < 4 ? d.reg + i : 0; };
         if (store) {
@@ -1786,6 +1799,7 @@ double mma_elem(MmaT t, uint64_t v, unsigned e) {
 // in consecutive registers from 24; SUST's data from 32. The out-of-range
 // mode (59-60) is .IGN (PTX .zero), the default (.clamp) or .TRAP.
 void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
+  if (!ex) return;   // no thread runs it: its object need not exist
   const Word& word = ins.w;
   uint64_t handle;
   if (ins.f[6]) {   // a uniform register: the handle's low word (the high one is zero)
@@ -1847,11 +1861,16 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   if (dim == 6) fault(w, ins, 0, "texture dimension 6 is not known");
   const bool layered = dim >= 4, cube = dim == 3 || dim == 7;
   const uint32_t dims = cube ? 3 : (dim & 3) + 1;
-  const unsigned lod_mode = ins.op == Op::TLD4 ? 0 : static_cast<unsigned>(word.field(87, 3));
+  // The LOD mode (87-89; from sm_100 split, its low bit at 59). A fetch's
+  // (TLD) is explicit, so sm_100's 0 means .LZ.
+  unsigned lod_mode = ins.op == Op::TLD4 ? 0
+                      : m_.sm >= 100    ? static_cast<unsigned>(word.field(59, 1) | (word.field(87, 2) << 1))
+                                        : static_cast<unsigned>(word.field(87, 3));
+  if (ins.op == Op::TLD && m_.sm >= 100 && lod_mode == 0) lod_mode = 1;
   const bool has_lod = lod_mode == 2 || lod_mode == 3 || lod_mode == 5;
   if (lod_mode == 4 || lod_mode == 5)
     fault(w, ins, 0, "texture fetches with a LOD clamp are not implemented yet", Err::UnsupportedPtx);
-  if (word.bit(76) || (ins.op == Op::TLD4 && word.bit(77)))
+  if (m_.sm >= 100 ? word.field(56, 2) != 0 : (word.bit(76) || (ins.op == Op::TLD4 && word.bit(77))))
     fault(w, ins, 0, "texture fetches with offsets are not implemented yet", Err::UnsupportedPtx);
   if (word.bit(78)) fault(w, ins, 0, "depth-compare texture fetches are not implemented yet", Err::UnsupportedPtx);
   if (ins.op == Op::TEX && lod_mode == 2)
@@ -1904,6 +1923,7 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
 
 void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
   if (ins.op == Op::MOVM) {
+    if (ins.f[0]) fault(w, ins, 0, "MOVM.U4TO8.M832 is not implemented", Err::UnsupportedPtx);
     // MOVM.16.MT88: transpose an 8x8 matrix of 16-bit elements across the
     // warp (movmatrix): lane 4g+t holds row g, columns 2t, 2t+1.
     uint16_t m[8][8];
@@ -1925,16 +1945,15 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
   unsigned rnd = 0;
   switch (ins.op) {
     case Op::HMMA: {
-      if (ins.f[3]) fault(w, ins, 0, "sparse HMMA is not implemented yet");
       static const unsigned ks[] = {8, 16, 4, 0};
-      K = ks[ins.f[0]];
+      static const unsigned sp_ks[] = {8, 16, 0, 32};   // .SP: 1688, 16816, 16832
+      K = ins.f[3] ? sp_ks[ins.f[0]] : ks[ins.f[0]];
       at = bt = ins.f[2] == 1 ? MmaT::BF16 : ins.f[2] == 2 ? MmaT::TF32 : MmaT::F16;
       if (at == MmaT::TF32 && ins.f[0] == 0) K = 8;
       acc = ins.f[1] ? AccF32 : AccF16;
       break;
     }
     case Op::IMMA: {
-      if (ins.f[3]) fault(w, ins, 0, "sparse IMMA is not implemented yet");
       const unsigned shape = ins.f[0];
       M = shape < 4 ? 8 : 16;
       const bool a4 = ins.f[4], b4 = ins.f[5];
@@ -1985,12 +2004,34 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
   };
   std::vector<double> A(M * K, 0.0), B(K * kN, 0.0);
   double C[16 * kN] = {};
-  for (unsigned r = 0; r < a_regs; ++r)
-    for (unsigned l = 0; l < 32; ++l) {
-      const unsigned g = l / 4, t = l % 4, row = g + (r % 2) * 8, col0 = t * per_reg + (r / 2) * (per_reg * 4);
-      const uint64_t v = reg(ra, r, l);
-      for (unsigned e = 0; e < per_reg; ++e) A[row * K + col0 + e] = mma_elem(at, v, e);
-    }
+  const bool sparse = (ins.op == Op::HMMA || ins.op == Op::IMMA) && ins.f[3];
+  if (sparse) {
+    // Structured-sparse A (mma.sp): each row holds half its K columns, in
+    // chunks placed by the metadata register's nibbles -- the PTX engine's
+    // hardware-checked rule (exec::mma_sparse_column).
+    uint32_t meta[32];
+    const Operand& mo = ins.src[3];
+    for (unsigned l = 0; l < 32; ++l) meta[l] = mo.reg == kRZ ? 0 : w.reg(mo.reg, l);
+    const bool tf32 = at == MmaT::TF32, int4 = bits == 4;
+    const unsigned chunk_elems = tf32 ? 2 : int4 ? 8 : 4, stored = chunk_elems / 2, cpr = per_reg / stored;
+    for (unsigned r = 0; r < a_regs / 2; ++r)
+      for (unsigned l = 0; l < 32; ++l) {
+        const unsigned g = l / 4, t = l % 4, row = g + (r % 2) * 8;
+        const uint64_t v = reg(ra, r, l);
+        for (unsigned e = 0; e < per_reg; ++e) {
+          const unsigned chunk = t * cpr + (r / 2) * 4 * cpr + e / stored;
+          const unsigned col = exec::mma_sparse_column(bits, K, ins.f[7], meta, row, chunk, e % stored);
+          if (col < K) A[row * K + col] = mma_elem(at, v, e);
+        }
+      }
+  } else {
+    for (unsigned r = 0; r < a_regs; ++r)
+      for (unsigned l = 0; l < 32; ++l) {
+        const unsigned g = l / 4, t = l % 4, row = g + (r % 2) * 8, col0 = t * per_reg + (r / 2) * (per_reg * 4);
+        const uint64_t v = reg(ra, r, l);
+        for (unsigned e = 0; e < per_reg; ++e) A[row * K + col0 + e] = mma_elem(at, v, e);
+      }
+  }
   for (unsigned r = 0; r < b_regs; ++r)
     for (unsigned l = 0; l < 32; ++l) {
       const unsigned g = l / 4, t = l % 4, row0 = t * per_reg + r * (per_reg * 4);

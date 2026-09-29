@@ -1632,6 +1632,39 @@ std::optional<uint64_t> surface_at(const TextureDesc& d, const SurfaceAccess& s)
   return layer_base + z * plane + y * row + static_cast<uint64_t>(x);
 }
 
+// Where stored element `k` of chunk `chunk` in row `row` (0-15) of a
+// structured-sparse A goes, as a column of the K-wide row: the metadata
+// rule of mma.sp, which wgmma.mma_async.sp follows for each warp's 16 rows.
+// A chunk is four elements (16- and 8-bit types, 2:4), two (tf32, 1:2) or
+// eight (int4, 4:8 in pairs), and its metadata is 4 bits, two 2-bit
+// indices of "units": an element, half a tf32 element (0b0100 and 0b1110
+// are tf32's only values), or a pair of int4 elements. Which lane of the
+// group of four carries a chunk's metadata: for 16- and 32-bit types, lane
+// 4g + H * selector + chunk / 4, four chunks of both rows to a lane, the
+// second row in the high half; for 8- and 4-bit types, a row to a lane --
+// row g from lane 4g + 2 * selector, row g + 8 from the next, chunks 8-15
+// from the pair after. H is the number of lanes holding the group's
+// metadata. All of it as an RTX 3060 (sm_86) places it.
+uint32_t sparse_column(uint32_t bits, uint32_t K, uint32_t sel, const Lanes& meta, uint32_t row,
+                              uint32_t chunk, uint32_t k) {
+  const bool tf32 = bits == 32, int4 = bits == 4, narrow = bits <= 8;
+  const uint32_t chunk_elems = tf32 ? 2 : int4 ? 8 : 4;
+  const uint32_t row_bits = tf32 ? 2 * K : int4 ? K / 2 : K;
+  const uint32_t holders = 2 * row_bits / 32;
+  const uint32_t group = row % 8, half = row / 8;
+  const uint32_t src = narrow ? 4 * group + 2 * sel + half + 2 * (chunk / 8)
+                              : 4 * group + holders * sel + chunk / 4;
+  const uint32_t shift = narrow ? (chunk % 8) * 4 : half * 16 + (chunk % 4) * 4;
+  const uint32_t nib = static_cast<uint32_t>(meta[src]) >> shift;
+  const uint32_t idx0 = nib & 3, idx1 = (nib >> 2) & 3;
+  uint32_t pos;
+  if (tf32) pos = idx0 / 2;
+  else if (int4) pos = 2 * (k < 2 ? idx0 : idx1) + k % 2;
+  else pos = k == 0 ? idx0 : idx1;
+  return chunk * chunk_elems + pos;
+}
+
+
 class Interpreter {
  public:
   Interpreter(const EntryFn& fn, const LaunchConfig& cfg, const ParamBuffer& params, MemoryManager& mem,
@@ -5794,38 +5827,6 @@ class Interpreter {
       }
     }
     return 0.0;
-  }
-
-  // Where stored element `k` of chunk `chunk` in row `row` (0-15) of a
-  // structured-sparse A goes, as a column of the K-wide row: the metadata
-  // rule of mma.sp, which wgmma.mma_async.sp follows for each warp's 16 rows.
-  // A chunk is four elements (16- and 8-bit types, 2:4), two (tf32, 1:2) or
-  // eight (int4, 4:8 in pairs), and its metadata is 4 bits, two 2-bit
-  // indices of "units": an element, half a tf32 element (0b0100 and 0b1110
-  // are tf32's only values), or a pair of int4 elements. Which lane of the
-  // group of four carries a chunk's metadata: for 16- and 32-bit types, lane
-  // 4g + H * selector + chunk / 4, four chunks of both rows to a lane, the
-  // second row in the high half; for 8- and 4-bit types, a row to a lane --
-  // row g from lane 4g + 2 * selector, row g + 8 from the next, chunks 8-15
-  // from the pair after. H is the number of lanes holding the group's
-  // metadata. All of it as an RTX 3060 (sm_86) places it.
-  static uint32_t sparse_column(uint32_t bits, uint32_t K, uint32_t sel, const Lanes& meta, uint32_t row,
-                                uint32_t chunk, uint32_t k) {
-    const bool tf32 = bits == 32, int4 = bits == 4, narrow = bits <= 8;
-    const uint32_t chunk_elems = tf32 ? 2 : int4 ? 8 : 4;
-    const uint32_t row_bits = tf32 ? 2 * K : int4 ? K / 2 : K;
-    const uint32_t holders = 2 * row_bits / 32;
-    const uint32_t group = row % 8, half = row / 8;
-    const uint32_t src = narrow ? 4 * group + 2 * sel + half + 2 * (chunk / 8)
-                                : 4 * group + holders * sel + chunk / 4;
-    const uint32_t shift = narrow ? (chunk % 8) * 4 : half * 16 + (chunk % 4) * 4;
-    const uint32_t nib = static_cast<uint32_t>(meta[src]) >> shift;
-    const uint32_t idx0 = nib & 3, idx1 = (nib >> 2) & 3;
-    uint32_t pos;
-    if (tf32) pos = idx0 / 2;
-    else if (int4) pos = 2 * (k < 2 ? idx0 : idx1) + k % 2;
-    else pos = k == 0 ? idx0 : idx1;
-    return chunk * chunk_elems + pos;
   }
 
   // mma.sync (9.7.16.5). A, B, C and D are held as full tiles, filled from
@@ -10867,5 +10868,16 @@ std::optional<uint64_t> surface_address(const TextureDesc& d, const SurfaceAcces
 
 double fp8_value(uint32_t byte, bool e5m2) { return fp8_to_double(byte & 0xFF, e5m2 ? kE5M2 : kE4M3); }
 uint32_t fp8_bits(double v, bool e5m2, bool satfinite) { return double_to_fp8(v, e5m2 ? kE5M2 : kE4M3, satfinite); }
+
+void validate_launch(const ptx::EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& profile) {
+  validate(fn, cfg, profile);
+}
+
+uint32_t mma_sparse_column(uint32_t bits, uint32_t K, uint32_t sel, const uint32_t meta[32], uint32_t row,
+                           uint32_t chunk, uint32_t k) {
+  Lanes m{};
+  for (int i = 0; i < 32; ++i) m[i] = meta[i];
+  return sparse_column(bits, K, sel, m, row, chunk, k);
+}
 
 }  // namespace vgpu::exec
