@@ -418,7 +418,6 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   the same test (e2e_bar_red_named). Writing it, the simulator caught a race
   in the test itself: one barrier reused by two groups of warps that were not
   ordered against each other, which the card had passed by timing luck.
-
 - The driver's reserved shared memory (sm_80 and later) and the
   `%reserved_smem_offset_{begin,end,cap,0,1}` registers that locate it.
   cooperative_groups keeps the barriers and exchange slots of tiles of more
