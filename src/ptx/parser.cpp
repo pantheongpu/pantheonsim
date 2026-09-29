@@ -1495,8 +1495,8 @@ class Parser {
           if (addr.base_kind == Addr::Base::Reg) {
             ins.op = OpLd{space, ty, std::move(dsts), addr};
           } else if (addr.base_kind == Addr::Base::CallSlot) {
-            if (vec != 1) return unsupported("vector ld.param from call slot");
-            OpLdSlot op{addr.base, addr.offset, ty, dsts[0]};
+            OpLdSlot op{addr.base, addr.offset, ty, dsts[0], {}};
+            op.rest.assign(dsts.begin() + 1, dsts.end());   // ld.param.v2/.v4
             ins.op = op;
           } else {
             ins.op = OpLd{space, ty, std::move(dsts), addr};
@@ -1526,8 +1526,9 @@ class Parser {
         if (space == Space::Param) {
           if (addr.base_kind != Addr::Base::CallSlot)
             return unsupported("st.param outside a call sequence");
-          if (vec != 1) return unsupported("vector st.param");
-          ins.op = OpStSlot{addr.base, addr.offset, ty, srcs[0]};
+          OpStSlot op{addr.base, addr.offset, ty, srcs[0], {}};
+          op.rest.assign(srcs.begin() + 1, srcs.end());   // st.param.v2/.v4
+          ins.op = op;
         } else {
           if (addr.base_kind == Addr::Base::CallSlot || addr.base_kind == Addr::Base::EntryParam)
             return unsupported("store through a parameter/slot name");
@@ -3519,31 +3520,38 @@ class Parser {
         else op.dst = expect_reg_operand("mbarrier destination");
         expect_punct(",");
       }
-      op.addr = parse_addr(fn);
-      if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
-        return unsupported("mbarrier through a parameter/slot name");
-      if (peek_punct(",")) {
-        next();
-        if (op.op == MbarOp::TestWait || op.op == MbarOp::TryWait) {
-          op.state = parse_operand();
-          op.have_state = true;
-          // try_wait's optional suspend-time hint: how long a thread may sleep
-          // before re-testing, which changes nothing a wait returns.
-          if (op.op == MbarOp::TryWait && peek_punct(",")) {
-            next();
-            (void)parse_operand();
+      // pending_count reads a state token (mbarrier.pending_count.b64 d, st),
+      // not the barrier.
+      if (op.op == MbarOp::PendingCount) {
+        op.state = parse_operand();
+        op.have_state = true;
+      } else {
+        op.addr = parse_addr(fn);
+        if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
+          return unsupported("mbarrier through a parameter/slot name");
+        if (peek_punct(",")) {
+          next();
+          if (op.op == MbarOp::TestWait || op.op == MbarOp::TryWait) {
+            op.state = parse_operand();
+            op.have_state = true;
+            // try_wait's optional suspend-time hint: how long a thread may sleep
+            // before re-testing, which changes nothing a wait returns.
+            if (op.op == MbarOp::TryWait && peek_punct(",")) {
+              next();
+              (void)parse_operand();
+            }
+          } else {
+            op.count = parse_operand();
+            op.have_count = true;
           }
-        } else {
-          op.count = parse_operand();
-          op.have_count = true;
         }
+        if (op.op == MbarOp::Init && !op.have_count)
+          return unsupported("mbarrier.init without an expected arrival count");
+        if ((op.op == MbarOp::ExpectTx || op.op == MbarOp::CompleteTx || op.expect_tx) && !op.have_count)
+          return unsupported("mbarrier transaction count missing");
+        if (op.op == MbarOp::ExpectTx || op.op == MbarOp::CompleteTx || op.expect_tx)
+          if (peek_punct(",")) return unsupported("mbarrier multicast (a ctaMask operand)");
       }
-      if (op.op == MbarOp::Init && !op.have_count)
-        return unsupported("mbarrier.init without an expected arrival count");
-      if ((op.op == MbarOp::ExpectTx || op.op == MbarOp::CompleteTx || op.expect_tx) && !op.have_count)
-        return unsupported("mbarrier transaction count missing");
-      if (op.op == MbarOp::ExpectTx || op.op == MbarOp::CompleteTx || op.expect_tx)
-        if (peek_punct(",")) return unsupported("mbarrier multicast (a ctaMask operand)");
       ins.op = op;
     } else if (op0 == "match") {
       // match.any.sync.b32 d, a, membermask

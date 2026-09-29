@@ -250,6 +250,51 @@ VTEST(module_global_string_and_symbols) {
   VCHECK_EQ(dev.memory().load_scalar(out, 4), 0x00004241ull);  // 'A','B',0,0 little-endian
 }
 
+VTEST(vector_param_return_and_argument) {
+  // A device function returning a 16-byte struct and taking a vector
+  // argument: CUDA 13 writes both with st.param.v4 / ld.param.v4 (sm_100+).
+  std::string ptx = std::string(kHeader) + R"(
+.func (.param .align 16 .b8 func_retval0[16]) make(.param .align 8 .b8 p0[8])
+{
+    .reg .f32 %f<7>;
+    ld.param.v2.f32 {%f1, %f5}, [p0];
+    add.f32 %f2, %f1, 0f3F800000;
+    add.f32 %f3, %f1, 0f40000000;
+    add.f32 %f4, %f5, 0f40400000;
+    st.param.v4.f32 [func_retval0], {%f1, %f2, %f3, %f4};
+    ret;
+}
+.visible .entry k(.param .u64 out)
+{
+    .reg .f32 %f<6>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    {
+    .param .align 8 .b8 param0[8];
+    st.param.v2.f32 [param0], {0f41200000, 0f42C80000};
+    .param .align 16 .b8 retval0[16];
+    call.uni (retval0), make, (param0);
+    ld.param.v4.f32 {%f1, %f2, %f3, %f4}, [retval0];
+    }
+    st.global.v4.f32 [%rd2], {%f1, %f2, %f3, %f4};
+    ret;
+}
+)";
+  runtime::Runtime rt(load_gpu("nvidia/b200"));
+  auto& dev = rt.device(0);
+  uint64_t mod = dev.load_module(ptx);
+  const ptx::EntryFn* fn = dev.get_function(mod, "k");
+  uint64_t out = dev.memory().alloc(16);
+  dev.launch(*fn, LaunchConfig{}, {arg_u64(out)}, rt.device(0).symbols(mod));
+  float got[4];
+  dev.memory().read(out, got, 16);
+  VCHECK_EQ(got[0], 10.0f);
+  VCHECK_EQ(got[1], 11.0f);
+  VCHECK_EQ(got[2], 12.0f);
+  VCHECK_EQ(got[3], 103.0f);
+}
+
 VTEST(local_memory_and_device_printf) {
   // The full nvcc printf pattern: local depot, %SP/%SPL, callseq slots,
   // vprintf, retval. Checks the returned character count; the text itself

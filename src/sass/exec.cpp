@@ -23,6 +23,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <unordered_map>
 #include <mutex>
 #include <thread>
 
@@ -63,7 +64,7 @@ struct Warp {
   Wait wait_kind[32] = {};
   uint32_t wait_arg[32] = {};         // the barrier a lane waits on
   Mask b[16] = {};                    // convergence barriers
-  uint32_t rpc[32] = {};              // the return-address register (RPCMOV)
+  uint64_t rpc[32] = {};              // the return-address register (RPCMOV)
   uint64_t gmma_issued = 0;           // warpgroup MMAs this warp has issued
   std::vector<uint8_t> local;         // per-lane local memory, local_size bytes each
   uint32_t local_size = 0;
@@ -74,6 +75,9 @@ struct Warp {
   bool give_way = false;
   uint32_t b2r = 0;                   // the last block barrier reduction's result (B2R.RESULT)
   bool b2r_pred = false;
+  // Set by a wait that came back unsatisfied (an mbarrier phase check): the
+  // warp's turn ends there, so the warps it waits on get to run.
+  bool yield = false;
 
   Mask runnable() const { return alive & ~exited & ~waiting; }
   uint32_t& reg(unsigned n, unsigned lane) {
@@ -104,6 +108,16 @@ struct Block {
     bool and_ = true, or_ = false;
   };
   Barrier bars[16];
+  // What an mbarrier's word in shared memory has no room for, by its offset:
+  // the transaction bytes its phase still waits for (raised by expect-tx,
+  // lowered as copies complete; it may dip below zero when a copy lands
+  // before its expect-tx), and whether every arrival is in while bytes are
+  // still due.
+  struct MbarSide {
+    int64_t tx = 0;
+    bool arrived_all = false;
+  };
+  std::unordered_map<uint32_t, MbarSide> mbar;
   exec::LaunchStats st;   // this block's counts, folded into the launch's
 };
 
@@ -196,6 +210,10 @@ class Runner {
   void exec_mma(Block& blk, Warp& w, const Instr& ins, Mask ex);
   void exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex);   // warpgroup MMA
   void exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex);   // textures and surfaces
+  void exec_syncs(Block& blk, Warp& w, const Instr& ins, Mask ex);   // mbarriers
+  uint32_t mbar_offset(Block& blk, Warp& w, const Instr& ins, unsigned lane, bool ur_only);
+  uint64_t mbar_arrive(Block& blk, uint32_t off, uint32_t arrivals, int64_t tx, bool drop);
+  uint64_t mbar_arrive80(Block& blk, uint32_t off);
   void builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name);
   uint32_t ival(Warp& w, const Operand& o, unsigned lane);   // with -/~ applied
 
@@ -517,6 +535,8 @@ void Runner::init_block(Block& blk, uint64_t linear) {
     w.local.assign(static_cast<size_t>(local_size_) * 32, 0);
   }
   for (Block::Barrier& b : blk.bars) b = Block::Barrier{};
+  blk.mbar.clear();
+  blk.gmma.clear();
 }
 
 exec::LaunchStats Runner::run() {
@@ -577,8 +597,13 @@ exec::LaunchStats Runner::run() {
           if (!(w.alive & ~w.exited)) continue;
           live = true;
           for (int n = 0; n < 256 && (w.alive & ~w.exited); ++n)
-            if (step_warp(blk, w)) progress = true;
-            else break;
+            if (step_warp(blk, w)) {
+              progress = true;
+              if (w.yield) break;
+            } else {
+              break;
+            }
+          w.yield = false;
         }
       if (live && !progress) throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": every warp of the grid is waiting (deadlock)");
     }
@@ -607,7 +632,9 @@ void Runner::run_block(Block& blk) {
         if (!(w.alive & ~w.exited)) break;
         if (!step_warp(blk, w)) break;
         progress = true;
+        if (w.yield) break;
       }
+      w.yield = false;
     }
     if (!live) return;
     if (!progress)

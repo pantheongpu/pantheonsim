@@ -45,6 +45,7 @@ bool executes(const Instr& ins) {
     case Op::USEL: case Op::USHF: case Op::VABSDIFF4: case Op::VIADD: case Op::VIMNMX: case Op::VIADDMNMX:
     case Op::VIMNMX3: case Op::IADD: case Op::UP2UR: case Op::ELECT: case Op::USETMAXREG: case Op::WARPGROUP:
     case Op::FMNMX3: case Op::STSM: case Op::RPCMOV: case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
+    case Op::SYNCS: case Op::ARRIVES:
     case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2FP: case Op::F2I:
     case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL:
     case Op::FSET: case Op::FSETP: case Op::HADD2: case Op::HFMA2: case Op::HMUL2: case Op::HSET2: case Op::HSETP2:
@@ -52,17 +53,15 @@ bool executes(const Instr& ins) {
     case Op::ATOM: case Op::ATOMG: case Op::ATOMS: case Op::LD: case Op::LDC: case Op::LDG: case Op::LDGDEPBAR:
     case Op::LDGSTS: case Op::LDL: case Op::LDS: case Op::LDSM: case Op::RED: case Op::ST: case Op::STG:
     case Op::STL: case Op::STS:
-    case Op::MATCH: case Op::REDUX: case Op::SHFL: case Op::VOTE: case Op::VOTEU:
+    case Op::MATCH: case Op::REDUX: case Op::SHFL: case Op::VOTE: case Op::VOTEU: case Op::MOVM:
       return true;
-    case Op::MOVM:
-      return ins.f[0] == 0;   // not sm_100's U4TO8.M832: its layout is unpublished and unmeasured here
     case Op::BMMA: case Op::DMMA: case Op::QMMA: case Op::SULD: case Op::SUST:
     case Op::BAR: case Op::BMOV: case Op::BPT: case Op::BRA: case Op::BREAK: case Op::BRX: case Op::BSSY:
     case Op::BSYNC: case Op::CALL: case Op::CCTL: case Op::DEPBAR: case Op::ERRBAR: case Op::EXIT: case Op::MEMBAR:
     case Op::NANOSLEEP: case Op::NOP: case Op::RET: case Op::YIELD:
       return true;
-    case Op::WARPSYNC:
-      return ins.f[1] == 0;   // not .COLLECTIVE yet
+    case Op::WARPSYNC: case Op::ENDCOLLECTIVE:
+      return true;
     case Op::R2UR:
       return ins.f[0] == 0;   // not the forms reporting a non-uniform value yet
     default:
@@ -124,7 +123,7 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
       case Op::BRA: case Op::BRX: case Op::JMP: case Op::CALL: case Op::RET: case Op::EXIT:
       case Op::BSSY: case Op::BSYNC: case Op::BREAK: case Op::WARPSYNC: case Op::BAR:
       case Op::NOP: case Op::YIELD: case Op::NANOSLEEP: case Op::BPT: case Op::DEPBAR:
-      case Op::MEMBAR: case Op::ERRBAR: case Op::CCTL: case Op::BMOV:
+      case Op::MEMBAR: case Op::ERRBAR: case Op::CCTL: case Op::BMOV: case Op::ENDCOLLECTIVE:
         pcs_set = exec_control(blk, w, ins, ex, group);
         break;
       case Op::LDG: case Op::STG: case Op::LDS: case Op::STS: case Op::LDL: case Op::STL:
@@ -143,6 +142,9 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group) {
         break;
       case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
         exec_gmma(blk, w, ins, ex);
+        break;
+      case Op::SYNCS: case Op::ARRIVES:
+        exec_syncs(blk, w, ins, ex);
         break;
       case Op::FADD: case Op::FMUL: case Op::FFMA: case Op::FMNMX: case Op::FSETP: case Op::FSET:
       case Op::FSEL: case Op::FCHK: case Op::MUFU: case Op::DADD: case Op::DMUL: case Op::DFMA:
@@ -645,8 +647,9 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       return;
     case Op::RPCMOV:   // RPCMOV.32 to or from the return-address register
       each_lane(ex, [&](unsigned l) {
-        if (ins.f[0]) write32(w, ins.dst[0], l, w.rpc[l]);
-        else w.rpc[l] = read32(w, ins.src[0], l);
+        const unsigned sh = ins.f[1] ? 32 : 0;
+        if (ins.f[0]) write32(w, ins.dst[0], l, static_cast<uint32_t>(w.rpc[l] >> sh));
+        else w.rpc[l] = (w.rpc[l] & ~(uint64_t{0xffffffff} << sh)) | (static_cast<uint64_t>(read32(w, ins.src[0], l)) << sh);
       });
       return;
     case Op::SGXT:
@@ -1569,6 +1572,10 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       return;
     }
     case Op::ATOMS: case Op::ATOMG: case Op::ATOM: case Op::RED: {
+      if (ins.op == Op::ATOMS && ins.f[2] == 2) {   // ATOMS.ARRIVE.64: an mbarrier
+        exec_syncs(blk, w, ins, ex);
+        return;
+      }
       const bool shared = ins.op == Op::ATOMS;
       const bool red = ins.op == Op::RED;
       const unsigned type = ins.f[4];   // 0 U32, 1 S32, 2 U64, 3 F32, 4 F16x2, 5 S64, 6 F64
@@ -2105,7 +2112,23 @@ void Runner::exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
 
 void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
   if (ins.op == Op::MOVM) {
-    if (ins.f[0]) fault(w, ins, 0, "MOVM.U4TO8.M832 is not implemented", Err::UnsupportedPtx);
+    if (ins.f[0]) {
+      // MOVM.U4TO8.M832 Rd, Ra (sm_100): the eight 4-bit fields of Ra, each
+      // widened to a byte -- fields 0-3 into Rd, 4-7 into Rd+1. ptxas uses it
+      // to run b1 MMA as u8 IMMA (one bit per nibble, the four bit planes in
+      // turn); the same per-lane widening of A and B is what makes those
+      // products come out, which mma_forms and wmma_types check exactly.
+      each_lane(ex, [&](unsigned l) {
+        const uint32_t v = read32(w, ins.src[0], l);
+        uint32_t out[2] = {};
+        for (unsigned i = 0; i < 8; ++i) out[i / 4] |= ((v >> (4 * i)) & 0xfu) << (8 * (i % 4));
+        if (ins.dst[0].reg != kRZ) {
+          w.reg(ins.dst[0].reg, l) = out[0];
+          w.reg(ins.dst[0].reg + 1, l) = out[1];
+        }
+      });
+      return;
+    }
     // MOVM.16.MT88: transpose an 8x8 matrix of 16-bit elements across the
     // warp (movmatrix): lane 4g+t holds row g, columns 2t, 2t+1.
     uint16_t m[8][8];
@@ -2329,6 +2352,21 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       const Mask need = w.wait_arg[l] & w.alive & ~w.exited;
       if ((need & ~waiting_ws) == 0) release |= Mask{1} << l;
     });
+    // A .COLLECTIVE warpsync runs what follows it (up to ENDCOLLECTIVE) once
+    // for all its lanes. Lanes that reach it from different places in the
+    // code would each run their own copy here, so that is refused rather
+    // than answered per path.
+    if (release) {
+      const uint64_t at = w.pc[std::countr_zero(release)];
+      bool collective = false, apart = false;
+      each_lane(release, [&](unsigned l) {
+        const Instr& at_ins = fetch(w.pc[l]);
+        collective = collective || (at_ins.op == Op::WARPSYNC && at_ins.f[1]);
+        apart = apart || w.pc[l] != at;
+      });
+      if (collective && apart)
+        throw Fault("WARPSYNC.COLLECTIVE reached from different code paths of one warp is not implemented");
+    }
     each_lane(release, [&](unsigned l) {
       w.waiting &= ~(Mask{1} << l);
       w.wait_kind[l] = Wait::None;
@@ -2368,9 +2406,14 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       each_lane(group, [&](unsigned l) { w.pc[l] += 16; });
       return true;
     case Op::NOP: case Op::DEPBAR: case Op::MEMBAR: case Op::ERRBAR: case Op::CCTL: case Op::NANOSLEEP:
+    case Op::ENDCOLLECTIVE:
       return false;
     case Op::YIELD:
+      // A hint ptxas puts in loops, spin-waits among them (sm_80's mbarrier
+      // waits poll shared memory): other lane groups, and other warps, go
+      // first.
       w.give_way = true;
+      w.yield = true;
       return false;
     case Op::BPT:
       if (ex) throw Error(Err::Trap, "SASS kernel " + k_.name + " executed BPT.TRAP (a trap)");
@@ -2673,4 +2716,168 @@ void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const 
     throw Error(Err::DeviceAssert, "device-side assertion failed: " + text);
   }
   fault(w, ins, 0, "call to " + name + ", which is not available");
+}
+
+// ---- mbarriers (SYNCS, ATOMS.ARRIVE, ARRIVES) ----------------------------------
+//
+// From sm_90 the mbarrier is the 64-bit word ptxas lays out for SYNCS
+// (decode.cpp, dec_syncs_*): the low word holds 0x100000 - count at bits
+// 1-20, the high word counts the phase's arrivals up from that value at bits
+// 11-30 and holds the phase at bit 31, so the arrival completing the phase
+// carries into it. Kernels do arithmetic on the words they get back
+// (pending_count, test_wait's token), so the word is kept exactly; what it has
+// no room for is in Block::mbar. Each lane's operation is its own atomic,
+// applied in lane order.
+
+// The barrier's shared offset from a lane's [Ra + URb + offset] (Ra at 24,
+// URb at `ur_at`) or, with ra_at < 0, [URa + offset] (URa at 24). The CTA's
+// rank in its cluster rides in bits 24 up.
+uint32_t Runner::mbar_offset(Block& blk, Warp& w, const Instr& ins, unsigned l, bool ur_only) {
+  const Word& word = ins.w;
+  const unsigned ub = m_.sm >= 100 ? 8 : 6, urz = m_.sm >= 100 ? 255u : 63u;
+  const auto ureg = [&](unsigned u) -> uint64_t { return u >= urz ? 0 : w.ur[u]; };
+  uint64_t a;
+  if (ur_only) {
+    a = ureg(static_cast<unsigned>(word.field(24, ub)));
+  } else {
+    const unsigned ra = static_cast<unsigned>(word.field(24, 8));
+    a = (ra == kRZ ? 0 : w.reg(ra, l)) + ureg(static_cast<unsigned>(word.field(64, ub)));
+  }
+  a += static_cast<uint64_t>(word.sfield(40, 24));
+  const uint32_t off = static_cast<uint32_t>(a) & 0xffffff;
+  if ((static_cast<uint32_t>(a) >> 24) != 0)
+    throw Fault("an mbarrier in another block of a cluster (a cluster launch runs on PTX)");
+  if (off % 8) throw Fault("an mbarrier must be 8-byte aligned");
+  if (off + 8 > blk.shared.size()) throw Fault("an mbarrier past the block's shared memory");
+  return off;
+}
+
+// One thread's arrive on an sm_90 mbarrier: `arrivals` arrivals, `tx` more
+// transaction bytes due (negative: completed), `drop` leaving later phases.
+// Returns the word before.
+uint64_t Runner::mbar_arrive(Block& blk, uint32_t off, uint32_t arrivals, int64_t tx, bool drop) {
+  uint64_t old;
+  std::memcpy(&old, &blk.shared[off], 8);
+  Block::MbarSide& side = blk.mbar[off];
+  uint32_t lo = static_cast<uint32_t>(old), hi = static_cast<uint32_t>(old >> 32);
+  uint32_t reload = (lo >> 1) & 0xfffff;   // 0x100000 - the expected count
+  if (drop) reload = std::min<uint32_t>(reload + arrivals, 0x100000);   // fewer from the next phase on
+  uint32_t remaining = side.arrived_all ? 0 : 0x100000 - ((hi >> 11) & 0xfffff);
+  remaining -= std::min(arrivals, remaining);
+  side.tx += tx;
+  uint32_t phase = hi >> 31, count;
+  if (remaining == 0 && side.tx == 0) {
+    phase ^= 1;
+    count = reload;
+    side.arrived_all = false;
+  } else {
+    side.arrived_all = remaining == 0;
+    count = remaining == 0 ? 0 : 0x100000 - remaining;
+  }
+  lo = (lo & ~(0xfffffu << 1)) | (reload << 1);
+  hi = (hi & 0x7ffu) | (count << 11) | (phase << 31);
+  const uint64_t now = lo | (static_cast<uint64_t>(hi) << 32);
+  std::memcpy(&blk.shared[off], &now, 8);
+  return old;
+}
+
+// One thread's arrive on an sm_80 mbarrier (ATOMS.ARRIVE.64): the high word
+// counts arrivals up to 0x80000000, carrying into the phase at bit 31, and
+// then starts again from the low word + 0x40000000 (init stores 0x40000000
+// - count there, and arrive_drop raises it). Returns the word before.
+uint64_t Runner::mbar_arrive80(Block& blk, uint32_t off) {
+  uint64_t old;
+  std::memcpy(&old, &blk.shared[off], 8);
+  const uint32_t lo = static_cast<uint32_t>(old);
+  uint32_t hi = static_cast<uint32_t>(old >> 32);
+  const uint32_t count = (hi & 0x7fffffffu) + 1;
+  if (count >= 0x80000000u) hi = ((hi ^ 0x80000000u) & 0x80000000u) | ((lo + 0x40000000u) & 0x7fffffffu);
+  else hi = (hi & 0x80000000u) | count;
+  const uint64_t now = lo | (static_cast<uint64_t>(hi) << 32);
+  std::memcpy(&blk.shared[off], &now, 8);
+  return old;
+}
+
+void Runner::exec_syncs(Block& blk, Warp& w, const Instr& ins, Mask ex) {
+  const unsigned urz = m_.sm >= 100 ? 255u : 63u;
+  const auto ureg = [&](unsigned u) -> uint64_t { return u >= urz ? 0 : w.ur[u]; };
+  const auto put_pair = [&](unsigned rd, unsigned l, uint64_t v) {
+    if (rd == kRZ) return;
+    w.reg(rd, l) = static_cast<uint32_t>(v);
+    w.reg(rd + 1, l) = static_cast<uint32_t>(v >> 32);
+  };
+  if (ins.op == Op::ATOMS) {   // ATOMS.ARRIVE.64 Rd, [addr]: sm_80's arrive
+    each_lane(ex, [&](unsigned l) { put_pair(ins.dst[0].reg, l, mbar_arrive80(blk, mbar_offset(blk, w, ins, l, false))); });
+    return;
+  }
+  if (ins.op == Op::ARRIVES) {   // cp.async's arrive; the copies have landed already (LDGSTS)
+    each_lane(ex, [&](unsigned l) {
+      const uint32_t off = mbar_offset(blk, w, ins, l, false);
+      if (ins.f[0] == 0) mbar_arrive80(blk, off);
+      else if (ins.f[0] == 1) mbar_arrive(blk, off, 0, -1, false);   // .TRANSCNT: A0T1's transaction
+      else mbar_arrive(blk, off, 1, 0, false);                        // .ARVCNT
+    });
+    return;
+  }
+  switch (ins.f[0]) {
+    case 0: {   // EXCH.64 URd, [URa + offset], URb: mbarrier.init
+      if (!ex) return;
+      const unsigned d = ins.dst[0].reg, b = ins.src[1].reg;
+      const uint32_t off = mbar_offset(blk, w, ins, static_cast<unsigned>(std::countr_zero(ex)), true);
+      uint64_t old;
+      std::memcpy(&old, &blk.shared[off], 8);
+      const uint64_t v = ureg(b) | (ureg(b + 1) << 32);
+      std::memcpy(&blk.shared[off], &v, 8);
+      blk.mbar.erase(off);
+      if (d < urz) {
+        w.ur[d] = static_cast<uint32_t>(old);
+        w.ur[d + 1] = static_cast<uint32_t>(old >> 32);
+      }
+      return;
+    }
+    case 1: {   // ARRIVE: see dec_syncs_arrive for the modes
+      const unsigned mode = ins.f[1];
+      const bool drop = ins.f[2];
+      const unsigned rb = ins.src[1].reg;
+      each_lane(ex, [&](unsigned l) {
+        const uint32_t b = rb == kRZ ? 0 : w.reg(rb, l);
+        uint32_t arrivals = 0;
+        int64_t tx = 0;
+        switch (mode) {
+          case 0: arrivals = 1; tx = b; break;              // arrive once, expect b bytes
+          case 1: arrivals = 1; break;                      // .A1T0
+          case 2: tx = 1; break;                            // .A0T1: one more due (cp.async's)
+          case 3: tx = b; break;                            // .A0TR: expect b bytes
+          case 4: tx = -static_cast<int64_t>(b); break;     // .A0TX: b bytes complete
+          case 5: arrivals = b; break;                      // .ART0: arrive b times
+          default: throw Fault("SYNCS.ARRIVE mode " + std::to_string(mode) + " is not implemented");
+        }
+        put_pair(ins.dst[0].reg, l, mbar_arrive(blk, mbar_offset(blk, w, ins, l, false), arrivals, tx, drop));
+      });
+      return;
+    }
+    case 2: {   // PHASECHK Pd, [addr], Rb: has the phase of Rb's bit 31 completed?
+      const unsigned rb = ins.src[1].reg;
+      bool all = true;
+      each_lane(ex, [&](unsigned l) {
+        const uint32_t off = mbar_offset(blk, w, ins, l, false);
+        uint64_t v;
+        std::memcpy(&v, &blk.shared[off], 8);
+        const bool done = static_cast<uint32_t>(v >> 63) != ((rb == kRZ ? 0 : w.reg(rb, l)) >> 31);
+        set_pred(w, ins.dst[0], l, done);
+        all = all && done;
+      });
+      if (!all) w.yield = true;   // the arrivals it waits for are other warps'
+      return;
+    }
+    case 3:   // CCTL.IV / .IVALL: mbarrier.inval
+      if (ins.src.empty()) {
+        if (ex) blk.mbar.clear();
+      } else {
+        each_lane(ex, [&](unsigned l) { blk.mbar.erase(mbar_offset(blk, w, ins, l, false)); });
+      }
+      return;
+    default:
+      throw Fault("SYNCS form not implemented");
+  }
 }

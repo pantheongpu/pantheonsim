@@ -1370,6 +1370,17 @@ set_tests_properties(e2e_sass_path PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
 
+# SASS on every architecture: programs built for each generation's SASS, sm_75
+# to sm_120, run by default and on their PTX, which must agree. sm_100 and
+# sm_120 need CUDA 12.8's nvcc; older ones skip those. nvidia/docs/sass.md.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_sass_archs COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_archs.sh)
+  set_tests_properties(e2e_sass_archs PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 3600)
+endif()
+
 # A grid-wide barrier through cooperative_groups, unmodified. Checks the
 # barrier holds, that a grid too large to be resident is refused rather than
 # hung, and that the same kernel launched ordinarily fails loudly.
