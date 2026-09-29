@@ -299,6 +299,15 @@ echo "$out" | sed 's/^/      /'
 expect "the exports program runs to the end" "0" "$status"
 expect "every one of its export checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# Events shared between processes (hipcc/ipc.cpp): an interprocess event's
+# handle opened in a process it forks, whose wait waits for the record made
+# here.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" timeout 120 "$(dirname "$exe")/ipc.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the interprocess events program runs to the end" "0" "$status"
+expect "every one of its interprocess checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)

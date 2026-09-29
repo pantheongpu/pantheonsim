@@ -1976,6 +1976,46 @@ struct Stamp {
   std::atomic<bool> taken{false};
   std::chrono::steady_clock::time_point when{};
 };
+// An interprocess event's state, which every process that opened it shares
+// (a small file, mapped): how many records have been made of it, anywhere,
+// and how many of those have happened. Another process's event is waited on
+// by these, having no queue of this process's to wait on.
+struct IpcEventState {
+  std::atomic<uint64_t>* counters = nullptr;   // [0] records made, [1] records done
+  std::string path;
+  bool owner = false;
+  static constexpr size_t kBytes = 4096;
+  ~IpcEventState() {
+    if (counters) ::munmap(counters, kBytes);
+    if (owner) ::unlink(path.c_str());
+  }
+  void done(uint64_t n) {
+    uint64_t now = counters[1].load();
+    while (now < n && !counters[1].compare_exchange_weak(now, n)) {
+    }
+  }
+  bool finished(uint64_t upto) const { return counters[1].load() >= upto; }
+  void wait(uint64_t upto) const {
+    while (!finished(upto)) std::this_thread::sleep_for(std::chrono::microseconds(50));
+  }
+};
+std::shared_ptr<IpcEventState> map_ipc_event(const std::string& path, bool create) {
+  const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC | (create ? O_CREAT | O_EXCL : 0), 0600);
+  if (fd < 0) return nullptr;
+  if (create && ::ftruncate(fd, IpcEventState::kBytes) != 0) {
+    ::close(fd);
+    ::unlink(path.c_str());
+    return nullptr;
+  }
+  void* p = ::mmap(nullptr, IpcEventState::kBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  ::close(fd);
+  if (p == MAP_FAILED) return nullptr;
+  auto st = std::make_shared<IpcEventState>();
+  st->counters = static_cast<std::atomic<uint64_t>*>(p);
+  st->path = path;
+  st->owner = create;
+  return st;
+}
 struct Event {
   int device = 0;   // the device current when it was made: it records only there
   bool timing = true;
@@ -1990,6 +2030,11 @@ struct Event {
   hipStream_t capture_stream = nullptr;
   uint64_t capture_ops = 0;
   std::vector<void*> capture_deps;
+  // An interprocess event's shared state; `remote` where another process
+  // made it and this one opened it.
+  std::shared_ptr<IpcEventState> ipc;
+  bool remote = false;
+  char ipc_id[40] = {};
 };
 
 // Lock order: s.mutex, then this.
@@ -2027,6 +2072,14 @@ hipError_t hipEventCreateWithFlags(hipEvent_t* event, unsigned int flags) {
   auto e = std::make_unique<Event>();
   e->device = device;
   e->timing = (flags & hipEventDisableTiming) == 0;
+  // An interprocess event's state is a file from the start, so records made
+  // before its handle is handed out count too.
+  if (flags & kInterprocess) {
+    static std::atomic<uint32_t> counter{0};
+    std::snprintf(e->ipc_id, sizeof e->ipc_id, "%x-e%x", static_cast<unsigned>(::getpid()), counter.fetch_add(1) + 1);
+    e->ipc = map_ipc_event(vgpu::telemetry::default_path() + "/ipc-hip-" + e->ipc_id, true);
+    if (!e->ipc) return record(s, fail(hipErrorOutOfMemory, "no file for the interprocess event's state"));
+  }
   g_events.emplace(handle, std::move(e));
   *event = handle;
   return hipSuccess;
@@ -2073,10 +2126,14 @@ hipError_t hipEventRecord(hipEvent_t event, hipStream_t stream) {
   e->recorded = true;
   e->stamp = stamp;
   e->queue = o.queue;
+  // An interprocess event's record counts for every process that has it.
+  std::shared_ptr<IpcEventState> ipc = e->ipc;
+  const uint64_t made = ipc ? ipc->counters[0].fetch_add(1) + 1 : 0;
   e->seq = o.queue->submit(
-      [stamp] {
+      [stamp, ipc, made] {
         stamp->when = std::chrono::steady_clock::now();
         stamp->taken.store(true, std::memory_order_release);
+        if (ipc) ipc->done(made);
         return hipSuccess;
       },
       std::move(o.after));
@@ -2105,9 +2162,23 @@ static bool in_capture(hipEvent_t event) {
   return e && captured_event(e);
 }
 
+// Another process's event: its shared state, and how many records of it
+// have been made by now -- what a wait on it waits for.
+static std::shared_ptr<IpcEventState> remote_event(hipEvent_t event, uint64_t* made) {
+  std::lock_guard<std::mutex> lock(g_event_mutex);
+  const Event* e = find_event(event);
+  if (!e || !e->remote || !e->ipc) return nullptr;
+  *made = e->ipc->counters[0].load();
+  return e->ipc;
+}
+
 hipError_t hipEventSynchronize(hipEvent_t event) {
   const ApiCall api("hipEventSynchronize");
   if (in_capture(event)) return record(state(), hipErrorCapturedEvent);
+  if (uint64_t made = 0; const auto ipc = remote_event(event, &made)) {
+    ipc->wait(made);
+    return hipSuccess;
+  }
   Queue::Marker m;
   bool exists = false;
   if (event_marker(event, &m, nullptr, &exists)) m.queue->wait(m.seq);
@@ -2121,6 +2192,8 @@ hipError_t hipEventSynchronize(hipEvent_t event) {
 hipError_t hipEventQuery(hipEvent_t event) {
   const ApiCall api("hipEventQuery");
   if (in_capture(event)) return record(state(), hipErrorCapturedEvent);
+  if (uint64_t made = 0; const auto ipc = remote_event(event, &made))
+    return ipc->finished(made) ? hipSuccess : hipErrorNotReady;
   Queue::Marker m;
   bool exists = false;
   if (event_marker(event, &m, nullptr, &exists) && !m.queue->done(m.seq)) return hipErrorNotReady;
@@ -4523,6 +4596,21 @@ hipError_t hipStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned int
     if (!e) return record(s, hipErrorInvalidHandle);
     hipError_t result = hipSuccess;
     if (capture_wait(s, resolve(s, stream), e, &result)) return record(s, result);
+    // Another process's event: the stream waits until its records so far
+    // have happened there.
+    if (e->remote && e->ipc) {
+      const std::shared_ptr<IpcEventState> ipc = e->ipc;
+      const uint64_t made = ipc->counters[0].load();
+      Order o;
+      if (const hipError_t err = order_for(s, stream, &o); err != hipSuccess) return record(s, err);
+      o.queue->submit(
+          [ipc, made] {
+            ipc->wait(made);
+            return hipSuccess;
+          },
+          std::move(o.after));
+      return record(s, hipSuccess);
+    }
   }
   Queue::Marker m;
   bool exists = false;
@@ -5218,11 +5306,59 @@ hipError_t hipMemPoolImportPointer(void** ptr, void* pool, void* data) {
   return record(s, hipSuccess);
 }
 
-hipError_t hipIpcGetEventHandle(void*, hipEvent_t) {
-  return refused("hipIpcGetEventHandle", "events are not shared between processes");
+// An interprocess event (hipEventInterprocess) is handed to another process
+// as the name of its shared state, which that process opens as an event of
+// its own: its waits wait for the records made anywhere, and its records
+// count everywhere. A process cannot open its own event's handle.
+struct IpcEventPayload {
+  uint32_t magic, version, pid, reserved;
+  char id[40];
+};
+static_assert(sizeof(IpcEventPayload) <= sizeof(vgpu::amd::abi::IpcMemHandle), "an event's handle fits HIP's");
+constexpr uint32_t kIpcEventMagic = 0x48455643;   // "HEVC"
+hipError_t hipIpcGetEventHandle(void* handle, hipEvent_t event) {
+  const ApiCall api("hipIpcGetEventHandle");
+  std::lock_guard<std::mutex> lock(g_event_mutex);
+  const Event* e = find_event(event);
+  if (!handle || !e || !e->ipc) return record(state(), hipErrorInvalidValue);
+  IpcEventPayload p{};
+  p.magic = kIpcEventMagic;
+  p.version = 1;
+  p.pid = e->remote ? 0 : static_cast<uint32_t>(::getpid());
+  std::memcpy(p.id, e->ipc_id, sizeof p.id);
+  std::memset(handle, 0, sizeof(vgpu::amd::abi::IpcMemHandle));
+  std::memcpy(handle, &p, sizeof p);
+  return hipSuccess;
 }
-hipError_t hipIpcOpenEventHandle(hipEvent_t*, vgpu::amd::abi::IpcMemHandle) {
-  return refused("hipIpcOpenEventHandle", "events are not shared between processes");
+hipError_t hipIpcOpenEventHandle(hipEvent_t* event, vgpu::amd::abi::IpcMemHandle handle) {
+  const ApiCall api("hipIpcOpenEventHandle");
+  State& s = state();
+  if (!event) return record(s, hipErrorInvalidValue);
+  IpcEventPayload p{};
+  std::memcpy(&p, &handle, sizeof p);
+  if (p.magic != kIpcEventMagic || p.version != 1 || !p.id[0]) return record(s, hipErrorInvalidValue);
+  if (p.pid == static_cast<uint32_t>(::getpid()))
+    return record(s, fail(hipErrorInvalidContext, "a process cannot open an event handle it made"));
+  int device = 0;
+  {
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+    device = s.current;
+  }
+  auto e = std::make_unique<Event>();
+  e->device = device;
+  e->timing = false;
+  e->remote = true;
+  std::memcpy(e->ipc_id, p.id, sizeof e->ipc_id);
+  e->ipc_id[sizeof e->ipc_id - 1] = '\0';
+  e->ipc = map_ipc_event(vgpu::telemetry::default_path() + "/ipc-hip-" + e->ipc_id, false);
+  if (!e->ipc) return record(s, fail(hipErrorInvalidValue, "the event's shared state is not there"));
+  std::lock_guard<std::mutex> lock(g_event_mutex);
+  static intptr_t next = 1 << 30;   // apart from hipEventCreate's handles
+  const hipEvent_t h = reinterpret_cast<hipEvent_t>(next++);
+  g_events.emplace(h, std::move(e));
+  *event = h;
+  return hipSuccess;
 }
 
 // ---- Arrays, textures and surfaces -------------------------------------------
