@@ -496,18 +496,20 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         } else if (!s16x2) {
           const uint32_t r = pick(a, b, mn);
           write32(w, ins.dst[0], l, relu(ins.op == Op::VIMNMX ? r : pick(r, read32(w, ins.src[2], l), mn)));
-        } else {   // per 16-bit half, signed or not
+        } else {   // per 16-bit half or per byte, signed or not
           const uint32_t c = ins.op == Op::VIMNMX3 ? read32(w, ins.src[2], l) : b;
+          const unsigned bits = ins.f[1] == 2 ? 8 : 16, lanes = 32 / bits;
+          const uint32_t mask = (1u << bits) - 1;
           uint32_t r = 0;
-          for (int h = 0; h < 2; ++h) {
-            const auto half = [&](uint32_t v) {
-              const uint32_t u = (v >> (16 * h)) & 0xffff;
-              return sgn ? static_cast<int32_t>(static_cast<int16_t>(u)) : static_cast<int32_t>(u);
+          for (unsigned h = 0; h < lanes; ++h) {
+            const auto part = [&](uint32_t v) {
+              const uint32_t u = (v >> (bits * h)) & mask;
+              return sgn ? static_cast<int32_t>(u << (32 - bits)) >> (32 - bits) : static_cast<int32_t>(u);
             };
-            const int32_t m = mn ? std::min({half(a), half(b), half(c)}) : std::max({half(a), half(b), half(c)});
-            r |= (static_cast<uint32_t>(m) & 0xffff) << (16 * h);
+            const int32_t m = mn ? std::min({part(a), part(b), part(c)}) : std::max({part(a), part(b), part(c)});
+            r |= (static_cast<uint32_t>(m) & mask) << (bits * h);
           }
-          write32(w, ins.dst[0], l, r);
+          write32(w, ins.dst[0], l, relu(r));
         }
       });
       return;
@@ -1950,6 +1952,14 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       return false;
     case Op::BRA: {
       Mask take = ex;
+      // A condition predicate beside the guard (sm_90's BRA Pn, sm_100's
+      // BRA.U UPn): both must hold.
+      for (const Operand& o : ins.src)
+        if (o.kind == Kind::Pred || o.kind == Kind::UPred)
+          each_lane(take, [&](unsigned l) {
+            if (!pred(w, o, l)) take &= ~(Mask{1} << l);
+          });
+      if (ins.f[1] && take) take = group;   // .U.ANY: all of them when any
       if (ins.f[0] >= 2) {
         // .DIV/.CONV: branch when the warp is (not) converged on the mask the
         // uniform register gives (~URZ: every lane).

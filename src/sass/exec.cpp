@@ -295,6 +295,10 @@ uint64_t Runner::read64(Warp& w, const Operand& o, unsigned lane) {
     case Kind::CBank:
       return cbank32(o.reg, static_cast<uint64_t>(o.imm)) |
              (static_cast<uint64_t>(cbank32(o.reg, static_cast<uint64_t>(o.imm) + 4)) << 32);
+    case Kind::Imm:
+      // A 64-bit immediate (sm_120's MOV.64, SEL.64); others zero-extend.
+      if (o.fwidth == 64) return static_cast<uint64_t>(o.imm);
+      return static_cast<uint64_t>(read32(w, o, lane));
     default: return static_cast<uint64_t>(read32(w, o, lane));
   }
 }
