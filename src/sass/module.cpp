@@ -17,8 +17,34 @@ bool runs_on(int cubin_sm, bool arch_specific, int device_sm) {
 
 const Code* Module::code_at(uint64_t addr) const {
   for (const Code& c : code)
-    if (addr >= c.base && addr < c.base + 16 * c.instrs.size()) return &c;
+    if (addr >= c.base && addr < c.base + 16 * c.count) return &c;
   return nullptr;
+}
+
+// An instruction the decoder does not know is kept as an unknown one and
+// reported if it is ever reached -- a kernel may carry code no launch executes.
+const Instr& Code::instr(size_t i) const {
+  std::call_once(decoded_->once, [&] {
+    std::vector<Instr>& out = decoded_->instrs;
+    out.reserve(count);
+    for (size_t k = 0; k < count; ++k) {
+      Word w;
+      std::memcpy(&w.lo, &(*bytes)[16 * k], 8);
+      std::memcpy(&w.hi, &(*bytes)[16 * k + 8], 8);
+      try {
+        out.push_back(decode(w, 16 * k, sm));
+      } catch (const Error& e) {
+        Instr bad;
+        bad.w = w;
+        bad.pc = 16 * k;
+        bad.sm = sm;
+        bad.op = Op::Unknown;
+        bad.mnemonic = e.what();
+        out.push_back(std::move(bad));
+      }
+    }
+  });
+  return decoded_->instrs[i];
 }
 
 namespace {
@@ -53,33 +79,18 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
     throw Error(Err::UnsupportedPtx, "cubin built for sm_" + std::to_string(c.sm) + " does not run on " + profile.id +
                                          " (sm_" + std::to_string(device_sm) + ")");
 
-  // Code: every .text section, decoded once. An instruction the decoder does
-  // not know is kept as an unknown one and reported if it is ever reached --
-  // a kernel may carry code no launch executes.
+  // Code: every .text section, placed in the code window; each is decoded
+  // when it first runs (Code::instr). The cubin's sections outlive them.
   uint64_t code_va = kCodeBase;
   for (const CubinSection& s : c.sections) {
     if (s.name.rfind(".text.", 0) != 0) continue;
     Code code;
     code.section = s.name;
     code.base = code_va;
-    const size_t n = s.bytes.size() / 16;
-    code.instrs.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-      Word w;
-      std::memcpy(&w.lo, &s.bytes[16 * i], 8);
-      std::memcpy(&w.hi, &s.bytes[16 * i + 8], 8);
-      try {
-        code.instrs.push_back(decode(w, 16 * i, c.sm));
-      } catch (const Error& e) {
-        Instr bad;
-        bad.w = w;
-        bad.pc = 16 * i;
-        bad.sm = c.sm;
-        bad.op = Op::Unknown;
-        bad.mnemonic = e.what();
-        code.instrs.push_back(std::move(bad));
-      }
-    }
+    code.count = s.bytes.size() / 16;
+    code.sm = c.sm;
+    code.bytes = &s.bytes;
+    const size_t n = code.count;
     code_va += (16 * n + 0xff) & ~uint64_t{0xff};
     m->code_index[s.name] = m->code.size();
     m->code.push_back(std::move(code));

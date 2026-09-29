@@ -389,7 +389,7 @@ const Instr& Runner::fetch(uint64_t addr, const Code** code_out) {
   const Code* c = m_.code_at(addr);
   if (!c) throw Fault("jump to 0x" + [&] { char b[24]; std::snprintf(b, sizeof b, "%llx", (unsigned long long)addr); return std::string(b); }() + ", which is not code");
   if (code_out) *code_out = c;
-  return c->instrs[(addr - c->base) / 16];
+  return c->instr((addr - c->base) / 16);
 }
 
 uint32_t Runner::read32(Warp& w, const Operand& o, unsigned lane) {

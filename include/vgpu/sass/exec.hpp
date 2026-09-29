@@ -1,6 +1,7 @@
 // Loading a cubin onto a simulated device and running its kernels' SASS.
 //
-// A loaded module is the cubin's code, decoded once, plus the device memory
+// A loaded module is the cubin's code, each section decoded the first time
+// it runs, plus the device memory
 // the driver would set up for it: every constant bank but bank 0 (bank 0 is
 // written per launch: the launch fields and the parameters), the module's
 // __device__ variables, and relocations resolved against those addresses.
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -36,10 +38,22 @@ inline constexpr uint64_t kParamWindow = 0x6ffd'0000'0000ull;
 inline constexpr uint64_t kBuiltinBase = 0x6ffa'0000'0000ull;
 
 // One .text section: a kernel's code, or a device function's.
+// Decoded the first time one of its instructions is fetched: a PyTorch cubin
+// holds hundreds of kernels, of which a program launches a few, and decoded
+// instructions take many times the bytes they are decoded from.
 struct Code {
   std::string section;
   uint64_t base = 0;             // its address in the code window
-  std::vector<Instr> instrs;     // instruction i is at byte offset 16 * i
+  size_t count = 0;              // instructions; instruction i is at byte offset 16 * i
+  int sm = 0;
+  const std::vector<uint8_t>* bytes = nullptr;   // the section's, in the module's cubin
+  const Instr& instr(size_t i) const;
+ private:
+  struct Decoded {
+    std::once_flag once;
+    std::vector<Instr> instrs;
+  };
+  std::unique_ptr<Decoded> decoded_ = std::make_unique<Decoded>();
 };
 
 struct Module {
