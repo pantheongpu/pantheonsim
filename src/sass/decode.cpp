@@ -2540,10 +2540,10 @@ void dec_plain(Instr& ins, Op op, const char* name) {
 
 // FENCE.VIEW.ASYNC.S: order generic-proxy shared memory accesses before
 // async-proxy ones (fence.proxy.async).
-void dec_fence(Instr& ins, const Word&) {
+void dec_fence(Instr& ins, const Word& w) {
   ins.op = Op::MEMBAR;
   ins.mnemonic = "FENCE";
-  ins.mods = {"VIEW", "ASYNC", "S"};
+  ins.mods = {"VIEW", "ASYNC", w.bit(73) ? "T" : "S"};   // .T: tcgen05's fences
 }
 
 // UTMACCTL.PF/.IV [URa]: prefetch or invalidate a TMA descriptor (82: PF).
@@ -2981,61 +2981,108 @@ std::string tmem_text(unsigned ur, int64_t off, int sm) {
   return t + "]";
 }
 
-// LDTM.shape.xN Rd, tmem[URa + offset] (tcgen05.ld): 81-82 the shape
-// (1 16dp256bit, 2 32dp32bit -- unnamed), 83-85 log2 N, the address at 32
-// and 40-63.
-void dec_ldtm(Instr& ins, const Word& w) {
-  ins.op = Op::LDTM;
-  ins.mnemonic = "LDTM";
-  static const char* const shapes[] = {"16dp64bit", "16dp256bit", "", "16dp128bit"};
-  const unsigned shape = static_cast<unsigned>(w.field(81, 2)), n = static_cast<unsigned>(w.field(83, 3));
-  if (*shapes[shape]) ins.mods.push_back(shapes[shape]);
-  ins.mods.push_back("x" + std::to_string(1u << n));
-  ins.f[0] = shape;
+// LDTM (tcgen05.ld) Rd, tmem[URa + offset] and STTM (tcgen05.st)
+// tmem[URa + offset], Rb: 80 .PACK16BIT/.EXPAND16BIT; 81-82 the shape -- 0
+// 16x128b, 1 16x256b, 2 32x32b (unnamed), 3 16x64b -- or with 87 one half of
+// 16x32bx2 (81: lanes 16-31); 83-85 log2 of the count. The data register is
+// at 16 (LDTM) or 32 (STTM), the uniform register at 32 (LDTM) or 64 (STTM),
+// the offset (lane << 16 | column) at 40-63.
+void dec_tmem_ldst(Instr& ins, const Word& w, bool store) {
+  ins.op = store ? Op::STTM : Op::LDTM;
+  ins.mnemonic = store ? "STTM" : "LDTM";
+  static const char* const shapes[] = {"16dp128bit", "16dp256bit", "", "16dp64bit"};
+  const bool half = w.bit(87);
+  const unsigned shape = half ? 4 + static_cast<unsigned>(w.bit(81)) : static_cast<unsigned>(w.field(81, 2));
+  const unsigned n = static_cast<unsigned>(w.field(83, 3));
+  if (half) ins.mods.push_back(w.bit(81) ? "16dp32bit_t16_t31" : "16dp32bit_t0_t15");
+  else if (*shapes[shape]) ins.mods.push_back(shapes[shape]);
+  if (n) ins.mods.push_back("x" + std::to_string(1u << n));
+  if (w.bit(80)) ins.mods.push_back(store ? "EXPAND16BIT" : "PACK16BIT");
+  ins.f[0] = shape;   // 0-3 as above, 4/5 16x32bx2's halves
   ins.f[1] = 1u << n;
-  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
-  const unsigned ur = static_cast<unsigned>(w.field(32, 8));
+  ins.f[2] = w.bit(80);
+  const unsigned ur = static_cast<unsigned>(w.field(store ? 64 : 32, 8));
   const int64_t off = static_cast<int64_t>(w.field(40, 24));
   Operand t = Txt(tmem_text(ur, off, ins.sm));
   t.reg = ur;
   t.imm = off;
-  ins.src.push_back(t);
+  const unsigned r = static_cast<unsigned>(w.field(store ? 32 : 16, 8));
+  if (store) {
+    ins.src.push_back(t);
+    ins.src.push_back(R(r));
+  } else {
+    ins.dst.push_back(R(r));
+    ins.src.push_back(t);
+  }
 }
 
-// UTCHMMA / UTCQMMA / UTCOMMA (tcgen05.mma): A's and B's descriptors in
-// the uniform registers at 24 and 32, D in tensor memory at 64, the pair at
-// 40 (a tensor-memory operand, then the instruction descriptor), a scale
-// operand in tensor memory at 48 (URZ: none), 87-90 the enable-input-D
-// predicate. The kind: 72-79 = 3 QMMA, 62-63 set OMMA (63 alone: .4X,
-// sm_103's .BLOCK16), else HMMA.
+// UTC[HIQO]MMA (tcgen05.mma). 10-11 of the opcode: 1 A in shared memory, 2
+// A in Tensor Memory, 3 A in shared memory with UTCQMMA's scale factors. A's
+// descriptor (or Tensor Memory address) at 24, B's descriptor at 32, D in
+// Tensor Memory at 64; the pair at 40 is the sparsity metadata's Tensor
+// Memory address (0 when dense) and the instruction descriptor; at 48 the
+// scale factors' Tensor Memory address (block-scaled kinds), or a register
+// with .ws's zero-column mask or the disable-output-lane masks. The kind:
+// 72-73 = 1 IMMA, 3 QMMA; 62-63 OMMA (63 alone: .4X, sm_103's .BLOCK16);
+// else HMMA. 75-78 scale-input-d; 83 .WS; 85 .2CTA; 87-89 the enable-input-D
+// predicate, 90 its not. Collectors: A's 84 .A_KEEP and 86 .A_REUSE; .ws
+// B's 81 .B_KEEP, 82 .B_REUSE and 79-80 the buffer.
 void dec_utcmma(Instr& ins, const Word& w) {
-  const bool q = w.field(72, 8) == 3, o = w.bit(63);
+  const unsigned form = static_cast<unsigned>(w.field(10, 2));
+  const unsigned kind72 = static_cast<unsigned>(w.field(72, 2));
+  const bool o = w.bit(63), q = !o && kind72 == 3, i8 = !o && kind72 == 1;
   ins.op = Op::UTCMMA;
-  ins.mnemonic = q ? "UTCQMMA" : o ? "UTCOMMA" : "UTCHMMA";
-  if (w.bit(85)) ins.mods.push_back("2CTA");
+  ins.mnemonic = o ? "UTCOMMA" : q ? "UTCQMMA" : i8 ? "UTCIMMA" : "UTCHMMA";
+  const bool two = w.bit(85), ws = w.bit(83);
+  if (two) ins.mods.push_back("2CTA");
+  if (ws) ins.mods.push_back("WS");
   if (o && !w.bit(62)) ins.mods.push_back(ins.sm == 103 ? "BLOCK16" : "4X");
-  ins.f[0] = q ? 1 : o ? 2 : 0;
-  ins.f[1] = w.bit(85);
-  const auto gdesc = [&](unsigned pos) {
-    Operand d = Txt("gdesc[UR" + std::to_string(w.field(pos, 8)) + "]");
-    d.reg = static_cast<unsigned>(w.field(pos, 8));
+  const bool a_tmem = form == 2, scaled = o || form == 3;
+  ins.f[0] = o ? 3 : q ? 1 : i8 ? 2 : 0;   // HMMA (f16/tf32), QMMA, IMMA, OMMA
+  ins.f[1] = two;
+  ins.f[2] = a_tmem;
+  ins.f[3] = scaled;
+  ins.f[4] = ws;
+  ins.f[5] = static_cast<uint32_t>(w.field(75, 4));   // scale-input-d
+  ins.f[6] = static_cast<uint32_t>(w.field(79, 8));   // collector controls, as above (from bit 79)
+  ins.f[7] = o && !w.bit(62);                          // 4X
+  const auto u = [&](unsigned pos) { return static_cast<unsigned>(w.field(pos, 8)); };
+  const auto tmem = [&](unsigned r) {
+    Operand d = Txt(tmem_text(r, 0, ins.sm));
+    d.reg = r;
     return d;
   };
-  ins.src.push_back(gdesc(24));
-  ins.src.push_back(gdesc(32));
-  const unsigned d = static_cast<unsigned>(w.field(64, 8)), p = static_cast<unsigned>(w.field(40, 8));
-  ins.src.push_back(Txt(tmem_text(d, 0, ins.sm)));
-  ins.src.back().reg = d;
-  ins.src.push_back(Txt(tmem_text(p, 0, ins.sm)));
-  ins.src.back().reg = p;
-  ins.src.push_back(Txt("idesc[UR" + std::to_string(p + 1) + "]"));
-  ins.src.back().reg = p + 1;
-  const unsigned sc = static_cast<unsigned>(w.field(48, 8));
-  if (sc != urz(ins.sm)) {
-    ins.src.push_back(Txt(tmem_text(sc, 0, ins.sm)));
-    ins.src.back().reg = sc;
+  const auto gdesc = [&](unsigned r, std::string suffix) {
+    Operand d = Txt("gdesc[UR" + std::to_string(r) + "]" + suffix);
+    d.reg = r;
+    return d;
+  };
+  if (a_tmem) {
+    Operand a = tmem(u(24));
+    if (w.bit(86)) a.text += ".A_REUSE";
+    if (w.bit(84)) a.text += ".A_KEEP";
+    ins.src.push_back(a);
+  } else {
+    ins.src.push_back(gdesc(u(24), ""));
   }
+  std::string bs;
+  if (ws) {
+    if (w.bit(82)) bs += ".B_REUSE";
+    if (w.bit(81)) bs += ".B_KEEP";
+    if (const unsigned buf = static_cast<unsigned>(w.field(79, 2))) bs += ".BUFFER" + std::to_string(buf);
+  }
+  ins.src.push_back(gdesc(u(32), bs));
+  ins.src.push_back(tmem(u(64)));
+  const unsigned p = u(40);
+  ins.src.push_back(tmem(p));
+  Operand id = Txt("idesc[UR" + std::to_string(p + 1) + "]");
+  id.reg = p + 1;
+  ins.src.push_back(id);
+  const unsigned x = u(48);
+  if (scaled) ins.src.push_back(tmem(x));
+  else if (x != urz(ins.sm)) ins.src.push_back(UR(x, ins.sm));
   ins.src.push_back(pred_src(w, 87, 90, true));
+  if (ins.f[5]) ins.src.push_back(Imm(ins.f[5]));
 }
 
 // UTCBAR[.2CTA][.MULTICAST] [URa], URb[, URc] (tcgen05.commit): arrive on
@@ -3052,14 +3099,27 @@ void dec_utcbar(Instr& ins, const Word& w) {
   if (w.bit(75)) ins.src.push_back(UR(static_cast<unsigned>(w.field(64, 8)), ins.sm));
 }
 
-// UTCCP.T.S[.2CTA].shape tmem[URa + offset], gdesc[URb] (tcgen05.cp):
-// shared memory into tensor memory; 84: 4x32dp128bit.
+// UTCCP.T.S[.2CTA][.shape][.decompress] tmem[URa + offset], gdesc[URb]
+// (tcgen05.cp): shared memory into Tensor Memory. The shape from 83, 84 and
+// 88: 0 128x256b (unnamed), 2 4x256b, 3 128x128b, 4 64x128b.warpx2::02_13,
+// 5 its 01_23, 6 32x128b.warpx4; 80-81 the decompression (1 b4x16_p64, 2
+// b6x16_p32 into 8 bits); 85 .2CTA. Tensor Memory at 24 (offset 40-55), the
+// descriptor at 32.
 void dec_utccp(Instr& ins, const Word& w) {
   ins.op = Op::UTCCP;
   ins.mnemonic = "UTCCP";
   ins.mods = {"T", "S"};
   if (w.bit(85)) ins.mods.push_back("2CTA");
-  ins.mods.push_back(w.bit(84) ? "4x32dp128bit" : "(shape)");
+  const unsigned shape = static_cast<unsigned>(w.field(83, 2) | (w.field(88, 1) << 2));
+  static const char* const shapes[] = {"", "(1)", "4dp256bit", "128dp128bit", "2x64dp128bit_lw02_lw13",
+                                       "2x64dp128bit_lw01_lw23", "4x32dp128bit", "(7)"};
+  if (*shapes[shape]) ins.mods.push_back(shapes[shape]);
+  const unsigned dec = static_cast<unsigned>(w.field(80, 2));
+  if (dec == 1) ins.mods.push_back("U4x16P64");
+  if (dec == 2) ins.mods.push_back("U6x16P32");
+  ins.f[0] = shape;
+  ins.f[1] = w.bit(85);
+  ins.f[2] = dec;
   const unsigned ur = static_cast<unsigned>(w.field(24, 8));
   const int64_t off = static_cast<int64_t>(w.field(40, 16));
   ins.src.push_back(Txt(tmem_text(ur, off, ins.sm)));
@@ -3067,6 +3127,19 @@ void dec_utccp(Instr& ins, const Word& w) {
   ins.src.back().imm = off;
   ins.src.push_back(Txt("gdesc[UR" + std::to_string(w.field(32, 8)) + "]"));
   ins.src.back().reg = static_cast<unsigned>(w.field(32, 8));
+}
+
+// UTCSHIFT[.2CTA].DOWN tmem[URa] (tcgen05.shift.down): each row of the 32
+// lanes' region down one lane.
+void dec_utcshift(Instr& ins, const Word& w) {
+  ins.op = Op::UTCSHIFT;
+  ins.mnemonic = "UTCSHIFT";
+  if (w.bit(85)) ins.mods.push_back("2CTA");
+  ins.mods.push_back(w.bit(80) ? "DOWN" : "(up)");
+  ins.f[1] = w.bit(85);
+  const unsigned ur = static_cast<unsigned>(w.field(24, 8));
+  ins.src.push_back(Txt(tmem_text(ur, 0, ins.sm)));
+  ins.src.back().reg = ur;
 }
 
 // UTCATOMSWS (tcgen05.alloc's allocator): 0x5e3 .FIND_AND_SET.ALIGN UPd,
@@ -3395,7 +3468,9 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
       {0x97e, [](Instr& i, const Word& w) { dec_gmem256(i, w, false); }},
       {0x97f, [](Instr& i, const Word& w) { dec_gmem256(i, w, true); }},
       {0x540, dec_cctl_ldcu}, {0x35d, dec_nanosleep}, {0x58d, dec_atoms_cast_p}, {0x547, dec_bra_up},
-      {0x9ee, dec_ldtm}, {0x5ea, dec_utcmma}, {0xdea, dec_utcmma}, {0x3e9, dec_utcbar}, {0x9e7, dec_utccp},
+      {0x9ee, [](Instr& i, const Word& w) { dec_tmem_ldst(i, w, false); }},
+      {0x9ed, [](Instr& i, const Word& w) { dec_tmem_ldst(i, w, true); }},
+      {0x5ea, dec_utcmma}, {0x9ea, dec_utcmma}, {0xdea, dec_utcmma}, {0x9e6, dec_utcshift}, {0x3e9, dec_utcbar}, {0x9e7, dec_utccp},
       {0x5e3, [](Instr& i, const Word& w) { dec_utcatomsws(i, w, true); }},
       {0x9e3, [](Instr& i, const Word& w) { dec_utcatomsws(i, w, false); }},
       {0xdbd, dec_stas}, {0x84c, dec_uvirtcount}, {0x3ca, dec_ugetnextworkid},
