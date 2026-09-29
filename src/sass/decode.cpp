@@ -7,8 +7,10 @@
 
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <cstring>
 #include <unordered_map>
+#include <vector>
 
 #include "vgpu/error.hpp"
 
@@ -303,7 +305,7 @@ void dec_imad(Instr& ins, const Word& w, bool uniform) {
       ins.mods.push_back("IADD");
       if (!is_signed) ins.mods.push_back("U32");
     } else if (!uniform && b.kind == Kind::Imm && c_rz && !is_signed && !x && b.imm > 0 &&
-               b.imm < 0x10000 && (b.imm & (b.imm - 1)) == 0) {
+               b.imm != 0x10000 && (b.imm & (b.imm - 1)) == 0) {   // nvdisasm's one exception
       ins.mods.push_back("SHL");
       ins.mods.push_back("U32");
     } else if (!is_signed) {
@@ -564,11 +566,13 @@ void dec_bra(Instr& ins, const Word& w) {
   // (bit 30 inverts it).
   const unsigned mode = static_cast<unsigned>(w.field(32, 2));
   if (mode == 1) ins.mods.push_back("U");   // the warp is known to agree
+  if (w.bit(84)) ins.mods.push_back("ANY");  // taken by all when any thread's guard holds
+  ins.f[1] = w.bit(84);
   if (mode == 2) ins.mods.push_back("DIV");
   if (mode == 3) ins.mods.push_back("CONV");
   const unsigned cond = static_cast<unsigned>(w.field(87, 3));
   if (cond != kPT || w.bit(90)) ins.src.push_back(pred_src(w, 87, 90));
-  if (mode >= 2) {
+  if (mode >= 2 && ins.sm >= 80) {   // Turing's take no uniform register
     Operand u = UR(static_cast<unsigned>(w.field(24, ureg_bits(ins.sm))), ins.sm);
     u.bnot = w.bit(30);
     ins.src.push_back(u);
@@ -646,6 +650,8 @@ std::string sreg_name(unsigned idx) {
     case 0x3f: return "SR_GLOBALERRORSTATUS";
     case 0x41: return "SR_WARPERRORSTATUS";
     case 0x50: return "SR_CLOCKLO";
+    case 0x88: return "SR_CgaCtaId";   // sm_90: the block's rank in its cluster
+    case 0x8a: return "SR_CgaSize";
     case 0x51: return "SR_CLOCKHI";
     case 0x52: return "SR_GLOBALTIMERLO";
     case 0x53: return "SR_GLOBALTIMERHI";
@@ -695,12 +701,25 @@ void dec_uldc(Instr& ins, const Word& w) {
 //          without it that uniform register is added to the address
 //   90     the register address is 64 bits (R2.64)
 
-const char* const kMemSize[] = {"U8", "S8", "U16", "S16", "", "64", "128", "(size 7)"};
+const char* const kMemSize[] = {"U8", "S8", "U16", "S16", "", "64", "128", "U.128"};
 
-unsigned mem_regs(unsigned size) { return size == 6 ? 4 : size == 5 ? 2 : 1; }
+unsigned mem_regs(unsigned size) { return size >= 6 ? 4 : size == 5 ? 2 : 1; }
 
 void mem_order_mods(Instr& ins, const Word& w) {
   const unsigned order = static_cast<unsigned>(w.field(77, 4));
+  ins.f[1] = order;
+  if (ins.sm < 80) {
+    // Turing always names the scope; a weak access is .SYS.
+    switch (order) {
+      case 0x3: ins.mods.push_back("CONSTANT"); ins.mods.push_back("SYS"); break;
+      case 0x7: ins.mods.push_back("SYS"); break;
+      case 0x8: ins.mods.push_back("STRONG"); ins.mods.push_back("CTA"); break;
+      case 0xa: ins.mods.push_back("STRONG"); ins.mods.push_back("GPU"); break;
+      case 0xb: ins.mods.push_back("STRONG"); ins.mods.push_back("SYS"); break;
+      default: ins.mods.push_back("ORDER" + std::to_string(order)); break;
+    }
+    return;
+  }
   switch (order) {
     case 0x0: break;
     case 0x4: ins.mods.push_back("CONSTANT"); break;
@@ -750,6 +769,24 @@ Operand mem_addr(unsigned ra, bool ra64, const std::string& ra_suffix, int ur, i
   return o;
 }
 
+// Turing's global addresses: a uniform register (91) is part of the
+// address, the register a 64-bit one (90) or a 32-bit offset (.U32) beside
+// it.
+Operand sm75_gaddr(const Word& w, unsigned ur_pos, int64_t off, int sm) {
+  const unsigned ra = static_cast<unsigned>(w.field(24, 8));
+  const bool has_ur = w.bit(91);
+  const int ur = has_ur ? static_cast<int>(w.field(ur_pos, ureg_bits(sm))) : -1;
+  const char* suffix = !has_ur ? "" : w.bit(90) ? ".64" : ".U32";
+  return mem_addr(ra, false, suffix, ur, off, sm);
+}
+
+// From sm_90 nvdisasm prints an .E access's memory descriptor, the uniform
+// register pair holding it (earlier architectures have it too, unprinted).
+void add_desc(Operand& a, const Word& w, unsigned pos, int sm) {
+  if (sm < 90) return;
+  a.text = "desc[UR" + std::to_string(w.field(pos, ureg_bits(sm))) + "]" + a.text;
+}
+
 // Global and generic loads/stores: LDG, STG, LD, ST.
 void dec_gmem(Instr& ins, const Word& w, Op op, const char* name, bool store) {
   ins.op = op;
@@ -769,12 +806,18 @@ void dec_gmem(Instr& ins, const Word& w, Op op, const char* name, bool store) {
   // Bit 91 says the uniform register field is in use (the 0x3xx forms of
   // these opcodes have none).
   const int ur = w.bit(91) ? static_cast<int>(w.field(store ? 64 : 32, ureg_bits(ins.sm))) : -1;
-  const int64_t off = w.sfield(40, 24);
+  // Turing's generic LD/ST keep the offset at 32 unless a uniform register
+  // is there (91), and a store's data at 64.
+  const bool t_generic = ins.sm < 80 && (op == Op::LD || op == Op::ST);
+  const int64_t off = t_generic && !w.bit(91) ? w.sfield(32, 24) : w.sfield(40, 24);
   // With .E the uniform register is the descriptor, not part of the address.
-  const Operand addr = mem_addr(ra, ra64, "", e ? -1 : ur, off, ins.sm);
+  const bool t_moved = t_generic && !w.bit(91);   // offset at 32, data at 64
+  Operand addr = ins.sm < 80 ? sm75_gaddr(w, store ? 64 : 32, off, ins.sm)
+                             : mem_addr(ra, ra64, "", e ? -1 : ur, off, ins.sm);
+  if (e) add_desc(addr, w, store ? 64 : 32, ins.sm);
   if (store) {
     ins.src.push_back(addr);
-    ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8)), mem_regs(size)));
+    ins.src.push_back(R(static_cast<unsigned>(w.field(t_moved ? 64 : 32, 8)), mem_regs(size)));
   } else {
     ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), mem_regs(size)));
     ins.src.push_back(addr);
@@ -787,6 +830,7 @@ void dec_smem(Instr& ins, const Word& w, Op op, const char* name, bool store, bo
   ins.mnemonic = name;
   const unsigned size = static_cast<unsigned>(w.field(73, 3));
   if (!shared) evict_mods(ins, w);
+  if (shared && w.bit(76)) ins.mods.push_back("U");   // Turing: a uniform-address load
   if (*kMemSize[size]) ins.mods.push_back(kMemSize[size]);
   ins.f[0] = size;
   const unsigned ra = static_cast<unsigned>(w.field(24, 8));
@@ -820,7 +864,7 @@ void dec_ldc(Instr& ins, const Word& w) {
     t += "R" + std::to_string(ra);
     if (off) t += "+" + signed_hex(off);
   } else {
-    t += signed_hex(off);
+    t += off == 0 && ins.sm >= 90 ? "RZ" : signed_hex(off);   // Hopper names the zero register
   }
   Operand o = Txt(t + "]");
   o.kind = Kind::Mem;
@@ -1139,9 +1183,10 @@ std::string float_type(unsigned size) {
 void dec_i2f(Instr& ins, const Word& w) {
   ins.op = Op::I2F;
   ins.mnemonic = "I2F";
-  const unsigned dsize = static_cast<unsigned>(w.field(75, 2)), ssize = static_cast<unsigned>(w.field(84, 2));
+  const unsigned dsize = w.field(75, 3) == 4 ? 4 : static_cast<unsigned>(w.field(75, 2));   // 4: BF16
+  const unsigned ssize = static_cast<unsigned>(w.field(84, 2));
   const bool sgn = w.bit(74);
-  if (dsize != 2) ins.mods.push_back(float_type(dsize));
+  if (dsize != 2) ins.mods.push_back(dsize == 4 ? "BF16" : float_type(dsize));
   if (!(ssize == 2 && sgn)) ins.mods.push_back(int_type(ssize, sgn));
   const unsigned rnd = static_cast<unsigned>(w.field(78, 2));
   if (rnd) ins.mods.push_back(kRnd[rnd]);
@@ -1227,7 +1272,7 @@ void dec_i2i(Instr& ins, const Word& w) {
 void dec_f2fp(Instr& ins, const Word& w) {
   ins.op = Op::F2FP;
   ins.mnemonic = "F2FP";
-  static const char* const dts[] = {"F16", "BF16", "(2)", "(3)", "(4)", "(5)", "E5M2", "E4M3"};
+  static const char* const dts[] = {"F16", "BF16", "(2)", "(3)", "(4)", "TF32", "E5M2", "E4M3"};
   static const char* const sts[] = {"F32", "(1)", "E5M2", "E4M3"};
   const unsigned dt = static_cast<unsigned>(w.field(76, 3)), st = static_cast<unsigned>(w.field(73, 2));
   const unsigned mode = static_cast<unsigned>(w.field(87, 3));
@@ -1239,7 +1284,8 @@ void dec_f2fp(Instr& ins, const Word& w) {
   } else if (dt != 0) {
     ins.mods.push_back(dts[dt]);
   }
-  ins.mods.push_back(mode == 4 ? "UNPACK_B" : mode == 1 ? "PACK_AB_MERGE_C" : "PACK_AB");
+  // Form 4 is one operand: b packed from F32 (PACK_B: tf32), else unpacked.
+  ins.mods.push_back(mode == 4 ? (st == 0 ? "PACK_B" : "UNPACK_B") : mode == 1 ? "PACK_AB_MERGE_C" : "PACK_AB");
   const unsigned rnd = static_cast<unsigned>(w.field(79, 2));
   if (rnd) ins.mods.push_back(kRnd[rnd]);
   ins.f[0] = dt == 1;
@@ -1363,7 +1409,7 @@ void dec_bmma(Instr& ins, const Word& w) {
 void dec_dmma(Instr& ins, const Word& w) {
   ins.op = Op::DMMA;
   ins.mnemonic = "DMMA";
-  ins.mods.push_back("884");
+  ins.mods.push_back(ins.sm >= 90 ? "8x8x4" : "884");
   const unsigned rnd = static_cast<unsigned>(w.field(78, 2));
   if (rnd) ins.mods.push_back(kRnd[rnd]);
   ins.f[0] = rnd;
@@ -1461,6 +1507,58 @@ void dec_plop3(Instr& ins, const Word& w, bool uniform) {
   ins.f[1] = lut1;
 }
 
+// PLOP3 on registers' sign bits (sm_90, 0x21f): a, b, c at 24, 32, 64;
+// the first LUT half moves to 72-79.
+void dec_plop3_sign(Instr& ins, const Word& w) {
+  ins.op = Op::PLOP3;
+  ins.mnemonic = "PLOP3";
+  ins.mods.push_back("LUT");
+  ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
+  ins.dst.push_back(P(static_cast<unsigned>(w.field(84, 3))));
+  for (unsigned pos : {24u, 32u, 64u}) {
+    Operand r = R(static_cast<unsigned>(w.field(pos, 8)));
+    r.suffix = ".SIGN";
+    r.reuse = reuse(w, static_cast<int>(ins.src.size()));
+    ins.src.push_back(r);
+  }
+  const unsigned lut0 = static_cast<unsigned>(w.field(72, 8)), lut1 = static_cast<unsigned>(w.field(16, 8));
+  ins.src.push_back(Imm(lut0));
+  ins.src.push_back(Imm(lut1));
+  ins.f[0] = lut0;
+  ins.f[1] = lut1;
+  ins.f[2] = 1;   // sources are sign bits
+}
+
+// sm_90's integer ops: VIADD a + b; VIMNMX min/max(a, b); VIADDMNMX
+// min/max(a + b, c); VIMNMX3 min/max(a, b, c) (.S16x2 at 73: per halves).
+// 72 signed (else .U32), 87-90 the predicate choosing min, 63 b negated.
+void dec_viadd(Instr& ins, const Word& w) {
+  ins.op = Op::VIADD;
+  ins.mnemonic = "VIADD";
+  ins.dst.push_back(dst_reg(w, false, ins.sm));
+  alu2(ins, w, kUnsigned);
+  int_neg(ins.src[1], w);
+}
+
+void dec_vimnmx(Instr& ins, const Word& w, int nsrc, bool add) {
+  ins.op = add ? Op::VIADDMNMX : nsrc == 3 ? Op::VIMNMX3 : Op::VIMNMX;
+  ins.mnemonic = add ? "VIADDMNMX" : nsrc == 3 ? "VIMNMX3" : "VIMNMX";
+  const bool s16x2 = !add && w.bit(73);   // per 16-bit half
+  if (s16x2) ins.mods.push_back(w.bit(72) ? "S16x2" : "U16x2");
+  else if (!w.bit(72)) ins.mods.push_back("U32");
+  if (w.bit(76)) ins.mods.push_back("RELU");   // a negative result becomes 0
+  ins.f[0] = w.bit(72);
+  ins.f[1] = s16x2;
+  ins.f[2] = w.bit(76);
+  ins.dst.push_back(dst_reg(w, false, ins.sm));
+  // VIMNMX prints a signed immediate as signed; the others print the bits.
+  const ImmStyle imm = !add && nsrc == 2 ? kSigned : kUnsigned;
+  if (nsrc == 3) alu3(ins, w, imm);
+  else alu2(ins, w, imm);
+  if (add) int_neg(ins.src[1], w);
+  ins.src.push_back(pred_src(w, 87, 90));
+}
+
 void dec_p2r(Instr& ins, const Word& w) {
   ins.op = Op::P2R;
   ins.mnemonic = "P2R";
@@ -1476,10 +1574,14 @@ void dec_p2r(Instr& ins, const Word& w) {
 void dec_r2p(Instr& ins, const Word& w) {
   ins.op = Op::R2P;
   ins.mnemonic = "R2P";
-  if (w.field(72, 2)) ins.mods.push_back("B" + std::to_string(w.field(72, 2)));
-  ins.f[0] = static_cast<uint32_t>(w.field(72, 2));
+  // Which byte of the register: 72-73, printed as a modifier; Turing keeps
+  // it at 76-77 and prints it on the register.
+  const unsigned byte = static_cast<unsigned>(ins.sm < 80 ? w.field(76, 2) : w.field(72, 2));
+  if (byte && ins.sm >= 80) ins.mods.push_back("B" + std::to_string(byte));
+  ins.f[0] = byte;
   ins.dst.push_back(Txt("PR"));
   alu2(ins, w, kUnsigned);
+  if (byte && ins.sm < 80) ins.src[0].suffix = ".B" + std::to_string(byte);
 }
 
 // ---- one-source integer ops -----------------------------------------------------
@@ -1579,12 +1681,29 @@ void dec_warpsync(Instr& ins, const Word& w) {
   ins.mnemonic = "WARPSYNC";
   const unsigned cond = static_cast<unsigned>(w.field(87, 3));
   if (cond != kPT || w.bit(90)) ins.src.push_back(pred_src(w, 87, 90));
-  one_src(ins, w, kUnsigned, false);
+  if (ins.sm >= 90 && w.field(9, 3) == 1) {
+    ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));   // moved to 24
+    if (w.bit(85)) ins.mods.push_back("EXCLUSIVE");
+    // .COLLECTIVE (86): with a branch target, for collectives in divergent
+    // code (paired with ENDCOLLECTIVE).
+    if (w.bit(86)) {
+      ins.mods.push_back("COLLECTIVE");
+      ins.src.push_back(label(branch_target(w, ins.pc, ins.sm)));
+      ins.f[1] = 1;
+    }
+  } else if (ins.sm >= 90 && w.field(32, 32) == 0) {
+    ins.mods.push_back("ALL");   // Hopper spells the full mask so
+    ins.f[0] = 1;
+  } else {
+    one_src(ins, w, kUnsigned, false);
+  }
 }
 
 void dec_nanosleep(Instr& ins, const Word& w) {
   ins.op = Op::NANOSLEEP;
   ins.mnemonic = "NANOSLEEP";
+  if (w.bit(84)) ins.mods.push_back("SYNCS");   // sm_90: wakes on a transaction barrier too
+  if (w.bit(85)) ins.mods.push_back("WARP");
   one_src(ins, w, kUnsigned, false);
 }
 
@@ -1713,9 +1832,12 @@ void dec_r2ur(Instr& ins, const Word& w) {
   ins.op = Op::R2UR;
   ins.mnemonic = "R2UR";
   const unsigned pd = static_cast<unsigned>(w.field(81, 3));
+  if (w.bit(84)) ins.mods.push_back("OR");
+  ins.f[0] = pd != kPT;
   if (pd != kPT) ins.dst.push_back(P(pd));
   ins.dst.push_back(UR(static_cast<unsigned>(w.field(16, ureg_bits(ins.sm))), ins.sm));
   ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
+  ins.src.back().reuse = reuse(w, 0);
 }
 
 // ---- atomics -------------------------------------------------------------------
@@ -1745,14 +1867,54 @@ void dec_atom_g(Instr& ins, const Word& w, Op op, const char* name) {
   ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
   ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), w.field(73, 3) == 2 || w.field(73, 3) == 5 ? 2 : 1));
   const int ur = w.bit(91) && !w.bit(72) ? static_cast<int>(w.field(64, ureg_bits(ins.sm))) : -1;
-  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), w.bit(90) || w.bit(72), "", ur, w.sfield(40, 24), ins.sm));
+  // The 0x3xx forms (bit 11 clear) have no uniform-register field and print
+  // a bare register.
+  const bool full = w.bit(11);
+  ins.src.push_back(ins.sm < 80 ? sm75_gaddr(w, 64, w.sfield(40, 24), ins.sm)
+                                : mem_addr(static_cast<unsigned>(w.field(24, 8)), full && (w.bit(90) || w.bit(72)), "", ur,
+                                           w.sfield(40, 24), ins.sm));
+  if (full && w.bit(72)) add_desc(ins.src.back(), w, 64, ins.sm);
   ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8))));
+}
+
+// sm_90's float atomics, opcodes of their own: ATOM (0x9a2, generic),
+// ATOMG (0x9a3), REDG (0x9a6). 73-76 the type (9 F32, 15 F64, 0 F16x2,
+// 3 BF16x2), mapped onto the older types' numbering (BF16x2 is 7).
+void dec_atom_f(Instr& ins, const Word& w, Op op, const char* name) {
+  ins.op = op;
+  ins.mnemonic = name;
+  const bool red = op == Op::RED;
+  if (w.bit(72)) ins.mods.push_back("E");
+  const unsigned aop = static_cast<unsigned>(w.field(87, red ? 3 : 4));
+  ins.mods.push_back(kAtomOp[aop]);
+  unsigned t;
+  const char* tname;
+  switch (w.field(73, 4)) {
+    case 9: t = 3; tname = "F32.FTZ.RN"; break;
+    case 15: t = 6; tname = "F64.RN"; break;
+    case 0: t = 4; tname = "F16x2.RN"; break;
+    case 3: t = 7; tname = "BF16x2.RN"; break;
+    default: throw Error(Err::UnsupportedPtx, "SASS: float atomic type " + std::to_string(w.field(73, 4)));
+  }
+  ins.mods.push_back(tname);
+  mem_order_mods(ins, w);
+  evict_mods(ins, w);
+  ins.f[0] = aop;
+  ins.f[4] = t;
+  const unsigned width = t == 6 ? 2 : 1;
+  if (!red) {
+    ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
+    ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), width));
+  }
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), w.bit(90) || w.bit(72), "", -1, w.sfield(40, 24), ins.sm));
+  if (w.bit(72)) add_desc(ins.src.back(), w, 64, ins.sm);
+  ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8)), width));
 }
 
 // RED: an atomic with no result.
 void dec_red(Instr& ins, const Word& w) {
   ins.op = Op::RED;
-  ins.mnemonic = "RED";
+  ins.mnemonic = ins.sm >= 90 ? "REDG" : "RED";
   if (w.bit(72)) ins.mods.push_back("E");
   const unsigned aop = static_cast<unsigned>(w.field(87, 3));
   ins.mods.push_back(kAtomOp[aop]);
@@ -1761,7 +1923,9 @@ void dec_red(Instr& ins, const Word& w) {
   evict_mods(ins, w);
   ins.f[0] = aop;
   const int ur = w.bit(91) && !w.bit(72) ? static_cast<int>(w.field(64, ureg_bits(ins.sm))) : -1;
-  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), w.bit(90), "", ur, w.sfield(40, 24), ins.sm));
+  ins.src.push_back(ins.sm < 80 ? sm75_gaddr(w, 64, w.sfield(40, 24), ins.sm)
+                                : mem_addr(static_cast<unsigned>(w.field(24, 8)), w.bit(90), "", ur, w.sfield(40, 24), ins.sm));
+  if (w.bit(72)) add_desc(ins.src.back(), w, 64, ins.sm);
   ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8))));
 }
 
@@ -1820,14 +1984,33 @@ void dec_atoms_popc(Instr& ins, const Word& w) {
 
 const char* const kTexDim[] = {"1D", "2D", "3D", "CUBE", "ARRAY_1D", "ARRAY_2D", "(6)", "ARRAY_CUBE"};
 
+// The object: a constant-bank word (bank 54-58, word 40-53) in the 0xbXX
+// forms; in the 0xfXX forms (sm_90+) a uniform register at 40 holding the
+// handle's low word, then an immediate (sm_90) or a second uniform register
+// at 48 (sm_100, unprinted when URZ).
+void tex_object(Instr& ins, const Word& w) {
+  if (!w.bit(10)) {
+    ins.src.push_back(Imm(w.field(54, 5)));
+    ins.src.push_back(Imm(w.field(40, 14)));   // the header's word index in the bank
+    return;
+  }
+  ins.f[6] = 1;   // handle in a uniform register
+  ins.f[7] = static_cast<uint32_t>(w.field(40, ureg_bits(ins.sm)));
+  ins.src.push_back(UR(static_cast<unsigned>(w.field(40, ureg_bits(ins.sm))), ins.sm));
+  if (ins.sm < 100) {
+    ins.src.push_back(Imm(w.field(48, 6)));
+  } else if (w.field(48, 8) != urz(ins.sm)) {
+    ins.src.push_back(UR(static_cast<unsigned>(w.field(48, 8)), ins.sm));
+  }
+}
+
 void tex_common(Instr& ins, const Word& w, bool with_mask) {
   ins.dst.push_back(R(static_cast<unsigned>(w.field(64, 8))));
   ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
   ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
   // A second coordinate register of RZ (a 1D lookup) is not printed.
   if (w.field(32, 8) != kRZ) ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8))));
-  ins.src.push_back(Imm(w.field(54, 5)));
-  ins.src.push_back(Imm(w.field(40, 14)));   // the header's word index in the bank
+  tex_object(ins, w);
   ins.src.push_back(Txt(kTexDim[w.field(61, 3)]));
   if (with_mask && w.field(72, 4) != 0xf) ins.src.push_back(Imm(w.field(72, 4)));   // all four: the default
   ins.f[0] = static_cast<uint32_t>(w.field(61, 3));
@@ -1898,8 +2081,7 @@ void dec_suld(Instr& ins, const Word& w) {
   const unsigned size = static_cast<unsigned>(w.field(73, 3));
   ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), mem_regs(size)));
   ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), false, "", -1, 0, ins.sm));
-  ins.src.push_back(Imm(w.field(54, 5)));
-  ins.src.push_back(Imm(w.field(40, 14)));
+  tex_object(ins, w);
 }
 
 void dec_sust(Instr& ins, const Word& w) {
@@ -1909,8 +2091,7 @@ void dec_sust(Instr& ins, const Word& w) {
   const unsigned size = static_cast<unsigned>(w.field(73, 3));
   ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), false, "", -1, 0, ins.sm));
   ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8)), mem_regs(size)));
-  ins.src.push_back(Imm(w.field(54, 5)));
-  ins.src.push_back(Imm(w.field(40, 14)));
+  tex_object(ins, w);
 }
 
 // ---- the rest ------------------------------------------------------------------
@@ -1998,6 +2179,7 @@ void dec_ldgsts(Instr& ins, const Word& w) {
   ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(16, 8)), false, "", -1,
                              static_cast<int64_t>(w.field(44, 20)), ins.sm));
   ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), true, "", -1, w.sfield(32, 12), ins.sm));
+  add_desc(ins.src.back(), w, 64, ins.sm);
   const unsigned p = static_cast<unsigned>(w.field(87, 3));
   if (p != kPT || w.bit(90)) ins.src.push_back(pred_src(w, 87, 90));
 }
@@ -2072,6 +2254,315 @@ void dec_uldc_idx(Instr& ins, const Word& w) {
   ins.src[0] = c;
   ins.f[1] = 1;   // indexed
   ins.f[2] = bank;
+}
+
+// ---- Hopper: transaction barriers, cluster and warpgroup housekeeping ----------
+//
+// SYNCS works on an mbarrier, a 64-bit word in shared memory whose layout
+// ptxas spells out (the constants it emits for mbarrier.init and
+// pending_count): the low word holds 0x100000 - count at bits 1-20, the high
+// word counts arrivals up from the same value at bits 11-30 and holds the
+// phase at bit 31. The address is [Ra + URb + offset]: Ra at 24, URb at 64,
+// the offset at 40-63.
+Operand syncs_addr(const Word& w, int sm) {
+  const unsigned ra = static_cast<unsigned>(w.field(24, 8));
+  const int ur = static_cast<int>(w.field(64, ureg_bits(sm)));
+  return mem_addr(ra, false, "", ur, w.sfield(40, 24), sm, ra != kRZ);
+}
+
+// SYNCS.EXCH.64 URd, [URa + offset], URb: store b, returning the old word
+// (mbarrier.init).
+void dec_syncs_exch(Instr& ins, const Word& w) {
+  ins.op = Op::SYNCS;
+  ins.mnemonic = "SYNCS";
+  ins.mods.push_back("EXCH");
+  if (w.bit(72)) ins.mods.push_back("64");
+  ins.f[0] = 0;   // EXCH
+  ins.dst.push_back(UR(static_cast<unsigned>(w.field(16, ureg_bits(ins.sm))), ins.sm));
+  ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, ureg_bits(ins.sm))), w.sfield(40, 24), ins.sm));
+  ins.src.push_back(UR(static_cast<unsigned>(w.field(32, ureg_bits(ins.sm))), ins.sm));
+}
+
+// SYNCS.ARRIVE.TRANS64[.RED][.OPTOUT][.mode] Rd, [addr], Rb. 84-86 the
+// mode: 0 arrive once and expect Rb more transaction bytes, 1 .A1T0 arrive
+// once, 3 .A0TR expect Rb bytes, 4 .A0TX complete Rb bytes, 5 .ART0 arrive
+// Rb times. 74 .RED returns nothing; 75 .OPTOUT also leaves the barrier
+// for later phases (arrive_drop). Rd (a pair) gets the word before.
+void dec_syncs_arrive(Instr& ins, const Word& w) {
+  ins.op = Op::SYNCS;
+  ins.mnemonic = "SYNCS";
+  ins.mods.push_back("ARRIVE");
+  ins.mods.push_back("TRANS64");
+  if (w.bit(74)) ins.mods.push_back("RED");
+  if (w.bit(75)) ins.mods.push_back("OPTOUT");
+  static const char* const modes[] = {"", "A1T0", "(2)", "A0TR", "A0TX", "ART0", "(6)", "(7)"};
+  const unsigned mode = static_cast<unsigned>(w.field(84, 3));
+  if (mode) ins.mods.push_back(modes[mode]);
+  ins.f[0] = 1;   // ARRIVE
+  ins.f[1] = mode;
+  ins.f[2] = w.bit(75);
+  const unsigned rd = static_cast<unsigned>(w.field(16, 8));
+  ins.dst.push_back(R(rd, rd == kRZ ? 1 : 2));
+  ins.src.push_back(syncs_addr(w, ins.sm));
+  ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8))));
+}
+
+// SYNCS.PHASECHK.TRANS64[.TRYWAIT] Pd, [addr], Rb: whether the phase whose
+// parity is Rb's bit 31 has completed (72: .TRYWAIT, the waiting form).
+void dec_syncs_phasechk(Instr& ins, const Word& w) {
+  ins.op = Op::SYNCS;
+  ins.mnemonic = "SYNCS";
+  ins.mods.push_back("PHASECHK");
+  ins.mods.push_back("TRANS64");
+  if (w.bit(72)) ins.mods.push_back("TRYWAIT");
+  ins.f[0] = 2;   // PHASECHK
+  ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
+  ins.src.push_back(syncs_addr(w, ins.sm));
+  ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8))));
+}
+
+// SYNCS.CCTL.IV [addr]: invalidate an mbarrier (.IVALL: all of them).
+void dec_syncs_cctl(Instr& ins, const Word& w) {
+  ins.op = Op::SYNCS;
+  ins.mnemonic = "SYNCS";
+  ins.mods.push_back("CCTL");
+  ins.f[0] = 3;
+  if (!w.bit(91)) {   // no address: all of them
+    ins.mods.push_back("IVALL");
+    return;
+  }
+  ins.mods.push_back("IV");
+  ins.src.push_back(syncs_addr(w, ins.sm));
+}
+
+// STSM.16.M88(.2/.4) (stmatrix): LDSM's layout, stored: 72-73 the count,
+// 78 .MT88; the address at 24 (+ offset 40-63), the data at 32.
+void dec_stsm(Instr& ins, const Word& w) {
+  ins.op = Op::STSM;
+  ins.mnemonic = "STSM";
+  ins.mods.push_back("16");
+  ins.mods.push_back(w.bit(78) ? "MT88" : "M88");
+  const unsigned n = static_cast<unsigned>(w.field(72, 2));
+  if (n == 1) ins.mods.push_back("2");
+  if (n == 2) ins.mods.push_back("4");
+  ins.f[0] = 1u << n;
+  ins.f[1] = w.bit(78);
+  const int ur = w.bit(91) ? static_cast<int>(w.field(64, ureg_bits(ins.sm))) : -1;
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), false, "", ur, w.sfield(40, 24), ins.sm));
+  ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8)), 1u << n));
+}
+
+// LEPC Rd, target (sm_90's 0x94e): the address of a code location, for a
+// return address; the offset keeps the old layout (Rd is at 16).
+void dec_lepc_target(Instr& ins, const Word& w) {
+  ins.op = Op::MOV;
+  ins.mnemonic = "LEPC";
+  ins.f[7] = 0x4e;
+  ins.f[6] = 1;   // with a target
+  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), 2));
+  // The offset's low byte is at 24-31 here (seen: 0x10, one instruction).
+  const int64_t off = static_cast<int64_t>(static_cast<uint64_t>(w.sfield(34, 48)) << 8 | w.field(24, 8));
+  ins.src.push_back(label(static_cast<uint64_t>(static_cast<int64_t>(ins.pc) + 16 + off)));
+}
+
+// ELECT Pd, URd, Ps: one leader among the threads with Ps; Pd says which,
+// URd gets its lane.
+void dec_elect(Instr& ins, const Word& w) {
+  ins.op = Op::ELECT;
+  ins.mnemonic = "ELECT";
+  ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
+  ins.dst.push_back(UR(static_cast<unsigned>(w.field(16, ureg_bits(ins.sm))), ins.sm));
+  ins.src.push_back(pred_src(w, 87, 90));
+}
+
+// Operand-less housekeeping the executor treats as no-ops or waits.
+void dec_plain(Instr& ins, Op op, const char* name) {
+  ins.op = op;
+  ins.mnemonic = name;
+}
+
+// FENCE.VIEW.ASYNC.S: order generic-proxy shared memory accesses before
+// async-proxy ones (fence.proxy.async).
+void dec_fence(Instr& ins, const Word&) {
+  ins.op = Op::MEMBAR;
+  ins.mnemonic = "FENCE";
+  ins.mods = {"VIEW", "ASYNC", "S"};
+}
+
+// UTMACCTL.PF/.IV [URa]: prefetch or invalidate a TMA descriptor (82: PF).
+void dec_utmacctl(Instr& ins, const Word& w) {
+  ins.op = Op::CCTL;
+  ins.mnemonic = "UTMACCTL";
+  ins.mods.push_back(w.bit(82) ? "PF" : "IV");
+  ins.f[0] = 0xff;   // not a data-cache op
+  ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, ureg_bits(ins.sm))), 0, ins.sm));
+}
+
+// USETMAXREG.DEALLOC/.TRY_ALLOC.CTAPOOL [UPd,] n (setmaxnreg): 72-73 the
+// direction, 74 .CTAPOOL, the count at 32.
+void dec_usetmaxreg(Instr& ins, const Word& w) {
+  ins.op = Op::USETMAXREG;
+  ins.mnemonic = "USETMAXREG";
+  static const char* const dirs[] = {"(0)", "DEALLOC", "TRY_ALLOC", "(3)"};
+  ins.mods.push_back(dirs[w.field(72, 2)]);
+  if (w.bit(74)) ins.mods.push_back("CTAPOOL");
+  const unsigned up = static_cast<unsigned>(w.field(81, 3));
+  if (up != kPT) ins.dst.push_back(UP(up));
+  ins.src.push_back(Imm(w.field(32, 8)));
+}
+
+// WARPGROUP.ARRIVE (wgmma.fence) and WARPGROUP.DEPBAR.LE gsb0, n
+// (wgmma.wait_group n; 80 selects it).
+void dec_warpgroup(Instr& ins, const Word& w) {
+  ins.op = Op::WARPGROUP;
+  ins.mnemonic = "WARPGROUP";
+  if (!w.bit(80)) {
+    ins.mods.push_back("ARRIVE");
+    return;
+  }
+  ins.mods.push_back("DEPBAR");
+  if (w.bit(47)) ins.mods.push_back("LE");
+  ins.src.push_back(Txt("gsb0"));
+  ins.src.push_back(Imm(w.field(72, 6)));
+}
+
+// LDGMC (multimem.ld_reduce): a reduction over a multicast object's copies.
+// Decoded for the record; the executor does not model multicast memory.
+void dec_ldgmc(Instr& ins, const Word& w) {
+  ins.op = Op::LDGMC;
+  ins.mnemonic = "LDGMC";
+  if (w.bit(72)) ins.mods.push_back("E");
+  const unsigned t = static_cast<unsigned>(w.field(73, 4));
+  ins.mods.push_back(w.field(88, 2) == 3 ? "F32ADD" : "ADD");
+  static const std::map<unsigned, const char*> types = {
+      {12, "F32.RN"}, {13, "F32x2.RN"}, {14, "F32x4.RN"}, {3, "BF16x2.RN"}, {4, "BF16x4.RN"}, {5, "BF16x8.RN"}};
+  const auto ty = types.find(t);
+  ins.mods.push_back(ty != types.end() ? ty->second : "(t" + std::to_string(t) + ")");
+  mem_order_mods(ins, w);
+  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), true, "", static_cast<int>(w.field(64, ureg_bits(ins.sm))),
+                             w.sfield(40, 24), ins.sm, true));
+}
+
+// ---- Hopper: warpgroup MMA and the tensor memory accelerator ------------------
+//
+// [HIQB]GMMA (wgmma.mma_async; 0x9f0-0x9f3, 0xdf0 with A in registers):
+//   16 D, 24 A's registers or the descriptors' uniform registers (gdesc:
+//   A's then B's 64-bit smem descriptors), 32 the descriptors when A is in
+//   registers, 64 C (RZ: none), 53-57 N/8 - 1, 61/62 A/B transposed, 72/63
+//   A/B negated, 73 sparse (metadata register at 40, selector at 48),
+//   72-79 the types (below), 82 .SAT, 84-86 the scoreboard (0 gsb0, 7
+//   none), 87-89 the scale-d predicate stored as 7 - UPn, 90 its not.
+enum GmmaKind { kGmmaH, kGmmaI, kGmmaB, kGmmaQ };
+
+void dec_gmma(Instr& ins, const Word& w, GmmaKind kind) {
+  static const char* const names[] = {"HGMMA", "IGMMA", "BGMMA", "QGMMA"};
+  static const Op ops[] = {Op::HGMMA, Op::IGMMA, Op::BGMMA, Op::QGMMA};
+  ins.op = ops[kind];
+  ins.mnemonic = names[kind];
+  const bool reg_a = w.bit(10), sp = w.bit(73);
+  const unsigned n = (static_cast<unsigned>(w.field(53, 5)) + 1) * 8;
+  unsigned k = 0;
+  std::vector<std::string> types;
+  switch (kind) {
+    case kGmmaH:
+      k = w.bit(77) ? 8 : 16;
+      types.push_back(w.bit(75) ? "F32" : "F16");
+      if (w.bit(76)) types.push_back("BF16");
+      if (w.bit(77)) types.push_back("TF32");
+      break;
+    case kGmmaI:
+      k = 32;
+      types.push_back(w.bit(76) ? "S8" : "U8");
+      types.push_back(w.bit(75) ? "S8" : "U8");
+      if (w.bit(82)) types.push_back("SAT");
+      break;
+    case kGmmaB:
+      k = 256;
+      types.push_back(w.bit(78) ? "AND" : "XOR");
+      types.push_back("POPC");
+      break;
+    case kGmmaQ:
+      k = 32;
+      types.push_back(w.bit(75) ? "F32" : "F16");
+      types.push_back(w.bit(76) ? "E5M2" : "E4M3");
+      types.push_back(w.bit(77) ? "E5M2" : "E4M3");
+      break;
+  }
+  if (sp) {
+    ins.mods.push_back("SP");
+    k *= 2;
+  }
+  ins.mods.push_back("64x" + std::to_string(n) + "x" + std::to_string(k));
+  for (const std::string& t : types) ins.mods.push_back(t);
+  ins.f[0] = n;
+  ins.f[1] = k;
+  ins.f[2] = static_cast<uint32_t>(w.field(72, 8));   // the type bits, as above
+  ins.f[3] = reg_a;
+  ins.f[4] = sp;
+  ins.f[5] = (w.bit(61) ? 1u : 0u) | (w.bit(62) ? 2u : 0u) | (w.bit(72) && kind == kGmmaH ? 4u : 0u) |
+             (w.bit(63) ? 8u : 0u);   // tnspA, tnspB, negA, negB
+  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
+  const unsigned desc_at = reg_a ? 32 : 24;
+  if (reg_a) ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
+  std::string g = "gdesc[UR" + std::to_string(w.field(desc_at, ureg_bits(ins.sm))) + "]";
+  if (kind == kGmmaH && w.bit(72)) g += ".negA";
+  if (w.bit(63)) g += ".negB";
+  if (w.bit(61)) g += ".tnspA";
+  if (w.bit(62)) g += ".tnspB";
+  Operand d = Txt(g);
+  d.reg = static_cast<unsigned>(w.field(desc_at, ureg_bits(ins.sm)));
+  ins.src.push_back(d);
+  ins.src.push_back(R(static_cast<unsigned>(w.field(64, 8))));
+  const unsigned up = 7 - static_cast<unsigned>(w.field(87, 3));
+  ins.f[6] = up | (w.bit(90) ? 8u : 0u);
+  if (up != kPT || w.bit(90)) ins.src.push_back(UP(up, w.bit(90)));
+  if (sp) {
+    ins.src.push_back(R(static_cast<unsigned>(w.field(40, 8))));
+    ins.src.push_back(Imm(w.field(48, 2)));
+  }
+  if (w.field(84, 3) == 0) ins.src.push_back(Txt("gsb0"));
+}
+
+// UTMALDG / UTMASTG / UTMAREDG (cp.async.bulk.tensor): 79-81 the
+// dimensions less one, 82 .IM2COL (offsets in the uniform register at 64),
+// 75 .MULTICAST (the CTA mask there), 76 an L2 policy descriptor at 40.
+// [URa] at 32: a load's shared destination, its mbarrier (URa+1) and the
+// coordinates (URa+2...); a store's shared source and the coordinates
+// (URa+1...). [URb] at 24: the tensor map's address.
+void dec_tma(Instr& ins, const Word& w, Op op, const char* name) {
+  ins.op = op;
+  ins.mnemonic = name;
+  const unsigned dims = static_cast<unsigned>(w.field(79, 3)) + 1;
+  ins.mods.push_back(std::to_string(dims) + "D");
+  if (op == Op::UTMAREDG) ins.mods.push_back("ADD");
+  if (w.bit(82)) ins.mods.push_back("IM2COL");
+  if (w.bit(75)) ins.mods.push_back("MULTICAST");
+  ins.f[0] = dims;
+  ins.f[1] = w.bit(82);
+  ins.f[2] = w.bit(75);
+  const int ub = static_cast<int>(ureg_bits(ins.sm));
+  ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(32, ub)), 0, ins.sm));
+  ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, ub)), 0, ins.sm));
+  if (w.bit(82) || w.bit(75)) ins.src.push_back(UR(static_cast<unsigned>(w.field(64, ub)), ins.sm));
+  if (w.bit(76)) ins.src.push_back(Txt("desc[UR" + std::to_string(w.field(40, ub)) + "]"));
+}
+
+// UBLKCP.S.G / .G.S (cp.async.bulk): shared <- global (73) or global <-
+// shared (74). [URa] at 32 the destination (a shared one's mbarrier at
+// URa+1), [URb] at 24 the source, the byte count in the uniform register at
+// 64.
+void dec_ublkcp(Instr& ins, const Word& w) {
+  ins.op = Op::UBLKCP;
+  ins.mnemonic = "UBLKCP";
+  const bool to_global = w.bit(74);
+  ins.mods.push_back(to_global ? "G" : "S");
+  ins.mods.push_back(to_global ? "S" : "G");
+  ins.f[0] = to_global;
+  const int ub = static_cast<int>(ureg_bits(ins.sm));
+  ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(32, ub)), 0, ins.sm));
+  ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, ub)), 0, ins.sm));
+  ins.src.push_back(UR(static_cast<unsigned>(w.field(64, ub)), ins.sm));
 }
 
 void dec_vabsdiff4(Instr& ins, const Word& w) {
@@ -2233,6 +2724,10 @@ const std::unordered_map<unsigned, Dec>& float_table() {
       {0x26, dec_idp},
       {0x1b, dec_bmsk},
       {0x39, dec_i2ip},
+      {0x36, dec_viadd},
+      {0x48, [](Instr& i, const Word& w) { dec_vimnmx(i, w, 2, false); }},
+      {0x46, [](Instr& i, const Word& w) { dec_vimnmx(i, w, 3, true); }},
+      {0x0f, [](Instr& i, const Word& w) { dec_vimnmx(i, w, 3, false); }},
       {0x0be, [](Instr& i, const Word& w) { dec_brev(i, w, true); }},
   };
   return t;
@@ -2278,12 +2773,42 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
       {0x38d, [](Instr& i, const Word& w) { dec_atoms(i, w, true); }},
       {0xf8c, dec_atoms_popc},
       {0xb60, dec_tex}, {0xb66, dec_tld}, {0xb63, dec_tld4}, {0xb99, dec_suld}, {0xb9d, dec_sust},
+      {0xf60, dec_tex}, {0xf66, dec_tld}, {0xf63, dec_tld4}, {0xf99, dec_suld}, {0xf9d, dec_sust},
       {0x34e, dec_lepc}, {0x98f, dec_cctl}, {0x31c, dec_b2r}, {0x3aa, dec_qspc}, {0x9ab, dec_errbar},
       {0x942, dec_break}, {0x95c, dec_bpt},
       {0x3a9, [](Instr& i, const Word& w) { dec_atom_cas(i, w, Op::ATOMG, "ATOMG"); }},
       {0x9a9, [](Instr& i, const Word& w) { dec_atom_cas(i, w, Op::ATOMG, "ATOMG"); }},
       {0x38b, [](Instr& i, const Word& w) { dec_atom_cas(i, w, Op::ATOM, "ATOM"); }},
       {0x98b, [](Instr& i, const Word& w) { dec_atom_cas(i, w, Op::ATOM, "ATOM"); }},
+      {0x9a2, [](Instr& i, const Word& w) { dec_atom_f(i, w, Op::ATOM, "ATOM"); }},
+      {0x9a3, [](Instr& i, const Word& w) { dec_atom_f(i, w, Op::ATOMG, "ATOMG"); }},
+      {0x9a6, [](Instr& i, const Word& w) { dec_atom_f(i, w, Op::RED, "REDG"); }},
+      {0x21f, dec_plop3_sign}, {0x2ca, dec_r2ur},
+      {0x5b2, dec_syncs_exch}, {0x9a7, dec_syncs_arrive}, {0x5a7, dec_syncs_phasechk}, {0x9b1, dec_syncs_cctl},
+      {0x844, dec_stsm}, {0x94e, dec_lepc_target}, {0x82f, dec_elect}, {0x3c6, dec_fence}, {0x9b9, dec_utmacctl},
+      {0x9c8, dec_usetmaxreg}, {0x9c5, dec_warpgroup}, {0x9a5, dec_ldgmc},
+      {0x5ab, [](Instr& i, const Word&) { dec_plain(i, Op::ERRBAR, "CGAERRBAR"); }},
+      {0x91b, [](Instr& i, const Word&) { dec_plain(i, Op::ENDCOLLECTIVE, "ENDCOLLECTIVE"); }},
+      {0x82e, [](Instr& i, const Word&) { dec_plain(i, Op::NOP, "ACQBULK"); }},
+      {0x82d, [](Instr& i, const Word&) { dec_plain(i, Op::NOP, "PREEXIT"); }},
+      {0x9b7, [](Instr& i, const Word&) { dec_plain(i, Op::NOP, "UTMACMDFLUSH"); }},
+      {0x9f0, [](Instr& i, const Word& w) { dec_gmma(i, w, kGmmaH); }},
+      {0xdf0, [](Instr& i, const Word& w) { dec_gmma(i, w, kGmmaH); }},
+      {0x9f1, [](Instr& i, const Word& w) { dec_gmma(i, w, kGmmaI); }},
+      {0xdf1, [](Instr& i, const Word& w) { dec_gmma(i, w, kGmmaI); }},
+      {0x9f2, [](Instr& i, const Word& w) { dec_gmma(i, w, kGmmaB); }},
+      {0x9f3, [](Instr& i, const Word& w) { dec_gmma(i, w, kGmmaQ); }},
+      {0xdf3, [](Instr& i, const Word& w) { dec_gmma(i, w, kGmmaQ); }},
+      {0x5b4, [](Instr& i, const Word& w) { dec_tma(i, w, Op::UTMALDG, "UTMALDG"); }},
+      {0x3b4, [](Instr& i, const Word& w) { dec_tma(i, w, Op::UTMALDG, "UTMALDG"); }},
+      {0x3b5, [](Instr& i, const Word& w) { dec_tma(i, w, Op::UTMASTG, "UTMASTG"); }},
+      {0x3b6, [](Instr& i, const Word& w) { dec_tma(i, w, Op::UTMAREDG, "UTMAREDG"); }},
+      {0x3ba, dec_ublkcp},
+      {0x9c7, [](Instr& i, const Word&) { dec_plain(i, Op::UCGABAR, "UCGABAR_ARV"); }},   // barrier.cluster.arrive
+      {0xdc7, [](Instr& i, const Word&) {                                                // barrier.cluster.wait
+         dec_plain(i, Op::UCGABAR, "UCGABAR_WAIT");
+         i.f[0] = 1;
+       }},
       {0x356, dec_bmov}, {0x355, dec_bmov_r}, {0x958, dec_brxu}, {0xfae, dec_ldgsts}, {0x83b, dec_ldsm}, {0x9af, dec_ldgdepbar},
       {0xabb, dec_uldc_idx},
       {0x23c, dec_hmma}, {0x27a, dec_qmma}, {0x237, dec_imma}, {0x23d, dec_bmma}, {0x23f, dec_dmma}, {0x23a, dec_movm},
@@ -2313,7 +2838,9 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
   if (const auto it = fixed_table().find(opc); it != fixed_table().end()) {
     it->second(ins, w);
     // The uniform datapath's own ops take a UP guard.
-    if (opc == 0x9c3 || opc == 0xab9 || opc == 0xabb || opc == 0x89c) ins.guard_uniform = true;
+    if (opc == 0x9c3 || opc == 0xab9 || opc == 0xabb || opc == 0x89c || opc == 0x5b2 || opc == 0x5b4 || opc == 0x3b4 ||
+        opc == 0x3b5 || opc == 0x3b6 || opc == 0x3ba)
+      ins.guard_uniform = true;
     return ins;
   }
   const unsigned low9 = opc & 0x1ff;
