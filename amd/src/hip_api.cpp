@@ -3973,17 +3973,18 @@ hipError_t hipGraphRetainUserObject(void*, void*, unsigned int, unsigned int) {
 
 // ---- Memory ----------------------------------------------------------------------
 
-// Device memory by kind: coarse-grained (0) and contiguous (4) are plain
-// device memory; fine-grained (1), signal memory (2) and uncached (3) are
-// what the host reads and writes directly too, as it does on a card -- here
-// host memory every device reaches, as pinned memory is, freed with hipFree.
-// Every write is visible at once either way.
+// Device memory by kind. Coarse-grained (0), fine-grained (1), uncached (3)
+// and contiguous (4) are all device memory, as ROCm's HIP reports them, and
+// what RCCL fills and shares between processes: every write is visible at
+// once here, so the grain changes nothing. Signal memory (2) is host memory
+// every device reaches, mapped as hipHostMallocMapped memory is, since the
+// host reads the signal directly; it is freed with hipFree.
 hipError_t hipExtMallocWithFlags(void** ptr, size_t size, unsigned int flags) {
   const ApiCall api("hipExtMallocWithFlags");
   if (flags > 4) return record(state(), hipErrorInvalidValue);
-  if (flags >= 1 && flags <= 3) {
+  if (flags == 2) {
     if (!size) return record(state(), hipErrorInvalidValue);
-    return host_alloc(ptr, size, g_host_allocations);
+    return host_alloc(ptr, size, g_host_allocations, 2);   // hipHostMallocMapped
   }
   return hipMalloc(ptr, size);
 }

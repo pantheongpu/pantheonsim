@@ -290,6 +290,31 @@ int main() {
   list[1].stream = s0;
   EXPECT(hipExtLaunchMultiKernelMultiDevice(list, 2, 0), hipErrorInvalidDevice, "two on one device are refused");
 
+  // hipExtMallocWithFlags: fine-grained and uncached memory is device memory,
+  // which RCCL fills and shares between processes; signal memory is host
+  // memory the host reads directly. ROCm 7.1's HIP answers the same.
+  (void)hipSetDevice(0);
+  for (unsigned kind : {1u, 2u, 3u}) {
+    void* m = nullptr;
+    const size_t bytes = kind == 2 ? 8 : 4096;
+    const std::string what = "hipExtMallocWithFlags kind " + std::to_string(kind);
+    EXPECT(hipExtMallocWithFlags(&m, bytes, kind), hipSuccess, what.c_str());
+    hipPointerAttribute_t attr{};
+    (void)hipPointerGetAttributes(&attr, m);
+    check(attr.type == (kind == 2 ? hipMemoryTypeHost : hipMemoryTypeDevice), (what + " is where ROCm puts it").c_str(),
+          std::to_string(attr.type));
+    EXPECT(hipMemset(m, 7, bytes), hipSuccess, (what + " can be filled").c_str());
+    unsigned host_flags = 99;
+    EXPECT(hipHostGetFlags(&host_flags, m), kind == 2 ? hipSuccess : hipErrorInvalidValue,
+           (what + ": hipHostGetFlags").c_str());
+    if (kind == 2) check(host_flags == hipHostMallocMapped, "signal memory is mapped host memory");
+    if (kind != 2) {
+      hipIpcMemHandle_t handle;
+      EXPECT(hipIpcGetMemHandle(&handle, m), hipSuccess, (what + " can be shared with another process").c_str());
+    }
+    (void)hipFree(m);
+  }
+
   char api_name[64];
   std::snprintf(api_name, sizeof api_name, "%s", hipApiName(1));
   check(std::string(api_name) == "__hipPopCallConfiguration" && std::string(hipApiName(0)) == "unknown",
