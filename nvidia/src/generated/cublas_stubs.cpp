@@ -42,7 +42,6 @@ VGPU_EXPORT int cublasCsrot_v2() { vgpu_report_unimplemented("cublasCsrot_v2"); 
 VGPU_EXPORT int cublasCsyr2_v2() { vgpu_report_unimplemented("cublasCsyr2_v2"); return 15; }
 VGPU_EXPORT int cublasCsyr2k_v2() { vgpu_report_unimplemented("cublasCsyr2k_v2"); return 15; }
 VGPU_EXPORT int cublasCsyr_v2() { vgpu_report_unimplemented("cublasCsyr_v2"); return 15; }
-VGPU_EXPORT int cublasDasum_v2() { vgpu_report_unimplemented("cublasDasum_v2"); return 15; }
 VGPU_EXPORT int cublasDcopy_v2() { vgpu_report_unimplemented("cublasDcopy_v2"); return 15; }
 VGPU_EXPORT int cublasDgelsBatched() { vgpu_report_unimplemented("cublasDgelsBatched"); return 15; }
 VGPU_EXPORT int cublasDgemmBatched() { vgpu_report_unimplemented("cublasDgemmBatched"); return 15; }
@@ -84,7 +83,6 @@ VGPU_EXPORT int cublasLtMatmulPreferenceSetAttribute() { vgpu_report_unimplement
 VGPU_EXPORT int cublasLtMatrixLayoutCreate() { vgpu_report_unimplemented("cublasLtMatrixLayoutCreate"); return 15; }
 VGPU_EXPORT int cublasLtMatrixLayoutDestroy() { vgpu_report_unimplemented("cublasLtMatrixLayoutDestroy"); return 15; }
 VGPU_EXPORT int cublasLtMatrixLayoutSetAttribute() { vgpu_report_unimplemented("cublasLtMatrixLayoutSetAttribute"); return 15; }
-VGPU_EXPORT int cublasSasum_v2() { vgpu_report_unimplemented("cublasSasum_v2"); return 15; }
 VGPU_EXPORT int cublasScasum_v2() { vgpu_report_unimplemented("cublasScasum_v2"); return 15; }
 VGPU_EXPORT int cublasScnrm2_v2() { vgpu_report_unimplemented("cublasScnrm2_v2"); return 15; }
 VGPU_EXPORT int cublasScopy_v2() { vgpu_report_unimplemented("cublasScopy_v2"); return 15; }

@@ -1,5 +1,5 @@
 // Differential conformance for cuBLAS level 1 and the triangular band product:
-// axpy, scal, dot, nrm2 and i?amax in single and double precision, positive and
+// axpy, scal, dot, nrm2, asum and i?amax in single and double precision, positive and
 // negative increments (BLAS walks a negative-increment vector from its far
 // end), and tbmv over both triangles, both operations, unit and non-unit
 // diagonals and several band widths; and dgmm (a matrix times a diagonal
@@ -45,6 +45,8 @@ cublasStatus_t dot(cublasHandle_t h, int n, const float* x, int ix, const float*
 cublasStatus_t dot(cublasHandle_t h, int n, const double* x, int ix, const double* y, int iy, double* r) { return cublasDdot(h, n, x, ix, y, iy, r); }
 cublasStatus_t nrm2(cublasHandle_t h, int n, const float* x, int ix, float* r) { return cublasSnrm2(h, n, x, ix, r); }
 cublasStatus_t nrm2(cublasHandle_t h, int n, const double* x, int ix, double* r) { return cublasDnrm2(h, n, x, ix, r); }
+cublasStatus_t asum(cublasHandle_t h, int n, const float* x, int ix, float* r) { return cublasSasum(h, n, x, ix, r); }
+cublasStatus_t asum(cublasHandle_t h, int n, const double* x, int ix, double* r) { return cublasDasum(h, n, x, ix, r); }
 cublasStatus_t iamax(cublasHandle_t h, int n, const float* x, int ix, int* r) { return cublasIsamax(h, n, x, ix, r); }
 cublasStatus_t iamax(cublasHandle_t h, int n, const double* x, int ix, int* r) { return cublasIdamax(h, n, x, ix, r); }
 cublasStatus_t tbmv(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t, cublasDiagType_t d, int n, int k, const float* A, int lda, float* x, int ix) { return cublasStbmv(h, u, t, d, n, k, A, lda, x, ix); }
@@ -96,6 +98,8 @@ template <class T> static void level1(cublasHandle_t h, const char* ty) {
     printf("%s dot inc %d,%d = %.6f\n", ty, ix, iy, (double)r);
     CB(nrm2(h, n, dx, ix, &r));
     printf("%s nrm2 inc %d = %.6f\n", ty, ix, (double)r);
+    CB(asum(h, n, dx, ix, &r));
+    printf("%s asum inc %d = %.6f\n", ty, ix, (double)r);
     int im = -1;
     CB(iamax(h, n, dx, ix, &im));
     printf("%s iamax inc %d = %d\n", ty, ix, im);
@@ -179,6 +183,8 @@ static void run() {
     printf("d dot_64 = %.6f\n", r);
     CB(cublasDnrm2_64(h, 5, dx, 2, &r));
     printf("d nrm2_64 inc 2 = %.6f\n", r);
+    CB(cublasDasum_64(h, 5, dx, 2, &r));
+    printf("d asum_64 inc 2 = %.6f\n", r);
     CB(cublasIdamax_64(h, 9, dy, 1, &im));
     printf("d iamax_64 = %lld\n", (long long)im);
     CB(cublasDscal_64(h, 9, &s, dy, 1));
@@ -193,6 +199,8 @@ static void run() {
     printf("s dot_64 = %.6f\n", (double)fr);
     CB(cublasSnrm2_64(h, 9, sx, 1, &fr));
     printf("s nrm2_64 = %.6f\n", (double)fr);
+    CB(cublasSasum_64(h, 9, sx, 1, &fr));
+    printf("s asum_64 = %.6f\n", (double)fr);
     CB(cublasIsamax_64(h, 9, sy, 1, &im));
     printf("s iamax_64 = %lld\n", (long long)im);
     CB(cublasSscal_64(h, 9, &fs, sy, 1));

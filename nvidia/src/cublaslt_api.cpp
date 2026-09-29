@@ -135,6 +135,73 @@ VGPU_EXPORT const char* cublasLtGetStatusName(cublasStatus_t s) {
   return s == CUBLAS_STATUS_SUCCESS ? "CUBLAS_STATUS_SUCCESS" : "CUBLAS_STATUS_ERROR";
 }
 
+/* ---- logging ----
+ * The library's API-trace logger. The simulator's cuBLASLt has no trace of its
+ * own to write, so these take and keep the settings, refusing what an RTX
+ * 3060's cuBLASLt refuses (a level outside 0 to 6); nothing is ever logged. */
+
+namespace {
+struct LtLogger {
+  std::mutex mu;
+  int level = 0;
+  int mask = 0;
+  bool disabled = false;
+  cublasLtLoggerCallback_t callback = nullptr;
+  FILE* file = nullptr;
+  bool owns_file = false;
+};
+LtLogger& lt_logger() {
+  static LtLogger l;
+  return l;
+}
+void set_log_file(LtLogger& l, FILE* f, bool owns) {
+  if (l.owns_file && l.file) std::fclose(l.file);
+  l.file = f;
+  l.owns_file = owns;
+}
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasLtLoggerSetCallback(cublasLtLoggerCallback_t callback) {
+  auto& l = lt_logger();
+  std::lock_guard<std::mutex> g(l.mu);
+  l.callback = callback;
+  return CUBLAS_STATUS_SUCCESS;
+}
+VGPU_EXPORT cublasStatus_t cublasLtLoggerSetFile(FILE* file) {
+  auto& l = lt_logger();
+  std::lock_guard<std::mutex> g(l.mu);
+  set_log_file(l, file, false);
+  return CUBLAS_STATUS_SUCCESS;
+}
+VGPU_EXPORT cublasStatus_t cublasLtLoggerOpenFile(const char* path) {
+  if (!path) return CUBLAS_STATUS_SUCCESS;  // as the card's library answers
+  FILE* f = std::fopen(path, "w");
+  if (!f) return CUBLAS_STATUS_INVALID_VALUE;
+  auto& l = lt_logger();
+  std::lock_guard<std::mutex> g(l.mu);
+  set_log_file(l, f, true);
+  return CUBLAS_STATUS_SUCCESS;
+}
+VGPU_EXPORT cublasStatus_t cublasLtLoggerSetLevel(int level) {
+  if (level < 0 || level > 6) return CUBLAS_STATUS_INVALID_VALUE;
+  auto& l = lt_logger();
+  std::lock_guard<std::mutex> g(l.mu);
+  l.level = level;
+  return CUBLAS_STATUS_SUCCESS;
+}
+VGPU_EXPORT cublasStatus_t cublasLtLoggerSetMask(int mask) {
+  auto& l = lt_logger();
+  std::lock_guard<std::mutex> g(l.mu);
+  l.mask = mask;
+  return CUBLAS_STATUS_SUCCESS;
+}
+VGPU_EXPORT cublasStatus_t cublasLtLoggerForceDisable(void) {
+  auto& l = lt_logger();
+  std::lock_guard<std::mutex> g(l.mu);
+  l.disabled = true;
+  return CUBLAS_STATUS_SUCCESS;
+}
+
 /* ---- descriptors ---- */
 
 VGPU_EXPORT cublasStatus_t cublasLtMatmulDescCreate(cublasLtMatmulDesc_t* d,

@@ -884,6 +884,24 @@ cublasStatus_t nrm2(cublasHandle_t h, int n, const T* x, int incx, T* result) {
   return CUBLAS_STATUS_SUCCESS;
 }
 
+// The sum of magnitudes; 0 for an empty vector or a non-positive stride, as
+// reference BLAS returns.
+template <class T>
+cublasStatus_t asum(cublasHandle_t h, int n, const T* x, int incx, T* result) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!result) return CUBLAS_STATUS_INVALID_VALUE;
+  if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (deferred_to_graph(h, [=] { asum<T>(h, n, x, incx, result); }))
+    return CUBLAS_STATUS_SUCCESS;
+  long double acc = 0.0L;
+  if (n > 0 && incx > 0) {
+    auto hx = fetch<T>(x, span(n, incx));
+    for (int i = 0; i < n; ++i) acc += std::fabs(static_cast<long double>(hx[static_cast<size_t>(i) * incx]));
+  }
+  put_result(h, result, static_cast<T>(acc));
+  return CUBLAS_STATUS_SUCCESS;
+}
+
 // The 1-based index of the first element of largest magnitude; 0 when there is
 // nothing to search, as reference BLAS returns.
 template <class T, class R = int>
@@ -1007,6 +1025,14 @@ VGPU_EXPORT cublasStatus_t cublasDnrm2_v2(cublasHandle_t h, int n, const double*
                                           double* result) {
   return nrm2(h, n, x, incx, result);
 }
+VGPU_EXPORT cublasStatus_t cublasSasum_v2(cublasHandle_t h, int n, const float* x, int incx,
+                                          float* result) {
+  return asum(h, n, x, incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasDasum_v2(cublasHandle_t h, int n, const double* x, int incx,
+                                          double* result) {
+  return asum(h, n, x, incx, result);
+}
 VGPU_EXPORT cublasStatus_t cublasIsamax_v2(cublasHandle_t h, int n, const float* x, int incx,
                                            int* result) {
   return iamax(h, n, x, incx, result);
@@ -1072,6 +1098,16 @@ VGPU_EXPORT cublasStatus_t cublasDnrm2_v2_64(cublasHandle_t h, int64_t n, const 
                                              double* result) {
   if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
   return nrm2(h, (int)n, x, (int)incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasSasum_v2_64(cublasHandle_t h, int64_t n, const float* x, int64_t incx,
+                                             float* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return asum(h, (int)n, x, (int)incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasDasum_v2_64(cublasHandle_t h, int64_t n, const double* x, int64_t incx,
+                                             double* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return asum(h, (int)n, x, (int)incx, result);
 }
 VGPU_EXPORT cublasStatus_t cublasIsamax_v2_64(cublasHandle_t h, int64_t n, const float* x, int64_t incx,
                                               int64_t* result) {
