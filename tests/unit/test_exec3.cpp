@@ -3248,6 +3248,53 @@ VTEST(mul24_szext_and_fns) {
   VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{5});
 }
 
+// atom.cas d, [a], b, c compares with b and stores c (atomicCAS(p, compare,
+// value)); measured on an RTX 3060: CAS(5 -> 7) on 5 stores 7 and returns 5,
+// on 9 stores nothing and returns 9. Global and shared, 32- and 64-bit.
+VTEST(atom_cas_compares_with_b_and_stores_c) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 buf)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .shared .align 8 .b8 sh[16];
+    ld.param.u64 %rd1, [buf];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, 5;
+    mov.u32 %r2, 7;
+    atom.global.cas.b32 %r3, [%rd2], %r1, %r2;
+    st.global.u32 [%rd2+8], %r3;
+    atom.global.cas.b32 %r4, [%rd2+4], %r1, %r2;
+    st.global.u32 [%rd2+12], %r4;
+    mov.u64 %rd3, 5;
+    mov.u64 %rd4, 0x100000007;
+    atom.global.cas.b64 %rd5, [%rd2+16], %rd3, %rd4;
+    st.global.u64 [%rd2+24], %rd5;
+    st.shared.u32 [sh], %r1;
+    atom.shared.cas.b32 %r5, [sh], %r1, %r2;
+    ld.shared.u32 %r6, [sh];
+    st.global.u32 [%rd2+32], %r5;
+    st.global.u32 [%rd2+36], %r6;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t buf = e.mem.alloc(40);
+  e.mem.store_scalar(buf, 4, 5);
+  e.mem.store_scalar(buf + 4, 4, 9);
+  e.mem.store_scalar(buf + 16, 8, 5);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(buf)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(buf, 4), uint64_t{7});        // a match stores c
+  VCHECK_EQ(e.mem.load_scalar(buf + 8, 4), uint64_t{5});    // and returns the old value
+  VCHECK_EQ(e.mem.load_scalar(buf + 4, 4), uint64_t{9});    // a miss stores nothing
+  VCHECK_EQ(e.mem.load_scalar(buf + 12, 4), uint64_t{9});
+  VCHECK_EQ(e.mem.load_scalar(buf + 16, 8), uint64_t{0x100000007});
+  VCHECK_EQ(e.mem.load_scalar(buf + 24, 8), uint64_t{5});
+  VCHECK_EQ(e.mem.load_scalar(buf + 32, 4), uint64_t{5});   // shared: old
+  VCHECK_EQ(e.mem.load_scalar(buf + 36, 4), uint64_t{7});   // and the store
+}
+
 VTEST(lop3_computes_the_truth_table_it_is_given) {
   // ptxas fuses bitwise chains into lop3, so optimized PTX is full of these
   // and a wrong truth table is a wrong mask rather than a crash. The immLut
