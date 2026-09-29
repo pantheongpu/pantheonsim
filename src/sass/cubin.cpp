@@ -92,15 +92,20 @@ uint32_t u32(const uint8_t* p) {
 
 bool is_cubin(const void* data, size_t size) {
   const auto* p = static_cast<const uint8_t*>(data);
+  // The CUDA OS ABI: 0x41 with ABI version 8 as CUDA 13's ptxas writes it,
+  // 0x33 with version 7 as CUDA 12.0's does.
   return size >= 64 && p[0] == 0x7f && p[1] == 'E' && p[2] == 'L' && p[3] == 'F' && p[4] == 2 /* 64-bit */ &&
-         p[7] == 0x41 /* the CUDA OS ABI */;
+         (p[7] == 0x41 || p[7] == 0x33);
 }
 
 Cubin parse_cubin(const uint8_t* data, size_t size) {
   if (!is_cubin(data, size)) bad("not a 64-bit CUDA ELF image");
   const Reader r{data, size};
   Cubin c;
-  c.sm = static_cast<int>((r.at<uint32_t>(0x30) >> 8) & 0xff);
+  // e_flags holds the architecture in bits 8-15 (ABI version 8), or in
+  // bits 0-7 and again 16-23 (version 7).
+  const uint32_t eflags = r.at<uint32_t>(0x30);
+  c.sm = static_cast<int>(data[7] == 0x33 ? eflags & 0xff : (eflags >> 8) & 0xff);
   const uint64_t shoff = r.at<uint64_t>(0x28);
   const uint16_t shentsize = r.at<uint16_t>(0x3a), shnum = r.at<uint16_t>(0x3c), shstrndx = r.at<uint16_t>(0x3e);
   if (shentsize < 64 || shnum == 0 || shstrndx >= shnum) bad("bad section header table");
@@ -243,7 +248,9 @@ Cubin parse_cubin(const uint8_t* data, size_t size) {
         if (k.name != sym_names[sym]) continue;
         if (rec.attr == kRegcount) k.regs = val;
         if (rec.attr == kFrameSize) k.frame_size = val;
-        if (rec.attr == kMinStackSize) k.min_stack = val;
+        // 0xffffffff: a stack alloca grows, of no size known in advance
+        // (CUDA 12.0's ptxas); the device's stack limit bounds it.
+        if (rec.attr == kMinStackSize && val != 0xffffffffu) k.min_stack = val;
       }
     }
   }
