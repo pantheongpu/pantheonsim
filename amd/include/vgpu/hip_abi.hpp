@@ -492,6 +492,102 @@ enum MemPoolAttr : int {
   kPoolUsedMemHigh = 8,
 };
 
+// ---- Graphs: what each kind of node is made from --------------------------------
+//
+// hipGraphNodeType.
+enum GraphNodeType : int {
+  kNodeKernel = 0,
+  kNodeMemcpy = 1,
+  kNodeMemset = 2,
+  kNodeHost = 3,
+  kNodeGraph = 4,
+  kNodeEmpty = 5,
+  kNodeWaitEvent = 6,
+  kNodeEventRecord = 7,
+  kNodeExtSemaphoreSignal = 8,
+  kNodeExtSemaphoreWait = 9,
+  kNodeMemAlloc = 10,
+  kNodeMemFree = 11,
+  kNodeMemcpyFromSymbol = 12,
+  kNodeMemcpyToSymbol = 13,
+  kNodeBatchMemOp = 14,
+};
+// hipKernelNodeParams.
+struct KernelNodeParams {
+  Dim3 blockDim;
+  void** extra;
+  void* func;
+  Dim3 gridDim;
+  void** kernelParams;
+  unsigned int sharedMemBytes;
+};
+// hipMemsetParams: width in elements, pitch in bytes.
+struct MemsetParams {
+  void* dst;
+  unsigned int elementSize;
+  size_t height;
+  size_t pitch;
+  unsigned int value;
+  size_t width;
+};
+// hipHostNodeParams.
+struct HostNodeParams {
+  void (*fn)(void*);
+  void* userData;
+};
+// hipMemAllocNodeParams: dptr is written when the node is added.
+struct MemAllocNodeParams {
+  MemPoolProps poolProps;
+  const MemAccessDesc* accessDescs;
+  size_t accessDescCount;
+  size_t bytesize;
+  void* dptr;
+};
+// hipMemcpyNodeParams.
+struct MemcpyNodeParams {
+  int flags;
+  int reserved[3];
+  Memcpy3DParms copyParams;
+};
+// hipGraphNodeParams: a type and, by it, one of the node parameter structs.
+struct GraphNodeParams {
+  int type;
+  int reserved0[3];
+  union {
+    long long reserved1[29];
+    KernelNodeParams kernel;
+    MemcpyNodeParams memcpy;
+    MemsetParams memset;
+    HostNodeParams host;
+    void* graph;    // hipChildGraphNodeParams
+    void* event;    // hipEventWaitNodeParams, hipEventRecordNodeParams
+    MemAllocNodeParams alloc;
+    void* free;     // hipMemFreeNodeParams
+  };
+  long long reserved2;
+};
+// hipGraphInstantiateParams.
+struct GraphInstantiateParams {
+  void* errNode_out;
+  unsigned long long flags;
+  int result_out;
+  void* uploadStream;
+};
+// hipBatchMemOpNodeParams: its operations are hipStreamBatchMemOpParams, 48
+// bytes each.
+struct BatchMemOpNodeParams {
+  void* ctx;
+  unsigned int count;
+  void* paramArray;
+  unsigned int flags;
+};
+// hipExternalSemaphoreSignalNodeParams and hipExternalSemaphoreWaitNodeParams.
+struct ExtSemaphoreNodeParams {
+  void** extSemArray;
+  const void* paramsArray;
+  unsigned int numExtSems;
+};
+
 // hipIpcMemHandle_t: 64 bytes a process hands another.
 struct IpcMemHandle {
   char reserved[64];

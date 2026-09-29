@@ -52,6 +52,10 @@ echo "wrote $(pwd)/api.gfx942"
 # advice.
 "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 memory.cpp -o memory.gfx942
 echo "wrote $(pwd)/memory.gfx942"
+# Graphs and stream capture: nodes of every kind, executable graphs and what
+# changes them, capture across streams and its modes, graph memory.
+"$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 graphs.cpp -o graphs.gfx942
+echo "wrote $(pwd)/graphs.gfx942"
 
 # Streams that run at once: kernels on two streams handing values to each
 # other, events, stream waits, the null stream's ordering, host functions.

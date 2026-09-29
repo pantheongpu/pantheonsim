@@ -207,20 +207,6 @@ struct HostVar {
   size_t size = 0;
 };
 
-// A kernel launch a graph holds: what to run and with what, copied when it was
-// captured, since a graph replays what the stream was asked to do then.
-struct Node {
-  int device = 0;
-  const void* host_function = nullptr;
-  vgpu::amd::abi::Dim3 grid{1, 1, 1}, block{1, 1, 1};
-  uint32_t shared = 0;
-  std::vector<uint8_t> args;
-};
-struct Graph {
-  std::vector<Node> nodes;
-  unsigned long long capture_id = 0;   // which capture recorded it
-};
-
 // What a stream was made with, which a program can ask for back, and the
 // queue its work runs on.
 using Queue = vgpu::amd::WorkQueue<hipError_t>;
@@ -245,11 +231,6 @@ struct Stream {
     static std::atomic<unsigned long long> next{1};
     return next++;
   }
-};
-
-// What graphs' allocation nodes have taken from a device.
-struct GraphMemory {
-  uint64_t used = 0, used_high = 0;
 };
 
 // A stream-ordered memory pool. What is freed to it is kept for reuse until
@@ -325,11 +306,9 @@ struct State {
   // Devices whose memory holds another process's opened IPC allocations:
   // every other device reaches them, without hipDeviceEnablePeerAccess.
   std::set<int> ipc_mapped;
-  std::map<hipStream_t, Graph> capturing;        // streams recording rather than running
   // Each device's hostcall buffer, made when a kernel is first launched on it:
   // what device-side printf writes through (vgpu/amd_hostcall.hpp).
   std::map<int, std::unique_ptr<vgpu::amd::Hostcall>> hostcalls;
-  std::vector<std::unique_ptr<Graph>> graphs, graph_execs;
   std::map<hipStream_t, Stream> streams;
   std::deque<Pool> pools;                       // a pool's address is its handle
   std::map<int, Pool*> default_pools;           // by device
@@ -356,8 +335,6 @@ struct State {
   // Virtual memory another device was granted: by mapped range, each
   // device's hipMemAccessFlags.
   std::map<std::pair<uint64_t, uint64_t>, std::map<int, int>> vmm_access;
-  // What graphs have allocated on each device, now and at most.
-  std::map<int, struct GraphMemory> graph_memory;
   // Device allocations, by where they start, whose copies are always
   // synchronous (HIP_POINTER_ATTRIBUTE_SYNC_MEMOPS, set by
   // hipPointerSetAttribute).
@@ -419,6 +396,36 @@ hipError_t record(State& s, hipError_t e) {
   if (e != hipSuccess && e != hipErrorNotReady) s.last = e;
   return e;
 }
+
+// Stream capture (hip_graph.inc). The caller holds s.mutex for each, and
+// passes a stream handle already resolved.
+struct Event;
+bool stream_capturing(State& s, hipStream_t resolved);
+// Whether a capture takes in any stream of the device.
+bool any_capture_on(State& s, int device);
+// Work on the legacy null stream while a blocking stream of `device`
+// captures: hipErrorStreamCaptureImplicit, and those captures are given up.
+hipError_t legacy_conflict(State& s, int device);
+// A call HIP calls potentially unsafe during a capture (allocating host
+// memory, synchronizing): hipErrorStreamCaptureUnsupported where the calling
+// thread's capture mode says so, and the captures it would upset are given up.
+hipError_t unsafe_during_capture(State& s);
+hipError_t capture_kernel(State& s, hipStream_t resolved, const void* func, const Kernel& k,
+                          vgpu::amd::abi::Dim3 grid, vgpu::amd::abi::Dim3 block, uint32_t shared,
+                          std::vector<uint8_t> args, void** extra, bool cooperative);
+hipError_t capture_host(State& s, hipStream_t resolved, void (*fn)(void*), void* data);
+hipError_t capture_alloc(State& s, hipStream_t resolved, int device, size_t bytes, void** ptr);
+hipError_t capture_free(State& s, hipStream_t resolved, void* ptr);
+hipError_t capture_record(State& s, hipStream_t resolved, Event* e);
+bool capture_wait(State& s, hipStream_t resolved, const Event* e, hipError_t* result);
+bool captured_event(const Event* e);
+void forget_stream(State& s, hipStream_t h);
+// Graph memory (an allocation node's) freed by hipFree, and how big it is.
+bool free_graph_memory(State& s, void* ptr, hipError_t* result);
+bool graph_memory_size(uint64_t va, uint64_t* base, uint64_t* size);
+// The same for any address an allocation node set aside, mapped or not yet:
+// a node may name it before the graph that maps it runs.
+bool graph_memory_range(uint64_t va, uint64_t* base, uint64_t* size);
 
 // ---- Stream order ------------------------------------------------------------
 //
@@ -579,6 +586,7 @@ PerThreadStreams::~PerThreadStreams() {
       const auto it = s.streams.find(h);
       if (it == s.streams.end()) continue;
       if (it->second.queue) qs.push_back(it->second.queue);
+      forget_stream(s, h);
       s.streams.erase(it);
     }
   }
@@ -1019,6 +1027,7 @@ std::map<uint64_t, size_t>::const_iterator find_range(const std::map<uint64_t, s
 hipError_t host_alloc(void** ptr, size_t size, std::map<uint64_t, size_t>& m, unsigned flags = 0) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
+  if (const hipError_t e = unsafe_during_capture(s); e != hipSuccess) return record(s, e);
   if (!ptr) return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   if (!size && &m != &g_managed) {
@@ -1109,11 +1118,37 @@ hipError_t locate(State& s, const void* p, const Region& r, Side* side) {
         return fail(hipErrorInvalidValue, "the region runs past the end of the allocation it starts in");
       return hipSuccess;
     }
+    if (graph_memory_range(va, &base, &size)) {
+      if (!r.reach(&reach) || reach > size - (va - base))
+        return fail(hipErrorInvalidValue, "the region runs past the end of the graph allocation it starts in");
+      return hipSuccess;
+    }
     if (m.access_at(va, &readable, &writable)) return hipSuccess;   // virtual memory, mapped
     return fail(hipErrorInvalidValue, "that address is not in any allocation");
   }
   return hipSuccess;   // the program's own host memory
 }
+
+// Where a copy or fill goes other than onto its stream: a graph node's
+// parameters are checked by the call that would make it (kRecord, which hands
+// back the regions and queues nothing), and a graph's launch runs its copies
+// and fills there on its own thread (kRun). Per thread; none for a call.
+struct RegionSink {
+  enum Mode { kRecord, kRun } mode = kRecord;
+  bool got = false;
+  void* dst = nullptr;
+  const void* src = nullptr;
+  Region dr, sr;
+  hipMemcpyKind kind = hipMemcpyDefault;
+};
+thread_local RegionSink* t_sink = nullptr;
+
+// Stream capture's copies and fills (hip_graph.inc; see "Stream capture"
+// below). The caller holds s.mutex.
+hipError_t capture_copy(State& s, hipStream_t resolved, void* dst, const Region& dr, const void* src, const Region& sr,
+                        hipMemcpyKind kind);
+hipError_t capture_fill(State& s, hipStream_t resolved, void* dst, const Region& r, const uint8_t* pattern,
+                        uint32_t len);
 
 // A copy between two regions of one shape, in `stream`'s order. Addresses
 // are unified: where each side is comes from its address, whatever the kind
@@ -1137,10 +1172,22 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
   vgpu::runtime::Device* d = nullptr;
   int ordinal = 0;
   const uint64_t dst_va = reinterpret_cast<uint64_t>(dst), src_va = reinterpret_cast<uint64_t>(src);
+  RegionSink* const sink = t_sink;
   {
     std::lock_guard<std::mutex> lock(s.mutex);
     d = device(s);
     if (!d) return hipErrorInvalidDevice;
+    // A call on a stream that is capturing becomes a node of its graph; one
+    // on the legacy null stream while a blocking stream captures is refused.
+    hipStream_t captured = nullptr;
+    if (!sink) {
+      const hipStream_t r = resolve(s, stream);
+      if (!r) {
+        if (const hipError_t e = legacy_conflict(s, s.current); e != hipSuccess) return e;
+      } else if (stream_capturing(s, r)) {
+        captured = r;
+      }
+    }
     if (kind != hipMemcpyDefault && kind != hipMemcpyHostToHost && kind != hipMemcpyHostToDevice &&
         kind != hipMemcpyDeviceToHost && kind != hipMemcpyDeviceToDevice && kind != 1024 /* NoCU */)
       return hipErrorInvalidMemcpyDirection;
@@ -1149,6 +1196,11 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
     ordinal = s.current;
     if (const hipError_t e = locate(s, dst, dr, &to); e != hipSuccess) return e;
     if (const hipError_t e = locate(s, src, sr, &from); e != hipSuccess) return e;
+    if (sink && sink->mode == RegionSink::kRecord) {
+      *sink = RegionSink{RegionSink::kRecord, true, dst, src, dr, sr, kind};
+      return hipSuccess;
+    }
+    if (captured) return capture_copy(s, captured, dst, dr, src, sr, kind);
     if (!async && to.device && from.device) {
       uint64_t dbase = 0, sbase = 0, size = 0;
       const bool dsync = to.mem->find_allocation(dst_va, &dbase, &size) && s.sync_memops.count(dbase);
@@ -1162,10 +1214,12 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
   // A synchronous copy of another device's memory also comes after what that
   // device's blocking streams were given: it is ordered on the device the
   // memory is on, as ROCm's HIP orders it, as well as the current one.
-  if (!async)
+  // A graph's launch runs its copy right here, on its stream's thread.
+  const bool run_here = sink != nullptr;
+  if (!async && !run_here)
     for (const Side* side : {&to, &from})
       if (side->device && side->ordinal != ordinal) drain_device(side->ordinal, true);
-  bool wait = !async;
+  bool wait = !async || run_here;
   if (async && (!to.mem || (!to.device && !from.device))) wait = true;
   const uint64_t w = dr.width, rows = dr.rows, depth = dr.depth;
   // An asynchronous copy's unpinned source is taken now, packed.
@@ -1214,7 +1268,7 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
     }
     return hipSuccess;
   };
-  return in_order(stream, work, wait);
+  return run_here ? work() : in_order(stream, work, wait);
 }
 
 // A copy of `bytes`, or of `rows` rows of them `dpitch` and `spitch` apart.
@@ -1237,22 +1291,37 @@ hipError_t fill_region(void* dst, const Region& r, const uint8_t* pattern, uint3
                        bool async) {
   State& s = state();
   Side side;
+  RegionSink* const sink = t_sink;
   {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return e;
     if (!device(s)) return hipErrorInvalidDevice;
+    hipStream_t captured = nullptr;
+    if (!sink) {
+      const hipStream_t rs = resolve(s, stream);
+      if (!rs) {
+        if (const hipError_t e = legacy_conflict(s, s.current); e != hipSuccess) return e;
+      } else if (stream_capturing(s, rs)) {
+        captured = rs;
+      }
+    }
     if (r.empty()) return hipSuccess;
     if (!dst) return hipErrorInvalidValue;
     if (const hipError_t e = locate(s, dst, r, &side); e != hipSuccess) return e;
     if (!side.mem) return fail(hipErrorInvalidValue, "that is host memory the runtime did not allocate or register");
+    if (sink && sink->mode == RegionSink::kRecord) {
+      sink->got = true;
+      sink->dst = dst;
+      sink->dr = r;
+      return hipSuccess;
+    }
+    if (captured) return capture_fill(s, captured, dst, r, pattern, pattern_len);
   }
   const std::vector<uint8_t> p(pattern, pattern + pattern_len);
   vgpu::MemoryManager* mem = side.mem;
   const bool on_device = side.device;
   const uint64_t base = reinterpret_cast<uint64_t>(dst);
-  return in_order(
-      stream,
-      [=] {
+  const auto work = [=] {
         try {
           for (uint64_t z = 0; z < r.depth; ++z)
             for (uint64_t y = 0; y < r.rows; ++y) {
@@ -1269,8 +1338,10 @@ hipError_t fill_region(void* dst, const Region& r, const uint8_t* pattern, uint3
           return fail(hipErrorInvalidValue, e.what());
         }
         return hipSuccess;
-      },
-      !async && !side.device);
+      };
+  // A graph's launch runs its fill right here, on its stream's thread.
+  if (sink) return work();
+  return in_order(stream, work, !async && !side.device);
 }
 // `bytes` bytes of a pattern.
 hipError_t fill_in_order(void* dst, const uint8_t* pattern, uint32_t pattern_len, uint64_t bytes, hipStream_t stream,
@@ -1328,6 +1399,8 @@ hipError_t hipDeviceSynchronize(void) {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
     ordinal = s.current;
+    // Nothing a capture has is there to wait for.
+    if (any_capture_on(s, ordinal)) return record(s, hipErrorStreamCaptureUnsupported);
   }
   // Everything queued on the device, on every stream, and the first failure
   // any of it had: where an asynchronous error comes out. The pools then
@@ -1362,6 +1435,7 @@ hipError_t hipMalloc(void** ptr, size_t size) {
   const ApiCall api("hipMalloc");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
+  if (const hipError_t e = unsafe_during_capture(s); e != hipSuccess) return record(s, e);
   if (!ptr) return record(s, hipErrorInvalidValue);
   vgpu::runtime::Device* d = device(s);
   if (!d) return record(s, hipErrorInvalidDevice);
@@ -1386,6 +1460,8 @@ hipError_t free_now(void* ptr) {
   if (!ptr) return hipSuccess;
   // Managed memory, and pinned host memory, which ROCm's HIP frees here too.
   if (host_free(s, ptr, g_managed) || host_free(s, ptr, g_host_allocations)) return hipSuccess;
+  // A graph's allocation: its memory goes, and its address stays the graph's.
+  if (hipError_t e = hipSuccess; free_graph_memory(s, ptr, &e)) return e;
   // Another process's pool memory, imported: this process's mapping goes.
   if (const auto im = g_pool_imports.find(ptr); im != g_pool_imports.end()) {
     try {
@@ -1689,6 +1765,12 @@ hipError_t module_launch(hipFunction_t f, unsigned int gx, unsigned int gy, unsi
   std::vector<uint8_t> args;
   if (const hipError_t e = build_kernargs(*fn->kernel, params, extra, &args); e != hipSuccess)
     return record(s, e);
+  if (const hipStream_t r = resolve(s, stream); !r) {
+    if (const hipError_t e = legacy_conflict(s, s.current); e != hipSuccess) return record(s, e);
+  } else if (stream_capturing(s, r)) {
+    return record(s, capture_kernel(s, r, f, *fn->kernel, {gx, gy, gz}, {bx, by, bz}, shared, std::move(args), extra,
+                                    false));
+  }
 
   LaunchJob job;
   if (const hipError_t e = prepare_launch(s, s.current, *fn->module, *fn->kernel, {gx, gy, gz}, {bx, by, bz}, shared,
@@ -1820,6 +1902,7 @@ hipError_t hipStreamDestroy(hipStream_t stream) {
     const auto it = s.streams.find(stream);
     if (it == s.streams.end()) return record(s, hipErrorInvalidHandle);
     q = it->second.queue;
+    forget_stream(s, stream);
     s.streams.erase(it);
   }
   // Its work still runs to the end, as HIP lets a stream destroyed with work
@@ -1838,6 +1921,10 @@ hipError_t hipStreamSynchronize(hipStream_t stream) {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
     stream = resolve(s, stream);
+    // A capturing stream has nothing to wait for yet; waiting on another
+    // is refused where its capture mode says.
+    if (stream && stream_capturing(s, stream)) return record(s, hipErrorStreamCaptureUnsupported);
+    if (const hipError_t e = unsafe_during_capture(s); e != hipSuccess) return record(s, e);
     if (!stream) {
       qs = queues_of(s, s.current, true);
     } else {
@@ -1871,6 +1958,13 @@ struct Event {
   std::shared_ptr<Queue> queue;   // what the last record was queued on
   uint64_t seq = 0;               // and which item of it
   std::shared_ptr<Stamp> stamp;
+  // Where it was last recorded in a capture (hip_graph.inc): which capture,
+  // which stream, after how many of its operations, and the graph nodes the
+  // stream's next operation would have followed then.
+  uint64_t capture = 0;
+  hipStream_t capture_stream = nullptr;
+  uint64_t capture_ops = 0;
+  std::vector<void*> capture_deps;
 };
 
 // Lock order: s.mutex, then this.
@@ -1948,6 +2042,8 @@ hipError_t hipEventRecord(hipEvent_t event, hipStream_t stream) {
   if (!e) return record(s, hipErrorInvalidHandle);
   // An event records only in a stream of its own device.
   if (e->device != o.device) return record(s, hipErrorInvalidHandle);
+  // In a capture it stands for where the stream's capture has got to.
+  if (const hipStream_t r = resolve(s, stream); r && stream_capturing(s, r)) return record(s, capture_record(s, r, e));
   auto stamp = std::make_shared<Stamp>();
   e->recorded = true;
   e->stamp = stamp;
@@ -1974,8 +2070,19 @@ bool event_marker(hipEvent_t event, Queue::Marker* m, std::shared_ptr<Stamp>* st
   return true;
 }
 
+// Whether an event was last recorded in a capture still going on, which
+// has nothing to wait for or ask about yet.
+static bool in_capture(hipEvent_t event) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  std::lock_guard<std::mutex> event_lock(g_event_mutex);
+  const Event* e = find_event(event);
+  return e && captured_event(e);
+}
+
 hipError_t hipEventSynchronize(hipEvent_t event) {
   const ApiCall api("hipEventSynchronize");
+  if (in_capture(event)) return record(state(), hipErrorCapturedEvent);
   Queue::Marker m;
   bool exists = false;
   if (event_marker(event, &m, nullptr, &exists)) m.queue->wait(m.seq);
@@ -1988,6 +2095,7 @@ hipError_t hipEventSynchronize(hipEvent_t event) {
 
 hipError_t hipEventQuery(hipEvent_t event) {
   const ApiCall api("hipEventQuery");
+  if (in_capture(event)) return record(state(), hipErrorCapturedEvent);
   Queue::Marker m;
   bool exists = false;
   if (event_marker(event, &m, nullptr, &exists) && !m.queue->done(m.seq)) return hipErrorNotReady;
@@ -2464,6 +2572,10 @@ hipError_t hipHostMalloc(void** ptr, size_t size, unsigned int flags) {
 hipError_t hipHostFree(void* ptr) {
   const ApiCall api("hipHostFree");
   State& s = state();
+  {
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (const hipError_t e = unsafe_during_capture(s); e != hipSuccess) return record(s, e);
+  }
   // Queued copies may still read or write it: HIP's hipHostFree waits for
   // the device first.
   if (ptr) {
@@ -2489,6 +2601,7 @@ hipError_t hipHostRegister(void* ptr, size_t size, unsigned int flags) {
   const ApiCall api("hipHostRegister");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
+  if (const hipError_t e = unsafe_during_capture(s); e != hipSuccess) return record(s, e);
   if (!ptr || !size || (flags & ~(0xFu | 0x80000000u))) return record(s, hipErrorInvalidValue);
   // Every page of it has to be the process's: msync says which are not.
   const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
@@ -2515,6 +2628,7 @@ hipError_t hipHostUnregister(void* ptr) {
   const ApiCall api("hipHostUnregister");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
+  if (const hipError_t e = unsafe_during_capture(s); e != hipSuccess) return record(s, e);
   if (!ptr) return record(s, hipErrorInvalidValue);
   std::lock_guard<std::mutex> host_lock(g_host_mutex);
   const auto it = g_host_registrations.find(reinterpret_cast<uint64_t>(ptr));
@@ -2826,100 +2940,6 @@ hipError_t hipMemcpyPeerAsync(void* dst, int dst_device, const void* src, int sr
   return record(state(), peer_copy(dst, dst_device, src, src_device, bytes, stream, true));
 }
 
-// ---- Graphs a stream is recorded into ----------------------------------------
-//
-// Between beginning and ending a capture, kernels launched on the stream are
-// recorded rather than run. The graph that comes out can be instantiated and
-// launched, which runs what was recorded, in order, with the arguments it was
-// recorded with.
-hipError_t hipStreamBeginCapture(hipStream_t stream, int) {
-  const ApiCall api("hipStreamBeginCapture");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  stream = resolve(s, stream);
-  if (!stream) return record(s, fail(hipErrorStreamCaptureUnsupported, "the null stream cannot be captured"));
-  static unsigned long long next_capture = 1;
-  if (!s.capturing.emplace(stream, Graph{{}, next_capture}).second) return record(s, hipErrorIllegalState);
-  ++next_capture;
-  return record(s, hipSuccess);
-}
-
-hipError_t hipStreamEndCapture(hipStream_t stream, void** graph) {
-  const ApiCall api("hipStreamEndCapture");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  stream = resolve(s, stream);
-  const auto it = s.capturing.find(stream);
-  if (it == s.capturing.end()) return record(s, hipErrorStreamCaptureUnmatched);
-  if (!graph) return record(s, hipErrorInvalidValue);
-  s.graphs.push_back(std::make_unique<Graph>(std::move(it->second)));
-  s.capturing.erase(it);
-  *graph = s.graphs.back().get();
-  return record(s, hipSuccess);
-}
-
-hipError_t hipGraphInstantiate(void** exec, void* graph, void*, char*, size_t) {
-  const ApiCall api("hipGraphInstantiate");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!exec || !graph) return record(s, hipErrorInvalidValue);
-  s.graph_execs.push_back(std::make_unique<Graph>(*static_cast<Graph*>(graph)));
-  *exec = s.graph_execs.back().get();
-  return record(s, hipSuccess);
-}
-
-hipError_t hipGraphLaunch(void* exec, hipStream_t stream) {
-  const ApiCall api("hipGraphLaunch");
-  State& s = state();
-  std::unique_lock<std::mutex> lock(s.mutex);
-  if (!exec) return record(s, hipErrorInvalidValue);
-  std::vector<LaunchJob> jobs;
-  for (const Node& node : static_cast<Graph*>(exec)->nodes) {
-    const auto hf = s.host_functions.find(node.host_function);
-    if (hf == s.host_functions.end()) return record(s, hipErrorInvalidDeviceFunction);
-    Module* m = nullptr;
-    if (const hipError_t e = module_on(s, *hf->second.binary, node.device, &m); e != hipSuccess) return record(s, e);
-    const Kernel* k = vgpu::amd::find_kernel(m->object, hf->second.kernel);
-    if (!k) return record(s, hipErrorInvalidDeviceFunction);
-    jobs.emplace_back();
-    if (const hipError_t e = prepare_launch(s, node.device, *m, *k, node.grid, node.block, node.shared, node.args,
-                                            stream, false, &jobs.back());
-        e != hipSuccess)
-      return record(s, e);
-  }
-  lock.unlock();
-  // The graph's launches, one after another, as one piece of the stream's work.
-  return record(s, in_order(stream, [jobs = std::move(jobs)] {
-    for (const LaunchJob& job : jobs)
-      if (const hipError_t e = run_launch(job); e != hipSuccess) return e;
-    return hipSuccess;
-  }));
-}
-
-hipError_t hipGraphDestroy(void* graph) {
-  const ApiCall api("hipGraphDestroy");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  for (size_t i = 0; i < s.graphs.size(); ++i)
-    if (s.graphs[i].get() == graph) {
-      s.graphs.erase(s.graphs.begin() + static_cast<std::ptrdiff_t>(i));
-      return record(s, hipSuccess);
-    }
-  return record(s, hipErrorInvalidValue);
-}
-
-hipError_t hipGraphExecDestroy(void* exec) {
-  const ApiCall api("hipGraphExecDestroy");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  for (size_t i = 0; i < s.graph_execs.size(); ++i)
-    if (s.graph_execs[i].get() == exec) {
-      s.graph_execs.erase(s.graph_execs.begin() + static_cast<std::ptrdiff_t>(i));
-      return record(s, hipSuccess);
-    }
-  return record(s, hipErrorInvalidValue);
-}
-
 // ---- Occupancy: how many work-groups of a kernel a compute unit holds -------
 
 }  // extern "C"
@@ -3111,9 +3131,11 @@ hipError_t launch_host_function(const void* host_function, vgpu::amd::abi::Dim3 
   std::vector<uint8_t> packed;
   if (const hipError_t e = build_kernargs(*k, args, extra, &packed); e != hipSuccess) return e;
   stream = resolve(s, stream);
-  if (auto cap = s.capturing.find(stream); stream && cap != s.capturing.end()) {
-    cap->second.nodes.push_back(Node{s.current, host_function, grid, block, static_cast<uint32_t>(shared), packed});
-    return hipSuccess;
+  if (!stream) {
+    if (const hipError_t e = legacy_conflict(s, s.current); e != hipSuccess) return e;
+  } else if (stream_capturing(s, stream)) {
+    return capture_kernel(s, stream, host_function, *k, grid, block, static_cast<uint32_t>(shared), std::move(packed),
+                          extra, cooperative);
   }
   LaunchJob job;
   if (const hipError_t e = prepare_launch(s, s.current, *m, *k, grid, block, static_cast<uint32_t>(shared),
@@ -3408,6 +3430,9 @@ hipError_t hipMallocFromPoolAsync(void** ptr, size_t size, void* pool, hipStream
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   Pool* p = find_pool(s, pool);
   if (!p) return record(s, hipErrorInvalidValue);
+  // In a capture, an allocation node: its address is handed back now.
+  if (const hipStream_t r = resolve(s, stream); r && stream_capturing(s, r))
+    return record(s, capture_alloc(s, r, p->device, size, ptr));
   return record(s, pool_alloc(s, p, ptr, size, stream));
 }
 hipError_t hipMallocAsync(void** ptr, size_t size, hipStream_t stream) {
@@ -3415,6 +3440,8 @@ hipError_t hipMallocAsync(void** ptr, size_t size, hipStream_t stream) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!device(s)) return record(s, hipErrorInvalidDevice);
+  if (const hipStream_t r = resolve(s, stream); r && stream_capturing(s, r))
+    return record(s, capture_alloc(s, r, s.current, size, ptr));
   return record(s, pool_alloc(s, current_pool(s, s.current), ptr, size, stream));
 }
 // Freed in the stream's order, once the work before it on the stream is done.
@@ -3426,6 +3453,8 @@ hipError_t hipFreeAsync(void* ptr, hipStream_t stream) {
   {
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
+    // In a capture, a node that frees it when the graph runs.
+    if (const hipStream_t r = resolve(s, stream); r && stream_capturing(s, r)) return record(s, capture_free(s, r, ptr));
     // Memory a pool keeps was freed already.
     for (const Pool& p : s.pools)
       for (const Pool::Kept& k : p.kept)
@@ -3450,6 +3479,8 @@ hipError_t hipFreeAsync(void* ptr, hipStream_t stream) {
       live = g_host_allocations.count(va) || g_managed.count(va);
     }
     uint64_t b = 0, n = 0;
+    // A graph's allocation may be freed in stream order before the launch that maps it has run.
+    if (!live) live = graph_memory_range(va, &b, &n) && b == va;
     if (!live && s.rt)
       for (int d = 0; d < s.rt->device_count() && !live; ++d)
         live = s.rt->device(d).memory().find_allocation(va, &b, &n) && b == va;
@@ -3642,17 +3673,6 @@ hipError_t hipPointerGetAttributes(vgpu::amd::abi::PointerAttribute* out, const 
   return record(s, hipSuccess);
 }
 
-// hipStreamCaptureStatus: 0 not capturing, 1 capturing.
-hipError_t hipStreamIsCapturing(hipStream_t stream, int* status) {
-  const ApiCall api("hipStreamIsCapturing");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!status) return record(s, hipErrorInvalidValue);
-  stream = resolve(s, stream);
-  *status = stream && s.capturing.count(stream) ? 1 : 0;
-  return record(s, hipSuccess);
-}
-
 // Nothing is ever left for a stream to do.
 // Whether the stream has work still to finish: hipErrorNotReady while it has.
 hipError_t hipStreamQuery(hipStream_t stream) {
@@ -3662,6 +3682,8 @@ hipError_t hipStreamQuery(hipStream_t stream) {
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   std::vector<std::shared_ptr<Queue>> qs;
   stream = resolve(s, stream);
+  if (stream && stream_capturing(s, stream)) return record(s, hipErrorStreamCaptureUnsupported);
+  if (const hipError_t e = unsafe_during_capture(s); e != hipSuccess) return record(s, e);
   if (!stream) {
     qs = queues_of(s, s.current, true);
   } else {
@@ -3851,7 +3873,6 @@ std::map<void*, int> g_ipc_open;   // pointer -> the device it was mapped on
 static_assert(sizeof(IpcPayload) <= 64, "an IPC payload fits hipMemPoolPtrExportData");
 std::map<uint64_t, IpcPayload> g_pool_exports;   // pool allocation -> how it was exported
 
-thread_local int t_capture_mode = 0;   // hipStreamCaptureMode, per thread as HIP keeps it
 
 }  // namespace
 
@@ -4258,6 +4279,9 @@ hipError_t hipModuleLaunchCooperativeKernel(hipFunction_t f, unsigned int gx, un
   if (uint64_t{gx} * gy * gz > resident) return record(s, hipErrorCooperativeLaunchTooLarge);
   std::vector<uint8_t> args;
   if (const hipError_t e = build_kernargs(*fn->kernel, params, nullptr, &args); e != hipSuccess) return record(s, e);
+  if (const hipStream_t r = resolve(s, stream); r && stream_capturing(s, r))
+    return record(s, capture_kernel(s, r, f, *fn->kernel, {gx, gy, gz}, {bx, by, bz}, shared, std::move(args), nullptr,
+                                    true));
   LaunchJob job;
   if (const hipError_t e = prepare_launch(s, s.current, *fn->module, *fn->kernel, {gx, gy, gz}, {bx, by, bz}, shared,
                                           std::move(args), stream, true, &job);
@@ -4285,8 +4309,8 @@ hipError_t hipLaunchHostFunc(hipStream_t stream, void (*fn)(void*), void* data) 
     std::lock_guard<std::mutex> lock(s.mutex);
     if (!fn) return record(s, hipErrorInvalidValue);
     stream = resolve(s, stream);
-    if (stream && s.capturing.count(stream))
-      return record(s, fail(hipErrorStreamCaptureUnsupported, "a host function in a captured stream is not modelled"));
+    // In a capture, a host node.
+    if (stream && stream_capturing(s, stream)) return record(s, capture_host(s, stream, fn, data));
   }
   return record(state(), in_order(stream, [fn, data] {
     fn(data);
@@ -4308,8 +4332,8 @@ hipError_t hipStreamAddCallback(hipStream_t stream, hipStreamCallback_t callback
     if (!callback || flags) return record(s, hipErrorInvalidValue);
     Stream null_stream;
     if (!find_stream(s, stream, &null_stream)) return record(s, hipErrorInvalidHandle);
-    if (const hipStream_t r = resolve(s, stream); r && s.capturing.count(r))
-      return record(s, fail(hipErrorStreamCaptureUnsupported, "a callback in a captured stream is not modelled"));
+    if (const hipStream_t r = resolve(s, stream); r && stream_capturing(s, r))
+      return record(s, fail(hipErrorStreamCaptureUnsupported, "a stream callback cannot be captured"));
   }
   // It is told the stream by the handle it was given -- but the thread's own
   // stream by its own handle, as ROCm's HIP passes it, not the reserved one.
@@ -4400,6 +4424,18 @@ hipError_t hipStreamGetDevice(hipStream_t stream, hipDevice_t* ordinal) {
 // recorded marks nothing, and the stream does not wait.
 hipError_t hipStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned int) {
   const ApiCall api("hipStreamWaitEvent");
+  {
+    // An event from a capture, or a stream that is capturing: the capture's
+    // to handle (a stream joins a capture this way).
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+    std::lock_guard<std::mutex> event_lock(g_event_mutex);
+    const Event* e = find_event(event);
+    if (!e) return record(s, hipErrorInvalidHandle);
+    hipError_t result = hipSuccess;
+    if (capture_wait(s, resolve(s, stream), e, &result)) return record(s, result);
+  }
   Queue::Marker m;
   bool exists = false;
   const bool recorded = event_marker(event, &m, nullptr, &exists);
@@ -4428,88 +4464,6 @@ extern "C" {
 hipError_t hipStreamWriteValue32(hipStream_t stream, void* ptr, uint32_t value, unsigned int flags) {
   const ApiCall api("hipStreamWriteValue32");
   return record(state(), write_value(stream, ptr, value, 4, flags));
-}
-
-// ---- Stream capture --------------------------------------------------------------
-
-// hipStreamCaptureStatus: 0 none, 1 active; and the capture's id.
-hipError_t hipStreamGetCaptureInfo(hipStream_t stream, int* status, unsigned long long* id) {
-  const ApiCall api("hipStreamGetCaptureInfo");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!status) return record(s, hipErrorInvalidValue);
-  stream = resolve(s, stream);
-  const auto it = stream ? s.capturing.find(stream) : s.capturing.end();
-  *status = it == s.capturing.end() ? 0 : 1;
-  if (id && it != s.capturing.end()) *id = it->second.capture_id;
-  return record(s, hipSuccess);
-}
-// The same, with the graph being recorded. A captured graph here is a
-// sequence, so there is never a set of nodes to depend on beyond the last.
-hipError_t hipStreamGetCaptureInfo_v2(hipStream_t stream, int* status, unsigned long long* id, void** graph,
-                                      const void*** deps, size_t* count) {
-  const ApiCall api("hipStreamGetCaptureInfo_v2");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!status) return record(s, hipErrorInvalidValue);
-  stream = resolve(s, stream);
-  const auto it = stream ? s.capturing.find(stream) : s.capturing.end();
-  *status = it == s.capturing.end() ? 0 : 1;
-  if (it != s.capturing.end()) {
-    if (id) *id = it->second.capture_id;
-    if (graph) *graph = &it->second;
-  }
-  if (deps) *deps = nullptr;
-  if (count) *count = 0;
-  return record(s, hipSuccess);
-}
-hipError_t hipThreadExchangeStreamCaptureMode(int* mode) {
-  const ApiCall api("hipThreadExchangeStreamCaptureMode");
-  if (!mode || *mode < 0 || *mode > 2) return record(state(), hipErrorInvalidValue);
-  std::swap(*mode, t_capture_mode);
-  return record(state(), hipSuccess);
-}
-hipError_t hipGraphInstantiateWithFlags(void** exec, void* graph, unsigned long long) {
-  const ApiCall api("hipGraphInstantiateWithFlags");
-  return hipGraphInstantiate(exec, graph, nullptr, nullptr, 0);
-}
-// A graph's nodes are its launches, in order; each one's handle is its place.
-hipError_t hipGraphGetNodes(void* graph, void** nodes, size_t* count) {
-  const ApiCall api("hipGraphGetNodes");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!graph || !count) return record(s, hipErrorInvalidValue);
-  auto& all = static_cast<Graph*>(graph)->nodes;
-  if (nodes)
-    for (size_t i = 0; i < std::min(*count, all.size()); ++i) nodes[i] = &all[i];
-  *count = all.size();
-  return record(s, hipSuccess);
-}
-// A graph here is the sequence of launches a capture recorded, so building
-// one node by node, or with nodes other than launches, is not modelled.
-hipError_t hipGraphAddDependencies(void*, const void*, const void*, size_t) {
-  return refused("hipGraphAddDependencies", "a graph here is a recorded sequence of launches");
-}
-hipError_t hipGraphAddEventRecordNode(void**, void*, const void*, size_t, hipEvent_t) {
-  return refused("hipGraphAddEventRecordNode", "a graph here holds only kernel launches");
-}
-hipError_t hipGraphAddHostNode(void**, void*, const void*, size_t, const void*) {
-  return refused("hipGraphAddHostNode", "a graph here holds only kernel launches");
-}
-hipError_t hipGraphNodeGetDependencies(void*, void**, size_t*) {
-  return refused("hipGraphNodeGetDependencies", "a graph here is a recorded sequence of launches");
-}
-hipError_t hipStreamUpdateCaptureDependencies(hipStream_t, void**, size_t, unsigned int) {
-  return refused("hipStreamUpdateCaptureDependencies", "a capture here records one sequence");
-}
-hipError_t hipGraphDebugDotPrint(void*, const char*, unsigned int) {
-  return refused("hipGraphDebugDotPrint", "graphs are not drawn");
-}
-hipError_t hipUserObjectCreate(void**, void*, void (*)(void*), unsigned int, unsigned int) {
-  return refused("hipUserObjectCreate", "a graph here does not own objects");
-}
-hipError_t hipGraphRetainUserObject(void*, void*, unsigned int, unsigned int) {
-  return refused("hipGraphRetainUserObject", "a graph here does not own objects");
 }
 
 // ---- Memory ----------------------------------------------------------------------
@@ -4564,6 +4518,7 @@ hipError_t hipMemGetAddressRange(void** base, size_t* size, void* ptr) {
         n = it->second;
       }
   }
+  if (!n) graph_memory_size(va, &b, &n);
   const int d = n ? -1 : owner_of(s, va);
   if (!n && (d < 0 || !s.rt->device(d).memory().find_allocation(va, &b, &n))) return record(s, hipErrorNotFound);
   if (base) *base = reinterpret_cast<void*>(b);
@@ -6277,40 +6232,12 @@ hipError_t hipMemGetAccess(unsigned long long* flags, const vgpu::amd::abi::MemL
   return record(s, hipSuccess);
 }
 
-// ---- Graph memory's counters ---------------------------------------------------
+}  // extern "C"
 
-// What graphs have allocated on a device: in use now and at most, reserved
-// now and at most. Only the two high-water marks may be set, and only back
-// to zero, where they start again from what is in use.
-hipError_t hipDeviceGetGraphMemAttribute(int ordinal, int attr, void* value) {
-  const ApiCall api("hipDeviceGetGraphMemAttribute");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!valid_device(s, ordinal)) return record(s, hipErrorInvalidDevice);
-  if (attr < 0 || attr > 3 || !value) return record(s, hipErrorInvalidValue);
-  const GraphMemory& g = s.graph_memory[ordinal];
-  const uint64_t v[4] = {g.used, g.used_high, g.used, g.used_high};
-  *static_cast<uint64_t*>(value) = v[attr];
-  return record(s, hipSuccess);
-}
-hipError_t hipDeviceSetGraphMemAttribute(int ordinal, int attr, void* value) {
-  const ApiCall api("hipDeviceSetGraphMemAttribute");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!valid_device(s, ordinal)) return record(s, hipErrorInvalidDevice);
-  if ((attr != 1 && attr != 3) || !value || *static_cast<const uint64_t*>(value))
-    return record(s, hipErrorInvalidValue);
-  GraphMemory& g = s.graph_memory[ordinal];
-  g.used_high = g.used;
-  return record(s, hipSuccess);
-}
-// Graph memory is freed when it is, so there is none held back to give back.
-hipError_t hipDeviceGraphMemTrim(int ordinal) {
-  const ApiCall api("hipDeviceGraphMemTrim");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  return record(s, valid_device(s, ordinal) ? hipSuccess : hipErrorInvalidDevice);
-}
+// ---- Graphs and stream capture -------------------------------------------------
+#include "hip_graph.inc"
+
+extern "C" {
 
 // ---- Memory and semaphores another API made (Vulkan interop) -------------------
 //

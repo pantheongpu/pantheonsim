@@ -273,6 +273,21 @@ echo "$out" | sed 's/^/      /'
 expect "the memory program runs to the end" "0" "$status"
 expect "every one of its checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# Graphs and stream capture (hipcc/graphs.cpp): graphs built node by node and
+# captured across streams, executable graphs and what changes them, capture
+# modes and what they refuse, event and memory nodes, user objects. It
+# writes a drawing of a graph into the working directory, so it runs in one
+# of its own.
+graph_dir=$(mktemp -d)
+graph_shim=$(cd "$shim" && pwd)
+out=$(cd "$graph_dir" && VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$graph_shim" timeout 300 \
+      "$(dirname "$exe")/graphs.gfx942" 2>&1)
+status=$?
+rm -rf "$graph_dir"
+echo "$out" | sed 's/^/      /'
+expect "the graphs program runs to the end" "0" "$status"
+expect "every one of its graph checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)
