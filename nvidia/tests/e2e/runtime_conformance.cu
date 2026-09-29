@@ -396,7 +396,11 @@ int main() {
 
   // A driver function outside the runtime, fetched the way NanoVDB fetches
   // cuMemGetAllocationGranularity and then calls without checking for null;
-  // and a name the driver does not have, which is not found.
+  // and a name the driver does not have, which is not found. Not under
+  // AddressSanitizer: fetching it loads the simulator's libcuda beside its
+  // libcudart, two copies of the core that ASan refuses as an ODR violation
+  // (the reason run_mixed_apis.sh skips sanitizer builds).
+#ifndef __SANITIZE_ADDRESS__
   {
     void* fn = nullptr;
     cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;
@@ -427,6 +431,7 @@ int main() {
           e == cudaSuccess && fn == nullptr && q == cudaDriverEntryPointSymbolNotFound,
           "got %d %s, status %d", e, cudaGetErrorName(e), (int)q);
   }
+#endif
 
   // Cache preferences: accepted for a kernel, refused for anything else, and the
   // device-wide one reads back.
