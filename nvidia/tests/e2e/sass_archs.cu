@@ -7,7 +7,8 @@
 //   - float and integer block reductions ending in one thread's store,
 //   - an mbarrier pipeline between warps (SYNCS from sm_90),
 //   - thread-block clusters: their special registers, barrier and
-//     distributed shared memory (sm_90+).
+//     distributed shared memory (sm_90+), st.async and red.async into
+//     another block (sm_90+), and cluster launch control (sm_100+).
 #include <cstdint>
 #include <cstdio>
 #include <cuda_runtime.h>
@@ -188,6 +189,91 @@ __global__ void cluster_ids(unsigned* out) {
 #endif
 }
 
+// st.async and red.async (sm_90+): each block of a 4-block cluster stores
+// into the next one's shared memory, and adds into rank 0's, completing on
+// that block's mbarrier; each block waits for its own. out: per block, the
+// stored pair and (rank 0) the sum.
+__global__ void async_stores(unsigned* out) {
+#if __CUDA_ARCH__ >= 900
+  __shared__ __align__(8) uint64_t bar;
+  __shared__ __align__(16) uint32_t slot[4];
+  __shared__ uint32_t sum;
+  unsigned rank, n;
+  asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(rank));
+  asm volatile("mov.u32 %0, %%cluster_nctarank;" : "=r"(n));
+  const unsigned b = static_cast<unsigned>(__cvta_generic_to_shared(&bar));
+  if (threadIdx.x == 0) {
+    sum = 0;
+    asm volatile("mbarrier.init.shared.b64 [%0], 1;" :: "r"(b));
+    // This block expects 8 bytes from its neighbour, and rank 0 also 4 from
+    // every block's add.
+    asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" :: "r"(b), "r"(rank == 0 ? 8 + 4 * n : 8));
+  }
+  asm volatile("barrier.cluster.arrive.aligned; barrier.cluster.wait.aligned;" ::: "memory");
+  if (threadIdx.x == 0) {
+    const unsigned next = (rank + 1) % n;
+    unsigned rs, rb, r0, rb0;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(rs) : "r"(static_cast<unsigned>(__cvta_generic_to_shared(slot))), "r"(next));
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(rb) : "r"(b), "r"(next));
+    asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.b32 [%0], {%1, %2}, [%3];"
+                 :: "r"(rs), "r"(100 + rank), "r"(200 + rank), "r"(rb) : "memory");
+    asm volatile("mapa.shared::cluster.u32 %0, %1, 0;" : "=r"(r0) : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&sum))));
+    asm volatile("mapa.shared::cluster.u32 %0, %1, 0;" : "=r"(rb0) : "r"(b));
+    asm volatile("red.async.relaxed.cluster.shared::cluster.mbarrier::complete_tx::bytes.add.u32 [%0], %1, [%2];"
+                 :: "r"(r0), "r"(rank + 1), "r"(rb0) : "memory");
+  }
+  unsigned done = 0;
+  while (!done)
+    asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], 0; selp.u32 %0, 1, 0, p; }"
+                 : "=r"(done) : "r"(b) : "memory");
+  if (threadIdx.x == 0) {
+    out[3 * blockIdx.x] = slot[0];
+    out[3 * blockIdx.x + 1] = slot[1];
+    out[3 * blockIdx.x + 2] = rank == 0 ? sum : 0;
+  }
+  asm volatile("barrier.cluster.arrive.aligned; barrier.cluster.wait.aligned;" ::: "memory");
+#endif
+}
+
+// Cluster launch control (sm_100+): each block does its own block's work,
+// then keeps cancelling blocks that have not started and doing theirs. Every
+// block's work must be done exactly once, whoever does it.
+__global__ void work_steal(unsigned* done, unsigned* stolen) {
+#if __CUDA_ARCH__ >= 1000
+  __shared__ __align__(16) uint32_t resp[4];
+  __shared__ __align__(8) uint64_t bar;
+  __shared__ unsigned next_id, have;
+  const unsigned b = static_cast<unsigned>(__cvta_generic_to_shared(&bar));
+  if (threadIdx.x == 0) asm volatile("mbarrier.init.shared.b64 [%0], 1;" :: "r"(b));
+  __syncthreads();
+  unsigned id = blockIdx.x, phase = 0;
+  for (;;) {
+    if (threadIdx.x == 0) atomicAdd(&done[id], 1);
+    if (threadIdx.x == 0) {
+      asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], 16;" :: "r"(b));
+      asm volatile("clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.b128 [%0], [%1];"
+                   :: "r"(static_cast<unsigned>(__cvta_generic_to_shared(resp))), "r"(b) : "memory");
+      unsigned ok = 0;
+      while (!ok)
+        asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+                     : "=r"(ok) : "r"(b), "r"(phase) : "memory");
+      uint32_t c, x;
+      asm volatile("{ .reg .b128 q; .reg .pred p; ld.shared.b128 q, [%2]; clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p, q; selp.u32 %0, 1, 0, p;"
+                   " clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %1, q; }"
+                   : "=r"(c), "=r"(x) : "r"(static_cast<unsigned>(__cvta_generic_to_shared(resp))) : "memory");
+      have = c;
+      next_id = x;
+      if (c) atomicAdd(stolen, 1);
+    }
+    __syncthreads();
+    phase ^= 1;
+    if (!have) break;
+    id = next_id;
+    __syncthreads();
+  }
+#endif
+}
+
 static int g_fail = 0;
 #define CHECK(c, ...)                        \
   do {                                       \
@@ -362,6 +448,49 @@ int main() {
           for (int i = 0; i < 13; ++i)
             CHECK(o[i] == want[i], "cluster block (%d,%d) word %d = %u, want %u", bx, by, i, o[i], want[i]);
         }
+    }
+  }
+
+  // st.async / red.async across a 4-block cluster.
+  {
+    int major = 0;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+    if (major >= 9) {
+      unsigned* da;
+      cudaMalloc(&da, 12 * sizeof(unsigned));
+      cudaMemset(da, 0, 12 * sizeof(unsigned));
+      cudaLaunchConfig_t cfg = {};
+      cfg.gridDim = dim3(4, 1, 1);
+      cfg.blockDim = dim3(32, 1, 1);
+      cudaLaunchAttribute attr[1];
+      attr[0].id = cudaLaunchAttributeClusterDimension;
+      attr[0].val.clusterDim.x = 4;
+      attr[0].val.clusterDim.y = 1;
+      attr[0].val.clusterDim.z = 1;
+      cfg.attrs = attr;
+      cfg.numAttrs = 1;
+      CHECK(cudaLaunchKernelEx(&cfg, async_stores, da) == cudaSuccess, "async_stores launch");
+      unsigned ha[12];
+      cudaMemcpy(ha, da, sizeof ha, cudaMemcpyDeviceToHost);
+      for (unsigned r = 0; r < 4; ++r) {
+        const unsigned from = (r + 3) % 4;
+        CHECK(ha[3 * r] == 100 + from && ha[3 * r + 1] == 200 + from, "st.async into block %u: %u %u", r, ha[3 * r], ha[3 * r + 1]);
+      }
+      CHECK(ha[2] == 1 + 2 + 3 + 4, "red.async sum %u, want 10", ha[2]);
+    }
+    if (major >= 10) {
+      const int nb = 64;
+      unsigned *dd, *ds;
+      cudaMalloc(&dd, nb * sizeof(unsigned));
+      cudaMalloc(&ds, sizeof(unsigned));
+      cudaMemset(dd, 0, nb * sizeof(unsigned));
+      cudaMemset(ds, 0, sizeof(unsigned));
+      work_steal<<<nb, 32>>>(dd, ds);
+      unsigned hd[nb], hs = 0;
+      cudaMemcpy(hd, dd, sizeof hd, cudaMemcpyDeviceToHost);
+      cudaMemcpy(&hs, ds, sizeof hs, cudaMemcpyDeviceToHost);
+      for (int i = 0; i < nb; ++i) CHECK(hd[i] == 1, "work_steal: block %d's work done %u times", i, hd[i]);
+      (void)hs;   // how many were stolen depends on scheduling
     }
   }
 
