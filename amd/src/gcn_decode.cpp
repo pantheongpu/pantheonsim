@@ -686,6 +686,12 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Ds, 0x5b}, {"ds_read_u16_d16_hi", 1, 1}},
       {{Enc::Ds, 0x4d}, {"ds_write_b64", 0, 2, 1, 2}},
       {{Enc::Ds, 0x76}, {"ds_read_b64", 2, 1}},
+      // gfx950's reads that transpose as they load, for matrix operands:
+      // 64 bits a lane of 4-, 8- or 16-bit elements (Triton's attention on
+      // MI350X). The 6-bit form (0xe1) is not modelled.
+      {{Enc::Ds, 0xe0}, {"ds_read_b64_tr_b4", 2, 1}},
+      {{Enc::Ds, 0xe2}, {"ds_read_b64_tr_b8", 2, 1}},
+      {{Enc::Ds, 0xe3}, {"ds_read_b64_tr_b16", 2, 1}},
       {{Enc::Ds, 0xdf}, {"ds_write_b128", 0, 2, 1, 4}},
       {{Enc::Ds, 0xff}, {"ds_read_b128", 4, 1}},
       // Lanes trading values without touching LDS at all: the offset is a
@@ -708,6 +714,11 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Flat, 0x15}, {"load_dwordx2", 2, 1}},
       {{Enc::Flat, 0x16}, {"load_dwordx3", 3, 1}},
       {{Enc::Flat, 0x17}, {"load_dwordx4", 4, 1}},
+      // Loads straight into LDS, no register written: gfx942's dword, and
+      // gfx950's three and four dwords a lane (vLLM's skinny GEMMs on MI350X).
+      {{Enc::Flat, 0x2a}, {"load_lds_dword", 0, 1}},
+      {{Enc::Flat, 0x7e}, {"load_lds_dwordx3", 0, 1}},
+      {{Enc::Flat, 0x7d}, {"load_lds_dwordx4", 0, 1}},
       {{Enc::Flat, 0x18}, {"store_byte", 0, 2}},
       {{Enc::Flat, 0x1a}, {"store_short", 0, 2}},
       // The top half of the register, stored as a short.

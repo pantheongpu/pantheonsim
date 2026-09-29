@@ -1,7 +1,9 @@
 name: vLLM nightly
 
 # vLLM for ROCm (0.30, its own PyTorch on ROCm 7.2.3), unmodified, generating
-# on a simulated MI300X what transformers generates on the CPU
+# on each simulated AMD GPU vLLM supports what transformers generates on the
+# CPU. (The RX 6900 XT is left out: vLLM ships no gfx1030 kernels, and says so
+# there as it does on the card.)
 # (amd/tests/e2e/run_vllm_amd.sh). ROCm's libraries are AMD's 7.2.3 release;
 # the HIP and HSA runtimes and the ROCm SMI and AMD SMI libraries are the
 # simulator's. Nightly, as it takes ROCm's libraries and vLLM's wheels, some
@@ -20,9 +22,13 @@ concurrency:
 
 jobs:
   vllm:
-    name: vLLM on amd/mi300x
+    name: vLLM on ${{ matrix.gpu }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu: [amd/mi300x, amd/mi325x, amd/mi250x, amd/mi350x, amd/rx7900xtx, amd/rx9070xt]
     steps:
       - uses: actions/checkout@v4
       - name: Make room for ROCm and vLLM
@@ -41,6 +47,6 @@ jobs:
         run: |
           set -o pipefail
           export VGPU_VLLM_PYTHON="$HOME/vllm-venv/bin/python"
-          VGPU_BUILD_DIR=build amd/tests/e2e/run_vllm_amd.sh amd/mi300x | tee vllm.log
+          VGPU_BUILD_DIR=build amd/tests/e2e/run_vllm_amd.sh "${{ matrix.gpu }}" | tee vllm.log
           # A skip means the job lost what it installed: here that is a failure.
           if grep -q '^SKIP' vllm.log; then echo "::error::the vLLM test skipped"; exit 1; fi

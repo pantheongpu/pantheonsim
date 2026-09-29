@@ -1690,3 +1690,10 @@ D3CB8900 14F26528	v_smfmac_f32_32x32x64_bf8_bf8 a[0:15], v[40:43], a[50:57], v60
 D3CE0808 0C0E1904	v_smfmac_f32_32x32x64_bf8_fp8 v[8:23], a[4:7], v[12:19], v3 abid:1
 D3CF0014 04060D02	v_smfmac_f32_32x32x64_fp8_bf8 v[20:35], v[2:5], v[6:13], v1
 D3D38900 14F26528	v_smfmac_f32_32x32x64_fp8_fp8 a[0:15], v[40:43], a[50:57], v60 cbsz:1 abid:1
+DDF48000 00040001	global_load_lds_dwordx4 v1, s[4:5]
+DDF88004 00040001	global_load_lds_dwordx3 v1, s[4:5] offset:4
+DCA88008 00040001	global_load_lds_dword v1, s[4:5] offset:8
+DDF49FF0 007F0002	global_load_lds_dwordx4 v[2:3], off offset:-16
+D9C60000 04000001	ds_read_b64_tr_b16 v[4:5], v1
+D9C40040 06000001	ds_read_b64_tr_b8 v[6:7], v1 offset:64
+D9C00000 08000001	ds_read_b64_tr_b4 v[8:9], v1

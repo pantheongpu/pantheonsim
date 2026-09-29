@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <fstream>
@@ -20,8 +21,8 @@ using namespace vgpu;
 
 namespace {
 
-amd::CodeObject object(const char* name) {
-  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/" + name + ".gfx942.o";
+amd::CodeObject object(const char* name, const char* target = "gfx942") {
+  const std::string path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/" + name + "." + target + ".o";
   std::ifstream in(path, std::ios::binary);
   if (!in) throw vtest::Failure("no code object at " + path);
   return amd::load_code_object(std::string((std::istreambuf_iterator<char>(in)), {}), path);
@@ -232,6 +233,126 @@ VTEST(a_matrix_instruction_broadcasts_a_blocks_a_to_its_group) {
   VCHECK_EQ(differ4, 0);
   VCHECK_EQ(differ2, 0);
   VCHECK(changed > 0);   // the two broadcasts took different blocks' A
+}
+
+VTEST(global_loads_into_lds_land_where_m0_the_offset_and_the_lane_say) {
+  const amd::CodeObject o = object("asm_lds_dma", "gfx950");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> src(256);
+  for (uint32_t i = 0; i < src.size(); ++i) src[i] = i * 7 + 1;
+  const uint64_t in = mem.alloc(256 * 4), out = mem.alloc(768 * 4);
+  mem.write(in, src.data(), 256 * 4);
+  const std::vector<uint32_t> r = run(o, "lds_dma", mem, out, 768, {in, out});
+  std::vector<uint32_t> want(768, 0);
+  for (uint32_t lane = 0; lane < 64; ++lane) {
+    for (uint32_t k = 0; k < 4; ++k) want[lane * 4 + k] = src[lane * 4 + k];            // x4: M0 0
+    for (uint32_t k = 0; k < 3; ++k) want[257 + lane * 3 + k] = src[lane * 4 + 1 + k];  // x3: M0 1024, offset 4
+    want[514 + lane] = src[lane * 4 + 2];                                                // x1: M0 2048, offset 8
+  }
+  int wrong = 0;
+  for (size_t i = 0; i < want.size(); ++i) wrong += r[i] != want[i];
+  VCHECK_EQ(wrong, 0);
+}
+
+VTEST(transposing_lds_reads_hand_each_lane_its_column) {
+  // Destination lane l's element r is element l mod tile of lane A's read,
+  // A = lane bits t..t+b-1, then r, then lane bits t+b and up (t = log2 tile;
+  // b = 2, 1, 0 for 16-, 8-, 4-bit elements): the map Triton's AMD backend
+  // lowers gfx950's ds_read_b64_tr_* by. For b16 that is the ISA's "each
+  // lane holds 4 consecutive M values": lane l's four halves are the
+  // (l mod 4)-th value of four lanes that differ only in the two bits r moves.
+  const amd::CodeObject o = object("asm_ds_tr", "gfx950");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint64_t> pattern(64);
+  for (uint64_t i = 0; i < 64; ++i) pattern[i] = 0x0123456789abcdefull * (i + 1) ^ (i << 56);
+  const uint64_t in = mem.alloc(64 * 8), out = mem.alloc(3 * 64 * 8);
+  mem.write(in, pattern.data(), 64 * 8);
+  const std::vector<uint32_t> r32 = run(o, "tr", mem, out, 3 * 64 * 2, {in, out});
+  int wrong = 0;
+  for (uint32_t form = 0; form < 3; ++form) {
+    const uint32_t bits = form == 0 ? 16 : form == 1 ? 8 : 4, tile = 64 / bits;
+    const uint32_t t = form == 0 ? 2 : form == 1 ? 3 : 4, b = form == 0 ? 2 : form == 1 ? 1 : 0;
+    const uint64_t mask = (uint64_t{1} << bits) - 1;
+    for (uint32_t l = 0; l < 64; ++l) {
+      uint64_t want = 0;
+      for (uint32_t r = 0; r < tile; ++r) {
+        const uint32_t a = ((l >> t) & ((1u << b) - 1)) | (r << b) | ((l >> (t + b)) << (b + t));
+        want |= ((pattern[a] >> ((l % tile) * bits)) & mask) << (r * bits);
+      }
+      const size_t at = (form * 64 + l) * 2;
+      const uint64_t got = r32[at] | uint64_t{r32[at + 1]} << 32;
+      wrong += got != want;
+    }
+  }
+  VCHECK_EQ(wrong, 0);
+}
+
+VTEST(a_work_group_waiting_for_another_on_the_same_thread_is_released) {
+  // One host thread, two groups, group 0 first and waiting for group 1.
+  setenv("VGPU_THREADS", "1", 1);
+  const amd::CodeObject o = object("asm_wait");
+  MemoryManager mem(16ull << 20);
+  const uint64_t flag = mem.alloc(4), out = mem.alloc(4);
+  const uint32_t zero = 0;
+  mem.write(flag, &zero, 4);
+  mem.write(out, &zero, 4);
+  const amd::Kernel* k = amd::find_kernel(o, "wait");
+  VCHECK(k != nullptr);
+  if (!k) return;
+  std::vector<uint8_t> args(k->kernarg_size, 0);
+  for (int b = 0; b < 8; ++b) args[b] = static_cast<uint8_t>(flag >> (8 * b)), args[8 + b] = static_cast<uint8_t>(out >> (8 * b));
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = k;
+  d.kernarg = mem.alloc(args.size());
+  mem.write(d.kernarg, args.data(), args.size());
+  d.group_size[0] = 64;
+  d.groups[0] = 2;
+  amd::execute(d, mem);
+  unsetenv("VGPU_THREADS");
+  uint32_t got = 0;
+  mem.read(out, &got, 4);
+  VCHECK_EQ(got, 42u);
+}
+
+VTEST(rdna_permlanex16_takes_op_sel_as_fi_and_bound_ctrl) {
+  const amd::CodeObject o = object("asm_permlane", "gfx1100");
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(4 * 64 * 4);
+  const std::vector<uint32_t> r = run(o, "permlane", mem, out, 4 * 64, {out});
+  int wrong = 0;
+  for (uint32_t item = 0; item < 64; ++item) {
+    const uint32_t lane = item % 32, from = 0xff800000u | (lane ^ 16);
+    const bool on = lane < 16;
+    wrong += r[item] != from;                          // FI, every lane on: all 32 bits
+    wrong += r[64 + item] != 7u;                       // no bits, source off: kept
+    wrong += r[128 + item] != (on ? from : 7u);        // FI: read anyway
+    wrong += r[192 + item] != (on ? 0u : 7u);          // BOUND_CTRL: zero
+  }
+  VCHECK_EQ(wrong, 0);
+}
+
+VTEST(rdna4_gives_each_wave_its_number_in_ttmp8) {
+  const amd::CodeObject o = object("asm_ttmp", "gfx1201");
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(128 * 4);
+  const amd::Kernel* k = amd::find_kernel(o, "wave_id");
+  VCHECK(k != nullptr);
+  if (!k) return;
+  std::vector<uint8_t> args(k->kernarg_size, 0);
+  for (int b = 0; b < 8; ++b) args[b] = static_cast<uint8_t>(out >> (8 * b));
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = k;
+  d.kernarg = mem.alloc(args.size());
+  mem.write(d.kernarg, args.data(), args.size());
+  d.group_size[0] = 128;   // four waves of 32
+  amd::execute(d, mem);
+  std::vector<uint32_t> r(128);
+  mem.read(out, r.data(), 128 * 4);
+  int wrong = 0;
+  for (uint32_t i = 0; i < 128; ++i) wrong += r[i] != i / 32;
+  VCHECK_EQ(wrong, 0);
 }
 
 VTEST(a_kernel_finds_only_the_group_ids_it_asked_for_one_after_another) {
