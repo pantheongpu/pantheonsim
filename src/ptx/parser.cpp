@@ -5081,7 +5081,10 @@ Module parse(const std::string& src) {
     }
     for (const auto& md : m.module_shared) {
       if (fn.shared.count(md.name)) continue;
-      if (reach && !reach->count(md.name)) continue;
+      // Only static .shared costs a kernel anything. A dynamic array
+      // (.extern, no size) is the launch's dynamic allocation under another
+      // name, so every kernel has it, whether or not it names it.
+      if (reach && !reach->count(md.name) && !md.dynamic) continue;
       SharedDecl d = md;
       if (d.dynamic) {
         fn.uses_dynamic_shared = true;
