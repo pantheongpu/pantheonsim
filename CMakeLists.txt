@@ -1341,6 +1341,13 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_occupancy_rules
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_occupancy_rules.sh)
+  set_tests_properties(e2e_occupancy_rules PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_modern_dtypes
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_modern_dtypes.sh)
   set_tests_properties(e2e_modern_dtypes PROPERTIES

@@ -53,10 +53,22 @@ struct Occupancy {
   const char* limited_by = "warps";
 };
 
+// How a device hands out registers and shared memory, as CUDA's occupancy
+// calculator (cuda_occupancy.h) states it for NVIDIA parts. The defaults --
+// everything in units of one, nothing reserved -- are the plain arithmetic.
+struct OccupancyRules {
+  uint32_t reg_alloc_unit = 1;    // registers per warp are allocated in these
+  uint32_t sub_partitions = 1;    // a warp's registers come from one of these
+  uint32_t regs_per_block = 0;    // the per-block limit, checked as the hardware
+                                  // does (warps rounded up to sub_partitions); 0: none
+  uint32_t smem_alloc_unit = 1;   // shared memory per block is allocated in these
+  uint32_t reserved_smem = 0;     // the driver's own shared memory per block
+};
+
 Occupancy compute_occupancy(uint32_t regs_per_thread, uint32_t threads_per_block,
                             uint32_t static_shared_bytes, uint32_t dynamic_shared_bytes,
                             uint32_t regs_per_sm, uint32_t max_threads_per_sm,
                             uint32_t max_blocks_per_sm, uint32_t shared_per_sm,
-                            uint32_t warp_size);
+                            uint32_t warp_size, const OccupancyRules& rules = {});
 
 }  // namespace vgpu::ptx

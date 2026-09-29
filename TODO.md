@@ -571,7 +571,15 @@ That count is functional, not decorative:
 - `__launch_bounds__` (`.maxntid` / `.reqntid`) is parsed and enforced;
 - `cudaFuncGetAttributes` reports real `numRegs` and `localSizeBytes`, and
   `cudaOccupancyMaxActiveBlocksPerMultiprocessor` does the standard occupancy
-  calculation instead of returning a placeholder.
+  calculation instead of returning a placeholder -- with NVIDIA's allocation
+  rules as CUDA's occupancy calculator (cuda_occupancy.h) states them:
+  registers per warp in units of 256 from four sub-partitions, the per-block
+  file checked with a block's warps rounded up to those, and shared memory in
+  128-byte units (256 before compute capability 8.0) with the driver's
+  reserved kilobyte added to every block. An RTX 3060's API agrees with the
+  calculator in all 22 cases of e2e_occupancy_rules, which checks the
+  simulator against it on five GPUs. It is not affected by how many named
+  barriers a kernel uses, on the card either.
 
 Checked against a physical RTX 3060: a simple kernel reports **8 registers and
 6 blocks/SM on both**. Measured against `ptxas -v` across the pantheon kernels,

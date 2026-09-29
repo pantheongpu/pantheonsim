@@ -11588,10 +11588,24 @@ KernelResources kernel_resources(const EntryFn& fn, const DeviceProfile& profile
   }
   KernelResources r;
   r.usage = usage;
+  // NVIDIA's allocation rules, as cuda_occupancy.h gives them and an RTX
+  // 3060's cudaOccupancyMaxActiveBlocksPerMultiprocessor applies them
+  // (e2e_occupancy_rules): registers per warp in units of 256 from four
+  // sub-partitions, shared memory in units of 128 bytes from compute
+  // capability 8.0 (256 before) with the driver's reserved shared memory added
+  // to every block.
+  ptx::OccupancyRules rules;
+  if (profile.vendor == "nvidia") {
+    rules.reg_alloc_unit = 256;
+    rules.sub_partitions = profile.cc_major == 6 && profile.cc_minor == 0 ? 2 : 4;
+    rules.regs_per_block = profile.limits.registers_per_block;
+    rules.smem_alloc_unit = profile.cc_major >= 8 ? 128 : 256;
+    rules.reserved_smem = profile.reserved_smem_per_block();
+  }
   r.occupancy = ptx::compute_occupancy(
       usage.regs_per_thread, block_threads, fn.static_shared_size, dynamic_shared,
       profile.limits.registers_per_sm, profile.limits.max_threads_per_sm,
-      profile.limits.max_blocks_per_sm, profile.limits.shared_mem_per_sm, profile.warp_size);
+      profile.limits.max_blocks_per_sm, profile.limits.shared_mem_per_sm, profile.warp_size, rules);
   return r;
 }
 
