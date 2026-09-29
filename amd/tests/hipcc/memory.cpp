@@ -35,6 +35,7 @@ __global__ void delay(uint64_t ms, uint64_t ticks_per_ms) {
     while (wall_clock64() - start < ticks_per_ms) __builtin_amdgcn_s_sleep(10);
   }
 }
+__global__ void add_double(double* p, double v) { atomicAdd(p, v); }
 __global__ void iota3d(uint8_t* p, size_t pitch, size_t height, size_t w, size_t h, size_t d) {
   for (size_t z = 0; z < d; ++z)
     for (size_t y = 0; y < h; ++y)
@@ -335,6 +336,15 @@ int main() {
   (void)hipMemRelease(imported_mem);
   close(dmabuf);
   (void)hipFree(dmabuf_src);
+
+  // ---- Pinned memory reached in whole pages, as a card maps it
+  double* small_pinned = nullptr;
+  (void)hipHostMalloc(reinterpret_cast<void**>(&small_pinned), sizeof(float), hipHostMallocCoherent);
+  *small_pinned = 1.5;
+  add_double<<<1, 1>>>(small_pinned, 2.0);
+  EXPECT(hipDeviceSynchronize(), hipSuccess, "an 8-byte atomic on a 4-byte pinned allocation stays in its page");
+  check(*small_pinned == 3.5, "and adds", std::to_string(*small_pinned));
+  (void)hipHostFree(small_pinned);
 
   // ---- Edge sizes
   void* ext = reinterpret_cast<void*>(1);

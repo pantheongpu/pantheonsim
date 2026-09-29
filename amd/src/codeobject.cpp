@@ -327,6 +327,37 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     }
   }
 
+  // A linked object's dynamic relocations, against the symbol table they
+  // name: absolute addresses (R_AMDGPU_ABS64, and _ABS32 and its halves) and
+  // ones relative to where the image lands (R_AMDGPU_RELATIVE64).
+  for (const Section& sec : sections) {
+    if (!out.linked || sec.type != 4 /* SHT_RELA */ || !(sec.flags & 2) || !sec.entsize) continue;
+    const Section* symtab = sec.link < sections.size() ? &sections[sec.link] : nullptr;
+    for (uint64_t at = sec.offset; at + sec.entsize <= sec.offset + sec.size; at += sec.entsize) {
+      const uint64_t where = r.u64(at);
+      const uint64_t info = r.u64(at + 8);
+      const uint64_t addend = r.u64(at + 16);
+      const uint32_t kind = static_cast<uint32_t>(info), sym = static_cast<uint32_t>(info >> 32);
+      uint64_t value = 0;
+      if (sym && symtab && symtab->entsize) value = r.u64(symtab->offset + uint64_t{sym} * symtab->entsize + 8);
+      CodeObject::DynRelocation d;
+      d.at = where;
+      switch (kind) {
+        case 3: d.value = value + addend; break;                        // R_AMDGPU_ABS64
+        case 13: d.value = addend; break;                               // R_AMDGPU_RELATIVE64
+        case 1: case 2: case 6:                                         // R_AMDGPU_ABS32_LO, _HI, ABS32
+          d.value = value + addend;
+          d.bytes = 4;
+          d.high = kind == 2;
+          break;
+        default: continue;
+      }
+      if (where + d.bytes > out.image.size())
+        throw Error::make(Err::ProfileParse, origin, ": a dynamic relocation points past the end of the image");
+      out.dyn_relocations.push_back(d);
+    }
+  }
+
   // The metadata note: a MessagePack map, with the kernels under
   // "amdhsa.kernels" and the target under "amdhsa.target". An object linked
   // from several -- Tensile's libraries are hundreds of kernels linked into
@@ -441,6 +472,18 @@ const Kernel* find_kernel(const CodeObject& o, const std::string& name) {
 }  // namespace vgpu::amd
 
 namespace vgpu::amd {
+
+void relocate_image(CodeObject& o, uint64_t base) {
+  for (const CodeObject::DynRelocation& d : o.dyn_relocations) {
+    const uint64_t address = base + d.value;
+    if (d.bytes == 8) {
+      std::memcpy(o.image.data() + d.at, &address, 8);
+    } else {
+      const uint32_t half = static_cast<uint32_t>(d.high ? address >> 32 : address);
+      std::memcpy(o.image.data() + d.at, &half, 4);
+    }
+  }
+}
 
 void place_globals(CodeObject& o, uint64_t base) {
   if (o.placed && o.data_base != base)

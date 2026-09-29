@@ -308,6 +308,24 @@ echo "$out" | sed 's/^/      /'
 expect "the interprocess events program runs to the end" "0" "$status"
 expect "every one of its interprocess checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# Every error code's name and text, from both the runtime's and the driver's
+# forms, as ROCm 7.1's own library gives them, line for line.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/errors.gfx942" 2>&1)
+expect "every error's name and text are ROCm's" "same" \
+  "$(diff -q <(echo "$out") "$(dirname "$exe")/rocm/errors.expected" >/dev/null && echo same ||
+     diff <(echo "$out") "$(dirname "$exe")/rocm/errors.expected" | head -4 | tr '\n' ' ')"
+
+# The devices a program is shown: ROCR_VISIBLE_DEVICES picks from four, then
+# HIP_VISIBLE_DEVICES from those, each read up to its first bad entry; none
+# shown is no device.
+visible() { env "$@" VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=4 LD_LIBRARY_PATH="$shim" \
+            "$(dirname "$exe")/visible.gfx942" 2>&1; }
+expect "HIP_VISIBLE_DEVICES=0,2 shows two devices" "hipSuccess 2" "$(visible HIP_VISIBLE_DEVICES=0,2)"
+expect "ROCR_VISIBLE_DEVICES=3 shows one" "hipSuccess 1" "$(visible ROCR_VISIBLE_DEVICES=3)"
+expect "a list stops at its first device that is not there" "hipSuccess 1" "$(visible HIP_VISIBLE_DEVICES=1,9,0)"
+expect "HIP's list picks from ROCr's" "hipSuccess 1" "$(visible ROCR_VISIBLE_DEVICES=1,2 HIP_VISIBLE_DEVICES=1)"
+expect "an empty list shows none" "hipErrorNoDevice 0" "$(visible HIP_VISIBLE_DEVICES=)"
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)
