@@ -1684,7 +1684,7 @@ void dec_tld(Instr& ins, const Word& w) {
 }
 
 void dec_tld4(Instr& ins, const Word& w) {
-  ins.op = Op::TLD;   // gather: executed by the texture path's TLD4 rule
+  ins.op = Op::TLD4;
   ins.mnemonic = "TLD4";
   if (w.bit(60)) ins.mods.push_back("SCR");
   static const char* const comps[] = {"R", "G", "B", "A"};
@@ -1740,24 +1740,30 @@ void dec_sust(Instr& ins, const Word& w) {
 // ---- the rest ------------------------------------------------------------------
 
 void dec_vabsdiff4(Instr& ins, const Word& w) {
-  ins.op = Op::IDP;   // placeholder op; executed by its own rule
+  ins.op = Op::VABSDIFF4;
   ins.mnemonic = "VABSDIFF4";
-  ins.mods.push_back("U8");
+  if (!w.bit(73)) ins.mods.push_back("U8");
   if (w.bit(75)) ins.mods.push_back("ACC");
-  ins.f[0] = w.bit(75);
+  ins.f[0] = w.bit(75);   // ACC: the sum of the four differences plus c
+  ins.f[1] = w.bit(73);   // signed bytes
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   alu3(ins, w, kUnsigned);
 }
 
+// IDP.4A: four byte products; IDP.2A: two halfword-by-byte products, from
+// b's low (LO) or high (HI) two bytes. Bits 73/74: a/b signed.
 void dec_idp(Instr& ins, const Word& w) {
   ins.op = Op::IDP;
   ins.mnemonic = "IDP";
-  ins.mods.push_back(w.bit(74) ? "2A" : "4A");
-  ins.mods.push_back(w.bit(73) ? "S8" : "U8");
-  ins.mods.push_back(w.bit(75) ? "S8" : "U8");
-  ins.f[0] = w.bit(74);
-  ins.f[1] = w.bit(73);
-  ins.f[2] = w.bit(75);
+  const bool two = w.bit(76), sa = w.bit(73), sb = w.bit(74);
+  ins.mods.push_back(two ? "2A" : "4A");
+  if (two) ins.mods.push_back(w.bit(77) ? "HI" : "LO");
+  ins.mods.push_back(two ? (sa ? "S16" : "U16") : (sa ? "S8" : "U8"));
+  ins.mods.push_back(sb ? "S8" : "U8");
+  ins.f[0] = two;
+  ins.f[1] = sa;
+  ins.f[2] = sb;
+  ins.f[3] = w.bit(77);
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   alu3(ins, w, kUnsigned);
 }

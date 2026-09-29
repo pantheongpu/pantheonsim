@@ -191,10 +191,11 @@ int main(void) {
   /* Block size beyond the profile limit. */
   EXPECT(cuLaunchKernel(fn, 1, 1, 1, 2048, 1, 1, 0, NULL, params, NULL), CUDA_ERROR_INVALID_VALUE);
 
-  /* cubin images are rejected with a clear NOT_SUPPORTED, not garbage. */
+  /* An ELF image that is not a CUDA cubin is an invalid image, found from its
+     first eight bytes (nothing past them is read). */
   const char elf[8] = {0x7f, 'E', 'L', 'F', 2, 1, 1, 0};
   CUmodule bad_mod;
-  EXPECT(cuModuleLoadData(&bad_mod, elf), CUDA_ERROR_NOT_SUPPORTED);
+  EXPECT(cuModuleLoadData(&bad_mod, elf), CUDA_ERROR_INVALID_IMAGE);
 
   /* Free/double-free. */
   CHECK(cuMemFree(da));

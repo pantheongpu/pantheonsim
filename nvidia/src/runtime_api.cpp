@@ -45,6 +45,7 @@
 
 #include "error_names.hpp"
 #include "fatbin.hpp"
+#include "vgpu/sass/exec.hpp"
 #include "vgpu/exec/tensormap.hpp"
 // cudaDeviceProp is filled in by this shim and read by the application, so
 // both sides must agree on its layout. The original failure was a stale
@@ -1086,6 +1087,11 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       auto kc = calls.find(fn);
       if (kc == calls.end()) {
         State::KernelCalls found;
+        if (fn->sass)   // SASS: what its call graph reaches
+          for (const std::string& f : vgpu::sass::reachable(*fn->sass, fn->name)) {
+            if (f == "malloc" || f == "free") found.heap = true;
+            if (f == "vprintf") found.printf = true;
+          }
         for (const auto& ins : fn->body)
           if (const auto* c = std::get_if<vgpu::ptx::OpCall>(&ins.op)) {
             if (c->callee == "malloc" || c->callee == "free") found.heap = true;

@@ -88,6 +88,7 @@ struct Block {
     bool and_ = true, or_ = false;
   };
   Barrier bars[16];
+  exec::LaunchStats st;   // this block's counts, folded into the launch's
 };
 
 struct Fault : std::exception {
@@ -106,6 +107,13 @@ class Runner {
   Runner(const Module& m, const CubinKernel& k, const exec::LaunchConfig& cfg,
          const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem, const DeviceProfile& profile)
       : m_(m), k_(k), cfg_(cfg), mem_(mem), profile_(profile) {
+    // A cooperative launch's grid-barrier workspace, as the PTX interpreter
+    // makes it: 64 zeroed bytes, freed however the launch ends.
+    if (cfg.cooperative) {
+      coop_ws_ = mem.alloc(64);
+      const uint8_t zero = 0;
+      mem.fill(coop_ws_, &zero, 1, 64);
+    }
     build_bank0(args);
     for (const auto& [name, va] : m.bank_va) {
       // ".nv.constant<N>" for the module; ".nv.constant<N>.<kernel>" for ours.
@@ -123,6 +131,14 @@ class Runner {
   }
 
   exec::LaunchStats run();
+  ~Runner() {
+    if (coop_ws_) {
+      try {
+        mem_.free(coop_ws_);
+      } catch (const Error&) {
+      }
+    }
+  }
 
  private:
   // ---- setup ----
@@ -152,7 +168,8 @@ class Runner {
   void mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t addr, const void* in, uint32_t n);
   uint64_t generic_addr(Warp& w, const Instr& ins, unsigned lane, const Operand& addr_op, bool wide);
 
-  [[noreturn]] void fault(const Warp& w, const Instr& ins, unsigned lane, const std::string& why) const;
+  [[noreturn]] void fault(const Warp& w, const Instr& ins, unsigned lane, const std::string& why,
+                          Err code = Err::OutOfBounds) const;
 
   // ---- instruction groups (exec_ops.inc) ----
   void exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex);
@@ -161,6 +178,7 @@ class Runner {
   void exec_warp(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask group);
   bool exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask group);   // true: it set the pcs
   void exec_mma(Block& blk, Warp& w, const Instr& ins, Mask ex);
+  void exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex);   // textures and surfaces
   void builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name);
   uint32_t ival(Warp& w, const Operand& o, unsigned lane);   // with -/~ applied
 
@@ -172,6 +190,7 @@ class Runner {
   std::vector<uint8_t> bank0_;
   std::map<unsigned, uint64_t> bank_va_, bank_size_;
   uint64_t entry_ = 0;
+  uint64_t coop_ws_ = 0;
   uint32_t local_size_ = 0;
   uint64_t shared_size_ = 0;
   uint32_t block_threads_ = 0;
@@ -206,6 +225,12 @@ void Runner::build_bank0(const std::vector<std::vector<uint8_t>>& args) {
   const uint32_t stack = std::max<uint32_t>({k_.min_stack, k_.frame_size, 16});
   put32(0x28, (stack + 15) & ~15u);
   put64(0x118, 0);   // the descriptor's bits are a cache policy: nothing here reads them
+  // PTX's %envreg1/%envreg2 (0x8c, 0x90): a cooperative launch's grid
+  // barrier workspace, high word first. cg::this_grid().sync() traps when it
+  // is zero, which is what an ordinary launch of a grid-sync kernel gets.
+  const uint64_t ws = coop_ws_ ? coop_ws_ : cfg_.coop_workspace;
+  put32(0x8c, static_cast<uint32_t>(ws >> 32));
+  put32(0x90, static_cast<uint32_t>(ws));
   if (args.size() != k_.params.size())
     throw Error(Err::InvalidValue, "kernel " + k_.name + " takes " + std::to_string(k_.params.size()) +
                                        " parameters, the launch passed " + std::to_string(args.size()));
@@ -358,7 +383,6 @@ void Runner::mem_read(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, v
         throw Fault("shared read of " + std::to_string(n) + " bytes at 0x" + [&] { char b[24]; std::snprintf(b, sizeof b, "%llx", (unsigned long long)a); return std::string(b); }() +
                     ", past the block's " + std::to_string(blk.shared.size()) + " bytes");
       std::memcpy(out, &blk.shared[a], n);
-      if (std::getenv("VGPU_SASS_DBGMEM")) std::fprintf(stderr, "    shared read %u bytes at 0x%llx lane %u: %08x\n", n, (unsigned long long)a, lane, *static_cast<uint32_t*>(out));
       return;
     case Space::Local:
       if (a + n > w.local_size)
@@ -383,7 +407,6 @@ void Runner::mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, 
       if (a + n > blk.shared.size())
         throw Fault("shared write of " + std::to_string(n) + " bytes past the block's " + std::to_string(blk.shared.size()) + " bytes");
       std::memcpy(&blk.shared[a], in, n);
-      if (std::getenv("VGPU_SASS_DBGMEM")) std::fprintf(stderr, "    shared write %u bytes at 0x%llx lane %u: %08x\n", n, (unsigned long long)a, lane, *static_cast<const uint32_t*>(in));
       return;
     case Space::Local:
       if (a + n > w.local_size)
@@ -402,11 +425,12 @@ void Runner::mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, 
   }
 }
 
-[[noreturn]] void Runner::fault(const Warp& w, const Instr& ins, unsigned lane, const std::string& why) const {
+[[noreturn]] void Runner::fault(const Warp& w, const Instr& ins, unsigned lane, const std::string& why,
+                                Err code) const {
   char b[160];
   std::snprintf(b, sizeof b, "SASS kernel %s, warp %u lane %u, at 0x%llx (%s): ", k_.name.c_str(), w.index, lane,
                 static_cast<unsigned long long>(ins.pc), to_text(ins).c_str());
-  throw Error(Err::OutOfBounds, b + why);
+  throw Error(code, b + why);
 }
 
 // ---- the grid ------------------------------------------------------------------
@@ -416,7 +440,9 @@ void Runner::init_block(Block& blk, uint64_t linear) {
   blk.ctaid[1] = static_cast<uint32_t>((linear / cfg_.grid[0]) % cfg_.grid[1]);
   blk.ctaid[2] = static_cast<uint32_t>(linear / (static_cast<uint64_t>(cfg_.grid[0]) * cfg_.grid[1]));
   blk.shared.assign(shared_size_, 0);
+  blk.st = exec::LaunchStats{};
   const uint32_t nwarps = (block_threads_ + 31) / 32;
+  blk.st.warps = nwarps;
   blk.warps.resize(nwarps);
   const uint32_t nregs = std::max<uint32_t>(k_.regs + 8, 16);
   for (uint32_t i = 0; i < nwarps; ++i) {
@@ -455,6 +481,8 @@ exec::LaunchStats Runner::run() {
       try {
         init_block(blk, i);
         run_block(blk);
+        std::lock_guard<std::mutex> g(stats_mu_);
+        stats_.add(blk.st);
       } catch (...) {
         std::lock_guard<std::mutex> g(fail_mu);
         if (!failure) failure = std::current_exception();
@@ -491,6 +519,7 @@ exec::LaunchStats Runner::run() {
         }
       if (live && !progress) throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": every warp of the grid is waiting (deadlock)");
     }
+    for (Block& blk : all) stats_.add(blk.st);
   } else if (threads <= 1) {
     worker();
   } else {
