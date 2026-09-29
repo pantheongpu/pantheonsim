@@ -3602,6 +3602,17 @@ class Parser {
         else op.dst = expect_reg_operand("mbarrier destination");
         expect_punct(",");
       }
+      // mbarrier.pending_count.b64 count, state: the ISA's form reads an
+      // arrival's state token, not the barrier (an address is accepted too).
+      if (op.op == MbarOp::PendingCount && !peek_punct("[")) {
+        op.state = parse_operand();
+        op.have_state = true;
+        ins.op = op;
+        expect_punct(";");
+        ins.text = reconstruct_from(start_tok);
+        ins.opcode_id = intern_opcode(parts[0]);
+        return ins;
+      }
       op.addr = parse_addr(fn);
       if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
         return unsupported("mbarrier through a parameter/slot name");

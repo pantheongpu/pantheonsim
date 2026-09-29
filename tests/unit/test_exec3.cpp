@@ -3548,6 +3548,51 @@ VTEST(integer_forms_from_the_third_sweep) {
   }
 }
 
+// mbarrier.pending_count.b64 count, state reads the count an arrival's state
+// token carries: the arrivals still pending before that arrive instruction.
+// Measured on an RTX 3060: 64 on a fresh barrier of 64, and 54 for every lane
+// of the next arrive after ten threads arrived.
+VTEST(mbarrier_pending_count_reads_the_state_token) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<3>;
+    .shared .align 8 .b8 bar[8];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r5, bar;
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 mbarrier.init.shared.b64 [%r5], 64;
+    bar.sync 0;
+    mov.u32 %r2, 0;
+    setp.lt.u32 %p2, %r1, 10;
+    @%p2 mbarrier.arrive.shared.b64 %rd3, [%r5];
+    @%p2 mbarrier.pending_count.b64 %r2, %rd3;
+    bar.warp.sync -1;
+    mbarrier.arrive.shared.b64 %rd4, [%r5];
+    mbarrier.pending_count.b64 %r3, %rd4;
+    mul.wide.u32 %rd5, %r1, 8;
+    add.u64 %rd6, %rd2, %rd5;
+    st.global.u32 [%rd6], %r2;
+    st.global.u32 [%rd6+4], %r3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(32 * 8);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t t = 0; t < 32; ++t) {
+    VCHECK_EQ(e.mem.load_scalar(out + 8 * t, 4), uint64_t{t < 10 ? 64u : 0u});
+    VCHECK_EQ(e.mem.load_scalar(out + 8 * t + 4, 4), uint64_t{54});
+  }
+}
+
 VTEST(lop3_computes_the_truth_table_it_is_given) {
   // ptxas fuses bitwise chains into lop3, so optimized PTX is full of these
   // and a wrong truth table is a wrong mask rather than a crash. The immLut
