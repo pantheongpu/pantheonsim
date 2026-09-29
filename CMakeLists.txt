@@ -1840,6 +1840,13 @@ set_tests_properties(e2e_vgpu_run PROPERTIES
   DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
+# The per-thread default stream's names (cudaMemcpy_ptds, ...), which a
+# program built with nvcc --default-stream per-thread calls; COLMAP does.
+add_test(NAME e2e_per_thread_stream COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_per_thread_stream.sh)
+set_tests_properties(e2e_per_thread_stream PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 300)
 add_test(NAME e2e_runtime_conformance COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_runtime_conformance.sh)
 set_tests_properties(e2e_runtime_conformance PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"

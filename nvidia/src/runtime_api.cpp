@@ -6436,3 +6436,71 @@ VGPU_EXPORT cudaError_t cudaStreamIsCapturing(cudaStream_t stream,
                                      : cudaStreamCaptureStatusNone;
   return cudaSuccess;
 }
+
+/* ===================================================================== */
+/* Per-thread default stream                                             */
+/* ===================================================================== */
+
+// A program built with nvcc --default-stream per-thread (or with
+// CUDA_API_PER_THREAD_DEFAULT_STREAM defined) calls these names instead:
+// cudaMemcpy_ptds, cudaLaunchKernel_ptsz and the rest, where stream 0 is the
+// calling thread's own default stream rather than the legacy one. Every
+// stream here is synchronous, so the two defaults behave alike and each name
+// is the plain function under another symbol. COLMAP builds this way.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattribute-alias"
+#endif
+#define VGPU_PT_ALIAS(name, target) \
+  extern "C" __attribute__((visibility("default"))) void name() __attribute__((alias(#target)));
+VGPU_PT_ALIAS(cudaMemcpy_ptds, cudaMemcpy)
+VGPU_PT_ALIAS(cudaMemcpyToSymbol_ptds, cudaMemcpyToSymbol)
+VGPU_PT_ALIAS(cudaMemcpyFromSymbol_ptds, cudaMemcpyFromSymbol)
+VGPU_PT_ALIAS(cudaMemcpy2D_ptds, cudaMemcpy2D)
+VGPU_PT_ALIAS(cudaMemcpy2DToArray_ptds, cudaMemcpy2DToArray)
+VGPU_PT_ALIAS(cudaMemcpy2DFromArray_ptds, cudaMemcpy2DFromArray)
+VGPU_PT_ALIAS(cudaMemcpy3D_ptds, cudaMemcpy3D)
+VGPU_PT_ALIAS(cudaMemcpy3DPeer_ptds, cudaMemcpy3DPeer)
+VGPU_PT_ALIAS(cudaMemset_ptds, cudaMemset)
+VGPU_PT_ALIAS(cudaMemset2D_ptds, cudaMemset2D)
+VGPU_PT_ALIAS(cudaMemcpyPeer_ptds, cudaMemcpyPeer)
+VGPU_PT_ALIAS(cudaMemcpyAsync_ptsz, cudaMemcpyAsync)
+VGPU_PT_ALIAS(cudaMemcpyToSymbolAsync_ptsz, cudaMemcpyToSymbolAsync)
+VGPU_PT_ALIAS(cudaMemcpyFromSymbolAsync_ptsz, cudaMemcpyFromSymbolAsync)
+VGPU_PT_ALIAS(cudaMemcpy2DAsync_ptsz, cudaMemcpy2DAsync)
+VGPU_PT_ALIAS(cudaMemcpy3DAsync_ptsz, cudaMemcpy3DAsync)
+VGPU_PT_ALIAS(cudaMemcpy3DPeerAsync_ptsz, cudaMemcpy3DPeerAsync)
+VGPU_PT_ALIAS(cudaMemsetAsync_ptsz, cudaMemsetAsync)
+VGPU_PT_ALIAS(cudaMemset2DAsync_ptsz, cudaMemset2DAsync)
+VGPU_PT_ALIAS(cudaStreamQuery_ptsz, cudaStreamQuery)
+VGPU_PT_ALIAS(cudaStreamGetFlags_ptsz, cudaStreamGetFlags)
+VGPU_PT_ALIAS(cudaStreamGetId_ptsz, cudaStreamGetId)
+VGPU_PT_ALIAS(cudaStreamGetPriority_ptsz, cudaStreamGetPriority)
+VGPU_PT_ALIAS(cudaEventRecord_ptsz, cudaEventRecord)
+VGPU_PT_ALIAS(cudaEventRecordWithFlags_ptsz, cudaEventRecordWithFlags)
+VGPU_PT_ALIAS(cudaStreamWaitEvent_ptsz, cudaStreamWaitEvent)
+VGPU_PT_ALIAS(cudaStreamAddCallback_ptsz, cudaStreamAddCallback)
+VGPU_PT_ALIAS(cudaStreamSynchronize_ptsz, cudaStreamSynchronize)
+VGPU_PT_ALIAS(cudaLaunchKernel_ptsz, cudaLaunchKernel)
+VGPU_PT_ALIAS(cudaLaunchKernelExC_ptsz, cudaLaunchKernelExC)
+VGPU_PT_ALIAS(cudaLaunchHostFunc_ptsz, cudaLaunchHostFunc)
+VGPU_PT_ALIAS(cudaMemPrefetchAsync_ptsz, cudaMemPrefetchAsync)
+VGPU_PT_ALIAS(cudaGraphLaunch_ptsz, cudaGraphLaunch)
+VGPU_PT_ALIAS(cudaGraphUpload_ptsz, cudaGraphUpload)
+VGPU_PT_ALIAS(cudaStreamBeginCapture_ptsz, cudaStreamBeginCapture)
+VGPU_PT_ALIAS(cudaStreamEndCapture_ptsz, cudaStreamEndCapture)
+VGPU_PT_ALIAS(cudaStreamIsCapturing_ptsz, cudaStreamIsCapturing)
+VGPU_PT_ALIAS(cudaStreamGetCaptureInfo_v2_ptsz, cudaStreamGetCaptureInfo_v2)
+VGPU_PT_ALIAS(cudaMallocAsync_ptsz, cudaMallocAsync)
+VGPU_PT_ALIAS(cudaFreeAsync_ptsz, cudaFreeAsync)
+VGPU_PT_ALIAS(cudaMallocFromPoolAsync_ptsz, cudaMallocFromPoolAsync)
+VGPU_PT_ALIAS(cudaLaunchCooperativeKernel_ptsz, cudaLaunchCooperativeKernel)
+VGPU_PT_ALIAS(cudaMemcpyPeerAsync_ptsz, cudaMemcpyPeerAsync)
+VGPU_PT_ALIAS(cudaStreamCopyAttributes_ptsz, cudaStreamCopyAttributes)
+VGPU_PT_ALIAS(cudaStreamGetAttribute_ptsz, cudaStreamGetAttribute)
+VGPU_PT_ALIAS(cudaStreamSetAttribute_ptsz, cudaStreamSetAttribute)
+VGPU_PT_ALIAS(cudaStreamUpdateCaptureDependencies_ptsz, cudaStreamUpdateCaptureDependencies)
+#undef VGPU_PT_ALIAS
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
