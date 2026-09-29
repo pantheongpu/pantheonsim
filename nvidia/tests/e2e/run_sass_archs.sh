@@ -42,6 +42,16 @@ progs=(${VGPU_SASS_PROGRAMS:-sass_archs:75 vector_add:75 device_functions:75 dev
 cute=" wgmma_cute tma_gemm_cute tma_reduce_cute tensormap_replace_cute "
 
 supported="$("$nvcc_bin" --list-gpu-code 2>/dev/null)"
+# Hopper's own programs use PTX newer than CUDA 12.0's (tensormap.replace is
+# 8.3); they are built with 12.8 and later.
+release="$("$nvcc_bin" --version | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
+read -r rmaj rmin <<< "$release"
+if (( ${rmaj:-0} * 100 + ${rmin:-0} < 1208 )); then
+  echo "SKIP sm_90a: its programs need CUDA 12.8 or later (this nvcc is $rmaj.$rmin)"
+  kept=()
+  for a in "${archs[@]}"; do [[ $a == sm_90a ]] || kept+=("$a"); done
+  archs=("${kept[@]}")
+fi
 read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
 jobs=()
 for arch in "${archs[@]}"; do

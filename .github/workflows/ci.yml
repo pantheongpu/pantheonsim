@@ -105,6 +105,49 @@ jobs:
           VGPU_BUILD_DIR: ${{ github.workspace }}/pantheonsim/build
         run: ./tests/workloads/run_pantheon_workloads.sh
 
+  sass:
+    name: SASS on every architecture
+    # The build job's toolkit is Ubuntu's CUDA 12.0, which targets up to
+    # sm_90a; Blackwell's SASS (sm_100, sm_120) needs CUDA 12.8 or later. This
+    # job builds against CUDA 13 and runs the SASS tests: the decoder against
+    # nvdisasm's corpora, which code a binary runs, and programs built for
+    # each generation's SASS run on that generation's GPU and checked against
+    # their PTX (nvidia/tests/e2e/run_sass_archs.sh).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      NVCC_PREPEND_FLAGS: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA 13
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/keyring.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
+            cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
+            libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
+
+      - name: Build VirtualGPU
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+          ls build/shim/libcudart.so.*
+
+      - name: The SASS tests
+        run: |
+          set -o pipefail
+          ctest --test-dir build --verbose -R '^(test_sass_decode|e2e_sass_path|e2e_sass_archs)$' 2>&1 | tee sass.log
+          if grep -E '\*\*\*Skipped|SKIP' sass.log; then
+            echo "::error::a SASS test skipped; this job installs what they need"; exit 1
+          fi
+
   ollama:
     name: ollama on every GPU
     runs-on: ubuntu-24.04
