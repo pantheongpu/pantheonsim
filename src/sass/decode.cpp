@@ -2297,7 +2297,7 @@ void dec_brxu(Instr& ins, const Word& w) {
 }
 
 // LDGSTS [shared], [global]: an asynchronous copy of 4, 8 or 16 bytes from
-// global to shared memory. 16-23 the shared address and 44-63 its offset,
+// global to shared memory. 16-23 the shared address and 44-63 its (signed) offset,
 // 24-31 the global one (64-bit with .E) and 32-43 its offset. 81 clear is
 // .BYPASS (not kept in L1), 72 .LTC128B, 82 .ZFILL (the global address's
 // low bits count the bytes to zero-fill at the end); 87-90 a predicate,
@@ -2314,8 +2314,7 @@ void dec_ldgsts(Instr& ins, const Word& w) {
   if (w.bit(82)) ins.mods.push_back("ZFILL");
   ins.f[0] = size;
   ins.f[1] = w.bit(82);
-  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(16, 8)), false, "", -1,
-                             static_cast<int64_t>(w.field(44, 20)), ins.sm));
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(16, 8)), false, "", -1, w.sfield(44, 20), ins.sm));
   ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), true, "", -1, w.sfield(32, 12), ins.sm));
   add_desc(ins.src.back(), w, 64, ins.sm);
   const unsigned p = static_cast<unsigned>(w.field(87, 3));
