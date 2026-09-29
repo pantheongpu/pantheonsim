@@ -120,12 +120,12 @@ enum ImmStyle { kSigned, kUnsigned, kFloat };
 // significant digits (0.25, 1, 1.4426950216293334961), infinities and NaNs
 // by name.
 // A float or double as nvdisasm prints it: twenty significant digits, and
-// from 2^24 up in exponent form with twenty after the point.
+// from 2^31 up in exponent form with twenty after the point.
 std::string float_text(double d) {
   char b[48];
   if (d == __builtin_inf() || d == -__builtin_inf()) return d < 0 ? "-INF" : "+INF";
   if (d == 0 && std::signbit(d)) return "-0.0";
-  if (std::fabs(d) >= 16777216.0) std::snprintf(b, sizeof b, "%.20e", d);
+  if (std::fabs(d) >= 2147483648.0) std::snprintf(b, sizeof b, "%.20e", d);   // past int32's range
   else std::snprintf(b, sizeof b, "%.20g", d);
   return b;
 }
@@ -262,7 +262,8 @@ const char* const kBoolOp[] = {"AND", "OR", "XOR", "(bool 3)"};
 // ---- integer ALU -------------------------------------------------------------
 
 void dec_imad(Instr& ins, const Word& w, bool uniform) {
-  const unsigned low9 = static_cast<unsigned>(w.field(0, 9) & 0x7f);   // 0x24 IMAD, 0x25 WIDE, 0x27 HI
+  unsigned low9 = static_cast<unsigned>(w.field(0, 9) & 0x7f);   // 0x24 IMAD, 0x25 WIDE, 0x27 HI
+  if (low9 == 0x26) low9 = 0x27;   // sm_120's UIMAD.HI
   ins.op = uniform ? Op::UIMAD : Op::IMAD;
   ins.mnemonic = uniform ? "UIMAD" : "IMAD";
   const bool is_signed = w.bit(73);
@@ -325,8 +326,9 @@ void dec_iadd3(Instr& ins, const Word& w, bool uniform) {
   ins.dst.push_back(dst_reg(w, uniform, ins.sm));
   const unsigned p0 = static_cast<unsigned>(w.field(81, 3)), p1 = static_cast<unsigned>(w.field(84, 3));
   // The carry-outs, when not PT (with .X too: a chained wider add).
-  if (p0 != kPT || p1 != kPT) ins.dst.push_back(uniform ? UP(p0) : P(p0));
-  if (p1 != kPT) ins.dst.push_back(uniform ? UP(p1) : P(p1));
+  // From sm_100 nvdisasm prints both even when PT.
+  if (p0 != kPT || p1 != kPT || ins.sm >= 100) ins.dst.push_back(uniform ? UP(p0) : P(p0));
+  if (p1 != kPT || ins.sm >= 100) ins.dst.push_back(uniform ? UP(p1) : P(p1));
   alu3(ins, w, kSigned, uniform);
   for (Operand& o : ins.src) {
     int_neg(o, w);
@@ -392,13 +394,19 @@ void dec_isetp(Instr& ins, const Word& w, bool uniform) {
   const unsigned bop = static_cast<unsigned>(w.field(74, 2));
   const bool ex = w.bit(72);
   ins.mods.push_back(kIntCmp[cmp]);
-  if (!is_signed) ins.mods.push_back("U32");
+  const bool wide = ins.sm >= 120 && w.bit(80);   // sm_120: a 64-bit compare
+  if (wide) ins.mods.push_back(is_signed ? "S64" : "U64");
+  else if (!is_signed) ins.mods.push_back("U32");
   ins.mods.push_back(kBoolOp[bop]);
   if (ex) ins.mods.push_back("EX");
+  ins.f[4] = wide;
   const unsigned p0 = static_cast<unsigned>(w.field(81, 3)), p1 = static_cast<unsigned>(w.field(84, 3));
   ins.dst.push_back(uniform ? UP(p0) : P(p0));
   ins.dst.push_back(uniform ? UP(p1) : P(p1));
   alu2(ins, w, kSigned, uniform);
+  if (wide)
+    for (Operand& o : ins.src)
+      if (o.kind == Kind::Reg || o.kind == Kind::UReg) o.width = 2;
   ins.src.push_back(pred_src(w, 87, 90, uniform));
   if (ex) ins.src.push_back(pred_src(w, 68, 71, uniform));
   ins.f[0] = cmp;
@@ -453,14 +461,55 @@ void dec_prmt(Instr& ins, const Word& w, bool uniform) {
 void dec_sel(Instr& ins, const Word& w, bool uniform) {
   ins.op = uniform ? Op::USEL : Op::SEL;
   ins.mnemonic = uniform ? "USEL" : "SEL";
+  // sm_120: the forms naming the third slot select 64-bit values (vector
+  // 2, 3, 7; uniform 2, 6), with b an immediate (sign-extended), a
+  // register at 32 or a uniform one there.
+  const unsigned form = static_cast<unsigned>(w.field(9, 3));
+  const bool wide = ins.sm >= 120 && (uniform ? form == 2 || form == 6 : form == 2 || form == 3 || form == 7);
+  if (wide) ins.mods.push_back("64");
+  ins.f[0] = wide;
   ins.dst.push_back(dst_reg(w, uniform, ins.sm));
-  alu2(ins, w, kUnsigned, uniform);
+  if (wide) {
+    ins.src.push_back(alu_src(w, Slot::R24, ins.sm, kSigned, uniform));
+    const Slot b = form == 2 ? Slot::Imm32 : (form == 3 && !uniform) ? Slot::R32 : Slot::UR32;
+    ins.src.push_back(alu_src(w, b, ins.sm, kSigned, uniform));
+    mark_reuse(ins, w);
+  } else {
+    alu2(ins, w, kUnsigned, uniform);
+  }
+  if (wide)
+    for (Operand& o : ins.src) {
+      if (o.kind == Kind::Imm) o.fwidth = 64;   // sign-extended to 64 bits
+      else o.width = 2;
+    }
   ins.src.push_back(pred_src(w, 87, 90, uniform));
 }
 
 void dec_mov(Instr& ins, const Word& w, bool uniform) {
   ins.op = uniform ? Op::UMOV : Op::MOV;
   ins.mnemonic = uniform ? "UMOV" : "MOV";
+  if (!uniform && ins.sm >= 100 && w.bit(88)) ins.mods.push_back("SPILL");   // a uniform register spilled to a vector one
+  // sm_120: form 2 moves a 64-bit immediate, held at 24-87; 80 a register pair.
+  if (ins.sm >= 120 && (w.field(9, 3) == 2 || w.bit(80))) {
+    ins.mods.push_back("64");
+    ins.f[1] = 1;
+    Operand d = dst_reg(w, uniform, ins.sm);
+    d.width = 2;
+    ins.dst.push_back(d);
+    if (w.field(9, 3) == 2) {
+      const uint64_t v = w.field(24, 64);
+      Operand o = Imm(static_cast<int64_t>(v));
+      o.width = 2;
+      o.fwidth = 64;
+      ins.src.push_back(o);
+    } else {
+      const AluForm f = alu_form(static_cast<unsigned>(w.field(9, 3)));
+      ins.src.push_back(alu_src(w, f.s1 == Slot::R64 ? f.s2 : f.s1, ins.sm, kUnsigned, uniform));
+      ins.src.back().width = 2;
+      if (ins.src.back().kind == Kind::Reg) ins.src.back().reuse = reuse(w, 1);
+    }
+    return;
+  }
   ins.dst.push_back(dst_reg(w, uniform, ins.sm));
   const AluForm f = alu_form(static_cast<unsigned>(w.field(9, 3)));
   ins.src.push_back(alu_src(w, f.s1 == Slot::R64 ? f.s2 : f.s1, ins.sm, kUnsigned, uniform));
@@ -470,7 +519,33 @@ void dec_mov(Instr& ins, const Word& w, bool uniform) {
   ins.f[0] = lanes;
 }
 
+// sm_120's IMNMX (0x17) and UIMNMX (0x85): 64-bit, with two predicate
+// results (81, 84) and two predicate sources (87-90 choosing the min, and
+// 77-80).
+void dec_imnmx64(Instr& ins, const Word& w, bool uniform) {
+  ins.op = Op::IMNMX;
+  ins.mnemonic = uniform ? "UIMNMX" : "IMNMX";
+  ins.mods.push_back(w.bit(73) ? "S64" : "U64");
+  ins.f[0] = w.bit(73);
+  ins.f[1] = 1;   // 64-bit
+  const auto p = [&](unsigned n) { return uniform ? UP(n) : P(n); };
+  ins.dst.push_back(p(static_cast<unsigned>(w.field(81, 3))));
+  ins.dst.push_back(p(static_cast<unsigned>(w.field(84, 3))));
+  Operand d = dst_reg(w, uniform, ins.sm);
+  d.width = 2;
+  ins.dst.push_back(d);
+  alu2(ins, w, kSigned, uniform);
+  for (Operand& o : ins.src)
+    if (o.kind == Kind::Reg || o.kind == Kind::UReg) o.width = 2;
+  ins.src.push_back(pred_src(w, 87, 90, uniform));
+  ins.src.push_back(pred_src(w, 77, 80, uniform));
+}
+
 void dec_imnmx(Instr& ins, const Word& w, bool uniform) {
+  if (ins.sm >= 120) {
+    dec_imnmx64(ins, w, uniform);
+    return;
+  }
   ins.op = Op::IMNMX;
   ins.mnemonic = uniform ? "UIMNMX" : "IMNMX";
   if (!w.bit(73)) ins.mods.push_back("U32");
@@ -591,16 +666,22 @@ void dec_exit(Instr& ins, const Word& w) {
 void dec_bssy(Instr& ins, const Word& w) {
   ins.op = Op::BSSY;
   ins.mnemonic = "BSSY";
+  if (ins.sm >= 100 && w.bit(72)) ins.mods.push_back("RELIABLE");
+  if (ins.sm >= 100 && w.bit(73)) ins.mods.push_back("RECONVERGENT");
   Operand b;
   b.kind = Kind::Bar;
   b.reg = static_cast<unsigned>(w.field(16, 4));
   ins.dst.push_back(b);
-  ins.src.push_back(label(branch_target(w, ins.pc, 0)));
+  // The old layout, ending at 71 from sm_100 (73 is a flag there).
+  const int64_t off = ins.sm >= 100 ? w.sfield(34, 38) * 4 : w.sfield(34, 48) * 4;
+  ins.src.push_back(label(static_cast<uint64_t>(static_cast<int64_t>(ins.pc) + 16 + off)));
 }
 
 void dec_bsync(Instr& ins, const Word& w) {
   ins.op = Op::BSYNC;
   ins.mnemonic = "BSYNC";
+  if (ins.sm >= 100 && w.bit(72)) ins.mods.push_back("RELIABLE");
+  if (ins.sm >= 100 && w.bit(73)) ins.mods.push_back("RECONVERGENT");
   Operand b;
   b.kind = Kind::Bar;
   b.reg = static_cast<unsigned>(w.field(16, 4));
@@ -780,6 +861,9 @@ Operand sm75_gaddr(const Word& w, unsigned ur_pos, int64_t off, int sm) {
   return mem_addr(ra, false, suffix, ur, off, sm);
 }
 
+// An atomic's offset: 40-63, from sm_100 40-62 (63 is something else).
+int64_t atom_off(const Word& w, int sm) { return sm >= 100 ? w.sfield(40, 23) : w.sfield(40, 24); }
+
 // From sm_90 nvdisasm prints an .E access's memory descriptor, the uniform
 // register pair holding it (earlier architectures have it too, unprinted).
 void add_desc(Operand& a, const Word& w, unsigned pos, int sm) {
@@ -837,7 +921,7 @@ void dec_smem(Instr& ins, const Word& w, Op op, const char* name, bool store, bo
   static const char* const strides[] = {"", ".X4", ".X8", ".X16"};
   const unsigned stride = shared ? static_cast<unsigned>(w.field(78, 2)) : 0;
   const int ur = w.bit(91) ? static_cast<int>(w.field(store ? 64 : 32, ureg_bits(ins.sm))) : -1;
-  const Operand addr = mem_addr(ra, false, strides[stride], ur, w.sfield(40, 24), ins.sm);
+  const Operand addr = mem_addr(ra, false, strides[stride], ur, w.sfield(40, 24), ins.sm, ins.sm >= 100 && ur >= 0);
   ins.f[3] = stride;
   if (store) {
     ins.src.push_back(addr);
@@ -1387,7 +1471,8 @@ void dec_qmma(Instr& ins, const Word& w) {
   ins.f[0] = w.bit(77);
   ins.f[1] = w.bit(78);
   ins.f[2] = w.bit(79);
-  mma_regs(ins, w, ".ROW", ".COL");
+  if (ins.sm >= 120) mma_regs(ins, w);   // sm_120 prints no layouts
+  else mma_regs(ins, w, ".ROW", ".COL");
 }
 
 // BMMA: 1-bit matrices; 76 .AND (else .XOR), shape from 75 and 85-86.
@@ -1419,8 +1504,14 @@ void dec_dmma(Instr& ins, const Word& w) {
 void dec_movm(Instr& ins, const Word& w) {
   ins.op = Op::MOVM;
   ins.mnemonic = "MOVM";
-  ins.mods.push_back("16");
-  ins.mods.push_back("MT88");
+  if (w.bit(75) && w.bit(78)) {   // sm_100: 4-bit elements widened to 8
+    ins.mods.push_back("U4TO8");
+    ins.mods.push_back("M832");
+    ins.f[0] = 1;
+  } else {
+    ins.mods.push_back("16");
+    ins.mods.push_back("MT88");
+  }
   ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
   ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
 }
@@ -1478,7 +1569,7 @@ void dec_redux(Instr& ins, const Word& w) {
   ins.mnemonic = "REDUX";
   static const char* const ops[] = {"AND", "OR", "XOR", "SUM", "MIN", "MAX", "(6)", "(7)"};
   const unsigned op = static_cast<unsigned>(w.field(78, 3));
-  ins.mods.push_back(ops[op]);
+  if (op) ins.mods.push_back(ops[op]);   // nvdisasm leaves AND unnamed
   if (op >= 3 && w.bit(73)) ins.mods.push_back("S32");
   ins.f[0] = op;
   ins.f[1] = w.bit(73);
@@ -1535,6 +1626,13 @@ void dec_plop3_sign(Instr& ins, const Word& w) {
 void dec_viadd(Instr& ins, const Word& w) {
   ins.op = Op::VIADD;
   ins.mnemonic = "VIADD";
+  // sm_120: 74-75 the lanes (1 S32, 2 U8x4), 80 saturating (.ISAT).
+  const unsigned lanes = static_cast<unsigned>(w.field(74, 2));
+  if (lanes == 1) ins.mods.push_back("S32");
+  if (lanes == 2) ins.mods.push_back("U8x4");
+  if (w.bit(80)) ins.mods.push_back("ISAT");
+  ins.f[0] = lanes;
+  ins.f[1] = w.bit(80);
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   alu2(ins, w, kUnsigned);
   int_neg(ins.src[1], w);
@@ -1544,13 +1642,20 @@ void dec_vimnmx(Instr& ins, const Word& w, int nsrc, bool add) {
   ins.op = add ? Op::VIADDMNMX : nsrc == 3 ? Op::VIMNMX3 : Op::VIMNMX;
   ins.mnemonic = add ? "VIADDMNMX" : nsrc == 3 ? "VIMNMX3" : "VIMNMX";
   const bool s16x2 = !add && w.bit(73);   // per 16-bit half
+  const bool u8x4 = !add && w.bit(74);    // per byte (sm_120)
   if (s16x2) ins.mods.push_back(w.bit(72) ? "S16x2" : "U16x2");
+  else if (u8x4) ins.mods.push_back(w.bit(72) ? "S8x4" : "U8x4");
   else if (!w.bit(72)) ins.mods.push_back("U32");
+  else if (ins.sm >= 120 && !add && nsrc == 2 && !u8x4) ins.mods.push_back("S32");   // sm_120 names signed too
   if (w.bit(76)) ins.mods.push_back("RELU");   // a negative result becomes 0
   ins.f[0] = w.bit(72);
-  ins.f[1] = s16x2;
+  ins.f[1] = s16x2 ? 1 : u8x4 ? 2 : 0;   // lanes: 32-bit, 16x2, 8x4
   ins.f[2] = w.bit(76);
   ins.dst.push_back(dst_reg(w, false, ins.sm));
+  if (ins.sm >= 100 && ins.sm < 120 && !add && nsrc == 2) {   // sm_100 prints two predicate results (PT so far)
+    ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
+    ins.dst.push_back(P(static_cast<unsigned>(w.field(84, 3))));
+  }
   // VIMNMX prints a signed immediate as signed; the others print the bits.
   const ImmStyle imm = !add && nsrc == 2 ? kSigned : kUnsigned;
   if (nsrc == 3) alu3(ins, w, imm);
@@ -1833,6 +1938,8 @@ void dec_r2ur(Instr& ins, const Word& w) {
   ins.mnemonic = "R2UR";
   const unsigned pd = static_cast<unsigned>(w.field(81, 3));
   if (w.bit(84)) ins.mods.push_back("OR");
+  if (ins.sm >= 100 && w.bit(86)) ins.mods.push_back("FILL");   // refill a spilled uniform register
+  if (ins.sm >= 100 && w.bit(87)) ins.mods.push_back("BROADCAST");
   ins.f[0] = pd != kPT;
   if (pd != kPT) ins.dst.push_back(P(pd));
   ins.dst.push_back(UR(static_cast<unsigned>(w.field(16, ureg_bits(ins.sm))), ins.sm));
@@ -1870,9 +1977,9 @@ void dec_atom_g(Instr& ins, const Word& w, Op op, const char* name) {
   // The 0x3xx forms (bit 11 clear) have no uniform-register field and print
   // a bare register.
   const bool full = w.bit(11);
-  ins.src.push_back(ins.sm < 80 ? sm75_gaddr(w, 64, w.sfield(40, 24), ins.sm)
+  ins.src.push_back(ins.sm < 80 ? sm75_gaddr(w, 64, atom_off(w, ins.sm), ins.sm)
                                 : mem_addr(static_cast<unsigned>(w.field(24, 8)), full && (w.bit(90) || w.bit(72)), "", ur,
-                                           w.sfield(40, 24), ins.sm));
+                                           atom_off(w, ins.sm), ins.sm));
   if (full && w.bit(72)) add_desc(ins.src.back(), w, 64, ins.sm);
   ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8))));
 }
@@ -1885,7 +1992,7 @@ void dec_atom_f(Instr& ins, const Word& w, Op op, const char* name) {
   ins.mnemonic = name;
   const bool red = op == Op::RED;
   if (w.bit(72)) ins.mods.push_back("E");
-  const unsigned aop = static_cast<unsigned>(w.field(87, red ? 3 : 4));
+  const unsigned aop = static_cast<unsigned>(w.field(87, 3));   // 90 is something else from sm_100
   ins.mods.push_back(kAtomOp[aop]);
   unsigned t;
   const char* tname;
@@ -1906,7 +2013,7 @@ void dec_atom_f(Instr& ins, const Word& w, Op op, const char* name) {
     ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
     ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), width));
   }
-  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), w.bit(90) || w.bit(72), "", -1, w.sfield(40, 24), ins.sm));
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), w.bit(90) || w.bit(72), "", -1, atom_off(w, ins.sm), ins.sm));
   if (w.bit(72)) add_desc(ins.src.back(), w, 64, ins.sm);
   ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8)), width));
 }
@@ -1923,8 +2030,8 @@ void dec_red(Instr& ins, const Word& w) {
   evict_mods(ins, w);
   ins.f[0] = aop;
   const int ur = w.bit(91) && !w.bit(72) ? static_cast<int>(w.field(64, ureg_bits(ins.sm))) : -1;
-  ins.src.push_back(ins.sm < 80 ? sm75_gaddr(w, 64, w.sfield(40, 24), ins.sm)
-                                : mem_addr(static_cast<unsigned>(w.field(24, 8)), w.bit(90), "", ur, w.sfield(40, 24), ins.sm));
+  ins.src.push_back(ins.sm < 80 ? sm75_gaddr(w, 64, atom_off(w, ins.sm), ins.sm)
+                                : mem_addr(static_cast<unsigned>(w.field(24, 8)), w.bit(90), "", ur, atom_off(w, ins.sm), ins.sm));
   if (w.bit(72)) add_desc(ins.src.back(), w, 64, ins.sm);
   ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8))));
 }
@@ -2021,11 +2128,18 @@ void tex_common(Instr& ins, const Word& w, bool with_mask) {
 // nvdisasm as they appear).
 const char* const kLod[] = {"", "LZ", "LB", "LL", "LBA", "LLA", "(6)", "(7)"};
 
+// The LOD mode: 87-89, or from sm_100 split with its low bit at 59 (Mesa
+// NAK's set_tex_lod_mode2).
+unsigned tex_lod(const Instr& ins, const Word& w) {
+  if (ins.sm >= 100) return static_cast<unsigned>(w.field(59, 1) | (w.field(87, 2) << 1));
+  return static_cast<unsigned>(w.field(87, 3));
+}
+
 void dec_tex(Instr& ins, const Word& w) {
   ins.op = Op::TEX;
   ins.mnemonic = "TEX";
   if (w.bit(60)) ins.mods.push_back("SCR");
-  const unsigned lod = static_cast<unsigned>(w.field(87, 3));
+  const unsigned lod = tex_lod(ins, w);
   if (lod) ins.mods.push_back(kLod[lod]);
   ins.f[2] = lod;
   tex_common(ins, w, true);
@@ -2035,7 +2149,8 @@ void dec_tld(Instr& ins, const Word& w) {
   ins.op = Op::TLD;
   ins.mnemonic = "TLD";
   if (w.bit(60)) ins.mods.push_back("SCR");
-  const unsigned lod = static_cast<unsigned>(w.field(87, 3));
+  unsigned lod = tex_lod(ins, w);
+  if (ins.sm >= 100 && lod == 0) lod = 1;   // a fetch's LOD is explicit: 0 reads as .LZ
   static const char* const lods[] = {"", "LZ", "(2)", "LL", "(4)", "(5)", "(6)", "(7)"};
   if (lod) ins.mods.push_back(lods[lod]);
   ins.f[2] = lod;
@@ -2114,7 +2229,7 @@ void dec_atom_cas(Instr& ins, const Word& w, Op op, const char* name) {
   ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
   ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), width));
   const int ur = w.bit(91) && !w.bit(72) ? static_cast<int>(w.field(64, ureg_bits(ins.sm))) : -1;
-  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), w.bit(90), "", ur, w.sfield(40, 24), ins.sm));
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), w.bit(90), "", ur, atom_off(w, ins.sm), ins.sm));
   ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8)), width));
   ins.src.push_back(R(static_cast<unsigned>(w.field(64, 8)), width));
 }
@@ -2170,8 +2285,9 @@ void dec_ldgsts(Instr& ins, const Word& w) {
   ins.mnemonic = "LDGSTS";
   ins.mods.push_back("E");
   if (!w.bit(81)) ins.mods.push_back("BYPASS");
-  if (w.bit(72)) ins.mods.push_back("LTC128B");
-  const unsigned size = static_cast<unsigned>(w.field(73, 3));
+  // sm_100 moves these up a bit: .LTC128B to 73, the size to 74-76.
+  if (w.bit(ins.sm >= 100 ? 73 : 72)) ins.mods.push_back("LTC128B");
+  const unsigned size = static_cast<unsigned>(w.field(ins.sm >= 100 ? 74 : 73, 3));
   if (*kMemSize[size]) ins.mods.push_back(kMemSize[size]);
   if (w.bit(82)) ins.mods.push_back("ZFILL");
   ins.f[0] = size;
@@ -2433,7 +2549,7 @@ void dec_ldgmc(Instr& ins, const Word& w) {
   ins.mnemonic = "LDGMC";
   if (w.bit(72)) ins.mods.push_back("E");
   const unsigned t = static_cast<unsigned>(w.field(73, 4));
-  ins.mods.push_back(w.field(88, 2) == 3 ? "F32ADD" : "ADD");
+  ins.mods.push_back(w.field(88, 2) != 3 ? "ADD" : w.bit(81) ? "HPADD" : "F32ADD");
   static const std::map<unsigned, const char*> types = {
       {12, "F32.RN"}, {13, "F32x2.RN"}, {14, "F32x4.RN"}, {3, "BF16x2.RN"}, {4, "BF16x4.RN"}, {5, "BF16x8.RN"}};
   const auto ty = types.find(t);
@@ -2538,6 +2654,7 @@ void dec_tma(Instr& ins, const Word& w, Op op, const char* name) {
   if (op == Op::UTMAREDG) ins.mods.push_back("ADD");
   if (w.bit(82)) ins.mods.push_back("IM2COL");
   if (w.bit(75)) ins.mods.push_back("MULTICAST");
+  if (ins.sm >= 100 && w.bit(85)) ins.mods.push_back("2CTA");   // a CTA pair's shared memory
   ins.f[0] = dims;
   ins.f[1] = w.bit(82);
   ins.f[2] = w.bit(75);
@@ -2563,6 +2680,346 @@ void dec_ublkcp(Instr& ins, const Word& w) {
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(32, ub)), 0, ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, ub)), 0, ins.sm));
   ins.src.push_back(UR(static_cast<unsigned>(w.field(64, ub)), ins.sm));
+}
+
+// ---- Blackwell ------------------------------------------------------------------
+
+// sm_120's uniform float and conversion ops share their vector twins'
+// encodings (with their own opcodes): decode as the twin, then move every
+// register onto the uniform datapath -- the fields are the same width from
+// sm_100 (eight bits), and RZ/PT become URZ/UPT.
+void uniformize(Instr& ins, Op op, const char* name) {
+  const auto conv = [&](Operand& o) {
+    if (o.kind == Kind::Reg) {
+      o.kind = Kind::UReg;
+    } else if (o.kind == Kind::Pred) {
+      o.kind = Kind::UPred;
+    }
+  };
+  for (Operand& o : ins.dst) conv(o);
+  for (Operand& o : ins.src) conv(o);
+  ins.op = op;
+  ins.mnemonic = name;
+  ins.guard_uniform = true;
+}
+
+template <void (*Dec)(Instr&, const Word&)>
+void dec_uniform_float(Instr& ins, const Word& w, Op op, const char* name) {
+  Dec(ins, w);
+  uniformize(ins, op, name);
+}
+
+// IADD(.64) d, a, b (sm_120): 73 64-bit, 72 a negated, 63 b negated.
+void dec_iadd(Instr& ins, const Word& w) {
+  ins.op = Op::IADD;
+  ins.mnemonic = "IADD";
+  const bool wide = w.bit(73);
+  if (wide) ins.mods.push_back("64");
+  ins.f[0] = wide;
+  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), wide ? 2 : 1));
+  alu2(ins, w, kSigned);
+  ins.src[0].neg = w.bit(72);
+  if (wide && ins.src[1].kind == Kind::Imm) ins.src[1].fwidth = 64;
+  int_neg(ins.src[1], w);
+  if (wide)
+    for (Operand& o : ins.src)
+      if (o.kind == Kind::Reg) o.width = 2;
+}
+
+// FMNMX3 d, a, b, c, p (sm_100): the min (p) or max of three.
+void dec_fmnmx3(Instr& ins, const Word& w) {
+  ins.op = Op::FMNMX3;
+  ins.mnemonic = "FMNMX3";
+  if (w.bit(80)) ins.mods.push_back("FTZ");
+  if (w.bit(81)) ins.mods.push_back("NAN");
+  ins.f[0] = w.bit(80);
+  ins.f[1] = w.bit(81);
+  ins.dst.push_back(dst_reg(w, false, ins.sm));
+  alu3(ins, w, kFloat);
+  float_srcs(ins, w);
+  ins.src.push_back(pred_src(w, 87, 90));
+}
+
+// LDCU(.size) URd, c[bank][URa + offset]: a uniform constant load; the
+// offset at 37-53 (in bytes), the bank at 54-58.
+void dec_ldcu(Instr& ins, const Word& w) {
+  ins.op = Op::ULDC;
+  ins.mnemonic = "LDCU";
+  static const char* const sizes[] = {"U8", "S8", "U16", "S16", "", "64", "128", "(7)"};
+  const unsigned size = static_cast<unsigned>(w.field(73, 3));
+  if (size != 4) ins.mods.push_back(sizes[size]);
+  ins.f[0] = size;
+  ins.dst.push_back(UR(static_cast<unsigned>(w.field(16, 8)), ins.sm));
+  const unsigned ur = static_cast<unsigned>(w.field(24, 8));
+  const unsigned bank = static_cast<unsigned>(w.field(54, 5)), off = static_cast<unsigned>(w.field(37, 17));
+  std::string t = "c[" + hex(bank) + "][";
+  if (ur != urz(ins.sm)) t += "UR" + std::to_string(ur) + (off ? "+" + hex(off) : "");
+  else t += off ? hex(off) : "URZ";
+  Operand c = Txt(t + "]");
+  c.reg = ur;
+  c.imm = off;
+  ins.src.push_back(c);
+  ins.f[1] = 2;   // LDCU's own addressing: f[2] bank, the register may be URZ
+  ins.f[2] = bank;
+}
+
+// CREDUX.MIN/MAX(.S32) URd, Ra (sm_100): a warp reduction to a uniform
+// register. 78-80 the op (0 MAX, 2 MIN), 73 signed.
+void dec_credux(Instr& ins, const Word& w) {
+  ins.op = Op::REDUX;
+  ins.mnemonic = "CREDUX";
+  const unsigned op = static_cast<unsigned>(w.field(78, 3));
+  ins.mods.push_back(op == 2 ? "MIN" : op == 0 ? "MAX" : "(op" + std::to_string(op) + ")");
+  if (w.bit(73)) ins.mods.push_back("S32");
+  ins.f[0] = op == 2 ? 4 : op == 0 ? 5 : 0xff;   // REDUX's numbering: 4 MIN, 5 MAX
+  ins.f[1] = w.bit(73);
+  ins.dst.push_back(UR(static_cast<unsigned>(w.field(16, 8)), ins.sm));
+  ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
+}
+
+// RPCMOV.32 Rpc.LO, Ra / Ra, Rpc.LO (sm_100): the return address register.
+void dec_rpcmov(Instr& ins, const Word& w, bool to_reg) {
+  ins.op = Op::RPCMOV;
+  ins.mnemonic = "RPCMOV";
+  ins.mods.push_back("32");
+  ins.f[0] = to_reg;
+  if (to_reg) {
+    ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
+    ins.src.push_back(Txt("Rpc.LO"));
+  } else {
+    ins.dst.push_back(Txt("Rpc.LO"));
+    ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8))));
+  }
+}
+
+// UP2UR URd, UPR, URa, mask: the uniform predicates into a register.
+void dec_up2ur(Instr& ins, const Word& w) {
+  ins.op = Op::UP2UR;
+  ins.mnemonic = "UP2UR";
+  ins.dst.push_back(UR(static_cast<unsigned>(w.field(16, 8)), ins.sm));
+  ins.src.push_back(Txt("UPR"));
+  ins.src.push_back(UR(static_cast<unsigned>(w.field(24, 8)), ins.sm));
+  ins.src.push_back(Imm(w.field(32, 8)));
+}
+
+// CS2UR URd, SR: a special register into a uniform register (pair, 80).
+void dec_cs2ur(Instr& ins, const Word& w) {
+  ins.op = Op::S2UR;
+  ins.mnemonic = "CS2UR";
+  if (!w.bit(80)) ins.mods.push_back("32");
+  ins.f[3] = w.bit(80);
+  ins.dst.push_back(UR(static_cast<unsigned>(w.field(16, 8)), ins.sm));
+  Operand sr;
+  sr.kind = Kind::SReg;
+  sr.reg = static_cast<unsigned>(w.field(72, 8));
+  sr.text = sreg_name(sr.reg);
+  ins.src.push_back(sr);
+}
+
+// LDG/STG.E.ENL2.256: 32 bytes in two register quads (sm_100): the first
+// quad at 64, the second at 16 (a load's destinations, a store's data with
+// the first at 32); the offset at 40-55.
+void dec_gmem256(Instr& ins, const Word& w, bool store) {
+  ins.op = store ? Op::STG : Op::LDG;
+  ins.mnemonic = store ? "STG" : "LDG";
+  ins.mods.push_back("E");
+  ins.mods.push_back("ENL2");
+  ins.mods.push_back("256");
+  mem_order_mods(ins, w);
+  evict_mods(ins, w);
+  ins.f[0] = 8;   // 32 bytes
+  const unsigned q0 = static_cast<unsigned>(w.field(store ? 32 : 64, 8)), q1 = static_cast<unsigned>(w.field(16, 8));
+  Operand a = mem_addr(static_cast<unsigned>(w.field(24, 8)), true, "", -1, w.sfield(40, 16) * 32, ins.sm);   // in 32-byte units
+  add_desc(a, w, store ? 64 : 32, ins.sm);
+  if (store) {
+    ins.src.push_back(a);
+    ins.src.push_back(R(q0, 4));
+    ins.src.push_back(R(q1, 4));
+  } else {
+    ins.dst.push_back(R(q0, 4));
+    ins.dst.push_back(R(q1, 4));
+    ins.src.push_back(a);
+  }
+  // 57-63: a load's hint, printed when not the default 0x7f.
+  if (!store && w.field(57, 7) != 0x7f) ins.src.push_back(Imm(w.field(57, 7)));
+}
+
+// CCTL.E.C.LDCU.IV.DEEP [URa]: invalidate the uniform constant cache for an
+// address (sm_100). Nothing to do with no cache modelled.
+void dec_cctl_ldcu(Instr& ins, const Word& w) {
+  ins.op = Op::CCTL;
+  ins.mnemonic = "CCTL";
+  ins.mods = {"E", "C", "LDCU", "IV", "DEEP"};
+  ins.f[0] = 0xff;
+  ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, 8)), 0, ins.sm));
+}
+
+// ATOMS.CAST.SPIN Pd, [addr], Rb, Rc (sm_100's 0x58d): the result is the
+// predicate at 81 instead of a register.
+void dec_atoms_cast_p(Instr& ins, const Word& w) {
+  dec_atoms(ins, w, true);
+  ins.dst[0] = P(static_cast<unsigned>(w.field(81, 3)));
+  ins.f[6] = 1;   // predicate result
+}
+
+// BRA with a uniform predicate condition (sm_100's 0x547): UPn at 24-26,
+// its not at 27.
+void dec_bra_up(Instr& ins, const Word& w) {
+  dec_bra(ins, w);
+  Operand up = UP(static_cast<unsigned>(w.field(24, 3)), w.bit(27));
+  ins.src.insert(ins.src.end() - 1, up);
+  ins.f[2] = 1;   // the condition is src[size-2]
+}
+
+// UVIMNMX (sm_120): VIMNMX on uniform registers, printing .S32 for signed.
+void dec_uvimnmx(Instr& ins, const Word& w) {
+  dec_vimnmx(ins, w, 2, false);
+  // No predicate results on the uniform form.
+  ins.dst.resize(1);
+  uniformize(ins, Op::VIMNMX, "UVIMNMX");
+}
+
+// ---- Blackwell's tensor cores (tcgen05) ------------------------------------------
+//
+// Tensor memory is addressed as tmem[URa + offset]. 85 is .2CTA throughout
+// (the pair of CTAs sharing an MMA).
+std::string tmem_text(unsigned ur, int64_t off, int sm) {
+  std::string t = "tmem[" + (ur == urz(sm) ? std::string("URZ") : "UR" + std::to_string(ur));
+  if (off) t += "+" + signed_hex(off);
+  return t + "]";
+}
+
+// LDTM.shape.xN Rd, tmem[URa + offset] (tcgen05.ld): 81-82 the shape
+// (1 16dp256bit, 2 32dp32bit -- unnamed), 83-85 log2 N, the address at 32
+// and 40-63.
+void dec_ldtm(Instr& ins, const Word& w) {
+  ins.op = Op::LDTM;
+  ins.mnemonic = "LDTM";
+  static const char* const shapes[] = {"16dp64bit", "16dp256bit", "", "16dp128bit"};
+  const unsigned shape = static_cast<unsigned>(w.field(81, 2)), n = static_cast<unsigned>(w.field(83, 3));
+  if (*shapes[shape]) ins.mods.push_back(shapes[shape]);
+  ins.mods.push_back("x" + std::to_string(1u << n));
+  ins.f[0] = shape;
+  ins.f[1] = 1u << n;
+  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
+  const unsigned ur = static_cast<unsigned>(w.field(32, 8));
+  const int64_t off = static_cast<int64_t>(w.field(40, 24));
+  Operand t = Txt(tmem_text(ur, off, ins.sm));
+  t.reg = ur;
+  t.imm = off;
+  ins.src.push_back(t);
+}
+
+// UTCHMMA / UTCQMMA / UTCOMMA (tcgen05.mma): A's and B's descriptors in
+// the uniform registers at 24 and 32, D in tensor memory at 64, the pair at
+// 40 (a tensor-memory operand, then the instruction descriptor), a scale
+// operand in tensor memory at 48 (URZ: none), 87-90 the enable-input-D
+// predicate. The kind: 72-79 = 3 QMMA, 62-63 set OMMA (63 alone: .4X,
+// sm_103's .BLOCK16), else HMMA.
+void dec_utcmma(Instr& ins, const Word& w) {
+  const bool q = w.field(72, 8) == 3, o = w.bit(63);
+  ins.op = Op::UTCMMA;
+  ins.mnemonic = q ? "UTCQMMA" : o ? "UTCOMMA" : "UTCHMMA";
+  if (w.bit(85)) ins.mods.push_back("2CTA");
+  if (o && !w.bit(62)) ins.mods.push_back(ins.sm == 103 ? "BLOCK16" : "4X");
+  ins.f[0] = q ? 1 : o ? 2 : 0;
+  ins.f[1] = w.bit(85);
+  const auto gdesc = [&](unsigned pos) {
+    Operand d = Txt("gdesc[UR" + std::to_string(w.field(pos, 8)) + "]");
+    d.reg = static_cast<unsigned>(w.field(pos, 8));
+    return d;
+  };
+  ins.src.push_back(gdesc(24));
+  ins.src.push_back(gdesc(32));
+  const unsigned d = static_cast<unsigned>(w.field(64, 8)), p = static_cast<unsigned>(w.field(40, 8));
+  ins.src.push_back(Txt(tmem_text(d, 0, ins.sm)));
+  ins.src.back().reg = d;
+  ins.src.push_back(Txt(tmem_text(p, 0, ins.sm)));
+  ins.src.back().reg = p;
+  ins.src.push_back(Txt("idesc[UR" + std::to_string(p + 1) + "]"));
+  ins.src.back().reg = p + 1;
+  const unsigned sc = static_cast<unsigned>(w.field(48, 8));
+  if (sc != urz(ins.sm)) {
+    ins.src.push_back(Txt(tmem_text(sc, 0, ins.sm)));
+    ins.src.back().reg = sc;
+  }
+  ins.src.push_back(pred_src(w, 87, 90, true));
+}
+
+// UTCBAR[.2CTA][.MULTICAST] [URa], URb[, URc] (tcgen05.commit): arrive on
+// an mbarrier when the MMAs so far complete; 75 multicast (the CTA mask at
+// 64).
+void dec_utcbar(Instr& ins, const Word& w) {
+  ins.op = Op::UTCBAR;
+  ins.mnemonic = "UTCBAR";
+  if (w.bit(85)) ins.mods.push_back("2CTA");
+  if (w.bit(75)) ins.mods.push_back("MULTICAST");
+  ins.f[0] = w.bit(75);
+  ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, 8)), 0, ins.sm));
+  ins.src.push_back(UR(static_cast<unsigned>(w.field(32, 8)), ins.sm));
+  if (w.bit(75)) ins.src.push_back(UR(static_cast<unsigned>(w.field(64, 8)), ins.sm));
+}
+
+// UTCCP.T.S[.2CTA].shape tmem[URa + offset], gdesc[URb] (tcgen05.cp):
+// shared memory into tensor memory; 84: 4x32dp128bit.
+void dec_utccp(Instr& ins, const Word& w) {
+  ins.op = Op::UTCCP;
+  ins.mnemonic = "UTCCP";
+  ins.mods = {"T", "S"};
+  if (w.bit(85)) ins.mods.push_back("2CTA");
+  ins.mods.push_back(w.bit(84) ? "4x32dp128bit" : "(shape)");
+  const unsigned ur = static_cast<unsigned>(w.field(24, 8));
+  const int64_t off = static_cast<int64_t>(w.field(40, 16));
+  ins.src.push_back(Txt(tmem_text(ur, off, ins.sm)));
+  ins.src.back().reg = ur;
+  ins.src.back().imm = off;
+  ins.src.push_back(Txt("gdesc[UR" + std::to_string(w.field(32, 8)) + "]"));
+  ins.src.back().reg = static_cast<unsigned>(w.field(32, 8));
+}
+
+// UTCATOMSWS (tcgen05.alloc's allocator): 0x5e3 .FIND_AND_SET.ALIGN UPd,
+// URd, URb (a column allocation); 0x9e3 .AND URd, URb (a release).
+void dec_utcatomsws(Instr& ins, const Word& w, bool find) {
+  ins.op = Op::UTCATOMSWS;
+  ins.mnemonic = "UTCATOMSWS";
+  if (w.bit(85)) ins.mods.push_back("2CTA");
+  if (find) {
+    ins.mods.push_back("FIND_AND_SET");
+    ins.mods.push_back("ALIGN");
+    ins.dst.push_back(UP(static_cast<unsigned>(w.field(81, 3))));
+  } else {
+    ins.mods.push_back("AND");
+  }
+  ins.f[0] = find;
+  ins.dst.push_back(UR(static_cast<unsigned>(w.field(16, 8)), ins.sm));
+  ins.src.push_back(UR(static_cast<unsigned>(w.field(32, 8)), ins.sm));
+}
+
+// STAS [Ra.64], Rb (st.async: a store to another CTA's shared memory that
+// completes on its mbarrier).
+void dec_stas(Instr& ins, const Word& w) {
+  ins.op = Op::STAS;
+  ins.mnemonic = "STAS";
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), true, "", -1, w.sfield(40, 24), ins.sm));
+  ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8))));
+}
+
+// UVIRTCOUNT.DEALLOC.SMPOOL n and UGETNEXTWORKID.BROADCAST [URa], [URa+1]
+// (cluster launch control's try_cancel).
+void dec_uvirtcount(Instr& ins, const Word& w) {
+  ins.op = Op::NOP;
+  ins.mnemonic = "UVIRTCOUNT";
+  ins.mods = {"DEALLOC", "SMPOOL"};
+  ins.src.push_back(Imm(w.field(32, 8)));
+}
+
+void dec_ugetnextworkid(Instr& ins, const Word& w) {
+  ins.op = Op::UGETNEXTWORKID;
+  ins.mnemonic = "UGETNEXTWORKID";
+  if (w.bit(72)) ins.mods.push_back("BROADCAST");
+  const int ur = static_cast<int>(w.field(24, 8));
+  ins.src.push_back(mem_addr(kRZ, false, "", ur, 0, ins.sm));
+  ins.src.push_back(mem_addr(kRZ, false, "", ur + 1, 0, ins.sm));
 }
 
 void dec_vabsdiff4(Instr& ins, const Word& w) {
@@ -2650,6 +3107,7 @@ void dec_errbar(Instr& ins, const Word&) {
 void dec_break(Instr& ins, const Word& w) {
   ins.op = Op::BREAK;
   ins.mnemonic = "BREAK";
+  if (ins.sm >= 100 && w.bit(72)) ins.mods.push_back("RELIABLE");
   const unsigned cond = static_cast<unsigned>(w.field(87, 3));
   if (cond != kPT || w.bit(90)) ins.src.push_back(pred_src(w, 87, 90));
   Operand b;
@@ -2678,7 +3136,7 @@ const std::unordered_map<unsigned, AluDec>& alu_table() {
   static const std::unordered_map<unsigned, AluDec> t = {
       {0x02, dec_mov},   {0x07, dec_sel},   {0x0c, dec_isetp}, {0x10, dec_iadd3}, {0x11, dec_lea},
       {0x12, dec_lop3},  {0x16, dec_prmt},  {0x17, dec_imnmx}, {0x19, dec_shf},   {0x24, dec_imad},
-      {0x25, dec_imad},  {0x27, dec_imad},  {0x1a, dec_sgxt},  {0x1b, dec_ubmsk},
+      {0x25, dec_imad},  {0x26, dec_imad},  {0x27, dec_imad},  {0x1a, dec_sgxt},  {0x1b, dec_ubmsk},
   };
   return t;
 }
@@ -2699,7 +3157,11 @@ const std::unordered_map<unsigned, Dec>& float_table() {
       {0x101, [](Instr& i, const Word& w) { dec_brev(i, w, false); }},
       {0x30, dec_hadd2},
       {0x31, dec_hfma2},
-      {0x35, [](Instr& i, const Word& w) {   // HFMA2 on the tensor pipe
+      {0x35, [](Instr& i, const Word& w) {   // HFMA2 on the tensor pipe; from sm_100 IADD
+         if (i.sm >= 100) {
+           dec_iadd(i, w);
+           return;
+         }
          dec_hfma2(i, w);
          i.mods.insert(i.mods.begin(), "MMA");
        }},
@@ -2724,6 +3186,28 @@ const std::unordered_map<unsigned, Dec>& float_table() {
       {0x26, dec_idp},
       {0x1b, dec_bmsk},
       {0x39, dec_i2ip},
+      // sm_120's uniform float path (their vector twins' encodings).
+      {0x55, [](Instr& i, const Word& w) { dec_uniform_float<dec_ffma>(i, w, Op::FFMA, "UFFMA"); }},
+      {0x54, [](Instr& i, const Word& w) {
+         dec_uniform_float<dec_fadd>(i, w, Op::FADD, "UFADD");
+         if (w.field(9, 3) == 1) {   // UFADD's register b is in the third slot
+           Operand b = UR(static_cast<unsigned>(w.field(64, 8)), i.sm);
+           b.slot = static_cast<uint8_t>(Slot::R64);
+           src_neg_abs(b, w, true);
+           b.reuse = i.src[1].reuse;
+           i.src[1] = b;
+         }
+       }},
+      {0x56, [](Instr& i, const Word& w) { dec_uniform_float<dec_fmul>(i, w, Op::FMUL, "UFMUL"); }},
+      {0x53, [](Instr& i, const Word& w) { dec_uniform_float<dec_fsetp>(i, w, Op::FSETP, "UFSETP"); }},
+      {0x51, [](Instr& i, const Word& w) { dec_uniform_float<dec_fsel>(i, w, Op::FSEL, "UFSEL"); }},
+      {0x5a, [](Instr& i, const Word& w) { dec_uniform_float<dec_i2f>(i, w, Op::I2F, "UI2F"); }},
+      {0x5b, [](Instr& i, const Word& w) { dec_uniform_float<dec_f2f>(i, w, Op::F2F, "UF2F"); }},
+      {0x5c, [](Instr& i, const Word& w) { dec_uniform_float<dec_f2i>(i, w, Op::F2I, "UF2I"); }},
+      {0x5d, [](Instr& i, const Word& w) { dec_uniform_float<dec_frnd>(i, w, Op::FRND, "UFRND"); }},
+      {0x5e, [](Instr& i, const Word& w) { dec_uniform_float<dec_i2fp>(i, w, Op::I2FP, "UI2FP"); }},
+      {0x4a, dec_uvimnmx},
+      {0x76, dec_fmnmx3},
       {0x36, dec_viadd},
       {0x48, [](Instr& i, const Word& w) { dec_vimnmx(i, w, 2, false); }},
       {0x46, [](Instr& i, const Word& w) { dec_vimnmx(i, w, 3, true); }},
@@ -2809,6 +3293,16 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
          dec_plain(i, Op::UCGABAR, "UCGABAR_WAIT");
          i.f[0] = 1;
        }},
+      {0x7ac, dec_ldcu}, {0x2cc, dec_credux}, {0x883, dec_up2ur}, {0x8cb, dec_cs2ur},
+      {0x352, [](Instr& i, const Word& w) { dec_rpcmov(i, w, false); }},
+      {0x353, [](Instr& i, const Word& w) { dec_rpcmov(i, w, true); }},
+      {0x97e, [](Instr& i, const Word& w) { dec_gmem256(i, w, false); }},
+      {0x97f, [](Instr& i, const Word& w) { dec_gmem256(i, w, true); }},
+      {0x540, dec_cctl_ldcu}, {0x35d, dec_nanosleep}, {0x58d, dec_atoms_cast_p}, {0x547, dec_bra_up},
+      {0x9ee, dec_ldtm}, {0x5ea, dec_utcmma}, {0xdea, dec_utcmma}, {0x3e9, dec_utcbar}, {0x9e7, dec_utccp},
+      {0x5e3, [](Instr& i, const Word& w) { dec_utcatomsws(i, w, true); }},
+      {0x9e3, [](Instr& i, const Word& w) { dec_utcatomsws(i, w, false); }},
+      {0xdbd, dec_stas}, {0x84c, dec_uvirtcount}, {0x3ca, dec_ugetnextworkid},
       {0x356, dec_bmov}, {0x355, dec_bmov_r}, {0x958, dec_brxu}, {0xfae, dec_ldgsts}, {0x83b, dec_ldsm}, {0x9af, dec_ldgdepbar},
       {0xabb, dec_uldc_idx},
       {0x23c, dec_hmma}, {0x27a, dec_qmma}, {0x237, dec_imma}, {0x23d, dec_bmma}, {0x23f, dec_dmma}, {0x23a, dec_movm},
@@ -2839,7 +3333,8 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
     it->second(ins, w);
     // The uniform datapath's own ops take a UP guard.
     if (opc == 0x9c3 || opc == 0xab9 || opc == 0xabb || opc == 0x89c || opc == 0x5b2 || opc == 0x5b4 || opc == 0x3b4 ||
-        opc == 0x3b5 || opc == 0x3b6 || opc == 0x3ba)
+        opc == 0x3b5 || opc == 0x3b6 || opc == 0x3ba || opc == 0x7ac || opc == 0x883 || opc == 0x8cb ||
+        opc == 0x9b9)
       ins.guard_uniform = true;
     return ins;
   }
@@ -2856,6 +3351,22 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
   // ALU ops keep bit 8 clear; the form in bits 9-11 is never zero for them.
   if (w.field(9, 3) != 0 && (low9 & 0x100) == 0) {
     const bool uniform = (low9 & 0x80) != 0;
+    // sm_120 gives the uniform datapath 64-bit ops of its own: UIADD3.64
+    // (0x97, the vector IMNMX's number) and UIMNMX.S64/U64 (0x85).
+    if (sm >= 120 && uniform && ((low9 & 0x7f) == 0x17 || (low9 & 0x7f) == 0x05)) {
+      if ((low9 & 0x7f) == 0x17) {
+        dec_iadd3(ins, w, true);
+        ins.mods.insert(ins.mods.begin(), "64");
+        ins.f[1] = 1;   // 64-bit
+        for (Operand& o : ins.src)
+          if (o.kind == Kind::UReg) o.width = 2;
+        ins.dst[0].width = 2;
+      } else {
+        dec_imnmx64(ins, w, true);
+      }
+      ins.guard_uniform = true;
+      return ins;
+    }
     if (const auto it = alu_table().find(low9 & 0x7f); it != alu_table().end()) {
       it->second(ins, w, uniform);
       ins.guard_uniform = uniform;   // the uniform datapath's guards are UP<n>
@@ -2905,7 +3416,15 @@ std::string operand_text(const Operand& o, int sm) {
     case Kind::Pred:
     case Kind::UPred:
       return (o.neg ? "!" : "") + reg_text(o, sm) + o.suffix;
-    case Kind::Imm: s = imm_text(o.imm); break;
+    case Kind::Imm:
+      if (o.width == 2) {   // a 64-bit immediate prints as its bits
+        char b[24];
+        std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(o.imm));
+        s = b;
+      } else {
+        s = imm_text(o.imm);
+      }
+      break;
     case Kind::FImm: s = o.text; break;
     case Kind::CBank:
       // With a swizzle after it nvdisasm puts a space inside: c[0x0] [0x390].H0_H0
