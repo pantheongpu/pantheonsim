@@ -4,8 +4,22 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+
+#include "vgpu/exec/tensormap.hpp"
+#include "vgpu/ptx/ast.hpp"
 
 namespace vgpu::exec {
+
+// One element of a reduction (red, atom, cp.reduce.async.bulk): `old`
+// combined with `b` by `op`, both of type `ty`. Floating-point add rounds to
+// nearest even and keeps subnormals; min and max return the other operand
+// when one is NaN.
+uint64_t reduce_value(ptx::AtomOp op, const ptx::Type& ty, uint64_t old, uint64_t b);
+
+// The element type a tensor map gives cp.reduce.async.bulk.tensor, and
+// whether `op` is defined for it (9.7.10.28.5.4); nothing if not.
+std::optional<ptx::Type> tensor_reduce_type(TmapType t, ptx::AtomOp op);
 
 // FP8: e4m3 (no infinity, max 448) or e5m2 (IEEE-shaped, max 57344).
 double fp8_value(uint32_t byte, bool e5m2);

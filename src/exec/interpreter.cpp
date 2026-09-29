@@ -45,6 +45,7 @@
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
+#include "vgpu/exec/tma.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/faults.hpp"
 #include "vgpu/host_cpus.hpp"
@@ -592,6 +593,28 @@ std::atomic<int> g_directed_rounding{0};
 // the input's payload -- the all-ones pattern below the sign, 0x7FFF for both
 // f16 and bf16 (and 0x7FFFFFFF for f32, which PTX calls canonical).
 inline constexpr uint64_t kCanonicalNaN16 = 0x7FFF;
+
+// bfloat16 is the top 16 bits of an f32: same exponent, mantissa truncated to
+// 7 bits. Converting in rounds to nearest even on the discarded half, which is
+// what cvt.rn asks for; converting out is exact.
+double bf16_to_double(uint64_t in) {
+  const uint32_t bits = static_cast<uint32_t>(in & 0xffffu) << 16;
+  return static_cast<double>(std::bit_cast<float>(bits));
+}
+uint64_t double_to_bf16(double x) {
+  const float f = static_cast<float>(x);
+  if (std::isnan(f)) return kCanonicalNaN16;
+  // A directed mode, or a double that is not already a float (rounding it to
+  // float first could round twice), takes the general form.
+  if (g_directed_rounding.load(std::memory_order_relaxed) != 0 || static_cast<double>(f) != x)
+    return double_to_narrow(x, 7, 8);
+  const uint32_t bits = std::bit_cast<uint32_t>(f);
+  // Round to nearest, ties to even, on the 16 bits being dropped.
+  const uint32_t lsb = (bits >> 16) & 1u;
+  const uint32_t rounded = bits + 0x7fffu + lsb;
+  return rounded >> 16;
+}
+
 
 inline uint64_t double_to_f16(double d) {
   // A normal binary16 result under round-to-nearest-even, done on the bits:
@@ -8199,27 +8222,6 @@ class Interpreter {
     }
   }
 
-  // bfloat16 is the top 16 bits of an f32: same exponent, mantissa truncated to
-  // 7 bits. Converting in rounds to nearest even on the discarded half, which is
-  // what cvt.rn asks for; converting out is exact.
-  static double bf16_to_double(uint64_t in) {
-    const uint32_t bits = static_cast<uint32_t>(in & 0xffffu) << 16;
-    return static_cast<double>(std::bit_cast<float>(bits));
-  }
-  static uint64_t double_to_bf16(double x) {
-    const float f = static_cast<float>(x);
-    if (std::isnan(f)) return kCanonicalNaN16;
-    // A directed mode, or a double that is not already a float (rounding it to
-    // float first could round twice), takes the general form.
-    if (g_directed_rounding.load(std::memory_order_relaxed) != 0 || static_cast<double>(f) != x)
-      return double_to_narrow(x, 7, 8);
-    const uint32_t bits = std::bit_cast<uint32_t>(f);
-    // Round to nearest, ties to even, on the 16 bits being dropped.
-    const uint32_t lsb = (bits >> 16) & 1u;
-    const uint32_t rounded = bits + 0x7fffu + lsb;
-    return rounded >> 16;
-  }
-
   uint64_t convert(const OpCvt* op, uint64_t in) {
     const Type& s = op->src_ty;
     const Type& d = op->dst_ty;
@@ -9040,49 +9042,9 @@ class Interpreter {
   // and keeps subnormals (the .noftz the ISA requires or defaults to); min
   // and max return the other operand when one is NaN, as min and max do.
   static uint64_t reduce_value(AtomOp op, const Type& ty, uint64_t old, uint64_t b) {
-    const uint64_t mask = ty.bits == 64 ? ~0ull : (1ull << ty.bits) - 1;
-    old &= mask;
-    b &= mask;
-    if (ty.is_real()) {
-      double x, y;
-      if (ty.bits == 16) {
-        x = ty.is_bfloat() ? bf16_to_double(old) : f16_to_double(old);
-        y = ty.is_bfloat() ? bf16_to_double(b) : f16_to_double(b);
-      } else if (ty.bits == 32) {
-        x = std::bit_cast<float>(static_cast<uint32_t>(old));
-        y = std::bit_cast<float>(static_cast<uint32_t>(b));
-      } else {
-        x = std::bit_cast<double>(old);
-        y = std::bit_cast<double>(b);
-      }
-      if (op == AtomOp::Min || op == AtomOp::Max) {
-        if (std::isnan(x)) return b;
-        if (std::isnan(y)) return old;
-        // -0 below +0, so the answer does not depend on operand order.
-        const bool y_less = y < x || (y == x && std::signbit(y) && !std::signbit(x));
-        return (op == AtomOp::Min) == y_less ? b : old;
-      }
-      // Add, in double and then rounded to the element type. A double has
-      // more than twice the precision of a float, a half or a bfloat16, so
-      // rounding twice gives the correctly rounded sum (Figueroa, 1995).
-      if (ty.bits == 16) return ty.is_bfloat() ? double_to_bf16(x + y) : double_to_f16(x + y);
-      if (ty.bits == 32) return std::bit_cast<uint32_t>(static_cast<float>(x + y));
-      return std::bit_cast<uint64_t>(x + y);
-    }
-    const bool s = ty.is_signed();
-    auto sx = [&](uint64_t v) { return ty.bits == 64 ? static_cast<int64_t>(v) : int64_t{static_cast<int32_t>(v)}; };
-    switch (op) {
-      case AtomOp::Add: return (old + b) & mask;
-      case AtomOp::Min: return s ? (sx(b) < sx(old) ? b : old) : std::min(old, b);
-      case AtomOp::Max: return s ? (sx(b) > sx(old) ? b : old) : std::max(old, b);
-      case AtomOp::And: return old & b;
-      case AtomOp::Or: return old | b;
-      case AtomOp::Xor: return old ^ b;
-      case AtomOp::Inc: return old >= b ? 0 : old + 1;
-      case AtomOp::Dec: return (old == 0 || old > b) ? b : old - 1;
-      default: return b;
-    }
+    return exec::reduce_value(op, ty, old, b);
   }
+
 
   // cp.reduce.async.bulk into global memory: element by element, each an
   // atomic read-modify-write, as the ISA makes them (and as they must be
@@ -9109,31 +9071,9 @@ class Interpreter {
   // The element type a tensor map gives cp.reduce.async.bulk.tensor, and
   // whether the operation has a form for it (the ISA's table in 9.7.10.28.5.4).
   static std::optional<Type> tensor_reduce_type(exec::TmapType t, AtomOp op) {
-    using K = Type::Kind;
-    using exec::TmapType;
-    Type ty;
-    switch (t) {
-      case TmapType::U32: ty = {K::U, 32}; break;
-      case TmapType::S32: ty = {K::S, 32}; break;
-      case TmapType::U64: ty = {K::U, 64}; break;
-      case TmapType::S64: ty = {K::S, 64}; break;
-      case TmapType::F16: ty = {K::F, 16}; break;
-      case TmapType::BF16: ty = {K::BF, 16}; break;
-      case TmapType::F32: ty = {K::F, 32}; break;
-      default: return std::nullopt;
-    }
-    bool ok = false;
-    switch (op) {
-      case AtomOp::Add: ok = !(ty.kind == K::S && ty.bits == 64); break;
-      case AtomOp::Min:
-      case AtomOp::Max: ok = !(ty.kind == K::F && ty.bits == 32); break;
-      case AtomOp::Inc:
-      case AtomOp::Dec: ok = ty.kind == K::U && ty.bits == 32; break;
-      default: ok = !ty.is_real(); break;
-    }
-    if (!ok) return std::nullopt;
-    return ty;
+    return exec::tensor_reduce_type(t, op);
   }
+
 
   void exec_bulk_copy(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpBulkCopy& op, Mask m) {
     // Copies, not references: a 32-bit address register is widened into a
@@ -9239,46 +9179,14 @@ class Interpreter {
         }
       } else {
         exec::TensorMap map = read_tensor_map(w, ctx, ins, lane, tmap_v[lane]);
-        if (map.rank != op.dims)
-          ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
-                   "a ." + std::to_string(op.dims) + "d tensor copy through a rank-" +
-                       std::to_string(map.rank) + " tensor map");
-        // The packed sub-byte types (5.5.1.1) are copied sixteen values at a
-        // time: `gs` bytes of global memory to an `es`-byte slot of shared
-        // memory, so dimension 0 is counted in groups here. A load leaves a
-        // slot's padding as it was ("un-initialized"); a store of type 15 is
-        // .b6p2x16, sixteen bytes each holding a value in bits 0-5, packed
-        // into twelve.
-        uint32_t gs = 0, packed_es = 0;
-        const bool packed = exec::TensorMap::packed_group(map.type, &gs, &packed_es);
-        if (packed) {
-          const bool padded = packed_es == 16;
-          if (map.im2col)
-            ctx_fail(ins, li, Err::UnsupportedPtx, "an im2col copy of a packed sub-byte type is not implemented");
-          if (op.reduce)
-            ctx_fail(ins, li, Err::InvalidValue,
-                     "cp.reduce.async.bulk does not support the packed sub-byte types (9.7.10.28.5.1)");
-          if (!op.to_shared && map.type == exec::TmapType::U4x16Align16)
-            ctx_fail(ins, li, Err::InvalidValue,
-                     "a tensor store (.global.shared::cta) does not support .b4x16_p64 (9.7.10.28.5.1)");
-          if (op.to_shared && map.swizzle == exec::TmapSwizzle::B128Atom64 && padded)
-            ctx_fail(ins, li, Err::InvalidValue,
-                     "the 128-byte swizzle in 64-byte atoms is for stores only with a padded sub-byte type");
-          const int64_t c0 = static_cast<int32_t>(static_cast<uint32_t>(coords[0][lane]));
-          if (padded ? c0 % 128 : c0 % 16)
-            ctx_fail(ins, li, padded ? Err::InvalidValue : Err::UnsupportedPtx,
-                     padded ? "the first coordinate of a .b4x16_p64 or .b6x16_p32 copy must be a multiple "
-                              "of 128 (9.7.10.28.5.1)"
-                            : "a .b4x16 copy whose first coordinate is not a multiple of 16 is not implemented");
-          if (map.dim[0] % 16 || map.box[0] % 16)
-            ctx_fail(ins, li, Err::UnsupportedPtx,
-                     "a packed sub-byte tensor whose dimension 0 or box is not whole groups of 16 values");
-          map.dim[0] /= 16;
-          map.box[0] /= 16;
-          map.stride[0] = gs;
-        }
-        const uint32_t es = packed ? packed_es : static_cast<uint32_t>(map.stride[0]);
-        if (!packed) gs = es;
+        int64_t cs[5] = {};
+        for (size_t d = 0; d < coords.size() && d < 5; ++d)
+          cs[d] = static_cast<int32_t>(static_cast<uint32_t>(coords[d][lane]));
+        exec::TmaBox box;
+        if (auto bad = exec::tma_box(map, op.dims, cs, op.four_rows, op.im2col, op.to_shared, op.reduce, &box))
+          ctx_fail(ins, li, bad->code, bad->what);
+        const bool packed = box.packed;
+        const uint32_t es = box.es, gs = box.gs;
         const uint32_t swz = exec::TensorMap::swizzle_bytes(map.swizzle);
         std::optional<Type> red_ty;
         if (op.reduce) {
@@ -9288,49 +9196,11 @@ class Interpreter {
                      "cp.reduce.async.bulk.tensor has no form of this operation for the tensor "
                      "map's element type (9.7.10.28.5.4)");
         }
-        if (map.im2col != op.im2col)
-          ctx_fail(ins, li, Err::InvalidValue,
-                   map.im2col ? "a tile-mode tensor copy through a map made by cuTensorMapEncodeIm2col"
-                              : "an im2col tensor copy through a map made by cuTensorMapEncodeTiled");
-        // Elements the copy takes, in the order they sit in shared memory, and
-        // where element e is in the tensor. Tile mode: the box, dimension 0
-        // fastest, each dimension's count the box over its traversal stride
-        // rounded up. im2col mode (5.5.4): `pixels` pixels, each `channels`
-        // channels wide, the pixels walked through the bounding box -- W
-        // fastest, each spatial dimension stepping by its traversal stride
-        // from lower to dim + upper - 1 and then starting over from lower
-        // with the next dimension advanced, the batch last -- beginning at the
-        // instruction's coordinates. A load reads each pixel at that position
-        // plus its im2col offsets; outside the tensor it reads zero.
-        std::array<uint64_t, 5> count{1, 1, 1, 1, 1};
-        uint64_t total = 1;
-        if (op.four_rows) {
-          // .tile::gather4/.tile::scatter4 (5.5.3.4): four boxes one row
-          // high, packed one after another -- as a 4-row box would be.
-          if (map.rank != 2 || map.box[1] != 1)
-            ctx_fail(ins, li, Err::InvalidValue,
-                     ".tile::gather4/.tile::scatter4 need a 2D tensor map whose box is one row high");
-          count[0] = (map.box[0] + map.elem_stride[0] - 1) / map.elem_stride[0];
-          total = 4 * count[0];
-        } else if (map.im2col) {
-          total = uint64_t{map.pixels} * map.channels;
-        } else {
-          for (uint32_t d = 0; d < map.rank; ++d) {
-            count[d] = (map.box[d] + map.elem_stride[d] - 1) / map.elem_stride[d];
-            total *= count[d];
-          }
-        }
-        std::array<int64_t, 5> start{};
-        for (uint32_t d = 0; d < map.rank; ++d)
-          start[d] = static_cast<int32_t>(static_cast<uint32_t>(coords[d][lane]));
-        if (packed) start[0] /= 16;
-        const uint32_t nsp = map.rank >= 2 ? map.rank - 2 : 0;   // im2col's spatial dimensions
         std::array<int64_t, 3> off{};
         for (uint32_t i = 0; i < op.im2col_offsets.size() && i < 3; ++i)
           off[i] = static_cast<uint16_t>(im2col_off[i][lane]);
-        std::array<int64_t, 5> pix = start;   // im2col: the pixel being read, in [1, rank-1]
+        const uint64_t total = box.total;
         if (op.to_shared) pb.data.resize(total * gs);
-        std::array<uint64_t, 5> j{};
         // A tile-mode load takes a box row at a time when it can: dimension 0
         // is contiguous in global memory, so the row's in-tensor part is one
         // bulk read rather than an allocation lookup per element. load_run
@@ -9341,18 +9211,10 @@ class Interpreter {
         const bool row_path = fast_enabled_ && !packed && !op.four_rows && !map.im2col && map.elem_stride[0] == 1 &&
                               (op.to_shared || !op.reduce);
         std::vector<uint8_t> row_buf;
-        for (uint64_t e = 0; e < total; ++e) {
-          if (row_path && !op.to_shared && j[0] == 0) {
-            bool rows_inside = true;
-            uint64_t row_addr = map.address;
-            for (uint32_t d = 1; d < map.rank; ++d) {
-              const int64_t g = start[d] + static_cast<int64_t>(j[d] * map.elem_stride[d]);
-              if (g < 0 || static_cast<uint64_t>(g) >= map.dim[d]) rows_inside = false;
-              else row_addr += static_cast<uint64_t>(g) * map.stride[d];
-            }
-            const int64_t n0 = static_cast<int64_t>(count[0]), dim0 = static_cast<int64_t>(map.dim[0]);
-            const int64_t lo = rows_inside ? std::clamp<int64_t>(-start[0], 0, n0) : n0;
-            const int64_t hi = rows_inside ? std::clamp<int64_t>(dim0 - start[0], lo, n0) : n0;
+        const int64_t n0 = static_cast<int64_t>(box.count[0]);
+        const auto row = [&](uint64_t e, uint64_t row_addr, int64_t lo, int64_t hi) -> bool {
+          if (!row_path) return false;
+          if (!op.to_shared) {
             bool ok = true;
             row_buf.resize(static_cast<size_t>(hi - lo) * es);
             for (int64_t k = lo; k < hi && ok; ++k) {
@@ -9361,62 +9223,21 @@ class Interpreter {
               if (soff + es > shared_size) ok = false;
               else std::memcpy(row_buf.data() + (k - lo) * es, ctx.shared->data() + soff, es);
             }
-            if (ok && mem_.store_run(row_addr + static_cast<uint64_t>(start[0] + lo) * es, row_buf.data(),
-                                     row_buf.size(), es)) {
-              e += count[0] - 1;
-              for (uint32_t d = 1; d < map.rank; ++d) {
-                if (++j[d] < count[d]) break;
-                j[d] = 0;
-              }
-              continue;
-            }
+            return ok && mem_.store_run(row_addr + static_cast<uint64_t>(box.start[0] + lo) * es, row_buf.data(),
+                                        row_buf.size(), es);
           }
-          if (row_path && op.to_shared && j[0] == 0) {
-            bool rows_inside = true;
-            uint64_t row_addr = map.address;
-            for (uint32_t d = 1; d < map.rank; ++d) {
-              const int64_t g = start[d] + static_cast<int64_t>(j[d] * map.elem_stride[d]);
-              if (g < 0 || static_cast<uint64_t>(g) >= map.dim[d]) rows_inside = false;
-              else row_addr += static_cast<uint64_t>(g) * map.stride[d];
-            }
-            const int64_t n0 = static_cast<int64_t>(count[0]), dim0 = static_cast<int64_t>(map.dim[0]);
-            const int64_t lo = rows_inside ? std::clamp<int64_t>(-start[0], 0, n0) : n0;
-            const int64_t hi = rows_inside ? std::clamp<int64_t>(dim0 - start[0], lo, n0) : n0;
-            uint8_t* row = pb.data.data() + e * es;
-            if ((!map.oob_nan || (lo == 0 && hi == n0)) &&
-                mem_.load_run(row_addr + static_cast<uint64_t>(start[0] + lo) * es, row + lo * es,
-                              static_cast<uint64_t>(hi - lo) * es, es)) {
-              std::memset(row, 0, static_cast<size_t>(lo) * es);
-              std::memset(row + hi * es, 0, static_cast<size_t>(n0 - hi) * es);
-              for (uint64_t k = 0; k < count[0]; ++k)
-                add_run(exec::swizzle_address(smem + (e + k) * es, swz, exec::TensorMap::swizzle_atom(map.swizzle)), es);
-              e += count[0] - 1;
-              j[0] = 0;
-              for (uint32_t d = 1; d < map.rank; ++d) {
-                if (++j[d] < count[d]) break;
-                j[d] = 0;
-              }
-              continue;
-            }
-          }
-          bool inside = true;
-          uint64_t gaddr = map.address;
-          auto at = [&](uint32_t d, int64_t g) {
-            if (g < 0 || static_cast<uint64_t>(g) >= map.dim[d]) inside = false;
-            else gaddr += static_cast<uint64_t>(g) * map.stride[d];
-          };
-          if (op.four_rows) {
-            at(0, start[0] + static_cast<int64_t>((e % count[0]) * map.elem_stride[0]));
-            at(1, static_cast<int32_t>(static_cast<uint32_t>(coords[1 + e / count[0]][lane])));
-          } else if (map.im2col) {
-            const uint64_t ch = e % map.channels;
-            at(0, start[0] + static_cast<int64_t>(ch));
-            for (uint32_t i = 0; i < nsp; ++i) at(1 + i, pix[1 + i] + off[i]);
-            at(map.rank - 1, pix[map.rank - 1]);
-          } else {
-            for (uint32_t d = 0; d < map.rank; ++d)
-              at(d, start[d] + static_cast<int64_t>(j[d] * map.elem_stride[d]));
-          }
+          uint8_t* rowp = pb.data.data() + e * es;
+          if ((map.oob_nan && !(lo == 0 && hi == n0)) ||
+              !mem_.load_run(row_addr + static_cast<uint64_t>(box.start[0] + lo) * es, rowp + lo * es,
+                             static_cast<uint64_t>(hi - lo) * es, es))
+            return false;
+          std::memset(rowp, 0, static_cast<size_t>(lo) * es);
+          std::memset(rowp + hi * es, 0, static_cast<size_t>(n0 - hi) * es);
+          for (uint64_t k = 0; k < box.count[0]; ++k)
+            add_run(exec::swizzle_address(smem + (e + k) * es, swz, exec::TensorMap::swizzle_atom(map.swizzle)), es);
+          return true;
+        };
+        exec::tma_walk(map, box, cs + 1, off, op.four_rows, [&](uint64_t e, uint64_t gaddr, bool inside) {
           // Shared position: the box packed densely, then swizzled by
           // address the same way wgmma reads it back.
           const uint64_t soff = exec::swizzle_address(smem + e * es, swz, exec::TensorMap::swizzle_atom(map.swizzle));
@@ -9481,24 +9302,7 @@ class Interpreter {
               }
             }
           }
-          if (map.im2col) {
-            // The next pixel, after the last channel of this one.
-            if ((e + 1) % map.channels == 0) {
-              uint32_t i = 0;
-              for (; i < nsp; ++i) {
-                pix[1 + i] += map.elem_stride[1 + i];
-                if (pix[1 + i] <= static_cast<int64_t>(map.dim[1 + i]) - 1 + map.upper[i]) break;
-                pix[1 + i] = map.lower[i];
-              }
-              if (i == nsp) ++pix[map.rank - 1];
-            }
-          } else {
-            for (uint32_t d = 0; d < map.rank; ++d) {
-              if (++j[d] < count[d]) break;
-              j[d] = 0;
-            }
-          }
-        }
+        }, row);
         // The barrier counts every byte of the box, the zero-filled ones too
         // -- for the packed types, the packed bytes, not the padded slots
         // (a 128 x 128 .b6x16_p32 tile completes 12288, as CUTLASS's
@@ -10678,6 +10482,78 @@ ParamBuffer build_params(const EntryFn& fn, const std::vector<std::vector<uint8_
 }
 
 }  // namespace
+
+// Shared with the SASS executor (numerics.hpp).
+uint64_t reduce_value(AtomOp op, const Type& ty, uint64_t old, uint64_t b) {
+  const uint64_t mask = ty.bits == 64 ? ~0ull : (1ull << ty.bits) - 1;
+  old &= mask;
+  b &= mask;
+  if (ty.is_real()) {
+    double x, y;
+    if (ty.bits == 16) {
+      x = ty.is_bfloat() ? bf16_to_double(old) : f16_to_double(old);
+      y = ty.is_bfloat() ? bf16_to_double(b) : f16_to_double(b);
+    } else if (ty.bits == 32) {
+      x = std::bit_cast<float>(static_cast<uint32_t>(old));
+      y = std::bit_cast<float>(static_cast<uint32_t>(b));
+    } else {
+      x = std::bit_cast<double>(old);
+      y = std::bit_cast<double>(b);
+    }
+    if (op == AtomOp::Min || op == AtomOp::Max) {
+      if (std::isnan(x)) return b;
+      if (std::isnan(y)) return old;
+      // -0 below +0, so the answer does not depend on operand order.
+      const bool y_less = y < x || (y == x && std::signbit(y) && !std::signbit(x));
+      return (op == AtomOp::Min) == y_less ? b : old;
+    }
+    // Add, in double and then rounded to the element type. A double has
+    // more than twice the precision of a float, a half or a bfloat16, so
+    // rounding twice gives the correctly rounded sum (Figueroa, 1995).
+    if (ty.bits == 16) return ty.is_bfloat() ? double_to_bf16(x + y) : double_to_f16(x + y);
+    if (ty.bits == 32) return std::bit_cast<uint32_t>(static_cast<float>(x + y));
+    return std::bit_cast<uint64_t>(x + y);
+  }
+  const bool s = ty.is_signed();
+  auto sx = [&](uint64_t v) { return ty.bits == 64 ? static_cast<int64_t>(v) : int64_t{static_cast<int32_t>(v)}; };
+  switch (op) {
+    case AtomOp::Add: return (old + b) & mask;
+    case AtomOp::Min: return s ? (sx(b) < sx(old) ? b : old) : std::min(old, b);
+    case AtomOp::Max: return s ? (sx(b) > sx(old) ? b : old) : std::max(old, b);
+    case AtomOp::And: return old & b;
+    case AtomOp::Or: return old | b;
+    case AtomOp::Xor: return old ^ b;
+    case AtomOp::Inc: return old >= b ? 0 : old + 1;
+    case AtomOp::Dec: return (old == 0 || old > b) ? b : old - 1;
+    default: return b;
+  }
+}
+std::optional<Type> tensor_reduce_type(exec::TmapType t, AtomOp op) {
+  using K = Type::Kind;
+  using exec::TmapType;
+  Type ty;
+  switch (t) {
+    case TmapType::U32: ty = {K::U, 32}; break;
+    case TmapType::S32: ty = {K::S, 32}; break;
+    case TmapType::U64: ty = {K::U, 64}; break;
+    case TmapType::S64: ty = {K::S, 64}; break;
+    case TmapType::F16: ty = {K::F, 16}; break;
+    case TmapType::BF16: ty = {K::BF, 16}; break;
+    case TmapType::F32: ty = {K::F, 32}; break;
+    default: return std::nullopt;
+  }
+  bool ok = false;
+  switch (op) {
+    case AtomOp::Add: ok = !(ty.kind == K::S && ty.bits == 64); break;
+    case AtomOp::Min:
+    case AtomOp::Max: ok = !(ty.kind == K::F && ty.bits == 32); break;
+    case AtomOp::Inc:
+    case AtomOp::Dec: ok = ty.kind == K::U && ty.bits == 32; break;
+    default: ok = !ty.is_real(); break;
+  }
+  if (!ok) return std::nullopt;
+  return ty;
+}
 
 KernelResources kernel_resources(const EntryFn& fn, const DeviceProfile& profile,
                                  uint32_t block_threads, uint32_t dynamic_shared) {

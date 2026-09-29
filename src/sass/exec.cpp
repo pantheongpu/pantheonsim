@@ -29,6 +29,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/numerics.hpp"
+#include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #if __has_include("vgpu/host_cpus.hpp")
 #include "vgpu/host_cpus.hpp"
@@ -214,6 +215,8 @@ class Runner {
   uint32_t mbar_offset(Block& blk, Warp& w, const Instr& ins, unsigned lane, bool ur_only);
   uint64_t mbar_arrive(Block& blk, uint32_t off, uint32_t arrivals, int64_t tx, bool drop);
   uint64_t mbar_arrive80(Block& blk, uint32_t off);
+  void exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex);   // TMA and bulk copies
+  Block& shared_block(Block& blk, uint32_t addr, uint32_t* off);
   void builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name);
   uint32_t ival(Warp& w, const Operand& o, unsigned lane);   // with -/~ applied
 
