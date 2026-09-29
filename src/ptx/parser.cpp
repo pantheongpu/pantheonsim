@@ -4081,10 +4081,16 @@ class Parser {
         OpPredBin op;
         op.op = *pop;
         op.dst = expect_reg_operand("predicate destination");
+        auto pred_source = [&](Reg& r, int8_t& imm) {
+          const Operand o = parse_operand();
+          if (const auto* reg = std::get_if<RegOperand>(&o)) r = reg->reg;
+          else if (const auto* i = std::get_if<ImmInt>(&o)) imm = i->value != 0 ? 1 : 0;
+          else fail(ins.line, base_op + ".pred takes predicate registers or immediates");
+        };
         expect_punct(",");
-        op.a = expect_reg_operand("predicate operand");
+        pred_source(op.a, op.a_imm);
         expect_punct(",");
-        op.b = expect_reg_operand("predicate operand");
+        pred_source(op.b, op.b_imm);
         ins.op = op;
       } else if (ty.is_float()) {
         if (ty.bits != 16 && ty.bits != 32 && ty.bits != 64)

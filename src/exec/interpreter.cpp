@@ -4996,8 +4996,8 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpPredBin>(&ins.op)) {
-      Mask a = read_pred(w, ins, op->a);
-      Mask b = read_pred(w, ins, op->b);
+      const Mask a = op->a_imm >= 0 ? (op->a_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->a);
+      const Mask b = op->b_imm >= 0 ? (op->b_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->b);
       Mask r = op->op == PredBinOp::And ? (a & b) : op->op == PredBinOp::Or ? (a | b) : (a ^ b);
       Mask& p = pred_slot(w, op->dst);
       p = (p & ~m) | (r & m);

@@ -3525,6 +3525,42 @@ VTEST(atom_cas_compares_with_b_and_stores_c) {
 // half neg/abs (it was dropped, for f32 comparisons too), -0 below +0 in half
 // min/max, cvt.f32.bf16 as a plain shift even for NaNs, and cvt.f64.f16
 // keeping a NaN's sign and payload.
+// and/or/xor.pred with an immediate source, which nvcc emits for a negation
+// (CUDA Samples' cdpAdvancedQuicksort: `xor.pred %p212, %p260, -1`).
+VTEST(predicate_logic_takes_an_immediate) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    setp.lt.u32 %p1, %r1, 5;
+    xor.pred %p2, %p1, -1;
+    and.pred %p3, %p1, 0;
+    or.pred %p4, 1, %p1;
+    selp.u32 %r2, 1, 0, %p2;
+    selp.u32 %r3, 2, 0, %p3;
+    selp.u32 %r4, 4, 0, %p4;
+    add.u32 %r5, %r2, %r3;
+    add.u32 %r5, %r5, %r4;
+    mul.wide.u32 %rd1, %r1, 4;
+    add.u64 %rd1, %rd2, %rd1;
+    st.global.u32 [%rd1], %r5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(4 * 32);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint64_t t = 0; t < 32; ++t) VCHECK_EQ(e.mem.load_scalar(out + 4 * t, 4), uint64_t{t < 5 ? 4u : 5u});
+}
+
 VTEST(half_precision_rules_from_the_fifth_sweep) {
   struct Case { const char* ins; uint32_t a, b, c, want; };
   const Case cases[] = {

@@ -887,7 +887,9 @@ struct OpSet {
   bool negate_c = false;
 };
 struct OpSelp { Type ty; Reg dst; Operand a, b; Reg pred; };
-struct OpPredBin { PredBinOp op = PredBinOp::And; Reg dst; Reg a, b; };
+// and/or/xor.pred. Either source may be an immediate, which nvcc emits for
+// a negation (`xor.pred %p2, %p1, -1`): non-zero is true in every lane.
+struct OpPredBin { PredBinOp op = PredBinOp::And; Reg dst; Reg a, b; int8_t a_imm = -1, b_imm = -1; };
 struct OpNotPred { Reg dst; Reg src; };
 // atom and red are the same instruction; red is the form that discards the
 // old value. nvcc emits it whenever the result of an atomicAdd() is unused,
