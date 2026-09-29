@@ -11177,7 +11177,7 @@ class Interpreter {
                "indirect call to function index " + std::to_string(index) +
                    ", which this module does not define");
     OpCall resolved = op;
-    resolved.target = fn_.module_funcs[static_cast<size_t>(index)];
+    resolved.target = fn_.module_funcs[static_cast<size_t>(index)].get();
     resolved.indirect = false;
     exec_user_call(w, ctx, ins, resolved, m);
   }

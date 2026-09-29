@@ -1060,14 +1060,16 @@ struct OpCpAsyncGroup {
 struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; Reg dst; };
 // A call. `callee` names either a builtin (vprintf, __assertfail, malloc,
 // free) or a device function defined in the same module, in which case
-// `target` points at it. Held by shared_ptr so a resolved call stays valid
-// however the module's containers are moved around.
+// `target` points at it. Not owning: a recursive function calls itself, and a
+// shared_ptr there made it own itself, a cycle that leaked the whole module.
+// The functions are owned by Module::funcs and by every kernel's
+// module_funcs, so a callee outlives any kernel that can reach it.
 struct EntryFn;
 struct OpCall {
   std::string callee;
   std::string retval_slot;
   std::vector<std::string> param_slots;
-  std::shared_ptr<const EntryFn> target;  // null for the builtins
+  const EntryFn* target = nullptr;  // null for the builtins
   // An indirect call through a function pointer: the callee is whatever
   // address this register holds, so it is resolved per execution rather than
   // at parse time.
@@ -1213,8 +1215,8 @@ struct Module {
   uint32_t address_size = 64;
   std::vector<EntryFn> entries;
   std::vector<GlobalVar> globals;
-  // Device functions, by definition order. Kept as shared_ptr so an OpCall can
-  // hold one without caring how the module is copied or moved.
+  // Device functions, by definition order. Kept as shared_ptr so a kernel's
+  // module_funcs can hold them without caring how the module is copied or moved.
   std::vector<std::shared_ptr<EntryFn>> funcs;
   std::vector<SharedDecl> module_shared;  // module-scope .shared variables
 
