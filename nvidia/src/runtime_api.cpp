@@ -4703,6 +4703,23 @@ static cudaError_t replay_fill(const RecordedLaunch& rl) {
     for (unsigned i = 0; i < 4; ++i) pattern[i] = static_cast<uint8_t>(value >> (8 * i));
     for (size_t y = 0; y < rl.height; ++y) {
       void* row = static_cast<char*>(rl.dst) + y * rl.dst_pitch;
+      // Managed and pinned memory are host addresses here, filled as
+      // cudaMemset fills them (taskflow zeroes a managed buffer with a node).
+      if (!is_device_ptr(row)) {
+        bool host = false;
+        for (auto* ranges : {&s.managed_allocs, &s.host_allocs}) {
+          auto it = find_range(*ranges, row);
+          if (it == ranges->end()) continue;
+          const size_t off = static_cast<size_t>(static_cast<char*>(row) - static_cast<char*>(it->first));
+          if (rl.bytes > it->second.size - off) return cudaErrorInvalidValue;
+          auto* out = static_cast<uint8_t*>(row);
+          for (size_t i = 0; i < rl.bytes; i += rl.elem_size)
+            std::memcpy(out + i, pattern, std::min<size_t>(rl.elem_size, rl.bytes - i));
+          host = true;
+          break;
+        }
+        if (host) continue;
+      }
       owner_memory(s, row).fill(reinterpret_cast<uint64_t>(row), pattern, rl.elem_size, rl.bytes);
     }
     return cudaSuccess;

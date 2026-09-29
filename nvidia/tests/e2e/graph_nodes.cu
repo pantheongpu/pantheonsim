@@ -294,6 +294,38 @@ int main() {
   CHECK(strstr(text, "WAIT_EVENT") != nullptr);
   remove(dot);
 
+  // Fill and copy nodes on managed memory, and an executable graph's fill node
+  // pointed at a different value (taskflow's cudaGraph.Update tests).
+  {
+    const int n = 1024;
+    int *m1 = nullptr, *m2 = nullptr, *m3 = nullptr;
+    CK(cudaMallocManaged(&m1, n * sizeof(int)));
+    CK(cudaMallocManaged(&m2, n * sizeof(int)));
+    CK(cudaMallocManaged(&m3, n * sizeof(int)));
+    for (int i = 0; i < n; ++i) { m2[i] = 2; m3[i] = 3; }
+    cudaGraph_t mg;
+    CK(cudaGraphCreate(&mg, 0));
+    cudaMemsetParams mp{};
+    mp.dst = m1; mp.value = 0x01; mp.elementSize = 1; mp.width = n * sizeof(int); mp.height = 1;
+    cudaGraphNode_t fill, copy;
+    CK(cudaGraphAddMemsetNode(&fill, mg, nullptr, 0, &mp));
+    CK(cudaGraphAddMemcpyNode1D(&copy, mg, &fill, 1, m2, m3, n * sizeof(int), cudaMemcpyDefault));
+    cudaGraphExec_t me;
+    CK(cudaGraphInstantiate(&me, mg, 0));
+    CK(cudaGraphLaunch(me, 0));
+    CK(cudaDeviceSynchronize());
+    CHECK(m1[0] == 0x01010101 && m1[n - 1] == 0x01010101);
+    CHECK(m2[0] == 3 && m2[n - 1] == 3);
+    mp.value = 0x0F; mp.elementSize = 4; mp.width = n / 2;   // half of it, as ints
+    CK(cudaGraphExecMemsetNodeSetParams(me, fill, &mp));
+    CK(cudaGraphLaunch(me, 0));
+    CK(cudaDeviceSynchronize());
+    CHECK(m1[0] == 0x0F && m1[n / 2 - 1] == 0x0F && m1[n / 2] == 0x01010101);
+    CK(cudaGraphExecDestroy(me));
+    CK(cudaGraphDestroy(mg));
+    CK(cudaFree(m1)); CK(cudaFree(m2)); CK(cudaFree(m3));
+  }
+
   // A destroyed executable graph is no longer a handle anything accepts.
   CK(cudaGraphExecDestroy(exec));
   WANT(cudaGraphUpload(exec, 0), cudaErrorInvalidValue);
