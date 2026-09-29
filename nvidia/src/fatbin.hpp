@@ -58,8 +58,10 @@ std::vector<FatbinPtx> extract_elf(const void* data);
 // driver picks it: SASS built for exactly this architecture, or else the
 // newest the device can run (the same major, an older minor). Only linked
 // cubins (ET_EXEC): relocatable ones (-rdc) need a device link first, and
-// the PTX path links those. Empty when there is none, or when VGPU_SASS=0
-// asks for PTX only.
+// the PTX path links those. Empty when there is none, when VGPU_SASS=0
+// asks for PTX only, or when the cubin holds an instruction the SASS
+// executor does not run yet and the fatbin has PTX (VGPU_SASS=1: the cubin
+// regardless).
 std::string pick_cubin(const void* fatbin, uint32_t cc);
 
 // Which of a fatbin's PTX images the driver would JIT for a device of compute

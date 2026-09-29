@@ -1,6 +1,8 @@
 // Loading a cubin: decoding its code, and giving its constant banks and
 // variables device memory with relocations resolved. See vgpu/sass/exec.hpp.
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "vgpu/error.hpp"
@@ -157,6 +159,32 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
     throw;
   }
   return m;
+}
+
+bool runs_instr(const Instr& ins);   // exec.cpp
+
+std::string unsupported(const uint8_t* image, size_t size) {
+  const Cubin c = parse_cubin(image, size);
+  // VGPU_SASS_REFUSE=<op>: treat that op as unsupported, for testing the
+  // fallback to PTX.
+  const char* refuse = std::getenv("VGPU_SASS_REFUSE");
+  for (const CubinSection& s : c.sections) {
+    if (s.name.rfind(".text.", 0) != 0) continue;
+    for (size_t i = 0; i + 16 <= s.bytes.size(); i += 16) {
+      Word w;
+      std::memcpy(&w.lo, &s.bytes[i], 8);
+      std::memcpy(&w.hi, &s.bytes[i + 8], 8);
+      char at[96];
+      std::snprintf(at, sizeof at, "sm_%d %s+0x%zx: ", c.sm, s.name.c_str() + 6, i);
+      try {
+        const Instr ins = decode(w, i, c.sm);
+        if (!runs_instr(ins) || (refuse && *refuse && ins.mnemonic == refuse)) return at + to_text(ins);
+      } catch (const Error& e) {
+        return at + e.message();
+      }
+    }
+  }
+  return {};
 }
 
 std::vector<std::string> reachable(const Module& m, const std::string& kernel) {

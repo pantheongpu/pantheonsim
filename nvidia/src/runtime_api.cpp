@@ -1029,10 +1029,13 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       std::fprintf(stderr, "[vgpu][trace] launch %s grid %ux%ux%u block %ux%ux%u shared %zu\n",
                    ki.entry_name.c_str(), gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y,
                    blockDim.z, sharedMem);
-    if (!ki.mod || !registered_ptx(s, *ki.mod))
-      throw vgpu::Error::make(vgpu::Err::Unsupported,
-                              "kernel '" + ki.entry_name +
-                                  "' has neither SASS this GPU runs nor PTX to fall back on");
+    if (!ki.mod || !registered_ptx(s, *ki.mod)) {
+      // What the real runtime says for a binary built only for other GPUs.
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] cudaLaunchKernel: kernel '%s' has neither SASS this GPU runs nor PTX\n",
+                     ki.entry_name.c_str());
+      return cudaErrorNoKernelImageForDevice;
+    }
     uint64_t mid = module_on_current(s, *ki.mod);
     vgpu::runtime::Device& dev = current(s);
     const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
