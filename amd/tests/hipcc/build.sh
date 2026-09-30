@@ -118,6 +118,11 @@ echo "wrote $(pwd)/rdna4.gfx1201"
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1030 rdna2.cpp -o rdna2.gfx1030
 "$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_W64 -mwavefrontsize64 --offload-arch=gfx1030 rdna2.cpp -o rdna2.w64.gfx1030
 echo "wrote $(pwd)/rdna2.gfx1030 and rdna2.w64.gfx1030"
+# Arrays, textures and surfaces, for each RDNA generation's image resources.
+for arch in gfx1030 gfx1100 gfx1201; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch images.cpp -o images.$arch
+done
+echo "wrote $(pwd)/images.gfx1030, images.gfx1100 and images.gfx1201"
 
 # The device code alone, for the decoder and the executor to be checked
 # against, and the listing of it from the same toolchain's llvm-objdump.

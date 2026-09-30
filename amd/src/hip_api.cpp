@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "vgpu/amd_image.hpp"
 #include "vgpu/amd_bundle.hpp"
 #include "vgpu/amd_chip.hpp"
 #include "vgpu/amd_codeobject.hpp"
@@ -2451,6 +2452,35 @@ void hip_version(const vgpu::DeviceProfile& p, int* major, int* minor) {
   }
 }
 
+// A Radeon device's texture and surface limits, as ROCm's HIP reports them
+// from its image runtime's (hip_images.inc): no cubemaps, gathers or
+// alternate 3D sizes, and 256-byte image and row alignment.
+// Whether a device has texture units: the Radeon targets.
+bool has_images(const vgpu::DeviceProfile& p) {
+  return p.gcn_arch.rfind("gfx10", 0) == 0 || p.gcn_arch.rfind("gfx11", 0) == 0 ||
+         p.gcn_arch.rfind("gfx12", 0) == 0;
+}
+void fill_texture_limits(vgpu::amd::abi::DevicePropR0600* props) {
+  constexpr int k1D = 16384, k2D = 16384, k3D = 16384, k3DDepth = 8192, kLayers = 8192;
+  props->maxTexture1DLinear = props->maxTexture1DMipmap = INT32_MAX;   // 16 bytes x 2^32 - 1 elements, capped
+  props->maxTexture1D = props->maxSurface1D = k1D;
+  props->maxTexture2D[0] = props->maxSurface2D[0] = k2D;
+  props->maxTexture2D[1] = props->maxSurface2D[1] = k2D;
+  props->maxTexture3D[0] = props->maxSurface3D[0] = k3D;
+  props->maxTexture3D[1] = props->maxSurface3D[1] = k3D;
+  props->maxTexture3D[2] = props->maxSurface3D[2] = k3DDepth;
+  props->maxTexture1DLayered[0] = props->maxSurface1DLayered[0] = k1D;
+  props->maxTexture1DLayered[1] = props->maxSurface1DLayered[1] = kLayers;
+  props->maxTexture2DLayered[0] = props->maxSurface2DLayered[0] = k2D;
+  props->maxTexture2DLayered[1] = props->maxSurface2DLayered[1] = k2D;
+  props->maxTexture2DLayered[2] = props->maxSurface2DLayered[2] = kLayers;
+  props->maxTexture2DLinear[0] = k2D;
+  props->maxTexture2DLinear[1] = k2D;
+  props->maxTexture2DLinear[2] = 16 * k2D;
+  props->textureAlignment = props->surfaceAlignment = 256;
+  props->texturePitchAlignment = 256;
+}
+
 void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0600* props) {
   std::memset(props, 0, sizeof *props);
   std::snprintf(props->name, sizeof props->name, "%s", p.model.c_str());
@@ -2515,6 +2545,7 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   // there). The texture alignments stay 0, as ROCm's HIP gives them for a
   // device without image support.
   props->memPitch = static_cast<size_t>(std::min<uint64_t>(p.vram_bytes, INT32_MAX));
+  if (has_images(p)) fill_texture_limits(props);
   // What ROCm's HIP gives as a device's UUID: the sixteen characters after
   // "GPU-" in its HSA agent's UUID (hsa_api.cpp), which rocminfo prints.
   char uuid[17];
@@ -2755,10 +2786,10 @@ hipError_t hipDeviceGetAttribute(int* value, int attribute, int ordinal) {
       break;
     }
     case A::kPciChipId: *value = static_cast<int>(s.rt->device(ordinal).profile().telemetry.pci_device_id); break;
-    // Not here: images and textures -- the MI300 family has no texture units,
-    // and hipcc refuses the texture API for gfx94x and gfx950 -- and
-    // fine-grained host memory.
-    case A::kImageSupport:
+    // Images and textures on the Radeon targets only -- the MI300 family has
+    // no texture units, and hipcc refuses the texture API for gfx94x and
+    // gfx950 -- and no fine-grained host memory.
+    case A::kImageSupport: *value = has_images(s.rt->device(ordinal).profile()) ? 1 : 0; break;
     case A::kFineGrainSupport: *value = 0; break;
     case A::kCanUseStreamWaitValue: *value = 1; break;   // hipStreamWaitValue32/64
     default:
@@ -5500,153 +5531,7 @@ hipError_t hipIpcOpenEventHandle(hipEvent_t* event, vgpu::amd::abi::IpcMemHandle
 }
 
 // ---- Arrays, textures and surfaces -------------------------------------------
-//
-// The GPUs modelled here (the MI300 family, gfx942 and gfx950) have no
-// texture units: hipcc refuses the texture API in their device code
-// (__HIP_NO_IMAGE_SUPPORT), and ROCm's HIP on them says image support is 0
-// and answers every call that would make an array, a texture or a surface
-// with hipErrorNotSupported. These are its answers, found by asking it
-// (ROCm's libamdhip64 on this HSA runtime, amd/tests/hipcc/textures.cpp), so
-// a program or library that calls them is told what it would be told on the
-// card, rather than failing to load for want of the symbol.
-namespace {
-hipError_t no_images(const char* name) {
-  const ApiCall api(name);
-  return record(state(), hipErrorNotSupported);
-}
-hipError_t no_such_array(const char* name) {   // a handle to what cannot exist
-  const ApiCall api(name);
-  return record(state(), hipErrorInvalidHandle);
-}
-hipError_t freeing_nothing(const char* name) {
-  const ApiCall api(name);
-  return record(state(), hipErrorInvalidValue);
-}
-hipError_t destroying(const char* name, uint64_t object) {   // none is ever made, so only 0 is fine
-  const ApiCall api(name);
-  return record(state(), object ? hipErrorInvalidValue : hipSuccess);
-}
-}  // namespace
-
-// hipChannelFormatDesc, which hipCreateChannelDesc returns by value.
-struct ChannelFormatDesc {
-  int x, y, z, w;
-  int f;
-};
-ChannelFormatDesc hipCreateChannelDesc(int x, int y, int z, int w, int f) { return {x, y, z, w, f}; }
-
-hipError_t hipDeviceGetTexture1DLinearMaxWidth(size_t* width, const void*, int device) {
-  const ApiCall api("hipDeviceGetTexture1DLinearMaxWidth");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!width) return record(s, hipErrorInvalidValue);
-  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
-  if (device < 0 || device >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
-  *width = 0;
-  return record(s, hipSuccess);
-}
-
-// What a hipcc-built program registers before main for a texture or surface
-// reference it declares: nothing to keep, since none can be bound.
-void __hipRegisterTexture(void*, void*, char*, const char*, int, int, int) {}
-void __hipRegisterSurface(void*, void*, char*, const char*, int, int) {}
-
-// A mipmapped array: its arguments checked, then refused like every array.
-hipError_t hipMallocMipmappedArray(void** array, const void* desc, vgpu::amd::abi::Extent, unsigned int, unsigned int) {
-  if (!array || !desc) {
-    const ApiCall api("hipMallocMipmappedArray");
-    return record(state(), hipErrorInvalidValue);
-  }
-  return no_images("hipMallocMipmappedArray");
-}
-#define VGPU_NO_IMAGES(name) \
-  hipError_t name() { return no_images(#name); }
-#define VGPU_NO_SUCH_ARRAY(name) \
-  hipError_t name() { return no_such_array(#name); }
-#define VGPU_FREEING_NOTHING(name) \
-  hipError_t name() { return freeing_nothing(#name); }
-// Making one, and the texture-reference API, which needs a texture to bind.
-VGPU_NO_IMAGES(hipMallocArray)
-VGPU_NO_IMAGES(hipMalloc3DArray)
-VGPU_NO_IMAGES(hipArrayCreate)
-VGPU_NO_IMAGES(hipArray3DCreate)
-VGPU_NO_IMAGES(hipMipmappedArrayCreate)
-VGPU_NO_IMAGES(hipCreateTextureObject)
-VGPU_NO_IMAGES(hipTexObjectCreate)
-VGPU_NO_IMAGES(hipCreateSurfaceObject)
-VGPU_NO_IMAGES(hipGetTextureReference)
-VGPU_NO_IMAGES(hipModuleGetTexRef)
-VGPU_NO_IMAGES(hipBindTexture)
-VGPU_NO_IMAGES(hipBindTexture2D)
-VGPU_NO_IMAGES(hipBindTextureToArray)
-VGPU_NO_IMAGES(hipBindTextureToMipmappedArray)
-// No texture is no value to unbind, before there being no textures at all.
-hipError_t hipUnbindTexture(const void* tex) {
-  if (!tex) return record(state(), hipErrorInvalidValue);
-  return no_images("hipUnbindTexture");
-}
-VGPU_NO_IMAGES(hipGetTextureAlignmentOffset)
-VGPU_NO_IMAGES(hipGetMipmappedArrayLevel)
-VGPU_NO_IMAGES(hipMipmappedArrayGetLevel)
-VGPU_NO_IMAGES(hipMemMapArrayAsync)
-VGPU_NO_IMAGES(hipTexRefGetAddress)
-VGPU_NO_IMAGES(hipTexRefGetAddressMode)
-VGPU_NO_IMAGES(hipTexRefGetArray)
-VGPU_NO_IMAGES(hipTexRefGetBorderColor)
-VGPU_NO_IMAGES(hipTexRefGetFilterMode)
-VGPU_NO_IMAGES(hipTexRefGetFlags)
-VGPU_NO_IMAGES(hipTexRefGetFormat)
-VGPU_NO_IMAGES(hipTexRefGetMaxAnisotropy)
-VGPU_NO_IMAGES(hipTexRefGetMipMappedArray)
-VGPU_NO_IMAGES(hipTexRefGetMipmapFilterMode)
-VGPU_NO_IMAGES(hipTexRefGetMipmapLevelBias)
-VGPU_NO_IMAGES(hipTexRefGetMipmapLevelClamp)
-VGPU_NO_IMAGES(hipTexRefSetAddress)
-VGPU_NO_IMAGES(hipTexRefSetAddress2D)
-VGPU_NO_IMAGES(hipTexRefSetAddressMode)
-VGPU_NO_IMAGES(hipTexRefSetArray)
-VGPU_NO_IMAGES(hipTexRefSetBorderColor)
-VGPU_NO_IMAGES(hipTexRefSetFilterMode)
-VGPU_NO_IMAGES(hipTexRefSetFlags)
-VGPU_NO_IMAGES(hipTexRefSetFormat)
-VGPU_NO_IMAGES(hipTexRefSetMaxAnisotropy)
-VGPU_NO_IMAGES(hipTexRefSetMipmapFilterMode)
-VGPU_NO_IMAGES(hipTexRefSetMipmapLevelBias)
-VGPU_NO_IMAGES(hipTexRefSetMipmapLevelClamp)
-VGPU_NO_IMAGES(hipTexRefSetMipmappedArray)
-// Graphics and external-memory interop, which has no graphics API to share with.
-VGPU_NO_IMAGES(hipGraphicsSubResourceGetMappedArray)
-// Asking about, or copying to or from, an array: there is none to name.
-VGPU_NO_SUCH_ARRAY(hipGetChannelDesc)
-VGPU_NO_SUCH_ARRAY(hipArrayGetDescriptor)
-VGPU_NO_SUCH_ARRAY(hipArray3DGetDescriptor)
-VGPU_NO_SUCH_ARRAY(hipArrayGetInfo)
-VGPU_NO_SUCH_ARRAY(hipMemcpyToArray)
-VGPU_NO_SUCH_ARRAY(hipMemcpyFromArray)
-VGPU_NO_SUCH_ARRAY(hipMemcpyFromArray_spt)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DToArray)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DToArray_spt)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DToArrayAsync)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DToArrayAsync_spt)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DFromArray)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DFromArray_spt)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DFromArrayAsync)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DFromArrayAsync_spt)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DArrayToArray)
-VGPU_NO_SUCH_ARRAY(hipGetTextureObjectResourceDesc)
-VGPU_NO_SUCH_ARRAY(hipGetTextureObjectResourceViewDesc)
-VGPU_NO_SUCH_ARRAY(hipGetTextureObjectTextureDesc)
-VGPU_NO_SUCH_ARRAY(hipTexObjectGetResourceDesc)
-VGPU_NO_SUCH_ARRAY(hipTexObjectGetResourceViewDesc)
-VGPU_NO_SUCH_ARRAY(hipTexObjectGetTextureDesc)
-// Freeing one.
-VGPU_FREEING_NOTHING(hipFreeArray)
-VGPU_FREEING_NOTHING(hipArrayDestroy)
-VGPU_FREEING_NOTHING(hipFreeMipmappedArray)
-VGPU_FREEING_NOTHING(hipMipmappedArrayDestroy)
-hipError_t hipDestroyTextureObject(uint64_t object) { return destroying("hipDestroyTextureObject", object); }
-hipError_t hipTexObjectDestroy(uint64_t object) { return destroying("hipTexObjectDestroy", object); }
-hipError_t hipDestroySurfaceObject(uint64_t object) { return destroying("hipDestroySurfaceObject", object); }
+#include "hip_images.inc"
 
 // ---- The rest of HIP's device, stream and launch API --------------------------
 //
@@ -6323,16 +6208,14 @@ hipError_t peer_copy(void* dst, int dst_device, const void* src, int src_device,
 constexpr size_t kMaxPitch = INT32_MAX;
 
 // The pointer a driver-style copy's side names: its memory type says which
-// field. An array is refused -- there are no image units -- unless it is
-// null, which is the wrong value.
-hipError_t side_pointer(int type, const void* host, void* dev, void* array, const void** out) {
+// field. An array is its own kind of side (copy_side).
+hipError_t side_pointer(int type, const void* host, void* dev, const void** out) {
   using namespace vgpu::amd::abi;
   switch (type) {
     case kMemTypeHost: *out = host; break;
     case kMemTypeDevice:
     case kMemTypeManaged:
     case kMemTypeUnified: *out = dev; break;
-    case kMemTypeArray: return array ? hipErrorNotSupported : hipErrorInvalidValue;
     default: return hipErrorInvalidValue;
   }
   return *out ? hipSuccess : hipErrorInvalidValue;
@@ -6345,23 +6228,85 @@ hipError_t row_pitch(size_t pitch, size_t width, size_t* out) {
   *out = pitch;
   return hipSuccess;
 }
+// One side of a pitched copy: where its region starts, its rows' pitch and
+// the bytes from one slice to the next. Memory is as the side says (a slice
+// `height` rows, or the copy's); an array's pitch and slices are its own,
+// and the region has to lie inside it. On a device without image units no
+// array exists, and naming one is refused as unsupported.
+hipError_t copy_side(int type, const void* host, void* dev, void* array, size_t pitch, size_t height,
+                     size_t x, size_t y, size_t z, const Region& r, const uint8_t** start, size_t* out_pitch,
+                     uint64_t* slice) {
+  if (type == vgpu::amd::abi::kMemTypeArray) {
+    if (!array) return hipErrorInvalidValue;
+    const HipArray* a = find_array(array);
+    if (!a) return images_here() ? hipErrorInvalidValue : hipErrorNotSupported;
+    if (x + r.width > a->pitch() || y + r.rows > a->rows() || z + r.depth > a->slices()) return hipErrorInvalidValue;
+    *out_pitch = a->pitch();
+    *slice = uint64_t{a->pitch()} * a->rows();
+    *start = a->data + z * *slice + y * *out_pitch + x;
+    return hipSuccess;
+  }
+  const void* p = nullptr;
+  if (const hipError_t e = side_pointer(type, host, dev, &p); e != hipSuccess) return e;
+  if (const hipError_t e = row_pitch(pitch, r.width, out_pitch); e != hipSuccess) return e;
+  *slice = uint64_t{*out_pitch} * (height ? height : r.rows);
+  *start = static_cast<const uint8_t*>(p) + z * *slice + y * *out_pitch + x;
+  return hipSuccess;
+}
 
 // hipMemcpyParam2D and its kin.
 hipError_t param_2d(const vgpu::amd::abi::Memcpy2D* p, hipStream_t stream, bool async) {
   if (!p) return hipErrorInvalidValue;
-  const void *src = nullptr, *dst = nullptr;
-  if (const hipError_t e = side_pointer(p->srcMemoryType, p->srcHost, p->srcDevice, p->srcArray, &src); e != hipSuccess)
-    return e;
-  if (const hipError_t e = side_pointer(p->dstMemoryType, p->dstHost, p->dstDevice, p->dstArray, &dst); e != hipSuccess)
-    return e;
+  const Region shape{p->WidthInBytes, p->Height, 1, 0, 0};
+  const uint8_t *s0 = nullptr, *d0 = nullptr;
   size_t spitch = 0, dpitch = 0;
-  if (const hipError_t e = row_pitch(p->srcPitch, p->WidthInBytes, &spitch); e != hipSuccess) return e;
-  if (const hipError_t e = row_pitch(p->dstPitch, p->WidthInBytes, &dpitch); e != hipSuccess) return e;
+  uint64_t sslice = 0, dslice = 0;
+  if (const hipError_t e = copy_side(p->srcMemoryType, p->srcHost, p->srcDevice, p->srcArray, p->srcPitch, 0,
+                                     p->srcXInBytes, p->srcY, 0, shape, &s0, &spitch, &sslice);
+      e != hipSuccess)
+    return e;
+  if (const hipError_t e = copy_side(p->dstMemoryType, p->dstHost, p->dstDevice, p->dstArray, p->dstPitch, 0,
+                                     p->dstXInBytes, p->dstY, 0, shape, &d0, &dpitch, &dslice);
+      e != hipSuccess)
+    return e;
   if (!p->WidthInBytes || !p->Height) return hipSuccess;
-  const auto* s0 = static_cast<const uint8_t*>(src) + p->srcY * spitch + p->srcXInBytes;
-  auto* d0 = const_cast<uint8_t*>(static_cast<const uint8_t*>(dst)) + p->dstY * dpitch + p->dstXInBytes;
-  return copy_region(d0, Region{p->WidthInBytes, p->Height, 1, dpitch, 0}, s0,
+  return copy_region(const_cast<uint8_t*>(d0), Region{p->WidthInBytes, p->Height, 1, dpitch, 0}, s0,
                      Region{p->WidthInBytes, p->Height, 1, spitch, 0}, hipMemcpyDefault, stream, async);
+}
+
+// hipMemcpy3D with an array on a side, as the driver's copy (ROCm's HIP's
+// getDrvMemcpy3DDesc): the extent's width and an array side's x are
+// elements of the array, and a 1D layered array's layers are its rows, so
+// its y and z -- and the copy's height and depth -- trade places.
+hipError_t drv_3d(const vgpu::amd::abi::Memcpy3D* p, hipStream_t stream, bool async);
+hipError_t array_3d(const vgpu::amd::abi::Memcpy3DParms* p, hipStream_t stream, bool async) {
+  using namespace vgpu::amd::abi;
+  const HipArray* sa = p->srcArray ? find_array(p->srcArray) : nullptr;
+  const HipArray* da = p->dstArray ? find_array(p->dstArray) : nullptr;
+  if ((p->srcArray && !sa) || (p->dstArray && !da)) return images_here() ? hipErrorInvalidValue : hipErrorNotSupported;
+  Memcpy3D d{};
+  const HipArray* a = da ? da : sa;
+  d.WidthInBytes = p->extent.width * a->element();
+  d.Height = p->extent.height, d.Depth = p->extent.depth;
+  d.srcXInBytes = p->srcPos.x * (sa ? sa->element() : 1), d.srcY = p->srcPos.y, d.srcZ = p->srcPos.z;
+  d.dstXInBytes = p->dstPos.x * (da ? da->element() : 1), d.dstY = p->dstPos.y, d.dstZ = p->dstPos.z;
+  const auto kind = static_cast<hipMemcpyKind>(p->kind);
+  if (sa) {
+    d.srcMemoryType = kMemTypeArray, d.srcArray = p->srcArray;
+  } else {
+    d.srcMemoryType = memory_type(kind, true), d.srcHost = p->srcPtr.ptr, d.srcDevice = p->srcPtr.ptr;
+    d.srcPitch = p->srcPtr.pitch, d.srcHeight = p->srcPtr.ysize;
+  }
+  if (da) {
+    d.dstMemoryType = kMemTypeArray, d.dstArray = p->dstArray;
+  } else {
+    d.dstMemoryType = memory_type(kind, false), d.dstHost = p->dstPtr.ptr, d.dstDevice = p->dstPtr.ptr;
+    d.dstPitch = p->dstPtr.pitch, d.dstHeight = p->dstPtr.ysize;
+  }
+  if (sa && sa->layered_1d()) std::swap(d.srcY, d.srcZ);
+  if (da && da->layered_1d()) std::swap(d.dstY, d.dstZ);
+  if ((sa && sa->layered_1d()) || (da && da->layered_1d())) std::swap(d.Height, d.Depth);
+  return drv_3d(&d, stream, async);
 }
 
 // hipMemcpy3D and its kin: each side an array or a pitched pointer, one of
@@ -6376,7 +6321,7 @@ hipError_t copy_3d(const vgpu::amd::abi::Memcpy3DParms* p, hipStream_t stream, b
   if (kind != hipMemcpyDefault && kind != hipMemcpyHostToHost && kind != hipMemcpyHostToDevice &&
       kind != hipMemcpyDeviceToHost && kind != hipMemcpyDeviceToDevice)
     return hipErrorInvalidMemcpyDirection;
-  if (sarr || darr) return hipErrorNotSupported;
+  if (sarr || darr) return array_3d(p, stream, async);
   const auto& e = p->extent;
   size_t spitch = 0, dpitch = 0;
   if (p->srcPtr.pitch >= kMaxPitch || p->dstPtr.pitch >= kMaxPitch) return hipErrorInvalidValue;
@@ -6396,21 +6341,20 @@ hipError_t copy_3d(const vgpu::amd::abi::Memcpy3DParms* p, hipStream_t stream, b
 // named by memory type, and whose slice is Height rows unless a side says.
 hipError_t drv_3d(const vgpu::amd::abi::Memcpy3D* p, hipStream_t stream, bool async) {
   if (!p) return hipErrorInvalidValue;
-  const void *src = nullptr, *dst = nullptr;
-  if (const hipError_t e = side_pointer(p->srcMemoryType, p->srcHost, p->srcDevice, p->srcArray, &src); e != hipSuccess)
-    return e;
-  if (const hipError_t e = side_pointer(p->dstMemoryType, p->dstHost, p->dstDevice, p->dstArray, &dst); e != hipSuccess)
-    return e;
+  const Region shape{p->WidthInBytes, p->Height, p->Depth, 0, 0};
+  const uint8_t *s0 = nullptr, *d0 = nullptr;
   size_t spitch = 0, dpitch = 0;
-  if (const hipError_t e = row_pitch(p->srcPitch, p->WidthInBytes, &spitch); e != hipSuccess) return e;
-  if (const hipError_t e = row_pitch(p->dstPitch, p->WidthInBytes, &dpitch); e != hipSuccess) return e;
+  uint64_t sslice = 0, dslice = 0;
+  if (const hipError_t e = copy_side(p->srcMemoryType, p->srcHost, p->srcDevice, p->srcArray, p->srcPitch,
+                                     p->srcHeight, p->srcXInBytes, p->srcY, p->srcZ, shape, &s0, &spitch, &sslice);
+      e != hipSuccess)
+    return e;
+  if (const hipError_t e = copy_side(p->dstMemoryType, p->dstHost, p->dstDevice, p->dstArray, p->dstPitch,
+                                     p->dstHeight, p->dstXInBytes, p->dstY, p->dstZ, shape, &d0, &dpitch, &dslice);
+      e != hipSuccess)
+    return e;
   if (!p->WidthInBytes || !p->Height || !p->Depth) return hipSuccess;
-  const uint64_t sslice = spitch * (p->srcHeight ? p->srcHeight : p->Height);
-  const uint64_t dslice = dpitch * (p->dstHeight ? p->dstHeight : p->Height);
-  const auto* s0 = static_cast<const uint8_t*>(src) + p->srcZ * sslice + p->srcY * spitch + p->srcXInBytes;
-  auto* d0 = const_cast<uint8_t*>(static_cast<const uint8_t*>(dst)) + p->dstZ * dslice + p->dstY * dpitch +
-             p->dstXInBytes;
-  return copy_region(d0, Region{p->WidthInBytes, p->Height, p->Depth, dpitch, dslice}, s0,
+  return copy_region(const_cast<uint8_t*>(d0), Region{p->WidthInBytes, p->Height, p->Depth, dpitch, dslice}, s0,
                      Region{p->WidthInBytes, p->Height, p->Depth, spitch, sslice}, hipMemcpyDefault, stream, async);
 }
 
@@ -6644,34 +6588,46 @@ hipError_t hipMemsetD2D32Async(void* dst, size_t pitch, unsigned int value, size
   return record(state(), set_d2d(dst, pitch, &value, 4, width, height, stream, true));
 }
 
-// Copies to and from arrays: there are none on this device.
-hipError_t hipMemcpyAtoA(void* dst, size_t, void* src, size_t, size_t) {
+// Copies of bytes to and from an array's first row (the driver API's):
+// none on a device without image units, where no array exists.
+hipError_t hipMemcpyAtoA(void* dst, size_t dst_offset, void* src, size_t src_offset, size_t bytes) {
   const ApiCall api("hipMemcpyAtoA");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  vgpu::amd::abi::Memcpy2D d{};
+  d.srcXInBytes = src_offset, d.srcMemoryType = vgpu::amd::abi::kMemTypeArray, d.srcArray = src;
+  d.dstXInBytes = dst_offset, d.dstMemoryType = vgpu::amd::abi::kMemTypeArray, d.dstArray = dst;
+  d.WidthInBytes = bytes, d.Height = 1;
+  return record(state(), param_2d(&d, nullptr, false));
 }
-hipError_t hipMemcpyAtoD(void* dst, void* src, size_t, size_t) {
+hipError_t hipMemcpyAtoD(void* dst, void* src, size_t src_offset, size_t bytes) {
   const ApiCall api("hipMemcpyAtoD");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  return record(state(), from_array(dst, 0, src, src_offset, 0, bytes, 1, hipMemcpyDeviceToDevice, nullptr, false));
 }
-hipError_t hipMemcpyAtoH(void* dst, void* src, size_t, size_t) {
+hipError_t hipMemcpyAtoH(void* dst, void* src, size_t src_offset, size_t bytes) {
   const ApiCall api("hipMemcpyAtoH");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  return record(state(), from_array(dst, 0, src, src_offset, 0, bytes, 1, hipMemcpyDeviceToHost, nullptr, false));
 }
-hipError_t hipMemcpyAtoHAsync(void* dst, void* src, size_t, size_t, hipStream_t) {
+hipError_t hipMemcpyAtoHAsync(void* dst, void* src, size_t src_offset, size_t bytes, hipStream_t stream) {
   const ApiCall api("hipMemcpyAtoHAsync");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  return record(state(), from_array(dst, 0, src, src_offset, 0, bytes, 1, hipMemcpyDeviceToHost, stream, true));
 }
-hipError_t hipMemcpyDtoA(void* dst, size_t, void* src, size_t) {
+hipError_t hipMemcpyDtoA(void* dst, size_t dst_offset, void* src, size_t bytes) {
   const ApiCall api("hipMemcpyDtoA");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  return record(state(), to_array(dst, dst_offset, 0, src, 0, bytes, 1, hipMemcpyDeviceToDevice, nullptr, false));
 }
-hipError_t hipMemcpyHtoA(void* dst, size_t, const void* src, size_t) {
+hipError_t hipMemcpyHtoA(void* dst, size_t dst_offset, const void* src, size_t bytes) {
   const ApiCall api("hipMemcpyHtoA");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  return record(state(), to_array(dst, dst_offset, 0, src, 0, bytes, 1, hipMemcpyHostToDevice, nullptr, false));
 }
-hipError_t hipMemcpyHtoAAsync(void* dst, size_t, const void* src, size_t, hipStream_t) {
+hipError_t hipMemcpyHtoAAsync(void* dst, size_t dst_offset, const void* src, size_t bytes, hipStream_t stream) {
   const ApiCall api("hipMemcpyHtoAAsync");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  return record(state(), to_array(dst, dst_offset, 0, src, 0, bytes, 1, hipMemcpyHostToDevice, stream, true));
 }
 
 // The per-thread default stream's forms of the 3D copy and the 2D and 3D
