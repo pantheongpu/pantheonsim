@@ -379,6 +379,22 @@ int main() {
          "a high-water mark is set back to zero, or not at all");
   (void)hipGetLastError();
 
+  // Pinned memory starts zeroed, as ROCm's does (fresh pages from the
+  // kernel): hip-tests' atomics read a hipHostMalloc buffer they never
+  // wrote. A buffer dirtied and freed, then allocated again, reads zero.
+  {
+    const size_t n = 3 << 20;
+    for (int round = 0; round < 2; ++round) {
+      unsigned char* h = nullptr;
+      (void)hipHostMalloc(reinterpret_cast<void**>(&h), n);
+      size_t nonzero = 0;
+      for (size_t i = 0; i < n; ++i) nonzero += h[i] != 0;
+      if (round == 1) check(nonzero == 0, "pinned memory starts zeroed", std::to_string(nonzero) + " bytes not zero");
+      for (size_t i = 0; i < n; ++i) h[i] = 0xab;
+      (void)hipHostFree(h);
+    }
+  }
+
   // A fill still queued when the memory is shared: hipMemset of device
   // memory returns before it runs, and sharing moves the bytes into a file,
   // so the handle waits for the fill and the shared memory holds it.
