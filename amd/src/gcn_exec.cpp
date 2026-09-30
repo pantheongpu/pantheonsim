@@ -3731,6 +3731,38 @@ struct Machine {
     // Otherwise lane by lane, each to its own memory: loads and stores, of a
     // byte or a half or whole registers.
     const std::string_view body = std::string_view(in.name).substr(in.name.find('_') + 1);
+    // An atomic, lane by lane: in LDS or private memory, which only this
+    // work-group reaches, done in place; in the device's, as a global one.
+    if (AtomicOp a; parse_atomic(body, &a)) {
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        if (!(w.exec >> lane & 1)) continue;
+        const uint64_t addr = lane_src64(w, in.src[0], lane) + static_cast<uint64_t>(in.offset);
+        uint64_t v = 0, expected = 0, before = 0;
+        atomic_data(w, in, a, lane, &v, &expected);
+        uint8_t* host = nullptr;
+        if (in_lds(addr)) {
+          const uint64_t where = addr - kSharedBase;
+          if (where + a.bytes > g.lds.size())
+            throw Error::make(Err::InvalidValue, "a flat atomic reaches LDS at ", where, ", past the ", g.lds.size(),
+                              " bytes the kernel reserved");
+          host = &g.lds[where];
+        } else if (in_private(addr)) {
+          host = scratch_at(g, w, lane, addr - kPrivateBase, a.bytes);
+        }
+        if (host) {
+          std::memcpy(&before, host, a.bytes);
+          const uint64_t after = atomic_result(a, before, v, expected);
+          std::memcpy(host, &after, a.bytes);
+        } else {
+          before = atomic_rmw(addr, a, v, expected);
+        }
+        if (!in.dst.empty()) {
+          if (a.bytes == 8) write_lane64(w, in.dst[0], lane, before);
+          else write_lane(w, in.dst[0], lane, static_cast<uint32_t>(before));
+        }
+      }
+      return lds;
+    }
     Narrow n;
     const bool part = narrow(in.name, &n), storing = body.rfind("store", 0) == 0;
     if (!part && body.rfind("load_dword", 0) != 0 && body.rfind("store_dword", 0) != 0)
@@ -4034,6 +4066,131 @@ struct Machine {
     }
   }
 
+  // A read-modify-write of global or flat memory: what it does, and how
+  // wide it is.
+  enum class Rmw { Add, Sub, And, Or, Xor, Swap, AddF32, SMin, UMin, SMax, UMax, PkAddF16, PkAddBf16, Inc, Dec,
+                   AddF64, MinF64, MaxF64, CmpSwap };
+  struct AtomicOp {
+    Rmw rmw = Rmw::Add;
+    uint32_t bytes = 4;
+  };
+  // An atomic, read from the name past its segment ("atomic_add_x2"); false
+  // for anything that is not one this knows.
+  static bool parse_atomic(std::string_view body, AtomicOp* a) {
+    if (body.rfind("atomic_", 0) != 0) return false;
+    std::string_view what = body.substr(7);
+    a->bytes = 4;
+    if (what.size() > 3 && what.substr(what.size() - 3) == "_x2") {
+      a->bytes = 8;
+      what.remove_suffix(3);
+    }
+    static const std::pair<std::string_view, Rmw> kNames[] = {
+        {"add", Rmw::Add},       {"sub", Rmw::Sub},         {"and", Rmw::And},           {"or", Rmw::Or},
+        {"xor", Rmw::Xor},       {"swap", Rmw::Swap},       {"smin", Rmw::SMin},         {"umin", Rmw::UMin},
+        {"smax", Rmw::SMax},     {"umax", Rmw::UMax},       {"inc", Rmw::Inc},           {"dec", Rmw::Dec},
+        {"cmpswap", Rmw::CmpSwap}, {"add_f32", Rmw::AddF32}, {"pk_add_f16", Rmw::PkAddF16},
+        {"pk_add_bf16", Rmw::PkAddBf16}, {"add_f64", Rmw::AddF64}, {"min_f64", Rmw::MinF64},
+        {"max_f64", Rmw::MaxF64}};
+    for (const auto& [name, rmw] : kNames)
+      if (what == name) {
+        a->rmw = rmw;
+        if (rmw == Rmw::AddF64 || rmw == Rmw::MinF64 || rmw == Rmw::MaxF64) a->bytes = 8;
+        return !(a->bytes == 8 && (rmw == Rmw::AddF32 || rmw == Rmw::PkAddF16 || rmw == Rmw::PkAddBf16));
+      }
+    return false;
+  }
+  // What an atomic leaves where it found `before`, given its data `v` and,
+  // for a compare-and-swap, what it must find. inc counts up to the data,
+  // then wraps to zero; dec counts down to zero, then wraps to the data (as
+  // does anything above it); the float min and max keep the number where the
+  // other is a NaN.
+  static uint64_t atomic_result(const AtomicOp& a, uint64_t before, uint64_t v, uint64_t expected) {
+    if (a.bytes == 4) {
+      const uint32_t b = static_cast<uint32_t>(before), x = static_cast<uint32_t>(v);
+      const int32_t sb = static_cast<int32_t>(b), sx = static_cast<int32_t>(x);
+      switch (a.rmw) {
+        case Rmw::Add: return uint32_t(b + x);
+        case Rmw::Sub: return uint32_t(b - x);
+        case Rmw::And: return b & x;
+        case Rmw::Or: return b | x;
+        case Rmw::Xor: return b ^ x;
+        case Rmw::Swap: return x;
+        case Rmw::AddF32: return as_bits(as_float(b) + as_float(x));
+        case Rmw::SMin: return static_cast<uint32_t>(std::min(sb, sx));
+        case Rmw::UMin: return std::min(b, x);
+        case Rmw::SMax: return static_cast<uint32_t>(std::max(sb, sx));
+        case Rmw::UMax: return std::max(b, x);
+        case Rmw::Inc: return b >= x ? 0 : b + 1;
+        case Rmw::Dec: return b == 0 || b > x ? x : b - 1;
+        case Rmw::PkAddF16: return packed_add(b, x, false);
+        case Rmw::PkAddBf16: return packed_add(b, x, true);
+        case Rmw::CmpSwap: return b == static_cast<uint32_t>(expected) ? x : b;
+        default: return b;
+      }
+    }
+    const int64_t sb = static_cast<int64_t>(before), sx = static_cast<int64_t>(v);
+    switch (a.rmw) {
+      case Rmw::Add: return before + v;
+      case Rmw::Sub: return before - v;
+      case Rmw::And: return before & v;
+      case Rmw::Or: return before | v;
+      case Rmw::Xor: return before ^ v;
+      case Rmw::Swap: return v;
+      case Rmw::SMin: return static_cast<uint64_t>(std::min(sb, sx));
+      case Rmw::UMin: return std::min(before, v);
+      case Rmw::SMax: return static_cast<uint64_t>(std::max(sb, sx));
+      case Rmw::UMax: return std::max(before, v);
+      case Rmw::Inc: return before >= v ? 0 : before + 1;
+      case Rmw::Dec: return before == 0 || before > v ? v : before - 1;
+      case Rmw::AddF64: return as_bits(as_double(before) + as_double(v));
+      case Rmw::MinF64: return as_bits(std::fmin(as_double(before), as_double(v)));
+      case Rmw::MaxF64: return as_bits(std::fmax(as_double(before), as_double(v)));
+      case Rmw::CmpSwap: return before == expected ? v : before;
+      default: return before;
+    }
+  }
+  // A lane's data for an atomic, and what a compare-and-swap must find: the
+  // register (or pair) after the data.
+  void atomic_data(const Wave& w, const Inst& in, const AtomicOp& a, uint32_t lane, uint64_t* v,
+                   uint64_t* expected) const {
+    if (a.bytes == 4) {
+      *v = lane_src(w, in.src[1], lane);
+      *expected = a.rmw == Rmw::CmpSwap ? w.vgpr[in.src[1].index + 1][lane] : 0;
+    } else {
+      *v = lane_src64(w, in.src[1], lane);
+      *expected = a.rmw == Rmw::CmpSwap
+                      ? (w.vgpr[in.src[1].index + 2][lane] | uint64_t{w.vgpr[in.src[1].index + 3][lane]} << 32)
+                      : 0;
+    }
+  }
+  // An atomic on memory a device reaches, returning what it found. Host
+  // memory the device maps (pinned, registered, managed) is updated with the
+  // CPU's own atomics there, so a host thread's atomics on it and a kernel's
+  // all land; the rest under the lock that makes work-groups on other threads
+  // take turns.
+  uint64_t atomic_rmw(uint64_t addr, const AtomicOp& a, uint64_t v, uint64_t expected) {
+    MemoryManager& m = at(addr);
+    if (uint8_t* h = m.host_address(addr, a.bytes); h && reinterpret_cast<uintptr_t>(h) % a.bytes == 0) {
+      if (a.bytes == 4) {
+        std::atomic_ref<uint32_t> r(*reinterpret_cast<uint32_t*>(h));
+        uint32_t before = r.load();
+        while (!r.compare_exchange_weak(before, static_cast<uint32_t>(atomic_result(a, before, v, expected)))) {
+        }
+        return before;
+      }
+      std::atomic_ref<uint64_t> r(*reinterpret_cast<uint64_t*>(h));
+      uint64_t before = r.load();
+      while (!r.compare_exchange_weak(before, atomic_result(a, before, v, expected))) {
+      }
+      return before;
+    }
+    const auto guard = atomic_guard(addr);
+    const uint64_t before = m.load_scalar(addr, a.bytes);
+    const uint64_t after = atomic_result(a, before, v, expected);
+    if (after != before) m.store_scalar(addr, a.bytes, after);
+    return before;
+  }
+
   void global_access(Wave& w, const Inst& in) {
     if (!w.exec) return;   // no lane to reach memory for
     const std::string& op = in.name;
@@ -4041,9 +4198,9 @@ struct Machine {
     // A flat access that reaches only the device's memory comes here too, so
     // what it does is read from its name past the segment ("load_dwordx4").
     const std::string_view body = std::string_view(op).substr(op.find('_') + 1);
-    enum class Kind { Narrow, HalfReg, Load, Store, StoreHi16, AddX2, AddF64, CmpSwapX2, CmpSwap, Atomic, Atomic64 } kind;
+    enum class Kind { Narrow, HalfReg, Load, Store, StoreHi16, Atomic } kind;
     Half half;
-    enum class Rmw { Add, Sub, And, Or, Xor, Swap, AddF32, SMin, UMin, SMax, UMax, PkAddF16, PkAddBf16, Inc, Dec } rmw = Rmw::Add;
+    AtomicOp atomic;
     Narrow n;
     bool narrow_store = false;
     if (narrow(op, &n)) {
@@ -4055,49 +4212,8 @@ struct Machine {
       kind = Kind::Load;
     } else if (body.rfind("store_dword", 0) == 0) {
       kind = Kind::Store;
-    } else if (body == "atomic_add_x2") {
-      kind = Kind::AddX2;
-    } else if (body.size() > 3 && body.rfind("atomic_", 0) == 0 && body.substr(body.size() - 3) == "_x2" &&
-               body != "atomic_cmpswap_x2") {
-      // The rest of the 64-bit forms, over a register pair.
-      kind = Kind::Atomic64;
-      const std::string_view what = body.substr(7, body.size() - 10);
-      if (what == "sub") rmw = Rmw::Sub;
-      else if (what == "and") rmw = Rmw::And;
-      else if (what == "or") rmw = Rmw::Or;
-      else if (what == "xor") rmw = Rmw::Xor;
-      else if (what == "swap") rmw = Rmw::Swap;
-      else if (what == "smin") rmw = Rmw::SMin;
-      else if (what == "umin") rmw = Rmw::UMin;
-      else if (what == "smax") rmw = Rmw::SMax;
-      else if (what == "umax") rmw = Rmw::UMax;
-      else if (what == "inc") rmw = Rmw::Inc;
-      else if (what == "dec") rmw = Rmw::Dec;
-      else throw Error::make(Err::Unsupported, "memory instruction ", op, " is decoded but not implemented");
-    } else if (body == "atomic_add_f64" || body == "atomic_min_f64" || body == "atomic_max_f64") {
-      kind = Kind::AddF64;
-    } else if (body == "atomic_cmpswap_x2") {
-      kind = Kind::CmpSwapX2;
-    } else if (body == "atomic_cmpswap") {
-      kind = Kind::CmpSwap;
-    } else if (body.rfind("atomic_", 0) == 0) {
+    } else if (parse_atomic(body, &atomic)) {
       kind = Kind::Atomic;
-      if (body == "atomic_add") rmw = Rmw::Add;
-      else if (body == "atomic_sub") rmw = Rmw::Sub;
-      else if (body == "atomic_and") rmw = Rmw::And;
-      else if (body == "atomic_or") rmw = Rmw::Or;
-      else if (body == "atomic_xor") rmw = Rmw::Xor;
-      else if (body == "atomic_swap") rmw = Rmw::Swap;
-      else if (body == "atomic_add_f32") rmw = Rmw::AddF32;
-      else if (body == "atomic_smin") rmw = Rmw::SMin;
-      else if (body == "atomic_umin") rmw = Rmw::UMin;
-      else if (body == "atomic_smax") rmw = Rmw::SMax;
-      else if (body == "atomic_umax") rmw = Rmw::UMax;
-      else if (body == "atomic_inc") rmw = Rmw::Inc;
-      else if (body == "atomic_dec") rmw = Rmw::Dec;
-      else if (body == "atomic_pk_add_f16") rmw = Rmw::PkAddF16;
-      else if (body == "atomic_pk_add_bf16") rmw = Rmw::PkAddBf16;
-      else throw Error::make(Err::Unsupported, "memory instruction ", op, " is decoded but not implemented");
     } else {
       throw Error::make(Err::Unsupported, "memory instruction ", op, " is decoded but not implemented");
     }
@@ -4135,99 +4251,17 @@ struct Machine {
           if (half.store) store(addr, half.bytes, half_store(lane_src(w, in.src[1], lane), half));
           else write_half_load(w, in, in.dst[0], lane, half_load(load(addr, half.bytes), half), half);
           break;
-        case Kind::AddF64: {
-          const auto guard = atomic_guard(addr);
-          const uint64_t before = at(addr).load_scalar(addr, 8);
-          const double x = as_double(before), y = as_double(lane_src64(w, in.src[1], lane));
-          // min and max keep the number where the other is a NaN.
-          at(addr).store_scalar(addr, 8, as_bits(body == "atomic_min_f64"   ? std::fmin(x, y)
-                                                 : body == "atomic_max_f64" ? std::fmax(x, y)
-                                                                            : x + y));
-          if (!in.dst.empty()) write_lane64(w, in.dst[0], lane, before);
-          break;
-        }
-        case Kind::AddX2: {
-          // The integer atomic that works on a pair.
-          const auto guard = atomic_guard(addr);
-          const uint64_t before = at(addr).load_scalar(addr, 8);
-          at(addr).store_scalar(addr, 8, before + lane_src64(w, in.src[1], lane));
-          if (!in.dst.empty()) write_lane64(w, in.dst[0], lane, before);
-          break;
-        }
-        case Kind::Atomic64: {
-          const uint64_t v = lane_src64(w, in.src[1], lane);
-          const auto guard = atomic_guard(addr);
-          const uint64_t before = at(addr).load_scalar(addr, 8);
-          uint64_t after = 0;
-          switch (rmw) {
-            case Rmw::Sub: after = before - v; break;
-            case Rmw::And: after = before & v; break;
-            case Rmw::Or: after = before | v; break;
-            case Rmw::Xor: after = before ^ v; break;
-            case Rmw::Swap: after = v; break;
-            case Rmw::SMin: after = static_cast<uint64_t>(std::min(static_cast<int64_t>(before), static_cast<int64_t>(v))); break;
-            case Rmw::UMin: after = std::min(before, v); break;
-            case Rmw::SMax: after = static_cast<uint64_t>(std::max(static_cast<int64_t>(before), static_cast<int64_t>(v))); break;
-            case Rmw::UMax: after = std::max(before, v); break;
-            // Counts up to the data, then wraps to zero; counts down to zero,
-            // then wraps to the data (as does anything above it).
-            case Rmw::Inc: after = before >= v ? 0 : before + 1; break;
-            case Rmw::Dec: after = before == 0 || before > v ? v : before - 1; break;
-            default: after = before + v; break;
-          }
-          at(addr).store_scalar(addr, 8, after);
-          if (!in.dst.empty()) write_lane64(w, in.dst[0], lane, before);
-          break;
-        }
-        case Kind::CmpSwapX2: {
-          // Two pairs: the value to write, then the one it must find.
-          const uint64_t value = lane_src64(w, in.src[1], lane);
-          const uint64_t expected = w.vgpr[in.src[1].index + 2][lane] |
-                                    static_cast<uint64_t>(w.vgpr[in.src[1].index + 3][lane]) << 32;
-          const auto guard = atomic_guard(addr);
-          const uint64_t before = at(addr).load_scalar(addr, 8);
-          if (before == expected) at(addr).store_scalar(addr, 8, value);
-          if (!in.dst.empty()) write_lane64(w, in.dst[0], lane, before);
-          break;
-        }
-        case Kind::CmpSwap: {
-          // The pair is the value to write and the one it must find.
-          const uint32_t value = lane_src(w, in.src[1], lane), expected = w.vgpr[in.src[1].index + 1][lane];
-          const auto guard = atomic_guard(addr);
-          const uint32_t before = static_cast<uint32_t>(at(addr).load_scalar(addr, 4));
-          if (before == expected) at(addr).store_scalar(addr, 4, value);
-          if (!in.dst.empty()) write_lane(w, in.dst[0], lane, before);
-          break;
-        }
         case Kind::Atomic: {
           // Lane by lane, which is what makes these atomic within a wave:
           // every lane's turn lands, whatever order they come in, and each is
-          // told what it found. Across work-groups on other threads, the lock.
-          const uint32_t v = lane_src(w, in.src[1], lane);
-          const auto guard = atomic_guard(addr);
-          const uint32_t before = static_cast<uint32_t>(at(addr).load_scalar(addr, 4));
-          uint32_t after = 0;
-          switch (rmw) {
-            case Rmw::Add: after = before + v; break;
-            case Rmw::Sub: after = before - v; break;
-            case Rmw::And: after = before & v; break;
-            case Rmw::Or: after = before | v; break;
-            case Rmw::Xor: after = before ^ v; break;
-            case Rmw::Swap: after = v; break;
-            case Rmw::AddF32: after = as_bits(as_float(before) + as_float(v)); break;
-            case Rmw::SMin: after = static_cast<uint32_t>(std::min(static_cast<int32_t>(before), static_cast<int32_t>(v))); break;
-            case Rmw::UMin: after = std::min(before, v); break;
-            case Rmw::SMax: after = static_cast<uint32_t>(std::max(static_cast<int32_t>(before), static_cast<int32_t>(v))); break;
-            case Rmw::UMax: after = std::max(before, v); break;
-            // Counts up to the data, then wraps to zero; counts down to zero,
-            // then wraps to the data (as does anything above it).
-            case Rmw::Inc: after = before >= v ? 0 : before + 1; break;
-            case Rmw::Dec: after = before == 0 || before > v ? v : before - 1; break;
-            case Rmw::PkAddF16: after = packed_add(before, v, false); break;
-            case Rmw::PkAddBf16: after = packed_add(before, v, true); break;
+          // told what it found.
+          uint64_t v = 0, expected = 0;
+          atomic_data(w, in, atomic, lane, &v, &expected);
+          const uint64_t before = atomic_rmw(addr, atomic, v, expected);
+          if (!in.dst.empty()) {
+            if (atomic.bytes == 8) write_lane64(w, in.dst[0], lane, before);
+            else write_lane(w, in.dst[0], lane, static_cast<uint32_t>(before));
           }
-          at(addr).store_scalar(addr, 4, after);
-          if (!in.dst.empty()) write_lane(w, in.dst[0], lane, before);
           break;
         }
       }

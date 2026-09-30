@@ -67,6 +67,10 @@ echo "wrote $(pwd)/exports.gfx942 and exports_kernel.gfx942.co"
 "$rocm/bin/hipcc" -O2 --genco --offload-arch=gfx9-4-generic modules_kernel.cpp -o modules_kernel.generic.co
 "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 modules.cpp -o modules.gfx942
 echo "wrote $(pwd)/modules.gfx942 and modules_kernel.generic.co"
+# Atomics: a flat one landing in LDS, a kernel's and a host thread's on one
+# pinned counter, and a float max by compare-and-swap.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 atomics.cpp -o atomics.gfx942
+echo "wrote $(pwd)/atomics.gfx942"
 # Events shared with another process, which it forks for.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 ipc.cpp -o ipc.gfx942
 echo "wrote $(pwd)/ipc.gfx942"

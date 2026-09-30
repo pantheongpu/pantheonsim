@@ -308,6 +308,14 @@ echo "$out" | sed 's/^/      /'
 expect "the modules program runs to the end" "0" "$status"
 expect "every one of its module checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# Atomics (hipcc/atomics.cpp): a flat atomic landing in LDS, a kernel's and a
+# host thread's atomics on one pinned counter, and a float max.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/atomics.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the atomics program runs to the end" "0" "$status"
+expect "every one of its atomic checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # Events shared between processes (hipcc/ipc.cpp): an interprocess event's
 # handle opened in a process it forks, whose wait waits for the record made
 # here.
