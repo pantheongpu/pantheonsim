@@ -740,14 +740,16 @@ const Stream* find_stream(State& s, hipStream_t stream, Stream* null_stream);
 // there, is the wrong value. A packet an HSA program puts on a queue goes to
 // the hardware as it is, and none of this is asked of it. The caller holds
 // s.mutex.
+// `grid_limits` false skips the grid's own limits: hipExtModuleLaunchKernel's
+// grid is counted in work-items, and ROCm's HIP takes any it is given.
 hipError_t check_launch(State& s, int ordinal, const Kernel& kernel, vgpu::amd::abi::Dim3 grid,
-                        vgpu::amd::abi::Dim3 block, size_t shared, hipStream_t stream) {
+                        vgpu::amd::abi::Dim3 block, size_t shared, hipStream_t stream, bool grid_limits = true) {
   if (!block.x || !block.y || !block.z || !grid.x || !grid.y || !grid.z) return hipErrorInvalidConfiguration;
   const vgpu::Limits& lim = s.rt->device(ordinal).profile().limits;
   const uint32_t bdim[3] = {block.x, block.y, block.z}, gdim[3] = {grid.x, grid.y, grid.z};
   for (int i = 0; i < 3; ++i) {
     if (lim.max_block_dim[i] && bdim[i] > lim.max_block_dim[i]) return hipErrorInvalidConfiguration;
-    if (lim.max_grid_dim[i] && gdim[i] > lim.max_grid_dim[i]) return hipErrorInvalidConfiguration;
+    if (grid_limits && lim.max_grid_dim[i] && gdim[i] > lim.max_grid_dim[i]) return hipErrorInvalidConfiguration;
   }
   const uint64_t threads = uint64_t{block.x} * block.y * block.z;
   if (lim.max_threads_per_block && threads > lim.max_threads_per_block) return hipErrorInvalidConfiguration;
@@ -1842,13 +1844,29 @@ hipError_t module_launch(hipFunction_t f, unsigned int gx, unsigned int gy, unsi
                          void** extra, const uint32_t* grid_items) {
   State& s = state();
   std::unique_lock<std::mutex> lock(s.mutex);
-  if (!f) return record(s, hipErrorInvalidValue);
+  if (!f) return record(s, hipErrorInvalidResourceHandle);
   vgpu::runtime::Device* d = device(s);
   if (!d) return record(s, hipErrorInvalidDevice);
   Function* fn = reinterpret_cast<Function*>(f);
-  if (const hipError_t e = check_launch(s, s.current, *fn->kernel, {gx, gy, gz}, {bx, by, bz}, shared, stream);
-      e != hipSuccess)
-    return record(s, e);
+  // hipModuleLaunchKernel answers a launch the device cannot take as a wrong
+  // value, as ROCm's does; hipExtModuleLaunchKernel (whose grid is in
+  // work-items) as a wrong configuration.
+  hipError_t e = check_launch(s, s.current, *fn->kernel, {gx, gy, gz}, {bx, by, bz}, shared, stream, !grid_items);
+  if (e == hipErrorInvalidConfiguration && !grid_items) e = hipErrorInvalidValue;
+  if (e != hipSuccess) return record(s, e);
+  // The arguments come one way or the other, not both.
+  if (params && extra) return record(s, fail(hipErrorInvalidValue, "a launch passed both kernelParams and extra"));
+  // A stream of another device's is not this device's to launch on.
+  if (stream) {
+    Stream null_stream;
+    if (const Stream* st = find_stream(s, stream, &null_stream); st && st->device != s.current)
+      return record(s, fail(hipErrorInvalidResourceHandle, "the stream belongs to another device"));
+  }
+  // A grid of work-items that is not a whole number of work-groups, for a
+  // kernel built for uniform ones (as clang builds HIP's by default).
+  if (grid_items && fn->kernel->uniform_work_group_size && (grid_items[0] || grid_items[1] || grid_items[2]))
+    return record(s, fail(hipErrorInvalidValue, "the kernel was built for uniform work-groups, and the grid is "
+                                                "not a whole number of them"));
   std::vector<uint8_t> args;
   if (const hipError_t e = build_kernargs(*fn->kernel, params, extra, &args); e != hipSuccess)
     return record(s, e);
@@ -3974,7 +3992,8 @@ hipError_t hipModuleLaunchCooperativeKernel(hipFunction_t f, unsigned int gx, un
 // runs.
 hipError_t hipDrvLaunchKernelEx(const void* config, hipFunction_t f, void** params, void** extra) {
   const ApiCall api("hipDrvLaunchKernelEx");
-  if (!config || !f) return record(state(), hipErrorInvalidValue);
+  if (!config) return record(state(), hipErrorInvalidValue);
+  if (!f) return record(state(), hipErrorInvalidResourceHandle);
   const auto* c = static_cast<const unsigned char*>(config);
   uint32_t dims[7];
   std::memcpy(dims, c, sizeof dims);   // grid x, y, z; block x, y, z; dynamic LDS

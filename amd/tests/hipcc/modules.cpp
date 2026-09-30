@@ -4,6 +4,7 @@
 // "ok <what>" or "FAIL <what>: <why>", and the last line counts them. Built by
 // build.sh with hipcc, with modules_kernel.generic.co beside it; run by
 // amd/tests/e2e/run_hipcc.sh.
+#include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
 
 #include <cstdio>
@@ -53,6 +54,39 @@ int main(int argc, char** argv) {
          "and launches");
   (void)hipMemcpy(host.data(), d, n * sizeof(int), hipMemcpyDeviceToHost);
   check(host[0] == 21 && host[n - 1] == 21, "and runs, reading its global", std::to_string(host[0]));
+
+  // Launches the device cannot take: hipModuleLaunchKernel answers them as
+  // wrong values, hipExtModuleLaunchKernel (whose grid is in work-items) as
+  // wrong configurations, and both refuse no function as a bad handle.
+  EXPECT(hipModuleLaunchKernel(nullptr, 1, 1, 1, 1, 1, 1, 0, nullptr, args, nullptr), hipErrorInvalidResourceHandle,
+         "a launch of no function");
+  EXPECT(hipModuleLaunchKernel(f, 0, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr), hipErrorInvalidValue,
+         "a module launch of an empty grid");
+  EXPECT(hipModuleLaunchKernel(f, 1, 1, 1, 2048, 1, 1, 0, nullptr, args, nullptr), hipErrorInvalidValue,
+         "a module launch of a block wider than the device's");
+  EXPECT(hipExtModuleLaunchKernel(f, 64, 1, 1, 2048, 1, 1, 0, nullptr, args, nullptr, nullptr, nullptr, 0),
+         hipErrorInvalidConfiguration, "an extended launch of a block wider than the device's");
+  void* extra[] = {HIP_LAUNCH_PARAM_END};
+  EXPECT(hipModuleLaunchKernel(f, 1, 1, 1, 64, 1, 1, 0, nullptr, args, extra), hipErrorInvalidValue,
+         "a launch passing both kernelParams and extra");
+  // hipcc builds HIP kernels for uniform work-groups: a grid of work-items
+  // that is not a whole number of them is refused.
+  EXPECT(hipExtModuleLaunchKernel(f, 100, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr, nullptr, nullptr, 0),
+         hipErrorInvalidValue, "an extended launch of a partial work-group, for a uniform kernel");
+  EXPECT(hipExtModuleLaunchKernel(f, n, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr, nullptr, nullptr, 0), hipSuccess,
+         "an extended launch of whole work-groups");
+  (void)hipDeviceSynchronize();
+  int devices = 0;
+  (void)hipGetDeviceCount(&devices);
+  if (devices > 1) {
+    hipStream_t other = nullptr;
+    (void)hipSetDevice(1);
+    (void)hipStreamCreate(&other);
+    (void)hipSetDevice(0);
+    EXPECT(hipModuleLaunchKernel(f, 1, 1, 1, 64, 1, 1, 0, other, args, nullptr), hipErrorInvalidResourceHandle,
+           "a launch on another device's stream");
+    (void)hipStreamDestroy(other);
+  }
 
   hipDeviceptr_t global = nullptr;
   size_t bytes = 0;
