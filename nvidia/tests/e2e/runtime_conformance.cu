@@ -433,6 +433,20 @@ int main() {
   }
 #endif
 
+  // A 2D copy whose rows are wider than a pitch is refused, on either side, as
+  // an RTX 3060 refuses it; cublasSetMatrix with ld < rows reports it.
+  {
+    char hbuf[64] = {0};
+    char* dbuf = nullptr;
+    cudaMalloc(&dbuf, 64);
+    e = cudaMemcpy2D(dbuf, 8, hbuf, 16, 16, 2, cudaMemcpyHostToDevice);
+    CHECK("cudaMemcpy2D destination pitch below the width -> invalid pitch", e == cudaErrorInvalidPitchValue, "got %d %s", e, cudaGetErrorName(e));
+    e = cudaMemcpy2D(dbuf, 16, hbuf, 8, 16, 2, cudaMemcpyHostToDevice);
+    CHECK("cudaMemcpy2D source pitch below the width -> invalid pitch", e == cudaErrorInvalidPitchValue, "got %d %s", e, cudaGetErrorName(e));
+    cudaGetLastError();
+    cudaFree(dbuf);
+  }
+
   // Cache preferences: accepted for a kernel, refused for anything else, and the
   // device-wide one reads back.
   e = cudaFuncSetCacheConfig(fill, cudaFuncCachePreferL1);

@@ -1851,6 +1851,8 @@ VGPU_EXPORT cudaError_t cudaMemcpy2D(void* dst, size_t dpitch, const void* src, 
                                      size_t width, size_t height, cudaMemcpyKind kind) {
   if (width == 0 || height == 0) return cudaSuccess;
   if (!dst || !src) return cudaErrorInvalidValue;
+  // A row wider than either pitch would overlap the next; CUDA refuses it.
+  if (width > dpitch || width > spitch) return cudaErrorInvalidPitchValue;
   // A rectangle is a run of rows; each row goes through the same path as a
   // linear copy, so the owning-device resolution applies to it too.
   for (size_t y = 0; y < height; ++y) {

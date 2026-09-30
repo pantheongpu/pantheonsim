@@ -203,4 +203,29 @@ static void run() {
   cublasDestroy(h);
 }
 
-int main() { run(); return 0; }
+// The host <-> device copy helpers, with strides on both sides, then back.
+static void host_copies() {
+  std::vector<float> hx(10);
+  for (int i = 0; i < 10; ++i) hx[i] = (float)(i + 1);
+  float* dv = up(std::vector<float>(15, 0.0f));
+  CB(cublasSetVector(5, sizeof(float), hx.data(), 2, dv, 3));   // x[0], x[2], ... to dv[0], dv[3], ...
+  print("SetVector inc 2,3", down(dv, 15));
+  std::vector<float> back(5, -1.0f);
+  CB(cublasGetVector(5, sizeof(float), dv, 3, back.data(), 1));
+  print("GetVector inc 3,1", back);
+  // A 3 x 2 column-major matrix with leading dimension 4 on the host and 5 on the device.
+  std::vector<double> ha(8);
+  for (int i = 0; i < 8; ++i) ha[i] = 10.0 + i;
+  double* dm = up(std::vector<double>(10, 0.0));
+  CB(cublasSetMatrix(3, 2, sizeof(double), ha.data(), 4, dm, 5));
+  print("SetMatrix 3x2 ld 4,5", down(dm, 10));
+  std::vector<double> hb(6, -1.0);
+  CB(cublasGetMatrixAsync(3, 2, sizeof(double), dm, 5, hb.data(), 3, 0));
+  cudaStreamSynchronize(0);
+  print("GetMatrixAsync ld 5,3", hb);
+  printf("SetVector inc 0 -> %d\n", (int)cublasSetVector(5, sizeof(float), hx.data(), 0, dv, 1));
+  printf("SetMatrix ld < rows -> %d\n", (int)cublasSetMatrix(3, 2, sizeof(double), ha.data(), 2, dm, 5));
+  cudaFree(dv); cudaFree(dm);
+}
+
+int main() { run(); host_copies(); return 0; }

@@ -351,6 +351,68 @@ VGPU_EXPORT cublasStatus_t cublasGetStream_v2(cublasHandle_t handle, cudaStream_
   if (stream) *stream = reinterpret_cast<Handle*>(handle)->stream;
   return CUBLAS_STATUS_SUCCESS;
 }
+// ---- host <-> device copies: cublasSetVector, cublasGetMatrix and the rest ----
+//
+// The legacy helpers that move a strided vector or a column-major matrix
+// between host and device. Each is one cudaMemcpy2D: a vector's elements are
+// rows one element wide, a matrix's columns are rows `rows` elements wide.
+// qulacs moves its state vectors with them.
+namespace {
+cublasStatus_t copy_2d(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width,
+                       size_t height, cudaMemcpyKind kind, cudaStream_t stream, bool async) {
+  if (!width || !height) return CUBLAS_STATUS_SUCCESS;
+  const cudaError_t e = async ? cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, kind, stream)
+                              : cudaMemcpy2D(dst, dpitch, src, spitch, width, height, kind);
+  return e == cudaSuccess ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_MAPPING_ERROR;
+}
+cublasStatus_t copy_vector(int n, int elem, const void* x, int incx, void* y, int incy,
+                           cudaMemcpyKind kind, cudaStream_t stream = nullptr, bool async = false) {
+  if (incx <= 0 || incy <= 0 || elem <= 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (n <= 0) return CUBLAS_STATUS_SUCCESS;
+  return copy_2d(y, size_t(incy) * elem, x, size_t(incx) * elem, size_t(elem), size_t(n), kind, stream,
+                 async);
+}
+cublasStatus_t copy_matrix(int rows, int cols, int elem, const void* A, int lda, void* B, int ldb,
+                           cudaMemcpyKind kind, cudaStream_t stream = nullptr, bool async = false) {
+  if (rows < 0 || cols < 0 || elem <= 0 || lda <= 0 || ldb <= 0) return CUBLAS_STATUS_INVALID_VALUE;
+  // A leading dimension below `rows` is a pitch narrower than a row, which
+  // cudaMemcpy2D refuses; cuBLAS reports that as a mapping error, as here.
+  return copy_2d(B, size_t(ldb) * elem, A, size_t(lda) * elem, size_t(rows) * elem, size_t(cols), kind,
+                 stream, async);
+}
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasSetVector(int n, int elemSize, const void* x, int incx, void* y, int incy) {
+  return copy_vector(n, elemSize, x, incx, y, incy, cudaMemcpyHostToDevice);
+}
+VGPU_EXPORT cublasStatus_t cublasGetVector(int n, int elemSize, const void* x, int incx, void* y, int incy) {
+  return copy_vector(n, elemSize, x, incx, y, incy, cudaMemcpyDeviceToHost);
+}
+VGPU_EXPORT cublasStatus_t cublasSetMatrix(int rows, int cols, int elemSize, const void* A, int lda, void* B,
+                                           int ldb) {
+  return copy_matrix(rows, cols, elemSize, A, lda, B, ldb, cudaMemcpyHostToDevice);
+}
+VGPU_EXPORT cublasStatus_t cublasGetMatrix(int rows, int cols, int elemSize, const void* A, int lda, void* B,
+                                           int ldb) {
+  return copy_matrix(rows, cols, elemSize, A, lda, B, ldb, cudaMemcpyDeviceToHost);
+}
+VGPU_EXPORT cublasStatus_t cublasSetVectorAsync(int n, int elemSize, const void* x, int incx, void* y,
+                                                int incy, cudaStream_t stream) {
+  return copy_vector(n, elemSize, x, incx, y, incy, cudaMemcpyHostToDevice, stream, true);
+}
+VGPU_EXPORT cublasStatus_t cublasGetVectorAsync(int n, int elemSize, const void* x, int incx, void* y,
+                                                int incy, cudaStream_t stream) {
+  return copy_vector(n, elemSize, x, incx, y, incy, cudaMemcpyDeviceToHost, stream, true);
+}
+VGPU_EXPORT cublasStatus_t cublasSetMatrixAsync(int rows, int cols, int elemSize, const void* A, int lda,
+                                                void* B, int ldb, cudaStream_t stream) {
+  return copy_matrix(rows, cols, elemSize, A, lda, B, ldb, cudaMemcpyHostToDevice, stream, true);
+}
+VGPU_EXPORT cublasStatus_t cublasGetMatrixAsync(int rows, int cols, int elemSize, const void* A, int lda,
+                                                void* B, int ldb, cudaStream_t stream) {
+  return copy_matrix(rows, cols, elemSize, A, lda, B, ldb, cudaMemcpyDeviceToHost, stream, true);
+}
+
 VGPU_EXPORT cublasStatus_t cublasSetPointerMode_v2(cublasHandle_t handle, cublasPointerMode_t m) {
   if (!valid(handle)) return CUBLAS_STATUS_NOT_INITIALIZED;
   reinterpret_cast<Handle*>(handle)->pointer_mode = m;

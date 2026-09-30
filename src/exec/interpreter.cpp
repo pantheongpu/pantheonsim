@@ -1841,6 +1841,9 @@ class Interpreter {
   // ---- symbols / registers / operands ----
 
   uint64_t resolve_symbol(const BlockCtx& ctx, const Instr& ins, const std::string& name) {
+    // PTX's one predefined constant: nvcc emits `mov.u32 %r, WARP_SZ` for
+    // warpSize. It is the warp size of the device the kernel runs on.
+    if (name == "WARP_SZ") return W_;
     // .local/.shared variables name an offset within their address space, not
     // a generic address; cvta converts when the kernel needs a generic pointer.
     // A .shared one is in this block's part of the cluster's window.
