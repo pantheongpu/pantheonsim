@@ -168,12 +168,14 @@ const Format kGfx11[] = {
 
 }  // namespace
 
-Format from_code(uint32_t code, bool gfx11) {
+Format from_code(uint32_t code, Gen g) {
+  const bool gfx11 = g != Gen::Gfx10;
   const Format* t = gfx11 ? kGfx11 : kGfx10;
   const uint32_t n = gfx11 ? std::size(kGfx11) : std::size(kGfx10);
   return code < n ? t[code] : Format{};
 }
-uint32_t code(Format f, bool gfx11) {
+uint32_t code(Format f, Gen g) {
+  const bool gfx11 = g != Gen::Gfx10;
   const Format* t = gfx11 ? kGfx11 : kGfx10;
   const uint32_t n = gfx11 ? std::size(kGfx11) : std::size(kGfx10);
   for (uint32_t c = 1; c < n; ++c)
@@ -226,42 +228,69 @@ void write_texel(Format f, const uint32_t in[4], uint8_t* bytes) {
 
 // ---- The image resource (T#) ----------------------------------------------------
 //
-// word 0: the base address's bits 39:8. word 1: bits 47:40 [7:0]; the format's
-// code [28:20]; the width less one's
-// low two bits [31:30]. word 2: the rest of the width less one [13:0]; the
-// height less one [27:14] (where HIP's texture functions read it). word 3:
-// the four DST_SELs [11:0]; BASE_LEVEL [15:12], LAST_LEVEL [19:16]; the
-// tiling [24:20] (0, linear); TYPE [31:28]. word 4: the depth (or layers)
-// less one [12:0]; the pitch less one, in texels [26:13].
+// As ROCm's image runtime writes it (ROCR-Runtime's resource_nv.h,
+// resource_gfx11.h and resource_gfx12.h). word 0: the base address's bits
+// 39:8. word 1: bits 47:40 [7:0]; the format's code, [28:20] on gfx10,
+// [27:20] on gfx11, [24:17] on gfx12 (with BASE_LEVEL [29:25]); the width
+// less one's low two bits [31:30]. word 2: the rest of the width less one
+// [11:0] ([13:0] on gfx12); the height less one [27:14] ([29:14] on gfx12),
+// where HIP's texture functions read it. word 3: the four DST_SELs [11:0];
+// BASE_LEVEL [15:12] and LAST_LEVEL [19:16] (gfx12: LAST_LEVEL [19:15]);
+// the tiling [24:20] (0, linear); TYPE [31:28]. word 4 [13:0]: a 3D image's
+// depth less one, an array's last layer, or else the row pitch less one, in
+// texels.
 
-void encode(const Image& i, bool gfx11, uint32_t w[8]) {
+namespace {
+bool array_type(Type t) { return t == Type::Img1DArray || t == Type::Img2DArray || t == Type::Cube; }
+}  // namespace
+
+void encode(const Image& i, Gen g, uint32_t w[8]) {
   std::memset(w, 0, 8 * sizeof(uint32_t));
   const uint32_t wm1 = std::max(1u, i.width) - 1, hm1 = std::max(1u, i.height) - 1;
   const uint32_t pitch = i.pitch ? i.pitch : std::max(1u, i.width);
+  const uint32_t fmt = code(i.format, g);
   w[0] = static_cast<uint32_t>(i.base >> 8);
   w[1] = static_cast<uint32_t>(i.base >> 40) & 0xFF;
-  w[1] |= (code(i.format, gfx11) & 0x1FF) << 20;
   w[1] |= (wm1 & 3) << 30;
-  w[2] = (wm1 >> 2) & 0x3FFF;
-  w[2] |= (hm1 & 0x3FFF) << 14;
   for (int k = 0; k < 4; ++k) w[3] |= (static_cast<uint32_t>(i.sel[k]) & 7) << (3 * k);
-  w[3] |= (i.base_level & 0xF) << 12 | (i.last_level & 0xF) << 16;
   w[3] |= (static_cast<uint32_t>(i.type) & 0xF) << 28;
-  w[4] = ((std::max(1u, i.depth) - 1) & 0x1FFF) | ((pitch - 1) & 0x3FFF) << 13;
+  if (g == Gen::Gfx12) {
+    w[1] |= (fmt & 0xFF) << 17 | (i.base_level & 0x1F) << 25;
+    w[2] = ((wm1 >> 2) & 0x3FFF) | (hm1 & 0xFFFF) << 14;
+    w[3] |= (i.last_level & 0x1F) << 15;
+  } else {
+    w[1] |= (fmt & (g == Gen::Gfx10 ? 0x1FF : 0xFF)) << 20;
+    w[2] = ((wm1 >> 2) & 0xFFF) | (hm1 & 0x3FFF) << 14;
+    w[3] |= (i.base_level & 0xF) << 12 | (i.last_level & 0xF) << 16;
+  }
+  if (i.type == Type::Img3D || array_type(i.type)) w[4] = (std::max(1u, i.depth) - 1) & 0x1FFF;
+  else w[4] = (pitch - 1) & 0x3FFF;
 }
 
-Image decode_image(const uint32_t w[8], bool gfx11) {
+Image decode_image(const uint32_t w[8], Gen g) {
   Image i;
   i.base = uint64_t{w[0]} << 8 | uint64_t{w[1] & 0xFF} << 40;
-  i.format = from_code(bits(w[1], 28, 20), gfx11);
-  i.width = (bits(w[1], 31, 30) | bits(w[2], 13, 0) << 2) + 1;
-  i.height = bits(w[2], 27, 14) + 1;
   for (int k = 0; k < 4; ++k) i.sel[k] = static_cast<Sel>(bits(w[3], 3 * k + 2, 3 * k));
-  i.base_level = bits(w[3], 15, 12);
-  i.last_level = bits(w[3], 19, 16);
   i.type = static_cast<Type>(bits(w[3], 31, 28));
-  i.depth = bits(w[4], 12, 0) + 1;
-  i.pitch = bits(w[4], 26, 13) + 1;
+  if (g == Gen::Gfx12) {
+    i.format = from_code(bits(w[1], 24, 17), g);
+    i.base_level = bits(w[1], 29, 25);
+    i.width = (bits(w[1], 31, 30) | bits(w[2], 13, 0) << 2) + 1;
+    i.height = bits(w[2], 29, 14) + 1;
+    i.last_level = bits(w[3], 19, 15);
+  } else {
+    i.format = from_code(g == Gen::Gfx10 ? bits(w[1], 28, 20) : bits(w[1], 27, 20), g);
+    i.width = (bits(w[1], 31, 30) | bits(w[2], 11, 0) << 2) + 1;
+    i.height = bits(w[2], 27, 14) + 1;
+    i.base_level = bits(w[3], 15, 12);
+    i.last_level = bits(w[3], 19, 16);
+  }
+  if (i.type == Type::Img3D || array_type(i.type)) {
+    i.depth = bits(w[4], 12, 0) + 1;
+    i.pitch = i.width;
+  } else {
+    i.pitch = bits(w[4], 13, 0) + 1;
+  }
   return i;
 }
 
@@ -299,27 +328,36 @@ uint64_t image_bytes(const Image& i) {
 // ---- The sampler resource (S#) -------------------------------------------------
 //
 // word 0: CLAMP_X [2:0], CLAMP_Y [5:3], CLAMP_Z [8:6], FORCE_UNNORMALIZED
-// [15]. word 1: MIN_LOD [11:0], MAX_LOD [23:12] (unsigned 4.8). word 2:
-// LOD_BIAS [13:0] (signed 6.8), XY_MAG_FILTER [21:20], XY_MIN_FILTER
-// [23:22], MIP_FILTER [27:26]. word 3: BORDER_COLOR_TYPE [31:30].
+// [15], where HIP's texture functions read it. word 1: MIN_LOD [11:0],
+// MAX_LOD [23:12] (unsigned 4.8; on gfx12 [12:0] and [25:13]). word 2:
+// LOD_BIAS [13:0] (signed 6.8), XY_MAG_FILTER [21:20] (read by HIP's
+// texture functions too), XY_MIN_FILTER [23:22], MIP_FILTER [27:26]. word 3:
+// BORDER_COLOR_TYPE [31:30].
 
-void encode(const Sampler& s, uint32_t w[4]) {
+void encode(const Sampler& s, Gen g, uint32_t w[4]) {
   w[0] = w[1] = w[2] = w[3] = 0;
   for (int k = 0; k < 3; ++k) w[0] |= (static_cast<uint32_t>(s.clamp[k]) & 7) << (3 * k);
   if (s.unnormalized) w[0] |= 1u << 15;
-  const auto fixed = [](float v) { return static_cast<uint32_t>(std::clamp(v, 0.0f, 15.99f) * 256.0f) & 0xFFF; };
-  w[1] = fixed(s.min_lod) | fixed(s.max_lod) << 12;
+  const float top = g == Gen::Gfx12 ? 31.99f : 15.99f;
+  const uint32_t lod_mask = g == Gen::Gfx12 ? 0x1FFF : 0xFFF, max_at = g == Gen::Gfx12 ? 13 : 12;
+  const auto fixed = [&](float v) { return static_cast<uint32_t>(std::clamp(v, 0.0f, top) * 256.0f) & lod_mask; };
+  w[1] = fixed(s.min_lod) | fixed(s.max_lod) << max_at;
   w[2] = static_cast<uint32_t>(static_cast<int32_t>(std::clamp(s.lod_bias, -32.0f, 31.99f) * 256.0f)) & 0x3FFF;
   w[2] |= (s.mag_linear ? 1u : 0u) << 20 | (s.min_linear ? 1u : 0u) << 22 | (s.mip_filter & 3u) << 26;
   w[3] = (s.border & 3u) << 30;
 }
 
-Sampler decode_sampler(const uint32_t w[4]) {
+Sampler decode_sampler(const uint32_t w[4], Gen g) {
   Sampler s;
   for (int k = 0; k < 3; ++k) s.clamp[k] = static_cast<Clamp>(bits(w[0], 3 * k + 2, 3 * k));
   s.unnormalized = bits(w[0], 15, 15);
-  s.min_lod = static_cast<float>(bits(w[1], 11, 0)) / 256.0f;
-  s.max_lod = static_cast<float>(bits(w[1], 23, 12)) / 256.0f;
+  if (g == Gen::Gfx12) {
+    s.min_lod = static_cast<float>(bits(w[1], 12, 0)) / 256.0f;
+    s.max_lod = static_cast<float>(bits(w[1], 25, 13)) / 256.0f;
+  } else {
+    s.min_lod = static_cast<float>(bits(w[1], 11, 0)) / 256.0f;
+    s.max_lod = static_cast<float>(bits(w[1], 23, 12)) / 256.0f;
+  }
   s.lod_bias = static_cast<float>(static_cast<int32_t>(bits(w[2], 13, 0) << 18) >> 18) / 256.0f;
   s.mag_linear = bits(w[2], 21, 20) != 0;
   s.min_linear = bits(w[2], 23, 22) != 0;
@@ -332,19 +370,21 @@ Sampler decode_sampler(const uint32_t w[4]) {
 //
 // word 0: the base address's low bits; word 1: its high 16 [15:0], the
 // stride [29:16]; word 2: the number of records; word 3: the four DST_SELs
-// [11:0], the format's code [18:12],
-// OOB_SELECT [29:28] (0: an index is in range below the record count).
+// [11:0], the format's code [18:12] ([17:12] from gfx11), OOB_SELECT
+// [29:28] (0: an index is in range below the record count).
 
-void encode_buffer(uint64_t base, uint32_t stride, uint32_t records, Format format, bool gfx11, uint32_t w[4]) {
+void encode_buffer(uint64_t base, uint32_t stride, uint32_t records, Format format, Gen g, uint32_t w[4]) {
   w[0] = static_cast<uint32_t>(base);
   w[1] = static_cast<uint32_t>(base >> 32) & 0xFFFF;
   w[1] |= (stride & 0x3FFF) << 16;
   w[2] = records;
   w[3] = 4 | 5 << 3 | 6 << 6 | 7 << 9;   // x, y, z, w
-  w[3] |= (code(format, gfx11) & 0x7F) << 12;
+  w[3] |= (code(format, g) & (g == Gen::Gfx10 ? 0x7F : 0x3F)) << 12;
 }
 
-Format buffer_format(const uint32_t w[4], bool gfx11) { return from_code(bits(w[3], 18, 12), gfx11); }
+Format buffer_format(const uint32_t w[4], Gen g) {
+  return from_code(g == Gen::Gfx10 ? bits(w[3], 18, 12) : bits(w[3], 17, 12), g);
+}
 Sel buffer_sel(const uint32_t w[4], int channel) { return static_cast<Sel>(bits(w[3], 3 * channel + 2, 3 * channel)); }
 
 }  // namespace vgpu::amd::image
