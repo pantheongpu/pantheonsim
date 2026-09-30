@@ -1751,7 +1751,7 @@ hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
 
 hipError_t hipModuleLoad(hipModule_t* module, const char* path) {
   const ApiCall api("hipModuleLoad");
-  if (!path) return hipErrorInvalidValue;
+  if (!module || !path || !*path) return record(state(), hipErrorInvalidValue);
   std::ifstream in(path, std::ios::binary);
   if (!in) return fail(hipErrorFileNotFound, std::string("no code object at ") + path);
   const std::string bytes((std::istreambuf_iterator<char>(in)), {});
@@ -1762,6 +1762,7 @@ hipError_t hipModuleLoad(hipModule_t* module, const char* path) {
 hipError_t hipModuleUnload(hipModule_t module) {
   const ApiCall api("hipModuleUnload");
   State& s = state();
+  if (!module) return record(s, hipErrorInvalidResourceHandle);
   // Its kernels may still be queued or running: unloading waits for the device.
   if (s.rt) {
     int ordinal = 0;
@@ -1810,7 +1811,8 @@ hipError_t hipModuleGetGlobal(void** dptr, size_t* bytes, hipModule_t module, co
   const ApiCall api("hipModuleGetGlobal");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!module || !name) return record(s, hipErrorInvalidValue);
+  if (!module) return record(s, hipErrorInvalidResourceHandle);
+  if (!name || !*name || (!dptr && !bytes)) return record(s, hipErrorInvalidValue);
   Module* m = reinterpret_cast<Module*>(module);
   const vgpu::amd::GlobalVar* g = vgpu::amd::find_global(m->object, name);
   if (!g) return record(s, fail(hipErrorNotFound, std::string("the module has no variable named ") + name));
@@ -2409,6 +2411,18 @@ namespace {
 
 // What a device is, in the layout the HIP headers give it: what
 // hipGetDeviceProperties returns and hipDeviceGetAttribute answers from.
+// HIP's version of an AMD device is its gfx version's first two parts:
+// gfx942 is 9.4, gfx90a 9.0 ("gfx" + major + minor digit + stepping).
+void hip_version(const vgpu::DeviceProfile& p, int* major, int* minor) {
+  *major = p.cc_major;
+  *minor = p.cc_minor;
+  if (p.gcn_arch.size() >= 6 && p.gcn_arch.rfind("gfx", 0) == 0) {
+    const std::string digits = p.gcn_arch.substr(3);
+    *major = std::atoi(digits.substr(0, digits.size() - 2).c_str());
+    *minor = static_cast<int>(std::strtol(digits.substr(digits.size() - 2, 1).c_str(), nullptr, 16));
+  }
+}
+
 void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0600* props) {
   std::memset(props, 0, sizeof *props);
   std::snprintf(props->name, sizeof props->name, "%s", p.model.c_str());
@@ -2436,15 +2450,7 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   props->maxThreadsPerMultiProcessor = static_cast<int>(p.limits.max_threads_per_sm);
   props->maxBlocksPerMultiProcessor = static_cast<int>(p.limits.max_blocks_per_sm);
   props->l2CacheSize = static_cast<int>(p.limits.l2_cache_bytes);
-  // HIP's version of an AMD device is its gfx version's first two parts:
-  // gfx942 is 9.4, gfx90a 9.0 ("gfx" + major + minor digit + stepping).
-  props->major = p.cc_major;
-  props->minor = p.cc_minor;
-  if (p.gcn_arch.size() >= 6 && p.gcn_arch.rfind("gfx", 0) == 0) {
-    const std::string digits = p.gcn_arch.substr(3);
-    props->major = std::atoi(digits.substr(0, digits.size() - 2).c_str());
-    props->minor = static_cast<int>(std::strtol(digits.substr(digits.size() - 2, 1).c_str(), nullptr, 16));
-  }
+  hip_version(p, &props->major, &props->minor);
   // The PCI address rocm-smi and sysfs give the device (telemetry's
   // describe_device): a bus of its own, ordinal + 1, device 0. Two devices on
   // one bus looked to RCCL like one GPU twice.
@@ -3935,11 +3941,14 @@ hipError_t hipFuncGetAttribute(int* value, int attribute, hipFunction_t f) {
   const ApiCall api("hipFuncGetAttribute");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!value || !f) return record(s, hipErrorInvalidValue);
+  if (!value) return record(s, hipErrorInvalidValue);
+  if (!f) return record(s, hipErrorInvalidResourceHandle);
   vgpu::runtime::Device* d = device(s);
   if (!d) return record(s, hipErrorInvalidDevice);
   const Kernel& k = *reinterpret_cast<Function*>(f)->kernel;
   const vgpu::DeviceProfile& p = d->profile();
+  int major = 0, minor = 0;
+  hip_version(p, &major, &minor);
   switch (attribute) {
     case 0: *value = static_cast<int>(k.max_flat_workgroup_size ? k.max_flat_workgroup_size : 1024); break;
     case 1: *value = static_cast<int>(k.group_segment); break;                          // SHARED_SIZE_BYTES
@@ -3947,7 +3956,7 @@ hipError_t hipFuncGetAttribute(int* value, int attribute, hipFunction_t f) {
     case 3: *value = static_cast<int>(k.private_segment); break;                        // LOCAL_SIZE_BYTES
     case 4: *value = static_cast<int>(k.vgpr_count); break;                             // NUM_REGS
     case 5:                                                                             // PTX_VERSION
-    case 6: *value = p.cc_major * 10 + p.cc_minor; break;                               // BINARY_VERSION
+    case 6: *value = major * 10 + minor; break;                                         // BINARY_VERSION
     case 7: *value = 0; break;                                                          // CACHE_MODE_CA
     case 8: *value = static_cast<int>(p.limits.shared_mem_per_block - k.group_segment); break;
     case 9: *value = -1; break;                                                         // CARVEOUT: none preferred

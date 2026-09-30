@@ -299,6 +299,15 @@ echo "$out" | sed 's/^/      /'
 expect "the exports program runs to the end" "0" "$status"
 expect "every one of its export checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# Modules (hipcc/modules.cpp): generic code (gfx9-4-generic) loaded and run on
+# gfx942, and the module calls' answers to hip-tests' negative cases.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" timeout 300 \
+      "$(dirname "$exe")/modules.gfx942" "$(dirname "$exe")/modules_kernel.generic.co" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the modules program runs to the end" "0" "$status"
+expect "every one of its module checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # Events shared between processes (hipcc/ipc.cpp): an interprocess event's
 # handle opened in a process it forks, whose wait waits for the record made
 # here.

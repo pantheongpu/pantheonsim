@@ -83,9 +83,40 @@ std::string target_of(const Entry& e) {
 }
 std::string processor(const std::string& target) { return target.substr(0, target.find(':')); }
 
+// The generic processor whose code a processor runs, as LLVM's AMDGPU
+// backend defines the families (AMDGPUUsage, "Generic Processor Versioning"):
+// code built for gfx9-4-generic runs on gfx940, gfx941, gfx942 and gfx950.
+// Empty for a processor in no family.
+std::string generic_of(const std::string& proc) {
+  static const struct {
+    const char* generic;
+    const char* members[9];
+  } kFamilies[] = {
+      {"gfx9-generic", {"gfx900", "gfx902", "gfx904", "gfx906", "gfx909", "gfx90c"}},
+      {"gfx9-4-generic", {"gfx940", "gfx941", "gfx942", "gfx950"}},
+      {"gfx10-1-generic", {"gfx1010", "gfx1011", "gfx1012", "gfx1013"}},
+      {"gfx10-3-generic", {"gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036"}},
+      {"gfx11-generic", {"gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153"}},
+      {"gfx12-generic", {"gfx1200", "gfx1201"}},
+  };
+  for (const auto& f : kFamilies)
+    for (const char* m : f.members)
+      if (m && proc == m) return f.generic;
+  return {};
+}
+
+// How well code built for `target` fits `device`'s processor: 2 for the
+// processor itself, 1 for its generic family, 0 for neither.
+int fit(const std::string& target, const std::string& device) {
+  const std::string t = processor(target), d = processor(device);
+  if (t == d) return 2;
+  const std::string g = generic_of(d);
+  return !g.empty() && t == g ? 1 : 0;
+}
+
 // Whether a bundle read for `device` keeps this entry's code.
 bool kept(const std::string& target, const std::string& device) {
-  return !target.empty() && (device.empty() || processor(target) == processor(device));
+  return !target.empty() && (device.empty() || fit(target, device) > 0);
 }
 
 // The compressed header, by format version: the magic, the version and the
@@ -266,21 +297,25 @@ std::unique_ptr<Bundle> read_bundle(const uint8_t* b, const std::string& device)
   return out;
 }
 
+// The device's own processor's code ahead of its generic family's, and of
+// either, the one naming the most of the device's features.
 const std::string_view* code_for(const Bundle& bundle, const std::string& device) {
-  const std::string bare = device.substr(0, device.find(':'));
   const std::string_view* best = nullptr;
   size_t named = 0;
+  int best_fit = 0;
   for (const auto& [target, code] : bundle.targets) {
-    if (target.substr(0, target.find(':')) != bare) continue;
+    const int f = fit(target, device);
+    if (!f) continue;
     bool fits = true;
     size_t n = 0;
     for (size_t colon = target.find(':'); colon != std::string::npos; colon = target.find(':', colon + 1), ++n) {
       const std::string feature = target.substr(colon, target.find(':', colon + 1) - colon);   // ":xnack-"
       if ((device + ":").find(feature + ":") == std::string::npos) fits = false;
     }
-    if (fits && (!best || n > named)) {
+    if (fits && (!best || f > best_fit || (f == best_fit && n > named))) {
       best = &code;
       named = n;
+      best_fit = f;
     }
   }
   return best;
