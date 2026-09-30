@@ -6492,4 +6492,46 @@ DONE:
   }
 }
 
+// Lane 0 loops long enough to count as starved, then writes a word; lanes
+// 1-31 wait at bar.warp.sync (__syncwarp) and read it. cooperative_groups'
+// multi-warp tiles are this shape. A starved path gets to run ahead, and it
+// used to run straight past bar.warp.sync without lane 0 and read the word
+// before it was written.
+VTEST(bar_warp_sync_waits_for_its_lanes_even_after_a_long_wait) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<4>;
+    .shared .align 4 .b32 word;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    setp.ne.u32 %p1, %r1, 0;
+    @%p1 bra WAIT;
+    mov.u32 %r3, 0;
+LOOP:
+    add.u32 %r3, %r3, 1;
+    setp.lt.u32 %p2, %r3, 3000;
+    @%p2 bra LOOP;
+    st.volatile.shared.u32 [word], %r3;
+WAIT:
+    bar.warp.sync -1;
+    ld.volatile.shared.u32 %r2, [word];
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint64_t lane = 0; lane < 32; ++lane) VCHECK_EQ(e.mem.load_scalar(out + lane * 4, 4), uint64_t{3000});
+}
+
 VTEST_MAIN

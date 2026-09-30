@@ -227,11 +227,12 @@ enum class ShflMode { Up, Down, Bfly, Idx };
 struct OpShfl { ShflMode mode; Reg dst; Reg pred_dst; Operand a, b, c, member_mask; };
 // Warp vote/ballot across the active mask.
 enum class VoteMode { All, Any, Uni, Ballot };
-struct OpVote { VoteMode mode = VoteMode::All; bool ballot = false; Reg dst; Reg src; bool negate_src = false; };
+struct OpVote { VoteMode mode = VoteMode::All; bool ballot = false; Reg dst; Reg src; bool negate_src = false;
+                bool has_members = false; Operand members; };  // vote.sync's membermask
 // redux.sync.<op>.<type> d, a, membermask -- reduce a across the participating
 // lanes of the warp and give every one of them the result.
 enum class ReduxOp { Add, Min, Max, And, Or, Xor };
-struct OpRedux { ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand src; };
+struct OpRedux { ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand src; Operand members; };
 // cvt.rn.f16x2.f32 d, a, b -- convert two f32 and pack them into one register,
 // a in the high half and b in the low half.
 struct OpCvtF16x2 { Reg dst; Operand a, b; bool bf16 = false; };
