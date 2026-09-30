@@ -33,8 +33,8 @@ __attribute__((amdgpu_kernel)) void kept(const int* in, int* out, int n) {
   int t = __builtin_amdgcn_workitem_id_x();
   out[t] = __builtin_amdgcn_update_dpp(-1, in[t], 0x111, 0xf, 0xf, 0);
 }
-// across the whole wave rather than within a row: the one form of this that
-// nothing here pins down, so it is decoded and refused rather than guessed
+// across the whole wave rather than within a row, with the lane past the
+// end, which has nothing to read, given zero
 __attribute__((amdgpu_kernel)) void across(const int* in, int* out, int n) {
   int t = __builtin_amdgcn_workitem_id_x();
   out[t] = __builtin_amdgcn_update_dpp(0, in[t], 0x130, 0xf, 0xf, 1);

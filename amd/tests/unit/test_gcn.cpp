@@ -103,6 +103,9 @@ VTEST(every_instruction_decodes_as_the_assembler_wrote_it) {
     check_against_assembler("asm_logic.gfx942.o", "asm_logic.gfx942.dis");
     check_against_assembler("asm_atomics.gfx942.o", "asm_atomics.gfx942.dis");
     check_against_assembler("asm_bcast.gfx942.o", "asm_bcast.gfx942.dis");
+    // What hip-tests' device library runs beyond those: dot products, fract,
+    // clamped integer adds, whole-wave DPP, increment and decrement atomics.
+    check_against_assembler("asm_isa_gaps.gfx942.o", "asm_isa_gaps.gfx942.dis");
     // And the hand-written kernels the executor's tests run, instruction by
     // instruction, so a decoder change that misreads one shows up here too.
     for (const char* name : {"asm_sopk", "asm_scalar", "asm_memory", "asm_vector"})
