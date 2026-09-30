@@ -62,6 +62,11 @@ echo "wrote $(pwd)/graphs.gfx942"
 "$rocm/bin/hipcc" -O2 --genco --offload-arch=gfx942 exports_kernel.cpp -o exports_kernel.gfx942.co
 "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 exports.cpp -o exports.gfx942
 echo "wrote $(pwd)/exports.gfx942 and exports_kernel.gfx942.co"
+# Modules: a code object built for gfx9-4-generic only, which gfx942 runs as
+# a member of that family, and the program that loads it.
+"$rocm/bin/hipcc" -O2 --genco --offload-arch=gfx9-4-generic modules_kernel.cpp -o modules_kernel.generic.co
+"$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 modules.cpp -o modules.gfx942
+echo "wrote $(pwd)/modules.gfx942 and modules_kernel.generic.co"
 # Events shared with another process, which it forks for.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 ipc.cpp -o ipc.gfx942
 echo "wrote $(pwd)/ipc.gfx942"

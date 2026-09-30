@@ -90,6 +90,12 @@ raw = open("bundle.bin", "rb").read()
 packed = zlib.compress(raw, 9)
 head = b"CCOB" + struct.pack("<HHII", 2, 0, 24 + len(packed), len(raw)) + hashlib.md5(raw).digest()[:8]
 open("bundle_zlib.bin", "wb").write(head + packed)'
+  # A bundle with generic code as well as a processor's own: gfx9-4-generic
+  # (asm_sopk) and gfx942 with XNACK off (asm_vector), compressed.
+  targets=host-x86_64-unknown-linux-gnu,hipv4-amdgcn-amd-amdhsa--gfx9-4-generic
+  targets=$targets,hipv4-amdgcn-amd-amdhsa--gfx942:xnack-
+  "$bundler" --type=o --targets=$targets --input=/dev/null --input=asm_sopk.gfx942.o --input=asm_vector.gfx942.o \
+    --output=bundle_generic.bin --compress
   "$lld" -shared asm_scalar.gfx942.o asm_vector.gfx942.o -o linked.gfx942.hsaco
   # And the kernels an HSA program loads (amd/tests/hsa), linked as ROCm's
   # loader wants them.

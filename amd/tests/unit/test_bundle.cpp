@@ -85,6 +85,28 @@ VTEST(a_bundle_read_for_a_device_keeps_only_that_processors_code) {
   }
 }
 
+// Code built for a generic processor runs on each member of its family, as
+// LLVM defines them: gfx9-4-generic on gfx940, gfx941, gfx942 and gfx950. A
+// processor's own code comes first, where its features fit.
+VTEST(a_device_runs_its_familys_generic_code_when_the_bundle_has_none_of_its_own) {
+  const std::string raw = file("bundle_generic.bin");
+  const std::unique_ptr<amd::Bundle> b = amd::read_bundle(bytes(raw));
+  VCHECK_EQ(amd::target_list(*b), std::string("gfx9-4-generic, gfx942:xnack-"));
+  const auto chosen = [&](const std::unique_ptr<amd::Bundle>& from, const std::string& device) -> std::string {
+    const std::string_view* code = amd::code_for(*from, device);
+    return code ? std::string(*code) : std::string("none");
+  };
+  VCHECK(chosen(b, "gfx942:sramecc+:xnack-") == file("asm_vector.gfx942.o"));   // its own
+  VCHECK(chosen(b, "gfx942:sramecc+:xnack+") == file("asm_sopk.gfx942.o"));     // its own does not fit
+  VCHECK(chosen(b, "gfx950:sramecc+:xnack-") == file("asm_sopk.gfx942.o"));     // the family's
+  VCHECK_EQ(chosen(b, "gfx90a:sramecc+:xnack-"), std::string("none"));          // in no family here
+  VCHECK_EQ(chosen(b, "gfx1100"), std::string("none"));
+  // Read for a device, the family's code is kept too.
+  const std::unique_ptr<amd::Bundle> for950 = amd::read_bundle(bytes(raw), "gfx950:sramecc+:xnack-");
+  VCHECK_EQ(for950->targets.size(), size_t{1});
+  VCHECK(chosen(for950, "gfx950:sramecc+:xnack-") == file("asm_sopk.gfx942.o"));
+}
+
 // A compressed bundle cut short, or one whose header claims more than it
 // inflates to, is refused rather than read as far as it goes.
 VTEST(a_damaged_compressed_bundle_is_refused) {

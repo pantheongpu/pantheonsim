@@ -1,0 +1,94 @@
+// Modules as ROCm's HIP answers them: a bundle carrying only generic code
+// (gfx9-4-generic) loads and runs on gfx942, and the module calls answer
+// hip-tests' negative cases (ModuleTest) as ROCm does. Each check prints
+// "ok <what>" or "FAIL <what>: <why>", and the last line counts them. Built by
+// build.sh with hipcc, with modules_kernel.generic.co beside it; run by
+// amd/tests/e2e/run_hipcc.sh.
+#include <hip/hip_runtime.h>
+
+#include <cstdio>
+#include <fstream>
+#include <iterator>
+#include <string>
+#include <vector>
+
+static int checks = 0, failures = 0;
+static void check(bool ok, const char* what, const std::string& why = "") {
+  ++checks;
+  if (ok) {
+    std::printf("ok    %s\n", what);
+  } else {
+    ++failures;
+    std::printf("FAIL  %s%s%s\n", what, why.empty() ? "" : ": ", why.c_str());
+  }
+}
+static std::string err(hipError_t e) { return hipGetErrorName(e); }
+#define EXPECT(call, want, what) \
+  do { \
+    const hipError_t got_ = (call); \
+    check(got_ == (want), what, "got " + err(got_) + ", want " + err(want)); \
+  } while (0)
+
+int main(int argc, char** argv) {
+  if (argc < 2) {
+    std::fprintf(stderr, "usage: modules <modules_kernel.generic.co>\n");
+    return 2;
+  }
+  const char* path = argv[1];
+  (void)hipFree(nullptr);
+
+  // Generic code: the bundle names gfx9-4-generic and nothing else.
+  hipModule_t m = nullptr;
+  EXPECT(hipModuleLoad(&m, path), hipSuccess, "a gfx9-4-generic code object loads on gfx942");
+  hipFunction_t f = nullptr;
+  EXPECT(hipModuleGetFunction(&f, m, "scale"), hipSuccess, "its kernel is found");
+  const int n = 256;
+  std::vector<int> host(n, 3);
+  int* d = nullptr;
+  (void)hipMalloc(&d, n * sizeof(int));
+  (void)hipMemcpy(d, host.data(), n * sizeof(int), hipMemcpyHostToDevice);
+  int count = n;
+  void* args[] = {&d, &count};
+  EXPECT(hipModuleLaunchKernel(f, n / 64, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr), hipSuccess,
+         "and launches");
+  (void)hipMemcpy(host.data(), d, n * sizeof(int), hipMemcpyDeviceToHost);
+  check(host[0] == 21 && host[n - 1] == 21, "and runs, reading its global", std::to_string(host[0]));
+
+  hipDeviceptr_t global = nullptr;
+  size_t bytes = 0;
+  EXPECT(hipModuleGetGlobal(&global, &bytes, m, "int_var"), hipSuccess, "its global is found");
+  check(bytes == sizeof(int), "the global's size", std::to_string(bytes));
+  EXPECT(hipModuleGetGlobal(&global, &bytes, nullptr, "int_var"), hipErrorInvalidResourceHandle,
+         "a global of no module");
+  EXPECT(hipModuleGetGlobal(&global, &bytes, m, ""), hipErrorInvalidValue, "a global with an empty name");
+  EXPECT(hipModuleGetGlobal(nullptr, nullptr, m, "int_var"), hipErrorInvalidValue,
+         "a global asked for with nowhere to put it");
+  EXPECT(hipModuleGetGlobal(&global, &bytes, m, "dummy"), hipErrorNotFound, "a global that is not there");
+
+  // What hipFuncGetAttribute says of a module's kernel: the device's version.
+  int value = 0, major = 0, minor = 0;
+  (void)hipDeviceGetAttribute(&major, hipDeviceAttributeComputeCapabilityMajor, 0);
+  (void)hipDeviceGetAttribute(&minor, hipDeviceAttributeComputeCapabilityMinor, 0);
+  EXPECT(hipFuncGetAttribute(&value, HIP_FUNC_ATTRIBUTE_BINARY_VERSION, f), hipSuccess, "a kernel's binary version");
+  check(value == major * 10 + minor && value == 94, "is the device's, 9.4", std::to_string(value));
+  EXPECT(hipFuncGetAttribute(&value, HIP_FUNC_ATTRIBUTE_PTX_VERSION, f), hipSuccess, "its PTX version");
+  check(value > 0, "is set", std::to_string(value));
+  EXPECT(hipFuncGetAttribute(nullptr, HIP_FUNC_ATTRIBUTE_BINARY_VERSION, f), hipErrorInvalidValue,
+         "an attribute with nowhere to put it");
+  EXPECT(hipFuncGetAttribute(&value, HIP_FUNC_ATTRIBUTE_BINARY_VERSION, nullptr), hipErrorInvalidResourceHandle,
+         "an attribute of no function");
+
+  // Loading and unloading.
+  hipModule_t other = nullptr;
+  EXPECT(hipModuleLoad(nullptr, path), hipErrorInvalidValue, "a load with nowhere to put the module");
+  EXPECT(hipModuleLoad(&other, nullptr), hipErrorInvalidValue, "a load of no file");
+  EXPECT(hipModuleLoad(&other, ""), hipErrorInvalidValue, "a load of an empty file name");
+  EXPECT(hipModuleLoad(&other, "no such file"), hipErrorFileNotFound, "a load of a file that is not there");
+  EXPECT(hipModuleUnload(nullptr), hipErrorInvalidResourceHandle, "an unload of no module");
+  EXPECT(hipModuleUnload(m), hipSuccess, "an unload");
+  EXPECT(hipModuleUnload(m), hipErrorNotFound, "the same module unloaded twice");
+
+  (void)hipFree(d);
+  std::printf("modules: %d checks, %d failed\n", checks, failures);
+  return failures ? 1 : 0;
+}
