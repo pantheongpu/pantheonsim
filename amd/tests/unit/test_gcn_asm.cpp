@@ -800,6 +800,7 @@ VTEST(the_real_time_clock_counts_at_the_wall_clock_rate) {
 VTEST(rdna_images_load_store_sample_gather_and_query_what_their_resources_describe) {
   namespace im = amd::image;
   const amd::CodeObject o = object("asm_images", "gfx1100");
+  constexpr im::Gen G = im::Gen::Gfx11;
   MemoryManager mem(16ull << 20);
   const auto t0 = [](int64_t x, int64_t y) {
     x = std::clamp<int64_t>(x, 0, 7), y = std::clamp<int64_t>(y, 0, 3);
@@ -831,28 +832,28 @@ VTEST(rdna_images_load_store_sample_gather_and_query_what_their_resources_descri
   uint32_t desc[48] = {};
   im::Image i0;
   i0.base = d0, i0.width = 8, i0.height = 4, i0.format = {im::Data::D32, im::Num::Float};
-  im::encode(i0, true, &desc[0]);
+  im::encode(i0, G, &desc[0]);
   im::Image i1;
   i1.base = d1, i1.width = 4, i1.height = 2, i1.format = {im::Data::D8_8_8_8, im::Num::Unorm};
-  im::encode(i1, true, &desc[8]);
+  im::encode(i1, G, &desc[8]);
   im::Image i2 = i0;
   i2.base = d2, i2.format = {im::Data::D32, im::Num::Uint};
-  im::encode(i2, true, &desc[16]);
+  im::encode(i2, G, &desc[16]);
   im::Sampler point, linear, mip;
-  im::encode(point, &desc[24]);
+  im::encode(point, G, &desc[24]);
   linear.mag_linear = linear.min_linear = true;
-  im::encode(linear, &desc[28]);
-  im::encode_buffer(db, 4, 32, {im::Data::D8_8_8_8, im::Num::Unorm}, true, &desc[32]);
+  im::encode(linear, G, &desc[28]);
+  im::encode_buffer(db, 4, 32, {im::Data::D8_8_8_8, im::Num::Unorm}, G, &desc[32]);
   im::Image i3;
   i3.base = d3, i3.width = 4, i3.height = 4, i3.last_level = 1, i3.format = {im::Data::D32, im::Num::Float};
-  im::encode(i3, true, &desc[36]);
+  im::encode(i3, G, &desc[36]);
   mip.mip_filter = 2;
-  im::encode(mip, &desc[44]);
+  im::encode(mip, G, &desc[44]);
   // The resources round-trip, and T3's level 1 sits right after level 0.
-  VCHECK_EQ(im::decode_image(&desc[8], true).width, 4u);
-  VCHECK(im::decode_image(&desc[8], true).format.data == im::Data::D8_8_8_8);
+  VCHECK_EQ(im::decode_image(&desc[8], G).width, 4u);
+  VCHECK(im::decode_image(&desc[8], G).format.data == im::Data::D8_8_8_8);
   VCHECK_EQ(im::texel_offset(i3, 1, 0, 0, 0), uint64_t{64});
-  VCHECK(im::decode_sampler(&desc[28]).mag_linear);
+  VCHECK(im::decode_sampler(&desc[28], G).mag_linear);
   const uint64_t ddesc = mem.alloc(sizeof(desc)), out = mem.alloc(800 * 4);
   mem.write(ddesc, desc, sizeof(desc));
 

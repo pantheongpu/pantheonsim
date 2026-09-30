@@ -4028,6 +4028,10 @@ struct Machine {
     for (int k = 0; k < 4; ++k) out[k] = as_bits(static_cast<float>(acc[k]));
   }
 
+  static image::Gen image_gen(gcn::Target t) {
+    return t == gcn::Target::Gfx1030 ? image::Gen::Gfx10 : t == gcn::Target::Gfx1100 ? image::Gen::Gfx11 : image::Gen::Gfx12;
+  }
+
   void image_access(Wave& w, const Inst& in) {
     if (!w.exec) return;
     const std::string& name = in.name;
@@ -4040,13 +4044,13 @@ struct Machine {
     const Operand& rsrc = in.src[1 + naddr];
     uint32_t t[8] = {};
     for (uint32_t k = 0; k < rsrc.width && k < 8; ++k) t[k] = w.sgpr[rsrc.index + k];
-    const image::Image img = image::decode_image(t, in.arch != gcn::Target::Gfx1030);
+    const image::Image img = image::decode_image(t, image_gen(in.arch));
     image::Sampler smp;
     if (sample) {
       const Operand& so = in.src[2 + naddr];
       uint32_t sw[4];
       for (uint32_t k = 0; k < 4; ++k) sw[k] = w.sgpr[so.index + k];
-      smp = image::decode_sampler(sw);
+      smp = image::decode_sampler(sw, image_gen(in.arch));
     }
     if (!resinfo && image::texel_bytes(img.format) == 0)
       throw Error::make(Err::Unsupported, name, " of an image whose format this does not read (data format ",
@@ -4274,7 +4278,11 @@ struct Machine {
         const uint32_t level = img.base_level + rel;
         const double lw = image::level_width(img, level), lh = image::level_height(img, level),
                      ld = image::level_depth(img, level);
-        const double tu = unnorm ? u : u * lw, tv = unnorm ? vv : vv * lh, tr = unnorm ? r : r * ld;
+        // In texels, kept to the 1/256 of a texel the hardware keeps: a
+        // coordinate HIP rounds to a texel's edge (floor(x * w) / w, for
+        // point sampling) lands on that edge, not a hair before it.
+        const auto snap = [](double t) { return std::round(t * 256.0) / 256.0; };
+        const double tu = snap(unnorm ? u : u * lw), tv = snap(unnorm ? vv : vv * lh), tr = snap(unnorm ? r : r * ld);
         if (gather) {
           // The four texels bilinear filtering would weigh, one channel of
           // each: (x0, y1), (x1, y1), (x1, y0), (x0, y0).
@@ -4415,10 +4423,10 @@ struct Machine {
     const bool formatted = body.rfind("load_format_", 0) == 0 || body.rfind("store_format_", 0) == 0;
     if (formatted) {
       if (in.enc == gcn::Enc::Mtbuf) {
-        format = image::from_code(in.format, in.arch != gcn::Target::Gfx1030);
+        format = image::from_code(in.format, image_gen(in.arch));
       } else if (rdna) {
         const uint32_t words[4] = {w.sgpr[rsrc.index], d1, records, d3};
-        format = image::buffer_format(words, in.arch != gcn::Target::Gfx1030);
+        format = image::buffer_format(words, image_gen(in.arch));
       } else {   // gfx9's two fields: NUM_FORMAT [14:12], DATA_FORMAT [18:15]
         format.data = static_cast<image::Data>((d3 >> 15) & 0xF);
         format.num = static_cast<image::Num>((d3 >> 12) & 7);
