@@ -287,9 +287,33 @@ struct Machine {
   // bytes to a word from wherever the string starts. One that is aligned is a
   // single access; one that is not is its bytes. An atomic still has to be
   // aligned, as the hardware requires, and goes to memory directly.
+  // Where an aligned word or pair starts inside an allocation and runs past
+  // its end, how many of its bytes are the allocation's; 0 otherwise.
+  // Compilers make an atomic on one or two bytes (a short, a half) as a
+  // word-wide compare-and-swap on the aligned word that holds them, after a
+  // word-wide load of it. A card, whose allocations are whole pages, takes
+  // that; here the rest of the word reads as zero and is not written. Any
+  // other access past the end is still refused.
+  static uint32_t word_tail(const MemoryManager& m, uint64_t addr, uint32_t size) {
+    if ((size != 4 && size != 8) || addr % size) return 0;
+    uint64_t base = 0, bytes = 0;
+    if (!m.find_allocation(addr, &base, &bytes)) return 0;
+    const uint64_t left = base + bytes - addr;
+    return left < size ? static_cast<uint32_t>(left) : 0;
+  }
   uint64_t load(uint64_t addr, uint32_t size) const {
     MemoryManager& m = at(addr);
-    if (addr % size == 0) return m.load_scalar(addr, size);
+    if (addr % size == 0) {
+      try {
+        return m.load_scalar(addr, size);
+      } catch (...) {
+        const uint32_t valid = word_tail(m, addr, size);
+        if (!valid) throw;
+        uint64_t v = 0;
+        m.read(addr, &v, valid);
+        return v;
+      }
+    }
     uint64_t v = 0;
     for (uint32_t b = 0; b < size; ++b) v |= m.load_scalar(addr + b, 1) << (8 * b);
     return v;
@@ -4185,9 +4209,29 @@ struct Machine {
       return before;
     }
     const auto guard = atomic_guard(addr);
-    const uint64_t before = m.load_scalar(addr, a.bytes);
+    uint64_t before = 0;
+    uint32_t valid = a.bytes;   // fewer on the last word of an allocation (word_tail)
+    try {
+      before = m.load_scalar(addr, a.bytes);
+    } catch (...) {
+      valid = word_tail(m, addr, a.bytes);
+      if (!valid) throw;
+      m.read(addr, &before, valid);
+    }
     const uint64_t after = atomic_result(a, before, v, expected);
-    if (after != before) m.store_scalar(addr, a.bytes, after);
+    if (after != before) {
+      if (valid == a.bytes) {
+        try {
+          m.store_scalar(addr, a.bytes, after);
+        } catch (...) {
+          valid = word_tail(m, addr, a.bytes);
+          if (!valid) throw;
+          m.write(addr, &after, valid);
+        }
+      } else {
+        m.write(addr, &after, valid);
+      }
+    }
     return before;
   }
 
