@@ -275,6 +275,11 @@ hip_4.3 {
     hipDestroyExternalSemaphore;
     hipDrvMemcpy2DUnaligned;
     hipExternalMemoryGetMappedBuffer;
+    hipGraphAddKernelNode;
+    hipGraphAddMemcpyNode;
+    hipGraphAddMemcpyNode1D;
+    hipGraphAddMemsetNode;
+    hipGraphCreate;
     hipGraphDestroy;
     hipGraphExecDestroy;
     hipGraphInstantiate;
@@ -291,7 +296,16 @@ hip_4.3 {
 hip_4.4 {
   global:
     hipGraphAddDependencies;
+    hipGraphAddEmptyNode;
+    hipGraphExecKernelNodeSetParams;
     hipGraphGetNodes;
+    hipGraphGetRootNodes;
+    hipGraphKernelNodeGetParams;
+    hipGraphKernelNodeSetParams;
+    hipGraphMemcpyNodeGetParams;
+    hipGraphMemcpyNodeSetParams;
+    hipGraphMemsetNodeGetParams;
+    hipGraphMemsetNodeSetParams;
     hipStreamWaitValue32;
     hipStreamWaitValue64;
     hipStreamWriteValue32;
@@ -302,10 +316,41 @@ hip_4.5 {
     hipDeviceGetGraphMemAttribute;
     hipDeviceGraphMemTrim;
     hipDeviceSetGraphMemAttribute;
+    hipGraphAddChildGraphNode;
     hipGraphAddEventRecordNode;
+    hipGraphAddEventWaitNode;
     hipGraphAddHostNode;
+    hipGraphAddMemcpyNodeFromSymbol;
+    hipGraphAddMemcpyNodeToSymbol;
+    hipGraphChildGraphNodeGetGraph;
+    hipGraphClone;
+    hipGraphDestroyNode;
+    hipGraphEventRecordNodeGetEvent;
+    hipGraphEventRecordNodeSetEvent;
+    hipGraphEventWaitNodeGetEvent;
+    hipGraphEventWaitNodeSetEvent;
+    hipGraphExecChildGraphNodeSetParams;
+    hipGraphExecEventRecordNodeSetEvent;
+    hipGraphExecEventWaitNodeSetEvent;
+    hipGraphExecHostNodeSetParams;
+    hipGraphExecMemcpyNodeSetParams;
+    hipGraphExecMemcpyNodeSetParams1D;
+    hipGraphExecMemcpyNodeSetParamsFromSymbol;
+    hipGraphExecMemcpyNodeSetParamsToSymbol;
+    hipGraphExecMemsetNodeSetParams;
+    hipGraphExecUpdate;
+    hipGraphGetEdges;
+    hipGraphHostNodeGetParams;
+    hipGraphHostNodeSetParams;
     hipGraphInstantiateWithFlags;
+    hipGraphMemcpyNodeSetParams1D;
+    hipGraphMemcpyNodeSetParamsFromSymbol;
+    hipGraphMemcpyNodeSetParamsToSymbol;
+    hipGraphNodeFindInClone;
     hipGraphNodeGetDependencies;
+    hipGraphNodeGetDependentNodes;
+    hipGraphNodeGetType;
+    hipGraphRemoveDependencies;
     hipGraphicsSubResourceGetMappedArray;
     hipStreamGetCaptureInfo;
     hipStreamGetCaptureInfo_v2;
@@ -314,6 +359,8 @@ hip_4.5 {
 hip_5.0 {
   global:
     hipDrvPointerGetAttributes;
+    hipGraphKernelNodeGetAttribute;
+    hipGraphKernelNodeSetAttribute;
     hipPointerGetAttribute;
     hipThreadExchangeStreamCaptureMode;
 } hip_4.5;
@@ -379,9 +426,22 @@ hip_5.3 {
     hipDeviceSetLimit;
     hipDrvGetErrorName;
     hipDrvGetErrorString;
+    hipGraphAddExternalSemaphoresSignalNode;
+    hipGraphAddExternalSemaphoresWaitNode;
     hipGraphDebugDotPrint;
+    hipGraphExecExternalSemaphoresSignalNodeSetParams;
+    hipGraphExecExternalSemaphoresWaitNodeSetParams;
+    hipGraphExternalSemaphoresSignalNodeGetParams;
+    hipGraphExternalSemaphoresSignalNodeSetParams;
+    hipGraphExternalSemaphoresWaitNodeGetParams;
+    hipGraphExternalSemaphoresWaitNodeSetParams;
+    hipGraphKernelNodeCopyAttributes;
     hipGraphLaunch_spt;
+    hipGraphNodeGetEnabled;
+    hipGraphNodeSetEnabled;
+    hipGraphReleaseUserObject;
     hipGraphRetainUserObject;
+    hipGraphUpload;
     hipLaunchHostFunc;
     hipLaunchHostFunc_spt;
     hipMemcpy2DAsync_spt;
@@ -401,9 +461,16 @@ hip_5.3 {
     hipStreamGetCaptureInfo_v2_spt;
     hipStreamIsCapturing_spt;
     hipUserObjectCreate;
+    hipUserObjectRelease;
+    hipUserObjectRetain;
 } hip_5.2;
 hip_5.5 {
   global:
+    hipGraphAddMemAllocNode;
+    hipGraphAddMemFreeNode;
+    hipGraphAddNode;
+    hipGraphMemAllocNodeGetParams;
+    hipGraphMemFreeNodeGetParams;
     hipModuleLaunchCooperativeKernel;
     hipModuleLaunchCooperativeKernelMultiDevice;
 } hip_5.3;
@@ -412,20 +479,32 @@ hip_5.6 {
     hipArray3DGetDescriptor;
     hipArrayGetDescriptor;
     hipArrayGetInfo;
+    hipDrvGraphAddMemcpyNode;
+    hipDrvGraphAddMemsetNode;
 } hip_5.5;
 hip_6.0 {
   global:
     hipChooseDeviceR0600;
+    hipDrvGraphMemcpyNodeGetParams;
+    hipDrvGraphMemcpyNodeSetParams;
     hipExtGetLastError;
     hipGetDevicePropertiesR0600;
 } hip_5.6;
 hip_6.1 {
   global:
     hipGetProcAddress;
+    hipGraphInstantiateWithParams;
+    hipStreamBeginCaptureToGraph;
 } hip_6.0;
 hip_6.2 {
   global:
+    hipDrvGraphAddMemFreeNode;
+    hipDrvGraphExecMemcpyNodeSetParams;
+    hipDrvGraphExecMemsetNodeSetParams;
     hipGetFuncBySymbol;
+    hipGraphExecGetFlags;
+    hipGraphExecNodeSetParams;
+    hipGraphNodeSetParams;
     hipMemcpy2DArrayToArray;
     hipMemcpyAtoA;
     hipMemcpyAtoD;
@@ -437,6 +516,10 @@ hip_6.2 {
 hip_6.4 {
   global:
     hipEventRecordWithFlags;
+    hipGraphAddBatchMemOpNode;
+    hipGraphBatchMemOpNodeGetParams;
+    hipGraphBatchMemOpNodeSetParams;
+    hipGraphExecBatchMemOpNodeSetParams;
     hipStreamBatchMemOp;
 } hip_6.2;
 hip_6.5 {

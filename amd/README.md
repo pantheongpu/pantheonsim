@@ -66,16 +66,22 @@ driver API's forms, peer copies) with ROCm's rules for who waits, managed
 memory's advice and prefetch, stream-ordered pools that keep freed memory for
 reuse by the rules each pool is set to, pools and their pointers shared with
 another process through a file descriptor, and virtual memory at HIP's 4 KiB
-page granularity. A kernel's fault is told at the
+page granularity. Graphs are the whole of HIP's graph API
+(`src/hip_graph.inc`, checked by `tests/hipcc/graphs.cpp`): every node type
+built by hand or captured from streams -- across streams joined by events, in
+each capture mode, with the calls a capture refuses refused as ROCm refuses
+them -- executable graphs and everything that changes one, child graphs,
+clones, allocation nodes whose memory outlives the graph, user objects, and a
+drawing in Graphviz's dot. A launch is one piece of its stream's work, its
+nodes run in an order their edges allow. A kernel's fault is told at the
 next synchronization, as on a card. `VGPU_SYNC_LAUNCHES=1` makes every call
 wait for its own work instead, which rules concurrency out when a program
 misbehaves. A program built by `hipcc` runs unmodified too:
 its device code is registered from inside the executable before `main`, its
 chevron launches go through `hipLaunchKernel`, and it reads the device through
 the real headers' `hipDeviceProp_t`, which is laid out here field for field as
-ROCm lays it out. Graph capture and replay, peer access between devices, and
-pinned host memory used to stage copies are there for the programs that use
-them. The library answers to both of ROCm's names for it (`libamdhip64.so.6`
+ROCm lays it out. Peer access between devices and pinned host memory used to
+stage copies are there for the programs that use them. The library answers to both of ROCm's names for it (`libamdhip64.so.6`
 and `.so.7`) and gives each function the symbol version the real one does,
 since a program built by `hipcc` asks for `hipMalloc@hip_4.2`, not just
 `hipMalloc`.
