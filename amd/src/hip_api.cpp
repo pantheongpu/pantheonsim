@@ -4089,6 +4089,19 @@ hipError_t hipExtModuleLaunchKernel(hipFunction_t f, uint32_t gx, uint32_t gy, u
                                     hipEvent_t start, hipEvent_t stop, uint32_t) {
   const ApiCall api("hipExtModuleLaunchKernel");
   if (!lx || !ly || !lz || !gx || !gy || !gz) return record(state(), hipErrorInvalidConfiguration);
+  // A work-group wider than the whole grid is cut to the grid, as ROCm's
+  // HIP does -- after the block is checked against the device's limits.
+  {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (const vgpu::runtime::Device* d = device(s)) {
+      const auto& limits = d->profile().limits;
+      if (uint64_t{lx} * ly * lz > limits.max_threads_per_block || lx > limits.max_block_dim[0] ||
+          ly > limits.max_block_dim[1] || lz > limits.max_block_dim[2])
+        return record(s, hipErrorInvalidConfiguration);
+    }
+  }
+  lx = std::min(lx, gx), ly = std::min(ly, gy), lz = std::min(lz, gz);
   if (start)
     if (const hipError_t e = hipEventRecord(start, stream); e != hipSuccess) return e;
   const uint32_t items[3] = {gx % lx ? gx : 0, gy % ly ? gy : 0, gz % lz ? gz : 0};
