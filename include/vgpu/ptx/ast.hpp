@@ -238,7 +238,9 @@ struct OpGetCtaRank { bool generic = false; Reg dst; Operand src; };
 
 // Warp shuffle. `pred_dst` is the optional "d|p" second destination.
 enum class ShflMode { Up, Down, Bfly, Idx };
-struct OpShfl { ShflMode mode; Reg dst; Reg pred_dst; Operand a, b, c, member_mask; };
+// has_members is false for the pre-Volta form without .sync, which takes no
+// member mask and shuffles among the lanes that happen to be active.
+struct OpShfl { ShflMode mode; Reg dst; Reg pred_dst; Operand a, b, c, member_mask; bool has_members = true; };
 // Warp vote/ballot across the active mask.
 enum class VoteMode { All, Any, Uni, Ballot };
 struct OpVote { VoteMode mode = VoteMode::All; bool ballot = false; Reg dst; Reg src; bool negate_src = false;

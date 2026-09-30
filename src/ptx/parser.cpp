@@ -3259,7 +3259,7 @@ class Parser {
       op.src = parse_operand();
       ins.op = op;
     } else if (op0 == "shfl") {
-      // shfl.sync.<mode>.b32 d[|p], a, b, c, membermask;
+      // shfl.sync.<mode>.b32 d[|p], a, b, c, membermask;  shfl.<mode>.b32 d[|p], a, b, c;
       ShflMode mode;
       bool have_mode = false, sync = false;
       for (size_t i = 1; i < parts.size(); ++i) {
@@ -3273,8 +3273,12 @@ class Parser {
         else return unsupported("shfl modifier '." + p + "'");
       }
       if (!have_mode) return unsupported("shfl needs a mode (.up/.down/.bfly/.idx)");
-      if (!sync) return unsupported("the deprecated non-.sync shfl is not implemented");
+      // Without .sync (deprecated since PTX 6.0, but still in PTX written for
+      // sm_60 and earlier, which the driver JIT-compiles for newer GPUs) there
+      // is no member mask: the lanes that are active shuffle among themselves.
+      // An RTX 3060 loads and runs it so.
       OpShfl op;
+      op.has_members = sync;
       op.mode = mode;
       op.dst = expect_reg_operand("shfl destination");
       if (peek_punct("|")) {  // optional predicate destination
@@ -3287,8 +3291,12 @@ class Parser {
       op.b = parse_operand();
       expect_punct(",");
       op.c = parse_operand();
-      expect_punct(",");
-      op.member_mask = parse_operand();
+      if (sync) {
+        expect_punct(",");
+        op.member_mask = parse_operand();
+      } else {
+        op.member_mask = ImmInt{-1};   // never read: nothing to wait for
+      }
       ins.op = op;
     } else if (op0 == "vote") {
       // vote.sync.{all,any,uni}.pred d, p, membermask;  vote.sync.ballot.b32 d, p, mask;
