@@ -342,6 +342,11 @@ PY
 expect "ROCR_VISIBLE_DEVICES names a device by its HSA UUID" "hipSuccess 1" "$(visible ROCR_VISIBLE_DEVICES=GPU-5647505500000002)"
 expect "ROCR_VISIBLE_DEVICES names a device by KFD's unique_id, as Ollama does" "hipSuccess 1" "$(visible ROCR_VISIBLE_DEVICES=$kfd_id)"
 expect "a UUID no device has shows none" "hipErrorNoDevice 0" "$(visible ROCR_VISIBLE_DEVICES=GPU-00000000deadbeef)"
+# CUDA_VISIBLE_DEVICES stands in for HIP_VISIBLE_DEVICES when that is unset,
+# as ROCm's HIP reads it: -1 hides every GPU, unless HIP_VISIBLE_DEVICES says.
+expect "CUDA_VISIBLE_DEVICES=-1 hides every GPU from HIP" "hipErrorNoDevice 0" "$(visible CUDA_VISIBLE_DEVICES=-1)"
+expect "HIP_VISIBLE_DEVICES comes before CUDA_VISIBLE_DEVICES" "hipSuccess 1" \
+  "$(visible HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=-1)"
 
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
