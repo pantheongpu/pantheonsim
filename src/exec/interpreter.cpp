@@ -2830,7 +2830,8 @@ class Interpreter {
       return;
     }
     if (const auto* bop = std::get_if<OpBar>(&ins.op)) {
-      if (bop->warp) {   // bar.warp.sync: the warp is already reconverged here
+      if (bop->warp) {   // bar.warp.sync: waits for its lanes (wait_for_members)
+        if (wait_for_members(w, ctx, ins, idx, bop->id, m)) return;
         ++w.paths[idx].pc;
         return;
       }
@@ -2936,6 +2937,9 @@ class Interpreter {
       return;
     }
 
+    if (const Operand* members = sync_members(ins); members && m != 0 && wait_for_members(w, ctx, ins, idx, *members, m))
+      return;
+
     if (m != 0) {
       try {
         dispatch(w, ctx, ins, m);
@@ -2969,6 +2973,38 @@ class Interpreter {
 
   // Is there another path that can still run -- one not itself waiting at a
   // barrier? Used to decide whether a barrier is merely waiting for stragglers.
+  // The member mask of a warp instruction that synchronizes the lanes it
+  // names (shfl.sync, vote.sync, match.sync, redux.sync), or null.
+  static const Operand* sync_members(const Instr& ins) {
+    if (const auto* op = std::get_if<OpShfl>(&ins.op)) return &op->member_mask;
+    if (const auto* op = std::get_if<OpMatch>(&ins.op)) return &op->membermask;
+    if (const auto* op = std::get_if<OpRedux>(&ins.op)) return &op->members;
+    if (const auto* op = std::get_if<OpVote>(&ins.op); op && op->has_members) return &op->members;
+    return nullptr;
+  }
+
+  // On the hardware a *.sync warp instruction and bar.warp.sync wait for every
+  // lane their member mask names. Running the lowest pc first used to bring
+  // those lanes here first, but a path that has waited too long now runs
+  // ahead (select_path), and it must not go on without them: in
+  // cooperative_groups' multi-warp tiles lane 0 spins on the other warps
+  // while its warp-mates wait at __syncwarp, then all read the tile's result.
+  // So a path that gets here while lanes it names are on another path parks,
+  // as at bar.red, until they reach this pc and merge with it. Returns true
+  // when it parked; if no other path can run, it goes on as before.
+  bool wait_for_members(Warp& w, const BlockCtx& ctx, const Instr& ins, size_t idx, const Operand& members, Mask m) {
+    if (w.paths.size() < 2 || m == 0) return false;
+    Lanes _s_members;
+    const Mask named = static_cast<Mask>(read_operand(w, ctx, ins, members, _s_members)[first_set(m)]) & 0xffffffffu;
+    for (size_t i = 0; i < w.paths.size(); ++i) {
+      if (i == idx || !(w.paths[i].mask & named)) continue;
+      if (select_other_runnable(w, idx) == idx) return false;
+      w.paths[idx].parked = Path::kAtBarrier;
+      return true;
+    }
+    return false;
+  }
+
   size_t select_other_runnable(Warp& w, size_t idx) {
     for (size_t i = 0; i < w.paths.size(); ++i)
       if (i != idx && !w.paths[i].parked) return i;

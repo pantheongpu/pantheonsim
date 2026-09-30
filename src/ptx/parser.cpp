@@ -3132,7 +3132,7 @@ class Parser {
       expect_punct(",");
       op.src = parse_operand();
       expect_punct(",");
-      (void)parse_operand();  // membermask; the active mask already carries it
+      op.members = parse_operand();
       ins.op = op;
     } else if (op0 == "istypep") {
       // istypep.<texref|samplerref|surfref> p, a (9.7.12.6).
@@ -3305,7 +3305,8 @@ class Parser {
       op.src = expect_reg_operand("vote predicate source");
       if (peek_punct(",")) {
         next();
-        (void)parse_operand();  // membermask
+        op.has_members = true;
+        op.members = parse_operand();
       }
       ins.op = op;
     } else if (op0 == "neg") {
@@ -4933,13 +4934,11 @@ class Parser {
       if (sync_seen == arrive_seen) return unsupported("bar needs one of .sync and .arrive");
       if (warp_scope && arrive_seen) return unsupported("bar.warp.arrive");
       if (warp_scope) {
-        // __syncwarp. A warp executes its lanes in lockstep here and diverged
-        // paths reconverge at the earliest common pc, so the lanes named by the
-        // mask are already synchronised by the time this is reached. The
-        // operand is the member mask, which nothing needs to consume.
-        (void)parse_operand();
+        // __syncwarp. The operand is the member mask: the lanes that have to
+        // be here before any of them goes on (see the interpreter).
         OpBar op;
         op.warp = true;
+        op.id = parse_operand();
         ins.op = op;
         expect_punct(";");
         return ins;
