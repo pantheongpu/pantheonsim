@@ -25,7 +25,11 @@ __global__ void locked_increment(int rounds) {
 }
 
 int main() {
-  const int blocks = 4, threads = 64, rounds = 3;
+  // Two warps per block and two blocks contend within a warp and across both,
+  // which is the whole property; every hand-over inside a warp waits out the
+  // scheduler's starvation limit, so more rounds only cost time (four blocks
+  // of three rounds took 230 s of a 300 s limit under AddressSanitizer).
+  const int blocks = 2, threads = 64, rounds = 1;
   locked_increment<<<blocks, threads>>>(rounds);
   unsigned h = 0;
   if (cudaDeviceSynchronize() != cudaSuccess || cudaMemcpyFromSymbol(&h, counter, sizeof h) != cudaSuccess) {

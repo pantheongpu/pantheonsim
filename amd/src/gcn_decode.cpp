@@ -327,6 +327,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x30}, {"v_frexp_exp_i32_f64_e32", 1, 1, 2}},
       {{Enc::Vop1, 0x31}, {"v_frexp_mant_f64_e32", 2, 1, 2}},
       {{Enc::Vop1, 0x32}, {"v_fract_f64_e32", 2, 1, 2}},
+      {{Enc::Vop1, 0x1b}, {"v_fract_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x48}, {"v_fract_f16_e32", 1, 1}},
       // Halves: to and from 16-bit integers, and one value at a time through
       // the transcendental and rounding units.
       {{Enc::Vop1, 0x39}, {"v_cvt_f16_u16_e32", 1, 1}},
@@ -466,6 +468,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop2, 0x037}, {"v_dot2c_f32_f16_e32", 1, 2}},
       {{Enc::Vop2, 0x016}, {"v_dot2c_f32_bf16_e32", 1, 2}},
       {{Enc::Vop2, 0x039}, {"v_dot4c_i32_i8_e32", 1, 2}},
+      {{Enc::Vop2, 0x038}, {"v_dot2c_i32_i16_e32", 1, 2}},
+      {{Enc::Vop2, 0x03a}, {"v_dot8c_i32_i4_e32", 1, 2}},
       {{Enc::Vop2, 0x03b}, {"v_fmac_f32_e32", 1, 2}},
       // The float comparisons share their opcodes with the long forms above.
       // A class test: the second source is a mask of the kinds of float
@@ -640,9 +644,26 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Ds, 0x08}, {"ds_max_u32", 0, 2}},
       {{Enc::Ds, 0x09}, {"ds_and_b32", 0, 2}},
       {{Enc::Ds, 0x0a}, {"ds_or_b32", 0, 2}},
+      {{Enc::Ds, 0x01}, {"ds_sub_u32", 0, 2}},
+      {{Enc::Ds, 0x02}, {"ds_rsub_u32", 0, 2}},
+      {{Enc::Ds, 0x03}, {"ds_inc_u32", 0, 2}},
+      {{Enc::Ds, 0x04}, {"ds_dec_u32", 0, 2}},
       // The forms that hand back what they found: an add, and a compare
       // that stores its second value where the first matched.
       {{Enc::Ds, 0x20}, {"ds_add_rtn_u32", 1, 2}},
+      {{Enc::Ds, 0x21}, {"ds_sub_rtn_u32", 1, 2}},
+      {{Enc::Ds, 0x22}, {"ds_rsub_rtn_u32", 1, 2}},
+      {{Enc::Ds, 0x23}, {"ds_inc_rtn_u32", 1, 2}},
+      {{Enc::Ds, 0x24}, {"ds_dec_rtn_u32", 1, 2}},
+      {{Enc::Ds, 0x25}, {"ds_min_rtn_i32", 1, 2}},
+      {{Enc::Ds, 0x26}, {"ds_max_rtn_i32", 1, 2}},
+      {{Enc::Ds, 0x27}, {"ds_min_rtn_u32", 1, 2}},
+      {{Enc::Ds, 0x28}, {"ds_max_rtn_u32", 1, 2}},
+      {{Enc::Ds, 0x29}, {"ds_and_rtn_b32", 1, 2}},
+      {{Enc::Ds, 0x2a}, {"ds_or_rtn_b32", 1, 2}},
+      {{Enc::Ds, 0x2b}, {"ds_xor_rtn_b32", 1, 2}},
+      // What was there, handed back as the new value goes in.
+      {{Enc::Ds, 0x2d}, {"ds_wrxchg_rtn_b32", 1, 2}},
       {{Enc::Ds, 0x30}, {"ds_cmpst_rtn_b32", 1, 3}},
       {{Enc::Ds, 0x3b}, {"ds_read_i16", 1, 1}},
       // 64-bit atomics over a register pair.
@@ -744,6 +765,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Flat, 0x48}, {"atomic_and", 0, 2}},
       {{Enc::Flat, 0x49}, {"atomic_or", 0, 2}},
       {{Enc::Flat, 0x4a}, {"atomic_xor", 0, 2}},
+      {{Enc::Flat, 0x4b}, {"atomic_inc", 0, 2}},
+      {{Enc::Flat, 0x4c}, {"atomic_dec", 0, 2}},
       {{Enc::Flat, 0x4d}, {"atomic_add_f32", 0, 2}},
       {{Enc::Flat, 0x44}, {"atomic_smin", 0, 2}},
       {{Enc::Flat, 0x45}, {"atomic_umin", 0, 2}},
@@ -763,6 +786,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Flat, 0x6a}, {"atomic_xor_x2", 0, 2, 1, 2}},
       {{Enc::Flat, 0x61}, {"atomic_cmpswap_x2", 0, 2, 1, 4}},
       {{Enc::Flat, 0x62}, {"atomic_add_x2", 0, 2, 1, 2}},
+      {{Enc::Flat, 0x6b}, {"atomic_inc_x2", 0, 2, 1, 2}},
+      {{Enc::Flat, 0x6c}, {"atomic_dec_x2", 0, 2, 1, 2}},
       // MUBUF: the buffer instructions. Only the two that act on the caches
       // are decoded -- a write-back of L2 and an invalidate, which a memory
       // fence compiles to -- and they take no operands.
@@ -835,6 +860,13 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // Four signed bytes of each source multiplied pairwise and added to the
       // third, clamped where asked.
       {{Enc::Vop3p, 0x28}, {"v_dot4_i32_i8", 1, 3}},
+      // The rest of the integer dot products: pairs of 16-bit values, four
+      // unsigned bytes, eight 4-bit values, signed or not.
+      {{Enc::Vop3p, 0x26}, {"v_dot2_i32_i16", 1, 3}},
+      {{Enc::Vop3p, 0x27}, {"v_dot2_u32_u16", 1, 3}},
+      {{Enc::Vop3p, 0x29}, {"v_dot4_u32_u8", 1, 3}},
+      {{Enc::Vop3p, 0x2a}, {"v_dot8_i32_i4", 1, 3}},
+      {{Enc::Vop3p, 0x2b}, {"v_dot8_u32_u4", 1, 3}},
       // Two pairs of halves multiplied and added into a float.
       {{Enc::Vop3p, 0x23}, {"v_dot2_f32_f16", 1, 3}},
       {{Enc::Vop3p, 0x21}, {"v_fma_mixlo_f16", 1, 3}},

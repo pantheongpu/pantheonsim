@@ -2231,12 +2231,17 @@ struct Machine {
         write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane) ^ lane_src(w, in.src[1], lane));
       });
     } else if (op == "v_add_u32_e32"_op || op == "v_add_u32_e64"_op) {
+      // The VOP3 form's clamp saturates: an unsigned sum past 32 bits is
+      // their maximum (as __clzll's sum of two leading-zero counts relies on).
       each([&](uint32_t lane) {
-        write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane) + lane_src(w, in.src[1], lane));
+        const uint64_t sum = uint64_t{lane_src(w, in.src[0], lane)} + lane_src(w, in.src[1], lane);
+        write_lane(w, in.dst[0], lane, in.clamp && sum > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(sum));
       });
     } else if (op == "v_sub_u32_e32"_op || op == "v_sub_u32_e64"_op) {
+      // Clamped, a difference below zero is zero.
       each([&](uint32_t lane) {
-        write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane) - lane_src(w, in.src[1], lane));
+        const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
+        write_lane(w, in.dst[0], lane, in.clamp && b > a ? 0u : a - b);
       });
     } else if (op == "v_add3_u32"_op) {
       each([&](uint32_t lane) {
@@ -2339,6 +2344,21 @@ struct Machine {
     } else if (op == "v_ceil_f32_e32"_op) {
       each([&](uint32_t lane) {
         write_float(w, in, lane, std::ceil(lane_float(w, in.src[0], lane)));
+      });
+    } else if (op == "v_fract_f32_e32"_op) {
+      each([&](uint32_t lane) {
+        // x - floor(x), held below 1 as v_fract_f64 is; an infinity is a NaN.
+        const float x = lane_float(w, in.src[0], lane);
+        write_float(w, in, lane,
+                    std::isinf(x) ? std::numeric_limits<float>::quiet_NaN()
+                                  : std::isnan(x) ? x : std::fmin(x - std::floor(x), 0x1.fffffep-1f));
+      });
+    } else if (op == "v_fract_f16_e32"_op) {
+      each([&](uint32_t lane) {
+        const float x = static_cast<float>(lane_half(w, in.src[0], lane));
+        const float r = std::isinf(x) ? std::numeric_limits<float>::quiet_NaN()
+                                      : std::isnan(x) ? x : std::fmin(x - std::floor(x), 0x1.ffcp-1f);
+        write_half(w, in, lane, static_cast<_Float16>(r));
       });
     } else if (op == "v_rndne_f32_e32"_op) {
       each([&](uint32_t lane) {
@@ -2451,6 +2471,41 @@ struct Machine {
         const int32_t x = static_cast<int32_t>(lane_src(w, in.src[0], lane)),
                       y = static_cast<int32_t>(lane_src(w, in.src[1], lane));
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(op == "v_min_i32_e32"_op ? std::min(x, y) : std::max(x, y)));
+      });
+    } else if (op == "v_dot2_i32_i16"_op || op == "v_dot2_u32_u16"_op) {
+      // Two pairs of 16-bit values (halves chosen as a packed instruction's
+      // are) multiplied and added to the third source; clamped, the sum
+      // saturates rather than wraps.
+      const bool is_signed = op == "v_dot2_i32_i16"_op;
+      each([&](uint32_t lane) {
+        const uint32_t c = lane_src(w, in.src[2], lane);
+        int64_t sum = is_signed ? int64_t{static_cast<int32_t>(c)} : int64_t{c};
+        for (uint32_t h = 0; h < 2; ++h) {
+          const uint16_t a = packed_bits(w, in, 0, h, lane), b = packed_bits(w, in, 1, h, lane);
+          sum += is_signed ? int64_t{static_cast<int16_t>(a)} * static_cast<int16_t>(b) : int64_t{a} * b;
+        }
+        if (in.clamp) sum = is_signed ? std::clamp<int64_t>(sum, INT32_MIN, INT32_MAX) : std::clamp<int64_t>(sum, 0, UINT32_MAX);
+        write_lane(w, in.dst[0], lane, static_cast<uint32_t>(sum));
+      });
+    } else if (op == "v_dot4_u32_u8"_op || op == "v_dot8_i32_i4"_op || op == "v_dot8_u32_u4"_op) {
+      // Four unsigned bytes, or eight 4-bit values, of each source multiplied
+      // pairwise and added to the third.
+      const bool nibbles = op != "v_dot4_u32_u8"_op, is_signed = op == "v_dot8_i32_i4"_op;
+      const uint32_t bits = nibbles ? 4 : 8, n = 32 / bits, mask = (1u << bits) - 1;
+      each([&](uint32_t lane) {
+        const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
+        const uint32_t c = lane_src(w, in.src[2], lane);
+        int64_t sum = is_signed ? int64_t{static_cast<int32_t>(c)} : int64_t{c};
+        for (uint32_t k = 0; k < n; ++k) {
+          int64_t x = (a >> (bits * k)) & mask, y = (b >> (bits * k)) & mask;
+          if (is_signed) {
+            if (x & 8) x -= 16;
+            if (y & 8) y -= 16;
+          }
+          sum += x * y;
+        }
+        if (in.clamp) sum = is_signed ? std::clamp<int64_t>(sum, INT32_MIN, INT32_MAX) : std::clamp<int64_t>(sum, 0, UINT32_MAX);
+        write_lane(w, in.dst[0], lane, static_cast<uint32_t>(sum));
       });
     } else if (op == "v_dot4_i32_i8"_op) {
       // Four signed bytes of each multiplied pairwise and added to the third
@@ -2661,6 +2716,29 @@ struct Machine {
         const float m = std::isfinite(x) ? std::frexp(x, &e) : x;
         if (!std::isfinite(x)) e = 0;
         write_lane(w, in.dst[0], lane, op == "v_frexp_mant_f32_e32"_op ? as_bits(m) : static_cast<uint32_t>(e));
+      });
+    } else if (op == "v_dot8c_i32_i4_e32"_op) {
+      each([&](uint32_t lane) {
+        // Eight signed 4-bit pairs, added into the destination; it wraps.
+        const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
+        uint32_t sum = w.vgpr[in.dst[0].index][lane];
+        for (uint32_t k = 0; k < 8; ++k) {
+          int32_t x = (a >> (4 * k)) & 15, y = (b >> (4 * k)) & 15;
+          if (x & 8) x -= 16;
+          if (y & 8) y -= 16;
+          sum += static_cast<uint32_t>(x * y);
+        }
+        write_lane(w, in.dst[0], lane, sum);
+      });
+    } else if (op == "v_dot2c_i32_i16_e32"_op) {
+      each([&](uint32_t lane) {
+        // Two signed 16-bit pairs, added into the destination; it wraps.
+        const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
+        uint32_t sum = w.vgpr[in.dst[0].index][lane];
+        for (uint32_t h = 0; h < 2; ++h)
+          sum += static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(a >> (16 * h))) *
+                                       static_cast<int32_t>(static_cast<int16_t>(b >> (16 * h))));
+        write_lane(w, in.dst[0], lane, sum);
       });
     } else if (op == "v_dot4c_i32_i8_e32"_op) {
       each([&](uint32_t lane) {
@@ -3317,6 +3395,35 @@ struct Machine {
         std::memcpy(&v1, at(uint64_t{static_cast<uint32_t>(in.offset1)} * 64 * 4), 4);
         set_word(w, in.dst[0], 0, lane, v0);
         set_word(w, in.dst[0], 1, lane, v1);
+      } else if (op == "ds_sub_u32"_op || op == "ds_rsub_u32"_op || op == "ds_inc_u32"_op || op == "ds_dec_u32"_op ||
+                 op == "ds_sub_rtn_u32"_op || op == "ds_rsub_rtn_u32"_op || op == "ds_inc_rtn_u32"_op ||
+                 op == "ds_dec_rtn_u32"_op || op == "ds_min_rtn_i32"_op || op == "ds_max_rtn_i32"_op ||
+                 op == "ds_min_rtn_u32"_op || op == "ds_max_rtn_u32"_op || op == "ds_and_rtn_b32"_op ||
+                 op == "ds_or_rtn_b32"_op || op == "ds_xor_rtn_b32"_op || op == "ds_wrxchg_rtn_b32"_op) {
+        // The rest of LDS's 32-bit read-modify-writes; the _rtn forms hand
+        // back what was there.
+        std::string what(in.name);
+        const bool rtn = what.find("_rtn") != std::string::npos;
+        if (rtn) what.erase(what.find("_rtn"), 4);
+        uint32_t was = 0;
+        std::memcpy(&was, at(off), 4);
+        const uint32_t v = lane_src(w, in.src[1], lane);
+        const int32_t sw = static_cast<int32_t>(was), sv = static_cast<int32_t>(v);
+        uint32_t now = was;
+        if (what == "ds_sub_u32") now = was - v;
+        else if (what == "ds_rsub_u32") now = v - was;
+        else if (what == "ds_inc_u32") now = was >= v ? 0 : was + 1;
+        else if (what == "ds_dec_u32") now = was == 0 || was > v ? v : was - 1;
+        else if (what == "ds_min_i32") now = static_cast<uint32_t>(std::min(sw, sv));
+        else if (what == "ds_max_i32") now = static_cast<uint32_t>(std::max(sw, sv));
+        else if (what == "ds_min_u32") now = std::min(was, v);
+        else if (what == "ds_max_u32") now = std::max(was, v);
+        else if (what == "ds_and_b32") now = was & v;
+        else if (what == "ds_or_b32") now = was | v;
+        else if (what == "ds_xor_b32") now = was ^ v;
+        else if (what == "ds_wrxchg_b32") now = v;
+        std::memcpy(at(off), &now, 4);
+        if (rtn) write_lane(w, in.dst[0], lane, was);
       } else if (op == "ds_min_i32"_op || op == "ds_min_u32"_op || op == "ds_max_u32"_op || op == "ds_and_b32"_op ||
                  op == "ds_or_b32"_op || op == "ds_add_rtn_u32"_op) {
         uint32_t was = 0;
@@ -3850,7 +3957,7 @@ struct Machine {
     const std::string_view body = std::string_view(op).substr(op.find('_') + 1);
     enum class Kind { Narrow, HalfReg, Load, Store, StoreHi16, AddX2, AddF64, CmpSwapX2, CmpSwap, Atomic, Atomic64 } kind;
     Half half;
-    enum class Rmw { Add, Sub, And, Or, Xor, Swap, AddF32, SMin, UMin, SMax, UMax, PkAddF16, PkAddBf16 } rmw = Rmw::Add;
+    enum class Rmw { Add, Sub, And, Or, Xor, Swap, AddF32, SMin, UMin, SMax, UMax, PkAddF16, PkAddBf16, Inc, Dec } rmw = Rmw::Add;
     Narrow n;
     bool narrow_store = false;
     if (narrow(op, &n)) {
@@ -3878,6 +3985,8 @@ struct Machine {
       else if (what == "umin") rmw = Rmw::UMin;
       else if (what == "smax") rmw = Rmw::SMax;
       else if (what == "umax") rmw = Rmw::UMax;
+      else if (what == "inc") rmw = Rmw::Inc;
+      else if (what == "dec") rmw = Rmw::Dec;
       else throw Error::make(Err::Unsupported, "memory instruction ", op, " is decoded but not implemented");
     } else if (body == "atomic_add_f64" || body == "atomic_min_f64" || body == "atomic_max_f64") {
       kind = Kind::AddF64;
@@ -3898,6 +4007,8 @@ struct Machine {
       else if (body == "atomic_umin") rmw = Rmw::UMin;
       else if (body == "atomic_smax") rmw = Rmw::SMax;
       else if (body == "atomic_umax") rmw = Rmw::UMax;
+      else if (body == "atomic_inc") rmw = Rmw::Inc;
+      else if (body == "atomic_dec") rmw = Rmw::Dec;
       else if (body == "atomic_pk_add_f16") rmw = Rmw::PkAddF16;
       else if (body == "atomic_pk_add_bf16") rmw = Rmw::PkAddBf16;
       else throw Error::make(Err::Unsupported, "memory instruction ", op, " is decoded but not implemented");
@@ -3972,6 +4083,10 @@ struct Machine {
             case Rmw::UMin: after = std::min(before, v); break;
             case Rmw::SMax: after = static_cast<uint64_t>(std::max(static_cast<int64_t>(before), static_cast<int64_t>(v))); break;
             case Rmw::UMax: after = std::max(before, v); break;
+            // Counts up to the data, then wraps to zero; counts down to zero,
+            // then wraps to the data (as does anything above it).
+            case Rmw::Inc: after = before >= v ? 0 : before + 1; break;
+            case Rmw::Dec: after = before == 0 || before > v ? v : before - 1; break;
             default: after = before + v; break;
           }
           at(addr).store_scalar(addr, 8, after);
@@ -4018,6 +4133,10 @@ struct Machine {
             case Rmw::UMin: after = std::min(before, v); break;
             case Rmw::SMax: after = static_cast<uint32_t>(std::max(static_cast<int32_t>(before), static_cast<int32_t>(v))); break;
             case Rmw::UMax: after = std::max(before, v); break;
+            // Counts up to the data, then wraps to zero; counts down to zero,
+            // then wraps to the data (as does anything above it).
+            case Rmw::Inc: after = before >= v ? 0 : before + 1; break;
+            case Rmw::Dec: after = before == 0 || before > v ? v : before - 1; break;
             case Rmw::PkAddF16: after = packed_add(before, v, false); break;
             case Rmw::PkAddBf16: after = packed_add(before, v, true); break;
           }
@@ -4059,6 +4178,26 @@ struct Machine {
     if (ctrl >= 0x121 && ctrl <= 0x12F) {   // row_ror: the same, wrapping
       const uint32_t n = ctrl - 0x120;
       *from = row + ((in_row + 16 - n) & 15);
+      return true;
+    }
+    // GCN's shifts and rotates of the whole wave by one lane (gone from RDNA):
+    // wave_shl reads the lane above, wave_shr the lane below, as the row forms do.
+    if (ctrl == 0x130) {   // wave_shl:1
+      if (lane == kLanes - 1) return false;
+      *from = lane + 1;
+      return true;
+    }
+    if (ctrl == 0x134) {   // wave_rol:1
+      *from = (lane + 1) % kLanes;
+      return true;
+    }
+    if (ctrl == 0x138) {   // wave_shr:1
+      if (lane == 0) return false;
+      *from = lane - 1;
+      return true;
+    }
+    if (ctrl == 0x13C) {   // wave_ror:1
+      *from = (lane + kLanes - 1) % kLanes;
       return true;
     }
     if (ctrl == 0x140) {   // the row reversed
