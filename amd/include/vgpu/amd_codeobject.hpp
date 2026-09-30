@@ -46,6 +46,10 @@ struct Kernel {
   uint32_t sgpr_count = 0, vgpr_count = 0, agpr_count = 0;
   uint32_t max_flat_workgroup_size = 0;
   uint32_t wavefront_size = 64;
+  // The kernel was built for work-groups that all have the same size
+  // (.uniform_work_group_size, clang's uniform-work-group-size attribute):
+  // a launch whose grid is not a whole number of them is refused.
+  bool uniform_work_group_size = false;
   std::vector<KernelArg> args;
   // From the kernel descriptor's kernel_code_properties: the user SGPRs the
   // hardware loads before the first instruction. The kernarg segment pointer

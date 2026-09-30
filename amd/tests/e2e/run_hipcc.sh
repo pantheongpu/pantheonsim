@@ -301,7 +301,7 @@ expect "every one of its export checks holds" "0 failed" "$(grep -o '[0-9]* fail
 
 # Modules (hipcc/modules.cpp): generic code (gfx9-4-generic) loaded and run on
 # gfx942, and the module calls' answers to hip-tests' negative cases.
-out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" timeout 300 \
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$shim" timeout 300 \
       "$(dirname "$exe")/modules.gfx942" "$(dirname "$exe")/modules_kernel.generic.co" 2>&1)
 status=$?
 echo "$out" | sed 's/^/      /'
