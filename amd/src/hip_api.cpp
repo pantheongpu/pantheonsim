@@ -2454,7 +2454,7 @@ void hip_version(const vgpu::DeviceProfile& p, int* major, int* minor) {
 
 // A Radeon device's texture and surface limits, as ROCm's HIP reports them
 // from its image runtime's (hip_images.inc): no cubemaps, gathers or
-// alternate 3D sizes, and 256-byte image and row alignment.
+// alternate 3D sizes.
 // Whether a device has texture units: the Radeon targets.
 bool has_images(const vgpu::DeviceProfile& p) {
   return p.gcn_arch.rfind("gfx10", 0) == 0 || p.gcn_arch.rfind("gfx11", 0) == 0 ||
@@ -2477,8 +2477,6 @@ void fill_texture_limits(vgpu::amd::abi::DevicePropR0600* props) {
   props->maxTexture2DLinear[0] = k2D;
   props->maxTexture2DLinear[1] = k2D;
   props->maxTexture2DLinear[2] = 16 * k2D;
-  props->textureAlignment = props->surfaceAlignment = 256;
-  props->texturePitchAlignment = 256;
 }
 
 void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0600* props) {
@@ -2542,9 +2540,12 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   props->memoryPoolsSupported = 1;
   props->ECCEnabled = p.telemetry.ecc ? 1 : 0;
   // The widest row a 2D or 3D copy takes (the attribute, an int, caps it
-  // there). The texture alignments stay 0, as ROCm's HIP gives them for a
-  // device without image support.
+  // there). The image alignments are 256 bytes on every device: ROCm's HIP
+  // sets them whenever the runtime has the images extension, which ROCm's
+  // does on every GPU, texture units or not.
   props->memPitch = static_cast<size_t>(std::min<uint64_t>(p.vram_bytes, INT32_MAX));
+  props->textureAlignment = props->surfaceAlignment = 256;
+  props->texturePitchAlignment = 256;
   if (has_images(p)) fill_texture_limits(props);
   // What ROCm's HIP gives as a device's UUID: the sixteen characters after
   // "GPU-" in its HSA agent's UUID (hsa_api.cpp), which rocminfo prints.

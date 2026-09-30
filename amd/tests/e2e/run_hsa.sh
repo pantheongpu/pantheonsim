@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # An HSA program on VirtualGPU's libhsa-runtime64 (amd/tests/hsa/hsa_dispatch.c):
 # agents, memory pools, an executable loaded from a code object, and kernels
-# dispatched through AQL queues, on two simulated MI300Xs.
+# dispatched through AQL queues, on two simulated MI300Xs; and the images
+# extension (hsa_images.c) on each Radeon profile and an MI300X.
 #
 # It is built against VirtualGPU's own HSA header, and again against ROCm's
 # where ROCm's headers are installed (VGPU_ROCM_INCLUDE, /opt/rocm/include, or
@@ -51,7 +52,34 @@ run() {   # run <label> <extra cflags...>
   fi
 }
 
+# The images extension (amd/tests/hsa/hsa_images.c): every check on a
+# Radeon profile, which has texture units, and the refusals on an MI300X,
+# which has none.
+run_images() {   # run_images <label> <extra cflags...>
+  local label=$1; shift
+  if ! "$cc" -std=c11 -O1 -Wall -Werror "${sanitize[@]}" "$@" "$root/amd/tests/hsa/hsa_images.c" -o "$tmp/hsa_images" \
+       -L"$shim" -l:libhsa-runtime64.so.1 -Wl,-rpath,"$(cd "$shim" && pwd)" 2> "$tmp/cc.log"; then
+    echo "FAIL  hsa_images.c builds against $label"; sed 's/^/      /' "$tmp/cc.log" | head -20; fail=1; return
+  fi
+  local gpu want out status passed
+  for run in "rx7900xtx 10" "rx9070xt 10" "rx6900xt 10" "mi300x 3"; do
+    set -- $run
+    gpu=$1 want=$2
+    out=$(VGPU_QUIET=1 VGPU_GPU=amd/$gpu timeout 120 "$tmp/hsa_images" 2>&1)
+    status=$?
+    passed=$(grep -c '^ok ' <<< "$out")
+    if [[ $status != 0 ]] || grep -q '^FAIL' <<< "$out" || [[ $passed != "$want" ]]; then
+      echo "FAIL  the images extension on $gpu, built against $label: $passed of $want (exit $status)"
+      echo "$out" | grep -v '^ok ' | tail -5 | sed 's/^/      /'
+      fail=1
+    else
+      echo "ok    the images extension on $gpu, built against $label: $want of $want"
+    fi
+  done
+}
+
 run "VirtualGPU's HSA header" -I"$root/amd/include"
+run_images "VirtualGPU's HSA header" -I"$root/amd/include"
 rocm_include="${VGPU_ROCM_INCLUDE:-}"
 if [[ -z "$rocm_include" ]]; then
   for d in /opt/rocm/include $(ls -d "$HOME"/.local/share/rocm-*/opt/rocm-*/include 2>/dev/null | sort -V | tail -1); do
@@ -60,6 +88,7 @@ if [[ -z "$rocm_include" ]]; then
 fi
 if [[ -n "$rocm_include" ]]; then
   run "ROCm's HSA headers" -DVGPU_REAL_HSA -D__HIP_PLATFORM_AMD__ -I"$rocm_include"
+  run_images "ROCm's HSA headers" -DVGPU_REAL_HSA -D__HIP_PLATFORM_AMD__ -I"$rocm_include"
 else
   echo "skip  no ROCm headers to build against as well"
 fi
