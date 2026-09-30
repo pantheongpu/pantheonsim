@@ -16,6 +16,7 @@
 
 #include "vgpu/amd_codeobject.hpp"
 #include "vgpu/amd_exec.hpp"
+#include "vgpu/amd_image.hpp"
 #include "vtest.hpp"
 
 using namespace vgpu;
@@ -791,6 +792,126 @@ VTEST(the_real_time_clock_counts_at_the_wall_clock_rate) {
   // The instructions the thread running the wave has retired: a count far
   // below a clock that has been going since the host started.
   VCHECK(shader < realtime / 1000);
+}
+
+// RDNA's image instructions and formatted buffer loads (asm_images.s) on
+// resources written here as the runtime writes a texture's: each result
+// against the texel arithmetic done on the host.
+VTEST(rdna_images_load_store_sample_gather_and_query_what_their_resources_describe) {
+  namespace im = amd::image;
+  const amd::CodeObject o = object("asm_images", "gfx1100");
+  MemoryManager mem(16ull << 20);
+  const auto t0 = [](int64_t x, int64_t y) {
+    x = std::clamp<int64_t>(x, 0, 7), y = std::clamp<int64_t>(y, 0, 3);
+    return static_cast<float>(x + 10 * y) + 0.25f;
+  };
+  std::vector<float> f0(32);
+  for (uint32_t i = 0; i < 32; ++i) f0[i] = t0(i % 8, i / 8);
+  std::vector<uint8_t> rgba(4 * 8), elems(4 * 32);
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint8_t b[4] = {static_cast<uint8_t>((i % 4) * 40), static_cast<uint8_t>((i / 4) * 100), 7, 255};
+    std::memcpy(&rgba[4 * i], b, 4);
+  }
+  for (uint32_t i = 0; i < 32; ++i) {
+    const uint8_t b[4] = {static_cast<uint8_t>(i), static_cast<uint8_t>(2 * i), static_cast<uint8_t>(3 * i),
+                          static_cast<uint8_t>(255 - i)};
+    std::memcpy(&elems[4 * i], b, 4);
+  }
+  std::vector<float> mips(16 + 4);
+  for (uint32_t i = 0; i < 20; ++i) mips[i] = i < 16 ? 1.0f : 2.0f;
+  const uint64_t d0 = mem.alloc(32 * 4), d1 = mem.alloc(rgba.size()), d2 = mem.alloc(32 * 4),
+                 db = mem.alloc(elems.size()), d3 = mem.alloc(mips.size() * 4);
+  mem.write(d0, f0.data(), 32 * 4);
+  mem.write(d1, rgba.data(), rgba.size());
+  const std::vector<uint32_t> zero(32, 0);
+  mem.write(d2, zero.data(), 32 * 4);
+  mem.write(db, elems.data(), elems.size());
+  mem.write(d3, mips.data(), mips.size() * 4);
+
+  uint32_t desc[48] = {};
+  im::Image i0;
+  i0.base = d0, i0.width = 8, i0.height = 4, i0.format = {im::Data::D32, im::Num::Float};
+  im::encode(i0, true, &desc[0]);
+  im::Image i1;
+  i1.base = d1, i1.width = 4, i1.height = 2, i1.format = {im::Data::D8_8_8_8, im::Num::Unorm};
+  im::encode(i1, true, &desc[8]);
+  im::Image i2 = i0;
+  i2.base = d2, i2.format = {im::Data::D32, im::Num::Uint};
+  im::encode(i2, true, &desc[16]);
+  im::Sampler point, linear, mip;
+  im::encode(point, &desc[24]);
+  linear.mag_linear = linear.min_linear = true;
+  im::encode(linear, &desc[28]);
+  im::encode_buffer(db, 4, 32, {im::Data::D8_8_8_8, im::Num::Unorm}, true, &desc[32]);
+  im::Image i3;
+  i3.base = d3, i3.width = 4, i3.height = 4, i3.last_level = 1, i3.format = {im::Data::D32, im::Num::Float};
+  im::encode(i3, true, &desc[36]);
+  mip.mip_filter = 2;
+  im::encode(mip, &desc[44]);
+  // The resources round-trip, and T3's level 1 sits right after level 0.
+  VCHECK_EQ(im::decode_image(&desc[8], true).width, 4u);
+  VCHECK(im::decode_image(&desc[8], true).format.data == im::Data::D8_8_8_8);
+  VCHECK_EQ(im::texel_offset(i3, 1, 0, 0, 0), uint64_t{64});
+  VCHECK(im::decode_sampler(&desc[28]).mag_linear);
+  const uint64_t ddesc = mem.alloc(sizeof(desc)), out = mem.alloc(800 * 4);
+  mem.write(ddesc, desc, sizeof(desc));
+
+  const amd::Kernel* k = amd::find_kernel(o, "images");
+  VCHECK(k != nullptr);
+  if (!k) return;
+  std::vector<uint8_t> args(k->kernarg_size, 0);
+  std::memcpy(&args[0], &out, 8);
+  std::memcpy(&args[8], &ddesc, 8);
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = k;
+  d.kernarg = mem.alloc(args.size());
+  mem.write(d.kernarg, args.data(), args.size());
+  d.group_size[0] = 32;
+  amd::execute(d, mem);
+  std::vector<uint32_t> r(800);
+  mem.read(out, r.data(), r.size() * 4);
+  const auto f = [&](uint32_t at) {
+    float v;
+    std::memcpy(&v, &r[at], 4);
+    return v;
+  };
+  const auto half = [](float v) {
+    const _Float16 h = static_cast<_Float16>(v);
+    uint16_t b;
+    std::memcpy(&b, &h, 2);
+    return uint32_t{b};
+  };
+  int wrong[13] = {};
+  for (uint32_t l = 0; l < 32; ++l) {
+    const int64_t x = l % 8, y = l / 8;
+    wrong[0] += f(l) != t0(x, y);
+    wrong[1] += f(32 + l) != t0(x, y);
+    wrong[2] += f(64 + l) != (x == 0 ? t0(0, y) : t0(x, y) - 0.5f);
+    const uint32_t t = (l % 4) + 4 * ((l / 4) % 2);
+    for (uint32_t c = 0; c < 4; ++c) wrong[3] += std::fabs(f(96 + 4 * l + c) - rgba[4 * t + c] / 255.0f) > 1e-6f;
+    const uint32_t level = l % 2;
+    wrong[4] += r[224 + 4 * l] != (4u >> level) || r[225 + 4 * l] != (4u >> level) || r[226 + 4 * l] != 1 ||
+                r[227 + 4 * l] != 2;
+    const float g[4] = {t0(x, y + 1), t0(x + 1, y + 1), t0(x + 1, y), t0(x, y)};
+    for (uint32_t c = 0; c < 4; ++c) wrong[5] += f(352 + 4 * l + c) != g[c];
+    for (uint32_t c = 0; c < 4; ++c) wrong[6] += std::fabs(f(480 + 4 * l + c) - elems[4 * l + c] / 255.0f) > 1e-6f;
+    wrong[7] += r[608 + l] != 0;
+    wrong[8] += f(640 + l) != t0(x, y);
+    const double lod = std::min(1.0, static_cast<double>(static_cast<float>(l) * 0.1f));
+    wrong[9] += std::fabs(f(672 + l) - static_cast<float>(1.0 + lod)) > 1e-6f;
+    wrong[10] += r[704 + l] != (half(rgba[4 * t] / 255.0f) | half(rgba[4 * t + 1] / 255.0f) << 16);
+    wrong[11] += r[736 + l] != 3 * l;
+    float e;
+    std::memcpy(&e, &elems[4 * l], 4);
+    wrong[12] += std::memcmp(&r[768 + l], &e, 4) != 0;
+  }
+  for (int c = 0; c < 13; ++c) VCHECK_EQ(wrong[c], 0);
+  std::vector<uint32_t> stored(32);
+  mem.read(d2, stored.data(), 32 * 4);
+  int bad = 0;
+  for (uint32_t l = 0; l < 32; ++l) bad += stored[l] != 3 * l + 5;
+  VCHECK_EQ(bad, 0);
 }
 
 VTEST_MAIN
