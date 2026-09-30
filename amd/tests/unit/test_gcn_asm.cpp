@@ -533,6 +533,25 @@ VTEST(lds_float_atomics_and_compare_and_stores_compute_what_the_isa_says) {
   VCHECK_EQ(wrong, 0);
 }
 
+VTEST(each_byte_of_a_word_converts_to_its_own_float) {
+  // v_cvt_f32_ubyte1 and 2 read byte 3 until the byte was taken from the
+  // right place in the name: uchar2's divide came out with a zero .y.
+  const amd::CodeObject o = object("asm_cvt_ubyte");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> in(64);
+  for (uint32_t l = 0; l < 64; ++l) in[l] = 0x01020304u * (l + 1) ^ (l << 11);
+  const uint64_t in_d = mem.alloc(64 * 4), out = mem.alloc(64 * 32);
+  mem.write(in_d, in.data(), 64 * 4);
+  const std::vector<uint32_t> r = run(o, "cvt_ubyte", mem, out, 64 * 8, {in_d, out});
+  int wrong = 0;
+  for (uint32_t l = 0; l < 64; ++l)
+    for (uint32_t k = 0; k < 4; ++k) {
+      wrong += r[8 * l + k] != f(static_cast<float>((in[l] >> (8 * k)) & 0xFF));
+      wrong += r[8 * l + 4 + k] != f(static_cast<float>((in[0] >> (8 * k)) & 0xFF));
+    }
+  VCHECK_EQ(wrong, 0);
+}
+
 VTEST(a_kernel_finds_only_the_group_ids_it_asked_for_one_after_another) {
   const amd::CodeObject o = object("asm_scalar");
   const amd::Kernel* k = amd::find_kernel(o, "group_z");

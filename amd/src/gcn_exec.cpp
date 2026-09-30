@@ -1883,7 +1883,7 @@ struct Machine {
     const auto half = [&](uint32_t k, uint32_t lane) { return static_cast<float>(lane_half(w, in.src[k], lane)); };
     if (op == "v_nop"_op) {
     } else if (op == "v_cvt_f32_ubyte1_e32"_op || op == "v_cvt_f32_ubyte2_e32"_op || op == "v_cvt_f32_ubyte3_e32"_op) {
-      const uint32_t at = 8 * static_cast<uint32_t>(op.substr(16, 1)[0] - '0');
+      const uint32_t at = 8 * static_cast<uint32_t>(op.substr(15, 1)[0] - '0');   // "v_cvt_f32_ubyte1_e32"[15]
       each([&](uint32_t lane) {
         write_float(w, in, lane, static_cast<float>((lane_src(w, in.src[0], lane) >> at) & 0xFF));
       });
