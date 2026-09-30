@@ -65,6 +65,13 @@ echo "wrote $(pwd)/exports.gfx942 and exports_kernel.gfx942.co"
 # Events shared with another process, which it forks for.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 ipc.cpp -o ipc.gfx942
 echo "wrote $(pwd)/ipc.gfx942"
+# Every error code's name and text; rocm/errors.expected is the same program
+# on ROCm's own libamdhip64.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 errors.cpp -o errors.gfx942
+echo "wrote $(pwd)/errors.gfx942"
+# How many devices a program is shown, under the visible-devices variables.
+"$rocm/bin/hipcc" -O2 --offload-arch=gfx942 visible.cpp -o visible.gfx942
+echo "wrote $(pwd)/visible.gfx942"
 
 # Streams that run at once: kernels on two streams handing values to each
 # other, events, stream waits, the null stream's ordering, host functions.

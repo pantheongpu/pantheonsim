@@ -35,4 +35,9 @@ uint32_t kfd_gfx_target_version(const std::string& gfx);
 // GUID and amd-smi as kfd_id.
 uint32_t kfd_gpu_id(const char* uuid);
 
+// KFD's unique_id for a GPU (its node's properties file): a hash of the
+// device's UUID. Ollama names a ROCm GPU "GPU-" and this in hex, and passes
+// that name in ROCR_VISIBLE_DEVICES.
+uint64_t kfd_unique_id(const char* uuid);
+
 }  // namespace vgpu::amd

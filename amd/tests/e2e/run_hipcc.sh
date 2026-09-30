@@ -308,6 +308,46 @@ echo "$out" | sed 's/^/      /'
 expect "the interprocess events program runs to the end" "0" "$status"
 expect "every one of its interprocess checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# Every error code's name and text, from both the runtime's and the driver's
+# forms, as ROCm 7.1's own library gives them, line for line.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/errors.gfx942" 2>&1)
+expect "every error's name and text are ROCm's" "same" \
+  "$(diff -q <(echo "$out") "$(dirname "$exe")/rocm/errors.expected" >/dev/null && echo same ||
+     diff <(echo "$out") "$(dirname "$exe")/rocm/errors.expected" | head -4 | tr '\n' ' ')"
+
+# The devices a program is shown: ROCR_VISIBLE_DEVICES picks from four, then
+# HIP_VISIBLE_DEVICES from those, each read up to its first bad entry; none
+# shown is no device.
+visible() { env "$@" VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=4 LD_LIBRARY_PATH="$shim" \
+            "$(dirname "$exe")/visible.gfx942" 2>&1; }
+expect "HIP_VISIBLE_DEVICES=0,2 shows two devices" "hipSuccess 2" "$(visible HIP_VISIBLE_DEVICES=0,2)"
+expect "ROCR_VISIBLE_DEVICES=3 shows one" "hipSuccess 1" "$(visible ROCR_VISIBLE_DEVICES=3)"
+expect "a list stops at its first device that is not there" "hipSuccess 1" "$(visible HIP_VISIBLE_DEVICES=1,9,0)"
+expect "HIP's list picks from ROCr's" "hipSuccess 1" "$(visible ROCR_VISIBLE_DEVICES=1,2 HIP_VISIBLE_DEVICES=1)"
+expect "an empty list shows none" "hipErrorNoDevice 0" "$(visible HIP_VISIBLE_DEVICES=)"
+# A device named by its UUID: the HSA agent's, or KFD's unique_id in hex,
+# which is how Ollama names a ROCm GPU in ROCR_VISIBLE_DEVICES. unique_id is
+# the 64-bit FNV-1a of the device's UUID string (amd/src/kfd.cpp), and that
+# string comes from the profile's id (describe_device, src/core/telemetry.cpp).
+kfd_id=$(python3 - <<'PY'
+h = 2166136261
+for c in b"amd/mi300x": h = ((h ^ c) * 16777619) & 0xFFFFFFFF
+u = "GPU-%08x-%04x-%04x-%04x-%08x%04x" % (h, (h >> 16) & 0xFFFF, 0x4000 | (h & 0x0FFF),
+                                          0x8000 | ((h >> 4) & 0x3FFF), (h * 2654435761) & 0xFFFFFFFF, 2)
+f = 1469598103934665603
+for c in u.encode(): f = ((f ^ c) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+print("GPU-%016x" % f)
+PY
+)
+expect "ROCR_VISIBLE_DEVICES names a device by its HSA UUID" "hipSuccess 1" "$(visible ROCR_VISIBLE_DEVICES=GPU-5647505500000002)"
+expect "ROCR_VISIBLE_DEVICES names a device by KFD's unique_id, as Ollama does" "hipSuccess 1" "$(visible ROCR_VISIBLE_DEVICES=$kfd_id)"
+expect "a UUID no device has shows none" "hipErrorNoDevice 0" "$(visible ROCR_VISIBLE_DEVICES=GPU-00000000deadbeef)"
+# CUDA_VISIBLE_DEVICES stands in for HIP_VISIBLE_DEVICES when that is unset,
+# as ROCm's HIP reads it: -1 hides every GPU, unless HIP_VISIBLE_DEVICES says.
+expect "CUDA_VISIBLE_DEVICES=-1 hides every GPU from HIP" "hipErrorNoDevice 0" "$(visible CUDA_VISIBLE_DEVICES=-1)"
+expect "HIP_VISIBLE_DEVICES comes before CUDA_VISIBLE_DEVICES" "hipSuccess 1" \
+  "$(visible HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=-1)"
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)
