@@ -96,6 +96,8 @@ int main() {
   IS(cuStreamAttachMemAsync(s, d, 0, CU_MEM_ATTACH_GLOBAL), CUDA_ERROR_INVALID_VALUE);
   IS(cuStreamAttachMemAsync(s, a, 0, 7), CUDA_ERROR_INVALID_VALUE);
 
+  // The location forms arrived in CUDA 12.2; hosted CI builds against 12.0.
+#if CUDA_VERSION >= 12020
   CUmemLocation loc{};
   loc.type = CU_MEM_LOCATION_TYPE_DEVICE;
   loc.id = 0;
@@ -110,6 +112,7 @@ int main() {
   loc.type = CU_MEM_LOCATION_TYPE_HOST;
   loc.id = 0;
   IS(cuMemPrefetchAsync_v2(a, 400, loc, 0, s), CUDA_SUCCESS);
+#endif
 
   // The host writes, a kernel reads and writes, the host reads.
   unsigned* ha = reinterpret_cast<unsigned*>(a);

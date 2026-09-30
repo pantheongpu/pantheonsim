@@ -1878,8 +1878,14 @@ VGPU_EXPORT CUresult cuMemAdvise(CUdeviceptr dptr, size_t count, int advice, CUd
 namespace {
 constexpr uintptr_t kTagArray = 0;
 
-size_t format_bytes(CUarray_format f) {
-  switch (f) {
+// Taken by reference and read as the raw value: an application can pass a
+// format this header does not name, and loading that as the enum is undefined
+// (UBSan: "not a valid value for type 'CUarray_format_enum'").
+size_t format_bytes(const CUarray_format& f) {
+  unsigned raw;
+  static_assert(sizeof raw == sizeof f);
+  std::memcpy(&raw, &f, sizeof raw);
+  switch (raw) {
     case CU_AD_FORMAT_UNSIGNED_INT8: case CU_AD_FORMAT_SIGNED_INT8: return 1;
     case CU_AD_FORMAT_UNSIGNED_INT16: case CU_AD_FORMAT_SIGNED_INT16: case CU_AD_FORMAT_HALF: return 2;
     case CU_AD_FORMAT_UNSIGNED_INT32: case CU_AD_FORMAT_SIGNED_INT32: case CU_AD_FORMAT_FLOAT: return 4;
