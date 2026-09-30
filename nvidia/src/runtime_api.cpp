@@ -6650,10 +6650,37 @@ VGPU_EXPORT cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
   // holding one frees it itself. What ends with the graph is the chance of ever
   // allocating at that address again, so the address can be given back -- by the
   // free that ends the allocation, or by the next trim.
+  //
+  // The graph's handle is its address, which the next graph created may well
+  // be given. What still refers to this one -- its allocations, and the execs
+  // instantiated from it, which keep auto-freeing on launch -- is moved to a
+  // token no graph can have (graphs are aligned, the token odd). Left at the
+  // address, a new graph there was taken for this one: its first
+  // instantiation was refused as a second instantiation of a graph holding
+  // memory (CUDA's graphMemoryFootprint sample, which destroys each graph
+  // after instantiating it).
+  //
+  // Nor is an allocation's address done with while such an exec lives: it
+  // allocates there on every launch. Only when the last of them goes too
+  // (cudaGraphExecDestroy) can nothing allocate there again. CUDA's
+  // graphMemoryNodes sample relaunches an exec whose graph it destroyed, after
+  // freeing the allocation outside the graph, and that launch found no record
+  // of the allocation.
+  static uintptr_t tombstones = 0;
+  void* const gone = reinterpret_cast<void*>((++tombstones << 1) | 1);
+  bool instantiated = false;
+  for (auto& [exec_handle, source] : g_exec_source)
+    if (source == static_cast<void*>(graph)) {
+      source = gone;
+      instantiated = true;
+    }
   {
     std::lock_guard<std::mutex> mem_lock(g_graph_mem_mu);
     for (auto& [va, a] : g_graph_allocs)
-      if (a.owner == static_cast<void*>(graph)) a.owner_gone = true;
+      if (a.owner == static_cast<void*>(graph)) {
+        a.owner_gone = !instantiated;
+        a.owner = gone;
+      }
   }
   g_graphs.erase(static_cast<void*>(graph));
   return cudaSuccess;
@@ -6661,7 +6688,19 @@ VGPU_EXPORT cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
 VGPU_EXPORT cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   g_graph_execs.erase(static_cast<void*>(exec));
-  g_exec_source.erase(static_cast<void*>(exec));
+  // The last exec of a destroyed graph: now nothing can allocate at that
+  // graph's addresses again (see cudaGraphDestroy).
+  if (const auto src = g_exec_source.find(static_cast<void*>(exec)); src != g_exec_source.end()) {
+    void* const source = src->second;
+    g_exec_source.erase(src);
+    const bool last = std::none_of(g_exec_source.begin(), g_exec_source.end(),
+                                   [&](const auto& kv) { return kv.second == source; });
+    if (last && !g_graphs.count(source)) {
+      std::lock_guard<std::mutex> mem_lock(g_graph_mem_mu);
+      for (auto& [va, a] : g_graph_allocs)
+        if (a.owner == source) a.owner_gone = true;
+    }
+  }
   g_exec_auto_free.erase(static_cast<void*>(exec));
   return cudaSuccess;
 }
