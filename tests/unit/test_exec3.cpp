@@ -10,6 +10,7 @@
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
+#include "vgpu/runtime/runtime.hpp"
 #include <array>
 #include <cmath>
 #include "vtest.hpp"
@@ -1804,6 +1805,200 @@ VTEST(bar_red_refuses_what_the_isa_leaves_undefined) {
   {
     auto err = VCAPTURE(Error, ptx::parse(kernel("  bar.red.popc.u32 %r2, 16, %p1;")));
     VCHECK_CONTAINS(err.what(), "barriers 0 to 15");
+  }
+}
+
+// A bar.sync inside a device function that was not inlined: the warp stops
+// in the middle of the callee and the other warps run until they arrive.
+// Each thread writes shared memory, the callee's barrier orders the writes
+// before the reads, and a thread in another warp reads it back. The callee
+// returns a value, and the caller carries on with its own registers intact.
+VTEST(bar_sync_inside_a_device_function_yields_to_other_warps) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.shared .align 4 .b8 buf[512];
+.func (.param .b32 ret) exchange(.param .b32 v)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<4>;
+  ld.param.b32 %r1, [v];
+  mov.u32 %r2, %tid.x;
+  mov.u32 %r7, buf;
+  mad.lo.u32 %r3, %r2, 4, %r7;
+  st.shared.u32 [%r3], %r1;
+  bar.sync 0;
+  xor.b32 %r4, %r2, 64;         // a thread two warps away
+  mad.lo.u32 %r5, %r4, 4, %r7;
+  ld.shared.u32 %r6, [%r5];
+  bar.sync 0;
+  st.param.b32 [ret], %r6;
+  ret;
+}
+.visible .entry k(.param .u64 p)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<6>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  mul.lo.u32 %r2, %r1, 3;
+  add.u32 %r7, %r1, 1000;       // live across the call
+  {
+  .param .b32 a0;
+  st.param.b32 [a0], %r2;
+  .param .b32 r0;
+  call.uni (r0), exchange, (a0);
+  ld.param.b32 %r3, [r0];
+  }
+  {
+  .param .b32 a1;
+  st.param.b32 [a1], %r3;
+  .param .b32 r1;
+  call.uni (r1), exchange, (a1);
+  ld.param.b32 %r4, [r1];
+  }
+  mul.wide.u32 %rd3, %r1, 8;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r3;
+  st.global.u32 [%rd4+4], %r7;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  const ptx::EntryFn* k = nullptr;
+  for (const auto& e : m.entries)
+    if (e.name == "k") k = &e;
+  VCHECK(k != nullptr);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(128 * 8);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.block = {128, 1, 1};
+  std::vector<uint8_t> pa(8);
+  std::memcpy(pa.data(), &out, 8);
+  exec::launch(*k, cfg, {pa}, mem, prof);
+  for (uint64_t t = 0; t < 128; ++t) {
+    VCHECK_EQ(mem.load_scalar(out + 8 * t, 4), (t ^ 64) * 3);
+    VCHECK_EQ(mem.load_scalar(out + 8 * t + 4, 4), t + 1000);
+  }
+  mem.free(out);
+}
+
+// A barrier inside a call that only some of the warp's lanes made can never
+// complete for that warp: the others wait in the caller until it returns. The
+// ISA leaves it undefined, and it is refused by name rather than hung on.
+VTEST(bar_sync_in_a_call_some_lanes_skipped_is_refused) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.func sync_here()
+{
+  bar.sync 0;
+  ret;
+}
+.visible .entry k()
+{
+  .reg .b32 %r<4>;
+  .reg .pred %p<2>;
+  mov.u32 %r1, %tid.x;
+  setp.lt.u32 %p1, %r1, 16;
+  @!%p1 bra SKIP;
+  call.uni sync_here, ();
+SKIP:
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  const ptx::EntryFn* k = nullptr;
+  for (const auto& e : m.entries)
+    if (e.name == "k") k = &e;
+  VCHECK(k != nullptr);
+  MemoryManager mem{1 << 20};
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  auto err = VCAPTURE(Error, exec::launch(*k, cfg, {}, mem, prof));
+  VCHECK_CONTAINS(err.what(), "needs lanes that did not make the call");
+}
+
+// An indirect call whose lanes hold different targets: each target runs for
+// its own lanes, each lane gets its own return value back in the one slot,
+// and the warp carries on together.
+VTEST(an_indirect_call_with_a_target_per_lane_runs_each_target) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.func (.param .b32 r) twice(.param .b32 a)
+{
+  .reg .b32 %r<3>;
+  ld.param.b32 %r1, [a];
+  shl.b32 %r2, %r1, 1;
+  st.param.b32 [r], %r2;
+  ret;
+}
+.func (.param .b32 r) plus100(.param .b32 a)
+{
+  .reg .b32 %r<3>;
+  ld.param.b32 %r1, [a];
+  add.u32 %r2, %r1, 100;
+  st.param.b32 [r], %r2;
+  ret;
+}
+.func (.param .b32 r) negate(.param .b32 a)
+{
+  .reg .b32 %r<3>;
+  ld.param.b32 %r1, [a];
+  neg.s32 %r2, %r1;
+  st.param.b32 [r], %r2;
+  ret;
+}
+.global .align 8 .u64 table[3] = {twice, plus100, negate};
+.visible .entry k(.param .u64 p)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<10>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  rem.u32 %r2, %r1, 3;
+  mov.u64 %rd3, table;
+  mul.wide.u32 %rd4, %r2, 8;
+  add.u64 %rd5, %rd3, %rd4;
+  ld.global.u64 %rd6, [%rd5];
+  {
+  .param .b32 a0;
+  st.param.b32 [a0], %r1;
+  .param .b32 r0;
+  proto: .callprototype (.param .b32 _) _ (.param .b32 _);
+  call (r0), %rd6, (a0), proto;
+  ld.param.b32 %r3, [r0];
+  }
+  activemask.b32 %r4;
+  mul.wide.u32 %rd7, %r1, 8;
+  add.u64 %rd8, %rd2, %rd7;
+  st.global.u32 [%rd8], %r3;
+  st.global.u32 [%rd8+4], %r4;
+  ret;
+}
+)";
+  // Through the runtime, which places the module's globals: the table's
+  // initialiser is a list of function addresses.
+  runtime::Runtime rt(load_gpu("nvidia/a10"));
+  auto& dev = rt.device(0);
+  uint64_t mod = dev.load_module(kPtx);
+  const ptx::EntryFn* fn = dev.get_function(mod, "k");
+  uint64_t out = dev.memory().alloc(32 * 8);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  dev.launch(*fn, cfg, {arg_u64(out)}, dev.symbols(mod));
+  for (uint32_t t = 0; t < 32; ++t) {
+    const uint32_t want = t % 3 == 0 ? 2 * t : t % 3 == 1 ? t + 100 : static_cast<uint32_t>(-static_cast<int32_t>(t));
+    VCHECK_EQ(dev.memory().load_scalar(out + 8 * t, 4), uint64_t{want});
+    VCHECK_EQ(dev.memory().load_scalar(out + 8 * t + 4, 4), uint64_t{0xffffffffu});
   }
 }
 

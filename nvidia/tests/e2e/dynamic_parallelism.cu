@@ -49,6 +49,26 @@ struct Mixed {
   double d;
   short s[3];
 };
+// Streams and events created on the device (CUDA Samples'
+// cdpSimpleQuicksort): children launched into a stream of the kernel's own,
+// an event recorded on it and waited for, both destroyed.
+__global__ void device_streams(int* out) {
+  cudaStream_t s1, s2;
+  cudaEvent_t e;
+  int err = 0;
+  err |= cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking);
+  err |= cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking);
+  err |= cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+  mark<<<1, 1, 0, s1>>>(out, 0);
+  err |= cudaEventRecord(e, s1);
+  err |= cudaStreamWaitEvent(s2, e, 0);
+  mark<<<1, 1, 0, s2>>>(out, 1);
+  err |= cudaStreamDestroy(s1);
+  err |= cudaStreamDestroy(s2);
+  err |= cudaEventDestroy(e);
+  out[2] = err;
+  out[3] = s1 != s2 && s1 != 0 && s2 != 0;
+}
 __global__ void takes_mixed(double* out, char a, Mixed m, int b, long long c) {
   out[0] = a;
   out[1] = m.c;
@@ -117,6 +137,19 @@ bool run() {
     CK(cudaMemcpy(h, d, sizeof h, cudaMemcpyDeviceToHost));
     const bool good = h[0] == 100 && h[1] == 101;
     std::printf("tail and fire-and-forget streams: %d %d%s\n", h[0], h[1], good ? "" : " (want 100 101)");
+    ok = ok && good;
+  }
+  {
+    int* d;
+    CK(cudaMalloc(&d, 4 * sizeof(int)));
+    CK(cudaMemset(d, 0, 4 * sizeof(int)));
+    device_streams<<<1, 1>>>(d);
+    CK(cudaDeviceSynchronize());
+    int h[4];
+    CK(cudaMemcpy(h, d, sizeof h, cudaMemcpyDeviceToHost));
+    const bool good = h[0] == 100 && h[1] == 101 && h[2] == 0 && h[3] == 1;
+    std::printf("device-created streams and events: %d %d err %d distinct %d%s\n", h[0], h[1], h[2], h[3],
+                good ? "" : " (want 100 101 err 0 distinct 1)");
     ok = ok && good;
   }
   {
