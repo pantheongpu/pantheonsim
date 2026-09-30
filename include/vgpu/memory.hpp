@@ -488,7 +488,10 @@ class MemoryManager {
     }
   };
   static constexpr size_t kRetiredHostMaps = 256;
-  std::unique_ptr<HostMaps> host_maps_;
+  // Made with the manager rather than on the first mapping: a kernel's worker
+  // thread reads this pointer while the program maps a buffer (hipHostMalloc
+  // while a launch runs), so it must never change after construction.
+  std::unique_ptr<HostMaps> host_maps_ = std::make_unique<HostMaps>();
   const HostMap* find_host_map_locked(uint64_t addr, uint64_t len) const;
   // Host memory mapped over the whole of [addr, addr + len), perhaps as
   // several mappings placed end to end: the pieces, in order, as (host

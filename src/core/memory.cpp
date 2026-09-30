@@ -407,7 +407,6 @@ const MemoryManager::HostMap* MemoryManager::find_host_map_locked(uint64_t addr,
 }
 
 void MemoryManager::map_host(uint64_t addr, void* host, uint64_t len) {
-  if (!host_maps_) host_maps_ = std::make_unique<HostMaps>();
   std::lock_guard<std::mutex> lock(host_maps_->mu);
   host_maps_->maps.push_back(HostMap{addr, len, static_cast<uint8_t*>(host)});
   // The allocator hands freed host addresses out again, so an old record of a
@@ -741,7 +740,8 @@ void MemoryManager::drop_shared(std::map<uint64_t, SharedRegion>::iterator it) {
 }
 
 bool MemoryManager::is_host_mapped(uint64_t addr) const {
-  if (!host_maps_) return false;
+  // Nothing mapped near it: no lock, as before any buffer was mapped at all.
+  if (!host_maps_->may_contain(addr)) return false;
   std::lock_guard<std::mutex> lock(host_maps_->mu);
   return find_host_map_locked(addr, 1) != nullptr;
 }
