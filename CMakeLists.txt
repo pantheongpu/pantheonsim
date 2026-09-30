@@ -151,6 +151,7 @@ add_library(vgpu STATIC
   src/ptx/lexer.cpp
   src/ptx/parser.cpp
   src/ptx/regalloc.cpp
+  src/ptx/contract.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
   src/runtime/runtime.cpp
@@ -1278,6 +1279,13 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_cg_multi_warp_tiles
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cg_multi_warp_tiles.sh)
+  set_tests_properties(e2e_cg_multi_warp_tiles PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_border_colour
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_border_colour.sh)
   set_tests_properties(e2e_border_colour PROPERTIES
@@ -1302,6 +1310,62 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_texture_int_coords
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_int_coords.sh)
   set_tests_properties(e2e_texture_int_coords PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_ptx_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ptx_forms.sh)
+  set_tests_properties(e2e_ptx_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_ptx_sweep
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ptx_sweep.sh)
+  set_tests_properties(e2e_ptx_sweep PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_ptx_warp_mem
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ptx_warp_mem.sh)
+  set_tests_properties(e2e_ptx_warp_mem PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_ptx_memory_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ptx_memory_forms.sh)
+  set_tests_properties(e2e_ptx_memory_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_occupancy_rules
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_occupancy_rules.sh)
+  set_tests_properties(e2e_occupancy_rules PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_ptx_half_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ptx_half_forms.sh)
+  set_tests_properties(e2e_ptx_half_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_mul_add_contraction
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mul_add_contraction.sh)
+  set_tests_properties(e2e_mul_add_contraction PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_div_approx
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_div_approx.sh)
+  set_tests_properties(e2e_div_approx PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
@@ -1399,6 +1463,11 @@ set_tests_properties(e2e_cooperative_grid PROPERTIES
 # is written against a clean-room header, so nothing else in the build compares
 # the two. It existed unregistered for a while, which is how ten device
 # attributes came to be filed under the wrong numbers.
+add_test(NAME e2e_reserved_smem_attr COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_reserved_smem_attr.sh)
+set_tests_properties(e2e_reserved_smem_attr PROPERTIES
+  DEPENDS "vgpucuda;vgpucudart"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
 add_test(NAME e2e_driver_abi COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_driver_abi.sh)
 set_tests_properties(e2e_driver_abi PROPERTIES
   DEPENDS vgpucuda

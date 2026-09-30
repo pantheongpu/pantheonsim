@@ -19,20 +19,23 @@ uint32_t slots_for(const Type& t) {
 
 // Collects every register referenced by an instruction, separating the
 // destination (a definition) from the sources (uses).
-void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t>& uses) {
+void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t>& uses, bool keyed = false) {
+  // keyed: each register as id * 2 + wide, since the 32- and 64-bit files
+  // number their registers separately (see ptx::instr_registers).
+  auto K = [keyed](const Reg& r) { return keyed ? r.id * 2 + (r.wide ? 1u : 0u) : r.id; };
   auto use_operand = [&](const Operand& o) {
-    if (const auto* r = std::get_if<RegOperand>(&o)) uses.push_back(r->reg.id);
+    if (const auto* r = std::get_if<RegOperand>(&o)) uses.push_back(K(r->reg));
   };
   auto use_addr = [&](const Addr& a) {
-    if (a.base_kind == Addr::Base::Reg && a.base_id != kNoReg) uses.push_back(a.base_id);
+    if (a.base_kind == Addr::Base::Reg && a.base_id != kNoReg) uses.push_back(keyed ? a.base_id * 2 + (a.base_wide ? 1u : 0u) : a.base_id);
   };
-  if (ins.has_pred && ins.pred.id != kNoReg) uses.push_back(ins.pred.id);
+  if (ins.has_pred && ins.pred.id != kNoReg) uses.push_back(K(ins.pred));
 
   std::visit(
       [&](const auto& op) {
         if constexpr (requires { op.dst; }) {
           if constexpr (std::is_same_v<std::decay_t<decltype(op.dst)>, Reg>) {
-            if (op.dst.id != kNoReg) defs.push_back(op.dst.id);
+            if (op.dst.id != kNoReg) defs.push_back(K(op.dst));
           } else if constexpr (std::is_same_v<std::decay_t<decltype(op.dst)>, Addr>) {
             // An address-typed destination defines memory, not a register; the
             // register it names is read to form the address.
@@ -40,10 +43,10 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
           }
         }
         if constexpr (requires { op.dsts; })
-          for (const auto& d : op.dsts) defs.push_back(d.id);
+          for (const auto& d : op.dsts) defs.push_back(K(d));
         if constexpr (requires { op.src; }) {
           if constexpr (std::is_same_v<std::decay_t<decltype(op.src)>, Reg>)
-            uses.push_back(op.src.id);
+            uses.push_back(K(op.src));
           else if constexpr (std::is_same_v<std::decay_t<decltype(op.src)>, Operand>)
             use_operand(op.src);
           else if constexpr (std::is_same_v<std::decay_t<decltype(op.src)>, Addr>)
@@ -55,29 +58,41 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
         if constexpr (requires { op.srcs; })
           for (const auto& s : op.srcs) use_operand(s);
         if constexpr (requires { op.a; }) {
-          if constexpr (std::is_same_v<std::decay_t<decltype(op.a)>, Reg>) uses.push_back(op.a.id);
+          if constexpr (std::is_same_v<std::decay_t<decltype(op.a)>, Reg>) uses.push_back(K(op.a));
           else if constexpr (std::is_same_v<std::decay_t<decltype(op.a)>, Operand>) use_operand(op.a);
-          else for (const auto& r : op.a) uses.push_back(r.id);
+          else for (const auto& r : op.a) uses.push_back(K(r));
         }
         if constexpr (requires { op.b; }) {
-          if constexpr (std::is_same_v<std::decay_t<decltype(op.b)>, Reg>) uses.push_back(op.b.id);
+          if constexpr (std::is_same_v<std::decay_t<decltype(op.b)>, Reg>) uses.push_back(K(op.b));
           else if constexpr (std::is_same_v<std::decay_t<decltype(op.b)>, Operand>) use_operand(op.b);
-          else for (const auto& r : op.b) uses.push_back(r.id);
+          else for (const auto& r : op.b) uses.push_back(K(r));
         }
         if constexpr (requires { op.c; }) {
           if constexpr (std::is_same_v<std::decay_t<decltype(op.c)>, Operand>) use_operand(op.c);
-          else for (const auto& r : op.c) uses.push_back(r.id);
+          else if constexpr (std::is_same_v<std::decay_t<decltype(op.c)>, Reg>) {
+            if (op.c.id != kNoReg) uses.push_back(K(op.c));   // setp/set's predicate operand
+          } else for (const auto& r : op.c) uses.push_back(K(r));
         }
+        if constexpr (requires { op.dst2; })
+          if (op.dst2.id != kNoReg) defs.push_back(K(op.dst2));
         if constexpr (requires { op.d; }) {
           if constexpr (std::is_same_v<std::decay_t<decltype(op.d)>, Operand>) use_operand(op.d);
-          else for (const auto& r : op.d) defs.push_back(r.id);
+          else for (const auto& r : op.d) defs.push_back(K(r));
         }
-        if constexpr (requires { op.pred; }) uses.push_back(op.pred.id);
+        if constexpr (requires { op.pred; }) uses.push_back(K(op.pred));
         if constexpr (requires { op.pred_dst; })
-          if (op.pred_dst.id != kNoReg) defs.push_back(op.pred_dst.id);
+          if (op.pred_dst.id != kNoReg) defs.push_back(K(op.pred_dst));
         if constexpr (requires { op.member_mask; }) use_operand(op.member_mask);
         if constexpr (requires { op.stride; }) use_operand(op.stride);
         if constexpr (requires { op.addr; }) use_addr(op.addr);
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpAtom>) {
+          if (op.b128) {
+            if (op.dst_hi.id != kNoReg) defs.push_back(K(op.dst_hi));
+            use_operand(op.b_hi);
+            if (op.op == AtomOp::Cas) use_operand(op.c_hi);
+          }
+        }
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpStBulk>) use_operand(op.size);
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpBar> ||
                       std::is_same_v<std::decay_t<decltype(op)>, OpBarRed>) {
           use_operand(op.id);
@@ -99,15 +114,15 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpWgmma>) {
           // The accumulator is read as well as written, and the descriptors
           // and the scale-d predicate are ordinary sources.
-          for (const auto& r : op.d) uses.push_back(r.id);
+          for (const auto& r : op.d) uses.push_back(K(r));
           use_operand(op.a_desc);
           use_operand(op.b_desc);
           use_operand(op.scale_d);
           use_operand(op.sp_meta);
         }
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpTcgen05>) {
-          for (const auto& r : op.regs) (op.kind == Tcgen05Kind::Ld ? defs : uses).push_back(r.id);
-          if (op.red) defs.push_back(op.red_dst.id);
+          for (const auto& r : op.regs) (op.kind == Tcgen05Kind::Ld ? defs : uses).push_back(K(r));
+          if (op.red) defs.push_back(K(op.red_dst));
           for (const Operand* o : {&op.taddr, &op.ncols, &op.cta_mask, &op.d_tmem, &op.b_desc,
                                    &op.idesc, &op.enable_d, &op.scale_a, &op.scale_b, &op.sp_meta,
                                    &op.zero_mask})
@@ -117,15 +132,19 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpClc>) {
           use_addr(op.mbar);
           for (const Reg* r : {&op.resp_lo, &op.resp_hi})
-            if (r->id != kNoReg) uses.push_back(r->id);
+            if (r->id != kNoReg) uses.push_back(K(*r));
           for (const auto& r : op.dst)
-            if (r.id != kNoReg) defs.push_back(r.id);
+            if (r.id != kNoReg) defs.push_back(K(r));
         }
       },
       ins.op);
 }
 
 }  // namespace
+
+void instr_registers(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t>& uses) {
+  collect(ins, defs, uses, /*keyed=*/true);
+}
 
 RegisterUsage analyze_registers(const EntryFn& fn) {
   RegisterUsage out;
@@ -248,7 +267,7 @@ Occupancy compute_occupancy(uint32_t regs_per_thread, uint32_t threads_per_block
                             uint32_t static_shared_bytes, uint32_t dynamic_shared_bytes,
                             uint32_t regs_per_sm, uint32_t max_threads_per_sm,
                             uint32_t max_blocks_per_sm, uint32_t shared_per_sm,
-                            uint32_t warp_size) {
+                            uint32_t warp_size, const OccupancyRules& rules) {
   Occupancy o;
   if (threads_per_block == 0 || warp_size == 0) return o;
   o.warps_per_block = (threads_per_block + warp_size - 1) / warp_size;
@@ -256,14 +275,29 @@ Occupancy compute_occupancy(uint32_t regs_per_thread, uint32_t threads_per_block
 
   uint32_t by_warps = max_threads_per_sm / warp_size / o.warps_per_block;
   uint32_t by_blocks = max_blocks_per_sm;
+  auto round_up = [](uint64_t v, uint64_t unit) { return unit > 1 ? (v + unit - 1) / unit * unit : v; };
   uint32_t by_regs = ~0u;
   if (regs_per_thread > 0 && regs_per_sm > 0) {
-    uint32_t regs_per_warp = regs_per_thread * warp_size;
-    uint32_t warps_by_regs = regs_per_warp ? regs_per_sm / regs_per_warp : ~0u;
-    by_regs = warps_by_regs / o.warps_per_block;
+    // cudaOccMaxBlocksPerSMRegsLimit: a warp's registers in the allocation
+    // unit; a block too big for the per-block file -- with its warps rounded
+    // up to the sub-partitions, as the hardware checks -- fits nowhere; and
+    // the warps that fit are counted per sub-partition.
+    const uint64_t per_warp = round_up(uint64_t{regs_per_thread} * warp_size, rules.reg_alloc_unit);
+    const uint32_t parts = std::max(1u, rules.sub_partitions);
+    const uint64_t assumed = per_warp * round_up(o.warps_per_block, parts);
+    if (rules.regs_per_block && (assumed > rules.regs_per_block ||
+                                 per_warp * o.warps_per_block > rules.regs_per_block)) {
+      by_regs = 0;
+    } else if (per_warp) {
+      const uint64_t warps = (regs_per_sm / parts) / per_warp * parts;
+      by_regs = static_cast<uint32_t>(warps / o.warps_per_block);
+    }
   }
   uint32_t by_shared = ~0u;
+  // cudaOccMaxBlocksPerSMSmemLimit: the block's shared memory with the
+  // driver's reservation, in the allocation unit.
   uint64_t shared = static_cast<uint64_t>(static_shared_bytes) + dynamic_shared_bytes;
+  if (shared || rules.reserved_smem) shared = round_up(shared + rules.reserved_smem, rules.smem_alloc_unit);
   if (shared > 0 && shared_per_sm > 0)
     by_shared = static_cast<uint32_t>(shared_per_sm / shared);
 

@@ -1390,10 +1390,49 @@ class Interpreter {
     bool exited = false;   // every warp Done; see BlockCtx::exited
   };
 
+  // The kernel's own shared memory as the hardware allocates it: static
+  // declarations, then the dynamic bytes, rounded up to the allocation unit
+  // (128 bytes from compute capability 8.0, 256 before; cuda_occupancy.h).
+  // An RTX 3060 reports this as %total_smem_size -- 128 for a kernel with one
+  // byte -- and puts its reserved shared memory straight after it.
+  uint32_t kernel_shared_bytes() const {
+    const uint64_t used = uint64_t{std::max(fn_.static_shared_size, fn_.dynamic_shared_offset)} +
+                          cfg_.shared_bytes;
+    const uint64_t unit = profile_.cc_major >= 8 ? 128 : 256;
+    return static_cast<uint32_t>((used + unit - 1) / unit * unit);
+  }
+  // The driver's reserved shared memory per block: 1 KiB from Ampere on
+  // (cudaDevAttrReservedSharedMemoryPerBlock; cuda_occupancy.h adds it to
+  // every block from compute capability 8.0), none before. The profile holds
+  // the rule, so the driver, the runtime and this agree.
+  uint32_t reserved_smem_bytes() const { return profile_.reserved_smem_per_block(); }
+  static constexpr uint32_t kReservedSmemUsed = 0x120;
+  uint32_t reserved_smem_base() const {
+    if (reserved_smem_bytes() == 0)
+      throw Error::make(Err::UnsupportedPtx, "%reserved_smem_offset_* on ", profile_.id,
+                        ": reserved shared memory exists from compute capability 8.0");
+    return kernel_shared_bytes();
+  }
+  // Whether the kernel or any device function in its module reads a
+  // %reserved_smem_offset_* register. Only then is the reserved region
+  // backed: every other kernel keeps its shared window at exactly what it
+  // declared, so an overrun past it is still caught rather than landing in
+  // bytes no kernel of its own should touch.
+  bool module_reads_reserved_smem() const {
+    if (fn_.reads_reserved_smem) return true;
+    for (const auto& f : fn_.module_funcs)
+      if (f && f->reads_reserved_smem) return true;
+    return false;
+  }
+
   void setup_block(BlockState& b) {
     // Fresh, zeroed shared memory per block (static declarations + the
-    // launch's dynamic bytes).
-    b.shared.assign(std::max(fn_.static_shared_size, fn_.dynamic_shared_offset) + cfg_.shared_bytes, 0);
+    // launch's dynamic bytes), and the reserved region behind them when the
+    // kernel asks where it is.
+    if (module_reads_reserved_smem() && reserved_smem_bytes())
+      b.shared.assign(size_t{kernel_shared_bytes()} + reserved_smem_bytes(), 0);
+    else
+      b.shared.assign(std::max(fn_.static_shared_size, fn_.dynamic_shared_offset) + cfg_.shared_bytes, 0);
     b.ctx.shared = &b.shared;
     b.ctx.bar_red = &b.bar_red;
     b.ctx.mbar = &b.mbar;
@@ -1565,6 +1604,7 @@ class Interpreter {
   // non-zero -- that many instructions. Zero means no bound.
   void run_warp_until_yield(Warp& w, const BlockCtx& ctx, uint64_t slice = 0) {
     uint64_t issued = 0;
+    turn_start_ = w.steps;
     for (Path& p : w.paths)
       if (p.parked == Path::kThisTurn) p.parked = Path::kRunnable;
     while (w.state == Warp::State::Ready) {
@@ -1980,7 +2020,18 @@ class Interpreter {
       case Sreg::NSmId: return profile_.limits.multiprocessors;
 
       case Sreg::DynamicSmemSize: return cfg_.shared_bytes;
-      case Sreg::TotalSmemSize: return fn_.static_shared_size + cfg_.shared_bytes;
+      case Sreg::TotalSmemSize: return kernel_shared_bytes();
+      // Measured on an RTX 3060, for kernels from none to 48 KiB of shared
+      // memory: begin, offset 0 and offset 1 are %total_smem_size; end is 288
+      // bytes on (the space cooperative_groups' memory.h says it can expect);
+      // cap is the reserved amount on (1 KiB, cudaDevAttrReservedSharedMemory-
+      // PerBlock).
+      case Sreg::ReservedSmemBegin:
+      case Sreg::ReservedSmemOffset0:
+      case Sreg::ReservedSmemOffset1:
+        return reserved_smem_base();
+      case Sreg::ReservedSmemEnd: return reserved_smem_base() + kReservedSmemUsed;
+      case Sreg::ReservedSmemCap: return reserved_smem_base() + reserved_smem_bytes();
       case Sreg::GridId: return grid_id_;
     }
     return 0;
@@ -2881,6 +2932,16 @@ class Interpreter {
   }
 
   void exec_bra(Warp& w, size_t idx, const OpBra& op, Mask m) {
+    // A warp that has run a long turn gives it up at its next backward
+    // branch. Warps of a block make progress independently on the hardware,
+    // so one may spin on a flag another warp sets -- cooperative_groups' tiles
+    // of more than one warp synchronise that way, through plain loads and
+    // atomics in shared memory -- and a turn that only ended at a barrier
+    // never let the other warp run. Yielding only at a loop edge, and only
+    // after this many instructions, keeps straight-line code and short loops
+    // in one turn, so the deterministic order stays what it was for them.
+    if (m != 0 && op.target <= w.paths[idx].pc && w.steps - turn_start_ >= kLongTurn)
+      w.yield_now = true;
     Mask taken = m;
     Mask fallthrough = w.paths[idx].mask & ~taken;
     if (taken == 0) {
@@ -2955,7 +3016,7 @@ class Interpreter {
   }
 
   bool fast_int_bin(Warp& w, const Instr& ins, const OpIntBin& op, Mask m) {
-    if (op.carry_in || op.carry_out || op.ty.bits != 32 || op.dst.wide || !narrow_operand(op.a) ||
+    if (op.carry_in || op.carry_out || op.sat || op.ty.bits != 32 || op.dst.wide || !narrow_operand(op.a) ||
         !narrow_operand(op.b) || op.op == IntBinOp::Div || op.op == IntBinOp::Rem)
       return false;
     Lanes32 sa, sb;
@@ -3024,7 +3085,8 @@ class Interpreter {
   }
 
   bool fast_setp(Warp& w, const Instr& ins, const OpSetp& op, Mask m) {
-    if (op.ty.bits != 32 || op.ty.is_bfloat() || !narrow_operand(op.a) || !narrow_operand(op.b))
+    if (op.ty.bits != 32 || op.ty.is_bfloat() || !narrow_operand(op.a) || !narrow_operand(op.b) ||
+        op.has_bop || op.has_q || op.packed || op.ftz)
       return false;
     Lanes32 sa, sb;
     const Lanes32& a = read_narrow(w, ins, op.a, sa);
@@ -3058,7 +3120,8 @@ class Interpreter {
   }
 
   bool fast_fma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpFma& op, Mask m) {
-    if (mem_.alu_fault_armed()) return false;
+    if (mem_.alu_fault_armed() || op.round != FRound::Nearest || op.sat || op.ftz || op.neg_ab || op.neg_c)
+      return false;
     if (op.ty.bits == 32) {
       if (op.dst.wide || !narrow_operand(op.a) || !narrow_operand(op.b) || !narrow_operand(op.c))
         return false;
@@ -3070,13 +3133,15 @@ class Interpreter {
 #if defined(__x86_64__) && defined(__GNUC__)
       if (g_hw_fma) {
         fma_lanes_f32_hw(d, a.data(), b.data(), c.data(), m, W_);
+        // A NaN result is the canonical one (see canon32).
+        for_active(m, W_, [&](uint32_t l) {
+          if ((d[l] & 0x7F800000u) == 0x7F800000u && (d[l] & 0x7FFFFFu)) d[l] = 0x7FFFFFFFu;
+        });
         w.written32[op.dst.id] = 1;
         return true;
       }
 #endif
-      for_active(m, W_, [&](uint32_t l) {
-        d[l] = static_cast<uint32_t>(f32bits(std::fma(f32(a[l]), f32(b[l]), f32(c[l]))));
-      });
+      for_active(m, W_, [&](uint32_t l) { d[l] = canon32(std::fma(f32(a[l]), f32(b[l]), f32(c[l]))); });
       w.written32[op.dst.id] = 1;
       return true;
     }
@@ -3099,7 +3164,7 @@ class Interpreter {
   }
 
   bool fast_float_bin(Warp& w, const Instr& ins, const OpFloatBin& op, Mask m) {
-    if (op.round != FRound::Nearest || op.nan_propagate || op.ty.bits != 32 || !op.ty.is_float() ||
+    if (op.round != FRound::Nearest || op.nan_propagate || op.sat || op.xorsign_abs || op.ftz || op.approx || op.ty.bits != 32 || !op.ty.is_float() ||
         op.dst.wide || !narrow_operand(op.a) || !narrow_operand(op.b) || mem_.alu_fault_armed())
       return false;
     Lanes32 sa, sb;
@@ -3107,15 +3172,15 @@ class Interpreter {
     const Lanes32& b = read_narrow(w, ins, op.b, sb);
     uint32_t* d = dst32(w, op.dst.id, m);
     auto run = [&](auto f) {
-      for_active(m, W_, [&](uint32_t l) { d[l] = static_cast<uint32_t>(f32bits(f(f32(a[l]), f32(b[l])))); });
+      for_active(m, W_, [&](uint32_t l) { d[l] = canon32(f(f32(a[l]), f32(b[l]))); });
     };
     switch (op.op) {
       case FloatBinOp::Add: run([](float x, float y) { return x + y; }); break;
       case FloatBinOp::Sub: run([](float x, float y) { return x - y; }); break;
       case FloatBinOp::Mul: run([](float x, float y) { return x * y; }); break;
       case FloatBinOp::Div: run([](float x, float y) { return x / y; }); break;
-      case FloatBinOp::Min: run([](float x, float y) { return std::fmin(x, y); }); break;
-      case FloatBinOp::Max: run([](float x, float y) { return std::fmax(x, y); }); break;
+      case FloatBinOp::Min: for_active(m, W_, [&](uint32_t l) { d[l] = ptx_min32(a[l], b[l]); }); break;
+      case FloatBinOp::Max: for_active(m, W_, [&](uint32_t l) { d[l] = ptx_max32(a[l], b[l]); }); break;
     }
     w.written32[op.dst.id] = 1;
     return true;
@@ -3124,7 +3189,7 @@ class Interpreter {
   // 64-bit integer arithmetic: the address computations around every memory
   // access. 64-bit registers are read in place, never widened.
   bool fast_int_bin64(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpIntBin& op, Mask m) {
-    if (op.carry_in || op.carry_out || !op.dst.wide || op.op == IntBinOp::Div || op.op == IntBinOp::Rem)
+    if (op.carry_in || op.carry_out || op.sat || !op.dst.wide || op.op == IntBinOp::Div || op.op == IntBinOp::Rem)
       return false;
     Lanes sa, sb;
     const Lanes& a = read_operand(w, ctx, ins, op.a, sa);
@@ -3151,13 +3216,15 @@ class Interpreter {
           });
         else run([](uint64_t x, uint64_t y) { return std::max(x, y); });
         break;
-      case IntBinOp::Shl: run([](uint64_t x, uint64_t y) { return y >= 64 ? 0 : x << y; }); break;
+      // The amount is a .u32, as in the general path.
+      case IntBinOp::Shl: run([](uint64_t x, uint64_t y) { y = static_cast<uint32_t>(y); return y >= 64 ? 0 : x << y; }); break;
       case IntBinOp::Shr:
         if (sig) run([](uint64_t x, uint64_t y) {
             const int64_t v = static_cast<int64_t>(x);
+            y = static_cast<uint32_t>(y);
             return static_cast<uint64_t>(y >= 64 ? (v < 0 ? -1 : 0) : v >> y);
           });
-        else run([](uint64_t x, uint64_t y) { return y >= 64 ? 0 : x >> y; });
+        else run([](uint64_t x, uint64_t y) { y = static_cast<uint32_t>(y); return y >= 64 ? 0 : x >> y; });
         break;
       default: return false;
     }
@@ -3219,7 +3286,7 @@ class Interpreter {
   // fma on f16 or bf16 halves: the same double-precision fma and rounding as
   // the general path, with the decode from the table and no widening.
   bool fast_f16x2_fma(Warp& w, const Instr& ins, const OpF16x2Fma& op, Mask m) {
-    if (op.dst.wide || !narrow_operand(op.a) || !narrow_operand(op.b) || !narrow_operand(op.c))
+    if (op.mods.any() || op.dst.wide || !narrow_operand(op.a) || !narrow_operand(op.b) || !narrow_operand(op.c))
       return false;
     Lanes32 sa, sb, sc;
     const Lanes32& a = read_narrow(w, ins, op.a, sa);
@@ -3231,10 +3298,9 @@ class Interpreter {
       for_active(m, W_, [&](uint32_t l) {
         uint64_t out = 0;
         for (int h = 0; h < halves; ++h) {
-          const double v = host_fma(bf16_to_double((a[l] >> (16 * h)) & 0xFFFF),
-                                    bf16_to_double((b[l] >> (16 * h)) & 0xFFFF),
-                                    bf16_to_double((c[l] >> (16 * h)) & 0xFFFF));
-          out |= double_to_bf16(v) << (16 * h);
+          out |= bf16_fma(bf16_to_double((a[l] >> (16 * h)) & 0xFFFF), bf16_to_double((b[l] >> (16 * h)) & 0xFFFF),
+                          bf16_to_double((c[l] >> (16 * h)) & 0xFFFF))
+                 << (16 * h);
         }
         d[l] = static_cast<uint32_t>(out);
       });
@@ -3274,6 +3340,14 @@ class Interpreter {
       Lanes r;  // written for every active lane below
       if (op->carry_in || op->carry_out) {
         exec_carry_add_sub(w, *op, a, b, m, r);
+      } else if (op->sat) {
+        // add/sub.sat.s32: the true sum, clamped.
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) {
+            const int64_t x = static_cast<int32_t>(a[lane]), y = static_cast<int32_t>(b[lane]);
+            const int64_t t = op->op == IntBinOp::Sub ? x - y : x + y;
+            r[lane] = static_cast<uint32_t>(static_cast<int32_t>(std::clamp<int64_t>(t, INT32_MIN, INT32_MAX)));
+          }
       } else {
         for (uint32_t lane = 0; lane < W_; ++lane)
           if (m & (Mask{1} << lane)) r[lane] = int_bin(op->op, op->ty, a[lane], b[lane], ins);
@@ -3326,12 +3400,45 @@ class Interpreter {
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Mask t = 0, thi = 0;
+      if (op->packed) {
+        // f16x2/bf16x2: the low halves decide p, the high halves q.
+        auto half = [&](uint64_t v, int h) {
+          uint64_t x = (v >> (16 * h)) & 0xFFFF;
+          if (op->ftz && !op->ty.is_bfloat()) x = half_ftz(x);
+          return op->ty.is_bfloat() ? bf16_to_double(x) : f16_to_double(x);
+        };
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) {
+            if (compare_float(op->cmp, half(a[lane], 0), half(b[lane], 0))) t |= Mask{1} << lane;
+            if (compare_float(op->cmp, half(a[lane], 1), half(b[lane], 1))) thi |= Mask{1} << lane;
+          }
+      } else {
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if ((m & (Mask{1} << lane)) &&
+              compare(op->cmp, op->ty, cmp_ftz(op->ftz, op->ty, a[lane]), cmp_ftz(op->ftz, op->ty, b[lane])))
+            t |= Mask{1} << lane;
+      }
+      // With a boolean operation: p = t bop c and q = !t bop c. c is read
+      // before either destination is written, since it may be one of them.
+      Mask pv = t, qv = ~t;
+      if (op->has_bop) {
+        Mask c = read_pred(w, ins, op->c);
+        if (op->negate_c) c = ~c;
+        auto combine = [&](Mask x) {
+          return op->bop == PredBinOp::And ? (x & c) : op->bop == PredBinOp::Or ? (x | c) : (x ^ c);
+        };
+        pv = combine(t);
+        qv = combine(op->packed ? thi : ~t);
+      } else if (op->packed) {
+        qv = thi;
+      }
       Mask& p = pred_slot(w, op->dst);
-      for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane)) {
-          bool t = compare(op->cmp, op->ty, a[lane], b[lane]);
-          p = t ? (p | (Mask{1} << lane)) : (p & ~(Mask{1} << lane));
-        }
+      p = (p & ~m) | (pv & m);
+      if (op->has_q) {
+        Mask& q = pred_slot(w, op->dst2);
+        q = (q & ~m) | (qv & m);
+      }
       return;
     }
     if (const auto* op = std::get_if<OpFloatBin>(&ins.op)) {
@@ -3355,8 +3462,28 @@ class Interpreter {
         case FRound::PlusInf: std::fesetround(FE_UPWARD); break;
         case FRound::Nearest: break;
       }
+      const uint64_t sign = uint64_t{1} << (op->ty.bits - 1);
+      // .ftz (f32): subnormal inputs and results to signed zero.
+      auto flush = [&](uint64_t x) {
+        return op->ftz && (x & 0x7F800000u) == 0 ? (x & 0x80000000u) : x;
+      };
       for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane)) r[lane] = float_bin(op->op, op->ty, a[lane], b[lane], op->nan_propagate);
+        if (m & (Mask{1} << lane)) {
+          const uint64_t av = flush(a[lane]), bvv = flush(b[lane]);
+          if (op->xorsign_abs) {
+            // The smaller/larger magnitude, signed sign(a) ^ sign(b); a NaN
+            // operand is ignored as in plain min/max (unless .NaN).
+            uint64_t v = float_bin(op->op, op->ty, av & ~sign, bvv & ~sign, op->nan_propagate);
+            if (!float_is_nan(op->ty, v)) v = (v & ~sign) | ((av ^ bvv) & sign);
+            r[lane] = v;
+          } else if (op->approx) {
+            r[lane] = div_approx32(static_cast<uint32_t>(av), static_cast<uint32_t>(bvv));
+          } else {
+            r[lane] = float_bin(op->op, op->ty, av, bvv, op->nan_propagate);
+          }
+          r[lane] = flush(r[lane]);
+          if (op->sat) r[lane] = float_sat(op->ty, r[lane]);
+        }
       if (op->round != FRound::Nearest) {
         std::fesetround(prev_round);
         g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
@@ -3393,10 +3520,32 @@ class Interpreter {
       Lanes _s_c;
       const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r;  // written for every active lane below
+      // The rounding mode is applied as float arithmetic's is: set around the
+      // fma (the host's fma honours it) and put back.
+      const int prev_round = op->round == FRound::Nearest ? 0 : std::fegetround();
+      if (op->round != FRound::Nearest) g_directed_rounding.fetch_add(1, std::memory_order_relaxed);
+      switch (op->round) {
+        case FRound::Zero: std::fesetround(FE_TOWARDZERO); break;
+        case FRound::MinusInf: std::fesetround(FE_DOWNWARD); break;
+        case FRound::PlusInf: std::fesetround(FE_UPWARD); break;
+        case FRound::Nearest: break;
+      }
+      // .ftz: subnormal f32 inputs and results to signed zero.
+      auto ftz = [&](float v) { return op->ftz && std::fpclassify(v) == FP_SUBNORMAL ? std::copysign(0.0f, v) : v; };
+      // A contracted sub negates the product or the addend.
+      const double sa = op->neg_ab ? -1.0 : 1.0, sc = op->neg_c ? -1.0 : 1.0;
       if (op->ty.bits == 32)
-        for_active(m, W_, [&](uint32_t l) { r[l] = f32bits(std::fma(f32(a[l]), f32(b[l]), f32(c[l]))); });
+        for_active(m, W_, [&](uint32_t l) {
+          const float av = op->neg_ab ? -f32(a[l]) : f32(a[l]), cv = op->neg_c ? -f32(c[l]) : f32(c[l]);
+          r[l] = canon32(ftz(std::fma(ftz(av), ftz(f32(b[l])), ftz(cv))));
+        });
       else
-        for_active(m, W_, [&](uint32_t l) { r[l] = f64bits(std::fma(f64(a[l]), f64(b[l]), f64(c[l]))); });
+        for_active(m, W_, [&](uint32_t l) { r[l] = f64bits(std::fma(sa * f64(a[l]), f64(b[l]), sc * f64(c[l]))); });
+      if (op->round != FRound::Nearest) {
+        std::fesetround(prev_round);
+        g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
+      }
+      if (op->sat) for_active(m, W_, [&](uint32_t l) { r[l] = float_sat(op->ty, r[l]); });
       alu_fault(r, m, op->ty.bits);
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
@@ -3433,15 +3582,22 @@ class Interpreter {
       Lanes r;
       const bool dfloat = op->dty.is_real();
       const bool sbf = op->sty.is_bfloat();
+      Mask cpred = 0;
+      if (op->has_bop) {
+        cpred = read_pred(w, ins, op->c);
+        if (op->negate_c) cpred = ~cpred;
+      }
       for (uint32_t lane = 0; lane < W_; ++lane) {
         if (!(m & (Mask{1} << lane))) continue;
+        const bool cl = (cpred >> lane) & 1;
         const int halves = op->packed ? 2 : 1;
         uint64_t out = 0;
         for (int h = 0; h < halves; ++h) {
           double x, y;
           if (op->packed) {
-            const uint64_t ax = (a[lane] >> (16 * h)) & 0xFFFF;
-            const uint64_t bx = (b[lane] >> (16 * h)) & 0xFFFF;
+            uint64_t ax = (a[lane] >> (16 * h)) & 0xFFFF;
+            uint64_t bx = (b[lane] >> (16 * h)) & 0xFFFF;
+            if (op->ftz && !sbf) { ax = half_ftz(ax); bx = half_ftz(bx); }
             x = sbf ? bf16_to_double(ax) : f16_to_double(ax);
             y = sbf ? bf16_to_double(bx) : f16_to_double(bx);
           } else if (op->sty.is_real()) {
@@ -3462,14 +3618,18 @@ class Interpreter {
           } else {
             // The scalar path reuses setp's comparator, which already handles
             // the signed/unsigned and NaN-aware cases from the source type.
-            t = compare(op->cmp, op->sty, a[lane], b[lane]);
+            t = compare(op->cmp, op->sty, cmp_ftz(op->ftz, op->sty, a[lane]), cmp_ftz(op->ftz, op->sty, b[lane]));
           }
           (void)x; (void)y;
+          if (op->has_bop)
+            t = op->bop == PredBinOp::And ? (t && cl) : op->bop == PredBinOp::Or ? (t || cl) : (t != cl);
           // True's encoding comes from the *destination* type: an integer
           // destination gets all ones, a float destination gets 1.0. Writing 1
           // into an integer destination is the easy mistake, and it makes
           // every use of the result as a mask select a single bit.
-          if (op->packed) {
+          if (op->packed_int_dst) {
+            out |= (t ? 0xFFFFull : 0ull) << (16 * h);
+          } else if (op->packed) {
             const uint64_t one = op->dty.is_bfloat() ? double_to_bf16(1.0) : double_to_f16(1.0);
             out |= (t ? one : 0ull) << (16 * h);
           } else if (dfloat) {
@@ -3573,6 +3733,19 @@ class Interpreter {
       write_reg(w, op->dst, m, r, dt.bits);
       return;
     }
+    if (const auto* op = std::get_if<OpIsTypep>(&ins.op)) {
+      // istypep (9.7.12.6): no handle here is a .texref/.samplerref/.surfref
+      // variable -- those went with CUDA 12's texture references -- and on an
+      // RTX 3060 it is false for texture and surface objects and any other
+      // value alike, so it is false.
+      Mask& p = pred_slot(w, op->dst);
+      p &= ~m;
+      return;
+    }
+    if (const auto* op = std::get_if<OpStBulk>(&ins.op)) {
+      exec_st_bulk(w, ctx, ins, *op, m);
+      return;
+    }
     if (const auto* op = std::get_if<OpAtom>(&ins.op)) {
       exec_atom(w, ctx, ins, *op, m);
       return;
@@ -3625,7 +3798,8 @@ class Interpreter {
       const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Lanes r;  // written for every active lane below
       for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane)) r[lane] = ~v[lane];
+        if (m & (Mask{1} << lane))
+          r[lane] = op->logical ? (mask_to_bits(v[lane], op->ty.bits) == 0 ? 1u : 0u) : ~v[lane];
       write_reg(w, op->dst, m, r, op->ty.bits);
       return;
     }
@@ -3636,7 +3810,7 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
           if (op->ty.kind == Type::Kind::F)
-            r[lane] = op->ty.bits == 32 ? f32bits(-f32(v[lane])) : f64bits(-f64(v[lane]));
+            r[lane] = float_sign_op(op->ty.bits, v[lane], op->ftz, /*negate=*/true);
           else
             r[lane] = static_cast<uint64_t>(-static_cast<int64_t>(v[lane]));
         }
@@ -3756,14 +3930,48 @@ class Interpreter {
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r;
+      HalfRounding rounding(op->rz ? FRound::Zero : FRound::Nearest);
+      auto one = [&](double x) -> uint64_t {
+        if (op->relu) {
+          if (std::isnan(x)) return kCanonicalNaN16;
+          if (x < 0 || std::signbit(x)) x = 0.0;   // -0 too (measured)
+        }
+        uint64_t h = op->bf16 ? double_to_bf16(x) : double_to_f16(x);
+        // .satfinite: an overflow stops at the largest finite value.
+        if (op->satfinite && !std::isnan(x) && (op->bf16 ? (h & 0x7FFF) == 0x7F80 : (h & 0x7FFF) == 0x7C00))
+          h = (h & 0x8000) | (op->bf16 ? 0x7F7F : 0x7BFF);
+        return h & 0xFFFF;
+      };
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
           // The first source goes in the high half, the second in the low.
-          const double x = static_cast<double>(f32(a[lane]));
-          const double y = static_cast<double>(f32(b[lane]));
-          const uint64_t hi = op->bf16 ? double_to_bf16(x) : double_to_f16(x);
-          const uint64_t lo = op->bf16 ? double_to_bf16(y) : double_to_f16(y);
-          r[lane] = ((hi & 0xffffull) << 16) | (lo & 0xffffull);
+          r[lane] = (one(static_cast<double>(f32(a[lane]))) << 16) | one(static_cast<double>(f32(b[lane])));
+        }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpCvtTf32>(&ins.op)) {
+      Lanes _s_v;
+      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
+          uint32_t x = static_cast<uint32_t>(v[lane]);
+          const bool nan = (x & 0x7F800000u) == 0x7F800000u && (x & 0x7FFFFFu);
+          if (nan) {
+            // Truncated rather than rounded (an RTX 3060: 0xff801fff gives
+            // 0xff800000); with .relu or .satfinite, the canonical NaN.
+            r[lane] = (op->relu || op->satfinite) ? 0x7FFFFFFFu : (x & ~0x1FFFu);
+            continue;
+          }
+          if (op->relu && (x & 0x80000000u)) x = 0;
+          uint32_t t;
+          if (op->rna) t = (x + 0x1000u) & ~0x1FFFu;                    // ties away, on the bits
+          else if (op->rz) t = x & ~0x1FFFu;
+          else t = (x + 0x0FFFu + ((x >> 13) & 1u)) & ~0x1FFFu;          // ties to even
+          // Rounding up can carry into the exponent and out to infinity.
+          if (op->satfinite && (t & 0x7FFFFFFFu) >= 0x7F800000u) t = (t & 0x80000000u) | 0x7F7FE000u;
+          r[lane] = t;
         }
       write_reg(w, op->dst, m, r, 32);
       return;
@@ -4037,10 +4245,12 @@ class Interpreter {
             in_space = v >= kLocalVaBase && v < kLocalVaBase + kLocalVaSize;
             break;
           default:
-            // Global is everything that is a device address and not one of the
-            // engine's private windows. Answering "not shared and not local"
-            // would also claim a null pointer is global.
-            in_space = is_device_va(v) && !(v >= kSharedVaBase && v < kSharedVaBase + kSharedVaSize) &&
+            // Global is every generic address outside the shared and local
+            // windows -- a null pointer and all-ones included, as an RTX 3060
+            // answers (this once required a device allocation, and said no to
+            // an address the card calls global). The engine's own parameter
+            // window is not global.
+            in_space = !(v >= kSharedVaBase && v < kSharedVaBase + kSharedVaSize) &&
                        !(v >= kLocalVaBase && v < kLocalVaBase + kLocalVaSize) &&
                        !(v >= kParamVaBase && v < kParamVaBase + kParamVaSize);
             break;
@@ -4146,8 +4356,10 @@ class Interpreter {
         Mask same = 0;
         for (uint32_t o = 0; o < W_; ++o)
           if ((members & (Mask{1} << o)) && a[o] == a[lane]) same |= (Mask{1} << o);
-        r[lane] = static_cast<uint64_t>(same);
+        // match.all writes the member mask when every member holds the same
+        // value and 0 otherwise; match.any, the members holding this lane's.
         if (same == members) all_agreed |= (Mask{1} << lane);
+        r[lane] = op->all ? (same == members ? static_cast<uint64_t>(members) : 0) : static_cast<uint64_t>(same);
       }
       write_reg(w, op->dst, m, r, 32);
       if (op->all && op->pred_dst.id != kNoReg) {
@@ -4161,11 +4373,14 @@ class Interpreter {
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
+      Lanes _s_c;
+      const Lanes* c = op->mad ? &read_operand(w, ctx, ins, op->c, _s_c) : nullptr;
       Lanes r;
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
           // The product is 48 bits wide, which is why .hi cannot be had by
-          // masking the inputs of a 32-bit multiply: it wants bits 47:24.
+          // masking the inputs of a 32-bit multiply: it wants bits 47:16 (the
+          // ISA's, and an RTX 3060's -- this once took 47:24).
           int64_t prod;
           if (op->is_signed) {
             auto s24 = [](uint64_t v) -> int64_t {
@@ -4177,7 +4392,15 @@ class Interpreter {
             prod = static_cast<int64_t>((a[lane] & 0xFFFFFFu) * (b[lane] & 0xFFFFFFu));
           }
           const uint64_t u = static_cast<uint64_t>(prod);
-          r[lane] = op->hi ? ((u >> 24) & 0xFFFFFFFFull) : (u & 0xFFFFFFFFull);
+          uint64_t v = op->hi ? ((u >> 16) & 0xFFFFFFFFull) : (u & 0xFFFFFFFFull);
+          if (op->sat) {
+            // The true sum of bits 47:16 and c, clamped (measured).
+            const int64_t t = (prod >> 16) + static_cast<int32_t>((*c)[lane]);
+            v = static_cast<uint32_t>(static_cast<int32_t>(std::clamp<int64_t>(t, INT32_MIN, INT32_MAX)));
+          } else if (op->mad) {
+            v = (v + (*c)[lane]) & 0xFFFFFFFFull;
+          }
+          r[lane] = v;
         }
       write_reg(w, op->dst, m, r, 32);
       return;
@@ -4214,10 +4437,15 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
           const uint32_t bits = static_cast<uint32_t>(mv[lane]);
-          const uint32_t base = static_cast<uint32_t>(bv[lane]) & 31u;
+          const uint32_t base = static_cast<uint32_t>(bv[lane]);
           const int32_t off = static_cast<int32_t>(static_cast<uint32_t>(ov[lane]));
           uint32_t found = 0xFFFFFFFFu;
-          if (off > 0) {
+          // An offset of INT_MIN gives 0 whatever the mask and base, and a
+          // base past bit 31 otherwise finds nothing (it is not taken modulo
+          // 32) -- both measured on an RTX 3060, over 650 cases.
+          if (off == INT32_MIN) found = 0;
+          else if (base > 31) ;
+          else if (off > 0) {
             int32_t n = off;
             for (int i = static_cast<int>(base); i < 32; ++i)
               if ((bits >> i) & 1u) { if (--n == 0) { found = static_cast<uint32_t>(i); break; } }
@@ -4295,14 +4523,16 @@ class Interpreter {
       Mask& dst = pred_slot(w, op->dst);
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
-          const double v = op->ty.bits == 64 ? f64(a[lane]) : static_cast<double>(f32(a[lane]));
-          const bool nan = std::isnan(v);
-          const bool inf = std::isinf(v);
-          // "Normal" excludes zero, subnormal, infinity and NaN -- and
-          // std::isnormal already means exactly that, including for zero,
-          // which is the case a hand-rolled exponent check usually gets wrong.
-          const bool normal = std::isnormal(v);
-          const bool subnormal = !nan && !inf && v != 0.0 && !normal;
+          // Classified at the operand's own width: an f32 subnormal widened to
+          // a double is a normal double, which made testp.normal.f32 true and
+          // testp.subnormal.f32 false for every f32 subnormal.
+          const int cls = op->ty.bits == 64 ? std::fpclassify(f64(a[lane])) : std::fpclassify(f32(a[lane]));
+          const bool nan = cls == FP_NAN;
+          const bool inf = cls == FP_INFINITE;
+          // Zero counts as normal: finite and not subnormal is what the card
+          // answers (testp.normal of +0 and -0 is true on an RTX 3060).
+          const bool normal = cls == FP_NORMAL || cls == FP_ZERO;
+          const bool subnormal = cls == FP_SUBNORMAL;
           bool t = false;
           switch (op->op) {
             case TestpOp::Finite: t = !nan && !inf; break;
@@ -4369,10 +4599,23 @@ class Interpreter {
           for (int i = 0; i < 4; ++i) bytes[4 + i] = (hi >> (8 * i)) & 0xFF;
           uint32_t sel = static_cast<uint32_t>(c[lane]);
           uint32_t out = 0;
+          const uint32_t s2 = sel & 3;
           for (int i = 0; i < 4; ++i) {
-            uint32_t nib = (sel >> (4 * i)) & 0xF;
-            uint8_t byte = bytes[nib & 0x7];
-            if (nib & 0x8) byte = (byte & 0x80) ? 0xFF : 0x00;  // sign-replicate mode
+            uint8_t byte = 0;
+            switch (op->mode) {
+              case PrmtMode::Generic: {
+                const uint32_t nib = (sel >> (4 * i)) & 0xF;
+                byte = bytes[nib & 0x7];
+                if (nib & 0x8) byte = (byte & 0x80) ? 0xFF : 0x00;  // sign-replicate mode
+                break;
+              }
+              case PrmtMode::F4e: byte = bytes[(s2 + i) & 7]; break;
+              case PrmtMode::B4e: byte = bytes[(s2 - i) & 7]; break;
+              case PrmtMode::Rc8: byte = bytes[s2]; break;
+              case PrmtMode::Ecl: byte = bytes[std::max<uint32_t>(i, s2)]; break;
+              case PrmtMode::Ecr: byte = bytes[std::min<uint32_t>(i, s2)]; break;
+              case PrmtMode::Rc16: byte = bytes[2 * (s2 & 1) + (i & 1)]; break;
+            }
             out |= static_cast<uint32_t>(byte) << (8 * i);
           }
           r[lane] = out;
@@ -4387,8 +4630,7 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
           if (op->ty.is_float())
-            r[lane] = op->ty.bits == 32 ? f32bits(std::fabs(f32(v[lane])))
-                                        : f64bits(std::fabs(f64(v[lane])));
+            r[lane] = float_sign_op(op->ty.bits, v[lane], op->ftz, /*negate=*/false);
           else {
             int64_t x = op->ty.bits == 64 ? static_cast<int64_t>(v[lane])
                                           : int64_t{static_cast<int32_t>(v[lane])};
@@ -4434,9 +4676,48 @@ class Interpreter {
             r[lane] = out;
             continue;
           }
-          const double x = op->ty.bits == 32 ? static_cast<double>(f32(v[lane])) : f64(v[lane]);
-          const double y = apply(x);
-          r[lane] = op->ty.bits == 32 ? f32bits(static_cast<float>(y)) : f64bits(y);
+          if (op->exact) {
+            // sqrt/rcp.{rn,rz,rm,rp}: the IEEE operations, correctly rounded in
+            // that mode (the host's own, set for the operation).
+            const bool directed = op->round != FRound::Nearest;
+            const int prev = directed ? std::fegetround() : 0;
+            if (directed) {
+              g_directed_rounding.fetch_add(1, std::memory_order_relaxed);
+              std::fesetround(op->round == FRound::Zero       ? FE_TOWARDZERO
+                              : op->round == FRound::MinusInf ? FE_DOWNWARD
+                                                              : FE_UPWARD);
+            }
+            if (op->ty.bits == 32) {
+              float x = f32(v[lane]);
+              if (op->ftz && std::fpclassify(x) == FP_SUBNORMAL) x = std::copysign(0.0f, x);
+              volatile float one = 1.0f;
+              float y = op->op == MathOp::Sqrt ? std::sqrt(x) : one / x;
+              if (op->ftz && std::fpclassify(y) == FP_SUBNORMAL) y = std::copysign(0.0f, y);
+              r[lane] = canon32(y);
+            } else {
+              const double x = f64(v[lane]);
+              volatile double one = 1.0;
+              r[lane] = f64bits(op->op == MathOp::Sqrt ? std::sqrt(x) : one / x);
+            }
+            if (directed) {
+              std::fesetround(prev);
+              g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
+            }
+            continue;
+          }
+          if (op->ty.bits == 32) {
+            // .ftz: subnormal inputs and results to signed zero, as the
+            // rounded forms above -- so sqrt.approx.ftz of a negative
+            // subnormal is -0, rsqrt's and lg2's are infinite, and a
+            // reciprocal or ex2 too small to be normal is 0 (an RTX 3060's).
+            float x = f32(v[lane]);
+            if (op->ftz && std::fpclassify(x) == FP_SUBNORMAL) x = std::copysign(0.0f, x);
+            float y = static_cast<float>(apply(static_cast<double>(x)));
+            if (op->ftz && std::fpclassify(y) == FP_SUBNORMAL) y = std::copysign(0.0f, y);
+            r[lane] = canon32(y);
+            continue;
+          }
+          r[lane] = f64bits(apply(f64(v[lane])));
         }
       // A half result still occupies a 32-bit register, packed or not.
       alu_fault(r, m, op->ty.bits == 16 ? 16u : op->ty.bits);
@@ -4538,6 +4819,13 @@ class Interpreter {
         for (uint32_t lane = 0; lane < W_; ++lane)
           if (m & (Mask{1} << lane)) prod[lane] = mul_hi(op->ty, a[lane], b[lane]);
         exec_carry_mad(w, op->ty.bits, op->carry_in, op->carry_out, prod, c, m, r);
+      } else if (op->sat) {
+        // mad.hi.sat.s32: the true sum of the product's high half and c, clamped.
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) {
+            const int64_t t = int64_t{static_cast<int32_t>(mul_hi(op->ty, a[lane], b[lane]))} + static_cast<int32_t>(c[lane]);
+            r[lane] = static_cast<uint32_t>(static_cast<int32_t>(std::clamp<int64_t>(t, INT32_MIN, INT32_MAX)));
+          }
       } else {
         for (uint32_t lane = 0; lane < W_; ++lane)
           if (m & (Mask{1} << lane)) r[lane] = mul_hi(op->ty, a[lane], b[lane]) + c[lane];
@@ -4572,13 +4860,18 @@ class Interpreter {
       Lanes _s_b;
       const Lanes& b = read_operand(w, ctx, ins, op->b, _s_b);
       Lanes r;  // written for every active lane below
+      const HalfMods& md = op->mods;
+      HalfRounding rounding(md.round);
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
           uint64_t out = 0;
           const int halves = op->packed ? 2 : 1;
           for (int h = 0; h < halves; ++h) {
-            const uint64_t ax = (a[lane] >> (16 * h)) & 0xFFFF;
-            const uint64_t bx = (b[lane] >> (16 * h)) & 0xFFFF;
+            uint64_t ax = (a[lane] >> (16 * h)) & 0xFFFF;
+            uint64_t bx = (b[lane] >> (16 * h)) & 0xFFFF;
+            if (md.ftz && !op->bf16) { ax = half_ftz(ax); bx = half_ftz(bx); }
+            const uint64_t sign = (ax ^ bx) & 0x8000;
+            if (md.xorsign_abs) { ax &= 0x7FFF; bx &= 0x7FFF; }
             double x = op->bf16 ? bf16_to_double(ax) : f16_to_double(ax);
             double y = op->bf16 ? bf16_to_double(bx) : f16_to_double(bx);
             double v;
@@ -4587,12 +4880,23 @@ class Interpreter {
               case FloatBinOp::Sub: v = x - y; break;
               case FloatBinOp::Mul: v = x * y; break;
               // PTX min/max return the non-NaN operand when exactly one is
-              // NaN, which is std::fmin/fmax's rule and not what < gives.
-              case FloatBinOp::Min: v = std::fmin(x, y); break;
-              case FloatBinOp::Max: v = std::fmax(x, y); break;
+              // NaN, which is std::fmin/fmax's rule and not what < gives --
+              // unless .NaN asks for the NaN.
+              // -0 orders below +0, as for f32 (measured on an RTX 3060:
+              // min(+0, -0) is -0, which .ftz makes of every negative
+              // subnormal).
+              case FloatBinOp::Min:
+                v = x == 0 && y == 0 ? (std::signbit(x) || std::signbit(y) ? -0.0 : 0.0) : std::fmin(x, y);
+                break;
+              case FloatBinOp::Max:
+                v = x == 0 && y == 0 ? (std::signbit(x) && std::signbit(y) ? -0.0 : 0.0) : std::fmax(x, y);
+                break;
               default: v = x * y; break;
             }
-            out |= (op->bf16 ? double_to_bf16(v) : double_to_f16(v)) << (16 * h);
+            if (md.nan_propagate && (std::isnan(x) || std::isnan(y))) v = std::numeric_limits<double>::quiet_NaN();
+            uint64_t hv = op->bf16 ? double_to_bf16(v) : double_to_f16(v);
+            if (md.xorsign_abs && !half_nan(hv, op->bf16)) hv = (hv & 0x7FFF) | sign;
+            out |= half_post(hv, op->bf16, md) << (16 * h);
           }
           r[lane] = out;
         }
@@ -4649,6 +4953,7 @@ class Interpreter {
       Lanes _s_c;
       const Lanes& c = read_operand(w, ctx, ins, op->c, _s_c);
       Lanes r;  // written for every active lane below
+      HalfRounding rounding(op->mods.round);
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) {
           uint64_t out = 0;
@@ -4657,11 +4962,12 @@ class Interpreter {
             const uint64_t ax = (a[lane] >> (16 * h)) & 0xFFFF;
             const uint64_t bx = (b[lane] >> (16 * h)) & 0xFFFF;
             const uint64_t cx = (c[lane] >> (16 * h)) & 0xFFFF;
-            double x = op->bf16 ? bf16_to_double(ax) : f16_to_double(ax);
-            double y = op->bf16 ? bf16_to_double(bx) : f16_to_double(bx);
-            double z = op->bf16 ? bf16_to_double(cx) : f16_to_double(cx);
-            const double v = host_fma(x, y, z);
-            out |= (op->bf16 ? double_to_bf16(v) : double_to_f16(v)) << (16 * h);
+            const bool ftz = op->mods.ftz && !op->bf16;
+            double x = op->bf16 ? bf16_to_double(ax) : f16_to_double(ftz ? half_ftz(ax) : ax);
+            double y = op->bf16 ? bf16_to_double(bx) : f16_to_double(ftz ? half_ftz(bx) : bx);
+            double z = op->bf16 ? bf16_to_double(cx) : f16_to_double(ftz ? half_ftz(cx) : cx);
+            const uint64_t hv = op->bf16 ? bf16_fma(x, y, z) : double_to_f16(host_fma(x, y, z));
+            out |= half_post(hv, op->bf16, op->mods) << (16 * h);
           }
           r[lane] = out;
         }
@@ -4677,8 +4983,17 @@ class Interpreter {
           // The sign bit is the top bit of each 16-bit half for both f16 and
           // bf16, so this is one mask either way; only how many halves take
           // part differs. neg flips it, abs clears it.
-          const uint64_t sign = op->packed ? 0x80008000ull : 0x00008000ull;
-          r[lane] = op->absolute ? (v[lane] & ~sign) : (v[lane] ^ sign);
+          // A NaN half comes out as the canonical 0x7fff (an RTX 3060), not
+          // with its sign flipped or cleared.
+          uint64_t out = 0;
+          for (int h = 0; h < (op->packed ? 2 : 1); ++h) {
+            uint64_t x = (v[lane] >> (16 * h)) & 0xFFFF;
+            if (op->ftz) x = half_ftz(x);   // a subnormal is a signed zero first
+            if (half_nan(x, op->bf16)) x = kCanonicalNaN16;
+            else x = op->absolute ? (x & 0x7FFF) : (x ^ 0x8000);
+            out |= x << (16 * h);
+          }
+          r[lane] = op->packed ? out : (out | (v[lane] & 0xFFFF0000ull));
         }
       write_reg(w, op->dst, m, r, 32);
       return;
@@ -4699,8 +5014,8 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpPredBin>(&ins.op)) {
-      Mask a = read_pred(w, ins, op->a);
-      Mask b = read_pred(w, ins, op->b);
+      const Mask a = op->a_imm >= 0 ? (op->a_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->a);
+      const Mask b = op->b_imm >= 0 ? (op->b_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->b);
       Mask r = op->op == PredBinOp::And ? (a & b) : op->op == PredBinOp::Or ? (a | b) : (a ^ b);
       Mask& p = pred_slot(w, op->dst);
       p = (p & ~m) | (r & m);
@@ -4860,9 +5175,13 @@ class Interpreter {
     return (v & sign) ? (v | ~((sign << 1) - 1)) : v;
   }
 
+  // The 32-bit forms take the ISA's 8-bit position and length; the 64-bit
+  // forms the whole 32-bit operands (measured on an RTX 3060: bfe.u64 with
+  // length 0x100 extracts nothing, not 0 bits wrapped to 256).
   static uint64_t bfe(Type ty, uint64_t a, uint64_t bpos, uint64_t clen) {
-    uint32_t pos = static_cast<uint32_t>(bpos) & 0xFF;
-    uint32_t len = static_cast<uint32_t>(clen) & 0xFF;
+    const uint32_t fmask = ty.bits == 64 ? 0xFFFFFFFFu : 0xFFu;
+    uint32_t pos = static_cast<uint32_t>(bpos) & fmask;
+    uint32_t len = static_cast<uint32_t>(clen) & fmask;
     uint32_t bits = ty.bits;
     if (pos >= bits || len == 0) {
       // Signed extract of an empty//out-of-range field replicates the sign bit.
@@ -4872,13 +5191,16 @@ class Interpreter {
     }
     if (len > bits - pos) len = bits - pos;
     uint64_t field = (a >> pos) & ((len >= 64) ? ~0ull : ((1ull << len) - 1));
-    if (ty.is_signed() && (field & (1ull << (len - 1)))) field |= ~((1ull << len) - 1);
+    // (A 64-bit field needs no extension -- and 1 << 64 is undefined, which
+    // on x86 made the whole of a negative value all ones.)
+    if (ty.is_signed() && len < 64 && (field & (1ull << (len - 1)))) field |= ~((1ull << len) - 1);
     return mask_to_bits(field, bits);
   }
 
   static uint64_t bfi(Type ty, uint64_t a, uint64_t b, uint64_t cpos, uint64_t dlen) {
-    uint32_t pos = static_cast<uint32_t>(cpos) & 0xFF;
-    uint32_t len = static_cast<uint32_t>(dlen) & 0xFF;
+    const uint32_t fmask = ty.bits == 64 ? 0xFFFFFFFFu : 0xFFu;
+    uint32_t pos = static_cast<uint32_t>(cpos) & fmask;
+    uint32_t len = static_cast<uint32_t>(dlen) & fmask;
     uint32_t bits = ty.bits;
     if (pos >= bits || len == 0) return mask_to_bits(b, bits);
     if (len > bits - pos) len = bits - pos;
@@ -4909,8 +5231,11 @@ class Interpreter {
       bool pred;
       switch (op.mode) {
         case ShflMode::Up:
+          // The ISA's pval = (j >= maxLane): for .up, c's clamp field is the
+          // lowest source lane (this compared with minLane, which agrees only
+          // when c's clamp bits are 0, as __shfl_up_sync passes them).
           j = lane - bval;
-          pred = static_cast<int32_t>(lane - bval) >= static_cast<int32_t>(min_lane);
+          pred = static_cast<int32_t>(lane - bval) >= static_cast<int32_t>(max_lane);
           break;
         case ShflMode::Down:
           j = lane + bval;
@@ -8537,6 +8862,46 @@ class Interpreter {
     }
   }
 
+  // A directed rounding mode for the half-precision arithmetic: the host mode
+  // set for the scope (double_to_narrow follows it) and put back after.
+  struct HalfRounding {
+    FRound mode;
+    int prev = 0;
+    explicit HalfRounding(FRound m) : mode(m) {
+      if (mode == FRound::Nearest) return;
+      prev = std::fegetround();
+      g_directed_rounding.fetch_add(1, std::memory_order_relaxed);
+      std::fesetround(mode == FRound::Zero ? FE_TOWARDZERO : mode == FRound::MinusInf ? FE_DOWNWARD : FE_UPWARD);
+    }
+    ~HalfRounding() {
+      if (mode == FRound::Nearest) return;
+      std::fesetround(prev);
+      g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
+    }
+  };
+  static bool half_is_nan(uint64_t h) { return (h & 0x7FFF) > 0x7C00 && (h & 0x7C00) == 0x7C00; }
+  static bool half_nan(uint64_t h, bool bf16) { return bf16 ? (h & 0x7FFF) > 0x7F80 : half_is_nan(h); }
+  // .ftz on an f16: a subnormal to signed zero.
+  static uint64_t half_ftz(uint64_t h) { return (h & 0x7C00) == 0 ? (h & 0x8000) : h; }
+  // A comparison's .ftz: an f32 or f16 subnormal operand as its signed zero.
+  static uint64_t cmp_ftz(bool ftz, Type ty, uint64_t v) {
+    if (!ftz || !ty.is_float() || ty.is_bfloat()) return v;
+    if (ty.bits == 32) return (v & 0x7F800000u) == 0 ? (v & 0x80000000u) : v;
+    if (ty.bits == 16) return half_ftz(v & 0xFFFF);
+    return v;
+  }
+  // The modifiers applied to a half result: .ftz, .relu, .sat.
+  static uint64_t half_post(uint64_t h, bool bf16, const HalfMods& md) {
+    const bool nan = half_nan(h, bf16);
+    if (md.ftz && !bf16) h = half_ftz(h);
+    if (md.relu && !nan && (h & 0x8000)) h = 0;
+    if (md.sat) {
+      if (nan || (h & 0x8000)) h = 0;
+      else if (bf16 ? h > 0x3F80 : h > 0x3C00) h = bf16 ? 0x3F80 : 0x3C00;
+    }
+    return h;
+  }
+
   // bfloat16 is the top 16 bits of an f32: same exponent, mantissa truncated to
   // 7 bits. Converting in rounds to nearest even on the discarded half, which is
   // what cvt.rn asks for; converting out is exact.
@@ -8558,11 +8923,41 @@ class Interpreter {
     return rounded >> 16;
   }
 
+  // fma of three bf16 values, rounded once to bf16. The double fma rounds
+  // first, and bf16's exponent range lets the addend sit far below the
+  // product: a product exactly halfway between two bf16 values plus a tiny
+  // positive c must round up, and rounding the double sum (which drops c)
+  // took the tie to even instead (measured: 0x9ccc * 0xfe60 + 0x007f is
+  // 0x5bb3 on an RTX 3060). The product is exact in a double, so the sum's
+  // rounding error is too (TwoSum), and it breaks such ties.
+  static uint64_t bf16_fma(double x, double y, double z) {
+    const double p = x * y;               // 8 x 8 significant bits: exact
+    const double s = p + z;
+    const uint64_t h = double_to_bf16(s);
+    if (!std::isfinite(s)) return h;
+    const double bb = s - p, err = (p - (s - bb)) + (z - bb);
+    const double hv = bf16_to_double(h);
+    if (err == 0 || hv == s) return h;
+    // s lies strictly between hv and its neighbour on s's side; only if it is
+    // their midpoint does err decide.
+    const bool up = s > hv;
+    const uint64_t n = (up == !(h & 0x8000)) ? h + 1 : (h & 0x7FFF) == 0 ? ((h ^ 0x8000) | 1) : h - 1;
+    const double nv = bf16_to_double(n);
+    if (s != hv + (nv - hv) / 2) return h;
+    return (err > 0) == (nv > hv) ? n : h;
+  }
+
   uint64_t convert(const OpCvt* op, uint64_t in) {
     const Type& s = op->src_ty;
     const Type& d = op->dst_ty;
     // Read the source as a real number (float src) or integer (int src).
     if (s.is_real()) {
+      // bf16 is the top half of an f32, and cvt.f32.bf16 is that shift on an
+      // RTX 3060 for every input, NaNs included: 0xffff becomes 0xffff0000
+      // and a signalling 0xff81 stays signalling.
+      if (s.is_bfloat() && d.bits == 32 && !d.is_bfloat() && d.is_real() && !op->sat && !op->relu &&
+          !op->ftz && (op->round == Round::None || op->round == Round::Rn))
+        return (in & 0xFFFFu) << 16;
       double x = s.is_bfloat()  ? bf16_to_double(in)
                  : s.bits == 16 ? f16_to_double(in)
                  : s.bits == 32 ? static_cast<double>(f32(in))
@@ -8586,6 +8981,11 @@ class Interpreter {
         };
         if (op->ftz && s.bits == 32 && !s.is_bfloat() && subnormal32(x)) x = std::copysign(0.0, x);
         if (op->sat) x = x > 1 ? 1.0 : x > 0 ? x : 0.0;   // NaN and -0 become +0
+        if (op->relu) {
+          // A negative result (and -0) to +0; a NaN to the canonical NaN.
+          if (std::isnan(x)) return kCanonicalNaN16;
+          if (x < 0 || std::signbit(x)) x = 0.0;
+        }
         if (d.is_bfloat()) return double_to_bf16(x);
         // A NaN from f64 keeps its sign and the top of its payload in f16 on a
         // real GPU, made quiet, where one from f32 comes out 0x7FFF whatever
@@ -8595,12 +8995,21 @@ class Interpreter {
           return ((b >> 48) & 0x8000u) | 0x7E00u | ((b >> 42) & 0x3FFu);
         }
         if (d.bits == 16) return double_to_f16(x);
+        // With .ftz, an f32 NaN goes through f32 arithmetic first and comes
+        // out as the canonical NaN widened (measured); without, its payload
+        // is kept.
+        if (d.bits == 64 && s.bits == 32 && op->ftz && std::isnan(x)) return 0x7FFF'FFFF'E000'0000ull;
+        // An f16 NaN widened to f64 keeps its sign and its payload, at the top
+        // of the f64's, and is made quiet (an RTX 3060: 0x7d55 becomes
+        // 0x7ffd540000000000, 0xffff 0xfffffc0000000000).
+        if (d.bits == 64 && s.bits == 16 && !s.is_bfloat() && std::isnan(x))
+          return (uint64_t{(in >> 15) & 1} << 63) | 0x7FF8'0000'0000'0000ull | (uint64_t{in & 0x3FFu} << 42);
         if (d.bits == 64) return f64bits(x);
         const float f = static_cast<float>(x);
         if (op->ftz && subnormal32(f)) return f32bits(std::copysign(0.0f, f));
         // f32 to f32 goes through the float pipeline, which writes the
         // canonical NaN; a narrowing cvt.f32.f64 keeps the payload.
-        if (std::isnan(f) && s.bits == 32) return 0x7FFF'FFFFu;
+        if (std::isnan(f) && (s.bits == 32 || s.bits == 16)) return 0x7FFF'FFFFu;
         return f32bits(f);
       }
       // float -> int: round then clamp to the destination range.
@@ -8610,7 +9019,12 @@ class Interpreter {
       // converting 2^63 back was undefined: +inf and 2^63 came out as INT64_MIN
       // for s64, and as 0 for u64. The 32-bit limits are exact doubles, which is
       // why only the 64-bit conversions were wrong.
-      if (std::isnan(rounded)) return 0;
+      // NaN: 0 from an f32 or f16 into 32 bits or fewer; the destination's
+      // sign bit alone from an f64 into any width, or from an f32 into 64
+      // (an RTX 3060: cvt.rzi.s16.f64 of NaN is 0x8000, .s32.f64 and .u32.f64
+      // 0x80000000, cvt.rzi.s64.f32 and .u64.f32 0x8000000000000000).
+      if (std::isnan(rounded))
+        return (s.bits == 64 || d.bits == 64) ? uint64_t{1} << (d.bits - 1) : 0;
       if (d.is_signed()) {
         const double limit = std::ldexp(1.0, static_cast<int>(d.bits) - 1);
         const uint64_t max = (uint64_t{1} << (d.bits - 1)) - 1;
@@ -8707,7 +9121,10 @@ class Interpreter {
           // bugs -- it just cannot be the default.
           if (strict())
             ctx_fail(ins, -1, Err::InvalidValue, "integer division by zero");
-          return op == IntBinOp::Div ? narrow_u(~uint64_t{0}, ty.bits) : u(a);
+          // All ones for the quotient and the remainder alike, signed or not
+          // (an RTX 3060; the remainder was once taken to be the dividend).
+          (void)a;
+          return narrow_u(~uint64_t{0}, ty.bits);
         }
         // The one signed quotient that does not fit: INT64_MIN / -1 is a
         // SIGFPE on x86, and it is data, not a malformed kernel. It wraps, as
@@ -8722,11 +9139,13 @@ class Interpreter {
       case IntBinOp::Or: return a | b;
       case IntBinOp::Xor: return a ^ b;
       case IntBinOp::Shl: {
-        uint64_t sh = u(b);
+        // The amount is a .u32 whatever the type: a 16-bit shift by 0x10000
+        // shifts everything out (it was once cut to 16 bits, to 0).
+        uint64_t sh = static_cast<uint32_t>(b);
         return sh >= ty.bits ? 0 : a << sh;  // PTX clamps shift amounts
       }
       case IntBinOp::Shr: {
-        uint64_t sh = u(b);
+        uint64_t sh = static_cast<uint32_t>(b);
         if (sig) {
           int64_t v = s(a);
           if (sh >= ty.bits) return static_cast<uint64_t>(v < 0 ? -1 : 0);
@@ -8743,16 +9162,91 @@ class Interpreter {
   // two disagree on exactly the inputs a numerically fragile kernel is
   // watching for -- a clamp written as max.NaN(x, lo) to keep NaNs visible
   // would quietly launder them away under fmax.
+  // f32 arithmetic writes the canonical NaN, 0x7fffffff, for every NaN
+  // result whatever the operands' payloads (an RTX 3060; f64 keeps the quieted
+  // payload, as the host does).
+  static uint32_t canon32(float r) { return std::isnan(r) ? 0x7FFFFFFFu : static_cast<uint32_t>(f32bits(r)); }
+  // min/max.f32: a NaN operand, quiet or signalling, gives the other one; two
+  // give the canonical NaN; -0 is below +0 (min(+0, -0) is -0 either way
+  // round). The host's fmin/fmax turn a signalling NaN into a NaN result and
+  // leave the zeros' order open.
+  static uint32_t ptx_min32(uint32_t a, uint32_t b) {
+    const float x = f32(a), y = f32(b);
+    if (std::isnan(x) && std::isnan(y)) return 0x7FFFFFFFu;
+    if (std::isnan(x)) return b;
+    if (std::isnan(y)) return a;
+    if (x == y) return (a | b) & 0x80000000u ? (a | 0x80000000u) : a;   // zeros: -0 wins
+    return x < y ? a : b;
+  }
+  static uint32_t ptx_max32(uint32_t a, uint32_t b) {
+    const float x = f32(a), y = f32(b);
+    if (std::isnan(x) && std::isnan(y)) return 0x7FFFFFFFu;
+    if (std::isnan(x)) return b;
+    if (std::isnan(y)) return a;
+    if (x == y) return a & b & 0x80000000u ? a : (a & 0x7FFFFFFFu);   // zeros: +0 wins
+    return x > y ? a : b;
+  }
+  // neg/abs on a float, as an RTX 3060 does them: an f32 NaN becomes the
+  // canonical NaN and .ftz flushes a subnormal to (signed) zero first; an f64
+  // NaN is left exactly as it is, sign included. Otherwise the sign is flipped
+  // or cleared.
+  static uint64_t float_sign_op(uint32_t bits, uint64_t v, bool ftz, bool negate) {
+    if (bits == 32) {
+      uint32_t x = static_cast<uint32_t>(v);
+      if ((x & 0x7F800000u) == 0x7F800000u && (x & 0x7FFFFFu)) return 0x7FFFFFFFu;
+      if (ftz && (x & 0x7F800000u) == 0) x &= 0x80000000u;
+      return negate ? x ^ 0x80000000u : x & 0x7FFFFFFFu;
+    }
+    const uint64_t sign = 0x8000'0000'0000'0000ull;
+    if (std::isnan(f64(v))) return v;
+    return negate ? v ^ sign : v & ~sign;
+  }
+  static bool float_is_nan(Type ty, uint64_t v) {
+    if (ty.bits == 64) return std::isnan(f64(v));
+    if (ty.bits == 32) return std::isnan(f32(v));
+    return (v & 0x7C00) == 0x7C00 && (v & 0x3FF);
+  }
+  // .sat: clamp to [0, 1]; a NaN and -0 to +0.
+  static uint64_t float_sat(Type ty, uint64_t v) {
+    if (ty.bits == 32) {
+      const float x = f32(v);
+      return f32bits(std::isnan(x) || x <= 0.0f ? 0.0f : std::min(x, 1.0f));
+    }
+    const double x = f64(v);
+    return f64bits(std::isnan(x) || x <= 0.0 ? 0.0 : std::min(x, 1.0));
+  }
+
+  // div.approx.f32, as the ISA documents it: a * (1/b) with the reciprocal
+  // rcp.approx gives, for |b| in [2^-126, 2^126]; for 2^126 < |b| < 2^128, 0
+  // -- signed as a quotient is -- or NaN when a is infinite. An RTX 3060
+  // follows both to the bit (its a * rcp.approx(b) and a mul.rn of the two
+  // agree on a million random pairs). Outside the documented range -- a
+  // subnormal, zero or infinite b -- it gives the quotient (0 / 2^-128 is 0,
+  // not 0 * inf), and so does this. The reciprocal is rcp.approx's here, at
+  // host precision (the documented divergence), so the result is the card's
+  // wherever the card's reciprocal is correctly rounded. .ftz is the
+  // caller's: the operands arrive flushed and the result is flushed after.
+  static uint64_t div_approx32(uint32_t a, uint32_t b) {
+    const float x = f32(a), y = f32(b), ay = std::fabs(y);
+    if (ay > 0x1p126f && ay <= std::numeric_limits<float>::max())
+      return std::isfinite(x) ? (a ^ b) & 0x80000000u : 0x7FFFFFFFu;
+    if (!(ay >= 0x1p-126f) || std::isinf(y)) return canon32(x / y);
+    return canon32(x * rcp_approx32(y));
+  }
+  // rcp.approx.f32 at host precision: the correctly rounded reciprocal.
+  static float rcp_approx32(float x) { return static_cast<float>(1.0 / static_cast<double>(x)); }
+
   uint64_t float_bin(FloatBinOp op, Type ty, uint64_t a, uint64_t b,
                      bool nan_propagate = false) {
     if (nan_propagate && (op == FloatBinOp::Min || op == FloatBinOp::Max)) {
       const double x = ty.bits == 64 ? f64(a) : static_cast<double>(f32(a));
       const double y = ty.bits == 64 ? f64(b) : static_cast<double>(f32(b));
       if (std::isnan(x) || std::isnan(y)) {
-        const double nan = std::numeric_limits<double>::quiet_NaN();
-        if (ty.bits == 64) return f64bits(nan);
-        if (ty.bits == 32) return f32bits(static_cast<float>(nan));
-        return double_to_f16(nan);
+        // The canonical NaN, as every f32 NaN result is (0x7fffffff; 0x7fff
+        // for a half).
+        if (ty.bits == 64) return f64bits(std::numeric_limits<double>::quiet_NaN());
+        if (ty.bits == 32) return 0x7FFFFFFFu;
+        return kCanonicalNaN16;
       }
     }
     return float_bin_impl(op, ty, a, b);
@@ -8778,10 +9272,10 @@ class Interpreter {
         case FloatBinOp::Sub: r = x - y; break;
         case FloatBinOp::Mul: r = x * y; break;
         case FloatBinOp::Div: r = x / y; break;
-        case FloatBinOp::Min: r = std::fmin(x, y); break;
-        case FloatBinOp::Max: r = std::fmax(x, y); break;
+        case FloatBinOp::Min: return ptx_min32(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+        case FloatBinOp::Max: return ptx_max32(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
       }
-      return f32bits(r);
+      return canon32(r);
     }
     double x = f64(a), y = f64(b), r = 0;
     switch (op) {
@@ -8862,7 +9356,17 @@ class Interpreter {
     if (a.base_id >= w.regs32.size() || !w.written32[a.base_id])
       ctx_fail(ins, -1, Err::UninitializedRegister,
                "address register " + a.base + " read before any write");
-    return widen(w, w.regs32[a.base_id]);
+    if (a.offset == 0) return widen(w, w.regs32[a.base_id]);
+    // A 32-bit address is register plus offset in 32 bits: nvcc leaves a
+    // "negative" base in the register and brings it back with the offset
+    // (Rodinia's needle: [%r4+68] with %r4 = temp - 64 for a thread of the
+    // second row). Every caller adds the offset to what this returns, so the
+    // base comes back as the wrapped sum less the offset.
+    const auto& r = w.regs32[a.base_id];
+    const uint64_t off = static_cast<uint64_t>(a.offset);
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      scratch[lane] = uint64_t{static_cast<uint32_t>(r[lane] + static_cast<uint32_t>(off))} - off;
+    return scratch;
   }
 
   // ---- cp.async ----
@@ -9945,6 +10449,17 @@ class Interpreter {
                      Mask m) {
     if (!ctx.mbar)
       ctx_fail(ins, -1, Err::UnsupportedPtx, "mbarrier outside a block context");
+    if (op.op == MbarOp::PendingCount && op.have_state) {
+      // The count an arrival's state token carries (see the arrive); no
+      // barrier is touched.
+      Lanes _s_st;
+      const Lanes& st = read_operand(w, ctx, ins, op.state, _s_st);
+      Lanes r;
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = static_cast<uint32_t>(st[lane] >> 1);
+      write_reg(w, op.dst, m, r, 32);
+      return;
+    }
     Lanes _s_base;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     const uint64_t sbase = space_base(Space::Shared);
@@ -10026,8 +10541,12 @@ class Interpreter {
           inc = lanes;
         }
         // The token names the phase this arrival belongs to, which is the
-        // phase a later test_wait asks about. Captured before any flip.
-        const uint64_t token = b.phase & 1u;
+        // phase a later test_wait asks about (bit 0), captured before any
+        // flip; above it, the arrivals still pending before this instruction,
+        // which is what mbarrier.pending_count reads from a state (an RTX
+        // 3060: 64 on a fresh barrier of 64, 54 after ten arrivals).
+        const uint64_t pending_before = b.expected > b.arrived ? b.expected - b.arrived : 0;
+        const uint64_t token = (b.phase & 1u) | (pending_before << 1);
         b.arrived += inc;
         const uint32_t before = b.phase;
         complete_phase_if_done(b);
@@ -10086,9 +10605,9 @@ class Interpreter {
         return;
       }
       case MbarOp::PendingCount: {
+        Lanes r;
         require_valid();
         land_bulk_copies(ctx, b);
-        Lanes r;
         const uint64_t pending = b.expected > b.arrived ? b.expected - b.arrived : 0;
         for (uint32_t lane = 0; lane < W_; ++lane)
           if (m & (Mask{1} << lane)) r[lane] = pending;
@@ -10096,6 +10615,73 @@ class Interpreter {
         return;
       }
     }
+  }
+
+  // st.bulk (9.7.10.14, sm_100): each thread zeroes its `size` bytes of
+  // shared memory, a multiple of 8 and at most 16 MiB. Outside the shared
+  // window, or with any other size, the ISA leaves it undefined; here it is
+  // reported.
+  void exec_st_bulk(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpStBulk& op, Mask m) {
+    Lanes _s_base, _s_size;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
+    const Lanes& size = read_operand(w, ctx, ins, op.size, _s_size);
+    const uint64_t sbase = op.shared ? kSharedVaBase : 0;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const int li = static_cast<int>(lane);
+      const uint64_t at = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+      const uint64_t n = size[lane];
+      if (n % 8 || n > (uint64_t{1} << 24))
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "st.bulk of " + std::to_string(n) + " bytes; the size must be a multiple of 8 up to 16 MiB");
+      if (!is_shared(at) || (n && !is_shared(at + n - 1)))
+        ctx_fail(ins, li, Err::InvalidValue,
+                 "st.bulk outside shared memory, which the ISA leaves undefined");
+      if (at % 8)
+        ctx_fail(ins, li, Err::MisalignedAccess, "st.bulk at an address not aligned to 8 bytes");
+      for (uint64_t off = 0; off < n; off += 8) store_routed(w, ctx, ins, lane, at + off, 8, 0);
+    }
+  }
+
+  // atom.{exch,cas}.b128 (sm_90): 16 aligned bytes read, and replaced by b
+  // (exch), or by c if they equal b (cas), under the same striped lock the
+  // other atomics take -- 16-byte atomicity is promised against other atomics.
+  void exec_atom128(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    Lanes _s_base, s1, s2, s3, s4;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
+    const Lanes& blo = read_operand(w, ctx, ins, op.b, s1);
+    const Lanes& bhi = read_operand(w, ctx, ins, op.b_hi, s2);
+    const bool cas = op.op == AtomOp::Cas;
+    Lanes clo{}, chi{};
+    if (cas) {
+      clo = read_operand(w, ctx, ins, op.c, s3);
+      chi = read_operand(w, ctx, ins, op.c_hi, s4);
+    }
+    const uint64_t sbase = space_base(op.space);
+    const bool lock_needed = concurrent_ && op.space != Space::Shared && op.space != Space::Local;
+    Lanes lo{}, hi{};
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+      if (addr % 16)
+        ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
+                 "atom.b128 at an address not aligned to 16 bytes");
+      std::unique_lock<std::mutex> guard;
+      if (lock_needed) guard = std::unique_lock<std::mutex>(atomic_lock_for(addr));
+      ++stats_.atomics;
+      stats_.atomic_bytes += 16;
+      lo[lane] = load_routed(w, ctx, ins, lane, addr, 8);
+      hi[lane] = load_routed(w, ctx, ins, lane, addr + 8, 8);
+      if (!cas) {
+        store_routed(w, ctx, ins, lane, addr, 8, blo[lane]);
+        store_routed(w, ctx, ins, lane, addr + 8, 8, bhi[lane]);
+      } else if (lo[lane] == blo[lane] && hi[lane] == bhi[lane]) {
+        store_routed(w, ctx, ins, lane, addr, 8, clo[lane]);
+        store_routed(w, ctx, ins, lane, addr + 8, 8, chi[lane]);
+      }
+    }
+    write_reg(w, op.dst, m, lo, 64);
+    write_reg(w, op.dst_hi, m, hi, 64);
   }
 
   // The video instructions (PTX ISA 9.7.20), as an RTX 3060 computes them
@@ -10286,6 +10872,10 @@ class Interpreter {
   }
 
   void exec_atom(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    if (op.b128) {
+      exec_atom128(w, ctx, ins, op, m);
+      return;
+    }
     // The access width is not the element width for the half forms: an
     // f16x2 atomic reads and writes a whole 32-bit word, and a scalar f16 one
     // touches 2 bytes. Taking the width from the element type alone is what
@@ -10355,11 +10945,14 @@ class Interpreter {
           // Min/max follow CUDA and use the fmin/fmax ordering rather than <,
           // so a NaN operand yields the other value.
           if (size == 4) {
-            const float x = std::bit_cast<float>(static_cast<uint32_t>(old));
-            const float y = std::bit_cast<float>(static_cast<uint32_t>(b));
+            float x = std::bit_cast<float>(static_cast<uint32_t>(old));
+            float y = std::bit_cast<float>(static_cast<uint32_t>(b));
+            // atom/red.add.f32 flush subnormal inputs and results to signed
+            // zero (the ISA's .ftz, which the card applies).
+            auto ftz = [](float v) { return std::fpclassify(v) == FP_SUBNORMAL ? std::copysign(0.0f, v) : v; };
             float res = x;
             switch (op.op) {
-              case AtomOp::Add: res = x + y; break;
+              case AtomOp::Add: res = ftz(ftz(x) + ftz(y)); break;
               case AtomOp::Exch: res = y; break;
               case AtomOp::Min: res = std::fmin(x, y); break;
               case AtomOp::Max: res = std::fmax(x, y); break;
@@ -10367,13 +10960,23 @@ class Interpreter {
                 ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
                          "this atomic operation has no float form");
             }
-            nv = std::bit_cast<uint32_t>(res);
+            // Exchange stores the bits it was given; an arithmetic result that
+            // is NaN is the canonical one, as f32 arithmetic writes it
+            // (atom.add.f32 onto a NaN stores 0x7fffffff on an RTX 3060).
+            nv = op.op == AtomOp::Exch ? static_cast<uint32_t>(b) : canon32(res);
           } else {
             const double x = std::bit_cast<double>(old);
             const double y = std::bit_cast<double>(b);
             double res = x;
             switch (op.op) {
-              case AtomOp::Add: res = x + y; break;
+              // A NaN comes through as it is, signalling or not: the one
+              // added if that is a NaN, else the one in memory (an RTX 3060).
+              // Left to the host's +, which NaN survived depended on the
+              // operand order the compiler chose, and a sanitizer build chose
+              // differently.
+              case AtomOp::Add:
+                res = std::isnan(y) ? y : std::isnan(x) ? x : x + y;
+                break;
               case AtomOp::Exch: res = y; break;
               case AtomOp::Min: res = std::fmin(x, y); break;
               case AtomOp::Max: res = std::fmax(x, y); break;
@@ -10654,6 +11257,9 @@ class Interpreter {
   }
 
   static constexpr uint32_t kMaxCallDepth = 256;
+  // The step count at which the running warp's turn began (see exec_bra).
+  uint64_t turn_start_ = 0;
+  static constexpr uint64_t kLongTurn = uint64_t{1} << 16;
   uint32_t call_depth_ = 0;
 
   // ---- the device heap: malloc() and free() called from a kernel ----
@@ -11067,10 +11673,24 @@ KernelResources kernel_resources(const EntryFn& fn, const DeviceProfile& profile
   }
   KernelResources r;
   r.usage = usage;
+  // NVIDIA's allocation rules, as cuda_occupancy.h gives them and an RTX
+  // 3060's cudaOccupancyMaxActiveBlocksPerMultiprocessor applies them
+  // (e2e_occupancy_rules): registers per warp in units of 256 from four
+  // sub-partitions, shared memory in units of 128 bytes from compute
+  // capability 8.0 (256 before) with the driver's reserved shared memory added
+  // to every block.
+  ptx::OccupancyRules rules;
+  if (profile.vendor == "nvidia") {
+    rules.reg_alloc_unit = 256;
+    rules.sub_partitions = profile.cc_major == 6 && profile.cc_minor == 0 ? 2 : 4;
+    rules.regs_per_block = profile.limits.registers_per_block;
+    rules.smem_alloc_unit = profile.cc_major >= 8 ? 128 : 256;
+    rules.reserved_smem = profile.reserved_smem_per_block();
+  }
   r.occupancy = ptx::compute_occupancy(
       usage.regs_per_thread, block_threads, fn.static_shared_size, dynamic_shared,
       profile.limits.registers_per_sm, profile.limits.max_threads_per_sm,
-      profile.limits.max_blocks_per_sm, profile.limits.shared_mem_per_sm, profile.warp_size);
+      profile.limits.max_blocks_per_sm, profile.limits.shared_mem_per_sm, profile.warp_size, rules);
   return r;
 }
 

@@ -3,6 +3,7 @@
 // Anything outside the subset throws Err::UnsupportedPtx naming the exact
 // instruction, source line, and kernel — never a silent wrong answer.
 #include "vgpu/ptx/parser.hpp"
+#include "vgpu/ptx/contract.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -45,6 +46,11 @@ const std::unordered_map<std::string, Sreg>& sreg_table() {
       {"%nsmid", Sreg::NSmId},
       {"%dynamic_smem_size", Sreg::DynamicSmemSize},
       {"%total_smem_size", Sreg::TotalSmemSize},
+      {"%reserved_smem_offset_begin", Sreg::ReservedSmemBegin},
+      {"%reserved_smem_offset_end", Sreg::ReservedSmemEnd},
+      {"%reserved_smem_offset_cap", Sreg::ReservedSmemCap},
+      {"%reserved_smem_offset_0", Sreg::ReservedSmemOffset0},
+      {"%reserved_smem_offset_1", Sreg::ReservedSmemOffset1},
       {"%gridid", Sreg::GridId},
       {"%clusterid.x", Sreg::ClusterIdX},
       {"%clusterid.y", Sreg::ClusterIdY},
@@ -802,6 +808,7 @@ class Parser {
     }
     expect_punct("{");
     parse_body(fn);
+    contract_mul_add(fn);
     place_dynamic_shared(fn);
     current_kernel_.clear();
     cur_fn_ = nullptr;
@@ -1034,6 +1041,13 @@ class Parser {
       expect_punct(";");
       return;
     }
+    // A packed-half register is 32 bits of whatever the instructions using it
+    // say: declared as one, it is a .b32 here.
+    if (peek().kind == Token::Kind::Word && (peek().text == ".f16x2" || peek().text == ".bf16x2")) {
+      next();
+      parse_reg_decl_of_type(fn, Type{Type::Kind::B, 32});
+      return;
+    }
     parse_reg_decl_of_type(fn, expect_type(".reg declaration"));
   }
 
@@ -1189,7 +1203,11 @@ class Parser {
     const std::string& w = t.text;
     if (w[0] == '%') {
       auto it = sreg_table().find(w);
-      if (it != sreg_table().end()) return SregOperand{it->second};
+      if (it != sreg_table().end()) {
+        if (cur_fn_ && it->second >= Sreg::ReservedSmemBegin && it->second <= Sreg::ReservedSmemOffset1)
+          cur_fn_->reads_reserved_smem = true;
+        return SregOperand{it->second};
+      }
       // %envreg0 .. %envreg31 all read as zero; they are only distinguished by
       // number for a driver that sets them, and this one does not.
       // %envreg0..31 is a bank the driver fills in before the launch. Which
@@ -1418,6 +1436,29 @@ class Parser {
       for (const Addr* a : {&op.addr, &op.mbar})
         if (a->base_kind == Addr::Base::CallSlot || a->base_kind == Addr::Base::EntryParam)
           return unsupported(op0 + ".async through a parameter/slot name");
+      ins.op = op;
+    } else if (op0 == "st" && parts.size() > 1 && parts[1] == "bulk") {
+      // st.bulk{.weak}{.shared::cta} [a], size, initval (PTX ISA 9.7.10.14,
+      // sm_100): zero `size` bytes of shared memory from a.
+      OpStBulk op;
+      for (size_t i = 2; i < parts.size(); ++i) {
+        if (parts[i] == "weak") ;
+        else if (parts[i] == "shared::cta" || parts[i] == "shared") op.shared = true;   // the splitter drops ::cta
+        else return unsupported("st.bulk modifier '." + parts[i] + "'");
+      }
+      const std::string arch = target_.substr(0, target_.find(','));
+      int sm = 0;
+      std::sscanf(arch.c_str(), "sm_%d", &sm);
+      if (sm < 100)
+        fail(ins.line, "st.bulk requires sm_100 or later; this module targets " +
+                           (arch.empty() ? std::string("nothing") : arch));
+      op.addr = parse_addr(fn);
+      expect_punct(",");
+      op.size = parse_operand();
+      expect_punct(",");
+      const Operand init = parse_operand();
+      const auto* imm = std::get_if<ImmInt>(&init);
+      if (!imm || imm->value != 0) return unsupported("st.bulk's initval must be the constant 0");
       ins.op = op;
     } else if (op0 == "ld" || op0 == "st") {
       Space space = Space::Generic;
@@ -1650,11 +1691,15 @@ class Parser {
       std::vector<Type> tys;
       std::string packed;  // "f16x2"/"bf16x2": two f32 sources packed into one register
       std::string fp8;     // the narrow side: e4m3x2, e2m1x2, ue8m0x2, s2f6x2, ...
-      bool satfinite = false, sat = false, ftz = false, relu = false, scaled = false;
+      bool satfinite = false, sat = false, ftz = false, relu = false, scaled = false, tf32 = false,
+           rna = false;
       Round round = Round::None;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "rn") round = Round::Rn;
+        else if (p == "rna") rna = true;
+        else if (p == "relu") relu = true;
+        else if (p == "tf32") tf32 = true;
         else if (p == "rz") round = Round::Rz;
         else if (p == "rm") round = Round::Rm;
         else if (p == "rp") round = Round::Rp;
@@ -1681,6 +1726,24 @@ class Parser {
         else if (auto t2 = parse_type_token(p)) tys.push_back(*t2);
         else return unsupported("unrecognized cvt modifier '." + p + "'");
       }
+      if (tf32) {
+        if (tys.size() != 1 || tys[0].bits != 32 || !tys[0].is_float())
+          return unsupported("cvt to tf32 from a source other than f32");
+        if (!rna && round != Round::Rn && round != Round::Rz)
+          return unsupported("cvt.tf32.f32 needs .rna, .rn or .rz");
+        OpCvtTf32 op;
+        op.rna = rna;
+        op.rz = round == Round::Rz;
+        op.satfinite = satfinite;
+        op.relu = relu;
+        op.dst = expect_reg_operand("cvt destination");
+        expect_punct(",");
+        op.src = parse_operand();
+        ins.op = op;
+        expect_punct(";");
+        return ins;
+      }
+      if (rna) return unsupported("cvt .rna is for tf32");
       if (!fp8.empty()) {
         OpCvtFp8 op;
         op.fmt = fp8 == "e4m3x2"  ? NarrowFmt::E4M3
@@ -1750,15 +1813,21 @@ class Parser {
         expect_punct(";");
         return ins;
       }
-      if (relu || scaled)
-        return unsupported(std::string("cvt .") + (relu ? "relu" : "scaled::n2::ue8m0") +
-                           " outside the narrow floating-point conversions is not implemented");
+      // .relu on the f16/bf16 forms is checked below with the forms themselves.
+      if (scaled)
+        return unsupported("cvt .scaled::n2::ue8m0 outside the narrow floating-point conversions "
+                           "is not implemented");
       if (!packed.empty()) {
         // cvt.rn.f16x2.f32 d, a, b -- two f32 converted and packed, a high, b low.
         if (tys.size() != 1 || tys[0].bits != 32 || !tys[0].is_float())
           return unsupported("cvt to " + packed + " from a source other than f32");
+        if (round != Round::Rn && round != Round::Rz)
+          return unsupported("cvt to " + packed + " needs .rn or .rz");
         OpCvtF16x2 op;
         op.bf16 = packed[0] == 'b';
+        op.rz = round == Round::Rz;
+        op.relu = relu;
+        op.satfinite = satfinite;
         op.dst = expect_reg_operand("cvt destination");
         expect_punct(",");
         op.a = parse_operand();
@@ -1769,13 +1838,28 @@ class Parser {
         return ins;
       }
       if (tys.size() != 2) fail(ins.line, "cvt needs .<dsttype>.<srctype>");
+      if (relu && !(tys[0].bits == 16 && tys[0].is_real() && tys[1].bits == 32 && tys[1].is_float()))
+        return unsupported("cvt .relu is for f32 to f16 or bf16");
+      if (satfinite && !relu) return unsupported("cvt .satfinite on " + parts.back());
       OpCvt op;
       op.dst_ty = tys[0];
       op.src_ty = tys[1];
       op.round = round;
       op.sat = sat;
       op.ftz = ftz;
+      op.relu = relu;
       op.dst = expect_reg_operand("cvt destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
+    } else if (op0 == "cnot") {
+      // cnot.{b16,b32,b64} d, a: 1 when a is zero, else 0 (C's !a).
+      auto ty = parts.size() == 2 ? parse_type_token(parts[1]) : std::nullopt;
+      if (!ty || ty->kind != Type::Kind::B || ty->bits < 16) return unsupported("cnot form (cnot.{b16,b32,b64})");
+      OpNot op;
+      op.ty = *ty;
+      op.logical = true;
+      op.dst = expect_reg_operand("cnot destination");
       expect_punct(",");
       op.src = parse_operand();
       ins.op = op;
@@ -1833,37 +1917,52 @@ class Parser {
                (opcode.find("f16") != std::string::npos ||
                 opcode.find("bf16") != std::string::npos)) {
       // Half-precision arithmetic in all four shapes: f16, f16x2, bf16, bf16x2.
+      // The modifiers were once accepted and dropped; each changes the result,
+      // so each is carried to execution.
       bool is_bf = false, is_packed = false, saw_ty = false;
+      HalfMods mods;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p2 = parts[i];
         if (p2 == "f16") { saw_ty = true; }
         else if (p2 == "f16x2") { saw_ty = true; is_packed = true; }
         else if (p2 == "bf16") { saw_ty = true; is_bf = true; }
         else if (p2 == "bf16x2") { saw_ty = true; is_bf = true; is_packed = true; }
-        else if (p2 == "rn" || p2 == "ftz" || p2 == "sat" || p2 == "rz" || p2 == "rm" ||
-                 p2 == "rp" || p2 == "NaN" || p2 == "xorsign" || p2 == "abs") ;
+        else if (p2 == "rn") ;
+        else if (p2 == "rz") mods.round = FRound::Zero;
+        else if (p2 == "rm") mods.round = FRound::MinusInf;
+        else if (p2 == "rp") mods.round = FRound::PlusInf;
+        else if (p2 == "ftz") mods.ftz = true;
+        else if (p2 == "sat") mods.sat = true;
+        else if (p2 == "relu") mods.relu = true;
+        else if (p2 == "NaN") mods.nan_propagate = true;
+        else if (p2 == "xorsign" || p2 == "abs") mods.xorsign_abs = true;
         else return unsupported("half-precision modifier '." + p2 + "'");
       }
+      const bool minmax = op0 == "min" || op0 == "max";
+      if ((mods.nan_propagate || mods.xorsign_abs) && !minmax)
+        return unsupported("." + std::string(mods.nan_propagate ? "NaN" : "xorsign.abs") + " is a modifier of min and max");
+      if (mods.relu && op0 != "fma")
+        return unsupported(".relu on " + op0 + " (a modifier of half-precision fma)");
       if (!saw_ty) return unsupported("half-precision form without a type");
       Reg dst = expect_reg_operand("destination");
       expect_punct(",");
       Operand a = parse_operand();
       if (op0 == "neg" || op0 == "abs") {
-        ins.op = OpF16x2Neg{is_bf, is_packed, op0 == "abs", dst, a};
+        ins.op = OpF16x2Neg{is_bf, is_packed, op0 == "abs", dst, a, mods.ftz && !is_bf};
       } else {
         expect_punct(",");
         Operand b = parse_operand();
         if (op0 == "fma") {
           expect_punct(",");
           Operand c = parse_operand();
-          ins.op = OpF16x2Fma{is_bf, is_packed, dst, a, b, c};
+          ins.op = OpF16x2Fma{is_bf, is_packed, dst, a, b, c, mods};
         } else {
           FloatBinOp fop = op0 == "add"   ? FloatBinOp::Add
                            : op0 == "sub" ? FloatBinOp::Sub
                            : op0 == "min" ? FloatBinOp::Min
                            : op0 == "max" ? FloatBinOp::Max
                                           : FloatBinOp::Mul;
-          ins.op = OpF16x2Bin{fop, is_bf, is_packed, dst, a, b};
+          ins.op = OpF16x2Bin{fop, is_bf, is_packed, dst, a, b, mods};
         }
       }
     } else if (op0 == "wmma") {
@@ -2059,6 +2158,7 @@ class Parser {
       if (!ty) fail(ins.line, "abs missing type");
       OpAbs op;
       op.ty = *ty;
+      op.ftz = std::find(parts.begin(), parts.end(), "ftz") != parts.end();
       op.dst = expect_reg_operand("abs destination");
       expect_punct(",");
       op.src = parse_operand();
@@ -2072,13 +2172,19 @@ class Parser {
       Type ty{};
       bool have_ty = false;
       bool packed_half = false;
+      FRound mround = FRound::Nearest;
+      bool exact = false, mftz = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
-        // approx/rn/rz/ftz/full select precision on hardware; VirtualGPU always
-        // computes at host precision (documented divergence).
-        if (p == "approx" || p == "rn" || p == "rz" || p == "rm" || p == "rp" || p == "ftz" ||
-            p == "full")
-          ;
+        // .approx/.full select a hardware approximation, computed here at host
+        // precision (documented divergence). .rn/.rz/.rm/.rp on sqrt and rcp
+        // are the IEEE forms: correctly rounded in that mode, so applied.
+        if (p == "approx" || p == "full") ;
+        else if (p == "ftz") mftz = true;
+        else if (p == "rn" || p == "rz" || p == "rm" || p == "rp") {
+          exact = true;
+          mround = p == "rz" ? FRound::Zero : p == "rm" ? FRound::MinusInf : p == "rp" ? FRound::PlusInf : FRound::Nearest;
+        }
         else if (p == "f16x2") { ty = Type{Type::Kind::F, 16}; have_ty = true; packed_half = true; }
         else if (p == "bf16x2") { ty = Type{Type::Kind::BF, 16}; have_ty = true; packed_half = true; }
         else if (auto t2 = parse_type_token(p)) {
@@ -2093,6 +2199,9 @@ class Parser {
       op.op = mops.at(op0);
       op.ty = ty;
       op.packed = packed_half;
+      op.round = mround;
+      op.exact = exact && (op.op == MathOp::Sqrt || op.op == MathOp::Rcp) && ty.bits >= 32;
+      op.ftz = mftz && ty.bits == 32;
       op.dst = expect_reg_operand("destination");
       expect_punct(",");
       op.src = parse_operand();
@@ -3009,6 +3118,15 @@ class Parser {
       expect_punct(",");
       (void)parse_operand();  // membermask; the active mask already carries it
       ins.op = op;
+    } else if (op0 == "istypep") {
+      // istypep.<texref|samplerref|surfref> p, a (9.7.12.6).
+      if (parts.size() != 2 || (parts[1] != "texref" && parts[1] != "samplerref" && parts[1] != "surfref"))
+        return unsupported("istypep form (.texref, .samplerref or .surfref)");
+      OpIsTypep op;
+      op.dst = expect_reg_operand("istypep destination");
+      expect_punct(",");
+      op.src = parse_operand();
+      ins.op = op;
     } else if (op0 == "stacksave" || op0 == "stackrestore" || op0 == "alloca") {
       // The per-thread stack (PTX ISA 9.7.19, sm_52 and later). The type is
       // .u32 or .u64; the ISA's own alloca example leaves it out, so it may be
@@ -3188,15 +3306,23 @@ class Parser {
       if (!ty) fail(ins.line, "neg missing type");
       OpNeg op;
       op.ty = *ty;
+      op.ftz = std::find(parts.begin(), parts.end(), "ftz") != parts.end();
       op.dst = expect_reg_operand("neg destination");
       expect_punct(",");
       op.src = parse_operand();
       ins.op = op;
     } else if (op0 == "prmt") {
-      // prmt.b32[.mode] d, a, b, c — only the default (generic) mode.
-      if (parts.size() < 2 || parts[1] != "b32") return unsupported("prmt form (only prmt.b32)");
-      if (parts.size() > 2) return unsupported("prmt with an explicit mode ('." + parts[2] + "')");
+      // prmt.b32[.mode] d, a, b, c
+      if (parts.size() < 2 || parts[1] != "b32" || parts.size() > 3) return unsupported("prmt form (prmt.b32[.mode])");
       OpPrmt op;
+      if (parts.size() == 3) {
+        static const std::unordered_map<std::string, PrmtMode> kModes = {
+            {"f4e", PrmtMode::F4e}, {"b4e", PrmtMode::B4e}, {"rc8", PrmtMode::Rc8},
+            {"ecl", PrmtMode::Ecl}, {"ecr", PrmtMode::Ecr}, {"rc16", PrmtMode::Rc16}};
+        auto it = kModes.find(parts[2]);
+        if (it == kModes.end()) return unsupported("prmt mode '." + parts[2] + "'");
+        op.mode = it->second;
+      }
       op.dst = expect_reg_operand("prmt destination");
       expect_punct(",");
       op.a = parse_operand();
@@ -3555,6 +3681,17 @@ class Parser {
         else op.dst = expect_reg_operand("mbarrier destination");
         expect_punct(",");
       }
+      // mbarrier.pending_count.b64 count, state: the ISA's form reads an
+      // arrival's state token, not the barrier (an address is accepted too).
+      if (op.op == MbarOp::PendingCount && !peek_punct("[")) {
+        op.state = parse_operand();
+        op.have_state = true;
+        ins.op = op;
+        expect_punct(";");
+        ins.text = reconstruct_from(start_tok);
+        ins.opcode_id = intern_opcode(parts[0]);
+        return ins;
+      }
       op.addr = parse_addr(fn);
       if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
         return unsupported("mbarrier through a parameter/slot name");
@@ -3603,18 +3740,27 @@ class Parser {
       expect_punct(",");
       op.membermask = parse_operand();
       ins.op = op;
-    } else if (op0 == "mul24") {
-      if (parts.size() != 3 || (parts[1] != "lo" && parts[1] != "hi"))
-        return unsupported("mul24 form (expected mul24.{lo,hi}.{u32,s32})");
+    } else if (op0 == "mul24" || op0 == "mad24") {
       OpMul24 op;
-      op.hi = parts[1] == "hi";
-      if (parts[2] == "s32") op.is_signed = true;
-      else if (parts[2] != "u32") return unsupported("mul24 type '." + parts[2] + "'");
-      op.dst = expect_reg_operand("mul24 destination");
+      op.mad = op0 == "mad24";
+      std::vector<std::string> ps = parts;
+      for (size_t i = 2; i < ps.size();)
+        if (op.mad && ps[i] == "sat") { op.sat = true; ps.erase(ps.begin() + i); } else ++i;
+      if (ps.size() != 3 || (ps[1] != "lo" && ps[1] != "hi"))
+        return unsupported(op0 + " form (expected " + op0 + ".{lo,hi}.{u32,s32})");
+      op.hi = ps[1] == "hi";
+      if (ps[2] == "s32") op.is_signed = true;
+      else if (ps[2] != "u32") return unsupported(op0 + " type '." + ps[2] + "'");
+      if (op.sat && !(op.hi && op.is_signed)) return unsupported("mad24 .sat is for mad24.hi.s32 only");
+      op.dst = expect_reg_operand(op0 + " destination");
       expect_punct(",");
       op.a = parse_operand();
       expect_punct(",");
       op.b = parse_operand();
+      if (op.mad) {
+        expect_punct(",");
+        op.c = parse_operand();
+      }
       ins.op = op;
     } else if (op0 == "szext") {
       if (parts.size() != 3 || (parts[1] != "clamp" && parts[1] != "wrap"))
@@ -3707,6 +3853,12 @@ class Parser {
       expect_punct(",");
       op.c = parse_operand();
       ins.op = op;
+    } else if (op0 == "pmevent") {
+      // pmevent[.mask] a: raises a performance-monitor event for a profiler to
+      // count. Nothing in the kernel observes it (the counters it feeds are
+      // %pm0-%pm7, which stay refused), so it does nothing here.
+      while (!at_end() && !peek_punct(";")) next();
+      ins.op = OpNop{};
     } else if (op0 == "prefetch" || op0 == "prefetchu" || op0 == "createpolicy" ||
                op0 == "applypriority" || op0 == "discard") {
       // Cache-management hints. Every one of these says where data should be
@@ -3754,7 +3906,7 @@ class Parser {
       std::optional<AtomOp> aop;
       Type ty{};
       bool have_ty = false;
-      bool packed_half = false;
+      bool packed_half = false, b128 = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "global") space = Space::Global;
@@ -3772,12 +3924,25 @@ class Parser {
         else if (p == "dec") aop = AtomOp::Dec;
         else if (p == "f16x2") { ty = Type{Type::Kind::F, 16}; have_ty = true; packed_half = true; }
         else if (p == "bf16x2") { ty = Type{Type::Kind::BF, 16}; have_ty = true; packed_half = true; }
+        else if (p == "b128") { ty = Type{Type::Kind::B, 64}; have_ty = true; b128 = true; }
         else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
         } else return unsupported("atom operation '." + p + "'");
       }
       if (!aop || !have_ty) return unsupported("atom form");
+      if (b128) {
+        // .b128 (PTX ISA 8.3, sm_90): .exch and .cas only.
+        if (*aop != AtomOp::Exch && *aop != AtomOp::Cas)
+          return unsupported("atom.b128 is defined for .exch and .cas only");
+        if (discards) return unsupported(op0 + ".b128");
+        const std::string arch = target_.substr(0, target_.find(','));
+        int sm = 0;
+        std::sscanf(arch.c_str(), "sm_%d", &sm);
+        if (sm < 90)
+          fail(ins.line, "atom.b128 requires sm_90 or later; this module targets " +
+                             (arch.empty() ? std::string("nothing") : arch));
+      }
       // Float atomics are what a reduction, a gradient accumulation, or an
       // embedding backward pass is built out of, so they are not optional for
       // ML work. CUDA exposes add/exch/min/max on float and double; the
@@ -3805,18 +3970,39 @@ class Parser {
       op.space = space;
       op.discards_result = discards;
       op.packed_half = packed_half;
-      if (!discards) {
-        op.dst = expect_reg_operand("atom destination");
+      op.b128 = b128;
+      if (b128) {
+        const auto [lo, hi] = b128_halves("atom.b128 destination");
+        op.dst = lo;
+        op.dst_hi = hi;
         expect_punct(",");
-      }
-      op.addr = parse_addr(fn);
-      if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
-        return unsupported("atom through a parameter/slot name");
-      expect_punct(",");
-      op.b = parse_operand();
-      if (*aop == AtomOp::Cas) {
+        op.addr = parse_addr(fn);
+        if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
+          return unsupported("atom through a parameter/slot name");
         expect_punct(",");
-        op.c = parse_operand();
+        const auto [blo, bhi] = b128_halves("atom.b128 operand b");
+        op.b = RegOperand{blo};
+        op.b_hi = RegOperand{bhi};
+        if (*aop == AtomOp::Cas) {
+          expect_punct(",");
+          const auto [clo, chi] = b128_halves("atom.b128 operand c");
+          op.c = RegOperand{clo};
+          op.c_hi = RegOperand{chi};
+        }
+      } else {
+        if (!discards) {
+          op.dst = expect_reg_operand("atom destination");
+          expect_punct(",");
+        }
+        op.addr = parse_addr(fn);
+        if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
+          return unsupported("atom through a parameter/slot name");
+        expect_punct(",");
+        op.b = parse_operand();
+        if (*aop == AtomOp::Cas) {
+          expect_punct(",");
+          op.c = parse_operand();
+        }
       }
       ins.op = op;
     } else if (op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "min" || op0 == "max" ||
@@ -3827,8 +4013,11 @@ class Parser {
       const std::string base_op = carry_in ? op0.substr(0, 3) : op0;
       bool carry_out = false;
       bool nan_propagate = false;
+      bool sat = false, xorsign_abs = false, ftz = false;
       bool wide = false, lo = false, hi = false;
       FRound frnd = FRound::Nearest;
+      bool frnd_explicit = false;
+      bool div_approx = false;
       Type ty{};
       bool have_ty = false;
       for (size_t i = 1; i < parts.size(); ++i) {
@@ -3837,35 +4026,40 @@ class Parser {
         else if (p == "lo") lo = true;
         else if (p == "hi") hi = true;
         else if (p == "cc") carry_out = true;
-        else if (p == "rn" || p == "ftz") ;
-        else if (p == "rz") frnd = FRound::Zero;
-        else if (p == "rm") frnd = FRound::MinusInf;
-        else if (p == "rp") frnd = FRound::PlusInf;
+        else if (p == "rn") frnd_explicit = true;
+        else if (p == "ftz") ftz = true;
+        else if (p == "rz") { frnd = FRound::Zero; frnd_explicit = true; }
+        else if (p == "rm") { frnd = FRound::MinusInf; frnd_explicit = true; }
+        else if (p == "rp") { frnd = FRound::PlusInf; frnd_explicit = true; }
         // .approx and .full ask for a faster, less accurate result -- div.approx
         // is what __fdividef compiles to, and ML kernels use it constantly.
-        // Both have a documented error bound, and the exact IEEE result falls
-        // inside it, so computing exactly satisfies the contract. This is the
-        // same policy the SFU transcendentals already follow: correct to better
-        // than hardware, never bit-identical to it.
-        else if (p == "approx" || p == "full") ;
+        // div.full has a documented error bound that the exact IEEE result
+        // falls inside, so it computes exactly. div.approx is documented as a
+        // formula, a * (1/b), with its own rule for a huge divisor; it is
+        // carried to execution, which follows both.
+        else if (p == "approx") div_approx = true;
+        else if (p == "full") ;
         // min.NaN/max.NaN propagate a NaN operand instead of returning the
         // other one. That is exactly what fmin/fmax do NOT do, so it cannot be
         // dropped -- it is handled at execution, and recorded here.
         else if (p == "NaN") nan_propagate = true;
         // .xorsign.abs takes the magnitude and xors the signs; a semantic
-        // change rather than an accuracy one.
-        else if (p == "xorsign" || p == "abs")
-          return unsupported("modifier '." + p + "' on " + op0 + " is not implemented");
-        // .sat clamps the result into [0,1]. That is a semantic change, not an
-        // accuracy one, so ignoring it would silently produce wrong numbers.
-        else if (p == "sat")
-          return unsupported("modifier '.sat' not implemented");
+        // change rather than an accuracy one, so it is carried to execution.
+        else if (p == "xorsign" || p == "abs") xorsign_abs = true;
+        // .sat clamps: floats into [0,1], add/sub.s32 into the s32 range.
+        else if (p == "sat") sat = true;
         else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
         } else return unsupported("unrecognized modifier '." + p + "'");
       }
       if (!have_ty) fail(ins.line, opcode + " missing type");
+      if (xorsign_abs && (!ty.is_float() || (base_op != "min" && base_op != "max")))
+        return unsupported(".xorsign.abs is a modifier of float min and max");
+      if (sat && ty.is_float() ? (ty.bits != 32 || (base_op != "add" && base_op != "sub" && base_op != "mul"))
+              : sat && !(ty.is_signed() && ty.bits == 32 && (base_op == "add" || base_op == "sub")))
+        return unsupported(".sat on " + base_op + "." + parts.back() +
+                           " (it is for add/sub/mul.f32 and add/sub.s32)");
       if (hi) {
         if (base_op != "mul") return unsupported("'." + base_op + ".hi' is not implemented");
         if (ty.is_float()) return unsupported("mul.hi on floats");
@@ -3892,10 +4086,16 @@ class Parser {
         OpPredBin op;
         op.op = *pop;
         op.dst = expect_reg_operand("predicate destination");
+        auto pred_source = [&](Reg& r, int8_t& imm) {
+          const Operand o = parse_operand();
+          if (const auto* reg = std::get_if<RegOperand>(&o)) r = reg->reg;
+          else if (const auto* i = std::get_if<ImmInt>(&o)) imm = i->value != 0 ? 1 : 0;
+          else fail(ins.line, base_op + ".pred takes predicate registers or immediates");
+        };
         expect_punct(",");
-        op.a = expect_reg_operand("predicate operand");
+        pred_source(op.a, op.a_imm);
         expect_punct(",");
-        op.b = expect_reg_operand("predicate operand");
+        pred_source(op.b, op.b_imm);
         ins.op = op;
       } else if (ty.is_float()) {
         if (ty.bits != 16 && ty.bits != 32 && ty.bits != 64)
@@ -3907,8 +4107,13 @@ class Parser {
         if (it == fops.end()) return unsupported("float op '" + base_op + "'");
         OpFloatBin op;
         op.round = frnd;
+        op.round_explicit = frnd_explicit;
         op.op = it->second;
         op.nan_propagate = nan_propagate;
+        op.sat = sat;
+        op.xorsign_abs = xorsign_abs;
+        op.ftz = ftz && ty.bits == 32;
+        op.approx = div_approx && op.op == FloatBinOp::Div && ty.bits == 32;
         op.ty = ty;
         op.dst = expect_reg_operand("destination");
         expect_punct(",");
@@ -3947,6 +4152,7 @@ class Parser {
         op.ty = ty;
         op.carry_in = carry_in;
         op.carry_out = carry_out;
+        op.sat = sat;
         op.dst = expect_reg_operand("destination");
         expect_punct(",");
         op.a = parse_operand();
@@ -3958,16 +4164,23 @@ class Parser {
       bool carry_in = (op0 == "madc");
       bool carry_out = false;
       Type ty{};
-      bool have_ty = false, lo = false, wide = false, hi = false;
+      bool have_ty = false, lo = false, wide = false, hi = false, sat = false, ftz = false;
+      FRound frnd = FRound::Nearest;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "lo") lo = true;
         else if (p == "wide") wide = true;
         else if (p == "hi") hi = true;
         else if (p == "cc") carry_out = true;
-        // Rounding modes: VirtualGPU always computes at host precision
-        // (round-to-nearest) — a documented divergence, see ARCHITECTURE.md.
-        else if (p == "rn" || p == "rz" || p == "rm" || p == "rp" || p == "ftz" || p == "sat") ;
+        // The rounding mode and .sat change the result, so both are carried to
+        // execution (they were once dropped here, which gave fma.rz and
+        // fma.sat round-to-nearest, unclamped results).
+        else if (p == "rn") ;
+        else if (p == "ftz") ftz = true;
+        else if (p == "rz") frnd = FRound::Zero;
+        else if (p == "rm") frnd = FRound::MinusInf;
+        else if (p == "rp") frnd = FRound::PlusInf;
+        else if (p == "sat") sat = true;
         else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
@@ -3986,26 +4199,47 @@ class Parser {
       if (ty.is_float()) {
         if (carry_in || carry_out) return unsupported("the carry bit is integer-only");
         if (ty.bits != 32 && ty.bits != 64) return unsupported("only f32/f64 fma implemented");
-        ins.op = OpFma{ty, dst, a, b, c};
+        if (sat && ty.bits != 32) return unsupported("fma/mad .sat is for .f32");
+        OpFma f{ty, dst, a, b, c};
+        f.round = frnd;
+        f.sat = sat;
+        f.ftz = ftz && ty.bits == 32;
+        ins.op = f;
+      } else if (sat && !(hi && ty.is_signed() && ty.bits == 32)) {
+        return unsupported("integer mad .sat is for mad.hi.sat.s32");
       } else if (wide) {
         if (ty.bits != 32) return unsupported("only mad.wide.{s32,u32} implemented");
         ins.op = OpMadWide{ty.is_signed(), dst, a, b, c};
       } else if (hi) {
-        ins.op = OpMadHi{ty, dst, a, b, c, carry_in, carry_out};
+        if (sat && (carry_in || carry_out)) return unsupported("mad.hi.sat with the carry bit");
+        ins.op = OpMadHi{ty, dst, a, b, c, carry_in, carry_out, sat};
       } else {
         if (!lo) return unsupported("integer mad requires .lo or .wide");
         ins.op = OpMadLo{ty, dst, a, b, c, carry_in, carry_out};
       }
     } else if (op0 == "set") {
-      // set.<cmp>[.ftz].<dtype>.<stype> d, a, b
+      // set.<cmp>[.<bop>][.ftz].<dtype>.<stype> d, a, b[, [!]c]
       std::vector<std::string> ps = parts;
-      for (size_t i = 2; i < ps.size();)
-        if (ps[i] == "ftz") ps.erase(ps.begin() + i); else ++i;
+      bool has_bop = false;
+      PredBinOp bop = PredBinOp::And;
+      bool set_ftz = false;
+      for (size_t i = 2; i < ps.size();) {
+        if (ps[i] == "ftz") {
+          set_ftz = true;
+          ps.erase(ps.begin() + i);
+        }
+        else if (ps[i] == "and" || ps[i] == "or" || ps[i] == "xor") {
+          has_bop = true;
+          bop = ps[i] == "and" ? PredBinOp::And : ps[i] == "or" ? PredBinOp::Or : PredBinOp::Xor;
+          ps.erase(ps.begin() + i);
+        } else ++i;
+      }
       if (ps.size() != 4) return unsupported("set form (expected set.<cmp>.<dtype>.<stype>)");
       auto it = cmp_table().find(ps[1]);
       if (it == cmp_table().end()) return unsupported("comparison '." + ps[1] + "'");
       OpSet op;
       op.cmp = it->second;
+      op.ftz = set_ftz;
       auto dt = ps[2] == "f16x2"  ? std::optional<Type>{Type{Type::Kind::F, 16}}
               : ps[2] == "bf16x2" ? std::optional<Type>{Type{Type::Kind::BF, 16}}
                                   : parse_type_token(ps[2]);
@@ -4015,33 +4249,69 @@ class Parser {
       if (!dt || !st) return unsupported("set types '." + ps[2] + "." + ps[3] + "'");
       const bool dpack = ps[2] == "f16x2" || ps[2] == "bf16x2";
       const bool spack = ps[3] == "f16x2" || ps[3] == "bf16x2";
-      if (dpack != spack)
+      const bool int_dst = !dt->is_real() && dt->bits == 32;
+      if (dpack != spack && !(spack && int_dst))
         return unsupported("set with only one side packed ('." + ps[2] + "." + ps[3] + "')");
       op.dty = *dt;
       op.sty = *st;
-      op.packed = dpack;
+      op.packed = spack;
+      op.packed_int_dst = spack && !dpack;
       op.dst = expect_reg_operand("set destination");
       expect_punct(",");
       op.a = parse_operand();
       expect_punct(",");
       op.b = parse_operand();
+      if (has_bop) {
+        op.has_bop = true;
+        op.bop = bop;
+        expect_punct(",");
+        if (peek_punct("!")) { next(); op.negate_c = true; }
+        op.c = expect_reg_operand("set predicate operand");
+      }
       ins.op = op;
     } else if (op0 == "setp") {
-      // setp.<cmp>[.ftz].<type> — drop the flush-to-zero qualifier.
-      if (parts.size() == 4 && parts[2] == "ftz") parts.erase(parts.begin() + 2);
-      if (parts.size() != 3) return unsupported("setp form (only setp.<cmp>.<type> is implemented)");
+      // setp.<cmp>[.<bop>][.ftz].<type> p[|q], a, b[, [!]c]
+      bool has_bop = false, setp_ftz = false;
+      PredBinOp bop = PredBinOp::And;
+      for (size_t i = 2; i < parts.size();) {
+        if (parts[i] == "ftz") {
+          setp_ftz = true;
+          parts.erase(parts.begin() + i);
+        } else if (parts[i] == "and" || parts[i] == "or" || parts[i] == "xor") {
+          has_bop = true;
+          bop = parts[i] == "and" ? PredBinOp::And : parts[i] == "or" ? PredBinOp::Or : PredBinOp::Xor;
+          parts.erase(parts.begin() + i);
+        } else ++i;
+      }
+      if (parts.size() != 3) return unsupported("setp form (setp.<cmp>[.<bop>].<type>)");
       auto it = cmp_table().find(parts[1]);
       if (it == cmp_table().end()) return unsupported("comparison '." + parts[1] + "'");
-      auto ty = parse_type_token(parts[2]);
+      const bool spacked = parts[2] == "f16x2" || parts[2] == "bf16x2";
+      auto ty = spacked ? std::optional<Type>{Type{parts[2][0] == 'b' ? Type::Kind::BF : Type::Kind::F, 16}}
+                        : parse_type_token(parts[2]);
       if (!ty) fail(ins.line, "setp missing type");
       OpSetp op;
       op.cmp = it->second;
       op.ty = *ty;
+      op.packed = spacked;
+      op.ftz = setp_ftz;
       op.dst = expect_reg_operand("predicate destination");
+      if (peek_punct("|")) {
+        next();
+        op.has_q = true;
+        op.dst2 = expect_reg_operand("second predicate destination");
+      }
       expect_punct(",");
       op.a = parse_operand();
       expect_punct(",");
       op.b = parse_operand();
+      if (has_bop) {
+        op.has_bop = true;
+        op.bop = bop;
+        expect_punct(",");
+        if (peek_punct("!")) { next(); op.negate_c = true; }
+        op.c = expect_reg_operand("setp predicate operand");
+      }
       ins.op = op;
     } else if (op0 == "selp") {
       if (parts.size() != 2) return unsupported("selp form");

@@ -160,6 +160,38 @@ VTEST(occupancy_matches_the_standard_calculation) {
   VCHECK_EQ(std::string(shmem.limited_by), "shared memory");
 }
 
+// NVIDIA's allocation rules (cuda_occupancy.h), with the numbers an RTX
+// 3060's cudaOccupancyMaxActiveBlocksPerMultiprocessor gives for the same
+// kernels (e2e_occupancy_rules).
+VTEST(occupancy_follows_nvidias_allocation_rules) {
+  ptx::OccupancyRules sm86;
+  sm86.reg_alloc_unit = 256;
+  sm86.sub_partitions = 4;
+  sm86.regs_per_block = 65536;
+  sm86.smem_alloc_unit = 128;
+  sm86.reserved_smem = 1024;
+  auto blocks = [&](uint32_t regs, uint32_t threads, uint32_t st, uint32_t dyn, const ptx::OccupancyRules& r,
+                    uint32_t smem_per_sm = 102400) {
+    return ptx::compute_occupancy(regs, threads, st, dyn, 65536, 1536, 16, smem_per_sm, 32, r).blocks_per_sm;
+  };
+  // 56 registers: 1792 a warp, 9 warps per sub-partition, 36 on the SM.
+  VCHECK_EQ(blocks(56, 128, 0, 0, sm86), 9u);
+  VCHECK_EQ(blocks(56, 192, 0, 0, sm86), 6u);
+  // 12,000 static bytes and the reserved KiB: 13,056 allocated, 7 fit
+  // (8 without the reservation and the rounding).
+  VCHECK_EQ(blocks(8, 64, 12000, 0, sm86), 7u);
+  VCHECK_EQ(blocks(8, 64, 12000, 0, ptx::OccupancyRules{}), 8u);
+  VCHECK_EQ(blocks(8, 128, 0, 9000, sm86), 10u);
+  VCHECK_EQ(blocks(8, 32, 0, 20001, sm86), 4u);
+  // A block whose registers exceed the per-block file fits nowhere.
+  VCHECK_EQ(blocks(72, 1024, 0, 0, sm86), 0u);
+  // Turing: 256-byte units, nothing reserved, 64 KiB a multiprocessor.
+  ptx::OccupancyRules sm75 = sm86;
+  sm75.smem_alloc_unit = 256;
+  sm75.reserved_smem = 0;
+  VCHECK_EQ(blocks(8, 64, 12000, 0, sm75, 65536), 5u);
+}
+
 VTEST(launch_bounds_are_enforced) {
   // __launch_bounds__ emits .maxntid; hardware refuses a larger block.
   std::string ptx = std::string(kHeader) +
