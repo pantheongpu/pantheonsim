@@ -3,6 +3,7 @@
 // landing, and a float max through its compare-and-swap loop. Each check
 // prints "ok <what>" or "FAIL <what>: <why>", and the last line counts them.
 // Built by build.sh with hipcc; run by amd/tests/e2e/run_hipcc.sh.
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <atomic>
@@ -36,6 +37,19 @@ __global__ void flat_into_lds(int* out, int* elsewhere, int use_lds) {
 }
 
 __global__ void count_system(int* counter) { atomicAdd_system(counter, 1); }
+
+__global__ void cas_short(unsigned short* p) {
+  unsigned short seen = *p;
+  while (true) {
+    const unsigned short was = atomicCAS(p, seen, static_cast<unsigned short>(seen + 1));
+    if (was == seen) break;
+    seen = was;
+  }
+}
+
+__global__ void add_half(__half* p) { unsafeAtomicAdd(p, __float2half(1.0f)); }
+
+__global__ void past_the_end(int* p) { p[1] = 1; }
 
 __global__ void max_of(float* mem, float* old) {
   old[blockIdx.x * blockDim.x + threadIdx.x] = unsafeAtomicMax(mem, 7.5f);
@@ -96,6 +110,43 @@ int main() {
           std::to_string(first) + " saw 5.5, " + std::to_string(larger) + " saw 7.5");
     (void)hipFree(mem);
     (void)hipFree(old);
+  }
+
+  // Atomics on one or two bytes, which the compiler makes as a word-wide
+  // compare-and-swap on the aligned word that holds them: on a two-byte
+  // allocation, the rest of that word is not the program's, and a card
+  // (allocating whole pages) takes it. So does this.
+  {
+    unsigned short* s16 = nullptr;
+    (void)hipMalloc(&s16, sizeof(unsigned short));
+    (void)hipMemset(s16, 0, sizeof(unsigned short));
+    hipLaunchKernelGGL(cas_short, dim3(4), dim3(64), 0, nullptr, s16);
+    const hipError_t e = hipDeviceSynchronize();
+    unsigned short got = 0;
+    (void)hipMemcpy(&got, s16, sizeof got, hipMemcpyDeviceToHost);
+    check(e == hipSuccess && got == 256, "atomicCAS on a two-byte allocation",
+          std::string(hipGetErrorName(e)) + ", " + std::to_string(got));
+    __half* h = nullptr;
+    (void)hipMalloc(&h, sizeof(__half));
+    (void)hipMemset(h, 0, sizeof(__half));
+    hipLaunchKernelGGL(add_half, dim3(2), dim3(64), 0, nullptr, h);
+    const hipError_t e2 = hipDeviceSynchronize();
+    __half hv;
+    (void)hipMemcpy(&hv, h, sizeof hv, hipMemcpyDeviceToHost);
+    check(e2 == hipSuccess && __half2float(hv) == 128.0f, "a half's unsafeAtomicAdd on a two-byte allocation",
+          std::string(hipGetErrorName(e2)) + ", " + std::to_string(__half2float(hv)));
+    (void)hipFree(s16);
+    (void)hipFree(h);
+  }
+
+  // A store past the end of an allocation is still refused: only an aligned
+  // word's load or atomic reaches past it. Last, since it fails the device.
+  {
+    int* one = nullptr;
+    (void)hipMalloc(&one, sizeof(int));
+    hipLaunchKernelGGL(past_the_end, dim3(1), dim3(1), 0, nullptr, one);
+    const hipError_t e = hipDeviceSynchronize();
+    check(e != hipSuccess, "a store past the end of an allocation is refused", hipGetErrorName(e));
   }
 
   std::printf("atomics: %d checks, %d failed\n", checks, failures);
