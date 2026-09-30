@@ -420,6 +420,119 @@ VTEST(rdna4_gives_each_wave_its_number_in_ttmp8) {
   VCHECK_EQ(wrong, 0);
 }
 
+VTEST(lds_64_bit_read_modify_writes_and_the_scalar_bit_operations_compute_what_the_isa_says) {
+  const amd::CodeObject o = object("asm_lds64");
+  MemoryManager mem(16ull << 20);
+  // a and b per lane: doubles, so the floating-point forms see numbers, whose
+  // bits the integer forms take as they are; some lanes a == b, some a > b.
+  std::vector<uint64_t> in(128);
+  for (uint32_t l = 0; l < 64; ++l) {
+    const double a = static_cast<double>(l) * 1.25 - 20.0, b = l % 7 == 0 ? a : static_cast<double>(63 - l) * 0.5;
+    std::memcpy(&in[2 * l], &a, 8);
+    std::memcpy(&in[2 * l + 1], &b, 8);
+  }
+  const uint64_t in_d = mem.alloc(in.size() * 8), out = mem.alloc(64 * 68 * 8);
+  mem.write(in_d, in.data(), in.size() * 8);
+  const std::vector<uint32_t> r = run(o, "lds64", mem, out, 64 * 68 * 2, {in_d, out});
+  const auto dbl = [](uint64_t x) {
+    double d;
+    std::memcpy(&d, &x, 8);
+    return d;
+  };
+  const auto bits = [](double d) {
+    uint64_t x;
+    std::memcpy(&x, &d, 8);
+    return x;
+  };
+  const char* names[] = {"add_u64", "sub_u64", "rsub_u64", "inc_u64", "dec_u64", "min_i64", "max_i64", "min_u64",
+                         "max_u64", "and_b64", "or_b64", "xor_b64", "add_f64", "min_f64", "max_f64"};
+  int wrong = 0;
+  for (uint32_t l = 0; l < 64; ++l) {
+    const uint64_t a = in[2 * l], b = in[2 * l + 1];
+    const auto at = [&](uint32_t word) { return uint64_t{r[(68 * l + word) * 2]} | uint64_t{r[(68 * l + word) * 2 + 1]} << 32; };
+    for (uint32_t k = 0; k < 30; ++k) {
+      const std::string what = k < 15 ? names[k] : k == 27 ? "wrxchg_b64" : k < 27 ? names[k - 15] : k == 28 ? "min_f64" : "max_f64";
+      uint64_t now = a;
+      if (what == "add_u64") now = a + b;
+      else if (what == "sub_u64") now = a - b;
+      else if (what == "rsub_u64") now = b - a;
+      else if (what == "inc_u64") now = a >= b ? 0 : a + 1;
+      else if (what == "dec_u64") now = a == 0 || a > b ? b : a - 1;
+      else if (what == "min_i64") now = static_cast<uint64_t>(std::min(static_cast<int64_t>(a), static_cast<int64_t>(b)));
+      else if (what == "max_i64") now = static_cast<uint64_t>(std::max(static_cast<int64_t>(a), static_cast<int64_t>(b)));
+      else if (what == "min_u64") now = std::min(a, b);
+      else if (what == "max_u64") now = std::max(a, b);
+      else if (what == "and_b64") now = a & b;
+      else if (what == "or_b64") now = a | b;
+      else if (what == "xor_b64") now = a ^ b;
+      else if (what == "wrxchg_b64") now = b;
+      else if (what == "add_f64") now = bits(dbl(a) + dbl(b));
+      else if (what == "min_f64") now = bits(std::fmin(dbl(a), dbl(b)));
+      else if (what == "max_f64") now = bits(std::fmax(dbl(a), dbl(b)));
+      const uint64_t handed_back = k >= 15 ? a : 0;
+      wrong += at(2 * k) != handed_back;
+      wrong += at(2 * k + 1) != now;
+    }
+    // The scalar results, on lane 0's a, the same in every lane.
+    const uint64_t s = in[0];
+    uint64_t brev = 0, wqm64 = 0;
+    uint32_t wqm32 = 0;
+    for (int i = 0; i < 64; ++i) brev |= ((s >> i) & 1) << (63 - i);
+    for (int q = 0; q < 16; ++q)
+      if ((s >> (4 * q)) & 0xF) wqm64 |= uint64_t{0xF} << (4 * q);
+    for (int q = 0; q < 8; ++q)
+      if ((s >> (4 * q)) & 0xF) wqm32 |= 0xFu << (4 * q);
+    const uint32_t lo = static_cast<uint32_t>(s);
+    const uint32_t want[14] = {static_cast<uint32_t>(brev), static_cast<uint32_t>(brev >> 32),
+                               static_cast<uint32_t>(64 - __builtin_popcountll(s)), static_cast<uint32_t>(32 - __builtin_popcount(lo)),
+                               ~lo ? static_cast<uint32_t>(__builtin_ctz(~lo)) : 0xFFFFFFFFu,
+                               ~s ? static_cast<uint32_t>(__builtin_ctzll(~s)) : 0xFFFFFFFFu,
+                               static_cast<uint32_t>(wqm64), static_cast<uint32_t>(wqm64 >> 32), wqm32,
+                               lo, static_cast<uint32_t>(s >> 32), 0, 0, 0};
+    for (int i = 0; i < 14; ++i) wrong += r[(68 * l + 60) * 2 + i] != want[i];
+  }
+  VCHECK_EQ(wrong, 0);
+}
+
+VTEST(lds_float_atomics_and_compare_and_stores_compute_what_the_isa_says) {
+  const amd::CodeObject o = object("asm_ldsf32");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> in(128);
+  for (uint32_t l = 0; l < 64; ++l) {
+    in[2 * l] = f(static_cast<float>(l) * 0.75f - 12.0f);
+    in[2 * l + 1] = f(l % 5 == 0 ? static_cast<float>(l) * 0.75f - 12.0f : static_cast<float>(40 - l) * 0.5f);
+  }
+  const uint64_t in_d = mem.alloc(in.size() * 4), out = mem.alloc(64 * 24 * 4);
+  mem.write(in_d, in.data(), in.size() * 4);
+  const std::vector<uint32_t> r = run(o, "ldsf32", mem, out, 64 * 24, {in_d, out});
+  const auto fl = [](uint32_t x) {
+    float v;
+    std::memcpy(&v, &x, 4);
+    return v;
+  };
+  int wrong = 0;
+  for (uint32_t l = 0; l < 64; ++l) {
+    const uint32_t a = in[2 * l], b = in[2 * l + 1];
+    const uint32_t sum = f(fl(a) + fl(b)), lo = f(std::fmin(fl(a), fl(b))), hi = f(std::fmax(fl(a), fl(b)));
+    const uint32_t keep_or_b = fl(b) == fl(b) && fl(a) == fl(b) ? b : a;   // cmpst_f32 against b
+    const uint32_t want[18] = {0, sum, a, sum, 0, lo, a, lo, 0, hi, a, hi,
+                               0, b,                // cmpst_b32 against a: b stored
+                               0, keep_or_b,        // cmpst_f32 against b: a kept unless a == b
+                               a, b};               // cmpst_rtn_f32 against a: a handed back, b stored
+    const uint32_t* got = &r[24 * l];
+    for (int i = 0; i < 18; ++i) wrong += got[i] != want[i];
+    uint64_t pair = uint64_t{a} | uint64_t{b} << 32;
+    double d;
+    std::memcpy(&d, &pair, 8);
+    d += d;
+    uint64_t twice;
+    std::memcpy(&twice, &d, 8);
+    wrong += got[18] != a || got[19] != b;   // ds_add_rtn_f64 hands back the pair
+    wrong += got[20] != static_cast<uint32_t>(twice) || got[21] != static_cast<uint32_t>(twice >> 32);
+  }
+  VCHECK_EQ(wrong, 0);
+}
+
 VTEST(a_kernel_finds_only_the_group_ids_it_asked_for_one_after_another) {
   const amd::CodeObject o = object("asm_scalar");
   const amd::Kernel* k = amd::find_kernel(o, "group_z");

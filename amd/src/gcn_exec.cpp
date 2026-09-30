@@ -1100,6 +1100,27 @@ struct Machine {
       write_scalar(w, in.dst[0], r);
       // A bit reversal sets no condition code, as the move it is a form of
       // does not.
+    } else if (op == "s_brev_b64"_op) {
+      uint64_t r = 0;
+      for (uint32_t k = 0; k < 64; ++k) r |= ((a >> k) & 1) << (63 - k);
+      write_scalar(w, in.dst[0], r);
+    } else if (op == "s_cmov_b64"_op) {
+      if (w.scc) write_scalar(w, in.dst[0], a);
+    } else if (op == "s_bcnt0_i32_b32"_op || op == "s_bcnt0_i32_b64"_op) {
+      const uint32_t r = op == "s_bcnt0_i32_b32"_op ? 32 - __builtin_popcount(static_cast<uint32_t>(a))
+                                                    : 64 - __builtin_popcountll(a);
+      write_scalar(w, in.dst[0], r);
+      w.scc = r != 0;
+    } else if (op == "s_ff0_i32_b32"_op || op == "s_ff0_i32_b64"_op) {
+      // The first clear bit, counting from bit 0, or -1 when there is none.
+      const uint64_t clear = op == "s_ff0_i32_b32"_op ? ~static_cast<uint32_t>(a) & 0xFFFFFFFFull : ~a;
+      write_scalar(w, in.dst[0], clear ? static_cast<uint32_t>(__builtin_ctzll(clear)) : 0xFFFFFFFFu);
+    } else if (op == "s_wqm_b32"_op || op == "s_wqm_b64"_op) {
+      uint64_t r = 0;
+      for (uint32_t q = 0; q < (op == "s_wqm_b32"_op ? 8u : 16u); ++q)
+        if ((a >> (4 * q)) & 0xF) r |= uint64_t{0xF} << (4 * q);
+      write_scalar(w, in.dst[0], r);
+      w.scc = r != 0;
     } else if (op == "s_cmov_b32"_op) {
       if (w.scc) write_scalar(w, in.dst[0], a);
     } else if (op == "s_abs_i32"_op) {
@@ -3347,12 +3368,31 @@ struct Machine {
         write_lane(w, in.dst[0], lane, before[from]);
       } else if (op == "ds_swizzle_b32"_op) {
         write_lane(w, in.dst[0], lane, before[swizzle_source(static_cast<uint32_t>(in.offset), lane)]);
-      } else if (op == "ds_add_f32"_op) {
-        // A float atomic, lane by lane, as the integer one is.
-        float v = 0;
-        std::memcpy(&v, at(off), 4);
-        v += as_float(lane_src(w, in.src[1], lane));
-        std::memcpy(at(off), &v, 4);
+      } else if (op == "ds_add_f32"_op || op == "ds_add_rtn_f32"_op || op == "ds_min_f32"_op ||
+                 op == "ds_min_rtn_f32"_op || op == "ds_max_f32"_op || op == "ds_max_rtn_f32"_op) {
+        // Float atomics, lane by lane, as the integer ones are; the _rtn
+        // forms hand back what was there.
+        uint32_t was = 0;
+        std::memcpy(&was, at(off), 4);
+        const float a = as_float(was), b = as_float(lane_src(w, in.src[1], lane));
+        const float now = op == "ds_add_f32"_op || op == "ds_add_rtn_f32"_op   ? a + b
+                          : op == "ds_min_f32"_op || op == "ds_min_rtn_f32"_op ? std::fmin(a, b)
+                                                                               : std::fmax(a, b);
+        std::memcpy(at(off), &now, 4);
+        if (op == "ds_add_rtn_f32"_op || op == "ds_min_rtn_f32"_op || op == "ds_max_rtn_f32"_op)
+          write_lane(w, in.dst[0], lane, was);
+      } else if (op == "ds_cmpst_b32"_op || op == "ds_cmpst_f32"_op || op == "ds_cmpst_rtn_f32"_op) {
+        // The second value is stored where the first is found (compared as
+        // floats for the _f32 forms); the _rtn form hands back what was there.
+        uint32_t was = 0;
+        std::memcpy(&was, at(off), 4);
+        const uint32_t cmp = lane_src(w, in.src[1], lane);
+        const bool equal = op == "ds_cmpst_b32"_op ? was == cmp : as_float(was) == as_float(cmp);
+        if (equal) {
+          const uint32_t v = lane_src(w, in.src[2], lane);
+          std::memcpy(at(off), &v, 4);
+        }
+        if (op == "ds_cmpst_rtn_f32"_op) write_lane(w, in.dst[0], lane, was);
       } else if (op == "ds_write_b8"_op || op == "ds_write_b16"_op) {
         const uint32_t v = lane_src(w, in.src[1], lane);
         const uint64_t bytes = op == "ds_write_b8"_op ? 1 : 2;
@@ -3465,18 +3505,64 @@ struct Machine {
         int16_t v = 0;
         std::memcpy(&v, at(off, 2), 2);
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(static_cast<int32_t>(v)));
-      } else if (op == "ds_add_u64"_op || op == "ds_min_i64"_op || op == "ds_max_i64"_op || op == "ds_min_u64"_op ||
-                 op == "ds_max_u64"_op || op == "ds_add_f64"_op) {
+      } else if (op == "ds_add_u64"_op ||
+                 op == "ds_sub_u64"_op ||
+                 op == "ds_rsub_u64"_op ||
+                 op == "ds_inc_u64"_op ||
+                 op == "ds_dec_u64"_op ||
+                 op == "ds_min_i64"_op ||
+                 op == "ds_max_i64"_op ||
+                 op == "ds_min_u64"_op ||
+                 op == "ds_max_u64"_op ||
+                 op == "ds_and_b64"_op ||
+                 op == "ds_or_b64"_op ||
+                 op == "ds_xor_b64"_op ||
+                 op == "ds_add_f64"_op ||
+                 op == "ds_min_f64"_op ||
+                 op == "ds_max_f64"_op ||
+                 op == "ds_add_rtn_u64"_op ||
+                 op == "ds_sub_rtn_u64"_op ||
+                 op == "ds_rsub_rtn_u64"_op ||
+                 op == "ds_inc_rtn_u64"_op ||
+                 op == "ds_dec_rtn_u64"_op ||
+                 op == "ds_min_rtn_i64"_op ||
+                 op == "ds_max_rtn_i64"_op ||
+                 op == "ds_min_rtn_u64"_op ||
+                 op == "ds_max_rtn_u64"_op ||
+                 op == "ds_and_rtn_b64"_op ||
+                 op == "ds_or_rtn_b64"_op ||
+                 op == "ds_xor_rtn_b64"_op ||
+                 op == "ds_wrxchg_rtn_b64"_op ||
+                 op == "ds_min_rtn_f64"_op ||
+                 op == "ds_max_rtn_f64"_op || op == "ds_add_rtn_f64"_op) {
+        // LDS's 64-bit read-modify-writes; the _rtn forms hand back what
+        // was there.
+        std::string what(in.name);
+        const bool rtn = what.find("_rtn") != std::string::npos;
+        if (rtn) what.erase(what.find("_rtn"), 4);
         uint64_t was = 0;
         std::memcpy(&was, at(off, 8), 8);
         const uint64_t v = lane_src64(w, in.src[1], lane);
-        const uint64_t now = op == "ds_add_u64"_op   ? was + v
-                             : op == "ds_add_f64"_op ? as_bits(as_double(was) + as_double(v))
-                             : op == "ds_min_i64"_op ? static_cast<uint64_t>(std::min(static_cast<int64_t>(was), static_cast<int64_t>(v)))
-                             : op == "ds_max_i64"_op ? static_cast<uint64_t>(std::max(static_cast<int64_t>(was), static_cast<int64_t>(v)))
-                             : op == "ds_min_u64"_op ? std::min(was, v)
-                                                     : std::max(was, v);
+        const int64_t sw = static_cast<int64_t>(was), sv = static_cast<int64_t>(v);
+        uint64_t now = was;
+        if (what == "ds_add_u64") now = was + v;
+        else if (what == "ds_sub_u64") now = was - v;
+        else if (what == "ds_rsub_u64") now = v - was;
+        else if (what == "ds_inc_u64") now = was >= v ? 0 : was + 1;
+        else if (what == "ds_dec_u64") now = was == 0 || was > v ? v : was - 1;
+        else if (what == "ds_min_i64") now = static_cast<uint64_t>(std::min(sw, sv));
+        else if (what == "ds_max_i64") now = static_cast<uint64_t>(std::max(sw, sv));
+        else if (what == "ds_min_u64") now = std::min(was, v);
+        else if (what == "ds_max_u64") now = std::max(was, v);
+        else if (what == "ds_and_b64") now = was & v;
+        else if (what == "ds_or_b64") now = was | v;
+        else if (what == "ds_xor_b64") now = was ^ v;
+        else if (what == "ds_wrxchg_b64") now = v;
+        else if (what == "ds_add_f64") now = as_bits(as_double(was) + as_double(v));
+        else if (what == "ds_min_f64") now = as_bits(std::fmin(as_double(was), as_double(v)));
+        else if (what == "ds_max_f64") now = as_bits(std::fmax(as_double(was), as_double(v)));
         std::memcpy(at(off, 8), &now, 8);
+        if (rtn) write_lane64(w, in.dst[0], lane, was);
       } else if (op == "ds_xor_b32"_op || op == "ds_max_i32"_op) {
         uint32_t before = 0;
         std::memcpy(&before, at(static_cast<uint64_t>(in.offset)), 4);

@@ -1112,6 +1112,10 @@ hipError_t host_alloc(void** ptr, size_t size, std::map<uint64_t, size_t>& m, un
   if (n > (size_t{1} << 47)) return record(s, hipErrorOutOfMemory);   // more than any host has
   void* p = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
   if (!p) return record(s, hipErrorOutOfMemory);
+  // Zeroed, as ROCm's is: its pinned memory is pages the kernel gives the
+  // driver fresh, and programs (hip-tests' atomics among them) read it
+  // before writing it.
+  std::memset(p, 0, (n + 4095) / 4096 * 4096);
   // Devices reach it in whole pages, as a card maps it: a kernel's 8-byte
   // atomic on a 4-byte allocation stays inside the page.
   map_host_everywhere(s, p, (n + 4095) / 4096 * 4096);
