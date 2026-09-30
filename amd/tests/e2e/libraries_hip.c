@@ -159,7 +159,9 @@ int main(int argc, char** argv) {
   CHECK(hipPointerGetAttributes(&attr, in + 3));
   printf("registered memory is host memory, at its own address %d\n",
          attr.type == 1 && attr.devicePointer == in + 3 && !attr.isManaged);
-  printf("registering it twice is refused %d\n", hipHostRegister(in, 8, 0) == 712);
+  // ROCm's HIP takes a second registration of the same memory, the new size
+  // replacing the old, and one hipHostUnregister undoes it.
+  printf("registering it again is accepted, as ROCm's HIP accepts it %d\n", hipHostRegister(in, 8, 0) == 0);
   CHECK(hipHostUnregister(in));
   CHECK(hipHostUnregister(out));
   printf("and unregistering what is not registered %d\n", hipHostUnregister(in) == 713);

@@ -368,6 +368,110 @@ struct MemAccessDesc {
   MemLocation location;
   int flags;   // hipMemAccessFlags: 0 none, 1 read, 3 read and write
 };
+
+// The shapes of HIP's 2D and 3D copies and fills. Widths and offsets along a
+// row are bytes, for linear memory; heights and depths are rows and slices.
+struct PitchedPtr {
+  void* ptr;
+  size_t pitch;   // bytes from one row to the next
+  size_t xsize;   // the row's width, as allocated (never checked)
+  size_t ysize;   // rows to a slice
+};
+struct Extent {
+  size_t width, height, depth;
+};
+struct Pos {
+  size_t x, y, z;
+};
+// hipMemcpy3D's parameters: each side an array or a pitched pointer.
+struct Memcpy3DParms {
+  void* srcArray;
+  Pos srcPos;
+  PitchedPtr srcPtr;
+  void* dstArray;
+  Pos dstPos;
+  PitchedPtr dstPtr;
+  Extent extent;
+  int kind;
+};
+// hipMemcpy3DPeer's: the same, and the device on each side.
+struct Memcpy3DPeerParms {
+  void* srcArray;
+  Pos srcPos;
+  PitchedPtr srcPtr;
+  int srcDevice;
+  void* dstArray;
+  Pos dstPos;
+  PitchedPtr dstPtr;
+  int dstDevice;
+  Extent extent;
+};
+// hipMemoryType, which names where a driver-style copy's side is.
+enum MemoryTypeKind : int {
+  kMemTypeHost = 1,
+  kMemTypeDevice = 2,
+  kMemTypeManaged = 3,
+  kMemTypeArray = 10,
+  kMemTypeUnified = 11,
+};
+// hip_Memcpy2D (hipMemcpyParam2D, hipDrvMemcpy2DUnaligned): the side's memory
+// type says which of its pointer fields is read.
+struct Memcpy2D {
+  size_t srcXInBytes, srcY;
+  int srcMemoryType;
+  const void* srcHost;
+  void* srcDevice;
+  void* srcArray;
+  size_t srcPitch;
+  size_t dstXInBytes, dstY;
+  int dstMemoryType;
+  void* dstHost;
+  void* dstDevice;
+  void* dstArray;
+  size_t dstPitch;
+  size_t WidthInBytes, Height;
+};
+// HIP_MEMCPY3D (hipDrvMemcpy3D): a slice is Height rows unless a side says
+// otherwise.
+struct Memcpy3D {
+  size_t srcXInBytes, srcY, srcZ, srcLOD;
+  int srcMemoryType;
+  const void* srcHost;
+  void* srcDevice;
+  void* srcArray;
+  size_t srcPitch, srcHeight;
+  size_t dstXInBytes, dstY, dstZ, dstLOD;
+  int dstMemoryType;
+  void* dstHost;
+  void* dstDevice;
+  void* dstArray;
+  size_t dstPitch, dstHeight;
+  size_t WidthInBytes, Height, Depth;
+};
+// hipMemcpy3DBatchAsync's operations: each operand a pointer (with its row
+// length and slice height) or an array.
+struct Memcpy3DOperand {
+  int type;   // hipMemcpyOperandTypePointer (1) or Array (2)
+  union {
+    struct {
+      void* ptr;
+      size_t rowLength;
+      size_t layerHeight;
+      MemLocation locHint;
+    } ptr;
+    struct {
+      void* array;
+      size_t x, y, z;
+    } array;
+  } op;
+};
+struct Memcpy3DBatchOp {
+  Memcpy3DOperand src;
+  Memcpy3DOperand dst;
+  Extent extent;
+  int srcAccessOrder;
+  unsigned int flags;
+};
 struct MemPoolProps {
   int allocType;
   int handleTypes;

@@ -60,7 +60,13 @@ flags and UUIDs, limits, stream ids and attributes, every launch form
 (`hipLaunchKernelExC`, `hipConfigureCall` and `hipLaunchByPtr`, a launch on
 several devices at once) -- each answers as ROCm's HIP does, down to the error
 for each wrong argument: AMD's own tests (hip-tests) are the reference, and
-`tests/hipcc/api.cpp` checks them. A kernel's fault is told at the
+`tests/hipcc/api.cpp` checks them. Memory is held to the same reference
+(`tests/hipcc/memory.cpp`): copies and memsets of every shape (2D, 3D, the
+driver API's forms, peer copies) with ROCm's rules for who waits, managed
+memory's advice and prefetch, stream-ordered pools that keep freed memory for
+reuse by the rules each pool is set to, pools and their pointers shared with
+another process through a file descriptor, and virtual memory at HIP's 4 KiB
+page granularity. A kernel's fault is told at the
 next synchronization, as on a card. `VGPU_SYNC_LAUNCHES=1` makes every call
 wait for its own work instead, which rules concurrency out when a program
 misbehaves. A program built by `hipcc` runs unmodified too:
