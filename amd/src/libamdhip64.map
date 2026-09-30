@@ -11,10 +11,16 @@
 
 hip_4.2 {
   global:
+    _Z24hipExtModuleLaunchKernelP18ihipModuleSymbol_tjjjjjjmP12ihipStream_tPPvS4_P11ihipEvent_tS6_j;
+    _Z24hipHccModuleLaunchKernelP18ihipModuleSymbol_tjjjjjjmP12ihipStream_tPPvS4_P11ihipEvent_tS6_;
+    __gnu_f2h_ieee;
+    __gnu_h2f_ieee;
+    __hipGetPCH;
     __hipPopCallConfiguration;
     __hipPushCallConfiguration;
     __hipRegisterFatBinary;
     __hipRegisterFunction;
+    __hipRegisterManagedVar;
     __hipRegisterSurface;
     __hipRegisterTexture;
     __hipRegisterVar;
@@ -120,6 +126,7 @@ hip_4.2 {
     hipGetTextureObjectResourceViewDesc;
     hipGetTextureObjectTextureDesc;
     hipGetTextureReference;
+    hipHccModuleLaunchKernel;
     hipHostAlloc;
     hipHostFree;
     hipHostGetDevicePointer;
@@ -275,6 +282,7 @@ hip_4.3 {
     hipDestroyExternalSemaphore;
     hipDrvMemcpy2DUnaligned;
     hipExternalMemoryGetMappedBuffer;
+    hipGLGetDevices;
     hipGraphAddKernelNode;
     hipGraphAddMemcpyNode;
     hipGraphAddMemcpyNode1D;
@@ -284,6 +292,11 @@ hip_4.3 {
     hipGraphExecDestroy;
     hipGraphInstantiate;
     hipGraphLaunch;
+    hipGraphicsGLRegisterBuffer;
+    hipGraphicsMapResources;
+    hipGraphicsResourceGetMappedPointer;
+    hipGraphicsUnmapResources;
+    hipGraphicsUnregisterResource;
     hipImportExternalMemory;
     hipImportExternalSemaphore;
     hipMemcpy2DToArrayAsync;
@@ -313,6 +326,9 @@ hip_4.4 {
 } hip_4.3;
 hip_4.5 {
   global:
+    amd_dbgapi_get_build_id;
+    amd_dbgapi_get_build_name;
+    amd_dbgapi_get_git_hash;
     hipDeviceGetGraphMemAttribute;
     hipDeviceGraphMemTrim;
     hipDeviceSetGraphMemAttribute;
@@ -351,6 +367,7 @@ hip_4.5 {
     hipGraphNodeGetDependentNodes;
     hipGraphNodeGetType;
     hipGraphRemoveDependencies;
+    hipGraphicsGLRegisterImage;
     hipGraphicsSubResourceGetMappedArray;
     hipStreamGetCaptureInfo;
     hipStreamGetCaptureInfo_v2;
@@ -454,6 +471,7 @@ hip_5.3 {
     hipMemset2DAsync_spt;
     hipMemset3DAsync_spt;
     hipMemsetAsync_spt;
+    hipRegisterTracerCallback;
     hipStreamAddCallback_spt;
     hipStreamBeginCapture_spt;
     hipStreamEndCapture_spt;
@@ -520,12 +538,18 @@ hip_6.4 {
     hipGraphBatchMemOpNodeGetParams;
     hipGraphBatchMemOpNodeSetParams;
     hipGraphExecBatchMemOpNodeSetParams;
+    hipLinkAddData;
+    hipLinkAddFile;
+    hipLinkComplete;
+    hipLinkCreate;
+    hipLinkDestroy;
     hipStreamBatchMemOp;
 } hip_6.2;
 hip_6.5 {
   global:
     hipDrvLaunchKernelEx;
     hipLaunchKernelExC;
+    hipMemGetHandleForAddressRange;
 } hip_6.4;
 hip_7.1 {
   global:
@@ -544,11 +568,18 @@ hip_7.1 {
     hipMemsetD2D8;
     hipMemsetD2D8Async;
     hipModuleGetFunctionCount;
+    hipModuleLoadFatBinary;
     hipStreamGetAttribute;
     hipStreamGetId;
     hipStreamSetAttribute;
 } hip_6.5;
 hip_7.2 {
+  global:
+    hipLibraryGetKernel;
+    hipLibraryGetKernelCount;
+    hipLibraryLoadData;
+    hipLibraryLoadFromFile;
+    hipLibraryUnload;
 } hip_7.1;
 ROCR_1 {
   global:

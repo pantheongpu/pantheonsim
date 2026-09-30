@@ -302,6 +302,15 @@ struct State {
   std::map<std::pair<const uint8_t*, std::string>, std::unique_ptr<vgpu::amd::Bundle>> bundles;
   std::map<const void*, HostFunction> host_functions;
   std::map<const void*, HostVar> host_vars;
+  // A program's __managed__ variables: each is managed memory, which the
+  // host reaches through a pointer of its own and a device's code through a
+  // pointer variable of the same name in the binary's module.
+  struct ManagedVar {
+    FatBinary* binary;
+    std::string name;
+    void** pointer;
+  };
+  std::vector<ManagedVar> managed_vars;
   std::set<std::pair<int, int>> peers;           // (device, peer) pairs with access enabled
   // Devices whose memory holds another process's opened IPC allocations:
   // every other device reaches them, without hipDeviceEnablePeerAccess.
@@ -922,6 +931,13 @@ hipError_t module_on(State& s, FatBinary& fb, int ordinal, Module** out) {
     m->object = vgpu::amd::load_code_object(std::string(*code), "the program's " + gfx + " code");
     m->device = ordinal;
     place(*m, d.memory());
+    // Its __managed__ variables' pointers, to the memory each already has.
+    for (const State::ManagedVar& v : s.managed_vars)
+      if (v.binary == &fb)
+        if (const vgpu::amd::GlobalVar* g = vgpu::amd::find_global(m->object, v.name)) {
+          const uint64_t at = reinterpret_cast<uint64_t>(*v.pointer);
+          d.memory().write(m->globals + g->offset, &at, sizeof at);
+        }
     report_loaded(*m, ordinal, code->data(), code->size());
     *out = m.get();
     fb.on_device.emplace(ordinal, std::move(m));
@@ -2159,6 +2175,27 @@ void __hipRegisterVar(void** modules, void* host_var, char*, const char* device_
   s.host_vars[host_var] = HostVar{reinterpret_cast<FatBinary*>(modules), device_name, size};
 }
 
+// Before main, once per __managed__ variable: its memory, managed and
+// holding its initial value, which the host's pointer is set to; the
+// modules loaded from the binary point their variable of the same name at it.
+void __hipRegisterManagedVar(void* modules, void** pointer, void* init_value, const char* name, size_t size,
+                             unsigned) {
+  if (!modules || !pointer || !name || !size) return;
+  void* p = nullptr;
+  if (host_alloc(&p, size, g_managed) != hipSuccess) return;
+  if (init_value) std::memcpy(p, init_value, size);
+  *pointer = p;
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  auto* fb = reinterpret_cast<FatBinary*>(modules);
+  s.managed_vars.push_back({fb, name, pointer});
+  for (auto& [ordinal, m] : fb->on_device)
+    if (const vgpu::amd::GlobalVar* g = vgpu::amd::find_global(m->object, name)) {
+      const uint64_t at = reinterpret_cast<uint64_t>(p);
+      s.rt->device(ordinal).memory().write(m->globals + g->offset, &at, sizeof at);
+    }
+}
+
 // At exit: the binary's modules go, and their variables with them.
 void __hipUnregisterFatBinary(void** modules) {
   State& s = state();
@@ -2168,6 +2205,9 @@ void __hipUnregisterFatBinary(void** modules) {
     it = it->second.binary == fb ? s.host_functions.erase(it) : std::next(it);
   for (auto it = s.host_vars.begin(); it != s.host_vars.end();)
     it = it->second.binary == fb ? s.host_vars.erase(it) : std::next(it);
+  s.managed_vars.erase(std::remove_if(s.managed_vars.begin(), s.managed_vars.end(),
+                                      [fb](const State::ManagedVar& v) { return v.binary == fb; }),
+                       s.managed_vars.end());
   for (size_t i = 0; i < s.fat_binaries.size(); ++i)
     if (s.fat_binaries[i].get() == fb) {
       for (auto& [ordinal, m] : fb->on_device)
@@ -3818,6 +3858,13 @@ hipError_t hipExtModuleLaunchKernel(hipFunction_t f, uint32_t gx, uint32_t gy, u
       e != hipSuccess)
     return e;
   return stop ? hipEventRecord(stop, stream) : hipSuccess;
+}
+// The same, under the name HCC gave it.
+hipError_t hipHccModuleLaunchKernel(hipFunction_t f, uint32_t gx, uint32_t gy, uint32_t gz, uint32_t lx, uint32_t ly,
+                                    uint32_t lz, size_t shared, hipStream_t stream, void** params, void** extra,
+                                    hipEvent_t start, hipEvent_t stop) {
+  const ApiCall api("hipHccModuleLaunchKernel");
+  return hipExtModuleLaunchKernel(f, gx, gy, gz, lx, ly, lz, shared, stream, params, extra, start, stop, 0);
 }
 
 }  // extern "C"
@@ -6230,6 +6277,243 @@ hipError_t hipMemGetAccess(unsigned long long* flags, const vgpu::amd::abi::MemL
     if (va >= range.first && va < range.first + range.second)
       if (const auto it = grants.find(location->id); it != grants.end()) *flags = static_cast<unsigned>(it->second);
   return record(s, hipSuccess);
+}
+
+// ---- Libraries: modules by another name ------------------------------------------
+//
+// hipLibrary_t is CUDA 12's library, which is a module here, loaded on the
+// current device; a hipKernel_t from it is the module's function. JIT and
+// library options change nothing.
+hipError_t hipLibraryLoadData(void** library, const void* code, void*, void*, unsigned int, void*, void*,
+                              unsigned int) {
+  const ApiCall api("hipLibraryLoadData");
+  if (!library || !code) return record(state(), hipErrorInvalidValue);
+  return hipModuleLoadData(reinterpret_cast<hipModule_t*>(library), code);
+}
+hipError_t hipLibraryLoadFromFile(void** library, const char* path, void*, void*, unsigned int, void*, void*,
+                                  unsigned int) {
+  const ApiCall api("hipLibraryLoadFromFile");
+  if (!library || !path) return record(state(), hipErrorInvalidValue);
+  const hipError_t e = hipModuleLoad(reinterpret_cast<hipModule_t*>(library), path);
+  return e == hipErrorFileNotFound ? record(state(), hipErrorInvalidValue) : e;
+}
+hipError_t hipLibraryUnload(void* library) {
+  const ApiCall api("hipLibraryUnload");
+  if (!library) return record(state(), hipErrorInvalidValue);
+  return hipModuleUnload(static_cast<hipModule_t>(library));
+}
+hipError_t hipLibraryGetKernel(void** kernel, void* library, const char* name) {
+  const ApiCall api("hipLibraryGetKernel");
+  if (!kernel || !library || !name) return record(state(), hipErrorInvalidValue);
+  return hipModuleGetFunction(reinterpret_cast<hipFunction_t*>(kernel), static_cast<hipModule_t>(library), name);
+}
+hipError_t hipLibraryGetKernelCount(unsigned int* count, void* library) {
+  const ApiCall api("hipLibraryGetKernelCount");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!count || !library) return record(s, hipErrorInvalidValue);
+  for (const auto& m : s.modules)
+    if (m.get() == library) {
+      *count = static_cast<unsigned int>(m->object.kernels.size());
+      return record(s, hipSuccess);
+    }
+  return record(s, hipErrorInvalidHandle);
+}
+
+// ---- Linking at run time -------------------------------------------------------------
+//
+// ROCm's HIP links LLVM bitcode with AMD's compiler library (comgr), which
+// is not here. A code object handed in as it is -- an AMDGPU ELF, or a
+// bundle holding one -- is what the link gives back.
+}  // extern "C"
+namespace {
+struct LinkState {
+  std::vector<std::vector<uint8_t>> inputs;
+  std::vector<uint8_t> output;
+  bool bitcode = false;
+};
+std::mutex g_link_mutex;
+std::set<LinkState*> g_links;
+hipError_t link_add(LinkState* st, int type, const void* data, size_t size) {
+  std::lock_guard<std::mutex> lock(g_link_mutex);
+  if (!g_links.count(st)) return hipErrorInvalidHandle;
+  if (!data || !size) return hipErrorInvalidImage;
+  constexpr int kLLVMBitcode = 100, kLLVMBundledBitcode = 101, kLLVMArchive = 102;
+  if (type == kLLVMBitcode || type == kLLVMBundledBitcode || type == kLLVMArchive) st->bitcode = true;
+  const auto* p = static_cast<const uint8_t*>(data);
+  st->inputs.emplace_back(p, p + size);
+  return hipSuccess;
+}
+}  // namespace
+extern "C" {
+hipError_t hipLinkCreate(unsigned int, void*, void**, void** state_out) {
+  const ApiCall api("hipLinkCreate");
+  if (!state_out) return record(state(), hipErrorInvalidValue);
+  auto* st = new LinkState;
+  std::lock_guard<std::mutex> lock(g_link_mutex);
+  g_links.insert(st);
+  *state_out = st;
+  return hipSuccess;
+}
+hipError_t hipLinkAddData(void* link, int type, void* data, size_t size, const char*, unsigned int, void*, void**) {
+  const ApiCall api("hipLinkAddData");
+  return record(state(), link_add(static_cast<LinkState*>(link), type, data, size));
+}
+hipError_t hipLinkAddFile(void* link, int type, const char* path, unsigned int, void*, void**) {
+  const ApiCall api("hipLinkAddFile");
+  if (!path) return record(state(), hipErrorInvalidValue);
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return record(state(), hipErrorInvalidValue);
+  const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  return record(state(), link_add(static_cast<LinkState*>(link), type, bytes.data(), bytes.size()));
+}
+hipError_t hipLinkComplete(void* link, void** binary, size_t* size) {
+  const ApiCall api("hipLinkComplete");
+  auto* st = static_cast<LinkState*>(link);
+  std::lock_guard<std::mutex> lock(g_link_mutex);
+  if (!g_links.count(st) || !binary || !size) return record(state(), hipErrorInvalidValue);
+  if (st->bitcode)
+    return record(state(), fail(hipErrorNotSupported, "linking LLVM bitcode needs AMD's compiler library (comgr)"));
+  if (st->inputs.size() > 1)
+    return record(state(), fail(hipErrorNotSupported, "linking more than one code object into one is not modelled"));
+  st->output = st->inputs.empty() ? std::vector<uint8_t>{} : st->inputs.front();
+  *binary = st->output.empty() ? nullptr : st->output.data();
+  *size = st->output.size();
+  return hipSuccess;
+}
+hipError_t hipLinkDestroy(void* link) {
+  const ApiCall api("hipLinkDestroy");
+  auto* st = static_cast<LinkState*>(link);
+  std::lock_guard<std::mutex> lock(g_link_mutex);
+  if (!g_links.erase(st)) return record(state(), hipErrorInvalidValue);
+  delete st;
+  return hipSuccess;
+}
+
+// A fat binary is loaded as any module is: the bundle's code for the device.
+hipError_t hipModuleLoadFatBinary(hipModule_t* module, const void* fatbin) {
+  const ApiCall api("hipModuleLoadFatBinary");
+  if (!module || !fatbin) return record(state(), hipErrorInvalidValue);
+  return hipModuleLoadData(module, fatbin);
+}
+
+// ---- OpenGL interop ------------------------------------------------------------------
+//
+// There is no OpenGL context for a device to share with: no device is an
+// OpenGL one, and what would register or map a buffer or an image is
+// refused as ROCm's HIP refuses it there.
+hipError_t hipGLGetDevices(unsigned int* count, int*, unsigned int, int) {
+  const ApiCall api("hipGLGetDevices");
+  if (!count) return record(state(), hipErrorInvalidValue);
+  *count = 0;
+  return record(state(), hipErrorNoDevice);
+}
+hipError_t hipGraphicsGLRegisterBuffer(void**, unsigned int, unsigned int) {
+  const ApiCall api("hipGraphicsGLRegisterBuffer");
+  return record(state(), hipErrorInvalidValue);
+}
+hipError_t hipGraphicsGLRegisterImage(void**, unsigned int, unsigned int, unsigned int) {
+  const ApiCall api("hipGraphicsGLRegisterImage");
+  return record(state(), hipErrorInvalidValue);
+}
+hipError_t hipGraphicsMapResources(int, void**, hipStream_t) {
+  const ApiCall api("hipGraphicsMapResources");
+  return record(state(), hipErrorUnknown);
+}
+hipError_t hipGraphicsResourceGetMappedPointer(void**, size_t*, void*) {
+  const ApiCall api("hipGraphicsResourceGetMappedPointer");
+  return record(state(), hipErrorUnknown);
+}
+hipError_t hipGraphicsUnmapResources(int, void**, hipStream_t) {
+  const ApiCall api("hipGraphicsUnmapResources");
+  return record(state(), hipErrorInvalidHandle);
+}
+hipError_t hipGraphicsUnregisterResource(void*) {
+  const ApiCall api("hipGraphicsUnregisterResource");
+  return record(state(), hipErrorInvalidValue);
+}
+
+// ---- A dma-buf for a range of device memory ---------------------------------------------
+//
+// Device memory here is host memory the simulator keeps, not memory a
+// dma-buf could describe. The range is checked as ROCm's HIP checks it --
+// device memory, mapped, of the size asked for -- and then refused.
+hipError_t hipMemGetHandleForAddressRange(void* handle, void* ptr, size_t size, int type, unsigned long long flags) {
+  const ApiCall api("hipMemGetHandleForAddressRange");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  constexpr int kDmaBufFd = 1;
+  if (!handle || !ptr || !size || type != kDmaBufFd || flags) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  const uint64_t va = reinterpret_cast<uint64_t>(ptr);
+  const int d = owner_of(s, va);
+  uint64_t base = 0, bytes = 0;
+  bool readable = false, writable = false;
+  if (d < 0 || (!s.rt->device(d).memory().find_allocation(va, &base, &bytes) &&
+                !s.rt->device(d).memory().access_at(va, &readable, &writable)))
+    return record(s, hipErrorInvalidValue);
+  return record(s, fail(hipErrorNotSupported, "simulated device memory cannot be exported as a dma-buf"));
+}
+
+// ---- What ROCm's own tools reach into -------------------------------------------------------
+
+// hiprtc's precompiled HIP headers: there are none; hiprtc parses the
+// headers themselves.
+void __hipGetPCH(const char** pch, unsigned int* size) {
+  if (pch) *pch = nullptr;
+  if (size) *size = 0;
+}
+// What a debugger asks the runtime it attaches to.
+const char* amd_dbgapi_get_build_name() { return ""; }
+const char* amd_dbgapi_get_git_hash() { return ""; }
+size_t amd_dbgapi_get_build_id() { return 0; }
+// roctracer's hook into the runtime. A profiler attaches here through
+// vgpu/hip_profiler.hpp instead, so there is nothing to register.
+hipError_t hipRegisterTracerCallback(const void*) { return hipSuccess; }
+
+// compiler-rt's half-precision conversions, which ROCm's library carries for
+// programs built without them: IEEE binary16, rounded to nearest even.
+uint16_t __gnu_f2h_ieee(float f) {
+  uint32_t x = 0;
+  std::memcpy(&x, &f, 4);
+  const uint32_t sign = (x >> 16) & 0x8000u, exp = (x >> 23) & 0xFFu, man = x & 0x7FFFFFu;
+  if (exp == 0xFF) return static_cast<uint16_t>(sign | 0x7C00u | (man ? 0x200u | (man >> 13) : 0));
+  const int e = static_cast<int>(exp) - 127 + 15;
+  if (e >= 0x1F) return static_cast<uint16_t>(sign | 0x7C00u);
+  if (e <= 0) {
+    if (e < -10) return static_cast<uint16_t>(sign);
+    const uint32_t m = man | 0x800000u;
+    const int shift = 14 - e;
+    uint32_t h = m >> shift;
+    const uint32_t rest = m & ((1u << shift) - 1), half = 1u << (shift - 1);
+    if (rest > half || (rest == half && (h & 1))) ++h;
+    return static_cast<uint16_t>(sign | h);
+  }
+  uint32_t h = (static_cast<uint32_t>(e) << 10) | (man >> 13);
+  const uint32_t rest = man & 0x1FFFu;
+  if (rest > 0x1000u || (rest == 0x1000u && (h & 1))) ++h;   // may carry into the exponent, up to infinity
+  return static_cast<uint16_t>(sign | h);
+}
+float __gnu_h2f_ieee(uint16_t h) {
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu, x = 0;
+  if (exp == 0x1F) {
+    x = sign | 0x7F800000u | (man << 13);
+  } else if (exp) {
+    x = sign | ((exp - 15 + 127) << 23) | (man << 13);
+  } else if (man) {
+    int e = -1;
+    do {
+      ++e;
+      man <<= 1;
+    } while (!(man & 0x400u));
+    x = sign | (static_cast<uint32_t>(127 - 15 - e) << 23) | ((man & 0x3FFu) << 13);
+  } else {
+    x = sign;
+  }
+  float f = 0;
+  std::memcpy(&f, &x, 4);
+  return f;
 }
 
 }  // extern "C"

@@ -177,7 +177,7 @@ add_custom_command(TARGET vgpucuda POST_BUILD
 # libamdhip64: the HIP runtime API shim. A HIP program links against it the
 # way it links against AMD's, and its kernels run on a simulated AMD GPU.
 # ---------------------------------------------------------------------------
-add_library(vgpuhip SHARED amd/src/hip_api.cpp amd/src/hsa_api.cpp)
+add_library(vgpuhip SHARED amd/src/hip_api.cpp amd/src/hip_cxx.cpp amd/src/hsa_api.cpp)
 target_link_libraries(vgpuhip PRIVATE vgpu ${CMAKE_DL_LIBS})
 target_include_directories(vgpuhip PRIVATE amd/include)
 # The real runtime's identity: a HIP program records SONAME "libamdhip64.so.6"
