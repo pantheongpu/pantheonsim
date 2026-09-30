@@ -677,16 +677,22 @@ hipError_t drain_device(int device, bool blocking_only = false) {
 hipError_t build_kernargs(const Kernel& k, void** params, void** extra, std::vector<uint8_t>* out) {
   out->assign(k.kernarg_size, 0);
   if (extra) {
+    // The buffer holds the kernel's own arguments, as many bytes of them as
+    // its metadata says -- which is what ROCm's HIP copies, whatever the size
+    // beside it says (hip-tests' RTC reduce passes an int's 4 there, for 28
+    // bytes of arguments, where HIP reads a size_t).
     const void* buffer = nullptr;
-    size_t size = 0;
     for (size_t i = 0; extra[i] != HIP_LAUNCH_PARAM_END; ++i) {
       if (extra[i] == HIP_LAUNCH_PARAM_BUFFER_POINTER) buffer = extra[++i];
-      else if (extra[i] == HIP_LAUNCH_PARAM_BUFFER_SIZE) size = *static_cast<size_t*>(extra[++i]);
+      else if (extra[i] == HIP_LAUNCH_PARAM_BUFFER_SIZE) ++i;
       else return fail(hipErrorInvalidValue, "extra[] holds something that is not a launch parameter");
     }
     if (!buffer) return fail(hipErrorInvalidValue, "extra[] has no argument buffer");
-    if (size > out->size()) out->resize(size);
-    std::memcpy(out->data(), buffer, size ? size : out->size());
+    size_t explicit_bytes = 0;
+    for (const vgpu::amd::KernelArg& a : k.args)
+      if (!a.hidden()) explicit_bytes = std::max<size_t>(explicit_bytes, a.offset + a.size);
+    if (k.args.empty()) explicit_bytes = out->size();   // no metadata to say: all of it
+    std::memcpy(out->data(), buffer, std::min(explicit_bytes, out->size()));
     return hipSuccess;
   }
   if (!params) {
