@@ -2,7 +2,7 @@
 // against what an RTX 3060's driver answers: registered host memory and its
 // flags, 2D memsets, occupancy-based block sizes, peer access, PCI bus ids,
 // mipmapped arrays, the pre-CUDA 4 launch (cuParamSet*, cuLaunchGrid), texture
-// references, and the deprecated odds and ends (cuDeviceGetProperties,
+// references, texture and surface objects, and the deprecated odds and ends (cuDeviceGetProperties,
 // cuCtxAttach). Every check passes on the card as well; where the simulated
 // machine differs from that one by design -- the device pointer of registered
 // memory is its host address, simulated devices are peers, read-only
@@ -58,6 +58,30 @@ done:
   cvt.u32.u16 %r3, %s2;
   st.global.u32 [%rd1+8], %r3;
   st.global.f64 [%rd1+16], %fd1;
+  ret;
+}
+.visible .entry texread(.param .u64 t, .param .u64 out, .param .f32 x, .param .f32 y)
+{
+  .reg .f32 %f<7>;
+  .reg .b64 %rd<3>;
+  ld.param.u64 %rd1, [t];
+  ld.param.u64 %rd2, [out];
+  ld.param.f32 %f5, [x];
+  ld.param.f32 %f6, [y];
+  tex.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}];
+  st.global.f32 [%rd2], %f1;
+  ret;
+}
+.visible .entry surfread(.param .u64 s, .param .u64 out, .param .u32 x, .param .u32 y)
+{
+  .reg .b32 %r<4>;
+  .reg .b64 %rd<3>;
+  ld.param.u64 %rd1, [s];
+  ld.param.u64 %rd2, [out];
+  ld.param.u32 %r2, [x];
+  ld.param.u32 %r3, [y];
+  suld.b.2d.b32.trap {%r1}, [%rd1, {%r2, %r3}];
+  st.global.u32 [%rd2], %r1;
   ret;
 }
 .visible .entry big(.param .u64 p)
@@ -717,6 +741,128 @@ static void texrefs(CUmodule mod, CUfunction kfill) {
   IS(cuMemFree(lin), CUDA_SUCCESS);
 }
 
+// ---- texture and surface objects ----
+static float fetch(CUfunction k, CUtexObject t, CUdeviceptr out, float x, float y) {
+  void* args[] = {&t, &out, &x, &y};
+  float v = -1;
+  if (cuLaunchKernel(k, 1, 1, 1, 1, 1, 1, 0, nullptr, args, nullptr) || cuCtxSynchronize() ||
+      cuMemcpyDtoH(&v, out, sizeof v))
+    return -1234;
+  return v;
+}
+
+static void texture_objects(CUfunction ktex, CUfunction ksurf) {
+  CUdeviceptr out;
+  IS(cuMemAlloc(&out, 16), CUDA_SUCCESS);
+  // A 4 x 4 float array holding 0..15.
+  CUDA_ARRAY3D_DESCRIPTOR ad{};
+  ad.Width = 4;
+  ad.Height = 4;
+  ad.Format = CU_AD_FORMAT_FLOAT;
+  ad.NumChannels = 1;
+  ad.Flags = CUDA_ARRAY3D_SURFACE_LDST;
+  CUarray arr;
+  IS(cuArray3DCreate(&arr, &ad), CUDA_SUCCESS);
+  float texels[16];
+  for (int i = 0; i < 16; ++i) texels[i] = static_cast<float>(i);
+  CUDA_MEMCPY2D c{};
+  c.srcMemoryType = CU_MEMORYTYPE_HOST;
+  c.srcHost = texels;
+  c.srcPitch = 16;
+  c.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+  c.dstArray = arr;
+  c.WidthInBytes = 16;
+  c.Height = 4;
+  IS(cuMemcpy2D(&c), CUDA_SUCCESS);
+  CUDA_RESOURCE_DESC rd{};
+  rd.resType = CU_RESOURCE_TYPE_ARRAY;
+  rd.res.array.hArray = arr;
+  CUDA_TEXTURE_DESC td{};
+  td.addressMode[0] = td.addressMode[1] = CU_TR_ADDRESS_MODE_CLAMP;
+  td.filterMode = CU_TR_FILTER_MODE_POINT;
+  CUtexObject t = 0;
+  IS(cuTexObjectCreate(&t, &rd, &td, nullptr), CUDA_SUCCESS);
+  check(fetch(ktex, t, out, 2.5f, 1.5f) == 6.0f, "a point-filtered fetch from an array");
+  check(fetch(ktex, t, out, 9.5f, 1.5f) == 7.0f, "clamped past the edge");
+  IS(cuTexObjectDestroy(t), CUDA_SUCCESS);
+  td.filterMode = CU_TR_FILTER_MODE_LINEAR;
+  td.flags = CU_TRSF_NORMALIZED_COORDINATES;
+  IS(cuTexObjectCreate(&t, &rd, &td, nullptr), CUDA_SUCCESS);
+  check(fetch(ktex, t, out, 2.0f / 4, 1.5f / 4) == 5.5f, "a linear fetch at normalized coordinates");
+  IS(cuTexObjectDestroy(t), CUDA_SUCCESS);
+  td = {};
+  td.addressMode[0] = td.addressMode[1] = CU_TR_ADDRESS_MODE_BORDER;
+  td.borderColor[0] = 7.0f;
+  IS(cuTexObjectCreate(&t, &rd, &td, nullptr), CUDA_SUCCESS);
+  check(fetch(ktex, t, out, -3.0f, 1.5f) == 7.0f, "the border colour outside");
+  IS(cuTexObjectDestroy(t), CUDA_SUCCESS);
+  // A surface over the same array: x counts bytes.
+  CUsurfObject sobj = 0;
+  IS(cuSurfObjectCreate(&sobj, &rd), CUDA_SUCCESS);
+  {
+    unsigned x = 8, y = 3;
+    void* args[] = {&sobj, &out, &x, &y};
+    IS(cuLaunchKernel(ksurf, 1, 1, 1, 1, 1, 1, 0, nullptr, args, nullptr), CUDA_SUCCESS);
+    IS(cuCtxSynchronize(), CUDA_SUCCESS);
+    float v = -1;
+    IS(cuMemcpyDtoH(&v, out, sizeof v), CUDA_SUCCESS);
+    check(v == 14.0f, "a surface load from the array");
+  }
+  IS(cuSurfObjectDestroy(sobj), CUDA_SUCCESS);
+
+  // 8-bit texels come back as floats in [0, 1] unless read as integers.
+  CUDA_ARRAY3D_DESCRIPTOR bd = ad;
+  bd.Format = CU_AD_FORMAT_UNSIGNED_INT8;
+  bd.Flags = 0;
+  CUarray bytes;
+  IS(cuArray3DCreate(&bytes, &bd), CUDA_SUCCESS);
+  unsigned char b8[16];
+  for (int i = 0; i < 16; ++i) b8[i] = static_cast<unsigned char>(i * 17);
+  c.srcHost = b8;
+  c.srcPitch = 4;
+  c.dstArray = bytes;
+  c.WidthInBytes = 4;
+  IS(cuMemcpy2D(&c), CUDA_SUCCESS);
+  rd.res.array.hArray = bytes;
+  td = {};
+  IS(cuTexObjectCreate(&t, &rd, &td, nullptr), CUDA_SUCCESS);
+  check(fetch(ktex, t, out, 3.5f, 3.5f) == 1.0f && fetch(ktex, t, out, 0.5f, 1.5f) == 68.0f / 255.0f,
+        "unsigned 8-bit texels promoted to [0, 1]");
+  IS(cuTexObjectDestroy(t), CUDA_SUCCESS);
+
+  // Pitched linear memory.
+  CUdeviceptr pm;
+  size_t pitch = 0;
+  IS(cuMemAllocPitch(&pm, &pitch, 16, 4, 4), CUDA_SUCCESS);
+  CUDA_MEMCPY2D up{};
+  up.srcMemoryType = CU_MEMORYTYPE_HOST;
+  up.srcHost = texels;
+  up.srcPitch = 16;
+  up.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+  up.dstDevice = pm;
+  up.dstPitch = pitch;
+  up.WidthInBytes = 16;
+  up.Height = 4;
+  IS(cuMemcpy2D(&up), CUDA_SUCCESS);
+  CUDA_RESOURCE_DESC pd{};
+  pd.resType = CU_RESOURCE_TYPE_PITCH2D;
+  pd.res.pitch2D.devPtr = pm;
+  pd.res.pitch2D.format = CU_AD_FORMAT_FLOAT;
+  pd.res.pitch2D.numChannels = 1;
+  pd.res.pitch2D.width = 4;
+  pd.res.pitch2D.height = 4;
+  pd.res.pitch2D.pitchInBytes = pitch;
+  IS(cuTexObjectCreate(&t, &pd, &td, nullptr), CUDA_SUCCESS);
+  check(fetch(ktex, t, out, 1.5f, 3.5f) == 13.0f, "a fetch from pitched memory");
+  IS(cuTexObjectDestroy(t), CUDA_SUCCESS);
+  IS(cuTexObjectCreate(nullptr, &pd, &td, nullptr), CUDA_ERROR_INVALID_VALUE);
+  IS(cuTexObjectCreate(&t, nullptr, &td, nullptr), CUDA_ERROR_INVALID_VALUE);
+  IS(cuArrayDestroy(arr), CUDA_SUCCESS);
+  IS(cuArrayDestroy(bytes), CUDA_SUCCESS);
+  IS(cuMemFree(pm), CUDA_SUCCESS);
+  IS(cuMemFree(out), CUDA_SUCCESS);
+}
+
 // ---- the rest ----
 static void misc(CUcontext ctx, CUdevice dev) {
   CUdevprop p{};
@@ -818,9 +964,10 @@ int main() {
 #endif
   check(attr(CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED) == 1, "virtual memory management is supported");
   CUmodule mod;
-  CUfunction kfill, kmixed, kbig;
+  CUfunction kfill, kmixed, kbig, ktex, ksurf;
   if (cuModuleLoadData(&mod, kPtx) || cuModuleGetFunction(&kfill, mod, "fill") ||
-      cuModuleGetFunction(&kmixed, mod, "mixed") || cuModuleGetFunction(&kbig, mod, "big")) {
+      cuModuleGetFunction(&kmixed, mod, "mixed") || cuModuleGetFunction(&kbig, mod, "big") ||
+      cuModuleGetFunction(&ktex, mod, "texread") || cuModuleGetFunction(&ksurf, mod, "surfread")) {
     std::printf("FAIL: the module did not load\n");
     return 1;
   }
@@ -832,6 +979,7 @@ int main() {
   mipmaps();
   legacy_launch(kfill, kmixed);
   texrefs(mod, kfill);
+  texture_objects(ktex, ksurf);
   misc(ctx, dev);
   IS(cuModuleUnload(mod), CUDA_SUCCESS);
   IS(cuCtxDestroy(ctx), CUDA_SUCCESS);

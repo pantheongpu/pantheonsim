@@ -12,6 +12,7 @@
 #include "vgpu_cuda.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +35,7 @@
 #include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/exec/tensormap.hpp"
+#include "vgpu/exec/texture.hpp"
 #include "vgpu/profiling.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
@@ -2926,6 +2928,187 @@ VGPU_EXPORT CUresult cuTexRefGetArray(CUarray* out, CUtexref t) {
   });
 }
 
+/* ---- texture and surface objects ----
+ * The same objects cudaCreateTextureObject makes, described through the
+ * driver's structs and kept in the device's table, where a kernel's texture
+ * and surface instructions find them. The handles come from a range of their
+ * own, far above the runtime's, since the two libraries share each device's
+ * table. What the runtime refuses is refused here too: resource views and
+ * anisotropic filtering, and the packed and block-compressed formats. */
+
+namespace {
+// CUDA_RESOURCE_DESC and CUDA_TEXTURE_DESC, as cuda.h lays them out.
+struct ResourceDescABI {
+  int type;   // CU_RESOURCE_TYPE_ARRAY, _MIPMAPPED_ARRAY, _LINEAR, _PITCH2D
+  union {
+    struct { CUarray array; } array;
+    struct { CUmipmappedArray mipmap; } mipmap;
+    struct { CUdeviceptr ptr; CUarray_format format; unsigned channels; size_t bytes; } linear;
+    struct {
+      CUdeviceptr ptr;
+      CUarray_format format;
+      unsigned channels;
+      size_t width, height, pitch;
+    } pitch2d;
+    int reserved[32];
+  } res;
+  unsigned flags;
+};
+struct TextureDescABI {
+  int address[3];
+  int filter;
+  unsigned flags;
+  unsigned max_anisotropy;
+  int mip_filter;
+  float mip_bias, mip_min, mip_max;
+  float border[4];
+  int reserved[12];
+};
+
+uint64_t next_texobj = uint64_t{1} << 40;
+
+// A driver format's channel kind and width, or false for one this does not read.
+bool format_kind(const CUarray_format& f, vgpu::exec::ChannelKind* kind, uint32_t* bits) {
+  unsigned raw;
+  std::memcpy(&raw, &f, sizeof raw);
+  switch (raw) {
+    case CU_AD_FORMAT_UNSIGNED_INT8: *kind = vgpu::exec::ChannelKind::Unsigned; *bits = 8; return true;
+    case CU_AD_FORMAT_UNSIGNED_INT16: *kind = vgpu::exec::ChannelKind::Unsigned; *bits = 16; return true;
+    case CU_AD_FORMAT_UNSIGNED_INT32: *kind = vgpu::exec::ChannelKind::Unsigned; *bits = 32; return true;
+    case CU_AD_FORMAT_SIGNED_INT8: *kind = vgpu::exec::ChannelKind::Signed; *bits = 8; return true;
+    case CU_AD_FORMAT_SIGNED_INT16: *kind = vgpu::exec::ChannelKind::Signed; *bits = 16; return true;
+    case CU_AD_FORMAT_SIGNED_INT32: *kind = vgpu::exec::ChannelKind::Signed; *bits = 32; return true;
+    case CU_AD_FORMAT_HALF: *kind = vgpu::exec::ChannelKind::Float; *bits = 16; return true;
+    case CU_AD_FORMAT_FLOAT: *kind = vgpu::exec::ChannelKind::Float; *bits = 32; return true;
+  }
+  return false;
+}
+
+// The format part of a descriptor: channels of one kind and width.
+CUresult set_format(vgpu::exec::TextureDesc* d, const CUarray_format& format, unsigned channels) {
+  uint32_t bits = 0;
+  if (!format_kind(format, &d->kind, &bits)) return CUDA_ERROR_NOT_SUPPORTED;
+  if (channels != 1 && channels != 2 && channels != 4) return CUDA_ERROR_INVALID_VALUE;
+  d->channels = channels;
+  for (unsigned c = 0; c < 4; ++c) d->channel_bits[c] = c < channels ? bits : 0;
+  d->texel_bytes = bits / 8 * channels;
+  return CUDA_SUCCESS;
+}
+
+// An array's shape, as cudaCreateTextureObject reads a cudaArray's.
+void set_array_shape(vgpu::exec::TextureDesc* d, const ArrayRec& a) {
+  d->base = a.mem;
+  d->width = static_cast<uint32_t>(a.desc.Width);
+  d->height = static_cast<uint32_t>(a.desc.Height);
+  d->depth = static_cast<uint32_t>(a.desc.Depth);
+  d->cubemap = a.desc.Flags & CUDA_ARRAY3D_CUBEMAP;
+  if (a.desc.Flags & CUDA_ARRAY3D_LAYERED) d->layers = static_cast<uint32_t>(d->cubemap ? a.desc.Depth / 6 : a.desc.Depth);
+  if (d->cubemap || d->layers) d->depth = 0;
+  d->pitch_bytes = static_cast<uint32_t>(a.row);
+  d->from_array = true;
+}
+
+CUresult describe_resource(ShimState& s, const ResourceDescABI& r, vgpu::exec::TextureDesc* d) {
+  switch (r.type) {
+    case 0: {   // CU_RESOURCE_TYPE_ARRAY
+      const ArrayRec* a = array_rec(s, r.res.array.array);
+      if (!a) return CUDA_ERROR_INVALID_HANDLE;
+      set_array_shape(d, *a);
+      return set_format(d, a->desc.Format, a->desc.NumChannels);
+    }
+    case 1: {   // CU_RESOURCE_TYPE_MIPMAPPED_ARRAY
+      auto it = s.mipmaps.find(reinterpret_cast<uintptr_t>(r.res.mipmap.mipmap));
+      if (it == s.mipmaps.end()) return CUDA_ERROR_INVALID_HANDLE;
+      const auto& lv = it->second.levels;
+      if (lv.size() > 17) return CUDA_ERROR_NOT_SUPPORTED;
+      const ArrayRec& a = s.arrays.at(lv[0]);
+      set_array_shape(d, a);
+      d->mip_levels = static_cast<uint32_t>(lv.size());
+      for (size_t l = 0; l < lv.size(); ++l) d->level_base[l] = s.arrays.at(lv[l]).mem;
+      return set_format(d, a.desc.Format, a.desc.NumChannels);
+    }
+    case 2: {   // CU_RESOURCE_TYPE_LINEAR
+      if (!r.res.linear.ptr) return CUDA_ERROR_INVALID_VALUE;
+      if (CUresult e = set_format(d, r.res.linear.format, r.res.linear.channels)) return e;
+      d->base = r.res.linear.ptr;
+      d->width = static_cast<uint32_t>(r.res.linear.bytes / d->texel_bytes);
+      d->pitch_bytes = 0;
+      return CUDA_SUCCESS;
+    }
+    case 3: {   // CU_RESOURCE_TYPE_PITCH2D
+      if (!r.res.pitch2d.ptr) return CUDA_ERROR_INVALID_VALUE;
+      if (CUresult e = set_format(d, r.res.pitch2d.format, r.res.pitch2d.channels)) return e;
+      d->base = r.res.pitch2d.ptr;
+      d->width = static_cast<uint32_t>(r.res.pitch2d.width);
+      d->height = static_cast<uint32_t>(r.res.pitch2d.height);
+      d->pitch_bytes = static_cast<uint32_t>(r.res.pitch2d.pitch);
+      return CUDA_SUCCESS;
+    }
+    default:
+      return CUDA_ERROR_INVALID_VALUE;
+  }
+}
+
+CUresult make_object(const char* name, unsigned long long* out, const void* res, const void* tex,
+                     const void* view, vgpu::exec::TexKind kind) {
+  return api(name, true, false, [&](ShimState& s) -> CUresult {
+    if (!out || !res) return CUDA_ERROR_INVALID_VALUE;
+    if (view) return CUDA_ERROR_NOT_SUPPORTED;   // a resource view reinterprets the format
+    vgpu::exec::TextureDesc d;
+    d.object = kind;
+    if (CUresult e = describe_resource(s, *static_cast<const ResourceDescABI*>(res), &d)) return e;
+    if (const auto* t = static_cast<const TextureDescABI*>(tex)) {
+      for (int i = 0; i < 3; ++i) {
+        if (t->address[i] < 0 || t->address[i] > 3) return CUDA_ERROR_INVALID_VALUE;
+        d.address[i] = static_cast<vgpu::exec::TexAddress>(t->address[i]);   // the same order
+      }
+      if (t->max_anisotropy > 1) return CUDA_ERROR_NOT_SUPPORTED;
+      d.filter = t->filter == 1 ? vgpu::exec::TexFilter::Linear : vgpu::exec::TexFilter::Point;
+      d.normalized_coords = t->flags & CU_TRSF_NORMALIZED_COORDINATES;
+      d.srgb = t->flags & CU_TRSF_SRGB;
+      // Integer texels come back as floats in [0, 1] or [-1, 1] unless
+      // CU_TRSF_READ_AS_INTEGER keeps them integers -- the driver's default is
+      // the opposite of the runtime's. Only 8- and 16-bit channels promote.
+      d.read_as_normalized_float = !(t->flags & CU_TRSF_READ_AS_INTEGER) &&
+                                   d.kind != vgpu::exec::ChannelKind::Float && d.channel_bits[0] < 32;
+      static_assert(sizeof d.border_bits == sizeof t->border);
+      std::memcpy(d.border_bits, t->border, sizeof d.border_bits);
+      auto q = [](float v) { return static_cast<int32_t>(std::trunc(std::clamp(v, -1e6f, 1e6f) * 256)); };
+      d.mip_filter = t->mip_filter == 1 ? vgpu::exec::TexFilter::Linear : vgpu::exec::TexFilter::Point;
+      d.mip_bias = q(t->mip_bias);
+      d.mip_min = q(t->mip_min);
+      d.mip_max = q(t->mip_max);
+    }
+    const uint64_t handle = next_texobj++;
+    current(s).textures()[handle] = d;
+    *out = handle;
+    return CUDA_SUCCESS;
+  });
+}
+
+CUresult destroy_object(const char* name, unsigned long long obj) {
+  return api(name, true, false, [&](ShimState& s) {
+    for (int dev = 0; dev < s.rt->device_count(); ++dev)
+      if (s.rt->device(dev).textures().erase(obj)) return CUDA_SUCCESS;
+    return CUDA_ERROR_INVALID_VALUE;
+  });
+}
+}  // namespace
+
+VGPU_EXPORT CUresult cuTexObjectCreate(unsigned long long* out, const void* res, const void* tex,
+                                       const void* view) {
+  return make_object("cuTexObjectCreate", out, res, tex, view, vgpu::exec::TexKind::Texture);
+}
+VGPU_EXPORT CUresult cuTexObjectDestroy(unsigned long long obj) {
+  return destroy_object("cuTexObjectDestroy", obj);
+}
+VGPU_EXPORT CUresult cuSurfObjectCreate(unsigned long long* out, const void* res) {
+  return make_object("cuSurfObjectCreate", out, res, nullptr, nullptr, vgpu::exec::TexKind::Surface);
+}
+VGPU_EXPORT CUresult cuSurfObjectDestroy(unsigned long long obj) {
+  return destroy_object("cuSurfObjectDestroy", obj);
+}
+
 VGPU_EXPORT CUresult cuMemcpy3D_v2(const CUDA_MEMCPY3D* p) {
   return api("cuMemcpy3D", true, false, [&](ShimState& s) {
     if (!p) return CUDA_ERROR_INVALID_VALUE;
@@ -3954,6 +4137,8 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuGraphicsUnregisterResource), VGPU_PROC(cuGraphicsMapResources),
     VGPU_PROC(cuGraphicsUnmapResources), VGPU_PROC(cuGraphicsResourceSetMapFlags_v2),
     VGPU_PROC(cuGraphicsResourceGetMappedPointer_v2), VGPU_PROC(cuGraphicsSubResourceGetMappedArray),
+    VGPU_PROC(cuTexObjectCreate), VGPU_PROC(cuTexObjectDestroy), VGPU_PROC(cuSurfObjectCreate),
+    VGPU_PROC(cuSurfObjectDestroy),
 };
 
 // A driver function this library exports but the table above does not list:
