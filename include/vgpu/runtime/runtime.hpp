@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <list>
+#include <map>
 #include <vector>
 
 #include "vgpu/exec/launch.hpp"
@@ -133,6 +134,16 @@ class Device {
   mutable std::list<LoadedModule> modules_;
 };
 
+// A range of host memory CUDA knows about, and the device that was current
+// when it was set up (the one whose cudaDeviceReset releases it). `flags` are
+// the ones the caller passed, which cuMemHostGetFlags and cudaHostGetFlags
+// report back.
+struct HostRange {
+  size_t size = 0;
+  int device = 0;
+  unsigned flags = 0;
+};
+
 class Runtime;
 // The process's simulated machine, made from the environment (VGPU_GPU,
 // VGPU_DEVICE_COUNT) the first time either CUDA library asks, and the same
@@ -154,11 +165,18 @@ class Runtime {
   int device_count() const { return static_cast<int>(devices_.size()); }
   Device& device(int ordinal);
 
+  // Host memory registered with cudaHostRegister or cuMemHostRegister, by its
+  // base. One record for both libraries, as the card keeps one: memory either
+  // API registered is already registered to the other, and either may
+  // unregister it. Callers hold shared_api_mutex().
+  std::map<void*, HostRange>& host_registrations() { return host_registrations_; }
+
  private:
   void publish_identity(const DeviceProfile& profile, int ordinal);
 
   telemetry::Publisher telemetry_;
   std::vector<std::unique_ptr<Device>> devices_;
+  std::map<void*, HostRange> host_registrations_;
 };
 
 }  // namespace vgpu::runtime

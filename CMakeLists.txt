@@ -1225,6 +1225,20 @@ if(TARGET vgpucublas)
       TIMEOUT 300)
   endforeach()
 
+  # Runtime entry points CUDA's samples reach for, checked against what an
+  # RTX 3060 answers (runtime_gaps.cu). On two devices, so that peer copies
+  # have a peer.
+  foreach(_check IN ITEMS "runtime_gaps:cudart")
+    string(REPLACE ":" ";" _parts "${_check}")
+    list(POP_FRONT _parts _name)
+    add_test(NAME e2e_${_name}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh ${_name} ${_parts})
+    set_tests_properties(e2e_${_name} PROPERTIES
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_DEVICE_COUNT=2"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endforeach()
+
   add_test(NAME e2e_rdc_link
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_rdc_link.sh)
   set_tests_properties(e2e_rdc_link PROPERTIES
