@@ -1889,9 +1889,13 @@ VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
     if (count == 0) return cudaSuccess;  // even for a null pointer, as on hardware
     // Managed and pinned memory are filled like device memory, as an RTX 3060
     // fills them (NanoVDB zeroes a managed grid buffer this way); here they
-    // are host addresses. Pageable and cudaHostRegister'd memory fall through
-    // to the device fill, which refuses them, as CUDA does.
+    // are host addresses. cudaHostRegister'd memory is refused, as CUDA
+    // refuses it: it is mapped for the device, and the core's fill now
+    // reaches host mappings (HIP fills its pinned and signal memory that way),
+    // so the refusal has to be said here. Pageable memory falls through to
+    // the device fill, which refuses it.
     if (!is_device_ptr(dst)) {
+      if (find_range(s.registered, dst) != s.registered.end()) return cudaErrorInvalidValue;
       for (auto* ranges : {&s.managed_allocs, &s.host_allocs}) {
         auto it = find_range(*ranges, dst);
         if (it == ranges->end()) continue;
