@@ -3025,7 +3025,7 @@ class Interpreter {
   // The member mask of a warp instruction that synchronizes the lanes it
   // names (shfl.sync, vote.sync, match.sync, redux.sync), or null.
   static const Operand* sync_members(const Instr& ins) {
-    if (const auto* op = std::get_if<OpShfl>(&ins.op)) return &op->member_mask;
+    if (const auto* op = std::get_if<OpShfl>(&ins.op); op && op->has_members) return &op->member_mask;
     if (const auto* op = std::get_if<OpMatch>(&ins.op)) return &op->membermask;
     if (const auto* op = std::get_if<OpRedux>(&ins.op)) return &op->members;
     if (const auto* op = std::get_if<OpVote>(&ins.op); op && op->has_members) return &op->members;
