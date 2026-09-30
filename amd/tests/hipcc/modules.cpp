@@ -88,6 +88,36 @@ int main(int argc, char** argv) {
     (void)hipStreamDestroy(other);
   }
 
+  // A library's kernel launched by hipLaunchKernel, as a host function is:
+  // ROCm's hipLaunchKernel takes either.
+  {
+    hipLibrary_t lib = nullptr;
+    EXPECT(hipLibraryLoadFromFile(&lib, path, nullptr, nullptr, 0, nullptr, nullptr, 0), hipSuccess,
+           "the code object loads as a library");
+    hipKernel_t kernel = nullptr;
+    EXPECT(hipLibraryGetKernel(&kernel, lib, "scale"), hipSuccess, "its kernel is found");
+    std::vector<int> ones(n, 1);
+    (void)hipMemcpy(d, ones.data(), n * sizeof(int), hipMemcpyHostToDevice);
+    EXPECT(hipLaunchKernel(reinterpret_cast<const void*>(kernel), dim3(n / 64), dim3(64), args, 0, nullptr),
+           hipSuccess, "hipLaunchKernel launches a library's kernel");
+    (void)hipMemcpy(ones.data(), d, n * sizeof(int), hipMemcpyDeviceToHost);
+    check(ones[0] == 7 && ones[n - 1] == 7, "and it runs", std::to_string(ones[0]));
+    EXPECT(hipLibraryUnload(lib), hipSuccess, "the library unloads");
+  }
+  // Libraries load lazily, as ROCm's do: an image that is no code object
+  // loads, and is refused when a kernel is asked of it.
+  {
+    hipLibrary_t lib = nullptr;
+    hipKernel_t kernel = nullptr;
+    EXPECT(hipLibraryLoadData(&lib, "call me ishmael", nullptr, nullptr, 0, nullptr, nullptr, 0), hipSuccess,
+           "a library of an image that is no code object loads");
+    EXPECT(hipLibraryGetKernel(&kernel, lib, "moby"), hipErrorInvalidImage, "and is refused when a kernel is asked");
+    EXPECT(hipLibraryUnload(lib), hipSuccess, "and unloads");
+    EXPECT(hipLibraryLoadData(nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr, 0), hipErrorInvalidValue,
+           "a library load with nowhere to put it");
+    EXPECT(hipLibraryUnload(nullptr), hipErrorInvalidValue, "an unload of no library");
+  }
+
   hipDeviceptr_t global = nullptr;
   size_t bytes = 0;
   EXPECT(hipModuleGetGlobal(&global, &bytes, m, "int_var"), hipSuccess, "its global is found");

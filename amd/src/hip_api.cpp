@@ -3313,6 +3313,9 @@ hipError_t hipModuleOccupancyMaxPotentialBlockSize(int* grid, int* block, hipFun
 // cooperative_groups::this_grid().sync()). They all have to be resident at
 // once, so a grid larger than the device holds of this kernel at this block
 // size -- what the occupancy calls say -- is refused, as HIP refuses it.
+hipError_t hipModuleLaunchCooperativeKernel(hipFunction_t f, unsigned int gx, unsigned int gy, unsigned int gz,
+                                            unsigned int bx, unsigned int by, unsigned int bz, unsigned int shared,
+                                            hipStream_t stream, void** params);
 }  // extern "C"
 namespace {
 
@@ -3330,8 +3333,20 @@ hipError_t launch_host_function(const void* host_function, vgpu::amd::abi::Dim3 
   vgpu::runtime::Device* d = device(s);
   if (!d) return hipErrorInvalidDevice;
   const auto hf = s.host_functions.find(host_function);
-  if (hf == s.host_functions.end())
-    return fail(hipErrorInvalidDeviceFunction, "no kernel was registered for that function");
+  if (hf == s.host_functions.end()) {
+    // A library's kernel (hipLibraryGetKernel) or a module's function, which
+    // ROCm's hipLaunchKernel takes as well as a host function.
+    const bool module_function = std::any_of(s.functions.begin(), s.functions.end(),
+                                             [&](const auto& f) { return f.get() == host_function; });
+    if (!module_function) return fail(hipErrorInvalidDeviceFunction, "no kernel was registered for that function");
+    lock.unlock();
+    const hipFunction_t f = reinterpret_cast<hipFunction_t>(const_cast<void*>(host_function));
+    if (cooperative)
+      return hipModuleLaunchCooperativeKernel(f, grid.x, grid.y, grid.z, block.x, block.y, block.z,
+                                              static_cast<unsigned>(shared), stream, args);
+    return module_launch(f, grid.x, grid.y, grid.z, block.x, block.y, block.z, static_cast<unsigned>(shared), stream,
+                         args, extra, nullptr);
+  }
   Module* m = nullptr;
   if (const hipError_t e = module_on(s, *hf->second.binary, s.current, &m); e != hipSuccess) return e;
   const Kernel* k = vgpu::amd::find_kernel(m->object, hf->second.kernel);
@@ -5559,7 +5574,11 @@ VGPU_NO_IMAGES(hipBindTexture)
 VGPU_NO_IMAGES(hipBindTexture2D)
 VGPU_NO_IMAGES(hipBindTextureToArray)
 VGPU_NO_IMAGES(hipBindTextureToMipmappedArray)
-VGPU_NO_IMAGES(hipUnbindTexture)
+// No texture is no value to unbind, before there being no textures at all.
+hipError_t hipUnbindTexture(const void* tex) {
+  if (!tex) return record(state(), hipErrorInvalidValue);
+  return no_images("hipUnbindTexture");
+}
 VGPU_NO_IMAGES(hipGetTextureAlignmentOffset)
 VGPU_NO_IMAGES(hipGetMipmappedArrayLevel)
 VGPU_NO_IMAGES(hipMipmappedArrayGetLevel)
@@ -6736,11 +6755,35 @@ hipError_t hipMemGetAccess(unsigned long long* flags, const vgpu::amd::abi::MemL
 // hipLibrary_t is CUDA 12's library, which is a module here, loaded on the
 // current device; a hipKernel_t from it is the module's function. JIT and
 // library options change nothing.
+}  // extern "C"
+namespace {
+// Libraries whose image could not be loaded. ROCm's HIP loads a library
+// lazily: loading anything succeeds, and the image is refused when a kernel
+// is first asked of it (hipErrorInvalidImage). These handles stand for such
+// libraries until they are unloaded.
+std::mutex g_unloadable_mutex;
+std::set<void*> g_unloadable;
+bool unloadable(void* library) {
+  std::lock_guard<std::mutex> lock(g_unloadable_mutex);
+  return g_unloadable.count(library) != 0;
+}
+}  // namespace
+extern "C" {
+
 hipError_t hipLibraryLoadData(void** library, const void* code, void*, void*, unsigned int, void*, void*,
                               unsigned int) {
   const ApiCall api("hipLibraryLoadData");
   if (!library || !code) return record(state(), hipErrorInvalidValue);
-  return hipModuleLoadData(reinterpret_cast<hipModule_t*>(library), code);
+  const hipError_t e = hipModuleLoadData(reinterpret_cast<hipModule_t*>(library), code);
+  if (e != hipErrorInvalidImage && e != hipErrorNoBinaryForGpu) return e;
+  static std::atomic<uintptr_t> next{0x7e1b0000};   // apart from any real handle
+  *library = reinterpret_cast<void*>(next.fetch_add(0x10));
+  {
+    std::lock_guard<std::mutex> lock(g_unloadable_mutex);
+    g_unloadable.insert(*library);
+  }
+  (void)hipGetLastError();   // the refusal comes later, from hipLibraryGetKernel
+  return record(state(), hipSuccess);
 }
 hipError_t hipLibraryLoadFromFile(void** library, const char* path, void*, void*, unsigned int, void*, void*,
                                   unsigned int) {
@@ -6752,15 +6795,21 @@ hipError_t hipLibraryLoadFromFile(void** library, const char* path, void*, void*
 hipError_t hipLibraryUnload(void* library) {
   const ApiCall api("hipLibraryUnload");
   if (!library) return record(state(), hipErrorInvalidValue);
+  {
+    std::lock_guard<std::mutex> lock(g_unloadable_mutex);
+    if (g_unloadable.erase(library)) return record(state(), hipSuccess);
+  }
   return hipModuleUnload(static_cast<hipModule_t>(library));
 }
 hipError_t hipLibraryGetKernel(void** kernel, void* library, const char* name) {
   const ApiCall api("hipLibraryGetKernel");
   if (!kernel || !library || !name) return record(state(), hipErrorInvalidValue);
+  if (unloadable(library)) return record(state(), fail(hipErrorInvalidImage, "the library's image is not a code object"));
   return hipModuleGetFunction(reinterpret_cast<hipFunction_t*>(kernel), static_cast<hipModule_t>(library), name);
 }
 hipError_t hipLibraryGetKernelCount(unsigned int* count, void* library) {
   const ApiCall api("hipLibraryGetKernelCount");
+  if (library && unloadable(library)) return record(state(), hipErrorInvalidImage);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!count || !library) return record(s, hipErrorInvalidValue);
