@@ -320,6 +320,8 @@ int main() {
     (void)hipFree(m);
   }
 
+  EXPECT(hipUnbindTexture(nullptr), hipErrorInvalidValue, "unbinding no texture");
+
   char api_name[64];
   std::snprintf(api_name, sizeof api_name, "%s", hipApiName(1));
   check(std::string(api_name) == "__hipPopCallConfiguration" && std::string(hipApiName(0)) == "unknown",
