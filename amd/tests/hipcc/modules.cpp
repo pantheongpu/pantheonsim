@@ -75,6 +75,10 @@ int main(int argc, char** argv) {
          hipErrorInvalidValue, "an extended launch of a partial work-group, for a uniform kernel");
   EXPECT(hipExtModuleLaunchKernel(f, n, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr, nullptr, nullptr, 0), hipSuccess,
          "an extended launch of whole work-groups");
+  // A block wider than the whole grid is cut to it (hipHccModuleLaunchKernel
+  // of 1 work-item in blocks of 10, as hip-tests' ProcAddress test does).
+  EXPECT(hipHccModuleLaunchKernel(f, 1, 1, 1, 1, 1, 10, 0, nullptr, args, nullptr, nullptr, nullptr), hipSuccess,
+         "an extended launch of one work-item in a wider block");
   (void)hipDeviceSynchronize();
   int devices = 0;
   (void)hipGetDeviceCount(&devices);
