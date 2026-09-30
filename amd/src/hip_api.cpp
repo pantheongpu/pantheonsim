@@ -41,6 +41,7 @@
 #include "vgpu/amd_decode_cache.hpp"
 #include "vgpu/amd_exec.hpp"
 #include "vgpu/amd_hostcall.hpp"
+#include "vgpu/amd_kfd.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
@@ -379,28 +380,60 @@ hipError_t ensure_runtime(State& s) {
   int count = 1;
   if (const char* c = std::getenv("VGPU_DEVICE_COUNT"); c && *c) count = std::atoi(c);
   if (count < 1) count = 1;
+  vgpu::DeviceProfile p;
+  try {
+    p = vgpu::load_gpu(id);
+  } catch (const std::exception& e) {
+    return fail(hipErrorInvalidDevice, std::string("no usable GPU profile: ") + e.what());
+  }
   // The devices a program is shown, as ROCm shows them: ROCR_VISIBLE_DEVICES
   // picks from the machine's, then HIP_VISIBLE_DEVICES (or
-  // CUDA_VISIBLE_DEVICES) from those -- each a list of indices, read up to
-  // the first that is not one of them. None shown is no device.
-  const auto shown = [](const char* var, int* n) {
+  // CUDA_VISIBLE_DEVICES) from those -- each a list read up to the first
+  // entry that names no device. An entry is an index, or a UUID: "GPU-" and
+  // the hex of either the HSA agent's UUID or KFD's unique_id, which is what
+  // Ollama passes. None shown is no device.
+  const int machine = count;
+  const auto uuid_of = [&](const std::string& item) -> int {
+    if (item.rfind("GPU-", 0) != 0 || item.size() == 4) return -1;
+    char* end = nullptr;
+    const unsigned long long want = std::strtoull(item.c_str() + 4, &end, 16);
+    if (*end) return -1;
+    for (int i = 0; i < machine; ++i) {
+      vgpu::telemetry::DeviceSample d;
+      vgpu::telemetry::describe_device(p, i, &d);
+      if (want == 0x5647505500000000ull + static_cast<unsigned>(i) || want == vgpu::amd::kfd_unique_id(d.uuid))
+        return i;
+    }
+    return -1;
+  };
+  std::vector<int> visible(static_cast<size_t>(machine));
+  for (int i = 0; i < machine; ++i) visible[static_cast<size_t>(i)] = i;
+  const auto shown = [&](const char* var) {
     const char* v = std::getenv(var);
     if (!v) return;
     std::vector<int> picked;
     std::stringstream list(v);
     for (std::string item; std::getline(list, item, ',');) {
-      if (item.empty() || item.find_first_not_of("0123456789") != std::string::npos) break;
-      const int i = std::atoi(item.c_str());
-      if (i >= *n || std::find(picked.begin(), picked.end(), i) != picked.end()) break;
-      picked.push_back(i);
+      int at = -1;   // a position in `visible`
+      if (!item.empty() && item.find_first_not_of("0123456789") == std::string::npos) {
+        at = std::atoi(item.c_str());
+        if (at >= static_cast<int>(visible.size())) at = -1;
+      } else if (const int dev = uuid_of(item); dev >= 0) {
+        const auto it = std::find(visible.begin(), visible.end(), dev);
+        if (it != visible.end()) at = static_cast<int>(it - visible.begin());
+      }
+      if (at < 0) break;
+      const int dev = visible[static_cast<size_t>(at)];
+      if (std::find(picked.begin(), picked.end(), dev) != picked.end()) break;
+      picked.push_back(dev);
     }
-    *n = static_cast<int>(picked.size());
+    visible = picked;
   };
-  shown("ROCR_VISIBLE_DEVICES", &count);
-  shown(std::getenv("HIP_VISIBLE_DEVICES") ? "HIP_VISIBLE_DEVICES" : "CUDA_VISIBLE_DEVICES", &count);
+  shown("ROCR_VISIBLE_DEVICES");
+  shown(std::getenv("HIP_VISIBLE_DEVICES") ? "HIP_VISIBLE_DEVICES" : "CUDA_VISIBLE_DEVICES");
+  count = static_cast<int>(visible.size());
   if (count < 1) return fail(hipErrorNoDevice, "no device is visible (ROCR_VISIBLE_DEVICES, HIP_VISIBLE_DEVICES)");
   try {
-    vgpu::DeviceProfile p = vgpu::load_gpu(id);
     if (p.vendor != "amd")
       return fail(hipErrorInvalidDevice, "VGPU_GPU=" + id +
                                              " is not an AMD GPU, and HIP runs on AMD GPUs. Set VGPU_GPU to an "
