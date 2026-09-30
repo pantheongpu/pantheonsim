@@ -87,6 +87,8 @@ uint32_t kfd_gfx_target_version(const std::string& gfx) {
   return static_cast<uint32_t>(std::stoul(major) * 10000 + minor * 100 + stepping);
 }
 
+uint64_t kfd_unique_id(const char* uuid) { return fnv(uuid); }
+
 uint32_t kfd_gpu_id(const char* uuid) {
   if (std::strncmp(uuid, "GPU-", 4) == 0) uuid += 4;
   return static_cast<uint32_t>(fnv(uuid) % 65536);
@@ -157,7 +159,7 @@ std::vector<KfdFile> kfd_topology(const DeviceProfile& p, int count, uint32_t cp
     q.add("num_sdma_engines", 2).add("num_sdma_xgmi_engines", 0).add("num_sdma_queues_per_engine", 8);
     q.add("num_cp_queues", 128).add("max_engine_clk_fcompute", d.sm_clock_max_mhz).add("local_mem_size", 0);
     q.add("fw_version", 0).add("capability", 0).add("debug_prop", 0).add("sdma_fw_version", 0);
-    q.add("unique_id", fnv(d.uuid)).add("num_xcc", c.xccs).add("max_engine_clk_ccompute", 0);
+    q.add("unique_id", kfd_unique_id(d.uuid)).add("num_xcc", c.xccs).add("max_engine_clk_ccompute", 0);
     out.push_back({node(i + 1) + "properties", q.text});
     out.push_back({node(i + 1) + "gpu_id", std::to_string(kfd_gpu_id(d.uuid)) + "\n"});
     out.push_back({node(i + 1) + "name", std::string(asic_name(p.gcn_arch)) + "\n"});
