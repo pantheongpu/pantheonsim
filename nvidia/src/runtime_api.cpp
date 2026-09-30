@@ -1889,9 +1889,13 @@ VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
     if (count == 0) return cudaSuccess;  // even for a null pointer, as on hardware
     // Managed and pinned memory are filled like device memory, as an RTX 3060
     // fills them (NanoVDB zeroes a managed grid buffer this way); here they
-    // are host addresses. Pageable and cudaHostRegister'd memory fall through
-    // to the device fill, which refuses them, as CUDA does.
+    // are host addresses. cudaHostRegister'd memory is refused, as CUDA
+    // refuses it: it is mapped for the device, and the core's fill now
+    // reaches host mappings (HIP fills its pinned and signal memory that way),
+    // so the refusal has to be said here. Pageable memory falls through to
+    // the device fill, which refuses it.
     if (!is_device_ptr(dst)) {
+      if (find_range(s.registered, dst) != s.registered.end()) return cudaErrorInvalidValue;
       for (auto* ranges : {&s.managed_allocs, &s.host_allocs}) {
         auto it = find_range(*ranges, dst);
         if (it == ranges->end()) continue;
@@ -4703,6 +4707,23 @@ static cudaError_t replay_fill(const RecordedLaunch& rl) {
     for (unsigned i = 0; i < 4; ++i) pattern[i] = static_cast<uint8_t>(value >> (8 * i));
     for (size_t y = 0; y < rl.height; ++y) {
       void* row = static_cast<char*>(rl.dst) + y * rl.dst_pitch;
+      // Managed and pinned memory are host addresses here, filled as
+      // cudaMemset fills them (taskflow zeroes a managed buffer with a node).
+      if (!is_device_ptr(row)) {
+        bool host = false;
+        for (auto* ranges : {&s.managed_allocs, &s.host_allocs}) {
+          auto it = find_range(*ranges, row);
+          if (it == ranges->end()) continue;
+          const size_t off = static_cast<size_t>(static_cast<char*>(row) - static_cast<char*>(it->first));
+          if (rl.bytes > it->second.size - off) return cudaErrorInvalidValue;
+          auto* out = static_cast<uint8_t*>(row);
+          for (size_t i = 0; i < rl.bytes; i += rl.elem_size)
+            std::memcpy(out + i, pattern, std::min<size_t>(rl.elem_size, rl.bytes - i));
+          host = true;
+          break;
+        }
+        if (host) continue;
+      }
       owner_memory(s, row).fill(reinterpret_cast<uint64_t>(row), pattern, rl.elem_size, rl.bytes);
     }
     return cudaSuccess;
@@ -6419,3 +6440,71 @@ VGPU_EXPORT cudaError_t cudaStreamIsCapturing(cudaStream_t stream,
                                      : cudaStreamCaptureStatusNone;
   return cudaSuccess;
 }
+
+/* ===================================================================== */
+/* Per-thread default stream                                             */
+/* ===================================================================== */
+
+// A program built with nvcc --default-stream per-thread (or with
+// CUDA_API_PER_THREAD_DEFAULT_STREAM defined) calls these names instead:
+// cudaMemcpy_ptds, cudaLaunchKernel_ptsz and the rest, where stream 0 is the
+// calling thread's own default stream rather than the legacy one. Every
+// stream here is synchronous, so the two defaults behave alike and each name
+// is the plain function under another symbol. COLMAP builds this way.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattribute-alias"
+#endif
+#define VGPU_PT_ALIAS(name, target) \
+  extern "C" __attribute__((visibility("default"))) void name() __attribute__((alias(#target)));
+VGPU_PT_ALIAS(cudaMemcpy_ptds, cudaMemcpy)
+VGPU_PT_ALIAS(cudaMemcpyToSymbol_ptds, cudaMemcpyToSymbol)
+VGPU_PT_ALIAS(cudaMemcpyFromSymbol_ptds, cudaMemcpyFromSymbol)
+VGPU_PT_ALIAS(cudaMemcpy2D_ptds, cudaMemcpy2D)
+VGPU_PT_ALIAS(cudaMemcpy2DToArray_ptds, cudaMemcpy2DToArray)
+VGPU_PT_ALIAS(cudaMemcpy2DFromArray_ptds, cudaMemcpy2DFromArray)
+VGPU_PT_ALIAS(cudaMemcpy3D_ptds, cudaMemcpy3D)
+VGPU_PT_ALIAS(cudaMemcpy3DPeer_ptds, cudaMemcpy3DPeer)
+VGPU_PT_ALIAS(cudaMemset_ptds, cudaMemset)
+VGPU_PT_ALIAS(cudaMemset2D_ptds, cudaMemset2D)
+VGPU_PT_ALIAS(cudaMemcpyPeer_ptds, cudaMemcpyPeer)
+VGPU_PT_ALIAS(cudaMemcpyAsync_ptsz, cudaMemcpyAsync)
+VGPU_PT_ALIAS(cudaMemcpyToSymbolAsync_ptsz, cudaMemcpyToSymbolAsync)
+VGPU_PT_ALIAS(cudaMemcpyFromSymbolAsync_ptsz, cudaMemcpyFromSymbolAsync)
+VGPU_PT_ALIAS(cudaMemcpy2DAsync_ptsz, cudaMemcpy2DAsync)
+VGPU_PT_ALIAS(cudaMemcpy3DAsync_ptsz, cudaMemcpy3DAsync)
+VGPU_PT_ALIAS(cudaMemcpy3DPeerAsync_ptsz, cudaMemcpy3DPeerAsync)
+VGPU_PT_ALIAS(cudaMemsetAsync_ptsz, cudaMemsetAsync)
+VGPU_PT_ALIAS(cudaMemset2DAsync_ptsz, cudaMemset2DAsync)
+VGPU_PT_ALIAS(cudaStreamQuery_ptsz, cudaStreamQuery)
+VGPU_PT_ALIAS(cudaStreamGetFlags_ptsz, cudaStreamGetFlags)
+VGPU_PT_ALIAS(cudaStreamGetId_ptsz, cudaStreamGetId)
+VGPU_PT_ALIAS(cudaStreamGetPriority_ptsz, cudaStreamGetPriority)
+VGPU_PT_ALIAS(cudaEventRecord_ptsz, cudaEventRecord)
+VGPU_PT_ALIAS(cudaEventRecordWithFlags_ptsz, cudaEventRecordWithFlags)
+VGPU_PT_ALIAS(cudaStreamWaitEvent_ptsz, cudaStreamWaitEvent)
+VGPU_PT_ALIAS(cudaStreamAddCallback_ptsz, cudaStreamAddCallback)
+VGPU_PT_ALIAS(cudaStreamSynchronize_ptsz, cudaStreamSynchronize)
+VGPU_PT_ALIAS(cudaLaunchKernel_ptsz, cudaLaunchKernel)
+VGPU_PT_ALIAS(cudaLaunchKernelExC_ptsz, cudaLaunchKernelExC)
+VGPU_PT_ALIAS(cudaLaunchHostFunc_ptsz, cudaLaunchHostFunc)
+VGPU_PT_ALIAS(cudaMemPrefetchAsync_ptsz, cudaMemPrefetchAsync)
+VGPU_PT_ALIAS(cudaGraphLaunch_ptsz, cudaGraphLaunch)
+VGPU_PT_ALIAS(cudaGraphUpload_ptsz, cudaGraphUpload)
+VGPU_PT_ALIAS(cudaStreamBeginCapture_ptsz, cudaStreamBeginCapture)
+VGPU_PT_ALIAS(cudaStreamEndCapture_ptsz, cudaStreamEndCapture)
+VGPU_PT_ALIAS(cudaStreamIsCapturing_ptsz, cudaStreamIsCapturing)
+VGPU_PT_ALIAS(cudaStreamGetCaptureInfo_v2_ptsz, cudaStreamGetCaptureInfo_v2)
+VGPU_PT_ALIAS(cudaMallocAsync_ptsz, cudaMallocAsync)
+VGPU_PT_ALIAS(cudaFreeAsync_ptsz, cudaFreeAsync)
+VGPU_PT_ALIAS(cudaMallocFromPoolAsync_ptsz, cudaMallocFromPoolAsync)
+VGPU_PT_ALIAS(cudaLaunchCooperativeKernel_ptsz, cudaLaunchCooperativeKernel)
+VGPU_PT_ALIAS(cudaMemcpyPeerAsync_ptsz, cudaMemcpyPeerAsync)
+VGPU_PT_ALIAS(cudaStreamCopyAttributes_ptsz, cudaStreamCopyAttributes)
+VGPU_PT_ALIAS(cudaStreamGetAttribute_ptsz, cudaStreamGetAttribute)
+VGPU_PT_ALIAS(cudaStreamSetAttribute_ptsz, cudaStreamSetAttribute)
+VGPU_PT_ALIAS(cudaStreamUpdateCaptureDependencies_ptsz, cudaStreamUpdateCaptureDependencies)
+#undef VGPU_PT_ALIAS
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif

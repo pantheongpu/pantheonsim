@@ -71,6 +71,11 @@ class Device {
 
   // The module's global-variable addresses (valid while the module is loaded).
   const exec::SymbolTable* symbols(uint64_t module_id) const;
+  // A module's global variable by name: its address and its declared size.
+  // False when the module declares no global of that name.
+  bool global(uint64_t module_id, const std::string& name, uint64_t* addr, uint64_t* size) const;
+  // Whether the module defines a kernel of that name.
+  bool has_kernel(uint64_t module_id, const std::string& name) const;
 
   void launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
               const std::vector<std::vector<uint8_t>>& args,

@@ -1,8 +1,9 @@
 // Differential conformance for cuBLAS level 1 and the triangular band product:
-// axpy, scal, dot, nrm2 and i?amax in single and double precision, positive and
+// axpy, scal, dot, nrm2, asum and i?amax in single and double precision, positive and
 // negative increments (BLAS walks a negative-increment vector from its far
 // end), and tbmv over both triangles, both operations, unit and non-unit
-// diagonals and several band widths; and dgmm (a matrix times a diagonal
+// diagonals and several band widths; gemv over both operations, negative
+// increments and beta zero or not; and dgmm (a matrix times a diagonal
 // one) from both sides, over every kind of increment, padded and in place.
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -45,12 +46,43 @@ cublasStatus_t dot(cublasHandle_t h, int n, const float* x, int ix, const float*
 cublasStatus_t dot(cublasHandle_t h, int n, const double* x, int ix, const double* y, int iy, double* r) { return cublasDdot(h, n, x, ix, y, iy, r); }
 cublasStatus_t nrm2(cublasHandle_t h, int n, const float* x, int ix, float* r) { return cublasSnrm2(h, n, x, ix, r); }
 cublasStatus_t nrm2(cublasHandle_t h, int n, const double* x, int ix, double* r) { return cublasDnrm2(h, n, x, ix, r); }
+cublasStatus_t asum(cublasHandle_t h, int n, const float* x, int ix, float* r) { return cublasSasum(h, n, x, ix, r); }
+cublasStatus_t asum(cublasHandle_t h, int n, const double* x, int ix, double* r) { return cublasDasum(h, n, x, ix, r); }
 cublasStatus_t iamax(cublasHandle_t h, int n, const float* x, int ix, int* r) { return cublasIsamax(h, n, x, ix, r); }
 cublasStatus_t iamax(cublasHandle_t h, int n, const double* x, int ix, int* r) { return cublasIdamax(h, n, x, ix, r); }
 cublasStatus_t tbmv(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t, cublasDiagType_t d, int n, int k, const float* A, int lda, float* x, int ix) { return cublasStbmv(h, u, t, d, n, k, A, lda, x, ix); }
 cublasStatus_t tbmv(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t, cublasDiagType_t d, int n, int k, const double* A, int lda, double* x, int ix) { return cublasDtbmv(h, u, t, d, n, k, A, lda, x, ix); }
 cublasStatus_t dgmm(cublasHandle_t h, cublasSideMode_t s, int m, int n, const float* A, int lda, const float* x, int ix, float* C, int ldc) { return cublasSdgmm(h, s, m, n, A, lda, x, ix, C, ldc); }
 cublasStatus_t dgmm(cublasHandle_t h, cublasSideMode_t s, int m, int n, const double* A, int lda, const double* x, int ix, double* C, int ldc) { return cublasDdgmm(h, s, m, n, A, lda, x, ix, C, ldc); }
+
+cublasStatus_t gemv(cublasHandle_t h, cublasOperation_t t, int m, int n, const float* a, const float* A, int lda, const float* x, int ix, const float* b, float* y, int iy) { return cublasSgemv(h, t, m, n, a, A, lda, x, ix, b, y, iy); }
+cublasStatus_t gemv(cublasHandle_t h, cublasOperation_t t, int m, int n, const double* a, const double* A, int lda, const double* x, int ix, const double* b, double* y, int iy) { return cublasDgemv(h, t, m, n, a, A, lda, x, ix, b, y, iy); }
+
+template <class T> static void matvec(cublasHandle_t h, const char* ty) {
+  const int m = 5, n = 3, lda = 6;  // padded: row 5 of each column is not A's
+  auto hA = values<T>((size_t)lda * n, 8);
+  T* dA = up(hA);
+  for (int trans = 0; trans <= 1; ++trans)
+    for (int inc : {1, -2})
+      for (int zero_beta = 0; zero_beta <= 1; ++zero_beta) {
+        const int xlen = trans ? m : n, ylen = trans ? n : m;
+        const size_t lx = (size_t)(inc < 0 ? -inc : inc) * (xlen - 1) + 1;
+        const size_t ly = (size_t)(inc < 0 ? -inc : inc) * (ylen - 1) + 1;
+        auto hx = values<T>(lx, 9), hy = values<T>(ly, 10);
+        T* dx = up(hx);
+        T* dy = up(hy);
+        const T alpha = (T)1.25, beta = zero_beta ? (T)0 : (T)-0.5;
+        CB(gemv(h, trans ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, &alpha, dA, lda, dx, inc, &beta, dy, inc));
+        char tag[64];
+        snprintf(tag, sizeof tag, "%s gemv %s inc %d beta %s", ty, trans ? "T" : "N", inc, zero_beta ? "0" : "-0.5");
+        print(tag, down(dy, ly));
+        cudaFree(dx); cudaFree(dy);
+      }
+  // A leading dimension shorter than a column.
+  const T one = 1;
+  printf("%s gemv lda < m -> %d\n", ty, (int)gemv(h, CUBLAS_OP_N, m, n, &one, dA, m - 1, dA, 1, &one, dA, 1));
+  cudaFree(dA);
+}
 
 template <class T> static void diag(cublasHandle_t h, const char* ty) {
   const int m = 5, n = 4, lda = 7;   // padded: rows 5 and 6 of each column are not A's
@@ -96,6 +128,8 @@ template <class T> static void level1(cublasHandle_t h, const char* ty) {
     printf("%s dot inc %d,%d = %.6f\n", ty, ix, iy, (double)r);
     CB(nrm2(h, n, dx, ix, &r));
     printf("%s nrm2 inc %d = %.6f\n", ty, ix, (double)r);
+    CB(asum(h, n, dx, ix, &r));
+    printf("%s asum inc %d = %.6f\n", ty, ix, (double)r);
     int im = -1;
     CB(iamax(h, n, dx, ix, &im));
     printf("%s iamax inc %d = %d\n", ty, ix, im);
@@ -148,6 +182,8 @@ static void run() {
   band<double>(h, "d");
   diag<float>(h, "s");
   diag<double>(h, "d");
+  matvec<float>(h, "s");
+  matvec<double>(h, "d");
   // Results written through a device pointer.
   CB(cublasSetPointerMode(h, CUBLAS_POINTER_MODE_DEVICE));
   auto hx = values<double>(9, 5);
@@ -179,6 +215,8 @@ static void run() {
     printf("d dot_64 = %.6f\n", r);
     CB(cublasDnrm2_64(h, 5, dx, 2, &r));
     printf("d nrm2_64 inc 2 = %.6f\n", r);
+    CB(cublasDasum_64(h, 5, dx, 2, &r));
+    printf("d asum_64 inc 2 = %.6f\n", r);
     CB(cublasIdamax_64(h, 9, dy, 1, &im));
     printf("d iamax_64 = %lld\n", (long long)im);
     CB(cublasDscal_64(h, 9, &s, dy, 1));
@@ -193,6 +231,8 @@ static void run() {
     printf("s dot_64 = %.6f\n", (double)fr);
     CB(cublasSnrm2_64(h, 9, sx, 1, &fr));
     printf("s nrm2_64 = %.6f\n", (double)fr);
+    CB(cublasSasum_64(h, 9, sx, 1, &fr));
+    printf("s asum_64 = %.6f\n", (double)fr);
     CB(cublasIsamax_64(h, 9, sy, 1, &im));
     printf("s iamax_64 = %lld\n", (long long)im);
     CB(cublasSscal_64(h, 9, &fs, sy, 1));

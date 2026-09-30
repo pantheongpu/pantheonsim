@@ -1546,9 +1546,7 @@ class Parser {
           if (addr.base_kind == Addr::Base::Reg) {
             ins.op = OpLd{space, ty, std::move(dsts), addr};
           } else if (addr.base_kind == Addr::Base::CallSlot) {
-            if (vec != 1) return unsupported("vector ld.param from call slot");
-            OpLdSlot op{addr.base, addr.offset, ty, dsts[0]};
-            ins.op = op;
+            ins.op = OpLdSlot{addr.base, addr.offset, ty, std::move(dsts)};
           } else {
             ins.op = OpLd{space, ty, std::move(dsts), addr};
           }
@@ -1577,8 +1575,7 @@ class Parser {
         if (space == Space::Param) {
           if (addr.base_kind != Addr::Base::CallSlot)
             return unsupported("st.param outside a call sequence");
-          if (vec != 1) return unsupported("vector st.param");
-          ins.op = OpStSlot{addr.base, addr.offset, ty, srcs[0]};
+          ins.op = OpStSlot{addr.base, addr.offset, ty, std::move(srcs)};
         } else {
           if (addr.base_kind == Addr::Base::CallSlot || addr.base_kind == Addr::Base::EntryParam)
             return unsupported("store through a parameter/slot name");

@@ -1693,9 +1693,10 @@ class Interpreter {
         return;
       }
       size_t idx = select_path(w);
-      if (w.paths[idx].pc >= cur_->body.size())
-        throw Error::make(Err::PtxParse, "control fell off the end of '", cur_->name,
-                          "' (missing ret)");
+      if (w.paths[idx].pc >= cur_->body.size()) {
+        exec_ret(w, ctx, implicit_ret(), idx, w.paths[idx].mask);
+        continue;
+      }
       const Instr& ins = cur_->body[w.paths[idx].pc];
       if (progress_ && (stats_.instructions & 0xFFFFF) == 0) report_progress();
       // Warp-level issue count, plus the per-lane total: their ratio is the
@@ -5172,17 +5173,18 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpStSlot>(&ins.op)) {
-      Lanes _s_v;
-      const Lanes& v = read_operand(w, ctx, ins, op->src, _s_v);
       Warp::Slot& slot = w.slots[op->slot];
       const uint32_t nbytes = op->ty.bytes() ? op->ty.bytes() : 4u;
       // A slot written before it was declared (or wider than declared) grows
       // to fit rather than dropping the write silently.
-      slot.fit(static_cast<uint32_t>(op->offset) + nbytes, W_);
-      for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane))
-          slot.write(lane, static_cast<uint32_t>(op->offset), nbytes,
-                     mask_to_bits(v[lane], op->ty.bits));
+      slot.fit(static_cast<uint32_t>(op->offset) + nbytes * static_cast<uint32_t>(op->srcs.size()), W_);
+      for (size_t e = 0; e < op->srcs.size(); ++e) {
+        Lanes _s_v;
+        const Lanes& v = read_operand(w, ctx, ins, op->srcs[e], _s_v);
+        const uint32_t at = static_cast<uint32_t>(op->offset) + nbytes * static_cast<uint32_t>(e);
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) slot.write(lane, at, nbytes, mask_to_bits(v[lane], op->ty.bits));
+      }
       return;
     }
     if (const auto* op = std::get_if<OpLdSlot>(&ins.op)) {
@@ -5190,11 +5192,13 @@ class Interpreter {
       if (it == w.slots.end())
         ctx_fail(ins, -1, Err::UninitializedRegister, "call slot '" + op->slot + "' read before write");
       const uint32_t nbytes = op->ty.bytes() ? op->ty.bytes() : 4u;
-      Lanes r{};
-      for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane))
-          r[lane] = it->second.read(lane, static_cast<uint32_t>(op->offset), nbytes);
-      write_reg(w, op->dst, m, r, op->ty.bits);
+      for (size_t e = 0; e < op->dsts.size(); ++e) {
+        const uint32_t at = static_cast<uint32_t>(op->offset) + nbytes * static_cast<uint32_t>(e);
+        Lanes r{};
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane)) r[lane] = it->second.read(lane, at, nbytes);
+        write_loaded(w, op->dsts[e], m, r, op->ty);
+      }
       return;
     }
     if (const auto* op = std::get_if<OpCall>(&ins.op)) {
@@ -9695,7 +9699,7 @@ class Interpreter {
             results[e][lane] = v;
           }
         }
-      for (size_t e = 0; e < n; ++e) write_reg(w, op.dsts[e], m, results[e], op.ty.bits);
+      for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, results[e], op.ty);
       return;
     }
     if (op.space == Space::Param) {
@@ -9712,7 +9716,7 @@ class Interpreter {
         std::memcpy(&v, params_.bytes.data() + at, size);
         Lanes r;  // written for every active lane below
         r.fill(v);
-        write_reg(w, op.dsts[e], m, r, op.ty.bits);
+        write_loaded(w, op.dsts[e], m, r, op.ty);
       }
       return;
     }
@@ -9740,28 +9744,32 @@ class Interpreter {
         for (size_t e = 0; e < n; ++e)
           results[e][lane] = load_routed(w, ctx, ins, lane, addr + e * size, size);
       }
-    // A signed narrow load sign-extends into the destination register: PTX says
-    // ld.s8 delivers the byte's value, not its bit pattern. Masking to the type
-    // width instead turns -1 into 255, and the cvt that follows reads the
-    // positive number -- which is how a quantized weight of -1 became +255 and
-    // corrupted every dequantized tensor while still looking like a plain copy.
-    for (size_t e = 0; e < n; ++e) {
-      const uint32_t dst_bits = op.dsts[e].wide ? 64u : 32u;
-      if (op.ty.is_signed() && op.ty.bits < dst_bits) {
-        Lanes ext = results[e];
-        const uint64_t sign_bit = 1ull << (op.ty.bits - 1);
-        const uint64_t value_mask = (sign_bit << 1) - 1;
-        for (uint32_t lane = 0; lane < W_; ++lane)
-          if (m & (Mask{1} << lane)) {
-            uint64_t v = ext[lane] & value_mask;
-            if (v & sign_bit) v |= ~value_mask;
-            ext[lane] = v;
-          }
-        write_reg(w, op.dsts[e], m, ext, dst_bits);
-      } else {
-        write_reg(w, op.dsts[e], m, results[e], op.ty.bits);
-      }
+    for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, results[e], op.ty);
+  }
+
+  // A signed narrow load sign-extends into the destination register: PTX says
+  // ld.s8 delivers the byte's value, not its bit pattern. Masking to the type
+  // width instead turns -1 into 255, and the cvt that follows reads the
+  // positive number -- which is how a quantized weight of -1 became +255 and
+  // corrupted every dequantized tensor while still looking like a plain copy.
+  // Parameters too: a kernel taking a signed char or short reads it with
+  // ld.param.s8 or .s16, and -128 arrived as 128.
+  void write_loaded(Warp& w, const Reg& dst, Mask m, const Lanes& vals, const Type& ty) {
+    const uint32_t dst_bits = dst.wide ? 64u : 32u;
+    if (!(ty.is_signed() && ty.bits < dst_bits)) {
+      write_reg(w, dst, m, vals, ty.bits);
+      return;
     }
+    Lanes ext = vals;
+    const uint64_t sign_bit = 1ull << (ty.bits - 1);
+    const uint64_t value_mask = (sign_bit << 1) - 1;
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) {
+        uint64_t v = ext[lane] & value_mask;
+        if (v & sign_bit) v |= ~value_mask;
+        ext[lane] = v;
+      }
+    write_reg(w, dst, m, ext, dst_bits);
   }
 
   void exec_st(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSt& op, Mask m) {
@@ -11300,6 +11308,24 @@ class Interpreter {
   // buffer: each lane passes its own arguments, so there is no single set of
   // bytes to read them from. The caller has already written its slots with
   // st.param; this binds them to the names the callee's body reads.
+  // Running off the end of a function is a return. nvcc emits kernels whose
+  // last block ends without one, after a call whose result nothing uses
+  // (Boost.Math's inverse Gaussian quantile), and a .func can end the same
+  // way; an RTX 3060 returns from both, the .func with its return value.
+  // Built by a plain function rather than a lambda: a lambda is implicitly
+  // constexpr, so g++-12 tried to evaluate the whole Instr variant at compile
+  // time for this static's initializer, and compiling this file took over
+  // 8 GB (GitHub's ubuntu-22.04 runners ran out of memory and died).
+  static Instr make_implicit_ret() {
+    Instr i;
+    i.op.emplace<OpRet>();
+    return i;
+  }
+  static const Instr& implicit_ret() {
+    static const Instr r = make_implicit_ret();
+    return r;
+  }
+
   void exec_user_call(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
     (void)ctx;
     const EntryFn& callee = *op.target;

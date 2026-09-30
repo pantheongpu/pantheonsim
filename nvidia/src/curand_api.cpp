@@ -208,3 +208,14 @@ VGPU_EXPORT curandStatus_t curandGenerateLogNormal(curandGenerator_t gen, float*
   store(out, h);
   return CURAND_STATUS_SUCCESS;
 }
+
+VGPU_EXPORT curandStatus_t curandGenerateLogNormalDouble(curandGenerator_t gen, double* out,
+                                                         size_t n, double mean, double stddev) {
+  curandStatus_t s = curandGenerateNormalDouble(gen, out, n, mean, stddev);
+  if (s != CURAND_STATUS_SUCCESS) return s;
+  std::vector<double> h(n);
+  cudaMemcpy(h.data(), out, n * sizeof(double), cudaMemcpyDeviceToHost);
+  for (auto& v : h) v = std::exp(v);
+  store(out, h);
+  return CURAND_STATUS_SUCCESS;
+}
