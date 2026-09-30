@@ -1,0 +1,105 @@
+# gfx1100 image instructions from HIP's texture and surface functions and hand-written image
+# instructions: the encoding and llvm-objdump's text. Written by amd/tools/isa-corpus.py.
+E0000000 80841400	buffer_load_format_x v20, v0, s[16:19], 0 idxen
+DC6A0000 0018000A	global_store_b32 v10, v0, s[24:25]
+F0300184 00020004	image_atomic_add v0, v[4:5], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+F0304184 00020004	image_atomic_add v0, v[4:5], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc
+F02C4384 00020004	image_atomic_cmpswap v[0:1], v[4:5], s[8:15] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm glc
+F0BC0204 10020004	image_gather4 v[0:3], v[4:5], s[8:15], s[16:19] dmask:0x2 dim:SQ_RSRC_IMG_2D
+F0C80104 1C040202	image_gather4_lz v[2:5], v[2:3], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_2D
+F05C0F84 00020004	image_get_resinfo v[0:3], v4, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+F0020384 00020004	image_load v0, v[4:5], s[8:15] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm d16
+F0000180 00010103	image_load v1, v3, s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_1D unorm
+F0000184 00011A2A	image_load v26, v[42:43], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+F0000189 00011C09 0000212B	image_load v28, [v9, v43, v33], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_3D unorm
+F0000380 00020001	image_load v[0:1], v1, s[8:15] dmask:0x3 dim:SQ_RSRC_IMG_1D unorm
+F0000F84 00020004	image_load v[0:3], v[4:5], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+F0040384 00020002	image_load_mip v[0:1], v[2:4], s[8:15] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm
+F06C0100 10020004	image_sample v0, v4, s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_1D
+F06C0F04 10020004	image_sample v[0:3], v[4:5], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
+F0780F04 10020004	image_sample_b v[0:3], v[4:6], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
+F0900104 10020004	image_sample_c_lz v0, v[4:6], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D
+F0700105 1C041D1C 011D1F1A	image_sample_d v29, [v28, v26, v31, v29, v[1:2]], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_2D
+F0700101 1C041E1C 0000011A	image_sample_d v30, [v28, v26, v1], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_1D
+F0700F04 10020004	image_sample_d v[0:3], v[4:9], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
+F0740104 1C041527	image_sample_l v21, v[39:41], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_2D
+F0740109 1C041827 00290828	image_sample_l v24, [v39, v40, v8, v41], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_3D
+F0740101 1C041B27 00000029	image_sample_l v27, [v39, v41], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_1D
+F0740F04 10020004	image_sample_l v[0:3], v[4:6], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
+F07C0108 1C041224	image_sample_lz v18, v[36:38], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_3D
+F07C0115 1C041324 00002925	image_sample_lz v19, [v36, v37, v41], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_2D_ARRAY
+F07C0111 1C041624 00000029	image_sample_lz v22, [v36, v41], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_1D_ARRAY
+F07C010C 1C041905	image_sample_lz v25, v[5:7], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_CUBE
+F07C0100 1C042224	image_sample_lz v34, v36, s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_1D
+F07C0F04 1C040624	image_sample_lz v[6:9], v[36:37], s[16:23], s[28:31] dmask:0xf dim:SQ_RSRC_IMG_2D
+F0180180 0001010F	image_store v1, v15, s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_1D unorm
+F0180184 00010208	image_store v2, v[8:9], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+F0180F84 00010105	image_store v[1:4], v[5:6], s[4:11] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+F01C0184 00010406	image_store_mip v4, v[6:8], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+81098109	s_add_i32 s9, s9, 1
+800AFF0A FFFFEE30	s_add_u32 s10, s10, 0xffffee30
+80080A08	s_add_u32 s8, s8, s10
+820BFF0B FFFFFFFF	s_addc_u32 s11, s11, -1
+82090B09	s_addc_u32 s9, s9, s11
+8B00007E	s_and_b32 s0, exec_lo, s0
+8B00FF1C 00008000	s_and_b32 s0, s28, 0x8000
+8B6A017E	s_and_b32 vcc_lo, exec_lo, s1
+916A017E	s_and_not1_b32 vcc_lo, exec_lo, s1
+86099F0C	s_ashr_i32 s9, s12, 31
+9309FF12 000E000E	s_bfe_u32 s9, s18, 0xe000e
+BF0C941E	s_bitcmp0_b32 s30, 20
+BF850001	s_clause 0x1
+BF068000	s_cmp_eq_u32 s0, 0
+BF108000	s_cmp_eq_u64 s[0:1], 0
+BF07840C	s_cmp_lg_u32 s12, 4
+BF118008	s_cmp_lg_u64 s[8:9], 0
+BF9F0000	s_code_end
+980280C1	s_cselect_b32 s2, -1, 0
+BF870009	s_delay_alu instid0(SALU_CYCLE_1)
+BF870499	s_delay_alu instid0(SALU_CYCLE_1) | instskip(NEXT) | instid1(SALU_CYCLE_1)
+BFB00000	s_endpgm
+BE8A4700	s_getpc_b64 s[10:11]
+F4080600 F8000000	s_load_b128 s[24:27], s[0:1], null
+F408070D F8000030	s_load_b128 s[28:31], s[26:27], 0x30
+F40C040D F8000000	s_load_b256 s[16:23], s[26:27], null
+F40000CD F8000030	s_load_b32 s3, s[26:27], 0x30
+F4000204 F8000000	s_load_b32 s8, s[8:9], null
+F4040180 F8000010	s_load_b64 s[6:7], s[0:1], 0x10
+84880D81	s_lshl_b64 s[8:9], 1, s13
+84888208	s_lshl_b64 s[8:9], s[8:9], 2
+BE810080	s_mov_b32 s1, 0
+BE88000C	s_mov_b32 s8, s12
+BEEA0000	s_mov_b32 vcc_lo, s0
+BF89FC07	s_waitcnt lgkmcnt(0)
+BF8903F7	s_waitcnt vmcnt(0)
+06044480	v_add_f32_e32 v2, 0, v34
+06042F02	v_add_f32_e32 v2, v2, v23
+D44D0001 00020481	v_cmp_ne_u32_e64 s1, 1, v2
+D5010001 000A2927	v_cndmask_b32_e64 v1, v39, v20, s2
+D5010011 001604F2	v_cndmask_b32_e64 v17, 1.0, v2, s5
+D5010002 00290280	v_cndmask_b32_e64 v2, 0, 1, s10
+D60C0007 03FE5127 3E800000	v_cubeid_f32 v7, v39, v40, 0x3e800000
+D60F0017 03FE5127 3E800000	v_cubema_f32 v23, v39, v40, 0x3e800000
+D60D0014 03FE5127 3E800000	v_cubesc_f32 v20, v39, v40, 0x3e800000
+D60E0012 03FE5127 3E800000	v_cubetc_f32 v18, v39, v40, 0x3e800000
+7E0A0B0C	v_cvt_f32_i32_e32 v5, v12
+7E0C0D00	v_cvt_f32_u32_e32 v6, v0
+7E062306	v_cvt_f32_ubyte0_e32 v3, v6
+C9101307 0208000F	v_dual_add_f32 v2, v7, v9 :: v_dual_mov_b32 v9, s15
+C9080CF0 27280EF0	v_dual_add_f32 v39, 0.5, v6 :: v_dual_add_f32 v40, 0.5, v7
+C9220B04 04040084	v_dual_add_f32 v4, v4, v5 :: v_dual_lshlrev_b32 v5, 4, v0
+CA1000FF 1C2A000F 3DCCCCCD	v_dual_mov_b32 v28, 0x3dcccccd :: v_dual_mov_b32 v43, s15
+CA0600FF 08122327 3E800000	v_dual_mov_b32 v8, 0x3e800000 :: v_dual_mul_f32 v19, v39, v17
+C8D01D0D 101C00FF 3ECCCCCD	v_dual_mul_f32 v16, v13, v14 :: v_dual_mov_b32 v29, 0x3ecccccd
+C8C62127 16141F28	v_dual_mul_f32 v22, v39, v16 :: v_dual_mul_f32 v21, v40, v15
+7E344913	v_floor_f32_e32 v26, v19
+D6130006 03C22B12	v_fma_f32 v6, v18, v21, 0.5
+30140082	v_lshlrev_b32_e32 v10, 2, v0
+32021690	v_lshrrev_b32_e32 v1, 16, v11
+32021408	v_lshrrev_b32_e32 v1, s8, v10
+7E5202F2	v_mov_b32_e32 v41, 1.0
+7E0C020F	v_mov_b32_e32 v6, s15
+10282528	v_mul_f32_e32 v20, v40, v18
+102E1CFF 3E800000	v_mul_f32_e32 v23, 0x3e800000, v14
+161614FF 00005556	v_mul_u32_u24_e32 v11, 0x5556, v10
+7E185511	v_rcp_f32_e32 v12, v17

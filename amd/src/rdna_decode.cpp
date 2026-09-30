@@ -46,21 +46,45 @@ struct Row {
 };
 
 const std::vector<Row>& rows_rdna3() {
-  static const std::vector<Row> rows = {
+  // The ordinary instructions, then the image ones (rdna_images_rdna3.inc).
+  static const std::vector<Row> rows = [] {
+    std::vector<Row> v = {
 #include "rdna_ops_rdna3.inc"
-  };
+    };
+    const std::vector<Row> images = {
+#include "rdna_images_rdna3.inc"
+    };
+    v.insert(v.end(), images.begin(), images.end());
+    return v;
+  }();
   return rows;
 }
 const std::vector<Row>& rows_rdna2() {
-  static const std::vector<Row> rows = {
+  // The ordinary instructions, then the image ones (rdna_images_rdna2.inc).
+  static const std::vector<Row> rows = [] {
+    std::vector<Row> v = {
 #include "rdna_ops_rdna2.inc"
-  };
+    };
+    const std::vector<Row> images = {
+#include "rdna_images_rdna2.inc"
+    };
+    v.insert(v.end(), images.begin(), images.end());
+    return v;
+  }();
   return rows;
 }
 const std::vector<Row>& rows_rdna4() {
-  static const std::vector<Row> rows = {
+  // The ordinary instructions, then the image ones (rdna_images_rdna4.inc).
+  static const std::vector<Row> rows = [] {
+    std::vector<Row> v = {
 #include "rdna_ops_rdna4.inc"
-  };
+    };
+    const std::vector<Row> images = {
+#include "rdna_images_rdna4.inc"
+    };
+    v.insert(v.end(), images.begin(), images.end());
+    return v;
+  }();
   return rows;
 }
 
@@ -287,6 +311,157 @@ bool two_addr(const std::string& name) {
 
 }  // namespace
 
+namespace {
+
+// How many 32-bit address registers an image instruction takes: its
+// coordinates by DIM, what its name adds (a mip level, a LOD, a bias, a
+// depth to compare with, an offset, derivatives, a LOD clamp), and with a16
+// the coordinates, LOD and clamp packed two to a register (the derivatives
+// too, a dimension's pair to a register). Throws for the ray-tracing ones.
+uint32_t image_address_words(const std::string& name, uint32_t dim, bool a16) {
+  static const uint32_t kCoords[8] = {1, 2, 3, 3, 2, 3, 3, 4};   // 1D 2D 3D CUBE 1D_ARR 2D_ARR MSAA MSAA_ARR
+  static const uint32_t kGradDims[8] = {1, 2, 3, 2, 1, 2, 2, 2};
+  const uint32_t coords = kCoords[dim & 7];
+  const auto has = [&](const char* part) {   // "_l" matches "_l" and "_l_o", not "_lz"
+    const std::string p(part);
+    for (size_t at = name.find(p); at != std::string::npos; at = name.find(p, at + 1)) {
+      const size_t end = at + p.size();
+      if (end == name.size() || name[end] == '_') return true;
+    }
+    return false;
+  };
+  const auto packed = [&](uint32_t n) { return a16 ? (n + 1) / 2 : n; };
+  if (name.find("bvh") != std::string::npos)
+    throw Error::make(Err::Unsupported, name, ": ray-tracing image instructions are not decoded yet");
+  if (name == "image_get_resinfo") return 1;
+  if (name.rfind("image_load", 0) == 0 || name.rfind("image_store", 0) == 0 || name.rfind("image_atomic", 0) == 0 ||
+      name == "image_msaa_load")
+    return packed(coords + (name.find("_mip") != std::string::npos ? 1 : 0));
+  // image_sample*, image_gather4*, image_get_lod.
+  uint32_t n = 0;
+  if (has("_o")) n += 1;   // the offsets, one register
+  if (has("_b")) n += 1;   // the bias
+  if (has("_c")) n += 1;   // the depth to compare with
+  if (has("_d")) {
+    const uint32_t g = kGradDims[dim & 7];
+    const bool g16 = a16 || has("_g16");
+    n += g16 ? 2 * ((g + 1) / 2) : 2 * g;
+  }
+  return n + packed(coords + (has("_l") ? 1 : 0) + (has("_cl") ? 1 : 0));
+}
+
+// The image instructions: gfx10's and gfx11's MIMG, 64 bits and, with NSA,
+// the extra address registers after it; RDNA4's VIMAGE and VSAMPLE, 96 bits.
+// The name comes from the table; everything else from the fields.
+Inst decode_image(const std::vector<uint8_t>& code, uint64_t at, Inst in) {
+  const bool r4 = g_rdna4, r2 = g_rdna2;
+  const uint32_t w0 = word(code, at), w1 = word(code, at + 4);
+  in.enc = Enc::Mimg;
+  in.size = 8;
+  uint8_t segment = 0;
+  uint32_t vdata = 0, rsrc = 0, samp = 0;
+  std::vector<uint32_t> addr;   // the address fields, first to last
+  uint32_t fields = 0;          // how many there are to name registers in
+  if (r4) {
+    const uint32_t w2 = word(code, at + 8);
+    in.size = 12;
+    segment = (w0 >> 26) == 0x39 ? 1 : 0;   // VSAMPLE : VIMAGE
+    in.opcode = bits(w0, 21, 14);
+    in.dim = static_cast<uint8_t>(bits(w0, 2, 0));
+    in.r128 = bits(w0, 4, 4);
+    in.d16 = bits(w0, 5, 5);
+    in.a16 = bits(w0, 6, 6);
+    in.dmask = static_cast<uint8_t>(bits(w0, 25, 22));
+    vdata = bits(w1, 7, 0);
+    rsrc = bits(w1, 17, 9);
+    in.cache = bits(w1, 22, 20) | bits(w1, 19, 18) << 3;   // TH, SCOPE
+    in.gfx12_cache = true;
+    for (uint32_t k = 0; k < 4; ++k) addr.push_back((w2 >> (8 * k)) & 0xFF);
+    if (segment == 1) {
+      in.tfe = bits(w0, 3, 3);
+      in.unorm = bits(w0, 13, 13);
+      in.lwe = bits(w1, 8, 8);
+      samp = bits(w1, 31, 23);
+      fields = 4;
+    } else {
+      in.tfe = bits(w1, 23, 23);
+      addr.push_back(bits(w1, 31, 24));
+      fields = 5;
+    }
+    in.nsa = true;
+  } else {
+    const uint64_t w = w0 | static_cast<uint64_t>(w1) << 32;
+    uint32_t nsa_words = 0;
+    if (r2) {
+      nsa_words = bits(w, 2, 1);
+      in.dim = static_cast<uint8_t>(bits(w, 5, 3));
+      in.cache = bits(w, 13, 13) | bits(w, 25, 25) << 1 | bits(w, 7, 7) << 2;   // glc, slc, dlc
+      in.unorm = bits(w, 12, 12);
+      in.tfe = bits(w, 16, 16);
+      in.lwe = bits(w, 17, 17);
+      in.opcode = bits(w, 24, 18) | bits(w, 0, 0) << 7;   // the opcode's top bit is bit 0
+      in.a16 = bits(w, 62, 62);
+      in.d16 = bits(w, 63, 63);
+      samp = bits(w, 57, 53) << 2;
+    } else {
+      nsa_words = bits(w, 0, 0);
+      in.dim = static_cast<uint8_t>(bits(w, 4, 2));
+      in.unorm = bits(w, 7, 7);
+      in.cache = bits(w, 14, 14) | bits(w, 12, 12) << 1 | bits(w, 13, 13) << 2;   // glc, slc, dlc
+      in.a16 = bits(w, 16, 16);
+      in.d16 = bits(w, 17, 17);
+      in.opcode = bits(w, 25, 18);
+      in.tfe = bits(w, 53, 53);
+      in.lwe = bits(w, 54, 54);
+      samp = bits(w, 62, 58) << 2;
+    }
+    in.dmask = static_cast<uint8_t>(bits(w, 11, 8));
+    in.r128 = bits(w, 15, 15);
+    vdata = bits(w, 47, 40);
+    rsrc = bits(w, 52, 48) << 2;
+    addr.push_back(bits(w, 39, 32));
+    in.nsa = nsa_words != 0;
+    for (uint32_t k = 0; k < nsa_words; ++k) {
+      const uint32_t extra = word(code, at + 8 + 4 * k);
+      for (uint32_t b = 0; b < 4; ++b) addr.push_back((extra >> (8 * b)) & 0xFF);
+    }
+    in.size = 8 + 4 * nsa_words;
+    fields = in.nsa ? static_cast<uint32_t>(addr.size()) : 1;
+  }
+  const Row& r = row(Enc::Mimg, segment, in.opcode);
+  in.name = r.name;
+  const std::string& name = in.name;
+  const bool sample = name.find("sample") != std::string::npos || name.find("gather4") != std::string::npos ||
+                      name == "image_get_lod";
+  const bool store = name.rfind("image_store", 0) == 0;
+  const bool atomic = name.rfind("image_atomic", 0) == 0;
+  const bool returns = !store && (!atomic || (r4 ? (in.cache & 1) : (in.cache & 1)));
+  // The data: a register per channel DMASK names (a gather4 always four),
+  // two 16-bit channels to one with d16, and a word more for tfe or lwe.
+  uint32_t channels = name.find("gather4") != std::string::npos ? 4 : std::max(1, __builtin_popcount(in.dmask));
+  if (in.d16) channels = (channels + 1) / 2;
+  if (in.tfe || in.lwe) channels += 1;
+  in.src.push_back(operand(256 + vdata, channels));
+  if (returns) in.dst.push_back(operand(256 + vdata, channels));
+  // The addresses: a range from the one field, or a register a field (the
+  // last taking what the others leave, as a range).
+  const uint32_t words = image_address_words(name, in.dim, in.a16);
+  if (!in.nsa) {
+    in.src.push_back(operand(256 + addr[0], words));
+  } else {
+    const uint32_t named = std::min(words, fields);
+    for (uint32_t k = 0; k < named; ++k) {
+      const uint32_t width = k + 1 == named ? words - (named - 1) : 1;
+      in.src.push_back(operand(256 + addr[k], width));
+    }
+  }
+  in.src.push_back(operand(rsrc, in.r128 ? 4 : 8));
+  if (sample) in.src.push_back(operand(samp, 4));
+  return in;
+}
+
+}  // namespace
+
 Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64) {
   const Generation generation(target);
   const bool r4 = g_rdna4, r2 = g_rdna2;
@@ -316,6 +491,10 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     in.name = "v_illegal";
     return in;
   }
+  // An image instruction: MIMG on gfx10 and gfx11; VIMAGE and VSAMPLE on
+  // RDNA4.
+  if ((!r4 && (w0 >> 26) == 0x3c) || (r4 && ((w0 >> 26) == 0x34 || (w0 >> 26) == 0x39)))
+    return decode_image(code, at, in);
   if ((w0 >> 23) == 0x17d) {
     in.enc = Enc::Sop1;
     in.opcode = bits(w0, 15, 8);
@@ -988,6 +1167,45 @@ std::string gfx12_cache(const std::string& name, uint32_t cache) {
   return s + kScope[scope];
 }
 
+// An image instruction as llvm-objdump writes it: the data, the addresses
+// (a range, or a list where the encoding names them one by one; RDNA4 lists
+// more than one always), the resource, the sampler, then DMASK, DIM and the
+// modifiers.
+std::string image_text(const Inst& i) {
+  static const char* kDim[8] = {"1D", "2D", "3D", "CUBE", "1D_ARRAY", "2D_ARRAY", "2D_MSAA", "2D_MSAA_ARRAY"};
+  const bool sample = i.name.find("sample") != std::string::npos || i.name.find("gather4") != std::string::npos ||
+                      i.name == "image_get_lod";
+  const size_t addrs = i.src.size() - (sample ? 3 : 2);
+  std::string s = i.name + " " + reg_text(i.src[0]) + ", ";
+  if (addrs == 1 && (!i.nsa || g_rdna4)) {
+    s += reg_text(i.src[1]);
+  } else {
+    s += "[";
+    for (size_t k = 1; k <= addrs; ++k) s += (k > 1 ? ", " : "") + reg_text(i.src[k]);
+    s += "]";
+  }
+  s += ", " + reg_text(i.src[1 + addrs]);
+  if (sample) s += ", " + reg_text(i.src[2 + addrs]);
+  char b[32];
+  std::snprintf(b, sizeof b, " dmask:0x%x", i.dmask);
+  s += b;
+  s += std::string(" dim:SQ_RSRC_IMG_") + kDim[i.dim & 7];
+  if (i.unorm) s += " unorm";
+  if (i.gfx12_cache) {
+    s += gfx12_cache(i.name, i.cache);
+  } else {
+    if (i.cache & 1) s += " glc";
+    if (i.cache & 2) s += " slc";
+    if (i.cache & 4) s += " dlc";
+  }
+  if (i.r128) s += " r128";
+  if (i.a16) s += " a16";
+  if (i.tfe) s += " tfe";
+  if (i.lwe) s += " lwe";
+  if (i.d16) s += " d16";
+  return s;
+}
+
 std::string one(const Inst& i) {
   const std::string& name = i.asm_name.empty() ? i.name : i.asm_name;
   std::string s = name;
@@ -1204,6 +1422,7 @@ std::string one(const Inst& i) {
 std::string to_text(const Inst& i) {
   const Generation generation(i.arch);
   if (i.enc == Enc::Vopd && i.dual.size() == 2) return one(i.dual[0]) + " :: " + one(i.dual[1]);
+  if (i.enc == Enc::Mimg) return image_text(i);
   return one(i);
 }
 
