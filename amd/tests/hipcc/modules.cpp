@@ -118,6 +118,24 @@ int main(int argc, char** argv) {
     EXPECT(hipLibraryUnload(nullptr), hipErrorInvalidValue, "an unload of no library");
   }
 
+  // Arguments packed in extra: the kernel's own come from the buffer, as
+  // many as it takes, whatever the size beside it says -- hip-tests' RTC
+  // reduce passes an int there, and a size too small for its arguments.
+  {
+    std::vector<int> fives(n, 5);
+    (void)hipMemcpy(d, fives.data(), n * sizeof(int), hipMemcpyHostToDevice);
+    struct {
+      int* p;
+      int n;
+    } packed{d, n};
+    int size = 4;
+    void* extra[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &packed, HIP_LAUNCH_PARAM_BUFFER_SIZE, &size, HIP_LAUNCH_PARAM_END};
+    EXPECT(hipModuleLaunchKernel(f, n / 64, 1, 1, 64, 1, 1, 0, nullptr, nullptr, extra), hipSuccess,
+           "a launch with its arguments in extra, beside an int's size");
+    (void)hipMemcpy(fives.data(), d, n * sizeof(int), hipMemcpyDeviceToHost);
+    check(fives[0] == 35 && fives[n - 1] == 35, "and the kernel has all its arguments", std::to_string(fives[0]));
+  }
+
   hipDeviceptr_t global = nullptr;
   size_t bytes = 0;
   EXPECT(hipModuleGetGlobal(&global, &bytes, m, "int_var"), hipSuccess, "its global is found");
