@@ -1188,6 +1188,7 @@ bool known_gfx9_name(const std::string& name) { return gfx9_opcode(name) >= 0; }
 
 const char* enc_name(Enc e) {
   switch (e) {
+    case Enc::Mimg: return "MIMG";
     case Enc::Sop1: return "SOP1";
     case Enc::Sop2: return "SOP2";
     case Enc::Sopk: return "SOPK";

@@ -123,7 +123,8 @@ VTEST(every_instruction_decodes_as_the_assembler_wrote_it) {
 namespace {
 // Decodes every instruction of a corpus (amd/tools/isa-corpus.py) and
 // compares it with llvm-objdump's text for it.
-void check_corpus(const std::string& file, amd::gcn::Target target = amd::gcn::Target::Gfx942) {
+// `at_least`: how many lines the corpus must have, so an emptied one fails.
+void check_corpus(const std::string& file, amd::gcn::Target target = amd::gcn::Target::Gfx942, size_t at_least = 1000) {
   const std::vector<std::string> corpus = lines(read(file, false));
   size_t checked = 0;
   std::string wrong;
@@ -147,7 +148,7 @@ void check_corpus(const std::string& file, amd::gcn::Target target = amd::gcn::T
     ++checked;
     if (got != want && wrong_count++ < 40) wrong += "\n  want \"" + want + "\"\n  got  \"" + got + "\"";
   }
-  VCHECK(checked > 1000);
+  VCHECK(checked > at_least);
   if (wrong_count)
     throw vtest::Failure(std::to_string(wrong_count) + " of " + std::to_string(checked) + " differ:" + wrong);
 }
@@ -179,6 +180,16 @@ VTEST(every_gfx1100_instruction_shape_decodes_as_llvm_prints_it) {
 // cache policy.
 VTEST(every_gfx1201_instruction_shape_decodes_as_llvm_prints_it) {
   check_corpus("isa_corpus_gfx1201.txt", amd::gcn::Target::Gfx1200);
+}
+
+// RDNA's image instructions (MIMG; RDNA4's VIMAGE and VSAMPLE): what HIP's
+// texture and surface functions compile to, and hand-written forms beside
+// them (NSA addresses, d16, a16, tfe, arrays, cubes, atomics), each decoded
+// and printed as llvm-objdump prints it.
+VTEST(every_rdna_image_instruction_shape_decodes_as_llvm_prints_it) {
+  check_corpus("isa_corpus_images_gfx1030.txt", amd::gcn::Target::Gfx1030, 40);
+  check_corpus("isa_corpus_images_gfx1100.txt", amd::gcn::Target::Gfx1100, 40);
+  check_corpus("isa_corpus_images_gfx1201.txt", amd::gcn::Target::Gfx1200, 40);
 }
 
 // And gfx1030 (RDNA2): gfx9's names, gfx10's memory bits, M0 and null the

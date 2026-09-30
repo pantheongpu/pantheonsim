@@ -21,7 +21,7 @@ namespace vgpu::amd::gcn {
 // The encodings, by the ISA's names for them.
 // Mtbuf and Vopd are RDNA's: a typed buffer access, and VOPD, two vector
 // instructions issued as one.
-enum class Enc { Sop1, Sop2, Sopk, Sopc, Sopp, Smem, Vop1, Vop2, Vop3, Vop3p, Vopc, Ds, Flat, Mubuf, Mtbuf, Vopd, Unknown };
+enum class Enc { Sop1, Sop2, Sopk, Sopc, Sopp, Smem, Vop1, Vop2, Vop3, Vop3p, Vopc, Ds, Flat, Mubuf, Mtbuf, Vopd, Mimg, Unknown };
 const char* enc_name(Enc e);
 
 // Where an operand lives. The ISA numbers scalar registers, vector registers
@@ -177,6 +177,18 @@ struct Inst {
   uint8_t printed_op_sel = 0;  // RDNA VOP3: the op_sel the assembler writes (gfx11 folds 16-bit halves into v1.h)
   bool gds = false;
   uint32_t format = 0;
+  // RDNA's image instructions (MIMG; RDNA4's VIMAGE and VSAMPLE): which of
+  // the four channels move (DMASK), the resource's shape (DIM: 1D, 2D, 3D,
+  // CUBE, 1D_ARRAY, 2D_ARRAY, 2D_MSAA, 2D_MSAA_ARRAY), and the modifiers:
+  // unnormalized coordinates, 16-bit addresses (a16) and data (d16), a
+  // texture-fail word after the data (tfe, lwe), a 128-bit resource (r128).
+  // nsa: the addresses are registers named one by one (src[1..]) rather than
+  // a range. The operands: src[0] the data (what a store or an atomic writes,
+  // and where a load's lands), then each address, then the resource and,
+  // for a sample, the sampler; dst[0] the data, when the instruction returns
+  // any.
+  uint8_t dmask = 0, dim = 0;
+  bool unorm = false, a16 = false, d16 = false, tfe = false, lwe = false, r128 = false, nsa = false;
   std::vector<Inst> dual;
   // For the performance counters: what the instruction counts as, and a
   // matrix instruction's work in units of 512 floating-point (or integer)
