@@ -58,6 +58,15 @@ int main() {
   CK(cuCtxCreate(&ctx, 0, dev));
 #endif
 
+  // What a caller checks before it uses any of this (CUDA's vectorAddMMAP
+  // sample among them); an RTX 3060 answers 1.
+  int vmm = 0;
+  CK(cuDeviceGetAttribute(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, dev));
+  if (vmm != 1) {
+    printf("FAIL VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED is %d\n", vmm);
+    return 1;
+  }
+
   CUmemAllocationProp prop{};
   prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
   prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;

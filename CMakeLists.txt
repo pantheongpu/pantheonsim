@@ -1225,10 +1225,10 @@ if(TARGET vgpucublas)
       TIMEOUT 300)
   endforeach()
 
-  # Runtime entry points CUDA's samples reach for, checked against what an
-  # RTX 3060 answers (runtime_gaps.cu). On two devices, so that peer copies
-  # have a peer.
-  foreach(_check IN ITEMS "runtime_gaps:cudart")
+  # Driver and runtime entry points CUDA's samples reach for, checked against
+  # what an RTX 3060 answers (driver_gaps.cpp, runtime_gaps.cu). On two
+  # devices, so that peer access and peer copies have a peer.
+  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
