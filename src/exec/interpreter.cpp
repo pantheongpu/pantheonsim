@@ -11312,12 +11312,17 @@ class Interpreter {
   // last block ends without one, after a call whose result nothing uses
   // (Boost.Math's inverse Gaussian quantile), and a .func can end the same
   // way; an RTX 3060 returns from both, the .func with its return value.
+  // Built by a plain function rather than a lambda: a lambda is implicitly
+  // constexpr, so g++-12 tried to evaluate the whole Instr variant at compile
+  // time for this static's initializer, and compiling this file took over
+  // 8 GB (GitHub's ubuntu-22.04 runners ran out of memory and died).
+  static Instr make_implicit_ret() {
+    Instr i;
+    i.op.emplace<OpRet>();
+    return i;
+  }
   static const Instr& implicit_ret() {
-    static const Instr r = [] {
-      Instr i;
-      i.op = OpRet{};
-      return i;
-    }();
+    static const Instr r = make_implicit_ret();
     return r;
   }
 
