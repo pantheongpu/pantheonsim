@@ -2165,9 +2165,13 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   props->canMapHostMemory = 1;
   props->managedMemory = 1;
   // Managed memory is host memory every device reaches at once: the host and
-  // the devices may use it at the same time, and the host directly.
+  // the devices may use it at the same time.
   props->concurrentManagedAccess = 1;
-  props->directManagedMemAccessFromHost = 1;
+  // But these are discrete GPUs: the host reaching device memory directly is
+  // an APU's property (ROCm's HIP sets it from the agent's direct host
+  // access), and RCCL, seeing it, allocates its host-visible flags as
+  // uncached device memory and zeroes them from the CPU.
+  props->directManagedMemAccessFromHost = 0;
   props->hostRegisterSupported = 1;
   props->memoryPoolsSupported = 1;
   props->ECCEnabled = p.telemetry.ecc ? 1 : 0;
@@ -4818,8 +4822,28 @@ hipError_t hipMemImportFromShareableHandle(void**, void*, int) {
 // address, and the other process maps that file: both then reach the same
 // bytes (vgpu/memory.hpp's share and adopt).
 
+}  // extern "C"
+namespace {
+// Sharing moves an allocation's bytes into a file at the same address. Work
+// still queued on its device has to finish first -- a hipMemset of device
+// memory returns before it runs, as ROCm's does -- or it would write memory
+// that has moved. Called without the state lock, which the queues take.
+void settle_before_sharing(const void* ptr) {
+  State& s = state();
+  int d = -1;
+  {
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!s.rt || !ptr) return;
+    d = owner_of(s, reinterpret_cast<uint64_t>(ptr));
+  }
+  if (d >= 0) (void)drain_device(d);
+}
+}  // namespace
+extern "C" {
+
 hipError_t hipIpcGetMemHandle(vgpu::amd::abi::IpcMemHandle* handle, void* ptr) {
   const ApiCall api("hipIpcGetMemHandle");
+  settle_before_sharing(ptr);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!handle || !ptr) return record(s, hipErrorInvalidValue);
@@ -4941,6 +4965,7 @@ hipError_t hipMemPoolImportFromShareableHandle(void** pool, void* handle, int ty
 }
 hipError_t hipMemPoolExportPointer(void* data, void* ptr) {
   const ApiCall api("hipMemPoolExportPointer");
+  settle_before_sharing(ptr);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!data || !ptr) return record(s, hipErrorInvalidValue);

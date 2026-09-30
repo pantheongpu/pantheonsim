@@ -316,6 +316,32 @@ int main() {
          "a high-water mark is set back to zero, or not at all");
   (void)hipGetLastError();
 
+  // A fill still queued when the memory is shared: hipMemset of device
+  // memory returns before it runs, and sharing moves the bytes into a file,
+  // so the handle waits for the fill and the shared memory holds it.
+  {
+    void* buf = nullptr;
+    const size_t n = 1 << 20;
+    (void)hipMalloc(&buf, n);
+    (void)hipMemset(buf, 0x5a, n);
+    hipIpcMemHandle_t h;
+    const hipError_t e = hipIpcGetMemHandle(&h, buf);
+    std::vector<unsigned char> back(n, 0);
+    (void)hipMemcpy(back.data(), buf, n, hipMemcpyDeviceToHost);
+    size_t wrong = 0;
+    for (unsigned char b : back) wrong += b != 0x5a;
+    check(e == hipSuccess && wrong == 0, "a fill queued before sharing lands in the shared memory",
+          std::to_string(e) + ", " + std::to_string(wrong) + " bytes wrong");
+    (void)hipFree(buf);
+  }
+
+  // A discrete GPU's memory is not the host's to touch directly: RCCL reads
+  // this attribute to choose between pinned host memory and uncached device
+  // memory it then writes from the CPU (an APU's layout).
+  int direct = -1;
+  (void)hipDeviceGetAttribute(&direct, hipDeviceAttributeDirectManagedMemAccessFromHost, 0);
+  check(direct == 0, "a discrete GPU does not give the host direct access to its memory", std::to_string(direct));
+
   std::printf("memory: %d checks, %d failed\n", checks, failures);
   return failures ? 1 : 0;
 }
