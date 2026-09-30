@@ -131,6 +131,7 @@ add_library(vgpu STATIC
   amd/src/rdna_decode.cpp
   amd/src/debugger.cpp
   amd/src/gcn_exec.cpp
+  amd/src/image.cpp
   amd/src/hostcall.cpp
   src/core/machine.cpp
   # Each vendor's part of the register model and its driver files.

@@ -1,4 +1,5 @@
 #include "vgpu/amd_exec.hpp"
+#include "vgpu/amd_image.hpp"
 
 #include <cfenv>
 #include <chrono>
@@ -3923,6 +3924,391 @@ struct Machine {
     }
   }
 
+  // ---- RDNA's image instructions --------------------------------------------------
+  //
+  // An image resource (T#, eight scalar registers) says where the texels are,
+  // how they are laid out and what format they have; a sampler (S#, four)
+  // says how a sample filters them and what a coordinate past an edge does
+  // (vgpu/amd_image.hpp). Loads, stores and atomics take whole texel
+  // coordinates; samples and gathers take them normalized to 0..1 (or in
+  // texels, where the instruction or the sampler says unnormalized) and
+  // filter, choosing the level by the LOD the instruction gives or works out.
+
+  // One texel's four results, the resource's DST_SEL applied; `border`
+  // where the coordinate fell outside and the sampler said to use its color.
+  void fetch_texel(const image::Image& img, uint32_t level, int64_t x, int64_t y, int64_t z, uint32_t out[4]) {
+    uint8_t bytes[16] = {};
+    const uint32_t n = image::texel_bytes(img.format);
+    const uint64_t addr = img.base + image::texel_offset(img, level, static_cast<uint32_t>(x), static_cast<uint32_t>(y),
+                                                        static_cast<uint32_t>(z));
+    at(addr).read(addr, bytes, n);
+    uint32_t raw[4];
+    image::read_texel(img.format, bytes, raw);
+    const bool ints = image::integer(img.format);
+    for (int k = 0; k < 4; ++k) {
+      switch (img.sel[k]) {
+        case image::Sel::Zero: out[k] = 0; break;
+        case image::Sel::One: out[k] = ints ? 1 : as_bits(1.0f); break;
+        case image::Sel::X: out[k] = raw[0]; break;
+        case image::Sel::Y: out[k] = raw[1]; break;
+        case image::Sel::Z: out[k] = raw[2]; break;
+        default: out[k] = raw[3]; break;
+      }
+    }
+  }
+  // Where an index along an axis of `n` texels lands, the sampler's mode for
+  // that axis applied; false where it is the border.
+  static bool wrap_index(image::Clamp mode, int64_t n, int64_t* i) {
+    int64_t v = *i;
+    switch (mode) {
+      case image::Clamp::Wrap: v = ((v % n) + n) % n; break;
+      case image::Clamp::Mirror: {
+        const int64_t p = ((v % (2 * n)) + 2 * n) % (2 * n);
+        v = p < n ? p : 2 * n - 1 - p;
+        break;
+      }
+      case image::Clamp::ClampLastTexel: v = std::clamp<int64_t>(v, 0, n - 1); break;
+      case image::Clamp::MirrorOnceLastTexel: v = std::clamp<int64_t>(v < 0 ? -v - 1 : v, 0, n - 1); break;
+      case image::Clamp::ClampHalfBorder:
+      case image::Clamp::ClampBorder:
+        if (v < 0 || v >= n) return false;
+        break;
+      default:   // the mirror-once modes to the border
+        v = v < 0 ? -v - 1 : v;
+        if (v >= n) return false;
+        break;
+    }
+    *i = v;
+    return true;
+  }
+  void border_color(const image::Image& img, const image::Sampler& smp, uint32_t out[4]) {
+    const bool ints = image::integer(img.format);
+    const uint32_t one = ints ? 1 : as_bits(1.0f);
+    out[0] = out[1] = out[2] = smp.border == 2 ? one : 0;
+    out[3] = smp.border == 0 ? 0 : one;
+  }
+  // A texel through the sampler: its index along each axis wrapped, or the
+  // border color.
+  void sampled_texel(const image::Image& img, const image::Sampler& smp, uint32_t level, int64_t x, int64_t y,
+                     int64_t z, uint32_t dims, uint32_t out[4]) {
+    const int64_t n[3] = {image::level_width(img, level), image::level_height(img, level),
+                          image::level_depth(img, level)};
+    int64_t c[3] = {x, y, z};
+    for (uint32_t k = 0; k < dims; ++k)
+      if (!wrap_index(smp.clamp[k], n[k], &c[k])) return border_color(img, smp, out);
+    fetch_texel(img, level, c[0], c[1], c[2], out);
+  }
+  // A sample at one level: `u`, `v`, `r` in texels (a coordinate a dimension
+  // does not have is 0), `slice` the array layer. Point sampling reads the
+  // texel the point is in; bilinear the two, four or eight around it,
+  // weighted by how near each is.
+  void sample_level(const image::Image& img, const image::Sampler& smp, uint32_t level, double u, double v, double r,
+                    int64_t slice, uint32_t dims, bool linear, uint32_t out[4]) {
+    const bool ints = image::integer(img.format);
+    if (!linear || ints) {
+      const int64_t x = static_cast<int64_t>(std::floor(u)), y = dims > 1 ? static_cast<int64_t>(std::floor(v)) : 0;
+      const int64_t z = dims > 2 ? static_cast<int64_t>(std::floor(r)) : slice;
+      return sampled_texel(img, smp, level, x, y, z, dims, out);
+    }
+    const double fu = u - 0.5, fv = v - 0.5, fr = r - 0.5;
+    const int64_t x0 = static_cast<int64_t>(std::floor(fu)), y0 = static_cast<int64_t>(std::floor(fv)),
+                  z0 = static_cast<int64_t>(std::floor(fr));
+    const double a = fu - x0, b = fv - y0, c = fr - z0;
+    double acc[4] = {0, 0, 0, 0};
+    for (uint32_t corner = 0; corner < (1u << dims); ++corner) {
+      const uint32_t dx = corner & 1, dy = (corner >> 1) & 1, dz = (corner >> 2) & 1;
+      double weight = dx ? a : 1 - a;
+      if (dims > 1) weight *= dy ? b : 1 - b;
+      if (dims > 2) weight *= dz ? c : 1 - c;
+      if (weight == 0) continue;
+      uint32_t t[4];
+      sampled_texel(img, smp, level, x0 + dx, dims > 1 ? y0 + dy : 0, dims > 2 ? z0 + dz : slice, dims, t);
+      for (int k = 0; k < 4; ++k) acc[k] += weight * as_float(t[k]);
+    }
+    for (int k = 0; k < 4; ++k) out[k] = as_bits(static_cast<float>(acc[k]));
+  }
+
+  void image_access(Wave& w, const Inst& in) {
+    if (!w.exec) return;
+    const std::string& name = in.name;
+    const bool gather = name.find("gather4") != std::string::npos;
+    const bool sample = gather || name.find("sample") != std::string::npos || name == "image_get_lod";
+    const bool store = name.rfind("image_store", 0) == 0;
+    const bool atomic = name.rfind("image_atomic", 0) == 0;
+    const bool resinfo = name == "image_get_resinfo";
+    const size_t naddr = in.src.size() - (sample ? 3 : 2);
+    const Operand& rsrc = in.src[1 + naddr];
+    uint32_t t[8] = {};
+    for (uint32_t k = 0; k < rsrc.width && k < 8; ++k) t[k] = w.sgpr[rsrc.index + k];
+    const image::Image img = image::decode_image(t, in.arch != gcn::Target::Gfx1030);
+    image::Sampler smp;
+    if (sample) {
+      const Operand& so = in.src[2 + naddr];
+      uint32_t sw[4];
+      for (uint32_t k = 0; k < 4; ++k) sw[k] = w.sgpr[so.index + k];
+      smp = image::decode_sampler(sw);
+    }
+    if (!resinfo && image::texel_bytes(img.format) == 0)
+      throw Error::make(Err::Unsupported, name, " of an image whose format this does not read (data format ",
+                        static_cast<int>(img.format.data), ")");
+    const uint32_t dim = in.dim & 7;
+    static const uint32_t kCoords[8] = {1, 2, 3, 3, 2, 3, 3, 4};
+    static const uint32_t kSpatial[8] = {1, 2, 3, 2, 1, 2, 2, 2};   // coordinates that are positions, not layers
+    if (dim == 3 || dim >= 6)
+      throw Error::make(Err::Unsupported, name, " of a cube or multisampled image, which this does not model");
+    const uint32_t coords = kCoords[dim], spatial = kSpatial[dim];
+    const bool layered = dim == 4 || dim == 5;
+    const auto has = [&](const char* part) {
+      const std::string p(part);
+      for (size_t at = name.find(p); at != std::string::npos; at = name.find(p, at + 1)) {
+        const size_t end = at + p.size();
+        if (end == name.size() || name[end] == '_') return true;
+      }
+      return false;
+    };
+    // Every lane's address words, flattened across the address registers.
+    struct Lane {
+      uint32_t word[16] = {};
+      uint32_t n = 0;
+    };
+    std::vector<Lane> lanes(kLanes);
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      if (!(w.exec >> lane & 1)) continue;
+      for (size_t k = 1; k <= naddr; ++k)
+        for (uint32_t d = 0; d < in.src[k].width && lanes[lane].n < 16; ++d)
+          lanes[lane].word[lanes[lane].n++] = word(w, in.src[k], d, lane);
+    }
+    // Reads a lane's components in the order the ISA gives them: each group
+    // (the offsets, the bias, the compare, each derivative vector, and the
+    // coordinates with the LOD and clamp) starting a register, two to a
+    // register with a16 (the derivatives with g16 too).
+    struct Addr {
+      double coord[4] = {0, 0, 0, 0};   // the coordinates, as floats (samples) or integers (the rest)
+      double lod = 0, bias = 0, clamp = 0;
+      double grad[2][3] = {};           // explicit derivatives: d/dx then d/dy of each spatial coordinate
+      bool has_grad = false;
+    };
+    const bool a16 = in.a16, g16 = in.a16 || has("_g16");
+    const auto read_addr = [&](const Lane& l) {
+      Addr a;
+      uint32_t at = 0;
+      const auto group = [&](uint32_t count, bool packed, bool floats, double* out) {
+        for (uint32_t k = 0; k < count; ++k) {
+          uint32_t v;
+          if (packed) {
+            v = (l.word[at + k / 2] >> (16 * (k & 1))) & 0xFFFF;
+            if (floats) {
+              _Float16 h;
+              const uint16_t b = static_cast<uint16_t>(v);
+              std::memcpy(&h, &b, 2);
+              out[k] = static_cast<double>(h);
+            } else {
+              out[k] = static_cast<double>(v);
+            }
+          } else {
+            v = l.word[at + k];
+            out[k] = floats ? static_cast<double>(as_float(v)) : static_cast<double>(v);
+          }
+        }
+        at += packed ? (count + 1) / 2 : count;
+      };
+      double scratch[8];
+      if (sample) {
+        if (has("_o")) group(1, false, false, scratch);   // texel offsets: not modelled yet, and rare
+        if (has("_b")) group(1, a16, true, &a.bias);
+        if (has("_c")) group(1, false, true, scratch);
+        if (has("_d")) {
+          a.has_grad = true;
+          for (int v = 0; v < 2; ++v) group(spatial, g16, true, a.grad[v]);
+        }
+      }
+      const bool lod = has("_l") || has("_mip") || resinfo;
+      const bool cl = has("_cl");
+      double c[6];
+      group(resinfo ? 1 : coords + (lod && !resinfo ? 1 : 0) + (cl ? 1 : 0), a16, sample, c);
+      if (resinfo) {
+        a.lod = c[0];
+      } else {
+        for (uint32_t k = 0; k < coords; ++k) a.coord[k] = c[k];
+        if (lod) a.lod = c[coords];
+        if (cl) a.clamp = c[coords + (lod ? 1 : 0)];
+      }
+      return a;
+    };
+    // The data: the channels DMASK names, in order, two to a register with d16.
+    const auto write_result = [&](uint32_t lane, const uint32_t v[4], bool ints) {
+      if (in.dst.empty()) return;
+      uint32_t out[4] = {0, 0, 0, 0}, n = 0;
+      for (int k = 0; k < 4; ++k)
+        if (gather ? k < 4 : (in.dmask >> k) & 1) out[n++] = v[k];
+      if (gather) n = 4;
+      if (n == 0) out[n++] = v[0];
+      const Operand& d = in.dst[0];
+      if (in.d16) {
+        for (uint32_t k = 0; k < n; k += 2) {
+          uint32_t packed = 0;
+          for (uint32_t h = 0; h < 2 && k + h < n; ++h) {
+            uint32_t half;
+            if (ints) {
+              half = out[k + h] & 0xFFFF;
+            } else {
+              const _Float16 f = static_cast<_Float16>(as_float(out[k + h]));
+              uint16_t b;
+              std::memcpy(&b, &f, 2);
+              half = b;
+            }
+            packed |= half << (16 * h);
+          }
+          set_word(w, d, k / 2, lane, packed);
+        }
+        if (in.tfe || in.lwe) set_word(w, d, (n + 1) / 2, lane, 0);
+      } else {
+        for (uint32_t k = 0; k < n; ++k) set_word(w, d, k, lane, out[k]);
+        if (in.tfe || in.lwe) set_word(w, d, n, lane, 0);
+      }
+    };
+    const uint32_t levels = img.last_level >= img.base_level ? img.last_level - img.base_level + 1 : 1;
+    std::vector<Addr> addrs(kLanes);
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+      if (w.exec >> lane & 1) addrs[lane] = read_addr(lanes[lane]);
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      if (!(w.exec >> lane & 1)) continue;
+      const Addr& a = addrs[lane];
+      if (resinfo) {
+        const uint32_t level = img.base_level + static_cast<uint32_t>(a.lod);
+        const uint32_t v[4] = {image::level_width(img, level),
+                               layered && dim == 4 ? img.depth : image::level_height(img, level),
+                               dim == 2 ? image::level_depth(img, level) : layered ? img.depth : 1u, levels};
+        write_result(lane, v, true);
+        continue;
+      }
+      if (!sample) {
+        // Whole texel coordinates, and the level for the _mip forms.
+        const uint32_t level = img.base_level + (has("_mip") ? static_cast<uint32_t>(a.lod) : 0);
+        const int64_t x = static_cast<int64_t>(a.coord[0]), y = coords > 1 ? static_cast<int64_t>(a.coord[1]) : 0;
+        const int64_t z = coords > 2 ? static_cast<int64_t>(a.coord[2]) : 0;
+        const int64_t zz = dim == 4 ? y : z, yy = dim == 4 ? 0 : y;   // a 1D array's layer is its second coordinate
+        const bool inside = level <= img.last_level && x >= 0 && x < image::level_width(img, level) && yy >= 0 &&
+                            yy < image::level_height(img, level) && zz >= 0 && zz < image::level_depth(img, level);
+        const uint64_t addr =
+            img.base + (inside ? image::texel_offset(img, level, static_cast<uint32_t>(x), static_cast<uint32_t>(yy),
+                                                     static_cast<uint32_t>(zz))
+                               : 0);
+        const bool ints = image::integer(img.format);
+        if (store) {
+          if (!inside) continue;   // a store past the edge is dropped
+          uint8_t bytes[16] = {};
+          const uint32_t nbytes = image::texel_bytes(img.format);
+          at(addr).read(addr, bytes, nbytes);
+          uint32_t raw[4];
+          image::read_texel(img.format, bytes, raw);
+          uint32_t k = 0;
+          for (int c = 0; c < 4; ++c) {
+            if (!((in.dmask >> c) & 1)) continue;
+            uint32_t v = in.d16 ? (word(w, in.src[0], k / 2, lane) >> (16 * (k & 1))) & 0xFFFF
+                                : word(w, in.src[0], k, lane);
+            if (in.d16 && !ints) {
+              _Float16 h;
+              const uint16_t b = static_cast<uint16_t>(v);
+              std::memcpy(&h, &b, 2);
+              v = as_bits(static_cast<float>(h));
+            }
+            raw[c] = v;
+            ++k;
+          }
+          image::write_texel(img.format, raw, bytes);
+          at(addr).write(addr, bytes, nbytes);
+          continue;
+        }
+        if (atomic) {
+          if (image::texel_bytes(img.format) != 4)
+            throw Error::make(Err::Unsupported, name, " of an image whose texels are not 32 bits");
+          const std::string_view body = std::string_view(name).substr(6);   // "atomic_add"
+          AtomicOp op;
+          if (!parse_atomic(body, &op)) throw Error::make(Err::Unsupported, name, " is decoded but not implemented");
+          const uint64_t v = word(w, in.src[0], 0, lane);
+          const uint64_t expected = op.rmw == Rmw::CmpSwap ? word(w, in.src[0], 1, lane) : 0;
+          const uint64_t before = inside ? atomic_rmw(addr, op, v, expected) : 0;
+          if (!in.dst.empty()) set_word(w, in.dst[0], 0, lane, static_cast<uint32_t>(before));
+          continue;
+        }
+        uint32_t v[4] = {0, 0, 0, 0};
+        if (inside) fetch_texel(img, level, x, yy, zz, v);
+        write_result(lane, v, ints);
+        continue;
+      }
+      // A sample, or a gather: the LOD from what the instruction gives, or
+      // from how fast the coordinates change across the lane's quad.
+      const uint32_t w0 = img.width, h0 = image::level_height(img, 0), d0 = image::level_depth(img, 0);
+      const bool unnorm = in.unorm || smp.unnormalized;
+      const double scale[3] = {unnorm ? 1.0 : double(w0), unnorm ? 1.0 : double(h0), unnorm ? 1.0 : double(d0)};
+      double lod = 0;
+      if (has("_l")) {
+        lod = a.lod;
+      } else if (!has("_lz") && !gather) {
+        double dx[3] = {}, dy[3] = {};
+        if (a.has_grad) {
+          for (uint32_t k = 0; k < spatial; ++k) dx[k] = a.grad[0][k], dy[k] = a.grad[1][k];
+        } else {
+          const uint32_t qx = lane ^ 1, qy = lane ^ 2;
+          const Addr& ax = (w.exec >> qx & 1) ? addrs[qx] : a;
+          const Addr& ay = (w.exec >> qy & 1) ? addrs[qy] : a;
+          const double sx = (lane & 1) ? -1 : 1, sy = (lane & 2) ? -1 : 1;
+          for (uint32_t k = 0; k < spatial; ++k) dx[k] = sx * (ax.coord[k] - a.coord[k]), dy[k] = sy * (ay.coord[k] - a.coord[k]);
+        }
+        double px = 0, py = 0;
+        for (uint32_t k = 0; k < spatial; ++k) px += dx[k] * scale[k] * dx[k] * scale[k], py += dy[k] * scale[k] * dy[k] * scale[k];
+        const double rho = std::sqrt(std::max(px, py));
+        lod = rho > 0 ? std::log2(rho) : -1e30;
+      }
+      lod += smp.lod_bias + a.bias;
+      lod = std::clamp(lod, static_cast<double>(smp.min_lod), static_cast<double>(smp.max_lod));
+      if (has("_cl")) lod = std::max(lod, a.clamp);
+      const bool linear = lod <= 0 ? smp.mag_linear : smp.min_linear;
+      const double top = static_cast<double>(levels - 1);
+      const double u = a.coord[0], vv = coords > 1 ? a.coord[1] : 0, r = coords > 2 ? a.coord[2] : 0;
+      const int64_t slice =
+          dim == 4 ? std::clamp<int64_t>(std::llround(vv), 0, img.depth - 1)
+          : dim == 5 ? std::clamp<int64_t>(std::llround(r), 0, img.depth - 1) : 0;
+      const auto at_level = [&](uint32_t rel, uint32_t out[4]) {
+        const uint32_t level = img.base_level + rel;
+        const double lw = image::level_width(img, level), lh = image::level_height(img, level),
+                     ld = image::level_depth(img, level);
+        const double tu = unnorm ? u : u * lw, tv = unnorm ? vv : vv * lh, tr = unnorm ? r : r * ld;
+        if (gather) {
+          // The four texels bilinear filtering would weigh, one channel of
+          // each: (x0, y1), (x1, y1), (x1, y0), (x0, y0).
+          const int64_t x0 = static_cast<int64_t>(std::floor(tu - 0.5)), y0 = static_cast<int64_t>(std::floor(tv - 0.5));
+          uint32_t ch = 0;
+          while (ch < 3 && !((in.dmask >> ch) & 1)) ++ch;
+          const int64_t xs[4] = {x0, x0 + 1, x0 + 1, x0}, ys[4] = {y0 + 1, y0 + 1, y0, y0};
+          for (int k = 0; k < 4; ++k) {
+            uint32_t tex[4];
+            sampled_texel(img, smp, level, xs[k], ys[k], slice, 2, tex);
+            out[k] = tex[ch];
+          }
+          return;
+        }
+        sample_level(img, smp, level, tu, spatial > 1 ? tv : 0, spatial > 2 ? tr : 0, slice, spatial, linear, out);
+      };
+      uint32_t v[4];
+      if (smp.mip_filter == 0 || levels == 1 || gather) {
+        at_level(0, v);
+      } else if (smp.mip_filter == 1) {
+        at_level(static_cast<uint32_t>(std::clamp(std::floor(lod + 0.5), 0.0, top)), v);
+      } else {
+        const double l = std::clamp(lod, 0.0, top);
+        const uint32_t l0 = static_cast<uint32_t>(std::floor(l)), l1 = std::min(l0 + 1, levels - 1);
+        const double f = l - l0;
+        uint32_t a0[4], a1[4];
+        at_level(l0, a0);
+        at_level(l1, a1);
+        for (int k = 0; k < 4; ++k) v[k] = as_bits(static_cast<float>(as_float(a0[k]) * (1 - f) + as_float(a1[k]) * f));
+      }
+      write_result(lane, v, image::integer(img.format));
+    }
+  }
+
   // A load, a store or an atomic through a buffer resource: four scalar
   // registers giving the buffer's base address, the stride of its records and
   // how many there are (bytes, where the stride is zero). An access past the
@@ -3932,6 +4318,73 @@ struct Machine {
   // the offset does: Tensile's DGEMM moves the resource's base back and
   // walks the scalar offset past the end, and gets zeroes there only if it
   // counts. Each register's worth is checked on its own.
+  // One lane's formatted buffer access: the element's channels, as many as
+  // the name's x, xy, xyz or xyzw says, through the resource's DST_SEL on a
+  // load (a channel the format lacks reading 0, alpha 1); half-width with
+  // d16, into a register's high half with d16_hi. A store leaves the
+  // channels it does not give as they were; outside the buffer a load reads
+  // 0 and a store is dropped.
+  void formatted_access(Wave& w, const Inst& in, std::string_view body, image::Format format, uint32_t d3,
+                        const Operand& data, uint32_t lane, uint64_t addr, bool inside) {
+    const bool storing = body.rfind("store", 0) == 0, d16 = body.find("_d16") != std::string_view::npos;
+    const bool hi = body.ends_with("_hi_x");
+    const std::string_view xyzw = body.substr(body.rfind('_') + 1);
+    const uint32_t count = static_cast<uint32_t>(xyzw.size());
+    const bool ints = image::integer(format);
+    const uint32_t nbytes = image::texel_bytes(format);
+    const auto to_half = [&](uint32_t v) -> uint32_t {
+      if (ints) return v & 0xFFFF;
+      const _Float16 f = static_cast<_Float16>(as_float(v));
+      uint16_t b;
+      std::memcpy(&b, &f, 2);
+      return b;
+    };
+    const auto from_half = [&](uint32_t v) -> uint32_t {
+      if (ints) return v & 0xFFFF;
+      _Float16 f;
+      const uint16_t b = static_cast<uint16_t>(v);
+      std::memcpy(&f, &b, 2);
+      return as_bits(static_cast<float>(f));
+    };
+    uint8_t bytes[16] = {};
+    uint32_t raw[4] = {0, 0, 0, 0};
+    if (inside) {
+      at(addr).read(addr, bytes, nbytes);
+      image::read_texel(format, bytes, raw);
+    }
+    if (storing) {
+      if (!inside) return;
+      for (uint32_t k = 0; k < count; ++k) {
+        const uint32_t v = d16 ? (word(w, data, k / 2, lane) >> (16 * ((k & 1) | (hi ? 1 : 0)))) & 0xFFFF
+                               : word(w, data, k, lane);
+        raw[k] = d16 ? from_half(v) : v;
+      }
+      image::write_texel(format, raw, bytes);
+      at(addr).write(addr, bytes, nbytes);
+      return;
+    }
+    uint32_t out[4];
+    for (uint32_t k = 0; k < 4; ++k) {
+      switch (static_cast<image::Sel>((d3 >> (3 * k)) & 7)) {
+        case image::Sel::Zero: out[k] = 0; break;
+        case image::Sel::One: out[k] = ints ? 1 : as_bits(1.0f); break;
+        case image::Sel::X: out[k] = raw[0]; break;
+        case image::Sel::Y: out[k] = raw[1]; break;
+        case image::Sel::Z: out[k] = raw[2]; break;
+        default: out[k] = raw[3]; break;
+      }
+      if (!inside) out[k] = 0;
+    }
+    if (!d16) {
+      for (uint32_t k = 0; k < count; ++k) set_word(w, data, k, lane, out[k]);
+    } else if (hi) {
+      set_word(w, data, 0, lane, (word(w, data, 0, lane) & 0xFFFF) | to_half(out[0]) << 16);
+    } else {
+      for (uint32_t k = 0; k < count; k += 2)
+        set_word(w, data, k / 2, lane, to_half(out[k]) | (k + 1 < count ? to_half(out[k + 1]) << 16 : 0));
+    }
+  }
+
   void buffer_access(Wave& w, const Inst& in, Group& g) {
     if (!w.exec) return;
     const bool reads_data = in.dst.empty();   // a store, or an atomic
@@ -3955,7 +4408,25 @@ struct Machine {
     const uint64_t soffset = static_cast<uint32_t>(scalar(w, soff));
     const bool valid_format = rdna ? ((d3 >> 12) & 0x7F) != 0 : ((d3 >> 15) & 0xF) != 0;
     const uint32_t oob_select = (d3 >> 28) & 3;
-    const std::string_view body = std::string_view(in.name).substr(7);   // past "buffer_"
+    const std::string_view body = std::string_view(in.name).substr(in.enc == gcn::Enc::Mtbuf ? 8 : 7);   // past "buffer_"
+    // A formatted access converts each element between its format (the
+    // resource's, or MTBUF's own) and a register's floats or integers.
+    image::Format format;
+    const bool formatted = body.rfind("load_format_", 0) == 0 || body.rfind("store_format_", 0) == 0;
+    if (formatted) {
+      if (in.enc == gcn::Enc::Mtbuf) {
+        format = image::from_code(in.format, in.arch != gcn::Target::Gfx1030);
+      } else if (rdna) {
+        const uint32_t words[4] = {w.sgpr[rsrc.index], d1, records, d3};
+        format = image::buffer_format(words, in.arch != gcn::Target::Gfx1030);
+      } else {   // gfx9's two fields: NUM_FORMAT [14:12], DATA_FORMAT [18:15]
+        format.data = static_cast<image::Data>((d3 >> 15) & 0xF);
+        format.num = static_cast<image::Num>((d3 >> 12) & 7);
+      }
+      if (image::texel_bytes(format) == 0)
+        throw Error::make(Err::Unsupported, in.name, " of a format this does not convert (",
+                          static_cast<int>(format.data), "/", static_cast<int>(format.num), ")");
+    }
     Narrow n;
     const bool part = narrow(in.name, &n);
     const bool atomic = body.rfind("atomic_", 0) == 0;
@@ -3980,7 +4451,9 @@ struct Machine {
           }
         return stride ? index < records : soffset + at + bytes <= records;
       };
-      if (Half h; half_access(body, &h)) {
+      if (formatted) {
+        formatted_access(w, in, body, format, d3, data, lane, addr, fits(offset, image::texel_bytes(format)));
+      } else if (Half h; half_access(body, &h)) {
         if (h.store) {
           if (fits(offset, h.bytes)) store(addr, h.bytes, half_store(lane_src(w, data, lane), h));
         } else {
@@ -4944,6 +5417,18 @@ struct Machine {
         if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
         else ++n.vmem_rd;
         buffer_access(w, in, g);
+        return true;
+      case gcn::Enc::Mtbuf:
+        ++n.vmem;
+        if (in.name.find("_store") != std::string::npos) ++n.vmem_wr;
+        else ++n.vmem_rd;
+        buffer_access(w, in, g);
+        return true;
+      case gcn::Enc::Mimg:
+        ++n.vmem;
+        if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
+        else ++n.vmem_rd;
+        image_access(w, in);
         return true;
       case gcn::Enc::Sopp: break;
       default:
