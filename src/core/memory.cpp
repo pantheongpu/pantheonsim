@@ -282,6 +282,13 @@ uint8_t* MemoryManager::materialize(Allocation& a, uint64_t chunk_idx) {
 
 void MemoryManager::fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_len, uint64_t len) {
   if (len == 0) return;
+  // Host memory mapped here is filled where it is, the pattern's phase
+  // running on across pieces.
+  if (std::vector<HostPiece> pieces; host_pieces(dst, len, &pieces)) {
+    for (const HostPiece& p : pieces)
+      for (uint64_t i = 0; i < p.len; ++i) p.host[i] = pattern[(p.offset + i) % pattern_len];
+    return;
+  }
   uint64_t base = 0;
   Allocation& a = resolve_mut(dst, len, "device memory fill", &base);
   bool all_zero = true;
@@ -344,6 +351,10 @@ void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
       return;
     }
   }
+  if (std::vector<HostPiece> pieces; src && host_pieces(dst, len, &pieces)) {
+    for (const HostPiece& p : pieces) std::memcpy(p.host, static_cast<const uint8_t*>(src) + p.offset, p.len);
+    return;
+  }
   // A null host buffer would be dereferenced by the memcpy below and take the
   // process down with a signal, losing the diagnosis. Saying which argument was
   // null is the whole point of running on a simulator.
@@ -372,6 +383,21 @@ void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   }
 }
 
+bool MemoryManager::host_pieces(uint64_t addr, uint64_t len, std::vector<HostPiece>* pieces) const {
+  if (!host_maps_ || !host_maps_->may_contain(addr)) return false;
+  std::lock_guard<std::mutex> lock(host_maps_->mu);
+  pieces->clear();
+  for (uint64_t at = addr, left = len; left;) {
+    const HostMap* m = find_host_map_locked(at, 1);
+    if (!m) return false;
+    const uint64_t n = std::min(left, m->base + m->len - at);
+    pieces->push_back({m->host + (at - m->base), at - addr, n});
+    at += n;
+    left -= n;
+  }
+  return true;
+}
+
 const MemoryManager::HostMap* MemoryManager::find_host_map_locked(uint64_t addr,
                                                                    uint64_t len) const {
   if (!host_maps_) return nullptr;
@@ -381,7 +407,6 @@ const MemoryManager::HostMap* MemoryManager::find_host_map_locked(uint64_t addr,
 }
 
 void MemoryManager::map_host(uint64_t addr, void* host, uint64_t len) {
-  if (!host_maps_) host_maps_ = std::make_unique<HostMaps>();
   std::lock_guard<std::mutex> lock(host_maps_->mu);
   host_maps_->maps.push_back(HostMap{addr, len, static_cast<uint8_t*>(host)});
   // The allocator hands freed host addresses out again, so an old record of a
@@ -715,7 +740,8 @@ void MemoryManager::drop_shared(std::map<uint64_t, SharedRegion>::iterator it) {
 }
 
 bool MemoryManager::is_host_mapped(uint64_t addr) const {
-  if (!host_maps_) return false;
+  // Nothing mapped near it: no lock, as before any buffer was mapped at all.
+  if (!host_maps_->may_contain(addr)) return false;
   std::lock_guard<std::mutex> lock(host_maps_->mu);
   return find_host_map_locked(addr, 1) != nullptr;
 }
@@ -729,6 +755,10 @@ void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
       std::memcpy(dst, m->host + (src - m->base), len);
       return;
     }
+  }
+  if (std::vector<HostPiece> pieces; dst && host_pieces(src, len, &pieces)) {
+    for (const HostPiece& p : pieces) std::memcpy(static_cast<uint8_t*>(dst) + p.offset, p.host, p.len);
+    return;
   }
   if (!dst)
     throw Error::make(Err::InvalidPointer,

@@ -49,7 +49,18 @@ do: each stream's work runs in order on a host thread of its own, so a kernel
 on one stream may wait on a flag another stream's kernel sets, an event and a
 stream say `hipErrorNotReady` while their work runs, `hipStreamWaitEvent`
 orders one stream behind another, and the null stream is the legacy default
-stream, ordered against the blocking streams. A kernel's fault is told at the
+stream, ordered against the blocking streams. `hipStreamLegacy` names it too;
+`hipStreamPerThread`, and the null stream in a program built with
+`-fgpu-default-stream=per-thread` (the `_spt` calls), is a stream of each
+thread's own. A stream can also run a host callback, write a value to memory,
+or hold its later work until memory holds a value, while every other stream
+goes on. Contexts are a stack per thread over each device's primary context,
+as in ROCm's HIP. Where HIP's calls go beyond the everyday ones -- device
+flags and UUIDs, limits, stream ids and attributes, every launch form
+(`hipLaunchKernelExC`, `hipConfigureCall` and `hipLaunchByPtr`, a launch on
+several devices at once) -- each answers as ROCm's HIP does, down to the error
+for each wrong argument: AMD's own tests (hip-tests) are the reference, and
+`tests/hipcc/api.cpp` checks them. A kernel's fault is told at the
 next synchronization, as on a card. `VGPU_SYNC_LAUNCHES=1` makes every call
 wait for its own work instead, which rules concurrency out when a program
 misbehaves. A program built by `hipcc` runs unmodified too:

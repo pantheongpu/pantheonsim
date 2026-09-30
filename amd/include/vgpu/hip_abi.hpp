@@ -55,6 +55,64 @@ struct Uuid {
   char bytes[16];
 };
 
+// hipLaunchKernelExC's configuration and its attributes: an id padded to
+// eight bytes, then a 64-byte union of the values.
+struct AccessPolicyWindow {
+  void* base_ptr;
+  int hit_prop;
+  float hit_ratio;
+  int miss_prop;
+  size_t num_bytes;
+};
+union LaunchAttributeValue {
+  char pad[64];
+  AccessPolicyWindow access_policy_window;
+  int cooperative;
+  int priority;
+  int sync_policy;
+};
+enum LaunchAttributeId : int {
+  kLaunchAttributeAccessPolicyWindow = 1,
+  kLaunchAttributeCooperative = 2,
+  kLaunchAttributeSynchronizationPolicy = 3,
+  kLaunchAttributePriority = 8,
+  kLaunchAttributeMemSyncDomainMap = 9,
+  kLaunchAttributeMemSyncDomain = 10,
+};
+struct LaunchAttribute {
+  int id;
+  char pad[4];
+  LaunchAttributeValue value;
+};
+struct LaunchConfig {
+  Dim3 grid;
+  Dim3 block;
+  size_t dynamic_shared;
+  void* stream;
+  LaunchAttribute* attrs;
+  unsigned int num_attrs;
+};
+
+// One device's part of a launch across several (hipLaunchCooperativeKernel-
+// MultiDevice, hipExtLaunchMultiKernelMultiDevice), by host function ...
+struct LaunchParams {
+  void* func;
+  Dim3 grid;
+  Dim3 block;
+  void** args;
+  size_t shared;
+  void* stream;
+};
+// ... and by module function (hipModuleLaunchCooperativeKernelMultiDevice).
+struct FunctionLaunchParams {
+  void* function;
+  unsigned int grid_x, grid_y, grid_z;
+  unsigned int block_x, block_y, block_z;
+  unsigned int shared;
+  void* stream;
+  void** params;
+};
+
 struct DeviceArch {
   unsigned hasGlobalInt32Atomics : 1;
   unsigned hasGlobalFloatAtomicExch : 1;
@@ -413,6 +471,41 @@ enum class DeviceAttribute : int {
   kCanUseStreamWaitValue = 10013,
   kImageSupport = 10014,
   kFineGrainSupport = 10016,
+  // Answered from the properties' own fields.
+  kAccessPolicyMaxWindowSize = 1,
+  kLuid = 21,
+  kLuidDeviceNodeMask = 22,
+  kMaxSurface1D = 32,
+  kMaxSurface1DLayered = 33,
+  kMaxSurface2D = 34,
+  kMaxSurface2DLayered = 35,
+  kMaxSurface3D = 36,
+  kMaxSurfaceCubemap = 37,
+  kMaxSurfaceCubemapLayered = 38,
+  kMaxTexture1DWidth = 39,
+  kMaxTexture1DLayered = 40,
+  kMaxTexture1DLinear = 41,
+  kMaxTexture1DMipmap = 42,
+  kMaxTexture2DWidth = 43,
+  kMaxTexture2DHeight = 44,
+  kMaxTexture2DGather = 45,
+  kMaxTexture2DLayered = 46,
+  kMaxTexture2DLinear = 47,
+  kMaxTexture2DMipmap = 48,
+  kMaxTexture3DWidth = 49,
+  kMaxTexture3DHeight = 50,
+  kMaxTexture3DDepth = 51,
+  kMaxTexture3DAlt = 52,
+  kMaxTextureCubemap = 53,
+  kMaxTextureCubemapLayered = 54,
+  kVirtualMemoryManagementSupported = 89,
+  kMemoryPoolSupportedHandleTypes = 91,
+  kHdpMemFlushCntl = 10005,   // a pointer, written over the int and the one after it
+  kHdpRegFlushCntl = 10006,
+  kWallClockRate = 10017,     // kHz
+  kNumberOfXccs = 10018,
+  kMaxAvailableVgprsPerThread = 10019,
+  kPciChipId = 10020,
 };
 
 }  // namespace vgpu::amd::abi
