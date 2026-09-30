@@ -25,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <mutex>
 #include <string>
 #include <dlfcn.h>
@@ -40,6 +41,7 @@
 #include "vgpu/amd_decode_cache.hpp"
 #include "vgpu/amd_exec.hpp"
 #include "vgpu/amd_hostcall.hpp"
+#include "vgpu/amd_kfd.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
@@ -378,8 +380,60 @@ hipError_t ensure_runtime(State& s) {
   int count = 1;
   if (const char* c = std::getenv("VGPU_DEVICE_COUNT"); c && *c) count = std::atoi(c);
   if (count < 1) count = 1;
+  vgpu::DeviceProfile p;
   try {
-    vgpu::DeviceProfile p = vgpu::load_gpu(id);
+    p = vgpu::load_gpu(id);
+  } catch (const std::exception& e) {
+    return fail(hipErrorInvalidDevice, std::string("no usable GPU profile: ") + e.what());
+  }
+  // The devices a program is shown, as ROCm shows them: ROCR_VISIBLE_DEVICES
+  // picks from the machine's, then HIP_VISIBLE_DEVICES (or
+  // CUDA_VISIBLE_DEVICES) from those -- each a list read up to the first
+  // entry that names no device. An entry is an index, or a UUID: "GPU-" and
+  // the hex of either the HSA agent's UUID or KFD's unique_id, which is what
+  // Ollama passes. None shown is no device.
+  const int machine = count;
+  const auto uuid_of = [&](const std::string& item) -> int {
+    if (item.rfind("GPU-", 0) != 0 || item.size() == 4) return -1;
+    char* end = nullptr;
+    const unsigned long long want = std::strtoull(item.c_str() + 4, &end, 16);
+    if (*end) return -1;
+    for (int i = 0; i < machine; ++i) {
+      vgpu::telemetry::DeviceSample d;
+      vgpu::telemetry::describe_device(p, i, &d);
+      if (want == 0x5647505500000000ull + static_cast<unsigned>(i) || want == vgpu::amd::kfd_unique_id(d.uuid))
+        return i;
+    }
+    return -1;
+  };
+  std::vector<int> visible(static_cast<size_t>(machine));
+  for (int i = 0; i < machine; ++i) visible[static_cast<size_t>(i)] = i;
+  const auto shown = [&](const char* var) {
+    const char* v = std::getenv(var);
+    if (!v) return;
+    std::vector<int> picked;
+    std::stringstream list(v);
+    for (std::string item; std::getline(list, item, ',');) {
+      int at = -1;   // a position in `visible`
+      if (!item.empty() && item.find_first_not_of("0123456789") == std::string::npos) {
+        at = std::atoi(item.c_str());
+        if (at >= static_cast<int>(visible.size())) at = -1;
+      } else if (const int dev = uuid_of(item); dev >= 0) {
+        const auto it = std::find(visible.begin(), visible.end(), dev);
+        if (it != visible.end()) at = static_cast<int>(it - visible.begin());
+      }
+      if (at < 0) break;
+      const int dev = visible[static_cast<size_t>(at)];
+      if (std::find(picked.begin(), picked.end(), dev) != picked.end()) break;
+      picked.push_back(dev);
+    }
+    visible = picked;
+  };
+  shown("ROCR_VISIBLE_DEVICES");
+  shown(std::getenv("HIP_VISIBLE_DEVICES") ? "HIP_VISIBLE_DEVICES" : "CUDA_VISIBLE_DEVICES");
+  count = static_cast<int>(visible.size());
+  if (count < 1) return fail(hipErrorNoDevice, "no device is visible (ROCR_VISIBLE_DEVICES, HIP_VISIBLE_DEVICES)");
+  try {
     if (p.vendor != "amd")
       return fail(hipErrorInvalidDevice, "VGPU_GPU=" + id +
                                              " is not an AMD GPU, and HIP runs on AMD GPUs. Set VGPU_GPU to an "
@@ -636,10 +690,10 @@ hipError_t build_kernargs(const Kernel& k, void** params, void** extra, std::vec
     return hipSuccess;
   }
   if (!params) {
-    // A kernel that takes nothing needs neither.
-    return k.kernarg_size && !k.args.empty()
-               ? fail(hipErrorInvalidValue, "the kernel takes arguments, and the launch passed none")
-               : hipSuccess;
+    // A kernel that takes nothing of the program's needs neither: what the
+    // compiler adds (hidden arguments) the runtime fills in.
+    const bool takes = std::any_of(k.args.begin(), k.args.end(), [](const vgpu::amd::KernelArg& a) { return !a.hidden(); });
+    return takes ? fail(hipErrorInvalidValue, "the kernel takes arguments, and the launch passed none") : hipSuccess;
   }
   for (size_t i = 0; i < k.args.size(); ++i) {
     const vgpu::amd::KernelArg& a = k.args[i];
@@ -889,6 +943,7 @@ void place(Module& m, vgpu::MemoryManager& mem) {
   if (m.object.linked) {
     m.code_size = m.object.image.size();
     m.code_base = mem.alloc(m.object.image.empty() ? 1 : m.object.image.size());
+    vgpu::amd::relocate_image(m.object, m.code_base);   // its global offset table, now it has an address
     if (!m.object.image.empty()) mem.write(m.code_base, m.object.image.data(), m.object.image.size());
     m.globals = m.code_base;
     // The device has the image now, and nothing reads the host's copy again:
@@ -1055,7 +1110,9 @@ hipError_t host_alloc(void** ptr, size_t size, std::map<uint64_t, size_t>& m, un
   if (n > (size_t{1} << 47)) return record(s, hipErrorOutOfMemory);   // more than any host has
   void* p = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
   if (!p) return record(s, hipErrorOutOfMemory);
-  map_host_everywhere(s, p, n);
+  // Devices reach it in whole pages, as a card maps it: a kernel's 8-byte
+  // atomic on a 4-byte allocation stays inside the page.
+  map_host_everywhere(s, p, (n + 4095) / 4096 * 4096);
   std::lock_guard<std::mutex> host_lock(g_host_mutex);
   m[reinterpret_cast<uint64_t>(p)] = n;
   g_host_flags[reinterpret_cast<uint64_t>(p)] = flags;
@@ -1390,7 +1447,10 @@ hipError_t hipGetDeviceCount(int* count) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!count) return record(s, hipErrorInvalidValue);
-  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) {
+    if (e == hipErrorNoDevice) *count = 0;
+    return record(s, e);
+  }
   *count = s.rt->device_count();
   return record(s, hipSuccess);
 }
@@ -1825,6 +1885,10 @@ const ErrorText* error_text(int e) {
 #undef E
     return t;
   }();
+  // ROCm 7.1's own HIP knows neither texture code its header names
+  // (hipErrorInvalidChannelDescriptor, hipErrorInvalidTexture): to it they
+  // are unknown errors.
+  if (e == 911 || e == 912) return nullptr;
   const auto it = table.find(e);
   return it == table.end() ? nullptr : &it->second;
 }
@@ -2389,6 +2453,14 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   props->pciDeviceID = 0;
   props->concurrentKernels = 1;
   props->cooperativeLaunch = 1;
+  // What its code can do, as the compiler's __HIP_ARCH_HAS_*__ macros say
+  // for every AMD target: atomics of each width in global and shared memory,
+  // doubles, the warp functions, a system fence, 3D grids -- and no funnel
+  // shift, extended syncthreads, surface functions or dynamic parallelism.
+  auto& a = props->arch;
+  a.hasGlobalInt32Atomics = a.hasGlobalFloatAtomicExch = a.hasSharedInt32Atomics = 1;
+  a.hasSharedFloatAtomicExch = a.hasFloatAtomicAdd = a.hasGlobalInt64Atomics = a.hasSharedInt64Atomics = 1;
+  a.hasDoubles = a.hasWarpVote = a.hasWarpBallot = a.hasWarpShuffle = a.hasThreadFenceSystem = a.has3dGrid = 1;
   props->unifiedAddressing = 1;
   // Pinned, registered and managed host memory are mapped for every
   // device's kernels (see hipHostMalloc), and allocations come from pools.
@@ -4346,7 +4418,8 @@ hipError_t hipDeviceGetLimit(size_t* value, int limit) {
 // named "unknown".
 hipError_t hipDrvGetErrorString(hipError_t error, const char** text) {
   const ApiCall api("hipDrvGetErrorString");
-  if (!text || !error_text(error)) return record(state(), hipErrorInvalidValue);
+  // hipErrorTbd has a name and, for the driver, no text.
+  if (!text || !error_text(error) || static_cast<int>(error) == 1054) return record(state(), hipErrorInvalidValue);
   *text = error_text(error)->text;
   return hipSuccess;
 }
@@ -4393,7 +4466,8 @@ hipError_t hipFuncSetAttribute(const void* host_function, int attr, int value) {
   if (attr == 8 && (value < 0 || uint64_t(value) + k->group_segment > p.limits.shared_mem_per_block))
     return record(s, hipErrorInvalidValue);
   if (attr == 9 && (value < -1 || value > 100)) return record(s, hipErrorInvalidValue);
-  if (attr != 8 && attr != 9) return record(s, hipErrorInvalidValue);
+  // hipFuncAttributeMax (10) is taken too, as ROCm's HIP takes it.
+  if (attr != 8 && attr != 9 && attr != 10) return record(s, hipErrorInvalidValue);
   return record(s, hipSuccess);
 }
 
@@ -4411,6 +4485,11 @@ const char* hipKernelNameRefByPtr(const void* host_function, hipStream_t) {
 hipError_t hipExtLaunchKernel(const void* host_function, vgpu::amd::abi::Dim3 grid, vgpu::amd::abi::Dim3 block,
                               void** args, size_t shared, hipStream_t stream, hipEvent_t start, hipEvent_t stop, int) {
   const ApiCall api("hipExtLaunchKernel");
+  // Events that are not there are the wrong value here, before anything runs.
+  {
+    std::lock_guard<std::mutex> lock(g_event_mutex);
+    if ((start && !find_event(start)) || (stop && !find_event(stop))) return record(state(), hipErrorInvalidValue);
+  }
   if (start)
     if (const hipError_t e = hipEventRecord(start, stream); e != hipSuccess) return e;
   if (const hipError_t e = hipLaunchKernel(host_function, grid, block, args, shared, stream); e != hipSuccess) return e;
@@ -4522,7 +4601,11 @@ hipError_t hipStreamCreateWithPriority(hipStream_t* stream, unsigned int flags, 
 hipError_t hipExtStreamCreateWithCUMask(hipStream_t* stream, uint32_t words, const uint32_t* mask) {
   const ApiCall api("hipExtStreamCreateWithCUMask");
   if (!words || !mask) return hipErrorInvalidValue;
-  return create_stream(stream, 0, 0, std::vector<uint32_t>(mask, mask + words));
+  // A mask with no compute unit in it is no mask: the stream gets them all,
+  // as ROCm gives it the default.
+  std::vector<uint32_t> cus(mask, mask + words);
+  if (std::all_of(cus.begin(), cus.end(), [](uint32_t w) { return w == 0; })) cus.clear();
+  return create_stream(stream, 0, 0, std::move(cus));
 }
 hipError_t hipExtStreamGetCUMask(hipStream_t stream, uint32_t words, uint32_t* mask) {
   const ApiCall api("hipExtStreamGetCUMask");
@@ -4583,8 +4666,10 @@ hipError_t hipStreamGetDevice(hipStream_t stream, hipDevice_t* ordinal) {
 // Whatever the event marks has already happened.
 // The stream's later work waits for what the event marks. An event never
 // recorded marks nothing, and the stream does not wait.
-hipError_t hipStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned int) {
+hipError_t hipStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned int flags) {
   const ApiCall api("hipStreamWaitEvent");
+  // hipEventWaitDefault (0) and hipEventWaitExternal (1) are the flags there are.
+  if (flags > 1) return record(state(), hipErrorInvalidValue);
   {
     // An event from a capture, or a stream that is capturing: the capture's
     // to handle (a stream joins a capture this way).
@@ -4681,7 +4766,7 @@ hipError_t hipMemGetAddressRange(void** base, size_t* size, void* ptr) {
   const ApiCall api("hipMemGetAddressRange");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!ptr) return record(s, hipErrorInvalidValue);
+  if (!ptr) return record(s, hipErrorNotFound);   // no allocation holds nothing, as ROCm's HIP has it
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   const uint64_t va = reinterpret_cast<uint64_t>(ptr);
   uint64_t b = 0, n = 0;
@@ -5413,6 +5498,14 @@ hipError_t hipDeviceGetTexture1DLinearMaxWidth(size_t* width, const void*, int d
 void __hipRegisterTexture(void*, void*, char*, const char*, int, int, int) {}
 void __hipRegisterSurface(void*, void*, char*, const char*, int, int) {}
 
+// A mipmapped array: its arguments checked, then refused like every array.
+hipError_t hipMallocMipmappedArray(void** array, const void* desc, vgpu::amd::abi::Extent, unsigned int, unsigned int) {
+  if (!array || !desc) {
+    const ApiCall api("hipMallocMipmappedArray");
+    return record(state(), hipErrorInvalidValue);
+  }
+  return no_images("hipMallocMipmappedArray");
+}
 #define VGPU_NO_IMAGES(name) \
   hipError_t name() { return no_images(#name); }
 #define VGPU_NO_SUCH_ARRAY(name) \
@@ -5424,7 +5517,6 @@ VGPU_NO_IMAGES(hipMallocArray)
 VGPU_NO_IMAGES(hipMalloc3DArray)
 VGPU_NO_IMAGES(hipArrayCreate)
 VGPU_NO_IMAGES(hipArray3DCreate)
-VGPU_NO_IMAGES(hipMallocMipmappedArray)
 VGPU_NO_IMAGES(hipMipmappedArrayCreate)
 VGPU_NO_IMAGES(hipCreateTextureObject)
 VGPU_NO_IMAGES(hipTexObjectCreate)

@@ -126,6 +126,17 @@ struct CodeObject {
   // to itself. Empty for an object not yet linked, whose variables are `data`.
   bool linked = false;
   std::vector<uint8_t> image;
+  // A linked object's dynamic relocations (.rela.dyn): words of the image that
+  // hold an address once it is placed -- global offset table entries, which
+  // is how code reaches a variable that is not protected -- each the image's
+  // base plus `value`, in `bytes` (8, or 4 for a half of one).
+  struct DynRelocation {
+    uint64_t at = 0;
+    uint64_t value = 0;
+    uint8_t bytes = 8;
+    bool high = false;   // the top 32 bits, for a half
+  };
+  std::vector<DynRelocation> dyn_relocations;
   // The processor the code was built for: the ELF header's e_flags machine
   // field (EF_AMDGPU_MACH), 0x4c for gfx942 and 0x4f for gfx950. Where the
   // same instruction means different things on the two -- an 8-bit float is
@@ -139,6 +150,9 @@ struct CodeObject {
 // the program counter, and that constant is what this fills in: before it,
 // the code has zeros there. Throws if called twice with different bases.
 void place_globals(CodeObject& o, uint64_t base);
+// Fills a linked object's image with the addresses its dynamic relocations
+// ask for, the image to be placed at `base`.
+void relocate_image(CodeObject& o, uint64_t base);
 // The global of that name, or null.
 const GlobalVar* find_global(const CodeObject& o, const std::string& name);
 
