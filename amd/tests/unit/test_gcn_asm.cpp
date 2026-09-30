@@ -552,6 +552,46 @@ VTEST(each_byte_of_a_word_converts_to_its_own_float) {
   VCHECK_EQ(wrong, 0);
 }
 
+VTEST(a_half_dot_product_into_a_float_is_not_held_to_one_by_its_clamp) {
+  // amd_mixed_dot({1, 3}, {3, 3}, 2, true) is 14 on a card; the clamp that
+  // holds other float results to [0, 1] does not hold this one.
+  const amd::CodeObject o = object("asm_dot_clamp");
+  MemoryManager mem(16ull << 20);
+  const auto h2 = [](float lo, float hi) {
+    const _Float16 a = static_cast<_Float16>(lo), b = static_cast<_Float16>(hi);
+    uint16_t x, y;
+    std::memcpy(&x, &a, 2);
+    std::memcpy(&y, &b, 2);
+    return uint32_t{x} | uint32_t{y} << 16;
+  };
+  std::vector<uint32_t> in(64 * 3);
+  std::vector<float> al(64), ah(64), bl(64), bh(64), c(64);
+  for (uint32_t l = 0; l < 64; ++l) {
+    al[l] = static_cast<float>(l % 7) - 2.0f, ah[l] = static_cast<float>(l % 5) + 0.5f;
+    bl[l] = static_cast<float>(l % 3) + 1.0f, bh[l] = static_cast<float>(l % 11) - 4.0f;
+    c[l] = static_cast<float>(l) * 0.25f - 3.0f;
+    in[3 * l] = h2(al[l], ah[l]);
+    in[3 * l + 1] = h2(bl[l], bh[l]);
+    in[3 * l + 2] = f(c[l]);
+  }
+  const uint64_t in_d = mem.alloc(in.size() * 4), out = mem.alloc(64 * 32);
+  mem.write(in_d, in.data(), in.size() * 4);
+  const std::vector<uint32_t> r = run(o, "dot_clamp", mem, out, 64 * 8, {in_d, out});
+  int wrong = 0;
+  for (uint32_t l = 0; l < 64; ++l) {
+    const auto dot = [&](float a0, float a1, float b0, float b1, float cc) {
+      return f(static_cast<float>(double(a0) * b0 + double(a1) * b1 + cc));
+    };
+    const uint32_t want[8] = {
+        dot(al[l], ah[l], bl[l], bh[l], c[l]),  dot(al[l], ah[l], bl[l], bh[l], c[l]),
+        dot(-al[l], ah[l], bl[l], bh[l], c[l]), dot(al[l], ah[l], bl[l], -bh[l], c[l]),
+        dot(al[l], ah[l], bl[l], bh[l], -c[l]), dot(-al[l], ah[l], bl[l], bh[l], c[l]),
+        dot(al[l], ah[l], bl[l], bh[l], c[l]),  dot(al[l], -ah[l], -bl[l], bh[l], c[l])};
+    for (int i = 0; i < 8; ++i) wrong += r[8 * l + i] != want[i];
+  }
+  VCHECK_EQ(wrong, 0);
+}
+
 VTEST(a_kernel_finds_only_the_group_ids_it_asked_for_one_after_another) {
   const amd::CodeObject o = object("asm_scalar");
   const amd::Kernel* k = amd::find_kernel(o, "group_z");

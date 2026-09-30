@@ -2095,7 +2095,11 @@ struct Machine {
           const uint8_t neg = h ? in.neg_hi : in.neg_lo;
           sum += (neg & 1 ? -double(a) : double(a)) * (neg & 2 ? -double(b) : double(b));
         }
-        write_float(w, in, lane, static_cast<float>(sum));
+        // Its clamp bit does not hold the result to [0, 1], as other float
+        // results' does: hip-tests' amd_mixed_dot({1, 3}, {3, 3}, 2, true)
+        // is 14 on a card, and the compiler takes the clamped form for the
+        // unclamped one.
+        write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(sum)));
       });
     } else if (op == "v_swap_b32"_op) {
       each([&](uint32_t lane) {
