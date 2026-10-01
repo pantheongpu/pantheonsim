@@ -62,6 +62,9 @@ echo "wrote $(pwd)/graphs.gfx942"
 "$rocm/bin/hipcc" -O2 --genco --offload-arch=gfx942 exports_kernel.cpp -o exports_kernel.gfx942.co
 "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 exports.cpp -o exports.gfx942
 echo "wrote $(pwd)/exports.gfx942 and exports_kernel.gfx942.co"
+# Events shared with another process, which it forks for.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 ipc.cpp -o ipc.gfx942
+echo "wrote $(pwd)/ipc.gfx942"
 
 # Streams that run at once: kernels on two streams handing values to each
 # other, events, stream waits, the null stream's ordering, host functions.

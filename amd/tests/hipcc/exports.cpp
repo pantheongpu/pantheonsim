@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 extern "C" {
@@ -161,8 +162,10 @@ int main(int argc, char** argv) {
   int fd = -1;
   EXPECT(hipMemGetHandleForAddressRange(&fd, nullptr, 256, hipMemRangeHandleTypeDmaBufFd, 0), hipErrorInvalidValue,
          "a dma-buf of nothing");
-  EXPECT(hipMemGetHandleForAddressRange(&fd, d, 256, hipMemRangeHandleTypeDmaBufFd, 0), hipErrorNotSupported,
-         "simulated memory is not a dma-buf");
+  EXPECT(hipMemGetHandleForAddressRange(&fd, d, 256, hipMemRangeHandleTypeDmaBufFd, 0), hipSuccess,
+         "device memory as a file descriptor");
+  check(fd >= 0, "which is one");
+  if (fd >= 0) close(fd);
   (void)hipFree(d);
   (void)hipGetLastError();
 
