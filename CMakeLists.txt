@@ -1423,6 +1423,13 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_device_last_error
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_last_error.sh)
+  set_tests_properties(e2e_device_last_error PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_device_function_barriers
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_function_barriers.sh)
   set_tests_properties(e2e_device_function_barriers PROPERTIES

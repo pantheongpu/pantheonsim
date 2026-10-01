@@ -433,6 +433,11 @@ struct Warp {
   // warp's share stays small. It also keeps the verdict independent of how
   // many host threads the grid happens to be spread over.
   uint64_t steps = 0;
+  // Per thread, the last error a device-runtime call returned: the device's
+  // cudaGetLastError reports it and clears it. The CUDA Programming Guide
+  // records device-side errors per thread, and an RTX 3060 keeps them so: a
+  // thread whose launch failed sees the error, its warp-mates do not.
+  Lanes device_error{};
   // Live paths. Reconvergence is by *lowest program counter*: the path with
   // the smallest pc always runs next, and paths that arrive at the same pc are
   // merged. For the structured control flow compilers emit, that reconverges
@@ -5239,6 +5244,14 @@ class Interpreter {
       // one after another in launch order, which every ordering these can
       // ask for already satisfies: creation hands back a distinct handle,
       // and destroying, recording and waiting have nothing left to do.
+      if (op->callee == "__cuda_syscall_cnpv2GetLastError") {
+        exec_device_get_last_error(w, *op, m);
+        return;
+      }
+      if (op->callee == "__cuda_syscall_cnpv2SetLastError") {
+        exec_device_set_last_error(w, ctx, ins, *op, m);
+        return;
+      }
       if (op->callee == "__cuda_syscall_cnpv2StreamCreate" || op->callee == "__cuda_syscall_cnpv2EventCreate") {
         exec_device_handle(w, ctx, ins, *op, m);
         return;
@@ -11492,6 +11505,33 @@ class Interpreter {
       if (m & (Mask{1} << lane)) out.write(lane, 0, bytes, r[lane]);
   }
 
+  // A device-runtime call's error, kept as the thread's last one when it is
+  // an error at all (a success does not clear it, as on the host).
+  static void record_device_errors(Warp& w, Mask m, const Lanes& r) {
+    for (uint32_t lane = 0; lane < kMaxWarpSize; ++lane)
+      if ((m & (Mask{1} << lane)) && r[lane]) w.device_error[lane] = r[lane];
+  }
+
+  // The device runtime's per-thread error, through the two driver entry points
+  // its library is built on: __cuda_syscall_cnpv2GetLastError reads it
+  // without clearing it (cudaPeekAtLastError is just that call), and
+  // __cuda_syscall_cnpv2SetLastError writes it -- the library's own
+  // cudaGetLastError reads and then sets 0.
+  void exec_device_get_last_error(Warp& w, const OpCall& op, Mask m) {
+    Lanes r{};
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) r[lane] = w.device_error[lane];
+    write_call_result(w, op, m, r, 4);
+  }
+  void exec_device_set_last_error(Warp& w, const BlockCtx&, const Instr& ins, const OpCall& op, Mask m) {
+    if (op.param_slots.size() != 1)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, op.callee + " takes one argument");
+    const Warp::Slot& err = call_slot(w, ins, op, 0);
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) w.device_error[lane] = static_cast<uint32_t>(err.read(lane, 0, 4));
+    write_call_result(w, op, m, Lanes{}, 4);
+  }
+
   // int f(int* out): writes `value` through the pointer and returns success.
   void exec_device_int_query(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m,
                              int value) {
@@ -11510,6 +11550,7 @@ class Interpreter {
       // so it goes wherever a generic store would.
       store_routed(w, ctx, ins, lane, addr, 4, static_cast<uint32_t>(value));
     }
+    record_device_errors(w, m, r);
     write_call_result(w, op, m, r, 4);
   }
 
@@ -11531,6 +11572,7 @@ class Interpreter {
       const uint64_t handle = kDeviceHandleBase + device_handles_.fetch_add(1, std::memory_order_relaxed);
       store_routed(w, ctx, ins, lane, addr, 8, handle);
     }
+    record_device_errors(w, m, r);
     write_call_result(w, op, m, r, 4);
   }
   static constexpr uint64_t kDeviceHandleBase = 0x5654'4750'0000'0000ull;   // "VTGP": never a device address
@@ -11613,6 +11655,7 @@ class Interpreter {
       dl_->queue.push_back(c);
       r[lane] = kSuccess;
     }
+    record_device_errors(w, m, r);
     write_call_result(w, op, m, r, 4);
   }
 
