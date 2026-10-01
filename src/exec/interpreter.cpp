@@ -6976,7 +6976,10 @@ class Interpreter {
             std::memcpy(&u, &d, 8);
             r[lane] = u;
           } else {
-            r[lane] = f32bits(static_cast<float>(D[cd_index(lane, reg)]));
+            // A NaN is the card's canonical one: which NaN the host's
+            // additions kept depended on the operand order the compiler
+            // chose (e4m3's NaN codes, a -O3 build against -O2).
+            r[lane] = canon32(static_cast<float>(D[cd_index(lane, reg)]));
           }
         }
       if (!op.acc_int) alu_fault(r, m, op.acc_f64 ? 64 : 32);

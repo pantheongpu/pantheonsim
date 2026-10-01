@@ -2404,9 +2404,10 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
     if (rd == kRZ) return;
     for (unsigned s = 0; s < c_elems; ++s) {
       const double v = D[cd(l, s)];
+      // NaN results are the canonical ones, as the PTX engine writes them.
       if (acc == AccF16) {
         uint32_t& word = w.reg(rd + s / 2, l);
-        const uint16_t h = f64_to_half(v);
+        const uint16_t h = v != v ? uint16_t{0x7fff} : f64_to_half(v);
         word = (s % 2) ? (word & 0xffff) | (static_cast<uint32_t>(h) << 16) : (word & 0xffff0000u) | h;
       } else if (acc == AccF64) {
         const uint64_t b = f64_bits(v);
@@ -2415,7 +2416,7 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
       } else if (acc == AccS32) {
         w.reg(rd + s, l) = static_cast<uint32_t>(static_cast<int32_t>(v));
       } else {
-        w.reg(rd + s, l) = f32_bits(static_cast<float>(v));
+        w.reg(rd + s, l) = v != v ? 0x7fffffffu : f32_bits(static_cast<float>(v));
       }
     }
   });
