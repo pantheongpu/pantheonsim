@@ -78,7 +78,7 @@ typed and Ex) match an RTX 3060 bit for bit in real arithmetic, the card's
 order of fused operations repeated. `GemmEx` takes exactly the card's table
 of operand and compute types — complex, and int8 into float, included — as
 do `SgemmEx`, the complex Ex GEMMs (`CgemmEx`, `Cgemm3mEx`, `CherkEx`,
-`CsyrkEx` and their 3m forms) and the grouped batched GEMMs; `geqrfBatched`
+`CsyrkEx` and their 3m forms); `geqrfBatched`
 is LAPACK's geqrf per matrix. Each routine refuses the arguments the card
 refuses, measured: an unknown fill mode, side, operation or diagonal, a
 negative size, a zero increment or a short leading dimension in levels 2 and

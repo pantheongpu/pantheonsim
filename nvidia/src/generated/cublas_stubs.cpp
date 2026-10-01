@@ -31,7 +31,7 @@ namespace {
 }
 }  // namespace
 
-// None at present: every entry point a program reaches in the stub list this
-// file once held is implemented in cublas_api.cpp. The cublasLt* names it also
-// held are not libcublas's (NVIDIA's exports none of them) and are left to
-// libcublasLt, where a lookup by name in the global scope must find them.
+
+// The cublasLt* names this list also held are not libcublas's (NVIDIA's
+// exports none of them) and are left to libcublasLt, where a lookup by name in
+// the global scope must find them.

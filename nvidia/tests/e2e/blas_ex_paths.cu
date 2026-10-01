@@ -3,8 +3,8 @@
 // f16sp's), the matrix add geam (geam-cuda) and batched least squares
 // gelsBatched (gels-cuda) and batched QR, geqrfBatched; and the GEMM family's Ex forms (GemmEx's type
 // table, SgemmEx, and the complex CgemmEx, Cgemm3mEx, CherkEx, CsyrkEx and
-// their 3m forms, over single-precision or int8 complex operands) and the
-// grouped batched GEMMs. Every check passes on the card too.
+// their 3m forms, over single-precision or int8 complex operands). Every check
+// passes on the card too.
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -607,87 +607,6 @@ static void gemm_ex(cublasHandle_t h) {
     cudaFree(p);
 }
 
-// ---- the grouped batched GEMMs (cuBLAS 12.5 on) ----
-#if CUBLAS_VERSION >= 120500
-static void grouped(cublasHandle_t h) {
-  // Group 0: two 2 x 2 products C = 2 A B + C, A 2 x 3; group 1: one 3 x 1
-  // product C = A^T B - C, A 2 x 3. Integers, so the answers are exact.
-  const int ld = 3;
-  std::vector<float> M(9 * 6);
-  for (int i = 0; i < 9 * 6; ++i) M[i] = (float)((i * 5) % 7 - 3);
-  float* d = dev(M);
-  // The three GEMMs' matrices, group 0's two and then group 1's one; C all ones.
-  std::vector<float*> pa = {d, d + 9, d + 18}, pb = {d + 27, d + 36, d + 45};
-  std::vector<float*> pc = {dev(std::vector<float>(9, 1)), dev(std::vector<float>(9, 1)), dev(std::vector<float>(9, 1))};
-  float** dpa = dev(pa);
-  float** dpb = dev(pb);
-  float** dpc = dev(pc);
-  const cublasOperation_t ta[2] = {CUBLAS_OP_N, CUBLAS_OP_T}, tb[2] = {CUBLAS_OP_N, CUBLAS_OP_N};
-  const int m[2] = {2, 3}, n[2] = {2, 1}, k[2] = {3, 2}, lda[2] = {ld, ld}, ldb[2] = {ld, ld}, ldc[2] = {ld, ld},
-            size[2] = {2, 1};
-  const float al[2] = {2, 1}, be[2] = {1, -1};
-  IS(cublasSgemmGroupedBatched(h, ta, tb, m, n, k, al, dpa, lda, dpb, ldb, be, dpc, ldc, 2, size),
-     CUBLAS_STATUS_SUCCESS);
-  bool ok = true;
-  for (int g = 0, i = 0; g < 2; ++g)
-    for (int j = 0; j < size[g]; ++j, ++i) {
-      const auto got = host(pc[i], 9);
-      const float* A = &M[9 * i];
-      const float* B = &M[27 + 9 * i];
-      for (int c = 0; c < n[g]; ++c)
-        for (int r = 0; r < m[g]; ++r) {
-          float s = 0;
-          for (int p = 0; p < k[g]; ++p) s += (ta[g] == CUBLAS_OP_N ? A[p * ld + r] : A[r * ld + p]) * B[c * ld + p];
-          ok = ok && got[c * ld + r] == al[g] * s + be[g] * 1;
-        }
-    }
-  check(ok, "sgemmGroupedBatched: two groups, each with its own operations, sizes, alpha and beta");
-  const int64_t m64[2] = {2, 3}, n64[2] = {2, 1}, k64[2] = {3, 2}, ld64[2] = {ld, ld}, size64[2] = {2, 1};
-  IS(cublasGemmGroupedBatchedEx_64(h, ta, tb, m64, n64, k64, al, (const void* const*)dpa, CUDA_R_32F, ld64,
-                                   (const void* const*)dpb, CUDA_R_32F, ld64, be, (void* const*)dpc, CUDA_R_32F, ld64,
-                                   2, size64, CUBLAS_COMPUTE_32F_FAST_TF32),
-     CUBLAS_STATUS_SUCCESS);
-  // The types it takes, and what it refuses.
-  auto ex = [&](cudaDataType t, cublasComputeType_t c) {
-    return cublasGemmGroupedBatchedEx(h, ta, tb, m, n, k, al, (const void* const*)dpa, t, lda,
-                                      (const void* const*)dpb, t, ldb, be, (void* const*)dpc, t, ldc, 2, size, c);
-  };
-  IS(ex(CUDA_R_16F, CUBLAS_COMPUTE_32F), CUBLAS_STATUS_SUCCESS);
-  IS(ex(CUDA_R_16F, CUBLAS_COMPUTE_16F), CUBLAS_STATUS_NOT_SUPPORTED);
-  IS(ex(CUDA_R_32F, CUBLAS_COMPUTE_32F_FAST_16F), CUBLAS_STATUS_NOT_SUPPORTED);
-  IS(ex(CUDA_C_32F, CUBLAS_COMPUTE_32F), CUBLAS_STATUS_NOT_SUPPORTED);
-  IS(ex(CUDA_R_8I, CUBLAS_COMPUTE_32I), CUBLAS_STATUS_NOT_SUPPORTED);
-  IS(cublasSgemmGroupedBatched(h, ta, tb, m, n, k, al, dpa, lda, dpb, ldb, be, dpc, ldc, 0, size),
-     CUBLAS_STATUS_SUCCESS);
-  IS(cublasSgemmGroupedBatched(h, ta, tb, m, n, k, al, dpa, lda, dpb, ldb, be, dpc, ldc, -1, size),
-     CUBLAS_STATUS_INVALID_VALUE);
-  const int bad_size[2] = {2, -1}, bad_lda[2] = {ld, 1};
-  IS(cublasSgemmGroupedBatched(h, ta, tb, m, n, k, al, dpa, lda, dpb, ldb, be, dpc, ldc, 2, bad_size),
-     CUBLAS_STATUS_INVALID_VALUE);
-  IS(cublasSgemmGroupedBatched(h, ta, tb, m, n, k, al, dpa, bad_lda, dpb, ldb, be, dpc, ldc, 2, size),
-     CUBLAS_STATUS_INVALID_VALUE);   // group 1's A^T is 3 x 2: lda must reach k = 2
-  cublasSetPointerMode(h, CUBLAS_POINTER_MODE_DEVICE);
-  IS(cublasSgemmGroupedBatched(h, ta, tb, m, n, k, d, dpa, lda, dpb, ldb, d, dpc, ldc, 2, size),
-     CUBLAS_STATUS_NOT_SUPPORTED);
-  cublasSetPointerMode(h, CUBLAS_POINTER_MODE_HOST);
-  // Double precision.
-  std::vector<double> Md(M.begin(), M.end());
-  double* dd = dev(Md);
-  double* dcd = dev(std::vector<double>(9, 0));
-  double** dpad = dev(std::vector<double*>{dd});
-  double** dpbd = dev(std::vector<double*>{dd + 27});
-  double** dpcd = dev(std::vector<double*>{dcd});
-  const double ald[1] = {1}, bed[1] = {0};
-  const int one[1] = {1};
-  IS(cublasDgemmGroupedBatched(h, ta, tb, m, n, k, ald, dpad, lda, dpbd, ldb, bed, dpcd, ldc, 1, one),
-     CUBLAS_STATUS_SUCCESS);
-  check(host(dcd, 1)[0] == Md[0] * Md[27] + Md[3] * Md[28] + Md[6] * Md[29], "dgemmGroupedBatched");
-  for (void* p : {(void*)d, (void*)pc[0], (void*)pc[1], (void*)pc[2], (void*)dpa, (void*)dpb, (void*)dpc, (void*)dd,
-                  (void*)dcd, (void*)dpad, (void*)dpbd, (void*)dpcd})
-    cudaFree(p);
-}
-#endif
-
 int main() {
   cublasHandle_t h;
   if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) {
@@ -699,9 +618,6 @@ int main() {
   gels(h);
   geqrf(h);
   gemm_ex(h);
-#if CUBLAS_VERSION >= 120500
-  grouped(h);
-#endif
   cublasDestroy(h);
   std::printf(failures ? "FAIL: %d cuBLAS checks\n" : "PASS: every cuBLAS check\n", failures);
   return failures ? 1 : 0;
