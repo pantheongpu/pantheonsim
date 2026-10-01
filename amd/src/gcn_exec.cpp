@@ -4592,7 +4592,7 @@ struct Machine {
   // A read-modify-write of global or flat memory: what it does, and how
   // wide it is.
   enum class Rmw { Add, Sub, And, Or, Xor, Swap, AddF32, SMin, UMin, SMax, UMax, PkAddF16, PkAddBf16, Inc, Dec,
-                   AddF64, MinF64, MaxF64, CmpSwap };
+                   AddF64, MinF64, MaxF64, MinF32, MaxF32, CmpSwap };
   struct AtomicOp {
     Rmw rmw = Rmw::Add;
     uint32_t bytes = 4;
@@ -4613,9 +4613,15 @@ struct Machine {
         {"smax", Rmw::SMax},     {"umax", Rmw::UMax},       {"inc", Rmw::Inc},           {"dec", Rmw::Dec},
         {"cmpswap", Rmw::CmpSwap}, {"add_f32", Rmw::AddF32}, {"pk_add_f16", Rmw::PkAddF16},
         {"pk_add_bf16", Rmw::PkAddBf16}, {"add_f64", Rmw::AddF64}, {"min_f64", Rmw::MinF64},
-        {"max_f64", Rmw::MaxF64}};
-    for (const auto& [name, rmw] : kNames)
+        {"max_f64", Rmw::MaxF64},
+        // RDNA's float min and max, as each generation spells them: gfx10's
+        // fmin (fmin_x2 the double), gfx11's min_f32, gfx12's min_num_f32.
+        {"fmin", Rmw::MinF32}, {"fmax", Rmw::MaxF32}, {"min_f32", Rmw::MinF32}, {"max_f32", Rmw::MaxF32},
+        {"min_num_f32", Rmw::MinF32}, {"max_num_f32", Rmw::MaxF32}};
+    for (auto [name, rmw] : kNames)
       if (what == name) {
+        if (a->bytes == 8 && rmw == Rmw::MinF32) rmw = Rmw::MinF64;
+        if (a->bytes == 8 && rmw == Rmw::MaxF32) rmw = Rmw::MaxF64;
         a->rmw = rmw;
         if (rmw == Rmw::AddF64 || rmw == Rmw::MinF64 || rmw == Rmw::MaxF64) a->bytes = 8;
         return !(a->bytes == 8 && (rmw == Rmw::AddF32 || rmw == Rmw::PkAddF16 || rmw == Rmw::PkAddBf16));
@@ -4639,6 +4645,8 @@ struct Machine {
         case Rmw::Xor: return b ^ x;
         case Rmw::Swap: return x;
         case Rmw::AddF32: return as_bits(as_float(b) + as_float(x));
+        case Rmw::MinF32: return as_bits(std::fmin(as_float(b), as_float(x)));
+        case Rmw::MaxF32: return as_bits(std::fmax(as_float(b), as_float(x)));
         case Rmw::SMin: return static_cast<uint32_t>(std::min(sb, sx));
         case Rmw::UMin: return std::min(b, x);
         case Rmw::SMax: return static_cast<uint32_t>(std::max(sb, sx));

@@ -53,13 +53,13 @@ for src in asm_lds_dma asm_ds_tr; do
 done
 
 # And for gfx1100 (RDNA3, wave32), for what only RDNA has (test_amd_gcn_asm).
-for src in asm_permlane asm_images asm_wave asm_literal; do
+for src in asm_permlane asm_images asm_wave asm_literal asm_fminmax11; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1100 -c "$src.s" -o "$src.gfx1100.o"
   echo "wrote $(pwd)/$src.gfx1100.o"
 done
 
 # And for gfx1201 (RDNA4), for what only it has (test_amd_gcn_asm).
-for src in asm_ttmp asm_cycles; do
+for src in asm_ttmp asm_cycles asm_fminmax12; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c "$src.s" -o "$src.gfx1201.o"
   echo "wrote $(pwd)/$src.gfx1201.o"
 done

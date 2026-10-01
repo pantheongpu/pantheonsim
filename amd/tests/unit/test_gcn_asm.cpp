@@ -460,6 +460,23 @@ VTEST(rdna_shader_cycles_count_up) {
   VCHECK(q[3] - q[1] > 0 && q[3] - q[1] < 64);
 }
 
+// RDNA's float atomic min and max in global memory (gfx11's
+// global_atomic_min_f32, gfx12's global_atomic_min_num_f32), returning what
+// they found: hip-tests' float atomicMin/atomicMax compile to them on gfx12.
+VTEST(rdna_float_atomic_min_and_max_in_global_memory) {
+  for (const auto& [name, target] : {std::pair{"asm_fminmax11", "gfx1100"}, std::pair{"asm_fminmax12", "gfx1201"}}) {
+    MemoryManager mem(16ull << 20);
+    const uint64_t out = mem.alloc(16);
+    const float three[2] = {3.0f, 3.0f};
+    mem.write(out, three, 8);
+    const std::vector<uint32_t> r = run(object(name, target), "fminmax", mem, out, 4, {out});
+    VCHECK_EQ(r[0], f(1.0f));
+    VCHECK_EQ(r[1], f(5.0f));
+    VCHECK_EQ(r[2], f(3.0f));
+    VCHECK_EQ(r[3], f(3.0f));
+  }
+}
+
 // RDNA's packed 16-bit instructions take a literal as the whole pair: the
 // high result reads its top 16 bits (hipRTC's fp16 header test builds
 // v_dot2_f32_f16 with 0x42004200, 3.0 in both halves).
