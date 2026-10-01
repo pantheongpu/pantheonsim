@@ -143,6 +143,9 @@ struct ShimState {
   std::unordered_map<uintptr_t, EventRec> events;
   std::set<uintptr_t> streams;      // explicitly created streams (all synchronous)
   std::map<uintptr_t, size_t> managed;  // cuMemAllocManaged results: base -> bytes
+  // The memory a loaded module's __managed__ globals were moved to, by (device,
+  // module id): entries in `managed` too, freed when the module is unloaded.
+  std::map<std::pair<int, uint64_t>, std::vector<uintptr_t>> module_managed;
   std::unordered_map<uintptr_t, ArrayRec> arrays;  // cuArray3DCreate results
   std::unordered_map<uintptr_t, MipmapRec> mipmaps;  // cuMipmappedArrayCreate results
   // Mipmapped arrays destroyed, and the level arrays that went with them: the
@@ -588,6 +591,46 @@ int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
 
 // Instantiates a context-independent library on `dev` (parsing its PTX into a
 // runtime module on first use) and returns the runtime module id.
+// A loaded module's __managed__ globals, moved onto managed memory: host memory
+// every device maps, at one address for the host and every device, holding the
+// variable's initial value -- as the runtime moves a registered __managed__
+// variable (runtime_api.cpp's bind_managed_vars). It used to stay ordinary
+// device memory, which the host could not touch. On an RTX 3060 a module loaded
+// with cuModuleLoadData has its managed global at the address cuModuleGetGlobal
+// returns, readable and writable from the host, reported as managed, and a
+// kernel's writes to it visible there after cuCtxSynchronize.
+void bind_managed_globals(ShimState& s, int dev, uint64_t mid) {
+  vgpu::runtime::Device& d = s.rt->device(dev);
+  std::vector<uintptr_t> storage;
+  for (const std::string& name : d.managed_globals(mid)) {
+    uint64_t at = 0, size = 0;
+    if (!d.global(mid, name, &at, &size)) continue;
+    const size_t n = std::max<size_t>(size, 1);
+    void* p = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
+    if (!p) throw vgpu::Error::make(vgpu::Err::OutOfMemory, "__managed__ '", name, "'");
+    d.memory().read(at, p, size);   // the initial value
+    for (int o = 0; o < s.rt->device_count(); ++o)
+      s.rt->device(o).memory().map_host(reinterpret_cast<uint64_t>(p), p, n);
+    s.managed[reinterpret_cast<uintptr_t>(p)] = n;
+    d.rebind_global(mid, name, reinterpret_cast<uint64_t>(p));
+    storage.push_back(reinterpret_cast<uintptr_t>(p));
+  }
+  if (!storage.empty()) s.module_managed[{dev, mid}] = std::move(storage);
+}
+
+// Unloads a module, and frees what its managed globals were moved to.
+void unload_module(ShimState& s, int dev, uint64_t mid) {
+  s.rt->device(dev).unload_module(mid);
+  const auto it = s.module_managed.find({dev, mid});
+  if (it == s.module_managed.end()) return;
+  for (uintptr_t p : it->second) {
+    for (int o = 0; o < s.rt->device_count(); ++o) s.rt->device(o).memory().unmap_host(p);
+    s.managed.erase(p);
+    std::free(reinterpret_cast<void*>(p));
+  }
+  s.module_managed.erase(it);
+}
+
 uint64_t library_module_on(ShimState& s, uintptr_t lib_handle, int dev) {
   auto it = s.libraries.find(lib_handle);
   if (it == s.libraries.end())
@@ -597,6 +640,7 @@ uint64_t library_module_on(ShimState& s, uintptr_t lib_handle, int dev) {
   if (mit != lib.per_device_module.end()) return mit->second;
   uint64_t mid = s.rt->device(dev).load_module(lib.ptx);
   lib.per_device_module[dev] = mid;
+  bind_managed_globals(s, dev, mid);
   return mid;
 }
 
@@ -1058,6 +1102,7 @@ VGPU_EXPORT CUresult cuModuleLoadData(CUmodule* module, const void* image) {
     }
     int dev = current_device(s);
     uint64_t mid = s.rt->device(dev).load_module(text);
+    bind_managed_globals(s, dev, mid);
     uintptr_t h = make_handle(s, kTagModule);
     s.modules[h] = {dev, mid};
     *module = reinterpret_cast<CUmodule>(h);
@@ -1464,7 +1509,7 @@ VGPU_EXPORT CUresult cuModuleUnload(CUmodule hmod) {
     auto it = s.modules.find(h);
     if (it == s.modules.end()) return CUDA_ERROR_NOT_FOUND;
     auto [dev, mid] = it->second;
-    s.rt->device(dev).unload_module(mid);
+    unload_module(s, dev, mid);
     s.modules.erase(it);
     for (auto fit = s.functions.begin(); fit != s.functions.end();) {
       // Function handles from this module are now dangling; drop them.
@@ -1594,7 +1639,7 @@ VGPU_EXPORT CUresult cuLibraryUnload(void* library) {
     uintptr_t h = check_handle(reinterpret_cast<uintptr_t>(library), kTagLibrary, "library");
     auto it = s.libraries.find(h);
     if (it == s.libraries.end()) return CUDA_ERROR_INVALID_VALUE;
-    for (auto& [dev, mid] : it->second.per_device_module) s.rt->device(dev).unload_module(mid);
+    for (auto& [dev, mid] : it->second.per_device_module) unload_module(s, dev, mid);
     // Drop kernels and functions minted from this library.
     for (auto k = s.kernels.begin(); k != s.kernels.end();)
       k = k->second.library == h ? s.kernels.erase(k) : std::next(k);
@@ -2214,6 +2259,13 @@ VGPU_EXPORT CUresult cuMemsetD2D32Async(CUdeviceptr d, size_t pitch, unsigned in
 VGPU_EXPORT CUresult cuMemGetAddressRange_v2(CUdeviceptr* base, size_t* size, CUdeviceptr dptr) {
   return api("cuMemGetAddressRange", true, false, [&](ShimState& s) {
     uint64_t b = 0, sz = 0;
+    // Managed memory is the allocation it was made as -- for a module's
+    // managed global, the variable, as the card reports it.
+    if (const auto* m = managed_range(s, dptr, 1)) {
+      if (base) *base = m->first;
+      if (size) *size = m->second;
+      return CUDA_SUCCESS;
+    }
     if (!owner_memory(s, dptr).find_allocation(dptr, &b, &sz)) return CUDA_ERROR_INVALID_VALUE;
     if (base) *base = b;
     if (size) *size = sz;

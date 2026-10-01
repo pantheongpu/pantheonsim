@@ -89,6 +89,9 @@ class Device {
   // each device's copy of the module onto it. Kernels launched afterwards use
   // the new address, as do globals initialised with this one's address.
   void rebind_global(uint64_t module_id, const std::string& name, uint64_t addr);
+  // The names of a module's __managed__ globals (".attribute(.managed)"), which
+  // whoever loaded the module moves onto host-shared memory with rebind_global.
+  std::vector<std::string> managed_globals(uint64_t module_id) const;
   // Whether the module defines a kernel of that name.
   bool has_kernel(uint64_t module_id, const std::string& name) const;
 
