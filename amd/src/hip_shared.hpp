@@ -22,6 +22,16 @@ struct Loaded;   // a code object loaded onto a device
 // the environment names no AMD GPU.
 bool start(std::string* why);
 int device_count();
+// Memory shared with another process, as HIP's IPC handles share it: the
+// allocation holding `ptr` moves into a file another process maps. `serial`
+// numbers this process's exports; the file is named by the pid and it.
+bool ipc_share(void* ptr, int* device, uint64_t* size, uint32_t* serial, std::string* why);
+void* ipc_attach(uint32_t pid, uint32_t serial, uint64_t size, int device, std::string* why);
+bool ipc_detach(void* ptr);
+// Device memory as a file descriptor (hipMemGetHandleForAddressRange's): the
+// allocation holding the range, and where `ptr` is in it.
+bool export_dmabuf(const void* ptr, size_t size, int* fd, uint64_t* offset, std::string* why);
+
 // Which of the machine's devices a shown one is (a visible-devices list can
 // show some of them, in another order): what its identity is drawn from.
 int physical(int ordinal);

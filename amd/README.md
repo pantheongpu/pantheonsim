@@ -473,7 +473,8 @@ That works because the runtime keeps to what ROCm's does where CLR looks:
 - **Work-group limit:** a packet is held only to the hardware's work-group limit, not the kernel's metadata.
 - **Host access:** the host is never given a device's memory directly, so CLR copies instead of writing through it.
 - **Supported extras:** AMD's loader extension, barrier-value packets, asynchronous signal handlers, dispatch timestamps and `hsa_amd_pointer_info` all work.
-- **Not modelled:** images, virtual memory, HSA's IPC and SVM are refused by name. HIP's IPC is modelled (see RCCL below).
+- **Images, virtual memory and IPC:** HSA's images extension (see Textures), its virtual memory (`hsa_amd_vmem_*`), its IPC handles (`hsa_amd_ipc_memory_*`) and dma-buf export are modelled. The last three are HIP's own (`src/hsa_vmem.inc`), reached by hidden names so that ROCm's libamdhip64 over this runtime does not call itself. ROCm's HIP runs `tests/hipcc/memory.cpp`'s virtual memory, pool IPC and dma-buf checks over it.
+- **Not modelled:** SVM's attributes and prefetch (the runtime reports no HMM, so ROCm's HIP keeps its managed memory without them), and graphics interop.
 
 `VGPU_TRACE_HSA=1` logs what memory the program allocates, locks and registers.
 

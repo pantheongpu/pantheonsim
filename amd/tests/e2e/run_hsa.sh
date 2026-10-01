@@ -78,8 +78,29 @@ run_images() {   # run_images <label> <extra cflags...>
   done
 }
 
+# Virtual memory and IPC (amd/tests/hsa/hsa_vmem.c), on an MI300X.
+run_vmem() {   # run_vmem <label> <extra cflags...>
+  local label=$1; shift
+  if ! "$cc" -std=c11 -O1 -Wall -Werror "${sanitize[@]}" "$@" "$root/amd/tests/hsa/hsa_vmem.c" -o "$tmp/hsa_vmem" \
+       -L"$shim" -l:libhsa-runtime64.so.1 -Wl,-rpath,"$(cd "$shim" && pwd)" 2> "$tmp/cc.log"; then
+    echo "FAIL  hsa_vmem.c builds against $label"; sed 's/^/      /' "$tmp/cc.log" | head -20; fail=1; return
+  fi
+  local out status passed
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x timeout 120 "$tmp/hsa_vmem" 2>&1)
+  status=$?
+  passed=$(grep -c '^ok ' <<< "$out")
+  if [[ $status != 0 ]] || grep -q '^FAIL' <<< "$out" || [[ $passed != 6 ]]; then
+    echo "FAIL  virtual memory and IPC, built against $label: $passed of 6 (exit $status)"
+    echo "$out" | grep -v '^ok ' | tail -5 | sed 's/^/      /'
+    fail=1
+  else
+    echo "ok    virtual memory and IPC, built against $label: 6 of 6"
+  fi
+}
+
 run "VirtualGPU's HSA header" -I"$root/amd/include"
 run_images "VirtualGPU's HSA header" -I"$root/amd/include"
+run_vmem "VirtualGPU's HSA header" -I"$root/amd/include"
 rocm_include="${VGPU_ROCM_INCLUDE:-}"
 if [[ -z "$rocm_include" ]]; then
   for d in /opt/rocm/include $(ls -d "$HOME"/.local/share/rocm-*/opt/rocm-*/include 2>/dev/null | sort -V | tail -1); do
@@ -89,6 +110,7 @@ fi
 if [[ -n "$rocm_include" ]]; then
   run "ROCm's HSA headers" -DVGPU_REAL_HSA -D__HIP_PLATFORM_AMD__ -I"$rocm_include"
   run_images "ROCm's HSA headers" -DVGPU_REAL_HSA -D__HIP_PLATFORM_AMD__ -I"$rocm_include"
+  run_vmem "ROCm's HSA headers" -DVGPU_REAL_HSA -D__HIP_PLATFORM_AMD__ -I"$rocm_include"
 else
   echo "skip  no ROCm headers to build against as well"
 fi

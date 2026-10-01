@@ -599,6 +599,39 @@ hsa_status_t hsa_ext_sampler_create_v2(hsa_agent_t agent, const hsa_ext_sampler_
                                        hsa_ext_sampler_t* sampler);
 hsa_status_t hsa_ext_sampler_destroy(hsa_agent_t agent, hsa_ext_sampler_t sampler);
 
+/* AMD's virtual memory and IPC (hsa_ext_amd.h). */
+typedef struct hsa_amd_vmem_alloc_handle_s { uint64_t handle; } hsa_amd_vmem_alloc_handle_t;
+typedef enum { MEMORY_TYPE_NONE, MEMORY_TYPE_PINNED } hsa_amd_memory_type_t;
+typedef struct hsa_amd_memory_access_desc_s {
+  hsa_access_permission_t permissions;
+  hsa_agent_t agent_handle;
+} hsa_amd_memory_access_desc_t;
+typedef struct hsa_amd_ipc_memory_s { uint32_t handle[8]; } hsa_amd_ipc_memory_t;
+hsa_status_t hsa_amd_vmem_address_reserve(void** va, size_t size, uint64_t address, uint64_t flags);
+hsa_status_t hsa_amd_vmem_address_reserve_align(void** va, size_t size, uint64_t address, uint64_t alignment,
+                                                uint64_t flags);
+hsa_status_t hsa_amd_vmem_address_free(void* va, size_t size);
+hsa_status_t hsa_amd_vmem_handle_create(hsa_amd_memory_pool_t pool, size_t size, hsa_amd_memory_type_t type,
+                                        uint64_t flags, hsa_amd_vmem_alloc_handle_t* memory_handle);
+hsa_status_t hsa_amd_vmem_handle_release(hsa_amd_vmem_alloc_handle_t memory_handle);
+hsa_status_t hsa_amd_vmem_map(void* va, size_t size, size_t in_offset, hsa_amd_vmem_alloc_handle_t memory_handle,
+                              uint64_t flags);
+hsa_status_t hsa_amd_vmem_unmap(void* va, size_t size);
+hsa_status_t hsa_amd_vmem_set_access(void* va, size_t size, const hsa_amd_memory_access_desc_t* desc,
+                                     size_t desc_cnt);
+hsa_status_t hsa_amd_vmem_get_access(void* va, hsa_access_permission_t* perms, hsa_agent_t agent_handle);
+hsa_status_t hsa_amd_vmem_export_shareable_handle(int* dmabuf_fd, hsa_amd_vmem_alloc_handle_t handle,
+                                                  uint64_t flags);
+hsa_status_t hsa_amd_vmem_import_shareable_handle(int dmabuf_fd, hsa_amd_vmem_alloc_handle_t* handle);
+hsa_status_t hsa_amd_vmem_retain_alloc_handle(hsa_amd_vmem_alloc_handle_t* memory_handle, void* addr);
+hsa_status_t hsa_amd_vmem_get_alloc_properties_from_handle(hsa_amd_vmem_alloc_handle_t memory_handle,
+                                                           hsa_amd_memory_pool_t* pool,
+                                                           hsa_amd_memory_type_t* type);
+hsa_status_t hsa_amd_ipc_memory_create(void* ptr, size_t len, hsa_amd_ipc_memory_t* handle);
+hsa_status_t hsa_amd_ipc_memory_attach(const hsa_amd_ipc_memory_t* handle, size_t len, uint32_t num_agents,
+                                       const hsa_agent_t* mapping_agents, void** mapped_ptr);
+hsa_status_t hsa_amd_ipc_memory_detach(void* mapped_ptr);
+
 #ifdef __cplusplus
 }
 #endif

@@ -38,6 +38,7 @@
 #include "vgpu/amd_bundle.hpp"
 #include "vgpu/amd_chip.hpp"
 #include "vgpu/amd_image.hpp"
+#include "vgpu/hip_abi.hpp"
 #include "vgpu/hsa_abi.h"
 
 namespace {
@@ -1939,32 +1940,20 @@ hsa_status_t hsa_amd_register_system_event_handler(void*, void*) { return HSA_ST
 // ---- Images and samplers -----------------------------------------------------------
 #include "hsa_images.inc"
 
+// ---- Virtual memory and memory shared between processes --------------------------
+#include "hsa_vmem.inc"
+
 // What this does not model yet, refused by name: images laid out by
-// graphics interop (hsa_amd_image_create), virtual memory, sharing memory between processes, SVM,
-// graphics interop and DMA-buf.
+// graphics interop (hsa_amd_image_create), SVM's attributes, graphics
+// interop and DMA-buf export.
 #define VGPU_HSA_REFUSED(name, what) \
   hsa_status_t name() { return fail(HSA_STATUS_ERROR_NOT_SUPPORTED, #name " is not supported: " what); }
 VGPU_HSA_REFUSED(hsa_amd_image_create, "images over another API's layout are not modelled")
-VGPU_HSA_REFUSED(hsa_amd_vmem_address_reserve, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_address_free, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_handle_create, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_handle_release, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_map, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_unmap, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_set_access, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_get_access, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_export_shareable_handle, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_import_shareable_handle, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_retain_alloc_handle, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_ipc_memory_create, "memory is not shared between processes yet")
-VGPU_HSA_REFUSED(hsa_amd_ipc_memory_attach, "memory is not shared between processes yet")
-VGPU_HSA_REFUSED(hsa_amd_ipc_memory_detach, "memory is not shared between processes yet")
 VGPU_HSA_REFUSED(hsa_amd_svm_attributes_get, "SVM is not modelled")
 VGPU_HSA_REFUSED(hsa_amd_svm_attributes_set, "SVM is not modelled")
 VGPU_HSA_REFUSED(hsa_amd_svm_prefetch_async, "SVM is not modelled")
 VGPU_HSA_REFUSED(hsa_amd_interop_map_buffer, "there is no graphics driver to share with")
 VGPU_HSA_REFUSED(hsa_amd_interop_unmap_buffer, "there is no graphics driver to share with")
-VGPU_HSA_REFUSED(hsa_amd_portable_export_dmabuf, "there is no DMA-buf to export")
 VGPU_HSA_REFUSED(hsa_executable_agent_global_variable_define, "external variables are not defined yet")
 
 }  // extern "C"
