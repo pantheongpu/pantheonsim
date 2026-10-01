@@ -59,7 +59,7 @@ for src in asm_permlane asm_images asm_wave asm_literal asm_fminmax11; do
 done
 
 # And for gfx1201 (RDNA4), for what only it has (test_amd_gcn_asm).
-for src in asm_ttmp asm_cycles asm_fminmax12; do
+for src in asm_ttmp asm_cycles asm_fminmax12 asm_salu_f16; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c "$src.s" -o "$src.gfx1201.o"
   echo "wrote $(pwd)/$src.gfx1201.o"
 done

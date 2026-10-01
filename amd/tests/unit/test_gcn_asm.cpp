@@ -460,6 +460,19 @@ VTEST(rdna_shader_cycles_count_up) {
   VCHECK(q[3] - q[1] > 0 && q[3] - q[1] < 64);
 }
 
+// RDNA4's scalar half instructions read an inline float constant as the
+// half's own encoding (2.0 is 0x4000): hip-tests' __halfMath on gfx12 got
+// 3.0 for 1.0 * 2.0 + 3.0 when it was read as a float's bits.
+VTEST(rdna4_scalar_half_instructions_read_inline_constants_as_halves) {
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(16);
+  const std::vector<uint32_t> r = run(object("asm_salu_f16", "gfx1201"), "salu_half", mem, out, 4, {out});
+  VCHECK_EQ(r[0], 0x4500u);   // 5.0
+  VCHECK_EQ(r[1], 0x4000u);   // 2.0
+  VCHECK_EQ(r[2], 0x3800u);   // 0.5
+  VCHECK_EQ(r[3], 1u);
+}
+
 // RDNA's float atomic min and max in global memory (gfx11's
 // global_atomic_min_f32, gfx12's global_atomic_min_num_f32), returning what
 // they found: hip-tests' float atomicMin/atomicMax compile to them on gfx12.

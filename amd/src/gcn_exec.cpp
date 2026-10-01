@@ -806,6 +806,18 @@ struct Machine {
 
   // ---- The instructions ---------------------------------------------------
 
+  // A half operand of a scalar float instruction: a register's low 16 bits,
+  // or a constant's. An inline float constant is the half's own encoding
+  // (2.0 is 0x4000), as the vector unit reads one for a 16-bit instruction,
+  // not the float's bits, whose low half is zero.
+  _Float16 scalar_half(Wave& w, const Operand& o) {
+    if (o.kind == OperandKind::InlineFloat) return static_cast<_Float16>(o.fvalue);
+    const uint16_t bits = static_cast<uint16_t>(scalar(w, o));
+    _Float16 r;
+    std::memcpy(&r, &bits, 2);
+    return r;
+  }
+
   // RDNA's scalar float instructions (gfx11.5 and gfx12): a float or a half
   // in a scalar register, IEEE arithmetic as the vector unit does it.
   // Returns whether `op` was one.
@@ -823,6 +835,9 @@ struct Machine {
       std::memcpy(&bits, &v, 2);
       write_scalar(w, in.dst[0], bits);
     };
+    // Source k of a half instruction (scalar_half: an inline float constant
+    // is the half's own encoding).
+    const auto hs = [&](size_t k) { return scalar_half(w, in.src[k]); };
     if (op == "s_add_f32"_op) put(x + y);
     else if (op == "s_sub_f32"_op) put(x - y);
     else if (op == "s_mul_f32"_op) put(x * y);
@@ -839,20 +854,20 @@ struct Machine {
     else if (op == "s_cvt_u32_f32"_op)
       write_scalar(w, in.dst[0], std::isnan(x) || x <= 0 ? 0u : x >= 4294967296.0f ? 0xFFFFFFFFu : static_cast<uint32_t>(x));
     else if (op == "s_cvt_f16_f32"_op) put_h(static_cast<_Float16>(x));
-    else if (op == "s_cvt_f32_f16"_op) put(static_cast<float>(h(a)));
+    else if (op == "s_cvt_f32_f16"_op) put(static_cast<float>(hs(0)));
     else if (op == "s_cvt_hi_f32_f16"_op) put(static_cast<float>(h(a >> 16)));
     else if (op == "s_ceil_f32"_op) put(std::ceil(x));
     else if (op == "s_floor_f32"_op) put(std::floor(x));
     else if (op == "s_trunc_f32"_op) put(std::trunc(x));
     else if (op == "s_rndne_f32"_op) put(std::nearbyint(x));
-    else if (op == "s_add_f16"_op) put_h(h(a) + h(b));
-    else if (op == "s_sub_f16"_op) put_h(h(a) - h(b));
-    else if (op == "s_mul_f16"_op) put_h(h(a) * h(b));
+    else if (op == "s_add_f16"_op) put_h(hs(0) + hs(1));
+    else if (op == "s_sub_f16"_op) put_h(hs(0) - hs(1));
+    else if (op == "s_mul_f16"_op) put_h(hs(0) * hs(1));
     else if (op == "s_fmac_f16"_op)
-      put_h(static_cast<_Float16>(std::fma(static_cast<float>(h(a)), static_cast<float>(h(b)),
+      put_h(static_cast<_Float16>(std::fma(static_cast<float>(hs(0)), static_cast<float>(hs(1)),
                                            static_cast<float>(h(scalar(w, in.dst[0]))))));
-    else if (op == "s_min_num_f16"_op) put_h(h(a) < h(b) || h(b) != h(b) ? h(a) : h(b));
-    else if (op == "s_max_num_f16"_op) put_h(h(a) > h(b) || h(b) != h(b) ? h(a) : h(b));
+    else if (op == "s_min_num_f16"_op) put_h(hs(0) < hs(1) || hs(1) != hs(1) ? hs(0) : hs(1));
+    else if (op == "s_max_num_f16"_op) put_h(hs(0) > hs(1) || hs(1) != hs(1) ? hs(0) : hs(1));
     else return false;
     return true;
   }
@@ -1292,14 +1307,10 @@ struct Machine {
     if (in.name.size() > 10 && in.name.rfind("s_cmp_", 0) == 0 &&
         (in.name.compare(in.name.size() - 4, 4, "_f32") == 0 || in.name.compare(in.name.size() - 4, 4, "_f16") == 0)) {
       const bool half = in.name.compare(in.name.size() - 4, 4, "_f16") == 0;
-      const auto value = [&](uint64_t v) -> double {
-        if (!half) return as_float(static_cast<uint32_t>(v));
-        _Float16 h16;
-        const uint16_t bits = static_cast<uint16_t>(v);
-        std::memcpy(&h16, &bits, 2);
-        return static_cast<double>(h16);
+      const auto value = [&](size_t k, uint64_t v) -> double {
+        return half ? static_cast<double>(scalar_half(w, in.src[k])) : as_float(static_cast<uint32_t>(v));
       };
-      const double x = value(a), y = value(b);
+      const double x = value(0, a), y = value(1, b);
       const std::string t = in.name.substr(6, in.name.size() - 10);
       const bool unordered = x != x || y != y;
       w.scc = t == "lt" ? x < y : t == "eq" ? x == y : t == "le" ? x <= y : t == "gt" ? x > y
