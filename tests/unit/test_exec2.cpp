@@ -224,6 +224,166 @@ VTEST(aggregate_byte_array_param) {
   VCHECK_EQ(e.mem.load_scalar(buf, 4), uint64_t{0xC0FFEE});
 }
 
+VTEST(signed_narrow_params_sign_extend) {
+  // A kernel taking signed char and short, as nvcc compiles it: ld.param.s8
+  // into a 16-bit register and ld.param.s16 straight into a 32-bit one. Both
+  // deliver the value (-128, -32768), not the bit pattern (128, 32768), by
+  // name and through a register holding the parameter's address. The
+  // unsigned load of the same byte is the control.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out, .param .u8 a, .param .u8 b, .param .u16 c)
+{
+    .reg .b16 %rs<2>;
+    .reg .b32 %r<7>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    ld.param.s8 %rs1, [a];
+    cvt.s32.s16 %r1, %rs1;
+    st.global.u32 [%rd2], %r1;
+    ld.param.s16 %r2, [c];
+    st.global.u32 [%rd2+4], %r2;
+    ld.param.s8 %r3, [b];
+    st.global.u32 [%rd2+8], %r3;
+    ld.param.u8 %r4, [a];
+    st.global.u32 [%rd2+12], %r4;
+    mov.u64 %rd3, c;
+    ld.param.s16 %r5, [%rd3];
+    st.global.u32 [%rd2+16], %r5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(20);
+  std::vector<uint8_t> o(8);
+  std::memcpy(o.data(), &out, 8);
+  exec::launch(m.entries[0], LaunchConfig{}, {o, {0x80}, {0x05}, {0x00, 0x80}}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out + 0, 4), uint64_t{0xFFFFFF80});   // -128
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0xFFFF8000});   // -32768
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), 5ull);
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), 128ull);
+  VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{0xFFFF8000});  // through a register
+}
+
+VTEST(vector_param_accesses_through_call_slots) {
+  // A struct passed to and returned from a device function, as nvcc writes
+  // it: st.param.v4.b8 into the argument, ld.param.v4.u8 and a signed byte
+  // (ld.param.s8) out of it in the callee, and the result back through a
+  // .v2 return slot. Boost.Math's quantile finders pass their arguments so.
+  // An RTX 3060 runs this PTX to ffffff80 and 1 + 2*10 + 3*100 + 200*1000.
+  std::string ptx = std::string(kHeader) + R"(
+.func (.param .align 8 .b8 r[8]) pack(.param .align 4 .b8 p[8])
+{
+    .reg .b16 %rs<5>;
+    .reg .b32 %r<4>;
+    ld.param.v4.u8 {%rs1, %rs2, %rs3, %rs4}, [p];
+    ld.param.s8 %r1, [p+4];
+    cvt.u32.u16 %r2, %rs1;
+    cvt.u32.u16 %r3, %rs2;
+    mad.lo.u32 %r2, %r3, 10, %r2;
+    cvt.u32.u16 %r3, %rs3;
+    mad.lo.u32 %r2, %r3, 100, %r2;
+    cvt.u32.u16 %r3, %rs4;
+    mad.lo.u32 %r2, %r3, 1000, %r2;
+    st.param.v2.b32 [r], {%r1, %r2};
+    ret;
+}
+.visible .entry k(.param .u64 out)
+{
+    .reg .b16 %rs<6>;
+    .reg .b32 %r<3>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u16 %rs1, 1;
+    mov.u16 %rs2, 2;
+    mov.u16 %rs3, 3;
+    mov.u16 %rs4, 200;
+    mov.u16 %rs5, 128;
+    {
+    .param .align 4 .b8 param0[8];
+    st.param.v4.b8 [param0], {%rs1, %rs2, %rs3, %rs4};
+    st.param.b8 [param0+4], %rs5;
+    .param .align 8 .b8 retval0[8];
+    call.uni (retval0), pack, (param0);
+    ld.param.v2.b32 {%r1, %r2}, [retval0];
+    }
+    st.global.v2.u32 [%rd2], {%r1, %r2};
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(8);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0xFFFFFF80});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), 200321ull);
+}
+
+VTEST(running_off_the_end_of_a_function_returns) {
+  // A kernel and a .func whose last block ends without ret. Lanes that run
+  // off the end of the .func return to the caller with the value they stored
+  // (lane 3), and lanes that run off the end of the kernel exit. An RTX 3060
+  // runs this PTX to 0 2 104 106. nvcc emits kernels like this after a call
+  // whose result nothing uses (Boost.Math's inverse Gaussian quantile).
+  std::string ptx = std::string(kHeader) + R"(
+.func (.param .b32 r) f(.param .b32 v)
+{
+    .reg .pred %q;
+    .reg .b32 %t<3>;
+    ld.param.b32 %t1, [v];
+    shl.b32 %t2, %t1, 1;
+    st.param.b32 [r], %t2;
+    setp.eq.u32 %q, %t1, 3;
+    @%q bra FEND;
+    ret;
+FEND:
+}
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd2, %rd2, %rd3;
+    {
+    .param .b32 param0;
+    st.param.b32 [param0], %r1;
+    .param .b32 retval0;
+    call.uni (retval0), f, (param0);
+    ld.param.b32 %r2, [retval0];
+    }
+    st.global.u32 [%rd2], %r2;
+    setp.lt.u32 %p1, %r1, 2;
+    @%p1 bra DONE;
+    add.u32 %r3, %r2, 100;
+    st.global.u32 [%rd2], %r3;
+    bra.uni END;
+DONE:
+    ret;
+END:
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(16);
+  std::vector<uint8_t> zero(16, 0);
+  e.mem.write(out, zero.data(), 16);
+  LaunchConfig cfg;
+  cfg.block = {4, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), 0ull);
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), 2ull);
+  VCHECK_EQ(e.mem.load_scalar(out + 8, 4), 104ull);
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), 106ull);
+}
+
 VTEST(module_global_string_and_symbols) {
   // "AB" + zero padding, read through a symbol address.
   std::string ptx = std::string(kHeader) + R"(

@@ -12,6 +12,9 @@ struct WgmmaDesc {
   uint64_t start = 0, lbo = 0, sbo = 0;
   uint32_t swizzle = 0;   // bytes in a swizzled row: 0 (none), 32, 64 or 128
   uint32_t atom = 16;     // bytes the swizzle moves as one (tcgen05's mode 1: 32)
+  // tcgen05, sm_103a: `lbo` is the absolute address where a K-major row
+  // continues past the end of its swizzle row (bit 52).
+  bool lbo_abs = false;
 };
 
 // Decodes a wgmma descriptor. Throws vgpu::Error for a nonzero base offset

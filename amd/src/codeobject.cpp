@@ -426,7 +426,9 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     kern.user_sgpr_count = std::max(kern.user_sgpr_count, (d.rsrc2 >> 1) & 0x1F);
     out.kernels.push_back(std::move(kern));
   }
-  if (out.kernels.empty()) throw Error::make(Err::ProfileParse, origin, ": no kernels");
+  // An object may have no kernels at all: a translation unit of a hipcc
+  // program that defines only __device__ variables is one, and its
+  // variables are still what hipMemcpyToSymbol reaches.
   return out;
 }
 

@@ -107,7 +107,7 @@ if [[ -x "$tmp/libraries_hip" ]]; then
     "a destroyed stream is no longer known 1" \
     "a kernel reads and writes registered host memory 1" \
     "registered memory is host memory, at its own address 1" \
-    "registering it twice is refused 1" \
+    "registering it again is accepted, as ROCm's HIP accepts it 1" \
     "and unregistering what is not registered 1" \
     "a kernel reads and writes pinned host memory 1" \
     "a kernel reads and writes managed memory, which says it is managed 1" \

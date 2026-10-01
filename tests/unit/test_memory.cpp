@@ -341,6 +341,33 @@ VTEST(a_mapped_host_buffer_is_readable_and_writable_from_the_device_side) {
   mem.unmap_host(addr);
 }
 
+VTEST(host_buffers_mapped_end_to_end_read_write_and_fill_as_one_range) {
+  // HIP's virtual memory maps separate host buffers side by side at device
+  // addresses; a copy or a fill that runs across the seam reaches both.
+  MemoryManager mem(1 << 20);
+  std::vector<uint8_t> a(4096, 0), b(4096, 0);
+  const uint64_t at = 0x7e00'0000'0000ull;
+  mem.map_host(at, a.data(), a.size());
+  mem.map_host(at + a.size(), b.data(), b.size());
+  std::vector<uint8_t> in(64);
+  for (size_t i = 0; i < in.size(); ++i) in[i] = static_cast<uint8_t>(i + 1);
+  mem.write(at + 4096 - 32, in.data(), in.size());
+  VCHECK_EQ(a[4095], 32u);
+  VCHECK_EQ(b[0], 33u);
+  std::vector<uint8_t> out(64, 0);
+  mem.read(at + 4096 - 32, out.data(), out.size());
+  VCHECK(out == in);
+  const uint8_t pattern[2] = {0xAA, 0xBB};
+  mem.fill(at + 4096 - 3, pattern, 2, 6);   // the phase runs on across the seam
+  VCHECK_EQ(a[4093], 0xAAu);
+  VCHECK_EQ(a[4095], 0xAAu);
+  VCHECK_EQ(b[0], 0xBBu);
+  VCHECK_EQ(b[2], 0xBBu);
+  VCHECK_EQ(b[3], 36u);   // past the fill: what the write left
+  mem.unmap_host(at);
+  mem.unmap_host(at + a.size());
+}
+
 VTEST(a_mapped_buffer_is_owned_by_the_device_even_outside_its_window) {
   // owns() is what decides whether a pointer is treated as device memory, and
   // a managed buffer lives at its real host address -- outside every device

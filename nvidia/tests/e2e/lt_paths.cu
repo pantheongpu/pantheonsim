@@ -308,6 +308,22 @@ static void pointer_mode_and_refusal() {
   for (void* p : {(void*)da, (void*)db, (void*)dd, (void*)dalpha}) cudaFree(p);
 }
 
+// The logger calls frameworks and bindings make at start-up (cudarc sets a
+// level). An RTX 3060's cuBLASLt takes levels 0 to 6 and refuses the rest,
+// and takes any mask.
+static void logger() {
+  check(cublasLtLoggerSetLevel(0) == CUBLAS_STATUS_SUCCESS, "logger level 0 taken", 0);
+  check(cublasLtLoggerSetLevel(5) == CUBLAS_STATUS_SUCCESS, "logger level 5 taken", 0);
+  check(cublasLtLoggerSetLevel(6) == CUBLAS_STATUS_SUCCESS, "logger level 6 taken", 0);
+  check(cublasLtLoggerSetLevel(7) == CUBLAS_STATUS_INVALID_VALUE, "logger level 7 refused", 0);
+  check(cublasLtLoggerSetLevel(-1) == CUBLAS_STATUS_INVALID_VALUE, "logger level -1 refused", 0);
+  check(cublasLtLoggerSetMask(31) == CUBLAS_STATUS_SUCCESS, "logger mask 31 taken", 0);
+  check(cublasLtLoggerSetMask(1000) == CUBLAS_STATUS_SUCCESS, "logger mask 1000 taken", 0);
+  check(cublasLtLoggerSetCallback(nullptr) == CUBLAS_STATUS_SUCCESS, "logger callback cleared", 0);
+  check(cublasLtLoggerSetFile(nullptr) == CUBLAS_STATUS_SUCCESS, "logger file cleared", 0);
+  check(cublasLtLoggerSetLevel(0) == CUBLAS_STATUS_SUCCESS, "logger back off", 0);
+}
+
 int main() {
   if (cublasLtCreate(&lt)) {
     std::printf("FAIL: cublasLtCreate\n");
@@ -317,6 +333,7 @@ int main() {
   bf16_batched_rowmajor();
   fp8_scaled();
   pointer_mode_and_refusal();
+  logger();
   cublasLtDestroy(lt);
   std::printf(failures ? "FAIL: %d cuBLASLt checks\n" : "PASS: every cuBLASLt check\n", failures);
   return failures ? 1 : 0;

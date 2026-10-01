@@ -250,6 +250,64 @@ for line in \
   expect "$line" "$line" "$(grep -Fo "$line" <<< "$out")"
 done
 
+# HIP's calls beyond the everyday ones (hipcc/api.cpp): device flags and
+# UUIDs, contexts, the legacy and per-thread default streams, callbacks,
+# waiting on memory in a stream, every launch form. Each is held to what
+# ROCm's HIP answers, and the program counts the checks that did not hold.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$shim" timeout 300 \
+      "$(dirname "$exe")/api.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the API program runs to the end" "0" "$status"
+expect "every one of its checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
+# HIP's copies, fills and allocations of every shape (hipcc/memory.cpp):
+# pitched memory, 2D and 3D copies with offsets, the driver API's forms,
+# memsets of each width, who waits for what, peer copies, managed memory's
+# advice, pools (exported and imported through a file descriptor), virtual
+# memory at page granularity and graph memory's counters.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$shim" timeout 300 \
+      "$(dirname "$exe")/memory.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the memory program runs to the end" "0" "$status"
+expect "every one of its checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
+# Graphs and stream capture (hipcc/graphs.cpp): graphs built node by node and
+# captured across streams, executable graphs and what changes them, capture
+# modes and what they refuse, event and memory nodes, user objects. It
+# writes a drawing of a graph into the working directory, so it runs in one
+# of its own.
+graph_dir=$(mktemp -d)
+graph_shim=$(cd "$shim" && pwd)
+out=$(cd "$graph_dir" && VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$graph_shim" timeout 300 \
+      "$(dirname "$exe")/graphs.gfx942" 2>&1)
+status=$?
+rm -rf "$graph_dir"
+echo "$out" | sed 's/^/      /'
+expect "the graphs program runs to the end" "0" "$status"
+expect "every one of its graph checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
+# The rest of what ROCm's library exports (hipcc/exports.cpp): __managed__
+# variables, a code object loaded as a library, a fat binary and a link's
+# input, HCC's launch by its C and C++ names, half conversions, and what a
+# device with no OpenGL and no dma-bufs answers.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$shim" timeout 300 \
+      "$(dirname "$exe")/exports.gfx942" "$(dirname "$exe")/exports_kernel.gfx942.co" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the exports program runs to the end" "0" "$status"
+expect "every one of its export checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
+# Events shared between processes (hipcc/ipc.cpp): an interprocess event's
+# handle opened in a process it forks, whose wait waits for the record made
+# here.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" timeout 120 "$(dirname "$exe")/ipc.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the interprocess events program runs to the end" "0" "$status"
+expect "every one of its interprocess checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)

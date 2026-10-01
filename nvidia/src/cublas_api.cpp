@@ -351,6 +351,68 @@ VGPU_EXPORT cublasStatus_t cublasGetStream_v2(cublasHandle_t handle, cudaStream_
   if (stream) *stream = reinterpret_cast<Handle*>(handle)->stream;
   return CUBLAS_STATUS_SUCCESS;
 }
+// ---- host <-> device copies: cublasSetVector, cublasGetMatrix and the rest ----
+//
+// The legacy helpers that move a strided vector or a column-major matrix
+// between host and device. Each is one cudaMemcpy2D: a vector's elements are
+// rows one element wide, a matrix's columns are rows `rows` elements wide.
+// qulacs moves its state vectors with them.
+namespace {
+cublasStatus_t copy_2d(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width,
+                       size_t height, cudaMemcpyKind kind, cudaStream_t stream, bool async) {
+  if (!width || !height) return CUBLAS_STATUS_SUCCESS;
+  const cudaError_t e = async ? cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, kind, stream)
+                              : cudaMemcpy2D(dst, dpitch, src, spitch, width, height, kind);
+  return e == cudaSuccess ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_MAPPING_ERROR;
+}
+cublasStatus_t copy_vector(int n, int elem, const void* x, int incx, void* y, int incy,
+                           cudaMemcpyKind kind, cudaStream_t stream = nullptr, bool async = false) {
+  if (incx <= 0 || incy <= 0 || elem <= 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (n <= 0) return CUBLAS_STATUS_SUCCESS;
+  return copy_2d(y, size_t(incy) * elem, x, size_t(incx) * elem, size_t(elem), size_t(n), kind, stream,
+                 async);
+}
+cublasStatus_t copy_matrix(int rows, int cols, int elem, const void* A, int lda, void* B, int ldb,
+                           cudaMemcpyKind kind, cudaStream_t stream = nullptr, bool async = false) {
+  if (rows < 0 || cols < 0 || elem <= 0 || lda <= 0 || ldb <= 0) return CUBLAS_STATUS_INVALID_VALUE;
+  // A leading dimension below `rows` is a pitch narrower than a row, which
+  // cudaMemcpy2D refuses; cuBLAS reports that as a mapping error, as here.
+  return copy_2d(B, size_t(ldb) * elem, A, size_t(lda) * elem, size_t(rows) * elem, size_t(cols), kind,
+                 stream, async);
+}
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasSetVector(int n, int elemSize, const void* x, int incx, void* y, int incy) {
+  return copy_vector(n, elemSize, x, incx, y, incy, cudaMemcpyHostToDevice);
+}
+VGPU_EXPORT cublasStatus_t cublasGetVector(int n, int elemSize, const void* x, int incx, void* y, int incy) {
+  return copy_vector(n, elemSize, x, incx, y, incy, cudaMemcpyDeviceToHost);
+}
+VGPU_EXPORT cublasStatus_t cublasSetMatrix(int rows, int cols, int elemSize, const void* A, int lda, void* B,
+                                           int ldb) {
+  return copy_matrix(rows, cols, elemSize, A, lda, B, ldb, cudaMemcpyHostToDevice);
+}
+VGPU_EXPORT cublasStatus_t cublasGetMatrix(int rows, int cols, int elemSize, const void* A, int lda, void* B,
+                                           int ldb) {
+  return copy_matrix(rows, cols, elemSize, A, lda, B, ldb, cudaMemcpyDeviceToHost);
+}
+VGPU_EXPORT cublasStatus_t cublasSetVectorAsync(int n, int elemSize, const void* x, int incx, void* y,
+                                                int incy, cudaStream_t stream) {
+  return copy_vector(n, elemSize, x, incx, y, incy, cudaMemcpyHostToDevice, stream, true);
+}
+VGPU_EXPORT cublasStatus_t cublasGetVectorAsync(int n, int elemSize, const void* x, int incx, void* y,
+                                                int incy, cudaStream_t stream) {
+  return copy_vector(n, elemSize, x, incx, y, incy, cudaMemcpyDeviceToHost, stream, true);
+}
+VGPU_EXPORT cublasStatus_t cublasSetMatrixAsync(int rows, int cols, int elemSize, const void* A, int lda,
+                                                void* B, int ldb, cudaStream_t stream) {
+  return copy_matrix(rows, cols, elemSize, A, lda, B, ldb, cudaMemcpyHostToDevice, stream, true);
+}
+VGPU_EXPORT cublasStatus_t cublasGetMatrixAsync(int rows, int cols, int elemSize, const void* A, int lda,
+                                                void* B, int ldb, cudaStream_t stream) {
+  return copy_matrix(rows, cols, elemSize, A, lda, B, ldb, cudaMemcpyDeviceToHost, stream, true);
+}
+
 VGPU_EXPORT cublasStatus_t cublasSetPointerMode_v2(cublasHandle_t handle, cublasPointerMode_t m) {
   if (!valid(handle)) return CUBLAS_STATUS_NOT_INITIALIZED;
   reinterpret_cast<Handle*>(handle)->pointer_mode = m;
@@ -699,36 +761,6 @@ VGPU_EXPORT cublasStatus_t cublasSetWorkspace_v2(cublasHandle_t h, void*, size_t
 
 /* ---- level 2 and level 1 ---- */
 
-VGPU_EXPORT cublasStatus_t cublasSgemv_v2(cublasHandle_t h, cublasOperation_t trans, int m, int n,
-                                          const float* alpha, const float* A, int lda,
-                                          const float* x, int incx, const float* beta, float* y,
-                                          int incy) {
-  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (m < 0 || n < 0 || lda < 1 || incx == 0 || incy == 0) return CUBLAS_STATUS_INVALID_VALUE;
-  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(float)),
-                            be = hold(h, beta, sizeof(float))] {
-        cublasSgemv_v2(h, trans, m, n, static_cast<const float*>(al.get()), A, lda, x, incx,
-                       static_cast<const float*>(be.get()), y, incy);
-      }))
-    return CUBLAS_STATUS_SUCCESS;
-  float a = scalar(h, alpha), b = scalar(h, beta);
-  const int xlen = trans == CUBLAS_OP_N ? n : m;
-  const int ylen = trans == CUBLAS_OP_N ? m : n;
-  if (!m || !n) return CUBLAS_STATUS_SUCCESS;
-  auto hA = fetch<float>(A, extent(lda, n, m));
-  auto hx = fetch<float>(x, static_cast<size_t>(std::abs(incx)) * (xlen - 1) + 1);
-  auto hy = fetch<float>(y, static_cast<size_t>(std::abs(incy)) * (ylen - 1) + 1);
-  for (int i = 0; i < ylen; ++i) {
-    float acc = 0.0f;
-    for (int j = 0; j < xlen; ++j)
-      acc += hA[trans == CUBLAS_OP_N ? idx(i, j, lda) : idx(j, i, lda)] * hx[j * incx];
-    float& yi = hy[i * incy];
-    yi = b == 0.0f ? a * acc : a * acc + b * yi;
-  }
-  store(y, hy);
-  return CUBLAS_STATUS_SUCCESS;
-}
-
 namespace {
 
 // Where element i of an n-element vector with increment inc sits, by BLAS's
@@ -738,6 +770,39 @@ inline size_t elem(int i, int n, int inc) {
   return inc > 0 ? static_cast<size_t>(i) * inc : static_cast<size_t>(n - 1 - i) * -inc;
 }
 inline size_t span(int n, int inc) { return static_cast<size_t>(std::abs(inc)) * (n - 1) + 1; }
+
+// y = alpha op(A) x + beta y. Increments follow BLAS's rule (a negative one
+// walks its vector from the far end), and a leading dimension shorter than a
+// column is refused, as it is by cuBLAS. beta 0 overwrites y without reading
+// it, so NaN in y stays out of the answer.
+template <class T>
+cublasStatus_t gemv(cublasHandle_t h, cublasOperation_t trans, int m, int n, const T* alpha,
+                    const T* A, int lda, const T* x, int incx, const T* beta, T* y, int incy) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (m < 0 || n < 0 || lda < std::max(1, m) || incx == 0 || incy == 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (trans == CUBLAS_OP_C) trans = CUBLAS_OP_T;  // real types
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(T)), be = hold(h, beta, sizeof(T))] {
+        gemv<T>(h, trans, m, n, static_cast<const T*>(al.get()), A, lda, x, incx,
+                static_cast<const T*>(be.get()), y, incy);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
+  const T a = scalar(h, alpha), b = scalar(h, beta);
+  const int xlen = trans == CUBLAS_OP_N ? n : m;
+  const int ylen = trans == CUBLAS_OP_N ? m : n;
+  if (!m || !n) return CUBLAS_STATUS_SUCCESS;
+  auto hA = fetch<T>(A, extent(lda, n, m));
+  auto hx = fetch<T>(x, span(xlen, incx));
+  auto hy = fetch<T>(y, span(ylen, incy));
+  for (int i = 0; i < ylen; ++i) {
+    T acc = 0;
+    for (int j = 0; j < xlen; ++j)
+      acc += hA[trans == CUBLAS_OP_N ? idx(i, j, lda) : idx(j, i, lda)] * hx[elem(j, xlen, incx)];
+    T& yi = hy[elem(i, ylen, incy)];
+    yi = b == T(0) ? a * acc : a * acc + b * yi;
+  }
+  store(y, hy);
+  return CUBLAS_STATUS_SUCCESS;
+}
 
 // The reductions hand their answer back through a host or device pointer,
 // depending on the handle's pointer mode.
@@ -822,16 +887,34 @@ cublasStatus_t nrm2(cublasHandle_t h, int n, const T* x, int incx, T* result) {
   return CUBLAS_STATUS_SUCCESS;
 }
 
-// The 1-based index of the first element of largest magnitude; 0 when there is
-// nothing to search, as reference BLAS returns.
+// The sum of magnitudes; 0 for an empty vector or a non-positive stride, as
+// reference BLAS returns.
 template <class T>
-cublasStatus_t iamax(cublasHandle_t h, int n, const T* x, int incx, int* result) {
+cublasStatus_t asum(cublasHandle_t h, int n, const T* x, int incx, T* result) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (!result) return CUBLAS_STATUS_INVALID_VALUE;
   if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
-  if (deferred_to_graph(h, [=] { iamax<T>(h, n, x, incx, result); }))
+  if (deferred_to_graph(h, [=] { asum<T>(h, n, x, incx, result); }))
     return CUBLAS_STATUS_SUCCESS;
-  int best = 0;
+  long double acc = 0.0L;
+  if (n > 0 && incx > 0) {
+    auto hx = fetch<T>(x, span(n, incx));
+    for (int i = 0; i < n; ++i) acc += std::fabs(static_cast<long double>(hx[static_cast<size_t>(i) * incx]));
+  }
+  put_result(h, result, static_cast<T>(acc));
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+// The 1-based index of the first element of largest magnitude; 0 when there is
+// nothing to search, as reference BLAS returns.
+template <class T, class R = int>
+cublasStatus_t iamax(cublasHandle_t h, int n, const T* x, int incx, R* result) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!result) return CUBLAS_STATUS_INVALID_VALUE;
+  if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (deferred_to_graph(h, [=] { iamax<T, R>(h, n, x, incx, result); }))
+    return CUBLAS_STATUS_SUCCESS;
+  R best = 0;
   if (n > 0 && incx > 0) {
     auto hx = fetch<T>(x, span(n, incx));
     T top = std::abs(hx[0]);
@@ -929,6 +1012,18 @@ VGPU_EXPORT cublasStatus_t cublasDscal_v2(cublasHandle_t h, int n, const double*
                                           int incx) {
   return scal(h, n, alpha, x, incx);
 }
+VGPU_EXPORT cublasStatus_t cublasSgemv_v2(cublasHandle_t h, cublasOperation_t trans, int m, int n,
+                                          const float* alpha, const float* A, int lda,
+                                          const float* x, int incx, const float* beta, float* y,
+                                          int incy) {
+  return gemv(h, trans, m, n, alpha, A, lda, x, incx, beta, y, incy);
+}
+VGPU_EXPORT cublasStatus_t cublasDgemv_v2(cublasHandle_t h, cublasOperation_t trans, int m, int n,
+                                          const double* alpha, const double* A, int lda,
+                                          const double* x, int incx, const double* beta, double* y,
+                                          int incy) {
+  return gemv(h, trans, m, n, alpha, A, lda, x, incx, beta, y, incy);
+}
 VGPU_EXPORT cublasStatus_t cublasSdot_v2(cublasHandle_t h, int n, const float* x, int incx,
                                          const float* y, int incy, float* result) {
   return dot(h, n, x, incx, y, incy, result);
@@ -944,6 +1039,14 @@ VGPU_EXPORT cublasStatus_t cublasSnrm2_v2(cublasHandle_t h, int n, const float* 
 VGPU_EXPORT cublasStatus_t cublasDnrm2_v2(cublasHandle_t h, int n, const double* x, int incx,
                                           double* result) {
   return nrm2(h, n, x, incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasSasum_v2(cublasHandle_t h, int n, const float* x, int incx,
+                                          float* result) {
+  return asum(h, n, x, incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasDasum_v2(cublasHandle_t h, int n, const double* x, int incx,
+                                          double* result) {
+  return asum(h, n, x, incx, result);
 }
 VGPU_EXPORT cublasStatus_t cublasIsamax_v2(cublasHandle_t h, int n, const float* x, int incx,
                                            int* result) {
@@ -962,6 +1065,74 @@ VGPU_EXPORT cublasStatus_t cublasDtbmv_v2(cublasHandle_t h, cublasFillMode_t upl
                                           cublasOperation_t trans, cublasDiagType_t diag, int n,
                                           int k, const double* A, int lda, double* x, int incx) {
   return tbmv(h, uplo, trans, diag, n, k, A, lda, x, incx);
+}
+
+// The 64-bit-index forms CUDA 12 added (cublasDnrm2_64 and so on; cuPDLPx
+// calls that one). Sizes and strides are int64_t, and i?amax answers in an
+// int64_t. Host-computed vectors that long would not fit in memory anyway, so
+// a size or stride beyond int is refused rather than truncated.
+namespace {
+bool fits_int(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
+}  // namespace
+VGPU_EXPORT cublasStatus_t cublasSaxpy_v2_64(cublasHandle_t h, int64_t n, const float* alpha,
+                                             const float* x, int64_t incx, float* y, int64_t incy) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return axpy(h, (int)n, alpha, x, (int)incx, y, (int)incy);
+}
+VGPU_EXPORT cublasStatus_t cublasDaxpy_v2_64(cublasHandle_t h, int64_t n, const double* alpha,
+                                             const double* x, int64_t incx, double* y, int64_t incy) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return axpy(h, (int)n, alpha, x, (int)incx, y, (int)incy);
+}
+VGPU_EXPORT cublasStatus_t cublasSscal_v2_64(cublasHandle_t h, int64_t n, const float* alpha, float* x,
+                                             int64_t incx) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return scal(h, (int)n, alpha, x, (int)incx);
+}
+VGPU_EXPORT cublasStatus_t cublasDscal_v2_64(cublasHandle_t h, int64_t n, const double* alpha, double* x,
+                                             int64_t incx) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return scal(h, (int)n, alpha, x, (int)incx);
+}
+VGPU_EXPORT cublasStatus_t cublasSdot_v2_64(cublasHandle_t h, int64_t n, const float* x, int64_t incx,
+                                            const float* y, int64_t incy, float* result) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return dot(h, (int)n, x, (int)incx, y, (int)incy, result);
+}
+VGPU_EXPORT cublasStatus_t cublasDdot_v2_64(cublasHandle_t h, int64_t n, const double* x, int64_t incx,
+                                            const double* y, int64_t incy, double* result) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return dot(h, (int)n, x, (int)incx, y, (int)incy, result);
+}
+VGPU_EXPORT cublasStatus_t cublasSnrm2_v2_64(cublasHandle_t h, int64_t n, const float* x, int64_t incx,
+                                             float* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return nrm2(h, (int)n, x, (int)incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasDnrm2_v2_64(cublasHandle_t h, int64_t n, const double* x, int64_t incx,
+                                             double* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return nrm2(h, (int)n, x, (int)incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasSasum_v2_64(cublasHandle_t h, int64_t n, const float* x, int64_t incx,
+                                             float* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return asum(h, (int)n, x, (int)incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasDasum_v2_64(cublasHandle_t h, int64_t n, const double* x, int64_t incx,
+                                             double* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return asum(h, (int)n, x, (int)incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasIsamax_v2_64(cublasHandle_t h, int64_t n, const float* x, int64_t incx,
+                                              int64_t* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return iamax(h, (int)n, x, (int)incx, result);
+}
+VGPU_EXPORT cublasStatus_t cublasIdamax_v2_64(cublasHandle_t h, int64_t n, const double* x, int64_t incx,
+                                              int64_t* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return iamax(h, (int)n, x, (int)incx, result);
 }
 
 /* ---- anything not implemented says so, rather than returning wrong numbers ---- */

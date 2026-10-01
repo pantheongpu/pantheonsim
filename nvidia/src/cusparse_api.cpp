@@ -23,10 +23,13 @@
 #include <functional>
 #include <mutex>
 #include <map>
+#include <memory>
 #include <set>
 #include <vector>
 
 #include <cuda_runtime.h>
+
+#include "vgpu/runtime/capture.hpp"
 
 namespace {
 
@@ -70,8 +73,11 @@ struct Handle {
   cusparsePointerMode_t mode = CUSPARSE_POINTER_MODE_HOST;
 };
 
-std::mutex g_mu;
-std::set<const void*> g_live;
+// The live-descriptor registry is never destroyed: a graph a program leaks
+// holds copies of descriptors (see Held), and it is released by libcudart's
+// destructors at exit, which may run after this library's.
+std::mutex& g_mu = *new std::mutex;
+std::set<const void*>& g_live = *new std::set<const void*>;
 template <class T> T* track(T* p) { std::lock_guard<std::mutex> l(g_mu); g_live.insert(p); return p; }
 bool known(const void* p) { std::lock_guard<std::mutex> l(g_mu); return p && g_live.count(p); }
 void untrack(const void* p) { std::lock_guard<std::mutex> l(g_mu); g_live.erase(p); }
@@ -265,6 +271,65 @@ inline size_t dn_index(const DnMat& m, int64_t r, int64_t c) {
 size_t dn_elems(const DnMat& m) {
   const int64_t lead = m.order == CUSPARSE_ORDER_COL ? m.cols : m.rows;
   return (size_t)lead * (size_t)m.ld;
+}
+
+// ---- CUDA graph capture ----
+//
+// On hardware a cuSPARSE call made while its stream is capturing is recorded
+// into the graph and runs at each launch, over whatever the graph's kernels
+// have produced by then. Computing it at call time instead read inputs that
+// did not exist yet and left the call out of every replay: HiGHS's HiPDLP
+// solver captures its iterations, SpMV included, and went to NaN here while
+// converging on an RTX 3060.
+//
+// So such a call is recorded as a closure over copies of what it was given:
+// the descriptors as they are now (a later cusparseDnVecSetValues does not
+// reach into a graph on hardware either), and host-mode scalars, whose
+// variables are usually gone by the time the graph runs. Device memory, and
+// device-mode scalars, are read when the graph runs.
+class Held {
+ public:
+  template <class T> T* copy(const void* p) {
+    std::shared_ptr<T> c(track(new T(*static_cast<const T*>(p))), [](T* q) {
+      untrack(q);
+      delete q;
+    });
+    keep_.push_back(c);
+    return c.get();
+  }
+  const void* scalar(const Handle& h, const void* p, size_t bytes) {
+    if (!p || bytes == 0 || h.mode == CUSPARSE_POINTER_MODE_DEVICE) return p;
+    auto v = std::make_shared<std::vector<uint8_t>>(static_cast<const uint8_t*>(p),
+                                                    static_cast<const uint8_t*>(p) + bytes);
+    keep_.push_back(v);
+    return v->data();
+  }
+  // The handle the recorded call runs with: the caller's pointer mode, and no
+  // stream, so running it is not taken for another capture.
+  cusparseHandle_t handle(cusparseHandle_t h) {
+    Handle* c = copy<Handle>(h);
+    c->stream = nullptr;
+    return reinterpret_cast<cusparseHandle_t>(c);
+  }
+
+ private:
+  std::vector<std::shared_ptr<void>> keep_;
+};
+
+bool capturing(cusparseHandle_t h) {
+  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+  return cudaStreamIsCapturing(reinterpret_cast<const Handle*>(h)->stream, &st) == cudaSuccess &&
+         st == cudaStreamCaptureStatusActive;
+}
+
+// The closure owns `held`, so the copies it points into live as long as the
+// graph does.
+cusparseStatus_t record(cusparseHandle_t h, std::shared_ptr<Held> held, std::function<void()> call) {
+  std::function<void()> op = [held = std::move(held), call = std::move(call)] { call(); };
+  return vgpu_record_host_op_if_capturing(
+             reinterpret_cast<CUstream_st*>(reinterpret_cast<const Handle*>(h)->stream), std::move(op))
+             ? CUSPARSE_STATUS_SUCCESS
+             : CUSPARSE_STATUS_EXECUTION_FAILED;
 }
 
 }  // namespace
@@ -555,9 +620,19 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMV(cusparseHandle_t h, cusparseOperation_
                                           const void* alpha, cusparseConstSpMatDescr_t matA,
                                           cusparseConstDnVecDescr_t vecX, const void* beta,
                                           cusparseDnVecDescr_t vecY, cudaDataType ct,
-                                          cusparseSpMVAlg_t, void*) {
+                                          cusparseSpMVAlg_t alg, void* buffer) {
   if (!known(h) || !known(matA) || !known(vecX) || !known(vecY))
     return CUSPARSE_STATUS_NOT_INITIALIZED;
+  if (capturing(h)) {
+    auto held = std::make_shared<Held>();
+    const cusparseHandle_t hc = held->handle(h);
+    const void* a = held->scalar(*reinterpret_cast<Handle*>(hc), alpha, type_bytes(ct));
+    const void* b = held->scalar(*reinterpret_cast<Handle*>(hc), beta, type_bytes(ct));
+    auto* A = reinterpret_cast<cusparseConstSpMatDescr_t>(held->copy<SpMat>(matA));
+    auto* X = reinterpret_cast<cusparseConstDnVecDescr_t>(held->copy<DnVec>(vecX));
+    auto* Y = reinterpret_cast<cusparseDnVecDescr_t>(held->copy<DnVec>(vecY));
+    return record(h, held, [=] { cusparseSpMV(hc, op, a, A, X, b, Y, ct, alg, buffer); });
+  }
   const auto& A = *reinterpret_cast<const SpMat*>(matA);
   const auto& X = *reinterpret_cast<const DnVec*>(vecX);
   auto& Y = *reinterpret_cast<DnVec*>(vecY);
@@ -673,9 +748,19 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMM(cusparseHandle_t h, cusparseOperation_
                                           cusparseConstSpMatDescr_t matA,
                                           cusparseConstDnMatDescr_t matB, const void* beta,
                                           cusparseDnMatDescr_t matC, cudaDataType ct,
-                                          cusparseSpMMAlg_t, void*) {
+                                          cusparseSpMMAlg_t alg, void* buffer) {
   if (!known(h) || !known(matA) || !known(matB) || !known(matC))
     return CUSPARSE_STATUS_NOT_INITIALIZED;
+  if (capturing(h)) {
+    auto held = std::make_shared<Held>();
+    const cusparseHandle_t hc = held->handle(h);
+    const void* a = held->scalar(*reinterpret_cast<Handle*>(hc), alpha, type_bytes(ct));
+    const void* b = held->scalar(*reinterpret_cast<Handle*>(hc), beta, type_bytes(ct));
+    auto* A = reinterpret_cast<cusparseConstSpMatDescr_t>(held->copy<SpMat>(matA));
+    auto* B = reinterpret_cast<cusparseConstDnMatDescr_t>(held->copy<DnMat>(matB));
+    auto* C = reinterpret_cast<cusparseDnMatDescr_t>(held->copy<DnMat>(matC));
+    return record(h, held, [=] { cusparseSpMM(hc, opA, opB, a, A, B, b, C, ct, alg, buffer); });
+  }
   const auto& A = *reinterpret_cast<const SpMat*>(matA);
   const auto& B = *reinterpret_cast<const DnMat*>(matB);
   const auto& C = *reinterpret_cast<const DnMat*>(matC);
@@ -715,8 +800,15 @@ VGPU_EXPORT cusparseStatus_t cusparseSparseToDense_bufferSize(cusparseHandle_t,
 VGPU_EXPORT cusparseStatus_t cusparseSparseToDense(cusparseHandle_t h,
                                                    cusparseConstSpMatDescr_t matA,
                                                    cusparseDnMatDescr_t matB,
-                                                   cusparseSparseToDenseAlg_t, void*) {
+                                                   cusparseSparseToDenseAlg_t alg, void* buffer) {
   if (!known(h) || !known(matA) || !known(matB)) return CUSPARSE_STATUS_NOT_INITIALIZED;
+  if (capturing(h)) {
+    auto held = std::make_shared<Held>();
+    const cusparseHandle_t hc = held->handle(h);
+    auto* A = reinterpret_cast<cusparseConstSpMatDescr_t>(held->copy<SpMat>(matA));
+    auto* B = reinterpret_cast<cusparseDnMatDescr_t>(held->copy<DnMat>(matB));
+    return record(h, held, [=] { cusparseSparseToDense(hc, A, B, alg, buffer); });
+  }
   const auto& A = *reinterpret_cast<const SpMat*>(matA);
   auto& B = *reinterpret_cast<DnMat*>(matB);
   if (A.rows != B.rows || A.cols != B.cols) return CUSPARSE_STATUS_INVALID_VALUE;
@@ -839,8 +931,16 @@ VGPU_EXPORT cusparseStatus_t cusparseCsr2cscEx2_bufferSize(
 VGPU_EXPORT cusparseStatus_t cusparseCsr2cscEx2(
     cusparseHandle_t h, int m, int n, int nnz, const void* csrVal, const int* csrRowPtr,
     const int* csrColInd, void* cscVal, int* cscColPtr, int* cscRowInd, cudaDataType valType,
-    cusparseAction_t copyValues, cusparseIndexBase_t idxBase, cusparseCsr2CscAlg_t, void*) {
+    cusparseAction_t copyValues, cusparseIndexBase_t idxBase, cusparseCsr2CscAlg_t alg, void* buffer) {
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
+  if (capturing(h)) {
+    auto held = std::make_shared<Held>();
+    const cusparseHandle_t hc = held->handle(h);
+    return record(h, held, [=] {
+      cusparseCsr2cscEx2(hc, m, n, nnz, csrVal, csrRowPtr, csrColInd, cscVal, cscColPtr, cscRowInd,
+                         valType, copyValues, idxBase, alg, buffer);
+    });
+  }
   if (m < 0 || n < 0 || nnz < 0) return CUSPARSE_STATUS_INVALID_VALUE;
   if (idxBase != CUSPARSE_INDEX_BASE_ZERO && idxBase != CUSPARSE_INDEX_BASE_ONE)
     return CUSPARSE_STATUS_INVALID_VALUE;
@@ -1376,8 +1476,19 @@ VGPU_EXPORT cusparseStatus_t cusparseSDDMM_preprocess(cusparseHandle_t h, cuspar
 VGPU_EXPORT cusparseStatus_t cusparseSDDMM(cusparseHandle_t h, cusparseOperation_t opA, cusparseOperation_t opB,
                                            const void* alpha, cusparseConstDnMatDescr_t matA,
                                            cusparseConstDnMatDescr_t matB, const void* beta,
-                                           cusparseSpMatDescr_t matC, cudaDataType ct, cusparseSDDMMAlg_t, void*) {
+                                           cusparseSpMatDescr_t matC, cudaDataType ct, cusparseSDDMMAlg_t alg,
+                                           void* buffer) {
   if (!known(h) || !known(matA) || !known(matB) || !known(matC)) return CUSPARSE_STATUS_NOT_INITIALIZED;
+  if (capturing(h)) {
+    auto held = std::make_shared<Held>();
+    const cusparseHandle_t hc = held->handle(h);
+    const void* a = held->scalar(*reinterpret_cast<Handle*>(hc), alpha, type_bytes(ct));
+    const void* b = held->scalar(*reinterpret_cast<Handle*>(hc), beta, type_bytes(ct));
+    auto* A = reinterpret_cast<cusparseConstDnMatDescr_t>(held->copy<DnMat>(matA));
+    auto* B = reinterpret_cast<cusparseConstDnMatDescr_t>(held->copy<DnMat>(matB));
+    auto* C = reinterpret_cast<cusparseSpMatDescr_t>(held->copy<SpMat>(matC));
+    return record(h, held, [=] { cusparseSDDMM(hc, opA, opB, a, A, B, b, C, ct, alg, buffer); });
+  }
   const auto& A = *reinterpret_cast<const DnMat*>(matA);
   const auto& B = *reinterpret_cast<const DnMat*>(matB);
   const auto& C = *reinterpret_cast<const SpMat*>(matC);
@@ -1491,10 +1602,21 @@ VGPU_EXPORT cusparseStatus_t cusparseSpSV_analysis(cusparseHandle_t h, cusparseO
 }
 VGPU_EXPORT cusparseStatus_t cusparseSpSV_solve(cusparseHandle_t h, cusparseOperation_t op, const void* alpha,
                                                 cusparseConstSpMatDescr_t matA, cusparseConstDnVecDescr_t vecX,
-                                                cusparseDnVecDescr_t vecY, cudaDataType ct, cusparseSpSVAlg_t,
+                                                cusparseDnVecDescr_t vecY, cudaDataType ct, cusparseSpSVAlg_t alg,
                                                 cusparseSpSVDescr_t d) {
   if (!known(h) || !known(d) || !known(matA) || !known(vecX) || !known(vecY))
     return CUSPARSE_STATUS_NOT_INITIALIZED;
+  // The analysis descriptor is used as it is when the graph runs, and must
+  // outlive the graph, as on hardware.
+  if (capturing(h)) {
+    auto held = std::make_shared<Held>();
+    const cusparseHandle_t hc = held->handle(h);
+    const void* a = held->scalar(*reinterpret_cast<Handle*>(hc), alpha, type_bytes(ct));
+    auto* A = reinterpret_cast<cusparseConstSpMatDescr_t>(held->copy<SpMat>(matA));
+    auto* X = reinterpret_cast<cusparseConstDnVecDescr_t>(held->copy<DnVec>(vecX));
+    auto* Y = reinterpret_cast<cusparseDnVecDescr_t>(held->copy<DnVec>(vecY));
+    return record(h, held, [=] { cusparseSpSV_solve(hc, op, a, A, X, Y, ct, alg, d); });
+  }
   const auto& A = *reinterpret_cast<const SpMat*>(matA);
   const auto& X = *reinterpret_cast<const DnVec*>(vecX);
   const auto& Y = *reinterpret_cast<const DnVec*>(vecY);
@@ -1526,9 +1648,18 @@ VGPU_EXPORT cusparseStatus_t cusparseSpSM_analysis(cusparseHandle_t h, cusparseO
 VGPU_EXPORT cusparseStatus_t cusparseSpSM_solve(cusparseHandle_t h, cusparseOperation_t opA, cusparseOperation_t opB,
                                                 const void* alpha, cusparseConstSpMatDescr_t matA,
                                                 cusparseConstDnMatDescr_t matB, cusparseDnMatDescr_t matC,
-                                                cudaDataType ct, cusparseSpSMAlg_t, cusparseSpSMDescr_t d) {
+                                                cudaDataType ct, cusparseSpSMAlg_t alg, cusparseSpSMDescr_t d) {
   if (!known(h) || !known(d) || !known(matA) || !known(matB) || !known(matC))
     return CUSPARSE_STATUS_NOT_INITIALIZED;
+  if (capturing(h)) {
+    auto held = std::make_shared<Held>();
+    const cusparseHandle_t hc = held->handle(h);
+    const void* a = held->scalar(*reinterpret_cast<Handle*>(hc), alpha, type_bytes(ct));
+    auto* A = reinterpret_cast<cusparseConstSpMatDescr_t>(held->copy<SpMat>(matA));
+    auto* B = reinterpret_cast<cusparseConstDnMatDescr_t>(held->copy<DnMat>(matB));
+    auto* C = reinterpret_cast<cusparseDnMatDescr_t>(held->copy<DnMat>(matC));
+    return record(h, held, [=] { cusparseSpSM_solve(hc, opA, opB, a, A, B, C, ct, alg, d); });
+  }
   const auto& A = *reinterpret_cast<const SpMat*>(matA);
   const auto& B = *reinterpret_cast<const DnMat*>(matB);
   const auto& C = *reinterpret_cast<const DnMat*>(matC);

@@ -217,6 +217,81 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   `createpolicy`, `applypriority`, `discard`) and the scheduling directives
   `griddepcontrol` and `setmaxnreg` are accepted and do nothing, each for a
   stated reason rather than a shrug.
+- PTX found by a differential probe -- 95 instruction forms run on an RTX 3060
+  and on the simulator, the results compared -- which turned up both gaps
+  and silent errors. Now implemented: `prmt`'s six modes; `setp`/`set` with
+  `.and/.or/.xor` and setp's `p|q`; `mad24` (and `mul24.hi`, which took bits
+  47:24 instead of 47:16); `add/sub.sat.s32`; `.sat` on f32 add/sub/mul/fma;
+  `min/max.xorsign.abs`; `cvt` with `.relu`, `.rz`/`.satfinite` on the
+  packed forms, and to tf32; `.f16x2` register declarations; `pmevent`.
+  Fixed, having been accepted and ignored: fma/mad's `.rz/.rm/.rp`, `.sat`
+  and `.ftz`; every half-precision modifier (`.sat`, `.ftz`, `.NaN`,
+  `.xorsign.abs`, `.relu`, the rounding modes); the packed cvt's rounding
+  mode. Also as the card does: f32 NaN results are 0x7fffffff; min/max take
+  the other operand for a signalling NaN too and order -0 below +0; `.sat`
+  sends -0 to +0; bf16 fma rounds once (a double-rounding tie went to even);
+  `isspacep.global` is true for any address outside shared and local memory.
+  e2e_ptx_forms hashes 127 variants against the card, and two held-out input
+  sets match too. Left as they are, and why: `ex2.approx.f16x2`,
+  `rcp.approx.ftz.f64` (the card returns only a 32-bit-accurate high word)
+  and `sin.approx` of tiny inputs follow the documented error bounds, not the
+  card's bits; ptxas miscompiles `szext` with a register width on sm_86 (the
+  card extends from 0 bits), so the ISA's meaning is kept.
+- A second sweep, 378 variants of the everyday instructions (integer and bit
+  operations, f32/f64 with every rounding mode and .ftz, comparisons,
+  conversions between every integer and float width, half precision),
+  e2e_ptx_sweep. Fixed from it: sqrt/rcp.{rn,rz,rm,rp} ignored the rounding
+  mode (and .ftz); f32 add/sub/mul/div/min/max ignored .ftz; testp classified
+  f32 values as doubles (an f32 subnormal came out normal) and the card calls
+  zero normal; neg/abs give the canonical NaN (f32 and halves) and leave an
+  f64 NaN untouched; rem by zero is all ones, not the dividend; fns finds
+  nothing from a base past 31 and returns 0 for an offset of INT_MIN; a NaN
+  converted to an integer is 0 from f32/f16 into 32 bits or fewer and the
+  destination's sign bit otherwise; cvt.f32.f16 of a NaN is 0x7fffffff and
+  cvt.ftz.f64.f32 widens the canonical NaN; setp/set on f16x2 with p|q and
+  with an integer destination.
+- A third sweep, 153 variants of warp instructions (shfl in every mode and
+  clamp, vote, match, redux, the lane masks, bar.red), atomics and reductions
+  on global and shared memory (the value returned and the memory left),
+  sub-word and vector memory, and 16/64-bit integer arithmetic:
+  e2e_ptx_warp_mem. Fixed from it: atom.cas compared with c and stored b, so
+  a matching CAS stored nothing (also its own PR against main); shfl.up
+  bounded by c's clamp field as the ISA's maxLane, not minLane; match.all
+  writes the member mask or 0; atom.add.f32 flushes subnormals and writes
+  the canonical NaN; a 16-bit shift's amount is a whole .u32; bfe/bfi.64 take
+  the whole position and length; bfe.s64 of all 64 bits kept (1 << 64 was
+  undefined); cnot.
+- A fourth sweep, 90 variants of the memory forms compilers emit (ld/st with
+  every cache operator, .volatile and the ordering qualifiers and scopes,
+  atomics with their semantics and scopes, fences and membar, generic
+  addressing and cvta, isspacep, mbarrier, cp.async with its zero fill,
+  ldmatrix, movmatrix): e2e_ptx_memory_forms. All matched but one:
+  mbarrier.pending_count.b64 takes an arrival's state token (the ISA's form),
+  which carries the count pending before that arrive; it was parsed as
+  taking the barrier's address.
+- Multiply-add contraction as the code generator performs it: a mul and the
+  add or sub consuming its product, neither with a rounding modifier, run as
+  one fma (src/ptx/contract.cpp). The PTX ISA allows it, ptxas does it, and
+  an RTX 3060's results show when: f32 and f64, .ftz forms too, either
+  operand order and both directions of sub; a product used only by adds and
+  subs fuses into each of them, one used any other way into none; the first
+  operand's product when both are; never across a branch. Found by
+  PolyBench's ADI, whose `x - y*a` came out one ulp off in a third of its
+  output and now matches the card bit for bit. VGPU_PTX_CONTRACT=0 turns it
+  off.
+- A fifth sweep, half precision: every f16, f16x2, bf16 and bf16x2 form of
+  add/sub/mul/fma/min/max/neg/abs with every modifier, setp and set with
+  every comparison (and f32's, with and without .ftz), and cvt between the
+  half types and every integer width with each rounding mode and .sat --
+  600 candidates, of which sm_86's ptxas takes 324, plus 56 f32 comparisons:
+  e2e_ptx_half_forms, 380 variants, also matching on two held-out input
+  sets. Found: .ftz on setp and set was dropped for every type, and on half
+  neg/abs, so subnormal operands were compared and negated as themselves;
+  half min/max left the sign of min(+0, -0) to std::fmin (the card orders
+  -0 below +0, as for f32, which .ftz makes of every negative subnormal);
+  cvt.f32.bf16 gave NaNs the canonical NaN where the card shifts the bits
+  (a signalling NaN stays signalling); and cvt.f64.f16 dropped a NaN's sign
+  and payload, which the card keeps, made quiet.
 - Half precision beyond f16x2: f16, bf16, f16x2 and bf16x2 arithmetic
   (add/sub/mul/fma/neg/min/max), the same four types on every transcendental,
   and atom/red.add on all of them. bf16 is a different decode, not a scaled
@@ -246,17 +321,27 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   file, `.local` frame and path stack, so divergence inside a callee and
   recursion both work. Parameters and the return value travel as call slots
   rather than a parameter buffer, because each lane passes its own arguments.
-  The callee runs to completion inside the caller's instruction, which is what
-  makes recursion fall out of the host stack -- and means a warp does not yield
-  mid-call, so a barrier inside a device function is refused by name rather
-  than silently skipping the rest of the body. Structs and arrays pass and
+  A call pushes a frame onto the warp -- the caller's paths, registers and
+  slots -- and the callee's last `ret` pops it, so a warp can stop in the
+  middle of a device function and let the others run: `__syncthreads()`,
+  `__syncthreads_count()` and named barriers inside functions nvcc did not
+  inline work, which every `-G` build needs (e2e_device_function_barriers,
+  built at -O3 with `__noinline__` and with -G; an RTX 3060 passes both).
+  This used to run the callee to completion inside the call instruction and
+  refuse a barrier there. A barrier inside a call that only some of the warp's
+  lanes made is still refused: the others wait in the caller, so it could
+  never complete. Structs and arrays pass and
   return by value: a call slot is a per-lane byte buffer, so `st.param
   [param0+8]` lands where it should. Indirect calls work too: device functions
   have addresses in a window of their own, an array global can be initialised
   with a list of symbols (`= {f, g, h}` -- a function-pointer table), and a
-  call through a register resolves the address back to the function. All
-  participating lanes must agree on the target; a divergent function pointer
-  is refused rather than picking one body and running it for everyone.
+  call through a register resolves the address back to the function. Lanes
+  may call different targets -- a virtual call over objects of different
+  types: the lanes that share the first lane's target make the call, the
+  rest split off at the call and take the next target, and the paths merge
+  after it, each lane with its own return value
+  (e2e_divergent_indirect_calls, virtual methods and a per-lane
+  function-pointer table at -O3 and -G; an RTX 3060 passes both).
 - Builtins a kernel can call: `vprintf`, `__assertfail` (a failed `assert()`
   reports its message and source location, and `cudaErrorAssert`), and the
   device heap -- `malloc`/`free` from inside a kernel, backed by the same
@@ -340,6 +425,11 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
   checks where every element lands and that a fragment stored by one instruction
   and loaded by the other comes back unchanged.
+- `atom.{exch,cas}.b128` (sm_90): 16 aligned bytes, the operands `.b128`
+  register pairs, under the atomics' striped lock. `st.bulk` (sm_100): zeroes
+  shared memory, a multiple of 8 bytes up to 16 MiB. `istypep`: false for every
+  handle, as an RTX 3060 answers for texture and surface objects; there are no
+  `.texref` variables since CUDA 12.
 - The per-thread stack (PTX ISA 9.7.19): `alloca`, `stacksave` and
   `stackrestore`, which nvcc emits for `alloca()` in device code. Each thread
   has a stack of `LaunchConfig::stack_bytes` (cudaLimitStackSize, 1 KiB by
@@ -361,6 +451,22 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   the same test (e2e_bar_red_named). Writing it, the simulator caught a race
   in the test itself: one barrier reused by two groups of warps that were not
   ordered against each other, which the card had passed by timing luck.
+- The driver's reserved shared memory (sm_80 and later) and the
+  `%reserved_smem_offset_{begin,end,cap,0,1}` registers that locate it.
+  cooperative_groups keeps the barriers and exchange slots of tiles of more
+  than one warp (`tiled_partition<64>` and up) there. The layout is the one an
+  RTX 3060 reports for kernels from none to 48 KiB of shared memory: the
+  region starts at `%total_smem_size` (the kernel's own shared memory in
+  128-byte allocation units, as cuda_occupancy.h gives them; the register now
+  reports it rounded, as the card does), `end` is 288 bytes on and `cap` 1 KiB
+  on. Only a module that reads the registers gets the region backed, so every
+  other kernel's shared overruns are still caught. Before compute capability
+  8.0 the registers are refused. Along the way: a warp that spins on a flag
+  another warp of its block sets (which is how those tiles synchronise) spun
+  forever under the deterministic scheduler, whose turns ended only at
+  barriers; a turn longer than 65,536 instructions now ends at the next
+  backward branch. e2e_cg_multi_warp_tiles passes on the card and on the
+  simulator under all three schedulers.
 - The rest of the special-register set a kernel is likely to read: %smid and
   %nsmid (blocks are placed round robin over the profile's SM count -- a real
   placement, and what a persistent kernel needs to partition work), %gridid,
@@ -498,7 +604,15 @@ That count is functional, not decorative:
 - `__launch_bounds__` (`.maxntid` / `.reqntid`) is parsed and enforced;
 - `cudaFuncGetAttributes` reports real `numRegs` and `localSizeBytes`, and
   `cudaOccupancyMaxActiveBlocksPerMultiprocessor` does the standard occupancy
-  calculation instead of returning a placeholder.
+  calculation instead of returning a placeholder -- with NVIDIA's allocation
+  rules as CUDA's occupancy calculator (cuda_occupancy.h) states them:
+  registers per warp in units of 256 from four sub-partitions, the per-block
+  file checked with a block's warps rounded up to those, and shared memory in
+  128-byte units (256 before compute capability 8.0) with the driver's
+  reserved kilobyte added to every block. An RTX 3060's API agrees with the
+  calculator in all 22 cases of e2e_occupancy_rules, which checks the
+  simulator against it on five GPUs. It is not affected by how many named
+  barriers a kernel uses, on the card either.
 
 Checked against a physical RTX 3060: a simple kernel reports **8 registers and
 6 blocks/SM on both**. Measured against `ptxas -v` across the pantheon kernels,
@@ -875,9 +989,16 @@ narrows what counts as observable, not what the detector looks at.
   fprop test, whose eight tile and cluster shapes pass against its host
   reference and fail with the offsets broken.
 
+- Blackwell Ultra (sm_103a, a simulated B300 as nvidia/b300): the fp4 MMAs
+  at K = 96 with three or six scale factors a row, shared-memory descriptors
+  with an absolute leading-dimension address, and `tcgen05.ld.red`. CUTLASS's
+  SM103 fp4 GEMMs run in e2e_cutlass_sm103. See nvidia/docs/blackwell.md.
 - Blackwell's tensor core (sm_100a/sm_100f, PTX ISA 9.7.18): Tensor Memory
   (128 lanes x 512 columns per CTA) allocated with `tcgen05.alloc`/`dealloc`
-  -- for a CTA pair with `.cta_group::2` -- and checked for leaks at exit;
+  -- for a CTA pair with `.cta_group::2` -- and checked for leaks at exit; an
+  allocation larger than what is free waits for another warp's dealloc, as
+  the ISA's blocking alloc does (and is reported as a deadlock when no other
+  warp of the CTA is left to free anything);
   `tcgen05.ld`/`st` in all five shapes with pack/unpack, each warp kept to
   its quarter of the lanes; `tcgen05.mma` for `.kind::f16`, `tf32`,
   `f8f6f4` (the 8-, 6- and 4-bit types, K- or MN-major) and `i8`, and
@@ -1291,10 +1412,19 @@ scripts/run-pantheon-workloads.sh.
    y = 0, the LOD's truncations), and the e2e tests hash tens of thousands
    of results against the hardware's. Refused by name: `tex.grad` (its LOD
    comes from undocumented approximate units), linear filtering of signed
-   8-bit normalized texels, mipmapped layered/cubemap textures, `tld4` on
-   layered/cubemap textures, border colours, sRGB, anisotropy and resource
-   views. The `.clamp`/`.zero` surface policies are done, as an RTX 3060 applies
-   them. See nvidia/docs/textures.md.
+   8-bit normalized texels, `tld4` on layered/cubemap textures, anisotropy
+   and resource views. The `.clamp`/`.zero` surface policies are done, as an
+   RTX 3060 applies them. See nvidia/docs/textures.md. Border
+   colours are done: converted to the texture's format by rules measured over
+   280,000 colours (e2e_border_colour, 705 cases). Measuring them turned up
+   four older mistakes, now fixed: an absent w read 1 (the card reads 0), a
+   mipmapped texture's unnormalized coordinates were taken as unnormalized
+   (the card normalizes them), half NaNs were quieted, and the float filter
+   was an exact sum where the card truncates each value below its
+   footprint's largest. Mipmapped layered and cubemap textures are done
+   too (e2e_texture_mip_layers, 240 cases). So is sRGB, through the texture unit's
+   measured decode table and its block-exponent blend (e2e_texture_srgb,
+   228 cases).
 
    `wgmma`, TMA and distributed shared memory are done now (see "Hopper's
    warpgroup MMA", "TMA and clusters" and "Distributed shared memory"). What

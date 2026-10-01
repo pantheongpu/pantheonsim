@@ -343,7 +343,9 @@ jobs:
         # jobs, and nothing ran it: two such tests broke on plain Linux
         # unnoticed. This runner has ROCm 7.1, so they run here. The ML tests
         # ran above; the workloads, every ollama test and the CUTLASS compiles run in the
-        # hosted jobs. A run started by hand for chosen tests skips this.
+        # hosted jobs, and vLLM (amd_vllm) in its own workflow, vllm-nightly.yml,
+        # which installs vLLM's ROCm build first. A run started by hand for
+        # chosen tests skips this.
         #
         # A skip fails the job too, unless the test is named in RUNNER_SKIPS_OK
         # with the reason it cannot run on this machine: a skip that nobody
@@ -359,7 +361,7 @@ jobs:
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j2 \
-            -E '^(pantheon_workloads|.*ollama.*|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$' \
+            -E '^(pantheon_workloads|.*ollama.*|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm)$' \
             2>&1 | tee rest.log
           skipped=$(grep -oE 'Test +#[0-9]+: [A-Za-z0-9_]+ \.+\*\*\*(Skipped|Not Run)' rest.log \
                     | sed -E 's/Test +#[0-9]+: ([A-Za-z0-9_]+).*/\1/' || true)

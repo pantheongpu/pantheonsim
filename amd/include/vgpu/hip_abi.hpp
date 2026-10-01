@@ -55,6 +55,64 @@ struct Uuid {
   char bytes[16];
 };
 
+// hipLaunchKernelExC's configuration and its attributes: an id padded to
+// eight bytes, then a 64-byte union of the values.
+struct AccessPolicyWindow {
+  void* base_ptr;
+  int hit_prop;
+  float hit_ratio;
+  int miss_prop;
+  size_t num_bytes;
+};
+union LaunchAttributeValue {
+  char pad[64];
+  AccessPolicyWindow access_policy_window;
+  int cooperative;
+  int priority;
+  int sync_policy;
+};
+enum LaunchAttributeId : int {
+  kLaunchAttributeAccessPolicyWindow = 1,
+  kLaunchAttributeCooperative = 2,
+  kLaunchAttributeSynchronizationPolicy = 3,
+  kLaunchAttributePriority = 8,
+  kLaunchAttributeMemSyncDomainMap = 9,
+  kLaunchAttributeMemSyncDomain = 10,
+};
+struct LaunchAttribute {
+  int id;
+  char pad[4];
+  LaunchAttributeValue value;
+};
+struct LaunchConfig {
+  Dim3 grid;
+  Dim3 block;
+  size_t dynamic_shared;
+  void* stream;
+  LaunchAttribute* attrs;
+  unsigned int num_attrs;
+};
+
+// One device's part of a launch across several (hipLaunchCooperativeKernel-
+// MultiDevice, hipExtLaunchMultiKernelMultiDevice), by host function ...
+struct LaunchParams {
+  void* func;
+  Dim3 grid;
+  Dim3 block;
+  void** args;
+  size_t shared;
+  void* stream;
+};
+// ... and by module function (hipModuleLaunchCooperativeKernelMultiDevice).
+struct FunctionLaunchParams {
+  void* function;
+  unsigned int grid_x, grid_y, grid_z;
+  unsigned int block_x, block_y, block_z;
+  unsigned int shared;
+  void* stream;
+  void** params;
+};
+
 struct DeviceArch {
   unsigned hasGlobalInt32Atomics : 1;
   unsigned hasGlobalFloatAtomicExch : 1;
@@ -310,6 +368,110 @@ struct MemAccessDesc {
   MemLocation location;
   int flags;   // hipMemAccessFlags: 0 none, 1 read, 3 read and write
 };
+
+// The shapes of HIP's 2D and 3D copies and fills. Widths and offsets along a
+// row are bytes, for linear memory; heights and depths are rows and slices.
+struct PitchedPtr {
+  void* ptr;
+  size_t pitch;   // bytes from one row to the next
+  size_t xsize;   // the row's width, as allocated (never checked)
+  size_t ysize;   // rows to a slice
+};
+struct Extent {
+  size_t width, height, depth;
+};
+struct Pos {
+  size_t x, y, z;
+};
+// hipMemcpy3D's parameters: each side an array or a pitched pointer.
+struct Memcpy3DParms {
+  void* srcArray;
+  Pos srcPos;
+  PitchedPtr srcPtr;
+  void* dstArray;
+  Pos dstPos;
+  PitchedPtr dstPtr;
+  Extent extent;
+  int kind;
+};
+// hipMemcpy3DPeer's: the same, and the device on each side.
+struct Memcpy3DPeerParms {
+  void* srcArray;
+  Pos srcPos;
+  PitchedPtr srcPtr;
+  int srcDevice;
+  void* dstArray;
+  Pos dstPos;
+  PitchedPtr dstPtr;
+  int dstDevice;
+  Extent extent;
+};
+// hipMemoryType, which names where a driver-style copy's side is.
+enum MemoryTypeKind : int {
+  kMemTypeHost = 1,
+  kMemTypeDevice = 2,
+  kMemTypeManaged = 3,
+  kMemTypeArray = 10,
+  kMemTypeUnified = 11,
+};
+// hip_Memcpy2D (hipMemcpyParam2D, hipDrvMemcpy2DUnaligned): the side's memory
+// type says which of its pointer fields is read.
+struct Memcpy2D {
+  size_t srcXInBytes, srcY;
+  int srcMemoryType;
+  const void* srcHost;
+  void* srcDevice;
+  void* srcArray;
+  size_t srcPitch;
+  size_t dstXInBytes, dstY;
+  int dstMemoryType;
+  void* dstHost;
+  void* dstDevice;
+  void* dstArray;
+  size_t dstPitch;
+  size_t WidthInBytes, Height;
+};
+// HIP_MEMCPY3D (hipDrvMemcpy3D): a slice is Height rows unless a side says
+// otherwise.
+struct Memcpy3D {
+  size_t srcXInBytes, srcY, srcZ, srcLOD;
+  int srcMemoryType;
+  const void* srcHost;
+  void* srcDevice;
+  void* srcArray;
+  size_t srcPitch, srcHeight;
+  size_t dstXInBytes, dstY, dstZ, dstLOD;
+  int dstMemoryType;
+  void* dstHost;
+  void* dstDevice;
+  void* dstArray;
+  size_t dstPitch, dstHeight;
+  size_t WidthInBytes, Height, Depth;
+};
+// hipMemcpy3DBatchAsync's operations: each operand a pointer (with its row
+// length and slice height) or an array.
+struct Memcpy3DOperand {
+  int type;   // hipMemcpyOperandTypePointer (1) or Array (2)
+  union {
+    struct {
+      void* ptr;
+      size_t rowLength;
+      size_t layerHeight;
+      MemLocation locHint;
+    } ptr;
+    struct {
+      void* array;
+      size_t x, y, z;
+    } array;
+  } op;
+};
+struct Memcpy3DBatchOp {
+  Memcpy3DOperand src;
+  Memcpy3DOperand dst;
+  Extent extent;
+  int srcAccessOrder;
+  unsigned int flags;
+};
 struct MemPoolProps {
   int allocType;
   int handleTypes;
@@ -328,6 +490,102 @@ enum MemPoolAttr : int {
   kPoolReservedMemHigh = 6,
   kPoolUsedMemCurrent = 7,
   kPoolUsedMemHigh = 8,
+};
+
+// ---- Graphs: what each kind of node is made from --------------------------------
+//
+// hipGraphNodeType.
+enum GraphNodeType : int {
+  kNodeKernel = 0,
+  kNodeMemcpy = 1,
+  kNodeMemset = 2,
+  kNodeHost = 3,
+  kNodeGraph = 4,
+  kNodeEmpty = 5,
+  kNodeWaitEvent = 6,
+  kNodeEventRecord = 7,
+  kNodeExtSemaphoreSignal = 8,
+  kNodeExtSemaphoreWait = 9,
+  kNodeMemAlloc = 10,
+  kNodeMemFree = 11,
+  kNodeMemcpyFromSymbol = 12,
+  kNodeMemcpyToSymbol = 13,
+  kNodeBatchMemOp = 14,
+};
+// hipKernelNodeParams.
+struct KernelNodeParams {
+  Dim3 blockDim;
+  void** extra;
+  void* func;
+  Dim3 gridDim;
+  void** kernelParams;
+  unsigned int sharedMemBytes;
+};
+// hipMemsetParams: width in elements, pitch in bytes.
+struct MemsetParams {
+  void* dst;
+  unsigned int elementSize;
+  size_t height;
+  size_t pitch;
+  unsigned int value;
+  size_t width;
+};
+// hipHostNodeParams.
+struct HostNodeParams {
+  void (*fn)(void*);
+  void* userData;
+};
+// hipMemAllocNodeParams: dptr is written when the node is added.
+struct MemAllocNodeParams {
+  MemPoolProps poolProps;
+  const MemAccessDesc* accessDescs;
+  size_t accessDescCount;
+  size_t bytesize;
+  void* dptr;
+};
+// hipMemcpyNodeParams.
+struct MemcpyNodeParams {
+  int flags;
+  int reserved[3];
+  Memcpy3DParms copyParams;
+};
+// hipGraphNodeParams: a type and, by it, one of the node parameter structs.
+struct GraphNodeParams {
+  int type;
+  int reserved0[3];
+  union {
+    long long reserved1[29];
+    KernelNodeParams kernel;
+    MemcpyNodeParams memcpy;
+    MemsetParams memset;
+    HostNodeParams host;
+    void* graph;    // hipChildGraphNodeParams
+    void* event;    // hipEventWaitNodeParams, hipEventRecordNodeParams
+    MemAllocNodeParams alloc;
+    void* free;     // hipMemFreeNodeParams
+  };
+  long long reserved2;
+};
+// hipGraphInstantiateParams.
+struct GraphInstantiateParams {
+  void* errNode_out;
+  unsigned long long flags;
+  int result_out;
+  void* uploadStream;
+};
+// hipBatchMemOpNodeParams: its operations are hipStreamBatchMemOpParams, 48
+// bytes each.
+struct BatchMemOpNodeParams {
+  void* ctx;
+  unsigned int count;
+  void* paramArray;
+  unsigned int flags;
+};
+// hipExternalSemaphoreSignalNodeParams and hipExternalSemaphoreWaitNodeParams.
+struct ExtSemaphoreNodeParams {
+  void** extSemArray;
+  const void* paramsArray;
+  unsigned int numExtSems;
 };
 
 // hipIpcMemHandle_t: 64 bytes a process hands another.
@@ -413,6 +671,41 @@ enum class DeviceAttribute : int {
   kCanUseStreamWaitValue = 10013,
   kImageSupport = 10014,
   kFineGrainSupport = 10016,
+  // Answered from the properties' own fields.
+  kAccessPolicyMaxWindowSize = 1,
+  kLuid = 21,
+  kLuidDeviceNodeMask = 22,
+  kMaxSurface1D = 32,
+  kMaxSurface1DLayered = 33,
+  kMaxSurface2D = 34,
+  kMaxSurface2DLayered = 35,
+  kMaxSurface3D = 36,
+  kMaxSurfaceCubemap = 37,
+  kMaxSurfaceCubemapLayered = 38,
+  kMaxTexture1DWidth = 39,
+  kMaxTexture1DLayered = 40,
+  kMaxTexture1DLinear = 41,
+  kMaxTexture1DMipmap = 42,
+  kMaxTexture2DWidth = 43,
+  kMaxTexture2DHeight = 44,
+  kMaxTexture2DGather = 45,
+  kMaxTexture2DLayered = 46,
+  kMaxTexture2DLinear = 47,
+  kMaxTexture2DMipmap = 48,
+  kMaxTexture3DWidth = 49,
+  kMaxTexture3DHeight = 50,
+  kMaxTexture3DDepth = 51,
+  kMaxTexture3DAlt = 52,
+  kMaxTextureCubemap = 53,
+  kMaxTextureCubemapLayered = 54,
+  kVirtualMemoryManagementSupported = 89,
+  kMemoryPoolSupportedHandleTypes = 91,
+  kHdpMemFlushCntl = 10005,   // a pointer, written over the int and the one after it
+  kHdpRegFlushCntl = 10006,
+  kWallClockRate = 10017,     // kHz
+  kNumberOfXccs = 10018,
+  kMaxAvailableVgprsPerThread = 10019,
+  kPciChipId = 10020,
 };
 
 }  // namespace vgpu::amd::abi

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <algorithm>
 #include <array>
+#include <list>
 #include <cstdlib>
 #include <exception>
 #include <thread>
@@ -40,6 +41,16 @@ using gcn::OperandKind;
 constexpr uint32_t kSgprs = 106;      // s0 through s101 and FLAT_SCRATCH (102, 103) on gfx9; s0 through s105 on RDNA
 constexpr uint32_t kVgprs = 256;
 constexpr uint32_t kLanes = 64;
+
+// The GPU's real-time clock: a counter at a constant 100 MHz, which is what
+// the runtime reports as the wall clock rate. Taken from the host's steady
+// clock, so a kernel that waits on it for a stretch of time waits that long.
+uint64_t realtime_ticks() {
+  return static_cast<uint64_t>(
+             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                 .count()) /
+         10;
+}
 
 // Where LDS sits in the one address space a flat access uses. The hardware
 // puts it in an aperture the wave reads from src_shared_base; this model puts
@@ -1188,15 +1199,11 @@ struct Machine {
     } else if (op == "s_pack_hl_b32_b16"_op) {
       write_scalar(w, in.dst[0], static_cast<uint32_t>(a) >> 16 | static_cast<uint32_t>(b) << 16);
     } else if (op == "s_sendmsg_rtn_b32"_op || op == "s_sendmsg_rtn_b64"_op) {
-      // A message that answers. The one compute code asks is the time: a
-      // counter at 100 MHz, from the host's steady clock.
+      // A message that answers. The one compute code asks is the time
+      // (realtime_ticks).
       if (in.simm != 131)
         throw Error::make(Err::Unsupported, "s_sendmsg_rtn of message ", in.simm, ", which this does not answer");
-      const uint64_t ticks = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                       std::chrono::steady_clock::now().time_since_epoch())
-                                                       .count()) /
-                             10;
-      write_scalar(w, in.dst[0], ticks);
+      write_scalar(w, in.dst[0], realtime_ticks());
     } else if (scalar_float(w, in, op, a, b)) {
     } else if (op == "s_add_nc_u64"_op || op == "s_sub_nc_u64"_op || op == "s_mul_u64"_op) {
       // RDNA4's 64-bit scalar arithmetic, SCC untouched.
@@ -1268,14 +1275,18 @@ struct Machine {
   }
 
   void scalar_load(Wave& w, const Inst& in) {
-    // A counter, rather than a load. What a card returns is a clock at a
-    // fixed rate; what this returns is the instructions retired so far by the
-    // host thread running the wave, which is this model's cycle count. A wave
-    // stays on one thread, so for it the count only ever goes up, which is
-    // what a program timing a stretch of its own code depends on.
+    // Counters, rather than loads. s_memtime is the shader clock, which on a
+    // card runs with the core clock; here it is the instructions retired so
+    // far by the host thread running the wave, which is this model's cycle
+    // count. A wave stays on one thread, so for it the count only ever goes
+    // up, which is what a program timing a stretch of its own code depends
+    // on. s_memrealtime is the real-time clock (realtime_ticks), at the rate
+    // the runtime reports: a kernel waiting on it for some milliseconds, as
+    // wall_clock64() loops do, waits that long.
     if (OpName(in.name) == "s_memtime"_op || OpName(in.name) == "s_memrealtime"_op) {
-      set_sgpr(w, in.dst[0].index, static_cast<uint32_t>(stats.instructions));
-      set_sgpr(w, in.dst[0].index + 1, static_cast<uint32_t>(stats.instructions >> 32));
+      const uint64_t t = OpName(in.name) == "s_memtime"_op ? stats.instructions : realtime_ticks();
+      set_sgpr(w, in.dst[0].index, static_cast<uint32_t>(t));
+      set_sgpr(w, in.dst[0].index + 1, static_cast<uint32_t>(t >> 32));
       return;
     }
     // The scalar cache holds nothing here to write back or drop.
@@ -2102,9 +2113,13 @@ struct Machine {
     // there: write_lane does each.)
     // op_sel on a 16-bit long form: a source's bit reads its high half,
     // which is the sub-dword selection SDWA makes, so the instruction runs
-    // as that. (The 8-bit float conversions and v_pack read their own bits.)
+    // as that. (The 8-bit float conversions and v_pack read their own bits;
+    // RDNA's v_permlane16 and v_permlanex16 take op_sel as FI and
+    // BOUND_CTRL. Rewritten as halves, a permlanex16 with FI set -- Triton's
+    // row maximum across a wave32, in vLLM's attention -- moved each lane's
+    // high half, and -inf arrived as a tiny positive number.)
     if (in.enc == gcn::Enc::Vop3 && (in.op_sel & 7) && in.name.find("fp8") == std::string::npos &&
-        in.name.find("bf8") == std::string::npos) {
+        in.name.find("bf8") == std::string::npos && in.name.rfind("v_permlane", 0) != 0) {
       const bool wide_third = in.name.find("u32_u16") != std::string::npos;   // v_mad_u32_u16's addend is 32 bits
       Inst x = in;
       for (uint32_t k = 0; k < x.src.size() && k < 3; ++k)
@@ -3161,6 +3176,42 @@ struct Machine {
       const Operand& data = op == "ds_bpermute_b32"_op ? in.src[1] : in.src[0];
       for (uint32_t lane = 0; lane < kLanes; ++lane) before[lane] = w.vgpr[data.index][lane];
     }
+    if (op == "ds_read_b64_tr_b16"_op || op == "ds_read_b64_tr_b8"_op || op == "ds_read_b64_tr_b4"_op) {
+      // gfx950's transposing reads. Each lane reads 64 bits from its address
+      // -- `tile` elements of `bits` bits -- and the hardware hands them out
+      // across the wave: destination lane l's element r is element l mod
+      // tile of what lane A read, where A takes, from its low bit up, lane
+      // bits t .. t+b-1, then r's t bits, then lane bits t+b and up (t =
+      // log2 tile; b = 2, 1, 0 for 16-, 8-, 4-bit elements). This is the map
+      // Triton's AMD backend lowers these instructions by (TargetFeatures:
+      // CDNA4's leading register and lane bases, 0 and b). The ISA asks for
+      // every lane to be on; every lane's read is made, and only the active
+      // lanes written.
+      const uint32_t bits = op == "ds_read_b64_tr_b16"_op ? 16 : op == "ds_read_b64_tr_b8"_op ? 8 : 4;
+      const uint32_t tile = 64 / bits, t = static_cast<uint32_t>(__builtin_ctz(tile));
+      const uint32_t b = bits == 16 ? 2 : bits == 8 ? 1 : 0;
+      std::array<uint64_t, kLanes> read{};
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        const uint64_t a = static_cast<uint32_t>(lane_src(w, in.src[0], lane) + static_cast<uint32_t>(in.offset));
+        if (a + 8 <= g.lds.size()) std::memcpy(&read[lane], &g.lds[a], 8);
+        else if (g.lds.empty())
+          throw Error::make(Err::InvalidValue, "an LDS access at ", a, " in a work-group given no LDS: the launch ",
+                            "did not pay for the LDS its kernel uses");
+      }
+      const uint64_t mask = (uint64_t{1} << bits) - 1;
+      for (uint32_t l = 0; l < kLanes; ++l) {
+        if (!(w.exec >> l & 1)) continue;
+        uint64_t out = 0;
+        for (uint32_t r = 0; r < tile; ++r) {
+          const uint32_t src = ((l >> t) & ((1u << b) - 1)) | (r << b) | ((l >> (t + b)) << (b + t));
+          const uint32_t c = l & (tile - 1);
+          out |= ((read[src % kLanes] >> (c * bits)) & mask) << (r * bits);
+        }
+        set_word(w, in.dst[0], 0, l, static_cast<uint32_t>(out));
+        set_word(w, in.dst[0], 1, l, static_cast<uint32_t>(out >> 32));
+      }
+      return;
+    }
     if (op == "ds_permute_b32"_op) {
       // The other way round from bpermute: each lane sends its value to the
       // lane its address names, and a lane no one sent to gets zero. Where
@@ -3763,6 +3814,30 @@ struct Machine {
       } else {
         throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
       }
+    }
+  }
+
+  // Loads straight into LDS (global_load_lds_dword; gfx950's _dwordx3 and
+  // _dwordx4): each lane reads its element from global memory and writes it
+  // into the work-group's LDS at M0, plus the instruction's offset, plus the
+  // lane's number times the element's size -- as LLVM's global_load_lds
+  // intrinsics lay it out. No register is written.
+  void global_load_lds(Wave& w, const Inst& in, Group& g) {
+    const std::string& op = in.name;
+    const uint32_t words = op.ends_with("_dwordx4") ? 4 : op.ends_with("_dwordx3") ? 3 : 1;
+    const uint32_t bytes = 4 * words;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      if (!(w.exec >> lane & 1)) continue;
+      const uint64_t addr = (in.has_saddr ? scalar_field(w, in.saddr, true) + lane_src(w, in.src[0], lane)
+                                          : lane_src64(w, in.src[0], lane)) +
+                            static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+      const uint64_t at = uint64_t{w.m0} + static_cast<uint64_t>(static_cast<int64_t>(in.offset)) + uint64_t{lane} * bytes;
+      if (at + bytes > g.lds.size())
+        throw Error::make(Err::InvalidValue, op, " writes LDS at ", at, ", past the ", g.lds.size(),
+                          " bytes the work-group has");
+      uint32_t v[4];
+      load_words(addr, words, v);
+      std::memcpy(&g.lds[at], v, bytes);
     }
   }
 
@@ -4542,6 +4617,7 @@ struct Machine {
         else ++n.flat_read, ++n.vmem_rd;
         if (in.segment == Inst::Segment::Scratch) scratch_access(w, in, g);
         else if (in.segment == Inst::Segment::Flat) n.lds += flat_access(w, in, g);
+        else if (in.name.find("_load_lds_") != std::string::npos) global_load_lds(w, in, g), ++n.lds;
         else global_access(w, in);
         return true;
       case gcn::Enc::Mubuf:
@@ -4833,10 +4909,15 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
     // that preloads them loads them itself where the hardware has not (its
     // first 256 bytes do it, and the hardware skips them).
     at = std::max(at, k.user_sgpr_count);
-    // RDNA4 gives the work-group's id in the trap handler's registers.
+    // RDNA4 gives the work-group's id in the trap handler's registers, and
+    // the wave's number within the group in TTMP8's bits 25 to 29, where
+    // LLVM reads it (llvm.amdgcn.wave.id). Without it every wave of a Triton
+    // kernel took itself for the first, and only a group's first 32 work-items'
+    // share of the work was done right.
     if (m.target() == gcn::Target::Gfx1200) {
       w.ttmp[9] = gx;
       w.ttmp[7] = (gy & 0xFFFF) | gz << 16;
+      w.ttmp[8] = (i & 0x1F) << 25;
     }
     if (k.group_id_x) m.set_sgpr(w, at++, gx);
     if (k.group_id_y) m.set_sgpr(w, at++, gy);
@@ -4873,14 +4954,21 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
 // barrier or yields (s_sleep, a wave waiting on something), and a barrier
 // every unfinished wave has reached is released. Says whether every wave has
 // stopped.
-bool run_round(Machine& m, Group& group) {
+// A turn may be cut short after `slice` instructions (0: no limit), as the
+// hardware interleaves the waves of groups resident together: a wave polling
+// memory for another group's write, with no s_sleep in its loop, gives the
+// other group its turn.
+bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
   bool runnable = false;
   for (Wave& w : group.waves) {
     if (w.done || w.at_barrier) continue;
     runnable = true;
     uint64_t pc = w.pc;
     try {
-      while (m.step(w, group)) pc = w.pc;
+      for (uint64_t n = 0; m.step(w, group); ++n) {
+        pc = w.pc;
+        if (slice && n + 1 >= slice) break;
+      }
     } catch (const Error& e) {
       throw m.at_instruction(e, pc);
     }
@@ -4896,14 +4984,65 @@ bool run_round(Machine& m, Group& group) {
   return !any;
 }
 
-// Runs one work-group to the end: its waves set up as the hardware leaves
-// them, then run until every one has stopped, a wave parked at a barrier
-// waiting for the others to reach it.
-void run_group(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_segment, uint32_t gx, uint32_t gy,
-               uint32_t gz) {
-  Group group;
-  set_up_group(group, m, d, packet, group_segment, gx, gy, gz);
-  while (!run_round(m, group)) {
+// Whether a group's last round ended with a wave waiting (s_sleep, as a
+// group polling a flag another group sets does) rather than at a barrier or
+// done.
+bool waiting(const Group& group) {
+  for (const Wave& w : group.waves)
+    if (!w.done && !w.at_barrier) return true;
+  return false;
+}
+
+// Runs work-groups [begin, end) on one host thread. Each group runs until it
+// finishes, waits (s_sleep) or has had its turn; the groups this thread holds take turns, and when every
+// one of them is waiting, the next is started beside them -- as the hardware
+// keeps many groups resident at once. hipBLASLt's Stream-K GEMMs have a group
+// wait for another's partial tile: run one group at a time, one that waited on
+// a group later on the same thread waited for ever. A kernel whose groups
+// never wait runs one group at a time, as before.
+template <typename GroupAt>
+void run_groups(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_segment, uint64_t begin,
+                uint64_t end, GroupAt group_at, const std::atomic<bool>* failed) {
+  // A group's first turn is some four million instructions a wave: long
+  // enough that a group that does not wait finishes in it, so the groups of
+  // an ordinary kernel still run one at a time. A group still going after
+  // that is waiting on another, or very long, and its later turns are short
+  // (32768), so that a group polling another's flag gives way quickly. (A
+  // short turn for every group held dozens of groups' registers at once and
+  // ran PyTorch's checks many times slower; a long one for every turn made
+  // vLLM's Stream-K GEMMs on MI350X six times slower.) The groups held at
+  // once are bounded by their waves' registers (256 waves to a thread).
+  constexpr uint64_t kFirstTurn = 1 << 22, kLaterTurn = 1 << 15;
+  constexpr uint64_t kMaxResidentWaves = 256;
+  struct Held {
+    Group group;
+    bool had_turn = false;
+  };
+  std::list<Held> resident;
+  uint64_t next = begin, resident_waves = 0;
+  const auto admit = [&] {
+    uint32_t gx, gy, gz;
+    group_at(next++, &gx, &gy, &gz);
+    resident.emplace_back();
+    set_up_group(resident.back().group, m, d, packet, group_segment, gx, gy, gz);
+    resident_waves += resident.back().group.waves.size();
+  };
+  while (!resident.empty() || next < end) {
+    if (failed && failed->load(std::memory_order_relaxed)) return;
+    if (resident.empty()) admit();
+    bool all_waiting = true;
+    for (auto it = resident.begin(); it != resident.end();) {
+      if (run_round(m, it->group, it->had_turn ? kLaterTurn : kFirstTurn)) {
+        resident_waves -= it->group.waves.size();
+        it = resident.erase(it);
+        all_waiting = false;
+        continue;
+      }
+      if (waiting(it->group)) it->had_turn = true;
+      else all_waiting = false;
+      ++it;
+    }
+    if (all_waiting && next < end && resident_waves < kMaxResidentWaves) admit();
   }
 }
 
@@ -4981,11 +5120,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     total = m.stats;
   } else if (nthreads <= 1) {
     Machine m(d, mem, *cache);
-    for (uint64_t i = 0; i < groups; ++i) {
-      uint32_t gx, gy, gz;
-      group_at(i, &gx, &gy, &gz);
-      run_group(m, d, packet, group_segment, gx, gy, gz);
-    }
+    run_groups(m, d, packet, group_segment, 0, groups, group_at, nullptr);
     total = m.stats;
   } else {
     // Each thread a range of work-groups and a machine of its own; what they
@@ -5002,11 +5137,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
         try {
           Machine m(d, mem, *cache);
           m.concurrent = true;
-          for (uint64_t i = begin; i < end && !failed.load(std::memory_order_relaxed); ++i) {
-            uint32_t gx, gy, gz;
-            group_at(i, &gx, &gy, &gz);
-            run_group(m, d, packet, group_segment, gx, gy, gz);
-          }
+          run_groups(m, d, packet, group_segment, begin, end, group_at, &failed);
           per_thread[t] = m.stats;
         } catch (...) {
           failed = true;

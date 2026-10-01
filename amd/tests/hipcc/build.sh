@@ -42,6 +42,30 @@ echo "wrote $(pwd)/textures.gfx942"
   sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > cooperative.gfx942.dis
 echo "wrote $(pwd)/cooperative.gfx942, cooperative.gfx942.o and its listing ($(wc -l < cooperative.gfx942.dis) instructions)"
 
+# HIP's calls beyond the everyday ones -- device flags and UUIDs, contexts, the
+# reserved stream handles, callbacks, waiting on memory, every launch form --
+# checked against what ROCm's HIP answers.
+"$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 api.cpp -o api.gfx942
+echo "wrote $(pwd)/api.gfx942"
+
+# HIP's copies, fills and allocations of every shape, and managed memory's
+# advice.
+"$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 memory.cpp -o memory.gfx942
+echo "wrote $(pwd)/memory.gfx942"
+# Graphs and stream capture: nodes of every kind, executable graphs and what
+# changes them, capture across streams and its modes, graph memory.
+"$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 graphs.cpp -o graphs.gfx942
+echo "wrote $(pwd)/graphs.gfx942"
+# The rest of ROCm's exports: __managed__ variables, libraries, fat
+# binaries, the run-time linker and HCC's launch, which load a code object
+# built on its own.
+"$rocm/bin/hipcc" -O2 --genco --offload-arch=gfx942 exports_kernel.cpp -o exports_kernel.gfx942.co
+"$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 exports.cpp -o exports.gfx942
+echo "wrote $(pwd)/exports.gfx942 and exports_kernel.gfx942.co"
+# Events shared with another process, which it forks for.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 ipc.cpp -o ipc.gfx942
+echo "wrote $(pwd)/ipc.gfx942"
+
 # Streams that run at once: kernels on two streams handing values to each
 # other, events, stream waits, the null stream's ordering, host functions.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 streams.cpp -o streams.gfx942

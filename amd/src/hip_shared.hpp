@@ -62,4 +62,12 @@ void unmap_host(void* p);
 // hipMemcpyDefault does.
 bool copy(void* dst, const void* src, size_t n, std::string* why);
 
+// A device's scratch limit: the private memory its queues may have, in
+// bytes, as HSA_AMD_AGENT_INFO_SCRATCH_LIMIT_CURRENT gives it and
+// hsa_amd_agent_set_async_scratch_limit (or HIP's hipExtLimitScratchCurrent)
+// sets it, up to the most there is.
+inline constexpr size_t kScratchLimitMax = size_t{1} << 32;
+size_t scratch_limit(int ordinal);
+bool set_scratch_limit(int ordinal, size_t bytes);
+
 }  // namespace vgpu::amd::shared

@@ -1,0 +1,52 @@
+name: Lazy modules nightly
+
+# The end-to-end suite with every module parsed lazily. A module of 2 MiB or
+# more is split into pieces and each function parsed when it is first used
+# (src/runtime/runtime.cpp); the e2e programs' modules are all smaller, so the
+# regular run parses them whole and only PyTorch-sized modules take the lazy
+# path. VGPU_LAZY_MODULE_BYTES=0 sends every module down it, so each e2e test
+# also checks that lazily parsed kernels, globals, textures and cross-function
+# calls behave exactly as eagerly parsed ones.
+#
+# Nightly rather than on every pull request: it repeats the build job's
+# 40-minute test run. A pull request that changes the lazy path or this file
+# runs it too.
+
+on:
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/lazy-modules-nightly.yml"
+      - "src/runtime/runtime.cpp"
+      - "include/vgpu/runtime/runtime.hpp"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lazy:
+    name: e2e with every module parsed lazily
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit nvidia-profiler
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: End-to-end tests, every module lazy
+        env:
+          VGPU_LAZY_MODULE_BYTES: "0"
+        # The same exclusions as the build job; the ML tests are the ml job's.
+        run: ctest --test-dir build --output-on-failure -R '^e2e_' -E '^(pantheon_workloads|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'

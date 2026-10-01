@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <functional>
 #include <dlfcn.h>
@@ -39,6 +40,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -488,6 +490,86 @@ vgpu::MemoryManager& owner_memory(State& s, const void* p) {
   return current(s).memory();
 }
 
+// A linked-in piece's file-scope names -- module variables and functions
+// not declared .visible, .extern or .weak -- belong to that piece alone,
+// the way an object file's local symbols do. Pasted together they did
+// not: every translation unit names its first string literal $str, and
+// CUDA's device-runtime library, always one of the pieces, has a $str of
+// its own ("cudaSuccess"). Its definition won, so a program's string
+// literal read as the library's (NanoVDB's device strcmp returned 17 for
+// two equal strings: 't' - 'c'). Renaming each linked-in piece's locals
+// keeps them apart. nvcc's __nv_static_ names are already unique, and the
+// host registers them by name, so they are left alone.
+void localize_ptx(std::string& text, size_t piece) {
+  auto id_char = [](char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+  };
+  auto starts = [](const std::string& line, const char* word) {
+    return line.compare(0, std::strlen(word), word) == 0;
+  };
+  std::set<std::string> locals;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t eol = text.find('\n', pos);
+    if (eol == std::string::npos) eol = text.size();
+    const std::string line = text.substr(pos, eol - pos);
+    pos = eol + 1;
+    // Module-scope declarations start in column 0; a function's own
+    // .shared or .local is indented and stays where it is.
+    const bool func = starts(line, ".func");
+    if (!func && !starts(line, ".global") && !starts(line, ".const")) continue;
+    std::string name;
+    size_t i = func ? 5 : 0;
+    if (func) {
+      while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+      if (i < line.size() && line[i] == '(') {  // the return parameter list
+        const size_t close = line.find(')', i);
+        if (close == std::string::npos) continue;
+        i = close + 1;
+      }
+      while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+      size_t j = i;
+      while (j < line.size() && id_char(line[j])) ++j;
+      name = line.substr(i, j - i);
+    } else {
+      // ".global .align 8 .u64 name[8] = {...};": the first token that is
+      // neither a directive nor a number.
+      std::istringstream toks(line);
+      std::string tok;
+      while (toks >> tok) {
+        if (tok[0] == '.' || std::isdigit(static_cast<unsigned char>(tok[0]))) continue;
+        size_t j = 0;
+        while (j < tok.size() && id_char(tok[j])) ++j;
+        name = tok.substr(0, j);
+        break;
+      }
+    }
+    if (!name.empty() && name.compare(0, 12, "__nv_static_") != 0) locals.insert(name);
+  }
+  if (locals.empty()) return;
+  const std::string suffix = "$vgpu" + std::to_string(piece);
+  std::string out;
+  out.reserve(text.size() + locals.size() * 16);
+  for (size_t k = 0; k < text.size();) {
+    const char c = text[k];
+    // An identifier starts with a letter, '_' or '$'; a register (after
+    // '%') or a number is copied through untouched.
+    if ((std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$') &&
+        (k == 0 || (!id_char(text[k - 1]) && text[k - 1] != '%'))) {
+      size_t j = k;
+      while (j < text.size() && id_char(text[j])) ++j;
+      const std::string word = text.substr(k, j - k);
+      out += word;
+      if (locals.count(word)) out += suffix;
+      k = j;
+    } else {
+      out += c;
+      ++k;
+    }
+  }
+  text = std::move(out);
+}
+
 // The PTX a registered fatbin holds for this machine's devices: the image the
 // driver would JIT (pick_ptx), or, for a separately compiled (-rdc) build,
 // its relocatable pieces put together. Empty where there is none.
@@ -546,7 +628,11 @@ std::string extract_registered_ptx(State& s, const void* fatCubin) {
     }
     std::string linked;
     size_t pieces = 0;
-    for (size_t i = 0; relocatable && relocatable[i] && i < 64; ++i) {
+    // The bound only guards against a list that is not terminated. It was 64,
+    // and a device-linked program has a piece per translation unit: AMReX's
+    // have about 320, so every kernel past the 64th unit was "no kernel named"
+    // (and cudaGetLastError's "invalid device function").
+    for (size_t i = 0; relocatable && relocatable[i] && i < 4096; ++i) {
       try {
         auto part = vgpu::cuda::extract_ptx(relocatable[i]);
         std::string text = pick_best(part);
@@ -562,7 +648,10 @@ std::string extract_registered_ptx(State& s, const void* fatCubin) {
         // module built for sm_80 claim to target sm_121 and be refused on an
         // A100 -- with an error about the *device* being too old, which is
         // the opposite of what had happened.
-        if (pieces > 0) text = strip_ptx_header(text);
+        if (pieces > 0) {
+          text = strip_ptx_header(text);
+          localize_ptx(text, pieces);
+        }
         linked += text;
         linked += "\n";
         ++pieces;
@@ -1106,6 +1195,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       lim.heap_used = lim.heap_used || kc->second.heap;
       lim.printf_used = lim.printf_used || kc->second.printf;
       cfg.device_heap_bytes = lim.malloc_heap;
+      cfg.stack_bytes = lim.stack;   // cudaLimitStackSize: each thread's alloca stack
     }
     if (cooperative) {
       // A cooperative launch promises every block is resident, so the grid has
@@ -1322,7 +1412,11 @@ VGPU_EXPORT cudaError_t cudaGetDeviceProperties(cudaDeviceProp* prop, int device
     prop->maxBlocksPerMultiProcessor = static_cast<int>(p.limits.max_blocks_per_sm);
     prop->sharedMemPerBlock = p.limits.shared_mem_per_block;
     prop->sharedMemPerBlockOptin = p.limits.shared_mem_per_block_optin;
-    prop->sharedMemPerMultiprocessor = p.limits.shared_mem_per_block_optin;
+    // The SM's whole shared memory, not the per-block opt-in: the two differ
+    // by the reserved 1 KiB from compute capability 8.0, and occupancy
+    // arithmetic that adds the reservation to a full-size block needs it.
+    prop->sharedMemPerMultiprocessor = p.limits.shared_mem_per_sm;
+    prop->reservedSharedMemPerBlock = p.reserved_smem_per_block();
     prop->regsPerBlock = static_cast<int>(p.limits.registers_per_block);
     prop->maxThreadsDim[0] = static_cast<int>(p.limits.max_block_dim[0]);
     prop->maxThreadsDim[1] = static_cast<int>(p.limits.max_block_dim[1]);
@@ -1379,6 +1473,7 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, 
       case cudaDevAttrMaxSharedMemoryPerBlock: *value = static_cast<int>(p.limits.shared_mem_per_block); break;
       case cudaDevAttrMaxSharedMemoryPerBlockOptin: *value = static_cast<int>(p.limits.shared_mem_per_block_optin); break;
       case cudaDevAttrMaxSharedMemoryPerMultiprocessor: *value = static_cast<int>(p.limits.shared_mem_per_sm); break;
+      case cudaDevAttrReservedSharedMemoryPerBlock: *value = static_cast<int>(p.reserved_smem_per_block()); break;
       case cudaDevAttrMaxRegistersPerBlock: *value = static_cast<int>(p.limits.registers_per_block); break;
       case cudaDevAttrMaxRegistersPerMultiprocessor: *value = static_cast<int>(p.limits.registers_per_sm); break;
       case cudaDevAttrMaxThreadsPerMultiProcessor: *value = static_cast<int>(p.limits.max_threads_per_sm); break;
@@ -1403,10 +1498,19 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, 
       // host address; see cudaHostGetDevicePointer.
       case cudaDevAttrCanMapHostMemory: *value = 1; break;
       case cudaDevAttrManagedMemory: *value = 1; break;
+      // The host and the device may touch managed memory at the same time, as
+      // on Linux since Pascal (Windows and WSL answer 0): here it is one
+      // host allocation. NanoVDB's DeviceStreamMap filters devices on it.
+      case cudaDevAttrConcurrentManagedAccess: *value = 1; break;
       // Grid-wide sync works under cudaLaunchCooperativeKernel; the
       // multi-device form does not.
       case cudaDevAttrCooperativeLaunch: *value = 1; break;
       case cudaDevAttrComputeMode: *value = 0; break;         // cudaComputeModeDefault
+      // The stream-ordered allocator is implemented: cudaMallocAsync and the
+      // cudaMemPool* API (an RTX 3060 answers 1; NanoVDB checks that the two
+      // agree). No pool can be exported to another process, so no handle types.
+      case cudaDevAttrMemoryPoolsSupported: *value = 1; break;
+      case cudaDevAttrMemoryPoolSupportedHandleTypes: *value = 0; break;
       default:
         // A silent zero here is how a scan came to launch no blocks. An
         // attribute this does not model is reported, so the caller either
@@ -1514,6 +1618,29 @@ VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBl
 VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     int* n, const void* f, int bs, size_t dyn, unsigned int) {
   return cudaOccupancyMaxActiveBlocksPerMultiprocessor(n, f, bs, dyn);
+}
+
+// What one device can do with another's memory. The answers follow
+// cudaDeviceCanAccessPeer: distinct simulated devices reach each other, and
+// atomics on a peer's memory are as atomic as on one's own. A device is not
+// asked about itself: an RTX 3060 answers that, like a device that does not
+// exist, with cudaErrorInvalidDevice. There is no performance to rank.
+VGPU_EXPORT cudaError_t cudaDeviceGetP2PAttribute(int* value, cudaDeviceP2PAttr attr, int srcDevice,
+                                                  int dstDevice) {
+  return guard("cudaDeviceGetP2PAttribute", [&](State& s) {
+    if (!value) return cudaErrorInvalidValue;
+    const int n = s.rt->device_count();
+    if (srcDevice < 0 || srcDevice >= n || dstDevice < 0 || dstDevice >= n || srcDevice == dstDevice)
+      return cudaErrorInvalidDevice;
+    switch (attr) {
+      case cudaDevP2PAttrPerformanceRank: *value = 0; break;
+      case cudaDevP2PAttrAccessSupported: *value = 1; break;
+      case cudaDevP2PAttrNativeAtomicSupported: *value = 1; break;
+      case cudaDevP2PAttrCudaArrayAccessSupported: *value = 0; break;
+      default: return cudaErrorInvalidValue;
+    }
+    return cudaSuccess;
+  });
 }
 
 VGPU_EXPORT cudaError_t cudaDeviceCanAccessPeer(int* can, int device, int peerDevice) {
@@ -1747,6 +1874,8 @@ VGPU_EXPORT cudaError_t cudaMemcpy2D(void* dst, size_t dpitch, const void* src, 
                                      size_t width, size_t height, cudaMemcpyKind kind) {
   if (width == 0 || height == 0) return cudaSuccess;
   if (!dst || !src) return cudaErrorInvalidValue;
+  // A row wider than either pitch would overlap the next; CUDA refuses it.
+  if (width > dpitch || width > spitch) return cudaErrorInvalidPitchValue;
   // A rectangle is a run of rows; each row goes through the same path as a
   // linear copy, so the owning-device resolution applies to it too.
   for (size_t y = 0; y < height; ++y) {
@@ -1781,6 +1910,24 @@ VGPU_EXPORT cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* 
 VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
   return guard("cudaMemset", [&](State& s) {
     if (count == 0) return cudaSuccess;  // even for a null pointer, as on hardware
+    // Managed and pinned memory are filled like device memory, as an RTX 3060
+    // fills them (NanoVDB zeroes a managed grid buffer this way); here they
+    // are host addresses. cudaHostRegister'd memory is refused, as CUDA
+    // refuses it: it is mapped for the device, and the core's fill now
+    // reaches host mappings (HIP fills its pinned and signal memory that way),
+    // so the refusal has to be said here. Pageable memory falls through to
+    // the device fill, which refuses it.
+    if (!is_device_ptr(dst)) {
+      if (find_range(s.registered, dst) != s.registered.end()) return cudaErrorInvalidValue;
+      for (auto* ranges : {&s.managed_allocs, &s.host_allocs}) {
+        auto it = find_range(*ranges, dst);
+        if (it == ranges->end()) continue;
+        const size_t off = static_cast<size_t>(static_cast<char*>(dst) - static_cast<char*>(it->first));
+        if (count > it->second.size - off) return cudaErrorInvalidValue;
+        std::memset(dst, value, count);
+        return cudaSuccess;
+      }
+    }
     const uint8_t byte = static_cast<uint8_t>(value);
     owner_memory(s, dst).fill(reinterpret_cast<uint64_t>(dst), &byte, 1, count);
     return cudaSuccess;
@@ -2606,9 +2753,11 @@ VGPU_EXPORT cudaError_t cudaPointerGetAttributes(cudaPointerAttributes* attr, co
       attr->devicePointer = const_cast<void*>(p);
       return cudaSuccess;
     }
-    // Plain host memory CUDA knows nothing about.
+    // Plain host memory CUDA knows nothing about. It belongs to no device,
+    // which CUDA says with cudaInvalidDeviceId (-2), not the current device:
+    // NanoVDB's ptrToDevice tells host pointers from device ones by that.
     attr->type = cudaMemoryTypeUnregistered;
-    attr->device = t_current_device;
+    attr->device = cudaInvalidDeviceId;
     attr->hostPointer = const_cast<void*>(p);
     return cudaSuccess;
   });
@@ -2959,7 +3108,6 @@ cudaError_t fill_from_resource(const cudaResourceDesc* res, vgpu::exec::TextureD
     case cudaResourceTypeMipmappedArray: {
       auto it = g_mipmapped.find(reinterpret_cast<uint64_t>(res->res.mipmap.mipmap));
       if (it == g_mipmapped.end()) return cudaErrorInvalidValue;
-      if (it->second.flags & (cudaArrayLayered | cudaArrayCubemap)) return cudaErrorNotSupported;
       const auto& lv = it->second.levels;
       if (lv.empty() || lv.size() > 17) return cudaErrorInvalidValue;
       const ArrayRec& a = g_arrays.at(lv[0]);
@@ -2967,6 +3115,12 @@ cudaError_t fill_from_resource(const cudaResourceDesc* res, vgpu::exec::TextureD
       d->width = a.width;
       d->height = a.height;
       d->depth = a.depth;
+      // Layered and cubemap mipmaps: every level has all the layers (and
+      // faces), each of that level's size. Level 0's depth is the slice
+      // count, as cudaMallocMipmappedArray keeps extent.depth for them.
+      d->cubemap = it->second.flags & cudaArrayCubemap;
+      if (it->second.flags & cudaArrayLayered) d->layers = d->cubemap ? a.depth / 6 : a.depth;
+      if (d->cubemap || d->layers) d->depth = 0;
       d->pitch_bytes = a.width * a.texel_bytes;
       d->texel_bytes = a.texel_bytes;
       d->channels = channels_of(a.fmt);
@@ -3280,18 +3434,16 @@ VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
     if (tex) {
       for (int i = 0; i < 3; ++i)
         if (!address_mode_of(tex->addressMode[i], &d.address[i])) return cudaErrorInvalidValue;
-      // Linear filtering is refused rather than approximated -- see the note at
-      // the fetch. sRGB and anisotropy change the result too.
+      // Linear filtering and sRGB decoding are done at the fetch, as the
+      // texture unit does them. Anisotropy changes the result too and is
+      // refused rather than approximated.
       if (tex->filterMode == cudaFilterModeLinear) d.filter = vgpu::exec::TexFilter::Linear;
-      if (tex->sRGB) return cudaErrorNotSupported;
+      d.srgb = tex->sRGB != 0;
       if (tex->maxAnisotropy > 1) return cudaErrorNotSupported;
-      // The border colour is taken as zero, the default. One a program sets
-      // with border addressing is refused rather than quietly replaced.
-      bool border = false;
-      for (int i = 0; i < 3; ++i) border |= tex->addressMode[i] == cudaAddressModeBorder;
-      if (border && (tex->borderColor[0] != 0 || tex->borderColor[1] != 0 ||
-                     tex->borderColor[2] != 0 || tex->borderColor[3] != 0))
-        return cudaErrorNotSupported;
+      // What border addressing returns outside the texture, converted to the
+      // texture's format at the fetch.
+      static_assert(sizeof d.border_bits == sizeof tex->borderColor);
+      std::memcpy(d.border_bits, tex->borderColor, sizeof d.border_bits);
       d.normalized_coords = tex->normalizedCoords != 0;
       // Mip selection, held as the hardware does in 1/256ths of a level,
       // truncated toward zero.
@@ -4578,6 +4730,23 @@ static cudaError_t replay_fill(const RecordedLaunch& rl) {
     for (unsigned i = 0; i < 4; ++i) pattern[i] = static_cast<uint8_t>(value >> (8 * i));
     for (size_t y = 0; y < rl.height; ++y) {
       void* row = static_cast<char*>(rl.dst) + y * rl.dst_pitch;
+      // Managed and pinned memory are host addresses here, filled as
+      // cudaMemset fills them (taskflow zeroes a managed buffer with a node).
+      if (!is_device_ptr(row)) {
+        bool host = false;
+        for (auto* ranges : {&s.managed_allocs, &s.host_allocs}) {
+          auto it = find_range(*ranges, row);
+          if (it == ranges->end()) continue;
+          const size_t off = static_cast<size_t>(static_cast<char*>(row) - static_cast<char*>(it->first));
+          if (rl.bytes > it->second.size - off) return cudaErrorInvalidValue;
+          auto* out = static_cast<uint8_t*>(row);
+          for (size_t i = 0; i < rl.bytes; i += rl.elem_size)
+            std::memcpy(out + i, pattern, std::min<size_t>(rl.elem_size, rl.bytes - i));
+          host = true;
+          break;
+        }
+        if (host) continue;
+      }
       owner_memory(s, row).fill(reinterpret_cast<uint64_t>(row), pattern, rl.elem_size, rl.bytes);
     }
     return cudaSuccess;
@@ -6294,3 +6463,71 @@ VGPU_EXPORT cudaError_t cudaStreamIsCapturing(cudaStream_t stream,
                                      : cudaStreamCaptureStatusNone;
   return cudaSuccess;
 }
+
+/* ===================================================================== */
+/* Per-thread default stream                                             */
+/* ===================================================================== */
+
+// A program built with nvcc --default-stream per-thread (or with
+// CUDA_API_PER_THREAD_DEFAULT_STREAM defined) calls these names instead:
+// cudaMemcpy_ptds, cudaLaunchKernel_ptsz and the rest, where stream 0 is the
+// calling thread's own default stream rather than the legacy one. Every
+// stream here is synchronous, so the two defaults behave alike and each name
+// is the plain function under another symbol. COLMAP builds this way.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattribute-alias"
+#endif
+#define VGPU_PT_ALIAS(name, target) \
+  extern "C" __attribute__((visibility("default"))) void name() __attribute__((alias(#target)));
+VGPU_PT_ALIAS(cudaMemcpy_ptds, cudaMemcpy)
+VGPU_PT_ALIAS(cudaMemcpyToSymbol_ptds, cudaMemcpyToSymbol)
+VGPU_PT_ALIAS(cudaMemcpyFromSymbol_ptds, cudaMemcpyFromSymbol)
+VGPU_PT_ALIAS(cudaMemcpy2D_ptds, cudaMemcpy2D)
+VGPU_PT_ALIAS(cudaMemcpy2DToArray_ptds, cudaMemcpy2DToArray)
+VGPU_PT_ALIAS(cudaMemcpy2DFromArray_ptds, cudaMemcpy2DFromArray)
+VGPU_PT_ALIAS(cudaMemcpy3D_ptds, cudaMemcpy3D)
+VGPU_PT_ALIAS(cudaMemcpy3DPeer_ptds, cudaMemcpy3DPeer)
+VGPU_PT_ALIAS(cudaMemset_ptds, cudaMemset)
+VGPU_PT_ALIAS(cudaMemset2D_ptds, cudaMemset2D)
+VGPU_PT_ALIAS(cudaMemcpyPeer_ptds, cudaMemcpyPeer)
+VGPU_PT_ALIAS(cudaMemcpyAsync_ptsz, cudaMemcpyAsync)
+VGPU_PT_ALIAS(cudaMemcpyToSymbolAsync_ptsz, cudaMemcpyToSymbolAsync)
+VGPU_PT_ALIAS(cudaMemcpyFromSymbolAsync_ptsz, cudaMemcpyFromSymbolAsync)
+VGPU_PT_ALIAS(cudaMemcpy2DAsync_ptsz, cudaMemcpy2DAsync)
+VGPU_PT_ALIAS(cudaMemcpy3DAsync_ptsz, cudaMemcpy3DAsync)
+VGPU_PT_ALIAS(cudaMemcpy3DPeerAsync_ptsz, cudaMemcpy3DPeerAsync)
+VGPU_PT_ALIAS(cudaMemsetAsync_ptsz, cudaMemsetAsync)
+VGPU_PT_ALIAS(cudaMemset2DAsync_ptsz, cudaMemset2DAsync)
+VGPU_PT_ALIAS(cudaStreamQuery_ptsz, cudaStreamQuery)
+VGPU_PT_ALIAS(cudaStreamGetFlags_ptsz, cudaStreamGetFlags)
+VGPU_PT_ALIAS(cudaStreamGetId_ptsz, cudaStreamGetId)
+VGPU_PT_ALIAS(cudaStreamGetPriority_ptsz, cudaStreamGetPriority)
+VGPU_PT_ALIAS(cudaEventRecord_ptsz, cudaEventRecord)
+VGPU_PT_ALIAS(cudaEventRecordWithFlags_ptsz, cudaEventRecordWithFlags)
+VGPU_PT_ALIAS(cudaStreamWaitEvent_ptsz, cudaStreamWaitEvent)
+VGPU_PT_ALIAS(cudaStreamAddCallback_ptsz, cudaStreamAddCallback)
+VGPU_PT_ALIAS(cudaStreamSynchronize_ptsz, cudaStreamSynchronize)
+VGPU_PT_ALIAS(cudaLaunchKernel_ptsz, cudaLaunchKernel)
+VGPU_PT_ALIAS(cudaLaunchKernelExC_ptsz, cudaLaunchKernelExC)
+VGPU_PT_ALIAS(cudaLaunchHostFunc_ptsz, cudaLaunchHostFunc)
+VGPU_PT_ALIAS(cudaMemPrefetchAsync_ptsz, cudaMemPrefetchAsync)
+VGPU_PT_ALIAS(cudaGraphLaunch_ptsz, cudaGraphLaunch)
+VGPU_PT_ALIAS(cudaGraphUpload_ptsz, cudaGraphUpload)
+VGPU_PT_ALIAS(cudaStreamBeginCapture_ptsz, cudaStreamBeginCapture)
+VGPU_PT_ALIAS(cudaStreamEndCapture_ptsz, cudaStreamEndCapture)
+VGPU_PT_ALIAS(cudaStreamIsCapturing_ptsz, cudaStreamIsCapturing)
+VGPU_PT_ALIAS(cudaStreamGetCaptureInfo_v2_ptsz, cudaStreamGetCaptureInfo_v2)
+VGPU_PT_ALIAS(cudaMallocAsync_ptsz, cudaMallocAsync)
+VGPU_PT_ALIAS(cudaFreeAsync_ptsz, cudaFreeAsync)
+VGPU_PT_ALIAS(cudaMallocFromPoolAsync_ptsz, cudaMallocFromPoolAsync)
+VGPU_PT_ALIAS(cudaLaunchCooperativeKernel_ptsz, cudaLaunchCooperativeKernel)
+VGPU_PT_ALIAS(cudaMemcpyPeerAsync_ptsz, cudaMemcpyPeerAsync)
+VGPU_PT_ALIAS(cudaStreamCopyAttributes_ptsz, cudaStreamCopyAttributes)
+VGPU_PT_ALIAS(cudaStreamGetAttribute_ptsz, cudaStreamGetAttribute)
+VGPU_PT_ALIAS(cudaStreamSetAttribute_ptsz, cudaStreamSetAttribute)
+VGPU_PT_ALIAS(cudaStreamUpdateCaptureDependencies_ptsz, cudaStreamUpdateCaptureDependencies)
+#undef VGPU_PT_ALIAS
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif

@@ -25,6 +25,7 @@
 #include <vector>
 
 #include <ctime>
+#include <map>
 #include <set>
 
 #include "error_names.hpp"
@@ -72,7 +73,20 @@ struct KernelRec {
 
 struct EventRec {
   bool recorded = false;
+  bool timing = true;   // false for CU_EVENT_DISABLE_TIMING
   struct timespec when {};
+};
+
+// A CUDA array: its descriptor and the device memory behind it, laid out row
+// by row (Width elements of NumChannels, then Height rows, then Depth slices;
+// a zero Height or Depth counts as one).
+struct ArrayRec {
+  CUDA_ARRAY3D_DESCRIPTOR desc{};
+  size_t elem = 0;       // bytes an element takes, all channels
+  size_t row = 0;        // bytes a row takes
+  size_t rows = 1, slices = 1;
+  int device = 0;
+  CUdeviceptr mem = 0;
 };
 
 struct ShimState {
@@ -96,6 +110,9 @@ struct ShimState {
   std::unordered_map<uintptr_t, EventRec> events;
   std::set<uintptr_t> streams;      // explicitly created streams (all synchronous)
   std::set<void*> host_allocs;      // cuMemHostAlloc results
+  std::map<uintptr_t, size_t> managed;  // cuMemAllocManaged results: base -> bytes
+  std::unordered_map<uintptr_t, ArrayRec> arrays;  // cuArray3DCreate results
+  int cache_config = 0;   // cuCtxSetCacheConfig: CU_FUNC_CACHE_PREFER_NONE until set
 };
 
 ShimState& state() {
@@ -226,6 +243,40 @@ vgpu::MemoryManager& owner_memory(ShimState& s, CUdeviceptr p) {
   return current(s).memory();
 }
 
+// The managed allocation holding [p, p + n), or nullptr.
+const std::pair<const uintptr_t, size_t>* managed_range(ShimState& s, CUdeviceptr p, size_t n) {
+  auto it = s.managed.upper_bound(p);
+  if (it == s.managed.begin()) return nullptr;
+  --it;
+  if (p + n > it->first + it->second || p + n < p) return nullptr;
+  return &*it;
+}
+
+// Reads, writes and fills of device memory. Managed memory is host memory the
+// devices map, and copies and memsets reach it directly, as the runtime's do.
+void dev_write(ShimState& s, CUdeviceptr dst, const void* src, size_t n) {
+  if (n && managed_range(s, dst, n)) {
+    std::memcpy(reinterpret_cast<void*>(dst), src, n);
+    return;
+  }
+  owner_memory(s, dst).write(dst, src, n);
+}
+void dev_read(ShimState& s, void* dst, CUdeviceptr src, size_t n) {
+  if (n && managed_range(s, src, n)) {
+    std::memcpy(dst, reinterpret_cast<const void*>(src), n);
+    return;
+  }
+  owner_memory(s, src).read(src, dst, n);
+}
+void dev_fill(ShimState& s, CUdeviceptr dst, const uint8_t* pattern, size_t width, size_t n) {
+  if (n && managed_range(s, dst, n)) {
+    auto* out = reinterpret_cast<uint8_t*>(dst);
+    for (size_t i = 0; i < n; i += width) std::memcpy(out + i, pattern, std::min(width, n - i));
+    return;
+  }
+  owner_memory(s, dst).fill(dst, pattern, width, n);
+}
+
 void check_device(ShimState& s, CUdevice dev) {
   if (dev < 0 || dev >= s.rt->device_count())
     throw vgpu::Error::make(vgpu::Err::UnknownGpu, "invalid device ordinal ", dev, " (have ",
@@ -348,6 +399,11 @@ int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
                                                      // MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
     case 82: return static_cast<int>(p.limits.registers_per_sm);
                                                      // MAX_REGISTERS_PER_MULTIPROCESSOR
+    // Managed memory is host memory every device maps (cuMemAllocManaged), so
+    // the host and the devices may use it at once, as on a Linux machine with
+    // a Pascal or newer GPU. The runtime answers the same.
+    case 83: return 1;                               // MANAGED_MEMORY
+    case 89: return 1;                               // CONCURRENT_MANAGED_ACCESS
     case 84: return 0;                               // MULTI_GPU_BOARD
     case 85: return 0;                               // MULTI_GPU_BOARD_GROUP_ID
     case 90: return 1;                               // COMPUTE_PREEMPTION_SUPPORTED
@@ -363,16 +419,14 @@ int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
     case 106: return static_cast<int>(p.limits.max_blocks_per_sm);
     case 107: return 0;                              // GENERIC_COMPRESSION_SUPPORTED
     case 110: return 0;                              // GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED
-    case 111: return 0;                              // RESERVED_SHARED_MEMORY_PER_BLOCK
+    case 111: return static_cast<int>(p.reserved_smem_per_block());  // RESERVED_SHARED_MEMORY_PER_BLOCK
 
     // ---- capabilities this deliberately does not implement ----
     // Zero is the true answer for each, and saying so explicitly keeps them out
     // of the "not modelled" report below: a caller that asks whether managed
     // memory works needs a truthful no, not a warning.
-    case 83: return 0;                               // MANAGED_MEMORY
     case 86: return 0;                               // HOST_NATIVE_ATOMIC_SUPPORTED
     case 88: return 0;                               // PAGEABLE_MEMORY_ACCESS
-    case 89: return 0;                               // CONCURRENT_MANAGED_ACCESS
     case 91: return 0;                               // CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM
     // COOPERATIVE_LAUNCH: cudaLaunchCooperativeKernel works, because the
     // scheduler can hold every block resident and interleave them. The
@@ -768,6 +822,12 @@ VGPU_EXPORT CUresult cuMemAlloc(CUdeviceptr* dptr, size_t bytesize) {
 
 VGPU_EXPORT CUresult cuMemFree_v2(CUdeviceptr dptr) {
   return api("cuMemFree", true, false, [&](ShimState& s) {
+    if (auto it = s.managed.find(dptr); it != s.managed.end()) {
+      for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(dptr);
+      std::free(reinterpret_cast<void*>(dptr));
+      s.managed.erase(it);
+      return CUDA_SUCCESS;
+    }
     owner_memory(s, dptr).free(dptr);
     return CUDA_SUCCESS;
   });
@@ -777,7 +837,7 @@ VGPU_EXPORT CUresult cuMemFree(CUdeviceptr dptr) { return cuMemFree_v2(dptr); }
 VGPU_EXPORT CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount) {
   return api("cuMemcpyHtoD", true, false, [&](ShimState& s) {
     if (!srcHost && ByteCount) return CUDA_ERROR_INVALID_VALUE;
-    owner_memory(s, dstDevice).write(dstDevice, srcHost, ByteCount);
+    dev_write(s, dstDevice, srcHost, ByteCount);
     return CUDA_SUCCESS;
   });
 }
@@ -788,7 +848,7 @@ VGPU_EXPORT CUresult cuMemcpyHtoD(CUdeviceptr d, const void* h, size_t n) {
 VGPU_EXPORT CUresult cuMemcpyDtoH_v2(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount) {
   return api("cuMemcpyDtoH", true, false, [&](ShimState& s) {
     if (!dstHost && ByteCount) return CUDA_ERROR_INVALID_VALUE;
-    owner_memory(s, srcDevice).read(srcDevice, dstHost, ByteCount);
+    dev_read(s, dstHost, srcDevice, ByteCount);
     return CUDA_SUCCESS;
   });
 }
@@ -799,8 +859,8 @@ VGPU_EXPORT CUresult cuMemcpyDtoH(void* h, CUdeviceptr d, size_t n) {
 VGPU_EXPORT CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount) {
   return api("cuMemcpyDtoD", true, false, [&](ShimState& s) {
     std::vector<uint8_t> tmp(ByteCount);
-    owner_memory(s, srcDevice).read(srcDevice, tmp.data(), ByteCount);
-    owner_memory(s, dstDevice).write(dstDevice, tmp.data(), ByteCount);
+    dev_read(s, tmp.data(), srcDevice, ByteCount);
+    dev_write(s, dstDevice, tmp.data(), ByteCount);
     return CUDA_SUCCESS;
   });
 }
@@ -1221,7 +1281,7 @@ VGPU_EXPORT CUresult cuMulticastBindMem(unsigned long long, size_t, unsigned lon
 VGPU_EXPORT CUresult cuStreamWriteValue32(CUstream, CUdeviceptr addr, unsigned int value,
                                           unsigned int) {
   return api("cuStreamWriteValue32", true, false, [&](ShimState& s) {
-    owner_memory(s, addr).write(addr, &value, sizeof value);
+    dev_write(s, addr, &value, sizeof value);
     return CUDA_SUCCESS;
   });
 }
@@ -1579,8 +1639,7 @@ namespace {
 template <typename T>
 CUresult memset_impl(const char* name, CUdeviceptr dptr, T value, size_t n) {
   return api(name, true, false, [&](ShimState& s) {
-    owner_memory(s, dptr).fill(dptr, reinterpret_cast<const uint8_t*>(&value), sizeof(T),
-                               n * sizeof(T));
+    dev_fill(s, dptr, reinterpret_cast<const uint8_t*>(&value), sizeof(T), n * sizeof(T));
     return CUDA_SUCCESS;
   });
 }
@@ -1761,6 +1820,470 @@ VGPU_EXPORT CUresult cuMemFreeHost(void* p) {
   });
 }
 
+/* ---- managed memory ----
+ * One allocation the host and every device address at the same pointer. Here
+ * that is host memory mapped into each device's address space, as the
+ * runtime's cudaMallocManaged does: there is one memory, so nothing migrates,
+ * and prefetches and advice have nothing to move. What they check is what an
+ * RTX 3080 Ti's driver checks: the flags, that the range is managed, and that
+ * a device named exists. */
+
+namespace {
+CUresult check_location(ShimState& s, const CUmemLocation& loc) {
+  switch (loc.type) {
+    case CU_MEM_LOCATION_TYPE_DEVICE:
+      return loc.id >= 0 && loc.id < s.rt->device_count() ? CUDA_SUCCESS : CUDA_ERROR_INVALID_DEVICE;
+    case CU_MEM_LOCATION_TYPE_HOST:
+    case CU_MEM_LOCATION_TYPE_HOST_NUMA:
+    case CU_MEM_LOCATION_TYPE_HOST_NUMA_CURRENT:
+      return CUDA_SUCCESS;
+    default:
+      return CUDA_ERROR_INVALID_VALUE;
+  }
+}
+CUmemLocation location_of(CUdevice dev) {
+  CUmemLocation loc{};
+  loc.type = dev == -1 ? CU_MEM_LOCATION_TYPE_HOST : CU_MEM_LOCATION_TYPE_DEVICE;  // -1: CU_DEVICE_CPU
+  loc.id = dev == -1 ? 0 : dev;
+  return loc;
+}
+}  // namespace
+
+VGPU_EXPORT CUresult cuMemAllocManaged(CUdeviceptr* dptr, size_t bytesize, unsigned int flags) {
+  return api("cuMemAllocManaged", true, false, [&](ShimState& s) {
+    // CU_MEM_ATTACH_GLOBAL (1) or CU_MEM_ATTACH_HOST (2), exactly; a size of 0 is refused.
+    if (!dptr || bytesize == 0 || (flags != 1 && flags != 2)) return CUDA_ERROR_INVALID_VALUE;
+    const size_t n = (bytesize + 4095) / 4096 * 4096;
+    void* p = std::aligned_alloc(4096, n);
+    if (!p) return CUDA_ERROR_OUT_OF_MEMORY;
+    for (int d = 0; d < s.rt->device_count(); ++d)
+      s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, bytesize);
+    s.managed[reinterpret_cast<uintptr_t>(p)] = bytesize;
+    *dptr = reinterpret_cast<CUdeviceptr>(p);
+    return CUDA_SUCCESS;
+  });
+}
+
+// Which stream may touch an allocation. The whole allocation, from its base
+// (length 0 or its full size), with GLOBAL (1), HOST (2) or SINGLE (4).
+VGPU_EXPORT CUresult cuStreamAttachMemAsync(CUstream, CUdeviceptr dptr, size_t length, unsigned int flags) {
+  return api("cuStreamAttachMemAsync", true, false, [&](ShimState& s) {
+    auto it = s.managed.find(dptr);
+    if (it == s.managed.end() || (length != 0 && length != it->second) ||
+        (flags != 1 && flags != 2 && flags != 4))
+      return CUDA_ERROR_INVALID_VALUE;
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuMemPrefetchAsync_v2(CUdeviceptr dptr, size_t count, CUmemLocation location,
+                                           unsigned int, CUstream) {
+  return api("cuMemPrefetchAsync", true, false, [&](ShimState& s) {
+    if (!managed_range(s, dptr, count)) return CUDA_ERROR_INVALID_VALUE;
+    return check_location(s, location);
+  });
+}
+VGPU_EXPORT CUresult cuMemPrefetchAsync(CUdeviceptr dptr, size_t count, CUdevice dstDevice, CUstream stream) {
+  return cuMemPrefetchAsync_v2(dptr, count, location_of(dstDevice), 0, stream);
+}
+VGPU_EXPORT CUresult cuMemAdvise_v2(CUdeviceptr dptr, size_t count, int advice, CUmemLocation location) {
+  return api("cuMemAdvise", true, false, [&](ShimState& s) {
+    if (!managed_range(s, dptr, count) || advice < 1 || advice > 6) return CUDA_ERROR_INVALID_VALUE;
+    // Read-mostly (1, 2) names no location; the others name one.
+    if (advice > 2) return check_location(s, location);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemAdvise(CUdeviceptr dptr, size_t count, int advice, CUdevice device) {
+  return cuMemAdvise_v2(dptr, count, advice, location_of(device));
+}
+
+/* ---- CUDA arrays and 2D/3D copies ----
+ * An array is device memory with a shape. The rules for creating one are the
+ * ones an RTX 3060's and an RTX 3080 Ti's drivers enforce (they agree):
+ * Width is never 0; a Depth needs a Height unless the array is layered, and a
+ * layered one needs at least one layer; a cubemap is square with a Depth of 6,
+ * or a multiple of 6 when layered; 1, 2 or 4 channels; a known format and
+ * known flag bits. The formats are the classic eight; the newer packed and
+ * block-compressed ones are refused here. */
+
+namespace {
+constexpr uintptr_t kTagArray = 0;
+
+// Taken by reference and read as the raw value: an application can pass a
+// format this header does not name, and loading that as the enum is undefined
+// (UBSan: "not a valid value for type 'CUarray_format_enum'").
+size_t format_bytes(const CUarray_format& f) {
+  unsigned raw;
+  static_assert(sizeof raw == sizeof f);
+  std::memcpy(&raw, &f, sizeof raw);
+  switch (raw) {
+    case CU_AD_FORMAT_UNSIGNED_INT8: case CU_AD_FORMAT_SIGNED_INT8: return 1;
+    case CU_AD_FORMAT_UNSIGNED_INT16: case CU_AD_FORMAT_SIGNED_INT16: case CU_AD_FORMAT_HALF: return 2;
+    case CU_AD_FORMAT_UNSIGNED_INT32: case CU_AD_FORMAT_SIGNED_INT32: case CU_AD_FORMAT_FLOAT: return 4;
+  }
+  return 0;
+}
+
+bool valid_array(const CUDA_ARRAY3D_DESCRIPTOR& d) {
+  const unsigned known = CUDA_ARRAY3D_LAYERED | CUDA_ARRAY3D_SURFACE_LDST | CUDA_ARRAY3D_CUBEMAP |
+                         CUDA_ARRAY3D_TEXTURE_GATHER;
+  if (d.Flags & ~known) return false;
+  if (!format_bytes(d.Format)) return false;
+  if (d.NumChannels != 1 && d.NumChannels != 2 && d.NumChannels != 4) return false;
+  if (d.Width == 0) return false;
+  const bool layered = d.Flags & CUDA_ARRAY3D_LAYERED, cube = d.Flags & CUDA_ARRAY3D_CUBEMAP;
+  if (cube) {
+    if (d.Width != d.Height) return false;
+    if (layered ? (d.Depth == 0 || d.Depth % 6 != 0) : d.Depth != 6) return false;
+    return true;
+  }
+  if (layered) return d.Depth != 0;
+  if (d.Height == 0 && d.Depth != 0) return false;
+  return true;
+}
+
+ArrayRec* array_rec(ShimState& s, CUarray a) {
+  auto it = s.arrays.find(reinterpret_cast<uintptr_t>(a));
+  return it == s.arrays.end() ? nullptr : &it->second;
+}
+
+// One side of a 2D or 3D copy, resolved to where its bytes are.
+struct Side {
+  bool host = false;        // host memory, reached with memcpy
+  const char* hsrc = nullptr;
+  char* hdst = nullptr;
+  CUdeviceptr dev = 0;      // device, managed or array memory
+  size_t pitch = 0, height = 0;
+};
+
+CUresult resolve(ShimState& s, CUmemorytype t, const void* h_in, void* h_out, CUdeviceptr d, CUarray a,
+                 size_t pitch, size_t height, size_t x, size_t y, size_t z, size_t w, size_t rows,
+                 size_t depth, Side* out) {
+  switch (t) {
+    case CU_MEMORYTYPE_HOST:
+      if (!h_in && !h_out) return CUDA_ERROR_INVALID_VALUE;
+      out->host = true;
+      out->hsrc = static_cast<const char*>(h_in);
+      out->hdst = static_cast<char*>(h_out);
+      out->pitch = pitch;
+      out->height = height;
+      break;
+    case CU_MEMORYTYPE_DEVICE:
+    case CU_MEMORYTYPE_UNIFIED:
+      out->dev = d;
+      out->pitch = pitch;
+      out->height = height;
+      break;
+    case CU_MEMORYTYPE_ARRAY: {
+      const ArrayRec* r = array_rec(s, a);
+      if (!r) return CUDA_ERROR_INVALID_VALUE;
+      // The region stays inside the array: its rows, rows and slices.
+      if (x + w > r->row || y + rows > r->rows || z + depth > r->slices) return CUDA_ERROR_INVALID_VALUE;
+      out->dev = r->mem;
+      out->pitch = r->row;
+      out->height = r->rows;
+      break;
+    }
+    default:
+      return CUDA_ERROR_INVALID_VALUE;
+  }
+  // A pitched host or device region must hold a row.
+  if (t != CU_MEMORYTYPE_ARRAY && rows > 1 && out->pitch < w) return CUDA_ERROR_INVALID_VALUE;
+  if (!out->host) out->dev += z * out->pitch * out->height + y * out->pitch + x;
+  else if (out->hsrc) out->hsrc += z * out->pitch * out->height + y * out->pitch + x;
+  else out->hdst += z * out->pitch * out->height + y * out->pitch + x;
+  return CUDA_SUCCESS;
+}
+
+CUresult copy_rows(ShimState& s, const Side& src, const Side& dst, size_t w, size_t rows, size_t depth) {
+  std::vector<uint8_t> tmp(w);
+  for (size_t z = 0; z < depth; ++z)
+    for (size_t y = 0; y < rows; ++y) {
+      const size_t so = z * src.pitch * src.height + y * src.pitch;
+      const size_t d_o = z * dst.pitch * dst.height + y * dst.pitch;
+      if (src.host) std::memcpy(tmp.data(), src.hsrc + so, w);
+      else dev_read(s, tmp.data(), src.dev + so, w);
+      if (dst.host) std::memcpy(dst.hdst + d_o, tmp.data(), w);
+      else dev_write(s, dst.dev + d_o, tmp.data(), w);
+    }
+  return CUDA_SUCCESS;
+}
+
+CUresult copy3d(ShimState& s, const CUDA_MEMCPY3D& p) {
+  if (p.WidthInBytes == 0 || p.Height == 0 || p.Depth == 0) return CUDA_SUCCESS;
+  if (p.srcLOD || p.dstLOD) return CUDA_ERROR_INVALID_VALUE;
+  Side src, dst;
+  if (CUresult r = resolve(s, p.srcMemoryType, p.srcHost, nullptr, p.srcDevice, p.srcArray, p.srcPitch,
+                           p.srcHeight, p.srcXInBytes, p.srcY, p.srcZ, p.WidthInBytes, p.Height, p.Depth,
+                           &src))
+    return r;
+  if (CUresult r = resolve(s, p.dstMemoryType, nullptr, p.dstHost, p.dstDevice, p.dstArray, p.dstPitch,
+                           p.dstHeight, p.dstXInBytes, p.dstY, p.dstZ, p.WidthInBytes, p.Height, p.Depth,
+                           &dst))
+    return r;
+  if (p.Depth > 1 && ((!src.host && src.height < p.Height && p.srcMemoryType != CU_MEMORYTYPE_ARRAY) ||
+                      (src.host && src.height < p.Height) || (dst.host && dst.height < p.Height) ||
+                      (!dst.host && dst.height < p.Height && p.dstMemoryType != CU_MEMORYTYPE_ARRAY)))
+    return CUDA_ERROR_INVALID_VALUE;  // slices would overlap
+  return copy_rows(s, src, dst, p.WidthInBytes, p.Height, p.Depth);
+}
+
+CUDA_MEMCPY3D as3d(const CUDA_MEMCPY2D& c) {
+  CUDA_MEMCPY3D p{};
+  p.srcXInBytes = c.srcXInBytes; p.srcY = c.srcY; p.srcMemoryType = c.srcMemoryType;
+  p.srcHost = c.srcHost; p.srcDevice = c.srcDevice; p.srcArray = c.srcArray; p.srcPitch = c.srcPitch;
+  p.dstXInBytes = c.dstXInBytes; p.dstY = c.dstY; p.dstMemoryType = c.dstMemoryType;
+  p.dstHost = c.dstHost; p.dstDevice = c.dstDevice; p.dstArray = c.dstArray; p.dstPitch = c.dstPitch;
+  p.WidthInBytes = c.WidthInBytes; p.Height = c.Height; p.Depth = 1;
+  return p;
+}
+
+// Bytes [off, off + n) of an array's first row, for cuMemcpyHtoA and the
+// rest: the card takes them for an array of any shape, within that row.
+CUresult linear_part(ShimState& s, CUarray a, size_t off, size_t n, CUdeviceptr* at) {
+  const ArrayRec* r = array_rec(s, a);
+  if (!r) return CUDA_ERROR_INVALID_VALUE;
+  if (off > r->row || n > r->row - off) return CUDA_ERROR_INVALID_VALUE;
+  *at = r->mem + off;
+  return CUDA_SUCCESS;
+}
+}  // namespace
+
+VGPU_EXPORT CUresult cuArray3DCreate_v2(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc) {
+  return api("cuArray3DCreate", true, false, [&](ShimState& s) {
+    if (!out || !desc || !valid_array(*desc)) return CUDA_ERROR_INVALID_VALUE;
+    ArrayRec r;
+    r.desc = *desc;
+    r.elem = format_bytes(desc->Format) * desc->NumChannels;
+    r.row = desc->Width * r.elem;
+    r.rows = desc->Height ? desc->Height : 1;
+    r.slices = desc->Depth ? desc->Depth : 1;
+    r.device = current_device(s);
+    r.mem = current(s).memory().alloc(r.row * r.rows * r.slices);
+    const uintptr_t h = make_handle(s, kTagArray);
+    s.arrays[h] = r;
+    *out = reinterpret_cast<CUarray>(h);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuArray3DCreate(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc) {
+  return cuArray3DCreate_v2(out, desc);
+}
+VGPU_EXPORT CUresult cuArrayCreate_v2(CUarray* out, const CUDA_ARRAY_DESCRIPTOR* desc) {
+  if (!desc) return CUDA_ERROR_INVALID_VALUE;
+  CUDA_ARRAY3D_DESCRIPTOR d{};
+  d.Width = desc->Width;
+  d.Height = desc->Height;
+  d.Format = desc->Format;
+  d.NumChannels = desc->NumChannels;
+  return cuArray3DCreate_v2(out, &d);
+}
+VGPU_EXPORT CUresult cuArrayCreate(CUarray* out, const CUDA_ARRAY_DESCRIPTOR* desc) {
+  return cuArrayCreate_v2(out, desc);
+}
+VGPU_EXPORT CUresult cuArray3DGetDescriptor_v2(CUDA_ARRAY3D_DESCRIPTOR* desc, CUarray a) {
+  return api("cuArray3DGetDescriptor", true, false, [&](ShimState& s) {
+    const ArrayRec* r = array_rec(s, a);
+    if (!desc || !r) return CUDA_ERROR_INVALID_VALUE;
+    *desc = r->desc;
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuArray3DGetDescriptor(CUDA_ARRAY3D_DESCRIPTOR* desc, CUarray a) {
+  return cuArray3DGetDescriptor_v2(desc, a);
+}
+// The 2D descriptor of any array, a 3D one included (the card answers for both).
+VGPU_EXPORT CUresult cuArrayGetDescriptor_v2(CUDA_ARRAY_DESCRIPTOR* desc, CUarray a) {
+  CUDA_ARRAY3D_DESCRIPTOR d{};
+  if (!desc) return CUDA_ERROR_INVALID_VALUE;
+  if (CUresult r = cuArray3DGetDescriptor_v2(&d, a)) return r;
+  desc->Width = d.Width;
+  desc->Height = d.Height;
+  desc->Format = d.Format;
+  desc->NumChannels = d.NumChannels;
+  return CUDA_SUCCESS;
+}
+VGPU_EXPORT CUresult cuArrayGetDescriptor(CUDA_ARRAY_DESCRIPTOR* desc, CUarray a) {
+  return cuArrayGetDescriptor_v2(desc, a);
+}
+VGPU_EXPORT CUresult cuArrayDestroy(CUarray a) {
+  return api("cuArrayDestroy", true, false, [&](ShimState& s) {
+    auto it = s.arrays.find(reinterpret_cast<uintptr_t>(a));
+    if (it == s.arrays.end()) return CUDA_ERROR_INVALID_VALUE;
+    s.rt->device(it->second.device).memory().free(it->second.mem);
+    s.arrays.erase(it);
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuMemcpyHtoA_v2(CUarray dst, size_t off, const void* src, size_t n) {
+  return api("cuMemcpyHtoA", true, false, [&](ShimState& s) {
+    CUdeviceptr at = 0;
+    if (!src && n) return CUDA_ERROR_INVALID_VALUE;
+    if (CUresult r = linear_part(s, dst, off, n, &at)) return r;
+    dev_write(s, at, src, n);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemcpyHtoA(CUarray d, size_t off, const void* src, size_t n) {
+  return cuMemcpyHtoA_v2(d, off, src, n);
+}
+VGPU_EXPORT CUresult cuMemcpyAtoH_v2(void* dst, CUarray src, size_t off, size_t n) {
+  return api("cuMemcpyAtoH", true, false, [&](ShimState& s) {
+    CUdeviceptr at = 0;
+    if (!dst && n) return CUDA_ERROR_INVALID_VALUE;
+    if (CUresult r = linear_part(s, src, off, n, &at)) return r;
+    dev_read(s, dst, at, n);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemcpyAtoH(void* dst, CUarray src, size_t off, size_t n) {
+  return cuMemcpyAtoH_v2(dst, src, off, n);
+}
+VGPU_EXPORT CUresult cuMemcpyDtoA_v2(CUarray dst, size_t off, CUdeviceptr src, size_t n) {
+  return api("cuMemcpyDtoA", true, false, [&](ShimState& s) {
+    CUdeviceptr at = 0;
+    if (CUresult r = linear_part(s, dst, off, n, &at)) return r;
+    std::vector<uint8_t> tmp(n);
+    dev_read(s, tmp.data(), src, n);
+    dev_write(s, at, tmp.data(), n);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemcpyDtoA(CUarray d, size_t off, CUdeviceptr src, size_t n) {
+  return cuMemcpyDtoA_v2(d, off, src, n);
+}
+VGPU_EXPORT CUresult cuMemcpyAtoD_v2(CUdeviceptr dst, CUarray src, size_t off, size_t n) {
+  return api("cuMemcpyAtoD", true, false, [&](ShimState& s) {
+    CUdeviceptr at = 0;
+    if (CUresult r = linear_part(s, src, off, n, &at)) return r;
+    std::vector<uint8_t> tmp(n);
+    dev_read(s, tmp.data(), at, n);
+    dev_write(s, dst, tmp.data(), n);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemcpyAtoD(CUdeviceptr d, CUarray src, size_t off, size_t n) {
+  return cuMemcpyAtoD_v2(d, src, off, n);
+}
+
+VGPU_EXPORT CUresult cuMemcpy3D_v2(const CUDA_MEMCPY3D* p) {
+  return api("cuMemcpy3D", true, false, [&](ShimState& s) {
+    if (!p) return CUDA_ERROR_INVALID_VALUE;
+    return copy3d(s, *p);
+  });
+}
+VGPU_EXPORT CUresult cuMemcpy3D(const CUDA_MEMCPY3D* p) { return cuMemcpy3D_v2(p); }
+VGPU_EXPORT CUresult cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D* p, CUstream) { return cuMemcpy3D_v2(p); }
+VGPU_EXPORT CUresult cuMemcpy3DAsync(const CUDA_MEMCPY3D* p, CUstream st) { return cuMemcpy3DAsync_v2(p, st); }
+VGPU_EXPORT CUresult cuMemcpy2D_v2(const CUDA_MEMCPY2D* c) {
+  return api("cuMemcpy2D", true, false, [&](ShimState& s) {
+    if (!c) return CUDA_ERROR_INVALID_VALUE;
+    return copy3d(s, as3d(*c));
+  });
+}
+VGPU_EXPORT CUresult cuMemcpy2D(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
+VGPU_EXPORT CUresult cuMemcpy2DUnaligned_v2(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
+VGPU_EXPORT CUresult cuMemcpy2DUnaligned(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
+VGPU_EXPORT CUresult cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D* c, CUstream) { return cuMemcpy2D_v2(c); }
+VGPU_EXPORT CUresult cuMemcpy2DAsync(const CUDA_MEMCPY2D* c, CUstream st) { return cuMemcpy2DAsync_v2(c, st); }
+
+// Stream-ordered allocation: the stream is synchronous, so the memory is
+// ready at once. A request for 0 bytes succeeds, as the card's does.
+VGPU_EXPORT CUresult cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstream) {
+  if (!dptr) return CUDA_ERROR_INVALID_VALUE;
+  if (bytesize == 0) {
+    *dptr = 0;
+    return CUDA_SUCCESS;
+  }
+  return cuMemAlloc_v2(dptr, bytesize);
+}
+VGPU_EXPORT CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream) {
+  if (dptr == 0) return CUDA_SUCCESS;
+  return cuMemFree_v2(dptr);
+}
+
+/* ---- pitched memory, module globals, context configuration ----
+ * Each answers as an RTX 3060's and an RTX 3080 Ti's drivers do (they agree). */
+
+// Rows padded to 512 bytes; the element size must be 4, 8 or 16 and neither
+// dimension 0.
+VGPU_EXPORT CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pitch, size_t width, size_t height,
+                                        unsigned int elem) {
+  return api("cuMemAllocPitch", true, false, [&](ShimState& s) {
+    if (!dptr || !pitch || width == 0 || height == 0 || (elem != 4 && elem != 8 && elem != 16))
+      return CUDA_ERROR_INVALID_VALUE;
+    *pitch = (width + 511) / 512 * 512;
+    *dptr = current(s).memory().alloc(*pitch * height);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemAllocPitch(CUdeviceptr* dptr, size_t* pitch, size_t width, size_t height,
+                                     unsigned int elem) {
+  return cuMemAllocPitch_v2(dptr, pitch, width, height, elem);
+}
+
+// A module's __device__ variable: its address and size, either of which may be
+// omitted but not both. A name the module does not declare is NOT_FOUND; a
+// kernel's name is INVALID_VALUE, as on the card.
+VGPU_EXPORT CUresult cuModuleGetGlobal_v2(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name) {
+  return api("cuModuleGetGlobal", true, false, [&](ShimState& s) {
+    if ((!dptr && !bytes) || !name) return CUDA_ERROR_INVALID_VALUE;
+    auto it = s.modules.find(reinterpret_cast<uintptr_t>(hmod));
+    if (it == s.modules.end()) return CUDA_ERROR_INVALID_HANDLE;
+    const auto [dev, mid] = it->second;
+    uint64_t addr = 0, size = 0;
+    if (!s.rt->device(dev).global(mid, name, &addr, &size))
+      return s.rt->device(dev).has_kernel(mid, name) ? CUDA_ERROR_INVALID_VALUE : CUDA_ERROR_NOT_FOUND;
+    if (dptr) *dptr = addr;
+    if (bytes) *bytes = static_cast<size_t>(size);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuModuleGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name) {
+  return cuModuleGetGlobal_v2(dptr, bytes, hmod, name);
+}
+
+// The L1/shared split is a preference the simulator has no cache to apply to;
+// it is kept and read back, as the card reads it back.
+VGPU_EXPORT CUresult cuCtxSetCacheConfig(int config) {
+  return api("cuCtxSetCacheConfig", true, false, [&](ShimState& s) {
+    if (config < 0 || config > 3) return CUDA_ERROR_INVALID_VALUE;
+    s.cache_config = config;
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuCtxGetCacheConfig(int* config) {
+  return api("cuCtxGetCacheConfig", true, false, [&](ShimState& s) {
+    if (!config) return CUDA_ERROR_INVALID_VALUE;
+    *config = s.cache_config;
+    return CUDA_SUCCESS;
+  });
+}
+// Shared memory banks are four bytes wide on every GPU this simulates: a
+// configuration is accepted and has no effect, and the answer stays
+// CU_SHARED_MEM_CONFIG_FOUR_BYTE_BANK_SIZE, as the card's does.
+VGPU_EXPORT CUresult cuCtxSetSharedMemConfig(int config) {
+  return config >= 0 && config <= 2 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+VGPU_EXPORT CUresult cuCtxGetSharedMemConfig(int* config) {
+  if (!config) return CUDA_ERROR_INVALID_VALUE;
+  *config = 1;
+  return CUDA_SUCCESS;
+}
+VGPU_EXPORT CUresult cuFuncSetSharedMemConfig(CUfunction, int config) {
+  return config >= 0 && config <= 2 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+// A stream callback runs at once: the stream is synchronous, so the work
+// queued before it is done. It is told the stream succeeded. Flags must be 0.
+VGPU_EXPORT CUresult cuStreamAddCallback(CUstream stream, CUstreamCallback cb, void* user, unsigned int flags) {
+  if (!cb || flags != 0) return CUDA_ERROR_INVALID_VALUE;
+  cb(stream, CUDA_SUCCESS, user);
+  return CUDA_SUCCESS;
+}
+
 /* ---- streams (all synchronous) and events (wall-clock timestamps) ---- */
 
 VGPU_EXPORT CUresult cuStreamCreate(CUstream* s_out, unsigned int) {
@@ -1783,6 +2306,13 @@ VGPU_EXPORT CUresult cuStreamDestroy_v2(CUstream stream) {
 }
 VGPU_EXPORT CUresult cuStreamDestroy(CUstream stream) { return cuStreamDestroy_v2(stream); }
 VGPU_EXPORT CUresult cuStreamSynchronize(CUstream) { return cuCtxSynchronize(); }
+// Streams are synchronous, so everything queued before the function has run
+// by the time it is called, which is all a host function is promised.
+VGPU_EXPORT CUresult cuLaunchHostFunc(CUstream, CUhostFn fn, void* user) {
+  if (!fn) return CUDA_ERROR_INVALID_VALUE;
+  fn(user);
+  return CUDA_SUCCESS;
+}
 VGPU_EXPORT CUresult cuStreamQuery(CUstream) { return CUDA_SUCCESS; }  // always idle
 VGPU_EXPORT CUresult cuStreamWaitEvent(CUstream, void*, unsigned int) { return CUDA_SUCCESS; }
 VGPU_EXPORT CUresult cuStreamGetPriority(CUstream, int* p) {
@@ -1804,11 +2334,12 @@ VGPU_EXPORT CUresult cuStreamIsCapturing(CUstream, int* status) {
   return CUDA_SUCCESS;
 }
 
-VGPU_EXPORT CUresult cuEventCreate(void** ev, unsigned int) {
+VGPU_EXPORT CUresult cuEventCreate(void** ev, unsigned int flags) {
   return api("cuEventCreate", true, false, [&](ShimState& s) {
     if (!ev) return CUDA_ERROR_INVALID_VALUE;
     uintptr_t h = make_handle(s, kTagEvent);
     s.events[h] = {};
+    s.events[h].timing = !(flags & 0x2);   // CU_EVENT_DISABLE_TIMING
     *ev = reinterpret_cast<void*>(h);
     return CUDA_SUCCESS;
   });
@@ -1835,9 +2366,12 @@ VGPU_EXPORT CUresult cuEventElapsedTime(float* ms, void* start, void* end) {
   return api("cuEventElapsedTime", true, false, [&](ShimState& s) {
     auto a = s.events.find(reinterpret_cast<uintptr_t>(start));
     auto b = s.events.find(reinterpret_cast<uintptr_t>(end));
-    if (!ms || a == s.events.end() || b == s.events.end() || !a->second.recorded ||
-        !b->second.recorded)
-      return CUDA_ERROR_INVALID_VALUE;
+    // As the card answers: an event never recorded, or made with
+    // CU_EVENT_DISABLE_TIMING, is an invalid handle here, not a bad value.
+    if (!ms) return CUDA_ERROR_INVALID_VALUE;
+    if (a == s.events.end() || b == s.events.end() || !a->second.recorded || !b->second.recorded ||
+        !a->second.timing || !b->second.timing)
+      return CUDA_ERROR_INVALID_HANDLE;
     double ns = (b->second.when.tv_sec - a->second.when.tv_sec) * 1e9 +
                 (b->second.when.tv_nsec - a->second.when.tv_nsec);
     *ms = static_cast<float>(ns / 1e6);
@@ -1951,8 +2485,31 @@ VGPU_EXPORT CUresult cuDeviceCanAccessPeer(int* can, CUdevice, CUdevice) {
 
 VGPU_EXPORT CUresult cuPointerGetAttribute(void* data, int attribute, CUdeviceptr ptr) {
   if (!data) return CUDA_ERROR_INVALID_VALUE;
+  bool managed = false;
+  {
+    auto& s = state();
+    std::lock_guard<std::recursive_mutex> g(s.mu);
+    managed = s.initialized && managed_range(s, ptr, 1);
+  }
+  if (managed) {
+    // What an RTX 3080 Ti's driver answers for a managed pointer: device
+    // memory, managed, the same address on both sides. The context is
+    // answered as it is for device memory below.
+    switch (attribute) {
+      case 1: *static_cast<void**>(data) = nullptr; return CUDA_SUCCESS;  // CONTEXT
+      case 2: *static_cast<unsigned int*>(data) = 2; return CUDA_SUCCESS;  // MEMORY_TYPE: DEVICE
+      case 3: *static_cast<CUdeviceptr*>(data) = ptr; return CUDA_SUCCESS;  // DEVICE_POINTER
+      case 4: *static_cast<void**>(data) = reinterpret_cast<void*>(ptr); return CUDA_SUCCESS;  // HOST_POINTER
+      case 8: *static_cast<int*>(data) = 1; return CUDA_SUCCESS;  // IS_MANAGED
+      default: return CUDA_ERROR_INVALID_VALUE;
+    }
+  }
   bool dev = vgpu::is_device_va(ptr);
   switch (attribute) {
+    case 8:  // CU_POINTER_ATTRIBUTE_IS_MANAGED
+      if (!dev) return CUDA_ERROR_INVALID_VALUE;
+      *static_cast<int*>(data) = 0;
+      return CUDA_SUCCESS;
     case 1: {  // CU_POINTER_ATTRIBUTE_CONTEXT
       if (!dev) return CUDA_ERROR_INVALID_VALUE;
       *static_cast<void**>(data) = nullptr;
@@ -2382,6 +2939,22 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuMemcpyDtoD), VGPU_PROC(cuMemcpy), VGPU_PROC(cuMemcpyAsync),
     VGPU_PROC(cuMemcpyHtoDAsync), VGPU_PROC(cuMemGetInfo), VGPU_PROC(cuMemGetAddressRange_v2),
     VGPU_PROC(cuMemHostAlloc), VGPU_PROC(cuMemAllocHost_v2), VGPU_PROC(cuMemFreeHost),
+    VGPU_PROC(cuMemAllocManaged), VGPU_PROC(cuStreamAttachMemAsync), VGPU_PROC(cuMemPrefetchAsync),
+    VGPU_PROC(cuMemPrefetchAsync_v2), VGPU_PROC(cuMemAdvise), VGPU_PROC(cuMemAdvise_v2),
+    VGPU_PROC(cuLaunchHostFunc),
+    VGPU_PROC(cuArray3DCreate), VGPU_PROC(cuArray3DCreate_v2), VGPU_PROC(cuArrayCreate),
+    VGPU_PROC(cuArrayCreate_v2), VGPU_PROC(cuArray3DGetDescriptor), VGPU_PROC(cuArray3DGetDescriptor_v2),
+    VGPU_PROC(cuArrayGetDescriptor), VGPU_PROC(cuArrayGetDescriptor_v2), VGPU_PROC(cuArrayDestroy),
+    VGPU_PROC(cuMemcpyHtoA), VGPU_PROC(cuMemcpyHtoA_v2), VGPU_PROC(cuMemcpyAtoH), VGPU_PROC(cuMemcpyAtoH_v2),
+    VGPU_PROC(cuMemcpyDtoA), VGPU_PROC(cuMemcpyDtoA_v2), VGPU_PROC(cuMemcpyAtoD), VGPU_PROC(cuMemcpyAtoD_v2),
+    VGPU_PROC(cuMemcpy2D), VGPU_PROC(cuMemcpy2D_v2), VGPU_PROC(cuMemcpy2DUnaligned),
+    VGPU_PROC(cuMemcpy2DUnaligned_v2), VGPU_PROC(cuMemcpy2DAsync), VGPU_PROC(cuMemcpy2DAsync_v2),
+    VGPU_PROC(cuMemcpy3D), VGPU_PROC(cuMemcpy3D_v2), VGPU_PROC(cuMemcpy3DAsync), VGPU_PROC(cuMemcpy3DAsync_v2),
+    VGPU_PROC(cuMemAllocAsync), VGPU_PROC(cuMemFreeAsync),
+    VGPU_PROC(cuMemAllocPitch), VGPU_PROC(cuMemAllocPitch_v2), VGPU_PROC(cuModuleGetGlobal),
+    VGPU_PROC(cuModuleGetGlobal_v2), VGPU_PROC(cuCtxSetCacheConfig), VGPU_PROC(cuCtxGetCacheConfig),
+    VGPU_PROC(cuCtxSetSharedMemConfig), VGPU_PROC(cuCtxGetSharedMemConfig),
+    VGPU_PROC(cuFuncSetSharedMemConfig), VGPU_PROC(cuStreamAddCallback),
     VGPU_PROC(cuPointerGetAttribute),
     VGPU_PROC(cuModuleLoadData), VGPU_PROC(cuModuleLoadDataEx), VGPU_PROC(cuModuleUnload),
     VGPU_PROC(cuModuleGetFunction), VGPU_PROC(cuModuleGetLoadingMode),
@@ -2405,6 +2978,31 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuTensorMapEncodeIm2col),
 };
 
+// A driver function this library exports but the table above does not list:
+// cuMemGetAllocationGranularity and the rest of the virtual memory API, which
+// NanoVDB fetches with cudaGetDriverEntryPoint and calls without checking.
+// Only a name with a single ABI is resolved this way. One that also has a _v2
+// export changed signature between releases, and which one a caller wants
+// depends on the version it asked for, so that stays the table's decision.
+void* exported_proc(const std::string& name) {
+  if (name.rfind("cu", 0) != 0) return nullptr;
+  static void* const self = [] {
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void*>(&exported_proc), &info) || !info.dli_fname) return (void*)nullptr;
+    return dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+  }();
+  if (!self) return nullptr;
+  void* fn = dlsym(self, name.c_str());
+  if (!fn || dlsym(self, (name + "_v2").c_str())) return nullptr;
+  // dlsym searches the library's dependencies too; only this library's own
+  // definition is an answer.
+  Dl_info where{}, mine{};
+  if (!dladdr(fn, &where) || !dladdr(reinterpret_cast<void*>(&exported_proc), &mine) ||
+      where.dli_fbase != mine.dli_fbase)
+    return nullptr;
+  return fn;
+}
+
 // Versioned/suffixed request names resolve to the same synchronous impls:
 // strip _v2/_v3 and _ptsz/_ptds suffixes when looking up.
 void* find_proc(const std::string& request) {
@@ -2424,7 +3022,7 @@ void* find_proc(const std::string& request) {
     }
     if (base == en) return e.fn;
   }
-  return nullptr;
+  return exported_proc(request);
 }
 
 }  // namespace

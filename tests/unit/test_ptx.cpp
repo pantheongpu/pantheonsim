@@ -2,6 +2,7 @@
 #include "vgpu/ptx/parser.hpp"
 
 #include <fstream>
+#include <memory>
 #include <sstream>
 
 #include "vgpu/error.hpp"
@@ -416,6 +417,37 @@ VTEST(acquire_and_release_are_recorded_on_loads_and_stores) {
   VCHECK(sts[0]->release);
   VCHECK(!sts[1]->release);
   VCHECK(!sts[2]->release);
+}
+
+// A recursive device function is freed with its module. Its call to itself
+// used to hold a shared_ptr to itself, a cycle that leaked the whole module
+// (AddressSanitizer's leak report on e2e_device_functions).
+VTEST(recursive_device_function_is_freed_with_its_module) {
+  const std::string ptx =
+      ".version 8.3\n.target sm_90\n.address_size 64\n"
+      ".func (.param .b32 r) down(.param .b32 n)\n{\n"
+      ".reg .b32 %r<4>;\n.reg .pred %p<2>;\n"
+      "ld.param.b32 %r1, [n];\n"
+      "setp.eq.s32 %p1, %r1, 0;\n"
+      "@%p1 bra DONE;\n"
+      "sub.s32 %r2, %r1, 1;\n"
+      "{\n.param .b32 a;\nst.param.b32 [a+0], %r2;\n.param .b32 b;\n"
+      "call (b), down, (a);\nld.param.b32 %r1, [b+0];\n}\n"
+      "DONE:\nst.param.b32 [r+0], %r1;\nret;\n}\n"
+      ".visible .entry k()\n{\n.reg .b32 %r<2>;\n"
+      "{\n.param .b32 a;\nst.param.b32 [a+0], 3;\n.param .b32 b;\n"
+      "call (b), down, (a);\nld.param.b32 %r1, [b+0];\n}\nret;\n}\n";
+  std::weak_ptr<EntryFn> down;
+  {
+    Module m = parse(ptx);
+    VCHECK_EQ(m.funcs.size(), size_t{1});
+    down = m.funcs[0];
+    const EntryFn* self = nullptr;
+    for (const auto& i : m.funcs[0]->body)
+      if (const auto* c = std::get_if<OpCall>(&i.op)) self = c->target;
+    VCHECK(self == m.funcs[0].get());   // the recursive call is resolved
+  }
+  VCHECK(down.expired());
 }
 
 VTEST_MAIN

@@ -99,6 +99,13 @@ struct DeviceProfile {
   TelemetryClass telemetry;
   std::map<std::string, bool> features;
 
+  // Shared memory the driver keeps back in every block, on top of what the
+  // kernel asks for: 1 KiB from compute capability 8.0 (an RTX 3060 reports
+  // cudaDevAttrReservedSharedMemoryPerBlock = 1024), none before. It is what
+  // separates a card's per-SM shared memory from its per-block opt-in, and
+  // cuda_occupancy.h adds it to every block.
+  uint32_t reserved_smem_per_block() const { return vendor == "nvidia" && cc_major >= 8 ? 1024 : 0; }
+
   // Parses a profile document. `origin` names the source in error messages.
   static DeviceProfile from_yaml(const std::string& src, const std::string& origin);
 };

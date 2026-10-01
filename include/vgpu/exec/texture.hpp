@@ -54,6 +54,10 @@ struct TextureDesc {
   // a level, truncated toward zero, as the hardware holds them (measured).
   uint32_t mip_levels = 0;   // 0 when not mipmapped
   uint64_t level_base[17] = {};
+  // Within one fetch of a mipmapped layered or cubemap texture: the slice
+  // (layer x faces + face) to read in whichever level it lands on. Every
+  // level of such a texture has all the slices, each of that level's size.
+  uint32_t mip_slice = 0;
   TexFilter mip_filter = TexFilter::Point;
   int32_t mip_bias = 0, mip_min = 0, mip_max = 0;
   uint32_t pitch_bytes = 0; // distance between rows; width*texel_bytes if dense
@@ -67,7 +71,15 @@ struct TextureDesc {
   // Integer channels delivered as floats scaled into [0,1] or [-1,1], which is
   // what cudaReadModeNormalizedFloat asks for.
   bool read_as_normalized_float = false;
+  // cudaTextureDesc::sRGB: an 8-bit unsigned normalized texture's colour
+  // channels are decoded from sRGB to linear (see tex_srgb in interpreter.cpp).
+  bool srgb = false;
   TexFilter filter = TexFilter::Point;
+  // cudaTextureDesc::borderColor, as the float bits the program set: what
+  // border addressing returns outside the texture, converted to the
+  // texture's format by the rules measured on an RTX 3060 (see
+  // tex_border_raw in interpreter.cpp).
+  uint32_t border_bits[4] = {0, 0, 0, 0};
   TexAddress address[3] = {TexAddress::Clamp, TexAddress::Clamp, TexAddress::Clamp};
   // True when the backing store came from cudaMallocArray rather than being a
   // view over linear device memory. The distinction matters for diagnostics

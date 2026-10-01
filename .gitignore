@@ -4,7 +4,7 @@ __pycache__/
 # The code objects the AMD tests read are built artifacts on purpose: they are
 # what a compiler produced, checked in so the tests need no compiler
 # (amd/tests/data/build.sh rebuilds them).
-!amd/tests/data/*.gfx942.o
+!amd/tests/data/*.gfx*.o
 !amd/tests/hipcc/*.gfx942.o
 *.so
 compile_commands.json

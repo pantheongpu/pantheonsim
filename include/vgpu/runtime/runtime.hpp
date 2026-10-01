@@ -34,6 +34,8 @@ class Device {
 
   const DeviceProfile& profile() const { return profile_; }
   int ordinal() const { return ordinal_; }
+  // How many devices the machine has, for device-side cudaGetDeviceCount.
+  void set_device_count(int n) { device_count_ = n; }
   MemoryManager& memory() { return mem_; }
 
   // Reports device-busy time to telemetry without running a kernel. Used by
@@ -72,6 +74,11 @@ class Device {
 
   // The module's global-variable addresses (valid while the module is loaded).
   const exec::SymbolTable* symbols(uint64_t module_id) const;
+  // A module's global variable by name: its address and its declared size.
+  // False when the module declares no global of that name.
+  bool global(uint64_t module_id, const std::string& name, uint64_t* addr, uint64_t* size) const;
+  // Whether the module defines a kernel of that name.
+  bool has_kernel(uint64_t module_id, const std::string& name) const;
 
   void launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
               const std::vector<std::vector<uint8_t>>& args,
@@ -95,6 +102,7 @@ class Device {
   std::unique_ptr<class FaultHook> fault_;
   DeviceProfile profile_;
   int ordinal_;
+  int device_count_ = 1;
   MemoryManager mem_;
   telemetry::Publisher* telemetry_ = nullptr;
   uint64_t next_module_id_ = 1;

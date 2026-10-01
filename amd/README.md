@@ -49,16 +49,49 @@ do: each stream's work runs in order on a host thread of its own, so a kernel
 on one stream may wait on a flag another stream's kernel sets, an event and a
 stream say `hipErrorNotReady` while their work runs, `hipStreamWaitEvent`
 orders one stream behind another, and the null stream is the legacy default
-stream, ordered against the blocking streams. A kernel's fault is told at the
+stream, ordered against the blocking streams. `hipStreamLegacy` names it too;
+`hipStreamPerThread`, and the null stream in a program built with
+`-fgpu-default-stream=per-thread` (the `_spt` calls), is a stream of each
+thread's own. A stream can also run a host callback, write a value to memory,
+or hold its later work until memory holds a value, while every other stream
+goes on. Contexts are a stack per thread over each device's primary context,
+as in ROCm's HIP. Where HIP's calls go beyond the everyday ones -- device
+flags and UUIDs, limits, stream ids and attributes, every launch form
+(`hipLaunchKernelExC`, `hipConfigureCall` and `hipLaunchByPtr`, a launch on
+several devices at once) -- each answers as ROCm's HIP does, down to the error
+for each wrong argument: AMD's own tests (hip-tests) are the reference, and
+`tests/hipcc/api.cpp` checks them. Memory is held to the same reference
+(`tests/hipcc/memory.cpp`): copies and memsets of every shape (2D, 3D, the
+driver API's forms, peer copies) with ROCm's rules for who waits, managed
+memory's advice and prefetch, stream-ordered pools that keep freed memory for
+reuse by the rules each pool is set to, pools and their pointers shared with
+another process through a file descriptor, and virtual memory at HIP's 4 KiB
+page granularity: memory the simulator keeps on the host (a file where it may
+be shared), mapped in place at the address a reservation set aside on any
+device, exported and imported as a file descriptor, with device memory handed
+out as one where ROCm hands out a dma-buf. Events made with `hipEventInterprocess` are shared
+the same way: another process opens one's handle, and its waits wait for the
+records made anywhere (`tests/hipcc/ipc.cpp`). Graphs are the whole of HIP's graph API
+(`src/hip_graph.inc`, checked by `tests/hipcc/graphs.cpp`): every node type
+built by hand or captured from streams -- across streams joined by events, in
+each capture mode, with the calls a capture refuses refused as ROCm refuses
+them -- executable graphs and everything that changes one, child graphs,
+clones, allocation nodes whose memory outlives the graph, user objects, and a
+drawing in Graphviz's dot. A launch is one piece of its stream's work, its
+nodes run in an order their edges allow. Every function ROCm 7.1's `libamdhip64`
+exports is here, down to `__managed__` variables, modules loaded as CUDA 12's
+libraries or as fat binaries, the run-time linker for code objects (linking
+LLVM bitcode needs AMD's compiler library, and is refused), HCC's launch by
+its C and C++ names, and what a device with no OpenGL and no dma-bufs answers
+(`tests/hipcc/exports.cpp`). A kernel's fault is told at the
 next synchronization, as on a card. `VGPU_SYNC_LAUNCHES=1` makes every call
 wait for its own work instead, which rules concurrency out when a program
 misbehaves. A program built by `hipcc` runs unmodified too:
 its device code is registered from inside the executable before `main`, its
 chevron launches go through `hipLaunchKernel`, and it reads the device through
 the real headers' `hipDeviceProp_t`, which is laid out here field for field as
-ROCm lays it out. Graph capture and replay, peer access between devices, and
-pinned host memory used to stage copies are there for the programs that use
-them. The library answers to both of ROCm's names for it (`libamdhip64.so.6`
+ROCm lays it out. Peer access between devices and pinned host memory used to
+stage copies are there for the programs that use them. The library answers to both of ROCm's names for it (`libamdhip64.so.6`
 and `.so.7`) and gives each function the symbol version the real one does,
 since a program built by `hipcc` asks for `hipMalloc@hip_4.2`, not just
 `hipMalloc`.
@@ -439,7 +472,7 @@ RCCL (PyTorch's collectives on ROCm) runs unmodified across simulated GPUs in on
 
 ## vLLM
 
-vLLM for ROCm, unmodified, generates on a simulated MI300X what Hugging Face's transformers generates on the CPU: `facebook/opt-125m`, greedy, "The capital of France is" continued as " the capital of the French Republic." in about two minutes (`tests/e2e/run_vllm_amd.sh`, ctest `amd_vllm`). It runs every night on a GitHub-hosted runner (`.github/workflows/vllm-nightly.yml`), with ROCm's libraries and vLLM's wheels installed by `tests/vllm/install.sh`.
+vLLM for ROCm, unmodified, generates on every simulated AMD GPU it supports -- MI300X, MI325X, MI250X, MI350X, RX 7900 XTX and RX 9070 XT -- what Hugging Face's transformers generates on the CPU: `facebook/opt-125m`, greedy, "The capital of France is" continued as " the capital of the French Republic." in two to eight minutes (`tests/e2e/run_vllm_amd.sh`, ctest `amd_vllm`). It runs every night on a GitHub-hosted runner (`.github/workflows/vllm-nightly.yml`), with ROCm's libraries and vLLM's wheels installed by `tests/vllm/install.sh`.
 
 - vLLM's ROCm wheels (`wheels.vllm.ai/rocm`) bring a PyTorch that is linked against a ROCm installed on the machine: its RUNPATH names `/opt/rocm-7.2.3/lib`. The machine needs that ROCm's libraries (hipBLAS, hipBLASLt, MIOpen, RCCL, rocprofiler-sdk and the rest) and OpenMPI. The simulator's HIP runtime, ROCm SMI and AMD SMI go in front of them on the library path.
 - vLLM asks AMD SMI whether this is a ROCm machine, and NVML whether it is a CUDA one. NVML answers only for NVIDIA GPUs, and says a machine of AMD GPUs has no NVIDIA driver, as it does on one.

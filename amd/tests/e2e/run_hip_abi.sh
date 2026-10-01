@@ -6,7 +6,8 @@
 # A hipcc-built program reads each field at the offset its own header gives,
 # so every field here has to sit where each release's header puts it: the
 # device properties in both layouts (R0600, and the older hipDeviceProp_tR0000
-# the unsuffixed call keeps), the pointer attributes, and the numbers
+# the unsuffixed call keeps), the pointer attributes, the parameter
+# structures of the 2D and 3D copies and the launches, and the numbers
 # hipDeviceGetAttribute is asked by. Skips where no ROCm headers are found:
 # the unit test pins the fields the workloads read everywhere else.
 set -uo pipefail
@@ -61,6 +62,29 @@ for rocm in "${releases[@]}"; do
     done
     echo 'static_assert(sizeof(vgpu::amd::abi::PointerAttribute) == sizeof(hipPointerAttribute_t), "the pointer attributes differ");'
     echo 'static_assert(vgpu::amd::abi::kMemoryUnregistered == hipMemoryTypeUnregistered && vgpu::amd::abi::kMemoryHost == hipMemoryTypeHost && vgpu::amd::abi::kMemoryDevice == hipMemoryTypeDevice, "the memory types differ");'
+    # The copies' and launches' parameter structures, field by field where
+    # VirtualGPU names the fields as the header does.
+    for pair in PitchedPtr:hipPitchedPtr Extent:hipExtent Pos:hipPos Memcpy3DParms:hipMemcpy3DParms \
+                Memcpy3DPeerParms:hipMemcpy3DPeerParms Memcpy2D:hip_Memcpy2D Memcpy3D:HIP_MEMCPY3D \
+                MemLocation:hipMemLocation MemPoolProps:hipMemPoolProps KernelNodeParams:hipKernelNodeParams \
+                MemsetParams:hipMemsetParams HostNodeParams:hipHostNodeParams MemAllocNodeParams:hipMemAllocNodeParams \
+                MemcpyNodeParams:hipMemcpyNodeParams GraphInstantiateParams:hipGraphInstantiateParams \
+                BatchMemOpNodeParams:hipBatchMemOpNodeParams; do
+      ours=${pair%%:*} theirs=${pair#*:}
+      for f in $(fields "$ours"); do
+        echo "static_assert(offsetof(vgpu::amd::abi::$ours, $f) == offsetof($theirs, $f), \"$theirs $f is out of place\");"
+      done
+      echo "static_assert(sizeof(vgpu::amd::abi::$ours) == sizeof($theirs), \"$theirs's size differs\");"
+    done
+    # And where it names them its own way.
+    echo 'static_assert(sizeof(vgpu::amd::abi::LaunchConfig) == sizeof(hipLaunchConfig_t) && offsetof(vgpu::amd::abi::LaunchConfig, dynamic_shared) == offsetof(hipLaunchConfig_t, dynamicSmemBytes) && offsetof(vgpu::amd::abi::LaunchConfig, attrs) == offsetof(hipLaunchConfig_t, attrs) && offsetof(vgpu::amd::abi::LaunchConfig, num_attrs) == offsetof(hipLaunchConfig_t, numAttrs), "hipLaunchConfig_t differs");'
+    echo 'static_assert(sizeof(vgpu::amd::abi::LaunchAttribute) == sizeof(hipLaunchAttribute) && offsetof(vgpu::amd::abi::LaunchAttribute, value) == offsetof(hipLaunchAttribute, val), "hipLaunchAttribute differs");'
+    echo 'static_assert(sizeof(vgpu::amd::abi::LaunchParams) == sizeof(hipLaunchParams) && offsetof(vgpu::amd::abi::LaunchParams, args) == offsetof(hipLaunchParams, args) && offsetof(vgpu::amd::abi::LaunchParams, stream) == offsetof(hipLaunchParams, stream), "hipLaunchParams differs");'
+    echo 'static_assert(sizeof(vgpu::amd::abi::FunctionLaunchParams) == sizeof(hipFunctionLaunchParams) && offsetof(vgpu::amd::abi::FunctionLaunchParams, stream) == offsetof(hipFunctionLaunchParams, hStream) && offsetof(vgpu::amd::abi::FunctionLaunchParams, params) == offsetof(hipFunctionLaunchParams, kernelParams), "hipFunctionLaunchParams differs");'
+    echo 'static_assert(sizeof(vgpu::amd::abi::Memcpy3DBatchOp) == sizeof(hipMemcpy3DBatchOp) && offsetof(vgpu::amd::abi::Memcpy3DBatchOp, extent) == offsetof(hipMemcpy3DBatchOp, extent) && offsetof(vgpu::amd::abi::Memcpy3DBatchOp, flags) == offsetof(hipMemcpy3DBatchOp, flags), "hipMemcpy3DBatchOp differs");'
+    # A graph node's generic parameters: a type, then one of the node structs.
+    echo 'static_assert(sizeof(vgpu::amd::abi::GraphNodeParams) == sizeof(hipGraphNodeParams) && offsetof(vgpu::amd::abi::GraphNodeParams, kernel) == offsetof(hipGraphNodeParams, kernel) && offsetof(vgpu::amd::abi::GraphNodeParams, alloc) == offsetof(hipGraphNodeParams, alloc) && offsetof(vgpu::amd::abi::GraphNodeParams, reserved2) == offsetof(hipGraphNodeParams, reserved2), "hipGraphNodeParams differs");'
+    echo 'static_assert(vgpu::amd::abi::kNodeKernel == hipGraphNodeTypeKernel && vgpu::amd::abi::kNodeMemAlloc == hipGraphNodeTypeMemAlloc && vgpu::amd::abi::kNodeMemFree == hipGraphNodeTypeMemFree && vgpu::amd::abi::kNodeBatchMemOp == hipGraphNodeTypeBatchMemOp, "the graph node types differ");'
   } > "$tmp/abi.cpp"
   check "$release: the device properties (R0600 and R0000) and pointer attributes sit where its headers put them" "$tmp/abi.cpp"
   # hipDeviceGetAttribute is asked by number, so each attribute VirtualGPU

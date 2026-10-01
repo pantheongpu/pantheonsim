@@ -34,9 +34,27 @@ echo "wrote $(pwd)/memory.gfx90a.o"
 
 # Kernels written in assembly, for instructions a compiler emits only now and
 # then (test_amd_gcn_asm).
-for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast; do
+for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_realtime; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx942 -c "$src.s" -o "$src.gfx942.o"
   echo "wrote $(pwd)/$src.gfx942.o"
+done
+
+# And for gfx950, for what only it has (test_amd_gcn_asm).
+for src in asm_lds_dma asm_ds_tr; do
+  "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -c "$src.s" -o "$src.gfx950.o"
+  echo "wrote $(pwd)/$src.gfx950.o"
+done
+
+# And for gfx1100 (RDNA3, wave32), for what only RDNA has (test_amd_gcn_asm).
+for src in asm_permlane; do
+  "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1100 -c "$src.s" -o "$src.gfx1100.o"
+  echo "wrote $(pwd)/$src.gfx1100.o"
+done
+
+# And for gfx1201 (RDNA4), for what only it has (test_amd_gcn_asm).
+for src in asm_ttmp; do
+  "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c "$src.s" -o "$src.gfx1201.o"
+  echo "wrote $(pwd)/$src.gfx1201.o"
 done
 
 # The same code as the assembler writes it, which the decoder's test compares
@@ -44,7 +62,7 @@ done
 # it the listing already checked in stays as it is.
 objdump=${2:-$(dirname "$(readlink -f "$(command -v "$clang")")")/llvm-objdump}
 if [[ -x "$objdump" ]]; then
-  for src in $sources asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast; do
+  for src in $sources asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait; do
     "$objdump" -d --mcpu=gfx942 "$src.gfx942.o" |
       sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > "$src.gfx942.dis"
     echo "wrote $(pwd)/$src.gfx942.dis ($(wc -l < "$src.gfx942.dis") instructions)"

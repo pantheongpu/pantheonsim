@@ -3473,6 +3473,10 @@ void Runner::exec_tcgen05(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     }
     case Op::UTCMMA: {
       exec::Tcgen05Mma m;
+      // A cubin that uses K = 96 or absolute descriptors was built for
+      // sm_103a; the 'a' is the only form such SASS exists in.
+      m.target_sm = static_cast<int>(m_.sm);
+      m.target_arch = true;
       const uint32_t p = u(40), x = u(48);
       m.idesc = urv(p + 1);
       m.cta_group = ins.f[1] ? 2 : 1;

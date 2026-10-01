@@ -73,7 +73,7 @@ class Tcgen05Host {
 };
 
 // A tcgen05 shared-memory matrix descriptor (9.7.18.4.1).
-WgmmaDesc tcgen05_desc(uint64_t d, Tcgen05Host& h);
+WgmmaDesc tcgen05_desc(uint64_t d, Tcgen05Host& h, bool lbo_abs_ok = false);   // bit 52 needs sm_103a
 
 // One thread's tcgen05.mma, its operands read.
 struct Tcgen05Mma {
@@ -93,6 +93,10 @@ struct Tcgen05Mma {
   int scale_d = -1;              // scale-input-d, -1 when absent
   ptx::Tcgen05Collector collector = ptx::Tcgen05Collector::Discard;
   uint32_t collector_buf = 0;
+  // The module's target: sm_103a alone has K = 96 fp4 and absolute
+  // leading-dimension descriptors (9.7.18.2.1.1, 9.7.18.4.1.1).
+  int target_sm = 0;
+  bool target_arch = false;   // an architecture-specific ("a") target
 };
 void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h);
 

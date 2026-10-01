@@ -30,6 +30,7 @@ set(VGPU_PROFILES
   nvidia/h100
   nvidia/h200
   nvidia/b200
+  nvidia/b300
   nvidia/rtx5090
   nvidia/rtx3060
   nvidia/rtx3080ti
@@ -154,6 +155,7 @@ add_library(vgpu STATIC
   src/ptx/lexer.cpp
   src/ptx/parser.cpp
   src/ptx/regalloc.cpp
+  src/ptx/contract.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
   src/runtime/runtime.cpp
@@ -179,7 +181,7 @@ add_custom_command(TARGET vgpucuda POST_BUILD
 # libamdhip64: the HIP runtime API shim. A HIP program links against it the
 # way it links against AMD's, and its kernels run on a simulated AMD GPU.
 # ---------------------------------------------------------------------------
-add_library(vgpuhip SHARED amd/src/hip_api.cpp amd/src/hsa_api.cpp)
+add_library(vgpuhip SHARED amd/src/hip_api.cpp amd/src/hip_cxx.cpp amd/src/hsa_api.cpp)
 target_link_libraries(vgpuhip PRIVATE vgpu ${CMAKE_DL_LIBS})
 target_include_directories(vgpuhip PRIVATE amd/include)
 # The real runtime's identity: a HIP program records SONAME "libamdhip64.so.6"
@@ -1126,6 +1128,15 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # cuSPARSE calls in a captured graph run at each launch, over what the
+  # graph's kernels produced (HiGHS's HiPDLP captures its SpMV iterations).
+  add_test(NAME e2e_graph_cusparse
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_cusparse.sh)
+  set_tests_properties(e2e_graph_cusparse PROPERTIES
+    DEPENDS vgpucusparse
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   # A leading dimension pads between columns, not after the last one. Operands
   # allocated to exactly their extent make an over-read fault instead of
   # quietly picking up whatever followed them.
@@ -1208,7 +1219,7 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda")
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -1262,6 +1273,27 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_atomic_cas
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_atomic_cas.sh)
+  set_tests_properties(e2e_atomic_cas PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_warp_spin_lock
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_warp_spin_lock.sh)
+  set_tests_properties(e2e_warp_spin_lock PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_ordered_vectors
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ordered_vectors.sh)
+  set_tests_properties(e2e_ordered_vectors PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_device_intrinsics
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_intrinsics.sh)
   set_tests_properties(e2e_device_intrinsics PROPERTIES
@@ -1282,6 +1314,111 @@ if(TARGET vgpucublas)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
+
+  add_test(NAME e2e_cg_multi_warp_tiles
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cg_multi_warp_tiles.sh)
+  set_tests_properties(e2e_cg_multi_warp_tiles PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_border_colour
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_border_colour.sh)
+  set_tests_properties(e2e_border_colour PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_texture_mip_layers
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_mip_layers.sh)
+  set_tests_properties(e2e_texture_mip_layers PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_texture_srgb
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_srgb.sh)
+  set_tests_properties(e2e_texture_srgb PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_texture_int_coords
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_int_coords.sh)
+  set_tests_properties(e2e_texture_int_coords PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_ptx_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ptx_forms.sh)
+  set_tests_properties(e2e_ptx_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_ptx_sweep
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ptx_sweep.sh)
+  set_tests_properties(e2e_ptx_sweep PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_ptx_warp_mem
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ptx_warp_mem.sh)
+  set_tests_properties(e2e_ptx_warp_mem PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_ptx_memory_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ptx_memory_forms.sh)
+  set_tests_properties(e2e_ptx_memory_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_occupancy_rules
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_occupancy_rules.sh)
+  set_tests_properties(e2e_occupancy_rules PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_ptx_half_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_ptx_half_forms.sh)
+  set_tests_properties(e2e_ptx_half_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_mul_add_contraction
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mul_add_contraction.sh)
+  set_tests_properties(e2e_mul_add_contraction PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_div_approx
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_div_approx.sh)
+  set_tests_properties(e2e_div_approx PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_device_function_barriers
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_function_barriers.sh)
+  set_tests_properties(e2e_device_function_barriers PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
+  add_test(NAME e2e_divergent_indirect_calls
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_divergent_indirect_calls.sh)
+  set_tests_properties(e2e_divergent_indirect_calls PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
 
   add_test(NAME e2e_modern_dtypes
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_modern_dtypes.sh)
@@ -1336,6 +1473,11 @@ set_tests_properties(e2e_alloca_stack PROPERTIES
   TIMEOUT 600)
 add_test(NAME e2e_surface_oob COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_surface_oob.sh)
 set_tests_properties(e2e_surface_oob PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+add_test(NAME e2e_stack_limit COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_stack_limit.sh)
+set_tests_properties(e2e_stack_limit PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
@@ -1396,6 +1538,11 @@ set_tests_properties(e2e_cooperative_grid PROPERTIES
 # is written against a clean-room header, so nothing else in the build compares
 # the two. It existed unregistered for a while, which is how ten device
 # attributes came to be filed under the wrong numbers.
+add_test(NAME e2e_reserved_smem_attr COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_reserved_smem_attr.sh)
+set_tests_properties(e2e_reserved_smem_attr PROPERTIES
+  DEPENDS "vgpucuda;vgpucudart"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
 add_test(NAME e2e_driver_abi COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_driver_abi.sh)
 set_tests_properties(e2e_driver_abi PROPERTIES
   DEPENDS vgpucuda
@@ -1594,6 +1741,22 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 5400)
+  add_test(NAME e2e_cutlass_sm100_conv COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_sm100_conv.sh)
+  set_tests_properties(e2e_cutlass_sm100_conv PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 7200)
+  add_test(NAME e2e_cutlass_fmha COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_fmha.sh)
+  set_tests_properties(e2e_cutlass_fmha PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 5400)
+
+  add_test(NAME e2e_cutlass_sm103 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutlass_sm103.sh)
+  set_tests_properties(e2e_cutlass_sm103 PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 5400)
   add_test(NAME e2e_block_semaphore COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_block_semaphore.sh)
   set_tests_properties(e2e_block_semaphore PROPERTIES
     DEPENDS vgpucudart
@@ -1656,6 +1819,18 @@ if(TARGET vgpucudart)
       RUN_SERIAL TRUE
       TIMEOUT 1800)
   endforeach()
+  # One operator at a time against the CPU (nvidia/tests/pytorch/ops.py): the
+  # libraries PyTorch ships -- cuBLAS/cuBLASLt (fp8 included), cuDNN, cuFFT,
+  # cuRAND, cuSOLVER, cuSPARSE -- each SDPA backend, autocast, and the
+  # jiterator's NVRTC kernels.
+  add_test(NAME e2e_pytorch_ops_rtx5090 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
+           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/ops.py 64 nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_ops_rtx5090 PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
   # cuDNN's graph API, BatchNorm training and RNNs, and cuBLASLt with a cuBLAS
   # handle -- the paths PyTorch's CUDA build takes -- against host references.
   add_test(NAME e2e_dnn_paths COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dnn_paths.sh)
@@ -1671,6 +1846,14 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # The two libraries loaded privately (RTLD_LOCAL), as Rust's libloading
+  # does, still share one machine. Needs only a C++ compiler.
+  add_test(NAME e2e_private_loads COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_private_loads.sh)
+  set_tests_properties(e2e_private_loads PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
   add_test(NAME e2e_graph_memory COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_memory.sh)
   set_tests_properties(e2e_graph_memory PROPERTIES
     DEPENDS vgpucudart
@@ -1686,6 +1869,13 @@ set_tests_properties(e2e_vgpu_run PROPERTIES
   DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
+# The per-thread default stream's names (cudaMemcpy_ptds, ...), which a
+# program built with nvcc --default-stream per-thread calls; COLMAP does.
+add_test(NAME e2e_per_thread_stream COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_per_thread_stream.sh)
+set_tests_properties(e2e_per_thread_stream PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 300)
 add_test(NAME e2e_runtime_conformance COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_runtime_conformance.sh)
 set_tests_properties(e2e_runtime_conformance PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"

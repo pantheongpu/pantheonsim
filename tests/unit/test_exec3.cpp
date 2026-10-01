@@ -10,6 +10,7 @@
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
+#include "vgpu/runtime/runtime.hpp"
 #include <array>
 #include <cmath>
 #include "vtest.hpp"
@@ -1807,6 +1808,200 @@ VTEST(bar_red_refuses_what_the_isa_leaves_undefined) {
   }
 }
 
+// A bar.sync inside a device function that was not inlined: the warp stops
+// in the middle of the callee and the other warps run until they arrive.
+// Each thread writes shared memory, the callee's barrier orders the writes
+// before the reads, and a thread in another warp reads it back. The callee
+// returns a value, and the caller carries on with its own registers intact.
+VTEST(bar_sync_inside_a_device_function_yields_to_other_warps) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.shared .align 4 .b8 buf[512];
+.func (.param .b32 ret) exchange(.param .b32 v)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<4>;
+  ld.param.b32 %r1, [v];
+  mov.u32 %r2, %tid.x;
+  mov.u32 %r7, buf;
+  mad.lo.u32 %r3, %r2, 4, %r7;
+  st.shared.u32 [%r3], %r1;
+  bar.sync 0;
+  xor.b32 %r4, %r2, 64;         // a thread two warps away
+  mad.lo.u32 %r5, %r4, 4, %r7;
+  ld.shared.u32 %r6, [%r5];
+  bar.sync 0;
+  st.param.b32 [ret], %r6;
+  ret;
+}
+.visible .entry k(.param .u64 p)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<6>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  mul.lo.u32 %r2, %r1, 3;
+  add.u32 %r7, %r1, 1000;       // live across the call
+  {
+  .param .b32 a0;
+  st.param.b32 [a0], %r2;
+  .param .b32 r0;
+  call.uni (r0), exchange, (a0);
+  ld.param.b32 %r3, [r0];
+  }
+  {
+  .param .b32 a1;
+  st.param.b32 [a1], %r3;
+  .param .b32 r1;
+  call.uni (r1), exchange, (a1);
+  ld.param.b32 %r4, [r1];
+  }
+  mul.wide.u32 %rd3, %r1, 8;
+  add.u64 %rd4, %rd2, %rd3;
+  st.global.u32 [%rd4], %r3;
+  st.global.u32 [%rd4+4], %r7;
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  const ptx::EntryFn* k = nullptr;
+  for (const auto& e : m.entries)
+    if (e.name == "k") k = &e;
+  VCHECK(k != nullptr);
+  MemoryManager mem{1 << 20};
+  const uint64_t out = mem.alloc(128 * 8);
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.block = {128, 1, 1};
+  std::vector<uint8_t> pa(8);
+  std::memcpy(pa.data(), &out, 8);
+  exec::launch(*k, cfg, {pa}, mem, prof);
+  for (uint64_t t = 0; t < 128; ++t) {
+    VCHECK_EQ(mem.load_scalar(out + 8 * t, 4), (t ^ 64) * 3);
+    VCHECK_EQ(mem.load_scalar(out + 8 * t + 4, 4), t + 1000);
+  }
+  mem.free(out);
+}
+
+// A barrier inside a call that only some of the warp's lanes made can never
+// complete for that warp: the others wait in the caller until it returns. The
+// ISA leaves it undefined, and it is refused by name rather than hung on.
+VTEST(bar_sync_in_a_call_some_lanes_skipped_is_refused) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.func sync_here()
+{
+  bar.sync 0;
+  ret;
+}
+.visible .entry k()
+{
+  .reg .b32 %r<4>;
+  .reg .pred %p<2>;
+  mov.u32 %r1, %tid.x;
+  setp.lt.u32 %p1, %r1, 16;
+  @!%p1 bra SKIP;
+  call.uni sync_here, ();
+SKIP:
+  ret;
+}
+)";
+  auto m = ptx::parse(kPtx);
+  const ptx::EntryFn* k = nullptr;
+  for (const auto& e : m.entries)
+    if (e.name == "k") k = &e;
+  VCHECK(k != nullptr);
+  MemoryManager mem{1 << 20};
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  auto err = VCAPTURE(Error, exec::launch(*k, cfg, {}, mem, prof));
+  VCHECK_CONTAINS(err.what(), "needs lanes that did not make the call");
+}
+
+// An indirect call whose lanes hold different targets: each target runs for
+// its own lanes, each lane gets its own return value back in the one slot,
+// and the warp carries on together.
+VTEST(an_indirect_call_with_a_target_per_lane_runs_each_target) {
+  const char* kPtx = R"(
+.version 8.3
+.target sm_86
+.address_size 64
+.func (.param .b32 r) twice(.param .b32 a)
+{
+  .reg .b32 %r<3>;
+  ld.param.b32 %r1, [a];
+  shl.b32 %r2, %r1, 1;
+  st.param.b32 [r], %r2;
+  ret;
+}
+.func (.param .b32 r) plus100(.param .b32 a)
+{
+  .reg .b32 %r<3>;
+  ld.param.b32 %r1, [a];
+  add.u32 %r2, %r1, 100;
+  st.param.b32 [r], %r2;
+  ret;
+}
+.func (.param .b32 r) negate(.param .b32 a)
+{
+  .reg .b32 %r<3>;
+  ld.param.b32 %r1, [a];
+  neg.s32 %r2, %r1;
+  st.param.b32 [r], %r2;
+  ret;
+}
+.global .align 8 .u64 table[3] = {twice, plus100, negate};
+.visible .entry k(.param .u64 p)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<10>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  rem.u32 %r2, %r1, 3;
+  mov.u64 %rd3, table;
+  mul.wide.u32 %rd4, %r2, 8;
+  add.u64 %rd5, %rd3, %rd4;
+  ld.global.u64 %rd6, [%rd5];
+  {
+  .param .b32 a0;
+  st.param.b32 [a0], %r1;
+  .param .b32 r0;
+  proto: .callprototype (.param .b32 _) _ (.param .b32 _);
+  call (r0), %rd6, (a0), proto;
+  ld.param.b32 %r3, [r0];
+  }
+  activemask.b32 %r4;
+  mul.wide.u32 %rd7, %r1, 8;
+  add.u64 %rd8, %rd2, %rd7;
+  st.global.u32 [%rd8], %r3;
+  st.global.u32 [%rd8+4], %r4;
+  ret;
+}
+)";
+  // Through the runtime, which places the module's globals: the table's
+  // initialiser is a list of function addresses.
+  runtime::Runtime rt(load_gpu("nvidia/a10"));
+  auto& dev = rt.device(0);
+  uint64_t mod = dev.load_module(kPtx);
+  const ptx::EntryFn* fn = dev.get_function(mod, "k");
+  uint64_t out = dev.memory().alloc(32 * 8);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  dev.launch(*fn, cfg, {arg_u64(out)}, dev.symbols(mod));
+  for (uint32_t t = 0; t < 32; ++t) {
+    const uint32_t want = t % 3 == 0 ? 2 * t : t % 3 == 1 ? t + 100 : static_cast<uint32_t>(-static_cast<int32_t>(t));
+    VCHECK_EQ(dev.memory().load_scalar(out + 8 * t, 4), uint64_t{want});
+    VCHECK_EQ(dev.memory().load_scalar(out + 8 * t + 4, 4), uint64_t{0xffffffffu});
+  }
+}
+
 // ---- cp.async ----
 //
 // The instruction's whole meaning is that the copy is *not* finished when it
@@ -2034,10 +2229,10 @@ VTEST(integer_division_by_zero_follows_the_hardware) {
   auto m = ptx::parse(ptx);
   uint64_t out = e.mem.alloc(8);
   exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
-  // Deterministic, which is more than hardware promises: all-ones for the
-  // quotient, the dividend for the remainder.
+  // What an RTX 3060 gives: all ones for the quotient and the remainder
+  // alike (the remainder was once taken to be the dividend, a guess).
   VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{0xFFFFFFFF});
-  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{7});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{0xFFFFFFFF});
 }
 
 VTEST(lane_masks_have_the_values_warp_algorithms_depend_on) {
@@ -2763,6 +2958,130 @@ VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{512 + 256});
 }
 
+// The driver's reserved shared memory, where cooperative_groups keeps the
+// scratch for tiles of more than one warp. An RTX 3060 puts it straight after
+// the kernel's own shared memory, counted in 128-byte allocation units:
+// 400 static bytes and 1024 dynamic ones are 1536, so the region starts
+// there, runs 288 bytes to its end and 1 KiB to its cap. It is real memory:
+// a store through %reserved_smem_offset_1 reads back.
+VTEST(reserved_shared_memory_follows_the_kernels_own) {
+  std::string ptx = std::string(kHeader) + R"(
+.extern .shared .align 16 .b8 dyn[];
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    .shared .align 4 .b8 tile[400];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %reserved_smem_offset_begin;
+    mov.u32 %r2, %reserved_smem_offset_end;
+    mov.u32 %r3, %reserved_smem_offset_cap;
+    mov.u32 %r4, %reserved_smem_offset_0;
+    mov.u32 %r5, %reserved_smem_offset_1;
+    mov.u32 %r6, %total_smem_size;
+    add.u32 %r7, %r5, 1020;          // the last word of the reserved KiB
+    st.shared.u32 [%r7], 77;
+    ld.shared.u32 %r8, [%r7];
+    st.global.u32 [%rd2], %r1;
+    st.global.u32 [%rd2+4], %r2;
+    st.global.u32 [%rd2+8], %r3;
+    st.global.u32 [%rd2+12], %r4;
+    st.global.u32 [%rd2+16], %r5;
+    st.global.u32 [%rd2+20], %r6;
+    st.global.u32 [%rd2+24], %r8;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  cfg.shared_bytes = 1024;
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  const uint64_t want[7] = {1536, 1536 + 0x120, 1536 + 0x400, 1536, 1536, 1536, 77};
+  for (int i = 0; i < 7; ++i) VCHECK_EQ(e.mem.load_scalar(out + 4 * i, 4), want[i]);
+}
+
+// A kernel that never asks where the reserved region is keeps its shared
+// window at exactly what it declared, so an overrun is still an overrun.
+VTEST(without_the_registers_a_shared_overrun_is_still_caught) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k()
+{
+    .reg .b32 %r<4>;
+    .shared .align 4 .b8 tile[400];
+    mov.u32 %r1, tile;
+    st.shared.u32 [%r1+400], 1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], LaunchConfig{}, {}, e.mem, e.prof));
+  VCHECK(err.code() == Err::OutOfBounds);
+}
+
+// Before Ampere there is no reserved shared memory, and the registers are
+// refused rather than given made-up values.
+VTEST(reserved_shared_memory_is_refused_before_ampere) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k()
+{
+    .reg .b32 %r<4>;
+    mov.u32 %r1, %reserved_smem_offset_1;
+    ret;
+}
+)";
+  auto m = ptx::parse(ptx);
+  MemoryManager mem{1 << 20};
+  DeviceProfile prof = load_gpu("nvidia/t4");
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], LaunchConfig{}, {}, mem, prof));
+  VCHECK_CONTAINS(err.what(), "compute capability 8.0");
+}
+
+// Warp 0 spins on a shared flag only warp 1 sets. The warps of a block make
+// progress independently, so this finishes on hardware; under the
+// deterministic scheduler a turn used to end only at a barrier, and warp 0
+// spun until the step budget ran out. A long turn now ends at a loop edge.
+VTEST(a_warp_spinning_on_another_warps_flag_lets_it_run) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    .reg .pred %p<4>;
+    .shared .align 4 .b32 flag;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    setp.lt.u32 %p1, %r1, 32;
+    @!%p1 bra SET;
+    mov.u32 %r3, 0;
+SPIN:
+    add.u32 %r3, %r3, 1;
+    ld.volatile.shared.u32 %r2, [flag];
+    setp.eq.u32 %p2, %r2, 0;
+    @%p2 bra SPIN;
+    setp.eq.u32 %p3, %r1, 0;
+    @%p3 st.global.u32 [%rd2], %r2;
+    ret;
+SET:
+    setp.eq.u32 %p3, %r1, 32;
+    @%p3 st.volatile.shared.u32 [flag], 42;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{42});
+}
+
 VTEST(fp8_e4m3_and_e5m2_are_different_formats) {
   // The two FP8 formats are not one shape with a different bias. e4m3 spends
   // its top exponent on ordinary numbers -- it has NO infinity -- so its
@@ -3341,7 +3660,8 @@ VTEST(mul24_szext_and_fns) {
   exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
   const uint64_t prod = uint64_t{0xFFFFFFu} * 0xFFFFFFu;   // 48 bits wide
   VCHECK_EQ(e.mem.load_scalar(out, 4), prod & 0xFFFFFFFFull);
-  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), (prod >> 24) & 0xFFFFFFFFull);
+  // .hi is bits 47:16 (the ISA's; an RTX 3060 gives 0xfffffe00 here).
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), (prod >> 16) & 0xFFFFFFFFull);
   VCHECK_EQ(e.mem.load_scalar(out + 8, 4), uint64_t{0xFFFFFFFFu});  // -1
   VCHECK_EQ(e.mem.load_scalar(out + 12, 4), uint64_t{255});
   VCHECK_EQ(e.mem.load_scalar(out + 16, 4), uint64_t{5});
@@ -3392,6 +3712,516 @@ VTEST(atom_cas_compares_with_b_and_stores_c) {
   VCHECK_EQ(e.mem.load_scalar(buf + 24, 8), uint64_t{5});
   VCHECK_EQ(e.mem.load_scalar(buf + 32, 4), uint64_t{5});   // shared: old
   VCHECK_EQ(e.mem.load_scalar(buf + 36, 4), uint64_t{7});   // and the store
+}
+
+// PTX forms a differential probe against an RTX 3060 found missing or wrong:
+// each case is an instruction (inputs in %r1, %r2, %r3, result in %r4) and
+// what the card gave for it.
+// Half-precision rules the fifth card-vs-simulator sweep found
+// (ptx_half_forms.cu), with an RTX 3060's values: .ftz on setp/set and on
+// half neg/abs (it was dropped, for f32 comparisons too), -0 below +0 in half
+// min/max, cvt.f32.bf16 as a plain shift even for NaNs, and cvt.f64.f16
+// keeping a NaN's sign and payload.
+// and/or/xor.pred with an immediate source, which nvcc emits for a negation
+// (CUDA Samples' cdpAdvancedQuicksort: `xor.pred %p212, %p260, -1`).
+// A 32-bit shared address is register plus offset in 32 bits. nvcc leaves a
+// "negative" base in the register and brings it back with the offset --
+// Rodinia's needle computes %r4 = temp - 64 for a thread of the second row
+// and loads [%r4+68]. Adding in 64 bits carried the address out of the
+// shared window altogether.
+// A mul and the add or sub consuming its product, neither with a rounding
+// modifier, run as one fma, as ptxas contracts them on an RTX 3060 (see
+// src/ptx/contract.cpp). With a = 1+2^-23, b = 1-2^-23 and c = -1 the
+// rounded product is 1 and the sum 0; fused, the result is -2^-46. What the
+// card measurably leaves alone stays unfused: an explicit .rn, and a product
+// also used some other way.
+// atom.add.f64 with a NaN keeps the NaN as it is, signalling or not: the
+// value added if it is a NaN, otherwise the one in memory (an RTX 3060).
+VTEST(atom_add_f64_passes_a_nan_through_unchanged) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 g, .param .u64 x)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<8>;
+    .reg .f64 %fd<4>;
+    ld.param.u64 %rd1, [g];
+    ld.param.u64 %rd2, [x];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 8;
+    add.u64 %rd4, %rd1, %rd3;
+    add.u64 %rd5, %rd2, %rd3;
+    ld.global.f64 %fd1, [%rd5];
+    atom.global.add.f64 %fd2, [%rd4], %fd1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t qa = 0x7ff8000000000123ull, qb = 0xfff8000000000456ull, sa = 0x7ff0000000000789ull,
+                 one = 0x3ff0000000000000ull;
+  const uint64_t old[8] = {qa, one, qa, qb, sa, one, qb, sa}, add[8] = {one, qa, qb, qa, one, sa, sa, qb};
+  const uint64_t want[8] = {qa, qa, qb, qa, sa, sa, sa, qb};
+  const uint64_t g = e.mem.alloc(64), x = e.mem.alloc(64);
+  e.mem.write(g, old, 64);
+  e.mem.write(x, add, 64);
+  LaunchConfig cfg;
+  cfg.block = {8, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(g), arg_u64(x)}, e.mem, e.prof);
+  for (int i = 0; i < 8; ++i) VCHECK_EQ(e.mem.load_scalar(g + 8 * i, 8), want[i]);
+}
+
+VTEST(mul_add_contract_as_the_code_generator_fuses_them) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .f32 %f<24>;
+    .reg .f64 %fd<8>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.b32 %f1, 0f3F800001;          // 1 + 2^-23
+    mov.b32 %f2, 0f3F7FFFFE;          // 1 - 2^-23
+    mov.b32 %f3, 0fBF800000;          // -1
+    mov.b32 %f4, 0f3F800000;          // 1
+    mul.f32 %f5, %f1, %f2;            // fused into the add
+    add.f32 %f6, %f5, %f3;
+    st.global.f32 [%rd2], %f6;
+    mul.f32 %f7, %f1, %f2;            // c - a*b
+    sub.f32 %f8, %f4, %f7;
+    st.global.f32 [%rd2+4], %f8;
+    mul.f32 %f9, %f1, %f2;            // a*b - c
+    sub.f32 %f10, %f9, %f4;
+    st.global.f32 [%rd2+8], %f10;
+    mul.rn.f32 %f11, %f1, %f2;        // explicit .rn: not fused
+    add.f32 %f12, %f11, %f3;
+    st.global.f32 [%rd2+12], %f12;
+    mul.f32 %f13, %f1, %f2;           // product also stored: not fused
+    add.f32 %f14, %f13, %f3;
+    st.global.f32 [%rd2+16], %f14;
+    st.global.f32 [%rd2+20], %f13;
+    mul.f32 %f15, %f1, %f2;           // two adds: both fused
+    add.f32 %f16, %f15, %f3;
+    add.f32 %f17, %f3, %f15;
+    st.global.f32 [%rd2+24], %f16;
+    st.global.f32 [%rd2+28], %f17;
+    mov.b64 %fd1, 0d3FF0000000000001; // f64: 1 + 2^-52
+    mov.b64 %fd2, 0d3FEFFFFFFFFFFFFE; // 1 - 2^-52
+    mov.b64 %fd3, 0dBFF0000000000000;
+    mul.f64 %fd4, %fd1, %fd2;
+    add.f64 %fd5, %fd4, %fd3;
+    st.global.f64 [%rd2+32], %fd5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(40);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  const float fused = -std::ldexp(1.0f, -46);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), fused);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 4, 4)), -fused);    // 1 - (1 - 2^-46)
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 8, 4)), fused);     // (1 - 2^-46) - 1
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 12, 4)), 0.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 16, 4)), 0.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 20, 4)), 1.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 24, 4)), fused);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 28, 4)), fused);
+  double d;
+  const uint64_t bits = e.mem.load_scalar(out + 32, 8);
+  std::memcpy(&d, &bits, 8);
+  VCHECK_EQ(d, -std::ldexp(1.0, -104));
+}
+
+VTEST(a_32_bit_address_wraps_register_plus_offset) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    .shared .align 4 .b8 buf[64];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, buf;
+    st.shared.u32 [%r1+4], 1234;
+    st.shared.u32 [%r1+60], 5678;
+    sub.u32 %r2, %r1, 64;          // below the window's start in 32 bits
+    ld.shared.u32 %r3, [%r2+68];   // buf + 4
+    sub.u32 %r4, %r1, 1000;
+    ld.shared.u32 %r5, [%r4+1060]; // buf + 60
+    st.global.u32 [%rd2], %r3;
+    st.global.u32 [%rd2+4], %r5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(8);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{1234});
+  VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{5678});
+}
+
+VTEST(predicate_logic_takes_an_immediate) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    setp.lt.u32 %p1, %r1, 5;
+    xor.pred %p2, %p1, -1;
+    and.pred %p3, %p1, 0;
+    or.pred %p4, 1, %p1;
+    selp.u32 %r2, 1, 0, %p2;
+    selp.u32 %r3, 2, 0, %p3;
+    selp.u32 %r4, 4, 0, %p4;
+    add.u32 %r5, %r2, %r3;
+    add.u32 %r5, %r5, %r4;
+    mul.wide.u32 %rd1, %r1, 4;
+    add.u64 %rd1, %rd2, %rd1;
+    st.global.u32 [%rd1], %r5;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(4 * 32);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint64_t t = 0; t < 32; ++t) VCHECK_EQ(e.mem.load_scalar(out + 4 * t, 4), uint64_t{t < 5 ? 4u : 5u});
+}
+
+VTEST(half_precision_rules_from_the_fifth_sweep) {
+  struct Case { const char* ins; uint32_t a, b, c, want; };
+  const Case cases[] = {
+      // Two f32 subnormals: 1 < 2 unless .ftz makes both zero.
+      {"{ .reg .pred p; setp.lt.f32 p, %r1, %r2; selp.u32 %r4, 1, 0, p; }", 1, 2, 0, 1},
+      {"{ .reg .pred p; setp.lt.ftz.f32 p, %r1, %r2; selp.u32 %r4, 1, 0, p; }", 1, 2, 0, 0},
+      {"{ .reg .b16 x, y; .reg .pred p; mov.b32 {x, _}, %r1; mov.b32 {y, _}, %r2; setp.lt.ftz.f16 p, x, y; "
+       "selp.u32 %r4, 1, 0, p; }", 1, 2, 0, 0},
+      {"set.eq.u32.f16x2 %r4, %r1, %r2", 0x00010002, 0x80028001, 0, 0},
+      {"set.eq.ftz.u32.f16x2 %r4, %r1, %r2", 0x00010002, 0x80028001, 0, 0xffffffff},
+      // .ftz before the sign change: a positive subnormal negates to -0, a
+      // negative one to +0.
+      {"{ .reg .b16 x, r; mov.b32 {x, _}, %r1; neg.ftz.f16 r, x; mov.b32 %r4, {r, r}; }", 3, 0, 0, 0x80008000},
+      {"{ .reg .b16 x, r; mov.b32 {x, _}, %r1; neg.ftz.f16 r, x; mov.b32 %r4, {r, r}; }", 0x8137, 0, 0, 0},
+      {"{ .reg .b16 x, r; mov.b32 {x, _}, %r1; neg.f16 r, x; mov.b32 %r4, {r, r}; }", 3, 0, 0, 0x80038003},
+      // -0 orders below +0.
+      {"min.f16x2 %r4, %r1, %r2", 0x00000000, 0x80008000, 0, 0x80008000},
+      {"max.f16x2 %r4, %r1, %r2", 0x00000000, 0x80008000, 0, 0},
+      {"{ .reg .b16 x, y, r; mov.b32 {x, _}, %r1; mov.b32 {y, _}, %r2; min.ftz.f16 r, x, y; mov.b32 %r4, {r, r}; }",
+       0x3f800000, 0xe6ec81aa, 0, 0x80008000},
+      {"max.ftz.f16x2 %r4, %r1, %r2", 1, 0x8553843f, 0, 0},
+      // cvt.f32.bf16 shifts; cvt.f64.f16 widens a NaN's payload, made quiet.
+      {"{ .reg .b16 h; .reg .f32 d; mov.b32 {h, _}, %r1; cvt.f32.bf16 d, h; mov.b32 %r4, d; }", 0xffff, 0, 0, 0xffff0000},
+      {"{ .reg .b16 h; .reg .f32 d; mov.b32 {h, _}, %r1; cvt.f32.bf16 d, h; mov.b32 %r4, d; }", 0xff81, 0, 0, 0xff810000},
+      {"{ .reg .b16 h; .reg .f64 d; mov.b32 {h, _}, %r1; cvt.f64.f16 d, h; mov.b64 {_, %r4}, d; }", 0x7d55, 0, 0, 0x7ffd5400},
+      {"{ .reg .b16 h; .reg .f64 d; mov.b32 {h, _}, %r1; cvt.f64.f16 d, h; mov.b64 {_, %r4}, d; }", 0xffff, 0, 0, 0xfffffc00},
+      {"{ .reg .b16 h; .reg .f64 d; mov.b32 {h, _}, %r1; cvt.f64.f16 d, h; mov.b64 {_, %r4}, d; }", 0x7c01, 0, 0, 0x7ff80400},
+  };
+  constexpr size_t n = sizeof cases / sizeof cases[0];
+  std::string body;
+  for (size_t i = 0; i < n; ++i) {
+    char line[512];
+    std::snprintf(line, sizeof line,
+                  "    mov.u32 %%r1, %u;\n    mov.u32 %%r2, %u;\n    mov.u32 %%r3, %u;\n    %s%s\n"
+                  "    st.global.u32 [%%rd2+%zu], %%r4;\n",
+                  cases[i].a, cases[i].b, cases[i].c, cases[i].ins, cases[i].ins[0] == '{' ? "" : ";", 4 * i);
+    body += line;
+  }
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+)" + body + "    ret;\n}\n";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4 * n);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  for (size_t i = 0; i < n; ++i) {
+    const auto got = static_cast<uint32_t>(e.mem.load_scalar(out + 4 * i, 4));
+    if (got != cases[i].want)
+      std::fprintf(stderr, "  %s (a=%08x b=%08x): %08x, the card gave %08x\n", cases[i].ins, cases[i].a, cases[i].b,
+                   got, cases[i].want);
+    VCHECK_EQ(got, cases[i].want);
+  }
+}
+
+// div.approx.f32 is the documented a * (1/b) with rcp.approx's reciprocal,
+// and 0 (NaN for an infinite a) when 2^126 < |b| < 2^128; .ftz on the
+// approximate math flushes subnormal inputs and results. Every expected value
+// is an RTX 3060's.
+VTEST(approximate_division_and_ftz_as_documented) {
+  struct Case { const char* ins; uint32_t a, b, want; };
+  const Case cases[] = {
+      // a * rcp(b), rounded twice: one ulp from the quotient, where the
+      // card's reciprocal is the correctly rounded one.
+      {"div.approx.f32 %r4, %r1, %r2", 0x4003729a, 0xc23da946, 0xbd316cbe},
+      {"div.approx.f32 %r4, %r1, %r2", 0x3cae08fc, 0x41e66e7d, 0x3a415888},
+      {"div.approx.ftz.f32 %r4, %r1, %r2", 0xbdbe23cc, 0xc0585d1d, 0x3ce0f8db},
+      {"div.approx.f32 %r4, %r1, %r2", 0xbc8141ad, 0x439d254c, 0xb852911f},
+      {"div.full.f32 %r4, %r1, %r2", 0x3cae08fc, 0x41e66e7d, 0x3a415887},
+      // 2^126 < |b| < 2^128: a zero signed as the quotient, NaN for an infinite a.
+      {"div.approx.f32 %r4, %r1, %r2", 0x3f800000, 0x7ec00000, 0},
+      {"div.approx.f32 %r4, %r1, %r2", 0x3f800000, 0xff000000, 0x80000000},
+      {"div.approx.f32 %r4, %r1, %r2", 0xc0400000, 0xff000000, 0},
+      {"div.approx.f32 %r4, %r1, %r2", 0x7149f2ca, 0x7f7fffff, 0},
+      {"div.approx.f32 %r4, %r1, %r2", 0x7f800000, 0x7e800001, 0x7fffffff},
+      {"div.approx.ftz.f32 %r4, %r1, %r2", 0xc0400000, 0x7ec00000, 0x80000000},
+      // 2^126 itself is in range; a subnormal b gives the quotient (0, not 0 * inf).
+      {"div.approx.f32 %r4, %r1, %r2", 0x3f800000, 0x7e800000, 0x00800000},
+      {"div.approx.f32 %r4, %r1, %r2", 0, 0x00200000, 0},
+      {"div.approx.f32 %r4, %r1, %r2", 0x3f800000, 0x00200000, 0x7f800000},
+      // .ftz: subnormal inputs are signed zeros, subnormal results flush.
+      {"rcp.approx.ftz.f32 %r4, %r2", 0, 0x7ec00000, 0},
+      {"rcp.approx.ftz.f32 %r4, %r2", 0, 0xff000000, 0x80000000},
+      {"sqrt.approx.ftz.f32 %r4, %r2", 0, 0x00200000, 0},
+      {"sqrt.approx.ftz.f32 %r4, %r2", 0, 0x80080000, 0x80000000},
+      {"sqrt.approx.f32 %r4, %r2", 0, 0x00200000, 0x1f800000},
+      {"rsqrt.approx.ftz.f32 %r4, %r2", 0, 0x00200000, 0x7f800000},
+      {"rsqrt.approx.ftz.f32 %r4, %r2", 0, 0x80080000, 0xff800000},
+      {"ex2.approx.ftz.f32 %r4, %r2", 0, 0xc3040000, 0},
+      {"ex2.approx.f32 %r4, %r2", 0, 0xc3040000, 0x00020000},
+      {"lg2.approx.ftz.f32 %r4, %r2", 0, 0x00000001, 0xff800000},
+      {"lg2.approx.ftz.f32 %r4, %r2", 0, 0x80080000, 0xff800000},
+      {"sin.approx.ftz.f32 %r4, %r2", 0, 0x00200000, 0},
+      {"sin.approx.ftz.f32 %r4, %r2", 0, 0x80080000, 0x80000000},
+  };
+  constexpr size_t n = sizeof cases / sizeof cases[0];
+  std::string body;
+  for (size_t i = 0; i < n; ++i) {
+    char line[512];
+    std::snprintf(line, sizeof line,
+                  "    mov.u32 %%r1, %u;\n    mov.u32 %%r2, %u;\n    %s;\n"
+                  "    st.global.u32 [%%rd2+%zu], %%r4;\n",
+                  cases[i].a, cases[i].b, cases[i].ins, 4 * i);
+    body += line;
+  }
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+)" + body + "    ret;\n}\n";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4 * n);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  for (size_t i = 0; i < n; ++i) {
+    const auto got = static_cast<uint32_t>(e.mem.load_scalar(out + 4 * i, 4));
+    if (got != cases[i].want)
+      std::fprintf(stderr, "  %s (a=%08x b=%08x): %08x, the card gave %08x\n", cases[i].ins, cases[i].a, cases[i].b,
+                   got, cases[i].want);
+    VCHECK_EQ(got, cases[i].want);
+  }
+}
+
+VTEST(ptx_forms_as_the_card_computes_them) {
+  struct Case { const char* ins; uint32_t a, b, c, want; };
+  const Case cases[] = {
+      // prmt's modes: f4e/b4e walk {b, a}; rc8/ecl/ecr/rc16 use c's low bits.
+      {"prmt.b32.f4e %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 1, 0xf0123456},
+      {"prmt.b32.b4e %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 0, 0xdebc9a78},
+      {"prmt.b32.rc8 %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 2, 0x34343434},
+      {"prmt.b32.ecl %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 1, 0x12345656},
+      {"prmt.b32.ecr %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 1, 0x56565678},
+      {"prmt.b32.rc16 %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 1, 0x12341234},
+      // setp/set with a boolean operation, and setp's second destination.
+      {"{ .reg .pred p, q; setp.ne.u32 q, %r3, 0; setp.lt.and.u32 p, %r1, %r2, q; selp.u32 %r4, 1, 0, p; }",
+       0x12345678, 0x9abcdef0, 0x0f1e2d3c, 1},
+      {"{ .reg .pred p, q; setp.lt.u32 p|q, %r1, %r2; selp.u32 %r4, 1, 2, q; }", 0x12345678, 0x9abcdef0, 0, 2},
+      {"{ .reg .pred p, q, r; setp.ne.u32 r, %r3, 0; setp.gt.xor.s32 p|q, %r1, %r2, !r; selp.u32 %r4, 1, 2, q; }",
+       0x12345678, 0x9abcdef0, 0x0f1e2d3c, 2},
+      {"{ .reg .pred r; setp.ne.u32 r, %r3, 0; set.lt.or.u32.u32 %r4, %r1, %r2, r; }", 0x12345678, 0x9abcdef0, 0x0f1e2d3c,
+       0xffffffff},
+      // mul24/mad24: .hi is bits 47:16; mad24.hi.sat clamps the true sum.
+      {"mul24.hi.u32 %r4, %r1, %r2", 0xffffff, 0xffffff, 0, 0xfffffe00},
+      {"mad24.lo.u32 %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 0x1234abcd, 0x2661cc4d},
+      {"mad24.hi.sat.s32 %r4, %r1, %r2, %r3", 0x7fffff, 0x7fffff, 0x7fffffff, 0x7fffffff},
+      {"mad24.hi.sat.s32 %r4, %r1, %r2, %r3", 0x800000, 0x7fffff, 0x80000000, 0x80000000},
+      {"mad24.hi.sat.s32 %r4, %r1, %r2, %r3", 0x12345678, 0x9abcdef0, 0x1234abcd, 0x047b47fa},
+      // add/sub.sat.s32.
+      {"add.sat.s32 %r4, %r1, %r2", 0x7fffffff, 1, 0, 0x7fffffff},
+      {"add.sat.s32 %r4, %r1, %r2", 0x80000000, 0xffffffff, 0, 0x80000000},
+      {"sub.sat.s32 %r4, %r1, %r2", 0x80000000, 1, 0, 0x80000000},
+      {"sub.sat.s32 %r4, %r1, %r2", 0x7fffffff, 0xffffffff, 0, 0x7fffffff},
+      // f32: fma's rounding mode and .sat, add.sat, mul.rm, max.xorsign.abs.
+      {"{ .reg .f32 a,b,c; mov.b32 a, %r1; mov.b32 b, %r2; mov.b32 c, %r3; fma.rz.f32 a, a, b, c; mov.b32 %r4, a; }",
+       0x3f800001, 0x3f800001, 0x33800000, 0x3f800002},
+      {"{ .reg .f32 a,b,c; mov.b32 a, %r1; mov.b32 b, %r2; mov.b32 c, %r3; fma.rz.f32 a, a, b, c; mov.b32 %r4, a; }",
+       0x3f800001, 0xbf800001, 0xb3800000, 0xbf800002},
+      {"{ .reg .f32 a,b,c; mov.b32 a, %r1; mov.b32 b, %r2; mov.b32 c, %r3; fma.rn.sat.f32 a, a, b, c; mov.b32 %r4, a; }",
+       0x40000000, 0x40000000, 0, 0x3f800000},
+      {"{ .reg .f32 a,b,c; mov.b32 a, %r1; mov.b32 b, %r2; mov.b32 c, %r3; fma.rn.sat.f32 a, a, b, c; mov.b32 %r4, a; }",
+       0x7fc00000, 0x3f800000, 0, 0},
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; add.sat.f32 a, a, b; mov.b32 %r4, a; }", 0x3f400000, 0x3f400000,
+       0, 0x3f800000},
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; add.sat.f32 a, a, b; mov.b32 %r4, a; }", 0xbf800000, 0x3f000000,
+       0, 0},
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; mul.rm.f32 a, a, b; mov.b32 %r4, a; }", 0x3dcccccd, 0x40400000,
+       0, 0x3e999999},
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; max.xorsign.abs.f32 a, a, b; mov.b32 %r4, a; }", 0x3f800000,
+       0xc0000000, 0, 0xc0000000},
+      // Half precision: the modifiers once accepted and dropped.
+      {"max.xorsign.abs.f16x2 %r4, %r1, %r2", 0x3c00bc00, 0xc0004000, 0, 0xc000c000},
+      {"add.sat.f16x2 %r4, %r1, %r2", 0x3c00bc00, 0x38003400, 0, 0x3c000000},
+      {"add.ftz.f16x2 %r4, %r1, %r2", 0x00010001, 0x00020000, 0, 0},
+      {"max.NaN.f16x2 %r4, %r1, %r2", 0x7e003c00, 0x3c007e00, 0, 0x7fff7fff},
+      {"fma.rn.relu.f16x2 %r4, %r1, %r2, %r3", 0x3c00bc00, 0x3c003c00, 0, 0x3c000000},
+      // cvt: the packed form's .rz and .relu, and tf32.
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; cvt.rz.f16x2.f32 %r4, a, b; }", 0x3f800fff, 0xbf800fff, 0,
+       0x3c00bc00},
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; cvt.rn.relu.f16x2.f32 %r4, a, b; }", 0x7fc00000, 0x80000000, 0,
+       0x7fff0000},
+      {"{ .reg .f32 a,b; mov.b32 a, %r1; mov.b32 b, %r2; cvt.rn.relu.f16x2.f32 %r4, a, b; }", 0xbf800000, 0x3f800000, 0,
+       0x00003c00},
+      {"{ .reg .f32 a; mov.b32 a, %r1; cvt.rna.tf32.f32 %r4, a; }", 0x3f801000, 0, 0, 0x3f802000},
+      {"{ .reg .f32 a; mov.b32 a, %r1; cvt.rna.tf32.f32 %r4, a; }", 0xff801fff, 0, 0, 0xff800000},
+      // isspacep.global: every generic address outside shared and local, null too.
+      {"{ .reg .pred p; .reg .u64 a; mov.b64 a, {%r1, %r2}; isspacep.global p, a; selp.u32 %r4, 1, 0, p; }", 0, 0, 0, 1},
+      // An immediate moved into an .f16x2 register.
+      {"{ .reg .f16x2 h; mov.b32 h, 0x3c00bc00; mov.b32 %r4, h; }", 0, 0, 0, 0x3c00bc00},
+      // pmevent does nothing a kernel can see.
+      {"{ pmevent 1; mov.u32 %r4, %r1; }", 7, 0, 0, 7},
+  };
+  constexpr size_t n = sizeof cases / sizeof cases[0];
+  std::string body;
+  for (size_t i = 0; i < n; ++i) {
+    char line[512];
+    std::snprintf(line, sizeof line,
+                  "    mov.u32 %%r1, %u;\n    mov.u32 %%r2, %u;\n    mov.u32 %%r3, %u;\n    %s%s\n"
+                  "    st.global.u32 [%%rd2+%zu], %%r4;\n",
+                  cases[i].a, cases[i].b, cases[i].c, cases[i].ins, cases[i].ins[0] == '{' ? "" : ";", 4 * i);
+    body += line;
+  }
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+)" + body + "    ret;\n}\n";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4 * n);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  for (size_t i = 0; i < n; ++i) {
+    const auto got = static_cast<uint32_t>(e.mem.load_scalar(out + 4 * i, 4));
+    if (got != cases[i].want)
+      std::fprintf(stderr, "  %s (a=%08x b=%08x c=%08x): %08x, the card gave %08x\n", cases[i].ins, cases[i].a,
+                   cases[i].b, cases[i].c, got, cases[i].want);
+    VCHECK_EQ(got, cases[i].want);
+  }
+}
+
+// Integer forms the third card-vs-simulator sweep found wrong, with an RTX
+// 3060's values: a 16-bit shift's amount is a whole .u32 (0xbf800000 shifts
+// everything out); rem.u16 by zero is all ones; bfe/bfi.64 take the whole
+// position and length, not their low 8 bits; bfe.s64 of the whole value keeps
+// it (1 << 64 was undefined); cnot.
+VTEST(integer_forms_from_the_third_sweep) {
+  struct Case { const char* ins; uint32_t a, b, c, want; };
+  const Case cases[] = {
+      {"{ .reg .b16 x; cvt.u16.u32 x, %r1; shl.b16 x, x, %r2; cvt.u32.u16 %r4, x; }", 0x09ce, 0xbf800000, 0, 0},
+      {"{ .reg .s16 x; cvt.s16.u32 x, %r1; shr.s16 x, x, %r2; cvt.u32.u16 %r4, x; }", 0x8000, 0x10000, 0, 0xffff},
+      {"{ .reg .s16 x; cvt.s16.u32 x, %r1; shr.s16 x, x, %r2; cvt.u32.u16 %r4, x; }", 0x8000, 3, 0, 0xf000},
+      {"{ .reg .u16 x, y; cvt.u16.u32 x, %r1; cvt.u16.u32 y, %r2; rem.u16 x, x, y; cvt.u32.u16 %r4, x; }", 1234, 0, 0,
+       0xffff},
+      {"{ .reg .s64 x; mov.b64 x, {%r1, %r2}; bfe.s64 x, x, 0, %r3; mov.b64 {%r4, _}, x; }", 0xd8c3f538, 0xe88c3cd2,
+       0xd8c3f538, 0xd8c3f538},
+      {"{ .reg .u64 x; mov.b64 x, {%r1, %r2}; bfe.u64 x, x, 3, %r3; mov.b64 {%r4, _}, x; }", 0x49428d8e, 0xb8e8ab15,
+       0x100, 0xa92851b1},
+      {"{ .reg .u64 x; mov.b64 x, {%r1, %r2}; bfe.u64 x, x, %r3, 8; mov.b64 {%r4, _}, x; }", 0x49428d8e, 0xb8e8ab15,
+       0x103, 0},
+      {"cnot.b32 %r4, %r1", 0, 0, 0, 1},
+      {"cnot.b32 %r4, %r1", 5, 0, 0, 0},
+      {"{ .reg .b16 x; cvt.u16.u32 x, %r1; cnot.b16 x, x; cvt.u32.u16 %r4, x; }", 0x10000, 0, 0, 1},
+  };
+  constexpr size_t n = sizeof cases / sizeof cases[0];
+  std::string body;
+  for (size_t i = 0; i < n; ++i) {
+    char line[512];
+    std::snprintf(line, sizeof line,
+                  "    mov.u32 %%r1, %u;\n    mov.u32 %%r2, %u;\n    mov.u32 %%r3, %u;\n    %s%s\n"
+                  "    st.global.u32 [%%rd2+%zu], %%r4;\n",
+                  cases[i].a, cases[i].b, cases[i].c, cases[i].ins, cases[i].ins[0] == '{' ? "" : ";", 4 * i);
+    body += line;
+  }
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+)" + body + "    ret;\n}\n";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(4 * n);
+  exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out)}, e.mem, e.prof);
+  for (size_t i = 0; i < n; ++i) {
+    const auto got = static_cast<uint32_t>(e.mem.load_scalar(out + 4 * i, 4));
+    if (got != cases[i].want)
+      std::fprintf(stderr, "  %s: %08x, the card gave %08x\n", cases[i].ins, got, cases[i].want);
+    VCHECK_EQ(got, cases[i].want);
+  }
+}
+
+// mbarrier.pending_count.b64 count, state reads the count an arrival's state
+// token carries: the arrivals still pending before that arrive instruction.
+// Measured on an RTX 3060: 64 on a fresh barrier of 64, and 54 for every lane
+// of the next arrive after ten threads arrived.
+VTEST(mbarrier_pending_count_reads_the_state_token) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<3>;
+    .shared .align 8 .b8 bar[8];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r5, bar;
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 mbarrier.init.shared.b64 [%r5], 64;
+    bar.sync 0;
+    mov.u32 %r2, 0;
+    setp.lt.u32 %p2, %r1, 10;
+    @%p2 mbarrier.arrive.shared.b64 %rd3, [%r5];
+    @%p2 mbarrier.pending_count.b64 %r2, %rd3;
+    bar.warp.sync -1;
+    mbarrier.arrive.shared.b64 %rd4, [%r5];
+    mbarrier.pending_count.b64 %r3, %rd4;
+    mul.wide.u32 %rd5, %r1, 8;
+    add.u64 %rd6, %rd2, %rd5;
+    st.global.u32 [%rd6], %r2;
+    st.global.u32 [%rd6+4], %r3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(32 * 8);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t t = 0; t < 32; ++t) {
+    VCHECK_EQ(e.mem.load_scalar(out + 8 * t, 4), uint64_t{t < 10 ? 64u : 0u});
+    VCHECK_EQ(e.mem.load_scalar(out + 8 * t + 4, 4), uint64_t{54});
+  }
 }
 
 VTEST(lop3_computes_the_truth_table_it_is_given) {
@@ -3966,7 +4796,10 @@ VTEST(an_unknown_texture_handle_is_named_rather_than_read) {
 
 VTEST(tex_clamps_out_of_range_coordinates_to_the_edge) {
   // cudaAddressModeClamp: the default, and the one that hides bugs if it is
-  // wrong, because an off-by-one only shows at the boundary.
+  // wrong, because an off-by-one only shows at the boundary. It applies to
+  // float coordinates; an integer coordinate outside the extent reads zero
+  // instead, whatever the address mode (an RTX 3060;
+  // e2e_texture_int_coords).
   std::string ptx = std::string(kHeader) + R"(
 .visible .entry k(.param .u64 t, .param .u64 out)
 {
@@ -3981,9 +4814,13 @@ VTEST(tex_clamps_out_of_range_coordinates_to_the_edge) {
     // the high one.
     sub.s32 %r2, %r1, 2;
     tex.1d.v4.f32.s32 {%f1, %f2, %f3, %f4}, [%rd1, {%r2}];
+    cvt.rn.f32.s32 %f5, %r2;
+    add.f32 %f5, %f5, 0f3F000000;   // the texel's centre
+    tex.1d.v4.f32.f32 {%f6, %f2, %f3, %f4}, [%rd1, {%f5}];
     mul.wide.u32 %rd4, %r1, 4;
     add.s64 %rd5, %rd3, %rd4;
-    st.global.f32 [%rd5], %f1;
+    st.global.f32 [%rd5], %f6;
+    st.global.f32 [%rd5+32], %f1;
     ret;
 }
 )";
@@ -4006,13 +4843,18 @@ VTEST(tex_clamps_out_of_range_coordinates_to_the_edge) {
   cfg.textures = &tex;
   exec::launch(m.entries[0], cfg, {arg_u64(7), arg_u64(out)}, e.mem, e.prof);
   const float want[8] = {10, 10, 10, 11, 12, 13, 13, 13};
-  for (uint32_t i = 0; i < 8; ++i) VCHECK_EQ(as_f32(e.mem.load_scalar(out + i * 4, 4)), want[i]);
+  const float want_int[8] = {0, 0, 10, 11, 12, 13, 0, 0};
+  for (uint32_t i = 0; i < 8; ++i) {
+    VCHECK_EQ(as_f32(e.mem.load_scalar(out + i * 4, 4)), want[i]);
+    VCHECK_EQ(as_f32(e.mem.load_scalar(out + 32 + i * 4, 4)), want_int[i]);
+  }
 }
 
-VTEST(a_missing_channel_reads_as_zero_and_alpha_as_one) {
-  // Hardware returns 0 for absent x/y/z and 1 for absent w. A kernel reading
-  // .w of a one-channel texture expects 1, and getting 0 is the kind of wrong
-  // that looks like a black image rather than an error.
+VTEST(a_missing_channel_reads_as_zero_w_included) {
+  // An RTX 3060 returns 0 for every channel the format lacks, w included --
+  // measured with tex1Dfetch<float4> on a one-channel float texture over
+  // linear memory, as here, and for arrays, pitched memory, both read modes
+  // and both filters. (The graphics APIs' w = 1 is not what CUDA returns.)
   std::string ptx = std::string(kHeader) + R"(
 .visible .entry k(.param .u64 t, .param .u64 out)
 {
@@ -4052,7 +4894,7 @@ VTEST(a_missing_channel_reads_as_zero_and_alpha_as_one) {
   VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), 2.5f);
   VCHECK_EQ(as_f32(e.mem.load_scalar(out + 4, 4)), 0.0f);
   VCHECK_EQ(as_f32(e.mem.load_scalar(out + 8, 4)), 0.0f);
-  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 12, 4)), 1.0f);
+  VCHECK_EQ(e.mem.load_scalar(out + 12, 4), uint64_t{0});
 }
 
 VTEST(a_surface_write_then_read_round_trips) {
@@ -4257,6 +5099,159 @@ VTEST(alloca_overflow_freed_memory_and_bad_restores_are_reported) {
   err = VCAPTURE(Error, ptx::parse(std::string(kHeader) +
                                    ".visible .entry k() { .reg .b64 %rd<2>; alloca.u64 %rd1, 8, 3; ret; }\n"));
   VCHECK_CONTAINS(err.message(), "power of two");
+}
+
+// ---- atom.b128, st.bulk, istypep ----
+
+// The forms CUDA 13.2's ptxas assembles for sm_100a.
+VTEST(b128_atomics_st_bulk_and_istypep_parse_as_ptxas_takes_them) {
+  auto m = ptx::parse(R"(.version 8.7
+.target sm_100a
+.address_size 64
+.visible .entry k(.param .u64 p, .param .u64 h)
+{
+    .reg .pred %p<2>;
+    .reg .b128 %q<4>;
+    .reg .b64 %rd<4>;
+    .reg .b32 %r<4>;
+    .shared .align 16 .b8 sm[256];
+    ld.param.u64 %rd1, [p];
+    ld.param.u64 %rd2, [h];
+    atom.global.cas.b128 %q0, [%rd1], %q1, %q2;
+    atom.exch.b128 %q3, [%rd1], %q1;
+    atom.relaxed.gpu.global.exch.b128 %q3, [%rd1+16], %q2;
+    atom.shared.cas.b128 %q0, [sm], %q1, %q2;
+    istypep.texref %p0, %rd2;
+    istypep.surfref %p1, %rd2;
+    istypep.samplerref %p1, %rd2;
+    mov.u32 %r1, sm;
+    st.bulk.weak.shared::cta [%r1], 64, 0;
+    st.bulk [%rd1], 256, 0;
+    st.bulk.shared::cta [%r1+64], %rd2, 0;
+    ret;
+}
+)");
+  VCHECK_EQ(m.entries.size(), size_t{1});
+}
+
+namespace {
+const char* kHeader100 = ".version 8.7\n.target sm_100\n.address_size 64\n";
+}  // namespace
+
+// atom.cas.b128 swaps all 16 bytes when both halves match, and returns the old
+// value either way; atom.exch.b128 always swaps.
+VTEST(atom_b128_cas_and_exch) {
+  const std::string ptx = std::string(kHeader90) + R"(
+.visible .entry k(.param .u64 p)
+{
+    .reg .b128 %q<4>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [p];
+    ld.global.b128 %q1, [%rd1+16];        // b: the new value
+    ld.global.b128 %q2, [%rd1+32];        // c: what is expected
+    atom.global.cas.b128 %q0, [%rd1], %q2, %q1;
+    st.global.b128 [%rd1+48], %q0;        // old
+    atom.global.cas.b128 %q3, [%rd1], %q2, %q1;
+    st.global.b128 [%rd1+64], %q3;        // no longer matches: unchanged
+    atom.global.exch.b128 %q3, [%rd1+80], %q2;
+    st.global.b128 [%rd1+96], %q3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t p = e.mem.alloc(128);
+  const uint64_t init[] = {0x1111, 0x2222,  0xAAAA, 0xBBBB,  0x1111, 0x2222,  0, 0,  0, 0,  0x5555, 0x6666};
+  e.mem.write(p, init, sizeof init);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(p)}, e.mem, e.prof);
+  uint64_t got[14];
+  e.mem.read(p, got, sizeof got);
+  // cas compares with b (%q2) and stores c (%q1); exch stores b.
+  VCHECK_EQ(got[6], uint64_t{0x1111});   // first cas returned the old value
+  VCHECK_EQ(got[7], uint64_t{0x2222});
+  VCHECK_EQ(got[0], uint64_t{0xAAAA});   // and stored b = %q1
+  VCHECK_EQ(got[1], uint64_t{0xBBBB});
+  VCHECK_EQ(got[8], uint64_t{0xAAAA});   // the second saw b, not c: no swap
+  VCHECK_EQ(got[9], uint64_t{0xBBBB});
+  VCHECK_EQ(got[10], uint64_t{0x1111});  // exch stored %q2
+  VCHECK_EQ(got[11], uint64_t{0x2222});
+  VCHECK_EQ(got[12], uint64_t{0x5555});  // and returned the old value
+  VCHECK_EQ(got[13], uint64_t{0x6666});
+}
+
+VTEST(atom_b128_refuses_what_the_isa_rules_out) {
+  auto parse = [](const char* header, const std::string& ins) {
+    return VCAPTURE(Error, ptx::parse(std::string(header) + ".visible .entry k() { .reg .b128 %q<3>; .reg .b64 %rd<2>; " +
+                                      ins + " ret; }\n"));
+  };
+  VCHECK_CONTAINS(parse(kHeader90, "atom.global.add.b128 %q0, [%rd1], %q1;").message(), ".exch and .cas only");
+  VCHECK_CONTAINS(parse(".version 8.3\n.target sm_86\n.address_size 64\n", "atom.global.exch.b128 %q0, [%rd1], %q1;")
+                      .message(),
+                  "sm_90");
+  const std::string ptx = std::string(kHeader90) +
+                          ".visible .entry k(.param .u64 p) { .reg .b128 %q<2>; .reg .b64 %rd<2>; ld.param.u64 %rd1, [p]; "
+                          "atom.global.exch.b128 %q0, [%rd1+8], %q1; ret; }\n";
+  Env e;
+  const uint64_t p = e.mem.alloc(64);
+  LaunchConfig cfg;
+  auto err = VCAPTURE(Error, exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(p)}, e.mem, e.prof));
+  VCHECK(err.code() == Err::MisalignedAccess);
+}
+
+// st.bulk zeroes exactly its bytes of shared memory; istypep is false for
+// every handle (as on an RTX 3060, for texture and surface objects alike).
+VTEST(st_bulk_zeroes_shared_memory_and_istypep_is_false) {
+  const std::string ptx = std::string(kHeader100) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .shared .align 16 .b8 sm[128];
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, sm;
+    mov.u32 %r2, 0;
+FILL:
+    add.u32 %r3, %r1, %r2;
+    st.shared.u32 [%r3], 0xEEEEEEEE;
+    add.u32 %r2, %r2, 4;
+    setp.lt.u32 %p1, %r2, 128;
+    @%p1 bra FILL;
+    add.u32 %r4, %r1, 16;
+    st.bulk.weak.shared::cta [%r4], 64, 0;
+    mov.u32 %r2, 0;
+COPY:
+    add.u32 %r3, %r1, %r2;
+    ld.shared.u32 %r5, [%r3];
+    cvt.u64.u32 %rd2, %r2;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r5;
+    add.u32 %r2, %r2, 4;
+    setp.lt.u32 %p1, %r2, 128;
+    @%p1 bra COPY;
+    istypep.texref %p0, %rd1;
+    selp.u32 %r6, 1, 0, %p0;
+    st.global.u32 [%rd1+128], %r6;
+    ret;
+}
+)";
+  Env e;
+  const uint64_t out = e.mem.alloc(132);
+  LaunchConfig cfg;
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint32_t i = 0; i < 32; ++i)
+    VCHECK_EQ(e.mem.load_scalar(out + 4 * i, 4), uint64_t{i >= 4 && i < 20 ? 0u : 0xEEEEEEEEu});
+  VCHECK_EQ(e.mem.load_scalar(out + 128, 4), uint64_t{0});
+  auto run_bad = [&](const std::string& ins) {
+    const std::string bad = std::string(kHeader100) + ".visible .entry k(.param .u64 g) { .reg .b64 %rd<2>; "
+                            ".shared .align 16 .b8 sm[64]; .reg .b32 %r<2>; mov.u32 %r1, sm; ld.param.u64 %rd1, [g]; " +
+                            ins + " ret; }\n";
+    return VCAPTURE(Error, exec::launch(ptx::parse(bad).entries[0], cfg, {arg_u64(out)}, e.mem, e.prof));
+  };
+  VCHECK_CONTAINS(run_bad("st.bulk.shared::cta [%r1], 12, 0;").message(), "multiple of 8");
+  VCHECK_CONTAINS(run_bad("st.bulk [%rd1], 16, 0;").message(), "outside shared memory");
 }
 
 // suld/sust's .clamp and .zero out-of-range policies (9.7.13.1-2), against
@@ -5020,6 +6015,447 @@ VTEST(tld4_gathers_the_footprint_like_hardware) {
   }
 }
 
+// Border colours, measured on an RTX 3060: a point fetch outside a 4x4
+// texture with border addressing returns cudaTextureDesc::borderColor
+// converted to the texture's format -- floats as they are, halves rounded
+// toward zero, normalized channels through a fixed-point form whose ties go
+// toward zero (0.5 on an 8-bit channel is 127/255), integer channels as the
+// float's low bits -- and 0 in every channel the format lacks.
+VTEST(tex_border_colour_as_the_card_converts_it) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.f32 %f5, 0fBF800000;
+    mov.f32 %f6, 0f3FC00000;
+    tex.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}];
+    st.global.v4.f32 [%rd3], {%f1, %f2, %f3, %f4};
+    tex.2d.v4.u32.f32 {%r1, %r2, %r3, %r4}, [%rd1, {%f5, %f6}];
+    st.global.v4.u32 [%rd3+16], {%r1, %r2, %r3, %r4};
+    tex.2d.v4.s32.f32 {%r1, %r2, %r3, %r4}, [%rd1, {%f5, %f6}];
+    st.global.v4.u32 [%rd3+32], {%r1, %r2, %r3, %r4};
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(48), data = e.mem.alloc(256);
+  const uint32_t b0[4] = {0x3e800000, 0xc0600000, 0x7149f2ca, 0x3f333333};   // 0.25, -3.5, 1e30, 0.7
+  const uint32_t b2[4] = {0x3f000000, 0x3b800000, 0x47c35000, 0xc0000000};   // 0.5, 2^-8, 100000, -2
+  const uint32_t bh[4] = {0x7f800001, 0x477ff000, 0x3effffff, 0xffc00001};   // sNaN, 65520, ..., -NaN
+  const struct {
+    ChannelKind kind;
+    uint32_t bits, channels;
+    bool norm;
+    const uint32_t* border;
+    int out;   // 0 f32, 1 u32, 2 s32
+    std::array<uint32_t, 4> want;
+  } cases[] = {
+      {ChannelKind::Float, 32, 4, false, b0, 0, {0x3e800000, 0xc0600000, 0x7149f2ca, 0x3f333333}},
+      {ChannelKind::Float, 32, 1, false, b0, 0, {0x3e800000, 0, 0, 0}},
+      {ChannelKind::Float, 16, 4, false, bh, 0, {0x7f802000, 0x477fe000, 0x3effe000, 0xffc00000}},
+      {ChannelKind::Unsigned, 8, 4, true, b0, 0, {0x3e808081, 0, 0x3f800000, 0x3f32b2b3}},
+      {ChannelKind::Unsigned, 8, 4, true, b2, 0, {0x3efefeff, 0x3b808081, 0x3f800000, 0}},
+      {ChannelKind::Signed, 8, 4, true, b2, 0, {0x3efdfbf8, 0, 0x3f800000, 0xbf800000}},
+      {ChannelKind::Unsigned, 16, 2, true, b2, 0, {0x3effff00, 0x3b800080, 0, 0}},
+      {ChannelKind::Signed, 16, 2, true, b0, 0, {0x3e800100, 0xbf800000, 0, 0}},
+      {ChannelKind::Unsigned, 8, 4, false, b0, 1, {0, 0, 0xca, 0x33}},
+      {ChannelKind::Signed, 8, 4, false, b0, 2, {0, 0, 0xffffffca, 0x33}},
+      {ChannelKind::Signed, 32, 4, false, b0, 2, {0x3e800000, 0xc0600000, 0x7149f2ca, 0x3f333333}},
+  };
+  for (const auto& c : cases) {
+    TextureTable tex;
+    TextureDesc d;
+    d.base = data;
+    d.width = 4;
+    d.height = 4;
+    d.kind = c.kind;
+    d.channels = c.channels;
+    for (uint32_t i = 0; i < 4; ++i) d.channel_bits[i] = i < c.channels ? c.bits : 0;
+    d.texel_bytes = c.bits / 8 * c.channels;
+    d.pitch_bytes = 4 * d.texel_bytes;
+    d.read_as_normalized_float = c.norm;
+    for (auto& a : d.address) a = TexAddress::Border;
+    std::memcpy(d.border_bits, c.border, 16);
+    tex[0x91] = d;
+    LaunchConfig cfg;
+    cfg.textures = &tex;
+    exec::launch(m.entries[0], cfg, {arg_u64(0x91), arg_u64(out)}, e.mem, e.prof);
+    std::array<uint32_t, 4> got{};
+    e.mem.read(out + 16 * c.out, got.data(), 16);
+    if (got != c.want)
+      std::fprintf(stderr, "  %u-bit x%u: %08x %08x %08x %08x, the card gave %08x %08x %08x %08x\n", c.bits,
+                   c.channels, got[0], got[1], got[2], got[3], c.want[0], c.want[1], c.want[2], c.want[3]);
+    VCHECK(got == c.want);
+  }
+}
+
+// The float blend of a linear fetch, measured on an RTX 3060: not an exact
+// sum -- each value is truncated toward zero to 2^(E - 27), E the largest
+// value's exponent -- and a result below the smallest normal float is
+// flushed, keeping its sign. Texels T at weight a, the border colour B at
+// 256 - a.
+VTEST(tex_linear_blend_as_the_card_rounds_it) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .f32 x, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f5, [x];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.f32 %f6, 0f3FC00000;
+    tex.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}];
+    st.global.f32 [%rd3], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(4), data = e.mem.alloc(64);
+  auto argf = [](float f) { std::vector<uint8_t> b(4); std::memcpy(b.data(), &f, 4); return b; };
+  const struct { uint32_t t, b; int a; uint32_t want; } cases[] = {
+      {0x40304000, 0x3dcccccd, 1, 0x3de207ff},   // 2.75, 0.1: the exact sum rounds to ...800
+      {0x40304000, 0x3dcccccd, 2, 0x3df74332},
+      {0xc1a00000, 0x3f7fffff, 1, 0x3f6afffe},   // -20, 1 - 2^-24
+      {0x00ffffff, 0x80000000, 0, 0x80000000},   // all border, -0
+      {0x80800000, 0x00000000, 1, 0x80000000},   // -2^-126 / 256, flushed
+      {0x3dcccccd, 0x40304000, 255, 0x3de207ff},  // the same with the roles swapped
+  };
+  for (const auto& c : cases) {
+    std::vector<uint32_t> t(16, c.t);
+    e.mem.write(data, t.data(), 64);
+    TextureTable tex;
+    TextureDesc d;
+    d.base = data;
+    d.width = 4;
+    d.height = 4;
+    d.pitch_bytes = 16;
+    d.kind = ChannelKind::Float;
+    d.channel_bits[0] = 32;
+    d.texel_bytes = 4;
+    d.filter = TexFilter::Linear;
+    for (auto& a : d.address) a = TexAddress::Border;
+    d.border_bits[0] = c.b;
+    tex[0x92] = d;
+    LaunchConfig cfg;
+    cfg.textures = &tex;
+    exec::launch(m.entries[0], cfg, {arg_u64(0x92), argf(c.a / 256.0f - 0.5f), arg_u64(out)}, e.mem, e.prof);
+    VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{c.want});
+  }
+}
+
+// tld4 on an RTX 3060: a NaN comes out as 0x7fffffff, a subnormal float as
+// 0, and a signed 8-bit normalized texel as its 16-bit form over 32767 (64 is
+// 16513/32767, -64 is -16512/32767).
+VTEST(tld4_border_nan_subnormal_and_snorm8_as_the_card_gathers) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .f32 x, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    ld.param.f32 %f5, [x];
+    mov.f32 %f6, %f5;
+    tld4.r.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}];
+    st.global.v4.f32 [%rd3], {%f1, %f2, %f3, %f4};
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16), data = e.mem.alloc(64);
+  const int8_t s8[4] = {64, -64, 64, -64};   // (0,0) (1,0) / (0,1) (1,1)
+  e.mem.write(data, s8, 4);
+  auto run = [&](const TextureDesc& d, float x) {
+    TextureTable tex;
+    tex[0x93] = d;
+    LaunchConfig cfg;
+    cfg.textures = &tex;
+    std::vector<uint8_t> xa(4);
+    std::memcpy(xa.data(), &x, 4);
+    exec::launch(m.entries[0], cfg, {arg_u64(0x93), xa, arg_u64(out)}, e.mem, e.prof);
+    std::array<uint32_t, 4> got{};
+    e.mem.read(out, got.data(), 16);
+    return got;
+  };
+  // Far outside a border-addressed float texture: all four taps are border.
+  TextureDesc f;
+  f.base = data;
+  f.width = 1;
+  f.height = 1;
+  f.kind = ChannelKind::Float;
+  f.channel_bits[0] = 32;
+  f.texel_bytes = 4;
+  for (auto& a : f.address) a = TexAddress::Border;
+  f.border_bits[0] = 0x7fc00000;
+  const std::array<uint32_t, 4> nan{0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
+  VCHECK(run(f, -5.0f) == nan);
+  f.border_bits[0] = 0x00000001;
+  VCHECK(run(f, -5.0f) == (std::array<uint32_t, 4>{0, 0, 0, 0}));
+  TextureDesc n;
+  n.base = data;
+  n.width = 2;
+  n.height = 2;
+  n.pitch_bytes = 2;
+  n.kind = ChannelKind::Signed;
+  n.channel_bits[0] = 8;
+  n.texel_bytes = 1;
+  n.read_as_normalized_float = true;
+  // (i, j+1), (i+1, j+1), (i+1, j), (i, j) at x = y = 1: 64, -64, -64, 64.
+  VCHECK(run(n, 1.0f) == (std::array<uint32_t, 4>{0x3f010302, 0xbf010102, 0xbf010102, 0x3f010302}));
+}
+
+// A mipmapped texture's coordinates are normalized even when the descriptor
+// says otherwise, and wrap still acts as clamp (measured: x = 0.25 on an
+// 8-wide level 0 reads texel 2; x = 1.25 reads the last).
+VTEST(tex_mipmapped_coordinates_are_normalized_regardless) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .f32 x, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f6, [x];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.f32 %f5, 0f00000000;
+    mov.f32 %f7, 0f3DCCCCCD;
+    tex.level.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f6, %f7}], %f5;
+    st.global.f32 [%rd3], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(4);
+  TextureDesc d;
+  d.width = 8;
+  d.height = 8;
+  d.kind = ChannelKind::Float;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.pitch_bytes = 32;
+  d.mip_levels = 2;
+  d.address[0] = d.address[1] = TexAddress::Wrap;
+  for (uint32_t l = 0; l < 2; ++l) {
+    const uint32_t w = 8 >> l;
+    d.level_base[l] = e.mem.alloc(w * w * 4);
+    std::vector<float> t(w * w);
+    for (uint32_t i = 0; i < w * w; ++i) t[i] = static_cast<float>(i % w);
+    e.mem.write(d.level_base[l], t.data(), w * w * 4);
+  }
+  d.base = d.level_base[0];
+  TextureTable tex;
+  tex[0x94] = d;
+  LaunchConfig cfg;
+  cfg.textures = &tex;
+  auto argf = [](float f) { std::vector<uint8_t> b(4); std::memcpy(b.data(), &f, 4); return b; };
+  for (auto [x, want] : {std::pair{0.25f, 2.0f}, {0.75f, 6.0f}, {1.25f, 7.0f}}) {
+    exec::launch(m.entries[0], cfg, {arg_u64(0x94), argf(x), arg_u64(out)}, e.mem, e.prof);
+    VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), want);
+  }
+}
+
+// A mipmapped layered texture: every level has all the layers, each of that
+// level's size, so a layer is found afresh in whichever level the fetch
+// lands on.
+VTEST(tex_mipmapped_layered_reads_each_levels_own_layer) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.u32 %r1, 2;
+    mov.f32 %f5, 0f3F400000;
+    mov.f32 %f6, 0f3E800000;
+    mov.f32 %f7, 0f3F800000;
+    tex.level.a2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%r1, %f5, %f6, %f6}], %f7;
+    st.global.f32 [%rd3], %f1;
+    mov.f32 %f7, 0f00000000;
+    tex.level.a2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%r1, %f5, %f6, %f6}], %f7;
+    st.global.f32 [%rd3+4], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(8);
+  TextureDesc d;
+  d.width = 4;
+  d.height = 4;
+  d.layers = 3;
+  d.kind = ChannelKind::Float;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.pitch_bytes = 16;
+  d.normalized_coords = true;
+  d.mip_levels = 2;
+  d.mip_max = 256;
+  for (uint32_t l = 0; l < 2; ++l) {
+    const uint32_t w = 4 >> l;
+    d.level_base[l] = e.mem.alloc(w * w * 3 * 4);
+    std::vector<float> t(w * w * 3);
+    for (uint32_t i = 0; i < t.size(); ++i) t[i] = static_cast<float>(100 * l + 10 * (i / (w * w)) + i % (w * w));
+    e.mem.write(d.level_base[l], t.data(), t.size() * 4);
+  }
+  d.base = d.level_base[0];
+  TextureTable tex;
+  tex[0x95] = d;
+  LaunchConfig cfg;
+  cfg.textures = &tex;
+  exec::launch(m.entries[0], cfg, {arg_u64(0x95), arg_u64(out)}, e.mem, e.prof);
+  // (0.75, 0.25): level 1 (2x2) texel (1, 0); level 0 (4x4) texel (3, 1).
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), 121.0f);
+  VCHECK_EQ(as_f32(e.mem.load_scalar(out + 4, 4)), 27.0f);
+}
+
+// Point sampling a cubemap clamps to the face whatever the address mode --
+// but a mipmapped cubemap applies the mode (measured on an RTX 3060: the
+// direction (1, -1.92, -1.92) lands on the -z face at t = 1.0, and wrap
+// reads row 0 where clamp reads the last row).
+VTEST(tex_mipmapped_cubemap_point_sampling_applies_the_address_mode) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .u64 out)
+{
+    .reg .f32 %f<10>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.f32 %f5, 0f3F800000;
+    mov.f32 %f6, 0fBFF5C290;
+    mov.f32 %f7, 0f00000000;
+    tex.level.cube.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6, %f6, %f6}], %f7;
+    st.global.f32 [%rd3], %f1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(4);
+  TextureDesc d;
+  d.width = 8;
+  d.height = 8;
+  d.cubemap = true;
+  d.kind = ChannelKind::Float;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.pitch_bytes = 32;
+  d.normalized_coords = true;
+  d.mip_levels = 1;
+  d.level_base[0] = e.mem.alloc(8 * 8 * 6 * 4);
+  std::vector<float> t(8 * 8 * 6);
+  for (uint32_t i = 0; i < t.size(); ++i) t[i] = static_cast<float>(i);
+  e.mem.write(d.level_base[0], t.data(), t.size() * 4);
+  d.base = d.level_base[0];
+  // Face 5 (-z), s = (1/1.92 ... ) -> column 1; t = 1.0 -> row 0 wrapped, 7 clamped.
+  for (auto [mode, want] : {std::pair{TexAddress::Wrap, 5 * 64 + 0 * 8 + 1}, {TexAddress::Clamp, 5 * 64 + 7 * 8 + 1}}) {
+    TextureDesc v = d;
+    for (auto& a : v.address) a = mode;
+    TextureTable tex;
+    tex[0x96] = v;
+    LaunchConfig cfg;
+    cfg.textures = &tex;
+    exec::launch(m.entries[0], cfg, {arg_u64(0x96), arg_u64(out)}, e.mem, e.prof);
+    VCHECK_EQ(as_f32(e.mem.load_scalar(out, 4)), static_cast<float>(want));
+  }
+}
+
+// sRGB textures, measured on an RTX 3060: an 8-bit unsigned normalized
+// texel's colour channels (x, y and z of four, x of one or two) decode
+// through the texture unit's table, not the sRGB formula (code 1 is
+// 20/65536, 128 is 14144/65536); alpha and other formats are left alone. A
+// linear blend truncates each table value below the block exponent of the
+// largest (code 11 vanishes next to 184) and rounds to a half's precision;
+// a border colour is encoded to the nearest code and decoded like a texel.
+VTEST(tex_srgb_as_the_card_decodes_it) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .f32 x, .param .u64 out)
+{
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    ld.param.f32 %f5, [x];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.f32 %f6, 0f3F800000;
+    tex.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}];
+    st.global.v4.f32 [%rd3], {%f1, %f2, %f3, %f4};
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16), data = e.mem.alloc(64);
+  auto argf = [](float f) { std::vector<uint8_t> b(4); std::memcpy(b.data(), &f, 4); return b; };
+  auto run = [&](TextureDesc d, float x) {
+    d.base = data;
+    d.width = 2;
+    d.height = 2;
+    d.srgb = true;
+    TextureTable tex;
+    tex[0x97] = d;
+    LaunchConfig cfg;
+    cfg.textures = &tex;
+    exec::launch(m.entries[0], cfg, {arg_u64(0x97), argf(x), arg_u64(out)}, e.mem, e.prof);
+    std::array<uint32_t, 4> got{};
+    e.mem.read(out, got.data(), 16);
+    return got;
+  };
+  auto texels = [&](std::initializer_list<uint8_t> row) {   // two rows alike
+    std::vector<uint8_t> b(row);
+    b.insert(b.end(), row);
+    e.mem.write(data, b.data(), b.size());
+  };
+  TextureDesc u4;
+  u4.kind = ChannelKind::Unsigned;
+  u4.channels = 4;
+  for (auto& b : u4.channel_bits) b = 8;
+  u4.texel_bytes = 4;
+  u4.pitch_bytes = 8;
+  u4.read_as_normalized_float = true;
+  texels({128, 1, 255, 128, 128, 1, 255, 128});
+  VCHECK(run(u4, 0.5f) == (std::array<uint32_t, 4>{0x3e5d0000, 0x39a00000, 0x3f800000, 0x3f008081}));
+  TextureDesc u2 = u4;
+  u2.channels = 2;
+  u2.channel_bits[2] = u2.channel_bits[3] = 0;
+  u2.texel_bytes = 2;
+  u2.pitch_bytes = 4;
+  texels({128, 128, 128, 128});
+  VCHECK(run(u2, 0.5f) == (std::array<uint32_t, 4>{0x3e5d0000, 0x3f008081, 0, 0}));
+  TextureDesc s4 = u4;
+  s4.kind = ChannelKind::Signed;
+  texels({128, 128, 128, 128, 128, 128, 128, 128});
+  VCHECK(run(s4, 0.5f) == (std::array<uint32_t, 4>{0xbf800000, 0xbf800000, 0xbf800000, 0xbf800000}));
+  // Linear blends at x = 0.5 + a/256: weight a on the second texel.
+  TextureDesc lin = u4;
+  lin.filter = TexFilter::Linear;
+  texels({200, 11, 0, 0, 50, 184, 0, 0});
+  auto got = run(lin, 0.5f + 255 / 256.0f);
+  VCHECK_EQ(got[0], 0x3d08c000u);   // 0.03339, not the table values' exact blend, 0.03412: code 50 counts as 1/32 next to 200
+  got = run(lin, 0.5f + 1 / 256.0f);
+  VCHECK_EQ(got[1], 0x3af60000u);   // code 11 counts as 0 next to 184
+  // The border colour (0.6, 0.3333, 0.99, 0.01) outside the texture.
+  TextureDesc b = u4;
+  for (auto& a : b.address) a = TexAddress::Border;
+  const uint32_t bc[4] = {0x3f19999a, 0x3eaaa64c, 0x3f7d70a4, 0x3c23d70a};
+  std::memcpy(b.border_bits, bc, 16);
+  VCHECK(run(b, -1.0f) == (std::array<uint32_t, 4>{0x3f190000, 0x3eaa0000, 0x3f7e0000, 0x3c008081}));
+}
+
 VTEST(a_texture_handle_used_as_a_surface_is_refused) {
   // The two have the same shape of handle and are not interchangeable.
   std::string ptx = std::string(kHeader) + R"(
@@ -5671,7 +7107,7 @@ VTEST(cvt_float_to_64bit_int_saturates_at_the_limits) {
   VCHECK_EQ(e.mem.load_scalar(out + 16, 8), 0xffffffffffffffffull);   // +inf -> u64 max
   VCHECK_EQ(e.mem.load_scalar(out + 24, 8), 0xffffffffffffffffull);   // 2^64 -> u64 max
   VCHECK_EQ(e.mem.load_scalar(out + 32, 8), 0x8000000000000000ull);   // -inf -> s64 min
-  VCHECK_EQ(e.mem.load_scalar(out + 40, 8), 0ull);                    // NaN -> 0
+  VCHECK_EQ(e.mem.load_scalar(out + 40, 8), 0x8000000000000000ull);   // NaN -> the sign bit (an RTX 3060)
 }
 
 // Malformed PTX gets a precise parse error, never a crash, a wrong register or
@@ -6418,6 +7854,122 @@ STORE:
   }
   unsetenv("VGPU_FASTPATH");
   unsetenv("VGPU_THREADS");
+}
+
+// Diverged paths that each make a device call through the same slot names
+// (param0, retval0). Lane 1 loops through a call; lane 0 waits at a higher pc
+// until the starvation boost runs it for 256 instructions, after `pad` others.
+// Across these pads the boost ends between lane 0's st.param and its call, and
+// between its call and its ld.param. A declaration used to clear the slot for
+// the whole warp, and a return to overwrite it for the whole warp, so lane 0's
+// argument or lane 1's pending result was lost. An RTX 3060 runs every pad to
+// 42 and 3998000 (the sum of 2*i for i below 2000).
+VTEST(diverged_calls_keep_each_lanes_call_slots) {
+  for (int pad = 248; pad <= 260; ++pad) {
+    std::string padding;
+    for (int i = 0; i < pad; ++i) padding += "    add.u32 %r9, %r9, 1;\n";
+    std::string ptx = std::string(kHeader) + R"(
+.func (.param .b32 r) twice(.param .b32 v)
+{
+    .reg .b32 %t<3>;
+    ld.param.b32 %t1, [v];
+    shl.b32 %t2, %t1, 1;
+    st.param.b32 [r], %t2;
+    ret;
+}
+.visible .entry k(.param .u64 out)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd2, %rd2, %rd3;
+    mov.u32 %r9, 0;
+    mov.u32 %r7, 0;
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 bra XPATH;
+    mov.u32 %r5, 0;
+YLOOP:
+    {
+    .param .b32 param0;
+    st.param.b32 [param0], %r5;
+    .param .b32 retval0;
+    call.uni (retval0), twice, (param0);
+    ld.param.b32 %r6, [retval0];
+    }
+    add.u32 %r7, %r7, %r6;
+    add.u32 %r5, %r5, 1;
+    setp.lt.u32 %p2, %r5, 2000;
+    @%p2 bra YLOOP;
+    bra.uni DONE;
+XPATH:
+)" + padding + R"(
+    {
+    .param .b32 param0;
+    st.param.b32 [param0], 21;
+    .param .b32 retval0;
+    call.uni (retval0), twice, (param0);
+    ld.param.b32 %r7, [retval0];
+    }
+DONE:
+    st.global.u32 [%rd2], %r7;
+    ret;
+}
+)";
+    Env e;
+    auto m = ptx::parse(ptx);
+    uint64_t out = e.mem.alloc(8);
+    LaunchConfig cfg;
+    cfg.block = {2, 1, 1};
+    exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+    VCHECK_EQ(e.mem.load_scalar(out, 4), 42ull);
+    VCHECK_EQ(e.mem.load_scalar(out + 4, 4), 3998000ull);
+  }
+}
+
+// Lane 0 loops long enough to count as starved, then writes a word; lanes
+// 1-31 wait at bar.warp.sync (__syncwarp) and read it. cooperative_groups'
+// multi-warp tiles are this shape. A starved path gets to run ahead, and it
+// used to run straight past bar.warp.sync without lane 0 and read the word
+// before it was written.
+VTEST(bar_warp_sync_waits_for_its_lanes_even_after_a_long_wait) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<4>;
+    .shared .align 4 .b32 word;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    setp.ne.u32 %p1, %r1, 0;
+    @%p1 bra WAIT;
+    mov.u32 %r3, 0;
+LOOP:
+    add.u32 %r3, %r3, 1;
+    setp.lt.u32 %p2, %r3, 3000;
+    @%p2 bra LOOP;
+    st.volatile.shared.u32 [word], %r3;
+WAIT:
+    bar.warp.sync -1;
+    ld.volatile.shared.u32 %r2, [word];
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint64_t lane = 0; lane < 32; ++lane) VCHECK_EQ(e.mem.load_scalar(out + lane * 4, 4), uint64_t{3000});
 }
 
 VTEST_MAIN

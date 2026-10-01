@@ -1,6 +1,7 @@
 // The CUDA runtime API's documented behaviour at its edges, on a simulated
 // 2 x Tesla T4. Each check was written from the documentation, and the ones
 // marked with a note used to disagree with it.
+#include <cuda.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -60,6 +61,8 @@ int main() {
   std::memset(&a, 0xff, sizeof a);
   CHECK("attributes: malloc is unregistered", cudaPointerGetAttributes(&a, host) == cudaSuccess &&
                                                  a.type == cudaMemoryTypeUnregistered, "type %d", (int)a.type);
+  CHECK("attributes: malloc belongs to no device", a.device == cudaInvalidDeviceId && a.devicePointer == nullptr &&
+                                                      a.hostPointer == host, "device %d", a.device);
   int* pinned = nullptr;
   cudaHostAlloc(&pinned, 64 * sizeof(int), 0);
   std::memset(&a, 0xff, sizeof a);
@@ -374,11 +377,74 @@ int main() {
     e = cudaMemcpyToSymbol(table, managed, 16, 0, cudaMemcpyDeviceToDevice);
     cudaMemcpyFromSymbol(got, table, 16);
     CHECK("cudaMemcpyToSymbol DeviceToDevice from managed memory", e == cudaSuccess && got[3] == 4, "got %d %s, value %d", e, cudaGetErrorName(e), got[3]);
+    // cudaMemset follows the same rule.
+    e = cudaMemset(managed, 7, 16);
+    CHECK("cudaMemset on managed memory", e == cudaSuccess && managed[3] == 0x07070707, "got %d %s", e, cudaGetErrorName(e));
+    e = cudaMemsetAsync(pinned + 1, 0, 8, 0);
+    cudaStreamSynchronize(0);
+    CHECK("cudaMemsetAsync on pinned memory", e == cudaSuccess && pinned[0] == 1 && pinned[2] == 0 && pinned[3] == 4,
+          "got %d %s", e, cudaGetErrorName(e));
+    e = cudaMemset(regd, 0, 16);
+    CHECK("cudaMemset on cudaHostRegister'd memory -> invalid value", e == cudaErrorInvalidValue, "got %d %s", e, cudaGetErrorName(e));
+    cudaGetLastError();
     cudaHostUnregister(regd);
     std::free(regd);
     cudaFree(managed);
     cudaFreeHost(pinned);
     cudaFree(dev);
+  }
+
+  // A driver function outside the runtime, fetched the way NanoVDB fetches
+  // cuMemGetAllocationGranularity and then calls without checking for null;
+  // and a name the driver does not have, which is not found. Not under
+  // AddressSanitizer: fetching it loads the simulator's libcuda beside its
+  // libcudart, two copies of the core that ASan refuses as an ODR violation
+  // (the reason run_mixed_apis.sh skips sanitizer builds).
+#ifndef __SANITIZE_ADDRESS__
+  {
+    void* fn = nullptr;
+    cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;
+#if CUDART_VERSION >= 12050
+    e = cudaGetDriverEntryPointByVersion("cuMemGetAllocationGranularity", &fn, 12000, cudaEnableDefault, &q);
+#else
+    e = cudaGetDriverEntryPoint("cuMemGetAllocationGranularity", &fn, cudaEnableDefault, &q);
+#endif
+    size_t granularity = 0;
+    if (e == cudaSuccess && fn) {
+      CUmemAllocationProp prop = {};
+      prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+      prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      prop.location.id = 0;
+      using Granularity = CUresult (*)(size_t*, const CUmemAllocationProp*, CUmemAllocationGranularity_flags);
+      reinterpret_cast<Granularity>(fn)(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+    }
+    CHECK("cuMemGetAllocationGranularity through the driver entry point",
+          e == cudaSuccess && q == cudaDriverEntryPointSuccess && granularity > 0,
+          "got %d %s, status %d, granularity %zu", e, cudaGetErrorName(e), (int)q, granularity);
+    fn = &granularity;
+#if CUDART_VERSION >= 12050
+    e = cudaGetDriverEntryPointByVersion("cuNoSuchFunction", &fn, 12000, cudaEnableDefault, &q);
+#else
+    e = cudaGetDriverEntryPoint("cuNoSuchFunction", &fn, cudaEnableDefault, &q);
+#endif
+    CHECK("a driver function that does not exist is not found",
+          e == cudaSuccess && fn == nullptr && q == cudaDriverEntryPointSymbolNotFound,
+          "got %d %s, status %d", e, cudaGetErrorName(e), (int)q);
+  }
+#endif
+
+  // A 2D copy whose rows are wider than a pitch is refused, on either side, as
+  // an RTX 3060 refuses it; cublasSetMatrix with ld < rows reports it.
+  {
+    char hbuf[64] = {0};
+    char* dbuf = nullptr;
+    cudaMalloc(&dbuf, 64);
+    e = cudaMemcpy2D(dbuf, 8, hbuf, 16, 16, 2, cudaMemcpyHostToDevice);
+    CHECK("cudaMemcpy2D destination pitch below the width -> invalid pitch", e == cudaErrorInvalidPitchValue, "got %d %s", e, cudaGetErrorName(e));
+    e = cudaMemcpy2D(dbuf, 16, hbuf, 8, 16, 2, cudaMemcpyHostToDevice);
+    CHECK("cudaMemcpy2D source pitch below the width -> invalid pitch", e == cudaErrorInvalidPitchValue, "got %d %s", e, cudaGetErrorName(e));
+    cudaGetLastError();
+    cudaFree(dbuf);
   }
 
   // Cache preferences: accepted for a kernel, refused for anything else, and the
@@ -394,6 +460,31 @@ int main() {
     cudaError_t e2 = cudaDeviceGetCacheConfig(&c);
     CHECK("cudaDeviceSetCacheConfig reads back", e == cudaSuccess && e2 == cudaSuccess && c == cudaFuncCachePreferShared,
           "got %d %d, reads %d", e, e2, (int)c);
+  }
+
+  // The stream-ordered allocator is implemented, so memory pools are reported,
+  // as an RTX 3060 reports them; and what one device can do with another's
+  // memory, where a device asked about itself (or one that does not exist) is
+  // an invalid device, as the card answers.
+  {
+    int v = -1;
+    e = cudaDeviceGetAttribute(&v, cudaDevAttrMemoryPoolsSupported, 0);
+    CHECK("memory pools supported", e == cudaSuccess && v == 1, "got %d %s, value %d", e, cudaGetErrorName(e), v);
+    // Concurrent managed access is answered (1 on Linux, 0 on Windows and WSL,
+    // so only the answer is checked); NanoVDB filters devices on it.
+    v = -1;
+    e = cudaDeviceGetAttribute(&v, cudaDevAttrConcurrentManagedAccess, 0);
+    CHECK("concurrent managed access is answered", e == cudaSuccess && (v == 0 || v == 1), "got %d %s, value %d", e, cudaGetErrorName(e), v);
+    v = -1;
+    e = cudaDeviceGetP2PAttribute(&v, cudaDevP2PAttrAccessSupported, 0, 1);
+    CHECK("P2P access supported between two devices", e == cudaSuccess && v == 1, "got %d %s, value %d", e, cudaGetErrorName(e), v);
+    e = cudaDeviceGetP2PAttribute(&v, cudaDevP2PAttrPerformanceRank, 1, 0);
+    CHECK("P2P performance rank", e == cudaSuccess && v == 0, "got %d %s, value %d", e, cudaGetErrorName(e), v);
+    e = cudaDeviceGetP2PAttribute(&v, cudaDevP2PAttrAccessSupported, 0, 0);
+    CHECK("P2P attribute of a device with itself -> invalid device", e == cudaErrorInvalidDevice, "got %d %s", e, cudaGetErrorName(e));
+    e = cudaDeviceGetP2PAttribute(&v, cudaDevP2PAttrAccessSupported, 0, 7);
+    CHECK("P2P attribute with no such device -> invalid device", e == cudaErrorInvalidDevice, "got %d %s", e, cudaGetErrorName(e));
+    cudaGetLastError();
   }
 
   // A managed buffer freed with another device current is gone from every

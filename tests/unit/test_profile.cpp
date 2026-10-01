@@ -18,7 +18,7 @@ VTEST(registry_lists_all_gpus) {
   auto ids = vgpu::available_gpus();
   const std::vector<std::string> expected = {
       "nvidia/a10",   "nvidia/a100", "nvidia/h100",   "nvidia/h200",
-      "nvidia/b200",  "nvidia/rtx5090", "nvidia/rtx3060", "nvidia/rtx3080ti", "nvidia/a100-sxm4-40gb",
+      "nvidia/b200",  "nvidia/b300",  "nvidia/rtx5090", "nvidia/rtx3060", "nvidia/rtx3080ti", "nvidia/a100-sxm4-40gb",
       "nvidia/gh200-480gb", "nvidia/h100-pcie", "nvidia/t4", "nvidia/a10g",
       "nvidia/l4", "nvidia/l40s",
       "amd/mi250x", "amd/mi300x", "amd/mi325x", "amd/mi350x", "amd/rx7900xtx", "amd/rx9070xt",
@@ -75,6 +75,26 @@ VTEST(every_amd_profile_has_hips_limits) {
     for (int d = 0; d < 3; ++d) VCHECK(l.max_grid_dim[d] > 0);
   }
   VCHECK(amd >= 6);
+}
+
+// The driver keeps 1 KiB of every block's shared memory from compute
+// capability 8.0, and that is exactly what separates each measured card's
+// per-SM shared memory from its per-block opt-in; before 8.0 the two agree.
+// cudaDevAttrReservedSharedMemoryPerBlock and occupancy arithmetic rely on it.
+VTEST(every_nvidia_profile_reserves_what_separates_sm_from_block_shared_memory) {
+  int nvidia = 0;
+  for (const auto& id : vgpu::available_gpus()) {
+    const DeviceProfile p = vgpu::load_gpu(id);
+    if (p.vendor != "nvidia") continue;
+    ++nvidia;
+    VCHECK_EQ(p.reserved_smem_per_block(), p.cc_major >= 8 ? 1024u : 0u);
+    VCHECK_EQ(p.limits.shared_mem_per_sm - p.limits.shared_mem_per_block_optin, p.reserved_smem_per_block());
+  }
+  VCHECK(nvidia >= 10);
+  for (const auto& id : vgpu::available_gpus()) {
+    const DeviceProfile p = vgpu::load_gpu(id);
+    if (p.vendor == "amd") VCHECK_EQ(p.reserved_smem_per_block(), 0u);
+  }
 }
 
 VTEST(h100_profile_values) {
