@@ -154,6 +154,13 @@ struct DispatchStats {
 // larger than it allows, or more LDS than the device has).
 DispatchStats execute(const Dispatch& d, MemoryManager& mem);
 
+// The process is exiting: every dispatch still running stops within a few
+// thousand instructions a wave, throwing Err::DeviceLost, and none starts.
+// A card abandons a kernel the process leaves behind; here its thread must
+// stop before the process's static objects, which it reads, are destroyed.
+void abandon_dispatches();
+bool dispatches_abandoned();
+
 // The lock a device read-modify-write at this address takes while work-groups
 // run on several threads -- what the host takes too when it changes memory a
 // kernel changes with atomics (vgpu/amd_hostcall.hpp).

@@ -5866,7 +5866,13 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
 // hardware interleaves the waves of groups resident together: a wave polling
 // memory for another group's write, with no s_sleep in its loop, gives the
 // other group its turn.
+std::atomic<bool> g_abandoned{false};
+[[noreturn]] void abandon() {
+  throw Error::make(Err::DeviceLost, "the process is exiting, and the dispatch was abandoned");
+}
+
 bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
+  if (g_abandoned.load(std::memory_order_relaxed)) abandon();
   bool runnable = false;
   for (Wave& w : group.waves) {
     if (w.done || w.at_barrier) continue;
@@ -5876,6 +5882,7 @@ bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
       for (uint64_t n = 0; m.step(w, group); ++n) {
         pc = w.pc;
         if (slice && n + 1 >= slice) break;
+        if ((n & 4095) == 4095 && g_abandoned.load(std::memory_order_relaxed)) abandon();
       }
     } catch (const Error& e) {
       throw m.at_instruction(e, pc);
@@ -5961,7 +5968,11 @@ std::mutex& memory_atomic_lock(uint64_t addr) {
   return locks[(addr >> 2) % locks.size()];
 }
 
+void abandon_dispatches() { g_abandoned.store(true); }
+bool dispatches_abandoned() { return g_abandoned.load(); }
+
 DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
+  if (g_abandoned.load(std::memory_order_relaxed)) abandon();
   if (!d.object || !d.kernel) throw Error::make(Err::InvalidValue, "a dispatch needs a kernel");
   const Kernel& k = *d.kernel;
   // A wave is 64 lanes on CDNA. An RDNA kernel says in its descriptor

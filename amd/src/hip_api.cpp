@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <vector>
 
@@ -931,6 +932,8 @@ hipError_t run_launch(const LaunchJob& job) {
     const double clock = mhz ? mhz * 1e6 : 1e9;
     d.note_busy(static_cast<double>(stats.instructions) / clock);
   } catch (const std::exception& e) {
+    // The process is exiting (stop_work_at_exit): nothing to say.
+    if (vgpu::amd::dispatches_abandoned()) return hipErrorLaunchFailure;
     // A launch that failed counted nothing, and the profiler is told so.
     if (prof && prof->launched && start) prof->launched(launch, nullptr, start, vgpu::amd::hipprof::now_ns(), token);
     for (uint64_t a : {job.kernarg_at ? 0 : kernarg, grid_sync})
@@ -946,7 +949,50 @@ hipError_t run_launch(const LaunchJob& job) {
 }
 
 // A prepared launch, run in its stream's order.
+// At exit, before the shim's static objects (its modules, their code and
+// decode caches among them) are destroyed: a kernel still running on a
+// stream's thread reads them. A card abandons the work a process leaves
+// behind; so does this. Every dispatch stops (vgpu::amd::abandon_dispatches),
+// and the streams' threads are given a few seconds to finish what they hold
+// -- not the one exit is called on, nor one that holds the lock -- after which
+// exit goes on regardless.
+//
+// When it runs matters: the decoder's tables and much else are made lazily,
+// as the first kernel runs, and exit destroys what was made last first. The
+// main thread's thread_local objects go before any of it, so a guard there
+// (made at its first launch) is the hook; an atexit handler, registered at
+// the first launch too, covers exit called from another thread.
+void stop_work_at_exit() {
+  vgpu::amd::abandon_dispatches();
+  State& s = state();
+  std::vector<std::shared_ptr<Queue>> qs;
+  {
+    std::unique_lock<std::mutex> lock(s.mutex, std::defer_lock);
+    for (int i = 0; i < 100 && !lock.try_lock(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (!lock.owns_lock()) return;
+    for (auto& [device, q] : s.null_queues)
+      if (q) qs.push_back(q);
+    for (auto& [handle, st] : s.streams)
+      if (st.queue) qs.push_back(st.queue);
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  for (const auto& q : qs)
+    if (!q->on_worker() && !q->wait_until(q->tail(), deadline)) return;
+}
+
+struct MainThreadExitGuard {
+  ~MainThreadExitGuard() {
+    if (static_cast<pid_t>(syscall(SYS_gettid)) == getpid()) stop_work_at_exit();
+  }
+};
+
 hipError_t launch_in_order(LaunchJob job) {
+  static const bool at_exit = (std::atexit(stop_work_at_exit), true);
+  (void)at_exit;
+  if (static_cast<pid_t>(syscall(SYS_gettid)) == getpid()) {
+    thread_local MainThreadExitGuard guard;
+    (void)guard;
+  }
   const hipStream_t stream = job.stream;
   return in_order(stream, [job = std::move(job)] { return run_launch(job); });
 }
