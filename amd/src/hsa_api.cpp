@@ -605,7 +605,7 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
     case HSA_AGENT_INFO_QUEUE_MIN_SIZE: put<uint32_t>(value, is_gpu ? 64 : 0); break;
     case HSA_AGENT_INFO_QUEUE_MAX_SIZE: put<uint32_t>(value, is_gpu ? 131072 : 0); break;
     case HSA_AGENT_INFO_QUEUE_TYPE: put<uint32_t>(value, HSA_QUEUE_TYPE_MULTI); break;
-    case HSA_AGENT_INFO_NODE: put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(gpu + 1) : 0); break;
+    case HSA_AGENT_INFO_NODE: put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(shared::physical(gpu) + 1) : 0); break;
     case HSA_AGENT_INFO_DEVICE: put<uint32_t>(value, is_gpu ? HSA_DEVICE_TYPE_GPU : HSA_DEVICE_TYPE_CPU); break;
     case HSA_AGENT_INFO_CACHE_SIZE: {
       uint32_t sizes[4] = {0, 0, 0, 0};
@@ -661,9 +661,13 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
     case HSA_AMD_AGENT_INFO_MAX_CLOCK_FREQUENCY:
       put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(shared::profile(gpu).telemetry.sm_clock_max_mhz) : 0);
       break;
-    case HSA_AMD_AGENT_INFO_DRIVER_NODE_ID: put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(gpu + 1) : 0); break;
+    case HSA_AMD_AGENT_INFO_DRIVER_NODE_ID:
+      put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(shared::physical(gpu) + 1) : 0);
+      break;
     // The PCI location: bus ordinal + 1, device 0, function 0, as HIP reports it.
-    case HSA_AMD_AGENT_INFO_BDFID: put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(gpu + 1) << 8 : 0); break;
+    case HSA_AMD_AGENT_INFO_BDFID:
+      put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(shared::physical(gpu) + 1) << 8 : 0);
+      break;
     case HSA_AMD_AGENT_INFO_DOMAIN: put<uint32_t>(value, 0); break;
     case HSA_AMD_AGENT_INFO_PRODUCT_NAME:
       put_string(value, is_gpu ? shared::profile(gpu).model : "VirtualGPU host CPU", 64);
@@ -673,7 +677,7 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
     case HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES: put<bool>(value, is_gpu); break;
     case HSA_AMD_AGENT_INFO_UUID: {
       char uuid[21];
-      if (is_gpu) std::snprintf(uuid, sizeof uuid, "GPU-%016llx", 0x5647505500000000ull + static_cast<unsigned>(gpu));
+      if (is_gpu) std::snprintf(uuid, sizeof uuid, "GPU-%016llx", 0x5647505500000000ull + static_cast<unsigned>(shared::physical(gpu)));
       else std::snprintf(uuid, sizeof uuid, "CPU-XX");
       put_string(value, uuid, 21);
       break;

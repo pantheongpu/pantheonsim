@@ -22,6 +22,9 @@ struct Loaded;   // a code object loaded onto a device
 // the environment names no AMD GPU.
 bool start(std::string* why);
 int device_count();
+// Which of the machine's devices a shown one is (a visible-devices list can
+// show some of them, in another order): what its identity is drawn from.
+int physical(int ordinal);
 const DeviceProfile& profile(int ordinal);
 MemoryManager& memory(int ordinal);
 

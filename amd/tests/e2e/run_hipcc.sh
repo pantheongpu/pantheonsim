@@ -350,7 +350,15 @@ expect "every error's name and text are ROCm's" "same" \
 # HIP_VISIBLE_DEVICES from those, each read up to its first bad entry; none
 # shown is no device.
 visible() { env "$@" VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=4 LD_LIBRARY_PATH="$shim" \
-            "$(dirname "$exe")/visible.gfx942" 2>&1; }
+            "$(dirname "$exe")/visible.gfx942" 2>&1 | head -1; }
+# Which machine device each shown one is: its bus and UUID are the machine
+# device's, in the order the list gives.
+visible_ids() { env "$@" VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=4 LD_LIBRARY_PATH="$shim" \
+                "$(dirname "$exe")/visible.gfx942" 2>&1 | tail -n +2 | tr '\n' ';'; }
+expect "HIP_VISIBLE_DEVICES=2,0 shows the machine's devices 2 and 0, in that order" \
+  "device 0: bus 0000:03:00.0 uuid ...02;device 1: bus 0000:01:00.0 uuid ...00;" "$(visible_ids HIP_VISIBLE_DEVICES=2,0)"
+expect "HIP's list numbers ROCr's: ROCR_VISIBLE_DEVICES=3,1 with HIP_VISIBLE_DEVICES=1 is the machine's device 1" \
+  "device 0: bus 0000:02:00.0 uuid ...01;" "$(visible_ids ROCR_VISIBLE_DEVICES=3,1 HIP_VISIBLE_DEVICES=1)"
 expect "HIP_VISIBLE_DEVICES=0,2 shows two devices" "hipSuccess 2" "$(visible HIP_VISIBLE_DEVICES=0,2)"
 expect "ROCR_VISIBLE_DEVICES=3 shows one" "hipSuccess 1" "$(visible ROCR_VISIBLE_DEVICES=3)"
 expect "a list stops at its first device that is not there" "hipSuccess 1" "$(visible HIP_VISIBLE_DEVICES=1,9,0)"

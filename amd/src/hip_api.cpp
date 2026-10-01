@@ -440,7 +440,10 @@ hipError_t ensure_runtime(State& s) {
                                              " is not an AMD GPU, and HIP runs on AMD GPUs. Set VGPU_GPU to an "
                                              "amd/ profile (for example VGPU_GPU=amd/mi300x).");
     vgpu::apply_vram_override(p);
-    s.rt = std::make_unique<vgpu::runtime::Runtime>(p, count);
+    // Each device shown is the machine's device the lists picked: logical
+    // device 0 of HIP_VISIBLE_DEVICES=1 is the machine's device 1, with its
+    // identity, telemetry and address window.
+    s.rt = std::make_unique<vgpu::runtime::Runtime>(p, count, visible, machine);
     s.profile_id = p.id;
   } catch (const std::exception& e) {
     return fail(hipErrorInvalidDevice, std::string("no usable GPU profile: ") + e.what());
@@ -804,8 +807,10 @@ hipError_t prepare_launch(State& s, int ordinal, const Module& module, const Ker
   job->cooperative = cooperative;
   job->hostcall = hostcall.get();
   const auto reach = [&](int to) {
-    if (job->peers.size() <= static_cast<size_t>(to)) job->peers.resize(static_cast<size_t>(to) + 1);
-    job->peers[static_cast<size_t>(to)] = &s.rt->device(to).memory();
+    // By the peer's address window: its physical device's (vgpu/memory.hpp).
+    const size_t window = static_cast<size_t>(s.rt->device(to).physical());
+    if (job->peers.size() <= window) job->peers.resize(window + 1);
+    job->peers[window] = &s.rt->device(to).memory();
   };
   for (const auto& [from, to] : s.peers)
     if (from == ordinal) reach(to);
@@ -2479,7 +2484,9 @@ void fill_texture_limits(vgpu::amd::abi::DevicePropR0600* props) {
   props->maxTexture2DLinear[2] = 16 * k2D;
 }
 
-void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0600* props) {
+void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0600* props,
+                     int physical = -1) {
+  if (physical < 0) physical = ordinal;
   std::memset(props, 0, sizeof *props);
   std::snprintf(props->name, sizeof props->name, "%s", p.model.c_str());
   std::snprintf(props->gcnArchName, sizeof props->gcnArchName, "%s", p.gcn_arch_full.c_str());
@@ -2511,7 +2518,7 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   // describe_device): a bus of its own, ordinal + 1, device 0. Two devices on
   // one bus looked to RCCL like one GPU twice.
   props->pciDomainID = 0;
-  props->pciBusID = ordinal + 1;
+  props->pciBusID = physical + 1;
   props->pciDeviceID = 0;
   props->concurrentKernels = 1;
   props->cooperativeLaunch = 1;
@@ -2550,7 +2557,7 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   // What ROCm's HIP gives as a device's UUID: the sixteen characters after
   // "GPU-" in its HSA agent's UUID (hsa_api.cpp), which rocminfo prints.
   char uuid[17];
-  std::snprintf(uuid, sizeof uuid, "%016llx", 0x5647505500000000ull + static_cast<unsigned>(ordinal));
+  std::snprintf(uuid, sizeof uuid, "%016llx", 0x5647505500000000ull + static_cast<unsigned>(physical));
   std::memcpy(props->uuid.bytes, uuid, 16);
 }
 
@@ -2558,9 +2565,10 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
 // hipGetDevicePropertiesR0000) fills, for a program built to that ABI. Each field is the R0600 one of the same name, so the two cannot
 // disagree; R0000's gcnArch, the number a gfx target was before it had a
 // name, is the target's digits (942).
-void fill_properties_r0000(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0000* out) {
+void fill_properties_r0000(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0000* out,
+                           int physical = -1) {
   vgpu::amd::abi::DevicePropR0600 in;
-  fill_properties(p, ordinal, &in);
+  fill_properties(p, ordinal, &in, physical);
   *out = {};
   std::memcpy(out->name, in.name, sizeof out->name);
   std::memcpy(out->gcnArchName, in.gcnArchName, sizeof out->gcnArchName);
@@ -2635,7 +2643,7 @@ hipError_t hipGetDevicePropertiesR0000(vgpu::amd::abi::DevicePropR0000* props, i
   if (!props) return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
-  fill_properties_r0000(s.rt->device(ordinal).profile(), ordinal, props);
+  fill_properties_r0000(s.rt->device(ordinal).profile(), ordinal, props, s.rt->device(ordinal).physical());
   return record(s, hipSuccess);
 }
 hipError_t hipGetDeviceProperties(hipDeviceProp_t* props, int ordinal) {
@@ -2650,7 +2658,7 @@ hipError_t hipGetDevicePropertiesR0600(vgpu::amd::abi::DevicePropR0600* props, i
   if (!props) return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
-  fill_properties(s.rt->device(ordinal).profile(), ordinal, props);
+  fill_properties(s.rt->device(ordinal).profile(), ordinal, props, s.rt->device(ordinal).physical());
   return record(s, hipSuccess);
 }
 
@@ -2666,7 +2674,7 @@ hipError_t hipDeviceGetAttribute(int* value, int attribute, int ordinal) {
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
   vgpu::amd::abi::DevicePropR0600 p;
-  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p);
+  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p, s.rt->device(ordinal).physical());
   const auto clamp = [](size_t v) { return v > 0x7fffffff ? 0x7fffffff : static_cast<int>(v); };
   using A = vgpu::amd::abi::DeviceAttribute;
   switch (static_cast<A>(attribute)) {
@@ -3573,7 +3581,7 @@ int vgpu_hip_profiler_device(int ordinal, vgpu::amd::hipprof::Device* out) {
   d.vram_bytes = p.vram_bytes;
   // The bus and UUID the device reports everywhere else: rocm-smi, sysfs.
   vgpu::telemetry::DeviceSample sample{};
-  vgpu::telemetry::describe_device(p, ordinal, &sample);
+  vgpu::telemetry::describe_device(p, s.rt->device(ordinal).physical(), &sample);
   unsigned bus = 0;
   if (std::sscanf(sample.bus_id, "%*x:%x:", &bus) == 1) d.pci_bus = bus;
   // "GPU-xxxxxxxx-xxxx-...": its hex digits, sixteen bytes of them.
@@ -4404,7 +4412,7 @@ hipError_t hipDeviceGetPCIBusId(char* bus_id, int len, int ordinal) {
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
   vgpu::amd::abi::DevicePropR0600 p;
-  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p);
+  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p, s.rt->device(ordinal).physical());
   // As snprintf fills it: a buffer too short for the whole string gets what
   // fits, and the call fails.
   const int n = std::snprintf(bus_id, static_cast<size_t>(len), "%04x:%02x:%02x.0", p.pciDomainID, p.pciBusID,
@@ -4421,7 +4429,7 @@ hipError_t hipDeviceGetByPCIBusId(int* ordinal, const char* bus_id) {
   if (std::sscanf(bus_id, "%x:%x:%x", &domain, &bus, &dev) != 3) return record(s, hipErrorInvalidValue);
   for (int i = 0; i < s.rt->device_count(); ++i) {
     vgpu::amd::abi::DevicePropR0600 p;
-    fill_properties(s.rt->device(i).profile(), i, &p);
+    fill_properties(s.rt->device(i).profile(), i, &p, s.rt->device(i).physical());
     if (unsigned(p.pciDomainID) == domain && unsigned(p.pciBusID) == bus && unsigned(p.pciDeviceID) == dev) {
       *ordinal = i;
       return record(s, hipSuccess);
@@ -5572,7 +5580,7 @@ hipError_t hipDeviceGetUuid(vgpu::amd::abi::Uuid* uuid, int ordinal) {
   if (!uuid) return record(s, hipErrorInvalidValue);
   if (!valid_device(s, ordinal)) return record(s, hipErrorInvalidDevice);
   vgpu::amd::abi::DevicePropR0600 p;
-  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p);
+  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p, s.rt->device(ordinal).physical());
   *uuid = p.uuid;
   return record(s, hipSuccess);
 }
@@ -5609,7 +5617,7 @@ hipError_t hipDeviceComputeCapability(int* major, int* minor, int ordinal) {
   if (!major || !minor) return record(s, hipErrorInvalidValue);
   if (!valid_device(s, ordinal)) return record(s, hipErrorInvalidDevice);
   vgpu::amd::abi::DevicePropR0600 p;
-  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p);
+  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p, s.rt->device(ordinal).physical());
   *major = p.major;
   *minor = p.minor;
   return record(s, hipSuccess);
@@ -5664,7 +5672,7 @@ hipError_t hipDeviceGetP2PAttribute(int* value, int attr, int src, int dst) {
   if (!value || attr < 0 || attr > 3) return record(s, hipErrorInvalidValue);
   if (!valid_device(s, src) || !valid_device(s, dst) || src == dst) return record(s, hipErrorInvalidDevice);
   vgpu::amd::abi::DevicePropR0600 p;
-  fill_properties(s.rt->device(src).profile(), src, &p);
+  fill_properties(s.rt->device(src).profile(), src, &p, s.rt->device(src).physical());
   const int image = s.rt->device(src).profile().gcn_arch.rfind("gfx9", 0) == 0 ? 0 : 1;
   *value = attr == 0 ? 0 : attr == 3 ? image : 1;
   return record(s, hipSuccess);
@@ -7282,6 +7290,12 @@ bool set_scratch_limit(int ordinal, size_t bytes) {
   std::lock_guard<std::mutex> lock(s.mutex);
   return set_scratch_limit_locked(s, ordinal, bytes);
 }
+int physical(int ordinal) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  return s.rt && ordinal >= 0 && ordinal < s.rt->device_count() ? s.rt->device(ordinal).physical() : ordinal;
+}
+
 int owner(uint64_t address) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
